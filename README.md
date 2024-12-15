@@ -1,2 +1,2 @@
 # 📚 flexiable-prefill-attention
-Flexible flash prefill attention with pure **MMA** PTX and **fine-grained tiling** for arbitrary headdim (Write for fun 👀~)
+📚 **Flexible** Flash Prefill Attention with **MMA** and **fine-grained tiling** for arbitrary HeadDim (Write for Fun 👀~)
