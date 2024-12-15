@@ -1,2 +1,2 @@
-# flash-attention-mma
-Write FlashAttention-2 from scratch using Tensor Cores with MMA PTX instruction.
+# flexiable-prefill-attention
+📚 Flexible flash prefill attention with pure MMA PTX and fine-grained tiling for arbitrary headdim (Write for fun 👀~)
