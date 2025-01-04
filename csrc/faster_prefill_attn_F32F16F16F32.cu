@@ -33,9 +33,10 @@
 // | warp_QP 6 | MMA 6 ... MMA 6 (x8) |
 // | warp_QP 7 | MMA 7 ... MMA 7 (x8) |
 
-// FFPA: Fine-grained tiling at the MMA level for all Q@K^T and P@V results in a constant SRAM usage of
-// Br * 16 or Bc * 16 for Q, K, V, leading to an overall SRAM complexity of O(Br * 16). Consequently,
-// this approach allows us to run faster than SDPA w or w/o MMA Acc F32. 
+// FFPA: Faster Flash Prefill Attention, Fine-grained tiling at the MMA level for 
+// all Q@K^T and P@V results in a constant SRAM usage of Br * 16 or Bc * 16 for Q, 
+// K, V, leading to an overall SRAM complexity of O(Br * 16)~O(1). Consequently,
+// this approach allows us to run faster than SDPA w or w/o MMA Acc F32.  
 
 template<
          const int kHeadDim,              // Headdim, 32,64,128     
@@ -79,7 +80,6 @@ ffpa_mma_stages_split_q_acc_f32_kernel(half* Q,
   static_assert(kPadQ >= 0 && kPadQ % 8 == 0); // 0,8,16
   static_assert(kPadK >= 0 && kPadK % 8 == 0); // 0,8,16
   static_assert(kPadV >= 0 && kPadV % 8 == 0); // 0,8,16
-  // TODO: add swizzle mode for Q, K, V.
   constexpr bool kSwizzleQ = (kPadQ == 0) ? true : false; // swizzle Q if kPadQ=0
   constexpr bool kSwizzleK = (kPadK == 0) ? true : false; // swizzle K if kPadK=0
   constexpr bool kSwizzleV = (kPadV == 0) ? true : false; // swizzle V if kPadV=0
@@ -164,7 +164,7 @@ ffpa_mma_stages_split_q_acc_f32_kernel(half* Q,
   // tile_K_seqlen: compute S_tile[Br,Bc] = Q@K^T = Q_tile[Br,d] * K^T[d,Bc]
   #pragma unroll 1
   for (int tile_K_seqlen = 0; tile_K_seqlen < Tc; ++tile_K_seqlen) { 
-    // TODO: process last tile_K_seqlen ? pad to multiple of 8.
+    // TODO: process last tile_K_seqlen ? pad to multiple of Bc.
     
     // Q/K g2s
     if constexpr (kStage > 1) {
@@ -186,7 +186,6 @@ ffpa_mma_stages_split_q_acc_f32_kernel(half* Q,
                               ) * sizeof(half));
           CP_ASYNC_CG(load_smem_Q_ptr, &Q[load_gmem_Q_addr + i], 16);
         }
-
         CP_ASYNC_COMMIT_GROUP();
         
         // K g2s
@@ -207,7 +206,6 @@ ffpa_mma_stages_split_q_acc_f32_kernel(half* Q,
           );
           CP_ASYNC_CG(load_smem_K_ptr, &K[load_gmem_K_addr + i], 16);
         }
-        
         CP_ASYNC_COMMIT_GROUP();
       } // end for stage
 
@@ -248,7 +246,6 @@ ffpa_mma_stages_split_q_acc_f32_kernel(half* Q,
             );
              CP_ASYNC_CG(load_smem_Q_ptr, &Q[load_gmem_Q_addr + i], 16);
           }
-          
           CP_ASYNC_COMMIT_GROUP();
 
           // next K tile g2s
@@ -290,7 +287,6 @@ ffpa_mma_stages_split_q_acc_f32_kernel(half* Q,
           );
           CP_ASYNC_CG(load_smem_Q_ptr, &Q[load_gmem_Q_addr + i], 16);
         }
-       
         CP_ASYNC_COMMIT_GROUP();
 
         // curr K tile g2s
@@ -311,7 +307,6 @@ ffpa_mma_stages_split_q_acc_f32_kernel(half* Q,
           );
           CP_ASYNC_CG(load_smem_K_ptr, &K[load_gmem_K_addr + i], 16);
         }
-
         CP_ASYNC_COMMIT_GROUP();
         // Wait curr Q, K tile ready.
         CP_ASYNC_WAIT_GROUP(0); 
@@ -578,7 +573,6 @@ ffpa_mma_stages_split_q_acc_f32_kernel(half* Q,
                 );
                 CP_ASYNC_CG(load_smem_V_ptr, &V[load_gmem_V_addr + i], 16);
               }
-              
               CP_ASYNC_COMMIT_GROUP();
             } // end if < (kWarpTileHeadDimV / 2)
           } else {
@@ -800,7 +794,7 @@ void launch_ffpa_mma_acc_f32(torch::Tensor Q,
   // d=256, 64 regs; d=512, 128 regs; d=1024, 256 regs;
   constexpr int V_smem_size  = (kStage * (Bc * (kMmaAtomN * 2 + kPadV))); 
   // try to let V reuse all Q+K smem after Q@K^T, reduce smem usage.
-  constexpr int kQKVSmemMaxSize = max(QK_smem_size, V_smem_size) * sizeof(half);
+  const int kQKVSmemMaxSize = max(QK_smem_size, V_smem_size) * sizeof(half);
 
   const int QKV_batch  = Q.size(0); 
   const int QKV_head   = Q.size(1);
