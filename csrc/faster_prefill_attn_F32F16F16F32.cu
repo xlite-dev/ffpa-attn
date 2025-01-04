@@ -774,10 +774,10 @@ void launch_ffpa_mma_acc_f32(torch::Tensor Q,
   constexpr int kWarpTileSeqLenQ = 1;
   constexpr int kWarpTileSeqLenK = (kHeadDim < 128) ? 8 : 16;
   constexpr int kWarpTileSeqLenP = 1;
-  constexpr int kWarpTileHeadDimV = (kHeadDim / (kMmaAtomN * kMmaTileHeadDimV)); // (d=64)8,(d=128)16,32,....
-  constexpr int Br = kMmaAtomM * kMmaTileSeqLenQ * kWarpTileSeqLenQ; // 16*4*1=64
-  constexpr int Bc = kMmaAtomN * kMmaTileSeqLenK * kWarpTileSeqLenK; //  8*1*8=64
-  constexpr int kNumThreads = WARP_SIZE * kMmaTileSeqLenQ * kMmaTileSeqLenK; // 32*4*1=128, num threads
+  constexpr int kWarpTileHeadDimV = (kHeadDim / (kMmaAtomN * kMmaTileHeadDimV)); 
+  constexpr int Br = kMmaAtomM * kMmaTileSeqLenQ * kWarpTileSeqLenQ;
+  constexpr int Bc = kMmaAtomN * kMmaTileSeqLenK * kWarpTileSeqLenK;
+  constexpr int kNumThreads = WARP_SIZE * kMmaTileSeqLenQ * kMmaTileSeqLenK; 
   // 0 for smem swizzle, > 0 for smem padding.
   constexpr int kPadQ = 0;
   constexpr int kPadK = 0; 
@@ -794,7 +794,8 @@ void launch_ffpa_mma_acc_f32(torch::Tensor Q,
   // d=256, 64 regs; d=512, 128 regs; d=1024, 256 regs;
   constexpr int V_smem_size  = (kStage * (Bc * (kMmaAtomN * 2 + kPadV))); 
   // try to let V reuse all Q+K smem after Q@K^T, reduce smem usage.
-  const int kQKVSmemMaxSize = max(QK_smem_size, V_smem_size) * sizeof(half);
+  constexpr int kQKVSmemMaxSize = (QK_smem_size > V_smem_size ? 
+                                   QK_smem_size * 2 : V_smem_size * 2);
 
   const int QKV_batch  = Q.size(0); 
   const int QKV_head   = Q.size(1);
@@ -847,7 +848,7 @@ void launch_ffpa_mma_acc_f32(torch::Tensor Q,
     kPadQ,
     kPadK,
     kPadV
-  ><<<grid, block, smem_max_size>>>(
+  ><<<grid, block, kQKVSmemMaxSize>>>(
     reinterpret_cast<half*>(Q.data_ptr()),
     reinterpret_cast<half*>(K.data_ptr()),
     reinterpret_cast<half*>(V.data_ptr()),

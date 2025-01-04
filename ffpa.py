@@ -38,6 +38,7 @@ def get_args():
     parser.add_argument("--debug", action="store_true")
     parser.add_argument("--verbose", '--v', action="store_true")
     parser.add_argument("--warmup", "--w", type=int, default=1)
+    parser.add_argument("--iters", "--i", type=int, default=5)
     parser.add_argument("--tag-hints", '--tags', '--hints', type=str, default=None)
     return parser.parse_args()
 
@@ -67,7 +68,7 @@ def get_device_capability():
 def get_build_sources():
     build_sources = []
     build_sources.append('./csrc/faster_prefill_attn_F16F16F16F16.cu')
-    build_sources.append('./csrc/faster_prefill_attn_F16F16F16F16.cu')
+    build_sources.append('./csrc/faster_prefill_attn_F32F16F16F32.cu')
     build_sources.append('./csrc/faster_prefill_attn_api.cc')
     return build_sources
 
@@ -371,14 +372,9 @@ pretty_print_line()
 pretty_print_line(f"B: batch_size, H: n_head, N: seq_len, D: head_dim, "
                   f"seed: {seed}, Warmup: {args.warmup}, Iters: {args.iters}")
 
-run_torch_sdpa = args.run_torch_sdpa
 for (B, H, N, D) in BHNDs:
     MAX_TFLOPS = -1
     q, k, v, o, fq, fk, fv, tk, tv = get_qkvo(B, H, N, D)
-    if D > 256:
-        args.run_torch_sdpa = True
-    else:
-        args.run_torch_sdpa = run_torch_sdpa
     torch.cuda.synchronize()
     pretty_print_line()
     pretty_print_line(f"B={B}, H={H}, N={N}, D={D}, Warmup: {args.warmup}, Iters: {args.iters}")
