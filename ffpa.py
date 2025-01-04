@@ -264,11 +264,11 @@ def run_benchmark(perf_func: callable,
         else:
             improve = 0
         MAX_TFLOPS = TFLOPS
-        print(f"{out_info:>50}: {out_val}, time:{str(mean_time)[:8]}ms, "
+        print(f"{out_info:>25}: {out_val}, time:{str(mean_time)[:8]}ms, "
               f"TFLOPS:{TFLOPS:<6.2f}(+{improve:.2f}%)")
     else:
         if (not only_show_improved) or (("flash" in tag) or ("sdpa" in tag)):
-            print(f"{out_info:>50}: {out_val}, time:{str(mean_time)[:8]}ms, "
+            print(f"{out_info:>25}: {out_val}, time:{str(mean_time)[:8]}ms, "
                   f"TFLOPS:{TFLOPS:<6.2f}")
             
     if show_matrix: print(out)
@@ -343,7 +343,7 @@ def check_all_close(out_flash_or_sdpa: torch.Tensor, out_mma: torch.Tensor,
     diff = torch.abs(out_flash_or_sdpa - out_mma)
     all_close = str(torch.allclose(out_flash_or_sdpa, out_mma, atol=1e-2))
     pretty_print_line(
-        f"{true_tag} vs {tag:<25}, all close: {all_close:<6}, "
+        f"{true_tag} vs {tag:<15}, all close: {all_close:<6}, "
         f"max diff: {diff.max().item():.6f}, min diff: {diff.min().item():.6f}, "
         f"mean diff: {diff.mean().item():.6f}"
     )
@@ -378,20 +378,20 @@ for (B, H, N, D) in BHNDs:
     torch.cuda.synchronize()
     pretty_print_line()
     pretty_print_line(f"B={B}, H={H}, N={N}, D={D}, Warmup: {args.warmup}, Iters: {args.iters}")
-    # Naive MHA.
+    # Naive MHA, FFPA, SDPA (D > 256)
     out_unfused,   _ = run_benchmark(unfused_standard_attn, q, k, v, "(unfused)")
-    out_ffpa_f161, _ = run_benchmark(lib.ffpa_mma_acc_f16, q, k, v, "(ffpa+acc+f16+stage1)", o, stages=1)
-    out_ffpa_f162, _ = run_benchmark(lib.ffpa_mma_acc_f16, q, k, v, "(ffpa+acc+f16+stage2)", o, stages=2)
+    out_sdpa,      _ = run_benchmark(partial(sdpa, use_flash=(D<=256)), q, k, v, "(sdpa)")
     out_ffpa_f321, _ = run_benchmark(lib.ffpa_mma_acc_f32, q, k, v, "(ffpa+acc+f32+stage1)", o, stages=1)
     out_ffpa_f322, _ = run_benchmark(lib.ffpa_mma_acc_f32, q, k, v, "(ffpa+acc+f32+stage2)", o, stages=2)
-    out_sdpa,      _ = run_benchmark(partial(sdpa, use_flash=(D<=256)), q, k, v, "(sdpa)")
+    out_ffpa_f161, _ = run_benchmark(lib.ffpa_mma_acc_f16, q, k, v, "(ffpa+acc+f16+stage1)", o, stages=1)
+    out_ffpa_f162, _ = run_benchmark(lib.ffpa_mma_acc_f16, q, k, v, "(ffpa+acc+f16+stage2)", o, stages=2)
     pretty_print_line()
     
     torch.cuda.synchronize()
     if args.check:
-        check_all_close(out_sdpa, out_ffpa_f161, "out_ffpa_f161", args.check_all)
-        check_all_close(out_sdpa, out_ffpa_f162, "out_ffpa_f161", args.check_all)
         check_all_close(out_sdpa, out_ffpa_f321, "out_ffpa_f321", args.check_all)
         check_all_close(out_sdpa, out_ffpa_f322, "out_ffpa_f322", args.check_all)
+        check_all_close(out_sdpa, out_ffpa_f161, "out_ffpa_f161", args.check_all)
+        check_all_close(out_sdpa, out_ffpa_f162, "out_ffpa_f161", args.check_all)
         pretty_print_line()
 
