@@ -1,4 +1,4 @@
-#include "utils.h"
+#include "utils.cuh"
 
 // Write FlashAttention-2 from scratch using Tensor Cores with MMA PTX instruction.
 // The input is Q,K,V, 4D tensor with shape [batch_size, num_heads, seq_len, head_dim].
