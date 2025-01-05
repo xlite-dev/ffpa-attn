@@ -102,7 +102,7 @@ ext_modules.append(
 
 setup(
     name=PACKAGE_NAME,
-    version="0.1.0",
+    version="0.0.1",
     packages=find_packages(
         exclude=(
             "build",
@@ -113,7 +113,7 @@ setup(
             "tmp",
         )
     ),
-    description="FFPA: Faster Flash Prefill Attention for headdim > 256, 1.2x~1.5x faster than SDPA EA",
+    description="FFPA: Faster Flash Prefill Attention for headdim > 256, ~1.5x faster than SDPA EA",
     ext_modules=ext_modules,
     cmdclass={ "build_ext": BuildExtension},
     python_requires=">=3.10",

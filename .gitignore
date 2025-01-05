@@ -18,3 +18,5 @@ __pycache__
 *.engine
 *.bin 
 outupt
+*.egg-info
+dist

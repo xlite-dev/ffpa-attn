@@ -358,7 +358,7 @@ def check_all_close(out_flash_or_sdpa: torch.Tensor, out_mma: torch.Tensor,
 
 
 Bs = [1, 4, 8] if not args.B else [args.B]
-Hs = [1, 4, 8] if not args.H else [args.H]
+Hs = [8, 16, 48] if not args.H else [args.H]
 Ns = [1024, 2048, 4096, 8192] if not args.N else [args.N]
 Ds = list(range(256, 1024, 64)) if not args.D else [args.D] 
 # batch_size, n_head, seq_len, head_dim (B,H,N,D)
