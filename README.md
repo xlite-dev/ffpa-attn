@@ -80,7 +80,7 @@ python3 setup.py bdist_wheel && cd dist && python3 -m pip install *.whl # pip un
 
 <div id="L1-bench"></div>  
 
-L1: level 1, O(Brx16)~O(1) SRAM complexity, O(d/4) register complexity, the same GPU HBM memory complexity as FlashAttention. B=1, H=48, N=8192, D=320-1024(FA2 not supported). More benchmarks (FFPA L2/L3 & more devices) data will be added over time as the project continues to develop. (Notes, *=MMA Acc F32, **=MMA Acc F16, Softmax Acc is always F32, T=TFLOPS, 👇Benchmark)
+L1: level 1, O(Brx16)~O(1) SRAM complexity, O(d/4) register complexity, the same GPU HBM memory complexity as FlashAttention. B=1, H=48, N=8192, D=320-1024(FA2 not supported). (Notes, *=MMA Acc F32, **=MMA Acc F16, Softmax Acc is always F32, T=TFLOPS, 👇Benchmark)
 
 - 📚 NVIDIA RTX 3080 Laptop
 
