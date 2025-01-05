@@ -23,7 +23,7 @@
 |**Shared QKV/KV** SMEM|**Prefetch K/V** g2s|**QKV Fine-grained Tiling**| **FFPA L1 Level**|
 |✔️|✔️|✔️|✔️|
 
-NOTE: This project is still in its early development stages and currently provides a few experimental kernels and benchmarks for reference.  
+NOTE: This project is still in its early development stages and currently provides a few experimental kernels and benchmarks for reference. More benchmark and features (L2/L3 & more devices) data will be added over time as the project continues to develop. 
 
 ## ©️Citations🎉🎉
 
