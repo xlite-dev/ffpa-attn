@@ -110,6 +110,7 @@ setup(
             "utils",
             "bench",
             "pybind",
+            "ffpa_attn",
             "tmp",
         )
     ),
