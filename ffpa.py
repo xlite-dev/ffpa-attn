@@ -67,8 +67,8 @@ def get_device_capability():
 
 def get_build_sources():
     build_sources = []
-    build_sources.append('./csrc/faster_prefill_attn_F16F16F16F16.cu')
-    build_sources.append('./csrc/faster_prefill_attn_F32F16F16F32.cu')
+    build_sources.append('./csrc/faster_prefill_attn_F16F16F16F16_L1.cu')
+    build_sources.append('./csrc/faster_prefill_attn_F32F16F16F32_L1.cu')
     build_sources.append('./csrc/faster_prefill_attn_api.cc')
     return build_sources
 
@@ -163,6 +163,7 @@ def get_mha_tflops(B: int, H: int, N: int, D: int, secs: float=1.0,
 MAX_TFLOPS = -1
 STATIS_INFO: dict[str, list[float]] = {}
 TOATL_TFLOPS: dict[str, float] = {}
+SDPA_TFLOPS = -1
 
 
 def run_benchmark(perf_func: callable, 
@@ -180,6 +181,7 @@ def run_benchmark(perf_func: callable,
     
     global MAX_TFLOPS
     global MAX_HEADDIM_CFG
+    global SDPA_TFLOPS
 
     tag_hints: str = args.tag_hints # e.g "share-qkv,tiling-kv,swizzle"
     if tag_hints:
@@ -247,6 +249,8 @@ def run_benchmark(perf_func: callable,
     
     TFLOPS = get_mha_tflops(B, H, N, D, mean_secs, 
                             only_matmul=args.only_flops_matmul)
+    if "sdpa" in tag:
+        SDPA_TFLOPS = TFLOPS
     out_info = f"{tag}"
     out_val_first = out.flatten()[:3].detach().cpu().numpy().tolist()
     out_val_last = out.flatten()[-3:].detach().cpu().numpy().tolist()
@@ -263,9 +267,13 @@ def run_benchmark(perf_func: callable,
             improve = round(improve, 2)
         else:
             improve = 0
+        if SDPA_TFLOPS > 0:
+            speedup_sdpa = (TFLOPS/ SDPA_TFLOPS)
+        else:
+            speedup_sdpa = 1.0
         MAX_TFLOPS = TFLOPS
         print(f"{out_info:>25}: {out_val}, time:{str(mean_time)[:8]}ms, "
-              f"TFLOPS:{TFLOPS:<6.2f}(+{improve:.2f}%)")
+              f"TFLOPS:{TFLOPS:<6.2f}(+{improve:<5.2f}%)(~{speedup_sdpa:<4.2f}x)")
     else:
         if (not only_show_improved) or (("flash" in tag) or ("sdpa" in tag)):
             print(f"{out_info:>25}: {out_val}, time:{str(mean_time)[:8]}ms, "
@@ -352,18 +360,18 @@ def check_all_close(out_flash_or_sdpa: torch.Tensor, out_mma: torch.Tensor,
 Bs = [1, 4, 8] if not args.B else [args.B]
 Hs = [1, 4, 8] if not args.H else [args.H]
 Ns = [1024, 2048, 4096, 8192] if not args.N else [args.N]
-Ds = [256, 512, 1024] if not args.D else [args.D] 
+Ds = list(range(256, 1024, 64)) if not args.D else [args.D] 
 # batch_size, n_head, seq_len, head_dim (B,H,N,D)
 BHNDs = [(B, H, N, D) for B in Bs for H in Hs for N in Ns for D in Ds]
 # max headdim supported for different methods. skip if D > max_D.
 MAX_HEADDIM_CFG: dict[str, int] = {
     # FFPA, SDPA, Naive MHA.
-    "(sdpa)":                          4096, # may no limit
-    "(unfused)":                       4096, # may no limit
-    "(ffpa+acc+f16+stage1)":           1024,
-    "(ffpa+acc+f16+stage2)":           1024,
-    "(ffpa+acc+f32+stage1)":           1024,
-    "(ffpa+acc+f32+stage2)":           1024,
+    "(sdpa)":                             4096, # may no limit
+    "(unfused)":                          4096, # may no limit
+    "(ffpa+acc+f16+L1+stage1)":           1024, # may no limit
+    "(ffpa+acc+f16+L1+stage2)":           1024, # may no limit
+    "(ffpa+acc+f32+L1+stage1)":           1024, # may no limit
+    "(ffpa+acc+f32+L1+stage2)":           1024, # may no limit
 }
 
 seed = args.seed if args.seed else random.choice(range(10000))
@@ -374,24 +382,25 @@ pretty_print_line(f"B: batch_size, H: n_head, N: seq_len, D: head_dim, "
 
 for (B, H, N, D) in BHNDs:
     MAX_TFLOPS = -1
+    SDPA_TFLOPS = -1
     q, k, v, o, fq, fk, fv, tk, tv = get_qkvo(B, H, N, D)
     torch.cuda.synchronize()
     pretty_print_line()
     pretty_print_line(f"B={B}, H={H}, N={N}, D={D}, Warmup: {args.warmup}, Iters: {args.iters}")
     # Naive MHA, FFPA, SDPA (D > 256)
-    out_unfused,   _ = run_benchmark(unfused_standard_attn, q, k, v, "(unfused)")
-    out_sdpa,      _ = run_benchmark(partial(sdpa, use_flash=(D<=256)), q, k, v, "(sdpa)")
-    out_ffpa_f321, _ = run_benchmark(lib.ffpa_mma_acc_f32, q, k, v, "(ffpa+acc+f32+stage1)", o, stages=1)
-    out_ffpa_f322, _ = run_benchmark(lib.ffpa_mma_acc_f32, q, k, v, "(ffpa+acc+f32+stage2)", o, stages=2)
-    out_ffpa_f161, _ = run_benchmark(lib.ffpa_mma_acc_f16, q, k, v, "(ffpa+acc+f16+stage1)", o, stages=1)
-    out_ffpa_f162, _ = run_benchmark(lib.ffpa_mma_acc_f16, q, k, v, "(ffpa+acc+f16+stage2)", o, stages=2)
+    out_unfused,      _ = run_benchmark(unfused_standard_attn, q, k, v, "(unfused)")
+    out_sdpa,         _ = run_benchmark(partial(sdpa, use_flash=(D<=256)), q, k, v, "(sdpa)")
+    out_ffpa_l1_f321, _ = run_benchmark(lib.ffpa_mma_acc_f32_L1, q, k, v, "(ffpa+acc+f32+L1+stage1)", o, stages=1)
+    out_ffpa_l1_f322, _ = run_benchmark(lib.ffpa_mma_acc_f32_L1, q, k, v, "(ffpa+acc+f32+L1+stage2)", o, stages=2)
+    out_ffpa_l1_f161, _ = run_benchmark(lib.ffpa_mma_acc_f16_L1, q, k, v, "(ffpa+acc+f16+L1+stage1)", o, stages=1)
+    out_ffpa_l1_f162, _ = run_benchmark(lib.ffpa_mma_acc_f16_L1, q, k, v, "(ffpa+acc+f16+L1+stage2)", o, stages=2)
     pretty_print_line()
     
     torch.cuda.synchronize()
     if args.check:
-        check_all_close(out_sdpa, out_ffpa_f321, "out_ffpa_f321", args.check_all)
-        check_all_close(out_sdpa, out_ffpa_f322, "out_ffpa_f322", args.check_all)
-        check_all_close(out_sdpa, out_ffpa_f161, "out_ffpa_f161", args.check_all)
-        check_all_close(out_sdpa, out_ffpa_f162, "out_ffpa_f161", args.check_all)
+        check_all_close(out_sdpa, out_ffpa_l1_f321, "out_ffpa_l1_f321", args.check_all)
+        check_all_close(out_sdpa, out_ffpa_l1_f322, "out_ffpa_l1_f322", args.check_all)
+        check_all_close(out_sdpa, out_ffpa_l1_f161, "out_ffpa_l1_f161", args.check_all)
+        check_all_close(out_sdpa, out_ffpa_l1_f162, "out_ffpa_l1_f161", args.check_all)
         pretty_print_line()
 
