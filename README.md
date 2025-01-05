@@ -40,11 +40,12 @@ NOTE: This project is still in its early development stages and currently provid
 ## 📖 Contents
 
 - [📖 Prerequisites](#prerequisites)
+- [📖 Installation](#install)
 - [📖 FFPA L1~L3 Design](#ffpa-design)
 - [📖 FFPA L1 Benchmark](#L1-bench)
 - [📖 FFPA L2 Benchmark](#L1-bench)
 - [📖 FFPA L3 Benchmark](#L1-bench)
-- [📖 Python Testing](#test)
+- [📖 Python Testing](#python-test)
 - [📖 References](#ref)
 
 ## 📖 FFPA L1~L3: FlashAttention + MMA Fine-grained Tiling
@@ -66,6 +67,15 @@ By leveraging this approach, we can achieve improved performance for large headd
 - PyTorch >= 2.4.0, CUDA >= 12.0
 - Recommended: PyTorch 2.5.1, CUDA 12.5
 
+## 📖 Installation  
+
+<div id="install"></div>  
+
+The FFPA implemented in this repo can be install as a python library, namely, `ffpa-attn` library (optional). 
+```bash
+python3 setup.py bdist_wheel && cd dist && python3 -m pip install *.whl # pip uninstall ffpa-attn -y 
+```
+
 ## 📖 FFPA L1 (Level 1): Benchmark 🎉🎉
 
 <div id="L1-bench"></div>  
@@ -83,14 +93,14 @@ L1: level 1, O(Brx16)~O(1) SRAM complexity, O(d/4) register complexity, the same
 |Speedup|3.07x|2.42x|3.33x|2.24x|2.35x|2.19x|2.19x|2.13x|2.03x|2.03x|1.90x|1.74x|
 
 ## 📖 Python Testing 
-<div id="test"></div>  
+<div id="python-test"></div>  
 
 You can test many custom FFPA kernel via Python script and figure out the difference in their performance.
 ```bash
 # You can test Ada or Ampere only, also, Volta, Ampere, Ada, Hopper, ...
 export TORCH_CUDA_ARCH_LIST=Ada # for Ada only
 export TORCH_CUDA_ARCH_LIST=Ampere # for Ampere only
-python3 ffpa.py --B 1 --H 48 --N 8192 --check --show-all --D 320 
+python3 tests/test.py --B 1 --H 48 --N 8192 --show-all --D 320 
 ```
 
 ## ©️License
