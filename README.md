@@ -1,6 +1,18 @@
 # 📚 FFPA: Faster Flash Prefill Attention  
 📚 **[WIP]** FFPA: Yet antother Faster Flash Prefill Attention with **O(1) SRAM complexity** & **O(d/4) or O(1) register complexity** for large headdim (D > 256), almost **>1.5x** 🎉 faster than SDPA EA, both MMA acc F32 and F16 (Experimental 👀~). This project is still in its early development stages and currently provides a few experimental kernels and benchmarks for reference.
 
+## ©️Citations🎉🎉
+
+```BibTeX
+@misc{faster-prefill-attention@2025,
+  title={faster-prefill-attention: Yet antother Faster Flash Prefill Attention than SDPA EA for large headdim.},
+  url={https://github.com/DefTruth/faster-prefill-attention},
+  note={Open-source software available at https://github.com/DefTruth/faster-prefill-attention},
+  author={DefTruth etc},
+  year={2025}
+}
+```
+
 ## 📖 Contents
 
 - [📖 Prerequisites](#prerequisites)
@@ -14,7 +26,7 @@
 ## 📖 FFPA L1~L3: FlashAttention + MMA Fine-grained Tiling
 <div id="ffpa-design"></div>  
 
-We have extended FlashAttention for large headdim (D > 256) by implementing **Fine-grained Tiling** at the **MMA level** for the Q·K^T and P·V matmul. This approach results in a constant SRAM usage of Br * 16 or Bc * 16 for Q, K, and V, leading to an overall SRAM complexity of O(Br * 16) ≈ O(1) and a register complexity of O(d/4) or O(1). Consequently, this method allows us to extend headdim beyond 256 and achieve faster performance compared to SDPA with or without MMA Accumulation F32 (almost **>1.5x** 🎉 faster than SDPA EA). 
+We have extended FlashAttention for large headdim (D > 256) by implementing **Fine-grained Tiling** at the **MMA level** for the Q@K^T and P@V matmul. This approach results in a constant SRAM usage of Br * 16 or Bc * 16 for Q, K, and V, leading to an overall SRAM complexity of O(Br * 16) ≈ O(1) and a register complexity of O(d/4) or O(1). Consequently, this method allows us to extend headdim beyond 256 and achieve faster performance compared to SDPA with or without MMA Accumulation F32 (almost **>1.5x** 🎉 faster than SDPA EA). 
 
 We have named this new attention tiling technique **FFPA: Faster Flash Prefill Attention**. We have designed three levels of FFPA based on SRAM and register complexity considerations. All levels will not introduce any additional VRAM requirements, ensuring that the GPU HBM memory complexity remains consistent with FlashAttention. (d=headdim)
 
@@ -77,19 +89,17 @@ GNU General Public License v3.0
 
 <div id="Contribute"></div>  
 
-How to contribute? Wecome to star this repo to support me👆🏻 ~
+How to contribute? Wecome to star⭐️ this repo to support me👆🏻 ~
 
-## ©️Citations🎉🎉
-
-```BibTeX
-@misc{faster-prefill-attention@2025,
-  title={faster-prefill-attention: Yet antother Faster Flash Prefill Attention than SDPA EA for large headdim.},
-  url={https://github.com/DefTruth/faster-prefill-attention},
-  note={Open-source software available at https://github.com/DefTruth/faster-prefill-attention},
-  author={DefTruth etc},
-  year={2025}
-}
-```
+<div align='center'>
+<a href="https://star-history.com/#DefTruth/faster-prefill-attention&Date">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=DefTruth/faster-prefill-attention&type=Date&theme=dark" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=DefTruth/faster-prefill-attention&type=Date" />
+   <img img width=450 height=300 alt="Star History Chart" src="https://api.star-history.com/svg?repos=DefTruth/faster-prefill-attention&type=Date" />
+ </picture>
+</a>
+</div>
 
 ## 📖 References   
 <div id="ref"></div>  
