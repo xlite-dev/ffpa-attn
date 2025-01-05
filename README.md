@@ -1,4 +1,16 @@
-# 📚 FFPA: Faster Flash Prefill Attention  
+<div align='center'>
+  <img src=https://github.com/user-attachments/assets/780500b9-65e6-439f-bc5f-db32c85158ad >
+</div> 
+
+<div align='center'>
+  <img src=https://img.shields.io/badge/Language-CUDA-brightgreen.svg >
+  <img src=https://img.shields.io/github/watchers/DefTruth/faster-prefill-attention?color=9cc >
+  <img src=https://img.shields.io/github/forks/DefTruth/faster-prefill-attention.svg?style=social >
+  <img src=https://img.shields.io/github/stars/DefTruth/faster-prefill-attention.svg?style=social >
+  <img src=https://img.shields.io/badge/Release-v0.0.1-brightgreen.svg >
+  <img src=https://img.shields.io/badge/License-GPLv3.0-turquoise.svg >
+ </div>   
+ 
 📚 **[WIP]** FFPA: Yet antother Faster Flash Prefill Attention with **O(1) SRAM complexity** & **O(d/4) or O(1) register complexity** for large headdim (D > 256), almost **>1.5x** 🎉 faster than SDPA EA, both MMA acc F32 and F16 (Experimental 👀~). This project is still in its early development stages and currently provides a few experimental kernels and benchmarks for reference.
 
 ## ©️Citations🎉🎉
