@@ -130,5 +130,4 @@ How to contribute? Wecome to star⭐️ this repo to support me👆🏻 ~
 
 - [flash-attention](https://github.com/Dao-AILab/flash-attention)
 - [CUDA-Learn-Notes](https://github.com/DefTruth/CUDA-Learn-Notes)
-- [cuda_hgemm](https://github.com/Bruce-Lee-LY/cuda_hgemm)
 - [cutlass](https://github.com/NVIDIA/cutlass)
