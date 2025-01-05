@@ -27,7 +27,7 @@ By leveraging this approach, we can achieve improved performance for large headd
 
 ## 📖 L1 (Level 1): Benchmark 🎉🎉
 
-L1: level 1, O(Brx16)~O(1) SRAM complexity, O(d/4) register complexity, same GPU HBM memory complexity as FlashAttention. B=1, H=48, N=8192, D=320~1024(FA2 not supported), T=TFLOPS.
+L1: level 1, O(Brx16)~O(1) SRAM complexity, O(d/4) register complexity, same GPU HBM memory complexity as FlashAttention. B=1, H=48, N=8192, D=320-1024(FA2 not supported), T=TFLOPS.
 
 - 📚 NVIDIA RTX 3080 Laptop
 
