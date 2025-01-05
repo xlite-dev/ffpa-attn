@@ -926,6 +926,7 @@ void ffpa_mma_acc_f32_L1(torch::Tensor Q,
       break;
     }
   }
+#undef CASE_LAUNCH_KERNEL_F32_L1
 }
 
 
