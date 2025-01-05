@@ -20,7 +20,7 @@ By leveraging this approach, we can achieve improved performance for large headd
 |Algorithm|320|384|448|512|576|640|704|768|832|896|960|1024|    
 |:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|  
 |SDPA EA|13T|16T|12T|16T|15T|15T|15T|15T|15T|15T|  
-|FFPA L1+Acc F32|32T|30T|30T|28T|28T|27T|26T||25T|25T|   
-|Speedup|2.48x|1.88x|2.55x|1.75x|1.90x|1.77x|1.73x||1.66x|1.66x|  
-|FFPA L1+Acc F16|40T|38T|39T|36T|35T|34T|33T||31T|31T|  
-|Speedup|3.07x|2.42x|3.33x|2.24x|2.35x|2.19x|2.19x||2.03x|2.03x|
+|FFPA L1+Acc F32|32T|30T|30T|28T|28T|27T|26T|25T|25T|25T|   
+|Speedup|2.48x|1.88x|2.55x|1.75x|1.90x|1.77x|1.73x|1.67x|1.66x|1.66x|  
+|FFPA L1+Acc F16|40T|38T|39T|36T|35T|34T|33T|32T|31T|31T|  
+|Speedup|3.07x|2.42x|3.33x|2.24x|2.35x|2.19x|2.19x|2.13x|2.03x|2.03x|
