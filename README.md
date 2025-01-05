@@ -1,19 +1,36 @@
 # 📚 FFPA: Faster Flash Prefill Attention  
 📚 **[WIP]** FFPA: Yet antother Faster Flash Prefill Attention with **O(1) SRAM complexity** & **O(d/4) or O(1) register complexity** for large headdim (D > 256), almost **>1.5x** 🎉 faster than SDPA EA, both MMA acc F32 and F16 (Experimental 👀~). This project is currently in the early stages of development and offers a selection of experimental kernels and benchmark results for your reference. 
 
-## 📖 FlashAttention + MMA level Fine-grained Tiling  
+## 📖 Contents
+
+- [📖 Prerequisites](#prerequisites)
+- [📖 FFPA L1~L3 Designs](#ffpa-design)
+- [📖 FFPA L1 Benchmark](#L1-bench)
+- [📖 Python Testing](#test)
+- [📖 References](#ref)
+
+## 📖 FFPA L1~L3: FlashAttention + MMA Fine-grained Tiling
+<div id="ffpa-design"></div>  
 
 We have extended FlashAttention for large headdim (D > 256) by implementing **Fine-grained Tiling** at the **MMA level** for the Q·K^T and P·V matmul. This approach results in a constant SRAM usage of Br * 16 or Bc * 16 for Q, K, and V, leading to an overall SRAM complexity of O(Br * 16) ≈ O(1) and a register complexity of O(d/4) or O(1). Consequently, this method allows us to extend headdim beyond 256 and achieve faster performance compared to SDPA with or without MMA Accumulation F32 (almost **>1.5x** 🎉 faster than SDPA EA). 
 
 We have named this new attention tiling technique **FFPA: Faster Flash Prefill Attention**. We have designed three levels of FFPA based on SRAM and register complexity considerations. All levels will not introduce any additional VRAM requirements, ensuring that the GPU HBM memory complexity remains consistent with FlashAttention. (d=headdim)
 
-- [x] L1: level 1, O(Brx16)~O(1) SRAM complexity, O(d/4) register complexity.  
-- [ ] L2: level 2, O(Brx16)~O(1) SRAM complexity, O(1) register complexity + Q@K^T recomputation.  
-- [ ] L3: level 3, O(Brx16)~O(1) SRAM complexity, O(1) register complexity + scaling O via HBM offloading. 
+- [x] 📚L1: level 1, O(Brx16)~O(1) SRAM complexity, O(d/4) register complexity.  
+- [ ] 📚L2: level 2, O(Brx16)~O(1) SRAM complexity, O(1) register complexity + Q@K^T recomputation.  
+- [ ] 📚L3: level 3, O(Brx16)~O(1) SRAM complexity, O(1) register complexity + scaling O via HBM offloading. 
 
 By leveraging this approach, we can achieve improved performance for large headdim (D > 256) through a balanced utilization of FlashAttention (which is not designed to support D > 256) and SDPA EA. This allows us to take advantage of the strengths of both methods while mitigating their limitations. 
 
-## 📖 L1 (Level 1): Benchmark 🎉🎉
+## 📖 Prerequisites
+<div id="prerequisites"></div>  
+
+- PyTorch >= 2.4.0, CUDA >= 12.0
+- Recommended: PyTorch 2.5.1, CUDA 12.5
+
+## 📖 FFPA L1 (Level 1): Benchmark 🎉🎉
+
+<div id="L1-bench"></div>  
 
 L1: level 1, O(Brx16)~O(1) SRAM complexity, O(d/4) register complexity, the same GPU HBM memory complexity as FlashAttention. B=1, H=48, N=8192, D=320-1024(FA2 not supported). (Notes, *=MMA Acc F32, **=MMA Acc F16, Softmax Acc is always F32, T=TFLOPS, 👇Benchmark)
 
@@ -31,14 +48,17 @@ L1: level 1, O(Brx16)~O(1) SRAM complexity, O(d/4) register complexity, the same
 
 - 📚 NVIDIA RTX 4090 (TODO)
 
-## 📖 Python Testing
+## 📖 Python Testing 
+<div id="test"></div>  
 
+You can test many custom FFPA kernel via Python script and figure out the difference in their performance.
 ```bash
-export TORCH_CUDA_ARCH_LIST=Ampere # sm80
-export TORCH_CUDA_ARCH_LIST=Ada # sm89
-python3 ffpa.py --B 1 --H 48 --N 8192 --check --show-all --D 320 # NVIDIA RTX 3080 Laptop
+# You can test Ada or Ampere only, also, Volta, Ampere, Ada, Hopper, ...
+export TORCH_CUDA_ARCH_LIST=Ada # for Ada only
+export TORCH_CUDA_ARCH_LIST=Ampere # for Ampere only
+python3 ffpa.py --B 1 --H 48 --N 8192 --check --show-all --D 320 
 ```
-log:  
+log: (tested on NVIDIA RTX 3080 Laptop)
 ```bash
 ----------------------------------------------------B=1, H=48, N=8192, D=320, Warmup: 1, Iters: 5-----------------------------------------------------
                    (sdpa): ['-0.02232361 ', '0.01992798  ', '0.00818634  '], time:315.3534ms, TFLOPS:13.13 (+0.00 %) (~1.00x)
@@ -74,6 +94,8 @@ How to contribute? Wecome to star this repo to support me👆🏻 ~
 ```
 
 ## 📖 References   
+<div id="ref"></div>  
+
 - [flash-attention](https://github.com/Dao-AILab/flash-attention)
 - [tiny-flash-attention](https://github.com/66RING/tiny-flash-attention)
 - [CUDA-Learn-Notes](https://github.com/DefTruth/CUDA-Learn-Notes)
