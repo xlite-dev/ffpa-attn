@@ -3,7 +3,7 @@
 </div> 
 
 <div align='center'>
-  <img src=https://img.shields.io/badge/Language-CUDA-brightgreen.svg >
+  <img src=https://img.shields.io/badge/Language-CUDA/Python-brightgreen.svg >
   <img src=https://img.shields.io/github/watchers/DefTruth/faster-prefill-attention?color=9cc >
   <img src=https://img.shields.io/github/forks/DefTruth/faster-prefill-attention.svg?style=social >
   <img src=https://img.shields.io/github/stars/DefTruth/faster-prefill-attention.svg?style=social >
