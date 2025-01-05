@@ -6,6 +6,8 @@
 - [📖 Prerequisites](#prerequisites)
 - [📖 FFPA L1~L3 Designs](#ffpa-design)
 - [📖 FFPA L1 Benchmark](#L1-bench)
+- [📖 FFPA L2 Benchmark](#L1-bench)
+- [📖 FFPA L3 Benchmark](#L1-bench)
 - [📖 Python Testing](#test)
 - [📖 References](#ref)
 
@@ -43,10 +45,6 @@ L1: level 1, O(Brx16)~O(1) SRAM complexity, O(d/4) register complexity, the same
 |Speedup|2.48x|1.88x|2.55x|1.75x|1.90x|1.77x|1.73x|1.67x|1.66x|1.66x|1.66x|1.54x|  
 |FFPA L1**|40T|38T|39T|36T|35T|34T|33T|32T|31T|31T|28T|27T|  
 |Speedup|3.07x|2.42x|3.33x|2.24x|2.35x|2.19x|2.19x|2.13x|2.03x|2.03x|1.90x|1.74x|
-
-- 📚 NVIDIA L20 (TODO)
-
-- 📚 NVIDIA RTX 4090 (TODO)
 
 ## 📖 Python Testing 
 <div id="test"></div>  
@@ -97,7 +95,6 @@ How to contribute? Wecome to star this repo to support me👆🏻 ~
 <div id="ref"></div>  
 
 - [flash-attention](https://github.com/Dao-AILab/flash-attention)
-- [tiny-flash-attention](https://github.com/66RING/tiny-flash-attention)
 - [CUDA-Learn-Notes](https://github.com/DefTruth/CUDA-Learn-Notes)
 - [cuda_hgemm](https://github.com/Bruce-Lee-LY/cuda_hgemm)
 - [cutlass](https://github.com/NVIDIA/cutlass)
