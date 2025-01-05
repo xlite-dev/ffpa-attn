@@ -1,5 +1,5 @@
 # 📚 FFPA: Faster Flash Prefill Attention  
-📚 [WIP] FFPA: Yet antother Faster Flash Prefill Attention with **O(1) SRAM complexity** & **O(d/4) or O(1) register complexity** for large head dim (D > 256), almost **>1.5x** 🎉 faster than SDPA EA, both MMA acc F32 and F16 (Experimental 👀~). This project is currently in the early stages of development and offers a selection of experimental kernels and benchmark results for your reference. We welcome feedback and contributions from the community as we continue to refine and expand these resources
+📚 **[WIP]** FFPA: Yet antother Faster Flash Prefill Attention with **O(1) SRAM complexity** & **O(d/4) or O(1) register complexity** for large headdim (D > 256), almost **>1.5x** 🎉 faster than SDPA EA, both MMA acc F32 and F16 (Experimental 👀~). This project is currently in the early stages of development and offers a selection of experimental kernels and benchmark results for your reference. 
 
 ## 📖 FlashAttention + MMA level Fine-grained Tiling  
 
@@ -37,6 +37,9 @@ L1: level 1, O(Brx16)~O(1) SRAM complexity, O(d/4) register complexity, the same
 export TORCH_CUDA_ARCH_LIST=Ampere # sm80
 export TORCH_CUDA_ARCH_LIST=Ada # sm89
 python3 ffpa.py --B 1 --H 48 --N 8192 --check --show-all --D 320 # NVIDIA RTX 3080 Laptop
+```
+log:  
+```bash
 ----------------------------------------------------B=1, H=48, N=8192, D=320, Warmup: 1, Iters: 5-----------------------------------------------------
                    (sdpa): ['-0.02232361 ', '0.01992798  ', '0.00818634  '], time:315.3534ms, TFLOPS:13.13 (+0.00 %) (~1.00x)
  (ffpa+acc+f32+L1+stage1): ['-0.02232361 ', '0.01991272  ', '0.00817108  '], time:152.9723ms, TFLOPS:27.06 (+106.15%)(~2.06x)
