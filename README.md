@@ -3,7 +3,7 @@
 </div> 
 
 <div align='center'>
-  <img src=https://img.shields.io/badge/Language-CUDA-brightgreen.svg >
+  <img src=https://img.shields.io/badge/Language-CUDA/Python-brightgreen.svg >
   <img src=https://img.shields.io/github/watchers/DefTruth/faster-prefill-attention?color=9cc >
   <img src=https://img.shields.io/github/forks/DefTruth/faster-prefill-attention.svg?style=social >
   <img src=https://img.shields.io/github/stars/DefTruth/faster-prefill-attention.svg?style=social >
@@ -23,7 +23,7 @@
 |**Shared QKV/KV** SMEM|**Prefetch K/V** g2s|**QKV Fine-grained Tiling**| **FFPA L1 Level**|
 |✔️|✔️|✔️|✔️|
 
-NOTE: This project is still in its early development stages and currently provides a few experimental kernels and benchmarks for reference. More benchmark and features (FFPA L2/L3 & more devices) data will be added over time as the project continues to develop. 
+NOTE: This project is still in its early development stages and currently provides a few experimental kernels and benchmarks for reference. More benchmarks and features (FFPA L2/L3 & more devices) data will be added over time as the project continues to develop. 
 
 ## ©️Citations🎉🎉
 
@@ -50,7 +50,7 @@ NOTE: This project is still in its early development stages and currently provid
 ## 📖 FFPA L1~L3: FlashAttention + MMA Fine-grained Tiling
 <div id="ffpa-design"></div>  
 
-We have extended FlashAttention for large headdim (D > 256) by implementing **Fine-grained Tiling** at the **MMA level** for the Q@K^T and P@V matmul. This approach results in a constant SRAM usage of Br * 16 or Bc * 16 for Q, K, and V, leading to an overall SRAM complexity of O(Br * 16) ≈ O(1) and a register complexity of O(d/4) or O(1). Consequently, this method allows us to extend headdim beyond 256 and achieve faster performance compared to SDPA with or without MMA Accumulation F32 (almost **>1.5x** 🎉 faster than SDPA EA). 
+We have extended FlashAttention for large headdim (D > 256) by implementing **Fine-grained Tiling** at the **MMA level** for the Q@K^T and P@V matmul. This approach results in a constant SRAM usage of Br * 16 or Bc * 16 for Q, K, and V, leading to an overall SRAM complexity of O(Br * 16) ≈ O(1) and a register complexity of O(d/4) or O(1). Consequently, this method allows us to extend **headdim > 256** and achieve faster performance compared to SDPA with or without MMA Accumulation F32 (almost **>1.5x** 🎉 faster than SDPA EA). 
 
 We have named this new attention tiling technique **FFPA: Faster Flash Prefill Attention**. We have designed three levels of FFPA based on SRAM and register complexity considerations. All levels will not introduce any additional VRAM requirements, ensuring that the GPU HBM memory complexity remains consistent with FlashAttention. (d=headdim)
 
@@ -70,7 +70,7 @@ By leveraging this approach, we can achieve improved performance for large headd
 
 <div id="L1-bench"></div>  
 
-L1: level 1, O(Brx16)~O(1) SRAM complexity, O(d/4) register complexity, the same GPU HBM memory complexity as FlashAttention. B=1, H=48, N=8192, D=320-1024(FA2 not supported). More benchmark (FFPA L2/L3 & more devices) data will be added over time as the project continues to develop. (Notes, *=MMA Acc F32, **=MMA Acc F16, Softmax Acc is always F32, T=TFLOPS, 👇Benchmark)
+L1: level 1, O(Brx16)~O(1) SRAM complexity, O(d/4) register complexity, the same GPU HBM memory complexity as FlashAttention. B=1, H=48, N=8192, D=320-1024(FA2 not supported). More benchmarks (FFPA L2/L3 & more devices) data will be added over time as the project continues to develop. (Notes, *=MMA Acc F32, **=MMA Acc F16, Softmax Acc is always F32, T=TFLOPS, 👇Benchmark)
 
 - 📚 NVIDIA RTX 3080 Laptop
 
