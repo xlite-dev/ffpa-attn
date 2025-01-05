@@ -4,7 +4,7 @@
 ## 📖 Contents
 
 - [📖 Prerequisites](#prerequisites)
-- [📖 FFPA L1~L3 Designs](#ffpa-design)
+- [📖 FFPA L1~L3 Design](#ffpa-design)
 - [📖 FFPA L1 Benchmark](#L1-bench)
 - [📖 FFPA L2 Benchmark](#L1-bench)
 - [📖 FFPA L3 Benchmark](#L1-bench)
@@ -34,7 +34,7 @@ By leveraging this approach, we can achieve improved performance for large headd
 
 <div id="L1-bench"></div>  
 
-L1: level 1, O(Brx16)~O(1) SRAM complexity, O(d/4) register complexity, the same GPU HBM memory complexity as FlashAttention. B=1, H=48, N=8192, D=320-1024(FA2 not supported). (Notes, *=MMA Acc F32, **=MMA Acc F16, Softmax Acc is always F32, T=TFLOPS, 👇Benchmark)
+L1: level 1, O(Brx16)~O(1) SRAM complexity, O(d/4) register complexity, the same GPU HBM memory complexity as FlashAttention. B=1, H=48, N=8192, D=320-1024(FA2 not supported). More benchmark data will be added over time as the project continues to develop. (Notes, *=MMA Acc F32, **=MMA Acc F16, Softmax Acc is always F32, T=TFLOPS, 👇Benchmark)
 
 - 📚 NVIDIA RTX 3080 Laptop
 
