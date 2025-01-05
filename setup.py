@@ -111,6 +111,7 @@ setup(
             "bench",
             "pybind",
             "pyffpa", # high level python api is not ready now.
+            "ffpa_attn", # high level python api is not ready now.
             "tmp",
         )
     ),
