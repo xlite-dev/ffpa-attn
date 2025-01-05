@@ -13,12 +13,14 @@
  
 📚 **[WIP]** FFPA: Yet antother Faster Flash Prefill Attention with **O(1) SRAM complexity** & **O(d/4) or O(1) register complexity** for large headdim (D > 256), almost **>1.5x** 🎉 faster than SDPA EA, both MMA acc F32 and F16 (Experimental 👀~). This project is still in its early development stages and currently provides a few experimental kernels and benchmarks for reference.  
 
-|Tensor Cores|Loop over Seqlen/HeadDim |Tile Block (Br, Bc)|MMA (m16n8k16)|
+|Tensor Cores|Loop over Seqlen/Headdim |Tile Block (Br, Bc)|MMA (m16n8k16)|
 |:---:|:---:|:---:|:---:|
 |✔️|✔️|✔️|✔️|
-|SMEM **Swizzle**/Padding |Copy Async|Tile MMA&Warp |**Prefetch K/V** g2s| 
+|Pack LDST (128 bits)|SMEM **Swizzle**/Padding |Copy Async|Tile MMA (More Threads)|
 |✔️|✔️|✔️|✔️|
-|**Shared QKV** SMEM|Collective Store (Warp Shfl) |**Split Q**|**QKV Fine-grained Tiling**|
+|Tile Warp (More Values)|Multi Stages (1/2)|Collective Store (Shfl)|**Split KV/Q**|
+|✔️|✔️|✔️|✔️|
+|**Shared QKV/KV** SMEM|**Prefetch K/V** g2s|**QKV Fine-grained Tiling**| **FFPA L1 Level**|
 |✔️|✔️|✔️|✔️|
 
 
