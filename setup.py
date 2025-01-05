@@ -110,7 +110,7 @@ setup(
             "utils",
             "bench",
             "pybind",
-            "ffpa_attn",
+            "ffpa_attn", # high level python api is not ready now.
             "tmp",
         )
     ),
