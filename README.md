@@ -13,18 +13,6 @@ We have named this new attention tiling technique **FFPA: Faster Flash Prefill A
 
 By leveraging this approach, we can achieve improved performance for large headdim (D > 256) through a balanced utilization of FlashAttention (which is not designed to support D > 256) and SDPA EA. This allows us to take advantage of the strengths of both methods while mitigating their limitations. 
 
-## ©️Citations🎉🎉
-
-```BibTeX
-@misc{faster-prefill-attention@2025,
-  title={faster-prefill-attention: Yet antother Faster Flash Prefill Attention than SDPA EA for large headdim.},
-  url={https://github.com/DefTruth/faster-prefill-attention},
-  note={Open-source software available at https://github.com/DefTruth/faster-prefill-attention},
-  author={DefTruth etc},
-  year={2025}
-}
-```
-
 ## 📖 L1 (Level 1): Benchmark 🎉🎉
 
 L1: level 1, O(Brx16)~O(1) SRAM complexity, O(d/4) register complexity, same GPU HBM memory complexity as FlashAttention. B=1, H=48, N=8192, D=320-1024(FA2 not supported), T=TFLOPS.
@@ -54,6 +42,18 @@ GNU General Public License v3.0
 <div id="Contribute"></div>  
 
 How to contribute? Wecome to star this repo to support me👆🏻 ~
+
+## ©️Citations🎉🎉
+
+```BibTeX
+@misc{faster-prefill-attention@2025,
+  title={faster-prefill-attention: Yet antother Faster Flash Prefill Attention than SDPA EA for large headdim.},
+  url={https://github.com/DefTruth/faster-prefill-attention},
+  note={Open-source software available at https://github.com/DefTruth/faster-prefill-attention},
+  author={DefTruth etc},
+  year={2025}
+}
+```
 
 ## 📖 References   
 - [flash-attention](https://github.com/Dao-AILab/flash-attention)
