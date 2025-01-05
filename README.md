@@ -1,5 +1,5 @@
 # 📚 FFPA: Faster Flash Prefill Attention  
-📚 **[WIP]** FFPA: Yet antother Faster Flash Prefill Attention with **O(1) SRAM complexity** & **O(d/4) or O(1) register complexity** for large headdim (D > 256), almost **>1.5x** 🎉 faster than SDPA EA, both MMA acc F32 and F16 (Experimental 👀~). This project is currently in the early stages of development and offers a selection of experimental kernels and benchmark results for your reference. 
+📚 **[WIP]** FFPA: Yet antother Faster Flash Prefill Attention with **O(1) SRAM complexity** & **O(d/4) or O(1) register complexity** for large headdim (D > 256), almost **>1.5x** 🎉 faster than SDPA EA, both MMA acc F32 and F16 (Experimental 👀~). This project is still in its early development stages and currently provides a few experimental kernels and benchmarks for reference.
 
 ## 📖 Contents
 
