@@ -17,14 +17,14 @@ By leveraging this approach, we can achieve improved performance for large headd
 
 L1: level 1, O(Brx16)~O(1) SRAM complexity, O(d/4) register complexity, same GPU HBM memory complexity as FlashAttention. B=1, H=48, N=8192, D=320-1024(FA2 not supported), T=TFLOPS.
 
-- 📚 NVIDIA RTX 3080 Laptop
+- 📚 NVIDIA RTX 3080 Laptop (*=MMA Acc F32, **=MMA Acc F16)
 
 |Algorithm|320|384|448|512|576|640|704|768|832|896|960|1024|    
 |:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|  
 |SDPA EA|13T|16T|12T|16T|15T|15T|15T|15T|15T|15T|15T|15T|  
-|FFPA L1+Acc F32|32T|30T|30T|28T|28T|27T|26T|25T|25T|25T|25T|24T|   
+|FFPA L1*|32T|30T|30T|28T|28T|27T|26T|25T|25T|25T|25T|24T|   
 |Speedup|2.48x|1.88x|2.55x|1.75x|1.90x|1.77x|1.73x|1.67x|1.66x|1.66x|1.66x|1.54x|  
-|FFPA L1+Acc F16|40T|38T|39T|36T|35T|34T|33T|32T|31T|31T|28T|27T|  
+|FFPA L1**|40T|38T|39T|36T|35T|34T|33T|32T|31T|31T|28T|27T|  
 |Speedup|3.07x|2.42x|3.33x|2.24x|2.35x|2.19x|2.19x|2.13x|2.03x|2.03x|1.90x|1.74x|
 
 - 📚 NVIDIA L20 (TODO)
