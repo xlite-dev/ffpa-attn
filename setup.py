@@ -52,7 +52,7 @@ def get_build_cuda_cflags(build_pkg: bool = False):
     return extra_cuda_cflags
 
 
-# package name managed by pip, which can be remove by `pip uninstall toy-hgemm`
+# package name managed by pip, which can be remove by `pip uninstall ffpa-attn -y`
 PACKAGE_NAME = "ffpa-attn"
 
 ext_modules = []
