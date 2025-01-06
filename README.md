@@ -11,7 +11,7 @@
   <img src=https://img.shields.io/badge/License-GPLv3.0-turquoise.svg >
  </div>   
  
-🤖 **[WIP]** FFPA: Yet antother Faster Flash Prefill Attention with **O(1) SRAM complexity** & **O(d/4) or O(1) register complexity** for large headdim (D > 256), almost **>1.5x** 🎉 faster than SDPA EA with or without MMA Accumulation F32 (Experimental 👀~). The FFPA kernels are modified from my repo 📖[CUDA-Learn-Notes](https://github.com/DefTruth/CUDA-Learn-Notes/tree/main/kernels/flash-attn)  ![](https://img.shields.io/github/stars/DefTruth/CUDA-Learn-Notes.svg?style=social).
+🤖 **[WIP]** FFPA: Yet antother Faster Flash Prefill Attention with **O(1) SRAM complexity** & **O(d/4) or O(1) register complexity** for large headdim (D > 256), almost **>1.5x** 🎉 faster than SDPA EA with or without MMA Accumulation F32 on many devices, such as NVIDIA L20, NVIDIA RTX 4090, NVIDIA RTX 3080 Laptop (Experimental 👀~). The FFPA kernels are modified from my repo 📖[CUDA-Learn-Notes](https://github.com/DefTruth/CUDA-Learn-Notes/tree/main/kernels/flash-attn)  ![](https://img.shields.io/github/stars/DefTruth/CUDA-Learn-Notes.svg?style=social).
 
 <!--
 |Tensor Cores|Loop over N/D |Tile Block (Br, Bc) |MMA (m16n8k16)|
@@ -24,7 +24,8 @@
 |**QKV Fine-grained Tiling**|**Shared QKV** SMEM|**FFPA L1 Level**|**FFPA L2/L3 Level** |
 |✔️|✔️|✔️|?|
 -->
-NOTE: This project is still in its early development stages and currently provides a few experimental kernels and benchmarks for reference. More benchmarks and features (FFPA L2/L3 & more devices) data will be added over time as the project continues to develop. 
+
+NOTE: This project is still in its early development stages and currently provides a few experimental kernels and benchmarks for reference. More benchmarks and features (FFPA **L2/L3** & more devices) data will be added over time as the project continues to develop. 
 
 ## ©️Citations🎉🎉
 
@@ -107,11 +108,11 @@ L1: level 1, O(Brx16)~O(1) SRAM complexity, O(d/4) register complexity, the same
 
 |Algorithm|320|384|448|512|576|640|704|768|832|896|960|1024|    
 |:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|  
-|SDPA EA|
-|FFPA L1*|
-|Speedup| 
-|FFPA L1^|
-|Speedup|
+|SDPA EA|82T|92T|83T|84T|78T|80T|78T|80T|78T|80T|78T|79T|
+|FFPA L1*|136T|135T|135T|132T|133T|133T|132T|131T|130T|125T|123T|93T|
+|Speedup|1.64x|1.45x|1.61x|1.57x|1.71x|1.65x|1.68x|1.62x|1.65x|1.56x|1.55x|1.17x| 
+|FFPA L1^|154T|161T|160T|157T|156T|155T|157T|154T|149T|150T|145T|100T|
+|Speedup|1.85x|1.73x|1.92x|1.87x|1.99x|1.93x|1.99x|1.90x|1.90x|1.88x|1.84x|1.25x|
 
 ## 📖 Python Testing 
 <div id="python-test"></div>  
