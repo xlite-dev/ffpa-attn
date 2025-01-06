@@ -13,12 +13,12 @@
  
 🤖 **[WIP]** FFPA: Yet antother Faster Flash Prefill Attention with **O(1) SRAM complexity** & **O(d/4) or O(1) register complexity** for large headdim (D > 256), almost **>1.5x** 🎉 faster than SDPA EA with or without MMA Accumulation F32 (Experimental 👀~). The FFPA kernels are modified from my repo 📖[CUDA-Learn-Notes](https://github.com/DefTruth/CUDA-Learn-Notes/tree/main/kernels/flash-attn)  ![](https://img.shields.io/github/stars/DefTruth/CUDA-Learn-Notes.svg?style=social).
 
-|Tensor Cores|Loop over Seqlen/Headdim |Tile Block |MMA (m16n8k16)|
+|Tensor Cores|Loop over Seqlen/Headdim |Tile Block (Br, Bc) |MMA (m16n8k16)|
 |:---:|:---:|:---:|:---:|
 |✔️|✔️|✔️|✔️|
-|Pack LDST (128 bits)|SMEM **Swizzle**/Padding |Copy Async|Tile MMA |
+|Pack LDST (128 bits)|SMEM **Swizzle**/Padding |Copy Async|Tile MMA (More Threads) |
 |✔️|✔️|✔️|✔️|
-|Tile Warp |Multi Stages (1/2)|Collective Store (Shfl)|**QKV Fine-grained Tiling**|
+|Tile Warp (More Values) |Multi Stages |Collective Store (Shfl)|**QKV Fine-grained Tiling**|
 |✔️|✔️|✔️|✔️|
 |**Shared QKV** SMEM|**Prefetch K/V** g2s|**Split Q**| **FFPA L1**|
 |✔️|✔️|✔️|✔️|
