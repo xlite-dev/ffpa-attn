@@ -18,12 +18,12 @@
 |✔️|✔️|✔️|✔️|
 |Pack LDST (128 bits)|SMEM **Swizzle**/Padding |Copy Async|Tile MMA (More Threads) |
 |✔️|✔️|✔️|✔️|
-|Tile Warp (More Values) |Multi Stages (1/2) |Collective Store (Shfl)|**Split Q**|
+|Tile Warp (More Values) |Multi Stages (1/2) |Collective Store (**Shfl**)|**Split Q**|
 |✔️|✔️|✔️|✔️|
 |**QKV Fine-grained Tiling**|**Shared QKV** SMEM|**FFPA L1 Level**|**FFPA L2/L3 Level** |
 |✔️|✔️|✔️|?|
 
-NOTE: This project is still in its early development stages and currently provides a few experimental kernels and benchmarks for reference. More benchmarks and features (🔑️FFPA L2/L3 & more devices) data will be added over time as the project continues to develop. 
+NOTE: This project is still in its early development stages and currently provides a few experimental kernels and benchmarks for reference. More benchmarks and features (FFPA L2/L3 & more devices) data will be added over time as the project continues to develop. 
 
 ## ©️Citations🎉🎉
 
@@ -48,7 +48,7 @@ NOTE: This project is still in its early development stages and currently provid
 - [📖 Python Testing](#python-test)
 - [📖 References](#ref)
 
-## 📖 FFPA L1~L3: FlashAttention + QKV Fine-grained Tiling at MMA level
+## 📖 FFPA L1~L3: FlashAttention + QKV Fine-grained Tiling at MMA level 🔑️
 <div id="ffpa-design"></div>  
 
 We have extended FlashAttention for large headdim (D > 256) by implementing **Fine-grained Tiling** at the **MMA level** for the Q@K^T and P@V matmul. This approach results in a constant SRAM usage of Br * 16 or Bc * 16 for Q, K, and V, leading to an overall SRAM complexity of O(Br * 16) ≈ O(1) and a register complexity of O(d/4) or O(1). Consequently, this method allows us to extend **headdim > 256** and achieve faster performance compared to SDPA with or without MMA Accumulation F32 (almost **>1.5x** 🎉 faster than SDPA EA). 
@@ -80,17 +80,37 @@ python3 setup.py bdist_wheel && cd dist && python3 -m pip install *.whl # pip un
 
 <div id="L1-bench"></div>  
 
-L1: level 1, O(Brx16)~O(1) SRAM complexity, O(d/4) register complexity, the same GPU HBM memory complexity as FlashAttention. B=1, H=48, N=8192, **D=320-1024(FA2 not supported 👀)**. (Notes, *=MMA Acc F32, **=MMA Acc F16, Softmax Acc is always F32, T=TFLOPS, 👇Benchmark)
+L1: level 1, O(Brx16)~O(1) SRAM complexity, O(d/4) register complexity, the same GPU HBM memory complexity as FlashAttention. B=1, H=48, N=8192, **D=320-1024(FA2 not supported 👀)**. (Notes, `*`=MMA Acc F32, `^`=MMA Acc F16, Softmax Acc dtype is always be F32, T=TFLOPS, 👇Benchmark)
 
-- 📚 NVIDIA RTX 3080 Laptop
+- 📚 NVIDIA RTX 3080 Laptop (`*`=MMA Acc F32, `^`=MMA Acc F16, `T`=TFLOPS)
 
 |Algorithm|320|384|448|512|576|640|704|768|832|896|960|1024|    
 |:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|  
 |SDPA EA|13T|16T|12T|16T|15T|15T|15T|15T|15T|15T|15T|15T|  
-|FFPA L1*|32T|30T|30T|28T|28T|27T|26T|25T|25T|25T|25T|24T|   
+|FFPA L1`*`|32T|30T|30T|28T|28T|27T|26T|25T|25T|25T|25T|24T|   
 |Speedup|2.48x|1.88x|2.55x|1.75x|1.90x|1.77x|1.73x|1.67x|1.66x|1.66x|1.66x|1.54x|  
-|FFPA L1**|40T|38T|39T|36T|35T|34T|33T|32T|31T|31T|28T|27T|  
+|FFPA L1`^`|40T|38T|39T|36T|35T|34T|33T|32T|31T|31T|28T|27T|  
 |Speedup|3.07x|2.42x|3.33x|2.24x|2.35x|2.19x|2.19x|2.13x|2.03x|2.03x|1.90x|1.74x|
+
+- 📚 NVIDIA L20 (`*`=MMA Acc F32, `^`=MMA Acc F16, `T`=TFLOPS)
+
+|Algorithm|320|384|448|512|576|640|704|768|832|896|960|1024|    
+|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|  
+|SDPA EA|
+|FFPA L1`*`|
+|Speedup| 
+|FFPA L1`^`|
+|Speedup|
+
+- 📚 NVIDIA RTX 4090 (`*`=MMA Acc F32, `^`=MMA Acc F16, `T`=TFLOPS)
+
+|Algorithm|320|384|448|512|576|640|704|768|832|896|960|1024|    
+|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|  
+|SDPA EA|
+|FFPA L1`*`|
+|Speedup| 
+|FFPA L1`^`|
+|Speedup|
 
 ## 📖 Python Testing 
 <div id="python-test"></div>  
