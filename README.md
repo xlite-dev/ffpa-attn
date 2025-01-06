@@ -55,13 +55,18 @@ NOTE: This project is still in its early development stages and currently provid
 
 We have extended FlashAttention for large headdim (D > 256) by implementing **Fine-grained Tiling** at the **MMA level (GEMM style)** for the Q@K^T and P@V matmul. This approach results in a constant SRAM usage of Br * 16 or Bc * 16 for Q, K, and V, leading to an overall SRAM complexity of O(Br * 16) ≈ O(1) and a register complexity of O(d/4) or O(1). Consequently, this method allows us to extend **headdim > 256** and achieve faster performance compared to SDPA with or without MMA Accumulation F32 (almost **>1.5x** 🎉 faster than SDPA EA). 
 
-We have named this new attention tiling technique **FFPA: Faster Flash Prefill Attention**. We have designed three levels of FFPA based on SRAM and register complexity considerations. All levels will not introduce any additional VRAM requirements, ensuring that the GPU HBM memory complexity remains consistent with FlashAttention. (d=headdim)
+We have named this new attention tiling technique **FFPA: Faster Flash Prefill Attention**. We have designed three levels of FFPA based on SRAM and register complexity considerations. All levels will not introduce any additional VRAM requirements, ensuring that the GPU HBM memory complexity remains consistent with FlashAttention. 👇
 
 - [x] 📚L1: level 1, O(Brx16)~O(1) SRAM complexity, O(d/4) register complexity.  
 - [ ] 📚L2: level 2, O(Brx16)~O(1) SRAM complexity, O(1) register complexity + Q@K^T recomputation.  
 - [ ] 📚L3: level 3, O(Brx16)~O(1) SRAM complexity, O(1) register complexity + scaling O via HBM offloading. 
 
-By leveraging this approach, we can achieve improved performance for large headdim (D > 256) through a balanced utilization of FlashAttention (which is not designed to support D > 256) and SDPA EA. This allows us to take advantage of the strengths of both methods while mitigating their limitations. 
+By leveraging this approach, we can achieve better performance for large headdim (D > 256) through a balanced utilization of FlashAttention (which is not designed to support D > 256) and SDPA EA. Approximate SRAM and Register complexity analysis for FFPA L1~L3 levels is as follows: (`d`=headdim,`C,Br,Bc`=Constant) 👇
+
+|📚Complexity| 📚FFPA L1 |  📚FFPA L2 |  📚FFPA L3 | 📚FlashAttention | 
+|:---:|:---:|:---:|:---:|:---:| 
+|SRAM | O(Brx16)~O(1) | O(Brx16)~O(1) | O(Brx16)~O(1) | ~O(3xBrxd), QKV |
+|Register | O(d/4) | O((Bc/16)x4+Cx2)~O(1)|O((Bc/16)x4+Cx2)~O(1)| ~O(d/2), SO |
 
 ## 📖 Prerequisites
 <div id="prerequisites"></div>  
