@@ -72,6 +72,7 @@ By leveraging this approach, we can achieve better performance for large headdim
 ## 📖 Prerequisites
 <div id="prerequisites"></div>  
 
+- Python >= 3.10
 - PyTorch >= 2.4.0, CUDA >= 12.4
 - Recommended: PyTorch 2.5.1, CUDA 12.5
 
@@ -81,8 +82,8 @@ By leveraging this approach, we can achieve better performance for large headdim
 
 The FFPA implemented in this repo can be install as a python library, namely, `ffpa-attn` library (optional). 
 ```bash
+# clone, then, run tests/install.sh directly or run commands as belows
 git clone https://github.com/DefTruth/faster-prefill-attention.git
-# Then, run tests/install.sh directly or run commands as belows:
 python3 setup.py bdist_wheel && rm -rf *.egg-info # build ffpa-attn from sources
 cd dist && python3 -m pip install ffpa_attn-*-linux_x86_64.whl # pip uninstall ffpa-attn -y 
 ```
@@ -183,4 +184,4 @@ How to contribute? Wecome to star⭐️ this repo to support me👆🏻 ~
 
 - [flash-attention](https://github.com/Dao-AILab/flash-attention)
 - [CUDA-Learn-Notes](https://github.com/DefTruth/CUDA-Learn-Notes)
-- [cutlass](https://github.com/NVIDIA/cutlass)
+- [SDPA](https://pytorch.org/docs/stable/generated/torch.nn.functional.scaled_dot_product_attention.html)
