@@ -31,7 +31,7 @@ NOTE: This project is still in its early development stages and currently provid
 
 ```BibTeX
 @misc{faster-prefill-attention@2025,
-  title={faster-prefill-attention: Yet another Faster Flash Prefill Attention for large headdim, outperforming SDPA EA.},
+  title={FFPA: Yet another Faster Flash Prefill Attention  with O(1) SRAM complexity for large headdim.},
   url={https://github.com/DefTruth/faster-prefill-attention},
   note={Open-source software available at https://github.com/DefTruth/faster-prefill-attention},
   author={DefTruth etc},
