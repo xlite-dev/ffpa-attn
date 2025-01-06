@@ -18,9 +18,9 @@
 |✔️|✔️|✔️|✔️|
 |Pack LDST (128 bits)|SMEM **Swizzle**/Padding |Copy Async|Tile MMA (More Threads) |
 |✔️|✔️|✔️|✔️|
-|Tile Warp (More Values) |Multi Stages |Collective Store (Shfl)|**QKV Fine-grained Tiling**|
+|Tile Warp (More Values) |Multi Stages |Collective Store (Shfl)|**Split Q**|
 |✔️|✔️|✔️|✔️|
-|**Shared QKV** SMEM|**Prefetch K/V** g2s|**Split Q**| **FFPA L1**|
+|**QKV Fine-grained Tiling**|**Shared QKV** SMEM|**Prefetch K/V** g2s| **FFPA L1 Level**|
 |✔️|✔️|✔️|✔️|
 
 NOTE: This project is still in its early development stages and currently provides a few experimental kernels and benchmarks for reference. More benchmarks and features (🔑️FFPA L2/L3 & more devices) data will be added over time as the project continues to develop. 
@@ -48,7 +48,7 @@ NOTE: This project is still in its early development stages and currently provid
 - [📖 Python Testing](#python-test)
 - [📖 References](#ref)
 
-## 📖 FFPA L1~L3: FlashAttention + MMA Fine-grained Tiling
+## 📖 FFPA L1~L3: FlashAttention + QKV Fine-grained Tiling at MMA level
 <div id="ffpa-design"></div>  
 
 We have extended FlashAttention for large headdim (D > 256) by implementing **Fine-grained Tiling** at the **MMA level** for the Q@K^T and P@V matmul. This approach results in a constant SRAM usage of Br * 16 or Bc * 16 for Q, K, and V, leading to an overall SRAM complexity of O(Br * 16) ≈ O(1) and a register complexity of O(d/4) or O(1). Consequently, this method allows us to extend **headdim > 256** and achieve faster performance compared to SDPA with or without MMA Accumulation F32 (almost **>1.5x** 🎉 faster than SDPA EA). 
