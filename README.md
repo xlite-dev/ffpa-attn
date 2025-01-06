@@ -76,8 +76,9 @@ By leveraging this approach, we can achieve improved performance for large headd
 The FFPA implemented in this repo can be install as a python library, namely, `ffpa-attn` library (optional). 
 ```bash
 git clone https://github.com/DefTruth/faster-prefill-attention.git
-python3 setup.py bdist_wheel && cd dist # build ffpa-attn from sources
-python3 -m pip install ffpa_attn-*-linux_x86_64.whl # pip uninstall ffpa-attn -y 
+# Then, run tests/install.sh directly or run commands as belows:
+python3 setup.py bdist_wheel && rm -rf *.egg-info # build ffpa-attn from sources
+cd dist && python3 -m pip install ffpa_attn-*-linux_x86_64.whl # pip uninstall ffpa-attn -y 
 ```
 
 ## 📖 FFPA L1 (Level 1): Benchmark 🎉🎉
