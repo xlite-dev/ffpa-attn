@@ -25,7 +25,7 @@
 |✔️|✔️|✔️|?|
 -->
 
-NOTE: This project is still in its early development stages and currently provides a few experimental kernels and benchmarks for reference. More benchmarks and features (FFPA **L2/L3** & more devices) data will be added over time as the project continues to develop. 
+NOTE: This project is still in its early development stages and currently provides a few experimental kernels and benchmarks for reference. More benchmarks data and features (FFPA **L2/L3** & more devices) will be added over time as the project continues to develop. 
 
 ## ©️Citations🎉🎉
 
