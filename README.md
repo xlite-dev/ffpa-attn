@@ -65,7 +65,7 @@ By leveraging this approach, we can achieve improved performance for large headd
 
 |Complexity| FFPA L1 |  FFPA L2 |  FFPA L3 | FlashAttention-2 | 
 |:---:|:---:|:---:|:---:|:---:| 
-|SRAM | O(Brx16)~O(1) | O(Brx16)~O(1) | O(Brx16)~O(1) | ~O((3~4)xBrxd), QKVO |
+|SRAM | O(Brx16)~O(1) | O(Brx16)~O(1) | O(Brx16)~O(1) | ~O(3xBrxd), QKV |
 |Register | O(d/4) | O((Bc/16)x4+Cx2)~O(1)|O((Bc/16)x4+Cx2)~O(1)| ~O(d/2), SO |
 
 ## 📖 Prerequisites
