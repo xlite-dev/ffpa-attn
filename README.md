@@ -96,11 +96,11 @@ L1: level 1, O(Brx16)~O(1) SRAM complexity, O(d/4) register complexity, the same
 
 |Algorithm|320|384|448|512|576|640|704|768|832|896|960|1024|    
 |:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|  
-|SDPA EA|
-|FFPA L1`*`|
-|Speedup| 
-|FFPA L1`^`|
-|Speedup|
+|SDPA EA|56T|63T|57T|58T|55T|56T|54T|55T|54T|55T|54T|56T|
+|FFPA L1`*`|99T|95T|95T|93T|94T|92T|92T|90T|89T|90T|90T|89T|
+|Speedup|1.77x|1.49x|1.64x|1.58x|1.72x|1.65x|1.68x|1.63x|1.64x|1.63x|1.67x|1.58x| 
+|FFPA L1`^`|96T|99T|100T|92T|93T|92T|93T|91T|90T|90T|88T|91T|
+|Speedup|1.71x|1.55x|1.73x|1.56x|1.69x|1.65x|1.71x|1.64x|1.65x|1.63x|1.62x|1.62x|
 
 - 📚 NVIDIA RTX 4090 (`*`=MMA Acc F32, `^`=MMA Acc F16, `T`=TFLOPS)
 
