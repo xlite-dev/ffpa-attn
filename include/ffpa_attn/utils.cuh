@@ -16,7 +16,6 @@
 #define WARP_SIZE 32
 
 namespace ffpa {
-namespace utils {
 
 __device__ __host__ inline 
 int div_ceil(int a, int b) { return (a % b != 0) ? (a / b + 1) : (a / b); }
@@ -72,7 +71,6 @@ __device__ inline void fill_1D_regs(T (&S)[M], T val) {
   }
 }
 
-} // utils
 } // ffpa
 
 #ifdef FFPA_MMA_DEBUG

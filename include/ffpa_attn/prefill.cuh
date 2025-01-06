@@ -1,4 +1,3 @@
-// prefill utils: QKV g2s funcs, rescale/softmax funcs etc.
 #pragma once
 #include <stdio.h>
 #include <stdlib.h>
@@ -14,6 +13,7 @@
 
 namespace ffpa {
 namespace prefill {
+// prefill utils: prefetch/load QKV g2s funcs, rescale/softmax funcs etc.
 
 } // prefill 
 } // ffpa
