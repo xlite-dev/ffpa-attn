@@ -1,15 +1,8 @@
-#include "mma_utils.cuh"
-#include "smem_swizzle.cuh"
+#include "ffpa_attn/deprecated/mma_utils.cuh"
+#include "ffpa_attn/deprecated/smem_swizzle.cuh"
 
 // Split Q across MMA(Warps) and keep access KV for all MMA(Warps),
 // in order to reduce the comm between warps via smem and warp shuffle.
-
-// MMA = m16n8k16, Br=16x4=64, Bc=8x8=64, layout: 4 warps
-// |   64x64   |      warp_KV 0       |
-// | warp_QP 0 | MMA 0 ... MMA 0 (x8) |
-// | warp_QP 1 | MMA 1 ... MMA 1 (x8) |
-// | warp_QP 2 | MMA 2 ... MMA 2 (x8) |
-// | warp_QP 3 | MMA 3 ... MMA 3 (x8) |
 
 // MMA = m16n8k16, Br=16x8=128, Bc=8x16=128, layout: 8 warps
 // |  128x128  |      warp_KV 0        |
@@ -21,17 +14,6 @@
 // | warp_QP 5 | MMA 5 ... MMA 5 (x16) |
 // | warp_QP 6 | MMA 6 ... MMA 6 (x16) |
 // | warp_QP 7 | MMA 7 ... MMA 7 (x16) |
-
-// MMA = m16n8k16, Br=16x8=128, Bc=8x8=64, layout: 8 warps
-// |  128x64  |      warp_KV 0        |
-// | warp_QP 0 | MMA 0 ... MMA 0 (x8) |
-// | warp_QP 1 | MMA 1 ... MMA 1 (x8) |
-// | warp_QP 2 | MMA 2 ... MMA 2 (x8) |
-// | warp_QP 3 | MMA 3 ... MMA 3 (x8) |
-// | warp_QP 4 | MMA 4 ... MMA 4 (x8) |
-// | warp_QP 5 | MMA 5 ... MMA 5 (x8) |
-// | warp_QP 6 | MMA 6 ... MMA 6 (x8) |
-// | warp_QP 7 | MMA 7 ... MMA 7 (x8) |
 
 // FFPA: Faster Flash Prefill Attention, Fine-grained tiling at the MMA level for 
 // all Q@K^T and P@V results in a constant SRAM usage of Br * 16 or Bc * 16 for Q, 

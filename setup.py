@@ -48,7 +48,7 @@ def get_build_cuda_cflags(build_pkg: bool = False):
     extra_cuda_cflags.append("--use_fast_math")
     extra_cuda_cflags.append("-diag-suppress 177" if not build_pkg else "--ptxas-options=-v")
     extra_cuda_cflags.append("-Xptxas -v" if not build_pkg else "--ptxas-options=-O3")
-    extra_cuda_cflags.append(f'-I {this_dir}/csrc')
+    extra_cuda_cflags.append(f'-I {this_dir}/include')
     return extra_cuda_cflags
 
 

@@ -7,6 +7,7 @@
 // [INFO]      --> col major ZigZag permuted -->                  |
 // [INFO]      --> Q smem store layout [4][Br][16].               |
 // ----------------------------------------------------------------
+#pragma once
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
