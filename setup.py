@@ -95,7 +95,7 @@ ext_modules.append(
             "nvcc": get_build_cuda_cflags(build_pkg=True) + generator_flag + cc_flag,
         },
         include_dirs=[
-            Path(this_dir) / "csrc" ,
+            Path(this_dir) / "include" ,
         ],
     )
 )
