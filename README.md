@@ -64,7 +64,7 @@ By leveraging this approach, we can achieve improved performance for large headd
 ## 📖 Prerequisites
 <div id="prerequisites"></div>  
 
-- PyTorch >= 2.4.0, CUDA >= 12.0
+- PyTorch >= 2.4.0, CUDA >= 12.4
 - Recommended: PyTorch 2.5.1, CUDA 12.5
 
 ## 📖 Installation  
