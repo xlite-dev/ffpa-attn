@@ -20,7 +20,7 @@
 |✔️|✔️|✔️|✔️|
 |Tile Warp (More Values) |Multi Stages |Collective Store (Shfl)|**Split Q**|
 |✔️|✔️|✔️|✔️|
-|**QKV Fine-grained Tiling**|**Shared QKV** SMEM|**Prefetch K/V** g2s| **FFPA L1 Level**|
+|**QKV Fine-grained Tiling**|**Shared QKV** SMEM|**Prefetch K/V** g2s| **FFPA L1 **|
 |✔️|✔️|✔️|✔️|
 
 NOTE: This project is still in its early development stages and currently provides a few experimental kernels and benchmarks for reference. More benchmarks and features (🔑️FFPA L2/L3 & more devices) data will be added over time as the project continues to develop. 
