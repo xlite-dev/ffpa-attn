@@ -61,12 +61,13 @@ We have named this new attention tiling technique **FFPA: Faster Flash Prefill A
 - [ ] 📚L2: level 2, O(Brx16)~O(1) SRAM complexity, O(1) register complexity + Q@K^T recomputation.  
 - [ ] 📚L3: level 3, O(Brx16)~O(1) SRAM complexity, O(1) register complexity + scaling O via HBM offloading. 
 
-By leveraging this approach, we can achieve better performance for large headdim (D > 256) through a balanced utilization of FlashAttention (which is not designed to support D > 256) and SDPA EA. Approximate SRAM and Register complexity analysis for FFPA L1~L3 levels is as follows: (`d`=headdim,`C,Br,Bc`=Constant) 👇
+By leveraging this approach, we can achieve better performance for large headdim (D > 256) through a balanced utilization of FlashAttention (which is not designed to support D > 256) and SDPA EA. Approximate SRAM and Register complexity analysis for FFPA L1~L3 levels and FA2 is as follows: (`d`=headdim,`C,Br,Bc`=Constant) 👇
 
 |📚Complexity| 📚FFPA L1 |  📚FFPA L2 |  📚FFPA L3 | 📚FlashAttention | 
 |:---:|:---:|:---:|:---:|:---:| 
 |SRAM | O(Brx16)~O(1) | O(Brx16)~O(1) | O(Brx16)~O(1) | ~O(3xBrxd), QKV |
 |Register | O(d/4) | O((Bc/16)x4+Cx2)~O(1)|O((Bc/16)x4+Cx2)~O(1)| ~O(d/2), SO |
+|HBM| =FA2 | =FA2 | =FA2 | =FA2 |
 
 ## 📖 Prerequisites
 <div id="prerequisites"></div>  
