@@ -124,7 +124,7 @@ export TORCH_CUDA_ARCH_LIST=Ada # for Ada only
 export TORCH_CUDA_ARCH_LIST=Ampere # for Ampere only
 python3 tests/test.py --B 1 --H 48 --N 8192 --show-all --D 320 
 ```
-- 📚 case: B=1, H=48, N=8192, D=320(FA2 not supported), device=NVIDIA RTX 4090.
+- 📚 case: B=1, H=48, N=8192, D=320(FA2 not supported), Device=NVIDIA RTX 4090.
 ```bash
 python3 tests/test.py --B 1 --H 48 --N 8192 --show-all --D 320
 ------------------------------------------------------------------------------------------------------------------------------------------------------
