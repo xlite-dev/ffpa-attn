@@ -289,6 +289,11 @@ def run_benchmark(perf_func: callable,
     out_val.append(out_val_last[-1])
     out_val = [f"{v:<12}" for v in out_val]
 
+    if SDPA_TFLOPS > 0:
+        speedup_sdpa = (TFLOPS/ SDPA_TFLOPS)
+    else:
+        speedup_sdpa = 1.0
+
     # caculate TFLOPS improved.
     if TFLOPS > MAX_TFLOPS:
         if MAX_TFLOPS > 0:
@@ -296,17 +301,15 @@ def run_benchmark(perf_func: callable,
             improve = round(improve, 2)
         else:
             improve = 0
-        if SDPA_TFLOPS > 0:
-            speedup_sdpa = (TFLOPS/ SDPA_TFLOPS)
-        else:
-            speedup_sdpa = 1.0
+        
         MAX_TFLOPS = TFLOPS
         print(f"{out_info:>25}: {out_val}, time:{str(mean_time)[:8]}ms, "
               f"TFLOPS:{TFLOPS:<6.2f}(+{improve:<5.2f}%)(~{speedup_sdpa:<4.2f}x)")
     else:
+        improve = 0
         if (not only_show_improved) or (("flash" in tag) or ("sdpa" in tag)):
             print(f"{out_info:>25}: {out_val}, time:{str(mean_time)[:8]}ms, "
-                  f"TFLOPS:{TFLOPS:<6.2f}")
+                  f"TFLOPS:{TFLOPS:<6.2f}(+{improve:<5.2f}%)(~{speedup_sdpa:<4.2f}x)")
             
     if show_matrix: print(out)
     time.sleep(args.sleep)
