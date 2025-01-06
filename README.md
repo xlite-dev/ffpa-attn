@@ -117,7 +117,7 @@ L1: level 1, O(Brx16)~O(1) SRAM complexity, O(d/4) register complexity, the same
 ## 📖 Python Testing 
 <div id="python-test"></div>  
 
-👇👀 You can test many custom FFPA kernels via Python script and figure out the difference in their performance.
+👇 You can test many custom FFPA kernels via Python and figure out the difference in their performance.
 ```bash
 # You can test Ada or Ampere only, also, Volta, Ampere, Ada, Hopper, ...
 export TORCH_CUDA_ARCH_LIST=Ada # for Ada only
