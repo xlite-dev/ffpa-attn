@@ -65,7 +65,7 @@ By leveraging this approach, we can achieve better performance for large headdim
 
 |📚Complexity| 📚FFPA L1 |  📚FFPA L2 |  📚FFPA L3 | 📚FlashAttention |
 |:---:|:---:|:---:|:---:|:---:|
-|SRAM | O(Brx16)≈O(1) | O(2xBrx16)≈O(1) | O(2xBrx16)≈O(1) | ≈O(3xBrxd), QKV |
+|SRAM | O(2xBrx16)≈O(1) | O(2xBrx16)≈O(1) | O(2xBrx16)≈O(1) | ≈O(3xBrxd), QKV |
 |Register | ≈O(d/4) | O((Bc/16)x4+Cx2)≈O(1)|O((Bc/16)x4+Cx2)≈O(1)| ≈O(d/2), SO |
 |HBM| ≈FA2 | ≈FA2 | ≈FA2 | =FA2 |
 
