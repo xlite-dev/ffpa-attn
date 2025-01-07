@@ -1,14 +1,15 @@
-from .version import __version__
 from .interface import (
+    faster_prefill_attn_func,
     ffpa,
-    LevelType, 
-    MMAAccType,
-    ffpa_acc_f32_L1, 
     ffpa_acc_f16_L1,
-    ffpa_mma_acc_f16_L1, 
+    ffpa_acc_f32_L1,
+    ffpa_mma_acc_f16_L1,
     ffpa_mma_acc_f32_L1,
-    faster_prefill_attn_func, 
+    LevelType,
+    MMAAccType,
 )
+from .version import __version__
+
 
 # e.g pyffpa.L1
 L1 = LevelType.L1
