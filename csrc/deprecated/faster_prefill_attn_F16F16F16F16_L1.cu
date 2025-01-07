@@ -1,5 +1,5 @@
-#include "ffpa_attn/deprecated/mma_utils.cuh"
-#include "ffpa_attn/deprecated/smem_swizzle.cuh"
+#include "cuffpa/deprecated/mma_utils.cuh"
+#include "cuffpa/deprecated/smem_swizzle.cuh"
 
 // Split Q across MMA(Warps) and keep access KV for all MMA(Warps),
 // in order to reduce the comm between warps via smem and warp shuffle.

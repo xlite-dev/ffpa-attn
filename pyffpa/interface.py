@@ -37,13 +37,5 @@ def faster_prefill_attn_func(q: torch.Tensor,
 
 
 ffpa: callable = faster_prefill_attn_func  
-
-
-faster_prefill_attn_acc_f32_L1 = partial(faster_prefill_attn_func, 
-                                         level=LevelType.L1,
-                                         acc=MMAAccType.FP32)
-
-
-faster_prefill_attn_acc_f16_L1 = partial(faster_prefill_attn_func, 
-                                         level=LevelType.L1, 
-                                         acc=MMAAccType.FP16)
+ffpa_acc_f32_L1 = partial(faster_prefill_attn_func, level=LevelType.L1, acc=MMAAccType.FP32)
+ffpa_acc_f16_L1 = partial(faster_prefill_attn_func, level=LevelType.L1, acc=MMAAccType.FP16)

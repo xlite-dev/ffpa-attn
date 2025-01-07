@@ -3,11 +3,11 @@ from .interface import (
     ffpa,
     LevelType, 
     MMAAccType,
+    ffpa_acc_f32_L1, 
+    ffpa_acc_f16_L1,
     ffpa_mma_acc_f16_L1, 
     ffpa_mma_acc_f32_L1,
     faster_prefill_attn_func, 
-    faster_prefill_attn_acc_f32_L1, 
-    faster_prefill_attn_acc_f16_L1
 )
 
 # e.g pyffpa.L1
