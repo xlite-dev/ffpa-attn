@@ -4,7 +4,7 @@ from pathlib import Path
 
 import torch
 from packaging.version import parse, Version
-from pyffpa import __version__
+from pyffpa.version import __version__
 from setuptools import find_packages, setup
 from torch.utils.cpp_extension import BuildExtension, CUDA_HOME, CUDAExtension
 
