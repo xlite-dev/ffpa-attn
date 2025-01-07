@@ -1,3 +1,4 @@
+# benchmarks
 python3 tests/test.py --B 1 --H 48 --N 8192 --show-all --D 320 
 python3 tests/test.py --B 1 --H 48 --N 8192 --show-all --D 384
 python3 tests/test.py --B 1 --H 48 --N 8192 --show-all --D 448
