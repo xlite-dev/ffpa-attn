@@ -142,7 +142,7 @@ L1: level 1, O(Brx16)~O(1) SRAM complexity, O(d/4) register complexity, the same
 # You can test Ada or Ampere only, also, Volta, Ampere, Ada, Hopper, ...
 export TORCH_CUDA_ARCH_LIST=Ada # for Ada only
 export TORCH_CUDA_ARCH_LIST=Ampere # for Ampere only
-python3 tests/test.py --B 1 --H 48 --N 8192 --show-all --D 320
+cd tests && python3 test.py --B 1 --H 48 --N 8192 --show-all --D 320
 ```
 - 📚 case: B=1, H=48, N=8192, D=320(FA2 not supported), Device=NVIDIA RTX 4090.
 ```bash
