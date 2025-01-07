@@ -1,27 +1,8 @@
-#include "mma_utils.cuh"
-#include "smem_swizzle.cuh"
+#include "cuffpa/deprecated/mma_utils.cuh"
+#include "cuffpa/deprecated/smem_swizzle.cuh"
 
 // Split Q across MMA(Warps) and keep access KV for all MMA(Warps),
 // in order to reduce the comm between warps via smem and warp shuffle.
-
-// MMA = m16n8k16, Br=16x4=64, Bc=8x8=64, layout: 4 warps
-// |   64x64   |      warp_KV 0       |
-// | warp_QP 0 | MMA 0 ... MMA 0 (x8) |
-// | warp_QP 1 | MMA 1 ... MMA 1 (x8) |
-// | warp_QP 2 | MMA 2 ... MMA 2 (x8) |
-// | warp_QP 3 | MMA 3 ... MMA 3 (x8) |
-
-// MMA = m16n8k16, Br=16x8=128, Bc=8x16=128, layout: 8 warps
-// |  128x128  |      warp_KV 0        |
-// | warp_QP 0 | MMA 0 ... MMA 0 (x16) |
-// | warp_QP 1 | MMA 1 ... MMA 1 (x16) |
-// | warp_QP 2 | MMA 2 ... MMA 2 (x16) |
-// | warp_QP 3 | MMA 3 ... MMA 3 (x16) |
-// | warp_QP 4 | MMA 4 ... MMA 4 (x16) |
-// | warp_QP 5 | MMA 5 ... MMA 5 (x16) |
-// | warp_QP 6 | MMA 6 ... MMA 6 (x16) |
-// | warp_QP 7 | MMA 7 ... MMA 7 (x16) |
-
 // MMA = m16n8k16, Br=16x8=128, Bc=8x8=64, layout: 8 warps
 // |  128x64  |      warp_KV 0        |
 // | warp_QP 0 | MMA 0 ... MMA 0 (x8) |
@@ -54,7 +35,7 @@ template<
          const int kWarpTileSeqLenK,      // 8, more values, N, Bc=8*8 =64, matmul N
          const int kWarpTileSeqLenP,      // 1, more values, M, Br=64*1=64, matmul M
          const int kWarpTileHeadDimV,     // 8, more values, N, d=8*(1|2|3|4|...)=8|...|32|64|96|128|...
-         const int kOStorageAccFloat32,   // 0/1, MMA Acc always be fp16, but O storage can be fp32 or half.
+         const int kOStorageAccFloat32,   // 0/1, MMA Acc always be fp32, but O storage can be fp32 or half.
          const int kStage,                // 1,2
          const int kPadQ,                 // Pad Q/K/V 0,8
          const int kPadK,             
@@ -62,7 +43,7 @@ template<
          >
 __global__ void __launch_bounds__(
   WARP_SIZE * kMmaTileSeqLenQ * kMmaTileSeqLenK) 
-ffpa_mma_stages_split_q_kernel_acc_f16_L1(half* Q, 
+ffpa_mma_stages_split_q_acc_f32_L1_kernel(half* Q, 
                                           half* K, 
                                           half* V, 
                                           half* O, 
@@ -90,11 +71,9 @@ ffpa_mma_stages_split_q_kernel_acc_f16_L1(half* Q,
   constexpr int Bc = kMmaAtomN * kMmaTileSeqLenK * kWarpTileSeqLenK; //  8*1*8=64
   static_assert(Br >= Bc); // for shared memory reuse.
   constexpr int kNumThreads = WARP_SIZE * kMmaTileSeqLenQ * kMmaTileSeqLenK; // 32*4*1=128, num threads
-  // Now, N must be mutliples of Bc(32/64) for KV tiling across seqlen.
   const int Tc = div_ceil(QKV_seqlen, Bc); // Tc K_tile[Bc,d]
   const float scale = 1.0f / sqrt((float) kHeadDim);
   
-  // grid(div_ceil(QKV_seqlen, Br), QKV_batch * QKV_head), (x,y,z)
   const int QKV_batch_id = blockIdx.y / QKV_head; // Batch size
   const int QKV_head_id  = blockIdx.y % QKV_head; // Head num
   const int Q_tile_id    = blockIdx.x;            // Q tile_id, range [0, Tr]
@@ -139,7 +118,7 @@ ffpa_mma_stages_split_q_kernel_acc_f16_L1(half* Q,
   constexpr int K_tile_size = Bc * (kMmaAtomK     + kPadK); // K[Bc,16]
   constexpr int V_tile_size = Bc * (kMmaAtomN * 2 + kPadV); // V[Bc,16]
   half* Q_tile_smem = smem; 
-  half* K_tile_smem = Q_tile_smem + kStage * Q_tile_size; 
+  half* K_tile_smem = Q_tile_smem + kStage * Q_tile_size;
   half* V_tile_smem = Q_tile_smem; // V may reuse all Q+K smem after Q@K^T.
   uint32_t smem_Q_base_ptr = __cvta_generic_to_shared(Q_tile_smem);
   uint32_t smem_K_base_ptr = __cvta_generic_to_shared(K_tile_smem);
@@ -153,14 +132,13 @@ ffpa_mma_stages_split_q_kernel_acc_f16_L1(half* Q,
   fill_2D_regs<float, kWarpTileSeqLenQ, 2>(lane_block_row_sum_old, 0.0f);
 
   // ---------------------- Registers for S=Q@K^T/O=P@V ----------------------------
-  // registers for QKV, S=Q[Br,d]@K[Bc,d]=[Br,Bc] and O=P[Br,Bc]@V[Bc,d]=[Br,d].
   uint32_t R_Q[kWarpTileSeqLenQ][ 4]; // [1][4]
   uint32_t R_K[kWarpTileSeqLenK][ 2]; // [8][2]
   uint32_t R_V[2]; // [2], S=Q@K, only use 2 32bits registers.
-  uint32_t R_S[kWarpTileSeqLenQ][kWarpTileSeqLenK][ 2]; // [1][8][2], acc fp16.
-  uint32_t R_O[2]; // registers for O=PV[Br,d]=P@V, [4], only use 2 32bits registers.
+  uint32_t R_S[kWarpTileSeqLenQ][kWarpTileSeqLenK][ 4]; // [1][8][4], acc f32.
+  uint32_t R_O[4]; // registers for O=PV[Br,d]=P@V, [4], only use 4 32bits registers.
   // registers final Output [D]=final rescale(R_O), kOStorageAccFloat32 
-  // 0/1, MMA Acc always be fp16, but O storage(R_D) can be fp32 or half.
+  // 0/1, MMA Acc always be fp32, but O storage(R_D) can be fp32 or half.
   // FP16 can provide precision to approximately 3-4 decimal places. Thus, if the 
   // error does not exceed 1e-3, using FP16 storage is sufficient for most applications.
   uint32_t R_D[kWarpTileSeqLenP][kWarpTileHeadDimV][(kOStorageAccFloat32) ? 4 : 2]; 
@@ -224,7 +202,7 @@ ffpa_mma_stages_split_q_kernel_acc_f16_L1(half* Q,
     // NOTE: K[Bc,d] with row major means K^T[d,Bc] in col major.
     // S_tile[Br,Bc]=Q_tile[Br,d]@K[Bc,d]
     // <HGEMM in shared memory>
-    fill_3D_regs<uint32_t, kWarpTileSeqLenQ, kWarpTileSeqLenK, 2>(R_S, 0);
+    fill_3D_regs<uint32_t, kWarpTileSeqLenQ, kWarpTileSeqLenK, 4>(R_S, 0);
     #pragma unroll
     for (int tile_K_d = 0; tile_K_d < (kHeadDim / kMmaAtomK); ++tile_K_d) {
       // s2 tn 0->0, 1->1, 2->0; s3 tn 0->0, 1->1, 2->2, 3->0;
@@ -326,12 +304,12 @@ ffpa_mma_stages_split_q_kernel_acc_f16_L1(half* Q,
         int lane_smem_Q_Br = warp_smem_Q_Br + lane_id % 16; // 0~15
         int lane_smem_Q_d  = (lane_id / 16) * 8; // 0,8
         uint32_t lane_smem_Q_ptr = (
-          smem_Q_base_ptr + (smem_sel * Q_tile_size + 
-                             lane_smem_Q_Br * (kMmaAtomK + kPadQ) + 
-                            (kSwizzleQ ? swizzle_permuted_j<kMmaAtomK>(
-                             lane_smem_Q_Br, lane_smem_Q_d): 
-                             lane_smem_Q_d )
-                            ) * sizeof(half)
+            smem_Q_base_ptr + (smem_sel * Q_tile_size + 
+                               lane_smem_Q_Br * (kMmaAtomK + kPadQ) + 
+                              (kSwizzleQ ? swizzle_permuted_j<kMmaAtomK>(
+                               lane_smem_Q_Br, lane_smem_Q_d): 
+                               lane_smem_Q_d )
+                              ) * sizeof(half)
         );
         LDMATRIX_X4(R_Q[0][0], R_Q[0][1], R_Q[0][2], R_Q[0][3], 
                     lane_smem_Q_ptr); // now, R_Q[1][4]
@@ -347,12 +325,12 @@ ffpa_mma_stages_split_q_kernel_acc_f16_L1(half* Q,
         int lane_smem_K_Bc = warp_smem_K_Bc + lane_id % 8; // 0~7
         int lane_smem_K_d  = ((lane_id / 8) % 2) * 8; // 0,8
         uint32_t lane_smem_K_ptr = (
-          smem_K_base_ptr + (smem_sel * K_tile_size + 
-                             lane_smem_K_Bc * (kMmaAtomK + kPadK) + 
-                            (kSwizzleK ? swizzle_permuted_j<kMmaAtomK>(
-                             lane_smem_K_Bc, lane_smem_K_d): 
-                             lane_smem_K_d )
-                            ) * sizeof(half)
+            smem_K_base_ptr + (smem_sel * K_tile_size + 
+                               lane_smem_K_Bc * (kMmaAtomK + kPadK) + 
+                              (kSwizzleK ? swizzle_permuted_j<kMmaAtomK>(
+                               lane_smem_K_Bc, lane_smem_K_d): 
+                               lane_smem_K_d )
+                              ) * sizeof(half)
         );
         LDMATRIX_X2(R_K[j][0], R_K[j][1], lane_smem_K_ptr); // R_K
       } // end for kWarpTileSeqLenK
@@ -367,10 +345,11 @@ ffpa_mma_stages_split_q_kernel_acc_f16_L1(half* Q,
       { // kWarpTileSeqLenQ = 1
         #pragma unroll
         for (int j = 0; j < kWarpTileSeqLenK; ++j) { // 8, 16, 32, ...
-          HMMA16816(R_S[0][j][0], R_S[0][j][1],
-                    R_Q[0][0],    R_Q[0][1],    R_Q[0][2],    R_Q[0][3], 
-                    R_K[j][0],    R_K[j][1], 
-                    R_S[0][j][0], R_S[0][j][1]);
+          // MMA always accumulate with F32 dtype for high precision.
+          HMMA16816F32(R_S[0][j][0], R_S[0][j][1], R_S[0][j][2], R_S[0][j][3],
+                       R_Q[0][0],    R_Q[0][1],    R_Q[0][2],    R_Q[0][3], 
+                       R_K[j][0],    R_K[j][1], 
+                       R_S[0][j][0], R_S[0][j][1], R_S[0][j][2], R_S[0][j][3]);
         }
       }
 
@@ -416,10 +395,12 @@ ffpa_mma_stages_split_q_kernel_acc_f16_L1(half* Q,
         // 10       ...
         // ...
         // 15       T28: {c2, c3}  T29: {c2, c3}  T30: {c2, c3}  T31: {c2, c3}
-        half* t_hptr_S_0_1 = reinterpret_cast<half*>(&(R_S[0][j][0])); 
+        // R_S[][][4] 4 32bit registers with each contains 1 F32 element.
+        // (x,y) 0~7->{c0, c1}, (z,w)->8~15 {c2, c3}
+        float* t_fptr_S_0_1 = reinterpret_cast<float*>(&(R_S[0][j][0])); 
         // This should be the row max after S = (Q @ K^T) / sqrt(d)
-        float tmp_max_0 = __half2float(__hmax(t_hptr_S_0_1[0], t_hptr_S_0_1[1])) * scale;
-        float tmp_max_1 = __half2float(__hmax(t_hptr_S_0_1[2], t_hptr_S_0_1[3])) * scale;
+        float tmp_max_0 = max(t_fptr_S_0_1[0], t_fptr_S_0_1[1]) * scale;
+        float tmp_max_1 = max(t_fptr_S_0_1[2], t_fptr_S_0_1[3]) * scale;
         lane_row_max_new[0][0] = max(lane_row_max_new[0][0], tmp_max_0);
         lane_row_max_new[0][1] = max(lane_row_max_new[0][1], tmp_max_1);
       } // end for kWarpTileSeqLenK
@@ -448,24 +429,23 @@ ffpa_mma_stages_split_q_kernel_acc_f16_L1(half* Q,
 
       #pragma unroll
       for (int j = 0; j < kWarpTileSeqLenK; ++j) {
-        half* t_hptr_S_0_1 = reinterpret_cast<half*>(&(R_S[0][j][0])); 
-        // P = Exp(S - m_new), fmaf(x, y, z) = x * y + z;
-        float4 t_reg_S_0_1;
-        t_reg_S_0_1.x = __expf(__fmaf_rn(
-          __half2float(t_hptr_S_0_1[0]), scale, - block_row_max_new_0));
-        t_reg_S_0_1.y = __expf(__fmaf_rn(
-          __half2float(t_hptr_S_0_1[1]), scale, - block_row_max_new_0));
-        t_reg_S_0_1.z = __expf(__fmaf_rn(
-          __half2float(t_hptr_S_0_1[2]), scale, - block_row_max_new_1));
-        t_reg_S_0_1.w = __expf(__fmaf_rn(
-          __half2float(t_hptr_S_0_1[3]), scale, - block_row_max_new_1));
-        lane_row_sum_new[0][0] += (t_reg_S_0_1.x + t_reg_S_0_1.y);
-        lane_row_sum_new[0][1] += (t_reg_S_0_1.z + t_reg_S_0_1.w);
+        // R_S[][][4] 4 32bit registers with each contains 1 F32 element.
+        // (x,y) 0~7->{c0, c1}, (z,w)->8~15 {c2, c3}
+        float* t_fptr_S_0_1 = reinterpret_cast<float*>(&(R_S[0][j][0])); 
+        half*  t_hptr_S_0_1 = reinterpret_cast< half*>(&(R_S[0][j][0])); 
+        // P = Exp(S - m_new), fmaf(x, y, z) = x * y + z in registers;
+        t_fptr_S_0_1[0] = __expf(__fmaf_rn(t_fptr_S_0_1[0], scale, - block_row_max_new_0));
+        t_fptr_S_0_1[1] = __expf(__fmaf_rn(t_fptr_S_0_1[1], scale, - block_row_max_new_0));
+        t_fptr_S_0_1[2] = __expf(__fmaf_rn(t_fptr_S_0_1[2], scale, - block_row_max_new_1));
+        t_fptr_S_0_1[3] = __expf(__fmaf_rn(t_fptr_S_0_1[3], scale, - block_row_max_new_1));
+        lane_row_sum_new[0][0] += (t_fptr_S_0_1[0] + t_fptr_S_0_1[1]);
+        lane_row_sum_new[0][1] += (t_fptr_S_0_1[2] + t_fptr_S_0_1[3]);
         // Update R_S for P[Br,Bc] = Exp(S-m), point wise.
-        t_hptr_S_0_1[0] = __float2half_rn(t_reg_S_0_1.x);
-        t_hptr_S_0_1[1] = __float2half_rn(t_reg_S_0_1.y);
-        t_hptr_S_0_1[2] = __float2half_rn(t_reg_S_0_1.z);
-        t_hptr_S_0_1[3] = __float2half_rn(t_reg_S_0_1.w);
+        // Also convert F32 -> half for P@V MMA, reuse R_S as P.
+        t_hptr_S_0_1[0] = __float2half_rn(t_fptr_S_0_1[0]);
+        t_hptr_S_0_1[1] = __float2half_rn(t_fptr_S_0_1[1]);
+        t_hptr_S_0_1[2] = __float2half_rn(t_fptr_S_0_1[2]);
+        t_hptr_S_0_1[3] = __float2half_rn(t_fptr_S_0_1[3]);
       } // end for kWarpTileSeqLenK
 
       // Warp level reduce sum, warp_size = 4
@@ -552,7 +532,7 @@ ffpa_mma_stages_split_q_kernel_acc_f16_L1(half* Q,
       #pragma unroll
       for (int j = 0; j < kWarpTileHeadDimV; ++j) { // 8, 16, 32, ...
         // Compute d tile, P[Br,Bc]@V[Bc,16] = O[Br,16]
-        fill_1D_regs<uint32_t, 2>(R_O, 0); // must clear 
+        fill_1D_regs<uint32_t, 4>(R_O, 0); // must clear 
 
         int smem_sel_v = (j / 2) % kStage;   
         int smem_sel_v_next = ((j / 2) + (kStage - 1)) % kStage;
@@ -608,9 +588,9 @@ ffpa_mma_stages_split_q_kernel_acc_f16_L1(half* Q,
         #pragma unroll
         for (int tile_V_Bc = 0; tile_V_Bc < (Bc / kMmaAtomK); ++tile_V_Bc) {
           // Load k16n8 V from smem [Bc,8*2] -> regs, R_V, ldmatrix.x2.trans.
-          int warp_smem_V_d  = warp_KV * (kMmaAtomN * kWarpTileHeadDimV) + (j % 2) * kMmaAtomN; // d, matmaul N
+          int warp_smem_V_d  = warp_KV * (kMmaAtomN * kWarpTileHeadDimV) + (j % 2) * kMmaAtomN; 
           int lane_smem_V_Bc = tile_V_Bc * kMmaAtomK + lane_id % 16; // 0~15; Bc, matmul K
-          int lane_smem_V_d  = warp_smem_V_d; // 0
+          int lane_smem_V_d  = warp_smem_V_d; // (j % 2) * kMmaAtomN 0, 8
           uint32_t lane_smem_V_ptr = (
             smem_V_base_ptr + (smem_sel_v * V_tile_size + 
                                lane_smem_V_Bc * (kMmaAtomN * 2 + kPadV) + 
@@ -633,10 +613,11 @@ ffpa_mma_stages_split_q_kernel_acc_f16_L1(half* Q,
           // tile_V_Bc = 2, all curr MMAs(0~4) need slice P[:, 32:48], 4, 5; stored in all MMAs. 
           // tile_V_Bc = 3, all curr MMAs(0~4) need slice P[:, 48:64], 6, 7; stored in all MMAs. 
           int w = tile_V_Bc * 2; // MMA(Warp) selected, 0, 2, 4, 6
-          HMMA16816(R_O[0], R_O[1],
-                    R_S[0][w][0], R_S[0][w][1], R_S[0][w + 1][0],  R_S[0][w + 1][1], 
-                    R_V[0], R_V[1],
-                    R_O[0], R_O[1]); 
+          // MMA always accumulate with F32 dtype for high precision.
+          HMMA16816F32(R_O[0], R_O[1], R_O[2], R_O[3],
+                       R_S[0][w][0], R_S[0][w][1], R_S[0][w + 1][0],  R_S[0][w + 1][1], 
+                       R_V[0], R_V[1],
+                       R_O[0], R_O[1], R_O[2], R_O[3]); 
         } // end for V Bc.
         if constexpr (kStage < 2) {
           // Wait curr P@V tile ready if kStage < 2 in order to avoid 
@@ -649,28 +630,24 @@ ffpa_mma_stages_split_q_kernel_acc_f16_L1(half* Q,
         // m = max(m_old, m_new), O_new[Br,d] = exp(m_old - m) * O_old + P@V
         // use exp(m_old - m_new), not 1/(m_old - m_new).
         // O_new[Br,d] = exp(m_old - m_new) * O_old + P@V
-        half* t_hptr_O_0_1 = reinterpret_cast<half*>(&(R_O[0])); 
+        float* t_fptr_O_0_1 = reinterpret_cast<float*>(&(R_O[0])); 
         if constexpr (kOStorageAccFloat32) {
           // (x,y) 0~7->{c0, c1}, (z,w)->8~15 {c2, c3}
           float* t_fptr_D_0_1 = reinterpret_cast<float*>(&(R_D[0][j][0])); // kWarpTileSeqLenP=1
-          t_fptr_D_0_1[0] = __fmaf_rn(
-            rescale_o_factor_0, t_fptr_D_0_1[0], __half2float(t_hptr_O_0_1[0]));
-          t_fptr_D_0_1[1] = __fmaf_rn(
-            rescale_o_factor_0, t_fptr_D_0_1[1], __half2float(t_hptr_O_0_1[1]));
-          t_fptr_D_0_1[2] = __fmaf_rn(
-            rescale_o_factor_1, t_fptr_D_0_1[2], __half2float(t_hptr_O_0_1[2]));
-          t_fptr_D_0_1[3] = __fmaf_rn(
-            rescale_o_factor_1, t_fptr_D_0_1[3], __half2float(t_hptr_O_0_1[3]));
+          t_fptr_D_0_1[0] = __fmaf_rn(rescale_o_factor_0, t_fptr_D_0_1[0], t_fptr_O_0_1[0]);
+          t_fptr_D_0_1[1] = __fmaf_rn(rescale_o_factor_0, t_fptr_D_0_1[1], t_fptr_O_0_1[1]);
+          t_fptr_D_0_1[2] = __fmaf_rn(rescale_o_factor_1, t_fptr_D_0_1[2], t_fptr_O_0_1[2]);
+          t_fptr_D_0_1[3] = __fmaf_rn(rescale_o_factor_1, t_fptr_D_0_1[3], t_fptr_O_0_1[3]);
         } else {
-          half* t_hptr_D_0_1 = reinterpret_cast<half*>(&(R_D[0][j][0])); 
-          t_hptr_D_0_1[0] = __float2half_rn(__fmaf_rn(rescale_o_factor_0, 
-            __half2float(t_hptr_D_0_1[0]), __half2float(t_hptr_O_0_1[0])));
-          t_hptr_D_0_1[1] = __float2half_rn(__fmaf_rn(rescale_o_factor_0, 
-            __half2float(t_hptr_D_0_1[1]), __half2float(t_hptr_O_0_1[1])));
-          t_hptr_D_0_1[2] = __float2half_rn(__fmaf_rn(rescale_o_factor_1, 
-            __half2float(t_hptr_D_0_1[2]), __half2float(t_hptr_O_0_1[2])));
-          t_hptr_D_0_1[3] = __float2half_rn(__fmaf_rn(rescale_o_factor_1, 
-            __half2float(t_hptr_D_0_1[3]), __half2float(t_hptr_O_0_1[3])));
+          half* t_hptr_D_0_1 = reinterpret_cast<half*>(&(R_D[0][j][0])); // kWarpTileSeqLenP=1
+          t_hptr_D_0_1[0] = __float2half_rn(__fmaf_rn(
+            rescale_o_factor_0, __half2float(t_hptr_D_0_1[0]), t_fptr_O_0_1[0]));
+          t_hptr_D_0_1[1] = __float2half_rn(__fmaf_rn(
+            rescale_o_factor_0, __half2float(t_hptr_D_0_1[1]), t_fptr_O_0_1[1]));
+          t_hptr_D_0_1[2] = __float2half_rn(__fmaf_rn(
+            rescale_o_factor_1, __half2float(t_hptr_D_0_1[2]), t_fptr_O_0_1[2]));
+          t_hptr_D_0_1[3] = __float2half_rn(__fmaf_rn(
+            rescale_o_factor_1, __half2float(t_hptr_D_0_1[3]), t_fptr_O_0_1[3]));
         } // end for tile_V_Bc
         // TODO: Write/Load scaled O -> gmem directly for very large d, e.g 4k,8k,...
         // Thus, reduce the registers usage or SRAM size for R_D. Prefetch O 128bits
@@ -764,8 +741,10 @@ ffpa_mma_stages_split_q_kernel_acc_f16_L1(half* Q,
 }
 
 template<const int kHeadDim, const int kStage>
-void launch_ffpa_mma_acc_f16_L1(
-  torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O) {
+void launch_ffpa_mma_acc_f32_L1(torch::Tensor Q, 
+                                torch::Tensor K, 
+                                torch::Tensor V, 
+                                torch::Tensor O) {
   // Q,K,V,O with [B, H, N, D] layout, B=batch, H=head, N=seqlen, D=dim
   // TODO: support BNHD layout, Q,K,V,O with [B, N, H, D] layout.
   // Now: fixed tile BrxBc=128x128 for d>= 128, 64x64 for d<128.
@@ -779,26 +758,22 @@ void launch_ffpa_mma_acc_f16_L1(
   constexpr int kWarpTileSeqLenQ = 1;
   constexpr int kWarpTileSeqLenK = (kHeadDim < 128) ? 8 : 16;
   constexpr int kWarpTileSeqLenP = 1;
-  constexpr int kWarpTileHeadDimV = (kHeadDim / (kMmaAtomN * kMmaTileHeadDimV));
+  constexpr int kWarpTileHeadDimV = (kHeadDim / (kMmaAtomN * kMmaTileHeadDimV)); 
   constexpr int Br = kMmaAtomM * kMmaTileSeqLenQ * kWarpTileSeqLenQ;
   constexpr int Bc = kMmaAtomN * kMmaTileSeqLenK * kWarpTileSeqLenK;
-  constexpr int kNumThreads = WARP_SIZE * kMmaTileSeqLenQ * kMmaTileSeqLenK;
+  constexpr int kNumThreads = WARP_SIZE * kMmaTileSeqLenQ * kMmaTileSeqLenK; 
   // 0 for smem swizzle, > 0 for smem padding.
   constexpr int kPadQ = 0;
   constexpr int kPadK = 0; 
   constexpr int kPadV = 8; // swizzle V seems can not get good performance.
-  // 0/1, MMA Acc always be fp16, but O storage can be fp32 or half.
-  // FP16 can provide precision to approximately 3-4 decimal places.
-  // Thus, if the error does not exceed 1e-3, using FP16 storage is 
-  // sufficient for most applications.
+  // 0/1, MMA Acc always be fp32, but O storage(R_D) can be fp32 or half.
+  // FP16 can provide precision to approximately 3-4 decimal places. Thus, if the 
+  // error does not exceed 1e-3, using FP16 storage is sufficient for most applications.
   constexpr int kOStorageAccFloat32 = (kHeadDim < 256) ? 1 : 0;
   
-  // static int kMaxSramPerBlock;
-  // cudaDeviceGetAttribute(&kMaxSramPerBlock, cudaDevAttrMaxSharedMemoryPerBlock, 0);
   // Calculate SRAM size needed per block, Q,K,V smem size, V shared the QK smem.
   constexpr int QK_smem_size = (kStage * (Br * (kMmaAtomK + kPadQ)) + 
                                 kStage * (Bc * (kMmaAtomK + kPadK)));
-  // Now, for V_smem_size, need fixed smem size, e.g 64*16*2/1024=2M;
   // R_D registers, s=2, d=64, 16 regs; d=128, 32 regs; 
   // d=256, 64 regs; d=512, 128 regs; d=1024, 256 regs;
   constexpr int V_smem_size  = (kStage * (Bc * (kMmaAtomN * 2 + kPadV))); 
@@ -816,7 +791,7 @@ void launch_ffpa_mma_acc_f16_L1(
   dim3 block(kNumThreads); // 4/8 warps per block
 
   cudaFuncSetAttribute(
-    ffpa_mma_stages_split_q_kernel_acc_f16_L1<
+    ffpa_mma_stages_split_q_acc_f32_L1_kernel<
       kHeadDim, 
       kMmaAtomM, 
       kMmaAtomN, 
@@ -839,7 +814,7 @@ void launch_ffpa_mma_acc_f16_L1(
     kQKVSmemMaxSize
   );
 
-  ffpa_mma_stages_split_q_kernel_acc_f16_L1<
+  ffpa_mma_stages_split_q_acc_f32_L1_kernel<
     kHeadDim, 
     kMmaAtomM, 
     kMmaAtomN, 
@@ -867,7 +842,7 @@ void launch_ffpa_mma_acc_f16_L1(
   );
 }
 
-void ffpa_mma_acc_f16_L1(torch::Tensor Q, 
+void ffpa_mma_acc_f32_L1(torch::Tensor Q, 
                          torch::Tensor K, 
                          torch::Tensor V, 
                          torch::Tensor O, 
@@ -878,31 +853,31 @@ void ffpa_mma_acc_f16_L1(torch::Tensor Q,
   CHECK_TORCH_TENSOR_DTYPE(O, torch::kHalf) // O [B,H,N,D]
   const int d = Q.size(3); // B, H, N, d
 
-#define CASE_LAUNCH_KERNEL_F16_L1(D, S)               \
+#define CASE_LAUNCH_KERNEL_F32_L1(D, S)               \
   case D:                                             \
-    launch_ffpa_mma_acc_f16_L1<(D), (S)>(Q, K, V, O); \
+    launch_ffpa_mma_acc_f32_L1<(D), (S)>(Q, K, V, O); \
     break;
 
   if (stages > 1) {
     switch (d)
     {
-      CASE_LAUNCH_KERNEL_F16_L1(32,   2);
-      CASE_LAUNCH_KERNEL_F16_L1(64,   2);
-      CASE_LAUNCH_KERNEL_F16_L1(96,   2);
-      CASE_LAUNCH_KERNEL_F16_L1(128,  2);
-      CASE_LAUNCH_KERNEL_F16_L1(256,  2);
-      CASE_LAUNCH_KERNEL_F16_L1(320,  2);
-      CASE_LAUNCH_KERNEL_F16_L1(384,  2);
-      CASE_LAUNCH_KERNEL_F16_L1(448,  2);
-      CASE_LAUNCH_KERNEL_F16_L1(512,  2);
-      CASE_LAUNCH_KERNEL_F16_L1(576,  2);
-      CASE_LAUNCH_KERNEL_F16_L1(640,  2);
-      CASE_LAUNCH_KERNEL_F16_L1(704,  2);
-      CASE_LAUNCH_KERNEL_F16_L1(768,  2);
-      CASE_LAUNCH_KERNEL_F16_L1(832,  2);
-      CASE_LAUNCH_KERNEL_F16_L1(896,  2);
-      CASE_LAUNCH_KERNEL_F16_L1(960,  2);
-      CASE_LAUNCH_KERNEL_F16_L1(1024, 2);
+      CASE_LAUNCH_KERNEL_F32_L1(32,   2);
+      CASE_LAUNCH_KERNEL_F32_L1(64,   2);
+      CASE_LAUNCH_KERNEL_F32_L1(96,   2);
+      CASE_LAUNCH_KERNEL_F32_L1(128,  2);
+      CASE_LAUNCH_KERNEL_F32_L1(256,  2);
+      CASE_LAUNCH_KERNEL_F32_L1(320,  2);
+      CASE_LAUNCH_KERNEL_F32_L1(384,  2);
+      CASE_LAUNCH_KERNEL_F32_L1(448,  2);
+      CASE_LAUNCH_KERNEL_F32_L1(512,  2);
+      CASE_LAUNCH_KERNEL_F32_L1(576,  2);
+      CASE_LAUNCH_KERNEL_F32_L1(640,  2);
+      CASE_LAUNCH_KERNEL_F32_L1(704,  2);
+      CASE_LAUNCH_KERNEL_F32_L1(768,  2);
+      CASE_LAUNCH_KERNEL_F32_L1(832,  2);
+      CASE_LAUNCH_KERNEL_F32_L1(896,  2);
+      CASE_LAUNCH_KERNEL_F32_L1(960,  2);
+      CASE_LAUNCH_KERNEL_F32_L1(1024, 2);
     default:
       throw std::runtime_error("headdim not support!");
       break;
@@ -910,27 +885,27 @@ void ffpa_mma_acc_f16_L1(torch::Tensor Q,
   } else {
     switch (d)
     {
-      CASE_LAUNCH_KERNEL_F16_L1(32,   1);
-      CASE_LAUNCH_KERNEL_F16_L1(64,   1);
-      CASE_LAUNCH_KERNEL_F16_L1(96,   1);
-      CASE_LAUNCH_KERNEL_F16_L1(128,  1);
-      CASE_LAUNCH_KERNEL_F16_L1(256,  1);
-      CASE_LAUNCH_KERNEL_F16_L1(320,  1);
-      CASE_LAUNCH_KERNEL_F16_L1(384,  1);
-      CASE_LAUNCH_KERNEL_F16_L1(448,  1);
-      CASE_LAUNCH_KERNEL_F16_L1(512,  1);
-      CASE_LAUNCH_KERNEL_F16_L1(576,  1);
-      CASE_LAUNCH_KERNEL_F16_L1(640,  1);
-      CASE_LAUNCH_KERNEL_F16_L1(704,  1);
-      CASE_LAUNCH_KERNEL_F16_L1(768,  1);
-      CASE_LAUNCH_KERNEL_F16_L1(832,  1);
-      CASE_LAUNCH_KERNEL_F16_L1(896,  1);
-      CASE_LAUNCH_KERNEL_F16_L1(960,  1);
-      CASE_LAUNCH_KERNEL_F16_L1(1024, 1);
+      CASE_LAUNCH_KERNEL_F32_L1(32,   1);
+      CASE_LAUNCH_KERNEL_F32_L1(64,   1);
+      CASE_LAUNCH_KERNEL_F32_L1(96,   1);
+      CASE_LAUNCH_KERNEL_F32_L1(128,  1);
+      CASE_LAUNCH_KERNEL_F32_L1(256,  1);
+      CASE_LAUNCH_KERNEL_F32_L1(320,  1);
+      CASE_LAUNCH_KERNEL_F32_L1(384,  1);
+      CASE_LAUNCH_KERNEL_F32_L1(448,  1);
+      CASE_LAUNCH_KERNEL_F32_L1(512,  1);
+      CASE_LAUNCH_KERNEL_F32_L1(576,  1);
+      CASE_LAUNCH_KERNEL_F32_L1(640,  1);
+      CASE_LAUNCH_KERNEL_F32_L1(704,  1);
+      CASE_LAUNCH_KERNEL_F32_L1(768,  1);
+      CASE_LAUNCH_KERNEL_F32_L1(832,  1);
+      CASE_LAUNCH_KERNEL_F32_L1(896,  1);
+      CASE_LAUNCH_KERNEL_F32_L1(960,  1);
+      CASE_LAUNCH_KERNEL_F32_L1(1024, 1);
     default:
       throw std::runtime_error("headdim not support!");
       break;
     }
   }
-#undef CASE_LAUNCH_KERNEL_F16_L1
+#undef CASE_LAUNCH_KERNEL_F32_L1
 }

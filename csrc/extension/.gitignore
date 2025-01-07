@@ -19,5 +19,3 @@ __pycache__
 *.bin 
 outupt
 *.egg-info
-dist
-.tmp
