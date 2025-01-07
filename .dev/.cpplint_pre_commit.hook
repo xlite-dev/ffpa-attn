@@ -11,10 +11,10 @@
 #  if [[ ! $(which cpplint) ]]; then
 #    pip install cpplint
 #  fi
-#  # diff files on local machine. 
+#  # diff files on local machine.
 #  files=$(git diff --cached --name-status | awk 'Extra open brace or missing close brace2}')
 #else
-#  # diff files between PR and latest commit on Travis CI. 
+#  # diff files between PR and latest commit on Travis CI.
 #  branch_ref=(gitrev−parse"TRAVIS_BRANCH")
 #  head_ref=$(git rev-parse HEAD)
 #  files=(gitdiff−−name−statusbranch_ref $head_ref | awk 'Extra open brace or missing close brace2}')
@@ -46,13 +46,13 @@ exec 1>&2
 cpplint=cpplint
 sum=0
 filters='-build/include_order,-build/namespaces,-legal/copyright,-runtime/references,-build/include_what_you_use'
-        
+
 # for cpp
 for file in $(git diff-index --name-status $against -- | grep -E '\.[ch](pp)?$' | awk '{print $2}'); do
     $cpplint --filter=$filters $file
     sum=$(expr ${sum} + $?)
 done
-    
+
 if [ ${sum} -eq 0 ]; then
     exit 0
 else

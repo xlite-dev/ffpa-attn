@@ -23,7 +23,6 @@ PERMUTED_DOCS_STRING = """------------------------------------------------------
 [INFO]      --> Q smem store layout [4][Br][16].               |
 ----------------------------------------------------------------"""
 
-
 def swizzle_permuted_j(
     i: int, j: int, col_stride: int = 16, num_elems_per_128b: int = 8
 ):
