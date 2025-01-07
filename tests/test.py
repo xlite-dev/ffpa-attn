@@ -114,7 +114,6 @@ def pretty_print_line(m: str = "", sep: str = "-", width: int = 150):
     print(pretty_line)
 
 
-
 def build_pyffpa_from_sources(verbose: bool = False):
     torch_arch_list_env = os.environ.get("TORCH_CUDA_ARCH_LIST", None)         
     # Load the CUDA kernel as a python module
