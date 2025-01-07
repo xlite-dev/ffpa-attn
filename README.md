@@ -80,12 +80,12 @@ By leveraging this approach, we can achieve better performance for large headdim
 
 <div id="install"></div>  
 
-The FFPA implemented in this repo can be install as a python library, namely, `ffpa-attn` library (optional). 
+The FFPA implemented in this repo can be install as a python library, namely, `pyffpa` library (optional). 
 ```bash
 # clone, then, run tests/install.sh directly or run commands as belows
 git clone https://github.com/DefTruth/faster-prefill-attention.git
-python3 setup.py bdist_wheel && rm -rf *.egg-info # build ffpa-attn from sources
-cd dist && python3 -m pip install ffpa_attn-*-linux_x86_64.whl # pip uninstall ffpa-attn -y 
+python3 setup.py bdist_wheel && rm -rf *.egg-info # build 'pyffpa' from sources
+cd dist && python3 -m pip install pyffpa-*-linux_x86_64.whl # pip uninstall pyffpa -y 
 ```
 
 ## 📖 FFPA L1 (Level 1): Benchmark 🎉🎉
@@ -184,4 +184,4 @@ How to contribute? Wecome to star⭐️ this repo to support me👆🏻 ~
 
 - [flash-attention](https://github.com/Dao-AILab/flash-attention)
 - [CUDA-Learn-Notes](https://github.com/DefTruth/CUDA-Learn-Notes)
-- [SDPA](https://pytorch.org/docs/stable/generated/torch.nn.functional.scaled_dot_product_attention.html)
+- [flashinfer](https://github.com/flashinfer-ai/flashinfer)

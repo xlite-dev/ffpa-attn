@@ -51,6 +51,7 @@ def get_project_dir():
 
 args = get_args()
 project_dir = get_project_dir()
+use_pyffpa_package = False
 
 
 def set_rand_seed(seed: int = 1):
@@ -114,36 +115,40 @@ def pretty_print_line(m: str = "", sep: str = "-", width: int = 150):
 
 
 
-def build_from_sources(verbose: bool = False):
+def build_pyffpa_from_sources(verbose: bool = False):
     torch_arch_list_env = os.environ.get("TORCH_CUDA_ARCH_LIST", None)         
     # Load the CUDA kernel as a python module
-    pretty_print_line(f"Loading ffpa-attn lib on device: {get_device_name()}, "
+    pretty_print_line(f"Loading pyffpa lib on device: {get_device_name()}, "
                       f"capability: {get_device_capability()}, "
                       f"Arch ENV: {torch_arch_list_env}")
-    return load(name='ffpa_cuda', sources=get_build_sources(),
+    return load(name='pyffpa_cuda', sources=get_build_sources(),
                 extra_cuda_cflags=get_build_cuda_cflags(), 
                 extra_cflags=get_build_cflags(), 
                 verbose=verbose)
 
 
-def try_load_ffpa_library(force_build: bool = False, verbose: bool = False):
+def try_load_pyffpa_library(force_build: bool = False, verbose: bool = False):
+    global use_pyffpa_package
     if not force_build:
         # check if can import toy_hgemm
         try:
-            import ffpa_attn
-            pretty_print_line(f"Import ffpa-attn library done, use it!")
-            return ffpa_attn
+            import pyffpa
+            pretty_print_line(f"Import pyffpa library done, use it!")
+            use_pyffpa_package = True
+            return pyffpa
         except Exception:
-            pretty_print_line(f"Can't import ffpa-attn, force build "
+            pretty_print_line(f"Can't import pyffpa, force build "
                               f"from sources")
             pretty_print_line(f"Also may need export LD_LIBRARY_PATH="
                               f"PATH-TO/torch/lib:$LD_LIBRARY_PATH")
-            ffpa_attn = build_from_sources(verbose=verbose)
-            return ffpa_attn
+            pyffpa = build_pyffpa_from_sources(verbose=verbose)
+            use_pyffpa_package = False
+            return pyffpa
     else:
-        pretty_print_line("Force ffpa_attn lib build from sources")
-        ffpa_attn = build_from_sources(verbose=verbose)
-        return ffpa_attn
+        pretty_print_line("Force pyffpa lib build from sources")
+        pyffpa = build_pyffpa_from_sources(verbose=verbose)
+        use_pyffpa_package = False
+        return pyffpa
 
 
 pretty_print_line()
@@ -151,8 +156,8 @@ print(args)
 pretty_print_line()
 
 # Load the CUDA kernel as a python module
-ffpa_attn = try_load_ffpa_library(force_build=args.force_build, 
-                                  verbose=args.verbose)
+pyffpa = try_load_pyffpa_library(force_build=args.force_build, 
+                                 verbose=args.verbose)
 
 
 def get_mha_tflops(B: int, H: int, N: int, D: int, secs: float=1.0, 
@@ -419,13 +424,22 @@ for (B, H, N, D) in BHNDs:
     torch.cuda.synchronize()
     pretty_print_line()
     pretty_print_line(f"B={B}, H={H}, N={N}, D={D}, Warmup: {args.warmup}, Iters: {args.iters}")
-    # Naive MHA, FFPA, SDPA (D > 256)
-    out_unfused,      _ = run_benchmark(unfused_standard_attn, q, k, v, "(unfused)")
-    out_sdpa,         _ = run_benchmark(partial(sdpa, use_flash=(D<=256)), q, k, v, "(sdpa)")
-    out_ffpa_l1_f321, _ = run_benchmark(ffpa_attn.ffpa_mma_acc_f32_L1, q, k, v, "(ffpa+acc+f32+L1+stage1)", o, stages=1)
-    out_ffpa_l1_f322, _ = run_benchmark(ffpa_attn.ffpa_mma_acc_f32_L1, q, k, v, "(ffpa+acc+f32+L1+stage2)", o, stages=2)
-    out_ffpa_l1_f161, _ = run_benchmark(ffpa_attn.ffpa_mma_acc_f16_L1, q, k, v, "(ffpa+acc+f16+L1+stage1)", o, stages=1)
-    out_ffpa_l1_f162, _ = run_benchmark(ffpa_attn.ffpa_mma_acc_f16_L1, q, k, v, "(ffpa+acc+f16+L1+stage2)", o, stages=2)
+    if not use_pyffpa_package:
+        # Naive MHA, FFPA, SDPA (D > 256)
+        out_unfused,      _ = run_benchmark(unfused_standard_attn, q, k, v, "(unfused)")
+        out_sdpa,         _ = run_benchmark(partial(sdpa, use_flash=(D<=256)), q, k, v, "(sdpa)")
+        out_ffpa_l1_f321, _ = run_benchmark(pyffpa.ffpa_mma_acc_f32_L1, q, k, v, "(ffpa+acc+f32+L1+stage1)", o, stages=1)
+        out_ffpa_l1_f322, _ = run_benchmark(pyffpa.ffpa_mma_acc_f32_L1, q, k, v, "(ffpa+acc+f32+L1+stage2)", o, stages=2)
+        out_ffpa_l1_f161, _ = run_benchmark(pyffpa.ffpa_mma_acc_f16_L1, q, k, v, "(ffpa+acc+f16+L1+stage1)", o, stages=1)
+        out_ffpa_l1_f162, _ = run_benchmark(pyffpa.ffpa_mma_acc_f16_L1, q, k, v, "(ffpa+acc+f16+L1+stage2)", o, stages=2)
+    else:
+        # Naive MHA, FFPA, SDPA (D > 256)
+        out_unfused,      _ = run_benchmark(unfused_standard_attn, q, k, v, "(unfused)")
+        out_sdpa,         _ = run_benchmark(partial(sdpa, use_flash=(D<=256)), q, k, v, "(sdpa)")
+        out_ffpa_l1_f321, _ = run_benchmark(partial(pyffpa.ffpa, level=pyffpa.L1, acc=pyffpa.FP32), q, k, v, "(ffpa+acc+f32+L1+stage1)", o, stages=1)
+        out_ffpa_l1_f322, _ = run_benchmark(partial(pyffpa.ffpa, level=pyffpa.L1, acc=pyffpa.FP32), q, k, v, "(ffpa+acc+f32+L1+stage2)", o, stages=2)
+        out_ffpa_l1_f161, _ = run_benchmark(partial(pyffpa.ffpa, level=pyffpa.L1, acc=pyffpa.FP16), q, k, v, "(ffpa+acc+f16+L1+stage1)", o, stages=1)
+        out_ffpa_l1_f162, _ = run_benchmark(partial(pyffpa.ffpa, level=pyffpa.L1, acc=pyffpa.FP16), q, k, v, "(ffpa+acc+f16+L1+stage2)", o, stages=2)
     pretty_print_line()
     
     torch.cuda.synchronize()

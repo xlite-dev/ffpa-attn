@@ -9,6 +9,19 @@ from torch.utils.cpp_extension import (
     CUDAExtension,
     CUDA_HOME,
 )
+from pathlib import Path
+from pyffpa import __version__
+
+# ninja build does not work unless include_dirs are abs path
+this_dir = os.path.dirname(os.path.abspath(__file__))
+
+
+def get_long_description():
+    description = (Path(this_dir) / "README.md").read_text(encoding="utf-8")
+    # replace relative repository path to absolute link to the release
+    static_url = f"https://github.com/DefTruth/faster-prefill-attention/blob/main"
+    description = description.replace("docs/", f"{static_url}/docs/")
+    return description
 
 
 def get_device_name():
@@ -25,14 +38,10 @@ def get_device_capability():
 
 def get_build_sources():
     build_sources = []
-    build_sources.append('./csrc/cuda/faster_prefill_attn_F16F16F16F16_L1.cu')
-    build_sources.append('./csrc/cuda/faster_prefill_attn_F32F16F16F32_L1.cu')
-    build_sources.append('./csrc/pybind/faster_prefill_attn_api.cc')
+    build_sources.append(f'{this_dir}/csrc/cuda/faster_prefill_attn_F16F16F16F16_L1.cu')
+    build_sources.append(f'{this_dir}/csrc/cuda/faster_prefill_attn_F32F16F16F32_L1.cu')
+    build_sources.append(f'{this_dir}/csrc/pybind/faster_prefill_attn_api.cc')
     return build_sources
-
-
-# ninja build does not work unless include_dirs are abs path
-this_dir = os.path.dirname(os.path.abspath(__file__))
 
 
 def get_build_cuda_cflags(build_pkg: bool = False):
@@ -52,8 +61,8 @@ def get_build_cuda_cflags(build_pkg: bool = False):
     return extra_cuda_cflags
 
 
-# package name managed by pip, which can be remove by `pip uninstall ffpa-attn -y`
-PACKAGE_NAME = "ffpa-attn"
+# package name managed by pip, which can be remove by `pip uninstall pyffpa -y`
+PACKAGE_NAME = "pyffpa"
 
 ext_modules = []
 generator_flag = []
@@ -86,7 +95,7 @@ if CUDA_HOME is not None:
 ext_modules.append(
     CUDAExtension(
         # package name for import
-        name="ffpa_attn",
+        name="pyffpa_cuda",
         sources=get_build_sources(),
         extra_compile_args={
             # add c compile flags
@@ -102,25 +111,30 @@ ext_modules.append(
 
 setup(
     name=PACKAGE_NAME,
-    version="0.0.1",
+    version=__version__,
+    author="DefTruth",
+    author_email="qyjdef@163.com",
     packages=find_packages(
         exclude=(
             "build",
+            "dist",
+            "include",
             "csrc",
-            "utils",
+            "tests",
             "bench",
-            "pybind",
-            "pyffpa", # high level python api is not ready now.
-            "ffpa_attn", # high level python api is not ready now.
             "tmp",
+            "pyffpa.egg-info",
         )
     ),
-    description="FFPA: Faster Flash Prefill Attention for headdim > 256, ~1.5x faster than SDPA EA",
+    description="FFPA: Yet another Faster Flash Prefill Attention for large headdim, ~1.5x faster than SDPA EA.",
+    long_description=get_long_description(),
+    long_description_content_type="text/markdown",
+    url="https://github.com/DefTruth/faster-prefill-attention",
     ext_modules=ext_modules,
     cmdclass={ "build_ext": BuildExtension},
     python_requires=">=3.10",
     install_requires=[
-        "torch",
+        "torch>=2.4.0",
         "packaging",
         "ninja",
     ],
