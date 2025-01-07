@@ -109,6 +109,11 @@ ext_modules.append(
     )
 )
 
+def fetch_requirements():
+    with open("requirements.txt") as f:
+        reqs = f.read().strip().split("\n")
+    return reqs
+
 setup(
     name=PACKAGE_NAME,
     version=__version__,
@@ -133,11 +138,17 @@ setup(
     ext_modules=ext_modules,
     cmdclass={ "build_ext": BuildExtension},
     python_requires=">=3.10",
-    install_requires=[
-        "torch>=2.4.0",
-        "packaging",
-        "ninja",
-    ],
+    install_requires=fetch_requirements(),
+    extras_require={
+        # optional dependencies, required by some features
+        "all": [],
+        # dev dependencies. Install them by `pip3 install 'akvattn[dev]'`
+        "dev": [
+            "pre-commit",
+            "packaging",
+            "ninja",
+        ],
+    },
 )
 
 
