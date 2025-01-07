@@ -60,7 +60,7 @@ ffpa_mma_stages_split_q_kernel_acc_f16_L1(half* Q,
   static_assert(kWarpTileSeqLenP == 1 && kWarpTileHeadDimV == (
     kHeadDim / (kMmaAtomN * kMmaTileHeadDimV))); // P@V
   static_assert(kOStorageAccFloat32 == 0 || kOStorageAccFloat32 == 1);
-  static_assert(kStage < 3 && kStage > 0); 
+  static_assert(kStage < 5 && kStage > 0); 
   static_assert(kPadQ >= 0 && kPadQ % 8 == 0); // 0,8,16
   static_assert(kPadK >= 0 && kPadK % 8 == 0); // 0,8,16
   static_assert(kPadV >= 0 && kPadV % 8 == 0); // 0,8,16
@@ -779,7 +779,6 @@ void launch_ffpa_mma_acc_f16_L1(
   // Calculate SRAM size needed per block, Q,K,V smem size, V shared the QK smem.
   constexpr int QK_smem_size = (kStage * (Br * (kMmaAtomK + kPadQ)) + 
                                 kStage * (Bc * (kMmaAtomK + kPadK)));
-  // Now, for V_smem_size, need fixed smem size, e.g 64*16*2/1024=2M;
   // R_D registers, s=2, d=64, 16 regs; d=128, 32 regs; 
   // d=256, 64 regs; d=512, 128 regs; d=1024, 256 regs;
   constexpr int V_smem_size  = (kStage * (Bc * (kMmaAtomN * 2 + kPadV))); 
@@ -858,60 +857,105 @@ void ffpa_mma_acc_f16_L1(torch::Tensor Q,
   CHECK_TORCH_TENSOR_DTYPE(V, torch::kHalf) // V [B,H,N,D]
   CHECK_TORCH_TENSOR_DTYPE(O, torch::kHalf) // O [B,H,N,D]
   const int d = Q.size(3); // B, H, N, d
-
-#define CASE_LAUNCH_KERNEL_F16_L1(D, S)               \
-  case D:                                             \
-    launch_ffpa_mma_acc_f16_L1<(D), (S)>(Q, K, V, O); \
+  
+  // dispatch headdim
+#define CASE_LAUNCH_KERNEL_F16_L1(D, S)      \
+  case D:                                    \
+    launch_ffpa_mma_acc_f16_L1<(D), (S)>(    \
+      Q, K, V, O);                           \
     break;
 
-  if (stages > 1) {
-    switch (d)
-    {
-      CASE_LAUNCH_KERNEL_F16_L1(32,   2);
-      CASE_LAUNCH_KERNEL_F16_L1(64,   2);
-      CASE_LAUNCH_KERNEL_F16_L1(96,   2);
-      CASE_LAUNCH_KERNEL_F16_L1(128,  2);
-      CASE_LAUNCH_KERNEL_F16_L1(256,  2);
-      CASE_LAUNCH_KERNEL_F16_L1(320,  2);
-      CASE_LAUNCH_KERNEL_F16_L1(384,  2);
-      CASE_LAUNCH_KERNEL_F16_L1(448,  2);
-      CASE_LAUNCH_KERNEL_F16_L1(512,  2);
-      CASE_LAUNCH_KERNEL_F16_L1(576,  2);
-      CASE_LAUNCH_KERNEL_F16_L1(640,  2);
-      CASE_LAUNCH_KERNEL_F16_L1(704,  2);
-      CASE_LAUNCH_KERNEL_F16_L1(768,  2);
-      CASE_LAUNCH_KERNEL_F16_L1(832,  2);
-      CASE_LAUNCH_KERNEL_F16_L1(896,  2);
-      CASE_LAUNCH_KERNEL_F16_L1(960,  2);
-      CASE_LAUNCH_KERNEL_F16_L1(1024, 2);
-    default:
-      throw std::runtime_error("headdim not support!");
-      break;
-    }
-  } else {
-    switch (d)
-    {
-      CASE_LAUNCH_KERNEL_F16_L1(32,   1);
-      CASE_LAUNCH_KERNEL_F16_L1(64,   1);
-      CASE_LAUNCH_KERNEL_F16_L1(96,   1);
-      CASE_LAUNCH_KERNEL_F16_L1(128,  1);
-      CASE_LAUNCH_KERNEL_F16_L1(256,  1);
-      CASE_LAUNCH_KERNEL_F16_L1(320,  1);
-      CASE_LAUNCH_KERNEL_F16_L1(384,  1);
-      CASE_LAUNCH_KERNEL_F16_L1(448,  1);
-      CASE_LAUNCH_KERNEL_F16_L1(512,  1);
-      CASE_LAUNCH_KERNEL_F16_L1(576,  1);
-      CASE_LAUNCH_KERNEL_F16_L1(640,  1);
-      CASE_LAUNCH_KERNEL_F16_L1(704,  1);
-      CASE_LAUNCH_KERNEL_F16_L1(768,  1);
-      CASE_LAUNCH_KERNEL_F16_L1(832,  1);
-      CASE_LAUNCH_KERNEL_F16_L1(896,  1);
-      CASE_LAUNCH_KERNEL_F16_L1(960,  1);
-      CASE_LAUNCH_KERNEL_F16_L1(1024, 1);
-    default:
-      throw std::runtime_error("headdim not support!");
-      break;
-    }
+#ifdef ENBALE_FFPA_ALL_HEADDIM
+  // multiple of 32
+#define DISPATCH_KERNEL_F16_L1_HEADDIM(S)    \
+  {                                          \
+    switch (d)                               \
+    {                                        \
+      CASE_LAUNCH_KERNEL_F16_L1(32,   (S));  \
+      CASE_LAUNCH_KERNEL_F16_L1(64,   (S));  \
+      CASE_LAUNCH_KERNEL_F16_L1(96,   (S));  \
+      CASE_LAUNCH_KERNEL_F16_L1(128,  (S));  \
+      CASE_LAUNCH_KERNEL_F16_L1(160,  (S));  \
+      CASE_LAUNCH_KERNEL_F16_L1(192,  (S));  \
+      CASE_LAUNCH_KERNEL_F16_L1(224,  (S));  \
+      CASE_LAUNCH_KERNEL_F16_L1(256,  (S));  \
+      CASE_LAUNCH_KERNEL_F16_L1(288,  (S));  \
+      CASE_LAUNCH_KERNEL_F16_L1(320,  (S));  \
+      CASE_LAUNCH_KERNEL_F16_L1(352,  (S));  \
+      CASE_LAUNCH_KERNEL_F16_L1(384,  (S));  \
+      CASE_LAUNCH_KERNEL_F16_L1(416,  (S));  \
+      CASE_LAUNCH_KERNEL_F16_L1(448,  (S));  \
+      CASE_LAUNCH_KERNEL_F16_L1(480,  (S));  \
+      CASE_LAUNCH_KERNEL_F16_L1(512,  (S));  \
+      CASE_LAUNCH_KERNEL_F16_L1(544,  (S));  \
+      CASE_LAUNCH_KERNEL_F16_L1(576,  (S));  \
+      CASE_LAUNCH_KERNEL_F16_L1(608,  (S));  \
+      CASE_LAUNCH_KERNEL_F16_L1(640,  (S));  \
+      CASE_LAUNCH_KERNEL_F16_L1(672,  (S));  \
+      CASE_LAUNCH_KERNEL_F16_L1(704,  (S));  \
+      CASE_LAUNCH_KERNEL_F16_L1(736,  (S));  \
+      CASE_LAUNCH_KERNEL_F16_L1(768,  (S));  \
+      CASE_LAUNCH_KERNEL_F16_L1(800,  (S));  \
+      CASE_LAUNCH_KERNEL_F16_L1(832,  (S));  \
+      CASE_LAUNCH_KERNEL_F16_L1(864,  (S));  \
+      CASE_LAUNCH_KERNEL_F16_L1(896,  (S));  \
+      CASE_LAUNCH_KERNEL_F16_L1(928,  (S));  \
+      CASE_LAUNCH_KERNEL_F16_L1(960,  (S));  \
+      CASE_LAUNCH_KERNEL_F16_L1(992,  (S));  \
+      CASE_LAUNCH_KERNEL_F16_L1(1024, (S));  \
+    default:                                 \
+      throw std::runtime_error(              \
+        "headdim not support!");             \
+      break;                                 \
+    }                                        \
   }
+#else
+  // multiple of 64
+#define DISPATCH_KERNEL_F16_L1_HEADDIM(S)    \
+  {                                          \
+    switch (d)                               \
+    {                                        \
+      CASE_LAUNCH_KERNEL_F16_L1(256,  (S));  \
+      CASE_LAUNCH_KERNEL_F16_L1(320,  (S));  \
+      CASE_LAUNCH_KERNEL_F16_L1(384,  (S));  \
+      CASE_LAUNCH_KERNEL_F16_L1(448,  (S));  \
+      CASE_LAUNCH_KERNEL_F16_L1(512,  (S));  \
+      CASE_LAUNCH_KERNEL_F16_L1(576,  (S));  \
+      CASE_LAUNCH_KERNEL_F16_L1(640,  (S));  \
+      CASE_LAUNCH_KERNEL_F16_L1(704,  (S));  \
+      CASE_LAUNCH_KERNEL_F16_L1(768,  (S));  \
+      CASE_LAUNCH_KERNEL_F16_L1(832,  (S));  \
+      CASE_LAUNCH_KERNEL_F16_L1(896,  (S));  \
+      CASE_LAUNCH_KERNEL_F16_L1(960,  (S));  \
+      CASE_LAUNCH_KERNEL_F16_L1(1024, (S));  \
+    default:                                 \
+      throw std::runtime_error(              \
+        "headdim not support!");             \
+      break;                                 \
+    }                                        \
+  }
+#endif
+
+#ifdef ENBALE_FFPA_ALL_STAGES
+  // dispatch stages
+  if (stages == 2) {
+    DISPATCH_KERNEL_F16_L1_HEADDIM(2);
+  } else if (stages == 3) {
+    DISPATCH_KERNEL_F16_L1_HEADDIM(3);
+  } else if (stages == 4) {
+    DISPATCH_KERNEL_F16_L1_HEADDIM(4);
+  } else {
+    DISPATCH_KERNEL_F16_L1_HEADDIM(1);
+  }
+#else 
+  // dispatch stages
+  if (stages == 2) {
+    DISPATCH_KERNEL_F16_L1_HEADDIM(2);
+  } else {
+    DISPATCH_KERNEL_F16_L1_HEADDIM(1);
+  }
+#endif
+
 #undef CASE_LAUNCH_KERNEL_F16_L1
+#undef DISPATCH_KERNEL_F16_L1_HEADDIM
 }

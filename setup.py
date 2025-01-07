@@ -1,18 +1,15 @@
-import os
 import subprocess
 from pathlib import Path
 
 import torch
+from env import ENV
 from packaging.version import parse, Version
 from setuptools import find_packages, setup
 from torch.utils.cpp_extension import BuildExtension, CUDA_HOME, CUDAExtension
 
-# ninja build does not work unless include_dirs are abs path
-this_dir = os.path.dirname(os.path.abspath(__file__))
-
 
 def get_long_description():
-    description = (Path(this_dir) / "README.md").read_text(encoding="utf-8")
+    description = (Path(ENV.project_dir()) / "README.md").read_text(encoding="utf-8")
     # replace relative repository path to absolute link to the release
     static_url = "https://github.com/DefTruth/faster-prefill-attention/blob/main"
     description = description.replace("docs/", f"{static_url}/docs/")
@@ -34,12 +31,12 @@ def get_device_capability():
 def get_build_sources():
     build_sources = []
     build_sources.append(
-        f"{this_dir}/csrc/deprecated/faster_prefill_attn_F16F16F16F16_L1.cu"
+        f"{ENV.project_dir()}/csrc/deprecated/faster_prefill_attn_F16F16F16F16_L1.cu"
     )
     build_sources.append(
-        f"{this_dir}/csrc/deprecated/faster_prefill_attn_F32F16F16F32_L1.cu"
+        f"{ENV.project_dir()}/csrc/deprecated/faster_prefill_attn_F32F16F16F32_L1.cu"
     )
-    build_sources.append(f"{this_dir}/csrc/pybind/faster_prefill_attn_api.cc")
+    build_sources.append(f"{ENV.project_dir()}/csrc/pybind/faster_prefill_attn_api.cc")
     return build_sources
 
 
@@ -58,20 +55,9 @@ def get_build_cuda_cflags(build_pkg: bool = False):
         "-diag-suppress 177" if not build_pkg else "--ptxas-options=-v"
     )
     extra_cuda_cflags.append("-Xptxas -v" if not build_pkg else "--ptxas-options=-O3")
-    extra_cuda_cflags.append(f"-I {this_dir}/include")
+    extra_cuda_cflags.extend(ENV.env_cuda_cflags())
+    extra_cuda_cflags.append(f"-I {ENV.project_dir()}/include")
     return extra_cuda_cflags
-
-
-# package name managed by pip, which can be remove by `pip uninstall pyffpa -y`
-PACKAGE_NAME = "pyffpa"
-
-ext_modules = []
-generator_flag = []
-cc_flag = []
-cc_flag.append("-gencode")
-cc_flag.append("arch=compute_80,code=sm_80")
-cc_flag.append("-gencode")
-cc_flag.append("arch=compute_89,code=sm_89")
 
 
 # helper function to get cuda version
@@ -86,12 +72,29 @@ def get_cuda_bare_metal_version(cuda_dir):
     return raw_output, bare_metal_version
 
 
-if CUDA_HOME is not None:
-    _, bare_metal_version = get_cuda_bare_metal_version(CUDA_HOME)
-    if bare_metal_version >= Version("11.8"):
-        cc_flag.append("-gencode")
-        cc_flag.append("arch=compute_90,code=sm_90")
+# package name managed by pip, which can be remove by `pip uninstall pyffpa -y`
+PACKAGE_NAME = "pyffpa"
 
+ext_modules = []
+generator_flag = []
+cc_flag = []
+
+if ENV.enable_ampere():
+    cc_flag.append("-gencode")
+    cc_flag.append("arch=compute_80,code=sm_80")
+
+if ENV.enable_ada():
+    cc_flag.append("-gencode")
+    cc_flag.append("arch=compute_89,code=sm_89")
+
+if ENV.enable_hopper():
+    if CUDA_HOME is not None:
+        _, bare_metal_version = get_cuda_bare_metal_version(CUDA_HOME)
+        if bare_metal_version >= Version("11.8"):
+            cc_flag.append("-gencode")
+            cc_flag.append("arch=compute_90,code=sm_90")
+
+assert cc_flag is not None, "cc_flag can not be NoneType."
 
 # cuda module
 # may need export LD_LIBRARY_PATH=PATH-TO/torch/lib:$LD_LIBRARY_PATH
@@ -107,7 +110,7 @@ ext_modules.append(
             "nvcc": get_build_cuda_cflags(build_pkg=True) + generator_flag + cc_flag,
         },
         include_dirs=[
-            Path(this_dir) / "include",
+            Path(ENV.project_dir()) / "include",
         ],
     )
 )

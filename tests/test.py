@@ -2,6 +2,7 @@ import argparse
 import math
 import os
 import random
+import sys
 import time
 from functools import partial
 from typing import Optional
@@ -12,6 +13,9 @@ from torch import Tensor
 from torch.nn import functional as F
 from torch.nn.attention import sdpa_kernel, SDPBackend
 from torch.utils.cpp_extension import load
+
+sys.path.append("../")
+from env import ENV
 
 torch.set_grad_enabled(False)
 torch.set_printoptions(
@@ -48,12 +52,7 @@ def get_args():
     return parser.parse_args()
 
 
-def get_project_dir():
-    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-
-
 args = get_args()
-project_dir = get_project_dir()
 use_pyffpa_package = False
 
 
@@ -79,17 +78,16 @@ def get_device_capability():
 def get_build_sources():
     build_sources = []
     build_sources.append(
-        f"{project_dir}/csrc/deprecated/faster_prefill_attn_F16F16F16F16_L1.cu"
+        f"{ENV.project_dir()}/csrc/deprecated/faster_prefill_attn_F16F16F16F16_L1.cu"
     )
     build_sources.append(
-        f"{project_dir}/csrc/deprecated/faster_prefill_attn_F32F16F16F32_L1.cu"
+        f"{ENV.project_dir()}/csrc/deprecated/faster_prefill_attn_F32F16F16F32_L1.cu"
     )
-    build_sources.append(f"{project_dir}/csrc/pybind/faster_prefill_attn_api.cc")
+    build_sources.append(f"{ENV.project_dir()}/csrc/pybind/faster_prefill_attn_api.cc")
     return build_sources
 
 
 def get_build_cuda_cflags(build_pkg: bool = False):
-    project_dir = get_project_dir()
     extra_cuda_cflags = []
     extra_cuda_cflags.append("-O3")
     extra_cuda_cflags.append("-std=c++17")
@@ -105,7 +103,8 @@ def get_build_cuda_cflags(build_pkg: bool = False):
         "-diag-suppress 177" if not build_pkg else "--ptxas-options=-v"
     )
     extra_cuda_cflags.append("-Xptxas -v" if not build_pkg else "--ptxas-options=-O3")
-    extra_cuda_cflags.append(f"-I {project_dir}/include")
+    extra_cuda_cflags.extend(ENV.env_cuda_cflags())
+    extra_cuda_cflags.append(f"-I {ENV.project_dir()}/include")
     return extra_cuda_cflags
 
 
@@ -437,8 +436,12 @@ MAX_HEADDIM_CFG: dict[str, int] = {
     "(unfused)": 4096,  # may no limit
     "(ffpa+acc+f16+L1+stage1)": 1024,  # may no limit
     "(ffpa+acc+f16+L1+stage2)": 1024,  # may no limit
+    "(ffpa+acc+f16+L1+stage3)": 1024,  # may no limit
+    "(ffpa+acc+f16+L1+stage4)": 1024,  # may no limit
     "(ffpa+acc+f32+L1+stage1)": 1024,  # may no limit
     "(ffpa+acc+f32+L1+stage2)": 1024,  # may no limit
+    "(ffpa+acc+f32+L1+stage3)": 1024,  # may no limit
+    "(ffpa+acc+f32+L1+stage4)": 1024,  # may no limit
 }
 
 seed = args.seed if args.seed else random.choice(range(10000))
