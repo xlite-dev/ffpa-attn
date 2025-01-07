@@ -38,8 +38,8 @@ def get_device_capability():
 
 def get_build_sources():
     build_sources = []
-    build_sources.append(f'{this_dir}/csrc/cuffpa/faster_prefill_attn_F16F16F16F16_L1.cu')
-    build_sources.append(f'{this_dir}/csrc/cuffpa/faster_prefill_attn_F32F16F16F32_L1.cu')
+    build_sources.append(f'{this_dir}/csrc/cuffpa/deprecated/faster_prefill_attn_F16F16F16F16_L1.cu')
+    build_sources.append(f'{this_dir}/csrc/cuffpa/deprecated/faster_prefill_attn_F32F16F16F32_L1.cu')
     build_sources.append(f'{this_dir}/csrc/pybind/faster_prefill_attn_api.cc')
     return build_sources
 
