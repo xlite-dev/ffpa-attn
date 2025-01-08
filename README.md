@@ -30,10 +30,10 @@ NOTE: This project is still in its early development stages and currently provid
 ## ©️Citations🎉🎉
 
 ```BibTeX
-@misc{faster-prefill-attention@2025,
-  title={FFPA: Yet another Faster Flash Prefill Attention with O(1) SRAM complexity for large headdim.},
-  url={https://github.com/DefTruth/faster-prefill-attention},
-  note={Open-source software available at https://github.com/DefTruth/faster-prefill-attention},
+@misc{cuffpa-py@2025,
+  title={FFPA: Yet another Faster Flash Prefill Attention for large headdim.},
+  url={https://github.com/DefTruth/cuffpa-py},
+  note={Open-source software available at https://github.com/DefTruth/cuffpa-py},
   author={DefTruth etc},
   year={2025}
 }
