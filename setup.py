@@ -133,7 +133,9 @@ setup(
             "tests",
             "bench",
             "tmp",
-            "pyffpa.egg-info",
+            "cuffpa_py.egg-info",
+            "__pycache__",
+            "third_party",
         )
     ),
     description="FFPA: Yet another Faster Flash Prefill Attention for large headdim, ~1.5x faster than SDPA EA.",
