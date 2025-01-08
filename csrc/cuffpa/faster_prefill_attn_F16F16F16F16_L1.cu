@@ -64,9 +64,6 @@ ffpa_mma_stages_split_q_kernel_acc_f16_L1(half* Q,
   static_assert(kPadQ >= 0 && kPadQ % 8 == 0); // 0,8,16
   static_assert(kPadK >= 0 && kPadK % 8 == 0); // 0,8,16
   static_assert(kPadV >= 0 && kPadV % 8 == 0); // 0,8,16
-  constexpr bool kSwizzleQ = (kPadQ == 0) ? true : false; // swizzle Q if kPadQ=0
-  constexpr bool kSwizzleK = (kPadK == 0) ? true : false; // swizzle K if kPadK=0
-  constexpr bool kSwizzleV = (kPadV == 0) ? true : false; // swizzle V if kPadV=0
   constexpr int Br = kMmaAtomM * kMmaTileSeqLenQ * kWarpTileSeqLenQ; // 16*4*1=64
   constexpr int Bc = kMmaAtomN * kMmaTileSeqLenK * kWarpTileSeqLenK; //  8*1*8=64
   static_assert(Br >= Bc); // for shared memory reuse.
