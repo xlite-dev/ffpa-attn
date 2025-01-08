@@ -146,7 +146,7 @@ cd tests && python3 test.py --B 1 --H 48 --N 8192 --show-all --D 320
 ```
 - 📚 case: B=1, H=48, N=8192, D=320(`FA2 not supported`), Device=NVIDIA RTX 4090.
 ```bash
-python3 tests/test.py --B 1 --H 48 --N 8192 --show-all --D 320
+python3 test.py --B 1 --H 48 --N 8192 --show-all --D 320 # NVIDIA RTX 4090
 -------------------------------------------------------------------------------------------------
 -----------------------------B=1, H=48, N=8192, D=320, Warmup: 1, Iters: 5-----------------------
                    (sdpa): ['-0.01750183 '], time:50.36ms, TFLOPS:82.19 (+0.00 %)(~1.00x)
