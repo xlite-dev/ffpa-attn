@@ -34,7 +34,7 @@ if (((T2).size(0) != (T1).size(0)) ||                \
 #define HALF2(value) (reinterpret_cast<half2*>(&(value))[0])
 
 
-#ifdef FFPA_MMA_DEBUG
+#ifdef ENABLE_FFPA_DEBUG
 #define FFPA_MMA_PRINT_T0_REG(R, format, ...)    \
 {                                                \
   if (tid == 0) {                                \
