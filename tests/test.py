@@ -54,6 +54,7 @@ def get_args():
 
 args = get_args()
 use_pyffpa_package = False
+ENV.list_ffpa_env()
 
 
 def set_rand_seed(seed: int = 1):

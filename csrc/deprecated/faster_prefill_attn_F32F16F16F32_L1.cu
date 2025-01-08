@@ -860,6 +860,23 @@ void ffpa_mma_acc_f32_L1(torch::Tensor Q,
       Q, K, V, O);                           \
     break;
 
+#ifdef ENABLE_FFPA_DEBUG
+  // minimal kernels for debug mode
+#define DISPATCH_KERNEL_F32_L1_HEADDIM(S)    \
+  {                                          \
+    switch (d)                               \
+    {                                        \
+      CASE_LAUNCH_KERNEL_F32_L1(320,  (S));  \
+      CASE_LAUNCH_KERNEL_F32_L1(512,  (S));  \
+      CASE_LAUNCH_KERNEL_F32_L1(1024, (S));  \
+    default:                                 \
+      throw std::runtime_error(              \
+        "headdim not support!");             \
+      break;                                 \
+    }                                        \
+  }
+
+#else 
 #ifdef ENBALE_FFPA_ALL_HEADDIM
   // multiple of 32
 #define DISPATCH_KERNEL_F32_L1_HEADDIM(S)    \
@@ -929,6 +946,8 @@ void ffpa_mma_acc_f32_L1(torch::Tensor Q,
       break;                                 \
     }                                        \
   }
+#endif
+
 #endif
 
 #ifdef ENBALE_FFPA_ALL_STAGES
