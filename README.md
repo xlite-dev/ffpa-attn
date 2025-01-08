@@ -11,7 +11,7 @@
   <img src=https://img.shields.io/badge/License-GPLv3.0-turquoise.svg >
  </div>
 
-🤖 [WIP] **FFPA**: Yet antother **Faster Flash Prefill Attention** with **O(1) SRAM complexity** & **O(d/4) or O(1) register complexity** for large headdim (D > 256), almost **>1.5x** 🎉 faster than SDPA EA with or without MMA Accumulation F32 on many devices, such as NVIDIA L20, 4090, 3080 Laptop (Experimental 👀~). The FFPA kernels are modified from my repo 📖[CUDA-Learn-Notes](https://github.com/DefTruth/CUDA-Learn-Notes/tree/main/kernels/flash-attn)  ![](https://img.shields.io/github/stars/DefTruth/CUDA-Learn-Notes.svg?style=social). Welcome to 🌟👆🏻star this repo to support me, many thanks ~ 🎉🎉
+🤖 [WIP] **FFPA**: Yet antother **Faster Flash Prefill Attention** with **O(1) SRAM complexity** & **O(d/4) or O(1) register complexity** for large headdim (D > 256), almost **>1.5x** 🎉 faster than SDPA EA with or without MMA Accumulation F32 on many devices, such as NVIDIA L20, 4090, 3080 Laptop (Experimental 👀~). The FFPA kernels are modified from my repo 📖[CUDA-Learn-Notes](https://github.com/DefTruth/CUDA-Learn-Notes/tree/main/kernels/flash-attn)  ![](https://img.shields.io/github/stars/DefTruth/CUDA-Learn-Notes.svg?style=social). 
 
 <!--
 |Tensor Cores|Loop over N/D |Tile Block (Br, Bc) |MMA (m16n8k16)|
@@ -25,7 +25,7 @@
 |✔️|✔️|✔️|?|
 -->
 
-NOTE: This project is still in its early development stages and currently provides a few experimental kernels and benchmarks for reference. More benchmarks data and features (FFPA **L2/L3** & more devices) will be added over time as the project continues to develop.
+NOTE: This project is still in its early development stages and currently provides a few experimental kernels and benchmarks for reference. More benchmarks data and features (FFPA **L2/L3** & more devices) will be added over time as the project continues to develop. Welcome to 🌟👆🏻star this repo to support me, many thanks ~ 🎉🎉
 
 ## ©️Citations🎉🎉
 
