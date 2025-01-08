@@ -19,7 +19,7 @@ __device__ __forceinline__ void m16n8k16_f16f16f16(
   uint32_t * RD0, uint32_t * RD1, 
   uint32_t * RA0, uint32_t * RA1, uint32_t * RA2, uint32_t * RA3, 
   uint32_t * RB0, uint32_t * RB1,
-  uint32_t * RC0, uint32_t * RC0
+  uint32_t * RC0, uint32_t * RC1
 ) {
   asm volatile(
     "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 "
@@ -37,7 +37,7 @@ __device__ __forceinline__ void m16n8k16_f16f16f32(
   uint32_t * RD0, uint32_t * RD1, uint32_t * RD2, uint32_t * RD3,
   uint32_t * RA0, uint32_t * RA1, uint32_t * RA2, uint32_t * RA3, 
   uint32_t * RB0, uint32_t * RB1,
-  uint32_t * RC0, uint32_t * RC0, uint32_t * RC2, uint32_t * RC3
+  uint32_t * RC0, uint32_t * RC1, uint32_t * RC2, uint32_t * RC3
 ) {
   asm volatile(
     "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
