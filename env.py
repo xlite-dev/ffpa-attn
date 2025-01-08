@@ -87,7 +87,8 @@ class ENV(object):
     def get_build_sources():
         def csrc(sub_dir, filename):
             csrc_file = f"{ENV.project_dir()}/csrc/{sub_dir}/{filename}"
-            pretty_print_line(f"csrc_file: {csrc_file}", sep="", mode="left")
+            if ENV.enable_debug():
+                pretty_print_line(f"csrc_file: {csrc_file}", sep="", mode="left")
             return csrc_file
 
         pretty_print_line()
