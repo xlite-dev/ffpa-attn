@@ -27,7 +27,7 @@ __device__ __forceinline__ void wait_group() {
 }
 
 // e.g: cp_async<half, 16>(smem_ptr, gmem_ptr);
-template <typename T, const int kBytes = 16>
+template <const int kBytes = 16, typename T = half>
 __device__ __forceinline__ void cp_async(
   uint32_t smem_ptr, const T* gmem_ptr) {
   static_assert(kBytes == 16 || kBytes == 8); // 8 or 4 halfs
