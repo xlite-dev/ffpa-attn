@@ -14,10 +14,6 @@
 namespace ffpa {
 namespace prefill {
 // prefill utils: prefetch/load QKV g2s funcs, rescale/softmax funcs etc.
-
-__device__ __host__ inline 
-int div_ceil(int a, int b) { return (a % b != 0) ? (a / b + 1) : (a / b); }
-
 template<typename T, int M, const int N, const int K = 2>
 __device__ inline void fill_3D_regs(T (&R)[M][N][K], T val) {
   #pragma unroll
