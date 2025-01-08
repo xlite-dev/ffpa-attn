@@ -56,7 +56,7 @@ namespace swizzle {
 
 // i: row index; j: col index. 
 template<const int kColStride = 16, const int kStep = 8>
-static __device__ __forceinline__ int permuted_j(int i, int j) {
+static __device__ __forceinline__ int permuted(int i, int j) {
   // swizzle: ((int(j / kStep) ^ int(i / 4)) % int(kColStride / kStep)) * kStep;
   static_assert(kColStride <= 16, "Currently, kColStride must be less than or equal to 16.");
   static_assert(kStep == 4 || kStep == 8, "kStep must be 8 or 4.");
@@ -73,21 +73,21 @@ static __device__ __forceinline__ int permuted_j(int i, int j) {
 // e.g kColStride = kMmaAtomK = 16, kStep = 8 -> load 8 half as 128 bits memory issue.
 template<const int kMmaAtomK = 16>
 static __device__ __forceinline__ int permuted_Q_j(int i, int j) {
-  return permuted_j<kMmaAtomK, 8>(i, j);
+  return permuted<kMmaAtomK, 8>(i, j);
 }
 
 // i: row index; j: col index
 // e.g kColStride = kMmaAtomK = 16, kStep = 8 -> load 8 half as 128 bits memory issue.
 template<const int kMmaAtomK = 16>
 static __device__ __forceinline__ int permuted_K_j(int i, int j) {
-  return permuted_j<kMmaAtomK, 8>(i, j);
+  return permuted<kMmaAtomK, 8>(i, j);
 }
 
 // i: row index; j: col index
 // e.g kColStride = kMmaAtomN * 2 = 16, kStep = 8 -> load 8 half as 128 bits memory issue.
 template<const int kMmaAtomNx2 = 16>
 static __device__ __forceinline__ int permuted_V_j(int i, int j) {
-  return permuted_j<kMmaAtomNx2, 8>(i, j);
+  return permuted<kMmaAtomNx2, 8>(i, j);
 }
 
 } // swizzle
