@@ -85,7 +85,7 @@ The FFPA implemented in this repo can be install as a python library, namely, `c
 git clone https://github.com/DefTruth/cuffpa-py.git
 # clone, then, run bash .dev/install.sh directly or run commands:
 python3 setup.py bdist_wheel && rm -rf *.egg-info # build 'cuffpa-py' from sources
-cd dist && python3 -m pip install cuffpa-py-*-linux_x86_64.whl # pip uninstall cuffpa-py -y
+cd dist && python3 -m pip install cuffpa_py-*-linux_x86_64.whl # pip uninstall cuffpa-py -y
 ```
 
 ## 📖 FFPA L1 (Level 1): Benchmark 🎉🎉
