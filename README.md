@@ -25,7 +25,9 @@
 |✔️|✔️|✔️|?|
 -->
 
-NOTE: This project is still in its early development stages and currently provides a few experimental kernels and benchmarks for reference. More benchmarks data and features (FFPA **L2/L3** & more devices) will be added over time as the project continues to develop. Welcome to 🌟👆🏻star this repo to support me, many thanks ~ 🎉🎉
+NOTE: This project is still in its early development stages and currently provides a few experimental kernels and benchmarks for reference. More benchmarks data and features (FFPA **L2/L3** & more devices) will be added over time as the project continues to develop. 
+
+Welcome to 🌟👆🏻star this repo to support me, many thanks ~ 🎉🎉
 
 ## ©️Citations🎉🎉
 
@@ -92,7 +94,7 @@ cd dist && python3 -m pip install cuffpa_py-*-linux_x86_64.whl # pip uninstall c
 
 <div id="L1-bench"></div>
 
-L1: level 1, O(Brx16)~O(1) SRAM complexity, O(d/4) register complexity, the same GPU HBM memory complexity as FlashAttention. B=1, H=48, N=8192, **D=320-1024(FA2 not supported 👀)**. (Notes, `*`=MMA Acc F32, `^`=MMA Acc F16, Softmax Acc dtype is always be F32, T=TFLOPS, 👇Benchmark)
+L1: level 1, O(2xBrx16)≈O(1) SRAM complexity, O(d/4) register complexity, the same GPU HBM memory complexity as FlashAttention. B=1, H=48, N=8192, **D=320-1024(FA2 not supported 👀)**. (Notes, `*`=MMA Acc F32, `^`=MMA Acc F16, Softmax Acc dtype is always be F32, T=TFLOPS, 👇Benchmark)
 
 - 📚 NVIDIA RTX 3080 Laptop (`*`=MMA Acc F32, `^`=MMA Acc F16, `T`=TFLOPS)
 
@@ -144,7 +146,7 @@ export TORCH_CUDA_ARCH_LIST=Ada # for Ada only
 export TORCH_CUDA_ARCH_LIST=Ampere # for Ampere only
 cd tests && python3 test.py --B 1 --H 48 --N 8192 --show-all --D 320
 ```
-- 📚 case: B=1, H=48, N=8192, D=320(FA2 not supported), Device=NVIDIA RTX 4090.
+- 📚 case: B=1, H=48, N=8192, D=320(`FA2 not supported`), Device=NVIDIA RTX 4090.
 ```bash
 python3 tests/test.py --B 1 --H 48 --N 8192 --show-all --D 320
 -------------------------------------------------------------------------------------------------
