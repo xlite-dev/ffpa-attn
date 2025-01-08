@@ -69,8 +69,8 @@ def get_cuda_bare_metal_version(cuda_dir):
     return raw_output, bare_metal_version
 
 
-# package name managed by pip, which can be remove by `pip uninstall pyffpa -y`
-PACKAGE_NAME = "pyffpa"
+# package name managed by pip, which can be remove by `pip uninstall cuffpa-py -y`
+PACKAGE_NAME = "cuffpa-py"
 
 ext_modules = []
 generator_flag = []
