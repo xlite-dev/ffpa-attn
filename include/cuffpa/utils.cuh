@@ -13,6 +13,15 @@
 #include <torch/types.h>
 #include <torch/extension.h>
 
+namespace ffpa {
+namespace utils {
+
+__device__ __host__ inline 
+int div_ceil(int a, int b) { return (a % b != 0) ? (a / b + 1) : (a / b); }
+
+} // utils
+} // ffpa
+
 #define STRINGFY(str) #str
 #define TORCH_BINDING_COMMON_EXTENSION(func) \
   m.def(STRINGFY(func), &func, STRINGFY(func));
