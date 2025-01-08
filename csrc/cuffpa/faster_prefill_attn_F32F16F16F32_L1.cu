@@ -1,9 +1,10 @@
-#include "cuffpa/mma.cuh"
-#include "cuffpa/warp.cuh"
-#include "cuffpa/swizzle.cuh"
-#include "cuffpa/cp_async.cuh"
-#include "cuffpa/prefill.cuh"
-#include "cuffpa/utils.cuh"
+#include "cuffpa/mma.cuh" // mma
+#include "cuffpa/warp.cuh" // warp
+#include "cuffpa/swizzle.cuh" // swizzle
+#include "cuffpa/cp_async.cuh" // cp_async
+#include "cuffpa/prefill.cuh" // prefill
+#include "cuffpa/utils.cuh" // utils
+using namespace ffpa;  
 
 // Split Q across MMA(Warps) and keep access KV for all MMA(Warps),
 // in order to reduce the comm between warps via smem and warp shuffle.
@@ -75,7 +76,7 @@ ffpa_mma_stages_split_q_acc_f32_L1_kernel(half* Q,
   constexpr int Bc = kMmaAtomN * kMmaTileSeqLenK * kWarpTileSeqLenK; //  8*1*8=64
   static_assert(Br >= Bc); // for shared memory reuse.
   constexpr int kNumThreads = WARP_SIZE * kMmaTileSeqLenQ * kMmaTileSeqLenK; // 32*4*1=128, num threads
-  const int Tc = ffpa::utils::div_ceil(QKV_seqlen, Bc); // Tc K_tile[Bc,d]
+  const int Tc = utils::div_ceil(QKV_seqlen, Bc); // Tc K_tile[Bc,d]
   const float scale = 1.0f / sqrt((float) kHeadDim);
   
   const int QKV_batch_id = blockIdx.y / QKV_head; // Batch size
@@ -132,8 +133,8 @@ ffpa_mma_stages_split_q_acc_f32_L1_kernel(half* Q,
   // block m_old, l_old, store in lane, use float to keep precision.
   float lane_block_row_max_old[kWarpTileSeqLenQ][2]; // [1][2]
   float lane_block_row_sum_old[kWarpTileSeqLenQ][2]; // [1][2]
-  ffpa::prefill::fill_2D_regs<float, kWarpTileSeqLenQ, 2>(lane_block_row_max_old, -INFINITY);
-  ffpa::prefill::fill_2D_regs<float, kWarpTileSeqLenQ, 2>(lane_block_row_sum_old, 0.0f);
+  prefill::fill_2D_regs<float, kWarpTileSeqLenQ, 2>(lane_block_row_max_old, -INFINITY);
+  prefill::fill_2D_regs<float, kWarpTileSeqLenQ, 2>(lane_block_row_sum_old, 0.0f);
 
   // ---------------------- Registers for S=Q@K^T/O=P@V ----------------------------
   uint32_t R_Q[kWarpTileSeqLenQ][ 4]; // [1][4]
@@ -146,7 +147,7 @@ ffpa_mma_stages_split_q_acc_f32_L1_kernel(half* Q,
   // FP16 can provide precision to approximately 3-4 decimal places. Thus, if the 
   // error does not exceed 1e-3, using FP16 storage is sufficient for most applications.
   uint32_t R_D[kWarpTileSeqLenP][kWarpTileHeadDimV][(kOStorageAccFloat32) ? 4 : 2]; 
-  ffpa::prefill::fill_3D_regs<uint32_t, kWarpTileSeqLenP, kWarpTileHeadDimV, 
+  prefill::fill_3D_regs<uint32_t, kWarpTileSeqLenP, kWarpTileHeadDimV, 
                               ((kOStorageAccFloat32) ? 4 : 2)>(R_D, 0);
   
   // <loop over K seqlen>: for K^T[d,seqlen] with K^T_tile[d,Bc]
@@ -169,13 +170,13 @@ ffpa_mma_stages_split_q_acc_f32_L1_kernel(half* Q,
           uint32_t load_smem_Q_ptr = (
             smem_Q_base_ptr + (stage * Q_tile_size + 
                                load_smem_Q_Br * (kMmaAtomK + kPadQ) + 
-                              (kSwizzleQ ? ffpa::swizzle::permuted_j<kMmaAtomK>(
+                              (kSwizzleQ ? swizzle::permuted<kMmaAtomK>(
                                load_smem_Q_Br, load_smem_Q_d + i) : 
                                load_smem_Q_d + i )
                               ) * sizeof(half));
-          ffpa::cp_async::cp_async<half, 16>(load_smem_Q_ptr, &Q[load_gmem_Q_addr + i]);
+          cp_async::cp_async<16>(load_smem_Q_ptr, &Q[load_gmem_Q_addr + i]);
         }
-        ffpa::cp_async::commit_group();
+        cp_async::commit_group();
         
         // K g2s
         int load_gmem_K_Bc = (tile_K_seqlen * Bc) + load_smem_K_Bc; // < seqlen
@@ -188,16 +189,16 @@ ffpa_mma_stages_split_q_acc_f32_L1_kernel(half* Q,
           uint32_t load_smem_K_ptr = (
               smem_K_base_ptr + (stage * K_tile_size + 
                                  load_smem_K_Bc * (kMmaAtomK + kPadK) + 
-                                (kSwizzleK ? ffpa::swizzle::permuted_j<kMmaAtomK>(
+                                (kSwizzleK ? swizzle::permuted<kMmaAtomK>(
                                  load_smem_K_Bc, load_smem_K_d + i) : 
                                  load_smem_K_d + i)
                                 ) * sizeof(half)
           );
-          ffpa::cp_async::cp_async<half, 16>(load_smem_K_ptr, &K[load_gmem_K_addr + i]);
+          cp_async::cp_async<16>(load_smem_K_ptr, &K[load_gmem_K_addr + i]);
         }
-        ffpa::cp_async::commit_group();
+        cp_async::commit_group();
       } // end for stage
-      ffpa::cp_async::wait_group<(kStage - 2)>();
+      cp_async::wait_group<(kStage - 2)>();
       __syncthreads(); 
     } // end if kStage > 1
 
@@ -206,7 +207,7 @@ ffpa_mma_stages_split_q_acc_f32_L1_kernel(half* Q,
     // NOTE: K[Bc,d] with row major means K^T[d,Bc] in col major.
     // S_tile[Br,Bc]=Q_tile[Br,d]@K[Bc,d]
     // <HGEMM in shared memory>
-    ffpa::prefill::fill_3D_regs<uint32_t, kWarpTileSeqLenQ, kWarpTileSeqLenK, 4>(R_S, 0);
+    prefill::fill_3D_regs<uint32_t, kWarpTileSeqLenQ, kWarpTileSeqLenK, 4>(R_S, 0);
     #pragma unroll
     for (int tile_K_d = 0; tile_K_d < (kHeadDim / kMmaAtomK); ++tile_K_d) {
       // s2 tn 0->0, 1->1, 2->0; s3 tn 0->0, 1->1, 2->2, 3->0;
@@ -227,14 +228,14 @@ ffpa_mma_stages_split_q_acc_f32_L1_kernel(half* Q,
             uint32_t load_smem_Q_ptr = (
               smem_Q_base_ptr + (smem_sel_next * Q_tile_size + 
                                  load_smem_Q_Br * (kMmaAtomK + kPadQ) + 
-                                (kSwizzleQ ? ffpa::swizzle::permuted_j<kMmaAtomK>(
+                                (kSwizzleQ ? swizzle::permuted<kMmaAtomK>(
                                  load_smem_Q_Br, load_smem_Q_d + i) : 
                                  load_smem_Q_d + i)
                                 ) * sizeof(half)
             );
-            ffpa::cp_async::cp_async<half, 16>(load_smem_Q_ptr, &Q[load_gmem_Q_addr + i]);
+            cp_async::cp_async<16>(load_smem_Q_ptr, &Q[load_gmem_Q_addr + i]);
           }
-          ffpa::cp_async::commit_group();
+          cp_async::commit_group();
 
           // next K tile g2s
           int load_gmem_K_Bc = tile_K_seqlen * Bc + load_smem_K_Bc; // < seqlen
@@ -247,14 +248,14 @@ ffpa_mma_stages_split_q_acc_f32_L1_kernel(half* Q,
             uint32_t load_smem_K_ptr = (
               smem_K_base_ptr + (smem_sel_next * K_tile_size + 
                                  load_smem_K_Bc * (kMmaAtomK + kPadK) + 
-                                (kSwizzleK ? ffpa::swizzle::permuted_j<kMmaAtomK>(
+                                (kSwizzleK ? swizzle::permuted<kMmaAtomK>(
                                  load_smem_K_Bc, load_smem_K_d + i) : 
                                  load_smem_K_d + i)
                                 ) * sizeof(half)
             );
-            ffpa::cp_async::cp_async<half, 16>(load_smem_K_ptr, &K[load_gmem_K_addr + i]);
+            cp_async::cp_async<16>(load_smem_K_ptr, &K[load_gmem_K_addr + i]);
           }
-          ffpa::cp_async::commit_group();
+          cp_async::commit_group();
         } 
       } else {
         // sync load curr Q, K g2s
@@ -268,14 +269,14 @@ ffpa_mma_stages_split_q_acc_f32_L1_kernel(half* Q,
           uint32_t load_smem_Q_ptr = (
             smem_Q_base_ptr + (smem_sel * Q_tile_size + 
                                load_smem_Q_Br * (kMmaAtomK + kPadQ) + 
-                              (kSwizzleQ ? ffpa::swizzle::permuted_j<kMmaAtomK>(
+                              (kSwizzleQ ? swizzle::permuted<kMmaAtomK>(
                                load_smem_Q_Br, load_smem_Q_d + i) : 
                                load_smem_Q_d + i)
                               ) * sizeof(half)
           );
-          ffpa::cp_async::cp_async<half, 16>(load_smem_Q_ptr, &Q[load_gmem_Q_addr + i]);
+          cp_async::cp_async<16>(load_smem_Q_ptr, &Q[load_gmem_Q_addr + i]);
         }
-        ffpa::cp_async::commit_group();
+        cp_async::commit_group();
 
         // curr K tile g2s
         int load_gmem_K_Bc = (tile_K_seqlen * Bc) + load_smem_K_Bc; // < seqlen
@@ -288,16 +289,16 @@ ffpa_mma_stages_split_q_acc_f32_L1_kernel(half* Q,
           uint32_t load_smem_K_ptr = (
             smem_K_base_ptr + (smem_sel * K_tile_size + 
                                load_smem_K_Bc * (kMmaAtomK + kPadK) + 
-                              (kSwizzleK ? ffpa::swizzle::permuted_j<kMmaAtomK>(
+                              (kSwizzleK ? swizzle::permuted<kMmaAtomK>(
                                load_smem_K_Bc, load_smem_K_d + i) : 
                                load_smem_K_d + i)
                               ) * sizeof(half)
           );
-          ffpa::cp_async::cp_async<half, 16>(load_smem_K_ptr, &K[load_gmem_K_addr + i]);
+          cp_async::cp_async<16>(load_smem_K_ptr, &K[load_gmem_K_addr + i]);
         }
-        ffpa::cp_async::commit_group();
+        cp_async::commit_group();
         // Wait curr Q, K tile ready.
-        ffpa::cp_async::wait_group<0>();
+        cp_async::wait_group<0>();
         __syncthreads(); 
       } // end if kStage > 1
 
@@ -310,12 +311,12 @@ ffpa_mma_stages_split_q_acc_f32_L1_kernel(half* Q,
         uint32_t lane_smem_Q_ptr = (
           smem_Q_base_ptr + (smem_sel * Q_tile_size + 
                              lane_smem_Q_Br * (kMmaAtomK + kPadQ) + 
-                            (kSwizzleQ ? ffpa::swizzle::permuted_j<kMmaAtomK>(
+                            (kSwizzleQ ? swizzle::permuted<kMmaAtomK>(
                              lane_smem_Q_Br, lane_smem_Q_d): 
                              lane_smem_Q_d )
                             ) * sizeof(half)
         );
-        ffpa::mma::ldmatrix_m8n8x4(
+        mma::ldmatrix_m8n8x4(
           &R_Q[0][0], &R_Q[0][1], &R_Q[0][2], &R_Q[0][3], lane_smem_Q_ptr
         );
       }
@@ -332,12 +333,12 @@ ffpa_mma_stages_split_q_acc_f32_L1_kernel(half* Q,
         uint32_t lane_smem_K_ptr = (
           smem_K_base_ptr + (smem_sel * K_tile_size + 
                              lane_smem_K_Bc * (kMmaAtomK + kPadK) + 
-                            (kSwizzleK ? ffpa::swizzle::permuted_j<kMmaAtomK>(
+                            (kSwizzleK ? swizzle::permuted<kMmaAtomK>(
                              lane_smem_K_Bc, lane_smem_K_d): 
                              lane_smem_K_d )
                             ) * sizeof(half)
         );
-        ffpa::mma::ldmatrix_m8n8x2(&R_K[j][0], &R_K[j][1], lane_smem_K_ptr);
+        mma::ldmatrix_m8n8x2(&R_K[j][0], &R_K[j][1], lane_smem_K_ptr);
       } // end for kWarpTileSeqLenK
       if constexpr (kStage < 2) {
         // Wait Q, K s2r ready if kStage < 2 in order to avoid 
@@ -351,7 +352,7 @@ ffpa_mma_stages_split_q_acc_f32_L1_kernel(half* Q,
         #pragma unroll
         for (int j = 0; j < kWarpTileSeqLenK; ++j) { // 8, 16, 32, ...
           // MMA always accumulate with F32 dtype for high precision.
-          ffpa::mma::m16n8k16_f16f16f32(
+          mma::m16n8k16_f16f16f32(
             &R_S[0][j][0], &R_S[0][j][1], &R_S[0][j][2], &R_S[0][j][3],
             &R_Q[0][0],    &R_Q[0][1],    &R_Q[0][2],    &R_Q[0][3], 
             &R_K[j][0],    &R_K[j][1], 
@@ -362,7 +363,7 @@ ffpa_mma_stages_split_q_acc_f32_L1_kernel(half* Q,
 
       if constexpr (kStage > 1) {
         // Wait next Q, K tile g2s ready.
-        ffpa::cp_async::wait_group<(kStage - 2)>();
+        cp_async::wait_group<(kStage - 2)>();
         __syncthreads(); 
       }
 
@@ -379,8 +380,8 @@ ffpa_mma_stages_split_q_acc_f32_L1_kernel(half* Q,
     // Online safe softmax, warp/block reduce max/sum, row wise
     float lane_row_max_new[kWarpTileSeqLenQ][2]; // [1][2]
     float lane_row_sum_new[kWarpTileSeqLenQ][2]; // [1][2]
-    ffpa::prefill::fill_2D_regs<float, kWarpTileSeqLenQ, 2>(lane_row_max_new, -INFINITY);
-    ffpa::prefill::fill_2D_regs<float, kWarpTileSeqLenQ, 2>(lane_row_sum_new, 0.0f);
+    prefill::fill_2D_regs<float, kWarpTileSeqLenQ, 2>(lane_row_max_new, -INFINITY);
+    prefill::fill_2D_regs<float, kWarpTileSeqLenQ, 2>(lane_row_sum_new, 0.0f);
 
     static_assert(kWarpTileSeqLenQ == 1);
     // Row max for [Br,Bc] tile, Thread -> Warp -> Block.
@@ -415,8 +416,8 @@ ffpa_mma_stages_split_q_acc_f32_L1_kernel(half* Q,
       // Warp level reduce max, warp_size = 4
       // Each thread contains the maximum of 2 rows of Br, 
       // and only the values of T0, T4, ..., T28 are used.
-      lane_row_max_new[0][0] = ffpa::warp::reduce_max<float, 4>(lane_row_max_new[0][0]);
-      lane_row_max_new[0][1] = ffpa::warp::reduce_max<float, 4>(lane_row_max_new[0][1]);
+      lane_row_max_new[0][0] = warp::reduce_max<float, 4>(lane_row_max_new[0][0]);
+      lane_row_max_new[0][1] = warp::reduce_max<float, 4>(lane_row_max_new[0][1]);
     } // end for kWarpTileSeqLenQ
 
     static_assert(kWarpTileSeqLenQ == 1);
@@ -456,8 +457,8 @@ ffpa_mma_stages_split_q_acc_f32_L1_kernel(half* Q,
       } // end for kWarpTileSeqLenK
 
       // Warp level reduce sum, warp_size = 4
-      lane_row_sum_new[0][0] = ffpa::warp::reduce_sum<float, 4>(lane_row_sum_new[0][0]);
-      lane_row_sum_new[0][1] = ffpa::warp::reduce_sum<float, 4>(lane_row_sum_new[0][1]);
+      lane_row_sum_new[0][0] = warp::reduce_sum<float, 4>(lane_row_sum_new[0][0]);
+      lane_row_sum_new[0][1] = warp::reduce_sum<float, 4>(lane_row_sum_new[0][1]);
     }
     
     // Prefetch V g2s before row max/sum for P@V if kStage > 1
@@ -476,15 +477,15 @@ ffpa_mma_stages_split_q_acc_f32_L1_kernel(half* Q,
             uint32_t load_smem_V_ptr = (
               smem_V_base_ptr + (stage * V_tile_size + 
                                  load_smem_V_Bc * (kMmaAtomN * 2 + kPadV) + 
-                                (kSwizzleV ? ffpa::swizzle::permuted_j<kMmaAtomN * 2>(
+                                (kSwizzleV ? swizzle::permuted<kMmaAtomN * 2>(
                                  load_smem_V_Bc, load_smem_V_d + i) : 
                                  load_smem_V_d + i)
                                 ) * sizeof(half)
                                 
             );
-            ffpa::cp_async::cp_async<half, 16>(load_smem_V_ptr, &V[load_gmem_V_addr + i]);
+            cp_async::cp_async<16>(load_smem_V_ptr, &V[load_gmem_V_addr + i]);
           }
-          ffpa::cp_async::commit_group();
+          cp_async::commit_group();
         }
       }
     }
@@ -531,7 +532,7 @@ ffpa_mma_stages_split_q_acc_f32_L1_kernel(half* Q,
       
       // Wait V g2s stages ready.
       if constexpr (kStage > 1) {
-        ffpa::cp_async::wait_group<(kStage - 2)>(); // s2->0, s3->1, s4->2
+        cp_async::wait_group<(kStage - 2)>(); // s2->0, s3->1, s4->2
         __syncthreads(); 
       }
 
@@ -539,8 +540,6 @@ ffpa_mma_stages_split_q_acc_f32_L1_kernel(half* Q,
       #pragma unroll
       for (int j = 0; j < kWarpTileHeadDimV; ++j) { // 8, 16, 32, ...
         // Compute d tile, P[Br,Bc]@V[Bc,16] = O[Br,16]
-        ffpa::prefill::fill_1D_regs<uint32_t, 4>(R_O, 0); // must clear 
-
         int smem_sel_v = (j / 2) % kStage;   
         int smem_sel_v_next = ((j / 2) + (kStage - 1)) % kStage;
         // V g2s, V tile smem [Bc,kMmaAtomN*2]=[64,16]
@@ -557,14 +556,14 @@ ffpa_mma_stages_split_q_acc_f32_L1_kernel(half* Q,
                 uint32_t load_smem_V_ptr = (
                   smem_V_base_ptr + (smem_sel_v_next * V_tile_size + 
                                      load_smem_V_Bc * (kMmaAtomN * 2 + kPadV) + 
-                                    (kSwizzleV ? ffpa::swizzle::permuted_j<kMmaAtomN * 2>(
+                                    (kSwizzleV ? swizzle::permuted<kMmaAtomN * 2>(
                                      load_smem_V_Bc, load_smem_V_d + i) : 
                                      load_smem_V_d + i)
                                     ) * sizeof(half)
                 );
-                ffpa::cp_async::cp_async<half, 16>(load_smem_V_ptr, &V[load_gmem_V_addr + i]);
+                cp_async::cp_async<16>(load_smem_V_ptr, &V[load_gmem_V_addr + i]);
               }
-              ffpa::cp_async::commit_group();
+              cp_async::commit_group();
             } // end if < (kWarpTileHeadDimV / 2)
           } else {
             // no stages for V g2s
@@ -578,20 +577,21 @@ ffpa_mma_stages_split_q_acc_f32_L1_kernel(half* Q,
               uint32_t load_smem_V_ptr = (
                 smem_V_base_ptr + (smem_sel_v * V_tile_size + 
                                    load_smem_V_Bc * (kMmaAtomN * 2 + kPadV) + 
-                                  (kSwizzleV ? ffpa::swizzle::permuted_j<kMmaAtomN * 2>(
+                                  (kSwizzleV ? swizzle::permuted<kMmaAtomN * 2>(
                                    load_smem_V_Bc, load_smem_V_d + i) : 
                                    load_smem_V_d + i)
                                   ) * sizeof(half)
               );
-              ffpa::cp_async::cp_async<half, 16>(load_smem_V_ptr, &V[load_gmem_V_addr + i]);
+              cp_async::cp_async<16>(load_smem_V_ptr, &V[load_gmem_V_addr + i]);
             }
-            ffpa::cp_async::commit_group();
+            cp_async::commit_group();
             // Wait curr V tile g2s ready.
-            ffpa::cp_async::wait_group<0>();
+            cp_async::wait_group<0>();
             __syncthreads(); 
           }
         }
 
+        prefill::fill_1D_regs<uint32_t, 4>(R_O, 0); // must clear 
         #pragma unroll
         for (int tile_V_Bc = 0; tile_V_Bc < (Bc / kMmaAtomK); ++tile_V_Bc) {
           // Load k16n8 V from smem [Bc,8*2] -> regs, R_V, ldmatrix.x2.trans.
@@ -601,12 +601,12 @@ ffpa_mma_stages_split_q_acc_f32_L1_kernel(half* Q,
           uint32_t lane_smem_V_ptr = (
             smem_V_base_ptr + (smem_sel_v * V_tile_size + 
                                lane_smem_V_Bc * (kMmaAtomN * 2 + kPadV) + 
-                              (kSwizzleV ? ffpa::swizzle::permuted_j<kMmaAtomN * 2>(
+                              (kSwizzleV ? swizzle::permuted<kMmaAtomN * 2>(
                                lane_smem_V_Bc, lane_smem_V_d) : 
                                lane_smem_V_d)
                               ) * sizeof(half)
           );
-          ffpa::mma::ldmatrix_m8n8x2_t(&R_V[0], &R_V[1], lane_smem_V_ptr);
+          mma::ldmatrix_m8n8x2_t(&R_V[0], &R_V[1], lane_smem_V_ptr);
           // Compute P[Br,Bc]@V[Bc,d] = O[Br,d]
           // For R_S[1][8][2], mapping the layout below of P matrix.
           // MMA = m16n8k16, Br=16x4=64, Bc=8x8=64, layout: 4 warps
@@ -621,7 +621,7 @@ ffpa_mma_stages_split_q_acc_f32_L1_kernel(half* Q,
           // tile_V_Bc = 3, all curr MMAs(0~4) need slice P[:, 48:64], 6, 7; stored in all MMAs. 
           int w = tile_V_Bc * 2; // MMA(Warp) selected, 0, 2, 4, 6
           // MMA always accumulate with F32 dtype for high precision.
-          ffpa::mma::m16n8k16_f16f16f32(
+          mma::m16n8k16_f16f16f32(
             &R_O[0], &R_O[1], &R_O[2], &R_O[3],
             &R_S[0][w][0], &R_S[0][w][1], &R_S[0][w + 1][0],  &R_S[0][w + 1][1], 
             &R_V[0], &R_V[1],
@@ -663,7 +663,7 @@ ffpa_mma_stages_split_q_acc_f32_L1_kernel(half* Q,
         // before P@V tile (>= Ampere) and copy async O 128bits r2g (>= Hopper).
         if constexpr (kStage > 1) {
           // Wait next V tile g2s ready.
-          ffpa::cp_async::wait_group<(kStage - 2)>();
+          cp_async::wait_group<(kStage - 2)>();
           __syncthreads();
         }
       } // end for kWarpTileHeadDimV. 
@@ -742,8 +742,8 @@ ffpa_mma_stages_split_q_acc_f32_L1_kernel(half* Q,
           O_gmem_offset + (store_lane_gmem_O_Br + 0) * kHeadDim + store_lane_gmem_O_d);
         int store_gmem_O_addr_1 = (
           O_gmem_offset + (store_lane_gmem_O_Br + 8) * kHeadDim + store_lane_gmem_O_d);
-        ffpa::cp_async::stg_sync_128b<half, uint32_t>(&O[store_gmem_O_addr_0], t_uptr_Z_0);
-        ffpa::cp_async::stg_sync_128b<half, uint32_t>(&O[store_gmem_O_addr_1], t_uptr_Z_1);
+        cp_async::stg_sync_128b(&O[store_gmem_O_addr_0], t_uptr_Z_0);
+        cp_async::stg_sync_128b(&O[store_gmem_O_addr_1], t_uptr_Z_1);
       }
     } // end for kWarpTileHeadDimV
   } // kWarpTileSeqLenP = 1
@@ -796,7 +796,7 @@ void launch_ffpa_mma_acc_f32_L1(torch::Tensor Q,
   assert(QKV_seqlen % max(Br, Bc) == 0); // multiple of max(Br, Bc)
   
   // Tr(=N/Br), batch_size x num_heads
-  dim3 grid(ffpa::utils::div_ceil(QKV_seqlen, Br), QKV_batch * QKV_head); 
+  dim3 grid(utils::div_ceil(QKV_seqlen, Br), QKV_batch * QKV_head); 
   dim3 block(kNumThreads); // 4/8 warps per block
 
   cudaFuncSetAttribute(
