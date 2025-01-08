@@ -64,7 +64,7 @@ __device__ __forceinline__ void ldmatrix_m8n8x4(
   );
 }
 
-__device__ __forceinline__ void ldmatrix_m8n8x4_t(
+__device__ __forceinline__ void ldmatrix_m8n8x4_trans(
   uint32_t * R0, uint32_t * R1, uint32_t * R2, uint32_t * R3, 
   uint32_t smem_ptr
 ) {
@@ -88,7 +88,7 @@ __device__ __forceinline__ void ldmatrix_m8n8x2(
   );
 }
 
-__device__ __forceinline__ void ldmatrix_m8n8x2_t(
+__device__ __forceinline__ void ldmatrix_m8n8x2_trans(
   uint32_t * R0, uint32_t * R1, 
   uint32_t smem_ptr
 ) {
