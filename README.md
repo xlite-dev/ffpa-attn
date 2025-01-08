@@ -25,7 +25,7 @@
 |✔️|✔️|✔️|?|
 -->
 
-NOTE: This project is still in its early development stages and currently provides a few experimental kernels and benchmarks for reference. More features (FFPA **L2/L3**) will be added in the future. Welcome to 🌟👆🏻star this repo to support me, many thanks ~ 🎉🎉
+NOTE: This project is still in its early dev stages and now provides a few experimental kernels and benchmarks for reference. More features will be added in the future. Welcome to 🌟👆🏻star this repo to support me, many thanks ~ 🎉🎉
 
 ## ©️Citations🎉🎉
 
