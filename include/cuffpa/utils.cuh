@@ -13,6 +13,15 @@
 #include <torch/types.h>
 #include <torch/extension.h>
 
+namespace ffpa {
+namespace utils {
+
+__device__ __host__ inline 
+int div_ceil(int a, int b) { return (a % b != 0) ? (a / b + 1) : (a / b); }
+
+} // utils
+} // ffpa
+
 #define STRINGFY(str) #str
 #define TORCH_BINDING_COMMON_EXTENSION(func) \
   m.def(STRINGFY(func), &func, STRINGFY(func));
@@ -34,7 +43,7 @@ if (((T2).size(0) != (T1).size(0)) ||                \
 #define HALF2(value) (reinterpret_cast<half2*>(&(value))[0])
 
 
-#ifdef FFPA_MMA_DEBUG
+#ifdef ENABLE_FFPA_DEBUG
 #define FFPA_MMA_PRINT_T0_REG(R, format, ...)    \
 {                                                \
   if (tid == 0) {                                \

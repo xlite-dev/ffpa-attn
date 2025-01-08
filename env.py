@@ -86,13 +86,18 @@ class ENV(object):
     @staticmethod
     def get_build_sources():
         def csrc(sub_dir, filename):
-            return f"{ENV.project_dir()}/csrc/{sub_dir}/{filename}"
+            csrc_file = f"{ENV.project_dir()}/csrc/{sub_dir}/{filename}"
+            if ENV.enable_debug():
+                pretty_print_line(f"csrc_file: {csrc_file}", sep="", mode="left")
+            return csrc_file
 
+        pretty_print_line()
         build_sources = [
             csrc("pybind", "faster_prefill_attn_api.cc"),
-            csrc("deprecated", "faster_prefill_attn_F16F16F16F16_L1.cu"),
-            csrc("deprecated", "faster_prefill_attn_F32F16F16F32_L1.cu"),
+            csrc("cuffpa", "faster_prefill_attn_F16F16F16F16_L1.cu"),
+            csrc("cuffpa", "faster_prefill_attn_F32F16F16F32_L1.cu"),
         ]
+        pretty_print_line()
         return build_sources
 
     @staticmethod
