@@ -1,6 +1,5 @@
 import argparse
 import math
-import os
 import random
 import sys
 import time
@@ -12,10 +11,9 @@ import torch
 from torch import Tensor
 from torch.nn import functional as F
 from torch.nn.attention import sdpa_kernel, SDPBackend
-from torch.utils.cpp_extension import load
 
 sys.path.append("../")
-from env import ENV
+from env import ENV, pretty_print_line
 
 torch.set_grad_enabled(False)
 torch.set_printoptions(
@@ -53,7 +51,6 @@ def get_args():
 
 
 args = get_args()
-use_pyffpa_package = False
 ENV.list_ffpa_env()
 
 
@@ -64,112 +61,16 @@ def set_rand_seed(seed: int = 1):
     torch.cuda.manual_seed_all(seed)
 
 
-def get_device_name():
-    device_name = torch.cuda.get_device_name(torch.cuda.current_device())
-    # since we will run GPU on WSL2, so add WSL2 tag.
-    if "Laptop" in device_name:
-        device_name += " WSL2"
-    return device_name
-
-
-def get_device_capability():
-    return torch.cuda.get_device_capability(torch.cuda.current_device())
-
-
-def get_build_sources():
-    build_sources = []
-    build_sources = [
-        f"{ENV.project_dir()}/csrc/pybind/faster_prefill_attn_api.cc",
-        f"{ENV.project_dir()}/csrc/deprecated/faster_prefill_attn_F16F16F16F16_L1.cu",
-        f"{ENV.project_dir()}/csrc/deprecated/faster_prefill_attn_F32F16F16F32_L1.cu",
-    ]
-    return build_sources
-
-
-def get_build_cuda_cflags(build_pkg: bool = False):
-    extra_cuda_cflags = []
-    extra_cuda_cflags.append("-O3")
-    extra_cuda_cflags.append("-std=c++17")
-    extra_cuda_cflags.append("-U__CUDA_NO_HALF_OPERATORS__")
-    extra_cuda_cflags.append("-U__CUDA_NO_HALF_CONVERSIONS__")
-    extra_cuda_cflags.append("-U__CUDA_NO_HALF2_OPERATORS__")
-    extra_cuda_cflags.append("-U__CUDA_NO_BFLOAT16_CONVERSIONS__")
-    extra_cuda_cflags.append("--expt-relaxed-constexpr")
-    extra_cuda_cflags.append("--expt-extended-lambda")
-    extra_cuda_cflags.append("--use_fast_math")
-    extra_cuda_cflags.append("-DFFPA_MMA_DEBUG" if args.debug else "")
-    extra_cuda_cflags.append(
-        "-diag-suppress 177" if not build_pkg else "--ptxas-options=-v"
-    )
-    extra_cuda_cflags.append("-Xptxas -v" if not build_pkg else "--ptxas-options=-O3")
-    extra_cuda_cflags.extend(ENV.env_cuda_cflags())
-    extra_cuda_cflags.append(f"-I {ENV.project_dir()}/include")
-    return extra_cuda_cflags
-
-
-def get_build_cflags():
-    extra_cflags = []
-    extra_cflags.append("-std=c++17")
-    return extra_cflags
-
-
-def pretty_print_line(m: str = "", sep: str = "-", width: int = 150):
-    res_len = width - len(m)
-    left_len = int(res_len / 2)
-    right_len = res_len - left_len
-    pretty_line = sep * left_len + m + sep * right_len
-    print(pretty_line)
-
-
-def build_pyffpa_from_sources(verbose: bool = False):
-    torch_arch_list_env = os.environ.get("TORCH_CUDA_ARCH_LIST", None)
-    # Load the CUDA kernel as a python module
-    pretty_print_line(
-        f"Loading pyffpa lib on device: {get_device_name()}, "
-        f"capability: {get_device_capability()}, "
-        f"Arch ENV: {torch_arch_list_env}"
-    )
-    return load(
-        name="pyffpa_cuda",
-        sources=get_build_sources(),
-        extra_cuda_cflags=get_build_cuda_cflags(),
-        extra_cflags=get_build_cflags(),
-        verbose=verbose,
-    )
-
-
-def try_load_pyffpa_library(force_build: bool = False, verbose: bool = False):
-    global use_pyffpa_package
-    if not force_build:
-        # check if can import toy_hgemm
-        try:
-            import pyffpa
-
-            pretty_print_line("Import pyffpa library done, use it!")
-            use_pyffpa_package = True
-            return pyffpa
-        except Exception:
-            pretty_print_line("Can't import pyffpa, force build from sources")
-            pretty_print_line(
-                "Also may need export LD_LIBRARY_PATH="
-                "PATH-TO/torch/lib:$LD_LIBRARY_PATH"
-            )
-            pyffpa = build_pyffpa_from_sources(verbose=verbose)
-            use_pyffpa_package = False
-            return pyffpa
-    else:
-        pretty_print_line("Force pyffpa lib build from sources")
-        pyffpa = build_pyffpa_from_sources(verbose=verbose)
-        use_pyffpa_package = False
-        return pyffpa
-
-
 pretty_print_line()
 print(args)
 pretty_print_line()
 
 # Load the CUDA kernel as a python module
-pyffpa = try_load_pyffpa_library(force_build=args.force_build, verbose=args.verbose)
+pyffpa, use_pyffpa_package = ENV.try_load_pyffpa_library(
+    force_build=args.force_build, verbose=args.verbose
+)
+if use_pyffpa_package:
+    import pyffpa  # tricks for IDE code search
 
 
 def get_mha_tflops(
