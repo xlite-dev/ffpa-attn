@@ -1,9 +1,4 @@
-#include "cuffpa/mma.cuh" // mma
-#include "cuffpa/warp.cuh" // warp
-#include "cuffpa/swizzle.cuh" // swizzle
-#include "cuffpa/cp_async.cuh" // cp_async
 #include "cuffpa/prefill.cuh" // prefill
-#include "cuffpa/utils.cuh" // utils
 using namespace ffpa;  
 
 // Split Q across MMA(Warps) and keep access KV for all MMA(Warps),
@@ -606,7 +601,7 @@ ffpa_mma_stages_split_q_acc_f32_L1_kernel(half* Q,
                                lane_smem_V_d)
                               ) * sizeof(half)
           );
-          mma::ldmatrix_m8n8x2_t(&R_V[0], &R_V[1], lane_smem_V_ptr);
+          mma::ldmatrix_m8n8x2_trans(&R_V[0], &R_V[1], lane_smem_V_ptr);
           // Compute P[Br,Bc]@V[Bc,d] = O[Br,d]
           // For R_S[1][8][2], mapping the layout below of P matrix.
           // MMA = m16n8k16, Br=16x4=64, Bc=8x8=64, layout: 4 warps
