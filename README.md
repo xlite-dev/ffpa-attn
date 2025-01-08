@@ -11,7 +11,7 @@
   <img src=https://img.shields.io/badge/License-GPLv3.0-turquoise.svg >
  </div>
 
-🤖 [WIP] **FFPA**: Yet antother **Faster Flash Prefill Attention** with **O(1) SRAM complexity** & **O(d/4) or O(1) register complexity** for large headdim (D > 256), almost **>1.5x** 🎉 faster than SDPA EA with or without MMA Accumulation F32 on many devices, such as NVIDIA L20, 4090, 3080 Laptop (Experimental 👀~). The FFPA kernels are modified from my repo 📖[CUDA-Learn-Notes](https://github.com/DefTruth/CUDA-Learn-Notes/tree/main/kernels/flash-attn)  ![](https://img.shields.io/github/stars/DefTruth/CUDA-Learn-Notes.svg?style=social).
+🤖 [WIP] **FFPA**: Yet antother **Faster Flash Prefill Attention** with **O(1) SRAM complexity** & **O(d/4) or O(1) register complexity** for large headdim (D > 256), almost **>1.5x** 🎉 faster than SDPA EA with or without MMA Accumulation F32 on many devices, such as NVIDIA L20, 4090, 3080 Laptop (Experimental 👀~). The FFPA kernels are modified from my repo 📖[CUDA-Learn-Notes](https://github.com/DefTruth/CUDA-Learn-Notes/tree/main/kernels/flash-attn)  ![](https://img.shields.io/github/stars/DefTruth/CUDA-Learn-Notes.svg?style=social). 
 
 <!--
 |Tensor Cores|Loop over N/D |Tile Block (Br, Bc) |MMA (m16n8k16)|
@@ -25,15 +25,15 @@
 |✔️|✔️|✔️|?|
 -->
 
-NOTE: This project is still in its early development stages and currently provides a few experimental kernels and benchmarks for reference. More benchmarks data and features (FFPA **L2/L3** & more devices) will be added over time as the project continues to develop.
+NOTE: This project is still in its early dev stages and now provides a few experimental kernels and benchmarks for reference. More features will be added in the future. Welcome to 🌟👆🏻star this repo to support me ~ 🎉🎉
 
 ## ©️Citations🎉🎉
 
 ```BibTeX
-@misc{faster-prefill-attention@2025,
-  title={FFPA: Yet another Faster Flash Prefill Attention with O(1) SRAM complexity for large headdim.},
-  url={https://github.com/DefTruth/faster-prefill-attention},
-  note={Open-source software available at https://github.com/DefTruth/faster-prefill-attention},
+@misc{cuffpa-py@2025,
+  title={FFPA: Yet another Faster Flash Prefill Attention for large headdim.},
+  url={https://github.com/DefTruth/cuffpa-py},
+  note={Open-source software available at https://github.com/DefTruth/cuffpa-py},
   author={DefTruth etc},
   year={2025}
 }
@@ -80,19 +80,19 @@ By leveraging this approach, we can achieve better performance for large headdim
 
 <div id="install"></div>
 
-The FFPA implemented in this repo can be install as a python library, namely, `pyffpa` library (optional).
+The FFPA implemented in this repo can be install as a python library, namely, `cuffpa-py` library (optional).
 ```bash
-# clone, then, run .dev/install.sh directly or run commands as belows
-git clone https://github.com/DefTruth/faster-prefill-attention.git
-python3 setup.py bdist_wheel && rm -rf *.egg-info # build 'pyffpa' from sources
-cd dist && python3 -m pip install pyffpa-*-linux_x86_64.whl # pip uninstall pyffpa -y
+git clone https://github.com/DefTruth/cuffpa-py.git
+# clone, then, run bash .dev/install.sh directly or run commands:
+python3 setup.py bdist_wheel && rm -rf *.egg-info # build 'cuffpa-py' from sources
+cd dist && python3 -m pip install cuffpa_py-*-linux_x86_64.whl # pip uninstall cuffpa-py -y
 ```
 
 ## 📖 FFPA L1 (Level 1): Benchmark 🎉🎉
 
 <div id="L1-bench"></div>
 
-L1: level 1, O(Brx16)~O(1) SRAM complexity, O(d/4) register complexity, the same GPU HBM memory complexity as FlashAttention. B=1, H=48, N=8192, **D=320-1024(FA2 not supported 👀)**. (Notes, `*`=MMA Acc F32, `^`=MMA Acc F16, Softmax Acc dtype is always be F32, T=TFLOPS, 👇Benchmark)
+L1: level 1, O(2xBrx16)≈O(1) SRAM complexity, O(d/4) register complexity, the same GPU HBM memory complexity as FlashAttention. B=1, H=48, N=8192, **D=320-1024(FA2 not supported 👀)**. (Notes, `*`=MMA Acc F32, `^`=MMA Acc F16, Softmax Acc dtype is always be F32, T=TFLOPS, 👇Benchmark)
 
 - 📚 NVIDIA RTX 3080 Laptop (`*`=MMA Acc F32, `^`=MMA Acc F16, `T`=TFLOPS)
 
@@ -144,7 +144,7 @@ export TORCH_CUDA_ARCH_LIST=Ada # for Ada only
 export TORCH_CUDA_ARCH_LIST=Ampere # for Ampere only
 cd tests && python3 test.py --B 1 --H 48 --N 8192 --show-all --D 320
 ```
-- 📚 case: B=1, H=48, N=8192, D=320(FA2 not supported), Device=NVIDIA RTX 4090.
+- 📚 case: B=1, H=48, N=8192, D=320(`FA2 not supported`), Device=NVIDIA RTX 4090.
 ```bash
 python3 tests/test.py --B 1 --H 48 --N 8192 --show-all --D 320
 -------------------------------------------------------------------------------------------------
