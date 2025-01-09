@@ -157,6 +157,18 @@ python3 test.py --B 1 --H 48 --N 8192 --show-all --D 320 # NVIDIA RTX 4090
  (ffpa+acc+f16+L1+stage2): ['-0.01747131 '], time:26.98ms, TFLOPS:153.41(+12.51%)(~1.87x)
 -------------------------------------------------------------------------------------------------
 ```
+- 👇 Generate benchmark table on Your own device (Welcome to PR your benchmark table)
+```bash
+python3 test.py --gen-bench --show-all # tested on NVIDIA L20
+|Algorithm|320|384|448|512|576|640|704|768|832|896|960|1024|
+|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+|SDPA EA|56T|64T|58T|58T|55T|56T|54T|55T|54T|55T|54T|56T|
+|FFPA L1*|98T|100T|102T|94T|94T|93T|93T|92T|90T|91T|90T|91T|
+|Speedup|1.75x|1.56x|1.76x|1.62x|1.71x|1.66x|1.72x|1.67x|1.67x|1.65x|1.67x|1.62x|
+|FFPA L1^|96T|97T|101T|98T|100T|92T|92T|90T|90T|90T|89T|89T|
+|Speedup|1.71x|1.52x|1.74x|1.69x|1.82x|1.64x|1.7x|1.64x|1.67x|1.64x|1.65x|1.59x|
+```
+
 
 ## ©️License
 
