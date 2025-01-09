@@ -148,7 +148,6 @@ cd tests && python3 test.py --B 1 --H 48 --N 8192 --show-all --D 320
 - 📚 case: B=1, H=48, N=8192, D=320(`FA2 not supported`), Device=NVIDIA RTX 4090.
 ```bash
 python3 test.py --B 1 --H 48 --N 8192 --show-all --D 320 # NVIDIA RTX 4090
--------------------------------------------------------------------------------------------------
 -----------------------------B=1, H=48, N=8192, D=320, Warmup: 1, Iters: 5-----------------------
                    (sdpa): ['-0.01750183 '], time:50.36ms, TFLOPS:82.19 (+0.00 %)(~1.00x)
  (ffpa+acc+f32+L1+stage1): ['-0.01754761 '], time:40.23ms, TFLOPS:102.87(+25.17%)(~1.25x)
@@ -157,7 +156,7 @@ python3 test.py --B 1 --H 48 --N 8192 --show-all --D 320 # NVIDIA RTX 4090
  (ffpa+acc+f16+L1+stage2): ['-0.01747131 '], time:26.98ms, TFLOPS:153.41(+12.51%)(~1.87x)
 -------------------------------------------------------------------------------------------------
 ```
-- 👇 Generate benchmark table on Your own device (Welcome to PR your benchmark table)
+- 📚 case: Generate benchmark table on Your own device (Welcome to PR your benchmark table 🎉🎉)
 ```bash
 python3 test.py --gen-bench --show-all # tested on NVIDIA L20
 |Algorithm|320|384|448|512|576|640|704|768|832|896|960|1024|
