@@ -393,64 +393,18 @@ ffpa_mma_stages_split_q_acc_f32_L1_kernel(
   // Finaly, we still have to rescale O once more.
   // O_output(D) = ( 1/l_final ) * O_final (FA2 paper)
   static_assert(kWarpTileSeqLenP == 1);
-  { // kWarpTileSeqLenP = 1
-    float rescale_factor_0 = __frcp_rn(lane_block_row_sum_old[0][0]);
-    float rescale_factor_1 = __frcp_rn(lane_block_row_sum_old[0][1]);
-    #pragma unroll
-    for (int j = 0; j < kWarpTileHeadDimV; ++j) { // 8, 16, 32, ...
-      // Scaling in registers & convert F32 -> half for O collective store.
-      if constexpr (kOStorageAccFloat32) {
-        float* t_fptr_D_0_1 = reinterpret_cast<float*>(&(R_D[0][j][0])); 
-        half*  t_hptr_D_0_1 = reinterpret_cast< half*>(&(R_D[0][j][0])); 
-        t_hptr_D_0_1[0] = __float2half_rn(rescale_factor_0 * t_fptr_D_0_1[0]);
-        t_hptr_D_0_1[1] = __float2half_rn(rescale_factor_0 * t_fptr_D_0_1[1]);
-        t_hptr_D_0_1[2] = __float2half_rn(rescale_factor_1 * t_fptr_D_0_1[2]);
-        t_hptr_D_0_1[3] = __float2half_rn(rescale_factor_1 * t_fptr_D_0_1[3]);
-      } else {
-        half* t_hptr_D_0_1 = reinterpret_cast<half*>(&(R_D[0][j][0])); 
-        t_hptr_D_0_1[0] = __float2half_rn(rescale_factor_0 * __half2float(t_hptr_D_0_1[0]));
-        t_hptr_D_0_1[1] = __float2half_rn(rescale_factor_0 * __half2float(t_hptr_D_0_1[1]));
-        t_hptr_D_0_1[2] = __float2half_rn(rescale_factor_1 * __half2float(t_hptr_D_0_1[2]));
-        t_hptr_D_0_1[3] = __float2half_rn(rescale_factor_1 * __half2float(t_hptr_D_0_1[3]));
-      }
-    } // end for kWarpTileHeadDimV
-  } // end for kWarpTileSeqLenP = 1
+  prefill::sync_recaling_final_o<kWarpTileHeadDimV, kOStorageAccFloat32>(
+    &R_D[0][0][0], &lane_block_row_sum_old[0][0]
+  );
 
   // Store O(D): Write O[Br,d] from regs -> gmem, collective store 
   // with reg reuse & warp shuffle. 
   static_assert(kWarpTileSeqLenP == 1);
-  { // kWarpTileSeqLenP = 1
-    #pragma unroll
-    for (int j = 0; j < kWarpTileHeadDimV; ++j) { // 8
-      // reuse R_Q[1][4], R_K[8][2] for collective store.
-      uint32_t* t_uptr_Z_0 = reinterpret_cast<uint32_t*>(&(R_Q[0][0])); 
-      uint32_t* t_uptr_Z_1 = reinterpret_cast<uint32_t*>(&(R_K[0][0])); 
-      t_uptr_Z_0[0] = R_D[0][j][0]; 
-      t_uptr_Z_1[0] = R_D[0][j][1]; 
-      t_uptr_Z_0[1] = __shfl_sync((0xffffffff), R_D[0][j][0], lane_id + 1, 4);
-      t_uptr_Z_0[2] = __shfl_sync((0xffffffff), R_D[0][j][0], lane_id + 2, 4);
-      t_uptr_Z_0[3] = __shfl_sync((0xffffffff), R_D[0][j][0], lane_id + 3, 4);
-      t_uptr_Z_1[1] = __shfl_sync((0xffffffff), R_D[0][j][1], lane_id + 1, 4);
-      t_uptr_Z_1[2] = __shfl_sync((0xffffffff), R_D[0][j][1], lane_id + 2, 4);
-      t_uptr_Z_1[3] = __shfl_sync((0xffffffff), R_D[0][j][1], lane_id + 3, 4);
-
-      // st.global.v4 128 bits. [Br,d]
-      if (lane_id % 4 == 0) {
-        // (0/1)*32 + (0/1)*16=(0,16,32,48), + 0~7 -> 0~56
-        int store_warp_regs_O_Br = warp_QP * (kMmaAtomM * kWarpTileSeqLenP ) + 0 * kMmaAtomM;
-        int store_lane_gmem_O_Br = O_tile_id * Br + store_warp_regs_O_Br + lane_id / 4; // 0~7
-        // (0~3)*16 + (0/1)*8=(0,8,16,24,...,48,56)
-        int store_warp_regs_O_d = warp_KV * (kMmaAtomN * kWarpTileHeadDimV) + j * kMmaAtomN;
-        int store_lane_gmem_O_d = store_warp_regs_O_d; // (0~3)*16+(0/8)
-        int store_gmem_O_addr_0 = (
-          O_gmem_offset + (store_lane_gmem_O_Br + 0) * kHeadDim + store_lane_gmem_O_d);
-        int store_gmem_O_addr_1 = (
-          O_gmem_offset + (store_lane_gmem_O_Br + 8) * kHeadDim + store_lane_gmem_O_d);
-        cp_async::stg_sync_128b(&O[store_gmem_O_addr_0], t_uptr_Z_0);
-        cp_async::stg_sync_128b(&O[store_gmem_O_addr_1], t_uptr_Z_1);
-      }
-    } // end for kWarpTileHeadDimV
-  } // kWarpTileSeqLenP = 1
+  prefill::sync_store_o_r2g<
+    Br, kHeadDim, kMmaAtomM, kMmaAtomN, kWarpTileHeadDimV>(
+      O, O_gmem_offset, O_tile_id, warp_QP, &R_D[0][0][0], 
+      &R_Q[0][0], &R_K[0][0]
+  );
 }
 
 template<const int kHeadDim, const int kStage>
