@@ -139,9 +139,7 @@ L1: level 1, O(2xBrx16)≈O(1) SRAM complexity, O(d/4) register complexity, the 
 
 👇 You can test many custom FFPA kernels via Python and figure out the difference in their performance.
 ```bash
-# You can test Ada or Ampere only, also, Volta, Ampere, Ada, Hopper, ...
-export TORCH_CUDA_ARCH_LIST=Ada # for Ada only
-export TORCH_CUDA_ARCH_LIST=Ampere # for Ampere only
+# You can test on many devices, such as Volta, Ampere, Ada, Hopper, ...
 cd tests && python3 test.py --B 1 --H 48 --N 8192 --show-all --D 320
 ```
 - 📚 case: B=1, H=48, N=8192, D=320(`FA2 not supported`), Device=NVIDIA RTX 4090.
