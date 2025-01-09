@@ -254,7 +254,7 @@ def run_benchmark(
         print(out)
     time.sleep(args.sleep)
     torch.cuda.synchronize()
-    return out.clone(), mean_time
+    return out.clone() if args.check else out, mean_time
 
 
 def gen_bench_markdown_table():
@@ -477,6 +477,8 @@ for (B, H, N, D) in BHNDs:
         )
     pretty_print_line()
 
+    del q; del k; del v; del o; del fq; del fk; del fv; del tk; del tv
+    torch.cuda.empty_cache()
     torch.cuda.synchronize()
     if args.check:
         check_all_close(out_sdpa, out_ffpa_l1_f321, "out_ffpa_l1_f321", args.check_all)
