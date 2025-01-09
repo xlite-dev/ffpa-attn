@@ -108,11 +108,11 @@ L1: level 1, O(2xBrx16)≈O(1) SRAM complexity, O(d/4) register complexity, the 
 
 |Algorithm|320|384|448|512|576|640|704|768|832|896|960|1024|
 |:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-|SDPA EA|82T|92T|83T|84T|78T|80T|78T|80T|78T|80T|78T|79T|
-|FFPA L1*|136T|135T|135T|132T|133T|133T|132T|131T|130T|125T|123T|93T|
-|Speedup|1.64x|1.45x|1.61x|1.57x|1.71x|1.65x|1.68x|1.62x|1.65x|1.56x|1.55x|1.17x|
-|FFPA L1^|154T|161T|160T|157T|156T|155T|157T|154T|149T|150T|145T|100T|
-|Speedup|1.85x|1.73x|1.92x|1.87x|1.99x|1.93x|1.99x|1.90x|1.90x|1.88x|1.84x|1.25x|
+|SDPA EA|80T|94T|86T|85T|79T|81T|79T|81T|79T|80T|79T|72T|
+|FFPA L1*|135T|140T|143T|135T|134T|134T|134T|134T|131T|131T|130T|131T|
+|Speedup|1.69x|1.49x|1.66x|1.59x|1.7x|1.65x|1.7x|1.65x|1.66x|1.64x|1.65x|1.82x|
+|FFPA L1^|153T|155T|157T|157T|159T|157T|157T|156T|151T|151T|150T|153T|
+|Speedup|1.91x|1.65x|1.83x|1.85x|2.01x|1.94x|1.99x|1.93x|1.91x|1.89x|1.9x|2.12x|
 
 - 📚 NVIDIA L20 (`*`=MMA Acc F32, `^`=MMA Acc F16, `T`=TFLOPS)
 
@@ -123,7 +123,6 @@ L1: level 1, O(2xBrx16)≈O(1) SRAM complexity, O(d/4) register complexity, the 
 |Speedup|1.75x|1.56x|1.76x|1.62x|1.71x|1.66x|1.72x|1.67x|1.67x|1.65x|1.67x|1.62x|
 |FFPA L1^|96T|97T|101T|98T|100T|92T|92T|90T|90T|90T|89T|89T|
 |Speedup|1.71x|1.52x|1.74x|1.69x|1.82x|1.64x|1.7x|1.64x|1.67x|1.64x|1.65x|1.59x|
-
 
 - 📚 NVIDIA A30 (`*`=MMA Acc F32, `^`=MMA Acc F16, `T`=TFLOPS)
 
@@ -158,14 +157,14 @@ python3 test.py --B 1 --H 48 --N 8192 --show-all --D 320 # NVIDIA RTX 4090
 ```
 - 📚 case: Generate benchmark table on Your own device (Welcome to PR your benchmark table 🎉🎉)
 ```bash
-python3 test.py --gen-bench --show-all # tested on NVIDIA L20
+python3 test.py --gen-bench --show-all # NVIDIA RTX 4090
 |Algorithm|320|384|448|512|576|640|704|768|832|896|960|1024|
 |:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-|SDPA EA|56T|64T|58T|58T|55T|56T|54T|55T|54T|55T|54T|56T|
-|FFPA L1*|98T|100T|102T|94T|94T|93T|93T|92T|90T|91T|90T|91T|
-|Speedup|1.75x|1.56x|1.76x|1.62x|1.71x|1.66x|1.72x|1.67x|1.67x|1.65x|1.67x|1.62x|
-|FFPA L1^|96T|97T|101T|98T|100T|92T|92T|90T|90T|90T|89T|89T|
-|Speedup|1.71x|1.52x|1.74x|1.69x|1.82x|1.64x|1.7x|1.64x|1.67x|1.64x|1.65x|1.59x|
+|SDPA EA|80T|94T|86T|85T|79T|81T|79T|81T|79T|80T|79T|72T|
+|FFPA L1*|135T|140T|143T|135T|134T|134T|134T|134T|131T|131T|130T|131T|
+|Speedup|1.69x|1.49x|1.66x|1.59x|1.7x|1.65x|1.7x|1.65x|1.66x|1.64x|1.65x|1.82x|
+|FFPA L1^|153T|155T|157T|157T|159T|157T|157T|156T|151T|151T|150T|153T|
+|Speedup|1.91x|1.65x|1.83x|1.85x|2.01x|1.94x|1.99x|1.93x|1.91x|1.89x|1.9x|2.12x|
 ```
 
 
