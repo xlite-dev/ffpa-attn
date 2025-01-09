@@ -46,10 +46,10 @@ NOTE: This project is still in its early dev stages and now provides a few exper
 - [📖 Python Testing](#python-test)
 - [📖 FFPA L1~L3 Design](#ffpa-design)
 - [📖 FFPA L1 Benchmark](#L1-bench)
-- [📚 NVIDIA L20 ~1.7x↑🎉](#L1-bench)
-- [📚 NVIDIA A30 ~1.5x↑🎉](#L1-bench)
-- [📚 NVIDIA 3080 ~2.5x↑🎉](#L1-bench)
-- [📚 NVIDIA 4090 ~1.8x↑🎉](#L1-bench)
+- [📚 FFPA L1: L20 ~1.7x↑🎉](#L1-bench)
+- [📚 FFPA L1: A30 ~1.5x↑🎉](#L1-bench)
+- [📚 FFPA L1: 3080 ~2.5x↑🎉](#L1-bench)
+- [📚 FFPA L1: 4090 ~1.8x↑🎉](#L1-bench)
 
 ## 📖 FFPA L1~L3: FlashAttention + QKV Fine-grained Tiling at MMA level 🔑️
 <div id="ffpa-design"></div>
