@@ -4,6 +4,8 @@ from env import ENV
 from packaging.version import Version
 from setuptools import find_packages, setup
 from torch.utils.cpp_extension import BuildExtension, CUDA_HOME, CUDAExtension
+import warnings
+warnings.filterwarnings("ignore")
 
 
 def get_long_description():
