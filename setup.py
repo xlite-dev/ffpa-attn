@@ -4,6 +4,8 @@ from env import ENV
 from packaging.version import Version
 from setuptools import find_packages, setup
 from torch.utils.cpp_extension import BuildExtension, CUDA_HOME, CUDAExtension
+import warnings
+warnings.filterwarnings("ignore")
 
 
 def get_long_description():
@@ -46,7 +48,7 @@ ext_modules.append(
     CUDAExtension(
         # package name for import
         name="pyffpa_cuda",
-        sources=ENV.get_build_sources(),
+        sources=ENV.get_build_sources(build_pkg=True),
         extra_compile_args={
             # add c compile flags
             "cxx": ["-O3", "-std=c++17"] + generator_flag,

@@ -30,7 +30,6 @@ __device__ __forceinline__ void cp_async_qkv_g2s(
   //  V: tile_V_d < (kHeadDim / kMmaAtomN * 2)
   if (d_tile_id >= (kHeadDim / kMmaAtomK)) { return; }
   const int tid = threadIdx.x; // within block
-  const int Q_tile_id = blockIdx.x; // Q tile_id, range [0, Tr]
   constexpr bool kSwizzle = (kPad == 0) ? true : false;
   // Mapping QKV tid -> smem, tile size [64/128, 16]
   // Br 64, tid / 2, row 0~64
