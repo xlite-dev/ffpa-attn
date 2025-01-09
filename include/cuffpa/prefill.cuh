@@ -1,15 +1,4 @@
 #pragma once
-#include <stdio.h>
-#include <stdlib.h>
-#include <stdint.h>
-#include <float.h>
-#include <vector>
-#include <algorithm>
-#include <cuda_runtime.h>
-#include <cuda_fp16.h>
-#include <cuda_bf16.h>
-#include <cuda_fp8.h>
-#include <mma.h>
 #include "cuffpa/mma.cuh" // ffpa::mma
 #include "cuffpa/warp.cuh" // ffpa::warp
 #include "cuffpa/swizzle.cuh" // ffpa::swizzle
@@ -19,39 +8,6 @@
 namespace ffpa {
 namespace prefill {
 // prefill utils: prefetch/load QKV g2s funcs, rescale/softmax funcs etc.
-template<typename T, int M, const int N, const int K = 2>
-__device__ inline void fill_3D_regs(T (&R)[M][N][K], T val) {
-  #pragma unroll
-  for (int i = 0; i < M; ++i) {
-    #pragma unroll
-    for (int j = 0; j < N; ++j) {
-      #pragma unroll
-      for (int k = 0; k < K; ++k) {
-        R[i][j][k] = val;
-      }
-    }
-  }
-}
-
-template<typename T, int M, const int N = 2>
-__device__ inline void fill_2D_regs(T (&R)[M][N], T val) {
-  #pragma unroll
-  for (int i = 0; i < M; ++i) {
-    #pragma unroll
-    for (int j = 0; j < N; ++j) {
-      R[i][j] = val;
-    }
-  }
-}
-
-template<typename T, int M>
-__device__ inline void fill_1D_regs(T (&S)[M], T val) {
-  #pragma unroll
-  for (int i = 0; i < M; ++i) {
-    S[i] = val;
-  }
-}
-
 // cp_async & commit_group
 template<
   const int BrOrBc,
@@ -69,6 +25,9 @@ __device__ __forceinline__ void cp_async_qkv_g2s(
   const int d_tile_id,    // headdim offset, tile_K_d * kMmaAtomK, tile_V_d * kMmaAtomN * 2
   const int stage         // stage * QKV tile_size
 ) {
+  // QK: tile_K_d < (kHeadDim / kMmaAtomK)
+  //  V: tile_V_d < (kHeadDim / kMmaAtomN * 2)
+  if (d_tile_id >= (kHeadDim / kMmaAtomK)) { return; }
   const int tid = threadIdx.x; // within block
   const int Q_tile_id = blockIdx.x; // Q tile_id, range [0, Tr]
   constexpr bool kSwizzle = (kPad == 0) ? true : false;
@@ -112,10 +71,10 @@ template<
 >
 __device__ __forceinline__ void sync_fetch_qkv_frags(
   uint32_t smem_base_ptr, // QKV smem base ptr
-  uint32_t * R, 
+  uint32_t * R,           // Register ptr, R_QKV
   const int mma_tile_id,  // Q warp_QP 0~num MMAs, KV warp_KV 0
   const int warp_tile_id, // Q 0, KV 0~kWarpTileSeqLenK
-  const int n_tile_id,   // seqlen QK 0, V tile_V_Bc
+  const int n_tile_id,    // seqlen QK 0, V tile_V_Bc
   const int stage
 ) {
   const int lane_id = threadIdx.x % WARP_SIZE; // 0~31
