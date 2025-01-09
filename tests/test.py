@@ -47,6 +47,7 @@ def get_args():
     parser.add_argument(
         "--force-build", "--build", action="store_true", help="Force build from sources"
     )
+    parser.add_argument("--gen-bench-table", "--gen-bench", action="store_true")
     return parser.parse_args()
 
 
@@ -114,7 +115,8 @@ def get_mha_tflops(
 
 
 MAX_TFLOPS = -1
-STATIS_INFO: dict[str, list[float]] = {}
+STATIS_INFO: dict[str, list[float | int] | set] = {}
+STATIS_INFO["headdim"] = set()
 TOATL_TFLOPS: dict[str, float] = {}
 SDPA_TFLOPS = -1
 
@@ -156,6 +158,8 @@ def run_benchmark(
     B, H, N, D = q.size()
     if "flash" in tag:
         B, N, H, D = q.size()
+
+    STATIS_INFO["headdim"].add(D)
 
     max_supported_D = MAX_HEADDIM_CFG.get(tag, None)
     # skip if headdim not supported.
@@ -203,6 +207,12 @@ def run_benchmark(
     mean_secs = total_secs / iters
 
     TFLOPS = get_mha_tflops(B, H, N, D, mean_secs, only_matmul=args.only_flops_matmul)
+    if tag in STATIS_INFO:
+        STATIS_INFO[tag].append(int(round(TFLOPS)))
+    else:
+        STATIS_INFO[tag] = []
+        STATIS_INFO[tag].append(int(round(TFLOPS)))
+
     if "sdpa" in tag:
         SDPA_TFLOPS = TFLOPS
     out_info = f"{tag}"
@@ -244,7 +254,51 @@ def run_benchmark(
         print(out)
     time.sleep(args.sleep)
     torch.cuda.synchronize()
-    return out.clone(), mean_time
+    return out.clone() if args.check else out, mean_time
+
+
+def gen_bench_markdown_table():
+    global STATIS_INFO
+    STATIS_INFO["headdim"] = sorted(list(STATIS_INFO["headdim"]))
+    pretty_print_line("FFPA Benchmark Data")
+    print(STATIS_INFO)
+    pretty_print_line()
+    headdims = [str(d) for d in STATIS_INFO["headdim"]]
+    num_headdim = len(headdims)
+    table_header = "|Algorithm|" + "|".join(headdims) + "|\n"
+    table_header += "|:---:|" + ":---:|" * num_headdim
+    # calculate improved
+    sdpa_tflops = STATIS_INFO["(sdpa)"]
+    ffpa_l1_f322_tflops = STATIS_INFO["(ffpa+acc+f32+L1+stage2)"]
+    ffpa_l1_f322_speedup = [
+        round(f / s, 2) for f, s in zip(ffpa_l1_f322_tflops, sdpa_tflops)
+    ]
+    ffpa_l1_f162_tflops = STATIS_INFO["(ffpa+acc+f16+L1+stage2)"]
+    ffpa_l1_f162_speedup = [
+        round(f / s, 2) for f, s in zip(ffpa_l1_f162_tflops, sdpa_tflops)
+    ]
+    # sdpa, ffpa, speedup strings.
+    sdpa_str = "|SDPA EA|" + "|".join([str(s) + "T" for s in sdpa_tflops]) + "|"
+    ffpa_l1_f32_str = (
+        "|FFPA L1*|" + "|".join([str(f) + "T" for f in ffpa_l1_f322_tflops]) + "|"
+    )
+    ffpa_l1_f32_speedup_str = (
+        "|Speedup|" + "|".join([str(fs) + "x" for fs in ffpa_l1_f322_speedup]) + "|"
+    )
+    ffpa_l1_f16_str = (
+        "|FFPA L1^|" + "|".join([str(f) + "T" for f in ffpa_l1_f162_tflops]) + "|"
+    )
+    ffpa_l1_f16_speedup_str = (
+        "|Speedup|" + "|".join([str(fs) + "x" for fs in ffpa_l1_f162_speedup]) + "|"
+    )
+    pretty_print_line("FFPA Benchmark Markdown Table")
+    print(table_header)
+    print(sdpa_str)
+    print(ffpa_l1_f32_str)
+    print(ffpa_l1_f32_speedup_str)
+    print(ffpa_l1_f16_str)
+    print(ffpa_l1_f16_speedup_str)
+    pretty_print_line()
 
 
 def get_qkvo(B, H, N, D):
@@ -323,10 +377,10 @@ def check_all_close(
     )
 
 
-Bs = [1, 4, 8] if not args.B else [args.B]
-Hs = [8, 16, 48] if not args.H else [args.H]
-Ns = [1024, 2048, 4096, 8192] if not args.N else [args.N]
-Ds = list(range(256, 1024, 64)) if not args.D else [args.D]
+Bs = [1] if not args.B else [args.B]
+Hs = [48] if not args.H else [args.H]
+Ns = [8192] if not args.N else [args.N]
+Ds = list(range(320, 1024 + 64, 64)) if not args.D else [args.D]
 # batch_size, n_head, seq_len, head_dim (B,H,N,D)
 BHNDs = [(B, H, N, D) for B in Bs for H in Hs for N in Ns for D in Ds]
 # max headdim supported for different methods. skip if D > max_D.
@@ -423,6 +477,8 @@ for (B, H, N, D) in BHNDs:
         )
     pretty_print_line()
 
+    del q; del k; del v; del o; del fq; del fk; del fv; del tk; del tv
+    torch.cuda.empty_cache()
     torch.cuda.synchronize()
     if args.check:
         check_all_close(out_sdpa, out_ffpa_l1_f321, "out_ffpa_l1_f321", args.check_all)
@@ -430,3 +486,6 @@ for (B, H, N, D) in BHNDs:
         check_all_close(out_sdpa, out_ffpa_l1_f161, "out_ffpa_l1_f161", args.check_all)
         check_all_close(out_sdpa, out_ffpa_l1_f162, "out_ffpa_l1_f161", args.check_all)
         pretty_print_line()
+
+if args.gen_bench_table:
+    gen_bench_markdown_table()
