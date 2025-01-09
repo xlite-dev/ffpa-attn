@@ -59,7 +59,6 @@ ffpa_mma_stages_split_q_kernel_acc_f16_L1(
   const int O_tile_id    = Q_tile_id;             // O tile_id, same as Q.
   const int tid          = threadIdx.x;           // within block
   const int warp_id      = tid / WARP_SIZE;       // 0~7 warp_id within block
-  const int lane_id      = tid % WARP_SIZE;       // 0~31
   const int warp_QP      = warp_id;               // 0,1,2,3 or 0~7
   const int warp_KV      = 0;                     // 0
   const int Q_gmem_offset = ((QKV_batch_id * QKV_head * QKV_seqlen * kHeadDim) + 
