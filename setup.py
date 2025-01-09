@@ -48,7 +48,7 @@ ext_modules.append(
     CUDAExtension(
         # package name for import
         name="pyffpa_cuda",
-        sources=ENV.get_build_sources(),
+        sources=ENV.get_build_sources(build_pkg=True),
         extra_compile_args={
             # add c compile flags
             "cxx": ["-O3", "-std=c++17"] + generator_flag,
