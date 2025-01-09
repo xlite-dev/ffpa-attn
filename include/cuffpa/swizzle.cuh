@@ -61,33 +61,17 @@ static __device__ __forceinline__ int permuted(int i, int j) {
   static_assert(kColStride <= 16, "Currently, kColStride must be less than or equal to 16.");
   static_assert(kStep == 4 || kStep == 8, "kStep must be 8 or 4.");
   static_assert(kColStride % kStep == 0, "kColStride must be multiple of kStep.");
-  if constexpr (kStep == 8) {
-    return (((j >> 3) ^ (i >> 2)) % (kColStride >> 3)) << 3;
+  // Fast permute for case kColStride = 16 & kStep = 8
+  if constexpr (kColStride == 16 && kStep == 8) {
+    return (j) ? 0 : 8; // 0 -> 8, 8 -> 0
   } else {
-    static_assert(kStep == 4);
-    return (((j >> 2) ^ (i >> 2)) % (kColStride >> 2)) << 2;
+    if constexpr (kStep == 8) {
+      return (((j >> 3) ^ (i >> 2)) % (kColStride >> 3)) << 3;
+    } else {
+      static_assert(kStep == 4);
+      return (((j >> 2) ^ (i >> 2)) % (kColStride >> 2)) << 2;
+    }
   }
-}
-
-// i: row index; j: col index
-// e.g kColStride = kMmaAtomK = 16, kStep = 8 -> load 8 half as 128 bits memory issue.
-template<const int kMmaAtomK = 16>
-static __device__ __forceinline__ int permuted_Q_j(int i, int j) {
-  return permuted<kMmaAtomK, 8>(i, j);
-}
-
-// i: row index; j: col index
-// e.g kColStride = kMmaAtomK = 16, kStep = 8 -> load 8 half as 128 bits memory issue.
-template<const int kMmaAtomK = 16>
-static __device__ __forceinline__ int permuted_K_j(int i, int j) {
-  return permuted<kMmaAtomK, 8>(i, j);
-}
-
-// i: row index; j: col index
-// e.g kColStride = kMmaAtomN * 2 = 16, kStep = 8 -> load 8 half as 128 bits memory issue.
-template<const int kMmaAtomNx2 = 16>
-static __device__ __forceinline__ int permuted_V_j(int i, int j) {
-  return permuted<kMmaAtomNx2, 8>(i, j);
 }
 
 } // swizzle
