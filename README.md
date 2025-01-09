@@ -41,7 +41,6 @@ NOTE: This project is still in its early dev stages and now provides a few exper
 
 ## 📖 Contents
 
-- [📖 Prerequisites](#prerequisites)
 - [📖 Installation⚙️](#install)
 - [📖 Python Testing👇](#python-test)
 - [📖 FFPA L1~L3 Design💡](#ffpa-design)
