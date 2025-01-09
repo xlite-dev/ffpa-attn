@@ -11,7 +11,7 @@ warnings.filterwarnings("ignore")
 def get_long_description():
     description = (Path(ENV.project_dir()) / "README.md").read_text(encoding="utf-8")
     # replace relative repository path to absolute link to the release
-    static_url = "https://github.com/DefTruth/faster-prefill-attention/blob/main"
+    static_url = "https://github.com/DefTruth/cuffpa-py/blob/main"
     description = description.replace("docs/", f"{static_url}/docs/")
     return description
 
@@ -92,7 +92,7 @@ setup(
     description="FFPA: Yet another Faster Flash Prefill Attention for large headdim, ~1.5x faster than SDPA EA.",
     long_description=get_long_description(),
     long_description_content_type="text/markdown",
-    url="https://github.com/DefTruth/faster-prefill-attention",
+    url="https://github.com/DefTruth/cuffpa-py",
     ext_modules=ext_modules,
     cmdclass={"build_ext": BuildExtension},
     python_requires=">=3.10",
