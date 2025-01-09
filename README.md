@@ -41,14 +41,13 @@ NOTE: This project is still in its early dev stages and now provides a few exper
 
 ## 📖 Contents
 
-- [📖 Prerequisites](#prerequisites)
-- [📖 Installation](#install)
-- [📖 FFPA L1~L3 Design](#ffpa-design)
-- [📖 FFPA L1 Benchmark](#L1-bench)
-- [📖 FFPA L2 Benchmark](#L1-bench)
-- [📖 FFPA L3 Benchmark](#L1-bench)
-- [📖 Python Testing](#python-test)
-- [📖 References](#ref)
+- [📖 Installation⚙️](#install)
+- [📖 Python Testing👇](#python-test)
+- [📖 FFPA L1~L3 Design💡](#ffpa-design)
+- [📈 FFPA L1: L20 ~1.7x↑🎉](#L1-bench)
+- [📈 FFPA L1: A30 ~1.5x↑🎉](#L1-bench)
+- [📈 FFPA L1: 3080 ~2.5x↑🎉](#L1-bench)
+- [📈 FFPA L1: 4090 ~1.8x↑🎉](#L1-bench)
 
 ## 📖 FFPA L1~L3: FlashAttention + QKV Fine-grained Tiling at MMA level 🔑️
 <div id="ffpa-design"></div>
@@ -94,27 +93,7 @@ cd dist && python3 -m pip install cuffpa_py-*-linux_x86_64.whl # pip uninstall c
 
 L1: level 1, O(2xBrx16)≈O(1) SRAM complexity, O(d/4) register complexity, the same GPU HBM memory complexity as FlashAttention. B=1, H=48, N=8192, **D=320-1024(FA2 not supported 👀)**. (Notes, `*`=MMA Acc F32, `^`=MMA Acc F16, Softmax Acc dtype is always be F32, T=TFLOPS, 👇Benchmark)
 
-- 📚 NVIDIA RTX 3080 Laptop (`*`=MMA Acc F32, `^`=MMA Acc F16, `T`=TFLOPS)
-
-|Algorithm|320|384|448|512|576|640|704|768|832|896|960|1024|
-|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-|SDPA EA|13T|16T|12T|16T|15T|15T|15T|15T|15T|15T|15T|15T|
-|FFPA L1*|32T|30T|30T|28T|28T|27T|26T|25T|25T|25T|25T|24T|
-|Speedup|2.48x|1.88x|2.55x|1.75x|1.90x|1.77x|1.73x|1.67x|1.66x|1.66x|1.66x|1.54x|
-|FFPA L1^|40T|38T|39T|36T|35T|34T|33T|32T|31T|31T|28T|27T|
-|Speedup|3.07x|2.42x|3.33x|2.24x|2.35x|2.19x|2.19x|2.13x|2.03x|2.03x|1.90x|1.74x|
-
-- 📚 NVIDIA RTX 4090 (`*`=MMA Acc F32, `^`=MMA Acc F16, `T`=TFLOPS)
-
-|Algorithm|320|384|448|512|576|640|704|768|832|896|960|1024|
-|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-|SDPA EA|80T|94T|86T|85T|79T|81T|79T|81T|79T|80T|79T|72T|
-|FFPA L1*|135T|140T|143T|135T|134T|134T|134T|134T|131T|131T|130T|131T|
-|Speedup|1.69x|1.49x|1.66x|1.59x|1.7x|1.65x|1.7x|1.65x|1.66x|1.64x|1.65x|1.82x|
-|FFPA L1^|153T|155T|157T|157T|159T|157T|157T|156T|151T|151T|150T|153T|
-|Speedup|1.91x|1.65x|1.83x|1.85x|2.01x|1.94x|1.99x|1.93x|1.91x|1.89x|1.9x|2.12x|
-
-- 📚 NVIDIA L20 (`*`=MMA Acc F32, `^`=MMA Acc F16, `T`=TFLOPS)
+- 📚 NVIDIA L20 (`*`=MMA Acc F32, `^`=MMA Acc F16, `T`=TFLOPS, **~1.7x↑🎉**)
 
 |Algorithm|320|384|448|512|576|640|704|768|832|896|960|1024|
 |:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
@@ -124,7 +103,7 @@ L1: level 1, O(2xBrx16)≈O(1) SRAM complexity, O(d/4) register complexity, the 
 |FFPA L1^|96T|97T|101T|98T|100T|92T|92T|90T|90T|90T|89T|89T|
 |Speedup|1.71x|1.52x|1.74x|1.69x|1.82x|1.64x|1.7x|1.64x|1.67x|1.64x|1.65x|1.59x|
 
-- 📚 NVIDIA A30 (`*`=MMA Acc F32, `^`=MMA Acc F16, `T`=TFLOPS)
+- 📚 NVIDIA A30 (`*`=MMA Acc F32, `^`=MMA Acc F16, `T`=TFLOPS, **~1.5x↑🎉**)
 
 |Algorithm|320|384|448|512|576|640|704|768|832|896|960|1024|
 |:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
@@ -133,6 +112,26 @@ L1: level 1, O(2xBrx16)≈O(1) SRAM complexity, O(d/4) register complexity, the 
 |Speedup|1.24x|1.24x|1.63x|1.36x|1.35x|1.3x|1.5x|1.36x|1.32x|1.27x|1.32x|1.56x|
 |FFPA L1^|31T|31T|32T|31T|31T|31T|31T|30T|30T|30T|29T|29T|
 |Speedup|1.24x|1.24x|1.68x|1.41x|1.35x|1.35x|1.55x|1.36x|1.36x|1.36x|1.32x|1.61x|
+
+- 📚 NVIDIA RTX 3080 Laptop (`*`=MMA Acc F32, `^`=MMA Acc F16, `T`=TFLOPS, **~2.5x↑🎉**)
+
+|Algorithm|320|384|448|512|576|640|704|768|832|896|960|1024|
+|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+|SDPA EA|13T|16T|12T|16T|15T|15T|15T|15T|15T|15T|15T|15T|
+|FFPA L1*|32T|30T|30T|28T|28T|27T|26T|25T|25T|25T|25T|24T|
+|Speedup|2.48x|1.88x|2.55x|1.75x|1.90x|1.77x|1.73x|1.67x|1.66x|1.66x|1.66x|1.54x|
+|FFPA L1^|40T|38T|39T|36T|35T|34T|33T|32T|31T|31T|28T|27T|
+|Speedup|3.07x|2.42x|3.33x|2.24x|2.35x|2.19x|2.19x|2.13x|2.03x|2.03x|1.90x|1.74x|
+
+- 📚 NVIDIA RTX 4090 (`*`=MMA Acc F32, `^`=MMA Acc F16, `T`=TFLOPS, **~1.8x↑🎉**)
+
+|Algorithm|320|384|448|512|576|640|704|768|832|896|960|1024|
+|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+|SDPA EA|80T|94T|86T|85T|79T|81T|79T|81T|79T|80T|79T|72T|
+|FFPA L1*|135T|140T|143T|135T|134T|134T|134T|134T|131T|131T|130T|131T|
+|Speedup|1.69x|1.49x|1.66x|1.59x|1.7x|1.65x|1.7x|1.65x|1.66x|1.64x|1.65x|1.82x|
+|FFPA L1^|153T|155T|157T|157T|159T|157T|157T|156T|151T|151T|150T|153T|
+|Speedup|1.91x|1.65x|1.83x|1.85x|2.01x|1.94x|1.99x|1.93x|1.91x|1.89x|1.9x|2.12x|
 
 ## 📖 Python Testing
 <div id="python-test"></div>
