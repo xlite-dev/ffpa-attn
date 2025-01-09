@@ -32,8 +32,8 @@ NOTE: This project is still in its early dev stages and now provides a few exper
 ```BibTeX
 @misc{cuffpa-py@2025,
   title={FFPA: Yet another Faster Flash Prefill Attention for large headdim.},
-  url={https://github.com/DefTruth/cuffpa-py},
-  note={Open-source software available at https://github.com/DefTruth/cuffpa-py},
+  url={https://github.com/DefTruth/cuffpa-py.git},
+  note={Open-source software available at https://github.com/DefTruth/cuffpa-py.git},
   author={DefTruth etc},
   year={2025}
 }
