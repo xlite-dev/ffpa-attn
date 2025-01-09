@@ -88,10 +88,10 @@ ffpa_mma_stages_split_q_acc_f32_L1_kernel(
   utils::fill_2D_regs<float, kWarpTileSeqLenQ, 2>(lane_block_row_sum_old, 0.0f);
 
   // ---------------------- Registers for S=Q@K^T/O=P@V ----------------------------
-  uint32_t R_Q[kWarpTileSeqLenQ][ 4]; // [1][4]
-  uint32_t R_K[kWarpTileSeqLenK][ 2]; // [8][2]
+  uint32_t R_Q[kWarpTileSeqLenQ][4]; // [1][4]
+  uint32_t R_K[kWarpTileSeqLenK][2]; // [8][2]
   uint32_t R_V[2]; // [2], S=Q@K, only use 2 32bits registers.
-  uint32_t R_S[kWarpTileSeqLenQ][kWarpTileSeqLenK][ 4]; // [1][8][4], acc f32.
+  uint32_t R_S[kWarpTileSeqLenQ][kWarpTileSeqLenK][4]; // [1][8][4], acc f32.
   uint32_t R_O[4]; // registers for O=PV[Br,d]=P@V, [4], only use 4 32bits registers.
   uint32_t R_D[kWarpTileSeqLenP][kWarpTileHeadDimV][(kOStorageAccFloat32) ? 4 : 2]; 
   utils::fill_3D_regs<uint32_t, kWarpTileSeqLenP, kWarpTileHeadDimV, 
@@ -207,91 +207,20 @@ ffpa_mma_stages_split_q_acc_f32_L1_kernel(
     utils::fill_2D_regs<float, kWarpTileSeqLenQ, 2>(lane_row_sum_new, 0.0f);
 
     static_assert(kWarpTileSeqLenQ == 1);
-    // Row max for [Br,Bc] tile, Thread -> Warp -> Block.
-    { // kWarpTileSeqLenQ = 1
-      // Thread level reduce max across kWarpTileSeqLenK dim, namely Bc.
-      #pragma unroll
-      for (int j = 0; j < kWarpTileSeqLenK; ++j) {
-        float* t_fptr_S_0_1 = reinterpret_cast<float*>(&(R_S[0][j][0])); 
-        // This should be the row max after S = (Q @ K^T) / sqrt(d)
-        float tmp_max_0 = max(t_fptr_S_0_1[0], t_fptr_S_0_1[1]) * scale;
-        float tmp_max_1 = max(t_fptr_S_0_1[2], t_fptr_S_0_1[3]) * scale;
-        lane_row_max_new[0][0] = max(lane_row_max_new[0][0], tmp_max_0);
-        lane_row_max_new[0][1] = max(lane_row_max_new[0][1], tmp_max_1);
-      } // end for kWarpTileSeqLenK
-
-      // Warp level reduce max, warp_size = 4
-      // Each thread contains the maximum of 2 rows of Br, 
-      // and only the values of T0, T4, ..., T28 are used.
-      lane_row_max_new[0][0] = warp::reduce_max<float, 4>(lane_row_max_new[0][0]);
-      lane_row_max_new[0][1] = warp::reduce_max<float, 4>(lane_row_max_new[0][1]);
-    } // end for kWarpTileSeqLenQ
-
-    static_assert(kWarpTileSeqLenQ == 1);
-    // Exp sum and mul scale_factor for [Br,Bc] tile, Thread -> Warp -> Block.
-    { // kWarpTileSeqLenQ = 1
-      // Use latest global row max without update.
-      // Br 0, row_id, 0~7,  16~23, 32~39, 48~55; 
-      float block_row_max_new_0 = lane_row_max_new[0][0]; 
-      // Br 1, row_id, 8~15, 24~31, 40~47, 56~63;
-      float block_row_max_new_1 = lane_row_max_new[0][1];
-    
-      float block_row_max_old_0 = lane_block_row_max_old[0][0];
-      float block_row_max_old_1 = lane_block_row_max_old[0][1];
-      // Apply m_new = max(m_old, m_new) here.
-      block_row_max_new_0 = max(block_row_max_old_0, block_row_max_new_0);
-      block_row_max_new_1 = max(block_row_max_old_1, block_row_max_new_1);
-
-      #pragma unroll
-      for (int j = 0; j < kWarpTileSeqLenK; ++j) {
-        // R_S[][][4] 4 32bit registers with each contains 1 F32 element.
-        // (x,y) 0~7->{c0, c1}, (z,w)->8~15 {c2, c3}
-        float* t_fptr_S_0_1 = reinterpret_cast<float*>(&(R_S[0][j][0])); 
-        half*  t_hptr_S_0_1 = reinterpret_cast< half*>(&(R_S[0][j][0])); 
-        // P = Exp(S - m_new), fmaf(x, y, z) = x * y + z in registers;
-        t_fptr_S_0_1[0] = __expf(__fmaf_rn(t_fptr_S_0_1[0], scale, - block_row_max_new_0));
-        t_fptr_S_0_1[1] = __expf(__fmaf_rn(t_fptr_S_0_1[1], scale, - block_row_max_new_0));
-        t_fptr_S_0_1[2] = __expf(__fmaf_rn(t_fptr_S_0_1[2], scale, - block_row_max_new_1));
-        t_fptr_S_0_1[3] = __expf(__fmaf_rn(t_fptr_S_0_1[3], scale, - block_row_max_new_1));
-        lane_row_sum_new[0][0] += (t_fptr_S_0_1[0] + t_fptr_S_0_1[1]);
-        lane_row_sum_new[0][1] += (t_fptr_S_0_1[2] + t_fptr_S_0_1[3]);
-        // Update R_S for P[Br,Bc] = Exp(S-m), point wise.
-        // Also convert F32 -> half for P@V MMA, reuse R_S as P.
-        t_hptr_S_0_1[0] = __float2half_rn(t_fptr_S_0_1[0]);
-        t_hptr_S_0_1[1] = __float2half_rn(t_fptr_S_0_1[1]);
-        t_hptr_S_0_1[2] = __float2half_rn(t_fptr_S_0_1[2]);
-        t_hptr_S_0_1[3] = __float2half_rn(t_fptr_S_0_1[3]);
-      } // end for kWarpTileSeqLenK
-
-      // Warp level reduce sum, warp_size = 4
-      lane_row_sum_new[0][0] = warp::reduce_sum<float, 4>(lane_row_sum_new[0][0]);
-      lane_row_sum_new[0][1] = warp::reduce_sum<float, 4>(lane_row_sum_new[0][1]);
-    }
+    prefill::sync_online_safe_softmax<kWarpTileSeqLenK, 1>(
+      &R_S[0][0][0], scale, &lane_row_max_new[0][0], &lane_row_sum_new[0][0],
+      &lane_block_row_max_old[0][0], &lane_block_row_sum_old[0][0]
+    );
     
     static_assert(kWarpTileSeqLenP == 1);
     {
-      // <Prefetch max/sum values>
-      // m = max(m_old, m_new), l = exp(m_old - m) * l_old + l_new (FA2 paper)
-      // Br 0, row_id, 0~7,  16~23, 32~39, 48~55; Br 1, row_id, 8~15, 24~31, 40~47, 56~63
-      float block_row_max_new_0 = lane_row_max_new[0][0]; 
-      float block_row_max_new_1 = lane_row_max_new[0][1];
-      float block_row_sum_new_0 = lane_row_sum_new[0][0];
-      float block_row_sum_new_1 = lane_row_sum_new[0][1];
-        
-      float block_row_max_old_0 = lane_block_row_max_old[0][0];
-      float block_row_max_old_1 = lane_block_row_max_old[0][1];
-      // NOTE: max(-inf, val) = val.
-      block_row_max_new_0 = max(block_row_max_old_0, block_row_max_new_0);
-      block_row_max_new_1 = max(block_row_max_old_1, block_row_max_new_1);   
-      // Avoid inf value while using m_old for rescaling O.
-      block_row_max_old_0 = (tile_K_seqlen > 0 ? block_row_max_old_0 : 
-                                                 block_row_max_new_0);                                       
-      block_row_max_old_1 = (tile_K_seqlen > 0 ? block_row_max_old_1 : 
-                                                 block_row_max_new_1);  
-      // rescale factor for O and l, exp(m_old - m) for curr tile [Br,d].
-      float rescale_o_factor_0 = __expf(block_row_max_old_0 - block_row_max_new_0);
-      float rescale_o_factor_1 = __expf(block_row_max_old_1 - block_row_max_new_1);
-      
+      float rescale_o_factor_0[1];
+      float rescale_o_factor_1[1];
+      prefill::sync_precompute_rescale_factors(
+        &lane_row_max_new[0][0], &lane_block_row_max_old[0][0], 
+        &rescale_o_factor_0[0], &rescale_o_factor_1[0], tile_K_seqlen
+      );
+
       // Wait V g2s stages ready.
       if constexpr (kStage > 1) {
         cp_async::wait_group<(kStage - 2)>(); // s2->0, s3->1, s4->2
@@ -346,45 +275,25 @@ ffpa_mma_stages_split_q_acc_f32_L1_kernel(
         // Now, we get [Br,8] slice of [Br,d], each warp(MMA) contains m16n8.
         // 0. Rescale O: Online rescaling O each tile_K_seqlen step, need m_new, m_old.
         // m = max(m_old, m_new), O_new[Br,d] = exp(m_old - m) * O_old + P@V
-        float* t_fptr_O_0_1 = reinterpret_cast<float*>(&(R_O[0])); 
-        if constexpr (kOStorageAccFloat32) {
-          // (x,y) 0~7->{c0, c1}, (z,w)->8~15 {c2, c3} kWarpTileSeqLenP=1
-          float* t_fptr_D_0_1 = reinterpret_cast<float*>(&(R_D[0][j][0]));
-          t_fptr_D_0_1[0] = __fmaf_rn(rescale_o_factor_0, t_fptr_D_0_1[0], t_fptr_O_0_1[0]);
-          t_fptr_D_0_1[1] = __fmaf_rn(rescale_o_factor_0, t_fptr_D_0_1[1], t_fptr_O_0_1[1]);
-          t_fptr_D_0_1[2] = __fmaf_rn(rescale_o_factor_1, t_fptr_D_0_1[2], t_fptr_O_0_1[2]);
-          t_fptr_D_0_1[3] = __fmaf_rn(rescale_o_factor_1, t_fptr_D_0_1[3], t_fptr_O_0_1[3]);
-        } else {
-          half* t_hptr_D_0_1 = reinterpret_cast<half*>(&(R_D[0][j][0])); 
-          t_hptr_D_0_1[0] = __float2half_rn(__fmaf_rn(
-            rescale_o_factor_0, __half2float(t_hptr_D_0_1[0]), t_fptr_O_0_1[0]));
-          t_hptr_D_0_1[1] = __float2half_rn(__fmaf_rn(
-            rescale_o_factor_0, __half2float(t_hptr_D_0_1[1]), t_fptr_O_0_1[1]));
-          t_hptr_D_0_1[2] = __float2half_rn(__fmaf_rn(
-            rescale_o_factor_1, __half2float(t_hptr_D_0_1[2]), t_fptr_O_0_1[2]));
-          t_hptr_D_0_1[3] = __float2half_rn(__fmaf_rn(
-            rescale_o_factor_1, __half2float(t_hptr_D_0_1[3]), t_fptr_O_0_1[3]));
-        } // end for tile_V_Bc
+        prefill::sync_rescaling_tiling_o<kOStorageAccFloat32, 1>(
+          &R_D[0][0][0], &R_O[0], &rescale_o_factor_0[0], 
+          &rescale_o_factor_1[0], tile_K_seqlen, j
+        );
+
         if constexpr (kStage > 1) {
           // Wait next V tile g2s ready.
           cp_async::wait_group<(kStage - 2)>();
           __syncthreads();
         }
-      } // end for kWarpTileHeadDimV. 
+      } // end for kWarpTileHeadDimV (end P@V)
+
       // Now, we can update m, l after O has been scaled.
-      // 1. First, update block row sum Exp for each lane which
-      // need both m_new and m_old.
-      float block_row_sum_old_0 = lane_block_row_sum_old[0][0];
-      float block_row_sum_old_1 = lane_block_row_sum_old[0][1];
-      // Update l = exp(m_old - m_new) * l_old + row_sum(P).
-      lane_block_row_sum_old[0][0] = (__fmaf_rn(
-        rescale_o_factor_0, block_row_sum_old_0, block_row_sum_new_0));
-      lane_block_row_sum_old[0][1] = (__fmaf_rn(
-        rescale_o_factor_1, block_row_sum_old_1, block_row_sum_new_1));
-      // 2. Then, update block row max for each lane.
-      lane_block_row_max_old[0][0] = block_row_max_new_0;
-      lane_block_row_max_old[0][1] = block_row_max_new_1;
-    } // end P@V
+      prefill::sync_update_max_expsum(
+        &lane_row_max_new[0][0], &lane_row_sum_new[0][0],
+        &lane_block_row_max_old[0][0], &lane_block_row_sum_old[0][0],
+        &rescale_o_factor_0[0], &rescale_o_factor_1[0], tile_K_seqlen
+      );
+    } 
     __syncthreads(); 
 
   } // end loop over N
@@ -393,7 +302,7 @@ ffpa_mma_stages_split_q_acc_f32_L1_kernel(
   // Finaly, we still have to rescale O once more.
   // O_output(D) = ( 1/l_final ) * O_final (FA2 paper)
   static_assert(kWarpTileSeqLenP == 1);
-  prefill::sync_recaling_final_o<kWarpTileHeadDimV, kOStorageAccFloat32>(
+  prefill::sync_rescaling_final_o<kWarpTileHeadDimV, kOStorageAccFloat32>(
     &R_D[0][0][0], &lane_block_row_sum_old[0][0]
   );
 
