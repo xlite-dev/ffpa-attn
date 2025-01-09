@@ -450,7 +450,7 @@ void ffpa_mma_acc_f16_L1(torch::Tensor Q,
   }
 
 #else
-#ifdef ENBALE_FFPA_ALL_HEADDIM
+#ifdef ENABLE_FFPA_ALL_HEADDIM
   // multiple of 32
 #define DISPATCH_KERNEL_F16_L1_HEADDIM(S)    \
   {                                          \
@@ -523,7 +523,7 @@ void ffpa_mma_acc_f16_L1(torch::Tensor Q,
 
 #endif
 
-#ifdef ENBALE_FFPA_ALL_STAGES
+#ifdef ENABLE_FFPA_ALL_STAGES
   // dispatch stages
   if (stages == 2) {
     DISPATCH_KERNEL_F16_L1_HEADDIM(2);
