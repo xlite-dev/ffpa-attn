@@ -75,6 +75,7 @@ setup(
     version="0.0.1",
     author="DefTruth",
     author_email="qyjdef@163.com",
+    license="GNU General Public License v3.0",
     packages=find_packages(
         exclude=(
             "build",
@@ -89,10 +90,10 @@ setup(
             "third_party",
         )
     ),
-    description="FFPA: Yet another Faster Flash Prefill Attention for large headdim, ~1.5x faster than SDPA EA.",
+    description="FFPA: Yet another Faster Flash Prefill Attention for large headdim, 1.5x~2x faster than SDPA EA.",
     long_description=get_long_description(),
     long_description_content_type="text/markdown",
-    url="https://github.com/DefTruth/cuffpa-py",
+    url="https://github.com/DefTruth/cuffpa-py.git",
     ext_modules=ext_modules,
     cmdclass={"build_ext": BuildExtension},
     python_requires=">=3.10",
