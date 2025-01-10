@@ -433,6 +433,19 @@ for (B, H, N, D) in BHNDs:
         out_ffpa_l1_f162, _ = run_benchmark(
             pyffpa.ffpa_mma_acc_f16_L1, q, k, v, "(ffpa+acc+f16+L1+stage2)", o, stages=2
         )
+        if ENV.enable_all_mutistages():
+            out_ffpa_l1_f323, _ = run_benchmark(
+                pyffpa.ffpa_mma_acc_f32_L1, q, k, v, "(ffpa+acc+f32+L1+stage3)", o, stages=3
+            )
+            out_ffpa_l1_f324, _ = run_benchmark(
+                pyffpa.ffpa_mma_acc_f32_L1, q, k, v, "(ffpa+acc+f32+L1+stage4)", o, stages=4
+            )
+            out_ffpa_l1_f163, _ = run_benchmark(
+                pyffpa.ffpa_mma_acc_f16_L1, q, k, v, "(ffpa+acc+f16+L1+stage3)", o, stages=3
+            )
+            out_ffpa_l1_f164, _ = run_benchmark(
+                pyffpa.ffpa_mma_acc_f16_L1, q, k, v, "(ffpa+acc+f16+L1+stage4)", o, stages=4
+            )
     else:
         # Naive MHA, FFPA, SDPA (D > 256)
         out_unfused, _ = run_benchmark(unfused_standard_attn, q, k, v, "(unfused)")
@@ -475,6 +488,43 @@ for (B, H, N, D) in BHNDs:
             o,
             stages=2,
         )
+        if ENV.enable_all_mutistages():
+            out_ffpa_l1_f323, _ = run_benchmark(
+                partial(pyffpa.ffpa, level=pyffpa.L1, acc=pyffpa.FP32),
+                q,
+                k,
+                v,
+                "(ffpa+acc+f32+L1+stage3)",
+                o,
+                stages=3,
+            )
+            out_ffpa_l1_f324, _ = run_benchmark(
+                partial(pyffpa.ffpa, level=pyffpa.L1, acc=pyffpa.FP32),
+                q,
+                k,
+                v,
+                "(ffpa+acc+f32+L1+stage4)",
+                o,
+                stages=4,
+            )
+            out_ffpa_l1_f163, _ = run_benchmark(
+                partial(pyffpa.ffpa, level=pyffpa.L1, acc=pyffpa.FP16),
+                q,
+                k,
+                v,
+                "(ffpa+acc+f16+L1+stage3)",
+                o,
+                stages=3,
+            )
+            out_ffpa_l1_f164, _ = run_benchmark(
+                partial(pyffpa.ffpa, level=pyffpa.L1, acc=pyffpa.FP16),
+                q,
+                k,
+                v,
+                "(ffpa+acc+f16+L1+stage4)",
+                o,
+                stages=4,
+            )
     pretty_print_line()
 
     del q; del k; del v; del o; del fq; del fk; del fv; del tk; del tv
@@ -485,6 +535,11 @@ for (B, H, N, D) in BHNDs:
         check_all_close(out_sdpa, out_ffpa_l1_f322, "out_ffpa_l1_f322", args.check_all)
         check_all_close(out_sdpa, out_ffpa_l1_f161, "out_ffpa_l1_f161", args.check_all)
         check_all_close(out_sdpa, out_ffpa_l1_f162, "out_ffpa_l1_f161", args.check_all)
+        if ENV.enable_all_mutistages():
+            check_all_close(out_sdpa, out_ffpa_l1_f323, "out_ffpa_l1_f323", args.check_all)
+            check_all_close(out_sdpa, out_ffpa_l1_f324, "out_ffpa_l1_f324", args.check_all)
+            check_all_close(out_sdpa, out_ffpa_l1_f163, "out_ffpa_l1_f163", args.check_all)
+            check_all_close(out_sdpa, out_ffpa_l1_f164, "out_ffpa_l1_f164", args.check_all)
         pretty_print_line()
 
 if args.gen_bench_table:
