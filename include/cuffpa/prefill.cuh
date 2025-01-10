@@ -9,7 +9,7 @@ namespace ffpa {
 namespace prefill {
 
 // prefill utils: prefetch/load QKV g2s funcs, rescale/softmax funcs etc.
-// cp_async & commit_group
+// cp_async & commit_group (optional)
 template<
   const int BrOrBc,
   const int kTileSize, 
@@ -57,7 +57,7 @@ __device__ __forceinline__ void cp_async_qkv_g2s(
                       ) * sizeof(half));
     cp_async::cp_async<16>(load_smem_ptr, &(gmem_ptr[load_gmem_addr + i]));
   }
-  cp_async::commit_group();
+  // cp_async::commit_group();
 }
 
 template<
@@ -69,7 +69,7 @@ template<
   const int kMmaAtomK, 
   const int kPad
 >
-__device__ __forceinline__ void sync_fetch_qkv_frags(
+__device__ __forceinline__ void sync_fetch_qkv_frags_s2r(
   uint32_t smem_base_ptr, // QKV smem base ptr
   uint32_t * R,           // Register ptr, R_QKV
   const int mma_tile_id,  // Q warp_QP 0~num MMAs, KV warp_KV 0
