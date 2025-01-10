@@ -4,7 +4,7 @@ from typing import Optional
 
 import torch
 
-# pyffpa_cuda.cpython.*.so
+# from pyffpa_cuda.cpython.*.so
 from pyffpa_cuda import ffpa_mma_acc_f16_L1, ffpa_mma_acc_f32_L1
 
 
