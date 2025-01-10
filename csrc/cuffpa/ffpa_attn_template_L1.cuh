@@ -19,53 +19,40 @@ template<
   const int kMmaAccFloat32QK,      // 0/1, Q@K^T, 0 MMA Acc with fp16, 1 MMA Acc with fp32.
   const int kMmaAccFloat32PV,      // 0/1, P@V, 0 MMA Acc with fp16, 1 MMA Acc with fp32.
   const int kOStorageAccFloat32,   // 0/1, MMA Acc always be f32/f16, but O storage can be fp32 or half.
-  const int kStageQK,              // <= 4, apply different multi stages policy for QK (<=4) and V (<=2)
-  const int kStagePV,              // <= 2, apply different multi stages policy for QK (<=4) and V (<=2)
-  const int kPadQ,                 // Pad Q/K/V 0,8; 0 -> smem swizzle
+  const int kStageQK,              // <= 4, may apply different multi stages policy for QK and V (<=4)
+  const int kStagePV,              // <= 2, may apply different multi stages policy for QK and V (<=4)
+  const int kPadQ,                 // Pad Q/K/V 0,8; 0 -> smem swizzle, > 0 -> padding
   const int kPadK,             
   const int kPadV             
 >
 __global__ void __launch_bounds__(
   WARP_SIZE * kMmaTileSeqLenQ * kMmaTileSeqLenK) 
-ffpa_mma_stages_split_q_L1_template(
-  half* Q, 
-  half* K, 
-  half* V, 
-  half* O, 
-  int QKV_seqlen,
-  int QKV_head
-) {
-  // Matmul Layout: Q[Br,d]@K^T[d,Bc] NT, P[Br,Bc]@V[Bc,d] NN.
-  // NOTE: K[Bc,d] with row major means K^T[d,Bc] in col major.
-  static_assert(kMmaAtomM == 16 && kMmaAtomN == 8 && kMmaAtomK == 16); // m16n8k16
-  static_assert(kMmaTileSeqLenQ  <= 8 && kMmaTileSeqLenK  == 1);  // Q@K^T
-  static_assert(kMmaTileSeqLenP  <= 8 && kMmaTileHeadDimV == 1);  // P@V
-  static_assert(kWarpTileSeqLenQ == 1 && kWarpTileSeqLenK <= 16); // Q@K^T
-  static_assert(kWarpTileSeqLenP == 1 && kWarpTileHeadDimV == (
-    kHeadDim / (kMmaAtomN * kMmaTileHeadDimV))); // P@V
-  static_assert(kOStorageAccFloat32 == 0 || kOStorageAccFloat32 == 1);
-  // Apply different multi stages policy for QK (<=4) and V (<=2).
-  static_assert(kStageQK < 5 && kStageQK > 0); // QK (<=4)
-  static_assert(kStagePV < 3 && kStagePV > 0); // V  (<=2)
-  static_assert(kPadQ >= 0 && kPadQ % 8 == 0); // 0,8,16
-  static_assert(kPadK >= 0 && kPadK % 8 == 0); // 0,8,16
-  static_assert(kPadV >= 0 && kPadV % 8 == 0); // 0,8,16
-  constexpr int Br = kMmaAtomM * kMmaTileSeqLenQ * kWarpTileSeqLenQ; // 16*4*1=64
-  constexpr int Bc = kMmaAtomN * kMmaTileSeqLenK * kWarpTileSeqLenK; //  8*1*8=64
-  static_assert(Br >= Bc); // for shared memory reuse.
-  constexpr int kNumThreads = WARP_SIZE * kMmaTileSeqLenQ * kMmaTileSeqLenK; // 32*4*1=128, num threads
+ffpa_mma_stages_split_q_L1_template(half* Q, 
+                                    half* K, 
+                                    half* V, 
+                                    half* O, 
+                                    int QKV_seqlen, 
+                                    int QKV_head) {
+  // TODO: May support QKV smem non-reuse ode for fully MMA & IO overlap.
+  prefill::check_compiling_states<
+    kHeadDim, kMmaAtomM, kMmaAtomN, kMmaAtomK, kMmaTileSeqLenQ, kMmaTileSeqLenK, 
+    kMmaTileSeqLenP, kMmaTileHeadDimV, kWarpTileSeqLenQ, kWarpTileSeqLenK, 
+    kWarpTileSeqLenP, kWarpTileHeadDimV, kMmaAccFloat32QK, kMmaAccFloat32PV,
+    kOStorageAccFloat32, kStageQK, kStagePV, kPadQ, kPadK, kPadV
+  >();
+  constexpr int Br = kMmaAtomM * kMmaTileSeqLenQ * kWarpTileSeqLenQ;
+  constexpr int Bc = kMmaAtomN * kMmaTileSeqLenK * kWarpTileSeqLenK;
+  constexpr int kNumThreads = WARP_SIZE * kMmaTileSeqLenQ * kMmaTileSeqLenK;
   // Now, N must be mutliples of Bc(32/64) for KV tiling across seqlen.
   const int Tc = utils::div_ceil(QKV_seqlen, Bc); // Tc K_tile[Bc,d]
   const float scale = 1.0f / sqrt((float) kHeadDim);
-  
   // grid(div_ceil(QKV_seqlen, Br), QKV_batch * QKV_head), (x,y,z)
   const int QKV_batch_id = blockIdx.y / QKV_head; // Batch size
   const int QKV_head_id  = blockIdx.y % QKV_head; // Head num
   const int Q_tile_id    = blockIdx.x;            // Q tile_id, range [0, Tr]
   const int O_tile_id    = Q_tile_id;             // O tile_id, same as Q.
   const int tid          = threadIdx.x;           // within block
-  const int warp_id      = tid / WARP_SIZE;       // 0~7 warp_id within block
-  const int warp_QP      = warp_id;               // 0,1,2,3 or 0~7
+  const int warp_QP      = tid / WARP_SIZE;       // 0,1,2,3 or 0~7
   const int warp_KV      = 0;                     // 0
   const int Q_gmem_offset = ((QKV_batch_id * QKV_head * QKV_seqlen * kHeadDim) + 
                              (QKV_head_id * QKV_seqlen * kHeadDim)); // Q [seqlen,d]
@@ -141,14 +128,14 @@ ffpa_mma_stages_split_q_L1_template(
       prefill::cp_async_qkv_g2s<
         Br, Q_tile_size, kHeadDim, kMmaAtomK, kNumThreads, kPadQ>(
           smem_Q_base_ptr, Q, Q_gmem_offset, Q_tile_id, 
-          (kStageQK > 1) ? (tile_K_d + 1) : tile_K_d, 
+          (kStageQK > 1) ? (tile_K_d + (kStageQK - 1)) : tile_K_d, 
           (kStageQK > 1) ? smem_sel_next : smem_sel
       );
 
       prefill::cp_async_qkv_g2s<
         Bc, K_tile_size, kHeadDim, kMmaAtomK, kNumThreads, kPadK>(
           smem_K_base_ptr, K, K_gmem_offset, tile_K_seqlen, 
-          (kStageQK > 1) ? (tile_K_d + 1) : tile_K_d, 
+          (kStageQK > 1) ? (tile_K_d + (kStageQK - 1)) : tile_K_d, 
           (kStageQK > 1) ? smem_sel_next : smem_sel
       );
       cp_async::commit_group(); // pack QK as 1 group.
@@ -208,10 +195,6 @@ ffpa_mma_stages_split_q_L1_template(
         __syncthreads(); 
       }
     } // end loop over d, S=Q@K^T
-    if constexpr (kStageQK > 2) {
-      // Ensure all QK g2s ready before P@V, V reuse QK smem.
-      cp_async::wait_group<0>(); 
-    }
     __syncthreads();
 
     // Prefetch V g2s before row max/sum for P@V if kStagePV > 1
@@ -268,7 +251,7 @@ ffpa_mma_stages_split_q_L1_template(
           prefill::cp_async_qkv_g2s<
             Bc, V_tile_size, kHeadDim, kMmaAtomN * 2, kNumThreads, kPadV>(
               smem_V_base_ptr, V, V_gmem_offset, tile_K_seqlen, 
-              (kStagePV > 1) ? (tile_V_d + 1)  : tile_V_d, 
+              (kStagePV > 1) ? (tile_V_d + (kStagePV - 1)) : tile_V_d, 
               (kStagePV > 1) ? smem_sel_v_next : smem_sel_v
           );
           cp_async::commit_group();
@@ -336,12 +319,6 @@ ffpa_mma_stages_split_q_L1_template(
         &rescale_o_factor_0[0], &rescale_o_factor_1[0], tile_K_seqlen
       );
     } // end P@V
-
-    if constexpr (kStagePV > 2) {
-      // Ensure all V g2s ready before P@V, QK reuse V smem 
-      // for next Tc iteration.
-      cp_async::wait_group<0>(); 
-    }
     __syncthreads(); 
 
   } // end loop over N
