@@ -269,6 +269,7 @@ def gen_bench_markdown_table():
     table_header += "|:---:|" + ":---:|" * num_headdim
     # calculate improved
     sdpa_tflops = STATIS_INFO["(sdpa)"]
+    # TODO: calculate best ffpa tflops across multi-stages.    
     ffpa_l1_f322_tflops = STATIS_INFO["(ffpa+acc+f32+L1+stage2)"]
     ffpa_l1_f322_speedup = [
         round(f / s, 2) for f, s in zip(ffpa_l1_f322_tflops, sdpa_tflops)
@@ -373,7 +374,7 @@ def check_all_close(
     pretty_print_line(
         f"{true_tag} vs {tag:<15}, all close: {all_close:<6}, "
         f"max diff: {diff.max().item():.6f}, min diff: {diff.min().item():.6f}, "
-        f"mean diff: {diff.mean().item():.6f}"
+        f"mean diff: {diff.mean().item():.6f}", sep="", mode="left"
     )
 
 
