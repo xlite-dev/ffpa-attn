@@ -93,9 +93,9 @@ class ENV(object):
         if ENV.enable_debug() or build_pkg:
             pretty_print_line()
         build_sources = [
-            csrc("pybind", "faster_prefill_attn_api.cc"),
-            csrc("cuffpa", "faster_prefill_attn_F16F16F16F16_L1.cu"),
-            csrc("cuffpa", "faster_prefill_attn_F32F16F16F32_L1.cu"),
+            csrc("pybind", "ffpa_attn_api.cc"),
+            csrc("cuffpa", "ffpa_attn_F16F16F16_L1.cu"),
+            csrc("cuffpa", "ffpa_attn_F16F16F32_L1.cu"),
         ]
         if ENV.enable_debug() or build_pkg:
             pretty_print_line()
@@ -121,6 +121,7 @@ class ENV(object):
         )
         extra_cuda_cflags.extend(ENV.env_cuda_cflags())
         extra_cuda_cflags.append(f"-I {ENV.project_dir()}/include")
+        extra_cuda_cflags.append(f"-I {ENV.project_dir()}/csrc/cuffpa")
         return extra_cuda_cflags
 
     @staticmethod
