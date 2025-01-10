@@ -11,7 +11,7 @@
   <img src=https://img.shields.io/badge/License-GPLv3.0-turquoise.svg >
  </div>
 
-🤖 [WIP] **FFPA**: Yet antother **Faster Flash Prefill Attention** with **O(1) SRAM complexity** & **O(d/4) or O(1) register complexity** for large headdim (D > 256), almost **1.5x~2x** 🎉 faster than SDPA EA with or without MMA Acc F32 on many devices: NVIDIA [📈L20 ~1.7x↑🎉](#L1-bench), [📈 A30 ~1.5x↑🎉](#L1-bench), [📈3080 ~2.5x↑🎉](#L1-bench), [📈4090 ~1.8x↑🎉](#L1-bench). 
+🤖 [WIP] **FFPA**: Yet antother **Faster Flash Prefill Attention** with **O(1) SRAM complexity** & **O(d/4) or O(1) register complexity** for large headdim (D > 256), almost **1.5x~2x** 🎉 faster than SDPA EA with or without MMA Acc F32 on many NVIDIA devices: [📈L20 ~1.7x↑🎉](#L1-bench), [📈 A30 ~1.5x↑🎉](#L1-bench), [📈3080 ~2.5x↑🎉](#L1-bench), [📈4090 ~1.8x↑🎉](#L1-bench). 
 
 <!--
 |Tensor Cores|Loop over N/D |Tile Block (Br, Bc) |MMA (m16n8k16)|
@@ -25,7 +25,7 @@
 |✔️|✔️|✔️|?|
 -->
 
-NOTE: This project is still in its early dev stages and now provides a few experimental kernels and benchmarks for reference. More features will be added in the future. Welcome to 🌟👆🏻star this repo to support me ~ 🎉🎉
+NOTE: This project is still in its early dev stages and now provides some kernels and benchmarks for reference. More features will be added in the future. Welcome to 🌟👆🏻star this repo to support me ~ 🎉🎉
 
 ## ©️Citations🎉🎉
 
