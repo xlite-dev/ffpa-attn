@@ -9,7 +9,53 @@ namespace ffpa {
 namespace prefill {
 
 // prefill utils: prefetch/load QKV g2s funcs, rescale/softmax funcs etc.
-// cp_async & commit_group
+
+template<
+  const int kHeadDim,              // Headdim, 32,64,128     
+  const int kMmaAtomM,             // MMA Atom M, 16
+  const int kMmaAtomN,             // MMA Atom N, 8
+  const int kMmaAtomK,             // MMA Atom K, 16
+  const int kMmaTileSeqLenQ,       // 4, more MMA(warp), M=16*4=64, Q@K^T=[Br(M), d(K)]@[d(K),  Bc(N)]  
+  const int kMmaTileSeqLenK,       // 1, more MMA(warp), N=8*1 =8,  Q@K^T=[Br(M), d(K)]@[d(K),  Bc(N)]    
+  const int kMmaTileSeqLenP,       // 4, more MMA(warp), M=16*4=64, P@V  =[Br(M),Bc(K)]@[Bc(K), d(N) ]
+  const int kMmaTileHeadDimV,      // 1, more MMA(warp), N=8*1 =8,  P@V  =[Br(M),Bc(K)]@[Bc(K), d(N) ]       
+  const int kWarpTileSeqLenQ,      // 1, more values, M, Br=64*1=64, matmul M 
+  const int kWarpTileSeqLenK,      // 8, more values, N, Bc=8*8 =64, matmul N
+  const int kWarpTileSeqLenP,      // 1, more values, M, Br=64*1=64, matmul M
+  const int kWarpTileHeadDimV,     // 8, more values, N, d=8*(1|2|3|4|...)=8|...|32|64|96|128|...
+  const int kMmaAccFloat32QK,      // 0/1, Q@K^T, 0 MMA Acc with fp16, 1 MMA Acc with fp32.
+  const int kMmaAccFloat32PV,      // 0/1, P@V, 0 MMA Acc with fp16, 1 MMA Acc with fp32.
+  const int kOStorageAccFloat32,   // 0/1, MMA Acc always be f32/f16, but O storage can be fp32 or half.
+  const int kStageQK,              // <= 4, may apply different multi stages policy for QK and V (<=4)
+  const int kStagePV,              // <= 2, may apply different multi stages policy for QK and V (<=4)
+  const int kPadQ,                 // Pad Q/K/V 0,8; 0 -> smem swizzle, > 0 -> padding
+  const int kPadK,             
+  const int kPadV             
+>
+__device__ __forceinline__ void check_compiling_states() {
+  // Matmul Layout: Q[Br,d]@K^T[d,Bc] NT, P[Br,Bc]@V[Bc,d] NN.
+  // NOTE: K[Bc,d] with row major means K^T[d,Bc] in col major.
+  static_assert(kMmaAtomM == 16 && kMmaAtomN == 8 && kMmaAtomK == 16); // m16n8k16
+  static_assert(kMmaTileSeqLenQ  <= 8 && kMmaTileSeqLenK  == 1);  // Q@K^T
+  static_assert(kMmaTileSeqLenP  <= 8 && kMmaTileHeadDimV == 1);  // P@V
+  static_assert(kWarpTileSeqLenQ == 1 && kWarpTileSeqLenK <= 16); // Q@K^T
+  static_assert(kWarpTileSeqLenP == 1 && kWarpTileHeadDimV == (
+    kHeadDim / (kMmaAtomN * kMmaTileHeadDimV))); // P@V
+  static_assert(kMmaAccFloat32QK == 0 || kMmaAccFloat32QK == 1);
+  static_assert(kMmaAccFloat32PV == 0 || kMmaAccFloat32PV == 1);
+  static_assert(kOStorageAccFloat32 == 0 || kOStorageAccFloat32 == 1);
+  constexpr int Br = kMmaAtomM * kMmaTileSeqLenQ * kWarpTileSeqLenQ; // 16*4*1=64
+  constexpr int Bc = kMmaAtomN * kMmaTileSeqLenK * kWarpTileSeqLenK; //  8*1*8=64
+  static_assert(Br >= Bc); // for shared memory reuse.
+  // Apply different multi stages policy for QK and V.
+  static_assert(kStageQK < 5 && kStageQK > 0); // QK (<=4)
+  static_assert(kStagePV < 5 && kStagePV > 0); // V  (<=2)
+  static_assert(kPadQ >= 0 && kPadQ % 8 == 0); // 0,8,16
+  static_assert(kPadK >= 0 && kPadK % 8 == 0); // 0,8,16
+  static_assert(kPadV >= 0 && kPadV % 8 == 0); // 0,8,16
+}
+
+// cp_async & commit_group (optional)
 template<
   const int BrOrBc,
   const int kTileSize, 
@@ -57,7 +103,7 @@ __device__ __forceinline__ void cp_async_qkv_g2s(
                       ) * sizeof(half));
     cp_async::cp_async<16>(load_smem_ptr, &(gmem_ptr[load_gmem_addr + i]));
   }
-  cp_async::commit_group();
+  // cp_async::commit_group();
 }
 
 template<
@@ -69,7 +115,7 @@ template<
   const int kMmaAtomK, 
   const int kPad
 >
-__device__ __forceinline__ void sync_fetch_qkv_frags(
+__device__ __forceinline__ void sync_fetch_qkv_frags_s2r(
   uint32_t smem_base_ptr, // QKV smem base ptr
   uint32_t * R,           // Register ptr, R_QKV
   const int mma_tile_id,  // Q warp_QP 0~num MMAs, KV warp_KV 0

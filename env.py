@@ -32,6 +32,11 @@ class ENV(object):
     # Enable debug mode for FFPA, fast build minimal kernels, default False.
     ENABLE_FFPA_DEBUG = bool(int(os.environ.get("ENABLE_FFPA_DEBUG", 0)))
 
+    # Enable force P@V use fp16 as MMA Acc dtype (TODO: Q@K)
+    ENABLE_FFPA_FORCE_PV_MMA_ACC_F16 = bool(
+        int(os.environ.get("ENABLE_FFPA_FORCE_PV_MMA_ACC_F16", 0))
+    )
+
     @classmethod
     def project_dir(cls):
         return cls.PROJECT_DIR
@@ -55,6 +60,10 @@ class ENV(object):
     @classmethod
     def enable_all_headdim(cls):
         return cls.ENABLE_FFPA_ALL_HEADDIM
+    
+    @classmethod
+    def enable_force_pv_mma_acc_fp16(cls):
+        return cls.ENABLE_FFPA_FORCE_PV_MMA_ACC_F16
 
     @classmethod
     def enable_debug(cls):
@@ -67,6 +76,8 @@ class ENV(object):
             extra_env_cflags.append("-DENABLE_FFPA_ALL_STAGES")
         if cls.enable_all_headdim():
             extra_env_cflags.append("-DENABLE_FFPA_ALL_HEADDIM")
+        if cls.enable_force_pv_mma_acc_fp16():
+            extra_env_cflags.append("-DENABLE_FFPA_FORCE_PV_MMA_ACC_F16")
         if cls.enable_debug():
             extra_env_cflags.append("-DENABLE_FFPA_DEBUG")
         return extra_env_cflags
@@ -93,9 +104,9 @@ class ENV(object):
         if ENV.enable_debug() or build_pkg:
             pretty_print_line()
         build_sources = [
-            csrc("pybind", "faster_prefill_attn_api.cc"),
-            csrc("cuffpa", "faster_prefill_attn_F16F16F16F16_L1.cu"),
-            csrc("cuffpa", "faster_prefill_attn_F32F16F16F32_L1.cu"),
+            csrc("pybind", "ffpa_attn_api.cc"),
+            csrc("cuffpa", "ffpa_attn_F16F16F16_L1.cu"),
+            csrc("cuffpa", "ffpa_attn_F16F16F32_L1.cu"),
         ]
         if ENV.enable_debug() or build_pkg:
             pretty_print_line()
@@ -121,6 +132,7 @@ class ENV(object):
         )
         extra_cuda_cflags.extend(ENV.env_cuda_cflags())
         extra_cuda_cflags.append(f"-I {ENV.project_dir()}/include")
+        extra_cuda_cflags.append(f"-I {ENV.project_dir()}/csrc/cuffpa")
         return extra_cuda_cflags
 
     @staticmethod
