@@ -25,9 +25,9 @@ void launch_ffpa_mma_acc_f16_L1(
   // Q@K^T or P@V, 0 MMA Acc with fp16, 1 MMA Acc with fp32.
   constexpr int kMmaAccFloat32QK = 0;
   constexpr int kMmaAccFloat32PV = 0;
-  // Apply different multi stages policy for QK (<=4) and V (<=2)
+  // Apply different multi stages policy for QK and V.
   constexpr int kStageQK = kStage; // <= 4
-  constexpr int kStagePV = (kStage > 2) ? 2 : kStage; // <= 2
+  constexpr int kStagePV = kStage; // <= 4
   // 0/1, The precision of the O storage buffer can differ from 
   // that of the MMA, supporting either FP32 or Half precision.
   // FP16 can provide precision to approximately 3-4 decimal places.
