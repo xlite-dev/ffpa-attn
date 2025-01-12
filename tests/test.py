@@ -260,46 +260,62 @@ def run_benchmark(
 def gen_bench_markdown_table():
     global STATIS_INFO
     STATIS_INFO["headdim"] = sorted(list(STATIS_INFO["headdim"]))
-    pretty_print_line("FFPA Benchmark Data")
+    pretty_print_line("FFPA-L1 Benchmark Data")
     print(STATIS_INFO)
     pretty_print_line()
     headdims = [str(d) for d in STATIS_INFO["headdim"]]
     num_headdim = len(headdims)
     table_header = "|Algorithm|" + "|".join(headdims) + "|\n"
     table_header += "|:---:|" + ":---:|" * num_headdim
-    # calculate improved
     sdpa_tflops = STATIS_INFO["(sdpa)"]
-    # TODO: calculate best ffpa tflops across multi-stages.    
-    ffpa_l1_f322_tflops = STATIS_INFO["(ffpa+acc+f32+L1+stage2)"]
-    ffpa_l1_f322_speedup = [
-        round(f / s, 2) for f, s in zip(ffpa_l1_f322_tflops, sdpa_tflops)
+    # calculate best ffpa tflops across multi-stages 1~4.  
+    if ENV.enable_all_mutistages():
+        ffpa_l1_32_best_tflops = [max(x, y, z, w) for x, y, z, w in zip(
+            STATIS_INFO["(ffpa+acc+f32+L1+stage1)"], 
+            STATIS_INFO["(ffpa+acc+f32+L1+stage2)"], 
+            STATIS_INFO["(ffpa+acc+f32+L1+stage3)"], 
+            STATIS_INFO["(ffpa+acc+f32+L1+stage4)"])]
+        ffpa_l1_f16_best_tflops = [max(x, y, z, w) for x, y, z, w in zip(
+            STATIS_INFO["(ffpa+acc+f16+L1+stage1)"], 
+            STATIS_INFO["(ffpa+acc+f16+L1+stage2)"], 
+            STATIS_INFO["(ffpa+acc+f16+L1+stage3)"], 
+            STATIS_INFO["(ffpa+acc+f16+L1+stage4)"])]
+    else:
+        ffpa_l1_32_best_tflops = [max(x, y) for x, y in zip(
+            STATIS_INFO["(ffpa+acc+f32+L1+stage1)"], 
+            STATIS_INFO["(ffpa+acc+f32+L1+stage2)"])]
+        ffpa_l1_f16_best_tflops = [max(x, y) for x, y in zip(
+            STATIS_INFO["(ffpa+acc+f16+L1+stage1)"], 
+            STATIS_INFO["(ffpa+acc+f16+L1+stage2)"])]
+        
+    # calculate improved
+    ffpa_l1_f32_speedup = [
+        round(f / s, 2) for f, s in zip(ffpa_l1_32_best_tflops, sdpa_tflops)
     ]
-    ffpa_l1_f162_tflops = STATIS_INFO["(ffpa+acc+f16+L1+stage2)"]
-    ffpa_l1_f162_speedup = [
-        round(f / s, 2) for f, s in zip(ffpa_l1_f162_tflops, sdpa_tflops)
+    ffpa_l1_f16_speedup = [
+        round(f / s, 2) for f, s in zip(ffpa_l1_f16_best_tflops, sdpa_tflops)
     ]
     # sdpa, ffpa, speedup strings.
-    sdpa_str = "|SDPA EA|" + "|".join([str(s) + "T" for s in sdpa_tflops]) + "|"
-    ffpa_l1_f32_str = (
-        "|FFPA L1*|" + "|".join([str(f) + "T" for f in ffpa_l1_f322_tflops]) + "|"
+    sdpa_tflops_str = "|SDPA EA|" + "|".join([str(s) + "T" for s in sdpa_tflops]) + "|"
+    ffpa_l1_f32_tflops_str = (
+        "|FFPA L1*|" + "|".join([str(f) + "T" for f in ffpa_l1_32_best_tflops]) + "|"
     )
     ffpa_l1_f32_speedup_str = (
-        "|Speedup|" + "|".join([str(fs) + "x" for fs in ffpa_l1_f322_speedup]) + "|"
+        "|Speedup|" + "|".join([str(fs) + "x" for fs in ffpa_l1_f32_speedup]) + "|"
     )
-    ffpa_l1_f16_str = (
-        "|FFPA L1^|" + "|".join([str(f) + "T" for f in ffpa_l1_f162_tflops]) + "|"
+    ffpa_l1_f16_tflops_str = (
+        "|FFPA L1^|" + "|".join([str(f) + "T" for f in ffpa_l1_f16_best_tflops]) + "|"
     )
     ffpa_l1_f16_speedup_str = (
-        "|Speedup|" + "|".join([str(fs) + "x" for fs in ffpa_l1_f162_speedup]) + "|"
+        "|Speedup|" + "|".join([str(fs) + "x" for fs in ffpa_l1_f16_speedup]) + "|"
     )
-    pretty_print_line("FFPA Benchmark Markdown Table")
+    pretty_print_line("FFPA-L1 Best Benchmark Markdown Table:\n")
     print(table_header)
-    print(sdpa_str)
-    print(ffpa_l1_f32_str)
+    print(sdpa_tflops_str)
+    print(ffpa_l1_f32_tflops_str)
     print(ffpa_l1_f32_speedup_str)
-    print(ffpa_l1_f16_str)
+    print(ffpa_l1_f16_tflops_str)
     print(ffpa_l1_f16_speedup_str)
-    pretty_print_line()
 
 
 def get_qkvo(B, H, N, D):

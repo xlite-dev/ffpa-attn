@@ -60,7 +60,7 @@ class ENV(object):
     @classmethod
     def enable_all_headdim(cls):
         return cls.ENABLE_FFPA_ALL_HEADDIM
-    
+
     @classmethod
     def enable_force_pv_mma_acc_fp16(cls):
         return cls.ENABLE_FFPA_FORCE_PV_MMA_ACC_F16
@@ -101,6 +101,7 @@ class ENV(object):
             if ENV.enable_debug() or build_pkg:
                 pretty_print_line(f"csrc_file: {csrc_file}", sep="", mode="left")
             return csrc_file
+
         if ENV.enable_debug() or build_pkg:
             pretty_print_line()
         build_sources = [
@@ -206,27 +207,42 @@ class ENV(object):
     def list_ffpa_env(cls):
         pretty_print_line("cuffpa-py ENVs")
         pretty_print_line(
-            f"PROJECT_DIR:              {cls.project_dir()}", sep="", mode="left"
-        )
-        pretty_print_line(
-            f"ENABLE_FFPA_DEBUG:        {cls.enable_debug()}", sep="", mode="left"
-        )
-        pretty_print_line(
-            f"ENABLE_FFPA_ADA:          {cls.enable_ada()}", sep="", mode="left"
-        )
-        pretty_print_line(
-            f"ENABLE_FFPA_AMPERE:       {cls.enable_ampere()}", sep="", mode="left"
-        )
-        pretty_print_line(
-            f"ENABLE_FFPA_HOPPER:       {cls.enable_hopper()}", sep="", mode="left"
-        )
-        pretty_print_line(
-            f"ENABLE_FFPA_ALL_STAGES:   {cls.enable_all_mutistages()}",
+            f"PROJECT_DIR:                      {cls.project_dir()}",
             sep="",
             mode="left",
         )
         pretty_print_line(
-            f"ENABLE_FFPA_ALL_HEADDIM:  {cls.enable_all_headdim()}", sep="", mode="left"
+            f"ENABLE_FFPA_DEBUG:                {cls.enable_debug()}",
+            sep="",
+            mode="left",
+        )
+        pretty_print_line(
+            f"ENABLE_FFPA_ADA:                  {cls.enable_ada()}", sep="", mode="left"
+        )
+        pretty_print_line(
+            f"ENABLE_FFPA_AMPERE:               {cls.enable_ampere()}",
+            sep="",
+            mode="left",
+        )
+        pretty_print_line(
+            f"ENABLE_FFPA_HOPPER:               {cls.enable_hopper()}",
+            sep="",
+            mode="left",
+        )
+        pretty_print_line(
+            f"ENABLE_FFPA_ALL_STAGES:           {cls.enable_all_mutistages()}",
+            sep="",
+            mode="left",
+        )
+        pretty_print_line(
+            f"ENABLE_FFPA_ALL_HEADDIM:          {cls.enable_all_headdim()}",
+            sep="",
+            mode="left",
+        )
+        pretty_print_line(
+            f"ENABLE_FFPA_FORCE_PV_MMA_ACC_F16: {cls.enable_force_pv_mma_acc_fp16()}",
+            sep="",
+            mode="left",
         )
         pretty_print_line()
 
