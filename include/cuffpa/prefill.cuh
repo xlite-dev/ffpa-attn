@@ -27,7 +27,7 @@ template<
   const int kMmaAccFloat32PV,      // 0/1, P@V, 0 MMA Acc with fp16, 1 MMA Acc with fp32.
   const int kOStorageAccFloat32,   // 0/1, MMA Acc always be f32/f16, but O storage can be fp32 or half.
   const int kStageQK,              // <= 4, may apply different multi stages policy for QK and V (<=4)
-  const int kStagePV,              // <= 2, may apply different multi stages policy for QK and V (<=4)
+  const int kStagePV,              // <= 4, may apply different multi stages policy for QK and V (<=4)
   const int kPadQ,                 // Pad Q/K/V 0,8; 0 -> smem swizzle, > 0 -> padding
   const int kPadK,             
   const int kPadV             
@@ -47,9 +47,9 @@ __device__ __forceinline__ void check_compiling_states() {
   constexpr int Br = kMmaAtomM * kMmaTileSeqLenQ * kWarpTileSeqLenQ; // 16*4*1=64
   constexpr int Bc = kMmaAtomN * kMmaTileSeqLenK * kWarpTileSeqLenK; //  8*1*8=64
   static_assert(Br >= Bc); // for shared memory reuse.
-  // Apply different multi stages policy for QK and V.
+  // May apply different multi stages policy for QK and V.
   static_assert(kStageQK < 5 && kStageQK > 0); // QK (<=4)
-  static_assert(kStagePV < 5 && kStagePV > 0); // V  (<=2)
+  static_assert(kStagePV < 5 && kStagePV > 0); // V  (<=4)
   static_assert(kPadQ >= 0 && kPadQ % 8 == 0); // 0,8,16
   static_assert(kPadK >= 0 && kPadK % 8 == 0); // 0,8,16
   static_assert(kPadV >= 0 && kPadV % 8 == 0); // 0,8,16
@@ -336,7 +336,7 @@ __device__ __forceinline__ void sync_precompute_rescale_factors(
                                          block_row_max_new_0);                                       
   block_row_max_old_1 = (n_tile_id > 0 ? block_row_max_old_1 : 
                                          block_row_max_new_1);  
-  // TODO: precompute rescale_o_factor_0 & rescale_o_factor_0                                       
+  // Precompute rescale_o_factor_0 & rescale_o_factor_1, avoid redundant exp.                                       
   rescale_o_factor_0[0] = __expf(block_row_max_old_0 - block_row_max_new_0);
   rescale_o_factor_1[0] = __expf(block_row_max_old_1 - block_row_max_new_1); 
 }
