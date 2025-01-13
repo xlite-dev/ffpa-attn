@@ -91,15 +91,25 @@ python3 setup.py bdist_wheel && cd dist && python3 -m pip install *.whl # pip un
 
 L1: level 1, O(2xBrx16)≈O(1) SRAM complexity, O(d/4) register complexity, the same GPU HBM memory complexity as FlashAttention. B=1, H=48, N=8192, **D=320-1024(FA2 not supported 👀)**. (Notes, `*`=MMA Acc F32, `^`=MMA Acc F16, Softmax Acc dtype is always be F32, T=TFLOPS, 👇Benchmark)
 
-- 📚 NVIDIA L20 (`*`=MMA Acc F32, `^`=MMA Acc F16, `T`=TFLOPS, **~1.7x↑🎉**)
+- 📚 NVIDIA L20 (`*`=MMA Acc F32, `^`=MMA Acc F16, `T`=TFLOPS, **~1.8x↑🎉**)
 
 |Algorithm|320|384|448|512|576|640|704|768|832|896|960|1024|
 |:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
 |SDPA EA|56T|63T|58T|58T|55T|56T|54T|55T|54T|55T|54T|56T|
-|FFPA L1*|101T|102T|103T|95T|96T|96T|95T|95T|95T|92T|91T|91T|
-|Speedup|1.8x|1.62x|1.78x|1.64x|1.75x|1.71x|1.76x|1.73x|1.76x|1.67x|1.69x|1.62x|
-|FFPA L1^|102T|105T|103T|102T|102T|95T|96T|95T|95T|92T|92T|89T|
-|Speedup|1.82x|1.67x|1.78x|1.76x|1.85x|1.7x|1.78x|1.73x|1.76x|1.67x|1.7x|1.59x|
+|FFPA L1*|103T|104T|103T|95T|95T|94T|95T|95T|93T|93T|93T|92T|
+|Speedup|1.84x|1.65x|1.78x|1.64x|1.73x|1.68x|1.76x|1.73x|1.72x|1.69x|1.72x|1.64x|
+|FFPA L1^|104T|105T|105T|104T|102T|95T|94T|93T|93T|94T|92T|93T|
+|Speedup|1.86x|1.67x|1.81x|1.79x|1.85x|1.7x|1.74x|1.69x|1.72x|1.71x|1.7x|1.66x|
+
+- 📚 NVIDIA L20 (`*`=MMA Acc: QK F32 + PV F16, `^`=MMA Acc F16, `T`=TFLOPS, **~1.9x↑🎉**)
+
+|Algorithm|320|384|448|512|576|640|704|768|832|896|960|1024|
+|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+|SDPA EA|56T|64T|58T|58T|55T|56T|54T|55T|54T|55T|54T|56T|
+|FFPA L1*|105T|106T|105T|96T|95T|94T|93T|93T|92T|92T|93T|93T|
+|Speedup|1.88x|1.66x|1.81x|1.66x|1.73x|1.68x|1.72x|1.69x|1.7x|1.67x|1.72x|1.66x|
+|FFPA L1^|104T|105T|105T|104T|102T|94T|94T|93T|93T|94T|92T|93T|
+|Speedup|1.86x|1.64x|1.81x|1.79x|1.85x|1.68x|1.74x|1.69x|1.72x|1.71x|1.7x|1.66x|
 
 - 📚 NVIDIA A30 (`*`=MMA Acc F32, `^`=MMA Acc F16, `T`=TFLOPS, **~1.5x↑🎉**)
 
@@ -130,6 +140,16 @@ L1: level 1, O(2xBrx16)≈O(1) SRAM complexity, O(d/4) register complexity, the 
 |Speedup|1.77x|1.59x|1.68x|1.64x|1.77x|1.72x|1.75x|1.69x|1.7x|1.68x|1.69x|1.65x|
 |FFPA L1^|176T|174T|171T|174T|173T|170T|169T|167T|164T|163T|162T|159T|
 |Speedup|2.15x|1.87x|2.01x|2.05x|2.19x|2.1x|2.14x|2.09x|2.08x|2.04x|2.08x|2.04x|
+
+- 📚 NVIDIA RTX 4090 (`*`=MMA Acc: QK F32 + PV F16, `^`=MMA Acc F16, `T`=TFLOPS, **~2x↑🎉**)
+
+|Algorithm|320|384|448|512|576|640|704|768|832|896|960|1024|
+|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+|SDPA EA|82T|93T|85T|85T|79T|81T|79T|80T|79T|80T|78T|78T|
+|FFPA L1*|170T|170T|160T|159T|156T|154T|153T|152T|151T|149T|143T|136T|
+|Speedup|2.07x|1.83x|1.88x|1.87x|1.97x|1.9x|1.94x|1.9x|1.91x|1.86x|1.83x|1.74x|
+|FFPA L1^|175T|173T|171T|174T|171T|170T|169T|167T|164T|164T|162T|157T|
+|Speedup|2.13x|1.86x|2.01x|2.05x|2.16x|2.1x|2.14x|2.09x|2.08x|2.05x|2.08x|2.01x|
 
 ## 📖 Python Testing
 <div id="python-test"></div>

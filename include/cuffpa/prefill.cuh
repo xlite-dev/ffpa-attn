@@ -28,6 +28,7 @@ template<
   const int kOStorageAccFloat32,   // 0/1, MMA Acc always be f32/f16, but O storage can be fp32 or half.
   const int kPrefetchQK,           // Prefetch QK at the Appropriate Time Point. 
   const int kPrefetchPV,           // Prefetch V at the Appropriate Time Point. 
+  const int kShareSmemQKV,         // QKV share the same shared memory, reuse QK smem for V.
   const int kStageQK,              // <= 4, may apply different multi stages policy for QK and V (<=4)
   const int kStagePV,              // <= 4, may apply different multi stages policy for QK and V (<=4)
   const int kPadQ,                 // Pad Q/K/V 0,8; 0 -> smem swizzle, > 0 -> padding
@@ -51,6 +52,7 @@ __device__ __forceinline__ void check_compiling_states() {
   static_assert(Br >= Bc); // for shared memory reuse.
   static_assert(kPrefetchQK == 0 || kPrefetchQK == 1);
   static_assert(kPrefetchPV == 0 || kPrefetchPV == 1);
+  static_assert(kShareSmemQKV == 0 || kShareSmemQKV == 1);
   // May apply different multi stages policy for QK and V.
   static_assert(kStageQK < 5 && kStageQK > 0); // QK (<=4)
   static_assert(kStagePV < 5 && kStagePV > 0); // V  (<=4)

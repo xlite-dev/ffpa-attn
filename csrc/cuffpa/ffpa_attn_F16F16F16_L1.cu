@@ -52,11 +52,17 @@ void launch_ffpa_mma_acc_f16_L1(
                                 kStageQK * (Bc * (kMmaAtomK + kPadK)));
   // R_D registers, s=2, d=64, 16 regs; d=128, 32 regs; 
   // d=256, 64 regs; d=512, 128 regs; d=1024, 256 regs;
-  constexpr int PV_smem_size  = (kStagePV * (Bc * (kMmaAtomN * 2 + kPadV))); 
+  constexpr int PV_smem_size = (kStagePV * (Bc * (kMmaAtomN * 2 + kPadV))); 
+#ifdef ENABLE_FFPA_QKV_SMEM_SHARE
+  constexpr int kShareSmemQKV = 1;
   // try to let V reuse all Q+K smem after Q@K^T, reduce smem usage.
   constexpr int kQKVSmemMaxSize = (QK_smem_size > PV_smem_size ? 
                                    QK_smem_size * 2 : 
                                    PV_smem_size * 2);
+#else
+  constexpr int kShareSmemQKV = 0;
+  constexpr int kQKVSmemMaxSize = (QK_smem_size + PV_smem_size) * 2;
+#endif 
 
   const int QKV_batch  = Q.size(0); 
   const int QKV_head   = Q.size(1);
@@ -86,6 +92,7 @@ void launch_ffpa_mma_acc_f16_L1(
       kOStorageAccFloat32,
       kPrefetchQK,
       kPrefetchPV,
+      kShareSmemQKV,
       kStageQK, 
       kStagePV,
       kPadQ,
@@ -114,6 +121,7 @@ void launch_ffpa_mma_acc_f16_L1(
     kOStorageAccFloat32,
     kPrefetchQK,
     kPrefetchPV,
+    kShareSmemQKV,
     kStageQK, 
     kStagePV,
     kPadQ,
