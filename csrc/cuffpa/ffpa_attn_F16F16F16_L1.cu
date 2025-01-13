@@ -1,4 +1,4 @@
-#include "ffpa_attn_template_L1.cuh"
+#include "ffpa_attn_templates_L1.cuh"
 using namespace ffpa;                                            
 
 
