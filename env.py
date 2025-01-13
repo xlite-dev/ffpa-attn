@@ -103,7 +103,13 @@ class ENV(object):
     @classmethod
     def list_ffpa_env(cls):
         def formatenv(name, value):
-            return print(f"{name:<32}: {value}")
+            try:
+                print(
+                    f"{name:<35}: {str(value):<5} -> command:"
+                    f" export {name}={int(value)}"
+                )
+            except:
+                print(f"{name:<35}: {value}")
 
         pretty_print_line("FFPA-ATTN ENVs")
         formatenv("PROJECT_DIR", cls.project_dir())
