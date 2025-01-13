@@ -19,8 +19,10 @@ template<
   const int kMmaAccFloat32QK,      // 0/1, Q@K^T, 0 MMA Acc with fp16, 1 MMA Acc with fp32.
   const int kMmaAccFloat32PV,      // 0/1, P@V, 0 MMA Acc with fp16, 1 MMA Acc with fp32.
   const int kOStorageAccFloat32,   // 0/1, MMA Acc always be f32/f16, but O storage can be fp32 or half.
+  const int kPrefetchQK,           // Prefetch QK at the Appropriate Time Point. 
+  const int kPrefetchPV,           // Prefetch V at the Appropriate Time Point. 
   const int kStageQK,              // <= 4, may apply different multi stages policy for QK and V (<=4)
-  const int kStagePV,              // <= 2, may apply different multi stages policy for QK and V (<=4)
+  const int kStagePV,              // <= 4, may apply different multi stages policy for QK and V (<=4)
   const int kPadQ,                 // Pad Q/K/V 0,8; 0 -> smem swizzle, > 0 -> padding
   const int kPadK,             
   const int kPadV             
@@ -33,12 +35,13 @@ ffpa_mma_stages_split_q_L1_template(half* Q,
                                     half* O, 
                                     int QKV_seqlen, 
                                     int QKV_head) {
-  // TODO: May support QKV smem non-reuse ode for fully MMA & IO overlap.
+  // TODO: May support QKV smem non-reuse mode for fully MMA & IO overlap.
   prefill::check_compiling_states<
     kHeadDim, kMmaAtomM, kMmaAtomN, kMmaAtomK, kMmaTileSeqLenQ, kMmaTileSeqLenK, 
     kMmaTileSeqLenP, kMmaTileHeadDimV, kWarpTileSeqLenQ, kWarpTileSeqLenK, 
     kWarpTileSeqLenP, kWarpTileHeadDimV, kMmaAccFloat32QK, kMmaAccFloat32PV,
-    kOStorageAccFloat32, kStageQK, kStagePV, kPadQ, kPadK, kPadV
+    kOStorageAccFloat32, kPrefetchQK, kPrefetchPV, kStageQK, kStagePV, 
+    kPadQ, kPadK, kPadV
   >();
   constexpr int Br = kMmaAtomM * kMmaTileSeqLenQ * kWarpTileSeqLenQ;
   constexpr int Bc = kMmaAtomN * kMmaTileSeqLenK * kWarpTileSeqLenK;
@@ -97,23 +100,48 @@ ffpa_mma_stages_split_q_L1_template(half* Q,
   #pragma unroll 1
   for (int tile_K_seqlen = 0; tile_K_seqlen < Tc; ++tile_K_seqlen) { 
     // TODO: process last tile_K_seqlen ? pad to multiple of Bc.
-    if constexpr (kStageQK > 1) {
-      #pragma unroll
-      for (int stage = 0; stage < (kStageQK - 1); ++stage) {
-        prefill::cp_async_qkv_g2s<
-          Br, Q_tile_size, kHeadDim, kMmaAtomK, kNumThreads, kPadQ>(
-            smem_Q_base_ptr, Q, Q_gmem_offset, Q_tile_id, stage, stage
-        );
+    if constexpr (kPrefetchQK) {
+      if constexpr (kStageQK > 1) {
+        if (tile_K_seqlen == 0) {
+          #pragma unroll
+          for (int stage = 0; stage < (kStageQK - 1); ++stage) {
+            prefill::cp_async_qkv_g2s<
+              Br, Q_tile_size, kHeadDim, kMmaAtomK, kNumThreads, kPadQ>(
+                smem_Q_base_ptr, Q, Q_gmem_offset, Q_tile_id, stage, stage
+            );
 
-        prefill::cp_async_qkv_g2s<
-          Bc, K_tile_size, kHeadDim, kMmaAtomK, kNumThreads, kPadK>(
-            smem_K_base_ptr, K, K_gmem_offset, tile_K_seqlen, stage, stage
-        );
-        cp_async::commit_group(); // pack QK as 1 group.
-      } // end for stage
-      cp_async::wait_group<(kStageQK - 2)>();
-      __syncthreads(); 
-    } // end if kStageQK > 1
+            prefill::cp_async_qkv_g2s<
+              Bc, K_tile_size, kHeadDim, kMmaAtomK, kNumThreads, kPadK>(
+                smem_K_base_ptr, K, K_gmem_offset, tile_K_seqlen, stage, stage
+            );
+            cp_async::commit_group(); // pack QK as 1 group.
+          } // end for stage
+          cp_async::wait_group<(kStageQK - 2)>();
+          __syncthreads(); 
+        } else {
+          cp_async::wait_group<(kStageQK - 2)>();
+          __syncthreads(); 
+        }
+      }
+    } else {
+      if constexpr (kStageQK > 1) {
+        #pragma unroll
+        for (int stage = 0; stage < (kStageQK - 1); ++stage) {
+          prefill::cp_async_qkv_g2s<
+            Br, Q_tile_size, kHeadDim, kMmaAtomK, kNumThreads, kPadQ>(
+              smem_Q_base_ptr, Q, Q_gmem_offset, Q_tile_id, stage, stage
+          );
+
+          prefill::cp_async_qkv_g2s<
+            Bc, K_tile_size, kHeadDim, kMmaAtomK, kNumThreads, kPadK>(
+              smem_K_base_ptr, K, K_gmem_offset, tile_K_seqlen, stage, stage
+          );
+          cp_async::commit_group(); // pack QK as 1 group.
+        } // end for stage
+        cp_async::wait_group<(kStageQK - 2)>();
+        __syncthreads(); 
+      } // end if kStageQK > 1
+    }
 
     // <loop over K d>: tile_K_d, kMmaAtomK = 16, K_tile_d[kMmaAtomK,Bc]
     // TODO: remove this zero fill, ref: https://github.com/flashinfer-ai/
@@ -164,6 +192,22 @@ ffpa_mma_stages_split_q_L1_template(half* Q,
       if constexpr (kStageQK < 2) {
         __syncthreads();
       }
+      if constexpr (kPrefetchPV && kStagePV > 1) {
+        if (tile_K_d == (kHeadDim / kMmaAtomK - 1)) {
+          __syncthreads(); // wait all QK s2r ready
+          // Prefetch V g2s before last Q@K^T iteration.
+          if constexpr (kStagePV > 1) {
+            #pragma unroll
+            for (int stage = 0; stage < (kStagePV - 1); ++stage) {
+              prefill::cp_async_qkv_g2s<
+                Bc, V_tile_size, kHeadDim, kMmaAtomN * 2, kNumThreads, kPadV>(
+                  smem_V_base_ptr, V, V_gmem_offset, tile_K_seqlen, stage, stage
+              );
+              cp_async::commit_group();
+            }
+          }
+        }
+      } // end kPrefetchQKV
       
       // Q@K^T MMA compute
       static_assert(kWarpTileSeqLenQ == 1);
@@ -191,15 +235,17 @@ ffpa_mma_stages_split_q_L1_template(half* Q,
       }
 
       if constexpr (kStageQK > 1) {
-        cp_async::wait_group<(kStageQK - 2)>();
-        __syncthreads(); 
+        if (tile_K_d < (kHeadDim / kMmaAtomK - 1)) {
+          cp_async::wait_group<(kStageQK - 2)>();
+          __syncthreads(); 
+        }
       }
     } // end loop over d, S=Q@K^T
     __syncthreads();
 
     // Prefetch V g2s before row max/sum for P@V if kStagePV > 1
     static_assert(kWarpTileSeqLenP == 1);
-    {
+    if constexpr (!kPrefetchPV) {
       if constexpr (kStagePV > 1) {
         #pragma unroll
         for (int stage = 0; stage < (kStagePV - 1); ++stage) {
@@ -271,6 +317,30 @@ ffpa_mma_stages_split_q_L1_template(half* Q,
               smem_V_base_ptr, &R_V[0], warp_KV, (j % 2), tile_V_Bc, 
               smem_sel_v
           );
+
+          if constexpr (kPrefetchQK && kStageQK > 1) {
+            if (j == (kWarpTileHeadDimV - 1) && tile_V_Bc == (Bc / kMmaAtomK - 1) 
+                && (tile_K_seqlen + 1) < Tc) {
+              __syncthreads(); // wait all V s2r ready
+              // Prefetch next QK g2s before last P@V iteration.
+              if constexpr (kStageQK > 1) {
+                #pragma unroll
+                for (int stage = 0; stage < (kStageQK - 1); ++stage) {
+                  prefill::cp_async_qkv_g2s<
+                    Br, Q_tile_size, kHeadDim, kMmaAtomK, kNumThreads, kPadQ>(
+                      smem_Q_base_ptr, Q, Q_gmem_offset, Q_tile_id, stage, stage
+                  );
+
+                  prefill::cp_async_qkv_g2s<
+                    Bc, K_tile_size, kHeadDim, kMmaAtomK, kNumThreads, kPadK>(
+                      smem_K_base_ptr, K, K_gmem_offset, tile_K_seqlen + 1, stage, stage
+                  );
+                  cp_async::commit_group(); // pack QK as 1 group.
+                } // end for stage
+              }
+            }
+          } // end if kPrefetchQKV && kStageQK > 1
+
           // Compute P[Br,Bc]@V[Bc,d] = O[Br,d] 
           const int w = tile_V_Bc * 2; // MMA(Warp) selected, 0, 2, 4, 6
           if constexpr (kMmaAccFloat32PV) {
@@ -307,8 +377,10 @@ ffpa_mma_stages_split_q_L1_template(half* Q,
 
         if constexpr (kStagePV > 1) {
           // Wait next V tile g2s ready.
-          cp_async::wait_group<(kStagePV - 2)>();
-          __syncthreads();
+          if (j < (kWarpTileHeadDimV - 1)) {
+            cp_async::wait_group<(kStagePV - 2)>();
+            __syncthreads();
+          }
         }
       } // end for kWarpTileHeadDimV (end P@V)
 
