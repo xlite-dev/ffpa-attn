@@ -38,7 +38,7 @@ class ENV(object):
     )
 
     # Enable FFPA Prefetch QKV at the Appropriate Time Point.
-    ENABLE_FFPA_PREFETCH_QKV = bool(int(os.environ.get("ENABLE_FFPA_PREFETCH_QKV", 1)))
+    ENABLE_FFPA_PREFETCH_QKV = bool(int(os.environ.get("ENABLE_FFPA_PREFETCH_QKV", 0)))
 
     @classmethod
     def project_dir(cls):
