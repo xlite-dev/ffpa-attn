@@ -67,11 +67,11 @@ print(args)
 pretty_print_line()
 
 # Load the CUDA kernel as a python module
-pyffpa, use_pyffpa_package = ENV.try_load_pyffpa_library(
+ffpa_attn, use_ffpa_attn_package = ENV.try_load_ffpa_library(
     force_build=args.force_build, verbose=args.verbose
 )
-if use_pyffpa_package:
-    import pyffpa  # tricks for IDE code search
+if use_ffpa_attn_package:
+    import ffpa_attn  # tricks for IDE code search
 
 
 def get_mha_tflops(
@@ -268,26 +268,42 @@ def gen_bench_markdown_table():
     table_header = "|Algorithm|" + "|".join(headdims) + "|\n"
     table_header += "|:---:|" + ":---:|" * num_headdim
     sdpa_tflops = STATIS_INFO["(sdpa)"]
-    # calculate best ffpa tflops across multi-stages 1~4.  
+    # calculate best ffpa tflops across multi-stages 1~4.
     if ENV.enable_all_mutistages():
-        ffpa_l1_32_best_tflops = [max(x, y, z, w) for x, y, z, w in zip(
-            STATIS_INFO["(ffpa+acc+f32+L1+stage1)"], 
-            STATIS_INFO["(ffpa+acc+f32+L1+stage2)"], 
-            STATIS_INFO["(ffpa+acc+f32+L1+stage3)"], 
-            STATIS_INFO["(ffpa+acc+f32+L1+stage4)"])]
-        ffpa_l1_f16_best_tflops = [max(x, y, z, w) for x, y, z, w in zip(
-            STATIS_INFO["(ffpa+acc+f16+L1+stage1)"], 
-            STATIS_INFO["(ffpa+acc+f16+L1+stage2)"], 
-            STATIS_INFO["(ffpa+acc+f16+L1+stage3)"], 
-            STATIS_INFO["(ffpa+acc+f16+L1+stage4)"])]
+        ffpa_l1_32_best_tflops = [
+            max(x, y, z, w)
+            for x, y, z, w in zip(
+                STATIS_INFO["(ffpa+acc+f32+L1+stage1)"],
+                STATIS_INFO["(ffpa+acc+f32+L1+stage2)"],
+                STATIS_INFO["(ffpa+acc+f32+L1+stage3)"],
+                STATIS_INFO["(ffpa+acc+f32+L1+stage4)"],
+            )
+        ]
+        ffpa_l1_f16_best_tflops = [
+            max(x, y, z, w)
+            for x, y, z, w in zip(
+                STATIS_INFO["(ffpa+acc+f16+L1+stage1)"],
+                STATIS_INFO["(ffpa+acc+f16+L1+stage2)"],
+                STATIS_INFO["(ffpa+acc+f16+L1+stage3)"],
+                STATIS_INFO["(ffpa+acc+f16+L1+stage4)"],
+            )
+        ]
     else:
-        ffpa_l1_32_best_tflops = [max(x, y) for x, y in zip(
-            STATIS_INFO["(ffpa+acc+f32+L1+stage1)"], 
-            STATIS_INFO["(ffpa+acc+f32+L1+stage2)"])]
-        ffpa_l1_f16_best_tflops = [max(x, y) for x, y in zip(
-            STATIS_INFO["(ffpa+acc+f16+L1+stage1)"], 
-            STATIS_INFO["(ffpa+acc+f16+L1+stage2)"])]
-        
+        ffpa_l1_32_best_tflops = [
+            max(x, y)
+            for x, y in zip(
+                STATIS_INFO["(ffpa+acc+f32+L1+stage1)"],
+                STATIS_INFO["(ffpa+acc+f32+L1+stage2)"],
+            )
+        ]
+        ffpa_l1_f16_best_tflops = [
+            max(x, y)
+            for x, y in zip(
+                STATIS_INFO["(ffpa+acc+f16+L1+stage1)"],
+                STATIS_INFO["(ffpa+acc+f16+L1+stage2)"],
+            )
+        ]
+
     # calculate improved
     ffpa_l1_f32_speedup = [
         round(f / s, 2) for f, s in zip(ffpa_l1_32_best_tflops, sdpa_tflops)
@@ -392,7 +408,9 @@ def check_all_close(
     pretty_print_line(
         f"{true_tag} vs {tag:<15}, all close: {all_close:<6}, "
         f"max diff: {diff.max().item():.6f}, min diff: {diff.min().item():.6f}, "
-        f"mean diff: {diff.mean().item():.6f}", sep="", mode="left"
+        f"mean diff: {diff.mean().item():.6f}",
+        sep="",
+        mode="left",
     )
 
 
@@ -434,45 +452,14 @@ for (B, H, N, D) in BHNDs:
     pretty_print_line(
         f"B={B}, H={H}, N={N}, D={D}, Warmup: {args.warmup}, Iters: {args.iters}"
     )
-    if not use_pyffpa_package:
+    if not use_ffpa_attn_package:
         # Naive MHA, FFPA, SDPA (D > 256)
         out_unfused, _ = run_benchmark(unfused_standard_attn, q, k, v, "(unfused)")
         out_sdpa, _ = run_benchmark(
             partial(sdpa, use_flash=(D <= 256)), q, k, v, "(sdpa)"
         )
         out_ffpa_l1_f321, _ = run_benchmark(
-            pyffpa.ffpa_mma_acc_f32_L1, q, k, v, "(ffpa+acc+f32+L1+stage1)", o, stages=1
-        )
-        out_ffpa_l1_f322, _ = run_benchmark(
-            pyffpa.ffpa_mma_acc_f32_L1, q, k, v, "(ffpa+acc+f32+L1+stage2)", o, stages=2
-        )
-        out_ffpa_l1_f161, _ = run_benchmark(
-            pyffpa.ffpa_mma_acc_f16_L1, q, k, v, "(ffpa+acc+f16+L1+stage1)", o, stages=1
-        )
-        out_ffpa_l1_f162, _ = run_benchmark(
-            pyffpa.ffpa_mma_acc_f16_L1, q, k, v, "(ffpa+acc+f16+L1+stage2)", o, stages=2
-        )
-        if ENV.enable_all_mutistages():
-            out_ffpa_l1_f323, _ = run_benchmark(
-                pyffpa.ffpa_mma_acc_f32_L1, q, k, v, "(ffpa+acc+f32+L1+stage3)", o, stages=3
-            )
-            out_ffpa_l1_f324, _ = run_benchmark(
-                pyffpa.ffpa_mma_acc_f32_L1, q, k, v, "(ffpa+acc+f32+L1+stage4)", o, stages=4
-            )
-            out_ffpa_l1_f163, _ = run_benchmark(
-                pyffpa.ffpa_mma_acc_f16_L1, q, k, v, "(ffpa+acc+f16+L1+stage3)", o, stages=3
-            )
-            out_ffpa_l1_f164, _ = run_benchmark(
-                pyffpa.ffpa_mma_acc_f16_L1, q, k, v, "(ffpa+acc+f16+L1+stage4)", o, stages=4
-            )
-    else:
-        # Naive MHA, FFPA, SDPA (D > 256)
-        out_unfused, _ = run_benchmark(unfused_standard_attn, q, k, v, "(unfused)")
-        out_sdpa, _ = run_benchmark(
-            partial(sdpa, use_flash=(D <= 256)), q, k, v, "(sdpa)"
-        )
-        out_ffpa_l1_f321, _ = run_benchmark(
-            partial(pyffpa.ffpa, level=pyffpa.L1, acc=pyffpa.FP32),
+            ffpa_attn.ffpa_mma_acc_f32_L1,
             q,
             k,
             v,
@@ -481,7 +468,7 @@ for (B, H, N, D) in BHNDs:
             stages=1,
         )
         out_ffpa_l1_f322, _ = run_benchmark(
-            partial(pyffpa.ffpa, level=pyffpa.L1, acc=pyffpa.FP32),
+            ffpa_attn.ffpa_mma_acc_f32_L1,
             q,
             k,
             v,
@@ -490,7 +477,7 @@ for (B, H, N, D) in BHNDs:
             stages=2,
         )
         out_ffpa_l1_f161, _ = run_benchmark(
-            partial(pyffpa.ffpa, level=pyffpa.L1, acc=pyffpa.FP16),
+            ffpa_attn.ffpa_mma_acc_f16_L1,
             q,
             k,
             v,
@@ -499,7 +486,7 @@ for (B, H, N, D) in BHNDs:
             stages=1,
         )
         out_ffpa_l1_f162, _ = run_benchmark(
-            partial(pyffpa.ffpa, level=pyffpa.L1, acc=pyffpa.FP16),
+            ffpa_attn.ffpa_mma_acc_f16_L1,
             q,
             k,
             v,
@@ -509,7 +496,7 @@ for (B, H, N, D) in BHNDs:
         )
         if ENV.enable_all_mutistages():
             out_ffpa_l1_f323, _ = run_benchmark(
-                partial(pyffpa.ffpa, level=pyffpa.L1, acc=pyffpa.FP32),
+                ffpa_attn.ffpa_mma_acc_f32_L1,
                 q,
                 k,
                 v,
@@ -518,7 +505,7 @@ for (B, H, N, D) in BHNDs:
                 stages=3,
             )
             out_ffpa_l1_f324, _ = run_benchmark(
-                partial(pyffpa.ffpa, level=pyffpa.L1, acc=pyffpa.FP32),
+                ffpa_attn.ffpa_mma_acc_f32_L1,
                 q,
                 k,
                 v,
@@ -527,7 +514,7 @@ for (B, H, N, D) in BHNDs:
                 stages=4,
             )
             out_ffpa_l1_f163, _ = run_benchmark(
-                partial(pyffpa.ffpa, level=pyffpa.L1, acc=pyffpa.FP16),
+                ffpa_attn.ffpa_mma_acc_f16_L1,
                 q,
                 k,
                 v,
@@ -536,7 +523,86 @@ for (B, H, N, D) in BHNDs:
                 stages=3,
             )
             out_ffpa_l1_f164, _ = run_benchmark(
-                partial(pyffpa.ffpa, level=pyffpa.L1, acc=pyffpa.FP16),
+                ffpa_attn.ffpa_mma_acc_f16_L1,
+                q,
+                k,
+                v,
+                "(ffpa+acc+f16+L1+stage4)",
+                o,
+                stages=4,
+            )
+    else:
+        # Naive MHA, FFPA, SDPA (D > 256)
+        out_unfused, _ = run_benchmark(unfused_standard_attn, q, k, v, "(unfused)")
+        out_sdpa, _ = run_benchmark(
+            partial(sdpa, use_flash=(D <= 256)), q, k, v, "(sdpa)"
+        )
+        out_ffpa_l1_f321, _ = run_benchmark(
+            partial(ffpa_attn.ffpa, level=ffpa_attn.L1, acc=ffpa_attn.FP32),
+            q,
+            k,
+            v,
+            "(ffpa+acc+f32+L1+stage1)",
+            o,
+            stages=1,
+        )
+        out_ffpa_l1_f322, _ = run_benchmark(
+            partial(ffpa_attn.ffpa, level=ffpa_attn.L1, acc=ffpa_attn.FP32),
+            q,
+            k,
+            v,
+            "(ffpa+acc+f32+L1+stage2)",
+            o,
+            stages=2,
+        )
+        out_ffpa_l1_f161, _ = run_benchmark(
+            partial(ffpa_attn.ffpa, level=ffpa_attn.L1, acc=ffpa_attn.FP16),
+            q,
+            k,
+            v,
+            "(ffpa+acc+f16+L1+stage1)",
+            o,
+            stages=1,
+        )
+        out_ffpa_l1_f162, _ = run_benchmark(
+            partial(ffpa_attn.ffpa, level=ffpa_attn.L1, acc=ffpa_attn.FP16),
+            q,
+            k,
+            v,
+            "(ffpa+acc+f16+L1+stage2)",
+            o,
+            stages=2,
+        )
+        if ENV.enable_all_mutistages():
+            out_ffpa_l1_f323, _ = run_benchmark(
+                partial(ffpa_attn.ffpa, level=ffpa_attn.L1, acc=ffpa_attn.FP32),
+                q,
+                k,
+                v,
+                "(ffpa+acc+f32+L1+stage3)",
+                o,
+                stages=3,
+            )
+            out_ffpa_l1_f324, _ = run_benchmark(
+                partial(ffpa_attn.ffpa, level=ffpa_attn.L1, acc=ffpa_attn.FP32),
+                q,
+                k,
+                v,
+                "(ffpa+acc+f32+L1+stage4)",
+                o,
+                stages=4,
+            )
+            out_ffpa_l1_f163, _ = run_benchmark(
+                partial(ffpa_attn.ffpa, level=ffpa_attn.L1, acc=ffpa_attn.FP16),
+                q,
+                k,
+                v,
+                "(ffpa+acc+f16+L1+stage3)",
+                o,
+                stages=3,
+            )
+            out_ffpa_l1_f164, _ = run_benchmark(
+                partial(ffpa_attn.ffpa, level=ffpa_attn.L1, acc=ffpa_attn.FP16),
                 q,
                 k,
                 v,
@@ -546,7 +612,15 @@ for (B, H, N, D) in BHNDs:
             )
     pretty_print_line()
 
-    del q; del k; del v; del o; del fq; del fk; del fv; del tk; del tv
+    del q
+    del k
+    del v
+    del o
+    del fq
+    del fk
+    del fv
+    del tk
+    del tv
     torch.cuda.empty_cache()
     torch.cuda.synchronize()
     if args.check:
@@ -555,10 +629,18 @@ for (B, H, N, D) in BHNDs:
         check_all_close(out_sdpa, out_ffpa_l1_f161, "out_ffpa_l1_f161", args.check_all)
         check_all_close(out_sdpa, out_ffpa_l1_f162, "out_ffpa_l1_f161", args.check_all)
         if ENV.enable_all_mutistages():
-            check_all_close(out_sdpa, out_ffpa_l1_f323, "out_ffpa_l1_f323", args.check_all)
-            check_all_close(out_sdpa, out_ffpa_l1_f324, "out_ffpa_l1_f324", args.check_all)
-            check_all_close(out_sdpa, out_ffpa_l1_f163, "out_ffpa_l1_f163", args.check_all)
-            check_all_close(out_sdpa, out_ffpa_l1_f164, "out_ffpa_l1_f164", args.check_all)
+            check_all_close(
+                out_sdpa, out_ffpa_l1_f323, "out_ffpa_l1_f323", args.check_all
+            )
+            check_all_close(
+                out_sdpa, out_ffpa_l1_f324, "out_ffpa_l1_f324", args.check_all
+            )
+            check_all_close(
+                out_sdpa, out_ffpa_l1_f163, "out_ffpa_l1_f163", args.check_all
+            )
+            check_all_close(
+                out_sdpa, out_ffpa_l1_f164, "out_ffpa_l1_f164", args.check_all
+            )
         pretty_print_line()
 
 if args.gen_bench_table:
