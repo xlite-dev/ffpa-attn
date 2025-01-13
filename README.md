@@ -30,10 +30,10 @@
 ## ©️Citations🎉🎉
 
 ```BibTeX
-@misc{cuffpa-py@2025,
+@misc{ffpa-attn@2025,
   title={FFPA: Yet another Faster Flash Prefill Attention for large headdim.},
-  url={https://github.com/DefTruth/cuffpa-py.git},
-  note={Open-source software available at https://github.com/DefTruth/cuffpa-py.git},
+  url={https://github.com/DefTruth/ffpa-attn-mma.git},
+  note={Open-source software available at https://github.com/DefTruth/ffpa-attn-mma.git},
   author={DefTruth etc},
   year={2025}
 }
@@ -79,11 +79,11 @@ By leveraging this approach, we can achieve better performance for large headdim
 
 <div id="install"></div>
 
-The FFPA implemented in this repo can be install as a python library, namely, `cuffpa-py` library (optional).
+The FFPA implemented in this repo can be install as a python library, namely, `ffpa-attn` library (optional).
 ```bash
 git clone https://github.com/DefTruth/cuffpa-py.git
 # clone, then, run bash .dev/install.sh directly or run commands:
-python3 setup.py bdist_wheel && cd dist && python3 -m pip install *.whl # pip uninstall cuffpa-py -y
+python3 setup.py bdist_wheel && cd dist && python3 -m pip install *.whl # pip uninstall ffpa-attn -y
 ```
 
 ## 📖 FFPA L1 (Level 1): Benchmark 🎉🎉
@@ -96,11 +96,11 @@ L1: level 1, O(2xBrx16)≈O(1) SRAM complexity, O(d/4) register complexity, the 
 
 |Algorithm|320|384|448|512|576|640|704|768|832|896|960|1024|
 |:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-|SDPA EA|56T|64T|58T|58T|55T|56T|54T|55T|54T|55T|54T|56T|
-|FFPA L1*|98T|100T|102T|94T|94T|93T|93T|92T|90T|91T|90T|91T|
-|Speedup|1.75x|1.56x|1.76x|1.62x|1.71x|1.66x|1.72x|1.67x|1.67x|1.65x|1.67x|1.62x|
-|FFPA L1^|96T|97T|101T|98T|100T|92T|92T|90T|90T|90T|89T|89T|
-|Speedup|1.71x|1.52x|1.74x|1.69x|1.82x|1.64x|1.7x|1.64x|1.67x|1.64x|1.65x|1.59x|
+|SDPA EA|56T|63T|58T|58T|55T|56T|54T|55T|54T|55T|54T|56T|
+|FFPA L1*|99T|101T|102T|95T|95T|95T|94T|92T|92T|93T|93T|93T|
+|Speedup|1.77x|1.6x|1.76x|1.64x|1.73x|1.7x|1.74x|1.67x|1.7x|1.69x|1.72x|1.66x|
+|FFPA L1^|98T|100T|101T|102T|101T|93T|92T|93T|94T|93T|93T|93T|
+|Speedup|1.75x|1.59x|1.74x|1.76x|1.84x|1.66x|1.7x|1.69x|1.74x|1.69x|1.72x|1.66x|
 
 - 📚 NVIDIA A30 (`*`=MMA Acc F32, `^`=MMA Acc F16, `T`=TFLOPS, **~1.5x↑🎉**)
 
