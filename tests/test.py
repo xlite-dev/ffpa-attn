@@ -309,13 +309,15 @@ def gen_bench_markdown_table():
     ffpa_l1_f16_speedup_str = (
         "|Speedup|" + "|".join([str(fs) + "x" for fs in ffpa_l1_f16_speedup]) + "|"
     )
-    pretty_print_line("FFPA-L1 Best Benchmark Markdown Table:\n")
+    pretty_print_line("FFPA-L1 Best Benchmark Markdown Table:")
+    print("\n")
     print(table_header)
     print(sdpa_tflops_str)
     print(ffpa_l1_f32_tflops_str)
     print(ffpa_l1_f32_speedup_str)
     print(ffpa_l1_f16_tflops_str)
     print(ffpa_l1_f16_speedup_str)
+    print("\n")
 
 
 def get_qkvo(B, H, N, D):
