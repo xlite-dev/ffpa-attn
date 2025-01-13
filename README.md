@@ -11,9 +11,16 @@
   <img src=https://img.shields.io/badge/License-GPLv3.0-turquoise.svg >
  </div>
 
-🤖[WIP] **FFPA**: Yet antother **Faster Flash Prefill Attention** with **O(1) SRAM complexity** & **O(d/4) or O(1) register complexity** for large headdim (D > 256), almost **1.5x~2x** 🎉 faster than SDPA EA with or without MMA Acc F32 on many devices: [📈L20 ~1.7x↑🎉](#L1-bench), [📈 A30 ~1.5x↑🎉](#L1-bench), [📈3080 ~2.5x↑🎉](#L1-bench), [📈4090 ~1.8x↑🎉](#L1-bench). 👇Features:🎉🎉
+🤖[WIP] **FFPA**: Yet antother **Faster Flash Prefill Attention** with **O(1) SRAM complexity** & **O(d/4) or O(1) register complexity** for large headdim (D > 256), almost **1.5x~2x** 🎉 faster than SDPA EA with or without MMA Acc F32 on many devices: [📈L20 ~1.7x↑🎉](#L1-bench), [📈 A30 ~1.5x↑🎉](#L1-bench), [📈3080 ~2.5x↑🎉](#L1-bench), [📈4090 ~1.8x↑🎉](#L1-bench). 
 
-|Tensor Cores|Loop over N/D |Tile Block (Br, Bc) |MMA (m16n8k16)|
+<div align='center'>
+  <img src='./bench/NVIDIA_GeForce_RTX_3080_Laptop_GPU_WSL2_ffpa+acc+f32+L1_Speedup.png' width="400px">
+  <img src='./bench/NVIDIA_GeForce_RTX_3080_Laptop_GPU_WSL2_ffpa+acc+f16+L1_Speedup.png' width="400px">
+</div> 
+
+💡NOTE: This project is still in its early dev stages and now provides some kernels and benchmarks for reference. More features will be added in the future. 👇Features🎉🎉(Welcome to 🌟👆🏻star this repo to support me ~)
+
+|Tensor Cores|Loop over N/D |Tile Block (Br, Bc) |MMA (16816-F16/F32)|
 |:---:|:---:|:---:|:---:|
 |✔️|✔️|✔️|✔️|
 |**Split Q** (FA-2)|Pack LDST (128 bits)|SMEM **Swizzle**/Padding |Copy Async |
@@ -22,8 +29,6 @@
 |✔️|✔️|✔️|✔️|
 |**QKV Fine-grained Tiling**|Fully **Shared QKV** SMEM|Mixed MMA F32/F16 Acc|**FFPA L1 Level**|
 |✔️|✔️|✔️|✔️|
-
-💡NOTE: This project is still in its early dev stages and now provides some kernels and benchmarks for reference. More features will be added in the future. Welcome to 🌟👆🏻star this repo to support me ~ 🎉🎉
 
 ## ©️Citations🎉🎉
 
@@ -125,11 +130,21 @@ L1: level 1, O(2xBrx16)≈O(1) SRAM complexity, O(d/4) register complexity, the 
 
 |Algorithm|320|384|448|512|576|640|704|768|832|896|960|1024|
 |:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+|SDPA EA|13T|16T|12T|16T|15T|15T|14T|14T|14T|14T|14T|14T|
+|FFPA L1*|33T|31T|31T|28T|28T|27T|26T|25T|25T|24T|23T|23T|
+|Speedup|2.54x|1.94x|2.58x|1.75x|1.87x|1.8x|1.86x|1.79x|1.79x|1.71x|1.64x|1.64x|
+|FFPA L1^|41T|40T|39T|38T|37T|36T|36T|34T|33T|32T|30T|30T|
+|Speedup|3.15x|2.5x|3.25x|2.38x|2.47x|2.4x|2.57x|2.43x|2.36x|2.29x|2.14x|2.14x|
+
+- 📚 NVIDIA RTX 3080 Laptop (`*`=MMA Acc: QK F32 + PV F16, `^`=MMA Acc F16, `T`=TFLOPS, **~2.8x↑🎉**)
+
+|Algorithm|320|384|448|512|576|640|704|768|832|896|960|1024|
+|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
 |SDPA EA|13T|16T|12T|16T|15T|15T|15T|15T|14T|14T|14T|14T|
-|FFPA L1*|30T|30T|30T|28T|29T|28T|27T|27T|25T|25T|24T|24T|
-|Speedup|2.31x|1.88x|2.5x|1.75x|1.93x|1.87x|1.8x|1.8x|1.79x|1.79x|1.71x|1.71x|
-|FFPA L1^|41T|40T|40T|39T|39T|37T|37T|35T|34T|32T|34T|32T|
-|Speedup|3.15x|2.5x|3.33x|2.44x|2.6x|2.47x|2.47x|2.33x|2.43x|2.29x|2.43x|2.29x|
+|FFPA L1*|37T|35T|35T|33T|31T|30T|30T|29T|26T|28T|26T|25T|
+|Speedup|2.85x|2.19x|2.92x|2.06x|2.07x|2.0x|2.0x|1.93x|1.86x|2.0x|1.86x|1.79x|
+|FFPA L1^|41T|41T|40T|39T|38T|37T|36T|35T|32T|31T|30T|31T|
+|Speedup|3.15x|2.56x|3.33x|2.44x|2.53x|2.47x|2.4x|2.33x|2.29x|2.21x|2.14x|2.21x|
 
 - 📚 NVIDIA RTX 4090 (`*`=MMA Acc F32, `^`=MMA Acc F16, `T`=TFLOPS, **~1.8x↑🎉**)
 
