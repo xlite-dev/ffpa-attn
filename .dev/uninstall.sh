@@ -1,1 +1,1 @@
-python3 -m pip uninstall cuffpa-py -y
+python3 -m pip uninstall ffpa-attn -y

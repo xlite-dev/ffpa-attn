@@ -30,10 +30,10 @@
 ## ©️Citations🎉🎉
 
 ```BibTeX
-@misc{cuffpa-py@2025,
+@misc{ffpa-attn@2025,
   title={FFPA: Yet another Faster Flash Prefill Attention for large headdim.},
-  url={https://github.com/DefTruth/cuffpa-py.git},
-  note={Open-source software available at https://github.com/DefTruth/cuffpa-py.git},
+  url={https://github.com/DefTruth/ffpa-attn-mma.git},
+  note={Open-source software available at https://github.com/DefTruth/ffpa-attn-mma.git},
   author={DefTruth etc},
   year={2025}
 }
@@ -79,11 +79,11 @@ By leveraging this approach, we can achieve better performance for large headdim
 
 <div id="install"></div>
 
-The FFPA implemented in this repo can be install as a python library, namely, `cuffpa-py` library (optional).
+The FFPA implemented in this repo can be install as a python library, namely, `ffpa-attn` library (optional).
 ```bash
-git clone https://github.com/DefTruth/cuffpa-py.git
+git clone https://github.com/DefTruth/ffpa-attn-mma.git
 # clone, then, run bash .dev/install.sh directly or run commands:
-python3 setup.py bdist_wheel && cd dist && python3 -m pip install *.whl # pip uninstall cuffpa-py -y
+python3 setup.py bdist_wheel && cd dist && python3 -m pip install *.whl # pip uninstall ffpa-attn -y
 ```
 
 ## 📖 FFPA L1 (Level 1): Benchmark 🎉🎉
@@ -96,21 +96,21 @@ L1: level 1, O(2xBrx16)≈O(1) SRAM complexity, O(d/4) register complexity, the 
 
 |Algorithm|320|384|448|512|576|640|704|768|832|896|960|1024|
 |:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-|SDPA EA|56T|64T|58T|58T|55T|56T|54T|55T|54T|55T|54T|56T|
-|FFPA L1*|98T|100T|102T|94T|94T|93T|93T|92T|90T|91T|90T|91T|
-|Speedup|1.75x|1.56x|1.76x|1.62x|1.71x|1.66x|1.72x|1.67x|1.67x|1.65x|1.67x|1.62x|
-|FFPA L1^|96T|97T|101T|98T|100T|92T|92T|90T|90T|90T|89T|89T|
-|Speedup|1.71x|1.52x|1.74x|1.69x|1.82x|1.64x|1.7x|1.64x|1.67x|1.64x|1.65x|1.59x|
+|SDPA EA|56T|63T|58T|58T|55T|56T|54T|55T|54T|55T|54T|56T|
+|FFPA L1*|99T|101T|102T|95T|95T|95T|94T|92T|92T|93T|93T|93T|
+|Speedup|1.77x|1.6x|1.76x|1.64x|1.73x|1.7x|1.74x|1.67x|1.7x|1.69x|1.72x|1.66x|
+|FFPA L1^|98T|100T|101T|102T|101T|93T|92T|93T|94T|93T|93T|93T|
+|Speedup|1.75x|1.59x|1.74x|1.76x|1.84x|1.66x|1.7x|1.69x|1.74x|1.69x|1.72x|1.66x|
 
 - 📚 NVIDIA A30 (`*`=MMA Acc F32, `^`=MMA Acc F16, `T`=TFLOPS, **~1.5x↑🎉**)
 
 |Algorithm|320|384|448|512|576|640|704|768|832|896|960|1024|
 |:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-|SDPA EA|25T|25T|19T|22T|23T|23T|20T|22T|22T|22T|22T|18T|
-|FFPA L1*|31T|31T|31T|30T|31T|30T|30T|30T|29T|28T|29T|28T|
-|Speedup|1.24x|1.24x|1.63x|1.36x|1.35x|1.3x|1.5x|1.36x|1.32x|1.27x|1.32x|1.56x|
-|FFPA L1^|31T|31T|32T|31T|31T|31T|31T|30T|30T|30T|29T|29T|
-|Speedup|1.24x|1.24x|1.68x|1.41x|1.35x|1.35x|1.55x|1.36x|1.36x|1.36x|1.32x|1.61x|
+|SDPA EA|25T|25T|24T|24T|24T|24T|23T|22T|22T|22T|22T|18T|
+|FFPA L1*|36T|37T|35T|36T|35T|36T|35T|34T|34T|32T|34T|31T|
+|Speedup|1.44x|1.48x|1.46x|1.5x|1.46x|1.5x|1.52x|1.55x|1.55x|1.45x|1.55x|1.72x|
+|FFPA L1^|36T|36T|37T|37T|35T|35T|35T|35T|35T|34T|35T|32T|
+|Speedup|1.44x|1.44x|1.54x|1.54x|1.46x|1.46x|1.52x|1.59x|1.59x|1.55x|1.59x|1.78x|
 
 - 📚 NVIDIA RTX 3080 Laptop (`*`=MMA Acc F32, `^`=MMA Acc F16, `T`=TFLOPS, **~2.5x↑🎉**)
 
@@ -126,11 +126,11 @@ L1: level 1, O(2xBrx16)≈O(1) SRAM complexity, O(d/4) register complexity, the 
 
 |Algorithm|320|384|448|512|576|640|704|768|832|896|960|1024|
 |:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-|SDPA EA|80T|94T|86T|85T|79T|81T|79T|81T|79T|80T|79T|72T|
-|FFPA L1*|135T|140T|143T|135T|134T|134T|134T|134T|131T|131T|130T|131T|
-|Speedup|1.69x|1.49x|1.66x|1.59x|1.7x|1.65x|1.7x|1.65x|1.66x|1.64x|1.65x|1.82x|
-|FFPA L1^|153T|155T|157T|157T|159T|157T|157T|156T|151T|151T|150T|153T|
-|Speedup|1.91x|1.65x|1.83x|1.85x|2.01x|1.94x|1.99x|1.93x|1.91x|1.89x|1.9x|2.12x|
+|SDPA EA|82T|93T|85T|85T|79T|81T|79T|80T|79T|80T|78T|78T|
+|FFPA L1*|145T|148T|143T|139T|140T|139T|138T|135T|134T|134T|132T|129T|
+|Speedup|1.77x|1.59x|1.68x|1.64x|1.77x|1.72x|1.75x|1.69x|1.7x|1.68x|1.69x|1.65x|
+|FFPA L1^|176T|174T|171T|174T|173T|170T|169T|167T|164T|163T|162T|159T|
+|Speedup|2.15x|1.87x|2.01x|2.05x|2.19x|2.1x|2.14x|2.09x|2.08x|2.04x|2.08x|2.04x|
 
 ## 📖 Python Testing
 <div id="python-test"></div>

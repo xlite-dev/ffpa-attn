@@ -159,7 +159,7 @@ class ENV(object):
         return raw_output, bare_metal_version
 
     @staticmethod
-    def build_pyffpa_from_sources(verbose: bool = False):
+    def build_ffpa_from_sources(verbose: bool = False):
         from torch.utils.cpp_extension import load
 
         torch_arch_list_env = os.environ.get("TORCH_CUDA_ARCH_LIST", None)
@@ -178,34 +178,34 @@ class ENV(object):
         )
 
     @staticmethod
-    def try_load_pyffpa_library(force_build: bool = False, verbose: bool = False):
-        use_pyffpa_package = False
+    def try_load_ffpa_library(force_build: bool = False, verbose: bool = False):
+        use_ffpa_attn_package = False
         if not force_build:
-            # check if can import toy_hgemm
+            # check if can import ffpa_attn
             try:
-                import pyffpa
+                import ffpa_attn
 
-                pretty_print_line("Import pyffpa library done, use it!")
-                use_pyffpa_package = True
-                return pyffpa, use_pyffpa_package
+                pretty_print_line("Import ffpa_attn library done, use it!")
+                use_ffpa_attn_package = True
+                return ffpa_attn, use_ffpa_attn_package
             except Exception:
-                pretty_print_line("Can't import pyffpa, force build from sources")
+                pretty_print_line("Can't import ffpa_attn, force build from sources")
                 pretty_print_line(
                     "Also may need export LD_LIBRARY_PATH="
                     "PATH-TO/torch/lib:$LD_LIBRARY_PATH"
                 )
-                pyffpa = ENV.build_pyffpa_from_sources(verbose=verbose)
-                use_pyffpa_package = False
-                return pyffpa, use_pyffpa_package
+                ffpa_attn = ENV.build_ffpa_from_sources(verbose=verbose)
+                use_ffpa_attn_package = False
+                return ffpa_attn, use_ffpa_attn_package
         else:
             pretty_print_line("Force pyffpa lib build from sources")
-            pyffpa = ENV.build_pyffpa_from_sources(verbose=verbose)
-            use_pyffpa_package = False
-            return pyffpa, use_pyffpa_package
+            ffpa_attn = ENV.build_ffpa_from_sources(verbose=verbose)
+            use_ffpa_attn_package = False
+            return ffpa_attn, use_ffpa_attn_package
 
     @classmethod
     def list_ffpa_env(cls):
-        pretty_print_line("cuffpa-py ENVs")
+        pretty_print_line("FFPA-ATTN ENVs")
         pretty_print_line(
             f"PROJECT_DIR:                      {cls.project_dir()}",
             sep="",
