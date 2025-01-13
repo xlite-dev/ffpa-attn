@@ -67,7 +67,7 @@ By leveraging this approach, we can achieve better performance for large headdim
 |SRAM | O(2xBrx16)≈O(1) | O(2xBrx16)≈O(1) | O(2xBrx16)≈O(1) | ≈O(3xBrxd), d↑ |
 |Register | ≈O(d/4), d↑ | O((Bc/16)x4+2C)≈O(1)|O((Bc/16)x4+2C)≈O(1)| ≈O(d/2), d↑ |
 |HBM| ≈FA2≈O(Nd), O | ≈FA2≈O(Nd), O| ≈FA2≈O(Nd), O | ≈O(Nd), O |
-|Extra HBM| ≈FA2≈O(N) | ≈FA2≈O(N) | ≈FA2≈O(N) | ≈O(N), m,l |
+|Extra HBM| ≈FA2≈O(N), m,l | ≈FA2≈O(N), m,l | ≈FA2≈O(N) | ≈O(N), m,l |
 
 ## 📖 Prerequisites
 <div id="prerequisites"></div>
