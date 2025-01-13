@@ -91,7 +91,7 @@ python3 setup.py bdist_wheel && cd dist && python3 -m pip install *.whl # pip un
 
 L1: level 1, O(2xBrx16)≈O(1) SRAM complexity, O(d/4) register complexity, the same GPU HBM memory complexity as FlashAttention. B=1, H=48, N=8192, **D=320-1024(FA2 not supported 👀)**. (Notes, `*`=MMA Acc F32, `^`=MMA Acc F16, Softmax Acc dtype is always be F32, T=TFLOPS, 👇Benchmark)
 
-- 📚 NVIDIA L20 (`*`=MMA Acc F32, `^`=MMA Acc F16, `T`=TFLOPS, **~1.7x↑🎉**)
+- 📚 NVIDIA L20 (`*`=MMA Acc F32, `^`=MMA Acc F16, `T`=TFLOPS, **~1.8x↑🎉**)
 
 |Algorithm|320|384|448|512|576|640|704|768|832|896|960|1024|
 |:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
@@ -100,6 +100,16 @@ L1: level 1, O(2xBrx16)≈O(1) SRAM complexity, O(d/4) register complexity, the 
 |Speedup|1.84x|1.65x|1.78x|1.64x|1.73x|1.68x|1.76x|1.73x|1.72x|1.69x|1.72x|1.64x|
 |FFPA L1^|104T|105T|105T|104T|102T|95T|94T|93T|93T|94T|92T|93T|
 |Speedup|1.86x|1.67x|1.81x|1.79x|1.85x|1.7x|1.74x|1.69x|1.72x|1.71x|1.7x|1.66x|
+
+- 📚 NVIDIA L20 (`*`=MMA Acc: QK F32 + PV F16, `^`=MMA Acc F16, `T`=TFLOPS, **~1.9x↑🎉**)
+
+|Algorithm|320|384|448|512|576|640|704|768|832|896|960|1024|
+|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+|SDPA EA|56T|64T|58T|58T|55T|56T|54T|55T|54T|55T|54T|56T|
+|FFPA L1*|105T|106T|105T|96T|95T|94T|93T|93T|92T|92T|93T|93T|
+|Speedup|1.88x|1.66x|1.81x|1.66x|1.73x|1.68x|1.72x|1.69x|1.7x|1.67x|1.72x|1.66x|
+|FFPA L1^|104T|105T|105T|104T|102T|94T|94T|93T|93T|94T|92T|93T|
+|Speedup|1.86x|1.64x|1.81x|1.79x|1.85x|1.68x|1.74x|1.69x|1.72x|1.71x|1.7x|1.66x|
 
 - 📚 NVIDIA A30 (`*`=MMA Acc F32, `^`=MMA Acc F16, `T`=TFLOPS, **~1.5x↑🎉**)
 
