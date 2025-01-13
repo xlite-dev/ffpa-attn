@@ -10,14 +10,11 @@ warnings.filterwarnings("ignore")
 
 def get_long_description():
     description = (Path(ENV.project_dir()) / "README.md").read_text(encoding="utf-8")
-    # replace relative repository path to absolute link to the release
-    static_url = "https://github.com/DefTruth/cuffpa-py/blob/main"
-    description = description.replace("docs/", f"{static_url}/docs/")
     return description
 
 
-# package name managed by pip, which can be remove by `pip uninstall cuffpa-py -y`
-PACKAGE_NAME = "cuffpa-py"
+# package name managed by pip, which can be remove by `pip uninstall ffpa-attn -y`
+PACKAGE_NAME = "ffpa-attn"
 
 ext_modules = []
 generator_flag = []
@@ -86,6 +83,7 @@ setup(
             "bench",
             "tmp",
             "cuffpa_py.egg-info",
+            "ffpa_attn.egg-info",
             "__pycache__",
             "third_party",
         )
@@ -93,15 +91,13 @@ setup(
     description="FFPA: Yet another Faster Flash Prefill Attention for large headdim, 1.5x~2x faster than SDPA EA.",
     long_description=get_long_description(),
     long_description_content_type="text/markdown",
-    url="https://github.com/DefTruth/cuffpa-py.git",
+    url="https://github.com/DefTruth/ffpa-attn-mma.git",
     ext_modules=ext_modules,
     cmdclass={"build_ext": BuildExtension},
     python_requires=">=3.10",
     install_requires=fetch_requirements(),
     extras_require={
-        # optional dependencies, required by some features
         "all": [],
-        # dev dependencies. Install them by `pip3 install 'akvattn[dev]'`
         "dev": [
             "pre-commit",
             "packaging",
