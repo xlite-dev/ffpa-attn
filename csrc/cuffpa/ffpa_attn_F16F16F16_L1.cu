@@ -45,8 +45,13 @@ void launch_ffpa_mma_acc_f16_L1(
   // 0 for smem swizzle, > 0 for smem padding.
   constexpr int kPadQ = 0;
   constexpr int kPadK = 0; 
-  constexpr int kPadV = 8; // swizzle V seems can not get good performance.
-  
+#ifdef ENABLE_FFPA_SMEM_SWIZZLE_V
+  // swizzle V seems can not get good performance.
+  constexpr int kPadV = 0; 
+#else 
+  constexpr int kPadV = 8;
+#endif
+
   // Calculate SRAM size needed per block, Q,K,V smem size, V shared the QK smem.
   constexpr int QK_smem_size = (kStageQK * (Br * (kMmaAtomK + kPadQ)) + 
                                 kStageQK * (Bc * (kMmaAtomK + kPadK)));
