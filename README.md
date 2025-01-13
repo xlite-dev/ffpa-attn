@@ -18,8 +18,9 @@
   <img src='./bench/NVIDIA_GeForce_RTX_3080_Laptop_GPU_WSL2_ffpa+acc+f16+L1_Speedup.png' width="400px">
 </div> 
 
-💡NOTE: This project is still in its early dev stages and now provides some kernels and benchmarks for reference. More features will be added in the future. 👇Features🎉🎉(Welcome to 🌟👆🏻star this repo to support me ~)
-
+💡NOTE: This project is still in its early dev stages and now provides some kernels and benchmarks for reference. More features will be added in the future. (Welcome to 🌟👆🏻star this repo to support me ~)
+<!--
+👇Features🎉🎉
 |Tensor Cores|Loop over N/D |Tile Block (Br, Bc) |MMA (16816-F16/F32)|
 |:---:|:---:|:---:|:---:|
 |✔️|✔️|✔️|✔️|
@@ -29,7 +30,7 @@
 |✔️|✔️|✔️|✔️|
 |**QKV Fine-grained Tiling**|Fully **Shared QKV** SMEM|Mixed MMA F32/F16 Acc|**FFPA L1 Level**|
 |✔️|✔️|✔️|✔️|
-
+-->
 ## ©️Citations🎉🎉
 
 ```BibTeX
