@@ -153,6 +153,9 @@ void ffpa_mma_acc_f16_L1(torch::Tensor Q,
   {                                          \
     switch (d)                               \
     {                                        \
+      CASE_LAUNCH_KERNEL_F16_L1(64,   (S));  \
+      CASE_LAUNCH_KERNEL_F16_L1(128,  (S));  \
+      CASE_LAUNCH_KERNEL_F16_L1(256,  (S));  \
       CASE_LAUNCH_KERNEL_F16_L1(320,  (S));  \
       CASE_LAUNCH_KERNEL_F16_L1(512,  (S));  \
       CASE_LAUNCH_KERNEL_F16_L1(1024, (S));  \
