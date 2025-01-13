@@ -406,7 +406,8 @@ ffpa_mma_stages_split_q_L1_template(half* Q,
   // Store O(D): Write O[Br,d] from regs -> gmem, collective store 
   // with reg reuse & warp shuffle. 
   static_assert(kWarpTileSeqLenP == 1);
-  prefill::sync_store_o_r2g<Br, kHeadDim, kMmaAtomM, kMmaAtomN, kWarpTileHeadDimV>(
-    O, O_gmem_offset, O_tile_id, warp_QP, &R_D[0][0][0], &R_Q[0][0], &R_K[0][0]
+  prefill::sync_store_o_r2g<
+    Br, kHeadDim, kMmaAtomM, kMmaAtomN, kWarpTileHeadDimV, kOStorageAccFloat32>(
+      O, O_gmem_offset, O_tile_id, warp_QP, &R_D[0][0][0], &R_Q[0][0], &R_K[0][0]
   );
 }

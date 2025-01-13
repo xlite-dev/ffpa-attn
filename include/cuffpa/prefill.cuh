@@ -474,7 +474,8 @@ template<
   const int kHeadDim, 
   const int kMmaAtomM, 
   const int kMmaAtomN, 
-  const int kWarpTileHeadDimV
+  const int kWarpTileHeadDimV,
+  const int kOStorageAccFloat32
 >
 __device__ __forceinline__ void sync_store_o_r2g(
   half * gmem_ptr,       // O gmem ptr
@@ -495,14 +496,15 @@ __device__ __forceinline__ void sync_store_o_r2g(
       // reuse R_Q[1][4], R_K[8][2] for collective store.
       uint32_t* t_uptr_Z_0 = reinterpret_cast<uint32_t*>(R_Q); 
       uint32_t* t_uptr_Z_1 = reinterpret_cast<uint32_t*>(R_K); 
-      t_uptr_Z_0[0] = R_D[j * 2 + 0]; 
-      t_uptr_Z_1[0] = R_D[j * 2 + 1]; 
-      t_uptr_Z_0[1] = __shfl_sync((0xffffffff), R_D[j * 2 + 0], lane_id + 1, 4);
-      t_uptr_Z_0[2] = __shfl_sync((0xffffffff), R_D[j * 2 + 0], lane_id + 2, 4);
-      t_uptr_Z_0[3] = __shfl_sync((0xffffffff), R_D[j * 2 + 0], lane_id + 3, 4);
-      t_uptr_Z_1[1] = __shfl_sync((0xffffffff), R_D[j * 2 + 1], lane_id + 1, 4);
-      t_uptr_Z_1[2] = __shfl_sync((0xffffffff), R_D[j * 2 + 1], lane_id + 2, 4);
-      t_uptr_Z_1[3] = __shfl_sync((0xffffffff), R_D[j * 2 + 1], lane_id + 3, 4);
+      const int offset = (kOStorageAccFloat32) ? j * 4 : j * 2;
+      t_uptr_Z_0[0] = R_D[offset + 0]; 
+      t_uptr_Z_1[0] = R_D[offset + 1]; 
+      t_uptr_Z_0[1] = __shfl_sync((0xffffffff), R_D[offset + 0], lane_id + 1, 4);
+      t_uptr_Z_0[2] = __shfl_sync((0xffffffff), R_D[offset + 0], lane_id + 2, 4);
+      t_uptr_Z_0[3] = __shfl_sync((0xffffffff), R_D[offset + 0], lane_id + 3, 4);
+      t_uptr_Z_1[1] = __shfl_sync((0xffffffff), R_D[offset + 1], lane_id + 1, 4);
+      t_uptr_Z_1[2] = __shfl_sync((0xffffffff), R_D[offset + 1], lane_id + 2, 4);
+      t_uptr_Z_1[3] = __shfl_sync((0xffffffff), R_D[offset + 1], lane_id + 3, 4);
 
       // st.global.v4 128 bits. [Br,d]
       if (lane_id % 4 == 0) {
