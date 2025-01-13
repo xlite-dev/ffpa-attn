@@ -81,7 +81,7 @@ By leveraging this approach, we can achieve better performance for large headdim
 
 The FFPA implemented in this repo can be install as a python library, namely, `ffpa-attn` library (optional).
 ```bash
-git clone https://github.com/DefTruth/cuffpa-py.git
+git clone https://github.com/DefTruth/ffpa-attn-mma.git
 # clone, then, run bash .dev/install.sh directly or run commands:
 python3 setup.py bdist_wheel && cd dist && python3 -m pip install *.whl # pip uninstall ffpa-attn -y
 ```
