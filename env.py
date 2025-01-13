@@ -32,13 +32,16 @@ class ENV(object):
     # default False.
     ENABLE_FFPA_HOPPER = bool(int(os.environ.get("ENABLE_FFPA_HOPPER", 0)))
 
-    # Enable force P@V use fp16 as MMA Acc dtype (TODO: Q@K)
+    # Enable force P@V use fp16 as MMA Acc dtype, default False. (TODO: Q@K)
     ENABLE_FFPA_FORCE_PV_MMA_ACC_F16 = bool(
         int(os.environ.get("ENABLE_FFPA_FORCE_PV_MMA_ACC_F16", 0))
     )
 
-    # Enable FFPA Prefetch QKV at the Appropriate Time Point.
+    # Enable FFPA Prefetch QKV at the Appropriate Time Point, default False.
     ENABLE_FFPA_PREFETCH_QKV = bool(int(os.environ.get("ENABLE_FFPA_PREFETCH_QKV", 0)))
+
+    # Enable QKV smem shared policy, default True.
+    ENABLE_FFPA_QKV_SMEM_SHARE = bool(int(os.environ.get("ENABLE_FFPA_QKV_SMEM_SHARE", 1)))
 
     @classmethod
     def project_dir(cls):
@@ -75,6 +78,10 @@ class ENV(object):
     @classmethod
     def enable_prefetch_qkv(cls):
         return cls.ENABLE_FFPA_PREFETCH_QKV
+    
+    @classmethod
+    def enable_qkv_smem_share(cls):
+        return cls.ENABLE_FFPA_QKV_SMEM_SHARE
 
     @classmethod
     def env_cuda_cflags(cls):
@@ -89,7 +96,29 @@ class ENV(object):
             extra_env_cflags.append("-DENABLE_FFPA_FORCE_PV_MMA_ACC_F16")
         if cls.enable_prefetch_qkv():
             extra_env_cflags.append("-DENABLE_FFPA_PREFETCH_QKV")
+        if cls.enable_qkv_smem_share():
+            extra_env_cflags.append("-DENABLE_FFPA_QKV_SMEM_SHARE")
         return extra_env_cflags
+
+    @classmethod
+    def list_ffpa_env(cls):
+        def formatenv(name, value):
+            return print(f"{name:<32}: {value}")
+
+        pretty_print_line("FFPA-ATTN ENVs")
+        formatenv("PROJECT_DIR", cls.project_dir())
+        formatenv("ENABLE_FFPA_DEBUG", cls.enable_debug())
+        formatenv("ENABLE_FFPA_ADA", cls.enable_ada())
+        formatenv("ENABLE_FFPA_AMPERE", cls.enable_ampere())
+        formatenv("ENABLE_FFPA_HOPPER", cls.enable_hopper())
+        formatenv("ENABLE_FFPA_ALL_STAGES", cls.enable_all_mutistages())
+        formatenv("ENABLE_FFPA_ALL_HEADDIM", cls.enable_all_headdim())
+        formatenv("ENABLE_FFPA_PREFETCH_QKV", cls.enable_prefetch_qkv())
+        formatenv("ENABLE_FFPA_QKV_SMEM_SHARE", cls.enable_qkv_smem_share())
+        formatenv(
+            "ENABLE_FFPA_FORCE_PV_MMA_ACC_F16", cls.enable_force_pv_mma_acc_fp16()
+        )
+        pretty_print_line()
 
     @staticmethod
     def get_device_name():
@@ -211,25 +240,6 @@ class ENV(object):
             ffpa_attn = ENV.build_ffpa_from_sources(verbose=verbose)
             use_ffpa_attn_package = False
             return ffpa_attn, use_ffpa_attn_package
-
-    @classmethod
-    def list_ffpa_env(cls):
-        def formatenv(name, value):
-            return print(f"{name:<32}: {value}")
-
-        pretty_print_line("FFPA-ATTN ENVs")
-        formatenv("PROJECT_DIR", cls.project_dir())
-        formatenv("ENABLE_FFPA_DEBUG", cls.enable_debug())
-        formatenv("ENABLE_FFPA_ADA", cls.enable_ada())
-        formatenv("ENABLE_FFPA_AMPERE", cls.enable_ampere())
-        formatenv("ENABLE_FFPA_HOPPER", cls.enable_hopper())
-        formatenv("ENABLE_FFPA_ALL_STAGES", cls.enable_all_mutistages())
-        formatenv("ENABLE_FFPA_ALL_HEADDIM", cls.enable_all_headdim())
-        formatenv("ENABLE_FFPA_PREFETCH_QKV", cls.enable_prefetch_qkv())
-        formatenv(
-            "ENABLE_FFPA_FORCE_PV_MMA_ACC_F16", cls.enable_force_pv_mma_acc_fp16()
-        )
-        pretty_print_line()
 
 
 def pretty_print_line(
