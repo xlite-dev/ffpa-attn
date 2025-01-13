@@ -18,7 +18,7 @@
 |✔️|✔️|✔️|✔️|
 |**Split Q** (FA-2)|Pack LDST (128 bits)|SMEM **Swizzle**/Padding |Copy Async |
 |✔️|✔️|✔️|✔️|
-|Tile MMA/Warp |Multi Stages (1~4) |Collective Store (**Warp Shfl**)| **Prefetch QKV** g2s |
+|Tile MMA/Warp |QKV Multi Stages (1~4) |Collective Store (**Warp Shfl**)| **Prefetch QKV** g2s |
 |✔️|✔️|✔️|✔️|
 |**QKV Fine-grained Tiling**|**Shared QKV** SMEM|Mixed MMA Acc|**FFPA L1 Level**|
 |✔️|✔️|✔️|✔️|
