@@ -16,9 +16,9 @@
 |Tensor Cores|Loop over N/D |Tile Block (Br, Bc) |MMA (m16n8k16)|
 |:---:|:---:|:---:|:---:|
 |✔️|✔️|✔️|✔️|
-|Pack LDST (128 bits)|SMEM **Swizzle**/Padding |Copy Async|Tile MMA (More Threads) |
+|**Split Q** (FA-2)|Pack LDST (128 bits)|SMEM **Swizzle**/Padding |Copy Async |
 |✔️|✔️|✔️|✔️|
-|Tile Warp (More Values) |Multi Stages (1~4) |Collective Store (**Shfl**)|**Split Q**|
+|Tile MMA (More Threads)|Tile Warp (More Values) |Multi Stages (1~4) |Collective Store (**Shfl**)|
 |✔️|✔️|✔️|✔️|
 |**QKV Fine-grained Tiling**|**Shared QKV** SMEM|**FFPA L1 Level**|**FFPA L2/L3 Level** |
 |✔️|✔️|✔️|?|
