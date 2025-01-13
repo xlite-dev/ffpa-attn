@@ -20,8 +20,8 @@
 |✔️|✔️|✔️|✔️|
 |Tile MMA (More Threads)|Tile Warp (More Values) |Multi Stages (1~4) |Collective Store (**Shfl**)|
 |✔️|✔️|✔️|✔️|
-|**QKV Fine-grained Tiling**|**Shared QKV** SMEM|**FFPA L1 Level**|**FFPA L2/L3 Level** |
-|✔️|✔️|✔️|?|
+|**QKV Fine-grained Tiling**|**Shared QKV** SMEM|Mixed F32/F16 MMA Acc|**FFPA L1**|
+|✔️|✔️|✔️|✔️|
 <!--
 -->
 
