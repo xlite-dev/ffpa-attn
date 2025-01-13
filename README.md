@@ -18,9 +18,9 @@
 |✔️|✔️|✔️|✔️|
 |**Split Q** (FA-2)|Pack LDST (128 bits)|SMEM **Swizzle**/Padding |Copy Async |
 |✔️|✔️|✔️|✔️|
-|Tile MMA (More Threads)|Tile Warp (More Values) |Multi Stages (1~4) |Collective Store (**Shfl**)|
+|Tile MMA/Warp |Multi Stages (1~4) |Collective Store (**Shfl**)| **Prefetch QKV** g2s |
 |✔️|✔️|✔️|✔️|
-|**QKV Fine-grained Tiling**|**Shared QKV** SMEM|Mixed F32/F16 MMA Acc|**FFPA L1**|
+|**Fine-grained Tiling**|**Shared QKV** SMEM|Mixed MMA Acc|**FFPA L1 Level**|
 |✔️|✔️|✔️|✔️|
 <!--
 -->
@@ -98,10 +98,10 @@ L1: level 1, O(2xBrx16)≈O(1) SRAM complexity, O(d/4) register complexity, the 
 |Algorithm|320|384|448|512|576|640|704|768|832|896|960|1024|
 |:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
 |SDPA EA|56T|63T|58T|58T|55T|56T|54T|55T|54T|55T|54T|56T|
-|FFPA L1*|99T|101T|102T|95T|95T|95T|94T|92T|92T|93T|93T|93T|
-|Speedup|1.77x|1.6x|1.76x|1.64x|1.73x|1.7x|1.74x|1.67x|1.7x|1.69x|1.72x|1.66x|
-|FFPA L1^|98T|100T|101T|102T|101T|93T|92T|93T|94T|93T|93T|93T|
-|Speedup|1.75x|1.59x|1.74x|1.76x|1.84x|1.66x|1.7x|1.69x|1.74x|1.69x|1.72x|1.66x|
+|FFPA L1*|101T|102T|103T|95T|96T|96T|95T|95T|95T|92T|91T|91T|
+|Speedup|1.8x|1.62x|1.78x|1.64x|1.75x|1.71x|1.76x|1.73x|1.76x|1.67x|1.69x|1.62x|
+|FFPA L1^|102T|105T|103T|102T|102T|95T|96T|95T|95T|92T|92T|89T|
+|Speedup|1.82x|1.67x|1.78x|1.76x|1.85x|1.7x|1.78x|1.73x|1.76x|1.67x|1.7x|1.59x|
 
 - 📚 NVIDIA A30 (`*`=MMA Acc F32, `^`=MMA Acc F16, `T`=TFLOPS, **~1.5x↑🎉**)
 

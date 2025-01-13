@@ -9,6 +9,9 @@ class ENV(object):
     # Project dir, path to faster-prefill-attention
     PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 
+    # Enable debug mode for FFPA, fast build minimal kernels, default False.
+    ENABLE_FFPA_DEBUG = bool(int(os.environ.get("ENABLE_FFPA_DEBUG", 0)))
+
     # Enable all multi stages kernels or not (1~4), default False (1~2).
     ENABLE_FFPA_ALL_STAGES = bool(int(os.environ.get("ENABLE_FFPA_ALL_STAGES", 0)))
 
@@ -29,17 +32,21 @@ class ENV(object):
     # default False.
     ENABLE_FFPA_HOPPER = bool(int(os.environ.get("ENABLE_FFPA_HOPPER", 0)))
 
-    # Enable debug mode for FFPA, fast build minimal kernels, default False.
-    ENABLE_FFPA_DEBUG = bool(int(os.environ.get("ENABLE_FFPA_DEBUG", 0)))
-
     # Enable force P@V use fp16 as MMA Acc dtype (TODO: Q@K)
     ENABLE_FFPA_FORCE_PV_MMA_ACC_F16 = bool(
         int(os.environ.get("ENABLE_FFPA_FORCE_PV_MMA_ACC_F16", 0))
     )
 
+    # Enable FFPA Prefetch QKV at the Appropriate Time Point.
+    ENABLE_FFPA_PREFETCH_QKV = bool(int(os.environ.get("ENABLE_FFPA_PREFETCH_QKV", 1)))
+
     @classmethod
     def project_dir(cls):
         return cls.PROJECT_DIR
+
+    @classmethod
+    def enable_debug(cls):
+        return cls.ENABLE_FFPA_DEBUG
 
     @classmethod
     def enable_hopper(cls):
@@ -66,20 +73,22 @@ class ENV(object):
         return cls.ENABLE_FFPA_FORCE_PV_MMA_ACC_F16
 
     @classmethod
-    def enable_debug(cls):
-        return cls.ENABLE_FFPA_DEBUG
+    def enable_prefetch_qkv(cls):
+        return cls.ENABLE_FFPA_PREFETCH_QKV
 
     @classmethod
     def env_cuda_cflags(cls):
         extra_env_cflags = []
+        if cls.enable_debug():
+            extra_env_cflags.append("-DENABLE_FFPA_DEBUG")
         if cls.enable_all_mutistages():
             extra_env_cflags.append("-DENABLE_FFPA_ALL_STAGES")
         if cls.enable_all_headdim():
             extra_env_cflags.append("-DENABLE_FFPA_ALL_HEADDIM")
         if cls.enable_force_pv_mma_acc_fp16():
             extra_env_cflags.append("-DENABLE_FFPA_FORCE_PV_MMA_ACC_F16")
-        if cls.enable_debug():
-            extra_env_cflags.append("-DENABLE_FFPA_DEBUG")
+        if cls.enable_prefetch_qkv():
+            extra_env_cflags.append("-DENABLE_FFPA_PREFETCH_QKV")
         return extra_env_cflags
 
     @staticmethod
@@ -165,7 +174,7 @@ class ENV(object):
         torch_arch_list_env = os.environ.get("TORCH_CUDA_ARCH_LIST", None)
         # Load the CUDA kernel as a python module
         pretty_print_line(
-            f"Loading pyffpa lib on device: {ENV.get_device_name()}, "
+            f"Loading ffpa_attn lib on device: {ENV.get_device_name()}, "
             f"capability: {ENV.get_device_capability()}, "
             f"Arch ENV: {torch_arch_list_env}"
         )
@@ -198,7 +207,7 @@ class ENV(object):
                 use_ffpa_attn_package = False
                 return ffpa_attn, use_ffpa_attn_package
         else:
-            pretty_print_line("Force pyffpa lib build from sources")
+            pretty_print_line("Force ffpa_attn lib build from sources")
             ffpa_attn = ENV.build_ffpa_from_sources(verbose=verbose)
             use_ffpa_attn_package = False
             return ffpa_attn, use_ffpa_attn_package
@@ -216,6 +225,7 @@ class ENV(object):
         formatenv("ENABLE_FFPA_HOPPER", cls.enable_hopper())
         formatenv("ENABLE_FFPA_ALL_STAGES", cls.enable_all_mutistages())
         formatenv("ENABLE_FFPA_ALL_HEADDIM", cls.enable_all_headdim())
+        formatenv("ENABLE_FFPA_PREFETCH_QKV", cls.enable_prefetch_qkv())
         formatenv(
             "ENABLE_FFPA_FORCE_PV_MMA_ACC_F16", cls.enable_force_pv_mma_acc_fp16()
         )

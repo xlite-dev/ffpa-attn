@@ -40,6 +40,14 @@ void launch_ffpa_mma_acc_f32_L1(torch::Tensor Q,
   // Thus, if the error does not exceed 1e-3, using FP16 storage is 
   // sufficient for most applications.
   constexpr int kOStorageAccFloat32 = (kHeadDim < 256) ? 1 : 0;
+  // Prefetch QKV at the Appropriate Time Point. 
+#ifdef ENABLE_FFPA_PREFETCH_QKV
+  constexpr int kPrefetchQK = (kStageQK > 1) ? 1 : 0; 
+  constexpr int kPrefetchPV = (kStagePV > 1) ? 1 : 0; 
+#else 
+  constexpr int kPrefetchQK = 0;
+  constexpr int kPrefetchPV = 0;
+#endif
   // 0 for smem swizzle, > 0 for smem padding.
   constexpr int kPadQ = 0;
   constexpr int kPadK = 0; 
@@ -82,6 +90,8 @@ void launch_ffpa_mma_acc_f32_L1(torch::Tensor Q,
       kMmaAccFloat32QK,
       kMmaAccFloat32PV,
       kOStorageAccFloat32,
+      kPrefetchQK,
+      kPrefetchPV,
       kStageQK, 
       kStagePV,
       kPadQ,
@@ -108,6 +118,8 @@ void launch_ffpa_mma_acc_f32_L1(torch::Tensor Q,
     kMmaAccFloat32QK,
     kMmaAccFloat32PV,
     kOStorageAccFloat32,
+    kPrefetchQK,
+    kPrefetchPV,
     kStageQK, 
     kStagePV,
     kPadQ,
