@@ -1,5 +1,6 @@
 import argparse
 import math
+import os
 import random
 import sys
 import time
@@ -37,6 +38,7 @@ def get_args():
     parser.add_argument("--H", type=int, default=None)
     parser.add_argument("--N", type=int, default=None)
     parser.add_argument("--D", type=int, default=None)
+    parser.add_argument("--MAX-D", "--MD", type=int, default=1024)
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--sleep", type=float, default=0.05)
     parser.add_argument("--debug", action="store_true")
@@ -45,9 +47,19 @@ def get_args():
     parser.add_argument("--iters", "--i", type=int, default=5)
     parser.add_argument("--tag-hints", "--tags", "--hints", type=str, default=None)
     parser.add_argument(
-        "--force-build", "--build", action="store_true", help="Force build from sources"
+        "--plot-flops", "--plot", action="store_true", help="Plot TFLOPS"
+    )
+    parser.add_argument(
+        "--save-dir", "--dir", type=str, default="../bench", help="Save dir for plot"
+    )
+    parser.add_argument(
+        "--save-tag", "--tag", type=str, default=None, help="Save name for plot"
     )
     parser.add_argument("--gen-bench-table", "--gen-bench", action="store_true")
+    parser.add_argument(
+        "--force-build", "--build", action="store_true", help="Force build from sources"
+    )
+
     return parser.parse_args()
 
 
@@ -257,20 +269,11 @@ def run_benchmark(
     return out.clone() if args.check else out, mean_time
 
 
-def gen_bench_markdown_table():
+def get_best_tflops():
     global STATIS_INFO
-    STATIS_INFO["headdim"] = sorted(list(STATIS_INFO["headdim"]))
-    pretty_print_line("FFPA-L1 Benchmark Data")
-    print(STATIS_INFO)
-    pretty_print_line()
-    headdims = [str(d) for d in STATIS_INFO["headdim"]]
-    num_headdim = len(headdims)
-    table_header = "|Algorithm|" + "|".join(headdims) + "|\n"
-    table_header += "|:---:|" + ":---:|" * num_headdim
-    sdpa_tflops = STATIS_INFO["(sdpa)"]
-    # calculate best ffpa tflops across multi-stages 1~4.
     if ENV.enable_all_mutistages():
-        ffpa_l1_32_best_tflops = [
+        sdpa_tflops = STATIS_INFO["(sdpa)"]
+        ffpa_l1_f32_best_tflops = [
             max(x, y, z, w)
             for x, y, z, w in zip(
                 STATIS_INFO["(ffpa+acc+f32+L1+stage1)"],
@@ -289,7 +292,7 @@ def gen_bench_markdown_table():
             )
         ]
     else:
-        ffpa_l1_32_best_tflops = [
+        ffpa_l1_f32_best_tflops = [
             max(x, y)
             for x, y in zip(
                 STATIS_INFO["(ffpa+acc+f32+L1+stage1)"],
@@ -306,15 +309,47 @@ def gen_bench_markdown_table():
 
     # calculate improved
     ffpa_l1_f32_speedup = [
-        round(f / s, 2) for f, s in zip(ffpa_l1_32_best_tflops, sdpa_tflops)
+        round(f / s, 2) for f, s in zip(ffpa_l1_f32_best_tflops, sdpa_tflops)
     ]
     ffpa_l1_f16_speedup = [
         round(f / s, 2) for f, s in zip(ffpa_l1_f16_best_tflops, sdpa_tflops)
     ]
+    STATIS_INFO["ffpa+acc-f32+L1(best)"] = ffpa_l1_f32_best_tflops
+    STATIS_INFO["ffpa+acc-f16+L1(best)"] = ffpa_l1_f16_best_tflops
+    STATIS_INFO["ffpa+acc-f32+L1(speedup)"] = ffpa_l1_f32_speedup
+    STATIS_INFO["ffpa+acc-f16+L1(speedup)"] = ffpa_l1_f16_speedup
+
+    return (
+        sdpa_tflops,
+        ffpa_l1_f32_best_tflops,
+        ffpa_l1_f16_best_tflops,
+        ffpa_l1_f32_speedup,
+        ffpa_l1_f16_speedup,
+    )
+
+
+def gen_bench_markdown_table():
+    global STATIS_INFO
+    STATIS_INFO["headdim"] = sorted(list(STATIS_INFO["headdim"]))
+    pretty_print_line("FFPA-L1 Benchmark Data")
+    print(STATIS_INFO)
+    pretty_print_line()
+    headdims = [str(d) for d in STATIS_INFO["headdim"]]
+    num_headdim = len(headdims)
+    table_header = "|Algorithm|" + "|".join(headdims) + "|\n"
+    table_header += "|:---:|" + ":---:|" * num_headdim
+    (
+        sdpa_tflops,
+        ffpa_l1_f32_best_tflops,
+        ffpa_l1_f16_best_tflops,
+        ffpa_l1_f32_speedup,
+        ffpa_l1_f16_speedup,
+    ) = get_best_tflops()
+
     # sdpa, ffpa, speedup strings.
     sdpa_tflops_str = "|SDPA EA|" + "|".join([str(s) + "T" for s in sdpa_tflops]) + "|"
     ffpa_l1_f32_tflops_str = (
-        "|FFPA L1*|" + "|".join([str(f) + "T" for f in ffpa_l1_32_best_tflops]) + "|"
+        "|FFPA L1*|" + "|".join([str(f) + "T" for f in ffpa_l1_f32_best_tflops]) + "|"
     )
     ffpa_l1_f32_speedup_str = (
         "|Speedup|" + "|".join([str(fs) + "x" for fs in ffpa_l1_f32_speedup]) + "|"
@@ -334,6 +369,146 @@ def gen_bench_markdown_table():
     print(ffpa_l1_f16_tflops_str)
     print(ffpa_l1_f16_speedup_str)
     print("\n")
+
+
+def sort_tflops_by_headdim():
+    global STATIS_INFO
+    NEW_STATIS_INFO = {}
+    headdims = sorted(list(STATIS_INFO["headdim"]), reverse=True)
+    NEW_STATIS_INFO["headdim"] = headdims
+    for tag, tflops in STATIS_INFO.items():
+        if tag == "headdim":
+            continue
+        new_tflops = []
+        for d in headdims:
+            idx = STATIS_INFO["headdim"].index(d)
+            new_tflops.append(tflops[idx])
+        NEW_STATIS_INFO[tag] = new_tflops
+    return NEW_STATIS_INFO
+
+
+def plot_speedup_bar(
+    speedup: list[float], extra_tag: str = "ffpa+acc+f32+L1", headdim: list[int] = None
+):
+    import matplotlib.pyplot as plt
+
+    _ = plt.subplots(figsize=(16, 9))[1]  # fig, axs
+    plt.subplots_adjust(left=0.04, right=0.99, top=0.95, bottom=0.07)
+    # The x-axis coordinates of the bar chart
+    x = range(len(speedup))
+    # Plot the bar chart, setting a different color for each bar
+    random.seed(0)
+    for i, value in enumerate(speedup):
+        random_color = (random.random(), random.random(), random.random())
+        plt.bar(i, value, color=random_color)
+    # Add the x-axis label
+    plt.xlabel("Headdim(D)")
+    plt.xticks(x, headdim)
+    # Add the y-axis label
+    plt.ylabel(f"{extra_tag.upper()} SpeedUp")
+    # Add the title
+    plt.title(f"SpeedUp of {extra_tag.upper()} vs SDPA EA, {ENV.get_device_name()}")
+    # Set the range of the y-axis, adjusted according to the data
+    plt.ylim(0, max(speedup) + 0.5)
+    # Add data labels on each bar
+    for i, v in enumerate(speedup):
+        plt.text(i, v + 0.1, str(v), ha="center")
+    # Show the grid lines for easy observation
+    plt.grid(True)
+    # Display the graph
+    device_name = ENV.get_device_name().replace(" ", "_")
+    if args.save_tag:
+        save_path = (
+            f"{args.save_dir}/{device_name}_{args.save_tag}_{extra_tag}_Speedup.png"
+        )
+    else:
+        save_path = f"{args.save_dir}/{device_name}_{extra_tag}_Speedup.png"
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300)
+    pretty_print_line(f"plot FFPA Speedup bar done, saved as {save_path}")
+    plt.close()
+
+
+def plot_tflops(level: str = "L1"):
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    ax: plt.Axes = plt.subplots(figsize=(16, 9))[1]  # fig, axs
+    plt.subplots_adjust(left=0.04, right=0.99, top=0.95, bottom=0.07)
+    B = 1 if not args.B else args.B
+    H = 48 if not args.H else args.H
+    N = 8192 if not args.N else args.N
+    ax.set_title(
+        f"FFPA {level} vs SDPA EA, {ENV.get_device_name()}, "
+        f"B={B}, H={H}, N={N}, Warmup={args.warmup}, "
+        f"Iters={args.iters}"
+    )
+    ax.set_xlabel("Headdim(D)")
+    ax.set_ylabel("TFLOPS")
+    ax.grid(True)
+
+    get_best_tflops()
+    new_statis_info = sort_tflops_by_headdim()
+
+    ax.set_xticks(np.arange(0, len(new_statis_info["headdim"]), 1))
+    ax.set_xticklabels(new_statis_info["headdim"], rotation=45, ha="right")
+    exclude_tags = []
+    exclude_tags.append("headdim")
+    exclude_tags = set(exclude_tags)
+
+    draw_tags = list(new_statis_info.keys())
+    draw_tags.remove("headdim")
+    draw_tags.remove("ffpa+acc-f32+L1(speedup)")
+    draw_tags.remove("ffpa+acc-f16+L1(speedup)")
+    draw_tags = set(draw_tags)
+    draw_tags.add("ffpa+acc-f32+L1(best)")
+    draw_tags.add("ffpa+acc-f16+L1(best)")
+    draw_tags = sorted(list(draw_tags))
+
+    def skip_it(tag: str) -> bool:
+        for etag in exclude_tags:
+            if etag in tag:
+                return True
+        if tag not in draw_tags:
+            return True
+        return False
+
+    for tag, tflops in new_statis_info.items():
+        if skip_it(tag):
+            continue
+        if tag == "(sdpa)":
+            ax.plot(tflops, label=tag, linewidth=3, color="green")
+        elif tag == "(unfused)":
+            ax.plot(tflops, label=tag, linewidth=3, color="black")
+        else:
+            if "ffpa+acc-f32+L1(best)" in tag:
+                ax.plot(tflops, label=tag, linewidth=4, color="blue")
+            elif "ffpa+acc-f16+L1(best)" in tag:
+                ax.plot(tflops, label=tag, linewidth=4, color="red")
+            else:
+                ax.plot(tflops, label=tag, linestyle="--")
+
+    ax.legend()
+    device_name = ENV.get_device_name().replace(" ", "_")
+    if args.save_tag:
+        save_path = f"{args.save_dir}/{device_name}_{args.save_tag}.png"
+    else:
+        save_path = f"{args.save_dir}/{device_name}.png"
+    os.makedirs(args.save_dir, exist_ok=True)
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300)
+    pretty_print_line(f"plot FFPA TFLOPS done, saved as {save_path}")
+    plt.close()
+    plot_speedup_bar(
+        new_statis_info["ffpa+acc-f32+L1(speedup)"],
+        "ffpa+acc+f32+L1",
+        new_statis_info["headdim"],
+    )
+    plot_speedup_bar(
+        new_statis_info["ffpa+acc-f16+L1(speedup)"],
+        "ffpa+acc+f16+L1",
+        new_statis_info["headdim"],
+    )
 
 
 def get_qkvo(B, H, N, D):
@@ -417,7 +592,7 @@ def check_all_close(
 Bs = [1] if not args.B else [args.B]
 Hs = [48] if not args.H else [args.H]
 Ns = [8192] if not args.N else [args.N]
-Ds = list(range(320, 1024 + 64, 64)) if not args.D else [args.D]
+Ds = list(range(320, args.MAX_D + 64, 64)) if not args.D else [args.D]
 # batch_size, n_head, seq_len, head_dim (B,H,N,D)
 BHNDs = [(B, H, N, D) for B in Bs for H in Hs for N in Ns for D in Ds]
 # max headdim supported for different methods. skip if D > max_D.
@@ -645,3 +820,6 @@ for (B, H, N, D) in BHNDs:
 
 if args.gen_bench_table:
     gen_bench_markdown_table()
+
+if args.plot_flops:
+    plot_tflops()
