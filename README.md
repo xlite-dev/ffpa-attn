@@ -20,7 +20,7 @@
 |✔️|✔️|✔️|✔️|
 |Tile MMA & Warp |QKV Multi Stages (1~4) |Collective Store (**Warp Shfl**)| **Prefetch QKV** g2s |
 |✔️|✔️|✔️|✔️|
-|**QKV Fine-grained Tiling**|**Shared QKV** SMEM|Mixed MMA Acc|**FFPA L1 Level**|
+|**QKV Fine-grained Tiling**|Fully **Shared QKV** SMEM|Mixed MMA Acc|**FFPA L1 Level**|
 |✔️|✔️|✔️|✔️|
 
 💡NOTE: This project is still in its early dev stages and now provides some kernels and benchmarks for reference. More features will be added in the future. Welcome to 🌟👆🏻star this repo to support me ~ 🎉🎉
