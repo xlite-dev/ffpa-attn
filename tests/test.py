@@ -409,6 +409,7 @@ def plot_speedup_bar(
     )
     # Set the range of the y-axis, adjusted according to the data
     plt.ylim(0, max(speedup) + 0.5)
+    plt.yticks(fontweight='bold')
     for i, v in enumerate(speedup):
         plt.text(i, v + 0.1, str(v), ha="center", fontsize=20, fontweight='bold')
     plt.grid(True)
@@ -488,7 +489,9 @@ def plot_tflops(level: str = "L1"):
                 ax.plot(tflops, label=tag, linewidth=4, color="red")
             else:
                 ax.plot(tflops, label=tag, linestyle="--")
-
+                
+    for label in ax.get_yticklabels():
+        label.set_fontweight('bold')
     ax.legend()
     device_name = ENV.get_device_name().replace(" ", "_")
     if args.save_tag:
