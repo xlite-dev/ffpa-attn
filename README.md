@@ -173,27 +173,13 @@ L1: level 1, O(2xBrx16)≈O(1) SRAM complexity, O(d/4) register complexity, the 
 # You can test on many devices, such as Volta, Ampere, Ada, Hopper, ...
 cd tests && python3 test.py --B 1 --H 48 --N 8192 --show-all --D 320
 ```
-- 📚 case: B=1, H=48, N=8192, D=320(`FA2 not supported`), Device=NVIDIA RTX 4090.
+- 📚 case: B=1, H=48, N=8192, D=320(`FA2 not supported`)
 ```bash
-python3 test.py --B 1 --H 48 --N 8192 --show-all --D 320 # NVIDIA RTX 4090
------------------------------B=1, H=48, N=8192, D=320, Warmup: 1, Iters: 5-----------------------
-                   (sdpa): ['-0.01750183 '], time:50.36ms, TFLOPS:82.19 (+0.00 %)(~1.00x)
- (ffpa+acc+f32+L1+stage1): ['-0.01754761 '], time:40.23ms, TFLOPS:102.87(+25.17%)(~1.25x)
- (ffpa+acc+f32+L1+stage2): ['-0.01754761 '], time:30.35ms, TFLOPS:136.34(+32.54%)(~1.66x)
- (ffpa+acc+f16+L1+stage1): ['-0.01747131 '], time:31.03ms, TFLOPS:133.27(+0.00 %)(~1.62x)
- (ffpa+acc+f16+L1+stage2): ['-0.01747131 '], time:26.98ms, TFLOPS:153.41(+12.51%)(~1.87x)
--------------------------------------------------------------------------------------------------
+python3 test.py --B 1 --H 48 --N 8192 --show-all --D 320
 ```
 - 📚 case: Generate benchmark table on Your own device (Welcome to PR your benchmark table 🎉🎉)
 ```bash
-python3 test.py --gen-bench --show-all # NVIDIA RTX 4090
-|Algorithm|320|384|448|512|576|640|704|768|832|896|960|1024|
-|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-|SDPA EA|80T|94T|86T|85T|79T|81T|79T|81T|79T|80T|79T|72T|
-|FFPA L1*|135T|140T|143T|135T|134T|134T|134T|134T|131T|131T|130T|131T|
-|Speedup|1.69x|1.49x|1.66x|1.59x|1.7x|1.65x|1.7x|1.65x|1.66x|1.64x|1.65x|1.82x|
-|FFPA L1^|153T|155T|157T|157T|159T|157T|157T|156T|151T|151T|150T|153T|
-|Speedup|1.91x|1.65x|1.83x|1.85x|2.01x|1.94x|1.99x|1.93x|1.91x|1.89x|1.9x|2.12x|
+python3 test.py --gen-bench --show-all
 ```
 
 
