@@ -12,8 +12,8 @@ class ENV(object):
     # Enable debug mode for FFPA, fast build minimal kernels, default False.
     ENABLE_FFPA_DEBUG = bool(int(os.environ.get("ENABLE_FFPA_DEBUG", 0)))
 
-    # Enable all multi stages kernels or not (1~4), default False (1~2).
-    ENABLE_FFPA_ALL_STAGES = bool(int(os.environ.get("ENABLE_FFPA_ALL_STAGES", 0)))
+    # Enable all multi stages kernels or not, if True (1~4) else (1~2), default True.
+    ENABLE_FFPA_ALL_STAGES = bool(int(os.environ.get("ENABLE_FFPA_ALL_STAGES", 1)))
 
     # Enable all headdims for FFPA kernels or not, default False.
     # True, headdim will range from 32 to 1024 with step = 32, range(32, 1024, 32)
@@ -37,16 +37,26 @@ class ENV(object):
         int(os.environ.get("ENABLE_FFPA_FORCE_PV_MMA_ACC_F16", 0))
     )
 
-    # Enable FFPA Prefetch QKV at the Appropriate Time Point, default False.
-    ENABLE_FFPA_PREFETCH_QKV = bool(int(os.environ.get("ENABLE_FFPA_PREFETCH_QKV", 0)))
+    # Enable FFPA Prefetch QKV at the Appropriate Time Point, default True, boost 5%~10%.
+    ENABLE_FFPA_PREFETCH_QKV = bool(int(os.environ.get("ENABLE_FFPA_PREFETCH_QKV", 1)))
 
-    # Enable QKV smem shared policy, default True.
-    ENABLE_FFPA_QKV_SMEM_SHARE = bool(int(os.environ.get("ENABLE_FFPA_QKV_SMEM_SHARE", 1)))
+    # Enable QKV smem shared policy, default False (perfered for MMA & g2s overlap).
+    # Set it as True on low SRAM device.
+    ENABLE_FFPA_QKV_SMEM_SHARE = bool(int(os.environ.get("ENABLE_FFPA_QKV_SMEM_SHARE", 0)))
 
-    # Enable smem swizzle for V, default False. swizzle V seems can not get 
-    # good performance. why? Will enable it by default untill I have figure 
-    # out the performance issue.
-    ENABLE_FFPA_SMEM_SWIZZLE_V = bool(int(os.environ.get("ENABLE_FFPA_SMEM_SWIZZLE_V", 0)))
+    # Enable smem swizzle for Q, default True. True: bank conflicts free for Q smem
+    # via swizzle; False: bank conflicts free for Q smem via padding.
+    ENABLE_FFPA_SMEM_SWIZZLE_Q = bool(int(os.environ.get("ENABLE_FFPA_SMEM_SWIZZLE_Q", 1)))
+
+    # Enable smem swizzle for K, default True. True: bank conflicts free for K smem
+    # via swizzle; False: bank conflicts free for K smem via padding.
+    ENABLE_FFPA_SMEM_SWIZZLE_K = bool(int(os.environ.get("ENABLE_FFPA_SMEM_SWIZZLE_K", 1)))
+
+    # Enable smem swizzle for V, default True. True: bank conflicts free for V smem
+    # via swizzle; False: bank conflicts free for V smem via padding. 
+    # FIXME(DefTruth):swizzle V seems can not get good performance. why? Will enable 
+    # it by default untill I have fixed the performance issue.
+    ENABLE_FFPA_SMEM_SWIZZLE_V = bool(int(os.environ.get("ENABLE_FFPA_SMEM_SWIZZLE_V", 1)))
 
     @classmethod
     def project_dir(cls):
@@ -89,6 +99,14 @@ class ENV(object):
         return cls.ENABLE_FFPA_QKV_SMEM_SHARE
     
     @classmethod
+    def enable_smem_swizzle_q(cls):
+        return cls.ENABLE_FFPA_SMEM_SWIZZLE_Q
+    
+    @classmethod
+    def enable_smem_swizzle_k(cls):
+        return cls.ENABLE_FFPA_SMEM_SWIZZLE_K
+    
+    @classmethod
     def enable_smem_swizzle_v(cls):
         return cls.ENABLE_FFPA_SMEM_SWIZZLE_V
 
@@ -107,6 +125,10 @@ class ENV(object):
             extra_env_cflags.append("-DENABLE_FFPA_PREFETCH_QKV")
         if cls.enable_qkv_smem_share():
             extra_env_cflags.append("-DENABLE_FFPA_QKV_SMEM_SHARE")
+        if cls.enable_smem_swizzle_q():
+            extra_env_cflags.append("-DENABLE_FFPA_SMEM_SWIZZLE_Q")
+        if cls.enable_smem_swizzle_k():
+            extra_env_cflags.append("-DENABLE_FFPA_SMEM_SWIZZLE_K")
         if cls.enable_smem_swizzle_v():
             extra_env_cflags.append("-DENABLE_FFPA_SMEM_SWIZZLE_V")
         return extra_env_cflags
@@ -132,6 +154,8 @@ class ENV(object):
         formatenv("ENABLE_FFPA_ALL_HEADDIM", cls.enable_all_headdim())
         formatenv("ENABLE_FFPA_PREFETCH_QKV", cls.enable_prefetch_qkv())
         formatenv("ENABLE_FFPA_QKV_SMEM_SHARE", cls.enable_qkv_smem_share())
+        formatenv("ENABLE_FFPA_SMEM_SWIZZLE_Q", cls.enable_smem_swizzle_q())
+        formatenv("ENABLE_FFPA_SMEM_SWIZZLE_K", cls.enable_smem_swizzle_k())
         formatenv("ENABLE_FFPA_SMEM_SWIZZLE_V", cls.enable_smem_swizzle_v())
         formatenv(
             "ENABLE_FFPA_FORCE_PV_MMA_ACC_F16", cls.enable_force_pv_mma_acc_fp16()

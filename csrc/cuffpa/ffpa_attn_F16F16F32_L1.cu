@@ -48,11 +48,18 @@ void launch_ffpa_mma_acc_f32_L1(torch::Tensor Q,
   constexpr int kPrefetchQK = 0;
   constexpr int kPrefetchPV = 0;
 #endif
-  // 0 for smem swizzle, > 0 for smem padding.
+  // QKV smem swizzle, 0 for smem swizzle, !0 for smem padding.
+#ifdef ENABLE_FFPA_SMEM_SWIZZLE_Q
   constexpr int kPadQ = 0;
+#else 
+  constexpr int kPadQ = 8;
+#endif
+#ifdef ENABLE_FFPA_SMEM_SWIZZLE_K
   constexpr int kPadK = 0; 
+#else
+  constexpr int kPadK = 8;
+#endif
 #ifdef ENABLE_FFPA_SMEM_SWIZZLE_V
-  // swizzle V seems can not get good performance.
   constexpr int kPadV = 0; 
 #else 
   constexpr int kPadV = 8;
