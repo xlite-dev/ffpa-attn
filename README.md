@@ -66,9 +66,9 @@ By leveraging this approach, we can achieve better performance for large headdim
 
 |📚Feature |📚Feature |📚Feature |📚Feature|
 |:---:|:---:|:---:|:---:|
-|✔️Tensor Cores|✔️Loop over N/D |✔️Tile Block(Br, Bc) |✔️MMA(m16n8k16)|
-|✔️**Split Q**(FA-2)|✔️Pack LDST(128 bits)|✔️SMEM **Swizzle**/Pad |✔️Copy Async |
-|✔️Tile MMA/Warp |✔️QKV Multi-Stages(1~4) |✔️Collective Store(Shfl)|✔️**Prefetch QKV** g2s |
+|✔️Tensor Cores|✔️Loop over N/D |✔️Tile Block(Br, Bc) |✔️**MMA(m16n8k16)**|
+|✔️**Split Q**(FA-2)|✔️Pack LDST(128 bits)|✔️SMEM **Swizzle/Pad** |✔️Copy Async |
+|✔️Tile MMA/Warp |✔️QKV Multi-Stages(1~4) |✔️Collective Store(**Shfl**)|✔️**Prefetch QKV** g2s |
 |✔️**QKV Fine-grained Tiling**|✔️**Shared QKV** SMEM|✔️Mixed MMA Acc|✔️**FFPA L1 Level**|
 
 ## 📖 Prerequisites
