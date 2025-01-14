@@ -394,26 +394,25 @@ def plot_speedup_bar(
 
     _ = plt.subplots(figsize=(16, 9))[1]  # fig, axs
     plt.subplots_adjust(left=0.04, right=0.99, top=0.95, bottom=0.07)
-    # The x-axis coordinates of the bar chart
     x = range(len(speedup))
     # Plot the bar chart, setting a different color for each bar
     random.seed(0)
     for i, value in enumerate(speedup):
         random_color = (random.random(), random.random(), random.random())
         plt.bar(i, value, color=random_color)
-    # Add the x-axis label
-    plt.xlabel("Headdim(D)")
-    plt.xticks(x, headdim)
-    # Add the y-axis label
-    plt.ylabel(f"{extra_tag.upper()} SpeedUp")
-    # Add the title
-    plt.title(f"SpeedUp of {extra_tag.upper()} vs SDPA EA, {ENV.get_device_name()}")
+    plt.xlabel("Headdim(D)", fontsize=15, fontweight="bold")
+    plt.xticks(x, headdim, fontsize=15, fontweight="bold")
+    plt.ylabel(f"{extra_tag.upper()} SpeedUp", fontsize=15, fontweight="bold")
+    plt.title(
+        f"SpeedUp of {extra_tag.upper()} vs SDPA EA, {ENV.get_device_name()}",
+        fontsize=15,
+        fontweight="bold",
+    )
     # Set the range of the y-axis, adjusted according to the data
     plt.ylim(0, max(speedup) + 0.5)
-    # Add data labels on each bar
+    plt.yticks(fontweight="bold")
     for i, v in enumerate(speedup):
-        plt.text(i, v + 0.1, str(v), ha="center")
-    # Show the grid lines for easy observation
+        plt.text(i, v + 0.1, str(v), ha="center", fontsize=20, fontweight="bold")
     plt.grid(True)
     # Display the graph
     device_name = ENV.get_device_name().replace(" ", "_")
@@ -441,17 +440,25 @@ def plot_tflops(level: str = "L1"):
     ax.set_title(
         f"FFPA {level} vs SDPA EA, {ENV.get_device_name()}, "
         f"B={B}, H={H}, N={N}, Warmup={args.warmup}, "
-        f"Iters={args.iters}"
+        f"Iters={args.iters}",
+        fontsize=15,
+        fontweight="bold",
     )
-    ax.set_xlabel("Headdim(D)")
-    ax.set_ylabel("TFLOPS")
+    ax.set_xlabel("Headdim(D)", fontsize=15, fontweight="bold")
+    ax.set_ylabel("TFLOPS", fontsize=15, fontweight="bold")
     ax.grid(True)
 
     get_best_tflops()
     new_statis_info = sort_tflops_by_headdim()
 
     ax.set_xticks(np.arange(0, len(new_statis_info["headdim"]), 1))
-    ax.set_xticklabels(new_statis_info["headdim"], rotation=45, ha="right")
+    ax.set_xticklabels(
+        new_statis_info["headdim"],
+        rotation=45,
+        ha="right",
+        fontsize=15,
+        fontweight="bold",
+    )
     exclude_tags = []
     exclude_tags.append("headdim")
     exclude_tags = set(exclude_tags)
@@ -487,6 +494,9 @@ def plot_tflops(level: str = "L1"):
                 ax.plot(tflops, label=tag, linewidth=4, color="red")
             else:
                 ax.plot(tflops, label=tag, linestyle="--")
+
+    for label in ax.get_yticklabels():
+        label.set_fontweight("bold")
 
     ax.legend()
     device_name = ENV.get_device_name().replace(" ", "_")

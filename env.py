@@ -4,7 +4,7 @@ import torch
 
 
 class ENV(object):
-    # ENVs for pyffpa compiling
+    # ENVs for FFPA kernels compiling
 
     # Project dir, path to faster-prefill-attention
     PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -41,22 +41,30 @@ class ENV(object):
     ENABLE_FFPA_PREFETCH_QKV = bool(int(os.environ.get("ENABLE_FFPA_PREFETCH_QKV", 1)))
 
     # Enable QKV smem shared policy, default False (perfered for MMA & g2s overlap).
-    # Set it as True on low SRAM device.
-    ENABLE_FFPA_QKV_SMEM_SHARE = bool(int(os.environ.get("ENABLE_FFPA_QKV_SMEM_SHARE", 0)))
+    # Please, set it as True if you want to run FFPA on low SRAM device.
+    ENABLE_FFPA_QKV_SMEM_SHARE = bool(
+        int(os.environ.get("ENABLE_FFPA_QKV_SMEM_SHARE", 0))
+    )
 
     # Enable smem swizzle for Q, default True. True: bank conflicts free for Q smem
     # via swizzle; False: bank conflicts free for Q smem via padding.
-    ENABLE_FFPA_SMEM_SWIZZLE_Q = bool(int(os.environ.get("ENABLE_FFPA_SMEM_SWIZZLE_Q", 1)))
+    ENABLE_FFPA_SMEM_SWIZZLE_Q = bool(
+        int(os.environ.get("ENABLE_FFPA_SMEM_SWIZZLE_Q", 1))
+    )
 
     # Enable smem swizzle for K, default True. True: bank conflicts free for K smem
     # via swizzle; False: bank conflicts free for K smem via padding.
-    ENABLE_FFPA_SMEM_SWIZZLE_K = bool(int(os.environ.get("ENABLE_FFPA_SMEM_SWIZZLE_K", 1)))
+    ENABLE_FFPA_SMEM_SWIZZLE_K = bool(
+        int(os.environ.get("ENABLE_FFPA_SMEM_SWIZZLE_K", 1))
+    )
 
-    # Enable smem swizzle for V, default True. True: bank conflicts free for V smem
-    # via swizzle; False: bank conflicts free for V smem via padding. 
-    # FIXME(DefTruth):swizzle V seems can not get good performance. why? Will enable 
-    # it by default untill I have fixed the performance issue.
-    ENABLE_FFPA_SMEM_SWIZZLE_V = bool(int(os.environ.get("ENABLE_FFPA_SMEM_SWIZZLE_V", 1)))
+    # Enable smem swizzle for V, now default True. True: bank conflicts free for V smem
+    # via swizzle; False: bank conflicts free for V smem via padding. FIXME(DefTruth):
+    # swizzle V seems can not get good performance. why? Will enable it by default untill
+    # I have fixed the performance issue. (Fixed)
+    ENABLE_FFPA_SMEM_SWIZZLE_V = bool(
+        int(os.environ.get("ENABLE_FFPA_SMEM_SWIZZLE_V", 1))
+    )
 
     @classmethod
     def project_dir(cls):
@@ -93,19 +101,19 @@ class ENV(object):
     @classmethod
     def enable_prefetch_qkv(cls):
         return cls.ENABLE_FFPA_PREFETCH_QKV
-    
+
     @classmethod
     def enable_qkv_smem_share(cls):
         return cls.ENABLE_FFPA_QKV_SMEM_SHARE
-    
+
     @classmethod
     def enable_smem_swizzle_q(cls):
         return cls.ENABLE_FFPA_SMEM_SWIZZLE_Q
-    
+
     @classmethod
     def enable_smem_swizzle_k(cls):
         return cls.ENABLE_FFPA_SMEM_SWIZZLE_K
-    
+
     @classmethod
     def enable_smem_swizzle_v(cls):
         return cls.ENABLE_FFPA_SMEM_SWIZZLE_V
@@ -141,7 +149,7 @@ class ENV(object):
                     f"{name:<35}: {str(value):<5} -> command:"
                     f" export {name}={int(value)}"
                 )
-            except:
+            except Exception:
                 print(f"{name:<35}: {value}")
 
         pretty_print_line("FFPA-ATTN ENVs")
