@@ -21,7 +21,7 @@
 💡NOTE: This project is still in its early dev stages and now provides some kernels and benchmarks for reference. More features will be added in the future. (Welcome to 🌟👆🏻star this repo to support me ~)👇Features🎉🎉
 
 
-|Tensor Cores|Loop over N/D |Tile Block (Br, Bc) |MMA (16816-F16/F32)|
+|Tensor Cores|Loop over N/D |Tile Block (Br, Bc) |MMA (m16n8k16)|
 |:---:|:---:|:---:|:---:|
 |✔️|✔️|✔️|✔️|
 |**Split Q** (FA-2)|Pack LDST (128 bits)|SMEM **Swizzle**/Padding |Copy Async |
