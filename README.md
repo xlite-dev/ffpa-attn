@@ -18,18 +18,7 @@
   <img src='./bench/NVIDIA_GeForce_RTX_3080_Laptop_GPU_WSL2_ffpa+acc+f16+L1_Speedup.png' width="405px">
 </div> 
 
-💡NOTE: This project is still in its early dev stages and now provides some kernels and benchmarks for reference. More features will be added in the future. (Welcome to 🌟👆🏻star this repo to support me ~)👇Features🎉🎉
-
-
-|Tensor Cores|Loop over N/D |Tile Block (Br, Bc) |MMA (m16n8k16)|
-|:---:|:---:|:---:|:---:|
-|✔️|✔️|✔️|✔️|
-|**Split Q** (FA-2)|Pack LDST (128 bits)|SMEM **Swizzle**/Padding |Copy Async |
-|✔️|✔️|✔️|✔️|
-|Tile MMA & Warp |QKV Multi Stages (1~4) |Collective Store (**Warp Shfl**)| **Prefetch QKV** g2s |
-|✔️|✔️|✔️|✔️|
-|**QKV Fine-grained Tiling**|Fully **Shared QKV** SMEM|Mixed MMA F32/F16 Acc|**FFPA L1 Level**|
-|✔️|✔️|✔️|✔️|
+💡NOTE: This project is still in its early dev stages and now provides some kernels and benchmarks for reference. More features will be added in the future. (Welcome to 🌟👆🏻star this repo to support me ~)
 
 ## ©️Citations🎉🎉
 
@@ -72,6 +61,18 @@ By leveraging this approach, we can achieve better performance for large headdim
 |Register | ≈O(d/4), d↑ | O((Bc/16)x4+2C)≈O(1)|O((Bc/16)x4+2C)≈O(1)| ≈O(d/2), d↑ |
 |HBM| ≈FA2≈O(Nd), O | ≈FA2≈O(Nd), O| ≈FA2≈O(Nd), O | ≈O(Nd), O |
 |Extra HBM| ≈FA2≈O(N), m,l | ≈FA2≈O(N), m,l | ≈FA2≈O(N), m,l | ≈O(N), m,l |
+
+📚👇Core Features🎉🎉: I have implemented **FFPA** using pure MMA PTX instructions, which supports features such as Split-Q, SMEM Swizzle/Padding, QKV Multi-Stages, Tile MMA, Tile Warp, Mixed MMA F32/F16 Acc (Q@K^T F32 + P@V F16), Fully Shared QKV SMEM, Prefetch QKV g2s, QKV Fine-grained Tiling, Collective Store, etc.
+
+|Tensor Cores|Loop over N/D |Tile Block (Br, Bc) |MMA (m16n8k16)|
+|:---:|:---:|:---:|:---:|
+|✔️|✔️|✔️|✔️|
+|**Split Q** (FA-2)|Pack LDST (128 bits)|SMEM **Swizzle**/Padding |Copy Async |
+|✔️|✔️|✔️|✔️|
+|Tile MMA & Warp |QKV Multi Stages (1~4) |Collective Store (**Warp Shfl**)| **Prefetch QKV** g2s |
+|✔️|✔️|✔️|✔️|
+|**QKV Fine-grained Tiling**|Fully **Shared QKV** SMEM|Mixed MMA F32/F16 Acc|**FFPA L1 Level**|
+|✔️|✔️|✔️|✔️|
 
 ## 📖 Prerequisites
 <div id="prerequisites"></div>
