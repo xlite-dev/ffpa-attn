@@ -50,7 +50,7 @@ def get_args():
         "--plot-flops", "--plot", action="store_true", help="Plot TFLOPS"
     )
     parser.add_argument(
-        "--save-dir", "--dir", type=str, default="../bench", help="Save dir for plot"
+        "--save-dir", "--dir", type=str, default="tmp", help="Save dir for plot"
     )
     parser.add_argument(
         "--save-tag", "--tag", type=str, default=None, help="Save name for plot"
