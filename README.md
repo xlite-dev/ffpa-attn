@@ -62,10 +62,11 @@ By leveraging this approach, we can achieve better performance for large headdim
 |HBM| ≈FA2≈O(Nd), O | ≈FA2≈O(Nd), O| ≈FA2≈O(Nd), O | ≈O(Nd), O |
 |Extra HBM| ≈FA2≈O(N), m,l | ≈FA2≈O(N), m,l | ≈FA2≈O(N), m,l | ≈O(N), m,l |
 
-📚👇Core Features🎉🎉: I have implemented **FFPA** using pure MMA PTX instructions, which supports features such as Split-Q, SMEM Swizzle/Padding, QKV Multi-Stages, Tile MMA, Tile Warp, Mixed MMA F32/F16 Acc (Q@K^T F32 + P@V F16), Fully Shared QKV SMEM, Prefetch QKV g2s, QKV Fine-grained Tiling, Collective Store, etc.
+**📚👇Core Features🎉🎉**: I have implemented **FFPA** using pure MMA PTX instructions, which supports features such as Split-Q, SMEM Swizzle/Padding, QKV Multi-Stages, Tile MMA, Tile Warp, Mixed MMA F32/F16 Acc (Q@K^T F32 + P@V F16), Fully Shared QKV SMEM, Prefetch QKV g2s, QKV Fine-grained Tiling, Collective Store, etc.
 
-|Tensor Cores|Loop over N/D |Tile Block (Br, Bc) |MMA (m16n8k16)|
+|📚Feature |📚Feature |📚Feature |📚Feature|
 |:---:|:---:|:---:|:---:|
+|Tensor Cores|Loop over N/D |Tile Block (Br, Bc) |MMA (m16n8k16)|
 |✔️|✔️|✔️|✔️|
 |**Split Q** (FA-2)|Pack LDST (128 bits)|SMEM **Swizzle**/Padding |Copy Async |
 |✔️|✔️|✔️|✔️|
