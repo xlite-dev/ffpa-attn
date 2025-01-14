@@ -14,8 +14,8 @@
 🤖[WIP] **FFPA**: Yet antother **Faster Flash Prefill Attention** with **O(1) SRAM complexity** & **O(d/4) or O(1) register complexity** for large headdim (D > 256), almost **1.5x~2x** 🎉 faster than SDPA EA with or without MMA Acc F32 on many devices: [📈L20 ~1.9x↑🎉](#L1-bench-l20), [📈 A30 ~1.8x↑🎉](#L1-bench-a30), [📈3080 ~2.8x↑🎉](#L1-bench-3080), [📈4090 ~2.1x↑🎉](#L1-bench-4090). 
 
 <div align='center'>
-  <img src='https://github.com/user-attachments/assets/7dc42fa1-a10e-453c-8e2c-befba6f12719' width="407px">
-  <img src='https://github.com/user-attachments/assets/c0443e13-94a4-4d29-8f77-e326e62a668e' width="407px">
+  <img src='https://github.com/user-attachments/assets/f42cf7d5-3a52-4a33-bb21-df1d376c0950' width="407px">
+  <img src='https://github.com/user-attachments/assets/0ed1a3e8-b986-4811-bc3f-f180044c5125' width="407px">
 </div> 
 
 💡NOTE: This project is still in its early dev stages and now provides some kernels and benchmarks for reference. More features will be added in the future. (Welcome to 🌟👆🏻star this repo to support me ~)
@@ -92,6 +92,18 @@ python3 setup.py bdist_wheel && cd dist && python3 -m pip install *.whl # pip un
 
 ## 📖 FFPA L1 (Level 1): Benchmark 🎉🎉
 
+<!--
+![NVIDIA_A30_ffpa+acc+f16+L1_Speedup](https://github.com/user-attachments/assets/f9fe3fb8-0928-47a3-a244-585d5f1cf9e8)
+![NVIDIA_A30_ffpa+acc+f32+L1_Speedup](https://github.com/user-attachments/assets/5df6300a-cd5b-404d-9e85-d90017321f1d)
+![NVIDIA_A30](https://github.com/user-attachments/assets/c99ade22-5d5a-4d9a-8fcb-b85f153d0ad3)
+![NVIDIA_GeForce_RTX_4090_ffpa+acc+f16+L1_Speedup](https://github.com/user-attachments/assets/f42cf7d5-3a52-4a33-bb21-df1d376c0950)
+![NVIDIA_GeForce_RTX_4090_ffpa+acc+f32+L1_Speedup](https://github.com/user-attachments/assets/0ed1a3e8-b986-4811-bc3f-f180044c5125)
+![NVIDIA_GeForce_RTX_4090](https://github.com/user-attachments/assets/7eabe0dc-4bca-4a33-ab01-84955f8e65d1)
+![NVIDIA_L20_ffpa+acc+f16+L1_Speedup](https://github.com/user-attachments/assets/fe3fb948-41c2-44ae-bb35-85a7754b17cb)
+![NVIDIA_L20_ffpa+acc+f32+L1_Speedup](https://github.com/user-attachments/assets/d5500148-e1f1-4ae9-b9d3-8291d3188350)
+![NVIDIA_L20](https://github.com/user-attachments/assets/eee4e075-97b8-4063-bb14-b413d7b46333)
+-->
+
 <div id="L1-bench-l20"></div>
 
 L1: level 1, O(2xBrx16)≈O(1) SRAM complexity, O(d/4) register complexity, the same GPU HBM memory complexity as FlashAttention. B=1, H=48, N=8192, **D=320-1024(FA2 not supported 👀)**. (Notes, `*`=MMA Acc F32, `^`=MMA Acc F16, Softmax Acc dtype is always be F32, T=TFLOPS, 👇Benchmark)
@@ -117,8 +129,8 @@ L1: level 1, O(2xBrx16)≈O(1) SRAM complexity, O(d/4) register complexity, the 
 |Speedup|1.86x|1.61x|1.78x|1.76x|1.87x|1.84x|1.89x|1.71x|1.74x|1.71x|1.85x|1.79x|
 
 <div align='center'>
-  <img src='https://github.com/user-attachments/assets/7881c7fc-aeb4-4556-92a0-901b5b25ee1b' width="407px">
-  <img src='https://github.com/user-attachments/assets/f530900d-0dff-4986-a7e7-47a47ba15556' width="407px">
+  <img src='https://github.com/user-attachments/assets/fe3fb948-41c2-44ae-bb35-85a7754b17cb' width="407px">
+  <img src='https://github.com/user-attachments/assets/d5500148-e1f1-4ae9-b9d3-8291d3188350' width="407px">
 </div> 
 
 <div id="L1-bench-a30"></div>
@@ -144,8 +156,8 @@ L1: level 1, O(2xBrx16)≈O(1) SRAM complexity, O(d/4) register complexity, the 
 |Speedup|1.92x|1.84x|1.88x|1.79x|1.83x|1.83x|1.91x|1.73x|1.68x|1.64x|1.77x|1.89x|
 
 <div align='center'>
-  <img src='https://github.com/user-attachments/assets/7437341e-207d-4e35-b13f-b5834957591f' width="407px">
-  <img src='https://github.com/user-attachments/assets/014df0f8-8283-4270-812e-a43bdf10366f' width="407px">
+  <img src='https://github.com/user-attachments/assets/f9fe3fb8-0928-47a3-a244-585d5f1cf9e8' width="407px">
+  <img src='https://github.com/user-attachments/assets/5df6300a-cd5b-404d-9e85-d90017321f1d' width="407px">
 </div> 
 
 <div id="L1-bench-3080"></div>
@@ -198,8 +210,8 @@ L1: level 1, O(2xBrx16)≈O(1) SRAM complexity, O(d/4) register complexity, the 
 |Speedup|2.44x|2.08x|2.22x|2.27x|2.41x|2.32x|2.35x|2.24x|2.24x|2.19x|2.23x|2.18x|
 
 <div align='center'>
-  <img src='https://github.com/user-attachments/assets/5699465b-03b8-460c-8d9e-7b84bad25d85' width="407px">
-  <img src='https://github.com/user-attachments/assets/083a3c6c-1afb-4fc5-9622-34ca22129627' width="407px">
+  <img src='https://github.com/user-attachments/assets/f42cf7d5-3a52-4a33-bb21-df1d376c0950' width="407px">
+  <img src='https://github.com/user-attachments/assets/0ed1a3e8-b986-4811-bc3f-f180044c5125' width="407px">
 </div> 
 
 ## 📖 Python Testing
