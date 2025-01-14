@@ -14,8 +14,8 @@
 🤖[WIP] **FFPA**: Yet antother **Faster Flash Prefill Attention** with **O(1) SRAM complexity** & **O(d/4) or O(1) register complexity** for large headdim (D > 256), almost **1.5x~2x** 🎉 faster than SDPA EA with or without MMA Acc F32 on many devices: [📈L20 ~1.7x↑🎉](#L1-bench), [📈 A30 ~1.5x↑🎉](#L1-bench), [📈3080 ~2.5x↑🎉](#L1-bench), [📈4090 ~1.8x↑🎉](#L1-bench). 
 
 <div align='left'>
-  <img src='./bench/NVIDIA_GeForce_RTX_3080_Laptop_GPU_WSL2_ffpa+acc+f32+L1_Speedup.png' width="405px">
-  <img src='./bench/NVIDIA_GeForce_RTX_3080_Laptop_GPU_WSL2_ffpa+acc+f16+L1_Speedup.png' width="405px">
+  <img src='https://github.com/user-attachments/assets/7dc42fa1-a10e-453c-8e2c-befba6f12719' width="407px">
+  <img src='https://github.com/user-attachments/assets/c0443e13-94a4-4d29-8f77-e326e62a668e' width="407px">
 </div> 
 
 💡NOTE: This project is still in its early dev stages and now provides some kernels and benchmarks for reference. More features will be added in the future. (Welcome to 🌟👆🏻star this repo to support me ~)
@@ -116,8 +116,8 @@ L1: level 1, O(2xBrx16)≈O(1) SRAM complexity, O(d/4) register complexity, the 
 |Speedup|1.86x|1.64x|1.81x|1.79x|1.85x|1.68x|1.74x|1.69x|1.72x|1.71x|1.7x|1.66x|
 
 <div align='left'>
-  <img src='https://github.com/user-attachments/assets/7881c7fc-aeb4-4556-92a0-901b5b25ee1b' width="405px">
-  <img src='https://github.com/user-attachments/assets/f530900d-0dff-4986-a7e7-47a47ba15556' width="405px">
+  <img src='https://github.com/user-attachments/assets/7881c7fc-aeb4-4556-92a0-901b5b25ee1b' width="407px">
+  <img src='https://github.com/user-attachments/assets/f530900d-0dff-4986-a7e7-47a47ba15556' width="407px">
 </div> 
 
 <div id="L1-bench-a30"></div>
@@ -143,8 +143,8 @@ L1: level 1, O(2xBrx16)≈O(1) SRAM complexity, O(d/4) register complexity, the 
 |Speedup|1.64x|1.68x|1.71x|1.67x|1.54x|1.54x|1.57x|1.64x|1.59x|1.59x|1.45x|1.72x|
 
 <div align='left'>
-  <img src='https://github.com/user-attachments/assets/7437341e-207d-4e35-b13f-b5834957591f' width="405px">
-  <img src='https://github.com/user-attachments/assets/014df0f8-8283-4270-812e-a43bdf10366f' width="405px">
+  <img src='https://github.com/user-attachments/assets/7437341e-207d-4e35-b13f-b5834957591f' width="407px">
+  <img src='https://github.com/user-attachments/assets/014df0f8-8283-4270-812e-a43bdf10366f' width="407px">
 </div> 
 
 <div id="L1-bench-3080"></div>
@@ -170,8 +170,8 @@ L1: level 1, O(2xBrx16)≈O(1) SRAM complexity, O(d/4) register complexity, the 
 |Speedup|3.15x|2.56x|3.33x|2.44x|2.53x|2.47x|2.4x|2.33x|2.29x|2.21x|2.14x|2.21x|
 
 <div align='left'>
-  <img src='https://github.com/user-attachments/assets/7dc42fa1-a10e-453c-8e2c-befba6f12719' width="405px">
-  <img src='https://github.com/user-attachments/assets/409e3111-6b20-4bb5-817e-1360e116bed8' width="405px">
+  <img src='https://github.com/user-attachments/assets/7dc42fa1-a10e-453c-8e2c-befba6f12719' width="407px">
+  <img src='https://github.com/user-attachments/assets/c0443e13-94a4-4d29-8f77-e326e62a668e' width="407px">
 </div> 
 
 <div id="L1-bench-4090"></div>
@@ -197,8 +197,8 @@ L1: level 1, O(2xBrx16)≈O(1) SRAM complexity, O(d/4) register complexity, the 
 |Speedup|2.13x|1.86x|2.01x|2.05x|2.16x|2.1x|2.14x|2.09x|2.08x|2.05x|2.08x|2.01x|
 
 <div align='left'>
-  <img src='https://github.com/user-attachments/assets/5699465b-03b8-460c-8d9e-7b84bad25d85' width="405px">
-  <img src='https://github.com/user-attachments/assets/083a3c6c-1afb-4fc5-9622-34ca22129627' width="405px">
+  <img src='https://github.com/user-attachments/assets/5699465b-03b8-460c-8d9e-7b84bad25d85' width="407px">
+  <img src='https://github.com/user-attachments/assets/083a3c6c-1afb-4fc5-9622-34ca22129627' width="407px">
 </div> 
 
 ## 📖 Python Testing
