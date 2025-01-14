@@ -187,15 +187,15 @@ L1: level 1, O(2xBrx16)≈O(1) SRAM complexity, O(d/4) register complexity, the 
 |FFPA L1^|194T|194T|189T|191T|197T|188T|184T|180T|177T|172T|171T|171T|
 |Speedup|2.4x|2.06x|2.22x|2.25x|2.49x|2.32x|2.33x|2.25x|2.24x|2.15x|2.19x|2.19x|
 
-- 📚 NVIDIA RTX 4090 (`*`=MMA Acc: QK F32 + PV F16, `^`=MMA Acc F16, `T`=TFLOPS, **~2x↑🎉**)
+- 📚 NVIDIA RTX 4090 (`*`=MMA Acc: QK F32 + PV F16, `^`=MMA Acc F16, `T`=TFLOPS, **~2.1x↑🎉**)
 
 |Algorithm|320|384|448|512|576|640|704|768|832|896|960|1024|
 |:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
 |SDPA EA|82T|93T|85T|85T|79T|81T|79T|80T|79T|80T|78T|78T|
-|FFPA L1*|170T|170T|160T|159T|156T|154T|153T|152T|151T|149T|143T|136T|
-|Speedup|2.07x|1.83x|1.88x|1.87x|1.97x|1.9x|1.94x|1.9x|1.91x|1.86x|1.83x|1.74x|
-|FFPA L1^|175T|173T|171T|174T|171T|170T|169T|167T|164T|164T|162T|157T|
-|Speedup|2.13x|1.86x|2.01x|2.05x|2.16x|2.1x|2.14x|2.09x|2.08x|2.05x|2.08x|2.01x|
+|FFPA L1*|174T|173T|174T|174T|172T|162T|162T|161T|160T|159T|166T|166T|
+|Speedup|2.12x|1.86x|2.05x|2.05x|2.18x|2.0x|2.05x|2.01x|2.03x|1.99x|2.13x|2.13x|
+|FFPA L1^|200T|195T|192T|192T|194T|191T|185T|182T|175T|172T|172T|172T|
+|Speedup|2.44x|2.1x|2.26x|2.26x|2.46x|2.36x|2.34x|2.27x|2.22x|2.15x|2.21x|2.21x|
 
 <div align='center'>
   <img src='https://github.com/user-attachments/assets/5699465b-03b8-460c-8d9e-7b84bad25d85' width="407px">
