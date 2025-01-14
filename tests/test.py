@@ -400,18 +400,19 @@ def plot_speedup_bar(
     for i, value in enumerate(speedup):
         random_color = (random.random(), random.random(), random.random())
         plt.bar(i, value, color=random_color)
-    plt.xlabel("Headdim(D)", fontsize=15, fontweight='bold')
-    plt.xticks(x, headdim, fontsize=15, fontweight='bold')
-    plt.ylabel(f"{extra_tag.upper()} SpeedUp", fontsize=15, fontweight='bold')
+    plt.xlabel("Headdim(D)", fontsize=15, fontweight="bold")
+    plt.xticks(x, headdim, fontsize=15, fontweight="bold")
+    plt.ylabel(f"{extra_tag.upper()} SpeedUp", fontsize=15, fontweight="bold")
     plt.title(
-        f"SpeedUp of {extra_tag.upper()} vs SDPA EA, {ENV.get_device_name()}", 
-        fontsize=15, fontweight='bold'
+        f"SpeedUp of {extra_tag.upper()} vs SDPA EA, {ENV.get_device_name()}",
+        fontsize=15,
+        fontweight="bold",
     )
     # Set the range of the y-axis, adjusted according to the data
     plt.ylim(0, max(speedup) + 0.5)
-    plt.yticks(fontweight='bold')
+    plt.yticks(fontweight="bold")
     for i, v in enumerate(speedup):
-        plt.text(i, v + 0.1, str(v), ha="center", fontsize=20, fontweight='bold')
+        plt.text(i, v + 0.1, str(v), ha="center", fontsize=20, fontweight="bold")
     plt.grid(True)
     # Display the graph
     device_name = ENV.get_device_name().replace(" ", "_")
@@ -440,10 +441,11 @@ def plot_tflops(level: str = "L1"):
         f"FFPA {level} vs SDPA EA, {ENV.get_device_name()}, "
         f"B={B}, H={H}, N={N}, Warmup={args.warmup}, "
         f"Iters={args.iters}",
-        fontsize=15, fontweight='bold'
+        fontsize=15,
+        fontweight="bold",
     )
-    ax.set_xlabel("Headdim(D)", fontsize=15, fontweight='bold')
-    ax.set_ylabel("TFLOPS", fontsize=15, fontweight='bold')
+    ax.set_xlabel("Headdim(D)", fontsize=15, fontweight="bold")
+    ax.set_ylabel("TFLOPS", fontsize=15, fontweight="bold")
     ax.grid(True)
 
     get_best_tflops()
@@ -451,8 +453,11 @@ def plot_tflops(level: str = "L1"):
 
     ax.set_xticks(np.arange(0, len(new_statis_info["headdim"]), 1))
     ax.set_xticklabels(
-        new_statis_info["headdim"], rotation=45, ha="right",
-        fontsize=15, fontweight='bold'
+        new_statis_info["headdim"],
+        rotation=45,
+        ha="right",
+        fontsize=15,
+        fontweight="bold",
     )
     exclude_tags = []
     exclude_tags.append("headdim")
@@ -489,9 +494,10 @@ def plot_tflops(level: str = "L1"):
                 ax.plot(tflops, label=tag, linewidth=4, color="red")
             else:
                 ax.plot(tflops, label=tag, linestyle="--")
-                
+
     for label in ax.get_yticklabels():
-        label.set_fontweight('bold')
+        label.set_fontweight("bold")
+
     ax.legend()
     device_name = ENV.get_device_name().replace(" ", "_")
     if args.save_tag:

@@ -11,11 +11,11 @@
   <img src=https://img.shields.io/badge/License-GPLv3.0-turquoise.svg >
  </div>
 
-🤖[WIP] **FFPA**: Yet antother **Faster Flash Prefill Attention** with **O(1) SRAM complexity** & **O(d/4) or O(1) register complexity** for large headdim (D > 256), almost **1.5x~2x** 🎉 faster than SDPA EA with or without MMA Acc F32 on many devices: [📈L20 ~1.9x↑🎉](#L1-bench-l20), [📈 A30 ~1.8x↑🎉](#L1-bench-a30), [📈3080 ~2.8x↑🎉](#L1-bench-3080), [📈4090 ~2.1x↑🎉](#L1-bench-4090). 
+🤖[WIP] **FFPA**: Yet antother **Faster Flash Prefill Attention** with **O(1) SRAM complexity** & **O(d/4) or O(1) register complexity** for large headdim (D > 256), almost **1.5x~2x** 🎉 faster than SDPA EA with or without MMA Acc F32 on many devices: [📈L20 ~1.9x↑🎉](#L1-bench-l20), [📈 A30 ~1.8x↑🎉](#L1-bench-a30), [📈3080 ~2.9x↑🎉](#L1-bench-3080), [📈4090 ~2.1x↑🎉](#L1-bench-4090). 
 
 <div align='center'>
-  <img src='https://github.com/user-attachments/assets/f42cf7d5-3a52-4a33-bb21-df1d376c0950' width="407px">
-  <img src='https://github.com/user-attachments/assets/0ed1a3e8-b986-4811-bc3f-f180044c5125' width="407px">
+  <img src='https://github.com/user-attachments/assets/447e2937-f7c8-47c8-8550-8c0c71b910e6' width="407px">
+  <img src='https://github.com/user-attachments/assets/65a8d564-8fa7-4d66-86b9-e238feb86143' width="407px">
 </div> 
 
 💡NOTE: This project is still in its early dev stages and now provides some kernels and benchmarks for reference. More features will be added in the future. (Welcome to 🌟👆🏻star this repo to support me ~)
@@ -39,7 +39,7 @@
 - [📖 FFPA L1~L3 Design💡](#ffpa-design)
 - [📈 FFPA L1: L20 ~1.9x↑🎉](#L1-bench-l20)
 - [📈 FFPA L1: A30 ~1.8x↑🎉](#L1-bench-a30)
-- [📈 FFPA L1: 3080 ~2.8x↑🎉](#L1-bench-3080)
+- [📈 FFPA L1: 3080 ~2.9x↑🎉](#L1-bench-3080)
 - [📈 FFPA L1: 4090 ~2.1x↑🎉](#L1-bench-4090)
 
 ## 📖 FFPA L1~L3: FlashAttention + QKV Fine-grained Tiling at MMA level💡
@@ -93,15 +93,18 @@ python3 setup.py bdist_wheel && cd dist && python3 -m pip install *.whl # pip un
 ## 📖 FFPA L1 (Level 1): Benchmark 🎉🎉
 
 <!--
-![NVIDIA_A30_ffpa+acc+f16+L1_Speedup](https://github.com/user-attachments/assets/f9fe3fb8-0928-47a3-a244-585d5f1cf9e8)
-![NVIDIA_A30_ffpa+acc+f32+L1_Speedup](https://github.com/user-attachments/assets/5df6300a-cd5b-404d-9e85-d90017321f1d)
-![NVIDIA_A30](https://github.com/user-attachments/assets/c99ade22-5d5a-4d9a-8fcb-b85f153d0ad3)
-![NVIDIA_GeForce_RTX_4090_ffpa+acc+f16+L1_Speedup](https://github.com/user-attachments/assets/f42cf7d5-3a52-4a33-bb21-df1d376c0950)
-![NVIDIA_GeForce_RTX_4090_ffpa+acc+f32+L1_Speedup](https://github.com/user-attachments/assets/0ed1a3e8-b986-4811-bc3f-f180044c5125)
-![NVIDIA_GeForce_RTX_4090](https://github.com/user-attachments/assets/7eabe0dc-4bca-4a33-ab01-84955f8e65d1)
-![NVIDIA_L20_ffpa+acc+f16+L1_Speedup](https://github.com/user-attachments/assets/fe3fb948-41c2-44ae-bb35-85a7754b17cb)
-![NVIDIA_L20_ffpa+acc+f32+L1_Speedup](https://github.com/user-attachments/assets/d5500148-e1f1-4ae9-b9d3-8291d3188350)
-![NVIDIA_L20](https://github.com/user-attachments/assets/eee4e075-97b8-4063-bb14-b413d7b46333)
+![NVIDIA_A30](https://github.com/user-attachments/assets/69be99e4-977f-4a8c-bef5-9d6667241e23)
+![NVIDIA_A30_ffpa+acc+f16+L1_Speedup](https://github.com/user-attachments/assets/7e323005-4445-41af-8e94-6efb62ed2b77)
+![NVIDIA_A30_ffpa+acc+f32+L1_Speedup](https://github.com/user-attachments/assets/e314649e-82b5-414d-85c9-8b6fbf260138)
+![NVIDIA_GeForce_RTX_3080_Laptop_GPU_WSL2](https://github.com/user-attachments/assets/be071842-25a7-4477-acc8-14d6e2ff5a54)
+![NVIDIA_GeForce_RTX_3080_Laptop_GPU_WSL2_ffpa+acc+f16+L1_Speedup](https://github.com/user-attachments/assets/d157cd69-4444-4735-a691-edaaff408137)
+![NVIDIA_GeForce_RTX_3080_Laptop_GPU_WSL2_ffpa+acc+f32+L1_Speedup](https://github.com/user-attachments/assets/3ce47627-e79d-40ee-b753-bdd235603b7d)
+![NVIDIA_GeForce_RTX_4090](https://github.com/user-attachments/assets/cba2edce-ac0d-412e-823c-7eea2cc63f83)
+![NVIDIA_GeForce_RTX_4090_ffpa+acc+f16+L1_Speedup](https://github.com/user-attachments/assets/447e2937-f7c8-47c8-8550-8c0c71b910e6)
+![NVIDIA_GeForce_RTX_4090_ffpa+acc+f32+L1_Speedup](https://github.com/user-attachments/assets/65a8d564-8fa7-4d66-86b9-e238feb86143)
+![NVIDIA_L20](https://github.com/user-attachments/assets/6be1708c-9491-4dc8-92cc-a3d48a335784)
+![NVIDIA_L20_ffpa+acc+f16+L1_Speedup](https://github.com/user-attachments/assets/a4927108-3f97-4209-9b80-bb31ad271e04)
+![NVIDIA_L20_ffpa+acc+f32+L1_Speedup](https://github.com/user-attachments/assets/eeb9943f-919d-45d8-a8a6-e0f8874f4bcd)
 -->
 
 <div id="L1-bench-l20"></div>
@@ -129,8 +132,8 @@ L1: level 1, O(2xBrx16)≈O(1) SRAM complexity, O(d/4) register complexity, the 
 |Speedup|1.86x|1.61x|1.78x|1.76x|1.87x|1.84x|1.89x|1.71x|1.74x|1.71x|1.85x|1.79x|
 
 <div align='center'>
-  <img src='https://github.com/user-attachments/assets/fe3fb948-41c2-44ae-bb35-85a7754b17cb' width="407px">
-  <img src='https://github.com/user-attachments/assets/d5500148-e1f1-4ae9-b9d3-8291d3188350' width="407px">
+  <img src='https://github.com/user-attachments/assets/a4927108-3f97-4209-9b80-bb31ad271e04' width="407px">
+  <img src='https://github.com/user-attachments/assets/eeb9943f-919d-45d8-a8a6-e0f8874f4bcd' width="407px">
 </div> 
 
 <div id="L1-bench-a30"></div>
@@ -156,8 +159,8 @@ L1: level 1, O(2xBrx16)≈O(1) SRAM complexity, O(d/4) register complexity, the 
 |Speedup|1.92x|1.84x|1.88x|1.79x|1.83x|1.83x|1.91x|1.73x|1.68x|1.64x|1.77x|1.89x|
 
 <div align='center'>
-  <img src='https://github.com/user-attachments/assets/f9fe3fb8-0928-47a3-a244-585d5f1cf9e8' width="407px">
-  <img src='https://github.com/user-attachments/assets/5df6300a-cd5b-404d-9e85-d90017321f1d' width="407px">
+  <img src='https://github.com/user-attachments/assets/7e323005-4445-41af-8e94-6efb62ed2b77' width="407px">
+  <img src='https://github.com/user-attachments/assets/e314649e-82b5-414d-85c9-8b6fbf260138' width="407px">
 </div> 
 
 <div id="L1-bench-3080"></div>
@@ -166,13 +169,13 @@ L1: level 1, O(2xBrx16)≈O(1) SRAM complexity, O(d/4) register complexity, the 
 
 |Algorithm|320|384|448|512|576|640|704|768|832|896|960|1024|
 |:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-|SDPA EA|13T|16T|12T|16T|15T|15T|14T|14T|14T|14T|14T|14T|
-|FFPA L1*|33T|31T|31T|28T|28T|27T|26T|25T|25T|24T|23T|23T|
-|Speedup|2.54x|1.94x|2.58x|1.75x|1.87x|1.8x|1.86x|1.79x|1.79x|1.71x|1.64x|1.64x|
-|FFPA L1^|41T|40T|39T|38T|37T|36T|36T|34T|33T|32T|30T|30T|
-|Speedup|3.15x|2.5x|3.25x|2.38x|2.47x|2.4x|2.57x|2.43x|2.36x|2.29x|2.14x|2.14x|
+|SDPA EA|13T|16T|11T|16T|15T|15T|15T|15T|14T|14T|14T|14T|
+|FFPA L1*|33T|31T|30T|30T|30T|27T|27T|26T|26T|26T|26T|25T|
+|Speedup|2.54x|1.94x|2.73x|1.88x|2.0x|1.8x|1.8x|1.73x|1.86x|1.86x|1.86x|1.79x|
+|FFPA L1^|43T|41T|39T|39T|39T|39T|39T|36T|34T|33T|31T|33T|
+|Speedup|3.31x|2.56x|3.55x|2.44x|2.6x|2.6x|2.6x|2.4x|2.43x|2.36x|2.21x|2.36x|
 
-- 📚 NVIDIA RTX 3080 Laptop (`*`=MMA Acc: QK F32 + PV F16, `^`=MMA Acc F16, `T`=TFLOPS, **~2.8x↑🎉**)
+- 📚 NVIDIA RTX 3080 Laptop (`*`=MMA Acc: QK F32 + PV F16, `^`=MMA Acc F16, `T`=TFLOPS, **~2.9x↑🎉**)
 
 |Algorithm|320|384|448|512|576|640|704|768|832|896|960|1024|
 |:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
@@ -182,9 +185,17 @@ L1: level 1, O(2xBrx16)≈O(1) SRAM complexity, O(d/4) register complexity, the 
 |FFPA L1^|41T|41T|40T|39T|38T|37T|36T|35T|32T|31T|30T|31T|
 |Speedup|3.15x|2.56x|3.33x|2.44x|2.53x|2.47x|2.4x|2.33x|2.29x|2.21x|2.14x|2.21x|
 
+|Algorithm|320|384|448|512|576|640|704|768|832|896|960|1024|
+|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+|SDPA EA|13T|15T|12T|15T|14T|15T|14T|14T|14T|14T|14T|14T|
+|FFPA L1*|38T|36T|34T|35T|34T|31T|32T|31T|30T|28T|27T|27T|
+|Speedup|2.92x|2.4x|2.83x|2.33x|2.43x|2.07x|2.29x|2.21x|2.14x|2.0x|1.93x|1.93x|
+|FFPA L1^|44T|41T|39T|39T|38T|39T|39T|36T|34T|32T|31T|33T|
+|Speedup|3.38x|2.73x|3.25x|2.6x|2.71x|2.6x|2.79x|2.57x|2.43x|2.29x|2.21x|2.36x|
+
 <div align='center'>
-  <img src='https://github.com/user-attachments/assets/7dc42fa1-a10e-453c-8e2c-befba6f12719' width="407px">
-  <img src='https://github.com/user-attachments/assets/c0443e13-94a4-4d29-8f77-e326e62a668e' width="407px">
+  <img src='https://github.com/user-attachments/assets/d157cd69-4444-4735-a691-edaaff408137' width="407px">
+  <img src='https://github.com/user-attachments/assets/3ce47627-e79d-40ee-b753-bdd235603b7d' width="407px">
 </div> 
 
 <div id="L1-bench-4090"></div>
@@ -210,8 +221,8 @@ L1: level 1, O(2xBrx16)≈O(1) SRAM complexity, O(d/4) register complexity, the 
 |Speedup|2.44x|2.08x|2.22x|2.27x|2.41x|2.32x|2.35x|2.24x|2.24x|2.19x|2.23x|2.18x|
 
 <div align='center'>
-  <img src='https://github.com/user-attachments/assets/f42cf7d5-3a52-4a33-bb21-df1d376c0950' width="407px">
-  <img src='https://github.com/user-attachments/assets/0ed1a3e8-b986-4811-bc3f-f180044c5125' width="407px">
+  <img src='https://github.com/user-attachments/assets/447e2937-f7c8-47c8-8550-8c0c71b910e6' width="407px">
+  <img src='https://github.com/user-attachments/assets/65a8d564-8fa7-4d66-86b9-e238feb86143' width="407px">
 </div> 
 
 ## 📖 Python Testing
