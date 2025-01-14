@@ -77,6 +77,7 @@ By leveraging this approach, we can achieve better performance for large headdim
 - Python >= 3.10
 - PyTorch >= 2.4.0, CUDA >= 12.4
 - Recommended: PyTorch 2.5.1, CUDA 12.5
+- Docker: nvcr.io/nvidia/pytorch:24.10-py3
 
 ## 📖 Installation
 
