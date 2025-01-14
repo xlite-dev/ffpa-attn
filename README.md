@@ -14,23 +14,12 @@
 🤖[WIP] **FFPA**: Yet antother **Faster Flash Prefill Attention** with **O(1) SRAM complexity** & **O(d/4) or O(1) register complexity** for large headdim (D > 256), almost **1.5x~2x** 🎉 faster than SDPA EA with or without MMA Acc F32 on many devices: [📈L20 ~1.7x↑🎉](#L1-bench), [📈 A30 ~1.5x↑🎉](#L1-bench), [📈3080 ~2.5x↑🎉](#L1-bench), [📈4090 ~1.8x↑🎉](#L1-bench). 
 
 <div align='center'>
-  <img src='./bench/NVIDIA_GeForce_RTX_3080_Laptop_GPU_WSL2_ffpa+acc+f32+L1_Speedup.png' width="400px">
-  <img src='./bench/NVIDIA_GeForce_RTX_3080_Laptop_GPU_WSL2_ffpa+acc+f16+L1_Speedup.png' width="400px">
+  <img src='https://github.com/user-attachments/assets/7dc42fa1-a10e-453c-8e2c-befba6f12719' width="407px">
+  <img src='https://github.com/user-attachments/assets/c0443e13-94a4-4d29-8f77-e326e62a668e' width="407px">
 </div> 
 
 💡NOTE: This project is still in its early dev stages and now provides some kernels and benchmarks for reference. More features will be added in the future. (Welcome to 🌟👆🏻star this repo to support me ~)
-<!--
-👇Features🎉🎉
-|Tensor Cores|Loop over N/D |Tile Block (Br, Bc) |MMA (16816-F16/F32)|
-|:---:|:---:|:---:|:---:|
-|✔️|✔️|✔️|✔️|
-|**Split Q** (FA-2)|Pack LDST (128 bits)|SMEM **Swizzle**/Padding |Copy Async |
-|✔️|✔️|✔️|✔️|
-|Tile MMA & Warp |QKV Multi Stages (1~4) |Collective Store (**Warp Shfl**)| **Prefetch QKV** g2s |
-|✔️|✔️|✔️|✔️|
-|**QKV Fine-grained Tiling**|Fully **Shared QKV** SMEM|Mixed MMA F32/F16 Acc|**FFPA L1 Level**|
-|✔️|✔️|✔️|✔️|
--->
+
 ## ©️Citations🎉🎉
 
 ```BibTeX
@@ -48,10 +37,10 @@
 - [📖 Installation⚙️](#install)
 - [📖 Python Testing👇](#python-test)
 - [📖 FFPA L1~L3 Design💡](#ffpa-design)
-- [📈 FFPA L1: L20 ~1.7x↑🎉](#L1-bench)
-- [📈 FFPA L1: A30 ~1.5x↑🎉](#L1-bench)
-- [📈 FFPA L1: 3080 ~2.5x↑🎉](#L1-bench)
-- [📈 FFPA L1: 4090 ~1.8x↑🎉](#L1-bench)
+- [📈 FFPA L1: L20 ~1.7x↑🎉](#L1-bench-l20)
+- [📈 FFPA L1: A30 ~1.5x↑🎉](#L1-bench-a30)
+- [📈 FFPA L1: 3080 ~2.5x↑🎉](#L1-bench-3080)
+- [📈 FFPA L1: 4090 ~1.8x↑🎉](#L1-bench-4090)
 
 ## 📖 FFPA L1~L3: FlashAttention + QKV Fine-grained Tiling at MMA level💡
 <div id="ffpa-design"></div>
@@ -73,6 +62,15 @@ By leveraging this approach, we can achieve better performance for large headdim
 |HBM| ≈FA2≈O(Nd), O | ≈FA2≈O(Nd), O| ≈FA2≈O(Nd), O | ≈O(Nd), O |
 |Extra HBM| ≈FA2≈O(N), m,l | ≈FA2≈O(N), m,l | ≈FA2≈O(N), m,l | ≈O(N), m,l |
 
+**📚👇Core Features🎉🎉**: I have implemented **FFPA L1~L3** using pure MMA PTX instructions, which supports many features such as Split-Q, SMEM Swizzle/Padding, QKV Multi-Stages(1~4), Tile MMAs/Warps, Mixed MMA F32/F16 Acc (Q@K^T MMA Acc F32 + P@V MMA Acc F16), Fully Shared QKV SMEM, Prefetch QKV g2s, **Fully QKV Fine-grained Tiling(GEMM style)**, Collective Store, etc.
+
+|📚Feature |📚Feature |📚Feature |📚Feature|
+|:---:|:---:|:---:|:---:|
+|✔️Tensor Cores|✔️Loop over N/D |✔️Tile Block(Br, Bc) |✔️MMA(m16n8k16)|
+|✔️**Split Q**(FA-2)|✔️Pack LDST(128 bits)|✔️SMEM **Swizzle**/Pad |✔️Copy Async |
+|✔️Tile MMA/Warp |✔️QKV Multi-Stages(1~4) |✔️Collective Store(Shfl)|✔️**Prefetch QKV** g2s |
+|✔️**QKV Fine-grained Tiling**|✔️**Shared QKV** SMEM|✔️Mixed MMA Acc|✔️**FFPA L1 Level**|
+
 ## 📖 Prerequisites
 <div id="prerequisites"></div>
 
@@ -93,7 +91,7 @@ python3 setup.py bdist_wheel && cd dist && python3 -m pip install *.whl # pip un
 
 ## 📖 FFPA L1 (Level 1): Benchmark 🎉🎉
 
-<div id="L1-bench"></div>
+<div id="L1-bench-l20"></div>
 
 L1: level 1, O(2xBrx16)≈O(1) SRAM complexity, O(d/4) register complexity, the same GPU HBM memory complexity as FlashAttention. B=1, H=48, N=8192, **D=320-1024(FA2 not supported 👀)**. (Notes, `*`=MMA Acc F32, `^`=MMA Acc F16, Softmax Acc dtype is always be F32, T=TFLOPS, 👇Benchmark)
 
@@ -117,6 +115,13 @@ L1: level 1, O(2xBrx16)≈O(1) SRAM complexity, O(d/4) register complexity, the 
 |FFPA L1^|104T|105T|105T|104T|102T|94T|94T|93T|93T|94T|92T|93T|
 |Speedup|1.86x|1.64x|1.81x|1.79x|1.85x|1.68x|1.74x|1.69x|1.72x|1.71x|1.7x|1.66x|
 
+<div align='center'>
+  <img src='https://github.com/user-attachments/assets/7881c7fc-aeb4-4556-92a0-901b5b25ee1b' width="407px">
+  <img src='https://github.com/user-attachments/assets/f530900d-0dff-4986-a7e7-47a47ba15556' width="407px">
+</div> 
+
+<div id="L1-bench-a30"></div>
+
 - 📚 NVIDIA A30 (`*`=MMA Acc F32, `^`=MMA Acc F16, `T`=TFLOPS, **~1.5x↑🎉**)
 
 |Algorithm|320|384|448|512|576|640|704|768|832|896|960|1024|
@@ -125,7 +130,24 @@ L1: level 1, O(2xBrx16)≈O(1) SRAM complexity, O(d/4) register complexity, the 
 |FFPA L1*|36T|37T|35T|36T|35T|36T|35T|34T|34T|32T|34T|31T|
 |Speedup|1.44x|1.48x|1.46x|1.5x|1.46x|1.5x|1.52x|1.55x|1.55x|1.45x|1.55x|1.72x|
 |FFPA L1^|36T|36T|37T|37T|35T|35T|35T|35T|35T|34T|35T|32T|
-|Speedup|1.44x|1.44x|1.54x|1.54x|1.46x|1.46x|1.52x|1.59x|1.59x|1.55x|1.59x|1.78x|
+|Speedup|1.64x|1.68x|1.71x|1.67x|1.54x|1.54x|1.57x|1.64x|1.59x|1.59x|1.45x|1.72x|
+
+- 📚 NVIDIA A30 (`*`=MMA Acc: QK F32 + PV F16, `^`=MMA Acc F16, `T`=TFLOPS, **~1.7x↑🎉**)
+
+|Algorithm|320|384|448|512|576|640|704|768|832|896|960|1024|
+|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+|SDPA EA|25T|25T|24T|24T|24T|24T|23T|22T|22T|22T|22T|18T|
+|FFPA L1*|42T|41T|39T|38T|37T|36T|36T|35T|34T|33T|31T|30T|
+|Speedup|1.68x|1.64x|1.62x|1.58x|1.54x|1.5x|1.57x|1.59x|1.55x|1.5x|1.41x|1.67x|
+|FFPA L1^|41T|42T|41T|40T|37T|37T|36T|36T|35T|35T|32T|31T|
+|Speedup|1.64x|1.68x|1.71x|1.67x|1.54x|1.54x|1.57x|1.64x|1.59x|1.59x|1.45x|1.72x|
+
+<div align='center'>
+  <img src='https://github.com/user-attachments/assets/7437341e-207d-4e35-b13f-b5834957591f' width="407px">
+  <img src='https://github.com/user-attachments/assets/014df0f8-8283-4270-812e-a43bdf10366f' width="407px">
+</div> 
+
+<div id="L1-bench-3080"></div>
 
 - 📚 NVIDIA RTX 3080 Laptop (`*`=MMA Acc F32, `^`=MMA Acc F16, `T`=TFLOPS, **~2.5x↑🎉**)
 
@@ -147,6 +169,13 @@ L1: level 1, O(2xBrx16)≈O(1) SRAM complexity, O(d/4) register complexity, the 
 |FFPA L1^|41T|41T|40T|39T|38T|37T|36T|35T|32T|31T|30T|31T|
 |Speedup|3.15x|2.56x|3.33x|2.44x|2.53x|2.47x|2.4x|2.33x|2.29x|2.21x|2.14x|2.21x|
 
+<div align='center'>
+  <img src='https://github.com/user-attachments/assets/7dc42fa1-a10e-453c-8e2c-befba6f12719' width="407px">
+  <img src='https://github.com/user-attachments/assets/c0443e13-94a4-4d29-8f77-e326e62a668e' width="407px">
+</div> 
+
+<div id="L1-bench-4090"></div>
+
 - 📚 NVIDIA RTX 4090 (`*`=MMA Acc F32, `^`=MMA Acc F16, `T`=TFLOPS, **~1.8x↑🎉**)
 
 |Algorithm|320|384|448|512|576|640|704|768|832|896|960|1024|
@@ -167,6 +196,11 @@ L1: level 1, O(2xBrx16)≈O(1) SRAM complexity, O(d/4) register complexity, the 
 |FFPA L1^|175T|173T|171T|174T|171T|170T|169T|167T|164T|164T|162T|157T|
 |Speedup|2.13x|1.86x|2.01x|2.05x|2.16x|2.1x|2.14x|2.09x|2.08x|2.05x|2.08x|2.01x|
 
+<div align='center'>
+  <img src='https://github.com/user-attachments/assets/5699465b-03b8-460c-8d9e-7b84bad25d85' width="407px">
+  <img src='https://github.com/user-attachments/assets/083a3c6c-1afb-4fc5-9622-34ca22129627' width="407px">
+</div> 
+
 ## 📖 Python Testing
 <div id="python-test"></div>
 
@@ -175,29 +209,20 @@ L1: level 1, O(2xBrx16)≈O(1) SRAM complexity, O(d/4) register complexity, the 
 # You can test on many devices, such as Volta, Ampere, Ada, Hopper, ...
 cd tests && python3 test.py --B 1 --H 48 --N 8192 --show-all --D 320
 ```
-- 📚 case: B=1, H=48, N=8192, D=320(`FA2 not supported`), Device=NVIDIA RTX 4090.
+- 📚 case: B=1, H=48, N=8192, D=320(`FA2 not supported`)
 ```bash
-python3 test.py --B 1 --H 48 --N 8192 --show-all --D 320 # NVIDIA RTX 4090
------------------------------B=1, H=48, N=8192, D=320, Warmup: 1, Iters: 5-----------------------
-                   (sdpa): ['-0.01750183 '], time:50.36ms, TFLOPS:82.19 (+0.00 %)(~1.00x)
- (ffpa+acc+f32+L1+stage1): ['-0.01754761 '], time:40.23ms, TFLOPS:102.87(+25.17%)(~1.25x)
- (ffpa+acc+f32+L1+stage2): ['-0.01754761 '], time:30.35ms, TFLOPS:136.34(+32.54%)(~1.66x)
- (ffpa+acc+f16+L1+stage1): ['-0.01747131 '], time:31.03ms, TFLOPS:133.27(+0.00 %)(~1.62x)
- (ffpa+acc+f16+L1+stage2): ['-0.01747131 '], time:26.98ms, TFLOPS:153.41(+12.51%)(~1.87x)
--------------------------------------------------------------------------------------------------
+python3 test.py --B 1 --H 48 --N 8192 --show-all --D 320
 ```
 - 📚 case: Generate benchmark table on Your own device (Welcome to PR your benchmark table 🎉🎉)
 ```bash
-python3 test.py --gen-bench --show-all # NVIDIA RTX 4090
-|Algorithm|320|384|448|512|576|640|704|768|832|896|960|1024|
-|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-|SDPA EA|80T|94T|86T|85T|79T|81T|79T|81T|79T|80T|79T|72T|
-|FFPA L1*|135T|140T|143T|135T|134T|134T|134T|134T|131T|131T|130T|131T|
-|Speedup|1.69x|1.49x|1.66x|1.59x|1.7x|1.65x|1.7x|1.65x|1.66x|1.64x|1.65x|1.82x|
-|FFPA L1^|153T|155T|157T|157T|159T|157T|157T|156T|151T|151T|150T|153T|
-|Speedup|1.91x|1.65x|1.83x|1.85x|2.01x|1.94x|1.99x|1.93x|1.91x|1.89x|1.9x|2.12x|
+python3 test.py --gen-bench --show-all
+```
+- 📚 case: Generate benchmark plots on Your own device (Welcome to PR your benchmark plots 🎉🎉)
+```bash
+python3 test.py --gen-bench --show-all --plot
 ```
 
+💡NOTE: Please check all configurable environment variables in [env.py](./env.py).
 
 ## ©️License
 

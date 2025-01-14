@@ -273,3 +273,8 @@ def pretty_print_line(
     else:
         pretty_line = sep * res_len + m
     print(pretty_line)
+
+
+if __name__ == "__main__":
+    # Debug: show FFPA ENV information. run: python3 env.py
+    ENV.list_ffpa_env()
