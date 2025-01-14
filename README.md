@@ -133,15 +133,15 @@ L1: level 1, O(2xBrx16)≈O(1) SRAM complexity, O(d/4) register complexity, the 
 |FFPA L1^|48T|46T|45T|43T|44T|44T|44T|38T|37T|36T|40T|34T|
 |Speedup|1.92x|1.84x|1.88x|1.79x|1.83x|1.83x|1.91x|1.73x|1.68x|1.64x|1.82x|1.89x|
 
-- 📚 NVIDIA A30 (`*`=MMA Acc: QK F32 + PV F16, `^`=MMA Acc F16, `T`=TFLOPS, **~1.7x↑🎉**)
+- 📚 NVIDIA A30 (`*`=MMA Acc: QK F32 + PV F16, `^`=MMA Acc F16, `T`=TFLOPS, **~1.9x↑🎉**)
 
 |Algorithm|320|384|448|512|576|640|704|768|832|896|960|1024|
 |:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
 |SDPA EA|25T|25T|24T|24T|24T|24T|23T|22T|22T|22T|22T|18T|
-|FFPA L1*|42T|41T|39T|38T|37T|36T|36T|35T|34T|33T|31T|30T|
-|Speedup|1.68x|1.64x|1.62x|1.58x|1.54x|1.5x|1.57x|1.59x|1.55x|1.5x|1.41x|1.67x|
-|FFPA L1^|41T|42T|41T|40T|37T|37T|36T|36T|35T|35T|32T|31T|
-|Speedup|1.64x|1.68x|1.71x|1.67x|1.54x|1.54x|1.57x|1.64x|1.59x|1.59x|1.45x|1.72x|
+|FFPA L1*|48T|46T|46T|43T|44T|38T|38T|38T|37T|36T|40T|34T|
+|Speedup|1.92x|1.84x|1.92x|1.79x|1.83x|1.58x|1.65x|1.73x|1.68x|1.64x|1.82x|1.89x|
+|FFPA L1^|48T|46T|45T|43T|44T|44T|44T|38T|37T|36T|39T|34T|
+|Speedup|1.92x|1.84x|1.88x|1.79x|1.83x|1.83x|1.91x|1.73x|1.68x|1.64x|1.77x|1.89x|
 
 <div align='center'>
   <img src='https://github.com/user-attachments/assets/7437341e-207d-4e35-b13f-b5834957591f' width="407px">
