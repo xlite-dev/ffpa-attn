@@ -182,7 +182,7 @@ python3 test.py --B 1 --H 48 --N 8192 --show-all --D 320
 python3 test.py --gen-bench --show-all
 ```
 
-Please check all configurable environment variables in [env.py](./eny.py).
+Please check all configurable environment variables in [env.py](./env.py).
 
 ## ©️License
 
