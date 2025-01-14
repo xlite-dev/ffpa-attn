@@ -1,6 +1,7 @@
 #pragma once
 #include "cuffpa/prefill.cuh" // ffpa::prefill
-using namespace ffpa;                                            
+using namespace ffpa;
+using mma::MMAMode;                                      
 
 
 template<
@@ -161,8 +162,6 @@ ffpa_mma_stages_split_q_L1_template(half* Q,
     }
 
     // <loop over K d>: tile_K_d, kMmaAtomK = 16, K_tile_d[kMmaAtomK,Bc]
-    // TODO: remove this zero fill, ref: https://github.com/flashinfer-ai/
-    // flashinfer/blob/main/include/flashinfer/mma.cuh#L231
     utils::fill_3D_regs<uint32_t, kWarpTileSeqLenQ, kWarpTileSeqLenK, 
                         (kMmaAccFloat32QK) ? 4 : 2>(R_S, 0);
     #pragma unroll
@@ -235,19 +234,17 @@ ffpa_mma_stages_split_q_L1_template(half* Q,
         for (int j = 0; j < kWarpTileSeqLenK; ++j) { // 8, 16, 32, ...
           if constexpr (kMmaAccFloat32QK) {
             // MMA accumulate with F32 dtype for high precision.
-            mma::m16n8k16_f16f16f32(
+            mma::m16n8k16_f16f16f32<MMAMode::kInplaceUpdate>(
               &R_S[0][j][0], &R_S[0][j][1], &R_S[0][j][2], &R_S[0][j][3],
               &R_Q[0][0],    &R_Q[0][1],    &R_Q[0][2],    &R_Q[0][3], 
-              &R_K[j][0],    &R_K[j][1], 
-              &R_S[0][j][0], &R_S[0][j][1], &R_S[0][j][2], &R_S[0][j][3]
+              &R_K[j][0],    &R_K[j][1]
             );
           } else {
             // MMA accumulate with F16 dtype for high throughput.
-            mma::m16n8k16_f16f16f16(
+            mma::m16n8k16_f16f16f16<MMAMode::kInplaceUpdate>(
               &R_S[0][j][0], &R_S[0][j][1],
               &R_Q[0][0],    &R_Q[0][1],    &R_Q[0][2],    &R_Q[0][3], 
-              &R_K[j][0],    &R_K[j][1], 
-              &R_S[0][j][0], &R_S[0][j][1]
+              &R_K[j][0],    &R_K[j][1]
             );
           }
         } // end for kWarpTileSeqLenK
@@ -345,9 +342,7 @@ ffpa_mma_stages_split_q_L1_template(half* Q,
           }
         }
 
-        // TODO: remove this zero fill, ref: https://github.com/flashinfer-ai/
-        // flashinfer/blob/main/include/flashinfer/mma.cuh#L231
-        utils::fill_1D_regs<uint32_t, (kMmaAccFloat32PV) ? 4 : 2>(R_O, 0); // must clear 
+        utils::fill_1D_regs<uint32_t, (kMmaAccFloat32PV) ? 4 : 2>(R_O, 0); 
         #pragma unroll
         for (int tile_V_Bc = 0; tile_V_Bc < (Bc / kMmaAtomK); ++tile_V_Bc) {
           prefill::sync_fetch_qkv_frags_s2r<
@@ -384,19 +379,17 @@ ffpa_mma_stages_split_q_L1_template(half* Q,
           const int w = tile_V_Bc * 2; // MMA(Warp) selected, 0, 2, 4, 6
           if constexpr (kMmaAccFloat32PV) {
             // MMA accumulate with F32 dtype for high precision.
-            mma::m16n8k16_f16f16f32(
+            mma::m16n8k16_f16f16f32<MMAMode::kInplaceUpdate>(
               &R_O[0], &R_O[1], &R_O[2], &R_O[3],
               &R_S[0][w][0], &R_S[0][w][1], &R_S[0][w + 1][0],  &R_S[0][w + 1][1], 
-              &R_V[0], &R_V[1],
-              &R_O[0], &R_O[1], &R_O[2], &R_O[3]
+              &R_V[0], &R_V[1]
             ); 
           } else {
             // MMA accumulate with F16 dtype for high throughput.
-            mma::m16n8k16_f16f16f16(
+            mma::m16n8k16_f16f16f16<MMAMode::kInplaceUpdate>(
               &R_O[0], &R_O[1],
               &R_S[0][w][0], &R_S[0][w][1], &R_S[0][w + 1][0],  &R_S[0][w + 1][1], 
-              &R_V[0], &R_V[1],
-              &R_O[0], &R_O[1]
+              &R_V[0], &R_V[1]
             ); 
           }
         } // end for V Bc.
