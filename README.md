@@ -115,6 +115,11 @@ L1: level 1, O(2xBrx16)≈O(1) SRAM complexity, O(d/4) register complexity, the 
 |FFPA L1^|104T|105T|105T|104T|102T|94T|94T|93T|93T|94T|92T|93T|
 |Speedup|1.86x|1.64x|1.81x|1.79x|1.85x|1.68x|1.74x|1.69x|1.72x|1.71x|1.7x|1.66x|
 
+<div align='left'>
+  <img src='https://github.com/user-attachments/assets/7881c7fc-aeb4-4556-92a0-901b5b25ee1b' width="405px">
+  <img src='https://github.com/user-attachments/assets/f530900d-0dff-4986-a7e7-47a47ba15556' width="405px">
+</div> 
+
 <div id="L1-bench-a30"></div>
 
 - 📚 NVIDIA A30 (`*`=MMA Acc F32, `^`=MMA Acc F16, `T`=TFLOPS, **~1.5x↑🎉**)
@@ -136,6 +141,11 @@ L1: level 1, O(2xBrx16)≈O(1) SRAM complexity, O(d/4) register complexity, the 
 |Speedup|1.68x|1.64x|1.62x|1.58x|1.54x|1.5x|1.57x|1.59x|1.55x|1.5x|1.41x|1.67x|
 |FFPA L1^|41T|42T|41T|40T|37T|37T|36T|36T|35T|35T|32T|31T|
 |Speedup|1.64x|1.68x|1.71x|1.67x|1.54x|1.54x|1.57x|1.64x|1.59x|1.59x|1.45x|1.72x|
+
+<div align='left'>
+  <img src='https://github.com/user-attachments/assets/7437341e-207d-4e35-b13f-b5834957591f' width="405px">
+  <img src='https://github.com/user-attachments/assets/014df0f8-8283-4270-812e-a43bdf10366f' width="405px">
+</div> 
 
 <div id="L1-bench-3080"></div>
 
@@ -159,6 +169,11 @@ L1: level 1, O(2xBrx16)≈O(1) SRAM complexity, O(d/4) register complexity, the 
 |FFPA L1^|41T|41T|40T|39T|38T|37T|36T|35T|32T|31T|30T|31T|
 |Speedup|3.15x|2.56x|3.33x|2.44x|2.53x|2.47x|2.4x|2.33x|2.29x|2.21x|2.14x|2.21x|
 
+<div align='left'>
+  <img src='https://github.com/user-attachments/assets/7dc42fa1-a10e-453c-8e2c-befba6f12719' width="405px">
+  <img src='https://github.com/user-attachments/assets/409e3111-6b20-4bb5-817e-1360e116bed8' width="405px">
+</div> 
+
 <div id="L1-bench-4090"></div>
 
 - 📚 NVIDIA RTX 4090 (`*`=MMA Acc F32, `^`=MMA Acc F16, `T`=TFLOPS, **~1.8x↑🎉**)
@@ -180,6 +195,11 @@ L1: level 1, O(2xBrx16)≈O(1) SRAM complexity, O(d/4) register complexity, the 
 |Speedup|2.07x|1.83x|1.88x|1.87x|1.97x|1.9x|1.94x|1.9x|1.91x|1.86x|1.83x|1.74x|
 |FFPA L1^|175T|173T|171T|174T|171T|170T|169T|167T|164T|164T|162T|157T|
 |Speedup|2.13x|1.86x|2.01x|2.05x|2.16x|2.1x|2.14x|2.09x|2.08x|2.05x|2.08x|2.01x|
+
+<div align='left'>
+  <img src='https://github.com/user-attachments/assets/5699465b-03b8-460c-8d9e-7b84bad25d85' width="405px">
+  <img src='https://github.com/user-attachments/assets/083a3c6c-1afb-4fc5-9622-34ca22129627' width="405px">
+</div> 
 
 ## 📖 Python Testing
 <div id="python-test"></div>
