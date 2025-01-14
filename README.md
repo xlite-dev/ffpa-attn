@@ -37,10 +37,10 @@
 - [📖 Installation⚙️](#install)
 - [📖 Python Testing👇](#python-test)
 - [📖 FFPA L1~L3 Design💡](#ffpa-design)
-- [📈 FFPA L1: L20 ~1.7x↑🎉](#L1-bench)
-- [📈 FFPA L1: A30 ~1.5x↑🎉](#L1-bench)
-- [📈 FFPA L1: 3080 ~2.5x↑🎉](#L1-bench)
-- [📈 FFPA L1: 4090 ~1.8x↑🎉](#L1-bench)
+- [📈 FFPA L1: L20 ~1.7x↑🎉](#L1-bench-l20)
+- [📈 FFPA L1: A30 ~1.5x↑🎉](#L1-bench-a30)
+- [📈 FFPA L1: 3080 ~2.5x↑🎉](#L1-bench-3080)
+- [📈 FFPA L1: 4090 ~1.8x↑🎉](#L1-bench-4090)
 
 ## 📖 FFPA L1~L3: FlashAttention + QKV Fine-grained Tiling at MMA level💡
 <div id="ffpa-design"></div>
@@ -91,7 +91,7 @@ python3 setup.py bdist_wheel && cd dist && python3 -m pip install *.whl # pip un
 
 ## 📖 FFPA L1 (Level 1): Benchmark 🎉🎉
 
-<div id="L1-bench"></div>
+<div id="L1-bench-l20"></div>
 
 L1: level 1, O(2xBrx16)≈O(1) SRAM complexity, O(d/4) register complexity, the same GPU HBM memory complexity as FlashAttention. B=1, H=48, N=8192, **D=320-1024(FA2 not supported 👀)**. (Notes, `*`=MMA Acc F32, `^`=MMA Acc F16, Softmax Acc dtype is always be F32, T=TFLOPS, 👇Benchmark)
 
@@ -115,6 +115,8 @@ L1: level 1, O(2xBrx16)≈O(1) SRAM complexity, O(d/4) register complexity, the 
 |FFPA L1^|104T|105T|105T|104T|102T|94T|94T|93T|93T|94T|92T|93T|
 |Speedup|1.86x|1.64x|1.81x|1.79x|1.85x|1.68x|1.74x|1.69x|1.72x|1.71x|1.7x|1.66x|
 
+<div id="L1-bench-a30"></div>
+
 - 📚 NVIDIA A30 (`*`=MMA Acc F32, `^`=MMA Acc F16, `T`=TFLOPS, **~1.5x↑🎉**)
 
 |Algorithm|320|384|448|512|576|640|704|768|832|896|960|1024|
@@ -124,6 +126,8 @@ L1: level 1, O(2xBrx16)≈O(1) SRAM complexity, O(d/4) register complexity, the 
 |Speedup|1.44x|1.48x|1.46x|1.5x|1.46x|1.5x|1.52x|1.55x|1.55x|1.45x|1.55x|1.72x|
 |FFPA L1^|36T|36T|37T|37T|35T|35T|35T|35T|35T|34T|35T|32T|
 |Speedup|1.44x|1.44x|1.54x|1.54x|1.46x|1.46x|1.52x|1.59x|1.59x|1.55x|1.59x|1.78x|
+
+<div id="L1-bench-3080"></div>
 
 - 📚 NVIDIA RTX 3080 Laptop (`*`=MMA Acc F32, `^`=MMA Acc F16, `T`=TFLOPS, **~2.5x↑🎉**)
 
@@ -144,6 +148,8 @@ L1: level 1, O(2xBrx16)≈O(1) SRAM complexity, O(d/4) register complexity, the 
 |Speedup|2.85x|2.19x|2.92x|2.06x|2.07x|2.0x|2.0x|1.93x|1.86x|2.0x|1.86x|1.79x|
 |FFPA L1^|41T|41T|40T|39T|38T|37T|36T|35T|32T|31T|30T|31T|
 |Speedup|3.15x|2.56x|3.33x|2.44x|2.53x|2.47x|2.4x|2.33x|2.29x|2.21x|2.14x|2.21x|
+
+<div id="L1-bench-4090"></div>
 
 - 📚 NVIDIA RTX 4090 (`*`=MMA Acc F32, `^`=MMA Acc F16, `T`=TFLOPS, **~1.8x↑🎉**)
 
