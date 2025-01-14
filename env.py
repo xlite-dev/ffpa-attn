@@ -47,7 +47,7 @@ class ENV(object):
     ENABLE_FFPA_SMEM_SWIZZLE_Q = bool(int(os.environ.get("ENABLE_FFPA_SMEM_SWIZZLE_Q", 1)))
 
     # Enable smem swizzle for K, default True.
-    ENABLE_FFPA_SMEM_SWIZZLE_K = bool(int(os.environ.get("ENABLE_FFPA_SMEM_SWIZZLE_K", 0)))
+    ENABLE_FFPA_SMEM_SWIZZLE_K = bool(int(os.environ.get("ENABLE_FFPA_SMEM_SWIZZLE_K", 1)))
 
     # Enable smem swizzle for V, default False for V, True for QK. 
     # swizzle V seems can not get good performance. why? Will enable
