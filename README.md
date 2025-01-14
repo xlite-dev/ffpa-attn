@@ -11,7 +11,7 @@
   <img src=https://img.shields.io/badge/License-GPLv3.0-turquoise.svg >
  </div>
 
-🤖[WIP] **FFPA**: Yet antother **Faster Flash Prefill Attention** with **O(1) SRAM complexity** & **O(d/4) or O(1) register complexity** for large headdim (D > 256), almost **1.5x~2x** 🎉 faster than SDPA EA with or without MMA Acc F32 on many devices: [📈L20 ~1.7x↑🎉](#L1-bench-l20), [📈 A30 ~1.5x↑🎉](#L1-bench-a30), [📈3080 ~2.5x↑🎉](#L1-bench-3080), [📈4090 ~1.8x↑🎉](#L1-bench-4090). 
+🤖[WIP] **FFPA**: Yet antother **Faster Flash Prefill Attention** with **O(1) SRAM complexity** & **O(d/4) or O(1) register complexity** for large headdim (D > 256), almost **1.5x~2x** 🎉 faster than SDPA EA with or without MMA Acc F32 on many devices: [📈L20 ~1.9x↑🎉](#L1-bench-l20), [📈 A30 ~1.8x↑🎉](#L1-bench-a30), [📈3080 ~2.8x↑🎉](#L1-bench-3080), [📈4090 ~2.1x↑🎉](#L1-bench-4090). 
 
 <div align='center'>
   <img src='https://github.com/user-attachments/assets/7dc42fa1-a10e-453c-8e2c-befba6f12719' width="407px">
@@ -37,10 +37,10 @@
 - [📖 Installation⚙️](#install)
 - [📖 Python Testing👇](#python-test)
 - [📖 FFPA L1~L3 Design💡](#ffpa-design)
-- [📈 FFPA L1: L20 ~1.7x↑🎉](#L1-bench-l20)
-- [📈 FFPA L1: A30 ~1.5x↑🎉](#L1-bench-a30)
-- [📈 FFPA L1: 3080 ~2.5x↑🎉](#L1-bench-3080)
-- [📈 FFPA L1: 4090 ~1.8x↑🎉](#L1-bench-4090)
+- [📈 FFPA L1: L20 ~1.9x↑🎉](#L1-bench-l20)
+- [📈 FFPA L1: A30 ~1.8x↑🎉](#L1-bench-a30)
+- [📈 FFPA L1: 3080 ~2.8x↑🎉](#L1-bench-3080)
+- [📈 FFPA L1: 4090 ~2.1x↑🎉](#L1-bench-4090)
 
 ## 📖 FFPA L1~L3: FlashAttention + QKV Fine-grained Tiling at MMA level💡
 <div id="ffpa-design"></div>
