@@ -12,8 +12,8 @@ class ENV(object):
     # Enable debug mode for FFPA, fast build minimal kernels, default False.
     ENABLE_FFPA_DEBUG = bool(int(os.environ.get("ENABLE_FFPA_DEBUG", 0)))
 
-    # Enable all multi stages kernels or not (1~4), default False (1~2).
-    ENABLE_FFPA_ALL_STAGES = bool(int(os.environ.get("ENABLE_FFPA_ALL_STAGES", 0)))
+    # Enable all multi stages kernels or not, if True (1~4) else (1~2), default True.
+    ENABLE_FFPA_ALL_STAGES = bool(int(os.environ.get("ENABLE_FFPA_ALL_STAGES", 1)))
 
     # Enable all headdims for FFPA kernels or not, default False.
     # True, headdim will range from 32 to 1024 with step = 32, range(32, 1024, 32)
@@ -37,22 +37,26 @@ class ENV(object):
         int(os.environ.get("ENABLE_FFPA_FORCE_PV_MMA_ACC_F16", 0))
     )
 
-    # Enable FFPA Prefetch QKV at the Appropriate Time Point, default False.
-    ENABLE_FFPA_PREFETCH_QKV = bool(int(os.environ.get("ENABLE_FFPA_PREFETCH_QKV", 0)))
+    # Enable FFPA Prefetch QKV at the Appropriate Time Point, default True, boost 5%~10%.
+    ENABLE_FFPA_PREFETCH_QKV = bool(int(os.environ.get("ENABLE_FFPA_PREFETCH_QKV", 1)))
 
-    # Enable QKV smem shared policy, default True.
-    ENABLE_FFPA_QKV_SMEM_SHARE = bool(int(os.environ.get("ENABLE_FFPA_QKV_SMEM_SHARE", 1)))
+    # Enable QKV smem shared policy, default False (perfered for MMA & g2s overlap).
+    # Set it as True on low SRAM device.
+    ENABLE_FFPA_QKV_SMEM_SHARE = bool(int(os.environ.get("ENABLE_FFPA_QKV_SMEM_SHARE", 0)))
 
-    # Enable smem swizzle for Q, default True.
+    # Enable smem swizzle for Q, default True. True: bank conflicts free for Q smem
+    # via swizzle; False: bank conflicts free for Q smem via padding.
     ENABLE_FFPA_SMEM_SWIZZLE_Q = bool(int(os.environ.get("ENABLE_FFPA_SMEM_SWIZZLE_Q", 1)))
 
-    # Enable smem swizzle for K, default True.
+    # Enable smem swizzle for K, default True. True: bank conflicts free for K smem
+    # via swizzle; False: bank conflicts free for K smem via padding.
     ENABLE_FFPA_SMEM_SWIZZLE_K = bool(int(os.environ.get("ENABLE_FFPA_SMEM_SWIZZLE_K", 1)))
 
-    # Enable smem swizzle for V, default False for V, True for QK. 
-    # swizzle V seems can not get good performance. why? Will enable
-    # it by default untill I have figure out the performance issue.
-    ENABLE_FFPA_SMEM_SWIZZLE_V = bool(int(os.environ.get("ENABLE_FFPA_SMEM_SWIZZLE_V", 0)))
+    # Enable smem swizzle for V, default True. True: bank conflicts free for V smem
+    # via swizzle; False: bank conflicts free for V smem via padding. 
+    # FIXME(DefTruth):swizzle V seems can not get good performance. why? Will enable 
+    # it by default untill I have fixed the performance issue.
+    ENABLE_FFPA_SMEM_SWIZZLE_V = bool(int(os.environ.get("ENABLE_FFPA_SMEM_SWIZZLE_V", 1)))
 
     @classmethod
     def project_dir(cls):
