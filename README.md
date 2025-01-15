@@ -222,8 +222,8 @@ L1: level 1, O(2xBrx16)≈O(1) SRAM complexity, O(d/4) register complexity, the 
 |Speedup|2.44x|2.08x|2.22x|2.27x|2.41x|2.32x|2.35x|2.24x|2.24x|2.19x|2.23x|2.18x|
 
 <div align='left'>
-  <img src='https://github.com/user-attachments/assets/447e2937-f7c8-47c8-8550-8c0c71b910e6' width="408px">
-  <img src='https://github.com/user-attachments/assets/65a8d564-8fa7-4d66-86b9-e238feb86143' width="408px">
+  <img src='https://github.com/user-attachments/assets/447e2937-f7c8-47c8-8550-8c0c71b910e6' width="410px">
+  <img src='https://github.com/user-attachments/assets/65a8d564-8fa7-4d66-86b9-e238feb86143' width="410px">
 </div> 
 
 ## 📖 Python Testing
