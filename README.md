@@ -230,15 +230,15 @@ L1: level 1, O(2xBrx16)≈O(1) SRAM complexity, O(d/4) register complexity, the 
 <div id="python-test"></div>
 
 👇You can test many custom FFPA kernels via Python and figure out the difference in their performance. The `--gen-bench` and `--plot` options help you generate a benchmark table in Markdown style and speedup bar plots on your device. Contributions of your benchmark tables and plots are welcome via a PR 🎉🎉.
+
 - 📚 case: B=1, H=48, N=8192, D=320(`FA2 not supported`)
 ```bash
 # You can test on many devices, such as Volta, Ampere, Ada, Hopper, ...
 cd tests && python3 test.py --B 1 --H 48 --N 8192 --show-all --D 320
 ```
-- 📚 case: Generate benchmark table and plots on Your own device.
+- 📚 case: Generate benchmark table and speedup bar plots on Your device.
 ```bash
-cd tests && python3 -m pip install -r requirements.txt
-python3 test.py --gen-bench --show-all --plot
+cd tests && pip install matplotlib && python3 test.py --gen-bench --show-all --plot
 ```
 💡NOTE: Please check all configurable environment variables in [env.py](./env.py).
 
