@@ -80,11 +80,11 @@ By leveraging this approach, we can achieve better performance for large headdim
 |✔️Tile MMA/Warp |✔️QKV Multi-Stages(1~4) |✔️Collective Store(**Shfl**)|✔️**Prefetch QKV** g2s |
 |✔️**QKV Fine-grained Tiling**|✔️**Shared QKV** SMEM|✔️Mixed MMA Acc|✔️**FFPA L1 Level**|
 
-- 📚 FFPA L1 kernel template signature
+- 📚 case: FFPA `L1` kernel template signature: [ffpa_attn_templates_L1.cuh](csrc/cuffpa/ffpa_attn_templates_L1.cuh)
 
-```C++
+```CUDA
 template<
-  const int kHeadDim,              // Headdim, 32,64,128     
+  const int kHeadDim,              // Headdim, 32~1024     
   const int kMmaAtomM,             // MMA Atom M, 16
   const int kMmaAtomN,             // MMA Atom N, 8
   const int kMmaAtomK,             // MMA Atom K, 16
