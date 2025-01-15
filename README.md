@@ -14,12 +14,12 @@
 🤖[WIP] **FFPA**: Yet antother **Faster Flash Prefill Attention** with **O(1) SRAM complexity** & **O(d/4) or O(1) register complexity** for large headdim (D > 256), almost **1.5x~2x** 🎉 faster than SDPA EA with or without MMA Acc F32 on many devices: [📈L20 ~1.9x↑🎉](#L1-bench-l20), [📈 A30 ~1.8x↑🎉](#L1-bench-a30), [📈3080 ~2.9x↑🎉](#L1-bench-3080), [📈4090 ~2.1x↑🎉](#L1-bench-4090). 
 
 <div align='left'>
-  <img src='https://github.com/user-attachments/assets/447e2937-f7c8-47c8-8550-8c0c71b910e6' width="408px">
-  <img src='https://github.com/user-attachments/assets/65a8d564-8fa7-4d66-86b9-e238feb86143' width="408px">
+  <img src='https://github.com/user-attachments/assets/447e2937-f7c8-47c8-8550-8c0c71b910e6' width="411px">
+  <img src='https://github.com/user-attachments/assets/65a8d564-8fa7-4d66-86b9-e238feb86143' width="411px">
 </div> 
 
 <!--
-<div align='center'>
+<div align='left'>
   <img src='https://github.com/user-attachments/assets/cba2edce-ac0d-412e-823c-7eea2cc63f83' height="170px" width="270px">
   <img src='https://github.com/user-attachments/assets/447e2937-f7c8-47c8-8550-8c0c71b910e6' height="170px" width="270px">
   <img src='https://github.com/user-attachments/assets/65a8d564-8fa7-4d66-86b9-e238feb86143' height="170px" width="270px">
@@ -32,7 +32,7 @@
 ## ©️Citations🎉🎉
 
 ```BibTeX
-@misc{ffpa-attn@2025,
+@misc{ffpa-attn-mma@2025,
   title={FFPA: Yet another Faster Flash Prefill Attention for large headdim.},
   url={https://github.com/DefTruth/ffpa-attn-mma.git},
   note={Open-source software available at https://github.com/DefTruth/ffpa-attn-mma.git},
@@ -140,9 +140,9 @@ L1: level 1, O(2xBrx16)≈O(1) SRAM complexity, O(d/4) register complexity, the 
 |FFPA L1^|104T|103T|103T|102T|103T|103T|102T|94T|94T|94T|100T|100T|
 |Speedup|1.86x|1.61x|1.78x|1.76x|1.87x|1.84x|1.89x|1.71x|1.74x|1.71x|1.85x|1.79x|
 
-<div align='center'>
-  <img src='https://github.com/user-attachments/assets/a4927108-3f97-4209-9b80-bb31ad271e04' width="407px">
-  <img src='https://github.com/user-attachments/assets/eeb9943f-919d-45d8-a8a6-e0f8874f4bcd' width="407px">
+<div align='left'>
+  <img src='https://github.com/user-attachments/assets/a4927108-3f97-4209-9b80-bb31ad271e04' width="411px">
+  <img src='https://github.com/user-attachments/assets/eeb9943f-919d-45d8-a8a6-e0f8874f4bcd' width="411px">
 </div> 
 
 <div id="L1-bench-a30"></div>
@@ -167,9 +167,9 @@ L1: level 1, O(2xBrx16)≈O(1) SRAM complexity, O(d/4) register complexity, the 
 |FFPA L1^|48T|46T|45T|43T|44T|44T|44T|38T|37T|36T|39T|34T|
 |Speedup|1.92x|1.84x|1.88x|1.79x|1.83x|1.83x|1.91x|1.73x|1.68x|1.64x|1.77x|1.89x|
 
-<div align='center'>
-  <img src='https://github.com/user-attachments/assets/7e323005-4445-41af-8e94-6efb62ed2b77' width="407px">
-  <img src='https://github.com/user-attachments/assets/e314649e-82b5-414d-85c9-8b6fbf260138' width="407px">
+<div align='left'>
+  <img src='https://github.com/user-attachments/assets/7e323005-4445-41af-8e94-6efb62ed2b77' width="411px">
+  <img src='https://github.com/user-attachments/assets/e314649e-82b5-414d-85c9-8b6fbf260138' width="411px">
 </div> 
 
 <div id="L1-bench-3080"></div>
@@ -194,9 +194,9 @@ L1: level 1, O(2xBrx16)≈O(1) SRAM complexity, O(d/4) register complexity, the 
 |FFPA L1^|44T|41T|39T|39T|38T|39T|39T|36T|34T|32T|31T|33T|
 |Speedup|3.38x|2.73x|3.25x|2.6x|2.71x|2.6x|2.79x|2.57x|2.43x|2.29x|2.21x|2.36x|
 
-<div align='center'>
-  <img src='https://github.com/user-attachments/assets/d157cd69-4444-4735-a691-edaaff408137' width="407px">
-  <img src='https://github.com/user-attachments/assets/3ce47627-e79d-40ee-b753-bdd235603b7d' width="407px">
+<div align='left'>
+  <img src='https://github.com/user-attachments/assets/d157cd69-4444-4735-a691-edaaff408137' width="411px">
+  <img src='https://github.com/user-attachments/assets/3ce47627-e79d-40ee-b753-bdd235603b7d' width="411px">
 </div> 
 
 <div id="L1-bench-4090"></div>
