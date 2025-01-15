@@ -25,8 +25,12 @@ void launch_ffpa_mma_acc_f32_L1(torch::Tensor Q,
   constexpr int Bc = kMmaAtomN * kMmaTileSeqLenK * kWarpTileSeqLenK;
   constexpr int kNumThreads = WARP_SIZE * kMmaTileSeqLenQ * kMmaTileSeqLenK;
   // Q@K^T or P@V, 0 MMA Acc with fp16, 1 MMA Acc with fp32.
+#ifdef ENABLE_FFPA_FORCE_QK_F16
+  constexpr int kMmaAccFloat32QK = 0;
+#else
   constexpr int kMmaAccFloat32QK = 1;
-#ifdef ENABLE_FFPA_FORCE_PV_MMA_ACC_F16
+#endif
+#ifdef ENABLE_FFPA_FORCE_PV_F16
   constexpr int kMmaAccFloat32PV = 0;
 #else
   constexpr int kMmaAccFloat32PV = 1;

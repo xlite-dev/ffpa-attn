@@ -12,14 +12,6 @@ class ENV(object):
     # Enable debug mode for FFPA, fast build minimal kernels, default False.
     ENABLE_FFPA_DEBUG = bool(int(os.environ.get("ENABLE_FFPA_DEBUG", 0)))
 
-    # Enable all multi stages kernels or not, if True (1~4) else (1~2), default True.
-    ENABLE_FFPA_ALL_STAGES = bool(int(os.environ.get("ENABLE_FFPA_ALL_STAGES", 1)))
-
-    # Enable all headdims for FFPA kernels or not, default False.
-    # True, headdim will range from 32 to 1024 with step = 32, range(32, 1024, 32)
-    # False, headdim will range from 256 to 1024 with step = 64, range(256, 1024, 64)
-    ENABLE_FFPA_ALL_HEADDIM = bool(int(os.environ.get("ENABLE_FFPA_ALL_HEADDIM", 0)))
-
     # Enable build FFPA kernels for Ada devices (sm89, L2O, 4090, etc),
     # default True.
     ENABLE_FFPA_ADA = bool(int(os.environ.get("ENABLE_FFPA_ADA", 1)))
@@ -32,10 +24,21 @@ class ENV(object):
     # default False.
     ENABLE_FFPA_HOPPER = bool(int(os.environ.get("ENABLE_FFPA_HOPPER", 0)))
 
-    # Enable force P@V use fp16 as MMA Acc dtype, default False. (TODO: Q@K)
-    ENABLE_FFPA_FORCE_PV_MMA_ACC_F16 = bool(
-        int(os.environ.get("ENABLE_FFPA_FORCE_PV_MMA_ACC_F16", 0))
-    )
+    # Enable all multi stages kernels or not, if True (1~4) else (1~2), default True.
+    ENABLE_FFPA_ALL_STAGES = bool(int(os.environ.get("ENABLE_FFPA_ALL_STAGES", 1)))
+
+    # Enable all headdims for FFPA kernels or not, default False.
+    # True, headdim will range from 32 to 1024 with step = 32, range(32, 1024, 32)
+    # False, headdim will range from 256 to 1024 with step = 64, range(256, 1024, 64)
+    ENABLE_FFPA_ALL_HEADDIM = bool(int(os.environ.get("ENABLE_FFPA_ALL_HEADDIM", 0)))
+
+    # Enable force Q@K^T use fp16 as MMA Acc dtype for FFPA Acc F32 kernels, default False.
+    # FFPA Acc F32 kernels MMA Acc = Mixed Q@K^T MMA Acc F16 + P@V MMA Acc F32.
+    ENABLE_FFPA_FORCE_OK_F16 = bool(int(os.environ.get("ENABLE_FFPA_FORCE_OK_F16", 0)))
+
+    # Enable force P@V use fp16 as MMA Acc dtype, for FFPA Acc F32 kernels, default False.
+    # FFPA Acc F32 kernels MMA Acc = Mixed Q@K^T MMA Acc F32 + P@V MMA Acc F16.
+    ENABLE_FFPA_FORCE_PV_F16 = bool(int(os.environ.get("ENABLE_FFPA_FORCE_PV_F16", 0)))
 
     # Enable FFPA Prefetch QKV at the Appropriate Time Point, default True, boost 5%~10%.
     ENABLE_FFPA_PREFETCH_QKV = bool(int(os.environ.get("ENABLE_FFPA_PREFETCH_QKV", 1)))
@@ -75,16 +78,16 @@ class ENV(object):
         return cls.ENABLE_FFPA_DEBUG
 
     @classmethod
-    def enable_hopper(cls):
-        return cls.ENABLE_FFPA_HOPPER
+    def enable_ada(cls):
+        return cls.ENABLE_FFPA_ADA
 
     @classmethod
     def enable_ampere(cls):
         return cls.ENABLE_FFPA_AMPERE
 
     @classmethod
-    def enable_ada(cls):
-        return cls.ENABLE_FFPA_ADA
+    def enable_hopper(cls):
+        return cls.ENABLE_FFPA_HOPPER
 
     @classmethod
     def enable_all_mutistages(cls):
@@ -95,8 +98,12 @@ class ENV(object):
         return cls.ENABLE_FFPA_ALL_HEADDIM
 
     @classmethod
-    def enable_force_pv_mma_acc_fp16(cls):
-        return cls.ENABLE_FFPA_FORCE_PV_MMA_ACC_F16
+    def enable_force_pv_fp16(cls):
+        return cls.ENABLE_FFPA_FORCE_PV_F16
+
+    @classmethod
+    def enable_force_qk_fp16(cls):
+        return cls.ENABLE_FFPA_FORCE_OK_F16
 
     @classmethod
     def enable_prefetch_qkv(cls):
@@ -127,8 +134,10 @@ class ENV(object):
             extra_env_cflags.append("-DENABLE_FFPA_ALL_STAGES")
         if cls.enable_all_headdim():
             extra_env_cflags.append("-DENABLE_FFPA_ALL_HEADDIM")
-        if cls.enable_force_pv_mma_acc_fp16():
-            extra_env_cflags.append("-DENABLE_FFPA_FORCE_PV_MMA_ACC_F16")
+        if cls.enable_force_qk_fp16():
+            extra_env_cflags.append("-DENABLE_FFPA_FORCE_OK_F16")
+        if cls.enable_force_pv_fp16():
+            extra_env_cflags.append("-DENABLE_FFPA_FORCE_PV_F16")
         if cls.enable_prefetch_qkv():
             extra_env_cflags.append("-DENABLE_FFPA_PREFETCH_QKV")
         if cls.enable_qkv_smem_share():
@@ -146,11 +155,11 @@ class ENV(object):
         def formatenv(name, value):
             try:
                 print(
-                    f"{name:<35}: {str(value):<5} -> command:"
+                    f"{name:<30}: {str(value):<5} -> command:"
                     f" export {name}={int(value)}"
                 )
             except Exception:
-                print(f"{name:<35}: {value}")
+                print(f"{name:<30}: {value}")
 
         pretty_print_line("FFPA-ATTN ENVs")
         formatenv("PROJECT_DIR", cls.project_dir())
@@ -161,13 +170,12 @@ class ENV(object):
         formatenv("ENABLE_FFPA_ALL_STAGES", cls.enable_all_mutistages())
         formatenv("ENABLE_FFPA_ALL_HEADDIM", cls.enable_all_headdim())
         formatenv("ENABLE_FFPA_PREFETCH_QKV", cls.enable_prefetch_qkv())
+        formatenv("ENABLE_FFPA_FORCE_QK_F16", cls.enable_force_qk_fp16())
+        formatenv("ENABLE_FFPA_FORCE_PV_F16", cls.enable_force_pv_fp16())
         formatenv("ENABLE_FFPA_QKV_SMEM_SHARE", cls.enable_qkv_smem_share())
         formatenv("ENABLE_FFPA_SMEM_SWIZZLE_Q", cls.enable_smem_swizzle_q())
         formatenv("ENABLE_FFPA_SMEM_SWIZZLE_K", cls.enable_smem_swizzle_k())
         formatenv("ENABLE_FFPA_SMEM_SWIZZLE_V", cls.enable_smem_swizzle_v())
-        formatenv(
-            "ENABLE_FFPA_FORCE_PV_MMA_ACC_F16", cls.enable_force_pv_mma_acc_fp16()
-        )
         pretty_print_line()
 
     @staticmethod
