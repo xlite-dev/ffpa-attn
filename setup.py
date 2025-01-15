@@ -88,7 +88,7 @@ setup(
             "third_party",
         )
     ),
-    description="FFPA: Yet another Faster Flash Prefill Attention for large headdim, 1.5x~2x faster than SDPA EA.",
+    description="FFPA: Yet another Faster Flash Prefill Attention for large headdim, 1.8x~3x faster than SDPA EA.",
     long_description=get_long_description(),
     long_description_content_type="text/markdown",
     url="https://github.com/DefTruth/ffpa-attn-mma.git",
