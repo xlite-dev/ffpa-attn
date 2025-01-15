@@ -80,6 +80,37 @@ By leveraging this approach, we can achieve better performance for large headdim
 |✔️Tile MMA/Warp |✔️QKV Multi-Stages(1~4) |✔️Collective Store(**Shfl**)|✔️**Prefetch QKV** g2s |
 |✔️**QKV Fine-grained Tiling**|✔️**Shared QKV** SMEM|✔️Mixed MMA Acc|✔️**FFPA L1 Level**|
 
+- 📚 case: FFPA `L1` kernel template signature: [ffpa_attn_templates_L1.cuh](csrc/cuffpa/ffpa_attn_templates_L1.cuh)
+
+```CUDA
+template<
+  const int kHeadDim,              // Headdim, 32~1024     
+  const int kMmaAtomM,             // MMA Atom M, 16
+  const int kMmaAtomN,             // MMA Atom N, 8
+  const int kMmaAtomK,             // MMA Atom K, 16
+  const int kMmaTileSeqLenQ,       // 4, more MMA(warp), M=16*4=64, Q@K^T=[Br(M), d(K)]@[d(K),  Bc(N)]  
+  const int kMmaTileSeqLenK,       // 1, more MMA(warp), N=8*1 =8,  Q@K^T=[Br(M), d(K)]@[d(K),  Bc(N)]    
+  const int kMmaTileSeqLenP,       // 4, more MMA(warp), M=16*4=64, P@V  =[Br(M),Bc(K)]@[Bc(K), d(N) ]
+  const int kMmaTileHeadDimV,      // 1, more MMA(warp), N=8*1 =8,  P@V  =[Br(M),Bc(K)]@[Bc(K), d(N) ]       
+  const int kWarpTileSeqLenQ,      // 1, more values, M, Br=64*1=64, matmul M 
+  const int kWarpTileSeqLenK,      // 8, more values, N, Bc=8*8 =64, matmul N
+  const int kWarpTileSeqLenP,      // 1, more values, M, Br=64*1=64, matmul M
+  const int kWarpTileHeadDimV,     // 8, more values, N, d=8*(1|2|3|4|...)=8|...|32|64|96|128|...
+  const int kMmaAccFloat32QK,      // 0/1, Q@K^T, 0 MMA Acc with fp16, 1 MMA Acc with fp32.
+  const int kMmaAccFloat32PV,      // 0/1, P@V, 0 MMA Acc with fp16, 1 MMA Acc with fp32.
+  const int kOStorageAccFloat32,   // 0/1, MMA Acc always be f32/f16, but O storage can be fp32 or half.
+  const int kPrefetchQK,           // Prefetch QK at the Appropriate Time Point. 
+  const int kPrefetchPV,           // Prefetch V at the Appropriate Time Point. 
+  const int kShareSmemQKV,         // QKV share the same shared memory, reuse QK smem for V.
+  const int kStageQK,              // <= 4, may apply different multi stages policy for QK and V (<=4)
+  const int kStagePV,              // <= 4, may apply different multi stages policy for QK and V (<=4)
+  const int kPadQ,                 // Pad Q/K/V 0,8; 0 -> smem swizzle, > 0 -> padding
+  const int kPadK,                 // Pad Q/K/V 0,8; 0 -> smem swizzle, > 0 -> padding
+  const int kPadV                  // Pad Q/K/V 0,8; 0 -> smem swizzle, > 0 -> padding
+>
+__global__ void ffpa_mma_stages_split_q_L1_template(half* Q, half* K, half* V, half* O, ...);
+```
+
 ## 📖 Prerequisites
 <div id="prerequisites"></div>
 
