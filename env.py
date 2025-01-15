@@ -34,7 +34,7 @@ class ENV(object):
 
     # Enable force Q@K^T use fp16 as MMA Acc dtype for FFPA Acc F32 kernels, default False.
     # FFPA Acc F32 kernels MMA Acc = Mixed Q@K^T MMA Acc F16 + P@V MMA Acc F32.
-    ENABLE_FFPA_FORCE_OK_F16 = bool(int(os.environ.get("ENABLE_FFPA_FORCE_OK_F16", 0)))
+    ENABLE_FFPA_FORCE_QK_F16 = bool(int(os.environ.get("ENABLE_FFPA_FORCE_QK_F16", 0)))
 
     # Enable force P@V use fp16 as MMA Acc dtype, for FFPA Acc F32 kernels, default False.
     # FFPA Acc F32 kernels MMA Acc = Mixed Q@K^T MMA Acc F32 + P@V MMA Acc F16.
@@ -103,7 +103,7 @@ class ENV(object):
 
     @classmethod
     def enable_force_qk_fp16(cls):
-        return cls.ENABLE_FFPA_FORCE_OK_F16
+        return cls.ENABLE_FFPA_FORCE_QK_F16
 
     @classmethod
     def enable_prefetch_qkv(cls):
@@ -135,7 +135,7 @@ class ENV(object):
         if cls.enable_all_headdim():
             extra_env_cflags.append("-DENABLE_FFPA_ALL_HEADDIM")
         if cls.enable_force_qk_fp16():
-            extra_env_cflags.append("-DENABLE_FFPA_FORCE_OK_F16")
+            extra_env_cflags.append("-DENABLE_FFPA_FORCE_QK_F16")
         if cls.enable_force_pv_fp16():
             extra_env_cflags.append("-DENABLE_FFPA_FORCE_PV_F16")
         if cls.enable_prefetch_qkv():
