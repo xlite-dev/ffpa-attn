@@ -105,11 +105,10 @@ template<
   const int kStageQK,              // <= 4, may apply different multi stages policy for QK and V (<=4)
   const int kStagePV,              // <= 4, may apply different multi stages policy for QK and V (<=4)
   const int kPadQ,                 // Pad Q/K/V 0,8; 0 -> smem swizzle, > 0 -> padding
-  const int kPadK,             
-  const int kPadV             
+  const int kPadK,                 // Pad Q/K/V 0,8; 0 -> smem swizzle, > 0 -> padding
+  const int kPadV                  // Pad Q/K/V 0,8; 0 -> smem swizzle, > 0 -> padding
 >
-__global__ void
-ffpa_mma_stages_split_q_L1_template(half* Q, half* K, half* V, half* O, ...);
+__global__ void ffpa_mma_stages_split_q_L1_template(half* Q, half* K, half* V, half* O, ...);
 ```
 
 ## 📖 Prerequisites
