@@ -34,7 +34,13 @@ void launch_ffpa_mma_acc_f16_L1(
   // Thus, if the error does not exceed 1e-3, using FP16 storage is 
   // sufficient for most applications.
   constexpr int kOStorageAccFloat32 = (kHeadDim < 256) ? 1 : 0;
-  // Prefetch QKV at the Appropriate Time Point. 
+  // Persist load Q s2r for headdim < 512, but still keep O(1) SRAM.
+#ifdef ENABLE_FFPA_PERSIST_Q_S2R
+  const int kPersistQs2r = 1;
+#else
+  const int kPersistQs2r = 0;
+#endif
+  // Prefetch QKV at the appropriate time point. 
 #ifdef ENABLE_FFPA_PREFETCH_QKV
   constexpr int kPrefetchQK = (kStageQK > 1) ? 1 : 0; 
   constexpr int kPrefetchPV = (kStagePV > 1) ? 1 : 0; 
@@ -105,6 +111,7 @@ void launch_ffpa_mma_acc_f16_L1(
       kPrefetchQK,
       kPrefetchPV,
       kShareSmemQKV,
+      kPersistQs2r,
       kStageQK, 
       kStagePV,
       kPadQ,
@@ -134,6 +141,7 @@ void launch_ffpa_mma_acc_f16_L1(
     kPrefetchQK,
     kPrefetchPV,
     kShareSmemQKV,
+    kPersistQs2r,
     kStageQK, 
     kStagePV,
     kPadQ,
