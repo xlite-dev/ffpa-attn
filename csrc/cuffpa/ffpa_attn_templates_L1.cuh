@@ -23,7 +23,8 @@ template<
   const int kPrefetchQK,           // Prefetch QK at the Appropriate Time Point. 
   const int kPrefetchPV,           // Prefetch V at the Appropriate Time Point. 
   const int kShareSmemQKV,         // QKV share the same shared memory, reuse QK smem for V.
-  const int kPersistQs2r,          // Persist load Q s2r for headdim < 512, but still keep O(1) SRAM.
+  const int kPersistQs2r,          // Persist load Q s2r for headdim < 512, more registers, but still keep O(1) SRAM.
+  const int kPersistQg2s,          // Persist load Q g2s for headdim < 512, more SRAM, but still keep register usage.
   const int kStageQK,              // <= 4, may apply different multi stages policy for QK and V (<=4)
   const int kStagePV,              // <= 4, may apply different multi stages policy for QK and V (<=4)
   const int kPadQ,                 // Pad Q/K/V 0,8; 0 -> smem swizzle, > 0 -> padding
@@ -43,7 +44,7 @@ ffpa_mma_stages_split_q_L1_template(half* Q,
     kMmaTileSeqLenP, kMmaTileHeadDimV, kWarpTileSeqLenQ, kWarpTileSeqLenK, 
     kWarpTileSeqLenP, kWarpTileHeadDimV, kMmaAccFloat32QK, kMmaAccFloat32PV,
     kOStorageAccFloat32, kPrefetchQK, kPrefetchPV, kShareSmemQKV, kPersistQs2r, 
-    kStageQK, kStagePV, kPadQ, kPadK, kPadV
+    kPersistQg2s, kStageQK, kStagePV, kPadQ, kPadK, kPadV
   >();
   constexpr int Br = kMmaAtomM * kMmaTileSeqLenQ * kWarpTileSeqLenQ;
   constexpr int Bc = kMmaAtomN * kMmaTileSeqLenK * kWarpTileSeqLenK;
@@ -74,7 +75,10 @@ ffpa_mma_stages_split_q_L1_template(half* Q,
   constexpr int K_tile_size = Bc * (kMmaAtomK     + kPadK); // K[Bc,16]
   constexpr int V_tile_size = Bc * (kMmaAtomN * 2 + kPadV); // V[Bc,16]
   half* Q_tile_smem = smem; 
-  half* K_tile_smem = Q_tile_smem + kStageQK * Q_tile_size; 
+  half* K_tile_smem = (
+    Q_tile_smem + (kPersistQg2s ? ((kHeadDim / kMmaAtomK) * Q_tile_size) : 
+                   (kStageQK * Q_tile_size))
+  ); // kPersistQg2s -> e.g d=64, Q smem [4][Br][16] [tile_K_d][Br][16]
   // V may reuse all Q+K smem after Q@K^T.
   half* V_tile_smem = (kShareSmemQKV ? Q_tile_smem : 
                        K_tile_smem + kStageQK * K_tile_size); 
@@ -91,7 +95,8 @@ ffpa_mma_stages_split_q_L1_template(half* Q,
 
   // ---------------------- Registers for S=Q@K^T/O=P@V ----------------------------
   // e.g, 64, !kPersistQs2r -> [1][4] 4 regs, kPersistQs2r -> [1][4*4] 16 regs.
-  uint32_t R_Q[kWarpTileSeqLenQ][(kPersistQs2r) ? (kHeadDim / kMmaAtomK) * 4 : 4]; 
+  uint32_t R_Q[kWarpTileSeqLenQ][
+    (kPersistQg2s) ? 4: ((kPersistQs2r) ? (kHeadDim / kMmaAtomK) * 4 : 4)]; 
   uint32_t R_K[kWarpTileSeqLenK][2]; // [8][2]
   uint32_t R_V[2]; // [2], S=Q@K, only use 2 32bits registers.
   // e.g [1][8][2], MMA Acc fp16; [1][8][4], MMA Acc fp32; 
@@ -100,6 +105,22 @@ ffpa_mma_stages_split_q_L1_template(half* Q,
   uint32_t R_D[kWarpTileSeqLenP][kWarpTileHeadDimV][(kOStorageAccFloat32) ? 4 : 2]; 
   utils::fill_3D_regs<uint32_t, kWarpTileSeqLenP, kWarpTileHeadDimV, 
                       ((kOStorageAccFloat32) ? 4 : 2)>(R_D, 0);
+
+  // load Q g2s at very beginning if kPersistQg2s is enabled.
+  if constexpr (kPersistQg2s) {
+    #pragma unroll
+    for (int tile_K_d = 0; tile_K_d < (kHeadDim / kMmaAtomK); ++tile_K_d) {
+      prefill::cp_async_qkv_g2s<
+        Br, Q_tile_size, kHeadDim, kMmaAtomK, kNumThreads, kPadQ>(
+          smem_Q_base_ptr, Q, Q_gmem_offset, Q_tile_id, 
+          tile_K_d, tile_K_d
+      );
+      cp_async::commit_group();
+    }
+    // Must wait Q g2s ready
+    cp_async::wait_group<0>();
+    __syncthreads();
+  }
   
   // <loop over K seqlen>: for K^T[d,seqlen] with K^T_tile[d,Bc]
   #pragma unroll 1
@@ -110,11 +131,13 @@ ffpa_mma_stages_split_q_L1_template(half* Q,
         if (tile_K_seqlen == 0) {
           #pragma unroll
           for (int stage = 0; stage < (kStageQK - 1); ++stage) {
-            prefill::cp_async_qkv_g2s<
-              Br, Q_tile_size, kHeadDim, kMmaAtomK, kNumThreads, kPadQ>(
-                smem_Q_base_ptr, Q, Q_gmem_offset, Q_tile_id, stage, stage
-            );
-
+            if constexpr (!kPersistQg2s) {
+              prefill::cp_async_qkv_g2s<
+                Br, Q_tile_size, kHeadDim, kMmaAtomK, kNumThreads, kPadQ>(
+                  smem_Q_base_ptr, Q, Q_gmem_offset, Q_tile_id, stage, stage
+              );
+            }
+            
             prefill::cp_async_qkv_g2s<
               Bc, K_tile_size, kHeadDim, kMmaAtomK, kNumThreads, kPadK>(
                 smem_K_base_ptr, K, K_gmem_offset, tile_K_seqlen, stage, stage
@@ -141,10 +164,12 @@ ffpa_mma_stages_split_q_L1_template(half* Q,
               );
             }
           } else {
-            prefill::cp_async_qkv_g2s<
-              Br, Q_tile_size, kHeadDim, kMmaAtomK, kNumThreads, kPadQ>(
-                smem_Q_base_ptr, Q, Q_gmem_offset, Q_tile_id, stage, stage
-            );
+            if constexpr (!kPersistQg2s) {
+              prefill::cp_async_qkv_g2s<
+                Br, Q_tile_size, kHeadDim, kMmaAtomK, kNumThreads, kPadQ>(
+                  smem_Q_base_ptr, Q, Q_gmem_offset, Q_tile_id, stage, stage
+              );
+            }
           }
           
           prefill::cp_async_qkv_g2s<
@@ -192,12 +217,14 @@ ffpa_mma_stages_split_q_L1_template(half* Q,
           );
         }
       } else {
-        prefill::cp_async_qkv_g2s<
-          Br, Q_tile_size, kHeadDim, kMmaAtomK, kNumThreads, kPadQ>(
-            smem_Q_base_ptr, Q, Q_gmem_offset, Q_tile_id, 
-            (kStageQK > 1) ? (tile_K_d + (kStageQK - 1)) : tile_K_d, 
-            (kStageQK > 1) ? smem_sel_next : smem_sel
-        );
+        if constexpr (!kPersistQg2s) {
+          prefill::cp_async_qkv_g2s<
+            Br, Q_tile_size, kHeadDim, kMmaAtomK, kNumThreads, kPadQ>(
+              smem_Q_base_ptr, Q, Q_gmem_offset, Q_tile_id, 
+              (kStageQK > 1) ? (tile_K_d + (kStageQK - 1)) : tile_K_d, 
+              (kStageQK > 1) ? smem_sel_next : smem_sel
+          );
+        }
       }
       
       prefill::cp_async_qkv_g2s<
@@ -225,10 +252,17 @@ ffpa_mma_stages_split_q_L1_template(half* Q,
             );
           }
         } else {
-          prefill::sync_fetch_qkv_frags_s2r<
-            0, 4, Q_tile_size, kMmaAtomM, kMmaAtomN, kMmaAtomK, kPadQ>(
-              smem_Q_base_ptr, &R_Q[0][0], warp_QP, 0, 0, smem_sel
-          );
+          if constexpr (!kPersistQg2s) {
+            prefill::sync_fetch_qkv_frags_s2r<
+              0, 4, Q_tile_size, kMmaAtomM, kMmaAtomN, kMmaAtomK, kPadQ>(
+                smem_Q_base_ptr, &R_Q[0][0], warp_QP, 0, 0, smem_sel
+            );
+          } else {
+            prefill::sync_fetch_qkv_frags_s2r<
+              0, 4, Q_tile_size, kMmaAtomM, kMmaAtomN, kMmaAtomK, kPadQ>(
+                smem_Q_base_ptr, &R_Q[0][0], warp_QP, 0, 0, tile_K_d
+            );
+          }
         }
       }
 
