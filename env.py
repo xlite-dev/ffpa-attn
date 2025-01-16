@@ -78,6 +78,11 @@ class ENV(object):
         int(os.environ.get("ENABLE_FFPA_PERSIST_Q_S2R", 0))
     )
 
+    # Persist load Q g2s for headdim < 512, more SRAM, but still keep register usage.
+    ENABLE_FFPA_PERSIST_Q_G2S = bool(
+        int(os.environ.get("ENABLE_FFPA_PERSIST_Q_G2S", 0))
+    )
+
     @classmethod
     def project_dir(cls):
         return cls.PROJECT_DIR
@@ -137,6 +142,10 @@ class ENV(object):
     @classmethod
     def enable_persist_q_s2r(cls):
         return cls.ENABLE_FFPA_PERSIST_Q_S2R
+    
+    @classmethod
+    def enable_persist_q_g2s(cls):
+        return cls.ENABLE_FFPA_PERSIST_Q_G2S
 
     @classmethod
     def env_cuda_cflags(cls):
@@ -163,6 +172,14 @@ class ENV(object):
             extra_env_cflags.append("-DENABLE_FFPA_SMEM_SWIZZLE_V")
         if cls.enable_persist_q_s2r():
             extra_env_cflags.append("-DENABLE_FFPA_PERSIST_Q_S2R")
+        if cls.enable_persist_q_g2s():
+            extra_env_cflags.append("-DENABLE_FFPA_PERSIST_Q_G2S")
+        assert not all(
+            (cls.enable_persist_q_s2r(), cls.enable_persist_q_g2s())
+        ), "PERSIST_Q_G2S and PERSIST_Q_S2R can not both enabled."
+        assert not all(
+            (cls.enable_qkv_smem_share(), cls.enable_persist_q_g2s())
+        ), "PERSIST_Q_G2S and QKV_SMEM_SHARE can not both enabled."
         return extra_env_cflags
 
     @classmethod
@@ -188,6 +205,7 @@ class ENV(object):
         formatenv("ENABLE_FFPA_FORCE_QK_F16", cls.enable_force_qk_fp16())
         formatenv("ENABLE_FFPA_FORCE_PV_F16", cls.enable_force_pv_fp16())
         formatenv("ENABLE_FFPA_PERSIST_Q_S2R", cls.enable_persist_q_s2r())
+        formatenv("ENABLE_FFPA_PERSIST_Q_G2S", cls.enable_persist_q_g2s())
         formatenv("ENABLE_FFPA_QKV_SMEM_SHARE", cls.enable_qkv_smem_share())
         formatenv("ENABLE_FFPA_SMEM_SWIZZLE_Q", cls.enable_smem_swizzle_q())
         formatenv("ENABLE_FFPA_SMEM_SWIZZLE_K", cls.enable_smem_swizzle_k())
