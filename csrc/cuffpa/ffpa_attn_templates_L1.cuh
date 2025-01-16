@@ -23,11 +23,12 @@ template<
   const int kPrefetchQK,           // Prefetch QK at the Appropriate Time Point. 
   const int kPrefetchPV,           // Prefetch V at the Appropriate Time Point. 
   const int kShareSmemQKV,         // QKV share the same shared memory, reuse QK smem for V.
+  const int kPersistQs2r,          // Persist load Q s2r for headdim < 512, but still keep O(1) SRAM.
   const int kStageQK,              // <= 4, may apply different multi stages policy for QK and V (<=4)
   const int kStagePV,              // <= 4, may apply different multi stages policy for QK and V (<=4)
   const int kPadQ,                 // Pad Q/K/V 0,8; 0 -> smem swizzle, > 0 -> padding
-  const int kPadK,             
-  const int kPadV             
+  const int kPadK,
+  const int kPadV            
 >
 __global__ void __launch_bounds__(
   WARP_SIZE * kMmaTileSeqLenQ * kMmaTileSeqLenK) 
@@ -41,8 +42,8 @@ ffpa_mma_stages_split_q_L1_template(half* Q,
     kHeadDim, kMmaAtomM, kMmaAtomN, kMmaAtomK, kMmaTileSeqLenQ, kMmaTileSeqLenK, 
     kMmaTileSeqLenP, kMmaTileHeadDimV, kWarpTileSeqLenQ, kWarpTileSeqLenK, 
     kWarpTileSeqLenP, kWarpTileHeadDimV, kMmaAccFloat32QK, kMmaAccFloat32PV,
-    kOStorageAccFloat32, kPrefetchQK, kPrefetchPV, kShareSmemQKV, kStageQK, 
-    kStagePV, kPadQ, kPadK, kPadV
+    kOStorageAccFloat32, kPrefetchQK, kPrefetchPV, kShareSmemQKV, kPersistQs2r, 
+    kStageQK, kStagePV, kPadQ, kPadK, kPadV
   >();
   constexpr int Br = kMmaAtomM * kMmaTileSeqLenQ * kWarpTileSeqLenQ;
   constexpr int Bc = kMmaAtomN * kMmaTileSeqLenK * kWarpTileSeqLenK;
@@ -89,7 +90,8 @@ ffpa_mma_stages_split_q_L1_template(half* Q,
   utils::fill_2D_regs<float, kWarpTileSeqLenQ, 2>(lane_block_row_sum_old, 0.0f);
 
   // ---------------------- Registers for S=Q@K^T/O=P@V ----------------------------
-  uint32_t R_Q[kWarpTileSeqLenQ][4]; // [1][4]
+  // e.g, 64, !kPersistQs2r -> [1][4] 4 regs, kPersistQs2r -> [1][4*4] 16 regs.
+  uint32_t R_Q[kWarpTileSeqLenQ][(kPersistQs2r) ? (kHeadDim / kMmaAtomK) * 4 : 4]; 
   uint32_t R_K[kWarpTileSeqLenK][2]; // [8][2]
   uint32_t R_V[2]; // [2], S=Q@K, only use 2 32bits registers.
   // e.g [1][8][2], MMA Acc fp16; [1][8][4], MMA Acc fp32; 
@@ -130,11 +132,21 @@ ffpa_mma_stages_split_q_L1_template(half* Q,
       if constexpr (kStageQK > 1) {
         #pragma unroll
         for (int stage = 0; stage < (kStageQK - 1); ++stage) {
-          prefill::cp_async_qkv_g2s<
-            Br, Q_tile_size, kHeadDim, kMmaAtomK, kNumThreads, kPadQ>(
-              smem_Q_base_ptr, Q, Q_gmem_offset, Q_tile_id, stage, stage
-          );
-
+          if constexpr (kPersistQs2r) {
+            // We only load Q g2s and s2r once if kPersistQs2r is enabled.
+            if (tile_K_seqlen == 0) {
+              prefill::cp_async_qkv_g2s<
+                Br, Q_tile_size, kHeadDim, kMmaAtomK, kNumThreads, kPadQ>(
+                  smem_Q_base_ptr, Q, Q_gmem_offset, Q_tile_id, stage, stage
+              );
+            }
+          } else {
+            prefill::cp_async_qkv_g2s<
+              Br, Q_tile_size, kHeadDim, kMmaAtomK, kNumThreads, kPadQ>(
+                smem_Q_base_ptr, Q, Q_gmem_offset, Q_tile_id, stage, stage
+            );
+          }
+          
           prefill::cp_async_qkv_g2s<
             Bc, K_tile_size, kHeadDim, kMmaAtomK, kNumThreads, kPadK>(
               smem_K_base_ptr, K, K_gmem_offset, tile_K_seqlen, stage, stage
@@ -168,14 +180,26 @@ ffpa_mma_stages_split_q_L1_template(half* Q,
     for (int tile_K_d = 0; tile_K_d < (kHeadDim / kMmaAtomK); ++tile_K_d) {
       const int smem_sel      = (tile_K_d) % kStageQK;   
       const int smem_sel_next = (tile_K_d + (kStageQK - 1)) % kStageQK;
-      // QK g2s
-      prefill::cp_async_qkv_g2s<
-        Br, Q_tile_size, kHeadDim, kMmaAtomK, kNumThreads, kPadQ>(
-          smem_Q_base_ptr, Q, Q_gmem_offset, Q_tile_id, 
-          (kStageQK > 1) ? (tile_K_d + (kStageQK - 1)) : tile_K_d, 
-          (kStageQK > 1) ? smem_sel_next : smem_sel
-      );
-
+      // QK g2s, kPersistQs2r or not.
+      if constexpr (kPersistQs2r) {
+        // We only load Q g2s and s2r once if kPersistQs2r is enabled.
+        if (tile_K_seqlen == 0) {
+          prefill::cp_async_qkv_g2s<
+            Br, Q_tile_size, kHeadDim, kMmaAtomK, kNumThreads, kPadQ>(
+              smem_Q_base_ptr, Q, Q_gmem_offset, Q_tile_id, 
+              (kStageQK > 1) ? (tile_K_d + (kStageQK - 1)) : tile_K_d, 
+              (kStageQK > 1) ? smem_sel_next : smem_sel
+          );
+        }
+      } else {
+        prefill::cp_async_qkv_g2s<
+          Br, Q_tile_size, kHeadDim, kMmaAtomK, kNumThreads, kPadQ>(
+            smem_Q_base_ptr, Q, Q_gmem_offset, Q_tile_id, 
+            (kStageQK > 1) ? (tile_K_d + (kStageQK - 1)) : tile_K_d, 
+            (kStageQK > 1) ? smem_sel_next : smem_sel
+        );
+      }
+      
       prefill::cp_async_qkv_g2s<
         Bc, K_tile_size, kHeadDim, kMmaAtomK, kNumThreads, kPadK>(
           smem_K_base_ptr, K, K_gmem_offset, tile_K_seqlen, 
@@ -192,10 +216,20 @@ ffpa_mma_stages_split_q_L1_template(half* Q,
       // QK s2r
       static_assert(kWarpTileSeqLenQ == 1);
       {
-        prefill::sync_fetch_qkv_frags_s2r<
-          0, 4, Q_tile_size, kMmaAtomM, kMmaAtomN, kMmaAtomK, kPadQ>(
-            smem_Q_base_ptr, &R_Q[0][0], warp_QP, 0, 0, smem_sel
-        );
+        if constexpr (kPersistQs2r) {
+          // We only load Q g2s and s2r once if kPersistQs2r is enabled.
+          if (tile_K_seqlen == 0) {
+            prefill::sync_fetch_qkv_frags_s2r<
+              0, 4, Q_tile_size, kMmaAtomM, kMmaAtomN, kMmaAtomK, kPadQ>(
+                smem_Q_base_ptr, &R_Q[0][tile_K_d * 4], warp_QP, 0, 0, smem_sel
+            );
+          }
+        } else {
+          prefill::sync_fetch_qkv_frags_s2r<
+            0, 4, Q_tile_size, kMmaAtomM, kMmaAtomN, kMmaAtomK, kPadQ>(
+              smem_Q_base_ptr, &R_Q[0][0], warp_QP, 0, 0, smem_sel
+          );
+        }
       }
 
       #pragma unroll
@@ -230,24 +264,25 @@ ffpa_mma_stages_split_q_L1_template(half* Q,
       // Q@K^T MMA compute
       static_assert(kWarpTileSeqLenQ == 1);
       { // kWarpTileSeqLenQ = 1
+        const int q_offset = (kPersistQs2r) ? (tile_K_d << 2) : 0; // (tile_K_d * 4)
         #pragma unroll
-        for (int j = 0; j < kWarpTileSeqLenK; ++j) { // 8, 16, 32, ...
+        for (int j = 0; j < kWarpTileSeqLenK; ++j) {
           if constexpr (kMmaAccFloat32QK) {
-            // MMA accumulate with F32 dtype for high precision.
             mma::m16n8k16_f16f16f32<MMAMode::kInplaceUpdate>(
               &R_S[0][j][0], &R_S[0][j][1], &R_S[0][j][2], &R_S[0][j][3],
-              &R_Q[0][0],    &R_Q[0][1],    &R_Q[0][2],    &R_Q[0][3], 
+              &R_Q[0][q_offset + 0],    &R_Q[0][q_offset + 1],    
+              &R_Q[0][q_offset + 2],    &R_Q[0][q_offset + 3], 
               &R_K[j][0],    &R_K[j][1]
             );
           } else {
-            // MMA accumulate with F16 dtype for high throughput.
             mma::m16n8k16_f16f16f16<MMAMode::kInplaceUpdate>(
               &R_S[0][j][0], &R_S[0][j][1],
-              &R_Q[0][0],    &R_Q[0][1],    &R_Q[0][2],    &R_Q[0][3], 
+              &R_Q[0][q_offset + 0],    &R_Q[0][q_offset + 1],    
+              &R_Q[0][q_offset + 2],    &R_Q[0][q_offset + 3], 
               &R_K[j][0],    &R_K[j][1]
             );
           }
-        } // end for kWarpTileSeqLenK
+        }
       }
 
       if constexpr (kStageQK > 1) {
@@ -297,10 +332,14 @@ ffpa_mma_stages_split_q_L1_template(half* Q,
       if ((tile_K_seqlen + 1) < Tc) {
         #pragma unroll
         for (int stage = 0; stage < (kStageQK - 1); ++stage) {
-          prefill::cp_async_qkv_g2s<
-            Br, Q_tile_size, kHeadDim, kMmaAtomK, kNumThreads, kPadQ>(
-              smem_Q_base_ptr, Q, Q_gmem_offset, Q_tile_id, stage, stage
-          );
+          // We do not need to load Q g2s & s2r while tile_K_seqlen > 0, 
+          // if kPersistQs2r is enabled.
+          if constexpr (!kPersistQs2r) {
+            prefill::cp_async_qkv_g2s<
+              Br, Q_tile_size, kHeadDim, kMmaAtomK, kNumThreads, kPadQ>(
+                smem_Q_base_ptr, Q, Q_gmem_offset, Q_tile_id, stage, stage
+            );
+          }
 
           prefill::cp_async_qkv_g2s<
             Bc, K_tile_size, kHeadDim, kMmaAtomK, kNumThreads, kPadK>(
@@ -360,10 +399,14 @@ ffpa_mma_stages_split_q_L1_template(half* Q,
               if constexpr (kStageQK > 1) {
                 #pragma unroll
                 for (int stage = 0; stage < (kStageQK - 1); ++stage) {
-                  prefill::cp_async_qkv_g2s<
-                    Br, Q_tile_size, kHeadDim, kMmaAtomK, kNumThreads, kPadQ>(
-                      smem_Q_base_ptr, Q, Q_gmem_offset, Q_tile_id, stage, stage
-                  );
+                  // We do not need to load Q g2s & s2r while tile_K_seqlen > 0, 
+                  // if kPersistQs2r is enabled.
+                  if constexpr (!kPersistQs2r) {
+                    prefill::cp_async_qkv_g2s<
+                      Br, Q_tile_size, kHeadDim, kMmaAtomK, kNumThreads, kPadQ>(
+                        smem_Q_base_ptr, Q, Q_gmem_offset, Q_tile_id, stage, stage
+                    );
+                  }
 
                   prefill::cp_async_qkv_g2s<
                     Bc, K_tile_size, kHeadDim, kMmaAtomK, kNumThreads, kPadK>(
@@ -376,19 +419,21 @@ ffpa_mma_stages_split_q_L1_template(half* Q,
           } // end if kPrefetchQKV && kStageQK > 1
 
           // Compute P[Br,Bc]@V[Bc,d] = O[Br,d] 
-          const int w = tile_V_Bc * 2; // MMA(Warp) selected, 0, 2, 4, 6
+          const int p_offset = tile_V_Bc * 2; // MMA(Warp) selected, 0, 2, 4, 6
           if constexpr (kMmaAccFloat32PV) {
             // MMA accumulate with F32 dtype for high precision.
             mma::m16n8k16_f16f16f32<MMAMode::kInplaceUpdate>(
               &R_O[0], &R_O[1], &R_O[2], &R_O[3],
-              &R_S[0][w][0], &R_S[0][w][1], &R_S[0][w + 1][0],  &R_S[0][w + 1][1], 
+              &R_S[0][p_offset][0],      &R_S[0][p_offset][1], 
+              &R_S[0][p_offset + 1][0],  &R_S[0][p_offset + 1][1], 
               &R_V[0], &R_V[1]
             ); 
           } else {
             // MMA accumulate with F16 dtype for high throughput.
             mma::m16n8k16_f16f16f16<MMAMode::kInplaceUpdate>(
               &R_O[0], &R_O[1],
-              &R_S[0][w][0], &R_S[0][w][1], &R_S[0][w + 1][0],  &R_S[0][w + 1][1], 
+              &R_S[0][p_offset][0],      &R_S[0][p_offset][1], 
+              &R_S[0][p_offset + 1][0],  &R_S[0][p_offset + 1][1], 
               &R_V[0], &R_V[1]
             ); 
           }
