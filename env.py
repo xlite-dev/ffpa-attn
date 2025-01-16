@@ -69,10 +69,10 @@ class ENV(object):
         int(os.environ.get("ENABLE_FFPA_SMEM_SWIZZLE_V", 1))
     )
 
-    # Persist load Q from s2r for headdim < 512 to reduce Q from g2s and s2r IO access, 
-    # but still keep O(1) SRAM complexity. Default value is False. This option will 
-    # introduce more registers for Q frags as the headdim becomes larger. We should 
-    # choose to enable it or not according to the balance between register usage and 
+    # Persist load Q from s2r for headdim < 512 to reduce Q from g2s and s2r IO access,
+    # but still keep O(1) SRAM complexity. Default value is False. This option will
+    # introduce more registers for Q frags as the headdim becomes larger. We should
+    # choose to enable it or not according to the balance between register usage and
     # IO access reduction.
     ENABLE_FFPA_PERSIST_Q_S2R = bool(
         int(os.environ.get("ENABLE_FFPA_PERSIST_Q_S2R", 0))
@@ -133,7 +133,7 @@ class ENV(object):
     @classmethod
     def enable_smem_swizzle_v(cls):
         return cls.ENABLE_FFPA_SMEM_SWIZZLE_V
-    
+
     @classmethod
     def enable_persist_q_s2r(cls):
         return cls.ENABLE_FFPA_PERSIST_Q_S2R
@@ -187,11 +187,11 @@ class ENV(object):
         formatenv("ENABLE_FFPA_PREFETCH_QKV", cls.enable_prefetch_qkv())
         formatenv("ENABLE_FFPA_FORCE_QK_F16", cls.enable_force_qk_fp16())
         formatenv("ENABLE_FFPA_FORCE_PV_F16", cls.enable_force_pv_fp16())
+        formatenv("ENABLE_FFPA_PERSIST_Q_S2R", cls.enable_persist_q_s2r())
         formatenv("ENABLE_FFPA_QKV_SMEM_SHARE", cls.enable_qkv_smem_share())
         formatenv("ENABLE_FFPA_SMEM_SWIZZLE_Q", cls.enable_smem_swizzle_q())
         formatenv("ENABLE_FFPA_SMEM_SWIZZLE_K", cls.enable_smem_swizzle_k())
         formatenv("ENABLE_FFPA_SMEM_SWIZZLE_V", cls.enable_smem_swizzle_v())
-        formatenv("ENABLE_FFPA_PERSIST_Q_S2R", cls.enable_persist_q_s2r())
         pretty_print_line()
 
     @staticmethod
