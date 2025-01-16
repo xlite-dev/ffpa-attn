@@ -2,7 +2,7 @@
 
 <div align="center">
   <p align="center">
-    <h2>🤖 FFPA: Yet antother Faster Flash Prefill Attention for large headdim 🐑</h3>
+    <h3>🤖 FFPA: Yet antother Faster Flash Prefill Attention for large headdim 🐑</h3>
   </p>
   <img src=https://github.com/user-attachments/assets/1312aba0-4707-4fcb-84dc-59c57347b23f width=250 >
   <div align='center'>
