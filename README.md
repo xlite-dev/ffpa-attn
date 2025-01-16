@@ -102,13 +102,14 @@ template<
   const int kPrefetchQK,           // Prefetch QK at the Appropriate Time Point. 
   const int kPrefetchPV,           // Prefetch V at the Appropriate Time Point. 
   const int kShareSmemQKV,         // QKV share the same shared memory, reuse QK smem for V.
+  const int kPersistQs2r,          // Persist load Q s2r for headdim < 512, but still keep O(1) SRAM.
   const int kStageQK,              // <= 4, may apply different multi stages policy for QK and V (<=4)
   const int kStagePV,              // <= 4, may apply different multi stages policy for QK and V (<=4)
   const int kPadQ,                 // Pad Q/K/V 0,8; 0 -> smem swizzle, > 0 -> padding
   const int kPadK,                 // Pad Q/K/V 0,8; 0 -> smem swizzle, > 0 -> padding
   const int kPadV                  // Pad Q/K/V 0,8; 0 -> smem swizzle, > 0 -> padding
->
-__global__ void ffpa_mma_stages_split_q_L1_template(half* Q, half* K, half* V, half* O, ...);
+> __global__ void // Q, K, V, O -> [B, H, N, D]
+ffpa_mma_stages_split_q_L1_template(half* Q, half* K, half* V, half* O, ...);
 ```
 
 ## 📖 Prerequisites
