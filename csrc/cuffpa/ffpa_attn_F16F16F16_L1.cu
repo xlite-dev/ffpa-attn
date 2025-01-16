@@ -34,11 +34,21 @@ void launch_ffpa_mma_acc_f16_L1(
   // Thus, if the error does not exceed 1e-3, using FP16 storage is 
   // sufficient for most applications.
   constexpr int kOStorageAccFloat32 = (kHeadDim < 256) ? 1 : 0;
-  // Persist load Q s2r for headdim < 512, but still keep O(1) SRAM.
+  // Persist load Q s2r for headdim < 512, more registers, 
+  // but still keep O(1) SRAM.
 #ifdef ENABLE_FFPA_PERSIST_Q_S2R
   const int kPersistQs2r = 1;
 #else
   const int kPersistQs2r = 0;
+#endif
+  // Persist load Q g2s for headdim < 512, more SRAM, but still
+  // keep register usage.
+#ifdef ENABLE_FFPA_PERSIST_Q_G2S
+  const int kPersistQg2s = (kHeadDim < 256) ? 1 : (
+    (kHeadDim <= 320) ? ((kStageQK < 3) ? 1 : 0) : 0 
+  );
+#else
+  const int kPersistQg2s = 0;
 #endif
   // Prefetch QKV at the appropriate time point. 
 #ifdef ENABLE_FFPA_PREFETCH_QKV
@@ -66,8 +76,11 @@ void launch_ffpa_mma_acc_f16_L1(
 #endif
 
   // Calculate SRAM size needed per block, Q,K,V smem size, V shared the QK smem.
-  constexpr int QK_smem_size = (kStageQK * (Br * (kMmaAtomK + kPadQ)) + 
-                                kStageQK * (Bc * (kMmaAtomK + kPadK)));
+  constexpr int QK_smem_size = (
+    (kPersistQg2s ? (kHeadDim / kMmaAtomK) : kStageQK) * // Q
+    (Br * (kMmaAtomK + kPadQ)) + 
+    (kStageQK) * (Bc * (kMmaAtomK + kPadK))  // K
+  );
   // R_D registers, s=2, d=64, 16 regs; d=128, 32 regs; 
   // d=256, 64 regs; d=512, 128 regs; d=1024, 256 regs;
   constexpr int PV_smem_size = (kStagePV * (Bc * (kMmaAtomN * 2 + kPadV))); 
@@ -112,6 +125,7 @@ void launch_ffpa_mma_acc_f16_L1(
       kPrefetchPV,
       kShareSmemQKV,
       kPersistQs2r,
+      kPersistQg2s,
       kStageQK, 
       kStagePV,
       kPadQ,
@@ -142,6 +156,7 @@ void launch_ffpa_mma_acc_f16_L1(
     kPrefetchPV,
     kShareSmemQKV,
     kPersistQs2r,
+    kPersistQg2s,
     kStageQK, 
     kStagePV,
     kPadQ,
