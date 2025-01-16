@@ -69,6 +69,15 @@ class ENV(object):
         int(os.environ.get("ENABLE_FFPA_SMEM_SWIZZLE_V", 1))
     )
 
+    # Persist load Q from s2r for headdim < 512 to reduce Q from g2s and s2r IO access, 
+    # but still keep O(1) SRAM complexity. Default value is False. This option will 
+    # introduce more registers for Q frags as the headdim becomes larger. We should 
+    # choose to enable it or not according to the balance between register usage and 
+    # IO access reduction.
+    ENABLE_FFPA_PERSIST_Q_S2R = bool(
+        int(os.environ.get("ENABLE_FFPA_PERSIST_Q_S2R", 0))
+    )
+
     @classmethod
     def project_dir(cls):
         return cls.PROJECT_DIR
@@ -124,6 +133,10 @@ class ENV(object):
     @classmethod
     def enable_smem_swizzle_v(cls):
         return cls.ENABLE_FFPA_SMEM_SWIZZLE_V
+    
+    @classmethod
+    def enable_persist_q_s2r(cls):
+        return cls.ENABLE_FFPA_PERSIST_Q_S2R
 
     @classmethod
     def env_cuda_cflags(cls):
@@ -148,6 +161,8 @@ class ENV(object):
             extra_env_cflags.append("-DENABLE_FFPA_SMEM_SWIZZLE_K")
         if cls.enable_smem_swizzle_v():
             extra_env_cflags.append("-DENABLE_FFPA_SMEM_SWIZZLE_V")
+        if cls.enable_persist_q_s2r():
+            extra_env_cflags.append("-DENABLE_FFPA_PERSIST_Q_S2R")
         return extra_env_cflags
 
     @classmethod
@@ -176,6 +191,7 @@ class ENV(object):
         formatenv("ENABLE_FFPA_SMEM_SWIZZLE_Q", cls.enable_smem_swizzle_q())
         formatenv("ENABLE_FFPA_SMEM_SWIZZLE_K", cls.enable_smem_swizzle_k())
         formatenv("ENABLE_FFPA_SMEM_SWIZZLE_V", cls.enable_smem_swizzle_v())
+        formatenv("ENABLE_FFPA_PERSIST_Q_S2R", cls.enable_persist_q_s2r())
         pretty_print_line()
 
     @staticmethod
