@@ -7,8 +7,8 @@
 
 namespace ffpa {
 namespace prefill {
-
 // prefill utils: prefetch/load QKV g2s funcs, rescale/softmax funcs etc.
+
 
 template<
   const int kHeadDim,              // Headdim, 32,64,128     
@@ -29,11 +29,12 @@ template<
   const int kPrefetchQK,           // Prefetch QK at the Appropriate Time Point. 
   const int kPrefetchPV,           // Prefetch V at the Appropriate Time Point. 
   const int kShareSmemQKV,         // QKV share the same shared memory, reuse QK smem for V.
+  const int kPersistQs2r,          // Persist load Q s2r for headdim < 512, but still keep O(1) SRAM.
   const int kStageQK,              // <= 4, may apply different multi stages policy for QK and V (<=4)
   const int kStagePV,              // <= 4, may apply different multi stages policy for QK and V (<=4)
   const int kPadQ,                 // Pad Q/K/V 0,8; 0 -> smem swizzle, > 0 -> padding
-  const int kPadK,             
-  const int kPadV             
+  const int kPadK,
+  const int kPadV
 >
 __device__ __forceinline__ void check_compiling_states() {
   // Matmul Layout: Q[Br,d]@K^T[d,Bc] NT, P[Br,Bc]@V[Bc,d] NN.
@@ -49,10 +50,15 @@ __device__ __forceinline__ void check_compiling_states() {
   static_assert(kOStorageAccFloat32 == 0 || kOStorageAccFloat32 == 1);
   constexpr int Br = kMmaAtomM * kMmaTileSeqLenQ * kWarpTileSeqLenQ; // 16*4*1=64
   constexpr int Bc = kMmaAtomN * kMmaTileSeqLenK * kWarpTileSeqLenK; //  8*1*8=64
-  static_assert(Br >= Bc); // for shared memory reuse.
+  // Make sure that Br >= Bc, for shared memory reuse.
+  static_assert(
+    (kMmaAtomM * kMmaTileSeqLenQ * kWarpTileSeqLenQ) >= 
+    (kMmaAtomN * kMmaTileSeqLenK * kWarpTileSeqLenK)); 
   static_assert(kPrefetchQK == 0 || kPrefetchQK == 1);
   static_assert(kPrefetchPV == 0 || kPrefetchPV == 1);
   static_assert(kShareSmemQKV == 0 || kShareSmemQKV == 1);
+  // Persist load Q s2r for headdim < 512, but still keep O(1) SRAM.
+  static_assert(kPersistQs2r == 0 || kPersistQs2r == 1);
   // May apply different multi stages policy for QK and V.
   static_assert(kStageQK < 5 && kStageQK > 0); // QK (<=4)
   static_assert(kStagePV < 5 && kStagePV > 0); // V  (<=4)
@@ -61,7 +67,7 @@ __device__ __forceinline__ void check_compiling_states() {
   static_assert(kPadV >= 0 && kPadV % 8 == 0); // 0,8,16
 }
 
-// cp_async & commit_group (optional)
+
 template<
   const int BrOrBc,
   const int kTileSize, 
@@ -111,6 +117,7 @@ __device__ __forceinline__ void cp_async_qkv_g2s(
   }
   // cp_async::commit_group();
 }
+
 
 template<
   const int kTrans,
@@ -185,6 +192,7 @@ __device__ __forceinline__ void sync_fetch_qkv_frags_s2r(
     }
   }
 }
+
 
 template<const int kWarpTileSeqLenK, const int kMmaAccFloat32>
 __device__ __forceinline__ void sync_online_safe_softmax(
@@ -323,6 +331,7 @@ __device__ __forceinline__ void sync_online_safe_softmax(
   }
 }
 
+
 __device__ __forceinline__ void sync_precompute_rescale_factors(
   float * lane_row_max_new,       // &lane_row_max_new[0][0]
   float * lane_block_row_max_old, // &lane_block_row_max_old[0][0]
@@ -439,6 +448,7 @@ __device__ __forceinline__ void sync_update_max_expsum(
   lane_block_row_max_old[1] = block_row_max_new_1;                           
 }
 
+
 template<const int kWarpTileHeadDimV, const int kOStorageAccFloat32>
 __device__ __forceinline__ void sync_rescaling_final_o(
   uint32_t * R_D,                // Final O after loop over N
@@ -470,6 +480,7 @@ __device__ __forceinline__ void sync_rescaling_final_o(
     } // end for kWarpTileHeadDimV
   } // end for kWarpTileSeqLenP = 1
 }
+
 
 template<
   const int Br, 
