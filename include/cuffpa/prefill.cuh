@@ -29,12 +29,13 @@ template<
   const int kPrefetchQK,           // Prefetch QK at the Appropriate Time Point. 
   const int kPrefetchPV,           // Prefetch V at the Appropriate Time Point. 
   const int kShareSmemQKV,         // QKV share the same shared memory, reuse QK smem for V.
-  const int kPersistQs2r,          // Persist load Q s2r for headdim < 512, but still keep O(1) SRAM.
+  const int kPersistQs2r,          // Persist load Q s2r for headdim < 512, more registers, but still keep O(1) SRAM.
+  const int kPersistQg2s,          // Persist load Q g2s for headdim < 512, more SRAM, but still keep register usage.
   const int kStageQK,              // <= 4, may apply different multi stages policy for QK and V (<=4)
   const int kStagePV,              // <= 4, may apply different multi stages policy for QK and V (<=4)
   const int kPadQ,                 // Pad Q/K/V 0,8; 0 -> smem swizzle, > 0 -> padding
   const int kPadK,
-  const int kPadV
+  const int kPadV            
 >
 __device__ __forceinline__ void check_compiling_states() {
   // Matmul Layout: Q[Br,d]@K^T[d,Bc] NT, P[Br,Bc]@V[Bc,d] NN.
@@ -48,8 +49,6 @@ __device__ __forceinline__ void check_compiling_states() {
   static_assert(kMmaAccFloat32QK == 0 || kMmaAccFloat32QK == 1);
   static_assert(kMmaAccFloat32PV == 0 || kMmaAccFloat32PV == 1);
   static_assert(kOStorageAccFloat32 == 0 || kOStorageAccFloat32 == 1);
-  constexpr int Br = kMmaAtomM * kMmaTileSeqLenQ * kWarpTileSeqLenQ; // 16*4*1=64
-  constexpr int Bc = kMmaAtomN * kMmaTileSeqLenK * kWarpTileSeqLenK; //  8*1*8=64
   // Make sure that Br >= Bc, for shared memory reuse.
   static_assert(
     (kMmaAtomM * kMmaTileSeqLenQ * kWarpTileSeqLenQ) >= 
@@ -57,8 +56,14 @@ __device__ __forceinline__ void check_compiling_states() {
   static_assert(kPrefetchQK == 0 || kPrefetchQK == 1);
   static_assert(kPrefetchPV == 0 || kPrefetchPV == 1);
   static_assert(kShareSmemQKV == 0 || kShareSmemQKV == 1);
-  // Persist load Q s2r for headdim < 512, but still keep O(1) SRAM.
+  // Persist load Q s2r for headdim < 512, more registers, but still keep O(1) SRAM.
   static_assert(kPersistQs2r == 0 || kPersistQs2r == 1);
+  // Persist load Q g2s for headdim < 512, more SRAM, but still keep register usage.
+  static_assert(kPersistQg2s == 0 || kPersistQg2s == 1);
+  // kPersistQg2s and kPersistQs2r can not both enabled.
+  static_assert((kPersistQg2s & kPersistQs2r)  == 0);
+  // kPersistQg2s and kShareSmemQKV can not both enabled.
+  static_assert((kPersistQg2s & kShareSmemQKV) == 0);
   // May apply different multi stages policy for QK and V.
   static_assert(kStageQK < 5 && kStageQK > 0); // QK (<=4)
   static_assert(kStagePV < 5 && kStagePV > 0); // V  (<=4)
