@@ -103,9 +103,11 @@ template<
   const int kPadK,                 // Pad Q/K/V 0,8; 0 -> smem swizzle, > 0 -> padding
   const int kPadV                  // Pad Q/K/V 0,8; 0 -> smem swizzle, > 0 -> padding
 > __global__ void // Q, K, V, O -> [B, H, N, D]
-// FFPA Attention Algo: Fine-grained tiling at MMA level, 1.8x~3x faster than SDPA EA.
+// FFPA Attention Algo: Fine-grained tiling at MMA level, achieve 1.8x~3x faster 
+// than SDPA EA w or w/o MMA Acc F32.
 ffpa_mma_stages_split_q_L1_large_d_template(half* Q, half* K, half* V, half* O, ...); 
-// FA-2 Attention Algo: Coarse-grained tiling at Attention level, same performance as SDPA FA-2 Backed.
+// FA-2 Attention Algo: Coarse-grained tiling at Attention level, achieve 95%-105%
+// performance as SDPA FA-2 Backend.
 ffpa_mma_stages_split_q_L1_small_d_template(half* Q, half* K, half* V, half* O, ...); 
 ```
 
@@ -129,21 +131,6 @@ python3 setup.py bdist_wheel && cd dist && python3 -m pip install *.whl # pip un
 ```
 
 ## 📖 FFPA L1 (Level 1): Benchmark 🎉🎉
-
-<!--
-![NVIDIA_A30](https://github.com/user-attachments/assets/69be99e4-977f-4a8c-bef5-9d6667241e23)
-![NVIDIA_A30_ffpa+acc+f16+L1_Speedup](https://github.com/user-attachments/assets/7e323005-4445-41af-8e94-6efb62ed2b77)
-![NVIDIA_A30_ffpa+acc+f32+L1_Speedup](https://github.com/user-attachments/assets/e314649e-82b5-414d-85c9-8b6fbf260138)
-![NVIDIA_GeForce_RTX_3080_Laptop_GPU_WSL2](https://github.com/user-attachments/assets/be071842-25a7-4477-acc8-14d6e2ff5a54)
-![NVIDIA_GeForce_RTX_3080_Laptop_GPU_WSL2_ffpa+acc+f16+L1_Speedup](https://github.com/user-attachments/assets/d157cd69-4444-4735-a691-edaaff408137)
-![NVIDIA_GeForce_RTX_3080_Laptop_GPU_WSL2_ffpa+acc+f32+L1_Speedup](https://github.com/user-attachments/assets/3ce47627-e79d-40ee-b753-bdd235603b7d)
-![NVIDIA_GeForce_RTX_4090](https://github.com/user-attachments/assets/cba2edce-ac0d-412e-823c-7eea2cc63f83)
-![NVIDIA_GeForce_RTX_4090_ffpa+acc+f16+L1_Speedup](https://github.com/user-attachments/assets/447e2937-f7c8-47c8-8550-8c0c71b910e6)
-![NVIDIA_GeForce_RTX_4090_ffpa+acc+f32+L1_Speedup](https://github.com/user-attachments/assets/65a8d564-8fa7-4d66-86b9-e238feb86143)
-![NVIDIA_L20](https://github.com/user-attachments/assets/6be1708c-9491-4dc8-92cc-a3d48a335784)
-![NVIDIA_L20_ffpa+acc+f16+L1_Speedup](https://github.com/user-attachments/assets/a4927108-3f97-4209-9b80-bb31ad271e04)
-![NVIDIA_L20_ffpa+acc+f32+L1_Speedup](https://github.com/user-attachments/assets/eeb9943f-919d-45d8-a8a6-e0f8874f4bcd)
--->
 
 <div id="L1-bench-l20"></div>
 
