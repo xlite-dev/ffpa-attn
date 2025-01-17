@@ -257,21 +257,23 @@ cd tests && python3 test.py --B 1 --H 48 --N 8192 --show-all --D 320
 ```bash
 cd tests && pip install matplotlib && python3 test.py --gen-bench --show-all --plot
 ```
-- 📚 case: Compare small headdim (d<=256, e.g 64), FFPA-L1 vs SDPA FA-2 Backend.  
+- 📚 case: Compare small headdim (d<=256, e.g 64), FFPA-L1 vs SDPA FA-2 BE.  
 ```bash
-export ENABLE_FFPA_FORCE_PV_F16=1 && export ENABLE_FFPA_PERSIST_Q_G2S=1 && export ENABLE_FFPA_PERSIST_KV_G2S=1
+export ENABLE_FFPA_FORCE_PV_F16=1 # Mixed Mma Acc (Q@K^T F32 + P@V F16).
+# Enbale ffpa-attn small d kernel which using coarse-grained tiling method.
+export ENABLE_FFPA_PERSIST_Q_G2S=1 && export ENABLE_FFPA_PERSIST_KV_G2S=1 
 python3 test.py --B 1 --H 8 --N 8192 --show-all --D 64 # NVIDIA RTX 3080 Laptop
---------------------------B=1, H=8, N=8192, D=64, Warmup: 1, Iters: 5-------------------------------------------------------
-                   (sdpa): ['0.00499344  ', '-0.01474762 ', '-0.00590134 '], time:4.346418ms, TFLOPS:32.24 (+0.00 %)(~1.00x)
- (ffpa+acc+f32+L1+stage1): ['0.00500107  ', '-0.01475525 ', '-0.00590515 '], time:3.538846ms, TFLOPS:39.59 (+22.82%)(~1.23x)
- (ffpa+acc+f32+L1+stage2): ['0.00500107  ', '-0.01475525 ', '-0.00590515 '], time:3.539991ms, TFLOPS:39.58 (+0.00 %)(~1.23x)
- (ffpa+acc+f16+L1+stage1): ['0.00498199  ', '-0.01475525 ', '-0.00591278 '], time:2.624893ms, TFLOPS:53.38 (+34.82%)(~1.66x)
- (ffpa+acc+f16+L1+stage2): ['0.00498199  ', '-0.01475525 ', '-0.00591278 '], time:2.629899ms, TFLOPS:53.28 (+0.00 %)(~1.65x)
- (ffpa+acc+f32+L1+stage3): ['0.00500107  ', '-0.01475525 ', '-0.00590515 '], time:3.535127ms, TFLOPS:39.64 (+0.00 %)(~1.23x)
- (ffpa+acc+f32+L1+stage4): ['0.00500107  ', '-0.01475525 ', '-0.00590515 '], time:3.538227ms, TFLOPS:39.60 (+0.00 %)(~1.23x)
- (ffpa+acc+f16+L1+stage3): ['0.00498199  ', '-0.01475525 ', '-0.00591278 '], time:2.627229ms, TFLOPS:53.33 (+0.00 %)(~1.65x)
- (ffpa+acc+f16+L1+stage4): ['0.00498199  ', '-0.01475525 ', '-0.00591278 '], time:2.624702ms, TFLOPS:53.38 (+0.01 %)(~1.66x)
-----------------------------------------------------------------------------------------------------------------------------
+--------------------------B=1, H=8, N=8192, D=64, Warmup: 1, Iters: 5---------------------
+                   (sdpa): ['0.00499344'], time:4.346418ms, TFLOPS:32.24 (+0.00 %)(~1.00x)
+ (ffpa+acc+f32+L1+stage1): ['0.00500107'], time:3.538846ms, TFLOPS:39.59 (+22.82%)(~1.23x)
+ (ffpa+acc+f32+L1+stage2): ['0.00500107'], time:3.539991ms, TFLOPS:39.58 (+0.00 %)(~1.23x)
+ (ffpa+acc+f16+L1+stage1): ['0.00498199'], time:2.624893ms, TFLOPS:53.38 (+34.82%)(~1.66x)
+ (ffpa+acc+f16+L1+stage2): ['0.00498199'], time:2.629899ms, TFLOPS:53.28 (+0.00 %)(~1.65x)
+ (ffpa+acc+f32+L1+stage3): ['0.00500107'], time:3.535127ms, TFLOPS:39.64 (+0.00 %)(~1.23x)
+ (ffpa+acc+f32+L1+stage4): ['0.00500107'], time:3.538227ms, TFLOPS:39.60 (+0.00 %)(~1.23x)
+ (ffpa+acc+f16+L1+stage3): ['0.00498199'], time:2.627229ms, TFLOPS:53.33 (+0.00 %)(~1.65x)
+ (ffpa+acc+f16+L1+stage4): ['0.00498199'], time:2.624702ms, TFLOPS:53.38 (+0.01 %)(~1.66x)
+------------------------------------------------------------------------------------------
 ```
 
 💡NOTE: Please check all configurable environment variables in [env.py](./env.py).
