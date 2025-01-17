@@ -271,9 +271,7 @@ cd tests && pip install matplotlib && python3 test.py --gen-bench --show-all --p
 ```
 - 📚 case: Compare small headdim (d<=256, e.g 64), FFPA-L1 vs SDPA FA-2 Backend.  
 ```bash
-export ENABLE_FFPA_FORCE_PV_F16=1
-export ENABLE_FFPA_PERSIST_Q_G2S=1
-export ENABLE_FFPA_PERSIST_KV_G2S=1
+export ENABLE_FFPA_FORCE_PV_F16=1 && export ENABLE_FFPA_PERSIST_Q_G2S=1 && export ENABLE_FFPA_PERSIST_KV_G2S=1
 python3 test.py --B 1 --H 8 --N 8192 --show-all --D 64 # NVIDIA RTX 3080 Laptop
 --------------------------B=1, H=8, N=8192, D=64, Warmup: 1, Iters: 5-------------------------------------------------------
                    (sdpa): ['0.00499344  ', '-0.01474762 ', '-0.00590134 '], time:4.346418ms, TFLOPS:32.24 (+0.00 %)(~1.00x)
