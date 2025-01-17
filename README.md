@@ -103,11 +103,12 @@ template<
   const int kPadK,                 // Pad Q/K/V 0,8; 0 -> smem swizzle, > 0 -> padding
   const int kPadV                  // Pad Q/K/V 0,8; 0 -> smem swizzle, > 0 -> padding
 > __global__ void // Q, K, V, O -> [B, H, N, D]
-// FFPA Attention Algo: Fine-grained tiling at MMA level, achieve 1.8x~3x faster 
-// than SDPA EA w or w/o MMA Acc F32.
+// FFPA Attention Algo: Fine-grained tiling at MMA level for large d, 
+// achieve 1.8x~3x🎉 faster than SDPA EA with or without MMA Acc F32.
 ffpa_mma_stages_split_q_L1_large_d_template(half* Q, half* K, half* V, half* O, ...); 
-// FA-2 Attention Algo: Coarse-grained tiling at Attention level, achieve 95%-105%
-// performance as SDPA FA-2 Backend.
+// FA-2 Attention Algo: Coarse-grained tiling at Attention level for small d, 
+// achieve 95%-105%🎉 performance as SDPA FA-2 BE with MMA Acc F32, almost 
+// 1.2x~1.4x🎉 faster with Mixed Mma Acc (Q@K^T F32 + P@V F16).
 ffpa_mma_stages_split_q_L1_small_d_template(half* Q, half* K, half* V, half* O, ...); 
 ```
 
