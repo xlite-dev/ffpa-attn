@@ -83,6 +83,11 @@ class ENV(object):
         int(os.environ.get("ENABLE_FFPA_PERSIST_Q_G2S", 0))
     )
 
+    # if True: grid(N/Br, H, B) else: grid(N/Br, B * H)
+    ENBALE_FFPA_LAUNCH_GRID_DNHB = bool(
+        int(os.environ.get("ENBALE_FFPA_LAUNCH_GRID_DNHB", 0))
+    )
+
     @classmethod
     def project_dir(cls):
         return cls.PROJECT_DIR
@@ -146,6 +151,10 @@ class ENV(object):
     @classmethod
     def enable_persist_q_g2s(cls):
         return cls.ENABLE_FFPA_PERSIST_Q_G2S
+    
+    @classmethod
+    def enable_launch_grid_dnhb(cls):
+        return cls.ENBALE_FFPA_LAUNCH_GRID_DNHB
 
     @classmethod
     def env_cuda_cflags(cls):
@@ -174,6 +183,8 @@ class ENV(object):
             extra_env_cflags.append("-DENABLE_FFPA_PERSIST_Q_S2R")
         if cls.enable_persist_q_g2s():
             extra_env_cflags.append("-DENABLE_FFPA_PERSIST_Q_G2S")
+        if cls.enable_launch_grid_dnhb():
+            extra_env_cflags.append("-DENBALE_FFPA_LAUNCH_GRID_DNHB")
         assert not all(
             (cls.enable_persist_q_s2r(), cls.enable_persist_q_g2s())
         ), "PERSIST_Q_G2S and PERSIST_Q_S2R can not both enabled."
@@ -210,6 +221,7 @@ class ENV(object):
         formatenv("ENABLE_FFPA_SMEM_SWIZZLE_Q", cls.enable_smem_swizzle_q())
         formatenv("ENABLE_FFPA_SMEM_SWIZZLE_K", cls.enable_smem_swizzle_k())
         formatenv("ENABLE_FFPA_SMEM_SWIZZLE_V", cls.enable_smem_swizzle_v())
+        formatenv("ENBALE_FFPA_LAUNCH_GRID_DNHB", cls.enable_launch_grid_dnhb())
         pretty_print_line()
 
     @staticmethod
