@@ -111,7 +111,7 @@ __device__ __forceinline__ void cp_async_qkv_g2s(
   // cp async & apply swizzle or padding.
   #pragma unroll
   for (int i = 0; i < (kMmaAtomK / (kNumThreads / BrOrBc)); i += 8) {
-    uint32_t load_smem_ptr = (
+    const uint32_t load_smem_ptr = (
       smem_base_ptr + (stage * kTileSize + 
                        load_smem_BrOrBc * (kMmaAtomK + kPad) + 
                       (kSwizzle ? swizzle::permuted<kMmaAtomK>(
@@ -151,7 +151,7 @@ __device__ __forceinline__ void sync_fetch_qkv_frags_s2r(
     const int warp_smem_d = warp_tile_id * kMmaAtomN;
     const int lane_smem_Bc = n_tile_id * kMmaAtomK + lane_id % 16;
     const int lane_smem_d  = warp_smem_d; // 0,8
-    uint32_t lane_smem_ptr = (
+    const uint32_t lane_smem_ptr = (
       smem_base_ptr + (stage * kTileSize + 
                        lane_smem_Bc * (kMmaAtomN * 2 + kPad) + 
                       (kSwizzle ? swizzle::permuted<kMmaAtomN * 2>(
@@ -169,7 +169,7 @@ __device__ __forceinline__ void sync_fetch_qkv_frags_s2r(
       const int warp_smem_Br = mma_tile_id * (kMmaAtomM);
       const int lane_smem_Br = warp_smem_Br + lane_id % 16; // 0~15
       const int lane_smem_d  = (lane_id / 16) * 8; // 0,8
-      uint32_t lane_smem_ptr = (
+      const uint32_t lane_smem_ptr = (
         smem_base_ptr + (stage * kTileSize + 
                          lane_smem_Br * (kMmaAtomK + kPad) + 
                         (kSwizzle ? swizzle::permuted<kMmaAtomK>(
@@ -185,7 +185,7 @@ __device__ __forceinline__ void sync_fetch_qkv_frags_s2r(
       const int warp_smem_Bc = warp_tile_id * kMmaAtomN;
       const int lane_smem_Bc = warp_smem_Bc + lane_id % 8; // 0~7
       const int lane_smem_d  = ((lane_id / 8) % 2) * 8; // 0,8
-      uint32_t lane_smem_ptr = (
+      const uint32_t lane_smem_ptr = (
         smem_base_ptr + (stage * kTileSize + 
                          lane_smem_Bc * (kMmaAtomK + kPad) + 
                         (kSwizzle ? swizzle::permuted<kMmaAtomK>(
@@ -201,8 +201,8 @@ __device__ __forceinline__ void sync_fetch_qkv_frags_s2r(
 
 template<const int kWarpTileSeqLenK, const int kMmaAccFloat32>
 __device__ __forceinline__ void sync_online_safe_softmax(
-  uint32_t * R_S,                 // &R_S[0][0][0]
-  const float scale,              // 1 / sqrt(d)
+  uint32_t * R_S,                       // &R_S[0][0][0]
+  const float scale,                    // 1 / sqrt(d)
   float * lane_row_max_new,       // &lane_row_max_new[0][0]
   float * lane_row_sum_new,       // &lane_row_sum_new[0][0]
   float * lane_block_row_max_old, // &lane_block_row_max_old[0][0]
@@ -214,10 +214,10 @@ __device__ __forceinline__ void sync_online_safe_softmax(
       // Thread level reduce max across kWarpTileSeqLenK dim, namely Bc.
       #pragma unroll
       for (int j = 0; j < kWarpTileSeqLenK; ++j) {
-        float* t_fptr_S_0_1 = reinterpret_cast<float*>(R_S + j * 4); // &R_S[0][j][0]
+        const float* t_fptr_S_0_1 = reinterpret_cast<float*>(R_S + j * 4); // &R_S[0][j][0]
         // This should be the row max after S = (Q @ K^T) / sqrt(d)
-        float tmp_max_0 = max(t_fptr_S_0_1[0], t_fptr_S_0_1[1]) * scale;
-        float tmp_max_1 = max(t_fptr_S_0_1[2], t_fptr_S_0_1[3]) * scale;
+        const float tmp_max_0 = max(t_fptr_S_0_1[0], t_fptr_S_0_1[1]) * scale;
+        const float tmp_max_1 = max(t_fptr_S_0_1[2], t_fptr_S_0_1[3]) * scale;
         lane_row_max_new[0] = max(lane_row_max_new[0], tmp_max_0);
         lane_row_max_new[1] = max(lane_row_max_new[1], tmp_max_1);
       } // end for kWarpTileSeqLenK
@@ -234,15 +234,14 @@ __device__ __forceinline__ void sync_online_safe_softmax(
     { // kWarpTileSeqLenQ = 1
       // Use latest global row max without update.
       // Br 0, row_id, 0~7,  16~23, 32~39, 48~55; 
-      float block_row_max_new_0 = lane_row_max_new[0]; 
-      // Br 1, row_id, 8~15, 24~31, 40~47, 56~63;
-      float block_row_max_new_1 = lane_row_max_new[1];
-    
-      float block_row_max_old_0 = lane_block_row_max_old[0];
-      float block_row_max_old_1 = lane_block_row_max_old[1];
+      // float block_row_max_new_0 = lane_row_max_new[0]; 
+      // // Br 1, row_id, 8~15, 24~31, 40~47, 56~63;
+      // float block_row_max_new_1 = lane_row_max_new[1];
+      // const float block_row_max_old_0 = lane_block_row_max_old[0];
+      // const float block_row_max_old_1 = lane_block_row_max_old[1];
       // Apply m_new = max(m_old, m_new) here.
-      block_row_max_new_0 = max(block_row_max_old_0, block_row_max_new_0);
-      block_row_max_new_1 = max(block_row_max_old_1, block_row_max_new_1);
+      const float block_row_max_new_0 = max(lane_block_row_max_old[0], lane_row_max_new[0]);
+      const float block_row_max_new_1 = max(lane_block_row_max_old[1], lane_row_max_new[1]);
 
       #pragma unroll
       for (int j = 0; j < kWarpTileSeqLenK; ++j) {
@@ -277,10 +276,10 @@ __device__ __forceinline__ void sync_online_safe_softmax(
       // Thread level reduce max across kWarpTileSeqLenK dim, namely Bc.
       #pragma unroll
       for (int j = 0; j < kWarpTileSeqLenK; ++j) {
-        half* t_hptr_S_0_1 = reinterpret_cast<half*>(R_S + j * 2); 
+        const half* t_hptr_S_0_1 = reinterpret_cast<half*>(R_S + j * 2); 
         // This should be the row max after S = (Q @ K^T) / sqrt(d)
-        float tmp_max_0 = __half2float(__hmax(t_hptr_S_0_1[0], t_hptr_S_0_1[1])) * scale;
-        float tmp_max_1 = __half2float(__hmax(t_hptr_S_0_1[2], t_hptr_S_0_1[3])) * scale;
+        const float tmp_max_0 = __half2float(__hmax(t_hptr_S_0_1[0], t_hptr_S_0_1[1])) * scale;
+        const float tmp_max_1 = __half2float(__hmax(t_hptr_S_0_1[2], t_hptr_S_0_1[3])) * scale;
         lane_row_max_new[0] = max(lane_row_max_new[0], tmp_max_0);
         lane_row_max_new[1] = max(lane_row_max_new[1], tmp_max_1);
       } // end for kWarpTileSeqLenK
@@ -297,15 +296,14 @@ __device__ __forceinline__ void sync_online_safe_softmax(
     { // kWarpTileSeqLenQ = 1
       // Use latest global row max without update.
       // Br 0, row_id, 0~7,  16~23, 32~39, 48~55; 
-      float block_row_max_new_0 = lane_row_max_new[0]; 
-      // Br 1, row_id, 8~15, 24~31, 40~47, 56~63;
-      float block_row_max_new_1 = lane_row_max_new[1];
-    
-      float block_row_max_old_0 = lane_block_row_max_old[0];
-      float block_row_max_old_1 = lane_block_row_max_old[1];
+      // float block_row_max_new_0 = lane_row_max_new[0]; 
+      // // Br 1, row_id, 8~15, 24~31, 40~47, 56~63;
+      // float block_row_max_new_1 = lane_row_max_new[1];
+      // const float block_row_max_old_0 = lane_block_row_max_old[0];
+      // const float block_row_max_old_1 = lane_block_row_max_old[1];
       // Apply m_new = max(m_old, m_new) here.
-      block_row_max_new_0 = max(block_row_max_old_0, block_row_max_new_0);
-      block_row_max_new_1 = max(block_row_max_old_1, block_row_max_new_1);
+      const float block_row_max_new_0 = max(lane_block_row_max_old[0], lane_row_max_new[0]);
+      const float block_row_max_new_1 = max(lane_block_row_max_old[1], lane_row_max_new[1]);
 
       #pragma unroll
       for (int j = 0; j < kWarpTileSeqLenK; ++j) {
@@ -338,11 +336,11 @@ __device__ __forceinline__ void sync_online_safe_softmax(
 
 
 __device__ __forceinline__ void sync_precompute_rescale_factors(
-  float * lane_row_max_new,       // &lane_row_max_new[0][0]
-  float * lane_block_row_max_old, // &lane_block_row_max_old[0][0]
-  float * rescale_o_factor_0,     // rescale factor
-  float * rescale_o_factor_1,     // rescale factor
-  const int n_tile_id             // tile_K_seqlen
+  float * rescale_o_factor_0,           // rescale factor
+  float * rescale_o_factor_1,           // rescale factor
+  const float * lane_row_max_new,       // &lane_row_max_new[0][0]
+  const float * lane_block_row_max_old, // &lane_block_row_max_old[0][0]
+  const int n_tile_id                   // tile_K_seqlen
 ) {
   float block_row_max_new_0 = lane_row_max_new[0]; 
   float block_row_max_new_1 = lane_row_max_new[1];
@@ -365,8 +363,8 @@ template<const int kOStorageAccFloat32, const int kMmaAccFloat32>
 __device__ __forceinline__ void sync_rescaling_tiling_o(
   uint32_t * R_D,             // &R_D[0][0][0]
   uint32_t * R_O,             // &R_O[0]
-  float * rescale_o_factor_0, // rescale factor
-  float * rescale_o_factor_1, // rescale factor
+  const float * rescale_o_factor_0, // rescale factor
+  const float * rescale_o_factor_1, // rescale factor
   const int n_tile_id,        // tile_K_seqlen
   const int d_tile_id         // j
 ) {
@@ -375,7 +373,7 @@ __device__ __forceinline__ void sync_rescaling_tiling_o(
   // m = max(m_old, m_new), O_new[Br,d] = exp(m_old - m) * O_old + P@V
   // m = max(m_old, m_new), l = exp(m_old - m) * l_old + l_new (FA2 paper)
   if constexpr (kMmaAccFloat32) {
-    float* t_fptr_O_0_1 = reinterpret_cast<float*>(R_O); 
+    const float* t_fptr_O_0_1 = reinterpret_cast<float*>(R_O); 
     if constexpr (kOStorageAccFloat32) {
       // (x,y) 0~7->{c0, c1}, (z,w)->8~15 {c2, c3} kWarpTileSeqLenP=1
       float* t_fptr_D_0_1 = reinterpret_cast<float*>(R_D + d_tile_id * 4); // &(R_D[0][j][0])
@@ -396,7 +394,7 @@ __device__ __forceinline__ void sync_rescaling_tiling_o(
     }
   } else {
     // MMA Acc F16
-    half* t_hptr_O_0_1 = reinterpret_cast<half*>(R_O); 
+    const half* t_hptr_O_0_1 = reinterpret_cast<half*>(R_O); 
     if constexpr (kOStorageAccFloat32) {
       // (x,y) 0~7->{c0, c1}, (z,w)->8~15 {c2, c3} kWarpTileSeqLenP=1
       float* t_fptr_D_0_1 = reinterpret_cast<float*>(R_D + d_tile_id * 4);
@@ -427,49 +425,38 @@ __device__ __forceinline__ void sync_update_max_expsum(
   float * lane_row_sum_new,       // &lane_row_sum_new[0][0]
   float * lane_block_row_max_old, // &lane_block_row_max_old[0][0]
   float * lane_block_row_sum_old, // &lane_block_row_sum_old[0][0]
-  float * rescale_o_factor_0,     // rescale factor
-  float * rescale_o_factor_1,     // rescale factor
-  const int n_tile_id             // tile_K_seqlen
+  const float * rescale_o_factor_0,     // rescale factor 0 exp(m_old - m_new)
+  const float * rescale_o_factor_1     // rescale factor 1 exp(m_old - m_new)
+  // const int n_tile_id             // tile_K_seqlen
 ) {
   // Now, we can update m, l after O has been scaled.
-  float block_row_max_new_0 = lane_row_max_new[0]; 
-  float block_row_max_new_1 = lane_row_max_new[1];
-  float block_row_max_old_0 = lane_block_row_max_old[0];
-  float block_row_max_old_1 = lane_block_row_max_old[1];
-  // NOTE: max(-inf, val) = val.
-  block_row_max_new_0 = max(block_row_max_old_0, block_row_max_new_0);
-  block_row_max_new_1 = max(block_row_max_old_1, block_row_max_new_1); 
   // Update l = exp(m_old - m_new) * l_old + row_sum(P).
-  float block_row_sum_new_0 = lane_row_sum_new[0];
-  float block_row_sum_new_1 = lane_row_sum_new[1];                                         
-  float block_row_sum_old_0 = lane_block_row_sum_old[0];
-  float block_row_sum_old_1 = lane_block_row_sum_old[1];
   lane_block_row_sum_old[0] = (__fmaf_rn(
-    rescale_o_factor_0[0], block_row_sum_old_0, block_row_sum_new_0));
+    rescale_o_factor_0[0], lane_block_row_sum_old[0], lane_row_sum_new[0]));
   lane_block_row_sum_old[1] = (__fmaf_rn(
-    rescale_o_factor_1[0], block_row_sum_old_1, block_row_sum_new_1));
+    rescale_o_factor_1[0], lane_block_row_sum_old[1], lane_row_sum_new[1]));
   // 2. Then, update block row max for each lane.
-  lane_block_row_max_old[0] = block_row_max_new_0;
-  lane_block_row_max_old[1] = block_row_max_new_1;                           
+  lane_block_row_max_old[0] = max(lane_block_row_max_old[0], lane_row_max_new[0]);
+  lane_block_row_max_old[1] = max(lane_block_row_max_old[1], lane_row_max_new[1]);                         
 }
 
 
 template<const int kWarpTileHeadDimV, const int kOStorageAccFloat32>
 __device__ __forceinline__ void sync_rescaling_final_o(
   uint32_t * R_D,                // Final O after loop over N
-  float * lane_block_row_sum_old // &lane_block_row_sum_old[0][0]
+  const float * lane_block_row_sum_old // &lane_block_row_sum_old[0][0]
 ) {
   // Finaly, we still have to rescale O once more.
   // O_output(D) = ( 1/l_final ) * O_final (FA2 paper)
   // static_assert(kWarpTileSeqLenP == 1);
   { // kWarpTileSeqLenP = 1
-    float rescale_factor_0 = __frcp_rn(lane_block_row_sum_old[0]);
-    float rescale_factor_1 = __frcp_rn(lane_block_row_sum_old[1]);
+    const float rescale_factor_0 = __frcp_rn(lane_block_row_sum_old[0]);
+    const float rescale_factor_1 = __frcp_rn(lane_block_row_sum_old[1]);
     #pragma unroll
     for (int j = 0; j < kWarpTileHeadDimV; ++j) { // 8, 16, 32, ...
       // Scaling in registers & convert F32 -> half for O collective store.
       if constexpr (kOStorageAccFloat32) {
-        float* t_fptr_D_0_1 = reinterpret_cast<float*>(R_D + j * 4); 
+        const float* t_fptr_D_0_1 = reinterpret_cast<float*>(R_D + j * 4); 
         half*  t_hptr_D_0_1 = reinterpret_cast< half*>(R_D + j * 4); 
         t_hptr_D_0_1[0] = __float2half_rn(rescale_factor_0 * t_fptr_D_0_1[0]);
         t_hptr_D_0_1[1] = __float2half_rn(rescale_factor_0 * t_fptr_D_0_1[1]);
@@ -528,15 +515,15 @@ __device__ __forceinline__ void sync_store_o_r2g(
       if (lane_id % 4 == 0) {
         // (0/1)*32 + (0/1)*16=(0,16,32,48), + 0~7 -> 0~56 kWarpTileSeqLenP = 1
         // int store_warp_regs_O_Br = warp_QP * (kMmaAtomM * kWarpTileSeqLenP ) + 0 * kMmaAtomM;
-        int store_warp_regs_O_Br = mma_tile_id * (kMmaAtomM);
-        int store_lane_gmem_O_Br = n_tile_id * Br + store_warp_regs_O_Br + lane_id / 4; // 0~7
+        const int store_warp_regs_O_Br = mma_tile_id * (kMmaAtomM);
+        const int store_lane_gmem_O_Br = n_tile_id * Br + store_warp_regs_O_Br + lane_id / 4; // 0~7
         // (0~3)*16 + (0/1)*8=(0,8,16,24,...,48,56)  warp_KV = 0
         // int store_warp_regs_O_d = warp_KV * (kMmaAtomN * kWarpTileHeadDimV) + j * kMmaAtomN;
-        int store_warp_regs_O_d = j * kMmaAtomN;
-        int store_lane_gmem_O_d = store_warp_regs_O_d; // (0~3)*16+(0/8)
-        int store_gmem_O_addr_0 = (
+        const int store_warp_regs_O_d = j * kMmaAtomN;
+        const int store_lane_gmem_O_d = store_warp_regs_O_d; // (0~3)*16+(0/8)
+        const int store_gmem_O_addr_0 = (
           gmem_offset + (store_lane_gmem_O_Br + 0) * kHeadDim + store_lane_gmem_O_d);
-        int store_gmem_O_addr_1 = (
+        const int store_gmem_O_addr_1 = (
           gmem_offset + (store_lane_gmem_O_Br + 8) * kHeadDim + store_lane_gmem_O_d);
         cp_async::stg_sync_128b(&gmem_ptr[store_gmem_O_addr_0], t_uptr_Z_0);
         cp_async::stg_sync_128b(&gmem_ptr[store_gmem_O_addr_1], t_uptr_Z_1);

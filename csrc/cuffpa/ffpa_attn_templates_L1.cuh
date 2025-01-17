@@ -5,7 +5,7 @@ using mma::MMAMode;
 
 
 template<
-  const int kHeadDim,              // Headdim, 32,64,128     
+  const int kHeadDim,              // Headdim, 32~1024     
   const int kMmaAtomM,             // MMA Atom M, 16
   const int kMmaAtomN,             // MMA Atom N, 8
   const int kMmaAtomK,             // MMA Atom K, 16
@@ -33,12 +33,16 @@ template<
 >
 __global__ void __launch_bounds__(
   WARP_SIZE * kMmaTileSeqLenQ * kMmaTileSeqLenK) 
-ffpa_mma_stages_split_q_L1_template(half* Q, 
-                                    half* K, 
-                                    half* V, 
-                                    half* O, 
-                                    int QKV_seqlen, 
-                                    int QKV_head) {
+ffpa_mma_stages_split_q_L1_template(const half* __restrict__ Q, 
+                                    const half* __restrict__ K, 
+                                    const half* __restrict__ V, 
+                                    half*       __restrict__ O, 
+                                    const int QKV_seqlen, 
+                                    const int QKV_head,
+                                    const float scale,
+                                    const int Tc
+) {
+  // TODO: Persist K/V g2s for small headdim (<=128).
   prefill::check_compiling_states<
     kHeadDim, kMmaAtomM, kMmaAtomN, kMmaAtomK, kMmaTileSeqLenQ, kMmaTileSeqLenK, 
     kMmaTileSeqLenP, kMmaTileHeadDimV, kWarpTileSeqLenQ, kWarpTileSeqLenK, 
@@ -49,17 +53,20 @@ ffpa_mma_stages_split_q_L1_template(half* Q,
   constexpr int Br = kMmaAtomM * kMmaTileSeqLenQ * kWarpTileSeqLenQ;
   constexpr int Bc = kMmaAtomN * kMmaTileSeqLenK * kWarpTileSeqLenK;
   constexpr int kNumThreads = WARP_SIZE * kMmaTileSeqLenQ * kMmaTileSeqLenK;
-  // Now, N must be mutliples of Bc(32/64) for KV tiling across seqlen.
-  const int Tc = utils::div_ceil(QKV_seqlen, Bc); // Tc K_tile[Bc,d]
-  const float scale = 1.0f / sqrt((float) kHeadDim);
+  
+#ifdef ENBALE_FFPA_LAUNCH_GRID_DNHB
+  // grid(div_ceil(QKV_seqlen, Br), QKV_head, QKV_batch), (x,y,z)
+  const int QKV_batch_id = blockIdx.z;            // Batch size
+  const int QKV_head_id  = blockIdx.y;            // Head num
+#else
   // grid(div_ceil(QKV_seqlen, Br), QKV_batch * QKV_head), (x,y,z)
   const int QKV_batch_id = blockIdx.y / QKV_head; // Batch size
   const int QKV_head_id  = blockIdx.y % QKV_head; // Head num
+#endif
   const int Q_tile_id    = blockIdx.x;            // Q tile_id, range [0, Tr]
   const int O_tile_id    = Q_tile_id;             // O tile_id, same as Q.
-  const int tid          = threadIdx.x;           // within block
-  const int warp_QP      = tid / WARP_SIZE;       // 0,1,2,3 or 0~7
-  const int warp_KV      = 0;                     // 0
+  const int warp_QP      = threadIdx.x / WARP_SIZE;       // 0,1,2,3 or 0~7
+  constexpr int warp_KV  = 0;                     // 0
   const int Q_gmem_offset = ((QKV_batch_id * QKV_head * QKV_seqlen * kHeadDim) + 
                              (QKV_head_id * QKV_seqlen * kHeadDim)); // Q [seqlen,d]
   const int K_gmem_offset = ((QKV_batch_id * QKV_head * QKV_seqlen * kHeadDim) + 
@@ -68,7 +75,8 @@ ffpa_mma_stages_split_q_L1_template(half* Q,
   const int O_gmem_offset = Q_gmem_offset; // O [seqlen,d]
 
   // int load_gmem_Q_Br = Q_tile_id * Br + load_smem_Q_Br; 
-  if ((Q_tile_id * Br + (tid / (kNumThreads / Br))) >= QKV_seqlen) return;
+  // if ((Q_tile_id * Br + (threadIdx.x / (kNumThreads / Br))) >= QKV_seqlen) return;
+  if ((Q_tile_id * Br) >= QKV_seqlen) return;
 
   extern __shared__ half smem[];
   constexpr int Q_tile_size = Br * (kMmaAtomK     + kPadQ); // Q[Br,16], 64*16*2=2048 bytes
@@ -82,9 +90,24 @@ ffpa_mma_stages_split_q_L1_template(half* Q,
   // V may reuse all Q+K smem after Q@K^T.
   half* V_tile_smem = (kShareSmemQKV ? Q_tile_smem : 
                        K_tile_smem + kStageQK * K_tile_size); 
-  uint32_t smem_Q_base_ptr = __cvta_generic_to_shared(Q_tile_smem);
-  uint32_t smem_K_base_ptr = __cvta_generic_to_shared(K_tile_smem);
-  uint32_t smem_V_base_ptr = __cvta_generic_to_shared(V_tile_smem);
+  const uint32_t smem_Q_base_ptr = __cvta_generic_to_shared(Q_tile_smem);
+  const uint32_t smem_K_base_ptr = __cvta_generic_to_shared(K_tile_smem);
+  const uint32_t smem_V_base_ptr = __cvta_generic_to_shared(V_tile_smem);
+
+  // load Q g2s at very beginning if kPersistQg2s is enabled.
+  // Put Q g2s before registers init, enable overlap between kPersistQg2s 
+  // and init states.
+  if constexpr (kPersistQg2s) {
+    #pragma unroll
+    for (int tile_K_d = 0; tile_K_d < (kHeadDim / kMmaAtomK); ++tile_K_d) {
+      prefill::cp_async_qkv_g2s<
+        Br, Q_tile_size, kHeadDim, kMmaAtomK, kNumThreads, kPadQ>(
+          smem_Q_base_ptr, Q, Q_gmem_offset, Q_tile_id, 
+          tile_K_d, tile_K_d
+      );
+      cp_async::commit_group();
+    }
+  }
 
   // --------------------- Registers/SMEM for thread block -------------------------
   // block m_old, l_old, store in lane, use float to keep precision.
@@ -106,22 +129,7 @@ ffpa_mma_stages_split_q_L1_template(half* Q,
   utils::fill_3D_regs<uint32_t, kWarpTileSeqLenP, kWarpTileHeadDimV, 
                       ((kOStorageAccFloat32) ? 4 : 2)>(R_D, 0);
 
-  // load Q g2s at very beginning if kPersistQg2s is enabled.
-  if constexpr (kPersistQg2s) {
-    #pragma unroll
-    for (int tile_K_d = 0; tile_K_d < (kHeadDim / kMmaAtomK); ++tile_K_d) {
-      prefill::cp_async_qkv_g2s<
-        Br, Q_tile_size, kHeadDim, kMmaAtomK, kNumThreads, kPadQ>(
-          smem_Q_base_ptr, Q, Q_gmem_offset, Q_tile_id, 
-          tile_K_d, tile_K_d
-      );
-      cp_async::commit_group();
-    }
-    // Must wait Q g2s ready
-    cp_async::wait_group<0>();
-    __syncthreads();
-  }
-  
+  // Now, N must be mutliples of Bc(32/64) for KV tiling across seqlen.              
   // <loop over K seqlen>: for K^T[d,seqlen] with K^T_tile[d,Bc]
   #pragma unroll 1
   for (int tile_K_seqlen = 0; tile_K_seqlen < Tc; ++tile_K_seqlen) { 
@@ -389,8 +397,9 @@ ffpa_mma_stages_split_q_L1_template(half* Q,
       float rescale_o_factor_0[1];
       float rescale_o_factor_1[1];
       prefill::sync_precompute_rescale_factors(
+        &rescale_o_factor_0[0], &rescale_o_factor_1[0], 
         &lane_row_max_new[0][0], &lane_block_row_max_old[0][0], 
-        &rescale_o_factor_0[0], &rescale_o_factor_1[0], tile_K_seqlen
+        tile_K_seqlen
       );
 
       // <HGEMM in registers>
@@ -499,7 +508,7 @@ ffpa_mma_stages_split_q_L1_template(half* Q,
       prefill::sync_update_max_expsum(
         &lane_row_max_new[0][0], &lane_row_sum_new[0][0],
         &lane_block_row_max_old[0][0], &lane_block_row_sum_old[0][0],
-        &rescale_o_factor_0[0], &rescale_o_factor_1[0], tile_K_seqlen
+        &rescale_o_factor_0[0], &rescale_o_factor_1[0]
       );
     } // end P@V
     __syncthreads(); 
