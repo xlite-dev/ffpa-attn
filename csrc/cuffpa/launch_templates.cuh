@@ -14,7 +14,6 @@ void launch_ffpa_mma_L1_template(torch::Tensor Q,
                                  torch::Tensor O) {
   // Q,K,V,O with [B, H, N, D] layout, B=batch, H=head, N=seqlen, D=dim
   // TODO: support BNHD layout, Q,K,V,O with [B, N, H, D] layout.
-  // Now: fixed tile BrxBc=128x128 for d>= 128, 64x64 for d<128.
   constexpr int kMmaAtomM = 16;
   constexpr int kMmaAtomN = 8;
   constexpr int kMmaAtomK = 16;
@@ -50,7 +49,7 @@ void launch_ffpa_mma_L1_template(torch::Tensor Q,
   // FP16 can provide precision to approximately 3-4 decimal places.
   // Thus, if the error does not exceed 1e-3, using FP16 storage is 
   // sufficient for most applications.
-  constexpr int kOStorageAccFloat32 = (kHeadDim < 256) ? 1 : 0;
+  constexpr int kOStorageAccFloat32 = (kHeadDim < 128) ? 1 : 0;
   // Persist load Q s2r for headdim < 512, more registers, 
   // but still keep O(1) SRAM.
 #ifdef ENABLE_FFPA_PERSIST_Q_S2R

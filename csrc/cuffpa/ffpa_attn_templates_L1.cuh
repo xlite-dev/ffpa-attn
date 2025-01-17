@@ -571,8 +571,8 @@ ffpa_mma_stages_split_q_L1_small_d_template(const half* __restrict__ Q,
                                             const float scale,
                                             const int Tc
 ) {
-  // TODO: This kernel template is developed for small head dimensions (d <= 256), namely,
-  // flash-attention-2. Always persist QKV for flash-attn, apply tiling at
+  // NOTE: This kernel template is developed for small head dimensions (d <= 256), 
+  // namely, flash-attention-2. Always persist QKV for flash-attn, apply tiling at
   // the Attention level not the MMA level. In order to reuse prefill.cuh, we choose
   // to keep the kPersistQg2s flag in the template.
   static_assert(kPersistQg2s == 1); 
@@ -648,8 +648,8 @@ ffpa_mma_stages_split_q_L1_small_d_template(const half* __restrict__ Q,
   uint32_t R_K[kWarpTileSeqLenK][2]; // [8][2]
   uint32_t R_V[2]; // [2], S=Q@K, only use 2 32bits registers.
   // e.g [1][8][2], MMA Acc fp16; [1][8][4], MMA Acc fp32; 
-  uint32_t R_S[kWarpTileSeqLenQ][kWarpTileSeqLenK][(kMmaAccFloat32QK) ? 4 : 2]; 
-  uint32_t R_O[kWarpTileSeqLenP][kWarpTileHeadDimV][(kMmaAccFloat32PV) ? 4 : 2]; // registers for O=PV[Br,d]=P@V, [4 or 2]
+  uint32_t R_S[kWarpTileSeqLenQ][kWarpTileSeqLenK][(kMmaAccFloat32QK)     ? 4 : 2]; 
+  uint32_t R_O[kWarpTileSeqLenP][kWarpTileHeadDimV][(kMmaAccFloat32PV)    ? 4 : 2]; // registers for O=PV[Br,d]=P@V, [4 or 2]
   uint32_t R_D[kWarpTileSeqLenP][kWarpTileHeadDimV][(kOStorageAccFloat32) ? 4 : 2]; 
   utils::fill_3D_regs<uint32_t, kWarpTileSeqLenP, kWarpTileHeadDimV, 
                       ((kOStorageAccFloat32) ? 4 : 2)>(R_D, 0);
