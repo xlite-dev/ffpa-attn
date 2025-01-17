@@ -42,6 +42,7 @@ ffpa_mma_stages_split_q_L1_template(const half* __restrict__ Q,
                                     const float scale,
                                     const int Tc
 ) {
+  // TODO: Persist K/V g2s for small headdim (<=128).
   prefill::check_compiling_states<
     kHeadDim, kMmaAtomM, kMmaAtomN, kMmaAtomK, kMmaTileSeqLenQ, kMmaTileSeqLenK, 
     kMmaTileSeqLenP, kMmaTileHeadDimV, kWarpTileSeqLenQ, kWarpTileSeqLenK, 
