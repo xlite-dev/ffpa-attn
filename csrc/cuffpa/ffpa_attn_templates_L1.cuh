@@ -5,7 +5,7 @@ using mma::MMAMode;
 
 
 template<
-  const int kHeadDim,              // Headdim, 32,64,128     
+  const int kHeadDim,              // Headdim, 32~1024     
   const int kMmaAtomM,             // MMA Atom M, 16
   const int kMmaAtomN,             // MMA Atom N, 8
   const int kMmaAtomK,             // MMA Atom K, 16
@@ -49,12 +49,16 @@ ffpa_mma_stages_split_q_L1_template(half* Q,
   constexpr int Br = kMmaAtomM * kMmaTileSeqLenQ * kWarpTileSeqLenQ;
   constexpr int Bc = kMmaAtomN * kMmaTileSeqLenK * kWarpTileSeqLenK;
   constexpr int kNumThreads = WARP_SIZE * kMmaTileSeqLenQ * kMmaTileSeqLenK;
-  // Now, N must be mutliples of Bc(32/64) for KV tiling across seqlen.
-  const int Tc = utils::div_ceil(QKV_seqlen, Bc); // Tc K_tile[Bc,d]
-  const float scale = 1.0f / sqrt((float) kHeadDim);
+  
+#ifdef ENBALE_FFPA_LAUNCH_GRID_DNHB
+  // grid(div_ceil(QKV_seqlen, Br), QKV_head, QKV_batch), (x,y,z)
+  const int QKV_batch_id = blockIdx.z;            // Batch size
+  const int QKV_head_id  = blockIdx.y;            // Head num
+#else
   // grid(div_ceil(QKV_seqlen, Br), QKV_batch * QKV_head), (x,y,z)
   const int QKV_batch_id = blockIdx.y / QKV_head; // Batch size
   const int QKV_head_id  = blockIdx.y % QKV_head; // Head num
+#endif
   const int Q_tile_id    = blockIdx.x;            // Q tile_id, range [0, Tr]
   const int O_tile_id    = Q_tile_id;             // O tile_id, same as Q.
   const int tid          = threadIdx.x;           // within block
@@ -86,6 +90,21 @@ ffpa_mma_stages_split_q_L1_template(half* Q,
   uint32_t smem_K_base_ptr = __cvta_generic_to_shared(K_tile_smem);
   uint32_t smem_V_base_ptr = __cvta_generic_to_shared(V_tile_smem);
 
+  // load Q g2s at very beginning if kPersistQg2s is enabled.
+  // Put Q g2s before registers init, enable overlap between kPersistQg2s 
+  // and init states.
+  if constexpr (kPersistQg2s) {
+    #pragma unroll
+    for (int tile_K_d = 0; tile_K_d < (kHeadDim / kMmaAtomK); ++tile_K_d) {
+      prefill::cp_async_qkv_g2s<
+        Br, Q_tile_size, kHeadDim, kMmaAtomK, kNumThreads, kPadQ>(
+          smem_Q_base_ptr, Q, Q_gmem_offset, Q_tile_id, 
+          tile_K_d, tile_K_d
+      );
+      cp_async::commit_group();
+    }
+  }
+
   // --------------------- Registers/SMEM for thread block -------------------------
   // block m_old, l_old, store in lane, use float to keep precision.
   float lane_block_row_max_old[kWarpTileSeqLenQ][2]; // [1][2]
@@ -105,22 +124,9 @@ ffpa_mma_stages_split_q_L1_template(half* Q,
   uint32_t R_D[kWarpTileSeqLenP][kWarpTileHeadDimV][(kOStorageAccFloat32) ? 4 : 2]; 
   utils::fill_3D_regs<uint32_t, kWarpTileSeqLenP, kWarpTileHeadDimV, 
                       ((kOStorageAccFloat32) ? 4 : 2)>(R_D, 0);
-
-  // load Q g2s at very beginning if kPersistQg2s is enabled.
-  if constexpr (kPersistQg2s) {
-    #pragma unroll
-    for (int tile_K_d = 0; tile_K_d < (kHeadDim / kMmaAtomK); ++tile_K_d) {
-      prefill::cp_async_qkv_g2s<
-        Br, Q_tile_size, kHeadDim, kMmaAtomK, kNumThreads, kPadQ>(
-          smem_Q_base_ptr, Q, Q_gmem_offset, Q_tile_id, 
-          tile_K_d, tile_K_d
-      );
-      cp_async::commit_group();
-    }
-    // Must wait Q g2s ready
-    cp_async::wait_group<0>();
-    __syncthreads();
-  }
+  // Now, N must be mutliples of Bc(32/64) for KV tiling across seqlen.
+  const int Tc = utils::div_ceil(QKV_seqlen, Bc); // Tc K_tile[Bc,d]
+  const float scale = 1.0f / sqrt((float) kHeadDim);
   
   // <loop over K seqlen>: for K^T[d,seqlen] with K^T_tile[d,Bc]
   #pragma unroll 1
