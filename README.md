@@ -18,7 +18,7 @@
   <p align="center"> <h2> 🤖FFPA: 1.8x~3x🎉faster vs SDPA EA with or without MMA Acc F32</h2></p>
 </div>
 
-🤖[WIP] **FFPA**: Yet antother **Faster Flash Prefill Attention** with **O(1) SRAM complexity** & **O(d/4) or O(1) register complexity** for large headdim (D > 256), almost **1.8x~3x** 🎉 faster than SDPA EA with or without MMA Acc F32 on many devices: [📈L20 ~1.9x↑🎉](#L1-bench-l20), [📈A30 ~1.8x↑🎉](#L1-bench-a30), [📈3080 ~2.9x↑🎉](#L1-bench-3080), [📈4090 ~2.1x↑🎉](#L1-bench-4090).   
+🤖[WIP] **FFPA**: Yet antother **Faster Flash Prefill Attention** with **O(1) SRAM complexity** & **O(d/4) or O(1) register complexity** for large headdim (D > 256), almost **1.8x~3x** 🎉 faster than SDPA EA with or without MMA Acc F32 on many devices: [📈L20 ~1.9x↑🎉](#L1-bench-l20), [📈A30 ~1.8x↑🎉](#L1-bench-a30), [📈3080 ~2.9x↑🎉](#L1-bench-3080), [📈4090 ~2.1x↑🎉](#L1-bench-4090). I have implemented not only `FFPA Attention Algo: Fine-grained tiling` for large headim but also ` FA-2 Attention Algo: Coarse-grained tiling` for small headidm in this repo.
 
 💡NOTE: This project is still in its early dev stages and now provides some kernels and benchmarks for reference. More features will be added in the future. (Welcome to 🌟👆🏻star this repo to support me ~)
 
@@ -103,7 +103,13 @@ template<
   const int kPadK,                 // Pad Q/K/V 0,8; 0 -> smem swizzle, > 0 -> padding
   const int kPadV                  // Pad Q/K/V 0,8; 0 -> smem swizzle, > 0 -> padding
 > __global__ void // Q, K, V, O -> [B, H, N, D]
-ffpa_mma_stages_split_q_L1_template(half* Q, half* K, half* V, half* O, ...);
+// FFPA Attention Algo: Fine-grained tiling at MMA level for large headdim (d>256), 
+// which can achieve 1.8x~3x🎉 faster than SDPA EA with or without MMA Acc F32.
+ffpa_mma_stages_split_q_L1_large_d_template(half* Q, half* K, half* V, half* O, ...); 
+// FA-2 Attention Algo: Coarse-grained tiling at Attention level for small headdim (d<=256), 
+// which can achieve 95%-105%🎉 performance as SDPA FA-2 BE with MMA Acc F32, and achieve
+// almost 1.2x~1.4x🎉 faster than SDPA FA-2 via Mixed MMA Acc(Q@K^T F32 + P@V F16).
+ffpa_mma_stages_split_q_L1_small_d_template(half* Q, half* K, half* V, half* O, ...); 
 ```
 
 ## 📖 Prerequisites
@@ -126,21 +132,6 @@ python3 setup.py bdist_wheel && cd dist && python3 -m pip install *.whl # pip un
 ```
 
 ## 📖 FFPA L1 (Level 1): Benchmark 🎉🎉
-
-<!--
-![NVIDIA_A30](https://github.com/user-attachments/assets/69be99e4-977f-4a8c-bef5-9d6667241e23)
-![NVIDIA_A30_ffpa+acc+f16+L1_Speedup](https://github.com/user-attachments/assets/7e323005-4445-41af-8e94-6efb62ed2b77)
-![NVIDIA_A30_ffpa+acc+f32+L1_Speedup](https://github.com/user-attachments/assets/e314649e-82b5-414d-85c9-8b6fbf260138)
-![NVIDIA_GeForce_RTX_3080_Laptop_GPU_WSL2](https://github.com/user-attachments/assets/be071842-25a7-4477-acc8-14d6e2ff5a54)
-![NVIDIA_GeForce_RTX_3080_Laptop_GPU_WSL2_ffpa+acc+f16+L1_Speedup](https://github.com/user-attachments/assets/d157cd69-4444-4735-a691-edaaff408137)
-![NVIDIA_GeForce_RTX_3080_Laptop_GPU_WSL2_ffpa+acc+f32+L1_Speedup](https://github.com/user-attachments/assets/3ce47627-e79d-40ee-b753-bdd235603b7d)
-![NVIDIA_GeForce_RTX_4090](https://github.com/user-attachments/assets/cba2edce-ac0d-412e-823c-7eea2cc63f83)
-![NVIDIA_GeForce_RTX_4090_ffpa+acc+f16+L1_Speedup](https://github.com/user-attachments/assets/447e2937-f7c8-47c8-8550-8c0c71b910e6)
-![NVIDIA_GeForce_RTX_4090_ffpa+acc+f32+L1_Speedup](https://github.com/user-attachments/assets/65a8d564-8fa7-4d66-86b9-e238feb86143)
-![NVIDIA_L20](https://github.com/user-attachments/assets/6be1708c-9491-4dc8-92cc-a3d48a335784)
-![NVIDIA_L20_ffpa+acc+f16+L1_Speedup](https://github.com/user-attachments/assets/a4927108-3f97-4209-9b80-bb31ad271e04)
-![NVIDIA_L20_ffpa+acc+f32+L1_Speedup](https://github.com/user-attachments/assets/eeb9943f-919d-45d8-a8a6-e0f8874f4bcd)
--->
 
 <div id="L1-bench-l20"></div>
 
@@ -266,6 +257,25 @@ cd tests && python3 test.py --B 1 --H 48 --N 8192 --show-all --D 320
 ```bash
 cd tests && pip install matplotlib && python3 test.py --gen-bench --show-all --plot
 ```
+- 📚 case: Compare small headdim (d<=256, e.g 64), FFPA-L1 vs SDPA FA-2 BE.  
+```bash
+export ENABLE_FFPA_FORCE_PV_F16=1 # Mixed Mma Acc (Q@K^T F32 + P@V F16).
+# Enbale ffpa-attn small d kernel which using coarse-grained tiling method.
+export ENABLE_FFPA_PERSIST_Q_G2S=1 && export ENABLE_FFPA_PERSIST_KV_G2S=1 
+python3 test.py --B 1 --H 8 --N 8192 --show-all --D 64 # NVIDIA RTX 3080 Laptop
+--------------------------B=1, H=8, N=8192, D=64, Warmup: 1, Iters: 5---------------------
+                   (sdpa): ['0.00499344'], time:4.346418ms, TFLOPS:32.24 (+0.00 %)(~1.00x)
+ (ffpa+acc+f32+L1+stage1): ['0.00500107'], time:3.538846ms, TFLOPS:39.59 (+22.82%)(~1.23x)
+ (ffpa+acc+f32+L1+stage2): ['0.00500107'], time:3.539991ms, TFLOPS:39.58 (+0.00 %)(~1.23x)
+ (ffpa+acc+f16+L1+stage1): ['0.00498199'], time:2.624893ms, TFLOPS:53.38 (+34.82%)(~1.66x)
+ (ffpa+acc+f16+L1+stage2): ['0.00498199'], time:2.629899ms, TFLOPS:53.28 (+0.00 %)(~1.65x)
+ (ffpa+acc+f32+L1+stage3): ['0.00500107'], time:3.535127ms, TFLOPS:39.64 (+0.00 %)(~1.23x)
+ (ffpa+acc+f32+L1+stage4): ['0.00500107'], time:3.538227ms, TFLOPS:39.60 (+0.00 %)(~1.23x)
+ (ffpa+acc+f16+L1+stage3): ['0.00498199'], time:2.627229ms, TFLOPS:53.33 (+0.00 %)(~1.65x)
+ (ffpa+acc+f16+L1+stage4): ['0.00498199'], time:2.624702ms, TFLOPS:53.38 (+0.01 %)(~1.66x)
+------------------------------------------------------------------------------------------
+```
+
 💡NOTE: Please check all configurable environment variables in [env.py](./env.py).
 
 ## ©️License

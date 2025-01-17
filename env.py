@@ -78,9 +78,16 @@ class ENV(object):
         int(os.environ.get("ENABLE_FFPA_PERSIST_Q_S2R", 0))
     )
 
-    # Persist load Q g2s for headdim < 512, more SRAM, but still keep register usage.
+    # Persist load Q g2s for headdim <= 320, more SRAM, but still keep register usage.
     ENABLE_FFPA_PERSIST_Q_G2S = bool(
         int(os.environ.get("ENABLE_FFPA_PERSIST_Q_G2S", 0))
+    )
+
+    # Persist load KV g2s for headdim <= 256, more SRAM. If True, auto use flash-attn
+    # algo that tiling at attention level for headdim <= 256 and auto use ffpa-attn
+    # fined-grain tiling at MMA level for headdim > 256.
+    ENABLE_FFPA_PERSIST_KV_G2S = bool(
+        int(os.environ.get("ENABLE_FFPA_PERSIST_KV_G2S", 0))
     )
 
     # if True: grid(N/Br, H, B) else: grid(N/Br, B * H)
@@ -147,11 +154,15 @@ class ENV(object):
     @classmethod
     def enable_persist_q_s2r(cls):
         return cls.ENABLE_FFPA_PERSIST_Q_S2R
-    
+
     @classmethod
     def enable_persist_q_g2s(cls):
         return cls.ENABLE_FFPA_PERSIST_Q_G2S
-    
+
+    @classmethod
+    def enable_persist_kv_g2s(cls):
+        return cls.ENABLE_FFPA_PERSIST_KV_G2S
+
     @classmethod
     def enable_launch_grid_dnhb(cls):
         return cls.ENBALE_FFPA_LAUNCH_GRID_DNHB
@@ -183,14 +194,24 @@ class ENV(object):
             extra_env_cflags.append("-DENABLE_FFPA_PERSIST_Q_S2R")
         if cls.enable_persist_q_g2s():
             extra_env_cflags.append("-DENABLE_FFPA_PERSIST_Q_G2S")
+        if cls.enable_persist_kv_g2s():
+            extra_env_cflags.append("-DENABLE_FFPA_PERSIST_KV_G2S")
         if cls.enable_launch_grid_dnhb():
             extra_env_cflags.append("-DENBALE_FFPA_LAUNCH_GRID_DNHB")
-        assert not all(
-            (cls.enable_persist_q_s2r(), cls.enable_persist_q_g2s())
-        ), "PERSIST_Q_G2S and PERSIST_Q_S2R can not both enabled."
+        if not cls.enable_persist_kv_g2s():
+            assert not all(
+                (cls.enable_persist_q_s2r(), cls.enable_persist_q_g2s())
+            ), "PERSIST_Q_G2S and PERSIST_Q_S2R can not both enabled."
+        if cls.enable_persist_kv_g2s():
+            assert (
+                cls.enable_persist_q_g2s()
+            ), "PERSIST_Q_G2S must be enable if PERSIST_KV_G2S is enabled."
         assert not all(
             (cls.enable_qkv_smem_share(), cls.enable_persist_q_g2s())
         ), "PERSIST_Q_G2S and QKV_SMEM_SHARE can not both enabled."
+        assert not all(
+            (cls.enable_qkv_smem_share(), cls.enable_persist_kv_g2s())
+        ), "PERSIST_KV_G2S and QKV_SMEM_SHARE can not both enabled."
         return extra_env_cflags
 
     @classmethod
@@ -217,6 +238,7 @@ class ENV(object):
         formatenv("ENABLE_FFPA_FORCE_PV_F16", cls.enable_force_pv_fp16())
         formatenv("ENABLE_FFPA_PERSIST_Q_S2R", cls.enable_persist_q_s2r())
         formatenv("ENABLE_FFPA_PERSIST_Q_G2S", cls.enable_persist_q_g2s())
+        formatenv("ENABLE_FFPA_PERSIST_KV_G2S", cls.enable_persist_kv_g2s())
         formatenv("ENABLE_FFPA_QKV_SMEM_SHARE", cls.enable_qkv_smem_share())
         formatenv("ENABLE_FFPA_SMEM_SWIZZLE_Q", cls.enable_smem_swizzle_q())
         formatenv("ENABLE_FFPA_SMEM_SWIZZLE_K", cls.enable_smem_swizzle_k())
