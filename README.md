@@ -18,7 +18,7 @@
   <p align="center"> <h2> 🤖FFPA: 1.8x~3x🎉faster vs SDPA EA with or without MMA Acc F32</h2></p>
 </div>
 
-🤖[WIP] **FFPA**: Yet antother **Faster Flash Prefill Attention** with **O(1) SRAM complexity** & **O(d/4) or O(1) register complexity** for large headdim (D > 256), almost **1.8x~3x** 🎉 faster than SDPA EA with or without MMA Acc F32 on many devices: [📈L20 ~1.9x↑🎉](#L1-bench-l20), [📈A30 ~1.8x↑🎉](#L1-bench-a30), [📈3080 ~2.9x↑🎉](#L1-bench-3080), [📈4090 ~2.1x↑🎉](#L1-bench-4090). I have implemente not only `FFPA Attention Algo: Fine-grained tiling` for large headim but also ` FA-2 Attention Algo: Coarse-grained tiling` for small headidm in this repo.
+🤖[WIP] **FFPA**: Yet antother **Faster Flash Prefill Attention** with **O(1) SRAM complexity** & **O(d/4) or O(1) register complexity** for large headdim (D > 256), almost **1.8x~3x** 🎉 faster than SDPA EA with or without MMA Acc F32 on many devices: [📈L20 ~1.9x↑🎉](#L1-bench-l20), [📈A30 ~1.8x↑🎉](#L1-bench-a30), [📈3080 ~2.9x↑🎉](#L1-bench-3080), [📈4090 ~2.1x↑🎉](#L1-bench-4090). I have implemented not only `FFPA Attention Algo: Fine-grained tiling` for large headim but also ` FA-2 Attention Algo: Coarse-grained tiling` for small headidm in this repo.
 
 💡NOTE: This project is still in its early dev stages and now provides some kernels and benchmarks for reference. More features will be added in the future. (Welcome to 🌟👆🏻star this repo to support me ~)
 
