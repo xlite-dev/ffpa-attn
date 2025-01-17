@@ -112,6 +112,9 @@ void launch_ffpa_mma_L1_template(torch::Tensor Q,
 #else
   dim3 grid(utils::div_ceil(QKV_seqlen, Br), QKV_batch * QKV_head); 
 #endif
+  // Precompute softmax scale and Tc
+  const int Tc = utils::div_ceil(QKV_seqlen, Bc); // Tc K_tile[Bc,d]  
+  const float scale = 1.0f / sqrt((float) kHeadDim);
 
   auto ffpa_mma_L1_kernel_func = (
     ffpa_mma_stages_split_q_L1_template<
@@ -155,7 +158,9 @@ void launch_ffpa_mma_L1_template(torch::Tensor Q,
     reinterpret_cast<half*>(V.data_ptr()),
     reinterpret_cast<half*>(O.data_ptr()),
     QKV_seqlen,
-    QKV_head
+    QKV_head,
+    scale,
+    Tc
   );
 }
 
