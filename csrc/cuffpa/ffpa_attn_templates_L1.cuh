@@ -33,12 +33,12 @@ template<
 >
 __global__ void __launch_bounds__(
   WARP_SIZE * kMmaTileSeqLenQ * kMmaTileSeqLenK) 
-ffpa_mma_stages_split_q_L1_template(half* Q, 
-                                    half* K, 
-                                    half* V, 
-                                    half* O, 
-                                    int QKV_seqlen, 
-                                    int QKV_head) {
+ffpa_mma_stages_split_q_L1_template(half* const __restrict__ Q, 
+                                    half* const __restrict__ K, 
+                                    half* const __restrict__ V, 
+                                    half*       __restrict__ O, 
+                                    int   const QKV_seqlen, 
+                                    int   const QKV_head) {
   prefill::check_compiling_states<
     kHeadDim, kMmaAtomM, kMmaAtomN, kMmaAtomK, kMmaTileSeqLenQ, kMmaTileSeqLenK, 
     kMmaTileSeqLenP, kMmaTileHeadDimV, kWarpTileSeqLenQ, kWarpTileSeqLenK, 
