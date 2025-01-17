@@ -42,7 +42,6 @@ ffpa_mma_stages_split_q_L1_template(const half* __restrict__ Q,
                                     const float scale,
                                     const int Tc
 ) {
-  // TODO: Persist K/V g2s for small headdim (<=128).
   prefill::check_compiling_states<
     kHeadDim, kMmaAtomM, kMmaAtomN, kMmaAtomK, kMmaTileSeqLenQ, kMmaTileSeqLenK, 
     kMmaTileSeqLenP, kMmaTileHeadDimV, kWarpTileSeqLenQ, kWarpTileSeqLenK, 
@@ -530,4 +529,60 @@ ffpa_mma_stages_split_q_L1_template(const half* __restrict__ Q,
     Br, kHeadDim, kMmaAtomM, kMmaAtomN, kWarpTileHeadDimV, kOStorageAccFloat32>(
       O, O_gmem_offset, O_tile_id, warp_QP, &R_D[0][0][0], &R_Q[0][0], &R_K[0][0]
   );
+}
+
+
+template<
+  const int kHeadDim,              // Headdim, 32~1024     
+  const int kMmaAtomM,             // MMA Atom M, 16
+  const int kMmaAtomN,             // MMA Atom N, 8
+  const int kMmaAtomK,             // MMA Atom K, 16
+  const int kMmaTileSeqLenQ,       // 4, more MMA(warp), M=16*4=64, Q@K^T=[Br(M), d(K)]@[d(K),  Bc(N)]  
+  const int kMmaTileSeqLenK,       // 1, more MMA(warp), N=8*1 =8,  Q@K^T=[Br(M), d(K)]@[d(K),  Bc(N)]    
+  const int kMmaTileSeqLenP,       // 4, more MMA(warp), M=16*4=64, P@V  =[Br(M),Bc(K)]@[Bc(K), d(N) ]
+  const int kMmaTileHeadDimV,      // 1, more MMA(warp), N=8*1 =8,  P@V  =[Br(M),Bc(K)]@[Bc(K), d(N) ]       
+  const int kWarpTileSeqLenQ,      // 1, more values, M, Br=64*1=64, matmul M 
+  const int kWarpTileSeqLenK,      // 8, more values, N, Bc=8*8 =64, matmul N
+  const int kWarpTileSeqLenP,      // 1, more values, M, Br=64*1=64, matmul M
+  const int kWarpTileHeadDimV,     // 8, more values, N, d=8*(1|2|3|4|...)=8|...|32|64|96|128|...
+  const int kMmaAccFloat32QK,      // 0/1, Q@K^T, 0 MMA Acc with fp16, 1 MMA Acc with fp32.
+  const int kMmaAccFloat32PV,      // 0/1, P@V, 0 MMA Acc with fp16, 1 MMA Acc with fp32.
+  const int kOStorageAccFloat32,   // 0/1, MMA Acc always be f32/f16, but O storage can be fp32 or half.
+  const int kPrefetchQK,           // Prefetch QK at the Appropriate Time Point. 
+  const int kPrefetchPV,           // Prefetch V at the Appropriate Time Point. 
+  const int kShareSmemQKV,         // QKV share the same shared memory, reuse QK smem for V.
+  const int kPersistQs2r,          // Persist load Q s2r for headdim < 512, more registers, but still keep O(1) SRAM.
+  const int kPersistQg2s,          // Persist QKV is always true for small d, Persist load QKV g2s for headdim < 512, more SRAM, but still keep register usage.
+  const int kStageQK,              // <= 4, may apply different multi stages policy for QK and V (<=4)
+  const int kStagePV,              // <= 4, may apply different multi stages policy for QK and V (<=4)
+  const int kPadQ,                 // Pad Q/K/V 0,8; 0 -> smem swizzle, > 0 -> padding
+  const int kPadK,
+  const int kPadV            
+>
+__global__ void __launch_bounds__(
+  WARP_SIZE * kMmaTileSeqLenQ * kMmaTileSeqLenK) 
+ffpa_mma_stages_split_q_L1_small_d_template(const half* __restrict__ Q, 
+                                            const half* __restrict__ K, 
+                                            const half* __restrict__ V, 
+                                            half*       __restrict__ O, 
+                                            const int QKV_seqlen, 
+                                            const int QKV_head,
+                                            const float scale,
+                                            const int Tc
+) {
+  // TODO: This kernel template is developed for small head dimensions (d <= 256), namely,
+  // flash-attention-2. Always persist QKV for flash-attn, apply tiling at
+  // the Attention level not the MMA level. In order to reuse prefill.cuh, we choose
+  // to keep the kPersistQg2s flag in the template.
+  static_assert(kPersistQg2s == 1); 
+  prefill::check_compiling_states<
+    kHeadDim, kMmaAtomM, kMmaAtomN, kMmaAtomK, kMmaTileSeqLenQ, kMmaTileSeqLenK, 
+    kMmaTileSeqLenP, kMmaTileHeadDimV, kWarpTileSeqLenQ, kWarpTileSeqLenK, 
+    kWarpTileSeqLenP, kWarpTileHeadDimV, kMmaAccFloat32QK, kMmaAccFloat32PV,
+    kOStorageAccFloat32, kPrefetchQK, kPrefetchPV, kShareSmemQKV, kPersistQs2r, 
+    kPersistQg2s, kStageQK, kStagePV, kPadQ, kPadK, kPadV
+  >();
+  constexpr int Br = kMmaAtomM * kMmaTileSeqLenQ * kWarpTileSeqLenQ;
+  constexpr int Bc = kMmaAtomN * kMmaTileSeqLenK * kWarpTileSeqLenK;
+  constexpr int kNumThreads = WARP_SIZE * kMmaTileSeqLenQ * kMmaTileSeqLenK;
 }
