@@ -18,12 +18,25 @@ void launch_ffpa_mma_L1_template(torch::Tensor Q,
   constexpr int kMmaAtomM = 16;
   constexpr int kMmaAtomN = 8;
   constexpr int kMmaAtomK = 16;
-  constexpr int kMmaTileSeqLenQ  = (kHeadDim < 128) ? 4 : 8;
+#ifdef ENABLE_FFPA_PERSIST_KV_G2S 
+  // Need more SRAM, use small tile 64x64 for large headdim
+  // and large tile for small headdim. headdim > 256 will 
+  // use ffpa-attn, not flash-attn.
+  constexpr int kMmaTileSeqLenQ  = (kHeadDim <= 128 || kHeadDim > 256) ? 8 : 4;
   constexpr int kMmaTileSeqLenK  = 1;
-  constexpr int kMmaTileSeqLenP  = (kHeadDim < 128) ? 4 : 8;
+  constexpr int kMmaTileSeqLenP  = (kHeadDim <= 128 || kHeadDim > 256) ? 8 : 4;
   constexpr int kMmaTileHeadDimV = 1;
   constexpr int kWarpTileSeqLenQ = 1;
-  constexpr int kWarpTileSeqLenK = (kHeadDim < 128) ? 8 : 16;
+  constexpr int kWarpTileSeqLenK = (kHeadDim <= 128 || kHeadDim > 256) ? 16 : 8;
+#else
+  // O(1) SRAM complexity, always use large tile for large headdim.
+  constexpr int kMmaTileSeqLenQ  = (kHeadDim <= 128) ? 8 : 8;
+  constexpr int kMmaTileSeqLenK  = 1;
+  constexpr int kMmaTileSeqLenP  = (kHeadDim <= 128) ? 8 : 8;
+  constexpr int kMmaTileHeadDimV = 1;
+  constexpr int kWarpTileSeqLenQ = 1;
+  constexpr int kWarpTileSeqLenK = (kHeadDim <= 128) ? 16 : 16;
+#endif
   constexpr int kWarpTileSeqLenP = 1;
   constexpr int kWarpTileHeadDimV = (kHeadDim / (kMmaAtomN * kMmaTileHeadDimV));
   constexpr int Br = kMmaAtomM * kMmaTileSeqLenQ * kWarpTileSeqLenQ;
@@ -45,23 +58,31 @@ void launch_ffpa_mma_L1_template(torch::Tensor Q,
 #else
   constexpr int kPersistQs2r = 0;
 #endif
+
   // Persist load Q g2s for headdim < 512, more SRAM, but still
   // keep register usage.
-#ifdef ENABLE_FFPA_PERSIST_Q_G2S
+#if defined(ENABLE_FFPA_PERSIST_Q_G2S)
   constexpr int kPersistQg2s = (kHeadDim < 256) ? 1 : (
     (kHeadDim <= 320) ? ((kStageQK < 3) ? 1 : 0) : 0 
   );
 #else
   constexpr int kPersistQg2s = 0;
 #endif
+
   // Prefetch QKV at the appropriate time point. 
-#ifdef ENABLE_FFPA_PREFETCH_QKV
+#if defined(ENABLE_FFPA_PREFETCH_QKV)
+#if defined(ENABLE_FFPA_PERSIST_KV_G2S)
+  constexpr int kPrefetchQK = 1; // kStageQK is unused
+  constexpr int kPrefetchPV = 1; // kStagePV is unused
+#else 
   constexpr int kPrefetchQK = (kStageQK > 1) ? 1 : 0; 
   constexpr int kPrefetchPV = (kStagePV > 1) ? 1 : 0; 
+#endif
 #else 
   constexpr int kPrefetchQK = 0;
   constexpr int kPrefetchPV = 0;
 #endif
+
   // QKV smem swizzle, 0 for smem swizzle, !0 for smem padding.
 #ifdef ENABLE_FFPA_SMEM_SWIZZLE_Q
   constexpr int kPadQ = 0;
@@ -78,26 +99,6 @@ void launch_ffpa_mma_L1_template(torch::Tensor Q,
 #else 
   constexpr int kPadV = 8;
 #endif
-
-  // Calculate SRAM size needed per block, Q,K,V smem size, V shared the QK smem.
-  constexpr int QK_smem_size = (
-    (kPersistQg2s ? (kHeadDim / kMmaAtomK) : kStageQK) * // Q
-    (Br * (kMmaAtomK + kPadQ)) + 
-    (kStageQK) * (Bc * (kMmaAtomK + kPadK))  // K
-  );
-  // R_D registers, s=2, d=64, 16 regs; d=128, 32 regs; 
-  // d=256, 64 regs; d=512, 128 regs; d=1024, 256 regs;
-  constexpr int PV_smem_size = (kStagePV * (Bc * (kMmaAtomN * 2 + kPadV))); 
-#ifdef ENABLE_FFPA_QKV_SMEM_SHARE
-  constexpr int kShareSmemQKV = 1;
-  // try to let V reuse all Q+K smem after Q@K^T, reduce smem usage.
-  constexpr int kQKVSmemMaxSize = (QK_smem_size > PV_smem_size ? 
-                                   QK_smem_size * 2 : 
-                                   PV_smem_size * 2);
-#else
-  constexpr int kShareSmemQKV = 0;
-  constexpr int kQKVSmemMaxSize = (QK_smem_size + PV_smem_size) * 2;
-#endif 
 
   const int QKV_batch  = Q.size(0); 
   const int QKV_head   = Q.size(1);
@@ -116,8 +117,143 @@ void launch_ffpa_mma_L1_template(torch::Tensor Q,
   const int Tc = utils::div_ceil(QKV_seqlen, Bc); // Tc K_tile[Bc,d]  
   const float scale = 1.0f / sqrt((float) kHeadDim);
 
+
+#define LAUNCH_TEMPLATE_FUNC(TEMPLATE_FUNC)                 \
+cudaFuncSetAttribute(                                       \
+  TEMPLATE_FUNC,                                            \
+  cudaFuncAttributeMaxDynamicSharedMemorySize,              \
+  kQKVSmemMaxSize                                           \
+);                                                          \
+TEMPLATE_FUNC<<<grid, block, kQKVSmemMaxSize>>>(            \
+  reinterpret_cast<half*>(Q.data_ptr()),                    \
+  reinterpret_cast<half*>(K.data_ptr()),                    \
+  reinterpret_cast<half*>(V.data_ptr()),                    \
+  reinterpret_cast<half*>(O.data_ptr()),                    \
+  QKV_seqlen,                                               \
+  QKV_head,                                                 \
+  scale,                                                    \
+  Tc                                                        \
+);
+
+#ifdef ENABLE_FFPA_PERSIST_KV_G2S
+  if constexpr (kHeadDim <= 256) {
+    // Calculate SRAM size needed per block, Q,K,V smem size, V shared the QK smem.
+    constexpr int QK_smem_size = (
+      (kHeadDim / kMmaAtomK) * (Br * (kMmaAtomK + kPadQ)) + 
+      (kHeadDim / kMmaAtomK) * (Bc * (kMmaAtomK + kPadK))  // K
+    );
+    // R_D registers, s=2, d=64, 16 regs; d=128, 32 regs; 
+    // d=256, 64 regs; d=512, 128 regs; d=1024, 256 regs;
+    constexpr int PV_smem_size = (
+      (kHeadDim / (kMmaAtomN * 2))* (Bc * (kMmaAtomN * 2 + kPadV))
+    );
+    constexpr int kShareSmemQKV = 0;
+    constexpr int kQKVSmemMaxSize = (QK_smem_size + PV_smem_size) * 2;
+
+    auto ffpa_mma_L1_kernel_func = (
+      ffpa_mma_stages_split_q_L1_small_d_template<
+        kHeadDim, 
+        kMmaAtomM, 
+        kMmaAtomN, 
+        kMmaAtomK, 
+        kMmaTileSeqLenQ,  
+        kMmaTileSeqLenK,
+        kMmaTileSeqLenP, 
+        kMmaTileHeadDimV, 
+        kWarpTileSeqLenQ, 
+        kWarpTileSeqLenK, 
+        kWarpTileSeqLenP, 
+        kWarpTileHeadDimV, 
+        kMmaAccFloat32QK,
+        kMmaAccFloat32PV,
+        kOStorageAccFloat32,
+        kPrefetchQK,
+        kPrefetchPV,
+        0, /*kShareSmemQKV*/
+        kPersistQs2r,
+        1, /*kPersistQg2s*/
+        1, /*kStageQK unused*/
+        1, /*kStagePV unused*/
+        kPadQ,
+        kPadK,
+        kPadV
+      >
+    );
+    LAUNCH_TEMPLATE_FUNC(ffpa_mma_L1_kernel_func);
+  } else {
+    // Calculate SRAM size needed per block, Q,K,V smem size, V shared the QK smem.
+    constexpr int QK_smem_size = (
+      (kPersistQg2s ? (kHeadDim / kMmaAtomK) : kStageQK) * // Q
+      (Br * (kMmaAtomK + kPadQ)) + 
+      (kStageQK) * (Bc * (kMmaAtomK + kPadK))  // K
+    );
+    // R_D registers, s=2, d=64, 16 regs; d=128, 32 regs; 
+    // d=256, 64 regs; d=512, 128 regs; d=1024, 256 regs;
+    constexpr int PV_smem_size = (kStagePV * (Bc * (kMmaAtomN * 2 + kPadV)));
+#if defined(ENABLE_FFPA_QKV_SMEM_SHARE)
+    constexpr int kShareSmemQKV = 1;
+    // try to let V reuse all Q+K smem after Q@K^T, reduce smem usage.
+    constexpr int kQKVSmemMaxSize = (QK_smem_size > PV_smem_size ? 
+                                     QK_smem_size * 2 : 
+                                     PV_smem_size * 2);
+#else
+    constexpr int kShareSmemQKV = 0;
+    constexpr int kQKVSmemMaxSize = (QK_smem_size + PV_smem_size) * 2;
+#endif 
+    auto ffpa_mma_L1_kernel_func = (
+      ffpa_mma_stages_split_q_L1_large_d_template<
+        kHeadDim, 
+        kMmaAtomM, 
+        kMmaAtomN, 
+        kMmaAtomK, 
+        kMmaTileSeqLenQ,  
+        kMmaTileSeqLenK,
+        kMmaTileSeqLenP, 
+        kMmaTileHeadDimV, 
+        kWarpTileSeqLenQ, 
+        kWarpTileSeqLenK, 
+        kWarpTileSeqLenP, 
+        kWarpTileHeadDimV, 
+        kMmaAccFloat32QK,
+        kMmaAccFloat32PV,
+        kOStorageAccFloat32,
+        kPrefetchQK,
+        kPrefetchPV,
+        kShareSmemQKV,
+        kPersistQg2s ? 0 : kPersistQs2r,
+        kPersistQg2s,
+        kStageQK, 
+        kStagePV,
+        kPadQ,
+        kPadK,
+        kPadV
+      >
+    );
+    LAUNCH_TEMPLATE_FUNC(ffpa_mma_L1_kernel_func);
+  }
+#else  
+  // Calculate SRAM size needed per block, Q,K,V smem size, V shared the QK smem.
+  constexpr int QK_smem_size = (
+    (kPersistQg2s ? (kHeadDim / kMmaAtomK) : kStageQK) * // Q
+    (Br * (kMmaAtomK + kPadQ)) + 
+    (kStageQK) * (Bc * (kMmaAtomK + kPadK))  // K
+  );
+  // R_D registers, s=2, d=64, 16 regs; d=128, 32 regs; 
+  // d=256, 64 regs; d=512, 128 regs; d=1024, 256 regs;
+  constexpr int PV_smem_size = (kStagePV * (Bc * (kMmaAtomN * 2 + kPadV)));
+#if defined(ENABLE_FFPA_QKV_SMEM_SHARE)
+  constexpr int kShareSmemQKV = 1;
+  // try to let V reuse all Q+K smem after Q@K^T, reduce smem usage.
+  constexpr int kQKVSmemMaxSize = (QK_smem_size > PV_smem_size ? 
+                                   QK_smem_size * 2 : 
+                                   PV_smem_size * 2);
+#else
+  constexpr int kShareSmemQKV = 0;
+  constexpr int kQKVSmemMaxSize = (QK_smem_size + PV_smem_size) * 2;
+#endif 
+
   auto ffpa_mma_L1_kernel_func = (
-    ffpa_mma_stages_split_q_L1_template<
+    ffpa_mma_stages_split_q_L1_large_d_template<
       kHeadDim, 
       kMmaAtomM, 
       kMmaAtomN, 
@@ -136,7 +272,7 @@ void launch_ffpa_mma_L1_template(torch::Tensor Q,
       kPrefetchQK,
       kPrefetchPV,
       kShareSmemQKV,
-      kPersistQs2r,
+      kPersistQg2s ? 0 : kPersistQs2r,
       kPersistQg2s,
       kStageQK, 
       kStagePV,
@@ -145,23 +281,10 @@ void launch_ffpa_mma_L1_template(torch::Tensor Q,
       kPadV
     >
   );
+  LAUNCH_TEMPLATE_FUNC(ffpa_mma_L1_kernel_func);
+#endif
 
-  cudaFuncSetAttribute(
-    ffpa_mma_L1_kernel_func,
-    cudaFuncAttributeMaxDynamicSharedMemorySize,
-    kQKVSmemMaxSize
-  );
-
-  ffpa_mma_L1_kernel_func<<<grid, block, kQKVSmemMaxSize>>>(
-    reinterpret_cast<half*>(Q.data_ptr()),
-    reinterpret_cast<half*>(K.data_ptr()),
-    reinterpret_cast<half*>(V.data_ptr()),
-    reinterpret_cast<half*>(O.data_ptr()),
-    QKV_seqlen,
-    QKV_head,
-    scale,
-    Tc
-  );
+#undef LAUNCH_TEMPLATE_FUNC
 }
 
 // dispatch headdim

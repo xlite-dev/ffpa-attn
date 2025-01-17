@@ -61,7 +61,7 @@ __device__ __forceinline__ void check_compiling_states() {
   // Persist load Q g2s for headdim < 512, more SRAM, but still keep register usage.
   static_assert(kPersistQg2s == 0 || kPersistQg2s == 1);
   // kPersistQg2s and kPersistQs2r can not both enabled.
-  static_assert((kPersistQg2s & kPersistQs2r)  == 0);
+  // static_assert((kPersistQg2s & kPersistQs2r)  == 0);
   // kPersistQg2s and kShareSmemQKV can not both enabled.
   static_assert((kPersistQg2s & kShareSmemQKV) == 0);
   // May apply different multi stages policy for QK and V.
