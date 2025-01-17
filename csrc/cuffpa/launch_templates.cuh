@@ -41,18 +41,18 @@ void launch_ffpa_mma_L1_template(torch::Tensor Q,
   // Persist load Q s2r for headdim < 512, more registers, 
   // but still keep O(1) SRAM.
 #ifdef ENABLE_FFPA_PERSIST_Q_S2R
-  const int kPersistQs2r = 1;
+  constexpr int kPersistQs2r = 1;
 #else
-  const int kPersistQs2r = 0;
+  constexpr int kPersistQs2r = 0;
 #endif
   // Persist load Q g2s for headdim < 512, more SRAM, but still
   // keep register usage.
 #ifdef ENABLE_FFPA_PERSIST_Q_G2S
-  const int kPersistQg2s = (kHeadDim < 256) ? 1 : (
+  constexpr int kPersistQg2s = (kHeadDim < 256) ? 1 : (
     (kHeadDim <= 320) ? ((kStageQK < 3) ? 1 : 0) : 0 
   );
 #else
-  const int kPersistQg2s = 0;
+  constexpr int kPersistQg2s = 0;
 #endif
   // Prefetch QKV at the appropriate time point. 
 #ifdef ENABLE_FFPA_PREFETCH_QKV
