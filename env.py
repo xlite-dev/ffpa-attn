@@ -279,6 +279,7 @@ class ENV(object):
 
     @staticmethod
     def get_build_cuda_cflags(build_pkg: bool = False):
+        device_name = ENV.get_device_name()
         extra_cuda_cflags = []
         extra_cuda_cflags.append("-O3")
         extra_cuda_cflags.append("-std=c++17")
@@ -294,6 +295,15 @@ class ENV(object):
         )
         extra_cuda_cflags.append(
             "-Xptxas -v" if not build_pkg else "--ptxas-options=-O3"
+        )
+        extra_cuda_cflags.append(
+            "-DBUILD_FFPA_ATTN_MMA_L20"  if "L20"  in device_name else ""
+        )
+        extra_cuda_cflags.append(
+            "-DBUILD_FFPA_ATTN_MMA_4090" if "4090" in device_name else ""
+        )
+        extra_cuda_cflags.append(
+            "-DBUILD_FFPA_ATTN_MMA_3080" if "3080" in device_name else ""
         )
         extra_cuda_cflags.extend(ENV.env_cuda_cflags())
         extra_cuda_cflags.append(f"-I {ENV.project_dir()}/include")
