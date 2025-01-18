@@ -21,12 +21,24 @@ void launch_ffpa_mma_L1_template(torch::Tensor Q,
   // Need more SRAM, use small tile 64x64 for large headdim
   // and large tile for small headdim. headdim > 256 will 
   // use ffpa-attn, not flash-attn.
+  // TODO: tune block size for L20/4090/3080 etc.
+  // prefer small block size on NVIDIA L20 device.
+#ifdef BUILD_FFPA_ATTN_MMA_L20
+  constexpr int kMmaTileSeqLenQ  = (kHeadDim <= 128 || kHeadDim > 256) ? 4 : 4;
+  constexpr int kMmaTileSeqLenK  = 1;
+  constexpr int kMmaTileSeqLenP  = (kHeadDim <= 128 || kHeadDim > 256) ? 4 : 4;
+  constexpr int kMmaTileHeadDimV = 1;
+  constexpr int kWarpTileSeqLenQ = 1;
+  constexpr int kWarpTileSeqLenK = (kHeadDim <= 128 || kHeadDim > 256) ? 8 : 8;
+#else 
   constexpr int kMmaTileSeqLenQ  = (kHeadDim <= 128 || kHeadDim > 256) ? 8 : 4;
   constexpr int kMmaTileSeqLenK  = 1;
   constexpr int kMmaTileSeqLenP  = (kHeadDim <= 128 || kHeadDim > 256) ? 8 : 4;
   constexpr int kMmaTileHeadDimV = 1;
   constexpr int kWarpTileSeqLenQ = 1;
   constexpr int kWarpTileSeqLenK = (kHeadDim <= 128 || kHeadDim > 256) ? 16 : 8;
+#endif
+
 #else
   // O(1) SRAM complexity, always use large tile for large headdim.
   constexpr int kMmaTileSeqLenQ  = (kHeadDim <= 128) ? 8 : 8;
