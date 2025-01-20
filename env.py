@@ -69,15 +69,6 @@ class ENV(object):
         int(os.environ.get("ENABLE_FFPA_SMEM_SWIZZLE_V", 1))
     )
 
-    # Persist load Q from s2r for headdim < 512 to reduce Q from g2s and s2r IO access,
-    # but still keep O(1) SRAM complexity. Default value is False. This option will
-    # introduce more registers for Q frags as the headdim becomes larger. We should
-    # choose to enable it or not according to the balance between register usage and
-    # IO access reduction.
-    ENABLE_FFPA_PERSIST_Q_S2R = bool(
-        int(os.environ.get("ENABLE_FFPA_PERSIST_Q_S2R", 0))
-    )
-
     # Persist load Q g2s for headdim <= 320, more SRAM, but still keep register usage.
     ENABLE_FFPA_PERSIST_Q_G2S = bool(
         int(os.environ.get("ENABLE_FFPA_PERSIST_Q_G2S", 0))
@@ -88,6 +79,20 @@ class ENV(object):
     # fined-grain tiling at MMA level for headdim > 256.
     ENABLE_FFPA_PERSIST_KV_G2S = bool(
         int(os.environ.get("ENABLE_FFPA_PERSIST_KV_G2S", 0))
+    )
+
+    # Persist load Q from s2r for headdim < 512 to reduce Q from g2s and s2r IO access,
+    # but still keep O(1) SRAM complexity. Default value is False. This option will
+    # introduce more registers for Q frags as the headdim becomes larger. We should
+    # choose to enable it or not according to the balance between register usage and
+    # IO access reduction.
+    ENABLE_FFPA_PERSIST_Q_S2R = bool(
+        int(os.environ.get("ENABLE_FFPA_PERSIST_Q_S2R", 0))
+    )
+
+    # Persist V s2r only for small d kernel, more registers.
+    ENABLE_FFPA_PERSIST_V_S2R = bool(
+        int(os.environ.get("ENABLE_FFPA_PERSIST_V_S2R", ENABLE_FFPA_PERSIST_KV_G2S))
     )
 
     # if True: grid(N/Br, H, B) else: grid(N/Br, B * H)
@@ -152,16 +157,22 @@ class ENV(object):
         return cls.ENABLE_FFPA_SMEM_SWIZZLE_V
 
     @classmethod
-    def enable_persist_q_s2r(cls):
-        return cls.ENABLE_FFPA_PERSIST_Q_S2R
-
-    @classmethod
     def enable_persist_q_g2s(cls):
         return cls.ENABLE_FFPA_PERSIST_Q_G2S
 
     @classmethod
     def enable_persist_kv_g2s(cls):
         return cls.ENABLE_FFPA_PERSIST_KV_G2S
+
+    @classmethod
+    def enable_persist_q_s2r(cls):
+        return cls.ENABLE_FFPA_PERSIST_Q_S2R
+
+    @classmethod
+    def enable_persist_v_s2r(cls):
+        if cls.enable_persist_kv_g2s():
+            return cls.ENABLE_FFPA_PERSIST_V_S2R
+        return False
 
     @classmethod
     def enable_launch_grid_dnhb(cls):
@@ -190,28 +201,36 @@ class ENV(object):
             extra_env_cflags.append("-DENABLE_FFPA_SMEM_SWIZZLE_K")
         if cls.enable_smem_swizzle_v():
             extra_env_cflags.append("-DENABLE_FFPA_SMEM_SWIZZLE_V")
-        if cls.enable_persist_q_s2r():
-            extra_env_cflags.append("-DENABLE_FFPA_PERSIST_Q_S2R")
         if cls.enable_persist_q_g2s():
             extra_env_cflags.append("-DENABLE_FFPA_PERSIST_Q_G2S")
         if cls.enable_persist_kv_g2s():
             extra_env_cflags.append("-DENABLE_FFPA_PERSIST_KV_G2S")
+        if cls.enable_persist_q_s2r():
+            extra_env_cflags.append("-DENABLE_FFPA_PERSIST_Q_S2R")
+        if cls.enable_persist_v_s2r():
+            extra_env_cflags.append("-DENABLE_FFPA_PERSIST_V_S2R")
         if cls.enable_launch_grid_dnhb():
             extra_env_cflags.append("-DENBALE_FFPA_LAUNCH_GRID_DNHB")
-        if not cls.enable_persist_kv_g2s():
-            assert not all(
-                (cls.enable_persist_q_s2r(), cls.enable_persist_q_g2s())
-            ), "PERSIST_Q_G2S and PERSIST_Q_S2R can not both enabled."
+
         if cls.enable_persist_kv_g2s():
             assert (
                 cls.enable_persist_q_g2s()
             ), "PERSIST_Q_G2S must be enable if PERSIST_KV_G2S is enabled."
-        assert not all(
-            (cls.enable_qkv_smem_share(), cls.enable_persist_q_g2s())
-        ), "PERSIST_Q_G2S and QKV_SMEM_SHARE can not both enabled."
-        assert not all(
-            (cls.enable_qkv_smem_share(), cls.enable_persist_kv_g2s())
-        ), "PERSIST_KV_G2S and QKV_SMEM_SHARE can not both enabled."
+            if cls.enable_qkv_smem_share():
+                assert (
+                    cls.enable_persist_q_s2r()
+                ), "PERSIST_Q_S2R must be enable if QKV_SMEM_SHARE and "
+                "PERSIST_KV_G2S are enabled."
+        else:
+            assert not all(
+                (cls.enable_persist_q_s2r(), cls.enable_persist_q_g2s())
+            ), "PERSIST_Q_G2S and PERSIST_Q_S2R can not both enabled."
+            assert not all(
+                (cls.enable_qkv_smem_share(), cls.enable_persist_q_g2s())
+            ), "PERSIST_Q_G2S and QKV_SMEM_SHARE can not both enabled."
+            assert not all(
+                (cls.enable_qkv_smem_share(), cls.enable_persist_kv_g2s())
+            ), "PERSIST_KV_G2S and QKV_SMEM_SHARE can not both enabled."
         return extra_env_cflags
 
     @classmethod
@@ -236,9 +255,10 @@ class ENV(object):
         formatenv("ENABLE_FFPA_PREFETCH_QKV", cls.enable_prefetch_qkv())
         formatenv("ENABLE_FFPA_FORCE_QK_F16", cls.enable_force_qk_fp16())
         formatenv("ENABLE_FFPA_FORCE_PV_F16", cls.enable_force_pv_fp16())
-        formatenv("ENABLE_FFPA_PERSIST_Q_S2R", cls.enable_persist_q_s2r())
         formatenv("ENABLE_FFPA_PERSIST_Q_G2S", cls.enable_persist_q_g2s())
         formatenv("ENABLE_FFPA_PERSIST_KV_G2S", cls.enable_persist_kv_g2s())
+        formatenv("ENABLE_FFPA_PERSIST_Q_S2R", cls.enable_persist_q_s2r())
+        formatenv("ENABLE_FFPA_PERSIST_V_S2R", cls.enable_persist_v_s2r())
         formatenv("ENABLE_FFPA_QKV_SMEM_SHARE", cls.enable_qkv_smem_share())
         formatenv("ENABLE_FFPA_SMEM_SWIZZLE_Q", cls.enable_smem_swizzle_q())
         formatenv("ENABLE_FFPA_SMEM_SWIZZLE_K", cls.enable_smem_swizzle_k())
@@ -297,7 +317,7 @@ class ENV(object):
             "-Xptxas -v" if not build_pkg else "--ptxas-options=-O3"
         )
         extra_cuda_cflags.append(
-            "-DBUILD_FFPA_ATTN_MMA_L20"  if "L20"  in device_name else ""
+            "-DBUILD_FFPA_ATTN_MMA_L20" if "L20" in device_name else ""
         )
         extra_cuda_cflags.append(
             "-DBUILD_FFPA_ATTN_MMA_4090" if "4090" in device_name else ""
