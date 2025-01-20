@@ -9,7 +9,6 @@ namespace ffpa {
 namespace prefill {
 // prefill utils: prefetch/load QKV g2s funcs, rescale/softmax funcs etc.
 
-
 template<
   const int kHeadDim,              // Headdim, 32,64,128     
   const int kMmaAtomM,             // MMA Atom M, 16
@@ -60,10 +59,21 @@ __device__ __forceinline__ void check_compiling_states() {
   static_assert(kPersistQs2r == 0 || kPersistQs2r == 1);
   // Persist load Q g2s for headdim < 512, more SRAM, but still keep register usage.
   static_assert(kPersistQg2s == 0 || kPersistQg2s == 1);
-  // kPersistQg2s and kPersistQs2r can not both enabled.
-  // static_assert((kPersistQg2s & kPersistQs2r)  == 0);
-  // kPersistQg2s and kShareSmemQKV can not both enabled.
-  static_assert((kPersistQg2s & kShareSmemQKV) == 0);
+  if constexpr (kHeadDim > 256) {
+    // kPersistQg2s and kPersistQs2r can not both enabled for large d kernel.
+    static_assert((kPersistQg2s & kPersistQs2r)  == 0);
+    // kPersistQg2s and kShareSmemQKV can not both enabled for large d kernel..
+    static_assert((kPersistQg2s & kShareSmemQKV) == 0);
+  } else {
+#ifdef ENABLE_FFPA_PERSIST_KV_G2S
+    if constexpr (kShareSmemQKV) {
+      // kPersistQs2r must be enabled is set kShareSmemQKV as 1
+      static_assert(kPersistQs2r == 1);
+    }
+    // kPersistQg2s must be enabled if KV g2s is enabled.
+    static_assert(kPersistQg2s == 1);
+#endif
+  }
   // May apply different multi stages policy for QK and V.
   static_assert(kStageQK < 5 && kStageQK > 0); // QK (<=4)
   static_assert(kStagePV < 5 && kStagePV > 0); // V  (<=4)
