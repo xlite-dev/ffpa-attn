@@ -61,7 +61,7 @@ void launch_ffpa_mma_L1_template(torch::Tensor Q,
   // FP16 can provide precision to approximately 3-4 decimal places.
   // Thus, if the error does not exceed 1e-3, using FP16 storage is 
   // sufficient for most applications.
-  constexpr int kOStorageAccFloat32 = (kHeadDim < 128) ? 1 : 0;
+  constexpr int kOStorageAccFloat32 = ((kHeadDim < 128)) ? 1 : 0;
   // Persist load Q s2r for headdim < 512, more registers, 
   // but still keep O(1) SRAM.
 #ifdef ENABLE_FFPA_PERSIST_Q_S2R
