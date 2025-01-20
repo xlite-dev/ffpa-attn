@@ -92,7 +92,7 @@ class ENV(object):
 
     # Persist V s2r only for small d kernel, more registers.
     ENABLE_FFPA_PERSIST_V_S2R = bool(
-        int(os.environ.get("ENABLE_FFPA_PERSIST_V_S2R", 1))
+        int(os.environ.get("ENABLE_FFPA_PERSIST_V_S2R", ENABLE_FFPA_PERSIST_KV_G2S))
     )
 
     # if True: grid(N/Br, H, B) else: grid(N/Br, B * H)
@@ -170,7 +170,9 @@ class ENV(object):
 
     @classmethod
     def enable_persist_v_s2r(cls):
-        return cls.ENABLE_FFPA_PERSIST_V_S2R
+        if cls.enable_persist_kv_g2s():
+            return cls.ENABLE_FFPA_PERSIST_V_S2R
+        return False
 
     @classmethod
     def enable_launch_grid_dnhb(cls):

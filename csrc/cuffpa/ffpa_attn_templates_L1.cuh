@@ -616,17 +616,15 @@ ffpa_mma_stages_split_q_L1_small_d_template(const half* __restrict__ Q,
   constexpr int Q_tile_size = Br * (kMmaAtomK     + kPadQ); // Q[Br,16], 64*16*2=2048 bytes
   constexpr int K_tile_size = Bc * (kMmaAtomK     + kPadK); // K[Bc,16]
   constexpr int V_tile_size = Bc * (kMmaAtomN * 2 + kPadV); // V[Bc,16]
-  // e.g d=64, Q smem [tile_K_d][Br][16], QKV may shared the same smem.
+  // e.g d=64, Q smem [tile_K_d][Br][16].
   half* Q_tile_smem = smem; 
-  // e.g d=64, K smem [tile_K_d][Bc][16], QKV may shared the same smem.
+  // e.g d=64, K smem [tile_K_d][Bc][16], QK may shared the same smem
   half* K_tile_smem = (
-    (kShareSmemQKV && kPersistQs2r) ? Q_tile_smem : // K reuse left half of Q smem
+    (kShareSmemQKV && kPersistQs2r) ? Q_tile_smem : 
     (Q_tile_smem + ((kHeadDim / kMmaAtomK) * Q_tile_size))
   ); 
-  // e.g d=64, V smem [tile_V_d][Bc][16], QKV may shared the same smem.
+  // e.g d=64, V smem [tile_V_d][Bc][16], V does not shared smem with QK.
   half* V_tile_smem = (
-    (kShareSmemQKV && kPersistQs2r) ? // V reuse right half of Q smem
-    (Q_tile_smem + ((kHeadDim / kMmaAtomK) * K_tile_size)):  
     (K_tile_smem + ((kHeadDim / kMmaAtomK) * K_tile_size))
   );
   const uint32_t smem_Q_base_ptr = __cvta_generic_to_shared(Q_tile_smem);
@@ -874,8 +872,11 @@ ffpa_mma_stages_split_q_L1_small_d_template(const half* __restrict__ Q,
               &R_O[0][j][0], &R_O[0][j][1], &R_O[0][j][2], &R_O[0][j][3],
               &R_S[0][p_offset][0],      &R_S[0][p_offset][1], 
               &R_S[0][p_offset + 1][0],  &R_S[0][p_offset + 1][1], 
-              // &R_V[0], &R_V[1]
+#ifdef ENABLE_FFPA_PERSIST_V_S2R
               &R_V[tile_V_Bc][0], &R_V[tile_V_Bc][1]
+#else
+              &R_V[0], &R_V[1]
+#endif
             ); 
           } else {
             // MMA accumulate with F16 dtype for high throughput.
@@ -883,8 +884,11 @@ ffpa_mma_stages_split_q_L1_small_d_template(const half* __restrict__ Q,
               &R_O[0][j][0], &R_O[0][j][1],
               &R_S[0][p_offset][0],      &R_S[0][p_offset][1], 
               &R_S[0][p_offset + 1][0],  &R_S[0][p_offset + 1][1], 
-              // &R_V[0], &R_V[1]
+#ifdef ENABLE_FFPA_PERSIST_V_S2R
               &R_V[tile_V_Bc][0], &R_V[tile_V_Bc][1]
+#else
+              &R_V[0], &R_V[1]
+#endif
             ); 
           }
         } // end for V Bc.

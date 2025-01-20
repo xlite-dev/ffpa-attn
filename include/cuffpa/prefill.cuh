@@ -59,7 +59,7 @@ __device__ __forceinline__ void check_compiling_states() {
   static_assert(kPersistQs2r == 0 || kPersistQs2r == 1);
   // Persist load Q g2s for headdim < 512, more SRAM, but still keep register usage.
   static_assert(kPersistQg2s == 0 || kPersistQg2s == 1);
-  if constexpr (kHeadDim > 256) {
+  if constexpr (kHeadDim > 128) {
     // kPersistQg2s and kPersistQs2r can not both enabled for large d kernel.
     static_assert((kPersistQg2s & kPersistQs2r)  == 0);
     // kPersistQg2s and kShareSmemQKV can not both enabled for large d kernel..
