@@ -25,34 +25,25 @@ void launch_ffpa_mma_L1_template(torch::Tensor Q,
 
 #ifdef ENABLE_FFPA_PERSIST_KV_G2S 
   // Need more SRAM, use small tile 64x64 for large headdim
-  // and large tile for small headdim. headdim > 256 will 
-  // use ffpa-attn, not flash-attn.
-  // TODO: tune block size for L20/4090/3080 etc.
-  // prefer small block size on NVIDIA L20 device.(64x64)
-  // prefer large block size on NVIDIA 4090 device.(128x128)
-#ifdef BUILD_FFPA_ATTN_MMA_L20
-  constexpr int kMmaTileSeqLenQ  = 4;
+  // and large tile for small headdim. headdim > 128 will 
+  // use ffpa-attn, not flash-attn. TODO: tune block size 
+  // for L20/4090/3080 etc. Prefer small block size for 
+  // ffpa small d kenel on NVIDIA L20, 4090, device.(64x64).
+  constexpr int kMmaTileSeqLenQ  = (kHeadDim <= 320) ? 4: 8;
   constexpr int kMmaTileSeqLenK  = 1;
-  constexpr int kMmaTileSeqLenP  = 4;
+  constexpr int kMmaTileSeqLenP  = (kHeadDim <= 320) ? 4: 8;
   constexpr int kMmaTileHeadDimV = 1;
   constexpr int kWarpTileSeqLenQ = 1;
-  constexpr int kWarpTileSeqLenK = 8;
-#else 
-  constexpr int kMmaTileSeqLenQ  = 8;
-  constexpr int kMmaTileSeqLenK  = 1;
-  constexpr int kMmaTileSeqLenP  = 8;
-  constexpr int kMmaTileHeadDimV = 1;
-  constexpr int kWarpTileSeqLenQ = 1;
-  constexpr int kWarpTileSeqLenK = 16;
-#endif
+  constexpr int kWarpTileSeqLenK = (kHeadDim <= 320) ? 8: 16;
 #else // if undef ENABLE_FFPA_PERSIST_KV_G2S
-  // O(1) SRAM complexity, always use large tile for large headdim.
-  constexpr int kMmaTileSeqLenQ  = 8;
+  // O(1) SRAM complexity, may always use large tile for 
+  // ffpa large d kernel. TODO: tune block size for L20/4090/3080 etc. 
+  constexpr int kMmaTileSeqLenQ  = (kHeadDim <= 320) ? 4: 8;
   constexpr int kMmaTileSeqLenK  = 1;
-  constexpr int kMmaTileSeqLenP  = 8;
+  constexpr int kMmaTileSeqLenP  = (kHeadDim <= 320) ? 4: 8;
   constexpr int kMmaTileHeadDimV = 1;
   constexpr int kWarpTileSeqLenQ = 1;
-  constexpr int kWarpTileSeqLenK = 16;
+  constexpr int kWarpTileSeqLenK = (kHeadDim <= 320) ? 8: 16;
 #endif
   constexpr int kWarpTileSeqLenP = 1;
   constexpr int kWarpTileHeadDimV = (kHeadDim / (kMmaAtomN * kMmaTileHeadDimV));
