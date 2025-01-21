@@ -33,21 +33,21 @@ void launch_ffpa_mma_L1_template(torch::Tensor Q,
 #if defined(BUILD_FFPA_ATTN_MMA_L20)
   // Enable QKV g2s & s2r with block 64x64 for d <= 128
   // (small d kernel) will get best performance.
-  constexpr int kMmaTileSeqLenQ  = (kHeadDim <= 320) ? 4: 8;
+  constexpr int kMmaTileSeqLenQ  = (kHeadDim <= 256) ? 4: 8;
   constexpr int kMmaTileSeqLenK  = 1;
-  constexpr int kMmaTileSeqLenP  = (kHeadDim <= 320) ? 4: 8;
+  constexpr int kMmaTileSeqLenP  = (kHeadDim <= 256) ? 4: 8;
   constexpr int kMmaTileHeadDimV = 1;
   constexpr int kWarpTileSeqLenQ = 1;
-  constexpr int kWarpTileSeqLenK = (kHeadDim <= 320) ? 8: 16;
+  constexpr int kWarpTileSeqLenK = (kHeadDim <= 256) ? 8: 16;
 #else
   // NOTE: On 4090, enable Q g2s for d <= 320 (large d kernel) 
   // will get best performance.
-  constexpr int kMmaTileSeqLenQ  = (kHeadDim <= 320) ? 8: 8;
+  constexpr int kMmaTileSeqLenQ  = (kHeadDim <= 256) ? 8: 8;
   constexpr int kMmaTileSeqLenK  = 1;
-  constexpr int kMmaTileSeqLenP  = (kHeadDim <= 320) ? 8: 8;
+  constexpr int kMmaTileSeqLenP  = (kHeadDim <= 256) ? 8: 8;
   constexpr int kMmaTileHeadDimV = 1;
   constexpr int kWarpTileSeqLenQ = 1;
-  constexpr int kWarpTileSeqLenK = (kHeadDim <= 320) ? 16: 16;
+  constexpr int kWarpTileSeqLenK = (kHeadDim <= 256) ? 16: 16;
 #endif
 
 #else // if undef ENABLE_FFPA_PERSIST_KV_G2S
@@ -56,21 +56,21 @@ void launch_ffpa_mma_L1_template(torch::Tensor Q,
 #if defined(BUILD_FFPA_ATTN_MMA_L20)
   // Enable QKV g2s & s2r with block 64x64 for d <= 128
   // (small d kernel) will get best performance.
-  constexpr int kMmaTileSeqLenQ  = (kHeadDim <= 320) ? 4: 8;
+  constexpr int kMmaTileSeqLenQ  = (kHeadDim <= 256) ? 4: 8;
   constexpr int kMmaTileSeqLenK  = 1;
-  constexpr int kMmaTileSeqLenP  = (kHeadDim <= 320) ? 4: 8;
+  constexpr int kMmaTileSeqLenP  = (kHeadDim <= 256) ? 4: 8;
   constexpr int kMmaTileHeadDimV = 1;
   constexpr int kWarpTileSeqLenQ = 1;
-  constexpr int kWarpTileSeqLenK = (kHeadDim <= 320) ? 8: 16;
+  constexpr int kWarpTileSeqLenK = (kHeadDim <= 256) ? 8: 16;
 #else
   // NOTE: On 4090, enable Q g2s for d <= 320 (large d kernel) 
   // will get best performance.
-  constexpr int kMmaTileSeqLenQ  = (kHeadDim <= 320) ? 8: 8;
+  constexpr int kMmaTileSeqLenQ  = (kHeadDim <= 256) ? 8: 8;
   constexpr int kMmaTileSeqLenK  = 1;
-  constexpr int kMmaTileSeqLenP  = (kHeadDim <= 320) ? 8: 8;
+  constexpr int kMmaTileSeqLenP  = (kHeadDim <= 256) ? 8: 8;
   constexpr int kMmaTileHeadDimV = 1;
   constexpr int kWarpTileSeqLenQ = 1;
-  constexpr int kWarpTileSeqLenK = (kHeadDim <= 320) ? 16: 16;
+  constexpr int kWarpTileSeqLenK = (kHeadDim <= 256) ? 16: 16;
 #endif
 
 #endif
@@ -228,7 +228,7 @@ TEMPLATE_FUNC<<<grid, block, kQKVSmemMaxSize>>>(            \
       >
     );
     LAUNCH_TEMPLATE_FUNC(ffpa_mma_L1_kernel_func);
-  } else { // large headdim > 256
+  } else { // large headdim >= 256
     // Calculate SRAM size needed per block, Q,K,V smem size, V shared the QK smem.
     constexpr int QK_smem_size = (
       (kPersistQg2s ? (kHeadDim / kMmaAtomK) : kStageQK) * // Q
@@ -265,7 +265,7 @@ TEMPLATE_FUNC<<<grid, block, kQKVSmemMaxSize>>>(            \
         kPrefetchQK,
         kPrefetchPV,
         (kPersistQg2s) ? 0 : kShareSmemQKV,
-        (kPersistQg2s || kHeadDim > 320) ? 0 : kPersistQs2r,
+        (kPersistQg2s || kHeadDim > 256) ? 0 : kPersistQs2r,
         kPersistQg2s,
         kStageQK, 
         kStagePV,
@@ -313,7 +313,7 @@ TEMPLATE_FUNC<<<grid, block, kQKVSmemMaxSize>>>(            \
       kPrefetchQK,
       kPrefetchPV,
       (kPersistQg2s) ? 0 : kShareSmemQKV,
-      (kPersistQg2s || kHeadDim > 320) ? 0 : kPersistQs2r,
+      (kPersistQg2s || kHeadDim > 256) ? 0 : kPersistQs2r,
       kPersistQg2s,
       kStageQK, 
       kStagePV,
