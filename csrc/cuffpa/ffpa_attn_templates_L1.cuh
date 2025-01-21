@@ -43,7 +43,7 @@ ffpa_mma_stages_split_q_L1_large_d_template(
   const float scale,
   const int Tc
 ) {
-  prefill::check_compiling_states<
+  prefill::check_large_d_compiling_states<
     kHeadDim, kMmaAtomM, kMmaAtomN, kMmaAtomK, kMmaTileSeqLenQ, kMmaTileSeqLenK, 
     kMmaTileSeqLenP, kMmaTileHeadDimV, kWarpTileSeqLenQ, kWarpTileSeqLenK, 
     kWarpTileSeqLenP, kWarpTileHeadDimV, kMmaAccFloat32QK, kMmaAccFloat32PV,
@@ -118,8 +118,7 @@ ffpa_mma_stages_split_q_L1_large_d_template(
 
   // ---------------------- Registers for S=Q@K^T/O=P@V ----------------------------
   // e.g, 64, !kPersistQs2r -> [1][4] 4 regs, kPersistQs2r -> [1][4*4] 16 regs.
-  uint32_t R_Q[kWarpTileSeqLenQ][
-    (kPersistQg2s) ? 4: ((kPersistQs2r) ? (kHeadDim / kMmaAtomK) * 4 : 4)]; 
+  uint32_t R_Q[kWarpTileSeqLenQ][(kPersistQs2r) ? (kHeadDim / kMmaAtomK) : 1][4]; 
   uint32_t R_K[kWarpTileSeqLenK][2]; // [8][2]
   uint32_t R_V[2]; // [2], S=Q@K, only use 2 32bits registers.
   // e.g [1][8][2], MMA Acc fp16; [1][8][4], MMA Acc fp32; 
@@ -256,19 +255,19 @@ ffpa_mma_stages_split_q_L1_large_d_template(
           if (tile_K_seqlen == 0) {
             prefill::sync_fetch_qkv_frags_s2r<
               0, 4, Q_tile_size, kMmaAtomM, kMmaAtomN, kMmaAtomK, kPadQ>(
-                smem_Q_base_ptr, &R_Q[0][tile_K_d * 4], warp_QP, 0, 0, smem_sel
+                smem_Q_base_ptr, &R_Q[0][tile_K_d][0], warp_QP, 0, 0, smem_sel
             );
           }
         } else {
           if constexpr (!kPersistQg2s) {
             prefill::sync_fetch_qkv_frags_s2r<
               0, 4, Q_tile_size, kMmaAtomM, kMmaAtomN, kMmaAtomK, kPadQ>(
-                smem_Q_base_ptr, &R_Q[0][0], warp_QP, 0, 0, smem_sel
+                smem_Q_base_ptr, &R_Q[0][0][0], warp_QP, 0, 0, smem_sel
             );
           } else {
             prefill::sync_fetch_qkv_frags_s2r<
               0, 4, Q_tile_size, kMmaAtomM, kMmaAtomN, kMmaAtomK, kPadQ>(
-                smem_Q_base_ptr, &R_Q[0][0], warp_QP, 0, 0, tile_K_d
+                smem_Q_base_ptr, &R_Q[0][0][0], warp_QP, 0, 0, tile_K_d
             );
           }
         }
@@ -306,21 +305,21 @@ ffpa_mma_stages_split_q_L1_large_d_template(
       // Q@K^T MMA compute
       static_assert(kWarpTileSeqLenQ == 1);
       { // kWarpTileSeqLenQ = 1
-        const int q_offset = (kPersistQs2r) ? (tile_K_d << 2) : 0; // (tile_K_d * 4)
+        const int q_offset = (kPersistQs2r) ? (tile_K_d) : 0; // (tile_K_d)
         #pragma unroll
         for (int j = 0; j < kWarpTileSeqLenK; ++j) {
           if constexpr (kMmaAccFloat32QK) {
             mma::m16n8k16_f16f16f32<MMAMode::kInplaceUpdate>(
               &R_S[0][j][0], &R_S[0][j][1], &R_S[0][j][2], &R_S[0][j][3],
-              &R_Q[0][q_offset + 0],    &R_Q[0][q_offset + 1],    
-              &R_Q[0][q_offset + 2],    &R_Q[0][q_offset + 3], 
+              &R_Q[0][q_offset][0],    &R_Q[0][q_offset][1],    
+              &R_Q[0][q_offset][2],    &R_Q[0][q_offset][3], 
               &R_K[j][0],    &R_K[j][1]
             );
           } else {
             mma::m16n8k16_f16f16f16<MMAMode::kInplaceUpdate>(
               &R_S[0][j][0], &R_S[0][j][1],
-              &R_Q[0][q_offset + 0],    &R_Q[0][q_offset + 1],    
-              &R_Q[0][q_offset + 2],    &R_Q[0][q_offset + 3], 
+              &R_Q[0][q_offset][0],    &R_Q[0][q_offset][1],    
+              &R_Q[0][q_offset][2],    &R_Q[0][q_offset][3], 
               &R_K[j][0],    &R_K[j][1]
             );
           }
@@ -528,7 +527,7 @@ ffpa_mma_stages_split_q_L1_large_d_template(
   static_assert(kWarpTileSeqLenP == 1);
   prefill::sync_store_o_r2g<
     Br, kHeadDim, kMmaAtomM, kMmaAtomN, kWarpTileHeadDimV, kOStorageAccFloat32>(
-      O, O_gmem_offset, O_tile_id, warp_QP, &R_D[0][0][0], &R_Q[0][0], &R_K[0][0]
+      O, O_gmem_offset, O_tile_id, warp_QP, &R_D[0][0][0], &R_Q[0][0][0], &R_K[0][0]
   );
 }
 
@@ -552,8 +551,8 @@ template<
   const int kPrefetchQK,           // Prefetch QK at the Appropriate Time Point. 
   const int kPrefetchPV,           // Prefetch V at the Appropriate Time Point. 
   const int kShareSmemQKV,         // QKV share the same shared memory, reuse QK smem for V.
-  const int kPersistQs2r,          // Persist load Q s2r for headdim < 512, more registers, but still keep O(1) SRAM.
-  const int kPersistQg2s,          // Persist QKV is always true for small d, Persist load QKV g2s for headdim < 512, more SRAM, but still keep register usage.
+  const int kPersistQs2r,          // Persist load Q s2r for headdim <= 128, more registers.
+  const int kPersistVs2r,          // Persist load V s2r for headdim <= 128, more registers.
   const int kStageQK,              // <= 4, may apply different multi stages policy for QK and V (<=4)
   const int kStagePV,              // <= 4, may apply different multi stages policy for QK and V (<=4)
   const int kPadQ,                 // Pad Q/K/V 0,8; 0 -> smem swizzle, > 0 -> padding
@@ -562,28 +561,28 @@ template<
 >
 __global__ void __launch_bounds__(
   WARP_SIZE * kMmaTileSeqLenQ * kMmaTileSeqLenK) 
-ffpa_mma_stages_split_q_L1_small_d_template(const half* __restrict__ Q, 
-                                            const half* __restrict__ K, 
-                                            const half* __restrict__ V, 
-                                            half*       __restrict__ O, 
-                                            const int QKV_seqlen, 
-                                            const int QKV_head,
-                                            const float scale,
-                                            const int Tc
+ffpa_mma_stages_split_q_L1_small_d_template(
+  const half* __restrict__ Q, 
+  const half* __restrict__ K, 
+  const half* __restrict__ V, 
+  half*       __restrict__ O, 
+  const int QKV_seqlen, 
+  const int QKV_head,
+  const float scale,
+  const int Tc
 ) {
   // NOTE: This kernel template is developed for small head dimensions (d <= 256), 
   // namely, flash-attention-2. Always persist QKV for flash-attn, apply tiling at
   // the Attention level not the MMA level. In order to reuse prefill.cuh, we choose
   // to keep the kPersistQg2s flag in the template.
-  static_assert(kPersistQg2s == 1); 
   static_assert(kHeadDim <= 256);
   static_assert(kStageQK == 1 && kStagePV == 1); 
-  prefill::check_compiling_states<
+  prefill::check_small_d_compiling_states<
     kHeadDim, kMmaAtomM, kMmaAtomN, kMmaAtomK, kMmaTileSeqLenQ, kMmaTileSeqLenK, 
     kMmaTileSeqLenP, kMmaTileHeadDimV, kWarpTileSeqLenQ, kWarpTileSeqLenK, 
     kWarpTileSeqLenP, kWarpTileHeadDimV, kMmaAccFloat32QK, kMmaAccFloat32PV,
     kOStorageAccFloat32, kPrefetchQK, kPrefetchPV, kShareSmemQKV, kPersistQs2r, 
-    kPersistQg2s, kStageQK, kStagePV, kPadQ, kPadK, kPadV
+    kPersistVs2r, kStageQK, kStagePV, kPadQ, kPadK, kPadV
   >();
   constexpr int Br = kMmaAtomM * kMmaTileSeqLenQ * kWarpTileSeqLenQ;
   constexpr int Bc = kMmaAtomN * kMmaTileSeqLenK * kWarpTileSeqLenK;
@@ -650,14 +649,10 @@ ffpa_mma_stages_split_q_L1_small_d_template(const half* __restrict__ Q,
   utils::fill_2D_regs<float, kWarpTileSeqLenQ, 2>(lane_block_row_sum_old, 0.0f);
 
   // ---------------------- Registers for S=Q@K^T/O=P@V ----------------------------
-  // e.g, 64, !kPersistQs2r -> [1][4] 4 regs, kPersistQs2r -> [1][4*4] 16 regs.
-  uint32_t R_Q[kWarpTileSeqLenQ][(kPersistQs2r) ? (kHeadDim / kMmaAtomK) * 4 : 4]; 
+  // e.g, 64, !kPersistQs2r -> [1][4] 4 regs, kPersistQs2r -> [1][4][4] 16 regs.
+  uint32_t R_Q[kWarpTileSeqLenQ][(kPersistQs2r) ? (kHeadDim / kMmaAtomK) : 1][4]; 
   uint32_t R_K[kWarpTileSeqLenK][2]; // [8][2]
-#ifdef ENABLE_FFPA_PERSIST_V_S2R
-  uint32_t R_V[(Bc / kMmaAtomK)][2]; // [4][2], e.g Bc=64, S=Q@K
-#else 
-  uint32_t R_V[2];
-#endif
+  uint32_t R_V[kWarpTileSeqLenP][(kPersistVs2r) ? (Bc / kMmaAtomK): 1][2]; // [1][4][2], e.g Bc=64, S=Q@K
   // e.g [1][8][2], MMA Acc fp16; [1][8][4], MMA Acc fp32; O=PV[Br,d]=P@V, [4 or 2]
   uint32_t R_S[kWarpTileSeqLenQ][kWarpTileSeqLenK][(kMmaAccFloat32QK)     ? 4 : 2]; 
   uint32_t R_O[kWarpTileSeqLenP][kWarpTileHeadDimV][(kMmaAccFloat32PV)    ? 4 : 2]; 
@@ -672,7 +667,7 @@ ffpa_mma_stages_split_q_L1_small_d_template(const half* __restrict__ Q,
     for (int tile_K_d = 0; tile_K_d < (kHeadDim / kMmaAtomK); ++tile_K_d) {
       prefill::sync_fetch_qkv_frags_s2r<
         0, 4, Q_tile_size, kMmaAtomM, kMmaAtomN, kMmaAtomK, kPadQ>(
-        smem_Q_base_ptr, &R_Q[0][tile_K_d * 4], warp_QP, 0, 0, tile_K_d
+        smem_Q_base_ptr, &R_Q[0][tile_K_d][0], warp_QP, 0, 0, tile_K_d
       );
     }
     __syncthreads(); // wait all warps Q s2r ready.
@@ -740,7 +735,7 @@ ffpa_mma_stages_split_q_L1_small_d_template(const half* __restrict__ Q,
         if constexpr (!kPersistQs2r) {
           prefill::sync_fetch_qkv_frags_s2r<
             0, 4, Q_tile_size, kMmaAtomM, kMmaAtomN, kMmaAtomK, kPadQ>(
-              smem_Q_base_ptr, &R_Q[0][0], warp_QP, 0, 0, tile_K_d
+              smem_Q_base_ptr, &R_Q[0][0][0], warp_QP, 0, 0, tile_K_d
           );
         }
       }
@@ -756,21 +751,21 @@ ffpa_mma_stages_split_q_L1_small_d_template(const half* __restrict__ Q,
       // Q@K^T MMA compute
       static_assert(kWarpTileSeqLenQ == 1);
       { // kWarpTileSeqLenQ = 1
-        const int q_offset = (kPersistQs2r) ? (tile_K_d << 2) : 0; // (tile_K_d * 4)
+        const int q_offset = (kPersistQs2r) ? (tile_K_d) : 0; // (tile_K_d)
         #pragma unroll
         for (int j = 0; j < kWarpTileSeqLenK; ++j) {
           if constexpr (kMmaAccFloat32QK) {
             mma::m16n8k16_f16f16f32<MMAMode::kInplaceUpdate>(
               &R_S[0][j][0], &R_S[0][j][1], &R_S[0][j][2], &R_S[0][j][3],
-              &R_Q[0][q_offset + 0],    &R_Q[0][q_offset + 1],    
-              &R_Q[0][q_offset + 2],    &R_Q[0][q_offset + 3], 
+              &R_Q[0][q_offset][0],    &R_Q[0][q_offset][1],    
+              &R_Q[0][q_offset][2],    &R_Q[0][q_offset][3], 
               &R_K[j][0],    &R_K[j][1]
             );
           } else {
             mma::m16n8k16_f16f16f16<MMAMode::kInplaceUpdate>(
               &R_S[0][j][0], &R_S[0][j][1],
-              &R_Q[0][q_offset + 0],    &R_Q[0][q_offset + 1],    
-              &R_Q[0][q_offset + 2],    &R_Q[0][q_offset + 3], 
+              &R_Q[0][q_offset][0],    &R_Q[0][q_offset][1],    
+              &R_Q[0][q_offset][2],    &R_Q[0][q_offset][3], 
               &R_K[j][0],    &R_K[j][1]
             );
           }
@@ -845,38 +840,35 @@ ffpa_mma_stages_split_q_L1_small_d_template(const half* __restrict__ Q,
       for (int j = 0; j < kWarpTileHeadDimV; ++j) { // 8, 16, 32, ...
         // Compute d tile, P[Br,Bc]@V[Bc,16] = O[Br,16]
         const int tile_V_d = (j >> 1); // (j / 2) 
-#ifdef ENABLE_FFPA_PERSIST_V_S2R
-        #pragma unroll
-        for (int tile_V_Bc = 0; tile_V_Bc < (Bc / kMmaAtomK); ++tile_V_Bc) {
-          prefill::sync_fetch_qkv_frags_s2r<
-            1, 2, V_tile_size, kMmaAtomM, kMmaAtomN, kMmaAtomK, kPadV>(
-              smem_V_base_ptr, &R_V[tile_V_Bc][0], warp_KV, (j % 2), 
-              tile_V_Bc, tile_V_d
-          );
+        if constexpr (kPersistVs2r) {
+          #pragma unroll
+          for (int tile_V_Bc = 0; tile_V_Bc < (Bc / kMmaAtomK); ++tile_V_Bc) {
+            prefill::sync_fetch_qkv_frags_s2r<
+              1, 2, V_tile_size, kMmaAtomM, kMmaAtomN, kMmaAtomK, kPadV>(
+                smem_V_base_ptr, &R_V[0][tile_V_Bc][0], warp_KV, (j % 2), 
+                tile_V_Bc, tile_V_d
+            );
+          }
         }
-#endif
         #pragma unroll
         for (int tile_V_Bc = 0; tile_V_Bc < (Bc / kMmaAtomK); ++tile_V_Bc) {
-#if !defined(ENABLE_FFPA_PERSIST_V_S2R)
-          prefill::sync_fetch_qkv_frags_s2r<
-            1, 2, V_tile_size, kMmaAtomM, kMmaAtomN, kMmaAtomK, kPadV>(
-              smem_V_base_ptr, &R_V[0], warp_KV, (j % 2), tile_V_Bc, 
-              tile_V_d
-          );
-#endif
+          if constexpr (!kPersistVs2r) {
+            prefill::sync_fetch_qkv_frags_s2r<
+              1, 2, V_tile_size, kMmaAtomM, kMmaAtomN, kMmaAtomK, kPadV>(
+                smem_V_base_ptr, &R_V[0][0], warp_KV, (j % 2), tile_V_Bc, 
+                tile_V_d
+            );
+          }
           // Compute P[Br,Bc]@V[Bc,d] = O[Br,d] 
           const int p_offset = tile_V_Bc * 2; // MMA(Warp) selected, 0, 2, 4, 6
+          const int v_offset = (kPersistVs2r) ? tile_V_Bc : 0;
           if constexpr (kMmaAccFloat32PV) {
             // MMA accumulate with F32 dtype for high precision.
             mma::m16n8k16_f16f16f32<MMAMode::kInplaceUpdate>(
               &R_O[0][j][0], &R_O[0][j][1], &R_O[0][j][2], &R_O[0][j][3],
               &R_S[0][p_offset][0],      &R_S[0][p_offset][1], 
               &R_S[0][p_offset + 1][0],  &R_S[0][p_offset + 1][1], 
-#ifdef ENABLE_FFPA_PERSIST_V_S2R
-              &R_V[tile_V_Bc][0], &R_V[tile_V_Bc][1]
-#else
-              &R_V[0], &R_V[1]
-#endif
+              &R_V[0][v_offset][0], &R_V[0][v_offset][1]
             ); 
           } else {
             // MMA accumulate with F16 dtype for high throughput.
@@ -884,11 +876,7 @@ ffpa_mma_stages_split_q_L1_small_d_template(const half* __restrict__ Q,
               &R_O[0][j][0], &R_O[0][j][1],
               &R_S[0][p_offset][0],      &R_S[0][p_offset][1], 
               &R_S[0][p_offset + 1][0],  &R_S[0][p_offset + 1][1], 
-#ifdef ENABLE_FFPA_PERSIST_V_S2R
-              &R_V[tile_V_Bc][0], &R_V[tile_V_Bc][1]
-#else
-              &R_V[0], &R_V[1]
-#endif
+              &R_V[0][v_offset][0], &R_V[0][v_offset][1]
             ); 
           }
         } // end for V Bc.
@@ -925,6 +913,6 @@ ffpa_mma_stages_split_q_L1_small_d_template(const half* __restrict__ Q,
   static_assert(kWarpTileSeqLenP == 1);
   prefill::sync_store_o_r2g<
     Br, kHeadDim, kMmaAtomM, kMmaAtomN, kWarpTileHeadDimV, kOStorageAccFloat32>(
-      O, O_gmem_offset, O_tile_id, warp_QP, &R_D[0][0][0], &R_Q[0][0], &R_K[0][0]
+      O, O_gmem_offset, O_tile_id, warp_QP, &R_D[0][0][0], &R_Q[0][0][0], &R_K[0][0]
   );
 }
