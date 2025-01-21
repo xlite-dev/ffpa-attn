@@ -855,7 +855,7 @@ ffpa_mma_stages_split_q_L1_small_d_template(
           if constexpr (!kPersistVs2r) {
             prefill::sync_fetch_qkv_frags_s2r<
               1, 2, V_tile_size, kMmaAtomM, kMmaAtomN, kMmaAtomK, kPadV>(
-                smem_V_base_ptr, &R_V[0][0], warp_KV, (j % 2), tile_V_Bc, 
+                smem_V_base_ptr, &R_V[0][0][0], warp_KV, (j % 2), tile_V_Bc, 
                 tile_V_d
             );
           }
