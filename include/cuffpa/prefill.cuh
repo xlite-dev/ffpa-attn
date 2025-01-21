@@ -36,7 +36,7 @@ template<
   const int kPadK,
   const int kPadV            
 >
-__device__ __forceinline__ void check_compiling_states() {
+__device__ __forceinline__ void check_large_d_compiling_states() {
   // Matmul Layout: Q[Br,d]@K^T[d,Bc] NT, P[Br,Bc]@V[Bc,d] NN.
   // NOTE: K[Bc,d] with row major means K^T[d,Bc] in col major.
   static_assert(kMmaAtomM == 16 && kMmaAtomN == 8 && kMmaAtomK == 16); // m16n8k16
@@ -59,20 +59,72 @@ __device__ __forceinline__ void check_compiling_states() {
   static_assert(kPersistQs2r == 0 || kPersistQs2r == 1);
   // Persist load Q g2s for headdim < 512, more SRAM, but still keep register usage.
   static_assert(kPersistQg2s == 0 || kPersistQg2s == 1);
-  if constexpr (kHeadDim > 128) {
-    // kPersistQg2s and kPersistQs2r can not both enabled for large d kernel.
-    static_assert((kPersistQg2s & kPersistQs2r)  == 0);
-    // kPersistQg2s and kShareSmemQKV can not both enabled for large d kernel..
-    static_assert((kPersistQg2s & kShareSmemQKV) == 0);
-  } else {
-#ifdef ENABLE_FFPA_PERSIST_KV_G2S
-    if constexpr (kShareSmemQKV) {
-      // kPersistQs2r must be enabled is set kShareSmemQKV as 1
-      static_assert(kPersistQs2r == 1);
-    }
-    // kPersistQg2s must be enabled if KV g2s is enabled.
-    static_assert(kPersistQg2s == 1);
-#endif
+  // kPersistQg2s and kPersistQs2r can not both enabled for large d kernel.
+  static_assert((kPersistQg2s & kPersistQs2r)  == 0);
+  // kPersistQg2s and kShareSmemQKV can not both enabled for large d kernel..
+  static_assert((kPersistQg2s & kShareSmemQKV) == 0);
+  // May apply different multi stages policy for QK and V.
+  static_assert(kStageQK < 5 && kStageQK > 0); // QK (<=4)
+  static_assert(kStagePV < 5 && kStagePV > 0); // V  (<=4)
+  static_assert(kPadQ >= 0 && kPadQ % 8 == 0); // 0,8,16
+  static_assert(kPadK >= 0 && kPadK % 8 == 0); // 0,8,16
+  static_assert(kPadV >= 0 && kPadV % 8 == 0); // 0,8,16
+}
+
+
+template<
+  const int kHeadDim,              // Headdim, 32~1024     
+  const int kMmaAtomM,             // MMA Atom M, 16
+  const int kMmaAtomN,             // MMA Atom N, 8
+  const int kMmaAtomK,             // MMA Atom K, 16
+  const int kMmaTileSeqLenQ,       // 4, more MMA(warp), M=16*4=64, Q@K^T=[Br(M), d(K)]@[d(K),  Bc(N)]  
+  const int kMmaTileSeqLenK,       // 1, more MMA(warp), N=8*1 =8,  Q@K^T=[Br(M), d(K)]@[d(K),  Bc(N)]    
+  const int kMmaTileSeqLenP,       // 4, more MMA(warp), M=16*4=64, P@V  =[Br(M),Bc(K)]@[Bc(K), d(N) ]
+  const int kMmaTileHeadDimV,      // 1, more MMA(warp), N=8*1 =8,  P@V  =[Br(M),Bc(K)]@[Bc(K), d(N) ]       
+  const int kWarpTileSeqLenQ,      // 1, more values, M, Br=64*1=64, matmul M 
+  const int kWarpTileSeqLenK,      // 8, more values, N, Bc=8*8 =64, matmul N
+  const int kWarpTileSeqLenP,      // 1, more values, M, Br=64*1=64, matmul M
+  const int kWarpTileHeadDimV,     // 8, more values, N, d=8*(1|2|3|4|...)=8|...|32|64|96|128|...
+  const int kMmaAccFloat32QK,      // 0/1, Q@K^T, 0 MMA Acc with fp16, 1 MMA Acc with fp32.
+  const int kMmaAccFloat32PV,      // 0/1, P@V, 0 MMA Acc with fp16, 1 MMA Acc with fp32.
+  const int kOStorageAccFloat32,   // 0/1, MMA Acc always be f32/f16, but O storage can be fp32 or half.
+  const int kPrefetchQK,           // Prefetch QK at the Appropriate Time Point. 
+  const int kPrefetchPV,           // Prefetch V at the Appropriate Time Point. 
+  const int kShareSmemQKV,         // QKV share the same shared memory, reuse QK smem for V.
+  const int kPersistQs2r,          // Persist load Q s2r for headdim <= 128, more registers.
+  const int kPersistVs2r,          // Persist load V s2r for headdim <= 128, more registers.
+  const int kStageQK,              // <= 4, may apply different multi stages policy for QK and V (<=4)
+  const int kStagePV,              // <= 4, may apply different multi stages policy for QK and V (<=4)
+  const int kPadQ,                 // Pad Q/K/V 0,8; 0 -> smem swizzle, > 0 -> padding
+  const int kPadK,
+  const int kPadV            
+>
+__device__ __forceinline__ void check_small_d_compiling_states() {
+  // Matmul Layout: Q[Br,d]@K^T[d,Bc] NT, P[Br,Bc]@V[Bc,d] NN.
+  // NOTE: K[Bc,d] with row major means K^T[d,Bc] in col major.
+  static_assert(kMmaAtomM == 16 && kMmaAtomN == 8 && kMmaAtomK == 16); // m16n8k16
+  static_assert(kMmaTileSeqLenQ  <= 8 && kMmaTileSeqLenK  == 1);  // Q@K^T
+  static_assert(kMmaTileSeqLenP  <= 8 && kMmaTileHeadDimV == 1);  // P@V
+  static_assert(kWarpTileSeqLenQ == 1 && kWarpTileSeqLenK <= 16); // Q@K^T
+  static_assert(kWarpTileSeqLenP == 1 && kWarpTileHeadDimV == (
+    kHeadDim / (kMmaAtomN * kMmaTileHeadDimV))); // P@V
+  static_assert(kMmaAccFloat32QK == 0 || kMmaAccFloat32QK == 1);
+  static_assert(kMmaAccFloat32PV == 0 || kMmaAccFloat32PV == 1);
+  static_assert(kOStorageAccFloat32 == 0 || kOStorageAccFloat32 == 1);
+  // Make sure that Br >= Bc, for shared memory reuse.
+  static_assert(
+    (kMmaAtomM * kMmaTileSeqLenQ * kWarpTileSeqLenQ) >= 
+    (kMmaAtomN * kMmaTileSeqLenK * kWarpTileSeqLenK)); 
+  static_assert(kPrefetchQK == 0 || kPrefetchQK == 1);
+  static_assert(kPrefetchPV == 0 || kPrefetchPV == 1);
+  static_assert(kShareSmemQKV == 0 || kShareSmemQKV == 1);
+  // Persist load Q s2r for headdim <= 128, more registers.
+  static_assert(kPersistQs2r == 0 || kPersistQs2r == 1);
+  // Persist load V s2r for headdim <= 128, more registers.
+  static_assert(kPersistVs2r == 0 || kPersistVs2r == 1);
+  if constexpr (kShareSmemQKV) {
+    // kPersistQs2r must be enabled is set kShareSmemQKV as 1
+    static_assert(kPersistQs2r == 1);
   }
   // May apply different multi stages policy for QK and V.
   static_assert(kStageQK < 5 && kStageQK > 0); // QK (<=4)
