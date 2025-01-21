@@ -18,7 +18,7 @@
   <p align="center"> <h2> 🤖FFPA: 1.8x~3x🎉faster vs SDPA EA with or without MMA Acc F32</h2></p>
 </div>
 
-🤖[WIP] **FFPA**: Yet antother **Faster Flash Prefill Attention** with **O(1) SRAM complexity** & **O(d/4) or O(1) register complexity** for large headdim (D > 256), almost **1.8x~3x** 🎉 faster than SDPA EA with or without MMA Acc F32 on many devices: [📈L20 ~1.9x↑🎉](#L1-bench-l20), [📈A30 ~1.8x↑🎉](#L1-bench-a30), [📈3080 ~2.9x↑🎉](#L1-bench-3080), [📈4090 ~2.1x↑🎉](#L1-bench-4090). I have implemented not only `FFPA Attention Algo: Fine-grained tiling` for large headim but also ` FA-2 Attention Algo: Coarse-grained tiling` for small headidm in this repo.
+🤖[WIP] **FFPA**: Yet antother **Faster Flash Prefill Attention** with **O(1) SRAM complexity** & **O(d/4) or O(1) register complexity** for large headdim (D > 256), almost **1.8x~3x** 🎉 faster than SDPA EA with or without MMA Acc F32 on many devices: [📈L20 ~1.9x↑🎉](#L1-bench-l20), [📈A30 ~1.8x↑🎉](#L1-bench-a30), [📈3080 ~2.9x↑🎉](#L1-bench-3080), [📈4090 ~2.1x↑🎉](#L1-bench-4090). **FFPA Attention Algo: Fine-grained tiling** for large headim, **FA-2 Attention Algo: Coarse-grained tiling** for small headidm.
 
 💡NOTE: This project is still in its early dev stages and now provides some kernels and benchmarks for reference. More features will be added in the future. (Welcome to 🌟👆🏻star this repo to support me ~)
 
@@ -259,20 +259,20 @@ cd tests && python3 test.py --B 1 --H 48 --N 8192 --show-all --D 320
 cd tests && pip install matplotlib && python3 test.py --gen-bench --show-all --plot
 ```
 - 📚 case: Compare small headdim (d<256, e.g 64), FFPA-L1 vs SDPA FA-2 BE.  
-```bash
+```python
 # Enable ffpa-attn small d kernel which using coarse-grained tiling method.
 export ENABLE_FFPA_PERSIST_Q_G2S=1 && export ENABLE_FFPA_PERSIST_KV_G2S=1 
 python3 test.py --B 1 --H 32 --N 1024 --check --show-all --D 64 # NVIDIA L20
 ---------------------------------------B=1, H=32, N=1024, D=64, Warmup: 1, Iters: 5--------------------
-                   (sdpa): ['-0.02571106 '], time:0.154352ms, TFLOPS:56.72 (+0.00 %)(~1.00x)
- (ffpa+acc+f32+L1+stage1): ['-0.02572632 '], time:0.103998ms, TFLOPS:84.19 (+48.42%)(~1.48x)
- (ffpa+acc+f32+L1+stage2): ['-0.02572632 '], time:0.101900ms, TFLOPS:85.92 (+2.06 %)(~1.51x)
- (ffpa+acc+f16+L1+stage1): ['-0.02568054 '], time:0.113105ms, TFLOPS:77.41 (+0.00 %)(~1.36x)
- (ffpa+acc+f16+L1+stage2): ['-0.02568054 '], time:0.112771ms, TFLOPS:77.64 (+0.00 %)(~1.37x)
- (ffpa+acc+f32+L1+stage3): ['-0.02572632 '], time:0.101947ms, TFLOPS:85.88 (+0.00 %)(~1.51x)
- (ffpa+acc+f32+L1+stage4): ['-0.02572632 '], time:0.102043ms, TFLOPS:85.80 (+0.00 %)(~1.51x)
- (ffpa+acc+f16+L1+stage3): ['-0.02568054 '], time:0.111246ms, TFLOPS:78.70 (+0.00 %)(~1.39x)
- (ffpa+acc+f16+L1+stage4): ['-0.02568054 '], time:0.108432ms, TFLOPS:80.75 (+0.00 %)(~1.42x)
+                   (sdpa): ['-0.02571106'], time:0.154352ms, TFLOPS:56.72 (+0.00 %)(~1.00x)
+ (ffpa+acc+f32+L1+stage1): ['-0.02572632'], time:0.103998ms, TFLOPS:84.19 (+48.42%)(~1.48x)
+ (ffpa+acc+f32+L1+stage2): ['-0.02572632'], time:0.101900ms, TFLOPS:85.92 (+2.06 %)(~1.51x)
+ (ffpa+acc+f16+L1+stage1): ['-0.02568054'], time:0.113105ms, TFLOPS:77.41 (+0.00 %)(~1.36x)
+ (ffpa+acc+f16+L1+stage2): ['-0.02568054'], time:0.112771ms, TFLOPS:77.64 (+0.00 %)(~1.37x)
+ (ffpa+acc+f32+L1+stage3): ['-0.02572632'], time:0.101947ms, TFLOPS:85.88 (+0.00 %)(~1.51x)
+ (ffpa+acc+f32+L1+stage4): ['-0.02572632'], time:0.102043ms, TFLOPS:85.80 (+0.00 %)(~1.51x)
+ (ffpa+acc+f16+L1+stage3): ['-0.02568054'], time:0.111246ms, TFLOPS:78.70 (+0.00 %)(~1.39x)
+ (ffpa+acc+f16+L1+stage4): ['-0.02568054'], time:0.108432ms, TFLOPS:80.75 (+0.00 %)(~1.42x)
 --------------------------------------------------------------------------------------------------------
 ```
 
