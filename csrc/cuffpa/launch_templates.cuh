@@ -172,6 +172,11 @@ TEMPLATE_FUNC<<<grid, block, kQKVSmemMaxSize>>>(            \
       (kQKSmemMaxSize + kVSmemMaxSize) : // QK shared the same smem
       (kQSmemMaxSize + kKSmemMaxSize + kVSmemMaxSize)
     );
+#ifdef ENABLE_FFPA_PERSIST_V_S2R
+    constexpr int kPersistVs2r = 1;
+#else
+    constexpr int kPersistVs2r = 0;
+#endif
 
     auto ffpa_mma_L1_kernel_func = (
       ffpa_mma_stages_split_q_L1_small_d_template<
@@ -194,7 +199,7 @@ TEMPLATE_FUNC<<<grid, block, kQKVSmemMaxSize>>>(            \
         kPrefetchPV,
         kShareSmemQKV,
         kPersistQs2r,
-        1, /*kPersistQg2s*/
+        kPersistVs2r,
         1, /*kStageQK unused*/
         1, /*kStagePV unused*/
         kPadQ,
