@@ -28,22 +28,51 @@ void launch_ffpa_mma_L1_template(torch::Tensor Q,
   // and large tile for small headdim. headdim > 128 will 
   // use ffpa-attn, not flash-attn. TODO: tune block size 
   // for L20/4090/3080 etc. Prefer small block size for 
-  // ffpa small d kenel on NVIDIA L20, 4090, device.(64x64).
+  // ffpa small d kenel on NVIDIA L20 device (64x64) and
+  // large block size on NVIDIA 4090 device (128x128)
+#if defined(BUILD_FFPA_ATTN_MMA_L20)
+  // Enable QKV g2s & s2r with block 64x64 for d <= 128
+  // (small d kernel) will get best performance.
   constexpr int kMmaTileSeqLenQ  = (kHeadDim <= 320) ? 4: 8;
   constexpr int kMmaTileSeqLenK  = 1;
   constexpr int kMmaTileSeqLenP  = (kHeadDim <= 320) ? 4: 8;
   constexpr int kMmaTileHeadDimV = 1;
   constexpr int kWarpTileSeqLenQ = 1;
   constexpr int kWarpTileSeqLenK = (kHeadDim <= 320) ? 8: 16;
+#else
+  // NOTE: On 4090, enable Q g2s for d <= 320 (large d kernel) 
+  // will get best performance.
+  constexpr int kMmaTileSeqLenQ  = (kHeadDim <= 320) ? 8: 8;
+  constexpr int kMmaTileSeqLenK  = 1;
+  constexpr int kMmaTileSeqLenP  = (kHeadDim <= 320) ? 8: 8;
+  constexpr int kMmaTileHeadDimV = 1;
+  constexpr int kWarpTileSeqLenQ = 1;
+  constexpr int kWarpTileSeqLenK = (kHeadDim <= 320) ? 16: 16;
+#endif
+
 #else // if undef ENABLE_FFPA_PERSIST_KV_G2S
   // O(1) SRAM complexity, may always use large tile for 
   // ffpa large d kernel. TODO: tune block size for L20/4090/3080 etc. 
+#if defined(BUILD_FFPA_ATTN_MMA_L20)
+  // Enable QKV g2s & s2r with block 64x64 for d <= 128
+  // (small d kernel) will get best performance.
   constexpr int kMmaTileSeqLenQ  = (kHeadDim <= 320) ? 4: 8;
   constexpr int kMmaTileSeqLenK  = 1;
   constexpr int kMmaTileSeqLenP  = (kHeadDim <= 320) ? 4: 8;
   constexpr int kMmaTileHeadDimV = 1;
   constexpr int kWarpTileSeqLenQ = 1;
   constexpr int kWarpTileSeqLenK = (kHeadDim <= 320) ? 8: 16;
+#else
+  // NOTE: On 4090, enable Q g2s for d <= 320 (large d kernel) 
+  // will get best performance.
+  constexpr int kMmaTileSeqLenQ  = (kHeadDim <= 320) ? 8: 8;
+  constexpr int kMmaTileSeqLenK  = 1;
+  constexpr int kMmaTileSeqLenP  = (kHeadDim <= 320) ? 8: 8;
+  constexpr int kMmaTileHeadDimV = 1;
+  constexpr int kWarpTileSeqLenQ = 1;
+  constexpr int kWarpTileSeqLenK = (kHeadDim <= 320) ? 16: 16;
+#endif
+
 #endif
   constexpr int kWarpTileSeqLenP = 1;
   constexpr int kWarpTileHeadDimV = (kHeadDim / (kMmaAtomN * kMmaTileHeadDimV));
@@ -235,8 +264,8 @@ TEMPLATE_FUNC<<<grid, block, kQKVSmemMaxSize>>>(            \
         kOStorageAccFloat32,
         kPrefetchQK,
         kPrefetchPV,
-        kPersistQg2s ? 0 : kShareSmemQKV,
-        kPersistQg2s ? 0 : kPersistQs2r,
+        (kPersistQg2s) ? 0 : kShareSmemQKV,
+        (kPersistQg2s || kHeadDim > 320) ? 0 : kPersistQs2r,
         kPersistQg2s,
         kStageQK, 
         kStagePV,
@@ -283,8 +312,8 @@ TEMPLATE_FUNC<<<grid, block, kQKVSmemMaxSize>>>(            \
       kOStorageAccFloat32,
       kPrefetchQK,
       kPrefetchPV,
-      kPersistQg2s ? 0 : kShareSmemQKV,
-      kPersistQg2s ? 0 : kPersistQs2r,
+      (kPersistQg2s) ? 0 : kShareSmemQKV,
+      (kPersistQg2s || kHeadDim > 320) ? 0 : kPersistQs2r,
       kPersistQg2s,
       kStageQK, 
       kStagePV,
