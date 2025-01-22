@@ -262,7 +262,7 @@ void launch_ffpa_mma_L1_template(torch::Tensor Q,
   constexpr int kMmaAtomM = 16;
   constexpr int kMmaAtomN = 8;
   constexpr int kMmaAtomK = 16;
-  // Split-Q algo, Tile Mma across Q and KV access for all MMAs.
+  // Split-Q(FA-2) Algo, Tile MMA across Q and keep KV access for all MMAs.
   constexpr int kMmaTileSeqLenQ   = getConfigMmaTileSeqLenQP<kHeadDim>();
   constexpr int kMmaTileSeqLenK   = 1;
   constexpr int kMmaTileSeqLenP   = getConfigMmaTileSeqLenQP<kHeadDim>();
