@@ -1,6 +1,251 @@
 #include "ffpa_attn_templates_L1.cuh"
 using namespace ffpa;                                            
 
+// Need more SRAM, use small tile 64x64 for large headdim
+// and large tile for small headdim. headdim > 128 will 
+// use ffpa-attn, not flash-attn. TODO: tune block size 
+// for L20/4090/3080 etc. Prefer small block size for 
+// ffpa small d kenel (64x64) and large block size for 
+// large d kernel (128x128).
+// NOTE: Enable QKV g2s & s2r with block 64x64 for d <= 128
+// (small d kernel) will get best performance.
+// NOTE: On 4090, enable Q g2s for d <= 320 (large d kernel) 
+// will get best performance.
+template<const int kHeadDim>
+constexpr int getConfigMmaTileSeqLenQP() {
+#ifdef ENABLE_FFPA_PERSIST_KV_G2S 
+#if defined(BUILD_FFPA_ATTN_MMA_L20)
+  constexpr int kMmaTileSeqLenQP  = (kHeadDim <= 256) ? 4: 8;
+#else
+  constexpr int kMmaTileSeqLenQP  = (kHeadDim <= 256) ? 8: 8;
+#endif
+#else // if undef ENABLE_FFPA_PERSIST_KV_G2S
+  // O(1) SRAM complexity, may always use large tile for 
+  // ffpa large d kernel. TODO: tune block size for L20/4090/3080 etc. 
+#if defined(BUILD_FFPA_ATTN_MMA_L20)
+  constexpr int kMmaTileSeqLenQP  = (kHeadDim <= 256) ? 4: 8;
+#else
+  constexpr int kMmaTileSeqLenQP  = (kHeadDim <= 256) ? 8: 8;
+#endif
+#endif
+  return kMmaTileSeqLenQP;
+}
+
+template<const int kHeadDim>
+constexpr int getConfigWarpTileSeqLenK() {
+#ifdef ENABLE_FFPA_PERSIST_KV_G2S 
+#if defined(BUILD_FFPA_ATTN_MMA_L20)
+  constexpr int kWarpTileSeqLenK  = (kHeadDim <= 256) ? 8: 16;
+#else
+  constexpr int kWarpTileSeqLenK  = (kHeadDim <= 256) ? 16: 16;
+#endif
+#else // if undef ENABLE_FFPA_PERSIST_KV_G2S
+#if defined(BUILD_FFPA_ATTN_MMA_L20)
+  constexpr int kWarpTileSeqLenK  = (kHeadDim <= 256) ? 8: 16;
+#else
+  constexpr int kWarpTileSeqLenK  = (kHeadDim <= 256) ? 16: 16;
+#endif
+#endif
+  return kWarpTileSeqLenK;
+}
+
+template<const int kHeadDim>
+constexpr int getConfigWarpTileHeadDimV() {
+  constexpr int kMmaAtomN = 8;
+  constexpr int kMmaTileHeadDimV = 1;
+  constexpr int kWarpTileHeadDimV = (
+    kHeadDim / (kMmaAtomN * kMmaTileHeadDimV));
+  return kWarpTileHeadDimV;
+}
+
+constexpr int getConfigShareSmemQKV() {
+#if defined(ENABLE_FFPA_QKV_SMEM_SHARE)
+  constexpr int kShareSmemQKV = 1;
+#else
+  constexpr int kShareSmemQKV = 0;
+#endif 
+  return kShareSmemQKV;
+}
+
+template<const int kHeadDim>
+constexpr int getConfigOStorageAccFloat32() {
+  // 0/1, The precision of the O storage buffer can differ from 
+  // that of the MMA, supporting either FP32 or Half precision.
+  // FP16 can provide precision to approximately 3-4 decimal places.
+  // Thus, if the error does not exceed 1e-3, using FP16 storage is 
+  // sufficient for most applications.
+  return ((kHeadDim < 128)) ? 1 : 0;
+}
+
+template<const int kStageQKV>
+constexpr int getConfigPrefetchQKV() {
+  // Prefetch QKV at the appropriate time point. 
+#if defined(ENABLE_FFPA_PREFETCH_QKV)
+#if defined(ENABLE_FFPA_PERSIST_KV_G2S)
+  constexpr int kPrefetchQKV = 1; // kStageQKV is unused
+#else 
+  constexpr int kPrefetchQKV = (kStageQKV > 1) ? 1 : 0; 
+#endif
+#else 
+  constexpr int kPrefetchQKV = 0;
+#endif
+  return kPrefetchQKV;
+}
+
+template<const int kStageQK, const int kHeadDim>
+constexpr int getConfigPersistQg2s() {
+  // Persist load Q g2s for headdim < 512, more SRAM, but still
+  // keep register usage.
+#if defined(ENABLE_FFPA_PERSIST_Q_G2S)
+  constexpr int kPersistQg2s = (kHeadDim < 256) ? 1 : (
+    (kHeadDim <= 320) ? ((kStageQK < 3) ? 1 : 0) : 0 
+  );
+#else
+  constexpr int kPersistQg2s = 0;
+#endif
+  return kPersistQg2s;
+}
+
+constexpr int getConfigPersistQs2r() {
+  // Persist load Q s2r for headdim < 512, more registers, 
+  // but still keep O(1) SRAM.
+#ifdef ENABLE_FFPA_PERSIST_Q_S2R
+  constexpr int kPersistQs2r = 1;
+#else
+  constexpr int kPersistQs2r = 0;
+#endif
+  return kPersistQs2r;
+}
+
+constexpr int getConfigPersistVs2r() {
+#ifdef ENABLE_FFPA_PERSIST_V_S2R
+  constexpr int kPersistVs2r = 1;
+#else
+  constexpr int kPersistVs2r = 0;
+#endif
+  return kPersistVs2r;
+}
+
+constexpr int getConfigPadQ() {
+#ifdef ENABLE_FFPA_SMEM_SWIZZLE_Q
+  constexpr int kPadQ = 0;
+#else 
+  constexpr int kPadQ = 8;
+#endif
+ return kPadQ;
+}
+
+constexpr int getConfigPadK() {
+#ifdef ENABLE_FFPA_SMEM_SWIZZLE_K
+  constexpr int kPadK = 0;
+#else 
+  constexpr int kPadK = 8;
+#endif
+ return kPadK;
+}
+
+constexpr int getConfigPadV() {
+#ifdef ENABLE_FFPA_SMEM_SWIZZLE_V
+  constexpr int kPadV = 0;
+#else 
+  constexpr int kPadV = 8;
+#endif
+ return kPadV;
+}
+
+template<const int kNumThreads>
+inline dim3 getConfigBlock() {
+  dim3 block(kNumThreads);
+  return block;
+}
+
+template<const int Br>
+inline dim3 getConfigGrid(
+  const int B, const int H, const int N) {
+  // Tr(=N/Br), batch_size x num_heads
+  // try grid(N/Br, B * H) or grid(N/Br, H, B)
+#ifdef ENBALE_FFPA_LAUNCH_GRID_DNHB
+  dim3 grid(utils::div_ceil(N, Br), H, B); 
+#else
+  dim3 grid(utils::div_ceil(N, Br), B * H); 
+#endif
+  return grid;
+}
+
+template<
+  const int Br, 
+  const int Bc, 
+  const int kMmaAtomM, 
+  const int kMmaAtomN, 
+  const int kMmaAtomK, 
+  const int kHeadDim, 
+  const int kShareSmemQKV, 
+  const int kPersistQg2s, 
+  const int kPersistQs2r, 
+  const int kStageQK,
+  const int kStagePV,
+  const int kPadQ, 
+  const int kPadK, 
+  const int kPadV
+>
+constexpr int getConfigQKVSmemMaxSize() {
+#ifdef ENABLE_FFPA_PERSIST_KV_G2S
+  if constexpr (kHeadDim < 256) { // 256 will use large d kernel
+    // Calculate SRAM size needed per block, Q,K,V smem size, V shared the QK smem.
+    constexpr int Q_smem_size = (
+      (kHeadDim / kMmaAtomK) * (Br * (kMmaAtomK + kPadQ)));
+    constexpr int K_smem_size = (
+      (kHeadDim / kMmaAtomK) * (Bc * (kMmaAtomK + kPadK)));
+    constexpr int V_smem_size = (
+      (kHeadDim / (kMmaAtomN * 2)) * (Bc * (kMmaAtomN * 2 + kPadV)));
+    constexpr int kQSmemMaxSize = Q_smem_size * 2;
+    constexpr int kKSmemMaxSize = K_smem_size * 2;
+    constexpr int kVSmemMaxSize = V_smem_size * 2;
+    constexpr int kQKSmemMaxSize = (
+      kQSmemMaxSize > kKSmemMaxSize ? kQSmemMaxSize : kKSmemMaxSize);
+    constexpr int kQKVSmemMaxSize = (
+      (kShareSmemQKV && kPersistQs2r) ? 
+      (kQKSmemMaxSize + kVSmemMaxSize) : // QK shared the same smem
+      (kQSmemMaxSize + kKSmemMaxSize + kVSmemMaxSize)
+    );
+    return kQKVSmemMaxSize;
+  } else {
+    // Calculate SRAM size needed per block, Q,K,V smem size, V shared the QK smem.
+    constexpr int Q_smem_size = ((kPersistQg2s ? (kHeadDim / kMmaAtomK) : kStageQK) * 
+                                 (Br * (kMmaAtomK + kPadQ))) * 2;
+    constexpr int K_smem_size = ((kStageQK) * (Bc * (kMmaAtomK + kPadK))) * 2;
+    constexpr int V_smem_size = (kStagePV * (Bc * (kMmaAtomN * 2 + kPadV))) * 2;
+    constexpr int kQKSmemMaxSize = (Q_smem_size + K_smem_size);
+    constexpr int kVSmemMaxSize  = V_smem_size;
+    // try to let V reuse all Q+K smem after Q@K^T, reduce smem usage.
+    constexpr int kQKVSmemMaxSize = (
+      (kShareSmemQKV && (!kPersistQg2s)) ? 
+      ((kQKSmemMaxSize > kVSmemMaxSize) ? kQKSmemMaxSize: kVSmemMaxSize) : 
+      (kQKSmemMaxSize + kVSmemMaxSize)
+    );
+    // NOTE: R_D registers usage, s=2, d=64, 16 regs; d=128, 32 regs; 
+    // d=256, 64 regs; d=512, 128 regs; d=1024, 256 regs;
+    return kQKVSmemMaxSize;
+  }
+#else  
+  // Calculate SRAM size needed per block, Q,K,V smem size, V shared the QK smem.
+  constexpr int Q_smem_size = ((kPersistQg2s ? (kHeadDim / kMmaAtomK) : kStageQK) * 
+                               (Br * (kMmaAtomK + kPadQ))) * 2;
+  constexpr int K_smem_size = ((kStageQK) * (Bc * (kMmaAtomK + kPadK))) * 2;
+  constexpr int V_smem_size = (kStagePV * (Bc * (kMmaAtomN * 2 + kPadV))) * 2;
+  constexpr int kQKSmemMaxSize = (Q_smem_size + K_smem_size);
+  constexpr int kVSmemMaxSize  = V_smem_size;
+  // try to let V reuse all Q+K smem after Q@K^T, reduce smem usage.
+  constexpr int kQKVSmemMaxSize = (
+    (kShareSmemQKV && (!kPersistQg2s)) ? 
+    ((kQKSmemMaxSize > kVSmemMaxSize) ? kQKSmemMaxSize: kVSmemMaxSize) : 
+    (kQKSmemMaxSize + kVSmemMaxSize)
+  );
+  // NOTE: R_D registers usage, s=2, d=64, 16 regs; d=128, 32 regs; 
+  // d=256, 64 regs; d=512, 128 regs; d=1024, 256 regs;
+  return kQKVSmemMaxSize;
+#endif
+}
 
 template<
   const int kHeadDim,          // Headdim, 32~1024   
@@ -17,145 +262,51 @@ void launch_ffpa_mma_L1_template(torch::Tensor Q,
   constexpr int kMmaAtomM = 16;
   constexpr int kMmaAtomN = 8;
   constexpr int kMmaAtomK = 16;
-#if defined(ENABLE_FFPA_QKV_SMEM_SHARE)
-  constexpr int kShareSmemQKV = 1;
-#else
-  constexpr int kShareSmemQKV = 0;
-#endif 
-
-#ifdef ENABLE_FFPA_PERSIST_KV_G2S 
-  // Need more SRAM, use small tile 64x64 for large headdim
-  // and large tile for small headdim. headdim > 128 will 
-  // use ffpa-attn, not flash-attn. TODO: tune block size 
-  // for L20/4090/3080 etc. Prefer small block size for 
-  // ffpa small d kenel (64x64) and large block size for 
-  // large d kernel (128x128).
-#if defined(BUILD_FFPA_ATTN_MMA_L20)
-  // Enable QKV g2s & s2r with block 64x64 for d <= 128
-  // (small d kernel) will get best performance.
-  constexpr int kMmaTileSeqLenQ  = (kHeadDim <= 256) ? 4: 8;
-  constexpr int kMmaTileSeqLenK  = 1;
-  constexpr int kMmaTileSeqLenP  = (kHeadDim <= 256) ? 4: 8;
-  constexpr int kMmaTileHeadDimV = 1;
-  constexpr int kWarpTileSeqLenQ = 1;
-  constexpr int kWarpTileSeqLenK = (kHeadDim <= 256) ? 8: 16;
-#else
-  // NOTE: On 4090, enable Q g2s for d <= 320 (large d kernel) 
-  // will get best performance.
-  constexpr int kMmaTileSeqLenQ  = (kHeadDim <= 256) ? 8: 8;
-  constexpr int kMmaTileSeqLenK  = 1;
-  constexpr int kMmaTileSeqLenP  = (kHeadDim <= 256) ? 8: 8;
-  constexpr int kMmaTileHeadDimV = 1;
-  constexpr int kWarpTileSeqLenQ = 1;
-  constexpr int kWarpTileSeqLenK = (kHeadDim <= 256) ? 16: 16;
-#endif
-
-#else // if undef ENABLE_FFPA_PERSIST_KV_G2S
-  // O(1) SRAM complexity, may always use large tile for 
-  // ffpa large d kernel. TODO: tune block size for L20/4090/3080 etc. 
-#if defined(BUILD_FFPA_ATTN_MMA_L20)
-  // Enable QKV g2s & s2r with block 64x64 for d <= 128
-  // (small d kernel) will get best performance.
-  constexpr int kMmaTileSeqLenQ  = (kHeadDim <= 256) ? 4: 8;
-  constexpr int kMmaTileSeqLenK  = 1;
-  constexpr int kMmaTileSeqLenP  = (kHeadDim <= 256) ? 4: 8;
-  constexpr int kMmaTileHeadDimV = 1;
-  constexpr int kWarpTileSeqLenQ = 1;
-  constexpr int kWarpTileSeqLenK = (kHeadDim <= 256) ? 8: 16;
-#else
-  // NOTE: On 4090, enable Q g2s for d <= 320 (large d kernel) 
-  // will get best performance.
-  constexpr int kMmaTileSeqLenQ  = (kHeadDim <= 256) ? 8: 8;
-  constexpr int kMmaTileSeqLenK  = 1;
-  constexpr int kMmaTileSeqLenP  = (kHeadDim <= 256) ? 8: 8;
-  constexpr int kMmaTileHeadDimV = 1;
-  constexpr int kWarpTileSeqLenQ = 1;
-  constexpr int kWarpTileSeqLenK = (kHeadDim <= 256) ? 16: 16;
-#endif
-
-#endif
-  constexpr int kWarpTileSeqLenP = 1;
-  constexpr int kWarpTileHeadDimV = (kHeadDim / (kMmaAtomN * kMmaTileHeadDimV));
+  // Split-Q algo, Tile Mma across Q and KV access for all MMAs.
+  constexpr int kMmaTileSeqLenQ   = getConfigMmaTileSeqLenQP<kHeadDim>();
+  constexpr int kMmaTileSeqLenK   = 1;
+  constexpr int kMmaTileSeqLenP   = getConfigMmaTileSeqLenQP<kHeadDim>();
+  constexpr int kMmaTileHeadDimV  = 1;
+  constexpr int kWarpTileSeqLenQ  = 1;
+  constexpr int kWarpTileSeqLenK  = getConfigWarpTileSeqLenK<kHeadDim>();
+  constexpr int kWarpTileSeqLenP  = 1;
+  constexpr int kWarpTileHeadDimV = getConfigWarpTileHeadDimV<kHeadDim>();
   constexpr int Br = kMmaAtomM * kMmaTileSeqLenQ * kWarpTileSeqLenQ;
   constexpr int Bc = kMmaAtomN * kMmaTileSeqLenK * kWarpTileSeqLenK;
-  static_assert(Br == Bc, "Br must be equal Bc in order to avoid illegal memory access.");
+  static_assert(Br == Bc, "Br must be equal Bc to avoid illegal memory access.");
   constexpr int kNumThreads = WARP_SIZE * kMmaTileSeqLenQ * kMmaTileSeqLenK;
+  constexpr int kOStorageAccFloat32 = getConfigOStorageAccFloat32<kHeadDim>();
   // Apply different multi stages policy for QK and V.
   // TODO: tune stages for Q@K and P@V.
   constexpr int kStageQK = kStage; // <= 4
   constexpr int kStagePV = kStage; // <= 4
-  // 0/1, The precision of the O storage buffer can differ from 
-  // that of the MMA, supporting either FP32 or Half precision.
-  // FP16 can provide precision to approximately 3-4 decimal places.
-  // Thus, if the error does not exceed 1e-3, using FP16 storage is 
-  // sufficient for most applications.
-  constexpr int kOStorageAccFloat32 = ((kHeadDim < 128)) ? 1 : 0;
-  // Persist load Q s2r for headdim < 512, more registers, 
-  // but still keep O(1) SRAM.
-#ifdef ENABLE_FFPA_PERSIST_Q_S2R
-  constexpr int kPersistQs2r = 1;
-#else
-  constexpr int kPersistQs2r = 0;
-#endif
-
-  // Persist load Q g2s for headdim < 512, more SRAM, but still
-  // keep register usage.
-#if defined(ENABLE_FFPA_PERSIST_Q_G2S)
-  constexpr int kPersistQg2s = (kHeadDim < 256) ? 1 : (
-    (kHeadDim <= 320) ? ((kStageQK < 3) ? 1 : 0) : 0 
-  );
-#else
-  constexpr int kPersistQg2s = 0;
-#endif
-
-  // Prefetch QKV at the appropriate time point. 
-#if defined(ENABLE_FFPA_PREFETCH_QKV)
-#if defined(ENABLE_FFPA_PERSIST_KV_G2S)
-  constexpr int kPrefetchQK = 1; // kStageQK is unused
-  constexpr int kPrefetchPV = 1; // kStagePV is unused
-#else 
-  constexpr int kPrefetchQK = (kStageQK > 1) ? 1 : 0; 
-  constexpr int kPrefetchPV = (kStagePV > 1) ? 1 : 0; 
-#endif
-#else 
-  constexpr int kPrefetchQK = 0;
-  constexpr int kPrefetchPV = 0;
-#endif
-
+  // Prefetch QKV, Persist Q g2s/s2r, Shared QKV smem.
+  constexpr int kPrefetchQK   = getConfigPrefetchQKV<kStageQK>();
+  constexpr int kPrefetchPV   = getConfigPrefetchQKV<kStagePV>(); 
+  constexpr int kPersistQs2r  = getConfigPersistQs2r();
+  constexpr int kPersistQg2s  = getConfigPersistQg2s<kStageQK, kHeadDim>();
+  constexpr int kShareSmemQKV = getConfigShareSmemQKV();
   // QKV smem swizzle, 0 for smem swizzle, !0 for smem padding.
-#ifdef ENABLE_FFPA_SMEM_SWIZZLE_Q
-  constexpr int kPadQ = 0;
-#else 
-  constexpr int kPadQ = 8;
-#endif
-#ifdef ENABLE_FFPA_SMEM_SWIZZLE_K
-  constexpr int kPadK = 0; 
-#else
-  constexpr int kPadK = 8;
-#endif
-#ifdef ENABLE_FFPA_SMEM_SWIZZLE_V
-  constexpr int kPadV = 0; 
-#else 
-  constexpr int kPadV = 8;
-#endif
+  constexpr int kPadQ = getConfigPadQ();
+  constexpr int kPadK = getConfigPadK();
+  constexpr int kPadV = getConfigPadV();
+  // Calculate SRAM size needed for per block.
+  constexpr int kQKVSmemMaxSize = getConfigQKVSmemMaxSize<
+    Br, Bc, kMmaAtomM, kMmaAtomN, kMmaAtomK, kHeadDim, kShareSmemQKV, 
+    kPersistQg2s, kPersistQs2r, kStageQK, kStagePV, kPadQ, kPadK,
+    kPadV
+  >();
 
   const int QKV_batch  = Q.size(0); 
   const int QKV_head   = Q.size(1);
   const int QKV_seqlen = Q.size(2); // QKV_seqlen
   assert(QKV_seqlen % max(Br, Bc) == 0); // multiple of max(Br, Bc)
   
-  dim3 block(kNumThreads); // 4/8 warps per block
-  // Tr(=N/Br), batch_size x num_heads
-  // try grid(N/Br, B * H) or grid(N/Br, H, B)
-#ifdef ENBALE_FFPA_LAUNCH_GRID_DNHB
-  dim3 grid(utils::div_ceil(QKV_seqlen, Br), QKV_head, QKV_batch); 
-#else
-  dim3 grid(utils::div_ceil(QKV_seqlen, Br), QKV_batch * QKV_head); 
-#endif
+  const dim3 block = getConfigBlock<kNumThreads>(); // 4/8 warps per block
+  const dim3 grid  = getConfigGrid<Br>(QKV_batch, QKV_head, QKV_seqlen);
   // Precompute softmax scale and Tc
   const int Tc = utils::div_ceil(QKV_seqlen, Bc); // Tc K_tile[Bc,d]  
   const float scale = 1.0f / sqrt((float) kHeadDim);
-
 
 #define LAUNCH_TEMPLATE_FUNC(TEMPLATE_FUNC)                 \
 cudaFuncSetAttribute(                                       \
@@ -176,30 +327,9 @@ TEMPLATE_FUNC<<<grid, block, kQKVSmemMaxSize>>>(            \
 
 #ifdef ENABLE_FFPA_PERSIST_KV_G2S
   if constexpr (kHeadDim < 256) { // 256 will use large d kernel
-    // Calculate SRAM size needed per block, Q,K,V smem size, V shared the QK smem.
-    constexpr int Q_smem_size = (
-      (kHeadDim / kMmaAtomK) * (Br * (kMmaAtomK + kPadQ)));
-    constexpr int K_smem_size = (
-      (kHeadDim / kMmaAtomK) * (Bc * (kMmaAtomK + kPadK)));
-    constexpr int V_smem_size = (
-      (kHeadDim / (kMmaAtomN * 2)) * (Bc * (kMmaAtomN * 2 + kPadV)));
-    constexpr int kQSmemMaxSize = Q_smem_size * 2;
-    constexpr int kKSmemMaxSize = K_smem_size * 2;
-    constexpr int kVSmemMaxSize = V_smem_size * 2;
-    constexpr int kQKSmemMaxSize = (
-      kQSmemMaxSize > kKSmemMaxSize ? kQSmemMaxSize : kKSmemMaxSize);
-    constexpr int kQKVSmemMaxSize = (
-      (kShareSmemQKV && kPersistQs2r) ? 
-      (kQKSmemMaxSize + kVSmemMaxSize) : // QK shared the same smem
-      (kQSmemMaxSize + kKSmemMaxSize + kVSmemMaxSize)
-    );
-#ifdef ENABLE_FFPA_PERSIST_V_S2R
-    constexpr int kPersistVs2r = 1;
-#else
-    constexpr int kPersistVs2r = 0;
-#endif
+    constexpr int kPersistVs2r = getConfigPersistVs2r(); // only for d < 256
 
-    auto ffpa_mma_L1_kernel_func = (
+    auto ffpa_mma_L1_small_d_kernel_func = (
       ffpa_mma_stages_split_q_L1_small_d_template<
         kHeadDim, 
         kMmaAtomM, 
@@ -228,25 +358,9 @@ TEMPLATE_FUNC<<<grid, block, kQKVSmemMaxSize>>>(            \
         kPadV
       >
     );
-    LAUNCH_TEMPLATE_FUNC(ffpa_mma_L1_kernel_func);
+    LAUNCH_TEMPLATE_FUNC(ffpa_mma_L1_small_d_kernel_func);
   } else { // large headdim >= 256
-    // Calculate SRAM size needed per block, Q,K,V smem size, V shared the QK smem.
-    constexpr int QK_smem_size = (
-      (kPersistQg2s ? (kHeadDim / kMmaAtomK) : kStageQK) * // Q
-      (Br * (kMmaAtomK + kPadQ)) + 
-      (kStageQK) * (Bc * (kMmaAtomK + kPadK))  // K
-    );
-    // R_D registers, s=2, d=64, 16 regs; d=128, 32 regs; 
-    // d=256, 64 regs; d=512, 128 regs; d=1024, 256 regs;
-    constexpr int PV_smem_size = (kStagePV * (Bc * (kMmaAtomN * 2 + kPadV)));
-    // try to let V reuse all Q+K smem after Q@K^T, reduce smem usage.
-    constexpr int kQKVSmemMaxSize = (
-      (kShareSmemQKV && (!kPersistQg2s)) ? 
-      ((QK_smem_size > PV_smem_size ? QK_smem_size * 2 : PV_smem_size * 2)) : 
-      ((QK_smem_size + PV_smem_size) * 2)
-    );
-
-    auto ffpa_mma_L1_kernel_func = (
+    auto ffpa_mma_L1_large_d_kernel_func = (
       ffpa_mma_stages_split_q_L1_large_d_template<
         kHeadDim, 
         kMmaAtomM, 
@@ -277,26 +391,10 @@ TEMPLATE_FUNC<<<grid, block, kQKVSmemMaxSize>>>(            \
         kPadV
       >
     );
-    LAUNCH_TEMPLATE_FUNC(ffpa_mma_L1_kernel_func);
+    LAUNCH_TEMPLATE_FUNC(ffpa_mma_L1_large_d_kernel_func);
   }
 #else  
-  // Always use large d ffpa kernel for all headdims.
-  // Calculate SRAM size needed per block, Q,K,V smem size, V shared the QK smem.
-  constexpr int QK_smem_size = (
-    (kPersistQg2s ? (kHeadDim / kMmaAtomK) : kStageQK) * // Q
-    (Br * (kMmaAtomK + kPadQ)) + 
-    (kStageQK) * (Bc * (kMmaAtomK + kPadK))  // K
-  );
-  // R_D registers, s=2, d=64, 16 regs; d=128, 32 regs; 
-  // d=256, 64 regs; d=512, 128 regs; d=1024, 256 regs;
-  constexpr int PV_smem_size = (kStagePV * (Bc * (kMmaAtomN * 2 + kPadV)));
-  constexpr int kQKVSmemMaxSize = (
-    (kShareSmemQKV && (!kPersistQg2s)) ? 
-    ((QK_smem_size > PV_smem_size ? QK_smem_size * 2 : PV_smem_size * 2)) : 
-    ((QK_smem_size + PV_smem_size) * 2)
-  );
-
-  auto ffpa_mma_L1_kernel_func = (
+  auto ffpa_mma_L1_large_d_kernel_func = (
     ffpa_mma_stages_split_q_L1_large_d_template<
       kHeadDim, 
       kMmaAtomM, 
@@ -327,7 +425,7 @@ TEMPLATE_FUNC<<<grid, block, kQKVSmemMaxSize>>>(            \
       kPadV
     >
   );
-  LAUNCH_TEMPLATE_FUNC(ffpa_mma_L1_kernel_func);
+  LAUNCH_TEMPLATE_FUNC(ffpa_mma_L1_large_d_kernel_func);
 #endif
 
 #undef LAUNCH_TEMPLATE_FUNC
