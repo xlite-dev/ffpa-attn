@@ -3,9 +3,9 @@ using namespace ffpa;
 
 
 template<
-  const int kHeadDim,              // Headdim, 32~1024   
-  const int kMmaAccFloat32QK,      // 0/1, Q@K^T, 0 MMA Acc with fp16, 1 MMA Acc with fp32.
-  const int kMmaAccFloat32PV,      // 0/1, P@V, 0 MMA Acc with fp16, 1 MMA Acc with fp32.
+  const int kHeadDim,          // Headdim, 32~1024   
+  const int kMmaAccFloat32QK,  // 0/1, Q@K^T, 0 MMA Acc with fp16, 1 MMA Acc with fp32.
+  const int kMmaAccFloat32PV,  // 0/1, P@V, 0 MMA Acc with fp16, 1 MMA Acc with fp32.
   const int kStage
 >
 void launch_ffpa_mma_L1_template(torch::Tensor Q, 
@@ -28,8 +28,8 @@ void launch_ffpa_mma_L1_template(torch::Tensor Q,
   // and large tile for small headdim. headdim > 128 will 
   // use ffpa-attn, not flash-attn. TODO: tune block size 
   // for L20/4090/3080 etc. Prefer small block size for 
-  // ffpa small d kenel on NVIDIA L20 device (64x64) and
-  // large block size on NVIDIA 4090 device (128x128)
+  // ffpa small d kenel (64x64) and large block size for 
+  // large d kernel (128x128).
 #if defined(BUILD_FFPA_ATTN_MMA_L20)
   // Enable QKV g2s & s2r with block 64x64 for d <= 128
   // (small d kernel) will get best performance.
@@ -81,6 +81,7 @@ void launch_ffpa_mma_L1_template(torch::Tensor Q,
   static_assert(Br == Bc, "Br must be equal Bc in order to avoid illegal memory access.");
   constexpr int kNumThreads = WARP_SIZE * kMmaTileSeqLenQ * kMmaTileSeqLenK;
   // Apply different multi stages policy for QK and V.
+  // TODO: tune stages for Q@K and P@V.
   constexpr int kStageQK = kStage; // <= 4
   constexpr int kStagePV = kStage; // <= 4
   // 0/1, The precision of the O storage buffer can differ from 
@@ -265,6 +266,8 @@ TEMPLATE_FUNC<<<grid, block, kQKVSmemMaxSize>>>(            \
         kPrefetchQK,
         kPrefetchPV,
         (kPersistQg2s) ? 0 : kShareSmemQKV,
+        // Force disable Q s2r for d >= 256, Q s2r for large d will 
+        // need too many register, thus, introduce performance drops.
         (kPersistQg2s || kHeadDim > 256) ? 0 : kPersistQs2r,
         kPersistQg2s,
         kStageQK, 
@@ -313,7 +316,9 @@ TEMPLATE_FUNC<<<grid, block, kQKVSmemMaxSize>>>(            \
       kPrefetchQK,
       kPrefetchPV,
       (kPersistQg2s) ? 0 : kShareSmemQKV,
-      (kPersistQg2s || kHeadDim > 256) ? 0 : kPersistQs2r,
+      // Force disable Q s2r for d >= 256, Q s2r for large d will 
+      // need too many register, thus, introduce performance drops.
+      (kPersistQg2s || kHeadDim > 256) ? 0 : kPersistQs2r, 
       kPersistQg2s,
       kStageQK, 
       kStagePV,

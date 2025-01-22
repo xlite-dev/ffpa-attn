@@ -28,8 +28,8 @@ template<
   const int kPrefetchQK,           // Prefetch QK at the Appropriate Time Point. 
   const int kPrefetchPV,           // Prefetch V at the Appropriate Time Point. 
   const int kShareSmemQKV,         // QKV share the same shared memory, reuse QK smem for V.
-  const int kPersistQs2r,          // Persist load Q s2r for headdim < 512, more registers, but still keep O(1) SRAM.
-  const int kPersistQg2s,          // Persist load Q g2s for headdim < 512, more SRAM, but still keep register usage.
+  const int kPersistQs2r,          // Persist load Q s2r for headdim < 320, more registers, but still keep O(1) SRAM.
+  const int kPersistQg2s,          // Persist load Q g2s for headdim < 320, more SRAM, but still keep register usage.
   const int kStageQK,              // <= 4, may apply different multi stages policy for QK and V (<=4)
   const int kStagePV,              // <= 4, may apply different multi stages policy for QK and V (<=4)
   const int kPadQ,                 // Pad Q/K/V 0,8; 0 -> smem swizzle, > 0 -> padding
@@ -263,8 +263,8 @@ __device__ __forceinline__ void sync_fetch_qkv_frags_s2r(
 
 template<const int kWarpTileSeqLenK, const int kMmaAccFloat32>
 __device__ __forceinline__ void sync_online_safe_softmax(
-  uint32_t * R_S,                       // &R_S[0][0][0]
-  const float scale,                    // 1 / sqrt(d)
+  uint32_t * R_S,                 // &R_S[0][0][0]
+  const float scale,              // 1 / sqrt(d)
   float * lane_row_max_new,       // &lane_row_max_new[0][0]
   float * lane_row_sum_new,       // &lane_row_sum_new[0][0]
   float * lane_block_row_max_old, // &lane_block_row_max_old[0][0]
@@ -296,11 +296,7 @@ __device__ __forceinline__ void sync_online_safe_softmax(
     { // kWarpTileSeqLenQ = 1
       // Use latest global row max without update.
       // Br 0, row_id, 0~7,  16~23, 32~39, 48~55; 
-      // float block_row_max_new_0 = lane_row_max_new[0]; 
-      // // Br 1, row_id, 8~15, 24~31, 40~47, 56~63;
-      // float block_row_max_new_1 = lane_row_max_new[1];
-      // const float block_row_max_old_0 = lane_block_row_max_old[0];
-      // const float block_row_max_old_1 = lane_block_row_max_old[1];
+      // Br 1, row_id, 8~15, 24~31, 40~47, 56~63;
       // Apply m_new = max(m_old, m_new) here.
       const float block_row_max_new_0 = max(lane_block_row_max_old[0], lane_row_max_new[0]);
       const float block_row_max_new_1 = max(lane_block_row_max_old[1], lane_row_max_new[1]);
@@ -356,13 +352,6 @@ __device__ __forceinline__ void sync_online_safe_softmax(
     // static_assert(kWarpTileSeqLenQ == 1);
     // Exp sum and mul scale_factor for [Br,Bc] tile, Thread -> Warp -> Block.
     { // kWarpTileSeqLenQ = 1
-      // Use latest global row max without update.
-      // Br 0, row_id, 0~7,  16~23, 32~39, 48~55; 
-      // float block_row_max_new_0 = lane_row_max_new[0]; 
-      // // Br 1, row_id, 8~15, 24~31, 40~47, 56~63;
-      // float block_row_max_new_1 = lane_row_max_new[1];
-      // const float block_row_max_old_0 = lane_block_row_max_old[0];
-      // const float block_row_max_old_1 = lane_block_row_max_old[1];
       // Apply m_new = max(m_old, m_new) here.
       const float block_row_max_new_0 = max(lane_block_row_max_old[0], lane_row_max_new[0]);
       const float block_row_max_new_1 = max(lane_block_row_max_old[1], lane_row_max_new[1]);
@@ -483,13 +472,12 @@ __device__ __forceinline__ void sync_rescaling_tiling_o(
 }
 
 __device__ __forceinline__ void sync_update_max_expsum(
-  float * lane_row_max_new,       // &lane_row_max_new[0][0]
-  float * lane_row_sum_new,       // &lane_row_sum_new[0][0]
-  float * lane_block_row_max_old, // &lane_block_row_max_old[0][0]
-  float * lane_block_row_sum_old, // &lane_block_row_sum_old[0][0]
-  const float * rescale_o_factor_0,     // rescale factor 0 exp(m_old - m_new)
-  const float * rescale_o_factor_1     // rescale factor 1 exp(m_old - m_new)
-  // const int n_tile_id             // tile_K_seqlen
+  float * lane_row_max_new,         // &lane_row_max_new[0][0]
+  float * lane_row_sum_new,         // &lane_row_sum_new[0][0]
+  float * lane_block_row_max_old,   // &lane_block_row_max_old[0][0]
+  float * lane_block_row_sum_old,   // &lane_block_row_sum_old[0][0]
+  const float * rescale_o_factor_0, // rescale factor 0 exp(m_old - m_new)
+  const float * rescale_o_factor_1  // rescale factor 1 exp(m_old - m_new)
 ) {
   // Now, we can update m, l after O has been scaled.
   // Update l = exp(m_old - m_new) * l_old + row_sum(P).
@@ -505,7 +493,7 @@ __device__ __forceinline__ void sync_update_max_expsum(
 
 template<const int kWarpTileHeadDimV, const int kOStorageAccFloat32>
 __device__ __forceinline__ void sync_rescaling_final_o(
-  uint32_t * R_D,                // Final O after loop over N
+  uint32_t * R_D,                      // Final O after loop over N
   const float * lane_block_row_sum_old // &lane_block_row_sum_old[0][0]
 ) {
   // Finaly, we still have to rescale O once more.
