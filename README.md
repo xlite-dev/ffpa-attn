@@ -9,7 +9,7 @@
     <img src=https://img.shields.io/github/watchers/DefTruth/ffpa-attn-mma?color=9cc >
     <img src=https://img.shields.io/github/forks/DefTruth/ffpa-attn-mma.svg?style=social >
     <img src=https://img.shields.io/github/stars/DefTruth/ffpa-attn-mma.svg?style=social >
-    <img src=https://img.shields.io/badge/Release-v0.0.1-brightgreen.svg >
+    <img src=https://img.shields.io/badge/Release-v0.0.2-brightgreen.svg >
     <img src=https://img.shields.io/badge/License-GPLv3.0-turquoise.svg >
  </div>
 </div>
