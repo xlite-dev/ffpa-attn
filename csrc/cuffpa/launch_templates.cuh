@@ -1,16 +1,6 @@
 #include "ffpa_attn_templates_L1.cuh"
 using namespace ffpa;                                            
 
-// Need more SRAM, use small tile 64x64 for large headdim
-// and large tile for small headdim. headdim > 128 will 
-// use ffpa-attn, not flash-attn. TODO: tune block size 
-// for L20/4090/3080 etc. Prefer small block size for 
-// ffpa small d kenel (64x64) and large block size for 
-// large d kernel (128x128).
-// NOTE: Enable QKV g2s & s2r with block 64x64 for d <= 128
-// (small d kernel) will get best performance.
-// NOTE: On 4090, enable Q g2s for d <= 320 (large d kernel) 
-// will get best performance.
 static constexpr int kMaxDForSmallDKernel   = 64;
 static constexpr int kMaxDForOStoreFloat32  = 64;
 static constexpr int kMaxDForSmallBlockTile = 256;
