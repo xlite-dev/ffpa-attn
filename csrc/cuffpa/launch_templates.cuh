@@ -11,21 +11,29 @@ using namespace ffpa;
 // (small d kernel) will get best performance.
 // NOTE: On 4090, enable Q g2s for d <= 320 (large d kernel) 
 // will get best performance.
+static constexpr int kMaxDForSmallDKernel   = 64;
+static constexpr int kMaxDForOStoreFloat32  = 64;
+static constexpr int kMaxDForSmallBlockTile = 256;
+
 template<const int kHeadDim>
 constexpr int getConfigMmaTileSeqLenQP() {
 #ifdef ENABLE_FFPA_PERSIST_KV_G2S 
 #if defined(BUILD_FFPA_ATTN_MMA_L20)
-  constexpr int kMmaTileSeqLenQP  = (kHeadDim <= 256) ? 4: 8;
+  constexpr int kMmaTileSeqLenQP  = (
+    kHeadDim <= kMaxDForSmallBlockTile) ? 4: 8;
 #else
-  constexpr int kMmaTileSeqLenQP  = (kHeadDim <= 256) ? 8: 8;
+  constexpr int kMmaTileSeqLenQP  = (
+    kHeadDim <= kMaxDForSmallBlockTile) ? 8: 8;
 #endif
 #else // if undef ENABLE_FFPA_PERSIST_KV_G2S
   // O(1) SRAM complexity, may always use large tile for 
   // ffpa large d kernel. TODO: tune block size for L20/4090/3080 etc. 
 #if defined(BUILD_FFPA_ATTN_MMA_L20)
-  constexpr int kMmaTileSeqLenQP  = (kHeadDim <= 256) ? 4: 8;
+  constexpr int kMmaTileSeqLenQP  = (
+    kHeadDim <= kMaxDForSmallBlockTile) ? 4: 8;
 #else
-  constexpr int kMmaTileSeqLenQP  = (kHeadDim <= 256) ? 8: 8;
+  constexpr int kMmaTileSeqLenQP  = (
+    kHeadDim <= kMaxDForSmallBlockTile) ? 8: 8;
 #endif
 #endif
   return kMmaTileSeqLenQP;
@@ -35,15 +43,19 @@ template<const int kHeadDim>
 constexpr int getConfigWarpTileSeqLenK() {
 #ifdef ENABLE_FFPA_PERSIST_KV_G2S 
 #if defined(BUILD_FFPA_ATTN_MMA_L20)
-  constexpr int kWarpTileSeqLenK  = (kHeadDim <= 256) ? 8: 16;
+  constexpr int kWarpTileSeqLenK  = (
+    kHeadDim <= kMaxDForSmallBlockTile) ? 8: 16;
 #else
-  constexpr int kWarpTileSeqLenK  = (kHeadDim <= 256) ? 16: 16;
+  constexpr int kWarpTileSeqLenK  = (
+    kHeadDim <= kMaxDForSmallBlockTile) ? 16: 16;
 #endif
 #else // if undef ENABLE_FFPA_PERSIST_KV_G2S
 #if defined(BUILD_FFPA_ATTN_MMA_L20)
-  constexpr int kWarpTileSeqLenK  = (kHeadDim <= 256) ? 8: 16;
+  constexpr int kWarpTileSeqLenK  = (
+    kHeadDim <= kMaxDForSmallBlockTile) ? 8: 16;
 #else
-  constexpr int kWarpTileSeqLenK  = (kHeadDim <= 256) ? 16: 16;
+  constexpr int kWarpTileSeqLenK  = (
+    kHeadDim <= kMaxDForSmallBlockTile) ? 16: 16;
 #endif
 #endif
   return kWarpTileSeqLenK;
@@ -74,7 +86,7 @@ constexpr int getConfigOStorageAccFloat32() {
   // FP16 can provide precision to approximately 3-4 decimal places.
   // Thus, if the error does not exceed 1e-3, using FP16 storage is 
   // sufficient for most applications.
-  return ((kHeadDim < 128)) ? 1 : 0;
+  return ((kHeadDim <= kMaxDForOStoreFloat32)) ? 1 : 0;
 }
 
 template<const int kStageQKV>
@@ -190,7 +202,7 @@ template<
 >
 constexpr int getConfigQKVSmemMaxSize() {
 #ifdef ENABLE_FFPA_PERSIST_KV_G2S
-  if constexpr (kHeadDim < 256) { // 256 will use large d kernel
+  if constexpr (kHeadDim <= kMaxDForSmallDKernel) { // e.g > 128 will use large d kernel
     // Calculate SRAM size needed per block, Q,K,V smem size, V shared the QK smem.
     constexpr int Q_smem_size = (
       (kHeadDim / kMmaAtomK) * (Br * (kMmaAtomK + kPadQ)));
@@ -326,7 +338,7 @@ TEMPLATE_FUNC<<<grid, block, kQKVSmemMaxSize>>>(            \
 );
 
 #ifdef ENABLE_FFPA_PERSIST_KV_G2S
-  if constexpr (kHeadDim < 256) { // 256 will use large d kernel
+  if constexpr (kHeadDim <= kMaxDForSmallDKernel) { // e.g > 128 will use large d kernel
     constexpr int kPersistVs2r = getConfigPersistVs2r(); // only for d < 256
 
     auto ffpa_mma_L1_small_d_kernel_func = (
@@ -359,7 +371,7 @@ TEMPLATE_FUNC<<<grid, block, kQKVSmemMaxSize>>>(            \
       >
     );
     LAUNCH_TEMPLATE_FUNC(ffpa_mma_L1_small_d_kernel_func);
-  } else { // large headdim >= 256
+  } else { // large headdim > kMaxDForSmallDKernel (e.g 128)
     auto ffpa_mma_L1_large_d_kernel_func = (
       ffpa_mma_stages_split_q_L1_large_d_template<
         kHeadDim, 
