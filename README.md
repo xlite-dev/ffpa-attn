@@ -250,9 +250,20 @@ L1: level 1, O(2xBrx16)≈O(1) SRAM complexity, O(d/4) register complexity, the 
 👇You can test many custom FFPA kernels via Python and figure out the difference in their performance. The `--gen-bench` and `--plot` options help you generate a benchmark table in Markdown style and speedup bar plots on your device. Contributions of your benchmark tables and plots are welcome via a PR 🎉🎉.
 
 - 📚 case: B=1, H=48, N=8192, D=320(`FA2 not supported`)
-```bash
+```python
 # You can test on many devices, such as Volta, Ampere, Ada, Hopper, ...
 cd tests && python3 test.py --B 1 --H 48 --N 8192 --show-all --D 320
+---------------------------------------B=1, H=48, N=8192, D=320, Warmup: 1, Iters: 5-------------------
+                   (sdpa): ['0.02055359'], time:73.68068ms, TFLOPS:56.18 (+0.00 %)(~1.00x)
+ (ffpa+acc+f32+L1+stage1): ['0.02061462'], time:52.88152ms, TFLOPS:78.27 (+39.33%)(~1.39x)
+ (ffpa+acc+f32+L1+stage2): ['0.02061462'], time:40.84453ms, TFLOPS:101.34(+29.47%)(~1.80x)
+ (ffpa+acc+f16+L1+stage1): ['0.02052307'], time:53.46422ms, TFLOPS:77.42 (+0.00 %)(~1.38x)
+ (ffpa+acc+f16+L1+stage2): ['0.02052307'], time:39.75868ms, TFLOPS:104.11(+2.73 %)(~1.85x)
+ (ffpa+acc+f32+L1+stage3): ['0.02061462'], time:40.49625ms, TFLOPS:102.21(+0.00 %)(~1.82x)
+ (ffpa+acc+f32+L1+stage4): ['0.02061462'], time:40.88068ms, TFLOPS:101.25(+0.00 %)(~1.80x)
+ (ffpa+acc+f16+L1+stage3): ['0.02052307'], time:39.57524ms, TFLOPS:104.59(+0.46 %)(~1.86x)
+ (ffpa+acc+f16+L1+stage4): ['0.02052307'], time:41.07236ms, TFLOPS:100.78(+0.00 %)(~1.79x)
+-------------------------------------------------------------------------------------------------------
 ```
 - 📚 case: Generate benchmark table and speedup bar plots on Your device.
 ```bash
@@ -273,6 +284,18 @@ python3 test.py --B 1 --H 32 --N 1024 --check --show-all --D 64 # NVIDIA L20
  (ffpa+acc+f32+L1+stage4): ['-0.02572632'], time:0.102043ms, TFLOPS:85.80 (+0.00 %)(~1.51x)
  (ffpa+acc+f16+L1+stage3): ['-0.02568054'], time:0.111246ms, TFLOPS:78.70 (+0.00 %)(~1.39x)
  (ffpa+acc+f16+L1+stage4): ['-0.02568054'], time:0.108432ms, TFLOPS:80.75 (+0.00 %)(~1.42x)
+--------------------------------------------------------------------------------------------------------
+python3 test.py --B 1 --H 32 --N 4096 --check --show-all --D 64 # NVIDIA L20
+-------------------------B=1, H=32, N=4096, D=64, Warmup: 1, Iters: 5-----------------------------------
+                   (sdpa): ['0.02157593'], time:1.397895ms, TFLOPS:100.23(+0.00 %)(~1.00x)
+ (ffpa+acc+f32+L1+stage1): ['0.02157593'], time:1.365280ms, TFLOPS:102.63(+2.39 %)(~1.02x)
+ (ffpa+acc+f32+L1+stage2): ['0.02157593'], time:1.364326ms, TFLOPS:102.70(+0.07 %)(~1.02x)
+ (ffpa+acc+f16+L1+stage1): ['0.02149963'], time:1.385259ms, TFLOPS:101.15(+0.00 %)(~1.01x)
+ (ffpa+acc+f16+L1+stage2): ['0.02149963'], time:1.384210ms, TFLOPS:101.22(+0.00 %)(~1.01x)
+ (ffpa+acc+f32+L1+stage3): ['0.02157593'], time:1.363992ms, TFLOPS:102.72(+0.02 %)(~1.02x)
+ (ffpa+acc+f32+L1+stage4): ['0.02157593'], time:1.364374ms, TFLOPS:102.70(+0.00 %)(~1.02x)
+ (ffpa+acc+f16+L1+stage3): ['0.02149963'], time:1.383972ms, TFLOPS:101.24(+0.00 %)(~1.01x)
+ (ffpa+acc+f16+L1+stage4): ['0.02149963'], time:1.382637ms, TFLOPS:101.34(+0.00 %)(~1.01x)
 --------------------------------------------------------------------------------------------------------
 ```
 
