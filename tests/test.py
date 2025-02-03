@@ -661,25 +661,6 @@ for (B, H, N, D) in BHNDs:
             o,
             stages=2,
         )
-        if ENV.enable_all_mutistages():
-            out_ffpa_l1_f323, _ = run_benchmark(
-                ffpa_attn.ffpa_mma_acc_f32_L1,
-                q,
-                k,
-                v,
-                "(ffpa+acc+f32+L1+stage3)",
-                o,
-                stages=3,
-            )
-            out_ffpa_l1_f324, _ = run_benchmark(
-                ffpa_attn.ffpa_mma_acc_f32_L1,
-                q,
-                k,
-                v,
-                "(ffpa+acc+f32+L1+stage4)",
-                o,
-                stages=4,
-            )
         out_ffpa_l1_f161, _ = run_benchmark(
             ffpa_attn.ffpa_mma_acc_f16_L1,
             q,
@@ -699,6 +680,24 @@ for (B, H, N, D) in BHNDs:
             stages=2,
         )
         if ENV.enable_all_mutistages():
+            out_ffpa_l1_f323, _ = run_benchmark(
+                ffpa_attn.ffpa_mma_acc_f32_L1,
+                q,
+                k,
+                v,
+                "(ffpa+acc+f32+L1+stage3)",
+                o,
+                stages=3,
+            )
+            out_ffpa_l1_f324, _ = run_benchmark(
+                ffpa_attn.ffpa_mma_acc_f32_L1,
+                q,
+                k,
+                v,
+                "(ffpa+acc+f32+L1+stage4)",
+                o,
+                stages=4,
+            )
             out_ffpa_l1_f163, _ = run_benchmark(
                 ffpa_attn.ffpa_mma_acc_f16_L1,
                 q,
@@ -741,25 +740,6 @@ for (B, H, N, D) in BHNDs:
             o,
             stages=2,
         )
-        if ENV.enable_all_mutistages():
-            out_ffpa_l1_f323, _ = run_benchmark(
-                partial(ffpa_attn.ffpa, level=ffpa_attn.L1, acc=ffpa_attn.FP32),
-                q,
-                k,
-                v,
-                "(ffpa+acc+f32+L1+stage3)",
-                o,
-                stages=3,
-            )
-            out_ffpa_l1_f324, _ = run_benchmark(
-                partial(ffpa_attn.ffpa, level=ffpa_attn.L1, acc=ffpa_attn.FP32),
-                q,
-                k,
-                v,
-                "(ffpa+acc+f32+L1+stage4)",
-                o,
-                stages=4,
-            )
         out_ffpa_l1_f161, _ = run_benchmark(
             partial(ffpa_attn.ffpa, level=ffpa_attn.L1, acc=ffpa_attn.FP16),
             q,
@@ -779,6 +759,24 @@ for (B, H, N, D) in BHNDs:
             stages=2,
         )
         if ENV.enable_all_mutistages():
+            out_ffpa_l1_f323, _ = run_benchmark(
+                partial(ffpa_attn.ffpa, level=ffpa_attn.L1, acc=ffpa_attn.FP32),
+                q,
+                k,
+                v,
+                "(ffpa+acc+f32+L1+stage3)",
+                o,
+                stages=3,
+            )
+            out_ffpa_l1_f324, _ = run_benchmark(
+                partial(ffpa_attn.ffpa, level=ffpa_attn.L1, acc=ffpa_attn.FP32),
+                q,
+                k,
+                v,
+                "(ffpa+acc+f32+L1+stage4)",
+                o,
+                stages=4,
+            )
             out_ffpa_l1_f163, _ = run_benchmark(
                 partial(ffpa_attn.ffpa, level=ffpa_attn.L1, acc=ffpa_attn.FP16),
                 q,
@@ -813,6 +811,8 @@ for (B, H, N, D) in BHNDs:
     if args.check:
         check_all_close(out_sdpa, out_ffpa_l1_f321, "out_ffpa_l1_f321", args.check_all)
         check_all_close(out_sdpa, out_ffpa_l1_f322, "out_ffpa_l1_f322", args.check_all)
+        check_all_close(out_sdpa, out_ffpa_l1_f161, "out_ffpa_l1_f161", args.check_all)
+        check_all_close(out_sdpa, out_ffpa_l1_f162, "out_ffpa_l1_f161", args.check_all)
         if ENV.enable_all_mutistages():
             check_all_close(
                 out_sdpa, out_ffpa_l1_f323, "out_ffpa_l1_f323", args.check_all
@@ -820,9 +820,6 @@ for (B, H, N, D) in BHNDs:
             check_all_close(
                 out_sdpa, out_ffpa_l1_f324, "out_ffpa_l1_f324", args.check_all
             )
-        check_all_close(out_sdpa, out_ffpa_l1_f161, "out_ffpa_l1_f161", args.check_all)
-        check_all_close(out_sdpa, out_ffpa_l1_f162, "out_ffpa_l1_f161", args.check_all)
-        if ENV.enable_all_mutistages():
             check_all_close(
                 out_sdpa, out_ffpa_l1_f163, "out_ffpa_l1_f163", args.check_all
             )
