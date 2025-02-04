@@ -119,6 +119,7 @@ ffpa_mma_stages_split_q_L1_small_d_template(half* Q, half* K, half* V, half* O, 
 
 - Python >= 3.10
 - PyTorch >= 2.4.0, CUDA >= 12.4
+- flash-attention >= 2.6.3 (for test)
 - Recommended: PyTorch 2.5.1, CUDA 12.5
 - Docker: nvcr.io/nvidia/pytorch:24.10-py3
 
