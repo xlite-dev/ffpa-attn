@@ -128,6 +128,15 @@ static constexpr int getConfigPersistVs2r() {
   return kPersistVs2r;
 }
 
+static constexpr int getConfigRegistersPipeKV() {
+#ifdef ENABLE_FFPA_REGISTERS_PIPE_KV
+  constexpr int kRegPipeKV = 1;
+#else
+  constexpr int kRegPipeKV = 0;
+#endif
+  return kRegPipeKV;
+}
+
 static constexpr int getConfigPadQ() {
 #ifdef ENABLE_FFPA_SMEM_SWIZZLE_Q
   constexpr int kPadQ = 0;
@@ -283,11 +292,12 @@ void launch_ffpa_mma_L1_template(torch::Tensor Q,
   constexpr int kStageQK = kStage; // <= 4
   constexpr int kStagePV = kStage; // <= 4
   // Prefetch QKV, Persist Q g2s/s2r, Shared QKV smem.
+  constexpr int kShareSmemQKV = getConfigShareSmemQKV();
   constexpr int kPrefetchQK   = getConfigPrefetchQKV<kStageQK>();
   constexpr int kPrefetchPV   = getConfigPrefetchQKV<kStagePV>(); 
   constexpr int kPersistQs2r  = getConfigPersistQs2r();
   constexpr int kPersistQg2s  = getConfigPersistQg2s<kStageQK, kHeadDim>();
-  constexpr int kShareSmemQKV = getConfigShareSmemQKV();
+  constexpr int kRegPipeKV    = getConfigRegistersPipeKV();
   // QKV smem swizzle, 0 for smem swizzle, !0 for smem padding.
   constexpr int kPadQ = getConfigPadQ();
   constexpr int kPadK = getConfigPadK();
@@ -353,6 +363,9 @@ TEMPLATE_FUNC<<<grid, block, kQKVSmemMaxSize>>>(            \
         kShareSmemQKV,
         kPersistQs2r,
         kPersistVs2r,
+        // Force disable KV registers ping pong buffers
+        // while V s2r is enabled.
+        (kPersistVs2r) ? 0 : kRegPipeKV,
         1, /*kStageQK unused*/
         1, /*kStagePV unused*/
         kPadQ,
@@ -386,6 +399,7 @@ TEMPLATE_FUNC<<<grid, block, kQKVSmemMaxSize>>>(            \
         // need too many register, thus, introduce performance drops.
         (kPersistQg2s || kHeadDim > 256) ? 0 : kPersistQs2r,
         kPersistQg2s,
+        kRegPipeKV,
         kStageQK, 
         kStagePV,
         kPadQ,
@@ -420,6 +434,7 @@ TEMPLATE_FUNC<<<grid, block, kQKVSmemMaxSize>>>(            \
       // need too many register, thus, introduce performance drops.
       (kPersistQg2s || kHeadDim > 256) ? 0 : kPersistQs2r, 
       kPersistQg2s,
+      kRegPipeKV,
       kStageQK, 
       kStagePV,
       kPadQ,
