@@ -95,6 +95,11 @@ class ENV(object):
         int(os.environ.get("ENABLE_FFPA_PERSIST_V_S2R", ENABLE_FFPA_PERSIST_KV_G2S))
     )
 
+    # Registers Ping pong double buffers for ldmatrix & mma computation overlapping.
+    ENABLE_FFPA_REGISTERS_PIPE_KV = bool(
+        int(os.environ.get("ENABLE_FFPA_REGISTERS_PIPE_KV", 0))
+    )
+
     # if True: grid(N/Br, H, B) else: grid(N/Br, B * H)
     ENBALE_FFPA_LAUNCH_GRID_DNHB = bool(
         int(os.environ.get("ENBALE_FFPA_LAUNCH_GRID_DNHB", 0))
@@ -173,6 +178,10 @@ class ENV(object):
         if cls.enable_persist_kv_g2s():
             return cls.ENABLE_FFPA_PERSIST_V_S2R
         return False
+    
+    @classmethod
+    def enable_registers_pipe_kv(cls):
+        return cls.ENABLE_FFPA_REGISTERS_PIPE_KV
 
     @classmethod
     def enable_launch_grid_dnhb(cls):
@@ -209,6 +218,8 @@ class ENV(object):
             extra_env_cflags.append("-DENABLE_FFPA_PERSIST_Q_S2R")
         if cls.enable_persist_v_s2r():
             extra_env_cflags.append("-DENABLE_FFPA_PERSIST_V_S2R")
+        if cls.enable_registers_pipe_kv():
+            extra_env_cflags.append("-DENABLE_FFPA_REGISTERS_PIPE_KV")
         if cls.enable_launch_grid_dnhb():
             extra_env_cflags.append("-DENBALE_FFPA_LAUNCH_GRID_DNHB")
 
@@ -263,6 +274,7 @@ class ENV(object):
         formatenv("ENABLE_FFPA_SMEM_SWIZZLE_Q", cls.enable_smem_swizzle_q())
         formatenv("ENABLE_FFPA_SMEM_SWIZZLE_K", cls.enable_smem_swizzle_k())
         formatenv("ENABLE_FFPA_SMEM_SWIZZLE_V", cls.enable_smem_swizzle_v())
+        formatenv("ENABLE_FFPA_REGISTERS_PIPE_KV", cls.enable_registers_pipe_kv())
         formatenv("ENBALE_FFPA_LAUNCH_GRID_DNHB", cls.enable_launch_grid_dnhb())
         pretty_print_line()
 
