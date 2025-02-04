@@ -12,6 +12,12 @@ import torch
 from torch import Tensor
 from torch.nn import functional as F
 from torch.nn.attention import sdpa_kernel, SDPBackend
+try:
+    from flash_attn import flash_attn_func
+    has_flash_attn = True
+except ImportError:
+    flash_attn_func = None
+    has_flash_attn = False
 
 sys.path.append("../")
 from env import ENV, pretty_print_line
@@ -29,9 +35,11 @@ def get_args():
     parser.add_argument("--no-rand-v", "--no-rv", action="store_true")
     parser.add_argument("--no-rand-qkv", "--no-rqkv", action="store_true")
     parser.add_argument("--run-torch-unfused", "--torch", action="store_true")
+    parser.add_argument("--run-flash-attn", "--flash", action="store_true")
     parser.add_argument("--check", action="store_true")
     parser.add_argument("--check-all", action="store_true")
     parser.add_argument("--show-all", "--show", action="store_true")
+    parser.add_argument("--show-less", "--show-l", action="store_true")
     parser.add_argument("--show-matrix", action="store_true")
     parser.add_argument("--only-flops-matmul", "--flops-mm", action="store_true")
     parser.add_argument("--B", type=int, default=None)
@@ -132,7 +140,6 @@ STATIS_INFO["headdim"] = set()
 TOATL_TFLOPS: dict[str, float] = {}
 SDPA_TFLOPS = -1
 
-
 def run_benchmark(
     perf_func: callable,
     q: torch.Tensor,
@@ -164,12 +171,15 @@ def run_benchmark(
         if not hit_hints:
             return None, None
 
-    if "unfused" in tag and (not args.run_torch_unfused):
-        return None, None
-
     B, H, N, D = q.size()
     if "flash" in tag:
         B, N, H, D = q.size()
+
+    if "unfused" in tag and (not args.run_torch_unfused):
+        return None, None
+    if "flash" in tag and ((not args.run_flash_attn) 
+                           or (not has_flash_attn) or (D > 256)):
+        return None, None
 
     STATIS_INFO["headdim"].add(D)
 
@@ -232,9 +242,14 @@ def run_benchmark(
     out_val_last = out.flatten()[-3:].detach().cpu().numpy().tolist()
     out_val_first = [round(v, 8) for v in out_val_first]
     out_val_last = [round(v, 8) for v in out_val_last]
-    out_val = out_val_first[:2]
-    out_val.append(out_val_last[-1])
+    if not args.show_less:
+        out_val = out_val_first[:2]
+        out_val.append(out_val_last[-1])
+    else:
+        out_val = out_val_first[:1]
     out_val = [f"{v:<12}" for v in out_val]
+    if args.show_less:
+        out_val = [v.strip() for v in out_val]
 
     if SDPA_TFLOPS > 0:
         speedup_sdpa = TFLOPS / SDPA_TFLOPS
@@ -643,6 +658,7 @@ for (B, H, N, D) in BHNDs:
         out_sdpa, _ = run_benchmark(
             partial(sdpa, use_flash=(D <= 256)), q, k, v, "(sdpa)"
         )
+        out_flash, _ = run_benchmark(flash_attn_func, fq, fk, fv, "(flash)")
         out_ffpa_l1_f321, _ = run_benchmark(
             ffpa_attn.ffpa_mma_acc_f32_L1,
             q,
@@ -723,6 +739,7 @@ for (B, H, N, D) in BHNDs:
         out_sdpa, _ = run_benchmark(
             partial(sdpa, use_flash=(D <= 256)), q, k, v, "(sdpa)"
         )
+        out_flash, _ = run_benchmark(flash_attn_func, fq, fk, fv, "(flash)")
         out_ffpa_l1_f321, _ = run_benchmark(
             partial(ffpa_attn.ffpa, level=ffpa_attn.L1, acc=ffpa_attn.FP32),
             q,

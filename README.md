@@ -97,6 +97,7 @@ template<
   const int kShareSmemQKV,         // QKV share the same shared memory, reuse QK smem for V.
   const int kPersistQs2r,          // Persist load Q s2r for headdim  < 512, more registers, but still keep O(1) SRAM.
   const int kPersistQg2s,          // Persist load Q g2s for headdim <= 320, more SRAM, but still keep register usage.
+  const int kRegPipeKV,            // Registers Ping pong double buffers for ldmatrix s2r & mma computation overlapping.
   const int kStageQK,              // <= 4, may apply different multi stages policy for QK and V (<=4)
   const int kStagePV,              // <= 4, may apply different multi stages policy for QK and V (<=4)
   const int kPadQ,                 // Pad Q/K/V 0,8; 0 -> smem swizzle, > 0 -> padding
@@ -118,6 +119,7 @@ ffpa_mma_stages_split_q_L1_small_d_template(half* Q, half* K, half* V, half* O, 
 
 - Python >= 3.10
 - PyTorch >= 2.4.0, CUDA >= 12.4
+- flash-attention >= 2.6.3 (for test)
 - Recommended: PyTorch 2.5.1, CUDA 12.5
 - Docker: nvcr.io/nvidia/pytorch:24.10-py3
 
@@ -253,17 +255,17 @@ L1: level 1, O(2xBrx16)≈O(1) SRAM complexity, O(d/4) register complexity, the 
 ```python
 # You can test on many devices, such as Volta, Ampere, Ada, Hopper, ...
 cd tests && python3 test.py --B 1 --H 48 --N 8192 --show-all --D 320
----------------------------------------B=1, H=48, N=8192, D=320, Warmup: 1, Iters: 5-------------------
-                   (sdpa): ['0.02055359'], time:73.68068ms, TFLOPS:56.18 (+0.00 %)(~1.00x)
- (ffpa+acc+f32+L1+stage1): ['0.02061462'], time:52.88152ms, TFLOPS:78.27 (+39.33%)(~1.39x)
- (ffpa+acc+f32+L1+stage2): ['0.02061462'], time:40.84453ms, TFLOPS:101.34(+29.47%)(~1.80x)
- (ffpa+acc+f16+L1+stage1): ['0.02052307'], time:53.46422ms, TFLOPS:77.42 (+0.00 %)(~1.38x)
- (ffpa+acc+f16+L1+stage2): ['0.02052307'], time:39.75868ms, TFLOPS:104.11(+2.73 %)(~1.85x)
- (ffpa+acc+f32+L1+stage3): ['0.02061462'], time:40.49625ms, TFLOPS:102.21(+0.00 %)(~1.82x)
- (ffpa+acc+f32+L1+stage4): ['0.02061462'], time:40.88068ms, TFLOPS:101.25(+0.00 %)(~1.80x)
- (ffpa+acc+f16+L1+stage3): ['0.02052307'], time:39.57524ms, TFLOPS:104.59(+0.46 %)(~1.86x)
- (ffpa+acc+f16+L1+stage4): ['0.02052307'], time:41.07236ms, TFLOPS:100.78(+0.00 %)(~1.79x)
--------------------------------------------------------------------------------------------------------
+---------------------------------------B=1, H=48, N=8192, D=320, Warmup: 1, Iters: 5--------------------
+                   (sdpa): ['-0.02380371'], time:73.66518ms, TFLOPS:56.19 (+0.00 %)(~1.00x)
+ (ffpa+acc+f32+L1+stage1): ['-0.02378845'], time:52.87361ms, TFLOPS:78.28 (+39.32%)(~1.39x)
+ (ffpa+acc+f32+L1+stage2): ['-0.02378845'], time:40.84062ms, TFLOPS:101.35(+29.46%)(~1.80x)
+ (ffpa+acc+f32+L1+stage3): ['-0.02378845'], time:40.49534ms, TFLOPS:102.21(+0.85 %)(~1.82x)
+ (ffpa+acc+f32+L1+stage4): ['-0.02378845'], time:40.88177ms, TFLOPS:101.25(+0.00 %)(~1.80x)
+ (ffpa+acc+f16+L1+stage1): ['-0.02378845'], time:53.43298ms, TFLOPS:77.46 (+0.00 %)(~1.38x)
+ (ffpa+acc+f16+L1+stage2): ['-0.02378845'], time:39.76068ms, TFLOPS:104.10(+1.85 %)(~1.85x)
+ (ffpa+acc+f16+L1+stage3): ['-0.02378845'], time:39.54901ms, TFLOPS:104.66(+0.54 %)(~1.86x)
+ (ffpa+acc+f16+L1+stage4): ['-0.02378845'], time:41.06554ms, TFLOPS:100.79(+0.00 %)(~1.79x)
+--------------------------------------------------------------------------------------------------------
 ```
 - 📚 case: Generate benchmark table and speedup bar plots on Your device.
 ```bash
@@ -275,27 +277,27 @@ cd tests && pip install matplotlib && python3 test.py --gen-bench --show-all --p
 export ENABLE_FFPA_PERSIST_Q_G2S=1 && export ENABLE_FFPA_PERSIST_KV_G2S=1 
 python3 test.py --B 1 --H 32 --N 1024 --check --show-all --D 64 # NVIDIA L20
 ---------------------------------------B=1, H=32, N=1024, D=64, Warmup: 1, Iters: 5--------------------
-                   (sdpa): ['-0.02571106'], time:0.154352ms, TFLOPS:56.72 (+0.00 %)(~1.00x)
- (ffpa+acc+f32+L1+stage1): ['-0.02572632'], time:0.103998ms, TFLOPS:84.19 (+48.42%)(~1.48x)
- (ffpa+acc+f32+L1+stage2): ['-0.02572632'], time:0.101900ms, TFLOPS:85.92 (+2.06 %)(~1.51x)
- (ffpa+acc+f16+L1+stage1): ['-0.02568054'], time:0.113105ms, TFLOPS:77.41 (+0.00 %)(~1.36x)
- (ffpa+acc+f16+L1+stage2): ['-0.02568054'], time:0.112771ms, TFLOPS:77.64 (+0.00 %)(~1.37x)
- (ffpa+acc+f32+L1+stage3): ['-0.02572632'], time:0.101947ms, TFLOPS:85.88 (+0.00 %)(~1.51x)
- (ffpa+acc+f32+L1+stage4): ['-0.02572632'], time:0.102043ms, TFLOPS:85.80 (+0.00 %)(~1.51x)
- (ffpa+acc+f16+L1+stage3): ['-0.02568054'], time:0.111246ms, TFLOPS:78.70 (+0.00 %)(~1.39x)
- (ffpa+acc+f16+L1+stage4): ['-0.02568054'], time:0.108432ms, TFLOPS:80.75 (+0.00 %)(~1.42x)
+                   (sdpa): ['0.00802612'], time:0.148057ms, TFLOPS:59.14 (+0.00 %)(~1.00x)
+ (ffpa+acc+f32+L1+stage1): ['0.00803375'], time:0.103807ms, TFLOPS:84.34 (+42.63%)(~1.43x)
+ (ffpa+acc+f32+L1+stage2): ['0.00803375'], time:0.102233ms, TFLOPS:85.64 (+1.54 %)(~1.45x)
+ (ffpa+acc+f32+L1+stage3): ['0.00803375'], time:0.102519ms, TFLOPS:85.40 (+0.00 %)(~1.44x)
+ (ffpa+acc+f32+L1+stage4): ['0.00803375'], time:0.102043ms, TFLOPS:85.80 (+0.19 %)(~1.45x)
+ (ffpa+acc+f16+L1+stage1): ['0.00795746'], time:0.104713ms, TFLOPS:83.61 (+0.00 %)(~1.41x)
+ (ffpa+acc+f16+L1+stage2): ['0.00795746'], time:0.102949ms, TFLOPS:85.05 (+0.00 %)(~1.44x)
+ (ffpa+acc+f16+L1+stage3): ['0.00795746'], time:0.108957ms, TFLOPS:80.36 (+0.00 %)(~1.36x)
+ (ffpa+acc+f16+L1+stage4): ['0.00795746'], time:0.103282ms, TFLOPS:84.77 (+0.00 %)(~1.43x)
 --------------------------------------------------------------------------------------------------------
 python3 test.py --B 1 --H 32 --N 4096 --check --show-all --D 64 # NVIDIA L20
 -------------------------B=1, H=32, N=4096, D=64, Warmup: 1, Iters: 5-----------------------------------
-                   (sdpa): ['0.02157593'], time:1.397895ms, TFLOPS:100.23(+0.00 %)(~1.00x)
- (ffpa+acc+f32+L1+stage1): ['0.02157593'], time:1.365280ms, TFLOPS:102.63(+2.39 %)(~1.02x)
- (ffpa+acc+f32+L1+stage2): ['0.02157593'], time:1.364326ms, TFLOPS:102.70(+0.07 %)(~1.02x)
- (ffpa+acc+f16+L1+stage1): ['0.02149963'], time:1.385259ms, TFLOPS:101.15(+0.00 %)(~1.01x)
- (ffpa+acc+f16+L1+stage2): ['0.02149963'], time:1.384210ms, TFLOPS:101.22(+0.00 %)(~1.01x)
- (ffpa+acc+f32+L1+stage3): ['0.02157593'], time:1.363992ms, TFLOPS:102.72(+0.02 %)(~1.02x)
- (ffpa+acc+f32+L1+stage4): ['0.02157593'], time:1.364374ms, TFLOPS:102.70(+0.00 %)(~1.02x)
- (ffpa+acc+f16+L1+stage3): ['0.02149963'], time:1.383972ms, TFLOPS:101.24(+0.00 %)(~1.01x)
- (ffpa+acc+f16+L1+stage4): ['0.02149963'], time:1.382637ms, TFLOPS:101.34(+0.00 %)(~1.01x)
+                   (sdpa): ['0.01959229'], time:1.397752ms, TFLOPS:100.24(+0.00 %)(~1.00x)
+ (ffpa+acc+f32+L1+stage1): ['0.01959229'], time:1.368856ms, TFLOPS:102.36(+2.11 %)(~1.02x)
+ (ffpa+acc+f32+L1+stage2): ['0.01959229'], time:1.367807ms, TFLOPS:102.44(+0.08 %)(~1.02x)
+ (ffpa+acc+f32+L1+stage3): ['0.01959229'], time:1.367855ms, TFLOPS:102.43(+0.00 %)(~1.02x)
+ (ffpa+acc+f32+L1+stage4): ['0.01959229'], time:1.368045ms, TFLOPS:102.42(+0.00 %)(~1.02x)
+ (ffpa+acc+f16+L1+stage1): ['0.01957703'], time:1.389312ms, TFLOPS:100.85(+0.00 %)(~1.01x)
+ (ffpa+acc+f16+L1+stage2): ['0.01957703'], time:1.388311ms, TFLOPS:100.92(+0.00 %)(~1.01x)
+ (ffpa+acc+f16+L1+stage3): ['0.01957703'], time:1.386976ms, TFLOPS:101.02(+0.00 %)(~1.01x)
+ (ffpa+acc+f16+L1+stage4): ['0.01957703'], time:1.387834ms, TFLOPS:100.96(+0.00 %)(~1.01x)
 --------------------------------------------------------------------------------------------------------
 ```
 
