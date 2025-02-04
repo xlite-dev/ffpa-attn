@@ -30,6 +30,7 @@ template<
   const int kShareSmemQKV,         // QKV share the same shared memory, reuse QK smem for V.
   const int kPersistQs2r,          // Persist load Q s2r for headdim < 320, more registers, but still keep O(1) SRAM.
   const int kPersistQg2s,          // Persist load Q g2s for headdim < 320, more SRAM, but still keep register usage.
+  const int kRegPipeKV,            // Registers Ping pong double buffers for ldmatrix s2r & mma computation overlapping.
   const int kStageQK,              // <= 4, may apply different multi stages policy for QK and V (<=4)
   const int kStagePV,              // <= 4, may apply different multi stages policy for QK and V (<=4)
   const int kPadQ,                 // Pad Q/K/V 0,8; 0 -> smem swizzle, > 0 -> padding
@@ -63,6 +64,8 @@ __device__ __forceinline__ void check_large_d_compiling_states() {
   static_assert((kPersistQg2s & kPersistQs2r)  == 0);
   // kPersistQg2s and kShareSmemQKV can not both enabled for large d kernel..
   static_assert((kPersistQg2s & kShareSmemQKV) == 0);
+  // Registers Ping pong double buffers for ldmatrix s2r & mma computation overlapping.
+  static_assert(kRegPipeKV == 0 || kRegPipeKV == 1);
   // May apply different multi stages policy for QK and V.
   static_assert(kStageQK < 5 && kStageQK > 0); // QK (<=4)
   static_assert(kStagePV < 5 && kStagePV > 0); // V  (<=4)
@@ -93,6 +96,7 @@ template<
   const int kShareSmemQKV,         // QKV share the same shared memory, reuse QK smem for V.
   const int kPersistQs2r,          // Persist load Q s2r for headdim <= 128, more registers.
   const int kPersistVs2r,          // Persist load V s2r for headdim <= 128, more registers.
+  const int kRegPipeKV,            // Registers Ping pong double buffers for ldmatrix s2r & mma computation overlapping.
   const int kStageQK,              // <= 4, may apply different multi stages policy for QK and V (<=4)
   const int kStagePV,              // <= 4, may apply different multi stages policy for QK and V (<=4)
   const int kPadQ,                 // Pad Q/K/V 0,8; 0 -> smem swizzle, > 0 -> padding
@@ -126,6 +130,11 @@ __device__ __forceinline__ void check_small_d_compiling_states() {
     // kPersistQs2r must be enabled is set kShareSmemQKV as 1
     static_assert(kPersistQs2r == 1);
   }
+  // Registers Ping pong double buffers for ldmatrix s2r & mma
+  // computation overlapping.
+  static_assert(kRegPipeKV == 0 || kRegPipeKV == 1);
+  // kRegPipeKV and kPersistVs2r can not both enabled.
+  static_assert((kRegPipeKV & kPersistVs2r) == 0);
   // May apply different multi stages policy for QK and V.
   static_assert(kStageQK < 5 && kStageQK > 0); // QK (<=4)
   static_assert(kStagePV < 5 && kStagePV > 0); // V  (<=4)
