@@ -43,7 +43,7 @@
 - [📈 FFPA L1: A30 ~1.8x↑🎉](#L1-bench-a30)
 - [📈 FFPA L1: 3080 ~2.9x↑🎉](#L1-bench-3080)
 - [📈 FFPA L1: 4090 ~2.1x↑🎉](#L1-bench-4090)
-- [📖 Fully Fused MLA w/ FFPA?](#python-test)
+- [📖 Fully Fused MLA w/ FFPA🎉](#fused-mla)
 
 ## 📖 FFPA L1~L3: FlashAttention + QKV Fine-grained Tiling at MMA level💡
 <div id="ffpa-design"></div>
@@ -303,6 +303,12 @@ cd tests && python3 test_ffpa_attn.py --B 1 --H 32 --N 4096 --check --show-all -
 ```
 
 💡NOTE: Please check all configurable environment variables in [env.py](./env.py).
+
+## 📖 Fully Fused MLA with FFPA
+
+<div id="fused-mla"></div>
+
+- [ ] Fully fused MLA into a single CUDA kernel w/ FFPA Algo (TODO)
 
 ## ©️License
 
