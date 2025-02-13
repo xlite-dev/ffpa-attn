@@ -308,7 +308,7 @@ cd tests && python3 test_ffpa_attn.py --B 1 --H 32 --N 4096 --check --show-all -
 
 <div id="fused-mla"></div>
 
-- [ ] Fully fused MLA (C_kv and C_q, dc and dc' >=512) into a single CUDA kernel with **FFPA** Algo and Tensor Cores. (TODO)
+- [ ] Fused MLA: Fully fused Multi-head latent Attention (MLA: C_kv with `dc >= 512` and C_q with `dc' >=512`) into a single CUDA kernel using **FFPA** Algo and Tensor Cores MMA instructions. (TODO)
 
 ## ©️License
 
