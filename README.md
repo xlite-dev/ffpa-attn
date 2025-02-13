@@ -308,7 +308,7 @@ cd tests && python3 test_ffpa_attn.py --B 1 --H 32 --N 4096 --check --show-all -
 
 <div id="fused-mla"></div>
 
-- [ ] Fully fused MLA into a single CUDA kernel w/ FFPA Algo (TODO)
+- [ ] Fully fused MLA (C_kv and C_q, dc and dc' >=512) into a single CUDA kernel with **FFPA** Algo and Tensor Cores. (TODO)
 
 ## ©️License
 
