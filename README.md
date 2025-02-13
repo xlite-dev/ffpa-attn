@@ -43,6 +43,7 @@
 - [📈 FFPA L1: A30 ~1.8x↑🎉](#L1-bench-a30)
 - [📈 FFPA L1: 3080 ~2.9x↑🎉](#L1-bench-3080)
 - [📈 FFPA L1: 4090 ~2.1x↑🎉](#L1-bench-4090)
+- [📖 Fully Fused MLA w/ FFPA?](#python-test)
 
 ## 📖 FFPA L1~L3: FlashAttention + QKV Fine-grained Tiling at MMA level💡
 <div id="ffpa-design"></div>
