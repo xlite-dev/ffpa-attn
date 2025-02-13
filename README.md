@@ -254,7 +254,7 @@ L1: level 1, O(2xBrx16)≈O(1) SRAM complexity, O(d/4) register complexity, the 
 - 📚 case: B=1, H=48, N=8192, D=320(`FA2 not supported`)
 ```python
 # You can test on many devices, such as Volta, Ampere, Ada, Hopper, ...
-cd tests && python3 test.py --B 1 --H 48 --N 8192 --show-all --D 320
+cd tests && python3 test_ffpa_attn.py --B 1 --H 48 --N 8192 --show-all --D 320
 ---------------------------------------B=1, H=48, N=8192, D=320, Warmup: 1, Iters: 5--------------------
                    (sdpa): ['-0.02380371'], time:73.66518ms, TFLOPS:56.19 (+0.00 %)(~1.00x)
  (ffpa+acc+f32+L1+stage1): ['-0.02378845'], time:52.87361ms, TFLOPS:78.28 (+39.32%)(~1.39x)
@@ -269,13 +269,13 @@ cd tests && python3 test.py --B 1 --H 48 --N 8192 --show-all --D 320
 ```
 - 📚 case: Generate benchmark table and speedup bar plots on Your device.
 ```bash
-cd tests && pip install matplotlib && python3 test.py --gen-bench --show-all --plot
+cd tests && pip install matplotlib && python3 test_ffpa_attn.py --gen-bench --show-all --plot
 ```
 - 📚 case: Compare small headdim (d<256, e.g 64), FFPA-L1 vs SDPA FA-2 BE.  
 ```python
 # Enable ffpa-attn small d kernel which using coarse-grained tiling method.
 export ENABLE_FFPA_PERSIST_Q_G2S=1 && export ENABLE_FFPA_PERSIST_KV_G2S=1 
-python3 test.py --B 1 --H 32 --N 1024 --check --show-all --D 64 # NVIDIA L20
+cd tests && python3 test_ffpa_attn.py --B 1 --H 32 --N 1024 --check --show-all --D 64 # NVIDIA L20
 ---------------------------------------B=1, H=32, N=1024, D=64, Warmup: 1, Iters: 5--------------------
                    (sdpa): ['0.00802612'], time:0.148057ms, TFLOPS:59.14 (+0.00 %)(~1.00x)
  (ffpa+acc+f32+L1+stage1): ['0.00803375'], time:0.103807ms, TFLOPS:84.34 (+42.63%)(~1.43x)
@@ -287,7 +287,7 @@ python3 test.py --B 1 --H 32 --N 1024 --check --show-all --D 64 # NVIDIA L20
  (ffpa+acc+f16+L1+stage3): ['0.00795746'], time:0.108957ms, TFLOPS:80.36 (+0.00 %)(~1.36x)
  (ffpa+acc+f16+L1+stage4): ['0.00795746'], time:0.103282ms, TFLOPS:84.77 (+0.00 %)(~1.43x)
 --------------------------------------------------------------------------------------------------------
-python3 test.py --B 1 --H 32 --N 4096 --check --show-all --D 64 # NVIDIA L20
+cd tests && python3 test_ffpa_attn.py --B 1 --H 32 --N 4096 --check --show-all --D 64 # NVIDIA L20
 -------------------------B=1, H=32, N=4096, D=64, Warmup: 1, Iters: 5-----------------------------------
                    (sdpa): ['0.01959229'], time:1.397752ms, TFLOPS:100.24(+0.00 %)(~1.00x)
  (ffpa+acc+f32+L1+stage1): ['0.01959229'], time:1.368856ms, TFLOPS:102.36(+2.11 %)(~1.02x)
