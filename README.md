@@ -308,7 +308,7 @@ cd tests && python3 test_ffpa_attn.py --B 1 --H 32 --N 4096 --check --show-all -
 
 <div id="fused-mla"></div>
 
-Extending the support of FA for large headdim is meaningful in the context of **DeepSeek MLA**. For example, when FA supports headdim values greater than 512, we can achieve fully Fused MLA into a single CUDA kernel. This is possible if the weight matrices W_UK and W_UV are absorbed into W_Q and W_O, resulting in C_kv/C_q with `dc/dc' >= 512`. TODO list👇:
+Extending the support of FA for large headdim is meaningful in the context of **DeepSeek MLA**. For example, when FA supports headdim values greater than 512, we can achieve fully Fused MLA into a single CUDA kernel, after W_UK/W_UV are absorbed into W_Q/W_O (resulting in C_kv/C_q with `dc/dc' >= 512`). TODO list👇:
 
 - [ ] 📚Fully Fused MLA into a single CUDA kernel using **FFPA** Algo and Tensor Cores.
 
