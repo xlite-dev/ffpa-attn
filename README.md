@@ -304,11 +304,13 @@ cd tests && python3 test_ffpa_attn.py --B 1 --H 32 --N 4096 --check --show-all -
 
 💡NOTE: Please check all configurable environment variables in [env.py](./env.py).
 
-## 📖 Fully Fused MLA with FFPA
+## 📖 Fully Fused MLA with FFPA 🎉
 
 <div id="fused-mla"></div>
 
-- [ ] Fused MLA: Fully fused Multi-head latent Attention (MLA: C_kv with `dc >= 512` and C_q with `dc' >=512`) into a single CUDA kernel using **FFPA** Algo and Tensor Cores MMA instructions. (TODO)
+Extending the support of FlashAttention for large Headdim is meaningful in the context of **DeepSeek MLA**. For example, when the headdim supported by FlashAttention exceeds 512, we can achieve fully Fused Multi-head latent Attention(MLA) in the prefill and decode stage after W_UK and W_UV weight matrixs are absorbed into W_Q and W_O, namely, C_kv with `dc >= 512` and C_q with `dc' >=512`. TODO list👇:
+
+- [ ] 📚Fully Fused MLA into a single CUDA kernel using **FFPA** Algo and Tensor Cores.
 
 ## ©️License
 
