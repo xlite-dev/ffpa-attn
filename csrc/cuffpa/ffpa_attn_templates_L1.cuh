@@ -55,7 +55,7 @@ ffpa_mma_stages_split_q_L1_large_d_template(
   constexpr int Bc = kMmaAtomN * kMmaTileSeqLenK * kWarpTileSeqLenK;
   constexpr int kNumThreads = WARP_SIZE * kMmaTileSeqLenQ * kMmaTileSeqLenK;
   
-#ifdef ENBALE_FFPA_LAUNCH_GRID_DNHB
+#ifdef ENABLE_FFPA_LAUNCH_GRID_DNHB
   // grid(div_ceil(QKV_seqlen, Br), QKV_head, QKV_batch), (x,y,z)
   const int QKV_batch_id = blockIdx.z;            // Batch size
   const int QKV_head_id  = blockIdx.y;            // Head num
@@ -648,7 +648,7 @@ ffpa_mma_stages_split_q_L1_small_d_template(
   constexpr int Br = kMmaAtomM * kMmaTileSeqLenQ * kWarpTileSeqLenQ;
   constexpr int Bc = kMmaAtomN * kMmaTileSeqLenK * kWarpTileSeqLenK;
   constexpr int kNumThreads = WARP_SIZE * kMmaTileSeqLenQ * kMmaTileSeqLenK;
-#ifdef ENBALE_FFPA_LAUNCH_GRID_DNHB
+#ifdef ENABLE_FFPA_LAUNCH_GRID_DNHB
   // grid(div_ceil(QKV_seqlen, Br), QKV_head, QKV_batch), (x,y,z)
   const int QKV_batch_id = blockIdx.z;            // Batch size
   const int QKV_head_id  = blockIdx.y;            // Head num

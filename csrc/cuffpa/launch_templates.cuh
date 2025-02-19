@@ -175,7 +175,7 @@ static inline dim3 getConfigGrid(
   const int B, const int H, const int N) {
   // Tr(=N/Br), batch_size x num_heads
   // try grid(N/Br, B * H) or grid(N/Br, H, B)
-#ifdef ENBALE_FFPA_LAUNCH_GRID_DNHB
+#ifdef ENABLE_FFPA_LAUNCH_GRID_DNHB
   dim3 grid(utils::div_ceil(N, Br), H, B); 
 #else
   dim3 grid(utils::div_ceil(N, Br), B * H); 
