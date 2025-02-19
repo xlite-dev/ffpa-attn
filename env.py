@@ -101,8 +101,8 @@ class ENV(object):
     )
 
     # if True: grid(N/Br, H, B) else: grid(N/Br, B * H)
-    ENBALE_FFPA_LAUNCH_GRID_DNHB = bool(
-        int(os.environ.get("ENBALE_FFPA_LAUNCH_GRID_DNHB", 0))
+    ENABLE_FFPA_LAUNCH_GRID_DNHB = bool(
+        int(os.environ.get("ENABLE_FFPA_LAUNCH_GRID_DNHB", 0))
     )
 
     @classmethod
@@ -185,7 +185,7 @@ class ENV(object):
 
     @classmethod
     def enable_launch_grid_dnhb(cls):
-        return cls.ENBALE_FFPA_LAUNCH_GRID_DNHB
+        return cls.ENABLE_FFPA_LAUNCH_GRID_DNHB
 
     @classmethod
     def env_cuda_cflags(cls):
@@ -275,7 +275,7 @@ class ENV(object):
         formatenv("ENABLE_FFPA_SMEM_SWIZZLE_K", cls.enable_smem_swizzle_k())
         formatenv("ENABLE_FFPA_SMEM_SWIZZLE_V", cls.enable_smem_swizzle_v())
         formatenv("ENABLE_FFPA_REGISTERS_PIPE_KV", cls.enable_registers_pipe_kv())
-        formatenv("ENBALE_FFPA_LAUNCH_GRID_DNHB", cls.enable_launch_grid_dnhb())
+        formatenv("ENABLE_FFPA_LAUNCH_GRID_DNHB", cls.enable_launch_grid_dnhb())
         pretty_print_line()
 
     @staticmethod
