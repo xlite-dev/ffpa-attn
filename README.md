@@ -1,7 +1,7 @@
 <div align="center">
   <p align="center">
     <h2>🤖FFPA(Split-D): Yet another Faster Flash Prefill Attention with O(1)⚡️GPU SRAM complexity for large headdim🐑</h2>
-    <a href="#ffpa-design">📚FFPA(Split-D) Blog</a> | <a href="https://zhuanlan.zhihu.com/p/13975660308"> 📈L20 ~1.9x↑🎉 </a> | <a href="#L1-bench-a30"> 📈A30 ~1.8x↑🎉 </a> | <a href="#L1-bench-3080"> 📈3080 ~2.9x↑🎉 </a> | <a href="#L1-bench-4090"> 📈4090 ~2.1x↑🎉 </a> <p>
+    <a href="https://zhuanlan.zhihu.com/p/13975660308">📚FFPA(Split-D) Blog</a> | <a href="#L1-bench-l20"> 📈L20 ~1.9x↑🎉 </a> | <a href="#L1-bench-a30"> 📈A30 ~1.8x↑🎉 </a> | <a href="#L1-bench-3080"> 📈3080 ~2.9x↑🎉 </a> | <a href="#L1-bench-4090"> 📈4090 ~2.1x↑🎉 </a> <p>
   </p>
   <img src=https://github.com/user-attachments/assets/4abfae2d-5a26-4f73-aaa2-d1e452a4215d width=250 >
   <div align='center'>
