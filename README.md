@@ -22,8 +22,10 @@
 
 <!--
 ![image](https://github.com/user-attachments/assets/b881cef6-3c49-4a2a-b390-43b328de7b10)
--->
 ![FFPA vs FA2](https://github.com/user-attachments/assets/c6cefc9a-5ef1-48ee-8c7d-68346c60bdcb)
+-->
+<img width="1496" alt="image" src="https://github.com/user-attachments/assets/6b5cc7c1-50f9-42cb-a123-4bf5b4ac8d6c" />
+
 
 💡NOTE: This project is still in its early dev stages and now provides some kernels and benchmarks for reference. More features will be added in the future. (Welcome to 🌟👆🏻star this repo to support me ~)
 
