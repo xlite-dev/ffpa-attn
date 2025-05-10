@@ -6,9 +6,9 @@
   <img src=https://github.com/user-attachments/assets/4abfae2d-5a26-4f73-aaa2-d1e452a4215d width=250 >
   <div align='center'>
     <img src=https://img.shields.io/badge/Language-CUDA/Python-brightgreen.svg >
-    <img src=https://img.shields.io/github/watchers/xlite-dev/ffpa-attn-mma?color=9cc >
-    <img src=https://img.shields.io/github/forks/xlite-dev/ffpa-attn-mma.svg?style=social >
-    <img src=https://img.shields.io/github/stars/xlite-dev/ffpa-attn-mma.svg?style=social >
+    <img src=https://img.shields.io/github/watchers/xlite-dev/ffpa-attn?color=9cc >
+    <img src=https://img.shields.io/github/forks/xlite-dev/ffpa-attn.svg?style=social >
+    <img src=https://img.shields.io/github/stars/xlite-dev/ffpa-attn.svg?style=social >
     <img src=https://img.shields.io/badge/Release-v0.0.2-brightgreen.svg >
     <img src=https://img.shields.io/badge/License-GPLv3.0-turquoise.svg >
  </div>
@@ -32,10 +32,10 @@
 ## ©️Citations🎉🎉
 
 ```BibTeX
-@misc{ffpa-attn-mma@2025,
+@misc{ffpa-attn@2025,
   title={FFPA: Yet another Faster Flash Prefill Attention for large headdim.},
-  url={https://github.com/xlite-dev/ffpa-attn-mma.git},
-  note={Open-source software available at https://github.com/xlite-dev/ffpa-attn-mma.git},
+  url={https://github.com/xlite-dev/ffpa-attn.git},
+  note={Open-source software available at https://github.com/xlite-dev/ffpa-attn.git},
   author={xlite-dev etc},
   year={2025}
 }
@@ -137,7 +137,7 @@ ffpa_mma_stages_split_q_L1_small_d_template(half* Q, half* K, half* V, half* O, 
 
 The FFPA implemented in this repo can be install as a python library, namely, `ffpa-attn` library (optional).
 ```bash
-git clone https://github.com/xlite-dev/ffpa-attn-mma.git
+git clone https://github.com/xlite-dev/ffpa-attn.git
 # clone, then, run bash .dev/install.sh directly or run commands:
 python3 setup.py bdist_wheel && cd dist && python3 -m pip install *.whl # pip uninstall ffpa-attn -y
 ```
@@ -332,11 +332,11 @@ GNU General Public License v3.0
 How to contribute? Wecome to star⭐️ this repo to support me👆🏻 ~
 
 <div align='center'>
-<a href="https://star-history.com/#xlite-dev/ffpa-attn-mma&Date">
+<a href="https://star-history.com/#xlite-dev/ffpa-attn&Date">
  <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=xlite-dev/ffpa-attn-mma&type=Date&theme=dark" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=xlite-dev/ffpa-attn-mma&type=Date" />
-   <img img width=450 height=300 alt="Star History Chart" src="https://api.star-history.com/svg?repos=xlite-dev/ffpa-attn-mma&type=Date" />
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=xlite-dev/ffpa-attn&type=Date&theme=dark" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=xlite-dev/ffpa-attn&type=Date" />
+   <img img width=450 height=300 alt="Star History Chart" src="https://api.star-history.com/svg?repos=xlite-dev/ffpa-attn&type=Date" />
  </picture>
 </a>
 </div>
@@ -345,5 +345,5 @@ How to contribute? Wecome to star⭐️ this repo to support me👆🏻 ~
 <div id="ref"></div>
 
 - [flash-attention](https://github.com/Dao-AILab/flash-attention)
-- [CUDA-Learn-Notes](https://github.com/xlite-dev/CUDA-Learn-Notes)
+- [LeetCUDA](https://github.com/xlite-dev/LeetCUDA)
 - [flashinfer](https://github.com/flashinfer-ai/flashinfer)
