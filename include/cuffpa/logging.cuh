@@ -147,4 +147,3 @@ if (((T2).size(0) != (T1).size(0)) ||                \
 #define FFPA_MMA_PRINT_T0_B0_MATRIX(B, format, ...) {}
 
 #endif
-
