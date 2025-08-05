@@ -46,7 +46,6 @@
 - [📈 FFPA L1: A30 ~1.8x↑🎉](#L1-bench-a30)
 - [📈 FFPA L1: 3080 ~2.9x↑🎉](#L1-bench-3080)
 - [📈 FFPA L1: 4090 ~2.1x↑🎉](#L1-bench-4090)
-- [📖 Fully Fused MLA w/ FFPA🎉](#fused-mla)
 
 ## 📖 FFPA L1~L3: FlashAttention + QKV Fine-grained Tiling at MMA level💡
 <div id="ffpa-design"></div>
@@ -256,7 +255,7 @@ L1: level 1, O(2xBrx16)≈O(1) SRAM complexity, O(d/4) register complexity, the 
 👇You can test many custom FFPA kernels via Python and figure out the difference in their performance. The `--gen-bench` and `--plot` options help you generate a benchmark table in Markdown style and speedup bar plots on your device. Contributions of your benchmark tables and plots are welcome via a PR 🎉🎉.
 
 - 📚 case: B=1, H=48, N=8192, D=320(`FA2 not supported`)
-```python
+```bash
 # You can test on many devices, such as Volta, Ampere, Ada, Hopper, ...
 cd tests && python3 test_ffpa_attn.py --B 1 --H 48 --N 8192 --show-all --D 320
 ---------------------------------------B=1, H=48, N=8192, D=320, Warmup: 1, Iters: 5--------------------
@@ -276,7 +275,7 @@ cd tests && python3 test_ffpa_attn.py --B 1 --H 48 --N 8192 --show-all --D 320
 cd tests && pip install matplotlib && python3 test_ffpa_attn.py --gen-bench --show-all --plot
 ```
 - 📚 case: Compare small headdim (d<256, e.g 64), FFPA-L1 vs SDPA FA-2 BE.  
-```python
+```bash
 # Enable ffpa-attn small d kernel which using coarse-grained tiling method.
 export ENABLE_FFPA_PERSIST_Q_G2S=1 && export ENABLE_FFPA_PERSIST_KV_G2S=1 
 cd tests && python3 test_ffpa_attn.py --B 1 --H 32 --N 1024 --check --show-all --D 64 # NVIDIA L20
@@ -306,14 +305,6 @@ cd tests && python3 test_ffpa_attn.py --B 1 --H 32 --N 4096 --check --show-all -
 ```
 
 💡NOTE: Please check all configurable environment variables in [env.py](./env.py).
-
-## 📖 Fully Fused MLA with FFPA 🎉
-
-<div id="fused-mla"></div>
-
-Extending the support of FA for large headdim is meaningful in the context of **DeepSeek MLA**. For example, when FA supports headdim values greater than 512, we can achieve fully Fused MLA into a single CUDA kernel, after W_UK/W_UV are absorbed into W_Q/W_O (resulting in C_kv/C_q with `dc/dc' >= 512`). TODO list👇:
-
-- [ ] 📚Fully Fused MLA into a single CUDA kernel using **FFPA** Algo and Tensor Cores.
 
 ## ©️License
 
