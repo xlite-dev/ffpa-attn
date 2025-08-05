@@ -18,16 +18,12 @@
   <p align="center"> <h2> 🤖FFPA: 1.8x~3x🎉faster vs SDPA EA with or without MMA Acc F32</h2></p>
 </div>
 
-🤖[WIP] **FFPA**: Yet another **Faster Flash Prefill Attention** with **O(1) SRAM complexity** & **O(d/4) or O(1) register complexity** for large headdim (D > 256), almost **1.8x~3x** 🎉 faster than SDPA EA with or without MMA Acc F32 on many devices: [📈L20 ~1.9x↑🎉](#L1-bench-l20), [📈A30 ~1.8x↑🎉](#L1-bench-a30), [📈3080 ~2.9x↑🎉](#L1-bench-3080), [📈4090 ~2.1x↑🎉](#L1-bench-4090). **FFPA Attention Algo: Fine-grained tiling** for large headim, **FA-2 Attention Algo: Coarse-grained tiling** for small headidm.
+🤖**FFPA(Split-D)**: Yet another **Faster Flash Prefill Attention** with **Split-D** strategy, achieve **O(1) SRAM complexity** and **O(d/4) or O(1) register complexity** for large headdim (**D > 256**), almost **1.8x~3x** 🎉 faster than SDPA EA with or without MMA Acc F32 on many devices: [📈L20 ~1.9x↑🎉](#L1-bench-l20), [📈A30 ~1.8x↑🎉](#L1-bench-a30), [📈3080 ~2.9x↑🎉](#L1-bench-3080), [📈4090 ~2.1x↑🎉](#L1-bench-4090). **FFPA Algo: Fine-grained tiling** for large headim, **FA-2 Algo: Coarse-grained tiling** for small headidm.
 
-<!--
-![image](https://github.com/user-attachments/assets/b881cef6-3c49-4a2a-b390-43b328de7b10)
-![FFPA vs FA2](https://github.com/user-attachments/assets/c6cefc9a-5ef1-48ee-8c7d-68346c60bdcb)
--->
 <img width="1496" alt="image" src="https://github.com/user-attachments/assets/6b5cc7c1-50f9-42cb-a123-4bf5b4ac8d6c" />
 
 
-💡NOTE: This project is still in its early dev stages and now provides some kernels and benchmarks for reference. More features will be added in the future. (Welcome to 🌟👆🏻star this repo to support me ~)
+💡NOTE: This project is still in its **early dev stages** and now provides some kernels and benchmarks for reference. More features will be added in the future. (Welcome to 🌟👆🏻star this repo to support me ~)
 
 ## ©️Citations🎉🎉
 
@@ -129,7 +125,7 @@ ffpa_mma_stages_split_q_L1_small_d_template(half* Q, half* K, half* V, half* O, 
 - PyTorch >= 2.4.0, CUDA >= 12.4
 - flash-attention >= 2.6.3 (for test)
 - Recommended: PyTorch 2.5.1, CUDA 12.5
-- Docker: nvcr.io/nvidia/pytorch:24.10-py3
+- Docker: nvcr.io/nvidia/pytorch:25.03-py3
 
 ## 📖 Installation
 
