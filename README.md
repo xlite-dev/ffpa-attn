@@ -113,7 +113,7 @@ ffpa_mma_stages_split_q_L1_large_d_template(half* Q, half* K, half* V, half* O, 
 // FA-2 Attention Algo: Coarse-grained tiling at Attention level for small headdim (d<256), 
 // which can achieve 95%-105%🎉 performance as SDPA FA-2 BE with MMA Acc F32 for N<=4096, 
 // and achieve almost 1.2x~1.4x🎉 faster than SDPA FA-2 via Mixed MMA Acc(Q@K^T F32 + 
-// P@V F16) for all range N.
+// P@V F16) for all range N on NVIDIA 4090 RTX device.
 ffpa_mma_stages_split_q_L1_small_d_template(half* Q, half* K, half* V, half* O, ...); 
 ```
 
