@@ -69,7 +69,7 @@ def fetch_requirements():
 
 setup(
     name=PACKAGE_NAME,
-    version="0.0.2",
+    version="0.0.2.1",
     author="DefTruth",
     author_email="qyjdef@163.com",
     license="GNU General Public License v3.0",
