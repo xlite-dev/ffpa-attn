@@ -178,7 +178,7 @@ class ENV(object):
         if cls.enable_persist_kv_g2s():
             return cls.ENABLE_FFPA_PERSIST_V_S2R
         return False
-    
+
     @classmethod
     def enable_registers_pipe_kv(cls):
         return cls.ENABLE_FFPA_REGISTERS_PIPE_KV
@@ -312,6 +312,22 @@ class ENV(object):
     @staticmethod
     def get_build_cuda_cflags(build_pkg: bool = False):
         device_name = ENV.get_device_name()
+
+        def _specific_device_tag():
+            if "L20" in device_name:
+                return "L20"
+            elif "4090" in device_name:
+                return "4090"
+            elif "3080" in device_name:
+                return "3080"
+            return None
+
+        def _specific_device_macro():
+            tag = _specific_device_tag()
+            if tag is not None:
+                return f"-DBUILD_FFPA_ATTN_MMA_{tag}"
+            return None
+
         extra_cuda_cflags = []
         extra_cuda_cflags.append("-O3")
         extra_cuda_cflags.append("-std=c++17")
@@ -322,24 +338,18 @@ class ENV(object):
         extra_cuda_cflags.append("--expt-relaxed-constexpr")
         extra_cuda_cflags.append("--expt-extended-lambda")
         extra_cuda_cflags.append("--use_fast_math")
+        extra_cuda_cflags.append(_specific_device_macro())
+        extra_cuda_cflags.extend(ENV.env_cuda_cflags())
+        extra_cuda_cflags.append(f"-I {ENV.project_dir()}/include")
+        extra_cuda_cflags.append(f"-I {ENV.project_dir()}/csrc/cuffpa")
         extra_cuda_cflags.append(
             "-diag-suppress 177" if not build_pkg else "--ptxas-options=-v"
         )
         extra_cuda_cflags.append(
             "-Xptxas -v" if not build_pkg else "--ptxas-options=-O3"
         )
-        extra_cuda_cflags.append(
-            "-DBUILD_FFPA_ATTN_MMA_L20" if "L20" in device_name else ""
-        )
-        extra_cuda_cflags.append(
-            "-DBUILD_FFPA_ATTN_MMA_4090" if "4090" in device_name else ""
-        )
-        extra_cuda_cflags.append(
-            "-DBUILD_FFPA_ATTN_MMA_3080" if "3080" in device_name else ""
-        )
-        extra_cuda_cflags.extend(ENV.env_cuda_cflags())
-        extra_cuda_cflags.append(f"-I {ENV.project_dir()}/include")
-        extra_cuda_cflags.append(f"-I {ENV.project_dir()}/csrc/cuffpa")
+        # Avoid None or empty str as flag or macro
+        extra_cuda_cflags = [flag for flag in extra_cuda_cflags if flag]
         return extra_cuda_cflags
 
     @staticmethod
