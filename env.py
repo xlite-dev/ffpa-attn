@@ -338,17 +338,18 @@ class ENV(object):
         extra_cuda_cflags.append("--expt-relaxed-constexpr")
         extra_cuda_cflags.append("--expt-extended-lambda")
         extra_cuda_cflags.append("--use_fast_math")
+        extra_cuda_cflags.append(_specific_device_macro())
+        extra_cuda_cflags.extend(ENV.env_cuda_cflags())
+        extra_cuda_cflags.append(f"-I {ENV.project_dir()}/include")
+        extra_cuda_cflags.append(f"-I {ENV.project_dir()}/csrc/cuffpa")
         extra_cuda_cflags.append(
             "-diag-suppress 177" if not build_pkg else "--ptxas-options=-v"
         )
         extra_cuda_cflags.append(
             "-Xptxas -v" if not build_pkg else "--ptxas-options=-O3"
         )
-        if _specific_device_macro() is not None:
-            extra_cuda_cflags.append(_specific_device_macro())
-        extra_cuda_cflags.extend(ENV.env_cuda_cflags())
-        extra_cuda_cflags.append(f"-I {ENV.project_dir()}/include")
-        extra_cuda_cflags.append(f"-I {ENV.project_dir()}/csrc/cuffpa")
+        # Avoid None or empty str as flag or macro
+        extra_cuda_cflags = [flag for flag in extra_cuda_cflags if flag]
         return extra_cuda_cflags
 
     @staticmethod
