@@ -1,3 +1,4 @@
+<!--
 <div align="center">
   <p align="center">
     <h2>🤖FFPA(Split-D): Yet another Faster Flash Prefill Attention with O(1)⚡️GPU SRAM complexity for large headdim🐑</h2>
@@ -13,22 +14,32 @@
     <img src=https://img.shields.io/badge/License-GPLv3.0-turquoise.svg >
  </div>
 </div>
+<img width="6412" height="2872" alt="image" src="https://github.com/user-attachments/assets/634c17db-d4be-4290-9e71-8854de4e88bc" />
+
+<img src=https://github.com/user-attachments/assets/c9d1db98-3643-4be6-9116-90848cb29f2f >
+-->
+
+<div align="center">
+  <p align="center">
+    <h2>🤖FFPA(Split-D): Yet another Faster Flash Prefill Attention with O(1)⚡️GPU SRAM complexity for large headdim🐑</h2>
+    <a href="https://zhuanlan.zhihu.com/p/13975660308">📚FFPA(Split-D) Blog</a> | <a href="#L1-bench-l20"> 📈L20 ~1.9x↑🎉 </a> | <a href="#L1-bench-a30"> 📈A30 ~1.8x↑🎉 </a> | <a href="#L1-bench-3080"> 📈3080 ~2.9x↑🎉 </a> | <a href="#L1-bench-4090"> 📈4090 ~2.1x↑🎉 </a> <p>
+  </p>
+  <img src=https://github.com/user-attachments/assets/634c17db-d4be-4290-9e71-8854de4e88bc >
+  <div align='center'>
+    <img src=https://img.shields.io/badge/Language-CUDA/Python-brightgreen.svg >
+    <img src=https://img.shields.io/github/watchers/xlite-dev/ffpa-attn?color=9cc >
+    <img src=https://img.shields.io/github/forks/xlite-dev/ffpa-attn.svg?style=social >
+    <img src=https://img.shields.io/github/stars/xlite-dev/ffpa-attn.svg?style=social >
+    <img src=https://img.shields.io/badge/Release-v0.0.2-brightgreen.svg >
+    <img src=https://img.shields.io/badge/License-GPLv3.0-turquoise.svg >
+ </div>
+</div>
 
 <div align="center">
   <p align="center"> <h2> 🤖FFPA: 1.8x~3x🎉faster vs SDPA EA with or without MMA Acc F32</h2></p>
 </div>
 
 🤖**FFPA(Split-D)**: Yet another **Faster Flash Prefill Attention** with **Split-D** strategy, achieve **O(1) SRAM complexity** and **O(d/4) or O(1) register complexity** for large headdim (**D > 256**), almost **1.8x~3x** 🎉 faster than SDPA EA with or without MMA Acc F32 on many devices: [📈L20 ~1.9x↑🎉](#L1-bench-l20), [📈A30 ~1.8x↑🎉](#L1-bench-a30), [📈3080 ~2.9x↑🎉](#L1-bench-3080), [📈4090 ~2.1x↑🎉](#L1-bench-4090). **FFPA Algo: Fine-grained tiling** for large headim, **FA-2 Algo: Coarse-grained tiling** for small headidm.
-
-<!--
-<img width="6120" height="2856" alt="image" src="https://github.com/user-attachments/assets/9fa5f74f-b312-49ec-b5f4-96959ea0e240" />
-<img width="6120" height="2856" alt="image" src="https://github.com/user-attachments/assets/32135140-e5ce-4861-a68c-d5a37c19ed51" />
--->
-
-
-<img width="6120" height="2856" alt="image" src="https://github.com/user-attachments/assets/7eed5eca-59b7-4a59-912e-3be5314dd299" />
-
-💡NOTE: This project is still in its **early dev stages** and now provides some kernels and benchmarks for reference. More features will be added in the future. (Welcome to 🌟👆🏻star this repo to support me ~)
 
 ## ©️Citations🎉🎉
 
