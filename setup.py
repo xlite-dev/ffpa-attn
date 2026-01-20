@@ -50,9 +50,14 @@ ext_modules.append(
             # add c compile flags
             "cxx": ["-O3", "-std=c++17"] + generator_flag,
             # add nvcc compile flags
-            "nvcc": ENV.get_build_cuda_cflags(build_pkg=True)
-            + generator_flag
-            + cc_flag,
+            "nvcc": [
+                flag for flag in (
+                    ENV.get_build_cuda_cflags(build_pkg=True)
+                    + generator_flag
+                    + cc_flag
+                )
+                if flag.strip()  # <--- Filter out empty strings
+            ],
         },
         include_dirs=[
             Path(ENV.project_dir()) / "include",
