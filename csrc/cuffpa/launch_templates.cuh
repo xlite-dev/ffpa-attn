@@ -33,31 +33,31 @@ template<const int kHeadDim>
 static constexpr int getConfigWarpTileSeqLenK() {
 #ifdef ENABLE_FFPA_PERSIST_KV_G2S 
 #if defined(BUILD_FFPA_ATTN_MMA_L20)
-  constexpr int kWarpTileSeqLenK  = (
+  constexpr int kValueTileSeqLenK  = (
     kHeadDim <= kMaxDForSmallBlockTile) ? 8: 16;
 #else
-  constexpr int kWarpTileSeqLenK  = (
+  constexpr int kValueTileSeqLenK  = (
     kHeadDim <= kMaxDForSmallBlockTile) ? 16: 16;
 #endif
 #else // if undef ENABLE_FFPA_PERSIST_KV_G2S
 #if defined(BUILD_FFPA_ATTN_MMA_L20)
-  constexpr int kWarpTileSeqLenK  = (
+  constexpr int kValueTileSeqLenK  = (
     kHeadDim <= kMaxDForSmallBlockTile) ? 8: 16;
 #else
-  constexpr int kWarpTileSeqLenK  = (
+  constexpr int kValueTileSeqLenK  = (
     kHeadDim <= kMaxDForSmallBlockTile) ? 16: 16;
 #endif
 #endif
-  return kWarpTileSeqLenK;
+  return kValueTileSeqLenK;
 }
 
 template<const int kHeadDim>
 static constexpr int getConfigWarpTileHeadDimV() {
   constexpr int kMmaAtomN = 8;
   constexpr int kMmaTileHeadDimV = 1;
-  constexpr int kWarpTileHeadDimV = (
+  constexpr int kValueTileHeadDimV = (
     kHeadDim / (kMmaAtomN * kMmaTileHeadDimV));
-  return kWarpTileHeadDimV;
+  return kValueTileHeadDimV;
 }
 
 static constexpr int getConfigShareSmemQKV() {
@@ -278,12 +278,12 @@ void launch_ffpa_mma_L1_template(torch::Tensor Q,
   constexpr int kMmaTileSeqLenK   = 1;
   constexpr int kMmaTileSeqLenP   = getConfigMmaTileSeqLenQP<kHeadDim>();
   constexpr int kMmaTileHeadDimV  = 1;
-  constexpr int kWarpTileSeqLenQ  = 1;
-  constexpr int kWarpTileSeqLenK  = getConfigWarpTileSeqLenK<kHeadDim>();
-  constexpr int kWarpTileSeqLenP  = 1;
-  constexpr int kWarpTileHeadDimV = getConfigWarpTileHeadDimV<kHeadDim>();
-  constexpr int Br = kMmaAtomM * kMmaTileSeqLenQ * kWarpTileSeqLenQ;
-  constexpr int Bc = kMmaAtomN * kMmaTileSeqLenK * kWarpTileSeqLenK;
+  constexpr int kValueTileSeqLenQ  = 1;
+  constexpr int kValueTileSeqLenK  = getConfigWarpTileSeqLenK<kHeadDim>();
+  constexpr int kValueTileSeqLenP  = 1;
+  constexpr int kValueTileHeadDimV = getConfigWarpTileHeadDimV<kHeadDim>();
+  constexpr int Br = kMmaAtomM * kMmaTileSeqLenQ * kValueTileSeqLenQ;
+  constexpr int Bc = kMmaAtomN * kMmaTileSeqLenK * kValueTileSeqLenK;
   static_assert(Br == Bc, "Br must be equal Bc to avoid illegal memory access.");
   constexpr int kNumThreads = WARP_SIZE * kMmaTileSeqLenQ * kMmaTileSeqLenK;
   constexpr int kOStorageAccFloat32 = getConfigOStorageAccFloat32<kHeadDim>();
@@ -351,10 +351,10 @@ TEMPLATE_FUNC<<<grid, block, kQKVSmemMaxSize>>>(            \
         kMmaTileSeqLenK,
         kMmaTileSeqLenP, 
         kMmaTileHeadDimV, 
-        kWarpTileSeqLenQ, 
-        kWarpTileSeqLenK, 
-        kWarpTileSeqLenP, 
-        kWarpTileHeadDimV, 
+        kValueTileSeqLenQ, 
+        kValueTileSeqLenK, 
+        kValueTileSeqLenP, 
+        kValueTileHeadDimV, 
         kMmaAccFloat32QK,
         kMmaAccFloat32PV,
         kOStorageAccFloat32,
@@ -385,10 +385,10 @@ TEMPLATE_FUNC<<<grid, block, kQKVSmemMaxSize>>>(            \
         kMmaTileSeqLenK,
         kMmaTileSeqLenP, 
         kMmaTileHeadDimV, 
-        kWarpTileSeqLenQ, 
-        kWarpTileSeqLenK, 
-        kWarpTileSeqLenP, 
-        kWarpTileHeadDimV, 
+        kValueTileSeqLenQ, 
+        kValueTileSeqLenK, 
+        kValueTileSeqLenP, 
+        kValueTileHeadDimV, 
         kMmaAccFloat32QK,
         kMmaAccFloat32PV,
         kOStorageAccFloat32,
@@ -420,10 +420,10 @@ TEMPLATE_FUNC<<<grid, block, kQKVSmemMaxSize>>>(            \
       kMmaTileSeqLenK,
       kMmaTileSeqLenP, 
       kMmaTileHeadDimV, 
-      kWarpTileSeqLenQ, 
-      kWarpTileSeqLenK, 
-      kWarpTileSeqLenP, 
-      kWarpTileHeadDimV, 
+      kValueTileSeqLenQ, 
+      kValueTileSeqLenK, 
+      kValueTileSeqLenP, 
+      kValueTileHeadDimV, 
       kMmaAccFloat32QK,
       kMmaAccFloat32PV,
       kOStorageAccFloat32,

@@ -106,10 +106,10 @@ template<
   const int kMmaTileSeqLenK,       // 1, more MMA(warp), N=8*1 =8,  Q@K^T=[Br(M), d(K)]@[d(K),  Bc(N)]    
   const int kMmaTileSeqLenP,       // 4, more MMA(warp), M=16*4=64, P@V  =[Br(M),Bc(K)]@[Bc(K), d(N) ]
   const int kMmaTileHeadDimV,      // 1, more MMA(warp), N=8*1 =8,  P@V  =[Br(M),Bc(K)]@[Bc(K), d(N) ]       
-  const int kWarpTileSeqLenQ,      // 1, more values, M, Br=64*1=64, matmul M 
-  const int kWarpTileSeqLenK,      // 8, more values, N, Bc=8*8 =64, matmul N
-  const int kWarpTileSeqLenP,      // 1, more values, M, Br=64*1=64, matmul M
-  const int kWarpTileHeadDimV,     // 8, more values, N, d=8*(1|2|3|4|...)=8|...|32|64|96|128|...
+  const int kValueTileSeqLenQ,     // 1, more values, M, Br=64*1=64, matmul M 
+  const int kValueTileSeqLenK,     // 8, more values, N, Bc=8*8 =64, matmul N
+  const int kValueTileSeqLenP,     // 1, more values, M, Br=64*1=64, matmul M
+  const int kValueTileHeadDimV,    // 8, more values, N, d=8*(1|2|3|4|...)=8|...|32|64|96|128|...
   const int kMmaAccFloat32QK,      // 0/1, Q@K^T, 0 MMA Acc with fp16, 1 MMA Acc with fp32.
   const int kMmaAccFloat32PV,      // 0/1, P@V, 0 MMA Acc with fp16, 1 MMA Acc with fp32.
   const int kOStorageAccFloat32,   // 0/1, MMA Acc always be f32/f16, but O storage can be fp32 or half.
