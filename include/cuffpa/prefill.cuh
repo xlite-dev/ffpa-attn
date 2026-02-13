@@ -18,10 +18,10 @@ template<
   const int kMmaTileSeqLenK,       // 1, more MMA(warp), N=8*1 =8,  Q@K^T=[Br(M), d(K)]@[d(K),  Bc(N)]    
   const int kMmaTileSeqLenP,       // 4, more MMA(warp), M=16*4=64, P@V  =[Br(M),Bc(K)]@[Bc(K), d(N) ]
   const int kMmaTileHeadDimV,      // 1, more MMA(warp), N=8*1 =8,  P@V  =[Br(M),Bc(K)]@[Bc(K), d(N) ]       
-  const int kValueTileSeqLenQ,      // 1, more values, M, Br=64*1=64, matmul M 
-  const int kValueTileSeqLenK,      // 8, more values, N, Bc=8*8 =64, matmul N
-  const int kValueTileSeqLenP,      // 1, more values, M, Br=64*1=64, matmul M
-  const int kValueTileHeadDimV,     // 8, more values, N, d=8*(1|2|3|4|...)=8|...|32|64|96|128|...
+  const int kValTileSeqLenQ,       // 1, more values, M, Br=64*1=64, matmul M 
+  const int kValTileSeqLenK,       // 8, more values, N, Bc=8*8 =64, matmul N
+  const int kValTileSeqLenP,       // 1, more values, M, Br=64*1=64, matmul M
+  const int kValTileHeadDimV,      // 8, more values, N, d=8*(1|2|3|4|...)=8|...|32|64|96|128|...
   const int kMmaAccFloat32QK,      // 0/1, Q@K^T, 0 MMA Acc with fp16, 1 MMA Acc with fp32.
   const int kMmaAccFloat32PV,      // 0/1, P@V, 0 MMA Acc with fp16, 1 MMA Acc with fp32.
   const int kOStorageAccFloat32,   // 0/1, MMA Acc always be f32/f16, but O storage can be fp32 or half.
@@ -43,16 +43,16 @@ __device__ __forceinline__ void check_large_d_compiling_states() {
   static_assert(kMmaAtomM == 16 && kMmaAtomN == 8 && kMmaAtomK == 16); // m16n8k16
   static_assert(kMmaTileSeqLenQ  <= 8 && kMmaTileSeqLenK  == 1);  // Q@K^T
   static_assert(kMmaTileSeqLenP  <= 8 && kMmaTileHeadDimV == 1);  // P@V
-  static_assert(kValueTileSeqLenQ == 1 && kValueTileSeqLenK <= 16); // Q@K^T
-  static_assert(kValueTileSeqLenP == 1 && kValueTileHeadDimV == (
+  static_assert(kValTileSeqLenQ == 1 && kValTileSeqLenK <= 16); // Q@K^T
+  static_assert(kValTileSeqLenP == 1 && kValTileHeadDimV == (
     kHeadDim / (kMmaAtomN * kMmaTileHeadDimV))); // P@V
   static_assert(kMmaAccFloat32QK == 0 || kMmaAccFloat32QK == 1);
   static_assert(kMmaAccFloat32PV == 0 || kMmaAccFloat32PV == 1);
   static_assert(kOStorageAccFloat32 == 0 || kOStorageAccFloat32 == 1);
   // Make sure that Br >= Bc, for shared memory reuse.
   static_assert(
-    (kMmaAtomM * kMmaTileSeqLenQ * kValueTileSeqLenQ) >= 
-    (kMmaAtomN * kMmaTileSeqLenK * kValueTileSeqLenK)); 
+    (kMmaAtomM * kMmaTileSeqLenQ * kValTileSeqLenQ) >= 
+    (kMmaAtomN * kMmaTileSeqLenK * kValTileSeqLenK)); 
   static_assert(kPrefetchQK == 0 || kPrefetchQK == 1);
   static_assert(kPrefetchPV == 0 || kPrefetchPV == 1);
   static_assert(kShareSmemQKV == 0 || kShareSmemQKV == 1);
@@ -84,10 +84,10 @@ template<
   const int kMmaTileSeqLenK,       // 1, more MMA(warp), N=8*1 =8,  Q@K^T=[Br(M), d(K)]@[d(K),  Bc(N)]    
   const int kMmaTileSeqLenP,       // 4, more MMA(warp), M=16*4=64, P@V  =[Br(M),Bc(K)]@[Bc(K), d(N) ]
   const int kMmaTileHeadDimV,      // 1, more MMA(warp), N=8*1 =8,  P@V  =[Br(M),Bc(K)]@[Bc(K), d(N) ]       
-  const int kValueTileSeqLenQ,      // 1, more values, M, Br=64*1=64, matmul M 
-  const int kValueTileSeqLenK,      // 8, more values, N, Bc=8*8 =64, matmul N
-  const int kValueTileSeqLenP,      // 1, more values, M, Br=64*1=64, matmul M
-  const int kValueTileHeadDimV,     // 8, more values, N, d=8*(1|2|3|4|...)=8|...|32|64|96|128|...
+  const int kValTileSeqLenQ,       // 1, more values, M, Br=64*1=64, matmul M 
+  const int kValTileSeqLenK,       // 8, more values, N, Bc=8*8 =64, matmul N
+  const int kValTileSeqLenP,       // 1, more values, M, Br=64*1=64, matmul M
+  const int kValTileHeadDimV,      // 8, more values, N, d=8*(1|2|3|4|...)=8|...|32|64|96|128|...
   const int kMmaAccFloat32QK,      // 0/1, Q@K^T, 0 MMA Acc with fp16, 1 MMA Acc with fp32.
   const int kMmaAccFloat32PV,      // 0/1, P@V, 0 MMA Acc with fp16, 1 MMA Acc with fp32.
   const int kOStorageAccFloat32,   // 0/1, MMA Acc always be f32/f16, but O storage can be fp32 or half.
@@ -109,16 +109,16 @@ __device__ __forceinline__ void check_small_d_compiling_states() {
   static_assert(kMmaAtomM == 16 && kMmaAtomN == 8 && kMmaAtomK == 16); // m16n8k16
   static_assert(kMmaTileSeqLenQ  <= 8 && kMmaTileSeqLenK  == 1);  // Q@K^T
   static_assert(kMmaTileSeqLenP  <= 8 && kMmaTileHeadDimV == 1);  // P@V
-  static_assert(kValueTileSeqLenQ == 1 && kValueTileSeqLenK <= 16); // Q@K^T
-  static_assert(kValueTileSeqLenP == 1 && kValueTileHeadDimV == (
+  static_assert(kValTileSeqLenQ == 1 && kValTileSeqLenK <= 16); // Q@K^T
+  static_assert(kValTileSeqLenP == 1 && kValTileHeadDimV == (
     kHeadDim / (kMmaAtomN * kMmaTileHeadDimV))); // P@V
   static_assert(kMmaAccFloat32QK == 0 || kMmaAccFloat32QK == 1);
   static_assert(kMmaAccFloat32PV == 0 || kMmaAccFloat32PV == 1);
   static_assert(kOStorageAccFloat32 == 0 || kOStorageAccFloat32 == 1);
   // Make sure that Br >= Bc, for shared memory reuse.
   static_assert(
-    (kMmaAtomM * kMmaTileSeqLenQ * kValueTileSeqLenQ) >= 
-    (kMmaAtomN * kMmaTileSeqLenK * kValueTileSeqLenK)); 
+    (kMmaAtomM * kMmaTileSeqLenQ * kValTileSeqLenQ) >= 
+    (kMmaAtomN * kMmaTileSeqLenK * kValTileSeqLenK)); 
   static_assert(kPrefetchQK == 0 || kPrefetchQK == 1);
   static_assert(kPrefetchPV == 0 || kPrefetchPV == 1);
   static_assert(kShareSmemQKV == 0 || kShareSmemQKV == 1);
@@ -208,7 +208,7 @@ __device__ __forceinline__ void sync_fetch_qkv_frags_s2r(
   uint32_t smem_base_ptr, // QKV smem base ptr
   uint32_t * R,           // Register ptr, R_QKV
   const int mma_tile_id,  // Q warp_QP 0~num MMAs, KV warp_KV 0
-  const int warp_tile_id, // Q 0, KV 0~kValueTileSeqLenK
+  const int warp_tile_id, // Q 0, KV 0~kValTileSeqLenK
   const int n_tile_id,    // seqlen QK 0, V tile_V_Bc
   const int stage
 ) {
@@ -218,7 +218,7 @@ __device__ __forceinline__ void sync_fetch_qkv_frags_s2r(
     // load V m8n8x2 via ldmatrix.x2.trans
     static_assert(kNumRegs == 2);
     // mma_tile_id = warp_KV == 0, warp_tile_id = (j % 2), n_tile_id = tile_V_Bc
-    // warp_smem_V_d  = warp_KV * (kMmaAtomN * kValueTileHeadDimV) + (j % 2) * kMmaAtomN; 
+    // warp_smem_V_d  = warp_KV * (kMmaAtomN * kValTileHeadDimV) + (j % 2) * kMmaAtomN; 
     const int warp_smem_d = warp_tile_id * kMmaAtomN;
     const int lane_smem_Bc = n_tile_id * kMmaAtomK + lane_id % 16;
     const int lane_smem_d  = warp_smem_d; // 0,8
@@ -235,8 +235,8 @@ __device__ __forceinline__ void sync_fetch_qkv_frags_s2r(
     static_assert(kNumRegs == 2 || kNumRegs == 4);
     if constexpr (kNumRegs == 4) {
       // load Q m8n8x4 via ldmatrix.x4 
-      // mma_tile_id = warp_QP, kValueTileSeqLenQ=1
-      // warp_smem_Q_Br = warp_QP * (kMmaAtomM * kValueTileSeqLenQ) + 0 * kMmaAtomM
+      // mma_tile_id = warp_QP, kValTileSeqLenQ=1
+      // warp_smem_Q_Br = warp_QP * (kMmaAtomM * kValTileSeqLenQ) + 0 * kMmaAtomM
       const int warp_smem_Br = mma_tile_id * (kMmaAtomM);
       const int lane_smem_Br = warp_smem_Br + lane_id % 16; // 0~15
       const int lane_smem_d  = (lane_id / 16) * 8; // 0,8
@@ -252,7 +252,7 @@ __device__ __forceinline__ void sync_fetch_qkv_frags_s2r(
     } else {
       // load K m8n8x2 via ldmatrix.x2
       // mma_tile_id = warp_KV == 0, warp_tile_id = j
-      // warp_smem_Bc = warp_KV * (kMmaAtomN * kValueTileSeqLenK) + j * kMmaAtomN;
+      // warp_smem_Bc = warp_KV * (kMmaAtomN * kValTileSeqLenK) + j * kMmaAtomN;
       const int warp_smem_Bc = warp_tile_id * kMmaAtomN;
       const int lane_smem_Bc = warp_smem_Bc + lane_id % 8; // 0~7
       const int lane_smem_d  = ((lane_id / 8) % 2) * 8; // 0,8
@@ -270,7 +270,7 @@ __device__ __forceinline__ void sync_fetch_qkv_frags_s2r(
 }
 
 
-template<const int kValueTileSeqLenK, const int kMmaAccFloat32>
+template<const int kValTileSeqLenK, const int kMmaAccFloat32>
 __device__ __forceinline__ void sync_online_safe_softmax(
   uint32_t * R_S,                 // &R_S[0][0][0]
   const float scale,              // 1 / sqrt(d)
@@ -281,28 +281,28 @@ __device__ __forceinline__ void sync_online_safe_softmax(
 ) {
   if constexpr (kMmaAccFloat32) {
     // Row max for [Br,Bc] tile, Thread -> Warp -> Block.
-    { // kValueTileSeqLenQ = 1
-      // Thread level reduce max across kValueTileSeqLenK dim, namely Bc.
+    { // kValTileSeqLenQ = 1
+      // Thread level reduce max across kValTileSeqLenK dim, namely Bc.
       #pragma unroll
-      for (int j = 0; j < kValueTileSeqLenK; ++j) {
+      for (int j = 0; j < kValTileSeqLenK; ++j) {
         const float* t_fptr_S_0_1 = reinterpret_cast<float*>(R_S + j * 4); // &R_S[0][j][0]
         // This should be the row max after S = (Q @ K^T) / sqrt(d)
         const float tmp_max_0 = max(t_fptr_S_0_1[0], t_fptr_S_0_1[1]) * scale;
         const float tmp_max_1 = max(t_fptr_S_0_1[2], t_fptr_S_0_1[3]) * scale;
         lane_row_max_new[0] = max(lane_row_max_new[0], tmp_max_0);
         lane_row_max_new[1] = max(lane_row_max_new[1], tmp_max_1);
-      } // end for kValueTileSeqLenK
+      } // end for kValTileSeqLenK
 
       // Warp level reduce max, warp_size = 4
       // Each thread contains the maximum of 2 rows of Br, 
       // and only the values of T0, T4, ..., T28 are used.
       lane_row_max_new[0] = warp::reduce_max<float, 4>(lane_row_max_new[0]);
       lane_row_max_new[1] = warp::reduce_max<float, 4>(lane_row_max_new[1]);
-    } // end for kValueTileSeqLenQ
+    } // end for kValTileSeqLenQ
 
-    // static_assert(kValueTileSeqLenQ == 1);
+    // static_assert(kValTileSeqLenQ == 1);
     // Exp sum and mul scale_factor for [Br,Bc] tile, Thread -> Warp -> Block.
-    { // kValueTileSeqLenQ = 1
+    { // kValTileSeqLenQ = 1
       // Use latest global row max without update.
       // Br 0, row_id, 0~7,  16~23, 32~39, 48~55; 
       // Br 1, row_id, 8~15, 24~31, 40~47, 56~63;
@@ -311,7 +311,7 @@ __device__ __forceinline__ void sync_online_safe_softmax(
       const float block_row_max_new_1 = max(lane_block_row_max_old[1], lane_row_max_new[1]);
 
       #pragma unroll
-      for (int j = 0; j < kValueTileSeqLenK; ++j) {
+      for (int j = 0; j < kValTileSeqLenK; ++j) {
         // R_S[][][4] 4 32bit registers with each contains 1 F32 element.
         // (x,y) 0~7->{c0, c1}, (z,w)->8~15 {c2, c3}
         float* t_fptr_S_0_1 = reinterpret_cast<float*>(R_S + j * 4); 
@@ -329,7 +329,7 @@ __device__ __forceinline__ void sync_online_safe_softmax(
         t_hptr_S_0_1[1] = __float2half_rn(t_fptr_S_0_1[1]);
         t_hptr_S_0_1[2] = __float2half_rn(t_fptr_S_0_1[2]);
         t_hptr_S_0_1[3] = __float2half_rn(t_fptr_S_0_1[3]);
-      } // end for kValueTileSeqLenK
+      } // end for kValTileSeqLenK
 
       // Warp level reduce sum, warp_size = 4
       lane_row_sum_new[0] = warp::reduce_sum<float, 4>(lane_row_sum_new[0]);
@@ -339,34 +339,34 @@ __device__ __forceinline__ void sync_online_safe_softmax(
   } else {
     // MMA Acc F16
     // Row max for [Br,Bc] tile, Thread -> Warp -> Block.
-    { // kValueTileSeqLenQ = 1
-      // Thread level reduce max across kValueTileSeqLenK dim, namely Bc.
+    { // kValTileSeqLenQ = 1
+      // Thread level reduce max across kValTileSeqLenK dim, namely Bc.
       #pragma unroll
-      for (int j = 0; j < kValueTileSeqLenK; ++j) {
+      for (int j = 0; j < kValTileSeqLenK; ++j) {
         const half* t_hptr_S_0_1 = reinterpret_cast<half*>(R_S + j * 2); 
         // This should be the row max after S = (Q @ K^T) / sqrt(d)
         const float tmp_max_0 = __half2float(__hmax(t_hptr_S_0_1[0], t_hptr_S_0_1[1])) * scale;
         const float tmp_max_1 = __half2float(__hmax(t_hptr_S_0_1[2], t_hptr_S_0_1[3])) * scale;
         lane_row_max_new[0] = max(lane_row_max_new[0], tmp_max_0);
         lane_row_max_new[1] = max(lane_row_max_new[1], tmp_max_1);
-      } // end for kValueTileSeqLenK
+      } // end for kValTileSeqLenK
 
       // Warp level reduce max, warp_size = 4
       // Each thread contains the maximum of 2 rows of Br, 
       // and only the values of T0, T4, ..., T28 are used.
       lane_row_max_new[0] = warp::reduce_max<float, 4>(lane_row_max_new[0]);
       lane_row_max_new[1] = warp::reduce_max<float, 4>(lane_row_max_new[1]);
-    } // end for kValueTileSeqLenQ
+    } // end for kValTileSeqLenQ
 
-    // static_assert(kValueTileSeqLenQ == 1);
+    // static_assert(kValTileSeqLenQ == 1);
     // Exp sum and mul scale_factor for [Br,Bc] tile, Thread -> Warp -> Block.
-    { // kValueTileSeqLenQ = 1
+    { // kValTileSeqLenQ = 1
       // Apply m_new = max(m_old, m_new) here.
       const float block_row_max_new_0 = max(lane_block_row_max_old[0], lane_row_max_new[0]);
       const float block_row_max_new_1 = max(lane_block_row_max_old[1], lane_row_max_new[1]);
 
       #pragma unroll
-      for (int j = 0; j < kValueTileSeqLenK; ++j) {
+      for (int j = 0; j < kValTileSeqLenK; ++j) {
         half* t_hptr_S_0_1 = reinterpret_cast<half*>(R_S + j * 2); 
         // P = Exp(S - m_new), fmaf(x, y, z) = x * y + z;
         float4 t_reg_S_0_1;
@@ -385,7 +385,7 @@ __device__ __forceinline__ void sync_online_safe_softmax(
         t_hptr_S_0_1[1] = __float2half_rn(t_reg_S_0_1.y);
         t_hptr_S_0_1[2] = __float2half_rn(t_reg_S_0_1.z);
         t_hptr_S_0_1[3] = __float2half_rn(t_reg_S_0_1.w);
-      } // end for kValueTileSeqLenK
+      } // end for kValTileSeqLenK
 
       // Warp level reduce sum, warp_size = 4
       lane_row_sum_new[0] = warp::reduce_sum<float, 4>(lane_row_sum_new[0]);
@@ -435,7 +435,7 @@ __device__ __forceinline__ void sync_rescaling_tiling_o(
   if constexpr (kMmaAccFloat32) {
     const float* t_fptr_O_0_1 = reinterpret_cast<float*>(R_O); 
     if constexpr (kOStorageAccFloat32) {
-      // (x,y) 0~7->{c0, c1}, (z,w)->8~15 {c2, c3} kValueTileSeqLenP=1
+      // (x,y) 0~7->{c0, c1}, (z,w)->8~15 {c2, c3} kValTileSeqLenP=1
       float* t_fptr_D_0_1 = reinterpret_cast<float*>(R_D + d_tile_id * 4); // &(R_D[0][j][0])
       t_fptr_D_0_1[0] = __fmaf_rn(rescale_o_factor_0[0], t_fptr_D_0_1[0], t_fptr_O_0_1[0]);
       t_fptr_D_0_1[1] = __fmaf_rn(rescale_o_factor_0[0], t_fptr_D_0_1[1], t_fptr_O_0_1[1]);
@@ -456,7 +456,7 @@ __device__ __forceinline__ void sync_rescaling_tiling_o(
     // MMA Acc F16
     const half* t_hptr_O_0_1 = reinterpret_cast<half*>(R_O); 
     if constexpr (kOStorageAccFloat32) {
-      // (x,y) 0~7->{c0, c1}, (z,w)->8~15 {c2, c3} kValueTileSeqLenP=1
+      // (x,y) 0~7->{c0, c1}, (z,w)->8~15 {c2, c3} kValTileSeqLenP=1
       float* t_fptr_D_0_1 = reinterpret_cast<float*>(R_D + d_tile_id * 4);
       t_fptr_D_0_1[0] = __fmaf_rn(
         rescale_o_factor_0[0], t_fptr_D_0_1[0], __half2float(t_hptr_O_0_1[0]));
@@ -500,19 +500,19 @@ __device__ __forceinline__ void sync_update_max_expsum(
 }
 
 
-template<const int kValueTileHeadDimV, const int kOStorageAccFloat32>
+template<const int kValTileHeadDimV, const int kOStorageAccFloat32>
 __device__ __forceinline__ void sync_rescaling_final_o(
   uint32_t * R_D,                      // Final O after loop over N
   const float * lane_block_row_sum_old // &lane_block_row_sum_old[0][0]
 ) {
   // Finaly, we still have to rescale O once more.
   // O_output(D) = ( 1/l_final ) * O_final (FA2 paper)
-  // static_assert(kValueTileSeqLenP == 1);
-  { // kValueTileSeqLenP = 1
+  // static_assert(kValTileSeqLenP == 1);
+  { // kValTileSeqLenP = 1
     const float rescale_factor_0 = __frcp_rn(lane_block_row_sum_old[0]);
     const float rescale_factor_1 = __frcp_rn(lane_block_row_sum_old[1]);
     #pragma unroll
-    for (int j = 0; j < kValueTileHeadDimV; ++j) { // 8, 16, 32, ...
+    for (int j = 0; j < kValTileHeadDimV; ++j) { // 8, 16, 32, ...
       // Scaling in registers & convert F32 -> half for O collective store.
       if constexpr (kOStorageAccFloat32) {
         const float* t_fptr_D_0_1 = reinterpret_cast<float*>(R_D + j * 4); 
@@ -528,8 +528,8 @@ __device__ __forceinline__ void sync_rescaling_final_o(
         t_hptr_D_0_1[2] = __float2half_rn(rescale_factor_1 * __half2float(t_hptr_D_0_1[2]));
         t_hptr_D_0_1[3] = __float2half_rn(rescale_factor_1 * __half2float(t_hptr_D_0_1[3]));
       }
-    } // end for kValueTileHeadDimV
-  } // end for kValueTileSeqLenP = 1
+    } // end for kValTileHeadDimV
+  } // end for kValTileSeqLenP = 1
 }
 
 
@@ -538,7 +538,7 @@ template<
   const int kHeadDim, 
   const int kMmaAtomM, 
   const int kMmaAtomN, 
-  const int kValueTileHeadDimV,
+  const int kValTileHeadDimV,
   const int kOStorageAccFloat32
 >
 __device__ __forceinline__ void sync_store_o_r2g(
@@ -553,10 +553,10 @@ __device__ __forceinline__ void sync_store_o_r2g(
   // Store O(D): Write O[Br,d] from regs -> gmem, collective store 
   // with reg reuse & warp shuffle. 
   const int lane_id = threadIdx.x % WARP_SIZE; // 0~31
-  // static_assert(kValueTileSeqLenP == 1);
-  { // kValueTileSeqLenP = 1
+  // static_assert(kValTileSeqLenP == 1);
+  { // kValTileSeqLenP = 1
     #pragma unroll
-    for (int j = 0; j < kValueTileHeadDimV; ++j) { // 8
+    for (int j = 0; j < kValTileHeadDimV; ++j) { // 8
       // reuse R_Q[1][4], R_K[8][2] for collective store.
       uint32_t* t_uptr_Z_0 = reinterpret_cast<uint32_t*>(R_Q); 
       uint32_t* t_uptr_Z_1 = reinterpret_cast<uint32_t*>(R_K); 
@@ -572,12 +572,12 @@ __device__ __forceinline__ void sync_store_o_r2g(
 
       // st.global.v4 128 bits. [Br,d]
       if (lane_id % 4 == 0) {
-        // (0/1)*32 + (0/1)*16=(0,16,32,48), + 0~7 -> 0~56 kValueTileSeqLenP = 1
-        // int store_warp_regs_O_Br = warp_QP * (kMmaAtomM * kValueTileSeqLenP ) + 0 * kMmaAtomM;
+        // (0/1)*32 + (0/1)*16=(0,16,32,48), + 0~7 -> 0~56 kValTileSeqLenP = 1
+        // int store_warp_regs_O_Br = warp_QP * (kMmaAtomM * kValTileSeqLenP ) + 0 * kMmaAtomM;
         const int store_warp_regs_O_Br = mma_tile_id * (kMmaAtomM);
         const int store_lane_gmem_O_Br = n_tile_id * Br + store_warp_regs_O_Br + lane_id / 4; // 0~7
         // (0~3)*16 + (0/1)*8=(0,8,16,24,...,48,56)  warp_KV = 0
-        // int store_warp_regs_O_d = warp_KV * (kMmaAtomN * kValueTileHeadDimV) + j * kMmaAtomN;
+        // int store_warp_regs_O_d = warp_KV * (kMmaAtomN * kValTileHeadDimV) + j * kMmaAtomN;
         const int store_warp_regs_O_d = j * kMmaAtomN;
         const int store_lane_gmem_O_d = store_warp_regs_O_d; // (0~3)*16+(0/8)
         const int store_gmem_O_addr_0 = (
@@ -587,8 +587,8 @@ __device__ __forceinline__ void sync_store_o_r2g(
         cp_async::stg_sync_128b(&gmem_ptr[store_gmem_O_addr_0], t_uptr_Z_0);
         cp_async::stg_sync_128b(&gmem_ptr[store_gmem_O_addr_1], t_uptr_Z_1);
       }
-    } // end for kValueTileHeadDimV
-  } // kValueTileSeqLenP = 1
+    } // end for kValTileHeadDimV
+  } // kValTileSeqLenP = 1
 }
 
 } // prefill 
