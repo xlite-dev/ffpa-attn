@@ -448,7 +448,15 @@ TEMPLATE_FUNC<<<grid, block, kQKVSmemMaxSize>>>(            \
 #undef LAUNCH_TEMPLATE_FUNC
 }
 
-// dispatch headdim
+// dispatch headdim, no switch
+#define _LAUNCHER_L1(D, S)     \
+  launch_ffpa_mma_L1_template< \
+    (D),                       \
+    kMmaAccFloat32QK,          \
+    kMmaAccFloat32PV,          \
+    (S)                        \
+  >(Q, K, V, O);               \
+
 #define LAUNCHER_L1(D, S)        \
   case D:                        \
     launch_ffpa_mma_L1_template< \
@@ -458,6 +466,10 @@ TEMPLATE_FUNC<<<grid, block, kQKVSmemMaxSize>>>(            \
       (S)                        \
     >(Q, K, V, O);               \
     break;
+
+// For common use cases, we can directly use _LAUNCHER_L1 
+// without switch to reduce binary size and improve L1 cache hit.
+#define DISPATCH_HEADDIM_L1(S, D) _LAUNCHER_L1(D, S)
 
 #ifdef ENABLE_FFPA_DEBUG
   // minimal kernels for debug mode
@@ -524,6 +536,7 @@ TEMPLATE_FUNC<<<grid, block, kQKVSmemMaxSize>>>(            \
       break;                          \
     }                                 \
   }
+
 #else
   // multiple of 64
 #define DISPATCH_HEADDIM(LAUNCHER, S) \
