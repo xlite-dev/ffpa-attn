@@ -31,10 +31,10 @@ template<
          const int kMmaTileSeqLenK,       // 1, more MMA(warp), N=8*1 =8,  Q@K^T=[Br(M), d(K)]@[d(K),  Bc(N)]    
          const int kMmaTileSeqLenP,       // 4, more MMA(warp), M=16*4=64, P@V  =[Br(M),Bc(K)]@[Bc(K), d(N) ]
          const int kMmaTileHeadDimV,      // 1, more MMA(warp), N=8*1 =8,  P@V  =[Br(M),Bc(K)]@[Bc(K), d(N) ]       
-         const int kWarpTileSeqLenQ,      // 1, more values, M, Br=64*1=64, matmul M 
-         const int kWarpTileSeqLenK,      // 8, more values, N, Bc=8*8 =64, matmul N
-         const int kWarpTileSeqLenP,      // 1, more values, M, Br=64*1=64, matmul M
-         const int kWarpTileHeadDimV,     // 8, more values, N, d=8*(1|2|3|4|...)=8|...|32|64|96|128|...
+         const int kValueTileSeqLenQ,      // 1, more values, M, Br=64*1=64, matmul M 
+         const int kValueTileSeqLenK,      // 8, more values, N, Bc=8*8 =64, matmul N
+         const int kValueTileSeqLenP,      // 1, more values, M, Br=64*1=64, matmul M
+         const int kValueTileHeadDimV,     // 8, more values, N, d=8*(1|2|3|4|...)=8|...|32|64|96|128|...
          const int kOStorageAccFloat32,   // 0/1, MMA Acc always be fp16, but O storage can be fp32 or half.
          const int kStage,                // 1,2
          const int kPadQ,                 // Pad Q/K/V 0,8
@@ -54,10 +54,10 @@ ffpa_mma_stages_split_q_kernel_acc_f16_L1(half* Q,
   static_assert(kMmaAtomM == 16 && kMmaAtomN == 8 && kMmaAtomK == 16); // m16n8k16
   static_assert(kMmaTileSeqLenQ  <= 8 && kMmaTileSeqLenK  == 1);  // Q@K^T
   static_assert(kMmaTileSeqLenP  <= 8 && kMmaTileHeadDimV == 1);  // P@V
-  static_assert(kWarpTileSeqLenQ == 1 && kWarpTileSeqLenK <= 16); // Q@K^T
-  // kWarpTileHeadDimV: d=8*(1|2|3|4|...) = 8|...|32|64|96|128|..., etc.
-  // e.g, kWarpTileHeadDimV = 8 -> d = 8*8 = 64; 16 -> d = 8*16 = 128.
-  static_assert(kWarpTileSeqLenP == 1 && kWarpTileHeadDimV == (
+  static_assert(kValueTileSeqLenQ == 1 && kValueTileSeqLenK <= 16); // Q@K^T
+  // kValueTileHeadDimV: d=8*(1|2|3|4|...) = 8|...|32|64|96|128|..., etc.
+  // e.g, kValueTileHeadDimV = 8 -> d = 8*8 = 64; 16 -> d = 8*16 = 128.
+  static_assert(kValueTileSeqLenP == 1 && kValueTileHeadDimV == (
     kHeadDim / (kMmaAtomN * kMmaTileHeadDimV))); // P@V
   static_assert(kOStorageAccFloat32 == 0 || kOStorageAccFloat32 == 1);
   static_assert(kStage < 5 && kStage > 0); 
@@ -67,8 +67,8 @@ ffpa_mma_stages_split_q_kernel_acc_f16_L1(half* Q,
   constexpr bool kSwizzleQ = (kPadQ == 0) ? true : false; // swizzle Q if kPadQ=0
   constexpr bool kSwizzleK = (kPadK == 0) ? true : false; // swizzle K if kPadK=0
   constexpr bool kSwizzleV = (kPadV == 0) ? true : false; // swizzle V if kPadV=0
-  constexpr int Br = kMmaAtomM * kMmaTileSeqLenQ * kWarpTileSeqLenQ; // 16*4*1=64
-  constexpr int Bc = kMmaAtomN * kMmaTileSeqLenK * kWarpTileSeqLenK; //  8*1*8=64
+  constexpr int Br = kMmaAtomM * kMmaTileSeqLenQ * kValueTileSeqLenQ; // 16*4*1=64
+  constexpr int Bc = kMmaAtomN * kMmaTileSeqLenK * kValueTileSeqLenK; //  8*1*8=64
   static_assert(Br >= Bc); // for shared memory reuse.
   constexpr int kNumThreads = WARP_SIZE * kMmaTileSeqLenQ * kMmaTileSeqLenK; // 32*4*1=128, num threads
   // Now, N must be mutliples of Bc(32/64) for KV tiling across seqlen.
@@ -128,24 +128,24 @@ ffpa_mma_stages_split_q_kernel_acc_f16_L1(half* Q,
 
   // --------------------- Registers/SMEM for thread block -------------------------
   // block m_old, l_old, store in lane, use float to keep precision.
-  float lane_block_row_max_old[kWarpTileSeqLenQ][2]; // [1][2]
-  float lane_block_row_sum_old[kWarpTileSeqLenQ][2]; // [1][2]
-  fill_2D_regs<float, kWarpTileSeqLenQ, 2>(lane_block_row_max_old, -INFINITY);
-  fill_2D_regs<float, kWarpTileSeqLenQ, 2>(lane_block_row_sum_old, 0.0f);
+  float lane_block_row_max_old[kValueTileSeqLenQ][2]; // [1][2]
+  float lane_block_row_sum_old[kValueTileSeqLenQ][2]; // [1][2]
+  fill_2D_regs<float, kValueTileSeqLenQ, 2>(lane_block_row_max_old, -INFINITY);
+  fill_2D_regs<float, kValueTileSeqLenQ, 2>(lane_block_row_sum_old, 0.0f);
 
   // ---------------------- Registers for S=Q@K^T/O=P@V ----------------------------
   // registers for QKV, S=Q[Br,d]@K[Bc,d]=[Br,Bc] and O=P[Br,Bc]@V[Bc,d]=[Br,d].
-  uint32_t R_Q[kWarpTileSeqLenQ][ 4]; // [1][4]
-  uint32_t R_K[kWarpTileSeqLenK][ 2]; // [8][2]
+  uint32_t R_Q[kValueTileSeqLenQ][ 4]; // [1][4]
+  uint32_t R_K[kValueTileSeqLenK][ 2]; // [8][2]
   uint32_t R_V[2]; // [2], S=Q@K, only use 2 32bits registers.
-  uint32_t R_S[kWarpTileSeqLenQ][kWarpTileSeqLenK][ 2]; // [1][8][2], acc fp16.
+  uint32_t R_S[kValueTileSeqLenQ][kValueTileSeqLenK][ 2]; // [1][8][2], acc fp16.
   uint32_t R_O[2]; // registers for O=PV[Br,d]=P@V, [4], only use 2 32bits registers.
   // registers final Output [D]=final rescale(R_O), kOStorageAccFloat32 
   // 0/1, MMA Acc always be fp16, but O storage(R_D) can be fp32 or half.
   // FP16 can provide precision to approximately 3-4 decimal places. Thus, if the 
   // error does not exceed 1e-3, using FP16 storage is sufficient for most applications.
-  uint32_t R_D[kWarpTileSeqLenP][kWarpTileHeadDimV][(kOStorageAccFloat32) ? 4 : 2]; 
-  fill_3D_regs<uint32_t, kWarpTileSeqLenP, kWarpTileHeadDimV, ((kOStorageAccFloat32) ? 4 : 2)>(R_D, 0);
+  uint32_t R_D[kValueTileSeqLenP][kValueTileHeadDimV][(kOStorageAccFloat32) ? 4 : 2]; 
+  fill_3D_regs<uint32_t, kValueTileSeqLenP, kValueTileHeadDimV, ((kOStorageAccFloat32) ? 4 : 2)>(R_D, 0);
   
   // <loop over K seqlen>: for K^T[d,seqlen] with K^T_tile[d,Bc]
   // tile_K_seqlen: compute S_tile[Br,Bc] = Q@K^T = Q_tile[Br,d] * K^T[d,Bc]
@@ -205,7 +205,7 @@ ffpa_mma_stages_split_q_kernel_acc_f16_L1(half* Q,
     // NOTE: K[Bc,d] with row major means K^T[d,Bc] in col major.
     // S_tile[Br,Bc]=Q_tile[Br,d]@K[Bc,d]
     // <HGEMM in shared memory>
-    fill_3D_regs<uint32_t, kWarpTileSeqLenQ, kWarpTileSeqLenK, 2>(R_S, 0);
+    fill_3D_regs<uint32_t, kValueTileSeqLenQ, kValueTileSeqLenK, 2>(R_S, 0);
     #pragma unroll
     for (int tile_K_d = 0; tile_K_d < (kHeadDim / kMmaAtomK); ++tile_K_d) {
       // s2 tn 0->0, 1->1, 2->0; s3 tn 0->0, 1->1, 2->2, 3->0;
@@ -301,9 +301,9 @@ ffpa_mma_stages_split_q_kernel_acc_f16_L1(half* Q,
       } // end if kStage > 1
 
       // Q s2r
-      static_assert(kWarpTileSeqLenQ == 1);
-      { // kWarpTileSeqLenQ = 1, Q[Br,d]=[M,K]
-        int warp_smem_Q_Br = warp_QP * (kMmaAtomM * kWarpTileSeqLenQ) + 0 * kMmaAtomM;
+      static_assert(kValueTileSeqLenQ == 1);
+      { // kValueTileSeqLenQ = 1, Q[Br,d]=[M,K]
+        int warp_smem_Q_Br = warp_QP * (kMmaAtomM * kValueTileSeqLenQ) + 0 * kMmaAtomM;
         int lane_smem_Q_Br = warp_smem_Q_Br + lane_id % 16; // 0~15
         int lane_smem_Q_d  = (lane_id / 16) * 8; // 0,8
         uint32_t lane_smem_Q_ptr = (
@@ -321,10 +321,10 @@ ffpa_mma_stages_split_q_kernel_acc_f16_L1(half* Q,
       // smem -> reg, load k16n8 from smem K, offset d according tile_K_d.
       // ldmatrix.x2 for K_tile_smem, [Bc,kMmaAtomK] from [Bc,d]=[K,N]
       #pragma unroll
-      for (int j = 0; j < kWarpTileSeqLenK; ++j) {
+      for (int j = 0; j < kValueTileSeqLenK; ++j) {
         // load k16n8 via ldmatrix.x2 from K_tile_smem[Bc,d]. 
         // K[Bc,d] with row major means K^T[d,Bc] in col major.
-        int warp_smem_K_Bc = warp_KV * (kMmaAtomN * kWarpTileSeqLenK) + j * kMmaAtomN;
+        int warp_smem_K_Bc = warp_KV * (kMmaAtomN * kValueTileSeqLenK) + j * kMmaAtomN;
         int lane_smem_K_Bc = warp_smem_K_Bc + lane_id % 8; // 0~7
         int lane_smem_K_d  = ((lane_id / 8) % 2) * 8; // 0,8
         uint32_t lane_smem_K_ptr = (
@@ -336,7 +336,7 @@ ffpa_mma_stages_split_q_kernel_acc_f16_L1(half* Q,
                             ) * sizeof(half)
         );
         LDMATRIX_X2(R_K[j][0], R_K[j][1], lane_smem_K_ptr); // R_K
-      } // end for kWarpTileSeqLenK
+      } // end for kValueTileSeqLenK
       if constexpr (kStage < 2) {
         // Wait Q, K s2r ready if kStage < 2 in order to avoid 
         // the next Q, K tile g2s overwrite.
@@ -344,10 +344,10 @@ ffpa_mma_stages_split_q_kernel_acc_f16_L1(half* Q,
       }
       
       // MMA compute
-      static_assert(kWarpTileSeqLenQ == 1);
-      { // kWarpTileSeqLenQ = 1
+      static_assert(kValueTileSeqLenQ == 1);
+      { // kValueTileSeqLenQ = 1
         #pragma unroll
-        for (int j = 0; j < kWarpTileSeqLenK; ++j) { // 8, 16, 32, ...
+        for (int j = 0; j < kValueTileSeqLenK; ++j) { // 8, 16, 32, ...
           HMMA16816(R_S[0][j][0], R_S[0][j][1],
                     R_Q[0][0],    R_Q[0][1],    R_Q[0][2],    R_Q[0][3], 
                     R_K[j][0],    R_K[j][1], 
@@ -372,17 +372,17 @@ ffpa_mma_stages_split_q_kernel_acc_f16_L1(half* Q,
     // | warp_QP 3 | MMA 3 ... MMA 3 (x8) |
 
     // Online safe softmax, warp/block reduce max/sum, row wise
-    float lane_row_max_new[kWarpTileSeqLenQ][2]; // [1][2]
-    float lane_row_sum_new[kWarpTileSeqLenQ][2]; // [1][2]
-    fill_2D_regs<float, kWarpTileSeqLenQ, 2>(lane_row_max_new, -INFINITY);
-    fill_2D_regs<float, kWarpTileSeqLenQ, 2>(lane_row_sum_new, 0.0f);
+    float lane_row_max_new[kValueTileSeqLenQ][2]; // [1][2]
+    float lane_row_sum_new[kValueTileSeqLenQ][2]; // [1][2]
+    fill_2D_regs<float, kValueTileSeqLenQ, 2>(lane_row_max_new, -INFINITY);
+    fill_2D_regs<float, kValueTileSeqLenQ, 2>(lane_row_sum_new, 0.0f);
 
-    static_assert(kWarpTileSeqLenQ == 1);
+    static_assert(kValueTileSeqLenQ == 1);
     // Row max for [Br,Bc] tile, Thread -> Warp -> Block.
-    { // kWarpTileSeqLenQ = 1
-      // Thread level reduce max across kWarpTileSeqLenK dim, namely Bc.
+    { // kValueTileSeqLenQ = 1
+      // Thread level reduce max across kValueTileSeqLenK dim, namely Bc.
       #pragma unroll
-      for (int j = 0; j < kWarpTileSeqLenK; ++j) {
+      for (int j = 0; j < kValueTileSeqLenK; ++j) {
         // reference: https://docs.nvidia.com/cuda/parallel-thread-execution/index.html
         // #matrix-fragments-for-mma-m16n8k16-with-floating-point-type
         // The layout of the fragments held by different threads for C. (m16n8k16)
@@ -403,18 +403,18 @@ ffpa_mma_stages_split_q_kernel_acc_f16_L1(half* Q,
         float tmp_max_1 = __half2float(__hmax(t_hptr_S_0_1[2], t_hptr_S_0_1[3])) * scale;
         lane_row_max_new[0][0] = max(lane_row_max_new[0][0], tmp_max_0);
         lane_row_max_new[0][1] = max(lane_row_max_new[0][1], tmp_max_1);
-      } // end for kWarpTileSeqLenK
+      } // end for kValueTileSeqLenK
 
       // Warp level reduce max, warp_size = 4
       // Each thread contains the maximum of 2 rows of Br, 
       // and only the values of T0, T4, ..., T28 are used.
       lane_row_max_new[0][0] = warp_reduce_max<float, 4>(lane_row_max_new[0][0]);
       lane_row_max_new[0][1] = warp_reduce_max<float, 4>(lane_row_max_new[0][1]);
-    } // end for kWarpTileSeqLenQ
+    } // end for kValueTileSeqLenQ
 
-    static_assert(kWarpTileSeqLenQ == 1);
+    static_assert(kValueTileSeqLenQ == 1);
     // Exp sum and mul scale_factor for [Br,Bc] tile, Thread -> Warp -> Block.
-    { // kWarpTileSeqLenQ = 1
+    { // kValueTileSeqLenQ = 1
       // Use latest global row max without update.
       // Br 0, row_id, 0~7,  16~23, 32~39, 48~55; 
       float block_row_max_new_0 = lane_row_max_new[0][0]; 
@@ -428,7 +428,7 @@ ffpa_mma_stages_split_q_kernel_acc_f16_L1(half* Q,
       block_row_max_new_1 = max(block_row_max_old_1, block_row_max_new_1);
 
       #pragma unroll
-      for (int j = 0; j < kWarpTileSeqLenK; ++j) {
+      for (int j = 0; j < kValueTileSeqLenK; ++j) {
         half* t_hptr_S_0_1 = reinterpret_cast<half*>(&(R_S[0][j][0])); 
         // P = Exp(S - m_new), fmaf(x, y, z) = x * y + z;
         float4 t_reg_S_0_1;
@@ -447,7 +447,7 @@ ffpa_mma_stages_split_q_kernel_acc_f16_L1(half* Q,
         t_hptr_S_0_1[1] = __float2half_rn(t_reg_S_0_1.y);
         t_hptr_S_0_1[2] = __float2half_rn(t_reg_S_0_1.z);
         t_hptr_S_0_1[3] = __float2half_rn(t_reg_S_0_1.w);
-      } // end for kWarpTileSeqLenK
+      } // end for kValueTileSeqLenK
 
       // Warp level reduce sum, warp_size = 4
       lane_row_sum_new[0][0] = warp_reduce_sum<float, 4>(lane_row_sum_new[0][0]);
@@ -455,8 +455,8 @@ ffpa_mma_stages_split_q_kernel_acc_f16_L1(half* Q,
     }
     
     // Prefetch V g2s before row max/sum for P@V if kStage > 1
-    static_assert(kWarpTileSeqLenP == 1);
-    { // kWarpTileSeqLenP = 1
+    static_assert(kValueTileSeqLenP == 1);
+    { // kValueTileSeqLenP = 1
       if constexpr (kStage > 1) {
         #pragma unroll
         for (int stage = 0; stage < (kStage - 1); ++stage) {
@@ -499,7 +499,7 @@ ffpa_mma_stages_split_q_kernel_acc_f16_L1(half* Q,
     // ...
     // 15   T28: {a2, a3}  T29: {a2, a3}  T30: {a2, a3}  T31: {a2, a3}  T28: {a6, a7}  T29: {a6, a7}  T30: {a6, a7}  T31: {a6, a7}
 
-    static_assert(kWarpTileSeqLenP == 1);
+    static_assert(kValueTileSeqLenP == 1);
     {
       // <Prefetch max/sum values>
       // m = max(m_old, m_new), l = exp(m_old - m) * l_old + l_new (FA2 paper)
@@ -531,7 +531,7 @@ ffpa_mma_stages_split_q_kernel_acc_f16_L1(half* Q,
 
       // <HGEMM in registers>
       #pragma unroll
-      for (int j = 0; j < kWarpTileHeadDimV; ++j) { // 8, 16, 32, ...
+      for (int j = 0; j < kValueTileHeadDimV; ++j) { // 8, 16, 32, ...
         // Compute d tile, P[Br,Bc]@V[Bc,16] = O[Br,16]
         fill_1D_regs<uint32_t, 2>(R_O, 0); // must clear 
 
@@ -540,7 +540,7 @@ ffpa_mma_stages_split_q_kernel_acc_f16_L1(half* Q,
         // V g2s, V tile smem [Bc,kMmaAtomN*2]=[64,16]
         if (j % 2 == 0) { // 0,2,4,6,...// curr K tile g2s
           if constexpr (kStage > 1) {
-            if (((j / 2) + 1) < (kWarpTileHeadDimV / 2)) {
+            if (((j / 2) + 1) < (kValueTileHeadDimV / 2)) {
               int load_gmem_V_Bc = (tile_K_seqlen * Bc) + load_smem_V_Bc; // < seqlen
               int load_gmem_V_d  = (((j / 2) + 1) * kMmaAtomN * 2) + load_smem_V_d; // V [Bc,16] from [seqlen,d]
               int load_gmem_V_addr = (
@@ -559,7 +559,7 @@ ffpa_mma_stages_split_q_kernel_acc_f16_L1(half* Q,
                 CP_ASYNC_CG(load_smem_V_ptr, &V[load_gmem_V_addr + i], 16);
               }
               CP_ASYNC_COMMIT_GROUP();
-            } // end if < (kWarpTileHeadDimV / 2)
+            } // end if < (kValueTileHeadDimV / 2)
           } else {
             // no stages for V g2s
             int load_gmem_V_Bc = (tile_K_seqlen * Bc) + load_smem_V_Bc; // < seqlen
@@ -589,7 +589,7 @@ ffpa_mma_stages_split_q_kernel_acc_f16_L1(half* Q,
         #pragma unroll
         for (int tile_V_Bc = 0; tile_V_Bc < (Bc / kMmaAtomK); ++tile_V_Bc) {
           // Load k16n8 V from smem [Bc,8*2] -> regs, R_V, ldmatrix.x2.trans.
-          int warp_smem_V_d  = warp_KV * (kMmaAtomN * kWarpTileHeadDimV) + (j % 2) * kMmaAtomN; // d, matmaul N
+          int warp_smem_V_d  = warp_KV * (kMmaAtomN * kValueTileHeadDimV) + (j % 2) * kMmaAtomN; // d, matmaul N
           int lane_smem_V_Bc = tile_V_Bc * kMmaAtomK + lane_id % 16; // 0~15; Bc, matmul K
           int lane_smem_V_d  = warp_smem_V_d; // 0
           uint32_t lane_smem_V_ptr = (
@@ -633,7 +633,7 @@ ffpa_mma_stages_split_q_kernel_acc_f16_L1(half* Q,
         half* t_hptr_O_0_1 = reinterpret_cast<half*>(&(R_O[0])); 
         if constexpr (kOStorageAccFloat32) {
           // (x,y) 0~7->{c0, c1}, (z,w)->8~15 {c2, c3}
-          float* t_fptr_D_0_1 = reinterpret_cast<float*>(&(R_D[0][j][0])); // kWarpTileSeqLenP=1
+          float* t_fptr_D_0_1 = reinterpret_cast<float*>(&(R_D[0][j][0])); // kValueTileSeqLenP=1
           t_fptr_D_0_1[0] = __fmaf_rn(
             rescale_o_factor_0, t_fptr_D_0_1[0], __half2float(t_hptr_O_0_1[0]));
           t_fptr_D_0_1[1] = __fmaf_rn(
@@ -661,7 +661,7 @@ ffpa_mma_stages_split_q_kernel_acc_f16_L1(half* Q,
           CP_ASYNC_WAIT_GROUP(kStage - 2); 
           __syncthreads();
         }
-      } // end for kWarpTileHeadDimV. 
+      } // end for kValueTileHeadDimV. 
       // Now, we can update m, l after O has been scaled.
       // 1. First, update block row sum Exp for each lane which
       // need both m_new and m_old.
@@ -683,12 +683,12 @@ ffpa_mma_stages_split_q_kernel_acc_f16_L1(half* Q,
 
   // Finaly, we still have to rescale O once more.
   // O_output(D) = ( 1/l_final ) * O_final (FA2 paper)
-  static_assert(kWarpTileSeqLenP == 1);
-  { // kWarpTileSeqLenP = 1
+  static_assert(kValueTileSeqLenP == 1);
+  { // kValueTileSeqLenP = 1
     float rescale_factor_0 = __frcp_rn(lane_block_row_sum_old[0][0]);
     float rescale_factor_1 = __frcp_rn(lane_block_row_sum_old[0][1]);
     #pragma unroll
-    for (int j = 0; j < kWarpTileHeadDimV; ++j) { // 8, 16, 32, ...
+    for (int j = 0; j < kValueTileHeadDimV; ++j) { // 8, 16, 32, ...
       // Scaling in registers & convert F32 -> half for O collective store.
       if constexpr (kOStorageAccFloat32) {
         float* t_fptr_D_0_1 = reinterpret_cast<float*>(&(R_D[0][j][0])); 
@@ -704,15 +704,15 @@ ffpa_mma_stages_split_q_kernel_acc_f16_L1(half* Q,
         t_hptr_D_0_1[2] = __float2half_rn(rescale_factor_1 * __half2float(t_hptr_D_0_1[2]));
         t_hptr_D_0_1[3] = __float2half_rn(rescale_factor_1 * __half2float(t_hptr_D_0_1[3]));
       }
-    } // end for kWarpTileHeadDimV
-  } // end for kWarpTileSeqLenP = 1
+    } // end for kValueTileHeadDimV
+  } // end for kValueTileSeqLenP = 1
 
   // Store O(D): Write O[Br,d] from regs -> gmem, collective store 
   // with reg reuse & warp shuffle. 
-  static_assert(kWarpTileSeqLenP == 1);
-  { // kWarpTileSeqLenP = 1
+  static_assert(kValueTileSeqLenP == 1);
+  { // kValueTileSeqLenP = 1
     #pragma unroll
-    for (int j = 0; j < kWarpTileHeadDimV; ++j) { // 8
+    for (int j = 0; j < kValueTileHeadDimV; ++j) { // 8
       // reuse R_Q[1][4], R_K[8][2] for collective store.
       uint32_t* t_uptr_Z_0 = reinterpret_cast<uint32_t*>(&(R_Q[0][0])); 
       uint32_t* t_uptr_Z_1 = reinterpret_cast<uint32_t*>(&(R_K[0][0])); 
@@ -728,10 +728,10 @@ ffpa_mma_stages_split_q_kernel_acc_f16_L1(half* Q,
       // st.global.v4 128 bits. [Br,d]
       if (lane_id % 4 == 0) {
         // (0/1)*32 + (0/1)*16=(0,16,32,48), + 0~7 -> 0~56
-        int store_warp_regs_O_Br = warp_QP * (kMmaAtomM * kWarpTileSeqLenP ) + 0 * kMmaAtomM;
+        int store_warp_regs_O_Br = warp_QP * (kMmaAtomM * kValueTileSeqLenP ) + 0 * kMmaAtomM;
         int store_lane_gmem_O_Br = O_tile_id * Br + store_warp_regs_O_Br + lane_id / 4; // 0~7
         // (0~3)*16 + (0/1)*8=(0,8,16,24,...,48,56)
-        int store_warp_regs_O_d = warp_KV * (kMmaAtomN * kWarpTileHeadDimV) + j * kMmaAtomN;
+        int store_warp_regs_O_d = warp_KV * (kMmaAtomN * kValueTileHeadDimV) + j * kMmaAtomN;
         int store_lane_gmem_O_d = store_warp_regs_O_d; // (0~3)*16+(0/8)
         int store_gmem_O_addr_0 = (
           O_gmem_offset + (store_lane_gmem_O_Br + 0) * kHeadDim + store_lane_gmem_O_d);
@@ -740,8 +740,8 @@ ffpa_mma_stages_split_q_kernel_acc_f16_L1(half* Q,
         LDST128BITS(O[store_gmem_O_addr_0]) = LDST128BITS(t_uptr_Z_0[0]);
         LDST128BITS(O[store_gmem_O_addr_1]) = LDST128BITS(t_uptr_Z_1[0]);
       }
-    } // end for kWarpTileHeadDimV
-  } // kWarpTileSeqLenP = 1
+    } // end for kValueTileHeadDimV
+  } // kValueTileSeqLenP = 1
 }
 
 template<const int kHeadDim, const int kStage>
@@ -757,12 +757,12 @@ void launch_ffpa_mma_acc_f16_L1(
   constexpr int kMmaTileSeqLenK  = 1;
   constexpr int kMmaTileSeqLenP  = (kHeadDim < 128) ? 4 : 8;
   constexpr int kMmaTileHeadDimV = 1;
-  constexpr int kWarpTileSeqLenQ = 1;
-  constexpr int kWarpTileSeqLenK = (kHeadDim < 128) ? 8 : 16;
-  constexpr int kWarpTileSeqLenP = 1;
-  constexpr int kWarpTileHeadDimV = (kHeadDim / (kMmaAtomN * kMmaTileHeadDimV));
-  constexpr int Br = kMmaAtomM * kMmaTileSeqLenQ * kWarpTileSeqLenQ;
-  constexpr int Bc = kMmaAtomN * kMmaTileSeqLenK * kWarpTileSeqLenK;
+  constexpr int kValueTileSeqLenQ = 1;
+  constexpr int kValueTileSeqLenK = (kHeadDim < 128) ? 8 : 16;
+  constexpr int kValueTileSeqLenP = 1;
+  constexpr int kValueTileHeadDimV = (kHeadDim / (kMmaAtomN * kMmaTileHeadDimV));
+  constexpr int Br = kMmaAtomM * kMmaTileSeqLenQ * kValueTileSeqLenQ;
+  constexpr int Bc = kMmaAtomN * kMmaTileSeqLenK * kValueTileSeqLenK;
   constexpr int kNumThreads = WARP_SIZE * kMmaTileSeqLenQ * kMmaTileSeqLenK;
   // 0 for smem swizzle, > 0 for smem padding.
   constexpr int kPadQ = 0;
@@ -805,10 +805,10 @@ void launch_ffpa_mma_acc_f16_L1(
       kMmaTileSeqLenK, 
       kMmaTileSeqLenP, 
       kMmaTileHeadDimV, 
-      kWarpTileSeqLenQ, 
-      kWarpTileSeqLenK, 
-      kWarpTileSeqLenP, 
-      kWarpTileHeadDimV, 
+      kValueTileSeqLenQ, 
+      kValueTileSeqLenK, 
+      kValueTileSeqLenP, 
+      kValueTileHeadDimV, 
       kOStorageAccFloat32,
       kStage, 
       kPadQ,
@@ -828,10 +828,10 @@ void launch_ffpa_mma_acc_f16_L1(
     kMmaTileSeqLenK,
     kMmaTileSeqLenP, 
     kMmaTileHeadDimV, 
-    kWarpTileSeqLenQ, 
-    kWarpTileSeqLenK, 
-    kWarpTileSeqLenP, 
-    kWarpTileHeadDimV, 
+    kValueTileSeqLenQ, 
+    kValueTileSeqLenK, 
+    kValueTileSeqLenP, 
+    kValueTileHeadDimV, 
     kOStorageAccFloat32,
     kStage, 
     kPadQ,
