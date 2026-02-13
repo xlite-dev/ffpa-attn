@@ -331,6 +331,8 @@ class ENV(object):
         extra_cuda_cflags = []
         extra_cuda_cflags.append("-O3")
         extra_cuda_cflags.append("-std=c++17")
+        extra_cuda_cflags.append("-Xcompiler")
+        extra_cuda_cflags.append("-fPIC")
         extra_cuda_cflags.append("-U__CUDA_NO_HALF_OPERATORS__")
         extra_cuda_cflags.append("-U__CUDA_NO_HALF_CONVERSIONS__")
         extra_cuda_cflags.append("-U__CUDA_NO_HALF2_OPERATORS__")
@@ -348,6 +350,8 @@ class ENV(object):
         extra_cuda_cflags.append(
             "-Xptxas -v" if not build_pkg else "--ptxas-options=-O3"
         )
+
+        extra_cuda_cflags.append("--threads=8")
         # Avoid None or empty str as flag or macro
         extra_cuda_cflags = [flag for flag in extra_cuda_cflags if flag]
         return extra_cuda_cflags
