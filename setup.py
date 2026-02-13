@@ -1,10 +1,11 @@
+import warnings
 from pathlib import Path
 
 from env import ENV
 from packaging.version import Version
 from setuptools import find_packages, setup
 from torch.utils.cpp_extension import BuildExtension, CUDA_HOME, CUDAExtension
-import warnings
+
 warnings.filterwarnings("ignore")
 
 
@@ -51,10 +52,9 @@ ext_modules.append(
             "cxx": ["-O3", "-std=c++17"] + generator_flag,
             # add nvcc compile flags
             "nvcc": [
-                flag for flag in (
-                    ENV.get_build_cuda_cflags(build_pkg=True)
-                    + generator_flag
-                    + cc_flag
+                flag
+                for flag in (
+                    ENV.get_build_cuda_cflags(build_pkg=True) + generator_flag + cc_flag
                 )
                 if flag.strip()  # <--- Filter out empty strings
             ],
@@ -96,7 +96,7 @@ setup(
     description="FFPA: Yet another Faster Flash Prefill Attention for large headdim, 1.8x~3x faster than SDPA EA.",
     long_description=get_long_description(),
     long_description_content_type="text/markdown",
-    url="https://github.com/DefTruth/ffpa-attn-mma.git",
+    url="https://github.com/xlite/ffpa-attn.git",
     ext_modules=ext_modules,
     cmdclass={"build_ext": BuildExtension},
     python_requires=">=3.10",
