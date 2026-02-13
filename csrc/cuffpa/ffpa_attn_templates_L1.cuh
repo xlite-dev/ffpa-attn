@@ -383,6 +383,13 @@ ffpa_mma_stages_split_q_L1_large_d_template(
       }
     }
 
+    // MMA = m16n8k16, Br=16x4=64, Bc=8x8=64, layout: 4 warps
+    // |   64x64   |      warp_KV 0       |
+    // | warp_QP 0 | MMA 0 ... MMA 0 (x8) |
+    // | warp_QP 1 | MMA 1 ... MMA 1 (x8) |
+    // | warp_QP 2 | MMA 2 ... MMA 2 (x8) |
+    // | warp_QP 3 | MMA 3 ... MMA 3 (x8) |
+
     // Online safe softmax, warp/block reduce max/sum, row wise
     float lane_row_max_new[kValueTileSeqLenQ][2]; // [1][2]
     float lane_row_sum_new[kValueTileSeqLenQ][2]; // [1][2]
@@ -390,6 +397,20 @@ ffpa_mma_stages_split_q_L1_large_d_template(
     utils::fill_2D_regs<float, kValueTileSeqLenQ, 2>(lane_row_sum_new, 0.0f);
 
     static_assert(kValueTileSeqLenQ == 1);
+    // reference: https://docs.nvidia.com/cuda/parallel-thread-execution/index.html
+    // #matrix-fragments-for-mma-m16n8k16-with-floating-point-type
+    // The layout of the fragments held by different threads for C. (m16n8k16)
+    // Row\Col  0    1    2    3    4    5    6    7
+    // 0        T0: {c0, c1}  T1: {c0, c1}  T2: {c0, c1}  T3: {c0, c1}
+    // 1        T4: {c0, c1}  T5: {c0, c1}  T6: {c0, c1}  T7: {c0, c1}
+    // 2        ...
+    // ...
+    // 7        T28: {c0, c1}  T29: {c0, c1}  T30: {c0, c1}  T31: {c0, c1}
+    // 8        T0: {c2, c3}   T1: {c2, c3}   T2: {c2, c3}   T3: {c2, c3}
+    // 9        T4: {c2, c3}   T5: {c2, c3}   T6: {c2, c3}   T7: {c2, c3}
+    // 10       ...
+    // ...
+    // 15       T28: {c2, c3}  T29: {c2, c3}  T30: {c2, c3}  T31: {c2, c3}
     prefill::sync_online_safe_softmax<kValueTileSeqLenK, kMmaAccFloat32QK>(
       &R_S[0][0][0], scale, &lane_row_max_new[0][0], &lane_row_sum_new[0][0],
       &lane_block_row_max_old[0][0], &lane_block_row_sum_old[0][0]
@@ -521,6 +542,17 @@ ffpa_mma_stages_split_q_L1_large_d_template(
           }
 
           // Compute P[Br,Bc]@V[Bc,d] = O[Br,d] 
+          // For R_S[1][8][2], mapping the layout below of P matrix.
+          // MMA = m16n8k16, Br=16x4=64, Bc=8x8=64, layout: 4 warps
+          // |   64x64   |      warp_KV 0       |
+          // | warp_QP 0 | MMA 0 ... MMA 0 (x8) |
+          // | warp_QP 1 | MMA 1 ... MMA 1 (x8) |
+          // | warp_QP 2 | MMA 2 ... MMA 2 (x8) |
+          // | warp_QP 3 | MMA 3 ... MMA 3 (x8) |
+          // tile_V_Bc = 0, all curr MMAs(0~4) need slice P[:,  0:16], 0, 1; stored in all MMAs.
+          // tile_V_Bc = 1, all curr MMAs(0~4) need slice P[:, 16:32], 2, 3; stored in all MMAs.
+          // tile_V_Bc = 2, all curr MMAs(0~4) need slice P[:, 32:48], 4, 5; stored in all MMAs. 
+          // tile_V_Bc = 3, all curr MMAs(0~4) need slice P[:, 48:64], 6, 7; stored in all MMAs. 
           const int p_offset = tile_V_Bc * 2; // MMA(Warp) selected, 0, 2, 4, 6
           const int v_offset = (kRegPipeKV) ? reg_ld_idx : 0;
           if constexpr (kMmaAccFloat32PV) {
@@ -546,6 +578,21 @@ ffpa_mma_stages_split_q_L1_large_d_template(
           // the next V tile g2s overwrite.
           __syncthreads();
         }
+        // according to the A matrix layout for MMA m16n8k16 instruction. 
+        // reference: https://docs.nvidia.com/cuda/parallel-thread-execution/index.html
+        // #matrix-fragments-for-mma-m16n8k16-with-floating-point-type
+        // The layout of the fragments held by different threads for A matrix with .f16.
+        // R\C  0    1    2    3    4    5    6    7    8    9   10   11   12   13   14   15
+        // 0    T0: {a0, a1}  T1: {a0, a1}  T2: {a0, a1}  T3: {a0, a1}  T0: {a4, a5}  T1: {a4, a5}  T2: {a4, a5}  T3: {a4, a5}
+        // 1    T4: {a0, a1}  T5: {a0, a1}  T6: {a0, a1}  T7: {a0, a1}  T4: {a4, a5}  T5: {a4, a5}  T6: {a4, a5}  T7: {a4, a5}
+        // 2    (dashed arrow pointing right)
+        // ...
+        // 7    T28: {a0, a1}  T29: {a0, a1}  T30: {a0, a1}  T31: {a0, a1}  T28: {a4, a5}  T29: {a4, a5}  T30: {a4, a5}  T31: {a4, a5}
+        // 8    T0: {a2, a3}   T1: {a2, a3}   T2: {a2, a3}   T3: {a2, a3}   T0: {a6, a7}   T1: {a6, a7}   T2: {a6, a7}   T3: {a6, a7}
+        // 9    T4: {a2, a3}   T5: {a2, a3}   T6: {a2, a3}   T7: {a2, a3}   T4: {a6, a7}   T5: {a6, a7}   T6: {a6, a7}   T7: {a6, a7}
+        // 10   (dashed arrow pointing right)
+        // ...
+        // 15   T28: {a2, a3}  T29: {a2, a3}  T30: {a2, a3}  T31: {a2, a3}  T28: {a6, a7}  T29: {a6, a7}  T30: {a6, a7}  T31: {a6, a7}
 
         // Now, we get [Br,8] slice of [Br,d], each warp(MMA) contains m16n8.
         // 0. Rescale O: Online rescaling O each tile_K_seqlen step, need m_new, m_old.
@@ -883,6 +930,13 @@ ffpa_mma_stages_split_q_L1_small_d_template(
       cp_async::commit_group();
     }
 
+    // MMA = m16n8k16, Br=16x4=64, Bc=8x8=64, layout: 4 warps
+    // |   64x64   |      warp_KV 0       |
+    // | warp_QP 0 | MMA 0 ... MMA 0 (x8) |
+    // | warp_QP 1 | MMA 1 ... MMA 1 (x8) |
+    // | warp_QP 2 | MMA 2 ... MMA 2 (x8) |
+    // | warp_QP 3 | MMA 3 ... MMA 3 (x8) |
+
     // Online safe softmax, warp/block reduce max/sum, row wise
     float lane_row_max_new[kValueTileSeqLenQ][2]; // [1][2]
     float lane_row_sum_new[kValueTileSeqLenQ][2]; // [1][2]
@@ -890,6 +944,20 @@ ffpa_mma_stages_split_q_L1_small_d_template(
     utils::fill_2D_regs<float, kValueTileSeqLenQ, 2>(lane_row_sum_new, 0.0f);
 
     static_assert(kValueTileSeqLenQ == 1);
+    // reference: https://docs.nvidia.com/cuda/parallel-thread-execution/index.html
+    // #matrix-fragments-for-mma-m16n8k16-with-floating-point-type
+    // The layout of the fragments held by different threads for C. (m16n8k16)
+    // Row\Col  0    1    2    3    4    5    6    7
+    // 0        T0: {c0, c1}  T1: {c0, c1}  T2: {c0, c1}  T3: {c0, c1}
+    // 1        T4: {c0, c1}  T5: {c0, c1}  T6: {c0, c1}  T7: {c0, c1}
+    // 2        ...
+    // ...
+    // 7        T28: {c0, c1}  T29: {c0, c1}  T30: {c0, c1}  T31: {c0, c1}
+    // 8        T0: {c2, c3}   T1: {c2, c3}   T2: {c2, c3}   T3: {c2, c3}
+    // 9        T4: {c2, c3}   T5: {c2, c3}   T6: {c2, c3}   T7: {c2, c3}
+    // 10       ...
+    // ...
+    // 15       T28: {c2, c3}  T29: {c2, c3}  T30: {c2, c3}  T31: {c2, c3}
     prefill::sync_online_safe_softmax<kValueTileSeqLenK, kMmaAccFloat32QK>(
       &R_S[0][0][0], scale, &lane_row_max_new[0][0], &lane_row_sum_new[0][0],
       &lane_block_row_max_old[0][0], &lane_block_row_sum_old[0][0]
@@ -914,6 +982,22 @@ ffpa_mma_stages_split_q_L1_small_d_template(
       } // end if (tile_K_seqlen + 1) < Tc
     }
     
+    // according to the A matrix layout for MMA m16n8k16 instruction. 
+    // reference: https://docs.nvidia.com/cuda/parallel-thread-execution/index.html
+    // #matrix-fragments-for-mma-m16n8k16-with-floating-point-type
+    // The layout of the fragments held by different threads for A matrix with .f16.
+    // R\C  0    1    2    3    4    5    6    7    8    9   10   11   12   13   14   15
+    // 0    T0: {a0, a1}  T1: {a0, a1}  T2: {a0, a1}  T3: {a0, a1}  T0: {a4, a5}  T1: {a4, a5}  T2: {a4, a5}  T3: {a4, a5}
+    // 1    T4: {a0, a1}  T5: {a0, a1}  T6: {a0, a1}  T7: {a0, a1}  T4: {a4, a5}  T5: {a4, a5}  T6: {a4, a5}  T7: {a4, a5}
+    // 2    (dashed arrow pointing right)
+    // ...
+    // 7    T28: {a0, a1}  T29: {a0, a1}  T30: {a0, a1}  T31: {a0, a1}  T28: {a4, a5}  T29: {a4, a5}  T30: {a4, a5}  T31: {a4, a5}
+    // 8    T0: {a2, a3}   T1: {a2, a3}   T2: {a2, a3}   T3: {a2, a3}   T0: {a6, a7}   T1: {a6, a7}   T2: {a6, a7}   T3: {a6, a7}
+    // 9    T4: {a2, a3}   T5: {a2, a3}   T6: {a2, a3}   T7: {a2, a3}   T4: {a6, a7}   T5: {a6, a7}   T6: {a6, a7}   T7: {a6, a7}
+    // 10   (dashed arrow pointing right)
+    // ...
+    // 15   T28: {a2, a3}  T29: {a2, a3}  T30: {a2, a3}  T31: {a2, a3}  T28: {a6, a7}  T29: {a6, a7}  T30: {a6, a7}  T31: {a6, a7}
+
     static_assert(kValueTileSeqLenP == 1);
     {
       float rescale_o_factor_0[1];
@@ -980,6 +1064,17 @@ ffpa_mma_stages_split_q_L1_small_d_template(
             }
           }
           // Compute P[Br,Bc]@V[Bc,d] = O[Br,d] 
+          // For R_S[1][8][2], mapping the layout below of P matrix.
+          // MMA = m16n8k16, Br=16x4=64, Bc=8x8=64, layout: 4 warps
+          // |   64x64   |      warp_KV 0       |
+          // | warp_QP 0 | MMA 0 ... MMA 0 (x8) |
+          // | warp_QP 1 | MMA 1 ... MMA 1 (x8) |
+          // | warp_QP 2 | MMA 2 ... MMA 2 (x8) |
+          // | warp_QP 3 | MMA 3 ... MMA 3 (x8) |
+          // tile_V_Bc = 0, all curr MMAs(0~4) need slice P[:,  0:16], 0, 1; stored in all MMAs.
+          // tile_V_Bc = 1, all curr MMAs(0~4) need slice P[:, 16:32], 2, 3; stored in all MMAs.
+          // tile_V_Bc = 2, all curr MMAs(0~4) need slice P[:, 32:48], 4, 5; stored in all MMAs. 
+          // tile_V_Bc = 3, all curr MMAs(0~4) need slice P[:, 48:64], 6, 7; stored in all MMAs. 
           const int p_offset = tile_V_Bc * 2; // MMA(Warp) selected, 0, 2, 4, 6
           const int v_offset = ((kPersistVs2r) ? tile_V_Bc : 
                                 ((kRegPipeKV) ? reg_ld_idx : 0));
