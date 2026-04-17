@@ -46,15 +46,12 @@ q = torch.randn(B, H, N, D, dtype=torch.bfloat16, device="cuda")
 k = torch.randn(B, H, N, D, dtype=torch.bfloat16, device="cuda")
 v = torch.randn(B, H, N, D, dtype=torch.bfloat16, device="cuda")
 
-# FFPA prefill attention; layout follows SDPA: (B, H, N, D).
+# FFPA self attention; layout follows SDPA: (B, H, N, D).
 out = ffpa_attn_func(q, k, v)  # -> torch.Tensor of shape (B, H, N, D)
 print(out.shape, out.dtype)
 
-# Accuracy check against PyTorch SDPA (same bf16 dtype).
 ref = F.scaled_dot_product_attention(q, k, v)
-max_abs = (out - ref).abs().max().item()
-mean_abs = (out - ref).abs().mean().item()
-print(f"vs SDPA: max_abs_err={max_abs:.4e}, mean_abs_err={mean_abs:.4e}")
+print(f"vs SDPA max_abs_err={(out - ref).abs().max().item():.4e}")
 ```
 
 **Cross-Attention** or **Decoding-Attention** example (short query, long KV cache; `Nq != Nkv`):
@@ -75,7 +72,7 @@ out = ffpa_attn_func(q, k, v)  # -> (B, H, Nq, D) = (1, 8, 128, 512)
 print(out.shape, out.dtype)
 
 ref = F.scaled_dot_product_attention(q, k, v)
-print(f"cross-attn vs SDPA max_abs_err={(out - ref).abs().max().item():.4e}")
+print(f"vs SDPA max_abs_err={(out - ref).abs().max().item():.4e}")
 ```
 
 A runnable end-to-end example (with SDPA accuracy/perf comparison, both aligned N=8192 and non-aligned N=8191 cases) is provided under [`examples/run_ffpa_attn.py`](./examples/run_ffpa_attn.py):
