@@ -1,9 +1,10 @@
 #pragma once
-#include "cuffpa/mma.cuh"       // ffpa::mma
-#include "cuffpa/warp.cuh"      // ffpa::warp
-#include "cuffpa/swizzle.cuh"   // ffpa::swizzle
-#include "cuffpa/cp_async.cuh"  // ffpa::cp_async
-#include "cuffpa/utils.cuh"     // ffpa::utils
+#include "cuffpa/mma.cuh"           // ffpa::mma
+#include "cuffpa/dtype_traits.cuh"  // ffpa::DtypeTraits
+#include "cuffpa/warp.cuh"          // ffpa::warp
+#include "cuffpa/swizzle.cuh"       // ffpa::swizzle
+#include "cuffpa/cp_async.cuh"      // ffpa::cp_async
+#include "cuffpa/utils.cuh"         // ffpa::utils
 
 namespace ffpa {
 namespace prefill {
@@ -143,15 +144,14 @@ __device__ __forceinline__ void check_small_d_compiling_states() {
 }
 
 template <const int BrOrBc, const int kTileSize, const int kHeadDim, const int kMmaAtomK,
-          const int kNumThreads,
-          const int kPad>
+          const int kNumThreads, const int kPad, typename kDataType = __half>
 __device__ __forceinline__ void cp_async_qkv_g2s(
-    uint32_t smem_base_ptr,  // QKV smem base ptr
-    const half* gmem_ptr,    // QKV gmem ptr
-    const int gmem_offset,   // QKV gmem_offset
-    const int n_tile_id,     // seqlen offset, Q_tile_id * Br, tile_K_seqlen * Bc
-    const int d_tile_id,     // headdim offset, tile_K_d * kMmaAtomK, tile_V_d * kMmaAtomN * 2
-    const int stage          // stage * QKV tile_size
+    uint32_t smem_base_ptr,     // QKV smem base ptr
+    const kDataType* gmem_ptr,  // QKV gmem ptr
+    const int gmem_offset,      // QKV gmem_offset
+    const int n_tile_id,        // seqlen offset, Q_tile_id * Br, tile_K_seqlen * Bc
+    const int d_tile_id,        // headdim offset, tile_K_d * kMmaAtomK, tile_V_d * kMmaAtomN * 2
+    const int stage             // stage * QKV tile_size
 ) {
   // QK: tile_K_d < (kHeadDim / kMmaAtomK)
   //  V: tile_V_d < (kHeadDim / kMmaAtomN * 2)
@@ -180,15 +180,14 @@ __device__ __forceinline__ void cp_async_qkv_g2s(
          (stage * kTileSize + load_smem_BrOrBc * (kMmaAtomK + kPad) +
           (kSwizzle ? swizzle::permuted<kMmaAtomK>(load_smem_BrOrBc, load_smem_d + i)
                     : load_smem_d + i)) *
-             sizeof(half));
+             sizeof(kDataType));
     cp_async::cp_async<16>(load_smem_ptr, &(gmem_ptr[load_gmem_addr + i]));
   }
   // cp_async::commit_group();
 }
 
 template <const int kTrans, const int kNumRegs, const int kTileSize, const int kMmaAtomM,
-          const int kMmaAtomN, const int kMmaAtomK,
-          const int kPad>
+          const int kMmaAtomN, const int kMmaAtomK, const int kPad, typename kDataType = __half>
 __device__ __forceinline__ void sync_fetch_qkv_frags_s2r(
     uint32_t smem_base_ptr,  // QKV smem base ptr
     uint32_t* R,             // Register ptr, R_QKV
@@ -210,7 +209,7 @@ __device__ __forceinline__ void sync_fetch_qkv_frags_s2r(
         (smem_base_ptr +
          (stage * kTileSize + lane_smem_Bc * (kMmaAtomN * 2 + kPad) +
           (kSwizzle ? swizzle::permuted<kMmaAtomN * 2>(lane_smem_Bc, lane_smem_d) : lane_smem_d)) *
-             sizeof(half));
+             sizeof(kDataType));
     mma::ldmatrix_m8n8x2_trans(&R[0], &R[1], lane_smem_ptr);
   } else {
     static_assert(kNumRegs == 2 || kNumRegs == 4);
@@ -225,7 +224,7 @@ __device__ __forceinline__ void sync_fetch_qkv_frags_s2r(
           (smem_base_ptr +
            (stage * kTileSize + lane_smem_Br * (kMmaAtomK + kPad) +
             (kSwizzle ? swizzle::permuted<kMmaAtomK>(lane_smem_Br, lane_smem_d) : lane_smem_d)) *
-               sizeof(half));
+               sizeof(kDataType));
       mma::ldmatrix_m8n8x4(&R[0], &R[1], &R[2], &R[3], lane_smem_ptr);
     } else {
       // load K m8n8x2 via ldmatrix.x2
@@ -238,13 +237,13 @@ __device__ __forceinline__ void sync_fetch_qkv_frags_s2r(
           (smem_base_ptr +
            (stage * kTileSize + lane_smem_Bc * (kMmaAtomK + kPad) +
             (kSwizzle ? swizzle::permuted<kMmaAtomK>(lane_smem_Bc, lane_smem_d) : lane_smem_d)) *
-               sizeof(half));
+               sizeof(kDataType));
       mma::ldmatrix_m8n8x2(&R[0], &R[1], lane_smem_ptr);
     }
   }
 }
 
-template <const int kValTileSeqLenK, const int kMmaAccFloat32>
+template <const int kValTileSeqLenK, const int kMmaAccFloat32, typename kDataType = __half>
 __device__ __forceinline__ void sync_online_safe_softmax(
     uint32_t* R_S,                  // &R_S[0][0][0]
     const float scale,              // 1 / sqrt(d)
@@ -253,6 +252,7 @@ __device__ __forceinline__ void sync_online_safe_softmax(
     float* lane_block_row_max_old,  // &lane_block_row_max_old[0][0]
     float* lane_block_row_sum_old   // &lane_block_row_sum_old[0][0]
 ) {
+  using Traits = DtypeTraits<kDataType>;
   if constexpr (kMmaAccFloat32) {
     // Row max for [Br,Bc] tile, Thread -> Warp -> Block.
     {  // kValTileSeqLenQ = 1
@@ -289,7 +289,7 @@ __device__ __forceinline__ void sync_online_safe_softmax(
         // R_S[][][4] 4 32bit registers with each contains 1 F32 element.
         // (x,y) 0~7->{c0, c1}, (z,w)->8~15 {c2, c3}
         float* t_fptr_S_0_1 = reinterpret_cast<float*>(R_S + j * 4);
-        half* t_hptr_S_0_1 = reinterpret_cast<half*>(R_S + j * 4);
+        kDataType* t_hptr_S_0_1 = reinterpret_cast<kDataType*>(R_S + j * 4);
         // P = Exp(S - m_new), fmaf(x, y, z) = x * y + z in registers;
         t_fptr_S_0_1[0] = __expf(__fmaf_rn(t_fptr_S_0_1[0], scale, -block_row_max_new_0));
         t_fptr_S_0_1[1] = __expf(__fmaf_rn(t_fptr_S_0_1[1], scale, -block_row_max_new_0));
@@ -298,11 +298,11 @@ __device__ __forceinline__ void sync_online_safe_softmax(
         lane_row_sum_new[0] += (t_fptr_S_0_1[0] + t_fptr_S_0_1[1]);
         lane_row_sum_new[1] += (t_fptr_S_0_1[2] + t_fptr_S_0_1[3]);
         // Update R_S for P[Br,Bc] = Exp(S-m), point wise.
-        // Also convert F32 -> half for P@V MMA, reuse R_S as P.
-        t_hptr_S_0_1[0] = __float2half_rn(t_fptr_S_0_1[0]);
-        t_hptr_S_0_1[1] = __float2half_rn(t_fptr_S_0_1[1]);
-        t_hptr_S_0_1[2] = __float2half_rn(t_fptr_S_0_1[2]);
-        t_hptr_S_0_1[3] = __float2half_rn(t_fptr_S_0_1[3]);
+        // Also convert F32 -> kDataType for P@V MMA, reuse R_S as P.
+        t_hptr_S_0_1[0] = Traits::from_float(t_fptr_S_0_1[0]);
+        t_hptr_S_0_1[1] = Traits::from_float(t_fptr_S_0_1[1]);
+        t_hptr_S_0_1[2] = Traits::from_float(t_fptr_S_0_1[2]);
+        t_hptr_S_0_1[3] = Traits::from_float(t_fptr_S_0_1[3]);
       }  // end for kValTileSeqLenK
 
       // Warp level reduce sum, warp_size = 4
@@ -311,16 +311,20 @@ __device__ __forceinline__ void sync_online_safe_softmax(
     }
 
   } else {
-    // MMA Acc F16
+    // MMA Acc F16 (only valid when kDataType == __half; bf16 forces kMmaAccFloat32==1).
+    static_assert(std::is_same_v<kDataType, __half>,
+                  "MMA Acc F16 path is only valid for __half activation dtype.");
     // Row max for [Br,Bc] tile, Thread -> Warp -> Block.
     {  // kValTileSeqLenQ = 1
 // Thread level reduce max across kValTileSeqLenK dim, namely Bc.
 #pragma unroll
       for (int j = 0; j < kValTileSeqLenK; ++j) {
-        const half* t_hptr_S_0_1 = reinterpret_cast<half*>(R_S + j * 2);
+        const kDataType* t_hptr_S_0_1 = reinterpret_cast<kDataType*>(R_S + j * 2);
         // This should be the row max after S = (Q @ K^T) / sqrt(d)
-        const float tmp_max_0 = __half2float(__hmax(t_hptr_S_0_1[0], t_hptr_S_0_1[1])) * scale;
-        const float tmp_max_1 = __half2float(__hmax(t_hptr_S_0_1[2], t_hptr_S_0_1[3])) * scale;
+        const float tmp_max_0 =
+            Traits::to_float(Traits::hmax(t_hptr_S_0_1[0], t_hptr_S_0_1[1])) * scale;
+        const float tmp_max_1 =
+            Traits::to_float(Traits::hmax(t_hptr_S_0_1[2], t_hptr_S_0_1[3])) * scale;
         lane_row_max_new[0] = max(lane_row_max_new[0], tmp_max_0);
         lane_row_max_new[1] = max(lane_row_max_new[1], tmp_max_1);
       }  // end for kValTileSeqLenK
@@ -341,24 +345,24 @@ __device__ __forceinline__ void sync_online_safe_softmax(
 
 #pragma unroll
       for (int j = 0; j < kValTileSeqLenK; ++j) {
-        half* t_hptr_S_0_1 = reinterpret_cast<half*>(R_S + j * 2);
+        kDataType* t_hptr_S_0_1 = reinterpret_cast<kDataType*>(R_S + j * 2);
         // P = Exp(S - m_new), fmaf(x, y, z) = x * y + z;
         float4 t_reg_S_0_1;
         t_reg_S_0_1.x =
-            __expf(__fmaf_rn(__half2float(t_hptr_S_0_1[0]), scale, -block_row_max_new_0));
+            __expf(__fmaf_rn(Traits::to_float(t_hptr_S_0_1[0]), scale, -block_row_max_new_0));
         t_reg_S_0_1.y =
-            __expf(__fmaf_rn(__half2float(t_hptr_S_0_1[1]), scale, -block_row_max_new_0));
+            __expf(__fmaf_rn(Traits::to_float(t_hptr_S_0_1[1]), scale, -block_row_max_new_0));
         t_reg_S_0_1.z =
-            __expf(__fmaf_rn(__half2float(t_hptr_S_0_1[2]), scale, -block_row_max_new_1));
+            __expf(__fmaf_rn(Traits::to_float(t_hptr_S_0_1[2]), scale, -block_row_max_new_1));
         t_reg_S_0_1.w =
-            __expf(__fmaf_rn(__half2float(t_hptr_S_0_1[3]), scale, -block_row_max_new_1));
+            __expf(__fmaf_rn(Traits::to_float(t_hptr_S_0_1[3]), scale, -block_row_max_new_1));
         lane_row_sum_new[0] += (t_reg_S_0_1.x + t_reg_S_0_1.y);
         lane_row_sum_new[1] += (t_reg_S_0_1.z + t_reg_S_0_1.w);
         // Update R_S for P[Br,Bc] = Exp(S-m), point wise.
-        t_hptr_S_0_1[0] = __float2half_rn(t_reg_S_0_1.x);
-        t_hptr_S_0_1[1] = __float2half_rn(t_reg_S_0_1.y);
-        t_hptr_S_0_1[2] = __float2half_rn(t_reg_S_0_1.z);
-        t_hptr_S_0_1[3] = __float2half_rn(t_reg_S_0_1.w);
+        t_hptr_S_0_1[0] = Traits::from_float(t_reg_S_0_1.x);
+        t_hptr_S_0_1[1] = Traits::from_float(t_reg_S_0_1.y);
+        t_hptr_S_0_1[2] = Traits::from_float(t_reg_S_0_1.z);
+        t_hptr_S_0_1[3] = Traits::from_float(t_reg_S_0_1.w);
       }  // end for kValTileSeqLenK
 
       // Warp level reduce sum, warp_size = 4
@@ -390,7 +394,7 @@ __device__ __forceinline__ void sync_precompute_rescale_factors(
   rescale_o_factor_1[0] = __expf(block_row_max_old_1 - block_row_max_new_1);
 }
 
-template <const int kOStorageAccFloat32, const int kMmaAccFloat32>
+template <const int kOStorageAccFloat32, const int kMmaAccFloat32, typename kDataType = __half>
 __device__ __forceinline__ void sync_rescaling_tiling_o(
     uint32_t* R_D,                    // &R_D[0][0][0]
     uint32_t* R_O,                    // &R_O[0]
@@ -399,6 +403,7 @@ __device__ __forceinline__ void sync_rescaling_tiling_o(
     const int n_tile_id,              // tile_K_seqlen
     const int d_tile_id               // j
 ) {
+  using Traits = DtypeTraits<kDataType>;
   // Now, we get [Br,8] slice of [Br,d], each warp(MMA) contains m16n8.
   // 0. Rescale O: Online rescaling O each tile_K_seqlen step, need m_new, m_old.
   // m = max(m_old, m_new), O_new[Br,d] = exp(m_old - m) * O_old + P@V
@@ -413,40 +418,46 @@ __device__ __forceinline__ void sync_rescaling_tiling_o(
       t_fptr_D_0_1[2] = __fmaf_rn(rescale_o_factor_1[0], t_fptr_D_0_1[2], t_fptr_O_0_1[2]);
       t_fptr_D_0_1[3] = __fmaf_rn(rescale_o_factor_1[0], t_fptr_D_0_1[3], t_fptr_O_0_1[3]);
     } else {
-      half* t_hptr_D_0_1 = reinterpret_cast<half*>(R_D + d_tile_id * 2);
-      t_hptr_D_0_1[0] = __float2half_rn(
-          __fmaf_rn(rescale_o_factor_0[0], __half2float(t_hptr_D_0_1[0]), t_fptr_O_0_1[0]));
-      t_hptr_D_0_1[1] = __float2half_rn(
-          __fmaf_rn(rescale_o_factor_0[0], __half2float(t_hptr_D_0_1[1]), t_fptr_O_0_1[1]));
-      t_hptr_D_0_1[2] = __float2half_rn(
-          __fmaf_rn(rescale_o_factor_1[0], __half2float(t_hptr_D_0_1[2]), t_fptr_O_0_1[2]));
-      t_hptr_D_0_1[3] = __float2half_rn(
-          __fmaf_rn(rescale_o_factor_1[0], __half2float(t_hptr_D_0_1[3]), t_fptr_O_0_1[3]));
+      kDataType* t_hptr_D_0_1 = reinterpret_cast<kDataType*>(R_D + d_tile_id * 2);
+      t_hptr_D_0_1[0] = Traits::from_float(
+          __fmaf_rn(rescale_o_factor_0[0], Traits::to_float(t_hptr_D_0_1[0]), t_fptr_O_0_1[0]));
+      t_hptr_D_0_1[1] = Traits::from_float(
+          __fmaf_rn(rescale_o_factor_0[0], Traits::to_float(t_hptr_D_0_1[1]), t_fptr_O_0_1[1]));
+      t_hptr_D_0_1[2] = Traits::from_float(
+          __fmaf_rn(rescale_o_factor_1[0], Traits::to_float(t_hptr_D_0_1[2]), t_fptr_O_0_1[2]));
+      t_hptr_D_0_1[3] = Traits::from_float(
+          __fmaf_rn(rescale_o_factor_1[0], Traits::to_float(t_hptr_D_0_1[3]), t_fptr_O_0_1[3]));
     }
   } else {
-    // MMA Acc F16
-    const half* t_hptr_O_0_1 = reinterpret_cast<half*>(R_O);
+    // MMA Acc F16 (only valid when kDataType == __half; bf16 forces kMmaAccFloat32==1).
+    static_assert(std::is_same_v<kDataType, __half>,
+                  "MMA Acc F16 path is only valid for __half activation dtype.");
+    const kDataType* t_hptr_O_0_1 = reinterpret_cast<kDataType*>(R_O);
     if constexpr (kOStorageAccFloat32) {
       // (x,y) 0~7->{c0, c1}, (z,w)->8~15 {c2, c3} kValTileSeqLenP=1
       float* t_fptr_D_0_1 = reinterpret_cast<float*>(R_D + d_tile_id * 4);
       t_fptr_D_0_1[0] =
-          __fmaf_rn(rescale_o_factor_0[0], t_fptr_D_0_1[0], __half2float(t_hptr_O_0_1[0]));
+          __fmaf_rn(rescale_o_factor_0[0], t_fptr_D_0_1[0], Traits::to_float(t_hptr_O_0_1[0]));
       t_fptr_D_0_1[1] =
-          __fmaf_rn(rescale_o_factor_0[0], t_fptr_D_0_1[1], __half2float(t_hptr_O_0_1[1]));
+          __fmaf_rn(rescale_o_factor_0[0], t_fptr_D_0_1[1], Traits::to_float(t_hptr_O_0_1[1]));
       t_fptr_D_0_1[2] =
-          __fmaf_rn(rescale_o_factor_1[0], t_fptr_D_0_1[2], __half2float(t_hptr_O_0_1[2]));
+          __fmaf_rn(rescale_o_factor_1[0], t_fptr_D_0_1[2], Traits::to_float(t_hptr_O_0_1[2]));
       t_fptr_D_0_1[3] =
-          __fmaf_rn(rescale_o_factor_1[0], t_fptr_D_0_1[3], __half2float(t_hptr_O_0_1[3]));
+          __fmaf_rn(rescale_o_factor_1[0], t_fptr_D_0_1[3], Traits::to_float(t_hptr_O_0_1[3]));
     } else {
-      half* t_hptr_D_0_1 = reinterpret_cast<half*>(R_D + d_tile_id * 2);
-      t_hptr_D_0_1[0] = __float2half_rn(__fmaf_rn(
-          rescale_o_factor_0[0], __half2float(t_hptr_D_0_1[0]), __half2float(t_hptr_O_0_1[0])));
-      t_hptr_D_0_1[1] = __float2half_rn(__fmaf_rn(
-          rescale_o_factor_0[0], __half2float(t_hptr_D_0_1[1]), __half2float(t_hptr_O_0_1[1])));
-      t_hptr_D_0_1[2] = __float2half_rn(__fmaf_rn(
-          rescale_o_factor_1[0], __half2float(t_hptr_D_0_1[2]), __half2float(t_hptr_O_0_1[2])));
-      t_hptr_D_0_1[3] = __float2half_rn(__fmaf_rn(
-          rescale_o_factor_1[0], __half2float(t_hptr_D_0_1[3]), __half2float(t_hptr_O_0_1[3])));
+      kDataType* t_hptr_D_0_1 = reinterpret_cast<kDataType*>(R_D + d_tile_id * 2);
+      t_hptr_D_0_1[0] =
+          Traits::from_float(__fmaf_rn(rescale_o_factor_0[0], Traits::to_float(t_hptr_D_0_1[0]),
+                                       Traits::to_float(t_hptr_O_0_1[0])));
+      t_hptr_D_0_1[1] =
+          Traits::from_float(__fmaf_rn(rescale_o_factor_0[0], Traits::to_float(t_hptr_D_0_1[1]),
+                                       Traits::to_float(t_hptr_O_0_1[1])));
+      t_hptr_D_0_1[2] =
+          Traits::from_float(__fmaf_rn(rescale_o_factor_1[0], Traits::to_float(t_hptr_D_0_1[2]),
+                                       Traits::to_float(t_hptr_O_0_1[2])));
+      t_hptr_D_0_1[3] =
+          Traits::from_float(__fmaf_rn(rescale_o_factor_1[0], Traits::to_float(t_hptr_D_0_1[3]),
+                                       Traits::to_float(t_hptr_O_0_1[3])));
     }
   }
 }
@@ -470,11 +481,12 @@ __device__ __forceinline__ void sync_update_max_expsum(
   lane_block_row_max_old[1] = max(lane_block_row_max_old[1], lane_row_max_new[1]);
 }
 
-template <const int kValTileHeadDimV, const int kOStorageAccFloat32>
+template <const int kValTileHeadDimV, const int kOStorageAccFloat32, typename kDataType = __half>
 __device__ __forceinline__ void sync_rescaling_final_o(
     uint32_t* R_D,                       // Final O after loop over N
     const float* lane_block_row_sum_old  // &lane_block_row_sum_old[0][0]
 ) {
+  using Traits = DtypeTraits<kDataType>;
   // Finaly, we still have to rescale O once more.
   // O_output(D) = ( 1/l_final ) * O_final (FA2 paper)
   // static_assert(kValTileSeqLenP == 1);
@@ -483,30 +495,29 @@ __device__ __forceinline__ void sync_rescaling_final_o(
     const float rescale_factor_1 = __frcp_rn(lane_block_row_sum_old[1]);
 #pragma unroll
     for (int j = 0; j < kValTileHeadDimV; ++j) {  // 8, 16, 32, ...
-      // Scaling in registers & convert F32 -> half for O collective store.
+      // Scaling in registers & convert F32 -> kDataType for O collective store.
       if constexpr (kOStorageAccFloat32) {
         const float* t_fptr_D_0_1 = reinterpret_cast<float*>(R_D + j * 4);
-        half* t_hptr_D_0_1 = reinterpret_cast<half*>(R_D + j * 4);
-        t_hptr_D_0_1[0] = __float2half_rn(rescale_factor_0 * t_fptr_D_0_1[0]);
-        t_hptr_D_0_1[1] = __float2half_rn(rescale_factor_0 * t_fptr_D_0_1[1]);
-        t_hptr_D_0_1[2] = __float2half_rn(rescale_factor_1 * t_fptr_D_0_1[2]);
-        t_hptr_D_0_1[3] = __float2half_rn(rescale_factor_1 * t_fptr_D_0_1[3]);
+        kDataType* t_hptr_D_0_1 = reinterpret_cast<kDataType*>(R_D + j * 4);
+        t_hptr_D_0_1[0] = Traits::from_float(rescale_factor_0 * t_fptr_D_0_1[0]);
+        t_hptr_D_0_1[1] = Traits::from_float(rescale_factor_0 * t_fptr_D_0_1[1]);
+        t_hptr_D_0_1[2] = Traits::from_float(rescale_factor_1 * t_fptr_D_0_1[2]);
+        t_hptr_D_0_1[3] = Traits::from_float(rescale_factor_1 * t_fptr_D_0_1[3]);
       } else {
-        half* t_hptr_D_0_1 = reinterpret_cast<half*>(R_D + j * 2);
-        t_hptr_D_0_1[0] = __float2half_rn(rescale_factor_0 * __half2float(t_hptr_D_0_1[0]));
-        t_hptr_D_0_1[1] = __float2half_rn(rescale_factor_0 * __half2float(t_hptr_D_0_1[1]));
-        t_hptr_D_0_1[2] = __float2half_rn(rescale_factor_1 * __half2float(t_hptr_D_0_1[2]));
-        t_hptr_D_0_1[3] = __float2half_rn(rescale_factor_1 * __half2float(t_hptr_D_0_1[3]));
+        kDataType* t_hptr_D_0_1 = reinterpret_cast<kDataType*>(R_D + j * 2);
+        t_hptr_D_0_1[0] = Traits::from_float(rescale_factor_0 * Traits::to_float(t_hptr_D_0_1[0]));
+        t_hptr_D_0_1[1] = Traits::from_float(rescale_factor_0 * Traits::to_float(t_hptr_D_0_1[1]));
+        t_hptr_D_0_1[2] = Traits::from_float(rescale_factor_1 * Traits::to_float(t_hptr_D_0_1[2]));
+        t_hptr_D_0_1[3] = Traits::from_float(rescale_factor_1 * Traits::to_float(t_hptr_D_0_1[3]));
       }
     }  // end for kValTileHeadDimV
   }  // end for kValTileSeqLenP = 1
 }
 
 template <const int Br, const int kHeadDim, const int kMmaAtomM, const int kMmaAtomN,
-          const int kValTileHeadDimV,
-          const int kOStorageAccFloat32>
+          const int kValTileHeadDimV, const int kOStorageAccFloat32, typename kDataType = __half>
 __device__ __forceinline__ void sync_store_o_r2g(
-    half* gmem_ptr,         // O gmem ptr
+    kDataType* gmem_ptr,    // O gmem ptr
     const int gmem_offset,  // O gmem global offset
     const int n_tile_id,    // curr tile id (seqlen) O_tile_id
     const int mma_tile_id,  // Q warp_QP 0~num MMAs, KV warp_KV 0
