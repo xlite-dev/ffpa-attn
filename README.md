@@ -1,10 +1,8 @@
 <div align="center">
   <p align="center">
-    <h2>🤖FFPA(Split-D): Yet another Faster Flash Prefill Attention with O(1)⚡️GPU SRAM complexity for large headdim🐑</h2>
+    <h2>🤖FFPA(Split-D): Yet another Faster Flash Prefill Attention <br>with O(1)⚡️GPU SRAM complexity for large headdim🐑</h2>
     <a href="https://zhuanlan.zhihu.com/p/13975660308">📚FFPA(Split-D) Blog</a> | <a href="./bench/README.md#bench-l20"> 📈L20 ~1.9x↑🎉 </a> | <a href="./bench/README.md#bench-a30"> 📈A30 ~1.8x↑🎉 </a> | <a href="./bench/README.md#bench-3080"> 📈3080 ~2.9x↑🎉 </a> | <a href="./bench/README.md#bench-4090"> 📈4090 ~2.1x↑🎉 </a>
   </p>
-  <img src='https://github.com/user-attachments/assets/447e2937-f7c8-47c8-8550-8c0c71b910e6' width="411px">
-  <img src='https://github.com/user-attachments/assets/65a8d564-8fa7-4d66-86b9-e238feb86143' width="411px">
 </div>
 
 **FFPA(Split-D)**: Yet another **Faster Flash Prefill Attention** with **Split-D** strategy, achieve **O(1) SRAM complexity** and **O(d/4) register complexity** for large headdim (**> 256**), **1.8x~3x** 🎉 faster than SDPA. Currently, FFPA supports self-attention, cross-attention, grouped/multi-query attention, causal attention with large headdim (D=320~1024). While the standard FlashAttention-2 only support headdim <= 256.
@@ -20,17 +18,18 @@
 > [!NOTE]
 > FFPA has so far only been tested on Ampere and Ada architectures (e.g. A30, RTX 3080, L20, RTX 4090). It should also work on Hopper and other newer architectures, but performance may not be optimal there since FFPA does not yet leverage TMA for further optimization.
 
-## ©️Citations
+## 🎉 Benchmark
 
-```BibTeX
-@misc{ffpa-attn@2025,
-  title={FFPA: Yet another Faster Flash Prefill Attention for large headdim.},
-  url={https://github.com/xlite-dev/ffpa-attn.git},
-  note={Open-source software available at https://github.com/xlite-dev/ffpa-attn.git},
-  author={DefTruth},
-  year={2025}
-}
-```
+<div id="bench-4090"></div>
+
+<div align='left'>
+
+<img src='https://github.com/user-attachments/assets/447e2937-f7c8-47c8-8550-8c0c71b910e6' width="411px">
+<img src='https://github.com/user-attachments/assets/65a8d564-8fa7-4d66-86b9-e238feb86143' width="411px">
+
+</div>
+
+Please check [benchmark](./bench) directory for more details.
 
 ## 📖 Quick Start
 
@@ -193,35 +192,6 @@ By leveraging this approach, we can achieve better performance than SDPA EA for 
 
 </div>
 
-## 📖 FFPA Benchmark 🎉🎉
-
-O(2xBrx16)≈O(1) SRAM complexity, O(d/4) register complexity, the same GPU HBM memory complexity as FlashAttention. B=1, H=48, N=8192, **D=320-1024(FA2 not supported 👀)**. (Notes, *=MMA Acc F32, ^=MMA Acc F16, Softmax Acc dtype is always be F32, T=TFLOPS). Please check [benchmark](./bench) directory for more details.
-
-<div id="bench-4090"></div>
-
-<div align='center'>
-
-<p>📚 NVIDIA RTX 4090 (*=MMA Acc F32, ^=MMA Acc F16, T=TFLOPS, <b>~1.8x↑🎉</b>)</p>
-
-|Algorithm|320|384|448|512|576|640|704|768|832|896|960|1024|
-|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-|SDPA EA|81T|94T|85T|85T|79T|81T|79T|80T|79T|80T|78T|78T|
-|FFPA*|149T|150T|150T|150T|150T|140T|140T|140T|139T|139T|137T|134T|
-|Speedup|1.84x|1.6x|1.76x|1.76x|1.9x|1.73x|1.77x|1.75x|1.76x|1.74x|1.76x|1.72x|
-|FFPA^|194T|194T|189T|191T|197T|188T|184T|180T|177T|172T|171T|171T|
-|Speedup|2.4x|2.06x|2.22x|2.25x|2.49x|2.32x|2.33x|2.25x|2.24x|2.15x|2.19x|2.19x|
-
-<p>📚 NVIDIA RTX 4090 (*=MMA Acc: QK F32 + PV F16, ^=MMA Acc F16, T=TFLOPS, <b>~2.1x↑🎉</b>)</p>
-
-|Algorithm|320|384|448|512|576|640|704|768|832|896|960|1024|
-|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-|SDPA EA|82T|92T|85T|84T|78T|81T|79T|80T|78T|79T|77T|78T|
-|FFPA*|176T|170T|171T|171T|171T|161T|160T|161T|160T|158T|165T|164T|
-|Speedup|2.15x|1.85x|2.01x|2.04x|2.19x|1.99x|2.03x|2.01x|2.05x|2.0x|2.14x|2.1x|
-|FFPA^|200T|191T|189T|191T|188T|188T|186T|179T|175T|173T|172T|170T|
-|Speedup|2.44x|2.08x|2.22x|2.27x|2.41x|2.32x|2.35x|2.24x|2.24x|2.19x|2.23x|2.18x|
-
-</div>
 
 ## ©️License
 
@@ -244,6 +214,18 @@ How to contribute? Wecome to star⭐️ this repo to support me👆🏻 ~
  </picture>
 </a>
 </div>
+
+## ©️Citations
+
+```BibTeX
+@misc{ffpa-attn@2025,
+  title={FFPA: Yet another Faster Flash Prefill Attention for large headdim.},
+  url={https://github.com/xlite-dev/ffpa-attn.git},
+  note={Open-source software available at https://github.com/xlite-dev/ffpa-attn.git},
+  author={DefTruth},
+  year={2025}
+}
+```
 
 ## 📖 References
 <div id="ref"></div>
