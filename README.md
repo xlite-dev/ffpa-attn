@@ -40,7 +40,8 @@ import torch
 import torch.nn.functional as F
 from ffpa_attn import ffpa_attn_func
 
-B, H, N, D = 1, 32, 8192, 512
+# D: 32, 64, ..., 320, ..., 1024 (FA-2 <= 256, FFPA supports up to 1024).
+B, H, N, D = 1, 32, 8192, 512 # batch_size, num_heads, seq_len, head_dim
 q = torch.randn(B, H, N, D, dtype=torch.bfloat16, device="cuda")
 k = torch.randn(B, H, N, D, dtype=torch.bfloat16, device="cuda")
 v = torch.randn(B, H, N, D, dtype=torch.bfloat16, device="cuda")

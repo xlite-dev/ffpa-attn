@@ -277,18 +277,28 @@ void launch_ffpa_mma_template(torch::Tensor Q, torch::Tensor K, torch::Tensor V,
                               kPersistQg2s, kPersistQs2r, kStageQK, kStagePV, kPadQ, kPadK,
                               kPadV>();
 
-  const int QKV_batch = Q.size(0);
-  const int QKV_head = Q.size(1);
-  const int QKV_seqlen = Q.size(2);  // QKV_seqlen
-  // Seqlen no longer has to be a multiple of max(Br, Bc): the kernel now
-  // handles the tail tile via cp.async zero-fill, softmax -inf masking and
-  // a per-row store predicate. div_ceil(QKV_seqlen, Bc) below still yields
-  // the right Tc for partial last tiles.
+  TORCH_CHECK(K.size(0) == Q.size(0) && V.size(0) == Q.size(0),
+              "ffpa_attn: Q/K/V must share the same batch size");
+  TORCH_CHECK(K.size(1) == Q.size(1) && V.size(1) == Q.size(1),
+              "ffpa_attn: Q/K/V must share the same num_heads");
+  TORCH_CHECK(K.size(2) == V.size(2),
+              "ffpa_attn: K and V must have identical sequence length (Nkv)");
+  TORCH_CHECK(K.size(3) == Q.size(3) && V.size(3) == Q.size(3),
+              "ffpa_attn: Q/K/V must share the same head dim");
+  const int Nb = Q.size(0);
+  const int Nh = Q.size(1);
+  // Cross-attention: Q seqlen (Nq) may differ from KV seqlen (Nkv).
+  const int Nq = Q.size(2);
+  const int Nkv = K.size(2);
+  // Seqlen (Nq, Nkv) no longer has to be a multiple of max(Br, Bc): the
+  // kernel handles the tail tile via cp.async zero-fill, softmax -inf
+  // masking and a per-row store predicate. div_ceil(Nkv, Bc) below still
+  // yields the right Tc for partial last KV tiles.
 
   const dim3 block = getConfigBlock<kNumThreads>();  // 4/8 warps per block
-  const dim3 grid = getConfigGrid<Br>(QKV_batch, QKV_head, QKV_seqlen);
-  // Precompute softmax scale and Tc
-  const int Tc = utils::div_ceil(QKV_seqlen, Bc);  // Tc K_tile[Bc,d]
+  // grid is driven by Q row tiles; KV tile count Tc is driven by Nkv.
+  const dim3 grid = getConfigGrid<Br>(Nb, Nh, Nq);
+  const int Tc = utils::div_ceil(Nkv, Bc);  // Tc K_tile[Bc,d]
   const float scale = 1.0f / sqrt((float)kHeadDim);
 
   // Launch on the caller's current CUDA stream so the kernel participates
@@ -297,13 +307,13 @@ void launch_ffpa_mma_template(torch::Tensor Q, torch::Tensor K, torch::Tensor V,
   const c10::cuda::OptionalCUDAGuard device_guard(Q.device());
   auto stream = at::cuda::getCurrentCUDAStream();
 
-#define LAUNCH_TEMPLATE_FUNC(TEMPLATE_FUNC)                                                   \
-  cudaFuncSetAttribute(TEMPLATE_FUNC, cudaFuncAttributeMaxDynamicSharedMemorySize,            \
-                       kQKVSmemMaxSize);                                                      \
-  TEMPLATE_FUNC<<<grid, block, kQKVSmemMaxSize, stream>>>(                                    \
-      reinterpret_cast<kDataType*>(Q.data_ptr()), reinterpret_cast<kDataType*>(K.data_ptr()), \
-      reinterpret_cast<kDataType*>(V.data_ptr()), reinterpret_cast<kDataType*>(O.data_ptr()), \
-      QKV_seqlen, QKV_head, scale, Tc);
+#define LAUNCH_TEMPLATE_FUNC(TEMPLATE_FUNC)                                                       \
+  cudaFuncSetAttribute(TEMPLATE_FUNC, cudaFuncAttributeMaxDynamicSharedMemorySize,                \
+                       kQKVSmemMaxSize);                                                          \
+  TEMPLATE_FUNC<<<grid, block, kQKVSmemMaxSize, stream>>>(                                        \
+      reinterpret_cast<kDataType*>(Q.data_ptr()), reinterpret_cast<kDataType*>(K.data_ptr()),     \
+      reinterpret_cast<kDataType*>(V.data_ptr()), reinterpret_cast<kDataType*>(O.data_ptr()), Nq, \
+      Nkv, Nh, scale, Tc);
 
 #ifdef ENABLE_FFPA_PERSIST_KV_G2S
   if constexpr (kHeadDim <= kMaxDForSmallDKernel) {       // e.g > 128 will use large d kernel
