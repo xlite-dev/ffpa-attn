@@ -1,0 +1,5 @@
+# Auto-generated TUs under this directory must not be reformatted.
+# env.py regenerates them deterministically; any clang-format edit here
+# would be overwritten on the next build and produce noisy diffs.
+DisableFormat: true
+SortIncludes: false

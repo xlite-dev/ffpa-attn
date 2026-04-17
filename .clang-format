@@ -1,0 +1,28 @@
+# Root clang-format for ffpa-attn C/C++/CUDA sources.
+# The repository uses a 2-space indent style; this config codifies it so the
+# pre-commit clang-format hook stays in sync with the existing code.
+# Files under csrc/cuffpa/generated/ have a local .clang-format with
+# DisableFormat: true and will never be touched.
+# Note: clang-format treats .cu/.cuh as C++, so a single Cpp block is enough.
+Language: Cpp
+BasedOnStyle: Google
+IndentWidth: 2
+TabWidth: 2
+UseTab: Never
+ContinuationIndentWidth: 4
+ColumnLimit: 100
+AccessModifierOffset: -1
+AllowShortFunctionsOnASingleLine: Inline
+AllowShortIfStatementsOnASingleLine: false
+AllowShortLoopsOnASingleLine: false
+DerivePointerAlignment: false
+PointerAlignment: Left
+SortIncludes: false
+SpacesBeforeTrailingComments: 2
+NamespaceIndentation: None
+# clang-format's IndentPPDirectives does NOT indent `#pragma`; it only affects
+# `#if/#ifdef/#endif`. Keep it at None to avoid unintended reformatting of
+# existing `#ifdef` blocks. If you want `#pragma unroll` to visually align with
+# the following `for`, rewrite it as `_Pragma("unroll")` in the source — that
+# form is a normal statement and is indented by clang-format automatically.
+IndentPPDirectives: None
