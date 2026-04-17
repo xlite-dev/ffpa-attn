@@ -1,5 +1,13 @@
 # 📖 FFPA Benchmark 🎉🎉
 
+## Quick Start
+
+```bash
+python3 bench/bench_ffpa_attn.py --B 1 --H 48 --N 8192 --show-all --D 320
+```
+
+## Benchmark Summary
+
 <div id="bench-l20"></div>
 
 O(2xBrx16)≈O(1) SRAM complexity, O(d/4) register complexity, the same GPU HBM memory complexity as FlashAttention. B=1, H=48, N=8192, **D=320-1024(FA2 not supported 👀)**. (Notes, *=MMA Acc F32, ^=MMA Acc F16, Softmax Acc dtype is always be F32, T=TFLOPS, 👇Benchmark)
