@@ -5,14 +5,6 @@
   </p>
   <img src='https://github.com/user-attachments/assets/447e2937-f7c8-47c8-8550-8c0c71b910e6' width="411px">
   <img src='https://github.com/user-attachments/assets/65a8d564-8fa7-4d66-86b9-e238feb86143' width="411px">
-  <div align='center'>
-    <img src=https://img.shields.io/badge/Language-CUDA/Python-brightgreen.svg >
-    <img src=https://img.shields.io/github/watchers/xlite-dev/ffpa-attn?color=9cc >
-    <img src=https://img.shields.io/github/forks/xlite-dev/ffpa-attn.svg?style=social >
-    <img src=https://img.shields.io/github/stars/xlite-dev/ffpa-attn.svg?style=social >
-    <img src=https://img.shields.io/badge/Release-v0.0.2-brightgreen.svg >
-    <img src=https://img.shields.io/badge/License-GPLv3.0-turquoise.svg >
- </div>
 </div>
 
 <div align="center">
