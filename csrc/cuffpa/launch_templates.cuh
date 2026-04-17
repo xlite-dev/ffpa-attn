@@ -231,12 +231,34 @@ static constexpr int getConfigQKVSmemMaxSize() {
 #endif
 }
 
-template <typename kDataType,          // Activation dtype (__half or __nv_bfloat16).
-          const int kHeadDim,          // Headdim, 32~1024
-          const int kMmaAccFloat32QK,  // 0/1, Q@K^T, 0 MMA Acc with fp16, 1 MMA Acc with fp32.
-          const int kMmaAccFloat32PV,  // 0/1, P@V, 0 MMA Acc with fp16, 1 MMA Acc with fp32.
-          const int kStage>
-void launch_ffpa_mma_template(torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O) {
+// Host-side launcher that picks compile-time configuration (block tile,
+// stages, prefetch / share-smem flags, pad vs swizzle, etc.) based on
+// ``kHeadDim`` and build macros, then launches the correct FFPA kernel
+// template (small-d FA-2 style vs large-d split-Q) on the caller's
+// current CUDA stream. Validates Q/K/V/O shape invariants up-front via
+// ``TORCH_CHECK`` (GQA/MQA head ratio, matching Nkv / D, and the
+// ``causal => Nkv >= Nq`` rule).
+//
+// Template parameters:
+//   kDataType            Activation dtype: ``__half`` or ``__nv_bfloat16``.
+//   kHeadDim             Head dim D (32, 64, ..., 1024); selects the
+//                        small-d vs large-d kernel and the block tile.
+//   kMmaAccFloat32QK/PV  0 -> fp16 MMA accumulator, 1 -> fp32 accumulator.
+//                        Must both be 1 for bf16 activations.
+//   kStage               cp.async pipeline depth used for QK (the PV
+//                        depth is derived inside the launcher).
+//
+// Runtime arguments:
+//   Q, K, V, O     : BHND tensors as described in the kernel template docs.
+//   causal         : 0/1 runtime flag. Non-zero enables causal masking with
+//                    queries aligned to the KV tail; requires Nkv >= Nq.
+//   softmax_scale  : pre-softmax scaling factor applied to QK^T. Matches the
+//                    flash-attn naming; the Python wrapper defaults it to
+//                    ``1 / sqrt(D)`` when the caller does not supply one.
+template <typename kDataType, const int kHeadDim, const int kMmaAccFloat32QK,
+          const int kMmaAccFloat32PV, const int kStage>
+void launch_ffpa_mma_template(torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O,
+                              int causal, double softmax_scale) {
   // Q,K,V,O with [B, H, N, D] layout, B=batch, H=head, N=seqlen, D=dim
   // TODO: support BNHD layout, Q,K,V,O with [B, N, H, D] layout.
   constexpr int kMmaAtomM = 16;
@@ -279,14 +301,20 @@ void launch_ffpa_mma_template(torch::Tensor Q, torch::Tensor K, torch::Tensor V,
 
   TORCH_CHECK(K.size(0) == Q.size(0) && V.size(0) == Q.size(0),
               "ffpa_attn: Q/K/V must share the same batch size");
-  TORCH_CHECK(K.size(1) == Q.size(1) && V.size(1) == Q.size(1),
-              "ffpa_attn: Q/K/V must share the same num_heads");
+  TORCH_CHECK(K.size(1) == V.size(1), "ffpa_attn: K and V must share the same num_heads (Nh_kv)");
+  TORCH_CHECK(Q.size(1) % K.size(1) == 0,
+              "ffpa_attn: Q num_heads must be an integer multiple of K/V num_heads "
+              "(GQA/MQA group_size = Nh_q / Nh_kv)");
   TORCH_CHECK(K.size(2) == V.size(2),
               "ffpa_attn: K and V must have identical sequence length (Nkv)");
   TORCH_CHECK(K.size(3) == Q.size(3) && V.size(3) == Q.size(3),
               "ffpa_attn: Q/K/V must share the same head dim");
+  TORCH_CHECK(causal == 0 || K.size(2) >= Q.size(2),
+              "ffpa_attn: causal attention requires Nkv >= Nq (queries are "
+              "aligned to the tail of the KV sequence)");
   const int Nb = Q.size(0);
-  const int Nh = Q.size(1);
+  const int Nh = Q.size(1);     // Q head count (Nh_q); used for grid fan-out.
+  const int Nh_kv = K.size(1);  // K/V head count; Nh % Nh_kv == 0 asserted above.
   // Cross-attention: Q seqlen (Nq) may differ from KV seqlen (Nkv).
   const int Nq = Q.size(2);
   const int Nkv = K.size(2);
@@ -299,7 +327,7 @@ void launch_ffpa_mma_template(torch::Tensor Q, torch::Tensor K, torch::Tensor V,
   // grid is driven by Q row tiles; KV tile count Tc is driven by Nkv.
   const dim3 grid = getConfigGrid<Br>(Nb, Nh, Nq);
   const int Tc = utils::div_ceil(Nkv, Bc);  // Tc K_tile[Bc,d]
-  const float scale = 1.0f / sqrt((float)kHeadDim);
+  const float scale = static_cast<float>(softmax_scale);
 
   // Launch on the caller's current CUDA stream so the kernel participates
   // correctly in multi-stream pipelines. Without this the kernel would
@@ -313,7 +341,7 @@ void launch_ffpa_mma_template(torch::Tensor Q, torch::Tensor K, torch::Tensor V,
   TEMPLATE_FUNC<<<grid, block, kQKVSmemMaxSize, stream>>>(                                        \
       reinterpret_cast<kDataType*>(Q.data_ptr()), reinterpret_cast<kDataType*>(K.data_ptr()),     \
       reinterpret_cast<kDataType*>(V.data_ptr()), reinterpret_cast<kDataType*>(O.data_ptr()), Nq, \
-      Nkv, Nh, scale, Tc);
+      Nkv, Nh, Nh_kv, scale, Tc, causal);
 
 #ifdef ENABLE_FFPA_PERSIST_KV_G2S
   if constexpr (kHeadDim <= kMaxDForSmallDKernel) {       // e.g > 128 will use large d kernel

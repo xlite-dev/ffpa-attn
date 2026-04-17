@@ -11,36 +11,18 @@ namespace ffpa {
 namespace prefill {
 // prefill utils: prefetch/load QKV g2s funcs, rescale/softmax funcs etc.
 
-template <
-    const int kHeadDim,          // Headdim, 32,64,128
-    const int kMmaAtomM,         // MMA Atom M, 16
-    const int kMmaAtomN,         // MMA Atom N, 8
-    const int kMmaAtomK,         // MMA Atom K, 16
-    const int kMmaTileSeqLenQ,   // 4, more MMA(warp), M=16*4=64, Q@K^T=[Br(M), d(K)]@[d(K),  Bc(N)]
-    const int kMmaTileSeqLenK,   // 1, more MMA(warp), N=8*1 =8,  Q@K^T=[Br(M), d(K)]@[d(K),  Bc(N)]
-    const int kMmaTileSeqLenP,   // 4, more MMA(warp), M=16*4=64, P@V  =[Br(M),Bc(K)]@[Bc(K), d(N) ]
-    const int kMmaTileHeadDimV,  // 1, more MMA(warp), N=8*1 =8,  P@V  =[Br(M),Bc(K)]@[Bc(K), d(N) ]
-    const int kValTileSeqLenQ,   // 1, more values, M, Br=64*1=64, matmul M
-    const int kValTileSeqLenK,   // 8, more values, N, Bc=8*8 =64, matmul N
-    const int kValTileSeqLenP,   // 1, more values, M, Br=64*1=64, matmul M
-    const int kValTileHeadDimV,  // 8, more values, N, d=8*(1|2|3|4|...)=8|...|32|64|96|128|...
-    const int kMmaAccFloat32QK,  // 0/1, Q@K^T, 0 MMA Acc with fp16, 1 MMA Acc with fp32.
-    const int kMmaAccFloat32PV,  // 0/1, P@V, 0 MMA Acc with fp16, 1 MMA Acc with fp32.
-    const int kOStorageAccFloat32,  // 0/1, MMA Acc always be f32/f16, but O storage can be fp32 or
-                                    // half.
-    const int kPrefetchQK,          // Prefetch QK at the Appropriate Time Point.
-    const int kPrefetchPV,          // Prefetch V at the Appropriate Time Point.
-    const int kShareSmemQKV,        // QKV share the same shared memory, reuse QK smem for V.
-    const int kPersistQs2r,  // Persist load Q s2r for headdim < 320, more registers, but still keep
-                             // O(1) SRAM.
-    const int kPersistQg2s,  // Persist load Q g2s for headdim < 320, more SRAM, but still keep
-                             // register usage.
-    const int kRegPipeKV,  // Registers Ping pong double buffers for ldmatrix s2r & mma computation
-                           // overlapping.
-    const int kStageQK,    // <= 4, may apply different multi stages policy for QK and V (<=4)
-    const int kStagePV,    // <= 4, may apply different multi stages policy for QK and V (<=4)
-    const int kPadQ,       // Pad Q/K/V 0,8; 0 -> smem swizzle, > 0 -> padding
-    const int kPadK, const int kPadV>
+// Compile-time sanity checks for the large-d (D > ~128) FFPA kernel
+// template. All invariants are enforced via static_assert so a bad config
+// fails at NVCC time instead of silently producing wrong numerics. See
+// ``ffpa_stages_split_q_large_d_template`` for the full parameter contract.
+template <const int kHeadDim, const int kMmaAtomM, const int kMmaAtomN, const int kMmaAtomK,
+          const int kMmaTileSeqLenQ, const int kMmaTileSeqLenK, const int kMmaTileSeqLenP,
+          const int kMmaTileHeadDimV, const int kValTileSeqLenQ, const int kValTileSeqLenK,
+          const int kValTileSeqLenP, const int kValTileHeadDimV, const int kMmaAccFloat32QK,
+          const int kMmaAccFloat32PV, const int kOStorageAccFloat32, const int kPrefetchQK,
+          const int kPrefetchPV, const int kShareSmemQKV, const int kPersistQs2r,
+          const int kPersistQg2s, const int kRegPipeKV, const int kStageQK, const int kStagePV,
+          const int kPadQ, const int kPadK, const int kPadV>
 __device__ __forceinline__ void check_large_d_compiling_states() {
   // Matmul Layout: Q[Br,d]@K^T[d,Bc] NT, P[Br,Bc]@V[Bc,d] NN.
   // NOTE: K[Bc,d] with row major means K^T[d,Bc] in col major.
@@ -77,34 +59,19 @@ __device__ __forceinline__ void check_large_d_compiling_states() {
   static_assert(kPadV >= 0 && kPadV % 8 == 0);  // 0,8,16
 }
 
-template <
-    const int kHeadDim,          // Headdim, 32~1024
-    const int kMmaAtomM,         // MMA Atom M, 16
-    const int kMmaAtomN,         // MMA Atom N, 8
-    const int kMmaAtomK,         // MMA Atom K, 16
-    const int kMmaTileSeqLenQ,   // 4, more MMA(warp), M=16*4=64, Q@K^T=[Br(M), d(K)]@[d(K),  Bc(N)]
-    const int kMmaTileSeqLenK,   // 1, more MMA(warp), N=8*1 =8,  Q@K^T=[Br(M), d(K)]@[d(K),  Bc(N)]
-    const int kMmaTileSeqLenP,   // 4, more MMA(warp), M=16*4=64, P@V  =[Br(M),Bc(K)]@[Bc(K), d(N) ]
-    const int kMmaTileHeadDimV,  // 1, more MMA(warp), N=8*1 =8,  P@V  =[Br(M),Bc(K)]@[Bc(K), d(N) ]
-    const int kValTileSeqLenQ,   // 1, more values, M, Br=64*1=64, matmul M
-    const int kValTileSeqLenK,   // 8, more values, N, Bc=8*8 =64, matmul N
-    const int kValTileSeqLenP,   // 1, more values, M, Br=64*1=64, matmul M
-    const int kValTileHeadDimV,  // 8, more values, N, d=8*(1|2|3|4|...)=8|...|32|64|96|128|...
-    const int kMmaAccFloat32QK,  // 0/1, Q@K^T, 0 MMA Acc with fp16, 1 MMA Acc with fp32.
-    const int kMmaAccFloat32PV,  // 0/1, P@V, 0 MMA Acc with fp16, 1 MMA Acc with fp32.
-    const int kOStorageAccFloat32,  // 0/1, MMA Acc always be f32/f16, but O storage can be fp32 or
-                                    // half.
-    const int kPrefetchQK,          // Prefetch QK at the Appropriate Time Point.
-    const int kPrefetchPV,          // Prefetch V at the Appropriate Time Point.
-    const int kShareSmemQKV,        // QKV share the same shared memory, reuse QK smem for V.
-    const int kPersistQs2r,         // Persist load Q s2r for headdim <= 128, more registers.
-    const int kPersistVs2r,         // Persist load V s2r for headdim <= 128, more registers.
-    const int kRegPipeKV,  // Registers Ping pong double buffers for ldmatrix s2r & mma computation
-                           // overlapping.
-    const int kStageQK,    // <= 4, may apply different multi stages policy for QK and V (<=4)
-    const int kStagePV,    // <= 4, may apply different multi stages policy for QK and V (<=4)
-    const int kPadQ,       // Pad Q/K/V 0,8; 0 -> smem swizzle, > 0 -> padding
-    const int kPadK, const int kPadV>
+// Compile-time sanity checks for the small-d (D <= 256) FFPA kernel
+// template. Enforces the FA-2-style small-d invariants (e.g. kStageQK ==
+// kStagePV == 1, Br >= Bc, kRegPipeKV and kPersistVs2r mutually exclusive).
+// See ``ffpa_stages_split_q_small_d_template`` for the full parameter
+// contract.
+template <const int kHeadDim, const int kMmaAtomM, const int kMmaAtomN, const int kMmaAtomK,
+          const int kMmaTileSeqLenQ, const int kMmaTileSeqLenK, const int kMmaTileSeqLenP,
+          const int kMmaTileHeadDimV, const int kValTileSeqLenQ, const int kValTileSeqLenK,
+          const int kValTileSeqLenP, const int kValTileHeadDimV, const int kMmaAccFloat32QK,
+          const int kMmaAccFloat32PV, const int kOStorageAccFloat32, const int kPrefetchQK,
+          const int kPrefetchPV, const int kShareSmemQKV, const int kPersistQs2r,
+          const int kPersistVs2r, const int kRegPipeKV, const int kStageQK, const int kStagePV,
+          const int kPadQ, const int kPadK, const int kPadV>
 __device__ __forceinline__ void check_small_d_compiling_states() {
   // Matmul Layout: Q[Br,d]@K^T[d,Bc] NT, P[Br,Bc]@V[Bc,d] NN.
   // NOTE: K[Bc,d] with row major means K^T[d,Bc] in col major.
@@ -144,6 +111,20 @@ __device__ __forceinline__ void check_small_d_compiling_states() {
   static_assert(kPadV >= 0 && kPadV % 8 == 0);  // 0,8,16
 }
 
+// Async g2s (global -> shared) copy for one BrOrBc x kMmaAtomK tile of
+// Q / K / V. Uses cp.async.ca.shared.global 16B transactions, with SMEM
+// destination addressing chosen by ``kPad`` (swizzle when kPad == 0,
+// padded layout otherwise). Rows whose global index >= ``seqlen_bound``
+// are zero-filled via cp.async src-size=0 so that tail tiles with
+// N % Br != 0 or N % Bc != 0 stay correct without extra branching.
+//
+// - ``BrOrBc``    tile rows in this call (Br for Q, Bc for K/V).
+// - ``kTileSize`` byte-stride between two cp.async stages in SMEM.
+// - ``kHeadDim``  global head-dim; ``d_tile_id >= kHeadDim/kMmaAtomK``
+//                 early-returns so callers can issue fixed-length loops.
+// - ``n_tile_id`` seqlen tile index (Q_tile_id for Q, tile_K_seqlen for K/V).
+// - ``d_tile_id`` head-dim sub-tile index; clamped via the early return.
+// - ``stage``     cp.async pipeline stage (multi-buffer ring index).
 template <const int BrOrBc, const int kTileSize, const int kHeadDim, const int kMmaAtomK,
           const int kNumThreads, const int kPad, typename kDataType = __half>
 __device__ __forceinline__ void cp_async_qkv_g2s(
@@ -192,6 +173,11 @@ __device__ __forceinline__ void cp_async_qkv_g2s(
   // cp_async::commit_group();
 }
 
+// Sync s2r (shared -> register) load of one MMA fragment of Q, K, or V
+// using ``ldmatrix.sync``. Selects ``ldmatrix.m8n8.x2``, ``x2.trans``
+// (for V, emits col-major fragments consumed by P@V), or ``x4`` (for Q)
+// based on ``kTrans`` / ``kNumRegs``. SMEM addressing mirrors the g2s
+// layout (swizzle when kPad == 0, else padded).
 template <const int kTrans, const int kNumRegs, const int kTileSize, const int kMmaAtomM,
           const int kMmaAtomN, const int kMmaAtomK, const int kPad, typename kDataType = __half>
 __device__ __forceinline__ void sync_fetch_qkv_frags_s2r(
@@ -304,6 +290,85 @@ __device__ __forceinline__ void sync_apply_kv_mask(
   }
 }
 
+// Apply a causal-attention -inf mask to R_S fragments whose local KV
+// column falls strictly above the allowed causal boundary for the
+// fragment's global Q row. Called only on tiles that straddle or lie
+// beyond the causal diagonal (selected by the launcher) so no overhead
+// is paid on non-causal paths.
+//
+// Convention: queries are aligned to the *tail* of the KV sequence so
+// that global q position in KV space is ``q_pos = row + kv_offset``
+// with ``kv_offset = Nkv - Nq >= 0``. A key is visible iff
+// ``k_pos <= q_pos``. This matches the standard decoding-style causal
+// mask and degenerates to the usual triangular mask when ``Nkv == Nq``.
+//
+// The fragment-to-(row,col) mapping follows the ``m16n8k16`` C-layout
+// (same mapping used by ``sync_apply_kv_mask``):
+//   row0 = warp_QP*16 + lane_id/4,   row8 = row0 + 8
+//   col_base = (lane_id % 4) * 2,    per-j cols in [j*8+col_base, j*8+col_base+1]
+// Each thread owns four values per fragment j: {row0,c0}, {row0,c1},
+// {row8,c0}, {row8,c1}; they may share a single row threshold when the
+// tile is fully below the diagonal for one sub-row but not the other.
+template <const int kValTileSeqLenK, const int kMmaAccFloat32, typename kDataType = __half>
+__device__ __forceinline__ void sync_apply_causal_mask(
+    uint32_t* R_S,        // &R_S[0][0][0]
+    const int warp_QP,    // warp row index (matches kernel state)
+    const int Br_base,    // Q_tile_id * Br (global Q row of tile's row 0)
+    const int Bc_base,    // tile_K_seqlen * Bc (global KV col of tile's col 0)
+    const int kv_offset)  // Nkv - Nq (>= 0 enforced at launch time)
+{
+  using Traits = DtypeTraits<kDataType>;
+  const int lane_id = threadIdx.x % WARP_SIZE;
+  const int row_base = warp_QP * 16 + (lane_id / 4);
+  const int col_base = (lane_id % 4) * 2;
+  const int thresh_row0 = (Br_base + row_base) + kv_offset;
+  const int thresh_row8 = thresh_row0 + 8;
+  if constexpr (kMmaAccFloat32) {
+#pragma unroll
+    for (int j = 0; j < kValTileSeqLenK; ++j) {
+      float* t_fptr = reinterpret_cast<float*>(R_S + j * 4);
+      const int k0 = Bc_base + j * 8 + col_base;
+      const int k1 = k0 + 1;
+      if (k0 > thresh_row0)
+        t_fptr[0] = -INFINITY;
+      if (k1 > thresh_row0)
+        t_fptr[1] = -INFINITY;
+      if (k0 > thresh_row8)
+        t_fptr[2] = -INFINITY;
+      if (k1 > thresh_row8)
+        t_fptr[3] = -INFINITY;
+    }
+  } else {
+    static_assert(std::is_same_v<kDataType, __half>,
+                  "MMA Acc F16 causal mask path is only valid for __half activation dtype.");
+    const kDataType neg_inf = Traits::from_float(-INFINITY);
+#pragma unroll
+    for (int j = 0; j < kValTileSeqLenK; ++j) {
+      kDataType* t_hptr = reinterpret_cast<kDataType*>(R_S + j * 2);
+      const int k0 = Bc_base + j * 8 + col_base;
+      const int k1 = k0 + 1;
+      if (k0 > thresh_row0)
+        t_hptr[0] = neg_inf;
+      if (k1 > thresh_row0)
+        t_hptr[1] = neg_inf;
+      if (k0 > thresh_row8)
+        t_hptr[2] = neg_inf;
+      if (k1 > thresh_row8)
+        t_hptr[3] = neg_inf;
+    }
+  }
+}
+
+// Online safe-softmax step for one [Br, Bc] S fragment (FA-2 paper algo 1).
+//   1. warp-reduces a per-row max across the Bc axis.
+//   2. ``m_new = max(m_old, m_new)`` for numerical stability.
+//   3. ``P = exp(S * scale - m_new)`` written back into R_S in the
+//      activation dtype so R_S can be reused as P for the next P@V MMA.
+//   4. warp-reduces the per-row exp-sum into ``lane_row_sum_new``.
+// Caller follows up with ``sync_precompute_rescale_factors`` +
+// ``sync_update_max_expsum`` to fold the new (m, l) into the running
+// (m_old, l_old). The fp32 accumulator path works for both fp16 and
+// bf16 activations; the fp16-acc fast path requires kDataType == __half.
 template <const int kValTileSeqLenK, const int kMmaAccFloat32, typename kDataType = __half>
 __device__ __forceinline__ void sync_online_safe_softmax(
     uint32_t* R_S,                  // &R_S[0][0][0]
@@ -433,6 +498,11 @@ __device__ __forceinline__ void sync_online_safe_softmax(
   }
 }
 
+// Precompute O-rescaling factors ``exp(m_old - m_new)`` for the two
+// sub-rows owned by this lane. Factored out of the softmax step so the
+// tiling-O rescaling loop over head-dim can reuse them without repeating
+// the ``__expf`` call. On the first KV tile (``n_tile_id == 0``) m_old
+// is forced to m_new so the factor is 1 and O starts un-rescaled.
 __device__ __forceinline__ void sync_precompute_rescale_factors(
     float* rescale_o_factor_0,            // rescale factor
     float* rescale_o_factor_1,            // rescale factor
@@ -455,6 +525,11 @@ __device__ __forceinline__ void sync_precompute_rescale_factors(
   rescale_o_factor_1[0] = __expf(block_row_max_old_1 - block_row_max_new_1);
 }
 
+// Apply the rescale ``O_new = exp(m_old - m_new) * O_old + P @ V`` to
+// one [Br, 8] head-dim slice of the running O accumulator. Called inside
+// the head-dim loop of P@V so the whole O tensor is updated incrementally
+// with the latest KV-tile contribution. Supports fp32 and fp16 O storage
+// independently of the MMA accumulator dtype.
 template <const int kOStorageAccFloat32, const int kMmaAccFloat32, typename kDataType = __half>
 __device__ __forceinline__ void sync_rescaling_tiling_o(
     uint32_t* R_D,                    // &R_D[0][0][0]
@@ -523,6 +598,10 @@ __device__ __forceinline__ void sync_rescaling_tiling_o(
   }
 }
 
+// Fold the new (m_new, l_new) into the running (m_old, l_old) after O has
+// been rescaled by ``sync_rescaling_tiling_o``. Implements the FA-2
+// recurrence ``l_new = exp(m_old - m_new) * l_old + rowsum(P)`` and
+// ``m_old <- max(m_old, m_new)``.
 __device__ __forceinline__ void sync_update_max_expsum(
     float* lane_row_max_new,          // &lane_row_max_new[0][0]
     float* lane_row_sum_new,          // &lane_row_sum_new[0][0]
@@ -542,6 +621,9 @@ __device__ __forceinline__ void sync_update_max_expsum(
   lane_block_row_max_old[1] = max(lane_block_row_max_old[1], lane_row_max_new[1]);
 }
 
+// Final O scaling once the KV loop is done: ``O = (1 / l_final) * O`` and
+// cast fp32 accumulator back to the activation dtype so the collective
+// ``sync_store_o_r2g`` can emit 128-bit global stores.
 template <const int kValTileHeadDimV, const int kOStorageAccFloat32, typename kDataType = __half>
 __device__ __forceinline__ void sync_rescaling_final_o(
     uint32_t* R_D,                       // Final O after loop over N
@@ -575,6 +657,13 @@ __device__ __forceinline__ void sync_rescaling_final_o(
   }  // end for kValTileSeqLenP = 1
 }
 
+// Collective write-back of the final O tile from registers to gmem.
+// Uses warp-shuffles across lane_id % 4 to pack the per-thread fragment
+// layout into contiguous 128-bit vectors, then ``st.global.v4`` once per
+// (lane % 4 == 0) thread. Scratch registers ``R_Q`` / ``R_K`` are reused
+// as the shuffle staging buffers so no extra SMEM is needed. Rows with
+// global idx >= ``seqlen_bound`` are not written, keeping tail padding
+// (N % Br != 0) untouched.
 template <const int Br, const int kHeadDim, const int kMmaAtomM, const int kMmaAtomN,
           const int kValTileHeadDimV, const int kOStorageAccFloat32, typename kDataType = __half>
 __device__ __forceinline__ void sync_store_o_r2g(

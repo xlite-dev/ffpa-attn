@@ -199,7 +199,7 @@ def run_benchmark(
         if s is not None:
           perf_func(q, k, v, out, s, stages)
         else:
-          perf_func(q, k, v, out, stages)
+          perf_func(q, k, v, out, stages=stages)
       else:
         perf_func(q, k, v, out)
   else:
@@ -215,7 +215,7 @@ def run_benchmark(
         if s is not None:
           perf_func(q, k, v, out, s, stages)
         else:
-          perf_func(q, k, v, out, stages)
+          perf_func(q, k, v, out, stages=stages)
       else:
         perf_func(q, k, v, out)
   else:
