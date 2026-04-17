@@ -195,7 +195,7 @@ By leveraging this approach, we can achieve better performance than SDPA EA for 
 
 ## 📖 FFPA Benchmark 🎉🎉
 
-O(2xBrx16)≈O(1) SRAM complexity, O(d/4) register complexity, the same GPU HBM memory complexity as FlashAttention. B=1, H=48, N=8192, **D=320-1024(FA2 not supported 👀)**. (Notes, *=MMA Acc F32, ^=MMA Acc F16, Softmax Acc dtype is always be F32, T=TFLOPS). Please check [benchmark](../bench) directory for more details.
+O(2xBrx16)≈O(1) SRAM complexity, O(d/4) register complexity, the same GPU HBM memory complexity as FlashAttention. B=1, H=48, N=8192, **D=320-1024(FA2 not supported 👀)**. (Notes, *=MMA Acc F32, ^=MMA Acc F16, Softmax Acc dtype is always be F32, T=TFLOPS). Please check [benchmark](./bench) directory for more details.
 
 <div id="bench-4090"></div>
 
