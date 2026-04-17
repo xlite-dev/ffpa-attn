@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <float.h>
+#include <type_traits>
 #include <vector>
 #include <algorithm>
 #include <cuda_runtime.h>
@@ -76,6 +77,55 @@ __device__ __forceinline__ void m16n8k16_f16f16f32(uint32_t* RD0, uint32_t* RD1,
         : "=r"(RD0[0]), "=r"(RD1[0]), "=r"(RD2[0]), "=r"(RD3[0])
         : "r"(RA0[0]), "r"(RA1[0]), "r"(RA2[0]), "r"(RA3[0]), "r"(RB0[0]), "r"(RB1[0]), "r"(0),
           "r"(0), "r"(0), "r"(0));
+  }
+}
+
+template <MMAMode mma_mode = MMAMode::kInplaceUpdate>
+__device__ __forceinline__ void m16n8k16_bf16bf16f32(uint32_t* RD0, uint32_t* RD1, uint32_t* RD2,
+                                                     uint32_t* RD3, uint32_t* RA0, uint32_t* RA1,
+                                                     uint32_t* RA2, uint32_t* RA3, uint32_t* RB0,
+                                                     uint32_t* RB1) {
+  // BF16 m16n8k16 mma. BF16 hardware has only the f32-accumulated variant; no
+  // bf16-accumulated mma instruction exists, so the FFPA BF16 path always
+  // routes through this wrapper with kMmaAccFloat32QK=1 and kMmaAccFloat32PV=1.
+  if constexpr (mma_mode == MMAMode::kInplaceUpdate) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+        "{%0,  %1,  %2,  %3}, "
+        "{%4,  %5,  %6,  %7}, "
+        "{%8,  %9}, "
+        "{%10, %11, %12, %13};\n"
+        : "=r"(RD0[0]), "=r"(RD1[0]), "=r"(RD2[0]), "=r"(RD3[0])
+        : "r"(RA0[0]), "r"(RA1[0]), "r"(RA2[0]), "r"(RA3[0]), "r"(RB0[0]), "r"(RB1[0]), "r"(RD0[0]),
+          "r"(RD1[0]), "r"(RD2[0]), "r"(RD3[0]));
+  } else {
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+        "{%0,  %1,  %2,  %3}, "
+        "{%4,  %5,  %6,  %7}, "
+        "{%8,  %9}, "
+        "{%10, %11, %12, %13};\n"
+        : "=r"(RD0[0]), "=r"(RD1[0]), "=r"(RD2[0]), "=r"(RD3[0])
+        : "r"(RA0[0]), "r"(RA1[0]), "r"(RA2[0]), "r"(RA3[0]), "r"(RB0[0]), "r"(RB1[0]), "r"(0),
+          "r"(0), "r"(0), "r"(0));
+  }
+}
+
+// Dtype-dispatching wrapper over the f32-accumulated m16n8k16 mma for the
+// activation dtypes supported by FFPA (half and bfloat16). The dispatch is
+// resolved at compile time via `if constexpr`, so each specialization of the
+// kernel only emits one PTX variant.
+template <typename kDataType, MMAMode mma_mode = MMAMode::kInplaceUpdate>
+__device__ __forceinline__ void m16n8k16_abf32(uint32_t* RD0, uint32_t* RD1, uint32_t* RD2,
+                                               uint32_t* RD3, uint32_t* RA0, uint32_t* RA1,
+                                               uint32_t* RA2, uint32_t* RA3, uint32_t* RB0,
+                                               uint32_t* RB1) {
+  if constexpr (std::is_same_v<kDataType, __half>) {
+    m16n8k16_f16f16f32<mma_mode>(RD0, RD1, RD2, RD3, RA0, RA1, RA2, RA3, RB0, RB1);
+  } else {
+    static_assert(std::is_same_v<kDataType, __nv_bfloat16>,
+                  "m16n8k16_abf32 only supports __half and __nv_bfloat16.");
+    m16n8k16_bf16bf16f32<mma_mode>(RD0, RD1, RD2, RD3, RA0, RA1, RA2, RA3, RB0, RB1);
   }
 }
 

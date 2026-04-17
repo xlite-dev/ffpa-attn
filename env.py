@@ -1,6 +1,20 @@
 import os
+import re
 
 import torch
+
+# Alias table mirroring cache-dit/setup.py::CUDA_ARCH_ALIASES so users may set
+# FFPA_BUILD_ARCH to either numeric SMs or architecture names.
+_ARCH_ALIASES = {
+  "maxwell": "50",
+  "pascal": "60",
+  "volta": "70",
+  "turing": "75",
+  "ampere": "80",
+  "ada": "89",
+  "hopper": "90",
+  "blackwell": "100",
+}
 
 
 class ENV(object):
@@ -12,17 +26,12 @@ class ENV(object):
   # Enable debug mode for FFPA, fast build minimal kernels, default False.
   ENABLE_FFPA_DEBUG = bool(int(os.environ.get("ENABLE_FFPA_DEBUG", 0)))
 
-  # Enable build FFPA kernels for Ada devices (sm89, L2O, 4090, etc),
-  # default True.
-  ENABLE_FFPA_ADA = bool(int(os.environ.get("ENABLE_FFPA_ADA", 1)))
-
-  # Enable build FFPA kernels for Ampere devices (sm80, A30, A100, etc),
-  # default True.
-  ENABLE_FFPA_AMPERE = bool(int(os.environ.get("ENABLE_FFPA_AMPERE", 1)))
-
-  # Enable build FFPA kernels for Hopper devices (sm90, H100, H20, etc),
-  # default False.
-  ENABLE_FFPA_HOPPER = bool(int(os.environ.get("ENABLE_FFPA_HOPPER", 0)))
+  # Target CUDA SM architectures to compile for. When empty the current
+  # device's capability is used. Accepts a comma/semicolon/space separated
+  # list of either numeric SMs (e.g. "80,89,90") or aliases (e.g.
+  # "ampere,ada,hopper"). Mirrors cache-dit's FFPA_BUILD_ARCH / TORCH_CUDA_
+  # ARCH_LIST handling so power users can pin a specific arch set.
+  FFPA_BUILD_ARCH = os.environ.get("FFPA_BUILD_ARCH", "")
 
   # Enable all multi stages kernels or not, if True (1~4) else (1~2), default True.
   ENABLE_FFPA_ALL_STAGES = bool(int(os.environ.get("ENABLE_FFPA_ALL_STAGES", 1)))
@@ -30,7 +39,7 @@ class ENV(object):
   # Enable all headdims for FFPA kernels or not, default False.
   # True, headdim will range from 32 to 1024 with step = 32, range(32, 1024, 32)
   # False, headdim will range from 256 to 1024 with step = 64, range(256, 1024, 64)
-  ENABLE_FFPA_ALL_HEADDIM = bool(int(os.environ.get("ENABLE_FFPA_ALL_HEADDIM", 0)))
+  ENABLE_FFPA_ALL_HEADDIM = bool(int(os.environ.get("ENABLE_FFPA_ALL_HEADDIM", 1)))
 
   # Enable force Q@K^T use fp16 as MMA Acc dtype for FFPA Acc F32 kernels, default False.
   # FFPA Acc F32 kernels MMA Acc = Mixed Q@K^T MMA Acc F16 + P@V MMA Acc F32.
@@ -94,16 +103,36 @@ class ENV(object):
     return cls.ENABLE_FFPA_DEBUG
 
   @classmethod
-  def enable_ada(cls):
-    return cls.ENABLE_FFPA_ADA
+  def get_build_arch_list(cls):
+    """Resolve the SM targets for the current build.
 
-  @classmethod
-  def enable_ampere(cls):
-    return cls.ENABLE_FFPA_AMPERE
-
-  @classmethod
-  def enable_hopper(cls):
-    return cls.ENABLE_FFPA_HOPPER
+        Priority: explicit ``FFPA_BUILD_ARCH`` env -> current device capability.
+        Returns a de-duplicated list of numeric SM strings (e.g. ``['89']``).
+        """
+    raw = cls.FFPA_BUILD_ARCH
+    if raw.strip():
+      archs = []
+      for tok in re.split(r"[;,\s]+", raw):
+        norm = tok.strip().lower()
+        if not norm:
+          continue
+        norm = norm.removesuffix("+ptx")
+        norm = norm.removeprefix("sm_").removeprefix("compute_")
+        norm = norm.replace(".", "")
+        norm = _ARCH_ALIASES.get(norm, norm)
+        if norm not in archs:
+          archs.append(norm)
+      if not archs:
+        raise RuntimeError(f"FFPA_BUILD_ARCH={raw!r} parsed to an empty arch list.")
+      return archs
+    # No explicit list -> use the current device's SM capability.
+    if not torch.cuda.is_available() or torch.cuda.device_count() == 0:
+      raise RuntimeError(
+        "FFPA_BUILD_ARCH is unset and no visible CUDA device is available "
+        "to infer the target arch. Set FFPA_BUILD_ARCH=<sm list>, e.g. 80,89,90."
+      )
+    cap = torch.cuda.get_device_capability(torch.cuda.current_device())
+    return [f"{cap[0]}{cap[1]}"]
 
   @classmethod
   def enable_all_mutistages(cls):
@@ -230,9 +259,7 @@ class ENV(object):
     pretty_print_line("FFPA-ATTN ENVs")
     formatenv("PROJECT_DIR", cls.project_dir())
     formatenv("ENABLE_FFPA_DEBUG", cls.enable_debug())
-    formatenv("ENABLE_FFPA_ADA", cls.enable_ada())
-    formatenv("ENABLE_FFPA_AMPERE", cls.enable_ampere())
-    formatenv("ENABLE_FFPA_HOPPER", cls.enable_hopper())
+    formatenv("FFPA_BUILD_ARCH", ",".join(cls.get_build_arch_list()))
     formatenv("ENABLE_FFPA_ALL_STAGES", cls.enable_all_mutistages())
     formatenv("ENABLE_FFPA_ALL_HEADDIM", cls.enable_all_headdim())
     formatenv("ENABLE_FFPA_PREFETCH_QKV", cls.enable_prefetch_qkv())
@@ -323,14 +350,30 @@ class ENV(object):
     cls._write_if_changed(decls_path, cls._render_decls_header(headdims))
     generated.append(decls_path)
 
-    # ---- one TU per (headdim, acc-dtype) ----
+    # ---- two TUs per headdim, one per dtype ----
+    # Splitting fp16 and bf16 into separate TUs doubles the number of build
+    # units (N_headdims x 2) but each TU now instantiates only a single
+    # dtype specialization of the heavy launch_ffpa_mma_L1_template, which
+    # both raises MAX_JOBS parallelism and cuts per-TU compile time.
     for d in headdims:
-      f16_path = os.path.join(gen_dir, f"ffpa_attn_L1_acc_f16_d{d}.cu")
-      f32_path = os.path.join(gen_dir, f"ffpa_attn_L1_acc_f32_d{d}.cu")
-      cls._write_if_changed(f16_path, cls._render_per_headdim_tu(d, "f16"))
-      cls._write_if_changed(f32_path, cls._render_per_headdim_tu(d, "f32"))
-      generated.append(f16_path)
-      generated.append(f32_path)
+      fp16_path = os.path.join(gen_dir, f"ffpa_attn_fp16_hdim{d}.cu")
+      bf16_path = os.path.join(gen_dir, f"ffpa_attn_bf16_hdim{d}.cu")
+      cls._write_if_changed(fp16_path, cls._render_per_headdim_fp16_tu(d))
+      cls._write_if_changed(bf16_path, cls._render_per_headdim_bf16_tu(d))
+      generated.append(fp16_path)
+      generated.append(bf16_path)
+
+    # Clean up stale TUs from previous layouts (pre-bf16 per-acc files and
+    # the combined fp16+bf16 per-headdim files).
+    for fname in os.listdir(gen_dir):
+      is_stale = ((fname.startswith("ffpa_attn_L1_acc_") and fname.endswith(".cu"))
+                  or (fname.startswith("ffpa_attn_L1_hdim") and fname.endswith(".cu")))
+      if is_stale:
+        stale = os.path.join(gen_dir, fname)
+        try:
+          os.remove(stale)
+        except OSError:
+          pass
 
     # ---- top-level dispatch TU: CHECK_* + switch(d) to per-D entry points ----
     dispatch_path = os.path.join(gen_dir, "ffpa_attn_L1_dispatch.cu")
@@ -339,7 +382,7 @@ class ENV(object):
 
     if cls.enable_debug() or build_pkg:
       pretty_print_line(
-        f"Generated {len(headdims)} x 2 per-headdim TUs under {gen_dir}",
+        f"Generated {len(headdims) * 2} per-(headdim,dtype) TUs under {gen_dir}",
         sep="",
         mode="left",
       )
@@ -358,25 +401,29 @@ class ENV(object):
     ]
     for d in headdims:
       lines.append(
-        f"void ffpa_mma_acc_f16_L1_d{d}(torch::Tensor Q, torch::Tensor K, "
+        f"void ffpa_mma_acc_f16_L1_fp16_d{d}(torch::Tensor Q, torch::Tensor K, "
         f"torch::Tensor V, torch::Tensor O, int stages);"
       )
       lines.append(
-        f"void ffpa_mma_acc_f32_L1_d{d}(torch::Tensor Q, torch::Tensor K, "
+        f"void ffpa_mma_acc_f32_L1_fp16_d{d}(torch::Tensor Q, torch::Tensor K, "
+        f"torch::Tensor V, torch::Tensor O, int stages);"
+      )
+      lines.append(
+        f"void ffpa_mma_acc_f32_L1_bf16_d{d}(torch::Tensor Q, torch::Tensor K, "
         f"torch::Tensor V, torch::Tensor O, int stages);"
       )
     lines.append("")
     return "\n".join(lines)
 
   @staticmethod
-  def _render_stage_body(d: int, qk: str, pv: str) -> str:
+  def _render_stage_body(d: int, t_in: str, qk: str, pv: str) -> str:
     """Render the stage-dispatch body at body scope (2-space indent).
 
         Preprocessor directives intentionally start at column 0 as required by
         strict compilers, while normal statements use the 2-space indent that
         matches the surrounding function body.
         """
-    call = (f"launch_ffpa_mma_L1_template<{d}, {qk}, {pv}, "
+    call = (f"launch_ffpa_mma_L1_template<{t_in}, {d}, {qk}, {pv}, "
             "{S}>(Q, K, V, O);")
     return (
       "#ifdef ENABLE_FFPA_ALL_STAGES\n"
@@ -399,49 +446,84 @@ class ENV(object):
     )
 
   @classmethod
-  def _render_per_headdim_tu(cls, d: int, acc: str) -> str:
-    assert acc in ("f16", "f32")
-    header = [
+  def _render_per_headdim_fp16_tu(cls, d: int) -> str:
+    """Render the fp16-only TU for headdim ``d`` with 2 entries:
+
+        - ``ffpa_mma_acc_f16_L1_fp16_d{d}``: fp16 activation, MMA acc=f16.
+        - ``ffpa_mma_acc_f32_L1_fp16_d{d}``: fp16 activation, MMA acc=f32
+          (with ``ENABLE_FFPA_FORCE_{QK,PV}_F16`` fall-back hooks for parity).
+        """
+    lines = [
       "// AUTO-GENERATED by env.py. DO NOT EDIT.",
       '#include "launch_templates.cuh"',
       "using namespace ffpa;",
       "",
-      f"void ffpa_mma_acc_{acc}_L1_d{d}(",
+    ]
+
+    f16_prefix = [
+      "  constexpr int kMmaAccFloat32QK = 0;",
+      "  constexpr int kMmaAccFloat32PV = 0;",
+    ]
+    f32_prefix = [
+      "#ifdef ENABLE_FFPA_FORCE_QK_F16",
+      "  constexpr int kMmaAccFloat32QK = 0;",
+      "#else",
+      "  constexpr int kMmaAccFloat32QK = 1;",
+      "#endif",
+      "#ifdef ENABLE_FFPA_FORCE_PV_F16",
+      "  constexpr int kMmaAccFloat32PV = 0;",
+      "#else",
+      "  constexpr int kMmaAccFloat32PV = 1;",
+      "#endif",
+    ]
+
+    body = "\n".join(lines) + "\n"
+    body += cls._render_entry(d, f"ffpa_mma_acc_f16_L1_fp16_d{d}", "__half", f16_prefix) + "\n"
+    body += cls._render_entry(d, f"ffpa_mma_acc_f32_L1_fp16_d{d}", "__half", f32_prefix)
+    return body
+
+  @classmethod
+  def _render_per_headdim_bf16_tu(cls, d: int) -> str:
+    """Render the bf16-only TU for headdim ``d``.
+
+        Only one entry (``ffpa_mma_acc_f32_L1_bf16_d{d}``) because bf16 has
+        no f16-acc mma PTX; acc is forced to f32.
+        """
+    lines = [
+      "// AUTO-GENERATED by env.py. DO NOT EDIT.",
+      '#include "launch_templates.cuh"',
+      "using namespace ffpa;",
+      "",
+    ]
+    bf16_prefix = [
+      "  constexpr int kMmaAccFloat32QK = 1;",
+      "  constexpr int kMmaAccFloat32PV = 1;",
+    ]
+    body = "\n".join(lines) + "\n"
+    body += cls._render_entry(d, f"ffpa_mma_acc_f32_L1_bf16_d{d}", "__nv_bfloat16", bf16_prefix)
+    return body
+
+  @classmethod
+  def _render_entry(cls, d: int, symbol: str, t_in: str, body_prefix: list) -> str:
+    head = [
+      f"void {symbol}(",
       "    torch::Tensor Q,",
       "    torch::Tensor K,",
       "    torch::Tensor V,",
       "    torch::Tensor O,",
       "    int stages) {",
     ]
-    if acc == "f16":
-      body_prefix = [
-        "  constexpr int kMmaAccFloat32QK = 0;",
-        "  constexpr int kMmaAccFloat32PV = 0;",
-      ]
-    else:
-      body_prefix = [
-        "#ifdef ENABLE_FFPA_FORCE_QK_F16",
-        "  constexpr int kMmaAccFloat32QK = 0;",
-        "#else",
-        "  constexpr int kMmaAccFloat32QK = 1;",
-        "#endif",
-        "#ifdef ENABLE_FFPA_FORCE_PV_F16",
-        "  constexpr int kMmaAccFloat32PV = 0;",
-        "#else",
-        "  constexpr int kMmaAccFloat32PV = 1;",
-        "#endif",
-      ]
-    stage_body = cls._render_stage_body(d, "kMmaAccFloat32QK", "kMmaAccFloat32PV")
-    return ("\n".join(header) + "\n" + "\n".join(body_prefix) + "\n" + stage_body + "}\n")
+    stage_body = cls._render_stage_body(d, t_in, "kMmaAccFloat32QK", "kMmaAccFloat32PV")
+    return ("\n".join(head) + "\n" + "\n".join(body_prefix) + "\n" + stage_body + "}\n")
 
   @staticmethod
   def _render_dispatch_tu(headdims) -> str:
 
-    def _cases(acc: str) -> str:
-      return "\n".join(f"    case {d}: ffpa_mma_acc_{acc}_L1_d{d}"
+    def _cases(symbol_prefix: str) -> str:
+      return "\n".join(f"    case {d}: {symbol_prefix}_d{d}"
                        "(Q, K, V, O, stages); break;" for d in headdims)
 
-    def _fn(name: str, acc: str) -> str:
+    def _fn(name: str, symbol_prefix: str, torch_dtype: str) -> str:
       return (
         f"void {name}(\n"
         "    torch::Tensor Q,\n"
@@ -449,13 +531,13 @@ class ENV(object):
         "    torch::Tensor V,\n"
         "    torch::Tensor O,\n"
         "    int stages) {\n"
-        "  CHECK_TORCH_TENSOR_DTYPE(Q, torch::kHalf)\n"
-        "  CHECK_TORCH_TENSOR_DTYPE(K, torch::kHalf)\n"
-        "  CHECK_TORCH_TENSOR_DTYPE(V, torch::kHalf)\n"
-        "  CHECK_TORCH_TENSOR_DTYPE(O, torch::kHalf)\n"
+        f"  CHECK_TORCH_TENSOR_DTYPE(Q, {torch_dtype})\n"
+        f"  CHECK_TORCH_TENSOR_DTYPE(K, {torch_dtype})\n"
+        f"  CHECK_TORCH_TENSOR_DTYPE(V, {torch_dtype})\n"
+        f"  CHECK_TORCH_TENSOR_DTYPE(O, {torch_dtype})\n"
         "  const int d = Q.size(3);\n"
         "  switch (d) {\n"
-        f"{_cases(acc)}\n"
+        f"{_cases(symbol_prefix)}\n"
         '    default: throw std::runtime_error("headdim not support!");\n'
         "  }\n"
         "}\n"
@@ -465,7 +547,9 @@ class ENV(object):
       "// AUTO-GENERATED by env.py. DO NOT EDIT.\n"
       '#include "cuffpa/logging.cuh"\n'
       '#include "ffpa_attn_L1_decls.h"\n'
-      "\n" + _fn("ffpa_mma_acc_f16_L1", "f16") + "\n" + _fn("ffpa_mma_acc_f32_L1", "f32")
+      "\n" + _fn("ffpa_mma_acc_f16_L1_fp16", "ffpa_mma_acc_f16_L1_fp16", "torch::kHalf") + "\n" +
+      _fn("ffpa_mma_acc_f32_L1_fp16", "ffpa_mma_acc_f32_L1_fp16", "torch::kHalf") + "\n" +
+      _fn("ffpa_mma_acc_f32_L1_bf16", "ffpa_mma_acc_f32_L1_bf16", "torch::kBFloat16")
     )
 
   @staticmethod

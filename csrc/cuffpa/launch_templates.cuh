@@ -228,7 +228,8 @@ static constexpr int getConfigQKVSmemMaxSize() {
 #endif
 }
 
-template <const int kHeadDim,          // Headdim, 32~1024
+template <typename kDataType,          // Activation dtype (__half or __nv_bfloat16).
+          const int kHeadDim,          // Headdim, 32~1024
           const int kMmaAccFloat32QK,  // 0/1, Q@K^T, 0 MMA Acc with fp16, 1 MMA Acc with fp32.
           const int kMmaAccFloat32PV,  // 0/1, P@V, 0 MMA Acc with fp16, 1 MMA Acc with fp32.
           const int kStage>
@@ -285,23 +286,24 @@ void launch_ffpa_mma_L1_template(torch::Tensor Q, torch::Tensor K, torch::Tensor
   const int Tc = utils::div_ceil(QKV_seqlen, Bc);  // Tc K_tile[Bc,d]
   const float scale = 1.0f / sqrt((float)kHeadDim);
 
-#define LAUNCH_TEMPLATE_FUNC(TEMPLATE_FUNC)                                                     \
-  cudaFuncSetAttribute(TEMPLATE_FUNC, cudaFuncAttributeMaxDynamicSharedMemorySize,              \
-                       kQKVSmemMaxSize);                                                        \
-  TEMPLATE_FUNC<<<grid, block, kQKVSmemMaxSize>>>(                                              \
-      reinterpret_cast<half*>(Q.data_ptr()), reinterpret_cast<half*>(K.data_ptr()),             \
-      reinterpret_cast<half*>(V.data_ptr()), reinterpret_cast<half*>(O.data_ptr()), QKV_seqlen, \
-      QKV_head, scale, Tc);
+#define LAUNCH_TEMPLATE_FUNC(TEMPLATE_FUNC)                                                   \
+  cudaFuncSetAttribute(TEMPLATE_FUNC, cudaFuncAttributeMaxDynamicSharedMemorySize,            \
+                       kQKVSmemMaxSize);                                                      \
+  TEMPLATE_FUNC<<<grid, block, kQKVSmemMaxSize>>>(                                            \
+      reinterpret_cast<kDataType*>(Q.data_ptr()), reinterpret_cast<kDataType*>(K.data_ptr()), \
+      reinterpret_cast<kDataType*>(V.data_ptr()), reinterpret_cast<kDataType*>(O.data_ptr()), \
+      QKV_seqlen, QKV_head, scale, Tc);
 
 #ifdef ENABLE_FFPA_PERSIST_KV_G2S
   if constexpr (kHeadDim <= kMaxDForSmallDKernel) {       // e.g > 128 will use large d kernel
     constexpr int kPersistVs2r = getConfigPersistVs2r();  // only for d < 256
 
     auto ffpa_mma_L1_small_d_kernel_func =
-        (ffpa_mma_stages_split_q_L1_small_d_template < kHeadDim, kMmaAtomM, kMmaAtomN, kMmaAtomK,
-         kMmaTileSeqLenQ, kMmaTileSeqLenK, kMmaTileSeqLenP, kMmaTileHeadDimV, kValTileSeqLenQ,
-         kValTileSeqLenK, kValTileSeqLenP, kValTileHeadDimV, kMmaAccFloat32QK, kMmaAccFloat32PV,
-         kOStorageAccFloat32, kPrefetchQK, kPrefetchPV, kShareSmemQKV, kPersistQs2r, kPersistVs2r,
+        (ffpa_mma_stages_split_q_L1_small_d_template < kDataType, kHeadDim, kMmaAtomM, kMmaAtomN,
+         kMmaAtomK, kMmaTileSeqLenQ, kMmaTileSeqLenK, kMmaTileSeqLenP, kMmaTileHeadDimV,
+         kValTileSeqLenQ, kValTileSeqLenK, kValTileSeqLenP, kValTileHeadDimV, kMmaAccFloat32QK,
+         kMmaAccFloat32PV, kOStorageAccFloat32, kPrefetchQK, kPrefetchPV, kShareSmemQKV,
+         kPersistQs2r, kPersistVs2r,
          // Force disable KV registers ping pong buffers
          // while V s2r is enabled.
          (kPersistVs2r) ? 0 : kRegPipeKV, 1, /*kStageQK unused*/
@@ -310,10 +312,11 @@ void launch_ffpa_mma_L1_template(torch::Tensor Q, torch::Tensor K, torch::Tensor
     LAUNCH_TEMPLATE_FUNC(ffpa_mma_L1_small_d_kernel_func);
   } else {  // large headdim > kMaxDForSmallDKernel (e.g 128)
     auto ffpa_mma_L1_large_d_kernel_func =
-        (ffpa_mma_stages_split_q_L1_large_d_template < kHeadDim, kMmaAtomM, kMmaAtomN, kMmaAtomK,
-         kMmaTileSeqLenQ, kMmaTileSeqLenK, kMmaTileSeqLenP, kMmaTileHeadDimV, kValTileSeqLenQ,
-         kValTileSeqLenK, kValTileSeqLenP, kValTileHeadDimV, kMmaAccFloat32QK, kMmaAccFloat32PV,
-         kOStorageAccFloat32, kPrefetchQK, kPrefetchPV, (kPersistQg2s) ? 0 : kShareSmemQKV,
+        (ffpa_mma_stages_split_q_L1_large_d_template < kDataType, kHeadDim, kMmaAtomM, kMmaAtomN,
+         kMmaAtomK, kMmaTileSeqLenQ, kMmaTileSeqLenK, kMmaTileSeqLenP, kMmaTileHeadDimV,
+         kValTileSeqLenQ, kValTileSeqLenK, kValTileSeqLenP, kValTileHeadDimV, kMmaAccFloat32QK,
+         kMmaAccFloat32PV, kOStorageAccFloat32, kPrefetchQK, kPrefetchPV,
+         (kPersistQg2s) ? 0 : kShareSmemQKV,
          // Force disable Q s2r for d >= 256, Q s2r for large d will
          // need too many register, thus, introduce performance drops.
          (kPersistQg2s || kHeadDim > 256) ? 0 : kPersistQs2r, kPersistQg2s, kRegPipeKV, kStageQK,
@@ -322,10 +325,11 @@ void launch_ffpa_mma_L1_template(torch::Tensor Q, torch::Tensor K, torch::Tensor
   }
 #else
   auto ffpa_mma_L1_large_d_kernel_func =
-      (ffpa_mma_stages_split_q_L1_large_d_template < kHeadDim, kMmaAtomM, kMmaAtomN, kMmaAtomK,
-       kMmaTileSeqLenQ, kMmaTileSeqLenK, kMmaTileSeqLenP, kMmaTileHeadDimV, kValTileSeqLenQ,
-       kValTileSeqLenK, kValTileSeqLenP, kValTileHeadDimV, kMmaAccFloat32QK, kMmaAccFloat32PV,
-       kOStorageAccFloat32, kPrefetchQK, kPrefetchPV, (kPersistQg2s) ? 0 : kShareSmemQKV,
+      (ffpa_mma_stages_split_q_L1_large_d_template < kDataType, kHeadDim, kMmaAtomM, kMmaAtomN,
+       kMmaAtomK, kMmaTileSeqLenQ, kMmaTileSeqLenK, kMmaTileSeqLenP, kMmaTileHeadDimV,
+       kValTileSeqLenQ, kValTileSeqLenK, kValTileSeqLenP, kValTileHeadDimV, kMmaAccFloat32QK,
+       kMmaAccFloat32PV, kOStorageAccFloat32, kPrefetchQK, kPrefetchPV,
+       (kPersistQg2s) ? 0 : kShareSmemQKV,
        // Force disable Q s2r for d >= 256, Q s2r for large d will
        // need too many register, thus, introduce performance drops.
        (kPersistQg2s || kHeadDim > 256) ? 0 : kPersistQs2r, kPersistQg2s, kRegPipeKV, kStageQK,

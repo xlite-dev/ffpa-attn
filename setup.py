@@ -2,9 +2,8 @@ import warnings
 from pathlib import Path
 
 from env import ENV
-from packaging.version import Version
 from setuptools import find_packages, setup
-from torch.utils.cpp_extension import BuildExtension, CUDA_HOME, CUDAExtension
+from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
 warnings.filterwarnings("ignore")
 
@@ -23,20 +22,12 @@ cc_flag = []
 
 ENV.list_ffpa_env()
 
-if ENV.enable_ampere():
+# Expand the FFPA_BUILD_ARCH list (or the current device's SM if unset) into
+# nvcc -gencode flags. Replaces the old ENABLE_FFPA_{ADA,AMPERE,HOPPER}
+# switches with a cache-dit-style arch list (see cache-dit/setup.py).
+for _sm in ENV.get_build_arch_list():
   cc_flag.append("-gencode")
-  cc_flag.append("arch=compute_80,code=sm_80")
-
-if ENV.enable_ada():
-  cc_flag.append("-gencode")
-  cc_flag.append("arch=compute_89,code=sm_89")
-
-if ENV.enable_hopper():
-  if CUDA_HOME is not None:
-    _, bare_metal_version = ENV.get_cuda_bare_metal_version(CUDA_HOME)
-    if bare_metal_version >= Version("11.8"):
-      cc_flag.append("-gencode")
-      cc_flag.append("arch=compute_90,code=sm_90")
+  cc_flag.append(f"arch=compute_{_sm},code=sm_{_sm}")
 
 assert cc_flag is not None, "cc_flag can not be NoneType."
 
