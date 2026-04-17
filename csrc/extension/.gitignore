@@ -16,6 +16,6 @@ __pycache__
 *.ncu*
 *.sqlite*
 *.engine
-*.bin 
+*.bin
 outupt
 *.egg-info

@@ -98,23 +98,23 @@ By leveraging this approach, we can achieve better performance than SDPA EA for 
 
 ```CUDA
 template<
-  const int kHeadDim,              // Headdim, 32~1024     
+  const int kHeadDim,              // Headdim, 32~1024
   const int kMmaAtomM,             // MMA Atom M, 16
   const int kMmaAtomN,             // MMA Atom N, 8
   const int kMmaAtomK,             // MMA Atom K, 16
-  const int kMmaTileSeqLenQ,       // 4, more MMA(warp), M=16*4=64, Q@K^T=[Br(M), d(K)]@[d(K),  Bc(N)]  
-  const int kMmaTileSeqLenK,       // 1, more MMA(warp), N=8*1 =8,  Q@K^T=[Br(M), d(K)]@[d(K),  Bc(N)]    
+  const int kMmaTileSeqLenQ,       // 4, more MMA(warp), M=16*4=64, Q@K^T=[Br(M), d(K)]@[d(K),  Bc(N)]
+  const int kMmaTileSeqLenK,       // 1, more MMA(warp), N=8*1 =8,  Q@K^T=[Br(M), d(K)]@[d(K),  Bc(N)]
   const int kMmaTileSeqLenP,       // 4, more MMA(warp), M=16*4=64, P@V  =[Br(M),Bc(K)]@[Bc(K), d(N) ]
-  const int kMmaTileHeadDimV,      // 1, more MMA(warp), N=8*1 =8,  P@V  =[Br(M),Bc(K)]@[Bc(K), d(N) ]       
-  const int kValTileSeqLenQ,       // 1, more values, M, Br=64*1=64, matmul M 
+  const int kMmaTileHeadDimV,      // 1, more MMA(warp), N=8*1 =8,  P@V  =[Br(M),Bc(K)]@[Bc(K), d(N) ]
+  const int kValTileSeqLenQ,       // 1, more values, M, Br=64*1=64, matmul M
   const int kValTileSeqLenK,       // 8, more values, N, Bc=8*8 =64, matmul N
   const int kValTileSeqLenP,       // 1, more values, M, Br=64*1=64, matmul M
   const int kValTileHeadDimV,      // 8, more values, N, d=8*(1|2|3|4|...)=8|...|32|64|96|128|...
   const int kMmaAccFloat32QK,      // 0/1, Q@K^T, 0 MMA Acc with fp16, 1 MMA Acc with fp32.
   const int kMmaAccFloat32PV,      // 0/1, P@V, 0 MMA Acc with fp16, 1 MMA Acc with fp32.
   const int kOStorageAccFloat32,   // 0/1, MMA Acc always be f32/f16, but O storage can be fp32 or half.
-  const int kPrefetchQK,           // Prefetch QK at the Appropriate Time Point. 
-  const int kPrefetchPV,           // Prefetch V at the Appropriate Time Point. 
+  const int kPrefetchQK,           // Prefetch QK at the Appropriate Time Point.
+  const int kPrefetchPV,           // Prefetch V at the Appropriate Time Point.
   const int kShareSmemQKV,         // QKV share the same shared memory, reuse QK smem for V.
   const int kPersistQs2r,          // Persist load Q s2r for headdim  < 512, more registers, but still keep O(1) SRAM.
   const int kPersistQg2s,          // Persist load Q g2s for headdim <= 320, more SRAM, but still keep register usage.
@@ -125,14 +125,14 @@ template<
   const int kPadK,                 // Pad Q/K/V 0,8; 0 -> smem swizzle, > 0 -> padding
   const int kPadV                  // Pad Q/K/V 0,8; 0 -> smem swizzle, > 0 -> padding
 > __global__ void // Q, K, V, O -> [B, H, N, D]
-// FFPA Attention Algo: Fine-grained tiling at MMA level for large headdim (d>=256), 
+// FFPA Attention Algo: Fine-grained tiling at MMA level for large headdim (d>=256),
 // which can achieve 1.8x~3x🎉 faster than SDPA EA with or without MMA Acc F32.
-ffpa_mma_stages_split_q_L1_large_d_template(half* Q, half* K, half* V, half* O, ...); 
-// FA-2 Attention Algo: Coarse-grained tiling at Attention level for small headdim (d<256), 
-// which can achieve 95%-105%🎉 performance as SDPA FA-2 BE with MMA Acc F32 for N<=4096, 
-// and achieve almost 1.2x~1.4x🎉 faster than SDPA FA-2 via Mixed MMA Acc(Q@K^T F32 + 
+ffpa_mma_stages_split_q_L1_large_d_template(half* Q, half* K, half* V, half* O, ...);
+// FA-2 Attention Algo: Coarse-grained tiling at Attention level for small headdim (d<256),
+// which can achieve 95%-105%🎉 performance as SDPA FA-2 BE with MMA Acc F32 for N<=4096,
+// and achieve almost 1.2x~1.4x🎉 faster than SDPA FA-2 via Mixed MMA Acc(Q@K^T F32 +
 // P@V F16) for all range N on NVIDIA 4090 RTX device.
-ffpa_mma_stages_split_q_L1_small_d_template(half* Q, half* K, half* V, half* O, ...); 
+ffpa_mma_stages_split_q_L1_small_d_template(half* Q, half* K, half* V, half* O, ...);
 ```
 
 ## 📖 Prerequisites
@@ -184,7 +184,7 @@ L1: level 1, O(2xBrx16)≈O(1) SRAM complexity, O(d/4) register complexity, the 
 <div align='left'>
   <img src='https://github.com/user-attachments/assets/a4927108-3f97-4209-9b80-bb31ad271e04' width="411px">
   <img src='https://github.com/user-attachments/assets/eeb9943f-919d-45d8-a8a6-e0f8874f4bcd' width="411px">
-</div> 
+</div>
 
 <div id="L1-bench-a30"></div>
 
@@ -211,7 +211,7 @@ L1: level 1, O(2xBrx16)≈O(1) SRAM complexity, O(d/4) register complexity, the 
 <div align='left'>
   <img src='https://github.com/user-attachments/assets/7e323005-4445-41af-8e94-6efb62ed2b77' width="411px">
   <img src='https://github.com/user-attachments/assets/e314649e-82b5-414d-85c9-8b6fbf260138' width="411px">
-</div> 
+</div>
 
 <div id="L1-bench-3080"></div>
 
@@ -238,7 +238,7 @@ L1: level 1, O(2xBrx16)≈O(1) SRAM complexity, O(d/4) register complexity, the 
 <div align='left'>
   <img src='https://github.com/user-attachments/assets/d157cd69-4444-4735-a691-edaaff408137' width="411px">
   <img src='https://github.com/user-attachments/assets/3ce47627-e79d-40ee-b753-bdd235603b7d' width="411px">
-</div> 
+</div>
 
 <div id="L1-bench-4090"></div>
 
@@ -265,7 +265,7 @@ L1: level 1, O(2xBrx16)≈O(1) SRAM complexity, O(d/4) register complexity, the 
 <div align='left'>
   <img src='https://github.com/user-attachments/assets/447e2937-f7c8-47c8-8550-8c0c71b910e6' width="411px">
   <img src='https://github.com/user-attachments/assets/65a8d564-8fa7-4d66-86b9-e238feb86143' width="411px">
-</div> 
+</div>
 
 ## 📖 Python Testing
 <div id="python-test"></div>
@@ -292,10 +292,10 @@ cd tests && python3 test_ffpa_attn.py --B 1 --H 48 --N 8192 --show-all --D 320
 ```bash
 cd tests && pip install matplotlib && python3 test_ffpa_attn.py --gen-bench --show-all --plot
 ```
-- 📚 case: Compare small headdim (d<256, e.g 64), FFPA-L1 vs SDPA FA-2 BE.  
+- 📚 case: Compare small headdim (d<256, e.g 64), FFPA-L1 vs SDPA FA-2 BE.
 ```bash
 # Enable ffpa-attn small d kernel which using coarse-grained tiling method.
-export ENABLE_FFPA_PERSIST_Q_G2S=1 && export ENABLE_FFPA_PERSIST_KV_G2S=1 
+export ENABLE_FFPA_PERSIST_Q_G2S=1 && export ENABLE_FFPA_PERSIST_KV_G2S=1
 cd tests && python3 test_ffpa_attn.py --B 1 --H 32 --N 1024 --check --show-all --D 64 # NVIDIA L20
 ---------------------------------------B=1, H=32, N=1024, D=64, Warmup: 1, Iters: 5--------------------
                    (sdpa): ['0.00802612'], time:0.148057ms, TFLOPS:59.14 (+0.00 %)(~1.00x)

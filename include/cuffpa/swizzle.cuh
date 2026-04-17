@@ -54,8 +54,8 @@
 namespace ffpa {
 namespace swizzle {
 
-// i: row index; j: col index. 
-template<const int kColStride = 16, const int kStep = 8>
+// i: row index; j: col index.
+template <const int kColStride = 16, const int kStep = 8>
 static __device__ __forceinline__ int permuted(int i, int j) {
   // swizzle: ((int(j / kStep) ^ int(i / 4)) % int(kColStride / kStep)) * kStep;
   static_assert(kColStride <= 16, "Currently, kColStride must be less than or equal to 16.");
@@ -69,6 +69,5 @@ static __device__ __forceinline__ int permuted(int i, int j) {
   }
 }
 
-} // swizzle
-} // ffpa
-
+}  // namespace swizzle
+}  // namespace ffpa
