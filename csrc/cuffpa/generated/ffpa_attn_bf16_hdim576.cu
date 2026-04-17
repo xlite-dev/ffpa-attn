@@ -2,7 +2,7 @@
 #include "launch_templates.cuh"
 using namespace ffpa;
 
-void ffpa_mma_acc_f32_L1_bf16_d576(
+void ffpa_mma_acc_f32_bf16_d576(
     torch::Tensor Q,
     torch::Tensor K,
     torch::Tensor V,
@@ -12,19 +12,19 @@ void ffpa_mma_acc_f32_L1_bf16_d576(
   constexpr int kMmaAccFloat32PV = 1;
 #ifdef ENABLE_FFPA_ALL_STAGES
   if (stages == 2) {
-    launch_ffpa_mma_L1_template<__nv_bfloat16, 576, kMmaAccFloat32QK, kMmaAccFloat32PV, 2>(Q, K, V, O);
+    launch_ffpa_mma_template<__nv_bfloat16, 576, kMmaAccFloat32QK, kMmaAccFloat32PV, 2>(Q, K, V, O);
   } else if (stages == 3) {
-    launch_ffpa_mma_L1_template<__nv_bfloat16, 576, kMmaAccFloat32QK, kMmaAccFloat32PV, 3>(Q, K, V, O);
+    launch_ffpa_mma_template<__nv_bfloat16, 576, kMmaAccFloat32QK, kMmaAccFloat32PV, 3>(Q, K, V, O);
   } else if (stages == 4) {
-    launch_ffpa_mma_L1_template<__nv_bfloat16, 576, kMmaAccFloat32QK, kMmaAccFloat32PV, 4>(Q, K, V, O);
+    launch_ffpa_mma_template<__nv_bfloat16, 576, kMmaAccFloat32QK, kMmaAccFloat32PV, 4>(Q, K, V, O);
   } else {
-    launch_ffpa_mma_L1_template<__nv_bfloat16, 576, kMmaAccFloat32QK, kMmaAccFloat32PV, 1>(Q, K, V, O);
+    launch_ffpa_mma_template<__nv_bfloat16, 576, kMmaAccFloat32QK, kMmaAccFloat32PV, 1>(Q, K, V, O);
   }
 #else
   if (stages == 2) {
-    launch_ffpa_mma_L1_template<__nv_bfloat16, 576, kMmaAccFloat32QK, kMmaAccFloat32PV, 2>(Q, K, V, O);
+    launch_ffpa_mma_template<__nv_bfloat16, 576, kMmaAccFloat32QK, kMmaAccFloat32PV, 2>(Q, K, V, O);
   } else {
-    launch_ffpa_mma_L1_template<__nv_bfloat16, 576, kMmaAccFloat32QK, kMmaAccFloat32PV, 1>(Q, K, V, O);
+    launch_ffpa_mma_template<__nv_bfloat16, 576, kMmaAccFloat32QK, kMmaAccFloat32PV, 1>(Q, K, V, O);
   }
 #endif
 }

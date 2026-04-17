@@ -23,9 +23,6 @@ class ENV(object):
   # Project dir, path to faster-prefill-attention
   PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 
-  # Enable debug mode for FFPA, fast build minimal kernels, default False.
-  ENABLE_FFPA_DEBUG = bool(int(os.environ.get("ENABLE_FFPA_DEBUG", 0)))
-
   # Target CUDA SM architectures to compile for. When empty the current
   # device's capability is used. Accepts a comma/semicolon/space separated
   # list of either numeric SMs (e.g. "80,89,90") or aliases (e.g.
@@ -94,13 +91,27 @@ class ENV(object):
   # if True: grid(N/Br, H, B) else: grid(N/Br, B * H)
   ENABLE_FFPA_LAUNCH_GRID_DNHB = bool(int(os.environ.get("ENABLE_FFPA_LAUNCH_GRID_DNHB", 0)))
 
+  # --- Build-time tuning knobs ---------------------------------------------
+  # nvcc intra-TU parallelism. With the per-headdim TU split, the outer
+  # ``MAX_JOBS`` already drives many nvcc processes in parallel, so keeping
+  # ``--threads`` small (default 4) avoids oversubscription. Set to 1 to
+  # disable intra-TU threading entirely; larger values only help when
+  # ``MAX_JOBS`` is small.
+  FFPA_NVCC_THREADS = int(os.environ.get("FFPA_NVCC_THREADS", 4))
+
+  # Emit ptxas verbose info (register / smem usage). Off by default because
+  # it produces tens of MB of log output and is only useful for tuning.
+  FFPA_PTXAS_VERBOSE = bool(int(os.environ.get("FFPA_PTXAS_VERBOSE", 0)))
+
+  # Development-time headdim subset override. Comma/space separated list of
+  # headdims (e.g. ``256,512``) that replaces the full generated set for
+  # fast iteration. Empty (default) means use the full set from
+  # ``ENABLE_FFPA_ALL_HEADDIM``.
+  FFPA_DEV_HEADDIMS = os.environ.get("FFPA_DEV_HEADDIMS", "")
+
   @classmethod
   def project_dir(cls):
     return cls.PROJECT_DIR
-
-  @classmethod
-  def enable_debug(cls):
-    return cls.ENABLE_FFPA_DEBUG
 
   @classmethod
   def get_build_arch_list(cls):
@@ -199,8 +210,6 @@ class ENV(object):
   @classmethod
   def env_cuda_cflags(cls):
     extra_env_cflags = []
-    if cls.enable_debug():
-      extra_env_cflags.append("-DENABLE_FFPA_DEBUG")
     if cls.enable_all_mutistages():
       extra_env_cflags.append("-DENABLE_FFPA_ALL_STAGES")
     if cls.enable_all_headdim():
@@ -258,8 +267,10 @@ class ENV(object):
 
     pretty_print_line("FFPA-ATTN ENVs")
     formatenv("PROJECT_DIR", cls.project_dir())
-    formatenv("ENABLE_FFPA_DEBUG", cls.enable_debug())
     formatenv("FFPA_BUILD_ARCH", ",".join(cls.get_build_arch_list()))
+    formatenv("FFPA_NVCC_THREADS", cls.FFPA_NVCC_THREADS)
+    formatenv("FFPA_PTXAS_VERBOSE", cls.FFPA_PTXAS_VERBOSE)
+    formatenv("FFPA_DEV_HEADDIMS", cls.FFPA_DEV_HEADDIMS or "(full)")
     formatenv("ENABLE_FFPA_ALL_STAGES", cls.enable_all_mutistages())
     formatenv("ENABLE_FFPA_ALL_HEADDIM", cls.enable_all_headdim())
     formatenv("ENABLE_FFPA_PREFETCH_QKV", cls.enable_prefetch_qkv())
@@ -293,14 +304,22 @@ class ENV(object):
   def get_enabled_headdims(cls):
     """Return the list of headdims enabled for the current build configuration.
 
-        The set mirrors the ``DISPATCH_HEADDIM`` macro in ``launch_templates.cuh``:
-
-        * ``ENABLE_FFPA_DEBUG``         -> minimal headdims for fast iteration.
+        * ``FFPA_DEV_HEADDIMS``         -> explicit subset for fast iteration.
         * ``ENABLE_FFPA_ALL_HEADDIM``   -> multiples of 32 in [32, 1024].
         * default                       -> multiples of 64 in [256, 1024].
         """
-    if cls.enable_debug():
-      return [32, 64, 128, 256, 320, 512, 1024]
+    raw = cls.FFPA_DEV_HEADDIMS.strip()
+    if raw:
+      subset = []
+      for tok in re.split(r"[;,\s]+", raw):
+        if not tok:
+          continue
+        d = int(tok)
+        if d not in subset:
+          subset.append(d)
+      if not subset:
+        raise RuntimeError(f"FFPA_DEV_HEADDIMS={raw!r} parsed to an empty list.")
+      return sorted(subset)
     if cls.enable_all_headdim():
       return list(range(32, 1025, 32))
     return list(range(256, 1025, 64))
@@ -329,7 +348,7 @@ class ENV(object):
 
         Splitting the big ``DISPATCH_HEADDIM`` switch into one TU per headdim lets
         ``MAX_JOBS`` invoke nvcc on many files in parallel, dramatically reducing
-        the wall-clock build time of the heavy ``launch_ffpa_mma_L1_template``
+        the wall-clock build time of the heavy ``launch_ffpa_mma_template``
         instantiations.
 
         The generated files are committed to the repository (not ignored). On
@@ -346,14 +365,14 @@ class ENV(object):
     generated = []
 
     # ---- declarations header shared by per-D TUs + dispatch TU ----
-    decls_path = os.path.join(gen_dir, "ffpa_attn_L1_decls.h")
+    decls_path = os.path.join(gen_dir, "ffpa_attn_decls.h")
     cls._write_if_changed(decls_path, cls._render_decls_header(headdims))
     generated.append(decls_path)
 
     # ---- two TUs per headdim, one per dtype ----
     # Splitting fp16 and bf16 into separate TUs doubles the number of build
     # units (N_headdims x 2) but each TU now instantiates only a single
-    # dtype specialization of the heavy launch_ffpa_mma_L1_template, which
+    # dtype specialization of the heavy launch_ffpa_mma_template, which
     # both raises MAX_JOBS parallelism and cuts per-TU compile time.
     for d in headdims:
       fp16_path = os.path.join(gen_dir, f"ffpa_attn_fp16_hdim{d}.cu")
@@ -363,11 +382,12 @@ class ENV(object):
       generated.append(fp16_path)
       generated.append(bf16_path)
 
-    # Clean up stale TUs from previous layouts (pre-bf16 per-acc files and
-    # the combined fp16+bf16 per-headdim files).
+    # Clean up stale TUs from previous layouts (pre-bf16 per-acc files,
+    # combined fp16+bf16 per-headdim files, and the old ``_L1`` naming).
+    stale_file_names = {"ffpa_attn_L1_decls.h", "ffpa_attn_L1_dispatch.cu"}
     for fname in os.listdir(gen_dir):
       is_stale = ((fname.startswith("ffpa_attn_L1_acc_") and fname.endswith(".cu"))
-                  or (fname.startswith("ffpa_attn_L1_hdim") and fname.endswith(".cu")))
+                  or (fname.startswith("ffpa_attn_L1_hdim") and fname.endswith(".cu")) or fname in stale_file_names)
       if is_stale:
         stale = os.path.join(gen_dir, fname)
         try:
@@ -376,11 +396,11 @@ class ENV(object):
           pass
 
     # ---- top-level dispatch TU: CHECK_* + switch(d) to per-D entry points ----
-    dispatch_path = os.path.join(gen_dir, "ffpa_attn_L1_dispatch.cu")
+    dispatch_path = os.path.join(gen_dir, "ffpa_attn_dispatch.cu")
     cls._write_if_changed(dispatch_path, cls._render_dispatch_tu(headdims))
     generated.append(dispatch_path)
 
-    if cls.enable_debug() or build_pkg:
+    if build_pkg:
       pretty_print_line(
         f"Generated {len(headdims) * 2} per-(headdim,dtype) TUs under {gen_dir}",
         sep="",
@@ -401,15 +421,15 @@ class ENV(object):
     ]
     for d in headdims:
       lines.append(
-        f"void ffpa_mma_acc_f16_L1_fp16_d{d}(torch::Tensor Q, torch::Tensor K, "
+        f"void ffpa_mma_acc_f16_fp16_d{d}(torch::Tensor Q, torch::Tensor K, "
         f"torch::Tensor V, torch::Tensor O, int stages);"
       )
       lines.append(
-        f"void ffpa_mma_acc_f32_L1_fp16_d{d}(torch::Tensor Q, torch::Tensor K, "
+        f"void ffpa_mma_acc_f32_fp16_d{d}(torch::Tensor Q, torch::Tensor K, "
         f"torch::Tensor V, torch::Tensor O, int stages);"
       )
       lines.append(
-        f"void ffpa_mma_acc_f32_L1_bf16_d{d}(torch::Tensor Q, torch::Tensor K, "
+        f"void ffpa_mma_acc_f32_bf16_d{d}(torch::Tensor Q, torch::Tensor K, "
         f"torch::Tensor V, torch::Tensor O, int stages);"
       )
     lines.append("")
@@ -423,7 +443,7 @@ class ENV(object):
         strict compilers, while normal statements use the 2-space indent that
         matches the surrounding function body.
         """
-    call = (f"launch_ffpa_mma_L1_template<{t_in}, {d}, {qk}, {pv}, "
+    call = (f"launch_ffpa_mma_template<{t_in}, {d}, {qk}, {pv}, "
             "{S}>(Q, K, V, O);")
     return (
       "#ifdef ENABLE_FFPA_ALL_STAGES\n"
@@ -449,8 +469,8 @@ class ENV(object):
   def _render_per_headdim_fp16_tu(cls, d: int) -> str:
     """Render the fp16-only TU for headdim ``d`` with 2 entries:
 
-        - ``ffpa_mma_acc_f16_L1_fp16_d{d}``: fp16 activation, MMA acc=f16.
-        - ``ffpa_mma_acc_f32_L1_fp16_d{d}``: fp16 activation, MMA acc=f32
+        - ``ffpa_mma_acc_f16_fp16_d{d}``: fp16 activation, MMA acc=f16.
+        - ``ffpa_mma_acc_f32_fp16_d{d}``: fp16 activation, MMA acc=f32
           (with ``ENABLE_FFPA_FORCE_{QK,PV}_F16`` fall-back hooks for parity).
         """
     lines = [
@@ -478,15 +498,15 @@ class ENV(object):
     ]
 
     body = "\n".join(lines) + "\n"
-    body += cls._render_entry(d, f"ffpa_mma_acc_f16_L1_fp16_d{d}", "__half", f16_prefix) + "\n"
-    body += cls._render_entry(d, f"ffpa_mma_acc_f32_L1_fp16_d{d}", "__half", f32_prefix)
+    body += cls._render_entry(d, f"ffpa_mma_acc_f16_fp16_d{d}", "__half", f16_prefix) + "\n"
+    body += cls._render_entry(d, f"ffpa_mma_acc_f32_fp16_d{d}", "__half", f32_prefix)
     return body
 
   @classmethod
   def _render_per_headdim_bf16_tu(cls, d: int) -> str:
     """Render the bf16-only TU for headdim ``d``.
 
-        Only one entry (``ffpa_mma_acc_f32_L1_bf16_d{d}``) because bf16 has
+        Only one entry (``ffpa_mma_acc_f32_bf16_d{d}``) because bf16 has
         no f16-acc mma PTX; acc is forced to f32.
         """
     lines = [
@@ -500,7 +520,7 @@ class ENV(object):
       "  constexpr int kMmaAccFloat32PV = 1;",
     ]
     body = "\n".join(lines) + "\n"
-    body += cls._render_entry(d, f"ffpa_mma_acc_f32_L1_bf16_d{d}", "__nv_bfloat16", bf16_prefix)
+    body += cls._render_entry(d, f"ffpa_mma_acc_f32_bf16_d{d}", "__nv_bfloat16", bf16_prefix)
     return body
 
   @classmethod
@@ -546,10 +566,10 @@ class ENV(object):
     return (
       "// AUTO-GENERATED by env.py. DO NOT EDIT.\n"
       '#include "cuffpa/logging.cuh"\n'
-      '#include "ffpa_attn_L1_decls.h"\n'
-      "\n" + _fn("ffpa_mma_acc_f16_L1_fp16", "ffpa_mma_acc_f16_L1_fp16", "torch::kHalf") + "\n" +
-      _fn("ffpa_mma_acc_f32_L1_fp16", "ffpa_mma_acc_f32_L1_fp16", "torch::kHalf") + "\n" +
-      _fn("ffpa_mma_acc_f32_L1_bf16", "ffpa_mma_acc_f32_L1_bf16", "torch::kBFloat16")
+      '#include "ffpa_attn_decls.h"\n'
+      "\n" + _fn("ffpa_mma_acc_f16_fp16", "ffpa_mma_acc_f16_fp16", "torch::kHalf") + "\n" +
+      _fn("ffpa_mma_acc_f32_fp16", "ffpa_mma_acc_f32_fp16", "torch::kHalf") + "\n" +
+      _fn("ffpa_mma_acc_f32_bf16", "ffpa_mma_acc_f32_bf16", "torch::kBFloat16")
     )
 
   @staticmethod
@@ -557,23 +577,23 @@ class ENV(object):
 
     def csrc(sub_dir, filename):
       csrc_file = f"{ENV.project_dir()}/csrc/{sub_dir}/{filename}"
-      if ENV.enable_debug() or build_pkg:
+      if build_pkg:
         pretty_print_line(f"csrc_file: {csrc_file}", sep="", mode="left")
       return csrc_file
 
-    if ENV.enable_debug() or build_pkg:
+    if build_pkg:
       pretty_print_line()
     # Generate per-headdim TUs under csrc/cuffpa/generated/ and use them as
     # the actual build sources. Splitting by headdim enables MAX_JOBS to
     # drive nvcc on many small files in parallel and cuts the build time
-    # of the heavy launch_ffpa_mma_L1_template instantiations.
+    # of the heavy launch_ffpa_mma_template instantiations.
     generated_files = ENV.generate_split_headdim_sources(build_pkg=build_pkg)
     generated_sources = [p for p in generated_files if p.endswith(".cu")]
-    if ENV.enable_debug() or build_pkg:
+    if build_pkg:
       for gs in generated_sources:
         pretty_print_line(f"csrc_file: {gs}", sep="", mode="left")
     build_sources = [csrc("pybind", "ffpa_attn_api.cc")] + generated_sources
-    if ENV.enable_debug() or build_pkg:
+    if build_pkg:
       pretty_print_line()
     return build_sources
 
@@ -612,10 +632,17 @@ class ENV(object):
     extra_cuda_cflags.extend(ENV.env_cuda_cflags())
     extra_cuda_cflags.append(f"-I {ENV.project_dir()}/include")
     extra_cuda_cflags.append(f"-I {ENV.project_dir()}/csrc/cuffpa")
-    extra_cuda_cflags.append("-diag-suppress 177" if not build_pkg else "--ptxas-options=-v")
-    extra_cuda_cflags.append("-Xptxas -v" if not build_pkg else "--ptxas-options=-O3")
+    extra_cuda_cflags.append("-diag-suppress")
+    extra_cuda_cflags.append("177")
+    if ENV.FFPA_PTXAS_VERBOSE:
+      extra_cuda_cflags.append("--ptxas-options=-v")
+      extra_cuda_cflags.append("-Xptxas")
+      extra_cuda_cflags.append("-v")
+    else:
+      extra_cuda_cflags.append("--ptxas-options=-O3")
 
-    extra_cuda_cflags.append("--threads=8")
+    if ENV.FFPA_NVCC_THREADS > 1:
+      extra_cuda_cflags.append(f"--threads={ENV.FFPA_NVCC_THREADS}")
     # Avoid None or empty str as flag or macro
     extra_cuda_cflags = [flag for flag in extra_cuda_cflags if flag]
     return extra_cuda_cflags
@@ -652,7 +679,7 @@ class ENV(object):
       f"Arch ENV: {torch_arch_list_env}"
     )
     return load(
-      name="pyffpa_cuda",
+      name="ffpa_attn._C",
       sources=ENV.get_build_sources(),
       extra_cuda_cflags=ENV.get_build_cuda_cflags(),
       extra_cflags=ENV.get_build_cflags(),

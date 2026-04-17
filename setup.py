@@ -1,11 +1,26 @@
+import importlib.util
+
+if importlib.util.find_spec("setuptools_scm") is None:
+  raise ImportError("setuptools-scm is not installed. Install it by `pip3 install setuptools-scm`")
+
+import os
 import warnings
 from pathlib import Path
 
 from env import ENV
 from setuptools import find_packages, setup
+from setuptools_scm.version import get_local_dirty_tag
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
 warnings.filterwarnings("ignore")
+
+
+def my_local_scheme(version):
+  # Used to build release packages; users should not set this manually.
+  local_version = os.getenv("FFPA_BUILD_LOCAL_VERSION")
+  if local_version is None:
+    return get_local_dirty_tag(version)
+  return f"+{local_version}"
 
 
 def get_long_description():
@@ -35,8 +50,8 @@ assert cc_flag is not None, "cc_flag can not be NoneType."
 # may need export LD_LIBRARY_PATH=PATH-TO/torch/lib:$LD_LIBRARY_PATH
 ext_modules.append(
   CUDAExtension(
-    # package name for import
-    name="pyffpa_cuda",
+    # package-internal C extension module; imported as ``ffpa_attn._C``.
+    name="ffpa_attn._C",
     sources=ENV.get_build_sources(build_pkg=True),
     extra_compile_args={
       # add c compile flags
@@ -62,7 +77,10 @@ def fetch_requirements():
 
 setup(
   name=PACKAGE_NAME,
-  version="0.0.2.1",
+  use_scm_version={
+    "write_to": str(Path("ffpa_attn") / "_version.py"),
+    "local_scheme": my_local_scheme,
+  },
   author="DefTruth",
   author_email="qyjdef@163.com",
   license="GNU General Public License v3.0",
@@ -95,6 +113,7 @@ setup(
       "pre-commit",
       "packaging",
       "ninja",
+      "setuptools-scm",
     ],
   },
 )

@@ -43,6 +43,30 @@ __device__ __forceinline__ void cp_async(uint32_t smem_ptr, const T* gmem_ptr) {
   }
 }
 
+// Predicated cp.async with zero-fill on out-of-bounds. Uses the
+// hardware-supported ``cp-size / src-size`` form: when ``src_size == 0`` the
+// destination is zero-filled and no global memory load is issued, avoiding
+// both UB on OOB gmem addresses and warp-divergent branches around
+// cp.async. Needed for seqlen boundary handling where rows beyond
+// ``QKV_seqlen`` must appear as zero in shared memory.
+template <const int kBytes = 16, typename T = half>
+__device__ __forceinline__ void cp_async_zfill(uint32_t smem_ptr, const T* gmem_ptr,
+                                               bool row_valid) {
+  static_assert(kBytes == 16 || kBytes == 8);
+  const int copy_bytes = row_valid ? kBytes : 0;
+  if constexpr (kBytes == 16) {
+    asm volatile(
+        "cp.async.cg.shared.global.L2::128B "
+        "[%0], [%1], %2, %3;\n" ::"r"(smem_ptr),
+        "l"(gmem_ptr), "n"(16), "r"(copy_bytes));
+  } else {
+    asm volatile(
+        "cp.async.ca.shared.global.L2::128B "
+        "[%0], [%1], %2, %3;\n" ::"r"(smem_ptr),
+        "l"(gmem_ptr), "n"(8), "r"(copy_bytes));
+  }
+}
+
 // e.g ldg_sync_128b<half, uint32_t>(...);
 template <typename T0, typename T1>
 __device__ __forceinline__ void ldg_sync_128b(T0* mem_dst_ptr, T1* gmem_src_ptr) {

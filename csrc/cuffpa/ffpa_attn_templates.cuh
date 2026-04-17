@@ -35,12 +35,11 @@ template <
     const int kPadQ,       // Pad Q/K/V 0,8; 0 -> smem swizzle, > 0 -> padding
     const int kPadK, const int kPadV>
 __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
-    ffpa_mma_stages_split_q_L1_large_d_template(const kDataType* __restrict__ Q,
-                                                const kDataType* __restrict__ K,
-                                                const kDataType* __restrict__ V,
-                                                kDataType* __restrict__ O, const int QKV_seqlen,
-                                                const int QKV_head, const float scale,
-                                                const int Tc) {
+    ffpa_stages_split_q_large_d_template(const kDataType* __restrict__ Q,
+                                         const kDataType* __restrict__ K,
+                                         const kDataType* __restrict__ V, kDataType* __restrict__ O,
+                                         const int QKV_seqlen, const int QKV_head,
+                                         const float scale, const int Tc) {
   prefill::check_large_d_compiling_states<
       kHeadDim, kMmaAtomM, kMmaAtomN, kMmaAtomK, kMmaTileSeqLenQ, kMmaTileSeqLenK, kMmaTileSeqLenP,
       kMmaTileHeadDimV, kValTileSeqLenQ, kValTileSeqLenK, kValTileSeqLenP, kValTileHeadDimV,
@@ -101,7 +100,7 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
 #pragma unroll
     for (int tile_K_d = 0; tile_K_d < (kHeadDim / kMmaAtomK); ++tile_K_d) {
       prefill::cp_async_qkv_g2s<Br, Q_tile_size, kHeadDim, kMmaAtomK, kNumThreads, kPadQ>(
-          smem_Q_base_ptr, Q, Q_gmem_offset, Q_tile_id, tile_K_d, tile_K_d);
+          smem_Q_base_ptr, Q, Q_gmem_offset, Q_tile_id, tile_K_d, tile_K_d, QKV_seqlen);
       cp_async::commit_group();
     }
   }
@@ -131,8 +130,8 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
   uint32_t reg_st_idx = 0;
   uint32_t reg_ld_idx = 1;
 
-// Now, N must be mutliples of Bc(32/64) for KV tiling across seqlen.
-// <loop over K seqlen>: for K^T[d,seqlen] with K^T_tile[d,Bc]
+  // Now, N must be mutliples of Bc(32/64) for KV tiling across seqlen.
+  // <loop over K seqlen>: for K^T[d,seqlen] with K^T_tile[d,Bc]
 #pragma unroll 1
   for (int tile_K_seqlen = 0; tile_K_seqlen < Tc; ++tile_K_seqlen) {
     // TODO: process last tile_K_seqlen ? pad to multiple of Bc.
@@ -143,11 +142,11 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
           for (int stage = 0; stage < (kStageQK - 1); ++stage) {
             if constexpr (!kPersistQg2s) {
               prefill::cp_async_qkv_g2s<Br, Q_tile_size, kHeadDim, kMmaAtomK, kNumThreads, kPadQ>(
-                  smem_Q_base_ptr, Q, Q_gmem_offset, Q_tile_id, stage, stage);
+                  smem_Q_base_ptr, Q, Q_gmem_offset, Q_tile_id, stage, stage, QKV_seqlen);
             }
 
             prefill::cp_async_qkv_g2s<Bc, K_tile_size, kHeadDim, kMmaAtomK, kNumThreads, kPadK>(
-                smem_K_base_ptr, K, K_gmem_offset, tile_K_seqlen, stage, stage);
+                smem_K_base_ptr, K, K_gmem_offset, tile_K_seqlen, stage, stage, QKV_seqlen);
             cp_async::commit_group();  // pack QK as 1 group.
           }  // end for stage
           cp_async::wait_group<(kStageQK - 2)>();
@@ -165,17 +164,17 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
             // We only load Q g2s and s2r once if kPersistQs2r is enabled.
             if (tile_K_seqlen == 0) {
               prefill::cp_async_qkv_g2s<Br, Q_tile_size, kHeadDim, kMmaAtomK, kNumThreads, kPadQ>(
-                  smem_Q_base_ptr, Q, Q_gmem_offset, Q_tile_id, stage, stage);
+                  smem_Q_base_ptr, Q, Q_gmem_offset, Q_tile_id, stage, stage, QKV_seqlen);
             }
           } else {
             if constexpr (!kPersistQg2s) {
               prefill::cp_async_qkv_g2s<Br, Q_tile_size, kHeadDim, kMmaAtomK, kNumThreads, kPadQ>(
-                  smem_Q_base_ptr, Q, Q_gmem_offset, Q_tile_id, stage, stage);
+                  smem_Q_base_ptr, Q, Q_gmem_offset, Q_tile_id, stage, stage, QKV_seqlen);
             }
           }
 
           prefill::cp_async_qkv_g2s<Bc, K_tile_size, kHeadDim, kMmaAtomK, kNumThreads, kPadK>(
-              smem_K_base_ptr, K, K_gmem_offset, tile_K_seqlen, stage, stage);
+              smem_K_base_ptr, K, K_gmem_offset, tile_K_seqlen, stage, stage, QKV_seqlen);
           cp_async::commit_group();  // pack QK as 1 group.
         }  // end for stage
         cp_async::wait_group<(kStageQK - 2)>();
@@ -190,7 +189,7 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
 #pragma unroll
         for (int stage = 0; stage < (kStagePV - 1); ++stage) {
           prefill::cp_async_qkv_g2s<Bc, V_tile_size, kHeadDim, kMmaAtomN * 2, kNumThreads, kPadV>(
-              smem_V_base_ptr, V, V_gmem_offset, tile_K_seqlen, stage, stage);
+              smem_V_base_ptr, V, V_gmem_offset, tile_K_seqlen, stage, stage, QKV_seqlen);
           cp_async::commit_group();
         }
       }
@@ -210,21 +209,21 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
           prefill::cp_async_qkv_g2s<Br, Q_tile_size, kHeadDim, kMmaAtomK, kNumThreads, kPadQ>(
               smem_Q_base_ptr, Q, Q_gmem_offset, Q_tile_id,
               (kStageQK > 1) ? (tile_K_d + (kStageQK - 1)) : tile_K_d,
-              (kStageQK > 1) ? smem_sel_next : smem_sel);
+              (kStageQK > 1) ? smem_sel_next : smem_sel, QKV_seqlen);
         }
       } else {
         if constexpr (!kPersistQg2s) {
           prefill::cp_async_qkv_g2s<Br, Q_tile_size, kHeadDim, kMmaAtomK, kNumThreads, kPadQ>(
               smem_Q_base_ptr, Q, Q_gmem_offset, Q_tile_id,
               (kStageQK > 1) ? (tile_K_d + (kStageQK - 1)) : tile_K_d,
-              (kStageQK > 1) ? smem_sel_next : smem_sel);
+              (kStageQK > 1) ? smem_sel_next : smem_sel, QKV_seqlen);
         }
       }
 
       prefill::cp_async_qkv_g2s<Bc, K_tile_size, kHeadDim, kMmaAtomK, kNumThreads, kPadK>(
           smem_K_base_ptr, K, K_gmem_offset, tile_K_seqlen,
           (kStageQK > 1) ? (tile_K_d + (kStageQK - 1)) : tile_K_d,
-          (kStageQK > 1) ? smem_sel_next : smem_sel);
+          (kStageQK > 1) ? smem_sel_next : smem_sel, QKV_seqlen);
       cp_async::commit_group();  // pack QK as 1 group.
 
       if constexpr (kStageQK <= 1) {
@@ -282,7 +281,7 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
             for (int stage = 0; stage < (kStagePV - 1); ++stage) {
               prefill::cp_async_qkv_g2s<Bc, V_tile_size, kHeadDim, kMmaAtomN * 2, kNumThreads,
                                         kPadV>(smem_V_base_ptr, V, V_gmem_offset, tile_K_seqlen,
-                                               stage, stage);
+                                               stage, stage, QKV_seqlen);
               cp_async::commit_group();
             }
           }
@@ -340,7 +339,7 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
 #pragma unroll
         for (int stage = 0; stage < (kStagePV - 1); ++stage) {
           prefill::cp_async_qkv_g2s<Bc, V_tile_size, kHeadDim, kMmaAtomN * 2, kNumThreads, kPadV>(
-              smem_V_base_ptr, V, V_gmem_offset, tile_K_seqlen, stage, stage);
+              smem_V_base_ptr, V, V_gmem_offset, tile_K_seqlen, stage, stage, QKV_seqlen);
           cp_async::commit_group();
         }
       }
@@ -374,6 +373,15 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
     // 10       ...
     // ...
     // 15       T28: {c2, c3}  T29: {c2, c3}  T30: {c2, c3}  T31: {c2, c3}
+    // Seqlen boundary: on the last KV tile with QKV_seqlen % Bc != 0, mask
+    // padding columns to -inf so online softmax ignores them.
+    {
+      const int kv_valid_local = QKV_seqlen - tile_K_seqlen * Bc;
+      if (kv_valid_local < Bc) {
+        prefill::sync_apply_kv_mask<kValTileSeqLenK, kMmaAccFloat32QK, kDataType>(&R_S[0][0][0],
+                                                                                  kv_valid_local);
+      }
+    }
     prefill::sync_online_safe_softmax<kValTileSeqLenK, kMmaAccFloat32QK, kDataType>(
         &R_S[0][0][0], scale, &lane_row_max_new[0][0], &lane_row_sum_new[0][0],
         &lane_block_row_max_old[0][0], &lane_block_row_sum_old[0][0]);
@@ -393,11 +401,11 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
           // if kPersistQs2r is enabled.
           if constexpr (!kPersistQs2r) {
             prefill::cp_async_qkv_g2s<Br, Q_tile_size, kHeadDim, kMmaAtomK, kNumThreads, kPadQ>(
-                smem_Q_base_ptr, Q, Q_gmem_offset, Q_tile_id, stage, stage);
+                smem_Q_base_ptr, Q, Q_gmem_offset, Q_tile_id, stage, stage, QKV_seqlen);
           }
 
           prefill::cp_async_qkv_g2s<Bc, K_tile_size, kHeadDim, kMmaAtomK, kNumThreads, kPadK>(
-              smem_K_base_ptr, K, K_gmem_offset, tile_K_seqlen + 1, stage, stage);
+              smem_K_base_ptr, K, K_gmem_offset, tile_K_seqlen + 1, stage, stage, QKV_seqlen);
           cp_async::commit_group();  // pack QK as 1 group.
         }  // end for stage
       }
@@ -423,7 +431,7 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
           prefill::cp_async_qkv_g2s<Bc, V_tile_size, kHeadDim, kMmaAtomN * 2, kNumThreads, kPadV>(
               smem_V_base_ptr, V, V_gmem_offset, tile_K_seqlen,
               (kStagePV > 1) ? (tile_V_d + (kStagePV - 1)) : tile_V_d,
-              (kStagePV > 1) ? smem_sel_v_next : smem_sel_v);
+              (kStagePV > 1) ? smem_sel_v_next : smem_sel_v, QKV_seqlen);
           cp_async::commit_group();
           if constexpr (kStagePV <= 1) {
             cp_async::wait_group<0>();
@@ -459,12 +467,12 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
                   if constexpr (!kPersistQs2r) {
                     prefill::cp_async_qkv_g2s<Br, Q_tile_size, kHeadDim, kMmaAtomK, kNumThreads,
                                               kPadQ>(smem_Q_base_ptr, Q, Q_gmem_offset, Q_tile_id,
-                                                     stage, stage);
+                                                     stage, stage, QKV_seqlen);
                   }
 
                   prefill::cp_async_qkv_g2s<Bc, K_tile_size, kHeadDim, kMmaAtomK, kNumThreads,
                                             kPadK>(smem_K_base_ptr, K, K_gmem_offset,
-                                                   tile_K_seqlen + 1, stage, stage);
+                                                   tile_K_seqlen + 1, stage, stage, QKV_seqlen);
                   cp_async::commit_group();  // pack QK as 1 group.
                 }  // end for stage
               }
@@ -576,7 +584,7 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
   static_assert(kValTileSeqLenP == 1);
   prefill::sync_store_o_r2g<Br, kHeadDim, kMmaAtomM, kMmaAtomN, kValTileHeadDimV,
                             kOStorageAccFloat32, kDataType>(
-      O, O_gmem_offset, O_tile_id, warp_QP, &R_D[0][0][0], &R_Q[0][0][0], &R_K[0][0]);
+      O, O_gmem_offset, O_tile_id, warp_QP, &R_D[0][0][0], &R_Q[0][0][0], &R_K[0][0], QKV_seqlen);
 }
 
 template <
@@ -609,12 +617,11 @@ template <
     const int kPadQ,       // Pad Q/K/V 0,8; 0 -> smem swizzle, > 0 -> padding
     const int kPadK, const int kPadV>
 __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
-    ffpa_mma_stages_split_q_L1_small_d_template(const kDataType* __restrict__ Q,
-                                                const kDataType* __restrict__ K,
-                                                const kDataType* __restrict__ V,
-                                                kDataType* __restrict__ O, const int QKV_seqlen,
-                                                const int QKV_head, const float scale,
-                                                const int Tc) {
+    ffpa_stages_split_q_small_d_template(const kDataType* __restrict__ Q,
+                                         const kDataType* __restrict__ K,
+                                         const kDataType* __restrict__ V, kDataType* __restrict__ O,
+                                         const int QKV_seqlen, const int QKV_head,
+                                         const float scale, const int Tc) {
   // NOTE: This kernel template is developed for small head dimensions (d <= 128),
   // namely, flash-attention-2. Always persist QKV for flash-attn, apply tiling at
   // the Attention level not the MMA level.
@@ -675,7 +682,7 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
 #pragma unroll
   for (int tile_K_d = 0; tile_K_d < (kHeadDim / kMmaAtomK); ++tile_K_d) {
     prefill::cp_async_qkv_g2s<Br, Q_tile_size, kHeadDim, kMmaAtomK, kNumThreads, kPadQ>(
-        smem_Q_base_ptr, Q, Q_gmem_offset, Q_tile_id, tile_K_d, tile_K_d);
+        smem_Q_base_ptr, Q, Q_gmem_offset, Q_tile_id, tile_K_d, tile_K_d, QKV_seqlen);
   }
   cp_async::commit_group();
 
@@ -727,7 +734,7 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
 #pragma unroll
         for (int tile_K_d = 0; tile_K_d < (kHeadDim / kMmaAtomK); ++tile_K_d) {
           prefill::cp_async_qkv_g2s<Bc, K_tile_size, kHeadDim, kMmaAtomK, kNumThreads, kPadK>(
-              smem_K_base_ptr, K, K_gmem_offset, tile_K_seqlen, tile_K_d, tile_K_d);
+              smem_K_base_ptr, K, K_gmem_offset, tile_K_seqlen, tile_K_d, tile_K_d, QKV_seqlen);
         }
         cp_async::commit_group();
         cp_async::wait_group<0>();
@@ -740,7 +747,7 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
 #pragma unroll
       for (int tile_K_d = 0; tile_K_d < (kHeadDim / kMmaAtomK); ++tile_K_d) {
         prefill::cp_async_qkv_g2s<Bc, K_tile_size, kHeadDim, kMmaAtomK, kNumThreads, kPadK>(
-            smem_K_base_ptr, K, K_gmem_offset, tile_K_seqlen, tile_K_d, tile_K_d);
+            smem_K_base_ptr, K, K_gmem_offset, tile_K_seqlen, tile_K_d, tile_K_d, QKV_seqlen);
       }
       cp_async::commit_group();
       cp_async::wait_group<0>();
@@ -753,7 +760,7 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
         const int tile_V_d = (j >> 1);  // (j / 2)
         if (j % 2 == 0) {
           prefill::cp_async_qkv_g2s<Bc, V_tile_size, kHeadDim, kMmaAtomN * 2, kNumThreads, kPadV>(
-              smem_V_base_ptr, V, V_gmem_offset, tile_K_seqlen, tile_V_d, tile_V_d);
+              smem_V_base_ptr, V, V_gmem_offset, tile_K_seqlen, tile_V_d, tile_V_d, QKV_seqlen);
         }
       }
       cp_async::commit_group();
@@ -832,7 +839,7 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
         const int tile_V_d = (j >> 1);  // (j / 2)
         if (j % 2 == 0) {
           prefill::cp_async_qkv_g2s<Bc, V_tile_size, kHeadDim, kMmaAtomN * 2, kNumThreads, kPadV>(
-              smem_V_base_ptr, V, V_gmem_offset, tile_K_seqlen, tile_V_d, tile_V_d);
+              smem_V_base_ptr, V, V_gmem_offset, tile_K_seqlen, tile_V_d, tile_V_d, QKV_seqlen);
         }
       }
       cp_async::commit_group();
@@ -866,6 +873,15 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
     // 10       ...
     // ...
     // 15       T28: {c2, c3}  T29: {c2, c3}  T30: {c2, c3}  T31: {c2, c3}
+    // Seqlen boundary: on the last KV tile with QKV_seqlen % Bc != 0, mask
+    // padding columns to -inf so online softmax ignores them.
+    {
+      const int kv_valid_local = QKV_seqlen - tile_K_seqlen * Bc;
+      if (kv_valid_local < Bc) {
+        prefill::sync_apply_kv_mask<kValTileSeqLenK, kMmaAccFloat32QK, kDataType>(&R_S[0][0][0],
+                                                                                  kv_valid_local);
+      }
+    }
     prefill::sync_online_safe_softmax<kValTileSeqLenK, kMmaAccFloat32QK, kDataType>(
         &R_S[0][0][0], scale, &lane_row_max_new[0][0], &lane_row_sum_new[0][0],
         &lane_block_row_max_old[0][0], &lane_block_row_sum_old[0][0]);
@@ -880,7 +896,8 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
 #pragma unroll
         for (int tile_K_d = 0; tile_K_d < (kHeadDim / kMmaAtomK); ++tile_K_d) {
           prefill::cp_async_qkv_g2s<Bc, K_tile_size, kHeadDim, kMmaAtomK, kNumThreads, kPadK>(
-              smem_K_base_ptr, K, K_gmem_offset, (tile_K_seqlen + 1), tile_K_d, tile_K_d);
+              smem_K_base_ptr, K, K_gmem_offset, (tile_K_seqlen + 1), tile_K_d, tile_K_d,
+              QKV_seqlen);
         }
         cp_async::commit_group();  // pack K as 1 group.
       }  // end if (tile_K_seqlen + 1) < Tc
@@ -1017,5 +1034,5 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
   static_assert(kValTileSeqLenP == 1);
   prefill::sync_store_o_r2g<Br, kHeadDim, kMmaAtomM, kMmaAtomN, kValTileHeadDimV,
                             kOStorageAccFloat32, kDataType>(
-      O, O_gmem_offset, O_tile_id, warp_QP, &R_D[0][0][0], &R_Q[0][0][0], &R_K[0][0]);
+      O, O_gmem_offset, O_tile_id, warp_QP, &R_D[0][0][0], &R_Q[0][0][0], &R_K[0][0], QKV_seqlen);
 }

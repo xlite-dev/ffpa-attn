@@ -24,3 +24,4 @@ dist
 bin
 .cache
 *.log
+ffpa_attn/_version.py
