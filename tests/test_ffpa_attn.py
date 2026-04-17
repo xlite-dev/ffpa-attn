@@ -126,3 +126,50 @@ def test_ffpa_attn_func_boundary_seqlen(dtype, B, H, N, D):
   assert out.shape == ref.shape
   assert torch.isfinite(out).all(), f"FFPA output has NaN/Inf at N={N}, D={D}"
   torch.testing.assert_close(out, ref, **_tolerance(dtype))
+
+
+# Cross-attention: Nq may differ from Nkv; Nk==Nv required. Covers
+# short-query / long-KV (decoding-style), long-query / short-KV, and
+# non-aligned tail on both sides.
+CROSS_SHAPES = [
+  # (Nq, Nkv)
+  (128, 1024),
+  (128, 8192),
+  (1024, 128),
+  (1024, 8192),
+  (8191, 8192),  # non-aligned Nq tail
+  (8192, 8191),  # non-aligned Nkv tail
+  (1, 4096),  # incremental-decoding-style single query
+]
+CROSS_HEADDIMS = [128, 256, 512]
+
+
+def _alloc_cross_qkv(B, H, Nq, Nkv, D, dtype):
+  torch.manual_seed(0)
+  q = torch.randn(B, H, Nq, D, dtype=dtype, device="cuda")
+  k = torch.randn(B, H, Nkv, D, dtype=dtype, device="cuda")
+  v = torch.randn(B, H, Nkv, D, dtype=dtype, device="cuda")
+  return q, k, v
+
+
+@pytest.mark.parametrize("dtype", DTYPES, ids=["fp16", "bf16"])
+@pytest.mark.parametrize("Nq,Nkv", CROSS_SHAPES)
+@pytest.mark.parametrize("D", CROSS_HEADDIMS)
+def test_ffpa_attn_func_cross_attention(dtype, Nq, Nkv, D):
+  B, H = 1, 4
+  q, k, v = _alloc_cross_qkv(B, H, Nq, Nkv, D, dtype)
+  out = ffpa_attn_func(q, k, v, stages=2, acc=_acc_for(dtype))
+  ref = _sdpa_ref(q, k, v)
+  assert out.shape == (B, H, Nq, D)
+  assert out.dtype == dtype
+  assert torch.isfinite(out).all(), f"FFPA output has NaN/Inf at Nq={Nq}, Nkv={Nkv}, D={D}"
+  torch.testing.assert_close(out, ref, **_tolerance(dtype))
+
+
+def test_ffpa_attn_func_rejects_mismatched_kv_seqlen():
+  torch.manual_seed(0)
+  q = torch.randn(1, 4, 128, 128, dtype=torch.float16, device="cuda")
+  k = torch.randn(1, 4, 1024, 128, dtype=torch.float16, device="cuda")
+  v = torch.randn(1, 4, 2048, 128, dtype=torch.float16, device="cuda")
+  with pytest.raises(ValueError, match="seqlen"):
+    ffpa_attn_func(q, k, v, stages=2, acc="f32")

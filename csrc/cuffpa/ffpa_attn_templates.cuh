@@ -3,6 +3,72 @@
 using namespace ffpa;
 using mma::MMAMode;
 
+// ============================================================================
+// ffpa_stages_split_q_large_d_template
+// ----------------------------------------------------------------------------
+// Split-Q (FlashAttention-2) prefill attention kernel tuned for *large* head
+// dimensions (D > ~128). Each thread block owns a fixed slice of Q rows
+// ([Br,D]) and streams K/V tiles ([Bc,D]) through an online safe-softmax.
+// The "large-d" variant tiles the head-dim axis into `kHeadDim / kMmaAtomK`
+// inner steps so SMEM stays O(1) in D.
+//
+// Supports cross-attention (Nq may differ from Nkv); Nk == Nv is required
+// and is asserted by the launcher. Causal mask and GQA/MQA are not supported.
+//
+// ----------------------------------------------------------------------------
+// Template parameters (compile-time configuration)
+// ----------------------------------------------------------------------------
+//   kDataType            Activation dtype: __half (fp16) or __nv_bfloat16.
+//   kHeadDim             Head dimension D (32, 64, ..., 1024), multiple of
+//                        kMmaAtomK.
+//   kMmaAtomM/N/K        MMA atom shape for m16n8k16 (fixed to 16/8/16).
+//   kMmaTileSeqLenQ/K/P  Warp-level MMA tiling along Q rows / K cols / P rows.
+//                        Thread block uses warps = kMmaTileSeqLenQ * kMmaTileSeqLenK.
+//   kMmaTileHeadDimV     Warp-level MMA tiling along V cols (head-dim).
+//   kValTileSeqLenQ/K/P  Extra value-level tiling multipliers yielding the
+//                        tile sizes Br = kMmaAtomM*kMmaTileSeqLenQ*kValTileSeqLenQ,
+//                        Bc = kMmaAtomN*kMmaTileSeqLenK*kValTileSeqLenK.
+//   kValTileHeadDimV     Value tiling over head-dim for P@V.
+//   kMmaAccFloat32QK/PV  0 -> fp16 MMA accumulator, 1 -> fp32 accumulator for
+//                        the Q@K^T / P@V stage respectively (bf16 requires 1).
+//   kOStorageAccFloat32  0 -> store O accumulator as fp16, 1 -> as fp32.
+//   kPrefetchQK/PV       0/1, enable async prefetch of next QK / PV tiles.
+//   kShareSmemQKV        0/1, let V reuse QK SMEM after Q@K^T to save SRAM.
+//   kPersistQs2r         0/1, persist Q in registers across all KV tiles.
+//   kPersistQg2s         0/1, persist Q in SMEM across all KV tiles.
+//   kRegPipeKV           0/1, register ping-pong between ldmatrix and mma.
+//   kStageQK / kStagePV  Multi-stage cp.async pipeline depth (<= 4) for QK / PV.
+//   kPadQ / kPadK / kPadV 0 selects SMEM swizzle (bank-conflict free), >0
+//                        selects padded layout with that padding width.
+//
+// ----------------------------------------------------------------------------
+// Runtime parameters (grid/block invariants)
+// ----------------------------------------------------------------------------
+//   Q     in : fp16/bf16 tensor, shape [Nb, Nh, Nq,  D] (BHND layout).
+//   K     in : fp16/bf16 tensor, shape [Nb, Nh, Nkv, D].
+//   V     in : fp16/bf16 tensor, shape [Nb, Nh, Nkv, D].
+//   O     out: fp16/bf16 tensor, shape [Nb, Nh, Nq,  D]; written in place.
+//   Nb       : Batch size; combined with Nh to fan out across gridDim.y
+//              (or gridDim.{y,z} under the DNHB layout).
+//   Nq       : Query sequence length. Drives gridDim.x = div_ceil(Nq, Br) and
+//              the per-row store predicate; need not be a multiple of Br.
+//   Nkv      : Key/Value sequence length (Nk == Nv). Drives the KV loop bound
+//              Tc = div_ceil(Nkv, Bc) and the tail-tile softmax mask; need not
+//              be a multiple of Bc.
+//   Nh       : Number of attention heads; used to decode (batch, head) from
+//              blockIdx.y when the grid is laid out as (Tr, Nb*Nh).
+//   scale    : Softmax pre-scale, typically 1 / sqrt(D).
+//   Tc       : Precomputed KV tile count = div_ceil(Nkv, Bc).
+//
+// ----------------------------------------------------------------------------
+// Grid / block layout
+// ----------------------------------------------------------------------------
+//   Block: (WARP_SIZE * kMmaTileSeqLenQ * kMmaTileSeqLenK, 1, 1).
+//   Grid : default     (div_ceil(Nq, Br), Nb*Nh, 1);
+//          DNHB layout (div_ceil(Nq, Br), Nh, Nb) if ENABLE_FFPA_LAUNCH_GRID_DNHB.
+//   Dynamic SMEM size is computed by getConfigQKVSmemMaxSize<...>() in the
+//   launcher and must be set via cudaFuncSetAttribute before launch.
+// ============================================================================
 template <
     typename kDataType,          // Activation dtype (__half or __nv_bfloat16).
     const int kHeadDim,          // Headdim, 32~1024
@@ -38,7 +104,7 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
     ffpa_stages_split_q_large_d_template(const kDataType* __restrict__ Q,
                                          const kDataType* __restrict__ K,
                                          const kDataType* __restrict__ V, kDataType* __restrict__ O,
-                                         const int QKV_seqlen, const int QKV_head,
+                                         const int Nq, const int Nkv, const int Nh,
                                          const float scale, const int Tc) {
   prefill::check_large_d_compiling_states<
       kHeadDim, kMmaAtomM, kMmaAtomN, kMmaAtomK, kMmaTileSeqLenQ, kMmaTileSeqLenK, kMmaTileSeqLenP,
@@ -51,28 +117,28 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
   constexpr int kNumThreads = WARP_SIZE * kMmaTileSeqLenQ * kMmaTileSeqLenK;
 
 #ifdef ENABLE_FFPA_LAUNCH_GRID_DNHB
-  // grid(div_ceil(QKV_seqlen, Br), QKV_head, QKV_batch), (x,y,z)
-  const int QKV_batch_id = blockIdx.z;  // Batch size
-  const int QKV_head_id = blockIdx.y;   // Head num
+  // grid(div_ceil(Nq, Br), Nh, Nb), (x,y,z)
+  const int Nb_id = blockIdx.z;  // Batch size
+  const int Nh_id = blockIdx.y;  // Head num
 #else
-  // grid(div_ceil(QKV_seqlen, Br), QKV_batch * QKV_head), (x,y,z)
-  const int QKV_batch_id = blockIdx.y / QKV_head;  // Batch size
-  const int QKV_head_id = blockIdx.y % QKV_head;   // Head num
+  // grid(div_ceil(Nq, Br), Nb * Nh), (x,y,z)
+  const int Nb_id = blockIdx.y / Nh;  // Batch size
+  const int Nh_id = blockIdx.y % Nh;  // Head num
 #endif
   const int Q_tile_id = blockIdx.x;             // Q tile_id, range [0, Tr]
   const int O_tile_id = Q_tile_id;              // O tile_id, same as Q.
   const int warp_QP = threadIdx.x / WARP_SIZE;  // 0,1,2,3 or 0~7
   constexpr int warp_KV = 0;                    // 0
-  const int Q_gmem_offset = ((QKV_batch_id * QKV_head * QKV_seqlen * kHeadDim) +
-                             (QKV_head_id * QKV_seqlen * kHeadDim));  // Q [seqlen,d]
-  const int K_gmem_offset = ((QKV_batch_id * QKV_head * QKV_seqlen * kHeadDim) +
-                             (QKV_head_id * QKV_seqlen * kHeadDim));  // K [seqlen,d]
-  const int V_gmem_offset = Q_gmem_offset;                            // V [seqlen,d]
-  const int O_gmem_offset = Q_gmem_offset;                            // O [seqlen,d]
+  const int Q_gmem_offset =
+      ((Nb_id * Nh * Nq * kHeadDim) + (Nh_id * Nq * kHeadDim));  // Q [seqlen,d]
+  const int K_gmem_offset =
+      ((Nb_id * Nh * Nkv * kHeadDim) + (Nh_id * Nkv * kHeadDim));  // K [seqlen,d]
+  const int V_gmem_offset = K_gmem_offset;                         // V [seqlen,d]
+  const int O_gmem_offset = Q_gmem_offset;                         // O [seqlen,d]
 
   // int load_gmem_Q_Br = Q_tile_id * Br + load_smem_Q_Br;
-  // if ((Q_tile_id * Br + (threadIdx.x / (kNumThreads / Br))) >= QKV_seqlen) return;
-  if ((Q_tile_id * Br) >= QKV_seqlen)
+  // if ((Q_tile_id * Br + (threadIdx.x / (kNumThreads / Br))) >= Nq) return;
+  if ((Q_tile_id * Br) >= Nq)
     return;
 
   extern __shared__ __align__(16) unsigned char ffpa_smem_raw[];
@@ -100,7 +166,7 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
 #pragma unroll
     for (int tile_K_d = 0; tile_K_d < (kHeadDim / kMmaAtomK); ++tile_K_d) {
       prefill::cp_async_qkv_g2s<Br, Q_tile_size, kHeadDim, kMmaAtomK, kNumThreads, kPadQ>(
-          smem_Q_base_ptr, Q, Q_gmem_offset, Q_tile_id, tile_K_d, tile_K_d, QKV_seqlen);
+          smem_Q_base_ptr, Q, Q_gmem_offset, Q_tile_id, tile_K_d, tile_K_d, Nq);
       cp_async::commit_group();
     }
   }
@@ -142,11 +208,11 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
           for (int stage = 0; stage < (kStageQK - 1); ++stage) {
             if constexpr (!kPersistQg2s) {
               prefill::cp_async_qkv_g2s<Br, Q_tile_size, kHeadDim, kMmaAtomK, kNumThreads, kPadQ>(
-                  smem_Q_base_ptr, Q, Q_gmem_offset, Q_tile_id, stage, stage, QKV_seqlen);
+                  smem_Q_base_ptr, Q, Q_gmem_offset, Q_tile_id, stage, stage, Nq);
             }
 
             prefill::cp_async_qkv_g2s<Bc, K_tile_size, kHeadDim, kMmaAtomK, kNumThreads, kPadK>(
-                smem_K_base_ptr, K, K_gmem_offset, tile_K_seqlen, stage, stage, QKV_seqlen);
+                smem_K_base_ptr, K, K_gmem_offset, tile_K_seqlen, stage, stage, Nkv);
             cp_async::commit_group();  // pack QK as 1 group.
           }  // end for stage
           cp_async::wait_group<(kStageQK - 2)>();
@@ -164,17 +230,17 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
             // We only load Q g2s and s2r once if kPersistQs2r is enabled.
             if (tile_K_seqlen == 0) {
               prefill::cp_async_qkv_g2s<Br, Q_tile_size, kHeadDim, kMmaAtomK, kNumThreads, kPadQ>(
-                  smem_Q_base_ptr, Q, Q_gmem_offset, Q_tile_id, stage, stage, QKV_seqlen);
+                  smem_Q_base_ptr, Q, Q_gmem_offset, Q_tile_id, stage, stage, Nq);
             }
           } else {
             if constexpr (!kPersistQg2s) {
               prefill::cp_async_qkv_g2s<Br, Q_tile_size, kHeadDim, kMmaAtomK, kNumThreads, kPadQ>(
-                  smem_Q_base_ptr, Q, Q_gmem_offset, Q_tile_id, stage, stage, QKV_seqlen);
+                  smem_Q_base_ptr, Q, Q_gmem_offset, Q_tile_id, stage, stage, Nq);
             }
           }
 
           prefill::cp_async_qkv_g2s<Bc, K_tile_size, kHeadDim, kMmaAtomK, kNumThreads, kPadK>(
-              smem_K_base_ptr, K, K_gmem_offset, tile_K_seqlen, stage, stage, QKV_seqlen);
+              smem_K_base_ptr, K, K_gmem_offset, tile_K_seqlen, stage, stage, Nkv);
           cp_async::commit_group();  // pack QK as 1 group.
         }  // end for stage
         cp_async::wait_group<(kStageQK - 2)>();
@@ -189,7 +255,7 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
 #pragma unroll
         for (int stage = 0; stage < (kStagePV - 1); ++stage) {
           prefill::cp_async_qkv_g2s<Bc, V_tile_size, kHeadDim, kMmaAtomN * 2, kNumThreads, kPadV>(
-              smem_V_base_ptr, V, V_gmem_offset, tile_K_seqlen, stage, stage, QKV_seqlen);
+              smem_V_base_ptr, V, V_gmem_offset, tile_K_seqlen, stage, stage, Nkv);
           cp_async::commit_group();
         }
       }
@@ -209,21 +275,21 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
           prefill::cp_async_qkv_g2s<Br, Q_tile_size, kHeadDim, kMmaAtomK, kNumThreads, kPadQ>(
               smem_Q_base_ptr, Q, Q_gmem_offset, Q_tile_id,
               (kStageQK > 1) ? (tile_K_d + (kStageQK - 1)) : tile_K_d,
-              (kStageQK > 1) ? smem_sel_next : smem_sel, QKV_seqlen);
+              (kStageQK > 1) ? smem_sel_next : smem_sel, Nq);
         }
       } else {
         if constexpr (!kPersistQg2s) {
           prefill::cp_async_qkv_g2s<Br, Q_tile_size, kHeadDim, kMmaAtomK, kNumThreads, kPadQ>(
               smem_Q_base_ptr, Q, Q_gmem_offset, Q_tile_id,
               (kStageQK > 1) ? (tile_K_d + (kStageQK - 1)) : tile_K_d,
-              (kStageQK > 1) ? smem_sel_next : smem_sel, QKV_seqlen);
+              (kStageQK > 1) ? smem_sel_next : smem_sel, Nq);
         }
       }
 
       prefill::cp_async_qkv_g2s<Bc, K_tile_size, kHeadDim, kMmaAtomK, kNumThreads, kPadK>(
           smem_K_base_ptr, K, K_gmem_offset, tile_K_seqlen,
           (kStageQK > 1) ? (tile_K_d + (kStageQK - 1)) : tile_K_d,
-          (kStageQK > 1) ? smem_sel_next : smem_sel, QKV_seqlen);
+          (kStageQK > 1) ? smem_sel_next : smem_sel, Nkv);
       cp_async::commit_group();  // pack QK as 1 group.
 
       if constexpr (kStageQK <= 1) {
@@ -281,7 +347,7 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
             for (int stage = 0; stage < (kStagePV - 1); ++stage) {
               prefill::cp_async_qkv_g2s<Bc, V_tile_size, kHeadDim, kMmaAtomN * 2, kNumThreads,
                                         kPadV>(smem_V_base_ptr, V, V_gmem_offset, tile_K_seqlen,
-                                               stage, stage, QKV_seqlen);
+                                               stage, stage, Nkv);
               cp_async::commit_group();
             }
           }
@@ -339,7 +405,7 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
 #pragma unroll
         for (int stage = 0; stage < (kStagePV - 1); ++stage) {
           prefill::cp_async_qkv_g2s<Bc, V_tile_size, kHeadDim, kMmaAtomN * 2, kNumThreads, kPadV>(
-              smem_V_base_ptr, V, V_gmem_offset, tile_K_seqlen, stage, stage, QKV_seqlen);
+              smem_V_base_ptr, V, V_gmem_offset, tile_K_seqlen, stage, stage, Nkv);
           cp_async::commit_group();
         }
       }
@@ -373,10 +439,10 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
     // 10       ...
     // ...
     // 15       T28: {c2, c3}  T29: {c2, c3}  T30: {c2, c3}  T31: {c2, c3}
-    // Seqlen boundary: on the last KV tile with QKV_seqlen % Bc != 0, mask
+    // Seqlen boundary: on the last KV tile with Nq % Bc != 0, mask
     // padding columns to -inf so online softmax ignores them.
     {
-      const int kv_valid_local = QKV_seqlen - tile_K_seqlen * Bc;
+      const int kv_valid_local = Nkv - tile_K_seqlen * Bc;
       if (kv_valid_local < Bc) {
         prefill::sync_apply_kv_mask<kValTileSeqLenK, kMmaAccFloat32QK, kDataType>(&R_S[0][0][0],
                                                                                   kv_valid_local);
@@ -401,11 +467,11 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
           // if kPersistQs2r is enabled.
           if constexpr (!kPersistQs2r) {
             prefill::cp_async_qkv_g2s<Br, Q_tile_size, kHeadDim, kMmaAtomK, kNumThreads, kPadQ>(
-                smem_Q_base_ptr, Q, Q_gmem_offset, Q_tile_id, stage, stage, QKV_seqlen);
+                smem_Q_base_ptr, Q, Q_gmem_offset, Q_tile_id, stage, stage, Nq);
           }
 
           prefill::cp_async_qkv_g2s<Bc, K_tile_size, kHeadDim, kMmaAtomK, kNumThreads, kPadK>(
-              smem_K_base_ptr, K, K_gmem_offset, tile_K_seqlen + 1, stage, stage, QKV_seqlen);
+              smem_K_base_ptr, K, K_gmem_offset, tile_K_seqlen + 1, stage, stage, Nkv);
           cp_async::commit_group();  // pack QK as 1 group.
         }  // end for stage
       }
@@ -431,7 +497,7 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
           prefill::cp_async_qkv_g2s<Bc, V_tile_size, kHeadDim, kMmaAtomN * 2, kNumThreads, kPadV>(
               smem_V_base_ptr, V, V_gmem_offset, tile_K_seqlen,
               (kStagePV > 1) ? (tile_V_d + (kStagePV - 1)) : tile_V_d,
-              (kStagePV > 1) ? smem_sel_v_next : smem_sel_v, QKV_seqlen);
+              (kStagePV > 1) ? smem_sel_v_next : smem_sel_v, Nkv);
           cp_async::commit_group();
           if constexpr (kStagePV <= 1) {
             cp_async::wait_group<0>();
@@ -467,12 +533,12 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
                   if constexpr (!kPersistQs2r) {
                     prefill::cp_async_qkv_g2s<Br, Q_tile_size, kHeadDim, kMmaAtomK, kNumThreads,
                                               kPadQ>(smem_Q_base_ptr, Q, Q_gmem_offset, Q_tile_id,
-                                                     stage, stage, QKV_seqlen);
+                                                     stage, stage, Nq);
                   }
 
                   prefill::cp_async_qkv_g2s<Bc, K_tile_size, kHeadDim, kMmaAtomK, kNumThreads,
                                             kPadK>(smem_K_base_ptr, K, K_gmem_offset,
-                                                   tile_K_seqlen + 1, stage, stage, QKV_seqlen);
+                                                   tile_K_seqlen + 1, stage, stage, Nkv);
                   cp_async::commit_group();  // pack QK as 1 group.
                 }  // end for stage
               }
@@ -584,9 +650,70 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
   static_assert(kValTileSeqLenP == 1);
   prefill::sync_store_o_r2g<Br, kHeadDim, kMmaAtomM, kMmaAtomN, kValTileHeadDimV,
                             kOStorageAccFloat32, kDataType>(
-      O, O_gmem_offset, O_tile_id, warp_QP, &R_D[0][0][0], &R_Q[0][0][0], &R_K[0][0], QKV_seqlen);
+      O, O_gmem_offset, O_tile_id, warp_QP, &R_D[0][0][0], &R_Q[0][0][0], &R_K[0][0], Nq);
 }
 
+// ============================================================================
+// ffpa_stages_split_q_small_d_template
+// ----------------------------------------------------------------------------
+// Split-Q (FlashAttention-2) prefill attention kernel tuned for *small* head
+// dimensions (D <= 128, up to 256). Unlike the "large-d" variant, this kernel
+// persists the full Q / K / V tile across head-dim within one KV step (no
+// inner tile_K_d loop), matching the classical FA-2 schedule. It therefore
+// uses more SMEM but fewer synchronizations, giving better throughput when D
+// is small.
+//
+// Supports cross-attention (Nq may differ from Nkv); Nk == Nv is required
+// and is asserted by the launcher. Causal mask and GQA/MQA are not supported.
+//
+// ----------------------------------------------------------------------------
+// Template parameters (compile-time configuration)
+// ----------------------------------------------------------------------------
+//   kDataType            Activation dtype: __half or __nv_bfloat16.
+//   kHeadDim             Head dimension D; must satisfy D <= 256 (static_assert).
+//   kMmaAtomM/N/K        MMA atom shape for m16n8k16 (fixed to 16/8/16).
+//   kMmaTileSeqLenQ/K/P  Warp-level MMA tiling along Q rows / K cols / P rows.
+//   kMmaTileHeadDimV     Warp-level MMA tiling along V cols (head-dim).
+//   kValTileSeqLenQ/K/P  Value-level multipliers forming Br, Bc as in the
+//                        large-d template.
+//   kValTileHeadDimV     Value tiling over head-dim for P@V.
+//   kMmaAccFloat32QK/PV  0 -> fp16 MMA accumulator, 1 -> fp32 accumulator
+//                        (bf16 requires 1).
+//   kOStorageAccFloat32  0/1, O accumulator storage dtype selector.
+//   kPrefetchQK/PV       0/1, enable async prefetch of next QK / PV tiles.
+//   kShareSmemQKV        0/1, share QK SMEM region when kPersistQs2r is on.
+//   kPersistQs2r         0/1, persist Q registers across all KV tiles.
+//   kPersistVs2r         0/1, persist the full V tile in registers across the
+//                        P@V inner loop (only viable for small D).
+//   kRegPipeKV           0/1, register ping-pong between ldmatrix and mma.
+//                        Mutually exclusive with kPersistVs2r.
+//   kStageQK / kStagePV  Must both be 1 for this template (static_assert).
+//   kPadQ / kPadK / kPadV 0 -> SMEM swizzle, >0 -> padded SMEM layout.
+//
+// ----------------------------------------------------------------------------
+// Runtime parameters
+// ----------------------------------------------------------------------------
+//   Q   in : fp16/bf16 tensor, shape [Nb, Nh, Nq,  D].
+//   K   in : fp16/bf16 tensor, shape [Nb, Nh, Nkv, D].
+//   V   in : fp16/bf16 tensor, shape [Nb, Nh, Nkv, D].
+//   O   out: fp16/bf16 tensor, shape [Nb, Nh, Nq,  D]; written in place.
+//   Nb     : Batch size; combined with Nh to fan out across gridDim.y.
+//   Nq     : Query sequence length; drives gridDim.x = div_ceil(Nq, Br) and
+//            the tail-row store predicate.
+//   Nkv    : Key/Value sequence length (Nk == Nv); drives the KV loop bound
+//            Tc = div_ceil(Nkv, Bc) and the tail-tile softmax mask.
+//   Nh     : Number of attention heads; used with blockIdx.y to recover
+//            (batch, head) indices.
+//   scale  : Softmax pre-scale, typically 1 / sqrt(D).
+//   Tc     : Precomputed KV tile count = div_ceil(Nkv, Bc).
+//
+// ----------------------------------------------------------------------------
+// Grid / block layout (identical shape to the large-d template)
+// ----------------------------------------------------------------------------
+//   Block: (WARP_SIZE * kMmaTileSeqLenQ * kMmaTileSeqLenK, 1, 1).
+//   Grid : (div_ceil(Nq, Br), Nb*Nh) or (div_ceil(Nq, Br), Nh, Nb) under
+//          ENABLE_FFPA_LAUNCH_GRID_DNHB.
+// ============================================================================
 template <
     typename kDataType,          // Activation dtype (__half or __nv_bfloat16).
     const int kHeadDim,          // Headdim, 32~1024
@@ -620,7 +747,7 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
     ffpa_stages_split_q_small_d_template(const kDataType* __restrict__ Q,
                                          const kDataType* __restrict__ K,
                                          const kDataType* __restrict__ V, kDataType* __restrict__ O,
-                                         const int QKV_seqlen, const int QKV_head,
+                                         const int Nq, const int Nkv, const int Nh,
                                          const float scale, const int Tc) {
   // NOTE: This kernel template is developed for small head dimensions (d <= 128),
   // namely, flash-attention-2. Always persist QKV for flash-attn, apply tiling at
@@ -637,28 +764,28 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
   constexpr int Bc = kMmaAtomN * kMmaTileSeqLenK * kValTileSeqLenK;
   constexpr int kNumThreads = WARP_SIZE * kMmaTileSeqLenQ * kMmaTileSeqLenK;
 #ifdef ENABLE_FFPA_LAUNCH_GRID_DNHB
-  // grid(div_ceil(QKV_seqlen, Br), QKV_head, QKV_batch), (x,y,z)
-  const int QKV_batch_id = blockIdx.z;  // Batch size
-  const int QKV_head_id = blockIdx.y;   // Head num
+  // grid(div_ceil(Nq, Br), Nh, Nb), (x,y,z)
+  const int Nb_id = blockIdx.z;  // Batch size
+  const int Nh_id = blockIdx.y;  // Head num
 #else
-  // grid(div_ceil(QKV_seqlen, Br), QKV_batch * QKV_head), (x,y,z)
-  const int QKV_batch_id = blockIdx.y / QKV_head;  // Batch size
-  const int QKV_head_id = blockIdx.y % QKV_head;   // Head num
+  // grid(div_ceil(Nq, Br), Nb * Nh), (x,y,z)
+  const int Nb_id = blockIdx.y / Nh;  // Batch size
+  const int Nh_id = blockIdx.y % Nh;  // Head num
 #endif
   const int Q_tile_id = blockIdx.x;             // Q tile_id, range [0, Tr]
   const int O_tile_id = Q_tile_id;              // O tile_id, same as Q.
   const int warp_QP = threadIdx.x / WARP_SIZE;  // 0,1,2,3 or 0~7
   constexpr int warp_KV = 0;                    // 0
-  const int Q_gmem_offset = ((QKV_batch_id * QKV_head * QKV_seqlen * kHeadDim) +
-                             (QKV_head_id * QKV_seqlen * kHeadDim));  // Q [seqlen,d]
-  const int K_gmem_offset = ((QKV_batch_id * QKV_head * QKV_seqlen * kHeadDim) +
-                             (QKV_head_id * QKV_seqlen * kHeadDim));  // K [seqlen,d]
-  const int V_gmem_offset = Q_gmem_offset;                            // V [seqlen,d]
-  const int O_gmem_offset = Q_gmem_offset;                            // O [seqlen,d]
+  const int Q_gmem_offset =
+      ((Nb_id * Nh * Nq * kHeadDim) + (Nh_id * Nq * kHeadDim));  // Q [seqlen,d]
+  const int K_gmem_offset =
+      ((Nb_id * Nh * Nkv * kHeadDim) + (Nh_id * Nkv * kHeadDim));  // K [seqlen,d]
+  const int V_gmem_offset = K_gmem_offset;                         // V [seqlen,d]
+  const int O_gmem_offset = Q_gmem_offset;                         // O [seqlen,d]
 
   // int load_gmem_Q_Br = Q_tile_id * Br + load_smem_Q_Br;
-  // if ((Q_tile_id * Br + (threadIdx.x / (kNumThreads / Br))) >= QKV_seqlen) return;
-  if ((Q_tile_id * Br) >= QKV_seqlen)
+  // if ((Q_tile_id * Br + (threadIdx.x / (kNumThreads / Br))) >= Nq) return;
+  if ((Q_tile_id * Br) >= Nq)
     return;
 
   extern __shared__ __align__(16) unsigned char ffpa_smem_raw[];
@@ -682,7 +809,7 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
 #pragma unroll
   for (int tile_K_d = 0; tile_K_d < (kHeadDim / kMmaAtomK); ++tile_K_d) {
     prefill::cp_async_qkv_g2s<Br, Q_tile_size, kHeadDim, kMmaAtomK, kNumThreads, kPadQ>(
-        smem_Q_base_ptr, Q, Q_gmem_offset, Q_tile_id, tile_K_d, tile_K_d, QKV_seqlen);
+        smem_Q_base_ptr, Q, Q_gmem_offset, Q_tile_id, tile_K_d, tile_K_d, Nq);
   }
   cp_async::commit_group();
 
@@ -734,7 +861,7 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
 #pragma unroll
         for (int tile_K_d = 0; tile_K_d < (kHeadDim / kMmaAtomK); ++tile_K_d) {
           prefill::cp_async_qkv_g2s<Bc, K_tile_size, kHeadDim, kMmaAtomK, kNumThreads, kPadK>(
-              smem_K_base_ptr, K, K_gmem_offset, tile_K_seqlen, tile_K_d, tile_K_d, QKV_seqlen);
+              smem_K_base_ptr, K, K_gmem_offset, tile_K_seqlen, tile_K_d, tile_K_d, Nkv);
         }
         cp_async::commit_group();
         cp_async::wait_group<0>();
@@ -747,7 +874,7 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
 #pragma unroll
       for (int tile_K_d = 0; tile_K_d < (kHeadDim / kMmaAtomK); ++tile_K_d) {
         prefill::cp_async_qkv_g2s<Bc, K_tile_size, kHeadDim, kMmaAtomK, kNumThreads, kPadK>(
-            smem_K_base_ptr, K, K_gmem_offset, tile_K_seqlen, tile_K_d, tile_K_d, QKV_seqlen);
+            smem_K_base_ptr, K, K_gmem_offset, tile_K_seqlen, tile_K_d, tile_K_d, Nkv);
       }
       cp_async::commit_group();
       cp_async::wait_group<0>();
@@ -760,7 +887,7 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
         const int tile_V_d = (j >> 1);  // (j / 2)
         if (j % 2 == 0) {
           prefill::cp_async_qkv_g2s<Bc, V_tile_size, kHeadDim, kMmaAtomN * 2, kNumThreads, kPadV>(
-              smem_V_base_ptr, V, V_gmem_offset, tile_K_seqlen, tile_V_d, tile_V_d, QKV_seqlen);
+              smem_V_base_ptr, V, V_gmem_offset, tile_K_seqlen, tile_V_d, tile_V_d, Nkv);
         }
       }
       cp_async::commit_group();
@@ -839,7 +966,7 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
         const int tile_V_d = (j >> 1);  // (j / 2)
         if (j % 2 == 0) {
           prefill::cp_async_qkv_g2s<Bc, V_tile_size, kHeadDim, kMmaAtomN * 2, kNumThreads, kPadV>(
-              smem_V_base_ptr, V, V_gmem_offset, tile_K_seqlen, tile_V_d, tile_V_d, QKV_seqlen);
+              smem_V_base_ptr, V, V_gmem_offset, tile_K_seqlen, tile_V_d, tile_V_d, Nkv);
         }
       }
       cp_async::commit_group();
@@ -873,10 +1000,10 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
     // 10       ...
     // ...
     // 15       T28: {c2, c3}  T29: {c2, c3}  T30: {c2, c3}  T31: {c2, c3}
-    // Seqlen boundary: on the last KV tile with QKV_seqlen % Bc != 0, mask
+    // Seqlen boundary: on the last KV tile with Nq % Bc != 0, mask
     // padding columns to -inf so online softmax ignores them.
     {
-      const int kv_valid_local = QKV_seqlen - tile_K_seqlen * Bc;
+      const int kv_valid_local = Nkv - tile_K_seqlen * Bc;
       if (kv_valid_local < Bc) {
         prefill::sync_apply_kv_mask<kValTileSeqLenK, kMmaAccFloat32QK, kDataType>(&R_S[0][0][0],
                                                                                   kv_valid_local);
@@ -896,8 +1023,7 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
 #pragma unroll
         for (int tile_K_d = 0; tile_K_d < (kHeadDim / kMmaAtomK); ++tile_K_d) {
           prefill::cp_async_qkv_g2s<Bc, K_tile_size, kHeadDim, kMmaAtomK, kNumThreads, kPadK>(
-              smem_K_base_ptr, K, K_gmem_offset, (tile_K_seqlen + 1), tile_K_d, tile_K_d,
-              QKV_seqlen);
+              smem_K_base_ptr, K, K_gmem_offset, (tile_K_seqlen + 1), tile_K_d, tile_K_d, Nkv);
         }
         cp_async::commit_group();  // pack K as 1 group.
       }  // end if (tile_K_seqlen + 1) < Tc
@@ -1034,5 +1160,5 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
   static_assert(kValTileSeqLenP == 1);
   prefill::sync_store_o_r2g<Br, kHeadDim, kMmaAtomM, kMmaAtomN, kValTileHeadDimV,
                             kOStorageAccFloat32, kDataType>(
-      O, O_gmem_offset, O_tile_id, warp_QP, &R_D[0][0][0], &R_Q[0][0][0], &R_K[0][0], QKV_seqlen);
+      O, O_gmem_offset, O_tile_id, warp_QP, &R_D[0][0][0], &R_Q[0][0][0], &R_K[0][0], Nq);
 }
