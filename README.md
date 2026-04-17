@@ -32,9 +32,9 @@ pip3 install dist/*.whl # pip uninstall ffpa-attn -y
 ```
 
 > [!NOTE]
-> FFPA currently only supports **equal-length Q/K/V self-attention** (i.e. `Nq == Nk == Nv`). **Causal attention (causal mask)** and cross-attention / incremental decoding where KV length differs from Q length are **not supported yet**.
+> FFPA supports cross-attention where the query seqlen ``Nq`` may differ from the key/value seqlen ``Nkv``, but requires **`Nk == Nv`** (no GQA/MQA). **Causal attention (causal mask)** is **not supported yet**.
 
-Minimal usage example (B=1, H=32, N=8192, D=512):
+Minimal usage example — **Self-Attention** (B=1, H=32, N=8192, D=512):
 ```python
 import torch
 import torch.nn.functional as F
@@ -55,6 +55,27 @@ ref = F.scaled_dot_product_attention(q, k, v)
 max_abs = (out - ref).abs().max().item()
 mean_abs = (out - ref).abs().mean().item()
 print(f"vs SDPA: max_abs_err={max_abs:.4e}, mean_abs_err={mean_abs:.4e}")
+```
+
+**Cross-Attention** or **Decoding-Attention** example (short query, long KV cache; `Nq != Nkv`):
+```python
+import torch
+import torch.nn.functional as F
+from ffpa_attn import ffpa_attn_func
+
+# Short-query / long-KV, e.g. incremental decoding or cross-attention:
+# Q: [B, H, Nq, D], K/V: [B, H, Nkv, D]; Nq can differ from Nkv but Nk==Nv required.
+B, H, D = 1, 8, 512
+Nq, Nkv = 128, 8192
+q = torch.randn(B, H, Nq,  D, dtype=torch.bfloat16, device="cuda")
+k = torch.randn(B, H, Nkv, D, dtype=torch.bfloat16, device="cuda")
+v = torch.randn(B, H, Nkv, D, dtype=torch.bfloat16, device="cuda")
+
+out = ffpa_attn_func(q, k, v)  # -> (B, H, Nq, D) = (1, 8, 128, 512)
+print(out.shape, out.dtype)
+
+ref = F.scaled_dot_product_attention(q, k, v)
+print(f"cross-attn vs SDPA max_abs_err={(out - ref).abs().max().item():.4e}")
 ```
 
 A runnable end-to-end example (with SDPA accuracy/perf comparison, both aligned N=8192 and non-aligned N=8191 cases) is provided under [`examples/run_ffpa_attn.py`](./examples/run_ffpa_attn.py):
