@@ -8,27 +8,31 @@
 // kept private to this TU and are the only routes through which the
 // heavy templated kernel specializations are reached.
 void ffpa_mma_acc_f16_fp16(torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O,
-                           int stages);
+                           int stages, int causal, double softmax_scale);
 void ffpa_mma_acc_f32_fp16(torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O,
-                           int stages);
+                           int stages, int causal, double softmax_scale);
 void ffpa_mma_acc_f32_bf16(torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O,
-                           int stages);
+                           int stages, int causal, double softmax_scale);
 
 // Public unified pybind entry. ``acc`` encoding:
 //   0 -> fp16 MMA accumulator (only valid for fp16 activations).
 //   1 -> fp32 MMA accumulator (valid for fp16 and bf16 activations).
 // The Python side translates ``acc='f16' / 'f32'`` to these integer codes
 // so the torch.library op schema stays simple and torch.compile-friendly.
+// ``softmax_scale`` is the pre-softmax scaling factor applied to QK^T
+// (named to match the flash-attn convention); the Python wrapper
+// defaults it to ``1 / sqrt(D)`` when unset.
 void ffpa_attn(torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O, int64_t stages,
-               int64_t acc) {
+               int64_t acc, int64_t causal, double softmax_scale) {
   const auto dtype = Q.scalar_type();
   const int stages_i = static_cast<int>(stages);
+  const int causal_i = static_cast<int>(causal);
 
   if (dtype == torch::kHalf) {
     if (acc == 0) {
-      ffpa_mma_acc_f16_fp16(Q, K, V, O, stages_i);
+      ffpa_mma_acc_f16_fp16(Q, K, V, O, stages_i, causal_i, softmax_scale);
     } else if (acc == 1) {
-      ffpa_mma_acc_f32_fp16(Q, K, V, O, stages_i);
+      ffpa_mma_acc_f32_fp16(Q, K, V, O, stages_i, causal_i, softmax_scale);
     } else {
       throw std::invalid_argument("ffpa_attn: acc must be 0 (f16) or 1 (f32)");
     }
@@ -38,7 +42,7 @@ void ffpa_attn(torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor 
           "ffpa_attn: bf16 activations require acc=1 (f32); "
           "no bf16-acc mma PTX exists.");
     }
-    ffpa_mma_acc_f32_bf16(Q, K, V, O, stages_i);
+    ffpa_mma_acc_f32_bf16(Q, K, V, O, stages_i, causal_i, softmax_scale);
   } else {
     throw std::invalid_argument("ffpa_attn: Q.dtype must be torch.float16 or torch.bfloat16");
   }
@@ -46,5 +50,5 @@ void ffpa_attn(torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor 
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("ffpa_attn", &ffpa_attn,
-        "FFPA unified prefill attention dispatch (fp16/bf16, acc=f16/f32)");
+        "FFPA unified prefill attention dispatch (fp16/bf16, acc=f16/f32, causal, softmax_scale)");
 }

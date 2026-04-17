@@ -173,3 +173,177 @@ def test_ffpa_attn_func_rejects_mismatched_kv_seqlen():
   v = torch.randn(1, 4, 2048, 128, dtype=torch.float16, device="cuda")
   with pytest.raises(ValueError, match="seqlen"):
     ffpa_attn_func(q, k, v, stages=2, acc="f32")
+
+
+# GQA / MQA: Q has Nh_q heads, K/V have Nh_kv heads (Nh_q % Nh_kv == 0).
+# group_size = Nh_q / Nh_kv; MHA is group_size=1, MQA is Nh_kv=1.
+# Covers standard GQA ratios, MQA, and a mix with cross-attention seqlens.
+GQA_HEAD_CONFIGS = [
+  # (Nh_q, Nh_kv)
+  (8, 1),  # MQA
+  (16, 2),  # GQA (typical 8x)
+  (32, 4),  # GQA (typical 8x)
+  (32, 8),  # GQA (4x, Llama-3 style)
+  (16, 16),  # MHA degenerate (group_size=1)
+]
+GQA_SEQLENS = [
+  # (Nq, Nkv)
+  (128, 128),
+  (1024, 1024),
+  (128, 8192),  # short Q, long KV (decoding-style)
+  (1024, 4096),  # cross + GQA
+]
+GQA_HEADDIMS = [64, 128, 256, 512]
+
+
+@pytest.mark.parametrize("dtype", DTYPES, ids=["fp16", "bf16"])
+@pytest.mark.parametrize("Nh_q,Nh_kv", GQA_HEAD_CONFIGS)
+@pytest.mark.parametrize("Nq,Nkv", GQA_SEQLENS)
+@pytest.mark.parametrize("D", GQA_HEADDIMS)
+def test_ffpa_attn_func_gqa(dtype, Nh_q, Nh_kv, Nq, Nkv, D):
+  B = 1
+  torch.manual_seed(0)
+  q = torch.randn(B, Nh_q, Nq, D, dtype=dtype, device="cuda")
+  k = torch.randn(B, Nh_kv, Nkv, D, dtype=dtype, device="cuda")
+  v = torch.randn(B, Nh_kv, Nkv, D, dtype=dtype, device="cuda")
+  out = ffpa_attn_func(q, k, v, stages=2, acc=_acc_for(dtype))
+  group_size = Nh_q // Nh_kv
+  k_ref = k.repeat_interleave(group_size, dim=1)
+  v_ref = v.repeat_interleave(group_size, dim=1)
+  ref = _sdpa_ref(q, k_ref, v_ref)
+  assert out.shape == (B, Nh_q, Nq, D)
+  assert out.dtype == dtype
+  assert torch.isfinite(out
+                        ).all(), (f"FFPA output has NaN/Inf at Nh_q={Nh_q}, Nh_kv={Nh_kv}, Nq={Nq}, Nkv={Nkv}, D={D}")
+  torch.testing.assert_close(out, ref, **_tolerance(dtype))
+
+
+def test_ffpa_attn_func_rejects_indivisible_num_heads():
+  torch.manual_seed(0)
+  # Nh_q=12, Nh_kv=8 -> 12 % 8 != 0
+  q = torch.randn(1, 12, 128, 128, dtype=torch.float16, device="cuda")
+  k = torch.randn(1, 8, 128, 128, dtype=torch.float16, device="cuda")
+  v = torch.randn(1, 8, 128, 128, dtype=torch.float16, device="cuda")
+  with pytest.raises(ValueError, match="num_heads"):
+    ffpa_attn_func(q, k, v, stages=2, acc="f32")
+
+
+def test_ffpa_attn_func_rejects_mismatched_kv_num_heads():
+  torch.manual_seed(0)
+  q = torch.randn(1, 16, 128, 128, dtype=torch.float16, device="cuda")
+  k = torch.randn(1, 4, 128, 128, dtype=torch.float16, device="cuda")
+  v = torch.randn(1, 2, 128, 128, dtype=torch.float16, device="cuda")
+  with pytest.raises(ValueError, match="num_heads"):
+    ffpa_attn_func(q, k, v, stages=2, acc="f32")
+
+
+# Causal attention: queries are aligned to the tail of the KV sequence so
+# Q row ``r`` only attends to ``k <= r + (Nkv - Nq)`` (the standard
+# FlashAttention "causal" convention). Covers:
+#   - self-attention causal (Nq == Nkv) with aligned and non-aligned seqlens,
+#   - decoding-style short-Q / long-KV causal (Nq < Nkv, every Q row sees
+#     the full KV prefix beyond the diagonal),
+#   - both small-D (<= 128) and large-D kernel paths,
+#   - combined with GQA.
+CAUSAL_SELF_SHAPES = [
+  # (N, D), Nq == Nkv
+  (64, 128),
+  (128, 64),
+  (1024, 128),
+  (1024, 256),
+  (4096, 128),
+  (127, 128),  # non-aligned tail
+  (129, 256),  # crosses Br=Bc=64 boundary by one row
+  # FFPA targets large headdim (FA-2 caps at 256); cover the D > 256 path too.
+  (512, 320),
+  (1024, 512),
+  (512, 1024),
+]
+CAUSAL_CROSS_SHAPES = [
+  # (Nq, Nkv, D); Nkv >= Nq required
+  (1, 8192, 128),  # 1-token decoding
+  (128, 1024, 128),  # short prefill
+  (128, 8192, 256),  # short prefill, long context
+  (1024, 4096, 128),  # chunked prefill
+  (129, 2048, 512),  # non-aligned Nq + large D
+  (128, 4096, 512),  # long context + D=512 (FFPA's sweet spot)
+  (64, 2048, 1024),  # short decoding with maximum D=1024
+]
+
+
+@pytest.mark.parametrize("dtype", DTYPES, ids=["fp16", "bf16"])
+@pytest.mark.parametrize("N,D", CAUSAL_SELF_SHAPES)
+def test_ffpa_attn_func_causal_self_attention(dtype, N, D):
+  B, H = 1, 4
+  q, k, v = _alloc_qkv(B, H, N, D, dtype)
+  out = ffpa_attn_func(q, k, v, stages=2, acc=_acc_for(dtype), causal=True)
+  ref = F.scaled_dot_product_attention(q, k, v, is_causal=True, scale=1.0 / math.sqrt(D))
+  assert out.shape == ref.shape
+  assert out.dtype == dtype
+  assert torch.isfinite(out).all(), f"FFPA causal output has NaN/Inf at N={N}, D={D}"
+  torch.testing.assert_close(out, ref, **_tolerance(dtype))
+
+
+@pytest.mark.parametrize("dtype", DTYPES, ids=["fp16", "bf16"])
+@pytest.mark.parametrize("Nq,Nkv,D", CAUSAL_CROSS_SHAPES)
+def test_ffpa_attn_func_causal_cross_attention(dtype, Nq, Nkv, D):
+  B, H = 1, 4
+  q, k, v = _alloc_cross_qkv(B, H, Nq, Nkv, D, dtype)
+  out = ffpa_attn_func(q, k, v, stages=2, acc=_acc_for(dtype), causal=True)
+  # Reference: build an explicit attn mask where Q row r may attend to
+  # KV positions k <= r + (Nkv - Nq). SDPA's is_causal only supports
+  # the Nq == Nkv square case, so use attn_mask for the general case.
+  kv_offset = Nkv - Nq
+  row_idx = torch.arange(Nq, device="cuda").view(-1, 1)
+  col_idx = torch.arange(Nkv, device="cuda").view(1, -1)
+  attn_mask = (col_idx <= (row_idx + kv_offset))  # [Nq, Nkv] bool
+  ref = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, scale=1.0 / math.sqrt(D))
+  assert out.shape == (B, H, Nq, D)
+  assert out.dtype == dtype
+  assert torch.isfinite(out).all(), (f"FFPA causal output has NaN/Inf at Nq={Nq}, Nkv={Nkv}, D={D}")
+  torch.testing.assert_close(out, ref, **_tolerance(dtype))
+
+
+@pytest.mark.parametrize("dtype", DTYPES, ids=["fp16", "bf16"])
+@pytest.mark.parametrize("Nh_q,Nh_kv", [(8, 1), (32, 4), (32, 8)])
+@pytest.mark.parametrize(
+  "Nq,Nkv,D",
+  [
+    (128, 128, 128),
+    (1024, 1024, 128),
+    (128, 4096, 256),
+    # Large-headdim (> 256) causal + GQA — FFPA's core use case.
+    (1024, 1024, 512),
+    (128, 4096, 512),
+    (512, 2048, 1024),
+  ],
+)
+def test_ffpa_attn_func_causal_gqa(dtype, Nh_q, Nh_kv, Nq, Nkv, D):
+  B = 1
+  torch.manual_seed(0)
+  q = torch.randn(B, Nh_q, Nq, D, dtype=dtype, device="cuda")
+  k = torch.randn(B, Nh_kv, Nkv, D, dtype=dtype, device="cuda")
+  v = torch.randn(B, Nh_kv, Nkv, D, dtype=dtype, device="cuda")
+  out = ffpa_attn_func(q, k, v, stages=2, acc=_acc_for(dtype), causal=True)
+  group_size = Nh_q // Nh_kv
+  k_ref = k.repeat_interleave(group_size, dim=1)
+  v_ref = v.repeat_interleave(group_size, dim=1)
+  kv_offset = Nkv - Nq
+  row_idx = torch.arange(Nq, device="cuda").view(-1, 1)
+  col_idx = torch.arange(Nkv, device="cuda").view(1, -1)
+  attn_mask = (col_idx <= (row_idx + kv_offset))
+  ref = F.scaled_dot_product_attention(q, k_ref, v_ref, attn_mask=attn_mask, scale=1.0 / math.sqrt(D))
+  assert out.shape == (B, Nh_q, Nq, D)
+  assert out.dtype == dtype
+  assert torch.isfinite(out).all()
+  torch.testing.assert_close(out, ref, **_tolerance(dtype))
+
+
+def test_ffpa_attn_func_rejects_causal_with_shorter_kv():
+  torch.manual_seed(0)
+  # Nq > Nkv + causal is rejected (no valid keys for later Q rows).
+  q = torch.randn(1, 4, 256, 128, dtype=torch.float16, device="cuda")
+  k = torch.randn(1, 4, 128, 128, dtype=torch.float16, device="cuda")
+  v = torch.randn(1, 4, 128, 128, dtype=torch.float16, device="cuda")
+  with pytest.raises(ValueError, match="causal"):
+    ffpa_attn_func(q, k, v, stages=2, acc="f32", causal=True)

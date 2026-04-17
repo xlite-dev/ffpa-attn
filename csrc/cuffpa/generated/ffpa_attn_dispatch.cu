@@ -7,45 +7,47 @@ void ffpa_mma_acc_f16_fp16(
     torch::Tensor K,
     torch::Tensor V,
     torch::Tensor O,
-    int stages) {
+    int stages,
+    int causal,
+    double softmax_scale) {
   CHECK_TORCH_TENSOR_DTYPE(Q, torch::kHalf)
   CHECK_TORCH_TENSOR_DTYPE(K, torch::kHalf)
   CHECK_TORCH_TENSOR_DTYPE(V, torch::kHalf)
   CHECK_TORCH_TENSOR_DTYPE(O, torch::kHalf)
   const int d = Q.size(3);
   switch (d) {
-    case 32: ffpa_mma_acc_f16_fp16_d32(Q, K, V, O, stages); break;
-    case 64: ffpa_mma_acc_f16_fp16_d64(Q, K, V, O, stages); break;
-    case 96: ffpa_mma_acc_f16_fp16_d96(Q, K, V, O, stages); break;
-    case 128: ffpa_mma_acc_f16_fp16_d128(Q, K, V, O, stages); break;
-    case 160: ffpa_mma_acc_f16_fp16_d160(Q, K, V, O, stages); break;
-    case 192: ffpa_mma_acc_f16_fp16_d192(Q, K, V, O, stages); break;
-    case 224: ffpa_mma_acc_f16_fp16_d224(Q, K, V, O, stages); break;
-    case 256: ffpa_mma_acc_f16_fp16_d256(Q, K, V, O, stages); break;
-    case 288: ffpa_mma_acc_f16_fp16_d288(Q, K, V, O, stages); break;
-    case 320: ffpa_mma_acc_f16_fp16_d320(Q, K, V, O, stages); break;
-    case 352: ffpa_mma_acc_f16_fp16_d352(Q, K, V, O, stages); break;
-    case 384: ffpa_mma_acc_f16_fp16_d384(Q, K, V, O, stages); break;
-    case 416: ffpa_mma_acc_f16_fp16_d416(Q, K, V, O, stages); break;
-    case 448: ffpa_mma_acc_f16_fp16_d448(Q, K, V, O, stages); break;
-    case 480: ffpa_mma_acc_f16_fp16_d480(Q, K, V, O, stages); break;
-    case 512: ffpa_mma_acc_f16_fp16_d512(Q, K, V, O, stages); break;
-    case 544: ffpa_mma_acc_f16_fp16_d544(Q, K, V, O, stages); break;
-    case 576: ffpa_mma_acc_f16_fp16_d576(Q, K, V, O, stages); break;
-    case 608: ffpa_mma_acc_f16_fp16_d608(Q, K, V, O, stages); break;
-    case 640: ffpa_mma_acc_f16_fp16_d640(Q, K, V, O, stages); break;
-    case 672: ffpa_mma_acc_f16_fp16_d672(Q, K, V, O, stages); break;
-    case 704: ffpa_mma_acc_f16_fp16_d704(Q, K, V, O, stages); break;
-    case 736: ffpa_mma_acc_f16_fp16_d736(Q, K, V, O, stages); break;
-    case 768: ffpa_mma_acc_f16_fp16_d768(Q, K, V, O, stages); break;
-    case 800: ffpa_mma_acc_f16_fp16_d800(Q, K, V, O, stages); break;
-    case 832: ffpa_mma_acc_f16_fp16_d832(Q, K, V, O, stages); break;
-    case 864: ffpa_mma_acc_f16_fp16_d864(Q, K, V, O, stages); break;
-    case 896: ffpa_mma_acc_f16_fp16_d896(Q, K, V, O, stages); break;
-    case 928: ffpa_mma_acc_f16_fp16_d928(Q, K, V, O, stages); break;
-    case 960: ffpa_mma_acc_f16_fp16_d960(Q, K, V, O, stages); break;
-    case 992: ffpa_mma_acc_f16_fp16_d992(Q, K, V, O, stages); break;
-    case 1024: ffpa_mma_acc_f16_fp16_d1024(Q, K, V, O, stages); break;
+    case 32: ffpa_mma_acc_f16_fp16_d32(Q, K, V, O, stages, causal, softmax_scale); break;
+    case 64: ffpa_mma_acc_f16_fp16_d64(Q, K, V, O, stages, causal, softmax_scale); break;
+    case 96: ffpa_mma_acc_f16_fp16_d96(Q, K, V, O, stages, causal, softmax_scale); break;
+    case 128: ffpa_mma_acc_f16_fp16_d128(Q, K, V, O, stages, causal, softmax_scale); break;
+    case 160: ffpa_mma_acc_f16_fp16_d160(Q, K, V, O, stages, causal, softmax_scale); break;
+    case 192: ffpa_mma_acc_f16_fp16_d192(Q, K, V, O, stages, causal, softmax_scale); break;
+    case 224: ffpa_mma_acc_f16_fp16_d224(Q, K, V, O, stages, causal, softmax_scale); break;
+    case 256: ffpa_mma_acc_f16_fp16_d256(Q, K, V, O, stages, causal, softmax_scale); break;
+    case 288: ffpa_mma_acc_f16_fp16_d288(Q, K, V, O, stages, causal, softmax_scale); break;
+    case 320: ffpa_mma_acc_f16_fp16_d320(Q, K, V, O, stages, causal, softmax_scale); break;
+    case 352: ffpa_mma_acc_f16_fp16_d352(Q, K, V, O, stages, causal, softmax_scale); break;
+    case 384: ffpa_mma_acc_f16_fp16_d384(Q, K, V, O, stages, causal, softmax_scale); break;
+    case 416: ffpa_mma_acc_f16_fp16_d416(Q, K, V, O, stages, causal, softmax_scale); break;
+    case 448: ffpa_mma_acc_f16_fp16_d448(Q, K, V, O, stages, causal, softmax_scale); break;
+    case 480: ffpa_mma_acc_f16_fp16_d480(Q, K, V, O, stages, causal, softmax_scale); break;
+    case 512: ffpa_mma_acc_f16_fp16_d512(Q, K, V, O, stages, causal, softmax_scale); break;
+    case 544: ffpa_mma_acc_f16_fp16_d544(Q, K, V, O, stages, causal, softmax_scale); break;
+    case 576: ffpa_mma_acc_f16_fp16_d576(Q, K, V, O, stages, causal, softmax_scale); break;
+    case 608: ffpa_mma_acc_f16_fp16_d608(Q, K, V, O, stages, causal, softmax_scale); break;
+    case 640: ffpa_mma_acc_f16_fp16_d640(Q, K, V, O, stages, causal, softmax_scale); break;
+    case 672: ffpa_mma_acc_f16_fp16_d672(Q, K, V, O, stages, causal, softmax_scale); break;
+    case 704: ffpa_mma_acc_f16_fp16_d704(Q, K, V, O, stages, causal, softmax_scale); break;
+    case 736: ffpa_mma_acc_f16_fp16_d736(Q, K, V, O, stages, causal, softmax_scale); break;
+    case 768: ffpa_mma_acc_f16_fp16_d768(Q, K, V, O, stages, causal, softmax_scale); break;
+    case 800: ffpa_mma_acc_f16_fp16_d800(Q, K, V, O, stages, causal, softmax_scale); break;
+    case 832: ffpa_mma_acc_f16_fp16_d832(Q, K, V, O, stages, causal, softmax_scale); break;
+    case 864: ffpa_mma_acc_f16_fp16_d864(Q, K, V, O, stages, causal, softmax_scale); break;
+    case 896: ffpa_mma_acc_f16_fp16_d896(Q, K, V, O, stages, causal, softmax_scale); break;
+    case 928: ffpa_mma_acc_f16_fp16_d928(Q, K, V, O, stages, causal, softmax_scale); break;
+    case 960: ffpa_mma_acc_f16_fp16_d960(Q, K, V, O, stages, causal, softmax_scale); break;
+    case 992: ffpa_mma_acc_f16_fp16_d992(Q, K, V, O, stages, causal, softmax_scale); break;
+    case 1024: ffpa_mma_acc_f16_fp16_d1024(Q, K, V, O, stages, causal, softmax_scale); break;
     default: throw std::runtime_error("headdim not support!");
   }
 }
@@ -55,45 +57,47 @@ void ffpa_mma_acc_f32_fp16(
     torch::Tensor K,
     torch::Tensor V,
     torch::Tensor O,
-    int stages) {
+    int stages,
+    int causal,
+    double softmax_scale) {
   CHECK_TORCH_TENSOR_DTYPE(Q, torch::kHalf)
   CHECK_TORCH_TENSOR_DTYPE(K, torch::kHalf)
   CHECK_TORCH_TENSOR_DTYPE(V, torch::kHalf)
   CHECK_TORCH_TENSOR_DTYPE(O, torch::kHalf)
   const int d = Q.size(3);
   switch (d) {
-    case 32: ffpa_mma_acc_f32_fp16_d32(Q, K, V, O, stages); break;
-    case 64: ffpa_mma_acc_f32_fp16_d64(Q, K, V, O, stages); break;
-    case 96: ffpa_mma_acc_f32_fp16_d96(Q, K, V, O, stages); break;
-    case 128: ffpa_mma_acc_f32_fp16_d128(Q, K, V, O, stages); break;
-    case 160: ffpa_mma_acc_f32_fp16_d160(Q, K, V, O, stages); break;
-    case 192: ffpa_mma_acc_f32_fp16_d192(Q, K, V, O, stages); break;
-    case 224: ffpa_mma_acc_f32_fp16_d224(Q, K, V, O, stages); break;
-    case 256: ffpa_mma_acc_f32_fp16_d256(Q, K, V, O, stages); break;
-    case 288: ffpa_mma_acc_f32_fp16_d288(Q, K, V, O, stages); break;
-    case 320: ffpa_mma_acc_f32_fp16_d320(Q, K, V, O, stages); break;
-    case 352: ffpa_mma_acc_f32_fp16_d352(Q, K, V, O, stages); break;
-    case 384: ffpa_mma_acc_f32_fp16_d384(Q, K, V, O, stages); break;
-    case 416: ffpa_mma_acc_f32_fp16_d416(Q, K, V, O, stages); break;
-    case 448: ffpa_mma_acc_f32_fp16_d448(Q, K, V, O, stages); break;
-    case 480: ffpa_mma_acc_f32_fp16_d480(Q, K, V, O, stages); break;
-    case 512: ffpa_mma_acc_f32_fp16_d512(Q, K, V, O, stages); break;
-    case 544: ffpa_mma_acc_f32_fp16_d544(Q, K, V, O, stages); break;
-    case 576: ffpa_mma_acc_f32_fp16_d576(Q, K, V, O, stages); break;
-    case 608: ffpa_mma_acc_f32_fp16_d608(Q, K, V, O, stages); break;
-    case 640: ffpa_mma_acc_f32_fp16_d640(Q, K, V, O, stages); break;
-    case 672: ffpa_mma_acc_f32_fp16_d672(Q, K, V, O, stages); break;
-    case 704: ffpa_mma_acc_f32_fp16_d704(Q, K, V, O, stages); break;
-    case 736: ffpa_mma_acc_f32_fp16_d736(Q, K, V, O, stages); break;
-    case 768: ffpa_mma_acc_f32_fp16_d768(Q, K, V, O, stages); break;
-    case 800: ffpa_mma_acc_f32_fp16_d800(Q, K, V, O, stages); break;
-    case 832: ffpa_mma_acc_f32_fp16_d832(Q, K, V, O, stages); break;
-    case 864: ffpa_mma_acc_f32_fp16_d864(Q, K, V, O, stages); break;
-    case 896: ffpa_mma_acc_f32_fp16_d896(Q, K, V, O, stages); break;
-    case 928: ffpa_mma_acc_f32_fp16_d928(Q, K, V, O, stages); break;
-    case 960: ffpa_mma_acc_f32_fp16_d960(Q, K, V, O, stages); break;
-    case 992: ffpa_mma_acc_f32_fp16_d992(Q, K, V, O, stages); break;
-    case 1024: ffpa_mma_acc_f32_fp16_d1024(Q, K, V, O, stages); break;
+    case 32: ffpa_mma_acc_f32_fp16_d32(Q, K, V, O, stages, causal, softmax_scale); break;
+    case 64: ffpa_mma_acc_f32_fp16_d64(Q, K, V, O, stages, causal, softmax_scale); break;
+    case 96: ffpa_mma_acc_f32_fp16_d96(Q, K, V, O, stages, causal, softmax_scale); break;
+    case 128: ffpa_mma_acc_f32_fp16_d128(Q, K, V, O, stages, causal, softmax_scale); break;
+    case 160: ffpa_mma_acc_f32_fp16_d160(Q, K, V, O, stages, causal, softmax_scale); break;
+    case 192: ffpa_mma_acc_f32_fp16_d192(Q, K, V, O, stages, causal, softmax_scale); break;
+    case 224: ffpa_mma_acc_f32_fp16_d224(Q, K, V, O, stages, causal, softmax_scale); break;
+    case 256: ffpa_mma_acc_f32_fp16_d256(Q, K, V, O, stages, causal, softmax_scale); break;
+    case 288: ffpa_mma_acc_f32_fp16_d288(Q, K, V, O, stages, causal, softmax_scale); break;
+    case 320: ffpa_mma_acc_f32_fp16_d320(Q, K, V, O, stages, causal, softmax_scale); break;
+    case 352: ffpa_mma_acc_f32_fp16_d352(Q, K, V, O, stages, causal, softmax_scale); break;
+    case 384: ffpa_mma_acc_f32_fp16_d384(Q, K, V, O, stages, causal, softmax_scale); break;
+    case 416: ffpa_mma_acc_f32_fp16_d416(Q, K, V, O, stages, causal, softmax_scale); break;
+    case 448: ffpa_mma_acc_f32_fp16_d448(Q, K, V, O, stages, causal, softmax_scale); break;
+    case 480: ffpa_mma_acc_f32_fp16_d480(Q, K, V, O, stages, causal, softmax_scale); break;
+    case 512: ffpa_mma_acc_f32_fp16_d512(Q, K, V, O, stages, causal, softmax_scale); break;
+    case 544: ffpa_mma_acc_f32_fp16_d544(Q, K, V, O, stages, causal, softmax_scale); break;
+    case 576: ffpa_mma_acc_f32_fp16_d576(Q, K, V, O, stages, causal, softmax_scale); break;
+    case 608: ffpa_mma_acc_f32_fp16_d608(Q, K, V, O, stages, causal, softmax_scale); break;
+    case 640: ffpa_mma_acc_f32_fp16_d640(Q, K, V, O, stages, causal, softmax_scale); break;
+    case 672: ffpa_mma_acc_f32_fp16_d672(Q, K, V, O, stages, causal, softmax_scale); break;
+    case 704: ffpa_mma_acc_f32_fp16_d704(Q, K, V, O, stages, causal, softmax_scale); break;
+    case 736: ffpa_mma_acc_f32_fp16_d736(Q, K, V, O, stages, causal, softmax_scale); break;
+    case 768: ffpa_mma_acc_f32_fp16_d768(Q, K, V, O, stages, causal, softmax_scale); break;
+    case 800: ffpa_mma_acc_f32_fp16_d800(Q, K, V, O, stages, causal, softmax_scale); break;
+    case 832: ffpa_mma_acc_f32_fp16_d832(Q, K, V, O, stages, causal, softmax_scale); break;
+    case 864: ffpa_mma_acc_f32_fp16_d864(Q, K, V, O, stages, causal, softmax_scale); break;
+    case 896: ffpa_mma_acc_f32_fp16_d896(Q, K, V, O, stages, causal, softmax_scale); break;
+    case 928: ffpa_mma_acc_f32_fp16_d928(Q, K, V, O, stages, causal, softmax_scale); break;
+    case 960: ffpa_mma_acc_f32_fp16_d960(Q, K, V, O, stages, causal, softmax_scale); break;
+    case 992: ffpa_mma_acc_f32_fp16_d992(Q, K, V, O, stages, causal, softmax_scale); break;
+    case 1024: ffpa_mma_acc_f32_fp16_d1024(Q, K, V, O, stages, causal, softmax_scale); break;
     default: throw std::runtime_error("headdim not support!");
   }
 }
@@ -103,45 +107,47 @@ void ffpa_mma_acc_f32_bf16(
     torch::Tensor K,
     torch::Tensor V,
     torch::Tensor O,
-    int stages) {
+    int stages,
+    int causal,
+    double softmax_scale) {
   CHECK_TORCH_TENSOR_DTYPE(Q, torch::kBFloat16)
   CHECK_TORCH_TENSOR_DTYPE(K, torch::kBFloat16)
   CHECK_TORCH_TENSOR_DTYPE(V, torch::kBFloat16)
   CHECK_TORCH_TENSOR_DTYPE(O, torch::kBFloat16)
   const int d = Q.size(3);
   switch (d) {
-    case 32: ffpa_mma_acc_f32_bf16_d32(Q, K, V, O, stages); break;
-    case 64: ffpa_mma_acc_f32_bf16_d64(Q, K, V, O, stages); break;
-    case 96: ffpa_mma_acc_f32_bf16_d96(Q, K, V, O, stages); break;
-    case 128: ffpa_mma_acc_f32_bf16_d128(Q, K, V, O, stages); break;
-    case 160: ffpa_mma_acc_f32_bf16_d160(Q, K, V, O, stages); break;
-    case 192: ffpa_mma_acc_f32_bf16_d192(Q, K, V, O, stages); break;
-    case 224: ffpa_mma_acc_f32_bf16_d224(Q, K, V, O, stages); break;
-    case 256: ffpa_mma_acc_f32_bf16_d256(Q, K, V, O, stages); break;
-    case 288: ffpa_mma_acc_f32_bf16_d288(Q, K, V, O, stages); break;
-    case 320: ffpa_mma_acc_f32_bf16_d320(Q, K, V, O, stages); break;
-    case 352: ffpa_mma_acc_f32_bf16_d352(Q, K, V, O, stages); break;
-    case 384: ffpa_mma_acc_f32_bf16_d384(Q, K, V, O, stages); break;
-    case 416: ffpa_mma_acc_f32_bf16_d416(Q, K, V, O, stages); break;
-    case 448: ffpa_mma_acc_f32_bf16_d448(Q, K, V, O, stages); break;
-    case 480: ffpa_mma_acc_f32_bf16_d480(Q, K, V, O, stages); break;
-    case 512: ffpa_mma_acc_f32_bf16_d512(Q, K, V, O, stages); break;
-    case 544: ffpa_mma_acc_f32_bf16_d544(Q, K, V, O, stages); break;
-    case 576: ffpa_mma_acc_f32_bf16_d576(Q, K, V, O, stages); break;
-    case 608: ffpa_mma_acc_f32_bf16_d608(Q, K, V, O, stages); break;
-    case 640: ffpa_mma_acc_f32_bf16_d640(Q, K, V, O, stages); break;
-    case 672: ffpa_mma_acc_f32_bf16_d672(Q, K, V, O, stages); break;
-    case 704: ffpa_mma_acc_f32_bf16_d704(Q, K, V, O, stages); break;
-    case 736: ffpa_mma_acc_f32_bf16_d736(Q, K, V, O, stages); break;
-    case 768: ffpa_mma_acc_f32_bf16_d768(Q, K, V, O, stages); break;
-    case 800: ffpa_mma_acc_f32_bf16_d800(Q, K, V, O, stages); break;
-    case 832: ffpa_mma_acc_f32_bf16_d832(Q, K, V, O, stages); break;
-    case 864: ffpa_mma_acc_f32_bf16_d864(Q, K, V, O, stages); break;
-    case 896: ffpa_mma_acc_f32_bf16_d896(Q, K, V, O, stages); break;
-    case 928: ffpa_mma_acc_f32_bf16_d928(Q, K, V, O, stages); break;
-    case 960: ffpa_mma_acc_f32_bf16_d960(Q, K, V, O, stages); break;
-    case 992: ffpa_mma_acc_f32_bf16_d992(Q, K, V, O, stages); break;
-    case 1024: ffpa_mma_acc_f32_bf16_d1024(Q, K, V, O, stages); break;
+    case 32: ffpa_mma_acc_f32_bf16_d32(Q, K, V, O, stages, causal, softmax_scale); break;
+    case 64: ffpa_mma_acc_f32_bf16_d64(Q, K, V, O, stages, causal, softmax_scale); break;
+    case 96: ffpa_mma_acc_f32_bf16_d96(Q, K, V, O, stages, causal, softmax_scale); break;
+    case 128: ffpa_mma_acc_f32_bf16_d128(Q, K, V, O, stages, causal, softmax_scale); break;
+    case 160: ffpa_mma_acc_f32_bf16_d160(Q, K, V, O, stages, causal, softmax_scale); break;
+    case 192: ffpa_mma_acc_f32_bf16_d192(Q, K, V, O, stages, causal, softmax_scale); break;
+    case 224: ffpa_mma_acc_f32_bf16_d224(Q, K, V, O, stages, causal, softmax_scale); break;
+    case 256: ffpa_mma_acc_f32_bf16_d256(Q, K, V, O, stages, causal, softmax_scale); break;
+    case 288: ffpa_mma_acc_f32_bf16_d288(Q, K, V, O, stages, causal, softmax_scale); break;
+    case 320: ffpa_mma_acc_f32_bf16_d320(Q, K, V, O, stages, causal, softmax_scale); break;
+    case 352: ffpa_mma_acc_f32_bf16_d352(Q, K, V, O, stages, causal, softmax_scale); break;
+    case 384: ffpa_mma_acc_f32_bf16_d384(Q, K, V, O, stages, causal, softmax_scale); break;
+    case 416: ffpa_mma_acc_f32_bf16_d416(Q, K, V, O, stages, causal, softmax_scale); break;
+    case 448: ffpa_mma_acc_f32_bf16_d448(Q, K, V, O, stages, causal, softmax_scale); break;
+    case 480: ffpa_mma_acc_f32_bf16_d480(Q, K, V, O, stages, causal, softmax_scale); break;
+    case 512: ffpa_mma_acc_f32_bf16_d512(Q, K, V, O, stages, causal, softmax_scale); break;
+    case 544: ffpa_mma_acc_f32_bf16_d544(Q, K, V, O, stages, causal, softmax_scale); break;
+    case 576: ffpa_mma_acc_f32_bf16_d576(Q, K, V, O, stages, causal, softmax_scale); break;
+    case 608: ffpa_mma_acc_f32_bf16_d608(Q, K, V, O, stages, causal, softmax_scale); break;
+    case 640: ffpa_mma_acc_f32_bf16_d640(Q, K, V, O, stages, causal, softmax_scale); break;
+    case 672: ffpa_mma_acc_f32_bf16_d672(Q, K, V, O, stages, causal, softmax_scale); break;
+    case 704: ffpa_mma_acc_f32_bf16_d704(Q, K, V, O, stages, causal, softmax_scale); break;
+    case 736: ffpa_mma_acc_f32_bf16_d736(Q, K, V, O, stages, causal, softmax_scale); break;
+    case 768: ffpa_mma_acc_f32_bf16_d768(Q, K, V, O, stages, causal, softmax_scale); break;
+    case 800: ffpa_mma_acc_f32_bf16_d800(Q, K, V, O, stages, causal, softmax_scale); break;
+    case 832: ffpa_mma_acc_f32_bf16_d832(Q, K, V, O, stages, causal, softmax_scale); break;
+    case 864: ffpa_mma_acc_f32_bf16_d864(Q, K, V, O, stages, causal, softmax_scale); break;
+    case 896: ffpa_mma_acc_f32_bf16_d896(Q, K, V, O, stages, causal, softmax_scale); break;
+    case 928: ffpa_mma_acc_f32_bf16_d928(Q, K, V, O, stages, causal, softmax_scale); break;
+    case 960: ffpa_mma_acc_f32_bf16_d960(Q, K, V, O, stages, causal, softmax_scale); break;
+    case 992: ffpa_mma_acc_f32_bf16_d992(Q, K, V, O, stages, causal, softmax_scale); break;
+    case 1024: ffpa_mma_acc_f32_bf16_d1024(Q, K, V, O, stages, causal, softmax_scale); break;
     default: throw std::runtime_error("headdim not support!");
   }
 }

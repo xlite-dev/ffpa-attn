@@ -1,14 +1,28 @@
 <div align="center">
   <p align="center">
     <h2>🤖FFPA(Split-D): Yet another Faster Flash Prefill Attention with O(1)⚡️GPU SRAM complexity for large headdim🐑</h2>
-    <a href="https://zhuanlan.zhihu.com/p/13975660308">📚FFPA(Split-D) Blog</a> | <a href="#bench-l20"> 📈L20 ~1.9x↑🎉 </a> | <a href="#bench-a30"> 📈A30 ~1.8x↑🎉 </a> | <a href="#bench-3080"> 📈3080 ~2.9x↑🎉 </a> | <a href="#bench-4090"> 📈4090 ~2.1x↑🎉 </a>
+    <a href="https://zhuanlan.zhihu.com/p/13975660308">📚FFPA(Split-D) Blog</a> | <a href="./bench/README.md#bench-l20"> 📈L20 ~1.9x↑🎉 </a> | <a href="./bench/README.md#bench-a30"> 📈A30 ~1.8x↑🎉 </a> | <a href="./bench/README.md#bench-3080"> 📈3080 ~2.9x↑🎉 </a> | <a href="./bench/README.md#bench-4090"> 📈4090 ~2.1x↑🎉 </a>
   </p>
   <img src='https://github.com/user-attachments/assets/447e2937-f7c8-47c8-8550-8c0c71b910e6' width="411px">
   <img src='https://github.com/user-attachments/assets/65a8d564-8fa7-4d66-86b9-e238feb86143' width="411px">
 </div>
 
 🤖**FFPA(Split-D)**: Yet another **Faster Flash Prefill Attention** with **Split-D** strategy, achieve **O(1) SRAM complexity** and **O(d/4) register complexity** for large headdim (**D > 256**), **1.8x~3x** 🎉 faster than SDPA on many devices.
-## ©️Citations🎉🎉
+
+**📚Core Features**: FFPA supports self-attention, cross-attention, grouped/multi-query attention, and causal attention with large headdim (D=320~1024). While the standard FlashAttention-2 only support headdim <= 256.
+
+<div align='center'>
+
+|[Self Attention](#example-self)| [Cross/Decode Attention](#example-cross)|[GQA/MQA Attention](#example-gqa)|[Causal Attention](#example-causal)|[Headdim](#ffpa-design)|
+|:---:|:---:|:---:|:---:|:---:|
+|✔️|✔️(`Nq != Nkv`)|✔️(`Nh_q % Nh_kv == 0`)|✔️|**320~1024** |
+
+</div>
+
+> [!NOTE]
+> FFPA has so far only been tested on Ampere and Ada architectures (e.g. A30, RTX 3080, L20, RTX 4090). It should also work on Hopper and other newer architectures, but performance may not be optimal there since FFPA does not yet leverage TMA for further optimization.
+
+## ©️Citations
 
 ```BibTeX
 @misc{ffpa-attn@2025,
@@ -24,7 +38,7 @@
 
 <div id="install"></div>
 
-First, clone the repo and build the package from source: (Note: `pip uninstall ffpa-attn -y` if you want to reinstall after code changes)
+First, clone the repo and build the package from source: (Note: `pip uninstall ffpa-attn -y` if you want to reinstall after code changes; recommended: PyTorch>=2.11.0, CUDA>=13.0).
 ```bash
 git clone https://github.com/xlite-dev/ffpa-attn.git
 python3 setup.py bdist_wheel
@@ -32,7 +46,9 @@ pip3 install dist/*.whl # pip uninstall ffpa-attn -y
 ```
 
 > [!NOTE]
-> FFPA supports cross-attention where the query seqlen ``Nq`` may differ from the key/value seqlen ``Nkv``, but requires **`Nk == Nv`** (no GQA/MQA). **Causal attention (causal mask)** is **not supported yet**.
+> FFPA supports cross-attention where the query seqlen ``Nq`` may differ from the key/value seqlen ``Nkv``, **grouped-query / multi-query attention** where Q has ``Nh_q`` heads and K/V have ``Nh_kv`` heads (requires ``Nh_q % Nh_kv == 0``; ``group_size = Nh_q / Nh_kv``), and **causal attention** (pass ``causal=True``; queries are aligned to the KV tail, i.e. Q row ``r`` attends to ``k <= r + (Nkv - Nq)``, which requires ``Nkv >= Nq``). K/V must share the same ``Nh_kv`` and ``Nkv``.
+
+<div id="example-self"></div>
 
 Minimal usage example — **Self-Attention** (B=1, H=32, N=8192, D=512):
 ```python
@@ -53,6 +69,8 @@ print(out.shape, out.dtype)
 ref = F.scaled_dot_product_attention(q, k, v)
 print(f"vs SDPA max_abs_err={(out - ref).abs().max().item():.4e}")
 ```
+
+<div id="example-cross"></div>
 
 **Cross-Attention** or **Decoding-Attention** example (short query, long KV cache; `Nq != Nkv`):
 ```python
@@ -75,21 +93,72 @@ ref = F.scaled_dot_product_attention(q, k, v)
 print(f"vs SDPA max_abs_err={(out - ref).abs().max().item():.4e}")
 ```
 
+<div id="example-gqa"></div>
+
+**Grouped-Query / Multi-Query Attention** example (Q has more heads than K/V):
+```python
+import torch
+import torch.nn.functional as F
+from ffpa_attn import ffpa_attn_func
+
+# GQA: Q has Nh_q heads, K/V share Nh_kv heads; group_size = Nh_q / Nh_kv.
+# Typical Llama-3-style 32/8 ratio; MQA is the Nh_kv==1 special case.
+# FFPA targets large headdim so we use D=512 here (FA-2 tops out at D=256).
+B, D, Nq, Nkv = 1, 512, 1024, 4096
+Nh_q, Nh_kv = 32, 8  # group_size = 4
+q = torch.randn(B, Nh_q,  Nq,  D, dtype=torch.bfloat16, device="cuda")
+k = torch.randn(B, Nh_kv, Nkv, D, dtype=torch.bfloat16, device="cuda")
+v = torch.randn(B, Nh_kv, Nkv, D, dtype=torch.bfloat16, device="cuda")
+
+out = ffpa_attn_func(q, k, v)  # -> (B, Nh_q, Nq, D) = (1, 32, 1024, 512)
+print(out.shape, out.dtype)
+
+# Reference: replicate K/V along head dim to match Q's head count.
+group_size = Nh_q // Nh_kv
+k_ref = k.repeat_interleave(group_size, dim=1)
+v_ref = v.repeat_interleave(group_size, dim=1)
+ref = F.scaled_dot_product_attention(q, k_ref, v_ref)
+print(f"vs SDPA max_abs_err={(out - ref).abs().max().item():.4e}")
+```
+
+<div id="example-causal"></div>
+
+**Causal Attention** example (self-attention causal; also supports chunked / decoding prefill with `Nkv > Nq`):
+```python
+import torch
+import torch.nn.functional as F
+from ffpa_attn import ffpa_attn_func
+
+# Causal self-attention: Q row r attends to k <= r (standard triangular mask).
+# FFPA is tuned for large headdim, so we keep D=512 as in the self-attn example.
+B, H, N, D = 1, 8, 4096, 512
+q = torch.randn(B, H, N, D, dtype=torch.bfloat16, device="cuda")
+k = torch.randn(B, H, N, D, dtype=torch.bfloat16, device="cuda")
+v = torch.randn(B, H, N, D, dtype=torch.bfloat16, device="cuda")
+
+out = ffpa_attn_func(q, k, v, causal=True)
+print(out.shape, out.dtype)
+
+ref = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+print(f"vs SDPA max_abs_err={(out - ref).abs().max().item():.4e}")
+
+# Chunked / decoding prefill: Nq < Nkv, queries aligned to the KV tail
+# so Q row r attends to k <= r + (Nkv - Nq). Requires Nkv >= Nq.
+Nq, Nkv = 128, 8192
+q = torch.randn(B, H, Nq,  D, dtype=torch.bfloat16, device="cuda")
+k = torch.randn(B, H, Nkv, D, dtype=torch.bfloat16, device="cuda")
+v = torch.randn(B, H, Nkv, D, dtype=torch.bfloat16, device="cuda")
+out = ffpa_attn_func(q, k, v, causal=True)
+print(out.shape, out.dtype)  # (1, 8, 128, 512)
+```
+
 A runnable end-to-end example (with SDPA accuracy/perf comparison, both aligned N=8192 and non-aligned N=8191 cases) is provided under [`examples/run_ffpa_attn.py`](./examples/run_ffpa_attn.py):
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python3 examples/run_ffpa_attn.py
 ```
 
-## 📖 Contents
-
-- [📖 FFPA Design](#ffpa-design)
-- [📈 FFPA: L20 ~1.9x↑🎉](#bench-l20)
-- [📈 FFPA: A30 ~1.8x↑🎉](#bench-a30)
-- [📈 FFPA: 3080 ~2.9x↑🎉](#bench-3080)
-- [📈 FFPA: 4090 ~2.1x↑🎉](#bench-4090)
-
-## 📖 FFPA Design
+## 📖 Fine-grained Tiling at MMA level
 
 <div id="ffpa-design"></div>
 
@@ -114,127 +183,26 @@ By leveraging this approach, we can achieve better performance than SDPA EA for 
 
 </div>
 
-**📚👇Core Features🎉🎉**: FFPA is implemented using pure MMA PTX instructions, which supports many features such as Split-Q, SMEM Swizzle/Padding, QKV Multi-Stages(1~4), Tile MMAs/Warps, Mixed MMA F32/F16 Acc (Q@K^T MMA Acc F32 + P@V MMA Acc F16), Fully Shared QKV SMEM, Prefetch QKV g2s, Persist Q s2r/g2s, **Fully QKV Fine-grained Tiling(GEMM style)**, Collective Store, etc.
+**📚Implementation**: FFPA is implemented using pure MMA PTX instructions, which supports many features such as Split-Q, SMEM Swizzle/Padding, QKV Multi-Stages(1~4), Tile MMAs/Warps, Mixed MMA F32/F16 Acc (Q@K^T MMA Acc F32 + P@V MMA Acc F16), Fully Shared QKV SMEM, Prefetch QKV g2s, Persist Q s2r/g2s, **Fully QKV Fine-grained Tiling(GEMM style)**, Collective Store, etc.
 
 <div align='center'>
 
-|📚Feature |📚Feature |📚Feature |📚Feature|
-|:---:|:---:|:---:|:---:|
 |✔️Tensor Cores |✔️**MMA(m16n8k16)** |✔️Tile Block(Br, Bc) |✔️Tile MMA/Warp |
+|:---:|:---:|:---:|:---:|
 |✔️**Split Q**(FA-2)|✔️Pack LDST(128 bits)|✔️SMEM **Swizzle/Pad** |✔️Copy Async |
 |✔️**Reg Double Buffers** |✔️QKV **Multi-Stages(1~4)** |✔️Collective Store(**Shfl**)|✔️**Prefetch QKV** g2s |
 |✔️**QKV Fine-grained Tiling**|✔️**Shared QKV** SMEM|✔️Mixed MMA Acc|✔️**Persist Q** s2r/g2s|
 
 </div>
 
-## 📖 Prerequisites
-<div id="prerequisites"></div>
-
-- Python >= 3.12
-- PyTorch >= 2.9.0, CUDA >= 12.9
-- flash-attention >= 2.6.3 (for test)
-- Recommended: PyTorch 2.11.0, CUDA 13.0
-
 ## 📖 FFPA Benchmark 🎉🎉
 
-<div id="bench-l20"></div>
-
-O(2xBrx16)≈O(1) SRAM complexity, O(d/4) register complexity, the same GPU HBM memory complexity as FlashAttention. B=1, H=48, N=8192, **D=320-1024(FA2 not supported 👀)**. (Notes, *=MMA Acc F32, ^=MMA Acc F16, Softmax Acc dtype is always be F32, T=TFLOPS, 👇Benchmark)
-
-<div align='center'>
-
-<p>📚 NVIDIA L20 (*=MMA Acc F32, ^=MMA Acc F16, T=TFLOPS, <b>~1.8x↑🎉</b>)</p>
-
-|Algorithm|320|384|448|512|576|640|704|768|832|896|960|1024|
-|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-|SDPA EA|56T|63T|58T|58T|55T|56T|54T|55T|54T|55T|54T|56T|
-|FFPA*|102T|102T|103T|104T|103T|95T|95T|95T|95T|96T|95T|94T|
-|Speedup|1.82x|1.62x|1.78x|1.79x|1.87x|1.7x|1.76x|1.73x|1.76x|1.75x|1.76x|1.68x|
-|FFPA^|104T|103T|103T|102T|104T|103T|102T|94T|94T|94T|100T|100T|
-|Speedup|1.86x|1.63x|1.78x|1.76x|1.89x|1.84x|1.89x|1.71x|1.74x|1.71x|1.85x|1.79x|
-
-<p>📚 NVIDIA L20 (*=MMA Acc: QK F32 + PV F16, ^=MMA Acc F16, T=TFLOPS, <b>~1.9x↑🎉</b>)</p>
-
-|Algorithm|320|384|448|512|576|640|704|768|832|896|960|1024|
-|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-|SDPA EA|56T|64T|58T|58T|55T|56T|54T|55T|54T|55T|54T|56T|
-|FFPA*|105T|102T|104T|103T|105T|95T|95T|94T|94T|94T|102T|101T|
-|Speedup|1.88x|1.59x|1.79x|1.78x|1.91x|1.7x|1.76x|1.71x|1.74x|1.71x|1.89x|1.8x|
-|FFPA^|104T|103T|103T|102T|103T|103T|102T|94T|94T|94T|100T|100T|
-|Speedup|1.86x|1.61x|1.78x|1.76x|1.87x|1.84x|1.89x|1.71x|1.74x|1.71x|1.85x|1.79x|
-
-<div align='center'>
-  <img src='https://github.com/user-attachments/assets/a4927108-3f97-4209-9b80-bb31ad271e04' width="411px">
-  <img src='https://github.com/user-attachments/assets/eeb9943f-919d-45d8-a8a6-e0f8874f4bcd' width="411px">
-</div>
-
-</div>
-
-<div id="bench-a30"></div>
-
-<div align='center'>
-
-<p>📚 NVIDIA A30 (*=MMA Acc F32, ^=MMA Acc F16, T=TFLOPS, <b>~1.8x↑🎉</b>)</p>
-
-|Algorithm|320|384|448|512|576|640|704|768|832|896|960|1024|
-|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-|SDPA EA|25T|25T|24T|24T|24T|24T|23T|22T|22T|22T|22T|18T|
-|FFPA*|45T|44T|44T|43T|43T|38T|37T|37T|37T|36T|33T|32T|
-|Speedup|1.8x|1.76x|1.83x|1.79x|1.79x|1.58x|1.61x|1.68x|1.68x|1.64x|1.5x|1.78x|
-|FFPA^|48T|46T|45T|43T|44T|44T|44T|38T|37T|36T|40T|34T|
-|Speedup|1.92x|1.84x|1.88x|1.79x|1.83x|1.83x|1.91x|1.73x|1.68x|1.64x|1.82x|1.89x|
-
-<p>📚 NVIDIA A30 (*=MMA Acc: QK F32 + PV F16, ^=MMA Acc F16, T=TFLOPS, <b>~1.9x↑🎉</b>)</p>
-
-|Algorithm|320|384|448|512|576|640|704|768|832|896|960|1024|
-|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-|SDPA EA|25T|25T|24T|24T|24T|24T|23T|22T|22T|22T|22T|18T|
-|FFPA*|48T|46T|46T|43T|44T|38T|38T|38T|37T|36T|40T|34T|
-|Speedup|1.92x|1.84x|1.92x|1.79x|1.83x|1.58x|1.65x|1.73x|1.68x|1.64x|1.82x|1.89x|
-|FFPA^|48T|46T|45T|43T|44T|44T|44T|38T|37T|36T|39T|34T|
-|Speedup|1.92x|1.84x|1.88x|1.79x|1.83x|1.83x|1.91x|1.73x|1.68x|1.64x|1.77x|1.89x|
-
-<div align='center'>
-  <img src='https://github.com/user-attachments/assets/7e323005-4445-41af-8e94-6efb62ed2b77' width="411px">
-  <img src='https://github.com/user-attachments/assets/e314649e-82b5-414d-85c9-8b6fbf260138' width="411px">
-</div>
-
-</div>
-
-<div id="bench-3080"></div>
-
-<div align='center'>
-
-<p>📚 NVIDIA RTX 3080 Laptop (*=MMA Acc F32, ^=MMA Acc F16, T=TFLOPS, <b>~2.5x↑🎉</b>)</p>
-
-|Algorithm|320|384|448|512|576|640|704|768|832|896|960|1024|
-|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-|SDPA EA|13T|16T|11T|16T|15T|15T|15T|15T|14T|14T|14T|14T|
-|FFPA*|33T|31T|30T|30T|30T|27T|27T|26T|26T|26T|26T|25T|
-|Speedup|2.54x|1.94x|2.73x|1.88x|2.0x|1.8x|1.8x|1.73x|1.86x|1.86x|1.86x|1.79x|
-|FFPA^|43T|41T|39T|39T|39T|39T|39T|36T|34T|33T|31T|33T|
-|Speedup|3.31x|2.56x|3.55x|2.44x|2.6x|2.6x|2.6x|2.4x|2.43x|2.36x|2.21x|2.36x|
-
-<p>📚 NVIDIA RTX 3080 Laptop (*=MMA Acc: QK F32 + PV F16, ^=MMA Acc F16, T=TFLOPS, <b>~2.9x↑🎉</b>)</p>
-
-|Algorithm|320|384|448|512|576|640|704|768|832|896|960|1024|
-|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-|SDPA EA|13T|15T|12T|15T|14T|15T|14T|14T|14T|14T|14T|14T|
-|FFPA*|38T|36T|34T|35T|34T|31T|32T|31T|30T|28T|27T|27T|
-|Speedup|2.92x|2.4x|2.83x|2.33x|2.43x|2.07x|2.29x|2.21x|2.14x|2.0x|1.93x|1.93x|
-|FFPA^|44T|41T|39T|39T|38T|39T|39T|36T|34T|32T|31T|33T|
-|Speedup|3.38x|2.73x|3.25x|2.6x|2.71x|2.6x|2.79x|2.57x|2.43x|2.29x|2.21x|2.36x|
-
-<div align='center'>
-  <img src='https://github.com/user-attachments/assets/d157cd69-4444-4735-a691-edaaff408137' width="411px">
-  <img src='https://github.com/user-attachments/assets/3ce47627-e79d-40ee-b753-bdd235603b7d' width="411px">
-</div>
-
-</div>
+O(2xBrx16)≈O(1) SRAM complexity, O(d/4) register complexity, the same GPU HBM memory complexity as FlashAttention. B=1, H=48, N=8192, **D=320-1024(FA2 not supported 👀)**. (Notes, *=MMA Acc F32, ^=MMA Acc F16, Softmax Acc dtype is always be F32, T=TFLOPS). Please check [benchmark](../bench) directory for more details.
 
 <div id="bench-4090"></div>
 
 <div align='center'>
+
 <p>📚 NVIDIA RTX 4090 (*=MMA Acc F32, ^=MMA Acc F16, T=TFLOPS, <b>~1.8x↑🎉</b>)</p>
 
 |Algorithm|320|384|448|512|576|640|704|768|832|896|960|1024|
@@ -255,10 +223,6 @@ O(2xBrx16)≈O(1) SRAM complexity, O(d/4) register complexity, the same GPU HBM 
 |FFPA^|200T|191T|189T|191T|188T|188T|186T|179T|175T|173T|172T|170T|
 |Speedup|2.44x|2.08x|2.22x|2.27x|2.41x|2.32x|2.35x|2.24x|2.24x|2.19x|2.23x|2.18x|
 
-<div align='center'>
-  <img src='https://github.com/user-attachments/assets/447e2937-f7c8-47c8-8550-8c0c71b910e6' width="411px">
-  <img src='https://github.com/user-attachments/assets/65a8d564-8fa7-4d66-86b9-e238feb86143' width="411px">
-</div>
 </div>
 
 ## ©️License

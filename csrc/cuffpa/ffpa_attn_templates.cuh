@@ -12,41 +12,43 @@ using mma::MMAMode;
 // The "large-d" variant tiles the head-dim axis into `kHeadDim / kMmaAtomK`
 // inner steps so SMEM stays O(1) in D.
 //
-// Supports cross-attention (Nq may differ from Nkv); Nk == Nv is required
-// and is asserted by the launcher. Causal mask and GQA/MQA are not supported.
+// Supports cross-attention (Nq may differ from Nkv; Nk == Nv is required
+// and is asserted by the launcher), grouped-query / multi-query attention
+// (K/V use Nh_kv heads shared across group_size = Nh / Nh_kv Q heads), and
+// causal attention as a runtime parameter.
 //
 // ----------------------------------------------------------------------------
 // Template parameters (compile-time configuration)
 // ----------------------------------------------------------------------------
-//   kDataType            Activation dtype: __half (fp16) or __nv_bfloat16.
-//   kHeadDim             Head dimension D (32, 64, ..., 1024), multiple of
-//                        kMmaAtomK.
-//   kMmaAtomM/N/K        MMA atom shape for m16n8k16 (fixed to 16/8/16).
-//   kMmaTileSeqLenQ/K/P  Warp-level MMA tiling along Q rows / K cols / P rows.
-//                        Thread block uses warps = kMmaTileSeqLenQ * kMmaTileSeqLenK.
-//   kMmaTileHeadDimV     Warp-level MMA tiling along V cols (head-dim).
-//   kValTileSeqLenQ/K/P  Extra value-level tiling multipliers yielding the
-//                        tile sizes Br = kMmaAtomM*kMmaTileSeqLenQ*kValTileSeqLenQ,
-//                        Bc = kMmaAtomN*kMmaTileSeqLenK*kValTileSeqLenK.
-//   kValTileHeadDimV     Value tiling over head-dim for P@V.
-//   kMmaAccFloat32QK/PV  0 -> fp16 MMA accumulator, 1 -> fp32 accumulator for
-//                        the Q@K^T / P@V stage respectively (bf16 requires 1).
-//   kOStorageAccFloat32  0 -> store O accumulator as fp16, 1 -> as fp32.
-//   kPrefetchQK/PV       0/1, enable async prefetch of next QK / PV tiles.
-//   kShareSmemQKV        0/1, let V reuse QK SMEM after Q@K^T to save SRAM.
-//   kPersistQs2r         0/1, persist Q in registers across all KV tiles.
-//   kPersistQg2s         0/1, persist Q in SMEM across all KV tiles.
-//   kRegPipeKV           0/1, register ping-pong between ldmatrix and mma.
-//   kStageQK / kStagePV  Multi-stage cp.async pipeline depth (<= 4) for QK / PV.
-//   kPadQ / kPadK / kPadV 0 selects SMEM swizzle (bank-conflict free), >0
-//                        selects padded layout with that padding width.
+//   kDataType             Activation dtype: __half (fp16) or __nv_bfloat16.
+//   kHeadDim              Head dimension D (32, 64, ..., 1024), multiple of
+//                         kMmaAtomK.
+//   kMmaAtomM/N/K         MMA atom shape for m16n8k16 (fixed to 16/8/16).
+//   kMmaTileSeqLenQ/K/P   Warp-level MMA tiling along Q rows / K cols / P rows.
+//                         Thread block uses warps = kMmaTileSeqLenQ * kMmaTileSeqLenK.
+//   kMmaTileHeadDimV      Warp-level MMA tiling along V cols (head-dim).
+//   kValTileSeqLenQ/K/P   Extra value-level tiling multipliers yielding the
+//                         tile sizes Br = kMmaAtomM*kMmaTileSeqLenQ*kValTileSeqLenQ,
+//                         Bc = kMmaAtomN*kMmaTileSeqLenK*kValTileSeqLenK.
+//   kValTileHeadDimV      Value tiling over head-dim for P@V.
+//   kMmaAccFloat32QK/PV   0 -> fp16 MMA accumulator, 1 -> fp32 accumulator for
+//                         the Q@K^T / P@V stage respectively (bf16 requires 1).
+//   kOStorageAccFloat32   0 -> store O accumulator as fp16, 1 -> as fp32.
+//   kPrefetchQK/PV        0/1, enable async prefetch of next QK / PV tiles.
+//   kShareSmemQKV         0/1, let V reuse QK SMEM after Q@K^T to save SRAM.
+//   kPersistQs2r          0/1, persist Q in registers across all KV tiles.
+//   kPersistQg2s          0/1, persist Q in SMEM across all KV tiles.
+//   kRegPipeKV            0/1, register ping-pong between ldmatrix and mma.
+//   kStageQK/kStagePV     Multi-stage cp.async pipeline depth (<= 4) for QK / PV.
+//   kPadQ/kPadK/kPadV     0 selects SMEM swizzle (bank-conflict free), >0
+//                         selects padded layout with that padding width.
 //
 // ----------------------------------------------------------------------------
 // Runtime parameters (grid/block invariants)
 // ----------------------------------------------------------------------------
 //   Q     in : fp16/bf16 tensor, shape [Nb, Nh, Nq,  D] (BHND layout).
-//   K     in : fp16/bf16 tensor, shape [Nb, Nh, Nkv, D].
-//   V     in : fp16/bf16 tensor, shape [Nb, Nh, Nkv, D].
+//   K     in : fp16/bf16 tensor, shape [Nb, Nh_kv, Nkv, D].
+//   V     in : fp16/bf16 tensor, shape [Nb, Nh_kv, Nkv, D].
 //   O     out: fp16/bf16 tensor, shape [Nb, Nh, Nq,  D]; written in place.
 //   Nb       : Batch size; combined with Nh to fan out across gridDim.y
 //              (or gridDim.{y,z} under the DNHB layout).
@@ -55,10 +57,20 @@ using mma::MMAMode;
 //   Nkv      : Key/Value sequence length (Nk == Nv). Drives the KV loop bound
 //              Tc = div_ceil(Nkv, Bc) and the tail-tile softmax mask; need not
 //              be a multiple of Bc.
-//   Nh       : Number of attention heads; used to decode (batch, head) from
-//              blockIdx.y when the grid is laid out as (Tr, Nb*Nh).
+//   Nh       : Number of Q attention heads (Nh_q); used to decode
+//              (batch, head) from blockIdx.y when the grid is laid out as
+//              (Tr, Nb*Nh).
+//   Nh_kv    : Number of K/V heads (GQA/MQA). Must divide Nh; the Q head
+//              index maps to ``kv_head_idx = Nh_id / (Nh / Nh_kv)``.
 //   scale    : Softmax pre-scale, typically 1 / sqrt(D).
 //   Tc       : Precomputed KV tile count = div_ceil(Nkv, Bc).
+//   causal   : 0/1 runtime flag. When non-zero, Q row ``r`` only attends
+//              to KV positions ``k <= r + (Nkv - Nq)`` (standard causal
+//              with queries aligned to the KV tail; the launcher enforces
+//              Nkv >= Nq). The kernel clips the KV loop to the last tile
+//              with any visible key and applies a per-fragment -inf mask
+//              on tiles that straddle the diagonal; tiles fully below the
+//              diagonal pay only one compare-and-branch.
 //
 // ----------------------------------------------------------------------------
 // Grid / block layout
@@ -69,43 +81,20 @@ using mma::MMAMode;
 //   Dynamic SMEM size is computed by getConfigQKVSmemMaxSize<...>() in the
 //   launcher and must be set via cudaFuncSetAttribute before launch.
 // ============================================================================
-template <
-    typename kDataType,          // Activation dtype (__half or __nv_bfloat16).
-    const int kHeadDim,          // Headdim, 32~1024
-    const int kMmaAtomM,         // MMA Atom M, 16
-    const int kMmaAtomN,         // MMA Atom N, 8
-    const int kMmaAtomK,         // MMA Atom K, 16
-    const int kMmaTileSeqLenQ,   // 4, more MMA(warp), M=16*4=64, Q@K^T=[Br(M), d(K)]@[d(K),  Bc(N)]
-    const int kMmaTileSeqLenK,   // 1, more MMA(warp), N=8*1 =8,  Q@K^T=[Br(M), d(K)]@[d(K),  Bc(N)]
-    const int kMmaTileSeqLenP,   // 4, more MMA(warp), M=16*4=64, P@V  =[Br(M),Bc(K)]@[Bc(K), d(N) ]
-    const int kMmaTileHeadDimV,  // 1, more MMA(warp), N=8*1 =8,  P@V  =[Br(M),Bc(K)]@[Bc(K), d(N) ]
-    const int kValTileSeqLenQ,   // 1, more values, M, Br=64*1=64, matmul M
-    const int kValTileSeqLenK,   // 8, more values, N, Bc=8*8 =64, matmul N
-    const int kValTileSeqLenP,   // 1, more values, M, Br=64*1=64, matmul M
-    const int kValTileHeadDimV,  // 8, more values, N, d=8*(1|2|3|4|...)=8|...|32|64|96|128|...
-    const int kMmaAccFloat32QK,  // 0/1, Q@K^T, 0 MMA Acc with fp16, 1 MMA Acc with fp32.
-    const int kMmaAccFloat32PV,  // 0/1, P@V, 0 MMA Acc with fp16, 1 MMA Acc with fp32.
-    const int kOStorageAccFloat32,  // 0/1, MMA Acc always be f32/f16, but O storage can be fp32 or
-                                    // half.
-    const int kPrefetchQK,          // Prefetch QK at the Appropriate Time Point.
-    const int kPrefetchPV,          // Prefetch V at the Appropriate Time Point.
-    const int kShareSmemQKV,        // QKV share the same shared memory, reuse QK smem for V.
-    const int kPersistQs2r,  // Persist load Q s2r for headdim < 320, more registers, but still keep
-                             // O(1) SRAM.
-    const int kPersistQg2s,  // Persist load Q g2s for headdim < 320, more SRAM, but still keep
-                             // register usage.
-    const int kRegPipeKV,  // Registers Ping pong double buffers for ldmatrix s2r & mma computation
-                           // overlapping.
-    const int kStageQK,    // <= 4, may apply different multi stages policy for QK and V (<=4)
-    const int kStagePV,    // <= 4, may apply different multi stages policy for QK and V (<=4)
-    const int kPadQ,       // Pad Q/K/V 0,8; 0 -> smem swizzle, > 0 -> padding
-    const int kPadK, const int kPadV>
+template <typename kDataType, const int kHeadDim, const int kMmaAtomM, const int kMmaAtomN,
+          const int kMmaAtomK, const int kMmaTileSeqLenQ, const int kMmaTileSeqLenK,
+          const int kMmaTileSeqLenP, const int kMmaTileHeadDimV, const int kValTileSeqLenQ,
+          const int kValTileSeqLenK, const int kValTileSeqLenP, const int kValTileHeadDimV,
+          const int kMmaAccFloat32QK, const int kMmaAccFloat32PV, const int kOStorageAccFloat32,
+          const int kPrefetchQK, const int kPrefetchPV, const int kShareSmemQKV,
+          const int kPersistQs2r, const int kPersistQg2s, const int kRegPipeKV, const int kStageQK,
+          const int kStagePV, const int kPadQ, const int kPadK, const int kPadV>
 __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
     ffpa_stages_split_q_large_d_template(const kDataType* __restrict__ Q,
                                          const kDataType* __restrict__ K,
                                          const kDataType* __restrict__ V, kDataType* __restrict__ O,
-                                         const int Nq, const int Nkv, const int Nh,
-                                         const float scale, const int Tc) {
+                                         const int Nq, const int Nkv, const int Nh, const int Nh_kv,
+                                         const float scale, const int Tc, const int causal) {
   prefill::check_large_d_compiling_states<
       kHeadDim, kMmaAtomM, kMmaAtomN, kMmaAtomK, kMmaTileSeqLenQ, kMmaTileSeqLenK, kMmaTileSeqLenP,
       kMmaTileHeadDimV, kValTileSeqLenQ, kValTileSeqLenK, kValTileSeqLenP, kValTileHeadDimV,
@@ -129,12 +118,16 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
   const int O_tile_id = Q_tile_id;              // O tile_id, same as Q.
   const int warp_QP = threadIdx.x / WARP_SIZE;  // 0,1,2,3 or 0~7
   constexpr int warp_KV = 0;                    // 0
+  // GQA: K/V have Nh_kv heads shared across group_size = Nh / Nh_kv Q heads;
+  // MHA path preserved when Nh_kv == Nh (group_size == 1, Nh_id == kv_head_idx).
+  const int group_size = Nh / Nh_kv;
+  const int kv_head_idx = Nh_id / group_size;
   const int Q_gmem_offset =
       ((Nb_id * Nh * Nq * kHeadDim) + (Nh_id * Nq * kHeadDim));  // Q [seqlen,d]
   const int K_gmem_offset =
-      ((Nb_id * Nh * Nkv * kHeadDim) + (Nh_id * Nkv * kHeadDim));  // K [seqlen,d]
-  const int V_gmem_offset = K_gmem_offset;                         // V [seqlen,d]
-  const int O_gmem_offset = Q_gmem_offset;                         // O [seqlen,d]
+      ((Nb_id * Nh_kv * Nkv * kHeadDim) + (kv_head_idx * Nkv * kHeadDim));  // K [seqlen,d]
+  const int V_gmem_offset = K_gmem_offset;                                  // V [seqlen,d]
+  const int O_gmem_offset = Q_gmem_offset;                                  // O [seqlen,d]
 
   // int load_gmem_Q_Br = Q_tile_id * Br + load_smem_Q_Br;
   // if ((Q_tile_id * Br + (threadIdx.x / (kNumThreads / Br))) >= Nq) return;
@@ -196,10 +189,25 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
   uint32_t reg_st_idx = 0;
   uint32_t reg_ld_idx = 1;
 
+  // Causal attention bounds (large-d kernel). Queries are aligned to the
+  // tail of the KV sequence: the global KV column visible to Q row r is
+  // ``k <= r + kv_offset`` with ``kv_offset = Nkv - Nq``. The launcher
+  // enforces ``Nkv >= Nq`` whenever ``causal != 0`` so ``kv_offset >= 0``.
+  // * ``Tc_eff``         : KV tile loop bound clipped by the last tile that
+  //                       still contains any visible key for this Q tile.
+  // * ``mask_start_tile``: first tile where at least one column exceeds
+  //                       the causal threshold of row 0 and therefore
+  //                       needs the per-fragment causal mask.
+  const int Br_base = Q_tile_id * Br;
+  const int kv_offset = Nkv - Nq;
+  const int causal_thresh_row0 = Br_base + kv_offset;  // max k for row 0
+  const int Tc_eff = causal ? min(Tc, ((Br_base + Br - 1 + kv_offset) / Bc) + 1) : Tc;
+  const int mask_start_tile = causal ? max(0, (causal_thresh_row0 + 1) / Bc) : INT_MAX;
+
   // Now, N must be mutliples of Bc(32/64) for KV tiling across seqlen.
   // <loop over K seqlen>: for K^T[d,seqlen] with K^T_tile[d,Bc]
 #pragma unroll 1
-  for (int tile_K_seqlen = 0; tile_K_seqlen < Tc; ++tile_K_seqlen) {
+  for (int tile_K_seqlen = 0; tile_K_seqlen < Tc_eff; ++tile_K_seqlen) {
     // TODO: process last tile_K_seqlen ? pad to multiple of Bc.
     if constexpr (kPrefetchQK) {
       if constexpr (kStageQK > 1) {
@@ -448,6 +456,13 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
                                                                                   kv_valid_local);
       }
     }
+    // Causal mask: skipped on tiles fully below the diagonal thanks to
+    // ``mask_start_tile`` (INT_MAX when causal == 0), so non-causal paths
+    // pay only one compare-and-branch per tile.
+    if (tile_K_seqlen >= mask_start_tile) {
+      prefill::sync_apply_causal_mask<kValTileSeqLenK, kMmaAccFloat32QK, kDataType>(
+          &R_S[0][0][0], warp_QP, Br_base, tile_K_seqlen * Bc, kv_offset);
+    }
     prefill::sync_online_safe_softmax<kValTileSeqLenK, kMmaAccFloat32QK, kDataType>(
         &R_S[0][0][0], scale, &lane_row_max_new[0][0], &lane_row_sum_new[0][0],
         &lane_block_row_max_old[0][0], &lane_block_row_sum_old[0][0]);
@@ -460,7 +475,7 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
 
     // !kShareSmemQKV: Prefetch QK g2s before all P@V.
     if constexpr ((!kShareSmemQKV) && kPrefetchQK && kStageQK > 1) {
-      if ((tile_K_seqlen + 1) < Tc) {
+      if ((tile_K_seqlen + 1) < Tc_eff) {
 #pragma unroll
         for (int stage = 0; stage < (kStageQK - 1); ++stage) {
           // We do not need to load Q g2s & s2r while tile_K_seqlen > 0,
@@ -522,7 +537,7 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
           // kShareSmemQKV: Prefetch next QK g2s before last P@V iteration.
           if constexpr ((kShareSmemQKV) && kPrefetchQK && kStageQK > 1) {
             if (j == (kValTileHeadDimV - 1) && tile_V_Bc == (Bc / kMmaAtomK - 1) &&
-                (tile_K_seqlen + 1) < Tc) {
+                (tile_K_seqlen + 1) < Tc_eff) {
               __syncthreads();  // wait all V s2r ready
               // Prefetch next QK g2s before last P@V iteration.
               if constexpr (kStageQK > 1) {
@@ -663,8 +678,9 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
 // uses more SMEM but fewer synchronizations, giving better throughput when D
 // is small.
 //
-// Supports cross-attention (Nq may differ from Nkv); Nk == Nv is required
-// and is asserted by the launcher. Causal mask and GQA/MQA are not supported.
+// Supports cross-attention, GQA/MQA, and runtime causal attention with the
+// same semantics as the large-d template; see that header for the full
+// contract.
 //
 // ----------------------------------------------------------------------------
 // Template parameters (compile-time configuration)
@@ -687,25 +703,28 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
 //                        P@V inner loop (only viable for small D).
 //   kRegPipeKV           0/1, register ping-pong between ldmatrix and mma.
 //                        Mutually exclusive with kPersistVs2r.
-//   kStageQK / kStagePV  Must both be 1 for this template (static_assert).
-//   kPadQ / kPadK / kPadV 0 -> SMEM swizzle, >0 -> padded SMEM layout.
+//   kStageQK/kStagePV    Must both be 1 for this template (static_assert).
+//   kPadQ/kPadK/kPadV    0 -> SMEM swizzle, >0 -> padded SMEM layout.
 //
 // ----------------------------------------------------------------------------
 // Runtime parameters
 // ----------------------------------------------------------------------------
 //   Q   in : fp16/bf16 tensor, shape [Nb, Nh, Nq,  D].
-//   K   in : fp16/bf16 tensor, shape [Nb, Nh, Nkv, D].
-//   V   in : fp16/bf16 tensor, shape [Nb, Nh, Nkv, D].
+//   K   in : fp16/bf16 tensor, shape [Nb, Nh_kv, Nkv, D].
+//   V   in : fp16/bf16 tensor, shape [Nb, Nh_kv, Nkv, D].
 //   O   out: fp16/bf16 tensor, shape [Nb, Nh, Nq,  D]; written in place.
 //   Nb     : Batch size; combined with Nh to fan out across gridDim.y.
 //   Nq     : Query sequence length; drives gridDim.x = div_ceil(Nq, Br) and
 //            the tail-row store predicate.
 //   Nkv    : Key/Value sequence length (Nk == Nv); drives the KV loop bound
 //            Tc = div_ceil(Nkv, Bc) and the tail-tile softmax mask.
-//   Nh     : Number of attention heads; used with blockIdx.y to recover
-//            (batch, head) indices.
+//   Nh     : Number of Q attention heads (Nh_q); combined with blockIdx.y
+//            to recover (batch, head) indices.
+//   Nh_kv  : Number of K/V heads (GQA/MQA). Must divide Nh.
 //   scale  : Softmax pre-scale, typically 1 / sqrt(D).
 //   Tc     : Precomputed KV tile count = div_ceil(Nkv, Bc).
+//   causal : 0/1 runtime flag; identical semantics to the large-d kernel
+//            (queries aligned to the KV tail, mask k > r + (Nkv - Nq)).
 //
 // ----------------------------------------------------------------------------
 // Grid / block layout (identical shape to the large-d template)
@@ -714,41 +733,20 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
 //   Grid : (div_ceil(Nq, Br), Nb*Nh) or (div_ceil(Nq, Br), Nh, Nb) under
 //          ENABLE_FFPA_LAUNCH_GRID_DNHB.
 // ============================================================================
-template <
-    typename kDataType,          // Activation dtype (__half or __nv_bfloat16).
-    const int kHeadDim,          // Headdim, 32~1024
-    const int kMmaAtomM,         // MMA Atom M, 16
-    const int kMmaAtomN,         // MMA Atom N, 8
-    const int kMmaAtomK,         // MMA Atom K, 16
-    const int kMmaTileSeqLenQ,   // 4, more MMA(warp), M=16*4=64, Q@K^T=[Br(M), d(K)]@[d(K),  Bc(N)]
-    const int kMmaTileSeqLenK,   // 1, more MMA(warp), N=8*1 =8,  Q@K^T=[Br(M), d(K)]@[d(K),  Bc(N)]
-    const int kMmaTileSeqLenP,   // 4, more MMA(warp), M=16*4=64, P@V  =[Br(M),Bc(K)]@[Bc(K), d(N) ]
-    const int kMmaTileHeadDimV,  // 1, more MMA(warp), N=8*1 =8,  P@V  =[Br(M),Bc(K)]@[Bc(K), d(N) ]
-    const int kValTileSeqLenQ,   // 1, more values, M, Br=64*1=64, matmul M
-    const int kValTileSeqLenK,   // 8, more values, N, Bc=8*8 =64, matmul N
-    const int kValTileSeqLenP,   // 1, more values, M, Br=64*1=64, matmul M
-    const int kValTileHeadDimV,  // 8, more values, N, d=8*(1|2|3|4|...)=8|...|32|64|96|128|...
-    const int kMmaAccFloat32QK,  // 0/1, Q@K^T, 0 MMA Acc with fp16, 1 MMA Acc with fp32.
-    const int kMmaAccFloat32PV,  // 0/1, P@V, 0 MMA Acc with fp16, 1 MMA Acc with fp32.
-    const int kOStorageAccFloat32,  // 0/1, MMA Acc always be f32/f16, but O storage can be fp32 or
-                                    // half.
-    const int kPrefetchQK,          // Prefetch QK at the Appropriate Time Point.
-    const int kPrefetchPV,          // Prefetch V at the Appropriate Time Point.
-    const int kShareSmemQKV,        // QKV share the same shared memory, reuse QK smem for V.
-    const int kPersistQs2r,         // Persist load Q s2r for headdim <= 128, more registers.
-    const int kPersistVs2r,         // Persist load V s2r for headdim <= 128, more registers.
-    const int kRegPipeKV,  // Registers Ping pong double buffers for ldmatrix s2r & mma computation
-                           // overlapping.
-    const int kStageQK,    // <= 4, may apply different multi stages policy for QK and V (<=4)
-    const int kStagePV,    // <= 4, may apply different multi stages policy for QK and V (<=4)
-    const int kPadQ,       // Pad Q/K/V 0,8; 0 -> smem swizzle, > 0 -> padding
-    const int kPadK, const int kPadV>
+template <typename kDataType, const int kHeadDim, const int kMmaAtomM, const int kMmaAtomN,
+          const int kMmaAtomK, const int kMmaTileSeqLenQ, const int kMmaTileSeqLenK,
+          const int kMmaTileSeqLenP, const int kMmaTileHeadDimV, const int kValTileSeqLenQ,
+          const int kValTileSeqLenK, const int kValTileSeqLenP, const int kValTileHeadDimV,
+          const int kMmaAccFloat32QK, const int kMmaAccFloat32PV, const int kOStorageAccFloat32,
+          const int kPrefetchQK, const int kPrefetchPV, const int kShareSmemQKV,
+          const int kPersistQs2r, const int kPersistVs2r, const int kRegPipeKV, const int kStageQK,
+          const int kStagePV, const int kPadQ, const int kPadK, const int kPadV>
 __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
     ffpa_stages_split_q_small_d_template(const kDataType* __restrict__ Q,
                                          const kDataType* __restrict__ K,
                                          const kDataType* __restrict__ V, kDataType* __restrict__ O,
-                                         const int Nq, const int Nkv, const int Nh,
-                                         const float scale, const int Tc) {
+                                         const int Nq, const int Nkv, const int Nh, const int Nh_kv,
+                                         const float scale, const int Tc, const int causal) {
   // NOTE: This kernel template is developed for small head dimensions (d <= 128),
   // namely, flash-attention-2. Always persist QKV for flash-attn, apply tiling at
   // the Attention level not the MMA level.
@@ -776,12 +774,16 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
   const int O_tile_id = Q_tile_id;              // O tile_id, same as Q.
   const int warp_QP = threadIdx.x / WARP_SIZE;  // 0,1,2,3 or 0~7
   constexpr int warp_KV = 0;                    // 0
+  // GQA: K/V have Nh_kv heads shared across group_size = Nh / Nh_kv Q heads;
+  // MHA path preserved when Nh_kv == Nh (group_size == 1, Nh_id == kv_head_idx).
+  const int group_size = Nh / Nh_kv;
+  const int kv_head_idx = Nh_id / group_size;
   const int Q_gmem_offset =
       ((Nb_id * Nh * Nq * kHeadDim) + (Nh_id * Nq * kHeadDim));  // Q [seqlen,d]
   const int K_gmem_offset =
-      ((Nb_id * Nh * Nkv * kHeadDim) + (Nh_id * Nkv * kHeadDim));  // K [seqlen,d]
-  const int V_gmem_offset = K_gmem_offset;                         // V [seqlen,d]
-  const int O_gmem_offset = Q_gmem_offset;                         // O [seqlen,d]
+      ((Nb_id * Nh_kv * Nkv * kHeadDim) + (kv_head_idx * Nkv * kHeadDim));  // K [seqlen,d]
+  const int V_gmem_offset = K_gmem_offset;                                  // V [seqlen,d]
+  const int O_gmem_offset = Q_gmem_offset;                                  // O [seqlen,d]
 
   // int load_gmem_Q_Br = Q_tile_id * Br + load_smem_Q_Br;
   // if ((Q_tile_id * Br + (threadIdx.x / (kNumThreads / Br))) >= Nq) return;
@@ -851,10 +853,18 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
     __syncthreads();  // wait all warps Q s2r ready.
   }
 
+  // Causal attention bounds (small-d kernel). See large-d kernel above
+  // for the detailed derivation; this block is the identical computation.
+  const int Br_base = Q_tile_id * Br;
+  const int kv_offset = Nkv - Nq;
+  const int causal_thresh_row0 = Br_base + kv_offset;  // max k for row 0
+  const int Tc_eff = causal ? min(Tc, ((Br_base + Br - 1 + kv_offset) / Bc) + 1) : Tc;
+  const int mask_start_tile = causal ? max(0, (causal_thresh_row0 + 1) / Bc) : INT_MAX;
+
 // Now, N must be mutliples of Bc(32/64) for KV tiling across seqlen.
 // <loop over K seqlen>: for K^T[d,seqlen] with K^T_tile[d,Bc]
 #pragma unroll 1
-  for (int tile_K_seqlen = 0; tile_K_seqlen < Tc; ++tile_K_seqlen) {
+  for (int tile_K_seqlen = 0; tile_K_seqlen < Tc_eff; ++tile_K_seqlen) {
     // TODO: process last tile_K_seqlen ? pad to multiple of Bc.
     if constexpr (kPrefetchQK) {
       if (tile_K_seqlen == 0) {
@@ -1009,6 +1019,11 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
                                                                                   kv_valid_local);
       }
     }
+    // Causal mask (small-d kernel); see large-d kernel for the rationale.
+    if (tile_K_seqlen >= mask_start_tile) {
+      prefill::sync_apply_causal_mask<kValTileSeqLenK, kMmaAccFloat32QK, kDataType>(
+          &R_S[0][0][0], warp_QP, Br_base, tile_K_seqlen * Bc, kv_offset);
+    }
     prefill::sync_online_safe_softmax<kValTileSeqLenK, kMmaAccFloat32QK, kDataType>(
         &R_S[0][0][0], scale, &lane_row_max_new[0][0], &lane_row_sum_new[0][0],
         &lane_block_row_max_old[0][0], &lane_block_row_sum_old[0][0]);
@@ -1019,14 +1034,14 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
 
     // !kShareSmemQKV: Prefetch QK g2s before all P@V.
     if constexpr (kPrefetchQK) {
-      if ((tile_K_seqlen + 1) < Tc) {
+      if ((tile_K_seqlen + 1) < Tc_eff) {
 #pragma unroll
         for (int tile_K_d = 0; tile_K_d < (kHeadDim / kMmaAtomK); ++tile_K_d) {
           prefill::cp_async_qkv_g2s<Bc, K_tile_size, kHeadDim, kMmaAtomK, kNumThreads, kPadK>(
               smem_K_base_ptr, K, K_gmem_offset, (tile_K_seqlen + 1), tile_K_d, tile_K_d, Nkv);
         }
         cp_async::commit_group();  // pack K as 1 group.
-      }  // end if (tile_K_seqlen + 1) < Tc
+      }  // end if (tile_K_seqlen + 1) < Tc_eff
     }
 
     // according to the A matrix layout for MMA m16n8k16 instruction.
