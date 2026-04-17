@@ -160,7 +160,7 @@ By leveraging this approach, we can achieve better performance than SDPA EA for 
 
 <div align='center'>
 
-|📚Complexity| 📚FFPA | 📚FA-2 |
+|📚Complexity Analysis| 📚FFPA Attention (Split-D)| 📚FlashAttention-2 |
 |:---:|:---:|:---:|
 |SRAM | O(2xBrx16)≈O(1) | ≈O(3xBrxd), d↑ |
 |Register | ≈O(d/4), d↑ | ≈O(d/2), d↑ |
