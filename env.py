@@ -679,7 +679,7 @@ class ENV(object):
       f"Arch ENV: {torch_arch_list_env}"
     )
     return load(
-      name="pyffpa_cuda",
+      name="ffpa_attn._C",
       sources=ENV.get_build_sources(),
       extra_cuda_cflags=ENV.get_build_cuda_cflags(),
       extra_cflags=ENV.get_build_cflags(),

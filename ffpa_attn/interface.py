@@ -1,6 +1,6 @@
 """Torch custom op registration for FFPA prefill attention.
 
-Wraps the single pybind entry ``pyffpa_cuda.ffpa_attn`` as a real
+Wraps the single pybind entry ``ffpa_attn._C.ffpa_attn`` as a real
 ``torch.library`` operator so callers (including ``torch.compile`` graphs)
 can reach the kernel through ``torch.ops.ffpa_attn.attn`` instead of
 calling the C-extension symbol directly.
@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import torch
 
-from pyffpa_cuda import ffpa_attn as _ffpa_attn_cuda
+from ._C import ffpa_attn as _ffpa_attn_cuda
 
 # acc encoding kept in sync with csrc/pybind/ffpa_attn_api.cc::ffpa_attn.
 _ACC_F16 = 0

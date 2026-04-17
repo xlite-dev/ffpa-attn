@@ -50,6 +50,7 @@ pip3 install dist/*.whl # pip uninstall ffpa-attn -y
 Minimal usage example (B=1, H=32, N=8192, D=512):
 ```python
 import torch
+import torch.nn.functional as F
 from ffpa_attn import ffpa_attn_func
 
 B, H, N, D = 1, 32, 8192, 512
@@ -60,6 +61,12 @@ v = torch.randn(B, H, N, D, dtype=torch.bfloat16, device="cuda")
 # FFPA prefill attention; layout follows SDPA: (B, H, N, D).
 out = ffpa_attn_func(q, k, v)  # -> torch.Tensor of shape (B, H, N, D)
 print(out.shape, out.dtype)
+
+# Accuracy check against PyTorch SDPA (same bf16 dtype).
+ref = F.scaled_dot_product_attention(q, k, v)
+max_abs = (out - ref).abs().max().item()
+mean_abs = (out - ref).abs().mean().item()
+print(f"vs SDPA: max_abs_err={max_abs:.4e}, mean_abs_err={mean_abs:.4e}")
 ```
 
 A runnable end-to-end example (with SDPA accuracy/perf comparison, both aligned N=8192 and non-aligned N=8191 cases) is provided under [`examples/run_ffpa_attn.py`](./examples/run_ffpa_attn.py):
@@ -70,8 +77,7 @@ CUDA_VISIBLE_DEVICES=0 python3 examples/run_ffpa_attn.py
 
 ## 📖 Contents
 
-- [📖 Python Testing👇](#python-test)
-- [📖 FFPA Design💡](#ffpa-design)
+- [📖 FFPA Design](#ffpa-design)
 - [📈 FFPA: L20 ~1.9x↑🎉](#bench-l20)
 - [📈 FFPA: A30 ~1.8x↑🎉](#bench-a30)
 - [📈 FFPA: 3080 ~2.9x↑🎉](#bench-3080)
