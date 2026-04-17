@@ -13,7 +13,7 @@
 
 |[Self Attention](#example-self)| [Cross/Decode Attention](#example-cross)|[GQA/MQA Attention](#example-gqa)|[Causal Attention](#example-causal)|[Headdim](#ffpa-design)|
 |:---:|:---:|:---:|:---:|:---:|
-|✔️|✔️(`Nq != Nkv`)|✔️(`Nh_q % Nh_kv == 0`)|✔️|**320~1024** |
+|✔️(`Nq = Nkv`)|✔️(`Nq != Nkv`)|✔️(`Nh_q % Nh_kv == 0`)|✔️(`causal mask`)|**320~1024** |
 
 </div>
 
