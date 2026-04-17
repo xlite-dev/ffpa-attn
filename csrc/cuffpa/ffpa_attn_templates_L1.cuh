@@ -408,7 +408,7 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
                                                &lane_row_max_new[0][0],
                                                &lane_block_row_max_old[0][0], tile_K_seqlen);
 
-// <HGEMM in registers>
+      // <HGEMM in registers>
 #pragma unroll
       for (int j = 0; j < kValTileHeadDimV; ++j) {  // 8, 16, 32, ...
         // Compute d tile, P[Br,Bc]@V[Bc,16] = O[Br,16]

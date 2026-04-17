@@ -20,4 +20,9 @@ PointerAlignment: Left
 SortIncludes: false
 SpacesBeforeTrailingComments: 2
 NamespaceIndentation: None
+# clang-format's IndentPPDirectives does NOT indent `#pragma`; it only affects
+# `#if/#ifdef/#endif`. Keep it at None to avoid unintended reformatting of
+# existing `#ifdef` blocks. If you want `#pragma unroll` to visually align with
+# the following `for`, rewrite it as `_Pragma("unroll")` in the source — that
+# form is a normal statement and is indented by clang-format automatically.
 IndentPPDirectives: None
