@@ -2,7 +2,7 @@
 
 Wraps the single pybind entry ``pyffpa_cuda.ffpa_attn`` as a real
 ``torch.library`` operator so callers (including ``torch.compile`` graphs)
-can reach the kernel through ``torch.ops.ffpa_attn.attn_l1`` instead of
+can reach the kernel through ``torch.ops.ffpa_attn.attn`` instead of
 calling the C-extension symbol directly.
 """
 
@@ -17,7 +17,7 @@ _ACC_F16 = 0
 _ACC_F32 = 1
 
 _OP_NAMESPACE = "ffpa_attn"
-_OP_NAME = "attn_l1"
+_OP_NAME = "attn"
 _OP_QUALNAME = f"{_OP_NAMESPACE}::{_OP_NAME}"
 
 # The op mutates ``O`` in place and returns it for convenience. The
@@ -31,7 +31,7 @@ torch.library.define(
 
 
 @torch.library.impl(_OP_QUALNAME, "CUDA")
-def _ffpa_attn_l1_cuda(
+def _ffpa_attn_impl_cuda(
   Q: torch.Tensor,
   K: torch.Tensor,
   V: torch.Tensor,
@@ -44,7 +44,7 @@ def _ffpa_attn_l1_cuda(
 
 
 @torch.library.register_fake(_OP_QUALNAME)
-def _ffpa_attn_l1_fake(
+def _ffpa_attn_impl_fake(
   Q: torch.Tensor,
   K: torch.Tensor,
   V: torch.Tensor,
@@ -67,7 +67,7 @@ def ffpa_attn_func(
   """Unified FFPA prefill attention entry.
 
   Dispatches by ``Q.dtype`` (fp16 / bf16) and ``acc`` through a single
-  registered torch op (``torch.ops.ffpa_attn.attn_l1``), keeping the
+  registered torch op (``torch.ops.ffpa_attn.attn``), keeping the
   Python layer minimal and fully compatible with ``torch.compile``.
 
   :param Q: Query tensor with layout ``[B, H, N, D]``; dtype must be
@@ -104,4 +104,4 @@ def ffpa_attn_func(
   if O is None:
     O = torch.zeros_like(Q)  # noqa: E741
 
-  return torch.ops.ffpa_attn.attn_l1(Q, K, V, O, int(stages), acc_code)
+  return torch.ops.ffpa_attn.attn(Q, K, V, O, int(stages), acc_code)

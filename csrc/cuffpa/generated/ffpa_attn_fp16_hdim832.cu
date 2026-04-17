@@ -2,7 +2,7 @@
 #include "launch_templates.cuh"
 using namespace ffpa;
 
-void ffpa_mma_acc_f16_L1_fp16_d832(
+void ffpa_mma_acc_f16_fp16_d832(
     torch::Tensor Q,
     torch::Tensor K,
     torch::Tensor V,
@@ -12,24 +12,24 @@ void ffpa_mma_acc_f16_L1_fp16_d832(
   constexpr int kMmaAccFloat32PV = 0;
 #ifdef ENABLE_FFPA_ALL_STAGES
   if (stages == 2) {
-    launch_ffpa_mma_L1_template<__half, 832, kMmaAccFloat32QK, kMmaAccFloat32PV, 2>(Q, K, V, O);
+    launch_ffpa_mma_template<__half, 832, kMmaAccFloat32QK, kMmaAccFloat32PV, 2>(Q, K, V, O);
   } else if (stages == 3) {
-    launch_ffpa_mma_L1_template<__half, 832, kMmaAccFloat32QK, kMmaAccFloat32PV, 3>(Q, K, V, O);
+    launch_ffpa_mma_template<__half, 832, kMmaAccFloat32QK, kMmaAccFloat32PV, 3>(Q, K, V, O);
   } else if (stages == 4) {
-    launch_ffpa_mma_L1_template<__half, 832, kMmaAccFloat32QK, kMmaAccFloat32PV, 4>(Q, K, V, O);
+    launch_ffpa_mma_template<__half, 832, kMmaAccFloat32QK, kMmaAccFloat32PV, 4>(Q, K, V, O);
   } else {
-    launch_ffpa_mma_L1_template<__half, 832, kMmaAccFloat32QK, kMmaAccFloat32PV, 1>(Q, K, V, O);
+    launch_ffpa_mma_template<__half, 832, kMmaAccFloat32QK, kMmaAccFloat32PV, 1>(Q, K, V, O);
   }
 #else
   if (stages == 2) {
-    launch_ffpa_mma_L1_template<__half, 832, kMmaAccFloat32QK, kMmaAccFloat32PV, 2>(Q, K, V, O);
+    launch_ffpa_mma_template<__half, 832, kMmaAccFloat32QK, kMmaAccFloat32PV, 2>(Q, K, V, O);
   } else {
-    launch_ffpa_mma_L1_template<__half, 832, kMmaAccFloat32QK, kMmaAccFloat32PV, 1>(Q, K, V, O);
+    launch_ffpa_mma_template<__half, 832, kMmaAccFloat32QK, kMmaAccFloat32PV, 1>(Q, K, V, O);
   }
 #endif
 }
 
-void ffpa_mma_acc_f32_L1_fp16_d832(
+void ffpa_mma_acc_f32_fp16_d832(
     torch::Tensor Q,
     torch::Tensor K,
     torch::Tensor V,
@@ -47,19 +47,19 @@ void ffpa_mma_acc_f32_L1_fp16_d832(
 #endif
 #ifdef ENABLE_FFPA_ALL_STAGES
   if (stages == 2) {
-    launch_ffpa_mma_L1_template<__half, 832, kMmaAccFloat32QK, kMmaAccFloat32PV, 2>(Q, K, V, O);
+    launch_ffpa_mma_template<__half, 832, kMmaAccFloat32QK, kMmaAccFloat32PV, 2>(Q, K, V, O);
   } else if (stages == 3) {
-    launch_ffpa_mma_L1_template<__half, 832, kMmaAccFloat32QK, kMmaAccFloat32PV, 3>(Q, K, V, O);
+    launch_ffpa_mma_template<__half, 832, kMmaAccFloat32QK, kMmaAccFloat32PV, 3>(Q, K, V, O);
   } else if (stages == 4) {
-    launch_ffpa_mma_L1_template<__half, 832, kMmaAccFloat32QK, kMmaAccFloat32PV, 4>(Q, K, V, O);
+    launch_ffpa_mma_template<__half, 832, kMmaAccFloat32QK, kMmaAccFloat32PV, 4>(Q, K, V, O);
   } else {
-    launch_ffpa_mma_L1_template<__half, 832, kMmaAccFloat32QK, kMmaAccFloat32PV, 1>(Q, K, V, O);
+    launch_ffpa_mma_template<__half, 832, kMmaAccFloat32QK, kMmaAccFloat32PV, 1>(Q, K, V, O);
   }
 #else
   if (stages == 2) {
-    launch_ffpa_mma_L1_template<__half, 832, kMmaAccFloat32QK, kMmaAccFloat32PV, 2>(Q, K, V, O);
+    launch_ffpa_mma_template<__half, 832, kMmaAccFloat32QK, kMmaAccFloat32PV, 2>(Q, K, V, O);
   } else {
-    launch_ffpa_mma_L1_template<__half, 832, kMmaAccFloat32QK, kMmaAccFloat32PV, 1>(Q, K, V, O);
+    launch_ffpa_mma_template<__half, 832, kMmaAccFloat32QK, kMmaAccFloat32PV, 1>(Q, K, V, O);
   }
 #endif
 }

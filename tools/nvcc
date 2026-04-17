@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# ccache-wrapped nvcc shim. Prepend the directory containing this file to
+# PATH (see tools/build_fast.sh) and PyTorch's CUDAExtension will pick up
+# this nvcc, which in turn invokes ccache + the real nvcc so that .cu
+# translation units are cached across clean rebuilds.
+#
+# ccache >= 4.0 supports CUDA; we also export CCACHE_* knobs so CUDA
+# compiles hit in the cache reliably (preprocessor-based, ignore comments,
+# 20 GB cache). Override externally if needed.
+set -euo pipefail
+
+# Locate the real nvcc. Honor NVCC_REAL if the user points it explicitly.
+if [[ -n "${NVCC_REAL:-}" ]]; then
+  REAL_NVCC="$NVCC_REAL"
+elif [[ -n "${CUDA_HOME:-}" && -x "$CUDA_HOME/bin/nvcc" ]]; then
+  REAL_NVCC="$CUDA_HOME/bin/nvcc"
+elif [[ -x "/usr/local/cuda/bin/nvcc" ]]; then
+  REAL_NVCC="/usr/local/cuda/bin/nvcc"
+else
+  # Fallback: strip our own dir from PATH and resolve nvcc from the rest.
+  SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
+  CLEAN_PATH="$(printf '%s' "$PATH" | tr ':' '\n' | grep -vxF "$SELF_DIR" | paste -sd: -)"
+  REAL_NVCC="$(PATH="$CLEAN_PATH" command -v nvcc)"
+fi
+
+export CCACHE_COMPILERCHECK="${CCACHE_COMPILERCHECK:-content}"
+export CCACHE_SLOPPINESS="${CCACHE_SLOPPINESS:-include_file_mtime,time_macros,locale,pch_defines}"
+export CCACHE_MAXSIZE="${CCACHE_MAXSIZE:-20G}"
+export CCACHE_DIR="${CCACHE_DIR:-$HOME/.ccache}"
+
+exec ccache "$REAL_NVCC" "$@"

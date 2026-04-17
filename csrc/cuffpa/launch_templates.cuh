@@ -1,4 +1,7 @@
-#include "ffpa_attn_templates_L1.cuh"
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
+
+#include "ffpa_attn_templates.cuh"
 using namespace ffpa;
 
 static constexpr int kMaxDForSmallDKernel = 64;
@@ -233,8 +236,7 @@ template <typename kDataType,          // Activation dtype (__half or __nv_bfloa
           const int kMmaAccFloat32QK,  // 0/1, Q@K^T, 0 MMA Acc with fp16, 1 MMA Acc with fp32.
           const int kMmaAccFloat32PV,  // 0/1, P@V, 0 MMA Acc with fp16, 1 MMA Acc with fp32.
           const int kStage>
-void launch_ffpa_mma_L1_template(torch::Tensor Q, torch::Tensor K, torch::Tensor V,
-                                 torch::Tensor O) {
+void launch_ffpa_mma_template(torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O) {
   // Q,K,V,O with [B, H, N, D] layout, B=batch, H=head, N=seqlen, D=dim
   // TODO: support BNHD layout, Q,K,V,O with [B, N, H, D] layout.
   constexpr int kMmaAtomM = 16;
@@ -277,8 +279,11 @@ void launch_ffpa_mma_L1_template(torch::Tensor Q, torch::Tensor K, torch::Tensor
 
   const int QKV_batch = Q.size(0);
   const int QKV_head = Q.size(1);
-  const int QKV_seqlen = Q.size(2);       // QKV_seqlen
-  assert(QKV_seqlen % max(Br, Bc) == 0);  // multiple of max(Br, Bc)
+  const int QKV_seqlen = Q.size(2);  // QKV_seqlen
+  // Seqlen no longer has to be a multiple of max(Br, Bc): the kernel now
+  // handles the tail tile via cp.async zero-fill, softmax -inf masking and
+  // a per-row store predicate. div_ceil(QKV_seqlen, Bc) below still yields
+  // the right Tc for partial last tiles.
 
   const dim3 block = getConfigBlock<kNumThreads>();  // 4/8 warps per block
   const dim3 grid = getConfigGrid<Br>(QKV_batch, QKV_head, QKV_seqlen);
@@ -286,10 +291,16 @@ void launch_ffpa_mma_L1_template(torch::Tensor Q, torch::Tensor K, torch::Tensor
   const int Tc = utils::div_ceil(QKV_seqlen, Bc);  // Tc K_tile[Bc,d]
   const float scale = 1.0f / sqrt((float)kHeadDim);
 
+  // Launch on the caller's current CUDA stream so the kernel participates
+  // correctly in multi-stream pipelines. Without this the kernel would
+  // default to stream 0 and race against user-side non-default streams.
+  const c10::cuda::OptionalCUDAGuard device_guard(Q.device());
+  auto stream = at::cuda::getCurrentCUDAStream();
+
 #define LAUNCH_TEMPLATE_FUNC(TEMPLATE_FUNC)                                                   \
   cudaFuncSetAttribute(TEMPLATE_FUNC, cudaFuncAttributeMaxDynamicSharedMemorySize,            \
                        kQKVSmemMaxSize);                                                      \
-  TEMPLATE_FUNC<<<grid, block, kQKVSmemMaxSize>>>(                                            \
+  TEMPLATE_FUNC<<<grid, block, kQKVSmemMaxSize, stream>>>(                                    \
       reinterpret_cast<kDataType*>(Q.data_ptr()), reinterpret_cast<kDataType*>(K.data_ptr()), \
       reinterpret_cast<kDataType*>(V.data_ptr()), reinterpret_cast<kDataType*>(O.data_ptr()), \
       QKV_seqlen, QKV_head, scale, Tc);
@@ -298,8 +309,8 @@ void launch_ffpa_mma_L1_template(torch::Tensor Q, torch::Tensor K, torch::Tensor
   if constexpr (kHeadDim <= kMaxDForSmallDKernel) {       // e.g > 128 will use large d kernel
     constexpr int kPersistVs2r = getConfigPersistVs2r();  // only for d < 256
 
-    auto ffpa_mma_L1_small_d_kernel_func =
-        (ffpa_mma_stages_split_q_L1_small_d_template < kDataType, kHeadDim, kMmaAtomM, kMmaAtomN,
+    auto ffpa_mma_small_d_kernel_func =
+        (ffpa_stages_split_q_small_d_template < kDataType, kHeadDim, kMmaAtomM, kMmaAtomN,
          kMmaAtomK, kMmaTileSeqLenQ, kMmaTileSeqLenK, kMmaTileSeqLenP, kMmaTileHeadDimV,
          kValTileSeqLenQ, kValTileSeqLenK, kValTileSeqLenP, kValTileHeadDimV, kMmaAccFloat32QK,
          kMmaAccFloat32PV, kOStorageAccFloat32, kPrefetchQK, kPrefetchPV, kShareSmemQKV,
@@ -309,10 +320,10 @@ void launch_ffpa_mma_L1_template(torch::Tensor Q, torch::Tensor K, torch::Tensor
          (kPersistVs2r) ? 0 : kRegPipeKV, 1, /*kStageQK unused*/
          1,                                  /*kStagePV unused*/
          kPadQ, kPadK, kPadV >);
-    LAUNCH_TEMPLATE_FUNC(ffpa_mma_L1_small_d_kernel_func);
+    LAUNCH_TEMPLATE_FUNC(ffpa_mma_small_d_kernel_func);
   } else {  // large headdim > kMaxDForSmallDKernel (e.g 128)
-    auto ffpa_mma_L1_large_d_kernel_func =
-        (ffpa_mma_stages_split_q_L1_large_d_template < kDataType, kHeadDim, kMmaAtomM, kMmaAtomN,
+    auto ffpa_mma_large_d_kernel_func =
+        (ffpa_stages_split_q_large_d_template < kDataType, kHeadDim, kMmaAtomM, kMmaAtomN,
          kMmaAtomK, kMmaTileSeqLenQ, kMmaTileSeqLenK, kMmaTileSeqLenP, kMmaTileHeadDimV,
          kValTileSeqLenQ, kValTileSeqLenK, kValTileSeqLenP, kValTileHeadDimV, kMmaAccFloat32QK,
          kMmaAccFloat32PV, kOStorageAccFloat32, kPrefetchQK, kPrefetchPV,
@@ -321,123 +332,20 @@ void launch_ffpa_mma_L1_template(torch::Tensor Q, torch::Tensor K, torch::Tensor
          // need too many register, thus, introduce performance drops.
          (kPersistQg2s || kHeadDim > 256) ? 0 : kPersistQs2r, kPersistQg2s, kRegPipeKV, kStageQK,
          kStagePV, kPadQ, kPadK, kPadV >);
-    LAUNCH_TEMPLATE_FUNC(ffpa_mma_L1_large_d_kernel_func);
+    LAUNCH_TEMPLATE_FUNC(ffpa_mma_large_d_kernel_func);
   }
 #else
-  auto ffpa_mma_L1_large_d_kernel_func =
-      (ffpa_mma_stages_split_q_L1_large_d_template < kDataType, kHeadDim, kMmaAtomM, kMmaAtomN,
-       kMmaAtomK, kMmaTileSeqLenQ, kMmaTileSeqLenK, kMmaTileSeqLenP, kMmaTileHeadDimV,
-       kValTileSeqLenQ, kValTileSeqLenK, kValTileSeqLenP, kValTileHeadDimV, kMmaAccFloat32QK,
-       kMmaAccFloat32PV, kOStorageAccFloat32, kPrefetchQK, kPrefetchPV,
-       (kPersistQg2s) ? 0 : kShareSmemQKV,
+  auto ffpa_mma_large_d_kernel_func =
+      (ffpa_stages_split_q_large_d_template < kDataType, kHeadDim, kMmaAtomM, kMmaAtomN, kMmaAtomK,
+       kMmaTileSeqLenQ, kMmaTileSeqLenK, kMmaTileSeqLenP, kMmaTileHeadDimV, kValTileSeqLenQ,
+       kValTileSeqLenK, kValTileSeqLenP, kValTileHeadDimV, kMmaAccFloat32QK, kMmaAccFloat32PV,
+       kOStorageAccFloat32, kPrefetchQK, kPrefetchPV, (kPersistQg2s) ? 0 : kShareSmemQKV,
        // Force disable Q s2r for d >= 256, Q s2r for large d will
        // need too many register, thus, introduce performance drops.
        (kPersistQg2s || kHeadDim > 256) ? 0 : kPersistQs2r, kPersistQg2s, kRegPipeKV, kStageQK,
        kStagePV, kPadQ, kPadK, kPadV >);
-  LAUNCH_TEMPLATE_FUNC(ffpa_mma_L1_large_d_kernel_func);
+  LAUNCH_TEMPLATE_FUNC(ffpa_mma_large_d_kernel_func);
 #endif
 
 #undef LAUNCH_TEMPLATE_FUNC
 }
-
-// dispatch headdim, no switch
-#define _LAUNCHER_L1(D, S) \
-  launch_ffpa_mma_L1_template<(D), kMmaAccFloat32QK, kMmaAccFloat32PV, (S)>(Q, K, V, O);
-
-#define LAUNCHER_L1(D, S)                                                                  \
-  case D:                                                                                  \
-    launch_ffpa_mma_L1_template<(D), kMmaAccFloat32QK, kMmaAccFloat32PV, (S)>(Q, K, V, O); \
-    break;
-
-// For common use cases, we can directly use _LAUNCHER_L1
-// without switch to reduce binary size and improve L1 cache hit.
-#define DISPATCH_HEADDIM_L1(S, D) _LAUNCHER_L1(D, S)
-
-#ifdef ENABLE_FFPA_DEBUG
-// minimal kernels for debug mode
-#define DISPATCH_HEADDIM(LAUNCHER, S)                     \
-  {                                                       \
-    switch (d) {                                          \
-      LAUNCHER(32, (S));                                  \
-      LAUNCHER(64, (S));                                  \
-      LAUNCHER(128, (S));                                 \
-      LAUNCHER(256, (S));                                 \
-      LAUNCHER(320, (S));                                 \
-      LAUNCHER(512, (S));                                 \
-      LAUNCHER(1024, (S));                                \
-      default:                                            \
-        throw std::runtime_error("headdim not support!"); \
-        break;                                            \
-    }                                                     \
-  }
-
-#else
-#ifdef ENABLE_FFPA_ALL_HEADDIM
-// multiple of 32
-#define DISPATCH_HEADDIM(LAUNCHER, S)                     \
-  {                                                       \
-    switch (d) {                                          \
-      LAUNCHER(32, (S));                                  \
-      LAUNCHER(64, (S));                                  \
-      LAUNCHER(96, (S));                                  \
-      LAUNCHER(128, (S));                                 \
-      LAUNCHER(160, (S));                                 \
-      LAUNCHER(192, (S));                                 \
-      LAUNCHER(224, (S));                                 \
-      LAUNCHER(256, (S));                                 \
-      LAUNCHER(288, (S));                                 \
-      LAUNCHER(320, (S));                                 \
-      LAUNCHER(352, (S));                                 \
-      LAUNCHER(384, (S));                                 \
-      LAUNCHER(416, (S));                                 \
-      LAUNCHER(448, (S));                                 \
-      LAUNCHER(480, (S));                                 \
-      LAUNCHER(512, (S));                                 \
-      LAUNCHER(544, (S));                                 \
-      LAUNCHER(576, (S));                                 \
-      LAUNCHER(608, (S));                                 \
-      LAUNCHER(640, (S));                                 \
-      LAUNCHER(672, (S));                                 \
-      LAUNCHER(704, (S));                                 \
-      LAUNCHER(736, (S));                                 \
-      LAUNCHER(768, (S));                                 \
-      LAUNCHER(800, (S));                                 \
-      LAUNCHER(832, (S));                                 \
-      LAUNCHER(864, (S));                                 \
-      LAUNCHER(896, (S));                                 \
-      LAUNCHER(928, (S));                                 \
-      LAUNCHER(960, (S));                                 \
-      LAUNCHER(992, (S));                                 \
-      LAUNCHER(1024, (S));                                \
-      default:                                            \
-        throw std::runtime_error("headdim not support!"); \
-        break;                                            \
-    }                                                     \
-  }
-
-#else
-// multiple of 64
-#define DISPATCH_HEADDIM(LAUNCHER, S)                     \
-  {                                                       \
-    switch (d) {                                          \
-      LAUNCHER(256, (S));                                 \
-      LAUNCHER(320, (S));                                 \
-      LAUNCHER(384, (S));                                 \
-      LAUNCHER(448, (S));                                 \
-      LAUNCHER(512, (S));                                 \
-      LAUNCHER(576, (S));                                 \
-      LAUNCHER(640, (S));                                 \
-      LAUNCHER(704, (S));                                 \
-      LAUNCHER(768, (S));                                 \
-      LAUNCHER(832, (S));                                 \
-      LAUNCHER(896, (S));                                 \
-      LAUNCHER(960, (S));                                 \
-      LAUNCHER(1024, (S));                                \
-      default:                                            \
-        throw std::runtime_error("headdim not support!"); \
-        break;                                            \
-    }                                                     \
-  }
-#endif
-
-#endif

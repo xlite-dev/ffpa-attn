@@ -289,57 +289,57 @@ def get_best_tflops():
   global STATIS_INFO
   if ENV.enable_all_mutistages():
     sdpa_tflops = STATIS_INFO["(sdpa)"]
-    ffpa_l1_f32_best_tflops = [
+    ffpa_f32_best_tflops = [
       max(x, y, z, w) for x, y, z, w in zip(
-        STATIS_INFO["(ffpa+acc+f32+L1+stage1)"],
-        STATIS_INFO["(ffpa+acc+f32+L1+stage2)"],
-        STATIS_INFO["(ffpa+acc+f32+L1+stage3)"],
-        STATIS_INFO["(ffpa+acc+f32+L1+stage4)"],
+        STATIS_INFO["(ffpa+acc+f32+stage1)"],
+        STATIS_INFO["(ffpa+acc+f32+stage2)"],
+        STATIS_INFO["(ffpa+acc+f32+stage3)"],
+        STATIS_INFO["(ffpa+acc+f32+stage4)"],
       )
     ]
-    ffpa_l1_f16_best_tflops = [
+    ffpa_f16_best_tflops = [
       max(x, y, z, w) for x, y, z, w in zip(
-        STATIS_INFO["(ffpa+acc+f16+L1+stage1)"],
-        STATIS_INFO["(ffpa+acc+f16+L1+stage2)"],
-        STATIS_INFO["(ffpa+acc+f16+L1+stage3)"],
-        STATIS_INFO["(ffpa+acc+f16+L1+stage4)"],
+        STATIS_INFO["(ffpa+acc+f16+stage1)"],
+        STATIS_INFO["(ffpa+acc+f16+stage2)"],
+        STATIS_INFO["(ffpa+acc+f16+stage3)"],
+        STATIS_INFO["(ffpa+acc+f16+stage4)"],
       )
     ]
   else:
-    ffpa_l1_f32_best_tflops = [
+    ffpa_f32_best_tflops = [
       max(x, y) for x, y in zip(
-        STATIS_INFO["(ffpa+acc+f32+L1+stage1)"],
-        STATIS_INFO["(ffpa+acc+f32+L1+stage2)"],
+        STATIS_INFO["(ffpa+acc+f32+stage1)"],
+        STATIS_INFO["(ffpa+acc+f32+stage2)"],
       )
     ]
-    ffpa_l1_f16_best_tflops = [
+    ffpa_f16_best_tflops = [
       max(x, y) for x, y in zip(
-        STATIS_INFO["(ffpa+acc+f16+L1+stage1)"],
-        STATIS_INFO["(ffpa+acc+f16+L1+stage2)"],
+        STATIS_INFO["(ffpa+acc+f16+stage1)"],
+        STATIS_INFO["(ffpa+acc+f16+stage2)"],
       )
     ]
 
   # calculate improved
-  ffpa_l1_f32_speedup = [round(f / s, 2) for f, s in zip(ffpa_l1_f32_best_tflops, sdpa_tflops)]
-  ffpa_l1_f16_speedup = [round(f / s, 2) for f, s in zip(ffpa_l1_f16_best_tflops, sdpa_tflops)]
-  STATIS_INFO["ffpa+acc-f32+L1(best)"] = ffpa_l1_f32_best_tflops
-  STATIS_INFO["ffpa+acc-f16+L1(best)"] = ffpa_l1_f16_best_tflops
-  STATIS_INFO["ffpa+acc-f32+L1(speedup)"] = ffpa_l1_f32_speedup
-  STATIS_INFO["ffpa+acc-f16+L1(speedup)"] = ffpa_l1_f16_speedup
+  ffpa_f32_speedup = [round(f / s, 2) for f, s in zip(ffpa_f32_best_tflops, sdpa_tflops)]
+  ffpa_f16_speedup = [round(f / s, 2) for f, s in zip(ffpa_f16_best_tflops, sdpa_tflops)]
+  STATIS_INFO["ffpa+acc-f32(best)"] = ffpa_f32_best_tflops
+  STATIS_INFO["ffpa+acc-f16(best)"] = ffpa_f16_best_tflops
+  STATIS_INFO["ffpa+acc-f32(speedup)"] = ffpa_f32_speedup
+  STATIS_INFO["ffpa+acc-f16(speedup)"] = ffpa_f16_speedup
 
   return (
     sdpa_tflops,
-    ffpa_l1_f32_best_tflops,
-    ffpa_l1_f16_best_tflops,
-    ffpa_l1_f32_speedup,
-    ffpa_l1_f16_speedup,
+    ffpa_f32_best_tflops,
+    ffpa_f16_best_tflops,
+    ffpa_f32_speedup,
+    ffpa_f16_speedup,
   )
 
 
 def gen_bench_markdown_table():
   global STATIS_INFO
   STATIS_INFO["headdim"] = sorted(list(STATIS_INFO["headdim"]))
-  pretty_print_line("FFPA-L1 Benchmark Data")
+  pretty_print_line("FFPA Benchmark Data")
   print(STATIS_INFO)
   pretty_print_line()
   headdims = [str(d) for d in STATIS_INFO["headdim"]]
@@ -348,26 +348,26 @@ def gen_bench_markdown_table():
   table_header += "|:---:|" + ":---:|" * num_headdim
   (
     sdpa_tflops,
-    ffpa_l1_f32_best_tflops,
-    ffpa_l1_f16_best_tflops,
-    ffpa_l1_f32_speedup,
-    ffpa_l1_f16_speedup,
+    ffpa_f32_best_tflops,
+    ffpa_f16_best_tflops,
+    ffpa_f32_speedup,
+    ffpa_f16_speedup,
   ) = get_best_tflops()
 
   # sdpa, ffpa, speedup strings.
   sdpa_tflops_str = "|SDPA EA|" + "|".join([str(s) + "T" for s in sdpa_tflops]) + "|"
-  ffpa_l1_f32_tflops_str = ("|FFPA L1*|" + "|".join([str(f) + "T" for f in ffpa_l1_f32_best_tflops]) + "|")
-  ffpa_l1_f32_speedup_str = ("|Speedup|" + "|".join([str(fs) + "x" for fs in ffpa_l1_f32_speedup]) + "|")
-  ffpa_l1_f16_tflops_str = ("|FFPA L1^|" + "|".join([str(f) + "T" for f in ffpa_l1_f16_best_tflops]) + "|")
-  ffpa_l1_f16_speedup_str = ("|Speedup|" + "|".join([str(fs) + "x" for fs in ffpa_l1_f16_speedup]) + "|")
-  pretty_print_line("FFPA-L1 Best Benchmark Markdown Table:")
+  ffpa_f32_tflops_str = ("|FFPA*|" + "|".join([str(f) + "T" for f in ffpa_f32_best_tflops]) + "|")
+  ffpa_f32_speedup_str = ("|Speedup|" + "|".join([str(fs) + "x" for fs in ffpa_f32_speedup]) + "|")
+  ffpa_f16_tflops_str = ("|FFPA^|" + "|".join([str(f) + "T" for f in ffpa_f16_best_tflops]) + "|")
+  ffpa_f16_speedup_str = ("|Speedup|" + "|".join([str(fs) + "x" for fs in ffpa_f16_speedup]) + "|")
+  pretty_print_line("FFPA Best Benchmark Markdown Table:")
   print("\n")
   print(table_header)
   print(sdpa_tflops_str)
-  print(ffpa_l1_f32_tflops_str)
-  print(ffpa_l1_f32_speedup_str)
-  print(ffpa_l1_f16_tflops_str)
-  print(ffpa_l1_f16_speedup_str)
+  print(ffpa_f32_tflops_str)
+  print(ffpa_f32_speedup_str)
+  print(ffpa_f16_tflops_str)
+  print(ffpa_f16_speedup_str)
   print("\n")
 
 
@@ -387,7 +387,7 @@ def sort_tflops_by_headdim():
   return NEW_STATIS_INFO
 
 
-def plot_speedup_bar(speedup: list[float], extra_tag: str = "ffpa+acc+f32+L1", headdim: list[int] = None):
+def plot_speedup_bar(speedup: list[float], extra_tag: str = "ffpa+acc+f32", headdim: list[int] = None):
   import matplotlib.pyplot as plt
 
   _ = plt.subplots(figsize=(16, 9))[1]  # fig, axs
@@ -424,7 +424,7 @@ def plot_speedup_bar(speedup: list[float], extra_tag: str = "ffpa+acc+f32+L1", h
   plt.close()
 
 
-def plot_tflops(level: str = "L1"):
+def plot_tflops():
   import matplotlib.pyplot as plt
   import numpy as np
 
@@ -434,7 +434,7 @@ def plot_tflops(level: str = "L1"):
   H = 48 if not args.H else args.H
   N = 8192 if not args.N else args.N
   ax.set_title(
-    f"FFPA {level} vs SDPA EA, {ENV.get_device_name()}, "
+    f"FFPA vs SDPA EA, {ENV.get_device_name()}, "
     f"B={B}, H={H}, N={N}, Warmup={args.warmup}, "
     f"Iters={args.iters}",
     fontsize=15,
@@ -461,11 +461,11 @@ def plot_tflops(level: str = "L1"):
 
   draw_tags = list(new_statis_info.keys())
   draw_tags.remove("headdim")
-  draw_tags.remove("ffpa+acc-f32+L1(speedup)")
-  draw_tags.remove("ffpa+acc-f16+L1(speedup)")
+  draw_tags.remove("ffpa+acc-f32(speedup)")
+  draw_tags.remove("ffpa+acc-f16(speedup)")
   draw_tags = set(draw_tags)
-  draw_tags.add("ffpa+acc-f32+L1(best)")
-  draw_tags.add("ffpa+acc-f16+L1(best)")
+  draw_tags.add("ffpa+acc-f32(best)")
+  draw_tags.add("ffpa+acc-f16(best)")
   draw_tags = sorted(list(draw_tags))
 
   def skip_it(tag: str) -> bool:
@@ -484,9 +484,9 @@ def plot_tflops(level: str = "L1"):
     elif tag == "(unfused)":
       ax.plot(tflops, label=tag, linewidth=3, color="black")
     else:
-      if "ffpa+acc-f32+L1(best)" in tag:
+      if "ffpa+acc-f32(best)" in tag:
         ax.plot(tflops, label=tag, linewidth=4, color="blue")
-      elif "ffpa+acc-f16+L1(best)" in tag:
+      elif "ffpa+acc-f16(best)" in tag:
         ax.plot(tflops, label=tag, linewidth=4, color="red")
       else:
         ax.plot(tflops, label=tag, linestyle="--")
@@ -506,13 +506,13 @@ def plot_tflops(level: str = "L1"):
   pretty_print_line(f"plot FFPA TFLOPS done, saved as {save_path}")
   plt.close()
   plot_speedup_bar(
-    new_statis_info["ffpa+acc-f32+L1(speedup)"],
-    "ffpa+acc+f32+L1",
+    new_statis_info["ffpa+acc-f32(speedup)"],
+    "ffpa+acc+f32",
     new_statis_info["headdim"],
   )
   plot_speedup_bar(
-    new_statis_info["ffpa+acc-f16+L1(speedup)"],
-    "ffpa+acc+f16+L1",
+    new_statis_info["ffpa+acc-f16(speedup)"],
+    "ffpa+acc+f16",
     new_statis_info["headdim"],
   )
 
@@ -609,14 +609,14 @@ MAX_HEADDIM_CFG: dict[str, int] = {
   # FFPA, SDPA, Naive MHA.
   "(sdpa)": 4096,  # may no limit
   "(unfused)": 4096,  # may no limit
-  "(ffpa+acc+f16+L1+stage1)": 1024,  # may no limit
-  "(ffpa+acc+f16+L1+stage2)": 1024,  # may no limit
-  "(ffpa+acc+f16+L1+stage3)": 1024,  # may no limit
-  "(ffpa+acc+f16+L1+stage4)": 1024,  # may no limit
-  "(ffpa+acc+f32+L1+stage1)": 1024,  # may no limit
-  "(ffpa+acc+f32+L1+stage2)": 1024,  # may no limit
-  "(ffpa+acc+f32+L1+stage3)": 1024,  # may no limit
-  "(ffpa+acc+f32+L1+stage4)": 1024,  # may no limit
+  "(ffpa+acc+f16+stage1)": 1024,  # may no limit
+  "(ffpa+acc+f16+stage2)": 1024,  # may no limit
+  "(ffpa+acc+f16+stage3)": 1024,  # may no limit
+  "(ffpa+acc+f16+stage4)": 1024,  # may no limit
+  "(ffpa+acc+f32+stage1)": 1024,  # may no limit
+  "(ffpa+acc+f32+stage2)": 1024,  # may no limit
+  "(ffpa+acc+f32+stage3)": 1024,  # may no limit
+  "(ffpa+acc+f32+stage4)": 1024,  # may no limit
 }
 
 seed = args.seed if args.seed else random.choice(range(10000))
@@ -639,77 +639,77 @@ for (B, H, N, D) in BHNDs:
     out_unfused, _ = run_benchmark(unfused_standard_attn, q, k, v, "(unfused)")
     out_sdpa, _ = run_benchmark(partial(sdpa, use_flash=(D <= 256)), q, k, v, "(sdpa)")
     out_flash, _ = run_benchmark(flash_attn_func, fq, fk, fv, "(flash)")
-    out_ffpa_l1_f321, _ = run_benchmark(
+    out_ffpa_f321, _ = run_benchmark(
       ffpa_f32_acc,
       q,
       k,
       v,
-      "(ffpa+acc+f32+L1+stage1)",
+      "(ffpa+acc+f32+stage1)",
       o,
       stages=1,
     )
-    out_ffpa_l1_f322, _ = run_benchmark(
+    out_ffpa_f322, _ = run_benchmark(
       ffpa_f32_acc,
       q,
       k,
       v,
-      "(ffpa+acc+f32+L1+stage2)",
+      "(ffpa+acc+f32+stage2)",
       o,
       stages=2,
     )
     if ENV.enable_all_mutistages():
-      out_ffpa_l1_f323, _ = run_benchmark(
+      out_ffpa_f323, _ = run_benchmark(
         ffpa_f32_acc,
         q,
         k,
         v,
-        "(ffpa+acc+f32+L1+stage3)",
+        "(ffpa+acc+f32+stage3)",
         o,
         stages=3,
       )
-      out_ffpa_l1_f324, _ = run_benchmark(
+      out_ffpa_f324, _ = run_benchmark(
         ffpa_f32_acc,
         q,
         k,
         v,
-        "(ffpa+acc+f32+L1+stage4)",
+        "(ffpa+acc+f32+stage4)",
         o,
         stages=4,
       )
-    out_ffpa_l1_f161, _ = run_benchmark(
+    out_ffpa_f161, _ = run_benchmark(
       ffpa_f16_acc,
       q,
       k,
       v,
-      "(ffpa+acc+f16+L1+stage1)",
+      "(ffpa+acc+f16+stage1)",
       o,
       stages=1,
     )
-    out_ffpa_l1_f162, _ = run_benchmark(
+    out_ffpa_f162, _ = run_benchmark(
       ffpa_f16_acc,
       q,
       k,
       v,
-      "(ffpa+acc+f16+L1+stage2)",
+      "(ffpa+acc+f16+stage2)",
       o,
       stages=2,
     )
     if ENV.enable_all_mutistages():
-      out_ffpa_l1_f163, _ = run_benchmark(
+      out_ffpa_f163, _ = run_benchmark(
         ffpa_f16_acc,
         q,
         k,
         v,
-        "(ffpa+acc+f16+L1+stage3)",
+        "(ffpa+acc+f16+stage3)",
         o,
         stages=3,
       )
-      out_ffpa_l1_f164, _ = run_benchmark(
+      out_ffpa_f164, _ = run_benchmark(
         ffpa_f16_acc,
         q,
         k,
         v,
-        "(ffpa+acc+f16+L1+stage4)",
+        "(ffpa+acc+f16+stage4)",
         o,
         stages=4,
       )
@@ -718,77 +718,77 @@ for (B, H, N, D) in BHNDs:
     out_unfused, _ = run_benchmark(unfused_standard_attn, q, k, v, "(unfused)")
     out_sdpa, _ = run_benchmark(partial(sdpa, use_flash=(D <= 256)), q, k, v, "(sdpa)")
     out_flash, _ = run_benchmark(flash_attn_func, fq, fk, fv, "(flash)")
-    out_ffpa_l1_f321, _ = run_benchmark(
+    out_ffpa_f321, _ = run_benchmark(
       ffpa_f32_acc,
       q,
       k,
       v,
-      "(ffpa+acc+f32+L1+stage1)",
+      "(ffpa+acc+f32+stage1)",
       o,
       stages=1,
     )
-    out_ffpa_l1_f322, _ = run_benchmark(
+    out_ffpa_f322, _ = run_benchmark(
       ffpa_f32_acc,
       q,
       k,
       v,
-      "(ffpa+acc+f32+L1+stage2)",
+      "(ffpa+acc+f32+stage2)",
       o,
       stages=2,
     )
     if ENV.enable_all_mutistages():
-      out_ffpa_l1_f323, _ = run_benchmark(
+      out_ffpa_f323, _ = run_benchmark(
         ffpa_f32_acc,
         q,
         k,
         v,
-        "(ffpa+acc+f32+L1+stage3)",
+        "(ffpa+acc+f32+stage3)",
         o,
         stages=3,
       )
-      out_ffpa_l1_f324, _ = run_benchmark(
+      out_ffpa_f324, _ = run_benchmark(
         ffpa_f32_acc,
         q,
         k,
         v,
-        "(ffpa+acc+f32+L1+stage4)",
+        "(ffpa+acc+f32+stage4)",
         o,
         stages=4,
       )
-    out_ffpa_l1_f161, _ = run_benchmark(
+    out_ffpa_f161, _ = run_benchmark(
       ffpa_f16_acc,
       q,
       k,
       v,
-      "(ffpa+acc+f16+L1+stage1)",
+      "(ffpa+acc+f16+stage1)",
       o,
       stages=1,
     )
-    out_ffpa_l1_f162, _ = run_benchmark(
+    out_ffpa_f162, _ = run_benchmark(
       ffpa_f16_acc,
       q,
       k,
       v,
-      "(ffpa+acc+f16+L1+stage2)",
+      "(ffpa+acc+f16+stage2)",
       o,
       stages=2,
     )
     if ENV.enable_all_mutistages():
-      out_ffpa_l1_f163, _ = run_benchmark(
+      out_ffpa_f163, _ = run_benchmark(
         ffpa_f16_acc,
         q,
         k,
         v,
-        "(ffpa+acc+f16+L1+stage3)",
+        "(ffpa+acc+f16+stage3)",
         o,
         stages=3,
       )
-      out_ffpa_l1_f164, _ = run_benchmark(
+      out_ffpa_f164, _ = run_benchmark(
         ffpa_f16_acc,
         q,
         k,
         v,
-        "(ffpa+acc+f16+L1+stage4)",
+        "(ffpa+acc+f16+stage4)",
         o,
         stages=4,
       )
@@ -806,16 +806,16 @@ for (B, H, N, D) in BHNDs:
   torch.cuda.empty_cache()
   torch.cuda.synchronize()
   if args.check:
-    check_all_close(out_sdpa, out_ffpa_l1_f321, "out_ffpa_l1_f321", args.check_all)
-    check_all_close(out_sdpa, out_ffpa_l1_f322, "out_ffpa_l1_f322", args.check_all)
+    check_all_close(out_sdpa, out_ffpa_f321, "out_ffpa_f321", args.check_all)
+    check_all_close(out_sdpa, out_ffpa_f322, "out_ffpa_f322", args.check_all)
     if ENV.enable_all_mutistages():
-      check_all_close(out_sdpa, out_ffpa_l1_f323, "out_ffpa_l1_f323", args.check_all)
-      check_all_close(out_sdpa, out_ffpa_l1_f324, "out_ffpa_l1_f324", args.check_all)
-    check_all_close(out_sdpa, out_ffpa_l1_f161, "out_ffpa_l1_f161", args.check_all)
-    check_all_close(out_sdpa, out_ffpa_l1_f162, "out_ffpa_l1_f161", args.check_all)
+      check_all_close(out_sdpa, out_ffpa_f323, "out_ffpa_f323", args.check_all)
+      check_all_close(out_sdpa, out_ffpa_f324, "out_ffpa_f324", args.check_all)
+    check_all_close(out_sdpa, out_ffpa_f161, "out_ffpa_f161", args.check_all)
+    check_all_close(out_sdpa, out_ffpa_f162, "out_ffpa_f161", args.check_all)
     if ENV.enable_all_mutistages():
-      check_all_close(out_sdpa, out_ffpa_l1_f163, "out_ffpa_l1_f163", args.check_all)
-      check_all_close(out_sdpa, out_ffpa_l1_f164, "out_ffpa_l1_f164", args.check_all)
+      check_all_close(out_sdpa, out_ffpa_f163, "out_ffpa_f163", args.check_all)
+      check_all_close(out_sdpa, out_ffpa_f164, "out_ffpa_f164", args.check_all)
     pretty_print_line()
 
 if args.gen_bench_table:

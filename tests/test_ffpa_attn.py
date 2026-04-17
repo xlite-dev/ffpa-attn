@@ -106,3 +106,23 @@ def test_ffpa_attn_func_rejects_invalid_acc():
   q, k, v = _alloc_qkv(1, 8, 1024, 128, torch.float16)
   with pytest.raises(ValueError, match="acc"):
     ffpa_attn_func(q, k, v, stages=2, acc="bad")
+
+
+# Boundary shapes: seqlen not a multiple of Bc=64 (and/or Br=64). Covers
+# partial first tile (N<64), single-tile tail, multi-tile + tail, and
+# sizes near common power-of-two boundaries. Uses D=128 (small_d kernel)
+# and D=256 (large_d kernel) for coverage of both kernel paths.
+BOUNDARY_SEQLENS = [1, 17, 33, 63, 65, 100, 127, 129, 200, 1000, 2047, 4095, 5000]
+BOUNDARY_HEADDIMS = [128, 256]
+BOUNDARY_SHAPES = [(1, 4, N, D) for N, D in itertools.product(BOUNDARY_SEQLENS, BOUNDARY_HEADDIMS)]
+
+
+@pytest.mark.parametrize("dtype", DTYPES, ids=["fp16", "bf16"])
+@pytest.mark.parametrize("B,H,N,D", BOUNDARY_SHAPES)
+def test_ffpa_attn_func_boundary_seqlen(dtype, B, H, N, D):
+  q, k, v = _alloc_qkv(B, H, N, D, dtype)
+  out = ffpa_attn_func(q, k, v, stages=2, acc=_acc_for(dtype))
+  ref = _sdpa_ref(q, k, v)
+  assert out.shape == ref.shape
+  assert torch.isfinite(out).all(), f"FFPA output has NaN/Inf at N={N}, D={D}"
+  torch.testing.assert_close(out, ref, **_tolerance(dtype))

@@ -1,4 +1,5 @@
 #pragma once
+#include <climits>                  // INT_MAX
 #include "cuffpa/mma.cuh"           // ffpa::mma
 #include "cuffpa/dtype_traits.cuh"  // ffpa::DtypeTraits
 #include "cuffpa/warp.cuh"          // ffpa::warp
@@ -151,7 +152,10 @@ __device__ __forceinline__ void cp_async_qkv_g2s(
     const int gmem_offset,      // QKV gmem_offset
     const int n_tile_id,        // seqlen offset, Q_tile_id * Br, tile_K_seqlen * Bc
     const int d_tile_id,        // headdim offset, tile_K_d * kMmaAtomK, tile_V_d * kMmaAtomN * 2
-    const int stage             // stage * QKV tile_size
+    const int stage,            // stage * QKV tile_size
+    const int seqlen_bound = INT_MAX  // bound on the seqlen axis; rows with
+                                      // global idx >= seqlen_bound are
+                                      // zero-filled via cp.async src-size=0
 ) {
   // QK: tile_K_d < (kHeadDim / kMmaAtomK)
   //  V: tile_V_d < (kHeadDim / kMmaAtomN * 2)
@@ -171,6 +175,8 @@ __device__ __forceinline__ void cp_async_qkv_g2s(
   const int load_gmem_d = (d_tile_id * kMmaAtomK) + load_smem_d;  // 0,8
   // Offset by QKV global gmem_offset.
   const int load_gmem_addr = (gmem_offset + load_gmem_BrOrBc * kHeadDim + load_gmem_d);
+  // Seqlen boundary predicate: rows beyond QKV_seqlen must be zero-filled.
+  const bool row_valid = (load_gmem_BrOrBc < seqlen_bound);
 
 // cp async & apply swizzle or padding.
 #pragma unroll
@@ -181,7 +187,7 @@ __device__ __forceinline__ void cp_async_qkv_g2s(
           (kSwizzle ? swizzle::permuted<kMmaAtomK>(load_smem_BrOrBc, load_smem_d + i)
                     : load_smem_d + i)) *
              sizeof(kDataType));
-    cp_async::cp_async<16>(load_smem_ptr, &(gmem_ptr[load_gmem_addr + i]));
+    cp_async::cp_async_zfill<16>(load_smem_ptr, &(gmem_ptr[load_gmem_addr + i]), row_valid);
   }
   // cp_async::commit_group();
 }
@@ -239,6 +245,61 @@ __device__ __forceinline__ void sync_fetch_qkv_frags_s2r(
             (kSwizzle ? swizzle::permuted<kMmaAtomK>(lane_smem_Bc, lane_smem_d) : lane_smem_d)) *
                sizeof(kDataType));
       mma::ldmatrix_m8n8x2(&R[0], &R[1], lane_smem_ptr);
+    }
+  }
+}
+
+// Apply a -inf mask to R_S fragments whose local KV column falls beyond the
+// valid KV length of the current tile. Used on the last KV tile when
+// ``QKV_seqlen % Bc != 0`` so that online safe-softmax treats padding
+// columns as logits of -inf (exp(-inf)=0), making them invisible to both
+// row_max and row_sum without changing the main-path performance.
+//
+// The fragment-to-column mapping follows the ``m16n8k16`` C-layout:
+// for j in [0, kValTileSeqLenK), R_S[j] covers local columns
+// ``j*8 + (lane_id%4)*2 + {0, 1}`` (and two rows offset by 0 / 8).
+// With ``kMmaTileSeqLenK == 1`` the warp_KV base is always 0.
+template <const int kValTileSeqLenK, const int kMmaAccFloat32, typename kDataType = __half>
+__device__ __forceinline__ void sync_apply_kv_mask(
+    uint32_t* R_S,             // &R_S[0][0][0]
+    const int kv_valid_local)  // valid KV columns inside this Bc-tile, in (0, Bc]
+{
+  using Traits = DtypeTraits<kDataType>;
+  const int lane_id = threadIdx.x % WARP_SIZE;
+  const int col_base = (lane_id % 4) * 2;  // local col within 8-col fragment
+  if constexpr (kMmaAccFloat32) {
+#pragma unroll
+    for (int j = 0; j < kValTileSeqLenK; ++j) {
+      float* t_fptr = reinterpret_cast<float*>(R_S + j * 4);
+      const int c0 = j * 8 + col_base;
+      const int c1 = c0 + 1;
+      if (c0 >= kv_valid_local) {
+        t_fptr[0] = -INFINITY;
+        t_fptr[2] = -INFINITY;
+      }
+      if (c1 >= kv_valid_local) {
+        t_fptr[1] = -INFINITY;
+        t_fptr[3] = -INFINITY;
+      }
+    }
+  } else {
+    static_assert(std::is_same_v<kDataType, __half>,
+                  "MMA Acc F16 mask path is only valid for __half activation dtype.");
+    // fp16 acc: 4 half values packed into 2 uint32; -inf in fp16 = 0xFC00.
+    const kDataType neg_inf = Traits::from_float(-INFINITY);
+#pragma unroll
+    for (int j = 0; j < kValTileSeqLenK; ++j) {
+      kDataType* t_hptr = reinterpret_cast<kDataType*>(R_S + j * 2);
+      const int c0 = j * 8 + col_base;
+      const int c1 = c0 + 1;
+      if (c0 >= kv_valid_local) {
+        t_hptr[0] = neg_inf;
+        t_hptr[2] = neg_inf;
+      }
+      if (c1 >= kv_valid_local) {
+        t_hptr[1] = neg_inf;
+        t_hptr[3] = neg_inf;
+      }
     }
   }
 }
@@ -517,13 +578,15 @@ __device__ __forceinline__ void sync_rescaling_final_o(
 template <const int Br, const int kHeadDim, const int kMmaAtomM, const int kMmaAtomN,
           const int kValTileHeadDimV, const int kOStorageAccFloat32, typename kDataType = __half>
 __device__ __forceinline__ void sync_store_o_r2g(
-    kDataType* gmem_ptr,    // O gmem ptr
-    const int gmem_offset,  // O gmem global offset
-    const int n_tile_id,    // curr tile id (seqlen) O_tile_id
-    const int mma_tile_id,  // Q warp_QP 0~num MMAs, KV warp_KV 0
-    uint32_t* R_D,          // Final scaled O
-    uint32_t* R_Q,          // R_Q[1][4] for registers reuse
-    uint32_t* R_K           // R_K[8][2] for registers reuse
+    kDataType* gmem_ptr,              // O gmem ptr
+    const int gmem_offset,            // O gmem global offset
+    const int n_tile_id,              // curr tile id (seqlen) O_tile_id
+    const int mma_tile_id,            // Q warp_QP 0~num MMAs, KV warp_KV 0
+    uint32_t* R_D,                    // Final scaled O
+    uint32_t* R_Q,                    // R_Q[1][4] for registers reuse
+    uint32_t* R_K,                    // R_K[8][2] for registers reuse
+    const int seqlen_bound = INT_MAX  // per-row bound: rows with global idx >=
+                                      // seqlen_bound are not written to gmem
 ) {
   // Store O(D): Write O[Br,d] from regs -> gmem, collective store
   // with reg reuse & warp shuffle.
@@ -560,8 +623,14 @@ __device__ __forceinline__ void sync_store_o_r2g(
             (gmem_offset + (store_lane_gmem_O_Br + 0) * kHeadDim + store_lane_gmem_O_d);
         const int store_gmem_O_addr_1 =
             (gmem_offset + (store_lane_gmem_O_Br + 8) * kHeadDim + store_lane_gmem_O_d);
-        cp_async::stg_sync_128b(&gmem_ptr[store_gmem_O_addr_0], t_uptr_Z_0);
-        cp_async::stg_sync_128b(&gmem_ptr[store_gmem_O_addr_1], t_uptr_Z_1);
+        // Row predicate: skip writes past QKV_seqlen to keep output rows
+        // beyond the valid length untouched when N % Br != 0.
+        if ((store_lane_gmem_O_Br + 0) < seqlen_bound) {
+          cp_async::stg_sync_128b(&gmem_ptr[store_gmem_O_addr_0], t_uptr_Z_0);
+        }
+        if ((store_lane_gmem_O_Br + 8) < seqlen_bound) {
+          cp_async::stg_sync_128b(&gmem_ptr[store_gmem_O_addr_1], t_uptr_Z_1);
+        }
       }
     }  // end for kValTileHeadDimV
   }  // kValTileSeqLenP = 1
