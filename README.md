@@ -7,10 +7,6 @@
   <img src='https://github.com/user-attachments/assets/65a8d564-8fa7-4d66-86b9-e238feb86143' width="411px">
 </div>
 
-<div align="center">
-  <p align="center"> <h2> 🤖FFPA: 1.8x~3x🎉faster vs SDPA EA with or without MMA Acc F32</h2></p>
-</div>
-
 🤖**FFPA(Split-D)**: Yet another **Faster Flash Prefill Attention** with **Split-D** strategy, achieve **O(1) SRAM complexity** and **O(d/4) register complexity** for large headdim (**D > 256**), almost **1.8x~3x** 🎉 faster than SDPA EA with or without MMA Acc F32 on many devices: [📈L20 ~1.9x↑🎉](#bench-l20), [📈A30 ~1.8x↑🎉](#bench-a30), [📈3080 ~2.9x↑🎉](#bench-3080), [📈4090 ~2.1x↑🎉](#bench-4090). **FFPA Algo: Fine-grained tiling** for large headim, **FA-2 Algo: Coarse-grained tiling** for small headidm.
 
 ## ©️Citations🎉🎉
