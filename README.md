@@ -138,7 +138,7 @@ out = ffpa_attn_func(q, k, v, causal=True)
 print(out.shape, out.dtype)  # (1, 8, 128, 512)
 ```
 
-A runnable end-to-end example with SDPA accuracy/perf comparison (include self-attn, cross-attn, GQA, causal-attn) is provided under [`examples/run_ffpa_attn.py`](./examples/run_ffpa_attn.py):
+A runnable end-to-end example (witt self-attn, cross-attn, GQA and causal-attn) is provided under [`examples/run_ffpa_attn.py`](./examples/run_ffpa_attn.py):
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python3 examples/run_ffpa_attn.py
