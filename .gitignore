@@ -26,3 +26,5 @@ bin
 *.log
 ffpa_attn/_version.py
 build*
+*.txt
+
