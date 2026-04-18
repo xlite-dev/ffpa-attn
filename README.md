@@ -13,7 +13,7 @@
 
 |[Self Attention](#example-self)| [Cross/Decode Attention](#example-cross)|[GQA/MQA Attention](#example-gqa)|[Causal Attention](#example-causal)|[Headdim](#ffpa-design)|
 |:---:|:---:|:---:|:---:|:---:|
-|✔️(`Nq = Nkv`)|✔️(`Nq != Nkv`)|✔️(`Nh_q % Nh_kv == 0`)|✔️(`causal mask`)|**320~1024** |
+|✔️(`Nq = Nkv`)|✔️(`Nq != Nkv`)|✔️(`Nh_q % Nh_kv == 0`)|✔️(`causal mask`)|**32~1024** |
 
 </div>
 
@@ -138,7 +138,7 @@ out = ffpa_attn_func(q, k, v, causal=True)
 print(out.shape, out.dtype)  # (1, 8, 128, 512)
 ```
 
-A runnable end-to-end example (with SDPA accuracy/perf comparison, both aligned N=8192 and non-aligned N=8191 cases) is provided under [`examples/run_ffpa_attn.py`](./examples/run_ffpa_attn.py):
+A runnable end-to-end example (witt self-attn, cross-attn, GQA and causal-attn) is provided under [`examples`](./examples/run_ffpa_attn.py):
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python3 examples/run_ffpa_attn.py
