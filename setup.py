@@ -1,119 +1,76 @@
-import importlib.util
+"""ffpa-attn build script.
 
-if importlib.util.find_spec("setuptools_scm") is None:
-  raise ImportError("setuptools-scm is not installed. Install it by `pip3 install setuptools-scm`")
+Most package metadata (name, version, dependencies, extras, URLs, etc.) lives
+in ``pyproject.toml``. This ``setup.py`` exists only to drive the optional
+``CUDAExtension`` build for the ``ffpa_attn._C`` C++/CUDA module via the
+PyTorch build helpers.
+
+Behavior:
+- Default: build the CUDA extension via ``torch.utils.cpp_extension``.
+- ``FFPA_SKIP_CUDA_EXT=1``: skip CUDA extension entirely (used by the
+  ReadTheDocs build and by the docs CI runner, which have no CUDA toolchain
+  but still need to import ``ffpa_attn`` so ``mkdocstrings`` can render API
+  documentation from docstrings).
+"""
 
 import os
+import sys
 import warnings
 from pathlib import Path
 
-from env import ENV
-from setuptools import find_packages, setup
-from setuptools_scm.version import get_local_dirty_tag
-from torch.utils.cpp_extension import BuildExtension, CUDAExtension
+from setuptools import setup
 
 warnings.filterwarnings("ignore")
 
-
-def my_local_scheme(version):
-  # Used to build release packages; users should not set this manually.
-  local_version = os.getenv("FFPA_BUILD_LOCAL_VERSION")
-  if local_version is None:
-    return get_local_dirty_tag(version)
-  return f"+{local_version}"
-
-
-def get_long_description():
-  description = (Path(ENV.project_dir()) / "README.md").read_text(encoding="utf-8")
-  return description
+# Ensure the project root (containing ``env.py``) is on ``sys.path`` so that
+# the build backend (``setuptools.build_meta``) can import ``env`` even when
+# pip invokes setup.py from a different working directory.
+_ROOT = Path(__file__).resolve().parent
+if str(_ROOT) not in sys.path:
+  sys.path.insert(0, str(_ROOT))
 
 
-# package name managed by pip, which can be remove by `pip uninstall ffpa-attn -y`
-PACKAGE_NAME = "ffpa-attn"
+def _env_flag(name: str) -> bool:
+  return os.getenv(name, "0").strip().lower() in {"1", "true", "yes", "on"}
+
+
+SKIP_CUDA_EXT = _env_flag("FFPA_SKIP_CUDA_EXT")
 
 ext_modules = []
-generator_flag = []
-cc_flag = []
+cmdclass = {}
 
-ENV.list_ffpa_env()
+if not SKIP_CUDA_EXT:
+  from env import ENV
+  from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
-# Expand the FFPA_BUILD_ARCH list (or the current device's SM if unset) into
-# nvcc -gencode flags. Replaces the old ENABLE_FFPA_{ADA,AMPERE,HOPPER}
-# switches with a cache-dit-style arch list (see cache-dit/setup.py).
-for _sm in ENV.get_build_arch_list():
-  cc_flag.append("-gencode")
-  cc_flag.append(f"arch=compute_{_sm},code=sm_{_sm}")
+  ENV.list_ffpa_env()
 
-assert cc_flag is not None, "cc_flag can not be NoneType."
+  cc_flag = []
+  for _sm in ENV.get_build_arch_list():
+    cc_flag.append("-gencode")
+    cc_flag.append(f"arch=compute_{_sm},code=sm_{_sm}")
 
-# cuda module
-# may need export LD_LIBRARY_PATH=PATH-TO/torch/lib:$LD_LIBRARY_PATH
-ext_modules.append(
-  CUDAExtension(
-    # package-internal C extension module; imported as ``ffpa_attn._C``.
-    name="ffpa_attn._C",
-    sources=ENV.get_build_sources(build_pkg=True),
-    extra_compile_args={
-      # add c compile flags
-      "cxx": ["-O3", "-std=c++17"] + generator_flag,
-      # add nvcc compile flags
-      "nvcc": [
-        flag for flag in (ENV.get_build_cuda_cflags(build_pkg=True) + generator_flag + cc_flag)
-        if flag.strip()  # <--- Filter out empty strings
+  ext_modules.append(
+    CUDAExtension(
+      # Package-internal C extension module; imported as ``ffpa_attn._C``.
+      name="ffpa_attn._C",
+      sources=[
+        # Convert to repo-relative paths; setuptools rejects absolute paths
+        # in ``sources`` for editable installs (``pip install -e .``).
+        os.path.relpath(s, _ROOT) for s in ENV.get_build_sources(build_pkg=True)
       ],
-    },
-    include_dirs=[
-      Path(ENV.project_dir()) / "include",
-    ],
+      extra_compile_args={
+        "cxx": ["-O3", "-std=c++17"],
+        "nvcc": [flag for flag in (ENV.get_build_cuda_cflags(build_pkg=True) + cc_flag) if flag.strip()],
+      },
+      include_dirs=[
+        Path(ENV.project_dir()) / "include",
+      ],
+    )
   )
-)
-
-
-def fetch_requirements():
-  with open("requirements.txt") as f:
-    reqs = f.read().strip().split("\n")
-  return reqs
-
+  cmdclass["build_ext"] = BuildExtension
 
 setup(
-  name=PACKAGE_NAME,
-  use_scm_version={
-    "write_to": str(Path("ffpa_attn") / "_version.py"),
-    "local_scheme": my_local_scheme,
-  },
-  author="DefTruth",
-  author_email="qyjdef@163.com",
-  license="GNU General Public License v3.0",
-  packages=find_packages(
-    exclude=(
-      "build",
-      "dist",
-      "include",
-      "csrc",
-      "tests",
-      "bench",
-      "tmp",
-      "cuffpa_py.egg-info",
-      "ffpa_attn.egg-info",
-      "__pycache__",
-      "third_party",
-    )
-  ),
-  description="FFPA: Yet another Faster Flash Prefill Attention for large headdim, 1.8x~3x faster than SDPA EA.",
-  long_description=get_long_description(),
-  long_description_content_type="text/markdown",
-  url="https://github.com/xlite/ffpa-attn.git",
   ext_modules=ext_modules,
-  cmdclass={"build_ext": BuildExtension},
-  python_requires=">=3.10",
-  install_requires=fetch_requirements(),
-  extras_require={
-    "all": [],
-    "dev": [
-      "pre-commit",
-      "packaging",
-      "ninja",
-      "setuptools-scm",
-    ],
-  },
+  cmdclass=cmdclass,
 )

@@ -1,0 +1,97 @@
+[project]
+
+name = "ffpa-attn"
+dynamic = ["version"]
+requires-python = ">=3.10"
+authors = [{name = "DefTruth"}]
+maintainers = [{name = "DefTruth"}]
+description = "FFPA: Yet another Faster Flash Prefill Attention for large headdim, 1.8x~3x faster than SDPA EA."
+readme = "README.md"
+license = {text = "GPL-3.0-only"}
+
+dependencies = [
+    "packaging",
+    "ninja",
+    "torch>=2.7.0",
+    "numpy",
+]
+
+[project.optional-dependencies]
+
+dev = [
+    "pre-commit",
+    "packaging",
+    "ninja",
+    "setuptools-scm",
+    "pytest",
+    "yapf==0.40.2",
+    "flake8",
+]
+
+tests = [
+    "pytest",
+    "matplotlib",
+]
+
+bench = [
+    "matplotlib",
+]
+
+docs = [
+    # Pinning mkdocs to 1.6.1 and mkdocs-material to 9.7.1 to avoid
+    # the breaking changes in mkdocs 2.0.0, which causes the CI failure
+    # in the check-mkdocs workflow.
+    # https://squidfunk.github.io/mkdocs-material/blog/2026/02/18/mkdocs-2.0/
+    "mkdocs==1.6.1",
+    "mkdocs-material==9.7.1",
+    "mkdocs-api-autonav",
+    "mkdocstrings-python",
+    "mkdocs-gen-files",
+    "mkdocs-awesome-nav",
+    "mkdocs-glightbox",
+    "mkdocs-git-revision-date-localized-plugin",
+    "mkdocs-minify-plugin",
+    "regex",
+]
+
+all = [
+    "ffpa-attn[dev]",
+    "ffpa-attn[tests]",
+    "ffpa-attn[bench]",
+]
+
+[project.urls]
+
+Repository = "https://github.com/xlite-dev/ffpa-attn"
+Homepage = "https://github.com/xlite-dev/ffpa-attn"
+GitHub = "https://github.com/xlite-dev/ffpa-attn"
+Documentation = "https://ffpa-attn.readthedocs.io"
+
+[build-system]
+
+requires = ["setuptools>=64", "setuptools_scm>=8", "torch>=2.7.0", "packaging", "ninja", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools_scm]
+version_scheme = "python-simplified-semver"
+local_scheme = "no-local-version"
+write_to = "ffpa_attn/_version.py"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+exclude = [
+    "build*",
+    "dist*",
+    "include*",
+    "csrc*",
+    "tests*",
+    "bench*",
+    "tmp*",
+    "docs*",
+    "tools*",
+    "examples*",
+    "third_party*",
+    "*.egg-info",
+]
