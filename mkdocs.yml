@@ -1,4 +1,4 @@
-site_name: FFPA-Attn
+site_name: FFPA - Faster Flash Prefill Attention for Large Headdim
 site_description: FFPA — Yet another Faster Flash Prefill Attention for large headdim with O(1) GPU SRAM complexity.
 site_url: https://ffpa-attn.readthedocs.io
 site_author: FFPA-Attn Team
