@@ -27,10 +27,10 @@
 
 <a id="install"></a>
 
-First, install the package from PyPI:
+First, install the package from PyPI: (required: PyTorch>=2.11.0, CUDA>=13.0)
 
 ```bash
-pip3 install -U ffpa-attn # (required: PyTorch>=2.11.0, CUDA>=13.0)
+pip3 install -U ffpa-attn # (Prebuilt: sm_80, sm_89, sm_90, sm_100, sm_120.)
 ```
 
 Or, you can clone the repo and build the package from source: (Note: `pip uninstall ffpa-attn -y` if you want to reinstall after code changes; recommended: PyTorch>=2.11.0, CUDA>=13.0).
