@@ -51,6 +51,7 @@ nav:
   - Home: index.md
   - Benchmark: benchmark/README.md
   - Examples: examples/README.md
+  - Environment Variables: env.md
   - API Reference: api/ffpa_attn.md
 
 plugins:
