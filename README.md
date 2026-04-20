@@ -18,7 +18,7 @@
 </div>
 
 > [!NOTE]
-> FFPA has been tested on Ampere, Ada, Hopper, Blackwell architectures (e.g. A30, RTX 3080, L20, RTX 4090, H200, RTX 5090), the performance may not be optimal (but still get 1.5x~2.3x speedup compared to SDPA for headdim >= 256) for Hopper and Blackwell architectures since FFPA does not yet leverage TMA and other architecture-specific optimizations for further optimization.
+> FFPA has been tested on `Ampere, Ada, Hopper, Blackwell` architectures (e.g. `A30, RTX 3080, L20, RTX 4090, H200, RTX 5090`), the performance may not be optimal (but still get `1.5x~2.3x↑🎉` speedup compared to SDPA for headdim `>= 256`) for Hopper and Blackwell architectures since it does not yet leverage TMA and other architecture-specific optimizations for further optimization.
 
 ## 📖 Quick Start
 
