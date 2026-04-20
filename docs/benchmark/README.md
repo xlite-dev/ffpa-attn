@@ -12,7 +12,7 @@ python3 bench/bench_ffpa_attn.py --B 1 --H 48 --N 8192 --show-all --D 320
 
 O(2xBrx16)≈O(1) SRAM complexity, O(d/4) register complexity, the same GPU HBM memory complexity as FlashAttention. B=1, H=48, N=8192, **D=320-1024(FA2 not supported 👀)**. (Notes, *=MMA Acc F32, ^=MMA Acc F16, Softmax Acc dtype is always be F32, T=TFLOPS, 👇Benchmark)
 
-<p>📚 NVIDIA L20 (*=MMA Acc F32, ^=MMA Acc F16, T=TFLOPS, <b>~1.8x↑🎉</b>)</p>
+<p align="center">📚 NVIDIA L20 (*=MMA Acc F32, ^=MMA Acc F16, T=TFLOPS, <b>~1.8x↑🎉</b>)</p>
 
 <div align="center" markdown="1">
 
@@ -26,7 +26,7 @@ O(2xBrx16)≈O(1) SRAM complexity, O(d/4) register complexity, the same GPU HBM 
 
 </div>
 
-<p>📚 NVIDIA L20 (*=MMA Acc: QK F32 + PV F16, ^=MMA Acc F16, T=TFLOPS, <b>~1.9x↑🎉</b>)</p>
+<p align="center">📚 NVIDIA L20 (*=MMA Acc: QK F32 + PV F16, ^=MMA Acc F16, T=TFLOPS, <b>~1.9x↑🎉</b>)</p>
 
 <div align="center" markdown="1">
 
@@ -40,11 +40,16 @@ O(2xBrx16)≈O(1) SRAM complexity, O(d/4) register complexity, the same GPU HBM 
 
 </div>
 
-<img src='../assets/a4927108-3f97-4209-9b80-bb31ad271e04.png' width="411px">
-  <img src='../assets/eeb9943f-919d-45d8-a8a6-e0f8874f4bcd.png' width="411px">
+<div align="center">
+
+<img src='../assets/a4927108-3f97-4209-9b80-bb31ad271e04.png' width="350px">
+<img src='../assets/eeb9943f-919d-45d8-a8a6-e0f8874f4bcd.png' width="350px">
+
+</div>
+
 <a id="bench-a30"></a>
 
-<p>📚 NVIDIA A30 (*=MMA Acc F32, ^=MMA Acc F16, T=TFLOPS, <b>~1.8x↑🎉</b>)</p>
+<p align="center">📚 NVIDIA A30 (*=MMA Acc F32, ^=MMA Acc F16, T=TFLOPS, <b>~1.8x↑🎉</b>)</p>
 
 <div align="center" markdown="1">
 
@@ -58,7 +63,7 @@ O(2xBrx16)≈O(1) SRAM complexity, O(d/4) register complexity, the same GPU HBM 
 
 </div>
 
-<p>📚 NVIDIA A30 (*=MMA Acc: QK F32 + PV F16, ^=MMA Acc F16, T=TFLOPS, <b>~1.9x↑🎉</b>)</p>
+<p align="center">📚 NVIDIA A30 (*=MMA Acc: QK F32 + PV F16, ^=MMA Acc F16, T=TFLOPS, <b>~1.9x↑🎉</b>)</p>
 
 <div align="center" markdown="1">
 
@@ -72,11 +77,16 @@ O(2xBrx16)≈O(1) SRAM complexity, O(d/4) register complexity, the same GPU HBM 
 
 </div>
 
-<img src='../assets/7e323005-4445-41af-8e94-6efb62ed2b77.png' width="411px">
-  <img src='../assets/e314649e-82b5-414d-85c9-8b6fbf260138.png' width="411px">
+<div align="center">
+
+<img src='../assets/7e323005-4445-41af-8e94-6efb62ed2b77.png' width="350px">
+<img src='../assets/e314649e-82b5-414d-85c9-8b6fbf260138.png' width="350px">
+
+</div>
+
 <a id="bench-3080"></a>
 
-<p>📚 NVIDIA RTX 3080 Laptop (*=MMA Acc F32, ^=MMA Acc F16, T=TFLOPS, <b>~2.5x↑🎉</b>)</p>
+<p align="center">📚 NVIDIA RTX 3080 Laptop (*=MMA Acc F32, ^=MMA Acc F16, T=TFLOPS, <b>~2.5x↑🎉</b>)</p>
 
 <div align="center" markdown="1">
 
@@ -90,7 +100,7 @@ O(2xBrx16)≈O(1) SRAM complexity, O(d/4) register complexity, the same GPU HBM 
 
 </div>
 
-<p>📚 NVIDIA RTX 3080 Laptop (*=MMA Acc: QK F32 + PV F16, ^=MMA Acc F16, T=TFLOPS, <b>~2.9x↑🎉</b>)</p>
+<p align="center">📚 NVIDIA RTX 3080 Laptop (*=MMA Acc: QK F32 + PV F16, ^=MMA Acc F16, T=TFLOPS, <b>~2.9x↑🎉</b>)</p>
 
 <div align="center" markdown="1">
 
@@ -104,11 +114,16 @@ O(2xBrx16)≈O(1) SRAM complexity, O(d/4) register complexity, the same GPU HBM 
 
 </div>
 
-<img src='../assets/d157cd69-4444-4735-a691-edaaff408137.png' width="411px">
-  <img src='../assets/3ce47627-e79d-40ee-b753-bdd235603b7d.png' width="411px">
+<div align="center">
+
+<img src='../assets/d157cd69-4444-4735-a691-edaaff408137.png' width="350px">
+<img src='../assets/3ce47627-e79d-40ee-b753-bdd235603b7d.png' width="350px">
+
+</div>
+
 <a id="bench-4090"></a>
 
-<p>📚 NVIDIA RTX 4090 (*=MMA Acc F32, ^=MMA Acc F16, T=TFLOPS, <b>~1.8x↑🎉</b>)</p>
+<p align="center">📚 NVIDIA RTX 4090 (*=MMA Acc F32, ^=MMA Acc F16, T=TFLOPS, <b>~1.8x↑🎉</b>)</p>
 
 <div align="center" markdown="1">
 
@@ -122,7 +137,7 @@ O(2xBrx16)≈O(1) SRAM complexity, O(d/4) register complexity, the same GPU HBM 
 
 </div>
 
-<p>📚 NVIDIA RTX 4090 (*=MMA Acc: QK F32 + PV F16, ^=MMA Acc F16, T=TFLOPS, <b>~2.1x↑🎉</b>)</p>
+<p align="center">📚 NVIDIA RTX 4090 (*=MMA Acc: QK F32 + PV F16, ^=MMA Acc F16, T=TFLOPS, <b>~2.1x↑🎉</b>)</p>
 
 <div align="center" markdown="1">
 
@@ -136,5 +151,9 @@ O(2xBrx16)≈O(1) SRAM complexity, O(d/4) register complexity, the same GPU HBM 
 
 </div>
 
-<img src='../assets/447e2937-f7c8-47c8-8550-8c0c71b910e6.png' width="411px">
-<img src='../assets/65a8d564-8fa7-4d66-86b9-e238feb86143.png' width="411px">
+<div align="center">
+
+<img src='../assets/447e2937-f7c8-47c8-8550-8c0c71b910e6.png' width="350px">
+<img src='../assets/65a8d564-8fa7-4d66-86b9-e238feb86143.png' width="350px">
+
+</div>
