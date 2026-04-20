@@ -29,7 +29,8 @@ First, clone the repo and build the package from source: (Note: `pip uninstall f
 git clone https://github.com/xlite-dev/ffpa-attn.git
 export MAX_JOBS=32 && python3 setup.py bdist_wheel
 # Optional: build with ccache for faster rebuilds
-apt install ccache && bash tools/build_fast.sh bdist_wheel
+sudo apt install ccache && bash tools/build_fast.sh bdist_wheel
+# Optional: for editable install, use `pip install -e .` instead.
 pip3 install dist/ffpa_attn-*.whl # pip uninstall ffpa-attn -y
 ```
 
