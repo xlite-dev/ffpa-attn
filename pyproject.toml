@@ -7,7 +7,7 @@ authors = [{name = "DefTruth"}]
 maintainers = [{name = "DefTruth"}]
 description = "FFPA: Yet another Faster Flash Prefill Attention for large headdim, 1.8x~3x faster than SDPA EA."
 readme = "README.md"
-license = {text = "GPL-3.0-only"}
+license = {text = "Apache-2.0"}
 
 dependencies = [
     "packaging",
@@ -51,6 +51,7 @@ docs = [
     "mkdocs-glightbox",
     "mkdocs-git-revision-date-localized-plugin",
     "mkdocs-minify-plugin",
+    "mkdocs-callouts",
     "regex",
 ]
 

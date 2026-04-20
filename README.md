@@ -209,7 +209,7 @@ By leveraging this approach, we can achieve better performance than SDPA EA for 
 
 <div id="License"></div>
 
-GNU General Public License v3.0
+Apache License 2.0
 
 ## 🎉Contribute
 
