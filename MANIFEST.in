@@ -1,5 +1,13 @@
 include MANIFEST.in
 include LICENSE
-include requirements.txt
-recursive-include tests *
+include pyproject.toml
+include README.md
+recursive-include ffpa_attn *.py
+recursive-include csrc *.cu *.cuh *.h *.hpp *.cpp
+recursive-include include *.h *.hpp *.cuh
+recursive-include tests *.py
+prune build
+prune dist
+prune docs/site
+prune third_party
 global-exclude *.o *.so *.dylib *.a .git *.pyc *.swp .gitignore *__pycache__

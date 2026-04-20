@@ -1,0 +1,92 @@
+site_name: FFPA-Attn
+site_description: FFPA — Yet another Faster Flash Prefill Attention for large headdim with O(1) GPU SRAM complexity.
+site_url: https://ffpa-attn.readthedocs.io
+site_author: FFPA-Attn Team
+
+repo_url: https://github.com/xlite-dev/ffpa-attn
+repo_name: xlite-dev/ffpa-attn
+edit_uri: edit/main/docs/
+
+theme:
+  name: material
+  language: en
+  palette:
+    - media: "(prefers-color-scheme)"
+      toggle:
+        icon: material/brightness-auto
+        name: Switch to light mode
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: white
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: black
+      toggle:
+        icon: material/brightness-2
+        name: Switch to system preference
+  features:
+    - content.action.edit
+    - content.code.copy
+    - navigation.instant
+    - navigation.instant.progress
+    - navigation.tracking
+    - navigation.tabs
+    - navigation.tabs.sticky
+    - navigation.sections
+    - navigation.indexes
+    - navigation.top
+    - navigation.footer
+    - search.suggest
+    - search.highlight
+    - search.share
+    - content.code.annotate
+    - content.tabs
+    - content.tooltips
+    - toc.follow
+
+nav:
+  - Home: index.md
+  - Benchmark: benchmark/README.md
+  - Examples: examples/README.md
+  - API Reference: api/ffpa_attn.md
+
+plugins:
+  - search
+  - mkdocstrings:
+      handlers:
+        python:
+          options:
+            docstring_style: sphinx
+            show_source: false
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - md_in_html
+  - tables
+  - fenced_code
+  - codehilite:
+      guess_lang: false
+  - toc:
+      permalink: true
+      toc_depth: 3
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span
+      pygments_lang_class: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.emoji
+  - pymdownx.tilde
+  - pymdownx.details
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/xlite-dev/ffpa-attn

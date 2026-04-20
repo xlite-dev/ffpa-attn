@@ -8,10 +8,16 @@
 #   5. Optional tmpfs build dir when FFPA_BUILD_IN_SHM=1.
 #   6. Pre-set FFPA_BUILD_ARCH to the current device SM when unset.
 #
+# Compatible with the PEP 621 pyproject.toml packaging: the script bypasses
+# pip's build isolation and invokes setup.py directly for the in-place CUDA
+# extension build. Pass-through args still work for ``bdist_wheel``; for an
+# isolated PEP 517 wheel use ``pip wheel . --no-build-isolation`` instead.
+#
 # Usage:
-#   bash tools/build_fast.sh                   # incremental
+#   bash tools/build_fast.sh                   # incremental in-place build
 #   FFPA_CLEAN=1 bash tools/build_fast.sh      # rm -rf build/ + rebuild
 #   FFPA_BUILD_IN_SHM=1 bash tools/build_fast.sh
+#   bash tools/build_fast.sh bdist_wheel       # PEP 517-compatible wheel
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
@@ -21,7 +27,7 @@ cd "$REPO_DIR"
 # build/, otherwise the shim directory is wiped).
 if [[ "${FFPA_CLEAN:-0}" == "1" ]]; then
   echo "[build_fast] FFPA_CLEAN=1 -> removing build/ and *.so"
-  rm -rf build/ dist/ *.egg-info/
+  rm -rf build/ dist/ ffpa_attn.egg-info/
   rm -f pyffpa_cuda*.so ffpa_attn/_C*.so
   find csrc/cuffpa/generated -maxdepth 1 -type f \( -name '*.cu' -o -name '*.h' \) -delete 2>/dev/null || true
 fi
