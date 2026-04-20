@@ -172,7 +172,7 @@ We have named this new attention tiling technique **FFPA: Faster Flash Prefill A
 
 By leveraging this approach, we can achieve better performance than SDPA EA for very large headdim (D > 256, `FA-2 not supported`). Approximate SRAM and register complexity analysis for FFPA is as follows: (`d`=headdim, `C,Br,Bc`=Constant, `Br=Bc`, let O(C)≈O(1)) 👇
 
-<div align="center">
+<div align="center" markdown="1">
 
 |📚Complexity Analysis| 📚FFPA Attention (Split-D)| 📚FlashAttention-2 |
 |:---:|:---:|:---:|
