@@ -27,7 +27,13 @@
 
 <a id="install"></a>
 
-First, clone the repo and build the package from source: (Note: `pip uninstall ffpa-attn -y` if you want to reinstall after code changes; recommended: PyTorch>=2.11.0, CUDA>=13.0).
+First, install the package from PyPI:
+
+```bash
+pip3 install -U ffpa-attn # (required: PyTorch>=2.11.0, CUDA>=13.0)
+```
+
+Or, you can clone the repo and build the package from source: (Note: `pip uninstall ffpa-attn -y` if you want to reinstall after code changes; recommended: PyTorch>=2.11.0, CUDA>=13.0).
 ```bash
 git clone https://github.com/xlite-dev/ffpa-attn.git
 export MAX_JOBS=32 && python3 setup.py bdist_wheel
