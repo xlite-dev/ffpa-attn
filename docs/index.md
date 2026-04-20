@@ -2,10 +2,6 @@
   <p align="center">
     <h2>🤖FFPA: Yet another Faster Flash Prefill Attention <br>with O(1)⚡️GPU SRAM complexity for large headdim🐑</h2>
     <a href="./benchmark/README.md"> 📈L20 ~1.9x↑🎉 </a> | <a href="./benchmark/README.md"> 📈A30 ~1.8x↑🎉 </a> | <a href="./benchmark/README.md"> 📈3080 ~2.9x↑🎉 </a> | <a href="./benchmark/README.md"> 📈4090 ~2.1x↑🎉 </a><br>
-    <script async defer src="https://buttons.github.io/buttons.js"></script>
-    <a class="github-button" href="https://github.com/xlite-dev/ffpa-attn" data-show-count="true" data-size="large" aria-label="Star">Star</a>
-    <a class="github-button" href="https://github.com/xlite-dev/ffpa-attn/subscription" data-show-count="true" data-icon="octicon-eye" data-size="large" aria-label="Watch">Watch</a>
-    <a class="github-button" href="https://github.com/xlite-dev/ffpa-attn/fork" data-show-count="true" data-icon="octicon-repo-forked" data-size="large" aria-label="Fork">Fork</a>
   </p>
   <img src='assets/65a8d564-8fa7-4d66-86b9-e238feb86143.png' width="500px">
 </div>
