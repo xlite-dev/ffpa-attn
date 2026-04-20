@@ -7,6 +7,8 @@ python3 examples/run_ffpa_attn.py
 
 Env: NVIDIA L20 (Ada), PyTorch 2.11, CUDA 13.0, Headdim=512 (FA-2 not supported).
 
+<div align="center" markdown="1">
+
 | Case | dtype | Nq/Nkv | allclose | FFPA / SDPA | speedup |
 |:---:|:---:|:---:|:---:|:---:|:---:|
 | self-attn | fp16 | 8192/8192 | ✅ | 46.7 / 74.7 ms | 1.60x |
@@ -19,3 +21,5 @@ Env: NVIDIA L20 (Ada), PyTorch 2.11, CUDA 13.0, Headdim=512 (FA-2 not supported)
 | gqa | bf16 | 8192/8192 | ✅ | 46.2 / 74.7 ms | 1.62x |
 | causal | bf16 | 8192/8192 | ✅ | 24.2 / 37.5 ms | 1.55x |
 | non-aligned | bf16 | 8191/8191 | ✅ | 12.3 / 19.0 ms | 1.55x |
+
+</div>
