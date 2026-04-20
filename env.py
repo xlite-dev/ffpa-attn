@@ -118,9 +118,14 @@ class ENV(object):
   def get_build_arch_list(cls):
     """Resolve the SM targets for the current build.
 
-        Priority: explicit ``FFPA_BUILD_ARCH`` env -> current device capability.
-        Returns a de-duplicated list of numeric SM strings (e.g. ``['89']``).
-        """
+    Priority order: explicit ``FFPA_BUILD_ARCH`` env var first, then fall
+    back to the current visible CUDA device's compute capability.
+
+    :returns: De-duplicated list of numeric SM strings (e.g. ``['89']``).
+    :raises RuntimeError: if ``FFPA_BUILD_ARCH`` parses to an empty list,
+        or if it is unset and no visible CUDA device is available to
+        infer the target arch.
+    """
     raw = cls.FFPA_BUILD_ARCH
     if raw.strip():
       archs = []
@@ -305,10 +310,13 @@ class ENV(object):
   def get_enabled_headdims(cls):
     """Return the list of headdims enabled for the current build configuration.
 
-        * ``FFPA_DEV_HEADDIMS``         -> explicit subset for fast iteration.
-        * ``ENABLE_FFPA_ALL_HEADDIM``   -> multiples of 32 in [32, 1024].
-        * default                       -> multiples of 64 in [256, 1024].
-        """
+    Priority order: ``FFPA_DEV_HEADDIMS`` (explicit subset for fast
+    iteration) -> ``ENABLE_FFPA_ALL_HEADDIM`` (multiples of 32 in
+    ``[32, 1024]``) -> default (multiples of 64 in ``[256, 1024]``).
+
+    :returns: Sorted list of ``int`` headdim values.
+    :raises RuntimeError: if ``FFPA_DEV_HEADDIMS`` parses to an empty list.
+    """
     raw = cls.FFPA_DEV_HEADDIMS.strip()
     if raw:
       subset = []
@@ -333,9 +341,13 @@ class ENV(object):
   def _write_if_changed(path: str, content: str):
     """Write ``content`` to ``path`` only if it differs from the current file.
 
-        Avoids touching mtime when unchanged so ``setuptools`` / ``ninja`` can skip
-        recompilation of TUs whose generated sources have not actually changed.
-        """
+    Avoids touching mtime when unchanged so ``setuptools`` / ``ninja`` can
+    skip recompilation of TUs whose generated sources have not actually
+    changed.
+
+    :param path: Destination file path.
+    :param content: New file content to write when it differs from disk.
+    """
     if os.path.exists(path):
       with open(path, "r", encoding="utf-8") as f:
         if f.read() == content:
@@ -347,18 +359,20 @@ class ENV(object):
   def generate_split_headdim_sources(cls, build_pkg: bool = False):
     """Generate per-headdim ``.cu`` translation units under ``csrc/cuffpa/generated/``.
 
-        Splitting the big ``DISPATCH_HEADDIM`` switch into one TU per headdim lets
-        ``MAX_JOBS`` invoke nvcc on many files in parallel, dramatically reducing
-        the wall-clock build time of the heavy ``launch_ffpa_mma_template``
-        instantiations.
+    Splitting the big ``DISPATCH_HEADDIM`` switch into one TU per headdim
+    lets ``MAX_JOBS`` invoke nvcc on many files in parallel, dramatically
+    reducing the wall-clock build time of the heavy
+    ``launch_ffpa_mma_template`` instantiations. The generated files are
+    committed to the repository (not ignored); on every build the
+    generator refreshes their contents only when they would actually
+    change, so under steady state this is a no-op and incremental builds
+    stay fast.
 
-        The generated files are committed to the repository (not ignored). On
-        every build the generator refreshes their contents only when they would
-        actually change, so under steady state this is a no-op and incremental
-        builds stay fast.
-
-        Returns the list of generated file paths (headers first, then ``.cu`` sources).
-        """
+    :param build_pkg: When ``True``, emit a per-call summary line via
+        ``pretty_print_line`` (suitable for the ``setup.py`` invocation).
+    :returns: List of generated file paths (declarations header first,
+        then per-headdim ``.cu`` sources, then the dispatch TU).
+    """
     gen_dir = cls.generated_sources_dir()
     os.makedirs(gen_dir, exist_ok=True)
 
@@ -440,10 +454,20 @@ class ENV(object):
   def _render_stage_body(d: int, t_in: str, qk: str, pv: str) -> str:
     """Render the stage-dispatch body at body scope (2-space indent).
 
-        Preprocessor directives intentionally start at column 0 as required by
-        strict compilers, while normal statements use the 2-space indent that
-        matches the surrounding function body.
-        """
+    Preprocessor directives intentionally start at column 0 as required
+    by strict compilers, while normal statements use the 2-space indent
+    that matches the surrounding function body.
+
+    :param d: Headdim value to bake into the kernel template arguments.
+    :param t_in: C++ activation type name (e.g. ``__half`` or
+        ``__nv_bfloat16``).
+    :param qk: Identifier for the ``kMmaAccFloat32QK`` template constant
+        in scope at the call site.
+    :param pv: Identifier for the ``kMmaAccFloat32PV`` template constant
+        in scope at the call site.
+    :returns: Rendered C++ snippet wrapping the per-stage
+        ``launch_ffpa_mma_template`` calls.
+    """
     call = (f"launch_ffpa_mma_template<{t_in}, {d}, {qk}, {pv}, "
             "{S}>(Q, K, V, O, causal, softmax_scale);")
     return (
@@ -468,12 +492,17 @@ class ENV(object):
 
   @classmethod
   def _render_per_headdim_fp16_tu(cls, d: int) -> str:
-    """Render the fp16-only TU for headdim ``d`` with 2 entries:
+    """Render the fp16-only TU for headdim ``d`` with two entry points.
 
-        - ``ffpa_mma_acc_f16_fp16_d{d}``: fp16 activation, MMA acc=f16.
-        - ``ffpa_mma_acc_f32_fp16_d{d}``: fp16 activation, MMA acc=f32
-          (with ``ENABLE_FFPA_FORCE_{QK,PV}_F16`` fall-back hooks for parity).
-        """
+    The two emitted symbols are:
+
+    - ``ffpa_mma_acc_f16_fp16_d{d}``: fp16 activation, MMA acc=f16.
+    - ``ffpa_mma_acc_f32_fp16_d{d}``: fp16 activation, MMA acc=f32
+      (with ``ENABLE_FFPA_FORCE_{QK,PV}_F16`` fall-back hooks for parity).
+
+    :param d: Headdim value to bake into both entry symbols.
+    :returns: Rendered TU source string ready to write to a ``.cu`` file.
+    """
     lines = [
       "// AUTO-GENERATED by env.py. DO NOT EDIT.",
       '#include "launch_templates.cuh"',
@@ -507,9 +536,12 @@ class ENV(object):
   def _render_per_headdim_bf16_tu(cls, d: int) -> str:
     """Render the bf16-only TU for headdim ``d``.
 
-        Only one entry (``ffpa_mma_acc_f32_bf16_d{d}``) because bf16 has
-        no f16-acc mma PTX; acc is forced to f32.
-        """
+    Only one entry (``ffpa_mma_acc_f32_bf16_d{d}``) is emitted because
+    bf16 has no f16-acc mma PTX; acc is forced to f32.
+
+    :param d: Headdim value to bake into the entry symbol.
+    :returns: Rendered TU source string ready to write to a ``.cu`` file.
+    """
     lines = [
       "// AUTO-GENERATED by env.py. DO NOT EDIT.",
       '#include "launch_templates.cuh"',

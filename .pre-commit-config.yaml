@@ -17,6 +17,8 @@ exclude: |
     | build/.*
     | dist/.*
     | ffpa_attn\.egg-info/.*
+    | \.tmp/.*
+    | ffpa_attn/_version\.py
   )$
 
 repos:
