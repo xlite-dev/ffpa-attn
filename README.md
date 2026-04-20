@@ -24,18 +24,18 @@
 
 <div id="install"></div>
 
-First, install the package from PyPI: (required: PyTorch>=2.11.0, CUDA>=13.0)
+First, install the prebuilt package from [PyPI](https://pypi.org/project/ffpa-attn/) (required: PyTorch>=2.11.0, CUDA>=13.0):
 
 ```bash
-pip3 install -U ffpa-attn # (Prebuilt: sm_80, sm_89, sm_90, sm_100, sm_120.)
+pip3 install -U ffpa-attn # (support: sm_80, sm_89, sm_90, sm_100, sm_120)
 ```
 
-Or, you can clone the repo and build the package from source: (Note: `pip uninstall ffpa-attn -y` if you want to reinstall after code changes; recommended: PyTorch>=2.11.0, CUDA>=13.0).
+Or, you can build [ffpa-attn](https://github.com/xlite-dev/ffpa-attn) from source (recommended: PyTorch>=2.11.0, CUDA>=13.0):
 ```bash
 git clone https://github.com/xlite-dev/ffpa-attn.git
-export MAX_JOBS=32 && python3 setup.py bdist_wheel
+cd ffpa-attn && MAX_JOBS=32 && python3 setup.py bdist_wheel
 # Optional: build with ccache for faster rebuilds
-sudo apt install ccache && bash tools/build_fast.sh bdist_wheel
+apt install ccache && bash tools/build_fast.sh bdist_wheel
 # Optional: for editable install, use `pip install -e .` instead.
 pip3 install dist/ffpa_attn-*.whl # pip uninstall ffpa-attn -y
 ```
