@@ -14,6 +14,7 @@ _ARCH_ALIASES = {
   "ada": "89",
   "hopper": "90",
   "blackwell": "100",
+  "blackwell_geforce": "120",
 }
 
 
@@ -68,12 +69,12 @@ class ENV(object):
   ENABLE_FFPA_SMEM_SWIZZLE_V = bool(int(os.environ.get("ENABLE_FFPA_SMEM_SWIZZLE_V", 1)))
 
   # Persist load Q g2s for headdim <= 320, more SRAM, but still keep register usage.
-  ENABLE_FFPA_PERSIST_Q_G2S = bool(int(os.environ.get("ENABLE_FFPA_PERSIST_Q_G2S", 0)))
+  ENABLE_FFPA_PERSIST_Q_G2S = bool(int(os.environ.get("ENABLE_FFPA_PERSIST_Q_G2S", 1)))
 
   # Persist load KV g2s for headdim <= 256, more SRAM. If True, auto use flash-attn
   # algo that tiling at attention level for headdim <= 256 and auto use ffpa-attn
   # fined-grain tiling at MMA level for headdim > 256.
-  ENABLE_FFPA_PERSIST_KV_G2S = bool(int(os.environ.get("ENABLE_FFPA_PERSIST_KV_G2S", 0)))
+  ENABLE_FFPA_PERSIST_KV_G2S = bool(int(os.environ.get("ENABLE_FFPA_PERSIST_KV_G2S", 1)))
 
   # Persist load Q from s2r for headdim < 512 to reduce Q from g2s and s2r IO access,
   # but still keep O(1) SRAM complexity. Default value is False. This option will
@@ -83,7 +84,7 @@ class ENV(object):
   ENABLE_FFPA_PERSIST_Q_S2R = bool(int(os.environ.get("ENABLE_FFPA_PERSIST_Q_S2R", 0)))
 
   # Persist V s2r only for small d kernel, more registers.
-  ENABLE_FFPA_PERSIST_V_S2R = bool(int(os.environ.get("ENABLE_FFPA_PERSIST_V_S2R", ENABLE_FFPA_PERSIST_KV_G2S)))
+  ENABLE_FFPA_PERSIST_V_S2R = bool(int(os.environ.get("ENABLE_FFPA_PERSIST_V_S2R", 1)))
 
   # Registers Ping pong double buffers for ldmatrix & mma computation overlapping.
   ENABLE_FFPA_REGISTERS_PIPE_KV = bool(int(os.environ.get("ENABLE_FFPA_REGISTERS_PIPE_KV", 0)))
