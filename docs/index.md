@@ -1,7 +1,7 @@
 <div align="center">
   <p align="center">
     <h2>🤖FFPA: Yet another Faster Flash Prefill Attention <br>with O(1)⚡️GPU SRAM complexity for large headdim🐑</h2>
-    <a href="https://zhuanlan.zhihu.com/p/13975660308">📚FFPA(Split-D) Blog</a> | <a href="./bench/README.md#bench-l20"> 📈L20 ~1.9x↑🎉 </a> | <a href="./bench/README.md#bench-a30"> 📈A30 ~1.8x↑🎉 </a> | <a href="./bench/README.md#bench-3080"> 📈3080 ~2.9x↑🎉 </a> | <a href="./bench/README.md#bench-4090"> 📈4090 ~2.1x↑🎉 </a><br>
+    <a href="./benchmark/README.md"> 📈L20 ~1.9x↑🎉 </a> | <a href="./benchmark/README.md"> 📈A30 ~1.8x↑🎉 </a> | <a href="./benchmark/README.md"> 📈3080 ~2.9x↑🎉 </a> | <a href="./benchmark/README.md"> 📈4090 ~2.1x↑🎉 </a><br>
     <script async defer src="https://buttons.github.io/buttons.js"></script>
     <a class="github-button" href="https://github.com/xlite-dev/ffpa-attn" data-show-count="true" data-size="large" aria-label="Star">Star</a>
     <a class="github-button" href="https://github.com/xlite-dev/ffpa-attn/subscription" data-show-count="true" data-icon="octicon-eye" data-size="large" aria-label="Watch">Watch</a>
@@ -172,12 +172,16 @@ We have named this new attention tiling technique **FFPA: Faster Flash Prefill A
 
 By leveraging this approach, we can achieve better performance than SDPA EA for very large headdim (D > 256, `FA-2 not supported`). Approximate SRAM and register complexity analysis for FFPA is as follows: (`d`=headdim, `C,Br,Bc`=Constant, `Br=Bc`, let O(C)≈O(1)) 👇
 
+<div align="center">
+
 |📚Complexity Analysis| 📚FFPA Attention (Split-D)| 📚FlashAttention-2 |
 |:---:|:---:|:---:|
 |SRAM | O(2xBrx16)≈O(1) | ≈O(3xBrxd), d↑ |
 |Register | ≈O(d/4), d↑ | ≈O(d/2), d↑ |
 |HBM| ≈FA2≈O(Nd), O | ≈O(Nd), O |
 |Extra HBM| ≈FA2≈O(N), m,l | ≈O(N), m,l |
+
+</div>
 
 **📚Implementation**: FFPA is implemented using pure MMA PTX instructions, which supports many features such as Split-Q, SMEM Swizzle/Padding, QKV Multi-Stages(1~4), Tile MMAs/Warps, Mixed MMA F32/F16 Acc (Q@K^T MMA Acc F32 + P@V MMA Acc F16), Fully Shared QKV SMEM, Prefetch QKV g2s, Persist Q s2r/g2s, **Fully QKV Fine-grained Tiling(GEMM style)**, Collective Store, etc.
 
@@ -199,6 +203,7 @@ GNU General Public License v3.0
 
 How to contribute? Wecome to star⭐️ this repo to support me👆🏻 ~
 
+<div align="center">
 <a href="https://star-history.com/#xlite-dev/ffpa-attn&Date">
  <picture>
    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=xlite-dev/ffpa-attn&type=Date&theme=dark" />
@@ -206,6 +211,8 @@ How to contribute? Wecome to star⭐️ this repo to support me👆🏻 ~
    <img img width=450 height=300 alt="Star History Chart" src="https://api.star-history.com/svg?repos=xlite-dev/ffpa-attn&type=Date" />
  </picture>
 </a>
+</div>
+
 ## ©️Citations
 
 ```BibTeX
