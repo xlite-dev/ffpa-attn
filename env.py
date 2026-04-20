@@ -24,13 +24,6 @@ class ENV(object):
   # Project dir, path to faster-prefill-attention
   PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 
-  # Target CUDA SM architectures to compile for. When empty the current
-  # device's capability is used. Accepts a comma/semicolon/space separated
-  # list of either numeric SMs (e.g. "80,89,90") or aliases (e.g.
-  # "ampere,ada,hopper"). Mirrors cache-dit's FFPA_BUILD_ARCH / TORCH_CUDA_
-  # ARCH_LIST handling so power users can pin a specific arch set.
-  FFPA_BUILD_ARCH = os.environ.get("FFPA_BUILD_ARCH", "")
-
   # Enable all multi stages kernels or not, if True (1~4) else (1~2), default True.
   ENABLE_FFPA_ALL_STAGES = bool(int(os.environ.get("ENABLE_FFPA_ALL_STAGES", 1)))
 
@@ -93,6 +86,13 @@ class ENV(object):
   ENABLE_FFPA_LAUNCH_GRID_DNHB = bool(int(os.environ.get("ENABLE_FFPA_LAUNCH_GRID_DNHB", 0)))
 
   # --- Build-time tuning knobs ---------------------------------------------
+  # Target CUDA SM architectures to compile for. When empty the current
+  # device's capability is used. Accepts a comma/semicolon/space separated
+  # list of either numeric SMs (e.g. "80,89,90") or aliases (e.g.
+  # "ampere,ada,hopper"). Mirrors cache-dit's FFPA_BUILD_ARCH / TORCH_CUDA_
+  # ARCH_LIST handling so power users can pin a specific arch set.
+  FFPA_BUILD_ARCH = os.environ.get("FFPA_BUILD_ARCH", "")
+
   # nvcc intra-TU parallelism. With the per-headdim TU split, the outer
   # ``MAX_JOBS`` already drives many nvcc processes in parallel, so keeping
   # ``--threads`` small (default 4) avoids oversubscription. Set to 1 to
