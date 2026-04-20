@@ -7,14 +7,18 @@
     <a class="github-button" href="https://github.com/xlite-dev/ffpa-attn/subscription" data-show-count="true" data-icon="octicon-eye" data-size="large" aria-label="Watch">Watch</a>
     <a class="github-button" href="https://github.com/xlite-dev/ffpa-attn/fork" data-show-count="true" data-icon="octicon-repo-forked" data-size="large" aria-label="Fork">Fork</a>
   </p>
-  <img src='https://github.com/user-attachments/assets/65a8d564-8fa7-4d66-86b9-e238feb86143' width="500px">
+  <img src='assets/65a8d564-8fa7-4d66-86b9-e238feb86143.png' width="500px">
 </div>
 
 **FFPA(Split-D)**: Yet another **Faster Flash Prefill Attention** with **Split-D** strategy, achieve **O(1) SRAM complexity** and **O(d/4) register complexity** for large headdim (**> 256**), **1.8x~3x** 🎉 faster than SDPA. Currently, FFPA supports self-attention, cross-attention, grouped/multi-query attention, causal attention with large headdim (D=320~1024). While the standard FlashAttention-2 only support headdim <= 256.
 
+<div align="center" markdown="1">
+
 |[Self Attention](#example-self)| [Cross/Decode Attention](#example-cross)|[GQA/MQA Attention](#example-gqa)|[Causal Attention](#example-causal)|[Headdim](#ffpa-design)|
 |:---:|:---:|:---:|:---:|:---:|
 |✔️(`Nq = Nkv`)|✔️(`Nq != Nkv`)|✔️(`Nh_q % Nh_kv == 0`)|✔️(`causal mask`)|**32~1024** |
+
+</div>
 
 > [!NOTE]
 > FFPA has been tested on `Ampere, Ada, Hopper, Blackwell` architectures (e.g. `A30, RTX 3080, L20, RTX 4090, H200, RTX 5090`), the performance may not be optimal (but still get `1.5x~2.3x↑🎉` speedup compared to SDPA for large headdim `> 256`) for Hopper and Blackwell architectures since it does not yet leverage TMA and other architecture-specific optimizations for further optimization.
@@ -148,6 +152,8 @@ CUDA_VISIBLE_DEVICES=0 python3 examples/run_ffpa_attn.py
 
 Env: NVIDIA L20 (Ada), PyTorch 2.11, CUDA 13.0, Headdim=512 (FA-2 not supported).
 
+<div align="center" markdown="1">
+
 | Case | dtype | Nq/Nkv | allclose | FFPA / SDPA | speedup |
 |:---:|:---:|:---:|:---:|:---:|:---:|
 | self-attn | fp16 | 8192/8192 | ✅ | 46.7 / 74.7 ms | 1.60x |
@@ -161,13 +167,15 @@ Env: NVIDIA L20 (Ada), PyTorch 2.11, CUDA 13.0, Headdim=512 (FA-2 not supported)
 | causal | bf16 | 8192/8192 | ✅ | 24.2 / 37.5 ms | 1.55x |
 | non-aligned | bf16 | 8191/8191 | ✅ | 12.3 / 19.0 ms | 1.55x |
 
+</div>
+
 ## 📖 Fine-grained Tiling at MMA level
 
 <a id="ffpa-design"></a>
 
 We have extended FlashAttention for large headdim (D > 256) by implementing **Fine-grained Tiling** at the **MMA level (GEMM style)** for the Q@K^T and P@V matmul. This approach results in a constant SRAM usage of Br * 16 or Bc * 16 (Br = Bc) for Q, K, and V, leading to an overall SRAM complexity of O(2 * Br * 16) ≈ O(1) and a register complexity of O(d/4). Consequently, this method allows us to extend headdim beyond 256 and achieve faster performance compared to SDPA with or without MMA Accumulation F32 (**1.8x~3x** 🎉 faster than SDPA EA).
 
-<img src=https://github.com/user-attachments/assets/ed30185b-2e11-4293-832f-43e9003d6ad9 >
+<img src=assets/ed30185b-2e11-4293-832f-43e9003d6ad9.png >
 We have named this new attention tiling technique **FFPA: Faster Flash Prefill Attention**. FFPA does not introduce any additional VRAM requirement, so the HBM memory complexity remains the same as FlashAttention.
 
 By leveraging this approach, we can achieve better performance than SDPA EA for very large headdim (D > 256, `FA-2 not supported`). Approximate SRAM and register complexity analysis for FFPA is as follows: (`d`=headdim, `C,Br,Bc`=Constant, `Br=Bc`, let O(C)≈O(1)) 👇
@@ -185,11 +193,15 @@ By leveraging this approach, we can achieve better performance than SDPA EA for 
 
 **📚Implementation**: FFPA is implemented using pure MMA PTX instructions, which supports many features such as Split-Q, SMEM Swizzle/Padding, QKV Multi-Stages(1~4), Tile MMAs/Warps, Mixed MMA F32/F16 Acc (Q@K^T MMA Acc F32 + P@V MMA Acc F16), Fully Shared QKV SMEM, Prefetch QKV g2s, Persist Q s2r/g2s, **Fully QKV Fine-grained Tiling(GEMM style)**, Collective Store, etc.
 
+<div align="center" markdown="1">
+
 |✔️Tensor Cores |✔️**MMA(m16n8k16)** |✔️Tile Block(Br, Bc) |✔️Tile MMA/Warp |
 |:---:|:---:|:---:|:---:|
 |✔️**Split Q**(FA-2)|✔️Pack LDST(128 bits)|✔️SMEM **Swizzle/Pad** |✔️Copy Async |
 |✔️**Reg Double Buffers** |✔️QKV **Multi-Stages(1~4)** |✔️Collective Store(**Shfl**)|✔️**Prefetch QKV** g2s |
 |✔️**QKV Fine-grained Tiling**|✔️**Shared QKV** SMEM|✔️Mixed MMA Acc|✔️**Persist Q** s2r/g2s|
+
+</div>
 
 ## ©️License
 
