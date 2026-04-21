@@ -156,7 +156,7 @@ CUDA_VISIBLE_DEVICES=0 python3 examples/run_ffpa_attn.py
 
 <div align='center'>
 
-Env: NVIDIA L20 (Ada), PyTorch 2.11, CUDA 13.0, Headdim=512 (FA-2 not supported).
+Env: NVIDIA L20, PyTorch 2.11, CUDA 13.0, Headdim=512 (FA-2 not supported)
 
 | Case | dtype | Nq/Nkv | allclose | FFPA / SDPA | speedup |
 |:---:|:---:|:---:|:---:|:---:|:---:|
