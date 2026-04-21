@@ -10,12 +10,14 @@
 // scratch + repack step to remain compatible with the existing handcrafted
 // shared-memory swizzle / padding layout.
 //
-// Multi-stage (kStageQK / kStagePV >= 1) is supported. The TMA repack is
-// synchronous (load -> barrier_wait -> repack -> __syncthreads) and writes
-// directly to the requested destination stage slot, so the surrounding
-// cp.async-based pipeline keeps issuing Q loads and waiting on its own
-// commit groups exactly as in the fallback kernel; only the K/V transfer
-// path differs.
+// Multi-stage (kStageQK / kStagePV >= 1) is supported and the K/V loads
+// are pipelined: each tile is split into an asynchronous ``issue_X_tile``
+// (TMA bulk-tensor copy with mbarrier-tx tracking, or cp.async fallback
+// for tail tiles) and a deferred ``consume_X_tile`` (mbarrier wait +
+// repack into the destination padded slot). The issue happens kStageX-1
+// outer iterations before the consume, so a stage-N TMA copy overlaps
+// with the stage-(N-1) MMA consumption ("plan D" multi-stage async
+// repack). Per-stage mbarriers ensure independent stage progress.
 // ============================================================================
 #pragma once
 
@@ -115,55 +117,102 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
   kDataType* K_tile_smem = (Q_tile_smem + (kPersistQg2s ? ((kHeadDim / kMmaAtomK) * Q_tile_size)
                                                         : (kStageQK * Q_tile_size)));
   kDataType* V_tile_smem = (kShareSmemQKV ? Q_tile_smem : K_tile_smem + kStageQK * K_tile_size);
-  // TMA scratch: a single contiguous tile-sized slot for K and V each is
-  // sufficient because each repack call is internally synchronous (load,
-  // barrier wait, repack, syncthreads) and the temp slot is consumed
-  // before the next call. The launcher reserves the matching dynamic
-  // shared-memory size via getExperimentalTmaSm90ScratchSize().
+  // TMA scratch: stage-sized tmp slots for K and V each, sized to match
+  // the destination stage count so that ``issue_K_tile`` for stage N can
+  // start its TMA load while ``consume_K_tile`` is still draining stage
+  // N-1 ("plan D" multi-stage async repack). The launcher reserves the
+  // matching dynamic shared-memory size via
+  // ``getExperimentalTmaSm90ScratchSize<Bc, kMmaAtomK, kMmaAtomN,
+  // kStageQK, kStagePV>()``.
   constexpr int kTmaTmpKTileSize = Bc * kMmaAtomK;
   constexpr int kTmaTmpVTileSize = Bc * (kMmaAtomN * 2);
   kDataType* K_tma_tmp_smem = (kShareSmemQKV ? (K_tile_smem + kStageQK * K_tile_size)
                                              : (V_tile_smem + kStagePV * V_tile_size));
-  kDataType* V_tma_tmp_smem = K_tma_tmp_smem + kTmaTmpKTileSize;
+  kDataType* V_tma_tmp_smem = K_tma_tmp_smem + kStageQK * kTmaTmpKTileSize;
   (void)kTmaTmpVTileSize;
   const uint32_t smem_Q_base_ptr = __cvta_generic_to_shared(Q_tile_smem);
   const uint32_t smem_K_base_ptr = __cvta_generic_to_shared(K_tile_smem);
   const uint32_t smem_V_base_ptr = __cvta_generic_to_shared(V_tile_smem);
 
-  __shared__ alignas(alignof(
-      ffpa::tma::barrier_t)) unsigned char K_tma_barrier_storage[sizeof(ffpa::tma::barrier_t)];
-  __shared__ alignas(alignof(
-      ffpa::tma::barrier_t)) unsigned char V_tma_barrier_storage[sizeof(ffpa::tma::barrier_t)];
-  ffpa::tma::barrier_t* K_tma_barrier =
+  // One mbarrier per K/V stage so that an outstanding load for stage N+1
+  // does not race with the consumer waiting on stage N. arrive_count=1:
+  // the only producer arrival is the ``barrier_arrive_tx`` from thread 0
+  // inside ``ffpa::tma::load_2d``; consumers do their own arrive() in
+  // ``wait_barrier`` to advance the phase for the next reuse.
+  __shared__ alignas(alignof(ffpa::tma::barrier_t)) unsigned char
+      K_tma_barrier_storage[kStageQK * sizeof(ffpa::tma::barrier_t)];
+  __shared__ alignas(alignof(ffpa::tma::barrier_t)) unsigned char
+      V_tma_barrier_storage[kStagePV * sizeof(ffpa::tma::barrier_t)];
+  ffpa::tma::barrier_t* K_tma_barriers =
       reinterpret_cast<ffpa::tma::barrier_t*>(K_tma_barrier_storage);
-  ffpa::tma::barrier_t* V_tma_barrier =
+  ffpa::tma::barrier_t* V_tma_barriers =
       reinterpret_cast<ffpa::tma::barrier_t*>(V_tma_barrier_storage);
   if (threadIdx.x == 0) {
-    ffpa::tma::init_barrier(K_tma_barrier, 1);
-    ffpa::tma::init_barrier(V_tma_barrier, 1);
+#pragma unroll
+    for (int s = 0; s < kStageQK; ++s) {
+      ffpa::tma::init_barrier(&K_tma_barriers[s], 1);
+    }
+#pragma unroll
+    for (int s = 0; s < kStagePV; ++s) {
+      ffpa::tma::init_barrier(&V_tma_barriers[s], 1);
+    }
   }
   __syncthreads();
 
-  // ---------- helper lambdas: TMA-or-cpasync K/V tile stagers ----------
-  // These wrap the repack helper with a cp.async fallback so tail tiles
-  // (where Bc would overrun Nkv) and any future eligibility miss still
-  // produce a correct K/V tile in the destination shared slot.
-  auto stage_K_tile = [&](int tile_K_seqlen, int d_tile, int dst_stage) -> void {
-    if (!ffpa::tma::load_2d_to_smem_repack<Bc, K_tile_size, kHeadDim, kMmaAtomK, kNumThreads,
-                                           kPadK>(K_tile_smem, K_tma_tmp_smem, K_tma_desc,
-                                                  tile_K_seqlen * Bc, d_tile, dst_stage, 0, Nkv,
-                                                  *K_tma_barrier)) {
+  // Per-slot bookkeeping: track whether each K/V stage slot was issued
+  // via TMA (true) or fell back to cp.async (false). Consumers must only
+  // ``wait_and_repack`` the TMA-issued slots; cp.async-fallback slots are
+  // already waited on by the surrounding ``cp_async::wait_group`` calls.
+  bool K_tma_used[kStageQK];
+  bool V_tma_used[kStagePV];
+#pragma unroll
+  for (int s = 0; s < kStageQK; ++s)
+    K_tma_used[s] = false;
+#pragma unroll
+  for (int s = 0; s < kStagePV; ++s)
+    V_tma_used[s] = false;
+
+  // ---------- helper lambdas: split issue / consume K/V tile stagers ----------
+  // ``issue_X_tile`` kicks off a TMA load (or falls back to cp.async when
+  // the helper reports ineligibility, e.g. tail tile or out-of-range
+  // d_tile). ``consume_X_tile`` is the deferred wait+repack that turns the
+  // TMA scratch tile into the destination padded slot. Calling consume on
+  // a slot whose issue used cp.async fallback is a no-op (cp.async is
+  // drained by the surrounding cp_async::wait_group).
+  auto issue_K_tile = [&](int tile_K_seqlen, int d_tile, int dst_stage) -> void {
+    if (ffpa::tma::issue_load_2d_to_tmp<Bc, kHeadDim, kMmaAtomK>(
+            K_tma_tmp_smem, K_tma_desc, tile_K_seqlen * Bc, d_tile, dst_stage, Nkv,
+            K_tma_barriers[dst_stage])) {
+      K_tma_used[dst_stage] = true;
+    } else {
+      K_tma_used[dst_stage] = false;
       ffpa::prefill::cp_async_qkv_g2s<Bc, K_tile_size, kHeadDim, kMmaAtomK, kNumThreads, kPadK>(
           smem_K_base_ptr, K, K_gmem_offset, tile_K_seqlen, d_tile, dst_stage, Nkv);
     }
   };
-  auto stage_V_tile = [&](int tile_K_seqlen, int d_tile, int dst_stage) -> void {
-    if (!ffpa::tma::load_2d_to_smem_repack<Bc, V_tile_size, kHeadDim, kMmaAtomN * 2, kNumThreads,
-                                           kPadV>(V_tile_smem, V_tma_tmp_smem, V_tma_desc,
-                                                  tile_K_seqlen * Bc, d_tile, dst_stage, 0, Nkv,
-                                                  *V_tma_barrier)) {
+  auto consume_K_tile = [&](int dst_stage) -> void {
+    if (K_tma_used[dst_stage]) {
+      ffpa::tma::wait_and_repack_tmp_to_dst<Bc, K_tile_size, kMmaAtomK, kNumThreads, kPadK>(
+          K_tile_smem, K_tma_tmp_smem, dst_stage, dst_stage, K_tma_barriers[dst_stage]);
+      K_tma_used[dst_stage] = false;
+    }
+  };
+  auto issue_V_tile = [&](int tile_K_seqlen, int d_tile, int dst_stage) -> void {
+    if (ffpa::tma::issue_load_2d_to_tmp<Bc, kHeadDim, kMmaAtomN * 2>(
+            V_tma_tmp_smem, V_tma_desc, tile_K_seqlen * Bc, d_tile, dst_stage, Nkv,
+            V_tma_barriers[dst_stage])) {
+      V_tma_used[dst_stage] = true;
+    } else {
+      V_tma_used[dst_stage] = false;
       ffpa::prefill::cp_async_qkv_g2s<Bc, V_tile_size, kHeadDim, kMmaAtomN * 2, kNumThreads, kPadV>(
           smem_V_base_ptr, V, V_gmem_offset, tile_K_seqlen, d_tile, dst_stage, Nkv);
+    }
+  };
+  auto consume_V_tile = [&](int dst_stage) -> void {
+    if (V_tma_used[dst_stage]) {
+      ffpa::tma::wait_and_repack_tmp_to_dst<Bc, V_tile_size, kMmaAtomN * 2, kNumThreads, kPadV>(
+          V_tile_smem, V_tma_tmp_smem, dst_stage, dst_stage, V_tma_barriers[dst_stage]);
+      V_tma_used[dst_stage] = false;
     }
   };
 
@@ -211,7 +260,7 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
                                               kPadQ>(smem_Q_base_ptr, Q, Q_gmem_offset, Q_tile_id,
                                                      stage, stage, Nq);
             }
-            stage_K_tile(tile_K_seqlen, stage, stage);
+            issue_K_tile(tile_K_seqlen, stage, stage);
             ffpa::cp_async::commit_group();
           }
           ffpa::cp_async::wait_group<(kStageQK - 2)>();
@@ -238,7 +287,7 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
                                                      stage, stage, Nq);
             }
           }
-          stage_K_tile(tile_K_seqlen, stage, stage);
+          issue_K_tile(tile_K_seqlen, stage, stage);
           ffpa::cp_async::commit_group();
         }
         ffpa::cp_async::wait_group<(kStageQK - 2)>();
@@ -250,7 +299,7 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
       if constexpr (kStagePV > 1) {
 #pragma unroll
         for (int stage = 0; stage < (kStagePV - 1); ++stage) {
-          stage_V_tile(tile_K_seqlen, stage, stage);
+          issue_V_tile(tile_K_seqlen, stage, stage);
           ffpa::cp_async::commit_group();
         }
       }
@@ -277,7 +326,7 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
               (kStageQK > 1) ? smem_sel_next : smem_sel, Nq);
         }
       }
-      stage_K_tile(tile_K_seqlen, (kStageQK > 1) ? (tile_K_d + (kStageQK - 1)) : tile_K_d,
+      issue_K_tile(tile_K_seqlen, (kStageQK > 1) ? (tile_K_d + (kStageQK - 1)) : tile_K_d,
                    (kStageQK > 1) ? smem_sel_next : smem_sel);
       ffpa::cp_async::commit_group();
 
@@ -285,6 +334,15 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
         ffpa::cp_async::wait_group<0>();
         __syncthreads();
       }
+
+      // Drain the K TMA load for the slot we are about to read from
+      // (no-op if the slot was filled via the cp.async fallback, which
+      // is already covered by the cp_async::wait_group above / the
+      // outer-iter wait_group<(kStageQK-2)>()). When the slot was
+      // TMA-issued one outer-iter ago (kStageQK > 1), this is what
+      // turns the still-in-flight scratch tile into the destination
+      // padded slot via wait_barrier + repack + __syncthreads.
+      consume_K_tile(smem_sel);
 
       static_assert(kValTileSeqLenQ == 1);
       {
@@ -328,7 +386,7 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
           if constexpr (kStagePV > 1) {
 #pragma unroll
             for (int stage = 0; stage < (kStagePV - 1); ++stage) {
-              stage_V_tile(tile_K_seqlen, stage, stage);
+              issue_V_tile(tile_K_seqlen, stage, stage);
               ffpa::cp_async::commit_group();
             }
           }
@@ -380,7 +438,7 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
       if constexpr (kStagePV > 1) {
 #pragma unroll
         for (int stage = 0; stage < (kStagePV - 1); ++stage) {
-          stage_V_tile(tile_K_seqlen, stage, stage);
+          issue_V_tile(tile_K_seqlen, stage, stage);
           ffpa::cp_async::commit_group();
         }
       }
@@ -421,7 +479,7 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
                                             kPadQ>(smem_Q_base_ptr, Q, Q_gmem_offset, Q_tile_id,
                                                    stage, stage, Nq);
           }
-          stage_K_tile(tile_K_seqlen + 1, stage, stage);
+          issue_K_tile(tile_K_seqlen + 1, stage, stage);
           ffpa::cp_async::commit_group();
         }
       }
@@ -441,13 +499,19 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
         const int smem_sel_v = (tile_V_d) % kStagePV;
         const int smem_sel_v_next = (tile_V_d + (kStagePV - 1)) % kStagePV;
         if (j % 2 == 0) {
-          stage_V_tile(tile_K_seqlen, (kStagePV > 1) ? (tile_V_d + (kStagePV - 1)) : tile_V_d,
+          issue_V_tile(tile_K_seqlen, (kStagePV > 1) ? (tile_V_d + (kStagePV - 1)) : tile_V_d,
                        (kStagePV > 1) ? smem_sel_v_next : smem_sel_v);
           ffpa::cp_async::commit_group();
           if constexpr (kStagePV <= 1) {
             ffpa::cp_async::wait_group<0>();
             __syncthreads();
           }
+          // Drain the V TMA load for the slot we are about to read.
+          // No-op if cp.async fallback was used (cp_async::wait_group
+          // covers it). For TMA-issued slots, this performs the
+          // wait_barrier + repack + __syncthreads that materialises
+          // the scratch tile into the destination padded slot.
+          consume_V_tile(smem_sel_v);
         }
 
         reg_st_idx = 0;
@@ -473,7 +537,7 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
                                                     kNumThreads, kPadQ>(
                         smem_Q_base_ptr, Q, Q_gmem_offset, Q_tile_id, stage, stage, Nq);
                   }
-                  stage_K_tile(tile_K_seqlen + 1, stage, stage);
+                  issue_K_tile(tile_K_seqlen + 1, stage, stage);
                   ffpa::cp_async::commit_group();
                 }
               }

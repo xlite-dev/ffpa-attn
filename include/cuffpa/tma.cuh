@@ -114,26 +114,60 @@ __device__ __forceinline__ void load_2d(void* smem_ptr, const CUtensorMap* tenso
   }
 }
 
-template <const int BrOrBc, const int kTileSize, const int kHeadDim, const int kCols,
-          const int kNumThreads, const int kPad, typename T>
-__device__ __forceinline__ bool load_2d_to_smem_repack(T* dst_smem_base_ptr, T* tmp_smem_base_ptr,
-                                                       const CUtensorMap* tensor_map,
-                                                       const int major_coord, const int d_tile_id,
-                                                       const int dst_stage, const int tmp_stage,
-                                                       const int seqlen_bound, barrier_t& barrier) {
+// Issue an asynchronous TMA load of one (BrOrBc, kCols) tile into the
+// caller-owned scratch slot ``tmp_stage`` of ``tmp_smem_base_ptr``. Only
+// thread 0 actually issues the bulk-tensor copy and the corresponding
+// ``barrier_arrive_tx``; other threads no-op. The returned bool indicates
+// whether the TMA was actually issued:
+//  * ``false`` on (a) null descriptor, (b) head-dim out of range, or
+//    (c) tail tile (``major_coord + BrOrBc > seqlen_bound``). In these
+//    cases the caller MUST fall back to a cp.async path AND MUST NOT call
+//    the matching ``wait_and_repack_tmp_to_dst``.
+//  * ``true`` if the TMA was issued. The caller MUST later call
+//    ``wait_and_repack_tmp_to_dst`` with the same ``tmp_stage`` and
+//    ``barrier`` to drain the load and materialise the tile in the
+//    destination padded/swizzled smem slot.
+//
+// Splitting issue from wait+repack is what enables stage-N issue to
+// overlap with stage-(N-1) MMA consumption ("plan D" multi-stage async
+// repack). For the legacy synchronous variant see
+// ``load_2d_to_smem_repack`` below.
+template <const int BrOrBc, const int kHeadDim, const int kCols, typename T>
+__device__ __forceinline__ bool issue_load_2d_to_tmp(T* tmp_smem_base_ptr,
+                                                     const CUtensorMap* tensor_map,
+                                                     const int major_coord, const int d_tile_id,
+                                                     const int tmp_stage, const int seqlen_bound,
+                                                     barrier_t& barrier) {
   if (tensor_map == nullptr || d_tile_id >= (kHeadDim / kCols) ||
       ((major_coord + BrOrBc) > seqlen_bound)) {
     return false;
   }
+  T* tmp_stage_ptr = tmp_smem_base_ptr + tmp_stage * BrOrBc * kCols;
+  load_2d(tmp_stage_ptr, tensor_map, d_tile_id * kCols, major_coord, barrier,
+          BrOrBc * kCols * sizeof(T));
+  return true;
+}
 
+// Wait on ``barrier`` (signalled by the matching ``issue_load_2d_to_tmp``
+// call with the same ``tmp_stage``) and repack the contiguous TMA scratch
+// tile at ``tmp_smem_base_ptr[tmp_stage]`` into the kernel's existing
+// padded (kPad>0) or XOR-swizzled (kPad==0) destination slot
+// ``dst_smem_base_ptr[dst_stage]``. All threads in the block participate.
+//
+// MUST only be invoked when the matching ``issue_load_2d_to_tmp`` returned
+// ``true``; otherwise the wait will block forever (no producer arrival).
+template <const int BrOrBc, const int kTileSize, const int kCols, const int kNumThreads,
+          const int kPad, typename T>
+__device__ __forceinline__ void wait_and_repack_tmp_to_dst(T* dst_smem_base_ptr,
+                                                           T* tmp_smem_base_ptr,
+                                                           const int dst_stage, const int tmp_stage,
+                                                           barrier_t& barrier) {
   constexpr bool kSwizzle = (kPad == 0);
   constexpr int kElemsPerThread = kCols / (kNumThreads / BrOrBc);
   static_assert(kElemsPerThread * sizeof(T) == 16,
                 "Experimental TMA repack expects one 16B vector per thread.");
 
   T* tmp_stage_ptr = tmp_smem_base_ptr + tmp_stage * BrOrBc * kCols;
-  load_2d(tmp_stage_ptr, tensor_map, d_tile_id * kCols, major_coord, barrier,
-          BrOrBc * kCols * sizeof(T));
   wait_barrier(barrier);
   __syncthreads();
 
@@ -145,6 +179,27 @@ __device__ __forceinline__ bool load_2d_to_smem_repack(T* dst_smem_base_ptr, T* 
            (kSwizzle ? (((col >> 3) ^ (row >> 2)) % (kCols >> 3)) << 3 : col);
   *reinterpret_cast<uint4*>(dst) = *reinterpret_cast<uint4*>(src);
   __syncthreads();
+}
+
+// Legacy synchronous helper kept for completeness: issues, waits and
+// repacks in a single call. Equivalent to ``issue_load_2d_to_tmp`` +
+// ``wait_and_repack_tmp_to_dst`` back-to-back. New code should prefer
+// the split helpers so that the issue and the wait can be hoisted apart
+// to enable multi-stage TMA pipelining.
+template <const int BrOrBc, const int kTileSize, const int kHeadDim, const int kCols,
+          const int kNumThreads, const int kPad, typename T>
+__device__ __forceinline__ bool load_2d_to_smem_repack(T* dst_smem_base_ptr, T* tmp_smem_base_ptr,
+                                                       const CUtensorMap* tensor_map,
+                                                       const int major_coord, const int d_tile_id,
+                                                       const int dst_stage, const int tmp_stage,
+                                                       const int seqlen_bound, barrier_t& barrier) {
+  if (!issue_load_2d_to_tmp<BrOrBc, kHeadDim, kCols, T>(tmp_smem_base_ptr, tensor_map, major_coord,
+                                                        d_tile_id, tmp_stage, seqlen_bound,
+                                                        barrier)) {
+    return false;
+  }
+  wait_and_repack_tmp_to_dst<BrOrBc, kTileSize, kCols, kNumThreads, kPad, T>(
+      dst_smem_base_ptr, tmp_smem_base_ptr, dst_stage, tmp_stage, barrier);
   return true;
 }
 #else
@@ -166,6 +221,35 @@ __device__ __forceinline__ void load_2d(void* smem_ptr, const CUtensorMap* tenso
   (void)major_coord;
   (void)barrier;
   (void)bytes;
+}
+
+template <const int BrOrBc, const int kHeadDim, const int kCols, typename T>
+__device__ __forceinline__ bool issue_load_2d_to_tmp(T* tmp_smem_base_ptr,
+                                                     const CUtensorMap* tensor_map,
+                                                     const int major_coord, const int d_tile_id,
+                                                     const int tmp_stage, const int seqlen_bound,
+                                                     barrier_t& barrier) {
+  (void)tmp_smem_base_ptr;
+  (void)tensor_map;
+  (void)major_coord;
+  (void)d_tile_id;
+  (void)tmp_stage;
+  (void)seqlen_bound;
+  (void)barrier;
+  return false;
+}
+
+template <const int BrOrBc, const int kTileSize, const int kCols, const int kNumThreads,
+          const int kPad, typename T>
+__device__ __forceinline__ void wait_and_repack_tmp_to_dst(T* dst_smem_base_ptr,
+                                                           T* tmp_smem_base_ptr,
+                                                           const int dst_stage, const int tmp_stage,
+                                                           barrier_t& barrier) {
+  (void)dst_smem_base_ptr;
+  (void)tmp_smem_base_ptr;
+  (void)dst_stage;
+  (void)tmp_stage;
+  (void)barrier;
 }
 
 template <const int BrOrBc, const int kTileSize, const int kHeadDim, const int kCols,

@@ -289,14 +289,16 @@ static constexpr int getConfigQKVSmemMaxSize() {
 #endif
 }
 
-// Experimental SM90 TMA scratch is sized for a single K tile + single V
-// tile because the synchronous repack helper consumes the temp slot before
-// the next call. Multi-stage K/V destination buffers stay in the existing
+// Experimental SM90 TMA scratch sized for one full pipeline depth so that
+// ``issue_K_tile`` for stage N can start its TMA copy while
+// ``consume_K_tile`` is still draining stage N-1 ("plan D" multi-stage
+// async repack). Multi-stage K/V destination buffers stay in the existing
 // kQKVSmemMaxSize accounting; only the temp staging area is added here.
 // Returns size in bytes (kDataType is 16-bit -> *2).
-template <const int Bc, const int kMmaAtomK, const int kMmaAtomN>
+template <const int Bc, const int kMmaAtomK, const int kMmaAtomN, const int kStageQK,
+          const int kStagePV>
 static constexpr int getExperimentalTmaSm90ScratchSize() {
-  return ((Bc * kMmaAtomK) + (Bc * (kMmaAtomN * 2))) * 2;
+  return (kStageQK * Bc * kMmaAtomK + kStagePV * Bc * (kMmaAtomN * 2)) * 2;
 }
 
 // Host-side launcher that picks compile-time configuration (block tile,
@@ -374,7 +376,7 @@ void launch_ffpa_mma_template(torch::Tensor Q, torch::Tensor K, torch::Tensor V,
                               kPersistQg2s, kPersistQs2r, kStageQK, kStagePV, kPadQ, kPadK,
                               kPadV>();
   constexpr int kExperimentalTmaSm90ScratchSize =
-      getExperimentalTmaSm90ScratchSize<Bc, kMmaAtomK, kMmaAtomN>();
+      getExperimentalTmaSm90ScratchSize<Bc, kMmaAtomK, kMmaAtomN, kStageQK, kStagePV>();
 
   TORCH_CHECK(K.size(0) == Q.size(0) && V.size(0) == Q.size(0),
               "ffpa_attn: Q/K/V must share the same batch size");
