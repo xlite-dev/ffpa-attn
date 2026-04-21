@@ -29,7 +29,7 @@ _OP_QUALNAME = f"{_OP_NAMESPACE}::{_OP_NAME}"
 torch.library.define(
   _OP_QUALNAME,
   "(Tensor Q, Tensor K, Tensor V, Tensor(a!) O, int stages, int acc, int causal, "
-  "float softmax_scale) -> Tensor(a!)",
+  "float softmax_scale, int tma) -> Tensor(a!)",
 )
 
 
@@ -43,8 +43,9 @@ def _ffpa_attn_impl_cuda(
   acc: int,
   causal: int,
   softmax_scale: float,
+  tma: int,
 ) -> torch.Tensor:
-  _ffpa_attn_cuda(Q, K, V, O, stages, acc, causal, softmax_scale)
+  _ffpa_attn_cuda(Q, K, V, O, stages, acc, causal, softmax_scale, tma)
   return O
 
 
@@ -58,8 +59,9 @@ def _ffpa_attn_impl_fake(
   acc: int,
   causal: int,
   softmax_scale: float,
+  tma: int,
 ) -> torch.Tensor:
-  del Q, K, V, stages, acc, causal, softmax_scale
+  del Q, K, V, stages, acc, causal, softmax_scale, tma
   return O
 
 
@@ -72,6 +74,7 @@ def ffpa_attn_func(
   softmax_scale: float | None = None,
   stages: int = 2,
   acc: str = "f32",
+  tma: bool = True,
 ) -> torch.Tensor:
   """Unified FFPA prefill attention entry.
 
@@ -109,6 +112,13 @@ def ffpa_attn_func(
   :param acc: MMA accumulator dtype. ``'f32'`` selects the fp32-acc kernel
       (required for bf16 activations); ``'f16'`` selects the fp16-acc
       kernel and is only valid for fp16 activations.
+  :param tma: When ``True`` (default), opt in to the experimental SM90+
+      TMA path for the large-d kernel. Honored only when running on a
+      device with compute capability >= 9.0, the compile-time eligibility
+      check passes, and the environment variable
+      ``ENABLE_FFPA_EXPERIMENTAL_TMA=1`` is set; otherwise the launcher
+      transparently falls back to the architecture-agnostic
+      ``cp.async``-based kernel.
 
   :returns: ``O``, filled with the attention output
       ``softmax(softmax_scale * QK^T) V``.
@@ -158,4 +168,6 @@ def ffpa_attn_func(
   if softmax_scale is None:
     softmax_scale = 1.0 / math.sqrt(Q.size(-1))
 
-  return torch.ops.ffpa_attn.attn(Q, K, V, O, int(stages), acc_code, int(bool(causal)), float(softmax_scale))
+  return torch.ops.ffpa_attn.attn(
+    Q, K, V, O, int(stages), acc_code, int(bool(causal)), float(softmax_scale), int(bool(tma))
+  )

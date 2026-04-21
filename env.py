@@ -437,15 +437,15 @@ class ENV(object):
     for d in headdims:
       lines.append(
         f"void ffpa_mma_acc_f16_fp16_d{d}(torch::Tensor Q, torch::Tensor K, "
-        f"torch::Tensor V, torch::Tensor O, int stages, int causal, double softmax_scale);"
+        f"torch::Tensor V, torch::Tensor O, int stages, int causal, double softmax_scale, int tma);"
       )
       lines.append(
         f"void ffpa_mma_acc_f32_fp16_d{d}(torch::Tensor Q, torch::Tensor K, "
-        f"torch::Tensor V, torch::Tensor O, int stages, int causal, double softmax_scale);"
+        f"torch::Tensor V, torch::Tensor O, int stages, int causal, double softmax_scale, int tma);"
       )
       lines.append(
         f"void ffpa_mma_acc_f32_bf16_d{d}(torch::Tensor Q, torch::Tensor K, "
-        f"torch::Tensor V, torch::Tensor O, int stages, int causal, double softmax_scale);"
+        f"torch::Tensor V, torch::Tensor O, int stages, int causal, double softmax_scale, int tma);"
       )
     lines.append("")
     return "\n".join(lines)
@@ -469,7 +469,7 @@ class ENV(object):
         ``launch_ffpa_mma_template`` calls.
     """
     call = (f"launch_ffpa_mma_template<{t_in}, {d}, {qk}, {pv}, "
-            "{S}>(Q, K, V, O, causal, softmax_scale);")
+            "{S}>(Q, K, V, O, causal, softmax_scale, tma);")
     return (
       "#ifdef ENABLE_FFPA_ALL_STAGES\n"
       "  if (stages == 2) {\n"
@@ -566,7 +566,8 @@ class ENV(object):
       "    torch::Tensor O,",
       "    int stages,",
       "    int causal,",
-      "    double softmax_scale) {",
+      "    double softmax_scale,",
+      "    int tma) {",
     ]
     stage_body = cls._render_stage_body(d, t_in, "kMmaAccFloat32QK", "kMmaAccFloat32PV")
     return ("\n".join(head) + "\n" + "\n".join(body_prefix) + "\n" + stage_body + "}\n")
@@ -577,7 +578,7 @@ class ENV(object):
     def _cases(symbol_prefix: str) -> str:
       return "\n".join(
         f"    case {d}: {symbol_prefix}_d{d}"
-        "(Q, K, V, O, stages, causal, softmax_scale); break;" for d in headdims
+        "(Q, K, V, O, stages, causal, softmax_scale, tma); break;" for d in headdims
       )
 
     def _fn(name: str, symbol_prefix: str, torch_dtype: str) -> str:
@@ -589,7 +590,8 @@ class ENV(object):
         "    torch::Tensor O,\n"
         "    int stages,\n"
         "    int causal,\n"
-        "    double softmax_scale) {\n"
+        "    double softmax_scale,\n"
+        "    int tma) {\n"
         f"  CHECK_TORCH_TENSOR_DTYPE(Q, {torch_dtype})\n"
         f"  CHECK_TORCH_TENSOR_DTYPE(K, {torch_dtype})\n"
         f"  CHECK_TORCH_TENSOR_DTYPE(V, {torch_dtype})\n"

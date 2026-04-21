@@ -9,24 +9,25 @@ void ffpa_mma_acc_f16_fp16_d832(
     torch::Tensor O,
     int stages,
     int causal,
-    double softmax_scale) {
+    double softmax_scale,
+    int tma) {
   constexpr int kMmaAccFloat32QK = 0;
   constexpr int kMmaAccFloat32PV = 0;
 #ifdef ENABLE_FFPA_ALL_STAGES
   if (stages == 2) {
-    launch_ffpa_mma_template<__half, 832, kMmaAccFloat32QK, kMmaAccFloat32PV, 2>(Q, K, V, O, causal, softmax_scale);
+    launch_ffpa_mma_template<__half, 832, kMmaAccFloat32QK, kMmaAccFloat32PV, 2>(Q, K, V, O, causal, softmax_scale, tma);
   } else if (stages == 3) {
-    launch_ffpa_mma_template<__half, 832, kMmaAccFloat32QK, kMmaAccFloat32PV, 3>(Q, K, V, O, causal, softmax_scale);
+    launch_ffpa_mma_template<__half, 832, kMmaAccFloat32QK, kMmaAccFloat32PV, 3>(Q, K, V, O, causal, softmax_scale, tma);
   } else if (stages == 4) {
-    launch_ffpa_mma_template<__half, 832, kMmaAccFloat32QK, kMmaAccFloat32PV, 4>(Q, K, V, O, causal, softmax_scale);
+    launch_ffpa_mma_template<__half, 832, kMmaAccFloat32QK, kMmaAccFloat32PV, 4>(Q, K, V, O, causal, softmax_scale, tma);
   } else {
-    launch_ffpa_mma_template<__half, 832, kMmaAccFloat32QK, kMmaAccFloat32PV, 1>(Q, K, V, O, causal, softmax_scale);
+    launch_ffpa_mma_template<__half, 832, kMmaAccFloat32QK, kMmaAccFloat32PV, 1>(Q, K, V, O, causal, softmax_scale, tma);
   }
 #else
   if (stages == 2) {
-    launch_ffpa_mma_template<__half, 832, kMmaAccFloat32QK, kMmaAccFloat32PV, 2>(Q, K, V, O, causal, softmax_scale);
+    launch_ffpa_mma_template<__half, 832, kMmaAccFloat32QK, kMmaAccFloat32PV, 2>(Q, K, V, O, causal, softmax_scale, tma);
   } else {
-    launch_ffpa_mma_template<__half, 832, kMmaAccFloat32QK, kMmaAccFloat32PV, 1>(Q, K, V, O, causal, softmax_scale);
+    launch_ffpa_mma_template<__half, 832, kMmaAccFloat32QK, kMmaAccFloat32PV, 1>(Q, K, V, O, causal, softmax_scale, tma);
   }
 #endif
 }
@@ -38,7 +39,8 @@ void ffpa_mma_acc_f32_fp16_d832(
     torch::Tensor O,
     int stages,
     int causal,
-    double softmax_scale) {
+    double softmax_scale,
+    int tma) {
 #ifdef ENABLE_FFPA_FORCE_QK_F16
   constexpr int kMmaAccFloat32QK = 0;
 #else
@@ -51,19 +53,19 @@ void ffpa_mma_acc_f32_fp16_d832(
 #endif
 #ifdef ENABLE_FFPA_ALL_STAGES
   if (stages == 2) {
-    launch_ffpa_mma_template<__half, 832, kMmaAccFloat32QK, kMmaAccFloat32PV, 2>(Q, K, V, O, causal, softmax_scale);
+    launch_ffpa_mma_template<__half, 832, kMmaAccFloat32QK, kMmaAccFloat32PV, 2>(Q, K, V, O, causal, softmax_scale, tma);
   } else if (stages == 3) {
-    launch_ffpa_mma_template<__half, 832, kMmaAccFloat32QK, kMmaAccFloat32PV, 3>(Q, K, V, O, causal, softmax_scale);
+    launch_ffpa_mma_template<__half, 832, kMmaAccFloat32QK, kMmaAccFloat32PV, 3>(Q, K, V, O, causal, softmax_scale, tma);
   } else if (stages == 4) {
-    launch_ffpa_mma_template<__half, 832, kMmaAccFloat32QK, kMmaAccFloat32PV, 4>(Q, K, V, O, causal, softmax_scale);
+    launch_ffpa_mma_template<__half, 832, kMmaAccFloat32QK, kMmaAccFloat32PV, 4>(Q, K, V, O, causal, softmax_scale, tma);
   } else {
-    launch_ffpa_mma_template<__half, 832, kMmaAccFloat32QK, kMmaAccFloat32PV, 1>(Q, K, V, O, causal, softmax_scale);
+    launch_ffpa_mma_template<__half, 832, kMmaAccFloat32QK, kMmaAccFloat32PV, 1>(Q, K, V, O, causal, softmax_scale, tma);
   }
 #else
   if (stages == 2) {
-    launch_ffpa_mma_template<__half, 832, kMmaAccFloat32QK, kMmaAccFloat32PV, 2>(Q, K, V, O, causal, softmax_scale);
+    launch_ffpa_mma_template<__half, 832, kMmaAccFloat32QK, kMmaAccFloat32PV, 2>(Q, K, V, O, causal, softmax_scale, tma);
   } else {
-    launch_ffpa_mma_template<__half, 832, kMmaAccFloat32QK, kMmaAccFloat32PV, 1>(Q, K, V, O, causal, softmax_scale);
+    launch_ffpa_mma_template<__half, 832, kMmaAccFloat32QK, kMmaAccFloat32PV, 1>(Q, K, V, O, causal, softmax_scale, tma);
   }
 #endif
 }
