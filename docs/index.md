@@ -152,9 +152,9 @@ A runnable end-to-end example (witt self-attn, cross-attn, GQA and causal-attn) 
 CUDA_VISIBLE_DEVICES=0 python3 examples/run_ffpa_attn.py
 ```
 
-Env: NVIDIA L20 (Ada), PyTorch 2.11, CUDA 13.0, Headdim=512 (FA-2 not supported).
-
 <div align="center" markdown="1">
+
+Env: NVIDIA L20, PyTorch 2.11, CUDA 13.0, Headdim=512 (FA-2 not supported)
 
 | Case | dtype | Nq/Nkv | allclose | FFPA / SDPA | speedup |
 |:---:|:---:|:---:|:---:|:---:|:---:|
