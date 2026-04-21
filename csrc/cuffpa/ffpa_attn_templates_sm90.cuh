@@ -160,10 +160,33 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
   (void)V_gmem_offset;
   const int O_gmem_offset = Q_gmem_offset;
 
+  // Per-block batch/head row offset into the flat 2D K/V tensor that the
+  // TMA descriptor addresses. The descriptor was built with
+  // globalDim = (kHeadDim, B*Nh_kv*Nkv) so a single ``major_coord`` row
+  // index selects the right (batch, kv_head, seqlen) row. Without this
+  // offset every block reads from batch 0 / kv_head 0, which produces
+  // garbage outputs for any block whose (Nb_id, kv_head_idx) != (0, 0).
+  const int kv_row_base = (Nb_id * Nh_kv + kv_head_idx) * Nkv;
+
   if ((Q_tile_id * Br) >= Nq)
     return;
 
-  extern __shared__ __align__(16) unsigned char ffpa_smem_raw[];
+  // TMA bulk-tensor-load requires the smem destination address to be
+  // 128-byte aligned (PTX hardware constraint, holds for all swizzle
+  // modes). Bump the dynamic-smem base alignment from 16 to 128 so that
+  // every per-stage K/V slot (K_tile_size / V_tile_size are multiples of
+  // 128B in plan A) inherits the alignment from the base.
+  // For TMA SWIZZLE_32B (Cute ``Swizzle<1, 4, 7>``: byte addr bit 7 XOR
+  // bit 4) the hardware swizzle phase depends on the ABSOLUTE smem byte
+  // address: the 32B swizzle pattern repeats every 256B (8 rows of
+  // 32B), so ``K_tile_smem`` / ``V_tile_smem`` must be 256B aligned for
+  // the TMA-written byte layout to match FFPA's relative-row permuted
+  // swizzle (rows 0..3 identity, 4..7 chunks swapped, ...). Each
+  // ``K_tile_size`` / ``V_tile_size`` is already a multiple of 256B in
+  // plan A, so a single base alignment suffices. We use 1024 (the
+  // SWIZZLE_128B pattern stride) to additionally cover the 128B
+  // swizzle modes if/when they get adopted.
+  extern __shared__ __align__(1024) unsigned char ffpa_smem_raw[];
   kDataType* smem = reinterpret_cast<kDataType*>(ffpa_smem_raw);
   constexpr int Q_tile_size = Br * (kMmaAtomK + kPadQ);
   constexpr int K_tile_size = Bc * (kMmaAtomK + kPadK);
@@ -212,30 +235,42 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
   // skip the wait to avoid hanging. KV-axis tail tiles do NOT need a
   // fallback because the TMA descriptor's OOB-fill zero-fills out-of-range
   // rows automatically.
+  // ``K_tma_phase[s]`` / ``V_tma_phase[s]`` track the parity bit each
+  // consumer must wait on for stage ``s``: 0 on the first issue, 1 on the
+  // second, alternating thereafter (mbarriers init'd with arrive_count=1
+  // flip phase as soon as the producer tx-count completes).
   bool K_tma_used[kStageQK];
   bool V_tma_used[kStagePV];
+  uint32_t K_tma_phase[kStageQK];
+  uint32_t V_tma_phase[kStagePV];
 #pragma unroll
-  for (int s = 0; s < kStageQK; ++s)
+  for (int s = 0; s < kStageQK; ++s) {
     K_tma_used[s] = false;
+    K_tma_phase[s] = 0;
+  }
 #pragma unroll
-  for (int s = 0; s < kStagePV; ++s)
+  for (int s = 0; s < kStagePV; ++s) {
     V_tma_used[s] = false;
+    V_tma_phase[s] = 0;
+  }
 
   // ---------- helper lambdas: issue / consume K/V tile stagers ----------
   // ``issue_X_tile`` issues a TMA bulk-tensor copy directly into the
   // destination swizzled slot. Tail KV rows are auto-zero-filled by TMA;
   // out-of-range head-dim sub-tiles no-op. ``consume_X_tile`` waits on
-  // the per-stage mbarrier and ``__syncthreads`` so all threads see the
-  // freshly written tile before the s2r ldmatrix reads start.
+  // the per-stage mbarrier (parity-based) and ``__syncthreads`` so all
+  // threads see the freshly written tile before the s2r ldmatrix reads
+  // start, then flips the per-slot phase bit for the next reuse.
   auto issue_K_tile = [&](int tile_K_seqlen, int d_tile, int dst_stage) -> void {
     K_tma_used[dst_stage] =
         ffpa::tma::issue_load_2d_to_dst_swizzled<Bc, kHeadDim, kMmaAtomK, K_tile_size>(
-            K_tile_smem, K_tma_desc, tile_K_seqlen * Bc, d_tile, dst_stage,
+            K_tile_smem, K_tma_desc, kv_row_base + tile_K_seqlen * Bc, d_tile, dst_stage,
             K_tma_barriers[dst_stage]);
   };
   auto consume_K_tile = [&](int dst_stage) -> void {
     if (K_tma_used[dst_stage]) {
-      ffpa::tma::wait_barrier(K_tma_barriers[dst_stage]);
+      ffpa::tma::wait_barrier_parity(K_tma_barriers[dst_stage], K_tma_phase[dst_stage]);
+      K_tma_phase[dst_stage] ^= 1u;
       K_tma_used[dst_stage] = false;
       __syncthreads();
     }
@@ -243,12 +278,13 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
   auto issue_V_tile = [&](int tile_K_seqlen, int d_tile, int dst_stage) -> void {
     V_tma_used[dst_stage] =
         ffpa::tma::issue_load_2d_to_dst_swizzled<Bc, kHeadDim, kMmaAtomN * 2, V_tile_size>(
-            V_tile_smem, V_tma_desc, tile_K_seqlen * Bc, d_tile, dst_stage,
+            V_tile_smem, V_tma_desc, kv_row_base + tile_K_seqlen * Bc, d_tile, dst_stage,
             V_tma_barriers[dst_stage]);
   };
   auto consume_V_tile = [&](int dst_stage) -> void {
     if (V_tma_used[dst_stage]) {
-      ffpa::tma::wait_barrier(V_tma_barriers[dst_stage]);
+      ffpa::tma::wait_barrier_parity(V_tma_barriers[dst_stage], V_tma_phase[dst_stage]);
+      V_tma_phase[dst_stage] ^= 1u;
       V_tma_used[dst_stage] = false;
       __syncthreads();
     }
@@ -299,9 +335,14 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
                                                      stage, stage, Nq);
             }
             issue_K_tile(tile_K_seqlen, stage, stage);
+            // Q (when loaded above) -> cp.async group counter.
+            // K (TMA) -> bulk-tensor group counter; mbarrier provides
+            // per-slot wait in consume_K_tile, this is the matching
+            // coarse-group commit for downstream readability.
             ffpa::cp_async::commit_group();
+            ffpa::tma::bulk_commit_group();
           }
-          ffpa::cp_async::wait_group<(kStageQK - 2)>();
+          ffpa::cp_async::wait_group<(kStageQK - 2)>();  // drains Q only
           __syncthreads();
         } else {
           ffpa::cp_async::wait_group<(kStageQK - 2)>();
@@ -326,19 +367,30 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
             }
           }
           issue_K_tile(tile_K_seqlen, stage, stage);
-          ffpa::cp_async::commit_group();
+          ffpa::cp_async::commit_group();  // Q -> cp.async counter
+          ffpa::tma::bulk_commit_group();  // K -> TMA bulk counter
         }
-        ffpa::cp_async::wait_group<(kStageQK - 2)>();
+        ffpa::cp_async::wait_group<(kStageQK - 2)>();  // drains Q only
         __syncthreads();
       }
     }
 
+    // V is on the TMA path: every issue_V_tile is a cp.async.bulk.tensor
+    // copy whose completion is tracked by the per-stage mbarrier (signed
+    // by ``cuda::device::barrier_arrive_tx`` inside ``load_2d`` and
+    // awaited via ``consume_V_tile`` -> ``wait_barrier_parity``). To keep
+    // the cp.async-vs-TMA bookkeeping unambiguous for downstream readers
+    // and for static analysis tools, we additionally close a TMA-only
+    // group with ``bulk_commit_group`` after each issue. The matching
+    // ``bulk_wait_group<(kStagePV-2)>`` below provides a coarse fallback
+    // drain alongside the per-slot mbarrier (both are correct; mbarrier
+    // is finer-grained and is what actually orders MMA reads).
     if constexpr ((!kShareSmemQKV) && kPrefetchPV && kStagePV > 1) {
       if constexpr (kStagePV > 1) {
 #pragma unroll
         for (int stage = 0; stage < (kStagePV - 1); ++stage) {
           issue_V_tile(tile_K_seqlen, stage, stage);
-          ffpa::cp_async::commit_group();
+          ffpa::tma::bulk_commit_group();
         }
       }
     }
@@ -366,20 +418,17 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
       }
       issue_K_tile(tile_K_seqlen, (kStageQK > 1) ? (tile_K_d + (kStageQK - 1)) : tile_K_d,
                    (kStageQK > 1) ? smem_sel_next : smem_sel);
-      ffpa::cp_async::commit_group();
+      ffpa::cp_async::commit_group();  // Q (when loaded above) -> cp.async counter
+      ffpa::tma::bulk_commit_group();  // K -> TMA bulk counter (mbarrier-waited)
 
       if constexpr (kStageQK <= 1) {
-        ffpa::cp_async::wait_group<0>();
+        ffpa::cp_async::wait_group<0>();  // drain Q
         __syncthreads();
       }
 
-      // Drain the K TMA load for the slot we are about to read from
-      // (no-op if the slot was filled via the cp.async fallback, which
-      // is already covered by the cp_async::wait_group above / the
-      // outer-iter wait_group<(kStageQK-2)>()). When the slot was
-      // TMA-issued one outer-iter ago (kStageQK > 1), this is what
-      // turns the still-in-flight scratch tile into the destination
-      // padded slot via wait_barrier + repack + __syncthreads.
+      // Drain the K TMA load for the slot we are about to read via its
+      // per-slot mbarrier (parity-based). bulk_commit/bulk_wait above
+      // additionally provide a FIFO-coarse drain of the TMA queue.
       consume_K_tile(smem_sel);
 
       static_assert(kValTileSeqLenQ == 1);
@@ -425,7 +474,7 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
 #pragma unroll
             for (int stage = 0; stage < (kStagePV - 1); ++stage) {
               issue_V_tile(tile_K_seqlen, stage, stage);
-              ffpa::cp_async::commit_group();
+              ffpa::tma::bulk_commit_group();  // V is TMA, not cp.async
             }
           }
         }
@@ -461,7 +510,7 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
 
       if constexpr (kStageQK > 1) {
         if (tile_K_d < (kHeadDim / kMmaAtomK - 1)) {
-          ffpa::cp_async::wait_group<(kStageQK - 2)>();
+          ffpa::cp_async::wait_group<(kStageQK - 2)>();  // drains Q
           __syncthreads();
         }
       }
@@ -477,7 +526,7 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
 #pragma unroll
         for (int stage = 0; stage < (kStagePV - 1); ++stage) {
           issue_V_tile(tile_K_seqlen, stage, stage);
-          ffpa::cp_async::commit_group();
+          ffpa::tma::bulk_commit_group();  // V is TMA, not cp.async
         }
       }
     }
@@ -503,8 +552,11 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
         &R_S[0][0][0], scale, &lane_row_max_new[0][0], &lane_row_sum_new[0][0],
         &lane_block_row_max_old[0][0], &lane_block_row_sum_old[0][0]);
 
+    // Drain TMA V copies issued earlier this iter to bound in-flight
+    // queue depth. Per-slot mbarrier already guards the smem read in
+    // consume_V_tile; this is the matching coarse-group drain.
     if constexpr (kStagePV > 1) {
-      ffpa::cp_async::wait_group<(kStagePV - 2)>();
+      ffpa::tma::bulk_wait_group<(kStagePV - 2)>();
       __syncthreads();
     }
 
@@ -518,7 +570,8 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
                                                    stage, stage, Nq);
           }
           issue_K_tile(tile_K_seqlen + 1, stage, stage);
-          ffpa::cp_async::commit_group();
+          ffpa::cp_async::commit_group();  // Q -> cp.async
+          ffpa::tma::bulk_commit_group();  // K -> TMA bulk
         }
       }
     }
@@ -539,16 +592,16 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
         if (j % 2 == 0) {
           issue_V_tile(tile_K_seqlen, (kStagePV > 1) ? (tile_V_d + (kStagePV - 1)) : tile_V_d,
                        (kStagePV > 1) ? smem_sel_v_next : smem_sel_v);
-          ffpa::cp_async::commit_group();
+          ffpa::tma::bulk_commit_group();  // V is TMA, not cp.async
           if constexpr (kStagePV <= 1) {
-            ffpa::cp_async::wait_group<0>();
+            ffpa::tma::bulk_wait_group<0>();
             __syncthreads();
           }
-          // Drain the V TMA load for the slot we are about to read.
-          // No-op if cp.async fallback was used (cp_async::wait_group
-          // covers it). For TMA-issued slots, this performs the
-          // wait_barrier + repack + __syncthreads that materialises
-          // the scratch tile into the destination padded slot.
+          // Drain the V TMA load for the slot we are about to read via
+          // its per-slot mbarrier (parity-based). The bulk_wait_group
+          // above is a coarser FIFO-drain; this is the precise per-slot
+          // wait + __syncthreads that materialises the swizzled tile in
+          // the destination smem stage before the s2r ldmatrix reads.
           consume_V_tile(smem_sel_v);
         }
 
@@ -576,7 +629,8 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
                         smem_Q_base_ptr, Q, Q_gmem_offset, Q_tile_id, stage, stage, Nq);
                   }
                   issue_K_tile(tile_K_seqlen + 1, stage, stage);
-                  ffpa::cp_async::commit_group();
+                  ffpa::cp_async::commit_group();  // Q -> cp.async
+                  ffpa::tma::bulk_commit_group();  // K -> TMA bulk
                 }
               }
             }
@@ -621,7 +675,7 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
 
         if constexpr (kStagePV > 1) {
           if (j < (kValTileHeadDimV - 1)) {
-            ffpa::cp_async::wait_group<(kStagePV - 2)>();
+            ffpa::tma::bulk_wait_group<(kStagePV - 2)>();
             __syncthreads();
           }
         }

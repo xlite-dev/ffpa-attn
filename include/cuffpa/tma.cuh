@@ -104,6 +104,56 @@ __device__ __forceinline__ void wait_barrier(barrier_t& barrier) {
   barrier.wait(barrier.arrive());
 }
 
+// Parity-based wait used by the plan-A consumers. mbarriers initialised
+// with ``arrive_count == 1`` and signalled exclusively by the producer's
+// ``cuda::device::barrier_arrive_tx`` (inside ``load_2d``) flip phase as
+// soon as the TMA's tx-count is satisfied. Consumers must therefore wait
+// on the *current* phase bit (0 on the first reuse, 1 on the second,
+// alternating thereafter) instead of using ``wait(arrive())`` -- the
+// latter would over-arrive and corrupt the next phase.
+__device__ __forceinline__ void wait_barrier_parity(barrier_t& barrier, uint32_t phase) {
+  barrier.wait_parity(phase != 0);
+  // The TMA bulk-tensor copy writes via the async proxy; ldmatrix.sync (used
+  // by the consumer) reads via the generic proxy. mbarrier wait_parity
+  // alone provides only completion of the TMA, not cross-proxy visibility
+  // for sm_120 / Blackwell, where a generic-proxy reader must observe an
+  // explicit ``fence.proxy.async.shared::cta`` after the producer arrival.
+  cde::fence_proxy_async_shared_cta();
+}
+
+// ------------------------------------------------------------------
+// TMA bulk-copy commit / wait wrappers
+// ------------------------------------------------------------------
+// ``cp.async.bulk.commit_group`` / ``cp.async.bulk.wait_group`` are the
+// TMA-specific counterparts of the cp.async commit/wait primitives in
+// ``ffpa::cp_async``. They track ONLY ``cp.async.bulk{,.tensor}`` copies
+// and are independent of ``cp.async.commit_group`` (the legacy cp.async
+// group counter does NOT track TMA, and vice versa).
+//
+// Plan A's data path uses mbarrier-based completion (every TMA copy in
+// ``load_2d`` arrives on its per-stage mbarrier via
+// ``cuda::device::barrier_arrive_tx`` and is awaited in the kernel via
+// ``wait_barrier_parity``). Mbarrier-tracking is strictly more
+// expressive than the bulk-group counter (per-slot phases, no FIFO
+// constraint), so the kernel does not currently call ``bulk_commit_group``
+// / ``bulk_wait_group``. They are exposed here for two reasons:
+//
+//   1. Code-review clarity: it makes the cp.async vs TMA wait split
+//      explicit. ``ffpa::cp_async::commit_group/wait_group`` only sync Q
+//      (which is still on cp.async); K/V are synced via
+//      ``consume_X_tile`` -> ``wait_barrier_parity``.
+//   2. Future use: a fused bulk_wait_group<0> at the very end of the
+//      kernel would let us drop the per-slot mbarrier waits if we later
+//      decide to coarsen the schedule.
+__device__ __forceinline__ void bulk_commit_group() {
+  asm volatile("cp.async.bulk.commit_group;\n" ::);
+}
+
+template <size_t n>
+__device__ __forceinline__ void bulk_wait_group() {
+  asm volatile("cp.async.bulk.wait_group %0;\n" ::"n"(n));
+}
+
 __device__ __forceinline__ void load_2d(void* smem_ptr, const CUtensorMap* tensor_map,
                                         int32_t minor_coord, int32_t major_coord,
                                         barrier_t& barrier, uint32_t bytes) {
@@ -228,6 +278,16 @@ __device__ __forceinline__ void init_barrier(barrier_t* barrier, int arrive_coun
 __device__ __forceinline__ void wait_barrier(barrier_t& barrier) {
   (void)barrier;
 }
+
+__device__ __forceinline__ void wait_barrier_parity(barrier_t& barrier, uint32_t phase) {
+  (void)barrier;
+  (void)phase;
+}
+
+__device__ __forceinline__ void bulk_commit_group() {}
+
+template <size_t n>
+__device__ __forceinline__ void bulk_wait_group() {}
 
 __device__ __forceinline__ void load_2d(void* smem_ptr, const CUtensorMap* tensor_map,
                                         int32_t minor_coord, int32_t major_coord,
