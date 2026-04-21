@@ -10,6 +10,32 @@
 // scratch + repack step to remain compatible with the existing handcrafted
 // shared-memory swizzle / padding layout.
 //
+// Why K/V only (and not Q) today
+// ------------------------------
+// Q is technically a perfectly valid TMA source too -- ``Q[Nb, Nh, Nq, D]``
+// is contiguous BHND just like K and V, and a 2D TMA descriptor with a
+// (Br, kMmaAtomK) box could load it. We deliberately keep Q on the
+// existing cp.async path for now because:
+//
+//   1. In the Split-Q FA-2 dataflow, each block reads its single Q tile
+//      exactly once and then keeps it resident in registers (kPersistQs2r)
+//      or shared (kPersistQg2s) for the entire ``Tc`` outer loop, while
+//      every K/V tile is reloaded ``Tc`` times across the head-dim
+//      sub-tiling. So the gmem-bandwidth-amortised win from TMA lives
+//      almost entirely on K/V; moving Q to TMA buys ~1/Tc of the savings
+//      while doubling the descriptor-build / mbarrier bookkeeping cost on
+//      the host and adding a third TMA pipeline to schedule.
+//   2. Q already participates in the cp.async commit/wait_group pipeline
+//      that gates the K loads; replacing only Q with TMA would force us to
+//      either drain that group early (costing a __syncthreads) or keep Q
+//      out of the existing prefetch window (losing the kPersistQg2s win).
+//   3. We want the SM90 path to inherit the kPersistQs2r / kPersistQg2s
+//      register/smem reuse modes byte-for-byte from the fallback kernel
+//      while we stabilise the K/V TMA + repack path. Adding Q TMA on top
+//      can be a follow-up once "plan A" (TMA swizzle direct-write,
+//      removing the repack) lands and the Q residency choice no longer
+//      interacts with the TMA scratch layout.
+//
 // Multi-stage (kStageQK / kStagePV >= 1) is supported and the K/V loads
 // are pipelined: each tile is split into an asynchronous ``issue_X_tile``
 // (TMA bulk-tensor copy with mbarrier-tx tracking, or cp.async fallback
