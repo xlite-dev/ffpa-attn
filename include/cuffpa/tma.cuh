@@ -114,24 +114,41 @@ __device__ __forceinline__ void load_2d(void* smem_ptr, const CUtensorMap* tenso
   }
 }
 
-// Issue an asynchronous TMA load of one (BrOrBc, kCols) tile into the
-// caller-owned scratch slot ``tmp_stage`` of ``tmp_smem_base_ptr``. Only
-// thread 0 actually issues the bulk-tensor copy and the corresponding
-// ``barrier_arrive_tx``; other threads no-op. The returned bool indicates
-// whether the TMA was actually issued:
-//  * ``false`` on (a) null descriptor, (b) head-dim out of range, or
-//    (c) tail tile (``major_coord + BrOrBc > seqlen_bound``). In these
-//    cases the caller MUST fall back to a cp.async path AND MUST NOT call
-//    the matching ``wait_and_repack_tmp_to_dst``.
-//  * ``true`` if the TMA was issued. The caller MUST later call
-//    ``wait_and_repack_tmp_to_dst`` with the same ``tmp_stage`` and
-//    ``barrier`` to drain the load and materialise the tile in the
-//    destination padded/swizzled smem slot.
+// Plan A: issue a TMA bulk-tensor copy directly into the destination
+// swizzled smem slot. The destination layout is the kernel's existing
+// ``kPad==0`` XOR-swizzled K/V slot, which (for kCols == 16 fp16, i.e.
+// 32B per row) is bit-for-bit equivalent to ``CU_TENSOR_MAP_SWIZZLE_32B``
+// (Cute ``Swizzle<1, 4, 3>``: address bit 4 XOR bit 7). The TMA
+// descriptor MUST therefore be configured with
+// ``CU_TENSOR_MAP_SWIZZLE_32B`` so the hardware writes the same byte
+// pattern that the existing ldmatrix kPad==0 path expects.
 //
-// Splitting issue from wait+repack is what enables stage-N issue to
-// overlap with stage-(N-1) MMA consumption ("plan D" multi-stage async
-// repack). For the legacy synchronous variant see
-// ``load_2d_to_smem_repack`` below.
+// Returns ``false`` and skips the issue when (a) the descriptor is null
+// or (b) ``d_tile_id`` is past the head-dim end (so speculative prefetch
+// loops beyond ``kHeadDim/kCols`` are safe to call). KV-axis tail tiles
+// (``major_coord + BrOrBc > seqlen_bound``) are NOT skipped; the TMA
+// descriptor's OOB-fill (``CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE``) zero-fills
+// out-of-bounds rows so no cp.async fallback is needed.
+//
+// MUST be paired with ``wait_barrier`` on the same barrier slot before
+// the destination smem is read.
+template <const int BrOrBc, const int kHeadDim, const int kCols, const int kTileSize, typename T>
+__device__ __forceinline__ bool issue_load_2d_to_dst_swizzled(
+    T* dst_smem_base_ptr, const CUtensorMap* tensor_map, const int major_coord, const int d_tile_id,
+    const int dst_stage, barrier_t& barrier) {
+  if (tensor_map == nullptr || d_tile_id >= (kHeadDim / kCols)) {
+    return false;
+  }
+  T* dst_stage_ptr = dst_smem_base_ptr + dst_stage * kTileSize;
+  load_2d(dst_stage_ptr, tensor_map, d_tile_id * kCols, major_coord, barrier,
+          BrOrBc * kCols * sizeof(T));
+  return true;
+}
+
+// Plan D legacy: issue an asynchronous TMA load of one (BrOrBc, kCols)
+// tile into the caller-owned scratch slot ``tmp_stage`` of
+// ``tmp_smem_base_ptr``. Kept for the scratch+repack flow; new code on
+// SM90+ should prefer ``issue_load_2d_to_dst_swizzled`` above.
 template <const int BrOrBc, const int kHeadDim, const int kCols, typename T>
 __device__ __forceinline__ bool issue_load_2d_to_tmp(T* tmp_smem_base_ptr,
                                                      const CUtensorMap* tensor_map,
@@ -221,6 +238,19 @@ __device__ __forceinline__ void load_2d(void* smem_ptr, const CUtensorMap* tenso
   (void)major_coord;
   (void)barrier;
   (void)bytes;
+}
+
+template <const int BrOrBc, const int kHeadDim, const int kCols, const int kTileSize, typename T>
+__device__ __forceinline__ bool issue_load_2d_to_dst_swizzled(
+    T* dst_smem_base_ptr, const CUtensorMap* tensor_map, const int major_coord, const int d_tile_id,
+    const int dst_stage, barrier_t& barrier) {
+  (void)dst_smem_base_ptr;
+  (void)tensor_map;
+  (void)major_coord;
+  (void)d_tile_id;
+  (void)dst_stage;
+  (void)barrier;
+  return false;
 }
 
 template <const int BrOrBc, const int kHeadDim, const int kCols, typename T>

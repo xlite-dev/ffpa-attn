@@ -1,14 +1,31 @@
 // ============================================================================
-// FFPA experimental SM90+ kernel templates with TMA-based K/V staging.
+// FFPA experimental SM90+ kernel templates with TMA-direct K/V staging
+// (plan A: TMA writes directly into the kPad==0 XOR-swizzled destination
+// slot, no scratch and no repack).
 //
 // This header isolates all TMA-related kernel changes from the
 // architecture-agnostic ``ffpa_attn_templates.cuh`` (which remains the
 // fallback for SM < 9.0 and for ``tma=False`` callers). The SM90 kernel
 // reuses the FFPA large-d Split-Q (FlashAttention-2) algorithm and only
 // substitutes the per-tile K/V global-to-shared transfer with a TMA
-// bulk tensor copy (``cp.async.bulk.tensor.2d.global.shared``), with a
-// scratch + repack step to remain compatible with the existing handcrafted
-// shared-memory swizzle / padding layout.
+// bulk-tensor copy (``cp.async.bulk.tensor.2d.global.shared``) configured
+// with ``CU_TENSOR_MAP_SWIZZLE_32B``.
+//
+// Plan A (current): the FFPA hand-crafted ``swizzle::permuted<16>``
+// formula for the 32B-per-row K/V slots is bit-for-bit equivalent to
+// TMA's ``SWIZZLE_32B`` (Cute ``Swizzle<1, 4, 3>``: byte address bit 4
+// XOR bit 7). The TMA descriptor is therefore configured with
+// ``CU_TENSOR_MAP_SWIZZLE_32B`` so the hardware writes exactly the byte
+// pattern that the existing ldmatrix kPad==0 path expects. There is no
+// scratch buffer and no repack: ``issue_X_tile`` writes straight into
+// the destination stage slot and ``consume_X_tile`` only waits on the
+// per-stage mbarrier and ``__syncthreads``.
+//
+// KV-axis tail tiles (``Nkv % Bc != 0``) are handled by TMA's OOB-fill
+// (``CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE`` zero-fills out-of-bounds rows),
+// so no cp.async fallback is needed for the K/V loads. Head-dim
+// out-of-range speculative prefetches still no-op via the helper's
+// ``d_tile_id >= kHeadDim/kCols`` guard.
 //
 // Why K/V only (and not Q) today
 // ------------------------------
@@ -31,19 +48,16 @@
 //      out of the existing prefetch window (losing the kPersistQg2s win).
 //   3. We want the SM90 path to inherit the kPersistQs2r / kPersistQg2s
 //      register/smem reuse modes byte-for-byte from the fallback kernel
-//      while we stabilise the K/V TMA + repack path. Adding Q TMA on top
-//      can be a follow-up once "plan A" (TMA swizzle direct-write,
-//      removing the repack) lands and the Q residency choice no longer
-//      interacts with the TMA scratch layout.
+//      while we stabilise the K/V TMA path. Adding Q TMA on top can be a
+//      follow-up once the K/V plan-A path lands and stabilises.
 //
 // Multi-stage (kStageQK / kStagePV >= 1) is supported and the K/V loads
 // are pipelined: each tile is split into an asynchronous ``issue_X_tile``
-// (TMA bulk-tensor copy with mbarrier-tx tracking, or cp.async fallback
-// for tail tiles) and a deferred ``consume_X_tile`` (mbarrier wait +
-// repack into the destination padded slot). The issue happens kStageX-1
-// outer iterations before the consume, so a stage-N TMA copy overlaps
-// with the stage-(N-1) MMA consumption ("plan D" multi-stage async
-// repack). Per-stage mbarriers ensure independent stage progress.
+// (TMA bulk-tensor copy with mbarrier-tx tracking) and a deferred
+// ``consume_X_tile`` (mbarrier wait + ``__syncthreads``). The issue
+// happens kStageX-1 outer iterations before the consume, so a stage-N
+// TMA copy overlaps with the stage-(N-1) MMA consumption. Per-stage
+// mbarriers ensure independent stage progress.
 // ============================================================================
 #pragma once
 
@@ -68,10 +82,18 @@ template <const int kHeadDim, const int kStageQK, const int kStagePV, const int 
           const int kPadK, const int kPadV>
 struct ExperimentalTmaLargeDConfig {
   static constexpr bool kEligibleHeadDim = (kHeadDim > 64);
-  static constexpr bool kRequiresPaddedSmem = (kPadK > 0 && kPadV > 0);
+  // Plan A: TMA writes directly into the kPad==0 XOR-swizzled destination
+  // slot via ``CU_TENSOR_MAP_SWIZZLE_32B``. FFPA's ``swizzle::permuted<16>``
+  // formula is bit-for-bit equivalent (Cute ``Swizzle<1, 4, 3>``: byte
+  // address bit 4 XOR bit 7), so the existing ldmatrix kPad==0 path reads
+  // the TMA-written tile correctly with zero repack. The kPad>0 padded
+  // layout is incompatible because TMA writes the box contiguously in
+  // 32B-stride swizzled rows -- it cannot leave 8-fp16 pad gaps between
+  // rows.
+  static constexpr bool kRequiresSwizzledSmem = (kPadK == 0 && kPadV == 0);
   static constexpr bool kSupportsAllStages = (kStageQK >= 1 && kStagePV >= 1);
   static constexpr bool kCanAttempt =
-      kEligibleHeadDim && kRequiresPaddedSmem && kSupportsAllStages && (kPadQ >= 0);
+      kEligibleHeadDim && kRequiresSwizzledSmem && kSupportsAllStages && (kPadQ >= 0);
 };
 
 }  // namespace sm90
@@ -129,6 +151,13 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
   const int Q_gmem_offset = ((Nb_id * Nh * Nq * kHeadDim) + (Nh_id * Nq * kHeadDim));
   const int K_gmem_offset = ((Nb_id * Nh_kv * Nkv * kHeadDim) + (kv_head_idx * Nkv * kHeadDim));
   const int V_gmem_offset = K_gmem_offset;
+  // Plan A removed the cp.async K/V fallback so K/V are only addressed
+  // via the TMA descriptors; suppress unused-variable warnings without
+  // touching the rest of the kernel skeleton.
+  (void)K;
+  (void)V;
+  (void)K_gmem_offset;
+  (void)V_gmem_offset;
   const int O_gmem_offset = Q_gmem_offset;
 
   if ((Q_tile_id * Br) >= Nq)
@@ -143,19 +172,10 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
   kDataType* K_tile_smem = (Q_tile_smem + (kPersistQg2s ? ((kHeadDim / kMmaAtomK) * Q_tile_size)
                                                         : (kStageQK * Q_tile_size)));
   kDataType* V_tile_smem = (kShareSmemQKV ? Q_tile_smem : K_tile_smem + kStageQK * K_tile_size);
-  // TMA scratch: stage-sized tmp slots for K and V each, sized to match
-  // the destination stage count so that ``issue_K_tile`` for stage N can
-  // start its TMA load while ``consume_K_tile`` is still draining stage
-  // N-1 ("plan D" multi-stage async repack). The launcher reserves the
-  // matching dynamic shared-memory size via
-  // ``getExperimentalTmaSm90ScratchSize<Bc, kMmaAtomK, kMmaAtomN,
-  // kStageQK, kStagePV>()``.
-  constexpr int kTmaTmpKTileSize = Bc * kMmaAtomK;
-  constexpr int kTmaTmpVTileSize = Bc * (kMmaAtomN * 2);
-  kDataType* K_tma_tmp_smem = (kShareSmemQKV ? (K_tile_smem + kStageQK * K_tile_size)
-                                             : (V_tile_smem + kStagePV * V_tile_size));
-  kDataType* V_tma_tmp_smem = K_tma_tmp_smem + kStageQK * kTmaTmpKTileSize;
-  (void)kTmaTmpVTileSize;
+  // Plan A: TMA writes directly into the K/V destination slots above
+  // (kPad==0 XOR-swizzled, layout = TMA SWIZZLE_32B). No scratch buffer
+  // is needed; the launcher therefore allocates only ``kQKVSmemMaxSize``
+  // and ``getExperimentalTmaSm90ScratchSize`` returns 0.
   const uint32_t smem_Q_base_ptr = __cvta_generic_to_shared(Q_tile_smem);
   const uint32_t smem_K_base_ptr = __cvta_generic_to_shared(K_tile_smem);
   const uint32_t smem_V_base_ptr = __cvta_generic_to_shared(V_tile_smem);
@@ -185,10 +205,13 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
   }
   __syncthreads();
 
-  // Per-slot bookkeeping: track whether each K/V stage slot was issued
-  // via TMA (true) or fell back to cp.async (false). Consumers must only
-  // ``wait_and_repack`` the TMA-issued slots; cp.async-fallback slots are
-  // already waited on by the surrounding ``cp_async::wait_group`` calls.
+  // Per-slot bookkeeping: track whether each K/V stage slot was actually
+  // issued via TMA (i.e. d-tile in range and descriptor non-null).
+  // Speculative prefetch loops can call issue with d_tile_id past the
+  // head-dim end; the issue helper no-ops in that case, and consume must
+  // skip the wait to avoid hanging. KV-axis tail tiles do NOT need a
+  // fallback because the TMA descriptor's OOB-fill zero-fills out-of-range
+  // rows automatically.
   bool K_tma_used[kStageQK];
   bool V_tma_used[kStagePV];
 #pragma unroll
@@ -198,47 +221,36 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
   for (int s = 0; s < kStagePV; ++s)
     V_tma_used[s] = false;
 
-  // ---------- helper lambdas: split issue / consume K/V tile stagers ----------
-  // ``issue_X_tile`` kicks off a TMA load (or falls back to cp.async when
-  // the helper reports ineligibility, e.g. tail tile or out-of-range
-  // d_tile). ``consume_X_tile`` is the deferred wait+repack that turns the
-  // TMA scratch tile into the destination padded slot. Calling consume on
-  // a slot whose issue used cp.async fallback is a no-op (cp.async is
-  // drained by the surrounding cp_async::wait_group).
+  // ---------- helper lambdas: issue / consume K/V tile stagers ----------
+  // ``issue_X_tile`` issues a TMA bulk-tensor copy directly into the
+  // destination swizzled slot. Tail KV rows are auto-zero-filled by TMA;
+  // out-of-range head-dim sub-tiles no-op. ``consume_X_tile`` waits on
+  // the per-stage mbarrier and ``__syncthreads`` so all threads see the
+  // freshly written tile before the s2r ldmatrix reads start.
   auto issue_K_tile = [&](int tile_K_seqlen, int d_tile, int dst_stage) -> void {
-    if (ffpa::tma::issue_load_2d_to_tmp<Bc, kHeadDim, kMmaAtomK>(
-            K_tma_tmp_smem, K_tma_desc, tile_K_seqlen * Bc, d_tile, dst_stage, Nkv,
-            K_tma_barriers[dst_stage])) {
-      K_tma_used[dst_stage] = true;
-    } else {
-      K_tma_used[dst_stage] = false;
-      ffpa::prefill::cp_async_qkv_g2s<Bc, K_tile_size, kHeadDim, kMmaAtomK, kNumThreads, kPadK>(
-          smem_K_base_ptr, K, K_gmem_offset, tile_K_seqlen, d_tile, dst_stage, Nkv);
-    }
+    K_tma_used[dst_stage] =
+        ffpa::tma::issue_load_2d_to_dst_swizzled<Bc, kHeadDim, kMmaAtomK, K_tile_size>(
+            K_tile_smem, K_tma_desc, tile_K_seqlen * Bc, d_tile, dst_stage,
+            K_tma_barriers[dst_stage]);
   };
   auto consume_K_tile = [&](int dst_stage) -> void {
     if (K_tma_used[dst_stage]) {
-      ffpa::tma::wait_and_repack_tmp_to_dst<Bc, K_tile_size, kMmaAtomK, kNumThreads, kPadK>(
-          K_tile_smem, K_tma_tmp_smem, dst_stage, dst_stage, K_tma_barriers[dst_stage]);
+      ffpa::tma::wait_barrier(K_tma_barriers[dst_stage]);
       K_tma_used[dst_stage] = false;
+      __syncthreads();
     }
   };
   auto issue_V_tile = [&](int tile_K_seqlen, int d_tile, int dst_stage) -> void {
-    if (ffpa::tma::issue_load_2d_to_tmp<Bc, kHeadDim, kMmaAtomN * 2>(
-            V_tma_tmp_smem, V_tma_desc, tile_K_seqlen * Bc, d_tile, dst_stage, Nkv,
-            V_tma_barriers[dst_stage])) {
-      V_tma_used[dst_stage] = true;
-    } else {
-      V_tma_used[dst_stage] = false;
-      ffpa::prefill::cp_async_qkv_g2s<Bc, V_tile_size, kHeadDim, kMmaAtomN * 2, kNumThreads, kPadV>(
-          smem_V_base_ptr, V, V_gmem_offset, tile_K_seqlen, d_tile, dst_stage, Nkv);
-    }
+    V_tma_used[dst_stage] =
+        ffpa::tma::issue_load_2d_to_dst_swizzled<Bc, kHeadDim, kMmaAtomN * 2, V_tile_size>(
+            V_tile_smem, V_tma_desc, tile_K_seqlen * Bc, d_tile, dst_stage,
+            V_tma_barriers[dst_stage]);
   };
   auto consume_V_tile = [&](int dst_stage) -> void {
     if (V_tma_used[dst_stage]) {
-      ffpa::tma::wait_and_repack_tmp_to_dst<Bc, V_tile_size, kMmaAtomN * 2, kNumThreads, kPadV>(
-          V_tile_smem, V_tma_tmp_smem, dst_stage, dst_stage, V_tma_barriers[dst_stage]);
+      ffpa::tma::wait_barrier(V_tma_barriers[dst_stage]);
       V_tma_used[dst_stage] = false;
+      __syncthreads();
     }
   };
 

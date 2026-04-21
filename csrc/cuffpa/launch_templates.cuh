@@ -188,7 +188,13 @@ static inline void buildExperimentalTmaDescriptors(torch::Tensor K, torch::Tenso
       static_cast<uint64_t>(sizeof(kDataType) * kHeadDim),
       16u,
       static_cast<uint32_t>(Bc),
-      CU_TENSOR_MAP_SWIZZLE_NONE,
+      // Plan A: TMA writes directly into the existing kPad==0 XOR-swizzled
+      // K/V slot. For 16 fp16 (32B) per row, FFPA's ``swizzle::permuted<16>``
+      // formula is bit-for-bit equivalent to TMA SWIZZLE_32B (Cute
+      // ``Swizzle<1, 4, 3>``: address bit 4 XOR bit 7), so the hardware
+      // produces exactly the byte layout that the existing ldmatrix kPad==0
+      // path expects -- no scratch / repack needed.
+      CU_TENSOR_MAP_SWIZZLE_32B,
       CU_TENSOR_MAP_L2_PROMOTION_L2_128B,
       CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE,
   });
@@ -199,7 +205,7 @@ static inline void buildExperimentalTmaDescriptors(torch::Tensor K, torch::Tenso
       static_cast<uint64_t>(sizeof(kDataType) * kHeadDim),
       16u,
       static_cast<uint32_t>(Bc),
-      CU_TENSOR_MAP_SWIZZLE_NONE,
+      CU_TENSOR_MAP_SWIZZLE_32B,
       CU_TENSOR_MAP_L2_PROMOTION_L2_128B,
       CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE,
   });
@@ -289,16 +295,13 @@ static constexpr int getConfigQKVSmemMaxSize() {
 #endif
 }
 
-// Experimental SM90 TMA scratch sized for one full pipeline depth so that
-// ``issue_K_tile`` for stage N can start its TMA copy while
-// ``consume_K_tile`` is still draining stage N-1 ("plan D" multi-stage
-// async repack). Multi-stage K/V destination buffers stay in the existing
-// kQKVSmemMaxSize accounting; only the temp staging area is added here.
-// Returns size in bytes (kDataType is 16-bit -> *2).
+// Plan A retired the per-stage TMA scratch buffers because TMA now writes
+// directly into the existing kPad==0 XOR-swizzled K/V destination slots.
+// The smem accounting therefore matches the cp.async fallback exactly.
 template <const int Bc, const int kMmaAtomK, const int kMmaAtomN, const int kStageQK,
           const int kStagePV>
 static constexpr int getExperimentalTmaSm90ScratchSize() {
-  return (kStageQK * Bc * kMmaAtomK + kStagePV * Bc * (kMmaAtomN * 2)) * 2;
+  return 0;
 }
 
 // Host-side launcher that picks compile-time configuration (block tile,
