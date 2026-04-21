@@ -146,15 +146,9 @@ out = ffpa_attn_func(q, k, v, causal=True)
 print(out.shape, out.dtype)  # (1, 8, 128, 512)
 ```
 
-A runnable end-to-end example (witt self-attn, cross-attn, GQA and causal-attn) is provided under [`examples`](https://github.com/xlite-dev/ffpa-attn/blob/main/examples/run_ffpa_attn.py):
-
-```bash
-CUDA_VISIBLE_DEVICES=0 python3 examples/run_ffpa_attn.py
-```
+A runnable end-to-end example (witt self-attn, cross-attn, GQA and causal-attn) is provided under [`examples`](https://github.com/xlite-dev/ffpa-attn/blob/main/examples/run_ffpa_attn.py). The performance snapshot for the NVIDIA L20 with Headdim=512 is listed below:
 
 <div align="center" markdown="1">
-
-Env: NVIDIA L20, PyTorch 2.11, CUDA 13.0, Headdim=512 (FA-2 not supported)
 
 | Case | dtype | Nq/Nkv | allclose | FFPA / SDPA | speedup |
 |:---:|:---:|:---:|:---:|:---:|:---:|
@@ -168,6 +162,8 @@ Env: NVIDIA L20, PyTorch 2.11, CUDA 13.0, Headdim=512 (FA-2 not supported)
 | gqa | bf16 | 8192/8192 | ✅ | 46.2 / 74.7 ms | 1.62x |
 | causal | bf16 | 8192/8192 | ✅ | 24.2 / 37.5 ms | 1.55x |
 | non-aligned | bf16 | 8191/8191 | ✅ | 12.3 / 19.0 ms | 1.55x |
+
+Env: NVIDIA L20, PyTorch 2.11, CUDA 13.0, Headdim=512 (FA-2 not supported)
 
 </div>
 
