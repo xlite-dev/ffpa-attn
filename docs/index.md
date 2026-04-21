@@ -146,7 +146,7 @@ out = ffpa_attn_func(q, k, v, causal=True)
 print(out.shape, out.dtype)  # (1, 8, 128, 512)
 ```
 
-A runnable end-to-end example (witt self-attn, cross-attn, GQA and causal-attn) is provided under [`examples`](https://github.com/xlite-dev/ffpa-attn/blob/main/examples/run_ffpa_attn.py). The performance snapshot for the NVIDIA L20 with Headdim=512 is listed below:
+A runnable end-to-end example (with self-attn, cross-attn, GQA and causal-attn) is provided under [`examples`](https://github.com/xlite-dev/ffpa-attn/blob/main/examples/run_ffpa_attn.py). The performance snapshot for the NVIDIA L20 with Headdim=512 is listed below:
 
 <div align="center" markdown="1">
 
