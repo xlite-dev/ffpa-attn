@@ -99,21 +99,60 @@
 //
 // Optimisations applied so far on top of the mbarrier path
 // --------------------------------------------------------
-//   * Plan A1 (this file): K-issue is dispatched BEFORE the matching Q
-//     cp.async submission in every prefetch slot and inner-loop iter, so
-//     the bulk-tensor request is on-the-wire before the cp.async commit
-//     (overlap dispatch). Negligible impact on a thread-0-bottlenecked
-//     workload but free, and required for any future multi-thread issue
-//     scheme to actually overlap with Q.
-//   * (Planned) Plan A2: spread the per-K-tile 32 TMA issues across the
-//     first 8..32 lanes of warp 0 (each lane drives a distinct d-tile,
-//     each lane calls ``barrier_arrive_tx`` for its own bytes). Should
-//     give 4..8x lower TMA issue latency without changing smem layout.
-//   * (Planned) Plan B/C: widen the K/V TMA box to 64 cols
-//     (SWIZZLE_64B + new ``permuted<32>``) or 128 cols (SWIZZLE_128B +
-//     ``permuted<64>``), reducing the issue count from 32 to 8 or 4.
-//     Requires touching ``sync_fetch_qkv_frags_s2r`` to match the new
-//     swizzle phase formula.
+//   * Plan A1 (DONE, in this file): K-issue is dispatched BEFORE the
+//     matching Q cp.async submission in every prefetch slot and inner-
+//     loop iter, so the bulk-tensor request is on-the-wire before the
+//     cp.async commit (overlap dispatch). Negligible standalone impact
+//     on a thread-0-bottlenecked workload but free, and required for
+//     any multi-thread issue scheme to actually overlap with Q.
+//   * Plan A2 (DONE): rotate the SASS-issuing thread across warps via
+//     ``issuer_lane = (idx * WARP_SIZE) mod kNumThreads`` (K and V
+//     offset by ``kNumThreads/2`` so they hit disjoint LSU schedulers).
+//     Threaded through ``ffpa::tma::load_2d`` /
+//     ``issue_load_2d_to_dst_swizzled``. Empirical impact on
+//     (1,48,8192,512) D=512 SM120 RTX5090: 0.79x -> 0.81x of cp.async
+//     baseline (~+2%, within noise). Confirms the bottleneck is the
+//     SM-wide TMA engine queue, NOT per-warp LSU dispatch contention.
+//   * Plan B/C (BLOCKER LIFTED, NOT YET WIRED IN): widen the K/V TMA
+//     box to 64 cols (SWIZZLE_64B) or 128 cols (SWIZZLE_128B), reducing
+//     the issue count from 32 to 16 or 8. ``ffpa::swizzle::permuted``
+//     in ``include/cuffpa/swizzle.cuh`` was extended to support
+//     ``kColStride in {16, 32, 64}`` matching CuTe ``Swizzle<{1,2,3},
+//     4, 3>`` so the byte pattern produced by SWIZZLE_64B/128B will be
+//     bit-for-bit consumable by ldmatrix.
+//
+//     What still needs to change to actually enable Plan B/C:
+//       (1) Add a ``kKvBoxCols`` (= 32 for B, 64 for C) compile-time
+//           constant to this kernel template; default to ``kMmaAtomK``
+//           to keep current behaviour.
+//       (2) ``K_tile_size = Bc * (kKvBoxCols + kPadK)`` and same for V;
+//           per-stage smem grows by ``kKvBoxCols / kMmaAtomK`` x.
+//       (3) ``launch_templates.cuh``: the K/V TMA descriptor's box
+//           minor dim becomes ``kKvBoxCols`` and the swizzle mode
+//           becomes ``CU_TENSOR_MAP_SWIZZLE_64B`` or ``_128B``.
+//       (4) The d-tile inner loop only fires ``issue_K_tile`` /
+//           ``issue_V_tile`` once every ``kKvBoxCols/kMmaAtomK``
+//           iterations; the ``smem_sel`` mapping advances at the same
+//           coarser cadence.
+//       (5) ``sync_fetch_qkv_frags_s2r`` for K/V must read with the
+//           wider swizzle (``permuted<kKvBoxCols>``) and the column
+//           argument must encode the sub-tile-within-box offset
+//           (``(tile_K_d % subtiles_per_box) * kMmaAtomK + j*8``).
+//       (6) Stage-N smem footprint at Plan C: K = kStageQK x Bc x 64 x
+//           2B = 32 KB at kStageQK=4; together with Q (64 KB) and V
+//           (16 KB) the total stays within SM120's 228 KB cap, but the
+//           dynamic smem request must be re-checked against the
+//           per-headdim launcher.
+//
+//     Risk assessment: A2's +2% empirically confirms that engine-side
+//     issue serialisation -- not LSU port contention -- is the
+//     bottleneck, so step (1)..(6) target the right knob. However even
+//     Plan C's 4x issue reduction may not close the full ~25% gap to
+//     cp.async because cp.async's 256-thread parallel dispatch is
+//     fundamentally hard to beat with single-issuer TMA. Plan B/C
+//     should be attempted only as an experiment to bound the
+//     achievable TMA performance, not as a default replacement for the
+//     cp.async path.
 // ============================================================================
 #pragma once
 
