@@ -675,6 +675,8 @@ class ENV(object):
     extra_cuda_cflags.append(f"-I {ENV.project_dir()}/csrc/cuffpa")
     extra_cuda_cflags.append("-diag-suppress")
     extra_cuda_cflags.append("177")
+    extra_cuda_cflags.append("-diag-suppress")
+    extra_cuda_cflags.append("1886")
     if ENV.FFPA_PTXAS_VERBOSE:
       extra_cuda_cflags.append("--ptxas-options=-v")
       extra_cuda_cflags.append("-Xptxas")
