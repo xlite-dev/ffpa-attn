@@ -209,20 +209,11 @@ By leveraging this approach, we can achieve better performance than SDPA EA for 
 
 <div id="why-not-tma"></div>
 
-FFPA ships an experimental SM>=SM90 TMA path (`tma=True`) that
-replaces the K/V `cp.async` global-to-shared transfer with
-`cp.async.bulk.tensor.2d` + mbarriers. After tuning (K-side
-SWIZZLE_128B, 64-col TMA box, decoupled Q/K stage cadence) it
-reaches parity with the `cp.async` baseline on D=512, but does not
-beat it. The reason is structural: **FFPA's split-D dataflow is a
-TMA anti-pattern**. TMA wins when one single-thread instruction can
-amortise its descriptor + mbarrier + queue cost over a large box,
-but split-D gives TMA narrow `Bc x kMmaAtomK` slices, while
-`cp.async` already saturates the same bytes in parallel from all
-256 threads in the CTA. Beating `cp.async + multi-stages + persist
-Q + smem swizzle` would require a co-redesign of the tiling
-(super-tile K/V on TMA + warp-specialised producer/consumer), not a
-drop-in K/V replacement.
+FFPA ships an experimental SM>=SM90 TMA path (`tma=True`) that replaces the K/V `cp.async` global-to-shared transfer with `cp.async.bulk.tensor.2d` + mbarriers. After tuning (K-side SWIZZLE_128B, 64-col TMA box, decoupled Q/K stage cadence) it reaches parity with the `cp.async` baseline on D=512, but does not beat it.
+
+The reason is structural: **FFPA's split-D dataflow is a TMA anti-pattern**. TMA wins when one single-thread instruction can amortise its descriptor + mbarrier + queue cost over a large box, but split-D gives TMA narrow `Bc x kMmaAtomK` slices, while `cp.async` already saturates the same bytes in parallel from all 256 threads in the CTA.
+
+Beating `cp.async + multi-stages + persist Q + smem swizzle` would require a co-redesign of the tiling (super-tile K/V on TMA + warp-specialised producer/consumer), not a drop-in K/V replacement.
 
 ## ©️License
 

@@ -112,19 +112,28 @@ namespace sm90 {
 
 // Eligibility check for the experimental TMA SM90 large-d kernel.
 //
-// * ``kEligibleHeadDim``  : large-d kernel only kicks in for D > 64
-//                           (small-d kernel is a different template).
-// * ``kRequiresPaddedSmem``: TMA repack writes to padded shared (no XOR
-//                           swizzle) since matching the kernel's
-//                           hand-crafted swizzle inside repack would
-//                           require an exact 128 B TMA swizzle layout
-//                           map, which is not yet implemented.
+// * ``kEligibleHeadDim``  : the K TMA box is widened to 64 fp16 cols
+//                           (``SWIZZLE_128B``) only when
+//                           ``kHeadDim >= 128 && kHeadDim % 64 == 0``.
+//                           At smaller / non-aligned head dims the K
+//                           box would fall back to the 16-col
+//                           ``SWIZZLE_32B`` shape, which is strictly
+//                           slower than the cp.async path, so we avoid
+//                           instantiating the SM90 TMA kernel there
+//                           altogether and let the launcher use the
+//                           non-TMA fallback. This also keeps compile
+//                           time and binary size in check.
+// * ``kRequiresSwizzledSmem``: TMA writes directly into the kPad==0
+//                           XOR-swizzled K/V slot, so any non-zero
+//                           ``kPadK`` / ``kPadV`` would leave per-row
+//                           pad gaps that the bulk-tensor copy cannot
+//                           skip.
 // * ``kSupportsAllStages``: multi-stage is supported (kStageQK and
 //                           kStagePV may each be >= 1).
 template <const int kHeadDim, const int kStageQK, const int kStagePV, const int kPadQ,
           const int kPadK, const int kPadV>
 struct ExperimentalTmaLargeDConfig {
-  static constexpr bool kEligibleHeadDim = (kHeadDim > 64);
+  static constexpr bool kEligibleHeadDim = (kHeadDim >= 128 && (kHeadDim % 64) == 0);
   // TMA writes directly into the kPad==0 XOR-swizzled destination slot.
   // FFPA's ``swizzle::permuted<16>`` (V, K when ``kKvBoxCols == 16``) is
   // bit-for-bit equivalent to ``CU_TENSOR_MAP_SWIZZLE_32B`` (Cute

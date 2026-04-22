@@ -205,38 +205,11 @@ By leveraging this approach, we can achieve better performance than SDPA EA for 
 
 <div id="why-not-tma"></div>
 
-FFPA ships an experimental SM>=SM90 TMA path (`tma=True`) that
-replaces the K/V `cp.async` global-to-shared transfer with
-`cp.async.bulk.tensor.2d` + mbarriers. After tuning (K-side
-SWIZZLE_128B with a 64-col TMA box, decoupled Q/K stage cadence,
-direct-write into the kPad==0 swizzled K/V slot) the path reaches
-parity with the well-tuned `cp.async + multi-stages` baseline on
-D=512, but does not beat it. The reason is structural — **FFPA's
-split-D dataflow is a TMA anti-pattern**:
+FFPA ships an experimental SM>=SM90 TMA path (`tma=True`) that replaces the K/V `cp.async` global-to-shared transfer with `cp.async.bulk.tensor.2d` + mbarriers. After tuning (K-side SWIZZLE_128B, 64-col TMA box, decoupled Q/K stage cadence) it reaches parity with the `cp.async` baseline on D=512, but does not beat it.
 
-- **TMA wants few large issues.** Each `cp.async.bulk.tensor` is a
-  single-thread SASS instruction with a fixed per-issue cost
-  (descriptor lookup + coordinate projection + mbarrier-tx write +
-  engine-queue insert). Performance comes from amortising that cost
-  over a large payload (FA-3 / cuDNN-flash KV-TMA paths typically
-  use 64- or 128-col boxes for exactly this reason).
-- **FFPA Split-D gives TMA the opposite shape.** The head-dim is
-  tiled by `kMmaAtomK = 16` fp16 = 32 B/row, so a naive K TMA box
-  is only `Bc x 16 = 2 KB`. One K tile then takes `D / kMmaAtomK =
-  32` issues, all fired serially from a single thread — vs
-  `cp.async`, which fires the same bytes in parallel from all 256
-  threads in the CTA.
-- **Widening the K box recovers parity, not headroom.** Bumping
-  the K box to 64 cols (SWIZZLE_128B) cuts the K issue count 4x and
-  closes the gap, but `cp.async`'s 256-thread parallel dispatch is
-  hard to beat with a single-issuer instruction.
+The reason is structural: **FFPA's split-D dataflow is a TMA anti-pattern**. TMA wins when one single-thread instruction can amortise its descriptor + mbarrier + queue cost over a large box, but split-D gives TMA narrow `Bc x kMmaAtomK` slices, while `cp.async` already saturates the same bytes in parallel from all 256 threads in the CTA.
 
-**Bottom line:** for FFPA's split-D large-D attention, beating
-`cp.async + stages + persist Q + smem swizzle` with TMA requires a
-co-redesign of the whole tiling (super-tile K/V on TMA + warp-
-specialised producer/consumer), not a drop-in K/V replacement. The
-TMA path is shipped as an opt-in switch (`tma=True`); it is
-correctness-equivalent and reaches parity on D=512.
+Beating `cp.async + multi-stages + persist Q + smem swizzle` would require a co-redesign of the tiling (super-tile K/V on TMA + warp-specialised producer/consumer), not a drop-in K/V replacement.
 
 ## ©️License
 
