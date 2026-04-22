@@ -201,6 +201,48 @@ By leveraging this approach, we can achieve better performance than SDPA EA for 
 
 </div>
 
+## 🤔 Why not TMA?
+
+<div id="why-not-tma"></div>
+
+FFPA ships an experimental SM90+ TMA path (`use_tma=True`, plan A) that
+replaces the K/V `cp.async` global-to-shared transfer with
+`cp.async.bulk.tensor.2d` + mbarriers, but on D=512 SM120 it lands at
+**0.66x..0.81x** of the well-tuned `cp.async + multi-stages` baseline
+(verified across H ∈ {32, 48, 64} × N ∈ {4096, 8192, 16384}). This is
+not a code-tuning gap — it is structural. **FFPA's split-D dataflow
+is a TMA anti-pattern**:
+
+- **TMA wants few large issues.** Each `cp.async.bulk.tensor` is a
+  single-thread SASS instruction with a fixed per-issue cost
+  (descriptor lookup + coordinate projection + mbarrier-tx write +
+  engine-queue insert). Performance comes from amortising that cost
+  over a >= 16 KB payload (cuDNN-flash / FA-3 KV-TMA paths typically
+  use 64- or 128-col boxes for exactly this reason).
+- **FFPA Split-D gives TMA the opposite shape.** The head-dim is
+  tiled by `kMmaAtomK = 16` fp16 = 32 B/row, so each TMA box is only
+  `Bc x 16 = 2 KB`. One K tile takes `D / kMmaAtomK = 32` issues, all
+  fired serially from a single thread — vs `cp.async`, which fires
+  the same bytes in parallel from all 256 threads in the CTA.
+- **Pipeline depth doesn't rescue TMA.** Raising `kStageQK` 1→4
+  helps `cp.async` ~1.5x (~26 ms → ~17 ms) but barely moves TMA
+  (~35 → ~27 ms). Deeper stages just queue further behind the same
+  single-issuer bottleneck.
+- **Even widening the box has limits.** Switching to `SWIZZLE_64B` /
+  `SWIZZLE_128B` (plan-B/C, also implemented in this repo, see
+  `csrc/cuffpa/ffpa_attn_templates_sm90.cuh`) cuts the issue count
+  4–8x but changes the smem layout and ldmatrix swizzle phase
+  formula across multiple files; it is unlikely to fully close the
+  gap because `cp.async`'s 256-thread parallel dispatch is
+  fundamentally hard to beat with a single-issuer instruction.
+
+**Bottom line:** for FFPA's split-D large-D attention, beating
+`cp.async + stages + persist Q + smem swizzle` with TMA requires a
+co-redesign of the whole tiling (super-tile K/V + Q on TMA + warp-
+specialised producer/consumer), not a drop-in K/V replacement. The
+current TMA path is shipped as an opt-in experimental switch
+(`use_tma=True`) and stays off by default on SM120.
+
 ## ©️License
 
 <a id="License"></a>
