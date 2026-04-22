@@ -12,7 +12,7 @@ These are read once during `pip install .` / `python setup.py build_ext` and dec
 - <span style="color:#c77dff;">FFPA_PTXAS_VERBOSE</span>, default `False (0)`, Emit ptxas verbose info (register / SMEM usage). Off by default because it produces tens of MB of log output; enable only for tuning.
 - <span style="color:#c77dff;">FFPA_DEV_HEADDIMS</span>, default `""`, Development-time headdim subset override. Comma/space separated list of headdims (e.g. `"256,512"`) that replaces the full generated set for fast iteration. Empty (default) means use the full set decided by `ENABLE_FFPA_ALL_HEADDIM`.
 - <span style="color:#c77dff;">ENABLE_FFPA_ALL_STAGES</span>, default `True (1)`, When `1`, generate kernels for all multi-stage variants (stages `1~4`); when `0`, only stages `1~2` are generated. Reducing this shortens build time at the cost of fewer schedule choices at runtime.
-- <span style="color:#c77dff;">ENABLE_FFPA_ALL_HEADDIM</span>, default `True (1)`, When `1`, headdims range from `32` to `1024` with step `32` (`range(32, 1024, 32)`); when `0`, headdims range from `256` to `1024` with step `64` (`range(256, 1024, 64)`).
+- <span style="color:#c77dff;">ENABLE_FFPA_ALL_HEADDIM</span>, default `False (0)`, When `1`, headdims range from `32` to `1024` with step `32` (`range(32, 1024, 32)`); when `0`, headdims range from `256` to `1024` with step `64` (`range(256, 1024, 64)`).
 - <span style="color:#c77dff;">MAX_JOBS</span>, default `min(nproc, 32)` via `tools/build_fast.sh`, Outer build parallelism passed to setuptools. The fast-build wrapper auto-caps at 32; for plain `python setup.py build_ext`, set it explicitly (e.g. `MAX_JOBS=32`).
 
 ### `tools/build_fast.sh`-only variables
