@@ -104,7 +104,7 @@ __device__ __forceinline__ void wait_barrier(barrier_t& barrier) {
   barrier.wait(barrier.arrive());
 }
 
-// Parity-based wait used by the plan-A consumers. mbarriers initialised
+// Parity-based wait for the direct-write consumers. mbarriers initialised
 // with ``arrive_count == 1`` and signalled exclusively by the producer's
 // ``cuda::device::barrier_arrive_tx`` (inside ``load_2d``) flip phase as
 // soon as the TMA's tx-count is satisfied. Consumers must therefore wait
@@ -130,7 +130,7 @@ __device__ __forceinline__ void wait_barrier_parity(barrier_t& barrier, uint32_t
 // and are independent of ``cp.async.commit_group`` (the legacy cp.async
 // group counter does NOT track TMA, and vice versa).
 //
-// Plan A's data path uses mbarrier-based completion (every TMA copy in
+// The SM90 K/V data path uses mbarrier-based completion (every TMA copy in
 // ``load_2d`` arrives on its per-stage mbarrier via
 // ``cuda::device::barrier_arrive_tx`` and is awaited in the kernel via
 // ``wait_barrier_parity``). Mbarrier-tracking is strictly more
@@ -172,14 +172,16 @@ __device__ __forceinline__ void load_2d(void* smem_ptr, const CUtensorMap* tenso
   }
 }
 
-// Plan A: issue a TMA bulk-tensor copy directly into the destination
-// swizzled smem slot. The destination layout is the kernel's existing
-// ``kPad==0`` XOR-swizzled K/V slot, which (for kCols == 16 fp16, i.e.
-// 32B per row) is bit-for-bit equivalent to ``CU_TENSOR_MAP_SWIZZLE_32B``
-// (Cute ``Swizzle<1, 4, 3>``: address bit 4 XOR bit 7). The TMA
-// descriptor MUST therefore be configured with
-// ``CU_TENSOR_MAP_SWIZZLE_32B`` so the hardware writes the same byte
-// pattern that the existing ldmatrix kPad==0 path expects.
+// Issue a TMA bulk-tensor copy directly into the destination swizzled
+// smem slot. The destination layout is the kernel's existing
+// ``kPad==0`` XOR-swizzled K/V slot, which (for ``kCols == 16`` fp16,
+// i.e. 32B per row) is bit-for-bit equivalent to
+// ``CU_TENSOR_MAP_SWIZZLE_32B`` (Cute ``Swizzle<1, 4, 3>``: address bit
+// 4 XOR bit 7), and (for ``kCols == 64`` fp16, i.e. 128B per row) is
+// equivalent to ``CU_TENSOR_MAP_SWIZZLE_128B`` (Cute
+// ``Swizzle<3, 4, 3>``). The TMA descriptor MUST be configured with
+// the swizzle mode that matches ``kCols`` so the hardware writes the
+// same byte pattern that the existing ldmatrix kPad==0 path expects.
 //
 // Returns ``false`` and skips the issue when (a) the descriptor is null
 // or (b) ``d_tile_id`` is past the head-dim end (so speculative prefetch
@@ -203,10 +205,10 @@ __device__ __forceinline__ bool issue_load_2d_to_dst_swizzled(
   return true;
 }
 
-// Plan D legacy: issue an asynchronous TMA load of one (BrOrBc, kCols)
-// tile into the caller-owned scratch slot ``tmp_stage`` of
-// ``tmp_smem_base_ptr``. Kept for the scratch+repack flow; new code on
-// SM90+ should prefer ``issue_load_2d_to_dst_swizzled`` above.
+// Legacy scratch+repack issuer: issue an asynchronous TMA load of one
+// (BrOrBc, kCols) tile into the caller-owned scratch slot ``tmp_stage``
+// of ``tmp_smem_base_ptr``. Kept for the scratch+repack flow; new code
+// on SM90+ should prefer ``issue_load_2d_to_dst_swizzled`` above.
 template <const int BrOrBc, const int kHeadDim, const int kCols, typename T>
 __device__ __forceinline__ bool issue_load_2d_to_tmp(T* tmp_smem_base_ptr,
                                                      const CUtensorMap* tensor_map,

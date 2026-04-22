@@ -181,9 +181,9 @@ static inline void buildExperimentalTmaDescriptors(torch::Tensor K, torch::Tenso
                                                    const int k_box_cols, CUtensorMap* k_tensor_map,
                                                    CUtensorMap* v_tensor_map) {
   const int total_kv_rows = K.size(0) * Nh_kv * Nkv;
-  // Plan C (K-only): switch the K TMA descriptor's box minor dim to
-  // ``k_box_cols`` (64 for SWIZZLE_128B) and the swizzle mode to match;
-  // V keeps the 16-col SWIZZLE_32B box.
+  // Switch the K TMA descriptor's box minor dim to ``k_box_cols`` (64
+  // for SWIZZLE_128B) and pick the matching swizzle mode; V keeps the
+  // 16-col SWIZZLE_32B box.
   const CUtensorMapSwizzle k_swizzle = (k_box_cols == 64)   ? CU_TENSOR_MAP_SWIZZLE_128B
                                        : (k_box_cols == 32) ? CU_TENSOR_MAP_SWIZZLE_64B
                                                             : CU_TENSOR_MAP_SWIZZLE_32B;
@@ -295,15 +295,15 @@ static constexpr int getConfigQKVSmemMaxSize() {
 #endif
 }
 
-// Plan A retired the per-stage TMA scratch buffers because TMA now writes
-// directly into the existing kPad==0 XOR-swizzled K/V destination slots.
-// Plan C (K-only, 2026-04-22) widens the K TMA box to 64 fp16 cols when
-// the head dim is large enough and kPadK==0; this enlarges the per-stage
-// K smem footprint relative to the cp.async path. The extra bytes are
-// reported here so the launcher's ``cudaFuncSetAttribute(... maxDynamicSm)``
-// covers the SM90 TMA kernel without changing the cp.async smem budget.
-// Must match the ``kKvBoxCols`` formula inside
-// ``ffpa_stages_split_q_large_d_sm90_template`` exactly.
+// TMA writes directly into the existing kPad==0 XOR-swizzled K/V
+// destination slots, so no per-stage scratch buffer is needed. The K
+// TMA box is widened to 64 fp16 cols (SWIZZLE_128B) when the head dim
+// is large enough and ``kPadK == 0``; this enlarges the per-stage K
+// smem footprint relative to the cp.async path. The extra bytes are
+// reported here so the launcher's ``cudaFuncSetAttribute(...
+// maxDynamicSharedMemorySize)`` covers the SM90 TMA kernel without
+// changing the cp.async smem budget. Must match the ``kKvBoxCols``
+// formula inside ``ffpa_stages_split_q_large_d_sm90_template`` exactly.
 template <const int Bc, const int kMmaAtomK, const int kMmaAtomN, const int kStageQK,
           const int kStagePV, const int kHeadDim, const int kPadK, typename kDataType = __half>
 static constexpr int getExperimentalTmaSm90ScratchSize() {
@@ -443,7 +443,7 @@ void launch_ffpa_mma_template(torch::Tensor Q, torch::Tensor K, torch::Tensor V,
   if (kAttemptExperimentalTma) {
     CUtensorMap k_tensor_map{};
     CUtensorMap v_tensor_map{};
-    // Plan C: K TMA box width must match the kernel's ``kKvBoxCols``
+    // K TMA box width must match the kernel's ``kKvBoxCols``
     // formula. Same triggers (kPadK==0, kHeadDim%64==0, kHeadDim>=128).
     constexpr int kKvBoxCols =
         ((kPadK == 0) && (kHeadDim % 64 == 0) && (kHeadDim >= 128)) ? 64 : kMmaAtomK;

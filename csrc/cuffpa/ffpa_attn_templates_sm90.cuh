@@ -1,25 +1,35 @@
 // ============================================================================
-// FFPA experimental SM90+ kernel templates with TMA-direct K/V staging
-// (plan A: TMA writes directly into the kPad==0 XOR-swizzled destination
-// slot, no scratch and no repack).
+// FFPA SM>=SM90 kernel templates with TMA-direct K/V staging.
 //
 // This header isolates all TMA-related kernel changes from the
 // architecture-agnostic ``ffpa_attn_templates.cuh`` (which remains the
 // fallback for SM < 9.0 and for ``tma=False`` callers). The SM90 kernel
 // reuses the FFPA large-d Split-Q (FlashAttention-2) algorithm and only
 // substitutes the per-tile K/V global-to-shared transfer with a TMA
-// bulk-tensor copy (``cp.async.bulk.tensor.2d.global.shared``) configured
-// with ``CU_TENSOR_MAP_SWIZZLE_32B``.
+// bulk-tensor copy (``cp.async.bulk.tensor.2d.global.shared``).
 //
-// Plan A (current): the FFPA hand-crafted ``swizzle::permuted<16>``
-// formula for the 32B-per-row K/V slots is bit-for-bit equivalent to
-// TMA's ``SWIZZLE_32B`` (Cute ``Swizzle<1, 4, 3>``: byte address bit 4
-// XOR bit 7). The TMA descriptor is therefore configured with
-// ``CU_TENSOR_MAP_SWIZZLE_32B`` so the hardware writes exactly the byte
-// pattern that the existing ldmatrix kPad==0 path expects. There is no
-// scratch buffer and no repack: ``issue_X_tile`` writes straight into
-// the destination stage slot and ``consume_X_tile`` only waits on the
-// per-stage mbarrier and ``__syncthreads``.
+// Direct-write design
+// -------------------
+// TMA writes directly into the existing ``kPad==0`` XOR-swizzled K/V
+// destination slot, no scratch buffer and no repack pass:
+//
+//   * The K TMA box is widened to ``kKvBoxCols=64`` fp16 cols
+//     (``CU_TENSOR_MAP_SWIZZLE_128B``, equivalent to FFPA's
+//     ``swizzle::permuted<64>`` = Cute ``Swizzle<3, 4, 3>``) when the
+//     head-dim is large enough (``kHeadDim >= 128`` and
+//     ``kHeadDim % 64 == 0``) and ``kPadK == 0``. Each K stage holds
+//     ``kSubtilesPerKBox = kKvBoxCols/kMmaAtomK`` consumed sub-tiles and
+//     the K issue rate drops by the same factor (e.g. 32->8 issues per
+//     K-seqlen tile at D=512). Smaller head dims fall back to the
+//     ``kKvBoxCols == kMmaAtomK`` (16 cols, ``SWIZZLE_32B``) shape.
+//   * V always uses the 16-col ``SWIZZLE_32B`` box. V's per-tile issue
+//     count is already half of K's, and widening V doubles its smem
+//     footprint with smaller marginal payoff.
+//   * For both K and V the FFPA hand-crafted swizzle formula is
+//     bit-for-bit equivalent to the chosen TMA swizzle mode, so the
+//     existing ldmatrix kPad==0 path consumes the TMA-written tile
+//     directly. ``getExperimentalTmaSm90ScratchSize`` accounts for the
+//     extra K smem implied by the wider K box.
 //
 // KV-axis tail tiles (``Nkv % Bc != 0``) are handled by TMA's OOB-fill
 // (``CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE`` zero-fills out-of-bounds rows),
@@ -32,7 +42,7 @@
 // Q is technically a perfectly valid TMA source too -- ``Q[Nb, Nh, Nq, D]``
 // is contiguous BHND just like K and V, and a 2D TMA descriptor with a
 // (Br, kMmaAtomK) box could load it. We deliberately keep Q on the
-// existing cp.async path for now because:
+// existing cp.async path because:
 //
 //   1. In the Split-Q FA-2 dataflow, each block reads its single Q tile
 //      exactly once and then keeps it resident in registers (kPersistQs2r)
@@ -46,10 +56,8 @@
 //      that gates the K loads; replacing only Q with TMA would force us to
 //      either drain that group early (costing a __syncthreads) or keep Q
 //      out of the existing prefetch window (losing the kPersistQg2s win).
-//   3. We want the SM90 path to inherit the kPersistQs2r / kPersistQg2s
-//      register/smem reuse modes byte-for-byte from the fallback kernel
-//      while we stabilise the K/V TMA path. Adding Q TMA on top can be a
-//      follow-up once the K/V plan-A path lands and stabilises.
+//   3. The SM90 path inherits the kPersistQs2r / kPersistQg2s
+//      register/smem reuse modes byte-for-byte from the fallback kernel.
 //
 // Multi-stage (kStageQK / kStagePV >= 1) is supported and the K/V loads
 // are pipelined: each tile is split into an asynchronous ``issue_X_tile``
@@ -57,102 +65,42 @@
 // ``consume_X_tile`` (mbarrier wait + ``__syncthreads``). The issue
 // happens kStageX-1 outer iterations before the consume, so a stage-N
 // TMA copy overlaps with the stage-(N-1) MMA consumption. Per-stage
-// mbarriers ensure independent stage progress.
+// mbarriers ensure independent stage progress. K stages advance at the
+// box cadence (every ``kSubtilesPerKBox`` sub-tiles); Q stages keep the
+// per-sub-tile cadence via a separate ``q_smem_sel`` index because Q
+// smem is still tiled by ``kMmaAtomK`` in d.
 //
-// Why Split-D is fundamentally hostile to TMA (perf analysis 2026-04-22)
-// ----------------------------------------------------------------------
-// Empirically the TMA path is 0.66x..0.81x of the cp.async baseline on
-// SM120 across (H={32,48,64} x N={4096,8192,16384} x D=512). Worse,
-// raising kStageQK from 1->4 helps cp.async (~26 ms -> ~17 ms, 1.5x) but
-// barely moves TMA (~35 -> ~27 ms, ~1.3x and far from cp.async even at
-// stage 4). Root cause is structural, not a code bug:
+// Why Split-D is structurally hostile to TMA
+// ------------------------------------------
+// FFPA's Split-D dataflow tiles the head dim by ``kMmaAtomK`` (=16 fp16
+// = 32 B per row). ``cp.async.bulk.tensor`` is a single-thread SASS
+// instruction with a fixed per-issue cost (descriptor lookup, coordinate
+// projection, mbarrier-tx write, engine-queue insert). A naive 2 KB box
+// makes the fixed:transfer ratio ~1:5, so TMA-engine issue rate is the
+// bottleneck -- not gmem bandwidth or LSU port contention. cp.async
+// amortises the same bytes across all 256 threads in parallel.
 //
-//   1. FFPA's Split-D dataflow tiles the head dim by ``kMmaAtomK`` (=16
-//      fp16 = 32 B per row). Each TMA box is ``(Bc=64) x (kMmaAtomK=16)``
-//      = 2 KB; one K tile takes ``kHeadDim/kMmaAtomK = 32`` issues.
-//   2. ``cp.async.bulk.tensor`` is a SASS instruction issued through the
-//      LSU. Each issue has a fixed cost (~30..80 cycles for descriptor
-//      lookup, coordinate projection, mbarrier-tx write, queue insert)
-//      that is independent of payload size. With a 2 KB payload the
-//      fixed:transfer ratio is ~1:5, so issue rate -- not gmem bandwidth
-//      -- is the bottleneck.
-//   3. cp.async amortises this across all ``kNumThreads=256`` threads
-//      (each fires 1..2 cp.async per sub-tile, 256-way parallel). TMA
-//      fires from a SINGLE thread (current code: ``if (threadIdx.x==0)``
-//      inside ``ffpa::tma::load_2d``), serialising 32 issues per K tile
-//      onto one warp lane. This is the single largest cost.
-//   4. Stages don't help: kStageQK only deepens the in-flight queue; it
-//      does not raise the per-issue dispatch rate. Once the LSU port for
-//      thread 0 is saturated, deeper pipelines just queue further behind
-//      that one bottleneck.
+// Widening the K box to 64 cols (SWIZZLE_128B, what this kernel does)
+// cuts the K issue count 4x and brings the TMA path to parity with the
+// well-tuned cp.async + multi-stages baseline on D=512, but does not
+// beat it. cp.async's 256-thread parallel dispatch is hard to beat with
+// a single-issuer instruction; closing the gap further would require a
+// larger redesign (super-tile K/V on TMA + warp-specialised
+// producer/consumer), not a drop-in K/V replacement.
 //
-// The ideal TMA shape is the opposite of Split-D's: large per-issue
-// payload (>= 16 KB) with few participating threads. cuDNN-flash and
-// FA-3 KV-TMA paths use a "super-tile" -- TMA loads e.g. 64 D-cols at
-// once (SWIZZLE_64B) while MMA still consumes 16 cols at a time, trading
-// 2..4x smem for 4..8x fewer issues. That is the planned plan-B/C path.
-//
-// For now the SM90 TMA kernel is structurally correct (16/16 unit tests
-// pass, max_abs_diff matches the cp.async noise floor) but should not
-// be promoted as the default path on SM120 until plan-B/C reduces the
-// issue count.
-//
-// Optimisations applied so far on top of the mbarrier path
-// --------------------------------------------------------
-//   * Plan A1 (DONE, in this file): K-issue is dispatched BEFORE the
-//     matching Q cp.async submission in every prefetch slot and inner-
-//     loop iter, so the bulk-tensor request is on-the-wire before the
-//     cp.async commit (overlap dispatch). Negligible standalone impact
-//     on a thread-0-bottlenecked workload but free, and required for
-//     any multi-thread issue scheme to actually overlap with Q.
-//   * Plan A2 (DONE): rotate the SASS-issuing thread across warps via
-//     ``issuer_lane = (idx * WARP_SIZE) mod kNumThreads`` (K and V
+// Optimisations applied on top of the mbarrier path
+// -------------------------------------------------
+//   * K-issue is dispatched BEFORE the matching Q cp.async submission in
+//     every prefetch slot and inner-loop iter, so the bulk-tensor
+//     request is on-the-wire before the cp.async commit (overlap
+//     dispatch).
+//   * Issuer-lane rotation: the SASS-issuing thread rotates across warps
+//     via ``issuer_lane = (idx * WARP_SIZE) mod kNumThreads`` (K and V
 //     offset by ``kNumThreads/2`` so they hit disjoint LSU schedulers).
 //     Threaded through ``ffpa::tma::load_2d`` /
-//     ``issue_load_2d_to_dst_swizzled``. Empirical impact on
-//     (1,48,8192,512) D=512 SM120 RTX5090: 0.79x -> 0.81x of cp.async
-//     baseline (~+2%, within noise). Confirms the bottleneck is the
-//     SM-wide TMA engine queue, NOT per-warp LSU dispatch contention.
-//   * Plan B/C (BLOCKER LIFTED, NOT YET WIRED IN): widen the K/V TMA
-//     box to 64 cols (SWIZZLE_64B) or 128 cols (SWIZZLE_128B), reducing
-//     the issue count from 32 to 16 or 8. ``ffpa::swizzle::permuted``
-//     in ``include/cuffpa/swizzle.cuh`` was extended to support
-//     ``kColStride in {16, 32, 64}`` matching CuTe ``Swizzle<{1,2,3},
-//     4, 3>`` so the byte pattern produced by SWIZZLE_64B/128B will be
-//     bit-for-bit consumable by ldmatrix.
-//
-//     What still needs to change to actually enable Plan B/C:
-//       (1) Add a ``kKvBoxCols`` (= 32 for B, 64 for C) compile-time
-//           constant to this kernel template; default to ``kMmaAtomK``
-//           to keep current behaviour.
-//       (2) ``K_tile_size = Bc * (kKvBoxCols + kPadK)`` and same for V;
-//           per-stage smem grows by ``kKvBoxCols / kMmaAtomK`` x.
-//       (3) ``launch_templates.cuh``: the K/V TMA descriptor's box
-//           minor dim becomes ``kKvBoxCols`` and the swizzle mode
-//           becomes ``CU_TENSOR_MAP_SWIZZLE_64B`` or ``_128B``.
-//       (4) The d-tile inner loop only fires ``issue_K_tile`` /
-//           ``issue_V_tile`` once every ``kKvBoxCols/kMmaAtomK``
-//           iterations; the ``smem_sel`` mapping advances at the same
-//           coarser cadence.
-//       (5) ``sync_fetch_qkv_frags_s2r`` for K/V must read with the
-//           wider swizzle (``permuted<kKvBoxCols>``) and the column
-//           argument must encode the sub-tile-within-box offset
-//           (``(tile_K_d % subtiles_per_box) * kMmaAtomK + j*8``).
-//       (6) Stage-N smem footprint at Plan C: K = kStageQK x Bc x 64 x
-//           2B = 32 KB at kStageQK=4; together with Q (64 KB) and V
-//           (16 KB) the total stays within SM120's 228 KB cap, but the
-//           dynamic smem request must be re-checked against the
-//           per-headdim launcher.
-//
-//     Risk assessment: A2's +2% empirically confirms that engine-side
-//     issue serialisation -- not LSU port contention -- is the
-//     bottleneck, so step (1)..(6) target the right knob. However even
-//     Plan C's 4x issue reduction may not close the full ~25% gap to
-//     cp.async because cp.async's 256-thread parallel dispatch is
-//     fundamentally hard to beat with single-issuer TMA. Plan B/C
-//     should be attempted only as an experiment to bound the
-//     achievable TMA performance, not as a default replacement for the
-//     cp.async path.
+//     ``issue_load_2d_to_dst_swizzled``.
+//   * Wider K TMA box (``kKvBoxCols=64`` / ``SWIZZLE_128B``) cuts K
+//     issue count 4x; see the direct-write design notes above.
 // ============================================================================
 #pragma once
 
@@ -177,14 +125,16 @@ template <const int kHeadDim, const int kStageQK, const int kStagePV, const int 
           const int kPadK, const int kPadV>
 struct ExperimentalTmaLargeDConfig {
   static constexpr bool kEligibleHeadDim = (kHeadDim > 64);
-  // Plan A: TMA writes directly into the kPad==0 XOR-swizzled destination
-  // slot via ``CU_TENSOR_MAP_SWIZZLE_32B``. FFPA's ``swizzle::permuted<16>``
-  // formula is bit-for-bit equivalent (Cute ``Swizzle<1, 4, 3>``: byte
-  // address bit 4 XOR bit 7), so the existing ldmatrix kPad==0 path reads
-  // the TMA-written tile correctly with zero repack. The kPad>0 padded
-  // layout is incompatible because TMA writes the box contiguously in
-  // 32B-stride swizzled rows -- it cannot leave 8-fp16 pad gaps between
-  // rows.
+  // TMA writes directly into the kPad==0 XOR-swizzled destination slot.
+  // FFPA's ``swizzle::permuted<16>`` (V, K when ``kKvBoxCols == 16``) is
+  // bit-for-bit equivalent to ``CU_TENSOR_MAP_SWIZZLE_32B`` (Cute
+  // ``Swizzle<1, 4, 3>``: byte address bit 4 XOR bit 7), and
+  // ``swizzle::permuted<64>`` (K when ``kKvBoxCols == 64``) is
+  // equivalent to ``CU_TENSOR_MAP_SWIZZLE_128B`` (Cute
+  // ``Swizzle<3, 4, 3>``), so the existing ldmatrix kPad==0 path reads
+  // the TMA-written tile correctly with zero repack. ``kPad>0`` padded
+  // layouts are incompatible because TMA writes the box contiguously
+  // in swizzled rows -- it cannot leave per-row pad gaps.
   static constexpr bool kRequiresSwizzledSmem = (kPadK == 0 && kPadV == 0);
   static constexpr bool kSupportsAllStages = (kStageQK >= 1 && kStagePV >= 1);
   static constexpr bool kCanAttempt =
@@ -199,9 +149,10 @@ struct ExperimentalTmaLargeDConfig {
 // ----------------------------------------------------------------------------
 // Mirror of ``ffpa_stages_split_q_large_d_template`` from
 // ``ffpa_attn_templates.cuh`` but with K/V tile staging delegated to TMA
-// (``cp.async.bulk.tensor.2d.global.shared``) followed by a thread-block
-// repack into the existing padded shared-memory layout. All other
-// algorithmic behavior (online softmax, causal mask, GQA/MQA,
+// (``cp.async.bulk.tensor.2d.global.shared``) writing directly into the
+// existing kPad==0 XOR-swizzled K/V destination slot (no scratch, no
+// repack). All other algorithmic behavior (online softmax, causal mask,
+// GQA/MQA,
 // kStageQK/kStagePV pipeline flow, kPersistQg2s/kPersistQs2r/kRegPipeKV
 // options) is identical to the fallback kernel; do NOT diverge those paths
 // here.
@@ -246,9 +197,10 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
   const int Q_gmem_offset = ((Nb_id * Nh * Nq * kHeadDim) + (Nh_id * Nq * kHeadDim));
   const int K_gmem_offset = ((Nb_id * Nh_kv * Nkv * kHeadDim) + (kv_head_idx * Nkv * kHeadDim));
   const int V_gmem_offset = K_gmem_offset;
-  // Plan A removed the cp.async K/V fallback so K/V are only addressed
-  // via the TMA descriptors; suppress unused-variable warnings without
-  // touching the rest of the kernel skeleton.
+  // K/V global pointers are only addressed via the TMA descriptors on
+  // this path; suppress unused-variable warnings without touching the
+  // rest of the kernel skeleton.
+
   (void)K;
   (void)V;
   (void)K_gmem_offset;
@@ -268,32 +220,26 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
 
   // TMA bulk-tensor-load requires the smem destination address to be
   // 128-byte aligned (PTX hardware constraint, holds for all swizzle
-  // modes). Bump the dynamic-smem base alignment from 16 to 128 so that
-  // every per-stage K/V slot (K_tile_size / V_tile_size are multiples of
-  // 128B in plan A) inherits the alignment from the base.
-  // For TMA SWIZZLE_32B (Cute ``Swizzle<1, 4, 7>``: byte addr bit 7 XOR
-  // bit 4) the hardware swizzle phase depends on the ABSOLUTE smem byte
-  // address: the 32B swizzle pattern repeats every 256B (8 rows of
-  // 32B), so ``K_tile_smem`` / ``V_tile_smem`` must be 256B aligned for
-  // the TMA-written byte layout to match FFPA's relative-row permuted
-  // swizzle (rows 0..3 identity, 4..7 chunks swapped, ...). Each
-  // ``K_tile_size`` / ``V_tile_size`` is already a multiple of 256B in
-  // plan A, so a single base alignment suffices. We use 1024 (the
-  // SWIZZLE_128B pattern stride) to additionally cover the 128B
-  // swizzle modes if/when they get adopted.
+  // modes). The hardware swizzle phase additionally depends on the
+  // ABSOLUTE smem byte address: SWIZZLE_32B repeats every 256 B,
+  // SWIZZLE_128B repeats every 1024 B, so the per-stage K/V slot must
+  // be aligned to the largest stride in use for the TMA-written byte
+  // layout to match FFPA's relative-row permuted swizzle. We bump the
+  // dynamic-smem base alignment to 1024 (covers all swizzle modes) and
+  // rely on K_tile_size / V_tile_size being multiples of that stride.
   extern __shared__ __align__(1024) unsigned char ffpa_smem_raw[];
   kDataType* smem = reinterpret_cast<kDataType*>(ffpa_smem_raw);
   constexpr int Q_tile_size = Br * (kMmaAtomK + kPadQ);
-  // Plan C (K-only, 2026-04-22): widen the K TMA box to 64 fp16 cols
-  // (SWIZZLE_128B) when the head-dim is large enough to amortise the
-  // bigger per-stage smem footprint and when kPadK==0 so the swizzle
-  // matches ``swizzle::permuted<64>``. Each K stage now holds a single
-  // wider box that covers ``kSubtilesPerKBox = kKvBoxCols/kMmaAtomK``
-  // consumed sub-tiles. The TMA issue count per K-seqlen tile drops
-  // from ``kHeadDim/kMmaAtomK`` to ``kHeadDim/kKvBoxCols``, e.g. 32->8
-  // at D=512, the dominant TMA-engine cost on this kernel. V stays on
-  // the current 16-col box (its issue count is already half of K's and
-  // widening V doubles the V-side smem with smaller marginal payoff).
+  // Widen the K TMA box to 64 fp16 cols (SWIZZLE_128B) when the
+  // head-dim is large enough to amortise the bigger per-stage smem
+  // footprint and ``kPadK==0`` so the swizzle matches
+  // ``swizzle::permuted<64>``. Each K stage then holds a single wider
+  // box covering ``kSubtilesPerKBox = kKvBoxCols/kMmaAtomK`` consumed
+  // sub-tiles, and the TMA issue count per K-seqlen tile drops from
+  // ``kHeadDim/kMmaAtomK`` to ``kHeadDim/kKvBoxCols`` (e.g. 32->8 at
+  // D=512). V stays on the 16-col box (its issue count is already half
+  // of K's and widening V doubles the V-side smem with smaller
+  // marginal payoff).
   constexpr int kKvBoxCols =
       ((kPadK == 0) && (kHeadDim % 64 == 0) && (kHeadDim >= 128)) ? 64 : kMmaAtomK;
   constexpr int kSubtilesPerKBox = kKvBoxCols / kMmaAtomK;
@@ -303,10 +249,11 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
   kDataType* K_tile_smem = (Q_tile_smem + (kPersistQg2s ? ((kHeadDim / kMmaAtomK) * Q_tile_size)
                                                         : (kStageQK * Q_tile_size)));
   kDataType* V_tile_smem = (kShareSmemQKV ? Q_tile_smem : K_tile_smem + kStageQK * K_tile_size);
-  // Plan A: TMA writes directly into the K/V destination slots above
-  // (kPad==0 XOR-swizzled, layout = TMA SWIZZLE_32B). No scratch buffer
-  // is needed; the launcher therefore allocates only ``kQKVSmemMaxSize``
-  // and ``getExperimentalTmaSm90ScratchSize`` returns 0.
+  // TMA writes directly into the K/V destination slots above (kPad==0
+  // XOR-swizzled, layout matches the chosen TMA swizzle mode). No
+  // scratch buffer is needed: the launcher allocates ``kQKVSmemMaxSize
+  // + getExperimentalTmaSm90ScratchSize`` where the scratch size only
+  // accounts for the extra K bytes implied by the wider K box.
   const uint32_t smem_Q_base_ptr = __cvta_generic_to_shared(Q_tile_smem);
   const uint32_t smem_K_base_ptr = __cvta_generic_to_shared(K_tile_smem);
   const uint32_t smem_V_base_ptr = __cvta_generic_to_shared(V_tile_smem);
@@ -371,12 +318,12 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
   // start, then flips the per-slot phase bit for the next reuse.
   //
   // ``issuer_lane`` rotates the SASS-issuing thread across warps so the
-  // per-warp-scheduler LSU dispatch port is not single-thread bottlenecked
-  // (plan A2: each call rotates ``idx * WARP_SIZE`` modulo ``kNumThreads``,
-  // so 32 inner-loop K issues are spread across all 8 warps' lane 0). K
-  // and V use disjoint base offsets so a given inner iter's K and V
-  // issues fire from different warps and contend for different LSU
-  // schedulers.
+  // per-warp-scheduler LSU dispatch port is not single-thread
+  // bottlenecked: each call rotates ``idx * WARP_SIZE`` modulo
+  // ``kNumThreads``, spreading inner-loop K issues across all warps'
+  // lane 0. K and V use disjoint base offsets so a given inner iter's
+  // K and V issues fire from different warps and contend for different
+  // LSU schedulers.
   constexpr int kIssuerStep = WARP_SIZE;
   constexpr int kVIssuerOffset = (kNumThreads >= 64) ? (kNumThreads / 2) : 0;
   auto k_issuer_lane = [](int idx) -> int { return (idx * kIssuerStep) % kNumThreads; };
@@ -528,8 +475,8 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
                               (kMmaAccFloat32QK) ? 4 : 2>(R_S, 0);
 #pragma unroll
     for (int tile_K_d = 0; tile_K_d < (kHeadDim / kMmaAtomK); ++tile_K_d) {
-      // Plan C box-coordinate translation. ``box_idx`` is the K TMA
-      // box this sub-tile lives in; ``subtile_idx`` is which of the
+      // Box-coordinate translation. ``box_idx`` is the K TMA box this
+      // sub-tile lives in; ``subtile_idx`` is which of the
       // ``kSubtilesPerKBox`` consumed sub-tiles inside that box; the
       // wider K smem layout has row stride ``kKvBoxCols`` so the s2r
       // path adds ``subtile_col_off`` to the column index. K issue /

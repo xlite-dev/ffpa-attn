@@ -182,7 +182,7 @@ __device__ __forceinline__ void cp_async_qkv_g2s(
 // ``kSmemColStride`` (optional, default 0 = "natural" per-branch stride):
 // overrides the row stride and the swizzle width used by the K/V
 // branches. Set to a value > kMmaAtomK (16, 32, 64) to read from a
-// "super-tile" smem layout (TMA plan-B/C) where one TMA box holds
+// wider "super-tile" smem layout where one TMA box holds
 // ``kSmemColStride / kMmaAtomK`` consumed sub-tiles in a single wider
 // row. ``subtile_col_offset`` selects which sub-tile within that row
 // the current ldmatrix should target (0 / 16 / 32 / 48 fp16 cols).
