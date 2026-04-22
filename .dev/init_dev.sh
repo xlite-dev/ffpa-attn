@@ -1,4 +1,0 @@
-set -x
-export ENABLE_FFPA_ALL_STAGES=1
-export ENABLE_FFPA_ALL_HEADDIM=0
-set +x
