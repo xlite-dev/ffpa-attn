@@ -178,23 +178,23 @@ template <typename kDataType>
 static inline void buildExperimentalTmaDescriptors(torch::Tensor K, torch::Tensor V,
                                                    const int Nh_kv, const int Nkv,
                                                    const int kHeadDim, const int Bc,
-                                                   CUtensorMap* k_tensor_map,
+                                                   const int k_box_cols, CUtensorMap* k_tensor_map,
                                                    CUtensorMap* v_tensor_map) {
   const int total_kv_rows = K.size(0) * Nh_kv * Nkv;
+  // Plan C (K-only): switch the K TMA descriptor's box minor dim to
+  // ``k_box_cols`` (64 for SWIZZLE_128B) and the swizzle mode to match;
+  // V keeps the 16-col SWIZZLE_32B box.
+  const CUtensorMapSwizzle k_swizzle = (k_box_cols == 64)   ? CU_TENSOR_MAP_SWIZZLE_128B
+                                       : (k_box_cols == 32) ? CU_TENSOR_MAP_SWIZZLE_64B
+                                                            : CU_TENSOR_MAP_SWIZZLE_32B;
   *k_tensor_map = tma::make_2d_copy_desc<kDataType>({
       reinterpret_cast<kDataType*>(K.data_ptr()),
       static_cast<uint64_t>(kHeadDim),
       static_cast<uint64_t>(total_kv_rows),
       static_cast<uint64_t>(sizeof(kDataType) * kHeadDim),
-      16u,
+      static_cast<uint32_t>(k_box_cols),
       static_cast<uint32_t>(Bc),
-      // Plan A: TMA writes directly into the existing kPad==0 XOR-swizzled
-      // K/V slot. For 16 fp16 (32B) per row, FFPA's ``swizzle::permuted<16>``
-      // formula is bit-for-bit equivalent to TMA SWIZZLE_32B (Cute
-      // ``Swizzle<1, 4, 3>``: address bit 4 XOR bit 7), so the hardware
-      // produces exactly the byte layout that the existing ldmatrix kPad==0
-      // path expects -- no scratch / repack needed.
-      CU_TENSOR_MAP_SWIZZLE_32B,
+      k_swizzle,
       CU_TENSOR_MAP_L2_PROMOTION_L2_128B,
       CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE,
   });
@@ -297,11 +297,20 @@ static constexpr int getConfigQKVSmemMaxSize() {
 
 // Plan A retired the per-stage TMA scratch buffers because TMA now writes
 // directly into the existing kPad==0 XOR-swizzled K/V destination slots.
-// The smem accounting therefore matches the cp.async fallback exactly.
+// Plan C (K-only, 2026-04-22) widens the K TMA box to 64 fp16 cols when
+// the head dim is large enough and kPadK==0; this enlarges the per-stage
+// K smem footprint relative to the cp.async path. The extra bytes are
+// reported here so the launcher's ``cudaFuncSetAttribute(... maxDynamicSm)``
+// covers the SM90 TMA kernel without changing the cp.async smem budget.
+// Must match the ``kKvBoxCols`` formula inside
+// ``ffpa_stages_split_q_large_d_sm90_template`` exactly.
 template <const int Bc, const int kMmaAtomK, const int kMmaAtomN, const int kStageQK,
-          const int kStagePV>
+          const int kStagePV, const int kHeadDim, const int kPadK, typename kDataType = __half>
 static constexpr int getExperimentalTmaSm90ScratchSize() {
-  return 0;
+  constexpr int kKvBoxCols =
+      ((kPadK == 0) && (kHeadDim % 64 == 0) && (kHeadDim >= 128)) ? 64 : kMmaAtomK;
+  constexpr int kK_extra_bytes_per_stage = Bc * (kKvBoxCols - kMmaAtomK) * sizeof(kDataType);
+  return kStageQK * kK_extra_bytes_per_stage;
 }
 
 // Host-side launcher that picks compile-time configuration (block tile,
@@ -379,7 +388,8 @@ void launch_ffpa_mma_template(torch::Tensor Q, torch::Tensor K, torch::Tensor V,
                               kPersistQg2s, kPersistQs2r, kStageQK, kStagePV, kPadQ, kPadK,
                               kPadV>();
   constexpr int kExperimentalTmaSm90ScratchSize =
-      getExperimentalTmaSm90ScratchSize<Bc, kMmaAtomK, kMmaAtomN, kStageQK, kStagePV>();
+      getExperimentalTmaSm90ScratchSize<Bc, kMmaAtomK, kMmaAtomN, kStageQK, kStagePV, kHeadDim,
+                                        kPadK, kDataType>();
 
   TORCH_CHECK(K.size(0) == Q.size(0) && V.size(0) == Q.size(0),
               "ffpa_attn: Q/K/V must share the same batch size");
@@ -433,8 +443,12 @@ void launch_ffpa_mma_template(torch::Tensor Q, torch::Tensor K, torch::Tensor V,
   if (kAttemptExperimentalTma) {
     CUtensorMap k_tensor_map{};
     CUtensorMap v_tensor_map{};
-    buildExperimentalTmaDescriptors<kDataType>(K, V, Nh_kv, Nkv, kHeadDim, Bc, &k_tensor_map,
-                                               &v_tensor_map);
+    // Plan C: K TMA box width must match the kernel's ``kKvBoxCols``
+    // formula. Same triggers (kPadK==0, kHeadDim%64==0, kHeadDim>=128).
+    constexpr int kKvBoxCols =
+        ((kPadK == 0) && (kHeadDim % 64 == 0) && (kHeadDim >= 128)) ? 64 : kMmaAtomK;
+    buildExperimentalTmaDescriptors<kDataType>(K, V, Nh_kv, Nkv, kHeadDim, Bc, kKvBoxCols,
+                                               &k_tensor_map, &v_tensor_map);
     uploadExperimentalTmaDescriptors(stream, k_tensor_map, v_tensor_map, &k_tma_desc_device,
                                      &v_tma_desc_device);
   }

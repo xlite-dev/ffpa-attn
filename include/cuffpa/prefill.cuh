@@ -178,15 +178,27 @@ __device__ __forceinline__ void cp_async_qkv_g2s(
 // (for V, emits col-major fragments consumed by P@V), or ``x4`` (for Q)
 // based on ``kTrans`` / ``kNumRegs``. SMEM addressing mirrors the g2s
 // layout (swizzle when kPad == 0, else padded).
+//
+// ``kSmemColStride`` (optional, default 0 = "natural" per-branch stride):
+// overrides the row stride and the swizzle width used by the K/V
+// branches. Set to a value > kMmaAtomK (16, 32, 64) to read from a
+// "super-tile" smem layout (TMA plan-B/C) where one TMA box holds
+// ``kSmemColStride / kMmaAtomK`` consumed sub-tiles in a single wider
+// row. ``subtile_col_offset`` selects which sub-tile within that row
+// the current ldmatrix should target (0 / 16 / 32 / 48 fp16 cols).
+// The Q branch (kNumRegs == 4) ignores both knobs.
 template <const int kTrans, const int kNumRegs, const int kTileSize, const int kMmaAtomM,
-          const int kMmaAtomN, const int kMmaAtomK, const int kPad, typename kDataType = __half>
+          const int kMmaAtomN, const int kMmaAtomK, const int kPad, typename kDataType = __half,
+          const int kSmemColStride = 0>
 __device__ __forceinline__ void sync_fetch_qkv_frags_s2r(
-    uint32_t smem_base_ptr,  // QKV smem base ptr
-    uint32_t* R,             // Register ptr, R_QKV
-    const int mma_tile_id,   // Q warp_QP 0~num MMAs, KV warp_KV 0
-    const int warp_tile_id,  // Q 0, KV 0~kValTileSeqLenK
-    const int n_tile_id,     // seqlen QK 0, V tile_V_Bc
-    const int stage) {
+    uint32_t smem_base_ptr,            // QKV smem base ptr
+    uint32_t* R,                       // Register ptr, R_QKV
+    const int mma_tile_id,             // Q warp_QP 0~num MMAs, KV warp_KV 0
+    const int warp_tile_id,            // Q 0, KV 0~kValTileSeqLenK
+    const int n_tile_id,               // seqlen QK 0, V tile_V_Bc
+    const int stage,                   // ring index into smem
+    const int subtile_col_offset = 0)  // sub-tile col base inside a wide TMA box
+{
   const int lane_id = threadIdx.x % WARP_SIZE;  // 0~31
   constexpr bool kSwizzle = (kPad == 0) ? true : false;
   if constexpr (kTrans) {
@@ -194,13 +206,15 @@ __device__ __forceinline__ void sync_fetch_qkv_frags_s2r(
     static_assert(kNumRegs == 2);
     // mma_tile_id = warp_KV == 0, warp_tile_id = (j % 2), n_tile_id = tile_V_Bc
     // warp_smem_V_d  = warp_KV * (kMmaAtomN * kValTileHeadDimV) + (j % 2) * kMmaAtomN;
+    constexpr int kVRowStride = (kSmemColStride > 0) ? kSmemColStride : (kMmaAtomN * 2);
+    constexpr int kVSwizzleW = (kSmemColStride > 0) ? kSmemColStride : (kMmaAtomN * 2);
     const int warp_smem_d = warp_tile_id * kMmaAtomN;
     const int lane_smem_Bc = n_tile_id * kMmaAtomK + lane_id % 16;
-    const int lane_smem_d = warp_smem_d;  // 0,8
+    const int lane_smem_d = subtile_col_offset + warp_smem_d;  // 0,8 (+ box subtile base)
     const uint32_t lane_smem_ptr =
         (smem_base_ptr +
-         (stage * kTileSize + lane_smem_Bc * (kMmaAtomN * 2 + kPad) +
-          (kSwizzle ? swizzle::permuted<kMmaAtomN * 2>(lane_smem_Bc, lane_smem_d) : lane_smem_d)) *
+         (stage * kTileSize + lane_smem_Bc * (kVRowStride + kPad) +
+          (kSwizzle ? swizzle::permuted<kVSwizzleW>(lane_smem_Bc, lane_smem_d) : lane_smem_d)) *
              sizeof(kDataType));
     mma::ldmatrix_m8n8x2_trans(&R[0], &R[1], lane_smem_ptr);
   } else {
@@ -222,13 +236,15 @@ __device__ __forceinline__ void sync_fetch_qkv_frags_s2r(
       // load K m8n8x2 via ldmatrix.x2
       // mma_tile_id = warp_KV == 0, warp_tile_id = j
       // warp_smem_Bc = warp_KV * (kMmaAtomN * kValTileSeqLenK) + j * kMmaAtomN;
+      constexpr int kKRowStride = (kSmemColStride > 0) ? kSmemColStride : kMmaAtomK;
+      constexpr int kKSwizzleW = (kSmemColStride > 0) ? kSmemColStride : kMmaAtomK;
       const int warp_smem_Bc = warp_tile_id * kMmaAtomN;
-      const int lane_smem_Bc = warp_smem_Bc + lane_id % 8;  // 0~7
-      const int lane_smem_d = ((lane_id / 8) % 2) * 8;      // 0,8
+      const int lane_smem_Bc = warp_smem_Bc + lane_id % 8;                   // 0~7
+      const int lane_smem_d = subtile_col_offset + ((lane_id / 8) % 2) * 8;  // 0,8 (+ box subtile)
       const uint32_t lane_smem_ptr =
           (smem_base_ptr +
-           (stage * kTileSize + lane_smem_Bc * (kMmaAtomK + kPad) +
-            (kSwizzle ? swizzle::permuted<kMmaAtomK>(lane_smem_Bc, lane_smem_d) : lane_smem_d)) *
+           (stage * kTileSize + lane_smem_Bc * (kKRowStride + kPad) +
+            (kSwizzle ? swizzle::permuted<kKSwizzleW>(lane_smem_Bc, lane_smem_d) : lane_smem_d)) *
                sizeof(kDataType));
       mma::ldmatrix_m8n8x2(&R[0], &R[1], lane_smem_ptr);
     }

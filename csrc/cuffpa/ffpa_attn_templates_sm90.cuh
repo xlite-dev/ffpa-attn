@@ -284,7 +284,20 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
   extern __shared__ __align__(1024) unsigned char ffpa_smem_raw[];
   kDataType* smem = reinterpret_cast<kDataType*>(ffpa_smem_raw);
   constexpr int Q_tile_size = Br * (kMmaAtomK + kPadQ);
-  constexpr int K_tile_size = Bc * (kMmaAtomK + kPadK);
+  // Plan C (K-only, 2026-04-22): widen the K TMA box to 64 fp16 cols
+  // (SWIZZLE_128B) when the head-dim is large enough to amortise the
+  // bigger per-stage smem footprint and when kPadK==0 so the swizzle
+  // matches ``swizzle::permuted<64>``. Each K stage now holds a single
+  // wider box that covers ``kSubtilesPerKBox = kKvBoxCols/kMmaAtomK``
+  // consumed sub-tiles. The TMA issue count per K-seqlen tile drops
+  // from ``kHeadDim/kMmaAtomK`` to ``kHeadDim/kKvBoxCols``, e.g. 32->8
+  // at D=512, the dominant TMA-engine cost on this kernel. V stays on
+  // the current 16-col box (its issue count is already half of K's and
+  // widening V doubles the V-side smem with smaller marginal payoff).
+  constexpr int kKvBoxCols =
+      ((kPadK == 0) && (kHeadDim % 64 == 0) && (kHeadDim >= 128)) ? 64 : kMmaAtomK;
+  constexpr int kSubtilesPerKBox = kKvBoxCols / kMmaAtomK;
+  constexpr int K_tile_size = Bc * (kKvBoxCols + kPadK);
   constexpr int V_tile_size = Bc * (kMmaAtomN * 2 + kPadV);
   kDataType* Q_tile_smem = smem;
   kDataType* K_tile_smem = (Q_tile_smem + (kPersistQg2s ? ((kHeadDim / kMmaAtomK) * Q_tile_size)
@@ -373,8 +386,10 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
 
   auto issue_K_tile = [&](int tile_K_seqlen, int d_tile, int dst_stage,
                           int issuer_lane = 0) -> void {
+    // d_tile is in units of ``kKvBoxCols`` (one wide TMA box per stage
+    // covering kSubtilesPerKBox consumed sub-tiles).
     K_tma_used[dst_stage] =
-        ffpa::tma::issue_load_2d_to_dst_swizzled<Bc, kHeadDim, kMmaAtomK, K_tile_size>(
+        ffpa::tma::issue_load_2d_to_dst_swizzled<Bc, kHeadDim, kKvBoxCols, K_tile_size>(
             K_tile_smem, K_tma_desc, kv_row_base + tile_K_seqlen * Bc, d_tile, dst_stage,
             K_tma_barriers[dst_stage], issuer_lane);
   };
@@ -513,26 +528,52 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
                               (kMmaAccFloat32QK) ? 4 : 2>(R_S, 0);
 #pragma unroll
     for (int tile_K_d = 0; tile_K_d < (kHeadDim / kMmaAtomK); ++tile_K_d) {
-      const int smem_sel = (tile_K_d) % kStageQK;
-      const int smem_sel_next = (tile_K_d + (kStageQK - 1)) % kStageQK;
+      // Plan C box-coordinate translation. ``box_idx`` is the K TMA
+      // box this sub-tile lives in; ``subtile_idx`` is which of the
+      // ``kSubtilesPerKBox`` consumed sub-tiles inside that box; the
+      // wider K smem layout has row stride ``kKvBoxCols`` so the s2r
+      // path adds ``subtile_col_off`` to the column index. K issue /
+      // consume happens once per box (i.e. on subtile_idx == 0); for
+      // kKvBoxCols == kMmaAtomK these all degenerate to the per-iter
+      // cadence (kSubtilesPerKBox == 1, subtile_idx always 0).
+      const int box_idx = tile_K_d / kSubtilesPerKBox;
+      const int subtile_idx = tile_K_d % kSubtilesPerKBox;
+      const int subtile_col_off = subtile_idx * kMmaAtomK;
+      const bool is_box_head = (subtile_idx == 0);
+      constexpr int kKBoxCount = kHeadDim / kKvBoxCols;
+      // K stage indices step at the box cadence (every kSubtilesPerKBox
+      // sub-tiles); Q stage indices keep the original per-sub-tile cadence
+      // because Q smem is still tiled by kMmaAtomK in d.
+      const int smem_sel = box_idx % kStageQK;
+      const int smem_sel_next = (box_idx + (kStageQK - 1)) % kStageQK;
+      const int q_smem_sel = (tile_K_d) % kStageQK;
+      const int q_smem_sel_next = (tile_K_d + (kStageQK - 1)) % kStageQK;
       // Issue K (TMA) before Q (cp.async) so the bulk-tensor request is
       // on-the-wire before the cp.async submission (overlap dispatch).
-      issue_K_tile(tile_K_seqlen, (kStageQK > 1) ? (tile_K_d + (kStageQK - 1)) : tile_K_d,
-                   (kStageQK > 1) ? smem_sel_next : smem_sel, k_issuer_lane(tile_K_d));
-      ffpa::tma::bulk_commit_group();  // K -> TMA bulk counter (mbarrier-waited)
+      // With wider K boxes we issue one TMA per box, not per sub-tile.
+      if (is_box_head) {
+        const int issue_box = (kStageQK > 1) ? (box_idx + (kStageQK - 1)) : box_idx;
+        // The OOB guard inside ``issue_load_2d_to_dst_swizzled`` skips
+        // box_idx >= kKBoxCount; but the prefetch can speculatively
+        // address beyond, so we keep the call and rely on its guard.
+        (void)kKBoxCount;
+        issue_K_tile(tile_K_seqlen, issue_box, (kStageQK > 1) ? smem_sel_next : smem_sel,
+                     k_issuer_lane(box_idx));
+        ffpa::tma::bulk_commit_group();  // K -> TMA bulk counter (mbarrier-waited)
+      }
       if constexpr (kPersistQs2r) {
         if (tile_K_seqlen == 0) {
           ffpa::prefill::cp_async_qkv_g2s<Br, Q_tile_size, kHeadDim, kMmaAtomK, kNumThreads, kPadQ>(
               smem_Q_base_ptr, Q, Q_gmem_offset, Q_tile_id,
               (kStageQK > 1) ? (tile_K_d + (kStageQK - 1)) : tile_K_d,
-              (kStageQK > 1) ? smem_sel_next : smem_sel, Nq);
+              (kStageQK > 1) ? q_smem_sel_next : q_smem_sel, Nq);
         }
       } else {
         if constexpr (!kPersistQg2s) {
           ffpa::prefill::cp_async_qkv_g2s<Br, Q_tile_size, kHeadDim, kMmaAtomK, kNumThreads, kPadQ>(
               smem_Q_base_ptr, Q, Q_gmem_offset, Q_tile_id,
               (kStageQK > 1) ? (tile_K_d + (kStageQK - 1)) : tile_K_d,
-              (kStageQK > 1) ? smem_sel_next : smem_sel, Nq);
+              (kStageQK > 1) ? q_smem_sel_next : q_smem_sel, Nq);
         }
       }
       ffpa::cp_async::commit_group();  // Q (when loaded above) -> cp.async counter
@@ -545,7 +586,11 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
       // Drain the K TMA load for the slot we are about to read via its
       // per-slot mbarrier (parity-based). bulk_commit/bulk_wait above
       // additionally provide a FIFO-coarse drain of the TMA queue.
-      consume_K_tile(smem_sel);
+      // With wider K boxes we only consume on the box head; subsequent
+      // sub-tiles inside the same box read from the already-resident slot.
+      if (is_box_head) {
+        consume_K_tile(smem_sel);
+      }
 
       static_assert(kValTileSeqLenQ == 1);
       {
@@ -553,13 +598,13 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
           if (tile_K_seqlen == 0) {
             ffpa::prefill::sync_fetch_qkv_frags_s2r<0, 4, Q_tile_size, kMmaAtomM, kMmaAtomN,
                                                     kMmaAtomK, kPadQ, kDataType>(
-                smem_Q_base_ptr, &R_Q[0][tile_K_d][0], warp_QP, 0, 0, smem_sel);
+                smem_Q_base_ptr, &R_Q[0][tile_K_d][0], warp_QP, 0, 0, q_smem_sel);
           }
         } else {
           if constexpr (!kPersistQg2s) {
             ffpa::prefill::sync_fetch_qkv_frags_s2r<0, 4, Q_tile_size, kMmaAtomM, kMmaAtomN,
                                                     kMmaAtomK, kPadQ, kDataType>(
-                smem_Q_base_ptr, &R_Q[0][0][0], warp_QP, 0, 0, smem_sel);
+                smem_Q_base_ptr, &R_Q[0][0][0], warp_QP, 0, 0, q_smem_sel);
           } else {
             ffpa::prefill::sync_fetch_qkv_frags_s2r<0, 4, Q_tile_size, kMmaAtomM, kMmaAtomN,
                                                     kMmaAtomK, kPadQ, kDataType>(
@@ -574,13 +619,13 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
 #pragma unroll
         for (int j = 0; j < kValTileSeqLenK; ++j) {
           ffpa::prefill::sync_fetch_qkv_frags_s2r<0, 2, K_tile_size, kMmaAtomM, kMmaAtomN,
-                                                  kMmaAtomK, kPadK, kDataType>(
-              smem_K_base_ptr, &R_K[j][0], warp_KV, j, 0, smem_sel);
+                                                  kMmaAtomK, kPadK, kDataType, kKvBoxCols>(
+              smem_K_base_ptr, &R_K[j][0], warp_KV, j, 0, smem_sel, subtile_col_off);
         }
       } else {
         ffpa::prefill::sync_fetch_qkv_frags_s2r<0, 2, K_tile_size, kMmaAtomM, kMmaAtomN, kMmaAtomK,
-                                                kPadK, kDataType>(
-            smem_K_base_ptr, &R_K[reg_st_idx][0], warp_KV, 0, 0, smem_sel);
+                                                kPadK, kDataType, kKvBoxCols>(
+            smem_K_base_ptr, &R_K[reg_st_idx][0], warp_KV, 0, 0, smem_sel, subtile_col_off);
       }
 
       if constexpr ((kShareSmemQKV) && kPrefetchPV && kStagePV > 1) {
@@ -606,8 +651,9 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
           if constexpr (kRegPipeKV) {
             if ((j + 1) < kValTileSeqLenK) {
               ffpa::prefill::sync_fetch_qkv_frags_s2r<0, 2, K_tile_size, kMmaAtomM, kMmaAtomN,
-                                                      kMmaAtomK, kPadK, kDataType>(
-                  smem_K_base_ptr, &R_K[reg_st_idx][0], warp_KV, (j + 1), 0, smem_sel);
+                                                      kMmaAtomK, kPadK, kDataType, kKvBoxCols>(
+                  smem_K_base_ptr, &R_K[reg_st_idx][0], warp_KV, (j + 1), 0, smem_sel,
+                  subtile_col_off);
             }
           }
           const int k_offset = (kRegPipeKV) ? reg_ld_idx : j;
