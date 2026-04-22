@@ -30,7 +30,7 @@ class ENV(object):
   # Enable all headdims for FFPA kernels or not, default False.
   # True, headdim will range from 32 to 1024 with step = 32, range(32, 1024, 32)
   # False, headdim will range from 256 to 1024 with step = 64, range(256, 1024, 64)
-  ENABLE_FFPA_ALL_HEADDIM = bool(int(os.environ.get("ENABLE_FFPA_ALL_HEADDIM", 1)))
+  ENABLE_FFPA_ALL_HEADDIM = bool(int(os.environ.get("ENABLE_FFPA_ALL_HEADDIM", 0)))
 
   # Enable force Q@K^T use fp16 as MMA Acc dtype for FFPA Acc F32 kernels, default False.
   # FFPA Acc F32 kernels MMA Acc = Mixed Q@K^T MMA Acc F16 + P@V MMA Acc F32.
