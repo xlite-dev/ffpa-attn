@@ -18,7 +18,7 @@
 </div>
 
 > [!NOTE]
-> FFPA has been tested on `Ampere`, `Ada`, `Hopper`, and `Blackwell` architectures (e.g., A30, L20, 4090, H200, 5090). For `Hopper` and `Blackwell`, it still delivers a `1.5×–2.3×↑🎉` speedup vs SDPA for large headdim `> 256`.
+> FFPA has been tested on `Ampere`, `Ada`, `Hopper`, and `Blackwell` architectures (e.g., A30, L20, 4090, H200, 5090). For `Hopper` and `Blackwell`, it still delivers a `1.5×–2.3×↑🎉` vs SDPA for headdim `> 256`.
 
 ## 📖 Quick Start
 
