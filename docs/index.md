@@ -164,8 +164,6 @@ A runnable end-to-end example (with self-attn, cross-attn, GQA and causal-attn) 
 | causal | bf16 | 8192/8192 | ✅ | 24.2 / 37.5 ms | 1.55x |
 | non-aligned | bf16 | 8191/8191 | ✅ | 12.3 / 19.0 ms | 1.55x |
 
-Env: NVIDIA L20, PyTorch 2.11, CUDA 13.0, Headdim=512 (FA-2 not supported)
-
 </div>
 
 ## 📖 Fine-grained Tiling at MMA level
