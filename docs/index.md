@@ -17,7 +17,7 @@
 </div>
 
 > [!NOTE]
-> FFPA has been tested on `Ampere, Ada, Hopper, Blackwell` architectures (e.g. `A30, RTX 3080, L20, RTX 4090, H200, RTX 5090`), the performance may not be optimal (but still get `1.5x~2.3x↑🎉` speedup compared to SDPA for large headdim `> 256`) for Hopper and Blackwell architectures since it does not yet leverage TMA and other architecture-specific optimizations for further optimization.
+> FFPA has been tested on `Ampere`, `Ada`, `Hopper`, and `Blackwell` architectures (e.g., A30, L20, 4090, H200, 5090). For `Hopper` and `Blackwell`, it still delivers a `1.5×–2.3×↑🎉` speedup over SDPA for headdim `> 256`.
 
 ## 📖 Quick Start
 
@@ -32,10 +32,11 @@ pip3 install -U ffpa-attn # (support: sm_80, sm_89, sm_90, sm_100, sm_120)
 Or, you can build [ffpa-attn](https://github.com/xlite-dev/ffpa-attn) from source (recommended: PyTorch>=2.11.0, CUDA>=13.0):
 ```bash
 git clone https://github.com/xlite-dev/ffpa-attn.git
-cd ffpa-attn && MAX_JOBS=32 && python3 setup.py bdist_wheel
-# Optional: build with ccache for faster rebuilds
+# Then, build the wheel package and install it with pip
+cd ffpa-attn && MAX_JOBS=32 python3 setup.py bdist_wheel
+# Optional: build ffpa-attn with ccache for faster rebuilds
 apt install ccache && bash tools/build_fast.sh bdist_wheel
-# Optional: for editable install, use `pip install -e .` instead.
+# Optional: for editable whl, use `pip install -e .` instead.
 pip3 install dist/ffpa_attn-*.whl # pip uninstall ffpa-attn -y
 ```
 
@@ -200,6 +201,14 @@ By leveraging this approach, we can achieve better performance than SDPA EA for 
 |✔️**QKV Fine-grained Tiling**|✔️**Shared QKV** SMEM|✔️Mixed MMA Acc|✔️**Persist Q** s2r/g2s|
 
 </div>
+
+## 🤔 Why not TMA?
+
+<div id="why-not-tma"></div>
+
+FFPA ships an experimental SM>=SM90 TMA path (`tma=True`) that replaces the K/V `cp.async` global-to-shared transfer with `cp.async.bulk.tensor.2d` + mbarriers. After tuning (K SWIZZLE_128B, 64-col TMA box, decoupled Q/K stage cadence) it reaches parity with the `cp.async` baseline on D=512, but does not beat it.
+
+The reason is structural: **FFPA's split-D dataflow is a TMA anti-pattern**. TMA wins when single thread instruction can amortise its descriptor + mbarrier + queue cost over a large box, but split-D gives it narrow `Bc` x `kMmaAtomK` slices, while `cp.async` already saturates the same bytes in parallel from all 256 threads in the CTA.
 
 ## ©️License
 

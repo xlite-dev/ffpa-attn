@@ -9,24 +9,25 @@ void ffpa_mma_acc_f32_bf16_d640(
     torch::Tensor O,
     int stages,
     int causal,
-    double softmax_scale) {
+    double softmax_scale,
+    int tma) {
   constexpr int kMmaAccFloat32QK = 1;
   constexpr int kMmaAccFloat32PV = 1;
 #ifdef ENABLE_FFPA_ALL_STAGES
   if (stages == 2) {
-    launch_ffpa_mma_template<__nv_bfloat16, 640, kMmaAccFloat32QK, kMmaAccFloat32PV, 2>(Q, K, V, O, causal, softmax_scale);
+    launch_ffpa_mma_template<__nv_bfloat16, 640, kMmaAccFloat32QK, kMmaAccFloat32PV, 2>(Q, K, V, O, causal, softmax_scale, tma);
   } else if (stages == 3) {
-    launch_ffpa_mma_template<__nv_bfloat16, 640, kMmaAccFloat32QK, kMmaAccFloat32PV, 3>(Q, K, V, O, causal, softmax_scale);
+    launch_ffpa_mma_template<__nv_bfloat16, 640, kMmaAccFloat32QK, kMmaAccFloat32PV, 3>(Q, K, V, O, causal, softmax_scale, tma);
   } else if (stages == 4) {
-    launch_ffpa_mma_template<__nv_bfloat16, 640, kMmaAccFloat32QK, kMmaAccFloat32PV, 4>(Q, K, V, O, causal, softmax_scale);
+    launch_ffpa_mma_template<__nv_bfloat16, 640, kMmaAccFloat32QK, kMmaAccFloat32PV, 4>(Q, K, V, O, causal, softmax_scale, tma);
   } else {
-    launch_ffpa_mma_template<__nv_bfloat16, 640, kMmaAccFloat32QK, kMmaAccFloat32PV, 1>(Q, K, V, O, causal, softmax_scale);
+    launch_ffpa_mma_template<__nv_bfloat16, 640, kMmaAccFloat32QK, kMmaAccFloat32PV, 1>(Q, K, V, O, causal, softmax_scale, tma);
   }
 #else
   if (stages == 2) {
-    launch_ffpa_mma_template<__nv_bfloat16, 640, kMmaAccFloat32QK, kMmaAccFloat32PV, 2>(Q, K, V, O, causal, softmax_scale);
+    launch_ffpa_mma_template<__nv_bfloat16, 640, kMmaAccFloat32QK, kMmaAccFloat32PV, 2>(Q, K, V, O, causal, softmax_scale, tma);
   } else {
-    launch_ffpa_mma_template<__nv_bfloat16, 640, kMmaAccFloat32QK, kMmaAccFloat32PV, 1>(Q, K, V, O, causal, softmax_scale);
+    launch_ffpa_mma_template<__nv_bfloat16, 640, kMmaAccFloat32QK, kMmaAccFloat32PV, 1>(Q, K, V, O, causal, softmax_scale, tma);
   }
 #endif
 }

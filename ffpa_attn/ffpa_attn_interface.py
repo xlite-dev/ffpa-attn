@@ -9,10 +9,20 @@ calling the C-extension symbol directly.
 from __future__ import annotations
 
 import math
+import warnings
 
 import torch
 
 from ._C import ffpa_attn as _ffpa_attn_cuda
+
+# The SM90 TMA large-d kernel only widens the K box to 64 fp16 cols
+# (SWIZZLE_128B) when the head dim satisfies these constraints; outside
+# this set the C++ ``ExperimentalTmaLargeDConfig::kCanAttempt`` predicate
+# is false and the SM90 TMA kernel template is never instantiated, so
+# requesting ``tma=True`` for an unsupported head dim cannot dispatch to
+# a TMA kernel anyway. Keep this check in sync with that predicate.
+_TMA_MIN_HEADDIM = 128
+_TMA_HEADDIM_ALIGN = 64
 
 # acc encoding kept in sync with csrc/pybind/ffpa_attn_api.cc::ffpa_attn.
 _ACC_F16 = 0
@@ -29,7 +39,7 @@ _OP_QUALNAME = f"{_OP_NAMESPACE}::{_OP_NAME}"
 torch.library.define(
   _OP_QUALNAME,
   "(Tensor Q, Tensor K, Tensor V, Tensor(a!) O, int stages, int acc, int causal, "
-  "float softmax_scale) -> Tensor(a!)",
+  "float softmax_scale, int tma) -> Tensor(a!)",
 )
 
 
@@ -43,8 +53,9 @@ def _ffpa_attn_impl_cuda(
   acc: int,
   causal: int,
   softmax_scale: float,
+  tma: int,
 ) -> torch.Tensor:
-  _ffpa_attn_cuda(Q, K, V, O, stages, acc, causal, softmax_scale)
+  _ffpa_attn_cuda(Q, K, V, O, stages, acc, causal, softmax_scale, tma)
   return O
 
 
@@ -58,8 +69,9 @@ def _ffpa_attn_impl_fake(
   acc: int,
   causal: int,
   softmax_scale: float,
+  tma: int,
 ) -> torch.Tensor:
-  del Q, K, V, stages, acc, causal, softmax_scale
+  del Q, K, V, stages, acc, causal, softmax_scale, tma
   return O
 
 
@@ -72,6 +84,7 @@ def ffpa_attn_func(
   softmax_scale: float | None = None,
   stages: int = 2,
   acc: str = "f32",
+  tma: bool = False,
 ) -> torch.Tensor:
   """Unified FFPA prefill attention entry.
 
@@ -109,6 +122,27 @@ def ffpa_attn_func(
   :param acc: MMA accumulator dtype. ``'f32'`` selects the fp32-acc kernel
       (required for bf16 activations); ``'f16'`` selects the fp16-acc
       kernel and is only valid for fp16 activations.
+  :param tma: When ``True``, opt in to the experimental SM90+ TMA path
+      for the large-d kernel. Defaults to ``False`` because the TMA path
+      is not currently faster than the cp.async fallback on any
+      architecture (it is kept as an opt-in for experimentation and as a
+      foundation for future warp-specialised producer/consumer work).
+      Honored only when:
+
+        * the head dim satisfies ``D >= 128 and D % 64 == 0`` (otherwise
+          the K TMA box cannot be widened to 64 fp16 cols and the SM90
+          TMA kernel template is not instantiated); requesting ``tma=True``
+          on an unsupported head dim emits a warning and silently falls
+          back to the cp.async kernel,
+        * the runtime device has compute capability >= 9.0,
+        * the environment variable ``ENABLE_FFPA_EXPERIMENTAL_TMA=1`` is
+          set,
+        * the C++ compile-time eligibility check
+          (``ExperimentalTmaLargeDConfig::kCanAttempt``: zero K/V
+          padding, multi-stage support) passes.
+
+      When any of these is not met, the launcher transparently uses the
+      architecture-agnostic ``cp.async``-based kernel.
 
   :returns: ``O``, filled with the attention output
       ``softmax(softmax_scale * QK^T) V``.
@@ -146,6 +180,25 @@ def ffpa_attn_func(
     raise ValueError(f"K and V must share the same seqlen, got Nk={K.size(2)}, Nv={V.size(2)}")
   if Q.size(3) != K.size(3) or Q.size(3) != V.size(3):
     raise ValueError("Q/K/V must share the same head dim")
+
+  # Pre-check tma eligibility on the head-dim axis. The SM90 TMA kernel
+  # only widens the K box to 64 fp16 cols when D >= 128 and D % 64 == 0;
+  # outside that set the C++ template is not instantiated, so dispatch
+  # would silently fall back. Coerce tma to False here so the user gets
+  # a single explicit warning instead of confusing 'TMA enabled but no
+  # speedup' behavior.
+  if tma:
+    head_dim = Q.size(3)
+    if head_dim < _TMA_MIN_HEADDIM or (head_dim % _TMA_HEADDIM_ALIGN) != 0:
+      warnings.warn(
+        f"ffpa_attn_func: tma=True is only supported for head_dim >= {_TMA_MIN_HEADDIM} "
+        f"and divisible by {_TMA_HEADDIM_ALIGN}, got head_dim={head_dim}; "
+        f"falling back to the cp.async kernel.",
+        RuntimeWarning,
+        stacklevel=2,
+      )
+      tma = False
+
   if causal and K.size(2) < Q.size(2):
     raise ValueError(
       f"causal=True requires Nkv >= Nq (queries are aligned to the KV tail), "
@@ -158,4 +211,6 @@ def ffpa_attn_func(
   if softmax_scale is None:
     softmax_scale = 1.0 / math.sqrt(Q.size(-1))
 
-  return torch.ops.ffpa_attn.attn(Q, K, V, O, int(stages), acc_code, int(bool(causal)), float(softmax_scale))
+  return torch.ops.ffpa_attn.attn(
+    Q, K, V, O, int(stages), acc_code, int(bool(causal)), float(softmax_scale), int(bool(tma))
+  )
