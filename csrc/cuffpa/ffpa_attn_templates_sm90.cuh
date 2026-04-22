@@ -58,6 +58,62 @@
 // happens kStageX-1 outer iterations before the consume, so a stage-N
 // TMA copy overlaps with the stage-(N-1) MMA consumption. Per-stage
 // mbarriers ensure independent stage progress.
+//
+// Why Split-D is fundamentally hostile to TMA (perf analysis 2026-04-22)
+// ----------------------------------------------------------------------
+// Empirically the TMA path is 0.66x..0.81x of the cp.async baseline on
+// SM120 across (H={32,48,64} x N={4096,8192,16384} x D=512). Worse,
+// raising kStageQK from 1->4 helps cp.async (~26 ms -> ~17 ms, 1.5x) but
+// barely moves TMA (~35 -> ~27 ms, ~1.3x and far from cp.async even at
+// stage 4). Root cause is structural, not a code bug:
+//
+//   1. FFPA's Split-D dataflow tiles the head dim by ``kMmaAtomK`` (=16
+//      fp16 = 32 B per row). Each TMA box is ``(Bc=64) x (kMmaAtomK=16)``
+//      = 2 KB; one K tile takes ``kHeadDim/kMmaAtomK = 32`` issues.
+//   2. ``cp.async.bulk.tensor`` is a SASS instruction issued through the
+//      LSU. Each issue has a fixed cost (~30..80 cycles for descriptor
+//      lookup, coordinate projection, mbarrier-tx write, queue insert)
+//      that is independent of payload size. With a 2 KB payload the
+//      fixed:transfer ratio is ~1:5, so issue rate -- not gmem bandwidth
+//      -- is the bottleneck.
+//   3. cp.async amortises this across all ``kNumThreads=256`` threads
+//      (each fires 1..2 cp.async per sub-tile, 256-way parallel). TMA
+//      fires from a SINGLE thread (current code: ``if (threadIdx.x==0)``
+//      inside ``ffpa::tma::load_2d``), serialising 32 issues per K tile
+//      onto one warp lane. This is the single largest cost.
+//   4. Stages don't help: kStageQK only deepens the in-flight queue; it
+//      does not raise the per-issue dispatch rate. Once the LSU port for
+//      thread 0 is saturated, deeper pipelines just queue further behind
+//      that one bottleneck.
+//
+// The ideal TMA shape is the opposite of Split-D's: large per-issue
+// payload (>= 16 KB) with few participating threads. cuDNN-flash and
+// FA-3 KV-TMA paths use a "super-tile" -- TMA loads e.g. 64 D-cols at
+// once (SWIZZLE_64B) while MMA still consumes 16 cols at a time, trading
+// 2..4x smem for 4..8x fewer issues. That is the planned plan-B/C path.
+//
+// For now the SM90 TMA kernel is structurally correct (16/16 unit tests
+// pass, max_abs_diff matches the cp.async noise floor) but should not
+// be promoted as the default path on SM120 until plan-B/C reduces the
+// issue count.
+//
+// Optimisations applied so far on top of the mbarrier path
+// --------------------------------------------------------
+//   * Plan A1 (this file): K-issue is dispatched BEFORE the matching Q
+//     cp.async submission in every prefetch slot and inner-loop iter, so
+//     the bulk-tensor request is on-the-wire before the cp.async commit
+//     (overlap dispatch). Negligible impact on a thread-0-bottlenecked
+//     workload but free, and required for any future multi-thread issue
+//     scheme to actually overlap with Q.
+//   * (Planned) Plan A2: spread the per-K-tile 32 TMA issues across the
+//     first 8..32 lanes of warp 0 (each lane drives a distinct d-tile,
+//     each lane calls ``barrier_arrive_tx`` for its own bytes). Should
+//     give 4..8x lower TMA issue latency without changing smem layout.
+//   * (Planned) Plan B/C: widen the K/V TMA box to 64 cols
+//     (SWIZZLE_64B + new ``permuted<32>``) or 128 cols (SWIZZLE_128B +
+//     ``permuted<64>``), reducing the issue count from 32 to 8 or 4.
+//     Requires touching ``sync_fetch_qkv_frags_s2r`` to match the new
+//     swizzle phase formula.
 // ============================================================================
 #pragma once
 
@@ -261,11 +317,27 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
   // the per-stage mbarrier (parity-based) and ``__syncthreads`` so all
   // threads see the freshly written tile before the s2r ldmatrix reads
   // start, then flips the per-slot phase bit for the next reuse.
-  auto issue_K_tile = [&](int tile_K_seqlen, int d_tile, int dst_stage) -> void {
+  //
+  // ``issuer_lane`` rotates the SASS-issuing thread across warps so the
+  // per-warp-scheduler LSU dispatch port is not single-thread bottlenecked
+  // (plan A2: each call rotates ``idx * WARP_SIZE`` modulo ``kNumThreads``,
+  // so 32 inner-loop K issues are spread across all 8 warps' lane 0). K
+  // and V use disjoint base offsets so a given inner iter's K and V
+  // issues fire from different warps and contend for different LSU
+  // schedulers.
+  constexpr int kIssuerStep = WARP_SIZE;
+  constexpr int kVIssuerOffset = (kNumThreads >= 64) ? (kNumThreads / 2) : 0;
+  auto k_issuer_lane = [](int idx) -> int { return (idx * kIssuerStep) % kNumThreads; };
+  auto v_issuer_lane = [](int idx) -> int {
+    return ((idx * kIssuerStep) + kVIssuerOffset) % kNumThreads;
+  };
+
+  auto issue_K_tile = [&](int tile_K_seqlen, int d_tile, int dst_stage,
+                          int issuer_lane = 0) -> void {
     K_tma_used[dst_stage] =
         ffpa::tma::issue_load_2d_to_dst_swizzled<Bc, kHeadDim, kMmaAtomK, K_tile_size>(
             K_tile_smem, K_tma_desc, kv_row_base + tile_K_seqlen * Bc, d_tile, dst_stage,
-            K_tma_barriers[dst_stage]);
+            K_tma_barriers[dst_stage], issuer_lane);
   };
   auto consume_K_tile = [&](int dst_stage) -> void {
     if (K_tma_used[dst_stage]) {
@@ -275,11 +347,12 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
       __syncthreads();
     }
   };
-  auto issue_V_tile = [&](int tile_K_seqlen, int d_tile, int dst_stage) -> void {
+  auto issue_V_tile = [&](int tile_K_seqlen, int d_tile, int dst_stage,
+                          int issuer_lane = 0) -> void {
     V_tma_used[dst_stage] =
         ffpa::tma::issue_load_2d_to_dst_swizzled<Bc, kHeadDim, kMmaAtomN * 2, V_tile_size>(
             V_tile_smem, V_tma_desc, kv_row_base + tile_K_seqlen * Bc, d_tile, dst_stage,
-            V_tma_barriers[dst_stage]);
+            V_tma_barriers[dst_stage], issuer_lane);
   };
   auto consume_V_tile = [&](int dst_stage) -> void {
     if (V_tma_used[dst_stage]) {
@@ -324,23 +397,24 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
 
 #pragma unroll 1
   for (int tile_K_seqlen = 0; tile_K_seqlen < Tc_eff; ++tile_K_seqlen) {
+    // K (TMA, long-latency) is dispatched FIRST in every prefetch /
+    // inner-loop slot so the bulk-tensor copy is on-the-wire before the
+    // matching Q cp.async commit; this lets the two overlap on the gmem
+    // path instead of strictly serialising K behind Q.
     if constexpr (kPrefetchQK) {
       if constexpr (kStageQK > 1) {
         if (tile_K_seqlen == 0) {
 #pragma unroll
           for (int stage = 0; stage < (kStageQK - 1); ++stage) {
+            issue_K_tile(tile_K_seqlen, stage, stage,
+                         k_issuer_lane(stage));  // TMA: dispatched first
+            ffpa::tma::bulk_commit_group();
             if constexpr (!kPersistQg2s) {
               ffpa::prefill::cp_async_qkv_g2s<Br, Q_tile_size, kHeadDim, kMmaAtomK, kNumThreads,
                                               kPadQ>(smem_Q_base_ptr, Q, Q_gmem_offset, Q_tile_id,
                                                      stage, stage, Nq);
             }
-            issue_K_tile(tile_K_seqlen, stage, stage);
-            // Q (when loaded above) -> cp.async group counter.
-            // K (TMA) -> bulk-tensor group counter; mbarrier provides
-            // per-slot wait in consume_K_tile, this is the matching
-            // coarse-group commit for downstream readability.
             ffpa::cp_async::commit_group();
-            ffpa::tma::bulk_commit_group();
           }
           ffpa::cp_async::wait_group<(kStageQK - 2)>();  // drains Q only
           __syncthreads();
@@ -353,6 +427,9 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
       if constexpr (kStageQK > 1) {
 #pragma unroll
         for (int stage = 0; stage < (kStageQK - 1); ++stage) {
+          issue_K_tile(tile_K_seqlen, stage, stage,
+                       k_issuer_lane(stage));  // TMA: dispatched first
+          ffpa::tma::bulk_commit_group();
           if constexpr (kPersistQs2r) {
             if (tile_K_seqlen == 0) {
               ffpa::prefill::cp_async_qkv_g2s<Br, Q_tile_size, kHeadDim, kMmaAtomK, kNumThreads,
@@ -366,9 +443,7 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
                                                      stage, stage, Nq);
             }
           }
-          issue_K_tile(tile_K_seqlen, stage, stage);
-          ffpa::cp_async::commit_group();  // Q -> cp.async counter
-          ffpa::tma::bulk_commit_group();  // K -> TMA bulk counter
+          ffpa::cp_async::commit_group();
         }
         ffpa::cp_async::wait_group<(kStageQK - 2)>();  // drains Q only
         __syncthreads();
@@ -389,7 +464,7 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
       if constexpr (kStagePV > 1) {
 #pragma unroll
         for (int stage = 0; stage < (kStagePV - 1); ++stage) {
-          issue_V_tile(tile_K_seqlen, stage, stage);
+          issue_V_tile(tile_K_seqlen, stage, stage, v_issuer_lane(stage));
           ffpa::tma::bulk_commit_group();
         }
       }
@@ -401,6 +476,11 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
     for (int tile_K_d = 0; tile_K_d < (kHeadDim / kMmaAtomK); ++tile_K_d) {
       const int smem_sel = (tile_K_d) % kStageQK;
       const int smem_sel_next = (tile_K_d + (kStageQK - 1)) % kStageQK;
+      // Issue K (TMA) before Q (cp.async) so the bulk-tensor request is
+      // on-the-wire before the cp.async submission (overlap dispatch).
+      issue_K_tile(tile_K_seqlen, (kStageQK > 1) ? (tile_K_d + (kStageQK - 1)) : tile_K_d,
+                   (kStageQK > 1) ? smem_sel_next : smem_sel, k_issuer_lane(tile_K_d));
+      ffpa::tma::bulk_commit_group();  // K -> TMA bulk counter (mbarrier-waited)
       if constexpr (kPersistQs2r) {
         if (tile_K_seqlen == 0) {
           ffpa::prefill::cp_async_qkv_g2s<Br, Q_tile_size, kHeadDim, kMmaAtomK, kNumThreads, kPadQ>(
@@ -416,10 +496,7 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
               (kStageQK > 1) ? smem_sel_next : smem_sel, Nq);
         }
       }
-      issue_K_tile(tile_K_seqlen, (kStageQK > 1) ? (tile_K_d + (kStageQK - 1)) : tile_K_d,
-                   (kStageQK > 1) ? smem_sel_next : smem_sel);
       ffpa::cp_async::commit_group();  // Q (when loaded above) -> cp.async counter
-      ffpa::tma::bulk_commit_group();  // K -> TMA bulk counter (mbarrier-waited)
 
       if constexpr (kStageQK <= 1) {
         ffpa::cp_async::wait_group<0>();  // drain Q
@@ -473,7 +550,7 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
           if constexpr (kStagePV > 1) {
 #pragma unroll
             for (int stage = 0; stage < (kStagePV - 1); ++stage) {
-              issue_V_tile(tile_K_seqlen, stage, stage);
+              issue_V_tile(tile_K_seqlen, stage, stage, v_issuer_lane(stage));
               ffpa::tma::bulk_commit_group();  // V is TMA, not cp.async
             }
           }
@@ -525,7 +602,7 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
       if constexpr (kStagePV > 1) {
 #pragma unroll
         for (int stage = 0; stage < (kStagePV - 1); ++stage) {
-          issue_V_tile(tile_K_seqlen, stage, stage);
+          issue_V_tile(tile_K_seqlen, stage, stage, v_issuer_lane(stage));
           ffpa::tma::bulk_commit_group();  // V is TMA, not cp.async
         }
       }
@@ -564,14 +641,15 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
       if ((tile_K_seqlen + 1) < Tc_eff) {
 #pragma unroll
         for (int stage = 0; stage < (kStageQK - 1); ++stage) {
+          issue_K_tile(tile_K_seqlen + 1, stage, stage,
+                       k_issuer_lane(stage));  // TMA: dispatched first
+          ffpa::tma::bulk_commit_group();
           if constexpr (!kPersistQs2r) {
             ffpa::prefill::cp_async_qkv_g2s<Br, Q_tile_size, kHeadDim, kMmaAtomK, kNumThreads,
                                             kPadQ>(smem_Q_base_ptr, Q, Q_gmem_offset, Q_tile_id,
                                                    stage, stage, Nq);
           }
-          issue_K_tile(tile_K_seqlen + 1, stage, stage);
-          ffpa::cp_async::commit_group();  // Q -> cp.async
-          ffpa::tma::bulk_commit_group();  // K -> TMA bulk
+          ffpa::cp_async::commit_group();
         }
       }
     }
@@ -591,7 +669,7 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
         const int smem_sel_v_next = (tile_V_d + (kStagePV - 1)) % kStagePV;
         if (j % 2 == 0) {
           issue_V_tile(tile_K_seqlen, (kStagePV > 1) ? (tile_V_d + (kStagePV - 1)) : tile_V_d,
-                       (kStagePV > 1) ? smem_sel_v_next : smem_sel_v);
+                       (kStagePV > 1) ? smem_sel_v_next : smem_sel_v, v_issuer_lane(tile_V_d));
           ffpa::tma::bulk_commit_group();  // V is TMA, not cp.async
           if constexpr (kStagePV <= 1) {
             ffpa::tma::bulk_wait_group<0>();
@@ -623,14 +701,15 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
               if constexpr (kStageQK > 1) {
 #pragma unroll
                 for (int stage = 0; stage < (kStageQK - 1); ++stage) {
+                  issue_K_tile(tile_K_seqlen + 1, stage, stage,
+                               k_issuer_lane(stage));  // TMA: dispatched first
+                  ffpa::tma::bulk_commit_group();
                   if constexpr (!kPersistQs2r) {
                     ffpa::prefill::cp_async_qkv_g2s<Br, Q_tile_size, kHeadDim, kMmaAtomK,
                                                     kNumThreads, kPadQ>(
                         smem_Q_base_ptr, Q, Q_gmem_offset, Q_tile_id, stage, stage, Nq);
                   }
-                  issue_K_tile(tile_K_seqlen + 1, stage, stage);
-                  ffpa::cp_async::commit_group();  // Q -> cp.async
-                  ffpa::tma::bulk_commit_group();  // K -> TMA bulk
+                  ffpa::cp_async::commit_group();
                 }
               }
             }

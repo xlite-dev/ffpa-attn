@@ -154,10 +154,18 @@ __device__ __forceinline__ void bulk_wait_group() {
   asm volatile("cp.async.bulk.wait_group %0;\n" ::"n"(n));
 }
 
+// Issue a TMA bulk-tensor copy + arrive_tx on the given barrier from
+// ``issuer_lane`` (default 0). Spreading the issuer across different
+// lanes / warps splits the per-warp-scheduler LSU dispatch port so that
+// multiple in-flight issues can be queued in parallel by the hardware
+// instead of strictly serialising on warp-0 lane-0. The destination
+// smem and barrier slots are still distinct per call (the kernel rotates
+// stage / d_tile), so multi-issuer is safe; only the SASS dispatcher
+// changes.
 __device__ __forceinline__ void load_2d(void* smem_ptr, const CUtensorMap* tensor_map,
                                         int32_t minor_coord, int32_t major_coord,
-                                        barrier_t& barrier, uint32_t bytes) {
-  if (threadIdx.x == 0) {
+                                        barrier_t& barrier, uint32_t bytes, int issuer_lane = 0) {
+  if (static_cast<int>(threadIdx.x) == issuer_lane) {
     cde::cp_async_bulk_tensor_2d_global_to_shared(smem_ptr, tensor_map, minor_coord, major_coord,
                                                   barrier);
     [[maybe_unused]] auto token = cuda::device::barrier_arrive_tx(barrier, 1, bytes);
@@ -185,13 +193,13 @@ __device__ __forceinline__ void load_2d(void* smem_ptr, const CUtensorMap* tenso
 template <const int BrOrBc, const int kHeadDim, const int kCols, const int kTileSize, typename T>
 __device__ __forceinline__ bool issue_load_2d_to_dst_swizzled(
     T* dst_smem_base_ptr, const CUtensorMap* tensor_map, const int major_coord, const int d_tile_id,
-    const int dst_stage, barrier_t& barrier) {
+    const int dst_stage, barrier_t& barrier, int issuer_lane = 0) {
   if (tensor_map == nullptr || d_tile_id >= (kHeadDim / kCols)) {
     return false;
   }
   T* dst_stage_ptr = dst_smem_base_ptr + dst_stage * kTileSize;
   load_2d(dst_stage_ptr, tensor_map, d_tile_id * kCols, major_coord, barrier,
-          BrOrBc * kCols * sizeof(T));
+          BrOrBc * kCols * sizeof(T), issuer_lane);
   return true;
 }
 
@@ -291,25 +299,27 @@ __device__ __forceinline__ void bulk_wait_group() {}
 
 __device__ __forceinline__ void load_2d(void* smem_ptr, const CUtensorMap* tensor_map,
                                         int32_t minor_coord, int32_t major_coord,
-                                        barrier_t& barrier, uint32_t bytes) {
+                                        barrier_t& barrier, uint32_t bytes, int issuer_lane = 0) {
   (void)smem_ptr;
   (void)tensor_map;
   (void)minor_coord;
   (void)major_coord;
   (void)barrier;
   (void)bytes;
+  (void)issuer_lane;
 }
 
 template <const int BrOrBc, const int kHeadDim, const int kCols, const int kTileSize, typename T>
 __device__ __forceinline__ bool issue_load_2d_to_dst_swizzled(
     T* dst_smem_base_ptr, const CUtensorMap* tensor_map, const int major_coord, const int d_tile_id,
-    const int dst_stage, barrier_t& barrier) {
+    const int dst_stage, barrier_t& barrier, int issuer_lane = 0) {
   (void)dst_smem_base_ptr;
   (void)tensor_map;
   (void)major_coord;
   (void)d_tile_id;
   (void)dst_stage;
   (void)barrier;
+  (void)issuer_lane;
   return false;
 }
 
