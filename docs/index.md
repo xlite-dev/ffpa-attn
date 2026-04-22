@@ -32,10 +32,11 @@ pip3 install -U ffpa-attn # (support: sm_80, sm_89, sm_90, sm_100, sm_120)
 Or, you can build [ffpa-attn](https://github.com/xlite-dev/ffpa-attn) from source (recommended: PyTorch>=2.11.0, CUDA>=13.0):
 ```bash
 git clone https://github.com/xlite-dev/ffpa-attn.git
+# Then, build the wheel package and install it with pip
 cd ffpa-attn && MAX_JOBS=32 python3 setup.py bdist_wheel
-# Optional: build with ccache for faster rebuilds
+# Optional: build ffpa-attn with ccache for faster rebuilds
 apt install ccache && bash tools/build_fast.sh bdist_wheel
-# Optional: for editable install, use `pip install -e .` instead.
+# Optional: for editable whl, use `pip install -e .` instead.
 pip3 install dist/ffpa_attn-*.whl # pip uninstall ffpa-attn -y
 ```
 
