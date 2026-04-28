@@ -204,15 +204,15 @@ By leveraging this approach, we can achieve better performance than SDPA EA for 
 
 </div>
 
-<!---
 ## 🤔 Why not TMA?
 
 <div id="why-not-tma"></div>
 
-FFPA ships an experimental SM>=SM90 TMA path (`tma=True`) that replaces the K/V `cp.async` global-to-shared transfer with `cp.async.bulk.tensor.2d` + mbarriers. After tuning (K SWIZZLE_128B, 64-col TMA box, decoupled Q/K stage cadence) it reaches parity with the `cp.async` baseline on D=512, but does not beat it.
+FFPA ships an experimental SM>=SM90 TMA path (**tma=True**) that replaces the K/V **cp.async** global-to-shared transfer with **cp.async.bulk.tensor.2d** + mbarriers. After tuning (K SWIZZLE_128B, 64-col TMA box, decoupled Q/K stage cadence) it reaches parity with the **cp.async** baseline on D=512, but does not beat it.
 
-The reason is structural: **FFPA's split-D dataflow is a TMA anti-pattern**. TMA wins when single thread instruction can amortise its descriptor + mbarrier + queue cost over a large box, but split-D gives it narrow `Bc` x `kMmaAtomK` slices, while `cp.async` already saturates the same bytes in parallel from all 256 threads in the CTA.
--->
+The reason is structural: **FFPA's Split-D dataflow is a TMA anti-pattern**. TMA wins when single thread instruction can amortise its descriptor + mbarrier + queue cost over a large box, but split-D gives it narrow **Bc** x **kMmaAtomK** slices, while **cp.async** already saturates the same bytes in parallel from all 256 threads in the CTA.
+
+Closing the gap further would require a major redesign (**super-tiled Q/K/V on TMA** + **warp-specialized** producer/consumer), rather than a drop-in K/V replacement.
 
 ## ©️License
 
