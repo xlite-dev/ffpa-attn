@@ -212,7 +212,7 @@ FFPA ships an experimental SM>=SM90 TMA path (**tma=True**) that replaces the K/
 
 The reason is structural: **FFPA's Split-D dataflow is a TMA anti-pattern**. TMA wins when single thread instruction can amortise its descriptor + mbarrier + queue cost over a large box, but split-D gives it narrow **Bc** x **kMmaAtomK** slices, while **cp.async** already saturates the same bytes in parallel from all 256 threads in the CTA.
 
-Closing the gap further would require a major redesign (**super-tiled Q/K/V on TMA** + **warp-specialized** producer/consumer), rather than a drop-in K/V replacement.
+Closing the gap further would require a major redesign (**super-tiled QKV on TMA** + **warp-specialized** producer/consumer), rather than a drop-in K/V replacement.
 
 ## ©️License
 
