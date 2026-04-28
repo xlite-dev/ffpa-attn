@@ -23,7 +23,7 @@
 
 <a id="install"></a>
 
-First, install the prebuilt package from [PyPI](https://pypi.org/project/ffpa-attn/) (required: PyTorch>=2.11.0, CUDA>=13.0):
+First, install the prebuilt package from [PyPI](https://pypi.org/project/ffpa-attn/) (required: PyTorch>=2.11.0, CUDA>=13.0, Ubuntu>=22.04):
 
 ```bash
 pip3 install -U ffpa-attn # (support: sm_80, sm_89, sm_90, sm_100, sm_120)
