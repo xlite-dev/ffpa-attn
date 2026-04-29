@@ -177,9 +177,10 @@ template <typename kDataType, const int kHeadDim, const int kMmaAtomM, const int
 __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
     ffpa_stages_split_q_large_d_sm90_template(
         const kDataType* __restrict__ Q, const kDataType* __restrict__ K,
-        const kDataType* __restrict__ V, kDataType* __restrict__ O, const int Nq, const int Nkv,
-        const int Nh, const int Nh_kv, const float scale, const int Tc, const int causal,
-        const CUtensorMap* __restrict__ K_tma_desc, const CUtensorMap* __restrict__ V_tma_desc) {
+        const kDataType* __restrict__ V, kDataType* __restrict__ O, float* __restrict__ softmax_lse,
+        const int Nq, const int Nkv, const int Nh, const int Nh_kv, const float scale, const int Tc,
+        const int causal, const CUtensorMap* __restrict__ K_tma_desc,
+        const CUtensorMap* __restrict__ V_tma_desc) {
   ffpa::prefill::check_large_d_compiling_states<
       kHeadDim, kMmaAtomM, kMmaAtomN, kMmaAtomK, kMmaTileSeqLenQ, kMmaTileSeqLenK, kMmaTileSeqLenP,
       kMmaTileHeadDimV, kValTileSeqLenQ, kValTileSeqLenK, kValTileSeqLenP, kValTileHeadDimV,
@@ -817,4 +818,9 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
   ffpa::prefill::sync_store_o_r2g<Br, kHeadDim, kMmaAtomM, kMmaAtomN, kValTileHeadDimV,
                                   kOStorageAccFloat32, kDataType>(
       O, O_gmem_offset, O_tile_id, warp_QP, &R_D[0][0][0], &R_Q[0][0][0], &R_K[0][0], Nq);
+
+  const int softmax_lse_offset = Nb_id * Nh * Nq + Nh_id * Nq;
+  ffpa::prefill::sync_store_lse_r2g<Br, kMmaAtomM, kValTileSeqLenQ>(
+      softmax_lse, softmax_lse_offset, O_tile_id, warp_QP, &lane_block_row_max_old[0][0],
+      &lane_block_row_sum_old[0][0], Nq);
 }

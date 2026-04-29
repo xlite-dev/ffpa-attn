@@ -91,7 +91,8 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
     ffpa_stages_split_q_large_d_template(const kDataType* __restrict__ Q,
                                          const kDataType* __restrict__ K,
                                          const kDataType* __restrict__ V, kDataType* __restrict__ O,
-                                         const int Nq, const int Nkv, const int Nh, const int Nh_kv,
+                                         float* __restrict__ softmax_lse, const int Nq,
+                                         const int Nkv, const int Nh, const int Nh_kv,
                                          const float scale, const int Tc, const int causal) {
   ffpa::prefill::check_large_d_compiling_states<
       kHeadDim, kMmaAtomM, kMmaAtomN, kMmaAtomK, kMmaTileSeqLenQ, kMmaTileSeqLenK, kMmaTileSeqLenP,
@@ -672,6 +673,13 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
   ffpa::prefill::sync_store_o_r2g<Br, kHeadDim, kMmaAtomM, kMmaAtomN, kValTileHeadDimV,
                                   kOStorageAccFloat32, kDataType>(
       O, O_gmem_offset, O_tile_id, warp_QP, &R_D[0][0][0], &R_Q[0][0][0], &R_K[0][0], Nq);
+
+  // Store softmax LSE: LSE = log(row_sum) + row_max, written per-row to the
+  // [B, Nh, Nq] float32 buffer.
+  const int softmax_lse_offset = Nb_id * Nh * Nq + Nh_id * Nq;
+  ffpa::prefill::sync_store_lse_r2g<Br, kMmaAtomM, kValTileSeqLenQ>(
+      softmax_lse, softmax_lse_offset, O_tile_id, warp_QP, &lane_block_row_max_old[0][0],
+      &lane_block_row_sum_old[0][0], Nq);
 }
 
 // ============================================================================
@@ -751,7 +759,8 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
     ffpa_stages_split_q_small_d_template(const kDataType* __restrict__ Q,
                                          const kDataType* __restrict__ K,
                                          const kDataType* __restrict__ V, kDataType* __restrict__ O,
-                                         const int Nq, const int Nkv, const int Nh, const int Nh_kv,
+                                         float* __restrict__ softmax_lse, const int Nq,
+                                         const int Nkv, const int Nh, const int Nh_kv,
                                          const float scale, const int Tc, const int causal) {
   // NOTE: This kernel template is developed for small head dimensions (d <= 128),
   // namely, flash-attention-2. Always persist QKV for flash-attn, apply tiling at
@@ -1184,4 +1193,9 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
   ffpa::prefill::sync_store_o_r2g<Br, kHeadDim, kMmaAtomM, kMmaAtomN, kValTileHeadDimV,
                                   kOStorageAccFloat32, kDataType>(
       O, O_gmem_offset, O_tile_id, warp_QP, &R_D[0][0][0], &R_Q[0][0][0], &R_K[0][0], Nq);
+
+  const int softmax_lse_offset = Nb_id * Nh * Nq + Nh_id * Nq;
+  ffpa::prefill::sync_store_lse_r2g<Br, kMmaAtomM, kValTileSeqLenQ>(
+      softmax_lse, softmax_lse_offset, O_tile_id, warp_QP, &lane_block_row_max_old[0][0],
+      &lane_block_row_sum_old[0][0], Nq);
 }

@@ -8,11 +8,14 @@
 // kept private to this TU and are the only routes through which the
 // heavy templated kernel specializations are reached.
 void ffpa_mma_acc_f16_fp16(torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O,
-                           int stages, int causal, double softmax_scale, int tma);
+                           torch::Tensor softmax_lse, int stages, int causal, double softmax_scale,
+                           int tma);
 void ffpa_mma_acc_f32_fp16(torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O,
-                           int stages, int causal, double softmax_scale, int tma);
+                           torch::Tensor softmax_lse, int stages, int causal, double softmax_scale,
+                           int tma);
 void ffpa_mma_acc_f32_bf16(torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O,
-                           int stages, int causal, double softmax_scale, int tma);
+                           torch::Tensor softmax_lse, int stages, int causal, double softmax_scale,
+                           int tma);
 
 // Public unified pybind entry. ``acc`` encoding:
 //   0 -> fp16 MMA accumulator (only valid for fp16 activations).
@@ -24,18 +27,31 @@ void ffpa_mma_acc_f32_bf16(torch::Tensor Q, torch::Tensor K, torch::Tensor V, to
 // defaults it to ``1 / sqrt(D)`` when unset.
 // ``tma`` (0/1) opts in to the experimental SM90 TMA path (only honored
 // when running on a SM90+ device with eligible compile-time config).
-void ffpa_attn(torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O, int64_t stages,
-               int64_t acc, int64_t causal, double softmax_scale, int64_t tma) {
+// ``softmax_lse`` receives the log-sum-exp values, layout [B, Nh_q, Nq]
+// float32.  When the tensor is empty (numel() == 0), it is auto-allocated
+// and written in-place; the Python wrapper should pre-allocate it.
+void ffpa_attn(torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O,
+               torch::Tensor softmax_lse, int64_t stages, int64_t acc, int64_t causal,
+               double softmax_scale, int64_t tma) {
   const auto dtype = Q.scalar_type();
   const int stages_i = static_cast<int>(stages);
   const int causal_i = static_cast<int>(causal);
   const int tma_i = static_cast<int>(tma);
 
+  // Auto-allocate softmax_lse if the caller passed an empty tensor.
+  if (softmax_lse.numel() == 0) {
+    const int B = Q.size(0);
+    const int Nh_q = Q.size(1);
+    const int Nq = Q.size(2);
+    softmax_lse = torch::empty({B, Nh_q, Nq},
+                               torch::TensorOptions().dtype(torch::kFloat32).device(Q.device()));
+  }
+
   if (dtype == torch::kHalf) {
     if (acc == 0) {
-      ffpa_mma_acc_f16_fp16(Q, K, V, O, stages_i, causal_i, softmax_scale, tma_i);
+      ffpa_mma_acc_f16_fp16(Q, K, V, O, softmax_lse, stages_i, causal_i, softmax_scale, tma_i);
     } else if (acc == 1) {
-      ffpa_mma_acc_f32_fp16(Q, K, V, O, stages_i, causal_i, softmax_scale, tma_i);
+      ffpa_mma_acc_f32_fp16(Q, K, V, O, softmax_lse, stages_i, causal_i, softmax_scale, tma_i);
     } else {
       throw std::invalid_argument("ffpa_attn: acc must be 0 (f16) or 1 (f32)");
     }
@@ -45,7 +61,7 @@ void ffpa_attn(torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor 
           "ffpa_attn: bf16 activations require acc=1 (f32); "
           "no bf16-acc mma PTX exists.");
     }
-    ffpa_mma_acc_f32_bf16(Q, K, V, O, stages_i, causal_i, softmax_scale, tma_i);
+    ffpa_mma_acc_f32_bf16(Q, K, V, O, softmax_lse, stages_i, causal_i, softmax_scale, tma_i);
   } else {
     throw std::invalid_argument("ffpa_attn: Q.dtype must be torch.float16 or torch.bfloat16");
   }
@@ -53,5 +69,6 @@ void ffpa_attn(torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor 
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("ffpa_attn", &ffpa_attn,
-        "FFPA unified prefill attention dispatch (fp16/bf16, acc=f16/f32, causal, softmax_scale)");
+        "FFPA unified prefill attention dispatch (fp16/bf16, acc=f16/f32, causal, softmax_scale, "
+        "outputs softmax_lse [B, Nh_q, Nq] float32)");
 }

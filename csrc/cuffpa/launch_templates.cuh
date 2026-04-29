@@ -347,7 +347,8 @@ static constexpr int getExperimentalTmaSm90ScratchSize() {
 template <typename kDataType, const int kHeadDim, const int kMmaAccFloat32QK,
           const int kMmaAccFloat32PV, const int kStage>
 void launch_ffpa_mma_template(torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O,
-                              int causal, double softmax_scale, int tma) {
+                              torch::Tensor softmax_lse, int causal, double softmax_scale,
+                              int tma) {
   // Q,K,V,O with [B, H, N, D] layout, B=batch, H=head, N=seqlen, D=dim
   // TODO: support BNHD layout, Q,K,V,O with [B, N, H, D] layout.
   constexpr int kMmaAtomM = 16;
@@ -420,6 +421,7 @@ void launch_ffpa_mma_template(torch::Tensor Q, torch::Tensor K, torch::Tensor V,
   const dim3 grid = getConfigGrid<Br>(Nb, Nh, Nq);
   const int Tc = utils::div_ceil(Nkv, Bc);  // Tc K_tile[Bc,d]
   const float scale = static_cast<float>(softmax_scale);
+  float* softmax_lse_ptr = softmax_lse.data_ptr<float>();
 
   // Eligibility for the SM90 TMA path requires the user to opt in via the
   // ``tma`` runtime flag, AND the compile-time config to be eligible, AND
@@ -454,22 +456,23 @@ void launch_ffpa_mma_template(torch::Tensor Q, torch::Tensor K, torch::Tensor V,
   }
 
   // Fallback launch macro: original kernel signature (unchanged).
-#define LAUNCH_TEMPLATE_FUNC_BASE(TEMPLATE_FUNC)                                                  \
-  cudaFuncSetAttribute(TEMPLATE_FUNC, cudaFuncAttributeMaxDynamicSharedMemorySize,                \
-                       smem_size_base);                                                           \
-  TEMPLATE_FUNC<<<grid, block, smem_size_base, stream>>>(                                         \
-      reinterpret_cast<kDataType*>(Q.data_ptr()), reinterpret_cast<kDataType*>(K.data_ptr()),     \
-      reinterpret_cast<kDataType*>(V.data_ptr()), reinterpret_cast<kDataType*>(O.data_ptr()), Nq, \
-      Nkv, Nh, Nh_kv, scale, Tc, causal);
+#define LAUNCH_TEMPLATE_FUNC_BASE(TEMPLATE_FUNC)                                              \
+  cudaFuncSetAttribute(TEMPLATE_FUNC, cudaFuncAttributeMaxDynamicSharedMemorySize,            \
+                       smem_size_base);                                                       \
+  TEMPLATE_FUNC<<<grid, block, smem_size_base, stream>>>(                                     \
+      reinterpret_cast<kDataType*>(Q.data_ptr()), reinterpret_cast<kDataType*>(K.data_ptr()), \
+      reinterpret_cast<kDataType*>(V.data_ptr()), reinterpret_cast<kDataType*>(O.data_ptr()), \
+      softmax_lse_ptr, Nq, Nkv, Nh, Nh_kv, scale, Tc, causal);
 
   // SM90 launch macro: extended signature with K/V TMA descriptors.
-#define LAUNCH_TEMPLATE_FUNC_SM90(TEMPLATE_FUNC)                                                  \
-  cudaFuncSetAttribute(TEMPLATE_FUNC, cudaFuncAttributeMaxDynamicSharedMemorySize,                \
-                       smem_size_sm90);                                                           \
-  TEMPLATE_FUNC<<<grid, block, smem_size_sm90, stream>>>(                                         \
-      reinterpret_cast<kDataType*>(Q.data_ptr()), reinterpret_cast<kDataType*>(K.data_ptr()),     \
-      reinterpret_cast<kDataType*>(V.data_ptr()), reinterpret_cast<kDataType*>(O.data_ptr()), Nq, \
-      Nkv, Nh, Nh_kv, scale, Tc, causal, k_tma_desc_device, v_tma_desc_device);
+#define LAUNCH_TEMPLATE_FUNC_SM90(TEMPLATE_FUNC)                                              \
+  cudaFuncSetAttribute(TEMPLATE_FUNC, cudaFuncAttributeMaxDynamicSharedMemorySize,            \
+                       smem_size_sm90);                                                       \
+  TEMPLATE_FUNC<<<grid, block, smem_size_sm90, stream>>>(                                     \
+      reinterpret_cast<kDataType*>(Q.data_ptr()), reinterpret_cast<kDataType*>(K.data_ptr()), \
+      reinterpret_cast<kDataType*>(V.data_ptr()), reinterpret_cast<kDataType*>(O.data_ptr()), \
+      softmax_lse_ptr, Nq, Nkv, Nh, Nh_kv, scale, Tc, causal, k_tma_desc_device,              \
+      v_tma_desc_device);
 
   // Effective config flags applied for the large-d kernel selection. The
   // SM90 TMA kernel and the fallback kernel must be parameterised
