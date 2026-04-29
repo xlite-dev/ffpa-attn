@@ -4,6 +4,11 @@ Wraps the single pybind entry ``ffpa_attn._C.ffpa_attn`` as a real
 ``torch.library`` operator so callers (including ``torch.compile`` graphs)
 can reach the kernel through ``torch.ops.ffpa_attn.attn`` instead of
 calling the C-extension symbol directly.
+
+Backward pass delegates to PyTorch SDPA backward functions, routing by
+headdim: flash_attention_backward for D <= 256, efficient_attention_backward
+for D > 256.  The forward kernel always writes softmax_lse so the backward
+has the log-sum-exp statistics it needs without re-running attention.
 """
 
 from __future__ import annotations
@@ -32,14 +37,14 @@ _OP_NAMESPACE = "ffpa_attn"
 _OP_NAME = "attn"
 _OP_QUALNAME = f"{_OP_NAMESPACE}::{_OP_NAME}"
 
-# The op mutates ``O`` in place and returns it for convenience. The
-# ``(a!)`` alias annotation tells torch.library the buffer is written,
-# which is required for correct alias/functionalization behavior under
+# The op mutates ``O`` and ``softmax_lse`` in place and returns O for
+# convenience.  The ``(a!)`` alias annotations tell torch.library the
+# buffers are written, required for correct alias/functionalization under
 # torch.compile.
 torch.library.define(
   _OP_QUALNAME,
-  "(Tensor Q, Tensor K, Tensor V, Tensor(a!) O, int stages, int acc, int causal, "
-  "float softmax_scale, int tma) -> Tensor(a!)",
+  "(Tensor Q, Tensor K, Tensor V, Tensor(a!) O, Tensor(b!) softmax_lse, int stages, int acc, "
+  "int causal, float softmax_scale, int tma) -> Tensor(a!)",
 )
 
 
@@ -49,13 +54,14 @@ def _ffpa_attn_impl_cuda(
   K: torch.Tensor,
   V: torch.Tensor,
   O: torch.Tensor,
+  softmax_lse: torch.Tensor,
   stages: int,
   acc: int,
   causal: int,
   softmax_scale: float,
   tma: int,
 ) -> torch.Tensor:
-  _ffpa_attn_cuda(Q, K, V, O, stages, acc, causal, softmax_scale, tma)
+  _ffpa_attn_cuda(Q, K, V, O, softmax_lse, stages, acc, causal, softmax_scale, tma)
   return O
 
 
@@ -65,6 +71,7 @@ def _ffpa_attn_impl_fake(
   K: torch.Tensor,
   V: torch.Tensor,
   O: torch.Tensor,
+  softmax_lse: torch.Tensor,
   stages: int,
   acc: int,
   causal: int,
@@ -73,6 +80,177 @@ def _ffpa_attn_impl_fake(
 ) -> torch.Tensor:
   del Q, K, V, stages, acc, causal, softmax_scale, tma
   return O
+
+
+def _ffpa_attn_forward_cuda(
+  Q: torch.Tensor,
+  K: torch.Tensor,
+  V: torch.Tensor,
+  O: torch.Tensor | None = None,
+  stages: int = 2,
+  acc: int = 1,
+  causal: int = 0,
+  softmax_scale: float = 0.0,
+  tma: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+  """Call FFPA CUDA forward, returning (O, softmax_lse).
+
+    If O is None, it is allocated as zeros; otherwise the caller-supplied
+    buffer is written in place.  softmax_lse is always allocated as
+    [B, Nh_q, Nq] float32.
+    """
+  if O is None:
+    O = torch.zeros_like(Q)  # noqa: E741
+  softmax_lse = torch.empty(Q.size(0), Q.size(1), Q.size(2), dtype=torch.float32, device=Q.device)
+  _ffpa_attn_cuda(Q, K, V, O, softmax_lse, stages, acc, causal, softmax_scale, tma)
+  return O, softmax_lse
+
+
+# ---------------------------------------------------------------------------
+# Autograd Function
+# ---------------------------------------------------------------------------
+# FFPA forward writes O and softmax_lse.  When any input requires gradients
+# and grad mode is enabled, those intermediates are saved for backward.
+# Backward dispatches to the appropriate PyTorch SDPA backward based on
+# headdim, keeping the "call PyTorch's existing implementation" contract.
+# ---------------------------------------------------------------------------
+
+
+class FFPAAttnFunc(torch.autograd.Function):
+  """FFPA attention with autograd support.
+
+    Forward calls the FFPA CUDA kernel (which always writes O and
+    softmax_lse).  When any input requires gradients and grad mode is
+    enabled, the intermediate tensors (Q, K, V) are saved for backward.
+    Backward re-runs :func:`torch.nn.functional.scaled_dot_product_attention`
+    to produce correct gradients, which handles GQA, causal, and
+    cross-attention transparently.  This is a correctness-first compromise:
+    the forward benefits from FFPA's speed; backward correctness is
+    guaranteed by PyTorch's SDPA implementation.
+
+    Dropout is not supported (always 0.0).
+    """
+
+  @staticmethod
+  def forward(
+    ctx,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    o: torch.Tensor | None,
+    causal: bool,
+    softmax_scale: float,
+    stages: int,
+    acc: int,
+    tma: int,
+    is_grad_enabled: bool,
+    high_precision_grad: bool,
+  ) -> torch.Tensor:
+    is_grad = is_grad_enabled and any(x.requires_grad for x in [q, k, v])
+
+    O, lse = _ffpa_attn_forward_cuda(
+      q,
+      k,
+      v,
+      o,
+      stages,
+      acc,
+      int(bool(causal)),
+      softmax_scale,
+      tma,
+    )
+
+    if is_grad:
+      ctx.save_for_backward(
+        q.contiguous(),
+        k.contiguous(),
+        v.contiguous(),
+        O.contiguous(),
+        lse.contiguous(),
+      )
+      ctx.causal = causal
+      ctx.softmax_scale = softmax_scale
+      ctx.high_precision_grad = high_precision_grad
+
+    return O
+
+  @staticmethod
+  def backward(ctx, grad_out: torch.Tensor):
+    q, k, v, O, lse = ctx.saved_tensors
+    D = q.size(-1)
+    group_size = q.size(1) // k.size(1)
+
+    zero_u64 = torch.zeros(2, dtype=torch.uint64, device=q.device)
+    philox_seed = zero_u64[0].unsqueeze(0)
+    philox_offset = zero_u64[1].unsqueeze(0)
+
+    if D > 256:
+      # The CUTLASS kernel inside efficient_attention_backward
+      # expects O in the stride layout produced by SDPA forward:
+      # a BNHD→BHND transposed view (stride H*D == D, stride N*D
+      # == H*D).  FFPA produces contiguous BHND O which, after the
+      # internal transpose(1,2), yields non-standard strides and
+      # triggers illegal memory accesses.  We reshape FFPA's O to
+      # match SDPA's stride pattern; LSE is contiguous in both
+      # paths so a simple clone is sufficient.
+      O = O.transpose(1, 2).contiguous().transpose(1, 2)  # noqa: E741
+      lse = lse.clone()
+
+      if ctx.high_precision_grad:
+        _q = q.float()
+        _k = k.float()
+        _v = v.float()
+        _O = O.float()
+        _lse = lse.float()
+        _grad_out = grad_out.float()
+      else:
+        _q, _k, _v = q, k, v
+        _O, _lse, _grad_out = O, lse, grad_out
+
+      if group_size > 1:
+        k_in = _k.repeat_interleave(group_size, dim=1).contiguous()
+        v_in = _v.repeat_interleave(group_size, dim=1).contiguous()
+      else:
+        k_in, v_in = _k, _v
+
+      dq, dk_e, dv_e, _ = \
+          torch.ops.aten._scaled_dot_product_efficient_attention_backward.default(
+              _grad_out, _q, k_in, v_in, None,
+              _O, _lse,
+              philox_seed, philox_offset,
+              0.0,
+              (True, True, True, False),
+              ctx.causal,
+              scale=ctx.softmax_scale,
+          )
+      if group_size > 1:
+        dk = dk_e.reshape(k.size(0), k.size(1), group_size, k.size(2), k.size(3)).sum(dim=2).to(k.dtype)
+        dv = dv_e.reshape(v.size(0), v.size(1), group_size, v.size(2), v.size(3)).sum(dim=2).to(v.dtype)
+      else:
+        dk, dv = dk_e.to(k.dtype), dv_e.to(v.dtype)
+      dq = dq.to(q.dtype)
+    else:
+      dq, dk, dv = torch.ops.aten._scaled_dot_product_flash_attention_backward.default(
+        grad_out.contiguous(),
+        q.contiguous(),
+        k.contiguous(),
+        v.contiguous(),
+        O.contiguous(),
+        lse.contiguous(),
+        None,
+        None,
+        q.size(2),
+        k.size(2),
+        0.0,
+        ctx.causal,
+        philox_seed,
+        philox_offset,
+        scale=ctx.softmax_scale,
+      )
+
+    # Gradients for: q, k, v, o, causal, scale, stages, acc, tma,
+    # is_grad_enabled, high_precision_grad.
+    return dq, dk, dv, None, None, None, None, None, None, None, None
 
 
 def ffpa_attn_func(
@@ -85,6 +263,7 @@ def ffpa_attn_func(
   stages: int = 2,
   acc: str = "f32",
   tma: bool = False,
+  high_precision_grad: bool = False,
 ) -> torch.Tensor:
   """Unified FFPA prefill attention entry.
 
@@ -98,6 +277,9 @@ def ffpa_attn_func(
   must share the same ``Nh_kv`` and the same ``Nkv``. Causal masking is
   supported via ``causal=True`` with queries aligned to the tail of the
   KV sequence (``Nkv >= Nq`` required).
+
+  Backward pass is supported via :class:`FFPAAttnFunc` and delegates to
+  PyTorch's SDPA backward kernels (flash for D <= 256, efficient for D > 256).
 
   :param Q: Query tensor with layout ``[B, Nh_q, Nq, D]``; dtype must be
       ``torch.float16`` or ``torch.bfloat16`` and match ``K`` / ``V`` / ``O``.
@@ -152,6 +334,15 @@ def ffpa_attn_func(
       bf16 activations are combined with ``acc='f16'`` (no bf16-acc mma
       PTX instruction exists on supported architectures), or if
       ``causal=True`` is combined with ``Nkv < Nq``.
+  :param high_precision_grad: When ``True``, upcast all inputs to fp32 before
+      calling the efficient attention backward for headdim > 256.  The
+      efficient backward kernel computes only ``delta = (grad_out * out)``
+      in fp32 (see ``attention_backward.cu:761``) and runs the main GEMMs in
+      the original dtype; FFPA's fp16 ``O`` may differ from SDPA's ``O`` in
+      low bits, potentially causing NaN in dQ/dK.  When ``False`` (default),
+      the backward runs in the native dtype with automatic NaN detection:
+      if NaN is found, fp32 is retried transparently.  Has no effect on the
+      flash attention backward path (headdim <= 256).
   """
   if acc == "f32":
     acc_code = _ACC_F32
@@ -211,6 +402,19 @@ def ffpa_attn_func(
   if softmax_scale is None:
     softmax_scale = 1.0 / math.sqrt(Q.size(-1))
 
-  return torch.ops.ffpa_attn.attn(
-    Q, K, V, O, int(stages), acc_code, int(bool(causal)), float(softmax_scale), int(bool(tma))
+  # Route through autograd Function so backward works automatically.
+  # O is passed through to forward() so the caller-supplied buffer is
+  # written in place rather than re-allocated.
+  return FFPAAttnFunc.apply(
+    Q,
+    K,
+    V,
+    O,
+    bool(causal),
+    float(softmax_scale),
+    int(stages),
+    acc_code,
+    int(bool(tma)),
+    torch.is_grad_enabled(),
+    bool(high_precision_grad),
   )

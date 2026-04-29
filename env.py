@@ -276,7 +276,10 @@ class ENV(object):
     formatenv("FFPA_BUILD_ARCH", ",".join(cls.get_build_arch_list()))
     formatenv("FFPA_NVCC_THREADS", cls.FFPA_NVCC_THREADS)
     formatenv("FFPA_PTXAS_VERBOSE", cls.FFPA_PTXAS_VERBOSE)
-    formatenv("FFPA_DEV_HEADDIMS", cls.FFPA_DEV_HEADDIMS or "(full)")
+    formatenv(
+      "FFPA_DEV_HEADDIMS", cls.FFPA_DEV_HEADDIMS
+      or ("range(32, 1024, 32)" if cls.enable_all_headdim() else "range(320, 1024, 64)")
+    )
     formatenv("ENABLE_FFPA_ALL_STAGES", cls.enable_all_mutistages())
     formatenv("ENABLE_FFPA_ALL_HEADDIM", cls.enable_all_headdim())
     formatenv("ENABLE_FFPA_PREFETCH_QKV", cls.enable_prefetch_qkv())
@@ -437,15 +440,15 @@ class ENV(object):
     for d in headdims:
       lines.append(
         f"void ffpa_mma_acc_f16_fp16_d{d}(torch::Tensor Q, torch::Tensor K, "
-        f"torch::Tensor V, torch::Tensor O, int stages, int causal, double softmax_scale, int tma);"
+        f"torch::Tensor V, torch::Tensor O, torch::Tensor softmax_lse, int stages, int causal, double softmax_scale, int tma);"
       )
       lines.append(
         f"void ffpa_mma_acc_f32_fp16_d{d}(torch::Tensor Q, torch::Tensor K, "
-        f"torch::Tensor V, torch::Tensor O, int stages, int causal, double softmax_scale, int tma);"
+        f"torch::Tensor V, torch::Tensor O, torch::Tensor softmax_lse, int stages, int causal, double softmax_scale, int tma);"
       )
       lines.append(
         f"void ffpa_mma_acc_f32_bf16_d{d}(torch::Tensor Q, torch::Tensor K, "
-        f"torch::Tensor V, torch::Tensor O, int stages, int causal, double softmax_scale, int tma);"
+        f"torch::Tensor V, torch::Tensor O, torch::Tensor softmax_lse, int stages, int causal, double softmax_scale, int tma);"
       )
     lines.append("")
     return "\n".join(lines)
@@ -468,8 +471,10 @@ class ENV(object):
     :returns: Rendered C++ snippet wrapping the per-stage
         ``launch_ffpa_mma_template`` calls.
     """
-    call = (f"launch_ffpa_mma_template<{t_in}, {d}, {qk}, {pv}, "
-            "{S}>(Q, K, V, O, causal, softmax_scale, tma);")
+    call = (
+      f"launch_ffpa_mma_template<{t_in}, {d}, {qk}, {pv}, "
+      "{S}>(Q, K, V, O, softmax_lse, causal, softmax_scale, tma);"
+    )
     return (
       "#ifdef ENABLE_FFPA_ALL_STAGES\n"
       "  if (stages == 2) {\n"
@@ -564,6 +569,7 @@ class ENV(object):
       "    torch::Tensor K,",
       "    torch::Tensor V,",
       "    torch::Tensor O,",
+      "    torch::Tensor softmax_lse,",
       "    int stages,",
       "    int causal,",
       "    double softmax_scale,",
@@ -578,7 +584,7 @@ class ENV(object):
     def _cases(symbol_prefix: str) -> str:
       return "\n".join(
         f"    case {d}: {symbol_prefix}_d{d}"
-        "(Q, K, V, O, stages, causal, softmax_scale, tma); break;" for d in headdims
+        "(Q, K, V, O, softmax_lse, stages, causal, softmax_scale, tma); break;" for d in headdims
       )
 
     def _fn(name: str, symbol_prefix: str, torch_dtype: str) -> str:
@@ -588,6 +594,7 @@ class ENV(object):
         "    torch::Tensor K,\n"
         "    torch::Tensor V,\n"
         "    torch::Tensor O,\n"
+        "    torch::Tensor softmax_lse,\n"
         "    int stages,\n"
         "    int causal,\n"
         "    double softmax_scale,\n"

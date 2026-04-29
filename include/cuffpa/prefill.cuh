@@ -673,6 +673,40 @@ __device__ __forceinline__ void sync_rescaling_final_o(
   }  // end for kValTileSeqLenP = 1
 }
 
+// Collective write-back of the softmax LSE values from registers to gmem.
+// Each 4-thread subgroup within a warp writes the logsumexp for the two Q
+// rows it owns: ``lse = log(row_sum) + row_max``.  Thread 0 of each group
+// emits both values via plain 32-bit global stores so the write pattern
+// matches the O-store row order exactly.
+template <const int Br, const int kMmaAtomM, const int kValTileSeqLenQ>
+__device__ __forceinline__ void sync_store_lse_r2g(float* __restrict__ gmem_lse_ptr,
+                                                   const int gmem_lse_offset, const int n_tile_id,
+                                                   const int mma_tile_id,
+                                                   const float* lane_block_row_max_old,
+                                                   const float* lane_block_row_sum_old,
+                                                   const int seqlen_bound = INT_MAX) {
+  // LSE = log(row_sum) + row_max (row_sum = sum_i exp(S_i - row_max))
+  const float lse_0 = __logf(lane_block_row_sum_old[0]) + lane_block_row_max_old[0];
+  const float lse_1 = __logf(lane_block_row_sum_old[1]) + lane_block_row_max_old[1];
+
+  const int lane_id = threadIdx.x % WARP_SIZE;
+  // Thread 0 of each 4-thread subgroup writes both rows; row indices mirror
+  // sync_store_o_r2g's layout so that LSE[i] corresponds to O[i,:].
+  if (lane_id % 4 == 0) {
+    const int row_in_warp = lane_id / 4;  // 0..7
+    const int global_row_0 = n_tile_id * Br + mma_tile_id * kMmaAtomM + row_in_warp;
+    const int global_row_1 = n_tile_id * Br + mma_tile_id * kMmaAtomM + row_in_warp + 8;
+    const int lse_idx_0 = gmem_lse_offset + global_row_0;
+    const int lse_idx_1 = gmem_lse_offset + global_row_1;
+    if (global_row_0 < seqlen_bound) {
+      gmem_lse_ptr[lse_idx_0] = lse_0;
+    }
+    if (global_row_1 < seqlen_bound) {
+      gmem_lse_ptr[lse_idx_1] = lse_1;
+    }
+  }
+}
+
 // Collective write-back of the final O tile from registers to gmem.
 // Uses warp-shuffles across lane_id % 4 to pack the per-thread fragment
 // layout into contiguous 128-bit vectors, then ``st.global.v4`` once per
