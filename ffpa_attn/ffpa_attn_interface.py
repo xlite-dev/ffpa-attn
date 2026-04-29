@@ -86,17 +86,21 @@ def _ffpa_attn_forward_cuda(
   Q: torch.Tensor,
   K: torch.Tensor,
   V: torch.Tensor,
-  stages: int,
-  acc: int,
-  causal: int,
-  softmax_scale: float,
-  tma: int,
+  O: torch.Tensor | None = None,
+  stages: int = 2,
+  acc: int = 1,
+  causal: int = 0,
+  softmax_scale: float = 0.0,
+  tma: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
   """Call FFPA CUDA forward, returning (O, softmax_lse).
 
-    O is allocated as zeros; softmax_lse is allocated as [B, Nh_q, Nq] float32.
+    If O is None, it is allocated as zeros; otherwise the caller-supplied
+    buffer is written in place.  softmax_lse is always allocated as
+    [B, Nh_q, Nq] float32.
     """
-  O = torch.zeros_like(Q)  # noqa: E741
+  if O is None:
+    O = torch.zeros_like(Q)  # noqa: E741
   softmax_lse = torch.empty(Q.size(0), Q.size(1), Q.size(2), dtype=torch.float32, device=Q.device)
   _ffpa_attn_cuda(Q, K, V, O, softmax_lse, stages, acc, causal, softmax_scale, tma)
   return O, softmax_lse
@@ -133,6 +137,7 @@ class FFPAAttnFunc(torch.autograd.Function):
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
+    o: torch.Tensor | None,
     causal: bool,
     softmax_scale: float,
     stages: int,
@@ -147,6 +152,7 @@ class FFPAAttnFunc(torch.autograd.Function):
       q,
       k,
       v,
+      o,
       stages,
       acc,
       int(bool(causal)),
@@ -242,12 +248,9 @@ class FFPAAttnFunc(torch.autograd.Function):
         scale=ctx.softmax_scale,
       )
 
-    return dq, dk, dv, None, None, None, None, None, None, None
-
-
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
+    # Gradients for: q, k, v, o, causal, scale, stages, acc, tma,
+    # is_grad_enabled, high_precision_grad.
+    return dq, dk, dv, None, None, None, None, None, None, None, None
 
 
 def ffpa_attn_func(
@@ -400,10 +403,13 @@ def ffpa_attn_func(
     softmax_scale = 1.0 / math.sqrt(Q.size(-1))
 
   # Route through autograd Function so backward works automatically.
+  # O is passed through to forward() so the caller-supplied buffer is
+  # written in place rather than re-allocated.
   return FFPAAttnFunc.apply(
     Q,
     K,
     V,
+    O,
     bool(causal),
     float(softmax_scale),
     int(stages),

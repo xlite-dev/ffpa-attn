@@ -107,7 +107,16 @@ def test_ffpa_bwd_basic(dtype, B, H, N, D):
   v = torch.randn(B, H, N, D, dtype=dtype, device="cuda", requires_grad=True)
 
   scale = 1.0 / math.sqrt(D)
-  out = ffpa_attn_func(q, k, v, causal=False, softmax_scale=scale, stages=2, acc="f32", high_precision_grad=True)
+  out = ffpa_attn_func(
+    q,
+    k,
+    v,
+    causal=False,
+    softmax_scale=scale,
+    stages=2,
+    acc="f32",
+    high_precision_grad=True,
+  )
   loss = out.sum()
   loss.backward()
 
@@ -143,7 +152,16 @@ def test_ffpa_bwd_causal(dtype, N, D):
   v = torch.randn(B, H, N, D, dtype=dtype, device="cuda", requires_grad=True)
 
   scale = 1.0 / math.sqrt(D)
-  out = ffpa_attn_func(q, k, v, causal=True, softmax_scale=scale, stages=2, acc="f32", high_precision_grad=True)
+  out = ffpa_attn_func(
+    q,
+    k,
+    v,
+    causal=True,
+    softmax_scale=scale,
+    stages=2,
+    acc="f32",
+    high_precision_grad=True,
+  )
   loss = out.sum()
   loss.backward()
 
@@ -179,7 +197,16 @@ def test_ffpa_bwd_gqa(dtype, Nh_q, Nh_kv, N, D):
   v = torch.randn(B, Nh_kv, N, D, dtype=dtype, device="cuda", requires_grad=True)
 
   scale = 1.0 / math.sqrt(D)
-  out = ffpa_attn_func(q, k, v, causal=False, softmax_scale=scale, stages=2, acc="f32", high_precision_grad=True)
+  out = ffpa_attn_func(
+    q,
+    k,
+    v,
+    causal=False,
+    softmax_scale=scale,
+    stages=2,
+    acc="f32",
+    high_precision_grad=True,
+  )
   loss = out.sum()
   loss.backward()
 
@@ -214,7 +241,16 @@ def test_ffpa_bwd_causal_gqa(dtype, Nh_q, Nh_kv, N, D):
   v = torch.randn(B, Nh_kv, N, D, dtype=dtype, device="cuda", requires_grad=True)
 
   scale = 1.0 / math.sqrt(D)
-  out = ffpa_attn_func(q, k, v, causal=True, softmax_scale=scale, stages=2, acc="f32", high_precision_grad=True)
+  out = ffpa_attn_func(
+    q,
+    k,
+    v,
+    causal=True,
+    softmax_scale=scale,
+    stages=2,
+    acc="f32",
+    high_precision_grad=True,
+  )
   loss = out.sum()
   loss.backward()
 
@@ -249,7 +285,16 @@ def test_ffpa_bwd_cross_attention(dtype, Nq, Nkv, D):
   v = torch.randn(B, H, Nkv, D, dtype=dtype, device="cuda", requires_grad=True)
 
   scale = 1.0 / math.sqrt(D)
-  out = ffpa_attn_func(q, k, v, causal=False, softmax_scale=scale, stages=2, acc="f32", high_precision_grad=True)
+  out = ffpa_attn_func(
+    q,
+    k,
+    v,
+    causal=False,
+    softmax_scale=scale,
+    stages=2,
+    acc="f32",
+    high_precision_grad=True,
+  )
   loss = out.sum()
   loss.backward()
 
@@ -277,7 +322,14 @@ def test_ffpa_bwd_nograd_forward_ok(dtype, D):
   v = torch.randn(B, H, N, D, dtype=dtype, device="cuda")
 
   with torch.no_grad():
-    out = ffpa_attn_func(q, k, v, stages=2, acc="f32", high_precision_grad=True)
+    out = ffpa_attn_func(
+      q,
+      k,
+      v,
+      stages=2,
+      acc="f32",
+      high_precision_grad=True,
+    )
 
   scale = 1.0 / math.sqrt(D)
   ref = _sdpa_ref(q, k, v, False, scale)
