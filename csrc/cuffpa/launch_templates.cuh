@@ -1,8 +1,9 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 
-#include "ffpa_attn_templates.cuh"
-#include "ffpa_attn_templates_sm90.cuh"
+#include "ffpa_attn_fwd_templates.cuh"
+#include "ffpa_attn_fwd_templates_sm90.cuh"
+#include "ffpa_attn_bwd_templates.cuh"
 using namespace ffpa;
 
 static constexpr int kMaxDForSmallDKernel = 64;
@@ -303,7 +304,7 @@ static constexpr int getConfigQKVSmemMaxSize() {
 // reported here so the launcher's ``cudaFuncSetAttribute(...
 // maxDynamicSharedMemorySize)`` covers the SM90 TMA kernel without
 // changing the cp.async smem budget. Must match the ``kKvBoxCols``
-// formula inside ``ffpa_stages_split_q_large_d_sm90_template`` exactly.
+// formula inside ``ffpa_stages_split_q_large_d_fwd_sm90_template`` exactly.
 template <const int Bc, const int kMmaAtomK, const int kMmaAtomN, const int kStageQK,
           const int kStagePV, const int kHeadDim, const int kPadK, typename kDataType = __half>
 static constexpr int getExperimentalTmaSm90ScratchSize() {
@@ -340,15 +341,15 @@ static constexpr int getExperimentalTmaSm90ScratchSize() {
 // Runtime ``tma`` flag (0/1) gates the experimental SM90 TMA path. When
 // non-zero AND the device is SM90+ AND the compile-time eligibility check
 // (head-dim, padding, share-smem flags) passes, the launcher dispatches the
-// ``ffpa_stages_split_q_large_d_sm90_template`` kernel with TMA descriptors;
+// ``ffpa_stages_split_q_large_d_fwd_sm90_template`` kernel with TMA descriptors;
 // otherwise it falls back to the architecture-agnostic kernels declared in
 // ``ffpa_attn_templates.cuh``. The fallback path is bit-for-bit unchanged
 // from the pre-TMA kernels.
 template <typename kDataType, const int kHeadDim, const int kMmaAccFloat32QK,
           const int kMmaAccFloat32PV, const int kStage>
-void launch_ffpa_mma_template(torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O,
-                              torch::Tensor softmax_lse, int causal, double softmax_scale,
-                              int tma) {
+void launch_ffpa_attn_fwd_template(torch::Tensor Q, torch::Tensor K, torch::Tensor V,
+                                   torch::Tensor O, torch::Tensor softmax_lse, int causal,
+                                   double softmax_scale, int tma) {
   // Q,K,V,O with [B, H, N, D] layout, B=batch, H=head, N=seqlen, D=dim
   // TODO: support BNHD layout, Q,K,V,O with [B, N, H, D] layout.
   constexpr int kMmaAtomM = 16;
@@ -485,7 +486,7 @@ void launch_ffpa_mma_template(torch::Tensor Q, torch::Tensor K, torch::Tensor V,
     constexpr int kPersistVs2r = getConfigPersistVs2r();  // only for d < 256
 
     auto ffpa_mma_small_d_kernel_func =
-        (ffpa_stages_split_q_small_d_template < kDataType, kHeadDim, kMmaAtomM, kMmaAtomN,
+        (ffpa_stages_split_q_small_d_fwd_template < kDataType, kHeadDim, kMmaAtomM, kMmaAtomN,
          kMmaAtomK, kMmaTileSeqLenQ, kMmaTileSeqLenK, kMmaTileSeqLenP, kMmaTileHeadDimV,
          kValTileSeqLenQ, kValTileSeqLenK, kValTileSeqLenP, kValTileHeadDimV, kMmaAccFloat32QK,
          kMmaAccFloat32PV, kOStorageAccFloat32, kPrefetchQK, kPrefetchPV, kShareSmemQKV,
@@ -500,7 +501,7 @@ void launch_ffpa_mma_template(torch::Tensor Q, torch::Tensor K, torch::Tensor V,
   } else {  // large headdim > kMaxDForSmallDKernel (e.g 128)
     if (kAttemptExperimentalTma) {
       auto ffpa_mma_large_d_sm90_kernel_func =
-          (ffpa_stages_split_q_large_d_sm90_template<
+          (ffpa_stages_split_q_large_d_fwd_sm90_template<
               kDataType, kHeadDim, kMmaAtomM, kMmaAtomN, kMmaAtomK, kMmaTileSeqLenQ,
               kMmaTileSeqLenK, kMmaTileSeqLenP, kMmaTileHeadDimV, kValTileSeqLenQ, kValTileSeqLenK,
               kValTileSeqLenP, kValTileHeadDimV, kMmaAccFloat32QK, kMmaAccFloat32PV,
@@ -510,7 +511,7 @@ void launch_ffpa_mma_template(torch::Tensor Q, torch::Tensor K, torch::Tensor V,
       LAUNCH_TEMPLATE_FUNC_SM90(ffpa_mma_large_d_sm90_kernel_func);
     } else {
       auto ffpa_mma_large_d_kernel_func =
-          (ffpa_stages_split_q_large_d_template<
+          (ffpa_stages_split_q_large_d_fwd_template<
               kDataType, kHeadDim, kMmaAtomM, kMmaAtomN, kMmaAtomK, kMmaTileSeqLenQ,
               kMmaTileSeqLenK, kMmaTileSeqLenP, kMmaTileHeadDimV, kValTileSeqLenQ, kValTileSeqLenK,
               kValTileSeqLenP, kValTileHeadDimV, kMmaAccFloat32QK, kMmaAccFloat32PV,
@@ -523,7 +524,7 @@ void launch_ffpa_mma_template(torch::Tensor Q, torch::Tensor K, torch::Tensor V,
 #else
   if (kAttemptExperimentalTma) {
     auto ffpa_mma_large_d_sm90_kernel_func =
-        (ffpa_stages_split_q_large_d_sm90_template<
+        (ffpa_stages_split_q_large_d_fwd_sm90_template<
             kDataType, kHeadDim, kMmaAtomM, kMmaAtomN, kMmaAtomK, kMmaTileSeqLenQ, kMmaTileSeqLenK,
             kMmaTileSeqLenP, kMmaTileHeadDimV, kValTileSeqLenQ, kValTileSeqLenK, kValTileSeqLenP,
             kValTileHeadDimV, kMmaAccFloat32QK, kMmaAccFloat32PV, kOStorageAccFloat32, kPrefetchQK,
@@ -532,7 +533,7 @@ void launch_ffpa_mma_template(torch::Tensor Q, torch::Tensor K, torch::Tensor V,
     LAUNCH_TEMPLATE_FUNC_SM90(ffpa_mma_large_d_sm90_kernel_func);
   } else {
     auto ffpa_mma_large_d_kernel_func =
-        (ffpa_stages_split_q_large_d_template<
+        (ffpa_stages_split_q_large_d_fwd_template<
             kDataType, kHeadDim, kMmaAtomM, kMmaAtomN, kMmaAtomK, kMmaTileSeqLenQ, kMmaTileSeqLenK,
             kMmaTileSeqLenP, kMmaTileHeadDimV, kValTileSeqLenQ, kValTileSeqLenK, kValTileSeqLenP,
             kValTileHeadDimV, kMmaAccFloat32QK, kMmaAccFloat32PV, kOStorageAccFloat32, kPrefetchQK,
@@ -551,4 +552,117 @@ void launch_ffpa_mma_template(torch::Tensor Q, torch::Tensor K, torch::Tensor V,
   if (v_tma_desc_device != nullptr) {
     cudaFreeAsync(v_tma_desc_device, stream);
   }
+}
+
+// ============================================================================
+// Backward launcher
+// ============================================================================
+// Host-side launcher for the FFPA Split-D large-d backward kernel.
+// Dispatches one KV-tile per block; each block iterates over Q tiles in
+// reverse order (FA-2 backward schedule).  Only supports headdim > 256
+// (smaller headdims go through the SDPA backward path).
+//
+// Template parameters:
+//   kDataType    Activation dtype: __half or __nv_bfloat16.
+//   kHeadDim     Head dim D (must be >= 256 for this path).
+//   kStage       cp.async pipeline depth for QK (PV depth is derived).
+//
+// Runtime arguments:
+//   Q,K,V        BHND tensors (same as forward).
+//   O            Forward output tensor (for dP_sum = dO * O dot product).
+//   softmax_lse  LSE tensor from forward [B, Nh_q, Nq] float32.
+//   dO           Incoming gradient (output grad), BHND.
+//   dQ,dK,dV     Output gradient buffers, pre-allocated and zeroed.
+//   causal       Runtime causal mask flag.
+//   softmax_scale Pre-softmax scale (1/sqrt(D)).
+template <typename kDataType, const int kHeadDim, const int kStage>
+void launch_ffpa_attn_bwd_template(torch::Tensor Q, torch::Tensor K, torch::Tensor V,
+                                   torch::Tensor O, torch::Tensor softmax_lse, torch::Tensor dO,
+                                   torch::Tensor dQ, torch::Tensor dK, torch::Tensor dV, int causal,
+                                   double softmax_scale) {
+  constexpr int kMmaAtomM = 16;
+  constexpr int kMmaAtomN = 8;
+  constexpr int kMmaAtomK = 16;
+
+  constexpr int kMmaTileSeqLenQ = getConfigMmaTileSeqLenQP<kHeadDim>();
+  constexpr int kMmaTileSeqLenK = 1;
+  constexpr int kValTileSeqLenQ = 1;
+  constexpr int kValTileSeqLenK = getConfigWarpTileSeqLenK<kHeadDim>();
+  constexpr int kValTileSeqLenP = 1;
+  constexpr int kValTileHeadDimV = getConfigWarpTileHeadDimV<kHeadDim>();
+
+  constexpr int Br = kMmaAtomM * kMmaTileSeqLenQ * kValTileSeqLenQ;
+  constexpr int Bc = kMmaAtomN * kMmaTileSeqLenK * kValTileSeqLenK;
+  static_assert(Br == Bc, "Br must equal Bc");
+
+  constexpr int kNumThreads = WARP_SIZE * kMmaTileSeqLenQ * kMmaTileSeqLenK;
+
+  // Backward always uses fp32 MMA accumulators for gradient precision.
+  constexpr int kMmaAccFloat32QK = 1;
+  constexpr int kMmaAccFloat32PV = 1;
+  constexpr int kOStorageAccFloat32 = 0;  // dQ/dK/dV stored as fp16/bf16
+
+  constexpr int kPrefetchQK = getConfigPrefetchQKV<kStage>();
+  constexpr int kPrefetchPV = kPrefetchQK;
+  constexpr int kPadQ = getConfigPadQ();
+  constexpr int kPadK = getConfigPadK();
+  constexpr int kPadV = getConfigPadV();
+  constexpr int kShareSmemQKV = 0;
+  constexpr int kPersistQs2r = 0;
+  constexpr int kPersistQg2s = 0;
+  constexpr int kRegPipeKV = 0;
+  constexpr int kMmaTileSeqLenP = kMmaTileSeqLenQ;
+  constexpr int kMmaTileHeadDimV = 1;
+  constexpr int kStageQK = kStage;
+  constexpr int kStagePV = kStage;
+
+  const int Nb = Q.size(0);
+  const int Nh = Q.size(1);
+  const int Nh_kv = K.size(1);
+  const int Nq = Q.size(2);
+  const int Nkv = K.size(2);
+
+  // Validate shapes (minimal — full validation done in Python wrapper).
+  TORCH_CHECK(Q.dim() == 4 && K.dim() == 4 && V.dim() == 4, "bwd: Q/K/V must be 4-D");
+  TORCH_CHECK(Q.size(1) % K.size(1) == 0, "bwd: Q heads must be multiple of K/V heads (GQA)");
+  TORCH_CHECK(causal == 0 || Nkv >= Nq, "bwd: causal requires Nkv >= Nq");
+
+  const float scale = static_cast<float>(softmax_scale);
+  const dim3 block = dim3(kNumThreads, 1, 1);
+  // KV-driven grid: one block per KV tile × (batch × kv_heads)
+  const dim3 grid = dim3(utils::div_ceil(Nkv, Bc), Nb * Nh_kv, 1);
+
+  // SMEM: Q + K + V + dO + O pipeline buffers only (~5KB for stage=1).
+  // dK/dV written directly to global via atomicAdd; no SMEM accumulators.
+  constexpr int kQKVSmemMaxSize = (3 * kStageQK * Br * (kMmaAtomK + kPadQ) +  // Q + dO + O
+                                   kStageQK * Bc * (kMmaAtomK + kPadK) +      // K
+                                   kStagePV * Bc * (kMmaAtomN * 2 + kPadV)) *
+                                  sizeof(kDataType);  // V
+  constexpr int kSmemTotal = kQKVSmemMaxSize;
+
+  auto stream = at::cuda::getCurrentCUDAStream();
+  int smem_size = static_cast<int>(kSmemTotal);
+
+  // Force stage=1 for backward (SMEM budget; multi-stage will be added later).
+  constexpr int kStageQK_eff = 1;
+  constexpr int kStagePV_eff = 1;
+
+  auto ffpa_bwd_kernel = ffpa_stages_split_q_large_d_bwd_template<
+      kDataType, kHeadDim, kMmaAtomM, kMmaAtomN, kMmaAtomK, kMmaTileSeqLenQ, kMmaTileSeqLenK,
+      kMmaTileSeqLenP, kMmaTileHeadDimV, kValTileSeqLenQ, kValTileSeqLenK, kValTileSeqLenP,
+      kValTileHeadDimV, kMmaAccFloat32QK, kMmaAccFloat32PV, kOStorageAccFloat32, kPrefetchQK,
+      kPrefetchPV, kShareSmemQKV, kPersistQs2r, kPersistQg2s, kRegPipeKV, kStageQK_eff,
+      kStagePV_eff, kPadQ, kPadK, kPadV>;
+
+  cudaFuncSetAttribute(ffpa_bwd_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
+  ffpa_bwd_kernel<<<grid, block, smem_size, stream>>>(
+      reinterpret_cast<const kDataType*>(Q.const_data_ptr()),
+      reinterpret_cast<const kDataType*>(K.const_data_ptr()),
+      reinterpret_cast<const kDataType*>(V.const_data_ptr()),
+      reinterpret_cast<const float*>(softmax_lse.const_data_ptr()),
+      reinterpret_cast<const kDataType*>(dO.const_data_ptr()),
+      reinterpret_cast<const kDataType*>(O.const_data_ptr()),
+      reinterpret_cast<kDataType*>(dQ.data_ptr()), reinterpret_cast<kDataType*>(dK.data_ptr()),
+      reinterpret_cast<kDataType*>(dV.data_ptr()), Nq, Nkv, Nh, Nh_kv, scale,
+      utils::div_ceil(Nkv, Bc), causal);
 }
