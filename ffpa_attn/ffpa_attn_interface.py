@@ -18,7 +18,7 @@ import warnings
 
 import torch
 
-from ._C import ffpa_attn as _ffpa_attn_cuda
+from ._C import ffpa_attn_forward as _ffpa_attn_fwd_cuda
 
 # The SM90 TMA large-d kernel only widens the K box to 64 fp16 cols
 # (SWIZZLE_128B) when the head dim satisfies these constraints; outside
@@ -61,7 +61,7 @@ def _ffpa_attn_impl_cuda(
   softmax_scale: float,
   tma: int,
 ) -> torch.Tensor:
-  _ffpa_attn_cuda(Q, K, V, O, softmax_lse, stages, acc, causal, softmax_scale, tma)
+  _ffpa_attn_fwd_cuda(Q, K, V, O, softmax_lse, stages, acc, causal, softmax_scale, tma)
   return O
 
 
@@ -102,7 +102,7 @@ def _ffpa_attn_forward_cuda(
   if O is None:
     O = torch.zeros_like(Q)  # noqa: E741
   softmax_lse = torch.empty(Q.size(0), Q.size(1), Q.size(2), dtype=torch.float32, device=Q.device)
-  _ffpa_attn_cuda(Q, K, V, O, softmax_lse, stages, acc, causal, softmax_scale, tma)
+  _ffpa_attn_fwd_cuda(Q, K, V, O, softmax_lse, stages, acc, causal, softmax_scale, tma)
   return O, softmax_lse
 
 
@@ -145,6 +145,7 @@ class FFPAAttnFunc(torch.autograd.Function):
     tma: int,
     is_grad_enabled: bool,
     high_precision_grad: bool,
+    backward_backend: str,
   ) -> torch.Tensor:
     is_grad = is_grad_enabled and any(x.requires_grad for x in [q, k, v])
 
@@ -171,6 +172,7 @@ class FFPAAttnFunc(torch.autograd.Function):
       ctx.causal = causal
       ctx.softmax_scale = softmax_scale
       ctx.high_precision_grad = high_precision_grad
+      ctx.backward_backend = backward_backend
 
     return O
 
@@ -249,8 +251,8 @@ class FFPAAttnFunc(torch.autograd.Function):
       )
 
     # Gradients for: q, k, v, o, causal, scale, stages, acc, tma,
-    # is_grad_enabled, high_precision_grad.
-    return dq, dk, dv, None, None, None, None, None, None, None, None
+    # is_grad_enabled, high_precision_grad, backward_backend.
+    return dq, dk, dv, None, None, None, None, None, None, None, None, None
 
 
 def ffpa_attn_func(
@@ -264,6 +266,7 @@ def ffpa_attn_func(
   acc: str = "f32",
   tma: bool = False,
   high_precision_grad: bool = False,
+  backward_backend: str = "sdpa",
 ) -> torch.Tensor:
   """Unified FFPA prefill attention entry.
 
@@ -325,15 +328,6 @@ def ffpa_attn_func(
 
       When any of these is not met, the launcher transparently uses the
       architecture-agnostic ``cp.async``-based kernel.
-
-  :returns: ``O``, filled with the attention output
-      ``softmax(softmax_scale * QK^T) V``.
-
-  :raises TypeError: if ``Q.dtype`` is neither fp16 nor bf16.
-  :raises ValueError: if ``acc`` is not one of ``{'f16', 'f32'}``, if
-      bf16 activations are combined with ``acc='f16'`` (no bf16-acc mma
-      PTX instruction exists on supported architectures), or if
-      ``causal=True`` is combined with ``Nkv < Nq``.
   :param high_precision_grad: When ``True``, upcast all inputs to fp32 before
       calling the efficient attention backward for headdim > 256.  The
       efficient backward kernel computes only ``delta = (grad_out * out)``
@@ -343,7 +337,25 @@ def ffpa_attn_func(
       the backward runs in the native dtype with automatic NaN detection:
       if NaN is found, fp32 is retried transparently.  Has no effect on the
       flash attention backward path (headdim <= 256).
+  :param backward_backend: Which backward implementation to use.  Currently
+      only ``"sdpa"`` is supported (default); delegates to PyTorch's SDPA
+      backward kernels.  ``"split_d"`` is reserved for the native Split-D
+      backward kernel (not yet implemented).  Has no effect in inference
+      mode (``torch.no_grad()`` or no input requires gradient).
+
+  :returns: ``O``, filled with the attention output
+      ``softmax(softmax_scale * QK^T) V``.
+
+  :raises TypeError: if ``Q.dtype`` is neither fp16 nor bf16.
+  :raises ValueError: if ``acc`` is not one of ``{'f16', 'f32'}``, if
+      bf16 activations are combined with ``acc='f16'`` (no bf16-acc mma
+      PTX instruction exists on supported architectures), or if
+      ``causal=True`` is combined with ``Nkv < Nq``.
   """
+  assert backward_backend == "sdpa", \
+    f"Only backward_backend='sdpa' is supported, got {backward_backend!r}. " \
+    f"Split-D backward kernel is not yet implemented."
+
   if acc == "f32":
     acc_code = _ACC_F32
   elif acc == "f16":
@@ -417,4 +429,5 @@ def ffpa_attn_func(
     int(bool(tma)),
     torch.is_grad_enabled(),
     bool(high_precision_grad),
+    str(backward_backend),
   )

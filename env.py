@@ -365,7 +365,7 @@ class ENV(object):
     Splitting the big ``DISPATCH_HEADDIM`` switch into one TU per headdim
     lets ``MAX_JOBS`` invoke nvcc on many files in parallel, dramatically
     reducing the wall-clock build time of the heavy
-    ``launch_ffpa_mma_template`` instantiations. The generated files are
+    ``launch_ffpa_attn_fwd_template`` instantiations. The generated files are
     committed to the repository (not ignored); on every build the
     generator refreshes their contents only when they would actually
     change, so under steady state this is a no-op and incremental builds
@@ -383,29 +383,28 @@ class ENV(object):
     generated = []
 
     # ---- declarations header shared by per-D TUs + dispatch TU ----
-    decls_path = os.path.join(gen_dir, "ffpa_attn_decls.h")
+    decls_path = os.path.join(gen_dir, "ffpa_attn_fwd_decls.h")
     cls._write_if_changed(decls_path, cls._render_decls_header(headdims))
     generated.append(decls_path)
 
-    # ---- two TUs per headdim, one per dtype ----
-    # Splitting fp16 and bf16 into separate TUs doubles the number of build
-    # units (N_headdims x 2) but each TU now instantiates only a single
-    # dtype specialization of the heavy launch_ffpa_mma_template, which
-    # both raises MAX_JOBS parallelism and cuts per-TU compile time.
+    # ---- two forward TUs per headdim, one per dtype ----
     for d in headdims:
-      fp16_path = os.path.join(gen_dir, f"ffpa_attn_fp16_hdim{d}.cu")
-      bf16_path = os.path.join(gen_dir, f"ffpa_attn_bf16_hdim{d}.cu")
+      fp16_path = os.path.join(gen_dir, f"ffpa_attn_fwd_fp16_hdim{d}.cu")
+      bf16_path = os.path.join(gen_dir, f"ffpa_attn_fwd_bf16_hdim{d}.cu")
       cls._write_if_changed(fp16_path, cls._render_per_headdim_fp16_tu(d))
       cls._write_if_changed(bf16_path, cls._render_per_headdim_bf16_tu(d))
       generated.append(fp16_path)
       generated.append(bf16_path)
 
-    # Clean up stale TUs from previous layouts (pre-bf16 per-acc files,
-    # combined fp16+bf16 per-headdim files, and the old ``_L1`` naming).
+    # Backward code generation disabled (Split-D kernel not yet implemented).
+    # The SDPA backward delegation path is used instead.
+
+    # Clean up stale TUs from previous builds (including backward TUs).
     stale_file_names = {"ffpa_attn_L1_decls.h", "ffpa_attn_L1_dispatch.cu"}
     for fname in os.listdir(gen_dir):
       is_stale = ((fname.startswith("ffpa_attn_L1_acc_") and fname.endswith(".cu"))
-                  or (fname.startswith("ffpa_attn_L1_hdim") and fname.endswith(".cu")) or fname in stale_file_names)
+                  or (fname.startswith("ffpa_attn_L1_hdim") and fname.endswith(".cu"))
+                  or (fname.startswith("ffpa_attn_bwd_") and fname.endswith(".cu")) or fname in stale_file_names)
       if is_stale:
         stale = os.path.join(gen_dir, fname)
         try:
@@ -414,7 +413,7 @@ class ENV(object):
           pass
 
     # ---- top-level dispatch TU: CHECK_* + switch(d) to per-D entry points ----
-    dispatch_path = os.path.join(gen_dir, "ffpa_attn_dispatch.cu")
+    dispatch_path = os.path.join(gen_dir, "ffpa_attn_fwd_dispatch.cu")
     cls._write_if_changed(dispatch_path, cls._render_dispatch_tu(headdims))
     generated.append(dispatch_path)
 
@@ -439,15 +438,15 @@ class ENV(object):
     ]
     for d in headdims:
       lines.append(
-        f"void ffpa_mma_acc_f16_fp16_d{d}(torch::Tensor Q, torch::Tensor K, "
+        f"void ffpa_attn_fwd_fp16f16_d{d}(torch::Tensor Q, torch::Tensor K, "
         f"torch::Tensor V, torch::Tensor O, torch::Tensor softmax_lse, int stages, int causal, double softmax_scale, int tma);"
       )
       lines.append(
-        f"void ffpa_mma_acc_f32_fp16_d{d}(torch::Tensor Q, torch::Tensor K, "
+        f"void ffpa_attn_fwd_fp16f32_d{d}(torch::Tensor Q, torch::Tensor K, "
         f"torch::Tensor V, torch::Tensor O, torch::Tensor softmax_lse, int stages, int causal, double softmax_scale, int tma);"
       )
       lines.append(
-        f"void ffpa_mma_acc_f32_bf16_d{d}(torch::Tensor Q, torch::Tensor K, "
+        f"void ffpa_attn_fwd_bf16f32_d{d}(torch::Tensor Q, torch::Tensor K, "
         f"torch::Tensor V, torch::Tensor O, torch::Tensor softmax_lse, int stages, int causal, double softmax_scale, int tma);"
       )
     lines.append("")
@@ -469,10 +468,10 @@ class ENV(object):
     :param pv: Identifier for the ``kMmaAccFloat32PV`` template constant
         in scope at the call site.
     :returns: Rendered C++ snippet wrapping the per-stage
-        ``launch_ffpa_mma_template`` calls.
+        ``launch_ffpa_attn_fwd_template`` calls.
     """
     call = (
-      f"launch_ffpa_mma_template<{t_in}, {d}, {qk}, {pv}, "
+      f"launch_ffpa_attn_fwd_template<{t_in}, {d}, {qk}, {pv}, "
       "{S}>(Q, K, V, O, softmax_lse, causal, softmax_scale, tma);"
     )
     return (
@@ -501,8 +500,8 @@ class ENV(object):
 
     The two emitted symbols are:
 
-    - ``ffpa_mma_acc_f16_fp16_d{d}``: fp16 activation, MMA acc=f16.
-    - ``ffpa_mma_acc_f32_fp16_d{d}``: fp16 activation, MMA acc=f32
+    - ``ffpa_attn_fwd_fp16f16_d{d}``: fp16 activation, MMA acc=f16.
+    - ``ffpa_attn_fwd_fp16f32_d{d}``: fp16 activation, MMA acc=f32
       (with ``ENABLE_FFPA_FORCE_{QK,PV}_F16`` fall-back hooks for parity).
 
     :param d: Headdim value to bake into both entry symbols.
@@ -533,15 +532,15 @@ class ENV(object):
     ]
 
     body = "\n".join(lines) + "\n"
-    body += cls._render_entry(d, f"ffpa_mma_acc_f16_fp16_d{d}", "__half", f16_prefix) + "\n"
-    body += cls._render_entry(d, f"ffpa_mma_acc_f32_fp16_d{d}", "__half", f32_prefix)
+    body += cls._render_entry(d, f"ffpa_attn_fwd_fp16f16_d{d}", "__half", f16_prefix) + "\n"
+    body += cls._render_entry(d, f"ffpa_attn_fwd_fp16f32_d{d}", "__half", f32_prefix)
     return body
 
   @classmethod
   def _render_per_headdim_bf16_tu(cls, d: int) -> str:
     """Render the bf16-only TU for headdim ``d``.
 
-    Only one entry (``ffpa_mma_acc_f32_bf16_d{d}``) is emitted because
+    Only one entry (``ffpa_attn_fwd_bf16f32_d{d}``) is emitted because
     bf16 has no f16-acc mma PTX; acc is forced to f32.
 
     :param d: Headdim value to bake into the entry symbol.
@@ -558,8 +557,155 @@ class ENV(object):
       "  constexpr int kMmaAccFloat32PV = 1;",
     ]
     body = "\n".join(lines) + "\n"
-    body += cls._render_entry(d, f"ffpa_mma_acc_f32_bf16_d{d}", "__nv_bfloat16", bf16_prefix)
+    body += cls._render_entry(d, f"ffpa_attn_fwd_bf16f32_d{d}", "__nv_bfloat16", bf16_prefix)
     return body
+
+  # -------------------- backward code generation --------------------
+
+  @staticmethod
+  def _render_bwd_decls_header(headdims):
+    """Render backward per-headdim declaration header."""
+    lines = [
+      "// AUTO-GENERATED by env.py. DO NOT EDIT.",
+      "#pragma once",
+      "#include <torch/types.h>",
+      "",
+    ]
+    for d in headdims:
+      lines.append(
+        f"void ffpa_attn_bwd_fp16f32_d{d}(torch::Tensor Q, torch::Tensor K, "
+        f"torch::Tensor V, torch::Tensor O, torch::Tensor softmax_lse, "
+        f"torch::Tensor dO, torch::Tensor dQ, torch::Tensor dK, torch::Tensor dV, "
+        f"int stages, int causal, double softmax_scale);"
+      )
+      lines.append(
+        f"void ffpa_attn_bwd_bf16f32_d{d}(torch::Tensor Q, torch::Tensor K, "
+        f"torch::Tensor V, torch::Tensor O, torch::Tensor softmax_lse, "
+        f"torch::Tensor dO, torch::Tensor dQ, torch::Tensor dK, torch::Tensor dV, "
+        f"int stages, int causal, double softmax_scale);"
+      )
+    lines.append("")
+    return "\n".join(lines)
+
+  @classmethod
+  def _render_bwd_entry(cls, d: int, symbol: str, t_in: str) -> str:
+    """Render a per-headdim backward wrapper that calls the backward launcher."""
+    call = (
+      f"launch_ffpa_attn_bwd_template<{t_in}, {d}, "
+      "{S}>(Q, K, V, O, softmax_lse, dO, dQ, dK, dV, causal, softmax_scale);"
+    )
+    stage_body = (
+      "#ifdef ENABLE_FFPA_ALL_STAGES\n"
+      "  if (stages == 2) {\n"
+      f"    {call.replace('{S}', '2')}\n"
+      "  } else if (stages == 3) {\n"
+      f"    {call.replace('{S}', '3')}\n"
+      "  } else if (stages == 4) {\n"
+      f"    {call.replace('{S}', '4')}\n"
+      "  } else {\n"
+      f"    {call.replace('{S}', '1')}\n"
+      "  }\n"
+      "#else\n"
+      "  if (stages == 2) {\n"
+      f"    {call.replace('{S}', '2')}\n"
+      "  } else {\n"
+      f"    {call.replace('{S}', '1')}\n"
+      "  }\n"
+      "#endif\n"
+    )
+    head = [
+      f"void {symbol}(",
+      "    torch::Tensor Q,",
+      "    torch::Tensor K,",
+      "    torch::Tensor V,",
+      "    torch::Tensor O,",
+      "    torch::Tensor softmax_lse,",
+      "    torch::Tensor dO,",
+      "    torch::Tensor dQ,",
+      "    torch::Tensor dK,",
+      "    torch::Tensor dV,",
+      "    int stages,",
+      "    int causal,",
+      "    double softmax_scale) {",
+    ]
+    return "\n".join(head) + "\n" + stage_body + "}\n"
+
+  @classmethod
+  def _render_bwd_per_headdim_fp16_tu(cls, d: int) -> str:
+    """Render backward fp16 TU for headdim d."""
+    lines = [
+      "// AUTO-GENERATED by env.py. DO NOT EDIT.",
+      '#include "launch_templates.cuh"',
+      "using namespace ffpa;",
+      "",
+    ]
+    body = "\n".join(lines) + "\n"
+    body += cls._render_bwd_entry(d, f"ffpa_attn_bwd_fp16f32_d{d}", "__half")
+    return body
+
+  @classmethod
+  def _render_bwd_per_headdim_bf16_tu(cls, d: int) -> str:
+    """Render backward bf16 TU for headdim d."""
+    lines = [
+      "// AUTO-GENERATED by env.py. DO NOT EDIT.",
+      '#include "launch_templates.cuh"',
+      "using namespace ffpa;",
+      "",
+    ]
+    body = "\n".join(lines) + "\n"
+    body += cls._render_bwd_entry(d, f"ffpa_attn_bwd_bf16f32_d{d}", "__nv_bfloat16")
+    return body
+
+  @staticmethod
+  def _render_bwd_dispatch_tu(headdims) -> str:
+    """Render backward dispatch TU with dtype checks and headdim switch."""
+
+    def _cases(symbol_prefix: str) -> str:
+      return "\n".join(
+        f"    case {d}: {symbol_prefix}_d{d}"
+        "(Q, K, V, O, softmax_lse, dO, dQ, dK, dV, stages, causal, softmax_scale); break;" for d in headdims
+      )
+
+    def _fn(name: str, symbol_prefix: str, torch_dtype: str) -> str:
+      return (
+        f"void {name}(\n"
+        "    torch::Tensor Q,\n"
+        "    torch::Tensor K,\n"
+        "    torch::Tensor V,\n"
+        "    torch::Tensor O,\n"
+        "    torch::Tensor softmax_lse,\n"
+        "    torch::Tensor dO,\n"
+        "    torch::Tensor dQ,\n"
+        "    torch::Tensor dK,\n"
+        "    torch::Tensor dV,\n"
+        "    int stages,\n"
+        "    int causal,\n"
+        "    double softmax_scale) {\n"
+        f"  CHECK_TORCH_TENSOR_DTYPE(Q, {torch_dtype})\n"
+        f"  CHECK_TORCH_TENSOR_DTYPE(K, {torch_dtype})\n"
+        f"  CHECK_TORCH_TENSOR_DTYPE(V, {torch_dtype})\n"
+        f"  CHECK_TORCH_TENSOR_DTYPE(O, {torch_dtype})\n"
+        f"  CHECK_TORCH_TENSOR_DTYPE(dO, {torch_dtype})\n"
+        f"  CHECK_TORCH_TENSOR_DTYPE(dQ, {torch_dtype})\n"
+        f"  CHECK_TORCH_TENSOR_DTYPE(dK, {torch_dtype})\n"
+        f"  CHECK_TORCH_TENSOR_DTYPE(dV, {torch_dtype})\n"
+        "  const int d = Q.size(3);\n"
+        "  switch (d) {\n"
+        f"{_cases(symbol_prefix)}\n"
+        '    default: throw std::runtime_error("bwd: headdim not supported!");\n'
+        "  }\n"
+        "}\n"
+      )
+
+    return (
+      "// AUTO-GENERATED by env.py. DO NOT EDIT.\n"
+      '#include "cuffpa/logging.cuh"\n'
+      '#include "ffpa_attn_bwd_decls.h"\n'
+      "\n" + _fn("ffpa_attn_bwd_fp16f32", "ffpa_attn_bwd_fp16f32", "torch::kHalf") + "\n" +
+      _fn("ffpa_attn_bwd_bf16f32", "ffpa_attn_bwd_bf16f32", "torch::kBFloat16")
+    )
+
+  # -------------------- forward entry rendering --------------------
 
   @classmethod
   def _render_entry(cls, d: int, symbol: str, t_in: str, body_prefix: list) -> str:
@@ -614,10 +760,10 @@ class ENV(object):
     return (
       "// AUTO-GENERATED by env.py. DO NOT EDIT.\n"
       '#include "cuffpa/logging.cuh"\n'
-      '#include "ffpa_attn_decls.h"\n'
-      "\n" + _fn("ffpa_mma_acc_f16_fp16", "ffpa_mma_acc_f16_fp16", "torch::kHalf") + "\n" +
-      _fn("ffpa_mma_acc_f32_fp16", "ffpa_mma_acc_f32_fp16", "torch::kHalf") + "\n" +
-      _fn("ffpa_mma_acc_f32_bf16", "ffpa_mma_acc_f32_bf16", "torch::kBFloat16")
+      '#include "ffpa_attn_fwd_decls.h"\n'
+      "\n" + _fn("ffpa_attn_fwd_fp16f16", "ffpa_attn_fwd_fp16f16", "torch::kHalf") + "\n" +
+      _fn("ffpa_attn_fwd_fp16f32", "ffpa_attn_fwd_fp16f32", "torch::kHalf") + "\n" +
+      _fn("ffpa_attn_fwd_bf16f32", "ffpa_attn_fwd_bf16f32", "torch::kBFloat16")
     )
 
   @staticmethod
@@ -634,7 +780,7 @@ class ENV(object):
     # Generate per-headdim TUs under csrc/cuffpa/generated/ and use them as
     # the actual build sources. Splitting by headdim enables MAX_JOBS to
     # drive nvcc on many small files in parallel and cuts the build time
-    # of the heavy launch_ffpa_mma_template instantiations.
+    # of the heavy launch_ffpa_attn_fwd_template instantiations.
     generated_files = ENV.generate_split_headdim_sources(build_pkg=build_pkg)
     generated_sources = [p for p in generated_files if p.endswith(".cu")]
     if build_pkg:

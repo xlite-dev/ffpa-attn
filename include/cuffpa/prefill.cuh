@@ -775,5 +775,67 @@ __device__ __forceinline__ void sync_store_o_r2g(
   }  // kValTileSeqLenP = 1
 }
 
+// ---- backward pass helpers ----
+
+// Reconstruct P from S and LSE: P = exp(S*scale - LSE).
+template <const int kValTileSeqLenK, const int kMmaAccFloat32, typename kDataType>
+__device__ __forceinline__ void sync_compute_p_from_lse(uint32_t* R_S, const float* lse_ptr,
+                                                        const float scale, const int limb) {
+  using Traits = DtypeTraits<kDataType>;
+  const int lid = threadIdx.x % WARP_SIZE;
+  const float l0 = lse_ptr[lid / 4];
+  const float l1 = lse_ptr[lid / 4 + 8];
+#pragma unroll
+  for (int c = 0; c < kValTileSeqLenK; ++c) {
+    if constexpr (kMmaAccFloat32) {
+      float* fp = reinterpret_cast<float*>(&R_S[c * 4]);
+      kDataType* hp = reinterpret_cast<kDataType*>(&R_S[c * 2]);
+      hp[0] = Traits::from_float(__expf(__fmaf_rn(fp[0], scale, -l0)));
+      hp[1] = Traits::from_float(__expf(__fmaf_rn(fp[1], scale, -l0)));
+      hp[2] = Traits::from_float(__expf(__fmaf_rn(fp[2], scale, -l1)));
+      hp[3] = Traits::from_float(__expf(__fmaf_rn(fp[3], scale, -l1)));
+    } else {
+      kDataType* hp = reinterpret_cast<kDataType*>(&R_S[c * 2]);
+      float v0 = __expf(__fmaf_rn(Traits::to_float(hp[0]), scale, -l0));
+      float v1 = __expf(__fmaf_rn(Traits::to_float(hp[1]), scale, -l0));
+      float v2 = __expf(__fmaf_rn(Traits::to_float(hp[2]), scale, -l1));
+      float v3 = __expf(__fmaf_rn(Traits::to_float(hp[3]), scale, -l1));
+      hp[0] = Traits::from_float(v0);
+      hp[1] = Traits::from_float(v1);
+      hp[2] = Traits::from_float(v2);
+      hp[3] = Traits::from_float(v3);
+    }
+  }
+}
+
+// dS = P * (dP - dP_sum).
+template <const int kValTileSeqLenK, const int kMmaAccFloat32, typename kDataType>
+__device__ __forceinline__ void sync_compute_ds_softmax_gradient(uint32_t* R_P, uint32_t* R_dP,
+                                                                 const float* dp_sum,
+                                                                 const int limb) {
+  using Traits = DtypeTraits<kDataType>;
+  const int lid = threadIdx.x % WARP_SIZE;
+  const float ds0 = dp_sum[lid / 4];
+  const float ds1 = dp_sum[lid / 4 + 8];
+#pragma unroll
+  for (int c = 0; c < kValTileSeqLenK; ++c) {
+    float* fd = reinterpret_cast<float*>(&R_dP[c * 4]);
+    if constexpr (kMmaAccFloat32) {
+      kDataType* hp = reinterpret_cast<kDataType*>(&R_P[c * 2]);
+      fd[0] = Traits::to_float(hp[0]) * (fd[0] - ds0);
+      fd[1] = Traits::to_float(hp[1]) * (fd[1] - ds0);
+      fd[2] = Traits::to_float(hp[2]) * (fd[2] - ds1);
+      fd[3] = Traits::to_float(hp[3]) * (fd[3] - ds1);
+    } else {
+      kDataType* hp = reinterpret_cast<kDataType*>(&R_P[c * 2]);
+      kDataType* hd = reinterpret_cast<kDataType*>(&R_dP[c * 2]);
+      fd[0] = Traits::to_float(hp[0]) * (Traits::to_float(hd[0]) - ds0);
+      fd[1] = Traits::to_float(hp[1]) * (Traits::to_float(hd[1]) - ds0);
+      fd[2] = Traits::to_float(hp[2]) * (Traits::to_float(hd[2]) - ds1);
+      fd[3] = Traits::to_float(hp[3]) * (Traits::to_float(hd[3]) - ds1);
+    }
+  }
+}
+
 }  // namespace prefill
 }  // namespace ffpa
