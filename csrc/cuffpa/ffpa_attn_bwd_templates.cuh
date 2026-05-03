@@ -78,6 +78,40 @@
 //     With stage=1, SMEM accumulators fit; with stage>=2 (multi-stage
 //     pipeline), extra SMEM is needed for ring buffers.
 //
+// 2d. Future Optimization: Small-Bc Persistent-KV Backward
+//     Split-D is primarily needed because large D makes full K/V residency too
+//     expensive in SMEM.  For moderate D, a separate FA-style backward path can
+//     reduce global-memory traffic by shrinking Bc and keeping K[Bc,D] and
+//     V[Bc,D] resident in SMEM for the whole KV-owning block.  This should be a
+//     distinct small-Bc persistent-KV kernel, not a replacement for the current
+//     O(1)-in-D Split-D fallback.
+//
+//     With dtype fp16/bf16, persistent K+V costs:
+//       2 * Bc * D * sizeof(dtype)
+//
+//     For Bc=32:
+//       D=512  -> 64 KB for K+V only
+//       D=768  -> 96 KB for K+V only
+//       D=1024 -> 128 KB for K+V only
+//
+//     The kernel still needs Q/dO streaming buffers, P/dS transpose scratch,
+//     padding, and synchronization space.  On a 100 KB-class SMEM budget,
+//     Bc=32 is therefore realistic for D<=512, marginal or too large for D=768,
+//     and not viable for D=1024.  D=1024 may require Bc=16, but that increases
+//     the number of KV tiles and can worsen atomic/grid overhead.
+//
+//     Expected dispatch policy:
+//       if persistent-KV smem fits, use small-Bc persistent-KV backward;
+//       otherwise use this Split-D backward with D-slice staging.
+//
+//     Minimal first implementation target:
+//       Br=64, Bc=32, D=512.  Load K[Bc,D] and V[Bc,D] once into SMEM at block
+//       entry, stream Q/dO/O by D-slice, compute S/dP in Phase 1, then reuse the
+//       resident K in Phase 2 for dQ.  Q/dO still need to be streamed for dK/dV,
+//       and dQ plus dK/dV may still use atomicAdd initially.  The main expected
+//       win is removing repeated global K/V loads across Q tiles and avoiding
+//       the Phase-2 K reload when SMEM budget allows it.
+//
 // ----------------------------------------------------------------------------
 // 3. Split-D Backward Algorithm (FA-2 Schedule + Head-Dim Tiling)
 // ----------------------------------------------------------------------------
