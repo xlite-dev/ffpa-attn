@@ -91,7 +91,7 @@ if not SKIP_CUDA_EXT:
         os.path.relpath(s, _ROOT) for s in ENV.get_build_sources(build_pkg=True)
       ],
       extra_compile_args={
-        "cxx": ["-O3", "-std=c++17"],
+        "cxx": [flag for flag in ENV.extra_gcc_flags() if flag.strip()],
         "nvcc": [flag for flag in (ENV.get_build_cuda_cflags(build_pkg=True) + cc_flag) if flag.strip()],
       },
       include_dirs=[

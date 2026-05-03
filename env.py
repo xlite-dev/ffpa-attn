@@ -85,6 +85,12 @@ class ENV(object):
   # if True: grid(N/Br, H, B) else: grid(N/Br, B * H)
   ENABLE_FFPA_LAUNCH_GRID_DNHB = bool(int(os.environ.get("ENABLE_FFPA_LAUNCH_GRID_DNHB", 0)))
 
+  # Enable native Split-D backward kernel generation/compilation. Defaults to
+  # disabled because the current native backward is still slower than SDPA.
+  # For development/validation, explicitly build with:
+  #   export ENABLE_FFPA_BACKWARD_IMPL=1
+  ENABLE_FFPA_BACKWARD_IMPL = bool(int(os.environ.get("ENABLE_FFPA_BACKWARD_IMPL", 0)))
+
   # --- Build-time tuning knobs ---------------------------------------------
   # Target CUDA SM architectures to compile for. When empty the current
   # device's capability is used. Accepts a comma/semicolon/space separated
@@ -214,6 +220,10 @@ class ENV(object):
     return cls.ENABLE_FFPA_LAUNCH_GRID_DNHB
 
   @classmethod
+  def enable_backward_impl(cls):
+    return cls.ENABLE_FFPA_BACKWARD_IMPL
+
+  @classmethod
   def env_cuda_cflags(cls):
     extra_env_cflags = []
     if cls.enable_all_mutistages():
@@ -246,6 +256,8 @@ class ENV(object):
       extra_env_cflags.append("-DENABLE_FFPA_REGISTERS_PIPE_KV")
     if cls.enable_launch_grid_dnhb():
       extra_env_cflags.append("-DENBALE_FFPA_LAUNCH_GRID_DNHB")
+    if cls.enable_backward_impl():
+      extra_env_cflags.append("-DENABLE_FFPA_BACKWARD_IMPL")
 
     if cls.enable_persist_kv_g2s():
       assert (cls.enable_persist_q_g2s()), "PERSIST_Q_G2S must be enable if PERSIST_KV_G2S is enabled."
@@ -260,6 +272,13 @@ class ENV(object):
       assert not all((cls.enable_qkv_smem_share(), cls.enable_persist_kv_g2s())
                      ), "PERSIST_KV_G2S and QKV_SMEM_SHARE can not both enabled."
     return extra_env_cflags
+
+  @classmethod
+  def extra_gcc_flags(cls):
+    extra_gcc_flags = ["-O3", "-std=c++17"]
+    if cls.enable_backward_impl():
+      extra_gcc_flags.append("-DENABLE_FFPA_BACKWARD_IMPL")
+    return extra_gcc_flags
 
   @classmethod
   def list_ffpa_env(cls):
@@ -295,6 +314,7 @@ class ENV(object):
     formatenv("ENABLE_FFPA_SMEM_SWIZZLE_V", cls.enable_smem_swizzle_v())
     formatenv("ENABLE_FFPA_REGISTERS_PIPE_KV", cls.enable_registers_pipe_kv())
     formatenv("ENABLE_FFPA_LAUNCH_GRID_DNHB", cls.enable_launch_grid_dnhb())
+    formatenv("ENABLE_FFPA_BACKWARD_IMPL", cls.enable_backward_impl())
     pretty_print_line()
 
   @staticmethod
@@ -396,15 +416,30 @@ class ENV(object):
       generated.append(fp16_path)
       generated.append(bf16_path)
 
-    # Backward code generation disabled (Split-D kernel not yet implemented).
-    # The SDPA backward delegation path is used instead.
+    bwd_generated_count = 0
+    if cls.enable_backward_impl():
+      # ---- backward TUs per headdim, one per dtype ----
+      bwd_decls_path = os.path.join(gen_dir, "ffpa_attn_bwd_decls.h")
+      cls._write_if_changed(bwd_decls_path, cls._render_bwd_decls_header(headdims))
+      generated.append(bwd_decls_path)
+      for d in headdims:
+        bwd_fp16_path = os.path.join(gen_dir, f"ffpa_attn_bwd_fp16_hdim{d}.cu")
+        bwd_bf16_path = os.path.join(gen_dir, f"ffpa_attn_bwd_bf16_hdim{d}.cu")
+        cls._write_if_changed(bwd_fp16_path, cls._render_bwd_per_headdim_fp16_tu(d))
+        cls._write_if_changed(bwd_bf16_path, cls._render_bwd_per_headdim_bf16_tu(d))
+        generated.append(bwd_fp16_path)
+        generated.append(bwd_bf16_path)
+      bwd_generated_count = len(headdims) * 2
 
-    # Clean up stale TUs from previous builds (including backward TUs).
+    # Clean up stale TUs from previous generator layouts. When native backward
+    # is disabled, also remove generated backward files from earlier dev builds
+    # so the default forward-only build does not leave confusing bwd artifacts.
     stale_file_names = {"ffpa_attn_L1_decls.h", "ffpa_attn_L1_dispatch.cu"}
     for fname in os.listdir(gen_dir):
       is_stale = ((fname.startswith("ffpa_attn_L1_acc_") and fname.endswith(".cu"))
                   or (fname.startswith("ffpa_attn_L1_hdim") and fname.endswith(".cu"))
-                  or (fname.startswith("ffpa_attn_bwd_") and fname.endswith(".cu")) or fname in stale_file_names)
+                  or (not cls.enable_backward_impl() and fname.startswith("ffpa_attn_bwd_"))
+                  or fname in stale_file_names)
       if is_stale:
         stale = os.path.join(gen_dir, fname)
         try:
@@ -417,9 +452,15 @@ class ENV(object):
     cls._write_if_changed(dispatch_path, cls._render_dispatch_tu(headdims))
     generated.append(dispatch_path)
 
+    if cls.enable_backward_impl():
+      bwd_dispatch_path = os.path.join(gen_dir, "ffpa_attn_bwd_dispatch.cu")
+      cls._write_if_changed(bwd_dispatch_path, cls._render_bwd_dispatch_tu(headdims))
+      generated.append(bwd_dispatch_path)
+      bwd_generated_count += 1
+
     if build_pkg:
       pretty_print_line(
-        f"Generated {len(headdims) * 2} per-(headdim,dtype) TUs under {gen_dir}",
+        f"Generated {len(headdims) * 2 + bwd_generated_count} per-headdim TUs under {gen_dir}",
         sep="",
         mode="left",
       )
@@ -595,23 +636,11 @@ class ENV(object):
       "{S}>(Q, K, V, O, softmax_lse, dO, dQ, dK, dV, causal, softmax_scale);"
     )
     stage_body = (
-      "#ifdef ENABLE_FFPA_ALL_STAGES\n"
-      "  if (stages == 2) {\n"
-      f"    {call.replace('{S}', '2')}\n"
-      "  } else if (stages == 3) {\n"
-      f"    {call.replace('{S}', '3')}\n"
-      "  } else if (stages == 4) {\n"
-      f"    {call.replace('{S}', '4')}\n"
-      "  } else {\n"
-      f"    {call.replace('{S}', '1')}\n"
-      "  }\n"
-      "#else\n"
       "  if (stages == 2) {\n"
       f"    {call.replace('{S}', '2')}\n"
       "  } else {\n"
       f"    {call.replace('{S}', '1')}\n"
       "  }\n"
-      "#endif\n"
     )
     head = [
       f"void {symbol}(",

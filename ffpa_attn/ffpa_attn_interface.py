@@ -18,6 +18,7 @@ import warnings
 
 import torch
 
+from ._C import ffpa_attn_backward as _ffpa_attn_bwd_cuda
 from ._C import ffpa_attn_forward as _ffpa_attn_fwd_cuda
 
 # The SM90 TMA large-d kernel only widens the K box to 64 fp16 cols
@@ -106,6 +107,37 @@ def _ffpa_attn_forward_cuda(
   return O, softmax_lse
 
 
+def _ffpa_attn_backward_cuda(
+  Q: torch.Tensor,
+  K: torch.Tensor,
+  V: torch.Tensor,
+  O: torch.Tensor,
+  softmax_lse: torch.Tensor,
+  dO: torch.Tensor,
+  stages: int,
+  causal: int,
+  softmax_scale: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+  dQ = torch.zeros_like(Q)
+  dK = torch.zeros_like(K)
+  dV = torch.zeros_like(V)
+  _ffpa_attn_bwd_cuda(
+    Q,
+    K,
+    V,
+    O,
+    softmax_lse,
+    dO,
+    dQ,
+    dK,
+    dV,
+    stages,
+    causal,
+    softmax_scale,
+  )
+  return dQ, dK, dV
+
+
 # ---------------------------------------------------------------------------
 # Autograd Function
 # ---------------------------------------------------------------------------
@@ -171,6 +203,7 @@ class FFPAAttnFunc(torch.autograd.Function):
       )
       ctx.causal = causal
       ctx.softmax_scale = softmax_scale
+      ctx.stages = stages
       ctx.high_precision_grad = high_precision_grad
       ctx.backward_backend = backward_backend
 
@@ -187,7 +220,19 @@ class FFPAAttnFunc(torch.autograd.Function):
     philox_offset = zero_u64[1].unsqueeze(0)
 
     if D > 256:
-      if ctx.backward_backend in ("triton", "split_d"):
+      if ctx.backward_backend == "split_d":
+        dq, dk, dv = _ffpa_attn_backward_cuda(
+          q.contiguous(),
+          k.contiguous(),
+          v.contiguous(),
+          O.contiguous(),
+          lse.contiguous(),
+          grad_out.contiguous(),
+          ctx.stages,
+          int(bool(ctx.causal)),
+          ctx.softmax_scale,
+        )
+      elif ctx.backward_backend == "triton":
         # ---- Split-D Triton backward ----
         from ffpa_attn.triton._ffpa_bwd import _ffpa_attn_backward as _ffpa_triton_bwd
 

@@ -584,10 +584,12 @@ void launch_ffpa_attn_bwd_template(torch::Tensor Q, torch::Tensor K, torch::Tens
   constexpr int kMmaAtomN = 8;
   constexpr int kMmaAtomK = 16;
 
-  constexpr int kMmaTileSeqLenQ = getConfigMmaTileSeqLenQP<kHeadDim>();
+  // Backward carries extra P/dS staging and gradient state, so keep the
+  // attention tile at 64x64 for RTX 3080 shared-memory pressure.
+  constexpr int kMmaTileSeqLenQ = 4;
   constexpr int kMmaTileSeqLenK = 1;
   constexpr int kValTileSeqLenQ = 1;
-  constexpr int kValTileSeqLenK = getConfigWarpTileSeqLenK<kHeadDim>();
+  constexpr int kValTileSeqLenK = 8;
   constexpr int kValTileSeqLenP = 1;
   constexpr int kValTileHeadDimV = getConfigWarpTileHeadDimV<kHeadDim>();
 
@@ -613,8 +615,9 @@ void launch_ffpa_attn_bwd_template(torch::Tensor Q, torch::Tensor K, torch::Tens
   constexpr int kRegPipeKV = 0;
   constexpr int kMmaTileSeqLenP = kMmaTileSeqLenQ;
   constexpr int kMmaTileHeadDimV = 1;
-  constexpr int kStageQK = kStage;
-  constexpr int kStagePV = kStage;
+  constexpr int kStageEff = (kStage == 2) ? 2 : 1;
+  constexpr int kStageQK = kStageEff;
+  constexpr int kStagePV = kStageEff;
 
   const int Nb = Q.size(0);
   const int Nh = Q.size(1);
@@ -632,27 +635,26 @@ void launch_ffpa_attn_bwd_template(torch::Tensor Q, torch::Tensor K, torch::Tens
   // KV-driven grid: one block per KV tile × (batch × kv_heads)
   const dim3 grid = dim3(utils::div_ceil(Nkv, Bc), Nb * Nh_kv, 1);
 
-  // SMEM: Q + K + V + dO + O pipeline buffers only (~5KB for stage=1).
-  // dK/dV written directly to global via atomicAdd; no SMEM accumulators.
+  // SMEM: Q + K + V + dO + O pipeline buffers plus per-Q-warp transposed P/dS
+  // scratch tiles for dK/dV MMA. dK/dV are written directly via atomicAdd.
   constexpr int kQKVSmemMaxSize = (3 * kStageQK * Br * (kMmaAtomK + kPadQ) +  // Q + dO + O
                                    kStageQK * Bc * (kMmaAtomK + kPadK) +      // K
                                    kStagePV * Bc * (kMmaAtomN * 2 + kPadV)) *
                                   sizeof(kDataType);  // V
-  constexpr int kSmemTotal = kQKVSmemMaxSize;
+  constexpr int kTransposeScratchPad = 8;
+  constexpr int kTransposeScratchSmemSize =
+      2 * kMmaTileSeqLenQ * Bc * (kMmaAtomK + kTransposeScratchPad) * sizeof(kDataType);
+  constexpr int kSmemTotal = kQKVSmemMaxSize + kTransposeScratchSmemSize;
 
   auto stream = at::cuda::getCurrentCUDAStream();
   int smem_size = static_cast<int>(kSmemTotal);
-
-  // Force stage=1 for backward (SMEM budget; multi-stage will be added later).
-  constexpr int kStageQK_eff = 1;
-  constexpr int kStagePV_eff = 1;
 
   auto ffpa_bwd_kernel = ffpa_stages_split_q_large_d_bwd_template<
       kDataType, kHeadDim, kMmaAtomM, kMmaAtomN, kMmaAtomK, kMmaTileSeqLenQ, kMmaTileSeqLenK,
       kMmaTileSeqLenP, kMmaTileHeadDimV, kValTileSeqLenQ, kValTileSeqLenK, kValTileSeqLenP,
       kValTileHeadDimV, kMmaAccFloat32QK, kMmaAccFloat32PV, kOStorageAccFloat32, kPrefetchQK,
-      kPrefetchPV, kShareSmemQKV, kPersistQs2r, kPersistQg2s, kRegPipeKV, kStageQK_eff,
-      kStagePV_eff, kPadQ, kPadK, kPadV>;
+      kPrefetchPV, kShareSmemQKV, kPersistQs2r, kPersistQg2s, kRegPipeKV, kStageQK, kStagePV, kPadQ,
+      kPadK, kPadV>;
 
   cudaFuncSetAttribute(ffpa_bwd_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
   ffpa_bwd_kernel<<<grid, block, smem_size, stream>>>(

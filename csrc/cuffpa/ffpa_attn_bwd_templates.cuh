@@ -230,6 +230,141 @@
 
 #include "cuffpa/prefill.cuh"
 
+namespace ffpa {
+namespace bwd {
+
+__device__ __forceinline__ int c_frag_local_row(const int lane_id, const int reg_id) {
+  return (lane_id / 4) + ((reg_id >= 2) ? 8 : 0);
+}
+
+__device__ __forceinline__ int c_frag_local_col(const int lane_id, const int n_tile_id,
+                                                const int reg_id) {
+  return n_tile_id * 8 + (lane_id % 4) * 2 + (reg_id & 1);
+}
+
+template <typename kDataType, const int kNumNTiles, const int kSmemStride>
+__device__ __forceinline__ void store_c_frag_to_smem(const uint32_t (&R_C)[kNumNTiles][4],
+                                                     kDataType* __restrict__ smem_tile) {
+  using Traits = DtypeTraits<kDataType>;
+  const int lane_id = threadIdx.x % WARP_SIZE;
+#pragma unroll
+  for (int n_tile = 0; n_tile < kNumNTiles; ++n_tile) {
+#pragma unroll
+    for (int reg_id = 0; reg_id < 4; ++reg_id) {
+      const int row = c_frag_local_row(lane_id, reg_id);
+      const int col = c_frag_local_col(lane_id, n_tile, reg_id);
+      const float val = reinterpret_cast<const float*>(&R_C[n_tile][0])[reg_id];
+      smem_tile[row * kSmemStride + col] = Traits::from_float(val);
+    }
+  }
+}
+
+template <typename kDataType, const int kNumNTiles>
+__device__ __forceinline__ void compute_p_and_ds_from_lse(
+    const uint32_t (&R_S)[kNumNTiles][4], const uint32_t (&R_dP)[kNumNTiles][4],
+    uint32_t (&R_P)[kNumNTiles][2], uint32_t (&R_dS)[kNumNTiles][2], const float lse_row0,
+    const float lse_row8, const float dp_sum_row0, const float dp_sum_row8, const float scale) {
+  using Traits = DtypeTraits<kDataType>;
+#pragma unroll
+  for (int n_tile = 0; n_tile < kNumNTiles; ++n_tile) {
+    const float* scores = reinterpret_cast<const float*>(&R_S[n_tile][0]);
+    const float* dP = reinterpret_cast<const float*>(&R_dP[n_tile][0]);
+    kDataType* p_frag = reinterpret_cast<kDataType*>(&R_P[n_tile][0]);
+    kDataType* ds_frag = reinterpret_cast<kDataType*>(&R_dS[n_tile][0]);
+    const float p0 = __expf(__fmaf_rn(scores[0], scale, -lse_row0));
+    const float p1 = __expf(__fmaf_rn(scores[1], scale, -lse_row0));
+    const float p2 = __expf(__fmaf_rn(scores[2], scale, -lse_row8));
+    const float p3 = __expf(__fmaf_rn(scores[3], scale, -lse_row8));
+    p_frag[0] = Traits::from_float(p0);
+    p_frag[1] = Traits::from_float(p1);
+    p_frag[2] = Traits::from_float(p2);
+    p_frag[3] = Traits::from_float(p3);
+    ds_frag[0] = Traits::from_float(p0 * (dP[0] - dp_sum_row0));
+    ds_frag[1] = Traits::from_float(p1 * (dP[1] - dp_sum_row0));
+    ds_frag[2] = Traits::from_float(p2 * (dP[2] - dp_sum_row8));
+    ds_frag[3] = Traits::from_float(p3 * (dP[3] - dp_sum_row8));
+  }
+}
+
+template <typename kDataType, const int kHeadDim>
+__device__ __forceinline__ void atomic_add_c_frag_to_dq(
+    const uint32_t (&R_C)[4], kDataType* __restrict__ dQ, const int q_gmem_offset,
+    const int Q_tile_id, const int warp_QP, const int d_col_base, const int Nq, const float scale) {
+  using Traits = DtypeTraits<kDataType>;
+  const int lane_id = threadIdx.x % WARP_SIZE;
+  const float* c_frag = reinterpret_cast<const float*>(&R_C[0]);
+#pragma unroll
+  for (int reg_id = 0; reg_id < 4; ++reg_id) {
+    const int row = Q_tile_id * 64 + warp_QP * 16 + c_frag_local_row(lane_id, reg_id);
+    const int col = d_col_base + (lane_id % 4) * 2 + (reg_id & 1);
+    if (row < Nq && col < kHeadDim) {
+      atomicAdd(&dQ[q_gmem_offset + row * kHeadDim + col],
+                Traits::from_float(c_frag[reg_id] * scale));
+    }
+  }
+}
+
+template <typename kDataType, const int kNumNTiles, const int kSmemStride>
+__device__ __forceinline__ void store_packed_c_frag_transposed_to_smem(
+    const uint32_t (&R_C)[kNumNTiles][2], kDataType* __restrict__ smem_tile) {
+  const int lane_id = threadIdx.x % WARP_SIZE;
+#pragma unroll
+  for (int n_tile = 0; n_tile < kNumNTiles; ++n_tile) {
+    const kDataType* frag = reinterpret_cast<const kDataType*>(&R_C[n_tile][0]);
+#pragma unroll
+    for (int reg_id = 0; reg_id < 4; ++reg_id) {
+      const int row = c_frag_local_row(lane_id, reg_id);
+      const int col = c_frag_local_col(lane_id, n_tile, reg_id);
+      smem_tile[col * kSmemStride + row] = frag[reg_id];
+    }
+  }
+}
+
+template <typename kDataType, const int kHeadDim>
+__device__ __forceinline__ void atomic_add_c_frag_to_dkv(const uint32_t (&R_C)[4],
+                                                         kDataType* __restrict__ dKV,
+                                                         const int kv_gmem_offset,
+                                                         const int K_tile_id, const int kv_frag,
+                                                         const int d_col_base, const int Nkv,
+                                                         const float scale) {
+  using Traits = DtypeTraits<kDataType>;
+  const int lane_id = threadIdx.x % WARP_SIZE;
+  const float* c_frag = reinterpret_cast<const float*>(&R_C[0]);
+#pragma unroll
+  for (int reg_id = 0; reg_id < 4; ++reg_id) {
+    const int row = K_tile_id * 64 + kv_frag * 16 + c_frag_local_row(lane_id, reg_id);
+    const int col = d_col_base + (lane_id % 4) * 2 + (reg_id & 1);
+    if (row < Nkv && col < kHeadDim) {
+      atomicAdd(&dKV[kv_gmem_offset + row * kHeadDim + col],
+                Traits::from_float(c_frag[reg_id] * scale));
+    }
+  }
+}
+
+template <typename kDataType, const int kHeadDim>
+__device__ __forceinline__ float dot_do_o_row_4lane(const kDataType* __restrict__ dO,
+                                                    const kDataType* __restrict__ O,
+                                                    const int q_gmem_offset, const int row,
+                                                    const int Nq) {
+  using Traits = DtypeTraits<kDataType>;
+  const int lane_id = threadIdx.x % WARP_SIZE;
+  const int lane_col = lane_id % 4;
+  float acc = 0.0f;
+  if (row < Nq) {
+#pragma unroll 1
+    for (int d = lane_col; d < kHeadDim; d += 4) {
+      const int addr = q_gmem_offset + row * kHeadDim + d;
+      acc += Traits::to_float(dO[addr]) * Traits::to_float(O[addr]);
+    }
+  }
+  acc += __shfl_xor_sync(0xffffffff, acc, 1);
+  acc += __shfl_xor_sync(0xffffffff, acc, 2);
+  return acc;
+}
+
+}  // namespace bwd
+}  // namespace ffpa
+
 template <typename kDataType, const int kHeadDim, const int kMmaAtomM, const int kMmaAtomN,
           const int kMmaAtomK, const int kMmaTileSeqLenQ, const int kMmaTileSeqLenK,
           const int kMmaTileSeqLenP, const int kMmaTileHeadDimV, const int kValTileSeqLenQ,
@@ -238,23 +373,298 @@ template <typename kDataType, const int kHeadDim, const int kMmaAtomM, const int
           const int kPrefetchQK, const int kPrefetchPV, const int kShareSmemQKV,
           const int kPersistQs2r, const int kPersistQg2s, const int kRegPipeKV, const int kStageQK,
           const int kStagePV, const int kPadQ, const int kPadK, const int kPadV>
-__global__ void ffpa_stages_split_q_large_d_bwd_template(const kDataType*, const kDataType*,
-                                                         const kDataType*, const float*,
-                                                         const kDataType*, const kDataType*,
-                                                         kDataType*, kDataType*, kDataType*,
-                                                         const int, const int, const int, const int,
-                                                         const float, const int, const int) {
-  // NOT YET IMPLEMENTED.  See algorithm documentation in the file header.
-  // The SDPA backward delegation path (backward_backend="sdpa") is used
-  // as the default and only supported option for now.
-  //
-  // Note: we use sizeof(kDataType) == 0 rather than static_assert(false)
-  // because NVCC evaluates static_assert(false) at template *definition*
-  // time (not instantiation time), which would break every TU that
-  // includes this header via launch_templates.cuh.  The dependent
-  // expression sizeof(kDataType) == 0 is deferred to instantiation and
-  // only fires if the backward template is actually instantiated.
-  static_assert(sizeof(kDataType) == 0,
-                "ffpa_stages_split_q_large_d_bwd_template is not yet implemented. "
-                "Use backward_backend='sdpa' instead.");
+__global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
+    ffpa_stages_split_q_large_d_bwd_template(
+        const kDataType* __restrict__ Q, const kDataType* __restrict__ K,
+        const kDataType* __restrict__ V, const float* __restrict__ softmax_lse,
+        const kDataType* __restrict__ dO, const kDataType* __restrict__ O,
+        kDataType* __restrict__ dQ, kDataType* __restrict__ dK, kDataType* __restrict__ dV,
+        const int Nq, const int Nkv, const int Nh, const int Nh_kv, const float scale, const int Tc,
+        const int causal) {
+  ffpa::prefill::check_large_d_compiling_states<
+      kHeadDim, kMmaAtomM, kMmaAtomN, kMmaAtomK, kMmaTileSeqLenQ, kMmaTileSeqLenK, kMmaTileSeqLenP,
+      kMmaTileHeadDimV, kValTileSeqLenQ, kValTileSeqLenK, kValTileSeqLenP, kValTileHeadDimV,
+      kMmaAccFloat32QK, kMmaAccFloat32PV, kOStorageAccFloat32, kPrefetchQK, kPrefetchPV,
+      kShareSmemQKV, kPersistQs2r, kPersistQg2s, kRegPipeKV, kStageQK, kStagePV, kPadQ, kPadK,
+      kPadV>();
+
+  constexpr int Br = kMmaAtomM * kMmaTileSeqLenQ * kValTileSeqLenQ;
+  constexpr int Bc = kMmaAtomN * kMmaTileSeqLenK * kValTileSeqLenK;
+  constexpr int kNumThreads = WARP_SIZE * kMmaTileSeqLenQ * kMmaTileSeqLenK;
+
+  static_assert(Br == 64, "Split-D backward stage-1 target currently requires Br=64.");
+  static_assert(Bc == 64, "Split-D backward stage-1 target currently requires Bc=64.");
+  static_assert(kMmaAccFloat32QK == 1 && kMmaAccFloat32PV == 1,
+                "Split-D backward requires fp32 MMA accumulators.");
+  static_assert(kStageQK <= 2 && kStagePV <= 2,
+                "Split-D backward currently supports only stage<=2.");
+
+#ifdef ENABLE_FFPA_LAUNCH_GRID_DNHB
+  const int Nb_id = blockIdx.z;
+  const int kv_head_idx = blockIdx.y;
+#else
+  const int Nb_id = blockIdx.y / Nh_kv;
+  const int kv_head_idx = blockIdx.y % Nh_kv;
+#endif
+  const int K_tile_id = blockIdx.x;
+  if (K_tile_id >= Tc || K_tile_id * Bc >= Nkv) {
+    return;
+  }
+
+  const int group_size = Nh / Nh_kv;
+  const int first_q_head = kv_head_idx * group_size;
+  const int kv_gmem_offset = (Nb_id * Nh_kv * Nkv * kHeadDim) + (kv_head_idx * Nkv * kHeadDim);
+  const int q_batch_offset = Nb_id * Nh * Nq * kHeadDim;
+  const int lse_batch_offset = Nb_id * Nh * Nq;
+
+  extern __shared__ __align__(16) unsigned char ffpa_smem_raw[];
+  kDataType* smem = reinterpret_cast<kDataType*>(ffpa_smem_raw);
+  constexpr int Q_tile_size = Br * (kMmaAtomK + kPadQ);
+  constexpr int K_tile_size = Bc * (kMmaAtomK + kPadK);
+  constexpr int V_tile_size = Bc * (kMmaAtomK + kPadV);
+  constexpr int kTransposeScratchPad = 8;
+  constexpr int Transpose_tile_size = Bc * (kMmaAtomK + kTransposeScratchPad);
+  kDataType* Q_tile_smem = smem;
+  kDataType* dO_tile_smem = Q_tile_smem + kStageQK * Q_tile_size;
+  kDataType* O_tile_smem = dO_tile_smem + kStageQK * Q_tile_size;
+  kDataType* K_tile_smem = O_tile_smem + kStageQK * Q_tile_size;
+  kDataType* V_tile_smem = K_tile_smem + kStageQK * K_tile_size;
+  kDataType* P_t_smem = V_tile_smem + kStagePV * V_tile_size;
+  kDataType* dS_t_smem = P_t_smem + kMmaTileSeqLenQ * Transpose_tile_size;
+  const uint32_t smem_Q_base_ptr = __cvta_generic_to_shared(Q_tile_smem);
+  const uint32_t smem_dO_base_ptr = __cvta_generic_to_shared(dO_tile_smem);
+  const uint32_t smem_K_base_ptr = __cvta_generic_to_shared(K_tile_smem);
+  const uint32_t smem_V_base_ptr = __cvta_generic_to_shared(V_tile_smem);
+
+  const int warp_QP = threadIdx.x / WARP_SIZE;
+  constexpr int warp_KV = 0;
+  const int Tr = ffpa::utils::div_ceil(Nq, Br);
+
+  uint32_t R_Q[4];
+  uint32_t R_dO[4];
+  uint32_t R_K[2];
+  uint32_t R_VK[2];
+  uint32_t R_S[kValTileSeqLenK][4];
+  uint32_t R_dP[kValTileSeqLenK][4];
+  uint32_t R_P[kValTileSeqLenK][2];
+  uint32_t R_dS[kValTileSeqLenK][2];
+  uint32_t R_dQ[4];
+  uint32_t R_QB[2];
+  uint32_t R_dOB[2];
+  uint32_t R_P_T[4];
+  uint32_t R_dS_T[4];
+  uint32_t R_dK[4];
+  uint32_t R_dV[4];
+
+#pragma unroll 1
+  for (int q_head_offset = 0; q_head_offset < group_size; ++q_head_offset) {
+    const int q_head_idx = first_q_head + q_head_offset;
+    const int q_gmem_offset = q_batch_offset + q_head_idx * Nq * kHeadDim;
+
+#pragma unroll 1
+    for (int Q_tile_id = Tr - 1; Q_tile_id >= 0; --Q_tile_id) {
+      if (Q_tile_id * Br >= Nq) {
+        continue;
+      }
+      const int Br_base = Q_tile_id * Br;
+      const int kv_offset = Nkv - Nq;
+      if (causal && (Br_base + Br - 1 + kv_offset) < K_tile_id * Bc) {
+        continue;
+      }
+
+      ffpa::utils::fill_2D_regs<uint32_t, kValTileSeqLenK, 4>(R_S, 0);
+      ffpa::utils::fill_2D_regs<uint32_t, kValTileSeqLenK, 4>(R_dP, 0);
+      ffpa::utils::fill_2D_regs<uint32_t, kValTileSeqLenK, 2>(R_P, 0);
+      ffpa::utils::fill_2D_regs<uint32_t, kValTileSeqLenK, 2>(R_dS, 0);
+
+      const int lane_id = threadIdx.x % WARP_SIZE;
+      const int row_in_warp0 = warp_QP * kMmaAtomM + lane_id / 4;
+      const int row_in_warp8 = row_in_warp0 + 8;
+      const int q_row0 = Q_tile_id * Br + row_in_warp0;
+      const int q_row8 = Q_tile_id * Br + row_in_warp8;
+
+      // Softmax backward row correction:
+      //   dP_sum[row] = rowsum(dO[row, :] * O[row, :])
+      // This is independent of the KV tile and is consumed by
+      //   dS = P * (dP - dP_sum).
+      // Current implementation computes it inside every KV-tile block, so the
+      // same Q row is recomputed across K_tile_id. A future faster design could
+      // precompute D[row] once per (B,H,Q) row, as FlashAttention backward does,
+      // or fuse it into a Q-driven prepass to remove this repeated global IO.
+      const float dp_sum_row0 =
+          ffpa::bwd::dot_do_o_row_4lane<kDataType, kHeadDim>(dO, O, q_gmem_offset, q_row0, Nq);
+      const float dp_sum_row8 =
+          ffpa::bwd::dot_do_o_row_4lane<kDataType, kHeadDim>(dO, O, q_gmem_offset, q_row8, Nq);
+
+      // Phase 1: reconstruct the attention logits and dP for this Q/KV tile.
+      // MMA math, accumulated across the full head dimension:
+      //   S  = Q  @ K^T
+      //   dP = dO @ V^T
+      // Note: Q/dO/K are loaded again in Phase 2 below. That duplicate global
+      // load is one of the main current bottlenecks. Future work should either
+      // keep reusable fragments alive across phases or restructure the loop so
+      // Phase 2 can consume the same staged Q/dO/K data without a second gmem
+      // pass. The hard-coded stage=0 also means stages=2 currently does not
+      // provide real cp.async overlap for this backward path.
+#pragma unroll 1
+      for (int tile_d = 0; tile_d < (kHeadDim / kMmaAtomK); ++tile_d) {
+        constexpr int stage = 0;
+        ffpa::prefill::cp_async_qkv_g2s<Br, Q_tile_size, kHeadDim, kMmaAtomK, kNumThreads, kPadQ>(
+            smem_Q_base_ptr, Q, q_gmem_offset, Q_tile_id, tile_d, stage, Nq);
+        ffpa::prefill::cp_async_qkv_g2s<Br, Q_tile_size, kHeadDim, kMmaAtomK, kNumThreads, kPadQ>(
+            smem_dO_base_ptr, dO, q_gmem_offset, Q_tile_id, tile_d, stage, Nq);
+        ffpa::prefill::cp_async_qkv_g2s<Bc, K_tile_size, kHeadDim, kMmaAtomK, kNumThreads, kPadK>(
+            smem_K_base_ptr, K, kv_gmem_offset, K_tile_id, tile_d, stage, Nkv);
+        ffpa::prefill::cp_async_qkv_g2s<Bc, V_tile_size, kHeadDim, kMmaAtomK, kNumThreads, kPadV>(
+            smem_V_base_ptr, V, kv_gmem_offset, K_tile_id, tile_d, stage, Nkv);
+        ffpa::cp_async::commit_group();
+        ffpa::cp_async::wait_group<0>();
+        __syncthreads();
+
+        ffpa::prefill::sync_fetch_qkv_frags_s2r<0, 4, Q_tile_size, kMmaAtomM, kMmaAtomN, kMmaAtomK,
+                                                kPadQ, kDataType>(smem_Q_base_ptr, &R_Q[0], warp_QP,
+                                                                  0, 0, stage);
+        ffpa::prefill::sync_fetch_qkv_frags_s2r<0, 4, Q_tile_size, kMmaAtomM, kMmaAtomN, kMmaAtomK,
+                                                kPadQ, kDataType>(smem_dO_base_ptr, &R_dO[0],
+                                                                  warp_QP, 0, 0, stage);
+
+#pragma unroll
+        for (int kv_frag = 0; kv_frag < kValTileSeqLenK; ++kv_frag) {
+          ffpa::prefill::sync_fetch_qkv_frags_s2r<0, 2, K_tile_size, kMmaAtomM, kMmaAtomN,
+                                                  kMmaAtomK, kPadK, kDataType>(
+              smem_K_base_ptr, &R_K[0], warp_KV, kv_frag, 0, stage);
+          ffpa::prefill::sync_fetch_qkv_frags_s2r<0, 2, V_tile_size, kMmaAtomM, kMmaAtomN,
+                                                  kMmaAtomK, kPadV, kDataType>(
+              smem_V_base_ptr, &R_VK[0], warp_KV, kv_frag, 0, stage);
+          ffpa::mma::m16n8k16_abf32<kDataType, ffpa::mma::MMAMode::kInplaceUpdate>(
+              &R_S[kv_frag][0], &R_S[kv_frag][1], &R_S[kv_frag][2], &R_S[kv_frag][3], &R_Q[0],
+              &R_Q[1], &R_Q[2], &R_Q[3], &R_K[0], &R_K[1]);
+          ffpa::mma::m16n8k16_abf32<kDataType, ffpa::mma::MMAMode::kInplaceUpdate>(
+              &R_dP[kv_frag][0], &R_dP[kv_frag][1], &R_dP[kv_frag][2], &R_dP[kv_frag][3], &R_dO[0],
+              &R_dO[1], &R_dO[2], &R_dO[3], &R_VK[0], &R_VK[1]);
+        }
+        __syncthreads();
+      }
+
+      const int kv_valid_local = Nkv - K_tile_id * Bc;
+      if (kv_valid_local < Bc) {
+        ffpa::prefill::sync_apply_kv_mask<kValTileSeqLenK, kMmaAccFloat32QK, kDataType>(
+            &R_S[0][0], kv_valid_local);
+      }
+      if (causal) {
+        ffpa::prefill::sync_apply_causal_mask<kValTileSeqLenK, kMmaAccFloat32QK, kDataType>(
+            &R_S[0][0], warp_QP, Br_base, K_tile_id * Bc, kv_offset);
+      }
+
+      const int lse_offset = lse_batch_offset + q_head_idx * Nq;
+      const float lse_row0 = (q_row0 < Nq) ? softmax_lse[lse_offset + q_row0] : INFINITY;
+      const float lse_row8 = (q_row8 < Nq) ? softmax_lse[lse_offset + q_row8] : INFINITY;
+      // Phase 1b/1c: reconstruct softmax probability and softmax gradient.
+      //   P  = exp(S * scale - LSE)
+      //   dS = P * (dP - dP_sum)
+      // P and dS are packed back to activation dtype so Tensor Core MMA can be
+      // used in Phase 2. This sacrifices some gradient precision versus fp32
+      // dS/P storage but keeps register and shared-memory pressure manageable.
+      ffpa::bwd::compute_p_and_ds_from_lse<kDataType, kValTileSeqLenK>(
+          R_S, R_dP, R_P, R_dS, lse_row0, lse_row8, dp_sum_row0, dp_sum_row8, scale);
+
+      // C-fragment -> transposed shared-memory staging for dK/dV:
+      //   dK = scale * dS^T @ Q
+      //   dV = P^T @ dO
+      // R_P/R_dS are produced in MMA C-fragment layout, but the dK/dV MMA wants
+      // them as A operands. The current safe path stores a transposed P/dS tile
+      // to shared memory and reloads it with ldmatrix.x4. This extra smem write,
+      // read, and barrier are expensive. A high-value future optimization is a
+      // register-level C-fragment -> A-fragment transpose that removes this
+      // scratch path entirely.
+      kDataType* warp_P_t_smem = P_t_smem + warp_QP * Transpose_tile_size;
+      kDataType* warp_dS_t_smem = dS_t_smem + warp_QP * Transpose_tile_size;
+      ffpa::bwd::store_packed_c_frag_transposed_to_smem<kDataType, kValTileSeqLenK,
+                                                        kMmaAtomK + kTransposeScratchPad>(
+          R_P, warp_P_t_smem);
+      ffpa::bwd::store_packed_c_frag_transposed_to_smem<kDataType, kValTileSeqLenK,
+                                                        kMmaAtomK + kTransposeScratchPad>(
+          R_dS, warp_dS_t_smem);
+      __syncthreads();
+      const uint32_t smem_warp_P_t_base_ptr = __cvta_generic_to_shared(warp_P_t_smem);
+      const uint32_t smem_warp_dS_t_base_ptr = __cvta_generic_to_shared(warp_dS_t_smem);
+
+      // Phase 2: gradient MMA and global accumulation.
+      //   dQ += scale * dS @ K
+      //   dK += scale * dS^T @ Q
+      //   dV += P^T @ dO
+      // Current bottleneck: Phase 2 reloads Q/dO/K from global memory even
+      // though Phase 1 has already loaded the same Q/dO/K D-slices to build
+      // S and dP. Removing or hiding this duplicate gmem traffic is one of the
+      // highest-priority future optimizations; possible directions include a
+      // true staged pipeline, keeping selected fragments live across phases, or
+      // restructuring the loop so Phase 2 consumes the Phase 1 staged data.
+      // dQ is partial across KV tiles, so it needs either atomicAdd or a
+      // separate reduction design. dK/dV are partial across Q tiles within this
+      // KV-owning block; atomics are correct but very expensive. A future fast
+      // design should accumulate dK/dV per block in registers/shared memory by
+      // D-slice and write each KV tile once, avoiding global atomics while still
+      // staying within the per-block shared-memory budget.
+#pragma unroll 1
+      for (int tile_d = 0; tile_d < (kHeadDim / kMmaAtomK); ++tile_d) {
+        constexpr int stage = 0;
+        ffpa::prefill::cp_async_qkv_g2s<Br, Q_tile_size, kHeadDim, kMmaAtomK, kNumThreads, kPadQ>(
+            smem_Q_base_ptr, Q, q_gmem_offset, Q_tile_id, tile_d, stage, Nq);
+        ffpa::prefill::cp_async_qkv_g2s<Br, Q_tile_size, kHeadDim, kMmaAtomK, kNumThreads, kPadQ>(
+            smem_dO_base_ptr, dO, q_gmem_offset, Q_tile_id, tile_d, stage, Nq);
+        ffpa::prefill::cp_async_qkv_g2s<Bc, K_tile_size, kHeadDim, kMmaAtomK, kNumThreads, kPadK>(
+            smem_K_base_ptr, K, kv_gmem_offset, K_tile_id, tile_d, stage, Nkv);
+        ffpa::cp_async::commit_group();
+        ffpa::cp_async::wait_group<0>();
+        __syncthreads();
+
+#pragma unroll
+        for (int d_subtile = 0; d_subtile < 2; ++d_subtile) {
+          ffpa::utils::fill_1D_regs<uint32_t, 4>(R_dQ, 0);
+#pragma unroll
+          for (int kv_frag = 0; kv_frag < (Bc / kMmaAtomK); ++kv_frag) {
+            ffpa::prefill::sync_fetch_qkv_frags_s2r<1, 2, K_tile_size, kMmaAtomM, kMmaAtomN,
+                                                    kMmaAtomK, kPadK, kDataType>(
+                smem_K_base_ptr, &R_K[0], warp_KV, d_subtile, kv_frag, stage);
+            const int ds_offset = kv_frag * 2;
+            ffpa::mma::m16n8k16_abf32<kDataType, ffpa::mma::MMAMode::kInplaceUpdate>(
+                &R_dQ[0], &R_dQ[1], &R_dQ[2], &R_dQ[3], &R_dS[ds_offset][0], &R_dS[ds_offset][1],
+                &R_dS[ds_offset + 1][0], &R_dS[ds_offset + 1][1], &R_K[0], &R_K[1]);
+          }
+          const int d_col_base = tile_d * kMmaAtomK + d_subtile * kMmaAtomN;
+          ffpa::bwd::atomic_add_c_frag_to_dq<kDataType, kHeadDim>(
+              R_dQ, dQ, q_gmem_offset, Q_tile_id, warp_QP, d_col_base, Nq, scale);
+
+          ffpa::prefill::sync_fetch_qkv_frags_s2r<1, 2, Q_tile_size, kMmaAtomM, kMmaAtomN,
+                                                  kMmaAtomK, kPadQ, kDataType>(
+              smem_Q_base_ptr, &R_QB[0], warp_KV, d_subtile, warp_QP, stage);
+          ffpa::prefill::sync_fetch_qkv_frags_s2r<1, 2, Q_tile_size, kMmaAtomM, kMmaAtomN,
+                                                  kMmaAtomK, kPadQ, kDataType>(
+              smem_dO_base_ptr, &R_dOB[0], warp_KV, d_subtile, warp_QP, stage);
+#pragma unroll
+          for (int kv_frag = 0; kv_frag < (Bc / kMmaAtomK); ++kv_frag) {
+            ffpa::utils::fill_1D_regs<uint32_t, 4>(R_dK, 0);
+            ffpa::utils::fill_1D_regs<uint32_t, 4>(R_dV, 0);
+            ffpa::prefill::sync_fetch_qkv_frags_s2r<0, 4, Transpose_tile_size, kMmaAtomM, kMmaAtomN,
+                                                    kMmaAtomK, kTransposeScratchPad, kDataType>(
+                smem_warp_dS_t_base_ptr, &R_dS_T[0], kv_frag, 0, 0, stage);
+            ffpa::prefill::sync_fetch_qkv_frags_s2r<0, 4, Transpose_tile_size, kMmaAtomM, kMmaAtomN,
+                                                    kMmaAtomK, kTransposeScratchPad, kDataType>(
+                smem_warp_P_t_base_ptr, &R_P_T[0], kv_frag, 0, 0, stage);
+            ffpa::mma::m16n8k16_abf32<kDataType, ffpa::mma::MMAMode::kInplaceUpdate>(
+                &R_dK[0], &R_dK[1], &R_dK[2], &R_dK[3], &R_dS_T[0], &R_dS_T[1], &R_dS_T[2],
+                &R_dS_T[3], &R_QB[0], &R_QB[1]);
+            ffpa::mma::m16n8k16_abf32<kDataType, ffpa::mma::MMAMode::kInplaceUpdate>(
+                &R_dV[0], &R_dV[1], &R_dV[2], &R_dV[3], &R_P_T[0], &R_P_T[1], &R_P_T[2], &R_P_T[3],
+                &R_dOB[0], &R_dOB[1]);
+            ffpa::bwd::atomic_add_c_frag_to_dkv<kDataType, kHeadDim>(
+                R_dK, dK, kv_gmem_offset, K_tile_id, kv_frag, d_col_base, Nkv, scale);
+            ffpa::bwd::atomic_add_c_frag_to_dkv<kDataType, kHeadDim>(
+                R_dV, dV, kv_gmem_offset, K_tile_id, kv_frag, d_col_base, Nkv, 1.0f);
+          }
+        }
+        __syncthreads();
+      }
+    }
+  }
 }
