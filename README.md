@@ -188,7 +188,7 @@ print(f"dK vs SDPA dK max_abs_err={(dk - k_ref.grad).abs().max().item():.4e}")
 print(f"dV vs SDPA dV max_abs_err={(dv - v_ref.grad).abs().max().item():.4e}")
 ```
 
-Runnable examples are provided under [`examples/ffpa_attn_fwd.py`](./examples/ffpa_attn_fwd.py) and [`examples/ffpa_attn_bwd.py`](./examples/ffpa_attn_bwd.py). The performance snapshot for the NVIDIA L20 with Headdim=512 is listed below:
+Runnable examples are provided under [`examples`](./examples). The performance snapshot for the NVIDIA L20 with Headdim=512 is listed below:
 
 <div align='center'>
 
