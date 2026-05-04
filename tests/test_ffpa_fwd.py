@@ -1,7 +1,7 @@
 """FFPA attention forward pass unit tests.
 
 Tests the unified ``ffpa_attn_func`` dispatcher across fp16 / bf16 activations.
-Heavy benchmarking lives under ``bench/bench_ffpa_attn.py``.
+Heavy benchmarking lives under ``bench/bench_ffpa_fwd.py``.
 
 Backward pass tests live in ``test_ffpa_bwd.py``.
 """

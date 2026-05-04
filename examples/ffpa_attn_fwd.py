@@ -1,6 +1,6 @@
-"""FFPA attention examples.
+"""FFPA attention forward examples.
 
-Runs ``ffpa_attn_func`` across the supported shape regimes and compares
+Runs ``ffpa_attn_func`` across the supported forward shape regimes and compares
 against ``torch.nn.functional.scaled_dot_product_attention``:
 
 1. Self-Attention            -- Nq == Nkv, Nh_q == Nh_kv, aligned seqlen.
@@ -13,16 +13,20 @@ against ``torch.nn.functional.scaled_dot_product_attention``:
 
 Usage::
 
-    CUDA_VISIBLE_DEVICES=0 python examples/run_ffpa_attn.py
+    CUDA_VISIBLE_DEVICES=0 python examples/ffpa_attn_fwd.py
 """
 
 from __future__ import annotations
 
 import math
+import os
+import sys
 import time
 
 import torch
 import torch.nn.functional as F
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from ffpa_attn import ffpa_attn_func
 
@@ -102,15 +106,10 @@ def main() -> None:
     raise SystemExit("CUDA is required to run this example.")
 
   for dtype in (torch.float16, torch.bfloat16):
-    # 1) Self-Attention: Nq == Nkv, Nh_q == Nh_kv, aligned seqlen.
     _run_case("self-attn", dtype, B=1, Nh_q=32, Nh_kv=32, Nq=8192, Nkv=8192)
-    # 2) Cross / Decode Attention: short query against long KV cache.
     _run_case("cross-attn", dtype, B=1, Nh_q=32, Nh_kv=32, Nq=1024, Nkv=8192)
-    # 3) Grouped-Query Attention: Nh_q=32, Nh_kv=8 (group size 4).
     _run_case("gqa", dtype, B=1, Nh_q=32, Nh_kv=8, Nq=8192, Nkv=8192)
-    # 4) Causal Attention: queries aligned to the tail of the KV sequence.
     _run_case("causal", dtype, B=1, Nh_q=32, Nh_kv=32, Nq=8192, Nkv=8192, causal=True)
-    # 5) Non-aligned seqlen (8191 % 64 != 0): exercises tail-tile masking.
     _run_case("non-aligned", dtype, B=1, Nh_q=8, Nh_kv=8, Nq=8191, Nkv=8191)
 
 

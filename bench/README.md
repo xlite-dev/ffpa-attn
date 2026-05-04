@@ -3,7 +3,8 @@
 ## Quick Start
 
 ```bash
-python3 bench/bench_ffpa_attn.py --B 1 --H 48 --N 8192 --show-all --D 320
+python3 bench/bench_ffpa_fwd.py --B 1 --H 48 --N 8192 --D 320
+python3 bench/bench_ffpa_bwd.py --B 1 --H 48 --N 8192 --D 320
 ```
 
 ## Benchmark Summary
