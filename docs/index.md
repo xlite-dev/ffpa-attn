@@ -17,7 +17,7 @@
 </div>
 
 > [!NOTE]
-> FFPA has been tested on `Ampere`, `Ada`, `Hopper`, and `Blackwell` architectures (e.g., A30, L20, 4090, H200, 5090). For `Hopper` and `Blackwell`, it still delivers a `1.5×–2.3×↑🎉` speedup over SDPA for headdim `> 256`.
+> FFPA has been tested on `Ampere`, `Ada`, `Hopper`, and `Blackwell` architectures (e.g., A30, L20, 4090, H200, 5090). For `Hopper` and `Blackwell`, it delivers a `1.5×–2.3×↑🎉` speedup over SDPA on the forward pass for headdim `> 256`, and a `1.07x~1.15x🎉` end-to-end speedup for forward + backward.
 
 ## 📖 Quick Start
 
@@ -147,7 +147,47 @@ out = ffpa_attn_func(q, k, v, causal=True)
 print(out.shape, out.dtype)  # (1, 8, 128, 512)
 ```
 
-A runnable end-to-end example (with self-attn, cross-attn, GQA and causal-attn) is provided under [`examples`](https://github.com/xlite-dev/ffpa-attn/blob/main/examples/run_ffpa_attn.py). The performance snapshot for the NVIDIA L20 with Headdim=512 is listed below:
+<a id="example-backward"></a>
+
+**Backward Pass** example (compare dQ / dK / dV against SDPA):
+```python
+import math
+import torch
+import torch.nn.functional as F
+from ffpa_attn import ffpa_attn_func
+
+# Focus on a large-headdim case where FFPA is typically used.
+B, H, N, D = 1, 32, 8192, 512
+scale = 1.0 / math.sqrt(D)
+
+q = torch.randn(B, H, N, D, dtype=torch.bfloat16, device="cuda", requires_grad=True)
+k = torch.randn(B, H, N, D, dtype=torch.bfloat16, device="cuda", requires_grad=True)
+v = torch.randn(B, H, N, D, dtype=torch.bfloat16, device="cuda", requires_grad=True)
+
+out = ffpa_attn_func(
+  q,
+  k,
+  v,
+  softmax_scale=scale,
+)
+out.sum().backward()
+
+dq = q.grad.detach().clone()
+dk = k.grad.detach().clone()
+dv = v.grad.detach().clone()
+
+q_ref = q.detach().clone().requires_grad_(True)
+k_ref = k.detach().clone().requires_grad_(True)
+v_ref = v.detach().clone().requires_grad_(True)
+out_ref = F.scaled_dot_product_attention(q_ref, k_ref, v_ref, scale=scale)
+out_ref.sum().backward()
+
+print(f"dQ vs SDPA dQ max_abs_err={(dq - q_ref.grad).abs().max().item():.4e}")
+print(f"dK vs SDPA dK max_abs_err={(dk - k_ref.grad).abs().max().item():.4e}")
+print(f"dV vs SDPA dV max_abs_err={(dv - v_ref.grad).abs().max().item():.4e}")
+```
+
+Runnable examples are provided under [`examples/ffpa_attn_fwd.py`](https://github.com/xlite-dev/ffpa-attn/blob/main/examples/ffpa_attn_fwd.py) and [`examples/ffpa_attn_bwd.py`](https://github.com/xlite-dev/ffpa-attn/blob/main/examples/ffpa_attn_bwd.py). The performance snapshot for the NVIDIA L20 with Headdim=512 is listed below:
 
 <div align="center" markdown="1">
 

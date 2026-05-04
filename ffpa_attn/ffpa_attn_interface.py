@@ -102,11 +102,16 @@ def _ffpa_attn_forward_cuda(
 
     If O is None, it is allocated as zeros; otherwise the caller-supplied
     buffer is written in place.  softmax_lse is always allocated as
-    [B, Nh_q, Nq] float32.
+    [B, Nh_q, Nq] float32 view backed by storage whose last-dimension stride is rounded up
+    to a multiple of 8 so PyTorch's mem-efficient SDPA backward can reuse it
+    without repacking on non-aligned sequence lengths.
     """
   if O is None:
     O = torch.zeros_like(Q)  # noqa: E741
-  softmax_lse = torch.empty(Q.size(0), Q.size(1), Q.size(2), dtype=torch.float32, device=Q.device)
+  seqlen_q = Q.size(2)
+  seqlen_q_aligned = ((seqlen_q + 7) // 8) * 8
+  softmax_lse_storage = torch.empty(Q.size(0), Q.size(1), seqlen_q_aligned, dtype=torch.float32, device=Q.device)
+  softmax_lse = softmax_lse_storage[..., :seqlen_q]
   _ffpa_attn_fwd_cuda(Q, K, V, O, softmax_lse, stages, acc, causal, softmax_scale, tma)
   return O, softmax_lse
 
@@ -234,7 +239,7 @@ class FFPAAttnFunc(torch.autograd.Function):
         k.contiguous(),
         v.contiguous(),
         O.contiguous(),
-        lse.contiguous(),
+        lse,
       )
       ctx.causal = causal
       ctx.softmax_scale = softmax_scale
@@ -328,10 +333,15 @@ class FFPAAttnFunc(torch.autograd.Function):
         # == H*D).  FFPA produces contiguous BHND O which, after the
         # internal transpose(1,2), yields non-standard strides and
         # triggers illegal memory accesses.  We reshape FFPA's O to
-        # match SDPA's stride pattern; LSE is contiguous in both
-        # paths so a simple clone is sufficient.
+        # match SDPA's stride pattern. The mem-efficient backward also
+        # requires lse.stride(1) % 8 == 0 when num_heads > 1, so pad the
+        # sequence dimension for odd tail lengths before calling into it.
         O = O.transpose(1, 2).contiguous().transpose(1, 2)  # noqa: E741
-        lse = lse.clone()
+        if lse.size(1) > 1 and (lse.stride(1) % 8) != 0:
+          seqlen_q_aligned = ((lse.size(-1) + 7) // 8) * 8
+          lse_padded = torch.empty(*lse.shape[:-1], seqlen_q_aligned, dtype=lse.dtype, device=lse.device)
+          lse_padded[..., :lse.size(-1)] = lse
+          lse = lse_padded
 
         if ctx.high_precision_grad:
           _q = q.float()
