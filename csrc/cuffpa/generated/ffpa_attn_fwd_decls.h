@@ -2,6 +2,42 @@
 #pragma once
 #include <torch/types.h>
 
-void ffpa_attn_fwd_fp16f16_d288(torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O, torch::Tensor softmax_lse, int stages, int causal, double softmax_scale, int tma);
-void ffpa_attn_fwd_fp16f32_d288(torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O, torch::Tensor softmax_lse, int stages, int causal, double softmax_scale, int tma);
-void ffpa_attn_fwd_bf16f32_d288(torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O, torch::Tensor softmax_lse, int stages, int causal, double softmax_scale, int tma);
+void ffpa_attn_fwd_fp16f16_d256(torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O, torch::Tensor softmax_lse, int stages, int causal, double softmax_scale, int tma);
+void ffpa_attn_fwd_fp16f32_d256(torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O, torch::Tensor softmax_lse, int stages, int causal, double softmax_scale, int tma);
+void ffpa_attn_fwd_bf16f32_d256(torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O, torch::Tensor softmax_lse, int stages, int causal, double softmax_scale, int tma);
+void ffpa_attn_fwd_fp16f16_d320(torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O, torch::Tensor softmax_lse, int stages, int causal, double softmax_scale, int tma);
+void ffpa_attn_fwd_fp16f32_d320(torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O, torch::Tensor softmax_lse, int stages, int causal, double softmax_scale, int tma);
+void ffpa_attn_fwd_bf16f32_d320(torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O, torch::Tensor softmax_lse, int stages, int causal, double softmax_scale, int tma);
+void ffpa_attn_fwd_fp16f16_d384(torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O, torch::Tensor softmax_lse, int stages, int causal, double softmax_scale, int tma);
+void ffpa_attn_fwd_fp16f32_d384(torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O, torch::Tensor softmax_lse, int stages, int causal, double softmax_scale, int tma);
+void ffpa_attn_fwd_bf16f32_d384(torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O, torch::Tensor softmax_lse, int stages, int causal, double softmax_scale, int tma);
+void ffpa_attn_fwd_fp16f16_d448(torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O, torch::Tensor softmax_lse, int stages, int causal, double softmax_scale, int tma);
+void ffpa_attn_fwd_fp16f32_d448(torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O, torch::Tensor softmax_lse, int stages, int causal, double softmax_scale, int tma);
+void ffpa_attn_fwd_bf16f32_d448(torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O, torch::Tensor softmax_lse, int stages, int causal, double softmax_scale, int tma);
+void ffpa_attn_fwd_fp16f16_d512(torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O, torch::Tensor softmax_lse, int stages, int causal, double softmax_scale, int tma);
+void ffpa_attn_fwd_fp16f32_d512(torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O, torch::Tensor softmax_lse, int stages, int causal, double softmax_scale, int tma);
+void ffpa_attn_fwd_bf16f32_d512(torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O, torch::Tensor softmax_lse, int stages, int causal, double softmax_scale, int tma);
+void ffpa_attn_fwd_fp16f16_d576(torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O, torch::Tensor softmax_lse, int stages, int causal, double softmax_scale, int tma);
+void ffpa_attn_fwd_fp16f32_d576(torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O, torch::Tensor softmax_lse, int stages, int causal, double softmax_scale, int tma);
+void ffpa_attn_fwd_bf16f32_d576(torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O, torch::Tensor softmax_lse, int stages, int causal, double softmax_scale, int tma);
+void ffpa_attn_fwd_fp16f16_d640(torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O, torch::Tensor softmax_lse, int stages, int causal, double softmax_scale, int tma);
+void ffpa_attn_fwd_fp16f32_d640(torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O, torch::Tensor softmax_lse, int stages, int causal, double softmax_scale, int tma);
+void ffpa_attn_fwd_bf16f32_d640(torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O, torch::Tensor softmax_lse, int stages, int causal, double softmax_scale, int tma);
+void ffpa_attn_fwd_fp16f16_d704(torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O, torch::Tensor softmax_lse, int stages, int causal, double softmax_scale, int tma);
+void ffpa_attn_fwd_fp16f32_d704(torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O, torch::Tensor softmax_lse, int stages, int causal, double softmax_scale, int tma);
+void ffpa_attn_fwd_bf16f32_d704(torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O, torch::Tensor softmax_lse, int stages, int causal, double softmax_scale, int tma);
+void ffpa_attn_fwd_fp16f16_d768(torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O, torch::Tensor softmax_lse, int stages, int causal, double softmax_scale, int tma);
+void ffpa_attn_fwd_fp16f32_d768(torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O, torch::Tensor softmax_lse, int stages, int causal, double softmax_scale, int tma);
+void ffpa_attn_fwd_bf16f32_d768(torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O, torch::Tensor softmax_lse, int stages, int causal, double softmax_scale, int tma);
+void ffpa_attn_fwd_fp16f16_d832(torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O, torch::Tensor softmax_lse, int stages, int causal, double softmax_scale, int tma);
+void ffpa_attn_fwd_fp16f32_d832(torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O, torch::Tensor softmax_lse, int stages, int causal, double softmax_scale, int tma);
+void ffpa_attn_fwd_bf16f32_d832(torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O, torch::Tensor softmax_lse, int stages, int causal, double softmax_scale, int tma);
+void ffpa_attn_fwd_fp16f16_d896(torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O, torch::Tensor softmax_lse, int stages, int causal, double softmax_scale, int tma);
+void ffpa_attn_fwd_fp16f32_d896(torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O, torch::Tensor softmax_lse, int stages, int causal, double softmax_scale, int tma);
+void ffpa_attn_fwd_bf16f32_d896(torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O, torch::Tensor softmax_lse, int stages, int causal, double softmax_scale, int tma);
+void ffpa_attn_fwd_fp16f16_d960(torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O, torch::Tensor softmax_lse, int stages, int causal, double softmax_scale, int tma);
+void ffpa_attn_fwd_fp16f32_d960(torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O, torch::Tensor softmax_lse, int stages, int causal, double softmax_scale, int tma);
+void ffpa_attn_fwd_bf16f32_d960(torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O, torch::Tensor softmax_lse, int stages, int causal, double softmax_scale, int tma);
+void ffpa_attn_fwd_fp16f16_d1024(torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O, torch::Tensor softmax_lse, int stages, int causal, double softmax_scale, int tma);
+void ffpa_attn_fwd_fp16f32_d1024(torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O, torch::Tensor softmax_lse, int stages, int causal, double softmax_scale, int tma);
+void ffpa_attn_fwd_bf16f32_d1024(torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O, torch::Tensor softmax_lse, int stages, int causal, double softmax_scale, int tma);
