@@ -18,6 +18,8 @@ import warnings
 
 import torch
 
+from ._C import ffpa_attn_backward as _ffpa_attn_bwd_cuda
+from ._C import ffpa_attn_backward_persistent_kv as _ffpa_attn_bwd_persistent_kv_cuda
 from ._C import ffpa_attn_forward as _ffpa_attn_fwd_cuda
 
 # The SM90 TMA large-d kernel only widens the K box to 64 fp16 cols
@@ -106,6 +108,68 @@ def _ffpa_attn_forward_cuda(
   return O, softmax_lse
 
 
+def _ffpa_attn_backward_cuda(
+  Q: torch.Tensor,
+  K: torch.Tensor,
+  V: torch.Tensor,
+  O: torch.Tensor,
+  softmax_lse: torch.Tensor,
+  dO: torch.Tensor,
+  stages: int,
+  causal: int,
+  softmax_scale: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+  dQ = torch.zeros_like(Q)
+  dK = torch.zeros_like(K)
+  dV = torch.zeros_like(V)
+  _ffpa_attn_bwd_cuda(
+    Q,
+    K,
+    V,
+    O,
+    softmax_lse,
+    dO,
+    dQ,
+    dK,
+    dV,
+    stages,
+    causal,
+    softmax_scale,
+  )
+  return dQ, dK, dV
+
+
+def _ffpa_attn_backward_persistent_kv_cuda(
+  Q: torch.Tensor,
+  K: torch.Tensor,
+  V: torch.Tensor,
+  O: torch.Tensor,
+  softmax_lse: torch.Tensor,
+  dO: torch.Tensor,
+  stages: int,
+  causal: int,
+  softmax_scale: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+  dQ = torch.zeros_like(Q)
+  dK = torch.zeros_like(K)
+  dV = torch.zeros_like(V)
+  _ffpa_attn_bwd_persistent_kv_cuda(
+    Q,
+    K,
+    V,
+    O,
+    softmax_lse,
+    dO,
+    dQ,
+    dK,
+    dV,
+    stages,
+    causal,
+    softmax_scale,
+  )
+  return dQ, dK, dV
+
+
 # ---------------------------------------------------------------------------
 # Autograd Function
 # ---------------------------------------------------------------------------
@@ -171,6 +235,7 @@ class FFPAAttnFunc(torch.autograd.Function):
       )
       ctx.causal = causal
       ctx.softmax_scale = softmax_scale
+      ctx.stages = stages
       ctx.high_precision_grad = high_precision_grad
       ctx.backward_backend = backward_backend
 
@@ -187,50 +252,120 @@ class FFPAAttnFunc(torch.autograd.Function):
     philox_offset = zero_u64[1].unsqueeze(0)
 
     if D > 256:
-      # The CUTLASS kernel inside efficient_attention_backward
-      # expects O in the stride layout produced by SDPA forward:
-      # a BNHD→BHND transposed view (stride H*D == D, stride N*D
-      # == H*D).  FFPA produces contiguous BHND O which, after the
-      # internal transpose(1,2), yields non-standard strides and
-      # triggers illegal memory accesses.  We reshape FFPA's O to
-      # match SDPA's stride pattern; LSE is contiguous in both
-      # paths so a simple clone is sufficient.
-      O = O.transpose(1, 2).contiguous().transpose(1, 2)  # noqa: E741
-      lse = lse.clone()
+      if ctx.backward_backend == "split_d":
+        dq, dk, dv = _ffpa_attn_backward_cuda(
+          q.contiguous(),
+          k.contiguous(),
+          v.contiguous(),
+          O.contiguous(),
+          lse.contiguous(),
+          grad_out.contiguous(),
+          ctx.stages,
+          int(bool(ctx.causal)),
+          ctx.softmax_scale,
+        )
+      elif ctx.backward_backend == "persistent_kv":
+        dq, dk, dv = _ffpa_attn_backward_persistent_kv_cuda(
+          q.contiguous(),
+          k.contiguous(),
+          v.contiguous(),
+          O.contiguous(),
+          lse.contiguous(),
+          grad_out.contiguous(),
+          ctx.stages,
+          int(bool(ctx.causal)),
+          ctx.softmax_scale,
+        )
+      elif ctx.backward_backend == "triton":
+        # ---- Split-D Triton backward ----
+        from ffpa_attn.triton._ffpa_bwd import _ffpa_attn_backward as _ffpa_triton_bwd
 
-      if ctx.high_precision_grad:
-        _q = q.float()
-        _k = k.float()
-        _v = v.float()
-        _O = O.float()
-        _lse = lse.float()
-        _grad_out = grad_out.float()
-      else:
-        _q, _k, _v = q, k, v
-        _O, _lse, _grad_out = O, lse, grad_out
+        # Pad LSE to seqlen_q_rounded (Triton kernel needs padded stride
+        # for safe masked loads).
+        seqlen_q = q.size(2)
+        seqlen_q_rounded = ((seqlen_q + 127) // 128) * 128
+        if lse.size(-1) < seqlen_q_rounded:
+          lse_padded = torch.empty(*lse.shape[:-1], seqlen_q_rounded, dtype=torch.float32, device=lse.device)
+          lse_padded[..., :lse.size(-1)] = lse
+          lse = lse_padded
 
-      if group_size > 1:
-        k_in = _k.repeat_interleave(group_size, dim=1).contiguous()
-        v_in = _v.repeat_interleave(group_size, dim=1).contiguous()
-      else:
-        k_in, v_in = _k, _v
+        if group_size > 1:
+          k_in = k.repeat_interleave(group_size, dim=1).contiguous()
+          v_in = v.repeat_interleave(group_size, dim=1).contiguous()
+        else:
+          k_in, v_in = k, v
 
-      dq, dk_e, dv_e, _ = \
-          torch.ops.aten._scaled_dot_product_efficient_attention_backward.default(
-              _grad_out, _q, k_in, v_in, None,
-              _O, _lse,
-              philox_seed, philox_offset,
-              0.0,
-              (True, True, True, False),
-              ctx.causal,
-              scale=ctx.softmax_scale,
-          )
-      if group_size > 1:
-        dk = dk_e.reshape(k.size(0), k.size(1), group_size, k.size(2), k.size(3)).sum(dim=2).to(k.dtype)
-        dv = dv_e.reshape(v.size(0), v.size(1), group_size, v.size(2), v.size(3)).sum(dim=2).to(v.dtype)
+        # Allocate gradient buffers.
+        dq = torch.empty_like(q)
+        dk_gqa = torch.empty_like(k_in)
+        dv_gqa = torch.empty_like(v_in)
+
+        _ffpa_triton_bwd(
+          do=grad_out.contiguous(),
+          q=q.contiguous(),
+          k=k_in.contiguous(),
+          v=v_in.contiguous(),
+          o=O.contiguous(),
+          lse=lse,
+          dq=dq,
+          dk=dk_gqa,
+          dv=dv_gqa,
+          causal=ctx.causal,
+          softmax_scale=ctx.softmax_scale,
+        )
+
+        if group_size > 1:
+          dk = dk_gqa.reshape(k.size(0), k.size(1), group_size, k.size(2), k.size(3)).sum(dim=2).to(k.dtype)
+          dv = dv_gqa.reshape(v.size(0), v.size(1), group_size, v.size(2), v.size(3)).sum(dim=2).to(v.dtype)
+        else:
+          dk, dv = dk_gqa.to(k.dtype), dv_gqa.to(v.dtype)
+        dq = dq.to(q.dtype)
       else:
-        dk, dv = dk_e.to(k.dtype), dv_e.to(v.dtype)
-      dq = dq.to(q.dtype)
+        # ---- SDPA delegation (original path) ----
+        # The CUTLASS kernel inside efficient_attention_backward
+        # expects O in the stride layout produced by SDPA forward:
+        # a BNHD→BHND transposed view (stride H*D == D, stride N*D
+        # == H*D).  FFPA produces contiguous BHND O which, after the
+        # internal transpose(1,2), yields non-standard strides and
+        # triggers illegal memory accesses.  We reshape FFPA's O to
+        # match SDPA's stride pattern; LSE is contiguous in both
+        # paths so a simple clone is sufficient.
+        O = O.transpose(1, 2).contiguous().transpose(1, 2)  # noqa: E741
+        lse = lse.clone()
+
+        if ctx.high_precision_grad:
+          _q = q.float()
+          _k = k.float()
+          _v = v.float()
+          _O = O.float()
+          _lse = lse.float()
+          _grad_out = grad_out.float()
+        else:
+          _q, _k, _v = q, k, v
+          _O, _lse, _grad_out = O, lse, grad_out
+
+        if group_size > 1:
+          k_in = _k.repeat_interleave(group_size, dim=1).contiguous()
+          v_in = _v.repeat_interleave(group_size, dim=1).contiguous()
+        else:
+          k_in, v_in = _k, _v
+
+        dq, dk_e, dv_e, _ = \
+            torch.ops.aten._scaled_dot_product_efficient_attention_backward.default(
+                _grad_out, _q, k_in, v_in, None,
+                _O, _lse,
+                philox_seed, philox_offset,
+                0.0,
+                (True, True, True, False),
+                ctx.causal,
+                scale=ctx.softmax_scale,
+            )
+        if group_size > 1:
+          dk = dk_e.reshape(k.size(0), k.size(1), group_size, k.size(2), k.size(3)).sum(dim=2).to(k.dtype)
+          dv = dv_e.reshape(v.size(0), v.size(1), group_size, v.size(2), v.size(3)).sum(dim=2).to(v.dtype)
+        else:
+          dk, dv = dk_e.to(k.dtype), dv_e.to(v.dtype)
+        dq = dq.to(q.dtype)
     else:
       dq, dk, dv = torch.ops.aten._scaled_dot_product_flash_attention_backward.default(
         grad_out.contiguous(),
@@ -337,11 +472,13 @@ def ffpa_attn_func(
       the backward runs in the native dtype with automatic NaN detection:
       if NaN is found, fp32 is retried transparently.  Has no effect on the
       flash attention backward path (headdim <= 256).
-  :param backward_backend: Which backward implementation to use.  Currently
-      only ``"sdpa"`` is supported (default); delegates to PyTorch's SDPA
-      backward kernels.  ``"split_d"`` is reserved for the native Split-D
-      backward kernel (not yet implemented).  Has no effect in inference
-      mode (``torch.no_grad()`` or no input requires gradient).
+  :param backward_backend: Which backward implementation to use.
+      ``"sdpa"`` (default) delegates to PyTorch's SDPA backward kernels (currently, fastest).
+      ``"triton"`` uses the Split-D Triton backward kernel (supports D > 256).
+      ``"split_d"`` uses the native D-slice Split-D backward kernel.
+      ``"persistent_kv"`` uses the native D=512 small-Bc persistent-KV backward kernel.
+      Has no effect in inference mode (``torch.no_grad()`` or no input
+      requires gradient).
 
   :returns: ``O``, filled with the attention output
       ``softmax(softmax_scale * QK^T) V``.
@@ -352,9 +489,8 @@ def ffpa_attn_func(
       PTX instruction exists on supported architectures), or if
       ``causal=True`` is combined with ``Nkv < Nq``.
   """
-  assert backward_backend == "sdpa", \
-    f"Only backward_backend='sdpa' is supported, got {backward_backend!r}. " \
-    f"Split-D backward kernel is not yet implemented."
+  assert backward_backend in ("sdpa", "triton", "split_d", "persistent_kv"), \
+    f"Unsupported backward_backend={backward_backend!r}; choose 'sdpa', 'triton', 'split_d', or 'persistent_kv'."
 
   if acc == "f32":
     acc_code = _ACC_F32

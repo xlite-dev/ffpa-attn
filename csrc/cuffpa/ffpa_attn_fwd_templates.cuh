@@ -2,7 +2,7 @@
 #include "cuffpa/prefill.cuh"  // ffpa::prefill
 
 // ============================================================================
-// ffpa_stages_split_q_large_d_fwd_template
+// ffpa_attn_split_d_fwd_template
 // ----------------------------------------------------------------------------
 // Split-Q (FlashAttention-2) prefill attention kernel tuned for *large* head
 // dimensions (D > ~128). Each thread block owns a fixed slice of Q rows
@@ -88,13 +88,11 @@ template <typename kDataType, const int kHeadDim, const int kMmaAtomM, const int
           const int kPersistQs2r, const int kPersistQg2s, const int kRegPipeKV, const int kStageQK,
           const int kStagePV, const int kPadQ, const int kPadK, const int kPadV>
 __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
-    ffpa_stages_split_q_large_d_fwd_template(const kDataType* __restrict__ Q,
-                                             const kDataType* __restrict__ K,
-                                             const kDataType* __restrict__ V,
-                                             kDataType* __restrict__ O,
-                                             float* __restrict__ softmax_lse, const int Nq,
-                                             const int Nkv, const int Nh, const int Nh_kv,
-                                             const float scale, const int Tc, const int causal) {
+    ffpa_attn_split_d_fwd_template(const kDataType* __restrict__ Q, const kDataType* __restrict__ K,
+                                   const kDataType* __restrict__ V, kDataType* __restrict__ O,
+                                   float* __restrict__ softmax_lse, const int Nq, const int Nkv,
+                                   const int Nh, const int Nh_kv, const float scale, const int Tc,
+                                   const int causal) {
   ffpa::prefill::check_large_d_compiling_states<
       kHeadDim, kMmaAtomM, kMmaAtomN, kMmaAtomK, kMmaTileSeqLenQ, kMmaTileSeqLenK, kMmaTileSeqLenP,
       kMmaTileHeadDimV, kValTileSeqLenQ, kValTileSeqLenK, kValTileSeqLenP, kValTileHeadDimV,
@@ -684,7 +682,7 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
 }
 
 // ============================================================================
-// ffpa_stages_split_q_small_d_fwd_template
+// ffpa_attn_persistent_d_fwd_template
 // ----------------------------------------------------------------------------
 // Split-Q (FlashAttention-2) prefill attention kernel tuned for *small* head
 // dimensions (D <= 128, up to 256). Unlike the "large-d" variant, this kernel
@@ -757,13 +755,12 @@ template <typename kDataType, const int kHeadDim, const int kMmaAtomM, const int
           const int kPersistQs2r, const int kPersistVs2r, const int kRegPipeKV, const int kStageQK,
           const int kStagePV, const int kPadQ, const int kPadK, const int kPadV>
 __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
-    ffpa_stages_split_q_small_d_fwd_template(const kDataType* __restrict__ Q,
-                                             const kDataType* __restrict__ K,
-                                             const kDataType* __restrict__ V,
-                                             kDataType* __restrict__ O,
-                                             float* __restrict__ softmax_lse, const int Nq,
-                                             const int Nkv, const int Nh, const int Nh_kv,
-                                             const float scale, const int Tc, const int causal) {
+    ffpa_attn_persistent_d_fwd_template(const kDataType* __restrict__ Q,
+                                        const kDataType* __restrict__ K,
+                                        const kDataType* __restrict__ V, kDataType* __restrict__ O,
+                                        float* __restrict__ softmax_lse, const int Nq,
+                                        const int Nkv, const int Nh, const int Nh_kv,
+                                        const float scale, const int Tc, const int causal) {
   // NOTE: This kernel template is developed for small head dimensions (d <= 128),
   // namely, flash-attention-2. Always persist QKV for flash-attn, apply tiling at
   // the Attention level not the MMA level.
