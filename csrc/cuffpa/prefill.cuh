@@ -1,11 +1,11 @@
 #pragma once
-#include <climits>                  // INT_MAX
-#include "cuffpa/mma.cuh"           // ffpa::mma
-#include "cuffpa/dtype_traits.cuh"  // ffpa::DtypeTraits
-#include "cuffpa/warp.cuh"          // ffpa::warp
-#include "cuffpa/swizzle.cuh"       // ffpa::swizzle
-#include "cuffpa/cp_async.cuh"      // ffpa::cp_async
-#include "cuffpa/utils.cuh"         // ffpa::utils
+#include <climits>           // INT_MAX
+#include "mma.cuh"           // ffpa::mma
+#include "dtype_traits.cuh"  // ffpa::DtypeTraits
+#include "warp.cuh"          // ffpa::warp
+#include "swizzle.cuh"       // ffpa::swizzle
+#include "cp_async.cuh"      // ffpa::cp_async
+#include "utils.cuh"         // ffpa::utils
 
 namespace ffpa {
 namespace prefill {

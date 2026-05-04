@@ -1,7 +1,6 @@
 import argparse
 import math
 import random
-import sys
 import time
 from typing import Optional
 
@@ -17,8 +16,10 @@ except ImportError:
   flash_attn_func = None
   has_flash_attn = False
 
-sys.path.append("../")
-from env import ENV, pretty_print_line
+
+def pretty_print_line(length: int = 150, m: str = "-"):
+  print(m * length)
+
 
 torch.set_grad_enabled(False)
 torch.set_printoptions(precision=6, threshold=8, edgeitems=3, linewidth=120, sci_mode=False)
@@ -54,7 +55,6 @@ def get_args():
   parser.add_argument("--save-dir", "--dir", type=str, default="tmp", help="Save dir for plot")
   parser.add_argument("--save-tag", "--tag", type=str, default=None, help="Save name for plot")
   parser.add_argument("--gen-bench-table", "--gen-bench", action="store_true")
-  parser.add_argument("--force-build", "--build", action="store_true", help="Force build from sources")
   parser.add_argument(
     "--dtype",
     choices=["fp16", "bf16"],
@@ -66,7 +66,6 @@ def get_args():
 
 
 args = get_args()
-ENV.list_ffpa_env()
 
 
 def set_rand_seed(seed: int = 1):
@@ -79,11 +78,6 @@ def set_rand_seed(seed: int = 1):
 pretty_print_line()
 print(args)
 pretty_print_line()
-
-# Load the CUDA kernel as a python module
-ffpa_attn, use_ffpa_attn_package = ENV.try_load_ffpa_library(force_build=args.force_build, verbose=args.verbose)
-if use_ffpa_attn_package:
-  import ffpa_attn  # noqa: F401
 
 # The sole public Python API is ``ffpa_attn_func``: it dispatches by
 # ``Q.dtype`` + ``acc`` through a registered torch op. Bind two local

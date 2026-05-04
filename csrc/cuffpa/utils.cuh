@@ -1,5 +1,5 @@
 #pragma once
-#include "cuffpa/logging.cuh"  // log
+#include "logging.cuh"  // log
 
 namespace ffpa {
 namespace utils {

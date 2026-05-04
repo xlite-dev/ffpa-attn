@@ -1,7 +1,8 @@
-"""Expose ``__version__`` resolved from setuptools-scm.
+"""Expose ``__version__`` resolved from the build-generated version file.
 
 Priority:
-  1. ``ffpa_attn/_version.py`` generated at build time by setuptools-scm.
+  1. ``src/ffpa_attn/_version.py`` generated at build time by setuptools-scm
+     or by the direct ``setup.py`` fallback used by ``tools/build_fast.sh``.
   2. Installed distribution metadata (for pip-installed users).
   3. ``"0.0.0+unknown"`` as a last-resort fallback (e.g. editable checkout
      without a build).

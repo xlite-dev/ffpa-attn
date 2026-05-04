@@ -76,12 +76,14 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools_scm]
 version_scheme = "python-simplified-semver"
 local_scheme = "no-local-version"
-write_to = "ffpa_attn/_version.py"
+write_to = "src/ffpa_attn/_version.py"
 
 [tool.setuptools]
 include-package-data = true
+package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
+where = ["src"]
 exclude = [
     "build*",
     "dist*",

@@ -7,7 +7,7 @@ python3 examples/ffpa_attn_bwd.py
 ```
 
 - `examples/ffpa_attn_fwd.py`: forward-only examples for self-attn, cross-attn, GQA, causal, and non-aligned seqlen.
-- `examples/ffpa_attn_bwd.py`: minimal bf16 backward example that compares dQ / dK / dV against SDPA.
+- `examples/ffpa_attn_bwd.py`: end2end forward + backward examples for self-attn, cross-attn, GQA, causal, and non-aligned seqlen.
 
 Env: NVIDIA L20 (Ada), PyTorch 2.11, CUDA 13.0, Headdim=512 (FA-2 not supported).
 

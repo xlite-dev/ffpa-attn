@@ -2,9 +2,8 @@ include MANIFEST.in
 include LICENSE
 include pyproject.toml
 include README.md
-recursive-include ffpa_attn *.py
+recursive-include src/ffpa_attn *.py
 recursive-include csrc *.cu *.cuh *.h *.hpp *.cpp
-recursive-include include *.h *.hpp *.cuh
 recursive-include tests *.py
 prune build
 prune dist

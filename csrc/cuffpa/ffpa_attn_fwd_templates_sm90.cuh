@@ -104,8 +104,8 @@
 // ============================================================================
 #pragma once
 
-#include "cuffpa/prefill.cuh"
-#include "cuffpa/tma.cuh"
+#include "prefill.cuh"
+#include "tma.cuh"
 
 namespace ffpa {
 namespace sm90 {

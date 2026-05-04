@@ -28,7 +28,7 @@ cd "$REPO_DIR"
 if [[ "${FFPA_CLEAN:-0}" == "1" ]]; then
   echo "[build_fast] FFPA_CLEAN=1 -> removing build/ and *.so"
   rm -rf build/ dist/ ffpa_attn.egg-info/
-  rm -f pyffpa_cuda*.so ffpa_attn/_C*.so
+  rm -f pyffpa_cuda*.so src/ffpa_attn/_C*.so
   find csrc/cuffpa/generated -maxdepth 1 -type f \( -name '*.cu' -o -name '*.h' \) -delete 2>/dev/null || true
 fi
 
