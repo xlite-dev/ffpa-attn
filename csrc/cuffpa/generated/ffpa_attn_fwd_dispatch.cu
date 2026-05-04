@@ -18,7 +18,7 @@ void ffpa_attn_fwd_fp16f16(
   CHECK_TORCH_TENSOR_DTYPE(O, torch::kHalf)
   const int d = Q.size(3);
   switch (d) {
-    case 320: ffpa_attn_fwd_fp16f16_d320(Q, K, V, O, softmax_lse, stages, causal, softmax_scale, tma); break;
+    case 288: ffpa_attn_fwd_fp16f16_d288(Q, K, V, O, softmax_lse, stages, causal, softmax_scale, tma); break;
     default: throw std::runtime_error("headdim not support!");
   }
 }
@@ -39,7 +39,7 @@ void ffpa_attn_fwd_fp16f32(
   CHECK_TORCH_TENSOR_DTYPE(O, torch::kHalf)
   const int d = Q.size(3);
   switch (d) {
-    case 320: ffpa_attn_fwd_fp16f32_d320(Q, K, V, O, softmax_lse, stages, causal, softmax_scale, tma); break;
+    case 288: ffpa_attn_fwd_fp16f32_d288(Q, K, V, O, softmax_lse, stages, causal, softmax_scale, tma); break;
     default: throw std::runtime_error("headdim not support!");
   }
 }
@@ -60,7 +60,7 @@ void ffpa_attn_fwd_bf16f32(
   CHECK_TORCH_TENSOR_DTYPE(O, torch::kBFloat16)
   const int d = Q.size(3);
   switch (d) {
-    case 320: ffpa_attn_fwd_bf16f32_d320(Q, K, V, O, softmax_lse, stages, causal, softmax_scale, tma); break;
+    case 288: ffpa_attn_fwd_bf16f32_d288(Q, K, V, O, softmax_lse, stages, causal, softmax_scale, tma); break;
     default: throw std::runtime_error("headdim not support!");
   }
 }

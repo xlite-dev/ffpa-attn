@@ -2,7 +2,7 @@
 #include "launch_templates.cuh"
 using namespace ffpa;
 
-void ffpa_attn_bwd_fp16f32_d320(
+void ffpa_attn_bwd_fp16f32_d288(
     torch::Tensor Q,
     torch::Tensor K,
     torch::Tensor V,
@@ -16,15 +16,15 @@ void ffpa_attn_bwd_fp16f32_d320(
     int causal,
     double softmax_scale) {
   if (stages == 2) {
-    launch_ffpa_attn_bwd_template<__half, 320, 2>(Q, K, V, O, softmax_lse, dO, dQ, dK, dV, causal, softmax_scale);
+    launch_ffpa_attn_bwd_template<__half, 288, 2>(Q, K, V, O, softmax_lse, dO, dQ, dK, dV, causal, softmax_scale);
   } else if (stages == 3) {
-    launch_ffpa_attn_bwd_template<__half, 320, 3>(Q, K, V, O, softmax_lse, dO, dQ, dK, dV, causal, softmax_scale);
+    launch_ffpa_attn_bwd_template<__half, 288, 3>(Q, K, V, O, softmax_lse, dO, dQ, dK, dV, causal, softmax_scale);
   } else {
-    launch_ffpa_attn_bwd_template<__half, 320, 1>(Q, K, V, O, softmax_lse, dO, dQ, dK, dV, causal, softmax_scale);
+    launch_ffpa_attn_bwd_template<__half, 288, 1>(Q, K, V, O, softmax_lse, dO, dQ, dK, dV, causal, softmax_scale);
   }
 }
 
-void ffpa_attn_bwd_persistent_kv_fp16f32_d320(
+void ffpa_attn_bwd_persistent_kv_fp16f32_d288(
     torch::Tensor Q,
     torch::Tensor K,
     torch::Tensor V,
@@ -38,8 +38,8 @@ void ffpa_attn_bwd_persistent_kv_fp16f32_d320(
     int causal,
     double softmax_scale) {
   if (stages == 2) {
-    launch_ffpa_attn_bwd_persistent_kv_template<__half, 320, 2>(Q, K, V, O, softmax_lse, dO, dQ, dK, dV, causal, softmax_scale);
+    launch_ffpa_attn_bwd_persistent_kv_template<__half, 288, 2>(Q, K, V, O, softmax_lse, dO, dQ, dK, dV, causal, softmax_scale);
   } else {
-    launch_ffpa_attn_bwd_persistent_kv_template<__half, 320, 1>(Q, K, V, O, softmax_lse, dO, dQ, dK, dV, causal, softmax_scale);
+    launch_ffpa_attn_bwd_persistent_kv_template<__half, 288, 1>(Q, K, V, O, softmax_lse, dO, dQ, dK, dV, causal, softmax_scale);
   }
 }

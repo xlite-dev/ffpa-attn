@@ -25,7 +25,7 @@ void ffpa_attn_bwd_fp16f32(
   CHECK_TORCH_TENSOR_DTYPE(dV, torch::kHalf)
   const int d = Q.size(3);
   switch (d) {
-    case 320: ffpa_attn_bwd_fp16f32_d320(Q, K, V, O, softmax_lse, dO, dQ, dK, dV, stages, causal, softmax_scale); break;
+    case 288: ffpa_attn_bwd_fp16f32_d288(Q, K, V, O, softmax_lse, dO, dQ, dK, dV, stages, causal, softmax_scale); break;
     default: throw std::runtime_error("bwd: headdim not supported!");
   }
 }
@@ -53,7 +53,7 @@ void ffpa_attn_bwd_bf16f32(
   CHECK_TORCH_TENSOR_DTYPE(dV, torch::kBFloat16)
   const int d = Q.size(3);
   switch (d) {
-    case 320: ffpa_attn_bwd_bf16f32_d320(Q, K, V, O, softmax_lse, dO, dQ, dK, dV, stages, causal, softmax_scale); break;
+    case 288: ffpa_attn_bwd_bf16f32_d288(Q, K, V, O, softmax_lse, dO, dQ, dK, dV, stages, causal, softmax_scale); break;
     default: throw std::runtime_error("bwd: headdim not supported!");
   }
 }
@@ -81,7 +81,7 @@ void ffpa_attn_bwd_persistent_kv_fp16f32(
   CHECK_TORCH_TENSOR_DTYPE(dV, torch::kHalf)
   const int d = Q.size(3);
   switch (d) {
-    case 320: ffpa_attn_bwd_persistent_kv_fp16f32_d320(Q, K, V, O, softmax_lse, dO, dQ, dK, dV, stages, causal, softmax_scale); break;
+    case 288: ffpa_attn_bwd_persistent_kv_fp16f32_d288(Q, K, V, O, softmax_lse, dO, dQ, dK, dV, stages, causal, softmax_scale); break;
     default: throw std::runtime_error("bwd: headdim not supported!");
   }
 }
@@ -109,7 +109,7 @@ void ffpa_attn_bwd_persistent_kv_bf16f32(
   CHECK_TORCH_TENSOR_DTYPE(dV, torch::kBFloat16)
   const int d = Q.size(3);
   switch (d) {
-    case 320: ffpa_attn_bwd_persistent_kv_bf16f32_d320(Q, K, V, O, softmax_lse, dO, dQ, dK, dV, stages, causal, softmax_scale); break;
+    case 288: ffpa_attn_bwd_persistent_kv_bf16f32_d288(Q, K, V, O, softmax_lse, dO, dQ, dK, dV, stages, causal, softmax_scale); break;
     default: throw std::runtime_error("bwd: headdim not supported!");
   }
 }
