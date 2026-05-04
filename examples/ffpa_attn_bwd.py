@@ -16,6 +16,7 @@ Usage::
 
 from __future__ import annotations
 
+import argparse
 import math
 import time
 
@@ -26,6 +27,17 @@ from ffpa_attn import ffpa_attn_func
 
 WARMUP, ITERS = 2, 5
 D = 512
+
+
+def _parse_args() -> argparse.Namespace:
+  parser = argparse.ArgumentParser(description="FFPA backward example and SDPA comparison.")
+  parser.add_argument(
+    "--backward-backend",
+    choices=["sdpa", "split_d", "persistent_kv", "triton"],
+    default="sdpa",
+    help="Backward backend passed to ffpa_attn_func.",
+  )
+  return parser.parse_args()
 
 
 def _make_sdpa_kwargs(causal: bool, nq: int, nkv: int):
@@ -55,6 +67,7 @@ def _run_ffpa_backward(
   k: torch.Tensor,
   v: torch.Tensor,
   scale: float,
+  backward_backend: str,
   causal: bool = False,
 ) -> None:
   q_i = q.detach().clone().requires_grad_(True)
@@ -64,6 +77,7 @@ def _run_ffpa_backward(
     q_i,
     k_i,
     v_i,
+    backward_backend=backward_backend,
     causal=causal,
     softmax_scale=scale,
   )
@@ -112,6 +126,7 @@ def _sdpa_ref_grads(
 def _run_case(
   name: str,
   dtype: torch.dtype,
+  backward_backend: str,
   B: int,
   Nh_q: int,
   Nh_kv: int,
@@ -129,6 +144,7 @@ def _run_case(
     q,
     k,
     v,
+    backward_backend=backward_backend,
     causal=causal,
     softmax_scale=scale,
   )
@@ -139,7 +155,7 @@ def _run_case(
   dv_ffpa = v.grad.detach().clone()
   dq_ref, dk_ref, dv_ref = _sdpa_ref_grads(q, k, v, scale, causal=causal)
 
-  ms_ffpa = _time_fn(_run_ffpa_backward, q, k, v, scale, causal)
+  ms_ffpa = _time_fn(_run_ffpa_backward, q, k, v, scale, backward_backend, causal)
   ms_sdpa = _time_fn(_run_sdpa_backward, q, k, v, scale, causal)
 
   dt_tag = str(dtype).replace("torch.", "")
@@ -149,20 +165,23 @@ def _run_case(
     f"dQ_err={(dq_ffpa - dq_ref).abs().max().item():.4e}  "
     f"dK_err={(dk_ffpa - dk_ref).abs().max().item():.4e}  "
     f"dV_err={(dv_ffpa - dv_ref).abs().max().item():.4e}  "
+    f"backend={backward_backend}  "
     f"FFPA={ms_ffpa:.2f} ms  SDPA={ms_sdpa:.2f} ms  speedup={ms_sdpa / ms_ffpa:.2f}x"
   )
 
 
 def main() -> None:
+  args = _parse_args()
+
   if not torch.cuda.is_available():
     raise SystemExit("CUDA is required to run this example.")
 
   for dtype in (torch.float16, torch.bfloat16):
-    _run_case("self-attn", dtype, B=1, Nh_q=32, Nh_kv=32, Nq=8192, Nkv=8192)
-    _run_case("cross-attn", dtype, B=1, Nh_q=32, Nh_kv=32, Nq=1024, Nkv=8192)
-    _run_case("gqa", dtype, B=1, Nh_q=32, Nh_kv=8, Nq=8192, Nkv=8192)
-    _run_case("causal", dtype, B=1, Nh_q=32, Nh_kv=32, Nq=8192, Nkv=8192, causal=True)
-    _run_case("non-aligned", dtype, B=1, Nh_q=8, Nh_kv=8, Nq=8191, Nkv=8191)
+    _run_case("self-attn", dtype, args.backward_backend, B=1, Nh_q=32, Nh_kv=32, Nq=8192, Nkv=8192)
+    _run_case("cross-attn", dtype, args.backward_backend, B=1, Nh_q=32, Nh_kv=32, Nq=1024, Nkv=8192)
+    _run_case("gqa", dtype, args.backward_backend, B=1, Nh_q=32, Nh_kv=8, Nq=8192, Nkv=8192)
+    _run_case("causal", dtype, args.backward_backend, B=1, Nh_q=32, Nh_kv=32, Nq=8192, Nkv=8192, causal=True)
+    _run_case("non-aligned", dtype, args.backward_backend, B=1, Nh_q=8, Nh_kv=8, Nq=8191, Nkv=8191)
 
 
 if __name__ == "__main__":
