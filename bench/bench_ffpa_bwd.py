@@ -21,6 +21,13 @@ def parse_args():
   parser.add_argument("--dtype", choices=["fp16", "bf16"], default="fp16")
   parser.add_argument("--causal", action="store_true")
   parser.add_argument("--stages", type=int, default=1)
+  parser.add_argument("--compare-stages", action="store_true", help="Run split-D stages 1, 2, and 3 side by side.")
+  parser.add_argument(
+    "--mode",
+    choices=["full", "backward-only"],
+    default="full",
+    help="full measures forward+backward; backward-only times only the backward call after forward is ready.",
+  )
   parser.add_argument("--warmup", type=int, default=5)
   parser.add_argument("--iters", type=int, default=20)
   parser.add_argument("--seed", type=int, default=0)
@@ -57,11 +64,58 @@ def time_backward(name, fn, q, k, v, dO, warmup, iters):
   return elapsed_ms
 
 
+def time_backward_only(name, fn, q, k, v, dO, warmup, iters):
+  start_event = torch.cuda.Event(enable_timing=True)
+  end_event = torch.cuda.Event(enable_timing=True)
+
+  for _ in range(warmup):
+    q_i = q.detach().clone().requires_grad_(True)
+    k_i = k.detach().clone().requires_grad_(True)
+    v_i = v.detach().clone().requires_grad_(True)
+    out = fn(q_i, k_i, v_i)
+    torch.cuda.synchronize()
+    out.backward(dO)
+  torch.cuda.synchronize()
+
+  elapsed_ms = 0.0
+  for _ in range(iters):
+    q_i = q.detach().clone().requires_grad_(True)
+    k_i = k.detach().clone().requires_grad_(True)
+    v_i = v.detach().clone().requires_grad_(True)
+    out = fn(q_i, k_i, v_i)
+    torch.cuda.synchronize()
+    start_event.record()
+    out.backward(dO)
+    end_event.record()
+    torch.cuda.synchronize()
+    elapsed_ms += start_event.elapsed_time(end_event)
+
+  elapsed_ms /= iters
+  print(f"{name:>14}: {elapsed_ms:.3f} ms")
+  return elapsed_ms
+
+
 def main():
   args = parse_args()
   assert torch.cuda.is_available(), "CUDA is required"
   q, k, v, dO = make_inputs(args)
   scale = 1.0 / math.sqrt(args.D)
+
+  def make_split_d(stages):
+
+    def split_d(q_i, k_i, v_i):
+      return ffpa_attn_func(
+        q_i,
+        k_i,
+        v_i,
+        causal=args.causal,
+        softmax_scale=scale,
+        stages=stages,
+        acc="f32",
+        backward_backend="split_d",
+      )
+
+    return split_d
 
   def split_d(q_i, k_i, v_i):
     return ffpa_attn_func(
@@ -80,11 +134,24 @@ def main():
 
   print(
     f"shape B={args.B} H={args.H} N={args.N} D={args.D} dtype={args.dtype} "
-    f"causal={args.causal} warmup={args.warmup} iters={args.iters}"
+    f"causal={args.causal} mode={args.mode} warmup={args.warmup} iters={args.iters}"
   )
-  split_ms = time_backward("split_d", split_d, q, k, v, dO, args.warmup, args.iters)
-  sdpa_ms = time_backward("sdpa", sdpa, q, k, v, dO, args.warmup, args.iters)
-  print(f"speedup: {sdpa_ms / split_ms:.3f}x vs sdpa")
+  timer = time_backward_only if args.mode == "backward-only" else time_backward
+  if args.compare_stages:
+    split1_ms = timer("split_d_s1", make_split_d(1), q, k, v, dO, args.warmup, args.iters)
+    split2_ms = timer("split_d_s2", make_split_d(2), q, k, v, dO, args.warmup, args.iters)
+    split3_ms = timer("split_d_s3", make_split_d(3), q, k, v, dO, args.warmup, args.iters)
+    sdpa_ms = timer("sdpa_bwd" if args.mode == "backward-only" else "sdpa", sdpa, q, k, v, dO, args.warmup, args.iters)
+    print(f"speedup stage1: {sdpa_ms / split1_ms:.3f}x vs sdpa")
+    print(f"speedup stage2: {sdpa_ms / split2_ms:.3f}x vs sdpa")
+    print(f"speedup stage3: {sdpa_ms / split3_ms:.3f}x vs sdpa")
+    print(f"stage2/stage1: {split2_ms / split1_ms:.3f}x time")
+    print(f"stage3/stage1: {split3_ms / split1_ms:.3f}x time")
+    print(f"stage3/stage2: {split3_ms / split2_ms:.3f}x time")
+  else:
+    split_ms = timer("split_d", split_d, q, k, v, dO, args.warmup, args.iters)
+    sdpa_ms = timer("sdpa_bwd" if args.mode == "backward-only" else "sdpa", sdpa, q, k, v, dO, args.warmup, args.iters)
+    print(f"speedup: {sdpa_ms / split_ms:.3f}x vs sdpa")
 
 
 if __name__ == "__main__":

@@ -130,7 +130,8 @@ def test_ffpa_bwd_basic(dtype, B, H, N, D):
 
 @pytest.mark.parametrize("dtype", DTYPES, ids=["fp16", "bf16"])
 @pytest.mark.parametrize("causal", [False, True], ids=["noncausal", "causal"])
-def test_ffpa_bwd_split_d_native_hdim512(dtype, causal):
+@pytest.mark.parametrize("stages", [1, 2, 3], ids=["stage1", "stage2", "stage3"])
+def test_ffpa_bwd_split_d_native_hdim512(dtype, causal, stages):
   """Native split-D backward for D=512 must match SDPA on a focused smoke shape."""
   B, H, N, D = 1, 2, 128, 512
   torch.manual_seed(0)
@@ -145,7 +146,7 @@ def test_ffpa_bwd_split_d_native_hdim512(dtype, causal):
     v,
     causal=causal,
     softmax_scale=scale,
-    stages=1,
+    stages=stages,
     acc="f32",
     high_precision_grad=True,
     backward_backend="split_d",

@@ -17,6 +17,8 @@ void ffpa_attn_bwd_fp16f32_d512(
     double softmax_scale) {
   if (stages == 2) {
     launch_ffpa_attn_bwd_template<__half, 512, 2>(Q, K, V, O, softmax_lse, dO, dQ, dK, dV, causal, softmax_scale);
+  } else if (stages == 3) {
+    launch_ffpa_attn_bwd_template<__half, 512, 3>(Q, K, V, O, softmax_lse, dO, dQ, dK, dV, causal, softmax_scale);
   } else {
     launch_ffpa_attn_bwd_template<__half, 512, 1>(Q, K, V, O, softmax_lse, dO, dQ, dK, dV, causal, softmax_scale);
   }

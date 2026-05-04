@@ -615,7 +615,7 @@ void launch_ffpa_attn_bwd_template(torch::Tensor Q, torch::Tensor K, torch::Tens
   constexpr int kRegPipeKV = 0;
   constexpr int kMmaTileSeqLenP = kMmaTileSeqLenQ;
   constexpr int kMmaTileHeadDimV = 1;
-  constexpr int kStageEff = (kStage == 2) ? 2 : 1;
+  constexpr int kStageEff = (kStage == 3) ? 3 : ((kStage == 2) ? 2 : 1);
   constexpr int kStageQK = kStageEff;
   constexpr int kStagePV = kStageEff;
 

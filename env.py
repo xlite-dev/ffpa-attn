@@ -638,6 +638,8 @@ class ENV(object):
     stage_body = (
       "  if (stages == 2) {\n"
       f"    {call.replace('{S}', '2')}\n"
+      "  } else if (stages == 3) {\n"
+      f"    {call.replace('{S}', '3')}\n"
       "  } else {\n"
       f"    {call.replace('{S}', '1')}\n"
       "  }\n"
