@@ -2,6 +2,6 @@
 #pragma once
 #include <torch/types.h>
 
-void ffpa_attn_fwd_fp16f16_d512(torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O, torch::Tensor softmax_lse, int stages, int causal, double softmax_scale, int tma);
-void ffpa_attn_fwd_fp16f32_d512(torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O, torch::Tensor softmax_lse, int stages, int causal, double softmax_scale, int tma);
-void ffpa_attn_fwd_bf16f32_d512(torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O, torch::Tensor softmax_lse, int stages, int causal, double softmax_scale, int tma);
+void ffpa_attn_fwd_fp16f16_d320(torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O, torch::Tensor softmax_lse, int stages, int causal, double softmax_scale, int tma);
+void ffpa_attn_fwd_fp16f32_d320(torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O, torch::Tensor softmax_lse, int stages, int causal, double softmax_scale, int tma);
+void ffpa_attn_fwd_bf16f32_d320(torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O, torch::Tensor softmax_lse, int stages, int causal, double softmax_scale, int tma);

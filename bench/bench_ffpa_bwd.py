@@ -23,6 +23,17 @@ def parse_args():
   parser.add_argument("--stages", type=int, default=1)
   parser.add_argument("--compare-stages", action="store_true", help="Run split-D stages 1, 2, and 3 side by side.")
   parser.add_argument(
+    "--compare-backends",
+    action="store_true",
+    help="Run split-D, persistent-KV, and SDPA backward side by side.",
+  )
+  parser.add_argument(
+    "--backward-backend",
+    choices=["split_d", "persistent_kv"],
+    default="split_d",
+    help="Native backward backend to benchmark when not using a compare mode.",
+  )
+  parser.add_argument(
     "--mode",
     choices=["full", "backward-only"],
     default="full",
@@ -95,15 +106,25 @@ def time_backward_only(name, fn, q, k, v, dO, warmup, iters):
   return elapsed_ms
 
 
+def try_time_backend(timer, name, fn, q, k, v, dO, warmup, iters):
+  try:
+    return timer(name, fn, q, k, v, dO, warmup, iters)
+  except RuntimeError as exc:
+    if "K/V-resident smem requirement" in str(exc):
+      print(f"{name:>14}: unavailable ({exc})")
+      return None
+    raise
+
+
 def main():
   args = parse_args()
   assert torch.cuda.is_available(), "CUDA is required"
   q, k, v, dO = make_inputs(args)
   scale = 1.0 / math.sqrt(args.D)
 
-  def make_split_d(stages):
+  def make_native(backend, stages):
 
-    def split_d(q_i, k_i, v_i):
+    def native(q_i, k_i, v_i):
       return ffpa_attn_func(
         q_i,
         k_i,
@@ -112,10 +133,13 @@ def main():
         softmax_scale=scale,
         stages=stages,
         acc="f32",
-        backward_backend="split_d",
+        backward_backend=backend,
       )
 
-    return split_d
+    return native
+
+  def make_split_d(stages):
+    return make_native("split_d", stages)
 
   def split_d(q_i, k_i, v_i):
     return ffpa_attn_func(
@@ -126,7 +150,7 @@ def main():
       softmax_scale=scale,
       stages=args.stages,
       acc="f32",
-      backward_backend="split_d",
+      backward_backend=args.backward_backend,
     )
 
   def sdpa(q_i, k_i, v_i):
@@ -137,7 +161,25 @@ def main():
     f"causal={args.causal} mode={args.mode} warmup={args.warmup} iters={args.iters}"
   )
   timer = time_backward_only if args.mode == "backward-only" else time_backward
-  if args.compare_stages:
+  if args.compare_backends:
+    split1_ms = timer("split_d_s1", make_native("split_d", 1), q, k, v, dO, args.warmup, args.iters)
+    split2_ms = timer("split_d_s2", make_native("split_d", 2), q, k, v, dO, args.warmup, args.iters)
+    pkv1_ms = try_time_backend(
+      timer, "persist_s1", make_native("persistent_kv", 1), q, k, v, dO, args.warmup, args.iters
+    )
+    pkv2_ms = try_time_backend(
+      timer, "persist_s2", make_native("persistent_kv", 2), q, k, v, dO, args.warmup, args.iters
+    )
+    sdpa_ms = timer("sdpa_bwd" if args.mode == "backward-only" else "sdpa", sdpa, q, k, v, dO, args.warmup, args.iters)
+    print(f"speedup split_d_s1: {sdpa_ms / split1_ms:.3f}x vs sdpa")
+    print(f"speedup split_d_s2: {sdpa_ms / split2_ms:.3f}x vs sdpa")
+    if pkv1_ms is not None:
+      print(f"speedup persist_s1: {sdpa_ms / pkv1_ms:.3f}x vs sdpa")
+      print(f"persist_s1/split_d_s1: {pkv1_ms / split1_ms:.3f}x time")
+    if pkv2_ms is not None:
+      print(f"speedup persist_s2: {sdpa_ms / pkv2_ms:.3f}x vs sdpa")
+      print(f"persist_s2/split_d_s2: {pkv2_ms / split2_ms:.3f}x time")
+  elif args.compare_stages:
     split1_ms = timer("split_d_s1", make_split_d(1), q, k, v, dO, args.warmup, args.iters)
     split2_ms = timer("split_d_s2", make_split_d(2), q, k, v, dO, args.warmup, args.iters)
     split3_ms = timer("split_d_s3", make_split_d(3), q, k, v, dO, args.warmup, args.iters)

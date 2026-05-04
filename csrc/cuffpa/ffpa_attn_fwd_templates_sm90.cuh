@@ -154,7 +154,7 @@ struct ExperimentalTmaLargeDConfig {
 }  // namespace ffpa
 
 // ============================================================================
-// ffpa_stages_split_q_large_d_fwd_sm90_template
+// ffpa_attn_split_d_fwd_sm90_template
 // ----------------------------------------------------------------------------
 // Mirror of ``ffpa_stages_split_q_large_d_template`` from
 // ``ffpa_attn_templates.cuh`` but with K/V tile staging delegated to TMA
@@ -175,12 +175,14 @@ template <typename kDataType, const int kHeadDim, const int kMmaAtomM, const int
           const int kPersistQs2r, const int kPersistQg2s, const int kRegPipeKV, const int kStageQK,
           const int kStagePV, const int kPadQ, const int kPadK, const int kPadV>
 __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
-    ffpa_stages_split_q_large_d_fwd_sm90_template(
-        const kDataType* __restrict__ Q, const kDataType* __restrict__ K,
-        const kDataType* __restrict__ V, kDataType* __restrict__ O, float* __restrict__ softmax_lse,
-        const int Nq, const int Nkv, const int Nh, const int Nh_kv, const float scale, const int Tc,
-        const int causal, const CUtensorMap* __restrict__ K_tma_desc,
-        const CUtensorMap* __restrict__ V_tma_desc) {
+    ffpa_attn_split_d_fwd_sm90_template(const kDataType* __restrict__ Q,
+                                        const kDataType* __restrict__ K,
+                                        const kDataType* __restrict__ V, kDataType* __restrict__ O,
+                                        float* __restrict__ softmax_lse, const int Nq,
+                                        const int Nkv, const int Nh, const int Nh_kv,
+                                        const float scale, const int Tc, const int causal,
+                                        const CUtensorMap* __restrict__ K_tma_desc,
+                                        const CUtensorMap* __restrict__ V_tma_desc) {
   ffpa::prefill::check_large_d_compiling_states<
       kHeadDim, kMmaAtomM, kMmaAtomN, kMmaAtomK, kMmaTileSeqLenQ, kMmaTileSeqLenK, kMmaTileSeqLenP,
       kMmaTileHeadDimV, kValTileSeqLenQ, kValTileSeqLenK, kValTileSeqLenP, kValTileHeadDimV,
