@@ -165,7 +165,7 @@ def _run_case(
     f"dQ_err={(dq_ffpa - dq_ref).abs().max().item():.4e}  "
     f"dK_err={(dk_ffpa - dk_ref).abs().max().item():.4e}  "
     f"dV_err={(dv_ffpa - dv_ref).abs().max().item():.4e}  "
-    f"backend={backward_backend:<13}  "
+    f"backend={backward_backend}  "
     f"FFPA={ms_ffpa:.2f} ms  SDPA={ms_sdpa:.2f} ms  speedup={ms_sdpa / ms_ffpa:.2f}x"
   )
 
