@@ -18,9 +18,12 @@ import warnings
 
 import torch
 
+from ._C import ffpa_attn_forward as _ffpa_attn_fwd_cuda
+# NOTE: The native backward kernels are currently slower than PyTorch's SDPA EA backward;
+# they are kept for experimentation and as a foundation for future optimised implementations.
 from ._C import ffpa_attn_backward as _ffpa_attn_bwd_cuda
 from ._C import ffpa_attn_backward_persistent_kv as _ffpa_attn_bwd_persistent_kv_cuda
-from ._C import ffpa_attn_forward as _ffpa_attn_fwd_cuda
+from .triton._ffpa_bwd import _ffpa_attn_backward as _ffpa_attn_backward_triton
 
 # The SM90 TMA large-d kernel only widens the K box to 64 fp16 cols
 # (SWIZZLE_128B) when the head dim satisfies these constraints; outside
@@ -277,9 +280,6 @@ class FFPAAttnFunc(torch.autograd.Function):
           ctx.softmax_scale,
         )
       elif ctx.backward_backend == "triton":
-        # ---- Split-D Triton backward ----
-        from ffpa_attn.triton._ffpa_bwd import _ffpa_attn_backward as _ffpa_triton_bwd
-
         # Pad LSE to seqlen_q_rounded (Triton kernel needs padded stride
         # for safe masked loads).
         seqlen_q = q.size(2)
@@ -300,7 +300,7 @@ class FFPAAttnFunc(torch.autograd.Function):
         dk_gqa = torch.empty_like(k_in)
         dv_gqa = torch.empty_like(v_in)
 
-        _ffpa_triton_bwd(
+        _ffpa_attn_backward_triton(
           do=grad_out.contiguous(),
           q=q.contiguous(),
           k=k_in.contiguous(),

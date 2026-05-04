@@ -13,7 +13,7 @@ from ffpa_attn import ffpa_attn_func  # noqa: E402
 
 
 def parse_args():
-  parser = argparse.ArgumentParser(description="Benchmark FFPA native split-D backward against SDPA backward.")
+  parser = argparse.ArgumentParser(description="Benchmark FFPA backward backends against SDPA backward.")
   parser.add_argument("--B", type=int, default=1)
   parser.add_argument("--H", type=int, default=2)
   parser.add_argument("--N", type=int, default=128)
@@ -25,11 +25,11 @@ def parse_args():
   parser.add_argument(
     "--compare-backends",
     action="store_true",
-    help="Run split-D, persistent-KV, and SDPA backward side by side.",
+    help="Run split-D, persistent-KV, Triton, and SDPA backward side by side.",
   )
   parser.add_argument(
     "--backward-backend",
-    choices=["split_d", "persistent_kv"],
+    choices=["split_d", "persistent_kv", "triton"],
     default="split_d",
     help="Native backward backend to benchmark when not using a compare mode.",
   )
@@ -110,10 +110,18 @@ def try_time_backend(timer, name, fn, q, k, v, dO, warmup, iters):
   try:
     return timer(name, fn, q, k, v, dO, warmup, iters)
   except RuntimeError as exc:
-    if "K/V-resident smem requirement" in str(exc):
+    if ("K/V-resident smem requirement" in str(exc) or "native backward was not compiled" in str(exc)):
       print(f"{name:>14}: unavailable ({exc})")
       return None
     raise
+
+
+def backend_label(backend, stages):
+  if backend == "split_d":
+    return f"split_d_s{stages}"
+  if backend == "persistent_kv":
+    return f"persist_s{stages}"
+  return backend
 
 
 def main():
@@ -162,23 +170,34 @@ def main():
   )
   timer = time_backward_only if args.mode == "backward-only" else time_backward
   if args.compare_backends:
-    split1_ms = timer("split_d_s1", make_native("split_d", 1), q, k, v, dO, args.warmup, args.iters)
-    split2_ms = timer("split_d_s2", make_native("split_d", 2), q, k, v, dO, args.warmup, args.iters)
+    split1_ms = try_time_backend(timer, "split_d_s1", make_native("split_d", 1), q, k, v, dO, args.warmup, args.iters)
+    split2_ms = try_time_backend(timer, "split_d_s2", make_native("split_d", 2), q, k, v, dO, args.warmup, args.iters)
     pkv1_ms = try_time_backend(
       timer, "persist_s1", make_native("persistent_kv", 1), q, k, v, dO, args.warmup, args.iters
     )
     pkv2_ms = try_time_backend(
       timer, "persist_s2", make_native("persistent_kv", 2), q, k, v, dO, args.warmup, args.iters
     )
+    triton_ms = try_time_backend(timer, "triton", make_native("triton", 1), q, k, v, dO, args.warmup, args.iters)
     sdpa_ms = timer("sdpa_bwd" if args.mode == "backward-only" else "sdpa", sdpa, q, k, v, dO, args.warmup, args.iters)
-    print(f"speedup split_d_s1: {sdpa_ms / split1_ms:.3f}x vs sdpa")
-    print(f"speedup split_d_s2: {sdpa_ms / split2_ms:.3f}x vs sdpa")
+    if split1_ms is not None:
+      print(f"speedup split_d_s1: {sdpa_ms / split1_ms:.3f}x vs sdpa")
+    if split2_ms is not None:
+      print(f"speedup split_d_s2: {sdpa_ms / split2_ms:.3f}x vs sdpa")
     if pkv1_ms is not None:
       print(f"speedup persist_s1: {sdpa_ms / pkv1_ms:.3f}x vs sdpa")
-      print(f"persist_s1/split_d_s1: {pkv1_ms / split1_ms:.3f}x time")
+      if split1_ms is not None:
+        print(f"persist_s1/split_d_s1: {pkv1_ms / split1_ms:.3f}x time")
     if pkv2_ms is not None:
       print(f"speedup persist_s2: {sdpa_ms / pkv2_ms:.3f}x vs sdpa")
-      print(f"persist_s2/split_d_s2: {pkv2_ms / split2_ms:.3f}x time")
+      if split2_ms is not None:
+        print(f"persist_s2/split_d_s2: {pkv2_ms / split2_ms:.3f}x time")
+    if triton_ms is not None:
+      print(f"speedup triton: {sdpa_ms / triton_ms:.3f}x vs sdpa")
+      if split1_ms is not None:
+        print(f"triton/split_d_s1: {triton_ms / split1_ms:.3f}x time")
+      if split2_ms is not None:
+        print(f"triton/split_d_s2: {triton_ms / split2_ms:.3f}x time")
   elif args.compare_stages:
     split1_ms = timer("split_d_s1", make_split_d(1), q, k, v, dO, args.warmup, args.iters)
     split2_ms = timer("split_d_s2", make_split_d(2), q, k, v, dO, args.warmup, args.iters)
@@ -191,9 +210,11 @@ def main():
     print(f"stage3/stage1: {split3_ms / split1_ms:.3f}x time")
     print(f"stage3/stage2: {split3_ms / split2_ms:.3f}x time")
   else:
-    split_ms = timer("split_d", split_d, q, k, v, dO, args.warmup, args.iters)
+    backend_name = backend_label(args.backward_backend, args.stages)
+    split_ms = try_time_backend(timer, backend_name, split_d, q, k, v, dO, args.warmup, args.iters)
     sdpa_ms = timer("sdpa_bwd" if args.mode == "backward-only" else "sdpa", sdpa, q, k, v, dO, args.warmup, args.iters)
-    print(f"speedup: {sdpa_ms / split_ms:.3f}x vs sdpa")
+    if split_ms is not None:
+      print(f"speedup {backend_name}: {sdpa_ms / split_ms:.3f}x vs sdpa")
 
 
 if __name__ == "__main__":
