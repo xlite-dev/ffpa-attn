@@ -262,7 +262,7 @@
 //   to Q head range [kv_head_idx*group_size, (kv_head_idx+1)*group_size).
 // ============================================================================
 
-#include "cuffpa/prefill.cuh"
+#include "prefill.cuh"
 
 namespace ffpa {
 namespace bwd {

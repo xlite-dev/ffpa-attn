@@ -1,5 +1,5 @@
 #pragma once
-#include "cuffpa/prefill.cuh"  // ffpa::prefill
+#include "prefill.cuh"  // ffpa::prefill
 
 // ============================================================================
 // ffpa_attn_split_d_fwd_template

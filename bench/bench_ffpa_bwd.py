@@ -1,13 +1,9 @@
 import argparse
 import math
-import os
-import sys
 import time
 
 import torch
 import torch.nn.functional as F
-
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from ffpa_attn import ffpa_attn_func  # noqa: E402
 
