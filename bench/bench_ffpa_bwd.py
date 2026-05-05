@@ -141,6 +141,7 @@ def main():
         stages=stages,
         acc="f32",
         backward_backend=backend,
+        autotune=args.autotune,
       )
 
     return native
@@ -158,6 +159,7 @@ def main():
       stages=args.stages,
       acc="f32",
       backward_backend=args.backward_backend,
+      autotune=args.autotune,
     )
 
   def sdpa(q_i, k_i, v_i):
@@ -165,7 +167,8 @@ def main():
 
   print(
     f"shape B={args.B} H={args.H} N={args.N} D={args.D} dtype={args.dtype} "
-    f"causal={args.causal} mode={args.mode} warmup={args.warmup} iters={args.iters}"
+    f"causal={args.causal} mode={args.mode} autotune={args.autotune} "
+    f"warmup={args.warmup} iters={args.iters}"
   )
   timer = time_backward_only if args.mode == "backward-only" else time_backward
   if args.compare_backends:

@@ -52,7 +52,7 @@ import triton.language as tl
 
 
 @triton.jit
-def _bwd_preprocess_do_o_dot(
+def _bwd_preprocess_do_o_dot_impl(
   Out,
   DO,
   Delta,
@@ -88,6 +88,35 @@ def _bwd_preprocess_do_o_dot(
   delta = tl.sum(o * do, axis=1)
   tl.store(Delta + off_hb * seqlen_q_rounded + offs_m, delta)
 
+
+def _gen_preprocess_autotune_configs():
+  """Generate autotune configs for the preprocess delta kernel."""
+  configs = []
+  for block_m in [64, 128, 256]:
+    for block_headdim in [64, 128]:
+      for num_warps in [4, 8]:
+        configs.append(
+          triton.Config(
+            {
+              "BLOCK_M": block_m,
+              "BLOCK_HEADDIM": block_headdim
+            },
+            num_warps=num_warps,
+            num_stages=3,
+          )
+        )
+  return configs
+
+
+# Autotuned variant.
+_bwd_preprocess_do_o_dot_autotune = triton.autotune(
+  configs=_gen_preprocess_autotune_configs(),
+  key=["seqlen_q", "headdim"],
+  reset_to_zero=["Delta"],
+)(_bwd_preprocess_do_o_dot_impl)
+
+# Non-autotuned variant.
+_bwd_preprocess_do_o_dot = _bwd_preprocess_do_o_dot_impl
 
 # ---------------------------------------------------------------------------
 # Split-D backward — one K/V column block
@@ -271,7 +300,7 @@ def _ffpa_bwd_kernel_one_col_block(
 # ---------------------------------------------------------------------------
 
 
-def _gen_autotune_configs():
+def _gen_bwd_autotune_configs():
   """Generate autotune configs over BLOCK_M, BLOCK_N, BLOCK_HEADDIM, num_warps, num_stages.
 
     NOTE: ATOMIC_ADD is intentionally excluded.  With SEQUENCE_PARALLEL=True
@@ -299,7 +328,7 @@ def _gen_autotune_configs():
   return configs
 
 
-_FFPA_BWD_AUTOTUNE_CONFIGS = _gen_autotune_configs()
+_FFPA_BWD_AUTOTUNE_CONFIGS = _gen_bwd_autotune_configs()
 _FFPA_BWD_HEURISTICS = {
   "EVEN_M": lambda args: args["seqlen_q"] % args["BLOCK_M"] == 0,
   "EVEN_N": lambda args: args["seqlen_k"] % args["BLOCK_N"] == 0,
@@ -461,18 +490,18 @@ _ffpa_bwd_kernel = _ffpa_bwd_kernel_impl
 
 
 def _ffpa_attn_backward(
-  do,
-  q,
-  k,
-  v,
-  o,
-  lse,
-  dq,
-  dk,
-  dv,
-  causal=False,
-  softmax_scale=None,
-  autotune=False,
+  do: torch.Tensor,
+  q: torch.Tensor,
+  k: torch.Tensor,
+  v: torch.Tensor,
+  o: torch.Tensor,
+  lse: torch.Tensor,
+  dq: torch.Tensor,
+  dk: torch.Tensor,
+  dv: torch.Tensor,
+  causal: bool = False,
+  softmax_scale: float = None,
+  autotune: bool = False,
 ):
   """
     FFPA backward entry point.
@@ -503,23 +532,44 @@ def _ffpa_attn_backward(
 
   BLOCK_HEADDIM_DELTA = max(triton.next_power_of_2(headdim), 16)
   delta = torch.empty_like(lse)
-  _bwd_preprocess_do_o_dot[(triton.cdiv(seqlen_q, 128), batch * nheads)](
-    o,
-    do,
-    delta,
-    o.stride(0),
-    o.stride(1),
-    o.stride(2),
-    do.stride(0),
-    do.stride(1),
-    do.stride(2),
-    nheads,
-    seqlen_q,
-    seqlen_q_rounded,
-    headdim,
-    BLOCK_M=128,
-    BLOCK_HEADDIM=BLOCK_HEADDIM_DELTA,
-  )
+  if autotune:
+
+    def pre_grid(meta):
+      return (triton.cdiv(seqlen_q, meta["BLOCK_M"]), batch * nheads)
+
+    _bwd_preprocess_do_o_dot_autotune[pre_grid](
+      o,
+      do,
+      delta,
+      o.stride(0),
+      o.stride(1),
+      o.stride(2),
+      do.stride(0),
+      do.stride(1),
+      do.stride(2),
+      nheads,
+      seqlen_q,
+      seqlen_q_rounded,
+      headdim,
+    )
+  else:
+    _bwd_preprocess_do_o_dot[(triton.cdiv(seqlen_q, 128), batch * nheads)](
+      o,
+      do,
+      delta,
+      o.stride(0),
+      o.stride(1),
+      o.stride(2),
+      do.stride(0),
+      do.stride(1),
+      do.stride(2),
+      nheads,
+      seqlen_q,
+      seqlen_q_rounded,
+      headdim,
+      BLOCK_M=128,
+      BLOCK_HEADDIM=BLOCK_HEADDIM_DELTA,
+    )
 
   # Grid: one program per (K-column block, batch-head), enabling column-parallel execution.
   # The grid lambda uses meta['BLOCK_N'] so it automatically matches the autotuned config
