@@ -84,7 +84,7 @@ def _ffpa_bwd_pre_impl(
   tl.store(Delta + off_hb * seqlen_q_rounded + offs_m, delta)
 
 
-def _gen_preprocess_autotune_configs():
+def _gen_pre_autotune_configs():
   """Generate autotune configs for the preprocess delta kernel."""
   configs = []
   for block_m in [64, 128, 256]:
@@ -105,7 +105,7 @@ def _gen_preprocess_autotune_configs():
 
 # Autotuned variant.
 _ffpa_bwd_pre_autotune = triton.autotune(
-  configs=_gen_preprocess_autotune_configs(),
+  configs=_gen_pre_autotune_configs(),
   key=["seqlen_q", "headdim"],
   reset_to_zero=["Delta"],
 )(_ffpa_bwd_pre_impl)
