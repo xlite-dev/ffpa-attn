@@ -234,7 +234,7 @@ class FFPAAttnFunc(torch.autograd.Function):
     philox_offset = zero_u64[1].unsqueeze(0)
 
     if D > 256:
-      if ctx.backward_backend == "split_d":
+      if ctx.backward_backend == "cuda":
         dq, dk, dv = _ffpa_attn_backward_cuda(
           q.contiguous(),
           k.contiguous(),
@@ -376,7 +376,7 @@ def ffpa_attn_func(
   acc: str = "f32",
   tma: bool = False,
   high_precision_grad: bool = False,
-  backward_backend: str = "sdpa",
+  backward_backend: str = "sdpa",  # TODO: default to "triton" for better performance.
   # options for Triton backward (only effective when backward_backend="triton")
   triton_backward_autotune: bool = False,
   triton_backward_version: str = "v2",
@@ -451,9 +451,9 @@ def ffpa_attn_func(
       if NaN is found, fp32 is retried transparently.  Has no effect on the
       flash attention backward path (headdim <= 256).
   :param backward_backend: Which backward implementation to use.
-      ``"sdpa"`` (default) delegates to PyTorch's SDPA backward kernels (currently, fastest).
-      ``"triton"`` uses the Split-D Triton backward kernel (supports D > 256).
-      ``"split_d"`` uses the native D-slice Split-D backward kernel.
+      ``"sdpa"`` (default) delegates to PyTorch's SDPA backward kernels (stable)
+      ``"triton"`` uses the Split-D Triton backward kernel, fastest when autotune is enabled,
+      ``"cuda"`` uses the native D-slice Split-D backward CUDA kernel.
       Has no effect in inference mode (``torch.no_grad()`` or no input
       requires gradient).
   :param triton_backward_autotune: Only meaningful when ``backward_backend="triton"``.
@@ -481,8 +481,8 @@ def ffpa_attn_func(
       PTX instruction exists on supported architectures), or if
       ``causal=True`` is combined with ``Nkv < Nq``.
   """
-  assert backward_backend in ("sdpa", "triton", "split_d"), \
-    f"Unsupported backward_backend={backward_backend!r}; choose 'sdpa', 'triton', or 'split_d'."
+  assert backward_backend in ("sdpa", "triton", "cuda"), \
+    f"Unsupported backward_backend={backward_backend!r}; choose 'sdpa', 'triton', or 'cuda'."
   if acc == "f32":
     acc_code = _ACC_F32
   elif acc == "f16":

@@ -33,7 +33,7 @@ def _parse_args() -> argparse.Namespace:
   parser = argparse.ArgumentParser(description="FFPA backward example and SDPA comparison.")
   parser.add_argument(
     "--backward-backend",
-    choices=["sdpa", "split_d", "triton"],
+    choices=["sdpa", "cuda", "triton"],
     default="sdpa",
     help="Backward backend passed to ffpa_attn_func.",
   )
@@ -73,8 +73,8 @@ def _run_ffpa_backward(
   v: torch.Tensor,
   scale: float,
   backward_backend: str,
-  causal: bool = False,
   triton_backward_autotune: bool = False,
+  causal: bool = False,
 ) -> None:
   q_i = q.detach().clone().requires_grad_(True)
   k_i = k.detach().clone().requires_grad_(True)
@@ -171,8 +171,8 @@ def _run_case(
     v,
     scale,
     backward_backend,
-    causal,
     triton_backward_autotune,
+    causal,
   )
   ms_sdpa = _time_fn(_run_sdpa_backward, q, k, v, scale, causal)
 

@@ -54,7 +54,7 @@ import triton.language as tl
 
 
 @triton.jit
-def _bwd_v1_preprocess_impl(
+def _ffpa_bwd_pre_impl(
   Out,
   DO,
   Delta,
@@ -71,6 +71,7 @@ def _bwd_v1_preprocess_impl(
   BLOCK_M: tl.constexpr,
   BLOCK_HEADDIM: tl.constexpr,
 ):
+  """Preprocess kernel to compute delta = rowsum(dO * O) for the backward pass."""
   start_m = tl.program_id(0)
   off_hb = tl.program_id(1)
   off_b = off_hb // nheads
@@ -111,14 +112,14 @@ def _gen_preprocess_autotune_configs():
 
 
 # Autotuned variant.
-_bwd_v1_preprocess_autotune = triton.autotune(
+_ffpa_bwd_pre_autotune = triton.autotune(
   configs=_gen_preprocess_autotune_configs(),
   key=["seqlen_q", "headdim"],
   reset_to_zero=["Delta"],
-)(_bwd_v1_preprocess_impl)
+)(_ffpa_bwd_pre_impl)
 
 # Non-autotuned variant.
-_bwd_v1_preprocess = _bwd_v1_preprocess_impl
+_ffpa_bwd_pre = _ffpa_bwd_pre_impl
 
 # ---------------------------------------------------------------------------
 # Split-D backward — one K/V column block
@@ -734,8 +735,8 @@ def _ffpa_bwd_v2_kernel_impl(
         dq_ptrs = DQ + offs_m[:, None] * stride_dqm + d_offs[None, :]
         dq_val = tl.load(dq_ptrs, mask=(offs_m[:, None] < seqlen_q) & (d_offs[None, :] < headdim), other=0.)
         dq_val += dq_d
-        tl.store(dq_ptrs, dq_val, mask=(offs_m[:, None] < seqlen_q) & (d_offs[None, :] < headdim))
         # NOTE: dQ is written non-atomically — each program owns a unique Q-row block.
+        tl.store(dq_ptrs, dq_val, mask=(offs_m[:, None] < seqlen_q) & (d_offs[None, :] < headdim))
 
 
 # Autotuned v2 variant.
@@ -782,31 +783,6 @@ def _ffpa_attn_backward(
         stride_qm = q.stride(2) = D
 
     LSE and delta are indexed linearly: offset = (batch * Nh + head) * Nq_rounded + row.
-
-    Future Optimisation Notes
-    -------------------------
-    **SEQUENCE_PARALLEL and autotune.**  The serial path (SEQUENCE_PARALLEL=False)
-    could theoretically be added to the autotune search space, but it is not
-    included for two reasons.  (a) It fundamentally changes the grid structure
-    (1-D vs 2-D), making the benchmark comparison less apples-to-apples.
-    (b) The serial path only has a realistic advantage when B * H is already
-    large enough to fill all SMs on their own (e.g. B=4, H=32 → 128 programs
-    on a 48-SM GPU), so column-parallelism adds nothing but atomic contention.
-    This narrow regime does not justify doubling the autotune config count.
-
-    **Preprocess-kernel fusion.**  ``_bwd_v1_preprocess`` and the main
-    backward kernel share ``dO`` and ``O`` as inputs, and the preprocess step
-    merely writes an intermediate ``delta`` buffer that the main kernel reads
-    back.  A fused kernel could:
-      1. Load ``O`` and ``dO`` once per Q-block, compute ``delta`` inline,
-         store it in registers or shared memory.
-      2. Proceed with Phase 1 (which no longer needs to reload ``dO`` for the
-         S accumulation — it was already loaded for ``delta``).
-    The main challenge is the grid mismatch: the preprocess kernel distributes
-    work as (Q-blocks, B*H), while the main backward kernel distributes as
-    (K-column-blocks, B*H).  A viable fusion point could be to fold the delta
-    computation into the main kernel's Q-block loop, eliminating the separate
-    kernel launch and the ``delta`` HBM round-trip.
   """
   if do.stride(-1) != 1:
     do = do.contiguous()
@@ -827,7 +803,7 @@ def _ffpa_attn_backward(
     def pre_grid(meta):
       return (triton.cdiv(seqlen_q, meta["BLOCK_M"]), batch * nheads)
 
-    _bwd_v1_preprocess_autotune[pre_grid](
+    _ffpa_bwd_pre_autotune[pre_grid](
       o,
       do,
       delta,
@@ -843,7 +819,7 @@ def _ffpa_attn_backward(
       headdim,
     )
   else:
-    _bwd_v1_preprocess[(triton.cdiv(seqlen_q, 128), batch * nheads)](
+    _ffpa_bwd_pre[(triton.cdiv(seqlen_q, 128), batch * nheads)](
       o,
       do,
       delta,
@@ -870,7 +846,11 @@ def _ffpa_attn_backward(
     # v2: shared-pid split-D, grid = (max(K-blocks, Q-blocks), 1, B*Nh).
     # pid serves as both K-col block index and Q-row block index.
     def grid(meta):
-      return (max(triton.cdiv(seqlen_k, meta["BLOCK_N"]), triton.cdiv(seqlen_q, meta["BLOCK_M"])), 1, batch * nheads)
+      return (
+        max(triton.cdiv(seqlen_k, meta["BLOCK_N"]), triton.cdiv(seqlen_q, meta["BLOCK_M"])),
+        1,
+        batch * nheads,
+      )
 
     if autotune:
       _ffpa_bwd_v2_autotune[grid](
