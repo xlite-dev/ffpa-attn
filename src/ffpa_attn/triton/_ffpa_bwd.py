@@ -1,7 +1,10 @@
 """
-Split-D FFPA Attention Backward — Triton Implementation.
+FFPA Attention Backward (Split-D) — Triton Implementation.
 
-Adapted from https://github.com/Dao-AILab/flash-attention/blob/main/flash_attn/flash_attn_triton.py
+FFPA v1 Backward Kernel was adapted from:
+  https://github.com/Dao-AILab/flash-attention/blob/main/flash_attn/flash_attn_triton.py
+FFPA v2 Backward Kernel was adapted from:
+  https://triton-lang.org/main/_downloads/54a35f6ec55f9746935b9566fb6bb1df/06-fused-attention.py
 
 Triton >= 3.x compatible (uses ``tl.trans`` instead of ``trans_b``).
 Supports headdim up to 1024 via Split-D tiling.
