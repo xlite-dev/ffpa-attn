@@ -21,11 +21,11 @@ def parse_args():
   parser.add_argument(
     "--compare-backends",
     action="store_true",
-    help="Run split-D, persistent-KV, Triton, and SDPA backward side by side.",
+    help="Run split-D, Triton, and SDPA backward side by side.",
   )
   parser.add_argument(
     "--backward-backend",
-    choices=["split_d", "persistent_kv", "triton"],
+    choices=["split_d", "triton"],
     default="split_d",
     help="Native backward backend to benchmark when not using a compare mode.",
   )
@@ -118,8 +118,6 @@ def try_time_backend(timer, name, fn, q, k, v, dO, warmup, iters):
 def backend_label(backend, stages):
   if backend == "split_d":
     return f"split_d_s{stages}"
-  if backend == "persistent_kv":
-    return f"persist_s{stages}"
   return backend
 
 
@@ -174,26 +172,12 @@ def main():
   if args.compare_backends:
     split1_ms = try_time_backend(timer, "split_d_s1", make_native("split_d", 1), q, k, v, dO, args.warmup, args.iters)
     split2_ms = try_time_backend(timer, "split_d_s2", make_native("split_d", 2), q, k, v, dO, args.warmup, args.iters)
-    pkv1_ms = try_time_backend(
-      timer, "persist_s1", make_native("persistent_kv", 1), q, k, v, dO, args.warmup, args.iters
-    )
-    pkv2_ms = try_time_backend(
-      timer, "persist_s2", make_native("persistent_kv", 2), q, k, v, dO, args.warmup, args.iters
-    )
     triton_ms = try_time_backend(timer, "triton", make_native("triton", 1), q, k, v, dO, args.warmup, args.iters)
     sdpa_ms = timer("sdpa_bwd" if args.mode == "backward-only" else "sdpa", sdpa, q, k, v, dO, args.warmup, args.iters)
     if split1_ms is not None:
       print(f"speedup split_d_s1: {sdpa_ms / split1_ms:.3f}x vs sdpa")
     if split2_ms is not None:
       print(f"speedup split_d_s2: {sdpa_ms / split2_ms:.3f}x vs sdpa")
-    if pkv1_ms is not None:
-      print(f"speedup persist_s1: {sdpa_ms / pkv1_ms:.3f}x vs sdpa")
-      if split1_ms is not None:
-        print(f"persist_s1/split_d_s1: {pkv1_ms / split1_ms:.3f}x time")
-    if pkv2_ms is not None:
-      print(f"speedup persist_s2: {sdpa_ms / pkv2_ms:.3f}x vs sdpa")
-      if split2_ms is not None:
-        print(f"persist_s2/split_d_s2: {pkv2_ms / split2_ms:.3f}x time")
     if triton_ms is not None:
       print(f"speedup triton: {sdpa_ms / triton_ms:.3f}x vs sdpa")
       if split1_ms is not None:

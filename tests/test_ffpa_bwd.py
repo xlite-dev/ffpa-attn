@@ -156,44 +156,6 @@ def test_ffpa_bwd_split_d_native_hdim512(dtype, causal, stages):
   torch.testing.assert_close(v.grad, dv_ref, **tol)
 
 
-@pytest.mark.parametrize("dtype", DTYPES, ids=["fp16", "bf16"])
-@pytest.mark.parametrize("causal", [False, True], ids=["noncausal", "causal"])
-@pytest.mark.parametrize("stages", [1, 2], ids=["stage1", "stage2"])
-def test_ffpa_bwd_persistent_kv_native_hdim512(dtype, causal, stages):
-  """Native persistent-KV backward for D=512 must match SDPA on a focused smoke shape."""
-  B, H, N, D = 1, 2, 128, 512
-  torch.manual_seed(0)
-  q = torch.randn(B, H, N, D, dtype=dtype, device="cuda", requires_grad=True)
-  k = torch.randn(B, H, N, D, dtype=dtype, device="cuda", requires_grad=True)
-  v = torch.randn(B, H, N, D, dtype=dtype, device="cuda", requires_grad=True)
-
-  scale = 1.0 / math.sqrt(D)
-  out = ffpa_attn_func(
-    q,
-    k,
-    v,
-    causal=causal,
-    softmax_scale=scale,
-    stages=stages,
-    acc="f32",
-    high_precision_grad=True,
-    backward_backend="persistent_kv",
-  )
-  try:
-    out.sum().backward()
-  except RuntimeError as exc:
-    if "K/V-resident smem requirement" in str(exc):
-      pytest.skip(str(exc))
-    raise
-
-  dq_ref, dk_ref, dv_ref = _sdpa_ref_grads(q, k, v, causal, scale)
-
-  tol = _tolerance(dtype)
-  torch.testing.assert_close(q.grad, dq_ref, **tol)
-  torch.testing.assert_close(k.grad, dk_ref, **tol)
-  torch.testing.assert_close(v.grad, dv_ref, **tol)
-
-
 # ---------------------------------------------------------------------------
 # Backward + causal
 # ---------------------------------------------------------------------------

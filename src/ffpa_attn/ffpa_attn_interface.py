@@ -22,7 +22,7 @@ from ._C import ffpa_attn_forward as _ffpa_attn_fwd_cuda
 # NOTE: The native backward kernels are currently slower than PyTorch's SDPA EA backward;
 # they are kept for experimentation and as a foundation for future optimised implementations.
 from ._C import ffpa_attn_backward as _ffpa_attn_bwd_cuda
-from ._C import ffpa_attn_backward_persistent_kv as _ffpa_attn_bwd_persistent_kv_cuda
+
 from .triton import _ffpa_attn_backward as _ffpa_attn_backward_triton
 
 # The SM90 TMA large-d kernel only widens the K box to 64 fp16 cols
@@ -147,37 +147,6 @@ def _ffpa_attn_backward_cuda(
   return dQ, dK, dV
 
 
-def _ffpa_attn_backward_persistent_kv_cuda(
-  Q: torch.Tensor,
-  K: torch.Tensor,
-  V: torch.Tensor,
-  O: torch.Tensor,
-  softmax_lse: torch.Tensor,
-  dO: torch.Tensor,
-  stages: int,
-  causal: int,
-  softmax_scale: float,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-  dQ = torch.zeros_like(Q)
-  dK = torch.zeros_like(K)
-  dV = torch.zeros_like(V)
-  _ffpa_attn_bwd_persistent_kv_cuda(
-    Q,
-    K,
-    V,
-    O,
-    softmax_lse,
-    dO,
-    dQ,
-    dK,
-    dV,
-    stages,
-    causal,
-    softmax_scale,
-  )
-  return dQ, dK, dV
-
-
 # ---------------------------------------------------------------------------
 # Autograd Function
 # ---------------------------------------------------------------------------
@@ -264,18 +233,6 @@ class FFPAAttnFunc(torch.autograd.Function):
     if D > 256:
       if ctx.backward_backend == "split_d":
         dq, dk, dv = _ffpa_attn_backward_cuda(
-          q.contiguous(),
-          k.contiguous(),
-          v.contiguous(),
-          O.contiguous(),
-          lse.contiguous(),
-          grad_out.contiguous(),
-          ctx.stages,
-          int(bool(ctx.causal)),
-          ctx.softmax_scale,
-        )
-      elif ctx.backward_backend == "persistent_kv":
-        dq, dk, dv = _ffpa_attn_backward_persistent_kv_cuda(
           q.contiguous(),
           k.contiguous(),
           v.contiguous(),
@@ -490,7 +447,6 @@ def ffpa_attn_func(
       ``"sdpa"`` (default) delegates to PyTorch's SDPA backward kernels (currently, fastest).
       ``"triton"`` uses the Split-D Triton backward kernel (supports D > 256).
       ``"split_d"`` uses the native D-slice Split-D backward kernel.
-      ``"persistent_kv"`` uses the native D=512 small-Bc persistent-KV backward kernel.
       Has no effect in inference mode (``torch.no_grad()`` or no input
       requires gradient).
   :param autotune: Only meaningful when ``backward_backend="triton"``.
@@ -514,9 +470,8 @@ def ffpa_attn_func(
       PTX instruction exists on supported architectures), or if
       ``causal=True`` is combined with ``Nkv < Nq``.
   """
-  assert backward_backend in ("sdpa", "triton", "split_d", "persistent_kv"), \
-    f"Unsupported backward_backend={backward_backend!r}; choose 'sdpa', 'triton', 'split_d', or 'persistent_kv'."
-
+  assert backward_backend in ("sdpa", "triton", "split_d"), \
+    f"Unsupported backward_backend={backward_backend!r}; choose 'sdpa', 'triton', or 'split_d'."
   if acc == "f32":
     acc_code = _ACC_F32
   elif acc == "f16":

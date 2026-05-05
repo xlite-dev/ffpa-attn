@@ -308,19 +308,35 @@ def _gen_bwd_autotune_configs():
     the same dQ positions, so atomic-add is required for correctness.
     ATOMIC_ADD=False would produce data-raced dQ gradients.
   """
-  # BLOCK_HEADDIM values:
-  #   64, 128  — classic D-chunk split (many chunks, low register pressure).
-  #              Best on Ampere (RTX 3080) where SMEM is limited (~100 KB).
-  #   256      — half-D chunk (2 chunks for D=512, halves HBM reloads).
-  #              Requires BLOCK_M ≤ 64 to fit registers; measured 1.3x slower
-  #              on Ampere due to the parallelism loss from smaller BLOCK_M.
-  #   512      — full-D load (1 chunk for D ≤ 512, eliminates D-chunk loop).
-  #              Failed to compile on Ampere (128 KB SMEM needed > 100 KB limit).
-  #              May be beneficial on Ada (128 KB SMEM) or Hopper (228 KB).
+  # BLOCK_M: larger = fewer Q-block iterations (good), more register pressure.
+  # BLOCK_N:
+  #   16  — many column blocks, more SM utilisation for small B*H, but
+  #         4× the atomic contention vs BLOCK_N=32.  Useful for very small
+  #         seqlen where more parallelism is needed.
+  #   32  — default.  Good trade-off for moderate seqlen (~1024).
+  #   64  — fewer column blocks, halves atomic contention.  Autotune
+  #         selected this for H=32, N=4096 (0.997x vs SDPA).
+  #   128 — 4× fewer blocks, minimal atomic contention.  Best for long
+  #         seqlen (N >= 8192) where atomic serialisation dominates.
+  # BLOCK_HEADDIM (gated by available shared memory):
+  #   64, 128 — classic D-chunk split, low register pressure, widely compatible.
+  #   256     — 2 chunks for D=512, halves HBM reloads.  Requires BLOCK_M ≤ 64
+  #             to fit registers; 1.3x slower on Ampere, may win on Ada+.
+  #   512     — full-D single chunk, eliminates D-chunk loop entirely.
+  #             Needs >= 128 KB SMEM; only included on Ada (128 KB) or Hopper
+  #             (228 KB).  Skipped on Ampere (99 KB limit).
+  try:
+    _max_smem = torch.cuda.get_device_properties(0).shared_memory_per_block_optin
+  except Exception:
+    _max_smem = 48 * 1024  # safe fallback: default SMEM
+  _headdim_candidates = [64, 128, 256]
+  if _max_smem >= 128 * 1024:
+    _headdim_candidates.append(512)
+
   configs = []
   for block_m in [32, 64, 128]:
-    for block_n in [32, 64]:
-      for block_headdim in [64, 128, 256, 512]:
+    for block_n in [16, 32, 64, 128]:
+      for block_headdim in _headdim_candidates:
         for num_warps in [4, 8]:
           for num_stages in [2, 3]:
             configs.append(
