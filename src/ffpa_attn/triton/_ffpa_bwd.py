@@ -517,6 +517,31 @@ def _ffpa_attn_backward(
         stride_qm = q.stride(2) = D
 
     LSE and delta are indexed linearly: offset = (batch * Nh + head) * Nq_rounded + row.
+
+    Future Optimisation Notes
+    -------------------------
+    **SEQUENCE_PARALLEL and autotune.**  The serial path (SEQUENCE_PARALLEL=False)
+    could theoretically be added to the autotune search space, but it is not
+    included for two reasons.  (a) It fundamentally changes the grid structure
+    (1-D vs 2-D), making the benchmark comparison less apples-to-apples.
+    (b) The serial path only has a realistic advantage when B * H is already
+    large enough to fill all SMs on their own (e.g. B=4, H=32 → 128 programs
+    on a 48-SM GPU), so column-parallelism adds nothing but atomic contention.
+    This narrow regime does not justify doubling the autotune config count.
+
+    **Preprocess-kernel fusion.**  ``_bwd_preprocess_do_o_dot`` and the main
+    backward kernel share ``dO`` and ``O`` as inputs, and the preprocess step
+    merely writes an intermediate ``delta`` buffer that the main kernel reads
+    back.  A fused kernel could:
+      1. Load ``O`` and ``dO`` once per Q-block, compute ``delta`` inline,
+         store it in registers or shared memory.
+      2. Proceed with Phase 1 (which no longer needs to reload ``dO`` for the
+         S accumulation — it was already loaded for ``delta``).
+    The main challenge is the grid mismatch: the preprocess kernel distributes
+    work as (Q-blocks, B*H), while the main backward kernel distributes as
+    (K-column-blocks, B*H).  A viable fusion point could be to fold the delta
+    computation into the main kernel's Q-block loop, eliminating the separate
+    kernel launch and the ``delta`` HBM round-trip.
   """
   if do.stride(-1) != 1:
     do = do.contiguous()
