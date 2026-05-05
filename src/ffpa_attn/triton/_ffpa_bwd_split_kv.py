@@ -1,6 +1,8 @@
 """
 Split-D FFPA Attention Backward — Triton Implementation.
 
+Adapted from https://github.com/Dao-AILab/flash-attention/blob/main/flash_attn/flash_attn_triton.py
+
 Triton >= 3.x compatible (uses ``tl.trans`` instead of ``trans_b``).
 Supports headdim up to 1024 via Split-D tiling.
 
@@ -124,7 +126,7 @@ _bwd_preprocess_do_o_dot = _bwd_preprocess_do_o_dot_impl
 
 
 @triton.jit
-def _ffpa_bwd_kernel_one_col_block(
+def ffpa_bwd_split_kv_kernel(
   start_n,
   Q,
   K,
@@ -428,7 +430,7 @@ def _ffpa_bwd_kernel_impl(
     # are occupied. Kept only for code clarity / reference.
     num_block_n = tl.cdiv(seqlen_k, BLOCK_N)
     for start_n in range(0, num_block_n):
-      _ffpa_bwd_kernel_one_col_block(
+      ffpa_bwd_split_kv_kernel(
         start_n,
         Q,
         K,
@@ -465,7 +467,7 @@ def _ffpa_bwd_kernel_impl(
     # block and write dQ via atomic-add (other programs may update the
     # same Q rows).  This fully utilises the GPU's SM count.
     start_n = tl.program_id(0)
-    _ffpa_bwd_kernel_one_col_block(
+    ffpa_bwd_split_kv_kernel(
       start_n,
       Q,
       K,
