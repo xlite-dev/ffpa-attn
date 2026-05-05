@@ -378,7 +378,7 @@ def ffpa_attn_func(
   high_precision_grad: bool = False,
   backward_backend: str = "sdpa",  # TODO: default to "triton" for better performance.
   # options for Triton backward (only effective when backward_backend="triton")
-  triton_backward_autotune: bool = False,
+  triton_backward_autotune: bool = False,  # TODO: default to True for better performance.
   triton_backward_version: str = "v2",
 ) -> torch.Tensor:
   """Unified FFPA prefill attention entry.
