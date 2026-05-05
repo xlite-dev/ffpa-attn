@@ -37,6 +37,11 @@ def _parse_args() -> argparse.Namespace:
     default="sdpa",
     help="Backward backend passed to ffpa_attn_func.",
   )
+  parser.add_argument(
+    "--autotune",
+    action="store_true",
+    help="Enable Triton autotuning (only effective when --backward-backend=triton).",
+  )
   return parser.parse_args()
 
 
@@ -69,6 +74,7 @@ def _run_ffpa_backward(
   scale: float,
   backward_backend: str,
   causal: bool = False,
+  autotune: bool = False,
 ) -> None:
   q_i = q.detach().clone().requires_grad_(True)
   k_i = k.detach().clone().requires_grad_(True)
@@ -78,6 +84,7 @@ def _run_ffpa_backward(
     k_i,
     v_i,
     backward_backend=backward_backend,
+    autotune=autotune,
     causal=causal,
     softmax_scale=scale,
   )
@@ -127,6 +134,7 @@ def _run_case(
   name: str,
   dtype: torch.dtype,
   backward_backend: str,
+  autotune: bool,
   B: int,
   Nh_q: int,
   Nh_kv: int,
@@ -145,6 +153,7 @@ def _run_case(
     k,
     v,
     backward_backend=backward_backend,
+    autotune=autotune,
     causal=causal,
     softmax_scale=scale,
   )
@@ -155,7 +164,7 @@ def _run_case(
   dv_ffpa = v.grad.detach().clone()
   dq_ref, dk_ref, dv_ref = _sdpa_ref_grads(q, k, v, scale, causal=causal)
 
-  ms_ffpa = _time_fn(_run_ffpa_backward, q, k, v, scale, backward_backend, causal)
+  ms_ffpa = _time_fn(_run_ffpa_backward, q, k, v, scale, backward_backend, causal, autotune)
   ms_sdpa = _time_fn(_run_sdpa_backward, q, k, v, scale, causal)
 
   dt_tag = str(dtype).replace("torch.", "")
@@ -177,11 +186,13 @@ def main() -> None:
     raise SystemExit("CUDA is required to run this example.")
 
   for dtype in (torch.float16, torch.bfloat16):
-    _run_case("self-attn", dtype, args.backward_backend, B=1, Nh_q=32, Nh_kv=32, Nq=8192, Nkv=8192)
-    _run_case("cross-attn", dtype, args.backward_backend, B=1, Nh_q=32, Nh_kv=32, Nq=1024, Nkv=8192)
-    _run_case("gqa", dtype, args.backward_backend, B=1, Nh_q=32, Nh_kv=8, Nq=8192, Nkv=8192)
-    _run_case("causal", dtype, args.backward_backend, B=1, Nh_q=32, Nh_kv=32, Nq=8192, Nkv=8192, causal=True)
-    _run_case("non-aligned", dtype, args.backward_backend, B=1, Nh_q=8, Nh_kv=8, Nq=8191, Nkv=8191)
+    _run_case("self-attn", dtype, args.backward_backend, args.autotune, B=1, Nh_q=32, Nh_kv=32, Nq=8192, Nkv=8192)
+    _run_case("cross-attn", dtype, args.backward_backend, args.autotune, B=1, Nh_q=32, Nh_kv=32, Nq=1024, Nkv=8192)
+    _run_case("gqa", dtype, args.backward_backend, args.autotune, B=1, Nh_q=32, Nh_kv=8, Nq=8192, Nkv=8192)
+    _run_case(
+      "causal", dtype, args.backward_backend, args.autotune, B=1, Nh_q=32, Nh_kv=32, Nq=8192, Nkv=8192, causal=True
+    )
+    _run_case("non-aligned", dtype, args.backward_backend, args.autotune, B=1, Nh_q=8, Nh_kv=8, Nq=8191, Nkv=8191)
 
 
 if __name__ == "__main__":
