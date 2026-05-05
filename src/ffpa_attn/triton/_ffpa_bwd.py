@@ -308,10 +308,19 @@ def _gen_bwd_autotune_configs():
     the same dQ positions, so atomic-add is required for correctness.
     ATOMIC_ADD=False would produce data-raced dQ gradients.
   """
+  # BLOCK_HEADDIM values:
+  #   64, 128  — classic D-chunk split (many chunks, low register pressure).
+  #              Best on Ampere (RTX 3080) where SMEM is limited (~100 KB).
+  #   256      — half-D chunk (2 chunks for D=512, halves HBM reloads).
+  #              Requires BLOCK_M ≤ 64 to fit registers; measured 1.3x slower
+  #              on Ampere due to the parallelism loss from smaller BLOCK_M.
+  #   512      — full-D load (1 chunk for D ≤ 512, eliminates D-chunk loop).
+  #              Failed to compile on Ampere (128 KB SMEM needed > 100 KB limit).
+  #              May be beneficial on Ada (128 KB SMEM) or Hopper (228 KB).
   configs = []
   for block_m in [32, 64, 128]:
     for block_n in [32, 64]:
-      for block_headdim in [64, 128]:
+      for block_headdim in [64, 128, 256, 512]:
         for num_warps in [4, 8]:
           for num_stages in [2, 3]:
             configs.append(
