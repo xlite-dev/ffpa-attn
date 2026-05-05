@@ -33,9 +33,14 @@ def _parse_args() -> argparse.Namespace:
   parser = argparse.ArgumentParser(description="FFPA backward example and SDPA comparison.")
   parser.add_argument(
     "--backward-backend",
-    choices=["sdpa", "split_d", "persistent_kv", "triton"],
+    choices=["sdpa", "cuda", "triton"],
     default="sdpa",
     help="Backward backend passed to ffpa_attn_func.",
+  )
+  parser.add_argument(
+    "--triton-backward-autotune",
+    action="store_true",
+    help="Enable Triton autotuning (only effective when --backward-backend=triton).",
   )
   return parser.parse_args()
 
@@ -68,6 +73,7 @@ def _run_ffpa_backward(
   v: torch.Tensor,
   scale: float,
   backward_backend: str,
+  triton_backward_autotune: bool = False,
   causal: bool = False,
 ) -> None:
   q_i = q.detach().clone().requires_grad_(True)
@@ -77,9 +83,10 @@ def _run_ffpa_backward(
     q_i,
     k_i,
     v_i,
-    backward_backend=backward_backend,
     causal=causal,
     softmax_scale=scale,
+    backward_backend=backward_backend,
+    triton_backward_autotune=triton_backward_autotune,
   )
   out.sum().backward()
 
@@ -127,6 +134,7 @@ def _run_case(
   name: str,
   dtype: torch.dtype,
   backward_backend: str,
+  triton_backward_autotune: bool,
   B: int,
   Nh_q: int,
   Nh_kv: int,
@@ -144,9 +152,10 @@ def _run_case(
     q,
     k,
     v,
-    backward_backend=backward_backend,
     causal=causal,
     softmax_scale=scale,
+    backward_backend=backward_backend,
+    triton_backward_autotune=triton_backward_autotune,
   )
   out.sum().backward()
 
@@ -155,7 +164,16 @@ def _run_case(
   dv_ffpa = v.grad.detach().clone()
   dq_ref, dk_ref, dv_ref = _sdpa_ref_grads(q, k, v, scale, causal=causal)
 
-  ms_ffpa = _time_fn(_run_ffpa_backward, q, k, v, scale, backward_backend, causal)
+  ms_ffpa = _time_fn(
+    _run_ffpa_backward,
+    q,
+    k,
+    v,
+    scale,
+    backward_backend,
+    triton_backward_autotune,
+    causal,
+  )
   ms_sdpa = _time_fn(_run_sdpa_backward, q, k, v, scale, causal)
 
   dt_tag = str(dtype).replace("torch.", "")
@@ -177,11 +195,62 @@ def main() -> None:
     raise SystemExit("CUDA is required to run this example.")
 
   for dtype in (torch.float16, torch.bfloat16):
-    _run_case("self-attn", dtype, args.backward_backend, B=1, Nh_q=32, Nh_kv=32, Nq=8192, Nkv=8192)
-    _run_case("cross-attn", dtype, args.backward_backend, B=1, Nh_q=32, Nh_kv=32, Nq=1024, Nkv=8192)
-    _run_case("gqa", dtype, args.backward_backend, B=1, Nh_q=32, Nh_kv=8, Nq=8192, Nkv=8192)
-    _run_case("causal", dtype, args.backward_backend, B=1, Nh_q=32, Nh_kv=32, Nq=8192, Nkv=8192, causal=True)
-    _run_case("non-aligned", dtype, args.backward_backend, B=1, Nh_q=8, Nh_kv=8, Nq=8191, Nkv=8191)
+    _run_case(
+      "self-attn",
+      dtype,
+      args.triton_backward_backend,
+      args.triton_backward_autotune,
+      B=1,
+      Nh_q=32,
+      Nh_kv=32,
+      Nq=8192,
+      Nkv=8192
+    )
+    _run_case(
+      "cross-attn",
+      dtype,
+      args.triton_backward_backend,
+      args.triton_backward_autotune,
+      B=1,
+      Nh_q=32,
+      Nh_kv=32,
+      Nq=1024,
+      Nkv=8192
+    )
+    _run_case(
+      "gqa",
+      dtype,
+      args.triton_backward_backend,
+      args.triton_backward_autotune,
+      B=1,
+      Nh_q=32,
+      Nh_kv=8,
+      Nq=8192,
+      Nkv=8192
+    )
+    _run_case(
+      "causal",
+      dtype,
+      args.triton_backward_backend,
+      args.triton_backward_autotune,
+      B=1,
+      Nh_q=32,
+      Nh_kv=32,
+      Nq=8192,
+      Nkv=8192,
+      causal=True
+    )
+    _run_case(
+      "non-aligned",
+      dtype,
+      args.triton_backward_backend,
+      args.triton_backward_autotune,
+      B=1,
+      Nh_q=8,
+      Nh_kv=8,
+      Nq=8191,
+      Nkv=8191
+    )
 
 
 if __name__ == "__main__":

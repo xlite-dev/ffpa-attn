@@ -17,7 +17,7 @@
 </div>
 
 > [!NOTE]
-> FFPA has been tested on `Ampere`, `Ada`, `Hopper`, and `Blackwell` architectures (e.g., A30, L20, 4090, H200, 5090). For `Hopper` and `Blackwell`, it delivers a `1.5×–2.3×↑🎉` speedup over SDPA on the forward pass for headdim `> 256`, and a `1.07x~1.15x🎉` end-to-end speedup for forward + backward.
+> FFPA has been tested on `Ampere`, `Ada`, `Hopper`, and `Blackwell` architectures (e.g., A30, L20, 4090, H200, 5090). For `Hopper` and `Blackwell`, it delivers a `1.5×–2.3×↑🎉` speedup over SDPA on the forward (CUDA) for headdim `> 256`, and a `1.1x~1.5x🎉` end-to-end speedup for forward (CUDA) + backward (Triton w/ autotune).
 
 ## 📖 Quick Start
 
@@ -26,7 +26,7 @@
 First, install the prebuilt package from [PyPI](https://pypi.org/project/ffpa-attn/) (required: PyTorch>=2.11.0, CUDA>=13.0, Ubuntu>=22.04):
 
 ```bash
-pip3 install -U ffpa-attn # (support: sm_80, sm_89, sm_90, sm_100, sm_120)
+pip3 install -U ffpa-attn # (support: sm_{80, 89, 90, 100, 120})
 ```
 
 Or, you can build [ffpa-attn](https://github.com/xlite-dev/ffpa-attn) from source (recommended: PyTorch>=2.11.0, CUDA>=13.0):
