@@ -475,7 +475,7 @@ def _ffpa_attn_backward(do, q, k, v, o, lse, dq, dk, dv, causal=False, softmax_s
         stride_qm = q.stride(2) = D
 
     LSE and delta are indexed linearly: offset = (batch * Nh + head) * Nq_rounded + row.
-    """
+  """
   if do.stride(-1) != 1:
     do = do.contiguous()
   batch, nheads, seqlen_q, headdim = q.shape
