@@ -35,6 +35,9 @@ def parse_args():
     default="full",
     help="full measures forward+backward; backward-only times only the backward call after forward is ready.",
   )
+  parser.add_argument(
+    "--autotune", action="store_true", help="Enable Triton autotuning (only effective for triton backend)."
+  )
   parser.add_argument("--warmup", type=int, default=5)
   parser.add_argument("--iters", type=int, default=20)
   parser.add_argument("--seed", type=int, default=0)

@@ -460,7 +460,20 @@ _ffpa_bwd_kernel = _ffpa_bwd_kernel_impl
 # ---------------------------------------------------------------------------
 
 
-def _ffpa_attn_backward(do, q, k, v, o, lse, dq, dk, dv, causal=False, softmax_scale=None, autotune=False):
+def _ffpa_attn_backward(
+  do,
+  q,
+  k,
+  v,
+  o,
+  lse,
+  dq,
+  dk,
+  dv,
+  causal=False,
+  softmax_scale=None,
+  autotune=False,
+):
   """
     FFPA backward entry point.
 
