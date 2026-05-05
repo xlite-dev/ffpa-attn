@@ -766,7 +766,7 @@ def _ffpa_attn_backward(
   causal: bool = False,
   softmax_scale: float = None,
   autotune: bool = False,
-  kernel_version: str = "v1",
+  kernel_version: str = "v2",
 ):
   """
     FFPA backward entry point.

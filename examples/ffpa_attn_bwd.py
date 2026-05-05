@@ -152,10 +152,10 @@ def _run_case(
     q,
     k,
     v,
-    backward_backend=backward_backend,
-    triton_backward_autotune=triton_backward_autotune,
     causal=causal,
     softmax_scale=scale,
+    backward_backend=backward_backend,
+    triton_backward_autotune=triton_backward_autotune,
   )
   out.sum().backward()
 
@@ -164,7 +164,16 @@ def _run_case(
   dv_ffpa = v.grad.detach().clone()
   dq_ref, dk_ref, dv_ref = _sdpa_ref_grads(q, k, v, scale, causal=causal)
 
-  ms_ffpa = _time_fn(_run_ffpa_backward, q, k, v, scale, backward_backend, causal, triton_backward_autotune)
+  ms_ffpa = _time_fn(
+    _run_ffpa_backward,
+    q,
+    k,
+    v,
+    scale,
+    backward_backend,
+    causal,
+    triton_backward_autotune,
+  )
   ms_sdpa = _time_fn(_run_sdpa_backward, q, k, v, scale, causal)
 
   dt_tag = str(dtype).replace("torch.", "")
