@@ -32,17 +32,6 @@ Known Limitations & Future Optimizations
    future optimisation should cache these tiles in shared memory (requires
    >= 64 KB SMEM, i.e. Ada or extended Ampere) or split the kernel into
    Phase-1-only and Phase-2-only kernels to eliminate the re-reads entirely.
-
-2. **dQ atomic-add contention at long seqlen.**  With SEQUENCE_PARALLEL
-   enabled, all column-block programs write to the same dQ buffer via
-   ``tl.atomic_add``.  At seqlen=4096 (~128 column blocks) this creates
-   measurable serialisation.  Mitigations include warp-level reduction
-   before the atomic, or kernel-split approaches where Phase 2 runs with
-   a 1-D grid over Q-blocks (non-atomic writes).
-
-3. **No autotune by default.**  The ``autotune=False`` path uses a fixed
-   config (discovered on Ampere).  For other architectures or
-   extreme shapes, set ``autotune=True`` to search the config space.
 """
 
 import math
