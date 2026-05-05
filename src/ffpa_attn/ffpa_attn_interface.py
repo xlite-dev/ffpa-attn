@@ -187,7 +187,9 @@ class FFPAAttnFunc(torch.autograd.Function):
     is_grad_enabled: bool,
     high_precision_grad: bool,
     backward_backend: str,
-    autotune: bool,
+    # options for Triton backward (only effective when backward_backend="triton")
+    triton_backward_autotune: bool,
+    triton_backward_version: str,
   ) -> torch.Tensor:
     is_grad = is_grad_enabled and any(x.requires_grad for x in [q, k, v])
 
@@ -216,7 +218,8 @@ class FFPAAttnFunc(torch.autograd.Function):
       ctx.stages = stages
       ctx.high_precision_grad = high_precision_grad
       ctx.backward_backend = backward_backend
-      ctx.autotune = autotune
+      ctx.triton_backward_autotune = triton_backward_autotune
+      ctx.triton_backward_version = triton_backward_version
 
     return O
 
@@ -276,7 +279,8 @@ class FFPAAttnFunc(torch.autograd.Function):
           dv=dv_gqa,
           causal=ctx.causal,
           softmax_scale=ctx.softmax_scale,
-          autotune=ctx.autotune,
+          autotune=ctx.triton_backward_autotune,
+          kernel_version=ctx.triton_backward_version,
         )
 
         if group_size > 1:
@@ -356,8 +360,9 @@ class FFPAAttnFunc(torch.autograd.Function):
       )
 
     # Gradients for: q, k, v, o, causal, scale, stages, acc, tma,
-    # is_grad_enabled, high_precision_grad, backward_backend, autotune.
-    return dq, dk, dv, None, None, None, None, None, None, None, None, None, None
+    # is_grad_enabled, high_precision_grad, backward_backend,
+    # triton_backward_autotune, triton_backward_version.
+    return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None
 
 
 def ffpa_attn_func(
@@ -372,7 +377,9 @@ def ffpa_attn_func(
   tma: bool = False,
   high_precision_grad: bool = False,
   backward_backend: str = "sdpa",
-  autotune: bool = False,
+  # options for Triton backward (only effective when backward_backend="triton")
+  triton_backward_autotune: bool = False,
+  triton_backward_version: str = "v2",
 ) -> torch.Tensor:
   """Unified FFPA prefill attention entry.
 
@@ -449,7 +456,7 @@ def ffpa_attn_func(
       ``"split_d"`` uses the native D-slice Split-D backward kernel.
       Has no effect in inference mode (``torch.no_grad()`` or no input
       requires gradient).
-  :param autotune: Only meaningful when ``backward_backend="triton"``.
+  :param triton_backward_autotune: Only meaningful when ``backward_backend="triton"``.
       When ``True``, enable Triton's autotuner to search for the optimal
       tile size, warp count, and pipeline depth at the first call per
       shape (cached afterwards).  Most effective on **short sequences**
@@ -457,9 +464,13 @@ def ffpa_attn_func(
       compared to accumulated kernel time, and where the config search
       can yield 10-50 % speedup over the fixed default.  On long sequences
       (N >> 2048) the fixed default config is usually near-optimal, so
-      leaving ``autotune=False`` avoids unnecessary benchmark latency.
+      leaving ``False`` avoids unnecessary benchmark latency.
       When ``False`` (default), uses a fixed best-known config discovered
       on Ampere for stable, predictable launch latency.
+  :param triton_backward_version: Version of the Triton backward kernel.
+      ``"v1"`` uses split-kv persistent kernel (with ``tl.atomic_add`` for dQ).
+      ``"v2"`` (default) uses shared-pid split-D kernel (dQ non-atomic, usually
+      faster).  Only meaningful when ``backward_backend="triton"``.
 
   :returns: ``O``, filled with the attention output
       ``softmax(softmax_scale * QK^T) V``.
@@ -546,5 +557,6 @@ def ffpa_attn_func(
     torch.is_grad_enabled(),
     bool(high_precision_grad),
     str(backward_backend),
-    bool(autotune),
+    bool(triton_backward_autotune),
+    str(triton_backward_version),
   )

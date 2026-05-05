@@ -25,7 +25,7 @@ Known Limitations & Future Optimizations
 -----------------------------------------
 1. **Q / dO / K repeated HBM reads across D-chunks.**  Phase 1 and Phase 2
    both iterate over D-chunks independently.  For D=512 with BLOCK_HEADDIM=128
-   this means 4 chunks × 2 phases = 8 HBM loads each for Q, dO and K.  A
+   this means 4 chunks x 2 phases = 8 HBM loads each for Q, dO and K.  A
    future optimisation should cache these tiles in shared memory (requires
    >= 64 KB SMEM, i.e. Ada or extended Ampere) or split the kernel into
    Phase-1-only and Phase-2-only kernels to eliminate the re-reads entirely.
@@ -54,7 +54,7 @@ import triton.language as tl
 
 
 @triton.jit
-def _bwd_preprocess_do_o_dot_impl(
+def _bwd_v1_preprocess_impl(
   Out,
   DO,
   Delta,
@@ -111,14 +111,14 @@ def _gen_preprocess_autotune_configs():
 
 
 # Autotuned variant.
-_bwd_preprocess_do_o_dot_autotune = triton.autotune(
+_bwd_v1_preprocess_autotune = triton.autotune(
   configs=_gen_preprocess_autotune_configs(),
   key=["seqlen_q", "headdim"],
   reset_to_zero=["Delta"],
-)(_bwd_preprocess_do_o_dot_impl)
+)(_bwd_v1_preprocess_impl)
 
 # Non-autotuned variant.
-_bwd_preprocess_do_o_dot = _bwd_preprocess_do_o_dot_impl
+_bwd_v1_preprocess = _bwd_v1_preprocess_impl
 
 # ---------------------------------------------------------------------------
 # Split-D backward — one K/V column block
@@ -126,7 +126,7 @@ _bwd_preprocess_do_o_dot = _bwd_preprocess_do_o_dot_impl
 
 
 @triton.jit
-def ffpa_bwd_split_kv_kernel(
+def ffpa_bwd_v1_kernel(
   start_n,
   Q,
   K,
@@ -288,12 +288,12 @@ def ffpa_bwd_split_kv_kernel(
 #
 # Two entry points share the same jit implementation:
 #
-#   _ffpa_bwd_kernel_autotune  — wraps the kernel with @triton.autotune for
+#   _ffpa_bwd_v1_autotune  — wraps the kernel with @triton.autotune for
 #                                 automatic tile-size / warp search.  First
 #                                 call at each shape benchmarks all configs
 #                                 (~4-6s) then caches the best.
 #
-#   _ffpa_bwd_kernel           — direct call without autotune.  Uses the
+#   _ffpa_bwd_v1           — direct call without autotune.  Uses the
 #                                 known-best config (BLOCK_M=128, BLOCK_N=32,
 #                                 BLOCK_HEADDIM=128, num_warps=8,
 #                                 num_stages=2) discovered on Ampere.
@@ -364,7 +364,7 @@ _FFPA_BWD_HEURISTICS = {
 
 @triton.heuristics(_FFPA_BWD_HEURISTICS)
 @triton.jit
-def _ffpa_bwd_kernel_impl(
+def _ffpa_bwd_v1_kernel_impl(
   Q,
   K,
   V,
@@ -430,7 +430,7 @@ def _ffpa_bwd_kernel_impl(
     # are occupied. Kept only for code clarity / reference.
     num_block_n = tl.cdiv(seqlen_k, BLOCK_N)
     for start_n in range(0, num_block_n):
-      ffpa_bwd_split_kv_kernel(
+      ffpa_bwd_v1_kernel(
         start_n,
         Q,
         K,
@@ -467,7 +467,7 @@ def _ffpa_bwd_kernel_impl(
     # block and write dQ via atomic-add (other programs may update the
     # same Q rows).  This fully utilises the GPU's SM count.
     start_n = tl.program_id(0)
-    ffpa_bwd_split_kv_kernel(
+    ffpa_bwd_v1_kernel(
       start_n,
       Q,
       K,
@@ -502,14 +502,251 @@ def _ffpa_bwd_kernel_impl(
 
 # Autotuned variant — wraps the impl with autotune; do NOT pass
 # BLOCK_M / BLOCK_N / BLOCK_HEADDIM when calling this variant.
-_ffpa_bwd_kernel_autotune = triton.autotune(
+_ffpa_bwd_v1_autotune = triton.autotune(
   configs=_FFPA_BWD_AUTOTUNE_CONFIGS,
   key=["seqlen_q", "seqlen_k", "headdim"],
   reset_to_zero=["DQ", "DK", "DV"],
-)(_ffpa_bwd_kernel_impl)
+)(_ffpa_bwd_v1_kernel_impl)
 
 # Non-autotuned variant — same impl, called with the best known config.
-_ffpa_bwd_kernel = _ffpa_bwd_kernel_impl
+_ffpa_bwd_v1 = _ffpa_bwd_v1_kernel_impl
+
+# ====================================================================
+# v2 kernel — shared-pid split-D backward (no dQ atomic_add)
+#
+# Inspired by flash-attention v2 _attn_bwd: one program_id serves as
+# both the K-column block index and the Q-row block index.
+#
+# Grid: (max(cdiv(Nk, BLOCK_N), cdiv(Nq, BLOCK_M)), 1, B*Nh)
+# Each program:
+#   1. Computes dK/dV for its K-col block (if pid*BLOCK_N < Nk).
+#   2. Computes dQ for its Q-row block (if pid*BLOCK_M < Nq).
+#
+# Because each program owns a unique Q-row block, dQ can be written
+# non-atomically, removing the main v1 bottleneck at long seqlen.
+# ====================================================================
+
+
+@triton.heuristics(_FFPA_BWD_HEURISTICS)
+@triton.jit
+def _ffpa_bwd_v2_kernel_impl(
+  Q,
+  K,
+  V,
+  DO,
+  DQ,
+  DK,
+  DV,
+  LSE,
+  D,
+  softmax_scale,
+  stride_qb,
+  stride_qh,
+  stride_qm,
+  stride_kb,
+  stride_kh,
+  stride_kn,
+  stride_vb,
+  stride_vh,
+  stride_vn,
+  stride_dob,
+  stride_doh,
+  stride_dom,
+  stride_dqb,
+  stride_dqh,
+  stride_dqm,
+  stride_dkb,
+  stride_dkh,
+  stride_dkn,
+  stride_dvb,
+  stride_dvh,
+  stride_dvn,
+  nheads,
+  seqlen_q,
+  seqlen_k,
+  seqlen_q_rounded,
+  headdim,
+  IS_CAUSAL: tl.constexpr,
+  BLOCK_HEADDIM: tl.constexpr,
+  DTYPE: tl.constexpr,
+  EVEN_M: tl.constexpr,
+  EVEN_N: tl.constexpr,
+  BLOCK_M: tl.constexpr,
+  BLOCK_N: tl.constexpr,
+):
+  pid = tl.program_id(0)
+  off_hb = tl.program_id(2)
+  off_b = off_hb // nheads
+  off_h = off_hb % nheads
+
+  # ---- base pointers ----
+  Q += off_b * stride_qb + off_h * stride_qh
+  K += off_b * stride_kb + off_h * stride_kh
+  V += off_b * stride_vb + off_h * stride_vh
+  DO += off_b * stride_dob + off_h * stride_doh
+  DQ += off_b * stride_dqb + off_h * stride_dqh
+  DK += off_b * stride_dkb + off_h * stride_dkh
+  DV += off_b * stride_dvb + off_h * stride_dvh
+  D += off_hb * seqlen_q_rounded
+  LSE += off_hb * seqlen_q_rounded
+
+  num_d_chunks = tl.cdiv(headdim, BLOCK_HEADDIM)
+
+  # ================================================================
+  # Part 1: dK / dV — pid as K-column block index
+  # ================================================================
+  start_n = pid * BLOCK_N
+  if start_n < seqlen_k:
+    offs_n = start_n + tl.arange(0, BLOCK_N)
+    offs_m = tl.arange(0, BLOCK_M)
+    offs_d = tl.arange(0, BLOCK_HEADDIM)
+
+    num_block_m = tl.cdiv(seqlen_q, BLOCK_M)
+
+    for start_m in range(0, num_block_m * BLOCK_M, BLOCK_M):
+      offs_qm = start_m + offs_m
+
+      # --- Phase 1: S = sum_d Q_d @ K_d^T, dP = sum_d dO_d @ V_d^T ---
+      S = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+      dP = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+
+      for d_chunk in range(num_d_chunks):
+        d_offs = d_chunk * BLOCK_HEADDIM + offs_d
+        q = tl.load(
+          Q + offs_qm[:, None] * stride_qm + d_offs[None, :],
+          mask=(offs_qm[:, None] < seqlen_q) & (d_offs[None, :] < headdim),
+          other=0.
+        )
+        k = tl.load(
+          K + offs_n[:, None] * stride_kn + d_offs[None, :],
+          mask=(offs_n[:, None] < seqlen_k) & (d_offs[None, :] < headdim),
+          other=0.
+        )
+        v = tl.load(
+          V + offs_n[:, None] * stride_vn + d_offs[None, :],
+          mask=(offs_n[:, None] < seqlen_k) & (d_offs[None, :] < headdim),
+          other=0.
+        )
+        do = tl.load(
+          DO + offs_qm[:, None] * stride_dom + d_offs[None, :],
+          mask=(offs_qm[:, None] < seqlen_q) & (d_offs[None, :] < headdim),
+          other=0.
+        )
+        S = tl.dot(q, tl.trans(k), acc=S)
+        dP = tl.dot(do, tl.trans(v), acc=dP)
+
+      # --- Phase 1b/1c: softmax + dS ---
+      if not EVEN_N:
+        S = tl.where(offs_n[None, :] < seqlen_k, S, float("-inf"))
+      if IS_CAUSAL:
+        S = tl.where(offs_qm[:, None] >= (offs_n[None, :]), S, float("-inf"))
+      lse_i = tl.load(LSE + offs_qm)
+      P = tl.exp(S * softmax_scale - lse_i[:, None])
+      Di = tl.load(D + offs_qm)
+      dS = (P * (dP - Di[:, None]) * softmax_scale).to(DTYPE)
+
+      # --- Phase 2 for dK/dV ---
+      for d_chunk in range(num_d_chunks):
+        d_offs = d_chunk * BLOCK_HEADDIM + offs_d
+        q = tl.load(
+          Q + offs_qm[:, None] * stride_qm + d_offs[None, :],
+          mask=(offs_qm[:, None] < seqlen_q) & (d_offs[None, :] < headdim),
+          other=0.
+        )
+        do = tl.load(
+          DO + offs_qm[:, None] * stride_dom + d_offs[None, :],
+          mask=(offs_qm[:, None] < seqlen_q) & (d_offs[None, :] < headdim),
+          other=0.
+        )
+        dk_d = tl.trans(tl.dot(tl.trans(q), dS)).to(DTYPE)
+        dk_ptrs = DK + offs_n[:, None] * stride_dkn + d_offs[None, :]
+        dk_val = tl.load(dk_ptrs, mask=(offs_n[:, None] < seqlen_k) & (d_offs[None, :] < headdim), other=0.)
+        dk_val += dk_d
+        tl.store(dk_ptrs, dk_val, mask=(offs_n[:, None] < seqlen_k) & (d_offs[None, :] < headdim))
+        dv_d = tl.trans(tl.dot(tl.trans(do).to(tl.float32), P)).to(DTYPE)
+        dv_ptrs = DV + offs_n[:, None] * stride_dvn + d_offs[None, :]
+        dv_val = tl.load(dv_ptrs, mask=(offs_n[:, None] < seqlen_k) & (d_offs[None, :] < headdim), other=0.)
+        dv_val += dv_d
+        tl.store(dv_ptrs, dv_val, mask=(offs_n[:, None] < seqlen_k) & (d_offs[None, :] < headdim))
+
+  # ================================================================
+  # Part 2: dQ — pid as Q-row block index (NON-ATOMIC!)
+  # ================================================================
+  start_m = pid * BLOCK_M
+  if start_m < seqlen_q:
+    offs_m = start_m + tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+    offs_d = tl.arange(0, BLOCK_HEADDIM)
+
+    num_block_n = tl.cdiv(seqlen_k, BLOCK_N)
+
+    for start_n_k in range(0, num_block_n * BLOCK_N, BLOCK_N):
+      offs_nk = start_n_k + offs_n
+
+      # --- Phase 1: S, dP for this Q-block × K-block ---
+      S_qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+      dP_qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+
+      for d_chunk in range(num_d_chunks):
+        d_offs = d_chunk * BLOCK_HEADDIM + offs_d
+        q = tl.load(
+          Q + offs_m[:, None] * stride_qm + d_offs[None, :],
+          mask=(offs_m[:, None] < seqlen_q) & (d_offs[None, :] < headdim),
+          other=0.
+        )
+        k = tl.load(
+          K + offs_nk[:, None] * stride_kn + d_offs[None, :],
+          mask=(offs_nk[:, None] < seqlen_k) & (d_offs[None, :] < headdim),
+          other=0.
+        )
+        v = tl.load(
+          V + offs_nk[:, None] * stride_vn + d_offs[None, :],
+          mask=(offs_nk[:, None] < seqlen_k) & (d_offs[None, :] < headdim),
+          other=0.
+        )
+        do = tl.load(
+          DO + offs_m[:, None] * stride_dom + d_offs[None, :],
+          mask=(offs_m[:, None] < seqlen_q) & (d_offs[None, :] < headdim),
+          other=0.
+        )
+        S_qk = tl.dot(q, tl.trans(k), acc=S_qk)
+        dP_qk = tl.dot(do, tl.trans(v), acc=dP_qk)
+
+      # --- Phase 1b/1c ---
+      if not EVEN_N:
+        S_qk = tl.where(offs_nk[None, :] < seqlen_k, S_qk, float("-inf"))
+      if IS_CAUSAL:
+        S_qk = tl.where(offs_m[:, None] >= (offs_nk[None, :]), S_qk, float("-inf"))
+      lse_i = tl.load(LSE + offs_m)
+      P_qk = tl.exp(S_qk * softmax_scale - lse_i[:, None])
+      Di = tl.load(D + offs_m)
+      dS_qk = (P_qk * (dP_qk - Di[:, None]) * softmax_scale).to(DTYPE)
+
+      # --- Phase 2 for dQ ---
+      for d_chunk in range(num_d_chunks):
+        d_offs = d_chunk * BLOCK_HEADDIM + offs_d
+        k = tl.load(
+          K + offs_nk[:, None] * stride_kn + d_offs[None, :],
+          mask=(offs_nk[:, None] < seqlen_k) & (d_offs[None, :] < headdim),
+          other=0.
+        )
+        dq_d = tl.dot(dS_qk, k).to(DTYPE)
+        dq_ptrs = DQ + offs_m[:, None] * stride_dqm + d_offs[None, :]
+        dq_val = tl.load(dq_ptrs, mask=(offs_m[:, None] < seqlen_q) & (d_offs[None, :] < headdim), other=0.)
+        dq_val += dq_d
+        tl.store(dq_ptrs, dq_val, mask=(offs_m[:, None] < seqlen_q) & (d_offs[None, :] < headdim))
+        # NOTE: dQ is written non-atomically — each program owns a unique Q-row block.
+
+
+# Autotuned v2 variant.
+_ffpa_bwd_v2_autotune = triton.autotune(
+  configs=_FFPA_BWD_AUTOTUNE_CONFIGS,
+  key=["seqlen_q", "seqlen_k", "headdim"],
+  reset_to_zero=["DQ", "DK", "DV"],
+)(_ffpa_bwd_v2_kernel_impl)
+
+# Non-autotuned v2 variant.
+_ffpa_bwd_v2 = _ffpa_bwd_v2_kernel_impl
 
 # ---------------------------------------------------------------------------
 # Python entry point
@@ -529,6 +766,7 @@ def _ffpa_attn_backward(
   causal: bool = False,
   softmax_scale: float = None,
   autotune: bool = False,
+  kernel_version: str = "v1",
 ):
   """
     FFPA backward entry point.
@@ -556,7 +794,7 @@ def _ffpa_attn_backward(
     on a 48-SM GPU), so column-parallelism adds nothing but atomic contention.
     This narrow regime does not justify doubling the autotune config count.
 
-    **Preprocess-kernel fusion.**  ``_bwd_preprocess_do_o_dot`` and the main
+    **Preprocess-kernel fusion.**  ``_bwd_v1_preprocess`` and the main
     backward kernel share ``dO`` and ``O`` as inputs, and the preprocess step
     merely writes an intermediate ``delta`` buffer that the main kernel reads
     back.  A fused kernel could:
@@ -589,7 +827,7 @@ def _ffpa_attn_backward(
     def pre_grid(meta):
       return (triton.cdiv(seqlen_q, meta["BLOCK_M"]), batch * nheads)
 
-    _bwd_preprocess_do_o_dot_autotune[pre_grid](
+    _bwd_v1_preprocess_autotune[pre_grid](
       o,
       do,
       delta,
@@ -605,7 +843,7 @@ def _ffpa_attn_backward(
       headdim,
     )
   else:
-    _bwd_preprocess_do_o_dot[(triton.cdiv(seqlen_q, 128), batch * nheads)](
+    _bwd_v1_preprocess[(triton.cdiv(seqlen_q, 128), batch * nheads)](
       o,
       do,
       delta,
@@ -623,108 +861,195 @@ def _ffpa_attn_backward(
       BLOCK_HEADDIM=BLOCK_HEADDIM_DELTA,
     )
 
-  # Grid: one program per (K-column block, batch-head), enabling column-parallel execution.
-  # The grid lambda uses meta['BLOCK_N'] so it automatically matches the autotuned config
-  # or the explicit BLOCK_N value passed below.
+  # Grid and kernel dispatch.
   dq.zero_()
   dk.zero_()
   dv.zero_()
 
-  def grid(meta):
-    return (triton.cdiv(seqlen_k, meta["BLOCK_N"]), batch * nheads)
+  if kernel_version == "v2":
+    # v2: shared-pid split-D, grid = (max(K-blocks, Q-blocks), 1, B*Nh).
+    # pid serves as both K-col block index and Q-row block index.
+    def grid(meta):
+      return (max(triton.cdiv(seqlen_k, meta["BLOCK_N"]), triton.cdiv(seqlen_q, meta["BLOCK_M"])), 1, batch * nheads)
 
-  # SEQUENCE_PARALLEL=True (persistent kernel): grid = (num_col_blocks, B*Nh).
-  # Each program processes one K-column block, fully utilising all SM.
-  # All programs write dQ to the same Q rows via atomic-add (correctness
-  # requires ATOMIC_ADD=True inside the one_col_block helper).
-  if autotune:
-    # Autotune: do NOT pass BLOCK_M/N/HEADDIM (autotune manages them).
-    _ffpa_bwd_kernel_autotune[grid](
-      q,
-      k,
-      v,
-      do,
-      dq,
-      dk,
-      dv,
-      lse,
-      delta,
-      softmax_scale,
-      q.stride(0),
-      q.stride(1),
-      q.stride(2),
-      k.stride(0),
-      k.stride(1),
-      k.stride(2),
-      v.stride(0),
-      v.stride(1),
-      v.stride(2),
-      do.stride(0),
-      do.stride(1),
-      do.stride(2),
-      dq.stride(0),
-      dq.stride(1),
-      dq.stride(2),
-      dk.stride(0),
-      dk.stride(1),
-      dk.stride(2),
-      dv.stride(0),
-      dv.stride(1),
-      dv.stride(2),
-      nheads,
-      seqlen_q,
-      seqlen_k,
-      seqlen_q_rounded,
-      headdim,
-      IS_CAUSAL=causal,
-      SEQUENCE_PARALLEL=True,
-      DTYPE=DTYPE,
-    )
+    if autotune:
+      _ffpa_bwd_v2_autotune[grid](
+        q,
+        k,
+        v,
+        do,
+        dq,
+        dk,
+        dv,
+        lse,
+        delta,
+        softmax_scale,
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        k.stride(0),
+        k.stride(1),
+        k.stride(2),
+        v.stride(0),
+        v.stride(1),
+        v.stride(2),
+        do.stride(0),
+        do.stride(1),
+        do.stride(2),
+        dq.stride(0),
+        dq.stride(1),
+        dq.stride(2),
+        dk.stride(0),
+        dk.stride(1),
+        dk.stride(2),
+        dv.stride(0),
+        dv.stride(1),
+        dv.stride(2),
+        nheads,
+        seqlen_q,
+        seqlen_k,
+        seqlen_q_rounded,
+        headdim,
+        IS_CAUSAL=causal,
+        DTYPE=DTYPE,
+      )
+    else:
+      _ffpa_bwd_v2[grid](
+        q,
+        k,
+        v,
+        do,
+        dq,
+        dk,
+        dv,
+        lse,
+        delta,
+        softmax_scale,
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        k.stride(0),
+        k.stride(1),
+        k.stride(2),
+        v.stride(0),
+        v.stride(1),
+        v.stride(2),
+        do.stride(0),
+        do.stride(1),
+        do.stride(2),
+        dq.stride(0),
+        dq.stride(1),
+        dq.stride(2),
+        dk.stride(0),
+        dk.stride(1),
+        dk.stride(2),
+        dv.stride(0),
+        dv.stride(1),
+        dv.stride(2),
+        nheads,
+        seqlen_q,
+        seqlen_k,
+        seqlen_q_rounded,
+        headdim,
+        IS_CAUSAL=causal,
+        DTYPE=DTYPE,
+        BLOCK_M=128,
+        BLOCK_N=32,
+        BLOCK_HEADDIM=128,
+        num_warps=8,
+        num_stages=2,
+      )
   else:
-    # Non-autotune: pass best known config explicitly.
-    _ffpa_bwd_kernel[grid](
-      q,
-      k,
-      v,
-      do,
-      dq,
-      dk,
-      dv,
-      lse,
-      delta,
-      softmax_scale,
-      q.stride(0),
-      q.stride(1),
-      q.stride(2),
-      k.stride(0),
-      k.stride(1),
-      k.stride(2),
-      v.stride(0),
-      v.stride(1),
-      v.stride(2),
-      do.stride(0),
-      do.stride(1),
-      do.stride(2),
-      dq.stride(0),
-      dq.stride(1),
-      dq.stride(2),
-      dk.stride(0),
-      dk.stride(1),
-      dk.stride(2),
-      dv.stride(0),
-      dv.stride(1),
-      dv.stride(2),
-      nheads,
-      seqlen_q,
-      seqlen_k,
-      seqlen_q_rounded,
-      headdim,
-      IS_CAUSAL=causal,
-      SEQUENCE_PARALLEL=True,
-      DTYPE=DTYPE,
-      BLOCK_M=128,
-      BLOCK_N=32,
-      BLOCK_HEADDIM=128,
-      num_warps=8,
-      num_stages=2,
-    )
+    # v1: split-kv (current), grid = (K-column blocks, B*Nh).
+    def grid(meta):
+      return (triton.cdiv(seqlen_k, meta["BLOCK_N"]), batch * nheads)
+
+    if autotune:
+      _ffpa_bwd_v1_autotune[grid](
+        q,
+        k,
+        v,
+        do,
+        dq,
+        dk,
+        dv,
+        lse,
+        delta,
+        softmax_scale,
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        k.stride(0),
+        k.stride(1),
+        k.stride(2),
+        v.stride(0),
+        v.stride(1),
+        v.stride(2),
+        do.stride(0),
+        do.stride(1),
+        do.stride(2),
+        dq.stride(0),
+        dq.stride(1),
+        dq.stride(2),
+        dk.stride(0),
+        dk.stride(1),
+        dk.stride(2),
+        dv.stride(0),
+        dv.stride(1),
+        dv.stride(2),
+        nheads,
+        seqlen_q,
+        seqlen_k,
+        seqlen_q_rounded,
+        headdim,
+        IS_CAUSAL=causal,
+        SEQUENCE_PARALLEL=True,
+        DTYPE=DTYPE,
+      )
+    else:
+      _ffpa_bwd_v1[grid](
+        q,
+        k,
+        v,
+        do,
+        dq,
+        dk,
+        dv,
+        lse,
+        delta,
+        softmax_scale,
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        k.stride(0),
+        k.stride(1),
+        k.stride(2),
+        v.stride(0),
+        v.stride(1),
+        v.stride(2),
+        do.stride(0),
+        do.stride(1),
+        do.stride(2),
+        dq.stride(0),
+        dq.stride(1),
+        dq.stride(2),
+        dk.stride(0),
+        dk.stride(1),
+        dk.stride(2),
+        dv.stride(0),
+        dv.stride(1),
+        dv.stride(2),
+        nheads,
+        seqlen_q,
+        seqlen_k,
+        seqlen_q_rounded,
+        headdim,
+        IS_CAUSAL=causal,
+        SEQUENCE_PARALLEL=True,
+        DTYPE=DTYPE,
+        BLOCK_M=128,
+        BLOCK_N=32,
+        BLOCK_HEADDIM=128,
+        num_warps=8,
+        num_stages=2,
+      )
