@@ -270,173 +270,36 @@ def _ffpa_bwd_kernel_one_col_block(
 #                                 where predictable launch latency matters.
 # ---------------------------------------------------------------------------
 
-# NOTE: ATOMIC_ADD is intentionally NOT in the autotune config.  With
-# SEQUENCE_PARALLEL=True (persistent kernel, always enabled) every column-
-# block program writes to the same dQ positions, so atomic-add is required
-# for correctness.  ATOMIC_ADD=False would produce data-raced dQ gradients.
-_FFPA_BWD_AUTOTUNE_CONFIGS = [
-  triton.Config({
-    "BLOCK_M": 32,
-    "BLOCK_N": 32,
-    "BLOCK_HEADDIM": 64
-  }, num_warps=4, num_stages=2),
-  triton.Config({
-    "BLOCK_M": 32,
-    "BLOCK_N": 32,
-    "BLOCK_HEADDIM": 64
-  }, num_warps=4, num_stages=3),
-  triton.Config({
-    "BLOCK_M": 32,
-    "BLOCK_N": 32,
-    "BLOCK_HEADDIM": 64
-  }, num_warps=8, num_stages=2),
-  triton.Config({
-    "BLOCK_M": 32,
-    "BLOCK_N": 32,
-    "BLOCK_HEADDIM": 64
-  }, num_warps=8, num_stages=3),
-  triton.Config({
-    "BLOCK_M": 32,
-    "BLOCK_N": 32,
-    "BLOCK_HEADDIM": 128
-  }, num_warps=4, num_stages=2),
-  triton.Config({
-    "BLOCK_M": 32,
-    "BLOCK_N": 32,
-    "BLOCK_HEADDIM": 128
-  }, num_warps=4, num_stages=3),
-  triton.Config({
-    "BLOCK_M": 32,
-    "BLOCK_N": 32,
-    "BLOCK_HEADDIM": 128
-  }, num_warps=8, num_stages=2),
-  triton.Config({
-    "BLOCK_M": 32,
-    "BLOCK_N": 32,
-    "BLOCK_HEADDIM": 128
-  }, num_warps=8, num_stages=3),
-  triton.Config({
-    "BLOCK_M": 64,
-    "BLOCK_N": 32,
-    "BLOCK_HEADDIM": 64
-  }, num_warps=4, num_stages=2),
-  triton.Config({
-    "BLOCK_M": 64,
-    "BLOCK_N": 32,
-    "BLOCK_HEADDIM": 64
-  }, num_warps=4, num_stages=3),
-  triton.Config({
-    "BLOCK_M": 64,
-    "BLOCK_N": 32,
-    "BLOCK_HEADDIM": 64
-  }, num_warps=8, num_stages=2),
-  triton.Config({
-    "BLOCK_M": 64,
-    "BLOCK_N": 32,
-    "BLOCK_HEADDIM": 64
-  }, num_warps=8, num_stages=3),
-  triton.Config({
-    "BLOCK_M": 64,
-    "BLOCK_N": 32,
-    "BLOCK_HEADDIM": 128
-  }, num_warps=4, num_stages=2),
-  triton.Config({
-    "BLOCK_M": 64,
-    "BLOCK_N": 32,
-    "BLOCK_HEADDIM": 128
-  }, num_warps=4, num_stages=3),
-  triton.Config({
-    "BLOCK_M": 64,
-    "BLOCK_N": 32,
-    "BLOCK_HEADDIM": 128
-  }, num_warps=8, num_stages=2),
-  triton.Config({
-    "BLOCK_M": 64,
-    "BLOCK_N": 32,
-    "BLOCK_HEADDIM": 128
-  }, num_warps=8, num_stages=3),
-  triton.Config({
-    "BLOCK_M": 64,
-    "BLOCK_N": 64,
-    "BLOCK_HEADDIM": 64
-  }, num_warps=4, num_stages=2),
-  triton.Config({
-    "BLOCK_M": 64,
-    "BLOCK_N": 64,
-    "BLOCK_HEADDIM": 64
-  }, num_warps=4, num_stages=3),
-  triton.Config({
-    "BLOCK_M": 64,
-    "BLOCK_N": 64,
-    "BLOCK_HEADDIM": 64
-  }, num_warps=8, num_stages=2),
-  triton.Config({
-    "BLOCK_M": 64,
-    "BLOCK_N": 64,
-    "BLOCK_HEADDIM": 64
-  }, num_warps=8, num_stages=3),
-  triton.Config({
-    "BLOCK_M": 64,
-    "BLOCK_N": 64,
-    "BLOCK_HEADDIM": 128
-  }, num_warps=4, num_stages=2),
-  triton.Config({
-    "BLOCK_M": 64,
-    "BLOCK_N": 64,
-    "BLOCK_HEADDIM": 128
-  }, num_warps=4, num_stages=3),
-  triton.Config({
-    "BLOCK_M": 64,
-    "BLOCK_N": 64,
-    "BLOCK_HEADDIM": 128
-  }, num_warps=8, num_stages=2),
-  triton.Config({
-    "BLOCK_M": 64,
-    "BLOCK_N": 64,
-    "BLOCK_HEADDIM": 128
-  }, num_warps=8, num_stages=3),
-  triton.Config({
-    "BLOCK_M": 128,
-    "BLOCK_N": 32,
-    "BLOCK_HEADDIM": 128
-  }, num_warps=4, num_stages=2),
-  triton.Config({
-    "BLOCK_M": 128,
-    "BLOCK_N": 32,
-    "BLOCK_HEADDIM": 128
-  }, num_warps=4, num_stages=3),
-  triton.Config({
-    "BLOCK_M": 128,
-    "BLOCK_N": 32,
-    "BLOCK_HEADDIM": 128
-  }, num_warps=8, num_stages=2),
-  triton.Config({
-    "BLOCK_M": 128,
-    "BLOCK_N": 32,
-    "BLOCK_HEADDIM": 128
-  }, num_warps=8, num_stages=3),
-  triton.Config({
-    "BLOCK_M": 128,
-    "BLOCK_N": 64,
-    "BLOCK_HEADDIM": 128
-  }, num_warps=4, num_stages=2),
-  triton.Config({
-    "BLOCK_M": 128,
-    "BLOCK_N": 64,
-    "BLOCK_HEADDIM": 128
-  }, num_warps=4, num_stages=3),
-  triton.Config({
-    "BLOCK_M": 128,
-    "BLOCK_N": 64,
-    "BLOCK_HEADDIM": 128
-  }, num_warps=8, num_stages=2),
-  triton.Config({
-    "BLOCK_M": 128,
-    "BLOCK_N": 64,
-    "BLOCK_HEADDIM": 128
-  }, num_warps=8, num_stages=3),
-]
 
+def _gen_autotune_configs():
+  """Generate autotune configs over BLOCK_M, BLOCK_N, BLOCK_HEADDIM, num_warps, num_stages.
+
+    NOTE: ATOMIC_ADD is intentionally excluded.  With SEQUENCE_PARALLEL=True
+    (persistent kernel, always enabled) every column-block program writes to
+    the same dQ positions, so atomic-add is required for correctness.
+    ATOMIC_ADD=False would produce data-raced dQ gradients.
+  """
+  configs = []
+  for block_m in [32, 64, 128]:
+    for block_n in [32, 64]:
+      for block_headdim in [64, 128]:
+        for num_warps in [4, 8]:
+          for num_stages in [2, 3]:
+            configs.append(
+              triton.Config(
+                {
+                  "BLOCK_M": block_m,
+                  "BLOCK_N": block_n,
+                  "BLOCK_HEADDIM": block_headdim
+                },
+                num_warps=num_warps,
+                num_stages=num_stages,
+              )
+            )
+  return configs
+
+
+_FFPA_BWD_AUTOTUNE_CONFIGS = _gen_autotune_configs()
 _FFPA_BWD_HEURISTICS = {
   "EVEN_M": lambda args: args["seqlen_q"] % args["BLOCK_M"] == 0,
   "EVEN_N": lambda args: args["seqlen_k"] % args["BLOCK_N"] == 0,
