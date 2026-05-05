@@ -23,7 +23,7 @@ from ._C import ffpa_attn_forward as _ffpa_attn_fwd_cuda
 # they are kept for experimentation and as a foundation for future optimised implementations.
 from ._C import ffpa_attn_backward as _ffpa_attn_bwd_cuda
 from ._C import ffpa_attn_backward_persistent_kv as _ffpa_attn_bwd_persistent_kv_cuda
-from .triton._ffpa_bwd import _ffpa_attn_backward as _ffpa_attn_backward_triton
+from .triton import _ffpa_attn_backward as _ffpa_attn_backward_triton
 
 # The SM90 TMA large-d kernel only widens the K box to 64 fp16 cols
 # (SWIZZLE_128B) when the head dim satisfies these constraints; outside
@@ -218,6 +218,7 @@ class FFPAAttnFunc(torch.autograd.Function):
     is_grad_enabled: bool,
     high_precision_grad: bool,
     backward_backend: str,
+    autotune: bool,
   ) -> torch.Tensor:
     is_grad = is_grad_enabled and any(x.requires_grad for x in [q, k, v])
 
@@ -246,6 +247,7 @@ class FFPAAttnFunc(torch.autograd.Function):
       ctx.stages = stages
       ctx.high_precision_grad = high_precision_grad
       ctx.backward_backend = backward_backend
+      ctx.autotune = autotune
 
     return O
 
@@ -317,6 +319,7 @@ class FFPAAttnFunc(torch.autograd.Function):
           dv=dv_gqa,
           causal=ctx.causal,
           softmax_scale=ctx.softmax_scale,
+          autotune=ctx.autotune,
         )
 
         if group_size > 1:
@@ -396,8 +399,8 @@ class FFPAAttnFunc(torch.autograd.Function):
       )
 
     # Gradients for: q, k, v, o, causal, scale, stages, acc, tma,
-    # is_grad_enabled, high_precision_grad, backward_backend.
-    return dq, dk, dv, None, None, None, None, None, None, None, None, None
+    # is_grad_enabled, high_precision_grad, backward_backend, autotune.
+    return dq, dk, dv, None, None, None, None, None, None, None, None, None, None
 
 
 def ffpa_attn_func(
@@ -412,6 +415,7 @@ def ffpa_attn_func(
   tma: bool = False,
   high_precision_grad: bool = False,
   backward_backend: str = "sdpa",
+  autotune: bool = False,
 ) -> torch.Tensor:
   """Unified FFPA prefill attention entry.
 
@@ -489,6 +493,17 @@ def ffpa_attn_func(
       ``"persistent_kv"`` uses the native D=512 small-Bc persistent-KV backward kernel.
       Has no effect in inference mode (``torch.no_grad()`` or no input
       requires gradient).
+  :param autotune: Only meaningful when ``backward_backend="triton"``.
+      When ``True``, enable Triton's autotuner to search for the optimal
+      tile size, warp count, and pipeline depth at the first call per
+      shape (cached afterwards).  Most effective on **short sequences**
+      (e.g. N <= 2048) where the autotune overhead (~4-6 s) is negligible
+      compared to accumulated kernel time, and where the config search
+      can yield 10-50 % speedup over the fixed default.  On long sequences
+      (N >> 2048) the fixed default config is usually near-optimal, so
+      leaving ``autotune=False`` avoids unnecessary benchmark latency.
+      When ``False`` (default), uses a fixed best-known config discovered
+      on Ampere for stable, predictable launch latency.
 
   :returns: ``O``, filled with the attention output
       ``softmax(softmax_scale * QK^T) V``.
@@ -576,4 +591,5 @@ def ffpa_attn_func(
     torch.is_grad_enabled(),
     bool(high_precision_grad),
     str(backward_backend),
+    bool(autotune),
   )

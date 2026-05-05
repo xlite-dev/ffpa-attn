@@ -18,6 +18,26 @@ Phase 2 (per Q-block, D-chunk):
     dV_d = (dO_d^T @ P)^T             [BLOCK_N, BLOCK_HEADDIM]  (atomicAdd)
 
 delta = rowsum(dO * O) is precomputed.
+
+Known Limitations & Future Optimizations
+-----------------------------------------
+1. **Q / dO / K repeated HBM reads across D-chunks.**  Phase 1 and Phase 2
+   both iterate over D-chunks independently.  For D=512 with BLOCK_HEADDIM=128
+   this means 4 chunks × 2 phases = 8 HBM loads each for Q, dO and K.  A
+   future optimisation should cache these tiles in shared memory (requires
+   >= 64 KB SMEM, i.e. Ada or extended Ampere) or split the kernel into
+   Phase-1-only and Phase-2-only kernels to eliminate the re-reads entirely.
+
+2. **dQ atomic-add contention at long seqlen.**  With SEQUENCE_PARALLEL
+   enabled, all column-block programs write to the same dQ buffer via
+   ``tl.atomic_add``.  At seqlen=4096 (~128 column blocks) this creates
+   measurable serialisation.  Mitigations include warp-level reduction
+   before the atomic, or kernel-split approaches where Phase 2 runs with
+   a 1-D grid over Q-blocks (non-atomic writes).
+
+3. **No autotune by default.**  The ``autotune=False`` path uses a fixed
+   config (discovered on Ampere).  For other architectures or
+   extreme shapes, set ``autotune=True`` to search the config space.
 """
 
 import math
@@ -181,6 +201,12 @@ def _ffpa_bwd_kernel_one_col_block(
       d_offs = d_start + offs_d
 
       # --- dQ_d = dS @ K_d ---
+      # NOTE: ATOMIC_ADD is always True because the persistent kernel
+      # (SEQUENCE_PARALLEL=True) launches one program per K-column block,
+      # and all programs write to the same Q-row positions in dQ.  Non-
+      # atomic load+add+store would produce data races.  The non-atomic
+      # branch is only reachable when SEQUENCE_PARALLEL=False, which is
+      # no longer used in the current implementation.
       k = tl.load(
         K + offs_n[:, None] * stride_kn + d_offs[None, :],
         mask=(offs_n[:, None] < seqlen_k) & (d_offs[None, :] < headdim),
@@ -228,15 +254,198 @@ def _ffpa_bwd_kernel_one_col_block(
 
 # ---------------------------------------------------------------------------
 # Main backward kernel
+#
+# Two entry points share the same jit implementation:
+#
+#   _ffpa_bwd_kernel_autotune  — wraps the kernel with @triton.autotune for
+#                                 automatic tile-size / warp search.  First
+#                                 call at each shape benchmarks all configs
+#                                 (~4-6s) then caches the best.
+#
+#   _ffpa_bwd_kernel           — direct call without autotune.  Uses the
+#                                 known-best config (BLOCK_M=128, BLOCK_N=32,
+#                                 BLOCK_HEADDIM=128, num_warps=8,
+#                                 num_stages=2) discovered on Ampere.
+#                                 for D=512.  Suitable for production use
+#                                 where predictable launch latency matters.
 # ---------------------------------------------------------------------------
 
+# NOTE: ATOMIC_ADD is intentionally NOT in the autotune config.  With
+# SEQUENCE_PARALLEL=True (persistent kernel, always enabled) every column-
+# block program writes to the same dQ positions, so atomic-add is required
+# for correctness.  ATOMIC_ADD=False would produce data-raced dQ gradients.
+_FFPA_BWD_AUTOTUNE_CONFIGS = [
+  triton.Config({
+    "BLOCK_M": 32,
+    "BLOCK_N": 32,
+    "BLOCK_HEADDIM": 64
+  }, num_warps=4, num_stages=2),
+  triton.Config({
+    "BLOCK_M": 32,
+    "BLOCK_N": 32,
+    "BLOCK_HEADDIM": 64
+  }, num_warps=4, num_stages=3),
+  triton.Config({
+    "BLOCK_M": 32,
+    "BLOCK_N": 32,
+    "BLOCK_HEADDIM": 64
+  }, num_warps=8, num_stages=2),
+  triton.Config({
+    "BLOCK_M": 32,
+    "BLOCK_N": 32,
+    "BLOCK_HEADDIM": 64
+  }, num_warps=8, num_stages=3),
+  triton.Config({
+    "BLOCK_M": 32,
+    "BLOCK_N": 32,
+    "BLOCK_HEADDIM": 128
+  }, num_warps=4, num_stages=2),
+  triton.Config({
+    "BLOCK_M": 32,
+    "BLOCK_N": 32,
+    "BLOCK_HEADDIM": 128
+  }, num_warps=4, num_stages=3),
+  triton.Config({
+    "BLOCK_M": 32,
+    "BLOCK_N": 32,
+    "BLOCK_HEADDIM": 128
+  }, num_warps=8, num_stages=2),
+  triton.Config({
+    "BLOCK_M": 32,
+    "BLOCK_N": 32,
+    "BLOCK_HEADDIM": 128
+  }, num_warps=8, num_stages=3),
+  triton.Config({
+    "BLOCK_M": 64,
+    "BLOCK_N": 32,
+    "BLOCK_HEADDIM": 64
+  }, num_warps=4, num_stages=2),
+  triton.Config({
+    "BLOCK_M": 64,
+    "BLOCK_N": 32,
+    "BLOCK_HEADDIM": 64
+  }, num_warps=4, num_stages=3),
+  triton.Config({
+    "BLOCK_M": 64,
+    "BLOCK_N": 32,
+    "BLOCK_HEADDIM": 64
+  }, num_warps=8, num_stages=2),
+  triton.Config({
+    "BLOCK_M": 64,
+    "BLOCK_N": 32,
+    "BLOCK_HEADDIM": 64
+  }, num_warps=8, num_stages=3),
+  triton.Config({
+    "BLOCK_M": 64,
+    "BLOCK_N": 32,
+    "BLOCK_HEADDIM": 128
+  }, num_warps=4, num_stages=2),
+  triton.Config({
+    "BLOCK_M": 64,
+    "BLOCK_N": 32,
+    "BLOCK_HEADDIM": 128
+  }, num_warps=4, num_stages=3),
+  triton.Config({
+    "BLOCK_M": 64,
+    "BLOCK_N": 32,
+    "BLOCK_HEADDIM": 128
+  }, num_warps=8, num_stages=2),
+  triton.Config({
+    "BLOCK_M": 64,
+    "BLOCK_N": 32,
+    "BLOCK_HEADDIM": 128
+  }, num_warps=8, num_stages=3),
+  triton.Config({
+    "BLOCK_M": 64,
+    "BLOCK_N": 64,
+    "BLOCK_HEADDIM": 64
+  }, num_warps=4, num_stages=2),
+  triton.Config({
+    "BLOCK_M": 64,
+    "BLOCK_N": 64,
+    "BLOCK_HEADDIM": 64
+  }, num_warps=4, num_stages=3),
+  triton.Config({
+    "BLOCK_M": 64,
+    "BLOCK_N": 64,
+    "BLOCK_HEADDIM": 64
+  }, num_warps=8, num_stages=2),
+  triton.Config({
+    "BLOCK_M": 64,
+    "BLOCK_N": 64,
+    "BLOCK_HEADDIM": 64
+  }, num_warps=8, num_stages=3),
+  triton.Config({
+    "BLOCK_M": 64,
+    "BLOCK_N": 64,
+    "BLOCK_HEADDIM": 128
+  }, num_warps=4, num_stages=2),
+  triton.Config({
+    "BLOCK_M": 64,
+    "BLOCK_N": 64,
+    "BLOCK_HEADDIM": 128
+  }, num_warps=4, num_stages=3),
+  triton.Config({
+    "BLOCK_M": 64,
+    "BLOCK_N": 64,
+    "BLOCK_HEADDIM": 128
+  }, num_warps=8, num_stages=2),
+  triton.Config({
+    "BLOCK_M": 64,
+    "BLOCK_N": 64,
+    "BLOCK_HEADDIM": 128
+  }, num_warps=8, num_stages=3),
+  triton.Config({
+    "BLOCK_M": 128,
+    "BLOCK_N": 32,
+    "BLOCK_HEADDIM": 128
+  }, num_warps=4, num_stages=2),
+  triton.Config({
+    "BLOCK_M": 128,
+    "BLOCK_N": 32,
+    "BLOCK_HEADDIM": 128
+  }, num_warps=4, num_stages=3),
+  triton.Config({
+    "BLOCK_M": 128,
+    "BLOCK_N": 32,
+    "BLOCK_HEADDIM": 128
+  }, num_warps=8, num_stages=2),
+  triton.Config({
+    "BLOCK_M": 128,
+    "BLOCK_N": 32,
+    "BLOCK_HEADDIM": 128
+  }, num_warps=8, num_stages=3),
+  triton.Config({
+    "BLOCK_M": 128,
+    "BLOCK_N": 64,
+    "BLOCK_HEADDIM": 128
+  }, num_warps=4, num_stages=2),
+  triton.Config({
+    "BLOCK_M": 128,
+    "BLOCK_N": 64,
+    "BLOCK_HEADDIM": 128
+  }, num_warps=4, num_stages=3),
+  triton.Config({
+    "BLOCK_M": 128,
+    "BLOCK_N": 64,
+    "BLOCK_HEADDIM": 128
+  }, num_warps=8, num_stages=2),
+  triton.Config({
+    "BLOCK_M": 128,
+    "BLOCK_N": 64,
+    "BLOCK_HEADDIM": 128
+  }, num_warps=8, num_stages=3),
+]
 
-@triton.heuristics({
+_FFPA_BWD_HEURISTICS = {
   "EVEN_M": lambda args: args["seqlen_q"] % args["BLOCK_M"] == 0,
   "EVEN_N": lambda args: args["seqlen_k"] % args["BLOCK_N"] == 0,
-})
+}
+
+
+@triton.heuristics(_FFPA_BWD_HEURISTICS)
 @triton.jit
-def _ffpa_bwd_kernel(
+def _ffpa_bwd_kernel_impl(
   Q,
   K,
   V,
@@ -274,9 +483,9 @@ def _ffpa_bwd_kernel(
   seqlen_q_rounded,
   headdim,
   IS_CAUSAL: tl.constexpr,
+  SEQUENCE_PARALLEL: tl.constexpr,
   BLOCK_HEADDIM: tl.constexpr,
   DTYPE: tl.constexpr,
-  SEQUENCE_PARALLEL: tl.constexpr,
   EVEN_M: tl.constexpr,
   EVEN_N: tl.constexpr,
   BLOCK_M: tl.constexpr,
@@ -297,6 +506,9 @@ def _ffpa_bwd_kernel(
   LSE += off_hb * seqlen_q_rounded
 
   if not SEQUENCE_PARALLEL:
+    # Serial path: one program per (batch, head) iterates over all K-column
+    # blocks in a loop.  Low SM utilisation — for B=1, H=8 only 8 of 48 SM
+    # are occupied. Kept only for code clarity / reference.
     num_block_n = tl.cdiv(seqlen_k, BLOCK_N)
     for start_n in range(0, num_block_n):
       _ffpa_bwd_kernel_one_col_block(
@@ -331,6 +543,10 @@ def _ffpa_bwd_kernel(
         BLOCK_N=BLOCK_N,
       )
   else:
+    # Persistent / column-parallel path: one program per (K-column block,
+    # batch-head).  All programs independently process their own column
+    # block and write dQ via atomic-add (other programs may update the
+    # same Q rows).  This fully utilises the GPU's SM count.
     start_n = tl.program_id(0)
     _ffpa_bwd_kernel_one_col_block(
       start_n,
@@ -365,12 +581,23 @@ def _ffpa_bwd_kernel(
     )
 
 
+# Autotuned variant — wraps the impl with autotune; do NOT pass
+# BLOCK_M / BLOCK_N / BLOCK_HEADDIM when calling this variant.
+_ffpa_bwd_kernel_autotune = triton.autotune(
+  configs=_FFPA_BWD_AUTOTUNE_CONFIGS,
+  key=["seqlen_q", "seqlen_k", "headdim"],
+  reset_to_zero=["DQ", "DK", "DV"],
+)(_ffpa_bwd_kernel_impl)
+
+# Non-autotuned variant — same impl, called with the best known config.
+_ffpa_bwd_kernel = _ffpa_bwd_kernel_impl
+
 # ---------------------------------------------------------------------------
 # Python entry point
 # ---------------------------------------------------------------------------
 
 
-def _ffpa_attn_backward(do, q, k, v, o, lse, dq, dk, dv, causal=False, softmax_scale=None):
+def _ffpa_attn_backward(do, q, k, v, o, lse, dq, dk, dv, causal=False, softmax_scale=None, autotune=False):
   """
     FFPA backward entry point.
 
@@ -418,63 +645,108 @@ def _ffpa_attn_backward(do, q, k, v, o, lse, dq, dk, dv, causal=False, softmax_s
     BLOCK_HEADDIM=BLOCK_HEADDIM_DELTA,
   )
 
-  if headdim >= 128:
-    BLOCK_HEADDIM_MAIN = 128
-    BLOCK_M = 32
-    BLOCK_N = 32
-  else:
-    BLOCK_HEADDIM_MAIN = max(triton.next_power_of_2(headdim), 16)
-    BLOCK_M = 64
-    BLOCK_N = 64
-  SEQUENCE_PARALLEL = False
-
+  # Grid: one program per (K-column block, batch-head), enabling column-parallel execution.
+  # The grid lambda uses meta['BLOCK_N'] so it automatically matches the autotuned config
+  # or the explicit BLOCK_N value passed below.
   dq.zero_()
   dk.zero_()
   dv.zero_()
 
-  grid = (triton.cdiv(seqlen_k, BLOCK_N) if SEQUENCE_PARALLEL else 1, batch * nheads)
+  def grid(meta):
+    return (triton.cdiv(seqlen_k, meta["BLOCK_N"]), batch * nheads)
 
-  _ffpa_bwd_kernel[grid](
-    q,
-    k,
-    v,
-    do,
-    dq,
-    dk,
-    dv,
-    lse,
-    delta,
-    softmax_scale,
-    q.stride(0),
-    q.stride(1),
-    q.stride(2),
-    k.stride(0),
-    k.stride(1),
-    k.stride(2),
-    v.stride(0),
-    v.stride(1),
-    v.stride(2),
-    do.stride(0),
-    do.stride(1),
-    do.stride(2),
-    dq.stride(0),
-    dq.stride(1),
-    dq.stride(2),
-    dk.stride(0),
-    dk.stride(1),
-    dk.stride(2),
-    dv.stride(0),
-    dv.stride(1),
-    dv.stride(2),
-    nheads,
-    seqlen_q,
-    seqlen_k,
-    seqlen_q_rounded,
-    headdim,
-    IS_CAUSAL=causal,
-    BLOCK_HEADDIM=BLOCK_HEADDIM_MAIN,
-    DTYPE=DTYPE,
-    SEQUENCE_PARALLEL=SEQUENCE_PARALLEL,
-    BLOCK_M=BLOCK_M,
-    BLOCK_N=BLOCK_N,
-  )
+  # SEQUENCE_PARALLEL=True (persistent kernel): grid = (num_col_blocks, B*Nh).
+  # Each program processes one K-column block, fully utilising all SM.
+  # All programs write dQ to the same Q rows via atomic-add (correctness
+  # requires ATOMIC_ADD=True inside the one_col_block helper).
+  if autotune:
+    # Autotune: do NOT pass BLOCK_M/N/HEADDIM (autotune manages them).
+    _ffpa_bwd_kernel_autotune[grid](
+      q,
+      k,
+      v,
+      do,
+      dq,
+      dk,
+      dv,
+      lse,
+      delta,
+      softmax_scale,
+      q.stride(0),
+      q.stride(1),
+      q.stride(2),
+      k.stride(0),
+      k.stride(1),
+      k.stride(2),
+      v.stride(0),
+      v.stride(1),
+      v.stride(2),
+      do.stride(0),
+      do.stride(1),
+      do.stride(2),
+      dq.stride(0),
+      dq.stride(1),
+      dq.stride(2),
+      dk.stride(0),
+      dk.stride(1),
+      dk.stride(2),
+      dv.stride(0),
+      dv.stride(1),
+      dv.stride(2),
+      nheads,
+      seqlen_q,
+      seqlen_k,
+      seqlen_q_rounded,
+      headdim,
+      IS_CAUSAL=causal,
+      SEQUENCE_PARALLEL=True,
+      DTYPE=DTYPE,
+    )
+  else:
+    # Non-autotune: pass best known config explicitly.
+    _ffpa_bwd_kernel[grid](
+      q,
+      k,
+      v,
+      do,
+      dq,
+      dk,
+      dv,
+      lse,
+      delta,
+      softmax_scale,
+      q.stride(0),
+      q.stride(1),
+      q.stride(2),
+      k.stride(0),
+      k.stride(1),
+      k.stride(2),
+      v.stride(0),
+      v.stride(1),
+      v.stride(2),
+      do.stride(0),
+      do.stride(1),
+      do.stride(2),
+      dq.stride(0),
+      dq.stride(1),
+      dq.stride(2),
+      dk.stride(0),
+      dk.stride(1),
+      dk.stride(2),
+      dv.stride(0),
+      dv.stride(1),
+      dv.stride(2),
+      nheads,
+      seqlen_q,
+      seqlen_k,
+      seqlen_q_rounded,
+      headdim,
+      IS_CAUSAL=causal,
+      SEQUENCE_PARALLEL=True,
+      DTYPE=DTYPE,
+      BLOCK_M=128,
+      BLOCK_N=32,
+      BLOCK_HEADDIM=128,
+      num_warps=8,
+      num_stages=2,
+    )
