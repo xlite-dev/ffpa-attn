@@ -7,8 +7,9 @@ C-extension symbol directly.
 
 Backward pass delegates to PyTorch SDPA backward functions, routing by
 headdim: flash_attention_backward for D <= 256, efficient_attention_backward
-for D > 256.  The forward kernel always writes softmax_lse so the backward
-has the log-sum-exp statistics it needs without re-running attention.
+for D > 256. Small-D forward/backward use PyTorch's aten flash-attention
+operator pair; large-D forward continues to use the FFPA CUDA or Triton
+kernels.
 """
 
 from __future__ import annotations
@@ -51,6 +52,73 @@ _FFPA_ATTN_IMPL_DEFAULTS: dict[str, object] = {
 }
 
 
+def _aten_flash_attn_forward(
+  q: torch.Tensor,
+  k: torch.Tensor,
+  v: torch.Tensor,
+  o: torch.Tensor | None,
+  causal: bool,
+  softmax_scale: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+  """Run the small-D path through the exact aten flash-attention forward op."""
+
+  q_bnhd = q.transpose(1, 2).contiguous()
+  k_bnhd = k.transpose(1, 2).contiguous()
+  v_bnhd = v.transpose(1, 2).contiguous()
+  out_bnhd, lse, rng_state, unused, _ = torch.ops.aten._flash_attention_forward(
+    q_bnhd,
+    k_bnhd,
+    v_bnhd,
+    None,
+    None,
+    q.size(2),
+    k.size(2),
+    0.0,
+    causal,
+    False,
+    scale=softmax_scale,
+  )
+  out = out_bnhd.transpose(1, 2).contiguous()
+  if o is None:
+    return out, lse, rng_state, unused
+
+  o.copy_(out)
+  return o, lse, rng_state, unused
+
+
+def _aten_flash_attn_backward(
+  grad_out: torch.Tensor,
+  q: torch.Tensor,
+  k: torch.Tensor,
+  v: torch.Tensor,
+  o: torch.Tensor,
+  lse: torch.Tensor,
+  causal: bool,
+  rng_state: torch.Tensor,
+  unused: torch.Tensor,
+  softmax_scale: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+  """Run the small-D path through PyTorch's flash-attention backward wrapper."""
+
+  return torch.ops.aten._scaled_dot_product_flash_attention_backward.default(
+    grad_out.contiguous(),
+    q.contiguous(),
+    k.contiguous(),
+    v.contiguous(),
+    o.contiguous(),
+    lse.contiguous(),
+    None,
+    None,
+    q.size(2),
+    k.size(2),
+    0.0,
+    causal,
+    rng_state.contiguous(),
+    unused.contiguous(),
+    scale=softmax_scale,
+  )
+
+
 @dataclass(frozen=True)
 class FFPAAttnMeta:
   """Non-tensor FFPA options passed through the autograd Function.
@@ -89,24 +157,21 @@ class FFPAAttnMeta:
 # ---------------------------------------------------------------------------
 # Autograd Function
 # ---------------------------------------------------------------------------
-# FFPA forward writes O and softmax_lse.  When any input requires gradients
-# and grad mode is enabled, those intermediates are saved for backward.
-# Backward dispatches to the appropriate PyTorch SDPA backward based on
-# headdim, keeping the "call PyTorch's existing implementation" contract.
+# Small-D uses PyTorch's flash-attention forward/backward pair; large-D uses
+# FFPA forward plus the existing FFPA / SDPA backward routing. When any input
+# requires gradients and grad mode is enabled, the selected path saves the
+# intermediates its matching backward consumes.
 # ---------------------------------------------------------------------------
 
 
 class FFPAAttnFunc(torch.autograd.Function):
   """FFPA attention with autograd support.
 
-    Forward calls the FFPA CUDA kernel (which always writes O and
-    softmax_lse).  When any input requires gradients and grad mode is
-    enabled, the intermediate tensors (Q, K, V) are saved for backward.
-    Backward re-runs :func:`torch.nn.functional.scaled_dot_product_attention`
-    to produce correct gradients, which handles GQA, causal, and
-    cross-attention transparently.  This is a correctness-first compromise:
-    the forward benefits from FFPA's speed; backward correctness is
-    guaranteed by PyTorch's SDPA implementation.
+    Forward routes by headdim. ``D <= 256`` uses PyTorch's flash-attention
+    forward/backward pair. ``D > 256`` continues to use the FFPA CUDA or
+    Triton kernels. When any input requires gradients and grad mode is
+    enabled, the intermediate tensors needed by the selected backward path
+    are saved on the context.
 
     Dropout is not supported (always 0.0).
   """
@@ -121,8 +186,18 @@ class FFPAAttnFunc(torch.autograd.Function):
     meta: FFPAAttnMeta,
   ) -> torch.Tensor:
     is_grad = meta.is_grad_enabled and any(x.requires_grad for x in [q, k, v])
+    head_dim = q.size(-1)
 
-    if meta.forward_backend == "cuda":
+    if head_dim <= 256:
+      O, lse, rng_state, unused = _aten_flash_attn_forward(
+        q,
+        k,
+        v,
+        o,
+        bool(meta.causal),
+        meta.softmax_scale,
+      )
+    elif meta.forward_backend == "cuda":
       O, lse = _ffpa_attn_forward_cuda(
         q,
         k,
@@ -145,7 +220,11 @@ class FFPAAttnFunc(torch.autograd.Function):
         meta.triton_forward_autotune,
       )
     else:
-      raise ValueError(f"Unsupported forward_backend={meta.forward_backend!r}; choose 'cuda' or 'triton'.")
+      raise ValueError(f"Unsupported forward_backend={meta.forward_backend!r};")
+
+    if head_dim > 256:
+      rng_state = torch.empty(0, dtype=torch.uint8, device=q.device)
+      unused = torch.empty(0, dtype=torch.uint8, device=q.device)
 
     if is_grad:
       ctx.save_for_backward(
@@ -154,6 +233,8 @@ class FFPAAttnFunc(torch.autograd.Function):
         v.contiguous(),
         O.contiguous(),
         lse,
+        rng_state,
+        unused,
       )
       ctx.meta = meta
 
@@ -161,7 +242,7 @@ class FFPAAttnFunc(torch.autograd.Function):
 
   @staticmethod
   def backward(ctx, grad_out: torch.Tensor):
-    q, k, v, O, lse = ctx.saved_tensors
+    q, k, v, O, lse, rng_state, unused = ctx.saved_tensors
     meta = ctx.meta
     D = q.size(-1)
     group_size = q.size(1) // k.size(1)
@@ -189,7 +270,12 @@ class FFPAAttnFunc(torch.autograd.Function):
         seqlen_q = q.size(2)
         seqlen_q_rounded = ((seqlen_q + 127) // 128) * 128
         if lse.size(-1) < seqlen_q_rounded:
-          lse_padded = torch.empty(*lse.shape[:-1], seqlen_q_rounded, dtype=torch.float32, device=lse.device)
+          lse_padded = torch.empty(
+            *lse.shape[:-1],
+            seqlen_q_rounded,
+            dtype=torch.float32,
+            device=lse.device,
+          )
           lse_padded[..., :lse.size(-1)] = lse
           lse = lse_padded
 
@@ -222,8 +308,20 @@ class FFPAAttnFunc(torch.autograd.Function):
         )
 
         if group_size > 1:
-          dk = dk_gqa.reshape(k.size(0), k.size(1), group_size, k.size(2), k.size(3)).sum(dim=2).to(k.dtype)
-          dv = dv_gqa.reshape(v.size(0), v.size(1), group_size, v.size(2), v.size(3)).sum(dim=2).to(v.dtype)
+          dk = dk_gqa.reshape(
+            k.size(0),
+            k.size(1),
+            group_size,
+            k.size(2),
+            k.size(3),
+          ).sum(dim=2).to(k.dtype)
+          dv = dv_gqa.reshape(
+            v.size(0),
+            v.size(1),
+            group_size,
+            v.size(2),
+            v.size(3),
+          ).sum(dim=2).to(v.dtype)
         else:
           dk, dv = dk_gqa.to(k.dtype), dv_gqa.to(v.dtype)
         dq = dq.to(q.dtype)
@@ -241,7 +339,12 @@ class FFPAAttnFunc(torch.autograd.Function):
         O = O.transpose(1, 2).contiguous().transpose(1, 2)  # noqa: E741
         if lse.size(1) > 1 and (lse.stride(1) % 8) != 0:
           seqlen_q_aligned = ((lse.size(-1) + 7) // 8) * 8
-          lse_padded = torch.empty(*lse.shape[:-1], seqlen_q_aligned, dtype=lse.dtype, device=lse.device)
+          lse_padded = torch.empty(
+            *lse.shape[:-1],
+            seqlen_q_aligned,
+            dtype=lse.dtype,
+            device=lse.device,
+          )
           lse_padded[..., :lse.size(-1)] = lse
           lse = lse_padded
 
@@ -273,28 +376,35 @@ class FFPAAttnFunc(torch.autograd.Function):
                 scale=meta.softmax_scale,
             )
         if group_size > 1:
-          dk = dk_e.reshape(k.size(0), k.size(1), group_size, k.size(2), k.size(3)).sum(dim=2).to(k.dtype)
-          dv = dv_e.reshape(v.size(0), v.size(1), group_size, v.size(2), v.size(3)).sum(dim=2).to(v.dtype)
+          dk = dk_e.reshape(
+            k.size(0),
+            k.size(1),
+            group_size,
+            k.size(2),
+            k.size(3),
+          ).sum(dim=2).to(k.dtype)
+          dv = dv_e.reshape(
+            v.size(0),
+            v.size(1),
+            group_size,
+            v.size(2),
+            v.size(3),
+          ).sum(dim=2).to(v.dtype)
         else:
           dk, dv = dk_e.to(k.dtype), dv_e.to(v.dtype)
         dq = dq.to(q.dtype)
     else:
-      dq, dk, dv = torch.ops.aten._scaled_dot_product_flash_attention_backward.default(
-        grad_out.contiguous(),
-        q.contiguous(),
-        k.contiguous(),
-        v.contiguous(),
-        O.contiguous(),
-        lse.contiguous(),
-        None,
-        None,
-        q.size(2),
-        k.size(2),
-        0.0,
+      dq, dk, dv = _aten_flash_attn_backward(
+        grad_out,
+        q,
+        k,
+        v,
+        O,
+        lse,
         meta.causal,
-        philox_seed,
-        philox_offset,
-        scale=meta.softmax_scale,
+        rng_state,
+        unused,
+        meta.softmax_scale,
       )
 
     # Gradients for: q, k, v, o, meta.
@@ -323,8 +433,10 @@ def ffpa_attn_func(
   supported via ``causal=True`` with queries aligned to the tail of the
   KV sequence (``Nkv >= Nq`` required).
 
-  Backward pass is supported via :class:`FFPAAttnFunc` and delegates to
-  PyTorch's SDPA backward kernels (flash for D <= 256, efficient for D > 256).
+  Backward pass is supported via :class:`FFPAAttnFunc`. For ``D <= 256`` it
+  uses PyTorch's flash-attention forward/backward pair; for ``D > 256`` it
+  keeps the existing FFPA forward plus SDPA/FFPA backward routing.
+  ``forward_backend`` only affects the large-D path.
 
   :param Q: Query tensor with layout ``[B, Nh_q, Nq, D]``; dtype must be
       ``torch.float16`` or ``torch.bfloat16`` and match ``K`` / ``V`` / ``O``.
@@ -349,8 +461,9 @@ def ffpa_attn_func(
       keys are ``stages``, ``acc``, ``tma``, ``high_precision_grad``,
       ``forward_backend``, ``triton_forward_autotune``, ``backward_backend``,
       ``triton_backward_autotune``, ``triton_backward_version``, and
-      ``triton_backward_preprocess_d_chunk``.  These options do not change the
-      autograd contract; unknown keys raise ``TypeError``.
+      ``triton_backward_preprocess_d_chunk``. ``forward_backend`` only affects
+      ``D > 256``. These options do not change the autograd contract; unknown
+      keys raise ``TypeError``.
 
   :returns: ``O``, filled with the attention output
       ``softmax(softmax_scale * QK^T) V``.

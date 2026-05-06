@@ -13,6 +13,7 @@ import torch
 import torch.nn.functional as F
 
 from ffpa_attn import ffpa_attn_func  # noqa: E402
+import ffpa_attn.ffpa_attn_interface as ffpa_attn_interface  # noqa: E402
 
 SEQLENS = [1024, 4096, 8192]
 HEADDIMS = [64, 128, 320, 512, 640]
@@ -115,6 +116,126 @@ def test_ffpa_attn_func_rejects_unknown_impl_option():
   q, k, v = _alloc_qkv(1, 4, 128, 320, torch.float16)
   with pytest.raises(TypeError, match="unexpected keyword"):
     ffpa_attn_func(q, k, v, unknown_impl_option=True)
+
+
+@pytest.mark.parametrize("forward_backend", ["cuda", "triton"])
+def test_ffpa_attn_func_small_d_routes_to_flash_attention(monkeypatch, forward_backend):
+  q, k, v = _alloc_qkv(1, 4, 64, 128, torch.float16)
+
+  def _unexpected_backend(*args, **kwargs):
+    raise AssertionError("small-D should not dispatch to FFPA forward")
+
+  def _fake_flash(q_in, k_in, v_in, o_in, causal, softmax_scale):
+    del o_in
+    del causal, softmax_scale
+    out = _sdpa_ref(q_in, k_in, v_in)
+    lse = torch.zeros(q_in.size(0), q_in.size(2), q_in.size(1), device=q_in.device, dtype=torch.float32)
+    seed = torch.zeros(1, device=q_in.device, dtype=torch.int64)
+    offset = torch.zeros(1, device=q_in.device, dtype=torch.int64)
+    return out, lse, seed, offset
+
+  monkeypatch.setattr(ffpa_attn_interface, "_ffpa_attn_forward_cuda", _unexpected_backend)
+  monkeypatch.setattr(ffpa_attn_interface, "_ffpa_attn_forward_triton", _unexpected_backend)
+  monkeypatch.setattr(ffpa_attn_interface, "_flash_attn_forward_small_d", _fake_flash)
+
+  out = ffpa_attn_func(q, k, v, stages=2, acc="f32", forward_backend=forward_backend)
+
+  torch.testing.assert_close(out, _sdpa_ref(q, k, v), **_tolerance(torch.float16))
+
+
+@pytest.mark.parametrize("forward_backend", ["cuda", "triton"])
+def test_ffpa_attn_func_large_d_keeps_selected_backend(monkeypatch, forward_backend):
+  q, k, v = _alloc_qkv(1, 4, 64, 320, torch.float16)
+  called = {"cuda": 0, "triton": 0}
+
+  def _fake_cuda(q_in, k_in, v_in, o_in, stages, acc, causal, softmax_scale, tma):
+    del o_in, stages, acc, causal, softmax_scale, tma
+    called["cuda"] += 1
+    out = q_in + k_in + v_in
+    lse = torch.zeros(q_in.size(0), q_in.size(1), q_in.size(2), device=q_in.device)
+    return out, lse
+
+  def _fake_triton(q_in, k_in, v_in, o_in, causal, softmax_scale, autotune):
+    del o_in, causal, softmax_scale, autotune
+    called["triton"] += 1
+    out = q_in + k_in + v_in
+    lse = torch.zeros(q_in.size(0), q_in.size(1), q_in.size(2), device=q_in.device)
+    return out, lse
+
+  def _unexpected_flash(*args, **kwargs):
+    raise AssertionError("large-D should not route to aten flash forward")
+
+  monkeypatch.setattr(ffpa_attn_interface, "_ffpa_attn_forward_cuda", _fake_cuda)
+  monkeypatch.setattr(ffpa_attn_interface, "_ffpa_attn_forward_triton", _fake_triton)
+  monkeypatch.setattr(ffpa_attn_interface, "_flash_attn_forward_small_d", _unexpected_flash)
+
+  out = ffpa_attn_func(q, k, v, stages=2, acc="f32", forward_backend=forward_backend)
+
+  assert called[forward_backend] == 1
+  assert called["cuda" if forward_backend == "triton" else "triton"] == 0
+  torch.testing.assert_close(out, q + k + v)
+
+
+@pytest.mark.parametrize("D", [128, 256])
+def test_ffpa_attn_func_small_d_backward_smoke(D):
+  q, k, v = _alloc_qkv(1, 4, 64, D, torch.float16)
+  q = q.requires_grad_(True)
+  k = k.requires_grad_(True)
+  v = v.requires_grad_(True)
+
+  out = ffpa_attn_func(q, k, v, stages=2, acc="f32", forward_backend="triton")
+  loss = out.float().square().mean()
+  loss.backward()
+
+  assert torch.isfinite(out).all()
+  assert torch.isfinite(q.grad).all()
+  assert torch.isfinite(k.grad).all()
+  assert torch.isfinite(v.grad).all()
+
+
+def test_ffpa_attn_func_small_d_honors_output_buffer():
+  q, k, v = _alloc_qkv(1, 4, 64, 128, torch.float16)
+  out_buffer = torch.empty_like(q)
+
+  out = ffpa_attn_func(q, k, v, O=out_buffer, stages=2, acc="f32", forward_backend="triton")
+  ref = _sdpa_ref(q, k, v)
+
+  assert out.data_ptr() == out_buffer.data_ptr()
+  torch.testing.assert_close(out, ref, **_tolerance(torch.float16))
+
+
+def test_ffpa_attn_func_small_d_backward_consumes_saved_flash_state(monkeypatch):
+  q, k, v = _alloc_qkv(1, 4, 32, 128, torch.float16)
+  q = q.requires_grad_(True)
+  k = k.requires_grad_(True)
+  v = v.requires_grad_(True)
+  saved_seed = torch.tensor([123], device=q.device, dtype=torch.int64)
+  saved_offset = torch.tensor([456], device=q.device, dtype=torch.int64)
+  seen = {"checked": False}
+
+  def _fake_flash_forward(q_in, k_in, v_in, o_in, causal, softmax_scale):
+    del o_in, causal, softmax_scale
+    out = _sdpa_ref(q_in, k_in, v_in)
+    lse = torch.zeros(q_in.size(0), q_in.size(2), q_in.size(1), device=q_in.device, dtype=torch.float32)
+    return out, lse, saved_seed, saved_offset
+
+  def _fake_flash_backward(grad_out, q_in, k_in, v_in, o_in, lse, causal, rng_state, unused, softmax_scale):
+    del grad_out, o_in, lse, causal, softmax_scale
+    assert rng_state.data_ptr() == saved_seed.data_ptr()
+    assert unused.data_ptr() == saved_offset.data_ptr()
+    seen["checked"] = True
+    return torch.zeros_like(q_in), torch.zeros_like(k_in), torch.zeros_like(v_in)
+
+  monkeypatch.setattr(ffpa_attn_interface, "_flash_attn_forward_small_d", _fake_flash_forward)
+  monkeypatch.setattr(ffpa_attn_interface, "_flash_attn_backward_small_d", _fake_flash_backward)
+
+  out = ffpa_attn_func(q, k, v, stages=2, acc="f32", forward_backend="triton")
+  out.sum().backward()
+
+  assert seen["checked"]
+  assert torch.count_nonzero(q.grad) == 0
+  assert torch.count_nonzero(k.grad) == 0
+  assert torch.count_nonzero(v.grad) == 0
 
 
 TRITON_FORWARD_SHAPES = [
