@@ -303,7 +303,7 @@ def ffpa_attn_func(
   forward_backend: str = "cuda",
   triton_forward_autotune: bool = False,
   # Options for Triton backward (only effective when backward_backend="triton")
-  backward_backend: str = "sdpa",  # TODO: default to "triton" for better performance.
+  backward_backend: str = "triton",  # NOTE: default to "triton" for better performance.
   triton_backward_autotune: bool = False,  # TODO: default to True for better performance.
   triton_backward_version: str = "v2",
 ) -> torch.Tensor:
