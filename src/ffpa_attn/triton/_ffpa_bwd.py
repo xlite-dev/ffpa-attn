@@ -44,7 +44,14 @@ import triton.language as tl
 # Preprocess: delta = rowsum(dO * O)
 # ---------------------------------------------------------------------------
 
+# BLOCK_HEADDIM must be >= headdim (no D-chunk loop).  Derive from
+# the runtime headdim so that autotune never tests invalid configs.
+_FFPA_BWD_PRE_HEURISTICS = {
+  "BLOCK_HEADDIM": lambda args: max(64, triton.next_power_of_2(args["headdim"])),
+}
 
+
+@triton.heuristics(_FFPA_BWD_PRE_HEURISTICS)
 @triton.jit
 def _ffpa_bwd_pre_impl(
   Out: torch.Tensor,
@@ -85,21 +92,19 @@ def _ffpa_bwd_pre_impl(
 
 
 def _gen_pre_autotune_configs() -> list[triton.Config]:
-  """Generate autotune configs for the preprocess delta kernel."""
+  """Generate autotune configs for the preprocess delta kernel.
+
+    BLOCK_HEADDIM is excluded from autotune — it must be >= headdim
+    (no D-chunk loop) and is derived from the runtime ``headdim`` via
+    ``_FFPA_BWD_PRE_HEURISTICS``.
+  """
   configs = []
   for block_m in [64, 128, 256]:
-    for block_headdim in [64, 128]:
-      for num_warps in [4, 8]:
-        configs.append(
-          triton.Config(
-            {
-              "BLOCK_M": block_m,
-              "BLOCK_HEADDIM": block_headdim
-            },
-            num_warps=num_warps,
-            num_stages=3,
-          )
-        )
+    for num_warps in [2, 4, 8]:
+      configs.append(triton.Config(
+        {"BLOCK_M": block_m},
+        num_warps=num_warps,
+      ))
   return configs
 
 
@@ -826,6 +831,7 @@ def _ffpa_attn_backward(
       headdim,
       BLOCK_M=128,
       BLOCK_HEADDIM=BLOCK_HEADDIM_DELTA,
+      num_warps=4,
     )
 
   # Grid and kernel dispatch.
@@ -924,9 +930,9 @@ def _ffpa_attn_backward(
         headdim,
         IS_CAUSAL=causal,
         DTYPE=DTYPE,
-        BLOCK_M=128,
+        BLOCK_M=64,
         BLOCK_N=64,
-        BLOCK_HEADDIM=128,
+        BLOCK_HEADDIM=128 if headdim <= 512 else 64,
         num_warps=8,
         num_stages=2,
       )
@@ -1018,9 +1024,9 @@ def _ffpa_attn_backward(
         IS_CAUSAL=causal,
         SEQUENCE_PARALLEL=True,
         DTYPE=DTYPE,
-        BLOCK_M=128,
+        BLOCK_M=64,
         BLOCK_N=64,
-        BLOCK_HEADDIM=128,
+        BLOCK_HEADDIM=128 if headdim <= 512 else 64,
         num_warps=8,
         num_stages=2,
       )
