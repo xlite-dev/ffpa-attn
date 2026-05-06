@@ -8,13 +8,15 @@
 #   5. Optional tmpfs build dir when FFPA_BUILD_IN_SHM=1.
 #   6. Pre-set FFPA_BUILD_ARCH to the current device SM when unset.
 #
-# Compatible with the PEP 621 pyproject.toml packaging: the script bypasses
-# pip's build isolation and invokes setup.py directly for the in-place CUDA
-# extension build. Pass-through args still work for ``bdist_wheel``; for an
-# isolated PEP 517 wheel use ``pip wheel . --no-build-isolation`` instead.
+# Compatible with the PEP 621 pyproject.toml packaging: by default the script
+# bypasses pip's build isolation and invokes setup.py directly for the in-place
+# CUDA extension build. Set ``FFPA_EDITABLE=1`` to register the package as an
+# editable install while reusing the same build environment. For an isolated
+# PEP 517 wheel use ``pip wheel . --no-build-isolation`` instead.
 #
 # Usage:
 #   bash tools/build_fast.sh                   # incremental in-place build
+#   FFPA_EDITABLE=1 bash tools/build_fast.sh   # editable install + extension build
 #   FFPA_CLEAN=1 bash tools/build_fast.sh      # rm -rf build/ + rebuild
 #   FFPA_BUILD_IN_SHM=1 bash tools/build_fast.sh
 #   bash tools/build_fast.sh bdist_wheel       # PEP 517-compatible wheel
@@ -27,7 +29,7 @@ cd "$REPO_DIR"
 # build/, otherwise the shim directory is wiped).
 if [[ "${FFPA_CLEAN:-0}" == "1" ]]; then
   echo "[build_fast] FFPA_CLEAN=1 -> removing build/ and *.so"
-  rm -rf build/ dist/ ffpa_attn.egg-info/
+  rm -rf build/ dist/ src/ffpa_attn.egg-info/ __pycache__
   rm -f pyffpa_cuda*.so src/ffpa_attn/_C*.so
   find csrc/cuffpa/generated -maxdepth 1 -type f \( -name '*.cu' -o -name '*.h' \) -delete 2>/dev/null || true
 fi
@@ -96,7 +98,12 @@ fi
 
 echo "[build_fast] MAX_JOBS=$MAX_JOBS  FFPA_NVCC_THREADS=$FFPA_NVCC_THREADS"
 T0=$(date +%s)
-python setup.py build_ext --inplace "$@"
+if [[ "${FFPA_EDITABLE:-0}" == "1" ]]; then
+  echo "[build_fast] editable mode: python -m pip install -e . --no-build-isolation --no-deps"
+  python -m pip install -e . --no-build-isolation --no-deps "$@"
+else
+  python setup.py build_ext --inplace "$@"
+fi
 T1=$(date +%s)
 echo "[build_fast] total elapsed: $((T1-T0))s"
 
@@ -122,6 +129,9 @@ echo "[build_fast] total elapsed: $((T1-T0))s"
 #   # Daily development (MAX_JOBS auto = min(nproc, 32), --threads=4, warm cache)
 #   bash tools/build_fast.sh
 #
+#   # First-time editable install: later Python-only edits need no rebuild
+#   FFPA_EDITABLE=1 bash tools/build_fast.sh
+#
 #   # Full clean rebuild (after touching launch_templates.cuh / ffpa_attn_templates.cuh)
 #   FFPA_CLEAN=1 bash tools/build_fast.sh
 #
@@ -138,8 +148,14 @@ echo "[build_fast] total elapsed: $((T1-T0))s"
 #   # Dump ptxas register/smem usage (for tuning)
 #   FFPA_PTXAS_VERBOSE=1 bash tools/build_fast.sh
 #
-#   # Pass-through args to setup.py build_ext
+#   # Pass-through args to setup.py build_ext / pip install -e
 #   bash tools/build_fast.sh --verbose
+#
+# Editable mode notes
+#   - Use FFPA_EDITABLE=1 once to install the package as editable.
+#   - After that, Python-only changes under src/ffpa_attn/ are picked up
+#     immediately without rerunning this script.
+#   - C++/CUDA source changes still require rerunning this script.
 #
 # Environment knobs honored by this script / env.py
 #   MAX_JOBS           : outer build parallelism (default = min(nproc, 32))
@@ -147,6 +163,7 @@ echo "[build_fast] total elapsed: $((T1-T0))s"
 #   FFPA_PTXAS_VERBOSE : 1 -> enable `--ptxas-options=-v -Xptxas -v` (default 0)
 #   FFPA_DEV_HEADDIMS  : explicit headdim subset, e.g. "256,512" (default empty)
 #   FFPA_BUILD_ARCH    : SM list or aliases; empty -> current device SM
+#   FFPA_EDITABLE      : 1 -> `python -m pip install -e . --no-build-isolation --no-deps`
 #   FFPA_CLEAN         : 1 -> rm build/, *.so, csrc/cuffpa/generated/*.{cu,h}
 #   FFPA_BUILD_IN_SHM  : 1 -> symlink build/ to /dev/shm/ffpa-build-$USER
 #   CCACHE_MAXSIZE     : ccache size cap (default 20G)

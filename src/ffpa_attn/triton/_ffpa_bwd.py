@@ -114,7 +114,7 @@ _ffpa_bwd_pre_autotune = triton.autotune(
 _ffpa_bwd_pre = _ffpa_bwd_pre_impl
 
 # ---------------------------------------------------------------------------
-# Split-D backward — one K/V column block
+# Split-D backward v1 kernel — one K/V column block
 # ---------------------------------------------------------------------------
 
 
