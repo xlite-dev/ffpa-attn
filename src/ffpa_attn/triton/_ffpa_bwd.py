@@ -305,11 +305,8 @@ def _gen_bwd_autotune_configs() -> list[triton.Config]:
   """
   # BLOCK_M: larger = fewer Q-block iterations (good), more register pressure.
   # BLOCK_N:
-  #   32  — default.  Good trade-off for moderate seqlen (~1024).
-  #   64  — fewer column blocks, halves atomic contention.  Autotune
-  #         selected this for H=32, N=4096 (0.997x vs SDPA).
-  #   128 — 4× fewer blocks, minimal atomic contention.  Best for long
-  #         seqlen (N >= 8192) where atomic serialisation dominates.
+  #   64  — fewer column blocks, halves atomic contention for v1.
+  #   128 — 4× fewer blocks, minimal atomic contention for v1.
   # BLOCK_HEADDIM (gated by available shared memory):
   #   64, 128 — classic D-chunk split, low register pressure, widely compatible.
   #   256     — 2 chunks for D=512, halves HBM reloads.  Requires BLOCK_M ≤ 64
@@ -328,8 +325,8 @@ def _gen_bwd_autotune_configs() -> list[triton.Config]:
     _headdim_candidates.append(512)
 
   configs = []
-  for block_m in [32, 64, 128]:
-    for block_n in [32, 64, 128]:
+  for block_m in [64, 128]:
+    for block_n in [64, 128]:
       for block_headdim in _headdim_candidates:
         for num_warps in [4, 8]:
           for num_stages in [2, 3]:
@@ -927,7 +924,7 @@ def _ffpa_attn_backward(
         IS_CAUSAL=causal,
         DTYPE=DTYPE,
         BLOCK_M=128,
-        BLOCK_N=32,
+        BLOCK_N=64,
         BLOCK_HEADDIM=128,
         num_warps=8,
         num_stages=2,
@@ -1021,7 +1018,7 @@ def _ffpa_attn_backward(
         SEQUENCE_PARALLEL=True,
         DTYPE=DTYPE,
         BLOCK_M=128,
-        BLOCK_N=32,
+        BLOCK_N=64,
         BLOCK_HEADDIM=128,
         num_warps=8,
         num_stages=2,
