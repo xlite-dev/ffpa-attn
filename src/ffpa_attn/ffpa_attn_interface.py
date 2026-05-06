@@ -220,7 +220,7 @@ class FFPAAttnFunc(torch.autograd.Function):
         meta.triton_forward_autotune,
       )
     else:
-      raise ValueError(f"Unsupported forward_backend={meta.forward_backend!r}; choose 'cuda' or 'triton'.")
+      raise ValueError(f"Unsupported forward_backend={meta.forward_backend!r};")
 
     if head_dim > 256:
       rng_state = torch.empty(0, dtype=torch.uint8, device=q.device)
