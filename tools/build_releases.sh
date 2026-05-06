@@ -1,10 +1,13 @@
+#!/usr/bin/env bash
+
 # Build release packages for ffpa-attn.
 # Conda ENV list: py310, py311, py312, py313, py314
 
+set -euo pipefail
+
 for env in py310 py311 py312 py313 py314; do
   echo "Building release for $env..."
-  FFPA_BUILD_ARCH=80,89,90,100,120 \
-    conda run -n "$env" bash tools/build_fast.sh bdist_wheel
+  FFPA_BUILD_ARCH=80,89,90,100,120 conda run -n "$env" bash tools/build_fast.sh bdist_wheel
   echo "Built release for $env"
 done
 
