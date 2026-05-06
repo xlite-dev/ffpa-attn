@@ -37,6 +37,19 @@ _TMA_HEADDIM_ALIGN = 64
 _ACC_F16 = 0
 _ACC_F32 = 1
 
+_FFPA_ATTN_IMPL_DEFAULTS: dict[str, object] = {
+  "stages": 2,
+  "acc": "f32",
+  "tma": False,
+  "high_precision_grad": False,
+  "forward_backend": "cuda",
+  "triton_forward_autotune": False,
+  "backward_backend": "triton",
+  "triton_backward_autotune": False,
+  "triton_backward_version": "v2",
+  "triton_backward_preprocess_d_chunk": False,
+}
+
 
 @dataclass(frozen=True)
 class FFPAAttnMeta:
@@ -54,6 +67,8 @@ class FFPAAttnMeta:
   :param backward_backend: Backward backend name. ``"sdpa"``, ``"cuda"``, or ``"triton"``.
   :param triton_backward_autotune: Whether to enable Triton backward autotune.
   :param triton_backward_version: Triton backward kernel version.
+  :param triton_backward_preprocess_d_chunk: Whether Triton backward should
+    compute delta with the split-D preprocess kernel.
   """
 
   causal: bool
@@ -68,6 +83,7 @@ class FFPAAttnMeta:
   backward_backend: str
   triton_backward_autotune: bool
   triton_backward_version: str
+  triton_backward_preprocess_d_chunk: bool
 
 
 # ---------------------------------------------------------------------------
@@ -202,6 +218,7 @@ class FFPAAttnFunc(torch.autograd.Function):
           softmax_scale=meta.softmax_scale,
           autotune=meta.triton_backward_autotune,
           kernel_version=meta.triton_backward_version,
+          preprocess_d_chunk=meta.triton_backward_preprocess_d_chunk,
         )
 
         if group_size > 1:
@@ -291,21 +308,7 @@ def ffpa_attn_func(
   O: torch.Tensor | None = None,
   causal: bool = False,
   softmax_scale: float | None = None,
-  # Below are specific to the forward and backward implementations and
-  # should have no effect on the autograd contract, but are exposed here
-  # for convenient experimentation without needing to rewrap the op or
-  # subclass the autograd Function.
-  stages: int = 2,
-  acc: str = "f32",
-  tma: bool = False,
-  high_precision_grad: bool = False,
-  # Options for Triton forward (only effective when forward_backend="triton")
-  forward_backend: str = "cuda",
-  triton_forward_autotune: bool = False,
-  # Options for Triton backward (only effective when backward_backend="triton")
-  backward_backend: str = "triton",  # NOTE: default to "triton" for better performance.
-  triton_backward_autotune: bool = False,  # TODO: default to True for better performance.
-  triton_backward_version: str = "v2",
+  **kwargs: object,
 ) -> torch.Tensor:
   """Unified FFPA prefill attention entry.
 
@@ -342,70 +345,12 @@ def ffpa_attn_func(
       ``QK^T``. Defaults to ``1 / sqrt(D)`` (standard attention scale)
       when ``None``. Named ``softmax_scale`` to match the
       ``flash-attn`` convention.
-  :param stages: Pipeline stages forwarded to the underlying CUDA kernel.
-  :param acc: MMA accumulator dtype. ``'f32'`` selects the fp32-acc kernel
-      (required for bf16 activations); ``'f16'`` selects the fp16-acc
-      kernel and is only valid for fp16 activations.
-  :param tma: When ``True``, opt in to the experimental SM90+ TMA path
-      for the large-d kernel. Defaults to ``False`` because the TMA path
-      is not currently faster than the cp.async fallback on any
-      architecture (it is kept as an opt-in for experimentation and as a
-      foundation for future warp-specialised producer/consumer work).
-      Honored only when:
-
-        * the head dim satisfies ``D >= 128 and D % 64 == 0`` (otherwise
-          the K TMA box cannot be widened to 64 fp16 cols and the SM90
-          TMA kernel template is not instantiated); requesting ``tma=True``
-          on an unsupported head dim emits a warning and silently falls
-          back to the cp.async kernel,
-        * the runtime device has compute capability >= 9.0,
-        * the environment variable ``ENABLE_FFPA_EXPERIMENTAL_TMA=1`` is
-          set,
-        * the C++ compile-time eligibility check
-          (``ExperimentalTmaLargeDConfig::kCanAttempt``: zero K/V
-          padding, multi-stage support) passes.
-
-      When any of these is not met, the launcher transparently uses the
-      architecture-agnostic ``cp.async``-based kernel.
-  :param high_precision_grad: When ``True``, upcast all inputs to fp32 before
-      calling the efficient attention backward for headdim > 256.  The
-      efficient backward kernel computes only ``delta = (grad_out * out)``
-      in fp32 (see ``attention_backward.cu:761``) and runs the main GEMMs in
-      the original dtype; FFPA's fp16 ``O`` may differ from SDPA's ``O`` in
-      low bits, potentially causing NaN in dQ/dK.  When ``False`` (default),
-      the backward runs in the native dtype with automatic NaN detection:
-      if NaN is found, fp32 is retried transparently.  Has no effect on the
-      flash attention backward path (headdim <= 256).
-  :param forward_backend: Which forward implementation to use.
-      ``"cuda"`` (default) uses the native CUDA FFPA forward. ``"triton"``
-      uses the single Split-D Triton forward kernel, currently developed and
-      validated first for head dimensions 320 and 512.  The Triton path follows
-      FlashAttention v2's Q-block parallel schedule and writes natural-log LSE
-      values for compatibility with the Triton backward kernel.
-  :param triton_forward_autotune: Only meaningful when ``forward_backend="triton"``.
-      When ``True``, enable Triton's autotuner for the forward tile sizes,
-      D-chunk sizes, warp count, and pipeline depth.
-  :param backward_backend: Which backward implementation to use.
-      ``"sdpa"`` (default) delegates to PyTorch's SDPA backward kernels (stable)
-      ``"triton"`` uses the Split-D Triton backward kernel, fastest when autotune is enabled,
-      ``"cuda"`` uses the native D-slice Split-D backward CUDA kernel.
-      Has no effect in inference mode (``torch.no_grad()`` or no input
-      requires gradient).
-  :param triton_backward_autotune: Only meaningful when ``backward_backend="triton"``.
-      When ``True``, enable Triton's autotuner to search for the optimal
-      tile size, warp count, and pipeline depth at the first call per
-      shape (cached afterwards).  Most effective on **short sequences**
-      (e.g. N <= 2048) where the autotune overhead (~4-6 s) is negligible
-      compared to accumulated kernel time, and where the config search
-      can yield 10-50 % speedup over the fixed default.  On long sequences
-      (N >> 2048) the fixed default config is usually near-optimal, so
-      leaving ``False`` avoids unnecessary benchmark latency.
-      When ``False`` (default), uses a fixed best-known config discovered
-      on Ampere for stable, predictable launch latency.
-  :param triton_backward_version: Version of the Triton backward kernel.
-      ``"v1"`` uses split-kv persistent kernel (with ``tl.atomic_add`` for dQ).
-      ``"v2"`` (default) uses shared-pid split-D kernel (dQ non-atomic, usually
-      faster).  Only meaningful when ``backward_backend="triton"``.
+    :param kwargs: Implementation-specific options for experimentation.  Supported
+      keys are ``stages``, ``acc``, ``tma``, ``high_precision_grad``,
+      ``forward_backend``, ``triton_forward_autotune``, ``backward_backend``,
+      ``triton_backward_autotune``, ``triton_backward_version``, and
+      ``triton_backward_preprocess_d_chunk``.  These options do not change the
+      autograd contract; unknown keys raise ``TypeError``.
 
   :returns: ``O``, filled with the attention output
       ``softmax(softmax_scale * QK^T) V``.
@@ -416,6 +361,23 @@ def ffpa_attn_func(
       PTX instruction exists on supported architectures), or if
       ``causal=True`` is combined with ``Nkv < Nq``.
   """
+  unknown_kwargs = sorted(set(kwargs) - set(_FFPA_ATTN_IMPL_DEFAULTS))
+  if unknown_kwargs:
+    unknown = ", ".join(unknown_kwargs)
+    raise TypeError(f"ffpa_attn_func got unexpected keyword argument(s): {unknown}")
+
+  impl_options = {**_FFPA_ATTN_IMPL_DEFAULTS, **kwargs}
+  stages = int(impl_options["stages"])
+  acc = impl_options["acc"]
+  tma = bool(impl_options["tma"])
+  high_precision_grad = bool(impl_options["high_precision_grad"])
+  forward_backend = str(impl_options["forward_backend"])
+  triton_forward_autotune = bool(impl_options["triton_forward_autotune"])
+  backward_backend = str(impl_options["backward_backend"])
+  triton_backward_autotune = bool(impl_options["triton_backward_autotune"])
+  triton_backward_version = str(impl_options["triton_backward_version"])
+  triton_backward_preprocess_d_chunk = bool(impl_options["triton_backward_preprocess_d_chunk"])
+
   assert forward_backend in ("cuda", "triton"), \
     f"Unsupported forward_backend={forward_backend!r}; choose 'cuda' or 'triton'."
   assert backward_backend in ("sdpa", "triton", "cuda"), \
@@ -491,6 +453,7 @@ def ffpa_attn_func(
     backward_backend=str(backward_backend),
     triton_backward_autotune=bool(triton_backward_autotune),
     triton_backward_version=str(triton_backward_version),
+    triton_backward_preprocess_d_chunk=bool(triton_backward_preprocess_d_chunk),
   )
 
   return FFPAAttnFunc.apply(
