@@ -113,6 +113,20 @@ def print_max_abs_err(name, fn, ref, q, k, v, dO):
     f"{name:>14}: max_abs_err={max_abs_err:.6e} "
     f"(out={out_err:.6e}, dq={dq_err:.6e}, dk={dk_err:.6e}, dv={dv_err:.6e})"
   )
+  # Per-tensor allclose check with tolerances matching those used in
+  # bench_ffpa_fwd.py (1e-2 for fp16, 2e-2 for bf16).
+  rtol = 1e-2 if q.dtype == torch.float16 else 2e-2
+  atol = rtol
+  checks = [
+    ("out", out_ref, out),
+    ("dq", dq_ref, dq),
+    ("dk", dk_ref, dk),
+    ("dv", dv_ref, dv),
+  ]
+  failed = [tag for tag, a, b in checks if not torch.allclose(a.float(), b.float(), rtol=rtol, atol=atol)]
+  if failed:
+    print(f"  WARNING: {name} FAILED allclose check for: {', '.join(failed)} "
+          f"(rtol={rtol}, atol={atol})")
 
 
 def time_backward(name, fn, q, k, v, dO, warmup, iters):
