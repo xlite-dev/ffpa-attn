@@ -219,7 +219,15 @@ def main() -> None:
       Nkv=8192
     )
     _run_case(
-      "gqa", dtype, args.backward_backend, args.triton_backward_autotune, B=1, Nh_q=32, Nh_kv=8, Nq=8192, Nkv=8192
+      "gqa",
+      dtype,
+      args.backward_backend,
+      args.triton_backward_autotune,
+      B=1,
+      Nh_q=32,
+      Nh_kv=8,
+      Nq=8192,
+      Nkv=8192,
     )
     _run_case(
       "causal",
