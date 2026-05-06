@@ -47,22 +47,22 @@ import triton.language as tl
 
 @triton.jit
 def _ffpa_bwd_pre_impl(
-  Out,
-  DO,
-  Delta,
-  stride_ob,
-  stride_oh,
-  stride_om,
-  stride_dob,
-  stride_doh,
-  stride_dom,
-  nheads,
-  seqlen_q,
-  seqlen_q_rounded,
-  headdim,
+  Out: torch.Tensor,
+  DO: torch.Tensor,
+  Delta: torch.Tensor,
+  stride_ob: int,
+  stride_oh: int,
+  stride_om: int,
+  stride_dob: int,
+  stride_doh: int,
+  stride_dom: int,
+  nheads: int,
+  seqlen_q: int,
+  seqlen_q_rounded: int,
+  headdim: int,
   BLOCK_M: tl.constexpr,
   BLOCK_HEADDIM: tl.constexpr,
-):
+) -> None:
   """Preprocess kernel to compute delta = rowsum(dO * O) for the backward pass."""
   start_m = tl.program_id(0)
   off_hb = tl.program_id(1)
@@ -84,7 +84,7 @@ def _ffpa_bwd_pre_impl(
   tl.store(Delta + off_hb * seqlen_q_rounded + offs_m, delta)
 
 
-def _gen_pre_autotune_configs():
+def _gen_pre_autotune_configs() -> list[triton.Config]:
   """Generate autotune configs for the preprocess delta kernel."""
   configs = []
   for block_m in [64, 128, 256]:
@@ -120,27 +120,27 @@ _ffpa_bwd_pre = _ffpa_bwd_pre_impl
 
 @triton.jit
 def ffpa_bwd_v1_kernel(
-  start_n,
-  Q,
-  K,
-  V,
-  DO,
-  DQ,
-  DK,
-  DV,
-  LSE,
-  D,
-  softmax_scale,
-  stride_qm,
-  stride_kn,
-  stride_vn,
-  stride_dom,
-  stride_dqm,
-  stride_dkn,
-  stride_dvn,
-  seqlen_q,
-  seqlen_k,
-  headdim,
+  start_n: int,
+  Q: torch.Tensor,
+  K: torch.Tensor,
+  V: torch.Tensor,
+  DO: torch.Tensor,
+  DQ: torch.Tensor,
+  DK: torch.Tensor,
+  DV: torch.Tensor,
+  LSE: torch.Tensor,
+  D: torch.Tensor,
+  softmax_scale: float,
+  stride_qm: int,
+  stride_kn: int,
+  stride_vn: int,
+  stride_dom: int,
+  stride_dqm: int,
+  stride_dkn: int,
+  stride_dvn: int,
+  seqlen_q: int,
+  seqlen_k: int,
+  headdim: int,
   ATOMIC_ADD: tl.constexpr,
   IS_CAUSAL: tl.constexpr,
   BLOCK_HEADDIM: tl.constexpr,
@@ -149,7 +149,7 @@ def ffpa_bwd_v1_kernel(
   EVEN_N: tl.constexpr,
   BLOCK_M: tl.constexpr,
   BLOCK_N: tl.constexpr,
-):
+) -> None:
   begin_m = 0 if not IS_CAUSAL else ((start_n * BLOCK_N) // BLOCK_M) * BLOCK_M
   offs_n = start_n * BLOCK_N + tl.arange(0, BLOCK_N)
   offs_m = tl.arange(0, BLOCK_M)
@@ -295,7 +295,7 @@ def ffpa_bwd_v1_kernel(
 # ---------------------------------------------------------------------------
 
 
-def _gen_bwd_autotune_configs():
+def _gen_bwd_autotune_configs() -> list[triton.Config]:
   """Generate autotune configs over BLOCK_M, BLOCK_N, BLOCK_HEADDIM, num_warps, num_stages.
 
     NOTE: ATOMIC_ADD is intentionally excluded.  With SEQUENCE_PARALLEL=True
@@ -358,42 +358,42 @@ _FFPA_BWD_HEURISTICS = {
 @triton.heuristics(_FFPA_BWD_HEURISTICS)
 @triton.jit
 def _ffpa_bwd_v1_kernel_impl(
-  Q,
-  K,
-  V,
-  DO,
-  DQ,
-  DK,
-  DV,
-  LSE,
-  D,
-  softmax_scale,
-  stride_qb,
-  stride_qh,
-  stride_qm,
-  stride_kb,
-  stride_kh,
-  stride_kn,
-  stride_vb,
-  stride_vh,
-  stride_vn,
-  stride_dob,
-  stride_doh,
-  stride_dom,
-  stride_dqb,
-  stride_dqh,
-  stride_dqm,
-  stride_dkb,
-  stride_dkh,
-  stride_dkn,
-  stride_dvb,
-  stride_dvh,
-  stride_dvn,
-  nheads,
-  seqlen_q,
-  seqlen_k,
-  seqlen_q_rounded,
-  headdim,
+  Q: torch.Tensor,
+  K: torch.Tensor,
+  V: torch.Tensor,
+  DO: torch.Tensor,
+  DQ: torch.Tensor,
+  DK: torch.Tensor,
+  DV: torch.Tensor,
+  LSE: torch.Tensor,
+  D: torch.Tensor,
+  softmax_scale: float,
+  stride_qb: int,
+  stride_qh: int,
+  stride_qm: int,
+  stride_kb: int,
+  stride_kh: int,
+  stride_kn: int,
+  stride_vb: int,
+  stride_vh: int,
+  stride_vn: int,
+  stride_dob: int,
+  stride_doh: int,
+  stride_dom: int,
+  stride_dqb: int,
+  stride_dqh: int,
+  stride_dqm: int,
+  stride_dkb: int,
+  stride_dkh: int,
+  stride_dkn: int,
+  stride_dvb: int,
+  stride_dvh: int,
+  stride_dvn: int,
+  nheads: int,
+  seqlen_q: int,
+  seqlen_k: int,
+  seqlen_q_rounded: int,
+  headdim: int,
   IS_CAUSAL: tl.constexpr,
   SEQUENCE_PARALLEL: tl.constexpr,
   BLOCK_HEADDIM: tl.constexpr,
@@ -402,7 +402,7 @@ def _ffpa_bwd_v1_kernel_impl(
   EVEN_N: tl.constexpr,
   BLOCK_M: tl.constexpr,
   BLOCK_N: tl.constexpr,
-):
+) -> None:
   off_hb = tl.program_id(1)
   off_b = off_hb // nheads
   off_h = off_hb % nheads
@@ -523,42 +523,42 @@ _ffpa_bwd_v1 = _ffpa_bwd_v1_kernel_impl
 @triton.heuristics(_FFPA_BWD_HEURISTICS)
 @triton.jit
 def _ffpa_bwd_v2_kernel_impl(
-  Q,
-  K,
-  V,
-  DO,
-  DQ,
-  DK,
-  DV,
-  LSE,
-  D,
-  softmax_scale,
-  stride_qb,
-  stride_qh,
-  stride_qm,
-  stride_kb,
-  stride_kh,
-  stride_kn,
-  stride_vb,
-  stride_vh,
-  stride_vn,
-  stride_dob,
-  stride_doh,
-  stride_dom,
-  stride_dqb,
-  stride_dqh,
-  stride_dqm,
-  stride_dkb,
-  stride_dkh,
-  stride_dkn,
-  stride_dvb,
-  stride_dvh,
-  stride_dvn,
-  nheads,
-  seqlen_q,
-  seqlen_k,
-  seqlen_q_rounded,
-  headdim,
+  Q: torch.Tensor,
+  K: torch.Tensor,
+  V: torch.Tensor,
+  DO: torch.Tensor,
+  DQ: torch.Tensor,
+  DK: torch.Tensor,
+  DV: torch.Tensor,
+  LSE: torch.Tensor,
+  D: torch.Tensor,
+  softmax_scale: float,
+  stride_qb: int,
+  stride_qh: int,
+  stride_qm: int,
+  stride_kb: int,
+  stride_kh: int,
+  stride_kn: int,
+  stride_vb: int,
+  stride_vh: int,
+  stride_vn: int,
+  stride_dob: int,
+  stride_doh: int,
+  stride_dom: int,
+  stride_dqb: int,
+  stride_dqh: int,
+  stride_dqm: int,
+  stride_dkb: int,
+  stride_dkh: int,
+  stride_dkn: int,
+  stride_dvb: int,
+  stride_dvh: int,
+  stride_dvn: int,
+  nheads: int,
+  seqlen_q: int,
+  seqlen_k: int,
+  seqlen_q_rounded: int,
+  headdim: int,
   IS_CAUSAL: tl.constexpr,
   BLOCK_HEADDIM: tl.constexpr,
   DTYPE: tl.constexpr,
@@ -566,7 +566,7 @@ def _ffpa_bwd_v2_kernel_impl(
   EVEN_N: tl.constexpr,
   BLOCK_M: tl.constexpr,
   BLOCK_N: tl.constexpr,
-):
+) -> None:
   pid = tl.program_id(0)
   off_hb = tl.program_id(2)
   off_b = off_hb // nheads
@@ -757,10 +757,10 @@ def _ffpa_attn_backward(
   dk: torch.Tensor,
   dv: torch.Tensor,
   causal: bool = False,
-  softmax_scale: float = None,
+  softmax_scale: float | None = None,
   autotune: bool = False,
   kernel_version: str = "v2",
-):
+) -> None:
   """
     FFPA backward entry point.
 
@@ -792,7 +792,7 @@ def _ffpa_attn_backward(
   delta = torch.empty_like(lse)
   if autotune:
 
-    def pre_grid(meta):
+    def pre_grid(meta: dict) -> tuple[int, int]:
       return (triton.cdiv(seqlen_q, meta["BLOCK_M"]), batch * nheads)
 
     _ffpa_bwd_pre_autotune[pre_grid](
@@ -837,7 +837,7 @@ def _ffpa_attn_backward(
   if kernel_version == "v2":
     # v2: shared-pid split-D, grid = (max(K-blocks, Q-blocks), 1, B*Nh).
     # pid serves as both K-col block index and Q-row block index.
-    def grid(meta):
+    def grid(meta: dict) -> tuple[int, ...]:
       return (
         max(triton.cdiv(seqlen_k, meta["BLOCK_N"]), triton.cdiv(seqlen_q, meta["BLOCK_M"])),
         1,
@@ -933,7 +933,7 @@ def _ffpa_attn_backward(
       )
   else:
     # v1: split-kv (current), grid = (K-column blocks, B*Nh).
-    def grid(meta):
+    def grid(meta: dict) -> tuple[int, ...]:
       return (triton.cdiv(seqlen_k, meta["BLOCK_N"]), batch * nheads)
 
     if autotune:
