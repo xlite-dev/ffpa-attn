@@ -51,7 +51,7 @@ class FFPAAttnMeta:
   :param high_precision_grad: Whether SDPA backward should upcast.
   :param forward_backend: Forward backend name, ``"cuda"`` or ``"triton"``.
   :param triton_forward_autotune: Whether to enable Triton forward autotune.
-  :param backward_backend: Backward backend name.
+  :param backward_backend: Backward backend name. ``"sdpa"``, ``"cuda"``, or ``"triton"``.
   :param triton_backward_autotune: Whether to enable Triton backward autotune.
   :param triton_backward_version: Triton backward kernel version.
   """
