@@ -105,6 +105,70 @@ def test_ffpa_attn_func_rejects_invalid_acc():
     ffpa_attn_func(q, k, v, stages=2, acc="bad")
 
 
+def test_ffpa_attn_func_rejects_invalid_forward_backend():
+  q, k, v = _alloc_qkv(1, 4, 128, 320, torch.float16)
+  with pytest.raises(AssertionError, match="forward_backend"):
+    ffpa_attn_func(q, k, v, stages=2, acc="f32", forward_backend="bad")
+
+
+TRITON_FORWARD_SHAPES = [
+  (1, 4, 128, 128, 320, False),
+  (1, 4, 129, 257, 320, False),
+  (1, 4, 128, 128, 512, True),
+  (1, 8, 64, 512, 512, True),
+]
+
+
+@pytest.mark.parametrize("dtype", DTYPES, ids=["fp16", "bf16"])
+@pytest.mark.parametrize("B,H,Nq,Nkv,D,causal", TRITON_FORWARD_SHAPES)
+def test_ffpa_attn_func_triton_forward_matches_sdpa(dtype, B, H, Nq, Nkv, D, causal):
+  q, k, v = _alloc_cross_qkv(B, H, Nq, Nkv, D, dtype)
+  out = ffpa_attn_func(q, k, v, stages=2, acc=_acc_for(dtype), causal=causal, forward_backend="triton")
+  if causal:
+    kv_offset = Nkv - Nq
+    row_idx = torch.arange(Nq, device="cuda").view(-1, 1)
+    col_idx = torch.arange(Nkv, device="cuda").view(1, -1)
+    attn_mask = (col_idx <= (row_idx + kv_offset))
+    ref = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, scale=1.0 / math.sqrt(D))
+  else:
+    ref = _sdpa_ref(q, k, v)
+  assert out.shape == ref.shape
+  assert out.dtype == dtype
+  assert torch.isfinite(out).all()
+  torch.testing.assert_close(out, ref, **_tolerance(dtype))
+
+
+@pytest.mark.parametrize("dtype", DTYPES, ids=["fp16", "bf16"])
+@pytest.mark.parametrize("D", [320, 512])
+def test_ffpa_attn_func_triton_forward_gqa_matches_sdpa(dtype, D):
+  B, Nh_q, Nh_kv, Nq, Nkv = 1, 8, 2, 128, 256
+  torch.manual_seed(0)
+  q = torch.randn(B, Nh_q, Nq, D, dtype=dtype, device="cuda")
+  k = torch.randn(B, Nh_kv, Nkv, D, dtype=dtype, device="cuda")
+  v = torch.randn(B, Nh_kv, Nkv, D, dtype=dtype, device="cuda")
+  out = ffpa_attn_func(q, k, v, stages=2, acc=_acc_for(dtype), forward_backend="triton")
+  group_size = Nh_q // Nh_kv
+  ref = _sdpa_ref(q, k.repeat_interleave(group_size, dim=1), v.repeat_interleave(group_size, dim=1))
+  assert out.shape == ref.shape
+  assert torch.isfinite(out).all()
+  torch.testing.assert_close(out, ref, **_tolerance(dtype))
+
+
+@pytest.mark.parametrize("backward_backend", ["sdpa", "triton"])
+def test_ffpa_attn_func_triton_forward_backward_smoke(backward_backend):
+  q, k, v = _alloc_qkv(1, 2, 64, 320, torch.float16)
+  q = q.requires_grad_(True)
+  k = k.requires_grad_(True)
+  v = v.requires_grad_(True)
+  out = ffpa_attn_func(q, k, v, stages=2, acc="f32", forward_backend="triton", backward_backend=backward_backend)
+  loss = out.float().square().mean()
+  loss.backward()
+  assert torch.isfinite(out).all()
+  assert torch.isfinite(q.grad).all()
+  assert torch.isfinite(k.grad).all()
+  assert torch.isfinite(v.grad).all()
+
+
 # Boundary shapes: seqlen not a multiple of Bc=64 (and/or Br=64). Covers
 # partial first tile (N<64), single-tile tail, multi-tile + tail, and
 # sizes near common power-of-two boundaries. Uses D=128 (small_d kernel)

@@ -12,6 +12,7 @@ PyTorch SDPA for backward correctness and end-to-end forward+backward runtime:
 Usage::
 
     CUDA_VISIBLE_DEVICES=0 python examples/ffpa_attn_bwd.py
+    CUDA_VISIBLE_DEVICES=0 python examples/ffpa_attn_bwd.py --backward-backend triton --autotune
 """
 
 from __future__ import annotations
@@ -25,7 +26,7 @@ import torch.nn.functional as F
 
 from ffpa_attn import ffpa_attn_func
 
-WARMUP, ITERS = 2, 5
+WARMUP, ITERS = 2, 10
 D = 512
 
 
@@ -41,6 +42,7 @@ def _parse_args() -> argparse.Namespace:
   parser.add_argument(
     "--triton-backward-autotune",
     "--autotune",
+    "--tune",
     action="store_true",
     help="Enable Triton autotuning (only effective when --backward-backend=triton).",
   )

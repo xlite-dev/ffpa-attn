@@ -13,11 +13,13 @@ against ``torch.nn.functional.scaled_dot_product_attention``:
 
 Usage::
 
-    CUDA_VISIBLE_DEVICES=0 python examples/ffpa_attn_fwd.py
+    CUDA_VISIBLE_DEVICES=0 python examples/ffpa_attn_fwd.py --forward-backend cuda
+    CUDA_VISIBLE_DEVICES=0 python examples/ffpa_attn_fwd.py --forward-backend triton --autotune
 """
 
 from __future__ import annotations
 
+import argparse
 import math
 import time
 
@@ -28,7 +30,26 @@ from ffpa_attn import ffpa_attn_func
 
 D = 512
 STAGES = 2
-WARMUP, ITERS = 2, 5
+WARMUP, ITERS = 2, 10
+
+
+def _parse_args() -> argparse.Namespace:
+  parser = argparse.ArgumentParser(description="FFPA forward example and SDPA comparison.")
+  parser.add_argument(
+    "--forward-backend",
+    choices=["cuda", "triton"],
+    default="cuda",
+    help="Forward backend passed to ffpa_attn_func.",
+  )
+  parser.add_argument("--seed", type=int, default=0, help="Random seed for input tensors.")
+  parser.add_argument(
+    "--triton-forward-autotune",
+    "--autotune",
+    "--tune",
+    action="store_true",
+    help="Enable Triton forward autotuning (only effective when --forward-backend=triton).",
+  )
+  return parser.parse_args()
 
 
 def _sdpa_ref(q, k, v, is_causal: bool = False):
@@ -58,6 +79,9 @@ def _expand_kv(k: torch.Tensor, v: torch.Tensor, nh_q: int):
 def _run_case(
   name: str,
   dtype: torch.dtype,
+  forward_backend: str,
+  triton_forward_autotune: bool,
+  seed: int,
   B: int,
   Nh_q: int,
   Nh_kv: int,
@@ -66,12 +90,21 @@ def _run_case(
   causal: bool = False,
   acc: str = "f32",
 ) -> None:
-  torch.manual_seed(0)
+  torch.manual_seed(seed)
   q = torch.randn(B, Nh_q, Nq, D, dtype=dtype, device="cuda")
   k = torch.randn(B, Nh_kv, Nkv, D, dtype=dtype, device="cuda")
   v = torch.randn(B, Nh_kv, Nkv, D, dtype=dtype, device="cuda")
 
-  out_ffpa = ffpa_attn_func(q, k, v, stages=STAGES, acc=acc, causal=causal)
+  out_ffpa = ffpa_attn_func(
+    q,
+    k,
+    v,
+    stages=STAGES,
+    acc=acc,
+    causal=causal,
+    forward_backend=forward_backend,
+    triton_forward_autotune=triton_forward_autotune,
+  )
   k_ref, v_ref = _expand_kv(k, v, Nh_q)
   out_sdpa = _sdpa_ref(q, k_ref, v_ref, is_causal=causal)
 
@@ -80,7 +113,16 @@ def _run_case(
   ok = torch.allclose(out_ffpa, out_sdpa, atol=tol, rtol=tol)
 
   ms_ffpa = _time_fn(
-    lambda q, k, v: ffpa_attn_func(q, k, v, stages=STAGES, acc=acc, causal=causal),
+    lambda q, k, v: ffpa_attn_func(
+      q,
+      k,
+      v,
+      stages=STAGES,
+      acc=acc,
+      causal=causal,
+      forward_backend=forward_backend,
+      triton_forward_autotune=triton_forward_autotune,
+    ),
     q,
     k,
     v,
@@ -93,20 +135,80 @@ def _run_case(
     f"B={B} Hq={Nh_q} Hkv={Nh_kv} Nq={Nq} Nkv={Nkv} D={D} causal={int(causal)}  "
     f"max|diff|={diff.max().item():.4f}  mean|diff|={diff.mean().item():.5f}  "
     f"allclose(atol={tol})={ok}  "
+    f"backend={forward_backend}  "
     f"FFPA={ms_ffpa:.2f} ms  SDPA={ms_sdpa:.2f} ms  speedup={ms_sdpa / ms_ffpa:.2f}x"
   )
 
 
 def main() -> None:
+  args = _parse_args()
+  print(args)
+
   if not torch.cuda.is_available():
     raise SystemExit("CUDA is required to run this example.")
 
   for dtype in (torch.float16, torch.bfloat16):
-    _run_case("self-attn", dtype, B=1, Nh_q=32, Nh_kv=32, Nq=8192, Nkv=8192)
-    _run_case("cross-attn", dtype, B=1, Nh_q=32, Nh_kv=32, Nq=1024, Nkv=8192)
-    _run_case("gqa", dtype, B=1, Nh_q=32, Nh_kv=8, Nq=8192, Nkv=8192)
-    _run_case("causal", dtype, B=1, Nh_q=32, Nh_kv=32, Nq=8192, Nkv=8192, causal=True)
-    _run_case("non-aligned", dtype, B=1, Nh_q=8, Nh_kv=8, Nq=8191, Nkv=8191)
+    _run_case(
+      "self-attn",
+      dtype,
+      args.forward_backend,
+      args.triton_forward_autotune,
+      seed=args.seed,
+      B=1,
+      Nh_q=32,
+      Nh_kv=32,
+      Nq=8192,
+      Nkv=8192,
+    )
+    _run_case(
+      "cross-attn",
+      dtype,
+      args.forward_backend,
+      args.triton_forward_autotune,
+      seed=args.seed,
+      B=1,
+      Nh_q=32,
+      Nh_kv=32,
+      Nq=1024,
+      Nkv=8192,
+    )
+    _run_case(
+      "gqa",
+      dtype,
+      args.forward_backend,
+      args.triton_forward_autotune,
+      seed=args.seed,
+      B=1,
+      Nh_q=32,
+      Nh_kv=8,
+      Nq=8192,
+      Nkv=8192,
+    )
+    _run_case(
+      "causal",
+      dtype,
+      args.forward_backend,
+      args.triton_forward_autotune,
+      seed=args.seed,
+      B=1,
+      Nh_q=32,
+      Nh_kv=32,
+      Nq=8192,
+      Nkv=8192,
+      causal=True,
+    )
+    _run_case(
+      "non-aligned",
+      dtype,
+      args.forward_backend,
+      args.triton_forward_autotune,
+      seed=args.seed,
+      B=1,
+      Nh_q=8,
+      Nh_kv=8,
+      Nq=8191,
+      Nkv=8191,
+    )
 
 
 if __name__ == "__main__":
