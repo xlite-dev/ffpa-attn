@@ -68,6 +68,53 @@ def make_inputs(args):
   return q, k, v, dO
 
 
+def run_forward_backward_once(fn, q, k, v, dO):
+  """Run one forward/backward pass and return output plus input gradients.
+
+  :param fn: Attention callable that consumes ``(q, k, v)`` and returns ``out``.
+  :param q: Query tensor.
+  :param k: Key tensor.
+  :param v: Value tensor.
+  :param dO: Upstream gradient tensor matching the output shape.
+  :return: Tuple ``(out, dq, dk, dv)`` detached from autograd.
+  """
+  q_i = q.detach().clone().requires_grad_(True)
+  k_i = k.detach().clone().requires_grad_(True)
+  v_i = v.detach().clone().requires_grad_(True)
+  out = fn(q_i, k_i, v_i)
+  out.backward(dO)
+  return out.detach(), q_i.grad.detach(), k_i.grad.detach(), v_i.grad.detach()
+
+
+def tensor_max_abs_err(ref: torch.Tensor, actual: torch.Tensor) -> float:
+  """Return the maximum absolute error between two tensors."""
+  return (ref.float() - actual.float()).abs().max().item()
+
+
+def print_max_abs_err(name, fn, ref, q, k, v, dO):
+  """Print max-abs-error for one backend against the SDPA reference.
+
+  :param name: Label shown in benchmark output.
+  :param fn: Backend callable under test.
+  :param ref: Reference tuple ``(out, dq, dk, dv)`` from SDPA.
+  :param q: Query tensor.
+  :param k: Key tensor.
+  :param v: Value tensor.
+  :param dO: Upstream gradient tensor.
+  """
+  out_ref, dq_ref, dk_ref, dv_ref = ref
+  out, dq, dk, dv = run_forward_backward_once(fn, q, k, v, dO)
+  out_err = tensor_max_abs_err(out_ref, out)
+  dq_err = tensor_max_abs_err(dq_ref, dq)
+  dk_err = tensor_max_abs_err(dk_ref, dk)
+  dv_err = tensor_max_abs_err(dv_ref, dv)
+  max_abs_err = max(out_err, dq_err, dk_err, dv_err)
+  print(
+    f"{name:>14}: max_abs_err={max_abs_err:.6e} "
+    f"(out={out_err:.6e}, dq={dq_err:.6e}, dk={dk_err:.6e}, dv={dv_err:.6e})"
+  )
+
+
 def time_backward(name, fn, q, k, v, dO, warmup, iters):
   for _ in range(warmup):
     q_i = q.detach().clone().requires_grad_(True)
@@ -115,6 +162,7 @@ def time_backward_only(name, fn, q, k, v, dO, warmup, iters):
     elapsed_ms += start_event.elapsed_time(end_event)
 
   elapsed_ms /= iters
+  name = f"{name}_bwd"
   print(f"{name:>14}: {elapsed_ms:.3f} ms")
   return elapsed_ms
 
@@ -184,6 +232,7 @@ def main():
     f"causal={args.causal} mode={args.mode} autotune={args.triton_backward_autotune} "
     f"version={args.triton_backward_version} warmup={args.warmup} iters={args.iters}"
   )
+  sdpa_ref = run_forward_backward_once(sdpa, q, k, v, dO)
   timer = time_backward_only if args.mode == "backward-only" else time_backward
   if args.compare_backends:
     cuda1_ms = try_time_backend(timer, "cuda_s1", make_native("cuda", 1), q, k, v, dO, args.warmup, args.iters)
@@ -200,6 +249,12 @@ def main():
         print(f"triton/cuda_s1: {triton_ms / cuda1_ms:.3f}x time")
       if cuda2_ms is not None:
         print(f"triton/cuda_s2: {triton_ms / cuda2_ms:.3f}x time")
+    if cuda1_ms is not None:
+      print_max_abs_err("cuda_s1", make_native("cuda", 1), sdpa_ref, q, k, v, dO)
+    if cuda2_ms is not None:
+      print_max_abs_err("cuda_s2", make_native("cuda", 2), sdpa_ref, q, k, v, dO)
+    if triton_ms is not None:
+      print_max_abs_err("triton", make_native("triton", 1), sdpa_ref, q, k, v, dO)
   elif args.compare_stages:
     cuda1_ms = timer("cuda_s1", make_cuda(1), q, k, v, dO, args.warmup, args.iters)
     cuda2_ms = timer("cuda_s2", make_cuda(2), q, k, v, dO, args.warmup, args.iters)
@@ -211,12 +266,16 @@ def main():
     print(f"stage2/stage1: {cuda2_ms / cuda1_ms:.3f}x time")
     print(f"stage3/stage1: {cuda3_ms / cuda1_ms:.3f}x time")
     print(f"stage3/stage2: {cuda3_ms / cuda2_ms:.3f}x time")
+    print_max_abs_err("cuda_s1", make_cuda(1), sdpa_ref, q, k, v, dO)
+    print_max_abs_err("cuda_s2", make_cuda(2), sdpa_ref, q, k, v, dO)
+    print_max_abs_err("cuda_s3", make_cuda(3), sdpa_ref, q, k, v, dO)
   else:
     backend_name = backend_label(args.backward_backend, args.stages)
     cuda_ms = try_time_backend(timer, backend_name, cuda, q, k, v, dO, args.warmup, args.iters)
     sdpa_ms = timer("sdpa_bwd" if args.mode == "backward-only" else "sdpa", sdpa, q, k, v, dO, args.warmup, args.iters)
     if cuda_ms is not None:
       print(f"speedup {backend_name}: {sdpa_ms / cuda_ms:.3f}x vs sdpa")
+      print_max_abs_err(backend_name, cuda, sdpa_ref, q, k, v, dO)
 
 
 if __name__ == "__main__":
