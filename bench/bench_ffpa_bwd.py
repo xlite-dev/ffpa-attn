@@ -54,6 +54,7 @@ def parse_args():
   )
   parser.add_argument(
     "--triton-preprocess-d-chunk",
+    "--d-chunk",
     action="store_true",
     help="Use split-D delta preprocess for the Triton backward backend."
   )
