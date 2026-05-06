@@ -26,7 +26,7 @@ import torch.nn.functional as F
 
 from ffpa_attn import ffpa_attn_func
 
-WARMUP, ITERS = 5, 10
+WARMUP, ITERS = 2, 10
 D = 512
 
 
