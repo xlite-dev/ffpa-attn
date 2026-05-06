@@ -37,7 +37,7 @@ def _parse_args() -> argparse.Namespace:
     default="triton",
     help="Backward backend passed to ffpa_attn_func.",
   )
-  parser.add_argument("--seed", type=int, default=42, help="Random seed for input tensors.")
+  parser.add_argument("--seed", type=int, default=0, help="Random seed for input tensors.")
   parser.add_argument(
     "--triton-backward-autotune",
     "--autotune",
