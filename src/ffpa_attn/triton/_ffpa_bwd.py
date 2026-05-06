@@ -219,7 +219,7 @@ def ffpa_bwd_v1_kernel(
       S = tl.where(offs_m_curr[:, None] >= (offs_n[None, :]), S, float("-inf"))
 
     lse_i = tl.load(LSE + offs_m_curr)
-    P = tl.exp2((S * softmax_scale - lse_i[:, None]) * 1.4426950408889634)
+    P = tl.exp(S * softmax_scale - lse_i[:, None])
 
     # ---- Phase 1c: dS = P * (dP - delta) * scale ----
     Di = tl.load(D + offs_m_curr)
@@ -638,7 +638,7 @@ def _ffpa_bwd_v2_kernel_impl(
       if IS_CAUSAL:
         S = tl.where(offs_qm[:, None] >= (offs_n[None, :]), S, float("-inf"))
       lse_i = tl.load(LSE + offs_qm)
-      P = tl.exp2((S * softmax_scale - lse_i[:, None]) * 1.4426950408889634)
+      P = tl.exp(S * softmax_scale - lse_i[:, None])
       Di = tl.load(D + offs_qm)
       dS = (P * (dP - Di[:, None]) * softmax_scale).to(DTYPE)
 
@@ -716,7 +716,7 @@ def _ffpa_bwd_v2_kernel_impl(
       if IS_CAUSAL:
         S_qk = tl.where(offs_m[:, None] >= (offs_nk[None, :]), S_qk, float("-inf"))
       lse_i = tl.load(LSE + offs_m)
-      P_qk = tl.exp2((S_qk * softmax_scale - lse_i[:, None]) * 1.4426950408889634)
+      P_qk = tl.exp(S_qk * softmax_scale - lse_i[:, None])
       Di = tl.load(D + offs_m)
       dS_qk = (P_qk * (dP_qk - Di[:, None]) * softmax_scale).to(DTYPE)
 
