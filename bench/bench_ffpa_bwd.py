@@ -17,7 +17,11 @@ def parse_args():
   parser.add_argument("--dtype", choices=["fp16", "bf16"], default="fp16")
   parser.add_argument("--causal", action="store_true")
   parser.add_argument("--stages", type=int, default=1)
-  parser.add_argument("--compare-stages", action="store_true", help="Run CUDA stages 1, 2, and 3 side by side.")
+  parser.add_argument(
+    "--compare-stages",
+    action="store_true",
+    help="Run CUDA stages 1, 2, and 3 side by side.",
+  )
   parser.add_argument(
     "--compare-backends",
     action="store_true",
@@ -33,7 +37,7 @@ def parse_args():
     "--mode",
     choices=["full", "backward-only"],
     default="full",
-    help="full measures forward+backward; backward-only times only the backward call after forward is ready.",
+    help="full measures forward+backward or backward-only.",
   )
   parser.add_argument(
     "--triton-backward-autotune",
