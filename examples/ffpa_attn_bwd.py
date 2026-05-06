@@ -42,6 +42,7 @@ def _parse_args() -> argparse.Namespace:
   parser.add_argument(
     "--triton-backward-autotune",
     "--autotune",
+    "--tune",
     action="store_true",
     help="Enable Triton autotuning (only effective when --backward-backend=triton).",
   )
