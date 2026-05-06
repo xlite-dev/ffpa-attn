@@ -457,7 +457,7 @@ def ffpa_attn_func(
       ``QK^T``. Defaults to ``1 / sqrt(D)`` (standard attention scale)
       when ``None``. Named ``softmax_scale`` to match the
       ``flash-attn`` convention.
-    :param kwargs: Implementation-specific options for experimentation.  Supported
+  :param kwargs: Implementation-specific options for experimentation.  Supported
       keys are ``stages``, ``acc``, ``tma``, ``high_precision_grad``,
       ``forward_backend``, ``triton_forward_autotune``, ``backward_backend``,
       ``triton_backward_autotune``, ``triton_backward_version``, and
