@@ -108,6 +108,7 @@ _ffpa_bwd_pre_autotune = triton.autotune(
   configs=_gen_pre_autotune_configs(),
   key=["seqlen_q", "headdim"],
   reset_to_zero=["Delta"],
+  cache_results=True,
 )(_ffpa_bwd_pre_impl)
 
 # Non-autotuned variant.
