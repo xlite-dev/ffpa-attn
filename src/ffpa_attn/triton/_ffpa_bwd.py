@@ -305,9 +305,6 @@ def _gen_bwd_autotune_configs() -> list[triton.Config]:
   """
   # BLOCK_M: larger = fewer Q-block iterations (good), more register pressure.
   # BLOCK_N:
-  #   16  — many column blocks, more SM utilisation for small B*H, but
-  #         4× the atomic contention vs BLOCK_N=32.  Useful for very small
-  #         seqlen where more parallelism is needed.
   #   32  — default.  Good trade-off for moderate seqlen (~1024).
   #   64  — fewer column blocks, halves atomic contention.  Autotune
   #         selected this for H=32, N=4096 (0.997x vs SDPA).
@@ -320,6 +317,8 @@ def _gen_bwd_autotune_configs() -> list[triton.Config]:
   #   512     — full-D single chunk, eliminates D-chunk loop entirely.
   #             Needs >= 128 KB SMEM; only included on Ada (128 KB) or Hopper
   #             (228 KB).  Skipped on Ampere (99 KB limit).
+  # TODO: Optimize the autotune time by saving the best config per shape
+  # (device-shape/headdim) in a file and loading it at the start of autotune.
   try:
     _max_smem = torch.cuda.get_device_properties(0).shared_memory_per_block_optin
   except Exception:
@@ -330,7 +329,7 @@ def _gen_bwd_autotune_configs() -> list[triton.Config]:
 
   configs = []
   for block_m in [32, 64, 128]:
-    for block_n in [16, 32, 64, 128]:
+    for block_n in [32, 64, 128]:
       for block_headdim in _headdim_candidates:
         for num_warps in [4, 8]:
           for num_stages in [2, 3]:
@@ -499,6 +498,7 @@ _ffpa_bwd_v1_autotune = triton.autotune(
   configs=_FFPA_BWD_AUTOTUNE_CONFIGS,
   key=["seqlen_q", "seqlen_k", "headdim"],
   reset_to_zero=["DQ", "DK", "DV"],
+  cache_results=True,
 )(_ffpa_bwd_v1_kernel_impl)
 
 # Non-autotuned variant — same impl, called with the best known config.
@@ -736,6 +736,7 @@ _ffpa_bwd_v2_autotune = triton.autotune(
   configs=_FFPA_BWD_AUTOTUNE_CONFIGS,
   key=["seqlen_q", "seqlen_k", "headdim"],
   reset_to_zero=["DQ", "DK", "DV"],
+  cache_results=True,
 )(_ffpa_bwd_v2_kernel_impl)
 
 # Non-autotuned v2 variant.

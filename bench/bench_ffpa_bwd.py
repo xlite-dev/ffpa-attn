@@ -238,7 +238,7 @@ def main():
     cuda1_ms = try_time_backend(timer, "cuda_s1", make_native("cuda", 1), q, k, v, dO, args.warmup, args.iters)
     cuda2_ms = try_time_backend(timer, "cuda_s2", make_native("cuda", 2), q, k, v, dO, args.warmup, args.iters)
     triton_ms = try_time_backend(timer, "triton", make_native("triton", 1), q, k, v, dO, args.warmup, args.iters)
-    sdpa_ms = timer("sdpa_bwd" if args.mode == "backward-only" else "sdpa", sdpa, q, k, v, dO, args.warmup, args.iters)
+    sdpa_ms = timer("sdpa", sdpa, q, k, v, dO, args.warmup, args.iters)
     if cuda1_ms is not None:
       print(f"speedup cuda_s1: {sdpa_ms / cuda1_ms:.3f}x vs sdpa")
     if cuda2_ms is not None:
@@ -259,7 +259,7 @@ def main():
     cuda1_ms = timer("cuda_s1", make_cuda(1), q, k, v, dO, args.warmup, args.iters)
     cuda2_ms = timer("cuda_s2", make_cuda(2), q, k, v, dO, args.warmup, args.iters)
     cuda3_ms = timer("cuda_s3", make_cuda(3), q, k, v, dO, args.warmup, args.iters)
-    sdpa_ms = timer("sdpa_bwd" if args.mode == "backward-only" else "sdpa", sdpa, q, k, v, dO, args.warmup, args.iters)
+    sdpa_ms = timer("sdpa", sdpa, q, k, v, dO, args.warmup, args.iters)
     print(f"speedup stage1: {sdpa_ms / cuda1_ms:.3f}x vs sdpa")
     print(f"speedup stage2: {sdpa_ms / cuda2_ms:.3f}x vs sdpa")
     print(f"speedup stage3: {sdpa_ms / cuda3_ms:.3f}x vs sdpa")
@@ -272,7 +272,7 @@ def main():
   else:
     backend_name = backend_label(args.backward_backend, args.stages)
     cuda_ms = try_time_backend(timer, backend_name, cuda, q, k, v, dO, args.warmup, args.iters)
-    sdpa_ms = timer("sdpa_bwd" if args.mode == "backward-only" else "sdpa", sdpa, q, k, v, dO, args.warmup, args.iters)
+    sdpa_ms = timer("sdpa", sdpa, q, k, v, dO, args.warmup, args.iters)
     if cuda_ms is not None:
       print(f"speedup {backend_name}: {sdpa_ms / cuda_ms:.3f}x vs sdpa")
       print_max_abs_err(backend_name, cuda, sdpa_ref, q, k, v, dO)
