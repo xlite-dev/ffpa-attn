@@ -39,7 +39,7 @@ def _gen_fwd_autotune_configs() -> list[triton.Config]:
   for block_m in [64, 128]:
     for block_headdim in [32, 64, 128]:
       for num_warps in [4, 8]:
-        for num_stages in [2, 3]:
+        for num_stages in [2, 3, 4]:
           configs.append(
             triton.Config(
               {
@@ -132,6 +132,7 @@ def _ffpa_fwd_kernel_impl(
 
   end_n = seqlen_k
   if IS_CAUSAL:
+    # Skip KV blocks that are fully masked by lower-right causal attention.
     end_n = tl.minimum(seqlen_k, (start_m + 1) * BLOCK_M + kv_offset)
 
   for start_n in range(0, end_n, BLOCK_N):
@@ -304,7 +305,7 @@ def _ffpa_attn_forward_impl(
       BLOCK_HEADDIM_QK=64,
       BLOCK_HEADDIM_V=64,
       num_warps=8,
-      num_stages=2,
+      num_stages=3,
     )
 
 

@@ -335,7 +335,7 @@ def _gen_bwd_autotune_configs() -> list[triton.Config]:
     for block_n in [64, 128]:
       for block_headdim in _headdim_candidates:
         for num_warps in [4, 8]:
-          for num_stages in [2, 3]:
+          for num_stages in [2, 3, 4]:
             configs.append(
               triton.Config(
                 {
