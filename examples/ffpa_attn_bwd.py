@@ -34,11 +34,13 @@ def _parse_args() -> argparse.Namespace:
   parser.add_argument(
     "--backward-backend",
     choices=["sdpa", "cuda", "triton"],
-    default="sdpa",
+    default="triton",
     help="Backward backend passed to ffpa_attn_func.",
   )
+  parser.add_argument("--seed", type=int, default=0, help="Random seed for input tensors.")
   parser.add_argument(
     "--triton-backward-autotune",
+    "--autotune",
     action="store_true",
     help="Enable Triton autotuning (only effective when --backward-backend=triton).",
   )
@@ -135,6 +137,7 @@ def _run_case(
   dtype: torch.dtype,
   backward_backend: str,
   triton_backward_autotune: bool,
+  seed: int,
   B: int,
   Nh_q: int,
   Nh_kv: int,
@@ -142,7 +145,7 @@ def _run_case(
   Nkv: int,
   causal: bool = False,
 ) -> None:
-  torch.manual_seed(0)
+  torch.manual_seed(seed)
   q = torch.randn(B, Nh_q, Nq, D, dtype=dtype, device="cuda", requires_grad=True)
   k = torch.randn(B, Nh_kv, Nkv, D, dtype=dtype, device="cuda", requires_grad=True)
   v = torch.randn(B, Nh_kv, Nkv, D, dtype=dtype, device="cuda", requires_grad=True)
@@ -190,6 +193,7 @@ def _run_case(
 
 def main() -> None:
   args = _parse_args()
+  print(args)
 
   if not torch.cuda.is_available():
     raise SystemExit("CUDA is required to run this example.")
@@ -198,8 +202,9 @@ def main() -> None:
     _run_case(
       "self-attn",
       dtype,
-      args.triton_backward_backend,
+      args.backward_backend,
       args.triton_backward_autotune,
+      seed=args.seed,
       B=1,
       Nh_q=32,
       Nh_kv=32,
@@ -209,8 +214,9 @@ def main() -> None:
     _run_case(
       "cross-attn",
       dtype,
-      args.triton_backward_backend,
+      args.backward_backend,
       args.triton_backward_autotune,
+      seed=args.seed,
       B=1,
       Nh_q=32,
       Nh_kv=32,
@@ -220,19 +226,21 @@ def main() -> None:
     _run_case(
       "gqa",
       dtype,
-      args.triton_backward_backend,
+      args.backward_backend,
       args.triton_backward_autotune,
+      seed=args.seed,
       B=1,
       Nh_q=32,
       Nh_kv=8,
       Nq=8192,
-      Nkv=8192
+      Nkv=8192,
     )
     _run_case(
       "causal",
       dtype,
-      args.triton_backward_backend,
+      args.backward_backend,
       args.triton_backward_autotune,
+      seed=args.seed,
       B=1,
       Nh_q=32,
       Nh_kv=32,
@@ -243,8 +251,9 @@ def main() -> None:
     _run_case(
       "non-aligned",
       dtype,
-      args.triton_backward_backend,
+      args.backward_backend,
       args.triton_backward_autotune,
+      seed=args.seed,
       B=1,
       Nh_q=8,
       Nh_kv=8,

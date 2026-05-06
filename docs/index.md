@@ -17,7 +17,7 @@
 </div>
 
 > [!NOTE]
-> FFPA has been tested on `Ampere`, `Ada`, `Hopper`, and `Blackwell` architectures (e.g., A30, L20, 4090, H200, 5090). For `Hopper` and `Blackwell`, it delivers a `1.5×–2.3×↑🎉` speedup over SDPA on the forward (CUDA) for headdim `> 256`, and a `1.1x~1.5x🎉` end-to-end speedup for forward (CUDA) + backward (Triton w/ autotune).
+> FFPA has been tested on `Ampere`, `Ada`, `Hopper`, and `Blackwell` architectures (e.g., A30, L20, 4090, H200, 5090), achieves `1.8×~3×↑🎉` forward (CUDA) and `1.5×~2.5×↑🎉` backward (Triton w/ autotune) speedup over SDPA for headdim `> 256`.
 
 ## 📖 Quick Start
 
@@ -225,18 +225,6 @@ By leveraging this approach, we can achieve better performance than SDPA EA for 
 |Register | ≈O(d/4), d↑ | ≈O(d/2), d↑ |
 |HBM| ≈FA2≈O(Nd), O | ≈O(Nd), O |
 |Extra HBM| ≈FA2≈O(N), m,l | ≈O(N), m,l |
-
-</div>
-
-**📚Implementation**: FFPA is implemented using pure MMA PTX instructions, which supports many features such as Split-Q, SMEM Swizzle/Padding, QKV Multi-Stages(1~4), Tile MMAs/Warps, Mixed MMA F32/F16 Acc (Q@K^T MMA Acc F32 + P@V MMA Acc F16), Fully Shared QKV SMEM, Prefetch QKV g2s, Persist Q s2r/g2s, **Fully QKV Fine-grained Tiling(GEMM style)**, Collective Store, etc.
-
-<div align="center" markdown="1">
-
-|✔️Tensor Cores |✔️**MMA(m16n8k16)** |✔️Tile Block(Br, Bc) |✔️Tile MMA/Warp |
-|:---:|:---:|:---:|:---:|
-|✔️**Split Q**(FA-2)|✔️Pack LDST(128 bits)|✔️SMEM **Swizzle/Pad** |✔️Copy Async |
-|✔️**Reg Double Buffers** |✔️QKV **Multi-Stages(1~4)** |✔️Collective Store(**Shfl**)|✔️**Prefetch QKV** g2s |
-|✔️**QKV Fine-grained Tiling**|✔️**Shared QKV** SMEM|✔️Mixed MMA Acc|✔️**Persist Q** s2r/g2s|
 
 </div>
 

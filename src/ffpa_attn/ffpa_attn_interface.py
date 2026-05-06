@@ -170,7 +170,7 @@ class FFPAAttnFunc(torch.autograd.Function):
     guaranteed by PyTorch's SDPA implementation.
 
     Dropout is not supported (always 0.0).
-    """
+  """
 
   @staticmethod
   def forward(

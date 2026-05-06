@@ -44,25 +44,32 @@ import triton.language as tl
 # Preprocess: delta = rowsum(dO * O)
 # ---------------------------------------------------------------------------
 
+# BLOCK_HEADDIM must be >= headdim (no D-chunk loop).  Derive from
+# the runtime headdim so that autotune never tests invalid configs.
+_FFPA_BWD_PRE_HEURISTICS = {
+  "BLOCK_HEADDIM": lambda args: max(64, triton.next_power_of_2(args["headdim"])),
+}
 
+
+@triton.heuristics(_FFPA_BWD_PRE_HEURISTICS)
 @triton.jit
 def _ffpa_bwd_pre_impl(
-  Out,
-  DO,
-  Delta,
-  stride_ob,
-  stride_oh,
-  stride_om,
-  stride_dob,
-  stride_doh,
-  stride_dom,
-  nheads,
-  seqlen_q,
-  seqlen_q_rounded,
-  headdim,
+  Out: torch.Tensor,
+  DO: torch.Tensor,
+  Delta: torch.Tensor,
+  stride_ob: int,
+  stride_oh: int,
+  stride_om: int,
+  stride_dob: int,
+  stride_doh: int,
+  stride_dom: int,
+  nheads: int,
+  seqlen_q: int,
+  seqlen_q_rounded: int,
+  headdim: int,
   BLOCK_M: tl.constexpr,
   BLOCK_HEADDIM: tl.constexpr,
-):
+) -> None:
   """Preprocess kernel to compute delta = rowsum(dO * O) for the backward pass."""
   start_m = tl.program_id(0)
   off_hb = tl.program_id(1)
@@ -84,22 +91,20 @@ def _ffpa_bwd_pre_impl(
   tl.store(Delta + off_hb * seqlen_q_rounded + offs_m, delta)
 
 
-def _gen_pre_autotune_configs():
-  """Generate autotune configs for the preprocess delta kernel."""
+def _gen_pre_autotune_configs() -> list[triton.Config]:
+  """Generate autotune configs for the preprocess delta kernel.
+
+    BLOCK_HEADDIM is excluded from autotune — it must be >= headdim
+    (no D-chunk loop) and is derived from the runtime ``headdim`` via
+    ``_FFPA_BWD_PRE_HEURISTICS``.
+  """
   configs = []
   for block_m in [64, 128, 256]:
-    for block_headdim in [64, 128]:
-      for num_warps in [4, 8]:
-        configs.append(
-          triton.Config(
-            {
-              "BLOCK_M": block_m,
-              "BLOCK_HEADDIM": block_headdim
-            },
-            num_warps=num_warps,
-            num_stages=3,
-          )
-        )
+    for num_warps in [2, 4, 8]:
+      configs.append(triton.Config(
+        {"BLOCK_M": block_m},
+        num_warps=num_warps,
+      ))
   return configs
 
 
@@ -108,39 +113,40 @@ _ffpa_bwd_pre_autotune = triton.autotune(
   configs=_gen_pre_autotune_configs(),
   key=["seqlen_q", "headdim"],
   reset_to_zero=["Delta"],
+  cache_results=True,
 )(_ffpa_bwd_pre_impl)
 
 # Non-autotuned variant.
 _ffpa_bwd_pre = _ffpa_bwd_pre_impl
 
 # ---------------------------------------------------------------------------
-# Split-D backward — one K/V column block
+# Split-D backward v1 kernel — one K/V column block
 # ---------------------------------------------------------------------------
 
 
 @triton.jit
 def ffpa_bwd_v1_kernel(
-  start_n,
-  Q,
-  K,
-  V,
-  DO,
-  DQ,
-  DK,
-  DV,
-  LSE,
-  D,
-  softmax_scale,
-  stride_qm,
-  stride_kn,
-  stride_vn,
-  stride_dom,
-  stride_dqm,
-  stride_dkn,
-  stride_dvn,
-  seqlen_q,
-  seqlen_k,
-  headdim,
+  start_n: int,
+  Q: torch.Tensor,
+  K: torch.Tensor,
+  V: torch.Tensor,
+  DO: torch.Tensor,
+  DQ: torch.Tensor,
+  DK: torch.Tensor,
+  DV: torch.Tensor,
+  LSE: torch.Tensor,
+  D: torch.Tensor,
+  softmax_scale: float,
+  stride_qm: int,
+  stride_kn: int,
+  stride_vn: int,
+  stride_dom: int,
+  stride_dqm: int,
+  stride_dkn: int,
+  stride_dvn: int,
+  seqlen_q: int,
+  seqlen_k: int,
+  headdim: int,
   ATOMIC_ADD: tl.constexpr,
   IS_CAUSAL: tl.constexpr,
   BLOCK_HEADDIM: tl.constexpr,
@@ -149,7 +155,7 @@ def ffpa_bwd_v1_kernel(
   EVEN_N: tl.constexpr,
   BLOCK_M: tl.constexpr,
   BLOCK_N: tl.constexpr,
-):
+) -> None:
   begin_m = 0 if not IS_CAUSAL else ((start_n * BLOCK_N) // BLOCK_M) * BLOCK_M
   offs_n = start_n * BLOCK_N + tl.arange(0, BLOCK_N)
   offs_m = tl.arange(0, BLOCK_M)
@@ -295,7 +301,7 @@ def ffpa_bwd_v1_kernel(
 # ---------------------------------------------------------------------------
 
 
-def _gen_bwd_autotune_configs():
+def _gen_bwd_autotune_configs() -> list[triton.Config]:
   """Generate autotune configs over BLOCK_M, BLOCK_N, BLOCK_HEADDIM, num_warps, num_stages.
 
     NOTE: ATOMIC_ADD is intentionally excluded.  With SEQUENCE_PARALLEL=True
@@ -305,14 +311,8 @@ def _gen_bwd_autotune_configs():
   """
   # BLOCK_M: larger = fewer Q-block iterations (good), more register pressure.
   # BLOCK_N:
-  #   16  — many column blocks, more SM utilisation for small B*H, but
-  #         4× the atomic contention vs BLOCK_N=32.  Useful for very small
-  #         seqlen where more parallelism is needed.
-  #   32  — default.  Good trade-off for moderate seqlen (~1024).
-  #   64  — fewer column blocks, halves atomic contention.  Autotune
-  #         selected this for H=32, N=4096 (0.997x vs SDPA).
-  #   128 — 4× fewer blocks, minimal atomic contention.  Best for long
-  #         seqlen (N >= 8192) where atomic serialisation dominates.
+  #   64  — fewer column blocks, halves atomic contention for v1.
+  #   128 — 4× fewer blocks, minimal atomic contention for v1.
   # BLOCK_HEADDIM (gated by available shared memory):
   #   64, 128 — classic D-chunk split, low register pressure, widely compatible.
   #   256     — 2 chunks for D=512, halves HBM reloads.  Requires BLOCK_M ≤ 64
@@ -320,6 +320,8 @@ def _gen_bwd_autotune_configs():
   #   512     — full-D single chunk, eliminates D-chunk loop entirely.
   #             Needs >= 128 KB SMEM; only included on Ada (128 KB) or Hopper
   #             (228 KB).  Skipped on Ampere (99 KB limit).
+  # TODO: Optimize the autotune time by saving the best config per shape
+  # (device-shape/headdim) in a file and loading it at the start of autotune.
   try:
     _max_smem = torch.cuda.get_device_properties(0).shared_memory_per_block_optin
   except Exception:
@@ -329,8 +331,8 @@ def _gen_bwd_autotune_configs():
     _headdim_candidates.append(512)
 
   configs = []
-  for block_m in [32, 64, 128]:
-    for block_n in [16, 32, 64, 128]:
+  for block_m in [64, 128]:
+    for block_n in [64, 128]:
       for block_headdim in _headdim_candidates:
         for num_warps in [4, 8]:
           for num_stages in [2, 3]:
@@ -358,42 +360,42 @@ _FFPA_BWD_HEURISTICS = {
 @triton.heuristics(_FFPA_BWD_HEURISTICS)
 @triton.jit
 def _ffpa_bwd_v1_kernel_impl(
-  Q,
-  K,
-  V,
-  DO,
-  DQ,
-  DK,
-  DV,
-  LSE,
-  D,
-  softmax_scale,
-  stride_qb,
-  stride_qh,
-  stride_qm,
-  stride_kb,
-  stride_kh,
-  stride_kn,
-  stride_vb,
-  stride_vh,
-  stride_vn,
-  stride_dob,
-  stride_doh,
-  stride_dom,
-  stride_dqb,
-  stride_dqh,
-  stride_dqm,
-  stride_dkb,
-  stride_dkh,
-  stride_dkn,
-  stride_dvb,
-  stride_dvh,
-  stride_dvn,
-  nheads,
-  seqlen_q,
-  seqlen_k,
-  seqlen_q_rounded,
-  headdim,
+  Q: torch.Tensor,
+  K: torch.Tensor,
+  V: torch.Tensor,
+  DO: torch.Tensor,
+  DQ: torch.Tensor,
+  DK: torch.Tensor,
+  DV: torch.Tensor,
+  LSE: torch.Tensor,
+  D: torch.Tensor,
+  softmax_scale: float,
+  stride_qb: int,
+  stride_qh: int,
+  stride_qm: int,
+  stride_kb: int,
+  stride_kh: int,
+  stride_kn: int,
+  stride_vb: int,
+  stride_vh: int,
+  stride_vn: int,
+  stride_dob: int,
+  stride_doh: int,
+  stride_dom: int,
+  stride_dqb: int,
+  stride_dqh: int,
+  stride_dqm: int,
+  stride_dkb: int,
+  stride_dkh: int,
+  stride_dkn: int,
+  stride_dvb: int,
+  stride_dvh: int,
+  stride_dvn: int,
+  nheads: int,
+  seqlen_q: int,
+  seqlen_k: int,
+  seqlen_q_rounded: int,
+  headdim: int,
   IS_CAUSAL: tl.constexpr,
   SEQUENCE_PARALLEL: tl.constexpr,
   BLOCK_HEADDIM: tl.constexpr,
@@ -402,7 +404,7 @@ def _ffpa_bwd_v1_kernel_impl(
   EVEN_N: tl.constexpr,
   BLOCK_M: tl.constexpr,
   BLOCK_N: tl.constexpr,
-):
+) -> None:
   off_hb = tl.program_id(1)
   off_b = off_hb // nheads
   off_h = off_hb % nheads
@@ -499,6 +501,7 @@ _ffpa_bwd_v1_autotune = triton.autotune(
   configs=_FFPA_BWD_AUTOTUNE_CONFIGS,
   key=["seqlen_q", "seqlen_k", "headdim"],
   reset_to_zero=["DQ", "DK", "DV"],
+  cache_results=True,
 )(_ffpa_bwd_v1_kernel_impl)
 
 # Non-autotuned variant — same impl, called with the best known config.
@@ -523,42 +526,42 @@ _ffpa_bwd_v1 = _ffpa_bwd_v1_kernel_impl
 @triton.heuristics(_FFPA_BWD_HEURISTICS)
 @triton.jit
 def _ffpa_bwd_v2_kernel_impl(
-  Q,
-  K,
-  V,
-  DO,
-  DQ,
-  DK,
-  DV,
-  LSE,
-  D,
-  softmax_scale,
-  stride_qb,
-  stride_qh,
-  stride_qm,
-  stride_kb,
-  stride_kh,
-  stride_kn,
-  stride_vb,
-  stride_vh,
-  stride_vn,
-  stride_dob,
-  stride_doh,
-  stride_dom,
-  stride_dqb,
-  stride_dqh,
-  stride_dqm,
-  stride_dkb,
-  stride_dkh,
-  stride_dkn,
-  stride_dvb,
-  stride_dvh,
-  stride_dvn,
-  nheads,
-  seqlen_q,
-  seqlen_k,
-  seqlen_q_rounded,
-  headdim,
+  Q: torch.Tensor,
+  K: torch.Tensor,
+  V: torch.Tensor,
+  DO: torch.Tensor,
+  DQ: torch.Tensor,
+  DK: torch.Tensor,
+  DV: torch.Tensor,
+  LSE: torch.Tensor,
+  D: torch.Tensor,
+  softmax_scale: float,
+  stride_qb: int,
+  stride_qh: int,
+  stride_qm: int,
+  stride_kb: int,
+  stride_kh: int,
+  stride_kn: int,
+  stride_vb: int,
+  stride_vh: int,
+  stride_vn: int,
+  stride_dob: int,
+  stride_doh: int,
+  stride_dom: int,
+  stride_dqb: int,
+  stride_dqh: int,
+  stride_dqm: int,
+  stride_dkb: int,
+  stride_dkh: int,
+  stride_dkn: int,
+  stride_dvb: int,
+  stride_dvh: int,
+  stride_dvn: int,
+  nheads: int,
+  seqlen_q: int,
+  seqlen_k: int,
+  seqlen_q_rounded: int,
+  headdim: int,
   IS_CAUSAL: tl.constexpr,
   BLOCK_HEADDIM: tl.constexpr,
   DTYPE: tl.constexpr,
@@ -566,7 +569,7 @@ def _ffpa_bwd_v2_kernel_impl(
   EVEN_N: tl.constexpr,
   BLOCK_M: tl.constexpr,
   BLOCK_N: tl.constexpr,
-):
+) -> None:
   pid = tl.program_id(0)
   off_hb = tl.program_id(2)
   off_b = off_hb // nheads
@@ -595,8 +598,9 @@ def _ffpa_bwd_v2_kernel_impl(
     offs_d = tl.arange(0, BLOCK_HEADDIM)
 
     num_block_m = tl.cdiv(seqlen_q, BLOCK_M)
+    begin_m = 0 if not IS_CAUSAL else start_n // BLOCK_M * BLOCK_M
 
-    for start_m in range(0, num_block_m * BLOCK_M, BLOCK_M):
+    for start_m in range(begin_m, num_block_m * BLOCK_M, BLOCK_M):
       offs_qm = start_m + offs_m
 
       # --- Phase 1: S = sum_d Q_d @ K_d^T, dP = sum_d dO_d @ V_d^T ---
@@ -672,8 +676,9 @@ def _ffpa_bwd_v2_kernel_impl(
     offs_d = tl.arange(0, BLOCK_HEADDIM)
 
     num_block_n = tl.cdiv(seqlen_k, BLOCK_N)
+    end_n_k = start_m + BLOCK_M if IS_CAUSAL else num_block_n * BLOCK_N
 
-    for start_n_k in range(0, num_block_n * BLOCK_N, BLOCK_N):
+    for start_n_k in range(0, end_n_k, BLOCK_N):
       offs_nk = start_n_k + offs_n
 
       # --- Phase 1: S, dP for this Q-block × K-block ---
@@ -736,6 +741,7 @@ _ffpa_bwd_v2_autotune = triton.autotune(
   configs=_FFPA_BWD_AUTOTUNE_CONFIGS,
   key=["seqlen_q", "seqlen_k", "headdim"],
   reset_to_zero=["DQ", "DK", "DV"],
+  cache_results=True,
 )(_ffpa_bwd_v2_kernel_impl)
 
 # Non-autotuned v2 variant.
@@ -757,10 +763,10 @@ def _ffpa_attn_backward(
   dk: torch.Tensor,
   dv: torch.Tensor,
   causal: bool = False,
-  softmax_scale: float = None,
+  softmax_scale: float | None = None,
   autotune: bool = False,
   kernel_version: str = "v2",
-):
+) -> None:
   """
     FFPA backward entry point.
 
@@ -792,7 +798,7 @@ def _ffpa_attn_backward(
   delta = torch.empty_like(lse)
   if autotune:
 
-    def pre_grid(meta):
+    def pre_grid(meta: dict) -> tuple[int, int]:
       return (triton.cdiv(seqlen_q, meta["BLOCK_M"]), batch * nheads)
 
     _ffpa_bwd_pre_autotune[pre_grid](
@@ -827,6 +833,7 @@ def _ffpa_attn_backward(
       headdim,
       BLOCK_M=128,
       BLOCK_HEADDIM=BLOCK_HEADDIM_DELTA,
+      num_warps=4,
     )
 
   # Grid and kernel dispatch.
@@ -837,7 +844,7 @@ def _ffpa_attn_backward(
   if kernel_version == "v2":
     # v2: shared-pid split-D, grid = (max(K-blocks, Q-blocks), 1, B*Nh).
     # pid serves as both K-col block index and Q-row block index.
-    def grid(meta):
+    def grid(meta: dict) -> tuple[int, ...]:
       return (
         max(triton.cdiv(seqlen_k, meta["BLOCK_N"]), triton.cdiv(seqlen_q, meta["BLOCK_M"])),
         1,
@@ -925,15 +932,15 @@ def _ffpa_attn_backward(
         headdim,
         IS_CAUSAL=causal,
         DTYPE=DTYPE,
-        BLOCK_M=128,
-        BLOCK_N=32,
-        BLOCK_HEADDIM=128,
+        BLOCK_M=64,
+        BLOCK_N=64,
+        BLOCK_HEADDIM=128 if headdim <= 512 else 64,
         num_warps=8,
         num_stages=2,
       )
   else:
     # v1: split-kv (current), grid = (K-column blocks, B*Nh).
-    def grid(meta):
+    def grid(meta: dict) -> tuple[int, ...]:
       return (triton.cdiv(seqlen_k, meta["BLOCK_N"]), batch * nheads)
 
     if autotune:
@@ -1019,9 +1026,9 @@ def _ffpa_attn_backward(
         IS_CAUSAL=causal,
         SEQUENCE_PARALLEL=True,
         DTYPE=DTYPE,
-        BLOCK_M=128,
-        BLOCK_N=32,
-        BLOCK_HEADDIM=128,
+        BLOCK_M=64,
+        BLOCK_N=64,
+        BLOCK_HEADDIM=128 if headdim <= 512 else 64,
         num_warps=8,
         num_stages=2,
       )

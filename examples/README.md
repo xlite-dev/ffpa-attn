@@ -3,13 +3,15 @@
 
 ```bash
 python3 examples/ffpa_attn_fwd.py
-python3 examples/ffpa_attn_bwd.py
+python3 examples/ffpa_attn_bwd.py --backward-backend triton --autotune
 ```
 
 - `examples/ffpa_attn_fwd.py`: forward-only examples for self-attn, cross-attn, GQA, causal, and non-aligned seqlen.
 - `examples/ffpa_attn_bwd.py`: end2end forward + backward examples for self-attn, cross-attn, GQA, causal, and non-aligned seqlen.
 
 Env: NVIDIA L20 (Ada), PyTorch 2.11, CUDA 13.0, Headdim=512 (FA-2 not supported).
+
+### Forward Pass (CUDA)
 
 | Case | dtype | Nq/Nkv | allclose | FFPA / SDPA | speedup |
 |:---:|:---:|:---:|:---:|:---:|:---:|
@@ -23,3 +25,18 @@ Env: NVIDIA L20 (Ada), PyTorch 2.11, CUDA 13.0, Headdim=512 (FA-2 not supported)
 | gqa | bf16 | 8192/8192 | ✅ | 46.2 / 74.7 ms | 1.62x |
 | causal | bf16 | 8192/8192 | ✅ | 24.2 / 37.5 ms | 1.55x |
 | non-aligned | bf16 | 8191/8191 | ✅ | 12.3 / 19.0 ms | 1.55x |
+
+### Backward Pass (Triton w/ autotune)
+
+| Case | dtype | Nq/Nkv | allclose | FFPA / SDPA | speedup |
+|:---:|:---:|:---:|:---:|:---:|:---:|
+| self-attn | fp16 | 8192/8192 | ✅ | 255.9 / 429.2 ms | 1.68x |
+| cross-attn | fp16 | 1024/8192 | ✅ | 36.54 / 54.41 ms | 1.49x |
+| gqa | fp16 | 8192/8192 | ✅ | 256.4 / 425.3 ms | 1.66x |
+| causal | fp16 | 8192/8192 | ✅ | 132.9 / 240.2 ms | 1.81x |
+| non-aligned | fp16 | 8191/8191 | ✅ | 68.59 / 118.4 ms | 1.73x |
+| self-attn | bf16 | 8192/8192 | ✅ | 255.2 / 425.3 ms | 1.67x |
+| cross-attn | bf16 | 1024/8192 | ✅ | 36.34 / 54.50 ms | 1.50x |
+| gqa | bf16 | 8192/8192 | ✅ | 255.7 / 425.6 ms | 1.66x |
+| causal | bf16 | 8192/8192 | ✅ | 132.6 / 237.7 ms | 1.79x |
+| non-aligned | bf16 | 8191/8191 | ✅ | 68.44 / 118.3 ms | 1.73x |
