@@ -19,38 +19,39 @@ import torch
 import triton
 import triton.language as tl
 
+_MAX_HEADDIM = 1024
+
+
+@triton.jit
+def _update_o_accs(o_accs, v_group: tl.constexpr, o_acc):
+  return o_accs[:v_group] + (o_acc, ) + o_accs[v_group + 1:]
+
 
 def _gen_fwd_autotune_configs() -> list[triton.Config]:
   """Generate autotune configs for the single FFPA Triton forward kernel.
 
-  The search space mirrors the backward module style: tune Q/K tile sizes,
-  D-chunk sizes, warp count, and pipeline depth.  ``BLOCK_HEADDIM_O`` controls
-  how much of the output head dimension is accumulated at once inside the one
-  forward kernel; it is not a kernel-version selector.
+  The search space is intentionally compact: tune Q/K tile sizes, QK D-chunk
+  size, output D-block size, warp count, and pipeline depth. Keep the D blocks
+  small (<=64) so accumulator pressure stays low enough to favor larger Q
+  blocks.
   """
   configs = []
-  for block_m in [16, 32, 64]:
-    for block_n in [32, 64, 128]:
-      for block_headdim_qk in [64, 128, 256]:
-        for block_headdim_o in [64, 128]:
-          for num_d_acc in [1, 2, 4]:
-            for num_warps in [4, 8]:
-              for num_stages in [2, 3]:
-                if block_m * block_headdim_o * num_d_acc > 8192:
-                  continue
-                configs.append(
-                  triton.Config(
-                    {
-                      "BLOCK_M": block_m,
-                      "BLOCK_N": block_n,
-                      "BLOCK_HEADDIM_QK": block_headdim_qk,
-                      "BLOCK_HEADDIM_O": block_headdim_o,
-                      "NUM_D_ACC": num_d_acc,
-                    },
-                    num_warps=num_warps,
-                    num_stages=num_stages,
-                  )
-                )
+  for block_m in [64, 128]:
+    for block_headdim in [32, 64, 128]:
+      for num_warps in [4, 8]:
+        for num_stages in [2, 3]:
+          configs.append(
+            triton.Config(
+              {
+                "BLOCK_M": block_m,
+                "BLOCK_N": 64,
+                "BLOCK_HEADDIM_QK": block_headdim,
+                "BLOCK_HEADDIM_V": block_headdim,
+              },
+              num_warps=num_warps,
+              num_stages=num_stages,
+            )
+          )
   return configs
 
 
@@ -58,6 +59,7 @@ _FFPA_FWD_AUTOTUNE_CONFIGS = _gen_fwd_autotune_configs()
 _FFPA_FWD_HEURISTICS = {
   "EVEN_M": lambda args: args["seqlen_q"] % args["BLOCK_M"] == 0,
   "EVEN_N": lambda args: args["seqlen_k"] % args["BLOCK_N"] == 0,
+  "NUM_V_GROUPS": lambda args: triton.cdiv(args["HEADDIM"], args["BLOCK_HEADDIM_V"]),
 }
 
 
@@ -87,16 +89,16 @@ def _ffpa_fwd_kernel_impl(
   seqlen_q: int,
   seqlen_k: int,
   seqlen_q_rounded: int,
-  headdim: int,
   IS_CAUSAL: tl.constexpr,
   DTYPE: tl.constexpr,
+  HEADDIM: tl.constexpr,
   EVEN_M: tl.constexpr,
   EVEN_N: tl.constexpr,
   BLOCK_M: tl.constexpr,
   BLOCK_N: tl.constexpr,
   BLOCK_HEADDIM_QK: tl.constexpr,
-  BLOCK_HEADDIM_O: tl.constexpr,
-  NUM_D_ACC: tl.constexpr,
+  BLOCK_HEADDIM_V: tl.constexpr,
+  NUM_V_GROUPS: tl.constexpr,
 ) -> None:
   """Single-kernel Split-D FFPA forward."""
   start_m = tl.program_id(0)
@@ -115,123 +117,81 @@ def _ffpa_fwd_kernel_impl(
   offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
   offs_n = tl.arange(0, BLOCK_N)
   offs_d_qk = tl.arange(0, BLOCK_HEADDIM_QK)
-  offs_d_o = tl.arange(0, BLOCK_HEADDIM_O)
+  offs_d_v = tl.arange(0, BLOCK_HEADDIM_V)
 
-  num_qk_d_chunks = tl.cdiv(headdim, BLOCK_HEADDIM_QK)
-  num_o_d_chunks = tl.cdiv(headdim, BLOCK_HEADDIM_O)
-  num_o_groups = tl.cdiv(num_o_d_chunks, NUM_D_ACC)
+  num_qk_d_chunks = tl.cdiv(HEADDIM, BLOCK_HEADDIM_QK)
   kv_offset = seqlen_k - seqlen_q
 
-  for o_group in range(num_o_groups):
-    o_chunk0 = o_group * NUM_D_ACC
-    o_d0 = o_chunk0 * BLOCK_HEADDIM_O + offs_d_o
-    o_d1 = (o_chunk0 + 1) * BLOCK_HEADDIM_O + offs_d_o
-    o_d2 = (o_chunk0 + 2) * BLOCK_HEADDIM_O + offs_d_o
-    o_d3 = (o_chunk0 + 3) * BLOCK_HEADDIM_O + offs_d_o
+  m_i = tl.full([BLOCK_M], -float("inf"), dtype=tl.float32)
+  l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
+  zero_acc = tl.zeros([BLOCK_M, BLOCK_HEADDIM_V], dtype=tl.float32)
+  # Mirrors CUDA fwd's R_D registers: one O accumulator per V head-dim slice.
+  # Each accumulator is rescaled by the online-softmax alpha before adding
+  # the current P @ V_slice contribution.
+  o_accs = (zero_acc, ) * NUM_V_GROUPS
 
-    m_i = tl.full([BLOCK_M], -float("inf"), dtype=tl.float32)
-    l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
-    acc0 = tl.zeros([BLOCK_M, BLOCK_HEADDIM_O], dtype=tl.float32)
-    acc1 = tl.zeros([BLOCK_M, BLOCK_HEADDIM_O], dtype=tl.float32)
-    acc2 = tl.zeros([BLOCK_M, BLOCK_HEADDIM_O], dtype=tl.float32)
-    acc3 = tl.zeros([BLOCK_M, BLOCK_HEADDIM_O], dtype=tl.float32)
+  for start_n in range(0, seqlen_k, BLOCK_N):
+    start_n = tl.multiple_of(start_n, BLOCK_N)
+    offs_kv = start_n + offs_n
 
-    for start_n in range(0, seqlen_k, BLOCK_N):
-      start_n = tl.multiple_of(start_n, BLOCK_N)
-      offs_kv = start_n + offs_n
-
-      scores = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
-      for qk_d_chunk in range(num_qk_d_chunks):
-        qk_d_start = qk_d_chunk * BLOCK_HEADDIM_QK
-        qk_d = qk_d_start + offs_d_qk
-        q = tl.load(
-          Q + offs_m[:, None] * stride_qm + qk_d[None, :],
-          mask=(offs_m[:, None] < seqlen_q) & (qk_d[None, :] < headdim),
-          other=0.0,
-        )
-        k = tl.load(
-          K + offs_kv[:, None] * stride_kn + qk_d[None, :],
-          mask=(offs_kv[:, None] < seqlen_k) & (qk_d[None, :] < headdim),
-          other=0.0,
-        )
-        scores = tl.dot(q, tl.trans(k), acc=scores)
-
-      scores = scores * softmax_scale
-      if not EVEN_N:
-        scores = tl.where(offs_kv[None, :] < seqlen_k, scores, -float("inf"))
-      if IS_CAUSAL:
-        causal_mask = offs_kv[None, :] <= (offs_m[:, None] + kv_offset)
-        scores = tl.where(causal_mask, scores, -float("inf"))
-
-      m_new = tl.maximum(m_i, tl.max(scores, axis=1))
-      alpha = tl.exp(m_i - m_new)
-      p = tl.exp(scores - m_new[:, None])
-      l_new = l_i * alpha + tl.sum(p, axis=1)
-
-      p_cast = p.to(DTYPE)
-      v0 = tl.load(
-        V + offs_kv[:, None] * stride_vn + o_d0[None, :],
-        mask=(offs_kv[:, None] < seqlen_k) & (o_d0[None, :] < headdim),
+    scores = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+    for qk_d_chunk in range(num_qk_d_chunks):
+      qk_d_start = qk_d_chunk * BLOCK_HEADDIM_QK
+      qk_d = qk_d_start + offs_d_qk
+      q = tl.load(
+        Q + offs_m[:, None] * stride_qm + qk_d[None, :],
+        mask=(offs_m[:, None] < seqlen_q) & (qk_d[None, :] < HEADDIM),
         other=0.0,
       )
-      acc0 = acc0 * alpha[:, None] + tl.dot(p_cast, v0)
-      if NUM_D_ACC >= 2:
-        v1 = tl.load(
-          V + offs_kv[:, None] * stride_vn + o_d1[None, :],
-          mask=(offs_kv[:, None] < seqlen_k) & (o_d1[None, :] < headdim),
-          other=0.0,
-        )
-        acc1 = acc1 * alpha[:, None] + tl.dot(p_cast, v1)
-      if NUM_D_ACC >= 3:
-        v2 = tl.load(
-          V + offs_kv[:, None] * stride_vn + o_d2[None, :],
-          mask=(offs_kv[:, None] < seqlen_k) & (o_d2[None, :] < headdim),
-          other=0.0,
-        )
-        acc2 = acc2 * alpha[:, None] + tl.dot(p_cast, v2)
-      if NUM_D_ACC >= 4:
-        v3 = tl.load(
-          V + offs_kv[:, None] * stride_vn + o_d3[None, :],
-          mask=(offs_kv[:, None] < seqlen_k) & (o_d3[None, :] < headdim),
-          other=0.0,
-        )
-        acc3 = acc3 * alpha[:, None] + tl.dot(p_cast, v3)
-      m_i = m_new
-      l_i = l_new
+      k = tl.load(
+        K + offs_kv[:, None] * stride_kn + qk_d[None, :],
+        mask=(offs_kv[:, None] < seqlen_k) & (qk_d[None, :] < HEADDIM),
+        other=0.0,
+      )
+      scores = tl.dot(q, tl.trans(k), acc=scores)
 
-    out0 = acc0 / (l_i[:, None] + 1.0e-10)
+    scores = scores * softmax_scale
+    if not EVEN_N:
+      scores = tl.where(offs_kv[None, :] < seqlen_k, scores, -float("inf"))
+    if IS_CAUSAL:
+      causal_mask = offs_kv[None, :] <= (offs_m[:, None] + kv_offset)
+      scores = tl.where(causal_mask, scores, -float("inf"))
+
+    m_new = tl.maximum(m_i, tl.max(scores, axis=1))
+    alpha = tl.exp(m_i - m_new)
+    p = tl.exp(scores - m_new[:, None])
+    l_new = l_i * alpha + tl.sum(p, axis=1)
+    p = p.to(DTYPE)
+
+    # Reuse the same softmax tile for all V slices, matching FFPA CUDA fwd:
+    # R_D[j] = alpha * R_D[j] + P @ V_j. This avoids recomputing QK/softmax
+    # per output head-dim group while keeping Split-D register pressure bounded.
+    for v_group in tl.static_range(0, NUM_V_GROUPS):
+      o_d = BLOCK_HEADDIM_V * v_group + offs_d_v
+      v = tl.load(
+        V + offs_kv[:, None] * stride_vn + o_d[None, :],
+        mask=(offs_kv[:, None] < seqlen_k) & (o_d[None, :] < HEADDIM),
+        other=0.0,
+      )
+      o_acc = o_accs[v_group] * alpha[:, None] + tl.dot(p, v)
+      o_accs = _update_o_accs(o_accs, v_group, o_acc)
+    m_i = m_new
+    l_i = l_new
+
+  for v_group in tl.static_range(0, NUM_V_GROUPS):
+    o_d = BLOCK_HEADDIM_V * v_group + offs_d_v
+    out = o_accs[v_group] / (l_i[:, None] + 1.0e-10)
     tl.store(
-      O + offs_m[:, None] * stride_om + o_d0[None, :],
-      out0.to(DTYPE),
-      mask=(offs_m[:, None] < seqlen_q) & (o_d0[None, :] < headdim),
+      O + offs_m[:, None] * stride_om + o_d[None, :],
+      out.to(DTYPE),
+      mask=(offs_m[:, None] < seqlen_q) & (o_d[None, :] < HEADDIM),
     )
-    if NUM_D_ACC >= 2:
-      out1 = acc1 / (l_i[:, None] + 1.0e-10)
-      tl.store(
-        O + offs_m[:, None] * stride_om + o_d1[None, :],
-        out1.to(DTYPE),
-        mask=(offs_m[:, None] < seqlen_q) & (o_d1[None, :] < headdim),
-      )
-    if NUM_D_ACC >= 3:
-      out2 = acc2 / (l_i[:, None] + 1.0e-10)
-      tl.store(
-        O + offs_m[:, None] * stride_om + o_d2[None, :],
-        out2.to(DTYPE),
-        mask=(offs_m[:, None] < seqlen_q) & (o_d2[None, :] < headdim),
-      )
-    if NUM_D_ACC >= 4:
-      out3 = acc3 / (l_i[:, None] + 1.0e-10)
-      tl.store(
-        O + offs_m[:, None] * stride_om + o_d3[None, :],
-        out3.to(DTYPE),
-        mask=(offs_m[:, None] < seqlen_q) & (o_d3[None, :] < headdim),
-      )
-    tl.store(LSE + offs_m, m_i + tl.log(l_i), mask=offs_m < seqlen_q)
+  tl.store(LSE + offs_m, m_i + tl.log(l_i), mask=offs_m < seqlen_q)
 
 
 _ffpa_fwd_autotune = triton.autotune(
   configs=_FFPA_FWD_AUTOTUNE_CONFIGS,
-  key=["seqlen_q", "seqlen_k", "headdim"],
+  key=["seqlen_q", "seqlen_k", "HEADDIM"],
   cache_results=True,
 )(_ffpa_fwd_kernel_impl)
 
@@ -270,6 +230,8 @@ def _ffpa_attn_forward_impl(
   assert q.dtype in (torch.float16, torch.bfloat16)
   assert lse.dtype == torch.float32
   assert q.stride(-1) == k.stride(-1) == v.stride(-1) == o.stride(-1) == 1
+  if headdim > _MAX_HEADDIM:
+    raise ValueError(f"Triton forward supports headdim <= {_MAX_HEADDIM}, got {headdim}")
 
   DTYPE = tl.float16 if q.dtype == torch.float16 else tl.bfloat16
 
@@ -301,9 +263,9 @@ def _ffpa_attn_forward_impl(
       seqlen_q,
       seqlen_k,
       seqlen_q_rounded,
-      headdim,
       IS_CAUSAL=causal,
       DTYPE=DTYPE,
+      HEADDIM=headdim,
     )
   else:
     _ffpa_fwd[grid](
@@ -330,15 +292,14 @@ def _ffpa_attn_forward_impl(
       seqlen_q,
       seqlen_k,
       seqlen_q_rounded,
-      headdim,
       IS_CAUSAL=causal,
       DTYPE=DTYPE,
-      BLOCK_M=16,
+      HEADDIM=headdim,
+      BLOCK_M=128,
       BLOCK_N=64,
       BLOCK_HEADDIM_QK=64,
-      BLOCK_HEADDIM_O=128,
-      NUM_D_ACC=4,
-      num_warps=4,
+      BLOCK_HEADDIM_V=64,
+      num_warps=8,
       num_stages=2,
     )
 

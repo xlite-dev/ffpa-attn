@@ -42,7 +42,7 @@ _ACC_F32 = 1
 
 
 @dataclass(frozen=True)
-class FFPAMeta:
+class FFPAAttnMeta:
   """Non-tensor FFPA options passed through the autograd Function.
 
   :param causal: Whether to apply lower-right causal masking.
@@ -214,7 +214,7 @@ class FFPAAttnFunc(torch.autograd.Function):
     k: torch.Tensor,
     v: torch.Tensor,
     o: torch.Tensor | None,
-    meta: FFPAMeta,
+    meta: FFPAAttnMeta,
   ) -> torch.Tensor:
     is_grad = meta.is_grad_enabled and any(x.requires_grad for x in [q, k, v])
 
@@ -598,7 +598,7 @@ def ffpa_attn_func(
     K,
     V,
     O,
-    FFPAMeta(
+    FFPAAttnMeta(
       causal=bool(causal),
       softmax_scale=float(softmax_scale),
       stages=int(stages),
