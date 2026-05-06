@@ -941,9 +941,9 @@ def _ffpa_attn_backward_triton(
         headdim,
         IS_CAUSAL=causal,
         DTYPE=DTYPE,
-        BLOCK_M=64,
+        BLOCK_M=128,
         BLOCK_N=64,
-        BLOCK_HEADDIM=128 if headdim <= 512 else 64,
+        BLOCK_HEADDIM=64,
         num_warps=8,
         num_stages=2,
       )
@@ -1035,9 +1035,9 @@ def _ffpa_attn_backward_triton(
         IS_CAUSAL=causal,
         SEQUENCE_PARALLEL=True,
         DTYPE=DTYPE,
-        BLOCK_M=64,
+        BLOCK_M=128,
         BLOCK_N=64,
-        BLOCK_HEADDIM=128 if headdim <= 512 else 64,
+        BLOCK_HEADDIM=64,
         num_warps=8,
         num_stages=2,
       )
