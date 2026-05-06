@@ -94,9 +94,11 @@ def _ffpa_bwd_pre_impl(
 def _gen_pre_autotune_configs() -> list[triton.Config]:
   """Generate autotune configs for the preprocess delta kernel.
 
-    BLOCK_HEADDIM is excluded from autotune — it must be >= headdim
-    (no D-chunk loop) and is derived from the runtime ``headdim`` via
-    ``_FFPA_BWD_PRE_HEURISTICS``.
+  ``BLOCK_HEADDIM`` is excluded from autotune because it must cover the full
+  runtime head dimension; ``_FFPA_BWD_PRE_HEURISTICS`` derives it from
+  ``headdim``.
+
+  :return: Triton autotune configurations for the delta preprocess kernel.
   """
   configs = []
   for block_m in [64, 128, 256]:
@@ -292,22 +294,20 @@ def ffpa_bwd_v1_kernel(
 #                                 call at each shape benchmarks all configs
 #                                 (~4-6s) then caches the best.
 #
-#   _ffpa_bwd_v1           — direct call without autotune.  Uses the
-#                                 known-best config (BLOCK_M=128, BLOCK_N=32,
-#                                 BLOCK_HEADDIM=128, num_warps=8,
-#                                 num_stages=2) discovered on Ampere.
-#                                 for D=512.  Suitable for production use
-#                                 where predictable launch latency matters.
+#   _ffpa_bwd_v1           — direct call without autotune. The Python launcher
+#                                 supplies the fixed fallback tile config.
 # ---------------------------------------------------------------------------
 
 
 def _gen_bwd_autotune_configs() -> list[triton.Config]:
   """Generate autotune configs over BLOCK_M, BLOCK_N, BLOCK_HEADDIM, num_warps, num_stages.
 
-    NOTE: ATOMIC_ADD is intentionally excluded.  With SEQUENCE_PARALLEL=True
-    (persistent kernel, always enabled) every column-block program writes to
-    the same dQ positions, so atomic-add is required for correctness.
-    ATOMIC_ADD=False would produce data-raced dQ gradients.
+  ``ATOMIC_ADD`` is intentionally excluded from autotune. In the v1
+  column-parallel path, every K-column-block program can update the same dQ
+  rows, so dQ atomic-add is required for correctness.
+
+  :return: Triton autotune configurations shared by the v1 and v2 backward
+      kernels.
   """
   # BLOCK_M: larger = fewer Q-block iterations (good), more register pressure.
   # BLOCK_N:
@@ -767,20 +767,27 @@ def _ffpa_attn_backward(
   autotune: bool = False,
   kernel_version: str = "v2",
 ) -> None:
-  """
-    FFPA backward entry point.
+  """Run the Triton FFPA Split-D backward kernels.
 
-    The kernel uses three strides per tensor:
-        stride_qb  — batch stride   (distance between consecutive batch elements)
-        stride_qh  — head stride    (distance between consecutive heads)
-        stride_qm  — row stride     (distance between consecutive seqlen rows)
-
-    For FFPA layout [B, Nh, Nq, D] these are naturally:
-        stride_qb = q.stride(0) = Nh * Nq * D
-        stride_qh = q.stride(1) = Nq * D
-        stride_qm = q.stride(2) = D
-
-    LSE and delta are indexed linearly: offset = (batch * Nh + head) * Nq_rounded + row.
+  :param do: Upstream output gradient with layout ``[B, Nh, Nq, D]``.
+  :param q: Query tensor saved from forward, layout ``[B, Nh, Nq, D]``.
+  :param k: Key tensor saved from forward, layout ``[B, Nh, Nk, D]``.
+  :param v: Value tensor saved from forward, layout ``[B, Nh, Nk, D]``.
+  :param o: Forward output tensor, layout ``[B, Nh, Nq, D]``.
+  :param lse: Forward softmax log-sum-exp tensor with visible layout
+    ``[B, Nh, Nq]`` and storage rounded on the last dimension.
+  :param dq: Query-gradient output tensor, written in place.
+  :param dk: Key-gradient output tensor, written in place.
+  :param dv: Value-gradient output tensor, written in place.
+  :param causal: Whether the forward pass used lower-triangular causal
+    masking.
+  :param softmax_scale: Scale applied to ``Q @ K.T``. Defaults to
+    ``1 / sqrt(D)`` when ``None``.
+  :param autotune: Whether to run Triton's autotuner for the preprocess and
+    selected backward kernel.
+  :param kernel_version: Backward kernel variant to launch. ``"v2"`` uses the
+    shared-pid split-D kernel without dQ atomics; any other value selects the
+    v1 column-parallel kernel.
   """
   if do.stride(-1) != 1:
     do = do.contiguous()
@@ -939,7 +946,7 @@ def _ffpa_attn_backward(
         num_stages=2,
       )
   else:
-    # v1: split-kv (current), grid = (K-column blocks, B*Nh).
+    # v1: column-parallel split-D, grid = (K-column blocks, B*Nh).
     def grid(meta: dict) -> tuple[int, ...]:
       return (triton.cdiv(seqlen_k, meta["BLOCK_N"]), batch * nheads)
 

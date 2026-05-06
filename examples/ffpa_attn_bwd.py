@@ -12,6 +12,7 @@ PyTorch SDPA for backward correctness and end-to-end forward+backward runtime:
 Usage::
 
     CUDA_VISIBLE_DEVICES=0 python examples/ffpa_attn_bwd.py
+    CUDA_VISIBLE_DEVICES=0 python examples/ffpa_attn_bwd.py --backward-backend triton --autotune
 """
 
 from __future__ import annotations
