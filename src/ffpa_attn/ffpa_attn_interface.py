@@ -13,6 +13,7 @@ has the log-sum-exp statistics it needs without re-running attention.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import math
 import warnings
 
@@ -24,6 +25,7 @@ from ._C import ffpa_attn_forward as _ffpa_attn_fwd_cuda
 from ._C import ffpa_attn_backward as _ffpa_attn_bwd_cuda
 
 from .triton import _ffpa_attn_backward as _ffpa_attn_backward_triton
+from .triton import _ffpa_attn_forward as _ffpa_attn_forward_triton
 
 # The SM90 TMA large-d kernel only widens the K box to 64 fp16 cols
 # (SWIZZLE_128B) when the head dim satisfies these constraints; outside
@@ -37,6 +39,39 @@ _TMA_HEADDIM_ALIGN = 64
 # acc encoding kept in sync with csrc/pybind/ffpa_attn_api.cc::ffpa_attn.
 _ACC_F16 = 0
 _ACC_F32 = 1
+
+
+@dataclass(frozen=True)
+class FFPAMeta:
+  """Non-tensor FFPA options passed through the autograd Function.
+
+  :param causal: Whether to apply lower-right causal masking.
+  :param softmax_scale: Scale applied to ``QK^T``.
+  :param stages: CUDA forward pipeline stages.
+  :param acc: Native CUDA accumulator code.
+  :param tma: Whether to request the CUDA TMA path.
+  :param is_grad_enabled: Grad-mode state captured at the public API.
+  :param high_precision_grad: Whether SDPA backward should upcast.
+  :param forward_backend: Forward backend name, ``"cuda"`` or ``"triton"``.
+  :param triton_forward_autotune: Whether to enable Triton forward autotune.
+  :param backward_backend: Backward backend name.
+  :param triton_backward_autotune: Whether to enable Triton backward autotune.
+  :param triton_backward_version: Triton backward kernel version.
+  """
+
+  causal: bool
+  softmax_scale: float
+  stages: int
+  acc: int
+  tma: int
+  is_grad_enabled: bool
+  high_precision_grad: bool
+  forward_backend: str
+  triton_forward_autotune: bool
+  backward_backend: str
+  triton_backward_autotune: bool
+  triton_backward_version: str
+
 
 _OP_NAMESPACE = "ffpa_attn"
 _OP_NAME = "attn"
@@ -179,31 +214,34 @@ class FFPAAttnFunc(torch.autograd.Function):
     k: torch.Tensor,
     v: torch.Tensor,
     o: torch.Tensor | None,
-    causal: bool,
-    softmax_scale: float,
-    stages: int,
-    acc: int,
-    tma: int,
-    is_grad_enabled: bool,
-    high_precision_grad: bool,
-    backward_backend: str,
-    # options for Triton backward (only effective when backward_backend="triton")
-    triton_backward_autotune: bool,
-    triton_backward_version: str,
+    meta: FFPAMeta,
   ) -> torch.Tensor:
-    is_grad = is_grad_enabled and any(x.requires_grad for x in [q, k, v])
+    is_grad = meta.is_grad_enabled and any(x.requires_grad for x in [q, k, v])
 
-    O, lse = _ffpa_attn_forward_cuda(
-      q,
-      k,
-      v,
-      o,
-      stages,
-      acc,
-      int(bool(causal)),
-      softmax_scale,
-      tma,
-    )
+    if meta.forward_backend == "cuda":
+      O, lse = _ffpa_attn_forward_cuda(
+        q,
+        k,
+        v,
+        o,
+        meta.stages,
+        meta.acc,
+        int(bool(meta.causal)),
+        meta.softmax_scale,
+        meta.tma,
+      )
+    elif meta.forward_backend == "triton":
+      O, lse = _ffpa_attn_forward_triton(
+        q,
+        k,
+        v,
+        o,
+        bool(meta.causal),
+        meta.softmax_scale,
+        meta.triton_forward_autotune,
+      )
+    else:
+      raise ValueError(f"Unsupported forward_backend={meta.forward_backend!r}; choose 'cuda' or 'triton'.")
 
     if is_grad:
       ctx.save_for_backward(
@@ -213,19 +251,14 @@ class FFPAAttnFunc(torch.autograd.Function):
         O.contiguous(),
         lse,
       )
-      ctx.causal = causal
-      ctx.softmax_scale = softmax_scale
-      ctx.stages = stages
-      ctx.high_precision_grad = high_precision_grad
-      ctx.backward_backend = backward_backend
-      ctx.triton_backward_autotune = triton_backward_autotune
-      ctx.triton_backward_version = triton_backward_version
+      ctx.meta = meta
 
     return O
 
   @staticmethod
   def backward(ctx, grad_out: torch.Tensor):
     q, k, v, O, lse = ctx.saved_tensors
+    meta = ctx.meta
     D = q.size(-1)
     group_size = q.size(1) // k.size(1)
 
@@ -234,7 +267,7 @@ class FFPAAttnFunc(torch.autograd.Function):
     philox_offset = zero_u64[1].unsqueeze(0)
 
     if D > 256:
-      if ctx.backward_backend == "cuda":
+      if meta.backward_backend == "cuda":
         dq, dk, dv = _ffpa_attn_backward_cuda(
           q.contiguous(),
           k.contiguous(),
@@ -242,11 +275,11 @@ class FFPAAttnFunc(torch.autograd.Function):
           O.contiguous(),
           lse.contiguous(),
           grad_out.contiguous(),
-          ctx.stages,
-          int(bool(ctx.causal)),
-          ctx.softmax_scale,
+          meta.stages,
+          int(bool(meta.causal)),
+          meta.softmax_scale,
         )
-      elif ctx.backward_backend == "triton":
+      elif meta.backward_backend == "triton":
         # Pad LSE to seqlen_q_rounded (Triton kernel needs padded stride
         # for safe masked loads).
         seqlen_q = q.size(2)
@@ -277,10 +310,10 @@ class FFPAAttnFunc(torch.autograd.Function):
           dq=dq,
           dk=dk_gqa,
           dv=dv_gqa,
-          causal=ctx.causal,
-          softmax_scale=ctx.softmax_scale,
-          autotune=ctx.triton_backward_autotune,
-          kernel_version=ctx.triton_backward_version,
+          causal=meta.causal,
+          softmax_scale=meta.softmax_scale,
+          autotune=meta.triton_backward_autotune,
+          kernel_version=meta.triton_backward_version,
         )
 
         if group_size > 1:
@@ -307,7 +340,7 @@ class FFPAAttnFunc(torch.autograd.Function):
           lse_padded[..., :lse.size(-1)] = lse
           lse = lse_padded
 
-        if ctx.high_precision_grad:
+        if meta.high_precision_grad:
           _q = q.float()
           _k = k.float()
           _v = v.float()
@@ -331,8 +364,8 @@ class FFPAAttnFunc(torch.autograd.Function):
                 philox_seed, philox_offset,
                 0.0,
                 (True, True, True, False),
-                ctx.causal,
-                scale=ctx.softmax_scale,
+                meta.causal,
+                scale=meta.softmax_scale,
             )
         if group_size > 1:
           dk = dk_e.reshape(k.size(0), k.size(1), group_size, k.size(2), k.size(3)).sum(dim=2).to(k.dtype)
@@ -353,16 +386,14 @@ class FFPAAttnFunc(torch.autograd.Function):
         q.size(2),
         k.size(2),
         0.0,
-        ctx.causal,
+        meta.causal,
         philox_seed,
         philox_offset,
-        scale=ctx.softmax_scale,
+        scale=meta.softmax_scale,
       )
 
-    # Gradients for: q, k, v, o, causal, scale, stages, acc, tma,
-    # is_grad_enabled, high_precision_grad, backward_backend,
-    # triton_backward_autotune, triton_backward_version.
-    return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None
+    # Gradients for: q, k, v, o, meta.
+    return dq, dk, dv, None, None
 
 
 def ffpa_attn_func(
@@ -372,12 +403,19 @@ def ffpa_attn_func(
   O: torch.Tensor | None = None,
   causal: bool = False,
   softmax_scale: float | None = None,
+  # Below are specific to the forward and backward implementations and
+  # should have no effect on the autograd contract, but are exposed here
+  # for convenient experimentation without needing to rewrap the op or
+  # subclass the autograd Function.
   stages: int = 2,
   acc: str = "f32",
   tma: bool = False,
   high_precision_grad: bool = False,
+  # Options for Triton forward (only effective when forward_backend="triton")
+  forward_backend: str = "cuda",
+  triton_forward_autotune: bool = False,
+  # Options for Triton backward (only effective when backward_backend="triton")
   backward_backend: str = "sdpa",  # TODO: default to "triton" for better performance.
-  # options for Triton backward (only effective when backward_backend="triton")
   triton_backward_autotune: bool = False,  # TODO: default to True for better performance.
   triton_backward_version: str = "v2",
 ) -> torch.Tensor:
@@ -450,6 +488,15 @@ def ffpa_attn_func(
       the backward runs in the native dtype with automatic NaN detection:
       if NaN is found, fp32 is retried transparently.  Has no effect on the
       flash attention backward path (headdim <= 256).
+  :param forward_backend: Which forward implementation to use.
+      ``"cuda"`` (default) uses the native CUDA FFPA forward. ``"triton"``
+      uses the single Split-D Triton forward kernel, currently developed and
+      validated first for head dimensions 320 and 512.  The Triton path follows
+      FlashAttention v2's Q-block parallel schedule and writes natural-log LSE
+      values for compatibility with the Triton backward kernel.
+  :param triton_forward_autotune: Only meaningful when ``forward_backend="triton"``.
+      When ``True``, enable Triton's autotuner for the forward tile sizes,
+      D-chunk sizes, warp count, and pipeline depth.
   :param backward_backend: Which backward implementation to use.
       ``"sdpa"`` (default) delegates to PyTorch's SDPA backward kernels (stable)
       ``"triton"`` uses the Split-D Triton backward kernel, fastest when autotune is enabled,
@@ -481,6 +528,8 @@ def ffpa_attn_func(
       PTX instruction exists on supported architectures), or if
       ``causal=True`` is combined with ``Nkv < Nq``.
   """
+  assert forward_backend in ("cuda", "triton"), \
+    f"Unsupported forward_backend={forward_backend!r}; choose 'cuda' or 'triton'."
   assert backward_backend in ("sdpa", "triton", "cuda"), \
     f"Unsupported backward_backend={backward_backend!r}; choose 'sdpa', 'triton', or 'cuda'."
   if acc == "f32":
@@ -549,14 +598,18 @@ def ffpa_attn_func(
     K,
     V,
     O,
-    bool(causal),
-    float(softmax_scale),
-    int(stages),
-    acc_code,
-    int(bool(tma)),
-    torch.is_grad_enabled(),
-    bool(high_precision_grad),
-    str(backward_backend),
-    bool(triton_backward_autotune),
-    str(triton_backward_version),
+    FFPAMeta(
+      causal=bool(causal),
+      softmax_scale=float(softmax_scale),
+      stages=int(stages),
+      acc=acc_code,
+      tma=int(bool(tma)),
+      is_grad_enabled=torch.is_grad_enabled(),
+      high_precision_grad=bool(high_precision_grad),
+      forward_backend=str(forward_backend),
+      triton_forward_autotune=bool(triton_forward_autotune),
+      backward_backend=str(backward_backend),
+      triton_backward_autotune=bool(triton_backward_autotune),
+      triton_backward_version=str(triton_backward_version),
+    ),
   )

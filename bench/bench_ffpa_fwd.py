@@ -1,344 +1,218 @@
 import argparse
 import math
-import random
 import time
-from typing import Optional
 
-import numpy as np
 import torch
-from torch import Tensor
-from torch.nn import functional as F
-from torch.nn.attention import sdpa_kernel, SDPBackend
-try:
-  from flash_attn import flash_attn_func
-  has_flash_attn = True
-except ImportError:
-  flash_attn_func = None
-  has_flash_attn = False
+import torch.nn.functional as F
+
+from ffpa_attn import ffpa_attn_func  # noqa: E402
 
 
-def pretty_print_line(length: int = 150, m: str = "-"):
-  print(m * length)
-
-
-torch.set_grad_enabled(False)
-torch.set_printoptions(precision=6, threshold=8, edgeitems=3, linewidth=120, sci_mode=False)
-
-
-def get_args():
-  parser = argparse.ArgumentParser()
-  parser.add_argument("--no-rand-q", "--no-rq", action="store_true")
-  parser.add_argument("--no-rand-k", "--no-rk", action="store_true")
-  parser.add_argument("--no-rand-v", "--no-rv", action="store_true")
-  parser.add_argument("--no-rand-qkv", "--no-rqkv", action="store_true")
-  parser.add_argument("--run-torch-unfused", "--torch", action="store_true")
-  parser.add_argument("--run-flash-attn", "--flash", action="store_true")
-  parser.add_argument("--check", action="store_true")
-  parser.add_argument("--check-all", action="store_true")
-  parser.add_argument("--show-all", "--show", action="store_true")
-  parser.add_argument("--show-less", "--show-l", action="store_true")
-  parser.add_argument("--show-matrix", action="store_true")
-  parser.add_argument("--only-flops-matmul", "--flops-mm", action="store_true")
-  parser.add_argument("--B", type=int, default=None)
-  parser.add_argument("--H", type=int, default=None)
-  parser.add_argument("--N", type=int, default=None)
-  parser.add_argument("--D", type=int, default=None)
-  parser.add_argument("--MAX-D", "--MD", type=int, default=1024)
-  parser.add_argument("--seed", type=int, default=None)
-  parser.add_argument("--sleep", type=float, default=0.05)
-  parser.add_argument("--debug", action="store_true")
-  parser.add_argument("--verbose", "--v", action="store_true")
-  parser.add_argument("--warmup", "--w", type=int, default=1)
-  parser.add_argument("--iters", "--i", type=int, default=5)
-  parser.add_argument("--tag-hints", "--tags", "--hints", type=str, default=None)
-  parser.add_argument("--plot-flops", "--plot", action="store_true", help="Plot TFLOPS")
-  parser.add_argument("--save-dir", "--dir", type=str, default="tmp", help="Save dir for plot")
-  parser.add_argument("--save-tag", "--tag", type=str, default=None, help="Save name for plot")
-  parser.add_argument("--gen-bench-table", "--gen-bench", action="store_true")
+def parse_args():
+  parser = argparse.ArgumentParser(description="Benchmark FFPA forward backends against SDPA forward.")
+  parser.add_argument("--B", type=int, default=1)
+  parser.add_argument("--H", type=int, default=16)
+  parser.add_argument("--H-kv", type=int, default=None, help="KV heads for GQA/MQA. Defaults to H.")
+  parser.add_argument("--N", type=int, default=1024)
+  parser.add_argument("--N-kv", type=int, default=None, help="KV sequence length. Defaults to N.")
+  parser.add_argument("--D", type=int, default=320)
+  parser.add_argument("--dtype", choices=["fp16", "bf16"], default="fp16")
+  parser.add_argument("--causal", action="store_true")
+  parser.add_argument("--stages", type=int, default=2)
   parser.add_argument(
-    "--dtype",
-    choices=["fp16", "bf16"],
-    default="fp16",
-    help="Activation dtype. bf16 forces MMA acc=f32 (no bf16-acc mma PTX)."
+    "--compare-stages",
+    action="store_true",
+    help="Run CUDA stages 1, 2, and 3 side by side.",
   )
-
+  parser.add_argument(
+    "--compare-backends",
+    action="store_true",
+    help="Run CUDA, Triton, and SDPA forward side by side.",
+  )
+  parser.add_argument(
+    "--forward-backend",
+    choices=["cuda", "triton"],
+    default="triton",
+    help="Native forward backend to benchmark when not using a compare mode.",
+  )
+  parser.add_argument(
+    "--triton-forward-autotune",
+    "--autotune",
+    action="store_true",
+    help="Enable Triton FFPA forward autotuning (only effective for triton backend).",
+  )
+  parser.add_argument("--warmup", type=int, default=5)
+  parser.add_argument("--iters", type=int, default=20)
+  parser.add_argument("--seed", type=int, default=0)
   return parser.parse_args()
 
 
-args = get_args()
+def make_inputs(args):
+  torch.manual_seed(args.seed)
+  dtype = torch.float16 if args.dtype == "fp16" else torch.bfloat16
+  nheads_kv = args.H if args.H_kv is None else args.H_kv
+  seqlen_k = args.N if args.N_kv is None else args.N_kv
+  q = torch.randn(args.B, args.H, args.N, args.D, device="cuda", dtype=dtype)
+  k = torch.randn(args.B, nheads_kv, seqlen_k, args.D, device="cuda", dtype=dtype)
+  v = torch.randn(args.B, nheads_kv, seqlen_k, args.D, device="cuda", dtype=dtype)
+  return q, k, v
 
 
-def set_rand_seed(seed: int = 1):
-  random.seed(seed)
-  np.random.seed(seed)
-  torch.manual_seed(seed)
-  torch.cuda.manual_seed_all(seed)
+def sdpa_reference(q, k, v, causal, scale):
+  group_size = q.size(1) // k.size(1)
+  if group_size > 1:
+    k = k.repeat_interleave(group_size, dim=1)
+    v = v.repeat_interleave(group_size, dim=1)
+  if causal and k.size(2) != q.size(2):
+    n_q, n_k = q.size(2), k.size(2)
+    kv_offset = n_k - n_q
+    row_idx = torch.arange(n_q, device=q.device).view(-1, 1)
+    col_idx = torch.arange(n_k, device=q.device).view(1, -1)
+    attn_mask = (col_idx <= (row_idx + kv_offset))
+    return F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, scale=scale)
+  return F.scaled_dot_product_attention(q, k, v, is_causal=causal, scale=scale)
 
 
-pretty_print_line()
-print(args)
-pretty_print_line()
-
-# The sole public Python API is ``ffpa_attn_func``: it dispatches by
-# ``Q.dtype`` + ``acc`` through a registered torch op. Bind two local
-# ``partial`` views to keep the call sites concise. Under bf16 there is
-# no bf16-acc mma PTX, so the "f16-acc" slot is routed to ``acc='f32'``.
-from functools import partial as _partial
-from ffpa_attn import ffpa_attn_func
-
-if args.dtype == "bf16":
-  ffpa_f16_acc = _partial(ffpa_attn_func, acc="f32")
-  ffpa_f32_acc = _partial(ffpa_attn_func, acc="f32")
-else:
-  ffpa_f16_acc = _partial(ffpa_attn_func, acc="f16")
-  ffpa_f32_acc = _partial(ffpa_attn_func, acc="f32")
+def tensor_max_abs_err(ref: torch.Tensor, actual: torch.Tensor) -> float:
+  """Return the maximum absolute error between two tensors."""
+  return (ref.float() - actual.float()).abs().max().item()
 
 
-def get_mha_tflops(B: int, H: int, N: int, D: int, secs: float = 1.0, only_matmul: bool = False):
-  flops_qk = B * H * N * N * (2 * D - 1)
-  flops_scaling = B * H * N * N
-  flops_row_max = B * H * N * (N - 1)
-  flops_subtract_max = B * H * N * N
-  flops_exp = B * H * N * N
-  flops_row_sum = B * H * N * (N - 1)
-  flops_normalization = B * H * N * N
-  flops_safe_softmax = (flops_row_max + flops_subtract_max + flops_exp + flops_row_sum + flops_normalization)
-  flops_pv = B * H * N * D * (2 * N - 1)
-  total_flops = flops_qk + flops_scaling + flops_safe_softmax + flops_pv
-  if only_matmul:
-    total_flops = flops_qk + flops_pv
-  tflops = total_flops * 1e-12 / (secs)
-  return tflops
+def tensor_mean_abs_err(ref: torch.Tensor, actual: torch.Tensor) -> float:
+  """Return the mean absolute error between two tensors."""
+  return (ref.float() - actual.float()).abs().mean().item()
 
 
-MAX_TFLOPS = -1
-STATIS_INFO: dict[str, list[float | int] | set] = {}
-STATIS_INFO["headdim"] = set()
-TOATL_TFLOPS: dict[str, float] = {}
-SDPA_TFLOPS = -1
+def print_abs_err(name, fn, ref, q, k, v):
+  """Print forward accuracy for one backend against the SDPA reference.
+
+  :param name: Label shown in benchmark output.
+  :param fn: Backend callable under test.
+  :param ref: SDPA reference output.
+  :param q: Query tensor.
+  :param k: Key tensor.
+  :param v: Value tensor.
+  """
+  out = fn(q, k, v).detach()
+  max_abs_err = tensor_max_abs_err(ref, out)
+  mean_abs_err = tensor_mean_abs_err(ref, out)
+  rtol = 1e-2 if q.dtype == torch.float16 else 2e-2
+  atol = rtol
+  allclose = torch.allclose(ref.float(), out.float(), rtol=rtol, atol=atol)
+  print(f"{name:>14}: allclose={allclose} max_abs_err={max_abs_err:.6e} mean_abs_err={mean_abs_err:.6e}")
 
 
-def run_benchmark(
-  perf_func: callable,
-  q: torch.Tensor,
-  k: torch.Tensor,
-  v: torch.Tensor,
-  tag: str,
-  out: Optional[torch.Tensor] = None,
-  s: Optional[torch.Tensor] = None,
-  stages: int = -1,
-  warmup: int = args.warmup,
-  iters: int = args.iters,
-  show_matrix: bool = args.show_matrix,
-  only_show_improved: bool = not args.show_all,
-):
-
-  global MAX_TFLOPS
-  global MAX_HEADDIM_CFG
-  global SDPA_TFLOPS
-
-  tag_hints: str = args.tag_hints
-  if tag_hints:
-    tag_hints: list = tag_hints.strip().split(",")
-    tag_hints.append("sdpa")
-    tag_hints.append("unfused")
-    hit_hints = False
-    for hint in tag_hints:
-      if hint in tag:
-        hit_hints = True
-    if not hit_hints:
-      return None, None
-
-  B, H, N, D = q.size()
-  if "flash" in tag:
-    B, N, H, D = q.size()
-
-  if "unfused" in tag and (not args.run_torch_unfused):
-    return None, None
-  if "flash" in tag and ((not args.run_flash_attn) or (not has_flash_attn) or (D > 256)):
-    return None, None
-
-  STATIS_INFO["headdim"].add(D)
-
-  max_supported_D = MAX_HEADDIM_CFG.get(tag, None)
-  if max_supported_D is not None:
-    if D > max_supported_D:
-      return None, None
-
-  if out is not None:
-    out.fill_(0)
-  if s is not None:
-    s.fill_(0)
-  if out is not None:
-    for i in range(warmup):
-      if stages >= 1:
-        if s is not None:
-          perf_func(q, k, v, out, s, stages)
-        else:
-          perf_func(q, k, v, out, stages=stages)
-      else:
-        perf_func(q, k, v, out)
-  else:
-    for i in range(warmup):
-      _ = perf_func(q, k, v)
-
+def time_forward(name, fn, q, k, v, warmup, iters):
+  for _ in range(warmup):
+    fn(q, k, v)
   torch.cuda.synchronize()
+
   start = time.time()
-  if out is not None:
-    for i in range(iters):
-      if stages >= 1:
-        if s is not None:
-          perf_func(q, k, v, out, s, stages)
-        else:
-          perf_func(q, k, v, out, stages=stages)
-      else:
-        perf_func(q, k, v, out)
-  else:
-    for i in range(iters):
-      out = perf_func(q, k, v)
+  for _ in range(iters):
+    fn(q, k, v)
   torch.cuda.synchronize()
-  end = time.time()
-  total_secs = end - start
-  total_time = (end - start) * 1000
-  mean_time = total_time / iters
-  mean_secs = total_secs / iters
-
-  TFLOPS = get_mha_tflops(B, H, N, D, mean_secs, only_matmul=args.only_flops_matmul)
-  if tag in STATIS_INFO:
-    STATIS_INFO[tag].append(int(round(TFLOPS)))
-  else:
-    STATIS_INFO[tag] = []
-    STATIS_INFO[tag].append(int(round(TFLOPS)))
-
-  if "sdpa" in tag:
-    SDPA_TFLOPS = TFLOPS
-  out_info = f"{tag}"
-  out_val_first = out.flatten()[:3].detach().float().cpu().numpy().tolist()
-  out_val_last = out.flatten()[-3:].detach().float().cpu().numpy().tolist()
-  out_val_first = [round(v, 8) for v in out_val_first]
-  out_val_last = [round(v, 8) for v in out_val_last]
-  if not args.show_less:
-    out_val = out_val_first[:2]
-    out_val.append(out_val_last[-1])
-  else:
-    out_val = out_val_first[:1]
-  out_val = [f"{v:<12}" for v in out_val]
-  if args.show_less:
-    out_val = [v.strip() for v in out_val]
-
-  if SDPA_TFLOPS > 0:
-    speedup_sdpa = TFLOPS / SDPA_TFLOPS
-  else:
-    speedup_sdpa = 1.0
-
-  if not show_matrix:
-    should_print = (speedup_sdpa >= MAX_TFLOPS) or (not only_show_improved) or ("sdpa" in tag)
-    if should_print:
-      print(f"{out_info:>65}: {out_val}, time:{mean_time:.6f}ms, TFLOPS:{TFLOPS:<6.2f}(~{speedup_sdpa:.2f}x)")
-  else:
-    print(f"{out_info:>42}: {out_val}, time:{mean_time:.6f}ms, TFLOPS:{TFLOPS:<6.2f}(~{speedup_sdpa:.2f}x)")
-
-  if speedup_sdpa > MAX_TFLOPS:
-    MAX_TFLOPS = speedup_sdpa
-
-  return out, mean_time
+  elapsed_ms = (time.time() - start) * 1000.0 / iters
+  print(f"{name:>14}: {elapsed_ms:.3f} ms")
+  return elapsed_ms
 
 
-def get_qkvo(B, H, N, D):
-  device = torch.device("cuda")
-  torch_dtype = torch.bfloat16 if args.dtype == "bf16" else torch.float16
-  q = torch.randn((B, H, N, D), device=device, dtype=torch_dtype)
-  k = torch.randn((B, H, N, D), device=device, dtype=torch_dtype)
-  v = torch.randn((B, H, N, D), device=device, dtype=torch_dtype)
-  o = torch.zeros((B, H, N, D), device=device, dtype=torch_dtype)
-
-  if args.no_rand_q or args.no_rand_qkv:
-    q.fill_(0.1)
-  if args.no_rand_k or args.no_rand_qkv:
-    k.fill_(0.1)
-  if args.no_rand_v or args.no_rand_qkv:
-    v.fill_(0.1)
-  return q, k, v, o
+def try_time_backend(name, fn, q, k, v, warmup, iters):
+  try:
+    return time_forward(name, fn, q, k, v, warmup, iters)
+  except RuntimeError as exc:
+    if "native forward was not compiled" in str(exc):
+      print(f"{name:>14}: unavailable ({exc})")
+      return None
+    raise
 
 
-def sdpa(q: Tensor, k: Tensor, v: Tensor):
-  with sdpa_kernel(SDPBackend.EFFICIENT_ATTENTION):
-    out: Tensor = F.scaled_dot_product_attention(q, k, v)
-    return out
-
-
-def unfused_standard_attn(q: Tensor, k: Tensor, v: Tensor):
-  att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(q.size(-1)))
-  att = torch.softmax(att, dim=-1)
-  out = att @ v
-  return out
-
-
-MAX_HEADDIM_CFG = {}
-
-
-def check_all_close(out_flash_or_sdpa: Tensor, out_mma: Tensor, tag: str = "out_mma", check_all: bool = False):
-  if args.run_torch_unfused:
-    pretty_print_line(m="-")
-  else:
-    pretty_print_line(m="=")
-  print(f"out_flash_or_sdpa: {out_flash_or_sdpa.shape}, {out_flash_or_sdpa.dtype}")
-  print(f"out_mma         : {out_mma.shape}, {out_mma.dtype}")
-  pretty_print_line(m="-")
-  out_flash_or_sdpa = out_flash_or_sdpa.float()
-  out_mma = out_mma.float()
-  rtol, atol = (1e-2, 1e-2) if args.dtype == "fp16" else (2e-2, 2e-2)
-  all_close = torch.allclose(out_flash_or_sdpa, out_mma, rtol=rtol, atol=atol)
-  max_diff = (out_flash_or_sdpa - out_mma).abs().max().item()
-  mean_diff = (out_flash_or_sdpa - out_mma).abs().mean().item()
-  print(f"{tag:<18}: allclose={all_close}, max_diff={max_diff:.8f}, mean_diff={mean_diff:.8f}")
-  if check_all:
-    diff = (out_flash_or_sdpa - out_mma).abs()
-    idx = torch.argmax(diff)
-    idx = np.unravel_index(idx.cpu().item(), diff.shape)
-    print(f"max_diff index: {idx}, out_flash_or_sdpa={out_flash_or_sdpa[idx]}, out_mma={out_mma[idx]}")
-  pretty_print_line(m="=")
+def backend_label(backend, stages):
+  if backend == "cuda":
+    return f"cuda_s{stages}"
+  return backend
 
 
 def main():
-  global MAX_HEADDIM_CFG
+  args = parse_args()
+  assert torch.cuda.is_available(), "CUDA is required"
+  q, k, v = make_inputs(args)
+  scale = 1.0 / math.sqrt(args.D)
 
-  B = args.B or 1
-  H = args.H or 48
-  N = args.N or 8192
-  D = args.D or 320
+  def make_native(backend, stages):
 
-  seed = args.seed if args.seed is not None else 1
-  set_rand_seed(seed)
+    def native(q_i, k_i, v_i):
+      return ffpa_attn_func(
+        q_i,
+        k_i,
+        v_i,
+        causal=args.causal,
+        softmax_scale=scale,
+        stages=stages,
+        acc="f32",
+        forward_backend=backend,
+        triton_forward_autotune=args.triton_forward_autotune,
+      )
 
-  q, k, v, o = get_qkvo(B, H, N, D)
+    return native
 
-  if has_flash_attn:
-    q_flash = q.transpose(1, 2).contiguous()
-    k_flash = k.transpose(1, 2).contiguous()
-    v_flash = v.transpose(1, 2).contiguous()
+  def sdpa(q_i, k_i, v_i):
+    return sdpa_reference(q_i, k_i, v_i, args.causal, scale)
 
-  if args.check or args.check_all:
-    out_sdpa = sdpa(q, k, v)
-    out_ffpa_f16 = ffpa_f16_acc(q, k, v)
-    out_ffpa_f32 = ffpa_f32_acc(q, k, v)
-    check_all_close(out_sdpa, out_ffpa_f16, tag="ffpa_f16_acc", check_all=args.check_all)
-    check_all_close(out_sdpa, out_ffpa_f32, tag="ffpa_f32_acc", check_all=args.check_all)
-    return
+  nheads_kv = args.H if args.H_kv is None else args.H_kv
+  seqlen_k = args.N if args.N_kv is None else args.N_kv
+  print(
+    f"shape B={args.B} Hq={args.H} Hkv={nheads_kv} Nq={args.N} Nkv={seqlen_k} "
+    f"D={args.D} dtype={args.dtype} causal={args.causal} "
+    f"autotune={args.triton_forward_autotune} warmup={args.warmup} iters={args.iters}"
+  )
+  ref = sdpa(q, k, v).detach()
 
-  pretty_print_line()
-  print(f"B={B}, H={H}, N={N}, D={D}, dtype={args.dtype}, warmup={args.warmup}, iters={args.iters}")
-  pretty_print_line()
-
-  out_sdpa, _ = run_benchmark(sdpa, q, k, v, "sdpa")
-  run_benchmark(ffpa_f16_acc, q, k, v, "ffpa-f16-acc")
-  run_benchmark(ffpa_f32_acc, q, k, v, "ffpa-f32-acc")
-
-  if args.run_torch_unfused:
-    run_benchmark(unfused_standard_attn, q, k, v, "torch-unfused")
-
-  if has_flash_attn and args.run_flash_attn and D <= 256:
-    run_benchmark(flash_attn_func, q_flash, k_flash, v_flash, "flash-attn")
+  if args.compare_backends:
+    cuda1 = make_native("cuda", 1)
+    cuda2 = make_native("cuda", 2)
+    triton = make_native("triton", 1)
+    cuda1_ms = try_time_backend("cuda_s1", cuda1, q, k, v, args.warmup, args.iters)
+    cuda2_ms = try_time_backend("cuda_s2", cuda2, q, k, v, args.warmup, args.iters)
+    triton_ms = try_time_backend("triton", triton, q, k, v, args.warmup, args.iters)
+    sdpa_ms = time_forward("sdpa", sdpa, q, k, v, args.warmup, args.iters)
+    if cuda1_ms is not None:
+      print(f"speedup cuda_s1: {sdpa_ms / cuda1_ms:.3f}x vs sdpa")
+    if cuda2_ms is not None:
+      print(f"speedup cuda_s2: {sdpa_ms / cuda2_ms:.3f}x vs sdpa")
+    if triton_ms is not None:
+      print(f"speedup triton: {sdpa_ms / triton_ms:.3f}x vs sdpa")
+      if cuda1_ms is not None:
+        print(f"triton/cuda_s1: {triton_ms / cuda1_ms:.3f}x time")
+      if cuda2_ms is not None:
+        print(f"triton/cuda_s2: {triton_ms / cuda2_ms:.3f}x time")
+    if cuda1_ms is not None:
+      print_abs_err("cuda_s1", cuda1, ref, q, k, v)
+    if cuda2_ms is not None:
+      print_abs_err("cuda_s2", cuda2, ref, q, k, v)
+    if triton_ms is not None:
+      print_abs_err("triton", triton, ref, q, k, v)
+  elif args.compare_stages:
+    cuda1 = make_native("cuda", 1)
+    cuda2 = make_native("cuda", 2)
+    cuda3 = make_native("cuda", 3)
+    cuda1_ms = time_forward("cuda_s1", cuda1, q, k, v, args.warmup, args.iters)
+    cuda2_ms = time_forward("cuda_s2", cuda2, q, k, v, args.warmup, args.iters)
+    cuda3_ms = time_forward("cuda_s3", cuda3, q, k, v, args.warmup, args.iters)
+    sdpa_ms = time_forward("sdpa", sdpa, q, k, v, args.warmup, args.iters)
+    print(f"speedup cuda_s1: {sdpa_ms / cuda1_ms:.3f}x vs sdpa")
+    print(f"speedup cuda_s2: {sdpa_ms / cuda2_ms:.3f}x vs sdpa")
+    print(f"speedup cuda_s3: {sdpa_ms / cuda3_ms:.3f}x vs sdpa")
+    print_abs_err("cuda_s1", cuda1, ref, q, k, v)
+    print_abs_err("cuda_s2", cuda2, ref, q, k, v)
+    print_abs_err("cuda_s3", cuda3, ref, q, k, v)
+  else:
+    native = make_native(args.forward_backend, args.stages)
+    backend_name = backend_label(args.forward_backend, args.stages)
+    native_ms = try_time_backend(backend_name, native, q, k, v, args.warmup, args.iters)
+    sdpa_ms = time_forward("sdpa", sdpa, q, k, v, args.warmup, args.iters)
+    if native_ms is not None:
+      print(f"speedup {backend_name}: {sdpa_ms / native_ms:.3f}x vs sdpa")
+      print_abs_err(backend_name, native, ref, q, k, v)
 
 
 if __name__ == "__main__":
