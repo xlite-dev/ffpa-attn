@@ -36,7 +36,17 @@ def parse_args():
     help="full measures forward+backward; backward-only times only the backward call after forward is ready.",
   )
   parser.add_argument(
-    "--autotune", action="store_true", help="Enable Triton autotuning (only effective for triton backend)."
+    "--triton-backward-autotune",
+    "--autotune",
+    action="store_true",
+    help="Enable Triton FFPA backward autotuning (only effective for triton backend)."
+  )
+  parser.add_argument(
+    "--triton-backward-version",
+    "--version",
+    type=str,
+    default="v2",
+    help="Enable Triton FFPA backward versioning (only effective for triton backend)."
   )
   parser.add_argument("--warmup", type=int, default=5)
   parser.add_argument("--iters", type=int, default=20)
@@ -139,7 +149,8 @@ def main():
         stages=stages,
         acc="f32",
         backward_backend=backend,
-        autotune=args.autotune,
+        triton_backward_autotune=args.triton_backward_autotune,
+        triton_backward_version=args.triton_backward_version,
       )
 
     return native
@@ -157,7 +168,8 @@ def main():
       stages=args.stages,
       acc="f32",
       backward_backend=args.backward_backend,
-      autotune=args.autotune,
+      triton_backward_autotune=args.triton_backward_autotune,
+      triton_backward_version=args.triton_backward_version,
     )
 
   def sdpa(q_i, k_i, v_i):
@@ -165,8 +177,8 @@ def main():
 
   print(
     f"shape B={args.B} H={args.H} N={args.N} D={args.D} dtype={args.dtype} "
-    f"causal={args.causal} mode={args.mode} autotune={args.autotune} "
-    f"warmup={args.warmup} iters={args.iters}"
+    f"causal={args.causal} mode={args.mode} autotune={args.triton_backward_autotune} "
+    f"version={args.triton_backward_version} warmup={args.warmup} iters={args.iters}"
   )
   timer = time_backward_only if args.mode == "backward-only" else time_backward
   if args.compare_backends:
