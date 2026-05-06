@@ -754,7 +754,7 @@ _ffpa_bwd_v2 = _ffpa_bwd_v2_kernel_impl
 # ---------------------------------------------------------------------------
 
 
-def _ffpa_attn_backward(
+def _ffpa_attn_backward_triton(
   do: torch.Tensor,
   q: torch.Tensor,
   k: torch.Tensor,

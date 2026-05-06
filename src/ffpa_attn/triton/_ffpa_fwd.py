@@ -309,7 +309,7 @@ def _ffpa_attn_forward_impl(
     )
 
 
-def _ffpa_attn_forward(
+def _ffpa_attn_forward_triton(
   Q: torch.Tensor,
   K: torch.Tensor,
   V: torch.Tensor,

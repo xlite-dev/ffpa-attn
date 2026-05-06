@@ -30,7 +30,7 @@ from ffpa_attn import ffpa_attn_func
 
 D = 512
 STAGES = 2
-WARMUP, ITERS = 2, 5
+WARMUP, ITERS = 5, 10
 
 
 def _parse_args() -> argparse.Namespace:

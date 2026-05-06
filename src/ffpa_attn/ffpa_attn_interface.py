@@ -1,9 +1,9 @@
-"""Torch custom op registration for FFPA prefill attention.
+"""Public Python interface for FFPA prefill attention.
 
-Wraps the single pybind entry ``ffpa_attn._C.ffpa_attn`` as a real
+The CUDA backend package registers the native forward kernel as a
 ``torch.library`` operator so callers (including ``torch.compile`` graphs)
-can reach the kernel through ``torch.ops.ffpa_attn.attn`` instead of
-calling the C-extension symbol directly.
+can reach it through ``torch.ops.ffpa_attn.attn`` instead of calling the
+C-extension symbol directly.
 
 Backward pass delegates to PyTorch SDPA backward functions, routing by
 headdim: flash_attention_backward for D <= 256, efficient_attention_backward
@@ -19,13 +19,10 @@ import warnings
 
 import torch
 
-from ._C import ffpa_attn_forward as _ffpa_attn_fwd_cuda
-# NOTE: The native backward kernels are currently slower than PyTorch's SDPA EA backward;
-# they are kept for experimentation and as a foundation for future optimised implementations.
-from ._C import ffpa_attn_backward as _ffpa_attn_bwd_cuda
-
-from .triton import _ffpa_attn_backward as _ffpa_attn_backward_triton
-from .triton import _ffpa_attn_forward as _ffpa_attn_forward_triton
+from .cuda import _ffpa_attn_forward_cuda
+from .cuda import _ffpa_attn_backward_cuda
+from .triton import _ffpa_attn_forward_triton
+from .triton import _ffpa_attn_backward_triton
 
 # The SM90 TMA large-d kernel only widens the K box to 64 fp16 cols
 # (SWIZZLE_128B) when the head dim satisfies these constraints; outside
@@ -71,115 +68,6 @@ class FFPAAttnMeta:
   backward_backend: str
   triton_backward_autotune: bool
   triton_backward_version: str
-
-
-_OP_NAMESPACE = "ffpa_attn"
-_OP_NAME = "attn"
-_OP_QUALNAME = f"{_OP_NAMESPACE}::{_OP_NAME}"
-
-# The op mutates ``O`` and ``softmax_lse`` in place and returns O for
-# convenience.  The ``(a!)`` alias annotations tell torch.library the
-# buffers are written, required for correct alias/functionalization under
-# torch.compile.
-torch.library.define(
-  _OP_QUALNAME,
-  "(Tensor Q, Tensor K, Tensor V, Tensor(a!) O, Tensor(b!) softmax_lse, int stages, int acc, "
-  "int causal, float softmax_scale, int tma) -> Tensor(a!)",
-)
-
-
-@torch.library.impl(_OP_QUALNAME, "CUDA")
-def _ffpa_attn_impl_cuda(
-  Q: torch.Tensor,
-  K: torch.Tensor,
-  V: torch.Tensor,
-  O: torch.Tensor,
-  softmax_lse: torch.Tensor,
-  stages: int,
-  acc: int,
-  causal: int,
-  softmax_scale: float,
-  tma: int,
-) -> torch.Tensor:
-  _ffpa_attn_fwd_cuda(Q, K, V, O, softmax_lse, stages, acc, causal, softmax_scale, tma)
-  return O
-
-
-@torch.library.register_fake(_OP_QUALNAME)
-def _ffpa_attn_impl_fake(
-  Q: torch.Tensor,
-  K: torch.Tensor,
-  V: torch.Tensor,
-  O: torch.Tensor,
-  softmax_lse: torch.Tensor,
-  stages: int,
-  acc: int,
-  causal: int,
-  softmax_scale: float,
-  tma: int,
-) -> torch.Tensor:
-  del Q, K, V, stages, acc, causal, softmax_scale, tma
-  return O
-
-
-def _ffpa_attn_forward_cuda(
-  Q: torch.Tensor,
-  K: torch.Tensor,
-  V: torch.Tensor,
-  O: torch.Tensor | None = None,
-  stages: int = 2,
-  acc: int = 1,
-  causal: int = 0,
-  softmax_scale: float = 0.0,
-  tma: int = 0,
-) -> tuple[torch.Tensor, torch.Tensor]:
-  """Call FFPA CUDA forward, returning (O, softmax_lse).
-
-    If O is None, it is allocated as zeros; otherwise the caller-supplied
-    buffer is written in place.  softmax_lse is always allocated as
-    [B, Nh_q, Nq] float32 view backed by storage whose last-dimension stride is rounded up
-    to a multiple of 8 so PyTorch's mem-efficient SDPA backward can reuse it
-    without repacking on non-aligned sequence lengths.
-    """
-  if O is None:
-    O = torch.zeros_like(Q)  # noqa: E741
-  seqlen_q = Q.size(2)
-  seqlen_q_aligned = ((seqlen_q + 7) // 8) * 8
-  softmax_lse_storage = torch.empty(Q.size(0), Q.size(1), seqlen_q_aligned, dtype=torch.float32, device=Q.device)
-  softmax_lse = softmax_lse_storage[..., :seqlen_q]
-  _ffpa_attn_fwd_cuda(Q, K, V, O, softmax_lse, stages, acc, causal, softmax_scale, tma)
-  return O, softmax_lse
-
-
-def _ffpa_attn_backward_cuda(
-  Q: torch.Tensor,
-  K: torch.Tensor,
-  V: torch.Tensor,
-  O: torch.Tensor,
-  softmax_lse: torch.Tensor,
-  dO: torch.Tensor,
-  stages: int,
-  causal: int,
-  softmax_scale: float,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-  dQ = torch.zeros_like(Q)
-  dK = torch.zeros_like(K)
-  dV = torch.zeros_like(V)
-  _ffpa_attn_bwd_cuda(
-    Q,
-    K,
-    V,
-    O,
-    softmax_lse,
-    dO,
-    dQ,
-    dK,
-    dV,
-    stages,
-    causal,
-    softmax_scale,
-  )
-  return dQ, dK, dV
 
 
 # ---------------------------------------------------------------------------

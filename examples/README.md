@@ -2,7 +2,11 @@
 # FFPA-Attn Examples
 
 ```bash
-python3 examples/ffpa_attn_fwd.py
+python3 examples/ffpa_attn_fwd.py --forward-backend cuda
+python3 examples/ffpa_attn_fwd.py --forward-backend triton
+python3 examples/ffpa_attn_fwd.py --forward-backend triton --autotune
+python3 examples/ffpa_attn_bwd.py --backward-backend sdpa
+python3 examples/ffpa_attn_bwd.py --backward-backend triton
 python3 examples/ffpa_attn_bwd.py --backward-backend triton --autotune
 ```
 
