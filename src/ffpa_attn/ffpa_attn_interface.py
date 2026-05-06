@@ -590,26 +590,25 @@ def ffpa_attn_func(
   if softmax_scale is None:
     softmax_scale = 1.0 / math.sqrt(Q.size(-1))
 
-  # Route through autograd Function so backward works automatically.
-  # O is passed through to forward() so the caller-supplied buffer is
-  # written in place rather than re-allocated.
+  _meta = FFPAAttnMeta(
+    causal=bool(causal),
+    softmax_scale=float(softmax_scale),
+    stages=int(stages),
+    acc=acc_code,
+    tma=int(bool(tma)),
+    is_grad_enabled=torch.is_grad_enabled(),
+    high_precision_grad=bool(high_precision_grad),
+    forward_backend=str(forward_backend),
+    triton_forward_autotune=bool(triton_forward_autotune),
+    backward_backend=str(backward_backend),
+    triton_backward_autotune=bool(triton_backward_autotune),
+    triton_backward_version=str(triton_backward_version),
+  )
+
   return FFPAAttnFunc.apply(
     Q,
     K,
     V,
     O,
-    FFPAAttnMeta(
-      causal=bool(causal),
-      softmax_scale=float(softmax_scale),
-      stages=int(stages),
-      acc=acc_code,
-      tma=int(bool(tma)),
-      is_grad_enabled=torch.is_grad_enabled(),
-      high_precision_grad=bool(high_precision_grad),
-      forward_backend=str(forward_backend),
-      triton_forward_autotune=bool(triton_forward_autotune),
-      backward_backend=str(backward_backend),
-      triton_backward_autotune=bool(triton_backward_autotune),
-      triton_backward_version=str(triton_backward_version),
-    ),
+    _meta,
   )

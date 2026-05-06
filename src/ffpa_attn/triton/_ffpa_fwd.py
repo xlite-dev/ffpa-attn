@@ -130,7 +130,11 @@ def _ffpa_fwd_kernel_impl(
   # the current P @ V_slice contribution.
   o_accs = (zero_acc, ) * NUM_V_GROUPS
 
-  for start_n in range(0, seqlen_k, BLOCK_N):
+  end_n = seqlen_k
+  if IS_CAUSAL:
+    end_n = tl.minimum(seqlen_k, (start_m + 1) * BLOCK_M + kv_offset)
+
+  for start_n in range(0, end_n, BLOCK_N):
     start_n = tl.multiple_of(start_n, BLOCK_N)
     offs_kv = start_n + offs_n
 
