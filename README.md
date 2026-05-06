@@ -188,7 +188,7 @@ print(f"dK vs SDPA dK max_abs_err={(dk - k_ref.grad).abs().max().item():.4e}")
 print(f"dV vs SDPA dV max_abs_err={(dv - v_ref.grad).abs().max().item():.4e}")
 ```
 
-Runnable examples are provided under [`examples`](./examples). The performance snapshot for the NVIDIA L20 with Headdim=512 is listed below:
+Runnable examples are provided under [`examples`](./examples). The performance (forward and backward) snapshot for the NVIDIA L20 with Headdim=512 is listed below:
 
 <div align='center'>
 

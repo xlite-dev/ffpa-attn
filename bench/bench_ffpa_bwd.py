@@ -52,6 +52,12 @@ def parse_args():
     default="v2",
     help="Enable Triton FFPA backward versioning (only effective for triton backend)."
   )
+  parser.add_argument(
+    "--triton-preprocess-d-chunk",
+    "--d-chunk",
+    action="store_true",
+    help="Use split-D delta preprocess for the Triton backward backend."
+  )
   parser.add_argument("--warmup", type=int, default=5)
   parser.add_argument("--iters", type=int, default=20)
   parser.add_argument("--seed", type=int, default=0)
@@ -217,6 +223,7 @@ def main():
         backward_backend=backend,
         triton_backward_autotune=args.triton_backward_autotune,
         triton_backward_version=args.triton_backward_version,
+        triton_backward_preprocess_d_chunk=args.triton_preprocess_d_chunk,
       )
 
     return native
@@ -236,6 +243,7 @@ def main():
       backward_backend=args.backward_backend,
       triton_backward_autotune=args.triton_backward_autotune,
       triton_backward_version=args.triton_backward_version,
+      triton_backward_preprocess_d_chunk=args.triton_preprocess_d_chunk,
     )
 
   def sdpa(q_i, k_i, v_i):
@@ -244,7 +252,8 @@ def main():
   print(
     f"shape B={args.B} H={args.H} N={args.N} D={args.D} dtype={args.dtype} "
     f"causal={args.causal} mode={args.mode} autotune={args.triton_backward_autotune} "
-    f"version={args.triton_backward_version} warmup={args.warmup} iters={args.iters}"
+    f"version={args.triton_backward_version} preprocess_d_chunk={args.triton_preprocess_d_chunk} "
+    f"warmup={args.warmup} iters={args.iters}"
   )
   sdpa_ref = run_forward_backward_once(sdpa, q, k, v, dO)
   timer = time_backward_only if args.mode == "backward-only" else time_backward

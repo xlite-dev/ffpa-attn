@@ -14,12 +14,19 @@ import math
 import pytest
 import torch
 import torch.nn.functional as F
+import triton
 
 from ffpa_attn import ffpa_attn_func  # noqa: E402
+from ffpa_attn.triton._ffpa_bwd import _ffpa_bwd_pre  # noqa: E402
 
 # Build subset for fast iteration: 64 (small-d), 320, 512 (large-d).
 HEADDIMS = [64, 320, 512]
 DTYPES = [torch.float16, torch.bfloat16]
+
+
+def _seqlen_q_rounded(seqlen_q):
+  """Return the padded LSE/Delta sequence dimension used by Triton backward."""
+  return ((seqlen_q + 127) // 128) * 128
 
 
 def _tolerance(dtype):
@@ -76,6 +83,93 @@ def _sdpa_ref_grads(q, k, v, causal, scale):
     dv = v2.grad
 
   return q2.grad, dk, dv
+
+
+def _run_bwd_pre(o, do, d_chunk, block_headdim=64):
+  """Run the Triton backward preprocess kernel and return visible delta.
+
+  :param o: Forward output tensor with layout ``[B, H, N, D]``.
+  :param do: Upstream output gradient with layout ``[B, H, N, D]``.
+  :param d_chunk: Whether to use the split-D preprocess mode.
+  :param block_headdim: D chunk size for split-D mode.
+  :return: Delta tensor view with layout ``[B, H, N]``.
+  """
+  B, H, N, D = o.shape
+  seqlen_q_rounded = _seqlen_q_rounded(N)
+  delta = torch.empty(B, H, seqlen_q_rounded, dtype=torch.float32, device=o.device)
+  full_block_headdim = max(64, triton.next_power_of_2(D)) if not d_chunk else block_headdim
+  _ffpa_bwd_pre[(triton.cdiv(N, 128), B * H)](
+    o,
+    do,
+    delta,
+    o.stride(0),
+    o.stride(1),
+    o.stride(2),
+    do.stride(0),
+    do.stride(1),
+    do.stride(2),
+    H,
+    N,
+    seqlen_q_rounded,
+    D,
+    BLOCK_M=128,
+    BLOCK_HEADDIM=full_block_headdim,
+    D_CHUNK=d_chunk,
+    num_warps=4,
+  )
+  return delta[..., :N]
+
+
+@pytest.mark.parametrize("dtype", DTYPES, ids=["fp16", "bf16"])
+@pytest.mark.parametrize("N,D", [(191, 64), (191, 320), (257, 512), (129, 1024)])
+def test_ffpa_bwd_preprocess_full_and_d_chunk(dtype, N, D):
+  """Full-D and split-D preprocess modes must match PyTorch delta."""
+  B, H = 1, 2
+  torch.manual_seed(0)
+  o = torch.randn(B, H, N, D, dtype=dtype, device="cuda")
+  do = torch.randn_like(o)
+  ref = (o.float() * do.float()).sum(dim=-1)
+
+  delta_full = _run_bwd_pre(o, do, d_chunk=False)
+  delta_d_chunk = _run_bwd_pre(o, do, d_chunk=True, block_headdim=64)
+
+  tol = {"atol": 2e-2, "rtol": 2e-2} if dtype == torch.bfloat16 else {"atol": 1e-2, "rtol": 1e-2}
+  torch.testing.assert_close(delta_full, ref, **tol)
+  torch.testing.assert_close(delta_d_chunk, ref, **tol)
+  torch.testing.assert_close(delta_d_chunk, delta_full, **tol)
+
+
+@pytest.mark.parametrize("dtype", DTYPES, ids=["fp16", "bf16"])
+@pytest.mark.parametrize("preprocess_d_chunk", [False, True], ids=["pre_full", "pre_d_chunk"])
+def test_ffpa_bwd_triton_preprocess_modes(dtype, preprocess_d_chunk):
+  """Triton backward must stay accurate with either preprocess mode."""
+  B, H, N, D = 1, 2, 128, 320
+  torch.manual_seed(0)
+  q = torch.randn(B, H, N, D, dtype=dtype, device="cuda", requires_grad=True)
+  k = torch.randn(B, H, N, D, dtype=dtype, device="cuda", requires_grad=True)
+  v = torch.randn(B, H, N, D, dtype=dtype, device="cuda", requires_grad=True)
+
+  scale = 1.0 / math.sqrt(D)
+  out = ffpa_attn_func(
+    q,
+    k,
+    v,
+    causal=False,
+    softmax_scale=scale,
+    stages=2,
+    acc="f32",
+    high_precision_grad=True,
+    backward_backend="triton",
+    triton_backward_preprocess_d_chunk=preprocess_d_chunk,
+  )
+  out.sum().backward()
+
+  dq_ref, dk_ref, dv_ref = _sdpa_ref_grads(q, k, v, False, scale)
+
+  tol = _tolerance(dtype)
+  torch.testing.assert_close(q.grad, dq_ref, **tol)
+  torch.testing.assert_close(k.grad, dk_ref, **tol)
+  torch.testing.assert_close(v.grad, dv_ref, **tol)
 
 
 # ---------------------------------------------------------------------------

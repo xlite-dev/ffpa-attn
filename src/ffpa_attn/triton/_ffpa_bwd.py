@@ -44,10 +44,11 @@ import triton.language as tl
 # Preprocess: delta = rowsum(dO * O)
 # ---------------------------------------------------------------------------
 
-# BLOCK_HEADDIM must be >= headdim (no D-chunk loop).  Derive from
-# the runtime headdim so that autotune never tests invalid configs.
+# In full-D mode BLOCK_HEADDIM must cover the whole head dimension.  In
+# D_CHUNK mode the launcher/autotuner supplies the chunk size explicitly.
 _FFPA_BWD_PRE_HEURISTICS = {
-  "BLOCK_HEADDIM": lambda args: max(64, triton.next_power_of_2(args["headdim"])),
+  "BLOCK_HEADDIM":
+  lambda args: args["BLOCK_HEADDIM"] if args["D_CHUNK"] else max(64, triton.next_power_of_2(args["headdim"])),
 }
 
 
@@ -69,6 +70,7 @@ def _ffpa_bwd_pre_impl(
   headdim: int,
   BLOCK_M: tl.constexpr,
   BLOCK_HEADDIM: tl.constexpr,
+  D_CHUNK: tl.constexpr,
 ) -> None:
   """Preprocess kernel to compute delta = rowsum(dO * O) for the backward pass."""
   start_m = tl.program_id(0)
@@ -77,42 +79,87 @@ def _ffpa_bwd_pre_impl(
   off_h = off_hb % nheads
   offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
   offs_d = tl.arange(0, BLOCK_HEADDIM)
-  o = tl.load(
-    Out + off_b * stride_ob + off_h * stride_oh + offs_m[:, None] * stride_om + offs_d[None, :],
-    mask=(offs_m[:, None] < seqlen_q) & (offs_d[None, :] < headdim),
-    other=0.0,
-  ).to(tl.float32)
-  do = tl.load(
-    DO + off_b * stride_dob + off_h * stride_doh + offs_m[:, None] * stride_dom + offs_d[None, :],
-    mask=(offs_m[:, None] < seqlen_q) & (offs_d[None, :] < headdim),
-    other=0.0,
-  ).to(tl.float32)
-  delta = tl.sum(o * do, axis=1)
-  tl.store(Delta + off_hb * seqlen_q_rounded + offs_m, delta)
+
+  if D_CHUNK:
+    delta = tl.zeros([BLOCK_M], dtype=tl.float32)
+    num_d_chunks = tl.cdiv(headdim, BLOCK_HEADDIM)
+    for d_chunk in range(num_d_chunks):
+      d_offs = d_chunk * BLOCK_HEADDIM + offs_d
+      o = tl.load(
+        Out + off_b * stride_ob + off_h * stride_oh + offs_m[:, None] * stride_om + d_offs[None, :],
+        mask=(offs_m[:, None] < seqlen_q) & (d_offs[None, :] < headdim),
+        other=0.0,
+      ).to(tl.float32)
+      do = tl.load(
+        DO + off_b * stride_dob + off_h * stride_doh + offs_m[:, None] * stride_dom + d_offs[None, :],
+        mask=(offs_m[:, None] < seqlen_q) & (d_offs[None, :] < headdim),
+        other=0.0,
+      ).to(tl.float32)
+      delta += tl.sum(o * do, axis=1)
+  else:
+    o = tl.load(
+      Out + off_b * stride_ob + off_h * stride_oh + offs_m[:, None] * stride_om + offs_d[None, :],
+      mask=(offs_m[:, None] < seqlen_q) & (offs_d[None, :] < headdim),
+      other=0.0,
+    ).to(tl.float32)
+    do = tl.load(
+      DO + off_b * stride_dob + off_h * stride_doh + offs_m[:, None] * stride_dom + offs_d[None, :],
+      mask=(offs_m[:, None] < seqlen_q) & (offs_d[None, :] < headdim),
+      other=0.0,
+    ).to(tl.float32)
+    delta = tl.sum(o * do, axis=1)
+
+  tl.store(Delta + off_hb * seqlen_q_rounded + offs_m, delta, mask=offs_m < seqlen_q)
 
 
-def _gen_pre_autotune_configs() -> list[triton.Config]:
+def _gen_pre_autotune_configs(d_chunk: bool) -> list[triton.Config]:
   """Generate autotune configs for the preprocess delta kernel.
 
-  ``BLOCK_HEADDIM`` is excluded from autotune because it must cover the full
-  runtime head dimension; ``_FFPA_BWD_PRE_HEURISTICS`` derives it from
-  ``headdim``.
+  ``BLOCK_HEADDIM`` participates in autotune only for D_CHUNK mode.  Full-D
+  mode keeps the historical runtime heuristic so invalid narrow configs are
+  never benchmarked for large head dimensions.
 
+  :param d_chunk: Whether generated configs should enable D_CHUNK mode.
   :return: Triton autotune configurations for the delta preprocess kernel.
   """
   configs = []
   for block_m in [64, 128, 256]:
-    for num_warps in [2, 4, 8]:
-      configs.append(triton.Config(
-        {"BLOCK_M": block_m},
-        num_warps=num_warps,
-      ))
+    if not d_chunk:
+      for num_warps in [2, 4, 8]:
+        configs.append(triton.Config(
+          {
+            "BLOCK_M": block_m,
+            "D_CHUNK": False
+          },
+          num_warps=num_warps,
+        ))
+      continue
+
+    for block_headdim in [64, 128, 256]:
+      for num_warps in [2, 4, 8]:
+        configs.append(
+          triton.Config(
+            {
+              "BLOCK_M": block_m,
+              "BLOCK_HEADDIM": block_headdim,
+              "D_CHUNK": True
+            },
+            num_warps=num_warps,
+          )
+        )
   return configs
 
 
 # Autotuned variant.
 _ffpa_bwd_pre_autotune = triton.autotune(
-  configs=_gen_pre_autotune_configs(),
+  configs=_gen_pre_autotune_configs(d_chunk=False),
+  key=["seqlen_q", "headdim"],
+  reset_to_zero=["Delta"],
+  cache_results=True,
+)(_ffpa_bwd_pre_impl)
+
+_ffpa_bwd_pre_d_chunk_autotune = triton.autotune(
+  configs=_gen_pre_autotune_configs(d_chunk=True),
   key=["seqlen_q", "headdim"],
   reset_to_zero=["Delta"],
   cache_results=True,
@@ -768,6 +815,7 @@ def _ffpa_attn_backward_triton(
   softmax_scale: float | None = None,
   autotune: bool = False,
   kernel_version: str = "v2",
+  preprocess_d_chunk: bool = False,
 ) -> None:
   """Run the Triton FFPA Split-D backward kernels.
 
@@ -790,6 +838,9 @@ def _ffpa_attn_backward_triton(
   :param kernel_version: Backward kernel variant to launch. ``"v2"`` uses the
     shared-pid split-D kernel without dQ atomics; any other value selects the
     v1 column-parallel kernel.
+  :param preprocess_d_chunk: Whether the delta preprocess kernel should split
+    the head dimension into ``BLOCK_HEADDIM`` chunks instead of processing the
+    full head dimension in one program.
   """
   if do.stride(-1) != 1:
     do = do.contiguous()
@@ -810,7 +861,8 @@ def _ffpa_attn_backward_triton(
     def pre_grid(meta: dict) -> tuple[int, int]:
       return (triton.cdiv(seqlen_q, meta["BLOCK_M"]), batch * nheads)
 
-    _ffpa_bwd_pre_autotune[pre_grid](
+    pre_kernel = _ffpa_bwd_pre_d_chunk_autotune if preprocess_d_chunk else _ffpa_bwd_pre_autotune
+    pre_kernel[pre_grid](
       o,
       do,
       delta,
@@ -826,6 +878,7 @@ def _ffpa_attn_backward_triton(
       headdim,
     )
   else:
+    block_headdim_delta = 64 if preprocess_d_chunk else BLOCK_HEADDIM_DELTA
     _ffpa_bwd_pre[(triton.cdiv(seqlen_q, 128), batch * nheads)](
       o,
       do,
@@ -841,7 +894,8 @@ def _ffpa_attn_backward_triton(
       seqlen_q_rounded,
       headdim,
       BLOCK_M=128,
-      BLOCK_HEADDIM=BLOCK_HEADDIM_DELTA,
+      BLOCK_HEADDIM=block_headdim_delta,
+      D_CHUNK=preprocess_d_chunk,
       num_warps=4,
     )
 

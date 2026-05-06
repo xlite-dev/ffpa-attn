@@ -111,6 +111,12 @@ def test_ffpa_attn_func_rejects_invalid_forward_backend():
     ffpa_attn_func(q, k, v, stages=2, acc="f32", forward_backend="bad")
 
 
+def test_ffpa_attn_func_rejects_unknown_impl_option():
+  q, k, v = _alloc_qkv(1, 4, 128, 320, torch.float16)
+  with pytest.raises(TypeError, match="unexpected keyword"):
+    ffpa_attn_func(q, k, v, unknown_impl_option=True)
+
+
 TRITON_FORWARD_SHAPES = [
   (1, 4, 128, 128, 320, False),
   (1, 4, 129, 257, 320, False),
