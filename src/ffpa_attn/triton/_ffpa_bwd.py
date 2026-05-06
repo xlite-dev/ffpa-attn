@@ -299,15 +299,16 @@ def ffpa_bwd_v1_kernel(
 # ---------------------------------------------------------------------------
 
 
-def _gen_bwd_autotune_configs() -> list[triton.Config]:
+def _gen_bwd_autotune_configs(block_n_values: tuple[int, ...]) -> list[triton.Config]:
   """Generate autotune configs over BLOCK_M, BLOCK_N, BLOCK_HEADDIM, num_warps, num_stages.
 
   ``ATOMIC_ADD`` is intentionally excluded from autotune. In the v1
   column-parallel path, every K-column-block program can update the same dQ
   rows, so dQ atomic-add is required for correctness.
 
-  :return: Triton autotune configurations shared by the v1 and v2 backward
-      kernels.
+  :param block_n_values: Candidate ``BLOCK_N`` values for the target backward
+      kernel variant.
+  :return: Triton autotune configurations for one backward kernel variant.
   """
   # BLOCK_M: larger = fewer Q-block iterations (good), more register pressure.
   # BLOCK_N:
@@ -332,7 +333,7 @@ def _gen_bwd_autotune_configs() -> list[triton.Config]:
 
   configs = []
   for block_m in [64, 128]:
-    for block_n in [64, 128]:
+    for block_n in block_n_values:
       for block_headdim in _headdim_candidates:
         for num_warps in [4, 8]:
           for num_stages in [2, 3, 4]:
@@ -350,7 +351,8 @@ def _gen_bwd_autotune_configs() -> list[triton.Config]:
   return configs
 
 
-_FFPA_BWD_AUTOTUNE_CONFIGS = _gen_bwd_autotune_configs()
+_FFPA_BWD_V1_AUTOTUNE_CONFIGS = _gen_bwd_autotune_configs(block_n_values=(64, 128))
+_FFPA_BWD_V2_AUTOTUNE_CONFIGS = _gen_bwd_autotune_configs(block_n_values=(64, ))
 _FFPA_BWD_HEURISTICS = {
   "EVEN_M": lambda args: args["seqlen_q"] % args["BLOCK_M"] == 0,
   "EVEN_N": lambda args: args["seqlen_k"] % args["BLOCK_N"] == 0,
@@ -498,7 +500,7 @@ def _ffpa_bwd_v1_kernel_impl(
 # Autotuned variant — wraps the impl with autotune; do NOT pass
 # BLOCK_M / BLOCK_N / BLOCK_HEADDIM when calling this variant.
 _ffpa_bwd_v1_autotune = triton.autotune(
-  configs=_FFPA_BWD_AUTOTUNE_CONFIGS,
+  configs=_FFPA_BWD_V1_AUTOTUNE_CONFIGS,
   key=["seqlen_q", "seqlen_k", "headdim"],
   reset_to_zero=["DQ", "DK", "DV"],
   cache_results=True,
@@ -738,7 +740,7 @@ def _ffpa_bwd_v2_kernel_impl(
 
 # Autotuned v2 variant.
 _ffpa_bwd_v2_autotune = triton.autotune(
-  configs=_FFPA_BWD_AUTOTUNE_CONFIGS,
+  configs=_FFPA_BWD_V2_AUTOTUNE_CONFIGS,
   key=["seqlen_q", "seqlen_k", "headdim"],
   reset_to_zero=["DQ", "DK", "DV"],
   cache_results=True,
