@@ -598,8 +598,9 @@ def _ffpa_bwd_v2_kernel_impl(
     offs_d = tl.arange(0, BLOCK_HEADDIM)
 
     num_block_m = tl.cdiv(seqlen_q, BLOCK_M)
+    begin_m = 0 if not IS_CAUSAL else start_n // BLOCK_M * BLOCK_M
 
-    for start_m in range(0, num_block_m * BLOCK_M, BLOCK_M):
+    for start_m in range(begin_m, num_block_m * BLOCK_M, BLOCK_M):
       offs_qm = start_m + offs_m
 
       # --- Phase 1: S = sum_d Q_d @ K_d^T, dP = sum_d dO_d @ V_d^T ---
@@ -675,8 +676,9 @@ def _ffpa_bwd_v2_kernel_impl(
     offs_d = tl.arange(0, BLOCK_HEADDIM)
 
     num_block_n = tl.cdiv(seqlen_k, BLOCK_N)
+    end_n_k = start_m + BLOCK_M if IS_CAUSAL else num_block_n * BLOCK_N
 
-    for start_n_k in range(0, num_block_n * BLOCK_N, BLOCK_N):
+    for start_n_k in range(0, end_n_k, BLOCK_N):
       offs_nk = start_n_k + offs_n
 
       # --- Phase 1: S, dP for this Q-block × K-block ---
