@@ -232,10 +232,9 @@ def run_benchmark(
     speedup_sdpa = 1.0
 
   if not show_matrix:
-    if (speedup_sdpa >= MAX_TFLOPS) or (not only_show_improved) or ("sdpa" in tag):
+    should_print = (speedup_sdpa >= MAX_TFLOPS) or (not only_show_improved) or ("sdpa" in tag)
+    if should_print:
       print(f"{out_info:>65}: {out_val}, time:{mean_time:.6f}ms, TFLOPS:{TFLOPS:<6.2f}(~{speedup_sdpa:.2f}x)")
-    else:
-      print(f"{out_info:>65}: {' ' * 50}, TFLOPS:{TFLOPS:<6.2f}(~{speedup_sdpa:.2f}x)")
   else:
     print(f"{out_info:>42}: {out_val}, time:{mean_time:.6f}ms, TFLOPS:{TFLOPS:<6.2f}(~{speedup_sdpa:.2f}x)")
 

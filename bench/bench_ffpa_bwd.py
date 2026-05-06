@@ -17,16 +17,16 @@ def parse_args():
   parser.add_argument("--dtype", choices=["fp16", "bf16"], default="fp16")
   parser.add_argument("--causal", action="store_true")
   parser.add_argument("--stages", type=int, default=1)
-  parser.add_argument("--compare-stages", action="store_true", help="Run split-D stages 1, 2, and 3 side by side.")
+  parser.add_argument("--compare-stages", action="store_true", help="Run CUDA stages 1, 2, and 3 side by side.")
   parser.add_argument(
     "--compare-backends",
     action="store_true",
-    help="Run split-D, Triton, and SDPA backward side by side.",
+    help="Run CUDA, Triton, and SDPA backward side by side.",
   )
   parser.add_argument(
     "--backward-backend",
     choices=["cuda", "triton"],
-    default="cuda",
+    default="triton",
     help="Native backward backend to benchmark when not using a compare mode.",
   )
   parser.add_argument(
