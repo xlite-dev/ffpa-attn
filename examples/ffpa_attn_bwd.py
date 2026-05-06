@@ -34,11 +34,12 @@ def _parse_args() -> argparse.Namespace:
   parser.add_argument(
     "--backward-backend",
     choices=["sdpa", "cuda", "triton"],
-    default="sdpa",
+    default="triton",
     help="Backward backend passed to ffpa_attn_func.",
   )
   parser.add_argument(
     "--triton-backward-autotune",
+    "--autotune",
     action="store_true",
     help="Enable Triton autotuning (only effective when --backward-backend=triton).",
   )
@@ -198,7 +199,7 @@ def main() -> None:
     _run_case(
       "self-attn",
       dtype,
-      args.triton_backward_backend,
+      args.backward_backend,
       args.triton_backward_autotune,
       B=1,
       Nh_q=32,
@@ -209,7 +210,7 @@ def main() -> None:
     _run_case(
       "cross-attn",
       dtype,
-      args.triton_backward_backend,
+      args.backward_backend,
       args.triton_backward_autotune,
       B=1,
       Nh_q=32,
@@ -218,20 +219,12 @@ def main() -> None:
       Nkv=8192
     )
     _run_case(
-      "gqa",
-      dtype,
-      args.triton_backward_backend,
-      args.triton_backward_autotune,
-      B=1,
-      Nh_q=32,
-      Nh_kv=8,
-      Nq=8192,
-      Nkv=8192
+      "gqa", dtype, args.backward_backend, args.triton_backward_autotune, B=1, Nh_q=32, Nh_kv=8, Nq=8192, Nkv=8192
     )
     _run_case(
       "causal",
       dtype,
-      args.triton_backward_backend,
+      args.backward_backend,
       args.triton_backward_autotune,
       B=1,
       Nh_q=32,
@@ -243,7 +236,7 @@ def main() -> None:
     _run_case(
       "non-aligned",
       dtype,
-      args.triton_backward_backend,
+      args.backward_backend,
       args.triton_backward_autotune,
       B=1,
       Nh_q=8,

@@ -3,7 +3,7 @@
 
 ```bash
 python3 examples/ffpa_attn_fwd.py
-python3 examples/ffpa_attn_bwd.py
+python3 examples/ffpa_attn_bwd.py --backward-backend triton --autotune
 ```
 
 - `examples/ffpa_attn_fwd.py`: forward-only examples for self-attn, cross-attn, GQA, causal, and non-aligned seqlen.
