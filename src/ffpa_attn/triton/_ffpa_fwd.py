@@ -51,8 +51,18 @@ def _gen_fwd_autotune_configs(headdim: int = 256) -> list[triton.Config]:
     _max_smem = 48 * 1024  # safe fallback: default SMEM
 
   _headdim_candidates = [64, 128, 256]
-  if _max_smem >= 96 * 1024 and headdim not in _headdim_candidates:
-    _headdim_candidates.append(headdim)
+  # Use triton.next_power_of_2(headdim) as a near-full-D single-chunk block size:
+  #   - power-of-2 headdims (512, 1024): next_pow2 == headdim → NUM_V_GROUPS=1,
+  #     eliminates the D-chunk loop entirely.
+  #   - non-power-of-2 headdims (320→512, 640→1024): next_pow2 pads to the next
+  #     power-of-2.  The kernel's load/store masks (qk_d < HEADDIM, o_d < HEADDIM)
+  #     zero out the padding columns, so correctness is preserved.
+  # tl.arange requires a power-of-2 range, so next_power_of_2 always produces a
+  # valid block size.  Only included on high-SMEM devices to keep register pressure
+  # manageable; skip when next_pow2 is already in [64, 128, 256] (dedup).
+  _next_pow2 = triton.next_power_of_2(headdim)
+  if _max_smem >= 96 * 1024 and _next_pow2 not in _headdim_candidates:  # 96 KB
+    _headdim_candidates.append(_next_pow2)
 
   configs = []
   for block_m in [64, 128]:
