@@ -23,14 +23,12 @@
 
 <div id="install"></div>
 
-First, install the prebuilt whl from [PyPI](https://pypi.org/project/ffpa-attn/) (required: PyTorch>=2.11.0, CUDA>=13.0, Ubuntu>=22.04):
+First, install the prebuilt package from [PyPI](https://pypi.org/project/ffpa-attn/) or build [ffpa-attn](https://github.com/xlite-dev/ffpa-attn) from source:
 
 ```bash
-pip3 install -U ffpa-attn # (support: sm_{80, 89, 90, 100, 120})
-```
-
-Or, you can build [ffpa-attn](https://github.com/xlite-dev/ffpa-attn) from source (recommended: PyTorch>=2.11.0, CUDA>=13.0):
-```bash
+# Required: PyTorch>=2.11.0, CUDA>=13.0, Ubuntu>=22.04
+pip3 install -U ffpa-attn # (support: sm_{80~120})
+# Or, build ffpa-attn from source, just follow the cmds:
 git clone https://github.com/xlite-dev/ffpa-attn.git
 # Then, build the wheel package and install it with pip
 cd ffpa-attn && MAX_JOBS=32 python3 setup.py bdist_wheel
