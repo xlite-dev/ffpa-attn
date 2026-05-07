@@ -10,14 +10,11 @@
 
 <div align='center'>
 
-|[Self Attn](./examples)| [GQA/MQA](./examples) |[Cross/Decode](./examples)|[Causal](./examples)|[Headdim](#ffpa-design)|[Fwd (CUDA)↑](./examples)|[Bwd (Triton)↑](./examples)|
+|[Self Attn](./examples)| [GQA](./examples) |[Cross Attn](./examples)|[Causal](./examples)|[Headdim](#ffpa-design)|[Fwd (CUDA)↑](./examples)|[Bwd (Triton)↑](./examples)|
 |:---:|:---:|:---:|:---:|:---:|:---:|:---:|
 |✔️(`Nq = Nkv`)|✔️|✔️(`Nq != Nkv`)|✔️|**320~1024** |**1.8x~3x↑🎉** |**1.5x~2.5x↑🎉** |
 
 </div>
-
-> [!NOTE]
-> FFPA has been tested on `Ampere`, `Ada`, `Hopper`, and `Blackwell` architectures (e.g., A30, L20, 4090, H200, 5090), achieves `1.8×~3×↑🎉` forward and `1.5×~2.5×↑🎉` backward speedup over SDPA.
 
 ## 📖 Quick Start
 
@@ -65,6 +62,8 @@ We extend FlashAttention to support large headdim ($D>256$) via **fine-grained t
   </i></p>
 </div>
 
+> [!NOTE]
+> FFPA has been tested on `Ampere`, `Ada`, `Hopper`, and `Blackwell` architectures (e.g., A30, L20, 4090, H200, 5090), achieves `1.8×~3×↑🎉` forward and `1.5×~2.5×↑🎉` backward speedup over SDPA.
 
 ## 🎉 Benchmark
 
