@@ -1,7 +1,7 @@
 <div align="center">
   <p align="center">
     <h2>🤖FFPA: Yet another Faster Flash Prefill Attention <br>with O(1)⚡️GPU SRAM complexity for large headdim🐑</h2>
-    <a href="./bench/README.md#bench-l20"> 📈L20 ~1.9x↑🎉 </a> | <a href="./bench/README.md#bench-a30"> 📈A30 ~1.8x↑🎉 </a> | <a href="./bench/README.md#bench-3080"> 📈3080 ~2.9x↑🎉 </a> | <a href="./bench/README.md#bench-4090"> 📈4090 ~2.1x↑🎉 </a>
+    <a href="./benchmark/README.md"> 📈L20 ~1.9x↑🎉 </a> | <a href="./benchmark/README.md"> 📈A30 ~1.8x↑🎉 </a> | <a href="./benchmark/README.md"> 📈3080 ~2.9x↑🎉 </a> | <a href="./benchmark/README.md"> 📈4090 ~2.1x↑🎉 </a>
   </p>
   <img src="assets/ffpa-api.png" width="600px">
 </div>
