@@ -195,7 +195,7 @@ def main() -> None:
       Nh_kv=32,
       Nq=8192,
       Nkv=8192,
-      is_causal=True,
+      causal=True,
     )
     _run_case(
       "non-aligned",
