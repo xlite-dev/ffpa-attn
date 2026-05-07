@@ -22,7 +22,7 @@ from .aten import _aten_flash_attn_forward, _aten_flash_attn_backward  # D <= 25
 if TYPE_CHECKING:
   from typing import Tuple, Union, Optional  # noqa: F401
 
-# The SM90 TMA large-d kernel only widens the K box to 64 fp16 cols
+# The SM>=90 TMA large-d kernel only widens the K box to 64 fp16 cols
 # (SWIZZLE_128B) when the head dim satisfies these constraints; outside
 # this set the C++ ``ExperimentalTmaLargeDConfig::kCanAttempt`` predicate
 # is false and the SM90 TMA kernel template is never instantiated, so
