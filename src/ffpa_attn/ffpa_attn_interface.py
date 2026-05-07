@@ -15,7 +15,7 @@ kernels.
 from __future__ import annotations
 
 import torch
-
+import torch.nn.functional as F
 from .functional import FFPAAttnFunc, FFPAAttnMeta
 
 
@@ -132,4 +132,25 @@ def ffpa_attn_func(
     enable_gqa,
     **kwargs,
   )
+  head_dim = query.size(3)
+  if head_dim <= 256:
+    # For small headdims (<= 256), delegate both forward and backward to PyTorch's
+    # standard scaled dot-product attention implementation for better performance.
+    # The dispatch branch for D <= 256 in FFPAAttnFunc is kept as a safety check
+    # but should never be hit because the routing decision is made here in the
+    # public interface.
+    return F.scaled_dot_product_attention(
+      query,
+      key,
+      value,
+      attn_mask=attn_mask,
+      dropout_p=dropout_p,
+      is_causal=is_causal,
+      scale=scale,
+      enable_gqa=enable_gqa or False,
+    )
+
   return FFPAAttnFunc.apply(query, key, value, _meta)
+
+
+__all__ = ["ffpa_attn_func"]

@@ -20,6 +20,12 @@
 > [!NOTE]
 > FFPA has been tested on `Ampere`, `Ada`, `Hopper`, and `Blackwell` architectures (e.g., A30, L20, 4090, H200, 5090), achieves `1.8×~3×↑🎉` forward (CUDA) and `1.5×~2.5×↑🎉` backward (Triton w/ autotune) speedup over SDPA for headdim `> 256`.
 
+## 📖 API Overview
+
+<div align="center">
+  <img src="docs/assets/ffpa-api.png" >
+</div>
+
 ## 📖 Quick Start
 
 <div id="install"></div>
