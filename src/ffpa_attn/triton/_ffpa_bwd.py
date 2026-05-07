@@ -24,8 +24,7 @@ Phase 2 (per Q-block, D-chunk):
 
 delta = rowsum(dO * O) is precomputed.
 
-Known Limitations & Future Optimizations
------------------------------------------
+Known Limitations & Future Optimizations:
 1. **Q / dO / K repeated HBM reads across D-chunks.**  Phase 1 and Phase 2
    both iterate over D-chunks independently.  For D=512 with BLOCK_HEADDIM=128
    this means 4 chunks x 2 phases = 8 HBM loads each for Q, dO and K.  A
@@ -40,10 +39,7 @@ import torch
 import triton
 import triton.language as tl
 
-# ---------------------------------------------------------------------------
 # Preprocess: delta = rowsum(dO * O)
-# ---------------------------------------------------------------------------
-
 # In full-D mode BLOCK_HEADDIM must cover the whole head dimension.  In
 # D_CHUNK mode the launcher/autotuner supplies the chunk size explicitly.
 _FFPA_BWD_PRE_HEURISTICS = {
@@ -168,11 +164,8 @@ _ffpa_bwd_pre_d_chunk_autotune = triton.autotune(
 # Non-autotuned variant.
 _ffpa_bwd_pre = _ffpa_bwd_pre_impl
 
-# ---------------------------------------------------------------------------
+
 # Split-D backward v1 kernel — one K/V column block
-# ---------------------------------------------------------------------------
-
-
 @triton.jit
 def ffpa_bwd_v1_kernel(
   start_n: int,
@@ -331,7 +324,6 @@ def ffpa_bwd_v1_kernel(
       tl.atomic_add(dv_ptrs, dv_d, mask=(offs_n[:, None] < seqlen_k) & (d_offs[None, :] < headdim))
 
 
-# ---------------------------------------------------------------------------
 # Main backward kernel
 #
 # Two entry points share the same jit implementation:
@@ -343,9 +335,6 @@ def ffpa_bwd_v1_kernel(
 #
 #   _ffpa_bwd_v1           — direct call without autotune. The Python launcher
 #                                 supplies the fixed fallback tile config.
-# ---------------------------------------------------------------------------
-
-
 def _gen_bwd_autotune_configs(block_n_values: tuple[int, ...], headdim: int = 512) -> list[triton.Config]:
   """Generate autotune configs over BLOCK_M, BLOCK_N, BLOCK_HEADDIM, num_warps, num_stages.
 
@@ -384,7 +373,7 @@ def _gen_bwd_autotune_configs(block_n_values: tuple[int, ...], headdim: int = 51
   #     power-of-2.  The kernel's load/store masks (d_offs < headdim) zero out the
   #     padding columns, so correctness is preserved.
   # tl.arange requires a power-of-2 range, so next_power_of_2 always produces a
-  # valid block size.  Only included on high-SMEM devices (Ada/Hopper, >= 128 KB);
+  # valid block size. Only included on high-SMEM devices (Ada/Hopper, >= 128 KB);
   # skip when next_pow2 is already in [64, 128, 256] (dedup).
   _next_pow2 = triton.next_power_of_2(headdim)
   if _max_smem >= 128 * 1024 and _next_pow2 not in _headdim_candidates:  # 128 KB
@@ -573,7 +562,6 @@ def _get_v1_autotune(headdim: int):
   return _ffpa_bwd_v1_autotune_cache[headdim]
 
 
-# ====================================================================
 # v2 kernel — shared-pid split-D backward (no dQ atomic_add)
 #
 # Inspired by flash-attention v2 _attn_bwd: one program_id serves as
@@ -586,9 +574,6 @@ def _get_v1_autotune(headdim: int):
 #
 # Because each program owns a unique Q-row block, dQ can be written
 # non-atomically, removing the main v1 bottleneck at long seqlen.
-# ====================================================================
-
-
 @triton.heuristics(_FFPA_BWD_HEURISTICS)
 @triton.jit
 def _ffpa_bwd_v2_kernel_impl(
@@ -654,9 +639,7 @@ def _ffpa_bwd_v2_kernel_impl(
 
   num_d_chunks = tl.cdiv(headdim, BLOCK_HEADDIM)
 
-  # ================================================================
   # Part 1: dK / dV — pid as K-column block index
-  # ================================================================
   start_n = pid * BLOCK_N
   if start_n < seqlen_k:
     offs_n = start_n + tl.arange(0, BLOCK_N)
@@ -732,9 +715,7 @@ def _ffpa_bwd_v2_kernel_impl(
         dv_val += dv_d
         tl.store(dv_ptrs, dv_val, mask=(offs_n[:, None] < seqlen_k) & (d_offs[None, :] < headdim))
 
-  # ================================================================
   # Part 2: dQ — pid as Q-row block index (NON-ATOMIC!)
-  # ================================================================
   start_m = pid * BLOCK_M
   if start_m < seqlen_q:
     offs_m = start_m + tl.arange(0, BLOCK_M)
@@ -1195,24 +1176,18 @@ def _ffpa_attn_backward_triton(
   else:
     k_in, v_in = k, v
 
-  dq = torch.empty_like(q)
-  dk_expanded = torch.empty_like(k_in)
-  dv_expanded = torch.empty_like(v_in)
-  _ffpa_attn_backward_triton_impl(
-    do=grad_out.contiguous(),
-    q=q.contiguous(),
-    k=k_in.contiguous(),
-    v=v_in.contiguous(),
-    o=o.contiguous(),
-    lse=lse,
-    dq=dq,
-    dk=dk_expanded,
-    dv=dv_expanded,
-    causal=causal,
-    softmax_scale=softmax_scale,
-    autotune=autotune,
-    kernel_version=kernel_version,
-    preprocess_d_chunk=preprocess_d_chunk,
+  dq, dk_expanded, dv_expanded = torch.ops.ffpa_attn._bwd_triton(
+    grad_out.contiguous(),
+    q.contiguous(),
+    k_in.contiguous(),
+    v_in.contiguous(),
+    o.contiguous(),
+    lse,
+    softmax_scale or (1.0 / math.sqrt(q.size(-1))),
+    int(causal),
+    int(autotune),
+    int(kernel_version == "v2"),
+    int(preprocess_d_chunk),
   )
 
   if group_size > 1:

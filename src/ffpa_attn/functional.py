@@ -15,9 +15,19 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from .cuda import _ffpa_attn_forward_cuda, _ffpa_attn_backward_cuda  # D > 256
-from .triton import _ffpa_attn_forward_triton, _ffpa_attn_backward_triton  # D > 256
-from .aten import _aten_flash_attn_forward, _aten_flash_attn_backward, _aten_efficient_attn_backward  # D <= 256
+from .cuda import (
+  _ffpa_attn_forward_cuda,
+  _ffpa_attn_backward_cuda,
+)  # D > 256
+from .triton import (
+  _ffpa_attn_forward_triton,
+  _ffpa_attn_backward_triton,
+)  # D > 256
+from .aten import (
+  _aten_flash_attn_forward,
+  _aten_flash_attn_backward,
+  _aten_efficient_attn_backward,
+)  # D <= 256
 
 if TYPE_CHECKING:
   from typing import Tuple, Union, Optional  # noqa: F401
@@ -243,7 +253,7 @@ class FFPAAttnMeta:
     return self
 
 
-class FFPAAttnFunc(torch.autograd.Function):
+class _FFPAAttnFunc(torch.autograd.Function):
   """FFPA attention with autograd support.
 
     Forward routes by headdim. ``D <= 256`` uses PyTorch's flash-attention
@@ -393,6 +403,48 @@ class FFPAAttnFunc(torch.autograd.Function):
 
     # Gradients for: q, k, v, o, meta.
     return dq, dk, dv, None, None
+
+
+# We cannot use ``torch.library.register_autograd`` on the forward ops
+# (``_fwd_cuda`` / ``_fwd_triton``) because each forward backend supports
+# *multiple* backward backends selected at runtime via ``backward_backend``:
+#
+#   forward_backend   │  backward_backend
+#   ──────────────────┼───────────────────
+#   cuda              │  triton, sdpa, (cuda)
+#   triton            │  triton, sdpa
+#
+# ``register_autograd`` binds a forward op to exactly one backward formula.
+# Hard-coding one backward (e.g. always Triton) would silently ignore the
+# user-requested ``backward_backend`` under ``torch.compile``, breaking the
+# sdpa/cuda backward paths when ``fullgraph=True``.
+#
+# Instead ``FFPAAttnFunc.apply`` delegates through a module-level function
+# guarded by ``torch._dynamo.disable``, which creates a graph break at the
+# autograd Function boundary.  The real ``_FFPAAttnFunc.backward`` (with
+# full backend dispatch) then runs eagerly.
+@torch._dynamo.disable
+def _ffpa_apply(*args, **kwargs):
+  return _FFPAAttnFunc.apply(*args, **kwargs)
+
+
+class FFPAAttnFunc:
+  """Public-facing autograd Function wrapper.
+
+  ``_FFPAAttnFunc`` holds the real ``forward`` / ``backward``, but its
+  auto-generated ``apply`` cannot be directly called under
+  ``torch.compile`` — Dynamo would inline it and replace the real backward
+  with an auto-generated template that produces zero gradients.  This
+  wrapper delegates to :func:`_ffpa_apply`, which is guarded by
+  ``torch._dynamo.disable`` so Dynamo leaves the autograd boundary intact.
+
+  Callers that need the real autograd Function (e.g. to inspect
+  ``forward`` / ``backward``) can access ``_FFPAAttnFunc`` directly.
+  """
+
+  @classmethod
+  def apply(cls, *args, **kwargs):
+    return _ffpa_apply(*args, **kwargs)
 
 
 __all__ = ["FFPAAttnMeta", "FFPAAttnFunc"]
