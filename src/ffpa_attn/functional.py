@@ -423,8 +423,6 @@ class _FFPAAttnFunc(torch.autograd.Function):
 # guarded by ``torch._dynamo.disable``, which creates a graph break at the
 # autograd Function boundary.  The real ``_FFPAAttnFunc.backward`` (with
 # full backend dispatch) then runs eagerly.
-
-
 @torch._dynamo.disable
 def _ffpa_apply(*args, **kwargs):
   return _FFPAAttnFunc.apply(*args, **kwargs)
