@@ -150,7 +150,7 @@ def ffpa_attn_func(
       dropout_p=dropout_p,
       is_causal=is_causal,
       scale=scale,
-      enable_gqa=enable_gqa,
+      enable_gqa=enable_gqa or False,
     )
 
   return FFPAAttnFunc.apply(query, key, value, _meta)
