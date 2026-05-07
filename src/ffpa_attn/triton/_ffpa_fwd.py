@@ -343,7 +343,13 @@ def _ffpa_attn_forward_triton(
 
   seqlen_q = Q.size(2)
   seqlen_q_aligned = ((seqlen_q + 127) // 128) * 128
-  softmax_lse_storage = torch.empty(Q.size(0), Q.size(1), seqlen_q_aligned, dtype=torch.float32, device=Q.device)
+  softmax_lse_storage = torch.empty(
+    Q.size(0),
+    Q.size(1),
+    seqlen_q_aligned,
+    dtype=torch.float32,
+    device=Q.device,
+  )
   softmax_lse = softmax_lse_storage[..., :seqlen_q]
   _ffpa_attn_forward_impl(
     Q,

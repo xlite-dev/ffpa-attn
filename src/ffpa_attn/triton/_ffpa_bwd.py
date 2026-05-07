@@ -812,11 +812,6 @@ def _get_v2_autotune(headdim: int):
   return _ffpa_bwd_v2_autotune_cache[headdim]
 
 
-# ---------------------------------------------------------------------------
-# Python entry point
-# ---------------------------------------------------------------------------
-
-
 def _ffpa_attn_backward_triton_impl(
   do: torch.Tensor,
   q: torch.Tensor,
@@ -1153,20 +1148,24 @@ def _ffpa_attn_backward_triton(
   * reduce expanded ``dk`` / ``dv`` back to the original KV head layout
   * cast the returned gradients back to the original input dtypes
 
-  :param grad_out: Upstream gradient ``[B, Nh_q, Nq, D]``.
-  :param q: Query tensor saved from forward.
-  :param k: Key tensor saved from forward.
-  :param v: Value tensor saved from forward.
-  :param o: Forward output tensor saved on the autograd context.
-  :param lse: Forward log-sum-exp tensor saved on the autograd context.
+  :param grad_out: Upstream output gradient with shape ``[B, Nh_q, Nq, D]``.
+  :param q: Query tensor saved from forward with shape ``[B, Nh_q, Nq, D]``.
+  :param k: Key tensor saved from forward with shape ``[B, Nh_kv, Nkv, D]``.
+  :param v: Value tensor saved from forward with shape ``[B, Nh_kv, Nkv, D]``.
+  :param o: Forward output tensor saved on the autograd context with shape
+    ``[B, Nh_q, Nq, D]``.
+  :param lse: Forward log-sum-exp tensor saved on the autograd context with
+    visible shape ``[B, Nh_q, Nq]``. The wrapper may pad its storage to
+    ``[B, Nh_q, ceil_div(Nq, 128) * 128]`` before calling the Triton kernel.
   :param causal: Whether lower-right causal masking was used in forward.
   :param softmax_scale: Scale applied to ``QK^T``.
   :param autotune: Whether to use the headdim-specific Triton autotuned entry.
   :param kernel_version: Triton backward kernel variant to dispatch.
   :param preprocess_d_chunk: Whether to split the preprocess delta reduction
     across head-dim chunks.
-  :returns: ``(dq, dk, dv)`` with the original ``q`` / ``k`` / ``v`` dtypes and
-    head layouts.
+  :returns: ``(dq, dk, dv)`` where ``dq`` has shape ``[B, Nh_q, Nq, D]`` and
+    ``dk`` / ``dv`` have shape ``[B, Nh_kv, Nkv, D]``. Returned tensors use
+    the original ``q`` / ``k`` / ``v`` dtypes and head layouts.
   """
   seqlen_q = q.size(2)
   seqlen_q_rounded = ((seqlen_q + 127) // 128) * 128

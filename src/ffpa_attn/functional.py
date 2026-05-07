@@ -331,18 +331,6 @@ class FFPAAttnFunc(torch.autograd.Function):
 
   @staticmethod
   def backward(ctx, grad_out: torch.Tensor):
-    if TYPE_CHECKING:
-      q: torch.Tensor
-      k: torch.Tensor
-      v: torch.Tensor
-      O: torch.Tensor
-      lse: torch.Tensor
-      rng_state: torch.Tensor
-      unused: torch.Tensor
-      dq: torch.Tensor
-      dk: torch.Tensor
-      dv: torch.Tensor
-
     q, k, v, O, lse, rng_state, unused = ctx.saved_tensors
     meta: FFPAAttnMeta = ctx.meta
     D = q.size(-1)
