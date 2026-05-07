@@ -71,15 +71,6 @@ Runnable examples are provided under [`examples`](./examples). The performance b
   <img src='https://github.com/user-attachments/assets/65a8d564-8fa7-4d66-86b9-e238feb86143' width="411px">
 </div>
 
-<!--
-## 🤔 Why not TMA?
-
-<div id="why-not-tma"></div>
-
-FFPA ships an experimental SM90 TMA path (**enable_tma=True**) that replaces the K/V [cp.async](https://docs.nvidia.com/cuda/parallel-thread-execution/index.html?highlight=cp%2520async#data-movement-and-conversion-instructions-cp-async) global-to-shared transfer with [cp.async.bulk.tensor.2d](https://docs.nvidia.com/cuda/parallel-thread-execution/index.html?highlight=cp%2520async%2520bulk%2520tensor%25202d#data-movement-and-conversion-instructions-cp-async-bulk-tensor). After tuning (K SWIZZLE_128B, 64-col TMA box) it reaches parity with the cp.async baseline, but does not beat it.
-
-**FFPA's Split-D dataflow is a TMA anti-pattern**. TMA wins when single thread instruction can amortise its dispatch cost over a large box, but split-D gives it narrow **Bc** x **kMmaAtomK** slices. It would require a major redesign (**super-tiled K/V on TMA** + **warp-specialized** [WGMMA](https://docs.nvidia.com/cuda/parallel-thread-execution/index.html?highlight=cp%2520async%2520bulk%2520tensor%25202d#asynchronous-warpgroup-level-matrix-instructions)), rather than a drop-in K/V replacement.
--->
 
 ## ©️License
 
