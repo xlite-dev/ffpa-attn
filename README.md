@@ -42,7 +42,7 @@ pip3 install dist/ffpa_attn-*.whl # pip uninstall ffpa-attn -y
 ```
 
 > [!NOTE]
-> FFPA supports **cross-attention** where the query seqlen ``Nq`` may differ from the key/value seqlen ``Nkv``, **GQA / MQA** attention where Q has ``Nh_q`` heads and K/V have ``Nh_kv`` heads (requires ``Nh_q % Nh_kv == 0``; group size = ``Nh_q / Nh_kv``), and **causal attention** (pass ``causal=True``; queries are aligned to the KV tail, i.e. Q row ``r`` attends to ``k <= r + (Nkv - Nq)``, which requires ``Nkv >= Nq``). K/V must share the same ``Nh_kv`` and ``Nkv``.
+> FFPA supports **cross-attention** where the query seqlen ``Nq`` may differ from the key/value seqlen ``Nkv``, **GQA / MQA** attention where Q has ``Nh_q`` heads and K/V have ``Nh_kv`` heads (requires ``Nh_q % Nh_kv == 0``; group size = ``Nh_q / Nh_kv``), and **causal attention** (pass ``is_causal=True``; queries are aligned to the KV tail, i.e. Q row ``r`` attends to ``k <= r + (Nkv - Nq)``, which requires ``Nkv >= Nq``). K/V must share the same ``Nh_kv`` and ``Nkv``.
 
 <div id="example-self"></div>
 
@@ -132,7 +132,7 @@ q = torch.randn(B, H, N, D, dtype=torch.bfloat16, device="cuda")
 k = torch.randn(B, H, N, D, dtype=torch.bfloat16, device="cuda")
 v = torch.randn(B, H, N, D, dtype=torch.bfloat16, device="cuda")
 
-out = ffpa_attn_func(q, k, v, causal=True)
+out = ffpa_attn_func(q, k, v, is_causal=True)
 print(out.shape, out.dtype)
 
 ref = F.scaled_dot_product_attention(q, k, v, is_causal=True)
@@ -144,7 +144,7 @@ Nq, Nkv = 128, 8192
 q = torch.randn(B, H, Nq,  D, dtype=torch.bfloat16, device="cuda")
 k = torch.randn(B, H, Nkv, D, dtype=torch.bfloat16, device="cuda")
 v = torch.randn(B, H, Nkv, D, dtype=torch.bfloat16, device="cuda")
-out = ffpa_attn_func(q, k, v, causal=True)
+out = ffpa_attn_func(q, k, v, is_causal=True)
 print(out.shape, out.dtype)  # (1, 8, 128, 512)
 ```
 
@@ -169,7 +169,7 @@ out = ffpa_attn_func(
   q,
   k,
   v,
-  softmax_scale=scale,
+  scale=scale,
 )
 out.sum().backward()
 
@@ -236,7 +236,7 @@ By leveraging this approach, we can achieve better performance than SDPA EA for 
 
 <div id="why-not-tma"></div>
 
-FFPA ships an experimental SM90 TMA path (**tma=True**) that replaces the K/V [cp.async](https://docs.nvidia.com/cuda/parallel-thread-execution/index.html?highlight=cp%2520async#data-movement-and-conversion-instructions-cp-async) global-to-shared transfer with [cp.async.bulk.tensor.2d](https://docs.nvidia.com/cuda/parallel-thread-execution/index.html?highlight=cp%2520async%2520bulk%2520tensor%25202d#data-movement-and-conversion-instructions-cp-async-bulk-tensor). After tuning (K SWIZZLE_128B, 64-col TMA box) it reaches parity with the cp.async baseline, but does not beat it.
+FFPA ships an experimental SM90 TMA path (**enable_tma=True**) that replaces the K/V [cp.async](https://docs.nvidia.com/cuda/parallel-thread-execution/index.html?highlight=cp%2520async#data-movement-and-conversion-instructions-cp-async) global-to-shared transfer with [cp.async.bulk.tensor.2d](https://docs.nvidia.com/cuda/parallel-thread-execution/index.html?highlight=cp%2520async%2520bulk%2520tensor%25202d#data-movement-and-conversion-instructions-cp-async-bulk-tensor). After tuning (K SWIZZLE_128B, 64-col TMA box) it reaches parity with the cp.async baseline, but does not beat it.
 
 **FFPA's Split-D dataflow is a TMA anti-pattern**. TMA wins when single thread instruction can amortise its dispatch cost over a large box, but split-D gives it narrow **Bc** x **kMmaAtomK** slices. It would require a major redesign (**super-tiled K/V on TMA** + **warp-specialized** [WGMMA](https://docs.nvidia.com/cuda/parallel-thread-execution/index.html?highlight=cp%2520async%2520bulk%2520tensor%25202d#asynchronous-warpgroup-level-matrix-instructions)), rather than a drop-in K/V replacement.
 

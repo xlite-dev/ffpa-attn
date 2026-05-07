@@ -101,7 +101,7 @@ def _run_case(
     v,
     stages=STAGES,
     acc=acc,
-    causal=causal,
+    is_causal=causal,
     forward_backend=forward_backend,
     triton_forward_autotune=triton_forward_autotune,
   )
@@ -119,7 +119,7 @@ def _run_case(
       v,
       stages=STAGES,
       acc=acc,
-      causal=causal,
+      is_causal=causal,
       forward_backend=forward_backend,
       triton_forward_autotune=triton_forward_autotune,
     ),
@@ -195,7 +195,7 @@ def main() -> None:
       Nh_kv=32,
       Nq=8192,
       Nkv=8192,
-      causal=True,
+      is_causal=True,
     )
     _run_case(
       "non-aligned",

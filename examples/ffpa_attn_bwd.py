@@ -87,8 +87,8 @@ def _run_ffpa_backward(
     q_i,
     k_i,
     v_i,
-    causal=causal,
-    softmax_scale=scale,
+    is_causal=causal,
+    scale=scale,
     backward_backend=backward_backend,
     triton_backward_autotune=triton_backward_autotune,
   )
@@ -157,8 +157,8 @@ def _run_case(
     q,
     k,
     v,
-    causal=causal,
-    softmax_scale=scale,
+    is_causal=causal,
+    scale=scale,
     backward_backend=backward_backend,
     triton_backward_autotune=triton_backward_autotune,
   )
@@ -248,7 +248,7 @@ def main() -> None:
       Nh_kv=32,
       Nq=8192,
       Nkv=8192,
-      causal=True
+      is_causal=True
     )
     _run_case(
       "non-aligned",
