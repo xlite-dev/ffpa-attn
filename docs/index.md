@@ -210,7 +210,7 @@ By leveraging this approach, we can achieve better performance than SDPA EA for 
 
 ## 🎉 Benchmark
 
-Runnable examples are provided under [`examples`](./examples). The performance benchmark for the NVIDIA RTX 4090 with large headdim (D=320~1024) is shown below, where FFPA achieves up to **2.1x** 🎉 faster than SDPA. For more comprehensive benchmarks, please refer to our [benchmark](./bench/README.md).
+Runnable examples are provided under [`examples`](./examples). The performance benchmark for the NVIDIA RTX 4090 with large headdim (D=320~1024) is shown below, where FFPA achieves up to **2.1x** 🎉 faster than SDPA. For more comprehensive benchmarks, please refer to our [benchmark](./benchmark/README.md).
 
 <div align='center'>
   <img src='https://github.com/user-attachments/assets/447e2937-f7c8-47c8-8550-8c0c71b910e6' width="330px">
