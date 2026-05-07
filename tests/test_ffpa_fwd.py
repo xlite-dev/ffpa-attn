@@ -89,19 +89,19 @@ def test_ffpa_attn_func_dispatch_shapes(dtype, B, H, N, D):
 
 
 def test_ffpa_attn_func_rejects_bf16_acc_f16():
-  q, k, v = _alloc_qkv(1, 8, 1024, 128, torch.bfloat16)
+  q, k, v = _alloc_qkv(1, 8, 1024, 512, torch.bfloat16)
   with pytest.raises(ValueError, match="bf16"):
     ffpa_attn_func(q, k, v, stages=2, acc="f16")
 
 
 def test_ffpa_attn_func_rejects_unsupported_dtype():
-  q, k, v = _alloc_qkv(1, 8, 1024, 128, torch.float32)
+  q, k, v = _alloc_qkv(1, 8, 1024, 512, torch.float32)
   with pytest.raises(TypeError):
     ffpa_attn_func(q, k, v, stages=2, acc="f32")
 
 
 def test_ffpa_attn_func_rejects_invalid_acc():
-  q, k, v = _alloc_qkv(1, 8, 1024, 128, torch.float16)
+  q, k, v = _alloc_qkv(1, 8, 1024, 512, torch.float16)
   with pytest.raises(ValueError, match="acc"):
     ffpa_attn_func(q, k, v, stages=2, acc="bad")
 
@@ -141,6 +141,53 @@ def test_ffpa_attn_func_small_d_routes_to_flash_attention(monkeypatch, forward_b
   out = ffpa_attn_func(q, k, v, stages=2, acc="f32", forward_backend=forward_backend)
 
   torch.testing.assert_close(out, _sdpa_ref(q, k, v), **_tolerance(torch.float16))
+
+
+def test_ffpa_attn_func_attn_mask_falls_back_to_sdpa(monkeypatch):
+  q, k, v = _alloc_qkv(1, 4, 128, 512, torch.float16)
+  row_idx = torch.arange(q.size(2), device=q.device).view(-1, 1)
+  col_idx = torch.arange(k.size(2), device=k.device).view(1, -1)
+  attn_mask = col_idx <= row_idx
+
+  def _unexpected_backend(*args, **kwargs):
+    raise AssertionError("attn_mask fallback should not dispatch to FFPA forward")
+
+  monkeypatch.setattr(ffpa_attn_functional, "_ffpa_attn_forward_cuda", _unexpected_backend)
+  monkeypatch.setattr(ffpa_attn_functional, "_ffpa_attn_forward_triton", _unexpected_backend)
+
+  out = ffpa_attn_func(q, k, v, attn_mask=attn_mask, stages=2, acc="f32")
+  ref = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, scale=1.0 / math.sqrt(q.size(-1)))
+  torch.testing.assert_close(out, ref, **_tolerance(torch.float16))
+
+
+def test_ffpa_attn_func_dropout_falls_back_to_sdpa(monkeypatch):
+  q, k, v = _alloc_qkv(1, 4, 128, 512, torch.float16)
+
+  def _unexpected_backend(*args, **kwargs):
+    raise AssertionError("dropout fallback should not dispatch to FFPA forward")
+
+  monkeypatch.setattr(ffpa_attn_functional, "_ffpa_attn_forward_cuda", _unexpected_backend)
+  monkeypatch.setattr(ffpa_attn_functional, "_ffpa_attn_forward_triton", _unexpected_backend)
+
+  torch.manual_seed(0)
+  out = ffpa_attn_func(q, k, v, dropout_p=0.25, stages=2, acc="f32")
+  torch.manual_seed(0)
+  ref = F.scaled_dot_product_attention(q, k, v, dropout_p=0.25, scale=1.0 / math.sqrt(q.size(-1)))
+  torch.testing.assert_close(out, ref, **_tolerance(torch.float16))
+
+
+def test_ffpa_attn_func_too_large_d_falls_back_to_sdpa(monkeypatch):
+  q, k, v = _alloc_qkv(1, 4, 64, 1152, torch.float16)
+
+  def _unexpected_backend(*args, **kwargs):
+    raise AssertionError("D > 1024 fallback should not dispatch to FFPA forward")
+
+  monkeypatch.setattr(ffpa_attn_functional, "_ffpa_attn_forward_cuda", _unexpected_backend)
+  monkeypatch.setattr(ffpa_attn_functional, "_ffpa_attn_forward_triton", _unexpected_backend)
+
+  out = ffpa_attn_func(q, k, v, stages=2, acc="f32")
+  ref = F.scaled_dot_product_attention(q, k, v, scale=1.0 / math.sqrt(q.size(-1)))
+  torch.testing.assert_close(out, ref, **_tolerance(torch.float16))
 
 
 @pytest.mark.parametrize("forward_backend", ["cuda", "triton"])
@@ -278,7 +325,7 @@ def test_ffpa_attn_func_triton_forward_gqa_matches_sdpa(dtype, D):
   q = torch.randn(B, Nh_q, Nq, D, dtype=dtype, device="cuda")
   k = torch.randn(B, Nh_kv, Nkv, D, dtype=dtype, device="cuda")
   v = torch.randn(B, Nh_kv, Nkv, D, dtype=dtype, device="cuda")
-  out = ffpa_attn_func(q, k, v, stages=2, acc=_acc_for(dtype), forward_backend="triton")
+  out = ffpa_attn_func(q, k, v, stages=2, acc=_acc_for(dtype), forward_backend="triton", enable_gqa=True)
   group_size = Nh_q // Nh_kv
   ref = _sdpa_ref(q, k.repeat_interleave(group_size, dim=1), v.repeat_interleave(group_size, dim=1))
   assert out.shape == ref.shape
@@ -361,9 +408,9 @@ def test_ffpa_attn_func_cross_attention(dtype, Nq, Nkv, D):
 
 def test_ffpa_attn_func_rejects_mismatched_kv_seqlen():
   torch.manual_seed(0)
-  q = torch.randn(1, 4, 128, 128, dtype=torch.float16, device="cuda")
-  k = torch.randn(1, 4, 1024, 128, dtype=torch.float16, device="cuda")
-  v = torch.randn(1, 4, 2048, 128, dtype=torch.float16, device="cuda")
+  q = torch.randn(1, 4, 128, 512, dtype=torch.float16, device="cuda")
+  k = torch.randn(1, 4, 1024, 512, dtype=torch.float16, device="cuda")
+  v = torch.randn(1, 4, 2048, 512, dtype=torch.float16, device="cuda")
   with pytest.raises(ValueError, match="seqlen"):
     ffpa_attn_func(q, k, v, stages=2, acc="f32")
 
@@ -399,7 +446,7 @@ def test_ffpa_attn_func_gqa(dtype, Nh_q, Nh_kv, Nq, Nkv, D):
   q = torch.randn(B, Nh_q, Nq, D, dtype=dtype, device="cuda")
   k = torch.randn(B, Nh_kv, Nkv, D, dtype=dtype, device="cuda")
   v = torch.randn(B, Nh_kv, Nkv, D, dtype=dtype, device="cuda")
-  out = ffpa_attn_func(q, k, v, stages=2, acc=_acc_for(dtype))
+  out = ffpa_attn_func(q, k, v, stages=2, acc=_acc_for(dtype), enable_gqa=True)
   group_size = Nh_q // Nh_kv
   k_ref = k.repeat_interleave(group_size, dim=1)
   v_ref = v.repeat_interleave(group_size, dim=1)
@@ -414,18 +461,18 @@ def test_ffpa_attn_func_gqa(dtype, Nh_q, Nh_kv, Nq, Nkv, D):
 def test_ffpa_attn_func_rejects_indivisible_num_heads():
   torch.manual_seed(0)
   # Nh_q=12, Nh_kv=8 -> 12 % 8 != 0
-  q = torch.randn(1, 12, 128, 128, dtype=torch.float16, device="cuda")
-  k = torch.randn(1, 8, 128, 128, dtype=torch.float16, device="cuda")
-  v = torch.randn(1, 8, 128, 128, dtype=torch.float16, device="cuda")
+  q = torch.randn(1, 12, 128, 512, dtype=torch.float16, device="cuda")
+  k = torch.randn(1, 8, 128, 512, dtype=torch.float16, device="cuda")
+  v = torch.randn(1, 8, 128, 512, dtype=torch.float16, device="cuda")
   with pytest.raises(ValueError, match="num_heads"):
     ffpa_attn_func(q, k, v, stages=2, acc="f32")
 
 
 def test_ffpa_attn_func_rejects_mismatched_kv_num_heads():
   torch.manual_seed(0)
-  q = torch.randn(1, 16, 128, 128, dtype=torch.float16, device="cuda")
-  k = torch.randn(1, 4, 128, 128, dtype=torch.float16, device="cuda")
-  v = torch.randn(1, 2, 128, 128, dtype=torch.float16, device="cuda")
+  q = torch.randn(1, 16, 128, 512, dtype=torch.float16, device="cuda")
+  k = torch.randn(1, 4, 128, 512, dtype=torch.float16, device="cuda")
+  v = torch.randn(1, 2, 128, 512, dtype=torch.float16, device="cuda")
   with pytest.raises(ValueError, match="num_heads"):
     ffpa_attn_func(q, k, v, stages=2, acc="f32")
 
@@ -482,6 +529,21 @@ def test_ffpa_attn_func_causal_self_attention(dtype, N, D):
 def test_ffpa_attn_func_causal_cross_attention(dtype, Nq, Nkv, D):
   B, H = 1, 4
   q, k, v = _alloc_cross_qkv(B, H, Nq, Nkv, D, dtype)
+  if D <= 256:
+    try:
+      ref = F.scaled_dot_product_attention(q, k, v, is_causal=True, scale=1.0 / math.sqrt(D))
+    except RuntimeError:
+      with pytest.raises(RuntimeError):
+        ffpa_attn_func(q, k, v, stages=2, acc=_acc_for(dtype), is_causal=True)
+      return
+
+    out = ffpa_attn_func(q, k, v, stages=2, acc=_acc_for(dtype), is_causal=True)
+    assert out.shape == ref.shape
+    assert out.dtype == dtype
+    assert torch.isfinite(out).all(), (f"FFPA causal output has NaN/Inf at Nq={Nq}, Nkv={Nkv}, D={D}")
+    torch.testing.assert_close(out, ref, **_tolerance(dtype))
+    return
+
   out = ffpa_attn_func(q, k, v, stages=2, acc=_acc_for(dtype), is_causal=True)
   # Reference: build an explicit attn mask where Q row r may attend to
   # KV positions k <= r + (Nkv - Nq). SDPA's is_causal only supports
@@ -517,7 +579,29 @@ def test_ffpa_attn_func_causal_gqa(dtype, Nh_q, Nh_kv, Nq, Nkv, D):
   q = torch.randn(B, Nh_q, Nq, D, dtype=dtype, device="cuda")
   k = torch.randn(B, Nh_kv, Nkv, D, dtype=dtype, device="cuda")
   v = torch.randn(B, Nh_kv, Nkv, D, dtype=dtype, device="cuda")
-  out = ffpa_attn_func(q, k, v, stages=2, acc=_acc_for(dtype), is_causal=True)
+  if D <= 256 and Nq != Nkv:
+    try:
+      ref = F.scaled_dot_product_attention(
+        q,
+        k,
+        v,
+        is_causal=True,
+        scale=1.0 / math.sqrt(D),
+        enable_gqa=True,
+      )
+    except RuntimeError:
+      with pytest.raises(RuntimeError):
+        ffpa_attn_func(q, k, v, stages=2, acc=_acc_for(dtype), is_causal=True, enable_gqa=True)
+      return
+
+    out = ffpa_attn_func(q, k, v, stages=2, acc=_acc_for(dtype), is_causal=True, enable_gqa=True)
+    assert out.shape == (B, Nh_q, Nq, D)
+    assert out.dtype == dtype
+    assert torch.isfinite(out).all()
+    torch.testing.assert_close(out, ref, **_tolerance(dtype))
+    return
+
+  out = ffpa_attn_func(q, k, v, stages=2, acc=_acc_for(dtype), is_causal=True, enable_gqa=True)
   group_size = Nh_q // Nh_kv
   k_ref = k.repeat_interleave(group_size, dim=1)
   v_ref = v.repeat_interleave(group_size, dim=1)
@@ -535,8 +619,17 @@ def test_ffpa_attn_func_causal_gqa(dtype, Nh_q, Nh_kv, Nq, Nkv, D):
 def test_ffpa_attn_func_rejects_causal_with_shorter_kv():
   torch.manual_seed(0)
   # Nq > Nkv + causal is rejected (no valid keys for later Q rows).
-  q = torch.randn(1, 4, 256, 128, dtype=torch.float16, device="cuda")
-  k = torch.randn(1, 4, 128, 128, dtype=torch.float16, device="cuda")
-  v = torch.randn(1, 4, 128, 128, dtype=torch.float16, device="cuda")
+  q = torch.randn(1, 4, 256, 512, dtype=torch.float16, device="cuda")
+  k = torch.randn(1, 4, 128, 512, dtype=torch.float16, device="cuda")
+  v = torch.randn(1, 4, 128, 512, dtype=torch.float16, device="cuda")
   with pytest.raises(ValueError, match="is_causal"):
     ffpa_attn_func(q, k, v, stages=2, acc="f32", is_causal=True)
+
+
+def test_ffpa_attn_func_requires_explicit_gqa_opt_in_for_large_d():
+  torch.manual_seed(0)
+  q = torch.randn(1, 16, 128, 512, dtype=torch.float16, device="cuda")
+  k = torch.randn(1, 4, 128, 512, dtype=torch.float16, device="cuda")
+  v = torch.randn(1, 4, 128, 512, dtype=torch.float16, device="cuda")
+  with pytest.raises(ValueError, match="enable_gqa=False"):
+    ffpa_attn_func(q, k, v, stages=2, acc="f32")

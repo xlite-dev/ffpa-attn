@@ -212,12 +212,14 @@ def main():
   def make_native(backend, stages):
 
     def native(q_i, k_i, v_i):
+      enable_gqa = q_i.size(1) != k_i.size(1)
       return ffpa_attn_func(
         q_i,
         k_i,
         v_i,
         is_causal=args.causal,
         scale=scale,
+        enable_gqa=enable_gqa,
         stages=stages,
         acc="f32",
         backward_backend=backend,
@@ -232,12 +234,14 @@ def main():
     return make_native("cuda", stages)
 
   def cuda(q_i, k_i, v_i):
+    enable_gqa = q_i.size(1) != k_i.size(1)
     return ffpa_attn_func(
       q_i,
       k_i,
       v_i,
       is_causal=args.causal,
       scale=scale,
+      enable_gqa=enable_gqa,
       stages=args.stages,
       acc="f32",
       backward_backend=args.backward_backend,

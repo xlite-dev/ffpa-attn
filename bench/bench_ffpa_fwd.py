@@ -141,12 +141,14 @@ def main():
   def make_native(backend, stages):
 
     def native(q_i, k_i, v_i):
+      enable_gqa = q_i.size(1) != k_i.size(1)
       return ffpa_attn_func(
         q_i,
         k_i,
         v_i,
         is_causal=args.causal,
         scale=scale,
+        enable_gqa=enable_gqa,
         stages=stages,
         acc="f32",
         forward_backend=backend,

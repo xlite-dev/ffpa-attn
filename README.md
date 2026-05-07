@@ -41,7 +41,7 @@ pip3 install dist/ffpa_attn-*.whl # pip uninstall ffpa-attn -y
 ```
 
 > [!NOTE]
-> FFPA supports **cross-attention** where the query seqlen ``Nq`` may differ from the key/value seqlen ``Nkv``, **GQA / MQA** attention where Q has ``Nh_q`` heads and K/V have ``Nh_kv`` heads (requires ``Nh_q % Nh_kv == 0``; group size = ``Nh_q / Nh_kv``), and **causal attention** (pass ``is_causal=True``; queries are aligned to the KV tail, i.e. Q row ``r`` attends to ``k <= r + (Nkv - Nq)``, which requires ``Nkv >= Nq``). K/V must share the same ``Nh_kv`` and ``Nkv``.
+> FFPA supports **cross-attention** where the query seqlen ``Nq`` may differ from the key/value seqlen ``Nkv``, **GQA / MQA** attention where Q has ``Nh_q`` heads and K/V have ``Nh_kv`` heads (requires ``Nh_q % Nh_kv == 0``; group size = ``Nh_q / Nh_kv``), and **causal attention** (pass ``is_causal=True``; queries are aligned to the KV tail, i.e. Q row ``r`` attends to ``k <= r + (Nkv - Nq)``, which requires ``Nkv >= Nq``). K/V must share the same ``Nh_kv`` and ``Nkv``. `enable_gqa` now defaults to `False` to match SDPA exactly, so GQA/MQA usage must pass `enable_gqa=True` explicitly.
 
 <div id="example-self"></div>
 
@@ -99,13 +99,14 @@ from ffpa_attn import ffpa_attn_func
 # GQA: Q has Nh_q heads, K/V share Nh_kv heads; group_size = Nh_q / Nh_kv.
 # Typical Llama-3-style 32/8 ratio; MQA is the Nh_kv==1 special case.
 # FFPA targets large headdim so we use D=512 here (FA-2 tops out at D=256).
+# enable_gqa defaults to False, so opt into GQA semantics explicitly.
 B, D, Nq, Nkv = 1, 512, 1024, 4096
 Nh_q, Nh_kv = 32, 8  # group_size = 4
 q = torch.randn(B, Nh_q,  Nq,  D, dtype=torch.bfloat16, device="cuda")
 k = torch.randn(B, Nh_kv, Nkv, D, dtype=torch.bfloat16, device="cuda")
 v = torch.randn(B, Nh_kv, Nkv, D, dtype=torch.bfloat16, device="cuda")
 
-out = ffpa_attn_func(q, k, v)  # -> (B, Nh_q, Nq, D) = (1, 32, 1024, 512)
+out = ffpa_attn_func(q, k, v, enable_gqa=True)  # -> (B, Nh_q, Nq, D) = (1, 32, 1024, 512)
 print(out.shape, out.dtype)
 
 # Reference: replicate K/V along head dim to match Q's head count.
@@ -139,6 +140,9 @@ print(f"vs SDPA max_abs_err={(out - ref).abs().max().item():.4e}")
 
 # Chunked / decoding prefill: Nq < Nkv, queries aligned to the KV tail
 # so Q row r attends to k <= r + (Nkv - Nq). Requires Nkv >= Nq.
+# This example keeps D=512 so it stays on the FFPA large-D path. For D <= 256,
+# ffpa_attn_func forwards the inputs directly to SDPA without synthesizing a
+# causal cross-attention mask for you.
 Nq, Nkv = 128, 8192
 q = torch.randn(B, H, Nq,  D, dtype=torch.bfloat16, device="cuda")
 k = torch.randn(B, H, Nkv, D, dtype=torch.bfloat16, device="cuda")
@@ -164,12 +168,7 @@ q = torch.randn(B, H, N, D, dtype=torch.bfloat16, device="cuda", requires_grad=T
 k = torch.randn(B, H, N, D, dtype=torch.bfloat16, device="cuda", requires_grad=True)
 v = torch.randn(B, H, N, D, dtype=torch.bfloat16, device="cuda", requires_grad=True)
 
-out = ffpa_attn_func(
-  q,
-  k,
-  v,
-  scale=scale,
-)
+out = ffpa_attn_func(q, k, v, scale=scale)
 out.sum().backward()
 
 dq = q.grad.detach().clone()

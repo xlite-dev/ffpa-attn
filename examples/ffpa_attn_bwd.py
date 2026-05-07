@@ -89,6 +89,7 @@ def _run_ffpa_backward(
     v_i,
     is_causal=causal,
     scale=scale,
+    enable_gqa=q_i.size(1) != k_i.size(1),
     backward_backend=backward_backend,
     triton_backward_autotune=triton_backward_autotune,
   )
@@ -159,6 +160,7 @@ def _run_case(
     v,
     is_causal=causal,
     scale=scale,
+    enable_gqa=Nh_q != Nh_kv,
     backward_backend=backward_backend,
     triton_backward_autotune=triton_backward_autotune,
   )

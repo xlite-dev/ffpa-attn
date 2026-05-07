@@ -102,6 +102,7 @@ def _run_case(
     stages=STAGES,
     acc=acc,
     is_causal=causal,
+    enable_gqa=Nh_q != Nh_kv,
     forward_backend=forward_backend,
     triton_forward_autotune=triton_forward_autotune,
   )
@@ -120,6 +121,7 @@ def _run_case(
       stages=STAGES,
       acc=acc,
       is_causal=causal,
+      enable_gqa=Nh_q != Nh_kv,
       forward_backend=forward_backend,
       triton_forward_autotune=triton_forward_autotune,
     ),

@@ -6,10 +6,9 @@ can reach it through ``torch.ops.ffpa_attn.attn`` instead of calling the
 C-extension symbol directly.
 
 Backward pass delegates to PyTorch SDPA backward functions, routing by
-headdim: flash_attention_backward for D <= 256, efficient_attention_backward
-for D > 256. Small-D forward/backward use PyTorch's aten flash-attention
-operator pair; large-D forward continues to use the FFPA CUDA or Triton
-kernels.
+headdim: SDPA for D <= 256, efficient_attention_backward for D > 256.
+Small-D directly delegates to ``torch.nn.functional.scaled_dot_product_attention``;
+large-D forward continues to use the FFPA CUDA or Triton kernels.
 """
 
 from __future__ import annotations
@@ -17,6 +16,28 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 from .functional import FFPAAttnFunc, FFPAAttnMeta
+
+
+def _should_fallback_to_sdpa(
+  query: torch.Tensor,
+  attn_mask: torch.Tensor | None,
+  dropout_p: float,
+) -> bool:
+  """Return whether the public API should delegate to SDPA directly.
+
+  FFPA currently falls back to SDPA for the following cases:
+
+  * ``head_dim <= 256``
+  * ``head_dim > 1024``
+  * ``attn_mask is not None``
+  * ``dropout_p > 0.0``
+
+  As FFPA grows support for these cases, remove the corresponding condition
+  here instead of scattering dispatch checks throughout ``ffpa_attn_func``.
+  """
+  assert query.dim() == 4, "Expected query shape [B, Nh_q, Nq, D]"
+  head_dim = query.size(3)
+  return head_dim <= 256 or head_dim > 1024 or attn_mask is not None or dropout_p > 0.0
 
 
 def _normalize_inputs(
@@ -27,7 +48,7 @@ def _normalize_inputs(
   dropout_p: float,
   is_causal: bool,
   scale: float | None,
-  enable_gqa: bool | None,
+  enable_gqa: bool,
   **kwargs: object,
 ) -> FFPAAttnMeta:
   """Validate and normalise all public-API inputs, returning a meta object."""
@@ -51,7 +72,7 @@ def ffpa_attn_func(
   dropout_p: float = 0.0,
   is_causal: bool = False,
   scale: float | None = None,
-  enable_gqa: bool | None = None,
+  enable_gqa: bool = False,
   **kwargs: object,
 ) -> torch.Tensor:
   """FFPA: Faster Flash Prefill Attention for large headdims (D > 256).
@@ -69,9 +90,10 @@ def ffpa_attn_func(
   ``is_causal=True`` with queries aligned to the tail of the KV sequence
   (``Nkv >= Nq`` required).
 
-  Backward pass is supported via :class:`FFPAAttnFunc`. For ``D <= 256`` it
-  uses PyTorch's flash-attention forward/backward pair; for ``D > 256`` it
-  keeps the existing FFPA forward plus SDPA/FFPA backward routing.
+  Backward pass is supported via :class:`FFPAAttnFunc`. The public API falls
+  back to SDPA for cases FFPA does not currently support directly (small-D,
+  ``D > 1024``, explicit ``attn_mask``, and dropout), and otherwise keeps the
+  existing FFPA forward plus SDPA/FFPA backward routing.
   ``forward_backend`` only affects the large-D path.
 
   :param query: Query tensor with layout ``[B, Nh_q, Nq, D]``; dtype must be
@@ -83,12 +105,10 @@ def ffpa_attn_func(
       as ``query``. ``key`` and ``value`` must share the same ``Nh_kv`` and
       ``Nkv``.
   :param attn_mask: Optional attention mask (``[Nq, Nkv]`` bool or float).
-      Currently **not supported** — passing a non-``None`` value raises
-      ``NotImplementedError``. Reserved for future use.
-  :param dropout_p: Dropout probability. Only supported for ``D <= 256``
-      (the PyTorch flash-attention path). When ``dropout_p > 0`` and
-      ``D > 256``, a ``NotImplementedError`` is raised because the FFPA
-      native kernels do not implement dropout.
+      Passing a non-``None`` value currently routes the call to SDPA.
+    :param dropout_p: Dropout probability. Passing ``dropout_p > 0`` currently
+      routes the call to SDPA because the FFPA native kernels do not yet
+      implement dropout.
   :param is_causal: When ``True``, apply a causal attention mask so that
       query row ``r`` only attends to KV positions ``k <= r + (Nkv - Nq)``
       (standard ``queries aligned to KV tail`` convention). Requires
@@ -96,11 +116,10 @@ def ffpa_attn_func(
       per KV tile; diagonal tiles apply a per-fragment -inf mask.
   :param scale: Pre-softmax scaling factor applied to ``QK^T``.
       Defaults to ``1 / sqrt(D)`` (standard attention scale) when ``None``.
-  :param enable_gqa: Grouped-query attention mode. ``None`` (default)
-      auto-detects GQA when ``query`` and ``key``/``value`` have different
-      numbers of heads. ``True`` forces GQA expansion (broadcast K/V heads
-      even when head counts match). ``False`` disables GQA (raises
-      ``ValueError`` if head counts differ).
+    :param enable_gqa: Grouped-query attention mode. Defaults to ``False`` to
+      match SDPA exactly. When ``False``, the large-D FFPA path requires
+      ``query`` and ``key``/``value`` to have the same number of heads. Pass
+      ``True`` to opt into GQA/MQA semantics explicitly.
   :param kwargs: Implementation-specific options for experimentation.
       Supported keys are ``stages``, ``acc``, ``enable_tma``,
       ``high_precision_grad``, ``forward_backend``,
@@ -118,9 +137,23 @@ def ffpa_attn_func(
       bf16 activations are combined with ``acc='f16'`` (no bf16-acc mma
       PTX instruction exists on supported architectures), or if
       ``is_causal=True`` is combined with ``Nkv < Nq``.
-  :raises NotImplementedError: if ``attn_mask`` is not ``None``, or if
-      ``dropout_p > 0`` with ``D > 256``.
+  :raises NotImplementedError: propagated from SDPA or FFPA backends for
+      unsupported backend-specific combinations.
   """
+  if _should_fallback_to_sdpa(query, attn_mask, dropout_p):
+    # Fallback intentionally delegates to SDPA exactly as the user called it.
+    # Do not synthesize masks or reinterpret GQA semantics here.
+    return F.scaled_dot_product_attention(
+      query,
+      key,
+      value,
+      attn_mask=attn_mask,
+      dropout_p=dropout_p,
+      is_causal=is_causal,
+      scale=scale,
+      enable_gqa=enable_gqa,
+    )
+
   _meta = _normalize_inputs(
     query,
     key,
@@ -132,26 +165,6 @@ def ffpa_attn_func(
     enable_gqa,
     **kwargs,
   )
-  head_dim = query.size(3)
-  if head_dim <= 256:
-    # For small headdims (<= 256), delegate both forward and backward to PyTorch's
-    # standard scaled dot-product attention implementation for better performance.
-    # The dispatch branch for D <= 256 in FFPAAttnFunc is kept as a safety check
-    # but should never be hit because the routing decision is made here in the
-    # public interface.
-    # NOTE: We choose to directly dispatch to SDPA without any checks and changes
-    # to the input tensors bacasue FFPA and SDPA shared the same input layout and
-    # dtype requirements. So, just let SDPA check the inputs itself is enough.
-    return F.scaled_dot_product_attention(
-      query,
-      key,
-      value,
-      attn_mask=attn_mask,
-      dropout_p=dropout_p,
-      is_causal=is_causal,
-      scale=scale,
-      enable_gqa=enable_gqa or False,
-    )
 
   return FFPAAttnFunc.apply(query, key, value, _meta)
 

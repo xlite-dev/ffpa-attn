@@ -17,7 +17,7 @@ import torch
 
 from .cuda import _ffpa_attn_forward_cuda, _ffpa_attn_backward_cuda  # D > 256
 from .triton import _ffpa_attn_forward_triton, _ffpa_attn_backward_triton  # D > 256
-from .aten import _aten_flash_attn_forward, _aten_flash_attn_backward  # D <= 256
+from .aten import _aten_flash_attn_forward, _aten_flash_attn_backward, _aten_efficient_attn_backward  # D <= 256
 
 if TYPE_CHECKING:
   from typing import Tuple, Union, Optional  # noqa: F401
@@ -154,7 +154,7 @@ class FFPAAttnMeta:
     dropout_p: float,
     is_causal: bool,
     scale: float | None,
-    enable_gqa: bool | None,
+    enable_gqa: bool,
   ) -> FFPAAttnMeta:
     """Fill user-facing fields and validate all inputs in place.
 
@@ -209,15 +209,12 @@ class FFPAAttnMeta:
     if query.size(3) != key.size(3) or query.size(3) != value.size(3):
       raise ValueError("query/key/value must share the same head dim")
 
-    if enable_gqa is not None:
-      if enable_gqa and query.size(1) == key.size(1):
-        pass
-      elif not enable_gqa and query.size(1) != key.size(1):
-        raise ValueError(
-          f"enable_gqa=False but query num_heads ({query.size(1)}) != "
-          f"key/value num_heads ({key.size(1)}). "
-          f"Set enable_gqa=True or use matching head counts."
-        )
+    if not enable_gqa and query.size(1) != key.size(1):
+      raise ValueError(
+        f"enable_gqa=False but query num_heads ({query.size(1)}) != "
+        f"key/value num_heads ({key.size(1)}). "
+        f"Set enable_gqa=True or use matching head counts."
+      )
 
     # TMA eligibility check — mutate self.enable_tma if needed.
     if self.enable_tma:
@@ -254,6 +251,11 @@ class FFPAAttnFunc(torch.autograd.Function):
     Triton kernels. When any input requires gradients and grad mode is
     enabled, the intermediate tensors needed by the selected backward path
     are saved on the context.
+
+    Backward is intentionally dispatch-only: backend-specific tensor
+    preparation and result restoration live in the backend wrappers under
+    ``ffpa_attn.aten`` / ``ffpa_attn.triton`` / ``ffpa_attn.cuda`` rather than
+    inside :meth:`backward` itself.
 
     Dropout is not supported for D > 256 now (always 0.0).
   """
@@ -340,17 +342,10 @@ class FFPAAttnFunc(torch.autograd.Function):
       dq: torch.Tensor
       dk: torch.Tensor
       dv: torch.Tensor
-      dk_e: torch.Tensor
-      dv_e: torch.Tensor
 
     q, k, v, O, lse, rng_state, unused = ctx.saved_tensors
     meta: FFPAAttnMeta = ctx.meta
     D = q.size(-1)
-    group_size = q.size(1) // k.size(1)
-
-    zero_u64 = torch.zeros(2, dtype=torch.uint64, device=q.device)
-    philox_seed = zero_u64[0].unsqueeze(0)
-    philox_offset = zero_u64[1].unsqueeze(0)
 
     if D > 256:
       if meta.backward_backend == "cuda":
@@ -366,132 +361,31 @@ class FFPAAttnFunc(torch.autograd.Function):
           meta.scale,
         )
       elif meta.backward_backend == "triton":
-        # Pad LSE to seqlen_q_rounded (Triton kernel needs padded stride
-        # for safe masked loads).
-        seqlen_q = q.size(2)
-        seqlen_q_rounded = ((seqlen_q + 127) // 128) * 128
-        if lse.size(-1) < seqlen_q_rounded:
-          lse_padded = torch.empty(
-            *lse.shape[:-1],
-            seqlen_q_rounded,
-            dtype=torch.float32,
-            device=lse.device,
-          )
-          lse_padded[..., :lse.size(-1)] = lse
-          lse = lse_padded
-
-        if group_size > 1:
-          k_in = k.repeat_interleave(group_size, dim=1).contiguous()
-          v_in = v.repeat_interleave(group_size, dim=1).contiguous()
-        else:
-          k_in, v_in = k, v
-
-        # Allocate gradient buffers.
-        dq = torch.empty_like(q)
-        dk_gqa = torch.empty_like(k_in)
-        dv_gqa = torch.empty_like(v_in)
-
-        _ffpa_attn_backward_triton(
-          do=grad_out.contiguous(),
-          q=q.contiguous(),
-          k=k_in.contiguous(),
-          v=v_in.contiguous(),
-          o=O.contiguous(),
+        dq, dk, dv = _ffpa_attn_backward_triton(
+          grad_out=grad_out,
+          q=q,
+          k=k,
+          v=v,
+          o=O,
           lse=lse,
-          dq=dq,
-          dk=dk_gqa,
-          dv=dv_gqa,
           causal=meta.is_causal,
           softmax_scale=meta.scale,
           autotune=meta.triton_backward_autotune,
           kernel_version=meta.triton_backward_version,
           preprocess_d_chunk=meta.triton_backward_preprocess_d_chunk,
         )
-
-        if group_size > 1:
-          dk = dk_gqa.reshape(
-            k.size(0),
-            k.size(1),
-            group_size,
-            k.size(2),
-            k.size(3),
-          ).sum(dim=2).to(k.dtype)
-          dv = dv_gqa.reshape(
-            v.size(0),
-            v.size(1),
-            group_size,
-            v.size(2),
-            v.size(3),
-          ).sum(dim=2).to(v.dtype)
-        else:
-          dk, dv = dk_gqa.to(k.dtype), dv_gqa.to(v.dtype)
-        dq = dq.to(q.dtype)
       else:
-        # SDPA delegation (original path) for D > 256 is still available as a fallback.
-        # The CUTLASS kernel inside efficient_attention_backward expects O in the stride
-        # layout produced by SDPA forward: a BNHD→BHND transposed view (stride H*D == D,
-        # stride N*D == H*D).  FFPA produces contiguous BHND O which, after the internal
-        # transpose(1,2), yields non-standard strides and triggers illegal memory accesses.
-        # We reshape FFPA's O to match SDPA's stride pattern. The mem-efficient backward also
-        # requires lse.stride(1) % 8 == 0 when num_heads > 1, so pad the sequence dimension
-        # for odd tail lengths before calling into it.
-        O = O.transpose(1, 2).contiguous().transpose(1, 2)  # noqa: E741
-        if lse.size(1) > 1 and (lse.stride(1) % 8) != 0:
-          seqlen_q_aligned = ((lse.size(-1) + 7) // 8) * 8
-          lse_padded = torch.empty(
-            *lse.shape[:-1],
-            seqlen_q_aligned,
-            dtype=lse.dtype,
-            device=lse.device,
-          )
-          lse_padded[..., :lse.size(-1)] = lse
-          lse = lse_padded
-
-        if meta.high_precision_grad:
-          _q = q.float()
-          _k = k.float()
-          _v = v.float()
-          _O = O.float()
-          _lse = lse.float()
-          _grad_out = grad_out.float()
-        else:
-          _q, _k, _v = q, k, v
-          _O, _lse, _grad_out = O, lse, grad_out
-
-        if group_size > 1:
-          k_in = _k.repeat_interleave(group_size, dim=1).contiguous()
-          v_in = _v.repeat_interleave(group_size, dim=1).contiguous()
-        else:
-          k_in, v_in = _k, _v
-
-        dq, dk_e, dv_e, _ = \
-            torch.ops.aten._scaled_dot_product_efficient_attention_backward.default(
-                _grad_out, _q, k_in, v_in, None,
-                _O, _lse,
-                philox_seed, philox_offset,
-                0.0,
-                (True, True, True, False),
-                meta.is_causal,
-                scale=meta.scale,
-            )
-        if group_size > 1:
-          dk = dk_e.reshape(
-            k.size(0),
-            k.size(1),
-            group_size,
-            k.size(2),
-            k.size(3),
-          ).sum(dim=2).to(k.dtype)
-          dv = dv_e.reshape(
-            v.size(0),
-            v.size(1),
-            group_size,
-            v.size(2),
-            v.size(3),
-          ).sum(dim=2).to(v.dtype)
-        else:
-          dk, dv = dk_e.to(k.dtype), dv_e.to(v.dtype)
-        dq = dq.to(q.dtype)
+        dq, dk, dv = _aten_efficient_attn_backward(
+          grad_out=grad_out,
+          q=q,
+          k=k,
+          v=v,
+          o=O,
+          lse=lse,
+          causal=meta.is_causal,
+          softmax_scale=meta.scale,
+          high_precision_grad=meta.high_precision_grad,
+        )
     else:
       # Aten flash-attention backward for D <= 256, which also supports dropout gradients
       # (currently always 0.0 since dropout is not supported).
