@@ -45,8 +45,8 @@ Then, try to accelerate your attention computations with just ♥️one line♥�
 >>> from ffpa_attn import ffpa_attn_func
 >>> # Monkey-patch SDPA to point to FFPA attention. Every thing that
 >>> # FFPA does not support will automatically fallback to SDPA. For
->>> # example, if the user calls SDPA with headdim <= 256, attn_mask
->>> # not None, and dropout_p > 0.0, it will fallback to the SDPA.
+>>> # example, if the user calls SDPA with headdim <= 256 or > 1024,
+>>> # attn_mask not None, and dropout_p > 0.0, etc.
 >>> F.scaled_dot_product_attention = ffpa_attn_func
 ```
 

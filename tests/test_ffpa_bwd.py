@@ -172,10 +172,7 @@ def test_ffpa_bwd_triton_preprocess_modes(dtype, preprocess_d_chunk):
   torch.testing.assert_close(v.grad, dv_ref, **tol)
 
 
-# ---------------------------------------------------------------------------
 # Basic backward correctness
-# ---------------------------------------------------------------------------
-
 BASIC_BWD_SHAPES = [
   (1, 8, 4096, 64),
   (1, 8, 4096, 320),
@@ -217,10 +214,7 @@ def test_ffpa_bwd_basic(dtype, B, H, N, D):
   torch.testing.assert_close(v.grad, dv_ref, **tol)
 
 
-# ---------------------------------------------------------------------------
 # Backward + causal
-# ---------------------------------------------------------------------------
-
 CAUSAL_BWD_SHAPES = [
   (4096, 64),
   (4096, 320),
@@ -270,10 +264,7 @@ def test_ffpa_bwd_causal(dtype, N, D):
   torch.testing.assert_close(v.grad, dv_ref, **tol)
 
 
-# ---------------------------------------------------------------------------
 # Backward + GQA
-# ---------------------------------------------------------------------------
-
 GQA_BWD_CONFIGS = [
   (16, 2, 4096, 64),  # 8x GQA
   (32, 4, 8192, 320),  # 8x GQA, large-d
@@ -349,10 +340,7 @@ def test_ffpa_bwd_sdpa_backend_gqa(dtype, Nh_q, Nh_kv, N, D):
   torch.testing.assert_close(v.grad, dv_ref, **tol)
 
 
-# ---------------------------------------------------------------------------
 # Backward + causal + GQA
-# ---------------------------------------------------------------------------
-
 CAUSAL_GQA_BWD_CONFIGS = [
   (16, 2, 4096, 64),
   (32, 4, 8192, 320),
@@ -399,10 +387,7 @@ def test_ffpa_bwd_causal_gqa(dtype, Nh_q, Nh_kv, N, D):
   torch.testing.assert_close(v.grad, dv_ref, **tol)
 
 
-# ---------------------------------------------------------------------------
 # Backward + cross-attention
-# ---------------------------------------------------------------------------
-
 CROSS_BWD_SHAPES = [
   (256, 4096, 64),
   (256, 8192, 320),
@@ -475,11 +460,7 @@ def test_ffpa_bwd_sdpa_backend_causal_cross_attention(dtype, Nq, Nkv, D):
   torch.testing.assert_close(v.grad, dv_ref, **tol)
 
 
-# ---------------------------------------------------------------------------
 # Inference path (no_grad)
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.parametrize("dtype", DTYPES, ids=["fp16", "bf16"])
 @pytest.mark.parametrize("D", HEADDIMS)
 def test_ffpa_bwd_nograd_forward_ok(dtype, D):
