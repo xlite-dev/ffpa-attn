@@ -32,12 +32,13 @@ def parse_args():
   parser.add_argument(
     "--forward-backend",
     choices=["cuda", "triton"],
-    default="triton",
+    default="cuda",
     help="Native forward backend to benchmark when not using a compare mode.",
   )
   parser.add_argument(
     "--triton-forward-autotune",
     "--autotune",
+    "--tune",
     action="store_true",
     help="Enable Triton FFPA forward autotuning (only effective for triton backend).",
   )
