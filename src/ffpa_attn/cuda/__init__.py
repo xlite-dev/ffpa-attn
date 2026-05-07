@@ -1,3 +1,4 @@
+"""CUDA FFPA attention forward/backward implementations for large-D (D > 256)."""
 import torch
 
 from ._ffpa_bwd import _ffpa_attn_backward_cuda
@@ -50,3 +51,6 @@ def _ffpa_attn_impl_fake(
 ) -> torch.Tensor:
   del Q, K, V, stages, acc, causal, softmax_scale, tma
   return O
+
+
+__all__ = ["_ffpa_attn_forward_cuda", "_ffpa_attn_backward_cuda"]

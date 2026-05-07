@@ -151,7 +151,7 @@ def time_backward(name, fn, q, k, v, dO, warmup, iters):
     fn(q_i, k_i, v_i).backward(dO)
   torch.cuda.synchronize()
   elapsed_ms = (time.time() - start) * 1000.0 / iters
-  print(f"{name:>8}: {elapsed_ms:.3f} ms")
+  print(f"{name:>14}: {elapsed_ms:.3f} ms")
   return elapsed_ms
 
 
@@ -200,7 +200,7 @@ def try_time_backend(timer, name, fn, q, k, v, dO, warmup, iters):
 def backend_label(backend, stages):
   if backend == "cuda":
     return f"cuda_s{stages}"
-  return backend
+  return f"ffpa({backend})"
 
 
 def main():
@@ -212,12 +212,14 @@ def main():
   def make_native(backend, stages):
 
     def native(q_i, k_i, v_i):
+      enable_gqa = q_i.size(1) != k_i.size(1)
       return ffpa_attn_func(
         q_i,
         k_i,
         v_i,
-        causal=args.causal,
-        softmax_scale=scale,
+        is_causal=args.causal,
+        scale=scale,
+        enable_gqa=enable_gqa,
         stages=stages,
         acc="f32",
         backward_backend=backend,
@@ -232,12 +234,14 @@ def main():
     return make_native("cuda", stages)
 
   def cuda(q_i, k_i, v_i):
+    enable_gqa = q_i.size(1) != k_i.size(1)
     return ffpa_attn_func(
       q_i,
       k_i,
       v_i,
-      causal=args.causal,
-      softmax_scale=scale,
+      is_causal=args.causal,
+      scale=scale,
+      enable_gqa=enable_gqa,
       stages=args.stages,
       acc="f32",
       backward_backend=args.backward_backend,
@@ -260,24 +264,24 @@ def main():
   if args.compare_backends:
     cuda1_ms = try_time_backend(timer, "cuda_s1", make_native("cuda", 1), q, k, v, dO, args.warmup, args.iters)
     cuda2_ms = try_time_backend(timer, "cuda_s2", make_native("cuda", 2), q, k, v, dO, args.warmup, args.iters)
-    triton_ms = try_time_backend(timer, "triton", make_native("triton", 1), q, k, v, dO, args.warmup, args.iters)
+    ffpa_ms = try_time_backend(timer, "ffpa", make_native("triton", 1), q, k, v, dO, args.warmup, args.iters)
     sdpa_ms = timer("sdpa", sdpa, q, k, v, dO, args.warmup, args.iters)
     if cuda1_ms is not None:
       print(f"speedup cuda_s1: {sdpa_ms / cuda1_ms:.3f}x vs sdpa")
     if cuda2_ms is not None:
       print(f"speedup cuda_s2: {sdpa_ms / cuda2_ms:.3f}x vs sdpa")
-    if triton_ms is not None:
-      print(f"speedup triton: {sdpa_ms / triton_ms:.3f}x vs sdpa")
+    if ffpa_ms is not None:
+      print(f"speedup ffpa: {sdpa_ms / ffpa_ms:.3f}x vs sdpa")
       if cuda1_ms is not None:
-        print(f"triton/cuda_s1: {triton_ms / cuda1_ms:.3f}x time")
+        print(f"ffpa/cuda_s1: {ffpa_ms / cuda1_ms:.3f}x time")
       if cuda2_ms is not None:
-        print(f"triton/cuda_s2: {triton_ms / cuda2_ms:.3f}x time")
+        print(f"ffpa/cuda_s2: {ffpa_ms / cuda2_ms:.3f}x time")
     if cuda1_ms is not None:
       print_max_abs_err("cuda_s1", make_native("cuda", 1), sdpa_ref, q, k, v, dO)
     if cuda2_ms is not None:
       print_max_abs_err("cuda_s2", make_native("cuda", 2), sdpa_ref, q, k, v, dO)
-    if triton_ms is not None:
-      print_max_abs_err("triton", make_native("triton", 1), sdpa_ref, q, k, v, dO)
+    if ffpa_ms is not None:
+      print_max_abs_err("ffpa", make_native("triton", 1), sdpa_ref, q, k, v, dO)
   elif args.compare_stages:
     cuda1_ms = timer("cuda_s1", make_cuda(1), q, k, v, dO, args.warmup, args.iters)
     cuda2_ms = timer("cuda_s2", make_cuda(2), q, k, v, dO, args.warmup, args.iters)

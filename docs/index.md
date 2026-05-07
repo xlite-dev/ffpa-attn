@@ -1,9 +1,9 @@
 <div align="center">
   <p align="center">
     <h2>🤖FFPA: Yet another Faster Flash Prefill Attention <br>with O(1)⚡️GPU SRAM complexity for large headdim🐑</h2>
-    <a href="./benchmark/README.md"> 📈L20 ~1.9x↑🎉 </a> | <a href="./benchmark/README.md"> 📈A30 ~1.8x↑🎉 </a> | <a href="./benchmark/README.md"> 📈3080 ~2.9x↑🎉 </a> | <a href="./benchmark/README.md"> 📈4090 ~2.1x↑🎉 </a><br>
+    <a href="./benchmark/README.md"> 📈L20 ~1.9x↑🎉 </a> | <a href="./benchmark/README.md"> 📈A30 ~1.8x↑🎉 </a> | <a href="./benchmark/README.md"> 📈3080 ~2.9x↑🎉 </a> | <a href="./benchmark/README.md"> 📈4090 ~2.1x↑🎉 </a>
   </p>
-  <img src='assets/65a8d564-8fa7-4d66-86b9-e238feb86143.png' width="500px">
+  <img src="assets/ffpa-api.png" width="600px">
 </div>
 
 **FFPA(Split-D)**: Yet another **Faster Flash Prefill Attention** with **Split-D** strategy, achieve **O(1) SRAM complexity** and **O(d/4) register complexity** for large headdim (**> 256**), **1.8x~3x** 🎉 faster than SDPA. Currently, FFPA supports self-attention, cross-attention, grouped/multi-query attention, causal attention with large headdim (D=320~1024). While the standard FlashAttention-2 only support headdim <= 256.
@@ -23,14 +23,12 @@
 
 <a id="install"></a>
 
-First, install the prebuilt package from [PyPI](https://pypi.org/project/ffpa-attn/) (required: PyTorch>=2.11.0, CUDA>=13.0, Ubuntu>=22.04):
+First, install the prebuilt package from [PyPI](https://pypi.org/project/ffpa-attn/) or build [ffpa-attn](https://github.com/xlite-dev/ffpa-attn) from source:
 
 ```bash
-pip3 install -U ffpa-attn # (support: sm_{80, 89, 90, 100, 120})
-```
-
-Or, you can build [ffpa-attn](https://github.com/xlite-dev/ffpa-attn) from source (recommended: PyTorch>=2.11.0, CUDA>=13.0):
-```bash
+# Required: PyTorch>=2.11.0, CUDA>=13.0, Ubuntu>=22.04
+pip3 install -U ffpa-attn # (support: sm_{80,90,...,120})
+# Or, build ffpa-attn from source, just follow the cmds:
 git clone https://github.com/xlite-dev/ffpa-attn.git
 # Then, build the wheel package and install it with pip
 cd ffpa-attn && MAX_JOBS=32 python3 setup.py bdist_wheel
@@ -40,8 +38,22 @@ apt install ccache && bash tools/build_fast.sh bdist_wheel
 pip3 install dist/ffpa_attn-*.whl # pip uninstall ffpa-attn -y
 ```
 
+Then, try to accelerate your attention computations with just ♥️one line♥️ of code ~
+
+```python
+>>> import torch.nn.functional as F
+>>> from ffpa_attn import ffpa_attn_func
+>>> # Monkey-patch SDPA to point to FFPA attention. Every thing that
+>>> # FFPA does not support will automatically fallback to SDPA. For
+>>> # example, if the user calls SDPA with headdim <= 256, attn_mask
+>>> # not None, and dropout_p > 0.0, it will fallback to the SDPA.
+>>> F.scaled_dot_product_attention = ffpa_attn_func
+```
+
+For more advanced features, please refer to our online docs at 📘[ffpa-attn.io](https://ffpa-attn.readthedocs.io/en/latest/).
+
 > [!NOTE]
-> FFPA supports **cross-attention** where the query seqlen ``Nq`` may differ from the key/value seqlen ``Nkv``, **GQA / MQA** attention where Q has ``Nh_q`` heads and K/V have ``Nh_kv`` heads (requires ``Nh_q % Nh_kv == 0``; group size = ``Nh_q / Nh_kv``), and **causal attention** (pass ``causal=True``; queries are aligned to the KV tail, i.e. Q row ``r`` attends to ``k <= r + (Nkv - Nq)``, which requires ``Nkv >= Nq``). K/V must share the same ``Nh_kv`` and ``Nkv``.
+> FFPA supports **cross-attention** where the query seqlen ``Nq`` may differ from the key/value seqlen ``Nkv``, **GQA / MQA** attention where Q has ``Nh_q`` heads and K/V have ``Nh_kv`` heads (requires ``Nh_q % Nh_kv == 0``; group size = ``Nh_q / Nh_kv``), and **causal attention** (pass ``is_causal=True``; queries are aligned to the KV tail, i.e. Q row ``r`` attends to ``k <= r + (Nkv - Nq)``, which requires ``Nkv >= Nq``). K/V must share the same ``Nh_kv`` and ``Nkv``. `enable_gqa` now defaults to `False` to match SDPA exactly, so GQA/MQA usage must pass `enable_gqa=True` explicitly.
 
 <a id="example-self"></a>
 
@@ -99,13 +111,14 @@ from ffpa_attn import ffpa_attn_func
 # GQA: Q has Nh_q heads, K/V share Nh_kv heads; group_size = Nh_q / Nh_kv.
 # Typical Llama-3-style 32/8 ratio; MQA is the Nh_kv==1 special case.
 # FFPA targets large headdim so we use D=512 here (FA-2 tops out at D=256).
+# enable_gqa defaults to False, so opt into GQA semantics explicitly.
 B, D, Nq, Nkv = 1, 512, 1024, 4096
 Nh_q, Nh_kv = 32, 8  # group_size = 4
 q = torch.randn(B, Nh_q,  Nq,  D, dtype=torch.bfloat16, device="cuda")
 k = torch.randn(B, Nh_kv, Nkv, D, dtype=torch.bfloat16, device="cuda")
 v = torch.randn(B, Nh_kv, Nkv, D, dtype=torch.bfloat16, device="cuda")
 
-out = ffpa_attn_func(q, k, v)  # -> (B, Nh_q, Nq, D) = (1, 32, 1024, 512)
+out = ffpa_attn_func(q, k, v, enable_gqa=True)  # -> (B, Nh_q, Nq, D) = (1, 32, 1024, 512)
 print(out.shape, out.dtype)
 
 # Reference: replicate K/V along head dim to match Q's head count.
@@ -131,7 +144,7 @@ q = torch.randn(B, H, N, D, dtype=torch.bfloat16, device="cuda")
 k = torch.randn(B, H, N, D, dtype=torch.bfloat16, device="cuda")
 v = torch.randn(B, H, N, D, dtype=torch.bfloat16, device="cuda")
 
-out = ffpa_attn_func(q, k, v, causal=True)
+out = ffpa_attn_func(q, k, v, is_causal=True)
 print(out.shape, out.dtype)
 
 ref = F.scaled_dot_product_attention(q, k, v, is_causal=True)
@@ -139,11 +152,14 @@ print(f"vs SDPA max_abs_err={(out - ref).abs().max().item():.4e}")
 
 # Chunked / decoding prefill: Nq < Nkv, queries aligned to the KV tail
 # so Q row r attends to k <= r + (Nkv - Nq). Requires Nkv >= Nq.
+# This example keeps D=512 so it stays on the FFPA large-D path. For D <= 256,
+# ffpa_attn_func forwards the inputs directly to SDPA without synthesizing a
+# causal cross-attention mask for you.
 Nq, Nkv = 128, 8192
 q = torch.randn(B, H, Nq,  D, dtype=torch.bfloat16, device="cuda")
 k = torch.randn(B, H, Nkv, D, dtype=torch.bfloat16, device="cuda")
 v = torch.randn(B, H, Nkv, D, dtype=torch.bfloat16, device="cuda")
-out = ffpa_attn_func(q, k, v, causal=True)
+out = ffpa_attn_func(q, k, v, is_causal=True)
 print(out.shape, out.dtype)  # (1, 8, 128, 512)
 ```
 
@@ -164,12 +180,7 @@ q = torch.randn(B, H, N, D, dtype=torch.bfloat16, device="cuda", requires_grad=T
 k = torch.randn(B, H, N, D, dtype=torch.bfloat16, device="cuda", requires_grad=True)
 v = torch.randn(B, H, N, D, dtype=torch.bfloat16, device="cuda", requires_grad=True)
 
-out = ffpa_attn_func(
-  q,
-  k,
-  v,
-  softmax_scale=scale,
-)
+out = ffpa_attn_func(q, k, v, scale=scale)
 out.sum().backward()
 
 dq = q.grad.detach().clone()
@@ -186,25 +197,6 @@ print(f"dQ vs SDPA dQ max_abs_err={(dq - q_ref.grad).abs().max().item():.4e}")
 print(f"dK vs SDPA dK max_abs_err={(dk - k_ref.grad).abs().max().item():.4e}")
 print(f"dV vs SDPA dV max_abs_err={(dv - v_ref.grad).abs().max().item():.4e}")
 ```
-
-Runnable examples are provided under [`examples`](./examples). The performance (forward and backward) snapshot for the NVIDIA L20 with Headdim=512 is listed below:
-
-<div align="center" markdown="1">
-
-| Case | dtype | Nq/Nkv | allclose | FFPA / SDPA | speedup |
-|:---:|:---:|:---:|:---:|:---:|:---:|
-| self-attn | fp16 | 8192/8192 | ✅ | 46.7 / 74.7 ms | 1.60x |
-| cross-attn | fp16 | 1024/8192 | ✅ | 6.32 / 9.94 ms | 1.57x |
-| gqa | fp16 | 8192/8192 | ✅ | 46.4 / 74.8 ms | 1.61x |
-| causal | fp16 | 8192/8192 | ✅ | 24.3 / 37.4 ms | 1.54x |
-| non-aligned | fp16 | 8191/8191 | ✅ | 12.3 / 19.0 ms | 1.55x |
-| self-attn | bf16 | 8192/8192 | ✅ | 46.5 / 74.7 ms | 1.61x |
-| cross-attn | bf16 | 1024/8192 | ✅ | 6.29 / 9.95 ms | 1.58x |
-| gqa | bf16 | 8192/8192 | ✅ | 46.2 / 74.7 ms | 1.62x |
-| causal | bf16 | 8192/8192 | ✅ | 24.2 / 37.5 ms | 1.55x |
-| non-aligned | bf16 | 8191/8191 | ✅ | 12.3 / 19.0 ms | 1.55x |
-
-</div>
 
 ## 📖 Split-D
 
@@ -228,11 +220,20 @@ By leveraging this approach, we can achieve better performance than SDPA EA for 
 
 </div>
 
+## 🎉 Benchmark
+
+Runnable examples are provided under [`examples`](./examples/README.md). The performance benchmark for the NVIDIA RTX 4090 with large headdim (D=320~1024) is shown below, where FFPA achieves up to **2.1x** 🎉 faster than SDPA. For more comprehensive benchmarks, please refer to our [benchmark](./benchmark/README.md).
+
+<div align='center'>
+  <img src='https://github.com/user-attachments/assets/447e2937-f7c8-47c8-8550-8c0c71b910e6' width="330px">
+  <img src='https://github.com/user-attachments/assets/65a8d564-8fa7-4d66-86b9-e238feb86143' width="330px">
+</div>
+
 ## 🤔 Why not TMA?
 
 <div id="why-not-tma"></div>
 
-FFPA ships an experimental SM90 TMA path (**tma=True**) that replaces the K/V [cp.async](https://docs.nvidia.com/cuda/parallel-thread-execution/index.html?highlight=cp%2520async#data-movement-and-conversion-instructions-cp-async) global-to-shared transfer with [cp.async.bulk.tensor.2d](https://docs.nvidia.com/cuda/parallel-thread-execution/index.html?highlight=cp%2520async%2520bulk%2520tensor%25202d#data-movement-and-conversion-instructions-cp-async-bulk-tensor). After tuning (K SWIZZLE_128B, 64-col TMA box) it reaches parity with the cp.async baseline, but does not beat it.
+FFPA ships an experimental SM90 TMA path (**enable_tma=True**) that replaces the K/V [cp.async](https://docs.nvidia.com/cuda/parallel-thread-execution/index.html?highlight=cp%2520async#data-movement-and-conversion-instructions-cp-async) global-to-shared transfer with [cp.async.bulk.tensor.2d](https://docs.nvidia.com/cuda/parallel-thread-execution/index.html?highlight=cp%2520async%2520bulk%2520tensor%25202d#data-movement-and-conversion-instructions-cp-async-bulk-tensor). After tuning (K SWIZZLE_128B, 64-col TMA box) it reaches parity with the cp.async baseline, but does not beat it.
 
 **FFPA's Split-D dataflow is a TMA anti-pattern**. TMA wins when single thread instruction can amortise its dispatch cost over a large box, but split-D gives it narrow **Bc** x **kMmaAtomK** slices. It would require a major redesign (**super-tiled K/V on TMA** + **warp-specialized** [WGMMA](https://docs.nvidia.com/cuda/parallel-thread-execution/index.html?highlight=cp%2520async%2520bulk%2520tensor%25202d#asynchronous-warpgroup-level-matrix-instructions)), rather than a drop-in K/V replacement.
 

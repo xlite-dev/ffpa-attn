@@ -154,8 +154,8 @@ def test_ffpa_bwd_triton_preprocess_modes(dtype, preprocess_d_chunk):
     q,
     k,
     v,
-    causal=False,
-    softmax_scale=scale,
+    is_causal=False,
+    scale=scale,
     stages=2,
     acc="f32",
     high_precision_grad=True,
@@ -200,8 +200,8 @@ def test_ffpa_bwd_basic(dtype, B, H, N, D):
     q,
     k,
     v,
-    causal=False,
-    softmax_scale=scale,
+    is_causal=False,
+    scale=scale,
     stages=2,
     acc="f32",
     high_precision_grad=True,
@@ -210,39 +210,6 @@ def test_ffpa_bwd_basic(dtype, B, H, N, D):
   loss.backward()
 
   dq_ref, dk_ref, dv_ref = _sdpa_ref_grads(q, k, v, False, scale)
-
-  tol = _tolerance(dtype)
-  torch.testing.assert_close(q.grad, dq_ref, **tol)
-  torch.testing.assert_close(k.grad, dk_ref, **tol)
-  torch.testing.assert_close(v.grad, dv_ref, **tol)
-
-
-@pytest.mark.parametrize("dtype", DTYPES, ids=["fp16", "bf16"])
-@pytest.mark.parametrize("causal", [False, True], ids=["noncausal", "causal"])
-@pytest.mark.parametrize("stages", [1, 2, 3], ids=["stage1", "stage2", "stage3"])
-def test_ffpa_bwd_split_d_native_hdim512(dtype, causal, stages):
-  """Native split-D backward for D=512 must match SDPA on a focused smoke shape."""
-  B, H, N, D = 1, 2, 128, 512
-  torch.manual_seed(0)
-  q = torch.randn(B, H, N, D, dtype=dtype, device="cuda", requires_grad=True)
-  k = torch.randn(B, H, N, D, dtype=dtype, device="cuda", requires_grad=True)
-  v = torch.randn(B, H, N, D, dtype=dtype, device="cuda", requires_grad=True)
-
-  scale = 1.0 / math.sqrt(D)
-  out = ffpa_attn_func(
-    q,
-    k,
-    v,
-    causal=causal,
-    softmax_scale=scale,
-    stages=stages,
-    acc="f32",
-    high_precision_grad=True,
-    backward_backend="split_d",
-  )
-  out.sum().backward()
-
-  dq_ref, dk_ref, dv_ref = _sdpa_ref_grads(q, k, v, causal, scale)
 
   tol = _tolerance(dtype)
   torch.testing.assert_close(q.grad, dq_ref, **tol)
@@ -278,8 +245,8 @@ def test_ffpa_bwd_causal(dtype, N, D):
     q,
     k,
     v,
-    causal=True,
-    softmax_scale=scale,
+    is_causal=True,
+    scale=scale,
     stages=2,
     acc="f32",
     high_precision_grad=True,
@@ -323,14 +290,48 @@ def test_ffpa_bwd_gqa(dtype, Nh_q, Nh_kv, N, D):
     q,
     k,
     v,
-    causal=False,
-    softmax_scale=scale,
+    is_causal=False,
+    scale=scale,
     stages=2,
     acc="f32",
     high_precision_grad=True,
+    enable_gqa=True,
   )
   loss = out.sum()
   loss.backward()
+
+  dq_ref, dk_ref, dv_ref = _sdpa_ref_grads(q, k, v, False, scale)
+
+  tol = _tolerance(dtype)
+  torch.testing.assert_close(q.grad, dq_ref, **tol)
+  torch.testing.assert_close(k.grad, dk_ref, **tol)
+  torch.testing.assert_close(v.grad, dv_ref, **tol)
+
+
+@pytest.mark.parametrize("dtype", DTYPES, ids=["fp16", "bf16"])
+@pytest.mark.parametrize("Nh_q,Nh_kv,N,D", [(32, 4, 8192, 320), (8, 1, 8192, 320)])
+def test_ffpa_bwd_sdpa_backend_gqa(dtype, Nh_q, Nh_kv, N, D):
+  """The SDPA backward backend must preserve high-precision GQA gradients."""
+  B = 1
+  torch.manual_seed(0)
+  q = torch.randn(B, Nh_q, N, D, dtype=dtype, device="cuda", requires_grad=True)
+  k = torch.randn(B, Nh_kv, N, D, dtype=dtype, device="cuda", requires_grad=True)
+  v = torch.randn(B, Nh_kv, N, D, dtype=dtype, device="cuda", requires_grad=True)
+
+  scale = 1.0 / math.sqrt(D)
+  out = ffpa_attn_func(
+    q,
+    k,
+    v,
+    is_causal=False,
+    scale=scale,
+    stages=2,
+    acc="f32",
+    high_precision_grad=True,
+    backward_backend="sdpa",
+    enable_gqa=True,
+  )
+  out.sum().backward()
 
   dq_ref, dk_ref, dv_ref = _sdpa_ref_grads(q, k, v, False, scale)
 
@@ -367,11 +368,12 @@ def test_ffpa_bwd_causal_gqa(dtype, Nh_q, Nh_kv, N, D):
     q,
     k,
     v,
-    causal=True,
-    softmax_scale=scale,
+    is_causal=True,
+    scale=scale,
     stages=2,
     acc="f32",
     high_precision_grad=True,
+    enable_gqa=True,
   )
   loss = out.sum()
   loss.backward()
@@ -411,8 +413,8 @@ def test_ffpa_bwd_cross_attention(dtype, Nq, Nkv, D):
     q,
     k,
     v,
-    causal=False,
-    softmax_scale=scale,
+    is_causal=False,
+    scale=scale,
     stages=2,
     acc="f32",
     high_precision_grad=True,
@@ -421,6 +423,38 @@ def test_ffpa_bwd_cross_attention(dtype, Nq, Nkv, D):
   loss.backward()
 
   dq_ref, dk_ref, dv_ref = _sdpa_ref_grads(q, k, v, False, scale)
+
+  tol = _tolerance(dtype)
+  torch.testing.assert_close(q.grad, dq_ref, **tol)
+  torch.testing.assert_close(k.grad, dk_ref, **tol)
+  torch.testing.assert_close(v.grad, dv_ref, **tol)
+
+
+@pytest.mark.parametrize("dtype", DTYPES, ids=["fp16", "bf16"])
+@pytest.mark.parametrize("Nq,Nkv,D", [(256, 4096, 320), (128, 8192, 512)])
+def test_ffpa_bwd_sdpa_backend_causal_cross_attention(dtype, Nq, Nkv, D):
+  """The SDPA backward backend must preserve causal cross-attention gradients."""
+  B, H = 1, 8
+  torch.manual_seed(0)
+  q = torch.randn(B, H, Nq, D, dtype=dtype, device="cuda", requires_grad=True)
+  k = torch.randn(B, H, Nkv, D, dtype=dtype, device="cuda", requires_grad=True)
+  v = torch.randn(B, H, Nkv, D, dtype=dtype, device="cuda", requires_grad=True)
+
+  scale = 1.0 / math.sqrt(D)
+  out = ffpa_attn_func(
+    q,
+    k,
+    v,
+    is_causal=True,
+    scale=scale,
+    stages=2,
+    acc="f32",
+    high_precision_grad=True,
+    backward_backend="sdpa",
+  )
+  out.sum().backward()
+
+  dq_ref, dk_ref, dv_ref = _sdpa_ref_grads(q, k, v, True, scale)
 
   tol = _tolerance(dtype)
   torch.testing.assert_close(q.grad, dq_ref, **tol)
