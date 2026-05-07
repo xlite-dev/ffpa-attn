@@ -54,7 +54,7 @@ def ffpa_attn_func(
   enable_gqa: bool | None = None,
   **kwargs: object,
 ) -> torch.Tensor:
-  """Unified FFPA prefill attention entry.
+  """FFPA: Faster Flash Prefill Attention for large headdims (D > 256).
 
   Signature aligned with ``torch.nn.functional.scaled_dot_product_attention``.
   Dispatches by ``query.dtype`` (fp16 / bf16) and ``acc`` through a single

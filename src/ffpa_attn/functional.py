@@ -126,6 +126,9 @@ class FFPAAttnMeta:
       raise ValueError(f"acc must be 'f16' or 'f32', got {acc_str!r}")
 
     return cls(
+      # NOTE: Some of these fields maybe updated later by normalize() based on
+      # the public API inputs, but we need to set them to some value here to create
+      # the instance.
       is_causal=False,
       scale=0.0,
       dropout_p=0.0,
@@ -252,7 +255,7 @@ class FFPAAttnFunc(torch.autograd.Function):
     enabled, the intermediate tensors needed by the selected backward path
     are saved on the context.
 
-    Dropout is not supported (always 0.0).
+    Dropout is not supported for D > 256 now (always 0.0).
   """
 
   @staticmethod
