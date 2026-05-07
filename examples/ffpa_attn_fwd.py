@@ -28,7 +28,6 @@ import torch.nn.functional as F
 
 from ffpa_attn import ffpa_attn_func
 
-D = 512
 STAGES = 2
 WARMUP, ITERS = 2, 10
 
@@ -41,6 +40,8 @@ def _parse_args() -> argparse.Namespace:
     default="cuda",
     help="Forward backend passed to ffpa_attn_func.",
   )
+  parser.add_argument("--N", type=int, default=8192, help="Sequence length (non-aligned uses N-1).")
+  parser.add_argument("--D", type=int, default=512, help="Head dimension.")
   parser.add_argument("--seed", type=int, default=0, help="Random seed for input tensors.")
   parser.add_argument(
     "--triton-forward-autotune",
@@ -87,6 +88,7 @@ def _run_case(
   Nh_kv: int,
   Nq: int,
   Nkv: int,
+  D: int,
   causal: bool = False,
   acc: str = "f32",
 ) -> None:
@@ -145,6 +147,7 @@ def _run_case(
 def main() -> None:
   args = _parse_args()
   print(args)
+  N, D = args.N, args.D
 
   if not torch.cuda.is_available():
     raise SystemExit("CUDA is required to run this example.")
@@ -159,8 +162,9 @@ def main() -> None:
       B=1,
       Nh_q=32,
       Nh_kv=32,
-      Nq=8192,
-      Nkv=8192,
+      Nq=N,
+      Nkv=N,
+      D=D,
     )
     _run_case(
       "cross-attn",
@@ -172,7 +176,8 @@ def main() -> None:
       Nh_q=32,
       Nh_kv=32,
       Nq=1024,
-      Nkv=8192,
+      Nkv=N,
+      D=D,
     )
     _run_case(
       "gqa",
@@ -183,8 +188,9 @@ def main() -> None:
       B=1,
       Nh_q=32,
       Nh_kv=8,
-      Nq=8192,
-      Nkv=8192,
+      Nq=N,
+      Nkv=N,
+      D=D,
     )
     _run_case(
       "causal",
@@ -195,8 +201,9 @@ def main() -> None:
       B=1,
       Nh_q=32,
       Nh_kv=32,
-      Nq=8192,
-      Nkv=8192,
+      Nq=N,
+      Nkv=N,
+      D=D,
       causal=True,
     )
     _run_case(
@@ -208,8 +215,9 @@ def main() -> None:
       B=1,
       Nh_q=8,
       Nh_kv=8,
-      Nq=8191,
-      Nkv=8191,
+      Nq=N - 1,
+      Nkv=N - 1,
+      D=D,
     )
 
 
