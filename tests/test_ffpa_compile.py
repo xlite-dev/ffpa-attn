@@ -13,9 +13,8 @@ from ffpa_attn import ffpa_attn_func
 # enough recompilations to avoid hitting the default limit of 8.
 torch._dynamo.config.recompile_limit = 64
 
+
 # Fixtures & helpers
-
-
 @pytest.fixture(scope="module", autouse=True)
 def _require_cuda():
   if not torch.cuda.is_available():
@@ -41,9 +40,8 @@ BWD_SHAPES = [
 
 DTYPES = [torch.float16, torch.bfloat16]
 
+
 # Forward-only compile tests
-
-
 @pytest.mark.parametrize("dtype", DTYPES, ids=["fp16", "bf16"])
 @pytest.mark.parametrize("B,H,N,D", FWD_SHAPES)
 def test_compile_forward_cuda(dtype, B, H, N, D):
@@ -129,8 +127,6 @@ def test_compile_backward(dtype, B, H, N, D, fw, bw):
 
 
 # Compile modes
-
-
 @pytest.mark.parametrize("mode", ["default", "reduce-overhead"])
 @pytest.mark.parametrize("dtype", DTYPES, ids=["fp16", "bf16"])
 def test_compile_modes_forward(mode, dtype):
@@ -150,8 +146,6 @@ def test_compile_modes_forward(mode, dtype):
 
 
 # GQA compile test
-
-
 @pytest.mark.parametrize("dtype", DTYPES, ids=["fp16", "bf16"])
 def test_compile_gqa(dtype):
   """torch.compile with GQA shapes matches eager across backend pairs."""
@@ -197,8 +191,6 @@ def test_compile_gqa(dtype):
 
 
 # Causal compile test
-
-
 @pytest.mark.parametrize("dtype", DTYPES, ids=["fp16", "bf16"])
 @pytest.mark.parametrize("fw,bw", [("cuda", "triton"), ("triton", "triton")], ids=["cuda-triton", "triton-triton"])
 def test_compile_causal(dtype, fw, bw):
