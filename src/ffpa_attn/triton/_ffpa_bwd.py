@@ -24,8 +24,7 @@ Phase 2 (per Q-block, D-chunk):
 
 delta = rowsum(dO * O) is precomputed.
 
-Known Limitations & Future Optimizations
------------------------------------------
+Known Limitations & Future Optimizations:
 1. **Q / dO / K repeated HBM reads across D-chunks.**  Phase 1 and Phase 2
    both iterate over D-chunks independently.  For D=512 with BLOCK_HEADDIM=128
    this means 4 chunks x 2 phases = 8 HBM loads each for Q, dO and K.  A
@@ -374,10 +373,10 @@ def _gen_bwd_autotune_configs(block_n_values: tuple[int, ...], headdim: int = 51
   #     power-of-2.  The kernel's load/store masks (d_offs < headdim) zero out the
   #     padding columns, so correctness is preserved.
   # tl.arange requires a power-of-2 range, so next_power_of_2 always produces a
-  # valid block size.  Only included on high-SMEM devices (Ada/Hopper, >= 128 KB);
+  # valid block size. Only included on high-SMEM devices (Ada/Hopper, >= 96 KB);
   # skip when next_pow2 is already in [64, 128, 256] (dedup).
   _next_pow2 = triton.next_power_of_2(headdim)
-  if _max_smem >= 128 * 1024 and _next_pow2 not in _headdim_candidates:  # 128 KB
+  if _max_smem >= 96 * 1024 and _next_pow2 not in _headdim_candidates:  # 96 KB
     _headdim_candidates.append(_next_pow2)
 
   configs = []
