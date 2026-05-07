@@ -1195,24 +1195,18 @@ def _ffpa_attn_backward_triton(
   else:
     k_in, v_in = k, v
 
-  dq = torch.empty_like(q)
-  dk_expanded = torch.empty_like(k_in)
-  dv_expanded = torch.empty_like(v_in)
-  _ffpa_attn_backward_triton_impl(
-    do=grad_out.contiguous(),
-    q=q.contiguous(),
-    k=k_in.contiguous(),
-    v=v_in.contiguous(),
-    o=o.contiguous(),
-    lse=lse,
-    dq=dq,
-    dk=dk_expanded,
-    dv=dv_expanded,
-    causal=causal,
-    softmax_scale=softmax_scale,
-    autotune=autotune,
-    kernel_version=kernel_version,
-    preprocess_d_chunk=preprocess_d_chunk,
+  dq, dk_expanded, dv_expanded = torch.ops.ffpa_attn._bwd_triton(
+    grad_out.contiguous(),
+    q.contiguous(),
+    k_in.contiguous(),
+    v_in.contiguous(),
+    o.contiguous(),
+    lse,
+    softmax_scale or (1.0 / math.sqrt(q.size(-1))),
+    int(causal),
+    int(autotune),
+    int(kernel_version == "v2"),
+    int(preprocess_d_chunk),
   )
 
   if group_size > 1:

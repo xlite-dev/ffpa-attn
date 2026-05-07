@@ -1,12 +1,11 @@
 """Public Python interface for FFPA prefill attention.
 
-The CUDA backend package registers the native forward kernel as a
-``torch.library`` operator so callers (including ``torch.compile`` graphs)
-can reach it through ``torch.ops.ffpa_attn.attn`` instead of calling the
-C-extension symbol directly.
+The CUDA and Triton backend packages register forward / backward kernels as
+``torch.library`` operators under ``torch.ops.ffpa_attn`` so that
+``torch.compile`` can trace through the forward path as proper custom ops.
 
-Backward pass delegates to PyTorch SDPA backward functions, routing by
-headdim: SDPA for D <= 256, efficient_attention_backward for D > 256.
+Backward pass delegates to the registered FFPA backward ops or PyTorch SDPA
+backward functions, routing by headdim and user-selected backend.
 Small-D directly delegates to ``torch.nn.functional.scaled_dot_product_attention``;
 large-D forward continues to use the FFPA CUDA or Triton kernels.
 """

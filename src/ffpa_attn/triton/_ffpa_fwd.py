@@ -364,17 +364,12 @@ def _ffpa_attn_forward_triton(
   softmax_scale: float = 0.0,
   autotune: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-  """Call the Triton FFPA forward, returning ``(O, softmax_lse)``.
+  """Call the Triton FFPA forward via registered torch op, returning ``(O, softmax_lse)``.
 
-  :param Q: Query tensor with layout ``[B, Nh_q, Nq, D]``.
-  :param K: Key tensor with layout ``[B, Nh_kv, Nkv, D]``.
-  :param V: Value tensor with layout ``[B, Nh_kv, Nkv, D]``.
-  :param O: Optional output tensor with layout ``[B, Nh_q, Nq, D]``.
-  :param causal: Whether to apply lower-right causal masking.
-  :param softmax_scale: Scale applied to ``Q @ K.T``.
-  :param autotune: Whether to enable Triton forward autotuning.
-  :return: Tuple ``(O, softmax_lse)``.  ``softmax_lse`` stores natural-log
-      LSE values with visible shape ``[B, Nh_q, Nq]``.
+  The ``O`` parameter is accepted for API compatibility but ignored — the
+  registered op always allocates a fresh output buffer.
+
+  :returns: Output tensor and softmax LSE sliced to visible shape ``[B, Nh_q, Nq]``.
   """
   if Q.stride(-1) != 1:
     Q = Q.contiguous()
@@ -382,29 +377,15 @@ def _ffpa_attn_forward_triton(
     K = K.contiguous()
   if V.stride(-1) != 1:
     V = V.contiguous()
-  if O is None:
-    O = torch.empty_like(Q)  # noqa: E741
-  if O.stride(-1) != 1:
-    raise ValueError("Triton forward requires O.stride(-1) == 1")
+  del O
 
   seqlen_q = Q.size(2)
-  seqlen_q_aligned = ((seqlen_q + 127) // 128) * 128
-  softmax_lse_storage = torch.empty(
-    Q.size(0),
-    Q.size(1),
-    seqlen_q_aligned,
-    dtype=torch.float32,
-    device=Q.device,
-  )
-  softmax_lse = softmax_lse_storage[..., :seqlen_q]
-  _ffpa_attn_forward_impl(
+  O_storage, softmax_lse_storage = torch.ops.ffpa_attn._fwd_triton(
     Q,
     K,
     V,
-    O,
-    softmax_lse,
-    causal=causal,
-    softmax_scale=softmax_scale,
-    autotune=autotune,
+    softmax_scale,
+    int(causal),
+    int(autotune),
   )
-  return O, softmax_lse
+  return O_storage, softmax_lse_storage[..., :seqlen_q]
