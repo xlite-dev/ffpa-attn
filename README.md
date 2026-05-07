@@ -10,7 +10,7 @@
 
 <div align='center'>
 
-|[Self Attn](./examples)| [GQA/MQA](./examples) |[Cross/Decode](./examples)|[Causal](./examples)|[Headdim](#ffpa-design)|[Fwd (CUDA)↑](./examples)|[Bwd (Triton)↑](./examples)|
+|[Self Attn](./examples)| [GQA/MQA](./examples) |[Cross Attn](./examples)|[Causal](./examples)|[Headdim](#ffpa-design)|[Fwd (CUDA)↑](./examples)|[Bwd (Triton)↑](./examples)|
 |:---:|:---:|:---:|:---:|:---:|:---:|:---:|
 |✔️(`Nq = Nkv`)|✔️|✔️(`Nq != Nkv`)|✔️|**320~1024** |**1.8x~3x↑🎉** |**1.5x~2.5x↑🎉** |
 
