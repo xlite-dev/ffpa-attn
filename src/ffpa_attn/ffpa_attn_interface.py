@@ -139,6 +139,9 @@ def ffpa_attn_func(
     # The dispatch branch for D <= 256 in FFPAAttnFunc is kept as a safety check
     # but should never be hit because the routing decision is made here in the
     # public interface.
+    # NOTE: We choose to directly dispatch to SDPA without any checks and changes
+    # to the input tensors bacasue FFPA and SDPA shared the same input layout and
+    # dtype requirements. So, just let SDPA check the inputs itself is enough.
     return F.scaled_dot_product_attention(
       query,
       key,
@@ -147,7 +150,7 @@ def ffpa_attn_func(
       dropout_p=dropout_p,
       is_causal=is_causal,
       scale=scale,
-      enable_gqa=enable_gqa or False,
+      enable_gqa=enable_gqa,
     )
 
   return FFPAAttnFunc.apply(query, key, value, _meta)

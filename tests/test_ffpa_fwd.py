@@ -206,6 +206,7 @@ def test_ffpa_attn_func_small_d_honors_output_buffer():
   torch.testing.assert_close(out, ref, **_tolerance(torch.float16))
 
 
+@pytest.mark.skip(reason="D <= 256 now delegates to F.scaled_dot_product_attention directly, bypassing FFPAAttnFunc")
 def test_ffpa_attn_func_small_d_backward_consumes_saved_flash_state(monkeypatch):
   q, k, v = _alloc_qkv(1, 4, 32, 128, torch.float16)
   q = q.requires_grad_(True)

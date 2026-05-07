@@ -129,7 +129,7 @@ def try_time_backend(name, fn, q, k, v, warmup, iters):
 def backend_label(backend, stages):
   if backend == "cuda":
     return f"cuda_s{stages}"
-  return backend
+  return f"ffpa({backend})"
 
 
 def main():
@@ -170,27 +170,27 @@ def main():
   if args.compare_backends:
     cuda1 = make_native("cuda", 1)
     cuda2 = make_native("cuda", 2)
-    triton = make_native("triton", 1)
+    ffpa_triton = make_native("triton", 1)
     cuda1_ms = try_time_backend("cuda_s1", cuda1, q, k, v, args.warmup, args.iters)
     cuda2_ms = try_time_backend("cuda_s2", cuda2, q, k, v, args.warmup, args.iters)
-    triton_ms = try_time_backend("triton", triton, q, k, v, args.warmup, args.iters)
+    ffpa_ms = try_time_backend("ffpa(triton)", ffpa_triton, q, k, v, args.warmup, args.iters)
     sdpa_ms = time_forward("sdpa", sdpa, q, k, v, args.warmup, args.iters)
     if cuda1_ms is not None:
       print(f"speedup cuda_s1: {sdpa_ms / cuda1_ms:.3f}x vs sdpa")
     if cuda2_ms is not None:
       print(f"speedup cuda_s2: {sdpa_ms / cuda2_ms:.3f}x vs sdpa")
-    if triton_ms is not None:
-      print(f"speedup triton: {sdpa_ms / triton_ms:.3f}x vs sdpa")
+    if ffpa_ms is not None:
+      print(f"speedup ffpa(triton): {sdpa_ms / ffpa_ms:.3f}x vs sdpa")
       if cuda1_ms is not None:
-        print(f"triton/cuda_s1: {triton_ms / cuda1_ms:.3f}x time")
+        print(f"ffpa(triton)/cuda_s1: {ffpa_ms / cuda1_ms:.3f}x time")
       if cuda2_ms is not None:
-        print(f"triton/cuda_s2: {triton_ms / cuda2_ms:.3f}x time")
+        print(f"ffpa(triton)/cuda_s2: {ffpa_ms / cuda2_ms:.3f}x time")
     if cuda1_ms is not None:
       print_abs_err("cuda_s1", cuda1, ref, q, k, v)
     if cuda2_ms is not None:
       print_abs_err("cuda_s2", cuda2, ref, q, k, v)
-    if triton_ms is not None:
-      print_abs_err("triton", triton, ref, q, k, v)
+    if ffpa_ms is not None:
+      print_abs_err("ffpa(triton)", ffpa_triton, ref, q, k, v)
   elif args.compare_stages:
     cuda1 = make_native("cuda", 1)
     cuda2 = make_native("cuda", 2)
