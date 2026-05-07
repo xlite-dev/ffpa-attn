@@ -13,9 +13,7 @@ from ffpa_attn import ffpa_attn_func
 # enough recompilations to avoid hitting the default limit of 8.
 torch._dynamo.config.recompile_limit = 64
 
-# ---------------------------------------------------------------------------
 # Fixtures & helpers
-# ---------------------------------------------------------------------------
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -43,9 +41,7 @@ BWD_SHAPES = [
 
 DTYPES = [torch.float16, torch.bfloat16]
 
-# ---------------------------------------------------------------------------
 # Forward-only compile tests
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("dtype", DTYPES, ids=["fp16", "bf16"])
@@ -86,15 +82,12 @@ def test_compile_forward_triton(dtype, B, H, N, D):
   assert torch.isfinite(out).all()
 
 
-# ---------------------------------------------------------------------------
 # Forward + backward compile tests.
-#
-# Use fullgraph=False because _apply_ffpa_autograd is guarded with
+# Use fullgraph=False because _ffpa_apply is guarded with
 # torch._dynamo.disable to prevent Dynamo from inlining the autograd
 # Function and replacing the real backward with an auto-generated template.
 # The forward path (including all torch.ops.ffpa_attn.* calls) is still
 # fully captured up to the graph break at the Function boundary.
-# ---------------------------------------------------------------------------
 
 _BACKEND_PAIRS = [
   # (forward_backend, backward_backend)
@@ -135,9 +128,7 @@ def test_compile_backward(dtype, B, H, N, D, fw, bw):
   torch.testing.assert_close(v.grad, grads_ref[2], **_tolerance(dtype))
 
 
-# ---------------------------------------------------------------------------
 # Compile modes
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("mode", ["default", "reduce-overhead"])
@@ -158,9 +149,7 @@ def test_compile_modes_forward(mode, dtype):
   torch.testing.assert_close(out, eager, **_tolerance(dtype))
 
 
-# ---------------------------------------------------------------------------
 # GQA compile test
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("dtype", DTYPES, ids=["fp16", "bf16"])
@@ -207,9 +196,7 @@ def test_compile_gqa(dtype):
   torch.testing.assert_close(v.grad, grads_ref[2], atol=5e-2, rtol=5e-2)
 
 
-# ---------------------------------------------------------------------------
 # Causal compile test
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("dtype", DTYPES, ids=["fp16", "bf16"])
@@ -257,11 +244,7 @@ def test_compile_causal(dtype, fw, bw):
   torch.testing.assert_close(v.grad, grads_ref[2], **_tolerance(dtype))
 
 
-# ---------------------------------------------------------------------------
 # Repeated invocation (cache hit) test
-# ---------------------------------------------------------------------------
-
-
 def test_compile_repeated_invocation():
   """Multiple calls through the same compiled function produce consistent output."""
   torch.manual_seed(0)

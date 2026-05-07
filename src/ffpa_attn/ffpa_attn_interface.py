@@ -13,7 +13,6 @@ large-D forward continues to use the FFPA CUDA or Triton kernels.
 from __future__ import annotations
 
 import torch
-import torch.nn.functional as F  # noqa: F401
 from .functional import FFPAAttnFunc, FFPAAttnMeta
 
 

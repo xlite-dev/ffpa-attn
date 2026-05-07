@@ -15,9 +15,19 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from .cuda import _ffpa_attn_forward_cuda, _ffpa_attn_backward_cuda  # D > 256
-from .triton import _ffpa_attn_forward_triton, _ffpa_attn_backward_triton  # D > 256
-from .aten import _aten_flash_attn_forward, _aten_flash_attn_backward, _aten_efficient_attn_backward  # D <= 256
+from .cuda import (
+  _ffpa_attn_forward_cuda,
+  _ffpa_attn_backward_cuda,
+)  # D > 256
+from .triton import (
+  _ffpa_attn_forward_triton,
+  _ffpa_attn_backward_triton,
+)  # D > 256
+from .aten import (
+  _aten_flash_attn_forward,
+  _aten_flash_attn_backward,
+  _aten_efficient_attn_backward,
+)  # D <= 256
 
 if TYPE_CHECKING:
   from typing import Tuple, Union, Optional  # noqa: F401

@@ -9,9 +9,7 @@ from ._ffpa_fwd import _ffpa_attn_forward_cuda
 
 _OP_NAMESPACE = "ffpa_attn"
 
-# ---------------------------------------------------------------------------
-# _fwd_cuda  --  ffpa_attn::_fwd_cuda
-# ---------------------------------------------------------------------------
+# ffpa_attn::_fwd_cuda
 torch.library.define(
   f"{_OP_NAMESPACE}::_fwd_cuda",
   "(Tensor q, Tensor k, Tensor v, int stages, int acc, int causal, "
@@ -72,9 +70,7 @@ def _fwd_cuda_fake(
   return O, softmax_lse
 
 
-# ---------------------------------------------------------------------------
-# _bwd_cuda  --  ffpa_attn::_bwd_cuda
-# ---------------------------------------------------------------------------
+# ffpa_attn::_bwd_cuda
 torch.library.define(
   f"{_OP_NAMESPACE}::_bwd_cuda",
   "(Tensor q, Tensor k, Tensor v, Tensor o, Tensor softmax_lse, Tensor dO, "

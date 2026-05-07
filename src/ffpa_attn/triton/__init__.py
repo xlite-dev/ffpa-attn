@@ -8,9 +8,6 @@ from ._ffpa_bwd import _ffpa_attn_backward_triton
 
 _OP_NAMESPACE = "ffpa_attn"
 
-# ---------------------------------------------------------------------------
-# _fwd_triton  --  ffpa_attn::_fwd_triton
-# ---------------------------------------------------------------------------
 torch.library.define(
   f"{_OP_NAMESPACE}::_fwd_triton",
   "(Tensor q, Tensor k, Tensor v, float softmax_scale, "
@@ -74,9 +71,6 @@ def _fwd_triton_fake(
   return o, softmax_lse
 
 
-# ---------------------------------------------------------------------------
-# _bwd_triton  --  ffpa_attn::_bwd_triton
-# ---------------------------------------------------------------------------
 torch.library.define(
   f"{_OP_NAMESPACE}::_bwd_triton",
   "(Tensor dO, Tensor q, Tensor k, Tensor v, Tensor o, Tensor lse, "
