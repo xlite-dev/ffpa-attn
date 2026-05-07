@@ -33,7 +33,24 @@ def _ffpa_attn_forward_cuda(
     O = torch.zeros_like(Q)  # noqa: E741
   seqlen_q = Q.size(2)
   seqlen_q_aligned = ((seqlen_q + 7) // 8) * 8
-  softmax_lse_storage = torch.empty(Q.size(0), Q.size(1), seqlen_q_aligned, dtype=torch.float32, device=Q.device)
+  softmax_lse_storage = torch.empty(
+    Q.size(0),
+    Q.size(1),
+    seqlen_q_aligned,
+    dtype=torch.float32,
+    device=Q.device,
+  )
   softmax_lse = softmax_lse_storage[..., :seqlen_q]
-  _ffpa_attn_fwd_cuda(Q, K, V, O, softmax_lse, stages, acc, causal, softmax_scale, tma)
+  _ffpa_attn_fwd_cuda(
+    Q,
+    K,
+    V,
+    O,
+    softmax_lse,
+    stages,
+    acc,
+    causal,
+    softmax_scale,
+    tma,
+  )
   return O, softmax_lse
