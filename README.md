@@ -6,18 +6,18 @@
   <img src="docs/assets/ffpa-api.png" width="700px">
 </div>
 
-**FFPA(Split-D)**: Yet another **Faster Flash Prefill Attention** with **Split-D** strategy, achieve **O(1) SRAM complexity** and **O(d/4) register complexity** for large headdim (**> 256**), **1.8x~3x** 🎉 faster than SDPA. Currently, FFPA supports self-attention, cross-attention, grouped/multi-query attention, causal attention with large headdim (D=320~1024). While the standard FlashAttention-2 only support headdim <= 256.
+**FFPA(Split-D)**: Yet another **Faster Flash Prefill Attention** with **Split-D** strategy, achieve **O(1) SRAM complexity** and **O(d/4) register complexity** for large headdim (**> 256**), **1.8x~3x** 🎉 faster than SDPA. 👇Core features:
 
 <div align='center'>
 
-|[Self Attention](#example-self)| [Cross/Decode Attention](#example-cross)|[GQA/MQA Attention](#example-gqa)|[Causal Attention](#example-causal)|[Headdim](#ffpa-design)|
-|:---:|:---:|:---:|:---:|:---:|
-|✔️(`Nq = Nkv`)|✔️(`Nq != Nkv`)|✔️(`Nh_q % Nh_kv == 0`)|✔️(`causal mask`)|**32~1024** |
+|[Self Attn](./examples)| [GQA/MQA](./examples) |[Cross/Decode](./examples)|[Causal](./examples)|[Headdim](#ffpa-design)|[Fwd (CUDA)↑](./examples)|[Bwd (Triton)↑](./examples)|
+|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+|✔️(`Nq = Nkv`)|✔️|✔️(`Nq != Nkv`)|✔️|**320~1024** |**1.8x~3x↑🎉** |**1.5x~2.5x↑🎉** |
 
 </div>
 
 > [!NOTE]
-> FFPA has been tested on `Ampere`, `Ada`, `Hopper`, and `Blackwell` architectures (e.g., A30, L20, 4090, H200, 5090), achieves `1.8×~3×↑🎉` forward (CUDA) and `1.5×~2.5×↑🎉` backward (Triton w/ autotune) speedup over SDPA for headdim `> 256`.
+> FFPA has been tested on `Ampere`, `Ada`, `Hopper`, and `Blackwell` architectures (e.g., A30, L20, 4090, H200, 5090), achieves `1.8×~3×↑🎉` forward and `1.5×~2.5×↑🎉` backward speedup over SDPA.
 
 ## 📖 Quick Start
 
@@ -38,7 +38,7 @@ apt install ccache && bash tools/build_fast.sh bdist_wheel
 pip3 install dist/ffpa_attn-*.whl # pip uninstall ffpa-attn -y
 ```
 
-Then, try to accelerate your attention computations with just ♥️one line♥️ of code ~
+Then, try to accelerate the attention for large headdim with just <i><b>one-line</b></i> of code:
 
 ```python
 >>> import torch.nn.functional as F
@@ -47,7 +47,7 @@ Then, try to accelerate your attention computations with just ♥️one line♥�
 >>> # FFPA does not support will automatically fallback to SDPA. For
 >>> # example, if the user calls SDPA with headdim <= 256 or > 1024,
 >>> # attn_mask not None, and dropout_p > 0.0, etc.
->>> F.scaled_dot_product_attention = ffpa_attn_func
+>>> F.scaled_dot_product_attention = ffpa_attn_func # one-line code
 ```
 
 For more advanced features, please refer to our online docs at 📘[ffpa-attn.io](https://ffpa-attn.readthedocs.io/en/latest/).
@@ -56,11 +56,15 @@ For more advanced features, please refer to our online docs at 📘[ffpa-attn.io
 
 <a id="ffpa-design"></a>
 
-We have extended FlashAttention for large headdim (D > 256) by implementing **Fine-grained Tiling** at the **MMA level (GEMM style)** for the Q@K^T and P@V matmul (namely, **Split-D**). This approach results in a constant SRAM usage of Br * 16 or Bc * 16 (Br = Bc) for Q, K, and V, leading to an overall SRAM complexity of O(Br * 16) ≈ O(1) and a register complexity of O(d/4). Consequently, this method allows us to extend headdim > 256 and achieve faster performance compared to SDPA with or without MMA Accumulation F32 (**1.8x~3x** 🎉 faster than SDPA EA).
+We extend FlashAttention to support large headdim ($D>256$) via **fine-grained tiling** at the **MMA** level for $QK^\top$ and $PV$ matrix multiplication, referred to as **Split-D**. This design keeps SRAM usage fixed at $B_r \times 16$ (with $B_r=B_c$) for Q, K and V, yielding constant SRAM complexity $O(B_r \times 16) \approx O(1)$ and register complexity $O(d/4)$.
 
 <div align='center'>
   <img src=https://github.com/user-attachments/assets/ed30185b-2e11-4293-832f-43e9003d6ad9 width="700px">
+  </p><i>
+    <b>FFPA</b> enables headdim <b> > 256</b>, and outperforms standard SDPA by <b>1.8x~3x</b>🎉.
+  </i></p>
 </div>
+
 
 ## 🎉 Benchmark
 
@@ -77,22 +81,6 @@ Runnable examples are provided under [`examples`](./examples). The performance b
 <div id="License"></div>
 
 Apache License 2.0
-
-## 🎉Contribute
-
-<div id="Contribute"></div>
-
-How to contribute? Wecome to star⭐️ this repo to support me👆🏻 ~
-
-<div align='center'>
-<a href="https://star-history.com/#xlite-dev/ffpa-attn&Date">
- <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=xlite-dev/ffpa-attn&type=Date&theme=dark" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=xlite-dev/ffpa-attn&type=Date" />
-   <img img width=450 height=300 alt="Star History Chart" src="https://api.star-history.com/svg?repos=xlite-dev/ffpa-attn&type=Date" />
- </picture>
-</a>
-</div>
 
 ## ©️Citations
 

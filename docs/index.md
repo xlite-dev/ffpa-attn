@@ -3,25 +3,25 @@
     <h2>🤖FFPA: Yet another Faster Flash Prefill Attention <br>with O(1)⚡️GPU SRAM complexity for large headdim🐑</h2>
     <a href="./benchmark/README.md"> 📈L20 ~1.9x↑🎉 </a> | <a href="./benchmark/README.md"> 📈A30 ~1.8x↑🎉 </a> | <a href="./benchmark/README.md"> 📈3080 ~2.9x↑🎉 </a> | <a href="./benchmark/README.md"> 📈4090 ~2.1x↑🎉 </a>
   </p>
-  <img src="assets/ffpa-api.png" width="600px">
+  <img src="assets/ffpa-api.png" width="700px">
 </div>
 
-**FFPA(Split-D)**: Yet another **Faster Flash Prefill Attention** with **Split-D** strategy, achieve **O(1) SRAM complexity** and **O(d/4) register complexity** for large headdim (**> 256**), **1.8x~3x** 🎉 faster than SDPA. Currently, FFPA supports self-attention, cross-attention, grouped/multi-query attention, causal attention with large headdim (D=320~1024). While the standard FlashAttention-2 only support headdim <= 256.
+**FFPA(Split-D)**: Yet another **Faster Flash Prefill Attention** with **Split-D** strategy, achieve **O(1) SRAM complexity** and **O(d/4) register complexity** for large headdim (**> 256**), **1.8x~3x** 🎉 faster than SDPA. 👇Core features:
 
-<div align="center" markdown="1">
+<div align='center' markdown="1">
 
-|[Self Attention](#example-self)| [Cross/Decode Attention](#example-cross)|[GQA/MQA Attention](#example-gqa)|[Causal Attention](#example-causal)|[Headdim](#ffpa-design)|
-|:---:|:---:|:---:|:---:|:---:|
-|✔️(`Nq = Nkv`)|✔️(`Nq != Nkv`)|✔️(`Nh_q % Nh_kv == 0`)|✔️(`causal mask`)|**32~1024** |
+|[Self Attn](./examples/README.md)| [GQA/MQA](./examples/README.md) |[Cross/Decode](./examples/README.md)|[Causal](./examples/README.md)|[Headdim](#ffpa-design)|[Fwd (CUDA)↑](./examples/README.md)|[Bwd (Triton)↑](./examples/README.md)|
+|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+|✔️(`Nq = Nkv`)|✔️|✔️(`Nq != Nkv`)|✔️|**320~1024** |**1.8x~3x↑🎉** |**1.5x~2.5x↑🎉** |
 
 </div>
 
 > [!NOTE]
-> FFPA has been tested on `Ampere`, `Ada`, `Hopper`, and `Blackwell` architectures (e.g., A30, L20, 4090, H200, 5090), achieves `1.8×~3×↑🎉` forward (CUDA) and `1.5×~2.5×↑🎉` backward (Triton w/ autotune) speedup over SDPA for headdim `> 256`.
+> FFPA has been tested on `Ampere`, `Ada`, `Hopper`, and `Blackwell` architectures (e.g., A30, L20, 4090, H200, 5090), achieves `1.8×~3×↑🎉` forward and `1.5×~2.5×↑🎉` backward speedup over SDPA.
 
 ## 📖 Quick Start
 
-<a id="install"></a>
+<div id="install"></div>
 
 First, install the prebuilt package from [PyPI](https://pypi.org/project/ffpa-attn/) or build [ffpa-attn](https://github.com/xlite-dev/ffpa-attn) from source:
 
@@ -38,16 +38,16 @@ apt install ccache && bash tools/build_fast.sh bdist_wheel
 pip3 install dist/ffpa_attn-*.whl # pip uninstall ffpa-attn -y
 ```
 
-Then, try to accelerate your attention computations with just ♥️one line♥️ of code ~
+Then, try to accelerate the attention for large headdim with just <i><b>one-line</b></i> of code:
 
 ```python
 >>> import torch.nn.functional as F
 >>> from ffpa_attn import ffpa_attn_func
 >>> # Monkey-patch SDPA to point to FFPA attention. Every thing that
 >>> # FFPA does not support will automatically fallback to SDPA. For
->>> # example, if the user calls SDPA with headdim <= 256, attn_mask
->>> # not None, and dropout_p > 0.0, it will fallback to the SDPA.
->>> F.scaled_dot_product_attention = ffpa_attn_func
+>>> # example, if the user calls SDPA with headdim <= 256 or > 1024,
+>>> # attn_mask not None, and dropout_p > 0.0, etc.
+>>> F.scaled_dot_product_attention = ffpa_attn_func # one-line code
 ```
 
 For more advanced features, please refer to our online docs at 📘[ffpa-attn.io](https://ffpa-attn.readthedocs.io/en/latest/).
@@ -202,22 +202,13 @@ print(f"dV vs SDPA dV max_abs_err={(dv - v_ref.grad).abs().max().item():.4e}")
 
 <a id="ffpa-design"></a>
 
-We have extended FlashAttention for large headdim (D > 256) by implementing **Fine-grained Tiling** at the **MMA level (GEMM style)** for the Q@K^T and P@V matmul (namely, **Split-D**). This approach results in a constant SRAM usage of Br * 16 or Bc * 16 (Br = Bc) for Q, K, and V, leading to an overall SRAM complexity of O(Br * 16) ≈ O(1) and a register complexity of O(d/4). Consequently, this method allows us to extend headdim > 256 and achieve faster performance compared to SDPA with or without MMA Accumulation F32 (**1.8x~3x** 🎉 faster than SDPA EA).
+We extend FlashAttention to support large headdim ($D>256$) via **fine-grained tiling** at the **MMA** level for $QK^\top$ and $PV$ matrix multiplication, referred to as **Split-D**. This design keeps SRAM usage fixed at $B_r \times 16$ (with $B_r=B_c$) for Q, K and V, yielding constant SRAM complexity $O(B_r \times 16) \approx O(1)$ and register complexity $O(d/4)$.
 
-<img src=assets/ed30185b-2e11-4293-832f-43e9003d6ad9.png >
-We have named this new attention tiling technique **FFPA: Faster Flash Prefill Attention**. FFPA does not introduce any additional VRAM requirement, so the HBM memory complexity remains the same as FlashAttention.
-
-By leveraging this approach, we can achieve better performance than SDPA EA for very large headdim (D > 256, `FA-2 not supported`). Approximate SRAM and register complexity analysis for FFPA is as follows: (`d`=headdim, `C,Br,Bc`=Constant, `Br=Bc`, let O(C)≈O(1)) 👇
-
-<div align="center" markdown="1">
-
-|📚Complexity Analysis| 📚FFPA Attention (Split-D)| 📚FlashAttention-2 |
-|:---:|:---:|:---:|
-|SRAM | O(2xBrx16)≈O(1) | ≈O(3xBrxd), d↑ |
-|Register | ≈O(d/4), d↑ | ≈O(d/2), d↑ |
-|HBM| ≈FA2≈O(Nd), O | ≈O(Nd), O |
-|Extra HBM| ≈FA2≈O(N), m,l | ≈O(N), m,l |
-
+<div align='center'>
+  <img src=https://github.com/user-attachments/assets/ed30185b-2e11-4293-832f-43e9003d6ad9 width="700px">
+  </p><i>
+    <b>FFPA</b> enables headdim <b> > 256</b>, and outperforms standard SDPA by <b>1.8x~3x</b>🎉.
+  </i></p>
 </div>
 
 ## 🎉 Benchmark
@@ -225,9 +216,10 @@ By leveraging this approach, we can achieve better performance than SDPA EA for 
 Runnable examples are provided under [`examples`](./examples/README.md). The performance benchmark for the NVIDIA RTX 4090 with large headdim (D=320~1024) is shown below, where FFPA achieves up to **2.1x** 🎉 faster than SDPA. For more comprehensive benchmarks, please refer to our [benchmark](./benchmark/README.md).
 
 <div align='center'>
-  <img src='https://github.com/user-attachments/assets/447e2937-f7c8-47c8-8550-8c0c71b910e6' width="330px">
-  <img src='https://github.com/user-attachments/assets/65a8d564-8fa7-4d66-86b9-e238feb86143' width="330px">
+  <img src='https://github.com/user-attachments/assets/447e2937-f7c8-47c8-8550-8c0c71b910e6' width="350px">
+  <img src='https://github.com/user-attachments/assets/65a8d564-8fa7-4d66-86b9-e238feb86143' width="350px">
 </div>
+
 
 ## 🤔 Why not TMA?
 
