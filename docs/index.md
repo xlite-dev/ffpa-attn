@@ -27,7 +27,7 @@ First, install the prebuilt package from [PyPI](https://pypi.org/project/ffpa-at
 
 ```bash
 # Required: PyTorch>=2.11.0, CUDA>=13.0, Ubuntu>=22.04
-pip3 install -U ffpa-attn # (support: sm_{80~120})
+pip3 install -U ffpa-attn # (support: sm_{80,90,...,120})
 # Or, build ffpa-attn from source, just follow the cmds:
 git clone https://github.com/xlite-dev/ffpa-attn.git
 # Then, build the wheel package and install it with pip
