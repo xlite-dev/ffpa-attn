@@ -40,6 +40,20 @@ apt install ccache && bash tools/build_fast.sh bdist_wheel
 pip3 install dist/ffpa_attn-*.whl # pip uninstall ffpa-attn -y
 ```
 
+Then, try to accelerate your attention computations with just ♥️one line♥️ of code ~
+
+```python
+>>> import torch.nn.functional as F
+>>> from ffpa_attn import ffpa_attn_func
+>>> # Monkey-patch SDPA to point to FFPA attention. Every thing that
+>>> # FFPA does not support will automatically fallback to SDPA. For
+>>> # example, if the user calls SDPA with headdim <= 256, attn_mask
+>>> # not None, and dropout_p > 0.0, it will fallback to the SDPA.
+>>> F.scaled_dot_product_attention = ffpa_attn_func
+```
+
+For more advanced features, please refer to our online docs at 📘[ffpa-attn.io](https://ffpa-attn.readthedocs.io/en/latest/).
+
 > [!NOTE]
 > FFPA supports **cross-attention** where the query seqlen ``Nq`` may differ from the key/value seqlen ``Nkv``, **GQA / MQA** attention where Q has ``Nh_q`` heads and K/V have ``Nh_kv`` heads (requires ``Nh_q % Nh_kv == 0``; group size = ``Nh_q / Nh_kv``), and **causal attention** (pass ``is_causal=True``; queries are aligned to the KV tail, i.e. Q row ``r`` attends to ``k <= r + (Nkv - Nq)``, which requires ``Nkv >= Nq``). K/V must share the same ``Nh_kv`` and ``Nkv``. `enable_gqa` now defaults to `False` to match SDPA exactly, so GQA/MQA usage must pass `enable_gqa=True` explicitly.
 

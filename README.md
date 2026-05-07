@@ -40,151 +40,19 @@ apt install ccache && bash tools/build_fast.sh bdist_wheel
 pip3 install dist/ffpa_attn-*.whl # pip uninstall ffpa-attn -y
 ```
 
-> [!NOTE]
-> FFPA supports **cross-attention** where the query seqlen ``Nq`` may differ from the key/value seqlen ``Nkv``, **GQA / MQA** attention where Q has ``Nh_q`` heads and K/V have ``Nh_kv`` heads (requires ``Nh_q % Nh_kv == 0``; group size = ``Nh_q / Nh_kv``), and **causal attention** (pass ``is_causal=True``; queries are aligned to the KV tail, i.e. Q row ``r`` attends to ``k <= r + (Nkv - Nq)``, which requires ``Nkv >= Nq``). K/V must share the same ``Nh_kv`` and ``Nkv``. `enable_gqa` now defaults to `False` to match SDPA exactly, so GQA/MQA usage must pass `enable_gqa=True` explicitly.
+Then, try to accelerate your attention computations with just ♥️one line♥️ of code ~
 
-<div id="example-self"></div>
-
-Minimal usage example — **Self-Attention** (B=1, H=32, N=8192, D=512):
 ```python
-import torch
-import torch.nn.functional as F
-from ffpa_attn import ffpa_attn_func
-
-# D: 32, 64, ..., 320, ..., 1024 (FA-2 <= 256, FFPA supports up to 1024).
-B, H, N, D = 1, 32, 8192, 512 # batch_size, num_heads, seq_len, head_dim
-q = torch.randn(B, H, N, D, dtype=torch.bfloat16, device="cuda")
-k = torch.randn(B, H, N, D, dtype=torch.bfloat16, device="cuda")
-v = torch.randn(B, H, N, D, dtype=torch.bfloat16, device="cuda")
-
-# FFPA self attention; layout follows SDPA: (B, H, N, D).
-out = ffpa_attn_func(q, k, v)  # -> torch.Tensor of shape (B, H, N, D)
-print(out.shape, out.dtype)
-
-ref = F.scaled_dot_product_attention(q, k, v)
-print(f"vs SDPA max_abs_err={(out - ref).abs().max().item():.4e}")
+>>> import torch.nn.functional as F
+>>> from ffpa_attn import ffpa_attn_func
+>>> # Monkey-patch SDPA to point to FFPA attention. Every thing that
+>>> # FFPA does not support will automatically fallback to SDPA. For
+>>> # example, if the user calls SDPA with headdim <= 256, attn_mask
+>>> # not None, and dropout_p > 0.0, it will fallback to the SDPA.
+>>> F.scaled_dot_product_attention = ffpa_attn_func
 ```
 
-<div id="example-cross"></div>
-
-**Cross-Attention** or **Decoding-Attention** example (short query, long KV cache; `Nq != Nkv`):
-```python
-import torch
-import torch.nn.functional as F
-from ffpa_attn import ffpa_attn_func
-
-# Short-query / long-KV, e.g. incremental decoding or cross-attention:
-# Q: [B, H, Nq, D], K/V: [B, H, Nkv, D]; Nq can differ from Nkv but Nk==Nv required.
-B, H, D = 1, 8, 512
-Nq, Nkv = 128, 8192
-q = torch.randn(B, H, Nq,  D, dtype=torch.bfloat16, device="cuda")
-k = torch.randn(B, H, Nkv, D, dtype=torch.bfloat16, device="cuda")
-v = torch.randn(B, H, Nkv, D, dtype=torch.bfloat16, device="cuda")
-
-out = ffpa_attn_func(q, k, v)  # -> (B, H, Nq, D) = (1, 8, 128, 512)
-print(out.shape, out.dtype)
-
-ref = F.scaled_dot_product_attention(q, k, v)
-print(f"vs SDPA max_abs_err={(out - ref).abs().max().item():.4e}")
-```
-
-<div id="example-gqa"></div>
-
-**Grouped-Query / Multi-Query Attention** example (Q has more heads than K/V):
-```python
-import torch
-import torch.nn.functional as F
-from ffpa_attn import ffpa_attn_func
-
-# GQA: Q has Nh_q heads, K/V share Nh_kv heads; group_size = Nh_q / Nh_kv.
-# Typical Llama-3-style 32/8 ratio; MQA is the Nh_kv==1 special case.
-# FFPA targets large headdim so we use D=512 here (FA-2 tops out at D=256).
-# enable_gqa defaults to False, so opt into GQA semantics explicitly.
-B, D, Nq, Nkv = 1, 512, 1024, 4096
-Nh_q, Nh_kv = 32, 8  # group_size = 4
-q = torch.randn(B, Nh_q,  Nq,  D, dtype=torch.bfloat16, device="cuda")
-k = torch.randn(B, Nh_kv, Nkv, D, dtype=torch.bfloat16, device="cuda")
-v = torch.randn(B, Nh_kv, Nkv, D, dtype=torch.bfloat16, device="cuda")
-
-out = ffpa_attn_func(q, k, v, enable_gqa=True)  # -> (B, Nh_q, Nq, D) = (1, 32, 1024, 512)
-print(out.shape, out.dtype)
-
-# Reference: replicate K/V along head dim to match Q's head count.
-group_size = Nh_q // Nh_kv
-k_ref = k.repeat_interleave(group_size, dim=1)
-v_ref = v.repeat_interleave(group_size, dim=1)
-ref = F.scaled_dot_product_attention(q, k_ref, v_ref)
-print(f"vs SDPA max_abs_err={(out - ref).abs().max().item():.4e}")
-```
-
-<div id="example-causal"></div>
-
-**Causal Attention** example (self-attention causal; also supports chunked / decoding prefill with `Nkv > Nq`):
-```python
-import torch
-import torch.nn.functional as F
-from ffpa_attn import ffpa_attn_func
-
-# Causal self-attention: Q row r attends to k <= r (standard triangular mask).
-# FFPA is tuned for large headdim, so we keep D=512 as in the self-attn example.
-B, H, N, D = 1, 8, 4096, 512
-q = torch.randn(B, H, N, D, dtype=torch.bfloat16, device="cuda")
-k = torch.randn(B, H, N, D, dtype=torch.bfloat16, device="cuda")
-v = torch.randn(B, H, N, D, dtype=torch.bfloat16, device="cuda")
-
-out = ffpa_attn_func(q, k, v, is_causal=True)
-print(out.shape, out.dtype)
-
-ref = F.scaled_dot_product_attention(q, k, v, is_causal=True)
-print(f"vs SDPA max_abs_err={(out - ref).abs().max().item():.4e}")
-
-# Chunked / decoding prefill: Nq < Nkv, queries aligned to the KV tail
-# so Q row r attends to k <= r + (Nkv - Nq). Requires Nkv >= Nq.
-# This example keeps D=512 so it stays on the FFPA large-D path. For D <= 256,
-# ffpa_attn_func forwards the inputs directly to SDPA without synthesizing a
-# causal cross-attention mask for you.
-Nq, Nkv = 128, 8192
-q = torch.randn(B, H, Nq,  D, dtype=torch.bfloat16, device="cuda")
-k = torch.randn(B, H, Nkv, D, dtype=torch.bfloat16, device="cuda")
-v = torch.randn(B, H, Nkv, D, dtype=torch.bfloat16, device="cuda")
-out = ffpa_attn_func(q, k, v, is_causal=True)
-print(out.shape, out.dtype)  # (1, 8, 128, 512)
-```
-
-<div id="example-backward"></div>
-
-**Backward Pass** example (compare dQ / dK / dV against SDPA):
-```python
-import math
-import torch
-import torch.nn.functional as F
-from ffpa_attn import ffpa_attn_func
-
-# Focus on a large-headdim case where FFPA is typically used.
-B, H, N, D = 1, 32, 8192, 512
-scale = 1.0 / math.sqrt(D)
-
-q = torch.randn(B, H, N, D, dtype=torch.bfloat16, device="cuda", requires_grad=True)
-k = torch.randn(B, H, N, D, dtype=torch.bfloat16, device="cuda", requires_grad=True)
-v = torch.randn(B, H, N, D, dtype=torch.bfloat16, device="cuda", requires_grad=True)
-
-out = ffpa_attn_func(q, k, v, scale=scale)
-out.sum().backward()
-
-dq = q.grad.detach().clone()
-dk = k.grad.detach().clone()
-dv = v.grad.detach().clone()
-
-q_ref = q.detach().clone().requires_grad_(True)
-k_ref = k.detach().clone().requires_grad_(True)
-v_ref = v.detach().clone().requires_grad_(True)
-out_ref = F.scaled_dot_product_attention(q_ref, k_ref, v_ref, scale=scale)
-out_ref.sum().backward()
-
-print(f"dQ vs SDPA dQ max_abs_err={(dq - q_ref.grad).abs().max().item():.4e}")
-print(f"dK vs SDPA dK max_abs_err={(dk - k_ref.grad).abs().max().item():.4e}")
-print(f"dV vs SDPA dV max_abs_err={(dv - v_ref.grad).abs().max().item():.4e}")
-```
+For more advanced features, please refer to our online docs at 📘[ffpa-attn.io](https://ffpa-attn.readthedocs.io/en/latest/).
 
 ## 📖 Split-D
 
