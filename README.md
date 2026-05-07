@@ -3,8 +3,7 @@
     <h2>🤖FFPA: Yet another Faster Flash Prefill Attention <br>with O(1)⚡️GPU SRAM complexity for large headdim🐑</h2>
     <a href="https://zhuanlan.zhihu.com/p/13975660308">📚FFPA(Split-D) Blog</a> | <a href="./bench/README.md#bench-l20"> 📈L20 ~1.9x↑🎉 </a> | <a href="./bench/README.md#bench-a30"> 📈A30 ~1.8x↑🎉 </a> | <a href="./bench/README.md#bench-3080"> 📈3080 ~2.9x↑🎉 </a> | <a href="./bench/README.md#bench-4090"> 📈4090 ~2.1x↑🎉 </a>
   </p>
-  <img src='https://github.com/user-attachments/assets/447e2937-f7c8-47c8-8550-8c0c71b910e6' width="411px">
-  <img src='https://github.com/user-attachments/assets/65a8d564-8fa7-4d66-86b9-e238feb86143' width="411px">
+  <img src="docs/assets/ffpa-api.png">
 </div>
 
 **FFPA(Split-D)**: Yet another **Faster Flash Prefill Attention** with **Split-D** strategy, achieve **O(1) SRAM complexity** and **O(d/4) register complexity** for large headdim (**> 256**), **1.8x~3x** 🎉 faster than SDPA. Currently, FFPA supports self-attention, cross-attention, grouped/multi-query attention, causal attention with large headdim (D=320~1024). While the standard FlashAttention-2 only support headdim <= 256.
@@ -19,12 +18,6 @@
 
 > [!NOTE]
 > FFPA has been tested on `Ampere`, `Ada`, `Hopper`, and `Blackwell` architectures (e.g., A30, L20, 4090, H200, 5090), achieves `1.8×~3×↑🎉` forward (CUDA) and `1.5×~2.5×↑🎉` backward (Triton w/ autotune) speedup over SDPA for headdim `> 256`.
-
-## 📖 API Overview
-
-<div align="center">
-  <img src="docs/assets/ffpa-api.png" >
-</div>
 
 ## 📖 Quick Start
 
@@ -194,25 +187,6 @@ print(f"dK vs SDPA dK max_abs_err={(dk - k_ref.grad).abs().max().item():.4e}")
 print(f"dV vs SDPA dV max_abs_err={(dv - v_ref.grad).abs().max().item():.4e}")
 ```
 
-Runnable examples are provided under [`examples`](./examples). The performance (forward and backward) snapshot for the NVIDIA L20 with Headdim=512 is listed below:
-
-<div align='center'>
-
-| Case | dtype | Nq/Nkv | allclose | FFPA / SDPA | speedup |
-|:---:|:---:|:---:|:---:|:---:|:---:|
-| self-attn | fp16 | 8192/8192 | ✅ | 46.7 / 74.7 ms | 1.60x |
-| cross-attn | fp16 | 1024/8192 | ✅ | 6.32 / 9.94 ms | 1.57x |
-| gqa | fp16 | 8192/8192 | ✅ | 46.4 / 74.8 ms | 1.61x |
-| causal | fp16 | 8192/8192 | ✅ | 24.3 / 37.4 ms | 1.54x |
-| non-aligned | fp16 | 8191/8191 | ✅ | 12.3 / 19.0 ms | 1.55x |
-| self-attn | bf16 | 8192/8192 | ✅ | 46.5 / 74.7 ms | 1.61x |
-| cross-attn | bf16 | 1024/8192 | ✅ | 6.29 / 9.95 ms | 1.58x |
-| gqa | bf16 | 8192/8192 | ✅ | 46.2 / 74.7 ms | 1.62x |
-| causal | bf16 | 8192/8192 | ✅ | 24.2 / 37.5 ms | 1.55x |
-| non-aligned | bf16 | 8191/8191 | ✅ | 12.3 / 19.0 ms | 1.55x |
-
-</div>
-
 ## 📖 Split-D
 
 <a id="ffpa-design"></a>
@@ -237,6 +211,16 @@ By leveraging this approach, we can achieve better performance than SDPA EA for 
 |Extra HBM| ≈FA2≈O(N), m,l | ≈O(N), m,l |
 
 </div>
+
+## 🎉 Benchmark
+
+Runnable examples are provided under [`examples`](./examples). The performance benchmark for the NVIDIA RTX 4090 with Headdim>=320 is shown below, where FFPA achieves up to **2.1x** 🎉 faster than SDPA for large headdim (D=320~1024). For more comprehensive benchmarks, please refer to our [benchmark](./bench/README.md).
+
+<div align='center'>
+  <img src='https://github.com/user-attachments/assets/447e2937-f7c8-47c8-8550-8c0c71b910e6' width="411px">
+  <img src='https://github.com/user-attachments/assets/65a8d564-8fa7-4d66-86b9-e238feb86143' width="411px">
+</div>
+
 
 ## 🤔 Why not TMA?
 
