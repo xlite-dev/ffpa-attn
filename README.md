@@ -16,9 +16,6 @@
 
 </div>
 
-> [!NOTE]
-> FFPA has been tested on `Ampere`, `Ada`, `Hopper`, and `Blackwell` architectures (e.g., A30, L20, 4090, H200, 5090), achieves `1.8×~3×↑🎉` forward and `1.5×~2.5×↑🎉` backward speedup over SDPA.
-
 ## 📖 Quick Start
 
 <div id="install"></div>
@@ -65,6 +62,8 @@ We extend FlashAttention to support large headdim ($D>256$) via **fine-grained t
   </i></p>
 </div>
 
+> [!NOTE]
+> FFPA has been tested on `Ampere`, `Ada`, `Hopper`, and `Blackwell` architectures (e.g., A30, L20, 4090, H200, 5090), achieves `1.8×~3×↑🎉` forward and `1.5×~2.5×↑🎉` backward speedup over SDPA.
 
 ## 🎉 Benchmark
 
