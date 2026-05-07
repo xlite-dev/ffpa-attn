@@ -62,31 +62,16 @@ We have extended FlashAttention for large headdim (D > 256) by implementing **Fi
   <img src=https://github.com/user-attachments/assets/ed30185b-2e11-4293-832f-43e9003d6ad9 >
 </div>
 
-We have named this new attention tiling technique **FFPA: Faster Flash Prefill Attention**. FFPA does not introduce any additional VRAM requirement, so the HBM memory complexity remains the same as FlashAttention.
-
-By leveraging this approach, we can achieve better performance than SDPA EA for very large headdim (D > 256, `FA-2 not supported`). Approximate SRAM and register complexity analysis for FFPA is as follows: (`d`=headdim, `C,Br,Bc`=Constant, `Br=Bc`, let O(C)≈O(1)) 👇
-
-<div align='center'>
-
-|📚Complexity Analysis| 📚FFPA Attention (Split-D)| 📚FlashAttention-2 |
-|:---:|:---:|:---:|
-|SRAM | O(2xBrx16)≈O(1) | ≈O(3xBrxd), d↑ |
-|Register | ≈O(d/4), d↑ | ≈O(d/2), d↑ |
-|HBM| ≈FA2≈O(Nd), O | ≈O(Nd), O |
-|Extra HBM| ≈FA2≈O(N), m,l | ≈O(N), m,l |
-
-</div>
-
 ## 🎉 Benchmark
 
-Runnable examples are provided under [`examples`](./examples). The performance benchmark for the NVIDIA RTX 4090 with large headdim (D=320~1024) is shown below, where FFPA achieves up to **2.1x** 🎉 faster than SDPA. For more comprehensive benchmarks, please refer to our [benchmark](./bench/README.md).
+Runnable examples are provided under [`examples`](./examples). The performance benchmark for the 4090 with large headdim (D=320~1024) is shown below. Please refer to our [bench](./bench/README.md) for more details.
 
 <div align='center'>
   <img src='https://github.com/user-attachments/assets/447e2937-f7c8-47c8-8550-8c0c71b910e6' width="411px">
   <img src='https://github.com/user-attachments/assets/65a8d564-8fa7-4d66-86b9-e238feb86143' width="411px">
 </div>
 
-
+<!--
 ## 🤔 Why not TMA?
 
 <div id="why-not-tma"></div>
@@ -94,6 +79,7 @@ Runnable examples are provided under [`examples`](./examples). The performance b
 FFPA ships an experimental SM90 TMA path (**enable_tma=True**) that replaces the K/V [cp.async](https://docs.nvidia.com/cuda/parallel-thread-execution/index.html?highlight=cp%2520async#data-movement-and-conversion-instructions-cp-async) global-to-shared transfer with [cp.async.bulk.tensor.2d](https://docs.nvidia.com/cuda/parallel-thread-execution/index.html?highlight=cp%2520async%2520bulk%2520tensor%25202d#data-movement-and-conversion-instructions-cp-async-bulk-tensor). After tuning (K SWIZZLE_128B, 64-col TMA box) it reaches parity with the cp.async baseline, but does not beat it.
 
 **FFPA's Split-D dataflow is a TMA anti-pattern**. TMA wins when single thread instruction can amortise its dispatch cost over a large box, but split-D gives it narrow **Bc** x **kMmaAtomK** slices. It would require a major redesign (**super-tiled K/V on TMA** + **warp-specialized** [WGMMA](https://docs.nvidia.com/cuda/parallel-thread-execution/index.html?highlight=cp%2520async%2520bulk%2520tensor%25202d#asynchronous-warpgroup-level-matrix-instructions)), rather than a drop-in K/V replacement.
+-->
 
 ## ©️License
 
