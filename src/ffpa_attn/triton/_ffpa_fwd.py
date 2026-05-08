@@ -61,11 +61,17 @@ def _gen_fwd_autotune_configs(headdim: int = 256, autotune_mode: str = "max") ->
   # valid block size.  Only included on high-SMEM devices to keep register pressure
   # manageable; skip when next_pow2 is already in [64, 128, 256] (dedup).
   _next_pow2 = triton.next_power_of_2(headdim)
-  if _max_smem >= 96 * 1024 and _next_pow2 not in _headdim_candidates and autotune_mode == "max":  # 96 KB
+  # 96 KB is the minimum SMEM for a full-D block with FFPA's current memory layout
+  if all([
+    _max_smem >= 96 * 1024,
+    _next_pow2 > 256,
+    _next_pow2 <= _MAX_HEADDIM,
+    autotune_mode == "max",
+  ]):
     _headdim_candidates.append(_next_pow2)
 
   if autotune_mode == "fast":
-    _headdim_candidates = [candidate for candidate in _headdim_candidates if candidate <= 128 or candidate == headdim]
+    _headdim_candidates = [c for c in _headdim_candidates if c <= 128]
 
   configs = []
   for block_m in [64, 128]:
@@ -111,22 +117,28 @@ def _gen_decode_fwd_stage1_autotune_configs(
 
   _headdim_candidates = [64, 128]
   _next_pow2 = triton.next_power_of_2(headdim)
-  if use_gemv and _max_smem >= 96 * 1024 and _next_pow2 not in _headdim_candidates and autotune_mode == "max":
+  if all([
+    use_gemv,
+    _max_smem >= 96 * 1024,
+    _next_pow2 > 128,
+    _next_pow2 <= _MAX_HEADDIM,
+    autotune_mode == "max",
+  ]):
     _headdim_candidates.append(_next_pow2)
 
   if use_gemv:
     block_m_candidates = [8]
     block_n_candidates = [64, 128]
-    if headdim <= 64 and autotune_mode == "max":
+    if autotune_mode == "max":
       block_n_candidates.append(256)
   else:
-    block_m_candidates = [8, 16, 32, 64] if autotune_mode == "max" else [8, 16, 32]
+    block_m_candidates = [8, 16, 32] if autotune_mode == "max" else [8, 16]
     block_n_candidates = [64, 128]
-    if headdim <= 64 and autotune_mode == "max":
+    if autotune_mode == "max":
       block_n_candidates.append(256)
 
   if autotune_mode == "fast":
-    _headdim_candidates = [candidate for candidate in _headdim_candidates if candidate <= 128 or candidate == headdim]
+    _headdim_candidates = [c for c in _headdim_candidates if c <= 128]
 
   configs = []
   for block_n in block_n_candidates:
@@ -724,7 +736,7 @@ def _ffpa_attn_forward_generic_impl(
       BLOCK_N=64,
       BLOCK_HEADDIM_QK=64,
       BLOCK_HEADDIM_V=64,
-      num_warps=8,
+      num_warps=4,
       num_stages=3,
     )
 
