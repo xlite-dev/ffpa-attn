@@ -94,9 +94,9 @@ def _bwd_triton_torch_op(
   softmax_scale: float,
   causal: int,
   autotune: int,
+  autotune_mode_is_max: int,
   kernel_version_is_v2: int,
   preprocess_d_chunk: int,
-  autotune_mode_is_max: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
   from ._ffpa_bwd import _ffpa_attn_backward_triton_impl as _triton_bwd_kernel
 
