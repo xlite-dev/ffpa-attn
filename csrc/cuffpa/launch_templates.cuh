@@ -490,49 +490,31 @@ void launch_ffpa_attn_fwd_template(torch::Tensor Q, torch::Tensor K, torch::Tens
   auto stream = at::cuda::getCurrentCUDAStream();
 
   if constexpr (kHeadDim > kMaxDForSmallDKernel) {
-    if (Nq < 8) {
-      const int num_sms_x2 =
-          max(1, at::cuda::getCurrentDeviceProperties()->multiProcessorCount * 2);
-      const int num_splits = select_decode_num_splits(Nb * Nh * utils::div_ceil(Nq, 16), num_sms_x2,
-                                                      Tc, 128, min(Nq, 16));
-      if (num_splits > 1) {
-        const int split_size = utils::div_ceil(Tc, num_splits) * Bc;
-        auto scratch_options = torch::TensorOptions().dtype(torch::kFloat32).device(Q.device());
-        auto partial_out = torch::empty({Nb, Nh, num_splits, Nq, kHeadDim}, scratch_options);
-        auto chunk_lse = torch::empty({Nb, Nh, num_splits, Nq}, scratch_options);
-        const dim3 decode_stage1_grid = dim3(num_splits, Nb * Nh, 1);
-        const dim3 decode_stage2_grid = dim3(Nq, Nb * Nh, 1);
-        const int decode_threads = ((kHeadDim / 8) + WARP_SIZE - 1) / WARP_SIZE * WARP_SIZE;
-        const dim3 decode_block = dim3(decode_threads, 1, 1);
+    const int num_sms_x2 = max(1, at::cuda::getCurrentDeviceProperties()->multiProcessorCount * 2);
+    const int num_splits = select_decode_num_splits(Nb * Nh * utils::div_ceil(Nq, 16), num_sms_x2,
+                                                    Tc, 128, min(Nq, 16));
+    if (Nq == 1 && num_splits > 1) {
+      const int split_size = utils::div_ceil(Tc, num_splits) * Bc;
+      auto scratch_options = torch::TensorOptions().dtype(torch::kFloat32).device(Q.device());
+      auto partial_out = torch::empty({Nb, Nh, num_splits, Nq, kHeadDim}, scratch_options);
+      auto chunk_lse = torch::empty({Nb, Nh, num_splits, Nq}, scratch_options);
+      const dim3 decode_stage1_grid = dim3(num_splits, Nb * Nh, 1);
+      const dim3 decode_stage2_grid = dim3(Nq, Nb * Nh, 1);
+      const int decode_threads = ((kHeadDim / 8) + WARP_SIZE - 1) / WARP_SIZE * WARP_SIZE;
+      const dim3 decode_block = dim3(decode_threads, 1, 1);
+      // Pure gemv implementation for Nq=1 case, do the reduction in stage 2.
+      auto decode_stage1_kernel =
+          (ffpa_attn_splitkv_decode_stage1_template<kDataType, kHeadDim, true>);
+      decode_stage1_kernel<<<decode_stage1_grid, decode_block, 0, stream>>>(
+          reinterpret_cast<kDataType*>(Q.data_ptr()), reinterpret_cast<kDataType*>(K.data_ptr()),
+          reinterpret_cast<kDataType*>(V.data_ptr()), partial_out.data_ptr<float>(),
+          chunk_lse.data_ptr<float>(), Nq, Nkv, Nh, Nh_kv, scale, num_splits, split_size, causal);
 
-        if (Nq == 1) {
-          // Pure gemv implementation for Nq=1 case, do the reduction in stage 2.
-          auto decode_stage1_kernel =
-              (ffpa_attn_splitkv_decode_stage1_template<kDataType, kHeadDim, true>);
-          decode_stage1_kernel<<<decode_stage1_grid, decode_block, 0, stream>>>(
-              reinterpret_cast<kDataType*>(Q.data_ptr()),
-              reinterpret_cast<kDataType*>(K.data_ptr()),
-              reinterpret_cast<kDataType*>(V.data_ptr()), partial_out.data_ptr<float>(),
-              chunk_lse.data_ptr<float>(), Nq, Nkv, Nh, Nh_kv, scale, num_splits, split_size,
-              causal);
-        } else {
-          // TODO: Use MMA with padding for the decode stage when Nq > 1.
-          auto decode_stage1_kernel =
-              (ffpa_attn_splitkv_decode_stage1_template<kDataType, kHeadDim, false>);
-          decode_stage1_kernel<<<decode_stage1_grid, decode_block, 0, stream>>>(
-              reinterpret_cast<kDataType*>(Q.data_ptr()),
-              reinterpret_cast<kDataType*>(K.data_ptr()),
-              reinterpret_cast<kDataType*>(V.data_ptr()), partial_out.data_ptr<float>(),
-              chunk_lse.data_ptr<float>(), Nq, Nkv, Nh, Nh_kv, scale, num_splits, split_size,
-              causal);
-        }
-
-        auto decode_stage2_kernel = (ffpa_attn_splitkv_decode_stage2_template<kDataType, kHeadDim>);
-        decode_stage2_kernel<<<decode_stage2_grid, decode_block, 0, stream>>>(
-            partial_out.data_ptr<float>(), chunk_lse.data_ptr<float>(),
-            reinterpret_cast<kDataType*>(O.data_ptr()), softmax_lse_ptr, Nq, Nh, num_splits);
-        return;
-      }
+      auto decode_stage2_kernel = (ffpa_attn_splitkv_decode_stage2_template<kDataType, kHeadDim>);
+      decode_stage2_kernel<<<decode_stage2_grid, decode_block, 0, stream>>>(
+          partial_out.data_ptr<float>(), chunk_lse.data_ptr<float>(),
+          reinterpret_cast<kDataType*>(O.data_ptr()), softmax_lse_ptr, Nq, Nh, num_splits);
+      return;
     }
   }
 
