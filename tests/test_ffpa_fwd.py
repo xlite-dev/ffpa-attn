@@ -405,6 +405,20 @@ def test_ffpa_attn_forward_decode_impl_matches_sdpa_for_larger_queries(dtype, Nq
   torch.testing.assert_close(o, ref, **_tolerance(dtype))
 
 
+@pytest.mark.parametrize("dtype", DTYPES, ids=["fp16", "bf16"])
+@pytest.mark.parametrize("Nq,Nkv,D", [(32, 8192, 512), (512, 8192, 512)])
+def test_ffpa_attn_func_triton_decode_heuristic_matches_sdpa_for_larger_queries(dtype, Nq, Nkv, D):
+  B, H = 1, 4
+  q, k, v = _alloc_cross_qkv(B, H, Nq, Nkv, D, dtype)
+  out = ffpa_attn_func(q, k, v, stages=2, acc=_acc_for(dtype), forward_backend="triton")
+
+  ref = _sdpa_ref(q, k, v)
+  assert out.shape == ref.shape
+  assert out.dtype == dtype
+  assert torch.isfinite(out).all()
+  torch.testing.assert_close(out, ref, **_tolerance(dtype))
+
+
 @pytest.mark.parametrize("backward_backend", ["sdpa", "triton"])
 def test_ffpa_attn_func_triton_forward_backward_smoke(backward_backend):
   q, k, v = _alloc_qkv(1, 2, 64, 320, torch.float16)

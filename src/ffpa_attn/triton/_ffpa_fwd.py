@@ -84,13 +84,17 @@ def _gen_fwd_autotune_configs(headdim: int = 256) -> list[triton.Config]:
   return configs
 
 
-def _gen_decode_fwd_stage1_autotune_configs(headdim: int = 256) -> list[triton.Config]:
+def _gen_decode_fwd_stage1_autotune_configs(headdim: int = 256, use_gemv: bool = False) -> list[triton.Config]:
   """Generate headdim-specific autotune configs for decode stage1.
 
-  Decode always has ``Nq == 1``, so the search space is the KV chunk size,
-  score tile width, split-D tile size, warp count, and pipeline depth.
+  The decode stage1 search space is intentionally compact. ``CHUNK_SIZE`` is
+  owned by the launcher via ``num_splits`` and is passed at runtime instead of
+  being autotuned here. GEMV and multi-row MMA paths are tuned separately so
+  full-D tiles are only explored for the single-row path.
 
   :param headdim: The actual head dimension for the target decode call.
+  :param use_gemv: Whether configs are generated for the ``seqlen_q == 1``
+      GEMV path.
   :return: Triton autotune configurations for decode stage1.
   """
   try:
@@ -100,19 +104,33 @@ def _gen_decode_fwd_stage1_autotune_configs(headdim: int = 256) -> list[triton.C
 
   _headdim_candidates = [64, 128]
   _next_pow2 = triton.next_power_of_2(headdim)
-  if _max_smem >= 96 * 1024 and _next_pow2 not in _headdim_candidates:
+  if use_gemv and _max_smem >= 96 * 1024 and _next_pow2 not in _headdim_candidates:
     _headdim_candidates.append(_next_pow2)
 
+  if use_gemv:
+    block_m_candidates = [8]
+    block_n_candidates = [64, 128]
+    if headdim <= 64:
+      block_n_candidates.append(256)
+  else:
+    block_m_candidates = [8, 16, 32, 64]
+    block_n_candidates = [64, 128]
+    if headdim <= 64:
+      block_n_candidates.append(256)
+
   configs = []
-  for chunk_size in [128, 256, 512]:
-    for block_n in [64, 128, 256]:
+  for block_n in block_n_candidates:
+    for block_m in block_m_candidates:
       for block_headdim in _headdim_candidates:
-        for num_warps in [4, 8]:
-          for num_stages in [2, 3, 4]:
+        num_warps_candidates = [4]
+        if not use_gemv and block_m >= 32 and block_n >= 128:
+          num_warps_candidates.append(8)
+        for num_warps in num_warps_candidates:
+          for num_stages in [2, 3]:
             configs.append(
               triton.Config(
                 {
-                  "CHUNK_SIZE": chunk_size,
+                  "BLOCK_M": block_m,
                   "BLOCK_N": block_n,
                   "BLOCK_HEADDIM_QK": block_headdim,
                   "BLOCK_HEADDIM_V": block_headdim,
@@ -122,6 +140,68 @@ def _gen_decode_fwd_stage1_autotune_configs(headdim: int = 256) -> list[triton.C
               )
             )
   return configs
+
+
+def _decode_num_splits_heuristic(
+  batch_nheads_mblocks: int,
+  num_sms: int,
+  num_n_blocks: int,
+  max_splits: int,
+) -> int:
+  """Mirror FlashAttention's split-kv occupancy heuristic in Python.
+
+  :param batch_nheads_mblocks: Number of independent query row blocks.
+  :param num_sms: Effective SM count available to the kernel launch.
+  :param num_n_blocks: Number of KV tiles along sequence length.
+  :param max_splits: Upper bound for the split search space.
+  :return: The chosen split count.
+  """
+  if batch_nheads_mblocks >= 0.8 * num_sms:
+    return 1
+
+  max_splits = max(1, min(max_splits, num_sms, num_n_blocks))
+  max_efficiency = 0.0
+  efficiencies: list[float] = []
+
+  def _ceil_div(a: int, b: int) -> int:
+    return (a + b - 1) // b
+
+  def _is_split_eligible(num_splits: int) -> bool:
+    return num_splits == 1 or _ceil_div(num_n_blocks, num_splits) != _ceil_div(num_n_blocks, num_splits - 1)
+
+  for num_splits in range(1, max_splits + 1):
+    if not _is_split_eligible(num_splits):
+      efficiencies.append(0.0)
+      continue
+    n_waves = float(batch_nheads_mblocks * num_splits) / float(num_sms)
+    efficiency = n_waves / math.ceil(n_waves)
+    max_efficiency = max(max_efficiency, efficiency)
+    efficiencies.append(efficiency)
+
+  for num_splits in range(1, max_splits + 1):
+    if not _is_split_eligible(num_splits):
+      continue
+    if efficiencies[num_splits - 1] >= 0.85 * max_efficiency:
+      return num_splits
+
+  return 1
+
+
+def _get_decode_num_splits(
+  seqlen_q: int, seqlen_k: int, headdim: int, batch: int, nheads_q: int, device: torch.device
+) -> int:
+  """Choose a decode split count using FlashAttention's split-kv heuristic."""
+  num_sms = max(1, torch.cuda.get_device_properties(device).multi_processor_count * 2)
+  block_n = 256 if headdim <= 64 else (128 if headdim <= 128 else 64)
+  num_n_blocks = triton.cdiv(seqlen_k, block_n)
+  num_m_blocks = triton.cdiv(seqlen_q, 64)
+  num_splits = _decode_num_splits_heuristic(
+    batch * nheads_q * num_m_blocks,
+    num_sms,
+    num_n_blocks,
+    max_splits=128,
+  )
+  return num_splits
 
 
 _FFPA_FWD_HEURISTICS = {
@@ -529,19 +609,106 @@ def _ffpa_decode_fwd_stage2_kernel(
 
 
 _ffpa_decode_fwd_stage1 = _ffpa_decode_fwd_stage1_kernel
-_ffpa_decode_fwd_stage1_autotune_cache: dict[int, callable] = {}  # headdim -> callable
+_ffpa_decode_fwd_stage1_autotune_cache: dict[tuple[int, bool], callable] = {}
 
 
-def _get_decode_fwd_stage1_autotune(headdim: int):
-  """Return a headdim-specific autotune wrapper for decode stage1."""
-  if headdim not in _ffpa_decode_fwd_stage1_autotune_cache:
-    configs = _gen_decode_fwd_stage1_autotune_configs(headdim)
-    _ffpa_decode_fwd_stage1_autotune_cache[headdim] = triton.autotune(
+def _get_decode_fwd_stage1_autotune(headdim: int, use_gemv: bool):
+  """Return a shape-class-specific autotune wrapper for decode stage1."""
+  cache_key = (headdim, use_gemv)
+  if cache_key not in _ffpa_decode_fwd_stage1_autotune_cache:
+    configs = _gen_decode_fwd_stage1_autotune_configs(headdim, use_gemv=use_gemv)
+    _ffpa_decode_fwd_stage1_autotune_cache[cache_key] = triton.autotune(
       configs=configs,
       key=["seqlen_q", "seqlen_k", "HEADDIM"],
       cache_results=True,
     )(_ffpa_decode_fwd_stage1_kernel)
-  return _ffpa_decode_fwd_stage1_autotune_cache[headdim]
+  return _ffpa_decode_fwd_stage1_autotune_cache[cache_key]
+
+
+def _ffpa_attn_forward_generic_impl(
+  q: torch.Tensor,
+  k: torch.Tensor,
+  v: torch.Tensor,
+  o: torch.Tensor,
+  lse: torch.Tensor,
+  causal: bool = False,
+  softmax_scale: float | None = None,
+  autotune: bool = False,
+) -> None:
+  """Launch the generic Triton forward kernel without split-kv scratch."""
+  batch, nheads_q, seqlen_q, headdim = q.shape
+  _, nheads_kv, seqlen_k, _ = k.shape
+  softmax_scale = softmax_scale or (1.0 / math.sqrt(headdim))
+  seqlen_q_rounded = lse.shape[-1]
+  DTYPE = tl.float16 if q.dtype == torch.float16 else tl.bfloat16
+
+  def grid(meta: dict) -> tuple[int, int]:
+    return (triton.cdiv(seqlen_q, meta["BLOCK_M"]), batch * nheads_q)
+
+  if autotune:
+    _get_fwd_autotune(headdim)[grid](
+      q,
+      k,
+      v,
+      o,
+      lse,
+      softmax_scale,
+      q.stride(0),
+      q.stride(1),
+      q.stride(2),
+      k.stride(0),
+      k.stride(1),
+      k.stride(2),
+      v.stride(0),
+      v.stride(1),
+      v.stride(2),
+      o.stride(0),
+      o.stride(1),
+      o.stride(2),
+      nheads_q,
+      nheads_kv,
+      seqlen_q,
+      seqlen_k,
+      seqlen_q_rounded,
+      IS_CAUSAL=causal,
+      DTYPE=DTYPE,
+      HEADDIM=headdim,
+    )
+  else:
+    _ffpa_fwd[grid](
+      q,
+      k,
+      v,
+      o,
+      lse,
+      softmax_scale,
+      q.stride(0),
+      q.stride(1),
+      q.stride(2),
+      k.stride(0),
+      k.stride(1),
+      k.stride(2),
+      v.stride(0),
+      v.stride(1),
+      v.stride(2),
+      o.stride(0),
+      o.stride(1),
+      o.stride(2),
+      nheads_q,
+      nheads_kv,
+      seqlen_q,
+      seqlen_k,
+      seqlen_q_rounded,
+      IS_CAUSAL=causal,
+      DTYPE=DTYPE,
+      HEADDIM=headdim,
+      BLOCK_M=128,
+      BLOCK_N=64,
+      BLOCK_HEADDIM_QK=64,
+      BLOCK_HEADDIM_V=64,
+      num_warps=8,
+      num_stages=3,
+    )
 
 
 def _ffpa_attn_forward_decode_impl(
@@ -553,16 +720,21 @@ def _ffpa_attn_forward_decode_impl(
   causal: bool = False,
   softmax_scale: float | None = None,
   autotune: bool = False,
+  num_splits: int | None = None,
 ) -> None:
-  """Run the short-query Triton forward path for ``seqlen_q < 8``."""
+  """Run the split-kv Triton forward path used for decode-like shapes."""
   batch, nheads_q, seqlen_q, headdim = q.shape
   _, nheads_kv, seqlen_k, _ = k.shape
   softmax_scale = softmax_scale or (1.0 / math.sqrt(headdim))
+  DTYPE = tl.float16 if q.dtype == torch.float16 else tl.bfloat16
+  use_gemv = seqlen_q == 1
+  if num_splits is None:
+    num_splits = _get_decode_num_splits(seqlen_q, seqlen_k, headdim, batch, nheads_q, q.device)
 
-  if autotune:
-    n_chunks = triton.cdiv(seqlen_k, 128)
-  else:
-    n_chunks = triton.cdiv(seqlen_k, 256)
+  n_chunks = num_splits
+  chunk_size = triton.cdiv(seqlen_k, n_chunks)
+  block_m = 8 if use_gemv else min(64, max(8, triton.next_power_of_2(seqlen_q)))
+  block_headdim = triton.next_power_of_2(headdim) if use_gemv else 64
 
   partial_out = torch.empty(
     (batch, nheads_q, n_chunks, seqlen_q, headdim),
@@ -577,9 +749,6 @@ def _ffpa_attn_forward_decode_impl(
   if autotune:
     chunk_lse.fill_(-float("inf"))
 
-  DTYPE = tl.float16 if q.dtype == torch.float16 else tl.bfloat16
-  use_gemv = seqlen_q == 1
-
   def stage1_grid(meta: dict) -> tuple[int, int, int]:
     return (
       triton.cdiv(seqlen_k, meta["CHUNK_SIZE"]),
@@ -588,7 +757,7 @@ def _ffpa_attn_forward_decode_impl(
     )
 
   if autotune:
-    _get_decode_fwd_stage1_autotune(headdim)[stage1_grid](
+    _get_decode_fwd_stage1_autotune(headdim, use_gemv)[stage1_grid](
       q,
       k,
       v,
@@ -620,7 +789,7 @@ def _ffpa_attn_forward_decode_impl(
       USE_GEMV=use_gemv,
       DTYPE=DTYPE,
       HEADDIM=headdim,
-      BLOCK_M=8,
+      CHUNK_SIZE=chunk_size,
     )
   else:
     _ffpa_decode_fwd_stage1[stage1_grid](
@@ -655,11 +824,11 @@ def _ffpa_attn_forward_decode_impl(
       USE_GEMV=use_gemv,
       DTYPE=DTYPE,
       HEADDIM=headdim,
-      BLOCK_M=8,
-      CHUNK_SIZE=256,
+      BLOCK_M=block_m,
+      CHUNK_SIZE=chunk_size,
       BLOCK_N=128,
-      BLOCK_HEADDIM_QK=64,
-      BLOCK_HEADDIM_V=64,
+      BLOCK_HEADDIM_QK=block_headdim,
+      BLOCK_HEADDIM_V=block_headdim,
       num_warps=4,
       num_stages=2,
     )
@@ -751,9 +920,8 @@ def _ffpa_attn_forward_impl(
   :param autotune: Whether to run Triton's autotuner for this shape.
   """
   batch, nheads_q, seqlen_q, headdim = q.shape
-  _, nheads_kv, seqlen_k, _ = k.shape
+  _, _, seqlen_k, _ = k.shape
   softmax_scale = softmax_scale or (1.0 / math.sqrt(headdim))
-  seqlen_q_rounded = lse.shape[-1]
 
   assert q.dtype == k.dtype == v.dtype == o.dtype
   assert q.dtype in (torch.float16, torch.bfloat16)
@@ -762,10 +930,10 @@ def _ffpa_attn_forward_impl(
   if headdim > _MAX_HEADDIM:
     raise ValueError(f"Triton forward supports headdim <= {_MAX_HEADDIM}, got {headdim}")
 
-  DTYPE = tl.float16 if q.dtype == torch.float16 else tl.bfloat16
+  num_splits = _get_decode_num_splits(seqlen_q, seqlen_k, headdim, batch, nheads_q, q.device)
 
-  if seqlen_q < 8:
-    _ffpa_attn_forward_decode_impl(
+  if num_splits == 1:
+    _ffpa_attn_forward_generic_impl(
       q,
       k,
       v,
@@ -777,73 +945,17 @@ def _ffpa_attn_forward_impl(
     )
     return
 
-  def grid(meta: dict) -> tuple[int, int]:
-    return (triton.cdiv(seqlen_q, meta["BLOCK_M"]), batch * nheads_q)
-
-  if autotune:
-    _get_fwd_autotune(headdim)[grid](
-      q,
-      k,
-      v,
-      o,
-      lse,
-      softmax_scale,
-      q.stride(0),
-      q.stride(1),
-      q.stride(2),
-      k.stride(0),
-      k.stride(1),
-      k.stride(2),
-      v.stride(0),
-      v.stride(1),
-      v.stride(2),
-      o.stride(0),
-      o.stride(1),
-      o.stride(2),
-      nheads_q,
-      nheads_kv,
-      seqlen_q,
-      seqlen_k,
-      seqlen_q_rounded,
-      IS_CAUSAL=causal,
-      DTYPE=DTYPE,
-      HEADDIM=headdim,
-    )
-  else:
-    _ffpa_fwd[grid](
-      q,
-      k,
-      v,
-      o,
-      lse,
-      softmax_scale,
-      q.stride(0),
-      q.stride(1),
-      q.stride(2),
-      k.stride(0),
-      k.stride(1),
-      k.stride(2),
-      v.stride(0),
-      v.stride(1),
-      v.stride(2),
-      o.stride(0),
-      o.stride(1),
-      o.stride(2),
-      nheads_q,
-      nheads_kv,
-      seqlen_q,
-      seqlen_k,
-      seqlen_q_rounded,
-      IS_CAUSAL=causal,
-      DTYPE=DTYPE,
-      HEADDIM=headdim,
-      BLOCK_M=128,
-      BLOCK_N=64,
-      BLOCK_HEADDIM_QK=64,
-      BLOCK_HEADDIM_V=64,
-      num_warps=8,
-      num_stages=3,
-    )
+  _ffpa_attn_forward_decode_impl(
+    q,
+    k,
+    v,
+    o,
+    lse,
+    causal=causal,
+    softmax_scale=softmax_scale,
+    autotune=autotune,
+    num_splits=num_splits,
+  )
 
 
 def _ffpa_attn_forward_triton(

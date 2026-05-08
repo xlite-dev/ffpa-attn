@@ -42,6 +42,7 @@ def _parse_args() -> argparse.Namespace:
     default="cuda",
     help="Forward backend passed to ffpa_attn_func.",
   )
+  parser.add_argument("--B", type=int, default=1, help="Batch size.")
   parser.add_argument("--N", type=int, default=8192, help="Sequence length (non-aligned uses N-1).")
   parser.add_argument("--D", type=int, default=512, help="Head dimension.")
   parser.add_argument("--seed", type=int, default=0, help="Random seed for input tensors.")
@@ -161,7 +162,7 @@ def main() -> None:
       args.forward_backend,
       args.triton_forward_autotune,
       seed=args.seed,
-      B=1,
+      B=args.B,
       Nh_q=32,
       Nh_kv=32,
       Nq=N,
@@ -174,7 +175,7 @@ def main() -> None:
       args.forward_backend,
       args.triton_forward_autotune,
       seed=args.seed,
-      B=1,
+      B=args.B,
       Nh_q=32,
       Nh_kv=32,
       Nq=1024,
@@ -182,12 +183,12 @@ def main() -> None:
       D=D,
     )
     _run_case(
-      "decode-attn(1)",
+      "decode(1)",
       dtype,
       args.forward_backend,
       args.triton_forward_autotune,
       seed=args.seed,
-      B=1,
+      B=args.B,
       Nh_q=32,
       Nh_kv=32,
       Nq=1,
@@ -195,12 +196,12 @@ def main() -> None:
       D=D,
     )
     _run_case(
-      "decode-attn(2)",
+      "decode(2)",
       dtype,
       args.forward_backend,
       args.triton_forward_autotune,
       seed=args.seed,
-      B=1,
+      B=args.B,
       Nh_q=32,
       Nh_kv=32,
       Nq=2,
@@ -208,12 +209,12 @@ def main() -> None:
       D=D,
     )
     _run_case(
-      "decode-attn(7)",
+      "decode(7)",
       dtype,
       args.forward_backend,
       args.triton_forward_autotune,
       seed=args.seed,
-      B=1,
+      B=args.B,
       Nh_q=32,
       Nh_kv=32,
       Nq=7,
@@ -221,12 +222,12 @@ def main() -> None:
       D=D,
     )
     _run_case(
-      "decode-attn(32)",
+      "decode(32)",
       dtype,
       args.forward_backend,
       args.triton_forward_autotune,
       seed=args.seed,
-      B=1,
+      B=args.B,
       Nh_q=32,
       Nh_kv=32,
       Nq=32,
@@ -234,12 +235,25 @@ def main() -> None:
       D=D,
     )
     _run_case(
-      "decode-attn(512)",
+      "decode(256)",
       dtype,
       args.forward_backend,
       args.triton_forward_autotune,
       seed=args.seed,
-      B=1,
+      B=args.B,
+      Nh_q=32,
+      Nh_kv=32,
+      Nq=256,
+      Nkv=N,
+      D=D,
+    )
+    _run_case(
+      "decode(512)",
+      dtype,
+      args.forward_backend,
+      args.triton_forward_autotune,
+      seed=args.seed,
+      B=args.B,
       Nh_q=32,
       Nh_kv=32,
       Nq=512,
@@ -252,7 +266,7 @@ def main() -> None:
       args.forward_backend,
       args.triton_forward_autotune,
       seed=args.seed,
-      B=1,
+      B=args.B,
       Nh_q=32,
       Nh_kv=8,
       Nq=N,
@@ -265,7 +279,7 @@ def main() -> None:
       args.forward_backend,
       args.triton_forward_autotune,
       seed=args.seed,
-      B=1,
+      B=args.B,
       Nh_q=32,
       Nh_kv=32,
       Nq=N,
@@ -279,7 +293,7 @@ def main() -> None:
       args.forward_backend,
       args.triton_forward_autotune,
       seed=args.seed,
-      B=1,
+      B=args.B,
       Nh_q=8,
       Nh_kv=8,
       Nq=N - 1 if N > 1 else N,  # avoid zero-dim
