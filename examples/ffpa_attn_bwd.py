@@ -53,6 +53,7 @@ def _parse_args() -> argparse.Namespace:
   parser.add_argument(
     "--triton-autotune-mode",
     "--autotune-mode",
+    "--mode",
     choices=["fast", "max"],
     default="fast",
     help="Triton autotune search-space mode.",
