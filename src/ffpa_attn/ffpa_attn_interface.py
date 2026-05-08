@@ -38,8 +38,15 @@ def _should_fallback_to_sdpa(
   here instead of scattering dispatch checks throughout ``ffpa_attn_func``.
   """
   assert query.dim() == 4, "Expected query shape [B, Nh_q, Nq, D]"
-  B, _, Nq, D = query.shape
-  return D <= 256 or D > 1024 or attn_mask is not None or dropout_p > 0.0 or (Nq < 512 and Nq != 1)
+  B, Nh_q, Nq, D = query.shape  # noqa: F841
+  _fallback = any([
+    D <= 256,
+    D > 1024,
+    attn_mask is not None,
+    dropout_p > 0.0,
+    (Nq < 512 and Nq != 1),
+  ])
+  return _fallback
 
 
 def _normalize_inputs(

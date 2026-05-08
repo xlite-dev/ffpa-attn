@@ -914,15 +914,17 @@ __global__ void __launch_bounds__(kHeadDim / 8) ffpa_attn_splitkv_decode_stage1_
       __syncthreads();
 
       for (int row = 0; row < active_rows; ++row) {
-        const float p = row_p[row];
-        const float rescale = row_rescale[row];
-        const int d = tid * kElemsPerThread;
-        uint4 vv;
-        ffpa::cp_async::ldg_sync_128b(&vv, &V_tile[d]);
-        const kDataType* vh = reinterpret_cast<const kDataType*>(&vv);
+        if (tid < kNumActiveThreads) {
+          const float p = row_p[row];
+          const float rescale = row_rescale[row];
+          const int d = tid * kElemsPerThread;
+          uint4 vv;
+          ffpa::cp_async::ldg_sync_128b(&vv, &V_tile[d]);
+          const kDataType* vh = reinterpret_cast<const kDataType*>(&vv);
 #pragma unroll
-        for (int v = 0; v < kElemsPerThread; ++v) {
-          acc[row][v] = acc[row][v] * rescale + p * Traits::to_float(vh[v]);
+          for (int v = 0; v < kElemsPerThread; ++v) {
+            acc[row][v] = acc[row][v] * rescale + p * Traits::to_float(vh[v]);
+          }
         }
       }
       // Wait for K async load (group 0), then swap buffers for next iteration.
@@ -942,7 +944,7 @@ __global__ void __launch_bounds__(kHeadDim / 8) ffpa_attn_splitkv_decode_stage1_
       const float inv_l = (row_l[row] > 0.0f) ? (1.0f / row_l[row]) : 0.0f;
 
       // Phase 1: pack acc into 2×uint4, store to smem_out via stg_sync_128b.
-      {
+      if (tid < kNumActiveThreads) {
         const int d = tid * kElemsPerThread;
         float tmp[8];
 #pragma unroll
