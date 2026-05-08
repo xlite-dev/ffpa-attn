@@ -728,6 +728,8 @@ __global__ void __launch_bounds__(256) ffpa_attn_splitkv_decode_stage1_template(
   const int split_end = min(Nkv, split_start + split_size);
   const int kv_offset = Nkv - Nq;
 
+  // K_tile: double-buffered smem for K rows (stage=2 cp.async pipeline).
+  __shared__ __align__(16) kDataType K_tile[2][kHeadDim];
   __shared__ kDataType q_tile[kMaxRows][kHeadDim];
   __shared__ float smem_out[kHeadDim];
   __shared__ float warp_partials[kMaxRows][kNumWarps];
@@ -759,6 +761,23 @@ __global__ void __launch_bounds__(256) ffpa_attn_splitkv_decode_stage1_template(
   }
   __syncthreads();
 
+  // K vector constants & pipeline state.
+  constexpr int kVecK = 16 / static_cast<int>(sizeof(kDataType));  // 8 for half/bf16
+  static_assert(kHeadDim % kVecK == 0, "kHeadDim must be multiple of kVecK");
+  constexpr int kNumVecK = kHeadDim / kVecK;
+  int cur_k = 0, next_k = 1;
+
+  // Preload first K row into K_tile[0] via cp.async.
+  {
+    for (int i = tid; i < kNumVecK; i += kNumThreads) {
+      uint32_t smem_ptr = __cvta_generic_to_shared(&K_tile[0][i * kVecK]);
+      ffpa::cp_async::cp_async<16>(smem_ptr, &K[kv_base + split_start * kHeadDim + i * kVecK]);
+    }
+    ffpa::cp_async::commit_group();
+    ffpa::cp_async::wait_group<0>();
+  }
+  __syncthreads();
+
   float acc[kMaxRows][kColsPerThread];
 #pragma unroll
   for (int row = 0; row < kMaxRows; ++row) {
@@ -769,20 +788,30 @@ __global__ void __launch_bounds__(256) ffpa_attn_splitkv_decode_stage1_template(
   }
 
   for (int global_k = split_start; global_k < split_end; ++global_k) {
+    // ---- Pipeline stage 1: issue async load of next K row ----
+    // cp.async runs in background while we process the current row.
+    if (global_k + 1 < split_end) {
+      for (int i = tid; i < kNumVecK; i += kNumThreads) {
+        uint32_t smem_ptr = __cvta_generic_to_shared(&K_tile[next_k][i * kVecK]);
+        ffpa::cp_async::cp_async<16>(smem_ptr, &K[kv_base + (global_k + 1) * kHeadDim + i * kVecK]);
+      }
+      ffpa::cp_async::commit_group();
+    }
+
     float score_partial[kMaxRows];
 #pragma unroll
     for (int row = 0; row < kMaxRows; ++row) {
       score_partial[row] = 0.0f;
     }
 
+    // ---- QK dot product from smem K_tile[cur_k] ----
     for (int row = 0; row < active_rows; ++row) {
       float qk = 0.0f;
 #pragma unroll
       for (int col = 0; col < kColsPerThread; ++col) {
         const int d = tid + col * kNumThreads;
         if (d < kHeadDim) {
-          qk += Traits::to_float(q_tile[row][d]) *
-                Traits::to_float(K[kv_base + global_k * kHeadDim + d]);
+          qk += Traits::to_float(q_tile[row][d]) * Traits::to_float(K_tile[cur_k][d]);
         }
       }
       score_partial[row] = qk;
@@ -841,7 +870,13 @@ __global__ void __launch_bounds__(256) ffpa_attn_splitkv_decode_stage1_template(
         }
       }
     }
+    // Wait for next K async load to complete, then swap buffers.
+    if (global_k + 1 < split_end) {
+      ffpa::cp_async::wait_group<0>();
+    }
     __syncthreads();
+    cur_k ^= 1;
+    next_k ^= 1;
   }
 
   const int split_row_base = (((Nb_id * Nh + Nh_id) * num_splits + split_id) * Nq);
