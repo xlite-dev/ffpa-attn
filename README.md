@@ -12,7 +12,7 @@
 
 |[Self Attn](./examples)| [GQA/MQA](./examples) |[Cross Attn](./examples)|[Causal Attn](./examples)|[Headdim](#ffpa-design)|[Fwd(CUDA)↑](./examples)|[Bwd(Triton)↑](./examples)|
 |:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-|✔️(`Nq=Nkv`)|✔️(`Hq!=Hkv`)|✔️(`Nq!=Nkv`)|✔️(`causal`)|**320~1024** |**1.8x~3x↑** |**1.5x~2.5x↑** |
+|✔️(`Nq=Nkv`)|✔️(`Hq!=Hkv`)|✔️(`Nq!=Nkv`)|✔️(`causal`)|**<=1024** |**1.8x~3x↑** |**1.5x~2.5x↑** |
 
 </div>
 
