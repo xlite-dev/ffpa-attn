@@ -10,9 +10,9 @@
 
 <div align='center' markdown="1">
 
-|[Self Attn](./examples/README.md)| [GQA/MQA](./examples/README.md) |[Cross/Decode](./examples/README.md)|[Causal](./examples/README.md)|[Headdim](#ffpa-design)|[Fwd (CUDA)↑](./examples/README.md)|[Bwd (Triton)↑](./examples/README.md)|
+|[Self Attn](./examples)| [GQA/MQA](./examples) |[Cross Attn](./examples)|[Causal Attn](./examples)|[Headdim](#ffpa-design)|[Forward↑](./examples)|[Backward↑](./examples)|
 |:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-|✔️(`Nq = Nkv`)|✔️|✔️(`Nq != Nkv`)|✔️|**320~1024** |**1.8x~3x↑🎉** |**1.5x~2.5x↑🎉** |
+|✔️(`Nq=Nkv`)|✔️(`Hq!=Hkv`)|✔️(`Nq!=Nkv`)|✔️(`causal`)|**320~1024** |**1.8x~3x↑🎉** |**1.5x~2.5x↑🎉** |
 
 </div>
 
