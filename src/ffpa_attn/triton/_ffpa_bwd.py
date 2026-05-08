@@ -918,6 +918,8 @@ def _ffpa_attn_backward_triton_impl(
   dk.zero_()
   dv.zero_()
 
+  # TODO: May force use v1 for short seqlen where atomics are not a
+  # bottleneck and v2 overhead would dominate.
   if kernel_version == "v2":
     # v2: shared-pid split-D, grid = (max(K-blocks, Q-blocks), 1, B*Nh).
     # pid serves as both K-col block index and Q-row block index.
