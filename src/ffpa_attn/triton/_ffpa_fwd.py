@@ -268,6 +268,9 @@ def _ffpa_fwd_kernel_impl(
   nheads_kv: int,
   seqlen_q: int,
   seqlen_k: int,
+  # Autotune buckets are passed explicitly to avoid redundant autotune
+  # runs for shapes that differ only in seqlen but fall in the same bucket.
+  # The kernel itself only uses the bucketed values.
   seqlen_q_bucket: int,
   seqlen_k_bucket: int,
   seqlen_q_rounded: int,
@@ -406,6 +409,9 @@ def _ffpa_decode_fwd_stage1_kernel(
   nheads_kv: int,
   seqlen_q: int,
   seqlen_k: int,
+  # Autotune buckets are passed explicitly to avoid redundant autotune
+  # runs for shapes that differ only in seqlen but fall in the same bucket.
+  # The kernel itself only uses the bucketed values.
   seqlen_q_bucket: int,
   seqlen_k_bucket: int,
   IS_CAUSAL: tl.constexpr,

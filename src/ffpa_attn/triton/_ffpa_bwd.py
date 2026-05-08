@@ -64,6 +64,9 @@ def _ffpa_bwd_pre_impl(
   stride_dom: int,
   nheads: int,
   seqlen_q: int,
+  # Autotune buckets are passed explicitly to avoid redundant autotune
+  # runs for shapes that differ only in seqlen but fall in the same bucket.
+  # The kernel itself only uses the bucketed values.
   seqlen_q_bucket: int,
   seqlen_q_rounded: int,
   headdim: int,
@@ -388,7 +391,7 @@ def _gen_bwd_autotune_configs(
       _headdim_candidates.append(_next_pow2)
 
   if autotune_mode == "fast":
-    _headdim_candidates = [candidate for candidate in _headdim_candidates if candidate <= 128 or candidate == headdim]
+    _headdim_candidates = [c for c in _headdim_candidates if c <= 128 or c == headdim]
 
   configs = []
   for block_m in [64, 128]:
@@ -453,6 +456,9 @@ def _ffpa_bwd_v1_kernel_impl(
   nheads: int,
   seqlen_q: int,
   seqlen_k: int,
+  # Autotune buckets are passed explicitly to avoid redundant autotune
+  # runs for shapes that differ only in seqlen but fall in the same bucket.
+  # The kernel itself only uses the bucketed values.
   seqlen_q_bucket: int,
   seqlen_k_bucket: int,
   seqlen_q_rounded: int,
@@ -629,6 +635,9 @@ def _ffpa_bwd_v2_kernel_impl(
   nheads: int,
   seqlen_q: int,
   seqlen_k: int,
+  # Autotune buckets are passed explicitly to avoid redundant autotune
+  # runs for shapes that differ only in seqlen but fall in the same bucket.
+  # The kernel itself only uses the bucketed values.
   seqlen_q_bucket: int,
   seqlen_k_bucket: int,
   seqlen_q_rounded: int,
