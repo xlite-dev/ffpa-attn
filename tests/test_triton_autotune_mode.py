@@ -28,6 +28,7 @@ def test_fwd_fast_mode_prunes_generic_configs(headdim):
   fast = _gen_fwd_autotune_configs(headdim, autotune_mode="fast")
   max_configs = _gen_fwd_autotune_configs(headdim, autotune_mode="max")
   assert len(fast) < len(max_configs)
+  assert all(config.num_warps == 4 for config in fast)
 
 
 def test_fwd_fast_mode_prunes_decode_configs():
