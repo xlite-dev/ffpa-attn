@@ -39,6 +39,8 @@ import torch
 import triton
 import triton.language as tl
 
+from ._autotune_utils import bucket_autotune_seqlen
+
 # Preprocess: delta = rowsum(dO * O)
 # In full-D mode BLOCK_HEADDIM must cover the whole head dimension.  In
 # D_CHUNK mode the launcher/autotuner supplies the chunk size explicitly.
@@ -62,6 +64,10 @@ def _ffpa_bwd_pre_impl(
   stride_dom: int,
   nheads: int,
   seqlen_q: int,
+  # Autotune buckets are passed explicitly to avoid redundant autotune
+  # runs for shapes that differ only in seqlen but fall in the same bucket.
+  # The kernel itself only uses the bucketed values.
+  seqlen_q_bucket: int,
   seqlen_q_rounded: int,
   headdim: int,
   BLOCK_M: tl.constexpr,
@@ -108,7 +114,7 @@ def _ffpa_bwd_pre_impl(
   tl.store(Delta + off_hb * seqlen_q_rounded + offs_m, delta, mask=offs_m < seqlen_q)
 
 
-def _gen_pre_autotune_configs(d_chunk: bool) -> list[triton.Config]:
+def _gen_pre_autotune_configs(d_chunk: bool, autotune_mode: str = "max") -> list[triton.Config]:
   """Generate autotune configs for the preprocess delta kernel.
 
   ``BLOCK_HEADDIM`` participates in autotune only for D_CHUNK mode.  Full-D
@@ -121,7 +127,7 @@ def _gen_pre_autotune_configs(d_chunk: bool) -> list[triton.Config]:
   configs = []
   for block_m in [64, 128, 256]:
     if not d_chunk:
-      for num_warps in [2, 4, 8]:
+      for num_warps in ([4, 8] if autotune_mode == "fast" else [2, 4, 8]):
         configs.append(triton.Config(
           {
             "BLOCK_M": block_m,
@@ -131,8 +137,8 @@ def _gen_pre_autotune_configs(d_chunk: bool) -> list[triton.Config]:
         ))
       continue
 
-    for block_headdim in [64, 128, 256]:
-      for num_warps in [2, 4, 8]:
+    for block_headdim in ([64, 128] if autotune_mode == "fast" else [64, 128, 256]):
+      for num_warps in ([4, 8] if autotune_mode == "fast" else [2, 4, 8]):
         configs.append(
           triton.Config(
             {
@@ -146,20 +152,20 @@ def _gen_pre_autotune_configs(d_chunk: bool) -> list[triton.Config]:
   return configs
 
 
-# Autotuned variant.
-_ffpa_bwd_pre_autotune = triton.autotune(
-  configs=_gen_pre_autotune_configs(d_chunk=False),
-  key=["seqlen_q", "headdim"],
-  reset_to_zero=["Delta"],
-  cache_results=True,
-)(_ffpa_bwd_pre_impl)
+_ffpa_bwd_pre_autotune_cache: dict[tuple[bool, str], callable] = {}
 
-_ffpa_bwd_pre_d_chunk_autotune = triton.autotune(
-  configs=_gen_pre_autotune_configs(d_chunk=True),
-  key=["seqlen_q", "headdim"],
-  reset_to_zero=["Delta"],
-  cache_results=True,
-)(_ffpa_bwd_pre_impl)
+
+def _get_pre_autotune(d_chunk: bool, autotune_mode: str):
+  cache_key = (d_chunk, autotune_mode)
+  if cache_key not in _ffpa_bwd_pre_autotune_cache:
+    _ffpa_bwd_pre_autotune_cache[cache_key] = triton.autotune(
+      configs=_gen_pre_autotune_configs(d_chunk=d_chunk, autotune_mode=autotune_mode),
+      key=["seqlen_q_bucket", "headdim"],
+      reset_to_zero=["Delta"],
+      cache_results=True,
+    )(_ffpa_bwd_pre_impl)
+  return _ffpa_bwd_pre_autotune_cache[cache_key]
+
 
 # Non-autotuned variant.
 _ffpa_bwd_pre = _ffpa_bwd_pre_impl
@@ -335,7 +341,11 @@ def ffpa_bwd_v1_kernel(
 #
 #   _ffpa_bwd_v1           — direct call without autotune. The Python launcher
 #                                 supplies the fixed fallback tile config.
-def _gen_bwd_autotune_configs(block_n_values: tuple[int, ...], headdim: int = 512) -> list[triton.Config]:
+def _gen_bwd_autotune_configs(
+  block_n_values: tuple[int, ...],
+  headdim: int = 512,
+  autotune_mode: str = "max",
+) -> list[triton.Config]:
   """Generate autotune configs over BLOCK_M, BLOCK_N, BLOCK_HEADDIM, num_warps, num_stages.
 
   ``ATOMIC_ADD`` is intentionally excluded from autotune. In the v1
@@ -377,14 +387,18 @@ def _gen_bwd_autotune_configs(block_n_values: tuple[int, ...], headdim: int = 51
   # skip when next_pow2 is already in [64, 128, 256] (dedup).
   _next_pow2 = triton.next_power_of_2(headdim)
   if _max_smem >= 128 * 1024 and _next_pow2 not in _headdim_candidates:  # 128 KB
-    _headdim_candidates.append(_next_pow2)
+    if autotune_mode == "max":
+      _headdim_candidates.append(_next_pow2)
+
+  if autotune_mode == "fast":
+    _headdim_candidates = [c for c in _headdim_candidates if c <= 128 or c == headdim]
 
   configs = []
   for block_m in [64, 128]:
     for block_n in block_n_values:
       for block_headdim in _headdim_candidates:
         for num_warps in [4, 8]:
-          for num_stages in [2, 3, 4]:
+          for num_stages in ([2, 3] if autotune_mode == "fast" else [2, 3, 4]):
             configs.append(
               triton.Config(
                 {
@@ -442,6 +456,11 @@ def _ffpa_bwd_v1_kernel_impl(
   nheads: int,
   seqlen_q: int,
   seqlen_k: int,
+  # Autotune buckets are passed explicitly to avoid redundant autotune
+  # runs for shapes that differ only in seqlen but fall in the same bucket.
+  # The kernel itself only uses the bucketed values.
+  seqlen_q_bucket: int,
+  seqlen_k_bucket: int,
   seqlen_q_rounded: int,
   headdim: int,
   IS_CAUSAL: tl.constexpr,
@@ -546,20 +565,25 @@ def _ffpa_bwd_v1_kernel_impl(
 # Non-autotuned variant — called with the best known config.
 _ffpa_bwd_v1 = _ffpa_bwd_v1_kernel_impl
 
-_ffpa_bwd_v1_autotune_cache: dict[int, callable] = {}  # headdim -> callable
+_ffpa_bwd_v1_autotune_cache: dict[tuple[int, str], callable] = {}  # (headdim, mode) -> callable
 
 
-def _get_v1_autotune(headdim: int):
+def _get_v1_autotune(headdim: int, autotune_mode: str):
   """Return a headdim-specific autotune wrapper for the v1 backward kernel."""
-  if headdim not in _ffpa_bwd_v1_autotune_cache:
-    configs = _gen_bwd_autotune_configs(block_n_values=(64, 128), headdim=headdim)
-    _ffpa_bwd_v1_autotune_cache[headdim] = triton.autotune(
+  cache_key = (headdim, autotune_mode)
+  if cache_key not in _ffpa_bwd_v1_autotune_cache:
+    configs = _gen_bwd_autotune_configs(
+      block_n_values=(64, ) if autotune_mode == "fast" else (64, 128),
+      headdim=headdim,
+      autotune_mode=autotune_mode,
+    )
+    _ffpa_bwd_v1_autotune_cache[cache_key] = triton.autotune(
       configs=configs,
-      key=["seqlen_q", "seqlen_k", "headdim"],
+      key=["seqlen_q_bucket", "seqlen_k_bucket", "headdim"],
       reset_to_zero=["DQ", "DK", "DV"],
       cache_results=True,
     )(_ffpa_bwd_v1_kernel_impl)
-  return _ffpa_bwd_v1_autotune_cache[headdim]
+  return _ffpa_bwd_v1_autotune_cache[cache_key]
 
 
 # v2 kernel — shared-pid split-D backward (no dQ atomic_add)
@@ -611,6 +635,11 @@ def _ffpa_bwd_v2_kernel_impl(
   nheads: int,
   seqlen_q: int,
   seqlen_k: int,
+  # Autotune buckets are passed explicitly to avoid redundant autotune
+  # runs for shapes that differ only in seqlen but fall in the same bucket.
+  # The kernel itself only uses the bucketed values.
+  seqlen_q_bucket: int,
+  seqlen_k_bucket: int,
   seqlen_q_rounded: int,
   headdim: int,
   IS_CAUSAL: tl.constexpr,
@@ -786,20 +815,25 @@ def _ffpa_bwd_v2_kernel_impl(
 # Non-autotuned v2 variant.
 _ffpa_bwd_v2 = _ffpa_bwd_v2_kernel_impl
 
-_ffpa_bwd_v2_autotune_cache: dict[int, callable] = {}  # headdim -> callable
+_ffpa_bwd_v2_autotune_cache: dict[tuple[int, str], callable] = {}  # (headdim, mode) -> callable
 
 
-def _get_v2_autotune(headdim: int):
+def _get_v2_autotune(headdim: int, autotune_mode: str):
   """Return a headdim-specific autotune wrapper for the v2 backward kernel."""
-  if headdim not in _ffpa_bwd_v2_autotune_cache:
-    configs = _gen_bwd_autotune_configs(block_n_values=(64, ), headdim=headdim)
-    _ffpa_bwd_v2_autotune_cache[headdim] = triton.autotune(
+  cache_key = (headdim, autotune_mode)
+  if cache_key not in _ffpa_bwd_v2_autotune_cache:
+    configs = _gen_bwd_autotune_configs(
+      block_n_values=(64, ),
+      headdim=headdim,
+      autotune_mode=autotune_mode,
+    )
+    _ffpa_bwd_v2_autotune_cache[cache_key] = triton.autotune(
       configs=configs,
-      key=["seqlen_q", "seqlen_k", "headdim"],
+      key=["seqlen_q_bucket", "seqlen_k_bucket", "headdim"],
       reset_to_zero=["DQ", "DK", "DV"],
       cache_results=True,
     )(_ffpa_bwd_v2_kernel_impl)
-  return _ffpa_bwd_v2_autotune_cache[headdim]
+  return _ffpa_bwd_v2_autotune_cache[cache_key]
 
 
 def _ffpa_attn_backward_triton_impl(
@@ -815,6 +849,7 @@ def _ffpa_attn_backward_triton_impl(
   causal: bool = False,
   softmax_scale: float | None = None,
   autotune: bool = False,
+  autotune_mode: str = "fast",
   kernel_version: str = "v2",
   preprocess_d_chunk: bool = False,
 ) -> None:
@@ -862,6 +897,8 @@ def _ffpa_attn_backward_triton_impl(
   _, _, seqlen_k, _ = k.shape
   softmax_scale = softmax_scale or (1.0 / math.sqrt(headdim))
   seqlen_q_rounded = lse.shape[-1]
+  seqlen_q_bucket = bucket_autotune_seqlen(seqlen_q)
+  seqlen_k_bucket = bucket_autotune_seqlen(seqlen_k)
 
   assert q.dtype == k.dtype == v.dtype == o.dtype == do.dtype
   assert q.dtype in (torch.float16, torch.bfloat16)
@@ -875,7 +912,7 @@ def _ffpa_attn_backward_triton_impl(
     def pre_grid(meta: dict) -> tuple[int, int]:
       return (triton.cdiv(seqlen_q, meta["BLOCK_M"]), batch * nheads)
 
-    pre_kernel = _ffpa_bwd_pre_d_chunk_autotune if preprocess_d_chunk else _ffpa_bwd_pre_autotune
+    pre_kernel = _get_pre_autotune(preprocess_d_chunk, autotune_mode)
     pre_kernel[pre_grid](
       o,
       do,
@@ -888,6 +925,7 @@ def _ffpa_attn_backward_triton_impl(
       do.stride(2),
       nheads,
       seqlen_q,
+      seqlen_q_bucket,
       seqlen_q_rounded,
       headdim,
     )
@@ -905,6 +943,7 @@ def _ffpa_attn_backward_triton_impl(
       do.stride(2),
       nheads,
       seqlen_q,
+      seqlen_q_bucket,
       seqlen_q_rounded,
       headdim,
       BLOCK_M=128,
@@ -918,6 +957,8 @@ def _ffpa_attn_backward_triton_impl(
   dk.zero_()
   dv.zero_()
 
+  # TODO: May force use v1 for short seqlen where atomics are not a
+  # bottleneck and v2 overhead would dominate.
   if kernel_version == "v2":
     # v2: shared-pid split-D, grid = (max(K-blocks, Q-blocks), 1, B*Nh).
     # pid serves as both K-col block index and Q-row block index.
@@ -929,7 +970,7 @@ def _ffpa_attn_backward_triton_impl(
       )
 
     if autotune:
-      _get_v2_autotune(headdim)[grid](
+      _get_v2_autotune(headdim, autotune_mode)[grid](
         q,
         k,
         v,
@@ -964,6 +1005,8 @@ def _ffpa_attn_backward_triton_impl(
         nheads,
         seqlen_q,
         seqlen_k,
+        seqlen_q_bucket,
+        seqlen_k_bucket,
         seqlen_q_rounded,
         headdim,
         IS_CAUSAL=causal,
@@ -1005,6 +1048,8 @@ def _ffpa_attn_backward_triton_impl(
         nheads,
         seqlen_q,
         seqlen_k,
+        seqlen_q_bucket,
+        seqlen_k_bucket,
         seqlen_q_rounded,
         headdim,
         IS_CAUSAL=causal,
@@ -1021,7 +1066,7 @@ def _ffpa_attn_backward_triton_impl(
       return (triton.cdiv(seqlen_k, meta["BLOCK_N"]), batch * nheads)
 
     if autotune:
-      _get_v1_autotune(headdim)[grid](
+      _get_v1_autotune(headdim, autotune_mode)[grid](
         q,
         k,
         v,
@@ -1056,6 +1101,8 @@ def _ffpa_attn_backward_triton_impl(
         nheads,
         seqlen_q,
         seqlen_k,
+        seqlen_q_bucket,
+        seqlen_k_bucket,
         seqlen_q_rounded,
         headdim,
         IS_CAUSAL=causal,
@@ -1098,6 +1145,8 @@ def _ffpa_attn_backward_triton_impl(
         nheads,
         seqlen_q,
         seqlen_k,
+        seqlen_q_bucket,
+        seqlen_k_bucket,
         seqlen_q_rounded,
         headdim,
         IS_CAUSAL=causal,
@@ -1121,6 +1170,7 @@ def _ffpa_attn_backward_triton(
   causal: bool = False,
   softmax_scale: float | None = None,
   autotune: bool = False,
+  autotune_mode: str = "fast",
   kernel_version: str = "v2",
   preprocess_d_chunk: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -1150,6 +1200,8 @@ def _ffpa_attn_backward_triton(
   :param causal: Whether lower-right causal masking was used in forward.
   :param softmax_scale: Scale applied to ``QK^T``.
   :param autotune: Whether to use the headdim-specific Triton autotuned entry.
+    :param autotune_mode: Triton autotune search-space mode, ``"fast"`` or
+      ``"max"``.
   :param kernel_version: Triton backward kernel variant to dispatch.
   :param preprocess_d_chunk: Whether to split the preprocess delta reduction
     across head-dim chunks.
@@ -1186,6 +1238,7 @@ def _ffpa_attn_backward_triton(
     softmax_scale or (1.0 / math.sqrt(q.size(-1))),
     int(causal),
     int(autotune),
+    int(autotune_mode == "max"),
     int(kernel_version == "v2"),
     int(preprocess_d_chunk),
   )

@@ -85,11 +85,18 @@ class ENV(object):
   # if True: grid(N/Br, H, B) else: grid(N/Br, B * H)
   ENABLE_FFPA_LAUNCH_GRID_DNHB = bool(int(os.environ.get("ENABLE_FFPA_LAUNCH_GRID_DNHB", 0)))
 
-  # Enable native Split-D backward kernel generation/compilation. Defaults to
-  # disabled because the current native backward is still slower than SDPA.
+  # Enable native CUDA forward kernel generation/compilation. Defaults to
+  # disabled so the package can be built and used in Triton-only mode.
   # For development/validation, explicitly build with:
-  #   export ENABLE_FFPA_BACKWARD_IMPL=1
-  ENABLE_FFPA_BACKWARD_IMPL = bool(int(os.environ.get("ENABLE_FFPA_BACKWARD_IMPL", 0)))
+  #   export ENABLE_FFPA_FWD_CUDA_IMPL=1
+  ENABLE_FFPA_FWD_CUDA_IMPL = bool(int(os.environ.get("ENABLE_FFPA_FWD_CUDA_IMPL", 0)))
+
+  # Enable native Split-D CUDA backward kernel generation/compilation.
+  # This flag only takes effect when CUDA forward is also enabled.
+  # For development/validation, explicitly build with:
+  #   export ENABLE_FFPA_FWD_CUDA_IMPL=1
+  #   export ENABLE_FFPA_BWD_CUDA_IMPL=1
+  ENABLE_FFPA_BWD_CUDA_IMPL = bool(int(os.environ.get("ENABLE_FFPA_BWD_CUDA_IMPL", 0)))
 
   # --- Build-time tuning knobs ---------------------------------------------
   # Target CUDA SM architectures to compile for. When empty the current
@@ -220,8 +227,12 @@ class ENV(object):
     return cls.ENABLE_FFPA_LAUNCH_GRID_DNHB
 
   @classmethod
-  def enable_backward_impl(cls):
-    return cls.ENABLE_FFPA_BACKWARD_IMPL
+  def enable_fwd_cuda_impl(cls):
+    return cls.ENABLE_FFPA_FWD_CUDA_IMPL
+
+  @classmethod
+  def enable_bwd_cuda_impl(cls):
+    return cls.enable_fwd_cuda_impl() and cls.ENABLE_FFPA_BWD_CUDA_IMPL
 
   @classmethod
   def env_cuda_cflags(cls):
@@ -256,8 +267,10 @@ class ENV(object):
       extra_env_cflags.append("-DENABLE_FFPA_REGISTERS_PIPE_KV")
     if cls.enable_launch_grid_dnhb():
       extra_env_cflags.append("-DENBALE_FFPA_LAUNCH_GRID_DNHB")
-    if cls.enable_backward_impl():
-      extra_env_cflags.append("-DENABLE_FFPA_BACKWARD_IMPL")
+    if cls.enable_fwd_cuda_impl():
+      extra_env_cflags.append("-DENABLE_FFPA_FWD_CUDA_IMPL")
+    if cls.enable_bwd_cuda_impl():
+      extra_env_cflags.append("-DENABLE_FFPA_BWD_CUDA_IMPL")
 
     if cls.enable_persist_kv_g2s():
       assert (cls.enable_persist_q_g2s()), "PERSIST_Q_G2S must be enable if PERSIST_KV_G2S is enabled."
@@ -276,8 +289,10 @@ class ENV(object):
   @classmethod
   def extra_gcc_flags(cls):
     extra_gcc_flags = ["-O3", "-std=c++17"]
-    if cls.enable_backward_impl():
-      extra_gcc_flags.append("-DENABLE_FFPA_BACKWARD_IMPL")
+    if cls.enable_fwd_cuda_impl():
+      extra_gcc_flags.append("-DENABLE_FFPA_FWD_CUDA_IMPL")
+    if cls.enable_bwd_cuda_impl():
+      extra_gcc_flags.append("-DENABLE_FFPA_BWD_CUDA_IMPL")
     return extra_gcc_flags
 
   @classmethod
@@ -314,7 +329,8 @@ class ENV(object):
     formatenv("ENABLE_FFPA_SMEM_SWIZZLE_V", cls.enable_smem_swizzle_v())
     formatenv("ENABLE_FFPA_REGISTERS_PIPE_KV", cls.enable_registers_pipe_kv())
     formatenv("ENABLE_FFPA_LAUNCH_GRID_DNHB", cls.enable_launch_grid_dnhb())
-    formatenv("ENABLE_FFPA_BACKWARD_IMPL", cls.enable_backward_impl())
+    formatenv("ENABLE_FFPA_FWD_CUDA_IMPL", cls.enable_fwd_cuda_impl())
+    formatenv("ENABLE_FFPA_BWD_CUDA_IMPL", cls.enable_bwd_cuda_impl())
     pretty_print_line()
 
   @staticmethod
@@ -402,22 +418,28 @@ class ENV(object):
     headdims = cls.get_enabled_headdims()
     generated = []
 
-    # ---- declarations header shared by per-D TUs + dispatch TU ----
-    decls_path = os.path.join(gen_dir, "ffpa_attn_fwd_decls.h")
-    cls._write_if_changed(decls_path, cls._render_decls_header(headdims))
-    generated.append(decls_path)
+    fwd_generated_count = 0
+    if cls.enable_fwd_cuda_impl():
+      # ---- declarations header shared by per-D TUs + dispatch TU ----
+      decls_path = os.path.join(gen_dir, "ffpa_attn_fwd_decls.h")
+      cls._write_if_changed(decls_path, cls._render_decls_header(headdims))
+      generated.append(decls_path)
 
-    # ---- two forward TUs per headdim, one per dtype ----
-    for d in headdims:
-      fp16_path = os.path.join(gen_dir, f"ffpa_attn_fwd_fp16_hdim{d}.cu")
-      bf16_path = os.path.join(gen_dir, f"ffpa_attn_fwd_bf16_hdim{d}.cu")
-      cls._write_if_changed(fp16_path, cls._render_per_headdim_fp16_tu(d))
-      cls._write_if_changed(bf16_path, cls._render_per_headdim_bf16_tu(d))
-      generated.append(fp16_path)
-      generated.append(bf16_path)
+      # ---- two forward TUs per headdim, one per dtype ----
+      for d in headdims:
+        fp16_path = os.path.join(gen_dir, f"ffpa_attn_fwd_fp16_hdim{d}.cu")
+        bf16_path = os.path.join(gen_dir, f"ffpa_attn_fwd_bf16_hdim{d}.cu")
+        cls._write_if_changed(fp16_path, cls._render_per_headdim_fp16_tu(d))
+        cls._write_if_changed(bf16_path, cls._render_per_headdim_bf16_tu(d))
+        generated.append(fp16_path)
+        generated.append(bf16_path)
+      dispatch_path = os.path.join(gen_dir, "ffpa_attn_fwd_dispatch.cu")
+      cls._write_if_changed(dispatch_path, cls._render_dispatch_tu(headdims))
+      generated.append(dispatch_path)
+      fwd_generated_count = len(headdims) * 2 + 1
 
     bwd_generated_count = 0
-    if cls.enable_backward_impl():
+    if cls.enable_bwd_cuda_impl():
       # ---- backward TUs per headdim, one per dtype ----
       bwd_decls_path = os.path.join(gen_dir, "ffpa_attn_bwd_decls.h")
       cls._write_if_changed(bwd_decls_path, cls._render_bwd_decls_header(headdims))
@@ -438,7 +460,8 @@ class ENV(object):
     for fname in os.listdir(gen_dir):
       is_stale = ((fname.startswith("ffpa_attn_L1_acc_") and fname.endswith(".cu"))
                   or (fname.startswith("ffpa_attn_L1_hdim") and fname.endswith(".cu"))
-                  or (not cls.enable_backward_impl() and fname.startswith("ffpa_attn_bwd_"))
+                  or (not cls.enable_fwd_cuda_impl() and fname.startswith("ffpa_attn_fwd_"))
+                  or (not cls.enable_bwd_cuda_impl() and fname.startswith("ffpa_attn_bwd_"))
                   or fname in stale_file_names)
       if is_stale:
         stale = os.path.join(gen_dir, fname)
@@ -447,12 +470,7 @@ class ENV(object):
         except OSError:
           pass
 
-    # ---- top-level dispatch TU: CHECK_* + switch(d) to per-D entry points ----
-    dispatch_path = os.path.join(gen_dir, "ffpa_attn_fwd_dispatch.cu")
-    cls._write_if_changed(dispatch_path, cls._render_dispatch_tu(headdims))
-    generated.append(dispatch_path)
-
-    if cls.enable_backward_impl():
+    if cls.enable_bwd_cuda_impl():
       bwd_dispatch_path = os.path.join(gen_dir, "ffpa_attn_bwd_dispatch.cu")
       cls._write_if_changed(bwd_dispatch_path, cls._render_bwd_dispatch_tu(headdims))
       generated.append(bwd_dispatch_path)
@@ -460,7 +478,7 @@ class ENV(object):
 
     if build_pkg:
       pretty_print_line(
-        f"Generated {len(headdims) * 2 + bwd_generated_count} per-headdim TUs under {gen_dir}",
+        f"Generated {fwd_generated_count + bwd_generated_count} CUDA TUs under {gen_dir}",
         sep="",
         mode="left",
       )
@@ -910,6 +928,12 @@ class ENV(object):
   @staticmethod
   def build_ffpa_from_sources(verbose: bool = False):
     from torch.utils.cpp_extension import load
+
+    if not ENV.enable_fwd_cuda_impl():
+      raise RuntimeError(
+        "CUDA forward is disabled for this build. "
+        "Rebuild with ENABLE_FFPA_FWD_CUDA_IMPL=1 to build ffpa_attn._C."
+      )
 
     torch_arch_list_env = os.environ.get("TORCH_CUDA_ARCH_LIST", None)
     # Load the CUDA kernel as a python module

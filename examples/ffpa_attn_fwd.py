@@ -39,7 +39,7 @@ def _parse_args() -> argparse.Namespace:
     "--backend",
     "--fwd",
     choices=["cuda", "triton"],
-    default="cuda",
+    default="triton",
     help="Forward backend passed to ffpa_attn_func.",
   )
   parser.add_argument("--B", type=int, default=1, help="Batch size.")
@@ -52,6 +52,14 @@ def _parse_args() -> argparse.Namespace:
     "--tune",
     action="store_true",
     help="Enable Triton forward autotuning (only effective when --forward-backend=triton).",
+  )
+  parser.add_argument(
+    "--triton-autotune-mode",
+    "--autotune-mode",
+    "--mode",
+    choices=["fast", "max"],
+    default="fast",
+    help="Triton autotune search-space mode.",
   )
   return parser.parse_args()
 
@@ -85,6 +93,7 @@ def _run_case(
   dtype: torch.dtype,
   forward_backend: str,
   triton_forward_autotune: bool,
+  triton_autotune_mode: str,
   seed: int,
   B: int,
   Nh_q: int,
@@ -110,6 +119,7 @@ def _run_case(
     enable_gqa=Nh_q != Nh_kv,
     forward_backend=forward_backend,
     triton_forward_autotune=triton_forward_autotune,
+    triton_autotune_mode=triton_autotune_mode,
   )
   k_ref, v_ref = _expand_kv(k, v, Nh_q)
   out_sdpa = _sdpa_ref(q, k_ref, v_ref, is_causal=causal)
@@ -129,6 +139,7 @@ def _run_case(
       enable_gqa=Nh_q != Nh_kv,
       forward_backend=forward_backend,
       triton_forward_autotune=triton_forward_autotune,
+      triton_autotune_mode=triton_autotune_mode,
     ),
     q,
     k,
@@ -161,6 +172,7 @@ def main() -> None:
       dtype,
       args.forward_backend,
       args.triton_forward_autotune,
+      args.triton_autotune_mode,
       seed=args.seed,
       B=args.B,
       Nh_q=32,
@@ -174,6 +186,7 @@ def main() -> None:
       dtype,
       args.forward_backend,
       args.triton_forward_autotune,
+      args.triton_autotune_mode,
       seed=args.seed,
       B=args.B,
       Nh_q=32,
@@ -187,6 +200,7 @@ def main() -> None:
       dtype,
       args.forward_backend,
       args.triton_forward_autotune,
+      args.triton_autotune_mode,
       seed=args.seed,
       B=args.B,
       Nh_q=32,
@@ -200,6 +214,7 @@ def main() -> None:
       dtype,
       args.forward_backend,
       args.triton_forward_autotune,
+      args.triton_autotune_mode,
       seed=args.seed,
       B=args.B,
       Nh_q=32,
@@ -213,6 +228,7 @@ def main() -> None:
       dtype,
       args.forward_backend,
       args.triton_forward_autotune,
+      args.triton_autotune_mode,
       seed=args.seed,
       B=args.B,
       Nh_q=32,
@@ -227,6 +243,7 @@ def main() -> None:
       dtype,
       args.forward_backend,
       args.triton_forward_autotune,
+      args.triton_autotune_mode,
       seed=args.seed,
       B=args.B,
       Nh_q=8,

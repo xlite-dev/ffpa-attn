@@ -32,7 +32,7 @@ def parse_args():
   parser.add_argument(
     "--forward-backend",
     choices=["cuda", "triton"],
-    default="cuda",
+    default="triton",
     help="Native forward backend to benchmark when not using a compare mode.",
   )
   parser.add_argument(
@@ -41,6 +41,13 @@ def parse_args():
     "--tune",
     action="store_true",
     help="Enable Triton FFPA forward autotuning (only effective for triton backend).",
+  )
+  parser.add_argument(
+    "--triton-autotune-mode",
+    "--autotune-mode",
+    choices=["fast", "max"],
+    default="fast",
+    help="Triton autotune search-space mode.",
   )
   parser.add_argument("--warmup", type=int, default=5)
   parser.add_argument("--iters", type=int, default=20)
@@ -154,6 +161,7 @@ def main():
         acc="f32",
         forward_backend=backend,
         triton_forward_autotune=args.triton_forward_autotune,
+        triton_autotune_mode=args.triton_autotune_mode,
       )
 
     return native
@@ -166,7 +174,8 @@ def main():
   print(
     f"shape B={args.B} Hq={args.H} Hkv={nheads_kv} Nq={args.N} Nkv={seqlen_k} "
     f"D={args.D} dtype={args.dtype} causal={args.causal} "
-    f"autotune={args.triton_forward_autotune} warmup={args.warmup} iters={args.iters}"
+    f"autotune={args.triton_forward_autotune} autotune_mode={args.triton_autotune_mode} "
+    f"warmup={args.warmup} iters={args.iters}"
   )
   ref = sdpa(q, k, v).detach()
 

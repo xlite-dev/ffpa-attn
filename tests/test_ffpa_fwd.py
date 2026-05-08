@@ -61,6 +61,20 @@ def _acc_for(dtype):
   return "f32"
 
 
+def _require_cuda_forward_impl() -> None:
+  if not ffpa_attn_functional.cuda_forward_available():
+    pytest.skip("CUDA forward backend was not compiled")
+
+
+def _force_cuda_backend_unavailable(monkeypatch) -> None:
+  monkeypatch.setattr(ffpa_attn_functional, "_CUDA_BACKEND_LOADED", True)
+  monkeypatch.setattr(ffpa_attn_functional, "_CUDA_BACKEND_IMPORT_ERROR", RuntimeError("missing ffpa_attn._C"))
+  monkeypatch.setattr(ffpa_attn_functional, "_CUDA_FWD_AVAILABLE", False)
+  monkeypatch.setattr(ffpa_attn_functional, "_CUDA_BWD_AVAILABLE", False)
+  monkeypatch.setattr(ffpa_attn_functional, "_CUDA_FORWARD_IMPL", None)
+  monkeypatch.setattr(ffpa_attn_functional, "_CUDA_BACKWARD_IMPL", None)
+
+
 @pytest.fixture(scope="module", autouse=True)
 def _require_cuda():
   if not torch.cuda.is_available():
@@ -224,6 +238,51 @@ def test_ffpa_attn_func_large_d_keeps_selected_backend(monkeypatch, forward_back
   torch.testing.assert_close(out, q + k + v)
 
 
+def test_ffpa_attn_func_large_d_defaults_to_triton(monkeypatch):
+  q, k, v = _alloc_qkv(1, 4, 512, 320, torch.float16)
+  called = {"cuda": 0, "triton": 0}
+
+  def _fake_cuda(*args, **kwargs):
+    called["cuda"] += 1
+    raise AssertionError("default large-D path should not use CUDA forward")
+
+  def _fake_triton(q_in, k_in, v_in, o_in, causal, softmax_scale, autotune):
+    del o_in, causal, softmax_scale, autotune
+    called["triton"] += 1
+    out = q_in + k_in + v_in
+    lse = torch.zeros(q_in.size(0), q_in.size(1), q_in.size(2), device=q_in.device)
+    return out, lse
+
+  monkeypatch.setattr(ffpa_attn_functional, "_require_cuda_forward_impl", lambda: _fake_cuda)
+  monkeypatch.setattr(ffpa_attn_functional, "_ffpa_attn_forward_triton", _fake_triton)
+
+  out = ffpa_attn_func(q, k, v, stages=2, acc="f32")
+
+  assert called["triton"] == 1
+  assert called["cuda"] == 0
+  torch.testing.assert_close(out, q + k + v)
+
+
+def test_ffpa_attn_func_cuda_forward_unavailable_raises(monkeypatch):
+  _force_cuda_backend_unavailable(monkeypatch)
+  q, k, v = _alloc_qkv(1, 4, 512, 320, torch.float16)
+
+  with pytest.raises(RuntimeError, match="ENABLE_FFPA_FWD_CUDA_IMPL"):
+    ffpa_attn_func(q, k, v, stages=2, acc="f32", forward_backend="cuda")
+
+
+def test_ffpa_attn_func_cuda_backward_unavailable_raises(monkeypatch):
+  _force_cuda_backend_unavailable(monkeypatch)
+  q, k, v = _alloc_qkv(1, 4, 512, 320, torch.float16)
+  q.requires_grad_(True)
+  k.requires_grad_(True)
+  v.requires_grad_(True)
+
+  out = ffpa_attn_func(q, k, v, stages=2, acc="f32", forward_backend="triton", backward_backend="cuda")
+  with pytest.raises(RuntimeError, match="ENABLE_FFPA_BWD_CUDA_IMPL"):
+    out.sum().backward()
+
+
 @pytest.mark.parametrize("D", [128, 256])
 def test_ffpa_attn_func_small_d_backward_smoke(D):
   q, k, v = _alloc_qkv(1, 4, 64, D, torch.float16)
@@ -356,6 +415,7 @@ def test_ffpa_attn_func_triton_decode_matches_sdpa(dtype, Nq, Nkv, D, causal):
   ],
 )
 def test_ffpa_attn_func_cuda_decode_matches_sdpa(dtype, Nq, Nkv, D, causal):
+  _require_cuda_forward_impl()
   B, H = 1, 4
   q, k, v = _alloc_cross_qkv(B, H, Nq, Nkv, D, dtype)
   out = ffpa_attn_func(q, k, v, stages=2, acc=_acc_for(dtype), is_causal=causal, forward_backend="cuda")
@@ -409,6 +469,7 @@ def test_ffpa_attn_func_triton_decode_gqa_matches_sdpa(dtype, Nq, D):
 @pytest.mark.parametrize("dtype", DTYPES, ids=["fp16", "bf16"])
 @pytest.mark.parametrize("Nq,D", [(1, 512), (7, 320)])
 def test_ffpa_attn_func_cuda_decode_gqa_matches_sdpa(dtype, Nq, D):
+  _require_cuda_forward_impl()
   B, Nh_q, Nh_kv, Nkv = 1, 8, 2, 8192
   torch.manual_seed(0)
   q = torch.randn(B, Nh_q, Nq, D, dtype=dtype, device="cuda")

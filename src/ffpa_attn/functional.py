@@ -15,10 +15,6 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from .cuda import (
-  _ffpa_attn_forward_cuda,
-  _ffpa_attn_backward_cuda,
-)  # D > 256
 from .triton import (
   _ffpa_attn_forward_triton,
   _ffpa_attn_backward_triton,
@@ -50,13 +46,83 @@ _FFPA_ATTN_IMPL_DEFAULTS: dict[str, object] = {
   "acc": "f32",
   "enable_tma": False,
   "high_precision_grad": False,
-  "forward_backend": "cuda",
+  "forward_backend": "triton",
   "triton_forward_autotune": False,
+  "triton_autotune_mode": "fast",
   "backward_backend": "triton",
   "triton_backward_autotune": False,
   "triton_backward_version": "v2",
   "triton_backward_preprocess_d_chunk": False,
 }
+
+_CUDA_BACKEND_LOADED = False
+_CUDA_BACKEND_IMPORT_ERROR: Exception | None = None
+_CUDA_FWD_AVAILABLE = False
+_CUDA_BWD_AVAILABLE = False
+_CUDA_FORWARD_IMPL = None
+_CUDA_BACKWARD_IMPL = None
+
+
+def _load_cuda_backend() -> None:
+  global _CUDA_BACKEND_LOADED
+  global _CUDA_BACKEND_IMPORT_ERROR
+  global _CUDA_FWD_AVAILABLE
+  global _CUDA_BWD_AVAILABLE
+  global _CUDA_FORWARD_IMPL
+  global _CUDA_BACKWARD_IMPL
+
+  if _CUDA_BACKEND_LOADED:
+    return
+
+  _CUDA_BACKEND_LOADED = True
+  try:
+    from . import cuda as cuda_backend
+  except Exception as exc:
+    _CUDA_BACKEND_IMPORT_ERROR = exc
+    return
+
+  _CUDA_FORWARD_IMPL = cuda_backend._ffpa_attn_forward_cuda
+  _CUDA_BACKWARD_IMPL = cuda_backend._ffpa_attn_backward_cuda
+  _CUDA_FWD_AVAILABLE = bool(getattr(cuda_backend, "CUDA_FWD_AVAILABLE", False))
+  _CUDA_BWD_AVAILABLE = bool(getattr(cuda_backend, "CUDA_BWD_AVAILABLE", False))
+
+
+def cuda_forward_available() -> bool:
+  _load_cuda_backend()
+  return _CUDA_FWD_AVAILABLE
+
+
+def cuda_backward_available() -> bool:
+  _load_cuda_backend()
+  return _CUDA_BWD_AVAILABLE
+
+
+def _require_cuda_forward_impl():
+  _load_cuda_backend()
+  if _CUDA_FWD_AVAILABLE and _CUDA_FORWARD_IMPL is not None:
+    return _CUDA_FORWARD_IMPL
+
+  message = (
+    "ffpa_attn_func: forward_backend='cuda' requested but the CUDA forward backend is unavailable. "
+    "Rebuild with ENABLE_FFPA_FWD_CUDA_IMPL=1 to enable it."
+  )
+  if _CUDA_BACKEND_IMPORT_ERROR is not None:
+    message = f"{message} Original import error: {_CUDA_BACKEND_IMPORT_ERROR}"
+  raise RuntimeError(message)
+
+
+def _require_cuda_backward_impl():
+  _load_cuda_backend()
+  if _CUDA_BWD_AVAILABLE and _CUDA_BACKWARD_IMPL is not None:
+    return _CUDA_BACKWARD_IMPL
+
+  message = (
+    "ffpa_attn_func: backward_backend='cuda' requested but the CUDA backward backend is unavailable. "
+    "Rebuild with ENABLE_FFPA_FWD_CUDA_IMPL=1 and ENABLE_FFPA_BWD_CUDA_IMPL=1 to enable it."
+  )
+  if _CUDA_BACKEND_IMPORT_ERROR is not None:
+    message = f"{message} Original import error: {_CUDA_BACKEND_IMPORT_ERROR}"
+  raise RuntimeError(message)
 
 
 @dataclass
@@ -73,6 +139,8 @@ class FFPAAttnMeta:
   :param high_precision_grad: Whether SDPA backward should upcast.
   :param forward_backend: Forward backend name, ``"cuda"`` or ``"triton"``.
   :param triton_forward_autotune: Whether to enable Triton forward autotune.
+  :param triton_autotune_mode: Triton autotune search-space mode,
+    ``"fast"`` or ``"max"``.
   :param backward_backend: Backward backend name. ``"sdpa"``, ``"cuda"``, or ``"triton"``.
   :param triton_backward_autotune: Whether to enable Triton backward autotune.
   :param triton_backward_version: Triton backward kernel version.
@@ -90,6 +158,7 @@ class FFPAAttnMeta:
   high_precision_grad: bool
   forward_backend: str
   triton_forward_autotune: bool
+  triton_autotune_mode: str
   backward_backend: str
   triton_backward_autotune: bool
   triton_backward_version: str
@@ -118,6 +187,7 @@ class FFPAAttnMeta:
     high_precision_grad = bool(impl_options["high_precision_grad"])
     forward_backend = str(impl_options["forward_backend"])
     triton_forward_autotune = bool(impl_options["triton_forward_autotune"])
+    triton_autotune_mode = str(impl_options["triton_autotune_mode"])
     backward_backend = str(impl_options["backward_backend"])
     triton_backward_autotune = bool(impl_options["triton_backward_autotune"])
     triton_backward_version = str(impl_options["triton_backward_version"])
@@ -127,6 +197,8 @@ class FFPAAttnMeta:
       f"Unsupported forward_backend={forward_backend!r}; choose 'cuda' or 'triton'."
     assert backward_backend in ("sdpa", "triton", "cuda"), \
       f"Unsupported backward_backend={backward_backend!r}; choose 'sdpa', 'triton', or 'cuda'."
+    assert triton_autotune_mode in ("fast", "max"), \
+      f"Unsupported triton_autotune_mode={triton_autotune_mode!r}; choose 'fast' or 'max'."
 
     if acc_str == "f32":
       acc = _ACC_F32
@@ -149,6 +221,7 @@ class FFPAAttnMeta:
       high_precision_grad=high_precision_grad,
       forward_backend=forward_backend,
       triton_forward_autotune=triton_forward_autotune,
+      triton_autotune_mode=triton_autotune_mode,
       backward_backend=backward_backend,
       triton_backward_autotune=triton_backward_autotune,
       triton_backward_version=triton_backward_version,
@@ -293,7 +366,8 @@ class _FFPAAttnFunc(torch.autograd.Function):
         meta.dropout_p,
       )
     elif meta.forward_backend == "cuda":
-      O, lse = _ffpa_attn_forward_cuda(
+      cuda_forward_impl = _require_cuda_forward_impl()
+      O, lse = cuda_forward_impl(
         q,
         k,
         v,
@@ -313,6 +387,7 @@ class _FFPAAttnFunc(torch.autograd.Function):
         meta.is_causal,
         meta.scale,
         meta.triton_forward_autotune,
+        meta.triton_autotune_mode,
       )
     else:
       raise ValueError(f"Unsupported forward_backend={meta.forward_backend!r};")
@@ -347,7 +422,8 @@ class _FFPAAttnFunc(torch.autograd.Function):
 
     if D > 256:
       if meta.backward_backend == "cuda":
-        dq, dk, dv = _ffpa_attn_backward_cuda(
+        cuda_backward_impl = _require_cuda_backward_impl()
+        dq, dk, dv = cuda_backward_impl(
           q.contiguous(),
           k.contiguous(),
           v.contiguous(),
@@ -369,6 +445,7 @@ class _FFPAAttnFunc(torch.autograd.Function):
           causal=meta.is_causal,
           softmax_scale=meta.scale,
           autotune=meta.triton_backward_autotune,
+          autotune_mode=meta.triton_autotune_mode,
           kernel_version=meta.triton_backward_version,
           preprocess_d_chunk=meta.triton_backward_preprocess_d_chunk,
         )
@@ -447,4 +524,4 @@ class FFPAAttnFunc:
     return _ffpa_apply(*args, **kwargs)
 
 
-__all__ = ["FFPAAttnMeta", "FFPAAttnFunc"]
+__all__ = ["FFPAAttnMeta", "FFPAAttnFunc", "cuda_forward_available", "cuda_backward_available"]

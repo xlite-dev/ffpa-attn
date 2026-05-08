@@ -46,6 +46,13 @@ def parse_args():
     help="Enable Triton FFPA backward autotuning (only effective for triton backend)."
   )
   parser.add_argument(
+    "--triton-autotune-mode",
+    "--autotune-mode",
+    choices=["fast", "max"],
+    default="fast",
+    help="Triton autotune search-space mode.",
+  )
+  parser.add_argument(
     "--triton-backward-version",
     "--version",
     type=str,
@@ -224,6 +231,7 @@ def main():
         acc="f32",
         backward_backend=backend,
         triton_backward_autotune=args.triton_backward_autotune,
+        triton_autotune_mode=args.triton_autotune_mode,
         triton_backward_version=args.triton_backward_version,
         triton_backward_preprocess_d_chunk=args.triton_preprocess_d_chunk,
       )
@@ -246,6 +254,7 @@ def main():
       acc="f32",
       backward_backend=args.backward_backend,
       triton_backward_autotune=args.triton_backward_autotune,
+      triton_autotune_mode=args.triton_autotune_mode,
       triton_backward_version=args.triton_backward_version,
       triton_backward_preprocess_d_chunk=args.triton_preprocess_d_chunk,
     )
@@ -256,6 +265,7 @@ def main():
   print(
     f"shape B={args.B} H={args.H} N={args.N} D={args.D} dtype={args.dtype} "
     f"causal={args.causal} mode={args.mode} autotune={args.triton_backward_autotune} "
+    f"autotune_mode={args.triton_autotune_mode} "
     f"version={args.triton_backward_version} preprocess_d_chunk={args.triton_preprocess_d_chunk} "
     f"warmup={args.warmup} iters={args.iters}"
   )
