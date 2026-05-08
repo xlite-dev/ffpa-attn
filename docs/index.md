@@ -28,18 +28,13 @@ First, install the prebuilt package from [PyPI](https://pypi.org/project/ffpa-at
 ```bash
 # Required: PyTorch>=2.11.0, CUDA>=13.0, Ubuntu>=22.04
 pip3 install -U ffpa-attn # (support: sm_{80,90,...,120})
-# Or, build ffpa-attn from source. By default this is a Triton-only install
-# with no native CUDA extension; large-D forward defaults to the Triton backend.
+# Or, build ffpa-attn from source, just follow the cmds:
 git clone https://github.com/xlite-dev/ffpa-attn.git
-# Triton-only install:
-cd ffpa-attn && pip3 install -e .
-# Optional: enable the native CUDA forward extension.
-ENABLE_FFPA_FWD_CUDA_IMPL=1 MAX_JOBS=32 python3 setup.py bdist_wheel
-# Optional: enable both native CUDA forward and backward.
-ENABLE_FFPA_FWD_CUDA_IMPL=1 ENABLE_FFPA_BWD_CUDA_IMPL=1 MAX_JOBS=32 python3 setup.py bdist_wheel
-# Optional: build with ccache for faster CUDA rebuilds.
-apt install ccache && ENABLE_FFPA_FWD_CUDA_IMPL=1 bash tools/build_fast.sh bdist_wheel
-# Optional: for editable installs with CUDA enabled, use `pip install -e .` with the same env vars.
+# Then, build the wheel package and install it with pip
+cd ffpa-attn && MAX_JOBS=32 python3 setup.py bdist_wheel
+# Optional: build ffpa-attn with ccache for faster rebuilds
+apt install ccache && bash tools/build_fast.sh bdist_wheel
+# Optional: for editable whl, use `pip install -e .` instead.
 pip3 install dist/ffpa_attn-*.whl # pip uninstall ffpa-attn -y
 ```
 
@@ -81,9 +76,6 @@ print(out.shape, out.dtype)
 ref = F.scaled_dot_product_attention(q, k, v)
 print(f"vs SDPA max_abs_err={(out - ref).abs().max().item():.4e}")
 ```
-
-> [!NOTE]
-> On source builds, `ffpa_attn_func` now defaults to `forward_backend="triton"` for the large-D path. Request `forward_backend="cuda"` only when the package was built with `ENABLE_FFPA_FWD_CUDA_IMPL=1`.
 
 <a id="example-cross"></a>
 
