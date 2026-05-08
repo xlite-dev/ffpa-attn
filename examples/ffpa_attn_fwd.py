@@ -137,7 +137,7 @@ def _run_case(
 
   dt_tag = str(dtype).replace("torch.", "")
   print(
-    f"[{name:<14} {dt_tag:<8} acc={acc}] "
+    f"[{name:<16} {dt_tag:<8} acc={acc}] "
     f"B={B} Hq={Nh_q} Hkv={Nh_kv} Nq={Nq} Nkv={Nkv} D={D} causal={int(causal)}  "
     f"max|diff|={diff.max().item():.4f}  mean|diff|={diff.mean().item():.5f}  "
     f"allclose(atol={tol})={ok}  "
@@ -182,7 +182,7 @@ def main() -> None:
       D=D,
     )
     _run_case(
-      "decode-attn",
+      "decode-attn(1)",
       dtype,
       args.forward_backend,
       args.triton_forward_autotune,
@@ -191,6 +191,58 @@ def main() -> None:
       Nh_q=32,
       Nh_kv=32,
       Nq=1,
+      Nkv=N,
+      D=D,
+    )
+    _run_case(
+      "decode-attn(2)",
+      dtype,
+      args.forward_backend,
+      args.triton_forward_autotune,
+      seed=args.seed,
+      B=1,
+      Nh_q=32,
+      Nh_kv=32,
+      Nq=2,
+      Nkv=N,
+      D=D,
+    )
+    _run_case(
+      "decode-attn(7)",
+      dtype,
+      args.forward_backend,
+      args.triton_forward_autotune,
+      seed=args.seed,
+      B=1,
+      Nh_q=32,
+      Nh_kv=32,
+      Nq=7,
+      Nkv=N,
+      D=D,
+    )
+    _run_case(
+      "decode-attn(32)",
+      dtype,
+      args.forward_backend,
+      args.triton_forward_autotune,
+      seed=args.seed,
+      B=1,
+      Nh_q=32,
+      Nh_kv=32,
+      Nq=32,
+      Nkv=N,
+      D=D,
+    )
+    _run_case(
+      "decode-attn(512)",
+      dtype,
+      args.forward_backend,
+      args.triton_forward_autotune,
+      seed=args.seed,
+      B=1,
+      Nh_q=32,
+      Nh_kv=32,
+      Nq=512,
       Nkv=N,
       D=D,
     )

@@ -14,6 +14,7 @@ import torch.nn.functional as F
 
 from ffpa_attn import ffpa_attn_func  # noqa: E402
 import ffpa_attn.functional as ffpa_attn_functional  # noqa: E402
+from ffpa_attn.triton._ffpa_fwd import _ffpa_attn_forward_decode_impl  # noqa: E402
 
 SEQLENS = [1024, 4096, 8192]
 HEADDIMS = [64, 128, 320, 512, 640]
@@ -318,6 +319,34 @@ def test_ffpa_attn_func_triton_forward_matches_sdpa(dtype, B, H, Nq, Nkv, D, cau
 
 
 @pytest.mark.parametrize("dtype", DTYPES, ids=["fp16", "bf16"])
+@pytest.mark.parametrize(
+  "Nq,Nkv,D,causal",
+  [
+    (1, 4096, 512, False),
+    (7, 4096, 320, False),
+    (1, 8192, 512, False),
+    (7, 8192, 512, True),
+  ],
+)
+def test_ffpa_attn_func_triton_decode_matches_sdpa(dtype, Nq, Nkv, D, causal):
+  B, H = 1, 4
+  q, k, v = _alloc_cross_qkv(B, H, Nq, Nkv, D, dtype)
+  out = ffpa_attn_func(q, k, v, stages=2, acc=_acc_for(dtype), is_causal=causal, forward_backend="triton")
+  if causal:
+    kv_offset = Nkv - Nq
+    row_idx = torch.arange(Nq, device="cuda").view(-1, 1)
+    col_idx = torch.arange(Nkv, device="cuda").view(1, -1)
+    attn_mask = (col_idx <= (row_idx + kv_offset))
+    ref = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, scale=1.0 / math.sqrt(D))
+  else:
+    ref = _sdpa_ref(q, k, v)
+  assert out.shape == ref.shape
+  assert out.dtype == dtype
+  assert torch.isfinite(out).all()
+  torch.testing.assert_close(out, ref, **_tolerance(dtype))
+
+
+@pytest.mark.parametrize("dtype", DTYPES, ids=["fp16", "bf16"])
 @pytest.mark.parametrize("D", [320, 512])
 def test_ffpa_attn_func_triton_forward_gqa_matches_sdpa(dtype, D):
   B, Nh_q, Nh_kv, Nq, Nkv = 1, 8, 2, 128, 256
@@ -331,6 +360,49 @@ def test_ffpa_attn_func_triton_forward_gqa_matches_sdpa(dtype, D):
   assert out.shape == ref.shape
   assert torch.isfinite(out).all()
   torch.testing.assert_close(out, ref, **_tolerance(dtype))
+
+
+@pytest.mark.parametrize("dtype", DTYPES, ids=["fp16", "bf16"])
+@pytest.mark.parametrize("Nq,D", [(1, 512), (5, 320)])
+def test_ffpa_attn_func_triton_decode_gqa_matches_sdpa(dtype, Nq, D):
+  B, Nh_q, Nh_kv, Nkv = 1, 8, 2, 8192
+  torch.manual_seed(0)
+  q = torch.randn(B, Nh_q, Nq, D, dtype=dtype, device="cuda")
+  k = torch.randn(B, Nh_kv, Nkv, D, dtype=dtype, device="cuda")
+  v = torch.randn(B, Nh_kv, Nkv, D, dtype=dtype, device="cuda")
+  out = ffpa_attn_func(q, k, v, stages=2, acc=_acc_for(dtype), forward_backend="triton", enable_gqa=True)
+  group_size = Nh_q // Nh_kv
+  ref = _sdpa_ref(q, k.repeat_interleave(group_size, dim=1), v.repeat_interleave(group_size, dim=1))
+  assert out.shape == ref.shape
+  assert out.dtype == dtype
+  assert torch.isfinite(out).all()
+  torch.testing.assert_close(out, ref, **_tolerance(dtype))
+
+
+@pytest.mark.parametrize("dtype", DTYPES, ids=["fp16", "bf16"])
+@pytest.mark.parametrize("Nq,Nkv,D", [(32, 8192, 512), (512, 8192, 512)])
+def test_ffpa_attn_forward_decode_impl_matches_sdpa_for_larger_queries(dtype, Nq, Nkv, D):
+  B, H = 1, 4
+  q, k, v = _alloc_cross_qkv(B, H, Nq, Nkv, D, dtype)
+  o = torch.empty_like(q)
+  lse = torch.empty(B, H, Nq, device="cuda", dtype=torch.float32)
+
+  _ffpa_attn_forward_decode_impl(
+    q,
+    k,
+    v,
+    o,
+    lse,
+    causal=False,
+    softmax_scale=1.0 / math.sqrt(D),
+    autotune=False,
+  )
+
+  ref = _sdpa_ref(q, k, v)
+  assert o.shape == ref.shape
+  assert o.dtype == dtype
+  assert torch.isfinite(o).all()
+  torch.testing.assert_close(o, ref, **_tolerance(dtype))
 
 
 @pytest.mark.parametrize("backward_backend", ["sdpa", "triton"])

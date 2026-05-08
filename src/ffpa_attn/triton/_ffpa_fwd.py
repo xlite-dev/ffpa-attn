@@ -84,9 +84,53 @@ def _gen_fwd_autotune_configs(headdim: int = 256) -> list[triton.Config]:
   return configs
 
 
+def _gen_decode_fwd_stage1_autotune_configs(headdim: int = 256) -> list[triton.Config]:
+  """Generate headdim-specific autotune configs for decode stage1.
+
+  Decode always has ``Nq == 1``, so the search space is the KV chunk size,
+  score tile width, split-D tile size, warp count, and pipeline depth.
+
+  :param headdim: The actual head dimension for the target decode call.
+  :return: Triton autotune configurations for decode stage1.
+  """
+  try:
+    _max_smem = torch.cuda.get_device_properties(0).shared_memory_per_block_optin
+  except Exception:
+    _max_smem = 48 * 1024
+
+  _headdim_candidates = [64, 128]
+  _next_pow2 = triton.next_power_of_2(headdim)
+  if _max_smem >= 96 * 1024 and _next_pow2 not in _headdim_candidates:
+    _headdim_candidates.append(_next_pow2)
+
+  configs = []
+  for chunk_size in [128, 256, 512]:
+    for block_n in [64, 128, 256]:
+      for block_headdim in _headdim_candidates:
+        for num_warps in [4, 8]:
+          for num_stages in [2, 3, 4]:
+            configs.append(
+              triton.Config(
+                {
+                  "CHUNK_SIZE": chunk_size,
+                  "BLOCK_N": block_n,
+                  "BLOCK_HEADDIM_QK": block_headdim,
+                  "BLOCK_HEADDIM_V": block_headdim,
+                },
+                num_warps=num_warps,
+                num_stages=num_stages,
+              )
+            )
+  return configs
+
+
 _FFPA_FWD_HEURISTICS = {
   "EVEN_M": lambda args: args["seqlen_q"] % args["BLOCK_M"] == 0,
   "EVEN_N": lambda args: args["seqlen_k"] % args["BLOCK_N"] == 0,
+  "NUM_V_GROUPS": lambda args: triton.cdiv(args["HEADDIM"], args["BLOCK_HEADDIM_V"]),
+}
+
+_FFPA_DECODE_FWD_HEURISTICS = {
   "NUM_V_GROUPS": lambda args: triton.cdiv(args["HEADDIM"], args["BLOCK_HEADDIM_V"]),
 }
 
@@ -222,8 +266,442 @@ def _ffpa_fwd_kernel_impl(
   tl.store(LSE + offs_m, m_i + tl.log(l_i), mask=offs_m < seqlen_q)
 
 
-_ffpa_fwd = _ffpa_fwd_kernel_impl
+@triton.heuristics(_FFPA_DECODE_FWD_HEURISTICS)
+@triton.jit
+def _ffpa_decode_fwd_stage1_kernel(
+  Q: torch.Tensor,
+  K: torch.Tensor,
+  V: torch.Tensor,
+  PartialOut: torch.Tensor,
+  ChunkLSE: torch.Tensor,
+  softmax_scale: float,
+  stride_qb: int,
+  stride_qh: int,
+  stride_qm: int,
+  stride_kb: int,
+  stride_kh: int,
+  stride_kn: int,
+  stride_vb: int,
+  stride_vh: int,
+  stride_vn: int,
+  stride_pb: int,
+  stride_ph: int,
+  stride_pc: int,
+  stride_pm: int,
+  stride_lb: int,
+  stride_lh: int,
+  stride_lc: int,
+  stride_lm: int,
+  nheads_q: int,
+  nheads_kv: int,
+  seqlen_q: int,
+  seqlen_k: int,
+  IS_CAUSAL: tl.constexpr,
+  USE_GEMV: tl.constexpr,
+  DTYPE: tl.constexpr,
+  HEADDIM: tl.constexpr,
+  BLOCK_M: tl.constexpr,
+  CHUNK_SIZE: tl.constexpr,
+  BLOCK_N: tl.constexpr,
+  BLOCK_HEADDIM_QK: tl.constexpr,
+  BLOCK_HEADDIM_V: tl.constexpr,
+  NUM_V_GROUPS: tl.constexpr,
+) -> None:
+  chunk_idx = tl.program_id(0)
+  off_hb = tl.program_id(1)
+  q_block = tl.program_id(2)
+  off_b = off_hb // nheads_q
+  off_hq = off_hb % nheads_q
+  group_size = nheads_q // nheads_kv
+  off_hkv = off_hq // group_size
 
+  Q += off_b * stride_qb + off_hq * stride_qh
+  K += off_b * stride_kb + off_hkv * stride_kh
+  V += off_b * stride_vb + off_hkv * stride_vh
+  PartialOut += off_b * stride_pb + off_hq * stride_ph + chunk_idx * stride_pc
+  ChunkLSE += off_b * stride_lb + off_hq * stride_lh + chunk_idx * stride_lc
+
+  chunk_start = chunk_idx * CHUNK_SIZE
+  chunk_end = tl.minimum(seqlen_k, chunk_start + CHUNK_SIZE)
+  kv_offset = seqlen_k - seqlen_q
+  offs_m = q_block * BLOCK_M + tl.arange(0, BLOCK_M)
+  mask_m = offs_m < seqlen_q
+  offs_n = tl.arange(0, BLOCK_N)
+  offs_d_qk = tl.arange(0, BLOCK_HEADDIM_QK)
+  offs_d_v = tl.arange(0, BLOCK_HEADDIM_V)
+  num_qk_d_chunks = tl.cdiv(HEADDIM, BLOCK_HEADDIM_QK)
+
+  if USE_GEMV:  # gemv
+    m_i_single = -float("inf")
+    l_i_single = 0.0
+    zero_acc_single = tl.zeros([BLOCK_HEADDIM_V], dtype=tl.float32)
+    o_accs_single = (zero_acc_single, ) * NUM_V_GROUPS
+
+    for start_n in range(0, CHUNK_SIZE, BLOCK_N):
+      start_n = tl.multiple_of(start_n, BLOCK_N)
+      offs_kv = chunk_start + start_n + offs_n
+      mask_n = offs_kv < chunk_end
+
+      scores = tl.zeros([1, BLOCK_N], dtype=tl.float32)
+      for qk_d_chunk in range(num_qk_d_chunks):
+        qk_d_start = qk_d_chunk * BLOCK_HEADDIM_QK
+        qk_d = qk_d_start + offs_d_qk
+        q = tl.load(
+          Q + qk_d,
+          mask=qk_d < HEADDIM,
+          other=0.0,
+        )
+        k = tl.load(
+          K + offs_kv[:, None] * stride_kn + qk_d[None, :],
+          mask=mask_n[:, None] & (qk_d[None, :] < HEADDIM),
+          other=0.0,
+        )
+        scores += tl.sum(k * q[None, :], axis=1)[None, :]
+
+      scores = tl.sum(scores, axis=0)
+      scores = scores * softmax_scale
+      scores = tl.where(mask_n, scores, -float("inf"))
+      if IS_CAUSAL:
+        causal_mask = offs_kv <= (seqlen_k - 1)
+        scores = tl.where(causal_mask, scores, -float("inf"))
+
+      m_new = tl.maximum(m_i_single, tl.max(scores, axis=0))
+      alpha = tl.exp(m_i_single - m_new)
+      p = tl.exp(scores - m_new)
+      l_new = l_i_single * alpha + tl.sum(p, axis=0)
+      p = p.to(DTYPE)
+
+      for v_group in tl.static_range(0, NUM_V_GROUPS):
+        o_d = BLOCK_HEADDIM_V * v_group + offs_d_v
+        v = tl.load(
+          V + offs_kv[:, None] * stride_vn + o_d[None, :],
+          mask=mask_n[:, None] & (o_d[None, :] < HEADDIM),
+          other=0.0,
+        )
+        o_acc = o_accs_single[v_group] * alpha + tl.sum(v * p[:, None], axis=0)
+        o_accs_single = _update_o_accs(o_accs_single, v_group, o_acc)
+
+      m_i_single = m_new
+      l_i_single = l_new
+
+    for v_group in tl.static_range(0, NUM_V_GROUPS):
+      o_d = BLOCK_HEADDIM_V * v_group + offs_d_v
+      out = o_accs_single[v_group] / (l_i_single + 1.0e-10)
+      tl.store(
+        PartialOut + o_d,
+        out,
+        mask=o_d < HEADDIM,
+      )
+    tl.store(ChunkLSE, m_i_single + tl.log(l_i_single))
+
+  else:  # MMA gemm
+
+    m_i = tl.full([BLOCK_M], -float("inf"), dtype=tl.float32)
+    l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
+    zero_acc = tl.zeros([BLOCK_M, BLOCK_HEADDIM_V], dtype=tl.float32)
+    o_accs = (zero_acc, ) * NUM_V_GROUPS
+
+    for start_n in range(0, CHUNK_SIZE, BLOCK_N):
+      start_n = tl.multiple_of(start_n, BLOCK_N)
+      offs_kv = chunk_start + start_n + offs_n
+      mask_n = offs_kv < chunk_end
+
+      scores = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+      for qk_d_chunk in range(num_qk_d_chunks):
+        qk_d_start = qk_d_chunk * BLOCK_HEADDIM_QK
+        qk_d = qk_d_start + offs_d_qk
+        q = tl.load(
+          Q + offs_m[:, None] * stride_qm + qk_d[None, :],
+          mask=mask_m[:, None] & (qk_d[None, :] < HEADDIM),
+          other=0.0,
+        )
+        k = tl.load(
+          K + offs_kv[:, None] * stride_kn + qk_d[None, :],
+          mask=mask_n[:, None] & (qk_d[None, :] < HEADDIM),
+          other=0.0,
+        )
+        scores = tl.dot(q, tl.trans(k), acc=scores)
+
+      scores = scores * softmax_scale
+      scores = tl.where(mask_n[None, :], scores, -float("inf"))
+      if IS_CAUSAL:
+        causal_mask = offs_kv[None, :] <= (offs_m[:, None] + kv_offset)
+        scores = tl.where(causal_mask, scores, -float("inf"))
+      scores = tl.where(mask_m[:, None], scores, -float("inf"))
+
+      m_prev = tl.where(mask_m, m_i, 0.0)
+      m_new = tl.where(mask_m, tl.maximum(m_i, tl.max(scores, axis=1)), 0.0)
+      alpha = tl.exp(m_prev - m_new)
+      p = tl.exp(scores - m_new[:, None])
+      l_new = l_i * alpha + tl.sum(p, axis=1)
+      p = p.to(DTYPE)
+
+      for v_group in tl.static_range(0, NUM_V_GROUPS):
+        o_d = BLOCK_HEADDIM_V * v_group + offs_d_v
+        v = tl.load(
+          V + offs_kv[:, None] * stride_vn + o_d[None, :],
+          mask=mask_n[:, None] & (o_d[None, :] < HEADDIM),
+          other=0.0,
+        )
+        o_acc = o_accs[v_group] * alpha[:, None] + tl.dot(p, v)
+        o_accs = _update_o_accs(o_accs, v_group, o_acc)
+
+      m_i = m_new
+      l_i = l_new
+
+    for v_group in tl.static_range(0, NUM_V_GROUPS):
+      o_d = BLOCK_HEADDIM_V * v_group + offs_d_v
+      out = o_accs[v_group] / (l_i[:, None] + 1.0e-10)
+      tl.store(
+        PartialOut + offs_m[:, None] * stride_pm + o_d[None, :],
+        out,
+        mask=mask_m[:, None] & (o_d[None, :] < HEADDIM),
+      )
+    tl.store(ChunkLSE + offs_m * stride_lm, m_i + tl.log(l_i), mask=mask_m)
+
+
+@triton.jit
+def _ffpa_decode_fwd_stage2_kernel(
+  PartialOut: torch.Tensor,
+  ChunkLSE: torch.Tensor,
+  O: torch.Tensor,
+  LSE: torch.Tensor,
+  stride_pb: int,
+  stride_ph: int,
+  stride_pc: int,
+  stride_pm: int,
+  stride_lb: int,
+  stride_lh: int,
+  stride_lc: int,
+  stride_lm: int,
+  stride_ob: int,
+  stride_oh: int,
+  stride_om: int,
+  stride_lseb: int,
+  stride_lseh: int,
+  stride_lsem: int,
+  nheads_q: int,
+  seqlen_q: int,
+  n_chunks: int,
+  DTYPE: tl.constexpr,
+  HEADDIM: tl.constexpr,
+  BLOCK_HEADDIM_V: tl.constexpr,
+  BLOCK_CHUNKS: tl.constexpr,
+) -> None:
+  off_hbm = tl.program_id(0)
+  v_group = tl.program_id(1)
+  off_hb = off_hbm // seqlen_q
+  off_m = off_hbm % seqlen_q
+  off_b = off_hb // nheads_q
+  off_hq = off_hb % nheads_q
+
+  PartialOut += off_b * stride_pb + off_hq * stride_ph + off_m * stride_pm
+  ChunkLSE += off_b * stride_lb + off_hq * stride_lh + off_m * stride_lm
+  O += off_b * stride_ob + off_hq * stride_oh + off_m * stride_om
+  LSE += off_b * stride_lseb + off_hq * stride_lseh + off_m * stride_lsem
+
+  offs_c = tl.arange(0, BLOCK_CHUNKS)
+  mask_c = offs_c < n_chunks
+  chunk_lse = tl.load(
+    ChunkLSE + offs_c * stride_lc,
+    mask=mask_c,
+    other=-float("inf"),
+  )
+  valid_c = mask_c & (chunk_lse > -float("inf"))
+  max_lse = tl.max(chunk_lse, axis=0)
+  weights = tl.where(valid_c, tl.exp(chunk_lse - max_lse), 0.0)
+  denom = tl.sum(weights, axis=0)
+
+  offs_d = v_group * BLOCK_HEADDIM_V + tl.arange(0, BLOCK_HEADDIM_V)
+  partial = tl.load(
+    PartialOut + offs_c[:, None] * stride_pc + offs_d[None, :],
+    mask=valid_c[:, None] & (offs_d[None, :] < HEADDIM),
+    other=0.0,
+  )
+  out = tl.sum(weights[:, None] * partial, axis=0) / denom
+  tl.store(
+    O + offs_d,
+    out.to(DTYPE),
+    mask=offs_d < HEADDIM,
+  )
+  if v_group == 0:
+    tl.store(LSE, max_lse + tl.log(denom))
+
+
+_ffpa_decode_fwd_stage1 = _ffpa_decode_fwd_stage1_kernel
+_ffpa_decode_fwd_stage1_autotune_cache: dict[int, callable] = {}  # headdim -> callable
+
+
+def _get_decode_fwd_stage1_autotune(headdim: int):
+  """Return a headdim-specific autotune wrapper for decode stage1."""
+  if headdim not in _ffpa_decode_fwd_stage1_autotune_cache:
+    configs = _gen_decode_fwd_stage1_autotune_configs(headdim)
+    _ffpa_decode_fwd_stage1_autotune_cache[headdim] = triton.autotune(
+      configs=configs,
+      key=["seqlen_q", "seqlen_k", "HEADDIM"],
+      cache_results=True,
+    )(_ffpa_decode_fwd_stage1_kernel)
+  return _ffpa_decode_fwd_stage1_autotune_cache[headdim]
+
+
+def _ffpa_attn_forward_decode_impl(
+  q: torch.Tensor,
+  k: torch.Tensor,
+  v: torch.Tensor,
+  o: torch.Tensor,
+  lse: torch.Tensor,
+  causal: bool = False,
+  softmax_scale: float | None = None,
+  autotune: bool = False,
+) -> None:
+  """Run the short-query Triton forward path for ``seqlen_q < 8``."""
+  batch, nheads_q, seqlen_q, headdim = q.shape
+  _, nheads_kv, seqlen_k, _ = k.shape
+  softmax_scale = softmax_scale or (1.0 / math.sqrt(headdim))
+
+  if autotune:
+    n_chunks = triton.cdiv(seqlen_k, 128)
+  else:
+    n_chunks = triton.cdiv(seqlen_k, 256)
+
+  partial_out = torch.empty(
+    (batch, nheads_q, n_chunks, seqlen_q, headdim),
+    device=q.device,
+    dtype=torch.float32,
+  )
+  chunk_lse = torch.empty(
+    (batch, nheads_q, n_chunks, seqlen_q),
+    device=q.device,
+    dtype=torch.float32,
+  )
+  if autotune:
+    chunk_lse.fill_(-float("inf"))
+
+  DTYPE = tl.float16 if q.dtype == torch.float16 else tl.bfloat16
+  use_gemv = seqlen_q == 1
+
+  def stage1_grid(meta: dict) -> tuple[int, int, int]:
+    return (
+      triton.cdiv(seqlen_k, meta["CHUNK_SIZE"]),
+      batch * nheads_q,
+      triton.cdiv(seqlen_q, meta["BLOCK_M"]),
+    )
+
+  if autotune:
+    _get_decode_fwd_stage1_autotune(headdim)[stage1_grid](
+      q,
+      k,
+      v,
+      partial_out,
+      chunk_lse,
+      softmax_scale,
+      q.stride(0),
+      q.stride(1),
+      q.stride(2),
+      k.stride(0),
+      k.stride(1),
+      k.stride(2),
+      v.stride(0),
+      v.stride(1),
+      v.stride(2),
+      partial_out.stride(0),
+      partial_out.stride(1),
+      partial_out.stride(2),
+      partial_out.stride(3),
+      chunk_lse.stride(0),
+      chunk_lse.stride(1),
+      chunk_lse.stride(2),
+      chunk_lse.stride(3),
+      nheads_q,
+      nheads_kv,
+      seqlen_q,
+      seqlen_k,
+      IS_CAUSAL=causal,
+      USE_GEMV=use_gemv,
+      DTYPE=DTYPE,
+      HEADDIM=headdim,
+      BLOCK_M=8,
+    )
+  else:
+    _ffpa_decode_fwd_stage1[stage1_grid](
+      q,
+      k,
+      v,
+      partial_out,
+      chunk_lse,
+      softmax_scale,
+      q.stride(0),
+      q.stride(1),
+      q.stride(2),
+      k.stride(0),
+      k.stride(1),
+      k.stride(2),
+      v.stride(0),
+      v.stride(1),
+      v.stride(2),
+      partial_out.stride(0),
+      partial_out.stride(1),
+      partial_out.stride(2),
+      partial_out.stride(3),
+      chunk_lse.stride(0),
+      chunk_lse.stride(1),
+      chunk_lse.stride(2),
+      chunk_lse.stride(3),
+      nheads_q,
+      nheads_kv,
+      seqlen_q,
+      seqlen_k,
+      IS_CAUSAL=causal,
+      USE_GEMV=use_gemv,
+      DTYPE=DTYPE,
+      HEADDIM=headdim,
+      BLOCK_M=8,
+      CHUNK_SIZE=256,
+      BLOCK_N=128,
+      BLOCK_HEADDIM_QK=64,
+      BLOCK_HEADDIM_V=64,
+      num_warps=4,
+      num_stages=2,
+    )
+
+  stage2_block_headdim_v = triton.next_power_of_2(headdim) if headdim <= 512 else 128
+  block_chunks = triton.next_power_of_2(n_chunks)
+
+  def stage2_grid(meta: dict) -> tuple[int, int]:
+    num_v_groups = triton.cdiv(o.size(-1), meta["BLOCK_HEADDIM_V"])
+    return (o.size(0) * o.size(1) * o.size(2), num_v_groups)
+
+  _ffpa_decode_fwd_stage2_kernel[stage2_grid](
+    partial_out,
+    chunk_lse,
+    o,
+    lse,
+    partial_out.stride(0),
+    partial_out.stride(1),
+    partial_out.stride(2),
+    partial_out.stride(3),
+    chunk_lse.stride(0),
+    chunk_lse.stride(1),
+    chunk_lse.stride(2),
+    chunk_lse.stride(3),
+    o.stride(0),
+    o.stride(1),
+    o.stride(2),
+    lse.stride(0),
+    lse.stride(1),
+    lse.stride(2),
+    o.size(1),
+    o.size(2),
+    n_chunks,
+    DTYPE=DTYPE,
+    HEADDIM=o.size(-1),
+    BLOCK_HEADDIM_V=stage2_block_headdim_v,
+    BLOCK_CHUNKS=block_chunks,
+    num_warps=4,
+  )
+
+
+_ffpa_fwd = _ffpa_fwd_kernel_impl
 _ffpa_fwd_autotune_cache: dict[int, callable] = {}  # headdim -> callable
 
 
@@ -285,6 +763,19 @@ def _ffpa_attn_forward_impl(
     raise ValueError(f"Triton forward supports headdim <= {_MAX_HEADDIM}, got {headdim}")
 
   DTYPE = tl.float16 if q.dtype == torch.float16 else tl.bfloat16
+
+  if seqlen_q < 8:
+    _ffpa_attn_forward_decode_impl(
+      q,
+      k,
+      v,
+      o,
+      lse,
+      causal=causal,
+      softmax_scale=softmax_scale,
+      autotune=autotune,
+    )
+    return
 
   def grid(meta: dict) -> tuple[int, int]:
     return (triton.cdiv(seqlen_q, meta["BLOCK_M"]), batch * nheads_q)
