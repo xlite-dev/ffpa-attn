@@ -41,7 +41,7 @@ Then, try to accelerate the attention for large headdim with just <i><b>one-line
 >>> # Monkey-patch SDPA to point to FFPA attention. Every thing that
 >>> # FFPA does not support will automatically fallback to SDPA. For
 >>> # example, if the user calls SDPA with headdim <= 256 or > 1024,
->>> # attn_mask not None, and dropout_p > 0.0, etc.
+>>> # attn_mask not None, dropout_p > 0.0, and N < 512, etc.
 >>> F.scaled_dot_product_attention = ffpa_attn_func # one-line code
 ```
 
@@ -61,7 +61,7 @@ We extend FlashAttention to support large headdim ($D>256$) via **fine-grained t
 </div>
 
 > [!NOTE]
-> FFPA has been tested on `Ampere`, `Ada`, `Hopper`, and `Blackwell` architectures (e.g., A30, L20, 4090, H200, 5090), achieves `1.8×~3×↑🎉` forward and `1.5×~2.5×↑🎉` backward padd speedup over SDPA. Currently, FFPA is mainly design for prefill (`N>=512`) and large headdim (`D>256`), and may not be faster than SDPA for small sequence length (`N<512`) or small headdim (`D<=256`).
+> FFPA has been tested on `Ampere`, `Ada`, `Hopper`, and `Blackwell` architectures (e.g., A30, L20, 4090, H200, 5090), achieves `1.8×~3×↑🎉` forward and `1.5×~2.5×↑🎉` backward padd speedup over SDPA. Currently, FFPA is mainly design for **prefill** (`N>=512`) and large headdim (`D>256`), and may not be faster than SDPA for small sequence length (`N<512`) or small headdim (`D<=256`).
 
 ## 🎉 Benchmark
 

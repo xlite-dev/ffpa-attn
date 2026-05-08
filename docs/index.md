@@ -46,7 +46,7 @@ Then, try to accelerate the attention for large headdim with just <i><b>one-line
 >>> # Monkey-patch SDPA to point to FFPA attention. Every thing that
 >>> # FFPA does not support will automatically fallback to SDPA. For
 >>> # example, if the user calls SDPA with headdim <= 256 or > 1024,
->>> # attn_mask not None, and dropout_p > 0.0, etc.
+>>> # attn_mask not None, dropout_p > 0.0, and N < 512, etc.
 >>> F.scaled_dot_product_attention = ffpa_attn_func # one-line code
 ```
 
