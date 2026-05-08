@@ -6,13 +6,13 @@
   <img src="docs/assets/ffpa-api.png" width="700px">
 </div>
 
-**FFPA(Split-D)**: Yet another **Faster Flash Prefill Attention** with **Split-D** strategy, achieve **O(1) SRAM complexity** and **O(d/4) register complexity** for large headdim (**> 256**), **1.8x~3x** 🎉 faster than SDPA. 👇Core features:
+**FFPA(Split-D)**: Yet another **Faster Flash Prefill Attention** with **Split-D** strategy, achieve **O(1) SRAM complexity** and **O(d/4) register complexity** for large headdim (**> 256**), **1.8~3x** 🎉 faster than SDPA. 👇Core features:
 
 <div align='center'>
 
 |[Self Attn](./examples)| [GQA/MQA](./examples) |[Cross Attn](./examples)|[Causal Attn](./examples)|[Headdim](#ffpa-design)|[Forward↑](./examples)|[Backward↑](./examples)|
 |:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-|✔️(`Nq=Nkv`)|✔️(`Hq!=Hkv`)|✔️(`Nq!=Nkv`)|✔️(`causal`)|**320~1024** |**1.8x~3x↑🎉** |**1.5x~2.5x↑🎉** |
+|✔️(`Nq=Nkv`)|✔️(`Hq!=Hkv`)|✔️(`Nq!=Nkv`)|✔️(`causal`)|**320~1024** |**1.8~3x↑🎉** |**1.5~2.5x↑🎉** |
 
 </div>
 
@@ -56,12 +56,12 @@ We extend FlashAttention to support large headdim ($D>256$) via **fine-grained t
 <div align='center'>
   <img src=https://github.com/user-attachments/assets/ed30185b-2e11-4293-832f-43e9003d6ad9 width="700px">
   </p><i>
-    <b>FFPA</b> enables headdim <b> > 256</b>, and outperforms standard SDPA by <b>1.8x~3x</b>🎉.
+    <b>FFPA</b> enables headdim <b> > 256</b>, and outperforms standard SDPA by <b>1.8~3x</b>🎉.
   </i></p>
 </div>
 
 > [!NOTE]
-> FFPA has been tested on `Ampere`, `Ada`, `Hopper`, and `Blackwell` architectures (e.g., A30, L20, 4090, H200, 5090), achieves `1.8×~3×↑🎉` forward and `1.5×~2.5×↑🎉` backward padd speedup over SDPA. Currently, FFPA is mainly design for **prefill** (`N>=512`) and large headdim (`D>256`), and may not be faster than SDPA for small sequence length (`N<512`) or small headdim (`D<=256`).
+> FFPA has been tested on `Ampere`, `Ada`, `Hopper`, and `Blackwell` architectures (e.g., A30, L20, 4090, H200, 5090), achieves `1.8~3×↑🎉` forward and `1.5~2.5×↑🎉` backward padd speedup over SDPA. Currently, FFPA is mainly design for **prefill** (`N>=512`) and large headdim (`D>256`), and may not be faster than SDPA for small sequence length (`N<512`) or small headdim (`D<=256`).
 
 ## 🎉 Benchmark
 
