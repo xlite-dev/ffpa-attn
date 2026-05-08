@@ -700,11 +700,12 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
 //     N = ring-buffer with N slots, prefetching N-1 rows ahead
 // ============================================================================
 template <typename kDataType, const int kHeadDim, const bool kUseGemv, const int kStage = 2>
-__global__ void __launch_bounds__(kHeadDim / 8) ffpa_attn_splitkv_decode_stage1_template(
-    const kDataType* __restrict__ Q, const kDataType* __restrict__ K,
-    const kDataType* __restrict__ V, float* __restrict__ partial_out, float* __restrict__ chunk_lse,
-    const int Nq, const int Nkv, const int Nh, const int Nh_kv, const float scale,
-    const int num_splits, const int split_size, const int causal) {
+__global__ void __launch_bounds__(((kHeadDim / 8 + WARP_SIZE - 1) / WARP_SIZE) * WARP_SIZE)
+    ffpa_attn_splitkv_decode_stage1_template(
+        const kDataType* __restrict__ Q, const kDataType* __restrict__ K,
+        const kDataType* __restrict__ V, float* __restrict__ partial_out,
+        float* __restrict__ chunk_lse, const int Nq, const int Nkv, const int Nh, const int Nh_kv,
+        const float scale, const int num_splits, const int split_size, const int causal) {
   using Traits = ffpa::DtypeTraits<kDataType>;
   constexpr int kElemsPerThread = 8;
   static_assert(kHeadDim % kElemsPerThread == 0, "kHeadDim must be multiple of 8");
@@ -982,14 +983,15 @@ __global__ void __launch_bounds__(kHeadDim / 8) ffpa_attn_splitkv_decode_stage1_
 // split dimension using the standard stable log-sum-exp recurrence.
 // ============================================================================
 template <typename kDataType, const int kHeadDim>
-__global__ void __launch_bounds__(kHeadDim / 8)
+__global__ void __launch_bounds__(((kHeadDim / 8 + WARP_SIZE - 1) / WARP_SIZE) * WARP_SIZE)
     ffpa_attn_splitkv_decode_stage2_template(const float* __restrict__ partial_out,
                                              const float* __restrict__ chunk_lse,
                                              kDataType* __restrict__ O,
                                              float* __restrict__ softmax_lse, const int Nq,
                                              const int Nh, const int num_splits) {
   using Traits = ffpa::DtypeTraits<kDataType>;
-  constexpr int kNumThreads = kHeadDim / 8;
+  constexpr int kNumActiveThreads = kHeadDim / 8;
+  constexpr int kNumThreads = ((kNumActiveThreads + WARP_SIZE - 1) / WARP_SIZE) * WARP_SIZE;
 
   const int row = blockIdx.x;
 #ifdef ENABLE_FFPA_LAUNCH_GRID_DNHB
@@ -1035,7 +1037,8 @@ __global__ void __launch_bounds__(kHeadDim / 8)
   // Accumulate weighted partial outputs in 8×fp32 chunks (two 128-bit loads
   // per split, packed into one 128-bit smem store of 8×half).
   // kNumVecF32 = kHeadDim / 8 = kNumThreads (e.g. D=512 → 64),
-  // so each thread handles one 8×fp32 vector per split loop.
+  // so for aligned cases each thread handles one 8×fp32 vector per split loop;
+  // for rounded launches (e.g. D=320), padded threads remain idle.
   constexpr int kVecF32 = 8;
   static_assert(kHeadDim % kVecF32 == 0, "kHeadDim must be multiple of 8");
   constexpr int kNumVecF32 = kHeadDim / kVecF32;
