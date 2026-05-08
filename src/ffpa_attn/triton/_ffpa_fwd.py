@@ -78,7 +78,7 @@ def _gen_fwd_autotune_configs(headdim: int = 256, autotune_mode: str = "max") ->
   configs = []
   for block_m in [64, 128]:
     for block_headdim in _headdim_candidates:
-      num_warps_candidates = [4] if autotune_mode == "fast" else [4, 8]
+      num_warps_candidates = [8] if autotune_mode == "fast" else [4, 8]
       for num_warps in num_warps_candidates:
         for num_stages in ([2, 3] if autotune_mode == "fast" else [2, 3, 4]):
           configs.append(
@@ -147,9 +147,9 @@ def _gen_decode_fwd_stage1_autotune_configs(
   for block_n in block_n_candidates:
     for block_m in block_m_candidates:
       for block_headdim in _headdim_candidates:
-        num_warps_candidates = [4]
+        num_warps_candidates = [8]
         if autotune_mode == "max" and not use_gemv and block_m >= 32 and block_n >= 128:
-          num_warps_candidates.append(8)
+          num_warps_candidates.append(4)
         for num_warps in num_warps_candidates:
           for num_stages in ([2] if autotune_mode == "fast" else [2, 3]):
             configs.append(
@@ -755,7 +755,7 @@ def _ffpa_attn_forward_generic_impl(
       BLOCK_N=64,
       BLOCK_HEADDIM_QK=64,
       BLOCK_HEADDIM_V=64,
-      num_warps=4,
+      num_warps=8,
       num_stages=3,
     )
 
@@ -885,7 +885,7 @@ def _ffpa_attn_forward_decode_impl(
       BLOCK_N=128,
       BLOCK_HEADDIM_QK=block_headdim,
       BLOCK_HEADDIM_V=block_headdim,
-      num_warps=4,
+      num_warps=8,
       num_stages=2,
     )
 
