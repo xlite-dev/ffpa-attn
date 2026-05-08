@@ -33,6 +33,8 @@ def _parse_args() -> argparse.Namespace:
   parser = argparse.ArgumentParser(description="FFPA backward example and SDPA comparison.")
   parser.add_argument(
     "--backward-backend",
+    "--backend",
+    "--bwd",
     choices=["sdpa", "cuda", "triton"],
     default="triton",
     help="Backward backend passed to ffpa_attn_func.",
