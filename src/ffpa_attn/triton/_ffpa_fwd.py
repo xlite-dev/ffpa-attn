@@ -84,7 +84,10 @@ def _gen_fwd_autotune_configs(headdim: int = 256) -> list[triton.Config]:
   return configs
 
 
-def _gen_decode_fwd_stage1_autotune_configs(headdim: int = 256, use_gemv: bool = False) -> list[triton.Config]:
+def _gen_decode_fwd_stage1_autotune_configs(
+  headdim: int = 256,
+  use_gemv: bool = False,
+) -> list[triton.Config]:
   """Generate headdim-specific autotune configs for decode stage1.
 
   The decode stage1 search space is intentionally compact. ``CHUNK_SIZE`` is
