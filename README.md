@@ -63,7 +63,7 @@ We extend FlashAttention to support large headdim ($D>256$) via **fine-grained t
 </div>
 
 > [!NOTE]
-> FFPA has been tested on `Ampere`, `Ada`, `Hopper`, and `Blackwell` architectures (e.g., A30, L20, 4090, H200, 5090), achieves `1.8×~3×↑🎉` forward and `1.5×~2.5×↑🎉` backward speedup over SDPA. Currently, FFPA is mainly design for prefill (N>=512) and large headdim (D>256), and may not be faster than SDPA for small sequence length (N<512) or small headdim (D<=256).
+> FFPA has been tested on `Ampere`, `Ada`, `Hopper`, and `Blackwell` architectures (e.g., A30, L20, 4090, H200, 5090), achieves `1.8×~3×↑🎉` forward and `1.5×~2.5×↑🎉` backward speedup over SDPA. Currently, FFPA is mainly design for prefill (`N>=512`) and large headdim (`D>256`), and may not be faster than SDPA for small sequence length (`N<512`) or small headdim (`D<=256`).
 
 ## 🎉 Benchmark
 
