@@ -697,8 +697,13 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
 // Two variants are instantiated by the launcher:
 //   * kUseGemv=true  -> Nq == 1
 //   * kUseGemv=false -> 2 <= Nq < 16 (rows are padded logically to 16)
+//
+//   kStage controls the K smem pipeline depth:
+//     1 = no pipeline (K read from gmem directly)
+//     2 = double-buffer cp.async
+//     N = ring-buffer with N slots, prefetching N-1 rows ahead
 // ============================================================================
-template <typename kDataType, const int kHeadDim, const bool kUseGemv>
+template <typename kDataType, const int kHeadDim, const bool kUseGemv, const int kStage = 2>
 __global__ void __launch_bounds__(256) ffpa_attn_splitkv_decode_stage1_template(
     const kDataType* __restrict__ Q, const kDataType* __restrict__ K,
     const kDataType* __restrict__ V, float* __restrict__ partial_out, float* __restrict__ chunk_lse,
@@ -728,8 +733,10 @@ __global__ void __launch_bounds__(256) ffpa_attn_splitkv_decode_stage1_template(
   const int split_end = min(Nkv, split_start + split_size);
   const int kv_offset = Nkv - Nq;
 
-  // K_tile: double-buffered smem for K rows (stage=2 cp.async pipeline).
-  __shared__ __align__(16) kDataType K_tile[2][kHeadDim];
+  // K_tile: ring-buffered smem for K rows (cp.async pipeline, kStage slots).
+  __shared__ __align__(16) kDataType K_tile[kStage][kHeadDim];
+  // V_tile: single-buffered smem for V row (cp.async overlaps with QK+reduce).
+  __shared__ __align__(16) kDataType V_tile[kHeadDim];
   __shared__ kDataType q_tile[kMaxRows][kHeadDim];
   __shared__ float smem_out[kHeadDim];
   __shared__ float warp_partials[kMaxRows][kNumWarps];
@@ -742,16 +749,41 @@ __global__ void __launch_bounds__(256) ffpa_attn_splitkv_decode_stage1_template(
   const int q_base = ((Nb_id * Nh + Nh_id) * Nq) * kHeadDim;
   const int kv_base = ((Nb_id * Nh_kv + kv_head_idx) * Nkv) * kHeadDim;
 
-  // Vectorized Q load: 128-bit (8×half/bf16) per transaction.
-  constexpr int kVecQ = 16 / static_cast<int>(sizeof(kDataType));  // 8 for half/bf16
-  static_assert(kHeadDim % kVecQ == 0, "kHeadDim must be multiple of kVecQ");
-  constexpr int kNumVecQ = kHeadDim / kVecQ;
-  for (int row = 0; row < active_rows; ++row) {
-    for (int i = tid; i < kNumVecQ; i += kNumThreads) {
-      ffpa::cp_async::ldg_sync_128b(&q_tile[row][i * kVecQ],
-                                    &Q[q_base + row * kHeadDim + i * kVecQ]);
+  // Vector constants for cp.async row loads (8×half/bf16 = 128-bit).
+  constexpr int kVecRow = 16 / static_cast<int>(sizeof(kDataType));  // 8 for half/bf16
+  static_assert(kHeadDim % kVecRow == 0, "kHeadDim must be multiple of kVecRow");
+  constexpr int kNumVecRow = kHeadDim / kVecRow;
+
+  // Prologue: issue K + V + Q async loads in one cp.async group.
+  if constexpr (kStage > 1) {
+    for (int s = 0; s < kStage - 1; ++s) {
+      const int gk = split_start + s;
+      if (gk >= split_end)
+        break;
+      const int slot = gk % kStage;
+      for (int i = tid; i < kNumVecRow; i += kNumThreads) {
+        uint32_t smem_ptr = __cvta_generic_to_shared(&K_tile[slot][i * kVecRow]);
+        ffpa::cp_async::cp_async<16>(smem_ptr, &K[kv_base + gk * kHeadDim + i * kVecRow]);
+      }
     }
   }
+  // V preload.
+  {
+    for (int i = tid; i < kNumVecRow; i += kNumThreads) {
+      uint32_t v_smem = __cvta_generic_to_shared(&V_tile[i * kVecRow]);
+      ffpa::cp_async::cp_async<16>(v_smem, &V[kv_base + split_start * kHeadDim + i * kVecRow]);
+    }
+  }
+  // Q load (async cp.async, overlaps with K+V).
+  for (int row = 0; row < active_rows; ++row) {
+    for (int i = tid; i < kNumVecRow; i += kNumThreads) {
+      uint32_t q_smem = __cvta_generic_to_shared(&q_tile[row][i * kVecRow]);
+      ffpa::cp_async::cp_async<16>(q_smem, &Q[q_base + row * kHeadDim + i * kVecRow]);
+    }
+  }
+  // Single commit: K + V + Q all in one group.
+  ffpa::cp_async::commit_group();
+
   if (tid < kMaxRows) {
     row_m[tid] = -INFINITY;
     row_l[tid] = 0.0f;
@@ -759,23 +791,8 @@ __global__ void __launch_bounds__(256) ffpa_attn_splitkv_decode_stage1_template(
     row_rescale[tid] = 0.0f;
     row_scores[tid] = 0.0f;
   }
-  __syncthreads();
-
-  // K vector constants & pipeline state.
-  constexpr int kVecK = 16 / static_cast<int>(sizeof(kDataType));  // 8 for half/bf16
-  static_assert(kHeadDim % kVecK == 0, "kHeadDim must be multiple of kVecK");
-  constexpr int kNumVecK = kHeadDim / kVecK;
-  int cur_k = 0, next_k = 1;
-
-  // Preload first K row into K_tile[0] via cp.async.
-  {
-    for (int i = tid; i < kNumVecK; i += kNumThreads) {
-      uint32_t smem_ptr = __cvta_generic_to_shared(&K_tile[0][i * kVecK]);
-      ffpa::cp_async::cp_async<16>(smem_ptr, &K[kv_base + split_start * kHeadDim + i * kVecK]);
-    }
-    ffpa::cp_async::commit_group();
-    ffpa::cp_async::wait_group<0>();
-  }
+  // Wait for K+V+Q async loads to complete.
+  ffpa::cp_async::wait_group<0>();
   __syncthreads();
 
   float acc[kMaxRows][kColsPerThread];
@@ -788,14 +805,13 @@ __global__ void __launch_bounds__(256) ffpa_attn_splitkv_decode_stage1_template(
   }
 
   for (int global_k = split_start; global_k < split_end; ++global_k) {
-    // ---- Pipeline stage 1: issue async load of next K row ----
-    // cp.async runs in background while we process the current row.
-    if (global_k + 1 < split_end) {
-      for (int i = tid; i < kNumVecK; i += kNumThreads) {
-        uint32_t smem_ptr = __cvta_generic_to_shared(&K_tile[next_k][i * kVecK]);
-        ffpa::cp_async::cp_async<16>(smem_ptr, &K[kv_base + (global_k + 1) * kHeadDim + i * kVecK]);
+    // ---- Pipeline stage 1: issue V async (overlaps with QK dot product) ----
+    if (global_k > split_start) {
+      for (int i = tid; i < kNumVecRow; i += kNumThreads) {
+        uint32_t v_smem = __cvta_generic_to_shared(&V_tile[i * kVecRow]);
+        ffpa::cp_async::cp_async<16>(v_smem, &V[kv_base + global_k * kHeadDim + i * kVecRow]);
       }
-      ffpa::cp_async::commit_group();
+      ffpa::cp_async::commit_group();  // → group 0 = V
     }
 
     float score_partial[kMaxRows];
@@ -804,17 +820,43 @@ __global__ void __launch_bounds__(256) ffpa_attn_splitkv_decode_stage1_template(
       score_partial[row] = 0.0f;
     }
 
-    // ---- QK dot product from smem K_tile[cur_k] ----
+    // ---- QK dot product ----
     for (int row = 0; row < active_rows; ++row) {
       float qk = 0.0f;
+      if constexpr (kStage == 1) {
+        // No pipeline: read K directly from gmem.
 #pragma unroll
-      for (int col = 0; col < kColsPerThread; ++col) {
-        const int d = tid + col * kNumThreads;
-        if (d < kHeadDim) {
-          qk += Traits::to_float(q_tile[row][d]) * Traits::to_float(K_tile[cur_k][d]);
+        for (int col = 0; col < kColsPerThread; ++col) {
+          const int d = tid + col * kNumThreads;
+          if (d < kHeadDim) {
+            qk += Traits::to_float(q_tile[row][d]) *
+                  Traits::to_float(K[kv_base + global_k * kHeadDim + d]);
+          }
+        }
+      } else {
+        const int read_slot = global_k % kStage;
+#pragma unroll
+        for (int col = 0; col < kColsPerThread; ++col) {
+          const int d = tid + col * kNumThreads;
+          if (d < kHeadDim) {
+            qk += Traits::to_float(q_tile[row][d]) * Traits::to_float(K_tile[read_slot][d]);
+          }
         }
       }
       score_partial[row] = qk;
+    }
+
+    // ---- Pipeline stage 2: issue K async (overlaps with reduce + softmax) ----
+    if constexpr (kStage > 1) {
+      const int prefetch_k = global_k + kStage - 1;
+      if (prefetch_k < split_end) {
+        const int slot = prefetch_k % kStage;
+        for (int i = tid; i < kNumVecRow; i += kNumThreads) {
+          uint32_t smem_ptr = __cvta_generic_to_shared(&K_tile[slot][i * kVecRow]);
+          ffpa::cp_async::cp_async<16>(smem_ptr, &K[kv_base + prefetch_k * kHeadDim + i * kVecRow]);
+        }
+        ffpa::cp_async::commit_group();  // → group 0 = K, group 1 = V
+      }
     }
 
     for (int row = 0; row < active_rows; ++row) {
@@ -859,6 +901,10 @@ __global__ void __launch_bounds__(256) ffpa_attn_splitkv_decode_stage1_template(
     }
     __syncthreads();
 
+    // Wait for V (group 1, oldest), then V update from smem V_tile.
+    ffpa::cp_async::wait_group<1>();
+    __syncthreads();
+
     for (int row = 0; row < active_rows; ++row) {
       const float p = row_p[row];
       const float rescale = row_rescale[row];
@@ -866,18 +912,17 @@ __global__ void __launch_bounds__(256) ffpa_attn_splitkv_decode_stage1_template(
       for (int col = 0; col < kColsPerThread; ++col) {
         const int d = tid + col * kNumThreads;
         if (d < kHeadDim) {
-          const float v = Traits::to_float(V[kv_base + global_k * kHeadDim + d]);
-          acc[row][col] = acc[row][col] * rescale + p * v;
+          acc[row][col] = acc[row][col] * rescale + p * Traits::to_float(V_tile[d]);
         }
       }
     }
-    // Wait for next K async load to complete, then swap buffers.
-    if (global_k + 1 < split_end) {
-      ffpa::cp_async::wait_group<0>();
+    // Wait for K async load (group 0), then swap buffers for next iteration.
+    if constexpr (kStage > 1) {
+      if (global_k + kStage - 1 < split_end) {
+        ffpa::cp_async::wait_group<0>();
+      }
     }
     __syncthreads();
-    cur_k ^= 1;
-    next_k ^= 1;
   }
 
   const int split_row_base = (((Nb_id * Nh + Nh_id) * num_splits + split_id) * Nq);
