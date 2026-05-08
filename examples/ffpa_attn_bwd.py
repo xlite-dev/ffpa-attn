@@ -1,7 +1,7 @@
 """FFPA attention backward example.
 
 Runs the same shape regimes as the forward example and compares FFPA against
-PyTorch SDPA for backward correctness and end-to-end forward+backward runtime:
+PyTorch SDPA for backward correctness and backward runtime by default:
 
 1. Self-Attention            -- Nq == Nkv, Nh_q == Nh_kv, aligned seqlen.
 2. Cross / Decode Attention  -- Nq != Nkv (short query, long KV).
@@ -13,6 +13,7 @@ Usage::
 
     CUDA_VISIBLE_DEVICES=0 python examples/ffpa_attn_bwd.py
     CUDA_VISIBLE_DEVICES=0 python examples/ffpa_attn_bwd.py --backward-backend triton --autotune
+    CUDA_VISIBLE_DEVICES=0 python examples/ffpa_attn_bwd.py --timing-mode full
 """
 
 from __future__ import annotations
@@ -43,6 +44,12 @@ def _parse_args() -> argparse.Namespace:
   parser.add_argument("--N", type=int, default=8192, help="Sequence length (non-aligned uses N-1).")
   parser.add_argument("--D", type=int, default=512, help="Head dimension.")
   parser.add_argument("--seed", type=int, default=0, help="Random seed for input tensors.")
+  parser.add_argument(
+    "--timing-mode",
+    choices=["backward-only", "full"],
+    default="backward-only",
+    help="Whether to time only backward or end-to-end forward+backward.",
+  )
   parser.add_argument(
     "--triton-backward-autotune",
     "--autotune",
@@ -83,6 +90,72 @@ def _time_fn(fn, *args, warmup: int = WARMUP, iters: int = ITERS) -> float:
   return (time.perf_counter() - t0) * 1000.0 / iters  # ms
 
 
+def _time_backward_only(fn, q, k, v, grad_out, warmup: int = WARMUP, iters: int = ITERS) -> float:
+  start_event = torch.cuda.Event(enable_timing=True)
+  end_event = torch.cuda.Event(enable_timing=True)
+
+  for _ in range(warmup):
+    q_i = q.detach().clone().requires_grad_(True)
+    k_i = k.detach().clone().requires_grad_(True)
+    v_i = v.detach().clone().requires_grad_(True)
+    out = fn(q_i, k_i, v_i)
+    torch.cuda.synchronize()
+    out.backward(grad_out)
+  torch.cuda.synchronize()
+
+  elapsed_ms = 0.0
+  for _ in range(iters):
+    q_i = q.detach().clone().requires_grad_(True)
+    k_i = k.detach().clone().requires_grad_(True)
+    v_i = v.detach().clone().requires_grad_(True)
+    out = fn(q_i, k_i, v_i)
+    torch.cuda.synchronize()
+    start_event.record()
+    out.backward(grad_out)
+    end_event.record()
+    torch.cuda.synchronize()
+    elapsed_ms += start_event.elapsed_time(end_event)
+
+  return elapsed_ms / iters
+
+
+def _ffpa_forward(
+  q_i: torch.Tensor,
+  k_i: torch.Tensor,
+  v_i: torch.Tensor,
+  scale: float,
+  backward_backend: str,
+  triton_backward_autotune: bool = False,
+  triton_autotune_mode: str = "fast",
+  causal: bool = False,
+) -> torch.Tensor:
+  return ffpa_attn_func(
+    q_i,
+    k_i,
+    v_i,
+    is_causal=causal,
+    scale=scale,
+    enable_gqa=q_i.size(1) != k_i.size(1),
+    backward_backend=backward_backend,
+    triton_backward_autotune=triton_backward_autotune,
+    triton_autotune_mode=triton_autotune_mode,
+  )
+
+
+def _sdpa_forward(
+  q_i: torch.Tensor,
+  k_i: torch.Tensor,
+  v_i: torch.Tensor,
+  scale: float,
+  causal: bool = False,
+) -> torch.Tensor:
+  group_size = q_i.size(1) // k_i.size(1)
+  k_in = k_i.repeat_interleave(group_size, dim=1) if group_size > 1 else k_i
+  v_in = v_i.repeat_interleave(group_size, dim=1) if group_size > 1 else v_i
+  kw = _make_sdpa_kwargs(causal, q_i.size(2), k_i.size(2))
+  return F.scaled_dot_product_attention(q_i, k_in, v_in, scale=scale, **kw)
+
+
 def _run_ffpa_backward(
   q: torch.Tensor,
   k: torch.Tensor,
@@ -96,16 +169,15 @@ def _run_ffpa_backward(
   q_i = q.detach().clone().requires_grad_(True)
   k_i = k.detach().clone().requires_grad_(True)
   v_i = v.detach().clone().requires_grad_(True)
-  out = ffpa_attn_func(
+  out = _ffpa_forward(
     q_i,
     k_i,
     v_i,
-    is_causal=causal,
-    scale=scale,
-    enable_gqa=q_i.size(1) != k_i.size(1),
+    scale,
     backward_backend=backward_backend,
     triton_backward_autotune=triton_backward_autotune,
     triton_autotune_mode=triton_autotune_mode,
+    causal=causal,
   )
   out.sum().backward()
 
@@ -121,11 +193,7 @@ def _run_sdpa_backward(
   k_i = k.detach().clone().requires_grad_(True)
   v_i = v.detach().clone().requires_grad_(True)
 
-  group_size = q_i.size(1) // k_i.size(1)
-  k_in = k_i.repeat_interleave(group_size, dim=1) if group_size > 1 else k_i
-  v_in = v_i.repeat_interleave(group_size, dim=1) if group_size > 1 else v_i
-  kw = _make_sdpa_kwargs(causal, q_i.size(2), k_i.size(2))
-  out = F.scaled_dot_product_attention(q_i, k_in, v_in, scale=scale, **kw)
+  out = _sdpa_forward(q_i, k_i, v_i, scale, causal=causal)
   out.sum().backward()
 
 
@@ -163,6 +231,7 @@ def _run_case(
   Nkv: int,
   D: int,
   causal: bool = False,
+  timing_mode: str = "backward-only",
 ) -> None:
   torch.manual_seed(seed)
   q = torch.randn(B, Nh_q, Nq, D, dtype=dtype, device="cuda", requires_grad=True)
@@ -188,18 +257,44 @@ def _run_case(
   dv_ffpa = v.grad.detach().clone()
   dq_ref, dk_ref, dv_ref = _sdpa_ref_grads(q, k, v, scale, causal=causal)
 
-  ms_ffpa = _time_fn(
-    _run_ffpa_backward,
-    q,
-    k,
-    v,
-    scale,
-    backward_backend,
-    triton_backward_autotune,
-    triton_autotune_mode,
-    causal,
-  )
-  ms_sdpa = _time_fn(_run_sdpa_backward, q, k, v, scale, causal)
+  if timing_mode == "backward-only":
+    grad_out = torch.ones_like(q)
+    ms_ffpa = _time_backward_only(
+      lambda q_i, k_i, v_i: _ffpa_forward(
+        q_i,
+        k_i,
+        v_i,
+        scale,
+        backward_backend,
+        triton_backward_autotune,
+        triton_autotune_mode,
+        causal,
+      ),
+      q,
+      k,
+      v,
+      grad_out,
+    )
+    ms_sdpa = _time_backward_only(
+      lambda q_i, k_i, v_i: _sdpa_forward(q_i, k_i, v_i, scale, causal=causal),
+      q,
+      k,
+      v,
+      grad_out,
+    )
+  else:
+    ms_ffpa = _time_fn(
+      _run_ffpa_backward,
+      q,
+      k,
+      v,
+      scale,
+      backward_backend,
+      triton_backward_autotune,
+      triton_autotune_mode,
+      causal,
+    )
+    ms_sdpa = _time_fn(_run_sdpa_backward, q, k, v, scale, causal)
 
   dt_tag = str(dtype).replace("torch.", "")
   print(
@@ -235,6 +330,7 @@ def main() -> None:
       Nq=N,
       Nkv=N,
       D=D,
+      timing_mode=args.timing_mode,
     )
     _run_case(
       "cross-attn",
@@ -249,6 +345,7 @@ def main() -> None:
       Nq=1024,
       Nkv=N,
       D=D,
+      timing_mode=args.timing_mode,
     )
     _run_case(
       "decode-attn",
@@ -263,6 +360,7 @@ def main() -> None:
       Nq=1,
       Nkv=N,
       D=D,
+      timing_mode=args.timing_mode,
     )
     _run_case(
       "gqa",
@@ -277,6 +375,7 @@ def main() -> None:
       Nq=N,
       Nkv=N,
       D=D,
+      timing_mode=args.timing_mode,
     )
     _run_case(
       "causal",
@@ -292,6 +391,7 @@ def main() -> None:
       Nkv=N,
       D=D,
       causal=True,
+      timing_mode=args.timing_mode,
     )
     _run_case(
       "non-aligned",
@@ -306,6 +406,7 @@ def main() -> None:
       Nq=N - 1 if N > 1 else N,  # avoid zero-dim
       Nkv=N - 1 if N > 1 else N,  # avoid zero-dim
       D=D,
+      timing_mode=args.timing_mode,
     )
 
 
