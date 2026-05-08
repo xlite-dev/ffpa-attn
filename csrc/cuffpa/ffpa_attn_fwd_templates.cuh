@@ -905,9 +905,10 @@ __global__ void __launch_bounds__(256)
 #endif
   const int tid = threadIdx.x;
 
+  // smem_o must be declared first for 16-byte alignment (128-bit stores).
+  __shared__ __align__(16) kDataType smem_o[kHeadDim];
   __shared__ float row_max;
   __shared__ float row_inv_denom;
-  __shared__ kDataType smem_o[kHeadDim];
 
   const int split_row_base = (((Nb_id * Nh + Nh_id) * num_splits) * Nq + row);
   const int o_row_base = ((Nb_id * Nh + Nh_id) * Nq + row) * kHeadDim;
