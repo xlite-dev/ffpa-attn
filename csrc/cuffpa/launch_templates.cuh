@@ -10,6 +10,55 @@ static constexpr int kMaxDForSmallDKernel = 64;
 static constexpr int kMaxDForOStoreFloat32 = 64;
 static constexpr int kMaxDForSmallBlockTile = 256;
 
+static inline int select_decode_num_splits(int batch_nheads_mblocks, int num_sms, int num_n_blocks,
+                                           int max_splits, int active_rows) {
+  if (batch_nheads_mblocks >= static_cast<int>(0.8f * static_cast<float>(num_sms))) {
+    return 1;
+  }
+
+  max_splits = min(max_splits, min(num_sms, num_n_blocks));
+  if (max_splits <= 1) {
+    return 1;
+  }
+
+  std::vector<float> efficiency(max_splits, 0.0f);
+  float max_efficiency = 0.0f;
+  int max_efficiency_split = 1;
+  auto is_split_eligible = [num_n_blocks](int num_splits) {
+    return num_splits == 1 || utils::div_ceil(num_n_blocks, num_splits) !=
+                                  utils::div_ceil(num_n_blocks, num_splits - 1);
+  };
+
+  for (int num_splits = 1; num_splits <= max_splits; ++num_splits) {
+    if (!is_split_eligible(num_splits)) {
+      continue;
+    }
+    const float n_waves =
+        static_cast<float>(batch_nheads_mblocks * num_splits) / static_cast<float>(num_sms);
+    const float eff = n_waves / ceilf(n_waves);
+    efficiency[num_splits - 1] = eff;
+    if (eff > max_efficiency) {
+      max_efficiency = eff;
+      max_efficiency_split = num_splits;
+    }
+  }
+
+  if (active_rows == 1) {
+    return max_efficiency_split;
+  }
+
+  for (int num_splits = 1; num_splits <= max_splits; ++num_splits) {
+    if (!is_split_eligible(num_splits)) {
+      continue;
+    }
+    if (efficiency[num_splits - 1] >= 0.85f * max_efficiency) {
+      return num_splits;
+    }
+  }
+
+  return 1;
+}
+
 template <const int kHeadDim>
 static constexpr int getConfigMmaTileSeqLenQP() {
 #ifdef ENABLE_FFPA_PERSIST_KV_G2S
@@ -439,6 +488,36 @@ void launch_ffpa_attn_fwd_template(torch::Tensor Q, torch::Tensor K, torch::Tens
   // default to stream 0 and race against user-side non-default streams.
   const c10::cuda::OptionalCUDAGuard device_guard(Q.device());
   auto stream = at::cuda::getCurrentCUDAStream();
+
+  if constexpr (kHeadDim > kMaxDForSmallDKernel) {
+    const int num_sms_x2 = max(1, at::cuda::getCurrentDeviceProperties()->multiProcessorCount * 2);
+    const int num_splits = select_decode_num_splits(Nb * Nh * utils::div_ceil(Nq, 16), num_sms_x2,
+                                                    Tc, 128, min(Nq, 16));
+    if (Nq == 1 && num_splits > 1) {
+      const int split_size = utils::div_ceil(Tc, num_splits) * Bc;
+      auto scratch_options = torch::TensorOptions().dtype(torch::kFloat32).device(Q.device());
+      auto partial_out = torch::empty({Nb, Nh, num_splits, Nq, kHeadDim}, scratch_options);
+      auto chunk_lse = torch::empty({Nb, Nh, num_splits, Nq}, scratch_options);
+      const dim3 decode_stage1_grid = dim3(num_splits, Nb * Nh, 1);
+      const dim3 decode_stage2_grid = dim3(Nq, Nb * Nh, 1);
+      const int decode_threads = ((kHeadDim / 8) + WARP_SIZE - 1) / WARP_SIZE * WARP_SIZE;
+      const dim3 decode_block = dim3(decode_threads, 1, 1);
+      // Pure gemv implementation for Nq=1 case, do the reduction in stage 2.
+      auto decode_stage1_kernel =
+          (ffpa_attn_splitkv_decode_stage1_template<kDataType, kHeadDim, true>);
+      decode_stage1_kernel<<<decode_stage1_grid, decode_block, 0, stream>>>(
+          reinterpret_cast<kDataType*>(Q.data_ptr()), reinterpret_cast<kDataType*>(K.data_ptr()),
+          reinterpret_cast<kDataType*>(V.data_ptr()), partial_out.data_ptr<float>(),
+          chunk_lse.data_ptr<float>(), Nq, Nkv, Nh, Nh_kv, scale, num_splits, split_size, causal);
+
+      auto decode_stage2_kernel = (ffpa_attn_splitkv_decode_stage2_template<kDataType, kHeadDim>);
+      decode_stage2_kernel<<<decode_stage2_grid, decode_block, 0, stream>>>(
+          partial_out.data_ptr<float>(), chunk_lse.data_ptr<float>(),
+          reinterpret_cast<kDataType*>(O.data_ptr()), softmax_lse_ptr, Nq, Nh, num_splits);
+      return;
+    }
+  }
+
   CUtensorMap* k_tma_desc_device = nullptr;
   CUtensorMap* v_tma_desc_device = nullptr;
   const int smem_size_base = kQKVSmemMaxSize;

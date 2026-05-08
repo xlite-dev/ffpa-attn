@@ -18,6 +18,7 @@ from .functional import FFPAAttnFunc, FFPAAttnMeta
 
 def _should_fallback_to_sdpa(
   query: torch.Tensor,
+  key: torch.Tensor,
   attn_mask: torch.Tensor | None,
   dropout_p: float,
 ) -> bool:
@@ -29,13 +30,29 @@ def _should_fallback_to_sdpa(
   * ``head_dim > 1024``
   * ``attn_mask is not None``
   * ``dropout_p > 0.0``
+  For now, as FFPA is mainly designed for prefill and may not outperform SDPA for short sequences.
+  While Nq == 1 is a common case for decode attention and FFPA does support it by flash-decoding
+  algorithm, the speedup over SDPA is not significant (~10% speedup).
+  * ``Nq < 512 && Nq != 1``
+  * ``Nk < 512``
 
   As FFPA grows support for these cases, remove the corresponding condition
   here instead of scattering dispatch checks throughout ``ffpa_attn_func``.
   """
   assert query.dim() == 4, "Expected query shape [B, Nh_q, Nq, D]"
-  head_dim = query.size(3)
-  return head_dim <= 256 or head_dim > 1024 or attn_mask is not None or dropout_p > 0.0
+  assert key.dim() == 4, "Expected key shape [B, Nh_kv, Nkv, D]"
+  B, Nh_q, Nq, D = query.shape  # noqa: F841
+  _, Nh_kv, Nkv, D_k = key.shape
+  assert D == D_k, "Query and key must have the same head dimension"
+  _fallback = any([
+    D <= 256,
+    D > 1024,
+    attn_mask is not None,
+    dropout_p > 0.0,
+    (Nq < 512 and Nq != 1),
+    Nkv < 512,
+  ])
+  return _fallback
 
 
 def _normalize_inputs(
@@ -138,7 +155,7 @@ def ffpa_attn_func(
   :raises NotImplementedError: propagated from SDPA or FFPA backends for
       unsupported backend-specific combinations.
   """
-  if _should_fallback_to_sdpa(query, attn_mask, dropout_p):
+  if _should_fallback_to_sdpa(query, key, attn_mask, dropout_p):
     # Fallback intentionally delegates to SDPA exactly as the user called it.
     # Do not synthesize masks or reinterpret GQA semantics here.
     # HACK: Use the native SDPA op directly to avoid recursive calls to this function
