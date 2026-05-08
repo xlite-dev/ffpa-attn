@@ -39,6 +39,8 @@ import torch
 import triton
 import triton.language as tl
 
+from ._autotune_utils import bucket_autotune_seqlen
+
 # Preprocess: delta = rowsum(dO * O)
 # In full-D mode BLOCK_HEADDIM must cover the whole head dimension.  In
 # D_CHUNK mode the launcher/autotuner supplies the chunk size explicitly.
@@ -62,6 +64,7 @@ def _ffpa_bwd_pre_impl(
   stride_dom: int,
   nheads: int,
   seqlen_q: int,
+  seqlen_q_bucket: int,
   seqlen_q_rounded: int,
   headdim: int,
   BLOCK_M: tl.constexpr,
@@ -154,7 +157,7 @@ def _get_pre_autotune(d_chunk: bool, autotune_mode: str):
   if cache_key not in _ffpa_bwd_pre_autotune_cache:
     _ffpa_bwd_pre_autotune_cache[cache_key] = triton.autotune(
       configs=_gen_pre_autotune_configs(d_chunk=d_chunk, autotune_mode=autotune_mode),
-      key=["seqlen_q", "headdim"],
+      key=["seqlen_q_bucket", "headdim"],
       reset_to_zero=["Delta"],
       cache_results=True,
     )(_ffpa_bwd_pre_impl)
@@ -450,6 +453,8 @@ def _ffpa_bwd_v1_kernel_impl(
   nheads: int,
   seqlen_q: int,
   seqlen_k: int,
+  seqlen_q_bucket: int,
+  seqlen_k_bucket: int,
   seqlen_q_rounded: int,
   headdim: int,
   IS_CAUSAL: tl.constexpr,
@@ -568,7 +573,7 @@ def _get_v1_autotune(headdim: int, autotune_mode: str):
     )
     _ffpa_bwd_v1_autotune_cache[cache_key] = triton.autotune(
       configs=configs,
-      key=["seqlen_q", "seqlen_k", "headdim"],
+      key=["seqlen_q_bucket", "seqlen_k_bucket", "headdim"],
       reset_to_zero=["DQ", "DK", "DV"],
       cache_results=True,
     )(_ffpa_bwd_v1_kernel_impl)
@@ -624,6 +629,8 @@ def _ffpa_bwd_v2_kernel_impl(
   nheads: int,
   seqlen_q: int,
   seqlen_k: int,
+  seqlen_q_bucket: int,
+  seqlen_k_bucket: int,
   seqlen_q_rounded: int,
   headdim: int,
   IS_CAUSAL: tl.constexpr,
@@ -813,7 +820,7 @@ def _get_v2_autotune(headdim: int, autotune_mode: str):
     )
     _ffpa_bwd_v2_autotune_cache[cache_key] = triton.autotune(
       configs=configs,
-      key=["seqlen_q", "seqlen_k", "headdim"],
+      key=["seqlen_q_bucket", "seqlen_k_bucket", "headdim"],
       reset_to_zero=["DQ", "DK", "DV"],
       cache_results=True,
     )(_ffpa_bwd_v2_kernel_impl)
@@ -881,6 +888,8 @@ def _ffpa_attn_backward_triton_impl(
   _, _, seqlen_k, _ = k.shape
   softmax_scale = softmax_scale or (1.0 / math.sqrt(headdim))
   seqlen_q_rounded = lse.shape[-1]
+  seqlen_q_bucket = bucket_autotune_seqlen(seqlen_q)
+  seqlen_k_bucket = bucket_autotune_seqlen(seqlen_k)
 
   assert q.dtype == k.dtype == v.dtype == o.dtype == do.dtype
   assert q.dtype in (torch.float16, torch.bfloat16)
@@ -907,6 +916,7 @@ def _ffpa_attn_backward_triton_impl(
       do.stride(2),
       nheads,
       seqlen_q,
+      seqlen_q_bucket,
       seqlen_q_rounded,
       headdim,
     )
@@ -924,6 +934,7 @@ def _ffpa_attn_backward_triton_impl(
       do.stride(2),
       nheads,
       seqlen_q,
+      seqlen_q_bucket,
       seqlen_q_rounded,
       headdim,
       BLOCK_M=128,
@@ -985,6 +996,8 @@ def _ffpa_attn_backward_triton_impl(
         nheads,
         seqlen_q,
         seqlen_k,
+        seqlen_q_bucket,
+        seqlen_k_bucket,
         seqlen_q_rounded,
         headdim,
         IS_CAUSAL=causal,
@@ -1026,6 +1039,8 @@ def _ffpa_attn_backward_triton_impl(
         nheads,
         seqlen_q,
         seqlen_k,
+        seqlen_q_bucket,
+        seqlen_k_bucket,
         seqlen_q_rounded,
         headdim,
         IS_CAUSAL=causal,
@@ -1077,6 +1092,8 @@ def _ffpa_attn_backward_triton_impl(
         nheads,
         seqlen_q,
         seqlen_k,
+        seqlen_q_bucket,
+        seqlen_k_bucket,
         seqlen_q_rounded,
         headdim,
         IS_CAUSAL=causal,
@@ -1119,6 +1136,8 @@ def _ffpa_attn_backward_triton_impl(
         nheads,
         seqlen_q,
         seqlen_k,
+        seqlen_q_bucket,
+        seqlen_k_bucket,
         seqlen_q_rounded,
         headdim,
         IS_CAUSAL=causal,

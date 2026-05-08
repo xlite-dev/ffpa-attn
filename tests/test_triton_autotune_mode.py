@@ -3,6 +3,7 @@
 import pytest
 
 from ffpa_attn.functional import FFPAAttnMeta
+from ffpa_attn.triton._autotune_utils import bucket_autotune_seqlen
 from ffpa_attn.triton._ffpa_bwd import _gen_bwd_autotune_configs, _gen_pre_autotune_configs
 from ffpa_attn.triton._ffpa_fwd import _gen_decode_fwd_stage1_autotune_configs, _gen_fwd_autotune_configs
 
@@ -21,6 +22,22 @@ def test_triton_autotune_mode_accepts_valid_values(mode):
 def test_triton_autotune_mode_rejects_invalid_value():
   with pytest.raises(AssertionError, match="triton_autotune_mode"):
     FFPAAttnMeta.from_kwargs(triton_autotune_mode="bad")
+
+
+@pytest.mark.parametrize(
+  ("seqlen", "expected_bucket"),
+  [
+    (1, 1024),
+    (1024, 1024),
+    (1025, 2048),
+    (8191, 8192),
+    (8192, 8192),
+    (8193, 8192),
+    (16384, 8192),
+  ],
+)
+def test_autotune_seqlen_bucket(seqlen, expected_bucket):
+  assert bucket_autotune_seqlen(seqlen) == expected_bucket
 
 
 @pytest.mark.parametrize("headdim", [320, 512])
