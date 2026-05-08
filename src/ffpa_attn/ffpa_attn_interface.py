@@ -29,13 +29,17 @@ def _should_fallback_to_sdpa(
   * ``head_dim > 1024``
   * ``attn_mask is not None``
   * ``dropout_p > 0.0``
+  For now, as FFPA is mainly designed for prefill and may not outperform SDPA for short sequences.
+  While Nq == 1 is a common case for decode attention and FFPA does support it by flash-decoding
+  algorithm, the speedup over SDPA is not significant (~10% speedup).
+  * ``Nq < 512 && Nq != 1``
 
   As FFPA grows support for these cases, remove the corresponding condition
   here instead of scattering dispatch checks throughout ``ffpa_attn_func``.
   """
   assert query.dim() == 4, "Expected query shape [B, Nh_q, Nq, D]"
-  head_dim = query.size(3)
-  return head_dim <= 256 or head_dim > 1024 or attn_mask is not None or dropout_p > 0.0
+  B, _, Nq, D = query.shape
+  return D <= 256 or D > 1024 or attn_mask is not None or dropout_p > 0.0 or (Nq < 512 and Nq != 1)
 
 
 def _normalize_inputs(
