@@ -84,9 +84,133 @@ def _gen_fwd_autotune_configs(headdim: int = 256) -> list[triton.Config]:
   return configs
 
 
+def _gen_decode_fwd_stage1_autotune_configs(headdim: int = 256, use_gemv: bool = False) -> list[triton.Config]:
+  """Generate headdim-specific autotune configs for decode stage1.
+
+  The decode stage1 search space is intentionally compact. ``CHUNK_SIZE`` is
+  owned by the launcher via ``num_splits`` and is passed at runtime instead of
+  being autotuned here. GEMV and multi-row MMA paths are tuned separately so
+  full-D tiles are only explored for the single-row path.
+
+  :param headdim: The actual head dimension for the target decode call.
+  :param use_gemv: Whether configs are generated for the ``seqlen_q == 1``
+      GEMV path.
+  :return: Triton autotune configurations for decode stage1.
+  """
+  try:
+    _max_smem = torch.cuda.get_device_properties(0).shared_memory_per_block_optin
+  except Exception:
+    _max_smem = 48 * 1024
+
+  _headdim_candidates = [64, 128]
+  _next_pow2 = triton.next_power_of_2(headdim)
+  if use_gemv and _max_smem >= 96 * 1024 and _next_pow2 not in _headdim_candidates:
+    _headdim_candidates.append(_next_pow2)
+
+  if use_gemv:
+    block_m_candidates = [8]
+    block_n_candidates = [64, 128]
+    if headdim <= 64:
+      block_n_candidates.append(256)
+  else:
+    block_m_candidates = [8, 16, 32, 64]
+    block_n_candidates = [64, 128]
+    if headdim <= 64:
+      block_n_candidates.append(256)
+
+  configs = []
+  for block_n in block_n_candidates:
+    for block_m in block_m_candidates:
+      for block_headdim in _headdim_candidates:
+        num_warps_candidates = [4]
+        if not use_gemv and block_m >= 32 and block_n >= 128:
+          num_warps_candidates.append(8)
+        for num_warps in num_warps_candidates:
+          for num_stages in [2, 3]:
+            configs.append(
+              triton.Config(
+                {
+                  "BLOCK_M": block_m,
+                  "BLOCK_N": block_n,
+                  "BLOCK_HEADDIM_QK": block_headdim,
+                  "BLOCK_HEADDIM_V": block_headdim,
+                },
+                num_warps=num_warps,
+                num_stages=num_stages,
+              )
+            )
+  return configs
+
+
+def _decode_num_splits_heuristic(
+  batch_nheads_mblocks: int,
+  num_sms: int,
+  num_n_blocks: int,
+  max_splits: int,
+) -> int:
+  """Mirror FlashAttention's split-kv occupancy heuristic in Python.
+
+  :param batch_nheads_mblocks: Number of independent query row blocks.
+  :param num_sms: Effective SM count available to the kernel launch.
+  :param num_n_blocks: Number of KV tiles along sequence length.
+  :param max_splits: Upper bound for the split search space.
+  :return: The chosen split count.
+  """
+  if batch_nheads_mblocks >= 0.8 * num_sms:
+    return 1
+
+  max_splits = max(1, min(max_splits, num_sms, num_n_blocks))
+  max_efficiency = 0.0
+  efficiencies: list[float] = []
+
+  def _ceil_div(a: int, b: int) -> int:
+    return (a + b - 1) // b
+
+  def _is_split_eligible(num_splits: int) -> bool:
+    return num_splits == 1 or _ceil_div(num_n_blocks, num_splits) != _ceil_div(num_n_blocks, num_splits - 1)
+
+  for num_splits in range(1, max_splits + 1):
+    if not _is_split_eligible(num_splits):
+      efficiencies.append(0.0)
+      continue
+    n_waves = float(batch_nheads_mblocks * num_splits) / float(num_sms)
+    efficiency = n_waves / math.ceil(n_waves)
+    max_efficiency = max(max_efficiency, efficiency)
+    efficiencies.append(efficiency)
+
+  for num_splits in range(1, max_splits + 1):
+    if not _is_split_eligible(num_splits):
+      continue
+    if efficiencies[num_splits - 1] >= 0.85 * max_efficiency:
+      return num_splits
+
+  return 1
+
+
+def _get_decode_num_splits(
+  seqlen_q: int, seqlen_k: int, headdim: int, batch: int, nheads_q: int, device: torch.device
+) -> int:
+  """Choose a decode split count using FlashAttention's split-kv heuristic."""
+  num_sms = max(1, torch.cuda.get_device_properties(device).multi_processor_count * 2)
+  block_n = 256 if headdim <= 64 else (128 if headdim <= 128 else 64)
+  num_n_blocks = triton.cdiv(seqlen_k, block_n)
+  num_m_blocks = triton.cdiv(seqlen_q, 64)
+  num_splits = _decode_num_splits_heuristic(
+    batch * nheads_q * num_m_blocks,
+    num_sms,
+    num_n_blocks,
+    max_splits=128,
+  )
+  return num_splits
+
+
 _FFPA_FWD_HEURISTICS = {
   "EVEN_M": lambda args: args["seqlen_q"] % args["BLOCK_M"] == 0,
   "EVEN_N": lambda args: args["seqlen_k"] % args["BLOCK_N"] == 0,
+  "NUM_V_GROUPS": lambda args: triton.cdiv(args["HEADDIM"], args["BLOCK_HEADDIM_V"]),
+}
+
+_FFPA_DECODE_FWD_HEURISTICS = {
   "NUM_V_GROUPS": lambda args: triton.cdiv(args["HEADDIM"], args["BLOCK_HEADDIM_V"]),
 }
 
@@ -222,34 +346,286 @@ def _ffpa_fwd_kernel_impl(
   tl.store(LSE + offs_m, m_i + tl.log(l_i), mask=offs_m < seqlen_q)
 
 
-_ffpa_fwd = _ffpa_fwd_kernel_impl
+@triton.heuristics(_FFPA_DECODE_FWD_HEURISTICS)
+@triton.jit
+def _ffpa_decode_fwd_stage1_kernel(
+  Q: torch.Tensor,
+  K: torch.Tensor,
+  V: torch.Tensor,
+  PartialOut: torch.Tensor,
+  ChunkLSE: torch.Tensor,
+  softmax_scale: float,
+  stride_qb: int,
+  stride_qh: int,
+  stride_qm: int,
+  stride_kb: int,
+  stride_kh: int,
+  stride_kn: int,
+  stride_vb: int,
+  stride_vh: int,
+  stride_vn: int,
+  stride_pb: int,
+  stride_ph: int,
+  stride_pc: int,
+  stride_pm: int,
+  stride_lb: int,
+  stride_lh: int,
+  stride_lc: int,
+  stride_lm: int,
+  nheads_q: int,
+  nheads_kv: int,
+  seqlen_q: int,
+  seqlen_k: int,
+  IS_CAUSAL: tl.constexpr,
+  USE_GEMV: tl.constexpr,
+  DTYPE: tl.constexpr,
+  HEADDIM: tl.constexpr,
+  BLOCK_M: tl.constexpr,
+  CHUNK_SIZE: tl.constexpr,
+  BLOCK_N: tl.constexpr,
+  BLOCK_HEADDIM_QK: tl.constexpr,
+  BLOCK_HEADDIM_V: tl.constexpr,
+  NUM_V_GROUPS: tl.constexpr,
+) -> None:
+  chunk_idx = tl.program_id(0)
+  off_hb = tl.program_id(1)
+  q_block = tl.program_id(2)
+  off_b = off_hb // nheads_q
+  off_hq = off_hb % nheads_q
+  group_size = nheads_q // nheads_kv
+  off_hkv = off_hq // group_size
 
-_ffpa_fwd_autotune_cache: dict[int, callable] = {}  # headdim -> callable
+  Q += off_b * stride_qb + off_hq * stride_qh
+  K += off_b * stride_kb + off_hkv * stride_kh
+  V += off_b * stride_vb + off_hkv * stride_vh
+  PartialOut += off_b * stride_pb + off_hq * stride_ph + chunk_idx * stride_pc
+  ChunkLSE += off_b * stride_lb + off_hq * stride_lh + chunk_idx * stride_lc
+
+  chunk_start = chunk_idx * CHUNK_SIZE
+  chunk_end = tl.minimum(seqlen_k, chunk_start + CHUNK_SIZE)
+  kv_offset = seqlen_k - seqlen_q
+  offs_m = q_block * BLOCK_M + tl.arange(0, BLOCK_M)
+  mask_m = offs_m < seqlen_q
+  offs_n = tl.arange(0, BLOCK_N)
+  offs_d_qk = tl.arange(0, BLOCK_HEADDIM_QK)
+  offs_d_v = tl.arange(0, BLOCK_HEADDIM_V)
+  num_qk_d_chunks = tl.cdiv(HEADDIM, BLOCK_HEADDIM_QK)
+
+  if USE_GEMV:  # gemv
+    m_i_single = -float("inf")
+    l_i_single = 0.0
+    zero_acc_single = tl.zeros([BLOCK_HEADDIM_V], dtype=tl.float32)
+    o_accs_single = (zero_acc_single, ) * NUM_V_GROUPS
+
+    for start_n in range(0, CHUNK_SIZE, BLOCK_N):
+      start_n = tl.multiple_of(start_n, BLOCK_N)
+      offs_kv = chunk_start + start_n + offs_n
+      mask_n = offs_kv < chunk_end
+
+      scores = tl.zeros([1, BLOCK_N], dtype=tl.float32)
+      for qk_d_chunk in range(num_qk_d_chunks):
+        qk_d_start = qk_d_chunk * BLOCK_HEADDIM_QK
+        qk_d = qk_d_start + offs_d_qk
+        q = tl.load(
+          Q + qk_d,
+          mask=qk_d < HEADDIM,
+          other=0.0,
+        )
+        k = tl.load(
+          K + offs_kv[:, None] * stride_kn + qk_d[None, :],
+          mask=mask_n[:, None] & (qk_d[None, :] < HEADDIM),
+          other=0.0,
+        )
+        scores += tl.sum(k * q[None, :], axis=1)[None, :]
+
+      scores = tl.sum(scores, axis=0)
+      scores = scores * softmax_scale
+      scores = tl.where(mask_n, scores, -float("inf"))
+      if IS_CAUSAL:
+        causal_mask = offs_kv <= (seqlen_k - 1)
+        scores = tl.where(causal_mask, scores, -float("inf"))
+
+      m_new = tl.maximum(m_i_single, tl.max(scores, axis=0))
+      alpha = tl.exp(m_i_single - m_new)
+      p = tl.exp(scores - m_new)
+      l_new = l_i_single * alpha + tl.sum(p, axis=0)
+      p = p.to(DTYPE)
+
+      for v_group in tl.static_range(0, NUM_V_GROUPS):
+        o_d = BLOCK_HEADDIM_V * v_group + offs_d_v
+        v = tl.load(
+          V + offs_kv[:, None] * stride_vn + o_d[None, :],
+          mask=mask_n[:, None] & (o_d[None, :] < HEADDIM),
+          other=0.0,
+        )
+        o_acc = o_accs_single[v_group] * alpha + tl.sum(v * p[:, None], axis=0)
+        o_accs_single = _update_o_accs(o_accs_single, v_group, o_acc)
+
+      m_i_single = m_new
+      l_i_single = l_new
+
+    for v_group in tl.static_range(0, NUM_V_GROUPS):
+      o_d = BLOCK_HEADDIM_V * v_group + offs_d_v
+      out = o_accs_single[v_group] / (l_i_single + 1.0e-10)
+      tl.store(
+        PartialOut + o_d,
+        out,
+        mask=o_d < HEADDIM,
+      )
+    tl.store(ChunkLSE, m_i_single + tl.log(l_i_single))
+
+  else:  # MMA gemm
+
+    m_i = tl.full([BLOCK_M], -float("inf"), dtype=tl.float32)
+    l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
+    zero_acc = tl.zeros([BLOCK_M, BLOCK_HEADDIM_V], dtype=tl.float32)
+    o_accs = (zero_acc, ) * NUM_V_GROUPS
+
+    for start_n in range(0, CHUNK_SIZE, BLOCK_N):
+      start_n = tl.multiple_of(start_n, BLOCK_N)
+      offs_kv = chunk_start + start_n + offs_n
+      mask_n = offs_kv < chunk_end
+
+      scores = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+      for qk_d_chunk in range(num_qk_d_chunks):
+        qk_d_start = qk_d_chunk * BLOCK_HEADDIM_QK
+        qk_d = qk_d_start + offs_d_qk
+        q = tl.load(
+          Q + offs_m[:, None] * stride_qm + qk_d[None, :],
+          mask=mask_m[:, None] & (qk_d[None, :] < HEADDIM),
+          other=0.0,
+        )
+        k = tl.load(
+          K + offs_kv[:, None] * stride_kn + qk_d[None, :],
+          mask=mask_n[:, None] & (qk_d[None, :] < HEADDIM),
+          other=0.0,
+        )
+        scores = tl.dot(q, tl.trans(k), acc=scores)
+
+      scores = scores * softmax_scale
+      scores = tl.where(mask_n[None, :], scores, -float("inf"))
+      if IS_CAUSAL:
+        causal_mask = offs_kv[None, :] <= (offs_m[:, None] + kv_offset)
+        scores = tl.where(causal_mask, scores, -float("inf"))
+      scores = tl.where(mask_m[:, None], scores, -float("inf"))
+
+      m_prev = tl.where(mask_m, m_i, 0.0)
+      m_new = tl.where(mask_m, tl.maximum(m_i, tl.max(scores, axis=1)), 0.0)
+      alpha = tl.exp(m_prev - m_new)
+      p = tl.exp(scores - m_new[:, None])
+      l_new = l_i * alpha + tl.sum(p, axis=1)
+      p = p.to(DTYPE)
+
+      for v_group in tl.static_range(0, NUM_V_GROUPS):
+        o_d = BLOCK_HEADDIM_V * v_group + offs_d_v
+        v = tl.load(
+          V + offs_kv[:, None] * stride_vn + o_d[None, :],
+          mask=mask_n[:, None] & (o_d[None, :] < HEADDIM),
+          other=0.0,
+        )
+        o_acc = o_accs[v_group] * alpha[:, None] + tl.dot(p, v)
+        o_accs = _update_o_accs(o_accs, v_group, o_acc)
+
+      m_i = m_new
+      l_i = l_new
+
+    for v_group in tl.static_range(0, NUM_V_GROUPS):
+      o_d = BLOCK_HEADDIM_V * v_group + offs_d_v
+      out = o_accs[v_group] / (l_i[:, None] + 1.0e-10)
+      tl.store(
+        PartialOut + offs_m[:, None] * stride_pm + o_d[None, :],
+        out,
+        mask=mask_m[:, None] & (o_d[None, :] < HEADDIM),
+      )
+    tl.store(ChunkLSE + offs_m * stride_lm, m_i + tl.log(l_i), mask=mask_m)
 
 
-def _get_fwd_autotune(headdim: int):
-  """Return a headdim-specific autotune wrapper for the forward kernel.
+@triton.jit
+def _ffpa_decode_fwd_stage2_kernel(
+  PartialOut: torch.Tensor,
+  ChunkLSE: torch.Tensor,
+  O: torch.Tensor,
+  LSE: torch.Tensor,
+  stride_pb: int,
+  stride_ph: int,
+  stride_pc: int,
+  stride_pm: int,
+  stride_lb: int,
+  stride_lh: int,
+  stride_lc: int,
+  stride_lm: int,
+  stride_ob: int,
+  stride_oh: int,
+  stride_om: int,
+  stride_lseb: int,
+  stride_lseh: int,
+  stride_lsem: int,
+  nheads_q: int,
+  seqlen_q: int,
+  n_chunks: int,
+  DTYPE: tl.constexpr,
+  HEADDIM: tl.constexpr,
+  BLOCK_HEADDIM_V: tl.constexpr,
+  BLOCK_CHUNKS: tl.constexpr,
+) -> None:
+  off_hbm = tl.program_id(0)
+  v_group = tl.program_id(1)
+  off_hb = off_hbm // seqlen_q
+  off_m = off_hbm % seqlen_q
+  off_b = off_hb // nheads_q
+  off_hq = off_hb % nheads_q
 
-  Results are cached by headdim so the autotune overhead is paid at most once
-  per shape on a given process.  The search space is generated by
-  :func:`_gen_fwd_autotune_configs` which gates a full-D chunk config on
-  device SMEM capacity.
+  PartialOut += off_b * stride_pb + off_hq * stride_ph + off_m * stride_pm
+  ChunkLSE += off_b * stride_lb + off_hq * stride_lh + off_m * stride_lm
+  O += off_b * stride_ob + off_hq * stride_oh + off_m * stride_om
+  LSE += off_b * stride_lseb + off_hq * stride_lseh + off_m * stride_lsem
 
-  :param headdim: The actual head dimension for the target forward call.
-  :return: A ``triton.autotune``-wrapped version of ``_ffpa_fwd_kernel_impl``
-      tuned for ``headdim``.
-  """
-  if headdim not in _ffpa_fwd_autotune_cache:
-    configs = _gen_fwd_autotune_configs(headdim)
-    _ffpa_fwd_autotune_cache[headdim] = triton.autotune(
+  offs_c = tl.arange(0, BLOCK_CHUNKS)
+  mask_c = offs_c < n_chunks
+  chunk_lse = tl.load(
+    ChunkLSE + offs_c * stride_lc,
+    mask=mask_c,
+    other=-float("inf"),
+  )
+  valid_c = mask_c & (chunk_lse > -float("inf"))
+  max_lse = tl.max(chunk_lse, axis=0)
+  weights = tl.where(valid_c, tl.exp(chunk_lse - max_lse), 0.0)
+  denom = tl.sum(weights, axis=0)
+
+  offs_d = v_group * BLOCK_HEADDIM_V + tl.arange(0, BLOCK_HEADDIM_V)
+  partial = tl.load(
+    PartialOut + offs_c[:, None] * stride_pc + offs_d[None, :],
+    mask=valid_c[:, None] & (offs_d[None, :] < HEADDIM),
+    other=0.0,
+  )
+  out = tl.sum(weights[:, None] * partial, axis=0) / denom
+  tl.store(
+    O + offs_d,
+    out.to(DTYPE),
+    mask=offs_d < HEADDIM,
+  )
+  if v_group == 0:
+    tl.store(LSE, max_lse + tl.log(denom))
+
+
+_ffpa_decode_fwd_stage1 = _ffpa_decode_fwd_stage1_kernel
+_ffpa_decode_fwd_stage1_autotune_cache: dict[tuple[int, bool], callable] = {}
+
+
+def _get_decode_fwd_stage1_autotune(headdim: int, use_gemv: bool):
+  """Return a shape-class-specific autotune wrapper for decode stage1."""
+  cache_key = (headdim, use_gemv)
+  if cache_key not in _ffpa_decode_fwd_stage1_autotune_cache:
+    configs = _gen_decode_fwd_stage1_autotune_configs(headdim, use_gemv=use_gemv)
+    _ffpa_decode_fwd_stage1_autotune_cache[cache_key] = triton.autotune(
       configs=configs,
       key=["seqlen_q", "seqlen_k", "HEADDIM"],
       cache_results=True,
-    )(_ffpa_fwd_kernel_impl)
-  return _ffpa_fwd_autotune_cache[headdim]
+    )(_ffpa_decode_fwd_stage1_kernel)
+  return _ffpa_decode_fwd_stage1_autotune_cache[cache_key]
 
 
-def _ffpa_attn_forward_impl(
+def _ffpa_attn_forward_generic_impl(
   q: torch.Tensor,
   k: torch.Tensor,
   v: torch.Tensor,
@@ -259,31 +635,11 @@ def _ffpa_attn_forward_impl(
   softmax_scale: float | None = None,
   autotune: bool = False,
 ) -> None:
-  """Run the Triton FFPA Split-D forward kernel.
-
-  :param q: Query tensor in ``[B, Hq, Nq, D]`` layout.
-  :param k: Key tensor in ``[B, Hkv, Nkv, D]`` layout.
-  :param v: Value tensor in ``[B, Hkv, Nkv, D]`` layout.
-  :param o: Output tensor in ``[B, Hq, Nq, D]`` layout, written in place.
-  :param lse: Float32 LSE tensor with shape ``[B, Hq, Nq_aligned]`` or a
-      view whose last dimension is the visible query length.
-  :param causal: Whether to apply lower-right causal masking.
-  :param softmax_scale: Scale applied to ``Q @ K.T``. Defaults to
-      ``1 / sqrt(D)``.
-  :param autotune: Whether to run Triton's autotuner for this shape.
-  """
+  """Launch the generic Triton forward kernel without split-kv scratch."""
   batch, nheads_q, seqlen_q, headdim = q.shape
   _, nheads_kv, seqlen_k, _ = k.shape
   softmax_scale = softmax_scale or (1.0 / math.sqrt(headdim))
   seqlen_q_rounded = lse.shape[-1]
-
-  assert q.dtype == k.dtype == v.dtype == o.dtype
-  assert q.dtype in (torch.float16, torch.bfloat16)
-  assert lse.dtype == torch.float32
-  assert q.stride(-1) == k.stride(-1) == v.stride(-1) == o.stride(-1) == 1
-  if headdim > _MAX_HEADDIM:
-    raise ValueError(f"Triton forward supports headdim <= {_MAX_HEADDIM}, got {headdim}")
-
   DTYPE = tl.float16 if q.dtype == torch.float16 else tl.bfloat16
 
   def grid(meta: dict) -> tuple[int, int]:
@@ -353,6 +709,253 @@ def _ffpa_attn_forward_impl(
       num_warps=8,
       num_stages=3,
     )
+
+
+def _ffpa_attn_forward_decode_impl(
+  q: torch.Tensor,
+  k: torch.Tensor,
+  v: torch.Tensor,
+  o: torch.Tensor,
+  lse: torch.Tensor,
+  causal: bool = False,
+  softmax_scale: float | None = None,
+  autotune: bool = False,
+  num_splits: int | None = None,
+) -> None:
+  """Run the split-kv Triton forward path used for decode-like shapes."""
+  batch, nheads_q, seqlen_q, headdim = q.shape
+  _, nheads_kv, seqlen_k, _ = k.shape
+  softmax_scale = softmax_scale or (1.0 / math.sqrt(headdim))
+  DTYPE = tl.float16 if q.dtype == torch.float16 else tl.bfloat16
+  use_gemv = seqlen_q == 1
+  if num_splits is None:
+    num_splits = _get_decode_num_splits(seqlen_q, seqlen_k, headdim, batch, nheads_q, q.device)
+
+  n_chunks = num_splits
+  chunk_size = triton.cdiv(seqlen_k, n_chunks)
+  block_m = 8 if use_gemv else min(64, max(8, triton.next_power_of_2(seqlen_q)))
+  block_headdim = triton.next_power_of_2(headdim) if use_gemv else 64
+
+  partial_out = torch.empty(
+    (batch, nheads_q, n_chunks, seqlen_q, headdim),
+    device=q.device,
+    dtype=torch.float32,
+  )
+  chunk_lse = torch.empty(
+    (batch, nheads_q, n_chunks, seqlen_q),
+    device=q.device,
+    dtype=torch.float32,
+  )
+  if autotune:
+    chunk_lse.fill_(-float("inf"))
+
+  def stage1_grid(meta: dict) -> tuple[int, int, int]:
+    return (
+      triton.cdiv(seqlen_k, meta["CHUNK_SIZE"]),
+      batch * nheads_q,
+      triton.cdiv(seqlen_q, meta["BLOCK_M"]),
+    )
+
+  if autotune:
+    _get_decode_fwd_stage1_autotune(headdim, use_gemv)[stage1_grid](
+      q,
+      k,
+      v,
+      partial_out,
+      chunk_lse,
+      softmax_scale,
+      q.stride(0),
+      q.stride(1),
+      q.stride(2),
+      k.stride(0),
+      k.stride(1),
+      k.stride(2),
+      v.stride(0),
+      v.stride(1),
+      v.stride(2),
+      partial_out.stride(0),
+      partial_out.stride(1),
+      partial_out.stride(2),
+      partial_out.stride(3),
+      chunk_lse.stride(0),
+      chunk_lse.stride(1),
+      chunk_lse.stride(2),
+      chunk_lse.stride(3),
+      nheads_q,
+      nheads_kv,
+      seqlen_q,
+      seqlen_k,
+      IS_CAUSAL=causal,
+      USE_GEMV=use_gemv,
+      DTYPE=DTYPE,
+      HEADDIM=headdim,
+      CHUNK_SIZE=chunk_size,
+    )
+  else:
+    _ffpa_decode_fwd_stage1[stage1_grid](
+      q,
+      k,
+      v,
+      partial_out,
+      chunk_lse,
+      softmax_scale,
+      q.stride(0),
+      q.stride(1),
+      q.stride(2),
+      k.stride(0),
+      k.stride(1),
+      k.stride(2),
+      v.stride(0),
+      v.stride(1),
+      v.stride(2),
+      partial_out.stride(0),
+      partial_out.stride(1),
+      partial_out.stride(2),
+      partial_out.stride(3),
+      chunk_lse.stride(0),
+      chunk_lse.stride(1),
+      chunk_lse.stride(2),
+      chunk_lse.stride(3),
+      nheads_q,
+      nheads_kv,
+      seqlen_q,
+      seqlen_k,
+      IS_CAUSAL=causal,
+      USE_GEMV=use_gemv,
+      DTYPE=DTYPE,
+      HEADDIM=headdim,
+      BLOCK_M=block_m,
+      CHUNK_SIZE=chunk_size,
+      BLOCK_N=128,
+      BLOCK_HEADDIM_QK=block_headdim,
+      BLOCK_HEADDIM_V=block_headdim,
+      num_warps=4,
+      num_stages=2,
+    )
+
+  stage2_block_headdim_v = triton.next_power_of_2(headdim) if headdim <= 512 else 128
+  block_chunks = triton.next_power_of_2(n_chunks)
+
+  def stage2_grid(meta: dict) -> tuple[int, int]:
+    num_v_groups = triton.cdiv(o.size(-1), meta["BLOCK_HEADDIM_V"])
+    return (o.size(0) * o.size(1) * o.size(2), num_v_groups)
+
+  _ffpa_decode_fwd_stage2_kernel[stage2_grid](
+    partial_out,
+    chunk_lse,
+    o,
+    lse,
+    partial_out.stride(0),
+    partial_out.stride(1),
+    partial_out.stride(2),
+    partial_out.stride(3),
+    chunk_lse.stride(0),
+    chunk_lse.stride(1),
+    chunk_lse.stride(2),
+    chunk_lse.stride(3),
+    o.stride(0),
+    o.stride(1),
+    o.stride(2),
+    lse.stride(0),
+    lse.stride(1),
+    lse.stride(2),
+    o.size(1),
+    o.size(2),
+    n_chunks,
+    DTYPE=DTYPE,
+    HEADDIM=o.size(-1),
+    BLOCK_HEADDIM_V=stage2_block_headdim_v,
+    BLOCK_CHUNKS=block_chunks,
+    num_warps=4,
+  )
+
+
+_ffpa_fwd = _ffpa_fwd_kernel_impl
+_ffpa_fwd_autotune_cache: dict[int, callable] = {}  # headdim -> callable
+
+
+def _get_fwd_autotune(headdim: int):
+  """Return a headdim-specific autotune wrapper for the forward kernel.
+
+  Results are cached by headdim so the autotune overhead is paid at most once
+  per shape on a given process.  The search space is generated by
+  :func:`_gen_fwd_autotune_configs` which gates a full-D chunk config on
+  device SMEM capacity.
+
+  :param headdim: The actual head dimension for the target forward call.
+  :return: A ``triton.autotune``-wrapped version of ``_ffpa_fwd_kernel_impl``
+      tuned for ``headdim``.
+  """
+  if headdim not in _ffpa_fwd_autotune_cache:
+    configs = _gen_fwd_autotune_configs(headdim)
+    _ffpa_fwd_autotune_cache[headdim] = triton.autotune(
+      configs=configs,
+      key=["seqlen_q", "seqlen_k", "HEADDIM"],
+      cache_results=True,
+    )(_ffpa_fwd_kernel_impl)
+  return _ffpa_fwd_autotune_cache[headdim]
+
+
+def _ffpa_attn_forward_impl(
+  q: torch.Tensor,
+  k: torch.Tensor,
+  v: torch.Tensor,
+  o: torch.Tensor,
+  lse: torch.Tensor,
+  causal: bool = False,
+  softmax_scale: float | None = None,
+  autotune: bool = False,
+) -> None:
+  """Run the Triton FFPA Split-D forward kernel.
+
+  :param q: Query tensor in ``[B, Hq, Nq, D]`` layout.
+  :param k: Key tensor in ``[B, Hkv, Nkv, D]`` layout.
+  :param v: Value tensor in ``[B, Hkv, Nkv, D]`` layout.
+  :param o: Output tensor in ``[B, Hq, Nq, D]`` layout, written in place.
+  :param lse: Float32 LSE tensor with shape ``[B, Hq, Nq_aligned]`` or a
+      view whose last dimension is the visible query length.
+  :param causal: Whether to apply lower-right causal masking.
+  :param softmax_scale: Scale applied to ``Q @ K.T``. Defaults to
+      ``1 / sqrt(D)``.
+  :param autotune: Whether to run Triton's autotuner for this shape.
+  """
+  batch, nheads_q, seqlen_q, headdim = q.shape
+  _, _, seqlen_k, _ = k.shape
+  softmax_scale = softmax_scale or (1.0 / math.sqrt(headdim))
+
+  assert q.dtype == k.dtype == v.dtype == o.dtype
+  assert q.dtype in (torch.float16, torch.bfloat16)
+  assert lse.dtype == torch.float32
+  assert q.stride(-1) == k.stride(-1) == v.stride(-1) == o.stride(-1) == 1
+  if headdim > _MAX_HEADDIM:
+    raise ValueError(f"Triton forward supports headdim <= {_MAX_HEADDIM}, got {headdim}")
+
+  num_splits = _get_decode_num_splits(seqlen_q, seqlen_k, headdim, batch, nheads_q, q.device)
+
+  if num_splits == 1:
+    _ffpa_attn_forward_generic_impl(
+      q,
+      k,
+      v,
+      o,
+      lse,
+      causal=causal,
+      softmax_scale=softmax_scale,
+      autotune=autotune,
+    )
+    return
+
+  _ffpa_attn_forward_decode_impl(
+    q,
+    k,
+    v,
+    o,
+    lse,
+    causal=causal,
+    softmax_scale=softmax_scale,
+    autotune=autotune,
+    num_splits=num_splits,
+  )
 
 
 def _ffpa_attn_forward_triton(
