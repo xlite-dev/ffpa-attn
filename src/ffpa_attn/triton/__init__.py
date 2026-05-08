@@ -11,7 +11,7 @@ _OP_NAMESPACE = "ffpa_attn"
 torch.library.define(
   f"{_OP_NAMESPACE}::_fwd_triton",
   "(Tensor q, Tensor k, Tensor v, float softmax_scale, "
-  "int causal, int autotune) -> (Tensor o, Tensor softmax_lse)",
+  "int causal, int autotune, int autotune_mode_is_max) -> (Tensor o, Tensor softmax_lse)",
 )
 
 
@@ -23,6 +23,7 @@ def _fwd_triton_torch_op(
   softmax_scale: float,
   causal: int,
   autotune: int,
+  autotune_mode_is_max: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
   from ._ffpa_fwd import _ffpa_attn_forward_impl as _triton_fwd_kernel
 
@@ -52,6 +53,7 @@ def _fwd_triton_torch_op(
     causal=bool(causal),
     softmax_scale=softmax_scale,
     autotune=bool(autotune),
+    autotune_mode="max" if autotune_mode_is_max else "fast",
   )
   return o, softmax_lse
 
@@ -64,6 +66,7 @@ def _fwd_triton_fake(
   softmax_scale: float,
   causal: int,
   autotune: int,
+  autotune_mode_is_max: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
   seqlen_q_aligned = ((q.size(2) + 127) // 128) * 128
   o = torch.empty_like(q)
@@ -75,7 +78,7 @@ torch.library.define(
   f"{_OP_NAMESPACE}::_bwd_triton",
   "(Tensor dO, Tensor q, Tensor k, Tensor v, Tensor o, Tensor lse, "
   "float softmax_scale, int causal, int autotune, "
-  "int kernel_version_is_v2, int preprocess_d_chunk) "
+  "int autotune_mode_is_max, int kernel_version_is_v2, int preprocess_d_chunk) "
   "-> (Tensor dq, Tensor dk, Tensor dv)",
 )
 
@@ -93,6 +96,7 @@ def _bwd_triton_torch_op(
   autotune: int,
   kernel_version_is_v2: int,
   preprocess_d_chunk: int,
+  autotune_mode_is_max: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
   from ._ffpa_bwd import _ffpa_attn_backward_triton_impl as _triton_bwd_kernel
 
@@ -113,6 +117,7 @@ def _bwd_triton_torch_op(
     causal=bool(causal),
     softmax_scale=softmax_scale,
     autotune=bool(autotune),
+    autotune_mode="max" if autotune_mode_is_max else "fast",
     kernel_version="v2" if kernel_version_is_v2 else "v1",
     preprocess_d_chunk=bool(preprocess_d_chunk),
   )

@@ -48,6 +48,7 @@ _FFPA_ATTN_IMPL_DEFAULTS: dict[str, object] = {
   "high_precision_grad": False,
   "forward_backend": "triton",
   "triton_forward_autotune": False,
+  "triton_autotune_mode": "fast",
   "backward_backend": "triton",
   "triton_backward_autotune": False,
   "triton_backward_version": "v2",
@@ -138,6 +139,8 @@ class FFPAAttnMeta:
   :param high_precision_grad: Whether SDPA backward should upcast.
   :param forward_backend: Forward backend name, ``"cuda"`` or ``"triton"``.
   :param triton_forward_autotune: Whether to enable Triton forward autotune.
+  :param triton_autotune_mode: Triton autotune search-space mode,
+    ``"fast"`` or ``"max"``.
   :param backward_backend: Backward backend name. ``"sdpa"``, ``"cuda"``, or ``"triton"``.
   :param triton_backward_autotune: Whether to enable Triton backward autotune.
   :param triton_backward_version: Triton backward kernel version.
@@ -155,6 +158,7 @@ class FFPAAttnMeta:
   high_precision_grad: bool
   forward_backend: str
   triton_forward_autotune: bool
+  triton_autotune_mode: str
   backward_backend: str
   triton_backward_autotune: bool
   triton_backward_version: str
@@ -183,6 +187,7 @@ class FFPAAttnMeta:
     high_precision_grad = bool(impl_options["high_precision_grad"])
     forward_backend = str(impl_options["forward_backend"])
     triton_forward_autotune = bool(impl_options["triton_forward_autotune"])
+    triton_autotune_mode = str(impl_options["triton_autotune_mode"])
     backward_backend = str(impl_options["backward_backend"])
     triton_backward_autotune = bool(impl_options["triton_backward_autotune"])
     triton_backward_version = str(impl_options["triton_backward_version"])
@@ -192,6 +197,8 @@ class FFPAAttnMeta:
       f"Unsupported forward_backend={forward_backend!r}; choose 'cuda' or 'triton'."
     assert backward_backend in ("sdpa", "triton", "cuda"), \
       f"Unsupported backward_backend={backward_backend!r}; choose 'sdpa', 'triton', or 'cuda'."
+    assert triton_autotune_mode in ("fast", "max"), \
+      f"Unsupported triton_autotune_mode={triton_autotune_mode!r}; choose 'fast' or 'max'."
 
     if acc_str == "f32":
       acc = _ACC_F32
@@ -214,6 +221,7 @@ class FFPAAttnMeta:
       high_precision_grad=high_precision_grad,
       forward_backend=forward_backend,
       triton_forward_autotune=triton_forward_autotune,
+      triton_autotune_mode=triton_autotune_mode,
       backward_backend=backward_backend,
       triton_backward_autotune=triton_backward_autotune,
       triton_backward_version=triton_backward_version,
@@ -379,6 +387,7 @@ class _FFPAAttnFunc(torch.autograd.Function):
         meta.is_causal,
         meta.scale,
         meta.triton_forward_autotune,
+        meta.triton_autotune_mode,
       )
     else:
       raise ValueError(f"Unsupported forward_backend={meta.forward_backend!r};")
@@ -436,6 +445,7 @@ class _FFPAAttnFunc(torch.autograd.Function):
           causal=meta.is_causal,
           softmax_scale=meta.scale,
           autotune=meta.triton_backward_autotune,
+          autotune_mode=meta.triton_autotune_mode,
           kernel_version=meta.triton_backward_version,
           preprocess_d_chunk=meta.triton_backward_preprocess_d_chunk,
         )

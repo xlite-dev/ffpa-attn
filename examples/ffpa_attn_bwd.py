@@ -50,6 +50,13 @@ def _parse_args() -> argparse.Namespace:
     action="store_true",
     help="Enable Triton autotuning (only effective when --backward-backend=triton).",
   )
+  parser.add_argument(
+    "--triton-autotune-mode",
+    "--autotune-mode",
+    choices=["fast", "max"],
+    default="fast",
+    help="Triton autotune search-space mode.",
+  )
   return parser.parse_args()
 
 
@@ -82,6 +89,7 @@ def _run_ffpa_backward(
   scale: float,
   backward_backend: str,
   triton_backward_autotune: bool = False,
+  triton_autotune_mode: str = "fast",
   causal: bool = False,
 ) -> None:
   q_i = q.detach().clone().requires_grad_(True)
@@ -96,6 +104,7 @@ def _run_ffpa_backward(
     enable_gqa=q_i.size(1) != k_i.size(1),
     backward_backend=backward_backend,
     triton_backward_autotune=triton_backward_autotune,
+    triton_autotune_mode=triton_autotune_mode,
   )
   out.sum().backward()
 
@@ -144,6 +153,7 @@ def _run_case(
   dtype: torch.dtype,
   backward_backend: str,
   triton_backward_autotune: bool,
+  triton_autotune_mode: str,
   seed: int,
   B: int,
   Nh_q: int,
@@ -168,6 +178,7 @@ def _run_case(
     enable_gqa=Nh_q != Nh_kv,
     backward_backend=backward_backend,
     triton_backward_autotune=triton_backward_autotune,
+    triton_autotune_mode=triton_autotune_mode,
   )
   out.sum().backward()
 
@@ -184,6 +195,7 @@ def _run_case(
     scale,
     backward_backend,
     triton_backward_autotune,
+    triton_autotune_mode,
     causal,
   )
   ms_sdpa = _time_fn(_run_sdpa_backward, q, k, v, scale, causal)
@@ -214,6 +226,7 @@ def main() -> None:
       dtype,
       args.backward_backend,
       args.triton_backward_autotune,
+      args.triton_autotune_mode,
       seed=args.seed,
       B=args.B,
       Nh_q=32,
@@ -227,6 +240,7 @@ def main() -> None:
       dtype,
       args.backward_backend,
       args.triton_backward_autotune,
+      args.triton_autotune_mode,
       seed=args.seed,
       B=args.B,
       Nh_q=32,
@@ -240,6 +254,7 @@ def main() -> None:
       dtype,
       args.backward_backend,
       args.triton_backward_autotune,
+      args.triton_autotune_mode,
       seed=args.seed,
       B=args.B,
       Nh_q=32,
@@ -253,6 +268,7 @@ def main() -> None:
       dtype,
       args.backward_backend,
       args.triton_backward_autotune,
+      args.triton_autotune_mode,
       seed=args.seed,
       B=args.B,
       Nh_q=32,
@@ -266,6 +282,7 @@ def main() -> None:
       dtype,
       args.backward_backend,
       args.triton_backward_autotune,
+      args.triton_autotune_mode,
       seed=args.seed,
       B=args.B,
       Nh_q=32,
@@ -280,6 +297,7 @@ def main() -> None:
       dtype,
       args.backward_backend,
       args.triton_backward_autotune,
+      args.triton_autotune_mode,
       seed=args.seed,
       B=args.B,
       Nh_q=8,
