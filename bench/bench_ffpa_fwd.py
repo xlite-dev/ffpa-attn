@@ -32,7 +32,7 @@ def parse_args():
   parser.add_argument(
     "--forward-backend",
     choices=["cuda", "triton"],
-    default="cuda",
+    default="triton",
     help="Native forward backend to benchmark when not using a compare mode.",
   )
   parser.add_argument(

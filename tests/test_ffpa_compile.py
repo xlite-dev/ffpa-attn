@@ -8,6 +8,7 @@ import pytest
 import torch
 
 from ffpa_attn import ffpa_attn_func
+import ffpa_attn.functional as ffpa_attn_functional
 
 # Parametrized tests produce many shape/dtype/backend variants; allow
 # enough recompilations to avoid hitting the default limit of 8.
@@ -41,11 +42,22 @@ BWD_SHAPES = [
 DTYPES = [torch.float16, torch.bfloat16]
 
 
+def _require_cuda_forward_impl() -> None:
+  if not ffpa_attn_functional.cuda_forward_available():
+    pytest.skip("CUDA forward backend was not compiled")
+
+
+def _require_cuda_backward_impl() -> None:
+  if not ffpa_attn_functional.cuda_backward_available():
+    pytest.skip("CUDA backward backend was not compiled")
+
+
 # Forward-only compile tests
 @pytest.mark.parametrize("dtype", DTYPES, ids=["fp16", "bf16"])
 @pytest.mark.parametrize("B,H,N,D", FWD_SHAPES)
 def test_compile_forward_cuda(dtype, B, H, N, D):
   """torch.compile forward with CUDA backend matches eager reference."""
+  _require_cuda_forward_impl()
   torch.manual_seed(0)
   device = "cuda"
   q = torch.randn(B, H, N, D, dtype=dtype, device=device)
@@ -100,6 +112,10 @@ _BACKEND_PAIRS = [
 @pytest.mark.parametrize("fw,bw", _BACKEND_PAIRS, ids=lambda p: f"{p[0]}-{p[1]}")
 def test_compile_backward(dtype, B, H, N, D, fw, bw):
   """torch.compile forward+backward matches eager grads across backend pairs."""
+  if fw == "cuda":
+    _require_cuda_forward_impl()
+  if bw == "cuda":
+    _require_cuda_backward_impl()
   torch.manual_seed(0)
   device = "cuda"
   q = torch.randn(B, H, N, D, dtype=dtype, device=device, requires_grad=True)
@@ -131,6 +147,7 @@ def test_compile_backward(dtype, B, H, N, D, fw, bw):
 @pytest.mark.parametrize("dtype", DTYPES, ids=["fp16", "bf16"])
 def test_compile_modes_forward(mode, dtype):
   """torch.compile forward passes with different compile modes."""
+  _require_cuda_forward_impl()
   torch.manual_seed(0)
   device = "cuda"
   B, H, N, D = 1, 8, 512, 320
@@ -149,6 +166,7 @@ def test_compile_modes_forward(mode, dtype):
 @pytest.mark.parametrize("dtype", DTYPES, ids=["fp16", "bf16"])
 def test_compile_gqa(dtype):
   """torch.compile with GQA shapes matches eager across backend pairs."""
+  _require_cuda_forward_impl()
   B, Nh_q, Nh_kv, N, D = 1, 16, 4, 512, 320
   torch.manual_seed(0)
   device = "cuda"
@@ -195,6 +213,10 @@ def test_compile_gqa(dtype):
 @pytest.mark.parametrize("fw,bw", [("cuda", "triton"), ("triton", "triton")], ids=["cuda-triton", "triton-triton"])
 def test_compile_causal(dtype, fw, bw):
   """torch.compile with causal masking matches eager across backend pairs."""
+  if fw == "cuda":
+    _require_cuda_forward_impl()
+  if bw == "cuda":
+    _require_cuda_backward_impl()
   B, H, N, D = 1, 8, 512, 320
   torch.manual_seed(0)
   device = "cuda"
@@ -239,6 +261,7 @@ def test_compile_causal(dtype, fw, bw):
 # Repeated invocation (cache hit) test
 def test_compile_repeated_invocation():
   """Multiple calls through the same compiled function produce consistent output."""
+  _require_cuda_forward_impl()
   torch.manual_seed(0)
   device = "cuda"
   B, H, N, D = 1, 8, 512, 320

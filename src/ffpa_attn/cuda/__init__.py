@@ -1,8 +1,20 @@
 """CUDA FFPA attention forward/backward implementations for large-D (D > 256)."""
 import torch
 
-from .._C import ffpa_attn_forward as _ffpa_attn_fwd_cuda
-from .._C import ffpa_attn_backward as _ffpa_attn_bwd_cuda
+try:
+  from .. import _C as _cuda_ext
+
+  _ffpa_attn_fwd_cuda = _cuda_ext.ffpa_attn_forward
+  _ffpa_attn_bwd_cuda = _cuda_ext.ffpa_attn_backward
+  CUDA_FWD_AVAILABLE = bool(getattr(_cuda_ext, "CUDA_FWD_AVAILABLE", True))
+  CUDA_BWD_AVAILABLE = bool(getattr(_cuda_ext, "CUDA_BWD_AVAILABLE", True))
+  _CUDA_IMPORT_ERROR = None
+except Exception as exc:
+  _ffpa_attn_fwd_cuda = None
+  _ffpa_attn_bwd_cuda = None
+  CUDA_FWD_AVAILABLE = False
+  CUDA_BWD_AVAILABLE = False
+  _CUDA_IMPORT_ERROR = exc
 
 from ._ffpa_bwd import _ffpa_attn_backward_cuda
 from ._ffpa_fwd import _ffpa_attn_forward_cuda
@@ -28,6 +40,12 @@ def _fwd_cuda_torch_op(
   softmax_scale: float,
   tma: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+  if _ffpa_attn_fwd_cuda is None:
+    raise RuntimeError(
+      "ffpa_attn forward CUDA backend is unavailable. "
+      "Rebuild with ENABLE_FFPA_FWD_CUDA_IMPL=1 to enable it. "
+      f"Original import error: {_CUDA_IMPORT_ERROR}"
+    )
   O = torch.empty_like(Q)  # noqa: E741
   seqlen_q = Q.size(2)
   seqlen_q_aligned = ((seqlen_q + 7) // 8) * 8
@@ -90,6 +108,12 @@ def _bwd_cuda_torch_op(
   causal: int,
   softmax_scale: float,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+  if _ffpa_attn_bwd_cuda is None:
+    raise RuntimeError(
+      "ffpa_attn backward CUDA backend is unavailable. "
+      "Rebuild with ENABLE_FFPA_FWD_CUDA_IMPL=1 and ENABLE_FFPA_BWD_CUDA_IMPL=1 to enable it. "
+      f"Original import error: {_CUDA_IMPORT_ERROR}"
+    )
   dQ = torch.zeros_like(Q)
   dK = torch.zeros_like(K)
   dV = torch.zeros_like(V)
@@ -112,4 +136,9 @@ def _bwd_cuda_fake(
   return torch.empty_like(Q), torch.empty_like(K), torch.empty_like(V)
 
 
-__all__ = ["_ffpa_attn_forward_cuda", "_ffpa_attn_backward_cuda"]
+__all__ = [
+  "_ffpa_attn_forward_cuda",
+  "_ffpa_attn_backward_cuda",
+  "CUDA_FWD_AVAILABLE",
+  "CUDA_BWD_AVAILABLE",
+]

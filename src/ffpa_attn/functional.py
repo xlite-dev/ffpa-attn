@@ -15,10 +15,6 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from .cuda import (
-  _ffpa_attn_forward_cuda,
-  _ffpa_attn_backward_cuda,
-)  # D > 256
 from .triton import (
   _ffpa_attn_forward_triton,
   _ffpa_attn_backward_triton,
@@ -50,13 +46,82 @@ _FFPA_ATTN_IMPL_DEFAULTS: dict[str, object] = {
   "acc": "f32",
   "enable_tma": False,
   "high_precision_grad": False,
-  "forward_backend": "cuda",
+  "forward_backend": "triton",
   "triton_forward_autotune": False,
   "backward_backend": "triton",
   "triton_backward_autotune": False,
   "triton_backward_version": "v2",
   "triton_backward_preprocess_d_chunk": False,
 }
+
+_CUDA_BACKEND_LOADED = False
+_CUDA_BACKEND_IMPORT_ERROR: Exception | None = None
+_CUDA_FWD_AVAILABLE = False
+_CUDA_BWD_AVAILABLE = False
+_CUDA_FORWARD_IMPL = None
+_CUDA_BACKWARD_IMPL = None
+
+
+def _load_cuda_backend() -> None:
+  global _CUDA_BACKEND_LOADED
+  global _CUDA_BACKEND_IMPORT_ERROR
+  global _CUDA_FWD_AVAILABLE
+  global _CUDA_BWD_AVAILABLE
+  global _CUDA_FORWARD_IMPL
+  global _CUDA_BACKWARD_IMPL
+
+  if _CUDA_BACKEND_LOADED:
+    return
+
+  _CUDA_BACKEND_LOADED = True
+  try:
+    from . import cuda as cuda_backend
+  except Exception as exc:
+    _CUDA_BACKEND_IMPORT_ERROR = exc
+    return
+
+  _CUDA_FORWARD_IMPL = cuda_backend._ffpa_attn_forward_cuda
+  _CUDA_BACKWARD_IMPL = cuda_backend._ffpa_attn_backward_cuda
+  _CUDA_FWD_AVAILABLE = bool(getattr(cuda_backend, "CUDA_FWD_AVAILABLE", False))
+  _CUDA_BWD_AVAILABLE = bool(getattr(cuda_backend, "CUDA_BWD_AVAILABLE", False))
+
+
+def cuda_forward_available() -> bool:
+  _load_cuda_backend()
+  return _CUDA_FWD_AVAILABLE
+
+
+def cuda_backward_available() -> bool:
+  _load_cuda_backend()
+  return _CUDA_BWD_AVAILABLE
+
+
+def _require_cuda_forward_impl():
+  _load_cuda_backend()
+  if _CUDA_FWD_AVAILABLE and _CUDA_FORWARD_IMPL is not None:
+    return _CUDA_FORWARD_IMPL
+
+  message = (
+    "ffpa_attn_func: forward_backend='cuda' requested but the CUDA forward backend is unavailable. "
+    "Rebuild with ENABLE_FFPA_FWD_CUDA_IMPL=1 to enable it."
+  )
+  if _CUDA_BACKEND_IMPORT_ERROR is not None:
+    message = f"{message} Original import error: {_CUDA_BACKEND_IMPORT_ERROR}"
+  raise RuntimeError(message)
+
+
+def _require_cuda_backward_impl():
+  _load_cuda_backend()
+  if _CUDA_BWD_AVAILABLE and _CUDA_BACKWARD_IMPL is not None:
+    return _CUDA_BACKWARD_IMPL
+
+  message = (
+    "ffpa_attn_func: backward_backend='cuda' requested but the CUDA backward backend is unavailable. "
+    "Rebuild with ENABLE_FFPA_FWD_CUDA_IMPL=1 and ENABLE_FFPA_BWD_CUDA_IMPL=1 to enable it."
+  )
+  if _CUDA_BACKEND_IMPORT_ERROR is not None:
+    message = f"{message} Original import error: {_CUDA_BACKEND_IMPORT_ERROR}"
+  raise RuntimeError(message)
 
 
 @dataclass
@@ -293,7 +358,8 @@ class _FFPAAttnFunc(torch.autograd.Function):
         meta.dropout_p,
       )
     elif meta.forward_backend == "cuda":
-      O, lse = _ffpa_attn_forward_cuda(
+      cuda_forward_impl = _require_cuda_forward_impl()
+      O, lse = cuda_forward_impl(
         q,
         k,
         v,
@@ -347,7 +413,8 @@ class _FFPAAttnFunc(torch.autograd.Function):
 
     if D > 256:
       if meta.backward_backend == "cuda":
-        dq, dk, dv = _ffpa_attn_backward_cuda(
+        cuda_backward_impl = _require_cuda_backward_impl()
+        dq, dk, dv = cuda_backward_impl(
           q.contiguous(),
           k.contiguous(),
           v.contiguous(),
@@ -447,4 +514,4 @@ class FFPAAttnFunc:
     return _ffpa_apply(*args, **kwargs)
 
 
-__all__ = ["FFPAAttnMeta", "FFPAAttnFunc"]
+__all__ = ["FFPAAttnMeta", "FFPAAttnFunc", "cuda_forward_available", "cuda_backward_available"]

@@ -39,7 +39,7 @@ def _parse_args() -> argparse.Namespace:
     "--backend",
     "--fwd",
     choices=["cuda", "triton"],
-    default="cuda",
+    default="triton",
     help="Forward backend passed to ffpa_attn_func.",
   )
   parser.add_argument("--B", type=int, default=1, help="Batch size.")
