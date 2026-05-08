@@ -26,16 +26,16 @@
 First, install the prebuilt package from [PyPI](https://pypi.org/project/ffpa-attn/) or build [ffpa-attn](https://github.com/xlite-dev/ffpa-attn) from source:
 
 ```bash
-# Required: PyTorch>=2.11.0, CUDA>=13.0, Ubuntu>=22.04
+# Fisrt, install the prebuilt package from PyPI
 pip3 install -U ffpa-attn # (support: sm_{80,90,...,120})
-# Or, build ffpa-attn from source, just follow the cmds:
+# Or, build ffpa-attn from source, just follow the cmds
 git clone https://github.com/xlite-dev/ffpa-attn.git
-# Then, build the wheel package and install it with pip
-cd ffpa-attn && MAX_JOBS=32 python3 setup.py bdist_wheel
+# Then, build the wheel package (Triton backend only)
+cd ffpa-attn && pip3 install -e . --no-build-isolation
+# Optional: build the whl with Triton and CUDA backends
+ENABLE_FFPA_FWD_CUDA_IMPL=1 && MAX_JOBS=32 pip3 install -e .
 # Optional: build ffpa-attn with ccache for faster rebuilds
 apt install ccache && bash tools/build_fast.sh bdist_wheel
-# Optional: for editable whl, use `pip install -e .` instead.
-pip3 install dist/ffpa_attn-*.whl # pip uninstall ffpa-attn -y
 ```
 
 Then, try to accelerate the attention for large headdim with just <i><b>one-line</b></i> of code:
