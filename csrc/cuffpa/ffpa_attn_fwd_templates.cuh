@@ -833,7 +833,8 @@ __global__ void __launch_bounds__(256) ffpa_attn_splitkv_decode_stage1_template(
       }
       row_scores[lane] = block_sum;
     }
-    __syncthreads();
+    // Only warp 0 writes row_scores; tid==0 (also warp 0) reads it.
+    __syncwarp();
 
     if (tid == 0) {
       for (int row = 0; row < active_rows; ++row) {
