@@ -180,6 +180,19 @@ def main() -> None:
       D=D,
     )
     _run_case(
+      "decode-attn",
+      dtype,
+      args.forward_backend,
+      args.triton_forward_autotune,
+      seed=args.seed,
+      B=1,
+      Nh_q=32,
+      Nh_kv=32,
+      Nq=1,
+      Nkv=N,
+      D=D,
+    )
+    _run_case(
       "gqa",
       dtype,
       args.forward_backend,
@@ -215,8 +228,8 @@ def main() -> None:
       B=1,
       Nh_q=8,
       Nh_kv=8,
-      Nq=N - 1,
-      Nkv=N - 1,
+      Nq=N - 1 if N > 1 else N,  # avoid zero-dim
+      Nkv=N - 1 if N > 1 else N,  # avoid zero-dim
       D=D,
     )
 
