@@ -19,25 +19,25 @@ attn_types = [
 
 # mean fp16, bf16
 fwd_speedups = [
-  np.mean([2.06, 2.08]),
-  np.mean([1.86, 1.87]),
-  np.mean([2.86, 2.85]),
-  np.mean([2.06, 2.09]),
-  np.mean([1.96, 1.99]),
-  np.mean([1.70, 1.74]),
-  np.mean([1.79, 1.82]),
-  np.mean([1.96, 1.98])
+  np.mean([2.06, 2.08]),  # self-attn
+  np.mean([1.86, 1.87]),  # cross-attn
+  np.mean([2.86, 2.85]),  # decode-attn
+  np.mean([2.06, 2.09]),  # gqa
+  np.mean([1.96, 1.99]),  # causal
+  np.mean([1.70, 1.74]),  # attn-mask
+  np.mean([1.79, 1.82]),  # dropout
+  np.mean([1.96, 1.98]),  # non-aligned
 ]
 
 bwd_speedups = [
-  np.mean([2.34, 2.49]),
-  np.mean([2.57, 2.51]),
-  np.mean([2.54, 2.62]),
-  np.mean([2.32, 2.46]),
-  np.mean([2.22, 2.56]),
-  np.mean([2.06, 2.17]),
-  np.mean([2.27, 2.41]),
-  np.mean([2.37, 2.67])
+  np.mean([2.34, 2.49]),  # self-attn
+  np.mean([2.57, 2.51]),  # cross-attn
+  np.mean([2.97, 3.11]),  # decode-attn
+  np.mean([2.32, 2.46]),  # gqa
+  np.mean([2.22, 2.56]),  # causal
+  np.mean([2.06, 2.17]),  # attn-mask
+  np.mean([2.27, 2.41]),  # dropout
+  np.mean([2.37, 2.67]),  # non-aligned
 ]
 
 sdpa_speedups = [1.0] * len(attn_types)
