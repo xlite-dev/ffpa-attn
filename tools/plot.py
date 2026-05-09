@@ -105,7 +105,7 @@ max_val = max(max(fwd_speedups), max(bwd_speedups))
 ax.set_ylim(0, max_val * 1.1)
 
 ax.legend(fontsize=20, loc='upper left')
-ax.grid(axis='y', alpha=0.3)
+ax.grid(axis='y', alpha=0.9)
 
 fig.tight_layout()
 plt.savefig('ffpa_speedup.png')

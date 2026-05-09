@@ -44,6 +44,13 @@ def _sdpa_ref(Q, K, V, attn_mask=None):
   return F.scaled_dot_product_attention(Q, K, V, attn_mask=attn_mask, scale=1.0 / math.sqrt(Q.size(-1)))
 
 
+def _tail_aligned_causal_mask(Nq, Nkv):
+  """Return FFPA's lower-right causal mask for cross/decode references."""
+  row_idx = torch.arange(Nq, device="cuda").view(-1, 1)
+  col_idx = torch.arange(Nkv, device="cuda").view(1, -1)
+  return col_idx <= (row_idx + (Nkv - Nq))
+
+
 def _tolerance(dtype):
   return {"atol": 2e-2, "rtol": 2e-2} if dtype == torch.bfloat16 else {"atol": 1e-2, "rtol": 1e-2}
 
@@ -189,6 +196,50 @@ def test_ffpa_attn_func_triton_dropout_matches_sdpa():
   with sdpa_kernel(SDPBackend.EFFICIENT_ATTENTION):
     ref = F.scaled_dot_product_attention(q, k, v, dropout_p=0.25, scale=1.0 / math.sqrt(q.size(-1)))
   torch.testing.assert_close(out, ref, **_tolerance(torch.float16))
+
+
+@pytest.mark.parametrize("dtype", DTYPES, ids=["fp16", "bf16"])
+@pytest.mark.parametrize(
+  "Nq,Nkv,D,causal",
+  [
+    (1, 4096, 512, False),
+    (2, 4096, 512, False),
+    (7, 4096, 512, False),
+    (1, 8192, 320, True),
+    (7, 4096, 512, True),
+  ],
+)
+def test_ffpa_attn_func_triton_decode_dropout_matches_sdpa(dtype, Nq, Nkv, D, causal):
+  """Decode/cross dropout must use the same SDPA Philox mask per score."""
+  q, k, v = _alloc_cross_qkv(1, 2, Nq, Nkv, D, dtype)
+  scale = 1.0 / math.sqrt(D)
+  dropout_p = 0.2
+  rng_seed = 1234
+
+  torch.manual_seed(rng_seed)
+  out = ffpa_attn_func(
+    q,
+    k,
+    v,
+    dropout_p=dropout_p,
+    is_causal=causal,
+    scale=scale,
+    stages=2,
+    acc="f32",
+    forward_backend="triton",
+  )
+
+  sdpa_kwargs = {}
+  if causal:
+    # SDPA is_causal uses a square-style upper-left convention for Nq != Nkv;
+    # FFPA decode aligns queries to the KV tail, so use an explicit mask.
+    sdpa_kwargs["attn_mask"] = _tail_aligned_causal_mask(Nq, Nkv)
+  torch.manual_seed(rng_seed)
+  with sdpa_kernel(SDPBackend.EFFICIENT_ATTENTION):
+    ref = F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p, scale=scale, **sdpa_kwargs)
+
+  tol = {"atol": 5e-2, "rtol": 5e-2} if dtype == torch.bfloat16 else {"atol": 4e-2, "rtol": 4e-2}
+  torch.testing.assert_close(out, ref, **tol)
 
 
 def test_ffpa_attn_func_too_large_d_falls_back_to_sdpa(monkeypatch):

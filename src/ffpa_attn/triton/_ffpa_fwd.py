@@ -50,14 +50,17 @@ def _update_o_accs(o_accs, v_group: tl.constexpr, o_acc):
 
 @triton.jit
 def _curand_uniform_from_element_offset(seed: tl.constexpr, element_offset):
+  # PyTorch mem-efficient attention maps each logical score element in
+  # [B, H, Nq, Nkv] to one Philox output.  Use the same uint32 -> uniform
+  # conversion as curand_uniform4; going through signed int32 can introduce a
+  # one-ulp mismatch for high-bit values, which is enough to break exact mask
+  # parity at the dropout threshold.
   quad_offset = element_offset // 4
   lane = element_offset - quad_offset * 4
   r0, r1, r2, r3 = tl.randint4x(seed, quad_offset)
   r = tl.where(lane == 0, r0, tl.where(lane == 1, r1, tl.where(lane == 2, r2, r3)))
-  r_i32 = r.to(tl.int32, bitcast=True)
-  r_f32 = r_i32.to(tl.float32)
-  r_f32 = tl.where(r_i32 < 0, r_f32 + 4294967296.0, r_f32)
-  return (r_f32 + 1.0) * 2.3283064365386963e-10
+  r_u32 = r.to(tl.uint32, bitcast=True)
+  return (r_u32.to(tl.float32) + 1.0) * 2.3283064365386963e-10
 
 
 @triton.jit
@@ -74,6 +77,8 @@ def _apply_dropout_to_p(
   HAS_DROPOUT: tl.constexpr,
 ):
   if HAS_DROPOUT:
+    # Keep this in SDPA's logical score order.  In split-kv decode, offs_n is
+    # passed as the global KV index, so no extra chunk offset should be added.
     linear = off_hb * seqlen_q * seqlen_k + offs_m[:, None] * seqlen_k + offs_n[None, :]
     rand = _curand_uniform_from_element_offset(philox_seed, philox_offset + linear)
     keep = rand > dropout_p
@@ -597,6 +602,8 @@ def _ffpa_decode_fwd_stage1_kernel(
       p = tl.exp(scores - m_new)
       l_new = l_i_single * alpha + tl.sum(p, axis=0)
       if HAS_DROPOUT:
+        # offs_kv already includes chunk_start, matching the global Nkv axis in
+        # SDPA's [B, H, Nq, Nkv] dropout RNG layout.
         linear = off_hb * seqlen_q * seqlen_k + (q_block * BLOCK_M) * seqlen_k + offs_kv
         rand = _curand_uniform_from_element_offset(PHILOX_SEED, philox_offset + linear)
         keep = rand > dropout_p

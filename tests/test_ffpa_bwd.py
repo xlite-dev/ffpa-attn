@@ -409,6 +409,49 @@ def test_ffpa_bwd_triton_dropout_matches_sdpa(kernel_version):
   torch.testing.assert_close(v.grad, dv_ref, atol=4e-2, rtol=4e-2)
 
 
+@pytest.mark.parametrize("Nq", [1, 7])
+def test_ffpa_bwd_triton_decode_dropout_matches_sdpa(Nq):
+  """Short-query dropout backward replays the decode forward Philox mask."""
+  B, H, Nkv, D = 1, 2, 513, 512
+  dtype = torch.float16
+  torch.manual_seed(99 + Nq)
+  q = torch.randn(B, H, Nq, D, dtype=dtype, device="cuda", requires_grad=True)
+  k = torch.randn(B, H, Nkv, D, dtype=dtype, device="cuda", requires_grad=True)
+  v = torch.randn(B, H, Nkv, D, dtype=dtype, device="cuda", requires_grad=True)
+  grad_out = torch.randn_like(q)
+
+  scale = 1.0 / math.sqrt(D)
+  rng_seed = 567
+  torch.manual_seed(rng_seed)
+  out = ffpa_attn_func(
+    q,
+    k,
+    v,
+    dropout_p=0.2,
+    scale=scale,
+    stages=2,
+    acc="f32",
+    backward_backend="triton",
+    triton_backward_version="v2",
+  )
+  out.backward(grad_out)
+
+  dq_ref, dk_ref, dv_ref = _sdpa_ref_grads(
+    q,
+    k,
+    v,
+    False,
+    scale,
+    dropout_p=0.2,
+    rng_seed=rng_seed,
+    grad_out=grad_out,
+  )
+
+  torch.testing.assert_close(q.grad, dq_ref, atol=4e-2, rtol=4e-2)
+  torch.testing.assert_close(k.grad, dk_ref, atol=4e-2, rtol=4e-2)
+  torch.testing.assert_close(v.grad, dv_ref, atol=4e-2, rtol=4e-2)
+
+
 @pytest.mark.parametrize("kernel_version", ["v1", "v2"])
 def test_ffpa_bwd_triton_dropout_additive_attn_mask_matches_sdpa(kernel_version):
   """Dropout and additive-bias gradients compose with the same SDPA mask."""

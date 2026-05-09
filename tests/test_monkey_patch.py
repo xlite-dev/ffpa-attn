@@ -7,8 +7,9 @@ These tests lock in the public usage pattern documented in
     from ffpa_attn import ffpa_attn_func
     F.scaled_dot_product_attention = ffpa_attn_func
 
-The fallback path inside ``ffpa_attn_func`` must call the native SDPA op
-directly instead of recursing through the patched Python symbol.
+Large-D cases must still dispatch through FFPA after the patch, while fallback
+cases must call the native SDPA op directly instead of recursing through the
+patched Python symbol.
 """
 
 from __future__ import annotations
@@ -34,8 +35,27 @@ def _alloc_qkv(dtype: torch.dtype, headdim: int = 128):
   return q, k, v
 
 
+def _alloc_cross_qkv(dtype: torch.dtype, nq: int, nkv: int, headdim: int = 512):
+  torch.manual_seed(0)
+  q = torch.randn(1, 4, nq, headdim, dtype=dtype, device="cuda")
+  k = torch.randn(1, 4, nkv, headdim, dtype=dtype, device="cuda")
+  v = torch.randn(1, 4, nkv, headdim, dtype=dtype, device="cuda")
+  return q, k, v
+
+
+def _tail_aligned_causal_mask(nq: int, nkv: int) -> torch.Tensor:
+  row_idx = torch.arange(nq, device="cuda").view(-1, 1)
+  col_idx = torch.arange(nkv, device="cuda").view(1, -1)
+  return col_idx <= (row_idx + (nkv - nq))
+
+
 def _tolerance(dtype: torch.dtype) -> dict[str, float]:
   return {"atol": 2e-2, "rtol": 2e-2} if dtype == torch.bfloat16 else {"atol": 1e-2, "rtol": 1e-2}
+
+
+def _block_native_sdpa(*args, **kwargs):
+  del args, kwargs
+  raise AssertionError("large-D monkey-patched case unexpectedly fell back to native SDPA")
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -56,14 +76,34 @@ def test_monkey_patched_sdpa_small_d_fallback_matches_native(dtype, monkeypatch)
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
-def test_monkey_patched_sdpa_attn_mask_fallback_matches_native(dtype, monkeypatch):
-  q, k, v = _alloc_qkv(dtype, headdim=512)
-  row_idx = torch.arange(q.size(2), device=q.device).view(-1, 1)
-  col_idx = torch.arange(k.size(2), device=k.device).view(1, -1)
-  attn_mask = col_idx <= row_idx
-  ref = _native_sdpa(q, k, v, attn_mask=attn_mask, scale=1.0 / math.sqrt(q.size(-1)))
+@pytest.mark.parametrize("case", ["self", "cross", "causal", "dropout", "attn_mask"])
+def test_monkey_patched_sdpa_large_d_ffpa_paths_match_native(dtype, case, monkeypatch):
+  if case == "cross":
+    q, k, v = _alloc_cross_qkv(dtype, nq=512, nkv=1024)
+  else:
+    q, k, v = _alloc_cross_qkv(dtype, nq=512, nkv=512)
 
+  scale = 1.0 / math.sqrt(q.size(-1))
+  kwargs: dict[str, object] = {"scale": scale}
+  if case == "causal":
+    kwargs["is_causal"] = True
+  elif case == "dropout":
+    kwargs["dropout_p"] = 0.2
+  elif case == "attn_mask":
+    kwargs["attn_mask"] = _tail_aligned_causal_mask(q.size(2), k.size(2))
+
+  if case == "dropout":
+    torch.manual_seed(1234)
+  ref = _native_sdpa(q, k, v, **kwargs)
+
+  # If this call accidentally routes to fallback, it will hit the blocked
+  # native op below.  That keeps this test focused on the monkey-patched FFPA
+  # path instead of merely comparing two native SDPA calls.
   monkeypatch.setattr(F, "scaled_dot_product_attention", ffpa_attn_func)
-  out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, scale=1.0 / math.sqrt(q.size(-1)))
+  monkeypatch.setattr(torch._C._nn, "scaled_dot_product_attention", _block_native_sdpa)
+  if case == "dropout":
+    torch.manual_seed(1234)
+  out = F.scaled_dot_product_attention(q, k, v, **kwargs)
 
-  torch.testing.assert_close(out, ref, **_tolerance(dtype))
+  tol = {"atol": 5e-2, "rtol": 5e-2} if case == "dropout" else _tolerance(dtype)
+  torch.testing.assert_close(out, ref, **tol)
