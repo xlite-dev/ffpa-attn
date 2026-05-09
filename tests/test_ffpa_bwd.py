@@ -267,6 +267,73 @@ def test_ffpa_bwd_triton_additive_attn_mask_only_grad_matches_sdpa():
   torch.testing.assert_close(attn_mask.grad, dmask_ref, atol=3e-2, rtol=3e-2)
 
 
+@pytest.mark.parametrize("dtype", DTYPES, ids=["fp16", "bf16"])
+@pytest.mark.parametrize(
+  "case",
+  ["base", "causal", "mask", "gqa", "d512"],
+)
+def test_ffpa_bwd_triton_decode_matches_sdpa(dtype, case):
+  """Nq=1 Triton decode backward must match SDPA across supported modes."""
+  B, Hq, Hkv, Nq, Nkv, D = 1, 4, 4, 1, 257, 64
+  causal = False
+  attn_mask = None
+  if case == "causal":
+    causal = True
+  elif case == "mask":
+    pass
+  elif case == "gqa":
+    Hkv = 2
+  elif case == "d512":
+    Hq, Hkv, Nkv, D = 2, 2, 129, 512
+
+  torch.manual_seed(7)
+  q = torch.randn(B, Hq, Nq, D, dtype=dtype, device="cuda", requires_grad=True)
+  k = torch.randn(B, Hkv, Nkv, D, dtype=dtype, device="cuda", requires_grad=True)
+  v = torch.randn(B, Hkv, Nkv, D, dtype=dtype, device="cuda", requires_grad=True)
+  grad_out = torch.randn_like(q)
+  if case == "mask":
+    attn_mask = (torch.randn(1, 1, Nq, Nkv, dtype=dtype, device="cuda") * 0.25).requires_grad_(True)
+
+  scale = 1.0 / math.sqrt(D)
+  out = ffpa_attn_func(
+    q,
+    k,
+    v,
+    causal=causal,
+    attn_mask=attn_mask,
+    scale=scale,
+    stages=2,
+    acc="f32",
+    backward_backend="triton",
+    triton_backward_version="v2",
+    enable_gqa=Hq != Hkv,
+  )
+  out.backward(grad_out)
+
+  ref = _sdpa_ref_grads(
+    q,
+    k,
+    v,
+    causal,
+    scale,
+    attn_mask=attn_mask,
+    return_mask_grad=attn_mask is not None,
+    grad_out=grad_out,
+  )
+  if attn_mask is None:
+    dq_ref, dk_ref, dv_ref = ref
+    dmask_ref = None
+  else:
+    dq_ref, dk_ref, dv_ref, dmask_ref = ref
+
+  tol = {"atol": 8e-2, "rtol": 8e-2} if dtype == torch.bfloat16 else {"atol": 3e-2, "rtol": 3e-2}
+  torch.testing.assert_close(q.grad, dq_ref, **tol)
+  torch.testing.assert_close(k.grad, dk_ref, **tol)
+  torch.testing.assert_close(v.grad, dv_ref, **tol)
+  if attn_mask is not None:
+    torch.testing.assert_close(attn_mask.grad, dmask_ref, **tol)
+
+
 @pytest.mark.parametrize("kernel_version", ["v1", "v2"])
 def test_ffpa_bwd_triton_dropout_matches_sdpa(kernel_version):
   """Triton dropout backward must reuse the forward Philox mask like SDPA."""

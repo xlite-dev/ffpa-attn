@@ -1084,6 +1084,196 @@ def _get_v2_autotune(headdim: int, autotune_mode: str):
   return _ffpa_bwd_v2_autotune_cache[cache_key]
 
 
+@triton.jit
+def _ffpa_bwd_decode_stage1_kernel(
+  Q: torch.Tensor,
+  K: torch.Tensor,
+  V: torch.Tensor,
+  DO: torch.Tensor,
+  DK: torch.Tensor,
+  DV: torch.Tensor,
+  PartialDQ: torch.Tensor,
+  LSE: torch.Tensor,
+  D: torch.Tensor,
+  AttnBias: torch.Tensor,
+  GradAttnBias: torch.Tensor,
+  softmax_scale: float,
+  stride_qb: int,
+  stride_qh: int,
+  stride_kb: int,
+  stride_kh: int,
+  stride_kn: int,
+  stride_vb: int,
+  stride_vh: int,
+  stride_vn: int,
+  stride_dob: int,
+  stride_doh: int,
+  stride_dkb: int,
+  stride_dkh: int,
+  stride_dkn: int,
+  stride_dvb: int,
+  stride_dvh: int,
+  stride_dvn: int,
+  stride_pqb: int,
+  stride_pqh: int,
+  stride_pqk: int,
+  stride_bb: int,
+  stride_bh: int,
+  stride_bn: int,
+  stride_gbb: int,
+  stride_gbh: int,
+  stride_gbn: int,
+  nheads: int,
+  seqlen_k: int,
+  seqlen_q_rounded: int,
+  headdim: int,
+  dropout_p: float,
+  philox_offset: int,
+  IS_CAUSAL: tl.constexpr,
+  HAS_ATTN_BIAS: tl.constexpr,
+  HAS_DROPOUT: tl.constexpr,
+  PHILOX_SEED: tl.constexpr,
+  BIAS_REQUIRES_GRAD: tl.constexpr,
+  GRAD_BIAS_NEEDS_REDUCTION: tl.constexpr,
+  DTYPE: tl.constexpr,
+  BLOCK_N: tl.constexpr,
+  BLOCK_HEADDIM: tl.constexpr,
+) -> None:
+  start_n_block = tl.program_id(0)
+  off_hb = tl.program_id(1)
+  off_b = off_hb // nheads
+  off_h = off_hb % nheads
+
+  Q += off_b * stride_qb + off_h * stride_qh
+  K += off_b * stride_kb + off_h * stride_kh
+  V += off_b * stride_vb + off_h * stride_vh
+  DO += off_b * stride_dob + off_h * stride_doh
+  DK += off_b * stride_dkb + off_h * stride_dkh
+  DV += off_b * stride_dvb + off_h * stride_dvh
+  PartialDQ += off_b * stride_pqb + off_h * stride_pqh + start_n_block * stride_pqk
+  LSE += off_hb * seqlen_q_rounded
+  D += off_hb * seqlen_q_rounded
+  if HAS_ATTN_BIAS:
+    AttnBias += off_b * stride_bb + off_h * stride_bh
+  if BIAS_REQUIRES_GRAD:
+    GradAttnBias += off_b * stride_gbb + off_h * stride_gbh
+
+  offs_n = start_n_block * BLOCK_N + tl.arange(0, BLOCK_N)
+  offs_d = tl.arange(0, BLOCK_HEADDIM)
+  mask_n = offs_n < seqlen_k
+  num_d_chunks = tl.cdiv(headdim, BLOCK_HEADDIM)
+
+  scores = tl.zeros([BLOCK_N], dtype=tl.float32)
+  dP = tl.zeros([BLOCK_N], dtype=tl.float32)
+  for d_chunk in range(num_d_chunks):
+    d_offs = d_chunk * BLOCK_HEADDIM + offs_d
+    q = tl.load(Q + d_offs, mask=d_offs < headdim, other=0.0).to(tl.float32)
+    do = tl.load(DO + d_offs, mask=d_offs < headdim, other=0.0).to(tl.float32)
+    k = tl.load(
+      K + offs_n[:, None] * stride_kn + d_offs[None, :],
+      mask=mask_n[:, None] & (d_offs[None, :] < headdim),
+      other=0.0,
+    ).to(tl.float32)
+    v = tl.load(
+      V + offs_n[:, None] * stride_vn + d_offs[None, :],
+      mask=mask_n[:, None] & (d_offs[None, :] < headdim),
+      other=0.0,
+    ).to(tl.float32)
+    scores += tl.sum(k * q[None, :], axis=1)
+    dP += tl.sum(v * do[None, :], axis=1)
+
+  scores = scores * softmax_scale
+  if HAS_ATTN_BIAS:
+    bias = tl.load(AttnBias + offs_n * stride_bn, mask=mask_n, other=0.0)
+    scores += bias
+  if IS_CAUSAL:
+    # Decode queries are tail-aligned to the KV cache, so the single query row
+    # may attend to every valid key position.
+    scores = tl.where(offs_n <= (seqlen_k - 1), scores, -float("inf"))
+  scores = tl.where(mask_n, scores, -float("inf"))
+
+  lse_i = tl.load(LSE)
+  P = tl.exp(scores - lse_i)
+  dropout_mult = tl.full([BLOCK_N], 1.0, dtype=tl.float32)
+  if HAS_DROPOUT:
+    linear = off_hb * seqlen_k + offs_n
+    rand = _curand_uniform_from_element_offset(PHILOX_SEED, philox_offset + linear)
+    keep = rand > dropout_p
+    dropout_mult = keep * (1.0 / (1.0 - dropout_p))
+  dP = dP * dropout_mult
+  P_drop = P * dropout_mult
+  delta_i = tl.load(D)
+  dBias = P * (dP - delta_i)
+  dS = dBias * softmax_scale
+
+  if BIAS_REQUIRES_GRAD:
+    grad_bias_ptrs = GradAttnBias + offs_n * stride_gbn
+    if GRAD_BIAS_NEEDS_REDUCTION:
+      tl.atomic_add(grad_bias_ptrs, dBias, sem="relaxed", mask=mask_n)
+    else:
+      tl.store(grad_bias_ptrs, dBias, mask=mask_n)
+
+  for d_chunk in range(num_d_chunks):
+    d_offs = d_chunk * BLOCK_HEADDIM + offs_d
+    q = tl.load(Q + d_offs, mask=d_offs < headdim, other=0.0).to(tl.float32)
+    do = tl.load(DO + d_offs, mask=d_offs < headdim, other=0.0).to(tl.float32)
+    k = tl.load(
+      K + offs_n[:, None] * stride_kn + d_offs[None, :],
+      mask=mask_n[:, None] & (d_offs[None, :] < headdim),
+      other=0.0,
+    ).to(tl.float32)
+    dk = dS[:, None] * q[None, :]
+    dv = P_drop[:, None] * do[None, :]
+    tl.store(
+      DK + offs_n[:, None] * stride_dkn + d_offs[None, :],
+      dk.to(DTYPE),
+      mask=mask_n[:, None] & (d_offs[None, :] < headdim),
+    )
+    tl.store(
+      DV + offs_n[:, None] * stride_dvn + d_offs[None, :],
+      dv.to(DTYPE),
+      mask=mask_n[:, None] & (d_offs[None, :] < headdim),
+    )
+    partial_dq = tl.sum(dS[:, None] * k, axis=0)
+    tl.store(PartialDQ + d_offs, partial_dq, mask=d_offs < headdim)
+
+
+@triton.jit
+def _ffpa_bwd_decode_dq_reduce_kernel(
+  PartialDQ: torch.Tensor,
+  DQ: torch.Tensor,
+  stride_pqb: int,
+  stride_pqh: int,
+  stride_pqk: int,
+  stride_dqb: int,
+  stride_dqh: int,
+  nheads: int,
+  num_k_blocks: int,
+  headdim: int,
+  BLOCK_K: tl.constexpr,
+  BLOCK_HEADDIM: tl.constexpr,
+) -> None:
+  d_block = tl.program_id(0)
+  off_hb = tl.program_id(1)
+  off_b = off_hb // nheads
+  off_h = off_hb % nheads
+
+  offs_k = tl.arange(0, BLOCK_K)
+  offs_d = d_block * BLOCK_HEADDIM + tl.arange(0, BLOCK_HEADDIM)
+  acc = tl.zeros([BLOCK_HEADDIM], dtype=tl.float32)
+  PartialDQ += off_b * stride_pqb + off_h * stride_pqh
+  for start_k in range(0, num_k_blocks, BLOCK_K):
+    k_blocks = start_k + offs_k
+    partial = tl.load(
+      PartialDQ + k_blocks[:, None] * stride_pqk + offs_d[None, :],
+      mask=(k_blocks[:, None] < num_k_blocks) & (offs_d[None, :] < headdim),
+      other=0.0,
+    )
+    acc += tl.sum(partial, axis=0)
+  DQ += off_b * stride_dqb + off_h * stride_dqh
+  tl.store(DQ + offs_d, acc, mask=offs_d < headdim)
+
+
 def _ffpa_attn_backward_triton_impl(
   do: torch.Tensor,
   q: torch.Tensor,
@@ -1217,6 +1407,89 @@ def _ffpa_attn_backward_triton_impl(
   dq.zero_()
   dk.zero_()
   dv.zero_()
+
+  if seqlen_q == 1 and not has_dropout:
+    block_n_decode = 64
+    block_headdim_decode = 64
+    num_k_blocks = triton.cdiv(seqlen_k, block_n_decode)
+    partial_dq = torch.empty(
+      (batch, nheads, num_k_blocks, headdim),
+      dtype=torch.float32,
+      device=q.device,
+    )
+    _ffpa_bwd_decode_stage1_kernel[(num_k_blocks, batch * nheads)](
+      q,
+      k,
+      v,
+      do,
+      dk,
+      dv,
+      partial_dq,
+      lse,
+      delta,
+      attn_bias_in,
+      grad_attn_bias_in,
+      softmax_scale,
+      q.stride(0),
+      q.stride(1),
+      k.stride(0),
+      k.stride(1),
+      k.stride(2),
+      v.stride(0),
+      v.stride(1),
+      v.stride(2),
+      do.stride(0),
+      do.stride(1),
+      dk.stride(0),
+      dk.stride(1),
+      dk.stride(2),
+      dv.stride(0),
+      dv.stride(1),
+      dv.stride(2),
+      partial_dq.stride(0),
+      partial_dq.stride(1),
+      partial_dq.stride(2),
+      bias_strides[0],
+      bias_strides[1],
+      bias_strides[3],
+      grad_bias_strides[0],
+      grad_bias_strides[1],
+      grad_bias_strides[3],
+      nheads,
+      seqlen_k,
+      seqlen_q_rounded,
+      headdim,
+      dropout_p,
+      philox_offset,
+      IS_CAUSAL=causal,
+      HAS_ATTN_BIAS=has_attn_bias,
+      HAS_DROPOUT=has_dropout,
+      PHILOX_SEED=philox_seed,
+      BIAS_REQUIRES_GRAD=bias_requires_grad,
+      GRAD_BIAS_NEEDS_REDUCTION=grad_bias_needs_reduction,
+      DTYPE=DTYPE,
+      BLOCK_N=block_n_decode,
+      BLOCK_HEADDIM=block_headdim_decode,
+      num_warps=8,
+      num_stages=2,
+    )
+    _ffpa_bwd_decode_dq_reduce_kernel[(triton.cdiv(headdim, block_headdim_decode), batch * nheads)](
+      partial_dq,
+      dq,
+      partial_dq.stride(0),
+      partial_dq.stride(1),
+      partial_dq.stride(2),
+      dq.stride(0),
+      dq.stride(1),
+      nheads,
+      num_k_blocks,
+      headdim,
+      BLOCK_K=64,
+      BLOCK_HEADDIM=block_headdim_decode,
+      num_warps=8,
+      num_stages=2,
+    )
+    return
 
   # TODO: May force use v1 for short seqlen where atomics are not a
   # bottleneck and v2 overhead would dominate.
