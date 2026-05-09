@@ -216,7 +216,12 @@ def _decode_num_splits_heuristic(
 
 
 def _get_decode_num_splits(
-  seqlen_q: int, seqlen_k: int, headdim: int, batch: int, nheads_q: int, device: torch.device
+  seqlen_q: int,
+  seqlen_k: int,
+  headdim: int,
+  batch: int,
+  nheads_q: int,
+  device: torch.device,
 ) -> int:
   """Choose a decode split count using FlashAttention's split-kv heuristic."""
   num_sms = max(1, torch.cuda.get_device_properties(device).multi_processor_count * 2)
@@ -309,6 +314,8 @@ def _ffpa_fwd_kernel_impl(
 
   m_i = tl.full([BLOCK_M], -float("inf"), dtype=tl.float32)
   l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
+  # Always use fp32 accumulators for O to reduce numerical instability;
+  # the final output is downcast to the input dtype at store time.
   zero_acc = tl.zeros([BLOCK_M, BLOCK_HEADDIM_V], dtype=tl.float32)
   # Mirrors CUDA fwd's R_D registers: one O accumulator per V head-dim slice.
   # Each accumulator is rescaled by the online-softmax alpha before adding

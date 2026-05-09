@@ -433,10 +433,10 @@ __device__ __forceinline__ void sync_online_safe_softmax(
         float* t_fptr_S_0_1 = reinterpret_cast<float*>(R_S + j * 4);
         kDataType* t_hptr_S_0_1 = reinterpret_cast<kDataType*>(R_S + j * 4);
         // P = Exp(S - m_new), fmaf(x, y, z) = x * y + z in registers;
-        t_fptr_S_0_1[0] = __expf(__fmaf_rn(t_fptr_S_0_1[0], scale, -block_row_max_new_0));
-        t_fptr_S_0_1[1] = __expf(__fmaf_rn(t_fptr_S_0_1[1], scale, -block_row_max_new_0));
-        t_fptr_S_0_1[2] = __expf(__fmaf_rn(t_fptr_S_0_1[2], scale, -block_row_max_new_1));
-        t_fptr_S_0_1[3] = __expf(__fmaf_rn(t_fptr_S_0_1[3], scale, -block_row_max_new_1));
+        t_fptr_S_0_1[0] = expf(__fmaf_rn(t_fptr_S_0_1[0], scale, -block_row_max_new_0));
+        t_fptr_S_0_1[1] = expf(__fmaf_rn(t_fptr_S_0_1[1], scale, -block_row_max_new_0));
+        t_fptr_S_0_1[2] = expf(__fmaf_rn(t_fptr_S_0_1[2], scale, -block_row_max_new_1));
+        t_fptr_S_0_1[3] = expf(__fmaf_rn(t_fptr_S_0_1[3], scale, -block_row_max_new_1));
         lane_row_sum_new[0] += (t_fptr_S_0_1[0] + t_fptr_S_0_1[1]);
         lane_row_sum_new[1] += (t_fptr_S_0_1[2] + t_fptr_S_0_1[3]);
         // Update R_S for P[Br,Bc] = Exp(S-m), point wise.
@@ -491,13 +491,13 @@ __device__ __forceinline__ void sync_online_safe_softmax(
         // P = Exp(S - m_new), fmaf(x, y, z) = x * y + z;
         float4 t_reg_S_0_1;
         t_reg_S_0_1.x =
-            __expf(__fmaf_rn(Traits::to_float(t_hptr_S_0_1[0]), scale, -block_row_max_new_0));
+            expf(__fmaf_rn(Traits::to_float(t_hptr_S_0_1[0]), scale, -block_row_max_new_0));
         t_reg_S_0_1.y =
-            __expf(__fmaf_rn(Traits::to_float(t_hptr_S_0_1[1]), scale, -block_row_max_new_0));
+            expf(__fmaf_rn(Traits::to_float(t_hptr_S_0_1[1]), scale, -block_row_max_new_0));
         t_reg_S_0_1.z =
-            __expf(__fmaf_rn(Traits::to_float(t_hptr_S_0_1[2]), scale, -block_row_max_new_1));
+            expf(__fmaf_rn(Traits::to_float(t_hptr_S_0_1[2]), scale, -block_row_max_new_1));
         t_reg_S_0_1.w =
-            __expf(__fmaf_rn(Traits::to_float(t_hptr_S_0_1[3]), scale, -block_row_max_new_1));
+            expf(__fmaf_rn(Traits::to_float(t_hptr_S_0_1[3]), scale, -block_row_max_new_1));
         lane_row_sum_new[0] += (t_reg_S_0_1.x + t_reg_S_0_1.y);
         lane_row_sum_new[1] += (t_reg_S_0_1.z + t_reg_S_0_1.w);
         // Update R_S for P[Br,Bc] = Exp(S-m), point wise.
@@ -517,7 +517,7 @@ __device__ __forceinline__ void sync_online_safe_softmax(
 // Precompute O-rescaling factors ``exp(m_old - m_new)`` for the two
 // sub-rows owned by this lane. Factored out of the softmax step so the
 // tiling-O rescaling loop over head-dim can reuse them without repeating
-// the ``__expf`` call. On the first KV tile (``n_tile_id == 0``) m_old
+// the ``expf`` call. On the first KV tile (``n_tile_id == 0``) m_old
 // is forced to m_new so the factor is 1 and O starts un-rescaled.
 __device__ __forceinline__ void sync_precompute_rescale_factors(
     float* rescale_o_factor_0,            // rescale factor
@@ -537,8 +537,8 @@ __device__ __forceinline__ void sync_precompute_rescale_factors(
   block_row_max_old_0 = (n_tile_id > 0 ? block_row_max_old_0 : block_row_max_new_0);
   block_row_max_old_1 = (n_tile_id > 0 ? block_row_max_old_1 : block_row_max_new_1);
   // Precompute rescale_o_factor_0 & rescale_o_factor_1, avoid redundant exp.
-  rescale_o_factor_0[0] = __expf(block_row_max_old_0 - block_row_max_new_0);
-  rescale_o_factor_1[0] = __expf(block_row_max_old_1 - block_row_max_new_1);
+  rescale_o_factor_0[0] = expf(block_row_max_old_0 - block_row_max_new_0);
+  rescale_o_factor_1[0] = expf(block_row_max_old_1 - block_row_max_new_1);
 }
 
 // Apply the rescale ``O_new = exp(m_old - m_new) * O_old + P @ V`` to
@@ -790,16 +790,16 @@ __device__ __forceinline__ void sync_compute_p_from_lse(uint32_t* R_S, const flo
     if constexpr (kMmaAccFloat32) {
       float* fp = reinterpret_cast<float*>(&R_S[c * 4]);
       kDataType* hp = reinterpret_cast<kDataType*>(&R_S[c * 2]);
-      hp[0] = Traits::from_float(__expf(__fmaf_rn(fp[0], scale, -l0)));
-      hp[1] = Traits::from_float(__expf(__fmaf_rn(fp[1], scale, -l0)));
-      hp[2] = Traits::from_float(__expf(__fmaf_rn(fp[2], scale, -l1)));
-      hp[3] = Traits::from_float(__expf(__fmaf_rn(fp[3], scale, -l1)));
+      hp[0] = Traits::from_float(expf(__fmaf_rn(fp[0], scale, -l0)));
+      hp[1] = Traits::from_float(expf(__fmaf_rn(fp[1], scale, -l0)));
+      hp[2] = Traits::from_float(expf(__fmaf_rn(fp[2], scale, -l1)));
+      hp[3] = Traits::from_float(expf(__fmaf_rn(fp[3], scale, -l1)));
     } else {
       kDataType* hp = reinterpret_cast<kDataType*>(&R_S[c * 2]);
-      float v0 = __expf(__fmaf_rn(Traits::to_float(hp[0]), scale, -l0));
-      float v1 = __expf(__fmaf_rn(Traits::to_float(hp[1]), scale, -l0));
-      float v2 = __expf(__fmaf_rn(Traits::to_float(hp[2]), scale, -l1));
-      float v3 = __expf(__fmaf_rn(Traits::to_float(hp[3]), scale, -l1));
+      float v0 = expf(__fmaf_rn(Traits::to_float(hp[0]), scale, -l0));
+      float v1 = expf(__fmaf_rn(Traits::to_float(hp[1]), scale, -l0));
+      float v2 = expf(__fmaf_rn(Traits::to_float(hp[2]), scale, -l1));
+      float v3 = expf(__fmaf_rn(Traits::to_float(hp[3]), scale, -l1));
       hp[0] = Traits::from_float(v0);
       hp[1] = Traits::from_float(v1);
       hp[2] = Traits::from_float(v2);

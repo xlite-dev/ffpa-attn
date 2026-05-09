@@ -288,10 +288,10 @@ __device__ __forceinline__ void compute_p_and_ds_from_lse(
     const float* dP = reinterpret_cast<const float*>(&R_dP[n_tile][0]);
     kDataType* p_frag = reinterpret_cast<kDataType*>(&R_P[n_tile][0]);
     kDataType* ds_frag = reinterpret_cast<kDataType*>(&R_dS[n_tile][0]);
-    const float p0 = __expf(__fmaf_rn(scores[0], scale, -lse_row0));
-    const float p1 = __expf(__fmaf_rn(scores[1], scale, -lse_row0));
-    const float p2 = __expf(__fmaf_rn(scores[2], scale, -lse_row8));
-    const float p3 = __expf(__fmaf_rn(scores[3], scale, -lse_row8));
+    const float p0 = expf(__fmaf_rn(scores[0], scale, -lse_row0));
+    const float p1 = expf(__fmaf_rn(scores[1], scale, -lse_row0));
+    const float p2 = expf(__fmaf_rn(scores[2], scale, -lse_row8));
+    const float p3 = expf(__fmaf_rn(scores[3], scale, -lse_row8));
     p_frag[0] = Traits::from_float(p0);
     p_frag[1] = Traits::from_float(p1);
     p_frag[2] = Traits::from_float(p2);

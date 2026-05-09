@@ -45,7 +45,7 @@ def _parse_args() -> argparse.Namespace:
   parser.add_argument("--B", type=int, default=1, help="Batch size.")
   parser.add_argument("--N", type=int, default=8192, help="Sequence length (non-aligned uses N-1).")
   parser.add_argument("--D", type=int, default=512, help="Head dimension.")
-  parser.add_argument("--seed", type=int, default=0, help="Random seed for input tensors.")
+  parser.add_argument("--seed", type=int, default=42, help="Random seed for input tensors.")
   parser.add_argument(
     "--triton-forward-autotune",
     "--autotune",
