@@ -63,6 +63,52 @@ _CUDA_FORWARD_IMPL = None
 _CUDA_BACKWARD_IMPL = None
 
 
+def _validate_attn_mask_shape(
+  attn_mask: torch.Tensor,
+  batch: int,
+  nheads_q: int,
+  seqlen_q: int,
+  seqlen_k: int,
+) -> None:
+  """Validate SDPA-style attention mask broadcast dimensions.
+
+  :param attn_mask: User-provided attention mask.
+  :param batch: Query batch size.
+  :param nheads_q: Number of query heads.
+  :param seqlen_q: Query sequence length.
+  :param seqlen_k: Key/value sequence length.
+  :raises ValueError: If ``attn_mask`` is not broadcastable to
+    ``[B, Nh_q, Nq, Nkv]`` under SDPA fused-kernel conventions.
+  """
+  if attn_mask.dim() not in (2, 3, 4):
+    raise ValueError("ffpa_attn_func: attn_mask must be 2-D, 3-D, or 4-D and broadcastable "
+                     "to [B, Nh_q, Nq, Nkv]")
+  if attn_mask.size(-2) not in (1, seqlen_q):
+    raise ValueError(
+      f"ffpa_attn_func: attn_mask query dimension must be 1 or {seqlen_q}, "
+      f"got {attn_mask.size(-2)}"
+    )
+  if attn_mask.size(-1) not in (1, seqlen_k):
+    raise ValueError(f"ffpa_attn_func: attn_mask key dimension must be 1 or {seqlen_k}, "
+                     f"got {attn_mask.size(-1)}")
+  if attn_mask.dim() == 3 and attn_mask.size(0) not in (1, batch):
+    raise ValueError(
+      f"ffpa_attn_func: 3-D attn_mask batch dimension must be 1 or {batch}, "
+      f"got {attn_mask.size(0)}"
+    )
+  if attn_mask.dim() == 4:
+    if attn_mask.size(0) not in (1, batch):
+      raise ValueError(
+        f"ffpa_attn_func: 4-D attn_mask batch dimension must be 1 or {batch}, "
+        f"got {attn_mask.size(0)}"
+      )
+    if attn_mask.size(1) not in (1, nheads_q):
+      raise ValueError(
+        f"ffpa_attn_func: 4-D attn_mask head dimension must be 1 or {nheads_q}, "
+        f"got {attn_mask.size(1)}"
+      )
+
+
 def _load_cuda_backend() -> None:
   global _CUDA_BACKEND_LOADED
   global _CUDA_BACKEND_IMPORT_ERROR
@@ -250,16 +296,15 @@ class FFPAAttnMeta:
     Raises ``TypeError``, ``ValueError``, or ``NotImplementedError`` for
     invalid or unsupported combinations.
     """
-    if attn_mask is not None:
-      raise NotImplementedError(
-        "ffpa_attn_func: attn_mask is not yet supported. "
-        "Pass attn_mask=None (the default) to use the built-in causal mask via is_causal=True."
-      )
     if dropout_p > 0.0 and query.size(-1) > 256:
       raise NotImplementedError(
         "ffpa_attn_func: dropout_p > 0 is only supported for head_dim <= 256 "
         "(the PyTorch flash-attention path). For head_dim > 256, pass dropout_p=0.0."
       )
+    if attn_mask is not None and is_causal:
+      raise RuntimeError("ffpa_attn_func: explicit attn_mask should not be set when is_causal=True")
+    if attn_mask is not None and attn_mask.dtype == torch.bool and attn_mask.requires_grad:
+      raise TypeError("ffpa_attn_func: boolean attn_mask cannot require gradients")
 
     # Fill in user-facing fields.
     self.is_causal = is_causal
@@ -325,6 +370,90 @@ class FFPAAttnMeta:
 
     return self
 
+  def normalize_attn_mask(
+    self,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    attn_mask: torch.Tensor | None,
+  ) -> torch.Tensor | None:
+    """Convert a user SDPA ``attn_mask`` into an additive FFPA attention bias.
+
+    The returned tensor is a 4-D additive bias that remains compact when the
+    user mask broadcasts over batch or head dimensions. Triton wrappers pass
+    zero strides for broadcast dimensions instead of materializing an expanded
+    ``[B, Nh_q, Nq, Nkv]`` view. Boolean masks follow SDPA semantics: ``True``
+    means the element participates in attention and ``False`` maps to ``-inf``
+    additive bias.
+
+    :param query: Query tensor with shape ``[B, Nh_q, Nq, D]``.
+    :param key: Key tensor with shape ``[B, Nh_kv, Nkv, D]``.
+    :param attn_mask: Optional user-provided SDPA attention mask.
+    :returns: Additive attention bias or ``None``.
+    :raises TypeError: If the mask dtype or device is unsupported.
+    :raises ValueError: If the mask shape is not broadcastable to attention scores.
+    """
+    if attn_mask is None:
+      return None
+
+    if attn_mask.device != query.device:
+      raise TypeError(
+        f"ffpa_attn_func: attn_mask must be on the same device as query, "
+        f"got {attn_mask.device} and {query.device}"
+      )
+    if attn_mask.dtype not in (torch.bool, torch.float32, query.dtype):
+      raise TypeError(
+        "ffpa_attn_func: attn_mask dtype must be bool, torch.float32, or match query dtype, "
+        f"got attn_mask.dtype={attn_mask.dtype} and query.dtype={query.dtype}"
+      )
+
+    batch, nheads_q, seqlen_q, _ = query.shape
+    seqlen_k = key.size(2)
+    _validate_attn_mask_shape(attn_mask, batch, nheads_q, seqlen_q, seqlen_k)
+
+    if attn_mask.dtype == torch.bool:
+      neg_inf = torch.tensor(float("-inf"), dtype=query.dtype, device=query.device)
+      attn_bias = torch.where(attn_mask, torch.zeros((), dtype=query.dtype, device=query.device), neg_inf)
+    else:
+      attn_bias = attn_mask
+
+    if attn_bias.dim() == 2:
+      attn_bias = attn_bias.view(1, 1, attn_bias.size(0), attn_bias.size(1))
+    elif attn_bias.dim() == 3:
+      attn_bias = attn_bias.view(attn_bias.size(0), 1, attn_bias.size(1), attn_bias.size(2))
+
+    if attn_bias.stride(-1) != 1:
+      attn_bias = attn_bias.contiguous()
+    return attn_bias
+
+  def normalize_inputs(
+    self,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attn_mask: torch.Tensor | None,
+    dropout_p: float,
+    is_causal: bool,
+    scale: float | None,
+    enable_gqa: bool,
+  ) -> tuple[FFPAAttnMeta, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """Validate public inputs and return metadata plus autograd inputs.
+
+    :param query: Query tensor passed to the public API.
+    :param key: Key tensor passed to the public API.
+    :param value: Value tensor passed to the public API.
+    :param attn_mask: Optional SDPA-style attention mask.
+    :param dropout_p: Dropout probability.
+    :param is_causal: Whether causal masking is requested.
+    :param scale: Optional softmax scale.
+    :param enable_gqa: Whether GQA/MQA semantics are enabled.
+    :returns: ``(meta, query, key, value, attn_bias)``. ``meta`` is non-tensor
+      dispatch state; the remaining values are passed directly to
+      :class:`FFPAAttnFunc` so autograd sees all differentiable inputs.
+    """
+    self.normalize(query, key, value, attn_mask, dropout_p, is_causal, scale, enable_gqa)
+    attn_bias = self.normalize_attn_mask(query, key, attn_mask)
+    return self, query, key, value, attn_bias
+
 
 class _FFPAAttnFunc(torch.autograd.Function):
   """FFPA attention with autograd support.
@@ -349,9 +478,10 @@ class _FFPAAttnFunc(torch.autograd.Function):
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
+    attn_bias: torch.Tensor | None,
     meta: FFPAAttnMeta,
   ) -> torch.Tensor:
-    is_grad = meta.is_grad_enabled and any(x.requires_grad for x in [q, k, v])
+    is_grad = meta.is_grad_enabled and any(x.requires_grad for x in (q, k, v, attn_bias) if x is not None)
     head_dim = q.size(-1)
     O = torch.empty_like(q)  # noqa: E741
 
@@ -388,6 +518,7 @@ class _FFPAAttnFunc(torch.autograd.Function):
         meta.scale,
         meta.triton_forward_autotune,
         meta.triton_autotune_mode,
+        attn_bias,
       )
     else:
       raise ValueError(f"Unsupported forward_backend={meta.forward_backend!r};")
@@ -410,6 +541,7 @@ class _FFPAAttnFunc(torch.autograd.Function):
         rng_state,
         unused,
       )
+      ctx.attn_bias = attn_bias
       ctx.meta = meta
 
     return O
@@ -417,6 +549,7 @@ class _FFPAAttnFunc(torch.autograd.Function):
   @staticmethod
   def backward(ctx, grad_out: torch.Tensor):
     q, k, v, O, lse, rng_state, unused = ctx.saved_tensors
+    attn_bias = getattr(ctx, "attn_bias", None)
     meta: FFPAAttnMeta = ctx.meta
     D = q.size(-1)
 
@@ -434,8 +567,9 @@ class _FFPAAttnFunc(torch.autograd.Function):
           int(meta.is_causal),
           meta.scale,
         )
+        grad_attn_bias = None
       elif meta.backward_backend == "triton":
-        dq, dk, dv = _ffpa_attn_backward_triton(
+        dq, dk, dv, grad_attn_bias = _ffpa_attn_backward_triton(
           grad_out=grad_out,
           q=q,
           k=k,
@@ -448,9 +582,11 @@ class _FFPAAttnFunc(torch.autograd.Function):
           autotune_mode=meta.triton_autotune_mode,
           kernel_version=meta.triton_backward_version,
           preprocess_d_chunk=meta.triton_backward_preprocess_d_chunk,
+          attn_bias=attn_bias,
+          return_attn_bias_grad=ctx.needs_input_grad[3],
         )
       else:
-        dq, dk, dv = _aten_efficient_attn_backward(
+        dq, dk, dv, grad_attn_bias = _aten_efficient_attn_backward(
           grad_out=grad_out,
           q=q,
           k=k,
@@ -460,6 +596,8 @@ class _FFPAAttnFunc(torch.autograd.Function):
           causal=meta.is_causal,
           softmax_scale=meta.scale,
           high_precision_grad=meta.high_precision_grad,
+          attn_bias=attn_bias,
+          return_attn_bias_grad=ctx.needs_input_grad[3],
         )
     else:
       # Aten flash-attention backward for D <= 256, which also supports dropout gradients
@@ -477,9 +615,10 @@ class _FFPAAttnFunc(torch.autograd.Function):
         meta.scale,
         meta.dropout_p,
       )
+      grad_attn_bias = None
 
-    # Gradients for: q, k, v, o, meta.
-    return dq, dk, dv, None, None
+    # Gradients for: q, k, v, attn_bias, meta.
+    return dq, dk, dv, grad_attn_bias, None
 
 
 # We cannot use ``torch.library.register_autograd`` on the forward ops
@@ -524,4 +663,9 @@ class FFPAAttnFunc:
     return _ffpa_apply(*args, **kwargs)
 
 
-__all__ = ["FFPAAttnMeta", "FFPAAttnFunc", "cuda_forward_available", "cuda_backward_available"]
+__all__ = [
+  "FFPAAttnMeta",
+  "FFPAAttnFunc",
+  "cuda_forward_available",
+  "cuda_backward_available",
+]

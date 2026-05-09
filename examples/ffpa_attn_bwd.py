@@ -79,6 +79,25 @@ def _make_sdpa_kwargs(causal: bool, nq: int, nkv: int):
   return {}
 
 
+def _make_broadcast_additive_attn_mask(nq: int, nkv: int, dtype: torch.dtype, seed: int) -> torch.Tensor:
+  """Build a differentiable broadcastable additive attention bias."""
+  torch.manual_seed(seed + 1)
+  return (torch.randn(1, 1, nq, nkv, dtype=dtype, device="cuda") * 0.25).requires_grad_(True)
+
+
+def _make_full_additive_attn_mask(
+  batch: int,
+  nheads: int,
+  nq: int,
+  nkv: int,
+  dtype: torch.dtype,
+  seed: int,
+) -> torch.Tensor:
+  """Build a differentiable full per-batch/per-head additive attention bias."""
+  torch.manual_seed(seed + 2)
+  return (torch.randn(batch, nheads, nq, nkv, dtype=dtype, device="cuda") * 0.25).requires_grad_(True)
+
+
 def _time_fn(fn, *args, warmup: int = WARMUP, iters: int = ITERS) -> float:
   for _ in range(warmup):
     fn(*args)
@@ -128,11 +147,13 @@ def _ffpa_forward(
   triton_backward_autotune: bool = False,
   triton_autotune_mode: str = "fast",
   causal: bool = False,
+  attn_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
   return ffpa_attn_func(
     q_i,
     k_i,
     v_i,
+    attn_mask=attn_mask,
     is_causal=causal,
     scale=scale,
     enable_gqa=q_i.size(1) != k_i.size(1),
@@ -148,11 +169,12 @@ def _sdpa_forward(
   v_i: torch.Tensor,
   scale: float,
   causal: bool = False,
+  attn_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
   group_size = q_i.size(1) // k_i.size(1)
   k_in = k_i.repeat_interleave(group_size, dim=1) if group_size > 1 else k_i
   v_in = v_i.repeat_interleave(group_size, dim=1) if group_size > 1 else v_i
-  kw = _make_sdpa_kwargs(causal, q_i.size(2), k_i.size(2))
+  kw = {"attn_mask": attn_mask} if attn_mask is not None else _make_sdpa_kwargs(causal, q_i.size(2), k_i.size(2))
   return F.scaled_dot_product_attention(q_i, k_in, v_in, scale=scale, **kw)
 
 
@@ -165,7 +187,10 @@ def _run_ffpa_backward(
   triton_backward_autotune: bool = False,
   triton_autotune_mode: str = "fast",
   causal: bool = False,
+  attn_mask: torch.Tensor | None = None,
 ) -> None:
+  if attn_mask is not None:
+    attn_mask.grad = None
   q_i = q.detach().clone().requires_grad_(True)
   k_i = k.detach().clone().requires_grad_(True)
   v_i = v.detach().clone().requires_grad_(True)
@@ -178,6 +203,7 @@ def _run_ffpa_backward(
     triton_backward_autotune=triton_backward_autotune,
     triton_autotune_mode=triton_autotune_mode,
     causal=causal,
+    attn_mask=attn_mask,
   )
   out.sum().backward()
 
@@ -188,12 +214,15 @@ def _run_sdpa_backward(
   v: torch.Tensor,
   scale: float,
   causal: bool = False,
+  attn_mask: torch.Tensor | None = None,
 ) -> None:
+  if attn_mask is not None:
+    attn_mask.grad = None
   q_i = q.detach().clone().requires_grad_(True)
   k_i = k.detach().clone().requires_grad_(True)
   v_i = v.detach().clone().requires_grad_(True)
 
-  out = _sdpa_forward(q_i, k_i, v_i, scale, causal=causal)
+  out = _sdpa_forward(q_i, k_i, v_i, scale, causal=causal, attn_mask=attn_mask)
   out.sum().backward()
 
 
@@ -203,7 +232,8 @@ def _sdpa_ref_grads(
   v: torch.Tensor,
   scale: float,
   causal: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+  attn_mask: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
   q_ref = q.detach().clone().requires_grad_(True)
   k_ref = k.detach().clone().requires_grad_(True)
   v_ref = v.detach().clone().requires_grad_(True)
@@ -211,10 +241,15 @@ def _sdpa_ref_grads(
   group_size = q_ref.size(1) // k_ref.size(1)
   k_in = k_ref.repeat_interleave(group_size, dim=1) if group_size > 1 else k_ref
   v_in = v_ref.repeat_interleave(group_size, dim=1) if group_size > 1 else v_ref
-  kw = _make_sdpa_kwargs(causal, q_ref.size(2), k_ref.size(2))
+  attn_mask_ref = None
+  if attn_mask is not None:
+    attn_mask_ref = attn_mask.detach().clone().requires_grad_(attn_mask.requires_grad)
+  kw = {
+    "attn_mask": attn_mask_ref
+  } if attn_mask_ref is not None else _make_sdpa_kwargs(causal, q_ref.size(2), k_ref.size(2))
   out_ref = F.scaled_dot_product_attention(q_ref, k_in, v_in, scale=scale, **kw)
   out_ref.sum().backward()
-  return q_ref.grad, k_ref.grad, v_ref.grad
+  return q_ref.grad, k_ref.grad, v_ref.grad, attn_mask_ref.grad if attn_mask_ref is not None else None
 
 
 def _run_case(
@@ -231,6 +266,7 @@ def _run_case(
   Nkv: int,
   D: int,
   causal: bool = False,
+  attn_mask: torch.Tensor | None = None,
   timing_mode: str = "backward-only",
 ) -> None:
   torch.manual_seed(seed)
@@ -243,6 +279,7 @@ def _run_case(
     q,
     k,
     v,
+    attn_mask=attn_mask,
     is_causal=causal,
     scale=scale,
     enable_gqa=Nh_q != Nh_kv,
@@ -255,7 +292,8 @@ def _run_case(
   dq_ffpa = q.grad.detach().clone()
   dk_ffpa = k.grad.detach().clone()
   dv_ffpa = v.grad.detach().clone()
-  dq_ref, dk_ref, dv_ref = _sdpa_ref_grads(q, k, v, scale, causal=causal)
+  dmask_ffpa = attn_mask.grad.detach().clone() if attn_mask is not None and attn_mask.grad is not None else None
+  dq_ref, dk_ref, dv_ref, dmask_ref = _sdpa_ref_grads(q, k, v, scale, causal=causal, attn_mask=attn_mask)
 
   if timing_mode == "backward-only":
     grad_out = torch.ones_like(q)
@@ -269,6 +307,7 @@ def _run_case(
         triton_backward_autotune,
         triton_autotune_mode,
         causal,
+        attn_mask,
       ),
       q,
       k,
@@ -276,7 +315,7 @@ def _run_case(
       grad_out,
     )
     ms_sdpa = _time_backward_only(
-      lambda q_i, k_i, v_i: _sdpa_forward(q_i, k_i, v_i, scale, causal=causal),
+      lambda q_i, k_i, v_i: _sdpa_forward(q_i, k_i, v_i, scale, causal=causal, attn_mask=attn_mask),
       q,
       k,
       v,
@@ -293,16 +332,21 @@ def _run_case(
       triton_backward_autotune,
       triton_autotune_mode,
       causal,
+      attn_mask,
     )
-    ms_sdpa = _time_fn(_run_sdpa_backward, q, k, v, scale, causal)
+    ms_sdpa = _time_fn(_run_sdpa_backward, q, k, v, scale, causal, attn_mask)
 
   dt_tag = str(dtype).replace("torch.", "")
+  dmask_msg = ""
+  if dmask_ffpa is not None and dmask_ref is not None:
+    dmask_msg = f"dMask_err={(dmask_ffpa - dmask_ref).abs().max().item():.4e}  "
   print(
     f"[{name:<14} {dt_tag:<8}] "
     f"B={B} Hq={Nh_q} Hkv={Nh_kv} Nq={Nq} Nkv={Nkv} D={D} causal={int(causal)}  "
     f"dQ_err={(dq_ffpa - dq_ref).abs().max().item():.4e}  "
     f"dK_err={(dk_ffpa - dk_ref).abs().max().item():.4e}  "
     f"dV_err={(dv_ffpa - dv_ref).abs().max().item():.4e}  "
+    f"{dmask_msg}"
     f"backend={backward_backend}  "
     f"FFPA={ms_ffpa:.2f} ms  SDPA={ms_sdpa:.2f} ms  speedup={ms_sdpa / ms_ffpa:.2f}x"
   )
@@ -391,6 +435,40 @@ def main() -> None:
       Nkv=N,
       D=D,
       causal=True,
+      timing_mode=args.timing_mode,
+    )
+    mask_n = max(N, 512)
+    full_mask_n = min(mask_n, 2048)
+    _run_case(
+      "attn-mask-full",
+      dtype,
+      args.backward_backend,
+      args.triton_backward_autotune,
+      args.triton_autotune_mode,
+      seed=args.seed,
+      B=args.B,
+      Nh_q=32,
+      Nh_kv=32,
+      Nq=full_mask_n,
+      Nkv=full_mask_n,
+      D=D,
+      attn_mask=_make_full_additive_attn_mask(args.B, 32, full_mask_n, full_mask_n, dtype, args.seed),
+      timing_mode=args.timing_mode,
+    )
+    _run_case(
+      "attn-mask-bcast",
+      dtype,
+      args.backward_backend,
+      args.triton_backward_autotune,
+      args.triton_autotune_mode,
+      seed=args.seed,
+      B=args.B,
+      Nh_q=32,
+      Nh_kv=32,
+      Nq=mask_n,
+      Nkv=mask_n,
+      D=D,
+      attn_mask=_make_broadcast_additive_attn_mask(mask_n, mask_n, dtype, args.seed),
       timing_mode=args.timing_mode,
     )
     _run_case(

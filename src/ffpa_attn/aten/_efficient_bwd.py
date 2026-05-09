@@ -57,7 +57,9 @@ def _aten_efficient_attn_backward(
   causal: bool,
   softmax_scale: float,
   high_precision_grad: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+  attn_bias: torch.Tensor | None = None,
+  return_attn_bias_grad: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
   """Run large-D backward through PyTorch's efficient-attention backward op.
 
   This wrapper owns the FFPA-specific tensor preparation required by
@@ -75,12 +77,19 @@ def _aten_efficient_attn_backward(
   :param softmax_scale: Scale applied to ``QK^T``.
   :param high_precision_grad: Whether to upcast inputs and intermediates to
     fp32 before calling the aten efficient backward op.
-  :returns: ``(dq, dk, dv)`` with the original ``q`` / ``k`` / ``v`` dtypes and
-    head layouts.
+  :param attn_bias: Optional additive attention bias broadcast to
+    ``[B, Nh_q, Nq, Nkv]``. Boolean masks must already be converted to
+    additive bias before entering this wrapper.
+  :param return_attn_bias_grad: Whether to request the additive-bias gradient
+    from the aten op.
+  :returns: ``(dq, dk, dv, d_attn_bias)`` with the original ``q`` / ``k`` /
+    ``v`` dtypes and head layouts. ``d_attn_bias`` is ``None`` unless
+    requested for an explicit additive bias.
   """
   group_size = q.size(1) // k.size(1)
   attn_bias_mask = None
   causal_for_op = causal
+  original_attn_bias = attn_bias
 
   if causal and k.size(2) != q.size(2):
     kv_offset = k.size(2) - q.size(2)
@@ -112,7 +121,6 @@ def _aten_efficient_attn_backward(
     q_in, k_in, v_in = q, k, v
     o_in, lse_in, grad_out_in = o, lse, grad_out
 
-  attn_bias = None
   if attn_bias_mask is not None:
     attn_bias = torch.zeros(
       q.size(0),
@@ -123,6 +131,8 @@ def _aten_efficient_attn_backward(
       device=q.device,
     )
     attn_bias.masked_fill_(~attn_bias_mask.view(1, 1, q.size(2), k.size(2)), float("-inf"))
+  elif attn_bias is not None:
+    attn_bias = attn_bias.to(dtype=q_in.dtype)
 
   if group_size > 1:
     k_in = k_in.repeat_interleave(group_size, dim=1).contiguous()
@@ -131,7 +141,7 @@ def _aten_efficient_attn_backward(
   zero_u64 = torch.zeros(2, dtype=torch.uint64, device=q.device)
   philox_seed = zero_u64[0].unsqueeze(0)
   philox_offset = zero_u64[1].unsqueeze(0)
-  dq, dk_expanded, dv_expanded, _ = (
+  dq, dk_expanded, dv_expanded, grad_attn_bias = (
     torch.ops.aten._scaled_dot_product_efficient_attention_backward.default(
       grad_out_in,
       q_in,
@@ -143,13 +153,17 @@ def _aten_efficient_attn_backward(
       philox_seed,
       philox_offset,
       0.0,
-      (True, True, True, False),
+      (True, True, True, bool(return_attn_bias_grad and original_attn_bias is not None)),
       causal_for_op,
       scale=softmax_scale,
     )
   )
   dk, dv = _reduce_expanded_kv_grads(dk_expanded, dv_expanded, k, v, group_size)
-  return dq.to(q.dtype), dk, dv
+  if not return_attn_bias_grad or original_attn_bias is None:
+    grad_attn_bias = None
+  else:
+    grad_attn_bias = grad_attn_bias.to(original_attn_bias.dtype)
+  return dq.to(q.dtype), dk, dv, grad_attn_bias
 
 
 __all__ = ["_aten_efficient_attn_backward"]

@@ -41,6 +41,52 @@ import triton.language as tl
 
 from ._autotune_utils import bucket_autotune_seqlen
 
+
+def _attn_bias_broadcast_strides(
+  attn_bias: torch.Tensor | None,
+  batch: int,
+  nheads: int,
+  seqlen_q: int,
+  seqlen_k: int,
+) -> tuple[int, int, int, int]:
+  """Return strides for broadcasting a compact 4-D attention bias."""
+  if attn_bias is None:
+    return (0, 0, 0, 0)
+  return (
+    0 if attn_bias.size(0) == 1 and batch > 1 else attn_bias.stride(0),
+    0 if attn_bias.size(1) == 1 and nheads > 1 else attn_bias.stride(1),
+    0 if attn_bias.size(2) == 1 and seqlen_q > 1 else attn_bias.stride(2),
+    0 if attn_bias.size(3) == 1 and seqlen_k > 1 else attn_bias.stride(3),
+  )
+
+
+def _attn_bias_grad_needs_reduction(
+  grad_attn_bias: torch.Tensor | None,
+  batch: int,
+  nheads: int,
+  seqlen_q: int,
+  seqlen_k: int,
+) -> bool:
+  """Return whether broadcasted score gradients must be accumulated.
+
+  SDPA accepts broadcastable ``attn_mask`` shapes such as ``[Nq, Nkv]``,
+  ``[1, 1, Nq, Nkv]``, and ``[B, 1, Nq, Nkv]`` for logical scores with
+  shape ``[B, Hq, Nq, Nkv]``. When one of those compact dimensions broadcasts
+  to more than one score dimension, multiple ``dBias`` elements map back to
+  the same user mask element. The Triton kernel must therefore accumulate with
+  ``tl.atomic_add`` instead of using a plain ``tl.store``. A full
+  ``[B, Hq, Nq, Nkv]`` mask does not need this reduction and uses ``store``.
+  """
+  if grad_attn_bias is None:
+    return False
+  return any([
+    grad_attn_bias.size(0) == 1 and batch > 1,
+    grad_attn_bias.size(1) == 1 and nheads > 1,
+    grad_attn_bias.size(2) == 1 and seqlen_q > 1,
+    grad_attn_bias.size(3) == 1 and seqlen_k > 1,
+  ])
+
+
 # Preprocess: delta = rowsum(dO * O)
 # In full-D mode BLOCK_HEADDIM must cover the whole head dimension.  In
 # D_CHUNK mode the launcher/autotuner supplies the chunk size explicitly.
@@ -184,6 +230,8 @@ def ffpa_bwd_v1_kernel(
   DV: torch.Tensor,
   LSE: torch.Tensor,
   D: torch.Tensor,
+  AttnBias: torch.Tensor,
+  GradAttnBias: torch.Tensor,
   softmax_scale: float,
   stride_qm: int,
   stride_kn: int,
@@ -192,11 +240,18 @@ def ffpa_bwd_v1_kernel(
   stride_dqm: int,
   stride_dkn: int,
   stride_dvn: int,
+  stride_bm: int,
+  stride_bn: int,
+  stride_gbm: int,
+  stride_gbn: int,
   seqlen_q: int,
   seqlen_k: int,
   headdim: int,
   ATOMIC_ADD: tl.constexpr,
   IS_CAUSAL: tl.constexpr,
+  HAS_ATTN_BIAS: tl.constexpr,
+  BIAS_REQUIRES_GRAD: tl.constexpr,
+  GRAD_BIAS_NEEDS_REDUCTION: tl.constexpr,
   BLOCK_HEADDIM: tl.constexpr,
   DTYPE: tl.constexpr,
   EVEN_M: tl.constexpr,
@@ -265,13 +320,34 @@ def ffpa_bwd_v1_kernel(
       S = tl.where(offs_n[None, :] < seqlen_k, S, float("-inf"))
     if IS_CAUSAL:
       S = tl.where(offs_m_curr[:, None] >= (offs_n[None, :]), S, float("-inf"))
+    S = S * softmax_scale
+    if HAS_ATTN_BIAS:
+      bias = tl.load(
+        AttnBias + offs_m_curr[:, None] * stride_bm + offs_n[None, :] * stride_bn,
+        mask=(offs_m_curr[:, None] < seqlen_q) & (offs_n[None, :] < seqlen_k),
+        other=0.0,
+      )
+      S += bias
 
     lse_i = tl.load(LSE + offs_m_curr)
-    P = tl.exp(S * softmax_scale - lse_i[:, None])
+    P = tl.exp(S - lse_i[:, None])
 
     # ---- Phase 1c: dS = P * (dP - delta) * scale ----
     Di = tl.load(D + offs_m_curr)
-    dS = (P * (dP - Di[:, None]) * softmax_scale).to(DTYPE)
+    if BIAS_REQUIRES_GRAD:
+      dBias = P * (dP - Di[:, None])
+      grad_bias_ptrs = GradAttnBias + offs_m_curr[:, None] * stride_gbm + offs_n[None, :] * stride_gbn
+      grad_bias_mask = (offs_m_curr[:, None] < seqlen_q) & (offs_n[None, :] < seqlen_k)
+      if GRAD_BIAS_NEEDS_REDUCTION:
+        # Broadcastable SDPA masks such as [Nq, Nkv], [1, 1, Nq, Nkv], or
+        # [B, 1, Nq, Nkv] collapse multiple score gradients onto one compact
+        # mask element, so the write must accumulate instead of overwrite.
+        tl.atomic_add(grad_bias_ptrs, dBias, sem="relaxed", mask=grad_bias_mask)
+      else:
+        tl.store(grad_bias_ptrs, dBias, mask=grad_bias_mask)
+      dS = (dBias * softmax_scale).to(DTYPE)
+    else:
+      dS = (P * (dP - Di[:, None]) * softmax_scale).to(DTYPE)
 
     # ---- Phase 2: dQ, dK, dV per D chunk ----
     for d_chunk in range(num_d_chunks):
@@ -431,6 +507,8 @@ def _ffpa_bwd_v1_kernel_impl(
   DV: torch.Tensor,
   LSE: torch.Tensor,
   D: torch.Tensor,
+  AttnBias: torch.Tensor,
+  GradAttnBias: torch.Tensor,
   softmax_scale: float,
   stride_qb: int,
   stride_qh: int,
@@ -453,6 +531,14 @@ def _ffpa_bwd_v1_kernel_impl(
   stride_dvb: int,
   stride_dvh: int,
   stride_dvn: int,
+  stride_bb: int,
+  stride_bh: int,
+  stride_bm: int,
+  stride_bn: int,
+  stride_gbb: int,
+  stride_gbh: int,
+  stride_gbm: int,
+  stride_gbn: int,
   nheads: int,
   seqlen_q: int,
   seqlen_k: int,
@@ -465,6 +551,9 @@ def _ffpa_bwd_v1_kernel_impl(
   headdim: int,
   IS_CAUSAL: tl.constexpr,
   SEQUENCE_PARALLEL: tl.constexpr,
+  HAS_ATTN_BIAS: tl.constexpr,
+  BIAS_REQUIRES_GRAD: tl.constexpr,
+  GRAD_BIAS_NEEDS_REDUCTION: tl.constexpr,
   BLOCK_HEADDIM: tl.constexpr,
   DTYPE: tl.constexpr,
   EVEN_M: tl.constexpr,
@@ -485,6 +574,10 @@ def _ffpa_bwd_v1_kernel_impl(
   DV += off_b * stride_dvb + off_h * stride_dvh
   D += off_hb * seqlen_q_rounded
   LSE += off_hb * seqlen_q_rounded
+  if HAS_ATTN_BIAS:
+    AttnBias += off_b * stride_bb + off_h * stride_bh
+  if BIAS_REQUIRES_GRAD:
+    GradAttnBias += off_b * stride_gbb + off_h * stride_gbh
 
   if not SEQUENCE_PARALLEL:
     # Serial path: one program per (batch, head) iterates over all K-column
@@ -503,6 +596,8 @@ def _ffpa_bwd_v1_kernel_impl(
         DV,
         LSE,
         D,
+        AttnBias,
+        GradAttnBias,
         softmax_scale,
         stride_qm,
         stride_kn,
@@ -511,11 +606,18 @@ def _ffpa_bwd_v1_kernel_impl(
         stride_dqm,
         stride_dkn,
         stride_dvn,
+        stride_bm,
+        stride_bn,
+        stride_gbm,
+        stride_gbn,
         seqlen_q,
         seqlen_k,
         headdim,
         ATOMIC_ADD=False,
         IS_CAUSAL=IS_CAUSAL,
+        HAS_ATTN_BIAS=HAS_ATTN_BIAS,
+        BIAS_REQUIRES_GRAD=BIAS_REQUIRES_GRAD,
+        GRAD_BIAS_NEEDS_REDUCTION=GRAD_BIAS_NEEDS_REDUCTION,
         BLOCK_HEADDIM=BLOCK_HEADDIM,
         DTYPE=DTYPE,
         EVEN_M=EVEN_M,
@@ -540,6 +642,8 @@ def _ffpa_bwd_v1_kernel_impl(
       DV,
       LSE,
       D,
+      AttnBias,
+      GradAttnBias,
       softmax_scale,
       stride_qm,
       stride_kn,
@@ -548,11 +652,18 @@ def _ffpa_bwd_v1_kernel_impl(
       stride_dqm,
       stride_dkn,
       stride_dvn,
+      stride_bm,
+      stride_bn,
+      stride_gbm,
+      stride_gbn,
       seqlen_q,
       seqlen_k,
       headdim,
       ATOMIC_ADD=True,
       IS_CAUSAL=IS_CAUSAL,
+      HAS_ATTN_BIAS=HAS_ATTN_BIAS,
+      BIAS_REQUIRES_GRAD=BIAS_REQUIRES_GRAD,
+      GRAD_BIAS_NEEDS_REDUCTION=GRAD_BIAS_NEEDS_REDUCTION,
       BLOCK_HEADDIM=BLOCK_HEADDIM,
       DTYPE=DTYPE,
       EVEN_M=EVEN_M,
@@ -610,6 +721,8 @@ def _ffpa_bwd_v2_kernel_impl(
   DV: torch.Tensor,
   LSE: torch.Tensor,
   D: torch.Tensor,
+  AttnBias: torch.Tensor,
+  GradAttnBias: torch.Tensor,
   softmax_scale: float,
   stride_qb: int,
   stride_qh: int,
@@ -632,6 +745,14 @@ def _ffpa_bwd_v2_kernel_impl(
   stride_dvb: int,
   stride_dvh: int,
   stride_dvn: int,
+  stride_bb: int,
+  stride_bh: int,
+  stride_bm: int,
+  stride_bn: int,
+  stride_gbb: int,
+  stride_gbh: int,
+  stride_gbm: int,
+  stride_gbn: int,
   nheads: int,
   seqlen_q: int,
   seqlen_k: int,
@@ -643,6 +764,9 @@ def _ffpa_bwd_v2_kernel_impl(
   seqlen_q_rounded: int,
   headdim: int,
   IS_CAUSAL: tl.constexpr,
+  HAS_ATTN_BIAS: tl.constexpr,
+  BIAS_REQUIRES_GRAD: tl.constexpr,
+  GRAD_BIAS_NEEDS_REDUCTION: tl.constexpr,
   BLOCK_HEADDIM: tl.constexpr,
   DTYPE: tl.constexpr,
   EVEN_M: tl.constexpr,
@@ -665,6 +789,10 @@ def _ffpa_bwd_v2_kernel_impl(
   DV += off_b * stride_dvb + off_h * stride_dvh
   D += off_hb * seqlen_q_rounded
   LSE += off_hb * seqlen_q_rounded
+  if HAS_ATTN_BIAS:
+    AttnBias += off_b * stride_bb + off_h * stride_bh
+  if BIAS_REQUIRES_GRAD:
+    GradAttnBias += off_b * stride_gbb + off_h * stride_gbh
 
   num_d_chunks = tl.cdiv(headdim, BLOCK_HEADDIM)
 
@@ -715,10 +843,31 @@ def _ffpa_bwd_v2_kernel_impl(
         S = tl.where(offs_n[None, :] < seqlen_k, S, float("-inf"))
       if IS_CAUSAL:
         S = tl.where(offs_qm[:, None] >= (offs_n[None, :]), S, float("-inf"))
+      S = S * softmax_scale
+      if HAS_ATTN_BIAS:
+        bias = tl.load(
+          AttnBias + offs_qm[:, None] * stride_bm + offs_n[None, :] * stride_bn,
+          mask=(offs_qm[:, None] < seqlen_q) & (offs_n[None, :] < seqlen_k),
+          other=0.0,
+        )
+        S += bias
       lse_i = tl.load(LSE + offs_qm)
-      P = tl.exp(S * softmax_scale - lse_i[:, None])
+      P = tl.exp(S - lse_i[:, None])
       Di = tl.load(D + offs_qm)
-      dS = (P * (dP - Di[:, None]) * softmax_scale).to(DTYPE)
+      if BIAS_REQUIRES_GRAD:
+        dBias = P * (dP - Di[:, None])
+        grad_bias_ptrs = GradAttnBias + offs_qm[:, None] * stride_gbm + offs_n[None, :] * stride_gbn
+        grad_bias_mask = (offs_qm[:, None] < seqlen_q) & (offs_n[None, :] < seqlen_k)
+        if GRAD_BIAS_NEEDS_REDUCTION:
+          # Broadcastable SDPA masks such as [Nq, Nkv], [1, 1, Nq, Nkv], or
+          # [B, 1, Nq, Nkv] collapse multiple score gradients onto one compact
+          # mask element, so the write must accumulate instead of overwrite.
+          tl.atomic_add(grad_bias_ptrs, dBias, sem="relaxed", mask=grad_bias_mask)
+        else:
+          tl.store(grad_bias_ptrs, dBias, mask=grad_bias_mask)
+        dS = (dBias * softmax_scale).to(DTYPE)
+      else:
+        dS = (P * (dP - Di[:, None]) * softmax_scale).to(DTYPE)
 
       # --- Phase 2 for dK/dV ---
       for d_chunk in range(num_d_chunks):
@@ -791,8 +940,16 @@ def _ffpa_bwd_v2_kernel_impl(
         S_qk = tl.where(offs_nk[None, :] < seqlen_k, S_qk, float("-inf"))
       if IS_CAUSAL:
         S_qk = tl.where(offs_m[:, None] >= (offs_nk[None, :]), S_qk, float("-inf"))
+      S_qk = S_qk * softmax_scale
+      if HAS_ATTN_BIAS:
+        bias = tl.load(
+          AttnBias + offs_m[:, None] * stride_bm + offs_nk[None, :] * stride_bn,
+          mask=(offs_m[:, None] < seqlen_q) & (offs_nk[None, :] < seqlen_k),
+          other=0.0,
+        )
+        S_qk += bias
       lse_i = tl.load(LSE + offs_m)
-      P_qk = tl.exp(S_qk * softmax_scale - lse_i[:, None])
+      P_qk = tl.exp(S_qk - lse_i[:, None])
       Di = tl.load(D + offs_m)
       dS_qk = (P_qk * (dP_qk - Di[:, None]) * softmax_scale).to(DTYPE)
 
@@ -843,9 +1000,11 @@ def _ffpa_attn_backward_triton_impl(
   v: torch.Tensor,
   o: torch.Tensor,
   lse: torch.Tensor,
+  attn_bias: torch.Tensor | None,
   dq: torch.Tensor,
   dk: torch.Tensor,
   dv: torch.Tensor,
+  grad_attn_bias: torch.Tensor | None,
   causal: bool = False,
   softmax_scale: float | None = None,
   autotune: bool = False,
@@ -899,6 +1058,13 @@ def _ffpa_attn_backward_triton_impl(
   seqlen_q_rounded = lse.shape[-1]
   seqlen_q_bucket = bucket_autotune_seqlen(seqlen_q)
   seqlen_k_bucket = bucket_autotune_seqlen(seqlen_k)
+  has_attn_bias = attn_bias is not None
+  attn_bias_in = attn_bias if attn_bias is not None else q
+  bias_strides = _attn_bias_broadcast_strides(attn_bias, batch, nheads, seqlen_q, seqlen_k)
+  bias_requires_grad = grad_attn_bias is not None
+  grad_attn_bias_in = grad_attn_bias if grad_attn_bias is not None else q
+  grad_bias_strides = _attn_bias_broadcast_strides(grad_attn_bias, batch, nheads, seqlen_q, seqlen_k)
+  grad_bias_needs_reduction = _attn_bias_grad_needs_reduction(grad_attn_bias, batch, nheads, seqlen_q, seqlen_k)
 
   assert q.dtype == k.dtype == v.dtype == o.dtype == do.dtype
   assert q.dtype in (torch.float16, torch.bfloat16)
@@ -980,6 +1146,8 @@ def _ffpa_attn_backward_triton_impl(
         dv,
         lse,
         delta,
+        attn_bias_in,
+        grad_attn_bias_in,
         softmax_scale,
         q.stride(0),
         q.stride(1),
@@ -1002,6 +1170,14 @@ def _ffpa_attn_backward_triton_impl(
         dv.stride(0),
         dv.stride(1),
         dv.stride(2),
+        bias_strides[0],
+        bias_strides[1],
+        bias_strides[2],
+        bias_strides[3],
+        grad_bias_strides[0],
+        grad_bias_strides[1],
+        grad_bias_strides[2],
+        grad_bias_strides[3],
         nheads,
         seqlen_q,
         seqlen_k,
@@ -1010,6 +1186,9 @@ def _ffpa_attn_backward_triton_impl(
         seqlen_q_rounded,
         headdim,
         IS_CAUSAL=causal,
+        HAS_ATTN_BIAS=has_attn_bias,
+        BIAS_REQUIRES_GRAD=bias_requires_grad,
+        GRAD_BIAS_NEEDS_REDUCTION=grad_bias_needs_reduction,
         DTYPE=DTYPE,
       )
     else:
@@ -1023,6 +1202,8 @@ def _ffpa_attn_backward_triton_impl(
         dv,
         lse,
         delta,
+        attn_bias_in,
+        grad_attn_bias_in,
         softmax_scale,
         q.stride(0),
         q.stride(1),
@@ -1045,6 +1226,14 @@ def _ffpa_attn_backward_triton_impl(
         dv.stride(0),
         dv.stride(1),
         dv.stride(2),
+        bias_strides[0],
+        bias_strides[1],
+        bias_strides[2],
+        bias_strides[3],
+        grad_bias_strides[0],
+        grad_bias_strides[1],
+        grad_bias_strides[2],
+        grad_bias_strides[3],
         nheads,
         seqlen_q,
         seqlen_k,
@@ -1053,6 +1242,9 @@ def _ffpa_attn_backward_triton_impl(
         seqlen_q_rounded,
         headdim,
         IS_CAUSAL=causal,
+        HAS_ATTN_BIAS=has_attn_bias,
+        BIAS_REQUIRES_GRAD=bias_requires_grad,
+        GRAD_BIAS_NEEDS_REDUCTION=grad_bias_needs_reduction,
         DTYPE=DTYPE,
         BLOCK_M=128,
         BLOCK_N=64,
@@ -1076,6 +1268,8 @@ def _ffpa_attn_backward_triton_impl(
         dv,
         lse,
         delta,
+        attn_bias_in,
+        grad_attn_bias_in,
         softmax_scale,
         q.stride(0),
         q.stride(1),
@@ -1098,6 +1292,14 @@ def _ffpa_attn_backward_triton_impl(
         dv.stride(0),
         dv.stride(1),
         dv.stride(2),
+        bias_strides[0],
+        bias_strides[1],
+        bias_strides[2],
+        bias_strides[3],
+        grad_bias_strides[0],
+        grad_bias_strides[1],
+        grad_bias_strides[2],
+        grad_bias_strides[3],
         nheads,
         seqlen_q,
         seqlen_k,
@@ -1107,6 +1309,9 @@ def _ffpa_attn_backward_triton_impl(
         headdim,
         IS_CAUSAL=causal,
         SEQUENCE_PARALLEL=True,
+        HAS_ATTN_BIAS=has_attn_bias,
+        BIAS_REQUIRES_GRAD=bias_requires_grad,
+        GRAD_BIAS_NEEDS_REDUCTION=grad_bias_needs_reduction,
         DTYPE=DTYPE,
       )
     else:
@@ -1120,6 +1325,8 @@ def _ffpa_attn_backward_triton_impl(
         dv,
         lse,
         delta,
+        attn_bias_in,
+        grad_attn_bias_in,
         softmax_scale,
         q.stride(0),
         q.stride(1),
@@ -1142,6 +1349,14 @@ def _ffpa_attn_backward_triton_impl(
         dv.stride(0),
         dv.stride(1),
         dv.stride(2),
+        bias_strides[0],
+        bias_strides[1],
+        bias_strides[2],
+        bias_strides[3],
+        grad_bias_strides[0],
+        grad_bias_strides[1],
+        grad_bias_strides[2],
+        grad_bias_strides[3],
         nheads,
         seqlen_q,
         seqlen_k,
@@ -1151,6 +1366,9 @@ def _ffpa_attn_backward_triton_impl(
         headdim,
         IS_CAUSAL=causal,
         SEQUENCE_PARALLEL=True,
+        HAS_ATTN_BIAS=has_attn_bias,
+        BIAS_REQUIRES_GRAD=bias_requires_grad,
+        GRAD_BIAS_NEEDS_REDUCTION=grad_bias_needs_reduction,
         DTYPE=DTYPE,
         BLOCK_M=128,
         BLOCK_N=64,
@@ -1173,8 +1391,10 @@ def _ffpa_attn_backward_triton(
   autotune_mode: str = "fast",
   kernel_version: str = "v2",
   preprocess_d_chunk: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-  """Run the Triton FFPA backward path and return ``(dq, dk, dv)``.
+  attn_bias: torch.Tensor | None = None,
+  return_attn_bias_grad: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
+  """Run the Triton FFPA backward path and return ``(dq, dk, dv, d_attn_bias)``.
 
   This is the backend-facing wrapper used by
   ``FFPAAttnFunc.backward(backward_backend="triton")``. It owns the
@@ -1205,9 +1425,14 @@ def _ffpa_attn_backward_triton(
   :param kernel_version: Triton backward kernel variant to dispatch.
   :param preprocess_d_chunk: Whether to split the preprocess delta reduction
     across head-dim chunks.
-  :returns: ``(dq, dk, dv)`` where ``dq`` has shape ``[B, Nh_q, Nq, D]`` and
+  :param attn_bias: Optional additive attention bias broadcast to
+    ``[B, Nh_q, Nq, Nkv]``.
+  :param return_attn_bias_grad: Whether to materialize the expanded additive
+    mask gradient for autograd.
+  :returns: ``(dq, dk, dv, d_attn_bias)`` where ``dq`` has shape ``[B, Nh_q, Nq, D]`` and
     ``dk`` / ``dv`` have shape ``[B, Nh_kv, Nkv, D]``. Returned tensors use
-    the original ``q`` / ``k`` / ``v`` dtypes and head layouts.
+    the original ``q`` / ``k`` / ``v`` dtypes and head layouts. ``d_attn_bias``
+    is the expanded bias gradient when requested, otherwise ``None``.
   """
   seqlen_q = q.size(2)
   seqlen_q_rounded = ((seqlen_q + 127) // 128) * 128
@@ -1228,19 +1453,21 @@ def _ffpa_attn_backward_triton(
   else:
     k_in, v_in = k, v
 
-  dq, dk_expanded, dv_expanded = torch.ops.ffpa_attn._bwd_triton(
+  dq, dk_expanded, dv_expanded, grad_attn_bias = torch.ops.ffpa_attn._bwd_triton(
     grad_out.contiguous(),
     q.contiguous(),
     k_in.contiguous(),
     v_in.contiguous(),
     o.contiguous(),
     lse,
+    attn_bias,
     softmax_scale or (1.0 / math.sqrt(q.size(-1))),
     int(causal),
     int(autotune),
     int(autotune_mode == "max"),
     int(kernel_version == "v2"),
     int(preprocess_d_chunk),
+    int(return_attn_bias_grad and attn_bias is not None),
   )
 
   if group_size > 1:
@@ -1261,4 +1488,8 @@ def _ffpa_attn_backward_triton(
   else:
     dk = dk_expanded.to(k.dtype)
     dv = dv_expanded.to(v.dtype)
-  return dq.to(q.dtype), dk, dv
+  if grad_attn_bias.numel() == 0:
+    grad_attn_bias_out = None
+  else:
+    grad_attn_bias_out = grad_attn_bias
+  return dq.to(q.dtype), dk, dv, grad_attn_bias_out

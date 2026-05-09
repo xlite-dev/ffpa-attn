@@ -21,6 +21,7 @@ def _should_fallback_to_sdpa(
   key: torch.Tensor,
   attn_mask: torch.Tensor | None,
   dropout_p: float,
+  forward_backend: str,
 ) -> bool:
   """Return whether the public API should delegate to SDPA directly.
 
@@ -28,8 +29,8 @@ def _should_fallback_to_sdpa(
 
   * ``head_dim <= 256``
   * ``head_dim > 1024``
-  * ``attn_mask is not None``
   * ``dropout_p > 0.0``
+  * explicit ``attn_mask`` with a non-Triton large-D backend
   For now, as FFPA is mainly designed for prefill and may not outperform SDPA for short sequences.
   While Nq == 1 is a common case for decode attention and FFPA does support it by flash-decoding
   algorithm, the speedup over SDPA is not significant (~10% speedup).
@@ -47,8 +48,8 @@ def _should_fallback_to_sdpa(
   _fallback = any([
     D <= 256,
     D > 1024,
-    attn_mask is not None,
     dropout_p > 0.0,
+    attn_mask is not None and forward_backend != "triton",
     (Nq < 512 and Nq != 1),
     Nkv < 512,
   ])
@@ -65,9 +66,9 @@ def _normalize_inputs(
   scale: float | None,
   enable_gqa: bool,
   **kwargs: object,
-) -> FFPAAttnMeta:
-  """Validate and normalise all public-API inputs, returning a meta object."""
-  return FFPAAttnMeta.from_kwargs(**kwargs).normalize(
+) -> tuple[FFPAAttnMeta, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
+  """Validate public inputs and return ``FFPAAttnFunc.apply`` arguments."""
+  return FFPAAttnMeta.from_kwargs(**kwargs).normalize_inputs(
     query,
     key,
     value,
@@ -107,8 +108,9 @@ def ffpa_attn_func(
 
   Backward pass is supported via :class:`FFPAAttnFunc`. The public API falls
   back to SDPA for cases FFPA does not currently support directly (small-D,
-  ``D > 1024``, explicit ``attn_mask``, and dropout), and otherwise keeps the
-  existing FFPA forward plus SDPA/FFPA backward routing.
+  ``D > 1024``, and dropout), and otherwise keeps the
+  existing FFPA forward plus SDPA/FFPA backward routing. Large-D Triton forward
+  and backward support explicit additive ``attn_mask`` gradients.
   ``forward_backend`` only affects the large-D path.
 
   :param query: Query tensor with layout ``[B, Nh_q, Nq, D]``; dtype must be
@@ -119,8 +121,10 @@ def ffpa_attn_func(
   :param value: Value tensor with layout ``[B, Nh_kv, Nkv, D]``; same dtype
       as ``query``. ``key`` and ``value`` must share the same ``Nh_kv`` and
       ``Nkv``.
-  :param attn_mask: Optional attention mask (``[Nq, Nkv]`` bool or float).
-      Passing a non-``None`` value currently routes the call to SDPA.
+    :param attn_mask: Optional attention mask broadcastable to
+      ``[B, Nh_q, Nq, Nkv]``. Boolean masks follow SDPA semantics where
+      ``True`` means the element participates in attention; floating masks are
+      additive attention bias. Large-D Triton supports additive mask gradients.
   :param dropout_p: Dropout probability. Passing ``dropout_p > 0`` currently
       routes the call to SDPA because the FFPA native kernels do not yet
       implement dropout.
@@ -155,7 +159,8 @@ def ffpa_attn_func(
   :raises NotImplementedError: propagated from SDPA or FFPA backends for
       unsupported backend-specific combinations.
   """
-  if _should_fallback_to_sdpa(query, key, attn_mask, dropout_p):
+  forward_backend = str(kwargs.get("forward_backend", "triton"))
+  if _should_fallback_to_sdpa(query, key, attn_mask, dropout_p, forward_backend):
     # Fallback intentionally delegates to SDPA exactly as the user called it.
     # Do not synthesize masks or reinterpret GQA semantics here.
     # HACK: Use the native SDPA op directly to avoid recursive calls to this function
@@ -175,7 +180,7 @@ def ffpa_attn_func(
       enable_gqa=enable_gqa,
     )
 
-  _meta = _normalize_inputs(
+  _meta, query, key, value, attn_bias = _normalize_inputs(
     query,
     key,
     value,
@@ -187,7 +192,7 @@ def ffpa_attn_func(
     **kwargs,
   )
 
-  return FFPAAttnFunc.apply(query, key, value, _meta)
+  return FFPAAttnFunc.apply(query, key, value, attn_bias, _meta)
 
 
 __all__ = ["ffpa_attn_func"]

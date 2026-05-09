@@ -45,17 +45,17 @@ def _make_sdpa_kwargs(causal, Nq, Nkv):
   return {}
 
 
-def _sdpa_ref(q, k, v, causal, scale):
+def _sdpa_ref(q, k, v, causal, scale, attn_mask=None):
   """Run SDPA forward only (no grad) for output comparison."""
   group_size = q.size(1) // k.size(1)
   k2 = k.repeat_interleave(group_size, dim=1) if group_size > 1 else k
   v2 = v.repeat_interleave(group_size, dim=1) if group_size > 1 else v
-  kw = _make_sdpa_kwargs(causal, q.size(2), k.size(2))
+  kw = {"attn_mask": attn_mask} if attn_mask is not None else _make_sdpa_kwargs(causal, q.size(2), k.size(2))
   return F.scaled_dot_product_attention(q, k2, v2, scale=scale, **kw)
 
 
-def _sdpa_ref_grads(q, k, v, causal, scale):
-  """Run SDPA forward + backward and return (dq, dk, dv) from autograd.
+def _sdpa_ref_grads(q, k, v, causal, scale, attn_mask=None, return_mask_grad=False):
+  """Run SDPA forward + backward and return gradients from autograd.
 
     SDPA supports MQA (Nh_kv == 1) natively, but for general GQA
     (Nh_kv > 1, Nh_q > Nh_kv) we repeat K/V to match Q, then sum-reduce
@@ -64,12 +64,15 @@ def _sdpa_ref_grads(q, k, v, causal, scale):
   q2 = q.detach().clone().requires_grad_(True)
   k2 = k.detach().clone().requires_grad_(True)
   v2 = v.detach().clone().requires_grad_(True)
+  attn_mask_ref = None
+  if attn_mask is not None:
+    attn_mask_ref = attn_mask.detach().clone().requires_grad_(return_mask_grad)
 
   group_size = q.size(1) // k.size(1)
   k_in = k2.repeat_interleave(group_size, dim=1) if group_size > 1 else k2
   v_in = v2.repeat_interleave(group_size, dim=1) if group_size > 1 else v2
 
-  kw = _make_sdpa_kwargs(causal, q.size(2), k.size(2))
+  kw = {"attn_mask": attn_mask_ref} if attn_mask_ref is not None else _make_sdpa_kwargs(causal, q.size(2), k.size(2))
   out_ref = F.scaled_dot_product_attention(q2, k_in, v_in, scale=scale, **kw)
   loss_ref = out_ref.sum()
   loss_ref.backward()
@@ -82,6 +85,8 @@ def _sdpa_ref_grads(q, k, v, causal, scale):
     dk = k2.grad
     dv = v2.grad
 
+  if return_mask_grad:
+    return q2.grad, dk, dv, attn_mask_ref.grad
   return q2.grad, dk, dv
 
 
@@ -170,6 +175,74 @@ def test_ffpa_bwd_triton_preprocess_modes(dtype, preprocess_d_chunk):
   torch.testing.assert_close(q.grad, dq_ref, **tol)
   torch.testing.assert_close(k.grad, dk_ref, **tol)
   torch.testing.assert_close(v.grad, dv_ref, **tol)
+
+
+@pytest.mark.parametrize("kernel_version", ["v1", "v2"])
+def test_ffpa_bwd_triton_additive_attn_mask_matches_sdpa(kernel_version):
+  """Masked Triton backward must match SDPA, including additive-bias gradients."""
+  B, H, N, D = 1, 4, 512, 512
+  dtype = torch.float16
+  torch.manual_seed(0)
+  q = torch.randn(B, H, N, D, dtype=dtype, device="cuda", requires_grad=True)
+  k = torch.randn(B, H, N, D, dtype=dtype, device="cuda", requires_grad=True)
+  v = torch.randn(B, H, N, D, dtype=dtype, device="cuda", requires_grad=True)
+  attn_mask = (torch.randn(1, 1, N, N, dtype=dtype, device="cuda") * 0.25).requires_grad_(True)
+
+  scale = 1.0 / math.sqrt(D)
+  out = ffpa_attn_func(
+    q,
+    k,
+    v,
+    attn_mask=attn_mask,
+    scale=scale,
+    stages=2,
+    acc="f32",
+    backward_backend="triton",
+    triton_backward_version=kernel_version,
+  )
+  out.sum().backward()
+
+  dq_ref, dk_ref, dv_ref, dmask_ref = _sdpa_ref_grads(
+    q,
+    k,
+    v,
+    False,
+    scale,
+    attn_mask=attn_mask,
+    return_mask_grad=True,
+  )
+
+  torch.testing.assert_close(q.grad, dq_ref, atol=3e-2, rtol=3e-2)
+  torch.testing.assert_close(k.grad, dk_ref, atol=3e-2, rtol=3e-2)
+  torch.testing.assert_close(v.grad, dv_ref, atol=3e-2, rtol=3e-2)
+  torch.testing.assert_close(attn_mask.grad, dmask_ref, atol=3e-2, rtol=3e-2)
+
+
+def test_ffpa_bwd_triton_additive_attn_mask_only_grad_matches_sdpa():
+  """The Triton path must save context even when only additive mask needs grad."""
+  B, H, N, D = 1, 2, 512, 512
+  dtype = torch.float16
+  torch.manual_seed(0)
+  q = torch.randn(B, H, N, D, dtype=dtype, device="cuda")
+  k = torch.randn(B, H, N, D, dtype=dtype, device="cuda")
+  v = torch.randn(B, H, N, D, dtype=dtype, device="cuda")
+  attn_mask = (torch.randn(1, 1, N, N, dtype=dtype, device="cuda") * 0.25).requires_grad_(True)
+
+  scale = 1.0 / math.sqrt(D)
+  out = ffpa_attn_func(
+    q,
+    k,
+    v,
+    attn_mask=attn_mask,
+    scale=scale,
+    stages=2,
+    acc="f32",
+    backward_backend="triton",
+  )
+  out.sum().backward()
+
+  _, _, _, dmask_ref = _sdpa_ref_grads(q, k, v, False, scale, attn_mask=attn_mask, return_mask_grad=True)
+  torch.testing.assert_close(attn_mask.grad, dmask_ref, atol=3e-2, rtol=3e-2)
 
 
 # Basic backward correctness
