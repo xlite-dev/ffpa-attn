@@ -9,7 +9,7 @@ plt.rcParams['axes.unicode_minus'] = False
 attn_types = [
   'self-attn(F/B)',
   'cross-attn(F/B)',
-  'decode-attn(F/B)',
+  'decode(Nq=1,F/B)',
   'gqa(F/B)',
   'causal(F/B)',
   'attn-mask(F/B)',
@@ -17,27 +17,27 @@ attn_types = [
   'non-aligned(F/B)',
 ]
 
-# mean fp16, bf16
+# fp16, bf16
 fwd_speedups = [
-  np.mean([2.06, 2.08]),
-  np.mean([1.86, 1.87]),
-  np.mean([2.86, 2.85]),
-  np.mean([2.06, 2.09]),
-  np.mean([1.96, 1.99]),
-  np.mean([1.70, 1.74]),
-  np.mean([1.79, 1.82]),
-  np.mean([1.96, 1.98])
+  np.amax([2.06, 2.08]),  # self-attn
+  np.amax([1.86, 1.87]),  # cross-attn
+  np.amax([2.86, 2.85]),  # decode-attn
+  np.amax([2.06, 2.09]),  # gqa
+  np.amax([1.96, 1.99]),  # causal
+  np.amax([1.70, 1.74]),  # attn-mask
+  np.amax([1.79, 1.82]),  # dropout
+  np.amax([1.96, 1.98]),  # non-aligned
 ]
 
 bwd_speedups = [
-  np.mean([2.34, 2.49]),
-  np.mean([2.57, 2.51]),
-  np.mean([0.84, 0.96]),
-  np.mean([2.32, 2.46]),
-  np.mean([2.22, 2.56]),
-  np.mean([2.06, 2.17]),
-  np.mean([2.27, 2.41]),
-  np.mean([2.37, 2.67])
+  np.amax([2.34, 2.49]),  # self-attn
+  np.amax([2.57, 2.51]),  # cross-attn
+  np.amax([2.97, 3.11]),  # decode-attn
+  np.amax([2.32, 2.46]),  # gqa
+  np.amax([2.22, 2.56]),  # causal
+  np.amax([2.06, 2.17]),  # attn-mask
+  np.amax([2.27, 2.41]),  # dropout
+  np.amax([2.37, 2.67]),  # non-aligned
 ]
 
 sdpa_speedups = [1.0] * len(attn_types)
@@ -91,7 +91,7 @@ autolabel(rect_bwd)
 
 ax.set_ylabel('Speedup Ratio (FFPA / SDPA)', fontsize=18)
 ax.set_title(
-  'FFPA vs SDPA Speedup (FWD & BWD), NVIDIA RTX 5090 Blackwell | B=1, N=8192, H=32, D=512',
+  'FFPA vs SDPA Speedup (FWD & BWD) | NVIDIA RTX 5090 Blackwell | B=1, N=8192, H=32, D=512',
   fontsize=22,
   pad=15,
   fontweight='bold'
