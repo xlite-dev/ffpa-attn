@@ -27,13 +27,14 @@ def _should_fallback_to_sdpa(
 
   For now, as FFPA is mainly designed for prefill and may not outperform SDPA
   for short sequences. While Nq == 1 is a common case for decode attention and
-  FFPA does support it by flash-decoding algorithm, the speedup over SDPA is
-  not significant (~10% speedup). FFPA currently falls back to SDPA for the
-  following cases:
+  FFPA does support it by flash-decoding algorithm, the speedup over SDPA is may
+  not be significant (~10% speedup on Ada). FFPA currently falls back to SDPA for
+  the following cases:
 
   * ``head_dim <= 256``
   * ``head_dim > 1024``
   * ``dropout_p > 0.0`` when the large-D forward backend is not Triton
+  * ``attn_mask is not None`` when the large-D forward backend is not Triton
   * ``8 <= Nq < 512``
   * ``Nk < 512``
 
@@ -48,6 +49,7 @@ def _should_fallback_to_sdpa(
   _fallback = any([
     D <= 256,
     D > 1024,
+    # dropout is only supported by triton backend for now.
     dropout_p > 0.0 and forward_backend != "triton",
     # attn_mask is only supported by triton backend for now.
     attn_mask is not None and forward_backend != "triton",
