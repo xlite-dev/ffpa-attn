@@ -34,7 +34,7 @@ def _should_fallback_to_sdpa(
   * ``head_dim <= 256``
   * ``head_dim > 1024``
   * ``dropout_p > 0.0`` when the large-D forward backend is not Triton
-  * ``Nq < 512 && Nq != 1``
+  * ``8 <= Nq < 512``
   * ``Nk < 512``
 
   As FFPA grows support for these cases, remove the corresponding condition
@@ -51,7 +51,7 @@ def _should_fallback_to_sdpa(
     dropout_p > 0.0 and forward_backend != "triton",
     # attn_mask is only supported by triton backend for now.
     attn_mask is not None and forward_backend != "triton",
-    (Nq < 512 and Nq != 1),
+    (8 <= Nq < 512),
     Nkv < 512,
   ])
   return _fallback

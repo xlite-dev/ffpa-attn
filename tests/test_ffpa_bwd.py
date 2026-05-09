@@ -275,7 +275,7 @@ def test_ffpa_bwd_triton_additive_attn_mask_only_grad_matches_sdpa():
 )
 def test_ffpa_bwd_triton_decode_matches_sdpa(dtype, Nq, case):
   """Small-Nq Triton decode backward must match SDPA across modes."""
-  B, Hq, Hkv, Nkv, D = 1, 4, 4, 257, 64
+  B, Hq, Hkv, Nkv, D = 1, 2, 2, 513, 512
   causal = False
   attn_mask = None
   if case == "causal":
@@ -283,9 +283,9 @@ def test_ffpa_bwd_triton_decode_matches_sdpa(dtype, Nq, case):
   elif case == "mask":
     pass
   elif case == "gqa":
-    Hkv = 2
+    Hq, Hkv = 4, 2
   elif case == "d512":
-    Hq, Hkv, Nkv, D = 2, 2, 129, 512
+    Hq, Hkv, Nkv, D = 2, 2, 769, 512
 
   torch.manual_seed(7)
   q = torch.randn(B, Hq, Nq, D, dtype=dtype, device="cuda", requires_grad=True)
@@ -338,7 +338,7 @@ def test_ffpa_bwd_triton_decode_matches_sdpa(dtype, Nq, case):
 @pytest.mark.parametrize("Nq", [1, 4])
 def test_ffpa_bwd_triton_decode_autotune_matches_sdpa(Nq):
   """Decode backward stage1 autotune should preserve SDPA parity."""
-  B, H, Nkv, D = 1, 2, 129, 64
+  B, H, Nkv, D = 1, 2, 513, 512
   dtype = torch.float16
   torch.manual_seed(17 + Nq)
   q = torch.randn(B, H, Nq, D, dtype=dtype, device="cuda", requires_grad=True)

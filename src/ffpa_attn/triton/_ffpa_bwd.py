@@ -1110,7 +1110,7 @@ def _gen_decode_bwd_stage1_autotune_configs(
   block_n_candidates = [64, 128]
   if autotune_mode == "max":
     block_n_candidates.append(256)
-  block_m_candidates = [8] if use_gemv or autotune_mode == "fast" else [8, 16]
+  block_m_candidates = [8] if use_gemv else ([16] if autotune_mode == "fast" else [16, 32])
 
   configs = []
   for block_n in block_n_candidates:
@@ -1359,6 +1359,8 @@ def _ffpa_bwd_decode_stage1_kernel(
 
     lse_i = tl.load(LSE + offs_m, mask=mask_m, other=-float("inf"))
     P = tl.exp(scores - lse_i[:, None])
+    score_mask = mask_m[:, None] & mask_n[None, :]
+    P = tl.where(score_mask, P, 0.0)
     dropout_mult = _dropout_multiplier(
       off_hb,
       offs_m,
@@ -1374,6 +1376,7 @@ def _ffpa_bwd_decode_stage1_kernel(
     P_drop = P * dropout_mult
     delta_i = tl.load(D + offs_m, mask=mask_m, other=0.0)
     dBias = P * (dP - delta_i[:, None])
+    dBias = tl.where(score_mask, dBias, 0.0)
     dS = (dBias * softmax_scale).to(DTYPE)
 
     if BIAS_REQUIRES_GRAD:
@@ -1604,10 +1607,11 @@ def _ffpa_attn_backward_triton_impl(
 
   if seqlen_q < 8 and not has_dropout:
     use_gemv = seqlen_q == 1
-    block_m_decode = 8
+    block_m_decode = 8 if use_gemv else 16
     block_n_decode = 64 if use_gemv else 128
     block_headdim_decode = 64
-    num_k_blocks = triton.cdiv(seqlen_k, block_n_decode)
+    min_block_n_decode = 64 if autotune else block_n_decode
+    num_k_blocks = triton.cdiv(seqlen_k, min_block_n_decode)
     partial_dq = torch.empty(
       (batch, nheads, num_k_blocks, block_m_decode, headdim),
       dtype=torch.float32,
@@ -1617,10 +1621,7 @@ def _ffpa_attn_backward_triton_impl(
     def decode_grid(meta: dict) -> tuple[int, int]:
       return (triton.cdiv(seqlen_k, meta["BLOCK_N"]), batch * nheads)
 
-    decode_stage1_kernel = (
-      _get_decode_bwd_stage1_autotune(headdim, use_gemv, autotune_mode) if autotune else _ffpa_bwd_decode_stage1_kernel
-    )
-    decode_stage1_kernel[decode_grid](
+    decode_stage1_args = (
       q,
       k,
       v,
@@ -1672,6 +1673,8 @@ def _ffpa_attn_backward_triton_impl(
       headdim,
       dropout_p,
       philox_offset,
+    )
+    decode_stage1_meta = dict(
       IS_CAUSAL=causal,
       HAS_ATTN_BIAS=has_attn_bias,
       HAS_DROPOUT=has_dropout,
@@ -1680,32 +1683,43 @@ def _ffpa_attn_backward_triton_impl(
       GRAD_BIAS_NEEDS_REDUCTION=grad_bias_needs_reduction,
       DTYPE=DTYPE,
       USE_GEMV=use_gemv,
-      BLOCK_M=block_m_decode,
-      BLOCK_N=block_n_decode,
-      BLOCK_HEADDIM=block_headdim_decode,
-      num_warps=8,
-      num_stages=2,
     )
-    _ffpa_bwd_decode_dq_reduce_kernel[(triton.cdiv(headdim, block_headdim_decode), batch * nheads)](
-      partial_dq,
-      dq,
-      partial_dq.stride(0),
-      partial_dq.stride(1),
-      partial_dq.stride(2),
-      partial_dq.stride(3),
-      dq.stride(0),
-      dq.stride(1),
-      dq.stride(2),
-      nheads,
-      seqlen_q,
-      num_k_blocks,
-      headdim,
-      BLOCK_K=64,
-      BLOCK_M=block_m_decode,
-      BLOCK_HEADDIM=block_headdim_decode,
-      num_warps=8,
-      num_stages=2,
-    )
+    if autotune:
+      _get_decode_bwd_stage1_autotune(headdim, use_gemv, autotune_mode)[decode_grid](
+        *decode_stage1_args,
+        **decode_stage1_meta,
+      )
+    else:
+      _ffpa_bwd_decode_stage1_kernel[decode_grid](
+        *decode_stage1_args,
+        **decode_stage1_meta,
+        BLOCK_M=block_m_decode,
+        BLOCK_N=block_n_decode,
+        BLOCK_HEADDIM=block_headdim_decode,
+        num_warps=8,
+        num_stages=2,
+      )
+    _ffpa_bwd_decode_dq_reduce_kernel[
+      (triton.cdiv(headdim, block_headdim_decode), triton.cdiv(seqlen_q, block_m_decode), batch * nheads)](
+        partial_dq,
+        dq,
+        partial_dq.stride(0),
+        partial_dq.stride(1),
+        partial_dq.stride(2),
+        partial_dq.stride(3),
+        dq.stride(0),
+        dq.stride(1),
+        dq.stride(2),
+        nheads,
+        seqlen_q,
+        num_k_blocks,
+        headdim,
+        BLOCK_K=64,
+        BLOCK_M=block_m_decode,
+        BLOCK_HEADDIM=block_headdim_decode,
+        num_warps=8,
+        num_stages=2,
+      )
     return
 
   if kernel_version == "v2":
