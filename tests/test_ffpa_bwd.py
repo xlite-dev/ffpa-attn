@@ -268,13 +268,14 @@ def test_ffpa_bwd_triton_additive_attn_mask_only_grad_matches_sdpa():
 
 
 @pytest.mark.parametrize("dtype", DTYPES, ids=["fp16", "bf16"])
+@pytest.mark.parametrize("Nq", [1, 2, 3, 4, 7])
 @pytest.mark.parametrize(
   "case",
   ["base", "causal", "mask", "gqa", "d512"],
 )
-def test_ffpa_bwd_triton_decode_matches_sdpa(dtype, case):
-  """Nq=1 Triton decode backward must match SDPA across supported modes."""
-  B, Hq, Hkv, Nq, Nkv, D = 1, 4, 4, 1, 257, 64
+def test_ffpa_bwd_triton_decode_matches_sdpa(dtype, Nq, case):
+  """Small-Nq Triton decode backward must match SDPA across modes."""
+  B, Hq, Hkv, Nkv, D = 1, 4, 4, 257, 64
   causal = False
   attn_mask = None
   if case == "causal":
@@ -326,12 +327,43 @@ def test_ffpa_bwd_triton_decode_matches_sdpa(dtype, case):
   else:
     dq_ref, dk_ref, dv_ref, dmask_ref = ref
 
-  tol = {"atol": 8e-2, "rtol": 8e-2} if dtype == torch.bfloat16 else {"atol": 3e-2, "rtol": 3e-2}
+  tol = {"atol": 8e-2, "rtol": 8e-2} if dtype == torch.bfloat16 or (causal and Nq > 1) else {"atol": 3e-2, "rtol": 3e-2}
   torch.testing.assert_close(q.grad, dq_ref, **tol)
   torch.testing.assert_close(k.grad, dk_ref, **tol)
   torch.testing.assert_close(v.grad, dv_ref, **tol)
   if attn_mask is not None:
     torch.testing.assert_close(attn_mask.grad, dmask_ref, **tol)
+
+
+@pytest.mark.parametrize("Nq", [1, 4])
+def test_ffpa_bwd_triton_decode_autotune_matches_sdpa(Nq):
+  """Decode backward stage1 autotune should preserve SDPA parity."""
+  B, H, Nkv, D = 1, 2, 129, 64
+  dtype = torch.float16
+  torch.manual_seed(17 + Nq)
+  q = torch.randn(B, H, Nq, D, dtype=dtype, device="cuda", requires_grad=True)
+  k = torch.randn(B, H, Nkv, D, dtype=dtype, device="cuda", requires_grad=True)
+  v = torch.randn(B, H, Nkv, D, dtype=dtype, device="cuda", requires_grad=True)
+  grad_out = torch.randn_like(q)
+
+  scale = 1.0 / math.sqrt(D)
+  out = ffpa_attn_func(
+    q,
+    k,
+    v,
+    scale=scale,
+    stages=2,
+    acc="f32",
+    backward_backend="triton",
+    triton_backward_version="v2",
+    triton_backward_autotune=True,
+  )
+  out.backward(grad_out)
+
+  dq_ref, dk_ref, dv_ref = _sdpa_ref_grads(q, k, v, False, scale, grad_out=grad_out)
+  torch.testing.assert_close(q.grad, dq_ref, atol=3e-2, rtol=3e-2)
+  torch.testing.assert_close(k.grad, dk_ref, atol=3e-2, rtol=3e-2)
+  torch.testing.assert_close(v.grad, dv_ref, atol=3e-2, rtol=3e-2)
 
 
 @pytest.mark.parametrize("kernel_version", ["v1", "v2"])

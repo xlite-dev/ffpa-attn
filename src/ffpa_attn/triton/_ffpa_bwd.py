@@ -1605,7 +1605,7 @@ def _ffpa_attn_backward_triton_impl(
   if seqlen_q < 8 and not has_dropout:
     use_gemv = seqlen_q == 1
     block_m_decode = 8
-    block_n_decode = 64
+    block_n_decode = 64 if use_gemv else 128
     block_headdim_decode = 64
     num_k_blocks = triton.cdiv(seqlen_k, block_n_decode)
     partial_dq = torch.empty(
@@ -1708,8 +1708,6 @@ def _ffpa_attn_backward_triton_impl(
     )
     return
 
-  # TODO: May force use v1 for short seqlen where atomics are not a
-  # bottleneck and v2 overhead would dominate.
   if kernel_version == "v2":
     # v2: shared-pid split-D, grid = (max(K-blocks, Q-blocks), 1, B*Nh).
     # pid serves as both K-col block index and Q-row block index.
