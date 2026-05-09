@@ -254,22 +254,23 @@ def main() -> None:
       D=D,
       causal=True,
     )
-    mask_n = max(N, 512)
-    _run_case(
-      "attn-mask",
-      dtype,
-      args.forward_backend,
-      args.triton_forward_autotune,
-      args.triton_autotune_mode,
-      seed=args.seed,
-      B=args.B,
-      Nh_q=32,
-      Nh_kv=32,
-      Nq=mask_n,
-      Nkv=mask_n,
-      D=D,
-      attn_mask=_make_broadcast_additive_attn_mask(mask_n, mask_n, dtype, args.seed),
-    )
+    if args.forward_backend != "cuda":
+      mask_n = max(N, 512)
+      _run_case(
+        "attn-mask",
+        dtype,
+        args.forward_backend,
+        args.triton_forward_autotune,
+        args.triton_autotune_mode,
+        seed=args.seed,
+        B=args.B,
+        Nh_q=32,
+        Nh_kv=32,
+        Nq=mask_n,
+        Nkv=mask_n,
+        D=D,
+        attn_mask=_make_broadcast_additive_attn_mask(mask_n, mask_n, dtype, args.seed),
+      )
     _run_case(
       "non-aligned",
       dtype,

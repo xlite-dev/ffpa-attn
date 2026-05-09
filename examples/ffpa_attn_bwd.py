@@ -324,7 +324,7 @@ def _run_case(
     ms_sdpa = _time_fn(_run_sdpa_backward, q, k, v, scale, causal, attn_mask)
 
   dt_tag = str(dtype).replace("torch.", "")
-  dmask_msg = ""
+  dmask_msg = "dMask_err=(NO Grad)  "
   if dmask_ffpa is not None and dmask_ref is not None:
     dmask_msg = f"dMask_err={(dmask_ffpa - dmask_ref).abs().max().item():.4e}  "
   print(
@@ -424,23 +424,24 @@ def main() -> None:
       causal=True,
       timing_mode=args.timing_mode,
     )
-    mask_n = max(N, 512)
-    _run_case(
-      "attn-mask",
-      dtype,
-      args.backward_backend,
-      args.triton_backward_autotune,
-      args.triton_autotune_mode,
-      seed=args.seed,
-      B=args.B,
-      Nh_q=32,
-      Nh_kv=32,
-      Nq=mask_n,
-      Nkv=mask_n,
-      D=D,
-      attn_mask=_make_broadcast_additive_attn_mask(mask_n, mask_n, dtype, args.seed),
-      timing_mode=args.timing_mode,
-    )
+    if args.backward_backend != "cuda":
+      mask_n = max(N, 512)
+      _run_case(
+        "attn-mask",
+        dtype,
+        args.backward_backend,
+        args.triton_backward_autotune,
+        args.triton_autotune_mode,
+        seed=args.seed,
+        B=args.B,
+        Nh_q=32,
+        Nh_kv=32,
+        Nq=mask_n,
+        Nkv=mask_n,
+        D=D,
+        attn_mask=_make_broadcast_additive_attn_mask(mask_n, mask_n, dtype, args.seed),
+        timing_mode=args.timing_mode,
+      )
     _run_case(
       "non-aligned",
       dtype,
