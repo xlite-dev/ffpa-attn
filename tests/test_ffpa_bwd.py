@@ -300,7 +300,7 @@ def test_ffpa_bwd_triton_decode_matches_sdpa(dtype, Nq, case):
     q,
     k,
     v,
-    causal=causal,
+    is_causal=causal,
     attn_mask=attn_mask,
     scale=scale,
     stages=2,
@@ -714,7 +714,7 @@ def test_ffpa_bwd_cross_attention(dtype, Nq, Nkv, D):
 
 
 @pytest.mark.parametrize("dtype", DTYPES, ids=["fp16", "bf16"])
-@pytest.mark.parametrize("Nq,Nkv,D", [(256, 4096, 320), (128, 8192, 512)])
+@pytest.mark.parametrize("Nq,Nkv,D", [(512, 4096, 320), (512, 8192, 512)])
 def test_ffpa_bwd_sdpa_backend_causal_cross_attention(dtype, Nq, Nkv, D):
   """The SDPA backward backend must preserve causal cross-attention gradients."""
   B, H = 1, 8
