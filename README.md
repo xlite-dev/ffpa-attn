@@ -10,9 +10,9 @@
 
 <div align='center'>
 
-|[Self Attn](./examples)| [GQA/MQA](./examples) |[Cross Attn](./examples)|[Causal Attn](./examples)|[Headdim](#ffpa-design)|[Forward↑](./examples)|[Backward↑](./examples)|
+|[Self Attn](./examples)| [GQA/MQA](./examples) |[Cross Attn](./examples)|[Causal/Mask](./examples)|[Headdim](#ffpa-design)|[Forward↑](./examples)|[Backward↑](./examples)|
 |:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-|✔️(`Nq=Nkv`)|✔️(`Hq!=Hkv`)|✔️(`Nq!=Nkv`)|✔️(`causal`)|**320~1024** |**1.8~3x↑🎉** |**1.5~2.5x↑🎉** |
+|✔️(`Nq=Nkv`)|✔️(`Hq!=Hkv`)|✔️(`Nq!=Nkv`)|✔️(`attn_mask`)|**320~1024** |**1.8~3x↑** |**1.5~2.5x↑** |
 
 </div>
 
@@ -30,7 +30,7 @@ git clone https://github.com/xlite-dev/ffpa-attn.git
 # Then, build the wheel package (Triton backend only)
 cd ffpa-attn && pip3 install -e . --no-build-isolation
 # Optional: build the whl with Triton and CUDA backends
-ENABLE_FFPA_FWD_CUDA_IMPL=1 && MAX_JOBS=32 pip3 install -e .
+ENABLE_FFPA_FWD_CUDA_IMPL=1 MAX_JOBS=8 pip3 install -e .
 ```
 
 Then, try to accelerate the attention for large headdim with just <i><b>one-line</b></i> of code:
@@ -38,10 +38,8 @@ Then, try to accelerate the attention for large headdim with just <i><b>one-line
 ```python
 >>> import torch.nn.functional as F
 >>> from ffpa_attn import ffpa_attn_func
->>> # Monkey-patch SDPA to point to FFPA attention. Every thing that
->>> # FFPA does not support will automatically fallback to SDPA. For
->>> # example, if the user calls SDPA with headdim <= 256 or > 1024,
->>> # attn_mask not None, dropout_p > 0.0, and N < 512, etc.
+>>> # Monkey-patch SDPA to point to FFPA. Every thing that FFPA
+>>> # does not support will auto fallback to SDPA: D <= 256, etc.
 >>> F.scaled_dot_product_attention = ffpa_attn_func # one-line code
 ```
 

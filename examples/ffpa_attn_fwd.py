@@ -64,8 +64,21 @@ def _parse_args() -> argparse.Namespace:
   return parser.parse_args()
 
 
-def _sdpa_ref(q, k, v, is_causal: bool = False):
-  return F.scaled_dot_product_attention(q, k, v, scale=1.0 / math.sqrt(q.size(-1)), is_causal=is_causal)
+def _sdpa_ref(q, k, v, is_causal: bool = False, attn_mask: torch.Tensor | None = None):
+  return F.scaled_dot_product_attention(
+    q,
+    k,
+    v,
+    attn_mask=attn_mask,
+    scale=1.0 / math.sqrt(q.size(-1)),
+    is_causal=is_causal,
+  )
+
+
+def _make_broadcast_additive_attn_mask(nq: int, nkv: int, dtype: torch.dtype, seed: int) -> torch.Tensor:
+  """Build a broadcastable additive attention bias for SDPA/FFPA."""
+  torch.manual_seed(seed + 1)
+  return torch.randn(1, 1, nq, nkv, dtype=dtype, device="cuda") * 0.25
 
 
 def _time_fn(fn, *args, warmup: int = WARMUP, iters: int = ITERS) -> float:
@@ -102,6 +115,7 @@ def _run_case(
   Nkv: int,
   D: int,
   causal: bool = False,
+  attn_mask: torch.Tensor | None = None,
   acc: str = "f32",
 ) -> None:
   torch.manual_seed(seed)
@@ -115,6 +129,7 @@ def _run_case(
     v,
     stages=STAGES,
     acc=acc,
+    attn_mask=attn_mask,
     is_causal=causal,
     enable_gqa=Nh_q != Nh_kv,
     forward_backend=forward_backend,
@@ -122,7 +137,7 @@ def _run_case(
     triton_autotune_mode=triton_autotune_mode,
   )
   k_ref, v_ref = _expand_kv(k, v, Nh_q)
-  out_sdpa = _sdpa_ref(q, k_ref, v_ref, is_causal=causal)
+  out_sdpa = _sdpa_ref(q, k_ref, v_ref, is_causal=causal, attn_mask=attn_mask)
 
   diff = (out_ffpa.float() - out_sdpa.float()).abs()
   tol = 5e-2 if dtype == torch.bfloat16 else 2e-2
@@ -135,6 +150,7 @@ def _run_case(
       v,
       stages=STAGES,
       acc=acc,
+      attn_mask=attn_mask,
       is_causal=causal,
       enable_gqa=Nh_q != Nh_kv,
       forward_backend=forward_backend,
@@ -145,7 +161,7 @@ def _run_case(
     k,
     v,
   )
-  ms_sdpa = _time_fn(lambda q, k, v: _sdpa_ref(q, k, v, is_causal=causal), q, k_ref, v_ref)
+  ms_sdpa = _time_fn(lambda q, k, v: _sdpa_ref(q, k, v, is_causal=causal, attn_mask=attn_mask), q, k_ref, v_ref)
 
   dt_tag = str(dtype).replace("torch.", "")
   print(
@@ -238,6 +254,23 @@ def main() -> None:
       D=D,
       causal=True,
     )
+    if args.forward_backend != "cuda":
+      mask_n = max(N, 512)
+      _run_case(
+        "attn-mask",
+        dtype,
+        args.forward_backend,
+        args.triton_forward_autotune,
+        args.triton_autotune_mode,
+        seed=args.seed,
+        B=args.B,
+        Nh_q=32,
+        Nh_kv=32,
+        Nq=mask_n,
+        Nkv=mask_n,
+        D=D,
+        attn_mask=_make_broadcast_additive_attn_mask(mask_n, mask_n, dtype, args.seed),
+      )
     _run_case(
       "non-aligned",
       dtype,

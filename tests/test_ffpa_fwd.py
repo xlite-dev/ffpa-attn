@@ -39,8 +39,8 @@ CORRECTNESS_SHAPES = [
 DISPATCH_SHAPES = [(1, H, 1024, D) for H, D in itertools.product(HEADNUMS, HEADDIMS)]
 
 
-def _sdpa_ref(Q, K, V):
-  return F.scaled_dot_product_attention(Q, K, V, scale=1.0 / math.sqrt(Q.size(-1)))
+def _sdpa_ref(Q, K, V, attn_mask=None):
+  return F.scaled_dot_product_attention(Q, K, V, attn_mask=attn_mask, scale=1.0 / math.sqrt(Q.size(-1)))
 
 
 def _tolerance(dtype):
@@ -149,7 +149,7 @@ def test_ffpa_attn_func_small_d_routes_to_flash_attention(monkeypatch, forward_b
     offset = torch.zeros(1, device=q_in.device, dtype=torch.int64)
     return out, lse, seed, offset
 
-  monkeypatch.setattr(ffpa_attn_functional, "_ffpa_attn_forward_cuda", _unexpected_backend)
+  monkeypatch.setattr(ffpa_attn_functional, "_require_cuda_forward_impl", lambda: _unexpected_backend)
   monkeypatch.setattr(ffpa_attn_functional, "_ffpa_attn_forward_triton", _unexpected_backend)
   monkeypatch.setattr(ffpa_attn_functional, "_aten_flash_attn_forward", _fake_flash)
 
@@ -158,20 +158,24 @@ def test_ffpa_attn_func_small_d_routes_to_flash_attention(monkeypatch, forward_b
   torch.testing.assert_close(out, _sdpa_ref(q, k, v), **_tolerance(torch.float16))
 
 
-def test_ffpa_attn_func_attn_mask_falls_back_to_sdpa(monkeypatch):
-  q, k, v = _alloc_qkv(1, 4, 128, 512, torch.float16)
+def test_ffpa_attn_func_triton_bool_attn_mask_matches_sdpa():
+  q, k, v = _alloc_qkv(1, 4, 512, 512, torch.float16)
   row_idx = torch.arange(q.size(2), device=q.device).view(-1, 1)
   col_idx = torch.arange(k.size(2), device=k.device).view(1, -1)
   attn_mask = col_idx <= row_idx
 
-  def _unexpected_backend(*args, **kwargs):
-    raise AssertionError("attn_mask fallback should not dispatch to FFPA forward")
-
-  monkeypatch.setattr(ffpa_attn_functional, "_ffpa_attn_forward_cuda", _unexpected_backend)
-  monkeypatch.setattr(ffpa_attn_functional, "_ffpa_attn_forward_triton", _unexpected_backend)
-
-  out = ffpa_attn_func(q, k, v, attn_mask=attn_mask, stages=2, acc="f32")
+  out = ffpa_attn_func(q, k, v, attn_mask=attn_mask, stages=2, acc="f32", forward_backend="triton")
   ref = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, scale=1.0 / math.sqrt(q.size(-1)))
+  torch.testing.assert_close(out, ref, **_tolerance(torch.float16))
+
+
+def test_ffpa_attn_func_triton_additive_attn_mask_matches_sdpa():
+  q, k, v = _alloc_qkv(1, 4, 512, 512, torch.float16)
+  torch.manual_seed(1)
+  attn_mask = torch.randn(1, 1, q.size(2), k.size(2), device=q.device, dtype=q.dtype) * 0.25
+
+  out = ffpa_attn_func(q, k, v, attn_mask=attn_mask, stages=2, acc="f32", forward_backend="triton")
+  ref = _sdpa_ref(q, k, v, attn_mask=attn_mask)
   torch.testing.assert_close(out, ref, **_tolerance(torch.float16))
 
 
@@ -181,7 +185,7 @@ def test_ffpa_attn_func_dropout_falls_back_to_sdpa(monkeypatch):
   def _unexpected_backend(*args, **kwargs):
     raise AssertionError("dropout fallback should not dispatch to FFPA forward")
 
-  monkeypatch.setattr(ffpa_attn_functional, "_ffpa_attn_forward_cuda", _unexpected_backend)
+  monkeypatch.setattr(ffpa_attn_functional, "_require_cuda_forward_impl", lambda: _unexpected_backend)
   monkeypatch.setattr(ffpa_attn_functional, "_ffpa_attn_forward_triton", _unexpected_backend)
 
   torch.manual_seed(0)
@@ -197,7 +201,7 @@ def test_ffpa_attn_func_too_large_d_falls_back_to_sdpa(monkeypatch):
   def _unexpected_backend(*args, **kwargs):
     raise AssertionError("D > 1024 fallback should not dispatch to FFPA forward")
 
-  monkeypatch.setattr(ffpa_attn_functional, "_ffpa_attn_forward_cuda", _unexpected_backend)
+  monkeypatch.setattr(ffpa_attn_functional, "_require_cuda_forward_impl", lambda: _unexpected_backend)
   monkeypatch.setattr(ffpa_attn_functional, "_ffpa_attn_forward_triton", _unexpected_backend)
 
   out = ffpa_attn_func(q, k, v, stages=2, acc="f32")
@@ -207,7 +211,7 @@ def test_ffpa_attn_func_too_large_d_falls_back_to_sdpa(monkeypatch):
 
 @pytest.mark.parametrize("forward_backend", ["cuda", "triton"])
 def test_ffpa_attn_func_large_d_keeps_selected_backend(monkeypatch, forward_backend):
-  q, k, v = _alloc_qkv(1, 4, 64, 320, torch.float16)
+  q, k, v = _alloc_qkv(1, 4, 512, 320, torch.float16)
   called = {"cuda": 0, "triton": 0}
 
   def _fake_cuda(q_in, k_in, v_in, o_in, stages, acc, causal, softmax_scale, tma):
@@ -217,8 +221,8 @@ def test_ffpa_attn_func_large_d_keeps_selected_backend(monkeypatch, forward_back
     lse = torch.zeros(q_in.size(0), q_in.size(1), q_in.size(2), device=q_in.device)
     return out, lse
 
-  def _fake_triton(q_in, k_in, v_in, o_in, causal, softmax_scale, autotune):
-    del o_in, causal, softmax_scale, autotune
+  def _fake_triton(q_in, k_in, v_in, o_in, causal, softmax_scale, autotune, autotune_mode, attn_bias):
+    del o_in, causal, softmax_scale, autotune, autotune_mode, attn_bias
     called["triton"] += 1
     out = q_in + k_in + v_in
     lse = torch.zeros(q_in.size(0), q_in.size(1), q_in.size(2), device=q_in.device)
@@ -227,7 +231,7 @@ def test_ffpa_attn_func_large_d_keeps_selected_backend(monkeypatch, forward_back
   def _unexpected_flash(*args, **kwargs):
     raise AssertionError("large-D should not route to aten flash forward")
 
-  monkeypatch.setattr(ffpa_attn_functional, "_ffpa_attn_forward_cuda", _fake_cuda)
+  monkeypatch.setattr(ffpa_attn_functional, "_require_cuda_forward_impl", lambda: _fake_cuda)
   monkeypatch.setattr(ffpa_attn_functional, "_ffpa_attn_forward_triton", _fake_triton)
   monkeypatch.setattr(ffpa_attn_functional, "_aten_flash_attn_forward", _unexpected_flash)
 
@@ -246,8 +250,8 @@ def test_ffpa_attn_func_large_d_defaults_to_triton(monkeypatch):
     called["cuda"] += 1
     raise AssertionError("default large-D path should not use CUDA forward")
 
-  def _fake_triton(q_in, k_in, v_in, o_in, causal, softmax_scale, autotune):
-    del o_in, causal, softmax_scale, autotune
+  def _fake_triton(q_in, k_in, v_in, o_in, causal, softmax_scale, autotune, autotune_mode, attn_bias):
+    del o_in, causal, softmax_scale, autotune, autotune_mode, attn_bias
     called["triton"] += 1
     out = q_in + k_in + v_in
     lse = torch.zeros(q_in.size(0), q_in.size(1), q_in.size(2), device=q_in.device)

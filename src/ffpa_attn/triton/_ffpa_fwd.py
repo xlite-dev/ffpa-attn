@@ -21,6 +21,25 @@ import triton.language as tl
 
 from ._autotune_utils import bucket_autotune_seqlen
 
+
+def _attn_bias_broadcast_strides(
+  attn_bias: torch.Tensor | None,
+  batch: int,
+  nheads: int,
+  seqlen_q: int,
+  seqlen_k: int,
+) -> tuple[int, int, int, int]:
+  """Return strides for broadcasting a compact 4-D attention bias."""
+  if attn_bias is None:
+    return (0, 0, 0, 0)
+  return (
+    0 if attn_bias.size(0) == 1 and batch > 1 else attn_bias.stride(0),
+    0 if attn_bias.size(1) == 1 and nheads > 1 else attn_bias.stride(1),
+    0 if attn_bias.size(2) == 1 and seqlen_q > 1 else attn_bias.stride(2),
+    0 if attn_bias.size(3) == 1 and seqlen_k > 1 else attn_bias.stride(3),
+  )
+
+
 _MAX_HEADDIM = 1024
 
 
@@ -256,6 +275,7 @@ def _ffpa_fwd_kernel_impl(
   V: torch.Tensor,
   O: torch.Tensor,
   LSE: torch.Tensor,
+  AttnBias: torch.Tensor,
   softmax_scale: float,
   stride_qb: int,
   stride_qh: int,
@@ -269,6 +289,10 @@ def _ffpa_fwd_kernel_impl(
   stride_ob: int,
   stride_oh: int,
   stride_om: int,
+  stride_bb: int,
+  stride_bh: int,
+  stride_bm: int,
+  stride_bn: int,
   nheads_q: int,
   nheads_kv: int,
   seqlen_q: int,
@@ -280,6 +304,7 @@ def _ffpa_fwd_kernel_impl(
   seqlen_k_bucket: int,
   seqlen_q_rounded: int,
   IS_CAUSAL: tl.constexpr,
+  HAS_ATTN_BIAS: tl.constexpr,
   DTYPE: tl.constexpr,
   HEADDIM: tl.constexpr,
   EVEN_M: tl.constexpr,
@@ -303,6 +328,8 @@ def _ffpa_fwd_kernel_impl(
   V += off_b * stride_vb + off_hkv * stride_vh
   O += off_b * stride_ob + off_hq * stride_oh
   LSE += off_hb * seqlen_q_rounded
+  if HAS_ATTN_BIAS:
+    AttnBias += off_b * stride_bb + off_hq * stride_bh
 
   offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
   offs_n = tl.arange(0, BLOCK_N)
@@ -348,6 +375,13 @@ def _ffpa_fwd_kernel_impl(
       scores = tl.dot(q, tl.trans(k), acc=scores)
 
     scores = scores * softmax_scale
+    if HAS_ATTN_BIAS:
+      bias = tl.load(
+        AttnBias + offs_m[:, None] * stride_bm + offs_kv[None, :] * stride_bn,
+        mask=(offs_m[:, None] < seqlen_q) & (offs_kv[None, :] < seqlen_k),
+        other=0.0,
+      )
+      scores += bias
     if not EVEN_N:
       scores = tl.where(offs_kv[None, :] < seqlen_k, scores, -float("inf"))
     if IS_CAUSAL:
@@ -394,6 +428,7 @@ def _ffpa_decode_fwd_stage1_kernel(
   V: torch.Tensor,
   PartialOut: torch.Tensor,
   ChunkLSE: torch.Tensor,
+  AttnBias: torch.Tensor,
   softmax_scale: float,
   stride_qb: int,
   stride_qh: int,
@@ -412,6 +447,10 @@ def _ffpa_decode_fwd_stage1_kernel(
   stride_lh: int,
   stride_lc: int,
   stride_lm: int,
+  stride_bb: int,
+  stride_bh: int,
+  stride_bm: int,
+  stride_bn: int,
   nheads_q: int,
   nheads_kv: int,
   seqlen_q: int,
@@ -422,6 +461,7 @@ def _ffpa_decode_fwd_stage1_kernel(
   seqlen_q_bucket: int,
   seqlen_k_bucket: int,
   IS_CAUSAL: tl.constexpr,
+  HAS_ATTN_BIAS: tl.constexpr,
   USE_GEMV: tl.constexpr,
   DTYPE: tl.constexpr,
   HEADDIM: tl.constexpr,
@@ -445,6 +485,8 @@ def _ffpa_decode_fwd_stage1_kernel(
   V += off_b * stride_vb + off_hkv * stride_vh
   PartialOut += off_b * stride_pb + off_hq * stride_ph + chunk_idx * stride_pc
   ChunkLSE += off_b * stride_lb + off_hq * stride_lh + chunk_idx * stride_lc
+  if HAS_ATTN_BIAS:
+    AttnBias += off_b * stride_bb + off_hq * stride_bh
 
   chunk_start = chunk_idx * CHUNK_SIZE
   chunk_end = tl.minimum(seqlen_k, chunk_start + CHUNK_SIZE)
@@ -485,6 +527,13 @@ def _ffpa_decode_fwd_stage1_kernel(
 
       scores = tl.sum(scores, axis=0)
       scores = scores * softmax_scale
+      if HAS_ATTN_BIAS:
+        bias = tl.load(
+          AttnBias + (q_block * BLOCK_M) * stride_bm + offs_kv * stride_bn,
+          mask=mask_n,
+          other=0.0,
+        )
+        scores += bias
       scores = tl.where(mask_n, scores, -float("inf"))
       if IS_CAUSAL:
         causal_mask = offs_kv <= (seqlen_k - 1)
@@ -548,6 +597,13 @@ def _ffpa_decode_fwd_stage1_kernel(
         scores = tl.dot(q, tl.trans(k), acc=scores)
 
       scores = scores * softmax_scale
+      if HAS_ATTN_BIAS:
+        bias = tl.load(
+          AttnBias + offs_m[:, None] * stride_bm + offs_kv[None, :] * stride_bn,
+          mask=mask_m[:, None] & mask_n[None, :],
+          other=0.0,
+        )
+        scores += bias
       scores = tl.where(mask_n[None, :], scores, -float("inf"))
       if IS_CAUSAL:
         causal_mask = offs_kv[None, :] <= (offs_m[:, None] + kv_offset)
@@ -680,6 +736,7 @@ def _ffpa_attn_forward_generic_impl(
   v: torch.Tensor,
   o: torch.Tensor,
   lse: torch.Tensor,
+  attn_bias: torch.Tensor | None = None,
   causal: bool = False,
   softmax_scale: float | None = None,
   autotune: bool = False,
@@ -693,6 +750,9 @@ def _ffpa_attn_forward_generic_impl(
   seqlen_q_bucket = bucket_autotune_seqlen(seqlen_q)
   seqlen_k_bucket = bucket_autotune_seqlen(seqlen_k)
   DTYPE = tl.float16 if q.dtype == torch.float16 else tl.bfloat16
+  has_attn_bias = attn_bias is not None
+  attn_bias_in = attn_bias if attn_bias is not None else q
+  bias_strides = _attn_bias_broadcast_strides(attn_bias, batch, nheads_q, seqlen_q, seqlen_k)
 
   def grid(meta: dict) -> tuple[int, int]:
     return (triton.cdiv(seqlen_q, meta["BLOCK_M"]), batch * nheads_q)
@@ -704,6 +764,7 @@ def _ffpa_attn_forward_generic_impl(
       v,
       o,
       lse,
+      attn_bias_in,
       softmax_scale,
       q.stride(0),
       q.stride(1),
@@ -717,6 +778,10 @@ def _ffpa_attn_forward_generic_impl(
       o.stride(0),
       o.stride(1),
       o.stride(2),
+      bias_strides[0],
+      bias_strides[1],
+      bias_strides[2],
+      bias_strides[3],
       nheads_q,
       nheads_kv,
       seqlen_q,
@@ -725,6 +790,7 @@ def _ffpa_attn_forward_generic_impl(
       seqlen_k_bucket,
       seqlen_q_rounded,
       IS_CAUSAL=causal,
+      HAS_ATTN_BIAS=has_attn_bias,
       DTYPE=DTYPE,
       HEADDIM=headdim,
     )
@@ -735,6 +801,7 @@ def _ffpa_attn_forward_generic_impl(
       v,
       o,
       lse,
+      attn_bias_in,
       softmax_scale,
       q.stride(0),
       q.stride(1),
@@ -748,6 +815,10 @@ def _ffpa_attn_forward_generic_impl(
       o.stride(0),
       o.stride(1),
       o.stride(2),
+      bias_strides[0],
+      bias_strides[1],
+      bias_strides[2],
+      bias_strides[3],
       nheads_q,
       nheads_kv,
       seqlen_q,
@@ -756,6 +827,7 @@ def _ffpa_attn_forward_generic_impl(
       seqlen_k_bucket,
       seqlen_q_rounded,
       IS_CAUSAL=causal,
+      HAS_ATTN_BIAS=has_attn_bias,
       DTYPE=DTYPE,
       HEADDIM=headdim,
       BLOCK_M=128,
@@ -773,6 +845,7 @@ def _ffpa_attn_forward_decode_impl(
   v: torch.Tensor,
   o: torch.Tensor,
   lse: torch.Tensor,
+  attn_bias: torch.Tensor | None = None,
   causal: bool = False,
   softmax_scale: float | None = None,
   autotune: bool = False,
@@ -789,6 +862,9 @@ def _ffpa_attn_forward_decode_impl(
   seqlen_k_bucket = bucket_autotune_seqlen(seqlen_k)
   if num_splits is None:
     num_splits = _get_decode_num_splits(seqlen_q, seqlen_k, headdim, batch, nheads_q, q.device)
+  has_attn_bias = attn_bias is not None
+  attn_bias_in = attn_bias if attn_bias is not None else q
+  bias_strides = _attn_bias_broadcast_strides(attn_bias, batch, nheads_q, seqlen_q, seqlen_k)
 
   n_chunks = num_splits
   chunk_size = triton.cdiv(seqlen_k, n_chunks)
@@ -822,6 +898,7 @@ def _ffpa_attn_forward_decode_impl(
       v,
       partial_out,
       chunk_lse,
+      attn_bias_in,
       softmax_scale,
       q.stride(0),
       q.stride(1),
@@ -840,6 +917,10 @@ def _ffpa_attn_forward_decode_impl(
       chunk_lse.stride(1),
       chunk_lse.stride(2),
       chunk_lse.stride(3),
+      bias_strides[0],
+      bias_strides[1],
+      bias_strides[2],
+      bias_strides[3],
       nheads_q,
       nheads_kv,
       seqlen_q,
@@ -847,6 +928,7 @@ def _ffpa_attn_forward_decode_impl(
       seqlen_q_bucket,
       seqlen_k_bucket,
       IS_CAUSAL=causal,
+      HAS_ATTN_BIAS=has_attn_bias,
       USE_GEMV=use_gemv,
       DTYPE=DTYPE,
       HEADDIM=headdim,
@@ -859,6 +941,7 @@ def _ffpa_attn_forward_decode_impl(
       v,
       partial_out,
       chunk_lse,
+      attn_bias_in,
       softmax_scale,
       q.stride(0),
       q.stride(1),
@@ -877,6 +960,10 @@ def _ffpa_attn_forward_decode_impl(
       chunk_lse.stride(1),
       chunk_lse.stride(2),
       chunk_lse.stride(3),
+      bias_strides[0],
+      bias_strides[1],
+      bias_strides[2],
+      bias_strides[3],
       nheads_q,
       nheads_kv,
       seqlen_q,
@@ -884,6 +971,7 @@ def _ffpa_attn_forward_decode_impl(
       seqlen_q_bucket,
       seqlen_k_bucket,
       IS_CAUSAL=causal,
+      HAS_ATTN_BIAS=has_attn_bias,
       USE_GEMV=use_gemv,
       DTYPE=DTYPE,
       HEADDIM=headdim,
@@ -966,6 +1054,7 @@ def _ffpa_attn_forward_impl(
   v: torch.Tensor,
   o: torch.Tensor,
   lse: torch.Tensor,
+  attn_bias: torch.Tensor | None = None,
   causal: bool = False,
   softmax_scale: float | None = None,
   autotune: bool = False,
@@ -1006,6 +1095,7 @@ def _ffpa_attn_forward_impl(
       v,
       o,
       lse,
+      attn_bias=attn_bias,
       causal=causal,
       softmax_scale=softmax_scale,
       autotune=autotune,
@@ -1019,6 +1109,7 @@ def _ffpa_attn_forward_impl(
     v,
     o,
     lse,
+    attn_bias=attn_bias,
     causal=causal,
     softmax_scale=softmax_scale,
     autotune=autotune,
@@ -1036,6 +1127,7 @@ def _ffpa_attn_forward_triton(
   softmax_scale: float = 0.0,
   autotune: bool = False,
   autotune_mode: str = "fast",
+  attn_bias: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
   """Call the Triton FFPA forward via registered torch op, returning ``(O, softmax_lse)``.
 
@@ -1057,6 +1149,7 @@ def _ffpa_attn_forward_triton(
     Q,
     K,
     V,
+    attn_bias,
     softmax_scale,
     int(causal),
     int(autotune),
