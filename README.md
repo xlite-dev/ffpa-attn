@@ -12,7 +12,7 @@
 
 |[Self Attn](./examples)| [GQA/MQA](./examples) |[Cross Attn](./examples)|[Causal/Mask](./examples)|[Headdim](#ffpa-design)|[Forward↑](./examples)|[Backward↑](./examples)|
 |:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-|✔️(`Nq=Nkv`)|✔️(`Hq!=Hkv`)|✔️(`Nq!=Nkv`)|✔️(`attn_mask`)|**320~1024** |**1.8~3x↑🎉** |**1.5~2.5x↑🎉** |
+|✔️(`Nq=Nkv`)|✔️(`Hq!=Hkv`)|✔️(`Nq!=Nkv`)|✔️(`attn_mask`)|**32~1024** |**1.8~3x↑** |**1.5~2.5x↑** |
 
 </div>
 
