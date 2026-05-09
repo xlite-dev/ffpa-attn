@@ -48,6 +48,39 @@ def _update_o_accs(o_accs, v_group: tl.constexpr, o_acc):
   return o_accs[:v_group] + (o_acc, ) + o_accs[v_group + 1:]
 
 
+@triton.jit
+def _curand_uniform_from_element_offset(seed: tl.constexpr, element_offset):
+  quad_offset = element_offset // 4
+  lane = element_offset - quad_offset * 4
+  r0, r1, r2, r3 = tl.randint4x(seed, quad_offset)
+  r = tl.where(lane == 0, r0, tl.where(lane == 1, r1, tl.where(lane == 2, r2, r3)))
+  r_i32 = r.to(tl.int32, bitcast=True)
+  r_f32 = r_i32.to(tl.float32)
+  r_f32 = tl.where(r_i32 < 0, r_f32 + 4294967296.0, r_f32)
+  return (r_f32 + 1.0) * 2.3283064365386963e-10
+
+
+@triton.jit
+def _apply_dropout_to_p(
+  p,
+  off_hb,
+  offs_m,
+  offs_n,
+  seqlen_q: int,
+  seqlen_k: int,
+  dropout_p: float,
+  philox_seed: tl.constexpr,
+  philox_offset: int,
+  HAS_DROPOUT: tl.constexpr,
+):
+  if HAS_DROPOUT:
+    linear = off_hb * seqlen_q * seqlen_k + offs_m[:, None] * seqlen_k + offs_n[None, :]
+    rand = _curand_uniform_from_element_offset(philox_seed, philox_offset + linear)
+    keep = rand > dropout_p
+    p = p * keep * (1.0 / (1.0 - dropout_p))
+  return p
+
+
 def _gen_fwd_autotune_configs(headdim: int = 256, autotune_mode: str = "max") -> list[triton.Config]:
   """Generate autotune configs for the single FFPA Triton forward kernel.
 
@@ -303,8 +336,12 @@ def _ffpa_fwd_kernel_impl(
   seqlen_q_bucket: int,
   seqlen_k_bucket: int,
   seqlen_q_rounded: int,
+  dropout_p: float,
+  philox_offset: int,
   IS_CAUSAL: tl.constexpr,
   HAS_ATTN_BIAS: tl.constexpr,
+  HAS_DROPOUT: tl.constexpr,
+  PHILOX_SEED: tl.constexpr,
   DTYPE: tl.constexpr,
   HEADDIM: tl.constexpr,
   EVEN_M: tl.constexpr,
@@ -392,6 +429,18 @@ def _ffpa_fwd_kernel_impl(
     alpha = tl.exp(m_i - m_new)
     p = tl.exp(scores - m_new[:, None])
     l_new = l_i * alpha + tl.sum(p, axis=1)
+    p = _apply_dropout_to_p(
+      p,
+      off_hb,
+      offs_m,
+      offs_kv,
+      seqlen_q,
+      seqlen_k,
+      dropout_p,
+      PHILOX_SEED,
+      philox_offset,
+      HAS_DROPOUT,
+    )
     p = p.to(DTYPE)
 
     # Reuse the same softmax tile for all V slices, matching FFPA CUDA fwd:
@@ -460,8 +509,12 @@ def _ffpa_decode_fwd_stage1_kernel(
   # The kernel itself only uses the bucketed values.
   seqlen_q_bucket: int,
   seqlen_k_bucket: int,
+  dropout_p: float,
+  philox_offset: int,
   IS_CAUSAL: tl.constexpr,
   HAS_ATTN_BIAS: tl.constexpr,
+  HAS_DROPOUT: tl.constexpr,
+  PHILOX_SEED: tl.constexpr,
   USE_GEMV: tl.constexpr,
   DTYPE: tl.constexpr,
   HEADDIM: tl.constexpr,
@@ -543,6 +596,11 @@ def _ffpa_decode_fwd_stage1_kernel(
       alpha = tl.exp(m_i_single - m_new)
       p = tl.exp(scores - m_new)
       l_new = l_i_single * alpha + tl.sum(p, axis=0)
+      if HAS_DROPOUT:
+        linear = off_hb * seqlen_q * seqlen_k + (q_block * BLOCK_M) * seqlen_k + offs_kv
+        rand = _curand_uniform_from_element_offset(PHILOX_SEED, philox_offset + linear)
+        keep = rand > dropout_p
+        p = p * keep * (1.0 / (1.0 - dropout_p))
       p = p.to(DTYPE)
 
       for v_group in tl.static_range(0, NUM_V_GROUPS):
@@ -615,6 +673,18 @@ def _ffpa_decode_fwd_stage1_kernel(
       alpha = tl.exp(m_prev - m_new)
       p = tl.exp(scores - m_new[:, None])
       l_new = l_i * alpha + tl.sum(p, axis=1)
+      p = _apply_dropout_to_p(
+        p,
+        off_hb,
+        offs_m,
+        offs_kv,
+        seqlen_q,
+        seqlen_k,
+        dropout_p,
+        PHILOX_SEED,
+        philox_offset,
+        HAS_DROPOUT,
+      )
       p = p.to(DTYPE)
 
       for v_group in tl.static_range(0, NUM_V_GROUPS):
@@ -741,6 +811,9 @@ def _ffpa_attn_forward_generic_impl(
   softmax_scale: float | None = None,
   autotune: bool = False,
   autotune_mode: str = "fast",
+  dropout_p: float = 0.0,
+  philox_seed: int = 0,
+  philox_offset: int = 0,
 ) -> None:
   """Launch the generic Triton forward kernel without split-kv scratch."""
   batch, nheads_q, seqlen_q, headdim = q.shape
@@ -751,6 +824,7 @@ def _ffpa_attn_forward_generic_impl(
   seqlen_k_bucket = bucket_autotune_seqlen(seqlen_k)
   DTYPE = tl.float16 if q.dtype == torch.float16 else tl.bfloat16
   has_attn_bias = attn_bias is not None
+  has_dropout = dropout_p > 0.0
   attn_bias_in = attn_bias if attn_bias is not None else q
   bias_strides = _attn_bias_broadcast_strides(attn_bias, batch, nheads_q, seqlen_q, seqlen_k)
 
@@ -789,8 +863,12 @@ def _ffpa_attn_forward_generic_impl(
       seqlen_q_bucket,
       seqlen_k_bucket,
       seqlen_q_rounded,
+      dropout_p,
+      philox_offset,
       IS_CAUSAL=causal,
       HAS_ATTN_BIAS=has_attn_bias,
+      HAS_DROPOUT=has_dropout,
+      PHILOX_SEED=philox_seed,
       DTYPE=DTYPE,
       HEADDIM=headdim,
     )
@@ -826,8 +904,12 @@ def _ffpa_attn_forward_generic_impl(
       seqlen_q_bucket,
       seqlen_k_bucket,
       seqlen_q_rounded,
+      dropout_p,
+      philox_offset,
       IS_CAUSAL=causal,
       HAS_ATTN_BIAS=has_attn_bias,
+      HAS_DROPOUT=has_dropout,
+      PHILOX_SEED=philox_seed,
       DTYPE=DTYPE,
       HEADDIM=headdim,
       BLOCK_M=128,
@@ -851,6 +933,9 @@ def _ffpa_attn_forward_decode_impl(
   autotune: bool = False,
   autotune_mode: str = "fast",
   num_splits: int | None = None,
+  dropout_p: float = 0.0,
+  philox_seed: int = 0,
+  philox_offset: int = 0,
 ) -> None:
   """Run the split-kv Triton forward path used for decode-like shapes."""
   batch, nheads_q, seqlen_q, headdim = q.shape
@@ -863,6 +948,7 @@ def _ffpa_attn_forward_decode_impl(
   if num_splits is None:
     num_splits = _get_decode_num_splits(seqlen_q, seqlen_k, headdim, batch, nheads_q, q.device)
   has_attn_bias = attn_bias is not None
+  has_dropout = dropout_p > 0.0
   attn_bias_in = attn_bias if attn_bias is not None else q
   bias_strides = _attn_bias_broadcast_strides(attn_bias, batch, nheads_q, seqlen_q, seqlen_k)
 
@@ -927,8 +1013,12 @@ def _ffpa_attn_forward_decode_impl(
       seqlen_k,
       seqlen_q_bucket,
       seqlen_k_bucket,
+      dropout_p,
+      philox_offset,
       IS_CAUSAL=causal,
       HAS_ATTN_BIAS=has_attn_bias,
+      HAS_DROPOUT=has_dropout,
+      PHILOX_SEED=philox_seed,
       USE_GEMV=use_gemv,
       DTYPE=DTYPE,
       HEADDIM=headdim,
@@ -970,8 +1060,12 @@ def _ffpa_attn_forward_decode_impl(
       seqlen_k,
       seqlen_q_bucket,
       seqlen_k_bucket,
+      dropout_p,
+      philox_offset,
       IS_CAUSAL=causal,
       HAS_ATTN_BIAS=has_attn_bias,
+      HAS_DROPOUT=has_dropout,
+      PHILOX_SEED=philox_seed,
       USE_GEMV=use_gemv,
       DTYPE=DTYPE,
       HEADDIM=headdim,
@@ -1059,6 +1153,9 @@ def _ffpa_attn_forward_impl(
   softmax_scale: float | None = None,
   autotune: bool = False,
   autotune_mode: str = "fast",
+  dropout_p: float = 0.0,
+  philox_seed: int = 0,
+  philox_offset: int = 0,
 ) -> None:
   """Run the Triton FFPA Split-D forward kernel.
 
@@ -1100,6 +1197,9 @@ def _ffpa_attn_forward_impl(
       softmax_scale=softmax_scale,
       autotune=autotune,
       autotune_mode=autotune_mode,
+      dropout_p=dropout_p,
+      philox_seed=philox_seed,
+      philox_offset=philox_offset,
     )
     return
 
@@ -1115,6 +1215,9 @@ def _ffpa_attn_forward_impl(
     autotune=autotune,
     autotune_mode=autotune_mode,
     num_splits=num_splits,
+    dropout_p=dropout_p,
+    philox_seed=philox_seed,
+    philox_offset=philox_offset,
   )
 
 
@@ -1128,6 +1231,9 @@ def _ffpa_attn_forward_triton(
   autotune: bool = False,
   autotune_mode: str = "fast",
   attn_bias: torch.Tensor | None = None,
+  dropout_p: float = 0.0,
+  philox_seed: int = 0,
+  philox_offset: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
   """Call the Triton FFPA forward via registered torch op, returning ``(O, softmax_lse)``.
 
@@ -1154,5 +1260,8 @@ def _ffpa_attn_forward_triton(
     int(causal),
     int(autotune),
     int(autotune_mode == "max"),
+    dropout_p,
+    philox_seed,
+    philox_offset,
   )
   return O_storage, softmax_lse_storage[..., :seqlen_q]

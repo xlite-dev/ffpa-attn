@@ -14,6 +14,7 @@ import math
 import pytest
 import torch
 import torch.nn.functional as F
+from torch.nn.attention import SDPBackend, sdpa_kernel
 import triton
 
 from ffpa_attn import ffpa_attn_func  # noqa: E402
@@ -54,7 +55,18 @@ def _sdpa_ref(q, k, v, causal, scale, attn_mask=None):
   return F.scaled_dot_product_attention(q, k2, v2, scale=scale, **kw)
 
 
-def _sdpa_ref_grads(q, k, v, causal, scale, attn_mask=None, return_mask_grad=False):
+def _sdpa_ref_grads(
+  q,
+  k,
+  v,
+  causal,
+  scale,
+  attn_mask=None,
+  return_mask_grad=False,
+  dropout_p=0.0,
+  rng_seed=None,
+  grad_out=None,
+):
   """Run SDPA forward + backward and return gradients from autograd.
 
     SDPA supports MQA (Nh_kv == 1) natively, but for general GQA
@@ -73,9 +85,18 @@ def _sdpa_ref_grads(q, k, v, causal, scale, attn_mask=None, return_mask_grad=Fal
   v_in = v2.repeat_interleave(group_size, dim=1) if group_size > 1 else v2
 
   kw = {"attn_mask": attn_mask_ref} if attn_mask_ref is not None else _make_sdpa_kwargs(causal, q.size(2), k.size(2))
-  out_ref = F.scaled_dot_product_attention(q2, k_in, v_in, scale=scale, **kw)
-  loss_ref = out_ref.sum()
-  loss_ref.backward()
+  if rng_seed is not None:
+    torch.manual_seed(rng_seed)
+  if dropout_p > 0.0:
+    with sdpa_kernel(SDPBackend.EFFICIENT_ATTENTION):
+      out_ref = F.scaled_dot_product_attention(q2, k_in, v_in, scale=scale, dropout_p=dropout_p, **kw)
+  else:
+    out_ref = F.scaled_dot_product_attention(q2, k_in, v_in, scale=scale, **kw)
+  if grad_out is None:
+    loss_ref = out_ref.sum()
+    loss_ref.backward()
+  else:
+    out_ref.backward(grad_out.detach())
 
   if group_size > 1:
     # k2.grad accumulates from repeat_interleave; shape [B, Nh_kv, N, D].
@@ -114,6 +135,7 @@ def _run_bwd_pre(o, do, d_chunk, block_headdim=64):
     do.stride(1),
     do.stride(2),
     H,
+    N,
     N,
     seqlen_q_rounded,
     D,
@@ -243,6 +265,97 @@ def test_ffpa_bwd_triton_additive_attn_mask_only_grad_matches_sdpa():
 
   _, _, _, dmask_ref = _sdpa_ref_grads(q, k, v, False, scale, attn_mask=attn_mask, return_mask_grad=True)
   torch.testing.assert_close(attn_mask.grad, dmask_ref, atol=3e-2, rtol=3e-2)
+
+
+@pytest.mark.parametrize("kernel_version", ["v1", "v2"])
+def test_ffpa_bwd_triton_dropout_matches_sdpa(kernel_version):
+  """Triton dropout backward must reuse the forward Philox mask like SDPA."""
+  B, H, N, D = 1, 2, 512, 512
+  dtype = torch.float16
+  torch.manual_seed(0)
+  q = torch.randn(B, H, N, D, dtype=dtype, device="cuda", requires_grad=True)
+  k = torch.randn(B, H, N, D, dtype=dtype, device="cuda", requires_grad=True)
+  v = torch.randn(B, H, N, D, dtype=dtype, device="cuda", requires_grad=True)
+  grad_out = torch.randn_like(q)
+
+  scale = 1.0 / math.sqrt(D)
+  rng_seed = 123
+  torch.manual_seed(rng_seed)
+  out = ffpa_attn_func(
+    q,
+    k,
+    v,
+    dropout_p=0.2,
+    scale=scale,
+    stages=2,
+    acc="f32",
+    backward_backend="triton",
+    triton_backward_version=kernel_version,
+  )
+  out.backward(grad_out)
+
+  dq_ref, dk_ref, dv_ref = _sdpa_ref_grads(
+    q,
+    k,
+    v,
+    False,
+    scale,
+    dropout_p=0.2,
+    rng_seed=rng_seed,
+    grad_out=grad_out,
+  )
+
+  torch.testing.assert_close(q.grad, dq_ref, atol=4e-2, rtol=4e-2)
+  torch.testing.assert_close(k.grad, dk_ref, atol=4e-2, rtol=4e-2)
+  torch.testing.assert_close(v.grad, dv_ref, atol=4e-2, rtol=4e-2)
+
+
+@pytest.mark.parametrize("kernel_version", ["v1", "v2"])
+def test_ffpa_bwd_triton_dropout_additive_attn_mask_matches_sdpa(kernel_version):
+  """Dropout and additive-bias gradients compose with the same SDPA mask."""
+  B, H, N, D = 1, 2, 512, 512
+  dtype = torch.float16
+  torch.manual_seed(1)
+  q = torch.randn(B, H, N, D, dtype=dtype, device="cuda", requires_grad=True)
+  k = torch.randn(B, H, N, D, dtype=dtype, device="cuda", requires_grad=True)
+  v = torch.randn(B, H, N, D, dtype=dtype, device="cuda", requires_grad=True)
+  attn_mask = (torch.randn(1, 1, N, N, dtype=dtype, device="cuda") * 0.25).requires_grad_(True)
+  grad_out = torch.randn_like(q)
+
+  scale = 1.0 / math.sqrt(D)
+  rng_seed = 321
+  torch.manual_seed(rng_seed)
+  out = ffpa_attn_func(
+    q,
+    k,
+    v,
+    attn_mask=attn_mask,
+    dropout_p=0.2,
+    scale=scale,
+    stages=2,
+    acc="f32",
+    backward_backend="triton",
+    triton_backward_version=kernel_version,
+  )
+  out.backward(grad_out)
+
+  dq_ref, dk_ref, dv_ref, dmask_ref = _sdpa_ref_grads(
+    q,
+    k,
+    v,
+    False,
+    scale,
+    attn_mask=attn_mask,
+    return_mask_grad=True,
+    dropout_p=0.2,
+    rng_seed=rng_seed,
+    grad_out=grad_out,
+  )
+
+  torch.testing.assert_close(q.grad, dq_ref, atol=4e-2, rtol=4e-2)
+  torch.testing.assert_close(k.grad, dk_ref, atol=4e-2, rtol=4e-2)
+  torch.testing.assert_close(v.grad, dv_ref, atol=4e-2, rtol=4e-2)
+  torch.testing.assert_close(attn_mask.grad, dmask_ref, atol=4e-2, rtol=4e-2)
 
 
 # Basic backward correctness

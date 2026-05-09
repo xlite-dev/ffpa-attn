@@ -11,6 +11,7 @@ import math
 import pytest
 import torch
 import torch.nn.functional as F
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from ffpa_attn import ffpa_attn_func  # noqa: E402
 import ffpa_attn.functional as ffpa_attn_functional  # noqa: E402
@@ -179,19 +180,14 @@ def test_ffpa_attn_func_triton_additive_attn_mask_matches_sdpa():
   torch.testing.assert_close(out, ref, **_tolerance(torch.float16))
 
 
-def test_ffpa_attn_func_dropout_falls_back_to_sdpa(monkeypatch):
-  q, k, v = _alloc_qkv(1, 4, 128, 512, torch.float16)
-
-  def _unexpected_backend(*args, **kwargs):
-    raise AssertionError("dropout fallback should not dispatch to FFPA forward")
-
-  monkeypatch.setattr(ffpa_attn_functional, "_require_cuda_forward_impl", lambda: _unexpected_backend)
-  monkeypatch.setattr(ffpa_attn_functional, "_ffpa_attn_forward_triton", _unexpected_backend)
+def test_ffpa_attn_func_triton_dropout_matches_sdpa():
+  q, k, v = _alloc_qkv(1, 2, 512, 512, torch.float16)
 
   torch.manual_seed(0)
-  out = ffpa_attn_func(q, k, v, dropout_p=0.25, stages=2, acc="f32")
+  out = ffpa_attn_func(q, k, v, dropout_p=0.25, stages=2, acc="f32", forward_backend="triton")
   torch.manual_seed(0)
-  ref = F.scaled_dot_product_attention(q, k, v, dropout_p=0.25, scale=1.0 / math.sqrt(q.size(-1)))
+  with sdpa_kernel(SDPBackend.EFFICIENT_ATTENTION):
+    ref = F.scaled_dot_product_attention(q, k, v, dropout_p=0.25, scale=1.0 / math.sqrt(q.size(-1)))
   torch.testing.assert_close(out, ref, **_tolerance(torch.float16))
 
 
@@ -221,8 +217,21 @@ def test_ffpa_attn_func_large_d_keeps_selected_backend(monkeypatch, forward_back
     lse = torch.zeros(q_in.size(0), q_in.size(1), q_in.size(2), device=q_in.device)
     return out, lse
 
-  def _fake_triton(q_in, k_in, v_in, o_in, causal, softmax_scale, autotune, autotune_mode, attn_bias):
-    del o_in, causal, softmax_scale, autotune, autotune_mode, attn_bias
+  def _fake_triton(
+    q_in,
+    k_in,
+    v_in,
+    o_in,
+    causal,
+    softmax_scale,
+    autotune,
+    autotune_mode,
+    attn_bias,
+    dropout_p=0.0,
+    philox_seed=0,
+    philox_offset=0,
+  ):
+    del o_in, causal, softmax_scale, autotune, autotune_mode, attn_bias, dropout_p, philox_seed, philox_offset
     called["triton"] += 1
     out = q_in + k_in + v_in
     lse = torch.zeros(q_in.size(0), q_in.size(1), q_in.size(2), device=q_in.device)
@@ -250,8 +259,21 @@ def test_ffpa_attn_func_large_d_defaults_to_triton(monkeypatch):
     called["cuda"] += 1
     raise AssertionError("default large-D path should not use CUDA forward")
 
-  def _fake_triton(q_in, k_in, v_in, o_in, causal, softmax_scale, autotune, autotune_mode, attn_bias):
-    del o_in, causal, softmax_scale, autotune, autotune_mode, attn_bias
+  def _fake_triton(
+    q_in,
+    k_in,
+    v_in,
+    o_in,
+    causal,
+    softmax_scale,
+    autotune,
+    autotune_mode,
+    attn_bias,
+    dropout_p=0.0,
+    philox_seed=0,
+    philox_offset=0,
+  ):
+    del o_in, causal, softmax_scale, autotune, autotune_mode, attn_bias, dropout_p, philox_seed, philox_offset
     called["triton"] += 1
     out = q_in + k_in + v_in
     lse = torch.zeros(q_in.size(0), q_in.size(1), q_in.size(2), device=q_in.device)
