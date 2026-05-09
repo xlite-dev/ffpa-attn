@@ -54,7 +54,7 @@ We extend FlashAttention to support large headdim ($D>256$) via **fine-grained t
 <div align='center'>
   <img src="./docs/assets/split-d.png" width="700px">
   </p><i>
-    <b>FFPA</b> enables headdim <b> > 256</b>, and outperforms standard SDPA by <b>1.8~3x</b>🎉.
+    <b>FFPA</b> enables headdim <b> > 256</b>, and outperforms standard SDPA by <b>1.5~3x</b>🎉.
   </i></p>
 </div>
 
