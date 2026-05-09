@@ -91,7 +91,7 @@ autolabel(rect_bwd)
 
 ax.set_ylabel('Speedup Ratio (FFPA / SDPA)', fontsize=18)
 ax.set_title(
-  'FFPA vs SDPA Speedup (FWD & BWD), NVIDIA RTX 5090 Blackwell | B=1, N=8192, H=32, D=512',
+  'FFPA vs SDPA Speedup (FWD & BWD) | NVIDIA RTX 5090 Blackwell | B=1, N=8192, H=32, D=512',
   fontsize=22,
   pad=15,
   fontweight='bold'
