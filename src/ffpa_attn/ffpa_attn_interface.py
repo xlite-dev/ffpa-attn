@@ -25,15 +25,15 @@ def _should_fallback_to_sdpa(
 ) -> bool:
   """Return whether the public API should delegate to SDPA directly.
 
-  FFPA currently falls back to SDPA for the following cases:
+  For now, as FFPA is mainly designed for prefill and may not outperform SDPA
+  for short sequences. While Nq == 1 is a common case for decode attention and
+  FFPA does support it by flash-decoding algorithm, the speedup over SDPA is
+  not significant (~10% speedup). FFPA currently falls back to SDPA for the
+  following cases:
 
   * ``head_dim <= 256``
   * ``head_dim > 1024``
   * ``dropout_p > 0.0``
-  * explicit ``attn_mask`` with a non-Triton large-D backend
-  For now, as FFPA is mainly designed for prefill and may not outperform SDPA for short sequences.
-  While Nq == 1 is a common case for decode attention and FFPA does support it by flash-decoding
-  algorithm, the speedup over SDPA is not significant (~10% speedup).
   * ``Nq < 512 && Nq != 1``
   * ``Nk < 512``
 
@@ -49,6 +49,7 @@ def _should_fallback_to_sdpa(
     D <= 256,
     D > 1024,
     dropout_p > 0.0,
+    # attn_mask is only supported by triton backend for now.
     attn_mask is not None and forward_backend != "triton",
     (Nq < 512 and Nq != 1),
     Nkv < 512,
@@ -121,7 +122,7 @@ def ffpa_attn_func(
   :param value: Value tensor with layout ``[B, Nh_kv, Nkv, D]``; same dtype
       as ``query``. ``key`` and ``value`` must share the same ``Nh_kv`` and
       ``Nkv``.
-    :param attn_mask: Optional attention mask broadcastable to
+  :param attn_mask: Optional attention mask broadcastable to
       ``[B, Nh_q, Nq, Nkv]``. Boolean masks follow SDPA semantics where
       ``True`` means the element participates in attention; floating masks are
       additive attention bias. Large-D Triton supports additive mask gradients.

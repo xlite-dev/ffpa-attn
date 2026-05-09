@@ -81,19 +81,6 @@ def _make_broadcast_additive_attn_mask(nq: int, nkv: int, dtype: torch.dtype, se
   return torch.randn(1, 1, nq, nkv, dtype=dtype, device="cuda") * 0.25
 
 
-def _make_full_additive_attn_mask(
-  batch: int,
-  nheads: int,
-  nq: int,
-  nkv: int,
-  dtype: torch.dtype,
-  seed: int,
-) -> torch.Tensor:
-  """Build a full per-batch/per-head additive attention bias."""
-  torch.manual_seed(seed + 2)
-  return torch.randn(batch, nheads, nq, nkv, dtype=dtype, device="cuda") * 0.25
-
-
 def _time_fn(fn, *args, warmup: int = WARMUP, iters: int = ITERS) -> float:
   for _ in range(warmup):
     fn(*args)
@@ -268,24 +255,8 @@ def main() -> None:
       causal=True,
     )
     mask_n = max(N, 512)
-    full_mask_n = min(mask_n, 2048)
     _run_case(
-      "attn-mask-full",
-      dtype,
-      args.forward_backend,
-      args.triton_forward_autotune,
-      args.triton_autotune_mode,
-      seed=args.seed,
-      B=args.B,
-      Nh_q=32,
-      Nh_kv=32,
-      Nq=full_mask_n,
-      Nkv=full_mask_n,
-      D=D,
-      attn_mask=_make_full_additive_attn_mask(args.B, 32, full_mask_n, full_mask_n, dtype, args.seed),
-    )
-    _run_case(
-      "attn-mask-bcast",
+      "attn-mask",
       dtype,
       args.forward_backend,
       args.triton_forward_autotune,
