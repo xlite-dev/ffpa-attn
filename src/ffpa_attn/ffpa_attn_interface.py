@@ -128,7 +128,7 @@ def ffpa_attn_func(
       ``[B, Nh_q, Nq, Nkv]``. Boolean masks follow SDPA semantics where
       ``True`` means the element participates in attention; floating masks are
       additive attention bias. Large-D Triton supports additive mask gradients.
-    :param dropout_p: Dropout probability. Large-D Triton implements SDPA-style
+  :param dropout_p: Dropout probability. Large-D Triton implements SDPA-style
       attention dropout; non-Triton large-D dropout routes to SDPA.
   :param is_causal: When ``True``, apply a causal attention mask so that
       query row ``r`` only attends to KV positions ``k <= r + (Nkv - Nq)``
