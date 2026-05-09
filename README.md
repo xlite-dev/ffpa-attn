@@ -38,9 +38,8 @@ Then, try to accelerate the attention for large headdim with just <i><b>one-line
 ```python
 >>> import torch.nn.functional as F
 >>> from ffpa_attn import ffpa_attn_func
->>> # Monkey-patch SDPA to point to FFPA attention. Every thing that
->>> # FFPA does not support will fallback to SDPA: D <= 256 or > 1024,
->>> # dropout_p > 0.0, and N < 512, etc.
+>>> # Monkey-patch SDPA to point to FFPA. Every thing that FFPA
+>>> # does not support will auto fallback to SDPA: D <= 256, etc.
 >>> F.scaled_dot_product_attention = ffpa_attn_func # one-line code
 ```
 
