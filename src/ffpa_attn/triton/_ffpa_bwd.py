@@ -89,14 +89,15 @@ def _attn_bias_grad_needs_reduction(
 
 @triton.jit
 def _curand_uniform_from_element_offset(seed: tl.constexpr, element_offset):
+  # Must match forward and PyTorch mem-efficient attention exactly: one Philox
+  # output per logical [B, H, Nq, Nkv] score element, converted through uint32
+  # like curand_uniform4.  Signed conversion can differ by one ulp.
   quad_offset = element_offset // 4
   lane = element_offset - quad_offset * 4
   r0, r1, r2, r3 = tl.randint4x(seed, quad_offset)
   r = tl.where(lane == 0, r0, tl.where(lane == 1, r1, tl.where(lane == 2, r2, r3)))
-  r_i32 = r.to(tl.int32, bitcast=True)
-  r_f32 = r_i32.to(tl.float32)
-  r_f32 = tl.where(r_i32 < 0, r_f32 + 4294967296.0, r_f32)
-  return (r_f32 + 1.0) * 2.3283064365386963e-10
+  r_u32 = r.to(tl.uint32, bitcast=True)
+  return (r_u32.to(tl.float32) + 1.0) * 2.3283064365386963e-10
 
 
 @triton.jit
@@ -113,6 +114,7 @@ def _dropout_multiplier(
 ):
   mult = tl.full([offs_m.shape[0], offs_n.shape[0]], 1.0, dtype=tl.float32)
   if HAS_DROPOUT:
+    # Replay the exact forward dropout mask using SDPA's logical score layout.
     linear = off_hb * seqlen_q * seqlen_k + offs_m[:, None] * seqlen_k + offs_n[None, :]
     rand = _curand_uniform_from_element_offset(philox_seed, philox_offset + linear)
     keep = rand > dropout_p
@@ -1605,7 +1607,7 @@ def _ffpa_attn_backward_triton_impl(
   dk.zero_()
   dv.zero_()
 
-  if seqlen_q < 8 and not has_dropout:
+  if seqlen_q < 8:
     use_gemv = seqlen_q == 1
     block_m_decode = 8 if use_gemv else 16
     block_n_decode = 64 if use_gemv else 128
