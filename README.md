@@ -52,7 +52,7 @@ For more advanced features, please refer to our online docs at 📘[ffpa-attn.io
 We extend FlashAttention to support large headdim ($D>256$) via **fine-grained tiling** at the **MMA** level for $QK^\top$ and $PV$ matrix multiplication, referred to as **Split-D**. This design keeps SRAM usage fixed at $B_r \times 16$ (with $B_r=B_c$) for Q, K and V, yielding constant SRAM complexity $O(B_r \times 16) \approx O(1)$ and register complexity $O(d/4)$.
 
 <div align='center'>
-  <img src=https://github.com/user-attachments/assets/ed30185b-2e11-4293-832f-43e9003d6ad9 width="700px">
+  <img src="./docs/assets/split-d.png" width="700px">
   </p><i>
     <b>FFPA</b> enables headdim <b> > 256</b>, and outperforms standard SDPA by <b>1.8~3x</b>🎉.
   </i></p>
