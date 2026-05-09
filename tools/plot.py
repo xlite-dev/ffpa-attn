@@ -44,7 +44,7 @@ sdpa_speedups = [1.0] * len(attn_types)
 
 fig, ax = plt.subplots(figsize=(32, 12))
 
-width = 0.22
+width = 0.20
 x = np.arange(len(attn_types))
 x_sdpa = x - width
 x_fwd = x
@@ -58,9 +58,9 @@ rect_fwd = ax.bar(
   x_fwd, fwd_speedups, width, label='FFPA Forward (FWD)', color='#2171b5', edgecolor='white', linewidth=1
 )
 
-# FFPA Backward bars (Orange)
+# FFPA Backward bars (Red-Orange)
 rect_bwd = ax.bar(
-  x_bwd, bwd_speedups, width, label='FFPA Backward (BWD)', color='#fd8d3c', edgecolor='white', linewidth=1
+  x_bwd, bwd_speedups, width, label='FFPA Backward (BWD)', color="#fd493c", edgecolor='white', linewidth=1
 )
 
 # Dashed baseline line at speedup = 1.0
@@ -74,14 +74,14 @@ def autolabel(rects):
     offset = 8 if h >= 1 else 20
     va_pos = 'bottom' if h >= 1 else 'top'
     ax.annotate(
-      f'{h:.2f}x',
+      f'{h:.1f}x',
       xy=(rect.get_x() + rect.get_width() / 2, h),
       xytext=(0, offset),
       textcoords='offset points',
       ha='center',
       va=va_pos,
-      fontsize=20,
-      fontweight='bold'
+      fontsize=19,
+      fontweight='bold',
     )
 
 
