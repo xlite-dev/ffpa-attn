@@ -87,6 +87,39 @@ def _attn_bias_grad_needs_reduction(
   ])
 
 
+@triton.jit
+def _curand_uniform_from_element_offset(seed: tl.constexpr, element_offset):
+  quad_offset = element_offset // 4
+  lane = element_offset - quad_offset * 4
+  r0, r1, r2, r3 = tl.randint4x(seed, quad_offset)
+  r = tl.where(lane == 0, r0, tl.where(lane == 1, r1, tl.where(lane == 2, r2, r3)))
+  r_i32 = r.to(tl.int32, bitcast=True)
+  r_f32 = r_i32.to(tl.float32)
+  r_f32 = tl.where(r_i32 < 0, r_f32 + 4294967296.0, r_f32)
+  return (r_f32 + 1.0) * 2.3283064365386963e-10
+
+
+@triton.jit
+def _dropout_multiplier(
+  off_hb,
+  offs_m,
+  offs_n,
+  seqlen_q: int,
+  seqlen_k: int,
+  dropout_p: float,
+  philox_seed: tl.constexpr,
+  philox_offset: int,
+  HAS_DROPOUT: tl.constexpr,
+):
+  mult = tl.full([offs_m.shape[0], offs_n.shape[0]], 1.0, dtype=tl.float32)
+  if HAS_DROPOUT:
+    linear = off_hb * seqlen_q * seqlen_k + offs_m[:, None] * seqlen_k + offs_n[None, :]
+    rand = _curand_uniform_from_element_offset(philox_seed, philox_offset + linear)
+    keep = rand > dropout_p
+    mult = keep * (1.0 / (1.0 - dropout_p))
+  return mult
+
+
 # Preprocess: delta = rowsum(dO * O)
 # In full-D mode BLOCK_HEADDIM must cover the whole head dimension.  In
 # D_CHUNK mode the launcher/autotuner supplies the chunk size explicitly.
@@ -247,9 +280,13 @@ def ffpa_bwd_v1_kernel(
   seqlen_q: int,
   seqlen_k: int,
   headdim: int,
+  dropout_p: float,
+  philox_offset: int,
   ATOMIC_ADD: tl.constexpr,
   IS_CAUSAL: tl.constexpr,
   HAS_ATTN_BIAS: tl.constexpr,
+  HAS_DROPOUT: tl.constexpr,
+  PHILOX_SEED: tl.constexpr,
   BIAS_REQUIRES_GRAD: tl.constexpr,
   GRAD_BIAS_NEEDS_REDUCTION: tl.constexpr,
   BLOCK_HEADDIM: tl.constexpr,
@@ -331,6 +368,19 @@ def ffpa_bwd_v1_kernel(
 
     lse_i = tl.load(LSE + offs_m_curr)
     P = tl.exp(S - lse_i[:, None])
+    dropout_mult = _dropout_multiplier(
+      tl.program_id(1),
+      offs_m_curr,
+      offs_n,
+      seqlen_q,
+      seqlen_k,
+      dropout_p,
+      PHILOX_SEED,
+      philox_offset,
+      HAS_DROPOUT,
+    )
+    dP = dP * dropout_mult
+    P_drop = P * dropout_mult
 
     # ---- Phase 1c: dS = P * (dP - delta) * scale ----
     Di = tl.load(D + offs_m_curr)
@@ -401,7 +451,7 @@ def ffpa_bwd_v1_kernel(
         mask=(offs_m_curr[:, None] < seqlen_q) & (d_offs[None, :] < headdim),
         other=0.0
       )
-      dv_d = tl.trans(tl.dot(tl.trans(do).to(tl.float32), P)).to(DTYPE)
+      dv_d = tl.trans(tl.dot(tl.trans(do).to(tl.float32), P_drop)).to(DTYPE)
       dv_ptrs = DV + offs_n[:, None] * stride_dvn + d_offs[None, :]
       tl.atomic_add(dv_ptrs, dv_d, mask=(offs_n[:, None] < seqlen_k) & (d_offs[None, :] < headdim))
 
@@ -549,9 +599,13 @@ def _ffpa_bwd_v1_kernel_impl(
   seqlen_k_bucket: int,
   seqlen_q_rounded: int,
   headdim: int,
+  dropout_p: float,
+  philox_offset: int,
   IS_CAUSAL: tl.constexpr,
   SEQUENCE_PARALLEL: tl.constexpr,
   HAS_ATTN_BIAS: tl.constexpr,
+  HAS_DROPOUT: tl.constexpr,
+  PHILOX_SEED: tl.constexpr,
   BIAS_REQUIRES_GRAD: tl.constexpr,
   GRAD_BIAS_NEEDS_REDUCTION: tl.constexpr,
   BLOCK_HEADDIM: tl.constexpr,
@@ -613,9 +667,13 @@ def _ffpa_bwd_v1_kernel_impl(
         seqlen_q,
         seqlen_k,
         headdim,
+        dropout_p,
+        philox_offset,
         ATOMIC_ADD=False,
         IS_CAUSAL=IS_CAUSAL,
         HAS_ATTN_BIAS=HAS_ATTN_BIAS,
+        HAS_DROPOUT=HAS_DROPOUT,
+        PHILOX_SEED=PHILOX_SEED,
         BIAS_REQUIRES_GRAD=BIAS_REQUIRES_GRAD,
         GRAD_BIAS_NEEDS_REDUCTION=GRAD_BIAS_NEEDS_REDUCTION,
         BLOCK_HEADDIM=BLOCK_HEADDIM,
@@ -659,9 +717,13 @@ def _ffpa_bwd_v1_kernel_impl(
       seqlen_q,
       seqlen_k,
       headdim,
+      dropout_p,
+      philox_offset,
       ATOMIC_ADD=True,
       IS_CAUSAL=IS_CAUSAL,
       HAS_ATTN_BIAS=HAS_ATTN_BIAS,
+      HAS_DROPOUT=HAS_DROPOUT,
+      PHILOX_SEED=PHILOX_SEED,
       BIAS_REQUIRES_GRAD=BIAS_REQUIRES_GRAD,
       GRAD_BIAS_NEEDS_REDUCTION=GRAD_BIAS_NEEDS_REDUCTION,
       BLOCK_HEADDIM=BLOCK_HEADDIM,
@@ -763,8 +825,12 @@ def _ffpa_bwd_v2_kernel_impl(
   seqlen_k_bucket: int,
   seqlen_q_rounded: int,
   headdim: int,
+  dropout_p: float,
+  philox_offset: int,
   IS_CAUSAL: tl.constexpr,
   HAS_ATTN_BIAS: tl.constexpr,
+  HAS_DROPOUT: tl.constexpr,
+  PHILOX_SEED: tl.constexpr,
   BIAS_REQUIRES_GRAD: tl.constexpr,
   GRAD_BIAS_NEEDS_REDUCTION: tl.constexpr,
   BLOCK_HEADDIM: tl.constexpr,
@@ -853,6 +919,19 @@ def _ffpa_bwd_v2_kernel_impl(
         S += bias
       lse_i = tl.load(LSE + offs_qm)
       P = tl.exp(S - lse_i[:, None])
+      dropout_mult = _dropout_multiplier(
+        off_hb,
+        offs_qm,
+        offs_n,
+        seqlen_q,
+        seqlen_k,
+        dropout_p,
+        PHILOX_SEED,
+        philox_offset,
+        HAS_DROPOUT,
+      )
+      dP = dP * dropout_mult
+      P_drop = P * dropout_mult
       Di = tl.load(D + offs_qm)
       if BIAS_REQUIRES_GRAD:
         dBias = P * (dP - Di[:, None])
@@ -887,7 +966,7 @@ def _ffpa_bwd_v2_kernel_impl(
         dk_val = tl.load(dk_ptrs, mask=(offs_n[:, None] < seqlen_k) & (d_offs[None, :] < headdim), other=0.)
         dk_val += dk_d
         tl.store(dk_ptrs, dk_val, mask=(offs_n[:, None] < seqlen_k) & (d_offs[None, :] < headdim))
-        dv_d = tl.trans(tl.dot(tl.trans(do).to(tl.float32), P)).to(DTYPE)
+        dv_d = tl.trans(tl.dot(tl.trans(do).to(tl.float32), P_drop)).to(DTYPE)
         dv_ptrs = DV + offs_n[:, None] * stride_dvn + d_offs[None, :]
         dv_val = tl.load(dv_ptrs, mask=(offs_n[:, None] < seqlen_k) & (d_offs[None, :] < headdim), other=0.)
         dv_val += dv_d
@@ -950,6 +1029,18 @@ def _ffpa_bwd_v2_kernel_impl(
         S_qk += bias
       lse_i = tl.load(LSE + offs_m)
       P_qk = tl.exp(S_qk - lse_i[:, None])
+      dropout_mult_qk = _dropout_multiplier(
+        off_hb,
+        offs_m,
+        offs_nk,
+        seqlen_q,
+        seqlen_k,
+        dropout_p,
+        PHILOX_SEED,
+        philox_offset,
+        HAS_DROPOUT,
+      )
+      dP_qk = dP_qk * dropout_mult_qk
       Di = tl.load(D + offs_m)
       dS_qk = (P_qk * (dP_qk - Di[:, None]) * softmax_scale).to(DTYPE)
 
@@ -1011,6 +1102,9 @@ def _ffpa_attn_backward_triton_impl(
   autotune_mode: str = "fast",
   kernel_version: str = "v2",
   preprocess_d_chunk: bool = False,
+  dropout_p: float = 0.0,
+  philox_seed: int = 0,
+  philox_offset: int = 0,
 ) -> None:
   """Run the Triton FFPA Split-D backward kernels in place.
 
@@ -1065,6 +1159,7 @@ def _ffpa_attn_backward_triton_impl(
   grad_attn_bias_in = grad_attn_bias if grad_attn_bias is not None else q
   grad_bias_strides = _attn_bias_broadcast_strides(grad_attn_bias, batch, nheads, seqlen_q, seqlen_k)
   grad_bias_needs_reduction = _attn_bias_grad_needs_reduction(grad_attn_bias, batch, nheads, seqlen_q, seqlen_k)
+  has_dropout = dropout_p > 0.0
 
   assert q.dtype == k.dtype == v.dtype == o.dtype == do.dtype
   assert q.dtype in (torch.float16, torch.bfloat16)
@@ -1185,8 +1280,12 @@ def _ffpa_attn_backward_triton_impl(
         seqlen_k_bucket,
         seqlen_q_rounded,
         headdim,
+        dropout_p,
+        philox_offset,
         IS_CAUSAL=causal,
         HAS_ATTN_BIAS=has_attn_bias,
+        HAS_DROPOUT=has_dropout,
+        PHILOX_SEED=philox_seed,
         BIAS_REQUIRES_GRAD=bias_requires_grad,
         GRAD_BIAS_NEEDS_REDUCTION=grad_bias_needs_reduction,
         DTYPE=DTYPE,
@@ -1241,8 +1340,12 @@ def _ffpa_attn_backward_triton_impl(
         seqlen_k_bucket,
         seqlen_q_rounded,
         headdim,
+        dropout_p,
+        philox_offset,
         IS_CAUSAL=causal,
         HAS_ATTN_BIAS=has_attn_bias,
+        HAS_DROPOUT=has_dropout,
+        PHILOX_SEED=philox_seed,
         BIAS_REQUIRES_GRAD=bias_requires_grad,
         GRAD_BIAS_NEEDS_REDUCTION=grad_bias_needs_reduction,
         DTYPE=DTYPE,
@@ -1307,9 +1410,13 @@ def _ffpa_attn_backward_triton_impl(
         seqlen_k_bucket,
         seqlen_q_rounded,
         headdim,
+        dropout_p,
+        philox_offset,
         IS_CAUSAL=causal,
         SEQUENCE_PARALLEL=True,
         HAS_ATTN_BIAS=has_attn_bias,
+        HAS_DROPOUT=has_dropout,
+        PHILOX_SEED=philox_seed,
         BIAS_REQUIRES_GRAD=bias_requires_grad,
         GRAD_BIAS_NEEDS_REDUCTION=grad_bias_needs_reduction,
         DTYPE=DTYPE,
@@ -1364,9 +1471,13 @@ def _ffpa_attn_backward_triton_impl(
         seqlen_k_bucket,
         seqlen_q_rounded,
         headdim,
+        dropout_p,
+        philox_offset,
         IS_CAUSAL=causal,
         SEQUENCE_PARALLEL=True,
         HAS_ATTN_BIAS=has_attn_bias,
+        HAS_DROPOUT=has_dropout,
+        PHILOX_SEED=philox_seed,
         BIAS_REQUIRES_GRAD=bias_requires_grad,
         GRAD_BIAS_NEEDS_REDUCTION=grad_bias_needs_reduction,
         DTYPE=DTYPE,
@@ -1393,6 +1504,9 @@ def _ffpa_attn_backward_triton(
   preprocess_d_chunk: bool = False,
   attn_bias: torch.Tensor | None = None,
   return_attn_bias_grad: bool = False,
+  dropout_p: float = 0.0,
+  philox_seed: int = 0,
+  philox_offset: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
   """Run the Triton FFPA backward path and return ``(dq, dk, dv, d_attn_bias)``.
 
@@ -1468,6 +1582,9 @@ def _ffpa_attn_backward_triton(
     int(kernel_version == "v2"),
     int(preprocess_d_chunk),
     int(return_attn_bias_grad and attn_bias is not None),
+    dropout_p,
+    philox_seed,
+    philox_offset,
   )
 
   if group_size > 1:

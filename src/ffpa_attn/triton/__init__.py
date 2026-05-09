@@ -24,7 +24,8 @@ def _attn_bias_grad_needs_reduction(attn_bias: torch.Tensor | None, q: torch.Ten
 torch.library.define(
   f"{_OP_NAMESPACE}::_fwd_triton",
   "(Tensor q, Tensor k, Tensor v, Tensor? attn_bias, float softmax_scale, "
-  "int causal, int autotune, int autotune_mode_is_max) -> (Tensor o, Tensor softmax_lse)",
+  "int causal, int autotune, int autotune_mode_is_max, float dropout_p, int philox_seed, int philox_offset) "
+  "-> (Tensor o, Tensor softmax_lse)",
 )
 
 
@@ -38,6 +39,9 @@ def _fwd_triton_torch_op(
   causal: int,
   autotune: int,
   autotune_mode_is_max: int,
+  dropout_p: float,
+  philox_seed: int,
+  philox_offset: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
   from ._ffpa_fwd import _ffpa_attn_forward_impl as _triton_fwd_kernel
 
@@ -69,6 +73,9 @@ def _fwd_triton_torch_op(
     softmax_scale=softmax_scale,
     autotune=bool(autotune),
     autotune_mode="max" if autotune_mode_is_max else "fast",
+    dropout_p=dropout_p,
+    philox_seed=philox_seed,
+    philox_offset=philox_offset,
   )
   return o, softmax_lse
 
@@ -83,6 +90,9 @@ def _fwd_triton_fake(
   causal: int,
   autotune: int,
   autotune_mode_is_max: int,
+  dropout_p: float,
+  philox_seed: int,
+  philox_offset: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
   seqlen_q_aligned = ((q.size(2) + 127) // 128) * 128
   o = torch.empty_like(q)
@@ -94,7 +104,8 @@ torch.library.define(
   f"{_OP_NAMESPACE}::_bwd_triton",
   "(Tensor dO, Tensor q, Tensor k, Tensor v, Tensor o, Tensor lse, Tensor? attn_bias, "
   "float softmax_scale, int causal, int autotune, "
-  "int autotune_mode_is_max, int kernel_version_is_v2, int preprocess_d_chunk, int return_attn_bias_grad) "
+  "int autotune_mode_is_max, int kernel_version_is_v2, int preprocess_d_chunk, int return_attn_bias_grad, "
+  "float dropout_p, int philox_seed, int philox_offset) "
   "-> (Tensor dq, Tensor dk, Tensor dv, Tensor grad_attn_bias)",
 )
 
@@ -115,6 +126,9 @@ def _bwd_triton_torch_op(
   kernel_version_is_v2: int,
   preprocess_d_chunk: int,
   return_attn_bias_grad: int,
+  dropout_p: float,
+  philox_seed: int,
+  philox_offset: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
   from ._ffpa_bwd import _ffpa_attn_backward_triton_impl as _triton_bwd_kernel
 
@@ -147,6 +161,9 @@ def _bwd_triton_torch_op(
     autotune_mode="max" if autotune_mode_is_max else "fast",
     kernel_version="v2" if kernel_version_is_v2 else "v1",
     preprocess_d_chunk=bool(preprocess_d_chunk),
+    dropout_p=dropout_p,
+    philox_seed=philox_seed,
+    philox_offset=philox_offset,
   )
   return dq, dk, dv, grad_attn_bias
 
@@ -167,8 +184,21 @@ def _bwd_triton_fake(
   kernel_version_is_v2: int,
   preprocess_d_chunk: int,
   return_attn_bias_grad: int,
+  dropout_p: float,
+  philox_seed: int,
+  philox_offset: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-  del softmax_scale, causal, autotune, autotune_mode_is_max, kernel_version_is_v2, preprocess_d_chunk
+  del (
+    softmax_scale,
+    causal,
+    autotune,
+    autotune_mode_is_max,
+    kernel_version_is_v2,
+    preprocess_d_chunk,
+    dropout_p,
+    philox_seed,
+    philox_offset,
+  )
   if attn_bias is not None and return_attn_bias_grad:
     grad_dtype = torch.float32 if _attn_bias_grad_needs_reduction(attn_bias, q, k) else attn_bias.dtype
     grad_attn_bias = torch.empty_like(attn_bias, dtype=grad_dtype)

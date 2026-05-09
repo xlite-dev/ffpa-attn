@@ -33,7 +33,7 @@ def _should_fallback_to_sdpa(
 
   * ``head_dim <= 256``
   * ``head_dim > 1024``
-  * ``dropout_p > 0.0``
+  * ``dropout_p > 0.0`` when the large-D forward backend is not Triton
   * ``Nq < 512 && Nq != 1``
   * ``Nk < 512``
 
@@ -48,7 +48,7 @@ def _should_fallback_to_sdpa(
   _fallback = any([
     D <= 256,
     D > 1024,
-    dropout_p > 0.0,
+    dropout_p > 0.0 and forward_backend != "triton",
     # attn_mask is only supported by triton backend for now.
     attn_mask is not None and forward_backend != "triton",
     (Nq < 512 and Nq != 1),
@@ -109,7 +109,7 @@ def ffpa_attn_func(
 
   Backward pass is supported via :class:`FFPAAttnFunc`. The public API falls
   back to SDPA for cases FFPA does not currently support directly (small-D,
-  ``D > 1024``, and dropout), and otherwise keeps the
+  ``D > 1024``, and non-Triton large-D dropout), and otherwise keeps the
   existing FFPA forward plus SDPA/FFPA backward routing. Large-D Triton forward
   and backward support explicit additive ``attn_mask`` gradients.
   ``forward_backend`` only affects the large-D path.
@@ -126,9 +126,8 @@ def ffpa_attn_func(
       ``[B, Nh_q, Nq, Nkv]``. Boolean masks follow SDPA semantics where
       ``True`` means the element participates in attention; floating masks are
       additive attention bias. Large-D Triton supports additive mask gradients.
-  :param dropout_p: Dropout probability. Passing ``dropout_p > 0`` currently
-      routes the call to SDPA because the FFPA native kernels do not yet
-      implement dropout.
+    :param dropout_p: Dropout probability. Large-D Triton implements SDPA-style
+      attention dropout; non-Triton large-D dropout routes to SDPA.
   :param is_causal: When ``True``, apply a causal attention mask so that
       query row ``r`` only attends to KV positions ``k <= r + (Nkv - Nq)``
       (standard ``queries aligned to KV tail`` convention). Requires

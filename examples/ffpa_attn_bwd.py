@@ -7,7 +7,8 @@ PyTorch SDPA for backward correctness and backward runtime by default:
 2. Cross / Decode Attention  -- Nq != Nkv (short query, long KV).
 3. Grouped-Query Attention   -- Nh_q % Nh_kv == 0, Nh_kv < Nh_q (MQA => Nh_kv=1).
 4. Causal Attention          -- causal=True, queries aligned to KV tail.
-5. Non-aligned Seqlen        -- N=8191 (not a multiple of Bc=64).
+5. Dropout Attention         -- dropout_p > 0, compares against SDPA dropout.
+6. Non-aligned Seqlen        -- N=8191 (not a multiple of Bc=64).
 
 Usage::
 
@@ -43,6 +44,7 @@ def _parse_args() -> argparse.Namespace:
   parser.add_argument("--B", type=int, default=1, help="Batch size.")
   parser.add_argument("--N", type=int, default=8192, help="Sequence length (non-aligned uses N-1).")
   parser.add_argument("--D", type=int, default=512, help="Head dimension.")
+  parser.add_argument("--dropout-p", type=float, default=0.1, help="Dropout probability for the dropout example case.")
   parser.add_argument("--seed", type=int, default=42, help="Random seed for input tensors.")
   parser.add_argument(
     "--timing-mode",
@@ -85,18 +87,31 @@ def _make_broadcast_additive_attn_mask(nq: int, nkv: int, dtype: torch.dtype, se
   return (torch.randn(1, 1, nq, nkv, dtype=dtype, device="cuda") * 0.25).requires_grad_(True)
 
 
-def _time_fn(fn, *args, warmup: int = WARMUP, iters: int = ITERS) -> float:
+def _time_fn(fn, *args, warmup: int = WARMUP, iters: int = ITERS, rng_seed: int | None = None) -> float:
   for _ in range(warmup):
+    if rng_seed is not None:
+      torch.manual_seed(rng_seed)
     fn(*args)
   torch.cuda.synchronize()
   t0 = time.perf_counter()
   for _ in range(iters):
+    if rng_seed is not None:
+      torch.manual_seed(rng_seed)
     fn(*args)
   torch.cuda.synchronize()
   return (time.perf_counter() - t0) * 1000.0 / iters  # ms
 
 
-def _time_backward_only(fn, q, k, v, grad_out, warmup: int = WARMUP, iters: int = ITERS) -> float:
+def _time_backward_only(
+  fn,
+  q,
+  k,
+  v,
+  grad_out,
+  warmup: int = WARMUP,
+  iters: int = ITERS,
+  rng_seed: int | None = None,
+) -> float:
   start_event = torch.cuda.Event(enable_timing=True)
   end_event = torch.cuda.Event(enable_timing=True)
 
@@ -104,6 +119,8 @@ def _time_backward_only(fn, q, k, v, grad_out, warmup: int = WARMUP, iters: int 
     q_i = q.detach().clone().requires_grad_(True)
     k_i = k.detach().clone().requires_grad_(True)
     v_i = v.detach().clone().requires_grad_(True)
+    if rng_seed is not None:
+      torch.manual_seed(rng_seed)
     out = fn(q_i, k_i, v_i)
     torch.cuda.synchronize()
     out.backward(grad_out)
@@ -114,6 +131,8 @@ def _time_backward_only(fn, q, k, v, grad_out, warmup: int = WARMUP, iters: int 
     q_i = q.detach().clone().requires_grad_(True)
     k_i = k.detach().clone().requires_grad_(True)
     v_i = v.detach().clone().requires_grad_(True)
+    if rng_seed is not None:
+      torch.manual_seed(rng_seed)
     out = fn(q_i, k_i, v_i)
     torch.cuda.synchronize()
     start_event.record()
@@ -135,6 +154,7 @@ def _ffpa_forward(
   triton_autotune_mode: str = "fast",
   causal: bool = False,
   attn_mask: torch.Tensor | None = None,
+  dropout_p: float = 0.0,
 ) -> torch.Tensor:
   return ffpa_attn_func(
     q_i,
@@ -142,6 +162,7 @@ def _ffpa_forward(
     v_i,
     attn_mask=attn_mask,
     is_causal=causal,
+    dropout_p=dropout_p,
     scale=scale,
     enable_gqa=q_i.size(1) != k_i.size(1),
     backward_backend=backward_backend,
@@ -157,12 +178,13 @@ def _sdpa_forward(
   scale: float,
   causal: bool = False,
   attn_mask: torch.Tensor | None = None,
+  dropout_p: float = 0.0,
 ) -> torch.Tensor:
   group_size = q_i.size(1) // k_i.size(1)
   k_in = k_i.repeat_interleave(group_size, dim=1) if group_size > 1 else k_i
   v_in = v_i.repeat_interleave(group_size, dim=1) if group_size > 1 else v_i
   kw = {"attn_mask": attn_mask} if attn_mask is not None else _make_sdpa_kwargs(causal, q_i.size(2), k_i.size(2))
-  return F.scaled_dot_product_attention(q_i, k_in, v_in, scale=scale, **kw)
+  return F.scaled_dot_product_attention(q_i, k_in, v_in, scale=scale, dropout_p=dropout_p, **kw)
 
 
 def _run_ffpa_backward(
@@ -175,6 +197,7 @@ def _run_ffpa_backward(
   triton_autotune_mode: str = "fast",
   causal: bool = False,
   attn_mask: torch.Tensor | None = None,
+  dropout_p: float = 0.0,
 ) -> None:
   if attn_mask is not None:
     attn_mask.grad = None
@@ -191,6 +214,7 @@ def _run_ffpa_backward(
     triton_autotune_mode=triton_autotune_mode,
     causal=causal,
     attn_mask=attn_mask,
+    dropout_p=dropout_p,
   )
   out.sum().backward()
 
@@ -202,6 +226,7 @@ def _run_sdpa_backward(
   scale: float,
   causal: bool = False,
   attn_mask: torch.Tensor | None = None,
+  dropout_p: float = 0.0,
 ) -> None:
   if attn_mask is not None:
     attn_mask.grad = None
@@ -209,7 +234,7 @@ def _run_sdpa_backward(
   k_i = k.detach().clone().requires_grad_(True)
   v_i = v.detach().clone().requires_grad_(True)
 
-  out = _sdpa_forward(q_i, k_i, v_i, scale, causal=causal, attn_mask=attn_mask)
+  out = _sdpa_forward(q_i, k_i, v_i, scale, causal=causal, attn_mask=attn_mask, dropout_p=dropout_p)
   out.sum().backward()
 
 
@@ -220,6 +245,8 @@ def _sdpa_ref_grads(
   scale: float,
   causal: bool = False,
   attn_mask: torch.Tensor | None = None,
+  dropout_p: float = 0.0,
+  dropout_seed: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
   q_ref = q.detach().clone().requires_grad_(True)
   k_ref = k.detach().clone().requires_grad_(True)
@@ -234,7 +261,9 @@ def _sdpa_ref_grads(
   kw = {
     "attn_mask": attn_mask_ref
   } if attn_mask_ref is not None else _make_sdpa_kwargs(causal, q_ref.size(2), k_ref.size(2))
-  out_ref = F.scaled_dot_product_attention(q_ref, k_in, v_in, scale=scale, **kw)
+  if dropout_seed is not None:
+    torch.manual_seed(dropout_seed)
+  out_ref = F.scaled_dot_product_attention(q_ref, k_in, v_in, scale=scale, dropout_p=dropout_p, **kw)
   out_ref.sum().backward()
   return q_ref.grad, k_ref.grad, v_ref.grad, attn_mask_ref.grad if attn_mask_ref is not None else None
 
@@ -254,6 +283,7 @@ def _run_case(
   D: int,
   causal: bool = False,
   attn_mask: torch.Tensor | None = None,
+  dropout_p: float = 0.0,
   timing_mode: str = "backward-only",
 ) -> None:
   torch.manual_seed(seed)
@@ -261,13 +291,16 @@ def _run_case(
   k = torch.randn(B, Nh_kv, Nkv, D, dtype=dtype, device="cuda", requires_grad=True)
   v = torch.randn(B, Nh_kv, Nkv, D, dtype=dtype, device="cuda", requires_grad=True)
   scale = 1.0 / math.sqrt(D)
+  dropout_seed = seed + 17
 
+  torch.manual_seed(dropout_seed)
   out = ffpa_attn_func(
     q,
     k,
     v,
     attn_mask=attn_mask,
     is_causal=causal,
+    dropout_p=dropout_p,
     scale=scale,
     enable_gqa=Nh_q != Nh_kv,
     backward_backend=backward_backend,
@@ -280,7 +313,16 @@ def _run_case(
   dk_ffpa = k.grad.detach().clone()
   dv_ffpa = v.grad.detach().clone()
   dmask_ffpa = attn_mask.grad.detach().clone() if attn_mask is not None and attn_mask.grad is not None else None
-  dq_ref, dk_ref, dv_ref, dmask_ref = _sdpa_ref_grads(q, k, v, scale, causal=causal, attn_mask=attn_mask)
+  dq_ref, dk_ref, dv_ref, dmask_ref = _sdpa_ref_grads(
+    q,
+    k,
+    v,
+    scale,
+    causal=causal,
+    attn_mask=attn_mask,
+    dropout_p=dropout_p,
+    dropout_seed=dropout_seed,
+  )
 
   if timing_mode == "backward-only":
     grad_out = torch.ones_like(q)
@@ -295,18 +337,29 @@ def _run_case(
         triton_autotune_mode,
         causal,
         attn_mask,
+        dropout_p,
       ),
       q,
       k,
       v,
       grad_out,
+      rng_seed=dropout_seed if dropout_p > 0.0 else None,
     )
     ms_sdpa = _time_backward_only(
-      lambda q_i, k_i, v_i: _sdpa_forward(q_i, k_i, v_i, scale, causal=causal, attn_mask=attn_mask),
+      lambda q_i, k_i, v_i: _sdpa_forward(
+        q_i,
+        k_i,
+        v_i,
+        scale,
+        causal=causal,
+        attn_mask=attn_mask,
+        dropout_p=dropout_p,
+      ),
       q,
       k,
       v,
       grad_out,
+      rng_seed=dropout_seed if dropout_p > 0.0 else None,
     )
   else:
     ms_ffpa = _time_fn(
@@ -320,8 +373,20 @@ def _run_case(
       triton_autotune_mode,
       causal,
       attn_mask,
+      dropout_p,
+      rng_seed=dropout_seed if dropout_p > 0.0 else None,
     )
-    ms_sdpa = _time_fn(_run_sdpa_backward, q, k, v, scale, causal, attn_mask)
+    ms_sdpa = _time_fn(
+      _run_sdpa_backward,
+      q,
+      k,
+      v,
+      scale,
+      causal,
+      attn_mask,
+      dropout_p,
+      rng_seed=dropout_seed if dropout_p > 0.0 else None,
+    )
 
   dt_tag = str(dtype).replace("torch.", "")
   dmask_msg = "dMask_err=(NO Grad)  "
@@ -329,7 +394,7 @@ def _run_case(
     dmask_msg = f"dMask_err={(dmask_ffpa - dmask_ref).abs().max().item():.4e}  "
   print(
     f"[{name:<14} {dt_tag:<8}] "
-    f"B={B} Hq={Nh_q} Hkv={Nh_kv} Nq={Nq} Nkv={Nkv} D={D} causal={int(causal)}  "
+    f"B={B} Hq={Nh_q} Hkv={Nh_kv} Nq={Nq} Nkv={Nkv} D={D} causal={int(causal)} dropout_p={dropout_p:g}  "
     f"dQ_err={(dq_ffpa - dq_ref).abs().max().item():.4e}  "
     f"dK_err={(dk_ffpa - dk_ref).abs().max().item():.4e}  "
     f"dV_err={(dv_ffpa - dv_ref).abs().max().item():.4e}  "
@@ -440,6 +505,22 @@ def main() -> None:
         Nkv=mask_n,
         D=D,
         attn_mask=_make_broadcast_additive_attn_mask(mask_n, mask_n, dtype, args.seed),
+        timing_mode=args.timing_mode,
+      )
+      _run_case(
+        "dropout",
+        dtype,
+        args.backward_backend,
+        args.triton_backward_autotune,
+        args.triton_autotune_mode,
+        seed=args.seed,
+        B=args.B,
+        Nh_q=32,
+        Nh_kv=32,
+        Nq=N,
+        Nkv=N,
+        D=D,
+        dropout_p=args.dropout_p,
         timing_mode=args.timing_mode,
       )
     _run_case(

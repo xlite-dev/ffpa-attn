@@ -59,6 +59,9 @@ def _aten_efficient_attn_backward(
   high_precision_grad: bool = False,
   attn_bias: torch.Tensor | None = None,
   return_attn_bias_grad: bool = False,
+  dropout_p: float = 0.0,
+  philox_seed: int = 0,
+  philox_offset: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
   """Run large-D backward through PyTorch's efficient-attention backward op.
 
@@ -82,6 +85,9 @@ def _aten_efficient_attn_backward(
     additive bias before entering this wrapper.
   :param return_attn_bias_grad: Whether to request the additive-bias gradient
     from the aten op.
+  :param dropout_p: Dropout probability used by the forward pass.
+  :param philox_seed: Philox seed saved from the forward pass.
+  :param philox_offset: Philox offset saved from the forward pass.
   :returns: ``(dq, dk, dv, d_attn_bias)`` with the original ``q`` / ``k`` /
     ``v`` dtypes and head layouts. ``d_attn_bias`` is ``None`` unless
     requested for an explicit additive bias.
@@ -138,9 +144,13 @@ def _aten_efficient_attn_backward(
     k_in = k_in.repeat_interleave(group_size, dim=1).contiguous()
     v_in = v_in.repeat_interleave(group_size, dim=1).contiguous()
 
-  zero_u64 = torch.zeros(2, dtype=torch.uint64, device=q.device)
-  philox_seed = zero_u64[0].unsqueeze(0)
-  philox_offset = zero_u64[1].unsqueeze(0)
+  if dropout_p > 0.0:
+    philox_seed_t = torch.tensor([philox_seed], dtype=torch.int64)
+    philox_offset_t = torch.tensor([philox_offset], dtype=torch.int64)
+  else:
+    zero_i64 = torch.zeros(2, dtype=torch.int64)
+    philox_seed_t = zero_i64[0].unsqueeze(0)
+    philox_offset_t = zero_i64[1].unsqueeze(0)
   dq, dk_expanded, dv_expanded, grad_attn_bias = (
     torch.ops.aten._scaled_dot_product_efficient_attention_backward.default(
       grad_out_in,
@@ -150,9 +160,9 @@ def _aten_efficient_attn_backward(
       attn_bias,
       o_in,
       lse_in,
-      philox_seed,
-      philox_offset,
-      0.0,
+      philox_seed_t,
+      philox_offset_t,
+      dropout_p,
       (True, True, True, bool(return_attn_bias_grad and original_attn_bias is not None)),
       causal_for_op,
       scale=softmax_scale,

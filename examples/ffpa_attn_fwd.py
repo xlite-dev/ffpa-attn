@@ -7,7 +7,8 @@ against ``torch.nn.functional.scaled_dot_product_attention``:
 2. Cross / Decode Attention  -- Nq != Nkv (short query, long KV).
 3. Grouped-Query Attention   -- Nh_q % Nh_kv == 0, Nh_kv < Nh_q (MQA => Nh_kv=1).
 4. Causal Attention          -- causal=True, queries aligned to KV tail.
-5. Non-aligned Seqlen        -- N=8191 (not a multiple of Bc=64), exercises
+5. Dropout Attention         -- dropout_p > 0, compares against SDPA dropout.
+6. Non-aligned Seqlen        -- N=8191 (not a multiple of Bc=64), exercises
                                cp.async zero-fill + softmax -inf mask +
                                per-row store predicate on the tail tile.
 
@@ -45,6 +46,7 @@ def _parse_args() -> argparse.Namespace:
   parser.add_argument("--B", type=int, default=1, help="Batch size.")
   parser.add_argument("--N", type=int, default=8192, help="Sequence length (non-aligned uses N-1).")
   parser.add_argument("--D", type=int, default=512, help="Head dimension.")
+  parser.add_argument("--dropout-p", type=float, default=0.1, help="Dropout probability for the dropout example case.")
   parser.add_argument("--seed", type=int, default=42, help="Random seed for input tensors.")
   parser.add_argument(
     "--triton-forward-autotune",
@@ -64,7 +66,7 @@ def _parse_args() -> argparse.Namespace:
   return parser.parse_args()
 
 
-def _sdpa_ref(q, k, v, is_causal: bool = False, attn_mask: torch.Tensor | None = None):
+def _sdpa_ref(q, k, v, is_causal: bool = False, attn_mask: torch.Tensor | None = None, dropout_p: float = 0.0):
   return F.scaled_dot_product_attention(
     q,
     k,
@@ -72,6 +74,7 @@ def _sdpa_ref(q, k, v, is_causal: bool = False, attn_mask: torch.Tensor | None =
     attn_mask=attn_mask,
     scale=1.0 / math.sqrt(q.size(-1)),
     is_causal=is_causal,
+    dropout_p=dropout_p,
   )
 
 
@@ -81,12 +84,16 @@ def _make_broadcast_additive_attn_mask(nq: int, nkv: int, dtype: torch.dtype, se
   return torch.randn(1, 1, nq, nkv, dtype=dtype, device="cuda") * 0.25
 
 
-def _time_fn(fn, *args, warmup: int = WARMUP, iters: int = ITERS) -> float:
+def _time_fn(fn, *args, warmup: int = WARMUP, iters: int = ITERS, rng_seed: int | None = None) -> float:
   for _ in range(warmup):
+    if rng_seed is not None:
+      torch.manual_seed(rng_seed)
     fn(*args)
   torch.cuda.synchronize()
   t0 = time.perf_counter()
   for _ in range(iters):
+    if rng_seed is not None:
+      torch.manual_seed(rng_seed)
     fn(*args)
   torch.cuda.synchronize()
   return (time.perf_counter() - t0) * 1000.0 / iters  # ms
@@ -116,6 +123,7 @@ def _run_case(
   D: int,
   causal: bool = False,
   attn_mask: torch.Tensor | None = None,
+  dropout_p: float = 0.0,
   acc: str = "f32",
 ) -> None:
   torch.manual_seed(seed)
@@ -123,6 +131,7 @@ def _run_case(
   k = torch.randn(B, Nh_kv, Nkv, D, dtype=dtype, device="cuda")
   v = torch.randn(B, Nh_kv, Nkv, D, dtype=dtype, device="cuda")
 
+  torch.manual_seed(seed + 17)
   out_ffpa = ffpa_attn_func(
     q,
     k,
@@ -131,13 +140,15 @@ def _run_case(
     acc=acc,
     attn_mask=attn_mask,
     is_causal=causal,
+    dropout_p=dropout_p,
     enable_gqa=Nh_q != Nh_kv,
     forward_backend=forward_backend,
     triton_forward_autotune=triton_forward_autotune,
     triton_autotune_mode=triton_autotune_mode,
   )
   k_ref, v_ref = _expand_kv(k, v, Nh_q)
-  out_sdpa = _sdpa_ref(q, k_ref, v_ref, is_causal=causal, attn_mask=attn_mask)
+  torch.manual_seed(seed + 17)
+  out_sdpa = _sdpa_ref(q, k_ref, v_ref, is_causal=causal, attn_mask=attn_mask, dropout_p=dropout_p)
 
   diff = (out_ffpa.float() - out_sdpa.float()).abs()
   tol = 5e-2 if dtype == torch.bfloat16 else 2e-2
@@ -152,6 +163,7 @@ def _run_case(
       acc=acc,
       attn_mask=attn_mask,
       is_causal=causal,
+      dropout_p=dropout_p,
       enable_gqa=Nh_q != Nh_kv,
       forward_backend=forward_backend,
       triton_forward_autotune=triton_forward_autotune,
@@ -160,13 +172,20 @@ def _run_case(
     q,
     k,
     v,
+    rng_seed=seed + 17 if dropout_p > 0.0 else None,
   )
-  ms_sdpa = _time_fn(lambda q, k, v: _sdpa_ref(q, k, v, is_causal=causal, attn_mask=attn_mask), q, k_ref, v_ref)
+  ms_sdpa = _time_fn(
+    lambda q, k, v: _sdpa_ref(q, k, v, is_causal=causal, attn_mask=attn_mask, dropout_p=dropout_p),
+    q,
+    k_ref,
+    v_ref,
+    rng_seed=seed + 17 if dropout_p > 0.0 else None,
+  )
 
   dt_tag = str(dtype).replace("torch.", "")
   print(
     f"[{name:<16} {dt_tag:<8} acc={acc}] "
-    f"B={B} Hq={Nh_q} Hkv={Nh_kv} Nq={Nq} Nkv={Nkv} D={D} causal={int(causal)}  "
+    f"B={B} Hq={Nh_q} Hkv={Nh_kv} Nq={Nq} Nkv={Nkv} D={D} causal={int(causal)} dropout_p={dropout_p:g}  "
     f"max|diff|={diff.max().item():.4f}  mean|diff|={diff.mean().item():.5f}  "
     f"allclose(atol={tol})={ok}  "
     f"backend={forward_backend}  "
@@ -270,6 +289,21 @@ def main() -> None:
         Nkv=mask_n,
         D=D,
         attn_mask=_make_broadcast_additive_attn_mask(mask_n, mask_n, dtype, args.seed),
+      )
+      _run_case(
+        "dropout",
+        dtype,
+        args.forward_backend,
+        args.triton_forward_autotune,
+        args.triton_autotune_mode,
+        seed=args.seed,
+        B=args.B,
+        Nh_q=32,
+        Nh_kv=32,
+        Nq=N,
+        Nkv=N,
+        D=D,
+        dropout_p=args.dropout_p,
       )
     _run_case(
       "non-aligned",
