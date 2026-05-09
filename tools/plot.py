@@ -74,7 +74,7 @@ def autolabel(rects):
     offset = 8 if h >= 1 else 20
     va_pos = 'bottom' if h >= 1 else 'top'
     ax.annotate(
-      f'{h:.2f}',
+      f'{h:.2f}x',
       xy=(rect.get_x() + rect.get_width() / 2, h),
       xytext=(0, offset),
       textcoords='offset points',
@@ -89,12 +89,12 @@ autolabel(rect_sdpa)
 autolabel(rect_fwd)
 autolabel(rect_bwd)
 
-ax.set_ylabel('Speedup Ratio (FFPA / SDPA)', fontsize=18, fontweight='semibold')
+ax.set_ylabel('Speedup Ratio (FFPA / SDPA)', fontsize=18)
 ax.set_title(
-  'FFPA vs SDPA Speedup (FWD & BWD)\nNVIDIA RTX 5090 Blackwell | B=1, N=8192, H=32, D=512',
+  'FFPA vs SDPA Speedup (FWD & BWD), NVIDIA RTX 5090 Blackwell | B=1, N=8192, H=32, D=512',
   fontsize=22,
-  pad=30,
-  fontweight='semibold'
+  pad=15,
+  fontweight='bold'
 )
 
 ax.set_xticks(x)

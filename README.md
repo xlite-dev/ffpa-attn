@@ -63,11 +63,10 @@ We extend FlashAttention to support large headdim ($D>256$) via **fine-grained t
 
 ## 🎉 Benchmark
 
-Runnable examples are provided under [`examples`](./examples). The performance benchmark for the 4090 with large headdim (D=320~1024) is shown below. Please refer to our [bench](./bench/README.md) for more details.
+Runnable examples are provided under [`examples`](./examples). The performance benchmark for the 5090 with large headdim (D=512) is shown below. Please refer to our [bench](./bench/README.md) for more details.
 
 <div align='center'>
-  <img src='https://github.com/user-attachments/assets/447e2937-f7c8-47c8-8550-8c0c71b910e6' width="370px">
-  <img src='https://github.com/user-attachments/assets/65a8d564-8fa7-4d66-86b9-e238feb86143' width="370px">
+  <img src='./docs/assets/ffpa_speedup.png' width='750px'>
 </div>
 
 
