@@ -6,8 +6,11 @@
 #include "ffpa_attn_bwd_templates.cuh"
 using namespace ffpa;
 
-static constexpr int kMaxDForSmallDKernel = 64;
-static constexpr int kMaxDForOStoreFloat32 = 64;
+static constexpr int kMaxDForSmallDKernel = 128;
+// Always use fp32 accumulators for O to reduce numerical instability
+// for D up to 512; Use fp16/bf16 for D > 512 to save registers, since
+// the larger D may cuase register spilling when using fp32 accumulators.
+static constexpr int kMaxDForOStoreFloat32 = 512;
 static constexpr int kMaxDForSmallBlockTile = 256;
 
 static inline int select_decode_num_splits(int batch_nheads_mblocks, int num_sms, int num_n_blocks,
