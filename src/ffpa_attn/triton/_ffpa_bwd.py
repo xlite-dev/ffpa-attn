@@ -21,14 +21,6 @@ Phase 2 (per Q-block, D-chunk):
     dV_d = (dO_d^T @ P)^T             [BLOCK_N, BLOCK_HEADDIM]  (atomicAdd)
 
 delta = rowsum(dO * O) is precomputed.
-
-Known Limitations & Future Optimizations:
-1. **Q / dO / K repeated HBM reads across D-chunks.**  Phase 1 and Phase 2
-   both iterate over D-chunks independently.  For D=512 with BLOCK_HEADDIM=128
-   this means 4 chunks x 2 phases = 8 HBM loads each for Q, dO and K.  A
-   future optimisation should cache these tiles in shared memory (requires
-   >= 64 KB SMEM, i.e. Ada or extended Ampere) or split the kernel into
-   Phase-1-only and Phase-2-only kernels to eliminate the re-reads entirely.
 """
 
 import math
