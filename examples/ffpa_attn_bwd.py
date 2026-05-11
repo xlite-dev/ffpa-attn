@@ -29,6 +29,7 @@ import torch.nn.functional as F
 from ffpa_attn import ffpa_attn_func
 
 WARMUP, ITERS = 2, 10
+MAX_MASK_GRAD_SEQLEN = 8192
 
 
 def _parse_args() -> argparse.Namespace:
@@ -82,9 +83,63 @@ def _make_sdpa_kwargs(causal: bool, nq: int, nkv: int):
 
 
 def _make_broadcast_additive_attn_mask(nq: int, nkv: int, dtype: torch.dtype, seed: int) -> torch.Tensor:
-  """Build a differentiable broadcastable additive attention bias."""
+  """Build a differentiable key-position additive attention bias."""
+  del dtype
   torch.manual_seed(seed + 1)
-  return (torch.randn(1, 1, nq, nkv, dtype=dtype, device="cuda") * 0.25).requires_grad_(True)
+  del nq
+  return (torch.randn(1, 1, 1, nkv, dtype=torch.float32, device="cuda") * 0.25).requires_grad_(True)
+
+
+def _is_key_position_bias(attn_mask: torch.Tensor | None, Nkv: int) -> bool:
+  """Return whether ``attn_mask`` is a compact [1, 1, 1, Nkv] key bias."""
+  return attn_mask is not None and tuple(attn_mask.shape) == (1, 1, 1, Nkv)
+
+
+def _key_position_bias_grad_ref(
+  q: torch.Tensor,
+  k: torch.Tensor,
+  v: torch.Tensor,
+  scale: float,
+  attn_mask: torch.Tensor,
+  block_m: int = 128,
+  block_n: int = 1024,
+) -> torch.Tensor:
+  """Compute a fp32 reference gradient for compact key-position additive bias."""
+  with torch.no_grad():
+    group_size = q.size(1) // k.size(1)
+    k_ref = k.detach().repeat_interleave(group_size, dim=1) if group_size > 1 else k.detach()
+    v_ref = v.detach().repeat_interleave(group_size, dim=1) if group_size > 1 else v.detach()
+    q_f = q.detach().float()
+    k_f = k_ref.float()
+    key_value_sum = v_ref.float().sum(dim=-1)
+    key_bias = attn_mask.detach().reshape(-1).float()
+    Nq = q.size(2)
+    Nkv = k_ref.size(2)
+    grad = torch.zeros(Nkv, dtype=torch.float32, device=q.device)
+
+    for m_start in range(0, Nq, block_m):
+      q_block = q_f[:, :, m_start:m_start + block_m, :]
+      lse = torch.full(q_block.shape[:-1], -torch.inf, dtype=torch.float32, device=q.device)
+      for n_start in range(0, Nkv, block_n):
+        scores = torch.matmul(q_block, k_f[:, :, n_start:n_start + block_n, :].transpose(-2, -1)) * scale
+        scores = scores + key_bias[n_start:n_start + block_n].view(1, 1, 1, -1)
+        lse = torch.logaddexp(lse, torch.logsumexp(scores, dim=-1))
+
+      delta = torch.zeros_like(lse)
+      for n_start in range(0, Nkv, block_n):
+        scores = torch.matmul(q_block, k_f[:, :, n_start:n_start + block_n, :].transpose(-2, -1)) * scale
+        scores = scores + key_bias[n_start:n_start + block_n].view(1, 1, 1, -1)
+        prob = torch.exp(scores - lse[..., None])
+        delta += (prob * key_value_sum[:, :, None, n_start:n_start + block_n]).sum(dim=-1)
+
+      for n_start in range(0, Nkv, block_n):
+        scores = torch.matmul(q_block, k_f[:, :, n_start:n_start + block_n, :].transpose(-2, -1)) * scale
+        scores = scores + key_bias[n_start:n_start + block_n].view(1, 1, 1, -1)
+        prob = torch.exp(scores - lse[..., None])
+        d_bias = prob * (key_value_sum[:, :, None, n_start:n_start + block_n] - delta[..., None])
+        grad[n_start:n_start + block_n] += d_bias.sum(dim=(0, 1, 2))
+
+    return grad.view(1, 1, 1, Nkv)
 
 
 def _time_fn(fn, *args, warmup: int = WARMUP, iters: int = ITERS, rng_seed: int | None = None) -> float:
@@ -183,7 +238,8 @@ def _sdpa_forward(
   group_size = q_i.size(1) // k_i.size(1)
   k_in = k_i.repeat_interleave(group_size, dim=1) if group_size > 1 else k_i
   v_in = v_i.repeat_interleave(group_size, dim=1) if group_size > 1 else v_i
-  kw = {"attn_mask": attn_mask} if attn_mask is not None else _make_sdpa_kwargs(causal, q_i.size(2), k_i.size(2))
+  sdpa_mask = attn_mask.to(q_i.dtype) if attn_mask is not None and attn_mask.dtype != q_i.dtype else attn_mask
+  kw = {"attn_mask": sdpa_mask} if sdpa_mask is not None else _make_sdpa_kwargs(causal, q_i.size(2), k_i.size(2))
   return F.scaled_dot_product_attention(q_i, k_in, v_in, scale=scale, dropout_p=dropout_p, **kw)
 
 
@@ -245,6 +301,7 @@ def _sdpa_ref_grads(
   scale: float,
   causal: bool = False,
   attn_mask: torch.Tensor | None = None,
+  return_mask_grad: bool = True,
   dropout_p: float = 0.0,
   dropout_seed: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
@@ -257,7 +314,11 @@ def _sdpa_ref_grads(
   v_in = v_ref.repeat_interleave(group_size, dim=1) if group_size > 1 else v_ref
   attn_mask_ref = None
   if attn_mask is not None:
-    attn_mask_ref = attn_mask.detach().clone().requires_grad_(attn_mask.requires_grad)
+    attn_mask_ref = attn_mask.detach().clone()
+    if attn_mask_ref.dtype != q_ref.dtype:
+      attn_mask_ref = attn_mask_ref.to(q_ref.dtype)
+      return_mask_grad = False
+    attn_mask_ref.requires_grad_(return_mask_grad and attn_mask.requires_grad)
   kw = {
     "attn_mask": attn_mask_ref
   } if attn_mask_ref is not None else _make_sdpa_kwargs(causal, q_ref.size(2), k_ref.size(2))
@@ -266,6 +327,14 @@ def _sdpa_ref_grads(
   out_ref = F.scaled_dot_product_attention(q_ref, k_in, v_in, scale=scale, dropout_p=dropout_p, **kw)
   out_ref.sum().backward()
   return q_ref.grad, k_ref.grad, v_ref.grad, attn_mask_ref.grad if attn_mask_ref is not None else None
+
+
+def _should_compare_mask_grad(B: int, Nh_q: int, Nq: int, Nkv: int, attn_mask: torch.Tensor | None) -> bool:
+  """Return whether the example should ask SDPA for additive-mask gradients."""
+  del B, Nh_q
+  if attn_mask is None or not attn_mask.requires_grad:
+    return False
+  return Nq <= MAX_MASK_GRAD_SEQLEN and Nkv <= MAX_MASK_GRAD_SEQLEN
 
 
 def _run_case(
@@ -292,13 +361,15 @@ def _run_case(
   v = torch.randn(B, Nh_kv, Nkv, D, dtype=dtype, device="cuda", requires_grad=True)
   scale = 1.0 / math.sqrt(D)
   dropout_seed = seed + 17
+  compare_mask_grad = _should_compare_mask_grad(B, Nh_q, Nq, Nkv, attn_mask)
+  active_attn_mask = attn_mask if compare_mask_grad else attn_mask.detach() if attn_mask is not None else None
 
   torch.manual_seed(dropout_seed)
   out = ffpa_attn_func(
     q,
     k,
     v,
-    attn_mask=attn_mask,
+    attn_mask=active_attn_mask,
     is_causal=causal,
     dropout_p=dropout_p,
     scale=scale,
@@ -312,17 +383,27 @@ def _run_case(
   dq_ffpa = q.grad.detach().clone()
   dk_ffpa = k.grad.detach().clone()
   dv_ffpa = v.grad.detach().clone()
-  dmask_ffpa = attn_mask.grad.detach().clone() if attn_mask is not None and attn_mask.grad is not None else None
+  dmask_ffpa = active_attn_mask.grad.detach().clone(
+  ) if active_attn_mask is not None and active_attn_mask.grad is not None else None
   dq_ref, dk_ref, dv_ref, dmask_ref = _sdpa_ref_grads(
     q,
     k,
     v,
     scale,
     causal=causal,
-    attn_mask=attn_mask,
+    attn_mask=active_attn_mask,
+    return_mask_grad=compare_mask_grad,
     dropout_p=dropout_p,
     dropout_seed=dropout_seed,
   )
+  if all([
+    compare_mask_grad,
+    dmask_ref is None,
+    dropout_p == 0.0,
+    not causal,
+    _is_key_position_bias(active_attn_mask, Nkv),
+  ]):
+    dmask_ref = _key_position_bias_grad_ref(q, k, v, scale, active_attn_mask)
 
   if timing_mode == "backward-only":
     grad_out = torch.ones_like(q)
@@ -336,7 +417,7 @@ def _run_case(
         triton_backward_autotune,
         triton_autotune_mode,
         causal,
-        attn_mask,
+        active_attn_mask,
         dropout_p,
       ),
       q,
@@ -352,7 +433,7 @@ def _run_case(
         v_i,
         scale,
         causal=causal,
-        attn_mask=attn_mask,
+        attn_mask=active_attn_mask,
         dropout_p=dropout_p,
       ),
       q,
@@ -372,7 +453,7 @@ def _run_case(
       triton_backward_autotune,
       triton_autotune_mode,
       causal,
-      attn_mask,
+      active_attn_mask,
       dropout_p,
       rng_seed=dropout_seed if dropout_p > 0.0 else None,
     )
@@ -383,7 +464,7 @@ def _run_case(
       v,
       scale,
       causal,
-      attn_mask,
+      active_attn_mask,
       dropout_p,
       rng_seed=dropout_seed if dropout_p > 0.0 else None,
     )
@@ -392,6 +473,8 @@ def _run_case(
   dmask_msg = "dMask_err=(NO Grad)  "
   if dmask_ffpa is not None and dmask_ref is not None:
     dmask_msg = f"dMask_err={(dmask_ffpa - dmask_ref).abs().max().item():.4e}  "
+  elif attn_mask is not None and not compare_mask_grad:
+    dmask_msg = "dMask_err=(SKIPPED large logical mask)  "
   print(
     f"[{name:<14} {dt_tag:<8}] "
     f"B={B} Hq={Nh_q} Hkv={Nh_kv} Nq={Nq} Nkv={Nkv} D={D} causal={int(causal)} dropout_p={dropout_p:g}  "

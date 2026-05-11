@@ -208,7 +208,7 @@ def test_ffpa_bwd_triton_additive_attn_mask_matches_sdpa(kernel_version):
   q = torch.randn(B, H, N, D, dtype=dtype, device="cuda", requires_grad=True)
   k = torch.randn(B, H, N, D, dtype=dtype, device="cuda", requires_grad=True)
   v = torch.randn(B, H, N, D, dtype=dtype, device="cuda", requires_grad=True)
-  attn_mask = (torch.randn(1, 1, N, N, dtype=dtype, device="cuda") * 0.25).requires_grad_(True)
+  attn_mask = (torch.randn(1, 1, 1, N, dtype=dtype, device="cuda") * 0.25).requires_grad_(True)
 
   scale = 1.0 / math.sqrt(D)
   out = ffpa_attn_func(
@@ -223,6 +223,8 @@ def test_ffpa_bwd_triton_additive_attn_mask_matches_sdpa(kernel_version):
     triton_backward_version=kernel_version,
   )
   out.sum().backward()
+  assert attn_mask.grad is not None
+  assert attn_mask.grad.shape == (1, 1, 1, N)
 
   dq_ref, dk_ref, dv_ref, dmask_ref = _sdpa_ref_grads(
     q,
@@ -248,7 +250,7 @@ def test_ffpa_bwd_triton_additive_attn_mask_only_grad_matches_sdpa():
   q = torch.randn(B, H, N, D, dtype=dtype, device="cuda")
   k = torch.randn(B, H, N, D, dtype=dtype, device="cuda")
   v = torch.randn(B, H, N, D, dtype=dtype, device="cuda")
-  attn_mask = (torch.randn(1, 1, N, N, dtype=dtype, device="cuda") * 0.25).requires_grad_(True)
+  attn_mask = (torch.randn(1, 1, 1, N, dtype=dtype, device="cuda") * 0.25).requires_grad_(True)
 
   scale = 1.0 / math.sqrt(D)
   out = ffpa_attn_func(
@@ -262,6 +264,8 @@ def test_ffpa_bwd_triton_additive_attn_mask_only_grad_matches_sdpa():
     backward_backend="triton",
   )
   out.sum().backward()
+  assert attn_mask.grad is not None
+  assert attn_mask.grad.shape == (1, 1, 1, N)
 
   _, _, _, dmask_ref = _sdpa_ref_grads(q, k, v, False, scale, attn_mask=attn_mask, return_mask_grad=True)
   torch.testing.assert_close(attn_mask.grad, dmask_ref, atol=3e-2, rtol=3e-2)
@@ -461,7 +465,7 @@ def test_ffpa_bwd_triton_dropout_additive_attn_mask_matches_sdpa(kernel_version)
   q = torch.randn(B, H, N, D, dtype=dtype, device="cuda", requires_grad=True)
   k = torch.randn(B, H, N, D, dtype=dtype, device="cuda", requires_grad=True)
   v = torch.randn(B, H, N, D, dtype=dtype, device="cuda", requires_grad=True)
-  attn_mask = (torch.randn(1, 1, N, N, dtype=dtype, device="cuda") * 0.25).requires_grad_(True)
+  attn_mask = (torch.randn(1, 1, 1, N, dtype=dtype, device="cuda") * 0.25).requires_grad_(True)
   grad_out = torch.randn_like(q)
 
   scale = 1.0 / math.sqrt(D)
@@ -480,6 +484,8 @@ def test_ffpa_bwd_triton_dropout_additive_attn_mask_matches_sdpa(kernel_version)
     triton_backward_version=kernel_version,
   )
   out.backward(grad_out)
+  assert attn_mask.grad is not None
+  assert attn_mask.grad.shape == (1, 1, 1, N)
 
   dq_ref, dk_ref, dv_ref, dmask_ref = _sdpa_ref_grads(
     q,
@@ -676,7 +682,7 @@ def test_ffpa_bwd_sdpa_backend_additive_attn_mask_matches_sdpa(dtype):
   q = torch.randn(B, H, N, D, dtype=dtype, device="cuda", requires_grad=True)
   k = torch.randn(B, H, N, D, dtype=dtype, device="cuda", requires_grad=True)
   v = torch.randn(B, H, N, D, dtype=dtype, device="cuda", requires_grad=True)
-  attn_mask = (torch.randn(1, 1, N, N, dtype=dtype, device="cuda") * 0.25).requires_grad_(True)
+  attn_mask = (torch.randn(1, 1, 1, N, dtype=dtype, device="cuda") * 0.25).requires_grad_(True)
 
   scale = 1.0 / math.sqrt(D)
   out = ffpa_attn_func(
@@ -691,6 +697,8 @@ def test_ffpa_bwd_sdpa_backend_additive_attn_mask_matches_sdpa(dtype):
     backward_backend="sdpa",
   )
   out.sum().backward()
+  assert attn_mask.grad is not None
+  assert attn_mask.grad.shape == (1, 1, 1, N)
 
   dq_ref, dk_ref, dv_ref, dmask_ref = _sdpa_ref_grads(
     q,

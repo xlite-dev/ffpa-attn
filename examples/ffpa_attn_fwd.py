@@ -79,9 +79,10 @@ def _sdpa_ref(q, k, v, is_causal: bool = False, attn_mask: torch.Tensor | None =
 
 
 def _make_broadcast_additive_attn_mask(nq: int, nkv: int, dtype: torch.dtype, seed: int) -> torch.Tensor:
-  """Build a broadcastable additive attention bias for SDPA/FFPA."""
+  """Build a key-position additive attention bias for SDPA/FFPA."""
   torch.manual_seed(seed + 1)
-  return torch.randn(1, 1, nq, nkv, dtype=dtype, device="cuda") * 0.25
+  del nq
+  return torch.randn(1, 1, 1, nkv, dtype=dtype, device="cuda") * 0.25
 
 
 def _time_fn(fn, *args, warmup: int = WARMUP, iters: int = ITERS, rng_seed: int | None = None) -> float:
