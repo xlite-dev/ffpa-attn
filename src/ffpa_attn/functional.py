@@ -41,7 +41,6 @@ _FFPA_ATTN_IMPL_DEFAULTS: dict[str, object] = {
   "triton_autotune_mode": "fast",
   "backward_backend": "triton",
   "triton_backward_autotune": False,
-  "triton_backward_version": "v2",
   "triton_backward_preprocess_d_chunk": False,
 }
 
@@ -190,7 +189,6 @@ class FFPAAttnMeta:
     ``"fast"`` or ``"max"``.
   :param backward_backend: Backward backend name. ``"sdpa"`` or ``"triton"``.
   :param triton_backward_autotune: Whether to enable Triton backward autotune.
-  :param triton_backward_version: Triton backward kernel version.
   :param triton_backward_preprocess_d_chunk: Whether Triton backward should
     compute delta with the split-D preprocess kernel.
   """
@@ -208,7 +206,6 @@ class FFPAAttnMeta:
   triton_autotune_mode: str
   backward_backend: str
   triton_backward_autotune: bool
-  triton_backward_version: str
   triton_backward_preprocess_d_chunk: bool
 
   @classmethod
@@ -237,7 +234,6 @@ class FFPAAttnMeta:
     triton_autotune_mode = str(impl_options["triton_autotune_mode"])
     backward_backend = str(impl_options["backward_backend"])
     triton_backward_autotune = bool(impl_options["triton_backward_autotune"])
-    triton_backward_version = str(impl_options["triton_backward_version"])
     triton_backward_preprocess_d_chunk = bool(impl_options["triton_backward_preprocess_d_chunk"])
 
     assert forward_backend in ("cuda", "triton"), \
@@ -271,7 +267,6 @@ class FFPAAttnMeta:
       triton_autotune_mode=triton_autotune_mode,
       backward_backend=backward_backend,
       triton_backward_autotune=triton_backward_autotune,
-      triton_backward_version=triton_backward_version,
       triton_backward_preprocess_d_chunk=triton_backward_preprocess_d_chunk,
     )
 
@@ -565,7 +560,6 @@ class _FFPAAttnFunc(torch.autograd.Function):
           softmax_scale=meta.scale,
           autotune=meta.triton_backward_autotune,
           autotune_mode=meta.triton_autotune_mode,
-          kernel_version=meta.triton_backward_version,
           preprocess_d_chunk=meta.triton_backward_preprocess_d_chunk,
           attn_bias=attn_bias,
           return_attn_bias_grad=ctx.needs_input_grad[3],

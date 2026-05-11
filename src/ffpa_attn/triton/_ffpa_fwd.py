@@ -6,6 +6,21 @@ owns a Q-row block for one batch/query-head pair.  Inside that program, the
 large head dimension is processed in chunks so D=320/512 can be handled without
 materialising the full attention matrix.
 
+There are two execution paths:
+
+* Generic path: one kernel streams the full KV sequence for each Q block,
+  performs online softmax, and writes O/LSE directly.
+* Decode path: used when split-kv improves occupancy for small query windows.
+  Stage1 computes one partial O and chunk-local LSE per KV chunk; stage2 merges
+  those partials with the log-sum-exp merge formula.
+
+GQA/MQA is handled inside the Triton kernels by mapping each query head to a KV
+head with ``off_hkv = off_hq // group_size``. Additive ``attn_bias`` follows
+SDPA's logical score shape ``[B, Hq, Nq, Nkv]`` and may use stride-0 broadcast
+dimensions, so compact masks such as ``[1, 1, 1, Nkv]`` never need to be
+materialized. Dropout is replay-compatible with SDPA: each logical score element
+uses one Philox output in row-major ``[B, Hq, Nq, Nkv]`` order.
+
 The saved LSE uses the natural logarithm convention expected by the existing
 Triton backward kernel: ``lse = log(sum(exp(score)))`` where
 ``score = softmax_scale * (Q @ K.T)`` after masking.
@@ -29,7 +44,20 @@ def _attn_bias_broadcast_strides(
   seqlen_q: int,
   seqlen_k: int,
 ) -> tuple[int, int, int, int]:
-  """Return strides for broadcasting a compact 4-D attention bias."""
+  """Return logical-score strides for a broadcastable 4-D attention bias.
+
+  The Triton kernels always form ``AttnBias + m * stride_bm + n * stride_bn``
+  as if the mask had full logical shape ``[B, Hq, Nq, Nkv]``. A stride of zero
+  marks a user dimension of size 1 that broadcasts over the logical scores.
+
+  :param attn_bias: Optional additive bias tensor already normalized to a 4-D
+      broadcastable shape.
+  :param batch: Runtime batch size of the logical score tensor.
+  :param nheads: Runtime query-head count of the logical score tensor.
+  :param seqlen_q: Runtime query sequence length.
+  :param seqlen_k: Runtime KV sequence length.
+  :return: ``(stride_b, stride_h, stride_m, stride_n)`` for logical indexing.
+  """
   if attn_bias is None:
     return (0, 0, 0, 0)
   return (
@@ -76,6 +104,9 @@ def _apply_dropout_to_p(
   philox_offset: int,
   HAS_DROPOUT: tl.constexpr,
 ):
+  # Forward and backward both depend on the exact same dropout RNG mapping.
+  # ``offs_n`` must be global KV positions, including split-kv chunk offsets,
+  # so the element_offset matches SDPA's logical [B, H, Nq, Nkv] score layout.
   if HAS_DROPOUT:
     # Keep this in SDPA's logical score order.  In split-kv decode, offs_n is
     # passed as the global KV index, so no extra chunk offset should be added.
@@ -357,11 +388,18 @@ def _ffpa_fwd_kernel_impl(
   BLOCK_HEADDIM_V: tl.constexpr,
   NUM_V_GROUPS: tl.constexpr,
 ) -> None:
-  """Single-kernel Split-D FFPA forward."""
+  """Run the generic single-kernel Split-D FFPA forward path.
+
+  One program owns one Q block for one logical query head. It streams KV blocks,
+  reconstructs QK over head-dim chunks, applies masking/bias/dropout, and keeps
+  an online-softmax accumulator for each V head-dim slice.
+  """
   start_m = tl.program_id(0)
   off_hb = tl.program_id(1)
   off_b = off_hb // nheads_q
   off_hq = off_hb % nheads_q
+  # GQA/MQA: multiple query heads can share one KV head. The output and LSE are
+  # query-head indexed; K/V loads are mapped back to the owning KV head.
   group_size = nheads_q // nheads_kv
   off_hkv = off_hq // group_size
 
@@ -418,6 +456,8 @@ def _ffpa_fwd_kernel_impl(
 
     scores = scores * softmax_scale
     if HAS_ATTN_BIAS:
+      # Broadcasted mask dimensions have stride 0, so this covers full masks
+      # and compact masks with the same pointer expression.
       bias = tl.load(
         AttnBias + offs_m[:, None] * stride_bm + offs_kv[None, :] * stride_bn,
         mask=(offs_m[:, None] < seqlen_q) & (offs_kv[None, :] < seqlen_k),
@@ -427,9 +467,14 @@ def _ffpa_fwd_kernel_impl(
     if not EVEN_N:
       scores = tl.where(offs_kv[None, :] < seqlen_k, scores, -float("inf"))
     if IS_CAUSAL:
+      # Lower-right causal semantics for Nq <= Nkv. Query row m can attend to
+      # key positions <= m + (Nkv - Nq), matching PyTorch SDPA.
       causal_mask = offs_kv[None, :] <= (offs_m[:, None] + kv_offset)
       scores = tl.where(causal_mask, scores, -float("inf"))
 
+    # Online softmax merge for the next KV block. ``m_i`` and ``l_i`` track the
+    # row max and denominator before dropout; ``p`` is dropped only for the O
+    # accumulation, while LSE stays the undropped softmax normalizer.
     m_new = tl.maximum(m_i, tl.max(scores, axis=1))
     alpha = tl.exp(m_i - m_new)
     p = tl.exp(scores - m_new[:, None])
@@ -530,11 +575,16 @@ def _ffpa_decode_fwd_stage1_kernel(
   BLOCK_HEADDIM_V: tl.constexpr,
   NUM_V_GROUPS: tl.constexpr,
 ) -> None:
+  # Split-kv decode stage1. Each program owns (KV chunk, B/Hq, Q block) and
+  # writes a partial output plus chunk-local LSE. Stage2 merges chunks using
+  # their LSEs, so stage1 never writes the final O/LSE directly.
   chunk_idx = tl.program_id(0)
   off_hb = tl.program_id(1)
   q_block = tl.program_id(2)
   off_b = off_hb // nheads_q
   off_hq = off_hb % nheads_q
+  # Same GQA/MQA contract as the generic path: query heads select their KV head
+  # through integer grouping, without materializing expanded K/V tensors.
   group_size = nheads_q // nheads_kv
   off_hkv = off_hq // group_size
 
@@ -557,6 +607,8 @@ def _ffpa_decode_fwd_stage1_kernel(
   num_qk_d_chunks = tl.cdiv(HEADDIM, BLOCK_HEADDIM_QK)
 
   if USE_GEMV:  # gemv
+    # Single-query decode path. Use vector reductions instead of MMA tiles so a
+    # one-row query does not pay matrix-tile overhead.
     m_i_single = -float("inf")
     l_i_single = 0.0
     zero_acc_single = tl.zeros([BLOCK_HEADDIM_V], dtype=tl.float32)
@@ -586,6 +638,8 @@ def _ffpa_decode_fwd_stage1_kernel(
       scores = tl.sum(scores, axis=0)
       scores = scores * softmax_scale
       if HAS_ATTN_BIAS:
+        # Nq == 1, so the query offset is exactly q_block * BLOCK_M. KV offsets
+        # are global positions inside the full sequence, not chunk-local ids.
         bias = tl.load(
           AttnBias + (q_block * BLOCK_M) * stride_bm + offs_kv * stride_bn,
           mask=mask_n,
@@ -663,6 +717,8 @@ def _ffpa_decode_fwd_stage1_kernel(
 
       scores = scores * softmax_scale
       if HAS_ATTN_BIAS:
+        # ``offs_kv`` already includes chunk_start. This keeps additive masks
+        # and dropout RNG aligned with the global SDPA score matrix.
         bias = tl.load(
           AttnBias + offs_m[:, None] * stride_bm + offs_kv[None, :] * stride_bn,
           mask=mask_m[:, None] & mask_n[None, :],
@@ -671,6 +727,8 @@ def _ffpa_decode_fwd_stage1_kernel(
         scores += bias
       scores = tl.where(mask_n[None, :], scores, -float("inf"))
       if IS_CAUSAL:
+        # Tail-aligned causal mask for decode windows. Rows outside the visible
+        # query length are masked later by ``mask_m``.
         causal_mask = offs_kv[None, :] <= (offs_m[:, None] + kv_offset)
         scores = tl.where(causal_mask, scores, -float("inf"))
       scores = tl.where(mask_m[:, None], scores, -float("inf"))
@@ -746,6 +804,10 @@ def _ffpa_decode_fwd_stage2_kernel(
   BLOCK_HEADDIM_V: tl.constexpr,
   BLOCK_CHUNKS: tl.constexpr,
 ) -> None:
+  # Split-kv stage2. Each program merges one (B, Hq, query row, V slice) across
+  # all chunk partials. The numerically stable merge is:
+  #   O = sum_c exp(LSE_c - LSE) * O_c,  LSE = logsumexp_c(LSE_c)
+  # where O_c was normalized within its chunk by stage1.
   off_hbm = tl.program_id(0)
   v_group = tl.program_id(1)
   off_hb = off_hbm // seqlen_q
@@ -822,7 +884,32 @@ def _ffpa_attn_forward_generic_impl(
   philox_seed: int = 0,
   philox_offset: int = 0,
 ) -> None:
-  """Launch the generic Triton forward kernel without split-kv scratch."""
+  """Launch the generic Triton forward kernel without split-kv scratch.
+
+  This path is selected when the split-kv occupancy heuristic returns one
+  split. The kernel streams all KV blocks in one program per Q block and writes
+  final ``o`` and natural-log ``lse`` in place.
+
+  :param q: Query tensor in ``[B, Hq, Nq, D]`` layout.
+  :param k: Key tensor in ``[B, Hkv, Nkv, D]`` layout.
+  :param v: Value tensor in ``[B, Hkv, Nkv, D]`` layout.
+  :param o: Output tensor in ``[B, Hq, Nq, D]`` layout, written in place.
+  :param lse: Float32 LSE tensor with rounded last-dimension storage.
+  :param attn_bias: Optional additive mask broadcastable to
+    ``[B, Hq, Nq, Nkv]``.
+  :param causal: Whether to apply lower-right causal masking.
+  :param softmax_scale: Scale applied to ``Q @ K.T``. Defaults to
+    ``1 / sqrt(D)`` when ``None``.
+  :param autotune: Whether to use the Triton autotuned entry for this shape.
+  :param autotune_mode: Triton autotune search-space mode, ``"fast"`` or
+    ``"max"``.
+  :param dropout_p: Forward dropout probability. The same Philox state must be
+    saved for backward replay.
+  :param philox_seed: Philox seed used for dropout. Ignored when
+    ``dropout_p == 0``.
+  :param philox_offset: Philox element offset used for dropout replay parity
+    with SDPA.
+  """
   batch, nheads_q, seqlen_q, headdim = q.shape
   _, nheads_kv, seqlen_k, _ = k.shape
   softmax_scale = softmax_scale or (1.0 / math.sqrt(headdim))
@@ -944,7 +1031,35 @@ def _ffpa_attn_forward_decode_impl(
   philox_seed: int = 0,
   philox_offset: int = 0,
 ) -> None:
-  """Run the split-kv Triton forward path used for decode-like shapes."""
+  """Run the split-kv Triton forward path used for decode-like shapes.
+
+  Stage1 splits the KV sequence into ``num_splits`` chunks and writes fp32
+  scratch tensors ``partial_out`` and ``chunk_lse``. Stage2 merges those chunks
+  into the final output using a log-sum-exp weighted sum. This path is usually
+  selected for small ``Nq`` and long ``Nkv`` where splitting improves SM
+  occupancy.
+
+  :param q: Query tensor in ``[B, Hq, Nq, D]`` layout.
+  :param k: Key tensor in ``[B, Hkv, Nkv, D]`` layout.
+  :param v: Value tensor in ``[B, Hkv, Nkv, D]`` layout.
+  :param o: Output tensor in ``[B, Hq, Nq, D]`` layout, written in place.
+  :param lse: Float32 visible LSE tensor in ``[B, Hq, Nq]`` layout.
+  :param attn_bias: Optional additive mask broadcastable to
+    ``[B, Hq, Nq, Nkv]``.
+  :param causal: Whether to apply lower-right causal masking.
+  :param softmax_scale: Scale applied to ``Q @ K.T``. Defaults to
+    ``1 / sqrt(D)`` when ``None``.
+  :param autotune: Whether to use the Triton autotuned stage1 entry.
+  :param autotune_mode: Triton autotune search-space mode, ``"fast"`` or
+    ``"max"``.
+  :param num_splits: Optional explicit split count. When ``None``, a
+    FlashAttention-style occupancy heuristic chooses it.
+  :param dropout_p: Forward dropout probability.
+  :param philox_seed: Philox seed used for dropout. Ignored when
+    ``dropout_p == 0``.
+  :param philox_offset: Philox element offset used for SDPA-compatible dropout
+    RNG layout.
+  """
   batch, nheads_q, seqlen_q, headdim = q.shape
   _, nheads_kv, seqlen_k, _ = k.shape
   softmax_scale = softmax_scale or (1.0 / math.sqrt(headdim))
@@ -1166,18 +1281,29 @@ def _ffpa_attn_forward_impl(
 ) -> None:
   """Run the Triton FFPA Split-D forward kernel.
 
+  This is the low-level implementation entry used by the registered torch op.
+  It validates tensor layout/dtypes, chooses between the generic and split-kv
+  decode paths, and forwards the saved dropout RNG state to the selected kernel.
+
   :param q: Query tensor in ``[B, Hq, Nq, D]`` layout.
   :param k: Key tensor in ``[B, Hkv, Nkv, D]`` layout.
   :param v: Value tensor in ``[B, Hkv, Nkv, D]`` layout.
   :param o: Output tensor in ``[B, Hq, Nq, D]`` layout, written in place.
   :param lse: Float32 LSE tensor with shape ``[B, Hq, Nq_aligned]`` or a
       view whose last dimension is the visible query length.
+  :param attn_bias: Optional additive mask broadcastable to
+      ``[B, Hq, Nq, Nkv]``.
   :param causal: Whether to apply lower-right causal masking.
   :param softmax_scale: Scale applied to ``Q @ K.T``. Defaults to
       ``1 / sqrt(D)``.
   :param autotune: Whether to run Triton's autotuner for this shape.
-    :param autotune_mode: Triton autotune search-space mode, ``"fast"`` or
-        ``"max"``.
+  :param autotune_mode: Triton autotune search-space mode, ``"fast"`` or
+      ``"max"``.
+  :param dropout_p: Forward dropout probability.
+  :param philox_seed: Philox seed used for dropout. Ignored when
+      ``dropout_p == 0``.
+  :param philox_offset: Philox element offset used for SDPA-compatible dropout
+      RNG layout.
   """
   batch, nheads_q, seqlen_q, headdim = q.shape
   _, _, seqlen_k, _ = k.shape
@@ -1247,6 +1373,23 @@ def _ffpa_attn_forward_triton(
   The ``O`` parameter is accepted for API compatibility but ignored — the
   registered op always allocates a fresh output buffer.
 
+  :param Q: Query tensor in ``[B, Hq, Nq, D]`` layout.
+  :param K: Key tensor in ``[B, Hkv, Nkv, D]`` layout.
+  :param V: Value tensor in ``[B, Hkv, Nkv, D]`` layout.
+  :param O: Ignored compatibility parameter.
+  :param causal: Whether to apply lower-right causal masking.
+  :param softmax_scale: Scale applied to ``Q @ K.T``. ``0.0`` means the op will
+    use its default scale.
+  :param autotune: Whether to use Triton's autotuner for the selected path.
+  :param autotune_mode: Triton autotune search-space mode, ``"fast"`` or
+    ``"max"``.
+  :param attn_bias: Optional additive mask broadcastable to
+    ``[B, Hq, Nq, Nkv]``.
+  :param dropout_p: Forward dropout probability.
+  :param philox_seed: Philox seed used for dropout. Ignored when
+    ``dropout_p == 0``.
+  :param philox_offset: Philox element offset used for SDPA-compatible dropout
+    RNG layout.
   :returns: Output tensor and softmax LSE sliced to visible shape ``[B, Nh_q, Nq]``.
   """
   if Q.stride(-1) != 1:

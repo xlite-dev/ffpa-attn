@@ -2,7 +2,7 @@
 // FFPA SM>=SM90 kernel templates with TMA-direct K/V staging.
 //
 // This header isolates all TMA-related kernel changes from the
-// architecture-agnostic ``ffpa_attn_templates.cuh`` (which remains the
+// architecture-agnostic ``ffpa_attn_fwd.cuh`` (which remains the
 // fallback for SM < 9.0 and for ``tma=False`` callers). The SM90 kernel
 // reuses the FFPA large-d Split-Q (FlashAttention-2) algorithm and only
 // substitutes the per-tile K/V global-to-shared transfer with a TMA
@@ -157,7 +157,7 @@ struct ExperimentalTmaLargeDConfig {
 // ffpa_attn_split_d_fwd_sm90_template
 // ----------------------------------------------------------------------------
 // Mirror of ``ffpa_stages_split_q_large_d_template`` from
-// ``ffpa_attn_templates.cuh`` but with K/V tile staging delegated to TMA
+// ``ffpa_attn_fwd.cuh`` but with K/V tile staging delegated to TMA
 // (``cp.async.bulk.tensor.2d.global.shared``) writing directly into the
 // existing kPad==0 XOR-swizzled K/V destination slot (no scratch, no
 // repack). All other algorithmic behavior (online softmax, causal mask,

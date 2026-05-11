@@ -1,7 +1,7 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 
-#include "ffpa_attn_fwd_templates.cuh"
+#include "ffpa_attn_fwd.cuh"
 using namespace ffpa;
 
 static constexpr int kMaxDForSmallDKernel = 128;

@@ -104,7 +104,7 @@ torch.library.define(
   f"{_OP_NAMESPACE}::_bwd_triton",
   "(Tensor dO, Tensor q, Tensor k, Tensor v, Tensor o, Tensor lse, Tensor? attn_bias, "
   "float softmax_scale, int causal, int autotune, "
-  "int autotune_mode_is_max, int kernel_version_is_v2, int preprocess_d_chunk, int return_attn_bias_grad, "
+  "int autotune_mode_is_max, int preprocess_d_chunk, int return_attn_bias_grad, "
   "float dropout_p, int philox_seed, int philox_offset) "
   "-> (Tensor dq, Tensor dk, Tensor dv, Tensor grad_attn_bias)",
 )
@@ -123,7 +123,6 @@ def _bwd_triton_torch_op(
   causal: int,
   autotune: int,
   autotune_mode_is_max: int,
-  kernel_version_is_v2: int,
   preprocess_d_chunk: int,
   return_attn_bias_grad: int,
   dropout_p: float,
@@ -159,7 +158,6 @@ def _bwd_triton_torch_op(
     softmax_scale=softmax_scale,
     autotune=bool(autotune),
     autotune_mode="max" if autotune_mode_is_max else "fast",
-    kernel_version="v2" if kernel_version_is_v2 else "v1",
     preprocess_d_chunk=bool(preprocess_d_chunk),
     dropout_p=dropout_p,
     philox_seed=philox_seed,
@@ -181,7 +179,6 @@ def _bwd_triton_fake(
   causal: int,
   autotune: int,
   autotune_mode_is_max: int,
-  kernel_version_is_v2: int,
   preprocess_d_chunk: int,
   return_attn_bias_grad: int,
   dropout_p: float,
@@ -193,7 +190,6 @@ def _bwd_triton_fake(
     causal,
     autotune,
     autotune_mode_is_max,
-    kernel_version_is_v2,
     preprocess_d_chunk,
     dropout_p,
     philox_seed,

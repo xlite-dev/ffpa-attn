@@ -472,7 +472,7 @@ def _run_case(
   dt_tag = str(dtype).replace("torch.", "")
   dmask_msg = "dMask_err=(NO Grad)  "
   if dmask_ffpa is not None and dmask_ref is not None:
-    dmask_msg = f"dMask_err={(dmask_ffpa - dmask_ref).abs().max().item():.4e}  "
+    dmask_msg = f"dMask_err={(dmask_ffpa.float() - dmask_ref.float()).abs().max().item():.4e}  "
   elif attn_mask is not None and not compare_mask_grad:
     dmask_msg = "dMask_err=(SKIPPED large logical mask)  "
   print(

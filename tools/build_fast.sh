@@ -132,7 +132,7 @@ echo "[build_fast] total elapsed: $((T1-T0))s"
 #   # First-time editable install: later Python-only edits need no rebuild
 #   FFPA_EDITABLE=1 bash tools/build_fast.sh
 #
-#   # Full clean rebuild (after touching launch_templates.cuh / ffpa_attn_templates.cuh)
+#   # Full clean rebuild (after touching launch_templates.cuh / ffpa_attn_fwd.cuh)
 #   FFPA_CLEAN=1 bash tools/build_fast.sh
 #
 #   # Fast iteration: only build a headdim subset
