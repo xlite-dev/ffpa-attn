@@ -10,10 +10,13 @@ ENABLE_FFPA_CUDA_IMPL=1 python3 examples/ffpa_attn_fwd.py --forward-backend cuda
 python3 examples/ffpa_attn_bwd.py --backward-backend sdpa
 python3 examples/ffpa_attn_bwd.py --backward-backend triton
 python3 examples/ffpa_attn_bwd.py --backward-backend triton --autotune
+python3 examples/perf.py
+python3 examples/perf.py --forward --backward --fwd-backend triton --bwd-backend triton --tune fast
 ```
 
 - `examples/ffpa_attn_fwd.py`: forward-only examples for self-attn, cross-attn, GQA, causal, and non-aligned seqlen.
 - `examples/ffpa_attn_bwd.py`: end2end forward + backward examples for self-attn, cross-attn, GQA, causal, and non-aligned seqlen.
+- `examples/perf.py`: migrated benchmark plotting entrypoint. It preserves the old plot style, can benchmark forward/backward cases on demand, and writes both `ffpa_speedup.png` and `ffpa_speedup.md`.
 - The additive-mask example uses a compact `[1, 1, 1, Nkv]` key-position bias by default. Use `[1, 1, Nq, Nkv]` only when per-query bias is required, since it scales as `O(Nq * Nkv)` memory.
 
 ## Benchmark

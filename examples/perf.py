@@ -1,0 +1,686 @@
+"""Benchmark FFPA speedups and render plot plus Markdown tables.
+
+Usage::
+
+  CUDA_VISIBLE_DEVICES=0 python examples/perf.py
+  CUDA_VISIBLE_DEVICES=0 python examples/perf.py --no-bwd --fwd-backend triton --tune fast
+  CUDA_VISIBLE_DEVICES=0 python examples/perf.py --no-fwd --bwd-backend triton --tune max
+  CUDA_VISIBLE_DEVICES=0 python examples/perf.py --fwd-backend triton --bwd-backend triton --tune fast
+"""
+
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+import re
+import sys
+from typing import Any
+
+import matplotlib.pyplot as plt
+import numpy as np
+import torch
+
+EXAMPLES_DIR = Path(__file__).resolve().parent
+if str(EXAMPLES_DIR) not in sys.path:
+  sys.path.insert(0, str(EXAMPLES_DIR))
+
+from ffpa_attn_bwd import run_backward_examples
+from ffpa_attn_fwd import run_forward_examples
+
+# Keep the exact legacy plotting style from tools/plot.py.
+plt.rcParams["figure.dpi"] = 300
+plt.rcParams["font.sans-serif"] = ["DejaVu Sans"]
+plt.rcParams["axes.unicode_minus"] = False
+
+PLOT_CASES: list[tuple[str, str]] = [
+  ("self-attn", "self-attn(F/B)"),
+  ("cross-attn", "cross-attn(F/B)"),
+  ("decode-attn", "decode(Nq=1,F/B)"),
+  ("gqa", "gqa(F/B)"),
+  ("causal", "causal(F/B)"),
+  ("attn-mask", "attn-mask(F/B)"),
+  ("dropout", "dropout(F/B)"),
+  ("non-aligned", "non-aligned(F/B)"),
+]
+CASE_LABELS = dict(PLOT_CASES)
+DTYPE_ORDER = ["fp16", "bf16"]
+DEFAULT_OUTPUT_STEM = "ffpa_speedup"
+FALLBACK_DEVICE_NAME = "NVIDIA RTX 5090 Blackwell"
+MARKDOWN_TABLE_HEADER = "| Case | dtype | Nq/Nkv | allclose | FFPA / SDPA | speedup |"
+MARKDOWN_TABLE_ALIGN = "|:---:|:---:|:---:|:---:|:---:|:---:|"
+FALLBACK_SPEEDUPS: dict[str, dict[str, dict[str, float]]] = {
+  "forward": {
+    "self-attn": {
+      "fp16": 2.06,
+      "bf16": 2.08
+    },
+    "cross-attn": {
+      "fp16": 1.86,
+      "bf16": 1.87
+    },
+    "decode-attn": {
+      "fp16": 2.86,
+      "bf16": 2.85
+    },
+    "gqa": {
+      "fp16": 2.06,
+      "bf16": 2.09
+    },
+    "causal": {
+      "fp16": 1.96,
+      "bf16": 1.99
+    },
+    "attn-mask": {
+      "fp16": 1.70,
+      "bf16": 1.74
+    },
+    "dropout": {
+      "fp16": 1.79,
+      "bf16": 1.82
+    },
+    "non-aligned": {
+      "fp16": 1.96,
+      "bf16": 1.98
+    },
+  },
+  "backward": {
+    "self-attn": {
+      "fp16": 2.34,
+      "bf16": 2.49
+    },
+    "cross-attn": {
+      "fp16": 2.57,
+      "bf16": 2.51
+    },
+    "decode-attn": {
+      "fp16": 2.97,
+      "bf16": 3.11
+    },
+    "gqa": {
+      "fp16": 2.32,
+      "bf16": 2.46
+    },
+    "causal": {
+      "fp16": 2.22,
+      "bf16": 2.56
+    },
+    "attn-mask": {
+      "fp16": 2.06,
+      "bf16": 2.17
+    },
+    "dropout": {
+      "fp16": 2.27,
+      "bf16": 2.41
+    },
+    "non-aligned": {
+      "fp16": 2.37,
+      "bf16": 2.67
+    },
+  },
+}
+RESULT_ROW = dict[str, Any]
+
+
+def _parse_args() -> argparse.Namespace:
+  """Parse CLI arguments.
+
+  :return: Parsed CLI namespace.
+  """
+  parser = argparse.ArgumentParser(
+    description="Benchmark FFPA forward/backward cases and generate plot plus Markdown tables."
+  )
+  parser.add_argument(
+    "--no-forward",
+    "--no-fwd",
+    dest="forward",
+    action="store_false",
+    help="Disable forward benchmark cases.",
+  )
+  parser.add_argument(
+    "--no-backward",
+    "--no-bwd",
+    dest="backward",
+    action="store_false",
+    help="Disable backward benchmark cases.",
+  )
+  parser.set_defaults(forward=True, backward=True)
+  parser.add_argument(
+    "--show-fallback",
+    action="store_true",
+    help="Render the legacy hard-coded fallback plot and Markdown table instead of running real benchmarks.",
+  )
+  parser.add_argument(
+    "--forward-backend",
+    "--fwd-backend",
+    choices=["cuda", "triton"],
+    default="triton",
+    help="Forward backend used when --forward is enabled.",
+  )
+  parser.add_argument(
+    "--backward-backend",
+    "--bwd-backend",
+    choices=["sdpa", "triton"],
+    default="triton",
+    help="Backward backend used when --backward is enabled.",
+  )
+  parser.add_argument("--tune", choices=["fast", "max"], help="Enable Triton autotune with the selected search mode.")
+  parser.add_argument("--B", type=int, default=1, help="Batch size used by benchmark mode.")
+  parser.add_argument("--H", type=int, default=32, help="Base head count used by benchmark mode.")
+  parser.add_argument("--N", type=int, default=8192, help="Base sequence length used by benchmark mode.")
+  parser.add_argument("--D", type=int, default=512, help="Head dimension used by benchmark mode.")
+  parser.add_argument("--seed", type=int, default=42, help="RNG seed used by benchmark mode.")
+  parser.add_argument(
+    "--save-path",
+    type=Path,
+    default=None,
+    help="Optional directory or file stem path used to save the generated PNG and Markdown artifacts.",
+  )
+  return parser.parse_args()
+
+
+def _device_name() -> str:
+  """Return the active CUDA device name when available.
+
+  :return: CUDA device name or a fallback label.
+  """
+  if torch.cuda.is_available():
+    return torch.cuda.get_device_name(torch.cuda.current_device())
+  return "CUDA Unavailable"
+
+
+def _slugify_device_name(device_name: str) -> str:
+  """Convert a device name into a filesystem-friendly slug.
+
+  :param device_name: Human-readable device name.
+  :return: Lowercase slug safe for filenames.
+  """
+  slug = re.sub(r"[^0-9A-Za-z]+", "-", device_name.strip().lower())
+  slug = re.sub(r"-+", "-", slug).strip("-")
+  return slug or "unknown-device"
+
+
+def _output_stem(device_name: str, B: int, H: int, N: int, D: int) -> Path:
+  """Build the output stem shared by the PNG and Markdown files.
+
+  :param device_name: Device name used in the run.
+  :param B: Batch size.
+  :param H: Head count.
+  :param N: Sequence length.
+  :param D: Head dimension.
+  :return: Output stem without extension.
+  """
+  device_slug = _slugify_device_name(device_name)
+  return Path(f"{DEFAULT_OUTPUT_STEM}_{device_slug}_B{B}_H{H}_N{N}_D{D}")
+
+
+def _resolve_output_stem(save_path: Path | None, device_name: str, B: int, H: int, N: int, D: int) -> Path:
+  """Resolve the final output stem, optionally rooted at ``save_path``.
+
+  :param save_path: Optional output directory.
+  :param device_name: Device name used in the run.
+  :param B: Batch size.
+  :param H: Head count.
+  :param N: Sequence length.
+  :param D: Head dimension.
+  :return: Output stem without extension.
+  """
+  default_stem = _output_stem(device_name, B, H, N, D)
+  if save_path is None:
+    return default_stem
+  save_path.mkdir(parents=True, exist_ok=True)
+  return save_path / default_stem.name
+
+
+def _case_shape(case_name: str, sequence_length: int) -> tuple[int, int]:
+  """Return the benchmark shape shown in Markdown for one case.
+
+  :param case_name: Canonical case name.
+  :param sequence_length: Base sequence length.
+  :return: ``(Nq, Nkv)`` pair.
+  """
+  if case_name == "cross-attn":
+    return 1024, sequence_length
+  if case_name == "decode-attn":
+    return 1, sequence_length
+  if case_name == "attn-mask":
+    mask_n = max(sequence_length, 512)
+    return mask_n, mask_n
+  if case_name == "non-aligned":
+    non_aligned_n = sequence_length - 1 if sequence_length > 1 else sequence_length
+    return non_aligned_n, non_aligned_n
+  return sequence_length, sequence_length
+
+
+def _mode_suffix(has_forward: bool, has_backward: bool) -> str:
+  """Build the title suffix that matches the legacy title style.
+
+  :param has_forward: Whether forward data is present.
+  :param has_backward: Whether backward data is present.
+  :return: Title mode suffix.
+  """
+  if has_forward and has_backward:
+    return "FWD & BWD"
+  if has_forward:
+    return "FWD"
+  return "BWD"
+
+
+def _forward_section_label(backend: str, tune_mode: str | None, fallback: bool) -> str:
+  """Describe the forward data source for Markdown headings.
+
+  :param backend: Forward backend.
+  :param tune_mode: Triton autotune mode.
+  :param fallback: Whether fallback hard-coded data is used.
+  :return: Human-readable section label.
+  """
+  if fallback:
+    return "Fallback hard-coded data"
+  if backend == "cuda":
+    return "Legacy CUDA"
+  if tune_mode is not None:
+    return f"Triton w/ autotune ({tune_mode})"
+  return "Triton"
+
+
+def _backward_section_label(backend: str, tune_mode: str | None, fallback: bool) -> str:
+  """Describe the backward data source for Markdown headings.
+
+  :param backend: Backward backend.
+  :param tune_mode: Triton autotune mode.
+  :param fallback: Whether fallback hard-coded data is used.
+  :return: Human-readable section label.
+  """
+  if fallback:
+    return "Fallback hard-coded data"
+  if backend == "sdpa":
+    return "SDPA backward"
+  if tune_mode is not None:
+    return f"Triton w/ autotune ({tune_mode})"
+  return "Triton"
+
+
+def _decorate_rows(direction: str, rows: list[dict[str, Any]]) -> list[RESULT_ROW]:
+  """Attach the direction field to benchmark results.
+
+  :param direction: ``forward`` or ``backward``.
+  :param rows: Raw rows returned by the example helper.
+  :return: Decorated result rows.
+  """
+  return [{"direction": direction, **row} for row in rows]
+
+
+def _build_fallback_rows(B: int, H: int, N: int, D: int) -> tuple[list[RESULT_ROW], list[RESULT_ROW]]:
+  """Build structured rows for the legacy hard-coded plot data.
+
+  :param B: Batch size shown in metadata.
+  :param H: Base head count shown in metadata.
+  :param N: Base sequence length shown in metadata.
+  :param D: Head dimension shown in metadata.
+  :return: ``(forward_rows, backward_rows)``.
+  """
+  forward_rows: list[RESULT_ROW] = []
+  backward_rows: list[RESULT_ROW] = []
+  for direction, target in (("forward", forward_rows), ("backward", backward_rows)):
+    for case_name, _ in PLOT_CASES:
+      nq, nkv = _case_shape(case_name, N)
+      for dtype in DTYPE_ORDER:
+        target.append({
+          "direction": direction,
+          "case_name": case_name,
+          "dtype": dtype,
+          "B": B,
+          "Hq": H,
+          "Hkv": H,
+          "Nq": nq,
+          "Nkv": nkv,
+          "D": D,
+          "allclose": None,
+          "ffpa_ms": None,
+          "sdpa_ms": None,
+          "speedup": FALLBACK_SPEEDUPS[direction][case_name][dtype],
+          "forward_backend": "hard-coded" if direction == "forward" else None,
+          "backward_backend": "hard-coded" if direction == "backward" else None,
+          "dropout_p": 0.1 if case_name == "dropout" else 0.0,
+          "causal": case_name == "causal",
+        })
+  return forward_rows, backward_rows
+
+
+def _aggregate_speedups(rows: list[RESULT_ROW], direction: str) -> list[float] | None:
+  """Aggregate per-dtype rows into the bar heights used by the plot.
+
+  :param rows: Structured rows for one or both directions.
+  :param direction: ``forward`` or ``backward``.
+  :return: Aggregated bar heights, or ``None`` when the direction is absent.
+  """
+  case_to_speedups: dict[str, list[float]] = {case_name: [] for case_name, _ in PLOT_CASES}
+  for row in rows:
+    if row["direction"] != direction:
+      continue
+    case_to_speedups[row["case_name"]].append(float(row["speedup"]))
+  if not any(case_to_speedups.values()):
+    return None
+  values: list[float] = []
+  for case_name, _ in PLOT_CASES:
+    speeds = case_to_speedups[case_name]
+    values.append(float(np.amax(speeds)) if speeds else float("nan"))
+  return values
+
+
+def plot_speedup(
+  forward_rows: list[RESULT_ROW],
+  backward_rows: list[RESULT_ROW],
+  *,
+  device_name: str,
+  B: int,
+  H: int,
+  N: int,
+  D: int,
+  output_path: Path,
+) -> Path:
+  """Render the speedup bar chart while preserving the legacy look.
+
+  :param forward_rows: Forward result rows.
+  :param backward_rows: Backward result rows.
+  :param device_name: Device name shown in the title.
+  :param B: Batch size shown in the title.
+  :param H: Head count shown in the title.
+  :param N: Sequence length shown in the title.
+  :param D: Head dimension shown in the title.
+  :param output_path: Output PNG path.
+  :return: Saved PNG path.
+  """
+  fwd_speedups = _aggregate_speedups(forward_rows, "forward")
+  bwd_speedups = _aggregate_speedups(backward_rows, "backward")
+  has_forward = fwd_speedups is not None
+  has_backward = bwd_speedups is not None
+  if not has_forward and not has_backward:
+    raise ValueError("No forward or backward rows were provided for plotting.")
+
+  attn_types = [label for _, label in PLOT_CASES]
+  sdpa_speedups = [1.0] * len(attn_types)
+
+  fig, ax = plt.subplots(figsize=(32, 12))
+  width = 0.20
+  x = np.arange(len(attn_types))
+
+  def _autolabel(rects) -> None:
+    for rect in rects:
+      h = rect.get_height()
+      if not np.isfinite(h):
+        continue
+      offset = 8 if h >= 1 else 20
+      va_pos = "bottom" if h >= 1 else "top"
+      ax.annotate(
+        f"{h:.1f}x",
+        xy=(rect.get_x() + rect.get_width() / 2, h),
+        xytext=(0, offset),
+        textcoords="offset points",
+        ha="center",
+        va=va_pos,
+        fontsize=19,
+        fontweight="bold",
+      )
+
+  if has_forward and has_backward:
+    x_sdpa = x - width
+    x_fwd = x
+    x_bwd = x + width
+  elif has_forward:
+    x_sdpa = x - width / 2
+    x_fwd = x + width / 2
+    x_bwd = None
+  else:
+    x_sdpa = x - width / 2
+    x_fwd = None
+    x_bwd = x + width / 2
+
+  rect_sdpa = ax.bar(
+    x_sdpa,
+    sdpa_speedups,
+    width,
+    label="SDPA Baseline",
+    color="#b0b0b0",
+    edgecolor="white",
+    linewidth=1,
+  )
+  _autolabel(rect_sdpa)
+
+  finite_values = [1.0]
+  if x_fwd is not None and fwd_speedups is not None:
+    rect_fwd = ax.bar(
+      x_fwd,
+      fwd_speedups,
+      width,
+      label="FFPA Forward (FWD)",
+      color="#2171b5",
+      edgecolor="white",
+      linewidth=1,
+    )
+    _autolabel(rect_fwd)
+    finite_values.extend(value for value in fwd_speedups if np.isfinite(value))
+
+  if x_bwd is not None and bwd_speedups is not None:
+    rect_bwd = ax.bar(
+      x_bwd,
+      bwd_speedups,
+      width,
+      label="FFPA Backward (BWD)",
+      color="#fd493c",
+      edgecolor="white",
+      linewidth=1,
+    )
+    _autolabel(rect_bwd)
+    finite_values.extend(value for value in bwd_speedups if np.isfinite(value))
+
+  ax.axhline(y=1, color="#555555", linestyle="--", linewidth=2)
+  ax.set_ylabel("Speedup Ratio (FFPA / SDPA)", fontsize=18)
+  ax.set_title(
+    f"FFPA vs SDPA Speedup ({_mode_suffix(has_forward, has_backward)}) | {device_name} | B={B}, N={N}, H={H}, D={D}",
+    fontsize=22,
+    pad=15,
+    fontweight="bold",
+  )
+  ax.set_xticks(x)
+  ax.set_xticklabels(attn_types, rotation=0, ha="center", fontsize=22, fontweight="bold")
+  ax.tick_params(axis="y", labelsize=16)
+  ax.set_ylim(0, max(finite_values) * 1.1)
+  ax.legend(fontsize=20, loc="upper left")
+  ax.grid(axis="y", alpha=0.9)
+
+  fig.tight_layout()
+  fig.savefig(output_path)
+  plt.close(fig)
+  return output_path
+
+
+def _sort_rows(rows: list[RESULT_ROW]) -> list[RESULT_ROW]:
+  """Sort rows by case order and dtype order.
+
+  :param rows: Structured result rows.
+  :return: Sorted rows.
+  """
+  case_rank = {case_name: index for index, (case_name, _) in enumerate(PLOT_CASES)}
+  dtype_rank = {dtype: index for index, dtype in enumerate(DTYPE_ORDER)}
+  return sorted(rows, key=lambda row: (case_rank[row["case_name"]], dtype_rank.get(row["dtype"], 999)))
+
+
+def _allclose_marker(row: RESULT_ROW) -> str:
+  """Convert the allclose field into the Markdown marker.
+
+  :param row: Structured result row.
+  :return: ``✅``, ``❌``, or ``-``.
+  """
+  if row.get("allclose") is True:
+    return "✅"
+  if row.get("allclose") is False:
+    return "❌"
+  return "-"
+
+
+def _latency_cell(row: RESULT_ROW) -> str:
+  """Format the latency cell for Markdown tables.
+
+  :param row: Structured result row.
+  :return: Markdown cell content.
+  """
+  ffpa_ms = row.get("ffpa_ms")
+  sdpa_ms = row.get("sdpa_ms")
+  if ffpa_ms is None or sdpa_ms is None:
+    return "- / -"
+  return f"{ffpa_ms:.2f} / {sdpa_ms:.2f} ms"
+
+
+def _render_table(rows: list[RESULT_ROW]) -> list[str]:
+  """Render one GFM benchmark table.
+
+  :param rows: Structured result rows for one direction.
+  :return: Markdown lines for the table.
+  """
+  lines = [MARKDOWN_TABLE_HEADER, MARKDOWN_TABLE_ALIGN]
+  for row in _sort_rows(rows):
+    lines.append(
+      "| "
+      f"{row['case_name']} | {row['dtype']} | {row['Nq']}/{row['Nkv']} | {_allclose_marker(row)} | {_latency_cell(row)} | {row['speedup']:.2f}x |"
+    )
+  return lines
+
+
+def render_speedup_markdown(
+  forward_rows: list[RESULT_ROW],
+  backward_rows: list[RESULT_ROW],
+  *,
+  device_name: str,
+  B: int,
+  H: int,
+  N: int,
+  D: int,
+  forward_backend: str,
+  backward_backend: str,
+  tune_mode: str | None,
+  fallback: bool,
+) -> str:
+  """Render README-style Markdown benchmark tables.
+
+  :param forward_rows: Forward result rows.
+  :param backward_rows: Backward result rows.
+  :param device_name: Device name shown in the metadata line.
+  :param B: Batch size shown in the metadata line.
+  :param H: Head count shown in the metadata line.
+  :param N: Sequence length shown in the metadata line.
+  :param D: Head dimension shown in the metadata line.
+  :param forward_backend: Selected forward backend.
+  :param backward_backend: Selected backward backend.
+  :param tune_mode: Triton autotune mode.
+  :param fallback: Whether fallback hard-coded data is used.
+  :return: Markdown document fragment.
+  """
+  lines = ["## Benchmark", "", f"Env: {device_name}, B={B}, N={N}, H={H}, D={D}."]
+  if fallback:
+    lines.extend([
+      "",
+      "Note: fallback mode reuses hard-coded plot speedups only, so FFPA / SDPA latency and allclose are unavailable."
+    ])
+  if forward_rows:
+    lines.extend(["", f"### Forward Pass ({_forward_section_label(forward_backend, tune_mode, fallback)})", ""])
+    lines.extend(_render_table(forward_rows))
+  if backward_rows:
+    lines.extend(["", f"### Backward Pass ({_backward_section_label(backward_backend, tune_mode, fallback)})", ""])
+    lines.extend(_render_table(backward_rows))
+  return "\n".join(lines) + "\n"
+
+
+def _benchmark_rows(args: argparse.Namespace) -> tuple[list[RESULT_ROW], list[RESULT_ROW]]:
+  """Collect benchmark rows for the requested directions.
+
+  :param args: Parsed CLI arguments.
+  :return: ``(forward_rows, backward_rows)``.
+  """
+  if not torch.cuda.is_available():
+    raise SystemExit("CUDA is required when --forward or --backward is requested.")
+
+  tune_mode = args.tune
+  forward_rows: list[RESULT_ROW] = []
+  backward_rows: list[RESULT_ROW] = []
+  if args.forward:
+    forward_rows = _decorate_rows(
+      "forward",
+      run_forward_examples(
+        B=args.B,
+        H=args.H,
+        N=args.N,
+        D=args.D,
+        seed=args.seed,
+        forward_backend=args.forward_backend,
+        triton_forward_autotune=args.forward_backend == "triton" and tune_mode is not None,
+        triton_autotune_mode=tune_mode or "fast",
+        print_results=True,
+      ),
+    )
+  if args.backward:
+    backward_rows = _decorate_rows(
+      "backward",
+      run_backward_examples(
+        B=args.B,
+        H=args.H,
+        N=args.N,
+        D=args.D,
+        seed=args.seed,
+        backward_backend=args.backward_backend,
+        timing_mode="backward-only",
+        triton_backward_autotune=args.backward_backend == "triton" and tune_mode is not None,
+        triton_autotune_mode=tune_mode or "fast",
+        print_results=True,
+      ),
+    )
+  return forward_rows, backward_rows
+
+
+def main() -> None:
+  """Run the requested benchmark mode and emit plot plus Markdown outputs."""
+  args = _parse_args()
+  fallback = args.show_fallback
+  device_name = FALLBACK_DEVICE_NAME if fallback else _device_name()
+
+  if not fallback and not args.forward and not args.backward:
+    raise SystemExit("At least one direction must remain enabled. Use default settings, --no-fwd, or --no-bwd.")
+
+  if fallback:
+    forward_rows, backward_rows = _build_fallback_rows(args.B, args.H, args.N, args.D)
+  else:
+    forward_rows, backward_rows = _benchmark_rows(args)
+
+  output_stem = _resolve_output_stem(args.save_path, device_name, args.B, args.H, args.N, args.D)
+  png_path = plot_speedup(
+    forward_rows,
+    backward_rows,
+    device_name=device_name,
+    B=args.B,
+    H=args.H,
+    N=args.N,
+    D=args.D,
+    output_path=output_stem.with_suffix(".png"),
+  )
+  markdown = render_speedup_markdown(
+    forward_rows,
+    backward_rows,
+    device_name=device_name,
+    B=args.B,
+    H=args.H,
+    N=args.N,
+    D=args.D,
+    forward_backend=args.forward_backend,
+    backward_backend=args.backward_backend,
+    tune_mode=args.tune,
+    fallback=fallback,
+  )
+  md_path = output_stem.with_suffix(".md")
+  md_path.write_text(markdown, encoding="utf-8")
+
+  print(f"\n{markdown}\n", end="")
+  print(f"Saved plot to {png_path}")
+  print(f"Saved Markdown to {md_path}")
+
+
+if __name__ == "__main__":
+  main()

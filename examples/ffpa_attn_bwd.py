@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import math
 import time
+from typing import Any
 
 import torch
 import torch.nn.functional as F
@@ -30,6 +31,7 @@ from ffpa_attn import ffpa_attn_func
 
 WARMUP, ITERS = 2, 10
 MAX_MASK_GRAD_SEQLEN = 1024 * 16  # 16K, avoid OOM.
+BACKWARD_RESULT = dict[str, Any]
 
 
 def _parse_args() -> argparse.Namespace:
@@ -80,6 +82,114 @@ def _make_sdpa_kwargs(causal: bool, nq: int, nkv: int):
   if causal:
     return {"is_causal": True}
   return {}
+
+
+def _dtype_tag(dtype: torch.dtype) -> str:
+  """Return a short dtype tag.
+
+  :param dtype: Torch dtype.
+  :return: String form without the ``torch.`` prefix.
+  """
+  if dtype == torch.float16:
+    return "fp16"
+  if dtype == torch.bfloat16:
+    return "bf16"
+  return str(dtype).replace("torch.", "")
+
+
+def _resolve_gqa_heads(num_heads: int) -> int:
+  """Choose the KV head count used by the GQA example.
+
+  :param num_heads: Query head count.
+  :return: KV head count that still divides ``num_heads``.
+  """
+  if num_heads <= 1:
+    return 1
+  candidate = max(1, num_heads // 4)
+  while candidate > 1 and num_heads % candidate != 0:
+    candidate -= 1
+  return candidate
+
+
+def _resolve_non_aligned_heads(num_heads: int) -> int:
+  """Choose the head count used by the non-aligned case.
+
+  :param num_heads: Base head count.
+  :return: Head count used by the non-aligned example.
+  """
+  if num_heads <= 8:
+    return num_heads
+  candidate = max(1, num_heads // 4)
+  while candidate > 1 and num_heads % candidate != 0:
+    candidate -= 1
+  return candidate
+
+
+def _mask_grad_status(
+  dmask_ffpa: torch.Tensor | None,
+  dmask_ref: torch.Tensor | None,
+  compare_mask_grad: bool,
+  attn_mask: torch.Tensor | None,
+) -> tuple[float | None, str | None]:
+  """Summarize mask-gradient comparison status.
+
+  :param dmask_ffpa: FFPA mask gradient.
+  :param dmask_ref: Reference mask gradient.
+  :param compare_mask_grad: Whether mask gradient comparison was requested.
+  :param attn_mask: Original additive mask.
+  :return: ``(error, status)`` pair.
+  """
+  if dmask_ffpa is not None and dmask_ref is not None:
+    return (dmask_ffpa.float() - dmask_ref.float()).abs().max().item(), "compared"
+  if attn_mask is not None and not compare_mask_grad:
+    return None, "skipped-large-logical-mask"
+  return None, "no-grad"
+
+
+def _max_abs_diff(lhs: torch.Tensor, rhs: torch.Tensor) -> float:
+  """Return max abs diff after promoting both tensors to fp32.
+
+  :param lhs: First tensor.
+  :param rhs: Second tensor.
+  :return: Maximum absolute difference in fp32.
+  """
+  return (lhs.float() - rhs.float()).abs().max().item()
+
+
+def _tensor_allclose(lhs: torch.Tensor, rhs: torch.Tensor, tol: float) -> bool:
+  """Return whether two tensors are close after promoting both to fp32.
+
+  :param lhs: First tensor.
+  :param rhs: Second tensor.
+  :param tol: Absolute and relative tolerance.
+  :return: ``True`` when the promoted tensors satisfy ``torch.allclose``.
+  """
+  return torch.allclose(lhs.float(), rhs.float(), atol=tol, rtol=tol)
+
+
+def _format_backward_result(result: BACKWARD_RESULT) -> str:
+  """Format one backward benchmark result for CLI output.
+
+  :param result: Structured backward result.
+  :return: Human-readable one-line summary.
+  """
+  if result["dmask_err"] is not None:
+    dmask_msg = f"dMask_err={result['dmask_err']:.4e}  "
+  elif result["dmask_status"] == "skipped-large-logical-mask":
+    dmask_msg = "dMask_err=(SKIPPED large logical mask)  "
+  else:
+    dmask_msg = "dMask_err=(NO Grad)  "
+  return (
+    f"[{result['case_name']:<14} {result['dtype']:<8}] "
+    f"B={result['B']} Hq={result['Hq']} Hkv={result['Hkv']} "
+    f"Nq={result['Nq']} Nkv={result['Nkv']} D={result['D']} "
+    f"causal={int(result['causal'])} dropout_p={result['dropout_p']:g}  "
+    f"dQ_err={result['dq_err']:.4e}  dK_err={result['dk_err']:.4e}  "
+    f"dV_err={result['dv_err']:.4e}  {dmask_msg}"
+    f"backend={result['backward_backend']}  "
+    f"FFPA={result['ffpa_ms']:.2f} ms  SDPA={result['sdpa_ms']:.2f} ms  "
+    f"speedup={result['speedup']:.2f}x"
+  )
 
 
 def _make_broadcast_additive_attn_mask(nq: int, nkv: int, dtype: torch.dtype, seed: int) -> torch.Tensor:
@@ -354,7 +464,8 @@ def _run_case(
   attn_mask: torch.Tensor | None = None,
   dropout_p: float = 0.0,
   timing_mode: str = "backward-only",
-) -> None:
+  print_result: bool = True,
+) -> BACKWARD_RESULT:
   torch.manual_seed(seed)
   q = torch.randn(B, Nh_q, Nq, D, dtype=dtype, device="cuda", requires_grad=True)
   k = torch.randn(B, Nh_kv, Nkv, D, dtype=dtype, device="cuda", requires_grad=True)
@@ -469,157 +580,196 @@ def _run_case(
       rng_seed=dropout_seed if dropout_p > 0.0 else None,
     )
 
-  dt_tag = str(dtype).replace("torch.", "")
-  dmask_msg = "dMask_err=(NO Grad)  "
-  if dmask_ffpa is not None and dmask_ref is not None:
-    dmask_msg = f"dMask_err={(dmask_ffpa.float() - dmask_ref.float()).abs().max().item():.4e}  "
-  elif attn_mask is not None and not compare_mask_grad:
-    dmask_msg = "dMask_err=(SKIPPED large logical mask)  "
-  print(
-    f"[{name:<14} {dt_tag:<8}] "
-    f"B={B} Hq={Nh_q} Hkv={Nh_kv} Nq={Nq} Nkv={Nkv} D={D} causal={int(causal)} dropout_p={dropout_p:g}  "
-    f"dQ_err={(dq_ffpa - dq_ref).abs().max().item():.4e}  "
-    f"dK_err={(dk_ffpa - dk_ref).abs().max().item():.4e}  "
-    f"dV_err={(dv_ffpa - dv_ref).abs().max().item():.4e}  "
-    f"{dmask_msg}"
-    f"backend={backward_backend}  "
-    f"FFPA={ms_ffpa:.2f} ms  SDPA={ms_sdpa:.2f} ms  speedup={ms_sdpa / ms_ffpa:.2f}x"
+  tol = 7.5e-2 if dtype == torch.bfloat16 and causal else 5e-2 if dtype == torch.bfloat16 else 2e-2
+  dq_err = _max_abs_diff(dq_ffpa, dq_ref)
+  dk_err = _max_abs_diff(dk_ffpa, dk_ref)
+  dv_err = _max_abs_diff(dv_ffpa, dv_ref)
+  dmask_err, dmask_status = _mask_grad_status(dmask_ffpa, dmask_ref, compare_mask_grad, attn_mask)
+  allclose = (
+    _tensor_allclose(dq_ffpa, dq_ref, tol) and _tensor_allclose(dk_ffpa, dk_ref, tol)
+    and _tensor_allclose(dv_ffpa, dv_ref, tol)
   )
+  if dmask_ffpa is not None and dmask_ref is not None:
+    allclose = allclose and _tensor_allclose(dmask_ffpa, dmask_ref, tol)
+
+  result: BACKWARD_RESULT = {
+    "case_name": name,
+    "dtype": _dtype_tag(dtype),
+    "backward_backend": backward_backend,
+    "timing_mode": timing_mode,
+    "B": B,
+    "Hq": Nh_q,
+    "Hkv": Nh_kv,
+    "Nq": Nq,
+    "Nkv": Nkv,
+    "D": D,
+    "causal": causal,
+    "dropout_p": dropout_p,
+    "dq_err": dq_err,
+    "dk_err": dk_err,
+    "dv_err": dv_err,
+    "dmask_err": dmask_err,
+    "dmask_status": dmask_status,
+    "compare_mask_grad": compare_mask_grad,
+    "allclose": allclose,
+    "tolerance": tol,
+    "ffpa_ms": ms_ffpa,
+    "sdpa_ms": ms_sdpa,
+    "speedup": ms_sdpa / ms_ffpa,
+  }
+  if print_result:
+    print(_format_backward_result(result))
+  return result
+
+
+def run_backward_examples(
+  *,
+  B: int = 1,
+  H: int = 32,
+  N: int = 8192,
+  D: int = 512,
+  dropout_p: float = 0.1,
+  seed: int = 42,
+  backward_backend: str = "triton",
+  timing_mode: str = "backward-only",
+  triton_backward_autotune: bool = False,
+  triton_autotune_mode: str = "fast",
+  print_results: bool = True,
+) -> list[BACKWARD_RESULT]:
+  """Run the canonical backward benchmark cases.
+
+  :param B: Batch size.
+  :param H: Base query head count used by the examples.
+  :param N: Base sequence length.
+  :param D: Head dimension.
+  :param dropout_p: Dropout probability for the dropout case.
+  :param seed: RNG seed.
+  :param backward_backend: Backward backend passed to ``ffpa_attn_func``.
+  :param timing_mode: Benchmark timing mode.
+  :param triton_backward_autotune: Whether to enable Triton backward autotune.
+  :param triton_autotune_mode: Triton autotune mode.
+  :param print_results: Whether to print each case result.
+  :return: One structured result per executed case and dtype.
+  """
+  results: list[BACKWARD_RESULT] = []
+  gqa_heads = _resolve_gqa_heads(H)
+  non_aligned_heads = _resolve_non_aligned_heads(H)
+
+  print(
+    f"\nRunning FFPA backward examples with backward_backend={backward_backend}, "
+    f"triton_backward_autotune={triton_backward_autotune}, "
+    f"triton_autotune_mode={triton_autotune_mode}, "
+    f"timing_mode={timing_mode}"
+  )
+
+  for dtype in (torch.float16, torch.bfloat16):
+    mask_n = max(N, 512)
+    case_specs: list[dict[str, Any]] = [
+      {
+        "name": "self-attn",
+        "Nh_q": H,
+        "Nh_kv": H,
+        "Nq": N,
+        "Nkv": N
+      },
+      {
+        "name": "cross-attn",
+        "Nh_q": H,
+        "Nh_kv": H,
+        "Nq": 1024,
+        "Nkv": N
+      },
+      {
+        "name": "decode-attn",
+        "Nh_q": H,
+        "Nh_kv": H,
+        "Nq": 1,
+        "Nkv": N
+      },
+      {
+        "name": "gqa",
+        "Nh_q": H,
+        "Nh_kv": gqa_heads,
+        "Nq": N,
+        "Nkv": N
+      },
+      {
+        "name": "causal",
+        "Nh_q": H,
+        "Nh_kv": H,
+        "Nq": N,
+        "Nkv": N,
+        "causal": True
+      },
+      {
+        "name": "attn-mask",
+        "Nh_q": H,
+        "Nh_kv": H,
+        "Nq": mask_n,
+        "Nkv": mask_n,
+        "attn_mask": _make_broadcast_additive_attn_mask(mask_n, mask_n, dtype, seed),
+      },
+      {
+        "name": "dropout",
+        "Nh_q": H,
+        "Nh_kv": H,
+        "Nq": N,
+        "Nkv": N,
+        "dropout_p": dropout_p,
+      },
+      {
+        "name": "non-aligned",
+        "Nh_q": non_aligned_heads,
+        "Nh_kv": non_aligned_heads,
+        "Nq": N - 1 if N > 1 else N,
+        "Nkv": N - 1 if N > 1 else N,
+      },
+    ]
+
+    for case in case_specs:
+      results.append(
+        _run_case(
+          case["name"],
+          dtype,
+          backward_backend,
+          triton_backward_autotune,
+          triton_autotune_mode,
+          seed=seed,
+          B=B,
+          Nh_q=case["Nh_q"],
+          Nh_kv=case["Nh_kv"],
+          Nq=case["Nq"],
+          Nkv=case["Nkv"],
+          D=D,
+          causal=case.get("causal", False),
+          attn_mask=case.get("attn_mask"),
+          dropout_p=case.get("dropout_p", 0.0),
+          timing_mode=timing_mode,
+          print_result=print_results,
+        )
+      )
+
+  return results
 
 
 def main() -> None:
   args = _parse_args()
   print(args)
-  N, D = args.N, args.D
 
   if not torch.cuda.is_available():
     raise SystemExit("CUDA is required to run this example.")
-
-  for dtype in (torch.float16, torch.bfloat16):
-    _run_case(
-      "self-attn",
-      dtype,
-      args.backward_backend,
-      args.triton_backward_autotune,
-      args.triton_autotune_mode,
-      seed=args.seed,
-      B=args.B,
-      Nh_q=32,
-      Nh_kv=32,
-      Nq=N,
-      Nkv=N,
-      D=D,
-      timing_mode=args.timing_mode,
-    )
-    _run_case(
-      "cross-attn",
-      dtype,
-      args.backward_backend,
-      args.triton_backward_autotune,
-      args.triton_autotune_mode,
-      seed=args.seed,
-      B=args.B,
-      Nh_q=32,
-      Nh_kv=32,
-      Nq=1024,
-      Nkv=N,
-      D=D,
-      timing_mode=args.timing_mode,
-    )
-    _run_case(
-      "decode-attn",
-      dtype,
-      args.backward_backend,
-      args.triton_backward_autotune,
-      args.triton_autotune_mode,
-      seed=args.seed,
-      B=args.B,
-      Nh_q=32,
-      Nh_kv=32,
-      Nq=1,
-      Nkv=N,
-      D=D,
-      timing_mode=args.timing_mode,
-    )
-    _run_case(
-      "gqa",
-      dtype,
-      args.backward_backend,
-      args.triton_backward_autotune,
-      args.triton_autotune_mode,
-      seed=args.seed,
-      B=args.B,
-      Nh_q=32,
-      Nh_kv=8,
-      Nq=N,
-      Nkv=N,
-      D=D,
-      timing_mode=args.timing_mode,
-    )
-    _run_case(
-      "causal",
-      dtype,
-      args.backward_backend,
-      args.triton_backward_autotune,
-      args.triton_autotune_mode,
-      seed=args.seed,
-      B=args.B,
-      Nh_q=32,
-      Nh_kv=32,
-      Nq=N,
-      Nkv=N,
-      D=D,
-      causal=True,
-      timing_mode=args.timing_mode,
-    )
-    mask_n = max(N, 512)
-    _run_case(
-      "attn-mask",
-      dtype,
-      args.backward_backend,
-      args.triton_backward_autotune,
-      args.triton_autotune_mode,
-      seed=args.seed,
-      B=args.B,
-      Nh_q=32,
-      Nh_kv=32,
-      Nq=mask_n,
-      Nkv=mask_n,
-      D=D,
-      attn_mask=_make_broadcast_additive_attn_mask(mask_n, mask_n, dtype, args.seed),
-      timing_mode=args.timing_mode,
-    )
-    _run_case(
-      "dropout",
-      dtype,
-      args.backward_backend,
-      args.triton_backward_autotune,
-      args.triton_autotune_mode,
-      seed=args.seed,
-      B=args.B,
-      Nh_q=32,
-      Nh_kv=32,
-      Nq=N,
-      Nkv=N,
-      D=D,
-      dropout_p=args.dropout_p,
-      timing_mode=args.timing_mode,
-    )
-    _run_case(
-      "non-aligned",
-      dtype,
-      args.backward_backend,
-      args.triton_backward_autotune,
-      args.triton_autotune_mode,
-      seed=args.seed,
-      B=args.B,
-      Nh_q=8,
-      Nh_kv=8,
-      Nq=N - 1 if N > 1 else N,  # avoid zero-dim
-      Nkv=N - 1 if N > 1 else N,  # avoid zero-dim
-      D=D,
-      timing_mode=args.timing_mode,
-    )
+  run_backward_examples(
+    B=args.B,
+    N=args.N,
+    D=args.D,
+    dropout_p=args.dropout_p,
+    seed=args.seed,
+    backward_backend=args.backward_backend,
+    timing_mode=args.timing_mode,
+    triton_backward_autotune=args.triton_backward_autotune,
+    triton_autotune_mode=args.triton_autotune_mode,
+    print_results=True,
+  )
 
 
 if __name__ == "__main__":
