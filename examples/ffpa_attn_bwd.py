@@ -29,7 +29,7 @@ import torch.nn.functional as F
 from ffpa_attn import ffpa_attn_func
 
 WARMUP, ITERS = 2, 10
-MAX_MASK_GRAD_SEQLEN = 8192
+MAX_MASK_GRAD_SEQLEN = 1024 * 16  # 16K, avoid OOM.
 
 
 def _parse_args() -> argparse.Namespace:
