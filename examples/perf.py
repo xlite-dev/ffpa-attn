@@ -45,9 +45,8 @@ PLOT_CASES: list[tuple[str, str]] = [
 CASE_LABELS = dict(PLOT_CASES)
 DTYPE_ORDER = ["fp16", "bf16"]
 DEFAULT_OUTPUT_STEM = "ffpa_speedup"
+DEFAULT_OUTPUT_DIR = Path(".tmp")
 FALLBACK_DEVICE_NAME = "NVIDIA RTX 5090 Blackwell"
-MARKDOWN_TABLE_HEADER = "| Case | dtype | Nq/Nkv | allclose | FFPA / SDPA | speedup |"
-MARKDOWN_TABLE_ALIGN = "|:---:|:---:|:---:|:---:|:---:|:---:|"
 FALLBACK_SPEEDUPS: dict[str, dict[str, dict[str, float]]] = {
   "forward": {
     "self-attn": {
@@ -170,10 +169,20 @@ def _parse_args() -> argparse.Namespace:
   parser.add_argument("--D", type=int, default=512, help="Head dimension used by benchmark mode.")
   parser.add_argument("--seed", type=int, default=42, help="RNG seed used by benchmark mode.")
   parser.add_argument(
+    "--norm",
+    action="store_true",
+    help="Enable pre-attention LayerNorm on q/k/v for both FFPA and SDPA paths.",
+  )
+  parser.add_argument(
+    "--show-allclose",
+    action="store_true",
+    help="Include the allclose column in the generated Markdown tables.",
+  )
+  parser.add_argument(
     "--save-path",
     type=Path,
     default=None,
-    help="Optional directory or file stem path used to save the generated PNG and Markdown artifacts.",
+    help="Optional output directory used to save the generated PNG and Markdown artifacts. Defaults to ./.tmp.",
   )
   return parser.parse_args()
 
@@ -225,10 +234,9 @@ def _resolve_output_stem(save_path: Path | None, device_name: str, B: int, H: in
   :return: Output stem without extension.
   """
   default_stem = _output_stem(device_name, B, H, N, D)
-  if save_path is None:
-    return default_stem
-  save_path.mkdir(parents=True, exist_ok=True)
-  return save_path / default_stem.name
+  output_dir = DEFAULT_OUTPUT_DIR if save_path is None else save_path
+  output_dir.mkdir(parents=True, exist_ok=True)
+  return output_dir / default_stem.name
 
 
 def _case_shape(case_name: str, sequence_length: int) -> tuple[int, int]:
@@ -518,6 +526,23 @@ def _allclose_marker(row: RESULT_ROW) -> str:
   return "-"
 
 
+def _markdown_table_columns(show_allclose: bool) -> tuple[str, str]:
+  """Return Markdown header and alignment rows.
+
+  :param show_allclose: Whether to include the allclose column.
+  :return: ``(header, align)`` rows.
+  """
+  if show_allclose:
+    return (
+      "| Case | dtype | Nq/Nkv | allclose | FFPA / SDPA | speedup |",
+      "|:---:|:---:|:---:|:---:|:---:|:---:|",
+    )
+  return (
+    "| Case | dtype | Nq/Nkv | FFPA / SDPA | speedup |",
+    "|:---:|:---:|:---:|:---:|:---:|",
+  )
+
+
 def _latency_cell(row: RESULT_ROW) -> str:
   """Format the latency cell for Markdown tables.
 
@@ -531,18 +556,26 @@ def _latency_cell(row: RESULT_ROW) -> str:
   return f"{ffpa_ms:.2f} / {sdpa_ms:.2f} ms"
 
 
-def _render_table(rows: list[RESULT_ROW]) -> list[str]:
+def _render_table(rows: list[RESULT_ROW], show_allclose: bool) -> list[str]:
   """Render one GFM benchmark table.
 
   :param rows: Structured result rows for one direction.
+  :param show_allclose: Whether to include the allclose column.
   :return: Markdown lines for the table.
   """
-  lines = [MARKDOWN_TABLE_HEADER, MARKDOWN_TABLE_ALIGN]
+  header, align = _markdown_table_columns(show_allclose)
+  lines = [header, align]
   for row in _sort_rows(rows):
-    lines.append(
-      "| "
-      f"{row['case_name']} | {row['dtype']} | {row['Nq']}/{row['Nkv']} | {_allclose_marker(row)} | {_latency_cell(row)} | {row['speedup']:.2f}x |"
-    )
+    if show_allclose:
+      lines.append(
+        "| "
+        f"{row['case_name']} | {row['dtype']} | {row['Nq']}/{row['Nkv']} | {_allclose_marker(row)} | {_latency_cell(row)} | {row['speedup']:.2f}x |"
+      )
+    else:
+      lines.append(
+        "| "
+        f"{row['case_name']} | {row['dtype']} | {row['Nq']}/{row['Nkv']} | {_latency_cell(row)} | {row['speedup']:.2f}x |"
+      )
   return lines
 
 
@@ -559,6 +592,7 @@ def render_speedup_markdown(
   backward_backend: str,
   tune_mode: str | None,
   fallback: bool,
+  show_allclose: bool,
 ) -> str:
   """Render README-style Markdown benchmark tables.
 
@@ -573,6 +607,7 @@ def render_speedup_markdown(
   :param backward_backend: Selected backward backend.
   :param tune_mode: Triton autotune mode.
   :param fallback: Whether fallback hard-coded data is used.
+  :param show_allclose: Whether to include the allclose column.
   :return: Markdown document fragment.
   """
   lines = ["## Benchmark", "", f"Env: {device_name}, B={B}, N={N}, H={H}, D={D}."]
@@ -583,10 +618,10 @@ def render_speedup_markdown(
     ])
   if forward_rows:
     lines.extend(["", f"### Forward Pass ({_forward_section_label(forward_backend, tune_mode, fallback)})", ""])
-    lines.extend(_render_table(forward_rows))
+    lines.extend(_render_table(forward_rows, show_allclose))
   if backward_rows:
     lines.extend(["", f"### Backward Pass ({_backward_section_label(backward_backend, tune_mode, fallback)})", ""])
-    lines.extend(_render_table(backward_rows))
+    lines.extend(_render_table(backward_rows, show_allclose))
   return "\n".join(lines) + "\n"
 
 
@@ -611,6 +646,7 @@ def _benchmark_rows(args: argparse.Namespace) -> tuple[list[RESULT_ROW], list[RE
         N=args.N,
         D=args.D,
         seed=args.seed,
+        apply_norm=args.norm,
         forward_backend=args.forward_backend,
         triton_forward_autotune=args.forward_backend == "triton" and tune_mode is not None,
         triton_autotune_mode=tune_mode or "fast",
@@ -626,6 +662,7 @@ def _benchmark_rows(args: argparse.Namespace) -> tuple[list[RESULT_ROW], list[RE
         N=args.N,
         D=args.D,
         seed=args.seed,
+        apply_norm=args.norm,
         backward_backend=args.backward_backend,
         timing_mode="backward-only",
         triton_backward_autotune=args.backward_backend == "triton" and tune_mode is not None,
@@ -673,6 +710,7 @@ def main() -> None:
     backward_backend=args.backward_backend,
     tune_mode=args.tune,
     fallback=fallback,
+    show_allclose=args.show_allclose,
   )
   md_path = output_stem.with_suffix(".md")
   md_path.write_text(markdown, encoding="utf-8")

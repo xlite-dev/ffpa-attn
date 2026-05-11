@@ -50,6 +50,11 @@ def _parse_args() -> argparse.Namespace:
   parser.add_argument("--dropout-p", type=float, default=0.1, help="Dropout probability for the dropout example case.")
   parser.add_argument("--seed", type=int, default=42, help="Random seed for input tensors.")
   parser.add_argument(
+    "--norm",
+    action="store_true",
+    help="Enable pre-attention LayerNorm on q/k/v for both FFPA and SDPA paths.",
+  )
+  parser.add_argument(
     "--timing-mode",
     choices=["backward-only", "full"],
     default="backward-only",
@@ -165,6 +170,50 @@ def _tensor_allclose(lhs: torch.Tensor, rhs: torch.Tensor, tol: float) -> bool:
   :return: ``True`` when the promoted tensors satisfy ``torch.allclose``.
   """
   return torch.allclose(lhs.float(), rhs.float(), atol=tol, rtol=tol)
+
+
+def _prepare_attn_mask(
+  attn_mask: torch.Tensor | None,
+  dtype: torch.dtype,
+  compare_mask_grad: bool,
+) -> torch.Tensor | None:
+  """Prepare an additive attention mask for the target attention dtype.
+
+  :param attn_mask: Optional additive mask.
+  :param dtype: Attention dtype.
+  :param compare_mask_grad: Whether mask gradients should be compared.
+  :return: Mask ready for FFPA/SDPA execution.
+  """
+  if attn_mask is None:
+    return None
+  prepared = attn_mask if compare_mask_grad else attn_mask.detach()
+  if prepared.dtype != dtype:
+    prepared = prepared.to(dtype)
+    if compare_mask_grad and attn_mask.requires_grad:
+      prepared = prepared.detach().requires_grad_(True)
+  return prepared
+
+
+def _maybe_norm_qkv(
+  q: torch.Tensor,
+  k: torch.Tensor,
+  v: torch.Tensor,
+  apply_norm: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+  """Optionally apply per-tensor LayerNorm over the head dimension.
+
+  :param q: Query tensor.
+  :param k: Key tensor.
+  :param v: Value tensor.
+  :param apply_norm: Whether to normalize q/k/v before attention.
+  :return: Normalized or original ``(q, k, v)``.
+  """
+  if not apply_norm:
+    return q, k, v
+  q = F.layer_norm(q, (q.size(-1), ))
+  k = F.layer_norm(k, (k.size(-1), ))
+  v = F.layer_norm(v, (v.size(-1), ))
+  return q, k, v
 
 
 def _format_backward_result(result: BACKWARD_RESULT) -> str:
@@ -464,16 +513,21 @@ def _run_case(
   attn_mask: torch.Tensor | None = None,
   dropout_p: float = 0.0,
   timing_mode: str = "backward-only",
+  apply_norm: bool = False,
   print_result: bool = True,
 ) -> BACKWARD_RESULT:
   torch.manual_seed(seed)
-  q = torch.randn(B, Nh_q, Nq, D, dtype=dtype, device="cuda", requires_grad=True)
-  k = torch.randn(B, Nh_kv, Nkv, D, dtype=dtype, device="cuda", requires_grad=True)
-  v = torch.randn(B, Nh_kv, Nkv, D, dtype=dtype, device="cuda", requires_grad=True)
+  q = torch.randn(B, Nh_q, Nq, D, dtype=dtype, device="cuda")
+  k = torch.randn(B, Nh_kv, Nkv, D, dtype=dtype, device="cuda")
+  v = torch.randn(B, Nh_kv, Nkv, D, dtype=dtype, device="cuda")
+  q, k, v = _maybe_norm_qkv(q, k, v, apply_norm)
+  q = q.requires_grad_(True)
+  k = k.requires_grad_(True)
+  v = v.requires_grad_(True)
   scale = 1.0 / math.sqrt(D)
   dropout_seed = seed + 17
   compare_mask_grad = _should_compare_mask_grad(B, Nh_q, Nq, Nkv, attn_mask)
-  active_attn_mask = attn_mask if compare_mask_grad else attn_mask.detach() if attn_mask is not None else None
+  active_attn_mask = _prepare_attn_mask(attn_mask, q.dtype, compare_mask_grad)
 
   torch.manual_seed(dropout_seed)
   out = ffpa_attn_func(
@@ -630,6 +684,7 @@ def run_backward_examples(
   D: int = 512,
   dropout_p: float = 0.1,
   seed: int = 42,
+  apply_norm: bool = False,
   backward_backend: str = "triton",
   timing_mode: str = "backward-only",
   triton_backward_autotune: bool = False,
@@ -644,6 +699,7 @@ def run_backward_examples(
   :param D: Head dimension.
   :param dropout_p: Dropout probability for the dropout case.
   :param seed: RNG seed.
+  :param apply_norm: Whether to normalize q/k/v before attention.
   :param backward_backend: Backward backend passed to ``ffpa_attn_func``.
   :param timing_mode: Benchmark timing mode.
   :param triton_backward_autotune: Whether to enable Triton backward autotune.
@@ -657,6 +713,7 @@ def run_backward_examples(
 
   print(
     f"\nRunning FFPA backward examples with backward_backend={backward_backend}, "
+    f"apply_norm={apply_norm}, "
     f"triton_backward_autotune={triton_backward_autotune}, "
     f"triton_autotune_mode={triton_autotune_mode}, "
     f"timing_mode={timing_mode}"
@@ -745,6 +802,7 @@ def run_backward_examples(
           attn_mask=case.get("attn_mask"),
           dropout_p=case.get("dropout_p", 0.0),
           timing_mode=timing_mode,
+          apply_norm=apply_norm,
           print_result=print_results,
         )
       )
@@ -764,6 +822,7 @@ def main() -> None:
     D=args.D,
     dropout_p=args.dropout_p,
     seed=args.seed,
+    apply_norm=args.norm,
     backward_backend=args.backward_backend,
     timing_mode=args.timing_mode,
     triton_backward_autotune=args.triton_backward_autotune,

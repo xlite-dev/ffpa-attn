@@ -51,6 +51,11 @@ def _parse_args() -> argparse.Namespace:
   parser.add_argument("--dropout-p", type=float, default=0.1, help="Dropout probability for the dropout example case.")
   parser.add_argument("--seed", type=int, default=42, help="Random seed for input tensors.")
   parser.add_argument(
+    "--norm",
+    action="store_true",
+    help="Enable pre-attention LayerNorm on q/k/v for both FFPA and SDPA paths.",
+  )
+  parser.add_argument(
     "--triton-forward-autotune",
     "--autotune",
     "--tune",
@@ -152,6 +157,28 @@ def _resolve_non_aligned_heads(num_heads: int) -> int:
   return candidate
 
 
+def _maybe_norm_qkv(
+  q: torch.Tensor,
+  k: torch.Tensor,
+  v: torch.Tensor,
+  apply_norm: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+  """Optionally apply per-tensor LayerNorm over the head dimension.
+
+  :param q: Query tensor.
+  :param k: Key tensor.
+  :param v: Value tensor.
+  :param apply_norm: Whether to normalize q/k/v before attention.
+  :return: Normalized or original ``(q, k, v)``.
+  """
+  if not apply_norm:
+    return q, k, v
+  q = F.layer_norm(q, (q.size(-1), ))
+  k = F.layer_norm(k, (k.size(-1), ))
+  v = F.layer_norm(v, (v.size(-1), ))
+  return q, k, v
+
+
 def _format_forward_result(result: FORWARD_RESULT) -> str:
   """Format one forward benchmark result for CLI output.
 
@@ -188,12 +215,14 @@ def _run_case(
   attn_mask: torch.Tensor | None = None,
   dropout_p: float = 0.0,
   acc: str = "f32",
+  apply_norm: bool = False,
   print_result: bool = True,
 ) -> FORWARD_RESULT:
   torch.manual_seed(seed)
   q = torch.randn(B, Nh_q, Nq, D, dtype=dtype, device="cuda")
   k = torch.randn(B, Nh_kv, Nkv, D, dtype=dtype, device="cuda")
   v = torch.randn(B, Nh_kv, Nkv, D, dtype=dtype, device="cuda")
+  q, k, v = _maybe_norm_qkv(q, k, v, apply_norm)
 
   torch.manual_seed(seed + 17)
   out_ffpa = ffpa_attn_func(
@@ -280,6 +309,7 @@ def run_forward_examples(
   D: int = 512,
   dropout_p: float = 0.1,
   seed: int = 42,
+  apply_norm: bool = False,
   forward_backend: str = "triton",
   triton_forward_autotune: bool = False,
   triton_autotune_mode: str = "fast",
@@ -293,6 +323,7 @@ def run_forward_examples(
   :param D: Head dimension.
   :param dropout_p: Dropout probability for the dropout case.
   :param seed: RNG seed.
+  :param apply_norm: Whether to normalize q/k/v before attention.
   :param forward_backend: Forward backend passed to ``ffpa_attn_func``.
   :param triton_forward_autotune: Whether to enable Triton forward autotune.
   :param triton_autotune_mode: Triton autotune mode.
@@ -304,6 +335,7 @@ def run_forward_examples(
   non_aligned_heads = _resolve_non_aligned_heads(H)
   print(
     f"\nRunning FFPA forward examples with forward_backend={forward_backend}, "
+    f"apply_norm={apply_norm}, "
     f"triton_forward_autotune={triton_forward_autotune}, "
     f"triton_autotune_mode={triton_autotune_mode}"
   )
@@ -393,6 +425,7 @@ def run_forward_examples(
           causal=case.get("causal", False),
           attn_mask=case.get("attn_mask"),
           dropout_p=case.get("dropout_p", 0.0),
+          apply_norm=apply_norm,
           print_result=print_results,
         )
       )
@@ -412,6 +445,7 @@ def main() -> None:
     D=args.D,
     dropout_p=args.dropout_p,
     seed=args.seed,
+    apply_norm=args.norm,
     forward_backend=args.forward_backend,
     triton_forward_autotune=args.triton_forward_autotune,
     triton_autotune_mode=args.triton_autotune_mode,
