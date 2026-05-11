@@ -668,9 +668,10 @@ class ENV(object):
     if build_pkg:
       pretty_print_line()
     # Generate per-headdim TUs under csrc/cuffpa/generated/ and use them as
-    # the actual build sources. Splitting by headdim enables MAX_JOBS to
-    # drive nvcc on many small files in parallel and cuts the build time
-    # of the heavy launch_ffpa_attn_fwd_template instantiations.
+    # the actual build sources. The generated TUs include launch_templates.cuh,
+    # which in turn includes ffpa_attn_fwd.cuh. Splitting by headdim enables
+    # MAX_JOBS to drive nvcc on many small files in parallel and cuts the build
+    # time of the heavy launch_ffpa_attn_fwd_template instantiations.
     generated_files = ENV.generate_split_headdim_sources(build_pkg=build_pkg)
     generated_sources = [p for p in generated_files if p.endswith(".cu")]
     if build_pkg:

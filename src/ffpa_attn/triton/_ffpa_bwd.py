@@ -7,20 +7,41 @@ FFPA Backward Kernel was adapted from:
 Triton >= 3.x compatible (uses ``tl.trans`` instead of ``trans_b``).
 Supports headdim up to 1024 via Split-D tiling.
 
-Phase 1 (per Q-block, D-chunk outer → accumulate S/dP across D):
-    S   = sum_d Q_d @ K_d^T           [BLOCK_M, BLOCK_N]  fp32
-    dP  = sum_d dO_d @ V_d^T           [BLOCK_M, BLOCK_N]  fp32
+The backward implementation has two execution paths:
 
-Phase 1b/1c (per Q-block):
-    P   = exp(S * scale - LSE)        [BLOCK_M, BLOCK_N]  fp32
-    dS  = P * (dP - delta) * scale    [BLOCK_M, BLOCK_N]  fp32→DTYPE
+* Main path for Nq >= 8: a shared-pid split-D kernel computes dK/dV and dQ
+  in the same launch. The pid is reused as either a K-block id or a Q-block id,
+  which keeps dQ non-atomic because each pid owns one Q tile.
+* Decode path for Nq < 8: stage1 computes dK/dV and per-K-block partial dQ;
+  a second kernel reduces partial dQ across K blocks. Nq == 1 uses a GEMV-style
+  specialization to avoid forming tiny matrix tiles.
 
-Phase 2 (per Q-block, D-chunk):
-    dQ_d = dS @ K_d                   [BLOCK_M, BLOCK_HEADDIM]
-    dK_d = (Q_d^T @ dS)^T             [BLOCK_N, BLOCK_HEADDIM]  (atomicAdd)
-    dV_d = (dO_d^T @ P)^T             [BLOCK_N, BLOCK_HEADDIM]  (atomicAdd)
+Additive ``attn_bias`` follows SDPA's logical score shape
+``[B, Hq, Nq, Nkv]``. Compact masks are represented by stride-0 dimensions in
+the Triton kernels, and their gradients are reduced back to the compact user
+shape. Dropout is replayed from the forward Philox seed/offset using the same
+logical score element order as PyTorch SDPA. GQA/MQA is handled outside these
+kernels by expanding K/V to query-head layout and reducing dK/dV back after the
+kernel returns.
 
-delta = rowsum(dO * O) is precomputed.
+Main path (Nq >= 8):
+  The single shared-pid kernel has two independent roles. When pid maps to a
+  K tile, it streams all relevant Q tiles, reconstructs scores and dP across
+  head-dim chunks, applies causal/additive-bias/dropout state, derives dS,
+  and accumulates one DK/DV tile. When the same pid maps to a Q tile, it
+  streams K tiles, reconstructs the same local dS, and accumulates DQ for the
+  owned Q rows. DQ is a plain store because Q tiles are uniquely owned; DK/DV
+  are also written by one K-tile owner after local accumulation over Q tiles.
+
+Decode path (Nq < 8):
+  The stage1 kernel is split by K tile because a tiny query window would
+  underutilize the main matrix-tile path. Each stage1 program computes DK/DV
+  for its K tile and writes a PartialDQ contribution. A second reduce kernel
+  sums PartialDQ across K tiles. Nq == 1 uses a GEMV-style specialization;
+  Nq in [2, 7] uses a small matrix tile. Causal masking is tail-aligned with
+  SDPA, so query row m can attend to key positions <= m + (Nkv - Nq).
+
+``delta = rowsum(dO * O)`` is precomputed once and reused by both paths.
 """
 
 import math
@@ -39,7 +60,13 @@ def _attn_bias_broadcast_strides(
   seqlen_q: int,
   seqlen_k: int,
 ) -> tuple[int, int, int, int]:
-  """Return strides for broadcasting a compact 4-D attention bias."""
+  """Return strides for broadcasting a compact 4-D attention bias.
+
+  The kernels always index ``AttnBias`` as if it had logical shape
+  ``[B, Hq, Nq, Nkv]``. A stride of zero means the corresponding user dimension
+  was size 1 and should be reused for every logical score element. This avoids
+  materializing common masks such as ``[1, 1, 1, Nkv]``.
+  """
   if attn_bias is None:
     return (0, 0, 0, 0)
   return (
@@ -81,7 +108,12 @@ def _attn_bias_grad_reduces_query(
   grad_attn_bias: torch.Tensor | None,
   seqlen_q: int,
 ) -> bool:
-  """Return whether compact bias gradients reduce the query dimension."""
+  """Return whether compact bias gradients reduce the query dimension.
+
+  ``[1, 1, 1, Nkv]`` key-position masks need a sum over all query rows. The
+  main kernel either atomically accumulates this reduction directly or writes
+  per-Q-block partials for the dedicated fp32 reducer below.
+  """
   return grad_attn_bias is not None and grad_attn_bias.size(2) == 1 and seqlen_q > 1
 
 
@@ -90,7 +122,12 @@ def _attn_bias_grad_is_key_bias(
   seqlen_q: int,
   seqlen_k: int,
 ) -> bool:
-  """Return whether grad is for a compact key-position bias [1, 1, 1, Nkv]."""
+  """Return whether grad is for a compact key-position bias [1, 1, 1, Nkv].
+
+  The special path is limited to the main kernel path (``seqlen_q >= 8``). It
+  keeps the high-volume ``sum over B*Hq*Nq`` in fp32 partial buffers and then
+  reduces once, which is more accurate and avoids many atomics for long Nq.
+  """
   if grad_attn_bias is None or seqlen_q < 8:
     return False
   return all([
@@ -126,6 +163,10 @@ def _dropout_multiplier(
   philox_offset: int,
   HAS_DROPOUT: tl.constexpr,
 ):
+  # Forward stores one dropout decision for every logical score element in
+  # row-major [B, H, Nq, Nkv] order. Backward must regenerate the same decisions
+  # before both dP and P are used: dP sees the mask through dO @ V^T, while dV
+  # sees the dropped probability through P_drop.
   mult = tl.full([offs_m.shape[0], offs_n.shape[0]], 1.0, dtype=tl.float32)
   if HAS_DROPOUT:
     # Replay the exact forward dropout mask using SDPA's logical score layout.
@@ -350,6 +391,10 @@ _FFPA_BWD_HEURISTICS = {
 #
 # Because each program owns a unique Q-row block, dQ can be written
 # non-atomically.
+#
+# The kernel sees K/V already expanded to query-head layout for GQA/MQA. That
+# keeps the Triton code head-local: off_h always indexes a query head, and the
+# wrapper folds expanded dK/dV back to the original KV heads afterwards.
 @triton.heuristics(_FFPA_BWD_HEURISTICS)
 @triton.jit
 def _ffpa_bwd_v2_kernel_impl(
@@ -456,7 +501,7 @@ def _ffpa_bwd_v2_kernel_impl(
     for start_m in range(begin_m, num_block_m * BLOCK_M, BLOCK_M):
       offs_qm = start_m + offs_m
 
-      # --- Phase 1: S = sum_d Q_d @ K_d^T, dP = sum_d dO_d @ V_d^T ---
+      # Reconstruct local scores and dP for this K tile by streaming D chunks.
       S = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
       dP = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
 
@@ -485,13 +530,15 @@ def _ffpa_bwd_v2_kernel_impl(
         S = tl.dot(q, tl.trans(k), acc=S)
         dP = tl.dot(do, tl.trans(v), acc=dP)
 
-      # --- Phase 1b/1c: softmax + dS ---
+      # Convert scores to P/dS under the same masking and dropout state as fwd.
       if not EVEN_N:
         S = tl.where(offs_n[None, :] < seqlen_k, S, float("-inf"))
       if IS_CAUSAL:
         S = tl.where(offs_qm[:, None] >= (offs_n[None, :]), S, float("-inf"))
       S = S * softmax_scale
       if HAS_ATTN_BIAS:
+        # AttnBias strides may be zero for broadcast dimensions. The pointer
+        # math therefore covers full masks and compact masks with the same load.
         bias = tl.load(
           AttnBias + offs_qm[:, None] * stride_bm + offs_n[None, :] * stride_bn,
           mask=(offs_qm[:, None] < seqlen_q) & (offs_n[None, :] < seqlen_k),
@@ -515,6 +562,21 @@ def _ffpa_bwd_v2_kernel_impl(
       P_drop = P * dropout_mult
       Di = tl.load(D + offs_qm)
       if BIAS_REQUIRES_GRAD:
+        # dBias is the gradient wrt the additive score bias before multiplying
+        # by softmax_scale. The write strategy depends on how the user mask was
+        # broadcast to logical [B, Hq, Nq, Nkv] scores:
+        #   1. GRAD_BIAS_REDUCES_M: the query dimension was broadcast, e.g.
+        #      [1, 1, 1, Nkv]. Sum the BLOCK_M rows first because all rows in
+        #      this tile alias the same key-position element. When
+        #      GRAD_BIAS_STORE_PARTIAL is true, the target is a fp32 partial
+        #      buffer indexed by Q-block, so a plain store is correct. Otherwise
+        #      multiple Q blocks alias the final compact mask and need atomics.
+        #   2. GRAD_BIAS_NEEDS_REDUCTION: some non-query dimension broadcasts,
+        #      such as batch or head. Keep the [M, N] layout but atomic-add each
+        #      score because different programs can target the same compact
+        #      batch/head mask element.
+        #   3. Full mask: every logical score owns a unique output element, so a
+        #      normal store is both correct and faster.
         dBias = P * (dP - Di[:, None])
         grad_bias_mask = (offs_qm[:, None] < seqlen_q) & (offs_n[None, :] < seqlen_k)
         if GRAD_BIAS_REDUCES_M:
@@ -535,7 +597,7 @@ def _ffpa_bwd_v2_kernel_impl(
       else:
         dS = (P * (dP - Di[:, None]) * softmax_scale).to(DTYPE)
 
-      # --- Phase 2 for dK/dV ---
+      # Accumulate this K tile's DK/DV over Q tiles, one D chunk at a time.
       for d_chunk in range(num_d_chunks):
         d_offs = d_chunk * BLOCK_HEADDIM + offs_d
         q = tl.load(
@@ -572,7 +634,7 @@ def _ffpa_bwd_v2_kernel_impl(
     for start_n_k in range(0, end_n_k, BLOCK_N):
       offs_nk = start_n_k + offs_n
 
-      # --- Phase 1: S, dP for this Q-block × K-block ---
+      # Reconstruct local scores and dP for this Q tile by streaming D chunks.
       S_qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
       dP_qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
 
@@ -601,13 +663,16 @@ def _ffpa_bwd_v2_kernel_impl(
         S_qk = tl.dot(q, tl.trans(k), acc=S_qk)
         dP_qk = tl.dot(do, tl.trans(v), acc=dP_qk)
 
-      # --- Phase 1b/1c ---
+      # Convert scores to dS for the owned Q tile. dQ uses this dS only; dBias
+      # was already emitted on the K-tile side to avoid duplicate mask writes.
       if not EVEN_N:
         S_qk = tl.where(offs_nk[None, :] < seqlen_k, S_qk, float("-inf"))
       if IS_CAUSAL:
         S_qk = tl.where(offs_m[:, None] >= (offs_nk[None, :]), S_qk, float("-inf"))
       S_qk = S_qk * softmax_scale
       if HAS_ATTN_BIAS:
+        # Same logical [B, Hq, Nq, Nkv] bias addressing as the dK/dV side. When
+        # a dimension was broadcast by the user, the corresponding stride is 0.
         bias = tl.load(
           AttnBias + offs_m[:, None] * stride_bm + offs_nk[None, :] * stride_bn,
           mask=(offs_m[:, None] < seqlen_q) & (offs_nk[None, :] < seqlen_k),
@@ -629,9 +694,11 @@ def _ffpa_bwd_v2_kernel_impl(
       )
       dP_qk = dP_qk * dropout_mult_qk
       Di = tl.load(D + offs_m)
+      # dQ does not write dBias. It still must replay dropout in dP so the
+      # softmax backward matches the forward dropped probability matrix.
       dS_qk = (P_qk * (dP_qk - Di[:, None]) * softmax_scale).to(DTYPE)
 
-      # --- Phase 2 for dQ ---
+      # Accumulate the owned Q tile's DQ over K tiles, one D chunk at a time.
       for d_chunk in range(num_d_chunks):
         d_offs = d_chunk * BLOCK_HEADDIM + offs_d
         k = tl.load(
@@ -739,136 +806,6 @@ def _get_decode_bwd_stage1_autotune(headdim: int, use_gemv: bool, autotune_mode:
 
 
 @triton.jit
-def _ffpa_bwd_key_bias_grad_stage1_kernel(
-  Q: torch.Tensor,
-  K: torch.Tensor,
-  V: torch.Tensor,
-  DO: torch.Tensor,
-  LSE: torch.Tensor,
-  D: torch.Tensor,
-  AttnBias: torch.Tensor,
-  PartialGradBias: torch.Tensor,
-  softmax_scale: float,
-  stride_qb: int,
-  stride_qh: int,
-  stride_qm: int,
-  stride_kb: int,
-  stride_kh: int,
-  stride_kn: int,
-  stride_vb: int,
-  stride_vh: int,
-  stride_vn: int,
-  stride_dob: int,
-  stride_doh: int,
-  stride_dom: int,
-  stride_bb: int,
-  stride_bh: int,
-  stride_bm: int,
-  stride_bn: int,
-  stride_pb: int,
-  stride_pm: int,
-  nheads: int,
-  seqlen_q: int,
-  seqlen_k: int,
-  seqlen_q_rounded: int,
-  headdim: int,
-  dropout_p: float,
-  philox_offset: int,
-  IS_CAUSAL: tl.constexpr,
-  HAS_ATTN_BIAS: tl.constexpr,
-  HAS_DROPOUT: tl.constexpr,
-  PHILOX_SEED: tl.constexpr,
-  BLOCK_M: tl.constexpr,
-  BLOCK_N: tl.constexpr,
-  BLOCK_HEADDIM: tl.constexpr,
-) -> None:
-  start_n_block = tl.program_id(0)
-  start_m_block = tl.program_id(1)
-  off_hb = tl.program_id(2)
-  off_b = off_hb // nheads
-  off_h = off_hb % nheads
-
-  Q += off_b * stride_qb + off_h * stride_qh
-  K += off_b * stride_kb + off_h * stride_kh
-  V += off_b * stride_vb + off_h * stride_vh
-  DO += off_b * stride_dob + off_h * stride_doh
-  LSE += off_hb * seqlen_q_rounded
-  D += off_hb * seqlen_q_rounded
-  if HAS_ATTN_BIAS:
-    AttnBias += off_b * stride_bb + off_h * stride_bh
-  PartialGradBias += off_hb * stride_pb + start_m_block * stride_pm
-
-  offs_m = start_m_block * BLOCK_M + tl.arange(0, BLOCK_M)
-  offs_n = start_n_block * BLOCK_N + tl.arange(0, BLOCK_N)
-  offs_d = tl.arange(0, BLOCK_HEADDIM)
-  mask_m = offs_m < seqlen_q
-  mask_n = offs_n < seqlen_k
-  num_d_chunks = tl.cdiv(headdim, BLOCK_HEADDIM)
-
-  scores = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
-  dP = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
-  for d_chunk in range(num_d_chunks):
-    d_offs = d_chunk * BLOCK_HEADDIM + offs_d
-    q = tl.load(
-      Q + offs_m[:, None] * stride_qm + d_offs[None, :],
-      mask=mask_m[:, None] & (d_offs[None, :] < headdim),
-      other=0.0,
-    )
-    k = tl.load(
-      K + offs_n[:, None] * stride_kn + d_offs[None, :],
-      mask=mask_n[:, None] & (d_offs[None, :] < headdim),
-      other=0.0,
-    )
-    v = tl.load(
-      V + offs_n[:, None] * stride_vn + d_offs[None, :],
-      mask=mask_n[:, None] & (d_offs[None, :] < headdim),
-      other=0.0,
-    )
-    do = tl.load(
-      DO + offs_m[:, None] * stride_dom + d_offs[None, :],
-      mask=mask_m[:, None] & (d_offs[None, :] < headdim),
-      other=0.0,
-    )
-    scores = tl.dot(q, tl.trans(k), acc=scores)
-    dP = tl.dot(do, tl.trans(v), acc=dP)
-
-  scores = scores * softmax_scale
-  if HAS_ATTN_BIAS:
-    bias = tl.load(
-      AttnBias + offs_m[:, None] * stride_bm + offs_n[None, :] * stride_bn,
-      mask=mask_m[:, None] & mask_n[None, :],
-      other=0.0,
-    )
-    scores += bias
-  scores = tl.where(mask_n[None, :], scores, -float("inf"))
-  if IS_CAUSAL:
-    kv_offset = seqlen_k - seqlen_q
-    scores = tl.where(offs_n[None, :] <= (offs_m[:, None] + kv_offset), scores, -float("inf"))
-  scores = tl.where(mask_m[:, None], scores, -float("inf"))
-
-  lse_i = tl.load(LSE + offs_m, mask=mask_m, other=-float("inf"))
-  P = tl.exp(scores - lse_i[:, None])
-  score_mask = mask_m[:, None] & mask_n[None, :]
-  P = tl.where(score_mask, P, 0.0)
-  dropout_mult = _dropout_multiplier(
-    off_hb,
-    offs_m,
-    offs_n,
-    seqlen_q,
-    seqlen_k,
-    dropout_p,
-    PHILOX_SEED,
-    philox_offset,
-    HAS_DROPOUT,
-  )
-  dP = dP * dropout_mult
-  delta_i = tl.load(D + offs_m, mask=mask_m, other=0.0)
-  dBias = P * (dP - delta_i[:, None])
-  partial = tl.sum(tl.where(score_mask, dBias, 0.0), axis=0)
-  tl.store(PartialGradBias + offs_n, partial, mask=mask_n)
-
-
-@triton.jit
 def _ffpa_bwd_key_bias_grad_reduce_kernel(
   PartialGradBias: torch.Tensor,
   GradAttnBias: torch.Tensor,
@@ -961,6 +898,9 @@ def _ffpa_bwd_decode_stage1_kernel(
   BLOCK_N: tl.constexpr,
   BLOCK_HEADDIM: tl.constexpr,
 ) -> None:
+  # Decode backward splits work by K block. DK/DV are independent per K block,
+  # but dQ is a sum over all K blocks, so stage1 writes PartialDQ and the reduce
+  # kernel below performs the cross-K accumulation.
   start_n_block = tl.program_id(0)
   off_hb = tl.program_id(1)
   off_b = off_hb // nheads
@@ -1009,9 +949,14 @@ def _ffpa_bwd_decode_stage1_kernel(
 
     scores = scores * softmax_scale
     if HAS_ATTN_BIAS:
+      # USE_GEMV is only used for Nq == 1, so the bias pointer has no query
+      # offset; broadcasted batch/head/key strides were already encoded by the
+      # launcher.
       bias = tl.load(AttnBias + offs_n * stride_bn, mask=mask_n, other=0.0)
       scores += bias
     if IS_CAUSAL:
+      # With a single tail-aligned query, all real K positions are legal. The
+      # mask still guards padded BLOCK_N lanes.
       scores = tl.where(offs_n <= (seqlen_k - 1), scores, -float("inf"))
     scores = tl.where(mask_n, scores, -float("inf"))
 
@@ -1098,6 +1043,8 @@ def _ffpa_bwd_decode_stage1_kernel(
     scores = tl.where(mask_n[None, :], scores, -float("inf"))
     if IS_CAUSAL:
       kv_offset = seqlen_k - seqlen_q
+      # Tail-aligned lower-right causal mask for decode windows where Nq can be
+      # smaller than Nkv. A query row m sees keys up to m + (Nkv - Nq).
       causal_mask = offs_n[None, :] <= (offs_m[:, None] + kv_offset)
       scores = tl.where(causal_mask, scores, -float("inf"))
     scores = tl.where(mask_m[:, None], scores, -float("inf"))
@@ -1126,6 +1073,9 @@ def _ffpa_bwd_decode_stage1_kernel(
 
     if BIAS_REQUIRES_GRAD:
       grad_bias_mask = mask_m[:, None] & mask_n[None, :]
+      # Decode can also receive compact masks. Query-broadcast masks reduce the
+      # M dimension inside the tile first; other broadcast dimensions use
+      # atomic adds to merge aliases across programs.
       if GRAD_BIAS_REDUCES_M:
         grad_bias_ptrs = GradAttnBias + offs_n * stride_gbn
         grad_bias = tl.sum(tl.where(grad_bias_mask, dBias, 0.0), axis=0)
@@ -1291,6 +1241,10 @@ def _ffpa_attn_backward_triton_impl(
   bias_requires_grad = grad_attn_bias is not None
   grad_bias_needs_reduction = _attn_bias_grad_needs_reduction(grad_attn_bias, batch, nheads, seqlen_q, seqlen_k)
   grad_bias_reduces_m = _attn_bias_grad_reduces_query(grad_attn_bias, seqlen_q)
+  # The [1, 1, 1, Nkv] key-position mask is common in examples and avoids
+  # materializing [B, Hq, Nq, Nkv]. In non-autotune mode we route its gradient
+  # through a fp32 partial buffer so dMask accuracy is not dominated by many
+  # score-level atomics or their accumulation order.
   use_key_bias_grad_reduction = _attn_bias_grad_is_key_bias(grad_attn_bias, seqlen_q, seqlen_k) and not autotune
   main_bias_requires_grad = bias_requires_grad
   grad_bias_store_partial = use_key_bias_grad_reduction
@@ -1371,6 +1325,10 @@ def _ffpa_attn_backward_triton_impl(
   dk.zero_()
   dv.zero_()
 
+  # Very short query lengths are decode-like: many K tiles contribute to one or
+  # a few query rows. The dedicated path keeps DK/DV per K block and reduces dQ
+  # explicitly, which is faster than launching the shared-pid matrix kernel for
+  # tiny Nq. The causal mask in this path is tail-aligned to SDPA semantics.
   if seqlen_q < 8:
     use_gemv = seqlen_q == 1
     block_m_decode = 8 if use_gemv else 16
@@ -1712,6 +1670,9 @@ def _ffpa_attn_backward_triton(
 
   group_size = q.size(1) // k.size(1)
   if group_size > 1:
+    # GQA/MQA contract: kernels operate on expanded query-head layout. Gradients
+    # for repeated KV heads are summed back into the original KV head dimension
+    # after the Triton op returns.
     k_in = k.repeat_interleave(group_size, dim=1).contiguous()
     v_in = v.repeat_interleave(group_size, dim=1).contiguous()
   else:
