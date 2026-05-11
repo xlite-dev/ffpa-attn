@@ -563,12 +563,18 @@ def _run_case(
   )
   if all([
     compare_mask_grad,
-    dmask_ref is None,
     dropout_p == 0.0,
     not causal,
     _is_key_position_bias(active_attn_mask, Nkv),
   ]):
+    # PyTorch SDPA returns a bf16/fp16 mask gradient for compact [1, 1, 1, Nkv]
+    # bias, but that broadcast-reduced leaf grad can differ materially from the
+    # mathematically reduced reference in low precision. Use the dedicated
+    # reference for this compact mask shape so dMask_err reflects FFPA kernel
+    # accuracy rather than SDPA's compact-mask autograd behavior.
     dmask_ref = _key_position_bias_grad_ref(q, k, v, scale, active_attn_mask)
+  if dmask_ffpa is not None and dmask_ref is not None and dmask_ref.dtype != dmask_ffpa.dtype:
+    dmask_ref = dmask_ref.to(dmask_ffpa.dtype)
 
   if timing_mode == "backward-only":
     grad_out = torch.ones_like(q)
