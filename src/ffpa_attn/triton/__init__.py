@@ -21,6 +21,30 @@ def _attn_bias_grad_needs_reduction(attn_bias: torch.Tensor | None, q: torch.Ten
   ])
 
 
+def _attn_bias_grad_dtype(attn_bias: torch.Tensor, q: torch.Tensor, k: torch.Tensor) -> torch.dtype:
+  """Return the internal accumulation dtype for Triton bias gradients.
+
+  BF16 additive-bias gradients are numerically sensitive even when the logical
+  mask shape does not require broadcast reduction. Keep the Triton accumulation
+  buffer in fp32 and cast back to the user dtype at the Python wrapper
+  boundary so the kernel only rounds once.
+  """
+  if attn_bias.dtype == torch.bfloat16 or _attn_bias_grad_needs_reduction(attn_bias, q, k):
+    return torch.float32
+  return attn_bias.dtype
+
+
+def _triton_bwd_grad_tensor_like(tensor: torch.Tensor) -> torch.Tensor:
+  """Allocate the internal Triton backward output buffer for one gradient.
+
+  Keep the Triton-owned backward gradient workspace in fp32 and cast back in
+  the higher-level Python wrapper once all kernel-side accumulation is
+  finished. This makes fp32 accumulation the default for both fp16 and bf16
+  backward kernels.
+  """
+  return torch.empty_like(tensor, dtype=torch.float32)
+
+
 torch.library.define(
   f"{_OP_NAMESPACE}::_fwd_triton",
   "(Tensor q, Tensor k, Tensor v, Tensor? attn_bias, float softmax_scale, "
@@ -131,11 +155,11 @@ def _bwd_triton_torch_op(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
   from ._ffpa_bwd import _ffpa_attn_backward_triton_impl as _triton_bwd_kernel
 
-  dq = torch.empty_like(q)
-  dk = torch.empty_like(k)
-  dv = torch.empty_like(v)
+  dq = _triton_bwd_grad_tensor_like(q)
+  dk = _triton_bwd_grad_tensor_like(k)
+  dv = _triton_bwd_grad_tensor_like(v)
   if attn_bias is not None and return_attn_bias_grad:
-    grad_dtype = torch.float32 if _attn_bias_grad_needs_reduction(attn_bias, q, k) else attn_bias.dtype
+    grad_dtype = _attn_bias_grad_dtype(attn_bias, q, k)
     grad_attn_bias = torch.empty_like(attn_bias, dtype=grad_dtype)
   else:
     grad_attn_bias = q.new_empty(0)
@@ -196,11 +220,16 @@ def _bwd_triton_fake(
     philox_offset,
   )
   if attn_bias is not None and return_attn_bias_grad:
-    grad_dtype = torch.float32 if _attn_bias_grad_needs_reduction(attn_bias, q, k) else attn_bias.dtype
+    grad_dtype = _attn_bias_grad_dtype(attn_bias, q, k)
     grad_attn_bias = torch.empty_like(attn_bias, dtype=grad_dtype)
   else:
     grad_attn_bias = q.new_empty(0)
-  return torch.empty_like(q), torch.empty_like(k), torch.empty_like(v), grad_attn_bias
+  return (
+    _triton_bwd_grad_tensor_like(q),
+    _triton_bwd_grad_tensor_like(k),
+    _triton_bwd_grad_tensor_like(v),
+    grad_attn_bias,
+  )
 
 
 __all__ = ["_ffpa_attn_forward_triton", "_ffpa_attn_backward_triton"]

@@ -457,6 +457,7 @@ def _ffpa_bwd_v2_kernel_impl(
   GRAD_BIAS_NEEDS_REDUCTION: tl.constexpr,
   GRAD_BIAS_REDUCES_M: tl.constexpr,
   GRAD_BIAS_STORE_PARTIAL: tl.constexpr,
+  FP32_GRAD_ACCUM: tl.constexpr,
   BLOCK_HEADDIM: tl.constexpr,
   DTYPE: tl.constexpr,
   EVEN_M: tl.constexpr,
@@ -608,12 +609,12 @@ def _ffpa_bwd_v2_kernel_impl(
           mask=(offs_qm[:, None] < seqlen_q) & (d_offs[None, :] < headdim),
           other=0.
         )
-        dk_d = tl.trans(tl.dot(tl.trans(q), dS)).to(DTYPE)
+        dk_d = tl.trans(tl.dot(tl.trans(q), dS, out_dtype=tl.float32))
         dk_ptrs = DK + offs_n[:, None] * stride_dkn + d_offs[None, :]
         dk_val = tl.load(dk_ptrs, mask=(offs_n[:, None] < seqlen_k) & (d_offs[None, :] < headdim), other=0.)
         dk_val += dk_d
         tl.store(dk_ptrs, dk_val, mask=(offs_n[:, None] < seqlen_k) & (d_offs[None, :] < headdim))
-        dv_d = tl.trans(tl.dot(tl.trans(do).to(tl.float32), P_drop)).to(DTYPE)
+        dv_d = tl.trans(tl.dot(tl.trans(do), P_drop.to(DTYPE), out_dtype=tl.float32))
         dv_ptrs = DV + offs_n[:, None] * stride_dvn + d_offs[None, :]
         dv_val = tl.load(dv_ptrs, mask=(offs_n[:, None] < seqlen_k) & (d_offs[None, :] < headdim), other=0.)
         dv_val += dv_d
@@ -704,7 +705,7 @@ def _ffpa_bwd_v2_kernel_impl(
           mask=(offs_nk[:, None] < seqlen_k) & (d_offs[None, :] < headdim),
           other=0.
         )
-        dq_d = tl.dot(dS_qk, k).to(DTYPE)
+        dq_d = tl.dot(dS_qk, k, out_dtype=tl.float32)
         dq_ptrs = DQ + offs_m[:, None] * stride_dqm + d_offs[None, :]
         dq_val = tl.load(dq_ptrs, mask=(offs_m[:, None] < seqlen_q) & (d_offs[None, :] < headdim), other=0.)
         dq_val += dq_d
@@ -890,6 +891,7 @@ def _ffpa_bwd_decode_stage1_kernel(
   BIAS_REQUIRES_GRAD: tl.constexpr,
   GRAD_BIAS_NEEDS_REDUCTION: tl.constexpr,
   GRAD_BIAS_REDUCES_M: tl.constexpr,
+  FP32_GRAD_ACCUM: tl.constexpr,
   DTYPE: tl.constexpr,
   USE_GEMV: tl.constexpr,
   BLOCK_M: tl.constexpr,
@@ -992,12 +994,12 @@ def _ffpa_bwd_decode_stage1_kernel(
       dv = P_drop[:, None] * do[None, :]
       tl.store(
         DK + offs_n[:, None] * stride_dkn + d_offs[None, :],
-        dk.to(DTYPE),
+        dk,
         mask=mask_n[:, None] & (d_offs[None, :] < headdim),
       )
       tl.store(
         DV + offs_n[:, None] * stride_dvn + d_offs[None, :],
-        dv.to(DTYPE),
+        dv,
         mask=mask_n[:, None] & (d_offs[None, :] < headdim),
       )
       partial_dq = tl.sum(dS[:, None] * k, axis=0)
@@ -1102,17 +1104,17 @@ def _ffpa_bwd_decode_stage1_kernel(
         mask=mask_n[:, None] & (d_offs[None, :] < headdim),
         other=0.0,
       )
-      dk = tl.dot(tl.trans(dS), q)
-      dv = tl.dot(tl.trans(P_drop.to(DTYPE)), do)
-      partial_dq = tl.dot(dS, k)
+      dk = tl.dot(tl.trans(dS), q, out_dtype=tl.float32)
+      dv = tl.dot(tl.trans(P_drop.to(DTYPE)), do, out_dtype=tl.float32)
+      partial_dq = tl.dot(dS, k, out_dtype=tl.float32)
       tl.store(
         DK + offs_n[:, None] * stride_dkn + d_offs[None, :],
-        dk.to(DTYPE),
+        dk,
         mask=mask_n[:, None] & (d_offs[None, :] < headdim),
       )
       tl.store(
         DV + offs_n[:, None] * stride_dvn + d_offs[None, :],
-        dv.to(DTYPE),
+        dv,
         mask=mask_n[:, None] & (d_offs[None, :] < headdim),
       )
       tl.store(
@@ -1269,7 +1271,10 @@ def _ffpa_attn_backward_triton_impl(
   assert q.dtype == k.dtype == v.dtype == o.dtype == do.dtype
   assert q.dtype in (torch.float16, torch.bfloat16)
 
-  DTYPE = tl.float16 if q.dtype == torch.float16 else tl.bfloat16
+  if q.dtype == torch.float16:
+    DTYPE = tl.float16
+  else:
+    DTYPE = tl.bfloat16
 
   BLOCK_HEADDIM_DELTA = max(triton.next_power_of_2(headdim), 16)
   delta = torch.empty_like(lse)
@@ -1404,6 +1409,7 @@ def _ffpa_attn_backward_triton_impl(
       BIAS_REQUIRES_GRAD=main_bias_requires_grad,
       GRAD_BIAS_NEEDS_REDUCTION=grad_bias_needs_reduction,
       GRAD_BIAS_REDUCES_M=grad_bias_reduces_m,
+      FP32_GRAD_ACCUM=True,
       DTYPE=DTYPE,
       USE_GEMV=use_gemv,
     )
@@ -1512,6 +1518,7 @@ def _ffpa_attn_backward_triton_impl(
       GRAD_BIAS_NEEDS_REDUCTION=grad_bias_needs_reduction,
       GRAD_BIAS_REDUCES_M=grad_bias_reduces_m,
       GRAD_BIAS_STORE_PARTIAL=grad_bias_store_partial,
+      FP32_GRAD_ACCUM=True,
       DTYPE=DTYPE,
     )
   else:
@@ -1574,6 +1581,7 @@ def _ffpa_attn_backward_triton_impl(
       GRAD_BIAS_NEEDS_REDUCTION=grad_bias_needs_reduction,
       GRAD_BIAS_REDUCES_M=grad_bias_reduces_m,
       GRAD_BIAS_STORE_PARTIAL=grad_bias_store_partial,
+      FP32_GRAD_ACCUM=True,
       DTYPE=DTYPE,
       BLOCK_M=128,
       BLOCK_N=64,
@@ -1716,5 +1724,5 @@ def _ffpa_attn_backward_triton(
   if grad_attn_bias.numel() == 0:
     grad_attn_bias_out = None
   else:
-    grad_attn_bias_out = grad_attn_bias
+    grad_attn_bias_out = grad_attn_bias.to(attn_bias.dtype) if attn_bias is not None else grad_attn_bias
   return dq.to(q.dtype), dk, dv, grad_attn_bias_out
