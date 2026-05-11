@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import math
 import time
+from typing import Any
 
 import torch
 import torch.nn.functional as F
@@ -31,6 +32,7 @@ from ffpa_attn import ffpa_attn_func
 
 STAGES = 2
 WARMUP, ITERS = 2, 10
+FORWARD_RESULT = dict[str, Any]
 
 
 def _parse_args() -> argparse.Namespace:
@@ -48,6 +50,11 @@ def _parse_args() -> argparse.Namespace:
   parser.add_argument("--D", type=int, default=512, help="Head dimension.")
   parser.add_argument("--dropout-p", type=float, default=0.1, help="Dropout probability for the dropout example case.")
   parser.add_argument("--seed", type=int, default=42, help="Random seed for input tensors.")
+  parser.add_argument(
+    "--norm",
+    action="store_true",
+    help="Enable pre-attention LayerNorm on q/k/v for both FFPA and SDPA paths.",
+  )
   parser.add_argument(
     "--triton-forward-autotune",
     "--autotune",
@@ -109,6 +116,88 @@ def _expand_kv(k: torch.Tensor, v: torch.Tensor, nh_q: int):
   return k.repeat_interleave(rep, dim=1), v.repeat_interleave(rep, dim=1)
 
 
+def _dtype_tag(dtype: torch.dtype) -> str:
+  """Return a short dtype tag.
+
+  :param dtype: Torch dtype.
+  :return: String form without the ``torch.`` prefix.
+  """
+  if dtype == torch.float16:
+    return "fp16"
+  if dtype == torch.bfloat16:
+    return "bf16"
+  return str(dtype).replace("torch.", "")
+
+
+def _resolve_gqa_heads(num_heads: int) -> int:
+  """Choose the KV head count used by the GQA example.
+
+  :param num_heads: Query head count.
+  :return: KV head count that still divides ``num_heads``.
+  """
+  if num_heads <= 1:
+    return 1
+  candidate = max(1, num_heads // 4)
+  while candidate > 1 and num_heads % candidate != 0:
+    candidate -= 1
+  return candidate
+
+
+def _resolve_non_aligned_heads(num_heads: int) -> int:
+  """Choose the head count used by the non-aligned case.
+
+  :param num_heads: Base head count.
+  :return: Head count used by the non-aligned example.
+  """
+  if num_heads <= 8:
+    return num_heads
+  candidate = max(1, num_heads // 4)
+  while candidate > 1 and num_heads % candidate != 0:
+    candidate -= 1
+  return candidate
+
+
+def _maybe_norm_qkv(
+  q: torch.Tensor,
+  k: torch.Tensor,
+  v: torch.Tensor,
+  apply_norm: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+  """Optionally apply per-tensor LayerNorm over the head dimension.
+
+  :param q: Query tensor.
+  :param k: Key tensor.
+  :param v: Value tensor.
+  :param apply_norm: Whether to normalize q/k/v before attention.
+  :return: Normalized or original ``(q, k, v)``.
+  """
+  if not apply_norm:
+    return q, k, v
+  q = F.layer_norm(q, (q.size(-1), ))
+  k = F.layer_norm(k, (k.size(-1), ))
+  v = F.layer_norm(v, (v.size(-1), ))
+  return q, k, v
+
+
+def _format_forward_result(result: FORWARD_RESULT) -> str:
+  """Format one forward benchmark result for CLI output.
+
+  :param result: Structured forward result.
+  :return: Human-readable one-line summary.
+  """
+  return (
+    f"[{result['case_name']:<16} {result['dtype']:<8} acc={result['acc']}] "
+    f"B={result['B']} Hq={result['Hq']} Hkv={result['Hkv']} "
+    f"Nq={result['Nq']} Nkv={result['Nkv']} D={result['D']} "
+    f"causal={int(result['causal'])} dropout_p={result['dropout_p']:g}  "
+    f"max|diff|={result['max_diff']:.4f}  mean|diff|={result['mean_diff']:.5f}  "
+    f"allclose(atol={result['tolerance']})={result['allclose']}  "
+    f"backend={result['forward_backend']}  "
+    f"FFPA={result['ffpa_ms']:.2f} ms  SDPA={result['sdpa_ms']:.2f} ms  "
+    f"speedup={result['speedup']:.2f}x"
+  )
+
+
 def _run_case(
   name: str,
   dtype: torch.dtype,
@@ -126,11 +215,14 @@ def _run_case(
   attn_mask: torch.Tensor | None = None,
   dropout_p: float = 0.0,
   acc: str = "f32",
-) -> None:
+  apply_norm: bool = False,
+  print_result: bool = True,
+) -> FORWARD_RESULT:
   torch.manual_seed(seed)
   q = torch.randn(B, Nh_q, Nq, D, dtype=dtype, device="cuda")
   k = torch.randn(B, Nh_kv, Nkv, D, dtype=dtype, device="cuda")
   v = torch.randn(B, Nh_kv, Nkv, D, dtype=dtype, device="cuda")
+  q, k, v = _maybe_norm_qkv(q, k, v, apply_norm)
 
   torch.manual_seed(seed + 17)
   out_ffpa = ffpa_attn_func(
@@ -183,143 +275,182 @@ def _run_case(
     rng_seed=seed + 17 if dropout_p > 0.0 else None,
   )
 
-  dt_tag = str(dtype).replace("torch.", "")
+  result: FORWARD_RESULT = {
+    "case_name": name,
+    "dtype": _dtype_tag(dtype),
+    "forward_backend": forward_backend,
+    "B": B,
+    "Hq": Nh_q,
+    "Hkv": Nh_kv,
+    "Nq": Nq,
+    "Nkv": Nkv,
+    "D": D,
+    "causal": causal,
+    "dropout_p": dropout_p,
+    "acc": acc,
+    "max_diff": diff.max().item(),
+    "mean_diff": diff.mean().item(),
+    "allclose": ok,
+    "tolerance": tol,
+    "ffpa_ms": ms_ffpa,
+    "sdpa_ms": ms_sdpa,
+    "speedup": ms_sdpa / ms_ffpa,
+  }
+  if print_result:
+    print(_format_forward_result(result))
+  return result
+
+
+def run_forward_examples(
+  *,
+  B: int = 1,
+  H: int = 32,
+  N: int = 8192,
+  D: int = 512,
+  dropout_p: float = 0.1,
+  seed: int = 42,
+  apply_norm: bool = False,
+  forward_backend: str = "triton",
+  triton_forward_autotune: bool = False,
+  triton_autotune_mode: str = "fast",
+  print_results: bool = True,
+) -> list[FORWARD_RESULT]:
+  """Run the canonical forward benchmark cases.
+
+  :param B: Batch size.
+  :param H: Base query head count used by the examples.
+  :param N: Base sequence length.
+  :param D: Head dimension.
+  :param dropout_p: Dropout probability for the dropout case.
+  :param seed: RNG seed.
+  :param apply_norm: Whether to normalize q/k/v before attention.
+  :param forward_backend: Forward backend passed to ``ffpa_attn_func``.
+  :param triton_forward_autotune: Whether to enable Triton forward autotune.
+  :param triton_autotune_mode: Triton autotune mode.
+  :param print_results: Whether to print each case result.
+  :return: One structured result per executed case and dtype.
+  """
+  results: list[FORWARD_RESULT] = []
+  gqa_heads = _resolve_gqa_heads(H)
+  non_aligned_heads = _resolve_non_aligned_heads(H)
   print(
-    f"[{name:<16} {dt_tag:<8} acc={acc}] "
-    f"B={B} Hq={Nh_q} Hkv={Nh_kv} Nq={Nq} Nkv={Nkv} D={D} causal={int(causal)} dropout_p={dropout_p:g}  "
-    f"max|diff|={diff.max().item():.4f}  mean|diff|={diff.mean().item():.5f}  "
-    f"allclose(atol={tol})={ok}  "
-    f"backend={forward_backend}  "
-    f"FFPA={ms_ffpa:.2f} ms  SDPA={ms_sdpa:.2f} ms  speedup={ms_sdpa / ms_ffpa:.2f}x"
+    f"\nRunning FFPA forward examples with forward_backend={forward_backend}, "
+    f"apply_norm={apply_norm}, "
+    f"triton_forward_autotune={triton_forward_autotune}, "
+    f"triton_autotune_mode={triton_autotune_mode}"
   )
+
+  for dtype in (torch.float16, torch.bfloat16):
+    case_specs: list[dict[str, Any]] = [
+      {
+        "name": "self-attn",
+        "Nh_q": H,
+        "Nh_kv": H,
+        "Nq": N,
+        "Nkv": N
+      },
+      {
+        "name": "cross-attn",
+        "Nh_q": H,
+        "Nh_kv": H,
+        "Nq": 1024,
+        "Nkv": N
+      },
+      {
+        "name": "decode-attn",
+        "Nh_q": H,
+        "Nh_kv": H,
+        "Nq": 1,
+        "Nkv": N
+      },
+      {
+        "name": "gqa",
+        "Nh_q": H,
+        "Nh_kv": gqa_heads,
+        "Nq": N,
+        "Nkv": N
+      },
+      {
+        "name": "causal",
+        "Nh_q": H,
+        "Nh_kv": H,
+        "Nq": N,
+        "Nkv": N,
+        "causal": True
+      },
+    ]
+    if forward_backend != "cuda":
+      mask_n = max(N, 512)
+      case_specs.extend([
+        {
+          "name": "attn-mask",
+          "Nh_q": H,
+          "Nh_kv": H,
+          "Nq": mask_n,
+          "Nkv": mask_n,
+          "attn_mask": _make_broadcast_additive_attn_mask(mask_n, mask_n, dtype, seed),
+        },
+        {
+          "name": "dropout",
+          "Nh_q": H,
+          "Nh_kv": H,
+          "Nq": N,
+          "Nkv": N,
+          "dropout_p": dropout_p,
+        },
+      ])
+    case_specs.append({
+      "name": "non-aligned",
+      "Nh_q": non_aligned_heads,
+      "Nh_kv": non_aligned_heads,
+      "Nq": N - 1 if N > 1 else N,
+      "Nkv": N - 1 if N > 1 else N,
+    })
+
+    for case in case_specs:
+      results.append(
+        _run_case(
+          case["name"],
+          dtype,
+          forward_backend,
+          triton_forward_autotune,
+          triton_autotune_mode,
+          seed=seed,
+          B=B,
+          Nh_q=case["Nh_q"],
+          Nh_kv=case["Nh_kv"],
+          Nq=case["Nq"],
+          Nkv=case["Nkv"],
+          D=D,
+          causal=case.get("causal", False),
+          attn_mask=case.get("attn_mask"),
+          dropout_p=case.get("dropout_p", 0.0),
+          apply_norm=apply_norm,
+          print_result=print_results,
+        )
+      )
+
+  return results
 
 
 def main() -> None:
   args = _parse_args()
   print(args)
-  N, D = args.N, args.D
 
   if not torch.cuda.is_available():
     raise SystemExit("CUDA is required to run this example.")
-
-  for dtype in (torch.float16, torch.bfloat16):
-    _run_case(
-      "self-attn",
-      dtype,
-      args.forward_backend,
-      args.triton_forward_autotune,
-      args.triton_autotune_mode,
-      seed=args.seed,
-      B=args.B,
-      Nh_q=32,
-      Nh_kv=32,
-      Nq=N,
-      Nkv=N,
-      D=D,
-    )
-    _run_case(
-      "cross-attn",
-      dtype,
-      args.forward_backend,
-      args.triton_forward_autotune,
-      args.triton_autotune_mode,
-      seed=args.seed,
-      B=args.B,
-      Nh_q=32,
-      Nh_kv=32,
-      Nq=1024,
-      Nkv=N,
-      D=D,
-    )
-    _run_case(
-      "decode-attn",
-      dtype,
-      args.forward_backend,
-      args.triton_forward_autotune,
-      args.triton_autotune_mode,
-      seed=args.seed,
-      B=args.B,
-      Nh_q=32,
-      Nh_kv=32,
-      Nq=1,
-      Nkv=N,
-      D=D,
-    )
-    _run_case(
-      "gqa",
-      dtype,
-      args.forward_backend,
-      args.triton_forward_autotune,
-      args.triton_autotune_mode,
-      seed=args.seed,
-      B=args.B,
-      Nh_q=32,
-      Nh_kv=8,
-      Nq=N,
-      Nkv=N,
-      D=D,
-    )
-    _run_case(
-      "causal",
-      dtype,
-      args.forward_backend,
-      args.triton_forward_autotune,
-      args.triton_autotune_mode,
-      seed=args.seed,
-      B=args.B,
-      Nh_q=32,
-      Nh_kv=32,
-      Nq=N,
-      Nkv=N,
-      D=D,
-      causal=True,
-    )
-    if args.forward_backend != "cuda":
-      mask_n = max(N, 512)
-      _run_case(
-        "attn-mask",
-        dtype,
-        args.forward_backend,
-        args.triton_forward_autotune,
-        args.triton_autotune_mode,
-        seed=args.seed,
-        B=args.B,
-        Nh_q=32,
-        Nh_kv=32,
-        Nq=mask_n,
-        Nkv=mask_n,
-        D=D,
-        attn_mask=_make_broadcast_additive_attn_mask(mask_n, mask_n, dtype, args.seed),
-      )
-      _run_case(
-        "dropout",
-        dtype,
-        args.forward_backend,
-        args.triton_forward_autotune,
-        args.triton_autotune_mode,
-        seed=args.seed,
-        B=args.B,
-        Nh_q=32,
-        Nh_kv=32,
-        Nq=N,
-        Nkv=N,
-        D=D,
-        dropout_p=args.dropout_p,
-      )
-    _run_case(
-      "non-aligned",
-      dtype,
-      args.forward_backend,
-      args.triton_forward_autotune,
-      args.triton_autotune_mode,
-      seed=args.seed,
-      B=args.B,
-      Nh_q=8,
-      Nh_kv=8,
-      Nq=N - 1 if N > 1 else N,  # avoid zero-dim
-      Nkv=N - 1 if N > 1 else N,  # avoid zero-dim
-      D=D,
-    )
+  run_forward_examples(
+    B=args.B,
+    N=args.N,
+    D=args.D,
+    dropout_p=args.dropout_p,
+    seed=args.seed,
+    apply_norm=args.norm,
+    forward_backend=args.forward_backend,
+    triton_forward_autotune=args.triton_forward_autotune,
+    triton_autotune_mode=args.triton_autotune_mode,
+    print_results=True,
+  )
 
 
 if __name__ == "__main__":
