@@ -18,20 +18,15 @@ def parse_args():
   parser.add_argument("--causal", action="store_true")
   parser.add_argument("--stages", type=int, default=1)
   parser.add_argument(
-    "--compare-stages",
-    action="store_true",
-    help="Run CUDA stages 1, 2, and 3 side by side.",
-  )
-  parser.add_argument(
     "--compare-backends",
     action="store_true",
-    help="Run CUDA, Triton, and SDPA backward side by side.",
+    help="Run FFPA Triton-backward and FFPA SDPA-backward side by side.",
   )
   parser.add_argument(
     "--backward-backend",
-    choices=["cuda", "triton"],
+    choices=["triton", "sdpa"],
     default="triton",
-    help="Native backward backend to benchmark when not using a compare mode.",
+    help="Backward backend passed to ffpa_attn_func when not using a compare mode.",
   )
   parser.add_argument(
     "--mode",
@@ -198,15 +193,15 @@ def try_time_backend(timer, name, fn, q, k, v, dO, warmup, iters):
   try:
     return timer(name, fn, q, k, v, dO, warmup, iters)
   except RuntimeError as exc:
-    if ("K/V-resident smem requirement" in str(exc) or "native backward was not compiled" in str(exc)):
+    if "K/V-resident smem requirement" in str(exc):
       print(f"{name:>14}: unavailable ({exc})")
       return None
     raise
 
 
 def backend_label(backend, stages):
-  if backend == "cuda":
-    return f"cuda_s{stages}"
+  if backend == "triton":
+    return f"ffpa({backend}, s{stages})"
   return f"ffpa({backend})"
 
 
@@ -238,10 +233,7 @@ def main():
 
     return native
 
-  def make_cuda(stages):
-    return make_native("cuda", stages)
-
-  def cuda(q_i, k_i, v_i):
+  def ffpa(q_i, k_i, v_i):
     enable_gqa = q_i.size(1) != k_i.size(1)
     return ffpa_attn_func(
       q_i,
@@ -272,47 +264,26 @@ def main():
   sdpa_ref = run_forward_backward_once(sdpa, q, k, v, dO)
   timer = time_backward_only if args.mode == "backward-only" else time_backward
   if args.compare_backends:
-    cuda1_ms = try_time_backend(timer, "cuda_s1", make_native("cuda", 1), q, k, v, dO, args.warmup, args.iters)
-    cuda2_ms = try_time_backend(timer, "cuda_s2", make_native("cuda", 2), q, k, v, dO, args.warmup, args.iters)
-    ffpa_ms = try_time_backend(timer, "ffpa", make_native("triton", 1), q, k, v, dO, args.warmup, args.iters)
+    triton_ms = try_time_backend(
+      timer, "ffpa_triton", make_native("triton", args.stages), q, k, v, dO, args.warmup, args.iters
+    )
+    sdpa_backend_ms = try_time_backend(
+      timer, "ffpa_sdpa", make_native("sdpa", args.stages), q, k, v, dO, args.warmup, args.iters
+    )
     sdpa_ms = timer("sdpa", sdpa, q, k, v, dO, args.warmup, args.iters)
-    if cuda1_ms is not None:
-      print(f"speedup cuda_s1: {sdpa_ms / cuda1_ms:.3f}x vs sdpa")
-    if cuda2_ms is not None:
-      print(f"speedup cuda_s2: {sdpa_ms / cuda2_ms:.3f}x vs sdpa")
-    if ffpa_ms is not None:
-      print(f"speedup ffpa: {sdpa_ms / ffpa_ms:.3f}x vs sdpa")
-      if cuda1_ms is not None:
-        print(f"ffpa/cuda_s1: {ffpa_ms / cuda1_ms:.3f}x time")
-      if cuda2_ms is not None:
-        print(f"ffpa/cuda_s2: {ffpa_ms / cuda2_ms:.3f}x time")
-    if cuda1_ms is not None:
-      print_max_abs_err("cuda_s1", make_native("cuda", 1), sdpa_ref, q, k, v, dO)
-    if cuda2_ms is not None:
-      print_max_abs_err("cuda_s2", make_native("cuda", 2), sdpa_ref, q, k, v, dO)
-    if ffpa_ms is not None:
-      print_max_abs_err("ffpa", make_native("triton", 1), sdpa_ref, q, k, v, dO)
-  elif args.compare_stages:
-    cuda1_ms = timer("cuda_s1", make_cuda(1), q, k, v, dO, args.warmup, args.iters)
-    cuda2_ms = timer("cuda_s2", make_cuda(2), q, k, v, dO, args.warmup, args.iters)
-    cuda3_ms = timer("cuda_s3", make_cuda(3), q, k, v, dO, args.warmup, args.iters)
-    sdpa_ms = timer("sdpa", sdpa, q, k, v, dO, args.warmup, args.iters)
-    print(f"speedup stage1: {sdpa_ms / cuda1_ms:.3f}x vs sdpa")
-    print(f"speedup stage2: {sdpa_ms / cuda2_ms:.3f}x vs sdpa")
-    print(f"speedup stage3: {sdpa_ms / cuda3_ms:.3f}x vs sdpa")
-    print(f"stage2/stage1: {cuda2_ms / cuda1_ms:.3f}x time")
-    print(f"stage3/stage1: {cuda3_ms / cuda1_ms:.3f}x time")
-    print(f"stage3/stage2: {cuda3_ms / cuda2_ms:.3f}x time")
-    print_max_abs_err("cuda_s1", make_cuda(1), sdpa_ref, q, k, v, dO)
-    print_max_abs_err("cuda_s2", make_cuda(2), sdpa_ref, q, k, v, dO)
-    print_max_abs_err("cuda_s3", make_cuda(3), sdpa_ref, q, k, v, dO)
+    if triton_ms is not None:
+      print(f"speedup ffpa_triton: {sdpa_ms / triton_ms:.3f}x vs sdpa")
+      print_max_abs_err("ffpa_triton", make_native("triton", args.stages), sdpa_ref, q, k, v, dO)
+    if sdpa_backend_ms is not None:
+      print(f"speedup ffpa_sdpa: {sdpa_ms / sdpa_backend_ms:.3f}x vs sdpa")
+      print_max_abs_err("ffpa_sdpa", make_native("sdpa", args.stages), sdpa_ref, q, k, v, dO)
   else:
     backend_name = backend_label(args.backward_backend, args.stages)
-    cuda_ms = try_time_backend(timer, backend_name, cuda, q, k, v, dO, args.warmup, args.iters)
+    ffpa_ms = try_time_backend(timer, backend_name, ffpa, q, k, v, dO, args.warmup, args.iters)
     sdpa_ms = timer("sdpa", sdpa, q, k, v, dO, args.warmup, args.iters)
-    if cuda_ms is not None:
-      print(f"speedup {backend_name}: {sdpa_ms / cuda_ms:.3f}x vs sdpa")
-      print_max_abs_err(backend_name, cuda, sdpa_ref, q, k, v, dO)
+    if ffpa_ms is not None:
+      print(f"speedup {backend_name}: {sdpa_ms / ffpa_ms:.3f}x vs sdpa")
+      print_max_abs_err(backend_name, ffpa, sdpa_ref, q, k, v, dO)
 
 
 if __name__ == "__main__":

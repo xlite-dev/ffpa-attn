@@ -30,7 +30,7 @@ git clone https://github.com/xlite-dev/ffpa-attn.git
 # Then, build the wheel package (Triton backend only)
 cd ffpa-attn && pip3 install -e . --no-build-isolation
 # Optional: build the whl with Triton and CUDA backends
-ENABLE_FFPA_FWD_CUDA_IMPL=1 MAX_JOBS=8 pip3 install -e .
+ENABLE_FFPA_CUDA_IMPL=1 MAX_JOBS=8 pip3 install -e .
 ```
 
 Then, try to accelerate the attention for large headdim with just <i><b>one-line</b></i> of code:

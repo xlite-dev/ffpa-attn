@@ -2,9 +2,9 @@
 # FFPA-Attn Examples
 
 ```bash
-python3 examples/ffpa_attn_fwd.py --forward-backend cuda
 python3 examples/ffpa_attn_fwd.py --forward-backend triton
 python3 examples/ffpa_attn_fwd.py --forward-backend triton --autotune
+ENABLE_FFPA_CUDA_IMPL=1 python3 examples/ffpa_attn_fwd.py --forward-backend cuda
 python3 examples/ffpa_attn_bwd.py --backward-backend sdpa
 python3 examples/ffpa_attn_bwd.py --backward-backend triton
 python3 examples/ffpa_attn_bwd.py --backward-backend triton --autotune
@@ -15,7 +15,7 @@ python3 examples/ffpa_attn_bwd.py --backward-backend triton --autotune
 
 Env: NVIDIA L20 (Ada), PyTorch 2.11, CUDA 13.0, Headdim=512 (FA-2 not supported).
 
-### Forward Pass (CUDA)
+### Forward Pass (Legacy CUDA)
 
 | Case | dtype | Nq/Nkv | allclose | FFPA / SDPA | speedup |
 |:---:|:---:|:---:|:---:|:---:|:---:|

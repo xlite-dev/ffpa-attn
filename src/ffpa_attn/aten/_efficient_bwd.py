@@ -139,6 +139,9 @@ def _aten_efficient_attn_backward(
     attn_bias.masked_fill_(~attn_bias_mask.view(1, 1, q.size(2), k.size(2)), float("-inf"))
   elif attn_bias is not None:
     attn_bias = attn_bias.to(dtype=q_in.dtype)
+    bias_shape = (q.size(0), q_in.size(1), q.size(2), k.size(2))
+    if attn_bias.shape != bias_shape:
+      attn_bias = attn_bias.expand(bias_shape).contiguous()
 
   if group_size > 1:
     k_in = k_in.repeat_interleave(group_size, dim=1).contiguous()
@@ -172,7 +175,7 @@ def _aten_efficient_attn_backward(
   if not return_attn_bias_grad or original_attn_bias is None:
     grad_attn_bias = None
   else:
-    grad_attn_bias = grad_attn_bias.to(original_attn_bias.dtype)
+    grad_attn_bias = grad_attn_bias.sum_to_size(original_attn_bias.shape).to(original_attn_bias.dtype)
   return dq.to(q.dtype), dk, dv, grad_attn_bias
 
 
