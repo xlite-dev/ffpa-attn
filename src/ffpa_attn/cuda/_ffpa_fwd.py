@@ -16,12 +16,15 @@ def _ffpa_attn_forward_cuda(
 ) -> tuple[torch.Tensor, torch.Tensor]:
   """Call FFPA CUDA forward via registered torch op, returning ``(O, softmax_lse)``.
 
-    The ``O`` parameter is accepted for API compatibility but ignored — the
-    registered op always allocates a fresh output buffer.
+  The ``O`` parameter is accepted for API compatibility but ignored — the
+  registered op always allocates a fresh output buffer.
+  The ``tma`` parameter is also accepted for API compatibility; legacy CUDA
+  TMA dispatch has been removed from the active backend and is forced off.
 
-    :returns: Output tensor and softmax LSE sliced to visible shape ``[B, H, Nq]``.
-    """
+  :returns: Output tensor and softmax LSE sliced to visible shape ``[B, H, Nq]``.
+  """
   del O
+  del tma
   O_storage, softmax_lse_storage = torch.ops.ffpa_attn._fwd_cuda(
     Q,
     K,
@@ -30,6 +33,6 @@ def _ffpa_attn_forward_cuda(
     acc,
     causal,
     softmax_scale,
-    tma,
+    0,
   )
   return O_storage, softmax_lse_storage[..., :Q.size(2)]

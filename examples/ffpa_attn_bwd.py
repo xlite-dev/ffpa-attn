@@ -37,7 +37,7 @@ def _parse_args() -> argparse.Namespace:
     "--backward-backend",
     "--backend",
     "--bwd",
-    choices=["sdpa", "cuda", "triton"],
+    choices=["sdpa", "triton"],
     default="triton",
     help="Backward backend passed to ffpa_attn_func.",
   )
@@ -489,40 +489,39 @@ def main() -> None:
       causal=True,
       timing_mode=args.timing_mode,
     )
-    if args.backward_backend != "cuda":
-      mask_n = max(N, 512)
-      _run_case(
-        "attn-mask",
-        dtype,
-        args.backward_backend,
-        args.triton_backward_autotune,
-        args.triton_autotune_mode,
-        seed=args.seed,
-        B=args.B,
-        Nh_q=32,
-        Nh_kv=32,
-        Nq=mask_n,
-        Nkv=mask_n,
-        D=D,
-        attn_mask=_make_broadcast_additive_attn_mask(mask_n, mask_n, dtype, args.seed),
-        timing_mode=args.timing_mode,
-      )
-      _run_case(
-        "dropout",
-        dtype,
-        args.backward_backend,
-        args.triton_backward_autotune,
-        args.triton_autotune_mode,
-        seed=args.seed,
-        B=args.B,
-        Nh_q=32,
-        Nh_kv=32,
-        Nq=N,
-        Nkv=N,
-        D=D,
-        dropout_p=args.dropout_p,
-        timing_mode=args.timing_mode,
-      )
+    mask_n = max(N, 512)
+    _run_case(
+      "attn-mask",
+      dtype,
+      args.backward_backend,
+      args.triton_backward_autotune,
+      args.triton_autotune_mode,
+      seed=args.seed,
+      B=args.B,
+      Nh_q=32,
+      Nh_kv=32,
+      Nq=mask_n,
+      Nkv=mask_n,
+      D=D,
+      attn_mask=_make_broadcast_additive_attn_mask(mask_n, mask_n, dtype, args.seed),
+      timing_mode=args.timing_mode,
+    )
+    _run_case(
+      "dropout",
+      dtype,
+      args.backward_backend,
+      args.triton_backward_autotune,
+      args.triton_autotune_mode,
+      seed=args.seed,
+      B=args.B,
+      Nh_q=32,
+      Nh_kv=32,
+      Nq=N,
+      Nkv=N,
+      D=D,
+      dropout_p=args.dropout_p,
+      timing_mode=args.timing_mode,
+    )
     _run_case(
       "non-aligned",
       dtype,

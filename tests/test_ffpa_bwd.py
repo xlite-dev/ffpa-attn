@@ -668,6 +668,47 @@ def test_ffpa_bwd_sdpa_backend_gqa(dtype, Nh_q, Nh_kv, N, D):
   torch.testing.assert_close(v.grad, dv_ref, **tol)
 
 
+@pytest.mark.parametrize("dtype", DTYPES, ids=["fp16", "bf16"])
+def test_ffpa_bwd_sdpa_backend_additive_attn_mask_matches_sdpa(dtype):
+  """The SDPA backward backend handles broadcast additive-mask gradients."""
+  B, H, N, D = 1, 8, 512, 320
+  torch.manual_seed(0)
+  q = torch.randn(B, H, N, D, dtype=dtype, device="cuda", requires_grad=True)
+  k = torch.randn(B, H, N, D, dtype=dtype, device="cuda", requires_grad=True)
+  v = torch.randn(B, H, N, D, dtype=dtype, device="cuda", requires_grad=True)
+  attn_mask = (torch.randn(1, 1, N, N, dtype=dtype, device="cuda") * 0.25).requires_grad_(True)
+
+  scale = 1.0 / math.sqrt(D)
+  out = ffpa_attn_func(
+    q,
+    k,
+    v,
+    attn_mask=attn_mask,
+    scale=scale,
+    stages=2,
+    acc="f32",
+    high_precision_grad=True,
+    backward_backend="sdpa",
+  )
+  out.sum().backward()
+
+  dq_ref, dk_ref, dv_ref, dmask_ref = _sdpa_ref_grads(
+    q,
+    k,
+    v,
+    False,
+    scale,
+    attn_mask=attn_mask,
+    return_mask_grad=True,
+  )
+
+  tol = _tolerance(dtype)
+  torch.testing.assert_close(q.grad, dq_ref, **tol)
+  torch.testing.assert_close(k.grad, dk_ref, **tol)
+  torch.testing.assert_close(v.grad, dv_ref, **tol)
+  torch.testing.assert_close(attn_mask.grad, dmask_ref, atol=3e-2, rtol=3e-2)
+
+
 # Backward + causal + GQA
 CAUSAL_GQA_BWD_CONFIGS = [
   (16, 2, 4096, 64),

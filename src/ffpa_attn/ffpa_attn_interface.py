@@ -1,13 +1,14 @@
 """Public Python interface for FFPA prefill attention.
 
-The CUDA and Triton backend packages register forward / backward kernels as
+The CUDA and Triton backend packages register forward kernels as
 ``torch.library`` operators under ``torch.ops.ffpa_attn`` so that
 ``torch.compile`` can trace through the forward path as proper custom ops.
 
-Backward pass delegates to the registered FFPA backward ops or PyTorch SDPA
-backward functions, routing by headdim and user-selected backend.
+Backward pass delegates to Triton FFPA backward or PyTorch SDPA backward
+functions, routing by headdim and user-selected backend.
 Small-D directly delegates to ``torch.nn.functional.scaled_dot_product_attention``;
-large-D forward continues to use the FFPA CUDA or Triton kernels.
+large-D forward continues to use the FFPA Triton kernel by default, with a
+legacy optional CUDA forward backend available only when compiled in.
 """
 
 from __future__ import annotations
@@ -147,7 +148,9 @@ def ffpa_attn_func(
       ``triton_forward_autotune``, ``triton_autotune_mode``,
       ``backward_backend``, ``triton_backward_autotune``, ``triton_backward_version``, and
       ``triton_backward_preprocess_d_chunk``. ``forward_backend`` only
-      affects ``D > 256``. These options do not change the autograd
+      affects ``D > 256``. ``enable_tma`` is reserved for future Triton
+      kernels and is currently a no-op. ``backward_backend`` supports
+      ``"triton"`` and ``"sdpa"``. These options do not change the autograd
       contract; unknown keys raise ``TypeError``.
 
   :returns: Output tensor ``O`` with layout ``[B, Nh_q, Nq, D]``,

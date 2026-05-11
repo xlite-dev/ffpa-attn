@@ -9,7 +9,6 @@ to access the low-level dispatch layer.
 from __future__ import annotations
 
 import math
-import warnings
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -27,15 +26,6 @@ from .aten import (
 
 if TYPE_CHECKING:
   from typing import Tuple, Union, Optional  # noqa: F401
-
-# The SM>=90 TMA large-d kernel only widens the K box to 64 fp16 cols
-# (SWIZZLE_128B) when the head dim satisfies these constraints; outside
-# this set the C++ ``ExperimentalTmaLargeDConfig::kCanAttempt`` predicate
-# is false and the SM90 TMA kernel template is never instantiated, so
-# requesting ``enable_tma=True`` for an unsupported head dim cannot dispatch to
-# a TMA kernel anyway. Keep this check in sync with that predicate.
-_TMA_MIN_HEADDIM = 128
-_TMA_HEADDIM_ALIGN = 64
 
 # MMA Acc encoding kept in sync with csrc/pybind/ffpa_attn_api.cc::ffpa_attn.
 _ACC_F16 = 0
@@ -58,9 +48,7 @@ _FFPA_ATTN_IMPL_DEFAULTS: dict[str, object] = {
 _CUDA_BACKEND_LOADED = False
 _CUDA_BACKEND_IMPORT_ERROR: Exception | None = None
 _CUDA_FWD_AVAILABLE = False
-_CUDA_BWD_AVAILABLE = False
 _CUDA_FORWARD_IMPL = None
-_CUDA_BACKWARD_IMPL = None
 
 
 def _reserve_large_d_dropout_rng(
@@ -138,9 +126,7 @@ def _load_cuda_backend() -> None:
   global _CUDA_BACKEND_LOADED
   global _CUDA_BACKEND_IMPORT_ERROR
   global _CUDA_FWD_AVAILABLE
-  global _CUDA_BWD_AVAILABLE
   global _CUDA_FORWARD_IMPL
-  global _CUDA_BACKWARD_IMPL
 
   if _CUDA_BACKEND_LOADED:
     return
@@ -153,9 +139,7 @@ def _load_cuda_backend() -> None:
     return
 
   _CUDA_FORWARD_IMPL = cuda_backend._ffpa_attn_forward_cuda
-  _CUDA_BACKWARD_IMPL = cuda_backend._ffpa_attn_backward_cuda
   _CUDA_FWD_AVAILABLE = bool(getattr(cuda_backend, "CUDA_FWD_AVAILABLE", False))
-  _CUDA_BWD_AVAILABLE = bool(getattr(cuda_backend, "CUDA_BWD_AVAILABLE", False))
 
 
 def cuda_forward_available() -> bool:
@@ -164,8 +148,7 @@ def cuda_forward_available() -> bool:
 
 
 def cuda_backward_available() -> bool:
-  _load_cuda_backend()
-  return _CUDA_BWD_AVAILABLE
+  return False
 
 
 def _require_cuda_forward_impl():
@@ -175,7 +158,7 @@ def _require_cuda_forward_impl():
 
   message = (
     "ffpa_attn_func: forward_backend='cuda' requested but the CUDA forward backend is unavailable. "
-    "Rebuild with ENABLE_FFPA_FWD_CUDA_IMPL=1 to enable it."
+    "Rebuild with ENABLE_FFPA_CUDA_IMPL=1 to enable it."
   )
   if _CUDA_BACKEND_IMPORT_ERROR is not None:
     message = f"{message} Original import error: {_CUDA_BACKEND_IMPORT_ERROR}"
@@ -183,17 +166,10 @@ def _require_cuda_forward_impl():
 
 
 def _require_cuda_backward_impl():
-  _load_cuda_backend()
-  if _CUDA_BWD_AVAILABLE and _CUDA_BACKWARD_IMPL is not None:
-    return _CUDA_BACKWARD_IMPL
-
-  message = (
-    "ffpa_attn_func: backward_backend='cuda' requested but the CUDA backward backend is unavailable. "
-    "Rebuild with ENABLE_FFPA_FWD_CUDA_IMPL=1 and ENABLE_FFPA_BWD_CUDA_IMPL=1 to enable it."
+  raise RuntimeError(
+    "ffpa_attn_func: backward_backend='cuda' has been removed from the active backend. "
+    "Use backward_backend='triton' or backward_backend='sdpa'."
   )
-  if _CUDA_BACKEND_IMPORT_ERROR is not None:
-    message = f"{message} Original import error: {_CUDA_BACKEND_IMPORT_ERROR}"
-  raise RuntimeError(message)
 
 
 @dataclass
@@ -204,7 +180,7 @@ class FFPAAttnMeta:
   :param scale: Scale applied to ``QK^T``.
   :param stages: CUDA forward pipeline stages.
   :param acc: Native CUDA accumulator code.
-  :param enable_tma: Whether to request the CUDA TMA path.
+  :param enable_tma: Reserved for future Triton TMA kernels. Currently a no-op.
   :param dropout_p: Dropout probability (default 0.0).
   :param is_grad_enabled: Grad-mode state captured at the public API.
   :param high_precision_grad: Whether SDPA backward should upcast.
@@ -212,7 +188,7 @@ class FFPAAttnMeta:
   :param triton_forward_autotune: Whether to enable Triton forward autotune.
   :param triton_autotune_mode: Triton autotune search-space mode,
     ``"fast"`` or ``"max"``.
-  :param backward_backend: Backward backend name. ``"sdpa"``, ``"cuda"``, or ``"triton"``.
+  :param backward_backend: Backward backend name. ``"sdpa"`` or ``"triton"``.
   :param triton_backward_autotune: Whether to enable Triton backward autotune.
   :param triton_backward_version: Triton backward kernel version.
   :param triton_backward_preprocess_d_chunk: Whether Triton backward should
@@ -266,8 +242,8 @@ class FFPAAttnMeta:
 
     assert forward_backend in ("cuda", "triton"), \
       f"Unsupported forward_backend={forward_backend!r}; choose 'cuda' or 'triton'."
-    assert backward_backend in ("sdpa", "triton", "cuda"), \
-      f"Unsupported backward_backend={backward_backend!r}; choose 'sdpa', 'triton', or 'cuda'."
+    assert backward_backend in ("sdpa", "triton"), \
+      f"Unsupported backward_backend={backward_backend!r}; choose 'sdpa' or 'triton'."
     assert triton_autotune_mode in ("fast", "max"), \
       f"Unsupported triton_autotune_mode={triton_autotune_mode!r}; choose 'fast' or 'max'."
 
@@ -328,8 +304,6 @@ class FFPAAttnMeta:
     if dropout_p > 0.0 and query.size(-1) > 256:
       if self.forward_backend != "triton":
         raise NotImplementedError("ffpa_attn_func: large-D dropout requires forward_backend='triton'")
-      if self.backward_backend == "cuda":
-        raise NotImplementedError("ffpa_attn_func: large-D dropout does not support backward_backend='cuda'")
     if attn_mask is not None and is_causal:
       raise RuntimeError("ffpa_attn_func: explicit attn_mask should not be set when is_causal=True")
     if attn_mask is not None and attn_mask.dtype == torch.bool and attn_mask.requires_grad:
@@ -372,19 +346,6 @@ class FFPAAttnMeta:
         f"key/value num_heads ({key.size(1)}). "
         f"Set enable_gqa=True or use matching head counts."
       )
-
-    # TMA eligibility check — mutate self.enable_tma if needed.
-    if self.enable_tma:
-      head_dim = query.size(3)
-      if head_dim < _TMA_MIN_HEADDIM or (head_dim % _TMA_HEADDIM_ALIGN) != 0:
-        warnings.warn(
-          f"ffpa_attn_func: enable_tma=True is only supported for "
-          f"head_dim >= {_TMA_MIN_HEADDIM} and divisible by {_TMA_HEADDIM_ALIGN}, "
-          f"got head_dim={head_dim}; falling back to the cp.async kernel.",
-          RuntimeWarning,
-          stacklevel=3,
-        )
-        self.enable_tma = 0
 
     if is_causal and key.size(2) < query.size(2):
       raise ValueError(
@@ -538,7 +499,7 @@ class _FFPAAttnFunc(torch.autograd.Function):
         meta.acc,
         int(meta.is_causal),
         meta.scale,
-        meta.enable_tma,
+        0,
       )
     elif meta.forward_backend == "triton":
       rng_state = _reserve_large_d_dropout_rng(q, k, meta.dropout_p)
@@ -592,21 +553,7 @@ class _FFPAAttnFunc(torch.autograd.Function):
     D = q.size(-1)
 
     if D > 256:
-      if meta.backward_backend == "cuda":
-        cuda_backward_impl = _require_cuda_backward_impl()
-        dq, dk, dv = cuda_backward_impl(
-          q.contiguous(),
-          k.contiguous(),
-          v.contiguous(),
-          O.contiguous(),
-          lse.contiguous(),
-          grad_out.contiguous(),
-          meta.stages,
-          int(meta.is_causal),
-          meta.scale,
-        )
-        grad_attn_bias = None
-      elif meta.backward_backend == "triton":
+      if meta.backward_backend == "triton":
         dq, dk, dv, grad_attn_bias = _ffpa_attn_backward_triton(
           grad_out=grad_out,
           q=q,
@@ -671,13 +618,13 @@ class _FFPAAttnFunc(torch.autograd.Function):
 #
 #   forward_backend   │  backward_backend
 #   ──────────────────┼───────────────────
-#   cuda              │  triton, sdpa, (cuda)
+#   cuda              │  triton, sdpa
 #   triton            │  triton, sdpa
 #
 # ``register_autograd`` binds a forward op to exactly one backward formula.
 # Hard-coding one backward (e.g. always Triton) would silently ignore the
 # user-requested ``backward_backend`` under ``torch.compile``, breaking the
-# sdpa/cuda backward paths when ``fullgraph=True``.
+# sdpa backward path when ``fullgraph=True``.
 #
 # Instead ``FFPAAttnFunc.apply`` delegates through a module-level function
 # guarded by ``torch._dynamo.disable``, which creates a graph break at the

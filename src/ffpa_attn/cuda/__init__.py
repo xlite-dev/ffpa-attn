@@ -5,13 +5,11 @@ try:
   from .. import _C as _cuda_ext
 
   _ffpa_attn_fwd_cuda = _cuda_ext.ffpa_attn_forward
-  _ffpa_attn_bwd_cuda = _cuda_ext.ffpa_attn_backward
-  CUDA_FWD_AVAILABLE = bool(getattr(_cuda_ext, "CUDA_FWD_AVAILABLE", True))
-  CUDA_BWD_AVAILABLE = bool(getattr(_cuda_ext, "CUDA_BWD_AVAILABLE", True))
+  CUDA_FWD_AVAILABLE = bool(getattr(_cuda_ext, "CUDA_FWD_AVAILABLE", False))
+  CUDA_BWD_AVAILABLE = False
   _CUDA_IMPORT_ERROR = None
 except Exception as exc:
   _ffpa_attn_fwd_cuda = None
-  _ffpa_attn_bwd_cuda = None
   CUDA_FWD_AVAILABLE = False
   CUDA_BWD_AVAILABLE = False
   _CUDA_IMPORT_ERROR = exc
@@ -43,7 +41,7 @@ def _fwd_cuda_torch_op(
   if _ffpa_attn_fwd_cuda is None:
     raise RuntimeError(
       "ffpa_attn forward CUDA backend is unavailable. "
-      "Rebuild with ENABLE_FFPA_FWD_CUDA_IMPL=1 to enable it. "
+      "Rebuild with ENABLE_FFPA_CUDA_IMPL=1 to enable it. "
       f"Original import error: {_CUDA_IMPORT_ERROR}"
     )
   O = torch.empty_like(Q)  # noqa: E741
@@ -86,54 +84,6 @@ def _fwd_cuda_fake(
   O = torch.empty_like(Q)  # noqa: E741
   softmax_lse = Q.new_empty(Q.size(0), Q.size(1), seqlen_q_aligned, dtype=torch.float32)
   return O, softmax_lse
-
-
-# ffpa_attn::_bwd_cuda
-torch.library.define(
-  f"{_OP_NAMESPACE}::_bwd_cuda",
-  "(Tensor q, Tensor k, Tensor v, Tensor o, Tensor softmax_lse, Tensor dO, "
-  "int stages, int causal, float softmax_scale) -> (Tensor dq, Tensor dk, Tensor dv)",
-)
-
-
-@torch.library.impl(f"{_OP_NAMESPACE}::_bwd_cuda", "CUDA")
-def _bwd_cuda_torch_op(
-  Q: torch.Tensor,
-  K: torch.Tensor,
-  V: torch.Tensor,
-  O: torch.Tensor,
-  softmax_lse: torch.Tensor,
-  dO: torch.Tensor,
-  stages: int,
-  causal: int,
-  softmax_scale: float,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-  if _ffpa_attn_bwd_cuda is None:
-    raise RuntimeError(
-      "ffpa_attn backward CUDA backend is unavailable. "
-      "Rebuild with ENABLE_FFPA_FWD_CUDA_IMPL=1 and ENABLE_FFPA_BWD_CUDA_IMPL=1 to enable it. "
-      f"Original import error: {_CUDA_IMPORT_ERROR}"
-    )
-  dQ = torch.zeros_like(Q)
-  dK = torch.zeros_like(K)
-  dV = torch.zeros_like(V)
-  _ffpa_attn_bwd_cuda(Q, K, V, O, softmax_lse, dO, dQ, dK, dV, stages, causal, softmax_scale)
-  return dQ, dK, dV
-
-
-@torch.library.register_fake(f"{_OP_NAMESPACE}::_bwd_cuda")
-def _bwd_cuda_fake(
-  Q: torch.Tensor,
-  K: torch.Tensor,
-  V: torch.Tensor,
-  O: torch.Tensor,
-  softmax_lse: torch.Tensor,
-  dO: torch.Tensor,
-  stages: int,
-  causal: int,
-  softmax_scale: float,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-  return torch.empty_like(Q), torch.empty_like(K), torch.empty_like(V)
 
 
 __all__ = [

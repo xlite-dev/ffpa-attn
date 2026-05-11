@@ -7,7 +7,7 @@ PyTorch build helpers.
 
 Behavior:
 - Default: pure Python / Triton-only build with no CUDA extension.
-- ``ENABLE_FFPA_FWD_CUDA_IMPL=1``: build the optional ``ffpa_attn._C``
+- ``ENABLE_FFPA_CUDA_IMPL=1``: build the optional ``ffpa_attn._C``
   CUDA extension via ``torch.utils.cpp_extension``.
 - ``FFPA_SKIP_CUDA_EXT=1``: force-skip CUDA extension even if the CUDA build
   flags are enabled (used by docs CI and similar environments).

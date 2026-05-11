@@ -47,11 +47,6 @@ def _require_cuda_forward_impl() -> None:
     pytest.skip("CUDA forward backend was not compiled")
 
 
-def _require_cuda_backward_impl() -> None:
-  if not ffpa_attn_functional.cuda_backward_available():
-    pytest.skip("CUDA backward backend was not compiled")
-
-
 # Forward-only compile tests
 @pytest.mark.parametrize("dtype", DTYPES, ids=["fp16", "bf16"])
 @pytest.mark.parametrize("B,H,N,D", FWD_SHAPES)
@@ -114,8 +109,6 @@ def test_compile_backward(dtype, B, H, N, D, fw, bw):
   """torch.compile forward+backward matches eager grads across backend pairs."""
   if fw == "cuda":
     _require_cuda_forward_impl()
-  if bw == "cuda":
-    _require_cuda_backward_impl()
   torch.manual_seed(0)
   device = "cuda"
   q = torch.randn(B, H, N, D, dtype=dtype, device=device, requires_grad=True)
@@ -215,8 +208,6 @@ def test_compile_causal(dtype, fw, bw):
   """torch.compile with causal masking matches eager across backend pairs."""
   if fw == "cuda":
     _require_cuda_forward_impl()
-  if bw == "cuda":
-    _require_cuda_backward_impl()
   B, H, N, D = 1, 8, 512, 320
   torch.manual_seed(0)
   device = "cuda"

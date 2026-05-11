@@ -85,18 +85,15 @@ class ENV(object):
   # if True: grid(N/Br, H, B) else: grid(N/Br, B * H)
   ENABLE_FFPA_LAUNCH_GRID_DNHB = bool(int(os.environ.get("ENABLE_FFPA_LAUNCH_GRID_DNHB", 0)))
 
-  # Enable native CUDA forward kernel generation/compilation. Defaults to
+  # Enable legacy native CUDA kernel generation/compilation. Defaults to
   # disabled so the package can be built and used in Triton-only mode.
   # For development/validation, explicitly build with:
-  #   export ENABLE_FFPA_FWD_CUDA_IMPL=1
-  ENABLE_FFPA_FWD_CUDA_IMPL = bool(int(os.environ.get("ENABLE_FFPA_FWD_CUDA_IMPL", 0)))
-
-  # Enable native Split-D CUDA backward kernel generation/compilation.
-  # This flag only takes effect when CUDA forward is also enabled.
-  # For development/validation, explicitly build with:
-  #   export ENABLE_FFPA_FWD_CUDA_IMPL=1
-  #   export ENABLE_FFPA_BWD_CUDA_IMPL=1
-  ENABLE_FFPA_BWD_CUDA_IMPL = bool(int(os.environ.get("ENABLE_FFPA_BWD_CUDA_IMPL", 0)))
+  #   export ENABLE_FFPA_CUDA_IMPL=1
+  # ``ENABLE_FFPA_FWD_CUDA_IMPL`` is accepted as a temporary compatibility
+  # alias for older scripts. Native CUDA backward is no longer generated.
+  ENABLE_FFPA_CUDA_IMPL = bool(
+    int(os.environ.get("ENABLE_FFPA_CUDA_IMPL", os.environ.get("ENABLE_FFPA_FWD_CUDA_IMPL", 0)))
+  )
 
   # --- Build-time tuning knobs ---------------------------------------------
   # Target CUDA SM architectures to compile for. When empty the current
@@ -228,11 +225,15 @@ class ENV(object):
 
   @classmethod
   def enable_fwd_cuda_impl(cls):
-    return cls.ENABLE_FFPA_FWD_CUDA_IMPL
+    return cls.ENABLE_FFPA_CUDA_IMPL
+
+  @classmethod
+  def enable_cuda_impl(cls):
+    return cls.ENABLE_FFPA_CUDA_IMPL
 
   @classmethod
   def enable_bwd_cuda_impl(cls):
-    return cls.enable_fwd_cuda_impl() and cls.ENABLE_FFPA_BWD_CUDA_IMPL
+    return False
 
   @classmethod
   def env_cuda_cflags(cls):
@@ -267,10 +268,8 @@ class ENV(object):
       extra_env_cflags.append("-DENABLE_FFPA_REGISTERS_PIPE_KV")
     if cls.enable_launch_grid_dnhb():
       extra_env_cflags.append("-DENBALE_FFPA_LAUNCH_GRID_DNHB")
-    if cls.enable_fwd_cuda_impl():
-      extra_env_cflags.append("-DENABLE_FFPA_FWD_CUDA_IMPL")
-    if cls.enable_bwd_cuda_impl():
-      extra_env_cflags.append("-DENABLE_FFPA_BWD_CUDA_IMPL")
+    if cls.enable_cuda_impl():
+      extra_env_cflags.append("-DENABLE_FFPA_CUDA_IMPL")
 
     if cls.enable_persist_kv_g2s():
       assert (cls.enable_persist_q_g2s()), "PERSIST_Q_G2S must be enable if PERSIST_KV_G2S is enabled."
@@ -289,10 +288,8 @@ class ENV(object):
   @classmethod
   def extra_gcc_flags(cls):
     extra_gcc_flags = ["-O3", "-std=c++17"]
-    if cls.enable_fwd_cuda_impl():
-      extra_gcc_flags.append("-DENABLE_FFPA_FWD_CUDA_IMPL")
-    if cls.enable_bwd_cuda_impl():
-      extra_gcc_flags.append("-DENABLE_FFPA_BWD_CUDA_IMPL")
+    if cls.enable_cuda_impl():
+      extra_gcc_flags.append("-DENABLE_FFPA_CUDA_IMPL")
     return extra_gcc_flags
 
   @classmethod
@@ -329,8 +326,7 @@ class ENV(object):
     formatenv("ENABLE_FFPA_SMEM_SWIZZLE_V", cls.enable_smem_swizzle_v())
     formatenv("ENABLE_FFPA_REGISTERS_PIPE_KV", cls.enable_registers_pipe_kv())
     formatenv("ENABLE_FFPA_LAUNCH_GRID_DNHB", cls.enable_launch_grid_dnhb())
-    formatenv("ENABLE_FFPA_FWD_CUDA_IMPL", cls.enable_fwd_cuda_impl())
-    formatenv("ENABLE_FFPA_BWD_CUDA_IMPL", cls.enable_bwd_cuda_impl())
+    formatenv("ENABLE_FFPA_CUDA_IMPL", cls.enable_cuda_impl())
     pretty_print_line()
 
   @staticmethod
@@ -439,19 +435,6 @@ class ENV(object):
       fwd_generated_count = len(headdims) * 2 + 1
 
     bwd_generated_count = 0
-    if cls.enable_bwd_cuda_impl():
-      # ---- backward TUs per headdim, one per dtype ----
-      bwd_decls_path = os.path.join(gen_dir, "ffpa_attn_bwd_decls.h")
-      cls._write_if_changed(bwd_decls_path, cls._render_bwd_decls_header(headdims))
-      generated.append(bwd_decls_path)
-      for d in headdims:
-        bwd_fp16_path = os.path.join(gen_dir, f"ffpa_attn_bwd_fp16_hdim{d}.cu")
-        bwd_bf16_path = os.path.join(gen_dir, f"ffpa_attn_bwd_bf16_hdim{d}.cu")
-        cls._write_if_changed(bwd_fp16_path, cls._render_bwd_per_headdim_fp16_tu(d))
-        cls._write_if_changed(bwd_bf16_path, cls._render_bwd_per_headdim_bf16_tu(d))
-        generated.append(bwd_fp16_path)
-        generated.append(bwd_bf16_path)
-      bwd_generated_count = len(headdims) * 2
 
     # Clean up stale TUs from previous generator layouts. When native backward
     # is disabled, also remove generated backward files from earlier dev builds
@@ -461,20 +444,13 @@ class ENV(object):
       is_stale = ((fname.startswith("ffpa_attn_L1_acc_") and fname.endswith(".cu"))
                   or (fname.startswith("ffpa_attn_L1_hdim") and fname.endswith(".cu"))
                   or (not cls.enable_fwd_cuda_impl() and fname.startswith("ffpa_attn_fwd_"))
-                  or (not cls.enable_bwd_cuda_impl() and fname.startswith("ffpa_attn_bwd_"))
-                  or fname in stale_file_names)
+                  or fname.startswith("ffpa_attn_bwd_") or fname in stale_file_names)
       if is_stale:
         stale = os.path.join(gen_dir, fname)
         try:
           os.remove(stale)
         except OSError:
           pass
-
-    if cls.enable_bwd_cuda_impl():
-      bwd_dispatch_path = os.path.join(gen_dir, "ffpa_attn_bwd_dispatch.cu")
-      cls._write_if_changed(bwd_dispatch_path, cls._render_bwd_dispatch_tu(headdims))
-      generated.append(bwd_dispatch_path)
-      bwd_generated_count += 1
 
     if build_pkg:
       pretty_print_line(
@@ -618,155 +594,6 @@ class ENV(object):
     body = "\n".join(lines) + "\n"
     body += cls._render_entry(d, f"ffpa_attn_fwd_bf16f32_d{d}", "__nv_bfloat16", bf16_prefix)
     return body
-
-  # -------------------- backward code generation --------------------
-
-  @staticmethod
-  def _render_bwd_decls_header(headdims):
-    """Render backward per-headdim declaration header."""
-    lines = [
-      "// AUTO-GENERATED by env.py. DO NOT EDIT.",
-      "#pragma once",
-      "#include <torch/types.h>",
-      "",
-    ]
-    for d in headdims:
-      lines.append(
-        f"void ffpa_attn_bwd_fp16f32_d{d}(torch::Tensor Q, torch::Tensor K, "
-        f"torch::Tensor V, torch::Tensor O, torch::Tensor softmax_lse, "
-        f"torch::Tensor dO, torch::Tensor dQ, torch::Tensor dK, torch::Tensor dV, "
-        f"int stages, int causal, double softmax_scale);"
-      )
-      lines.append(
-        f"void ffpa_attn_bwd_bf16f32_d{d}(torch::Tensor Q, torch::Tensor K, "
-        f"torch::Tensor V, torch::Tensor O, torch::Tensor softmax_lse, "
-        f"torch::Tensor dO, torch::Tensor dQ, torch::Tensor dK, torch::Tensor dV, "
-        f"int stages, int causal, double softmax_scale);"
-      )
-    lines.append("")
-    return "\n".join(lines)
-
-  @classmethod
-  def _render_bwd_entry(
-    cls,
-    d: int,
-    symbol: str,
-    t_in: str,
-    launcher: str = "launch_ffpa_attn_bwd_template",
-    allow_stage3: bool = True
-  ) -> str:
-    """Render a per-headdim backward wrapper that calls the backward launcher."""
-    call = (f"{launcher}<{t_in}, {d}, "
-            "{S}>(Q, K, V, O, softmax_lse, dO, dQ, dK, dV, causal, softmax_scale);")
-    if allow_stage3:
-      stage_body = (
-        "  if (stages == 2) {\n"
-        f"    {call.replace('{S}', '2')}\n"
-        "  } else if (stages == 3) {\n"
-        f"    {call.replace('{S}', '3')}\n"
-        "  } else {\n"
-        f"    {call.replace('{S}', '1')}\n"
-        "  }\n"
-      )
-    else:
-      stage_body = (
-        "  if (stages == 2) {\n"
-        f"    {call.replace('{S}', '2')}\n"
-        "  } else {\n"
-        f"    {call.replace('{S}', '1')}\n"
-        "  }\n"
-      )
-    head = [
-      f"void {symbol}(",
-      "    torch::Tensor Q,",
-      "    torch::Tensor K,",
-      "    torch::Tensor V,",
-      "    torch::Tensor O,",
-      "    torch::Tensor softmax_lse,",
-      "    torch::Tensor dO,",
-      "    torch::Tensor dQ,",
-      "    torch::Tensor dK,",
-      "    torch::Tensor dV,",
-      "    int stages,",
-      "    int causal,",
-      "    double softmax_scale) {",
-    ]
-    return "\n".join(head) + "\n" + stage_body + "}\n"
-
-  @classmethod
-  def _render_bwd_per_headdim_fp16_tu(cls, d: int) -> str:
-    """Render backward fp16 TU for headdim d."""
-    lines = [
-      "// AUTO-GENERATED by env.py. DO NOT EDIT.",
-      '#include "launch_templates.cuh"',
-      "using namespace ffpa;",
-      "",
-    ]
-    body = "\n".join(lines) + "\n"
-    body += cls._render_bwd_entry(d, f"ffpa_attn_bwd_fp16f32_d{d}", "__half")
-    return body
-
-  @classmethod
-  def _render_bwd_per_headdim_bf16_tu(cls, d: int) -> str:
-    """Render backward bf16 TU for headdim d."""
-    lines = [
-      "// AUTO-GENERATED by env.py. DO NOT EDIT.",
-      '#include "launch_templates.cuh"',
-      "using namespace ffpa;",
-      "",
-    ]
-    body = "\n".join(lines) + "\n"
-    body += cls._render_bwd_entry(d, f"ffpa_attn_bwd_bf16f32_d{d}", "__nv_bfloat16")
-    return body
-
-  @staticmethod
-  def _render_bwd_dispatch_tu(headdims) -> str:
-    """Render backward dispatch TU with dtype checks and headdim switch."""
-
-    def _cases(symbol_prefix: str) -> str:
-      return "\n".join(
-        f"    case {d}: {symbol_prefix}_d{d}"
-        "(Q, K, V, O, softmax_lse, dO, dQ, dK, dV, stages, causal, softmax_scale); break;" for d in headdims
-      )
-
-    def _fn(name: str, symbol_prefix: str, torch_dtype: str) -> str:
-      return (
-        f"void {name}(\n"
-        "    torch::Tensor Q,\n"
-        "    torch::Tensor K,\n"
-        "    torch::Tensor V,\n"
-        "    torch::Tensor O,\n"
-        "    torch::Tensor softmax_lse,\n"
-        "    torch::Tensor dO,\n"
-        "    torch::Tensor dQ,\n"
-        "    torch::Tensor dK,\n"
-        "    torch::Tensor dV,\n"
-        "    int stages,\n"
-        "    int causal,\n"
-        "    double softmax_scale) {\n"
-        f"  CHECK_TORCH_TENSOR_DTYPE(Q, {torch_dtype})\n"
-        f"  CHECK_TORCH_TENSOR_DTYPE(K, {torch_dtype})\n"
-        f"  CHECK_TORCH_TENSOR_DTYPE(V, {torch_dtype})\n"
-        f"  CHECK_TORCH_TENSOR_DTYPE(O, {torch_dtype})\n"
-        f"  CHECK_TORCH_TENSOR_DTYPE(dO, {torch_dtype})\n"
-        f"  CHECK_TORCH_TENSOR_DTYPE(dQ, {torch_dtype})\n"
-        f"  CHECK_TORCH_TENSOR_DTYPE(dK, {torch_dtype})\n"
-        f"  CHECK_TORCH_TENSOR_DTYPE(dV, {torch_dtype})\n"
-        "  const int d = Q.size(3);\n"
-        "  switch (d) {\n"
-        f"{_cases(symbol_prefix)}\n"
-        '    default: throw std::runtime_error("bwd: headdim not supported!");\n'
-        "  }\n"
-        "}\n"
-      )
-
-    return (
-      "// AUTO-GENERATED by env.py. DO NOT EDIT.\n"
-      '#include "logging.cuh"\n'
-      '#include "ffpa_attn_bwd_decls.h"\n'
-      "\n" + _fn("ffpa_attn_bwd_fp16f32", "ffpa_attn_bwd_fp16f32", "torch::kHalf") + "\n" +
-      _fn("ffpa_attn_bwd_bf16f32", "ffpa_attn_bwd_bf16f32", "torch::kBFloat16")
-    )
 
   # -------------------- forward entry rendering --------------------
 
@@ -931,8 +758,8 @@ class ENV(object):
 
     if not ENV.enable_fwd_cuda_impl():
       raise RuntimeError(
-        "CUDA forward is disabled for this build. "
-        "Rebuild with ENABLE_FFPA_FWD_CUDA_IMPL=1 to build ffpa_attn._C."
+        "CUDA kernels are disabled for this build. "
+        "Rebuild with ENABLE_FFPA_CUDA_IMPL=1 to build ffpa_attn._C."
       )
 
     torch_arch_list_env = os.environ.get("TORCH_CUDA_ARCH_LIST", None)
