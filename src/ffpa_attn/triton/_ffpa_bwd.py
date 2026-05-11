@@ -1231,8 +1231,8 @@ def _ffpa_attn_backward_triton_impl(
   _, _, seqlen_k, _ = k.shape
   softmax_scale = softmax_scale or (1.0 / math.sqrt(headdim))
   seqlen_q_rounded = lse.shape[-1]
-  seqlen_q_bucket = bucket_autotune_seqlen(seqlen_q)
-  seqlen_k_bucket = bucket_autotune_seqlen(seqlen_k)
+  seqlen_q_bucket = bucket_autotune_seqlen(seqlen_q, autotune_mode)
+  seqlen_k_bucket = bucket_autotune_seqlen(seqlen_k, autotune_mode)
   has_attn_bias = attn_bias is not None
   attn_bias_in = attn_bias if attn_bias is not None else q
   bias_strides = _attn_bias_broadcast_strides(attn_bias, batch, nheads, seqlen_q, seqlen_k)
