@@ -199,8 +199,7 @@ def test_ffpa_bwd_triton_preprocess_modes(dtype, preprocess_d_chunk):
   torch.testing.assert_close(v.grad, dv_ref, **tol)
 
 
-@pytest.mark.parametrize("kernel_version", ["v1", "v2"])
-def test_ffpa_bwd_triton_additive_attn_mask_matches_sdpa(kernel_version):
+def test_ffpa_bwd_triton_additive_attn_mask_matches_sdpa():
   """Masked Triton backward must match SDPA, including additive-bias gradients."""
   B, H, N, D = 1, 4, 512, 512
   dtype = torch.float16
@@ -220,7 +219,6 @@ def test_ffpa_bwd_triton_additive_attn_mask_matches_sdpa(kernel_version):
     stages=2,
     acc="f32",
     backward_backend="triton",
-    triton_backward_version=kernel_version,
   )
   out.sum().backward()
   assert attn_mask.grad is not None
@@ -310,7 +308,6 @@ def test_ffpa_bwd_triton_decode_matches_sdpa(dtype, Nq, case):
     stages=2,
     acc="f32",
     backward_backend="triton",
-    triton_backward_version="v2",
     enable_gqa=Hq != Hkv,
   )
   out.backward(grad_out)
@@ -359,7 +356,6 @@ def test_ffpa_bwd_triton_decode_autotune_matches_sdpa(Nq):
     stages=2,
     acc="f32",
     backward_backend="triton",
-    triton_backward_version="v2",
     triton_backward_autotune=True,
   )
   out.backward(grad_out)
@@ -370,8 +366,7 @@ def test_ffpa_bwd_triton_decode_autotune_matches_sdpa(Nq):
   torch.testing.assert_close(v.grad, dv_ref, atol=3e-2, rtol=3e-2)
 
 
-@pytest.mark.parametrize("kernel_version", ["v1", "v2"])
-def test_ffpa_bwd_triton_dropout_matches_sdpa(kernel_version):
+def test_ffpa_bwd_triton_dropout_matches_sdpa():
   """Triton dropout backward must reuse the forward Philox mask like SDPA."""
   B, H, N, D = 1, 2, 512, 512
   dtype = torch.float16
@@ -393,7 +388,6 @@ def test_ffpa_bwd_triton_dropout_matches_sdpa(kernel_version):
     stages=2,
     acc="f32",
     backward_backend="triton",
-    triton_backward_version=kernel_version,
   )
   out.backward(grad_out)
 
@@ -436,7 +430,6 @@ def test_ffpa_bwd_triton_decode_dropout_matches_sdpa(Nq):
     stages=2,
     acc="f32",
     backward_backend="triton",
-    triton_backward_version="v2",
   )
   out.backward(grad_out)
 
@@ -456,8 +449,7 @@ def test_ffpa_bwd_triton_decode_dropout_matches_sdpa(Nq):
   torch.testing.assert_close(v.grad, dv_ref, atol=4e-2, rtol=4e-2)
 
 
-@pytest.mark.parametrize("kernel_version", ["v1", "v2"])
-def test_ffpa_bwd_triton_dropout_additive_attn_mask_matches_sdpa(kernel_version):
+def test_ffpa_bwd_triton_dropout_additive_attn_mask_matches_sdpa():
   """Dropout and additive-bias gradients compose with the same SDPA mask."""
   B, H, N, D = 1, 2, 512, 512
   dtype = torch.float16
@@ -481,7 +473,6 @@ def test_ffpa_bwd_triton_dropout_additive_attn_mask_matches_sdpa(kernel_version)
     stages=2,
     acc="f32",
     backward_backend="triton",
-    triton_backward_version=kernel_version,
   )
   out.backward(grad_out)
   assert attn_mask.grad is not None

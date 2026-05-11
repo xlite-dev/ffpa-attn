@@ -60,30 +60,6 @@ def _should_fallback_to_sdpa(
   return _fallback
 
 
-def _normalize_inputs(
-  query: torch.Tensor,
-  key: torch.Tensor,
-  value: torch.Tensor,
-  attn_mask: torch.Tensor | None,
-  dropout_p: float,
-  is_causal: bool,
-  scale: float | None,
-  enable_gqa: bool,
-  **kwargs: object,
-) -> tuple[FFPAAttnMeta, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
-  """Validate public inputs and return ``FFPAAttnFunc.apply`` arguments."""
-  return FFPAAttnMeta.from_kwargs(**kwargs).normalize_inputs(
-    query,
-    key,
-    value,
-    attn_mask,
-    dropout_p,
-    is_causal,
-    scale,
-    enable_gqa,
-  )
-
-
 def ffpa_attn_func(
   query: torch.Tensor,
   key: torch.Tensor,
@@ -146,7 +122,7 @@ def ffpa_attn_func(
       Supported keys are ``stages``, ``acc``, ``enable_tma``,
       ``high_precision_grad``, ``forward_backend``,
       ``triton_forward_autotune``, ``triton_autotune_mode``,
-      ``backward_backend``, ``triton_backward_autotune``, ``triton_backward_version``, and
+      ``backward_backend``, ``triton_backward_autotune``, and
       ``triton_backward_preprocess_d_chunk``. ``forward_backend`` only
       affects ``D > 256``. ``enable_tma`` is reserved for future Triton
       kernels and is currently a no-op. ``backward_backend`` supports
@@ -164,8 +140,8 @@ def ffpa_attn_func(
   :raises NotImplementedError: propagated from SDPA or FFPA backends for
       unsupported backend-specific combinations.
   """
-  forward_backend = str(kwargs.get("forward_backend", "triton"))
-  if _should_fallback_to_sdpa(query, key, attn_mask, dropout_p, forward_backend):
+  meta = FFPAAttnMeta.from_kwargs(**kwargs)
+  if _should_fallback_to_sdpa(query, key, attn_mask, dropout_p, meta.forward_backend):
     # Fallback intentionally delegates to SDPA exactly as the user called it.
     # Do not synthesize masks or reinterpret GQA semantics here.
     # HACK: Use the native SDPA op directly to avoid recursive calls to this function
@@ -185,7 +161,7 @@ def ffpa_attn_func(
       enable_gqa=enable_gqa,
     )
 
-  _meta, query, key, value, attn_bias = _normalize_inputs(
+  meta, query, key, value, attn_bias = meta.normalize_inputs(
     query,
     key,
     value,
@@ -194,10 +170,9 @@ def ffpa_attn_func(
     is_causal,
     scale,
     enable_gqa,
-    **kwargs,
   )
 
-  return FFPAAttnFunc.apply(query, key, value, attn_bias, _meta)
+  return FFPAAttnFunc.apply(query, key, value, attn_bias, meta)
 
 
 __all__ = ["ffpa_attn_func"]
