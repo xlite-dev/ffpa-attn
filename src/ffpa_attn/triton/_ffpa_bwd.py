@@ -743,22 +743,25 @@ def _ffpa_bwd_v2_kernel_impl(
 # Non-autotuned v2 variant.
 _ffpa_bwd_v2 = _ffpa_bwd_v2_kernel_impl
 
-_ffpa_bwd_v2_autotune_cache: dict[tuple[int, str], callable] = {}  # (headdim, mode) -> callable
+_ffpa_bwd_v2_autotune_cache: dict[tuple[int, str, bool], callable] = {}  # (headdim, mode, bias_grad) -> callable
 
 
-def _get_v2_autotune(headdim: int, autotune_mode: str):
+def _get_v2_autotune(headdim: int, autotune_mode: str, bias_requires_grad: bool):
   """Return a headdim-specific autotune wrapper for the v2 backward kernel."""
-  cache_key = (headdim, autotune_mode)
+  cache_key = (headdim, autotune_mode, bias_requires_grad)
   if cache_key not in _ffpa_bwd_v2_autotune_cache:
     configs = _gen_bwd_autotune_configs(
       block_n_values=(64, ),
       headdim=headdim,
       autotune_mode=autotune_mode,
     )
+    reset_args = ["DQ", "DK", "DV"]
+    if bias_requires_grad:
+      reset_args.append("GradAttnBias")
     _ffpa_bwd_v2_autotune_cache[cache_key] = triton.autotune(
       configs=configs,
       key=["seqlen_q_bucket", "seqlen_k_bucket", "headdim"],
-      reset_to_zero=["DQ", "DK", "DV"],
+      reset_to_zero=reset_args,
       cache_results=True,
     )(_ffpa_bwd_v2_kernel_impl)
   return _ffpa_bwd_v2_autotune_cache[cache_key]
@@ -811,13 +814,21 @@ def _gen_decode_bwd_stage1_autotune_configs(
   return configs
 
 
-_ffpa_bwd_decode_stage1_autotune_cache: dict[tuple[int, bool, str], callable] = {}
+_ffpa_bwd_decode_stage1_autotune_cache: dict[tuple[int, bool, str, bool], callable] = {}
 
 
-def _get_decode_bwd_stage1_autotune(headdim: int, use_gemv: bool, autotune_mode: str):
+def _get_decode_bwd_stage1_autotune(
+  headdim: int,
+  use_gemv: bool,
+  autotune_mode: str,
+  bias_requires_grad: bool,
+):
   """Return an autotune wrapper for the decode backward stage1 kernel."""
-  cache_key = (headdim, use_gemv, autotune_mode)
+  cache_key = (headdim, use_gemv, autotune_mode, bias_requires_grad)
   if cache_key not in _ffpa_bwd_decode_stage1_autotune_cache:
+    reset_args = ["DK", "DV", "PartialDQ"]
+    if bias_requires_grad:
+      reset_args.append("GradAttnBias")
     _ffpa_bwd_decode_stage1_autotune_cache[cache_key] = triton.autotune(
       configs=_gen_decode_bwd_stage1_autotune_configs(
         headdim=headdim,
@@ -825,7 +836,7 @@ def _get_decode_bwd_stage1_autotune(headdim: int, use_gemv: bool, autotune_mode:
         autotune_mode=autotune_mode,
       ),
       key=["seqlen_q_bucket", "seqlen_k_bucket", "headdim"],
-      reset_to_zero=["DK", "DV", "PartialDQ"],
+      reset_to_zero=reset_args,
       cache_results=True,
     )(_ffpa_bwd_decode_stage1_kernel)
   return _ffpa_bwd_decode_stage1_autotune_cache[cache_key]
@@ -1439,7 +1450,7 @@ def _ffpa_attn_backward_triton_impl(
       USE_GEMV=use_gemv,
     )
     if autotune:
-      _get_decode_bwd_stage1_autotune(headdim, use_gemv, autotune_mode)[decode_grid](
+      _get_decode_bwd_stage1_autotune(headdim, use_gemv, autotune_mode, main_bias_requires_grad)[decode_grid](
         *decode_stage1_args,
         **decode_stage1_meta,
       )
@@ -1484,7 +1495,7 @@ def _ffpa_attn_backward_triton_impl(
     )
 
   if autotune:
-    _get_v2_autotune(headdim, autotune_mode)[grid](
+    _get_v2_autotune(headdim, autotune_mode, main_bias_requires_grad)[grid](
       q,
       k,
       v,
