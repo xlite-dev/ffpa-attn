@@ -206,7 +206,7 @@ def test_ffpa_attn_func_triton_bool_attn_mask_matches_sdpa():
 def test_ffpa_attn_func_triton_additive_attn_mask_matches_sdpa():
   q, k, v = _alloc_qkv(1, 4, 512, 512, torch.float16)
   torch.manual_seed(1)
-  attn_mask = torch.randn(1, 1, q.size(2), k.size(2), device=q.device, dtype=q.dtype) * 0.25
+  attn_mask = torch.randn(1, 1, 1, k.size(2), device=q.device, dtype=q.dtype) * 0.25
 
   out = ffpa_attn_func(q, k, v, attn_mask=attn_mask, stages=2, acc="f32", forward_backend="triton")
   ref = _sdpa_ref(q, k, v, attn_mask=attn_mask)

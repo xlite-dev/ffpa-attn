@@ -87,6 +87,30 @@ def _attn_bias_grad_needs_reduction(
   ])
 
 
+def _attn_bias_grad_reduces_query(
+  grad_attn_bias: torch.Tensor | None,
+  seqlen_q: int,
+) -> bool:
+  """Return whether compact bias gradients reduce the query dimension."""
+  return grad_attn_bias is not None and grad_attn_bias.size(2) == 1 and seqlen_q > 1
+
+
+def _attn_bias_grad_is_key_bias(
+  grad_attn_bias: torch.Tensor | None,
+  seqlen_q: int,
+  seqlen_k: int,
+) -> bool:
+  """Return whether grad is for a compact key-position bias [1, 1, 1, Nkv]."""
+  if grad_attn_bias is None or seqlen_q < 8:
+    return False
+  return all([
+    grad_attn_bias.size(0) == 1,
+    grad_attn_bias.size(1) == 1,
+    grad_attn_bias.size(2) == 1,
+    grad_attn_bias.size(3) == seqlen_k,
+  ])
+
+
 @triton.jit
 def _curand_uniform_from_element_offset(seed: tl.constexpr, element_offset):
   # Must match forward and PyTorch mem-efficient attention exactly: one Philox
@@ -291,6 +315,8 @@ def ffpa_bwd_v1_kernel(
   PHILOX_SEED: tl.constexpr,
   BIAS_REQUIRES_GRAD: tl.constexpr,
   GRAD_BIAS_NEEDS_REDUCTION: tl.constexpr,
+  GRAD_BIAS_REDUCES_M: tl.constexpr,
+  GRAD_BIAS_STORE_PARTIAL: tl.constexpr,
   BLOCK_HEADDIM: tl.constexpr,
   DTYPE: tl.constexpr,
   EVEN_M: tl.constexpr,
@@ -388,14 +414,20 @@ def ffpa_bwd_v1_kernel(
     Di = tl.load(D + offs_m_curr)
     if BIAS_REQUIRES_GRAD:
       dBias = P * (dP - Di[:, None])
-      grad_bias_ptrs = GradAttnBias + offs_m_curr[:, None] * stride_gbm + offs_n[None, :] * stride_gbn
       grad_bias_mask = (offs_m_curr[:, None] < seqlen_q) & (offs_n[None, :] < seqlen_k)
-      if GRAD_BIAS_NEEDS_REDUCTION:
-        # Broadcastable SDPA masks such as [Nq, Nkv], [1, 1, Nq, Nkv], or
-        # [B, 1, Nq, Nkv] collapse multiple score gradients onto one compact
-        # mask element, so the write must accumulate instead of overwrite.
+      if GRAD_BIAS_REDUCES_M:
+        m_block = start_m // BLOCK_M
+        grad_bias_ptrs = GradAttnBias + m_block * stride_gbm + offs_n * stride_gbn
+        grad_bias = tl.sum(tl.where(grad_bias_mask, dBias, 0.0), axis=0)
+        if GRAD_BIAS_STORE_PARTIAL:
+          tl.store(grad_bias_ptrs, grad_bias, mask=offs_n < seqlen_k)
+        else:
+          tl.atomic_add(grad_bias_ptrs, grad_bias, sem="relaxed", mask=offs_n < seqlen_k)
+      elif GRAD_BIAS_NEEDS_REDUCTION:
+        grad_bias_ptrs = GradAttnBias + offs_m_curr[:, None] * stride_gbm + offs_n[None, :] * stride_gbn
         tl.atomic_add(grad_bias_ptrs, dBias, sem="relaxed", mask=grad_bias_mask)
       else:
+        grad_bias_ptrs = GradAttnBias + offs_m_curr[:, None] * stride_gbm + offs_n[None, :] * stride_gbn
         tl.store(grad_bias_ptrs, dBias, mask=grad_bias_mask)
       dS = (dBias * softmax_scale).to(DTYPE)
     else:
@@ -610,6 +642,8 @@ def _ffpa_bwd_v1_kernel_impl(
   PHILOX_SEED: tl.constexpr,
   BIAS_REQUIRES_GRAD: tl.constexpr,
   GRAD_BIAS_NEEDS_REDUCTION: tl.constexpr,
+  GRAD_BIAS_REDUCES_M: tl.constexpr,
+  GRAD_BIAS_STORE_PARTIAL: tl.constexpr,
   BLOCK_HEADDIM: tl.constexpr,
   DTYPE: tl.constexpr,
   EVEN_M: tl.constexpr,
@@ -678,6 +712,8 @@ def _ffpa_bwd_v1_kernel_impl(
         PHILOX_SEED=PHILOX_SEED,
         BIAS_REQUIRES_GRAD=BIAS_REQUIRES_GRAD,
         GRAD_BIAS_NEEDS_REDUCTION=GRAD_BIAS_NEEDS_REDUCTION,
+        GRAD_BIAS_REDUCES_M=GRAD_BIAS_REDUCES_M,
+        GRAD_BIAS_STORE_PARTIAL=GRAD_BIAS_STORE_PARTIAL,
         BLOCK_HEADDIM=BLOCK_HEADDIM,
         DTYPE=DTYPE,
         EVEN_M=EVEN_M,
@@ -728,6 +764,8 @@ def _ffpa_bwd_v1_kernel_impl(
       PHILOX_SEED=PHILOX_SEED,
       BIAS_REQUIRES_GRAD=BIAS_REQUIRES_GRAD,
       GRAD_BIAS_NEEDS_REDUCTION=GRAD_BIAS_NEEDS_REDUCTION,
+      GRAD_BIAS_REDUCES_M=GRAD_BIAS_REDUCES_M,
+      GRAD_BIAS_STORE_PARTIAL=GRAD_BIAS_STORE_PARTIAL,
       BLOCK_HEADDIM=BLOCK_HEADDIM,
       DTYPE=DTYPE,
       EVEN_M=EVEN_M,
@@ -835,6 +873,8 @@ def _ffpa_bwd_v2_kernel_impl(
   PHILOX_SEED: tl.constexpr,
   BIAS_REQUIRES_GRAD: tl.constexpr,
   GRAD_BIAS_NEEDS_REDUCTION: tl.constexpr,
+  GRAD_BIAS_REDUCES_M: tl.constexpr,
+  GRAD_BIAS_STORE_PARTIAL: tl.constexpr,
   BLOCK_HEADDIM: tl.constexpr,
   DTYPE: tl.constexpr,
   EVEN_M: tl.constexpr,
@@ -937,14 +977,20 @@ def _ffpa_bwd_v2_kernel_impl(
       Di = tl.load(D + offs_qm)
       if BIAS_REQUIRES_GRAD:
         dBias = P * (dP - Di[:, None])
-        grad_bias_ptrs = GradAttnBias + offs_qm[:, None] * stride_gbm + offs_n[None, :] * stride_gbn
         grad_bias_mask = (offs_qm[:, None] < seqlen_q) & (offs_n[None, :] < seqlen_k)
-        if GRAD_BIAS_NEEDS_REDUCTION:
-          # Broadcastable SDPA masks such as [Nq, Nkv], [1, 1, Nq, Nkv], or
-          # [B, 1, Nq, Nkv] collapse multiple score gradients onto one compact
-          # mask element, so the write must accumulate instead of overwrite.
+        if GRAD_BIAS_REDUCES_M:
+          m_block = start_m // BLOCK_M
+          grad_bias_ptrs = GradAttnBias + m_block * stride_gbm + offs_n * stride_gbn
+          grad_bias = tl.sum(tl.where(grad_bias_mask, dBias, 0.0), axis=0)
+          if GRAD_BIAS_STORE_PARTIAL:
+            tl.store(grad_bias_ptrs, grad_bias, mask=offs_n < seqlen_k)
+          else:
+            tl.atomic_add(grad_bias_ptrs, grad_bias, sem="relaxed", mask=offs_n < seqlen_k)
+        elif GRAD_BIAS_NEEDS_REDUCTION:
+          grad_bias_ptrs = GradAttnBias + offs_qm[:, None] * stride_gbm + offs_n[None, :] * stride_gbn
           tl.atomic_add(grad_bias_ptrs, dBias, sem="relaxed", mask=grad_bias_mask)
         else:
+          grad_bias_ptrs = GradAttnBias + offs_qm[:, None] * stride_gbm + offs_n[None, :] * stride_gbn
           tl.store(grad_bias_ptrs, dBias, mask=grad_bias_mask)
         dS = (dBias * softmax_scale).to(DTYPE)
       else:
@@ -1154,6 +1200,163 @@ def _get_decode_bwd_stage1_autotune(headdim: int, use_gemv: bool, autotune_mode:
 
 
 @triton.jit
+def _ffpa_bwd_key_bias_grad_stage1_kernel(
+  Q: torch.Tensor,
+  K: torch.Tensor,
+  V: torch.Tensor,
+  DO: torch.Tensor,
+  LSE: torch.Tensor,
+  D: torch.Tensor,
+  AttnBias: torch.Tensor,
+  PartialGradBias: torch.Tensor,
+  softmax_scale: float,
+  stride_qb: int,
+  stride_qh: int,
+  stride_qm: int,
+  stride_kb: int,
+  stride_kh: int,
+  stride_kn: int,
+  stride_vb: int,
+  stride_vh: int,
+  stride_vn: int,
+  stride_dob: int,
+  stride_doh: int,
+  stride_dom: int,
+  stride_bb: int,
+  stride_bh: int,
+  stride_bm: int,
+  stride_bn: int,
+  stride_pb: int,
+  stride_pm: int,
+  nheads: int,
+  seqlen_q: int,
+  seqlen_k: int,
+  seqlen_q_rounded: int,
+  headdim: int,
+  dropout_p: float,
+  philox_offset: int,
+  IS_CAUSAL: tl.constexpr,
+  HAS_ATTN_BIAS: tl.constexpr,
+  HAS_DROPOUT: tl.constexpr,
+  PHILOX_SEED: tl.constexpr,
+  BLOCK_M: tl.constexpr,
+  BLOCK_N: tl.constexpr,
+  BLOCK_HEADDIM: tl.constexpr,
+) -> None:
+  start_n_block = tl.program_id(0)
+  start_m_block = tl.program_id(1)
+  off_hb = tl.program_id(2)
+  off_b = off_hb // nheads
+  off_h = off_hb % nheads
+
+  Q += off_b * stride_qb + off_h * stride_qh
+  K += off_b * stride_kb + off_h * stride_kh
+  V += off_b * stride_vb + off_h * stride_vh
+  DO += off_b * stride_dob + off_h * stride_doh
+  LSE += off_hb * seqlen_q_rounded
+  D += off_hb * seqlen_q_rounded
+  if HAS_ATTN_BIAS:
+    AttnBias += off_b * stride_bb + off_h * stride_bh
+  PartialGradBias += off_hb * stride_pb + start_m_block * stride_pm
+
+  offs_m = start_m_block * BLOCK_M + tl.arange(0, BLOCK_M)
+  offs_n = start_n_block * BLOCK_N + tl.arange(0, BLOCK_N)
+  offs_d = tl.arange(0, BLOCK_HEADDIM)
+  mask_m = offs_m < seqlen_q
+  mask_n = offs_n < seqlen_k
+  num_d_chunks = tl.cdiv(headdim, BLOCK_HEADDIM)
+
+  scores = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+  dP = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+  for d_chunk in range(num_d_chunks):
+    d_offs = d_chunk * BLOCK_HEADDIM + offs_d
+    q = tl.load(
+      Q + offs_m[:, None] * stride_qm + d_offs[None, :],
+      mask=mask_m[:, None] & (d_offs[None, :] < headdim),
+      other=0.0,
+    )
+    k = tl.load(
+      K + offs_n[:, None] * stride_kn + d_offs[None, :],
+      mask=mask_n[:, None] & (d_offs[None, :] < headdim),
+      other=0.0,
+    )
+    v = tl.load(
+      V + offs_n[:, None] * stride_vn + d_offs[None, :],
+      mask=mask_n[:, None] & (d_offs[None, :] < headdim),
+      other=0.0,
+    )
+    do = tl.load(
+      DO + offs_m[:, None] * stride_dom + d_offs[None, :],
+      mask=mask_m[:, None] & (d_offs[None, :] < headdim),
+      other=0.0,
+    )
+    scores = tl.dot(q, tl.trans(k), acc=scores)
+    dP = tl.dot(do, tl.trans(v), acc=dP)
+
+  scores = scores * softmax_scale
+  if HAS_ATTN_BIAS:
+    bias = tl.load(
+      AttnBias + offs_m[:, None] * stride_bm + offs_n[None, :] * stride_bn,
+      mask=mask_m[:, None] & mask_n[None, :],
+      other=0.0,
+    )
+    scores += bias
+  scores = tl.where(mask_n[None, :], scores, -float("inf"))
+  if IS_CAUSAL:
+    kv_offset = seqlen_k - seqlen_q
+    scores = tl.where(offs_n[None, :] <= (offs_m[:, None] + kv_offset), scores, -float("inf"))
+  scores = tl.where(mask_m[:, None], scores, -float("inf"))
+
+  lse_i = tl.load(LSE + offs_m, mask=mask_m, other=-float("inf"))
+  P = tl.exp(scores - lse_i[:, None])
+  score_mask = mask_m[:, None] & mask_n[None, :]
+  P = tl.where(score_mask, P, 0.0)
+  dropout_mult = _dropout_multiplier(
+    off_hb,
+    offs_m,
+    offs_n,
+    seqlen_q,
+    seqlen_k,
+    dropout_p,
+    PHILOX_SEED,
+    philox_offset,
+    HAS_DROPOUT,
+  )
+  dP = dP * dropout_mult
+  delta_i = tl.load(D + offs_m, mask=mask_m, other=0.0)
+  dBias = P * (dP - delta_i[:, None])
+  partial = tl.sum(tl.where(score_mask, dBias, 0.0), axis=0)
+  tl.store(PartialGradBias + offs_n, partial, mask=mask_n)
+
+
+@triton.jit
+def _ffpa_bwd_key_bias_grad_reduce_kernel(
+  PartialGradBias: torch.Tensor,
+  GradAttnBias: torch.Tensor,
+  seqlen_k: int,
+  total_rows: int,
+  stride_gbn: int,
+  BLOCK_N: tl.constexpr,
+  BLOCK_R: tl.constexpr,
+) -> None:
+  start_n = tl.program_id(0) * BLOCK_N
+  offs_n = start_n + tl.arange(0, BLOCK_N)
+  offs_r = tl.arange(0, BLOCK_R)
+  mask_n = offs_n < seqlen_k
+  acc = tl.zeros([BLOCK_R, BLOCK_N], dtype=tl.float32)
+  for start_r in range(0, total_rows, BLOCK_R):
+    rows = start_r + offs_r
+    partial = tl.load(
+      PartialGradBias + rows[:, None] * seqlen_k + offs_n[None, :],
+      mask=(rows[:, None] < total_rows) & mask_n[None, :],
+      other=0.0,
+    )
+    acc += partial
+  grad = tl.sum(acc, axis=0)
+  tl.store(GradAttnBias + offs_n * stride_gbn, grad, mask=mask_n)
+
+
+@triton.jit
 def _ffpa_bwd_decode_stage1_kernel(
   Q: torch.Tensor,
   K: torch.Tensor,
@@ -1212,6 +1415,7 @@ def _ffpa_bwd_decode_stage1_kernel(
   PHILOX_SEED: tl.constexpr,
   BIAS_REQUIRES_GRAD: tl.constexpr,
   GRAD_BIAS_NEEDS_REDUCTION: tl.constexpr,
+  GRAD_BIAS_REDUCES_M: tl.constexpr,
   DTYPE: tl.constexpr,
   USE_GEMV: tl.constexpr,
   BLOCK_M: tl.constexpr,
@@ -1382,11 +1586,16 @@ def _ffpa_bwd_decode_stage1_kernel(
     dS = (dBias * softmax_scale).to(DTYPE)
 
     if BIAS_REQUIRES_GRAD:
-      grad_bias_ptrs = GradAttnBias + offs_m[:, None] * stride_gbm + offs_n[None, :] * stride_gbn
       grad_bias_mask = mask_m[:, None] & mask_n[None, :]
-      if GRAD_BIAS_NEEDS_REDUCTION:
+      if GRAD_BIAS_REDUCES_M:
+        grad_bias_ptrs = GradAttnBias + offs_n * stride_gbn
+        grad_bias = tl.sum(tl.where(grad_bias_mask, dBias, 0.0), axis=0)
+        tl.atomic_add(grad_bias_ptrs, grad_bias, sem="relaxed", mask=mask_n)
+      elif GRAD_BIAS_NEEDS_REDUCTION:
+        grad_bias_ptrs = GradAttnBias + offs_m[:, None] * stride_gbm + offs_n[None, :] * stride_gbn
         tl.atomic_add(grad_bias_ptrs, dBias, sem="relaxed", mask=grad_bias_mask)
       else:
+        grad_bias_ptrs = GradAttnBias + offs_m[:, None] * stride_gbm + offs_n[None, :] * stride_gbn
         tl.store(grad_bias_ptrs, dBias, mask=grad_bias_mask)
 
     for d_chunk in range(num_d_chunks):
@@ -1545,9 +1754,29 @@ def _ffpa_attn_backward_triton_impl(
   attn_bias_in = attn_bias if attn_bias is not None else q
   bias_strides = _attn_bias_broadcast_strides(attn_bias, batch, nheads, seqlen_q, seqlen_k)
   bias_requires_grad = grad_attn_bias is not None
-  grad_attn_bias_in = grad_attn_bias if grad_attn_bias is not None else q
-  grad_bias_strides = _attn_bias_broadcast_strides(grad_attn_bias, batch, nheads, seqlen_q, seqlen_k)
   grad_bias_needs_reduction = _attn_bias_grad_needs_reduction(grad_attn_bias, batch, nheads, seqlen_q, seqlen_k)
+  grad_bias_reduces_m = _attn_bias_grad_reduces_query(grad_attn_bias, seqlen_q)
+  use_key_bias_grad_reduction = _attn_bias_grad_is_key_bias(grad_attn_bias, seqlen_q, seqlen_k) and not autotune
+  main_bias_requires_grad = bias_requires_grad
+  grad_bias_store_partial = use_key_bias_grad_reduction
+  partial_grad_bias = None
+  if use_key_bias_grad_reduction:
+    num_m_blocks_for_bias = triton.cdiv(seqlen_q, 128)
+    partial_grad_bias = torch.empty(
+      (batch * nheads, num_m_blocks_for_bias, seqlen_k),
+      dtype=torch.float32,
+      device=q.device,
+    )
+    grad_attn_bias_in = partial_grad_bias
+    grad_bias_strides = (
+      nheads * partial_grad_bias.stride(0),
+      partial_grad_bias.stride(0),
+      partial_grad_bias.stride(1),
+      partial_grad_bias.stride(2),
+    )
+  else:
+    grad_attn_bias_in = grad_attn_bias if grad_attn_bias is not None else q
+    grad_bias_strides = _attn_bias_broadcast_strides(grad_attn_bias, batch, nheads, seqlen_q, seqlen_k)
   has_dropout = dropout_p > 0.0
 
   assert q.dtype == k.dtype == v.dtype == o.dtype == do.dtype
@@ -1681,8 +1910,9 @@ def _ffpa_attn_backward_triton_impl(
       HAS_ATTN_BIAS=has_attn_bias,
       HAS_DROPOUT=has_dropout,
       PHILOX_SEED=philox_seed,
-      BIAS_REQUIRES_GRAD=bias_requires_grad,
+      BIAS_REQUIRES_GRAD=main_bias_requires_grad,
       GRAD_BIAS_NEEDS_REDUCTION=grad_bias_needs_reduction,
+      GRAD_BIAS_REDUCES_M=grad_bias_reduces_m,
       DTYPE=DTYPE,
       USE_GEMV=use_gemv,
     )
@@ -1790,8 +2020,10 @@ def _ffpa_attn_backward_triton_impl(
         HAS_ATTN_BIAS=has_attn_bias,
         HAS_DROPOUT=has_dropout,
         PHILOX_SEED=philox_seed,
-        BIAS_REQUIRES_GRAD=bias_requires_grad,
+        BIAS_REQUIRES_GRAD=main_bias_requires_grad,
         GRAD_BIAS_NEEDS_REDUCTION=grad_bias_needs_reduction,
+        GRAD_BIAS_REDUCES_M=grad_bias_reduces_m,
+        GRAD_BIAS_STORE_PARTIAL=grad_bias_store_partial,
         DTYPE=DTYPE,
       )
     else:
@@ -1850,8 +2082,10 @@ def _ffpa_attn_backward_triton_impl(
         HAS_ATTN_BIAS=has_attn_bias,
         HAS_DROPOUT=has_dropout,
         PHILOX_SEED=philox_seed,
-        BIAS_REQUIRES_GRAD=bias_requires_grad,
+        BIAS_REQUIRES_GRAD=main_bias_requires_grad,
         GRAD_BIAS_NEEDS_REDUCTION=grad_bias_needs_reduction,
+        GRAD_BIAS_REDUCES_M=grad_bias_reduces_m,
+        GRAD_BIAS_STORE_PARTIAL=grad_bias_store_partial,
         DTYPE=DTYPE,
         BLOCK_M=128,
         BLOCK_N=64,
@@ -1921,8 +2155,10 @@ def _ffpa_attn_backward_triton_impl(
         HAS_ATTN_BIAS=has_attn_bias,
         HAS_DROPOUT=has_dropout,
         PHILOX_SEED=philox_seed,
-        BIAS_REQUIRES_GRAD=bias_requires_grad,
+        BIAS_REQUIRES_GRAD=main_bias_requires_grad,
         GRAD_BIAS_NEEDS_REDUCTION=grad_bias_needs_reduction,
+        GRAD_BIAS_REDUCES_M=grad_bias_reduces_m,
+        GRAD_BIAS_STORE_PARTIAL=grad_bias_store_partial,
         DTYPE=DTYPE,
       )
     else:
@@ -1982,8 +2218,10 @@ def _ffpa_attn_backward_triton_impl(
         HAS_ATTN_BIAS=has_attn_bias,
         HAS_DROPOUT=has_dropout,
         PHILOX_SEED=philox_seed,
-        BIAS_REQUIRES_GRAD=bias_requires_grad,
+        BIAS_REQUIRES_GRAD=main_bias_requires_grad,
         GRAD_BIAS_NEEDS_REDUCTION=grad_bias_needs_reduction,
+        GRAD_BIAS_REDUCES_M=grad_bias_reduces_m,
+        GRAD_BIAS_STORE_PARTIAL=grad_bias_store_partial,
         DTYPE=DTYPE,
         BLOCK_M=128,
         BLOCK_N=64,
@@ -1991,6 +2229,20 @@ def _ffpa_attn_backward_triton_impl(
         num_warps=8,
         num_stages=2,
       )
+
+  if use_key_bias_grad_reduction:
+    key_bias_block_n = 64
+    _ffpa_bwd_key_bias_grad_reduce_kernel[(triton.cdiv(seqlen_k, key_bias_block_n), )](
+      partial_grad_bias,
+      grad_attn_bias,
+      seqlen_k,
+      partial_grad_bias.numel() // seqlen_k,
+      grad_attn_bias.stride(3),
+      BLOCK_N=key_bias_block_n,
+      BLOCK_R=64,
+      num_warps=8,
+      num_stages=2,
+    )
 
 
 def _ffpa_attn_backward_triton(

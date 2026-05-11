@@ -141,7 +141,9 @@ def _aten_efficient_attn_backward(
     attn_bias = attn_bias.to(dtype=q_in.dtype)
     bias_shape = (q.size(0), q_in.size(1), q.size(2), k.size(2))
     if attn_bias.shape != bias_shape:
-      attn_bias = attn_bias.expand(bias_shape).contiguous()
+      # Keep broadcast dimensions as zero-stride views. Materializing here can
+      # turn compact masks such as [1, 1, 1, N] into [B, H, N, N].
+      attn_bias = attn_bias.expand(bias_shape)
 
   if group_size > 1:
     k_in = k_in.repeat_interleave(group_size, dim=1).contiguous()
