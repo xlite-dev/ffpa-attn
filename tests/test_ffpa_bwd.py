@@ -366,6 +366,46 @@ def test_ffpa_bwd_triton_decode_autotune_matches_sdpa(Nq):
   torch.testing.assert_close(v.grad, dv_ref, atol=3e-2, rtol=3e-2)
 
 
+@pytest.mark.parametrize("dtype", DTYPES, ids=["fp16", "bf16"])
+def test_ffpa_bwd_triton_decode_single_query_causal_large_matches_sdpa(dtype):
+  """Large single-query causal decode should match SDPA for fwd and bwd."""
+  B, H, Nq, Nkv, D = 1, 32, 1, 8192, 512
+  torch.manual_seed(7)
+  q = torch.randn(B, H, Nq, D, dtype=dtype, device="cuda", requires_grad=True)
+  k = torch.randn(B, H, Nkv, D, dtype=dtype, device="cuda", requires_grad=True)
+  v = torch.randn(B, H, Nkv, D, dtype=dtype, device="cuda", requires_grad=True)
+  grad_out = torch.randn_like(q)
+
+  scale = 1.0 / math.sqrt(D)
+  out = ffpa_attn_func(
+    q,
+    k,
+    v,
+    is_causal=True,
+    scale=scale,
+    stages=2,
+    acc="f32",
+    backward_backend="triton",
+  )
+  out.backward(grad_out)
+
+  out_ref = _sdpa_ref(q.detach(), k.detach(), v.detach(), True, scale)
+  dq_ref, dk_ref, dv_ref = _sdpa_ref_grads(
+    q.detach(),
+    k.detach(),
+    v.detach(),
+    True,
+    scale,
+    grad_out=grad_out,
+  )
+
+  tol = {"atol": 1e-2, "rtol": 1e-2} if dtype == torch.bfloat16 else {"atol": 3e-3, "rtol": 3e-3}
+  torch.testing.assert_close(out, out_ref, **tol)
+  torch.testing.assert_close(q.grad, dq_ref, **tol)
+  torch.testing.assert_close(k.grad, dk_ref, **tol)
+  torch.testing.assert_close(v.grad, dv_ref, **tol)
+
+
 def test_ffpa_bwd_triton_dropout_matches_sdpa():
   """Triton dropout backward must reuse the forward Philox mask like SDPA."""
   B, H, N, D = 1, 2, 512, 512

@@ -31,6 +31,27 @@ Main path (Nq >= 8):
   owned Q rows. DQ is a plain store because Q tiles are uniquely owned; DK/DV
   are also written by one K-tile owner after local accumulation over Q tiles.
 
+  Performance note:
+    The current main-path implementation does not keep one full DK/DV/DQ tile
+    in registers until completion. Instead, it repeatedly performs global
+    ``load old grad -> add current tile contribution -> store updated grad``
+    on ``DQ`` / ``DK`` / ``DV`` as it walks K or Q tiles. This has two direct
+    consequences:
+
+    1. Memory bandwidth pressure: each partial update pays an extra global
+       read and global write, so backward traffic scales with the number of
+       contributing tiles rather than one final write per output tile.
+    2. Accumulation dtype follows output storage: these global round-trips use
+       the actual storage dtype of ``DQ`` / ``DK`` / ``DV``. If the wrapper
+       allocates fp32 buffers, cross-tile accumulation stays fp32. If it
+       allocates bf16/fp16 buffers, every partial update is rounded at store
+       time and reloaded at that lower precision on the next iteration.
+
+    Because of this, the repeated DQ/DK/DV load/store pattern is both a major
+    performance bottleneck and the reason output-buffer dtype materially
+    affects backward accuracy. A future rewrite should prefer register or
+    local-scratch fp32 accumulation with one final cast/store per output tile.
+
 Decode path (Nq < 8):
   The stage1 kernel is split by K tile because a tiny query window would
   underutilize the main matrix-tile path. Each stage1 program computes DK/DV
@@ -457,7 +478,6 @@ def _ffpa_bwd_v2_kernel_impl(
   GRAD_BIAS_NEEDS_REDUCTION: tl.constexpr,
   GRAD_BIAS_REDUCES_M: tl.constexpr,
   GRAD_BIAS_STORE_PARTIAL: tl.constexpr,
-  FP32_GRAD_ACCUM: tl.constexpr,
   BLOCK_HEADDIM: tl.constexpr,
   DTYPE: tl.constexpr,
   EVEN_M: tl.constexpr,
@@ -611,6 +631,11 @@ def _ffpa_bwd_v2_kernel_impl(
         )
         dk_d = tl.trans(tl.dot(tl.trans(q), dS, out_dtype=tl.float32))
         dk_ptrs = DK + offs_n[:, None] * stride_dkn + d_offs[None, :]
+        # NOTE: These global load/store ops use DK's storage dtype, which is
+        # chosen by _triton_bwd_grad_tensor_like() in triton/__init__.py. If
+        # the wrapper allocates fp32 DK, this cross-Q-tile accumulation stays
+        # fp32; if it allocates bf16/fp16 DK, each load-add-store round-trips
+        # through that lower-precision storage format.
         dk_val = tl.load(dk_ptrs, mask=(offs_n[:, None] < seqlen_k) & (d_offs[None, :] < headdim), other=0.)
         dk_val += dk_d
         tl.store(dk_ptrs, dk_val, mask=(offs_n[:, None] < seqlen_k) & (d_offs[None, :] < headdim))
@@ -707,6 +732,8 @@ def _ffpa_bwd_v2_kernel_impl(
         )
         dq_d = tl.dot(dS_qk, k, out_dtype=tl.float32)
         dq_ptrs = DQ + offs_m[:, None] * stride_dqm + d_offs[None, :]
+        # Same storage-dtype rule as DK/DV above: DQ's global accumulation
+        # precision follows the buffer allocated by _triton_bwd_grad_tensor_like().
         dq_val = tl.load(dq_ptrs, mask=(offs_m[:, None] < seqlen_q) & (d_offs[None, :] < headdim), other=0.)
         dq_val += dq_d
         # NOTE: dQ is written non-atomically — each program owns a unique Q-row block.
@@ -891,7 +918,6 @@ def _ffpa_bwd_decode_stage1_kernel(
   BIAS_REQUIRES_GRAD: tl.constexpr,
   GRAD_BIAS_NEEDS_REDUCTION: tl.constexpr,
   GRAD_BIAS_REDUCES_M: tl.constexpr,
-  FP32_GRAD_ACCUM: tl.constexpr,
   DTYPE: tl.constexpr,
   USE_GEMV: tl.constexpr,
   BLOCK_M: tl.constexpr,
@@ -1409,7 +1435,6 @@ def _ffpa_attn_backward_triton_impl(
       BIAS_REQUIRES_GRAD=main_bias_requires_grad,
       GRAD_BIAS_NEEDS_REDUCTION=grad_bias_needs_reduction,
       GRAD_BIAS_REDUCES_M=grad_bias_reduces_m,
-      FP32_GRAD_ACCUM=True,
       DTYPE=DTYPE,
       USE_GEMV=use_gemv,
     )
@@ -1518,7 +1543,6 @@ def _ffpa_attn_backward_triton_impl(
       GRAD_BIAS_NEEDS_REDUCTION=grad_bias_needs_reduction,
       GRAD_BIAS_REDUCES_M=grad_bias_reduces_m,
       GRAD_BIAS_STORE_PARTIAL=grad_bias_store_partial,
-      FP32_GRAD_ACCUM=True,
       DTYPE=DTYPE,
     )
   else:
@@ -1581,7 +1605,6 @@ def _ffpa_attn_backward_triton_impl(
       GRAD_BIAS_NEEDS_REDUCTION=grad_bias_needs_reduction,
       GRAD_BIAS_REDUCES_M=grad_bias_reduces_m,
       GRAD_BIAS_STORE_PARTIAL=grad_bias_store_partial,
-      FP32_GRAD_ACCUM=True,
       DTYPE=DTYPE,
       BLOCK_M=128,
       BLOCK_N=64,

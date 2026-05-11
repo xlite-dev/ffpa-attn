@@ -37,12 +37,18 @@ def _attn_bias_grad_dtype(attn_bias: torch.Tensor, q: torch.Tensor, k: torch.Ten
 def _triton_bwd_grad_tensor_like(tensor: torch.Tensor) -> torch.Tensor:
   """Allocate the internal Triton backward output buffer for one gradient.
 
-  Keep the Triton-owned backward gradient workspace in fp32 and cast back in
-  the higher-level Python wrapper once all kernel-side accumulation is
-  finished. This makes fp32 accumulation the default for both fp16 and bf16
-  backward kernels.
+  ``FP32_GRAD_ACCUM`` only controls kernel-local accumulation. The externally
+  visible dQ/dK/dV buffers should stay in the user's dtype so enabling fp32
+  accumulation does not double backward activation memory.
+
+  This allocation also determines the dtype used by the Triton kernel's global
+  ``tl.load`` / ``tl.store`` traffic on ``DQ`` / ``DK`` / ``DV``. For example,
+  when ``_triton_bwd_grad_tensor_like(k)`` returns bf16 storage, the backward
+  kernel's ``tl.load(dk_ptrs)`` / ``tl.store(dk_ptrs, ...)`` sites operate on
+  bf16 values. Returning fp32 here therefore upgrades the kernel's cross-tile
+  global accumulation dtype, not just the Python-visible output tensor dtype.
   """
-  return torch.empty_like(tensor, dtype=torch.float32)
+  return torch.empty_like(tensor)
 
 
 torch.library.define(
