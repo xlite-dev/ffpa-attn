@@ -186,6 +186,13 @@ def _prepare_attn_mask(
   """
   if attn_mask is None:
     return None
+  # Keep additive masks in their original dtype when we compare dMask. The
+  # Triton wrapper intentionally allocates bf16-mask gradients in fp32 and only
+  # casts back at the autograd boundary; forcing the example mask itself to q's
+  # bf16 dtype would turn the reported dMask into a bf16 leaf-gradient test and
+  # hide whether the internal fp32 grad_attn_bias path actually helps.
+  if compare_mask_grad:
+    return attn_mask
   prepared = attn_mask if compare_mask_grad else attn_mask.detach()
   if prepared.dtype != dtype:
     prepared = prepared.to(dtype)
