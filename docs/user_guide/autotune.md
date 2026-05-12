@@ -36,7 +36,7 @@ There are two ways to use Triton tuned configs:
 	path:
 
 	```bash
-	python -m ffpa_attn.autotune --mode fast --directions both --overwrite
+	python -m ffpa_attn.autotune --mode fast --directions both --dtypes bf16,fp16 --overwrite
 	```
 
 	The generated JSON is saved under
@@ -74,10 +74,17 @@ You can generate only forward configs, only backward configs, or both:
 ```bash
 python -m ffpa_attn.autotune --mode fast --directions forward --overwrite
 python -m ffpa_attn.autotune --mode fast --directions backward --overwrite
-python -m ffpa_attn.autotune --mode fast --directions both --overwrite
+python -m ffpa_attn.autotune --mode fast --directions both --dtypes bf16,fp16 --overwrite
 ```
 
 `both` is the default.
+
+The default dtype set is `bf16`. For benchmarks such as `examples/perf.py` that
+run both `fp16` and `bf16`, generate both dtype configs explicitly:
+
+```bash
+python -m ffpa_attn.autotune --mode fast --directions both --dtypes bf16,fp16 --overwrite
+```
 
 ### Output Location
 
@@ -239,7 +246,7 @@ A typical workflow is:
 
 	```bash
 	CUDA_VISIBLE_DEVICES=0 \
-	python -m ffpa_attn.autotune --mode fast --directions both --overwrite
+	python -m ffpa_attn.autotune --mode fast --directions both --dtypes bf16,fp16 --overwrite
 	```
 
 3. Commit the generated JSON under `src/ffpa_attn/triton/configs/`.
