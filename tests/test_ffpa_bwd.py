@@ -199,6 +199,105 @@ def test_ffpa_bwd_triton_preprocess_modes(dtype, preprocess_d_chunk):
   torch.testing.assert_close(v.grad, dv_ref, **tol)
 
 
+@pytest.mark.parametrize("dtype", DTYPES, ids=["fp16", "bf16"])
+def test_ffpa_bwd_triton_internal_qkv_storage_dtype_option(dtype):
+  """The low-level Triton backward op should expose optional fp32 dq/dk/dv storage."""
+  B, H, N, D = 1, 2, 128, 320
+  torch.manual_seed(0)
+  q = torch.randn(B, H, N, D, dtype=dtype, device="cuda")
+  k = torch.randn(B, H, N, D, dtype=dtype, device="cuda")
+  v = torch.randn(B, H, N, D, dtype=dtype, device="cuda")
+  do = torch.randn_like(q)
+  scale = 1.0 / math.sqrt(D)
+
+  o, lse = torch.ops.ffpa_attn._fwd_triton(
+    q,
+    k,
+    v,
+    None,
+    scale,
+    0,
+    0,
+    0,
+    0.0,
+    0,
+    0,
+  )
+
+  dq_default, dk_default, dv_default, _ = torch.ops.ffpa_attn._bwd_triton(
+    do,
+    q,
+    k,
+    v,
+    o,
+    lse,
+    None,
+    scale,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0.0,
+    0,
+    0,
+  )
+  dq_fp32, dk_fp32, dv_fp32, _ = torch.ops.ffpa_attn._bwd_triton(
+    do,
+    q,
+    k,
+    v,
+    o,
+    lse,
+    None,
+    scale,
+    0,
+    0,
+    0,
+    0,
+    0,
+    1,
+    0.0,
+    0,
+    0,
+  )
+
+  assert dq_default.dtype == dtype
+  assert dk_default.dtype == dtype
+  assert dv_default.dtype == dtype
+  assert dq_fp32.dtype == torch.float32
+  assert dk_fp32.dtype == torch.float32
+  assert dv_fp32.dtype == torch.float32
+
+
+@pytest.mark.parametrize("dtype", DTYPES, ids=["fp16", "bf16"])
+def test_ffpa_bwd_triton_grad_qkv_storage_dtype_preserves_public_grad_dtype(dtype):
+  """Public gradients should stay in q/k/v dtype even when Triton storage is fp32."""
+  B, H, N, D = 1, 2, 128, 320
+  torch.manual_seed(0)
+  q = torch.randn(B, H, N, D, dtype=dtype, device="cuda", requires_grad=True)
+  k = torch.randn(B, H, N, D, dtype=dtype, device="cuda", requires_grad=True)
+  v = torch.randn(B, H, N, D, dtype=dtype, device="cuda", requires_grad=True)
+
+  scale = 1.0 / math.sqrt(D)
+  out = ffpa_attn_func(
+    q,
+    k,
+    v,
+    is_causal=True,
+    scale=scale,
+    acc="f32",
+    backward_backend="triton",
+    triton_backward_grad_qkv_storage_dtype=torch.float32,
+  )
+  out.sum().backward()
+
+  assert q.grad is not None and q.grad.dtype == dtype
+  assert k.grad is not None and k.grad.dtype == dtype
+  assert v.grad is not None and v.grad.dtype == dtype
+
+
 def test_ffpa_bwd_triton_additive_attn_mask_matches_sdpa():
   """Masked Triton backward must match SDPA, including additive-bias gradients."""
   B, H, N, D = 1, 4, 512, 512

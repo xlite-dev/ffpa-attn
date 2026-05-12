@@ -1658,6 +1658,7 @@ def _ffpa_attn_backward_triton(
   preprocess_d_chunk: bool = False,
   attn_bias: torch.Tensor | None = None,
   return_attn_bias_grad: bool = False,
+  grad_qkv_storage_dtype: torch.dtype | None = None,
   dropout_p: float = 0.0,
   philox_seed: int = 0,
   philox_offset: int = 0,
@@ -1696,11 +1697,19 @@ def _ffpa_attn_backward_triton(
     ``[B, Nh_q, Nq, Nkv]``.
   :param return_attn_bias_grad: Whether to materialize the expanded additive
     mask gradient for autograd.
+  :param grad_qkv_storage_dtype: Optional storage dtype for the internal
+    Triton ``DQ`` / ``DK`` / ``DV`` buffers. ``None`` keeps q/k/v dtypes;
+    ``torch.float32`` upgrades the intermediate global accumulation storage.
   :returns: ``(dq, dk, dv, d_attn_bias)`` where ``dq`` has shape ``[B, Nh_q, Nq, D]`` and
     ``dk`` / ``dv`` have shape ``[B, Nh_kv, Nkv, D]``. Returned tensors use
     the original ``q`` / ``k`` / ``v`` dtypes and head layouts. ``d_attn_bias``
     is the expanded bias gradient when requested, otherwise ``None``.
   """
+  if grad_qkv_storage_dtype not in (None, torch.float32):
+    raise ValueError(
+      "_ffpa_attn_backward_triton: grad_qkv_storage_dtype must be None or torch.float32, "
+      f"got {grad_qkv_storage_dtype!r}"
+    )
   seqlen_q = q.size(2)
   seqlen_q_rounded = ((seqlen_q + 127) // 128) * 128
   if lse.size(-1) < seqlen_q_rounded:
@@ -1737,6 +1746,7 @@ def _ffpa_attn_backward_triton(
     int(autotune_mode == "max"),
     int(preprocess_d_chunk),
     int(return_attn_bias_grad and attn_bias is not None),
+    int(grad_qkv_storage_dtype == torch.float32),
     dropout_p,
     philox_seed,
     philox_offset,
