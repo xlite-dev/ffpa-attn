@@ -177,13 +177,13 @@ def _iter_forward_tasks(
   for dtype in dtypes:
     for headdim in DEFAULT_HEADDIMS:
       for causal in (False, True):
-        for seqlen_k in decode_kv_seqlens:
-          tasks.append(TuneTask("forward", dtype, headdim, 1, seqlen_k, causal, heads, heads, case_name="decode-attn"))
         for seqlen_q in prefill_seqlens:
           for seqlen_k in prefill_seqlens:
             if causal and seqlen_k < seqlen_q:
               continue
             tasks.append(TuneTask("forward", dtype, headdim, seqlen_q, seqlen_k, causal, heads, heads))
+        for seqlen_k in decode_kv_seqlens:
+          tasks.append(TuneTask("forward", dtype, headdim, 1, seqlen_k, causal, heads, heads, case_name="decode-attn"))
       if full_tasks:
         tasks.extend(_iter_full_variant_tasks("forward", dtype, headdim, prefill_seqlens, heads))
   return tasks
@@ -202,16 +202,16 @@ def _iter_backward_tasks(
   for dtype in dtypes:
     for headdim in DEFAULT_HEADDIMS:
       for causal in (False, True):
-        for seqlen_q in decode_query_seqlens:
-          for seqlen_k in decode_kv_seqlens:
-            tasks.append(
-              TuneTask("backward", dtype, headdim, seqlen_q, seqlen_k, causal, heads, heads, case_name="decode-attn")
-            )
         for seqlen_q in prefill_seqlens:
           for seqlen_k in prefill_seqlens:
             if causal and seqlen_k < seqlen_q:
               continue
             tasks.append(TuneTask("backward", dtype, headdim, seqlen_q, seqlen_k, causal, heads, heads))
+        for seqlen_q in decode_query_seqlens:
+          for seqlen_k in decode_kv_seqlens:
+            tasks.append(
+              TuneTask("backward", dtype, headdim, seqlen_q, seqlen_k, causal, heads, heads, case_name="decode-attn")
+            )
       if full_tasks:
         tasks.extend(_iter_full_variant_tasks("backward", dtype, headdim, prefill_seqlens, heads))
   return tasks
@@ -499,6 +499,7 @@ def main() -> int:
     f"mode={args.mode} directions={args.directions} B={args.B} H={args.H} "
     f"full_tasks={args.full_tasks} full_variants={full_variant_count}"
   )
+  tune_start_time = time.perf_counter()
   with exact_autotune_seqlen_keys():
     for index, task in enumerate(tasks, start=1):
       try:
@@ -509,16 +510,22 @@ def main() -> int:
           tuned_entries = _tune_backward(task, args.B, args.mode, entries)
         torch.cuda.synchronize()
         elapsed = time.perf_counter() - start_time
+        total_elapsed = time.perf_counter() - tune_start_time
         for tuned_entry, choices_count in tuned_entries:
           print(
-            f"[AUTOTUNED][{index}/{len(tasks)}] {_format_entry(tuned_entry, choices_count, args.B)}, t={elapsed:.3f}s",
+            f"[AUTOTUNED][{index}/{len(tasks)}] {_format_entry(tuned_entry, choices_count, args.B)}, "
+            f"t={elapsed:.3f}s, T={total_elapsed:.3f}s",
             flush=True,
           )
       except RuntimeError as exc:
         if "out of memory" not in str(exc).lower():
           raise
         elapsed = time.perf_counter() - start_time
-        print(f"[AUTOTUNE-SKIPPED][{index}/{len(tasks)}] OOM after {elapsed:.3f}s: {exc}", flush=True)
+        total_elapsed = time.perf_counter() - tune_start_time
+        print(
+          f"[AUTOTUNE-SKIPPED][{index}/{len(tasks)}] OOM after t={elapsed:.3f}s, T={total_elapsed:.3f}s: {exc}",
+          flush=True,
+        )
         torch.cuda.empty_cache()
 
   ordered_entries = sorted(

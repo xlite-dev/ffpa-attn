@@ -107,6 +107,23 @@ def test_persistent_autotune_decode_tasks_skip_nkv1_and_nq4():
   assert all(task.seqlen_q == 1 and task.seqlen_k > 1 for task in backward_decode_tasks)
 
 
+def test_persistent_autotune_tasks_start_with_common_prefill():
+  dtypes = [torch.bfloat16]
+  seqlens = [1, 512, 1024]
+
+  forward_tasks = _iter_forward_tasks(dtypes, seqlens, heads=8, full_tasks=True)
+  backward_tasks = _iter_backward_tasks(dtypes, seqlens, heads=8, full_tasks=True)
+
+  assert forward_tasks[0].case_name == "common"
+  assert forward_tasks[0].seqlen_q >= 512
+  assert backward_tasks[0].case_name == "common"
+  assert backward_tasks[0].seqlen_q >= 512
+  first_forward_full = next(index for index, task in enumerate(forward_tasks) if task.case_name == "attn-mask")
+  first_backward_full = next(index for index, task in enumerate(backward_tasks) if task.case_name == "attn-mask")
+  assert any(task.case_name == "decode-attn" for task in forward_tasks[:first_forward_full])
+  assert any(task.case_name == "decode-attn" for task in backward_tasks[:first_backward_full])
+
+
 def test_persistent_autotune_default_tasks_keep_baseline_variants():
   dtypes = [torch.bfloat16]
   seqlens = [1, 512]
