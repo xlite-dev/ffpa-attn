@@ -222,7 +222,7 @@ def _ffpa_bwd_pre_impl(
   # Autotune buckets are passed explicitly to avoid redundant autotune
   # runs for shapes that differ only in seqlen but fall in the same bucket.
   # The kernel itself only uses the bucketed values.
-  seqlen_q_bucket: int,
+  autotune_seqlen_q_bucket: int,
   seqlen_q_rounded: int,
   headdim: int,
   BLOCK_M: tl.constexpr,
@@ -230,6 +230,7 @@ def _ffpa_bwd_pre_impl(
   D_CHUNK: tl.constexpr,
 ) -> None:
   """Preprocess kernel to compute delta = rowsum(dO * O) for the backward pass."""
+  _ = autotune_seqlen_q_bucket
   start_m = tl.program_id(0)
   off_hb = tl.program_id(1)
   off_b = off_hb // nheads
@@ -315,7 +316,7 @@ def _get_pre_autotune(d_chunk: bool, autotune_mode: str):
   if cache_key not in _ffpa_bwd_pre_autotune_cache:
     _ffpa_bwd_pre_autotune_cache[cache_key] = triton.autotune(
       configs=_gen_pre_autotune_configs(d_chunk=d_chunk, autotune_mode=autotune_mode),
-      key=["seqlen_q_bucket", "headdim"],
+      key=["autotune_seqlen_q_bucket", "headdim"],
       reset_to_zero=["Delta"],
       cache_results=True,
     )(_ffpa_bwd_pre_impl)
@@ -464,8 +465,10 @@ def _ffpa_bwd_v2_kernel_impl(
   # Autotune buckets are passed explicitly to avoid redundant autotune
   # runs for shapes that differ only in seqlen but fall in the same bucket.
   # The kernel itself only uses the bucketed values.
-  seqlen_q_bucket: int,
-  seqlen_k_bucket: int,
+  autotune_seqlen_q_bucket: int,
+  autotune_seqlen_k_bucket: int,
+  autotune_causal_key: int,
+  autotune_dtype_key: int,
   seqlen_q_rounded: int,
   headdim: int,
   dropout_p: float,
@@ -487,6 +490,10 @@ def _ffpa_bwd_v2_kernel_impl(
 ) -> None:
   pid = tl.program_id(0)
   off_hb = tl.program_id(2)
+  _ = autotune_seqlen_q_bucket
+  _ = autotune_seqlen_k_bucket
+  _ = autotune_causal_key
+  _ = autotune_dtype_key
   off_b = off_hb // nheads
   off_h = off_hb % nheads
 
@@ -762,7 +769,13 @@ def _get_v2_autotune(headdim: int, autotune_mode: str, bias_requires_grad: bool)
       reset_args.append("GradAttnBias")
     _ffpa_bwd_v2_autotune_cache[cache_key] = triton.autotune(
       configs=configs,
-      key=["seqlen_q_bucket", "seqlen_k_bucket", "headdim"],
+      key=[
+        "autotune_seqlen_q_bucket",
+        "autotune_seqlen_k_bucket",
+        "headdim",
+        "autotune_causal_key",
+        "autotune_dtype_key",
+      ],
       reset_to_zero=reset_args,
       cache_results=True,
     )(_ffpa_bwd_v2_kernel_impl)
@@ -839,7 +852,13 @@ def _get_decode_bwd_stage1_autotune(
         use_gemv=use_gemv,
         autotune_mode=autotune_mode,
       ),
-      key=["seqlen_q_bucket", "seqlen_k_bucket", "headdim"],
+      key=[
+        "autotune_seqlen_q_bucket",
+        "autotune_seqlen_k_bucket",
+        "headdim",
+        "autotune_causal_key",
+        "autotune_dtype_key",
+      ],
       reset_to_zero=reset_args,
       cache_results=True,
     )(_ffpa_bwd_decode_stage1_kernel)
@@ -882,6 +901,7 @@ def _ffpa_bwd_decode_stage1_kernel(
   DK: torch.Tensor,
   DV: torch.Tensor,
   PartialDQ: torch.Tensor,
+  WrittenKBlocks: torch.Tensor,
   LSE: torch.Tensor,
   D: torch.Tensor,
   AttnBias: torch.Tensor,
@@ -920,8 +940,10 @@ def _ffpa_bwd_decode_stage1_kernel(
   nheads: int,
   seqlen_q: int,
   seqlen_k: int,
-  seqlen_q_bucket: int,
-  seqlen_k_bucket: int,
+  autotune_seqlen_q_bucket: int,
+  autotune_seqlen_k_bucket: int,
+  autotune_causal_key: int,
+  autotune_dtype_key: int,
   seqlen_q_rounded: int,
   headdim: int,
   dropout_p: float,
@@ -942,10 +964,17 @@ def _ffpa_bwd_decode_stage1_kernel(
   # Decode backward splits work by K block. DK/DV are independent per K block,
   # but dQ is a sum over all K blocks, so stage1 writes PartialDQ and the reduce
   # kernel below performs the cross-K accumulation.
+  _ = autotune_seqlen_q_bucket
+  _ = autotune_seqlen_k_bucket
+  _ = autotune_causal_key
+  _ = autotune_dtype_key
   start_n_block = tl.program_id(0)
   off_hb = tl.program_id(1)
   off_b = off_hb // nheads
   off_h = off_hb % nheads
+
+  if start_n_block == 0:
+    tl.store(WrittenKBlocks + off_hb, tl.num_programs(0))
 
   Q += off_b * stride_qb + off_h * stride_qh
   K += off_b * stride_kb + off_h * stride_kh
@@ -1168,6 +1197,7 @@ def _ffpa_bwd_decode_stage1_kernel(
 @triton.jit
 def _ffpa_bwd_decode_dq_reduce_kernel(
   PartialDQ: torch.Tensor,
+  WrittenKBlocks: torch.Tensor,
   DQ: torch.Tensor,
   stride_pqb: int,
   stride_pqh: int,
@@ -1195,12 +1225,13 @@ def _ffpa_bwd_decode_dq_reduce_kernel(
   offs_d = d_block * BLOCK_HEADDIM + tl.arange(0, BLOCK_HEADDIM)
   mask_m = offs_m < seqlen_q
   acc = tl.zeros([BLOCK_M, BLOCK_HEADDIM], dtype=tl.float32)
+  written_k_blocks = tl.load(WrittenKBlocks + off_hb)
   PartialDQ += off_b * stride_pqb + off_h * stride_pqh
-  for start_k in range(0, num_k_blocks, BLOCK_K):
+  for start_k in range(0, written_k_blocks, BLOCK_K):
     k_blocks = start_k + offs_k
     partial = tl.load(
       PartialDQ + k_blocks[:, None, None] * stride_pqk + offs_m[None, :, None] * stride_pqm + offs_d[None, None, :],
-      mask=(k_blocks[:, None, None] < num_k_blocks) & mask_m[None, :, None] & (offs_d[None, None, :] < headdim),
+      mask=(k_blocks[:, None, None] < written_k_blocks) & mask_m[None, :, None] & (offs_d[None, None, :] < headdim),
       other=0.0,
     )
     acc += tl.sum(partial, axis=0)
@@ -1274,8 +1305,9 @@ def _ffpa_attn_backward_triton_impl(
   _, _, seqlen_k, _ = k.shape
   softmax_scale = softmax_scale or (1.0 / math.sqrt(headdim))
   seqlen_q_rounded = lse.shape[-1]
-  seqlen_q_bucket = bucket_autotune_seqlen(seqlen_q, autotune_mode)
-  seqlen_k_bucket = bucket_autotune_seqlen(seqlen_k, autotune_mode)
+  autotune_seqlen_q_bucket = bucket_autotune_seqlen(seqlen_q, autotune_mode)
+  autotune_seqlen_k_bucket = bucket_autotune_seqlen(seqlen_k, autotune_mode)
+  autotune_causal_key = int(causal)
   has_attn_bias = attn_bias is not None
   attn_bias_in = attn_bias if attn_bias is not None else q
   bias_strides = _attn_bias_broadcast_strides(attn_bias, batch, nheads, seqlen_q, seqlen_k)
@@ -1322,6 +1354,7 @@ def _ffpa_attn_backward_triton_impl(
     DTYPE = tl.float16
   else:
     DTYPE = tl.bfloat16
+  autotune_dtype_key = 1 if q.dtype == torch.bfloat16 else 0
 
   BLOCK_HEADDIM_DELTA = max(triton.next_power_of_2(headdim), 16)
   delta = torch.empty_like(lse)
@@ -1343,7 +1376,7 @@ def _ffpa_attn_backward_triton_impl(
       do.stride(2),
       nheads,
       seqlen_q,
-      seqlen_q_bucket,
+      autotune_seqlen_q_bucket,
       seqlen_q_rounded,
       headdim,
     )
@@ -1361,7 +1394,7 @@ def _ffpa_attn_backward_triton_impl(
       do.stride(2),
       nheads,
       seqlen_q,
-      seqlen_q_bucket,
+      autotune_seqlen_q_bucket,
       seqlen_q_rounded,
       headdim,
       BLOCK_M=128,
@@ -1386,15 +1419,16 @@ def _ffpa_attn_backward_triton_impl(
     block_headdim_decode = 64
     min_block_n_decode = 64 if autotune else block_n_decode
     num_k_blocks = triton.cdiv(seqlen_k, min_block_n_decode)
-    # Autotuned decode stage1 can pick a larger BLOCK_N than the minimum block
-    # count used for PartialDQ allocation, which leaves some tail K-block slots
-    # unwritten in the final selected config. Keep those slots zero so the dQ
-    # reducer sees only real stage1 contributions.
-    partial_dq = torch.zeros(
+    # Allocate for the smallest candidate BLOCK_N so every autotune config has
+    # enough slots. Stage1 records the actual launched K-block count per head,
+    # and the reducer below sums only that written prefix, so no full-buffer
+    # zero-init is needed here.
+    partial_dq = torch.empty(
       (batch, nheads, num_k_blocks, block_m_decode, headdim),
       dtype=torch.float32,
       device=q.device,
     )
+    written_k_blocks = torch.empty((batch * nheads, ), dtype=torch.int32, device=q.device)
 
     def decode_grid(meta: dict) -> tuple[int, int]:
       return (triton.cdiv(seqlen_k, meta["BLOCK_N"]), batch * nheads)
@@ -1407,6 +1441,7 @@ def _ffpa_attn_backward_triton_impl(
       dk,
       dv,
       partial_dq,
+      written_k_blocks,
       lse,
       delta,
       attn_bias_in,
@@ -1445,8 +1480,10 @@ def _ffpa_attn_backward_triton_impl(
       nheads,
       seqlen_q,
       seqlen_k,
-      seqlen_q_bucket,
-      seqlen_k_bucket,
+      autotune_seqlen_q_bucket,
+      autotune_seqlen_k_bucket,
+      autotune_causal_key,
+      autotune_dtype_key,
       seqlen_q_rounded,
       headdim,
       dropout_p,
@@ -1481,6 +1518,7 @@ def _ffpa_attn_backward_triton_impl(
     _ffpa_bwd_decode_dq_reduce_kernel[
       (triton.cdiv(headdim, block_headdim_decode), triton.cdiv(seqlen_q, block_m_decode), batch * nheads)](
         partial_dq,
+        written_k_blocks,
         dq,
         partial_dq.stride(0),
         partial_dq.stride(1),
@@ -1554,8 +1592,10 @@ def _ffpa_attn_backward_triton_impl(
       nheads,
       seqlen_q,
       seqlen_k,
-      seqlen_q_bucket,
-      seqlen_k_bucket,
+      autotune_seqlen_q_bucket,
+      autotune_seqlen_k_bucket,
+      autotune_causal_key,
+      autotune_dtype_key,
       seqlen_q_rounded,
       headdim,
       dropout_p,
@@ -1616,8 +1656,10 @@ def _ffpa_attn_backward_triton_impl(
       nheads,
       seqlen_q,
       seqlen_k,
-      seqlen_q_bucket,
-      seqlen_k_bucket,
+      autotune_seqlen_q_bucket,
+      autotune_seqlen_k_bucket,
+      autotune_causal_key,
+      autotune_dtype_key,
       seqlen_q_rounded,
       headdim,
       dropout_p,
