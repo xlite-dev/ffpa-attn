@@ -70,6 +70,7 @@ import triton
 import triton.language as tl
 
 from ._autotune_utils import bucket_autotune_seqlen
+from ._persistent_autotune import PersistentConfigRequest, dtype_name, lookup_persistent_config
 
 
 def _attn_bias_broadcast_strides(
@@ -1367,6 +1368,8 @@ def _ffpa_attn_backward_triton_impl(
     DTYPE = tl.float16
   else:
     DTYPE = tl.bfloat16
+  runtime_dtype = dtype_name(q.dtype)
+  grad_v_storage_dtype = "fp32" if dv.dtype == torch.float32 else None
   autotune_dtype_key = 1 if q.dtype == torch.bfloat16 else 0
 
   BLOCK_HEADDIM_DELTA = max(triton.next_power_of_2(headdim), 16)
@@ -1395,7 +1398,23 @@ def _ffpa_attn_backward_triton_impl(
     )
   else:
     block_headdim_delta = 64 if preprocess_d_chunk else BLOCK_HEADDIM_DELTA
-    _ffpa_bwd_pre[(triton.cdiv(seqlen_q, 128), batch * nheads)](
+    pre_config = lookup_persistent_config(
+      PersistentConfigRequest(
+        direction="backward",
+        kernel="bwd_preprocess",
+        autotune_mode=autotune_mode,
+        dtype=runtime_dtype,
+        headdim=headdim,
+        seqlen_q=seqlen_q,
+        preprocess_d_chunk=preprocess_d_chunk,
+      )
+    ) or {
+      "BLOCK_M": 128,
+      "BLOCK_HEADDIM": block_headdim_delta,
+      "D_CHUNK": preprocess_d_chunk,
+      "num_warps": 4,
+    }
+    _ffpa_bwd_pre[(triton.cdiv(seqlen_q, pre_config["BLOCK_M"]), batch * nheads)](
       o,
       do,
       delta,
@@ -1410,10 +1429,7 @@ def _ffpa_attn_backward_triton_impl(
       autotune_seqlen_q_bucket,
       seqlen_q_rounded,
       headdim,
-      BLOCK_M=128,
-      BLOCK_HEADDIM=block_headdim_delta,
-      D_CHUNK=preprocess_d_chunk,
-      num_warps=4,
+      **pre_config,
     )
 
   # Very short query lengths are decode-like: many K tiles contribute to one or
@@ -1428,6 +1444,28 @@ def _ffpa_attn_backward_triton_impl(
     block_m_decode = 8 if use_gemv else 16
     block_n_decode = 64 if use_gemv else 128
     block_headdim_decode = 64
+    decode_persisted_config = None
+    if not autotune:
+      decode_persisted_config = lookup_persistent_config(
+        PersistentConfigRequest(
+          direction="backward",
+          kernel="decode_bwd_stage1",
+          autotune_mode=autotune_mode,
+          dtype=runtime_dtype,
+          headdim=headdim,
+          seqlen_q=seqlen_q,
+          seqlen_k=seqlen_k,
+          causal=causal,
+          bias_grad=main_bias_requires_grad,
+          grad_v_storage_dtype=grad_v_storage_dtype,
+          use_gemv=use_gemv,
+          has_dropout=has_dropout,
+        )
+      )
+      if decode_persisted_config is not None:
+        block_m_decode = int(decode_persisted_config["BLOCK_M"])
+        block_n_decode = int(decode_persisted_config["BLOCK_N"])
+        block_headdim_decode = int(decode_persisted_config["BLOCK_HEADDIM"])
     min_block_n_decode = 64 if autotune else block_n_decode
     num_k_blocks = triton.cdiv(seqlen_k, min_block_n_decode)
     # Allocate for the smallest candidate BLOCK_N so every autotune config has
@@ -1517,14 +1555,17 @@ def _ffpa_attn_backward_triton_impl(
         **decode_stage1_meta,
       )
     else:
+      decode_launch_config = decode_persisted_config or {
+        "BLOCK_M": block_m_decode,
+        "BLOCK_N": block_n_decode,
+        "BLOCK_HEADDIM": block_headdim_decode,
+        "num_warps": 8,
+        "num_stages": 2,
+      }
       _ffpa_bwd_decode_stage1_kernel[decode_grid](
         *decode_stage1_args,
         **decode_stage1_meta,
-        BLOCK_M=block_m_decode,
-        BLOCK_N=block_n_decode,
-        BLOCK_HEADDIM=block_headdim_decode,
-        num_warps=8,
-        num_stages=2,
+        **decode_launch_config,
       )
     _ffpa_bwd_decode_dq_reduce_kernel[
       (triton.cdiv(headdim, block_headdim_decode), triton.cdiv(seqlen_q, block_m_decode), batch * nheads)](
@@ -1621,6 +1662,27 @@ def _ffpa_attn_backward_triton_impl(
       DTYPE=DTYPE,
     )
   else:
+    main_config = lookup_persistent_config(
+      PersistentConfigRequest(
+        direction="backward",
+        kernel="bwd_main",
+        autotune_mode=autotune_mode,
+        dtype=runtime_dtype,
+        headdim=headdim,
+        seqlen_q=seqlen_q,
+        seqlen_k=seqlen_k,
+        causal=causal,
+        bias_grad=main_bias_requires_grad,
+        grad_v_storage_dtype=grad_v_storage_dtype,
+        has_dropout=has_dropout,
+      )
+    ) or {
+      "BLOCK_M": 128,
+      "BLOCK_N": 64,
+      "BLOCK_HEADDIM": 64,
+      "num_warps": 8,
+      "num_stages": 2,
+    }
     _ffpa_bwd[grid](
       q,
       k,
@@ -1683,11 +1745,7 @@ def _ffpa_attn_backward_triton_impl(
       GRAD_BIAS_REDUCES_M=grad_bias_reduces_m,
       GRAD_BIAS_STORE_PARTIAL=grad_bias_store_partial,
       DTYPE=DTYPE,
-      BLOCK_M=128,
-      BLOCK_N=64,
-      BLOCK_HEADDIM=64,
-      num_warps=8,
-      num_stages=2,
+      **main_config,
     )
 
   if use_key_bias_grad_reduction:

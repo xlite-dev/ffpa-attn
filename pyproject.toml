@@ -82,6 +82,9 @@ write_to = "src/ffpa_attn/_version.py"
 include-package-data = true
 package-dir = {"" = "src"}
 
+[tool.setuptools.package-data]
+"ffpa_attn.triton" = ["configs/*.json"]
+
 [tool.setuptools.packages.find]
 where = ["src"]
 exclude = [

@@ -5,7 +5,13 @@ import pytest
 from ffpa_attn.functional import FFPAAttnMeta
 from ffpa_attn.triton._autotune_utils import bucket_autotune_seqlen
 from ffpa_attn.triton._ffpa_bwd import _gen_bwd_autotune_configs, _gen_pre_autotune_configs
-from ffpa_attn.triton._ffpa_fwd import _gen_decode_fwd_stage1_autotune_configs, _gen_fwd_autotune_configs
+from ffpa_attn.triton._persistent_autotune import config_from_triton_config
+from ffpa_attn.triton._ffpa_fwd import (
+  _gen_decode_fwd_stage1_autotune_configs,
+  _gen_fwd_autotune_configs,
+  _get_decode_fwd_stage1_autotune,
+  _get_fwd_autotune,
+)
 
 
 def test_triton_autotune_mode_defaults_to_fast():
@@ -45,7 +51,7 @@ def test_fwd_fast_mode_prunes_generic_configs(headdim):
   fast = _gen_fwd_autotune_configs(headdim, autotune_mode="fast")
   max_configs = _gen_fwd_autotune_configs(headdim, autotune_mode="max")
   assert len(fast) < len(max_configs)
-  assert all(config.num_warps == 4 for config in fast)
+  assert all(config.num_warps == 8 for config in fast)
 
 
 def test_fwd_fast_mode_prunes_decode_configs():
@@ -64,3 +70,16 @@ def test_bwd_fast_mode_prunes_kernel_configs():
   fast = _gen_bwd_autotune_configs((64, 128), headdim=512, autotune_mode="fast")
   max_configs = _gen_bwd_autotune_configs((64, 128), headdim=512, autotune_mode="max")
   assert len(fast) < len(max_configs)
+
+
+def test_forward_autotune_keys_include_causal():
+  assert "autotune_causal_key" in _get_fwd_autotune(320, "fast").keys
+  assert "autotune_causal_key" in _get_decode_fwd_stage1_autotune(320, True, "fast").keys
+
+
+def test_triton_config_serialization_round_trip_shape():
+  config = _gen_bwd_autotune_configs((64, ), headdim=512, autotune_mode="fast")[0]
+  serialized = config_from_triton_config(config)
+  assert serialized["BLOCK_M"] in (64, 128)
+  assert serialized["BLOCK_N"] == 64
+  assert "num_warps" in serialized

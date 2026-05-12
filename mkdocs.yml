@@ -52,6 +52,8 @@ nav:
   - Benchmark: benchmark/README.md
   - Examples: examples/README.md
   - Environment Variables: env.md
+  - User Guide:
+      - Triton Autotune: user_guide/autotune.md
   - Developer Guide:
       - Pre-commit Hook: developer_guide/pre-commit.md
   - API Reference: api/ffpa_attn.md

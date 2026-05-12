@@ -63,10 +63,13 @@ We extend FlashAttention to support large headdim ($D>256$) via **fine-grained t
 
 ## 🎉 Benchmark
 
-Runnable examples are provided under [`examples`](./examples). The performance benchmark for the 5090 with large headdim (D=512) is shown below. Please refer to our [bench](./bench/README.md) for more details.
+Runnable examples are provided under [`examples`](./examples). The performance benchmark for the 5090 with large headdim (D=320~1024) is shown below. Please refer to our [examples](./examples) for more details.
 
 <div align='center'>
-  <img src='./docs/assets/ffpa_speedup.png' width='750px'>
+  <img src='./docs/assets/perf/ffpa_speedup_nvidia-geforce-rtx-5090_B1_H32_N8192_D320.png' width='750px'>
+  <img src='./docs/assets/perf/ffpa_speedup_nvidia-geforce-rtx-5090_B1_H32_N8192_D512.png' width='750px'>
+  <img src='./docs/assets/perf/ffpa_speedup_nvidia-geforce-rtx-5090_B1_H32_N8192_D640.png' width='750px'>
+  <img src='./docs/assets/perf/ffpa_speedup_nvidia-geforce-rtx-5090_B1_H32_N8192_D1024.png' width='750px'>
 </div>
 
 
