@@ -775,7 +775,7 @@ def _get_bwd_autotune(headdim: int, autotune_mode: str, bias_requires_grad: bool
   cache_key = (headdim, autotune_mode, bias_requires_grad)
   if cache_key not in _ffpa_bwd_autotune_cache:
     configs = _gen_bwd_autotune_configs(
-      block_n_values=(64, 128),
+      block_n_values=(64, ) if autotune_mode == "fast" else (64, 128),
       headdim=headdim,
       autotune_mode=autotune_mode,
     )
