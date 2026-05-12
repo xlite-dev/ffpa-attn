@@ -742,8 +742,8 @@ def _ffpa_bwd_v2_kernel_impl(
 
 # Non-autotuned v2 variant.
 _ffpa_bwd_v2 = _ffpa_bwd_v2_kernel_impl
-
-_ffpa_bwd_v2_autotune_cache: dict[tuple[int, str, bool], callable] = {}  # (headdim, mode, bias_grad) -> callable
+# (headdim, mode, bias_grad) -> callable
+_ffpa_bwd_v2_autotune_cache: dict[tuple[int, str, bool], callable] = {}
 
 
 def _get_v2_autotune(headdim: int, autotune_mode: str, bias_requires_grad: bool):
@@ -757,6 +757,8 @@ def _get_v2_autotune(headdim: int, autotune_mode: str, bias_requires_grad: bool)
     )
     reset_args = ["DQ", "DK", "DV"]
     if bias_requires_grad:
+      # Some bias-grad layouts use atomic-add or per-tile partial writes, so
+      # autotune candidate runs must clear GradAttnBias just like DQ/DK/DV.
       reset_args.append("GradAttnBias")
     _ffpa_bwd_v2_autotune_cache[cache_key] = triton.autotune(
       configs=configs,
@@ -828,6 +830,8 @@ def _get_decode_bwd_stage1_autotune(
   if cache_key not in _ffpa_bwd_decode_stage1_autotune_cache:
     reset_args = ["DK", "DV", "PartialDQ"]
     if bias_requires_grad:
+      # Decode stage1 can also accumulate or alias compact mask gradients
+      # across autotune candidate runs, so GradAttnBias must be reset too.
       reset_args.append("GradAttnBias")
     _ffpa_bwd_decode_stage1_autotune_cache[cache_key] = triton.autotune(
       configs=_gen_decode_bwd_stage1_autotune_configs(
