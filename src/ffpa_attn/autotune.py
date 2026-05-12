@@ -10,6 +10,7 @@ Example:
 from __future__ import annotations
 
 import argparse
+import json
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -172,34 +173,30 @@ def _record_entry(entries: dict[tuple[Any, ...], dict[str, Any]], entry: dict[st
 
 
 def _format_config(config: dict[str, Any]) -> str:
-  """Return a compact stable string for progress logs.
+  """Return a compact JSON-style config string for progress logs.
 
   :param config: Persisted Triton launch config.
   :return: Human-readable config string.
   """
-  return ", ".join(f"{key}={config[key]}" for key in sorted(config))
+  return json.dumps(config, sort_keys=True, separators=(",", ":"))
 
 
-def _format_entry(entry: dict[str, Any]) -> str:
+def _format_entry(entry: dict[str, Any], choices_count: int, batch: int, heads: int) -> str:
   """Return one progress-log description for a tuned entry.
 
   :param entry: Persisted config entry.
+  :param choices_count: Number of autotune candidates considered by the wrapper.
+  :param batch: Batch size used for tuning.
+  :param heads: Number of heads used for tuning.
   :return: Human-readable entry description.
   """
-  parts = [
-    f"direction={entry['direction']}",
-    f"kernel={entry['kernel']}",
-    f"dtype={entry['dtype']}",
-    f"D={entry['headdim']}",
-    f"Nq={entry['seqlen_q']}",
-    f"Nkv={entry['seqlen_k']}",
-    f"causal={entry['causal']}",
-  ]
-  if "use_gemv" in entry:
-    parts.append(f"use_gemv={entry['use_gemv']}")
-  if "preprocess_d_chunk" in entry:
-    parts.append(f"preprocess_d_chunk={entry['preprocess_d_chunk']}")
-  return f"{' '.join(parts)} Config {_format_config(entry['config'])}"
+  direction = "FWD" if entry["direction"] == "forward" else "BWD"
+  shape = (
+    f"{direction}:{entry['kernel']}("
+    f"{entry['dtype']},B{batch},H{heads},Q{entry['seqlen_q']},K{entry['seqlen_k']},"
+    f"D{entry['headdim']},C{int(bool(entry['causal']))}"
+  )
+  return f"{shape}) best[{choices_count}]={_format_config(entry['config'])}"
 
 
 def _tune_forward(
@@ -208,7 +205,7 @@ def _tune_forward(
   heads: int,
   mode: str,
   entries: dict[tuple[Any, ...], dict[str, Any]],
-) -> list[dict[str, Any]]:
+) -> list[tuple[dict[str, Any], int]]:
   q, k, v = _make_tensors(task, batch, heads)
   out = ffpa_attn_func(
     q,
@@ -225,14 +222,16 @@ def _tune_forward(
     wrapper = _get_fwd_autotune(task.headdim, mode)
     kernel = "fwd_generic"
     entry = _entry_base(task, mode, kernel, config_from_triton_config(wrapper.best_config))
+    choices_count = len(wrapper.configs)
   else:
     use_gemv = task.seqlen_q == 1
     wrapper = _get_decode_fwd_stage1_autotune(task.headdim, use_gemv, mode)
     kernel = "decode_fwd_stage1"
     entry = _entry_base(task, mode, kernel, config_from_triton_config(wrapper.best_config))
     entry["use_gemv"] = use_gemv
+    choices_count = len(wrapper.configs)
   _record_entry(entries, entry)
-  return [entry]
+  return [(entry, choices_count)]
 
 
 def _tune_backward(
@@ -241,7 +240,7 @@ def _tune_backward(
   heads: int,
   mode: str,
   entries: dict[tuple[Any, ...], dict[str, Any]],
-) -> list[dict[str, Any]]:
+) -> list[tuple[dict[str, Any], int]]:
   q, k, v = _make_tensors(task, batch, heads)
   out = ffpa_attn_func(
     q,
@@ -260,6 +259,7 @@ def _tune_backward(
   pre_entry = _entry_base(task, mode, "bwd_preprocess", config_from_triton_config(pre_wrapper.best_config))
   pre_entry["preprocess_d_chunk"] = False
   _record_entry(entries, pre_entry)
+  pre_choices_count = len(pre_wrapper.configs)
 
   if task.seqlen_q < 8:
     use_gemv = task.seqlen_q == 1
@@ -271,6 +271,7 @@ def _tune_backward(
       "has_dropout": False,
       "use_gemv": use_gemv,
     })
+    choices_count = len(wrapper.configs)
   else:
     wrapper = _get_bwd_autotune(task.headdim, mode, False)
     entry = _entry_base(task, mode, "bwd_main", config_from_triton_config(wrapper.best_config))
@@ -279,8 +280,9 @@ def _tune_backward(
       "grad_v_storage_dtype": None,
       "has_dropout": False,
     })
+    choices_count = len(wrapper.configs)
   _record_entry(entries, entry)
-  return [pre_entry, entry]
+  return [(pre_entry, pre_choices_count), (entry, choices_count)]
 
 
 def _build_payload(entries: list[dict[str, Any]], mode: str, batch: int, heads: int,
@@ -348,11 +350,6 @@ def main() -> int:
   entries: dict[tuple[Any, ...], dict[str, Any]] = {}
   print(f"Generating {len(tasks)} FFPA Triton tuned config task(s) for {output_path}")
   for index, task in enumerate(tasks, start=1):
-    label = (
-      f"[{index}/{len(tasks)}] {task.direction} dtype={_dtype_schema_name(task.dtype)} "
-      f"D={task.headdim} Nq={task.seqlen_q} Nkv={task.seqlen_k} causal={task.causal}"
-    )
-    print(label, flush=True)
     try:
       start_time = time.perf_counter()
       if task.direction == "forward":
@@ -361,8 +358,11 @@ def main() -> int:
         tuned_entries = _tune_backward(task, args.B, args.H, args.mode, entries)
       torch.cuda.synchronize()
       elapsed = time.perf_counter() - start_time
-      for tuned_entry in tuned_entries:
-        print(f"[AUTOTUNED][{index}/{len(tasks)}] {_format_entry(tuned_entry)}, time cost: {elapsed:.3f}s", flush=True)
+      for tuned_entry, choices_count in tuned_entries:
+        print(
+          f"[AUTOTUNED][{index}/{len(tasks)}] {_format_entry(tuned_entry, choices_count, args.B, args.H)}, t={elapsed:.3f}s",
+          flush=True,
+        )
     except RuntimeError as exc:
       if "out of memory" not in str(exc).lower():
         raise
