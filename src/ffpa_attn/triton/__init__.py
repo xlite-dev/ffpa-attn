@@ -21,6 +21,70 @@ def _attn_bias_grad_needs_reduction(attn_bias: torch.Tensor | None, q: torch.Ten
   ])
 
 
+def _attn_bias_grad_dtype(attn_bias: torch.Tensor, q: torch.Tensor, k: torch.Tensor) -> torch.dtype:
+  """Return the internal accumulation dtype for Triton bias gradients.
+
+  BF16 additive-bias gradients are numerically sensitive even when the logical
+  mask shape does not require broadcast reduction. Keep the Triton accumulation
+  buffer in fp32 and cast back to the user dtype at the Python wrapper
+  boundary so the kernel only rounds once.
+  """
+  if attn_bias.dtype == torch.bfloat16 or _attn_bias_grad_needs_reduction(attn_bias, q, k):
+    return torch.float32
+  return attn_bias.dtype
+
+
+def _triton_bwd_grad_tensor_like(
+  tensor: torch.Tensor,
+  grad_qkv_storage_dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+  """Allocate the internal Triton backward output buffer for one gradient.
+
+  This allocation also determines the dtype used by the Triton kernel's global
+  ``tl.load`` / ``tl.store`` traffic on ``DQ`` / ``DK`` / ``DV``. For example,
+  when ``_triton_bwd_grad_tensor_like(k)`` returns bf16 storage, the backward
+  kernel's ``tl.load(dk_ptrs)`` / ``tl.store(dk_ptrs, ...)`` sites operate on
+  bf16 values. Returning fp32 here therefore upgrades the kernel's cross-tile
+  global accumulation dtype, not just the Python-visible output tensor dtype.
+
+  Memory note:
+  The fp32 override is expensive because this helper is called three times per
+  backward launch (for ``DQ`` / ``DK`` / ``DV``), and the Triton wrapper passes
+  already-expanded K/V tensors for GQA/MQA. One fp32 buffer costs
+
+  ``tensor.numel() * 4`` bytes,
+
+  so a typical large-D self-attention or causal shape
+  ``B=1, Hq=32, Nq=Nkv=8192, D=512`` allocates
+
+  ``1 * 32 * 8192 * 512 * 4 = 536870912`` bytes per buffer = ``512 MiB``,
+
+  and ``DQ + DK + DV`` together cost ``1536 MiB`` (about ``1.50 GiB``).
+  At ``N=4096`` the same configuration still needs ``768 MiB`` total. Because
+  K/V storage follows the expanded query-head layout, this fp32 cost also
+  applies to GQA/MQA after head expansion, even if the original KV tensors had
+  fewer heads.
+
+  Recommendation:
+  keep ``grad_qkv_storage_dtype=None`` by default and only switch to fp32 for
+  targeted numerical debugging or narrow accuracy studies. For the common
+  ``B=1, Hq=32, D=512`` regime, fp32 storage is generally not recommended once
+  ``N > 4096`` because the three internal buffers alone exceed roughly
+  ``768 MiB``.
+
+  :param tensor: Reference tensor that provides shape, device, and default
+    dtype.
+  :param grad_qkv_storage_dtype: Optional storage dtype for the internal
+    Triton ``DQ`` / ``DK`` / ``DV`` buffers. ``None`` keeps the user-visible
+    activation dtype; ``torch.float32`` upgrades the cross-tile global
+    accumulation storage to fp32.
+  :return: Newly allocated gradient buffer.
+  """
+  if grad_qkv_storage_dtype is None:
+    return torch.empty_like(tensor)
+  return torch.empty_like(tensor, dtype=grad_qkv_storage_dtype)
+
+
 torch.library.define(
   f"{_OP_NAMESPACE}::_fwd_triton",
   "(Tensor q, Tensor k, Tensor v, Tensor? attn_bias, float softmax_scale, "
@@ -104,7 +168,7 @@ torch.library.define(
   f"{_OP_NAMESPACE}::_bwd_triton",
   "(Tensor dO, Tensor q, Tensor k, Tensor v, Tensor o, Tensor lse, Tensor? attn_bias, "
   "float softmax_scale, int causal, int autotune, "
-  "int autotune_mode_is_max, int preprocess_d_chunk, int return_attn_bias_grad, "
+  "int autotune_mode_is_max, int preprocess_d_chunk, int return_attn_bias_grad, int grad_qkv_storage_dtype_is_fp32, "
   "float dropout_p, int philox_seed, int philox_offset) "
   "-> (Tensor dq, Tensor dk, Tensor dv, Tensor grad_attn_bias)",
 )
@@ -125,17 +189,19 @@ def _bwd_triton_torch_op(
   autotune_mode_is_max: int,
   preprocess_d_chunk: int,
   return_attn_bias_grad: int,
+  grad_qkv_storage_dtype_is_fp32: int,
   dropout_p: float,
   philox_seed: int,
   philox_offset: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
   from ._ffpa_bwd import _ffpa_attn_backward_triton_impl as _triton_bwd_kernel
 
-  dq = torch.empty_like(q)
-  dk = torch.empty_like(k)
-  dv = torch.empty_like(v)
+  grad_qkv_storage_dtype = torch.float32 if grad_qkv_storage_dtype_is_fp32 else None
+  dq = _triton_bwd_grad_tensor_like(q, grad_qkv_storage_dtype)
+  dk = _triton_bwd_grad_tensor_like(k, grad_qkv_storage_dtype)
+  dv = _triton_bwd_grad_tensor_like(v, grad_qkv_storage_dtype)
   if attn_bias is not None and return_attn_bias_grad:
-    grad_dtype = torch.float32 if _attn_bias_grad_needs_reduction(attn_bias, q, k) else attn_bias.dtype
+    grad_dtype = _attn_bias_grad_dtype(attn_bias, q, k)
     grad_attn_bias = torch.empty_like(attn_bias, dtype=grad_dtype)
   else:
     grad_attn_bias = q.new_empty(0)
@@ -181,6 +247,7 @@ def _bwd_triton_fake(
   autotune_mode_is_max: int,
   preprocess_d_chunk: int,
   return_attn_bias_grad: int,
+  grad_qkv_storage_dtype_is_fp32: int,
   dropout_p: float,
   philox_seed: int,
   philox_offset: int,
@@ -191,16 +258,23 @@ def _bwd_triton_fake(
     autotune,
     autotune_mode_is_max,
     preprocess_d_chunk,
+    grad_qkv_storage_dtype_is_fp32,
     dropout_p,
     philox_seed,
     philox_offset,
   )
+  grad_qkv_storage_dtype = torch.float32 if grad_qkv_storage_dtype_is_fp32 else None
   if attn_bias is not None and return_attn_bias_grad:
-    grad_dtype = torch.float32 if _attn_bias_grad_needs_reduction(attn_bias, q, k) else attn_bias.dtype
+    grad_dtype = _attn_bias_grad_dtype(attn_bias, q, k)
     grad_attn_bias = torch.empty_like(attn_bias, dtype=grad_dtype)
   else:
     grad_attn_bias = q.new_empty(0)
-  return torch.empty_like(q), torch.empty_like(k), torch.empty_like(v), grad_attn_bias
+  return (
+    _triton_bwd_grad_tensor_like(q, grad_qkv_storage_dtype),
+    _triton_bwd_grad_tensor_like(k, grad_qkv_storage_dtype),
+    _triton_bwd_grad_tensor_like(v, grad_qkv_storage_dtype),
+    grad_attn_bias,
+  )
 
 
 __all__ = ["_ffpa_attn_forward_triton", "_ffpa_attn_backward_triton"]

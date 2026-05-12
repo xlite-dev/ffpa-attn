@@ -31,6 +31,27 @@ Main path (Nq >= 8):
   owned Q rows. DQ is a plain store because Q tiles are uniquely owned; DK/DV
   are also written by one K-tile owner after local accumulation over Q tiles.
 
+  Performance note:
+    The current main-path implementation does not keep one full DK/DV/DQ tile
+    in registers until completion. Instead, it repeatedly performs global
+    ``load old grad -> add current tile contribution -> store updated grad``
+    on ``DQ`` / ``DK`` / ``DV`` as it walks K or Q tiles. This has two direct
+    consequences:
+
+    1. Memory bandwidth pressure: each partial update pays an extra global
+       read and global write, so backward traffic scales with the number of
+       contributing tiles rather than one final write per output tile.
+    2. Accumulation dtype follows output storage: these global round-trips use
+       the actual storage dtype of ``DQ`` / ``DK`` / ``DV``. If the wrapper
+       allocates fp32 buffers, cross-tile accumulation stays fp32. If it
+       allocates bf16/fp16 buffers, every partial update is rounded at store
+       time and reloaded at that lower precision on the next iteration.
+
+    Because of this, the repeated DQ/DK/DV load/store pattern is both a major
+    performance bottleneck and the reason output-buffer dtype materially
+    affects backward accuracy. A future rewrite should prefer register or
+    local-scratch fp32 accumulation with one final cast/store per output tile.
+
 Decode path (Nq < 8):
   The stage1 kernel is split by K tile because a tiny query window would
   underutilize the main matrix-tile path. Each stage1 program computes DK/DV
@@ -201,7 +222,7 @@ def _ffpa_bwd_pre_impl(
   # Autotune buckets are passed explicitly to avoid redundant autotune
   # runs for shapes that differ only in seqlen but fall in the same bucket.
   # The kernel itself only uses the bucketed values.
-  seqlen_q_bucket: int,
+  autotune_seqlen_q_bucket: int,
   seqlen_q_rounded: int,
   headdim: int,
   BLOCK_M: tl.constexpr,
@@ -209,6 +230,7 @@ def _ffpa_bwd_pre_impl(
   D_CHUNK: tl.constexpr,
 ) -> None:
   """Preprocess kernel to compute delta = rowsum(dO * O) for the backward pass."""
+  _ = autotune_seqlen_q_bucket
   start_m = tl.program_id(0)
   off_hb = tl.program_id(1)
   off_b = off_hb // nheads
@@ -294,7 +316,7 @@ def _get_pre_autotune(d_chunk: bool, autotune_mode: str):
   if cache_key not in _ffpa_bwd_pre_autotune_cache:
     _ffpa_bwd_pre_autotune_cache[cache_key] = triton.autotune(
       configs=_gen_pre_autotune_configs(d_chunk=d_chunk, autotune_mode=autotune_mode),
-      key=["seqlen_q_bucket", "headdim"],
+      key=["autotune_seqlen_q_bucket", "headdim"],
       reset_to_zero=["Delta"],
       cache_results=True,
     )(_ffpa_bwd_pre_impl)
@@ -443,8 +465,10 @@ def _ffpa_bwd_v2_kernel_impl(
   # Autotune buckets are passed explicitly to avoid redundant autotune
   # runs for shapes that differ only in seqlen but fall in the same bucket.
   # The kernel itself only uses the bucketed values.
-  seqlen_q_bucket: int,
-  seqlen_k_bucket: int,
+  autotune_seqlen_q_bucket: int,
+  autotune_seqlen_k_bucket: int,
+  autotune_causal_key: int,
+  autotune_dtype_key: int,
   seqlen_q_rounded: int,
   headdim: int,
   dropout_p: float,
@@ -466,6 +490,10 @@ def _ffpa_bwd_v2_kernel_impl(
 ) -> None:
   pid = tl.program_id(0)
   off_hb = tl.program_id(2)
+  _ = autotune_seqlen_q_bucket
+  _ = autotune_seqlen_k_bucket
+  _ = autotune_causal_key
+  _ = autotune_dtype_key
   off_b = off_hb // nheads
   off_h = off_hb % nheads
 
@@ -608,12 +636,17 @@ def _ffpa_bwd_v2_kernel_impl(
           mask=(offs_qm[:, None] < seqlen_q) & (d_offs[None, :] < headdim),
           other=0.
         )
-        dk_d = tl.trans(tl.dot(tl.trans(q), dS)).to(DTYPE)
+        dk_d = tl.trans(tl.dot(tl.trans(q), dS, out_dtype=tl.float32))
         dk_ptrs = DK + offs_n[:, None] * stride_dkn + d_offs[None, :]
+        # NOTE: These global load/store ops use DK's storage dtype, which is
+        # chosen by _triton_bwd_grad_tensor_like() in triton/__init__.py. If
+        # the wrapper allocates fp32 DK, this cross-Q-tile accumulation stays
+        # fp32; if it allocates bf16/fp16 DK, each load-add-store round-trips
+        # through that lower-precision storage format.
         dk_val = tl.load(dk_ptrs, mask=(offs_n[:, None] < seqlen_k) & (d_offs[None, :] < headdim), other=0.)
         dk_val += dk_d
         tl.store(dk_ptrs, dk_val, mask=(offs_n[:, None] < seqlen_k) & (d_offs[None, :] < headdim))
-        dv_d = tl.trans(tl.dot(tl.trans(do).to(tl.float32), P_drop)).to(DTYPE)
+        dv_d = tl.trans(tl.dot(tl.trans(do), P_drop.to(DTYPE), out_dtype=tl.float32))
         dv_ptrs = DV + offs_n[:, None] * stride_dvn + d_offs[None, :]
         dv_val = tl.load(dv_ptrs, mask=(offs_n[:, None] < seqlen_k) & (d_offs[None, :] < headdim), other=0.)
         dv_val += dv_d
@@ -704,8 +737,10 @@ def _ffpa_bwd_v2_kernel_impl(
           mask=(offs_nk[:, None] < seqlen_k) & (d_offs[None, :] < headdim),
           other=0.
         )
-        dq_d = tl.dot(dS_qk, k).to(DTYPE)
+        dq_d = tl.dot(dS_qk, k, out_dtype=tl.float32)
         dq_ptrs = DQ + offs_m[:, None] * stride_dqm + d_offs[None, :]
+        # Same storage-dtype rule as DK/DV above: DQ's global accumulation
+        # precision follows the buffer allocated by _triton_bwd_grad_tensor_like().
         dq_val = tl.load(dq_ptrs, mask=(offs_m[:, None] < seqlen_q) & (d_offs[None, :] < headdim), other=0.)
         dq_val += dq_d
         # NOTE: dQ is written non-atomically — each program owns a unique Q-row block.
@@ -714,23 +749,34 @@ def _ffpa_bwd_v2_kernel_impl(
 
 # Non-autotuned v2 variant.
 _ffpa_bwd_v2 = _ffpa_bwd_v2_kernel_impl
+# (headdim, mode, bias_grad) -> callable
+_ffpa_bwd_v2_autotune_cache: dict[tuple[int, str, bool], callable] = {}
 
-_ffpa_bwd_v2_autotune_cache: dict[tuple[int, str], callable] = {}  # (headdim, mode) -> callable
 
-
-def _get_v2_autotune(headdim: int, autotune_mode: str):
+def _get_v2_autotune(headdim: int, autotune_mode: str, bias_requires_grad: bool):
   """Return a headdim-specific autotune wrapper for the v2 backward kernel."""
-  cache_key = (headdim, autotune_mode)
+  cache_key = (headdim, autotune_mode, bias_requires_grad)
   if cache_key not in _ffpa_bwd_v2_autotune_cache:
     configs = _gen_bwd_autotune_configs(
       block_n_values=(64, ),
       headdim=headdim,
       autotune_mode=autotune_mode,
     )
+    reset_args = ["DQ", "DK", "DV"]
+    if bias_requires_grad:
+      # Some bias-grad layouts use atomic-add or per-tile partial writes, so
+      # autotune candidate runs must clear GradAttnBias just like DQ/DK/DV.
+      reset_args.append("GradAttnBias")
     _ffpa_bwd_v2_autotune_cache[cache_key] = triton.autotune(
       configs=configs,
-      key=["seqlen_q_bucket", "seqlen_k_bucket", "headdim"],
-      reset_to_zero=["DQ", "DK", "DV"],
+      key=[
+        "autotune_seqlen_q_bucket",
+        "autotune_seqlen_k_bucket",
+        "headdim",
+        "autotune_causal_key",
+        "autotune_dtype_key",
+      ],
+      reset_to_zero=reset_args,
       cache_results=True,
     )(_ffpa_bwd_v2_kernel_impl)
   return _ffpa_bwd_v2_autotune_cache[cache_key]
@@ -783,21 +829,37 @@ def _gen_decode_bwd_stage1_autotune_configs(
   return configs
 
 
-_ffpa_bwd_decode_stage1_autotune_cache: dict[tuple[int, bool, str], callable] = {}
+_ffpa_bwd_decode_stage1_autotune_cache: dict[tuple[int, bool, str, bool], callable] = {}
 
 
-def _get_decode_bwd_stage1_autotune(headdim: int, use_gemv: bool, autotune_mode: str):
+def _get_decode_bwd_stage1_autotune(
+  headdim: int,
+  use_gemv: bool,
+  autotune_mode: str,
+  bias_requires_grad: bool,
+):
   """Return an autotune wrapper for the decode backward stage1 kernel."""
-  cache_key = (headdim, use_gemv, autotune_mode)
+  cache_key = (headdim, use_gemv, autotune_mode, bias_requires_grad)
   if cache_key not in _ffpa_bwd_decode_stage1_autotune_cache:
+    reset_args = ["DK", "DV", "PartialDQ"]
+    if bias_requires_grad:
+      # Decode stage1 can also accumulate or alias compact mask gradients
+      # across autotune candidate runs, so GradAttnBias must be reset too.
+      reset_args.append("GradAttnBias")
     _ffpa_bwd_decode_stage1_autotune_cache[cache_key] = triton.autotune(
       configs=_gen_decode_bwd_stage1_autotune_configs(
         headdim=headdim,
         use_gemv=use_gemv,
         autotune_mode=autotune_mode,
       ),
-      key=["seqlen_q_bucket", "seqlen_k_bucket", "headdim"],
-      reset_to_zero=["DK", "DV", "PartialDQ"],
+      key=[
+        "autotune_seqlen_q_bucket",
+        "autotune_seqlen_k_bucket",
+        "headdim",
+        "autotune_causal_key",
+        "autotune_dtype_key",
+      ],
+      reset_to_zero=reset_args,
       cache_results=True,
     )(_ffpa_bwd_decode_stage1_kernel)
   return _ffpa_bwd_decode_stage1_autotune_cache[cache_key]
@@ -839,6 +901,7 @@ def _ffpa_bwd_decode_stage1_kernel(
   DK: torch.Tensor,
   DV: torch.Tensor,
   PartialDQ: torch.Tensor,
+  WrittenKBlocks: torch.Tensor,
   LSE: torch.Tensor,
   D: torch.Tensor,
   AttnBias: torch.Tensor,
@@ -877,8 +940,10 @@ def _ffpa_bwd_decode_stage1_kernel(
   nheads: int,
   seqlen_q: int,
   seqlen_k: int,
-  seqlen_q_bucket: int,
-  seqlen_k_bucket: int,
+  autotune_seqlen_q_bucket: int,
+  autotune_seqlen_k_bucket: int,
+  autotune_causal_key: int,
+  autotune_dtype_key: int,
   seqlen_q_rounded: int,
   headdim: int,
   dropout_p: float,
@@ -899,10 +964,17 @@ def _ffpa_bwd_decode_stage1_kernel(
   # Decode backward splits work by K block. DK/DV are independent per K block,
   # but dQ is a sum over all K blocks, so stage1 writes PartialDQ and the reduce
   # kernel below performs the cross-K accumulation.
+  _ = autotune_seqlen_q_bucket
+  _ = autotune_seqlen_k_bucket
+  _ = autotune_causal_key
+  _ = autotune_dtype_key
   start_n_block = tl.program_id(0)
   off_hb = tl.program_id(1)
   off_b = off_hb // nheads
   off_h = off_hb % nheads
+
+  if start_n_block == 0:
+    tl.store(WrittenKBlocks + off_hb, tl.num_programs(0))
 
   Q += off_b * stride_qb + off_h * stride_qh
   K += off_b * stride_kb + off_h * stride_kh
@@ -992,12 +1064,12 @@ def _ffpa_bwd_decode_stage1_kernel(
       dv = P_drop[:, None] * do[None, :]
       tl.store(
         DK + offs_n[:, None] * stride_dkn + d_offs[None, :],
-        dk.to(DTYPE),
+        dk,
         mask=mask_n[:, None] & (d_offs[None, :] < headdim),
       )
       tl.store(
         DV + offs_n[:, None] * stride_dvn + d_offs[None, :],
-        dv.to(DTYPE),
+        dv,
         mask=mask_n[:, None] & (d_offs[None, :] < headdim),
       )
       partial_dq = tl.sum(dS[:, None] * k, axis=0)
@@ -1102,17 +1174,17 @@ def _ffpa_bwd_decode_stage1_kernel(
         mask=mask_n[:, None] & (d_offs[None, :] < headdim),
         other=0.0,
       )
-      dk = tl.dot(tl.trans(dS), q)
-      dv = tl.dot(tl.trans(P_drop.to(DTYPE)), do)
-      partial_dq = tl.dot(dS, k)
+      dk = tl.dot(tl.trans(dS), q, out_dtype=tl.float32)
+      dv = tl.dot(tl.trans(P_drop.to(DTYPE)), do, out_dtype=tl.float32)
+      partial_dq = tl.dot(dS, k, out_dtype=tl.float32)
       tl.store(
         DK + offs_n[:, None] * stride_dkn + d_offs[None, :],
-        dk.to(DTYPE),
+        dk,
         mask=mask_n[:, None] & (d_offs[None, :] < headdim),
       )
       tl.store(
         DV + offs_n[:, None] * stride_dvn + d_offs[None, :],
-        dv.to(DTYPE),
+        dv,
         mask=mask_n[:, None] & (d_offs[None, :] < headdim),
       )
       tl.store(
@@ -1125,6 +1197,7 @@ def _ffpa_bwd_decode_stage1_kernel(
 @triton.jit
 def _ffpa_bwd_decode_dq_reduce_kernel(
   PartialDQ: torch.Tensor,
+  WrittenKBlocks: torch.Tensor,
   DQ: torch.Tensor,
   stride_pqb: int,
   stride_pqh: int,
@@ -1152,12 +1225,13 @@ def _ffpa_bwd_decode_dq_reduce_kernel(
   offs_d = d_block * BLOCK_HEADDIM + tl.arange(0, BLOCK_HEADDIM)
   mask_m = offs_m < seqlen_q
   acc = tl.zeros([BLOCK_M, BLOCK_HEADDIM], dtype=tl.float32)
+  written_k_blocks = tl.load(WrittenKBlocks + off_hb)
   PartialDQ += off_b * stride_pqb + off_h * stride_pqh
-  for start_k in range(0, num_k_blocks, BLOCK_K):
+  for start_k in range(0, written_k_blocks, BLOCK_K):
     k_blocks = start_k + offs_k
     partial = tl.load(
       PartialDQ + k_blocks[:, None, None] * stride_pqk + offs_m[None, :, None] * stride_pqm + offs_d[None, None, :],
-      mask=(k_blocks[:, None, None] < num_k_blocks) & mask_m[None, :, None] & (offs_d[None, None, :] < headdim),
+      mask=(k_blocks[:, None, None] < written_k_blocks) & mask_m[None, :, None] & (offs_d[None, None, :] < headdim),
       other=0.0,
     )
     acc += tl.sum(partial, axis=0)
@@ -1231,8 +1305,9 @@ def _ffpa_attn_backward_triton_impl(
   _, _, seqlen_k, _ = k.shape
   softmax_scale = softmax_scale or (1.0 / math.sqrt(headdim))
   seqlen_q_rounded = lse.shape[-1]
-  seqlen_q_bucket = bucket_autotune_seqlen(seqlen_q, autotune_mode)
-  seqlen_k_bucket = bucket_autotune_seqlen(seqlen_k, autotune_mode)
+  autotune_seqlen_q_bucket = bucket_autotune_seqlen(seqlen_q, autotune_mode)
+  autotune_seqlen_k_bucket = bucket_autotune_seqlen(seqlen_k, autotune_mode)
+  autotune_causal_key = int(causal)
   has_attn_bias = attn_bias is not None
   attn_bias_in = attn_bias if attn_bias is not None else q
   bias_strides = _attn_bias_broadcast_strides(attn_bias, batch, nheads, seqlen_q, seqlen_k)
@@ -1240,16 +1315,22 @@ def _ffpa_attn_backward_triton_impl(
   grad_bias_needs_reduction = _attn_bias_grad_needs_reduction(grad_attn_bias, batch, nheads, seqlen_q, seqlen_k)
   grad_bias_reduces_m = _attn_bias_grad_reduces_query(grad_attn_bias, seqlen_q)
   # The [1, 1, 1, Nkv] key-position mask is common in examples and avoids
-  # materializing [B, Hq, Nq, Nkv]. In non-autotune mode we route its gradient
-  # through a fp32 partial buffer so dMask accuracy is not dominated by many
-  # score-level atomics or their accumulation order.
-  use_key_bias_grad_reduction = _attn_bias_grad_is_key_bias(grad_attn_bias, seqlen_q, seqlen_k) and not autotune
+  # materializing [B, Hq, Nq, Nkv]. Route its gradient through the same fp32
+  # partial-buffer path in both autotune and non-autotune modes so compact
+  # key-bias dMask keeps one reduction semantic instead of switching to
+  # score-level atomics only because autotune is enabled.
+  use_key_bias_grad_reduction = _attn_bias_grad_is_key_bias(grad_attn_bias, seqlen_q, seqlen_k)
   main_bias_requires_grad = bias_requires_grad
   grad_bias_store_partial = use_key_bias_grad_reduction
   partial_grad_bias = None
   if use_key_bias_grad_reduction:
-    num_m_blocks_for_bias = triton.cdiv(seqlen_q, 128)
-    partial_grad_bias = torch.empty(
+    min_block_m_for_bias = 64 if autotune else 128
+    num_m_blocks_for_bias = triton.cdiv(seqlen_q, min_block_m_for_bias)
+    # Main-path autotune can switch between BLOCK_M=64 and BLOCK_M=128. Size the
+    # partial key-bias buffer for the smallest candidate so BLOCK_M=64 has room
+    # for every Q block, and zero-init it so larger BLOCK_M configs safely leave
+    # the extra rows unused.
+    partial_grad_bias = torch.zeros(
       (batch * nheads, num_m_blocks_for_bias, seqlen_k),
       dtype=torch.float32,
       device=q.device,
@@ -1269,7 +1350,11 @@ def _ffpa_attn_backward_triton_impl(
   assert q.dtype == k.dtype == v.dtype == o.dtype == do.dtype
   assert q.dtype in (torch.float16, torch.bfloat16)
 
-  DTYPE = tl.float16 if q.dtype == torch.float16 else tl.bfloat16
+  if q.dtype == torch.float16:
+    DTYPE = tl.float16
+  else:
+    DTYPE = tl.bfloat16
+  autotune_dtype_key = 1 if q.dtype == torch.bfloat16 else 0
 
   BLOCK_HEADDIM_DELTA = max(triton.next_power_of_2(headdim), 16)
   delta = torch.empty_like(lse)
@@ -1291,7 +1376,7 @@ def _ffpa_attn_backward_triton_impl(
       do.stride(2),
       nheads,
       seqlen_q,
-      seqlen_q_bucket,
+      autotune_seqlen_q_bucket,
       seqlen_q_rounded,
       headdim,
     )
@@ -1309,7 +1394,7 @@ def _ffpa_attn_backward_triton_impl(
       do.stride(2),
       nheads,
       seqlen_q,
-      seqlen_q_bucket,
+      autotune_seqlen_q_bucket,
       seqlen_q_rounded,
       headdim,
       BLOCK_M=128,
@@ -1334,11 +1419,16 @@ def _ffpa_attn_backward_triton_impl(
     block_headdim_decode = 64
     min_block_n_decode = 64 if autotune else block_n_decode
     num_k_blocks = triton.cdiv(seqlen_k, min_block_n_decode)
+    # Allocate for the smallest candidate BLOCK_N so every autotune config has
+    # enough slots. Stage1 records the actual launched K-block count per head,
+    # and the reducer below sums only that written prefix, so no full-buffer
+    # zero-init is needed here.
     partial_dq = torch.empty(
       (batch, nheads, num_k_blocks, block_m_decode, headdim),
       dtype=torch.float32,
       device=q.device,
     )
+    written_k_blocks = torch.empty((batch * nheads, ), dtype=torch.int32, device=q.device)
 
     def decode_grid(meta: dict) -> tuple[int, int]:
       return (triton.cdiv(seqlen_k, meta["BLOCK_N"]), batch * nheads)
@@ -1351,6 +1441,7 @@ def _ffpa_attn_backward_triton_impl(
       dk,
       dv,
       partial_dq,
+      written_k_blocks,
       lse,
       delta,
       attn_bias_in,
@@ -1389,8 +1480,10 @@ def _ffpa_attn_backward_triton_impl(
       nheads,
       seqlen_q,
       seqlen_k,
-      seqlen_q_bucket,
-      seqlen_k_bucket,
+      autotune_seqlen_q_bucket,
+      autotune_seqlen_k_bucket,
+      autotune_causal_key,
+      autotune_dtype_key,
       seqlen_q_rounded,
       headdim,
       dropout_p,
@@ -1408,7 +1501,7 @@ def _ffpa_attn_backward_triton_impl(
       USE_GEMV=use_gemv,
     )
     if autotune:
-      _get_decode_bwd_stage1_autotune(headdim, use_gemv, autotune_mode)[decode_grid](
+      _get_decode_bwd_stage1_autotune(headdim, use_gemv, autotune_mode, main_bias_requires_grad)[decode_grid](
         *decode_stage1_args,
         **decode_stage1_meta,
       )
@@ -1425,6 +1518,7 @@ def _ffpa_attn_backward_triton_impl(
     _ffpa_bwd_decode_dq_reduce_kernel[
       (triton.cdiv(headdim, block_headdim_decode), triton.cdiv(seqlen_q, block_m_decode), batch * nheads)](
         partial_dq,
+        written_k_blocks,
         dq,
         partial_dq.stride(0),
         partial_dq.stride(1),
@@ -1453,7 +1547,7 @@ def _ffpa_attn_backward_triton_impl(
     )
 
   if autotune:
-    _get_v2_autotune(headdim, autotune_mode)[grid](
+    _get_v2_autotune(headdim, autotune_mode, main_bias_requires_grad)[grid](
       q,
       k,
       v,
@@ -1498,8 +1592,10 @@ def _ffpa_attn_backward_triton_impl(
       nheads,
       seqlen_q,
       seqlen_k,
-      seqlen_q_bucket,
-      seqlen_k_bucket,
+      autotune_seqlen_q_bucket,
+      autotune_seqlen_k_bucket,
+      autotune_causal_key,
+      autotune_dtype_key,
       seqlen_q_rounded,
       headdim,
       dropout_p,
@@ -1560,8 +1656,10 @@ def _ffpa_attn_backward_triton_impl(
       nheads,
       seqlen_q,
       seqlen_k,
-      seqlen_q_bucket,
-      seqlen_k_bucket,
+      autotune_seqlen_q_bucket,
+      autotune_seqlen_k_bucket,
+      autotune_causal_key,
+      autotune_dtype_key,
       seqlen_q_rounded,
       headdim,
       dropout_p,
@@ -1611,6 +1709,7 @@ def _ffpa_attn_backward_triton(
   preprocess_d_chunk: bool = False,
   attn_bias: torch.Tensor | None = None,
   return_attn_bias_grad: bool = False,
+  grad_qkv_storage_dtype: torch.dtype | None = None,
   dropout_p: float = 0.0,
   philox_seed: int = 0,
   philox_offset: int = 0,
@@ -1649,11 +1748,19 @@ def _ffpa_attn_backward_triton(
     ``[B, Nh_q, Nq, Nkv]``.
   :param return_attn_bias_grad: Whether to materialize the expanded additive
     mask gradient for autograd.
+  :param grad_qkv_storage_dtype: Optional storage dtype for the internal
+    Triton ``DQ`` / ``DK`` / ``DV`` buffers. ``None`` keeps q/k/v dtypes;
+    ``torch.float32`` upgrades the intermediate global accumulation storage.
   :returns: ``(dq, dk, dv, d_attn_bias)`` where ``dq`` has shape ``[B, Nh_q, Nq, D]`` and
     ``dk`` / ``dv`` have shape ``[B, Nh_kv, Nkv, D]``. Returned tensors use
     the original ``q`` / ``k`` / ``v`` dtypes and head layouts. ``d_attn_bias``
     is the expanded bias gradient when requested, otherwise ``None``.
   """
+  if grad_qkv_storage_dtype not in (None, torch.float32):
+    raise ValueError(
+      "_ffpa_attn_backward_triton: grad_qkv_storage_dtype must be None or torch.float32, "
+      f"got {grad_qkv_storage_dtype!r}"
+    )
   seqlen_q = q.size(2)
   seqlen_q_rounded = ((seqlen_q + 127) // 128) * 128
   if lse.size(-1) < seqlen_q_rounded:
@@ -1690,6 +1797,7 @@ def _ffpa_attn_backward_triton(
     int(autotune_mode == "max"),
     int(preprocess_d_chunk),
     int(return_attn_bias_grad and attn_bias is not None),
+    int(grad_qkv_storage_dtype == torch.float32),
     dropout_p,
     philox_seed,
     philox_offset,
@@ -1716,5 +1824,5 @@ def _ffpa_attn_backward_triton(
   if grad_attn_bias.numel() == 0:
     grad_attn_bias_out = None
   else:
-    grad_attn_bias_out = grad_attn_bias
+    grad_attn_bias_out = grad_attn_bias.to(attn_bias.dtype) if attn_bias is not None else grad_attn_bias
   return dq.to(q.dtype), dk, dv, grad_attn_bias_out

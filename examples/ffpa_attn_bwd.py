@@ -34,6 +34,19 @@ MAX_MASK_GRAD_SEQLEN = 1024 * 16  # 16K, avoid OOM.
 BACKWARD_RESULT = dict[str, Any]
 
 
+def _parse_grad_qkv_dtype(arg: str) -> torch.dtype | None:
+  """Parse the CLI grad-qkv-dtype option.
+
+  :param arg: CLI value, ``"none"`` or ``"fp32"``.
+  :return: ``None`` or ``torch.float32``.
+  """
+  if arg == "none":
+    return None
+  if arg == "fp32":
+    return torch.float32
+  raise ValueError(f"Unsupported grad-qkv-dtype={arg!r}; choose 'none' or 'fp32'.")
+
+
 def _parse_args() -> argparse.Namespace:
   parser = argparse.ArgumentParser(description="FFPA backward example and SDPA comparison.")
   parser.add_argument(
@@ -74,6 +87,13 @@ def _parse_args() -> argparse.Namespace:
     choices=["fast", "max"],
     default="fast",
     help="Triton autotune search-space mode.",
+  )
+  parser.add_argument(
+    "--grad-qkv-storage-dtype",
+    "--grad-qkv-dtype",
+    choices=["none", "fp32"],
+    default="none",
+    help="Optional Triton backward dq/dk/dv storage dtype forwarded to ffpa_attn_func.",
   )
   return parser.parse_args()
 
@@ -186,6 +206,13 @@ def _prepare_attn_mask(
   """
   if attn_mask is None:
     return None
+  # Keep additive masks in their original dtype when we compare dMask. The
+  # Triton wrapper intentionally allocates bf16-mask gradients in fp32 and only
+  # casts back at the autograd boundary; forcing the example mask itself to q's
+  # bf16 dtype would turn the reported dMask into a bf16 leaf-gradient test and
+  # hide whether the internal fp32 grad_attn_bias path actually helps.
+  if compare_mask_grad:
+    return attn_mask
   prepared = attn_mask if compare_mask_grad else attn_mask.detach()
   if prepared.dtype != dtype:
     prepared = prepared.to(dtype)
@@ -369,6 +396,7 @@ def _ffpa_forward(
   causal: bool = False,
   attn_mask: torch.Tensor | None = None,
   dropout_p: float = 0.0,
+  triton_backward_grad_qkv_storage_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
   return ffpa_attn_func(
     q_i,
@@ -382,6 +410,7 @@ def _ffpa_forward(
     backward_backend=backward_backend,
     triton_backward_autotune=triton_backward_autotune,
     triton_autotune_mode=triton_autotune_mode,
+    triton_backward_grad_qkv_storage_dtype=triton_backward_grad_qkv_storage_dtype,
   )
 
 
@@ -413,6 +442,7 @@ def _run_ffpa_backward(
   causal: bool = False,
   attn_mask: torch.Tensor | None = None,
   dropout_p: float = 0.0,
+  triton_backward_grad_qkv_storage_dtype: torch.dtype | None = None,
 ) -> None:
   if attn_mask is not None:
     attn_mask.grad = None
@@ -430,6 +460,7 @@ def _run_ffpa_backward(
     causal=causal,
     attn_mask=attn_mask,
     dropout_p=dropout_p,
+    triton_backward_grad_qkv_storage_dtype=triton_backward_grad_qkv_storage_dtype,
   )
   out.sum().backward()
 
@@ -513,6 +544,7 @@ def _run_case(
   attn_mask: torch.Tensor | None = None,
   dropout_p: float = 0.0,
   timing_mode: str = "backward-only",
+  triton_backward_grad_qkv_storage_dtype: torch.dtype | None = None,
   apply_norm: bool = False,
   print_result: bool = True,
 ) -> BACKWARD_RESULT:
@@ -542,6 +574,7 @@ def _run_case(
     backward_backend=backward_backend,
     triton_backward_autotune=triton_backward_autotune,
     triton_autotune_mode=triton_autotune_mode,
+    triton_backward_grad_qkv_storage_dtype=triton_backward_grad_qkv_storage_dtype,
   )
   out.sum().backward()
 
@@ -563,12 +596,18 @@ def _run_case(
   )
   if all([
     compare_mask_grad,
-    dmask_ref is None,
     dropout_p == 0.0,
     not causal,
     _is_key_position_bias(active_attn_mask, Nkv),
   ]):
+    # PyTorch SDPA returns a bf16/fp16 mask gradient for compact [1, 1, 1, Nkv]
+    # bias, but that broadcast-reduced leaf grad can differ materially from the
+    # mathematically reduced reference in low precision. Use the dedicated
+    # reference for this compact mask shape so dMask_err reflects FFPA kernel
+    # accuracy rather than SDPA's compact-mask autograd behavior.
     dmask_ref = _key_position_bias_grad_ref(q, k, v, scale, active_attn_mask)
+  if dmask_ffpa is not None and dmask_ref is not None and dmask_ref.dtype != dmask_ffpa.dtype:
+    dmask_ref = dmask_ref.to(dmask_ffpa.dtype)
 
   if timing_mode == "backward-only":
     grad_out = torch.ones_like(q)
@@ -584,6 +623,7 @@ def _run_case(
         causal,
         active_attn_mask,
         dropout_p,
+        triton_backward_grad_qkv_storage_dtype,
       ),
       q,
       k,
@@ -620,6 +660,7 @@ def _run_case(
       causal,
       active_attn_mask,
       dropout_p,
+      triton_backward_grad_qkv_storage_dtype,
       rng_seed=dropout_seed if dropout_p > 0.0 else None,
     )
     ms_sdpa = _time_fn(
@@ -689,6 +730,7 @@ def run_backward_examples(
   timing_mode: str = "backward-only",
   triton_backward_autotune: bool = False,
   triton_autotune_mode: str = "fast",
+  triton_backward_grad_qkv_storage_dtype: torch.dtype | None = None,
   print_results: bool = True,
 ) -> list[BACKWARD_RESULT]:
   """Run the canonical backward benchmark cases.
@@ -704,6 +746,8 @@ def run_backward_examples(
   :param timing_mode: Benchmark timing mode.
   :param triton_backward_autotune: Whether to enable Triton backward autotune.
   :param triton_autotune_mode: Triton autotune mode.
+  :param triton_backward_grad_qkv_storage_dtype: Optional Triton backward
+    dq/dk/dv storage dtype forwarded to ``ffpa_attn_func``.
   :param print_results: Whether to print each case result.
   :return: One structured result per executed case and dtype.
   """
@@ -716,6 +760,7 @@ def run_backward_examples(
     f"apply_norm={apply_norm}, "
     f"triton_backward_autotune={triton_backward_autotune}, "
     f"triton_autotune_mode={triton_autotune_mode}, "
+    f"triton_backward_grad_qkv_storage_dtype={triton_backward_grad_qkv_storage_dtype}, "
     f"timing_mode={timing_mode}"
   )
 
@@ -802,6 +847,7 @@ def run_backward_examples(
           attn_mask=case.get("attn_mask"),
           dropout_p=case.get("dropout_p", 0.0),
           timing_mode=timing_mode,
+          triton_backward_grad_qkv_storage_dtype=triton_backward_grad_qkv_storage_dtype,
           apply_norm=apply_norm,
           print_result=print_results,
         )
@@ -816,6 +862,7 @@ def main() -> None:
 
   if not torch.cuda.is_available():
     raise SystemExit("CUDA is required to run this example.")
+  grad_qkv_dtype = _parse_grad_qkv_dtype(args.grad_qkv_storage_dtype)
   run_backward_examples(
     B=args.B,
     N=args.N,
@@ -827,6 +874,7 @@ def main() -> None:
     timing_mode=args.timing_mode,
     triton_backward_autotune=args.triton_backward_autotune,
     triton_autotune_mode=args.triton_autotune_mode,
+    triton_backward_grad_qkv_storage_dtype=grad_qkv_dtype,
     print_results=True,
   )
 

@@ -27,6 +27,20 @@ if str(EXAMPLES_DIR) not in sys.path:
 from ffpa_attn_bwd import run_backward_examples
 from ffpa_attn_fwd import run_forward_examples
 
+
+def _parse_grad_qkv_dtype(arg: str) -> torch.dtype | None:
+  """Parse the CLI grad-qkv-dtype option.
+
+  :param arg: CLI value, ``"none"`` or ``"fp32"``.
+  :return: ``None`` or ``torch.float32``.
+  """
+  if arg == "none":
+    return None
+  if arg == "fp32":
+    return torch.float32
+  raise ValueError(f"Unsupported grad-qkv-dtype={arg!r}; choose 'none' or 'fp32'.")
+
+
 # Keep the exact legacy plotting style from tools/plot.py.
 plt.rcParams["figure.dpi"] = 300
 plt.rcParams["font.sans-serif"] = ["DejaVu Sans"]
@@ -172,6 +186,13 @@ def _parse_args() -> argparse.Namespace:
     "--norm",
     action="store_true",
     help="Enable pre-attention LayerNorm on q/k/v for both FFPA and SDPA paths.",
+  )
+  parser.add_argument(
+    "--grad-qkv-storage-dtype",
+    "--grad-qkv-dtype",
+    choices=["none", "fp32"],
+    default="none",
+    help="Optional Triton backward dq/dk/dv storage dtype forwarded to the example runners.",
   )
   parser.add_argument(
     "--show-allclose",
@@ -635,6 +656,7 @@ def _benchmark_rows(args: argparse.Namespace) -> tuple[list[RESULT_ROW], list[RE
     raise SystemExit("CUDA is required when --forward or --backward is requested.")
 
   tune_mode = args.tune
+  grad_qkv_dtype = _parse_grad_qkv_dtype(args.grad_qkv_storage_dtype)
   forward_rows: list[RESULT_ROW] = []
   backward_rows: list[RESULT_ROW] = []
   if args.forward:
@@ -650,6 +672,7 @@ def _benchmark_rows(args: argparse.Namespace) -> tuple[list[RESULT_ROW], list[RE
         forward_backend=args.forward_backend,
         triton_forward_autotune=args.forward_backend == "triton" and tune_mode is not None,
         triton_autotune_mode=tune_mode or "fast",
+        triton_backward_grad_qkv_storage_dtype=grad_qkv_dtype,
         print_results=True,
       ),
     )
@@ -667,6 +690,7 @@ def _benchmark_rows(args: argparse.Namespace) -> tuple[list[RESULT_ROW], list[RE
         timing_mode="backward-only",
         triton_backward_autotune=args.backward_backend == "triton" and tune_mode is not None,
         triton_autotune_mode=tune_mode or "fast",
+        triton_backward_grad_qkv_storage_dtype=grad_qkv_dtype,
         print_results=True,
       ),
     )
