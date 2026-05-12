@@ -111,6 +111,53 @@ def _sdpa_ref_grads(
   return q2.grad, dk, dv
 
 
+def _key_position_bias_grad_ref(
+  q: torch.Tensor,
+  k: torch.Tensor,
+  v: torch.Tensor,
+  scale: float,
+  attn_mask: torch.Tensor,
+  block_m: int = 128,
+  block_n: int = 1024,
+) -> torch.Tensor:
+  """Compute a fp32 reference gradient for compact [1, 1, 1, Nkv] key bias."""
+  with torch.no_grad():
+    group_size = q.size(1) // k.size(1)
+    k_ref = k.detach().repeat_interleave(group_size, dim=1) if group_size > 1 else k.detach()
+    v_ref = v.detach().repeat_interleave(group_size, dim=1) if group_size > 1 else v.detach()
+    q_f = q.detach().float()
+    k_f = k_ref.float()
+    key_value_sum = v_ref.float().sum(dim=-1)
+    key_bias = attn_mask.detach().reshape(-1).float()
+    seqlen_q = q.size(2)
+    seqlen_k = k_ref.size(2)
+    grad = torch.zeros(seqlen_k, dtype=torch.float32, device=q.device)
+
+    for m_start in range(0, seqlen_q, block_m):
+      q_block = q_f[:, :, m_start:m_start + block_m, :]
+      lse = torch.full(q_block.shape[:-1], -torch.inf, dtype=torch.float32, device=q.device)
+      for n_start in range(0, seqlen_k, block_n):
+        scores = torch.matmul(q_block, k_f[:, :, n_start:n_start + block_n, :].transpose(-2, -1)) * scale
+        scores = scores + key_bias[n_start:n_start + block_n].view(1, 1, 1, -1)
+        lse = torch.logaddexp(lse, torch.logsumexp(scores, dim=-1))
+
+      delta = torch.zeros_like(lse)
+      for n_start in range(0, seqlen_k, block_n):
+        scores = torch.matmul(q_block, k_f[:, :, n_start:n_start + block_n, :].transpose(-2, -1)) * scale
+        scores = scores + key_bias[n_start:n_start + block_n].view(1, 1, 1, -1)
+        prob = torch.exp(scores - lse[..., None])
+        delta += (prob * key_value_sum[:, :, None, n_start:n_start + block_n]).sum(dim=-1)
+
+      for n_start in range(0, seqlen_k, block_n):
+        scores = torch.matmul(q_block, k_f[:, :, n_start:n_start + block_n, :].transpose(-2, -1)) * scale
+        scores = scores + key_bias[n_start:n_start + block_n].view(1, 1, 1, -1)
+        prob = torch.exp(scores - lse[..., None])
+        d_bias = prob * (key_value_sum[:, :, None, n_start:n_start + block_n] - delta[..., None])
+        grad[n_start:n_start + block_n] += d_bias.sum(dim=(0, 1, 2))
+
+    return grad.view(1, 1, 1, seqlen_k)
+
+
 def _run_bwd_pre(o, do, d_chunk, block_headdim=64):
   """Run the Triton backward preprocess kernel and return visible delta.
 
@@ -339,6 +386,48 @@ def test_ffpa_bwd_triton_additive_attn_mask_matches_sdpa():
   torch.testing.assert_close(attn_mask.grad, dmask_ref, atol=3e-2, rtol=3e-2)
 
 
+def test_ffpa_bwd_triton_key_bias_autotune_fp32_qkv_storage_matches_sdpa():
+  """Autotuned key-bias backward must keep dMask correct with fp32 qkv storage."""
+  B, H, N, D = 1, 32, 8192, 512
+  dtype = torch.float16
+  torch.manual_seed(42)
+  q = torch.randn(B, H, N, D, dtype=dtype, device="cuda", requires_grad=True)
+  k = torch.randn(B, H, N, D, dtype=dtype, device="cuda", requires_grad=True)
+  v = torch.randn(B, H, N, D, dtype=dtype, device="cuda", requires_grad=True)
+  attn_mask = (torch.randn(1, 1, 1, N, dtype=torch.float32, device="cuda") * 0.25).requires_grad_(True)
+
+  scale = 1.0 / math.sqrt(D)
+  out = ffpa_attn_func(
+    q,
+    k,
+    v,
+    attn_mask=attn_mask,
+    scale=scale,
+    stages=2,
+    acc="f32",
+    backward_backend="triton",
+    triton_backward_autotune=True,
+    triton_backward_grad_qkv_storage_dtype=torch.float32,
+  )
+  out.sum().backward()
+
+  assert attn_mask.grad is not None
+  dq_ref, dk_ref, dv_ref = _sdpa_ref_grads(
+    q,
+    k,
+    v,
+    False,
+    scale,
+    attn_mask=attn_mask.to(dtype),
+  )
+  dmask_ref = _key_position_bias_grad_ref(q, k, v, scale, attn_mask)
+
+  torch.testing.assert_close(q.grad, dq_ref, atol=3e-2, rtol=3e-2)
+  torch.testing.assert_close(k.grad, dk_ref, atol=3e-2, rtol=3e-2)
+  torch.testing.assert_close(v.grad, dv_ref, atol=3e-2, rtol=3e-2)
+  torch.testing.assert_close(attn_mask.grad, dmask_ref, atol=3e-2, rtol=3e-2)
+
+
 def test_ffpa_bwd_triton_additive_attn_mask_only_grad_matches_sdpa():
   """The Triton path must save context even when only additive mask needs grad."""
   B, H, N, D = 1, 2, 512, 512
@@ -460,6 +549,35 @@ def test_ffpa_bwd_triton_decode_autotune_matches_sdpa(Nq):
   out.backward(grad_out)
 
   dq_ref, dk_ref, dv_ref = _sdpa_ref_grads(q, k, v, False, scale, grad_out=grad_out)
+  torch.testing.assert_close(q.grad, dq_ref, atol=3e-2, rtol=3e-2)
+  torch.testing.assert_close(k.grad, dk_ref, atol=3e-2, rtol=3e-2)
+  torch.testing.assert_close(v.grad, dv_ref, atol=3e-2, rtol=3e-2)
+
+
+def test_ffpa_bwd_triton_decode_autotune_fp32_qkv_storage_matches_sdpa():
+  """Single-query decode autotune must keep dQ correct with fp32 qkv storage."""
+  B, H, Nq, Nkv, D = 1, 32, 1, 8192, 512
+  dtype = torch.float16
+  torch.manual_seed(42)
+  q = torch.randn(B, H, Nq, D, dtype=dtype, device="cuda", requires_grad=True)
+  k = torch.randn(B, H, Nkv, D, dtype=dtype, device="cuda", requires_grad=True)
+  v = torch.randn(B, H, Nkv, D, dtype=dtype, device="cuda", requires_grad=True)
+
+  scale = 1.0 / math.sqrt(D)
+  out = ffpa_attn_func(
+    q,
+    k,
+    v,
+    scale=scale,
+    stages=2,
+    acc="f32",
+    backward_backend="triton",
+    triton_backward_autotune=True,
+    triton_backward_grad_qkv_storage_dtype=torch.float32,
+  )
+  out.sum().backward()
+
+  dq_ref, dk_ref, dv_ref = _sdpa_ref_grads(q, k, v, False, scale)
   torch.testing.assert_close(q.grad, dq_ref, atol=3e-2, rtol=3e-2)
   torch.testing.assert_close(k.grad, dk_ref, atol=3e-2, rtol=3e-2)
   torch.testing.assert_close(v.grad, dv_ref, atol=3e-2, rtol=3e-2)

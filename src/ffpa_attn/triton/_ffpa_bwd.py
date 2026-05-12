@@ -1292,8 +1292,13 @@ def _ffpa_attn_backward_triton_impl(
   grad_bias_store_partial = use_key_bias_grad_reduction
   partial_grad_bias = None
   if use_key_bias_grad_reduction:
-    num_m_blocks_for_bias = triton.cdiv(seqlen_q, 128)
-    partial_grad_bias = torch.empty(
+    min_block_m_for_bias = 64 if autotune else 128
+    num_m_blocks_for_bias = triton.cdiv(seqlen_q, min_block_m_for_bias)
+    # Main-path autotune can switch between BLOCK_M=64 and BLOCK_M=128. Size the
+    # partial key-bias buffer for the smallest candidate so BLOCK_M=64 has room
+    # for every Q block, and zero-init it so larger BLOCK_M configs safely leave
+    # the extra rows unused.
+    partial_grad_bias = torch.zeros(
       (batch * nheads, num_m_blocks_for_bias, seqlen_k),
       dtype=torch.float32,
       device=q.device,
@@ -1381,7 +1386,11 @@ def _ffpa_attn_backward_triton_impl(
     block_headdim_decode = 64
     min_block_n_decode = 64 if autotune else block_n_decode
     num_k_blocks = triton.cdiv(seqlen_k, min_block_n_decode)
-    partial_dq = torch.empty(
+    # Autotuned decode stage1 can pick a larger BLOCK_N than the minimum block
+    # count used for PartialDQ allocation, which leaves some tail K-block slots
+    # unwritten in the final selected config. Keep those slots zero so the dQ
+    # reducer sees only real stage1 contributions.
+    partial_dq = torch.zeros(
       (batch, nheads, num_k_blocks, block_m_decode, headdim),
       dtype=torch.float32,
       device=q.device,
