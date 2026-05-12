@@ -256,7 +256,7 @@ def _tune_backward(
   out.float().sum().backward()
 
   pre_wrapper = _get_pre_autotune(False, mode)
-  pre_entry = _entry_base(task, mode, "bwd_preprocess", config_from_triton_config(pre_wrapper.best_config))
+  pre_entry = _entry_base(task, mode, "bwd_preproc", config_from_triton_config(pre_wrapper.best_config))
   pre_entry["preprocess_d_chunk"] = False
   _record_entry(entries, pre_entry)
   pre_choices_count = len(pre_wrapper.configs)

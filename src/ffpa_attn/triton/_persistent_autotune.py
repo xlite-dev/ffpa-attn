@@ -45,7 +45,7 @@ _KERNEL_CONFIG_KEYS = {
     "num_ctas",
     "maxnreg",
   },
-  "bwd_preprocess": {
+  "bwd_preproc": {
     "BLOCK_M",
     "BLOCK_HEADDIM",
     "D_CHUNK",
