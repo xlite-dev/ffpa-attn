@@ -642,20 +642,20 @@ def _ffpa_bwd_kernel_impl(
 
         if start_m == begin_m:
           dk_d = tl.trans(tl.dot(tl.trans(q), dS, out_dtype=tl.float32))
-          tl.store(dk_ptrs, dk_d, mask=grad_mask)
+          tl.store(dk_ptrs, dk_d, mask=grad_mask, eviction_policy="evict_last")
           dv_d = tl.trans(tl.dot(tl.trans(do), P_drop.to(DTYPE), out_dtype=tl.float32))
-          tl.store(dv_ptrs, dv_d, mask=grad_mask)
+          tl.store(dv_ptrs, dv_d, mask=grad_mask, eviction_policy="evict_last")
         else:
           # NOTE: These global load/store ops use each gradient buffer's storage
           # dtype, which is chosen by _triton_bwd_grad_tensor_like() in
           # triton/__init__.py. dV can optionally use fp32 internal storage;
           # otherwise each later update round-trips through bf16/fp16 storage.
-          dk_val = tl.load(dk_ptrs, mask=grad_mask, other=0.)
+          dk_val = tl.load(dk_ptrs, mask=grad_mask, other=0., eviction_policy="evict_last")
           dk_d = tl.trans(tl.dot(tl.trans(q), dS, out_dtype=tl.float32))
-          tl.store(dk_ptrs, dk_val + dk_d, mask=grad_mask)
-          dv_val = tl.load(dv_ptrs, mask=grad_mask, other=0.)
+          tl.store(dk_ptrs, dk_val + dk_d, mask=grad_mask, eviction_policy="evict_last")
+          dv_val = tl.load(dv_ptrs, mask=grad_mask, other=0., eviction_policy="evict_last")
           dv_d = tl.trans(tl.dot(tl.trans(do), P_drop.to(DTYPE), out_dtype=tl.float32))
-          tl.store(dv_ptrs, dv_val + dv_d, mask=grad_mask)
+          tl.store(dv_ptrs, dv_val + dv_d, mask=grad_mask, eviction_policy="evict_last")
 
   # Part 2: dQ — pid as Q-row block index (NON-ATOMIC!)
   start_m = pid * BLOCK_M
@@ -746,14 +746,14 @@ def _ffpa_bwd_kernel_impl(
         dq_mask = (offs_m[:, None] < seqlen_q) & (d_offs[None, :] < headdim)
         if start_n_k == 0:
           dq_d = tl.dot(dS_qk, k, out_dtype=tl.float32)
-          tl.store(dq_ptrs, dq_d, mask=dq_mask)
+          tl.store(dq_ptrs, dq_d, mask=dq_mask, eviction_policy="evict_last")
         else:
           # Same storage-dtype rule as DK/DV above: later DQ accumulation
           # precision follows the buffer allocated by _triton_bwd_grad_tensor_like().
-          dq_val = tl.load(dq_ptrs, mask=dq_mask, other=0.)
+          dq_val = tl.load(dq_ptrs, mask=dq_mask, other=0., eviction_policy="evict_last")
           dq_d = tl.dot(dS_qk, k, out_dtype=tl.float32)
           # NOTE: dQ is written non-atomically — each program owns a unique Q-row block.
-          tl.store(dq_ptrs, dq_val + dq_d, mask=dq_mask)
+          tl.store(dq_ptrs, dq_val + dq_d, mask=dq_mask, eviction_policy="evict_last")
 
 
 # Non-autotuned main backward variant.
