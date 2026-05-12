@@ -417,7 +417,7 @@ _FFPA_BWD_HEURISTICS = {
 # wrapper folds expanded dK/dV back to the original KV heads afterwards.
 @triton.heuristics(_FFPA_BWD_HEURISTICS)
 @triton.jit
-def _ffpa_bwd_v2_kernel_impl(
+def _ffpa_bwd_kernel_impl(
   Q: torch.Tensor,
   K: torch.Tensor,
   V: torch.Tensor,
@@ -497,7 +497,6 @@ def _ffpa_bwd_v2_kernel_impl(
   off_b = off_hb // nheads
   off_h = off_hb % nheads
 
-  # ---- base pointers ----
   Q += off_b * stride_qb + off_h * stride_qh
   K += off_b * stride_kb + off_h * stride_kh
   V += off_b * stride_vb + off_h * stride_vh
@@ -507,6 +506,7 @@ def _ffpa_bwd_v2_kernel_impl(
   DV += off_b * stride_dvb + off_h * stride_dvh
   D += off_hb * seqlen_q_rounded
   LSE += off_hb * seqlen_q_rounded
+
   if HAS_ATTN_BIAS:
     AttnBias += off_b * stride_bb + off_h * stride_bh
   if BIAS_REQUIRES_GRAD:
@@ -636,21 +636,27 @@ def _ffpa_bwd_v2_kernel_impl(
           mask=(offs_qm[:, None] < seqlen_q) & (d_offs[None, :] < headdim),
           other=0.
         )
-        dk_d = tl.trans(tl.dot(tl.trans(q), dS, out_dtype=tl.float32))
         dk_ptrs = DK + offs_n[:, None] * stride_dkn + d_offs[None, :]
-        # NOTE: These global load/store ops use DK's storage dtype, which is
-        # chosen by _triton_bwd_grad_tensor_like() in triton/__init__.py. If
-        # the wrapper allocates fp32 DK, this cross-Q-tile accumulation stays
-        # fp32; if it allocates bf16/fp16 DK, each load-add-store round-trips
-        # through that lower-precision storage format.
-        dk_val = tl.load(dk_ptrs, mask=(offs_n[:, None] < seqlen_k) & (d_offs[None, :] < headdim), other=0.)
-        dk_val += dk_d
-        tl.store(dk_ptrs, dk_val, mask=(offs_n[:, None] < seqlen_k) & (d_offs[None, :] < headdim))
-        dv_d = tl.trans(tl.dot(tl.trans(do), P_drop.to(DTYPE), out_dtype=tl.float32))
         dv_ptrs = DV + offs_n[:, None] * stride_dvn + d_offs[None, :]
-        dv_val = tl.load(dv_ptrs, mask=(offs_n[:, None] < seqlen_k) & (d_offs[None, :] < headdim), other=0.)
-        dv_val += dv_d
-        tl.store(dv_ptrs, dv_val, mask=(offs_n[:, None] < seqlen_k) & (d_offs[None, :] < headdim))
+        grad_mask = (offs_n[:, None] < seqlen_k) & (d_offs[None, :] < headdim)
+
+        if start_m == begin_m:
+          dk_d = tl.trans(tl.dot(tl.trans(q), dS, out_dtype=tl.float32))
+          tl.store(dk_ptrs, dk_d, mask=grad_mask)
+          dv_d = tl.trans(tl.dot(tl.trans(do), P_drop.to(DTYPE), out_dtype=tl.float32))
+          tl.store(dv_ptrs, dv_d, mask=grad_mask)
+        else:
+          # NOTE: These global load/store ops use DK/DV's storage dtype, which
+          # is chosen by _triton_bwd_grad_tensor_like() in triton/__init__.py.
+          # If the wrapper allocates fp32 DK/DV, cross-Q-tile accumulation stays
+          # fp32; if it allocates bf16/fp16 DK/DV, each later update round-trips
+          # through that lower-precision storage format.
+          dk_val = tl.load(dk_ptrs, mask=grad_mask, other=0.)
+          dk_d = tl.trans(tl.dot(tl.trans(q), dS, out_dtype=tl.float32))
+          tl.store(dk_ptrs, dk_val + dk_d, mask=grad_mask)
+          dv_val = tl.load(dv_ptrs, mask=grad_mask, other=0.)
+          dv_d = tl.trans(tl.dot(tl.trans(do), P_drop.to(DTYPE), out_dtype=tl.float32))
+          tl.store(dv_ptrs, dv_val + dv_d, mask=grad_mask)
 
   # Part 2: dQ — pid as Q-row block index (NON-ATOMIC!)
   start_m = pid * BLOCK_M
@@ -737,37 +743,46 @@ def _ffpa_bwd_v2_kernel_impl(
           mask=(offs_nk[:, None] < seqlen_k) & (d_offs[None, :] < headdim),
           other=0.
         )
-        dq_d = tl.dot(dS_qk, k, out_dtype=tl.float32)
         dq_ptrs = DQ + offs_m[:, None] * stride_dqm + d_offs[None, :]
-        # Same storage-dtype rule as DK/DV above: DQ's global accumulation
-        # precision follows the buffer allocated by _triton_bwd_grad_tensor_like().
-        dq_val = tl.load(dq_ptrs, mask=(offs_m[:, None] < seqlen_q) & (d_offs[None, :] < headdim), other=0.)
-        dq_val += dq_d
-        # NOTE: dQ is written non-atomically — each program owns a unique Q-row block.
-        tl.store(dq_ptrs, dq_val, mask=(offs_m[:, None] < seqlen_q) & (d_offs[None, :] < headdim))
+        dq_mask = (offs_m[:, None] < seqlen_q) & (d_offs[None, :] < headdim)
+        if start_n_k == 0:
+          dq_d = tl.dot(dS_qk, k, out_dtype=tl.float32)
+          tl.store(dq_ptrs, dq_d, mask=dq_mask)
+        else:
+          # Same storage-dtype rule as DK/DV above: later DQ accumulation
+          # precision follows the buffer allocated by _triton_bwd_grad_tensor_like().
+          dq_val = tl.load(dq_ptrs, mask=dq_mask, other=0.)
+          dq_d = tl.dot(dS_qk, k, out_dtype=tl.float32)
+          # NOTE: dQ is written non-atomically — each program owns a unique Q-row block.
+          tl.store(dq_ptrs, dq_val + dq_d, mask=dq_mask)
 
 
-# Non-autotuned v2 variant.
-_ffpa_bwd_v2 = _ffpa_bwd_v2_kernel_impl
+# Non-autotuned main backward variant.
+_ffpa_bwd = _ffpa_bwd_kernel_impl
 # (headdim, mode, bias_grad) -> callable
-_ffpa_bwd_v2_autotune_cache: dict[tuple[int, str, bool], callable] = {}
+_ffpa_bwd_autotune_cache: dict[tuple[int, str, bool], callable] = {}
 
 
-def _get_v2_autotune(headdim: int, autotune_mode: str, bias_requires_grad: bool):
-  """Return a headdim-specific autotune wrapper for the v2 backward kernel."""
+def _get_bwd_autotune(headdim: int, autotune_mode: str, bias_requires_grad: bool):
+  """Return an autotune wrapper for the main backward kernel.
+
+  :param headdim: Runtime head dimension used by the config generator.
+  :param autotune_mode: Search-space mode, ``"fast"`` or ``"max"``.
+  :param bias_requires_grad: Whether GradAttnBias may need reset between
+      autotune candidate runs.
+  :return: Triton autotune wrapper for ``_ffpa_bwd_kernel_impl``.
+  """
   cache_key = (headdim, autotune_mode, bias_requires_grad)
-  if cache_key not in _ffpa_bwd_v2_autotune_cache:
+  if cache_key not in _ffpa_bwd_autotune_cache:
     configs = _gen_bwd_autotune_configs(
-      block_n_values=(64, ),
+      block_n_values=(64, ) if autotune_mode == "fast" else (64, 128),
       headdim=headdim,
       autotune_mode=autotune_mode,
     )
-    reset_args = ["DQ", "DK", "DV"]
+    reset_args = []
     if bias_requires_grad:
-      # Some bias-grad layouts use atomic-add or per-tile partial writes, so
-      # autotune candidate runs must clear GradAttnBias just like DQ/DK/DV.
       reset_args.append("GradAttnBias")
-    _ffpa_bwd_v2_autotune_cache[cache_key] = triton.autotune(
+    _ffpa_bwd_autotune_cache[cache_key] = triton.autotune(
       configs=configs,
       key=[
         "autotune_seqlen_q_bucket",
@@ -778,8 +793,8 @@ def _get_v2_autotune(headdim: int, autotune_mode: str, bias_requires_grad: bool)
       ],
       reset_to_zero=reset_args,
       cache_results=True,
-    )(_ffpa_bwd_v2_kernel_impl)
-  return _ffpa_bwd_v2_autotune_cache[cache_key]
+    )(_ffpa_bwd_kernel_impl)
+  return _ffpa_bwd_autotune_cache[cache_key]
 
 
 def _gen_decode_bwd_stage1_autotune_configs(
@@ -1403,16 +1418,14 @@ def _ffpa_attn_backward_triton_impl(
       num_warps=4,
     )
 
-  # Grid and kernel dispatch.
-  dq.zero_()
-  dk.zero_()
-  dv.zero_()
-
   # Very short query lengths are decode-like: many K tiles contribute to one or
   # a few query rows. The dedicated path keeps DK/DV per K block and reduces dQ
   # explicitly, which is faster than launching the shared-pid matrix kernel for
   # tiny Nq. The causal mask in this path is tail-aligned to SDPA semantics.
   if seqlen_q < 8:
+    dq.zero_()
+    dk.zero_()
+    dv.zero_()
     use_gemv = seqlen_q == 1
     block_m_decode = 8 if use_gemv else 16
     block_n_decode = 64 if use_gemv else 128
@@ -1547,7 +1560,7 @@ def _ffpa_attn_backward_triton_impl(
     )
 
   if autotune:
-    _get_v2_autotune(headdim, autotune_mode, main_bias_requires_grad)[grid](
+    _get_bwd_autotune(headdim, autotune_mode, main_bias_requires_grad)[grid](
       q,
       k,
       v,
@@ -1611,7 +1624,7 @@ def _ffpa_attn_backward_triton_impl(
       DTYPE=DTYPE,
     )
   else:
-    _ffpa_bwd_v2[grid](
+    _ffpa_bwd[grid](
       q,
       k,
       v,
