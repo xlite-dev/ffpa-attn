@@ -2,9 +2,14 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
+
 _AUTOTUNE_SEQLEN_BUCKET_SIZE = 1024
 _AUTOTUNE_SEQLEN_BUCKET_CAP = 8192
 _AUTOTUNE_MAX_SEQLEN_BUCKET_CAP = 16384
+_EXACT_AUTOTUNE_SEQLEN_KEYS: ContextVar[bool] = ContextVar("ffpa_exact_autotune_seqlen_keys", default=False)
 
 
 def _bucket_upper_edge(seqlen: int, bucket_size: int) -> int:
@@ -67,3 +72,31 @@ def bucket_autotune_seqlen(seqlen: int, autotune_mode: str = "fast") -> int:
       return _bucket_upper_edge(seqlen, 1024)
     return _AUTOTUNE_MAX_SEQLEN_BUCKET_CAP
   raise ValueError(f"Unsupported autotune_mode={autotune_mode!r}; choose 'fast' or 'max'.")
+
+
+def autotune_seqlen_key(seqlen: int, autotune_mode: str = "fast") -> int:
+  """Return the sequence-length key used by Triton autotune wrappers.
+
+  Runtime autotune uses bucketed keys to reduce repeated online tuning. The
+  persistent autotune generator switches this helper to exact keys so every
+  target grid shape is independently benchmarked before being written to JSON.
+
+  :param seqlen: Runtime sequence length.
+  :param autotune_mode: Triton autotune search-space mode.
+  :return: Exact or bucketed autotune key.
+  """
+  if _EXACT_AUTOTUNE_SEQLEN_KEYS.get():
+    if seqlen <= 0:
+      raise ValueError(f"Expected positive sequence length, got {seqlen}")
+    return seqlen
+  return bucket_autotune_seqlen(seqlen, autotune_mode)
+
+
+@contextmanager
+def exact_autotune_seqlen_keys() -> Iterator[None]:
+  """Use exact sequence lengths as Triton autotune keys inside the context."""
+  token = _EXACT_AUTOTUNE_SEQLEN_KEYS.set(True)
+  try:
+    yield
+  finally:
+    _EXACT_AUTOTUNE_SEQLEN_KEYS.reset(token)

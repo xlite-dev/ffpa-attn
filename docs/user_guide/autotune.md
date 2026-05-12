@@ -147,8 +147,18 @@ The sequence-length grid is:
 1, 512, 1024, 2048, 4096, 8192, 16384
 ```
 
+The `1` entry is used only for decode query length (`Nq=1`). Decode tuning does
+not generate `Nkv=1` cases because a single-token KV cache is not a meaningful
+decode-attention benchmark target.
+
 The `16384` sequence length is generated only when the current GPU has at least
 48 GiB of memory. Smaller-memory devices skip it.
+
+Persistent config generation tunes every target sequence length in this grid
+with exact Triton autotune keys. It does not reuse the online runtime seqlen
+buckets while generating JSON, so an entry for `512`, `1024`, or `2048` means
+that shape was benchmarked independently. Runtime lookup still performs reuse
+when the workload shape is not an exact persisted entry.
 
 The generated matrix covers:
 
@@ -161,7 +171,7 @@ Forward tasks include self-attention, cross-attention, decode attention
 (`Nq=1`), causal, and non-causal variants.
 
 Backward tasks include main backward shapes (`Nq >= 512`) and decode backward
-shapes (`Nq=1` and a small `Nq < 8` case), with causal and non-causal variants.
+shapes (`Nq=1`, `Nkv>1`), with causal and non-causal variants.
 
 ## Runtime Lookup Rules
 

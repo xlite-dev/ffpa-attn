@@ -21,7 +21,7 @@ import torch
 import triton
 
 from ffpa_attn import __version__, ffpa_attn_func
-from ffpa_attn.triton._autotune_utils import bucket_autotune_seqlen
+from ffpa_attn.triton._autotune_utils import autotune_seqlen_key, exact_autotune_seqlen_keys
 from ffpa_attn.triton._ffpa_bwd import _get_bwd_autotune, _get_decode_bwd_stage1_autotune, _get_pre_autotune
 from ffpa_attn.triton._ffpa_fwd import _get_decode_fwd_stage1_autotune, _get_decode_num_splits, _get_fwd_autotune
 from ffpa_attn.triton._persistent_autotune import (
@@ -89,7 +89,7 @@ def _available_seqlens() -> list[int]:
 def _iter_forward_tasks(dtypes: list[torch.dtype], seqlens: list[int]) -> list[TuneTask]:
   tasks: list[TuneTask] = []
   prefill_seqlens = [value for value in seqlens if value >= 512]
-  decode_kv_seqlens = prefill_seqlens
+  decode_kv_seqlens = [value for value in prefill_seqlens if value > 1]
   for dtype in dtypes:
     for headdim in DEFAULT_HEADDIMS:
       for causal in (False, True):
@@ -106,12 +106,13 @@ def _iter_forward_tasks(dtypes: list[torch.dtype], seqlens: list[int]) -> list[T
 def _iter_backward_tasks(dtypes: list[torch.dtype], seqlens: list[int]) -> list[TuneTask]:
   tasks: list[TuneTask] = []
   prefill_seqlens = [value for value in seqlens if value >= 512]
-  decode_query_seqlens = [1, 4]
+  decode_query_seqlens = [1]
+  decode_kv_seqlens = [value for value in prefill_seqlens if value > 1]
   for dtype in dtypes:
     for headdim in DEFAULT_HEADDIMS:
       for causal in (False, True):
         for seqlen_q in decode_query_seqlens:
-          for seqlen_k in prefill_seqlens:
+          for seqlen_k in decode_kv_seqlens:
             tasks.append(TuneTask("backward", dtype, headdim, seqlen_q, seqlen_k, causal))
         for seqlen_q in prefill_seqlens:
           for seqlen_k in prefill_seqlens:
@@ -147,8 +148,8 @@ def _entry_base(task: TuneTask, mode: str, kernel: str, config: dict[str, Any]) 
     "headdim": task.headdim,
     "seqlen_q": task.seqlen_q,
     "seqlen_k": task.seqlen_k,
-    "seqlen_q_bucket": bucket_autotune_seqlen(task.seqlen_q, mode),
-    "seqlen_k_bucket": bucket_autotune_seqlen(task.seqlen_k, mode),
+    "seqlen_q_bucket": autotune_seqlen_key(task.seqlen_q, mode),
+    "seqlen_k_bucket": autotune_seqlen_key(task.seqlen_k, mode),
     "config": config,
   }
 
@@ -219,13 +220,13 @@ def _tune_forward(
   del out
   num_splits = _get_decode_num_splits(task.seqlen_q, task.seqlen_k, task.headdim, batch, heads, q.device)
   if num_splits == 1:
-    wrapper = _get_fwd_autotune(task.headdim, mode)
+    wrapper = _get_fwd_autotune(task.headdim, mode, _dtype_schema_name(task.dtype))
     kernel = "fwd_generic"
     entry = _entry_base(task, mode, kernel, config_from_triton_config(wrapper.best_config))
     choices_count = len(wrapper.configs)
   else:
     use_gemv = task.seqlen_q == 1
-    wrapper = _get_decode_fwd_stage1_autotune(task.headdim, use_gemv, mode)
+    wrapper = _get_decode_fwd_stage1_autotune(task.headdim, use_gemv, mode, _dtype_schema_name(task.dtype))
     kernel = "decode_fwd_stage1"
     entry = _entry_base(task, mode, kernel, config_from_triton_config(wrapper.best_config))
     entry["use_gemv"] = use_gemv
@@ -255,7 +256,7 @@ def _tune_backward(
   )
   out.float().sum().backward()
 
-  pre_wrapper = _get_pre_autotune(False, mode)
+  pre_wrapper = _get_pre_autotune(False, mode, _dtype_schema_name(task.dtype))
   pre_entry = _entry_base(task, mode, "bwd_preproc", config_from_triton_config(pre_wrapper.best_config))
   pre_entry["preprocess_d_chunk"] = False
   _record_entry(entries, pre_entry)
@@ -349,26 +350,27 @@ def main() -> int:
 
   entries: dict[tuple[Any, ...], dict[str, Any]] = {}
   print(f"Generating {len(tasks)} FFPA Triton tuned config task(s) for {output_path}")
-  for index, task in enumerate(tasks, start=1):
-    try:
-      start_time = time.perf_counter()
-      if task.direction == "forward":
-        tuned_entries = _tune_forward(task, args.B, args.H, args.mode, entries)
-      else:
-        tuned_entries = _tune_backward(task, args.B, args.H, args.mode, entries)
-      torch.cuda.synchronize()
-      elapsed = time.perf_counter() - start_time
-      for tuned_entry, choices_count in tuned_entries:
-        print(
-          f"[AUTOTUNED][{index}/{len(tasks)}] {_format_entry(tuned_entry, choices_count, args.B, args.H)}, t={elapsed:.3f}s",
-          flush=True,
-        )
-    except RuntimeError as exc:
-      if "out of memory" not in str(exc).lower():
-        raise
-      elapsed = time.perf_counter() - start_time
-      print(f"[AUTOTUNE-SKIPPED][{index}/{len(tasks)}] OOM after {elapsed:.3f}s: {exc}", flush=True)
-      torch.cuda.empty_cache()
+  with exact_autotune_seqlen_keys():
+    for index, task in enumerate(tasks, start=1):
+      try:
+        start_time = time.perf_counter()
+        if task.direction == "forward":
+          tuned_entries = _tune_forward(task, args.B, args.H, args.mode, entries)
+        else:
+          tuned_entries = _tune_backward(task, args.B, args.H, args.mode, entries)
+        torch.cuda.synchronize()
+        elapsed = time.perf_counter() - start_time
+        for tuned_entry, choices_count in tuned_entries:
+          print(
+            f"[AUTOTUNED][{index}/{len(tasks)}] {_format_entry(tuned_entry, choices_count, args.B, args.H)}, t={elapsed:.3f}s",
+            flush=True,
+          )
+      except RuntimeError as exc:
+        if "out of memory" not in str(exc).lower():
+          raise
+        elapsed = time.perf_counter() - start_time
+        print(f"[AUTOTUNE-SKIPPED][{index}/{len(tasks)}] OOM after {elapsed:.3f}s: {exc}", flush=True)
+        torch.cuda.empty_cache()
 
   ordered_entries = sorted(
     entries.values(),

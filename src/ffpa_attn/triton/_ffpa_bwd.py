@@ -69,7 +69,7 @@ import torch
 import triton
 import triton.language as tl
 
-from ._autotune_utils import bucket_autotune_seqlen
+from ._autotune_utils import autotune_seqlen_key
 from ._persistent_autotune import PersistentConfigRequest, dtype_name, lookup_persistent_config
 
 
@@ -309,11 +309,11 @@ def _gen_pre_autotune_configs(d_chunk: bool, autotune_mode: str = "max") -> list
   return configs
 
 
-_ffpa_bwd_pre_autotune_cache: dict[tuple[bool, str], callable] = {}
+_ffpa_bwd_pre_autotune_cache: dict[tuple[bool, str, str], callable] = {}
 
 
-def _get_pre_autotune(d_chunk: bool, autotune_mode: str):
-  cache_key = (d_chunk, autotune_mode)
+def _get_pre_autotune(d_chunk: bool, autotune_mode: str, dtype: str):
+  cache_key = (d_chunk, autotune_mode, dtype)
   if cache_key not in _ffpa_bwd_pre_autotune_cache:
     _ffpa_bwd_pre_autotune_cache[cache_key] = triton.autotune(
       configs=_gen_pre_autotune_configs(d_chunk=d_chunk, autotune_mode=autotune_mode),
@@ -1319,8 +1319,8 @@ def _ffpa_attn_backward_triton_impl(
   _, _, seqlen_k, _ = k.shape
   softmax_scale = softmax_scale or (1.0 / math.sqrt(headdim))
   seqlen_q_rounded = lse.shape[-1]
-  autotune_seqlen_q_bucket = bucket_autotune_seqlen(seqlen_q, autotune_mode)
-  autotune_seqlen_k_bucket = bucket_autotune_seqlen(seqlen_k, autotune_mode)
+  autotune_seqlen_q_bucket = autotune_seqlen_key(seqlen_q, autotune_mode)
+  autotune_seqlen_k_bucket = autotune_seqlen_key(seqlen_k, autotune_mode)
   autotune_causal_key = int(causal)
   has_attn_bias = attn_bias is not None
   attn_bias_in = attn_bias if attn_bias is not None else q
@@ -1379,7 +1379,7 @@ def _ffpa_attn_backward_triton_impl(
     def pre_grid(meta: dict) -> tuple[int, int]:
       return (triton.cdiv(seqlen_q, meta["BLOCK_M"]), batch * nheads)
 
-    pre_kernel = _get_pre_autotune(preprocess_d_chunk, autotune_mode)
+    pre_kernel = _get_pre_autotune(preprocess_d_chunk, autotune_mode, runtime_dtype)
     pre_kernel[pre_grid](
       o,
       do,
