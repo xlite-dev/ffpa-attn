@@ -642,21 +642,20 @@ def _ffpa_bwd_kernel_impl(
 
         if start_m == begin_m:
           dk_d = tl.trans(tl.dot(tl.trans(q), dS, out_dtype=tl.float32))
-          tl.store(dk_ptrs, dk_d, mask=grad_mask)
+          tl.store(dk_ptrs, dk_d, mask=grad_mask, eviction_policy="evict_last")
           dv_d = tl.trans(tl.dot(tl.trans(do), P_drop.to(DTYPE), out_dtype=tl.float32))
-          tl.store(dv_ptrs, dv_d, mask=grad_mask)
+          tl.store(dv_ptrs, dv_d, mask=grad_mask, eviction_policy="evict_last")
         else:
-          # NOTE: These global load/store ops use DK/DV's storage dtype, which
-          # is chosen by _triton_bwd_grad_tensor_like() in triton/__init__.py.
-          # If the wrapper allocates fp32 DK/DV, cross-Q-tile accumulation stays
-          # fp32; if it allocates bf16/fp16 DK/DV, each later update round-trips
-          # through that lower-precision storage format.
-          dk_val = tl.load(dk_ptrs, mask=grad_mask, other=0.)
+          # NOTE: These global load/store ops use each gradient buffer's storage
+          # dtype, which is chosen by _triton_bwd_grad_tensor_like() in
+          # triton/__init__.py. dV can optionally use fp32 internal storage;
+          # otherwise each later update round-trips through bf16/fp16 storage.
+          dk_val = tl.load(dk_ptrs, mask=grad_mask, other=0., eviction_policy="evict_last")
           dk_d = tl.trans(tl.dot(tl.trans(q), dS, out_dtype=tl.float32))
-          tl.store(dk_ptrs, dk_val + dk_d, mask=grad_mask)
-          dv_val = tl.load(dv_ptrs, mask=grad_mask, other=0.)
+          tl.store(dk_ptrs, dk_val + dk_d, mask=grad_mask, eviction_policy="evict_last")
+          dv_val = tl.load(dv_ptrs, mask=grad_mask, other=0., eviction_policy="evict_last")
           dv_d = tl.trans(tl.dot(tl.trans(do), P_drop.to(DTYPE), out_dtype=tl.float32))
-          tl.store(dv_ptrs, dv_val + dv_d, mask=grad_mask)
+          tl.store(dv_ptrs, dv_val + dv_d, mask=grad_mask, eviction_policy="evict_last")
 
   # Part 2: dQ — pid as Q-row block index (NON-ATOMIC!)
   start_m = pid * BLOCK_M
@@ -747,14 +746,14 @@ def _ffpa_bwd_kernel_impl(
         dq_mask = (offs_m[:, None] < seqlen_q) & (d_offs[None, :] < headdim)
         if start_n_k == 0:
           dq_d = tl.dot(dS_qk, k, out_dtype=tl.float32)
-          tl.store(dq_ptrs, dq_d, mask=dq_mask)
+          tl.store(dq_ptrs, dq_d, mask=dq_mask, eviction_policy="evict_last")
         else:
           # Same storage-dtype rule as DK/DV above: later DQ accumulation
           # precision follows the buffer allocated by _triton_bwd_grad_tensor_like().
-          dq_val = tl.load(dq_ptrs, mask=dq_mask, other=0.)
+          dq_val = tl.load(dq_ptrs, mask=dq_mask, other=0., eviction_policy="evict_last")
           dq_d = tl.dot(dS_qk, k, out_dtype=tl.float32)
           # NOTE: dQ is written non-atomically — each program owns a unique Q-row block.
-          tl.store(dq_ptrs, dq_val + dq_d, mask=dq_mask)
+          tl.store(dq_ptrs, dq_val + dq_d, mask=dq_mask, eviction_policy="evict_last")
 
 
 # Non-autotuned main backward variant.
@@ -1722,7 +1721,7 @@ def _ffpa_attn_backward_triton(
   preprocess_d_chunk: bool = False,
   attn_bias: torch.Tensor | None = None,
   return_attn_bias_grad: bool = False,
-  grad_qkv_storage_dtype: torch.dtype | None = None,
+  grad_v_storage_dtype: torch.dtype | None = None,
   dropout_p: float = 0.0,
   philox_seed: int = 0,
   philox_offset: int = 0,
@@ -1761,18 +1760,19 @@ def _ffpa_attn_backward_triton(
     ``[B, Nh_q, Nq, Nkv]``.
   :param return_attn_bias_grad: Whether to materialize the expanded additive
     mask gradient for autograd.
-  :param grad_qkv_storage_dtype: Optional storage dtype for the internal
-    Triton ``DQ`` / ``DK`` / ``DV`` buffers. ``None`` keeps q/k/v dtypes;
-    ``torch.float32`` upgrades the intermediate global accumulation storage.
+  :param grad_v_storage_dtype: Optional storage dtype for the internal Triton
+    ``DV`` buffer. ``None`` keeps v's dtype; ``torch.float32`` upgrades dV's
+    cross-tile global accumulation storage while leaving dQ/dK storage in the
+    original q/k dtype.
   :returns: ``(dq, dk, dv, d_attn_bias)`` where ``dq`` has shape ``[B, Nh_q, Nq, D]`` and
     ``dk`` / ``dv`` have shape ``[B, Nh_kv, Nkv, D]``. Returned tensors use
     the original ``q`` / ``k`` / ``v`` dtypes and head layouts. ``d_attn_bias``
     is the expanded bias gradient when requested, otherwise ``None``.
   """
-  if grad_qkv_storage_dtype not in (None, torch.float32):
+  if grad_v_storage_dtype not in (None, torch.float32):
     raise ValueError(
-      "_ffpa_attn_backward_triton: grad_qkv_storage_dtype must be None or torch.float32, "
-      f"got {grad_qkv_storage_dtype!r}"
+      "_ffpa_attn_backward_triton: grad_v_storage_dtype must be None or torch.float32, "
+      f"got {grad_v_storage_dtype!r}"
     )
   seqlen_q = q.size(2)
   seqlen_q_rounded = ((seqlen_q + 127) // 128) * 128
@@ -1810,7 +1810,7 @@ def _ffpa_attn_backward_triton(
     int(autotune_mode == "max"),
     int(preprocess_d_chunk),
     int(return_attn_bias_grad and attn_bias is not None),
-    int(grad_qkv_storage_dtype == torch.float32),
+    int(grad_v_storage_dtype == torch.float32),
     dropout_p,
     philox_seed,
     philox_offset,

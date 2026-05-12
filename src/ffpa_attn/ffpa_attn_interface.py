@@ -122,16 +122,15 @@ def ffpa_attn_func(
       Supported keys are ``stages``, ``acc``, ``enable_tma``,
       ``high_precision_grad``, ``forward_backend``,
       ``triton_forward_autotune``, ``triton_autotune_mode``,
-      ``backward_backend``, ``triton_backward_autotune``, and
+      ``backward_backend``, ``triton_backward_autotune``,
       ``triton_backward_preprocess_d_chunk``, and
-      ``triton_backward_grad_qkv_storage_dtype``. ``forward_backend`` only affects ``D > 256``.
+      ``triton_backward_grad_v_storage_dtype``. ``forward_backend`` only affects ``D > 256``.
       ``enable_tma`` is reserved for future Triton kernels and is currently a
       no-op. ``backward_backend`` supports ``"triton"`` and ``"sdpa"``.
-      ``triton_backward_grad_qkv_storage_dtype`` defaults to ``None`` and
+      ``triton_backward_grad_v_storage_dtype`` defaults to ``None`` and
       currently only accepts ``torch.float32`` as an override for Triton
-      backward's internal ``DQ`` / ``DK`` / ``DV`` storage dtype. These
-      options do not change the autograd contract; unknown keys raise
-      ``TypeError``.
+      backward's internal ``DV`` storage dtype. These options do not change
+      the autograd contract; unknown keys raise ``TypeError``.
 
   :returns: Output tensor ``O`` with layout ``[B, Nh_q, Nq, D]``,
       filled with the attention output ``softmax(scale * QK^T) V``.
