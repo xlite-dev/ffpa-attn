@@ -67,7 +67,7 @@ class TuneTask:
   nheads_kv: int = 32
   has_attn_bias: bool = False
   has_dropout: bool = False
-  case_name: str = "baseline"
+  case_name: str = "common"
 
 
 def _parse_dtypes(value: str) -> list[torch.dtype]:
@@ -315,7 +315,7 @@ def _format_entry(entry: dict[str, Any], choices_count: int, batch: int) -> str:
   nheads_kv = int(entry.get("nheads_kv", nheads_q))
   shape = (
     f"{direction}:{entry['kernel']}("
-    f"case={entry.get('case_name', 'baseline')},{entry['dtype']},B{batch},Hq/Hkv={nheads_q}/{nheads_kv},"
+    f"case={entry.get('case_name', 'common')},{entry['dtype']},B{batch},Hq/Hkv={nheads_q}/{nheads_kv},"
     f"Q{entry['seqlen_q']},K{entry['seqlen_k']},D{entry['headdim']},"
     f"C{int(bool(entry['causal']))},mask={int(bool(entry.get('has_attn_bias', False)))},"
     f"drop={int(bool(entry.get('has_dropout', False)))},gqa={int(nheads_q != nheads_kv)}"
@@ -396,7 +396,7 @@ def _tune_backward(
     "has_attn_bias": False,
     "has_dropout": False,
     "nheads_kv": task.nheads_q,
-    "case_name": "baseline",
+    "case_name": "common",
   })
   _record_entry(entries, pre_entry)
   pre_choices_count = len(pre_wrapper.configs)
@@ -527,7 +527,7 @@ def main() -> int:
       item["direction"],
       item["kernel"],
       item["dtype"],
-      item.get("case_name", "baseline"),
+      item.get("case_name", "common"),
       item["headdim"],
       item["seqlen_q"],
       item["seqlen_k"],
