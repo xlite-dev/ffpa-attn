@@ -54,7 +54,7 @@ _KERNEL_CONFIG_KEYS = {
     "num_ctas",
     "maxnreg",
   },
-  "bwd_main": {
+  "bwd_generic": {
     "BLOCK_M",
     "BLOCK_N",
     "BLOCK_HEADDIM",

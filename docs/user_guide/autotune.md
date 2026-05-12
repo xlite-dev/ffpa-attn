@@ -176,7 +176,7 @@ Backward lookup additionally filters by:
 
 | Field | Meaning |
 | --- | --- |
-| `kernel` | `bwd_preprocess`, `bwd_main`, or `decode_bwd_stage1`. |
+| `kernel` | `bwd_preprocess`, `bwd_generic`, or `decode_bwd_stage1`. |
 | `preprocess_d_chunk` | Applies to the delta preprocess kernel. |
 | `bias_grad` | Whether attention-bias gradients are requested. |
 | `grad_v_storage_dtype` | Optional internal `dV` storage override. |

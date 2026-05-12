@@ -1665,7 +1665,7 @@ def _ffpa_attn_backward_triton_impl(
     main_config = lookup_persistent_config(
       PersistentConfigRequest(
         direction="backward",
-        kernel="bwd_main",
+        kernel="bwd_generic",
         autotune_mode=autotune_mode,
         dtype=runtime_dtype,
         headdim=headdim,

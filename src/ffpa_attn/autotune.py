@@ -274,7 +274,7 @@ def _tune_backward(
     choices_count = len(wrapper.configs)
   else:
     wrapper = _get_bwd_autotune(task.headdim, mode, False)
-    entry = _entry_base(task, mode, "bwd_main", config_from_triton_config(wrapper.best_config))
+    entry = _entry_base(task, mode, "bwd_generic", config_from_triton_config(wrapper.best_config))
     entry.update({
       "bias_grad": False,
       "grad_v_storage_dtype": None,

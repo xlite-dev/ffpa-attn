@@ -97,7 +97,7 @@ def test_lookup_backward_filters_variants(tmp_path, monkeypatch):
     _payload([
       {
         "direction": "backward",
-        "kernel": "bwd_main",
+        "kernel": "bwd_generic",
         "autotune_mode": "fast",
         "causal": True,
         "dtype": "fp16",
@@ -117,7 +117,7 @@ def test_lookup_backward_filters_variants(tmp_path, monkeypatch):
       },
       {
         "direction": "backward",
-        "kernel": "bwd_main",
+        "kernel": "bwd_generic",
         "autotune_mode": "fast",
         "causal": True,
         "dtype": "fp16",
@@ -141,7 +141,7 @@ def test_lookup_backward_filters_variants(tmp_path, monkeypatch):
 
   request = persistent.PersistentConfigRequest(
     direction="backward",
-    kernel="bwd_main",
+    kernel="bwd_generic",
     autotune_mode="fast",
     dtype="fp16",
     headdim=512,
