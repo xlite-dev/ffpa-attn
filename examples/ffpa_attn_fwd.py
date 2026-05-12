@@ -199,6 +199,37 @@ def _maybe_norm_qkv(
   return q, k, v
 
 
+def _max_abs_diff(lhs: torch.Tensor, rhs: torch.Tensor) -> float:
+  """Return max abs diff after promoting both tensors to fp32.
+
+  :param lhs: First tensor.
+  :param rhs: Second tensor.
+  :return: Maximum absolute difference in fp32.
+  """
+  return (lhs.float() - rhs.float()).abs().max().item()
+
+
+def _mean_abs_diff(lhs: torch.Tensor, rhs: torch.Tensor) -> float:
+  """Return mean abs diff after promoting both tensors to fp32.
+
+  :param lhs: First tensor.
+  :param rhs: Second tensor.
+  :return: Mean absolute difference in fp32.
+  """
+  return (lhs.float() - rhs.float()).abs().mean().item()
+
+
+def _tensor_allclose(lhs: torch.Tensor, rhs: torch.Tensor, tol: float) -> bool:
+  """Return whether two tensors are close after promoting both to fp32.
+
+  :param lhs: First tensor.
+  :param rhs: Second tensor.
+  :param tol: Absolute and relative tolerance.
+  :return: ``True`` when the promoted tensors satisfy ``torch.allclose``.
+  """
+  return torch.allclose(lhs.float(), rhs.float(), atol=tol, rtol=tol)
+
+
 def _format_forward_result(result: FORWARD_RESULT) -> str:
   """Format one forward benchmark result for CLI output.
 
@@ -265,9 +296,8 @@ def _run_case(
   torch.manual_seed(seed + 17)
   out_sdpa = _sdpa_ref(q, k_ref, v_ref, is_causal=causal, attn_mask=attn_mask, dropout_p=dropout_p)
 
-  diff = (out_ffpa.float() - out_sdpa.float()).abs()
   tol = 5e-2 if dtype == torch.bfloat16 else 2e-2
-  ok = torch.allclose(out_ffpa, out_sdpa, atol=tol, rtol=tol)
+  ok = _tensor_allclose(out_ffpa, out_sdpa, tol)
 
   ms_ffpa = _time_fn(
     lambda q, k, v: ffpa_attn_func(
@@ -311,8 +341,8 @@ def _run_case(
     "causal": causal,
     "dropout_p": dropout_p,
     "acc": acc,
-    "max_diff": diff.max().item(),
-    "mean_diff": diff.mean().item(),
+    "max_diff": _max_abs_diff(out_ffpa, out_sdpa),
+    "mean_diff": _mean_abs_diff(out_ffpa, out_sdpa),
     "allclose": ok,
     "tolerance": tol,
     "ffpa_ms": ms_ffpa,
