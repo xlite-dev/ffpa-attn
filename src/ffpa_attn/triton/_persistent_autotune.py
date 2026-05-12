@@ -91,7 +91,12 @@ class PersistentConfigRequest:
   :param bias_grad: Whether the current backward call writes attention-bias gradients.
   :param grad_v_storage_dtype: Optional Triton backward dV storage dtype name.
   :param use_gemv: Decode backward single-query specialization flag.
+  :param has_attn_bias: Whether an additive attention bias is active.
   :param has_dropout: Whether dropout is active.
+  :param nheads_q: Optional runtime query-head count, kept for callers that
+      want to describe the request. Lookup does not require it to match.
+  :param nheads_kv: Optional runtime key/value-head count before backward
+      GQA/MQA expansion. Lookup does not require it to match.
   """
 
   direction: str
@@ -106,7 +111,10 @@ class PersistentConfigRequest:
   bias_grad: bool | None = None
   grad_v_storage_dtype: str | None = None
   use_gemv: bool | None = None
+  has_attn_bias: bool | None = None
   has_dropout: bool | None = None
+  nheads_q: int | None = None
+  nheads_kv: int | None = None
 
 
 def default_config_dir() -> Path:
@@ -301,6 +309,23 @@ def clear_config_cache() -> None:
   _CONFIG_CACHE.clear()
 
 
+def _head_layout_rank(entry: dict[str, Any], request: PersistentConfigRequest) -> int:
+  """Rank head-layout metadata without making it a compatibility filter.
+
+  :param entry: Persisted config entry.
+  :param request: Runtime lookup request.
+  :return: ``0`` for an exact recorded head-layout match, otherwise ``1``.
+  """
+  if request.nheads_q is None or request.nheads_kv is None:
+    return 1
+  try:
+    if int(entry.get("nheads_q")) == request.nheads_q and int(entry.get("nheads_kv")) == request.nheads_kv:
+      return 0
+  except (TypeError, ValueError):
+    pass
+  return 1
+
+
 def lookup_persistent_config(request: PersistentConfigRequest) -> dict[str, Any] | None:
   """Find the best persisted launch config for a runtime request.
 
@@ -330,6 +355,8 @@ def lookup_persistent_config(request: PersistentConfigRequest) -> dict[str, Any]
     if request.grad_v_storage_dtype is None and entry.get("grad_v_storage_dtype") is not None:
       continue
     if request.use_gemv is not None and bool(entry.get("use_gemv", False)) != request.use_gemv:
+      continue
+    if request.has_attn_bias is not None and bool(entry.get("has_attn_bias", False)) != request.has_attn_bias:
       continue
     if request.has_dropout is not None and bool(entry.get("has_dropout", False)) != request.has_dropout:
       continue
@@ -365,5 +392,5 @@ def lookup_persistent_config(request: PersistentConfigRequest) -> dict[str, Any]
 
   if not candidates:
     return None
-  selected = candidates[0]
+  selected = min(candidates, key=lambda entry: _head_layout_rank(entry, request))
   return sanitize_kernel_config(request.kernel, selected["config"])

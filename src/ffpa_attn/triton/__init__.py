@@ -162,7 +162,7 @@ torch.library.define(
   "(Tensor dO, Tensor q, Tensor k, Tensor v, Tensor o, Tensor lse, Tensor? attn_bias, "
   "float softmax_scale, int causal, int autotune, "
   "int autotune_mode_is_max, int preprocess_d_chunk, int return_attn_bias_grad, int grad_v_storage_dtype_is_fp32, "
-  "float dropout_p, int philox_seed, int philox_offset) "
+  "int original_nheads_kv, float dropout_p, int philox_seed, int philox_offset) "
   "-> (Tensor dq, Tensor dk, Tensor dv, Tensor grad_attn_bias)",
 )
 
@@ -183,6 +183,7 @@ def _bwd_triton_torch_op(
   preprocess_d_chunk: int,
   return_attn_bias_grad: int,
   grad_v_storage_dtype_is_fp32: int,
+  original_nheads_kv: int,
   dropout_p: float,
   philox_seed: int,
   philox_offset: int,
@@ -218,6 +219,7 @@ def _bwd_triton_torch_op(
     autotune=bool(autotune),
     autotune_mode="max" if autotune_mode_is_max else "fast",
     preprocess_d_chunk=bool(preprocess_d_chunk),
+    original_nheads_kv=original_nheads_kv,
     dropout_p=dropout_p,
     philox_seed=philox_seed,
     philox_offset=philox_offset,
@@ -241,6 +243,7 @@ def _bwd_triton_fake(
   preprocess_d_chunk: int,
   return_attn_bias_grad: int,
   grad_v_storage_dtype_is_fp32: int,
+  original_nheads_kv: int,
   dropout_p: float,
   philox_seed: int,
   philox_offset: int,
@@ -251,7 +254,7 @@ def _bwd_triton_fake(
     autotune,
     autotune_mode_is_max,
     preprocess_d_chunk,
-    grad_v_storage_dtype_is_fp32,
+    original_nheads_kv,
     dropout_p,
     philox_seed,
     philox_offset,

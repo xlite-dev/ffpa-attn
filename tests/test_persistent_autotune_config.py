@@ -156,6 +156,148 @@ def test_lookup_backward_filters_variants(tmp_path, monkeypatch):
   assert persistent.lookup_persistent_config(request.__class__(**{**request.__dict__, "has_dropout": True})) is None
 
 
+def test_lookup_filters_mask_dropout_but_not_head_layout(tmp_path, monkeypatch):
+  _patch_cuda_device(monkeypatch)
+  monkeypatch.setenv(persistent.CONFIG_ENV_VAR, str(tmp_path))
+  persistent.clear_config_cache()
+  path = persistent.device_config_path(tmp_path, "NVIDIA L20")
+  persistent.write_config_file(
+    _payload([
+      {
+        "direction": "forward",
+        "kernel": "fwd_generic",
+        "autotune_mode": "fast",
+        "causal": False,
+        "dtype": "bf16",
+        "headdim": 512,
+        "seqlen_q": 1024,
+        "seqlen_k": 1024,
+        "config": {
+          "BLOCK_M": 64,
+          "BLOCK_N": 64,
+          "BLOCK_HEADDIM_QK": 64,
+          "BLOCK_HEADDIM_V": 64,
+          "num_warps": 8
+        },
+      },
+      {
+        "direction": "forward",
+        "kernel": "fwd_generic",
+        "autotune_mode": "fast",
+        "causal": False,
+        "dtype": "bf16",
+        "headdim": 512,
+        "seqlen_q": 1024,
+        "seqlen_k": 1024,
+        "nheads_q": 8,
+        "nheads_kv": 8,
+        "has_attn_bias": True,
+        "has_dropout": False,
+        "config": {
+          "BLOCK_M": 128,
+          "BLOCK_N": 64,
+          "BLOCK_HEADDIM_QK": 64,
+          "BLOCK_HEADDIM_V": 64,
+          "num_warps": 8
+        },
+      },
+      {
+        "direction": "forward",
+        "kernel": "fwd_generic",
+        "autotune_mode": "fast",
+        "causal": False,
+        "dtype": "bf16",
+        "headdim": 512,
+        "seqlen_q": 1024,
+        "seqlen_k": 1024,
+        "nheads_q": 8,
+        "nheads_kv": 8,
+        "has_attn_bias": False,
+        "has_dropout": True,
+        "config": {
+          "BLOCK_M": 64,
+          "BLOCK_N": 64,
+          "BLOCK_HEADDIM_QK": 128,
+          "BLOCK_HEADDIM_V": 128,
+          "num_warps": 8
+        },
+      },
+      {
+        "direction": "forward",
+        "kernel": "fwd_generic",
+        "autotune_mode": "fast",
+        "causal": False,
+        "dtype": "bf16",
+        "headdim": 512,
+        "seqlen_q": 1024,
+        "seqlen_k": 1024,
+        "nheads_q": 8,
+        "nheads_kv": 2,
+        "has_attn_bias": False,
+        "has_dropout": False,
+        "config": {
+          "BLOCK_M": 128,
+          "BLOCK_N": 64,
+          "BLOCK_HEADDIM_QK": 128,
+          "BLOCK_HEADDIM_V": 128,
+          "num_warps": 4
+        },
+      },
+      {
+        "direction": "forward",
+        "kernel": "fwd_generic",
+        "autotune_mode": "fast",
+        "causal": False,
+        "dtype": "bf16",
+        "headdim": 512,
+        "seqlen_q": 1024,
+        "seqlen_k": 1024,
+        "nheads_q": 8,
+        "nheads_kv": 1,
+        "has_attn_bias": False,
+        "has_dropout": False,
+        "config": {
+          "BLOCK_M": 64,
+          "BLOCK_N": 64,
+          "BLOCK_HEADDIM_QK": 128,
+          "BLOCK_HEADDIM_V": 128,
+          "num_warps": 4
+        },
+      },
+    ]),
+    path,
+  )
+
+  request = persistent.PersistentConfigRequest(
+    direction="forward",
+    kernel="fwd_generic",
+    autotune_mode="fast",
+    dtype="bf16",
+    headdim=512,
+    seqlen_q=1024,
+    seqlen_k=1024,
+    causal=False,
+    has_attn_bias=False,
+    has_dropout=False,
+    nheads_q=8,
+    nheads_kv=8,
+  )
+  assert persistent.lookup_persistent_config(request)["BLOCK_M"] == 64
+  assert persistent.lookup_persistent_config(request.__class__(**{
+    **request.__dict__, "has_attn_bias": True
+  }))["BLOCK_M"] == 128
+  assert persistent.lookup_persistent_config(request.__class__(**{
+    **request.__dict__, "has_dropout": True
+  }))["BLOCK_HEADDIM_QK"] == 128
+  assert persistent.lookup_persistent_config(request.__class__(**{
+    **request.__dict__, "nheads_kv": 1
+  }))["BLOCK_HEADDIM_QK"] == 128
+  assert persistent.lookup_persistent_config(request.__class__(**{
+    **request.__dict__, "nheads_q": 16,
+    "nheads_kv": 4
+  }))["BLOCK_M"] == 64
+
+
 def test_missing_or_wrong_schema_config_falls_back(tmp_path, monkeypatch):
   _patch_cuda_device(monkeypatch)
   monkeypatch.setenv(persistent.CONFIG_ENV_VAR, str(tmp_path))

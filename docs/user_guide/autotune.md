@@ -63,11 +63,29 @@ By default, the command refuses to overwrite an existing device config. Use
 python -m ffpa_attn.autotune --mode fast --overwrite
 ```
 
-The first version supports `B=1` and `H=32` for config generation:
+The generator defaults to `B=1` and `H=32`. You can change them when your
+deployment shape uses a different batch size or query-head count:
 
 ```bash
 python -m ffpa_attn.autotune --mode fast --B 1 --H 32 --overwrite
 ```
+
+By default, the generated task grid covers the baseline no-mask, no-dropout,
+equal-head cases. Add `--full-tasks` to also tune canonical `attn_mask`,
+dropout, GQA, and MQA variants modeled after `examples/perf.py`:
+
+```bash
+python -m ffpa_attn.autotune \
+	--mode fast \
+	--directions both \
+	--dtypes bf16,fp16 \
+	--full-tasks \
+	--overwrite
+```
+
+`--full-tasks` can increase autotune time substantially because each additional
+variant is benchmarked separately. It is intentionally disabled by default so
+existing generation jobs keep their current coverage and runtime.
 
 You can generate only forward configs, only backward configs, or both:
 
@@ -173,6 +191,20 @@ Forward tasks include self-attention, cross-attention, decode attention
 Backward tasks include main backward shapes (`Nq >= 512`) and decode backward
 shapes (`Nq=1`, `Nkv>1`), with causal and non-causal variants.
 
+When `--full-tasks` is enabled, the generator adds square prefill variants for
+each tuned sequence length:
+
+| Case | Shape / variant |
+| --- | --- |
+| `attn-mask` | Compact additive key-position mask `[1, 1, 1, Nkv]`. Backward tunes the bias-gradient path. |
+| `dropout` | `dropout_p=0.1`, using the Triton dropout path. |
+| `gqa` | `Hq=H`, `Hkv` chosen with the same divisor rule as `examples/perf.py`. |
+| `mqa` | `Hq=H`, `Hkv=1`. |
+
+These are single-feature canonical variants, not a full Cartesian product. For
+example, `--full-tasks` tunes `gqa` and `dropout` separately, but it does not
+generate a combined GQA+dropout case.
+
 ## Runtime Lookup Rules
 
 When runtime autotune is disabled, FFPA tries to load the current device JSON.
@@ -188,6 +220,8 @@ Forward lookup filters by:
 | `autotune_mode` | Must match `triton_autotune_mode`. |
 | `dtype` | `fp16` or `bf16`. |
 | `causal` | Must match `is_causal`. |
+| `has_attn_bias` | Whether `attn_mask` / additive bias is present. |
+| `has_dropout` | Whether dropout is active. |
 
 Backward lookup additionally filters by:
 
@@ -199,6 +233,19 @@ Backward lookup additionally filters by:
 | `grad_v_storage_dtype` | Optional internal `dV` storage override. |
 | `use_gemv` | Decode backward single-query specialization. |
 | `has_dropout` | Whether dropout replay is active. |
+| `has_attn_bias` | Whether additive bias is active. |
+
+Generated entries may include `nheads_q` and `nheads_kv` for logging and JSON
+metadata. Runtime lookup can prefer an exact recorded head layout when one is
+available, but it does not require the head layout to match. Batch size and
+head count commonly vary across workloads, so FFPA reuses the same launch
+config across compatible mask/dropout/causal/kernel variants instead of missing
+the persistent config because `Hq` or `Hkv` changed.
+
+Configs generated before these variant fields existed are treated as no-mask,
+no-dropout entries. They can still satisfy baseline requests, while
+`has_attn_bias` and `has_dropout` continue to prevent semantically different
+kernel variants from being mixed.
 
 After variant filtering, FFPA chooses the nearest persisted head dimension. Ties
 prefer the larger candidate. Examples:
@@ -256,7 +303,7 @@ A typical workflow is:
 
 	```bash
 	CUDA_VISIBLE_DEVICES=0 \
-	python -m ffpa_attn.autotune --mode fast --directions both --dtypes bf16,fp16 --overwrite
+	python -m ffpa_attn.autotune --mode fast --directions both --dtypes bf16,fp16 --full-tasks --overwrite
 	```
 
 3. Commit the generated JSON under `src/ffpa_attn/triton/configs/`.
@@ -269,9 +316,6 @@ A typical workflow is:
 		 v,
 		 forward_backend="triton",
 		 backward_backend="triton",
-		 triton_forward_autotune=False,
-		 triton_backward_autotune=False,
-		 triton_autotune_mode="fast",
 	)
 	```
 

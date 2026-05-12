@@ -107,6 +107,32 @@ def test_persistent_autotune_decode_tasks_skip_nkv1_and_nq4():
   assert all(task.seqlen_q == 1 and task.seqlen_k > 1 for task in backward_decode_tasks)
 
 
+def test_persistent_autotune_default_tasks_keep_baseline_variants():
+  dtypes = [torch.bfloat16]
+  seqlens = [1, 512]
+
+  tasks = _iter_forward_tasks(dtypes, seqlens, heads=8) + _iter_backward_tasks(dtypes, seqlens, heads=8)
+
+  assert tasks
+  assert all(task.nheads_q == 8 and task.nheads_kv == 8 for task in tasks)
+  assert all(not task.has_attn_bias for task in tasks)
+  assert all(not task.has_dropout for task in tasks)
+
+
+def test_persistent_autotune_full_tasks_add_mask_dropout_gqa_mqa():
+  dtypes = [torch.bfloat16]
+  seqlens = [1, 512]
+
+  tasks = _iter_forward_tasks(dtypes, seqlens, heads=8, full_tasks=True)
+  cases = {task.case_name for task in tasks}
+
+  assert {"attn-mask", "dropout", "gqa", "mqa"}.issubset(cases)
+  assert any(task.case_name == "attn-mask" and task.has_attn_bias for task in tasks)
+  assert any(task.case_name == "dropout" and task.has_dropout for task in tasks)
+  assert any(task.case_name == "gqa" and task.nheads_q == 8 and 1 < task.nheads_kv < 8 for task in tasks)
+  assert any(task.case_name == "mqa" and task.nheads_q == 8 and task.nheads_kv == 1 for task in tasks)
+
+
 def test_triton_config_serialization_round_trip_shape():
   config = _gen_bwd_autotune_configs((64, ), headdim=512, autotune_mode="fast")[0]
   serialized = config_from_triton_config(config)

@@ -1274,6 +1274,7 @@ def _ffpa_attn_backward_triton_impl(
   autotune: bool = False,
   autotune_mode: str = "fast",
   preprocess_d_chunk: bool = False,
+  original_nheads_kv: int | None = None,
   dropout_p: float = 0.0,
   philox_seed: int = 0,
   philox_offset: int = 0,
@@ -1312,11 +1313,13 @@ def _ffpa_attn_backward_triton_impl(
   :param preprocess_d_chunk: Whether the delta preprocess kernel should split
     the head dimension into ``BLOCK_HEADDIM`` chunks instead of processing the
     full head dimension in one program.
+  :param original_nheads_kv: Original KV-head count before GQA/MQA expansion.
   """
   if do.stride(-1) != 1:
     do = do.contiguous()
   batch, nheads, seqlen_q, headdim = q.shape
   _, _, seqlen_k, _ = k.shape
+  original_nheads_kv = original_nheads_kv or nheads
   softmax_scale = softmax_scale or (1.0 / math.sqrt(headdim))
   seqlen_q_rounded = lse.shape[-1]
   autotune_seqlen_q_bucket = autotune_seqlen_key(seqlen_q, autotune_mode)
@@ -1459,7 +1462,10 @@ def _ffpa_attn_backward_triton_impl(
           bias_grad=main_bias_requires_grad,
           grad_v_storage_dtype=grad_v_storage_dtype,
           use_gemv=use_gemv,
+          has_attn_bias=has_attn_bias,
           has_dropout=has_dropout,
+          nheads_q=nheads,
+          nheads_kv=original_nheads_kv,
         )
       )
       if decode_persisted_config is not None:
@@ -1674,7 +1680,10 @@ def _ffpa_attn_backward_triton_impl(
         causal=causal,
         bias_grad=main_bias_requires_grad,
         grad_v_storage_dtype=grad_v_storage_dtype,
+        has_attn_bias=has_attn_bias,
         has_dropout=has_dropout,
+        nheads_q=nheads,
+        nheads_kv=original_nheads_kv,
       )
     ) or {
       "BLOCK_M": 128,
@@ -1842,7 +1851,8 @@ def _ffpa_attn_backward_triton(
     lse_padded[..., :lse.size(-1)] = lse
     lse = lse_padded
 
-  group_size = q.size(1) // k.size(1)
+  original_nheads_kv = k.size(1)
+  group_size = q.size(1) // original_nheads_kv
   if group_size > 1:
     # GQA/MQA contract: kernels operate on expanded query-head layout. Gradients
     # for repeated KV heads are summed back into the original KV head dimension
@@ -1867,6 +1877,7 @@ def _ffpa_attn_backward_triton(
     int(preprocess_d_chunk),
     int(return_attn_bias_grad and attn_bias is not None),
     int(grad_v_storage_dtype == torch.float32),
+    original_nheads_kv,
     dropout_p,
     philox_seed,
     philox_offset,

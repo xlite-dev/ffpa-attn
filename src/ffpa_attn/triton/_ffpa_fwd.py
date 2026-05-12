@@ -982,6 +982,10 @@ def _ffpa_attn_forward_generic_impl(
         seqlen_q=seqlen_q,
         seqlen_k=seqlen_k,
         causal=causal,
+        has_attn_bias=has_attn_bias,
+        has_dropout=has_dropout,
+        nheads_q=nheads_q,
+        nheads_kv=nheads_kv,
       )
     )
     launch_config = persisted_config or {
@@ -1181,6 +1185,10 @@ def _ffpa_attn_forward_decode_impl(
         seqlen_k=seqlen_k,
         causal=causal,
         use_gemv=use_gemv,
+        has_attn_bias=has_attn_bias,
+        has_dropout=has_dropout,
+        nheads_q=nheads_q,
+        nheads_kv=nheads_kv,
       )
     )
     launch_config = persisted_config or {
