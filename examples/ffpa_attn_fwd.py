@@ -35,8 +35,8 @@ WARMUP, ITERS = 2, 10
 FORWARD_RESULT = dict[str, Any]
 
 
-def _parse_grad_qkv_dtype(arg: str) -> torch.dtype | None:
-  """Parse the CLI grad-qkv-dtype option.
+def _parse_grad_v_dtype(arg: str) -> torch.dtype | None:
+  """Parse the CLI grad-v-dtype option.
 
   :param arg: CLI value, ``"none"`` or ``"fp32"``.
   :return: ``None`` or ``torch.float32``.
@@ -45,7 +45,7 @@ def _parse_grad_qkv_dtype(arg: str) -> torch.dtype | None:
     return None
   if arg == "fp32":
     return torch.float32
-  raise ValueError(f"Unsupported grad-qkv-dtype={arg!r}; choose 'none' or 'fp32'.")
+  raise ValueError(f"Unsupported grad-v-dtype={arg!r}; choose 'none' or 'fp32'.")
 
 
 def _parse_args() -> argparse.Namespace:
@@ -84,11 +84,11 @@ def _parse_args() -> argparse.Namespace:
     help="Triton autotune search-space mode.",
   )
   parser.add_argument(
-    "--grad-qkv-storage-dtype",
-    "--grad-qkv-dtype",
+    "--grad-v-storage-dtype",
+    "--grad-v-dtype",
     choices=["none", "fp32"],
     default="none",
-    help="Optional Triton backward dq/dk/dv storage dtype forwarded to ffpa_attn_func.",
+    help="Optional Triton backward dV storage dtype forwarded to ffpa_attn_func.",
   )
   return parser.parse_args()
 
@@ -266,7 +266,7 @@ def _run_case(
   attn_mask: torch.Tensor | None = None,
   dropout_p: float = 0.0,
   acc: str = "f32",
-  triton_backward_grad_qkv_storage_dtype: torch.dtype | None = None,
+  triton_backward_grad_v_storage_dtype: torch.dtype | None = None,
   apply_norm: bool = False,
   print_result: bool = True,
 ) -> FORWARD_RESULT:
@@ -290,7 +290,7 @@ def _run_case(
     forward_backend=forward_backend,
     triton_forward_autotune=triton_forward_autotune,
     triton_autotune_mode=triton_autotune_mode,
-    triton_backward_grad_qkv_storage_dtype=triton_backward_grad_qkv_storage_dtype,
+    triton_backward_grad_v_storage_dtype=triton_backward_grad_v_storage_dtype,
   )
   k_ref, v_ref = _expand_kv(k, v, Nh_q)
   torch.manual_seed(seed + 17)
@@ -313,7 +313,7 @@ def _run_case(
       forward_backend=forward_backend,
       triton_forward_autotune=triton_forward_autotune,
       triton_autotune_mode=triton_autotune_mode,
-      triton_backward_grad_qkv_storage_dtype=triton_backward_grad_qkv_storage_dtype,
+      triton_backward_grad_v_storage_dtype=triton_backward_grad_v_storage_dtype,
     ),
     q,
     k,
@@ -366,7 +366,7 @@ def run_forward_examples(
   forward_backend: str = "triton",
   triton_forward_autotune: bool = False,
   triton_autotune_mode: str = "fast",
-  triton_backward_grad_qkv_storage_dtype: torch.dtype | None = None,
+  triton_backward_grad_v_storage_dtype: torch.dtype | None = None,
   print_results: bool = True,
 ) -> list[FORWARD_RESULT]:
   """Run the canonical forward benchmark cases.
@@ -381,8 +381,8 @@ def run_forward_examples(
   :param forward_backend: Forward backend passed to ``ffpa_attn_func``.
   :param triton_forward_autotune: Whether to enable Triton forward autotune.
   :param triton_autotune_mode: Triton autotune mode.
-  :param triton_backward_grad_qkv_storage_dtype: Optional Triton backward
-    dq/dk/dv storage dtype forwarded to ``ffpa_attn_func``.
+  :param triton_backward_grad_v_storage_dtype: Optional Triton backward dV
+    storage dtype forwarded to ``ffpa_attn_func``.
   :param print_results: Whether to print each case result.
   :return: One structured result per executed case and dtype.
   """
@@ -394,7 +394,7 @@ def run_forward_examples(
     f"apply_norm={apply_norm}, "
     f"triton_forward_autotune={triton_forward_autotune}, "
     f"triton_autotune_mode={triton_autotune_mode}, "
-    f"triton_backward_grad_qkv_storage_dtype={triton_backward_grad_qkv_storage_dtype}"
+    f"triton_backward_grad_v_storage_dtype={triton_backward_grad_v_storage_dtype}"
   )
 
   for dtype in (torch.float16, torch.bfloat16):
@@ -483,7 +483,7 @@ def run_forward_examples(
           attn_mask=case.get("attn_mask"),
           dropout_p=case.get("dropout_p", 0.0),
           apply_norm=apply_norm,
-          triton_backward_grad_qkv_storage_dtype=triton_backward_grad_qkv_storage_dtype,
+          triton_backward_grad_v_storage_dtype=triton_backward_grad_v_storage_dtype,
           print_result=print_results,
         )
       )
@@ -497,7 +497,7 @@ def main() -> None:
 
   if not torch.cuda.is_available():
     raise SystemExit("CUDA is required to run this example.")
-  grad_qkv_dtype = _parse_grad_qkv_dtype(args.grad_qkv_storage_dtype)
+  grad_v_dtype = _parse_grad_v_dtype(args.grad_v_storage_dtype)
   run_forward_examples(
     B=args.B,
     N=args.N,
@@ -508,7 +508,7 @@ def main() -> None:
     forward_backend=args.forward_backend,
     triton_forward_autotune=args.triton_forward_autotune,
     triton_autotune_mode=args.triton_autotune_mode,
-    triton_backward_grad_qkv_storage_dtype=grad_qkv_dtype,
+    triton_backward_grad_v_storage_dtype=grad_v_dtype,
     print_results=True,
   )
 
