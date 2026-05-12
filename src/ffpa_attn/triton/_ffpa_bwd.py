@@ -1283,10 +1283,11 @@ def _ffpa_attn_backward_triton_impl(
   grad_bias_needs_reduction = _attn_bias_grad_needs_reduction(grad_attn_bias, batch, nheads, seqlen_q, seqlen_k)
   grad_bias_reduces_m = _attn_bias_grad_reduces_query(grad_attn_bias, seqlen_q)
   # The [1, 1, 1, Nkv] key-position mask is common in examples and avoids
-  # materializing [B, Hq, Nq, Nkv]. In non-autotune mode we route its gradient
-  # through a fp32 partial buffer so dMask accuracy is not dominated by many
-  # score-level atomics or their accumulation order.
-  use_key_bias_grad_reduction = _attn_bias_grad_is_key_bias(grad_attn_bias, seqlen_q, seqlen_k) and not autotune
+  # materializing [B, Hq, Nq, Nkv]. Route its gradient through a fp32 partial
+  # buffer in both autotune and non-autotune modes so the math stays on the
+  # same fixed-order reduction path instead of switching to score-level
+  # atomics when autotune is enabled.
+  use_key_bias_grad_reduction = _attn_bias_grad_is_key_bias(grad_attn_bias, seqlen_q, seqlen_k)
   main_bias_requires_grad = bias_requires_grad
   grad_bias_store_partial = use_key_bias_grad_reduction
   partial_grad_bias = None
