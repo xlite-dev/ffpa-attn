@@ -3,6 +3,7 @@ include LICENSE
 include pyproject.toml
 include README.md
 recursive-include src/ffpa_attn *.py
+recursive-include src/ffpa_attn/triton/configs *.json
 recursive-include csrc *.cu *.cuh *.h *.hpp *.cpp
 recursive-include tests *.py
 prune build

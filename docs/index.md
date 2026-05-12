@@ -209,10 +209,13 @@ We extend FlashAttention to support large headdim ($D>256$) via **fine-grained t
 
 ## 🎉 Benchmark
 
-Runnable examples are provided under [`examples`](./examples). The performance benchmark for the 5090 with large headdim (D=512) is shown below. Please refer to our [bench](./benchmark/README.md) for more details.
+Runnable examples are provided under [`examples`](./examples). The performance benchmark for the 5090 with large headdim (D=320~1024) is shown below. Please refer to our [`examples`](./examples) for more details.
 
 <div align='center'>
-  <img src='./assets/ffpa_speedup.png' width='700px'>
+  <img src='./assets/perf/ffpa_speedup_nvidia-geforce-rtx-5090_B1_H32_N8192_D320.png' width='750px'>
+  <img src='./assets/perf/ffpa_speedup_nvidia-geforce-rtx-5090_B1_H32_N8192_D512.png' width='750px'>
+  <img src='./assets/perf/ffpa_speedup_nvidia-geforce-rtx-5090_B1_H32_N8192_D640.png' width='750px'>
+  <img src='./assets/perf/ffpa_speedup_nvidia-geforce-rtx-5090_B1_H32_N8192_D1024.png' width='750px'>
 </div>
 
 ## ©️License
@@ -220,22 +223,6 @@ Runnable examples are provided under [`examples`](./examples). The performance b
 <a id="License"></a>
 
 Apache License 2.0
-
-## 🎉Contribute
-
-<a id="Contribute"></a>
-
-How to contribute? Wecome to star⭐️ this repo to support me👆🏻 ~
-
-<div align="center">
-<a href="https://star-history.com/#xlite-dev/ffpa-attn&Date">
- <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=xlite-dev/ffpa-attn&type=Date&theme=dark" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=xlite-dev/ffpa-attn&type=Date" />
-   <img img width=450 height=300 alt="Star History Chart" src="https://api.star-history.com/svg?repos=xlite-dev/ffpa-attn&type=Date" />
- </picture>
-</a>
-</div>
 
 ## ©️Citations
 

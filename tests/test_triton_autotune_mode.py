@@ -1,11 +1,19 @@
 """Unit tests for Triton FFPA autotune mode plumbing and search-space pruning."""
 
 import pytest
+import torch
 
+from ffpa_attn.autotune import _iter_backward_tasks, _iter_forward_tasks
 from ffpa_attn.functional import FFPAAttnMeta
-from ffpa_attn.triton._autotune_utils import bucket_autotune_seqlen
-from ffpa_attn.triton._ffpa_bwd import _gen_bwd_autotune_configs, _gen_pre_autotune_configs
-from ffpa_attn.triton._ffpa_fwd import _gen_decode_fwd_stage1_autotune_configs, _gen_fwd_autotune_configs
+from ffpa_attn.triton._autotune_utils import autotune_seqlen_key, bucket_autotune_seqlen, exact_autotune_seqlen_keys
+from ffpa_attn.triton._ffpa_bwd import _gen_bwd_autotune_configs, _gen_pre_autotune_configs, _get_pre_autotune
+from ffpa_attn.triton._persistent_autotune import config_from_triton_config
+from ffpa_attn.triton._ffpa_fwd import (
+  _gen_decode_fwd_stage1_autotune_configs,
+  _gen_fwd_autotune_configs,
+  _get_decode_fwd_stage1_autotune,
+  _get_fwd_autotune,
+)
 
 
 def test_triton_autotune_mode_defaults_to_fast():
@@ -40,12 +48,20 @@ def test_autotune_seqlen_bucket(seqlen, expected_bucket):
   assert bucket_autotune_seqlen(seqlen) == expected_bucket
 
 
+def test_autotune_seqlen_key_uses_exact_context():
+  assert autotune_seqlen_key(513, "fast") == 1024
+  with exact_autotune_seqlen_keys():
+    assert autotune_seqlen_key(513, "fast") == 513
+    assert autotune_seqlen_key(8193, "fast") == 8193
+  assert autotune_seqlen_key(513, "fast") == 1024
+
+
 @pytest.mark.parametrize("headdim", [320, 512])
 def test_fwd_fast_mode_prunes_generic_configs(headdim):
   fast = _gen_fwd_autotune_configs(headdim, autotune_mode="fast")
   max_configs = _gen_fwd_autotune_configs(headdim, autotune_mode="max")
   assert len(fast) < len(max_configs)
-  assert all(config.num_warps == 4 for config in fast)
+  assert all(config.num_warps == 8 for config in fast)
 
 
 def test_fwd_fast_mode_prunes_decode_configs():
@@ -64,3 +80,36 @@ def test_bwd_fast_mode_prunes_kernel_configs():
   fast = _gen_bwd_autotune_configs((64, 128), headdim=512, autotune_mode="fast")
   max_configs = _gen_bwd_autotune_configs((64, 128), headdim=512, autotune_mode="max")
   assert len(fast) < len(max_configs)
+
+
+def test_forward_autotune_keys_include_causal():
+  assert "autotune_causal_key" in _get_fwd_autotune(320, "fast", "bf16").keys
+  assert "autotune_causal_key" in _get_decode_fwd_stage1_autotune(320, True, "fast", "bf16").keys
+
+
+def test_autotune_wrappers_are_dtype_scoped():
+  assert _get_fwd_autotune(320, "fast", "bf16") is not _get_fwd_autotune(320, "fast", "fp16")
+  assert _get_decode_fwd_stage1_autotune(320, True, "fast",
+                                         "bf16") is not _get_decode_fwd_stage1_autotune(320, True, "fast", "fp16")
+  assert _get_pre_autotune(False, "fast", "bf16") is not _get_pre_autotune(False, "fast", "fp16")
+
+
+def test_persistent_autotune_decode_tasks_skip_nkv1_and_nq4():
+  dtypes = [torch.bfloat16]
+  seqlens = [1, 4, 512]
+
+  forward_decode_tasks = [task for task in _iter_forward_tasks(dtypes, seqlens) if task.seqlen_q == 1]
+  backward_decode_tasks = [task for task in _iter_backward_tasks(dtypes, seqlens) if task.seqlen_q < 8]
+
+  assert forward_decode_tasks
+  assert backward_decode_tasks
+  assert all(task.seqlen_q == 1 and task.seqlen_k > 1 for task in forward_decode_tasks)
+  assert all(task.seqlen_q == 1 and task.seqlen_k > 1 for task in backward_decode_tasks)
+
+
+def test_triton_config_serialization_round_trip_shape():
+  config = _gen_bwd_autotune_configs((64, ), headdim=512, autotune_mode="fast")[0]
+  serialized = config_from_triton_config(config)
+  assert serialized["BLOCK_M"] in (64, 128)
+  assert serialized["BLOCK_N"] == 64
+  assert "num_warps" in serialized

@@ -34,7 +34,8 @@ import torch
 import triton
 import triton.language as tl
 
-from ._autotune_utils import bucket_autotune_seqlen
+from ._autotune_utils import autotune_seqlen_key
+from ._persistent_autotune import PersistentConfigRequest, dtype_name, lookup_persistent_config
 
 
 def _attn_bias_broadcast_strides(
@@ -371,6 +372,7 @@ def _ffpa_fwd_kernel_impl(
   # The kernel itself only uses the bucketed values.
   seqlen_q_bucket: int,
   seqlen_k_bucket: int,
+  autotune_causal_key: int,
   seqlen_q_rounded: int,
   dropout_p: float,
   philox_offset: int,
@@ -559,6 +561,7 @@ def _ffpa_decode_fwd_stage1_kernel(
   # The kernel itself only uses the bucketed values.
   seqlen_q_bucket: int,
   seqlen_k_bucket: int,
+  autotune_causal_key: int,
   dropout_p: float,
   philox_offset: int,
   IS_CAUSAL: tl.constexpr,
@@ -849,12 +852,12 @@ def _ffpa_decode_fwd_stage2_kernel(
 
 
 _ffpa_decode_fwd_stage1 = _ffpa_decode_fwd_stage1_kernel
-_ffpa_decode_fwd_stage1_autotune_cache: dict[tuple[int, bool, str], callable] = {}
+_ffpa_decode_fwd_stage1_autotune_cache: dict[tuple[int, bool, str, str], callable] = {}
 
 
-def _get_decode_fwd_stage1_autotune(headdim: int, use_gemv: bool, autotune_mode: str):
+def _get_decode_fwd_stage1_autotune(headdim: int, use_gemv: bool, autotune_mode: str, dtype: str):
   """Return a shape-class-specific autotune wrapper for decode stage1."""
-  cache_key = (headdim, use_gemv, autotune_mode)
+  cache_key = (headdim, use_gemv, autotune_mode, dtype)
   if cache_key not in _ffpa_decode_fwd_stage1_autotune_cache:
     configs = _gen_decode_fwd_stage1_autotune_configs(
       headdim,
@@ -863,7 +866,7 @@ def _get_decode_fwd_stage1_autotune(headdim: int, use_gemv: bool, autotune_mode:
     )
     _ffpa_decode_fwd_stage1_autotune_cache[cache_key] = triton.autotune(
       configs=configs,
-      key=["seqlen_q_bucket", "seqlen_k_bucket", "HEADDIM"],
+      key=["seqlen_q_bucket", "seqlen_k_bucket", "autotune_causal_key", "HEADDIM"],
       cache_results=True,
     )(_ffpa_decode_fwd_stage1_kernel)
   return _ffpa_decode_fwd_stage1_autotune_cache[cache_key]
@@ -914,8 +917,9 @@ def _ffpa_attn_forward_generic_impl(
   _, nheads_kv, seqlen_k, _ = k.shape
   softmax_scale = softmax_scale or (1.0 / math.sqrt(headdim))
   seqlen_q_rounded = lse.shape[-1]
-  seqlen_q_bucket = bucket_autotune_seqlen(seqlen_q, autotune_mode)
-  seqlen_k_bucket = bucket_autotune_seqlen(seqlen_k, autotune_mode)
+  seqlen_q_bucket = autotune_seqlen_key(seqlen_q, autotune_mode)
+  seqlen_k_bucket = autotune_seqlen_key(seqlen_k, autotune_mode)
+  autotune_causal_key = int(causal)
   DTYPE = tl.float16 if q.dtype == torch.float16 else tl.bfloat16
   has_attn_bias = attn_bias is not None
   has_dropout = dropout_p > 0.0
@@ -926,7 +930,7 @@ def _ffpa_attn_forward_generic_impl(
     return (triton.cdiv(seqlen_q, meta["BLOCK_M"]), batch * nheads_q)
 
   if autotune:
-    _get_fwd_autotune(headdim, autotune_mode)[grid](
+    _get_fwd_autotune(headdim, autotune_mode, dtype_name(q.dtype))[grid](
       q,
       k,
       v,
@@ -956,6 +960,7 @@ def _ffpa_attn_forward_generic_impl(
       seqlen_k,
       seqlen_q_bucket,
       seqlen_k_bucket,
+      autotune_causal_key,
       seqlen_q_rounded,
       dropout_p,
       philox_offset,
@@ -967,6 +972,26 @@ def _ffpa_attn_forward_generic_impl(
       HEADDIM=headdim,
     )
   else:
+    persisted_config = lookup_persistent_config(
+      PersistentConfigRequest(
+        direction="forward",
+        kernel="fwd_generic",
+        autotune_mode=autotune_mode,
+        dtype=dtype_name(q.dtype),
+        headdim=headdim,
+        seqlen_q=seqlen_q,
+        seqlen_k=seqlen_k,
+        causal=causal,
+      )
+    )
+    launch_config = persisted_config or {
+      "BLOCK_M": 128,
+      "BLOCK_N": 64,
+      "BLOCK_HEADDIM_QK": 64,
+      "BLOCK_HEADDIM_V": 64,
+      "num_warps": 8,
+      "num_stages": 3,
+    }
     _ffpa_fwd[grid](
       q,
       k,
@@ -997,6 +1022,7 @@ def _ffpa_attn_forward_generic_impl(
       seqlen_k,
       seqlen_q_bucket,
       seqlen_k_bucket,
+      autotune_causal_key,
       seqlen_q_rounded,
       dropout_p,
       philox_offset,
@@ -1006,12 +1032,7 @@ def _ffpa_attn_forward_generic_impl(
       PHILOX_SEED=philox_seed,
       DTYPE=DTYPE,
       HEADDIM=headdim,
-      BLOCK_M=128,
-      BLOCK_N=64,
-      BLOCK_HEADDIM_QK=64,
-      BLOCK_HEADDIM_V=64,
-      num_warps=8,
-      num_stages=3,
+      **launch_config,
     )
 
 
@@ -1065,8 +1086,9 @@ def _ffpa_attn_forward_decode_impl(
   softmax_scale = softmax_scale or (1.0 / math.sqrt(headdim))
   DTYPE = tl.float16 if q.dtype == torch.float16 else tl.bfloat16
   use_gemv = seqlen_q == 1
-  seqlen_q_bucket = bucket_autotune_seqlen(seqlen_q, autotune_mode)
-  seqlen_k_bucket = bucket_autotune_seqlen(seqlen_k, autotune_mode)
+  seqlen_q_bucket = autotune_seqlen_key(seqlen_q, autotune_mode)
+  seqlen_k_bucket = autotune_seqlen_key(seqlen_k, autotune_mode)
+  autotune_causal_key = int(causal)
   if num_splits is None:
     num_splits = _get_decode_num_splits(seqlen_q, seqlen_k, headdim, batch, nheads_q, q.device)
   has_attn_bias = attn_bias is not None
@@ -1100,7 +1122,7 @@ def _ffpa_attn_forward_decode_impl(
     )
 
   if autotune:
-    _get_decode_fwd_stage1_autotune(headdim, use_gemv, autotune_mode)[stage1_grid](
+    _get_decode_fwd_stage1_autotune(headdim, use_gemv, autotune_mode, dtype_name(q.dtype))[stage1_grid](
       q,
       k,
       v,
@@ -1135,6 +1157,7 @@ def _ffpa_attn_forward_decode_impl(
       seqlen_k,
       seqlen_q_bucket,
       seqlen_k_bucket,
+      autotune_causal_key,
       dropout_p,
       philox_offset,
       IS_CAUSAL=causal,
@@ -1147,6 +1170,29 @@ def _ffpa_attn_forward_decode_impl(
       CHUNK_SIZE=chunk_size,
     )
   else:
+    persisted_config = lookup_persistent_config(
+      PersistentConfigRequest(
+        direction="forward",
+        kernel="decode_fwd_stage1",
+        autotune_mode=autotune_mode,
+        dtype=dtype_name(q.dtype),
+        headdim=headdim,
+        seqlen_q=seqlen_q,
+        seqlen_k=seqlen_k,
+        causal=causal,
+        use_gemv=use_gemv,
+      )
+    )
+    launch_config = persisted_config or {
+      "BLOCK_M": block_m,
+      "CHUNK_SIZE": chunk_size,
+      "BLOCK_N": 128,
+      "BLOCK_HEADDIM_QK": block_headdim,
+      "BLOCK_HEADDIM_V": block_headdim,
+      "num_warps": 8,
+      "num_stages": 2,
+    }
+    launch_config = {**launch_config, "CHUNK_SIZE": chunk_size}
     _ffpa_decode_fwd_stage1[stage1_grid](
       q,
       k,
@@ -1182,6 +1228,7 @@ def _ffpa_attn_forward_decode_impl(
       seqlen_k,
       seqlen_q_bucket,
       seqlen_k_bucket,
+      autotune_causal_key,
       dropout_p,
       philox_offset,
       IS_CAUSAL=causal,
@@ -1191,13 +1238,7 @@ def _ffpa_attn_forward_decode_impl(
       USE_GEMV=use_gemv,
       DTYPE=DTYPE,
       HEADDIM=headdim,
-      BLOCK_M=block_m,
-      CHUNK_SIZE=chunk_size,
-      BLOCK_N=128,
-      BLOCK_HEADDIM_QK=block_headdim,
-      BLOCK_HEADDIM_V=block_headdim,
-      num_warps=8,
-      num_stages=2,
+      **launch_config,
     )
 
   stage2_block_headdim_v = triton.next_power_of_2(headdim) if headdim <= 512 else 128
@@ -1238,10 +1279,10 @@ def _ffpa_attn_forward_decode_impl(
 
 
 _ffpa_fwd = _ffpa_fwd_kernel_impl
-_ffpa_fwd_autotune_cache: dict[tuple[int, str], callable] = {}  # (headdim, mode) -> callable
+_ffpa_fwd_autotune_cache: dict[tuple[int, str, str], callable] = {}  # (headdim, mode, dtype) -> callable
 
 
-def _get_fwd_autotune(headdim: int, autotune_mode: str):
+def _get_fwd_autotune(headdim: int, autotune_mode: str, dtype: str):
   """Return a headdim-specific autotune wrapper for the forward kernel.
 
   Results are cached by headdim so the autotune overhead is paid at most once
@@ -1253,12 +1294,12 @@ def _get_fwd_autotune(headdim: int, autotune_mode: str):
   :return: A ``triton.autotune``-wrapped version of ``_ffpa_fwd_kernel_impl``
       tuned for ``headdim``.
   """
-  cache_key = (headdim, autotune_mode)
+  cache_key = (headdim, autotune_mode, dtype)
   if cache_key not in _ffpa_fwd_autotune_cache:
     configs = _gen_fwd_autotune_configs(headdim, autotune_mode=autotune_mode)
     _ffpa_fwd_autotune_cache[cache_key] = triton.autotune(
       configs=configs,
-      key=["seqlen_q_bucket", "seqlen_k_bucket", "HEADDIM"],
+      key=["seqlen_q_bucket", "seqlen_k_bucket", "autotune_causal_key", "HEADDIM"],
       cache_results=True,
     )(_ffpa_fwd_kernel_impl)
   return _ffpa_fwd_autotune_cache[cache_key]
