@@ -32,8 +32,6 @@ from ._ffpa_fwd import (
 from ._persistent_autotune import PersistentConfigRequest, dtype_name, lookup_persistent_config
 from ._autotune_utils import autotune_seqlen_key
 
-# Heuristics (mirror the original generic kernel)
-
 
 def _sm90_num_v_groups(args):
   return triton.cdiv(args["HEADDIM"], args["BLOCK_HEADDIM_V"])
@@ -44,8 +42,6 @@ _SM90_FWD_HEURISTICS = {
   "EVEN_N": lambda args: args["seqlen_k"] % args["BLOCK_N"] == 0,
   "NUM_V_GROUPS": _sm90_num_v_groups,
 }
-
-# Pre-hook (for autotune support)
 
 
 def _sm90_host_descriptor_pre_hook(nargs):
@@ -64,9 +60,6 @@ def _sm90_host_descriptor_pre_hook(nargs):
   nargs["desc_k"].block_shape = [BLOCK_N, BLOCK_HEADDIM_QK]
   nargs["desc_v"].block_shape = [BLOCK_N, BLOCK_HEADDIM_V]
   nargs["desc_o"].block_shape = [BLOCK_M, BLOCK_HEADDIM_V]
-
-
-# TMA forward kernel
 
 
 @triton.heuristics(_SM90_FWD_HEURISTICS)
@@ -233,8 +226,6 @@ def _ffpa_fwd_sm90_kernel_impl(
       )
   tl.store(LSE + offs_m, m_i + tl.log(l_i), mask=offs_m < seqlen_q)
 
-
-# Default launch config
 
 _SM90_DEFAULT_CONFIG = {
   "BLOCK_M": 128,
@@ -484,9 +475,6 @@ def _ffpa_attn_forward_sm90_generic_impl(
   )
 
 
-# Gating
-
-
 def is_sm90_tma_forward_supported(
   q: torch.Tensor,
   k: torch.Tensor,
@@ -518,9 +506,6 @@ def is_sm90_tma_forward_supported(
   if q.dtype not in (torch.float16, torch.bfloat16):
     return False
   return q.stride(-1) == k.stride(-1) == v.stride(-1) == o.stride(-1) == 1
-
-
-# Public entry point
 
 
 def _ffpa_attn_forward_sm90_tma_impl(
