@@ -32,25 +32,6 @@ from ._ffpa_fwd import (
 from ._persistent_autotune import PersistentConfigRequest, dtype_name, lookup_persistent_config
 
 # ---------------------------------------------------------------------------
-# JIT helpers
-# ---------------------------------------------------------------------------
-
-
-@triton.jit
-def _maybe_make_tensor_desc(desc_or_ptr, shape, strides, block_shape):
-  """Return a TMA-compatible descriptor regardless of the input type.
-
-    When *desc_or_ptr* is already a :class:`tl.tensor_descriptor` (host-side
-    ``TensorDescriptor``), it is returned unchanged.  Otherwise a new
-    descriptor is created on the fly from the raw pointer, which keeps the
-    kernel compatible with plain-tensor fallback paths.
-    """
-  if isinstance(desc_or_ptr, tl.tensor_descriptor):
-    return desc_or_ptr
-  return tl.make_tensor_descriptor(desc_or_ptr, shape, strides, block_shape)
-
-
-# ---------------------------------------------------------------------------
 # Heuristics (mirror the original generic kernel)
 # ---------------------------------------------------------------------------
 
@@ -145,32 +126,6 @@ def _ffpa_fwd_sm90_kernel_impl(
   off_hq = off_hb % nheads_q
   group_size = nheads_q // nheads_kv
   off_hkv = off_hq // group_size
-
-  # --- descriptor preparation ---
-  desc_q = _maybe_make_tensor_desc(
-    desc_q,
-    shape=[y_dim_q, HEADDIM],
-    strides=[HEADDIM, 1],
-    block_shape=[BLOCK_M, BLOCK_HEADDIM_QK],
-  )
-  desc_k = _maybe_make_tensor_desc(
-    desc_k,
-    shape=[y_dim_kv, HEADDIM],
-    strides=[HEADDIM, 1],
-    block_shape=[BLOCK_N, BLOCK_HEADDIM_QK],
-  )
-  desc_v = _maybe_make_tensor_desc(
-    desc_v,
-    shape=[y_dim_kv, HEADDIM],
-    strides=[HEADDIM, 1],
-    block_shape=[BLOCK_N, BLOCK_HEADDIM_V],
-  )
-  desc_o = _maybe_make_tensor_desc(
-    desc_o,
-    shape=[y_dim_q, HEADDIM],
-    strides=[HEADDIM, 1],
-    block_shape=[BLOCK_M, BLOCK_HEADDIM_V],
-  )
 
   # --- per-program offsets ---
   q_base_y = (off_b * nheads_q + off_hq) * seqlen_q
