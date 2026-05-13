@@ -1376,14 +1376,40 @@ def _ffpa_attn_backward_triton_impl(
   use_key_bias_grad_reduction = _attn_bias_grad_is_key_bias(grad_attn_bias, seqlen_q, seqlen_k)
   main_bias_requires_grad = bias_requires_grad
   grad_bias_store_partial = use_key_bias_grad_reduction
+  has_dropout = dropout_p > 0.0
+  runtime_dtype = dtype_name(q.dtype)
+  grad_v_storage_dtype = "fp32" if dv.dtype == torch.float32 else None
+  persisted_main_config = None
+  if not autotune and seqlen_q >= 8:
+    persisted_main_config = lookup_persistent_config(
+      PersistentConfigRequest(
+        direction="backward",
+        kernel="bwd_generic",
+        autotune_mode=autotune_mode,
+        dtype=runtime_dtype,
+        headdim=headdim,
+        seqlen_q=seqlen_q,
+        seqlen_k=seqlen_k,
+        causal=causal,
+        bias_grad=main_bias_requires_grad,
+        grad_v_storage_dtype=grad_v_storage_dtype,
+        has_attn_bias=has_attn_bias,
+        has_dropout=has_dropout,
+        nheads_q=nheads,
+        nheads_kv=original_nheads_kv,
+        device_index=q.device.index,
+      )
+    )
   partial_grad_bias = None
   if use_key_bias_grad_reduction:
-    min_block_m_for_bias = 64 if autotune else 128
+    min_block_m_for_bias = 64 if autotune else int((persisted_main_config or {"BLOCK_M": 128})["BLOCK_M"])
     num_m_blocks_for_bias = triton.cdiv(seqlen_q, min_block_m_for_bias)
     # Main-path autotune can switch between BLOCK_M=64 and BLOCK_M=128. Size the
     # partial key-bias buffer for the smallest candidate so BLOCK_M=64 has room
-    # for every Q block, and zero-init it so larger BLOCK_M configs safely leave
-    # the extra rows unused.
+    # for every Q block. Persistent mode must use the selected BLOCK_M; otherwise
+    # a persisted BLOCK_M=64 kernel would write more rows than a fallback-sized
+    # BLOCK_M=128 buffer provides. Zero-init so larger BLOCK_M configs safely
+    # leave the extra rows unused.
     partial_grad_bias = torch.zeros(
       (batch * nheads, num_m_blocks_for_bias, seqlen_k),
       dtype=torch.float32,
@@ -1405,7 +1431,6 @@ def _ffpa_attn_backward_triton_impl(
       seqlen_q,
       seqlen_k,
     )
-  has_dropout = dropout_p > 0.0
 
   assert q.dtype == k.dtype == v.dtype == o.dtype == do.dtype
   assert q.dtype in (torch.float16, torch.bfloat16)
@@ -1414,8 +1439,6 @@ def _ffpa_attn_backward_triton_impl(
     DTYPE = tl.float16
   else:
     DTYPE = tl.bfloat16
-  runtime_dtype = dtype_name(q.dtype)
-  grad_v_storage_dtype = "fp32" if dv.dtype == torch.float32 else None
   autotune_dtype_key = 1 if q.dtype == torch.bfloat16 else 0
 
   BLOCK_HEADDIM_DELTA = max(64, triton.next_power_of_2(headdim))
@@ -1710,25 +1733,7 @@ def _ffpa_attn_backward_triton_impl(
       DTYPE=DTYPE,
     )
   else:
-    main_config = lookup_persistent_config(
-      PersistentConfigRequest(
-        direction="backward",
-        kernel="bwd_generic",
-        autotune_mode=autotune_mode,
-        dtype=runtime_dtype,
-        headdim=headdim,
-        seqlen_q=seqlen_q,
-        seqlen_k=seqlen_k,
-        causal=causal,
-        bias_grad=main_bias_requires_grad,
-        grad_v_storage_dtype=grad_v_storage_dtype,
-        has_attn_bias=has_attn_bias,
-        has_dropout=has_dropout,
-        nheads_q=nheads,
-        nheads_kv=original_nheads_kv,
-        device_index=q.device.index,
-      )
-    ) or {
+    main_config = persisted_main_config or {
       "BLOCK_M": 128,
       "BLOCK_N": 64,
       "BLOCK_HEADDIM": 64,

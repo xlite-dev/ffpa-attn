@@ -1,11 +1,8 @@
 # Triton Autotune and Persistent Tuned Configs
 
-FFPA's Triton backend can autotune forward and backward launch parameters for
-large-head-dimension attention. The autotune result can be persisted as a
-device-specific JSON file and reused later when runtime autotune is disabled.
+FFPA's Triton backend can autotune forward and backward launch parameters for large-head-dimension attention. The autotune result can be persisted as a device-specific JSON file and reused later when runtime autotune is disabled.
 
-This is useful for production inference or training jobs where you want stable
-startup latency and do not want each process to pay the Triton autotune cost.
+This is useful for production inference or training jobs where you want stable startup latency and do not want each process to pay the Triton autotune cost.
 
 ## Overview
 
