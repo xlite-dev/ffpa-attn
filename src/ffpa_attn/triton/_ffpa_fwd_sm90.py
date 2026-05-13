@@ -78,10 +78,10 @@ def _sm90_host_descriptor_pre_hook(nargs):
 @triton.heuristics(_SM90_FWD_HEURISTICS)
 @triton.jit
 def _ffpa_fwd_sm90_kernel_impl(
-  desc_q,
-  desc_k,
-  desc_v,
-  desc_o,
+  desc_q: tl.tensor_descriptor,
+  desc_k: tl.tensor_descriptor,
+  desc_v: tl.tensor_descriptor,
+  desc_o: tl.tensor_descriptor,
   LSE: torch.Tensor,
   AttnBias: torch.Tensor,
   softmax_scale: float,
@@ -258,7 +258,7 @@ def _gen_fwd_sm90_autotune_configs(headdim: int = 256, autotune_mode: str = "max
       for block_headdim in _headdim_candidates:
         num_warps_candidates = [8] if autotune_mode == "fast" else [4, 8]
         for num_warps in num_warps_candidates:
-          for num_stages in [2, 3]:
+          for num_stages in [2, 3, 4]:
             configs.append(
               triton.Config(
                 {
