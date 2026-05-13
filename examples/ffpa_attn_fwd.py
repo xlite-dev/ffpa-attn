@@ -94,6 +94,11 @@ def _parse_args() -> argparse.Namespace:
     default="none",
     help="Optional Triton backward dV storage dtype forwarded to ffpa_attn_func.",
   )
+  parser.add_argument(
+    "--enable-tma",
+    action="store_true",
+    help="Enable experimental SM90+ TMA forward path (silently falls back on unsupported devices).",
+  )
   return parser.parse_args()
 
 
@@ -262,6 +267,7 @@ def _format_forward_result(result: FORWARD_RESULT) -> str:
     f"max|diff|={result['max_diff']:.4f}  mean|diff|={result['mean_diff']:.5f}  "
     f"allclose(atol={result['tolerance']})={result['allclose']}  "
     f"backend={result['forward_backend']}  "
+    f"tma={int(result.get('enable_tma', False))}  "
     f"FFPA={result['ffpa_ms']:.2f} ms  SDPA={result['sdpa_ms']:.2f} ms  "
     f"TFLOPS={format_tflops_short(result['ffpa_tflops'])}/{format_tflops_short(result['sdpa_tflops'])}  "
     f"speedup={result['speedup']:.2f}x"
@@ -290,6 +296,7 @@ def _run_case(
   warmup: int = DEFAULT_WARMUP,
   iters: int = DEFAULT_ITERS,
   print_result: bool = True,
+  enable_tma: bool = False,
 ) -> FORWARD_RESULT:
   torch.manual_seed(seed)
   q = torch.randn(B, Nh_q, Nq, D, dtype=dtype, device="cuda")
@@ -312,6 +319,7 @@ def _run_case(
     triton_autotune=triton_autotune,
     triton_autotune_mode=triton_autotune_mode,
     triton_backward_grad_v_storage_dtype=triton_backward_grad_v_storage_dtype,
+    enable_tma=enable_tma,
   )
   k_ref, v_ref = _expand_kv(k, v, Nh_q)
   torch.manual_seed(seed + 17)
@@ -335,6 +343,7 @@ def _run_case(
       triton_autotune=triton_autotune,
       triton_autotune_mode=triton_autotune_mode,
       triton_backward_grad_v_storage_dtype=triton_backward_grad_v_storage_dtype,
+      enable_tma=enable_tma,
     ),
     q,
     k,
@@ -378,6 +387,7 @@ def _run_case(
     "ffpa_tflops": tflops_from_ms(flop_count, ms_ffpa),
     "sdpa_tflops": tflops_from_ms(flop_count, ms_sdpa),
     "speedup": ms_sdpa / ms_ffpa,
+    "enable_tma": enable_tma,
   }
   if print_result:
     print(_format_forward_result(result))
@@ -400,6 +410,7 @@ def run_forward_examples(
   warmup: int = DEFAULT_WARMUP,
   iters: int = DEFAULT_ITERS,
   print_results: bool = True,
+  enable_tma: bool = False,
 ) -> list[FORWARD_RESULT]:
   """Run the canonical forward benchmark cases.
 
@@ -430,6 +441,7 @@ def run_forward_examples(
     f"triton_autotune={triton_autotune}, "
     f"triton_autotune_mode={triton_autotune_mode}, "
     f"triton_backward_grad_v_storage_dtype={triton_backward_grad_v_storage_dtype}, "
+    f"enable_tma={enable_tma}, "
     f"warmup={warmup}, iters={iters}"
   )
 
@@ -523,6 +535,7 @@ def run_forward_examples(
           warmup=warmup,
           iters=iters,
           print_result=print_results,
+          enable_tma=enable_tma,
         )
       )
 
@@ -550,6 +563,7 @@ def main() -> None:
     warmup=args.warmup,
     iters=args.iters,
     print_results=True,
+    enable_tma=args.enable_tma,
   )
 
 

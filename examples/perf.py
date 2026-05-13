@@ -204,6 +204,11 @@ def _parse_args() -> argparse.Namespace:
     help="Enable pre-attention LayerNorm on q/k/v for both FFPA and SDPA paths.",
   )
   parser.add_argument(
+    "--enable-tma",
+    action="store_true",
+    help="Enable experimental SM90+ TMA forward path (silently falls back on unsupported devices).",
+  )
+  parser.add_argument(
     "--grad-v-storage-dtype",
     "--grad-v-dtype",
     choices=["none", "fp32"],
@@ -895,6 +900,7 @@ def _benchmark_rows(args: argparse.Namespace) -> tuple[list[RESULT_ROW], list[RE
         warmup=args.warmup,
         iters=args.iters,
         print_results=True,
+        enable_tma=args.enable_tma,
       ),
     )
   if args.backward:
