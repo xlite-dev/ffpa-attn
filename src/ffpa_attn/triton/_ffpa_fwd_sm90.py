@@ -84,6 +84,8 @@ def _ffpa_fwd_sm90_kernel_impl(
   desc_o: tl.tensor_descriptor,
   LSE: torch.Tensor,
   AttnBias: torch.Tensor,
+  O: torch.Tensor,
+  stride_om: int,
   softmax_scale: float,
   stride_bb: int,
   stride_bh: int,
@@ -213,11 +215,25 @@ def _ffpa_fwd_sm90_kernel_impl(
     m_i = m_new
     l_i = l_new
 
-  # --- epilogue: write O via descriptor, LSE via raw pointer ---
-  for v_group in tl.static_range(0, NUM_V_GROUPS):
-    o_d_start = BLOCK_HEADDIM_V * v_group
-    out = o_accs[v_group] / (l_i[:, None] + 1.0e-10)
-    desc_o.store([o_offset_y, o_d_start], out.to(DTYPE))
+  # --- epilogue: write O via descriptor when aligned, raw pointer otherwise ---
+  # TMA descriptor stores may not correctly clip partial rows on all
+  # Triton versions; use a masked raw-pointer store for non-aligned seqlen
+  # to guarantee correctness.
+  if EVEN_M:
+    for v_group in tl.static_range(0, NUM_V_GROUPS):
+      o_d_start = BLOCK_HEADDIM_V * v_group
+      out = o_accs[v_group] / (l_i[:, None] + 1.0e-10)
+      desc_o.store([o_offset_y, o_d_start], out.to(DTYPE))
+  else:
+    offs_d_v = tl.arange(0, BLOCK_HEADDIM_V)
+    for v_group in tl.static_range(0, NUM_V_GROUPS):
+      o_d = BLOCK_HEADDIM_V * v_group + offs_d_v
+      out = o_accs[v_group] / (l_i[:, None] + 1.0e-10)
+      tl.store(
+        O + offs_m[:, None] * stride_om + o_d[None, :],
+        out.to(DTYPE),
+        mask=(offs_m[:, None] < seqlen_q) & (o_d[None, :] < HEADDIM),
+      )
   tl.store(LSE + offs_m, m_i + tl.log(l_i), mask=offs_m < seqlen_q)
 
 
@@ -227,11 +243,11 @@ def _ffpa_fwd_sm90_kernel_impl(
 
 _SM90_DEFAULT_CONFIG = {
   "BLOCK_M": 128,
-  "BLOCK_N": 64,
-  "BLOCK_HEADDIM_QK": 64,
-  "BLOCK_HEADDIM_V": 64,
-  "num_warps": 8,
-  "num_stages": 3,
+  "BLOCK_N": 128,
+  "BLOCK_HEADDIM_QK": 128,
+  "BLOCK_HEADDIM_V": 128,
+  "num_warps": 4,
+  "num_stages": 4,
 }
 
 
@@ -401,6 +417,8 @@ def _ffpa_attn_forward_sm90_generic_impl(
       desc_o,
       lse,
       attn_bias_in,
+      o,
+      o.stride(2),
       softmax_scale,
       bias_strides[0],
       bias_strides[1],
@@ -438,6 +456,8 @@ def _ffpa_attn_forward_sm90_generic_impl(
     desc_o,
     lse,
     attn_bias_in,
+    o,
+    o.stride(2),
     softmax_scale,
     bias_strides[0],
     bias_strides[1],
