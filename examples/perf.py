@@ -24,7 +24,7 @@ EXAMPLES_DIR = Path(__file__).resolve().parent
 if str(EXAMPLES_DIR) not in sys.path:
   sys.path.insert(0, str(EXAMPLES_DIR))
 
-from _attention_flops import format_tflops_short
+from attention_flops import format_tflops_short
 from ffpa_attn_bwd import run_backward_examples
 from ffpa_attn_fwd import run_forward_examples
 
@@ -58,13 +58,13 @@ PLOT_CASES: list[tuple[str, str]] = [
   ("non-aligned", "non-aligned(F/B)"),
 ]
 TFLOPS_PLOT_CASES: list[tuple[str, str]] = [
-  ("self-attn", "SA"),
-  ("cross-attn", "XA"),
-  ("gqa", "GQA"),
-  ("causal", "CAU"),
-  ("attn-mask", "MASK"),
-  ("dropout", "DROP"),
-  ("non-aligned", "NA"),
+  ("self-attn", "self-attn(F/B)"),
+  ("cross-attn", "cross-attn(F/B)"),
+  ("gqa", "gqa(F/B)"),
+  ("causal", "causal(F/B)"),
+  ("attn-mask", "attn-mask(F/B)"),
+  ("dropout", "dropout(F/B)"),
+  ("non-aligned", "non-aligned(F/B)"),
 ]
 CASE_LABELS = dict(PLOT_CASES)
 DTYPE_ORDER = ["fp16", "bf16"]
@@ -692,21 +692,28 @@ def plot_tflops(
     finite_values.extend(value for value in bwd_ffpa_tflops if np.isfinite(value))
 
   ax.set_ylabel("Throughput (TFLOPS)", fontsize=18)
-  ax.set_title(
+  fig.suptitle(
     f"FFPA vs SDPA TFLOPS ({_mode_suffix(has_forward, has_backward)}) | {device_name} | B={B}, N={N}, H={H}, D={D}",
     fontsize=22,
-    pad=15,
     fontweight="bold",
+    y=0.98,
   )
   ax.set_xticks(x)
   ax.set_xticklabels(attn_types, rotation=0, ha="center", fontsize=22, fontweight="bold")
   ax.tick_params(axis="y", labelsize=16)
   ymax = max(finite_values) if finite_values else 1.0
   ax.set_ylim(0, ymax * 1.1 if ymax > 0 else 1.0)
-  ax.legend(fontsize=20, loc="upper left")
+  fig.legend(
+    fontsize=20,
+    loc="upper center",
+    bbox_to_anchor=(0.5, 0.945),
+    ncol=4,
+    columnspacing=1.5,
+    handletextpad=0.6,
+  )
   ax.grid(axis="y", alpha=0.9)
 
-  fig.tight_layout()
+  fig.tight_layout(rect=(0, 0, 1, 0.90))
   fig.savefig(output_path)
   plt.close(fig)
   return output_path
@@ -926,7 +933,7 @@ def main() -> None:
     H=args.H,
     N=args.N,
     D=args.D,
-    output_path=output_stem.with_name(f"{output_stem.name}_speedup.png"),
+    output_path=output_stem.with_name(f"{output_stem.name}.png"),  # speedup
   )
   tflops_png_path = None if fallback else plot_tflops(
     forward_rows,
@@ -936,7 +943,7 @@ def main() -> None:
     H=args.H,
     N=args.N,
     D=args.D,
-    output_path=output_stem.with_name(f"{output_stem.name}_tflops.png"),
+    output_path=output_stem.with_name(f"{output_stem.name}_T.png"),  # tflops
   )
   markdown = render_speedup_markdown(
     forward_rows,
