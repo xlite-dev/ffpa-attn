@@ -29,6 +29,7 @@ import torch
 import torch.nn.functional as F
 
 from ffpa_attn import ffpa_attn_func
+from _attention_flops import attention_fwd_flops, format_tflops_short, tflops_from_ms
 
 STAGES = 2
 DEFAULT_WARMUP = 2
@@ -262,6 +263,7 @@ def _format_forward_result(result: FORWARD_RESULT) -> str:
     f"allclose(atol={result['tolerance']})={result['allclose']}  "
     f"backend={result['forward_backend']}  "
     f"FFPA={result['ffpa_ms']:.2f} ms  SDPA={result['sdpa_ms']:.2f} ms  "
+    f"TFLOPS={format_tflops_short(result['ffpa_tflops'])} / {format_tflops_short(result['sdpa_tflops'])}  "
     f"speedup={result['speedup']:.2f}x"
   )
 
@@ -350,6 +352,7 @@ def _run_case(
     iters=iters,
     rng_seed=seed + 17 if dropout_p > 0.0 else None,
   )
+  flop_count = attention_fwd_flops(B, Nh_q, Nq, Nkv, D, causal)
 
   result: FORWARD_RESULT = {
     "case_name": name,
@@ -372,6 +375,8 @@ def _run_case(
     "iters": iters,
     "ffpa_ms": ms_ffpa,
     "sdpa_ms": ms_sdpa,
+    "ffpa_tflops": tflops_from_ms(flop_count, ms_ffpa),
+    "sdpa_tflops": tflops_from_ms(flop_count, ms_sdpa),
     "speedup": ms_sdpa / ms_ffpa,
   }
   if print_result:

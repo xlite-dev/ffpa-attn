@@ -24,6 +24,7 @@ EXAMPLES_DIR = Path(__file__).resolve().parent
 if str(EXAMPLES_DIR) not in sys.path:
   sys.path.insert(0, str(EXAMPLES_DIR))
 
+from _attention_flops import format_tflops_short
 from ffpa_attn_bwd import run_backward_examples
 from ffpa_attn_fwd import run_forward_examples
 
@@ -56,11 +57,24 @@ PLOT_CASES: list[tuple[str, str]] = [
   ("dropout", "dropout(F/B)"),
   ("non-aligned", "non-aligned(F/B)"),
 ]
+TFLOPS_PLOT_CASES: list[tuple[str, str]] = [
+  ("self-attn", "SA"),
+  ("cross-attn", "XA"),
+  ("gqa", "GQA"),
+  ("causal", "CAU"),
+  ("attn-mask", "MASK"),
+  ("dropout", "DROP"),
+  ("non-aligned", "NA"),
+]
 CASE_LABELS = dict(PLOT_CASES)
 DTYPE_ORDER = ["fp16", "bf16"]
 DEFAULT_OUTPUT_STEM = "ffpa_speedup"
 DEFAULT_OUTPUT_DIR = Path(".tmp")
 FALLBACK_DEVICE_NAME = "NVIDIA RTX 5090 Blackwell"
+TFLOPS_FWD_SDPA_COLOR = "#b0b0b0"
+TFLOPS_FWD_FFPA_COLOR = "#2171b5"
+TFLOPS_BWD_SDPA_COLOR = "#f5a623"
+TFLOPS_BWD_FFPA_COLOR = "#fd493c"
 FALLBACK_SPEEDUPS: dict[str, dict[str, dict[str, float]]] = {
   "forward": {
     "self-attn": {
@@ -398,6 +412,44 @@ def _aggregate_speedups(rows: list[RESULT_ROW], direction: str) -> list[float] |
   return values
 
 
+def _aggregate_metric(
+  rows: list[RESULT_ROW],
+  direction: str,
+  metric_key: str,
+  plot_cases: list[tuple[str, str]] | None = None,
+) -> list[float] | None:
+  """Aggregate one numeric metric per case for plotting.
+
+  The benchmark plots show one bar per case and direction, so rows across dtypes
+  are reduced to the maximum finite value for that case.
+
+  :param rows: Structured rows for one or both directions.
+  :param direction: ``forward`` or ``backward``.
+  :param metric_key: Row field containing the numeric metric.
+  :param plot_cases: Ordered cases to aggregate for plotting.
+  :return: Aggregated bar heights, or ``None`` when the direction is absent.
+  """
+  active_plot_cases = PLOT_CASES if plot_cases is None else plot_cases
+  active_case_names = {case_name for case_name, _ in active_plot_cases}
+  case_to_values: dict[str, list[float]] = {case_name: [] for case_name, _ in active_plot_cases}
+  for row in rows:
+    if row["direction"] != direction:
+      continue
+    if row["case_name"] not in active_case_names:
+      continue
+    value = row.get(metric_key)
+    if value is None:
+      continue
+    case_to_values[row["case_name"]].append(float(value))
+  if not any(case_to_values.values()):
+    return None
+  values: list[float] = []
+  for case_name, _ in active_plot_cases:
+    metric_values = case_to_values[case_name]
+    values.append(float(np.amax(metric_values)) if metric_values else float("nan"))
+  return values
+
+
 def plot_speedup(
   forward_rows: list[RESULT_ROW],
   backward_rows: list[RESULT_ROW],
@@ -525,6 +577,141 @@ def plot_speedup(
   return output_path
 
 
+def plot_tflops(
+  forward_rows: list[RESULT_ROW],
+  backward_rows: list[RESULT_ROW],
+  *,
+  device_name: str,
+  B: int,
+  H: int,
+  N: int,
+  D: int,
+  output_path: Path,
+) -> Path | None:
+  """Render the TFLOPS comparison bar chart.
+
+  :param forward_rows: Forward result rows.
+  :param backward_rows: Backward result rows.
+  :param device_name: Device name shown in the title.
+  :param B: Batch size shown in the title.
+  :param H: Head count shown in the title.
+  :param N: Sequence length shown in the title.
+  :param D: Head dimension shown in the title.
+  :param output_path: Output PNG path.
+  :return: Saved PNG path, or ``None`` when no TFLOPS data is available.
+  """
+  fwd_ffpa_tflops = _aggregate_metric(forward_rows, "forward", "ffpa_tflops", plot_cases=TFLOPS_PLOT_CASES)
+  fwd_sdpa_tflops = _aggregate_metric(forward_rows, "forward", "sdpa_tflops", plot_cases=TFLOPS_PLOT_CASES)
+  bwd_ffpa_tflops = _aggregate_metric(backward_rows, "backward", "ffpa_tflops", plot_cases=TFLOPS_PLOT_CASES)
+  bwd_sdpa_tflops = _aggregate_metric(backward_rows, "backward", "sdpa_tflops", plot_cases=TFLOPS_PLOT_CASES)
+  has_forward = fwd_ffpa_tflops is not None and fwd_sdpa_tflops is not None
+  has_backward = bwd_ffpa_tflops is not None and bwd_sdpa_tflops is not None
+  if not has_forward and not has_backward:
+    return None
+
+  attn_types = [label for _, label in TFLOPS_PLOT_CASES]
+  x = np.arange(len(attn_types))
+  fig, ax = plt.subplots(figsize=(32, 12))
+
+  def _autolabel(rects) -> None:
+    for rect in rects:
+      h = rect.get_height()
+      if not np.isfinite(h):
+        continue
+      ax.annotate(
+        format_tflops_short(float(h)),
+        xy=(rect.get_x() + rect.get_width() / 2, h),
+        xytext=(0, 8),
+        textcoords="offset points",
+        ha="center",
+        va="bottom",
+        fontsize=19,
+        fontweight="bold",
+      )
+
+  finite_values: list[float] = []
+  if has_forward and has_backward:
+    width = 0.18
+    x_fwd_sdpa = x - 1.5 * width
+    x_fwd_ffpa = x - 0.5 * width
+    x_bwd_sdpa = x + 0.5 * width
+    x_bwd_ffpa = x + 1.5 * width
+  else:
+    width = 0.20
+    x_fwd_sdpa = x - width / 2 if has_forward else None
+    x_fwd_ffpa = x + width / 2 if has_forward else None
+    x_bwd_sdpa = x - width / 2 if has_backward else None
+    x_bwd_ffpa = x + width / 2 if has_backward else None
+
+  if has_forward and x_fwd_sdpa is not None and x_fwd_ffpa is not None:
+    rect_fwd_sdpa = ax.bar(
+      x_fwd_sdpa,
+      fwd_sdpa_tflops,
+      width,
+      label="SDPA FWD",
+      color=TFLOPS_FWD_SDPA_COLOR,
+      edgecolor="white",
+      linewidth=1,
+    )
+    rect_fwd_ffpa = ax.bar(
+      x_fwd_ffpa,
+      fwd_ffpa_tflops,
+      width,
+      label="FFPA FWD",
+      color=TFLOPS_FWD_FFPA_COLOR,
+      edgecolor="white",
+      linewidth=1,
+    )
+    _autolabel(rect_fwd_sdpa)
+    _autolabel(rect_fwd_ffpa)
+    finite_values.extend(value for value in fwd_sdpa_tflops if np.isfinite(value))
+    finite_values.extend(value for value in fwd_ffpa_tflops if np.isfinite(value))
+
+  if has_backward and x_bwd_sdpa is not None and x_bwd_ffpa is not None:
+    rect_bwd_sdpa = ax.bar(
+      x_bwd_sdpa,
+      bwd_sdpa_tflops,
+      width,
+      label="SDPA BWD",
+      color=TFLOPS_BWD_SDPA_COLOR,
+      edgecolor="white",
+      linewidth=1,
+    )
+    rect_bwd_ffpa = ax.bar(
+      x_bwd_ffpa,
+      bwd_ffpa_tflops,
+      width,
+      label="FFPA BWD",
+      color=TFLOPS_BWD_FFPA_COLOR,
+      edgecolor="white",
+      linewidth=1,
+    )
+    _autolabel(rect_bwd_sdpa)
+    _autolabel(rect_bwd_ffpa)
+    finite_values.extend(value for value in bwd_sdpa_tflops if np.isfinite(value))
+    finite_values.extend(value for value in bwd_ffpa_tflops if np.isfinite(value))
+
+  ax.set_ylabel("Throughput (TFLOPS)", fontsize=18)
+  ax.set_title(
+    f"FFPA vs SDPA TFLOPS ({_mode_suffix(has_forward, has_backward)}) | {device_name} | B={B}, N={N}, H={H}, D={D}",
+    fontsize=22,
+    pad=15,
+    fontweight="bold",
+  )
+  ax.set_xticks(x)
+  ax.set_xticklabels(attn_types, rotation=0, ha="center", fontsize=22, fontweight="bold")
+  ax.tick_params(axis="y", labelsize=16)
+  ymax = max(finite_values) if finite_values else 1.0
+  ax.set_ylim(0, ymax * 1.1 if ymax > 0 else 1.0)
+  ax.legend(fontsize=20, loc="upper left")
+  ax.grid(axis="y", alpha=0.9)
+
+  fig.tight_layout()
+  fig.savefig(output_path)
+  plt.close(fig)
+  return output_path
+
+
 def _sort_rows(rows: list[RESULT_ROW]) -> list[RESULT_ROW]:
   """Sort rows by case order and dtype order.
 
@@ -557,12 +744,12 @@ def _markdown_table_columns(show_allclose: bool) -> tuple[str, str]:
   """
   if show_allclose:
     return (
-      "| Case | dtype | Nq/Nkv | allclose | FFPA / SDPA | speedup |",
-      "|:---:|:---:|:---:|:---:|:---:|:---:|",
+      "| Case | dtype | Nq/Nkv | allclose | FFPA / SDPA | TFLOPS | speedup |",
+      "|:---:|:---:|:---:|:---:|:---:|:---:|:---:|",
     )
   return (
-    "| Case | dtype | Nq/Nkv | FFPA / SDPA | speedup |",
-    "|:---:|:---:|:---:|:---:|:---:|",
+    "| Case | dtype | Nq/Nkv | FFPA / SDPA | TFLOPS | speedup |",
+    "|:---:|:---:|:---:|:---:|:---:|:---:|",
   )
 
 
@@ -579,6 +766,15 @@ def _latency_cell(row: RESULT_ROW) -> str:
   return f"{ffpa_ms:.2f} / {sdpa_ms:.2f} ms"
 
 
+def _tflops_cell(row: RESULT_ROW) -> str:
+  """Format the TFLOPS cell for Markdown tables.
+
+  :param row: Structured result row.
+  :return: Markdown cell content.
+  """
+  return f"{format_tflops_short(row.get('ffpa_tflops'))} / {format_tflops_short(row.get('sdpa_tflops'))}"
+
+
 def _render_table(rows: list[RESULT_ROW], show_allclose: bool) -> list[str]:
   """Render one GFM benchmark table.
 
@@ -592,12 +788,12 @@ def _render_table(rows: list[RESULT_ROW], show_allclose: bool) -> list[str]:
     if show_allclose:
       lines.append(
         "| "
-        f"{row['case_name']} | {row['dtype']} | {row['Nq']}/{row['Nkv']} | {_allclose_marker(row)} | {_latency_cell(row)} | {row['speedup']:.2f}x |"
+        f"{row['case_name']} | {row['dtype']} | {row['Nq']}/{row['Nkv']} | {_allclose_marker(row)} | {_latency_cell(row)} | {_tflops_cell(row)} | {row['speedup']:.2f}x |"
       )
     else:
       lines.append(
         "| "
-        f"{row['case_name']} | {row['dtype']} | {row['Nq']}/{row['Nkv']} | {_latency_cell(row)} | {row['speedup']:.2f}x |"
+        f"{row['case_name']} | {row['dtype']} | {row['Nq']}/{row['Nkv']} | {_latency_cell(row)} | {_tflops_cell(row)} | {row['speedup']:.2f}x |"
       )
   return lines
 
@@ -634,10 +830,14 @@ def render_speedup_markdown(
   :return: Markdown document fragment.
   """
   lines = ["## Benchmark", "", f"Env: {device_name}, B={B}, N={N}, H={H}, D={D}."]
+  lines.extend([
+    "",
+    "TFLOPS reports the theoretical dominant attention GEMM throughput only; forward and backward are computed separately from the measured latency.",
+  ])
   if fallback:
     lines.extend([
       "",
-      "Note: fallback mode reuses hard-coded plot speedups only, so FFPA / SDPA latency and allclose are unavailable."
+      "Note: fallback mode reuses hard-coded plot speedups only, so FFPA / SDPA latency, TFLOPS, and allclose are unavailable."
     ])
   if forward_rows:
     lines.extend(["", f"### Forward Pass ({_forward_section_label(forward_backend, tune_mode, fallback)})", ""])
@@ -718,7 +918,7 @@ def main() -> None:
     forward_rows, backward_rows = _benchmark_rows(args)
 
   output_stem = _resolve_output_stem(args.save_path, device_name, args.B, args.H, args.N, args.D)
-  png_path = plot_speedup(
+  speedup_png_path = plot_speedup(
     forward_rows,
     backward_rows,
     device_name=device_name,
@@ -726,7 +926,17 @@ def main() -> None:
     H=args.H,
     N=args.N,
     D=args.D,
-    output_path=output_stem.with_suffix(".png"),
+    output_path=output_stem.with_name(f"{output_stem.name}_speedup.png"),
+  )
+  tflops_png_path = None if fallback else plot_tflops(
+    forward_rows,
+    backward_rows,
+    device_name=device_name,
+    B=args.B,
+    H=args.H,
+    N=args.N,
+    D=args.D,
+    output_path=output_stem.with_name(f"{output_stem.name}_tflops.png"),
   )
   markdown = render_speedup_markdown(
     forward_rows,
@@ -746,7 +956,11 @@ def main() -> None:
   md_path.write_text(markdown, encoding="utf-8")
 
   print(f"\n{markdown}\n", end="")
-  print(f"Saved plot to {png_path}")
+  print(f"Saved speedup plot to {speedup_png_path}")
+  if tflops_png_path is not None:
+    print(f"Saved TFLOPS plot to {tflops_png_path}")
+  elif fallback:
+    print("Skipped TFLOPS plot in fallback mode because no TFLOPS data is available.")
   print(f"Saved Markdown to {md_path}")
 
 
