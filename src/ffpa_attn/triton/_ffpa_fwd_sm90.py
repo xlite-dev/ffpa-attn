@@ -78,10 +78,10 @@ def _sm90_host_descriptor_pre_hook(nargs):
 @triton.heuristics(_SM90_FWD_HEURISTICS)
 @triton.jit
 def _ffpa_fwd_sm90_kernel_impl(
-  desc_q: TensorDescriptor,
-  desc_k: TensorDescriptor,
-  desc_v: TensorDescriptor,
-  desc_o: TensorDescriptor,
+  desc_q,
+  desc_k,
+  desc_v,
+  desc_o,
   LSE: torch.Tensor,
   AttnBias: torch.Tensor,
   softmax_scale: float,
