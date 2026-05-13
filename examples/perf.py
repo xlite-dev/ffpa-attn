@@ -181,6 +181,8 @@ def _parse_args() -> argparse.Namespace:
   parser.add_argument("--H", type=int, default=32, help="Base head count used by benchmark mode.")
   parser.add_argument("--N", type=int, default=8192, help="Base sequence length used by benchmark mode.")
   parser.add_argument("--D", type=int, default=512, help="Head dimension used by benchmark mode.")
+  parser.add_argument("--warmup", type=int, default=2, help="Warmup iterations used for timing.")
+  parser.add_argument("--iters", type=int, default=10, help="Measured iterations used for timing.")
   parser.add_argument("--seed", type=int, default=42, help="RNG seed used by benchmark mode.")
   parser.add_argument(
     "--norm",
@@ -670,9 +672,11 @@ def _benchmark_rows(args: argparse.Namespace) -> tuple[list[RESULT_ROW], list[RE
         seed=args.seed,
         apply_norm=args.norm,
         forward_backend=args.forward_backend,
-        triton_forward_autotune=args.forward_backend == "triton" and tune_mode is not None,
+        triton_autotune=args.forward_backend == "triton" and tune_mode is not None,
         triton_autotune_mode=tune_mode or "fast",
         triton_backward_grad_v_storage_dtype=grad_v_dtype,
+        warmup=args.warmup,
+        iters=args.iters,
         print_results=True,
       ),
     )
@@ -688,9 +692,11 @@ def _benchmark_rows(args: argparse.Namespace) -> tuple[list[RESULT_ROW], list[RE
         apply_norm=args.norm,
         backward_backend=args.backward_backend,
         timing_mode="backward-only",
-        triton_backward_autotune=args.backward_backend == "triton" and tune_mode is not None,
+        triton_autotune=args.backward_backend == "triton" and tune_mode is not None,
         triton_autotune_mode=tune_mode or "fast",
         triton_backward_grad_v_storage_dtype=grad_v_dtype,
+        warmup=args.warmup,
+        iters=args.iters,
         print_results=True,
       ),
     )

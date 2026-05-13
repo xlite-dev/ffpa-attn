@@ -36,11 +36,11 @@ def parse_args():
     help="Native forward backend to benchmark when not using a compare mode.",
   )
   parser.add_argument(
-    "--triton-forward-autotune",
+    "--triton-autotune",
     "--autotune",
     "--tune",
     action="store_true",
-    help="Enable Triton FFPA forward autotuning (only effective for triton backend).",
+    help="Enable Triton FFPA runtime autotuning (only effective for triton backend).",
   )
   parser.add_argument(
     "--triton-autotune-mode",
@@ -160,7 +160,7 @@ def main():
         stages=stages,
         acc="f32",
         forward_backend=backend,
-        triton_forward_autotune=args.triton_forward_autotune,
+        triton_autotune=args.triton_autotune,
         triton_autotune_mode=args.triton_autotune_mode,
       )
 
@@ -174,7 +174,7 @@ def main():
   print(
     f"shape B={args.B} Hq={args.H} Hkv={nheads_kv} Nq={args.N} Nkv={seqlen_k} "
     f"D={args.D} dtype={args.dtype} causal={args.causal} "
-    f"autotune={args.triton_forward_autotune} autotune_mode={args.triton_autotune_mode} "
+    f"autotune={args.triton_autotune} autotune_mode={args.triton_autotune_mode} "
     f"warmup={args.warmup} iters={args.iters}"
   )
   ref = sdpa(q, k, v).detach()

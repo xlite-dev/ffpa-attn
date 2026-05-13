@@ -7,22 +7,30 @@ the forward/backward Triton launchers when runtime autotune is disabled.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
 import torch
 
+from ..logger import init_logger
+
 SCHEMA_VERSION = 1
 CONFIG_ENV_VAR = "FFPA_TUNED_CONFIG_DIR"
 MAX_CONFIGS_ENV_VAR = "FFPA_AUTOTUNE_MAX_CONFIGS"
+SKIP_PERSISTENT_TUNED_CONFIG_ENV_VAR = "FFPA_SKIP_PERSISIT_TUNED_CONFIG"
+
+logger = init_logger(__name__)
 
 DEFAULT_HEADDIMS = [320, 512, 640, 768, 1024]
 DEFAULT_SEQLENS = [1, 512, 1024, 2048, 4096, 8192, 16384]
 
 _CONFIG_CACHE: dict[tuple[str, str], list[dict[str, Any]]] = {}
+_DEVICE_NAME_CACHE: dict[int, str] = {}
 
 _KERNEL_CONFIG_KEYS = {
   "fwd_generic": {
@@ -91,7 +99,14 @@ class PersistentConfigRequest:
   :param bias_grad: Whether the current backward call writes attention-bias gradients.
   :param grad_v_storage_dtype: Optional Triton backward dV storage dtype name.
   :param use_gemv: Decode backward single-query specialization flag.
+  :param has_attn_bias: Whether an additive attention bias is active.
   :param has_dropout: Whether dropout is active.
+  :param nheads_q: Optional runtime query-head count, kept for callers that
+      want to describe the request. Lookup does not require it to match.
+  :param nheads_kv: Optional runtime key/value-head count before backward
+      GQA/MQA expansion. Lookup does not require it to match.
+  :param device_index: Optional CUDA device index for runtime callers. Passing
+      this avoids a CUDA current-device query on repeated cache hits.
   """
 
   direction: str
@@ -106,7 +121,11 @@ class PersistentConfigRequest:
   bias_grad: bool | None = None
   grad_v_storage_dtype: str | None = None
   use_gemv: bool | None = None
+  has_attn_bias: bool | None = None
   has_dropout: bool | None = None
+  nheads_q: int | None = None
+  nheads_kv: int | None = None
+  device_index: int | None = None
 
 
 def default_config_dir() -> Path:
@@ -146,8 +165,19 @@ def device_config_path(config_dir: Path | None = None, device_name: str | None =
   :return: Path named ``{sanitized_device_name}.json``.
   """
   root = config_dir or runtime_config_dir()
-  name = device_name or torch.cuda.get_device_name(torch.cuda.current_device())
+  name = device_name or _device_name(torch.cuda.current_device())
   return root / f"{sanitize_device_name(name)}.json"
+
+
+def _device_name(device_index: int) -> str:
+  """Return the cached CUDA device name for a device index.
+
+  :param device_index: CUDA device index.
+  :return: CUDA device name.
+  """
+  if device_index not in _DEVICE_NAME_CACHE:
+    _DEVICE_NAME_CACHE[device_index] = torch.cuda.get_device_name(device_index)
+  return _DEVICE_NAME_CACHE[device_index]
 
 
 def dtype_name(dtype: torch.dtype) -> str:
@@ -221,6 +251,14 @@ def max_configs_from_env() -> int | None:
   if limit <= 0:
     raise ValueError(f"{MAX_CONFIGS_ENV_VAR} must be positive, got {value!r}")
   return limit
+
+
+def skip_persistent_tuned_config_from_env() -> bool:
+  """Return whether persistent tuned-config lookup is force-disabled.
+
+  :return: ``True`` when ``FFPA_SKIP_PERSISIT_TUNED_CONFIG=1``.
+  """
+  return os.environ.get(SKIP_PERSISTENT_TUNED_CONFIG_ENV_VAR) == "1"
 
 
 def config_from_triton_config(config: Any) -> dict[str, Any]:
@@ -299,16 +337,81 @@ def load_config_entries(config_dir: Path | None = None, device_name: str | None 
 def clear_config_cache() -> None:
   """Clear the in-process JSON entry cache."""
   _CONFIG_CACHE.clear()
+  _DEVICE_NAME_CACHE.clear()
+  _lookup_persistent_config_cached.cache_clear()
 
 
-def lookup_persistent_config(request: PersistentConfigRequest) -> dict[str, Any] | None:
-  """Find the best persisted launch config for a runtime request.
+def _head_layout_rank(entry: dict[str, Any], request: PersistentConfigRequest) -> int:
+  """Rank head-layout metadata without making it a compatibility filter.
 
-  :param request: Runtime shape and variant filters.
-  :return: Kernel launch meta dict, or ``None`` if no compatible entry exists.
+  Head layout is intentionally a preference, not a hard filter.  The bundled
+  persistent grid currently uses compact representative H values, while lookup
+  should still be able to reuse those configs for nearby GQA/MQA or
+  model-specific head counts.  Decode may eventually deserve stricter layout
+  matching, but the current design keeps it out of the critical path.
+
+  :param entry: Persisted config entry.
+  :param request: Runtime lookup request.
+  :return: ``0`` for an exact recorded head-layout match, otherwise ``1``.
   """
+  if request.nheads_q is None or request.nheads_kv is None:
+    return 1
+  try:
+    if int(entry.get("nheads_q")) == request.nheads_q and int(entry.get("nheads_kv")) == request.nheads_kv:
+      return 0
+  except (TypeError, ValueError):
+    pass
+  return 1
+
+
+def _lookup_cache_key(request: PersistentConfigRequest) -> tuple[str, int, PersistentConfigRequest]:
+  """Return the cache key for one persistent lookup request."""
+  device_index = request.device_index if request.device_index is not None else torch.cuda.current_device()
+  return (os.environ.get(CONFIG_ENV_VAR, ""), device_index, request)
+
+
+def _debug_lookup_message(prefix: str, request: PersistentConfigRequest, config: dict[str, Any] | None) -> None:
+  """Log one DEBUG persistent lookup event.
+
+  :param prefix: Event prefix describing lookup state.
+  :param request: Runtime shape and variant filters.
+  :param config: Selected kernel launch meta dict, or ``None`` on fallback.
+  """
+  logger.debug_once(
+    "%s: direction=%s kernel=%s mode=%s dtype=%s D=%d Nq=%d Nkv=%s "
+    "causal=%s use_gemv=%s bias_grad=%s has_attn_bias=%s has_dropout=%s "
+    "Hq=%s Hkv=%s config=%s",
+    prefix,
+    request.direction,
+    request.kernel,
+    request.autotune_mode,
+    request.dtype,
+    request.headdim,
+    request.seqlen_q,
+    request.seqlen_k,
+    request.causal,
+    request.use_gemv,
+    request.bias_grad,
+    request.has_attn_bias,
+    request.has_dropout,
+    request.nheads_q,
+    request.nheads_kv,
+    config,
+  )
+
+
+@lru_cache(maxsize=None)
+def _lookup_persistent_config_cached(
+  config_dir_key: str,
+  device_index: int,
+  request: PersistentConfigRequest,
+) -> dict[str, Any] | None:
+  """Find and cache the best persisted launch config for one request."""
+  del config_dir_key
+  device_name = _device_name(device_index)
+
   candidates: list[dict[str, Any]] = []
-  for entry in load_config_entries():
+  for entry in load_config_entries(device_name=device_name):
     if entry.get("direction") != request.direction:
       continue
     if entry.get("kernel") != request.kernel:
@@ -330,6 +433,8 @@ def lookup_persistent_config(request: PersistentConfigRequest) -> dict[str, Any]
     if request.grad_v_storage_dtype is None and entry.get("grad_v_storage_dtype") is not None:
       continue
     if request.use_gemv is not None and bool(entry.get("use_gemv", False)) != request.use_gemv:
+      continue
+    if request.has_attn_bias is not None and bool(entry.get("has_attn_bias", False)) != request.has_attn_bias:
       continue
     if request.has_dropout is not None and bool(entry.get("has_dropout", False)) != request.has_dropout:
       continue
@@ -365,5 +470,32 @@ def lookup_persistent_config(request: PersistentConfigRequest) -> dict[str, Any]
 
   if not candidates:
     return None
-  selected = candidates[0]
+  selected = min(candidates, key=lambda entry: _head_layout_rank(entry, request))
   return sanitize_kernel_config(request.kernel, selected["config"])
+
+
+def lookup_persistent_config(request: PersistentConfigRequest) -> dict[str, Any] | None:
+  """Find the best persisted launch config for a runtime request.
+
+  :param request: Runtime shape and variant filters.
+  :return: Kernel launch meta dict, or ``None`` if no compatible entry exists.
+  """
+  if skip_persistent_tuned_config_from_env():
+    if logger.isEnabledFor(logging.DEBUG):
+      _debug_lookup_message("Persistent autotune lookup skipped by env", request, None)
+    return None
+
+  cache_key = _lookup_cache_key(request)
+  if not logger.isEnabledFor(logging.DEBUG):
+    return _lookup_persistent_config_cached(*cache_key)
+
+  hits_before = _lookup_persistent_config_cached.cache_info().hits
+  config = _lookup_persistent_config_cached(*cache_key)
+  hits_after = _lookup_persistent_config_cached.cache_info().hits
+  if hits_after > hits_before and config is not None:
+    _debug_lookup_message("Persistent autotune cache hit", request, config)
+  elif config is not None:
+    _debug_lookup_message("Persistent autotune selected config", request, config)
+  else:
+    _debug_lookup_message("Persistent autotune lookup miss", request, None)
+  return config

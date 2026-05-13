@@ -279,12 +279,16 @@ def _gen_pre_autotune_configs(d_chunk: bool, autotune_mode: str = "max") -> list
   never benchmarked for large head dimensions.
 
   :param d_chunk: Whether generated configs should enable D_CHUNK mode.
+  :param autotune_mode: Accepted for API symmetry; backward preprocess uses the
+      same bounded search space for fast and max because only bwd_main gets an
+      expanded max search.
   :return: Triton autotune configurations for the delta preprocess kernel.
   """
+  del autotune_mode
   configs = []
   for block_m in [64, 128, 256]:
     if not d_chunk:
-      for num_warps in ([4, 8] if autotune_mode == "fast" else [2, 4, 8]):
+      for num_warps in [4, 8]:
         configs.append(triton.Config(
           {
             "BLOCK_M": block_m,
@@ -294,8 +298,8 @@ def _gen_pre_autotune_configs(d_chunk: bool, autotune_mode: str = "max") -> list
         ))
       continue
 
-    for block_headdim in ([64, 128] if autotune_mode == "fast" else [64, 128, 256]):
-      for num_warps in ([4, 8] if autotune_mode == "fast" else [2, 4, 8]):
+    for block_headdim in [64, 128]:
+      for num_warps in [4, 8]:
         configs.append(
           triton.Config(
             {
@@ -328,58 +332,80 @@ def _get_pre_autotune(d_chunk: bool, autotune_mode: str, dtype: str):
 _ffpa_bwd_pre = _ffpa_bwd_pre_impl
 
 
+def _normalize_bwd_pre_config(
+  config: dict[str, object] | None,
+  *,
+  preprocess_d_chunk: bool,
+  block_headdim_delta: int,
+) -> dict[str, object]:
+  """Return a complete launch config for the backward preprocess kernel.
+
+  Older persistent ``bwd_preproc`` entries were generated from full-D autotune
+  configs that relied on the Triton heuristic for ``BLOCK_HEADDIM`` and thus
+  did not serialize that key.  The non-autotuned persistent launcher passes an
+  explicit config dict, so fill the runtime value here before launching.
+
+  :param config: Persisted launch config, or ``None`` when no entry matched.
+  :param preprocess_d_chunk: Whether the preprocess path uses D-chunk mode.
+  :param block_headdim_delta: Full-D ``BLOCK_HEADDIM`` value for this runtime
+      head dimension, or the D-chunk block size when ``preprocess_d_chunk`` is
+      enabled.
+  :return: Complete kernel launch meta dict.
+  """
+  normalized = {
+    "BLOCK_M": 128,
+    "BLOCK_HEADDIM": block_headdim_delta,
+    "D_CHUNK": preprocess_d_chunk,
+    "num_warps": 4,
+  }
+  if config is not None:
+    normalized.update(config)
+  return normalized
+
+
+def _supports_bwd_main_max_extra_configs() -> bool:
+  """Return whether the current GPU should try extra bwd_main max configs."""
+  try:
+    major, _minor = torch.cuda.get_device_capability()
+  except Exception:
+    return False
+  return major >= 9
+
+
 def _gen_bwd_autotune_configs(
   block_n_values: tuple[int, ...],
-  headdim: int = 512,
   autotune_mode: str = "max",
 ) -> list[triton.Config]:
   """Generate autotune configs over BLOCK_M, BLOCK_N, BLOCK_HEADDIM, num_warps, num_stages.
 
   :param block_n_values: Candidate ``BLOCK_N`` values for the target backward
       kernel variant.
-  :param headdim: Full-D ``BLOCK_HEADDIM`` candidate for architectures with
-      enough shared memory.  When the actual runtime headdim matches this
-      value the kernel skips the D-chunk loop entirely.
+  :param autotune_mode: Search-space mode, ``"fast"`` or ``"max"``.
   :return: Triton autotune configurations for one backward kernel variant.
   """
   # BLOCK_M: larger = fewer Q-block iterations (good), more register pressure.
   # BLOCK_N: controls K/V tile size for dK/dV and dQ recomputation.
-  # BLOCK_HEADDIM (gated by available shared memory):
+  # BLOCK_HEADDIM:
   #   64, 128 — classic D-chunk split, low register pressure, widely compatible.
-  #   256     — 2 chunks for D=512, halves HBM reloads.  Requires BLOCK_M ≤ 64
-  #             to fit registers; 1.3x slower on Ampere, may win on Ada+.
-  #   headdim — full-D single chunk, eliminates D-chunk loop entirely.
-  #             Needs >= 128 KB SMEM; only included on Ada (128 KB) or Hopper
-  #             (228 KB).  Skipped on Ampere (99 KB limit).
+  #   256     — SM90+ max-only wider split-D candidate.  On SM < 90 measured
+  #             performance is effectively identical, so max intentionally uses
+  #             the fast search space.  Full-D dynamic candidates and stage-4
+  #             pipelines are still pruned because they make offline persistent
+  #             tuning much slower without a clear default win.
   # TODO: Optimize the autotune time by saving the best config per shape
   # (device-shape/headdim) in a file and loading it at the start of autotune.
-  try:
-    _max_smem = torch.cuda.get_device_properties(0).shared_memory_per_block_optin
-  except Exception:
-    _max_smem = 48 * 1024  # safe fallback: default SMEM
-  _headdim_candidates = [64, 128, 256]
-  # Use triton.next_power_of_2(headdim) as a near-full-D single-chunk block size:
-  #   - power-of-2 headdims (512, 1024): next_pow2 == headdim → single D chunk.
-  #   - non-power-of-2 headdims (320→512, 640→1024): next_pow2 pads to the next
-  #     power-of-2.  The kernel's load/store masks (d_offs < headdim) zero out the
-  #     padding columns, so correctness is preserved.
-  # tl.arange requires a power-of-2 range, so next_power_of_2 always produces a
-  # valid block size. Only included on high-SMEM devices (Ada/Hopper, >= 128 KB);
-  # skip when next_pow2 is already in [64, 128, 256] (dedup).
-  _next_pow2 = triton.next_power_of_2(headdim)
-  if _max_smem >= 128 * 1024 and _next_pow2 not in _headdim_candidates:  # 128 KB
-    if autotune_mode == "max":
-      _headdim_candidates.append(_next_pow2)
-
-  if autotune_mode == "fast":
-    _headdim_candidates = [c for c in _headdim_candidates if c <= 128 or c == headdim]
+  use_extra_max_configs = autotune_mode == "max" and _supports_bwd_main_max_extra_configs()
+  if autotune_mode == "max" and not use_extra_max_configs:
+    block_n_values = (64, )
+  _headdim_candidates = [64, 128, 256] if use_extra_max_configs else [64, 128]
+  _num_stages_candidates = [2, 3]
 
   configs = []
   for block_m in [64, 128]:
     for block_n in block_n_values:
       for block_headdim in _headdim_candidates:
         for num_warps in [4, 8]:
-          for num_stages in ([2, 3] if autotune_mode == "fast" else [2, 3, 4]):
+          for num_stages in _num_stages_candidates:
             configs.append(
               triton.Config(
                 {
@@ -776,7 +802,6 @@ def _get_bwd_autotune(headdim: int, autotune_mode: str, bias_requires_grad: bool
   if cache_key not in _ffpa_bwd_autotune_cache:
     configs = _gen_bwd_autotune_configs(
       block_n_values=(64, ) if autotune_mode == "fast" else (64, 128),
-      headdim=headdim,
       autotune_mode=autotune_mode,
     )
     reset_args = []
@@ -804,32 +829,24 @@ def _gen_decode_bwd_stage1_autotune_configs(
 ) -> list[triton.Config]:
   """Generate decode-backward stage1 autotune configs.
 
-  :param headdim: Runtime head dimension used to decide whether full-D GEMV
-      candidates are worth exploring.
+  :param headdim: Runtime head dimension.  Kept in the signature for caller
+      symmetry; decode backward uses the same bounded search space for fast and
+      max because only bwd_main gets an expanded max search.
   :param use_gemv: Whether the target shape is the single-query GEMV path.
-  :param autotune_mode: Search-space mode, ``"fast"`` or ``"max"``.
+  :param autotune_mode: Accepted search-space mode, ``"fast"`` or ``"max"``.
   :return: Triton autotune configs for the decode backward stage1 kernel.
   """
-  try:
-    max_smem = torch.cuda.get_device_properties(0).shared_memory_per_block_optin
-  except Exception:
-    max_smem = 48 * 1024
+  del headdim, autotune_mode
 
   headdim_candidates = [64, 128]
-  next_pow2 = triton.next_power_of_2(headdim)
-  if use_gemv and autotune_mode == "max" and max_smem >= 96 * 1024 and next_pow2 > 128:
-    headdim_candidates.append(next_pow2)
-
   block_n_candidates = [64, 128]
-  if autotune_mode == "max":
-    block_n_candidates.append(256)
-  block_m_candidates = [8] if use_gemv else ([16] if autotune_mode == "fast" else [16, 32])
+  block_m_candidates = [8] if use_gemv else [16]
 
   configs = []
   for block_n in block_n_candidates:
     for block_m in block_m_candidates:
       for block_headdim in headdim_candidates:
-        for num_stages in ([2] if autotune_mode == "fast" else [2, 3]):
+        for num_stages in [2]:
           configs.append(
             triton.Config(
               {
@@ -1274,6 +1291,7 @@ def _ffpa_attn_backward_triton_impl(
   autotune: bool = False,
   autotune_mode: str = "fast",
   preprocess_d_chunk: bool = False,
+  original_nheads_kv: int | None = None,
   dropout_p: float = 0.0,
   philox_seed: int = 0,
   philox_offset: int = 0,
@@ -1312,11 +1330,13 @@ def _ffpa_attn_backward_triton_impl(
   :param preprocess_d_chunk: Whether the delta preprocess kernel should split
     the head dimension into ``BLOCK_HEADDIM`` chunks instead of processing the
     full head dimension in one program.
+  :param original_nheads_kv: Original KV-head count before GQA/MQA expansion.
   """
   if do.stride(-1) != 1:
     do = do.contiguous()
   batch, nheads, seqlen_q, headdim = q.shape
   _, _, seqlen_k, _ = k.shape
+  original_nheads_kv = original_nheads_kv or nheads
   softmax_scale = softmax_scale or (1.0 / math.sqrt(headdim))
   seqlen_q_rounded = lse.shape[-1]
   autotune_seqlen_q_bucket = autotune_seqlen_key(seqlen_q, autotune_mode)
@@ -1326,7 +1346,13 @@ def _ffpa_attn_backward_triton_impl(
   attn_bias_in = attn_bias if attn_bias is not None else q
   bias_strides = _attn_bias_broadcast_strides(attn_bias, batch, nheads, seqlen_q, seqlen_k)
   bias_requires_grad = grad_attn_bias is not None
-  grad_bias_needs_reduction = _attn_bias_grad_needs_reduction(grad_attn_bias, batch, nheads, seqlen_q, seqlen_k)
+  grad_bias_needs_reduction = _attn_bias_grad_needs_reduction(
+    grad_attn_bias,
+    batch,
+    nheads,
+    seqlen_q,
+    seqlen_k,
+  )
   grad_bias_reduces_m = _attn_bias_grad_reduces_query(grad_attn_bias, seqlen_q)
   # The [1, 1, 1, Nkv] key-position mask is common in examples and avoids
   # materializing [B, Hq, Nq, Nkv]. Route its gradient through the same fp32
@@ -1336,14 +1362,40 @@ def _ffpa_attn_backward_triton_impl(
   use_key_bias_grad_reduction = _attn_bias_grad_is_key_bias(grad_attn_bias, seqlen_q, seqlen_k)
   main_bias_requires_grad = bias_requires_grad
   grad_bias_store_partial = use_key_bias_grad_reduction
+  has_dropout = dropout_p > 0.0
+  runtime_dtype = dtype_name(q.dtype)
+  grad_v_storage_dtype = "fp32" if dv.dtype == torch.float32 else None
+  persisted_main_config = None
+  if not autotune and seqlen_q >= 8:
+    persisted_main_config = lookup_persistent_config(
+      PersistentConfigRequest(
+        direction="backward",
+        kernel="bwd_generic",
+        autotune_mode=autotune_mode,
+        dtype=runtime_dtype,
+        headdim=headdim,
+        seqlen_q=seqlen_q,
+        seqlen_k=seqlen_k,
+        causal=causal,
+        bias_grad=main_bias_requires_grad,
+        grad_v_storage_dtype=grad_v_storage_dtype,
+        has_attn_bias=has_attn_bias,
+        has_dropout=has_dropout,
+        nheads_q=nheads,
+        nheads_kv=original_nheads_kv,
+        device_index=q.device.index,
+      )
+    )
   partial_grad_bias = None
   if use_key_bias_grad_reduction:
-    min_block_m_for_bias = 64 if autotune else 128
+    min_block_m_for_bias = 64 if autotune else int((persisted_main_config or {"BLOCK_M": 128})["BLOCK_M"])
     num_m_blocks_for_bias = triton.cdiv(seqlen_q, min_block_m_for_bias)
     # Main-path autotune can switch between BLOCK_M=64 and BLOCK_M=128. Size the
     # partial key-bias buffer for the smallest candidate so BLOCK_M=64 has room
-    # for every Q block, and zero-init it so larger BLOCK_M configs safely leave
-    # the extra rows unused.
+    # for every Q block. Persistent mode must use the selected BLOCK_M; otherwise
+    # a persisted BLOCK_M=64 kernel would write more rows than a fallback-sized
+    # BLOCK_M=128 buffer provides. Zero-init so larger BLOCK_M configs safely
+    # leave the extra rows unused.
     partial_grad_bias = torch.zeros(
       (batch * nheads, num_m_blocks_for_bias, seqlen_k),
       dtype=torch.float32,
@@ -1358,8 +1410,13 @@ def _ffpa_attn_backward_triton_impl(
     )
   else:
     grad_attn_bias_in = grad_attn_bias if grad_attn_bias is not None else q
-    grad_bias_strides = _attn_bias_broadcast_strides(grad_attn_bias, batch, nheads, seqlen_q, seqlen_k)
-  has_dropout = dropout_p > 0.0
+    grad_bias_strides = _attn_bias_broadcast_strides(
+      grad_attn_bias,
+      batch,
+      nheads,
+      seqlen_q,
+      seqlen_k,
+    )
 
   assert q.dtype == k.dtype == v.dtype == o.dtype == do.dtype
   assert q.dtype in (torch.float16, torch.bfloat16)
@@ -1368,37 +1425,36 @@ def _ffpa_attn_backward_triton_impl(
     DTYPE = tl.float16
   else:
     DTYPE = tl.bfloat16
-  runtime_dtype = dtype_name(q.dtype)
-  grad_v_storage_dtype = "fp32" if dv.dtype == torch.float32 else None
   autotune_dtype_key = 1 if q.dtype == torch.bfloat16 else 0
 
-  BLOCK_HEADDIM_DELTA = max(triton.next_power_of_2(headdim), 16)
+  BLOCK_HEADDIM_DELTA = max(64, triton.next_power_of_2(headdim))
   delta = torch.empty_like(lse)
+
+  def pre_grid(meta: dict) -> tuple[int, int]:
+    return (triton.cdiv(seqlen_q, meta["BLOCK_M"]), batch * nheads)
+
+  pre_args = (
+    o,
+    do,
+    delta,
+    o.stride(0),
+    o.stride(1),
+    o.stride(2),
+    do.stride(0),
+    do.stride(1),
+    do.stride(2),
+    nheads,
+    seqlen_q,
+    autotune_seqlen_q_bucket,
+    seqlen_q_rounded,
+    headdim,
+  )
   if autotune:
-
-    def pre_grid(meta: dict) -> tuple[int, int]:
-      return (triton.cdiv(seqlen_q, meta["BLOCK_M"]), batch * nheads)
-
     pre_kernel = _get_pre_autotune(preprocess_d_chunk, autotune_mode, runtime_dtype)
-    pre_kernel[pre_grid](
-      o,
-      do,
-      delta,
-      o.stride(0),
-      o.stride(1),
-      o.stride(2),
-      do.stride(0),
-      do.stride(1),
-      do.stride(2),
-      nheads,
-      seqlen_q,
-      autotune_seqlen_q_bucket,
-      seqlen_q_rounded,
-      headdim,
-    )
+    pre_kernel[pre_grid](*pre_args)
   else:
     block_headdim_delta = 64 if preprocess_d_chunk else BLOCK_HEADDIM_DELTA
-    pre_config = lookup_persistent_config(
+    persisted_pre_config = lookup_persistent_config(
       PersistentConfigRequest(
         direction="backward",
         kernel="bwd_preproc",
@@ -1407,28 +1463,16 @@ def _ffpa_attn_backward_triton_impl(
         headdim=headdim,
         seqlen_q=seqlen_q,
         preprocess_d_chunk=preprocess_d_chunk,
+        device_index=q.device.index,
       )
-    ) or {
-      "BLOCK_M": 128,
-      "BLOCK_HEADDIM": block_headdim_delta,
-      "D_CHUNK": preprocess_d_chunk,
-      "num_warps": 4,
-    }
+    )
+    pre_config = _normalize_bwd_pre_config(
+      persisted_pre_config,
+      preprocess_d_chunk=preprocess_d_chunk,
+      block_headdim_delta=block_headdim_delta,
+    )
     _ffpa_bwd_pre[(triton.cdiv(seqlen_q, pre_config["BLOCK_M"]), batch * nheads)](
-      o,
-      do,
-      delta,
-      o.stride(0),
-      o.stride(1),
-      o.stride(2),
-      do.stride(0),
-      do.stride(1),
-      do.stride(2),
-      nheads,
-      seqlen_q,
-      autotune_seqlen_q_bucket,
-      seqlen_q_rounded,
-      headdim,
+      *pre_args,
       **pre_config,
     )
 
@@ -1444,6 +1488,7 @@ def _ffpa_attn_backward_triton_impl(
     block_m_decode = 8 if use_gemv else 16
     block_n_decode = 64 if use_gemv else 128
     block_headdim_decode = 64
+    reduce_block_headdim_decode = block_headdim_decode
     decode_persisted_config = None
     if not autotune:
       decode_persisted_config = lookup_persistent_config(
@@ -1459,7 +1504,11 @@ def _ffpa_attn_backward_triton_impl(
           bias_grad=main_bias_requires_grad,
           grad_v_storage_dtype=grad_v_storage_dtype,
           use_gemv=use_gemv,
+          has_attn_bias=has_attn_bias,
           has_dropout=has_dropout,
+          nheads_q=nheads,
+          nheads_kv=original_nheads_kv,
+          device_index=q.device.index,
         )
       )
       if decode_persisted_config is not None:
@@ -1550,7 +1599,12 @@ def _ffpa_attn_backward_triton_impl(
       USE_GEMV=use_gemv,
     )
     if autotune:
-      _get_decode_bwd_stage1_autotune(headdim, use_gemv, autotune_mode, main_bias_requires_grad)[decode_grid](
+      _get_decode_bwd_stage1_autotune(
+        headdim,
+        use_gemv,
+        autotune_mode,
+        main_bias_requires_grad,
+      )[decode_grid](
         *decode_stage1_args,
         **decode_stage1_meta,
       )
@@ -1567,27 +1621,30 @@ def _ffpa_attn_backward_triton_impl(
         **decode_stage1_meta,
         **decode_launch_config,
       )
-    _ffpa_bwd_decode_dq_reduce_kernel[
-      (triton.cdiv(headdim, block_headdim_decode), triton.cdiv(seqlen_q, block_m_decode), batch * nheads)](
-        partial_dq,
-        written_k_blocks,
-        dq,
-        partial_dq.stride(0),
-        partial_dq.stride(1),
-        partial_dq.stride(2),
-        partial_dq.stride(3),
-        dq.stride(0),
-        dq.stride(1),
-        dq.stride(2),
-        nheads,
-        seqlen_q,
-        headdim,
-        BLOCK_K=64,
-        BLOCK_M=block_m_decode,
-        BLOCK_HEADDIM=block_headdim_decode,
-        num_warps=8,
-        num_stages=2,
-      )
+    _ffpa_bwd_decode_dq_reduce_kernel[(
+      triton.cdiv(headdim, reduce_block_headdim_decode),
+      triton.cdiv(seqlen_q, block_m_decode),
+      batch * nheads,
+    )](
+      partial_dq,
+      written_k_blocks,
+      dq,
+      partial_dq.stride(0),
+      partial_dq.stride(1),
+      partial_dq.stride(2),
+      partial_dq.stride(3),
+      dq.stride(0),
+      dq.stride(1),
+      dq.stride(2),
+      nheads,
+      seqlen_q,
+      headdim,
+      BLOCK_K=64,
+      BLOCK_M=block_m_decode,
+      BLOCK_HEADDIM=reduce_block_headdim_decode,
+      num_warps=8,
+      num_stages=2,
+    )
     return
 
   def grid(meta: dict) -> tuple[int, ...]:
@@ -1662,21 +1719,7 @@ def _ffpa_attn_backward_triton_impl(
       DTYPE=DTYPE,
     )
   else:
-    main_config = lookup_persistent_config(
-      PersistentConfigRequest(
-        direction="backward",
-        kernel="bwd_generic",
-        autotune_mode=autotune_mode,
-        dtype=runtime_dtype,
-        headdim=headdim,
-        seqlen_q=seqlen_q,
-        seqlen_k=seqlen_k,
-        causal=causal,
-        bias_grad=main_bias_requires_grad,
-        grad_v_storage_dtype=grad_v_storage_dtype,
-        has_dropout=has_dropout,
-      )
-    ) or {
+    main_config = persisted_main_config or {
       "BLOCK_M": 128,
       "BLOCK_N": 64,
       "BLOCK_HEADDIM": 64,
@@ -1842,7 +1885,8 @@ def _ffpa_attn_backward_triton(
     lse_padded[..., :lse.size(-1)] = lse
     lse = lse_padded
 
-  group_size = q.size(1) // k.size(1)
+  original_nheads_kv = k.size(1)
+  group_size = q.size(1) // original_nheads_kv
   if group_size > 1:
     # GQA/MQA contract: kernels operate on expanded query-head layout. Gradients
     # for repeated KV heads are summed back into the original KV head dimension
@@ -1867,6 +1911,7 @@ def _ffpa_attn_backward_triton(
     int(preprocess_d_chunk),
     int(return_attn_bias_grad and attn_bias is not None),
     int(grad_v_storage_dtype == torch.float32),
+    original_nheads_kv,
     dropout_p,
     philox_seed,
     philox_offset,

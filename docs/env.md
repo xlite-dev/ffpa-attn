@@ -30,6 +30,8 @@ These only affect the ccache-based fast-build wrapper.
 
 These are read by `env.py` and gate which generated kernel template is dispatched at import / call time. All are booleans (`0` / `1`) unless noted.
 
+- <span style="color:#c77dff;">FFPA_SKIP_PERSISIT_TUNED_CONFIG</span>, default `False (0)`, When set to `1`, `lookup_persistent_config()` always returns `None` even if a device JSON exists and matches. This is useful for A/B benchmarking the persistent tuned-config path against the built-in fallback launch defaults without changing call sites.
+
 ### MMA accumulator dtype
 
 - <span style="color:#c77dff;">ENABLE_FFPA_FORCE_QK_F16</span>, default `False (0)`, Force `Q@K^T` MMA accumulator to FP16 within the FFPA Acc-F32 kernels. Enables the mixed mode `Q@K^T MMA Acc F16 + P@V MMA Acc F32`.

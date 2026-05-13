@@ -37,10 +37,9 @@ _FFPA_ATTN_IMPL_DEFAULTS: dict[str, object] = {
   "enable_tma": False,
   "high_precision_grad": False,
   "forward_backend": "triton",
-  "triton_forward_autotune": False,
+  "triton_autotune": False,
   "triton_autotune_mode": "fast",
   "backward_backend": "triton",
-  "triton_backward_autotune": False,
   "triton_backward_preprocess_d_chunk": False,
   "triton_backward_grad_v_storage_dtype": None,
 }
@@ -185,11 +184,10 @@ class FFPAAttnMeta:
   :param is_grad_enabled: Grad-mode state captured at the public API.
   :param high_precision_grad: Whether SDPA backward should upcast.
   :param forward_backend: Forward backend name, ``"cuda"`` or ``"triton"``.
-  :param triton_forward_autotune: Whether to enable Triton forward autotune.
+  :param triton_autotune: Whether to enable Triton runtime autotune.
   :param triton_autotune_mode: Triton autotune search-space mode,
     ``"fast"`` or ``"max"``.
   :param backward_backend: Backward backend name. ``"sdpa"`` or ``"triton"``.
-  :param triton_backward_autotune: Whether to enable Triton backward autotune.
   :param triton_backward_preprocess_d_chunk: Whether Triton backward should
     compute delta with the split-D preprocess kernel.
   :param triton_backward_grad_v_storage_dtype: Optional storage dtype for
@@ -206,10 +204,9 @@ class FFPAAttnMeta:
   is_grad_enabled: bool
   high_precision_grad: bool
   forward_backend: str
-  triton_forward_autotune: bool
+  triton_autotune: bool
   triton_autotune_mode: str
   backward_backend: str
-  triton_backward_autotune: bool
   triton_backward_preprocess_d_chunk: bool
   triton_backward_grad_v_storage_dtype: torch.dtype | None
 
@@ -235,10 +232,9 @@ class FFPAAttnMeta:
     enable_tma = int(bool(impl_options["enable_tma"]))
     high_precision_grad = bool(impl_options["high_precision_grad"])
     forward_backend = str(impl_options["forward_backend"])
-    triton_forward_autotune = bool(impl_options["triton_forward_autotune"])
+    triton_autotune = bool(impl_options["triton_autotune"])
     triton_autotune_mode = str(impl_options["triton_autotune_mode"])
     backward_backend = str(impl_options["backward_backend"])
-    triton_backward_autotune = bool(impl_options["triton_backward_autotune"])
     triton_backward_preprocess_d_chunk = bool(impl_options["triton_backward_preprocess_d_chunk"])
     triton_backward_grad_v_storage_dtype = impl_options["triton_backward_grad_v_storage_dtype"]
 
@@ -274,10 +270,9 @@ class FFPAAttnMeta:
       enable_tma=enable_tma,
       high_precision_grad=high_precision_grad,
       forward_backend=forward_backend,
-      triton_forward_autotune=triton_forward_autotune,
+      triton_autotune=triton_autotune,
       triton_autotune_mode=triton_autotune_mode,
       backward_backend=backward_backend,
-      triton_backward_autotune=triton_backward_autotune,
       triton_backward_preprocess_d_chunk=triton_backward_preprocess_d_chunk,
       triton_backward_grad_v_storage_dtype=triton_backward_grad_v_storage_dtype,
     )
@@ -517,7 +512,7 @@ class _FFPAAttnFunc(torch.autograd.Function):
         O,
         meta.is_causal,
         meta.scale,
-        meta.triton_forward_autotune,
+        meta.triton_autotune,
         meta.triton_autotune_mode,
         attn_bias,
         meta.dropout_p,
@@ -570,7 +565,7 @@ class _FFPAAttnFunc(torch.autograd.Function):
           lse=lse,
           causal=meta.is_causal,
           softmax_scale=meta.scale,
-          autotune=meta.triton_backward_autotune,
+          autotune=meta.triton_autotune,
           autotune_mode=meta.triton_autotune_mode,
           preprocess_d_chunk=meta.triton_backward_preprocess_d_chunk,
           attn_bias=attn_bias,
