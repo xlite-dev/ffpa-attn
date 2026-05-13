@@ -28,6 +28,7 @@ import torch
 import torch.nn.functional as F
 
 from ffpa_attn import ffpa_attn_func
+from attention_flops import attention_bwd_flops, format_tflops_short, tflops_from_ms
 
 DEFAULT_WARMUP = 2
 DEFAULT_ITERS = 10
@@ -169,21 +170,21 @@ def _resolve_non_aligned_heads(num_heads: int) -> int:
 def _mask_grad_status(
   dmask_ffpa: torch.Tensor | None,
   dmask_ref: torch.Tensor | None,
-  compare_mask_grad: bool,
+  mask_grad_skip_reason: str | None,
   attn_mask: torch.Tensor | None,
 ) -> tuple[float | None, str | None]:
   """Summarize mask-gradient comparison status.
 
   :param dmask_ffpa: FFPA mask gradient.
   :param dmask_ref: Reference mask gradient.
-  :param compare_mask_grad: Whether mask gradient comparison was requested.
+  :param mask_grad_skip_reason: Reason why mask gradient comparison was skipped.
   :param attn_mask: Original additive mask.
   :return: ``(error, status)`` pair.
   """
   if dmask_ffpa is not None and dmask_ref is not None:
     return (dmask_ffpa.float() - dmask_ref.float()).abs().max().item(), "compared"
-  if attn_mask is not None and not compare_mask_grad:
-    return None, "skipped-large-logical-mask"
+  if attn_mask is not None and mask_grad_skip_reason is not None:
+    return None, mask_grad_skip_reason
   return None, "no-grad"
 
 
@@ -269,6 +270,8 @@ def _format_backward_result(result: BACKWARD_RESULT) -> str:
     dmask_msg = f"dMask_err={result['dmask_err']:.4e}  "
   elif result["dmask_status"] == "skipped-large-logical-mask":
     dmask_msg = "dMask_err=(SKIPPED large logical mask)  "
+  elif result["dmask_status"] == "skipped-ffpa-forward-fallback":
+    dmask_msg = "dMask_err=(SKIPPED FFPA fwd fallback)  "
   else:
     dmask_msg = "dMask_err=(NO Grad)  "
   return (
@@ -280,6 +283,7 @@ def _format_backward_result(result: BACKWARD_RESULT) -> str:
     f"dV_err={result['dv_err']:.4e}  {dmask_msg}"
     f"backend={result['backward_backend']}  "
     f"FFPA={result['ffpa_ms']:.2f} ms  SDPA={result['sdpa_ms']:.2f} ms  "
+    f"TFLOPS={format_tflops_short(result['ffpa_tflops'])}/{format_tflops_short(result['sdpa_tflops'])}  "
     f"speedup={result['speedup']:.2f}x"
   )
 
@@ -537,12 +541,33 @@ def _sdpa_ref_grads(
   return q_ref.grad, k_ref.grad, v_ref.grad, attn_mask_ref.grad if attn_mask_ref is not None else None
 
 
-def _should_compare_mask_grad(B: int, Nh_q: int, Nq: int, Nkv: int, attn_mask: torch.Tensor | None) -> bool:
-  """Return whether the example should ask SDPA for additive-mask gradients."""
+def _mask_grad_skip_reason(
+  B: int,
+  Nh_q: int,
+  Nq: int,
+  Nkv: int,
+  D: int,
+  attn_mask: torch.Tensor | None,
+) -> str | None:
+  """Return why additive mask-gradient comparison should be skipped.
+
+  The backward example keeps additive masks in fp32 only when the call stays on
+  FFPA's large-D forward path, because that is the path whose internal fp32
+  attention-bias gradient handling we want to validate. When the public API
+  falls back to native SDPA forward, passing a fp32 additive bias alongside bf16
+  or fp16 queries triggers a dtype mismatch in the native op.
+
+  :return: Skip reason string, or ``None`` when mask-gradient comparison should
+    proceed.
+  """
   del B, Nh_q
   if attn_mask is None or not attn_mask.requires_grad:
-    return False
-  return Nq <= MAX_MASK_GRAD_SEQLEN and Nkv <= MAX_MASK_GRAD_SEQLEN
+    return "no-grad"
+  if Nq > MAX_MASK_GRAD_SEQLEN or Nkv > MAX_MASK_GRAD_SEQLEN:
+    return "skipped-large-logical-mask"
+  if D <= 256 or D > 1024 or (8 <= Nq < 512) or Nkv < 512:
+    return "skipped-ffpa-forward-fallback"
+  return None
 
 
 def _run_case(
@@ -578,7 +603,8 @@ def _run_case(
   v = v.requires_grad_(True)
   scale = 1.0 / math.sqrt(D)
   dropout_seed = seed + 17
-  compare_mask_grad = _should_compare_mask_grad(B, Nh_q, Nq, Nkv, attn_mask)
+  mask_grad_skip_reason = _mask_grad_skip_reason(B, Nh_q, Nq, Nkv, D, attn_mask)
+  compare_mask_grad = mask_grad_skip_reason is None
   active_attn_mask = _prepare_attn_mask(attn_mask, q.dtype, compare_mask_grad)
 
   torch.manual_seed(dropout_seed)
@@ -703,11 +729,13 @@ def _run_case(
       rng_seed=dropout_seed if dropout_p > 0.0 else None,
     )
 
+  flop_count = attention_bwd_flops(B, Nh_q, Nq, Nkv, D, causal)
+
   tol = 7.5e-2 if dtype == torch.bfloat16 and causal else 5e-2 if dtype == torch.bfloat16 else 2e-2
   dq_err = _max_abs_diff(dq_ffpa, dq_ref)
   dk_err = _max_abs_diff(dk_ffpa, dk_ref)
   dv_err = _max_abs_diff(dv_ffpa, dv_ref)
-  dmask_err, dmask_status = _mask_grad_status(dmask_ffpa, dmask_ref, compare_mask_grad, attn_mask)
+  dmask_err, dmask_status = _mask_grad_status(dmask_ffpa, dmask_ref, mask_grad_skip_reason, attn_mask)
   allclose = (
     _tensor_allclose(dq_ffpa, dq_ref, tol) and _tensor_allclose(dk_ffpa, dk_ref, tol)
     and _tensor_allclose(dv_ffpa, dv_ref, tol)
@@ -740,6 +768,8 @@ def _run_case(
     "iters": iters,
     "ffpa_ms": ms_ffpa,
     "sdpa_ms": ms_sdpa,
+    "ffpa_tflops": tflops_from_ms(flop_count, ms_ffpa),
+    "sdpa_tflops": tflops_from_ms(flop_count, ms_sdpa),
     "speedup": ms_sdpa / ms_ffpa,
   }
   if print_result:
