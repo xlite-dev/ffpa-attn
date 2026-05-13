@@ -254,23 +254,24 @@ def _gen_fwd_sm90_autotune_configs(headdim: int = 256, autotune_mode: str = "max
 
   configs = []
   for block_m in [64, 128]:
-    for block_headdim in _headdim_candidates:
-      num_warps_candidates = [8] if autotune_mode == "fast" else [4, 8]
-      for num_warps in num_warps_candidates:
-        for num_stages in [2, 3]:
-          configs.append(
-            triton.Config(
-              {
-                "BLOCK_M": block_m,
-                "BLOCK_N": 64,
-                "BLOCK_HEADDIM_QK": block_headdim,
-                "BLOCK_HEADDIM_V": block_headdim,
-              },
-              num_warps=num_warps,
-              num_stages=num_stages,
-              pre_hook=_sm90_host_descriptor_pre_hook,
+    for block_n in [64, 128]:
+      for block_headdim in _headdim_candidates:
+        num_warps_candidates = [8] if autotune_mode == "fast" else [4, 8]
+        for num_warps in num_warps_candidates:
+          for num_stages in [2, 3]:
+            configs.append(
+              triton.Config(
+                {
+                  "BLOCK_M": block_m,
+                  "BLOCK_N": block_n,
+                  "BLOCK_HEADDIM_QK": block_headdim,
+                  "BLOCK_HEADDIM_V": block_headdim,
+                },
+                num_warps=num_warps,
+                num_stages=num_stages,
+                pre_hook=_sm90_host_descriptor_pre_hook,
+              )
             )
-          )
   return configs
 
 
