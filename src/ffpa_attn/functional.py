@@ -179,7 +179,10 @@ class FFPAAttnMeta:
   :param scale: Scale applied to ``QK^T``.
   :param stages: CUDA forward pipeline stages.
   :param acc: Native CUDA accumulator code.
-  :param enable_tma: Reserved for future Triton TMA kernels. Currently a no-op.
+  :param enable_tma: Experimental SM90+ Triton forward path (descriptor/TMA).
+    Only effective when ``forward_backend='triton'`` and the device capability
+    is >= 9.  Falls back silently to the standard Triton forward otherwise.
+    Defaults to ``False``.
   :param dropout_p: Dropout probability (default 0.0).
   :param is_grad_enabled: Grad-mode state captured at the public API.
   :param high_precision_grad: Whether SDPA backward should upcast.
@@ -518,6 +521,7 @@ class _FFPAAttnFunc(torch.autograd.Function):
         meta.dropout_p,
         int(rng_state[0].item()) if rng_state.numel() else 0,
         int(rng_state[1].item()) if rng_state.numel() else 0,
+        bool(meta.enable_tma),
       )
     else:
       raise ValueError(f"Unsupported forward_backend={meta.forward_backend!r};")

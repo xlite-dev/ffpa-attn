@@ -1320,12 +1320,17 @@ def _ffpa_attn_forward_impl(
   dropout_p: float = 0.0,
   philox_seed: int = 0,
   philox_offset: int = 0,
+  enable_tma: bool = False,
 ) -> None:
   """Run the Triton FFPA Split-D forward kernel.
 
   This is the low-level implementation entry used by the registered torch op.
   It validates tensor layout/dtypes, chooses between the generic and split-kv
   decode paths, and forwards the saved dropout RNG state to the selected kernel.
+
+  When ``enable_tma=True`` and the device supports SM >= 90, the experimental
+  TMA forward path in :mod:`._ffpa_fwd_sm90` is tried for the generic prefill
+  path; otherwise the existing Triton forward is used unchanged.
 
   :param q: Query tensor in ``[B, Hq, Nq, D]`` layout.
   :param k: Key tensor in ``[B, Hkv, Nkv, D]`` layout.
@@ -1346,6 +1351,9 @@ def _ffpa_attn_forward_impl(
       ``dropout_p == 0``.
   :param philox_offset: Philox element offset used for SDPA-compatible dropout
       RNG layout.
+  :param enable_tma: Whether the experimental SM90+ TMA forward path may be
+      used. Defaults to ``False``. The SM90 path is silently skipped when
+      hardware or shape preconditions are not met.
   """
   batch, nheads_q, seqlen_q, headdim = q.shape
   _, _, seqlen_k, _ = k.shape
@@ -1359,6 +1367,28 @@ def _ffpa_attn_forward_impl(
     raise ValueError(f"Triton forward supports headdim <= {_MAX_HEADDIM}, got {headdim}")
 
   num_splits = _get_decode_num_splits(seqlen_q, seqlen_k, headdim, batch, nheads_q, q.device)
+
+  if enable_tma and num_splits == 1:
+    from ._ffpa_fwd_sm90 import is_sm90_tma_forward_supported as _sm90_supported
+    from ._ffpa_fwd_sm90 import _ffpa_attn_forward_sm90_tma_impl as _sm90_impl
+
+    if _sm90_supported(q, k, v, o, num_splits=num_splits):
+      _sm90_impl(
+        q,
+        k,
+        v,
+        o,
+        lse,
+        attn_bias=attn_bias,
+        causal=causal,
+        softmax_scale=softmax_scale,
+        autotune=autotune,
+        autotune_mode=autotune_mode,
+        dropout_p=dropout_p,
+        philox_seed=philox_seed,
+        philox_offset=philox_offset,
+      )
+      return
 
   if num_splits == 1:
     _ffpa_attn_forward_generic_impl(
@@ -1409,6 +1439,7 @@ def _ffpa_attn_forward_triton(
   dropout_p: float = 0.0,
   philox_seed: int = 0,
   philox_offset: int = 0,
+  enable_tma: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
   """Call the Triton FFPA forward via registered torch op, returning ``(O, softmax_lse)``.
 
@@ -1432,6 +1463,8 @@ def _ffpa_attn_forward_triton(
     ``dropout_p == 0``.
   :param philox_offset: Philox element offset used for SDPA-compatible dropout
     RNG layout.
+  :param enable_tma: Whether the experimental SM90+ TMA forward path may be
+    used. Defaults to ``False``.
   :returns: Output tensor and softmax LSE sliced to visible shape ``[B, Nh_q, Nq]``.
   """
   if Q.stride(-1) != 1:
@@ -1455,5 +1488,6 @@ def _ffpa_attn_forward_triton(
     dropout_p,
     philox_seed,
     philox_offset,
+    int(enable_tma),
   )
   return O_storage, softmax_lse_storage[..., :seqlen_q]
