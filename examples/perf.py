@@ -562,17 +562,17 @@ def plot_speedup(
     f"FFPA vs SDPA Speedup ({_mode_suffix(has_forward, has_backward)}) | {device_name} | B={B}, N={N}, H={H}, D={D}",
     fontsize=22,
     fontweight="bold",
-    y=0.965,
+    y=0.958,
   )
   ax.set_xticks(x)
   ax.set_xticklabels(attn_types, rotation=0, ha="center", fontsize=22, fontweight="bold")
   ax.tick_params(axis="y", labelsize=16)
   ymax = max(finite_values) if finite_values else 1.0
-  ax.set_ylim(0, ymax * 1.28 if ymax > 0 else 1.0)
+  ax.set_ylim(0, ymax * 1.17 if ymax > 0 else 1.0)
   ax.legend(
     fontsize=20,
     loc="upper center",
-    bbox_to_anchor=(0.5, 0.985),
+    bbox_to_anchor=(0.5, 0.972),
     ncol=3 if has_forward and has_backward else 2,
     columnspacing=1.5,
     handletextpad=0.6,
@@ -580,7 +580,7 @@ def plot_speedup(
   )
   ax.grid(axis="y", alpha=0.9)
 
-  fig.tight_layout(rect=(0, 0, 1, 0.96))
+  fig.tight_layout(rect=(0, 0, 1, 0.955))
   fig.savefig(output_path)
   plt.close(fig)
   return output_path
@@ -705,17 +705,17 @@ def plot_tflops(
     f"FFPA vs SDPA TFLOPS ({_mode_suffix(has_forward, has_backward)}) | {device_name} | B={B}, N={N}, H={H}, D={D}",
     fontsize=22,
     fontweight="bold",
-    y=0.965,
+    y=0.958,
   )
   ax.set_xticks(x)
   ax.set_xticklabels(attn_types, rotation=0, ha="center", fontsize=22, fontweight="bold")
   ax.tick_params(axis="y", labelsize=16)
   ymax = max(finite_values) if finite_values else 1.0
-  ax.set_ylim(0, ymax * 1.28 if ymax > 0 else 1.0)
+  ax.set_ylim(0, ymax * 1.18 if ymax > 0 else 1.0)
   ax.legend(
     fontsize=20,
     loc="upper center",
-    bbox_to_anchor=(0.5, 0.985),
+    bbox_to_anchor=(0.5, 0.968),
     ncol=4,
     columnspacing=1.5,
     handletextpad=0.6,
@@ -723,7 +723,7 @@ def plot_tflops(
   )
   ax.grid(axis="y", alpha=0.9)
 
-  fig.tight_layout(rect=(0, 0, 1, 0.96))
+  fig.tight_layout(rect=(0, 0, 1, 0.955))
   fig.savefig(output_path)
   plt.close(fig)
   return output_path
