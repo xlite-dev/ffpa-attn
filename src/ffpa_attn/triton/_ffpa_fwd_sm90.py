@@ -431,6 +431,7 @@ def _ffpa_attn_forward_sm90_generic_impl(
       DTYPE=DTYPE,
       HEADDIM=headdim,
     )
+    print(autotune_fn.best_config)
     return
 
   # --- fixed-config launch ---
