@@ -22,6 +22,7 @@ from ..logger import init_logger
 SCHEMA_VERSION = 1
 CONFIG_ENV_VAR = "FFPA_TUNED_CONFIG_DIR"
 MAX_CONFIGS_ENV_VAR = "FFPA_AUTOTUNE_MAX_CONFIGS"
+SKIP_PERSISTENT_TUNED_CONFIG_ENV_VAR = "FFPA_SKIP_PERSISIT_TUNED_CONFIG"
 
 logger = init_logger(__name__)
 
@@ -252,6 +253,14 @@ def max_configs_from_env() -> int | None:
   return limit
 
 
+def skip_persistent_tuned_config_from_env() -> bool:
+  """Return whether persistent tuned-config lookup is force-disabled.
+
+  :return: ``True`` when ``FFPA_SKIP_PERSISIT_TUNED_CONFIG=1``.
+  """
+  return os.environ.get(SKIP_PERSISTENT_TUNED_CONFIG_ENV_VAR) == "1"
+
+
 def config_from_triton_config(config: Any) -> dict[str, Any]:
   """Serialize a ``triton.Config``-like object to plain JSON data.
 
@@ -471,6 +480,11 @@ def lookup_persistent_config(request: PersistentConfigRequest) -> dict[str, Any]
   :param request: Runtime shape and variant filters.
   :return: Kernel launch meta dict, or ``None`` if no compatible entry exists.
   """
+  if skip_persistent_tuned_config_from_env():
+    if logger.isEnabledFor(logging.DEBUG):
+      _debug_lookup_message("Persistent autotune lookup skipped by env", request, None)
+    return None
+
   cache_key = _lookup_cache_key(request)
   if not logger.isEnabledFor(logging.DEBUG):
     return _lookup_persistent_config_cached(*cache_key)

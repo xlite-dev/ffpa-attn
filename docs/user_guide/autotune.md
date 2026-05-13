@@ -257,6 +257,15 @@ FFPA_TUNED_CONFIG_DIR=/tmp/ffpa-config-smoke \
 python your_script.py
 ```
 
+To compare persistent tuned configs against the built-in fallback launch defaults without removing the JSON, force runtime lookup to bypass persisted entries:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 \
+FFPA_TUNED_CONFIG_DIR=/tmp/ffpa-config-smoke \
+FFPA_SKIP_PERSISIT_TUNED_CONFIG=1 \
+python your_script.py
+```
+
 For repository tests, a focused check is:
 
 ```bash

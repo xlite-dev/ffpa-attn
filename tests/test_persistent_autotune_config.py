@@ -147,6 +147,50 @@ def test_lookup_reuses_cached_request_result(tmp_path, monkeypatch):
   assert load_calls == 1
 
 
+def test_lookup_skip_persistent_tuned_config_env_returns_none(tmp_path, monkeypatch):
+  _patch_cuda_device(monkeypatch)
+  monkeypatch.setenv(persistent.CONFIG_ENV_VAR, str(tmp_path))
+  persistent.clear_config_cache()
+  path = persistent.device_config_path(tmp_path, "NVIDIA L20")
+  persistent.write_config_file(
+    _payload([
+      {
+        "direction": "forward",
+        "kernel": "fwd_generic",
+        "autotune_mode": "fast",
+        "causal": False,
+        "dtype": "bf16",
+        "headdim": 512,
+        "seqlen_q": 1024,
+        "seqlen_k": 8192,
+        "config": {
+          "BLOCK_M": 128,
+          "BLOCK_N": 64,
+          "BLOCK_HEADDIM_QK": 64,
+          "BLOCK_HEADDIM_V": 64,
+          "num_warps": 8
+        },
+      },
+    ]),
+    path,
+  )
+  request = persistent.PersistentConfigRequest(
+    direction="forward",
+    kernel="fwd_generic",
+    autotune_mode="fast",
+    dtype="bf16",
+    headdim=512,
+    seqlen_q=1024,
+    seqlen_k=8192,
+    causal=False,
+    device_index=0,
+  )
+
+  assert persistent.lookup_persistent_config(request)["BLOCK_M"] == 128
+  monkeypatch.setenv(persistent.SKIP_PERSISTENT_TUNED_CONFIG_ENV_VAR, "1")
+  assert persistent.lookup_persistent_config(request) is None
+
+
 def test_lookup_caches_device_name_by_device_index(tmp_path, monkeypatch):
   monkeypatch.setattr(persistent.torch.cuda, "current_device", lambda: 0)
   monkeypatch.setenv(persistent.CONFIG_ENV_VAR, str(tmp_path))
