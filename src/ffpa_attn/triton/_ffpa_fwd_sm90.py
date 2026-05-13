@@ -30,6 +30,7 @@ from ._ffpa_fwd import (
   _update_o_accs,
 )
 from ._persistent_autotune import PersistentConfigRequest, dtype_name, lookup_persistent_config
+from ._autotune_utils import autotune_seqlen_key
 
 # ---------------------------------------------------------------------------
 # Heuristics (mirror the original generic kernel)
@@ -77,10 +78,10 @@ def _sm90_host_descriptor_pre_hook(nargs):
 @triton.heuristics(_SM90_FWD_HEURISTICS)
 @triton.jit
 def _ffpa_fwd_sm90_kernel_impl(
-  desc_q,
-  desc_k,
-  desc_v,
-  desc_o,
+  desc_q: TensorDescriptor,
+  desc_k: TensorDescriptor,
+  desc_v: TensorDescriptor,
+  desc_o: TensorDescriptor,
   LSE: torch.Tensor,
   AttnBias: torch.Tensor,
   softmax_scale: float,
@@ -119,7 +120,7 @@ def _ffpa_fwd_sm90_kernel_impl(
     Identical algorithm to ``_ffpa_fwd_kernel_impl`` with Q / K / V / O
     pointer arithmetic replaced by ``desc.load`` / ``desc.store`` calls.
     LSE and attn_bias stay on raw pointers.
-    """
+  """
   start_m = tl.program_id(0)
   off_hb = tl.program_id(1)
   off_b = off_hb // nheads_q
@@ -234,6 +235,72 @@ _SM90_DEFAULT_CONFIG = {
 }
 
 
+def _gen_fwd_sm90_autotune_configs(headdim: int = 256, autotune_mode: str = "max") -> list[triton.Config]:
+  """Generate autotune configs for the SM90 TMA forward kernel.
+
+  The search space is compact: tune BLOCK_M, head-dim chunk size, warp
+  count, and pipeline depth.  Every config carries
+  :func:`_sm90_host_descriptor_pre_hook` so the descriptor block shapes
+  are updated before each trial.
+
+  :param headdim: The actual head dimension for the target shape.
+  :param autotune_mode: Triton autotune search-space mode, ``"fast"`` or
+      ``"max"``.
+  :return: Triton autotune configurations for the SM90 TMA forward kernel.
+  """
+  _headdim_candidates = [64, 128]
+  if autotune_mode == "max":
+    _headdim_candidates.append(256)
+
+  configs = []
+  for block_m in [64, 128]:
+    for block_headdim in _headdim_candidates:
+      num_warps_candidates = [8] if autotune_mode == "fast" else [4, 8]
+      for num_warps in num_warps_candidates:
+        for num_stages in [2, 3]:
+          configs.append(
+            triton.Config(
+              {
+                "BLOCK_M": block_m,
+                "BLOCK_N": 64,
+                "BLOCK_HEADDIM_QK": block_headdim,
+                "BLOCK_HEADDIM_V": block_headdim,
+              },
+              num_warps=num_warps,
+              num_stages=num_stages,
+              pre_hook=_sm90_host_descriptor_pre_hook,
+            )
+          )
+  return configs
+
+
+_ffpa_fwd_sm90_autotune_cache: dict[tuple[int, str, str], callable] = {}
+
+
+def _get_fwd_sm90_autotune(headdim: int, autotune_mode: str, dtype: str):
+  """Return a headdim-specific autotune wrapper for the SM90 TMA kernel.
+
+  Results are cached by headdim so the autotune overhead is paid at most
+  once per shape on a given process.
+
+  :param headdim: The actual head dimension for the target forward call.
+  :param autotune_mode: Triton autotune search-space mode, ``"fast"`` or
+      ``"max"``.
+  :param dtype: Dtype name matching :func:`dtype_name`.
+  :return: A ``triton.autotune``-wrapped version of
+      ``_ffpa_fwd_sm90_kernel_impl`` tuned for ``headdim``.
+  """
+  cache_key = (headdim, autotune_mode, dtype)
+  if cache_key not in _ffpa_fwd_sm90_autotune_cache:
+    configs = _gen_fwd_sm90_autotune_configs(headdim, autotune_mode=autotune_mode)
+    _ffpa_fwd_sm90_autotune_cache[cache_key] = triton.autotune(
+      configs=configs,
+      key=["seqlen_q_bucket", "seqlen_k_bucket", "autotune_causal_key", "HEADDIM"],
+      cache_results=True,
+    )(_ffpa_fwd_sm90_kernel_impl)
+  return _ffpa_fwd_sm90_autotune_cache[cache_key]
+
+
 def _ffpa_attn_forward_sm90_generic_impl(
   q: torch.Tensor,
   k: torch.Tensor,
@@ -266,28 +333,29 @@ def _ffpa_attn_forward_sm90_generic_impl(
   bias_strides = _attn_bias_broadcast_strides(attn_bias, batch, nheads_q, seqlen_q, seqlen_k)
 
   # --- choose config ---
-  # Phase 1 uses a fixed default; persistent config lookup is included
-  # for future tuning but is expected to return None currently.
+  # When autotune is requested, the autotune wrapper (with pre_hook) manages
+  # block_shape updates; the launcher only needs to pick a fallback config.
   launch_config = dict(_SM90_DEFAULT_CONFIG)
-  persisted = lookup_persistent_config(
-    PersistentConfigRequest(
-      direction="forward",
-      kernel="fwd_sm90_generic",
-      autotune_mode=autotune_mode,
-      dtype=dtype_name(q.dtype),
-      headdim=headdim,
-      seqlen_q=seqlen_q,
-      seqlen_k=seqlen_k,
-      causal=causal,
-      has_attn_bias=has_attn_bias,
-      has_dropout=has_dropout,
-      nheads_q=nheads_q,
-      nheads_kv=nheads_kv,
-      device_index=q.device.index,
+  if not autotune:
+    persisted = lookup_persistent_config(
+      PersistentConfigRequest(
+        direction="forward",
+        kernel="fwd_sm90_generic",
+        autotune_mode=autotune_mode,
+        dtype=dtype_name(q.dtype),
+        headdim=headdim,
+        seqlen_q=seqlen_q,
+        seqlen_k=seqlen_k,
+        causal=causal,
+        has_attn_bias=has_attn_bias,
+        has_dropout=has_dropout,
+        nheads_q=nheads_q,
+        nheads_kv=nheads_kv,
+        device_index=q.device.index,
+      )
     )
-  )
-  if persisted is not None:
-    launch_config.update(persisted)
+    if persisted is not None:
+      launch_config.update(persisted)
 
   # --- build descriptors ---
   y_dim_q = batch * nheads_q * seqlen_q
@@ -299,11 +367,14 @@ def _ffpa_attn_forward_sm90_generic_impl(
   desc_v = TensorDescriptor(v, shape=[y_dim_kv, headdim], strides=[headdim, 1], block_shape=dummy_block)
   desc_o = TensorDescriptor(o, shape=[y_dim_q, headdim], strides=[headdim, 1], block_shape=dummy_block)
 
-  # Set per-descriptor block shapes for the chosen config.
-  desc_q.block_shape = [launch_config["BLOCK_M"], launch_config["BLOCK_HEADDIM_QK"]]
-  desc_k.block_shape = [launch_config["BLOCK_N"], launch_config["BLOCK_HEADDIM_QK"]]
-  desc_v.block_shape = [launch_config["BLOCK_N"], launch_config["BLOCK_HEADDIM_V"]]
-  desc_o.block_shape = [launch_config["BLOCK_M"], launch_config["BLOCK_HEADDIM_V"]]
+  # For the fixed-config path we set block_shape explicitly.  The autotune
+  # path leaves block_shape as dummy because the pre_hook on each Config
+  # updates them before every trial and final invocation.
+  if not autotune:
+    desc_q.block_shape = [launch_config["BLOCK_M"], launch_config["BLOCK_HEADDIM_QK"]]
+    desc_k.block_shape = [launch_config["BLOCK_N"], launch_config["BLOCK_HEADDIM_QK"]]
+    desc_v.block_shape = [launch_config["BLOCK_N"], launch_config["BLOCK_HEADDIM_V"]]
+    desc_o.block_shape = [launch_config["BLOCK_M"], launch_config["BLOCK_HEADDIM_V"]]
 
   # --- TMA allocator (required for descriptor path) ---
   def _tma_alloc_fn(size: int, align: int, _):
@@ -311,11 +382,54 @@ def _ffpa_attn_forward_sm90_generic_impl(
 
   triton.set_allocator(_tma_alloc_fn)
 
-  # --- grid ---
+  # --- bucket keys (used by autotune cache key) ---
+  seqlen_q_bucket = autotune_seqlen_key(seqlen_q, autotune_mode)
+  seqlen_k_bucket = autotune_seqlen_key(seqlen_k, autotune_mode)
+  autotune_causal_key = int(causal)
+
+  if autotune:
+    autotune_fn = _get_fwd_sm90_autotune(headdim, autotune_mode, dtype_name(q.dtype))
+
+    def grid(meta):
+      return (triton.cdiv(seqlen_q, meta["BLOCK_M"]), batch * nheads_q)
+
+    autotune_fn[grid](
+      desc_q,
+      desc_k,
+      desc_v,
+      desc_o,
+      lse,
+      attn_bias_in,
+      softmax_scale,
+      bias_strides[0],
+      bias_strides[1],
+      bias_strides[2],
+      bias_strides[3],
+      y_dim_q,
+      y_dim_kv,
+      nheads_q,
+      nheads_kv,
+      seqlen_q,
+      seqlen_k,
+      seqlen_q_bucket,
+      seqlen_k_bucket,
+      autotune_causal_key,
+      seqlen_q_rounded,
+      dropout_p,
+      philox_offset,
+      IS_CAUSAL=causal,
+      HAS_ATTN_BIAS=has_attn_bias,
+      HAS_DROPOUT=has_dropout,
+      PHILOX_SEED=philox_seed,
+      DTYPE=DTYPE,
+      HEADDIM=headdim,
+    )
+    return
+
+  # --- fixed-config launch ---
   def grid(meta):
     return (triton.cdiv(seqlen_q, meta["BLOCK_M"]), batch * nheads_q)
 
-  # --- launch ---
   _ffpa_fwd_sm90_kernel_impl[grid](
     desc_q,
     desc_k,
@@ -334,9 +448,9 @@ def _ffpa_attn_forward_sm90_generic_impl(
     nheads_kv,
     seqlen_q,
     seqlen_k,
-    0,  # seqlen_q_bucket (unused in Phase 1)
-    0,  # seqlen_k_bucket
-    0,  # autotune_causal_key
+    seqlen_q_bucket,
+    seqlen_k_bucket,
+    autotune_causal_key,
     seqlen_q_rounded,
     dropout_p,
     philox_offset,
@@ -424,8 +538,7 @@ def _ffpa_attn_forward_sm90_tma_impl(
         ``[B, Hq, Nq, Nkv]``.
     :param causal: Whether to apply lower-right causal masking.
     :param softmax_scale: Scale applied to ``Q @ K.T``.
-    :param autotune: Whether to use the Triton autotuned path (Phase 1
-        ignores this and uses a fixed config).
+    :param autotune: Whether to use the Triton autotuner for the SM90 TMA path.
     :param autotune_mode: Triton autotune search-space mode, ``"fast"`` or
         ``"max"``.
     :param dropout_p: Forward dropout probability.
