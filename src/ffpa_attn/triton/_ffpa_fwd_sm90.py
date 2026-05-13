@@ -462,6 +462,8 @@ def _ffpa_attn_forward_sm90_generic_impl(
     lse,
     attn_bias_in,
     o,
+    o.stride(0),
+    o.stride(1),
     o.stride(2),
     softmax_scale,
     bias_strides[0],
