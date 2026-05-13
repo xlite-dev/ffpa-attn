@@ -5,6 +5,7 @@ import logging
 import pytest
 
 from ffpa_attn.triton import _persistent_autotune as persistent
+from ffpa_attn.triton._ffpa_bwd import _normalize_bwd_pre_config
 
 
 def _payload(entries):
@@ -336,6 +337,31 @@ def test_lookup_backward_filters_variants(tmp_path, monkeypatch):
   )
   assert persistent.lookup_persistent_config(request)["BLOCK_HEADDIM"] == 128
   assert persistent.lookup_persistent_config(request.__class__(**{**request.__dict__, "has_dropout": True})) is None
+
+
+def test_backward_preprocess_config_backfills_block_headdim():
+  config = _normalize_bwd_pre_config(
+    {
+      "BLOCK_M": 128,
+      "D_CHUNK": False,
+      "num_warps": 4
+    },
+    preprocess_d_chunk=False,
+    block_headdim_delta=512,
+  )
+  assert config == {"BLOCK_M": 128, "BLOCK_HEADDIM": 512, "D_CHUNK": False, "num_warps": 4}
+
+  d_chunk_config = _normalize_bwd_pre_config(
+    {
+      "BLOCK_M": 64,
+      "BLOCK_HEADDIM": 128,
+      "D_CHUNK": True,
+      "num_warps": 8
+    },
+    preprocess_d_chunk=True,
+    block_headdim_delta=64,
+  )
+  assert d_chunk_config["BLOCK_HEADDIM"] == 128
 
 
 def test_lookup_filters_mask_dropout_but_not_head_layout(tmp_path, monkeypatch):

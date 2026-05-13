@@ -14,17 +14,17 @@ There are two ways to use Triton tuned configs:
 1. Run with runtime autotune enabled for one process:
 
 ```python
-	from ffpa_attn import ffpa_attn_func
+from ffpa_attn import ffpa_attn_func
 
-	out = ffpa_attn_func(
-		 q,
-		 k,
-		 v,
-		 forward_backend="triton",
-		 backward_backend="triton",
-		 triton_autotune=True,
-		 triton_autotune_mode="fast",
-	)
+out = ffpa_attn_func(
+	q,
+	k,
+	v,
+	forward_backend="triton", # default is 'triton'
+	backward_backend="triton", # default is 'triton'
+	triton_autotune=True, # default is False
+	triton_autotune_mode="fast", # default is 'fast'.
+)
 ```
 
 Triton benchmarks candidate configs and caches the best config in the current process. This is convenient for experiments, but the chosen config is not stored in the FFPA repository.
@@ -35,10 +35,9 @@ Triton benchmarks candidate configs and caches the best config in the current pr
 python -m ffpa_attn.autotune --mode fast --directions both --dtypes bf16,fp16 --overwrite
 ```
 
-The generated JSON is saved under `src/ffpa_attn/triton/configs/{device_name}.json`, for example
-`src/ffpa_attn/triton/configs/NVIDIA_L20.json`.
+The generated JSON is saved under <span style="color:#c77dff;">src/ffpa_attn/triton/configs/{device_name}.json </span>, for example <span style="color:#c77dff;">src/ffpa_attn/triton/configs/NVIDIA_L20.json</span>.
 
-Later calls with `triton_autotune=False` will automatically load the matching
+Later calls with <span style="color:#c77dff;">triton_autotune=False</span> will automatically load the matching
 device config when it exists.
 
 ## Generate Persistent Configs
@@ -57,7 +56,7 @@ By default, the command refuses to overwrite an existing device config. Use
 python -m ffpa_attn.autotune --mode fast --overwrite
 ```
 
-The generator defaults to `B=1` and `H=32`. You can change them when your
+The generator defaults to <span style="color:#c77dff;">B=1</span> and <span style="color:#c77dff;">H=32</span>. You can change them when your
 deployment shape uses a different batch size or query-head count:
 
 ```bash
@@ -65,7 +64,7 @@ python -m ffpa_attn.autotune --mode fast --B 1 --H 32 --overwrite
 ```
 
 By default, the generated task grid covers the baseline no-mask, no-dropout,
-equal-head cases. Add `--full-tasks` to also tune canonical `attn_mask`,
+equal-head cases. Add <span style="color:#c77dff;">--full-tasks</span> to also tune canonical <span style="color:#c77dff;">attn_mask</span>,
 dropout, GQA, and MQA variants modeled after `examples/perf.py`:
 
 ```bash
@@ -77,11 +76,7 @@ python -m ffpa_attn.autotune \
 	--overwrite
 ```
 
-`--full-tasks` can increase autotune time substantially because each additional
-variant is benchmarked separately. It is intentionally disabled by default so
-existing generation jobs keep their current coverage and runtime.
-
-You can generate only forward configs, only backward configs, or both:
+<span style="color:#c77dff;">--full-tasks</span> can increase autotune time substantially because each additional variant is benchmarked separately. It is intentionally disabled by default so existing generation jobs keep their current coverage and runtime. You can generate only forward configs, only backward configs, or both:
 
 ```bash
 python -m ffpa_attn.autotune --mode fast --directions forward --overwrite
@@ -89,10 +84,7 @@ python -m ffpa_attn.autotune --mode fast --directions backward --overwrite
 python -m ffpa_attn.autotune --mode fast --directions both --dtypes bf16,fp16 --overwrite
 ```
 
-`both` is the default.
-
-The default dtype set is `bf16`. For benchmarks such as `examples/perf.py` that
-run both `fp16` and `bf16`, generate both dtype configs explicitly:
+<span style="color:#c77dff;">both</span> is the default. The default dtype set is <span style="color:#c77dff;">bf16</span>. For benchmarks such as <span style="color:#c77dff;">examples/perf.py</span> that run both <span style="color:#c77dff;">fp16</span> and <span style="color:#c77dff;">bf16</span>, generate both dtype configs explicitly:
 
 ```bash
 python -m ffpa_attn.autotune --mode fast --directions both --dtypes bf16,fp16 --overwrite
@@ -106,8 +98,7 @@ The default output directory is the package config directory:
 src/ffpa_attn/triton/configs/
 ```
 
-The file name is derived from `torch.cuda.get_device_name()` with non-file-name
-characters replaced by underscores. For example:
+The file name is derived from <span style="color:#c77dff;">torch.cuda.get_device_name()</span> with non-file-name characters replaced by underscores. For example:
 
 ```text
 NVIDIA L20 -> NVIDIA_L20.json
@@ -125,8 +116,7 @@ python -m ffpa_attn.autotune \
   --output-dir /tmp/ffpa-config-smoke
 ```
 
-At runtime, FFPA can also load configs from a custom directory with
-`FFPA_TUNED_CONFIG_DIR`:
+At runtime, FFPA can also load configs from a custom directory with <span style="color:#c77dff;">FFPA_TUNED_CONFIG_DIR</span>:
 
 ```bash
 FFPA_TUNED_CONFIG_DIR=/tmp/ffpa-config-smoke python your_script.py
@@ -138,113 +128,97 @@ The generator supports the same mode names as the runtime Triton autotune path:
 
 | Mode | Purpose |
 | --- | --- |
-| `fast` | Smaller search space. Recommended as the default persistent config mode. |
-| `max` | Larger search space. Slower to generate, but may find better configs. |
+| <span style="color:#c77dff;">fast</span> | Smaller search space. Recommended as the default persistent config mode. |
+| <span style="color:#c77dff;">max</span> | Larger search space. Slower to generate, but may find better configs. |
 
-The runtime lookup requires the mode to match. A JSON generated with
-`--mode fast` is used when `triton_autotune_mode="fast"`; a JSON generated with
-`--mode max` is used when `triton_autotune_mode="max"`.
+The runtime lookup requires the mode to match. A JSON generated with <span style="color:#c77dff;">--mode fast</span> is used when <span style="color:#c77dff;">triton_autotune_mode="fast"</span>; a JSON generated with <span style="color:#c77dff;">--mode max</span> is used when <span style="color:#c77dff;">triton_autotune_mode="max"</span>.
 
 ## Shape Coverage
 
 The generator tunes the following head dimensions:
 
 ```text
-320, 512, 640, 768, 1024
+320, 512, 640, 768, 1024 # headdim
 ```
 
 The sequence-length grid is:
 
 ```text
-1, 512, 1024, 2048, 4096, 8192, 16384
+1, 512, 1024, 2048, 4096, 8192, 16384 # seqlen
 ```
 
-The `1` entry is used only for decode query length (`Nq=1`). Decode tuning does
-not generate `Nkv=1` cases because a single-token KV cache is not a meaningful
-decode-attention benchmark target.
+The <span style="color:#c77dff;">1</span> entry is used only for decode query length (<span style="color:#c77dff;">Nq=1</span>`). Decode tuning does not generate <span style="color:#c77dff;">Nkv=1</span> cases because a single-token KV cache is not a meaningful decode-attention benchmark target.
 
-The `16384` sequence length is generated only when the current GPU has at least
-48 GiB of memory. Smaller-memory devices skip it.
+The <span style="color:#c77dff;">16384</span> sequence length is generated only when the current GPU has at least <span style="color:#c77dff;">48 GiB</span> of memory. Smaller-memory devices skip it.
 
-Persistent config generation tunes every target sequence length in this grid
-with exact Triton autotune keys. It does not reuse the online runtime seqlen
-buckets while generating JSON, so an entry for `512`, `1024`, or `2048` means
-that shape was benchmarked independently. Runtime lookup still performs reuse
-when the workload shape is not an exact persisted entry.
-
-The generated matrix covers:
+Persistent config generation tunes every target sequence length in this grid with exact Triton autotune keys. It does not reuse the online runtime seqlen buckets while generating JSON, so an entry for <span style="color:#c77dff;">512</span>, <span style="color:#c77dff;">1024</span>, or <span style="color:#c77dff;">2048</span> means that shape was benchmarked independently. Runtime lookup still performs reuse when the workload shape is not an exact persisted entry. The generated matrix covers:
 
 | Direction | Kernels |
 | --- | --- |
 | Forward | generic forward, split-KV/decode stage1 |
 | Backward | delta preprocess, main backward, decode backward stage1 |
 
-Forward tasks include self-attention, cross-attention, decode attention
-(`Nq=1`), causal, and non-causal variants.
+Forward tasks include self-attention, cross-attention, decode attention (<span style="color:#c77dff;">Nq=1</span>), causal, and non-causal variants.
 
-Backward tasks include main backward shapes (`Nq >= 512`) and decode backward
-shapes (`Nq=1`, `Nkv>1`), with causal and non-causal variants.
+Backward tasks include main backward shapes (<span style="color:#c77dff;">Nq >= 512</span>) and decode backward
+shapes (<span style="color:#c77dff;">Nq=1</span>, <span style="color:#c77dff;">Nkv>1</span>), with causal and non-causal variants.
 
-When `--full-tasks` is enabled, the generator adds square prefill variants for
+When <span style="color:#c77dff;">--full-tasks</span> is enabled, the generator adds square prefill variants for
 each tuned sequence length:
 
 | Case | Shape / variant |
 | --- | --- |
-| `attn-mask` | Compact additive key-position mask `[1, 1, 1, Nkv]`. Backward tunes the bias-gradient path. |
-| `dropout` | `dropout_p=0.1`, using the Triton dropout path. |
-| `gqa` | `Hq=H`, `Hkv` chosen with the same divisor rule as `examples/perf.py`. |
-| `mqa` | `Hq=H`, `Hkv=1`. |
+| <span style="color:#c77dff;">attn-mask</span> | Compact additive key-position mask <span style="color:#c77dff;">[1, 1, 1, Nkv]</span>. Backward tunes the bias-gradient path. |
+| <span style="color:#c77dff;">dropout</span> | <span style="color:#c77dff;">dropout_p=0.1</span>, using the Triton dropout path. |
+| <span style="color:#c77dff;">gqa</span> | <span style="color:#c77dff;">Hq=H</span>, <span style="color:#c77dff;">Hkv</span> chosen with the same divisor rule as <span style="color:#c77dff;">examples/perf.py</span>. |
+| <span style="color:#c77dff;">mqa</span> | <span style="color:#c77dff;">Hq=H</span>, <span style="color:#c77dff;">Hkv=1</span>. |
 
 These are single-feature canonical variants, not a full Cartesian product. For
-example, `--full-tasks` tunes `gqa` and `dropout` separately, but it does not
+example, <span style="color:#c77dff;">--full-tasks</span> tunes <span style="color:#c77dff;">gqa</span> and <span style="color:#c77dff;">dropout</span> separately, but it does not
 generate a combined GQA+dropout case.
 
 ## Runtime Lookup Rules
 
-When runtime autotune is disabled, FFPA tries to load the current device JSON.
-If no compatible entry is found, it falls back to the built-in default launch
-parameters.
-
-Forward lookup filters by:
+When runtime autotune is disabled, FFPA tries to load the current device JSON. If no compatible entry is found, it falls back to the built-in default launch parameters. Forward lookup filters by:
 
 | Field | Meaning |
 | --- | --- |
-| `direction` | Must be `forward`. |
-| `kernel` | `fwd_generic` or `decode_fwd_stage1`. |
-| `autotune_mode` | Must match `triton_autotune_mode`. |
-| `dtype` | `fp16` or `bf16`. |
-| `causal` | Must match `is_causal`. |
-| `has_attn_bias` | Whether `attn_mask` / additive bias is present. |
-| `has_dropout` | Whether dropout is active. |
+| <span style="color:#c77dff;">direction</span> | Must be <span style="color:#c77dff;">forward</span>. |
+| <span style="color:#c77dff;">kernel</span> | <span style="color:#c77dff;">fwd_generic</span> or <span style="color:#c77dff;">decode_fwd_stage1</span>. |
+| <span style="color:#c77dff;">autotune_mode</span> | Must match <span style="color:#c77dff;">triton_autotune_mode</span>. |
+| <span style="color:#c77dff;">dtype</span> | <span style="color:#c77dff;">fp16</span> or <span style="color:#c77dff;">bf16</span>. |
+| <span style="color:#c77dff;">causal</span> | Must match <span style="color:#c77dff;">is_causal</span>. |
+| <span style="color:#c77dff;">has_attn_bias</span> | Whether <span style="color:#c77dff;">attn_mask</span> / additive bias is present. |
+| <span style="color:#c77dff;">has_dropout</span> | Whether dropout is active. |
 
 Backward lookup additionally filters by:
 
 | Field | Meaning |
 | --- | --- |
-| `kernel` | `bwd_preproc`, `bwd_generic`, or `decode_bwd_stage1`. |
-| `preprocess_d_chunk` | Applies to the delta preprocess kernel. |
-| `bias_grad` | Whether attention-bias gradients are requested. |
-| `grad_v_storage_dtype` | Optional internal `dV` storage override. |
-| `use_gemv` | Decode backward single-query specialization. |
-| `has_dropout` | Whether dropout replay is active. |
-| `has_attn_bias` | Whether additive bias is active. |
+| <span style="color:#c77dff;">kernel</span> | <span style="color:#c77dff;">bwd_preproc</span>, <span style="color:#c77dff;">bwd_generic</span>, or <span style="color:#c77dff;">decode_bwd_stage1</span>. |
+| <span style="color:#c77dff;">preprocess_d_chunk</span> | Applies to the delta preprocess kernel. |
+| <span style="color:#c77dff;">bias_grad</span> | Whether attention-bias gradients are requested. |
+| <span style="color:#c77dff;">grad_v_storage_dtype</span> | Optional internal <span style="color:#c77dff;">dV</span> storage override. |
+| <span style="color:#c77dff;">use_gemv</span> | Decode backward single-query specialization. |
+| <span style="color:#c77dff;">has_dropout</span> | Whether dropout replay is active. |
+| <span style="color:#c77dff;">has_attn_bias</span> | Whether additive bias is active. |
 
-Generated entries may include `nheads_q` and `nheads_kv` for logging and JSON
+Generated entries may include <span style="color:#c77dff;">nheads_q</span> and <span style="color:#c77dff;">nheads_kv</span> for logging and JSON
 metadata. Runtime lookup can prefer an exact recorded head layout when one is
 available, but it does not require the head layout to match. Batch size and
 head count commonly vary across workloads, so FFPA reuses the same launch
 config across compatible mask/dropout/causal/kernel variants instead of missing
-the persistent config because `Hq` or `Hkv` changed.
+the persistent config because <span style="color:#c77dff;">Hq</span> or <span style="color:#c77dff;">Hkv</span> changed.
 
 Configs generated before these variant fields existed are treated as no-mask,
 no-dropout entries. They can still satisfy baseline requests, while
-`has_attn_bias` and `has_dropout` continue to prevent semantically different
+<span style="color:#c77dff;">has_attn_bias</span> and <span style="color:#c77dff;">has_dropout</span> continue to prevent semantically different
 kernel variants from being mixed.
 
 After variant filtering, FFPA chooses the nearest persisted head dimension. Ties
 prefer the larger candidate. Examples:
 
-| Runtime `D` | Persisted `D` |
+| Runtime <span style="color:#c77dff;">D</span> | Persisted <span style="color:#c77dff;">D</span> |
 | --- | --- |
 | 384 | 320 |
 | 448 | 512 |
@@ -254,14 +228,14 @@ For sequence length, FFPA chooses the smallest persisted sequence length that is
 greater than or equal to the runtime value. If the runtime value is larger than
 all persisted values, FFPA uses the largest available persisted value. Examples:
 
-| Runtime seqlen | Persisted seqlen |
+| Runtime <span style="color:#c77dff;">seqlen</span> | Persisted <span style="color:#c77dff;">seqlen</span> |
 | --- | --- |
 | 3000 | 4096 |
 | 32768 | 8192 or 16384, depending on what was generated |
 
 ### Debug Persistent Lookup
 
-Set `FFPA_LOGGER_LEVEL=DEBUG` when you want to verify that runtime calls are
+Set <span style="color:#c77dff;">FFPA_LOGGER_LEVEL=DEBUG</span> when you want to verify that runtime calls are
 using persistent tuned configs instead of falling back to the built-in defaults:
 
 ```bash
@@ -272,13 +246,12 @@ python examples/perf.py --case decode-attn --backend ffpa-triton
 
 On repeated runtime lookup hits, FFPA logs the kernel name and sanitized launch
 config selected from the in-process persistent config cache. The message uses
-`debug_once` semantics, so the same cache-hit/config line is emitted once per
+<span style="color:#c77dff;">debug_once</span> semantics, so the same cache-hit/config line is emitted once per
 process instead of repeating on every attention call.
 
 ## Development Smoke Tests
 
-Full autotune generation can take a long time. Use `FFPA_AUTOTUNE_MAX_CONFIGS`
-to cap the number of shapes during development:
+Full autotune generation can take a long time. Use <span style="color:#c77dff;">FFPA_AUTOTUNE_MAX_CONFIGS</span> to cap the number of shapes during development:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 \
@@ -316,18 +289,12 @@ CUDA_VISIBLE_DEVICES=0 python -m ffpa_attn.autotune \
 	--mode fast --directions both --dtypes bf16,fp16 --full-tasks --overwrite
 ```
 
-3. Commit the generated JSON under `src/ffpa_attn/triton/configs/`.
+3. Commit the generated JSON under <span style="color:#c77dff;">src/ffpa_attn/triton/configs/</span>.
 4. Run normal workloads with runtime autotune disabled, which is the default:
 
-	```python
-	out = ffpa_attn_func(
-		 q,
-		 k,
-		 v,
-		 forward_backend="triton",
-		 backward_backend="triton",
-	)
-	```
+```python
+out = ffpa_attn_func(q, k, v)
+```
 
 If the runtime shape is outside the generated grid, FFPA uses the nearest
 compatible persisted config. If the device JSON is missing, malformed, or does
@@ -336,13 +303,6 @@ defaults.
 
 ## Current Scope and Limitations
 
-The first persistent-config generator focuses on the common no-bias and
-no-dropout path. The JSON schema already records `bias_grad`, `has_dropout`,
-and `grad_v_storage_dtype`, so bias-gradient and dropout-specific configs can be
-added later without changing the runtime lookup design.
+The first persistent-config generator focuses on the common no-bias and no-dropout path. The JSON schema already records <span style="color:#c77dff;">bias_grad</span>, <span style="color:#c77dff;">has_dropout</span>, and <span style="color:#c77dff;">grad_v_storage_dtype</span>, so bias-gradient and dropout-specific configs can be added later without changing the runtime lookup design.
 
-`decode_dq_reduce` and key-bias gradient reduction are not currently autotuned
-by FFPA, so they keep their fixed launch parameters.
-
-Persistent configs are device-specific. Do not reuse a JSON generated on one GPU
-class as a performance baseline for a different GPU class.
+<span style="color:#c77dff;">decode_dq_reduce</span> and key-bias gradient reduction are not currently autotuned by FFPA, so they keep their fixed launch parameters. Persistent configs are device-specific. Do not reuse a JSON generated on one GPU class as a performance baseline for a different GPU class.

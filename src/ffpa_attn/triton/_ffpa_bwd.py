@@ -328,6 +328,37 @@ def _get_pre_autotune(d_chunk: bool, autotune_mode: str, dtype: str):
 _ffpa_bwd_pre = _ffpa_bwd_pre_impl
 
 
+def _normalize_bwd_pre_config(
+  config: dict[str, object] | None,
+  *,
+  preprocess_d_chunk: bool,
+  block_headdim_delta: int,
+) -> dict[str, object]:
+  """Return a complete launch config for the backward preprocess kernel.
+
+  Older persistent ``bwd_preproc`` entries were generated from full-D autotune
+  configs that relied on the Triton heuristic for ``BLOCK_HEADDIM`` and thus
+  did not serialize that key.  The non-autotuned persistent launcher passes an
+  explicit config dict, so fill the runtime value here before launching.
+
+  :param config: Persisted launch config, or ``None`` when no entry matched.
+  :param preprocess_d_chunk: Whether the preprocess path uses D-chunk mode.
+  :param block_headdim_delta: Full-D ``BLOCK_HEADDIM`` value for this runtime
+      head dimension, or the D-chunk block size when ``preprocess_d_chunk`` is
+      enabled.
+  :return: Complete kernel launch meta dict.
+  """
+  normalized = {
+    "BLOCK_M": 128,
+    "BLOCK_HEADDIM": block_headdim_delta,
+    "D_CHUNK": preprocess_d_chunk,
+    "num_warps": 4,
+  }
+  if config is not None:
+    normalized.update(config)
+  return normalized
+
+
 def _gen_bwd_autotune_configs(
   block_n_values: tuple[int, ...],
   headdim: int = 512,
@@ -1375,7 +1406,7 @@ def _ffpa_attn_backward_triton_impl(
   grad_v_storage_dtype = "fp32" if dv.dtype == torch.float32 else None
   autotune_dtype_key = 1 if q.dtype == torch.bfloat16 else 0
 
-  BLOCK_HEADDIM_DELTA = max(triton.next_power_of_2(headdim), 16)
+  BLOCK_HEADDIM_DELTA = max(64, triton.next_power_of_2(headdim))
   delta = torch.empty_like(lse)
 
   def pre_grid(meta: dict) -> tuple[int, int]:
@@ -1402,7 +1433,7 @@ def _ffpa_attn_backward_triton_impl(
     pre_kernel[pre_grid](*pre_args)
   else:
     block_headdim_delta = 64 if preprocess_d_chunk else BLOCK_HEADDIM_DELTA
-    pre_config = lookup_persistent_config(
+    persisted_pre_config = lookup_persistent_config(
       PersistentConfigRequest(
         direction="backward",
         kernel="bwd_preproc",
@@ -1413,12 +1444,12 @@ def _ffpa_attn_backward_triton_impl(
         preprocess_d_chunk=preprocess_d_chunk,
         device_index=q.device.index,
       )
-    ) or {
-      "BLOCK_M": 128,
-      "BLOCK_HEADDIM": block_headdim_delta,
-      "D_CHUNK": preprocess_d_chunk,
-      "num_warps": 4,
-    }
+    )
+    pre_config = _normalize_bwd_pre_config(
+      persisted_pre_config,
+      preprocess_d_chunk=preprocess_d_chunk,
+      block_headdim_delta=block_headdim_delta,
+    )
     _ffpa_bwd_pre[(triton.cdiv(seqlen_q, pre_config["BLOCK_M"]), batch * nheads)](
       *pre_args,
       **pre_config,

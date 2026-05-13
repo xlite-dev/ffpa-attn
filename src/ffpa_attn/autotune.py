@@ -393,6 +393,7 @@ def _tune_backward(
 
   pre_wrapper = _get_pre_autotune(False, mode, _dtype_schema_name(task.dtype))
   pre_entry = _entry_base(task, mode, "bwd_preproc", config_from_triton_config(pre_wrapper.best_config))
+  pre_entry["config"].setdefault("BLOCK_HEADDIM", max(64, triton.next_power_of_2(task.headdim)))
   pre_entry.update({
     "preprocess_d_chunk": False,
     "has_attn_bias": False,
@@ -511,6 +512,9 @@ def main() -> int:
     full_variant_count,
   )
   tune_start_time = time.perf_counter()
+  # Offline persistent tuning deliberately bypasses runtime seqlen bucketing so
+  # target grid points such as 2048 are tuned on their exact shapes instead of
+  # being intercepted by a coarser online autotune bucket.
   with exact_autotune_seqlen_keys():
     for index, task in enumerate(tasks, start=1):
       try:

@@ -335,6 +335,12 @@ def clear_config_cache() -> None:
 def _head_layout_rank(entry: dict[str, Any], request: PersistentConfigRequest) -> int:
   """Rank head-layout metadata without making it a compatibility filter.
 
+  Head layout is intentionally a preference, not a hard filter.  The bundled
+  persistent grid currently uses compact representative H values, while lookup
+  should still be able to reuse those configs for nearby GQA/MQA or
+  model-specific head counts.  Decode may eventually deserve stricter layout
+  matching, but the current design keeps it out of the critical path.
+
   :param entry: Persisted config entry.
   :param request: Runtime lookup request.
   :return: ``0`` for an exact recorded head-layout match, otherwise ``1``.
