@@ -3,6 +3,8 @@
 These helpers intentionally report only the dominant GEMM work in attention,
 not the full kernel instruction count. They are used to derive approximate
 forward/backward TFLOPS from measured latency in the example benchmarks.
+
+References: https://github.com/Dao-AILab/flash-attention/blob/main/benchmarks/benchmark_flash_attention.py
 """
 
 from __future__ import annotations
