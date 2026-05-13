@@ -42,8 +42,7 @@ device config when it exists.
 
 ## Generate Persistent Configs
 
-Run the autotune generator from the repository root or from an installed FFPA
-environment:
+Run the autotune generator from the repository root or from an installed FFPA environment:
 
 ```bash
 python -m ffpa_attn.autotune --mode fast

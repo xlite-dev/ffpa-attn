@@ -1360,7 +1360,13 @@ def _ffpa_attn_backward_triton_impl(
   attn_bias_in = attn_bias if attn_bias is not None else q
   bias_strides = _attn_bias_broadcast_strides(attn_bias, batch, nheads, seqlen_q, seqlen_k)
   bias_requires_grad = grad_attn_bias is not None
-  grad_bias_needs_reduction = _attn_bias_grad_needs_reduction(grad_attn_bias, batch, nheads, seqlen_q, seqlen_k)
+  grad_bias_needs_reduction = _attn_bias_grad_needs_reduction(
+    grad_attn_bias,
+    batch,
+    nheads,
+    seqlen_q,
+    seqlen_k,
+  )
   grad_bias_reduces_m = _attn_bias_grad_reduces_query(grad_attn_bias, seqlen_q)
   # The [1, 1, 1, Nkv] key-position mask is common in examples and avoids
   # materializing [B, Hq, Nq, Nkv]. Route its gradient through the same fp32
@@ -1392,7 +1398,13 @@ def _ffpa_attn_backward_triton_impl(
     )
   else:
     grad_attn_bias_in = grad_attn_bias if grad_attn_bias is not None else q
-    grad_bias_strides = _attn_bias_broadcast_strides(grad_attn_bias, batch, nheads, seqlen_q, seqlen_k)
+    grad_bias_strides = _attn_bias_broadcast_strides(
+      grad_attn_bias,
+      batch,
+      nheads,
+      seqlen_q,
+      seqlen_k,
+    )
   has_dropout = dropout_p > 0.0
 
   assert q.dtype == k.dtype == v.dtype == o.dtype == do.dtype
@@ -1790,7 +1802,7 @@ def _ffpa_attn_backward_triton_impl(
 
   if use_key_bias_grad_reduction:
     key_bias_block_n = 64
-    _ffpa_bwd_key_bias_grad_reduce_kernel[(triton.cdiv(seqlen_k, key_bias_block_n), )](
+    _ffpa_bwd_key_bias_grad_reduce_kernel[(triton.cdiv(seqlen_k, key_bias_block_n))](
       partial_grad_bias,
       grad_attn_bias,
       seqlen_k,
