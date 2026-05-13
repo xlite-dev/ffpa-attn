@@ -203,17 +203,10 @@ Backward lookup additionally filters by:
 | <span style="color:#c77dff;">has_dropout</span> | Whether dropout replay is active. |
 | <span style="color:#c77dff;">has_attn_bias</span> | Whether additive bias is active. |
 
-Generated entries may include <span style="color:#c77dff;">nheads_q</span> and <span style="color:#c77dff;">nheads_kv</span> for logging and JSON
-metadata. Runtime lookup can prefer an exact recorded head layout when one is
-available, but it does not require the head layout to match. Batch size and
-head count commonly vary across workloads, so FFPA reuses the same launch
-config across compatible mask/dropout/causal/kernel variants instead of missing
-the persistent config because <span style="color:#c77dff;">Hq</span> or <span style="color:#c77dff;">Hkv</span> changed.
+Generated entries may include <span style="color:#c77dff;">nheads_q</span> and <span style="color:#c77dff;">nheads_kv</span> for logging and JSON metadata. Runtime lookup can prefer an exact recorded head layout when one is available, but it does not require the head layout to match. Batch size and head count commonly vary across workloads, so FFPA reuses the same launch config across compatible mask/dropout/causal/kernel variants instead of missing the persistent config because <span style="color:#c77dff;">Hq</span> or <span style="color:#c77dff;">Hkv</span> changed.
 
 Configs generated before these variant fields existed are treated as no-mask,
-no-dropout entries. They can still satisfy baseline requests, while
-<span style="color:#c77dff;">has_attn_bias</span> and <span style="color:#c77dff;">has_dropout</span> continue to prevent semantically different
-kernel variants from being mixed.
+no-dropout entries. They can still satisfy baseline requests, while <span style="color:#c77dff;">has_attn_bias</span> and <span style="color:#c77dff;">has_dropout</span> continue to prevent semantically different kernel variants from being mixed.
 
 After variant filtering, FFPA chooses the nearest persisted head dimension. Ties
 prefer the larger candidate. Examples:
@@ -244,10 +237,7 @@ FFPA_TUNED_CONFIG_DIR=/tmp/ffpa-config-smoke \
 python examples/perf.py --case decode-attn --backend ffpa-triton
 ```
 
-On repeated runtime lookup hits, FFPA logs the kernel name and sanitized launch
-config selected from the in-process persistent config cache. The message uses
-<span style="color:#c77dff;">debug_once</span> semantics, so the same cache-hit/config line is emitted once per
-process instead of repeating on every attention call.
+On repeated runtime lookup hits, FFPA logs the kernel name and sanitized launch config selected from the in-process persistent config cache. The message uses <span style="color:#c77dff;">debug_once</span> semantics, so the same cache-hit/config line is emitted once per process instead of repeating on every attention call.
 
 ## Development Smoke Tests
 
@@ -296,10 +286,7 @@ CUDA_VISIBLE_DEVICES=0 python -m ffpa_attn.autotune \
 out = ffpa_attn_func(q, k, v)
 ```
 
-If the runtime shape is outside the generated grid, FFPA uses the nearest
-compatible persisted config. If the device JSON is missing, malformed, or does
-not contain a compatible entry, FFPA silently keeps the existing built-in launch
-defaults.
+If the runtime shape is outside the generated grid, FFPA uses the nearest compatible persisted config. If the device JSON is missing, malformed, or does not contain a compatible entry, FFPA silently keeps the existing built-in launch defaults.
 
 ## Current Scope and Limitations
 
