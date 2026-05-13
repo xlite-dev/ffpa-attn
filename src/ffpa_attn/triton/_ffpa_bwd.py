@@ -380,7 +380,7 @@ def _gen_bwd_autotune_configs(
 
   :param block_n_values: Candidate ``BLOCK_N`` values for the target backward
       kernel variant.
-    :param autotune_mode: Search-space mode, ``"fast"`` or ``"max"``.
+  :param autotune_mode: Search-space mode, ``"fast"`` or ``"max"``.
   :return: Triton autotune configurations for one backward kernel variant.
   """
   # BLOCK_M: larger = fewer Q-block iterations (good), more register pressure.
