@@ -1,0 +1,496 @@
+"""SM90+ Triton forward entry points for experimental TMA kernels.
+
+This module provides an SM90-specialized forward path that replaces raw-pointer
+memory access with TMA descriptor loads/stores.  Phase 1 (current) uses a
+non-warp-specialized kernel; warp specialization will be added in a later phase.
+
+Design
+------
+* Q / K / V / O are passed as ``TensorDescriptor`` objects flattened to
+  ``[B*H*N, D]`` so the kernel addresses them with simple ``(y, x)`` offsets.
+* LSE and ``attn_bias`` remain raw pointers — LSE is too small to benefit from
+  TMA, and ``attn_bias`` may carry stride-0 broadcast dimensions that are
+  incompatible with descriptor semantics.
+* The Split-D structure (head-dim chunks for QK, V accumulator groups) is
+  preserved from the original generic kernel.
+"""
+
+from __future__ import annotations
+
+import math
+
+import torch
+import triton
+import triton.language as tl
+from triton.tools.tensor_descriptor import TensorDescriptor
+
+from ._ffpa_fwd import (
+  _apply_dropout_to_p,
+  _attn_bias_broadcast_strides,
+  _update_o_accs,
+)
+from ._persistent_autotune import PersistentConfigRequest, dtype_name, lookup_persistent_config
+
+# ---------------------------------------------------------------------------
+# JIT helpers
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def _maybe_make_tensor_desc(desc_or_ptr, shape, strides, block_shape):
+  """Return a TMA-compatible descriptor regardless of the input type.
+
+    When *desc_or_ptr* is already a :class:`tl.tensor_descriptor` (host-side
+    ``TensorDescriptor``), it is returned unchanged.  Otherwise a new
+    descriptor is created on the fly from the raw pointer, which keeps the
+    kernel compatible with plain-tensor fallback paths.
+    """
+  if isinstance(desc_or_ptr, tl.tensor_descriptor):
+    return desc_or_ptr
+  return tl.make_tensor_descriptor(desc_or_ptr, shape, strides, block_shape)
+
+
+# ---------------------------------------------------------------------------
+# Heuristics (mirror the original generic kernel)
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def _sm90_num_v_groups(args):
+  return triton.cdiv(args["HEADDIM"], args["BLOCK_HEADDIM_V"])
+
+
+_SM90_FWD_HEURISTICS = {
+  "EVEN_M": lambda args: args["seqlen_q"] % args["BLOCK_M"] == 0,
+  "EVEN_N": lambda args: args["seqlen_k"] % args["BLOCK_N"] == 0,
+  "NUM_V_GROUPS": _sm90_num_v_groups,
+}
+
+# ---------------------------------------------------------------------------
+# Pre-hook (for future autotune support)
+# ---------------------------------------------------------------------------
+
+
+def _sm90_host_descriptor_pre_hook(nargs):
+  """Set per-descriptor block shapes before a TMA kernel launch.
+
+    Called as a ``pre_hook`` on :class:`triton.Config` so that each autotune
+    candidate updates the block shape to match its compile-time tile sizes.
+    """
+  if not isinstance(nargs.get("desc_q"), TensorDescriptor):
+    return
+  BLOCK_M = nargs["BLOCK_M"]
+  BLOCK_N = nargs["BLOCK_N"]
+  BLOCK_HEADDIM_QK = nargs["BLOCK_HEADDIM_QK"]
+  BLOCK_HEADDIM_V = nargs["BLOCK_HEADDIM_V"]
+  nargs["desc_q"].block_shape = [BLOCK_M, BLOCK_HEADDIM_QK]
+  nargs["desc_k"].block_shape = [BLOCK_N, BLOCK_HEADDIM_QK]
+  nargs["desc_v"].block_shape = [BLOCK_N, BLOCK_HEADDIM_V]
+  nargs["desc_o"].block_shape = [BLOCK_M, BLOCK_HEADDIM_V]
+
+
+# ---------------------------------------------------------------------------
+# TMA forward kernel
+# ---------------------------------------------------------------------------
+
+
+@triton.heuristics(_SM90_FWD_HEURISTICS)
+@triton.jit
+def _ffpa_fwd_sm90_kernel_impl(
+  desc_q,
+  desc_k,
+  desc_v,
+  desc_o,
+  LSE: torch.Tensor,
+  AttnBias: torch.Tensor,
+  softmax_scale: float,
+  stride_bb: int,
+  stride_bh: int,
+  stride_bm: int,
+  stride_bn: int,
+  y_dim_q: int,
+  y_dim_kv: int,
+  nheads_q: int,
+  nheads_kv: int,
+  seqlen_q: int,
+  seqlen_k: int,
+  seqlen_q_bucket: int,
+  seqlen_k_bucket: int,
+  autotune_causal_key: int,
+  seqlen_q_rounded: int,
+  dropout_p: float,
+  philox_offset: int,
+  IS_CAUSAL: tl.constexpr,
+  HAS_ATTN_BIAS: tl.constexpr,
+  HAS_DROPOUT: tl.constexpr,
+  PHILOX_SEED: tl.constexpr,
+  DTYPE: tl.constexpr,
+  HEADDIM: tl.constexpr,
+  EVEN_M: tl.constexpr,
+  EVEN_N: tl.constexpr,
+  BLOCK_M: tl.constexpr,
+  BLOCK_N: tl.constexpr,
+  BLOCK_HEADDIM_QK: tl.constexpr,
+  BLOCK_HEADDIM_V: tl.constexpr,
+  NUM_V_GROUPS: tl.constexpr,
+) -> None:
+  """TMA-descriptor variant of the Split-D FFPA generic forward kernel.
+
+    Identical algorithm to ``_ffpa_fwd_kernel_impl`` with Q / K / V / O
+    pointer arithmetic replaced by ``desc.load`` / ``desc.store`` calls.
+    LSE and attn_bias stay on raw pointers.
+    """
+  start_m = tl.program_id(0)
+  off_hb = tl.program_id(1)
+  off_b = off_hb // nheads_q
+  off_hq = off_hb % nheads_q
+  group_size = nheads_q // nheads_kv
+  off_hkv = off_hq // group_size
+
+  # --- descriptor preparation ---
+  desc_q = _maybe_make_tensor_desc(
+    desc_q,
+    shape=[y_dim_q, HEADDIM],
+    strides=[HEADDIM, 1],
+    block_shape=[BLOCK_M, BLOCK_HEADDIM_QK],
+  )
+  desc_k = _maybe_make_tensor_desc(
+    desc_k,
+    shape=[y_dim_kv, HEADDIM],
+    strides=[HEADDIM, 1],
+    block_shape=[BLOCK_N, BLOCK_HEADDIM_QK],
+  )
+  desc_v = _maybe_make_tensor_desc(
+    desc_v,
+    shape=[y_dim_kv, HEADDIM],
+    strides=[HEADDIM, 1],
+    block_shape=[BLOCK_N, BLOCK_HEADDIM_V],
+  )
+  desc_o = _maybe_make_tensor_desc(
+    desc_o,
+    shape=[y_dim_q, HEADDIM],
+    strides=[HEADDIM, 1],
+    block_shape=[BLOCK_M, BLOCK_HEADDIM_V],
+  )
+
+  # --- per-program offsets ---
+  q_base_y = (off_b * nheads_q + off_hq) * seqlen_q
+  kv_base_y = (off_b * nheads_kv + off_hkv) * seqlen_k
+  q_offset_y = q_base_y + start_m * BLOCK_M
+  o_offset_y = q_offset_y  # O follows Q layout
+
+  LSE += off_hb * seqlen_q_rounded
+  if HAS_ATTN_BIAS:
+    AttnBias += off_b * stride_bb + off_hq * stride_bh
+
+  # --- arange helpers ---
+  offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
+  offs_n = tl.arange(0, BLOCK_N)
+
+  num_qk_d_chunks = tl.cdiv(HEADDIM, BLOCK_HEADDIM_QK)
+  kv_offset = seqlen_k - seqlen_q
+
+  # --- online softmax state ---
+  m_i = tl.full([BLOCK_M], -float("inf"), dtype=tl.float32)
+  l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
+  zero_acc = tl.zeros([BLOCK_M, BLOCK_HEADDIM_V], dtype=tl.float32)
+  o_accs = (zero_acc, ) * NUM_V_GROUPS
+
+  end_n = seqlen_k
+  if IS_CAUSAL:
+    end_n = tl.minimum(seqlen_k, (start_m + 1) * BLOCK_M + kv_offset)
+
+  # --- KV loop ---
+  for start_n in range(0, end_n, BLOCK_N):
+    start_n = tl.multiple_of(start_n, BLOCK_N)
+    offs_kv = start_n + offs_n
+    k_offset_y = kv_base_y + start_n
+    v_offset_y = kv_base_y + start_n
+
+    scores = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+    for qk_d_chunk in range(num_qk_d_chunks):
+      qk_d_start = qk_d_chunk * BLOCK_HEADDIM_QK
+      # TMA descriptor loads — OOB elements return 0 automatically
+      q = desc_q.load([q_offset_y, qk_d_start])
+      k = desc_k.load([k_offset_y, qk_d_start])
+      scores = tl.dot(q, tl.trans(k), acc=scores)
+
+    scores = scores * softmax_scale
+    if HAS_ATTN_BIAS:
+      # attn_bias stays on raw pointer — may be stride-0 broadcast
+      bias = tl.load(
+        AttnBias + offs_m[:, None] * stride_bm + offs_kv[None, :] * stride_bn,
+        mask=(offs_m[:, None] < seqlen_q) & (offs_kv[None, :] < seqlen_k),
+        other=0.0,
+      )
+      scores += bias
+    if not EVEN_N:
+      scores = tl.where(offs_kv[None, :] < seqlen_k, scores, -float("inf"))
+    if IS_CAUSAL:
+      causal_mask = offs_kv[None, :] <= (offs_m[:, None] + kv_offset)
+      scores = tl.where(causal_mask, scores, -float("inf"))
+
+    # --- online softmax merge ---
+    m_new = tl.maximum(m_i, tl.max(scores, axis=1))
+    alpha = tl.exp(m_i - m_new)
+    p = tl.exp(scores - m_new[:, None])
+    l_new = l_i * alpha + tl.sum(p, axis=1)
+    p = _apply_dropout_to_p(
+      p,
+      off_hb,
+      offs_m,
+      offs_kv,
+      seqlen_q,
+      seqlen_k,
+      dropout_p,
+      PHILOX_SEED,
+      philox_offset,
+      HAS_DROPOUT,
+    )
+    p = p.to(DTYPE)
+
+    # --- Split-D V accumulation ---
+    for v_group in tl.static_range(0, NUM_V_GROUPS):
+      o_d_start = BLOCK_HEADDIM_V * v_group
+      v = desc_v.load([v_offset_y, o_d_start])
+      o_acc = o_accs[v_group] * alpha[:, None] + tl.dot(p, v)
+      o_accs = _update_o_accs(o_accs, v_group, o_acc)
+    m_i = m_new
+    l_i = l_new
+
+  # --- epilogue: write O via descriptor, LSE via raw pointer ---
+  for v_group in tl.static_range(0, NUM_V_GROUPS):
+    o_d_start = BLOCK_HEADDIM_V * v_group
+    out = o_accs[v_group] / (l_i[:, None] + 1.0e-10)
+    desc_o.store([o_offset_y, o_d_start], out.to(DTYPE))
+  tl.store(LSE + offs_m, m_i + tl.log(l_i), mask=offs_m < seqlen_q)
+
+
+# ---------------------------------------------------------------------------
+# Default launch config (Phase 1: fixed, no autotune)
+# ---------------------------------------------------------------------------
+
+_SM90_DEFAULT_CONFIG = {
+  "BLOCK_M": 128,
+  "BLOCK_N": 64,
+  "BLOCK_HEADDIM_QK": 64,
+  "BLOCK_HEADDIM_V": 64,
+  "num_warps": 8,
+  "num_stages": 3,
+}
+
+
+def _ffpa_attn_forward_sm90_generic_impl(
+  q: torch.Tensor,
+  k: torch.Tensor,
+  v: torch.Tensor,
+  o: torch.Tensor,
+  lse: torch.Tensor,
+  attn_bias: torch.Tensor | None = None,
+  causal: bool = False,
+  softmax_scale: float | None = None,
+  autotune: bool = False,
+  autotune_mode: str = "fast",
+  dropout_p: float = 0.0,
+  philox_seed: int = 0,
+  philox_offset: int = 0,
+) -> None:
+  """Launch the SM90 TMA forward kernel (generic prefill path).
+
+    This is the TMA counterpart of ``_ffpa_attn_forward_generic_impl``.
+    Phase 1 uses a fixed launch config; autotune integration is deferred
+    to a later phase.
+    """
+  batch, nheads_q, seqlen_q, headdim = q.shape
+  _, nheads_kv, seqlen_k, _ = k.shape
+  softmax_scale = softmax_scale or (1.0 / math.sqrt(headdim))
+  seqlen_q_rounded = lse.shape[-1]
+  DTYPE = tl.float16 if q.dtype == torch.float16 else tl.bfloat16
+  has_attn_bias = attn_bias is not None
+  has_dropout = dropout_p > 0.0
+  attn_bias_in = attn_bias if attn_bias is not None else q
+  bias_strides = _attn_bias_broadcast_strides(attn_bias, batch, nheads_q, seqlen_q, seqlen_k)
+
+  # --- choose config ---
+  # Phase 1 uses a fixed default; persistent config lookup is included
+  # for future tuning but is expected to return None currently.
+  launch_config = dict(_SM90_DEFAULT_CONFIG)
+  persisted = lookup_persistent_config(
+    PersistentConfigRequest(
+      direction="forward",
+      kernel="fwd_sm90_generic",
+      autotune_mode=autotune_mode,
+      dtype=dtype_name(q.dtype),
+      headdim=headdim,
+      seqlen_q=seqlen_q,
+      seqlen_k=seqlen_k,
+      causal=causal,
+      has_attn_bias=has_attn_bias,
+      has_dropout=has_dropout,
+      nheads_q=nheads_q,
+      nheads_kv=nheads_kv,
+      device_index=q.device.index,
+    )
+  )
+  if persisted is not None:
+    launch_config.update(persisted)
+
+  # --- build descriptors ---
+  y_dim_q = batch * nheads_q * seqlen_q
+  y_dim_kv = batch * nheads_kv * seqlen_k
+  dummy_block = [1, 1]
+
+  desc_q = TensorDescriptor(q, shape=[y_dim_q, headdim], strides=[headdim, 1], block_shape=dummy_block)
+  desc_k = TensorDescriptor(k, shape=[y_dim_kv, headdim], strides=[headdim, 1], block_shape=dummy_block)
+  desc_v = TensorDescriptor(v, shape=[y_dim_kv, headdim], strides=[headdim, 1], block_shape=dummy_block)
+  desc_o = TensorDescriptor(o, shape=[y_dim_q, headdim], strides=[headdim, 1], block_shape=dummy_block)
+
+  # Set per-descriptor block shapes for the chosen config.
+  desc_q.block_shape = [launch_config["BLOCK_M"], launch_config["BLOCK_HEADDIM_QK"]]
+  desc_k.block_shape = [launch_config["BLOCK_N"], launch_config["BLOCK_HEADDIM_QK"]]
+  desc_v.block_shape = [launch_config["BLOCK_N"], launch_config["BLOCK_HEADDIM_V"]]
+  desc_o.block_shape = [launch_config["BLOCK_M"], launch_config["BLOCK_HEADDIM_V"]]
+
+  # --- TMA allocator (required for descriptor path) ---
+  def _tma_alloc_fn(size: int, align: int, _):
+    return torch.empty(size, dtype=torch.int8, device=q.device)
+
+  triton.set_allocator(_tma_alloc_fn)
+
+  # --- grid ---
+  def grid(meta):
+    return (triton.cdiv(seqlen_q, meta["BLOCK_M"]), batch * nheads_q)
+
+  # --- launch ---
+  _ffpa_fwd_sm90_kernel_impl[grid](
+    desc_q,
+    desc_k,
+    desc_v,
+    desc_o,
+    lse,
+    attn_bias_in,
+    softmax_scale,
+    bias_strides[0],
+    bias_strides[1],
+    bias_strides[2],
+    bias_strides[3],
+    y_dim_q,
+    y_dim_kv,
+    nheads_q,
+    nheads_kv,
+    seqlen_q,
+    seqlen_k,
+    0,  # seqlen_q_bucket (unused in Phase 1)
+    0,  # seqlen_k_bucket
+    0,  # autotune_causal_key
+    seqlen_q_rounded,
+    dropout_p,
+    philox_offset,
+    IS_CAUSAL=causal,
+    HAS_ATTN_BIAS=has_attn_bias,
+    HAS_DROPOUT=has_dropout,
+    PHILOX_SEED=philox_seed,
+    DTYPE=DTYPE,
+    HEADDIM=headdim,
+    **launch_config,
+  )
+
+
+# ---------------------------------------------------------------------------
+# Gating
+# ---------------------------------------------------------------------------
+
+
+def is_sm90_tma_forward_supported(
+  q: torch.Tensor,
+  k: torch.Tensor,
+  v: torch.Tensor,
+  o: torch.Tensor,
+  *,
+  num_splits: int,
+) -> bool:
+  """Return whether the experimental SM90 TMA forward path may run.
+
+    The caller must also pass ``enable_tma=True``; this function only checks
+    hardware / shape / dtype preconditions.  On SM < 90 (including Ada L20)
+    it returns ``False`` so the existing generic path is used silently.
+
+    :param q: Query tensor in ``[B, Hq, Nq, D]`` layout.
+    :param k: Key tensor in ``[B, Hkv, Nkv, D]`` layout.
+    :param v: Value tensor in ``[B, Hkv, Nkv, D]`` layout.
+    :param o: Output tensor in ``[B, Hq, Nq, D]`` layout.
+    :param num_splits: Decode split count selected by the generic dispatcher.
+    :return: ``True`` when the call is eligible for the SM90 generic prefill
+        path; otherwise ``False`` so the caller can use the existing fallback.
+    """
+  if num_splits != 1:
+    return False
+  if not q.is_cuda:
+    return False
+  if torch.cuda.get_device_capability(q.device)[0] < 9:
+    return False
+  if q.dtype not in (torch.float16, torch.bfloat16):
+    return False
+  return q.stride(-1) == k.stride(-1) == v.stride(-1) == o.stride(-1) == 1
+
+
+# ---------------------------------------------------------------------------
+# Public entry point
+# ---------------------------------------------------------------------------
+
+
+def _ffpa_attn_forward_sm90_tma_impl(
+  q: torch.Tensor,
+  k: torch.Tensor,
+  v: torch.Tensor,
+  o: torch.Tensor,
+  lse: torch.Tensor,
+  attn_bias: torch.Tensor | None = None,
+  causal: bool = False,
+  softmax_scale: float | None = None,
+  autotune: bool = False,
+  autotune_mode: str = "fast",
+  dropout_p: float = 0.0,
+  philox_seed: int = 0,
+  philox_offset: int = 0,
+) -> None:
+  """Run the SM90 TMA forward implementation.
+
+    This is the integration scaffold for the descriptor/TMA kernel.  Phase 1
+    implements a non-warp-specialized TMA kernel that replaces raw-pointer
+    memory access with descriptor loads/stores while preserving the Split-D
+    algorithm structure.
+
+    :param q: Query tensor in ``[B, Hq, Nq, D]`` layout.
+    :param k: Key tensor in ``[B, Hkv, Nkv, D]`` layout.
+    :param v: Value tensor in ``[B, Hkv, Nkv, D]`` layout.
+    :param o: Output tensor in ``[B, Hq, Nq, D]`` layout, written in place.
+    :param lse: Float32 LSE tensor with rounded last-dimension storage.
+    :param attn_bias: Optional additive mask broadcastable to
+        ``[B, Hq, Nq, Nkv]``.
+    :param causal: Whether to apply lower-right causal masking.
+    :param softmax_scale: Scale applied to ``Q @ K.T``.
+    :param autotune: Whether to use the Triton autotuned path (Phase 1
+        ignores this and uses a fixed config).
+    :param autotune_mode: Triton autotune search-space mode, ``"fast"`` or
+        ``"max"``.
+    :param dropout_p: Forward dropout probability.
+    :param philox_seed: Philox seed used for dropout.
+    :param philox_offset: Philox element offset used for dropout replay parity
+        with SDPA.
+    """
+  _ffpa_attn_forward_sm90_generic_impl(
+    q,
+    k,
+    v,
+    o,
+    lse,
+    attn_bias=attn_bias,
+    causal=causal,
+    softmax_scale=softmax_scale,
+    autotune=autotune,
+    autotune_mode=autotune_mode,
+    dropout_p=dropout_p,
+    philox_seed=philox_seed,
+    philox_offset=philox_offset,
+  )

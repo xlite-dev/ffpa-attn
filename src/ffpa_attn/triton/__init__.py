@@ -81,7 +81,8 @@ def _triton_bwd_grad_tensor_like(
 torch.library.define(
   f"{_OP_NAMESPACE}::_fwd_triton",
   "(Tensor q, Tensor k, Tensor v, Tensor? attn_bias, float softmax_scale, "
-  "int causal, int autotune, int autotune_mode_is_max, float dropout_p, int philox_seed, int philox_offset) "
+  "int causal, int autotune, int autotune_mode_is_max, float dropout_p, int philox_seed, int philox_offset, "
+  "int enable_tma) "
   "-> (Tensor o, Tensor softmax_lse)",
 )
 
@@ -99,6 +100,7 @@ def _fwd_triton_torch_op(
   dropout_p: float,
   philox_seed: int,
   philox_offset: int,
+  enable_tma: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
   from ._ffpa_fwd import _ffpa_attn_forward_impl as _triton_fwd_kernel
 
@@ -133,6 +135,7 @@ def _fwd_triton_torch_op(
     dropout_p=dropout_p,
     philox_seed=philox_seed,
     philox_offset=philox_offset,
+    enable_tma=bool(enable_tma),
   )
   return o, softmax_lse
 
@@ -150,6 +153,7 @@ def _fwd_triton_fake(
   dropout_p: float,
   philox_seed: int,
   philox_offset: int,
+  enable_tma: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
   seqlen_q_aligned = ((q.size(2) + 127) // 128) * 128
   o = torch.empty_like(q)
