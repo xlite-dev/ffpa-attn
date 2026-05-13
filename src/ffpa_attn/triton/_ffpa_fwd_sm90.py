@@ -230,8 +230,8 @@ def _ffpa_fwd_sm90_kernel_impl(
 _SM90_DEFAULT_CONFIG = {
   "BLOCK_M": 128,
   "BLOCK_N": 128,
-  "BLOCK_HEADDIM_QK": 128,
-  "BLOCK_HEADDIM_V": 128,
+  "BLOCK_HEADDIM_QK": 64,
+  "BLOCK_HEADDIM_V": 64,
   "num_warps": 4,
   "num_stages": 3,
 }
