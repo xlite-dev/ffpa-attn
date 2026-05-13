@@ -85,6 +85,8 @@ def _ffpa_fwd_sm90_kernel_impl(
   LSE: torch.Tensor,
   AttnBias: torch.Tensor,
   O: torch.Tensor,
+  stride_ob: int,
+  stride_oh: int,
   stride_om: int,
   softmax_scale: float,
   stride_bb: int,
@@ -137,6 +139,7 @@ def _ffpa_fwd_sm90_kernel_impl(
   o_offset_y = q_offset_y  # O follows Q layout
 
   LSE += off_hb * seqlen_q_rounded
+  O += off_b * stride_ob + off_hq * stride_oh
   if HAS_ATTN_BIAS:
     AttnBias += off_b * stride_bb + off_hq * stride_bh
 
@@ -418,6 +421,8 @@ def _ffpa_attn_forward_sm90_generic_impl(
       lse,
       attn_bias_in,
       o,
+      o.stride(0),
+      o.stride(1),
       o.stride(2),
       softmax_scale,
       bias_strides[0],
