@@ -1578,7 +1578,12 @@ def _ffpa_attn_backward_triton_impl(
       USE_GEMV=use_gemv,
     )
     if autotune:
-      _get_decode_bwd_stage1_autotune(headdim, use_gemv, autotune_mode, main_bias_requires_grad)[decode_grid](
+      _get_decode_bwd_stage1_autotune(
+        headdim,
+        use_gemv,
+        autotune_mode,
+        main_bias_requires_grad,
+      )[decode_grid](
         *decode_stage1_args,
         **decode_stage1_meta,
       )
@@ -1595,27 +1600,30 @@ def _ffpa_attn_backward_triton_impl(
         **decode_stage1_meta,
         **decode_launch_config,
       )
-    _ffpa_bwd_decode_dq_reduce_kernel[
-      (triton.cdiv(headdim, reduce_block_headdim_decode), triton.cdiv(seqlen_q, block_m_decode), batch * nheads)](
-        partial_dq,
-        written_k_blocks,
-        dq,
-        partial_dq.stride(0),
-        partial_dq.stride(1),
-        partial_dq.stride(2),
-        partial_dq.stride(3),
-        dq.stride(0),
-        dq.stride(1),
-        dq.stride(2),
-        nheads,
-        seqlen_q,
-        headdim,
-        BLOCK_K=64,
-        BLOCK_M=block_m_decode,
-        BLOCK_HEADDIM=reduce_block_headdim_decode,
-        num_warps=8,
-        num_stages=2,
-      )
+    _ffpa_bwd_decode_dq_reduce_kernel[(
+      triton.cdiv(headdim, reduce_block_headdim_decode),
+      triton.cdiv(seqlen_q, block_m_decode),
+      batch * nheads,
+    )](
+      partial_dq,
+      written_k_blocks,
+      dq,
+      partial_dq.stride(0),
+      partial_dq.stride(1),
+      partial_dq.stride(2),
+      partial_dq.stride(3),
+      dq.stride(0),
+      dq.stride(1),
+      dq.stride(2),
+      nheads,
+      seqlen_q,
+      headdim,
+      BLOCK_K=64,
+      BLOCK_M=block_m_decode,
+      BLOCK_HEADDIM=reduce_block_headdim_decode,
+      num_warps=8,
+      num_stages=2,
+    )
     return
 
   def grid(meta: dict) -> tuple[int, ...]:
