@@ -32,9 +32,7 @@ from ._ffpa_fwd import (
 from ._persistent_autotune import PersistentConfigRequest, dtype_name, lookup_persistent_config
 from ._autotune_utils import autotune_seqlen_key
 
-# ---------------------------------------------------------------------------
 # Heuristics (mirror the original generic kernel)
-# ---------------------------------------------------------------------------
 
 
 def _sm90_num_v_groups(args):
@@ -47,9 +45,7 @@ _SM90_FWD_HEURISTICS = {
   "NUM_V_GROUPS": _sm90_num_v_groups,
 }
 
-# ---------------------------------------------------------------------------
-# Pre-hook (for future autotune support)
-# ---------------------------------------------------------------------------
+# Pre-hook (for autotune support)
 
 
 def _sm90_host_descriptor_pre_hook(nargs):
@@ -57,7 +53,7 @@ def _sm90_host_descriptor_pre_hook(nargs):
 
     Called as a ``pre_hook`` on :class:`triton.Config` so that each autotune
     candidate updates the block shape to match its compile-time tile sizes.
-    """
+  """
   if not isinstance(nargs.get("desc_q"), TensorDescriptor):
     return
   BLOCK_M = nargs["BLOCK_M"]
@@ -70,9 +66,7 @@ def _sm90_host_descriptor_pre_hook(nargs):
   nargs["desc_o"].block_shape = [BLOCK_M, BLOCK_HEADDIM_V]
 
 
-# ---------------------------------------------------------------------------
 # TMA forward kernel
-# ---------------------------------------------------------------------------
 
 
 @triton.heuristics(_SM90_FWD_HEURISTICS)
@@ -240,9 +234,7 @@ def _ffpa_fwd_sm90_kernel_impl(
   tl.store(LSE + offs_m, m_i + tl.log(l_i), mask=offs_m < seqlen_q)
 
 
-# ---------------------------------------------------------------------------
-# Default launch config (Phase 1: fixed, no autotune)
-# ---------------------------------------------------------------------------
+# Default launch config
 
 _SM90_DEFAULT_CONFIG = {
   "BLOCK_M": 128,
@@ -250,7 +242,7 @@ _SM90_DEFAULT_CONFIG = {
   "BLOCK_HEADDIM_QK": 128,
   "BLOCK_HEADDIM_V": 128,
   "num_warps": 4,
-  "num_stages": 2,
+  "num_stages": 3,
 }
 
 
@@ -341,7 +333,7 @@ def _ffpa_attn_forward_sm90_generic_impl(
     This is the TMA counterpart of ``_ffpa_attn_forward_generic_impl``.
     Phase 1 uses a fixed launch config; autotune integration is deferred
     to a later phase.
-    """
+  """
   batch, nheads_q, seqlen_q, headdim = q.shape
   _, nheads_kv, seqlen_k, _ = k.shape
   softmax_scale = softmax_scale or (1.0 / math.sqrt(headdim))
@@ -492,9 +484,7 @@ def _ffpa_attn_forward_sm90_generic_impl(
   )
 
 
-# ---------------------------------------------------------------------------
 # Gating
-# ---------------------------------------------------------------------------
 
 
 def is_sm90_tma_forward_supported(
@@ -518,7 +508,7 @@ def is_sm90_tma_forward_supported(
     :param num_splits: Decode split count selected by the generic dispatcher.
     :return: ``True`` when the call is eligible for the SM90 generic prefill
         path; otherwise ``False`` so the caller can use the existing fallback.
-    """
+  """
   if num_splits != 1:
     return False
   if not q.is_cuda:
@@ -530,9 +520,7 @@ def is_sm90_tma_forward_supported(
   return q.stride(-1) == k.stride(-1) == v.stride(-1) == o.stride(-1) == 1
 
 
-# ---------------------------------------------------------------------------
 # Public entry point
-# ---------------------------------------------------------------------------
 
 
 def _ffpa_attn_forward_sm90_tma_impl(
@@ -573,7 +561,7 @@ def _ffpa_attn_forward_sm90_tma_impl(
     :param philox_seed: Philox seed used for dropout.
     :param philox_offset: Philox element offset used for dropout replay parity
         with SDPA.
-    """
+  """
   _ffpa_attn_forward_sm90_generic_impl(
     q,
     k,
