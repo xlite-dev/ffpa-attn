@@ -1802,7 +1802,7 @@ def _ffpa_attn_backward_triton_impl(
 
   if use_key_bias_grad_reduction:
     key_bias_block_n = 64
-    _ffpa_bwd_key_bias_grad_reduce_kernel[(triton.cdiv(seqlen_k, key_bias_block_n))](
+    _ffpa_bwd_key_bias_grad_reduce_kernel[(triton.cdiv(seqlen_k, key_bias_block_n), )](
       partial_grad_bias,
       grad_attn_bias,
       seqlen_k,
