@@ -6,7 +6,12 @@ import torch
 from ffpa_attn.autotune import _iter_backward_tasks, _iter_forward_tasks
 from ffpa_attn.functional import FFPAAttnMeta
 from ffpa_attn.triton._autotune_utils import autotune_seqlen_key, bucket_autotune_seqlen, exact_autotune_seqlen_keys
-from ffpa_attn.triton._ffpa_bwd import _gen_bwd_autotune_configs, _gen_pre_autotune_configs, _get_pre_autotune
+from ffpa_attn.triton._ffpa_bwd import (
+  _gen_bwd_autotune_configs,
+  _gen_decode_bwd_stage1_autotune_configs,
+  _gen_pre_autotune_configs,
+  _get_pre_autotune,
+)
 from ffpa_attn.triton._persistent_autotune import config_from_triton_config
 from ffpa_attn.triton._ffpa_fwd import (
   _gen_decode_fwd_stage1_autotune_configs,
@@ -86,24 +91,43 @@ def test_fwd_fast_mode_prunes_decode_configs():
   assert len(fast) < len(max_configs)
 
 
-def test_bwd_fast_mode_prunes_preprocess_configs():
+def test_bwd_non_main_modes_use_same_preprocess_configs():
   fast = _gen_pre_autotune_configs(d_chunk=False, autotune_mode="fast")
   max_configs = _gen_pre_autotune_configs(d_chunk=False, autotune_mode="max")
+  assert [config_from_triton_config(config)
+          for config in fast] == [config_from_triton_config(config) for config in max_configs]
+
+
+@pytest.mark.parametrize("use_gemv", [False, True])
+def test_bwd_non_main_modes_use_same_decode_configs(use_gemv):
+  fast = _gen_decode_bwd_stage1_autotune_configs(512, use_gemv=use_gemv, autotune_mode="fast")
+  max_configs = _gen_decode_bwd_stage1_autotune_configs(512, use_gemv=use_gemv, autotune_mode="max")
+  assert [config_from_triton_config(config)
+          for config in fast] == [config_from_triton_config(config) for config in max_configs]
+
+
+def test_bwd_fast_mode_prunes_kernel_configs(monkeypatch):
+  monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (9, 0))
+  fast = _gen_bwd_autotune_configs((64, ), autotune_mode="fast")
+  max_configs = _gen_bwd_autotune_configs((64, 128), autotune_mode="max")
   assert len(fast) < len(max_configs)
 
 
-def test_bwd_fast_mode_prunes_kernel_configs():
-  fast = _gen_bwd_autotune_configs((64, ), headdim=512, autotune_mode="fast")
-  max_configs = _gen_bwd_autotune_configs((64, 128), headdim=512, autotune_mode="max")
-  assert len(fast) < len(max_configs)
-
-
-def test_bwd_max_mode_keeps_main_kernel_search_light():
-  configs = _gen_bwd_autotune_configs((64, 128), headdim=512, autotune_mode="max")
+def test_bwd_max_mode_keeps_main_kernel_search_light_on_sm90(monkeypatch):
+  monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (9, 0))
+  configs = _gen_bwd_autotune_configs((64, 128), autotune_mode="max")
   serialized = [config_from_triton_config(config) for config in configs]
   assert len(serialized) == 48
   assert {config["BLOCK_HEADDIM"] for config in serialized} == {64, 128, 256}
   assert {config["num_stages"] for config in serialized} == {2, 3}
+
+
+def test_bwd_max_mode_matches_fast_kernel_search_below_sm90(monkeypatch):
+  monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (8, 9))
+  fast = _gen_bwd_autotune_configs((64, ), autotune_mode="fast")
+  max_configs = _gen_bwd_autotune_configs((64, 128), autotune_mode="max")
+  assert [config_from_triton_config(config)
+          for config in max_configs] == [config_from_triton_config(config) for config in fast]
 
 
 def test_forward_autotune_keys_include_causal():
@@ -175,7 +199,7 @@ def test_persistent_autotune_full_tasks_add_mask_dropout_gqa_mqa():
 
 
 def test_triton_config_serialization_round_trip_shape():
-  config = _gen_bwd_autotune_configs((64, ), headdim=512, autotune_mode="fast")[0]
+  config = _gen_bwd_autotune_configs((64, ), autotune_mode="fast")[0]
   serialized = config_from_triton_config(config)
   assert serialized["BLOCK_M"] in (64, 128)
   assert serialized["BLOCK_N"] == 64

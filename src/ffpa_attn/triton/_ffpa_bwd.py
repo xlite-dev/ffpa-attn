@@ -279,12 +279,16 @@ def _gen_pre_autotune_configs(d_chunk: bool, autotune_mode: str = "max") -> list
   never benchmarked for large head dimensions.
 
   :param d_chunk: Whether generated configs should enable D_CHUNK mode.
+  :param autotune_mode: Accepted for API symmetry; backward preprocess uses the
+      same bounded search space for fast and max because only bwd_main gets an
+      expanded max search.
   :return: Triton autotune configurations for the delta preprocess kernel.
   """
+  del autotune_mode
   configs = []
   for block_m in [64, 128, 256]:
     if not d_chunk:
-      for num_warps in ([4, 8] if autotune_mode == "fast" else [2, 4, 8]):
+      for num_warps in [4, 8]:
         configs.append(triton.Config(
           {
             "BLOCK_M": block_m,
@@ -294,8 +298,8 @@ def _gen_pre_autotune_configs(d_chunk: bool, autotune_mode: str = "max") -> list
         ))
       continue
 
-    for block_headdim in ([64, 128] if autotune_mode == "fast" else [64, 128, 256]):
-      for num_warps in ([4, 8] if autotune_mode == "fast" else [2, 4, 8]):
+    for block_headdim in [64, 128]:
+      for num_warps in [4, 8]:
         configs.append(
           triton.Config(
             {
@@ -359,30 +363,41 @@ def _normalize_bwd_pre_config(
   return normalized
 
 
+def _supports_bwd_main_max_extra_configs() -> bool:
+  """Return whether the current GPU should try extra bwd_main max configs."""
+  try:
+    major, _minor = torch.cuda.get_device_capability()
+  except Exception:
+    return False
+  return major >= 9
+
+
 def _gen_bwd_autotune_configs(
   block_n_values: tuple[int, ...],
-  headdim: int = 512,
   autotune_mode: str = "max",
 ) -> list[triton.Config]:
   """Generate autotune configs over BLOCK_M, BLOCK_N, BLOCK_HEADDIM, num_warps, num_stages.
 
   :param block_n_values: Candidate ``BLOCK_N`` values for the target backward
       kernel variant.
-  :param headdim: Runtime head dimension.  Kept in the signature for caller
-      symmetry with other autotune generators; the default backward-main search
-      space currently uses fixed split-D candidates to keep max tuning bounded.
+    :param autotune_mode: Search-space mode, ``"fast"`` or ``"max"``.
   :return: Triton autotune configurations for one backward kernel variant.
   """
   # BLOCK_M: larger = fewer Q-block iterations (good), more register pressure.
   # BLOCK_N: controls K/V tile size for dK/dV and dQ recomputation.
   # BLOCK_HEADDIM:
   #   64, 128 — classic D-chunk split, low register pressure, widely compatible.
-  #   256     — max-only wider split-D candidate.  Full-D dynamic candidates and
-  #             stage-4 pipelines are still pruned because they make offline
-  #             persistent tuning much slower without a clear default win.
+  #   256     — SM90+ max-only wider split-D candidate.  On SM < 90 measured
+  #             performance is effectively identical, so max intentionally uses
+  #             the fast search space.  Full-D dynamic candidates and stage-4
+  #             pipelines are still pruned because they make offline persistent
+  #             tuning much slower without a clear default win.
   # TODO: Optimize the autotune time by saving the best config per shape
   # (device-shape/headdim) in a file and loading it at the start of autotune.
-  _headdim_candidates = [64, 128] if autotune_mode == "fast" else [64, 128, 256]
+  use_extra_max_configs = autotune_mode == "max" and _supports_bwd_main_max_extra_configs()
+  if autotune_mode == "max" and not use_extra_max_configs:
+    block_n_values = (64, )
+  _headdim_candidates = [64, 128, 256] if use_extra_max_configs else [64, 128]
   _num_stages_candidates = [2, 3]
 
   configs = []
@@ -787,7 +802,6 @@ def _get_bwd_autotune(headdim: int, autotune_mode: str, bias_requires_grad: bool
   if cache_key not in _ffpa_bwd_autotune_cache:
     configs = _gen_bwd_autotune_configs(
       block_n_values=(64, ) if autotune_mode == "fast" else (64, 128),
-      headdim=headdim,
       autotune_mode=autotune_mode,
     )
     reset_args = []
@@ -815,32 +829,24 @@ def _gen_decode_bwd_stage1_autotune_configs(
 ) -> list[triton.Config]:
   """Generate decode-backward stage1 autotune configs.
 
-  :param headdim: Runtime head dimension used to decide whether full-D GEMV
-      candidates are worth exploring.
+  :param headdim: Runtime head dimension.  Kept in the signature for caller
+      symmetry; decode backward uses the same bounded search space for fast and
+      max because only bwd_main gets an expanded max search.
   :param use_gemv: Whether the target shape is the single-query GEMV path.
-  :param autotune_mode: Search-space mode, ``"fast"`` or ``"max"``.
+  :param autotune_mode: Accepted search-space mode, ``"fast"`` or ``"max"``.
   :return: Triton autotune configs for the decode backward stage1 kernel.
   """
-  try:
-    max_smem = torch.cuda.get_device_properties(0).shared_memory_per_block_optin
-  except Exception:
-    max_smem = 48 * 1024
+  del headdim, autotune_mode
 
   headdim_candidates = [64, 128]
-  next_pow2 = triton.next_power_of_2(headdim)
-  if use_gemv and autotune_mode == "max" and max_smem >= 96 * 1024 and next_pow2 > 128:
-    headdim_candidates.append(next_pow2)
-
   block_n_candidates = [64, 128]
-  if autotune_mode == "max":
-    block_n_candidates.append(256)
-  block_m_candidates = [8] if use_gemv else ([16] if autotune_mode == "fast" else [16, 32])
+  block_m_candidates = [8] if use_gemv else [16]
 
   configs = []
   for block_n in block_n_candidates:
     for block_m in block_m_candidates:
       for block_headdim in headdim_candidates:
-        for num_stages in ([2] if autotune_mode == "fast" else [2, 3]):
+        for num_stages in [2]:
           configs.append(
             triton.Config(
               {
