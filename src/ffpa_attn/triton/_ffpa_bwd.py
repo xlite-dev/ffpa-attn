@@ -368,49 +368,29 @@ def _gen_bwd_autotune_configs(
 
   :param block_n_values: Candidate ``BLOCK_N`` values for the target backward
       kernel variant.
-  :param headdim: Full-D ``BLOCK_HEADDIM`` candidate for architectures with
-      enough shared memory.  When the actual runtime headdim matches this
-      value the kernel skips the D-chunk loop entirely.
+  :param headdim: Runtime head dimension.  Kept in the signature for caller
+      symmetry with other autotune generators; the default backward-main search
+      space currently uses fixed split-D candidates to keep max tuning bounded.
   :return: Triton autotune configurations for one backward kernel variant.
   """
   # BLOCK_M: larger = fewer Q-block iterations (good), more register pressure.
   # BLOCK_N: controls K/V tile size for dK/dV and dQ recomputation.
-  # BLOCK_HEADDIM (gated by available shared memory):
+  # BLOCK_HEADDIM:
   #   64, 128 — classic D-chunk split, low register pressure, widely compatible.
-  #   256     — 2 chunks for D=512, halves HBM reloads.  Requires BLOCK_M ≤ 64
-  #             to fit registers; 1.3x slower on Ampere, may win on Ada+.
-  #   headdim — full-D single chunk, eliminates D-chunk loop entirely.
-  #             Needs >= 128 KB SMEM; only included on Ada (128 KB) or Hopper
-  #             (228 KB).  Skipped on Ampere (99 KB limit).
+  #   256     — max-only wider split-D candidate.  Full-D dynamic candidates and
+  #             stage-4 pipelines are still pruned because they make offline
+  #             persistent tuning much slower without a clear default win.
   # TODO: Optimize the autotune time by saving the best config per shape
   # (device-shape/headdim) in a file and loading it at the start of autotune.
-  try:
-    _max_smem = torch.cuda.get_device_properties(0).shared_memory_per_block_optin
-  except Exception:
-    _max_smem = 48 * 1024  # safe fallback: default SMEM
-  _headdim_candidates = [64, 128, 256]
-  # Use triton.next_power_of_2(headdim) as a near-full-D single-chunk block size:
-  #   - power-of-2 headdims (512, 1024): next_pow2 == headdim → single D chunk.
-  #   - non-power-of-2 headdims (320→512, 640→1024): next_pow2 pads to the next
-  #     power-of-2.  The kernel's load/store masks (d_offs < headdim) zero out the
-  #     padding columns, so correctness is preserved.
-  # tl.arange requires a power-of-2 range, so next_power_of_2 always produces a
-  # valid block size. Only included on high-SMEM devices (Ada/Hopper, >= 128 KB);
-  # skip when next_pow2 is already in [64, 128, 256] (dedup).
-  _next_pow2 = triton.next_power_of_2(headdim)
-  if _max_smem >= 128 * 1024 and _next_pow2 not in _headdim_candidates:  # 128 KB
-    if autotune_mode == "max":
-      _headdim_candidates.append(_next_pow2)
-
-  if autotune_mode == "fast":
-    _headdim_candidates = [c for c in _headdim_candidates if c <= 128 or c == headdim]
+  _headdim_candidates = [64, 128] if autotune_mode == "fast" else [64, 128, 256]
+  _num_stages_candidates = [2, 3]
 
   configs = []
   for block_m in [64, 128]:
     for block_n in block_n_values:
       for block_headdim in _headdim_candidates:
         for num_warps in [4, 8]:
-          for num_stages in ([2, 3] if autotune_mode == "fast" else [2, 3, 4]):
+          for num_stages in _num_stages_candidates:
             configs.append(
               triton.Config(
                 {

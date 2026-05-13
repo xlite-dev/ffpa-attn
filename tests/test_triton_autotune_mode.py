@@ -93,9 +93,17 @@ def test_bwd_fast_mode_prunes_preprocess_configs():
 
 
 def test_bwd_fast_mode_prunes_kernel_configs():
-  fast = _gen_bwd_autotune_configs((64, 128), headdim=512, autotune_mode="fast")
+  fast = _gen_bwd_autotune_configs((64, ), headdim=512, autotune_mode="fast")
   max_configs = _gen_bwd_autotune_configs((64, 128), headdim=512, autotune_mode="max")
   assert len(fast) < len(max_configs)
+
+
+def test_bwd_max_mode_keeps_main_kernel_search_light():
+  configs = _gen_bwd_autotune_configs((64, 128), headdim=512, autotune_mode="max")
+  serialized = [config_from_triton_config(config) for config in configs]
+  assert len(serialized) == 48
+  assert {config["BLOCK_HEADDIM"] for config in serialized} == {64, 128, 256}
+  assert {config["num_stages"] for config in serialized} == {2, 3}
 
 
 def test_forward_autotune_keys_include_causal():
