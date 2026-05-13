@@ -283,7 +283,7 @@ def _format_backward_result(result: BACKWARD_RESULT) -> str:
     f"dV_err={result['dv_err']:.4e}  {dmask_msg}"
     f"backend={result['backward_backend']}  "
     f"FFPA={result['ffpa_ms']:.2f} ms  SDPA={result['sdpa_ms']:.2f} ms  "
-    f"TFLOPS={format_tflops_short(result['ffpa_tflops'])} / {format_tflops_short(result['sdpa_tflops'])}  "
+    f"TFLOPS={format_tflops_short(result['ffpa_tflops'])}/{format_tflops_short(result['sdpa_tflops'])}  "
     f"speedup={result['speedup']:.2f}x"
   )
 

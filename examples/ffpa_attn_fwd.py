@@ -263,7 +263,7 @@ def _format_forward_result(result: FORWARD_RESULT) -> str:
     f"allclose(atol={result['tolerance']})={result['allclose']}  "
     f"backend={result['forward_backend']}  "
     f"FFPA={result['ffpa_ms']:.2f} ms  SDPA={result['sdpa_ms']:.2f} ms  "
-    f"TFLOPS={format_tflops_short(result['ffpa_tflops'])} / {format_tflops_short(result['sdpa_tflops'])}  "
+    f"TFLOPS={format_tflops_short(result['ffpa_tflops'])}/{format_tflops_short(result['sdpa_tflops'])}  "
     f"speedup={result['speedup']:.2f}x"
   )
 
