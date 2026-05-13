@@ -703,17 +703,17 @@ def plot_tflops(
   ax.tick_params(axis="y", labelsize=16)
   ymax = max(finite_values) if finite_values else 1.0
   ax.set_ylim(0, ymax * 1.1 if ymax > 0 else 1.0)
-  fig.legend(
+  ax.legend(
     fontsize=20,
     loc="upper center",
-    bbox_to_anchor=(0.5, 0.945),
+    bbox_to_anchor=(0.5, 0.975),
     ncol=4,
     columnspacing=1.5,
     handletextpad=0.6,
   )
   ax.grid(axis="y", alpha=0.9)
 
-  fig.tight_layout(rect=(0, 0, 1, 0.90))
+  fig.tight_layout(rect=(0, 0, 1, 0.95))
   fig.savefig(output_path)
   plt.close(fig)
   return output_path
