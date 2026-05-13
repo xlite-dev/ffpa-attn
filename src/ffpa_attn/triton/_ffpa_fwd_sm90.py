@@ -55,7 +55,6 @@ def _maybe_make_tensor_desc(desc_or_ptr, shape, strides, block_shape):
 # ---------------------------------------------------------------------------
 
 
-@triton.jit
 def _sm90_num_v_groups(args):
   return triton.cdiv(args["HEADDIM"], args["BLOCK_HEADDIM_V"])
 
