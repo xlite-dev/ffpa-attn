@@ -986,6 +986,7 @@ def _ffpa_attn_forward_generic_impl(
         has_dropout=has_dropout,
         nheads_q=nheads_q,
         nheads_kv=nheads_kv,
+        device_index=q.device.index,
       )
     )
     launch_config = persisted_config or {
@@ -1189,6 +1190,7 @@ def _ffpa_attn_forward_decode_impl(
         has_dropout=has_dropout,
         nheads_q=nheads_q,
         nheads_kv=nheads_kv,
+        device_index=q.device.index,
       )
     )
     launch_config = persisted_config or {

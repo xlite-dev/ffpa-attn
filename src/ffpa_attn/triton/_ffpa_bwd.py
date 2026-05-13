@@ -1377,28 +1377,29 @@ def _ffpa_attn_backward_triton_impl(
 
   BLOCK_HEADDIM_DELTA = max(triton.next_power_of_2(headdim), 16)
   delta = torch.empty_like(lse)
+
+  def pre_grid(meta: dict) -> tuple[int, int]:
+    return (triton.cdiv(seqlen_q, meta["BLOCK_M"]), batch * nheads)
+
+  pre_args = (
+    o,
+    do,
+    delta,
+    o.stride(0),
+    o.stride(1),
+    o.stride(2),
+    do.stride(0),
+    do.stride(1),
+    do.stride(2),
+    nheads,
+    seqlen_q,
+    autotune_seqlen_q_bucket,
+    seqlen_q_rounded,
+    headdim,
+  )
   if autotune:
-
-    def pre_grid(meta: dict) -> tuple[int, int]:
-      return (triton.cdiv(seqlen_q, meta["BLOCK_M"]), batch * nheads)
-
     pre_kernel = _get_pre_autotune(preprocess_d_chunk, autotune_mode, runtime_dtype)
-    pre_kernel[pre_grid](
-      o,
-      do,
-      delta,
-      o.stride(0),
-      o.stride(1),
-      o.stride(2),
-      do.stride(0),
-      do.stride(1),
-      do.stride(2),
-      nheads,
-      seqlen_q,
-      autotune_seqlen_q_bucket,
-      seqlen_q_rounded,
-      headdim,
-    )
+    pre_kernel[pre_grid](*pre_args)
   else:
     block_headdim_delta = 64 if preprocess_d_chunk else BLOCK_HEADDIM_DELTA
     pre_config = lookup_persistent_config(
@@ -1410,6 +1411,7 @@ def _ffpa_attn_backward_triton_impl(
         headdim=headdim,
         seqlen_q=seqlen_q,
         preprocess_d_chunk=preprocess_d_chunk,
+        device_index=q.device.index,
       )
     ) or {
       "BLOCK_M": 128,
@@ -1418,20 +1420,7 @@ def _ffpa_attn_backward_triton_impl(
       "num_warps": 4,
     }
     _ffpa_bwd_pre[(triton.cdiv(seqlen_q, pre_config["BLOCK_M"]), batch * nheads)](
-      o,
-      do,
-      delta,
-      o.stride(0),
-      o.stride(1),
-      o.stride(2),
-      do.stride(0),
-      do.stride(1),
-      do.stride(2),
-      nheads,
-      seqlen_q,
-      autotune_seqlen_q_bucket,
-      seqlen_q_rounded,
-      headdim,
+      *pre_args,
       **pre_config,
     )
 
@@ -1447,6 +1436,7 @@ def _ffpa_attn_backward_triton_impl(
     block_m_decode = 8 if use_gemv else 16
     block_n_decode = 64 if use_gemv else 128
     block_headdim_decode = 64
+    reduce_block_headdim_decode = block_headdim_decode
     decode_persisted_config = None
     if not autotune:
       decode_persisted_config = lookup_persistent_config(
@@ -1466,6 +1456,7 @@ def _ffpa_attn_backward_triton_impl(
           has_dropout=has_dropout,
           nheads_q=nheads,
           nheads_kv=original_nheads_kv,
+          device_index=q.device.index,
         )
       )
       if decode_persisted_config is not None:
@@ -1574,7 +1565,7 @@ def _ffpa_attn_backward_triton_impl(
         **decode_launch_config,
       )
     _ffpa_bwd_decode_dq_reduce_kernel[
-      (triton.cdiv(headdim, block_headdim_decode), triton.cdiv(seqlen_q, block_m_decode), batch * nheads)](
+      (triton.cdiv(headdim, reduce_block_headdim_decode), triton.cdiv(seqlen_q, block_m_decode), batch * nheads)](
         partial_dq,
         written_k_blocks,
         dq,
@@ -1590,7 +1581,7 @@ def _ffpa_attn_backward_triton_impl(
         headdim,
         BLOCK_K=64,
         BLOCK_M=block_m_decode,
-        BLOCK_HEADDIM=block_headdim_decode,
+        BLOCK_HEADDIM=reduce_block_headdim_decode,
         num_warps=8,
         num_stages=2,
       )
@@ -1684,6 +1675,7 @@ def _ffpa_attn_backward_triton_impl(
         has_dropout=has_dropout,
         nheads_q=nheads,
         nheads_kv=original_nheads_kv,
+        device_index=q.device.index,
       )
     ) or {
       "BLOCK_M": 128,

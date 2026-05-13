@@ -31,7 +31,8 @@ import torch.nn.functional as F
 from ffpa_attn import ffpa_attn_func
 
 STAGES = 2
-WARMUP, ITERS = 2, 10
+DEFAULT_WARMUP = 2
+DEFAULT_ITERS = 10
 FORWARD_RESULT = dict[str, Any]
 
 
@@ -61,6 +62,8 @@ def _parse_args() -> argparse.Namespace:
   parser.add_argument("--B", type=int, default=1, help="Batch size.")
   parser.add_argument("--N", type=int, default=8192, help="Sequence length (non-aligned uses N-1).")
   parser.add_argument("--D", type=int, default=512, help="Head dimension.")
+  parser.add_argument("--warmup", type=int, default=DEFAULT_WARMUP, help="Warmup iterations used for timing.")
+  parser.add_argument("--iters", type=int, default=DEFAULT_ITERS, help="Measured iterations used for timing.")
   parser.add_argument("--dropout-p", type=float, default=0.1, help="Dropout probability for the dropout example case.")
   parser.add_argument("--seed", type=int, default=42, help="Random seed for input tensors.")
   parser.add_argument(
@@ -69,11 +72,11 @@ def _parse_args() -> argparse.Namespace:
     help="Enable pre-attention LayerNorm on q/k/v for both FFPA and SDPA paths.",
   )
   parser.add_argument(
-    "--triton-forward-autotune",
+    "--triton-autotune",
     "--autotune",
     "--tune",
     action="store_true",
-    help="Enable Triton forward autotuning (only effective when --forward-backend=triton).",
+    help="Enable Triton runtime autotuning (only effective when --forward-backend=triton).",
   )
   parser.add_argument(
     "--triton-autotune-mode",
@@ -91,6 +94,19 @@ def _parse_args() -> argparse.Namespace:
     help="Optional Triton backward dV storage dtype forwarded to ffpa_attn_func.",
   )
   return parser.parse_args()
+
+
+def _validate_timing_args(warmup: int, iters: int) -> None:
+  """Validate benchmark timing loop counts.
+
+  :param warmup: Warmup iterations used for timing.
+  :param iters: Measured iterations used for timing.
+  :raises ValueError: If ``warmup`` is negative or ``iters`` is not positive.
+  """
+  if warmup < 0:
+    raise ValueError(f"warmup must be non-negative, got {warmup}")
+  if iters <= 0:
+    raise ValueError(f"iters must be positive, got {iters}")
 
 
 def _sdpa_ref(q, k, v, is_causal: bool = False, attn_mask: torch.Tensor | None = None, dropout_p: float = 0.0):
@@ -112,7 +128,8 @@ def _make_broadcast_additive_attn_mask(nq: int, nkv: int, dtype: torch.dtype, se
   return torch.randn(1, 1, 1, nkv, dtype=dtype, device="cuda") * 0.25
 
 
-def _time_fn(fn, *args, warmup: int = WARMUP, iters: int = ITERS, rng_seed: int | None = None) -> float:
+def _time_fn(fn, *args, warmup: int = DEFAULT_WARMUP, iters: int = DEFAULT_ITERS, rng_seed: int | None = None) -> float:
+  _validate_timing_args(warmup, iters)
   for _ in range(warmup):
     if rng_seed is not None:
       torch.manual_seed(rng_seed)
@@ -253,7 +270,7 @@ def _run_case(
   name: str,
   dtype: torch.dtype,
   forward_backend: str,
-  triton_forward_autotune: bool,
+  triton_autotune: bool,
   triton_autotune_mode: str,
   seed: int,
   B: int,
@@ -268,6 +285,8 @@ def _run_case(
   acc: str = "f32",
   triton_backward_grad_v_storage_dtype: torch.dtype | None = None,
   apply_norm: bool = False,
+  warmup: int = DEFAULT_WARMUP,
+  iters: int = DEFAULT_ITERS,
   print_result: bool = True,
 ) -> FORWARD_RESULT:
   torch.manual_seed(seed)
@@ -288,7 +307,7 @@ def _run_case(
     dropout_p=dropout_p,
     enable_gqa=Nh_q != Nh_kv,
     forward_backend=forward_backend,
-    triton_forward_autotune=triton_forward_autotune,
+    triton_autotune=triton_autotune,
     triton_autotune_mode=triton_autotune_mode,
     triton_backward_grad_v_storage_dtype=triton_backward_grad_v_storage_dtype,
   )
@@ -311,13 +330,15 @@ def _run_case(
       dropout_p=dropout_p,
       enable_gqa=Nh_q != Nh_kv,
       forward_backend=forward_backend,
-      triton_forward_autotune=triton_forward_autotune,
+      triton_autotune=triton_autotune,
       triton_autotune_mode=triton_autotune_mode,
       triton_backward_grad_v_storage_dtype=triton_backward_grad_v_storage_dtype,
     ),
     q,
     k,
     v,
+    warmup=warmup,
+    iters=iters,
     rng_seed=seed + 17 if dropout_p > 0.0 else None,
   )
   ms_sdpa = _time_fn(
@@ -325,6 +346,8 @@ def _run_case(
     q,
     k_ref,
     v_ref,
+    warmup=warmup,
+    iters=iters,
     rng_seed=seed + 17 if dropout_p > 0.0 else None,
   )
 
@@ -345,6 +368,8 @@ def _run_case(
     "mean_diff": _mean_abs_diff(out_ffpa, out_sdpa),
     "allclose": ok,
     "tolerance": tol,
+    "warmup": warmup,
+    "iters": iters,
     "ffpa_ms": ms_ffpa,
     "sdpa_ms": ms_sdpa,
     "speedup": ms_sdpa / ms_ffpa,
@@ -364,9 +389,11 @@ def run_forward_examples(
   seed: int = 42,
   apply_norm: bool = False,
   forward_backend: str = "triton",
-  triton_forward_autotune: bool = False,
+  triton_autotune: bool = False,
   triton_autotune_mode: str = "fast",
   triton_backward_grad_v_storage_dtype: torch.dtype | None = None,
+  warmup: int = DEFAULT_WARMUP,
+  iters: int = DEFAULT_ITERS,
   print_results: bool = True,
 ) -> list[FORWARD_RESULT]:
   """Run the canonical forward benchmark cases.
@@ -379,22 +406,26 @@ def run_forward_examples(
   :param seed: RNG seed.
   :param apply_norm: Whether to normalize q/k/v before attention.
   :param forward_backend: Forward backend passed to ``ffpa_attn_func``.
-  :param triton_forward_autotune: Whether to enable Triton forward autotune.
+  :param triton_autotune: Whether to enable Triton runtime autotune.
   :param triton_autotune_mode: Triton autotune mode.
   :param triton_backward_grad_v_storage_dtype: Optional Triton backward dV
     storage dtype forwarded to ``ffpa_attn_func``.
+  :param warmup: Warmup iterations used for timing.
+  :param iters: Measured iterations used for timing.
   :param print_results: Whether to print each case result.
   :return: One structured result per executed case and dtype.
   """
+  _validate_timing_args(warmup, iters)
   results: list[FORWARD_RESULT] = []
   gqa_heads = _resolve_gqa_heads(H)
   non_aligned_heads = _resolve_non_aligned_heads(H)
   print(
     f"\nRunning FFPA forward examples with forward_backend={forward_backend}, "
     f"apply_norm={apply_norm}, "
-    f"triton_forward_autotune={triton_forward_autotune}, "
+    f"triton_autotune={triton_autotune}, "
     f"triton_autotune_mode={triton_autotune_mode}, "
-    f"triton_backward_grad_v_storage_dtype={triton_backward_grad_v_storage_dtype}"
+    f"triton_backward_grad_v_storage_dtype={triton_backward_grad_v_storage_dtype}, "
+    f"warmup={warmup}, iters={iters}"
   )
 
   for dtype in (torch.float16, torch.bfloat16):
@@ -470,7 +501,7 @@ def run_forward_examples(
           case["name"],
           dtype,
           forward_backend,
-          triton_forward_autotune,
+          triton_autotune,
           triton_autotune_mode,
           seed=seed,
           B=B,
@@ -484,6 +515,8 @@ def run_forward_examples(
           dropout_p=case.get("dropout_p", 0.0),
           apply_norm=apply_norm,
           triton_backward_grad_v_storage_dtype=triton_backward_grad_v_storage_dtype,
+          warmup=warmup,
+          iters=iters,
           print_result=print_results,
         )
       )
@@ -506,9 +539,11 @@ def main() -> None:
     seed=args.seed,
     apply_norm=args.norm,
     forward_backend=args.forward_backend,
-    triton_forward_autotune=args.triton_forward_autotune,
+    triton_autotune=args.triton_autotune,
     triton_autotune_mode=args.triton_autotune_mode,
     triton_backward_grad_v_storage_dtype=grad_v_dtype,
+    warmup=args.warmup,
+    iters=args.iters,
     print_results=True,
   )
 

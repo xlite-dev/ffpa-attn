@@ -21,6 +21,22 @@ def test_triton_autotune_mode_defaults_to_fast():
   assert meta.triton_autotune_mode == "fast"
 
 
+def test_triton_autotune_defaults_to_false():
+  meta = FFPAAttnMeta.from_kwargs()
+  assert meta.triton_autotune is False
+
+
+def test_triton_autotune_accepts_true():
+  meta = FFPAAttnMeta.from_kwargs(triton_autotune=True)
+  assert meta.triton_autotune is True
+
+
+@pytest.mark.parametrize("old_key", ["triton_forward_autotune", "triton_backward_autotune"])
+def test_old_directional_triton_autotune_keys_are_rejected(old_key):
+  with pytest.raises(TypeError, match=old_key):
+    FFPAAttnMeta.from_kwargs(**{old_key: True})
+
+
 @pytest.mark.parametrize("mode", ["fast", "max"])
 def test_triton_autotune_mode_accepts_valid_values(mode):
   meta = FFPAAttnMeta.from_kwargs(triton_autotune_mode=mode)

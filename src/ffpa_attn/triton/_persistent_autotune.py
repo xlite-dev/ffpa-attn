@@ -7,22 +7,29 @@ the forward/backward Triton launchers when runtime autotune is disabled.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
 import torch
 
+from ..logger import init_logger
+
 SCHEMA_VERSION = 1
 CONFIG_ENV_VAR = "FFPA_TUNED_CONFIG_DIR"
 MAX_CONFIGS_ENV_VAR = "FFPA_AUTOTUNE_MAX_CONFIGS"
+
+logger = init_logger(__name__)
 
 DEFAULT_HEADDIMS = [320, 512, 640, 768, 1024]
 DEFAULT_SEQLENS = [1, 512, 1024, 2048, 4096, 8192, 16384]
 
 _CONFIG_CACHE: dict[tuple[str, str], list[dict[str, Any]]] = {}
+_DEVICE_NAME_CACHE: dict[int, str] = {}
 
 _KERNEL_CONFIG_KEYS = {
   "fwd_generic": {
@@ -97,6 +104,8 @@ class PersistentConfigRequest:
       want to describe the request. Lookup does not require it to match.
   :param nheads_kv: Optional runtime key/value-head count before backward
       GQA/MQA expansion. Lookup does not require it to match.
+  :param device_index: Optional CUDA device index for runtime callers. Passing
+      this avoids a CUDA current-device query on repeated cache hits.
   """
 
   direction: str
@@ -115,6 +124,7 @@ class PersistentConfigRequest:
   has_dropout: bool | None = None
   nheads_q: int | None = None
   nheads_kv: int | None = None
+  device_index: int | None = None
 
 
 def default_config_dir() -> Path:
@@ -154,8 +164,19 @@ def device_config_path(config_dir: Path | None = None, device_name: str | None =
   :return: Path named ``{sanitized_device_name}.json``.
   """
   root = config_dir or runtime_config_dir()
-  name = device_name or torch.cuda.get_device_name(torch.cuda.current_device())
+  name = device_name or _device_name(torch.cuda.current_device())
   return root / f"{sanitize_device_name(name)}.json"
+
+
+def _device_name(device_index: int) -> str:
+  """Return the cached CUDA device name for a device index.
+
+  :param device_index: CUDA device index.
+  :return: CUDA device name.
+  """
+  if device_index not in _DEVICE_NAME_CACHE:
+    _DEVICE_NAME_CACHE[device_index] = torch.cuda.get_device_name(device_index)
+  return _DEVICE_NAME_CACHE[device_index]
 
 
 def dtype_name(dtype: torch.dtype) -> str:
@@ -307,6 +328,8 @@ def load_config_entries(config_dir: Path | None = None, device_name: str | None 
 def clear_config_cache() -> None:
   """Clear the in-process JSON entry cache."""
   _CONFIG_CACHE.clear()
+  _DEVICE_NAME_CACHE.clear()
+  _lookup_persistent_config_cached.cache_clear()
 
 
 def _head_layout_rank(entry: dict[str, Any], request: PersistentConfigRequest) -> int:
@@ -326,14 +349,54 @@ def _head_layout_rank(entry: dict[str, Any], request: PersistentConfigRequest) -
   return 1
 
 
-def lookup_persistent_config(request: PersistentConfigRequest) -> dict[str, Any] | None:
-  """Find the best persisted launch config for a runtime request.
+def _lookup_cache_key(request: PersistentConfigRequest) -> tuple[str, int, PersistentConfigRequest]:
+  """Return the cache key for one persistent lookup request."""
+  device_index = request.device_index if request.device_index is not None else torch.cuda.current_device()
+  return (os.environ.get(CONFIG_ENV_VAR, ""), device_index, request)
 
+
+def _debug_lookup_message(prefix: str, request: PersistentConfigRequest, config: dict[str, Any] | None) -> None:
+  """Log one DEBUG persistent lookup event.
+
+  :param prefix: Event prefix describing lookup state.
   :param request: Runtime shape and variant filters.
-  :return: Kernel launch meta dict, or ``None`` if no compatible entry exists.
+  :param config: Selected kernel launch meta dict, or ``None`` on fallback.
   """
+  logger.debug_once(
+    "%s: direction=%s kernel=%s mode=%s dtype=%s D=%d Nq=%d Nkv=%s "
+    "causal=%s use_gemv=%s bias_grad=%s has_attn_bias=%s has_dropout=%s "
+    "Hq=%s Hkv=%s config=%s",
+    prefix,
+    request.direction,
+    request.kernel,
+    request.autotune_mode,
+    request.dtype,
+    request.headdim,
+    request.seqlen_q,
+    request.seqlen_k,
+    request.causal,
+    request.use_gemv,
+    request.bias_grad,
+    request.has_attn_bias,
+    request.has_dropout,
+    request.nheads_q,
+    request.nheads_kv,
+    config,
+  )
+
+
+@lru_cache(maxsize=None)
+def _lookup_persistent_config_cached(
+  config_dir_key: str,
+  device_index: int,
+  request: PersistentConfigRequest,
+) -> dict[str, Any] | None:
+  """Find and cache the best persisted launch config for one request."""
+  del config_dir_key
+  device_name = _device_name(device_index)
+
   candidates: list[dict[str, Any]] = []
-  for entry in load_config_entries():
+  for entry in load_config_entries(device_name=device_name):
     if entry.get("direction") != request.direction:
       continue
     if entry.get("kernel") != request.kernel:
@@ -394,3 +457,25 @@ def lookup_persistent_config(request: PersistentConfigRequest) -> dict[str, Any]
     return None
   selected = min(candidates, key=lambda entry: _head_layout_rank(entry, request))
   return sanitize_kernel_config(request.kernel, selected["config"])
+
+
+def lookup_persistent_config(request: PersistentConfigRequest) -> dict[str, Any] | None:
+  """Find the best persisted launch config for a runtime request.
+
+  :param request: Runtime shape and variant filters.
+  :return: Kernel launch meta dict, or ``None`` if no compatible entry exists.
+  """
+  cache_key = _lookup_cache_key(request)
+  if not logger.isEnabledFor(logging.DEBUG):
+    return _lookup_persistent_config_cached(*cache_key)
+
+  hits_before = _lookup_persistent_config_cached.cache_info().hits
+  config = _lookup_persistent_config_cached(*cache_key)
+  hits_after = _lookup_persistent_config_cached.cache_info().hits
+  if hits_after > hits_before and config is not None:
+    _debug_lookup_message("Persistent autotune cache hit", request, config)
+  elif config is not None:
+    _debug_lookup_message("Persistent autotune selected config", request, config)
+  else:
+    _debug_lookup_message("Persistent autotune lookup miss", request, None)
+  return config

@@ -35,9 +35,12 @@ from ffpa_attn.triton._persistent_autotune import (
   sanitize_device_name,
   write_config_file,
 )
+from .logger import init_logger
 
 _FULL_TASK_DROPOUT_P = 0.1
 _TUNE_SEED = 42
+
+logger = init_logger(__name__)
 
 
 @dataclass(frozen=True)
@@ -342,7 +345,7 @@ def _tune_forward(
     is_causal=task.causal,
     enable_gqa=task.nheads_q != task.nheads_kv,
     forward_backend="triton",
-    triton_forward_autotune=True,
+    triton_autotune=True,
     triton_autotune_mode=mode,
   )
   del out
@@ -383,8 +386,7 @@ def _tune_backward(
     enable_gqa=task.nheads_q != task.nheads_kv,
     forward_backend="triton",
     backward_backend="triton",
-    triton_forward_autotune=False,
-    triton_backward_autotune=True,
+    triton_autotune=True,
     triton_autotune_mode=mode,
   )
   out.float().sum().backward()
@@ -426,11 +428,13 @@ def _tune_backward(
 def _build_payload(
   entries: list[dict[str, Any]], mode: str, batch: int, heads: int, full_tasks: bool, seqlens: list[int]
 ) -> dict[str, Any]:
-  props = torch.cuda.get_device_properties(torch.cuda.current_device())
+  device_index = torch.cuda.current_device()
+  device_name = torch.cuda.get_device_name(device_index)
+  props = torch.cuda.get_device_properties(device_index)
   return {
     "schema_version": SCHEMA_VERSION,
-    "device_name": torch.cuda.get_device_name(torch.cuda.current_device()),
-    "device_name_sanitized": sanitize_device_name(torch.cuda.get_device_name(torch.cuda.current_device())),
+    "device_name": device_name,
+    "device_name_sanitized": sanitize_device_name(device_name),
     "compute_capability": f"{props.major}.{props.minor}",
     "generated_at": datetime.now(timezone.utc).isoformat(),
     "ffpa_version": __version__,
@@ -481,7 +485,7 @@ def main() -> int:
   output_dir = args.output_dir or default_config_dir()
   output_path = device_config_path(output_dir)
   if output_path.exists() and not args.overwrite:
-    print(f"Tuned config already exists, not overwriting: {output_path}")
+    logger.info("Tuned config already exists, not overwriting: %s", output_path)
     return 0
 
   seqlens = _available_seqlens()
@@ -494,10 +498,17 @@ def main() -> int:
 
   entries: dict[tuple[Any, ...], dict[str, Any]] = {}
   full_variant_count = sum(task.case_name in {"attn-mask", "dropout", "gqa", "mqa"} for task in tasks)
-  print(
-    f"Generating {len(tasks)} FFPA Triton tuned config task(s) for {output_path} "
-    f"mode={args.mode} directions={args.directions} B={args.B} H={args.H} "
-    f"full_tasks={args.full_tasks} full_variants={full_variant_count}"
+  logger.info(
+    "Generating %d FFPA Triton tuned config task(s) for %s "
+    "mode=%s directions=%s B=%d H=%d full_tasks=%s full_variants=%d",
+    len(tasks),
+    output_path,
+    args.mode,
+    args.directions,
+    args.B,
+    args.H,
+    args.full_tasks,
+    full_variant_count,
   )
   tune_start_time = time.perf_counter()
   with exact_autotune_seqlen_keys():
@@ -512,19 +523,26 @@ def main() -> int:
         elapsed = time.perf_counter() - start_time
         total_elapsed = time.perf_counter() - tune_start_time
         for tuned_entry, choices_count in tuned_entries:
-          print(
-            f"[AUTOTUNED][{index}/{len(tasks)}] {_format_entry(tuned_entry, choices_count, args.B)}, "
-            f"t={elapsed:.3f}s, T={total_elapsed:.3f}s",
-            flush=True,
+          logger.info(
+            "[AUTOTUNED][%d/%d] %s, t=%.3fs, T=%.3fs",
+            index,
+            len(tasks),
+            _format_entry(tuned_entry, choices_count, args.B),
+            elapsed,
+            total_elapsed,
           )
       except RuntimeError as exc:
         if "out of memory" not in str(exc).lower():
           raise
         elapsed = time.perf_counter() - start_time
         total_elapsed = time.perf_counter() - tune_start_time
-        print(
-          f"[AUTOTUNE-SKIPPED][{index}/{len(tasks)}] OOM after t={elapsed:.3f}s, T={total_elapsed:.3f}s: {exc}",
-          flush=True,
+        logger.info(
+          "[AUTOTUNE-SKIPPED][%d/%d] OOM after t=%.3fs, T=%.3fs: %s",
+          index,
+          len(tasks),
+          elapsed,
+          total_elapsed,
+          exc,
         )
         torch.cuda.empty_cache()
 
@@ -547,7 +565,7 @@ def main() -> int:
   )
   payload = _build_payload(ordered_entries, args.mode, args.B, args.H, args.full_tasks, seqlens)
   write_config_file(payload, output_path, overwrite=args.overwrite)
-  print(f"Wrote {len(ordered_entries)} tuned config entries to {output_path}")
+  logger.info("Wrote %d tuned config entries to %s", len(ordered_entries), output_path)
   return 0
 
 

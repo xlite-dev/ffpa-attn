@@ -1,5 +1,7 @@
 """Unit tests for persistent FFPA Triton autotune configs."""
 
+import logging
+
 import pytest
 
 from ffpa_attn.triton import _persistent_autotune as persistent
@@ -86,6 +88,186 @@ def test_lookup_forward_uses_shape_grid_nearest(tmp_path, monkeypatch):
     )
   )
   assert config == {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_HEADDIM_QK": 128, "BLOCK_HEADDIM_V": 128, "num_warps": 8}
+
+
+def test_lookup_reuses_cached_request_result(tmp_path, monkeypatch):
+  _patch_cuda_device(monkeypatch)
+  monkeypatch.setenv(persistent.CONFIG_ENV_VAR, str(tmp_path))
+  persistent.clear_config_cache()
+  path = persistent.device_config_path(tmp_path, "NVIDIA L20")
+  persistent.write_config_file(
+    _payload([
+      {
+        "direction": "forward",
+        "kernel": "fwd_generic",
+        "autotune_mode": "fast",
+        "causal": False,
+        "dtype": "bf16",
+        "headdim": 512,
+        "seqlen_q": 1024,
+        "seqlen_k": 8192,
+        "config": {
+          "BLOCK_M": 128,
+          "BLOCK_N": 64,
+          "BLOCK_HEADDIM_QK": 64,
+          "BLOCK_HEADDIM_V": 64,
+          "num_warps": 8
+        },
+      },
+    ]),
+    path,
+  )
+  load_calls = 0
+  original_load_config_entries = persistent.load_config_entries
+
+  def counted_load_config_entries(*args, **kwargs):
+    nonlocal load_calls
+    load_calls += 1
+    return original_load_config_entries(*args, **kwargs)
+
+  monkeypatch.setattr(persistent, "load_config_entries", counted_load_config_entries)
+  monkeypatch.setattr(
+    persistent.torch.cuda, "current_device", lambda: (_ for _ in ()).throw(RuntimeError("unexpected"))
+  )
+  request = persistent.PersistentConfigRequest(
+    direction="forward",
+    kernel="fwd_generic",
+    autotune_mode="fast",
+    dtype="bf16",
+    headdim=512,
+    seqlen_q=1024,
+    seqlen_k=8192,
+    causal=False,
+    device_index=0,
+  )
+
+  assert persistent.lookup_persistent_config(request)["BLOCK_M"] == 128
+  assert persistent.lookup_persistent_config(request)["BLOCK_M"] == 128
+  assert load_calls == 1
+
+
+def test_lookup_caches_device_name_by_device_index(tmp_path, monkeypatch):
+  monkeypatch.setattr(persistent.torch.cuda, "current_device", lambda: 0)
+  monkeypatch.setenv(persistent.CONFIG_ENV_VAR, str(tmp_path))
+  persistent.clear_config_cache()
+  path = persistent.device_config_path(tmp_path, "NVIDIA L20")
+  persistent.write_config_file(
+    _payload([
+      {
+        "direction": "forward",
+        "kernel": "fwd_generic",
+        "autotune_mode": "fast",
+        "causal": False,
+        "dtype": "bf16",
+        "headdim": 512,
+        "seqlen_q": 1024,
+        "seqlen_k": 8192,
+        "config": {
+          "BLOCK_M": 128,
+          "BLOCK_N": 64,
+          "BLOCK_HEADDIM_QK": 64,
+          "BLOCK_HEADDIM_V": 64,
+          "num_warps": 8
+        },
+      },
+    ]),
+    path,
+  )
+  device_name_calls = 0
+
+  def counted_get_device_name(device=0):
+    nonlocal device_name_calls
+    device_name_calls += 1
+    assert device == 0
+    return "NVIDIA L20"
+
+  monkeypatch.setattr(persistent.torch.cuda, "get_device_name", counted_get_device_name)
+  request = persistent.PersistentConfigRequest(
+    direction="forward",
+    kernel="fwd_generic",
+    autotune_mode="fast",
+    dtype="bf16",
+    headdim=512,
+    seqlen_q=1024,
+    seqlen_k=8192,
+    causal=False,
+    device_index=0,
+  )
+
+  assert persistent.lookup_persistent_config(request)["BLOCK_M"] == 128
+  assert persistent.lookup_persistent_config(request.__class__(**{
+    **request.__dict__, "headdim": 384
+  }))["BLOCK_M"] == 128
+  assert device_name_calls == 1
+
+
+def test_lookup_debug_logs_selected_config_cached_hit_and_miss(tmp_path, monkeypatch):
+  _patch_cuda_device(monkeypatch)
+  monkeypatch.setenv(persistent.CONFIG_ENV_VAR, str(tmp_path))
+  persistent.clear_config_cache()
+  path = persistent.device_config_path(tmp_path, "NVIDIA L20")
+  persistent.write_config_file(
+    _payload([
+      {
+        "direction": "forward",
+        "kernel": "fwd_generic",
+        "autotune_mode": "fast",
+        "causal": False,
+        "dtype": "bf16",
+        "headdim": 512,
+        "seqlen_q": 1024,
+        "seqlen_k": 8192,
+        "config": {
+          "BLOCK_M": 128,
+          "BLOCK_N": 64,
+          "BLOCK_HEADDIM_QK": 64,
+          "BLOCK_HEADDIM_V": 64,
+          "num_warps": 8
+        },
+      },
+    ]),
+    path,
+  )
+  debug_messages = []
+
+  def debug_once(message, *args, **kwargs):
+    del kwargs
+    debug_messages.append(message % args)
+
+  monkeypatch.setattr(persistent.logger, "isEnabledFor", lambda level: level == logging.DEBUG)
+  monkeypatch.setattr(persistent.logger, "debug_once", debug_once)
+  request = persistent.PersistentConfigRequest(
+    direction="forward",
+    kernel="fwd_generic",
+    autotune_mode="fast",
+    dtype="bf16",
+    headdim=512,
+    seqlen_q=1024,
+    seqlen_k=8192,
+    causal=False,
+    device_index=0,
+  )
+
+  assert persistent.lookup_persistent_config(request)["BLOCK_M"] == 128
+  assert len(debug_messages) == 1
+  assert debug_messages[0].startswith("Persistent autotune selected config")
+  assert "kernel=fwd_generic" in debug_messages[0]
+  assert "config={" in debug_messages[0]
+  assert "'BLOCK_M': 128" in debug_messages[0]
+  assert persistent.lookup_persistent_config(request)["BLOCK_M"] == 128
+
+  assert len(debug_messages) == 2
+  assert debug_messages[1].startswith("Persistent autotune cache hit")
+  assert "kernel=fwd_generic" in debug_messages[1]
+  assert "config={" in debug_messages[1]
+  assert "'BLOCK_M': 128" in debug_messages[1]
+
+  missing_request = request.__class__(**{**request.__dict__, "dtype": "fp16"})
+  assert persistent.lookup_persistent_config(missing_request) is None
+  assert len(debug_messages) == 3
+  assert debug_messages[2].startswith("Persistent autotune lookup miss")
+  assert "kernel=fwd_generic" in debug_messages[2]
+  assert "config=None" in debug_messages[2]
 
 
 def test_lookup_backward_filters_variants(tmp_path, monkeypatch):

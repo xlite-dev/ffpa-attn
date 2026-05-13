@@ -366,6 +366,47 @@ def test_ffpa_attn_func_large_d_defaults_to_triton(monkeypatch):
   torch.testing.assert_close(out, q + k + v)
 
 
+def test_ffpa_attn_func_backward_autotune_enables_saved_forward_autotune(monkeypatch):
+  seen_autotune = []
+
+  def _fake_triton(
+    q_in,
+    k_in,
+    v_in,
+    o_in,
+    causal,
+    softmax_scale,
+    autotune,
+    autotune_mode,
+    attn_bias,
+    dropout_p=0.0,
+    philox_seed=0,
+    philox_offset=0,
+  ):
+    del k_in, v_in, causal, softmax_scale, autotune_mode, attn_bias, dropout_p, philox_seed, philox_offset
+    seen_autotune.append(autotune)
+    return torch.empty_like(o_in), torch.empty(q_in.shape[:-1], dtype=torch.float32, device=q_in.device)
+
+  monkeypatch.setattr(ffpa_attn_functional, "_ffpa_attn_forward_triton", _fake_triton)
+  q = torch.randn(1, 1, 512, 320, dtype=torch.float16, device="cuda", requires_grad=True)
+  k = torch.randn(1, 1, 512, 320, dtype=torch.float16, device="cuda", requires_grad=True)
+  v = torch.randn(1, 1, 512, 320, dtype=torch.float16, device="cuda", requires_grad=True)
+
+  out = ffpa_attn_func(
+    q,
+    k,
+    v,
+    stages=2,
+    acc="f32",
+    forward_backend="triton",
+    backward_backend="triton",
+    triton_autotune=True,
+  )
+
+  assert out.shape == q.shape
+  assert seen_autotune == [True]
+
+
 def test_ffpa_attn_func_cuda_forward_unavailable_raises(monkeypatch):
   _force_cuda_backend_unavailable(monkeypatch)
   q, k, v = _alloc_qkv(1, 4, 512, 320, torch.float16)

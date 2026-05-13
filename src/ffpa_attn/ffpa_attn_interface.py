@@ -121,8 +121,8 @@ def ffpa_attn_func(
   :param kwargs: Implementation-specific options for experimentation.
       Supported keys are ``stages``, ``acc``, ``enable_tma``,
       ``high_precision_grad``, ``forward_backend``,
-      ``triton_forward_autotune``, ``triton_autotune_mode``,
-      ``backward_backend``, ``triton_backward_autotune``,
+      ``triton_autotune``, ``triton_autotune_mode``,
+      ``backward_backend``,
       ``triton_backward_preprocess_d_chunk``, and
       ``triton_backward_grad_v_storage_dtype``. ``forward_backend`` only affects ``D > 256``.
       ``enable_tma`` is reserved for future Triton kernels and is currently a

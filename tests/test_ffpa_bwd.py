@@ -408,7 +408,7 @@ def test_ffpa_bwd_triton_key_bias_autotune_fp32_v_storage_matches_sdpa():
     stages=2,
     acc="f32",
     backward_backend="triton",
-    triton_backward_autotune=True,
+    triton_autotune=True,
     triton_backward_grad_v_storage_dtype=torch.float32,
   )
   out.sum().backward()
@@ -546,7 +546,7 @@ def test_ffpa_bwd_triton_decode_autotune_matches_sdpa(Nq):
     stages=2,
     acc="f32",
     backward_backend="triton",
-    triton_backward_autotune=True,
+    triton_autotune=True,
   )
   out.backward(grad_out)
 
@@ -574,7 +574,7 @@ def test_ffpa_bwd_triton_decode_autotune_fp32_v_storage_matches_sdpa():
     stages=2,
     acc="f32",
     backward_backend="triton",
-    triton_backward_autotune=True,
+    triton_autotune=True,
     triton_backward_grad_v_storage_dtype=torch.float32,
   )
   out.sum().backward()

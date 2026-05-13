@@ -13,7 +13,7 @@ There are two ways to use Triton tuned configs:
 
 1. Run with runtime autotune enabled for one process:
 
-	```python
+```python
 	from ffpa_attn import ffpa_attn_func
 
 	out = ffpa_attn_func(
@@ -22,30 +22,24 @@ There are two ways to use Triton tuned configs:
 		 v,
 		 forward_backend="triton",
 		 backward_backend="triton",
-		 triton_forward_autotune=True,
-		 triton_backward_autotune=True,
+		 triton_autotune=True,
 		 triton_autotune_mode="fast",
 	)
-	```
+```
 
-	Triton benchmarks candidate configs and caches the best config in the
-	current process. This is convenient for experiments, but the chosen config is
-	not stored in the FFPA repository.
+Triton benchmarks candidate configs and caches the best config in the current process. This is convenient for experiments, but the chosen config is not stored in the FFPA repository.
 
-2. Generate persistent tuned configs once, then use the default non-autotune
-	path:
+2. Generate persistent tuned configs once, then use the default non-autotune path:
 
-	```bash
-	python -m ffpa_attn.autotune --mode fast --directions both --dtypes bf16,fp16 --overwrite
-	```
+```bash
+python -m ffpa_attn.autotune --mode fast --directions both --dtypes bf16,fp16 --overwrite
+```
 
-	The generated JSON is saved under
-	`src/ffpa_attn/triton/configs/{device_name}.json`, for example
-	`src/ffpa_attn/triton/configs/NVIDIA_L20.json`.
+The generated JSON is saved under `src/ffpa_attn/triton/configs/{device_name}.json`, for example
+`src/ffpa_attn/triton/configs/NVIDIA_L20.json`.
 
-	Later calls with `triton_forward_autotune=False` and
-	`triton_backward_autotune=False` will automatically load the matching
-	device config when it exists.
+Later calls with `triton_autotune=False` will automatically load the matching
+device config when it exists.
 
 ## Generate Persistent Configs
 
@@ -265,6 +259,22 @@ all persisted values, FFPA uses the largest available persisted value. Examples:
 | 3000 | 4096 |
 | 32768 | 8192 or 16384, depending on what was generated |
 
+### Debug Persistent Lookup
+
+Set `FFPA_LOGGER_LEVEL=DEBUG` when you want to verify that runtime calls are
+using persistent tuned configs instead of falling back to the built-in defaults:
+
+```bash
+FFPA_LOGGER_LEVEL=DEBUG \
+FFPA_TUNED_CONFIG_DIR=/tmp/ffpa-config-smoke \
+python examples/perf.py --case decode-attn --backend ffpa-triton
+```
+
+On repeated runtime lookup hits, FFPA logs the kernel name and sanitized launch
+config selected from the in-process persistent config cache. The message uses
+`debug_once` semantics, so the same cache-hit/config line is emitted once per
+process instead of repeating on every attention call.
+
 ## Development Smoke Tests
 
 Full autotune generation can take a long time. Use `FFPA_AUTOTUNE_MAX_CONFIGS`
@@ -301,10 +311,10 @@ A typical workflow is:
 1. Select the deployment GPU type.
 2. Generate a full config on that GPU:
 
-	```bash
-	CUDA_VISIBLE_DEVICES=0 \
-	python -m ffpa_attn.autotune --mode fast --directions both --dtypes bf16,fp16 --full-tasks --overwrite
-	```
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m ffpa_attn.autotune \
+	--mode fast --directions both --dtypes bf16,fp16 --full-tasks --overwrite
+```
 
 3. Commit the generated JSON under `src/ffpa_attn/triton/configs/`.
 4. Run normal workloads with runtime autotune disabled, which is the default:
