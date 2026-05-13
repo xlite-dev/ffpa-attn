@@ -258,9 +258,9 @@ def _gen_fwd_sm90_autotune_configs(headdim: int = 256, autotune_mode: str = "max
   for block_m in [64, 128]:
     for block_n in [64, 128]:
       for block_headdim in _headdim_candidates:
-        num_warps_candidates = [8] if autotune_mode == "fast" else [4, 8]
+        num_warps_candidates = [4] if autotune_mode == "fast" else [4, 8]
         for num_warps in num_warps_candidates:
-          for num_stages in [2, 3, 4]:
+          for num_stages in [2, 3] if autotune_mode == "fast" else [2, 3, 4]:
             configs.append(
               triton.Config(
                 {
