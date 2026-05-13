@@ -247,7 +247,7 @@ _SM90_DEFAULT_CONFIG = {
   "BLOCK_HEADDIM_QK": 128,
   "BLOCK_HEADDIM_V": 128,
   "num_warps": 4,
-  "num_stages": 4,
+  "num_stages": 2,
 }
 
 
