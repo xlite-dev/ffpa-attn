@@ -558,20 +558,29 @@ def plot_speedup(
 
   ax.axhline(y=1, color="#555555", linestyle="--", linewidth=2)
   ax.set_ylabel("Speedup Ratio (FFPA / SDPA)", fontsize=18)
-  ax.set_title(
+  fig.suptitle(
     f"FFPA vs SDPA Speedup ({_mode_suffix(has_forward, has_backward)}) | {device_name} | B={B}, N={N}, H={H}, D={D}",
     fontsize=22,
-    pad=15,
     fontweight="bold",
+    y=0.965,
   )
   ax.set_xticks(x)
   ax.set_xticklabels(attn_types, rotation=0, ha="center", fontsize=22, fontweight="bold")
   ax.tick_params(axis="y", labelsize=16)
-  ax.set_ylim(0, max(finite_values) * 1.1)
-  ax.legend(fontsize=20, loc="upper left")
+  ymax = max(finite_values) if finite_values else 1.0
+  ax.set_ylim(0, ymax * 1.28 if ymax > 0 else 1.0)
+  ax.legend(
+    fontsize=20,
+    loc="upper center",
+    bbox_to_anchor=(0.5, 0.985),
+    ncol=3 if has_forward and has_backward else 2,
+    columnspacing=1.5,
+    handletextpad=0.6,
+    frameon=True,
+  )
   ax.grid(axis="y", alpha=0.9)
 
-  fig.tight_layout()
+  fig.tight_layout(rect=(0, 0, 1, 0.96))
   fig.savefig(output_path)
   plt.close(fig)
   return output_path
