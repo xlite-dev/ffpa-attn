@@ -112,6 +112,8 @@ class PersistentConfigRequest:
   :param use_gemv: Decode backward single-query specialization flag.
   :param has_attn_bias: Whether an additive attention bias is active.
   :param has_dropout: Whether dropout is active.
+  :param enable_tma: Whether SM90 forward TMA configs are allowed.
+  :param enable_ws: Whether SM90 forward warp-specialized configs are allowed.
   :param nheads_q: Optional runtime query-head count, kept for callers that
       want to describe the request. Lookup does not require it to match.
   :param nheads_kv: Optional runtime key/value-head count before backward
@@ -134,6 +136,8 @@ class PersistentConfigRequest:
   use_gemv: bool | None = None
   has_attn_bias: bool | None = None
   has_dropout: bool | None = None
+  enable_tma: bool | None = None
+  enable_ws: bool | None = None
   nheads_q: int | None = None
   nheads_kv: int | None = None
   device_index: int | None = None
@@ -391,7 +395,7 @@ def _debug_lookup_message(prefix: str, request: PersistentConfigRequest, config:
   logger.debug_once(
     "%s: direction=%s kernel=%s mode=%s dtype=%s D=%d Nq=%d Nkv=%s "
     "causal=%s use_gemv=%s bias_grad=%s has_attn_bias=%s has_dropout=%s "
-    "Hq=%s Hkv=%s config=%s",
+    "enable_tma=%s enable_ws=%s Hq=%s Hkv=%s config=%s",
     prefix,
     request.direction,
     request.kernel,
@@ -405,6 +409,8 @@ def _debug_lookup_message(prefix: str, request: PersistentConfigRequest, config:
     request.bias_grad,
     request.has_attn_bias,
     request.has_dropout,
+    request.enable_tma,
+    request.enable_ws,
     request.nheads_q,
     request.nheads_kv,
     config,
@@ -449,7 +455,12 @@ def _lookup_persistent_config_cached(
       continue
     if request.has_dropout is not None and bool(entry.get("has_dropout", False)) != request.has_dropout:
       continue
-    if not isinstance(entry.get("config"), dict):
+    config = entry.get("config")
+    if not isinstance(config, dict):
+      continue
+    if request.kernel == "fwd_sm90_generic" and request.enable_ws is False and bool(
+      config.get("warp_specialize", False)
+    ):
       continue
     try:
       int(entry["headdim"])

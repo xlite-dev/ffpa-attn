@@ -147,6 +147,75 @@ def test_lookup_sm90_forward_preserves_tma_ws_config(tmp_path, monkeypatch):
   }
 
 
+def test_lookup_sm90_forward_respects_disabled_ws(tmp_path, monkeypatch):
+  _patch_cuda_device(monkeypatch)
+  monkeypatch.setenv(persistent.CONFIG_ENV_VAR, str(tmp_path))
+  persistent.clear_config_cache()
+  path = persistent.device_config_path(tmp_path, "NVIDIA L20")
+  base_entry = {
+    "direction": "forward",
+    "kernel": "fwd_sm90_generic",
+    "autotune_mode": "fast",
+    "causal": False,
+    "dtype": "fp16",
+    "headdim": 512,
+    "seqlen_q": 4096,
+    "seqlen_k": 4096,
+  }
+  persistent.write_config_file(
+    _payload([
+      {
+        **base_entry,
+        "config": {
+          "BLOCK_M": 128,
+          "BLOCK_N": 128,
+          "BLOCK_HEADDIM_QK": 128,
+          "BLOCK_HEADDIM_V": 128,
+          "warp_specialize": True,
+          "num_warps": 4,
+          "num_stages": 3,
+        },
+      },
+      {
+        **base_entry,
+        "config": {
+          "BLOCK_M": 64,
+          "BLOCK_N": 128,
+          "BLOCK_HEADDIM_QK": 64,
+          "BLOCK_HEADDIM_V": 64,
+          "warp_specialize": False,
+          "num_warps": 4,
+          "num_stages": 3,
+        },
+      },
+    ]),
+    path,
+  )
+
+  config = persistent.lookup_persistent_config(
+    persistent.PersistentConfigRequest(
+      direction="forward",
+      kernel="fwd_sm90_generic",
+      autotune_mode="fast",
+      dtype="fp16",
+      headdim=512,
+      seqlen_q=4096,
+      seqlen_k=4096,
+      causal=False,
+      enable_ws=False,
+    )
+  )
+  assert config == {
+    "BLOCK_M": 64,
+    "BLOCK_N": 128,
+    "BLOCK_HEADDIM_QK": 64,
+    "BLOCK_HEADDIM_V": 64,
+    "warp_specialize": False,
+    "num_warps": 4,
+    "num_stages": 3,
+  }
+
+
 def test_lookup_reuses_cached_request_result(tmp_path, monkeypatch):
   _patch_cuda_device(monkeypatch)
   monkeypatch.setenv(persistent.CONFIG_ENV_VAR, str(tmp_path))

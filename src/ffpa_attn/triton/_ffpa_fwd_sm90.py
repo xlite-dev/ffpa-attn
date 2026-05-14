@@ -557,6 +557,8 @@ def _ffpa_attn_forward_sm90_generic_impl(
         causal=causal,
         has_attn_bias=has_attn_bias,
         has_dropout=has_dropout,
+        enable_tma=True,
+        enable_ws=enable_ws,
         nheads_q=nheads_q,
         nheads_kv=nheads_kv,
         device_index=q.device.index,
@@ -600,17 +602,16 @@ def _ffpa_attn_forward_sm90_generic_impl(
   autotune_causal_key = int(causal)
 
   if autotune:
-    autotune_fn = _get_fwd_sm90_autotune(
-      headdim,
-      autotune_mode,
-      dtype_name(q.dtype),
-      enable_ws=enable_ws,
-    )
 
     def grid(meta):
       return (triton.cdiv(seqlen_q, meta["BLOCK_M"]), batch * nheads_q)
 
-    autotune_fn[grid](
+    _get_fwd_sm90_autotune(
+      headdim,
+      autotune_mode,
+      dtype_name(q.dtype),
+      enable_ws=enable_ws,
+    )[grid](
       desc_q,
       desc_k,
       desc_v,

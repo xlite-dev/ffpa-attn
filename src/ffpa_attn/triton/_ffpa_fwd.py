@@ -865,7 +865,12 @@ def _get_decode_fwd_stage1_autotune(headdim: int, use_gemv: bool, autotune_mode:
     )
     _ffpa_decode_fwd_stage1_autotune_cache[cache_key] = triton.autotune(
       configs=configs,
-      key=["autotune_seqlen_q_bucket", "autotune_seqlen_k_bucket", "autotune_causal_key", "HEADDIM"],
+      key=[
+        "autotune_seqlen_q_bucket",
+        "autotune_seqlen_k_bucket",
+        "autotune_causal_key",
+        "HEADDIM",
+      ],
       cache_results=True,
     )(_ffpa_decode_fwd_stage1_kernel)
   return _ffpa_decode_fwd_stage1_autotune_cache[cache_key]
