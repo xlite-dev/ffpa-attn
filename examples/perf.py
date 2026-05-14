@@ -924,6 +924,8 @@ def _benchmark_rows(args: argparse.Namespace) -> tuple[list[RESULT_ROW], list[RE
         triton_autotune=args.backward_backend == "triton" and tune_mode is not None,
         triton_autotune_mode=tune_mode or "fast",
         triton_backward_grad_v_storage_dtype=grad_v_dtype,
+        enable_tma=args.enable_tma,
+        enable_ws=args.enable_ws,
         warmup=args.warmup,
         iters=args.iters,
         print_results=True,
