@@ -21,10 +21,24 @@ import torch
 import triton
 
 from ffpa_attn import __version__, ffpa_attn_func
-from ffpa_attn.triton._autotune_utils import autotune_seqlen_key, exact_autotune_seqlen_keys
-from ffpa_attn.triton._ffpa_bwd import _get_bwd_autotune, _get_decode_bwd_stage1_autotune, _get_pre_autotune
-from ffpa_attn.triton._ffpa_fwd import _get_decode_fwd_stage1_autotune, _get_decode_num_splits, _get_fwd_autotune
-from ffpa_attn.triton._ffpa_fwd_sm90 import _get_fwd_sm90_autotune, is_sm90_tma_forward_supported
+from ffpa_attn.triton._autotune_utils import (
+  autotune_seqlen_key,
+  exact_autotune_seqlen_keys,
+)
+from ffpa_attn.triton._ffpa_bwd import (
+  _get_bwd_autotune,
+  _get_decode_bwd_stage1_autotune,
+  _get_pre_autotune,
+)
+from ffpa_attn.triton._ffpa_fwd import (
+  _get_decode_fwd_stage1_autotune,
+  _get_decode_num_splits,
+  _get_fwd_autotune,
+)
+from ffpa_attn.triton._ffpa_fwd_sm90 import (
+  _get_fwd_sm90_autotune,
+  is_sm90_tma_forward_supported,
+)
 from ffpa_attn.triton._persistent_autotune import (
   DEFAULT_HEADDIMS,
   DEFAULT_SEQLENS,
@@ -163,9 +177,29 @@ def _iter_full_variant_tasks(
       ),
     ])
     if 1 < gqa_heads < heads:
-      tasks.append(TuneTask(direction, dtype, headdim, seqlen, seqlen, False, heads, gqa_heads, case_name="gqa"))
+      tasks.append(TuneTask(
+        direction,
+        dtype,
+        headdim,
+        seqlen,
+        seqlen,
+        False,
+        heads,
+        gqa_heads,
+        case_name="gqa",
+      ))
     if heads > 1:
-      tasks.append(TuneTask(direction, dtype, headdim, seqlen, seqlen, False, heads, 1, case_name="mqa"))
+      tasks.append(TuneTask(
+        direction,
+        dtype,
+        headdim,
+        seqlen,
+        seqlen,
+        False,
+        heads,
+        1,
+        case_name="mqa",
+      ))
   return tasks
 
 
@@ -185,9 +219,30 @@ def _iter_forward_tasks(
           for seqlen_k in prefill_seqlens:
             if causal and seqlen_k < seqlen_q:
               continue
-            tasks.append(TuneTask("forward", dtype, headdim, seqlen_q, seqlen_k, causal, heads, heads))
+            tasks.append(TuneTask(
+              "forward",
+              dtype,
+              headdim,
+              seqlen_q,
+              seqlen_k,
+              causal,
+              heads,
+              heads,
+            ))
         for seqlen_k in decode_kv_seqlens:
-          tasks.append(TuneTask("forward", dtype, headdim, 1, seqlen_k, causal, heads, heads, case_name="decode-attn"))
+          tasks.append(
+            TuneTask(
+              "forward",
+              dtype,
+              headdim,
+              1,
+              seqlen_k,
+              causal,
+              heads,
+              heads,
+              case_name="decode-attn",
+            )
+          )
       if full_tasks:
         tasks.extend(_iter_full_variant_tasks("forward", dtype, headdim, prefill_seqlens, heads))
   return tasks
@@ -210,11 +265,30 @@ def _iter_backward_tasks(
           for seqlen_k in prefill_seqlens:
             if causal and seqlen_k < seqlen_q:
               continue
-            tasks.append(TuneTask("backward", dtype, headdim, seqlen_q, seqlen_k, causal, heads, heads))
+            tasks.append(TuneTask(
+              "backward",
+              dtype,
+              headdim,
+              seqlen_q,
+              seqlen_k,
+              causal,
+              heads,
+              heads,
+            ))
         for seqlen_q in decode_query_seqlens:
           for seqlen_k in decode_kv_seqlens:
             tasks.append(
-              TuneTask("backward", dtype, headdim, seqlen_q, seqlen_k, causal, heads, heads, case_name="decode-attn")
+              TuneTask(
+                "backward",
+                dtype,
+                headdim,
+                seqlen_q,
+                seqlen_k,
+                causal,
+                heads,
+                heads,
+                case_name="decode-attn",
+              )
             )
       if full_tasks:
         tasks.extend(_iter_full_variant_tasks("backward", dtype, headdim, prefill_seqlens, heads))
@@ -247,7 +321,14 @@ def _make_attn_bias(task: TuneTask) -> torch.Tensor | None:
     return None
   torch.manual_seed(_TUNE_SEED + 1)
   if task.direction == "backward":
-    return (torch.randn(1, 1, 1, task.seqlen_k, dtype=torch.float32, device="cuda") * 0.25).requires_grad_(True)
+    return (torch.randn(
+      1,
+      1,
+      1,
+      task.seqlen_k,
+      dtype=torch.float32,
+      device="cuda",
+    ) * 0.25).requires_grad_(True)
   return torch.randn(1, 1, 1, task.seqlen_k, dtype=task.dtype, device="cuda") * 0.25
 
 
@@ -337,8 +418,21 @@ def _tune_forward(
 ) -> list[tuple[dict[str, Any], int]]:
   q, k, v = _make_tensors(task, batch)
   attn_bias = _make_attn_bias(task)
-  num_splits = _get_decode_num_splits(task.seqlen_q, task.seqlen_k, task.headdim, batch, task.nheads_q, q.device)
-  use_sm90_tma = enable_tma and is_sm90_tma_forward_supported(q, k, v, torch.empty_like(q), num_splits=num_splits)
+  num_splits = _get_decode_num_splits(
+    task.seqlen_q,
+    task.seqlen_k,
+    task.headdim,
+    batch,
+    task.nheads_q,
+    q.device,
+  )
+  use_sm90_tma = enable_tma and is_sm90_tma_forward_supported(
+    q,
+    k,
+    v,
+    torch.empty_like(q),
+    num_splits=num_splits,
+  )
   use_sm90_ws = use_sm90_tma and enable_ws
   if task.has_dropout:
     torch.manual_seed(_TUNE_SEED + 17)
@@ -358,7 +452,12 @@ def _tune_forward(
   )
   del out
   if use_sm90_tma:
-    wrapper = _get_fwd_sm90_autotune(task.headdim, mode, _dtype_schema_name(task.dtype), enable_ws=use_sm90_ws)
+    wrapper = _get_fwd_sm90_autotune(
+      task.headdim,
+      mode,
+      _dtype_schema_name(task.dtype),
+      enable_ws=use_sm90_ws,
+    )
     kernel = "fwd_sm90_generic"
     entry = _entry_base(task, mode, kernel, config_from_triton_config(wrapper.best_config))
     choices_count = len(wrapper.configs)
@@ -369,7 +468,12 @@ def _tune_forward(
     choices_count = len(wrapper.configs)
   else:
     use_gemv = task.seqlen_q == 1
-    wrapper = _get_decode_fwd_stage1_autotune(task.headdim, use_gemv, mode, _dtype_schema_name(task.dtype))
+    wrapper = _get_decode_fwd_stage1_autotune(
+      task.headdim,
+      use_gemv,
+      mode,
+      _dtype_schema_name(task.dtype),
+    )
     kernel = "decode_fwd_stage1"
     entry = _entry_base(task, mode, kernel, config_from_triton_config(wrapper.best_config))
     entry["use_gemv"] = use_gemv
@@ -404,7 +508,12 @@ def _tune_backward(
   out.float().sum().backward()
 
   pre_wrapper = _get_pre_autotune(False, mode, _dtype_schema_name(task.dtype))
-  pre_entry = _entry_base(task, mode, "bwd_preproc", config_from_triton_config(pre_wrapper.best_config))
+  pre_entry = _entry_base(
+    task,
+    mode,
+    "bwd_preproc",
+    config_from_triton_config(pre_wrapper.best_config),
+  )
   pre_entry["config"].setdefault("BLOCK_HEADDIM", max(64, triton.next_power_of_2(task.headdim)))
   pre_entry.update({
     "preprocess_d_chunk": False,
@@ -418,8 +527,18 @@ def _tune_backward(
 
   if task.seqlen_q < 8:
     use_gemv = task.seqlen_q == 1
-    wrapper = _get_decode_bwd_stage1_autotune(task.headdim, use_gemv, mode, task.has_attn_bias)
-    entry = _entry_base(task, mode, "decode_bwd_stage1", config_from_triton_config(wrapper.best_config))
+    wrapper = _get_decode_bwd_stage1_autotune(
+      task.headdim,
+      use_gemv,
+      mode,
+      task.has_attn_bias,
+    )
+    entry = _entry_base(
+      task,
+      mode,
+      "decode_bwd_stage1",
+      config_from_triton_config(wrapper.best_config),
+    )
     entry.update({
       "bias_grad": task.has_attn_bias,
       "grad_v_storage_dtype": None,
@@ -428,7 +547,12 @@ def _tune_backward(
     choices_count = len(wrapper.configs)
   else:
     wrapper = _get_bwd_autotune(task.headdim, mode, task.has_attn_bias)
-    entry = _entry_base(task, mode, "bwd_generic", config_from_triton_config(wrapper.best_config))
+    entry = _entry_base(
+      task,
+      mode,
+      "bwd_generic",
+      config_from_triton_config(wrapper.best_config),
+    )
     entry.update({
       "bias_grad": task.has_attn_bias,
       "grad_v_storage_dtype": None,
@@ -478,10 +602,29 @@ def _build_payload(
 
 def _parse_args() -> argparse.Namespace:
   parser = argparse.ArgumentParser(description="Generate persistent FFPA Triton tuned configs.")
-  parser.add_argument("--mode", choices=("fast", "max"), default="fast", help="Triton autotune search-space mode.")
-  parser.add_argument("--directions", choices=("forward", "backward", "both"), default="both")
-  parser.add_argument("--B", type=int, default=1, help="Batch size used for tuning.")
-  parser.add_argument("--H", type=int, default=32, help="Base query-head count used for tuning.")
+  parser.add_argument(
+    "--mode",
+    choices=("fast", "max"),
+    default="fast",
+    help="Triton autotune search-space mode.",
+  )
+  parser.add_argument(
+    "--directions",
+    choices=("forward", "backward", "both"),
+    default="both",
+  )
+  parser.add_argument(
+    "--B",
+    type=int,
+    default=1,
+    help="Batch size used for tuning.",
+  )
+  parser.add_argument(
+    "--H",
+    type=int,
+    default=32,
+    help="Base query-head count used for tuning.",
+  )
   parser.add_argument(
     "--full-tasks",
     action="store_true",
@@ -500,8 +643,17 @@ def _parse_args() -> argparse.Namespace:
     action="store_true",
     help="Allow warp-specialized SM90+ TMA forward configs when --enable-tma is set.",
   )
-  parser.add_argument("--overwrite", action="store_true", help="Overwrite an existing device config JSON.")
-  parser.add_argument("--output-dir", type=Path, default=None, help="Directory for generated device JSON.")
+  parser.add_argument(
+    "--overwrite",
+    action="store_true",
+    help="Overwrite an existing device config JSON.",
+  )
+  parser.add_argument(
+    "--output-dir",
+    type=Path,
+    default=None,
+    help="Directory for generated device JSON.",
+  )
   return parser.parse_args()
 
 
@@ -525,9 +677,19 @@ def main() -> int:
   seqlens = _available_seqlens()
   tasks: list[TuneTask] = []
   if args.directions in ("forward", "both"):
-    tasks.extend(_iter_forward_tasks(args.dtypes, seqlens, heads=args.H, full_tasks=args.full_tasks))
+    tasks.extend(_iter_forward_tasks(
+      args.dtypes,
+      seqlens,
+      heads=args.H,
+      full_tasks=args.full_tasks,
+    ))
   if args.directions in ("backward", "both"):
-    tasks.extend(_iter_backward_tasks(args.dtypes, seqlens, heads=args.H, full_tasks=args.full_tasks))
+    tasks.extend(_iter_backward_tasks(
+      args.dtypes,
+      seqlens,
+      heads=args.H,
+      full_tasks=args.full_tasks,
+    ))
   tasks = _limit_tasks(tasks)
 
   entries: dict[tuple[Any, ...], dict[str, Any]] = {}
@@ -554,7 +716,12 @@ def main() -> int:
         start_time = time.perf_counter()
         if task.direction == "forward":
           tuned_entries = _tune_forward(
-            task, args.B, args.mode, entries, enable_tma=args.enable_tma, enable_ws=args.enable_ws
+            task,
+            args.B,
+            args.mode,
+            entries,
+            enable_tma=args.enable_tma,
+            enable_ws=args.enable_ws,
           )
         else:
           tuned_entries = _tune_backward(task, args.B, args.mode, entries)
@@ -603,7 +770,14 @@ def main() -> int:
     )
   )
   payload = _build_payload(
-    ordered_entries, args.mode, args.B, args.H, args.full_tasks, seqlens, args.enable_tma, args.enable_ws
+    ordered_entries,
+    args.mode,
+    args.B,
+    args.H,
+    args.full_tasks,
+    seqlens,
+    args.enable_tma,
+    args.enable_ws,
   )
   write_config_file(payload, output_path, overwrite=args.overwrite)
   logger.info("Wrote %d tuned config entries to %s", len(ordered_entries), output_path)

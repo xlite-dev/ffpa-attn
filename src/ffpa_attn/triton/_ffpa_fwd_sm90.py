@@ -29,7 +29,11 @@ from ._ffpa_fwd import (
   _attn_bias_broadcast_strides,
   _update_o_accs,
 )
-from ._persistent_autotune import PersistentConfigRequest, dtype_name, lookup_persistent_config
+from ._persistent_autotune import (
+  PersistentConfigRequest,
+  dtype_name,
+  lookup_persistent_config,
+)
 from ._autotune_utils import autotune_seqlen_key
 
 
@@ -42,6 +46,99 @@ _SM90_FWD_HEURISTICS = {
   "EVEN_N": lambda args: args["seqlen_k"] % args["BLOCK_N"] == 0,
   "NUM_V_GROUPS": _sm90_num_v_groups,
 }
+
+
+@triton.jit
+def _ffpa_fwd_sm90_process_kv_block(
+  desc_q: tl.tensor_descriptor,
+  desc_k: tl.tensor_descriptor,
+  desc_v: tl.tensor_descriptor,
+  AttnBias: torch.Tensor,
+  q_offset_y,
+  kv_base_y,
+  start_n,
+  off_hb,
+  offs_m,
+  offs_n,
+  o_accs,
+  m_i,
+  l_i,
+  softmax_scale: float,
+  stride_bm: int,
+  stride_bn: int,
+  seqlen_q: tl.constexpr,
+  seqlen_k: tl.constexpr,
+  kv_offset: tl.constexpr,
+  dropout_p: float,
+  philox_offset: int,
+  IS_CAUSAL: tl.constexpr,
+  HAS_ATTN_BIAS: tl.constexpr,
+  HAS_DROPOUT: tl.constexpr,
+  PHILOX_SEED: tl.constexpr,
+  DTYPE: tl.constexpr,
+  EVEN_N: tl.constexpr,
+  BLOCK_M: tl.constexpr,
+  BLOCK_N: tl.constexpr,
+  BLOCK_HEADDIM_QK: tl.constexpr,
+  BLOCK_HEADDIM_V: tl.constexpr,
+  NUM_QK_D_CHUNKS: tl.constexpr,
+  NUM_V_GROUPS: tl.constexpr,
+):
+  start_n = tl.multiple_of(start_n, BLOCK_N)
+  offs_kv = start_n + offs_n
+  k_offset_y = kv_base_y + start_n
+  v_offset_y = kv_base_y + start_n
+
+  scores = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+  # Phase 1: QK with Split-D reduction structure.
+  for qk_d_chunk in range(NUM_QK_D_CHUNKS):
+    qk_d_start = qk_d_chunk * BLOCK_HEADDIM_QK
+    # TMA descriptor loads — OOB elements return 0 automatically.
+    q = desc_q.load([q_offset_y, qk_d_start])
+    k = desc_k.load([k_offset_y, qk_d_start])
+    scores = tl.dot(q, tl.trans(k), acc=scores)
+
+  scores = scores * softmax_scale
+  if HAS_ATTN_BIAS:
+    # attn_bias stays on raw pointer — may be stride-0 broadcast.
+    bias = tl.load(
+      AttnBias + offs_m[:, None] * stride_bm + offs_kv[None, :] * stride_bn,
+      mask=(offs_m[:, None] < seqlen_q) & (offs_kv[None, :] < seqlen_k),
+      other=0.0,
+    )
+    scores += bias
+  if not EVEN_N:
+    scores = tl.where(offs_kv[None, :] < seqlen_k, scores, -float("inf"))
+  if IS_CAUSAL:
+    causal_mask = offs_kv[None, :] <= (offs_m[:, None] + kv_offset)
+    scores = tl.where(causal_mask, scores, -float("inf"))
+
+  # Phase 2: Online softmax.
+  m_new = tl.maximum(m_i, tl.max(scores, axis=1))
+  alpha = tl.exp(m_i - m_new)
+  p = tl.exp(scores - m_new[:, None])
+  l_new = l_i * alpha + tl.sum(p, axis=1)
+  p = _apply_dropout_to_p(
+    p,
+    off_hb,
+    offs_m,
+    offs_kv,
+    seqlen_q,
+    seqlen_k,
+    dropout_p,
+    PHILOX_SEED,
+    philox_offset,
+    HAS_DROPOUT,
+  )
+  p = p.to(DTYPE)
+
+  # Phase 3: PV with Split-D V accumulation.
+  for v_group in tl.static_range(0, NUM_V_GROUPS):
+    o_d_start = BLOCK_HEADDIM_V * v_group
+    v = desc_v.load([v_offset_y, o_d_start])
+    o_acc = o_accs[v_group] * alpha[:, None] + tl.dot(p, v)
+    o_accs = _update_o_accs(o_accs, v_group, o_acc)
+  return o_accs, m_new, l_new
 
 
 def _sm90_host_descriptor_pre_hook(nargs):
@@ -168,133 +265,81 @@ def _ffpa_fwd_sm90_kernel_impl(
       flatten=True,
       warp_specialize=True,
     ):
-      start_n = tl.multiple_of(start_n, BLOCK_N)
-      offs_kv = start_n + offs_n
-      k_offset_y = kv_base_y + start_n
-      v_offset_y = kv_base_y + start_n
-
-      scores = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
-      # Phase 1: QK with Split-D reduction structure
-      # Keep this as a plain head-dim reduction loop. Inner qk_d_chunk WS was
-      # correct in testing but slower: the loop has a short trip count, carries
-      # a serial scores dependency, and excludes the softmax + V/P@V work that
-      # gives the outer KV loop enough work to amortize producer/consumer splits.
-      for qk_d_chunk in range(num_qk_d_chunks):
-        qk_d_start = qk_d_chunk * BLOCK_HEADDIM_QK
-        # TMA descriptor loads — OOB elements return 0 automatically
-        q = desc_q.load([q_offset_y, qk_d_start])
-        k = desc_k.load([k_offset_y, qk_d_start])
-        scores = tl.dot(q, tl.trans(k), acc=scores)
-
-      scores = scores * softmax_scale
-      if HAS_ATTN_BIAS:
-        # attn_bias stays on raw pointer — may be stride-0 broadcast
-        bias = tl.load(
-          AttnBias + offs_m[:, None] * stride_bm + offs_kv[None, :] * stride_bn,
-          mask=(offs_m[:, None] < seqlen_q) & (offs_kv[None, :] < seqlen_k),
-          other=0.0,
-        )
-        scores += bias
-      if not EVEN_N:
-        scores = tl.where(offs_kv[None, :] < seqlen_k, scores, -float("inf"))
-      if IS_CAUSAL:
-        causal_mask = offs_kv[None, :] <= (offs_m[:, None] + kv_offset)
-        scores = tl.where(causal_mask, scores, -float("inf"))
-
-      # Phase 2: Online softmax
-      m_new = tl.maximum(m_i, tl.max(scores, axis=1))
-      alpha = tl.exp(m_i - m_new)
-      p = tl.exp(scores - m_new[:, None])
-      l_new = l_i * alpha + tl.sum(p, axis=1)
-      p = _apply_dropout_to_p(
-        p,
+      o_accs, m_i, l_i = _ffpa_fwd_sm90_process_kv_block(
+        desc_q,
+        desc_k,
+        desc_v,
+        AttnBias,
+        q_offset_y,
+        kv_base_y,
+        start_n,
         off_hb,
         offs_m,
-        offs_kv,
+        offs_n,
+        o_accs,
+        m_i,
+        l_i,
+        softmax_scale,
+        stride_bm,
+        stride_bn,
         seqlen_q,
         seqlen_k,
+        kv_offset,
         dropout_p,
-        PHILOX_SEED,
         philox_offset,
+        IS_CAUSAL,
+        HAS_ATTN_BIAS,
         HAS_DROPOUT,
+        PHILOX_SEED,
+        DTYPE,
+        EVEN_N,
+        BLOCK_M,
+        BLOCK_N,
+        BLOCK_HEADDIM_QK,
+        BLOCK_HEADDIM_V,
+        num_qk_d_chunks,
+        NUM_V_GROUPS,
       )
-      p = p.to(DTYPE)
-
-      # Phase 3: PV with Split-D V accumulation
-      # Reuse the same softmax tile for all V slices, matching FFPA CUDA fwd:
-      # R_D[j] = alpha * R_D[j] + P @ V_j. This avoids recomputing QK/softmax
-      # per output head-dim group while keeping Split-D register pressure bounded.
-      for v_group in tl.static_range(0, NUM_V_GROUPS):
-        o_d_start = BLOCK_HEADDIM_V * v_group
-        v = desc_v.load([v_offset_y, o_d_start])
-        o_acc = o_accs[v_group] * alpha[:, None] + tl.dot(p, v)
-        o_accs = _update_o_accs(o_accs, v_group, o_acc)
-      m_i = m_new
-      l_i = l_new
   else:
     # Keep the non-WS TMA path on the original plain range. A tl.range with
     # WS-only attrs still changes non-WS codegen and caps the stage3/4 TMA
     # candidates that were the fast path before WS was added.
     for start_n in range(0, end_n, BLOCK_N):
-      start_n = tl.multiple_of(start_n, BLOCK_N)
-      offs_kv = start_n + offs_n
-      k_offset_y = kv_base_y + start_n
-      v_offset_y = kv_base_y + start_n
-
-      scores = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
-      # Phase 1: QK with Split-D reduction structure
-      for qk_d_chunk in range(num_qk_d_chunks):
-        qk_d_start = qk_d_chunk * BLOCK_HEADDIM_QK
-        # TMA descriptor loads — OOB elements return 0 automatically
-        q = desc_q.load([q_offset_y, qk_d_start])
-        k = desc_k.load([k_offset_y, qk_d_start])
-        scores = tl.dot(q, tl.trans(k), acc=scores)
-
-      scores = scores * softmax_scale
-      if HAS_ATTN_BIAS:
-        # attn_bias stays on raw pointer — may be stride-0 broadcast
-        bias = tl.load(
-          AttnBias + offs_m[:, None] * stride_bm + offs_kv[None, :] * stride_bn,
-          mask=(offs_m[:, None] < seqlen_q) & (offs_kv[None, :] < seqlen_k),
-          other=0.0,
-        )
-        scores += bias
-      if not EVEN_N:
-        scores = tl.where(offs_kv[None, :] < seqlen_k, scores, -float("inf"))
-      if IS_CAUSAL:
-        causal_mask = offs_kv[None, :] <= (offs_m[:, None] + kv_offset)
-        scores = tl.where(causal_mask, scores, -float("inf"))
-
-      # Phase 2: Online softmax
-      m_new = tl.maximum(m_i, tl.max(scores, axis=1))
-      alpha = tl.exp(m_i - m_new)
-      p = tl.exp(scores - m_new[:, None])
-      l_new = l_i * alpha + tl.sum(p, axis=1)
-      p = _apply_dropout_to_p(
-        p,
+      o_accs, m_i, l_i = _ffpa_fwd_sm90_process_kv_block(
+        desc_q,
+        desc_k,
+        desc_v,
+        AttnBias,
+        q_offset_y,
+        kv_base_y,
+        start_n,
         off_hb,
         offs_m,
-        offs_kv,
+        offs_n,
+        o_accs,
+        m_i,
+        l_i,
+        softmax_scale,
+        stride_bm,
+        stride_bn,
         seqlen_q,
         seqlen_k,
+        kv_offset,
         dropout_p,
-        PHILOX_SEED,
         philox_offset,
+        IS_CAUSAL,
+        HAS_ATTN_BIAS,
         HAS_DROPOUT,
+        PHILOX_SEED,
+        DTYPE,
+        EVEN_N,
+        BLOCK_M,
+        BLOCK_N,
+        BLOCK_HEADDIM_QK,
+        BLOCK_HEADDIM_V,
+        num_qk_d_chunks,
+        NUM_V_GROUPS,
       )
-      p = p.to(DTYPE)
-
-      # Phase 3: PV with Split-D V accumulation
-      # Reuse the same softmax tile for all V slices, matching FFPA CUDA fwd:
-      # R_D[j] = alpha * R_D[j] + P @ V_j. This avoids recomputing QK/softmax
-      # per output head-dim group while keeping Split-D register pressure bounded.
-      for v_group in tl.static_range(0, NUM_V_GROUPS):
-        o_d_start = BLOCK_HEADDIM_V * v_group
-        v = desc_v.load([v_offset_y, o_d_start])
-        o_acc = o_accs[v_group] * alpha[:, None] + tl.dot(p, v)
-        o_accs = _update_o_accs(o_accs, v_group, o_acc)
-      m_i = m_new
-      l_i = l_new
 
   # Phase 4: Epilogue - write O via descriptor when aligned, raw pointer otherwise
   # TMA descriptor stores may not correctly clip partial rows on all
@@ -330,43 +375,13 @@ _SM90_DEFAULT_CONFIG = {
   "num_stages": 3,
 }
 
+# BLOCK_M, BLOCK_N, BLOCK_HEADDIM_QK
 _SM90_WS_CONFIGS = [
   (64, 64, 64),
   (64, 64, 128),
   (64, 128, 64),
   (128, 64, 64),
 ]
-
-
-def _sm90_config_tile(config: dict) -> tuple[int, int, int]:
-  return (config["BLOCK_M"], config["BLOCK_N"], config["BLOCK_HEADDIM_QK"])
-
-
-def _select_sm90_fixed_launch_config(enable_ws: bool, persisted: dict | None = None) -> dict:
-  """Return a fixed-launch config with the same WS safety policy as autotune.
-
-  :param enable_ws: Whether the fixed launch may use warp specialization.
-  :param persisted: Optional persistent autotune config to use as the base.
-  :return: A fixed launch config for ``_ffpa_fwd_sm90_kernel_impl``.
-  """
-  launch_config = dict(_SM90_DEFAULT_CONFIG)
-  if persisted is not None:
-    launch_config.update(persisted)
-
-  if not enable_ws:
-    launch_config["warp_specialize"] = False
-    return launch_config
-
-  tile = _sm90_config_tile(launch_config)
-  if persisted is None and tile in _SM90_WS_CONFIGS:
-    launch_config["warp_specialize"] = True
-
-  if launch_config.get("warp_specialize", False):
-    if tile in _SM90_WS_CONFIGS:
-      launch_config["num_stages"] = 2
-    else:
-      launch_config["warp_specialize"] = False
-  return launch_config
 
 
 def _gen_fwd_sm90_autotune_configs(
@@ -414,28 +429,26 @@ def _gen_fwd_sm90_autotune_configs(
             )
         if enable_ws and (block_m, block_n, block_headdim) in _SM90_WS_CONFIGS:
           for num_warps in num_warps_candidates:
-            # Keep WS launch staging at 2. Config.num_stages is a backend-wide
-            # pipeline/warpspec option, while tl.range(num_stages=2) is the
-            # local outer-KV-loop pipeline depth; they are not substitutes for
-            # each other. Raising the launch depth still changes global WS and
-            # latency/pipeline passes around this loop. Unlike the FA2 reference
-            # 2/3/4 NUM_STAGES sweep, FFPA's Split-D WS stage3 has already hit
-            # shared-memory limits on 5090 for the validated tiles, so broader
-            # staging needs explicit retesting.
-            configs.append(
-              triton.Config(
-                {
-                  "BLOCK_M": block_m,
-                  "BLOCK_N": block_n,
-                  "BLOCK_HEADDIM_QK": block_headdim,
-                  "BLOCK_HEADDIM_V": block_headdim,
-                  "warp_specialize": True,
-                },
-                num_warps=num_warps,
-                num_stages=2,
-                pre_hook=_sm90_host_descriptor_pre_hook,
+            for num_stages in [2, 3]:
+              # Config.num_stages is a backend-wide pipeline/warpspec option,
+              # while tl.range(num_stages=2) is the local outer-KV-loop
+              # pipeline depth; they are not substitutes for each other. Sweep
+              # launch stages 2/3 so smaller tiles and larger-SMEM devices such
+              # as H200/B200 can keep legal deeper WS candidates.
+              configs.append(
+                triton.Config(
+                  {
+                    "BLOCK_M": block_m,
+                    "BLOCK_N": block_n,
+                    "BLOCK_HEADDIM_QK": block_headdim,
+                    "BLOCK_HEADDIM_V": block_headdim,
+                    "warp_specialize": True,
+                  },
+                  num_warps=num_warps,
+                  num_stages=num_stages,
+                  pre_hook=_sm90_host_descriptor_pre_hook,
+                )
               )
-            )
   return configs
 
 
@@ -503,9 +516,13 @@ def _ffpa_attn_forward_sm90_generic_impl(
   attn_bias_in = attn_bias if attn_bias is not None else q
   bias_strides = _attn_bias_broadcast_strides(attn_bias, batch, nheads_q, seqlen_q, seqlen_k)
 
+  launch_config = dict(_SM90_DEFAULT_CONFIG)
+  if enable_ws:
+    launch_config["warp_specialize"] = True
+    launch_config["num_stages"] = 2
+
   # When autotune is requested, the autotune wrapper (with pre_hook) manages
   # block_shape updates; the launcher only needs to pick a fixed-path config.
-  launch_config = dict(_SM90_DEFAULT_CONFIG)
   if not autotune:
     persisted = lookup_persistent_config(
       PersistentConfigRequest(
@@ -524,7 +541,8 @@ def _ffpa_attn_forward_sm90_generic_impl(
         device_index=q.device.index,
       )
     )
-    launch_config = _select_sm90_fixed_launch_config(enable_ws, persisted)
+    if persisted is not None:
+      launch_config = persisted
 
   y_dim_q = batch * nheads_q * seqlen_q
   y_dim_kv = batch * nheads_kv * seqlen_k
@@ -606,7 +624,6 @@ def _ffpa_attn_forward_sm90_generic_impl(
     )
     return
 
-  # fixed-config launch
   def grid(meta):
     return (triton.cdiv(seqlen_q, meta["BLOCK_M"]), batch * nheads_q)
 
