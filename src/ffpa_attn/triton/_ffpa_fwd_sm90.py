@@ -261,8 +261,6 @@ def _ffpa_fwd_sm90_kernel_impl(
 
   if warp_specialize:
     # KV loop / warp-specialization boundary.
-    # num_stages=2 keeps the TMA pipeline shallow enough for the validated WS
-    # tiles; deeper staging is more resource-sensitive here.
     # disallow_acc_multi_buffer=True is needed for the Split-D accumulator shape.
     # The total fp32 state is comparable to a FA2-style [BLOCK_M, HEAD_DIM] acc,
     # but here Triton sees multiple loop-carried dot accumulators in o_accs plus
@@ -273,7 +271,6 @@ def _ffpa_fwd_sm90_kernel_impl(
       0,
       end_n,
       BLOCK_N,
-      num_stages=2,
       disallow_acc_multi_buffer=True,
       flatten=True,
       warp_specialize=True,
@@ -391,12 +388,20 @@ _SM90_DEFAULT_CONFIG = {
   "num_stages": 3,
 }
 
-# BLOCK_M, BLOCK_N, BLOCK_HEADDIM_QK
+# BLOCK_M, BLOCK_N, BLOCK_HEADDIM_QK, BLOCK_HEADDIM_V
 _SM90_WS_CONFIGS = [
-  (64, 64, 64),
-  (64, 64, 128),
-  (64, 128, 64),
-  (128, 64, 64),
+  (64, 64, 64, 64),
+  (64, 64, 128, 128),
+  (64, 128, 64, 64),
+  (128, 64, 64, 64),
+  # Smaller M/QK tiles reduce WS staging pressure while keeping V chunks at 64
+  # to avoid doubling the number of V accumulator groups for D=512.
+  (32, 64, 64, 64),
+  (32, 128, 64, 64),
+  (64, 64, 32, 64),
+  (64, 128, 32, 64),
+  (32, 64, 32, 64),
+  (32, 128, 32, 64),
 ]
 
 
@@ -418,56 +423,61 @@ def _gen_fwd_sm90_autotune_configs(
   :param enable_ws: Whether to generate only warp-specialized configs.
   :return: Triton autotune configurations for the SM90 TMA forward kernel.
   """
+  _ = headdim  # unused
   _headdim_candidates = [64, 128]
   if autotune_mode == "max":
     _headdim_candidates.append(256)
 
   configs = []
-  for block_m in [64, 128]:
-    for block_n in [64, 128]:
-      for block_headdim in _headdim_candidates:
-        num_warps_candidates = [4] if autotune_mode == "fast" else [4, 8]
-        if enable_ws:
-          if (block_m, block_n, block_headdim) not in _SM90_WS_CONFIGS:
-            continue
-          for num_warps in num_warps_candidates:
-            for num_stages in [2, 3]:
-              # Config.num_stages is a backend-wide pipeline/warpspec option,
-              # while tl.range(num_stages=2) is the local outer-KV-loop
-              # pipeline depth; they are not substitutes for each other. Sweep
-              # launch stages 2/3 so smaller tiles and larger-SMEM devices such
-              # as H200/B200 can keep legal deeper WS candidates.
-              configs.append(
-                triton.Config(
-                  {
-                    "BLOCK_M": block_m,
-                    "BLOCK_N": block_n,
-                    "BLOCK_HEADDIM_QK": block_headdim,
-                    "BLOCK_HEADDIM_V": block_headdim,
-                    "warp_specialize": True,
-                  },
-                  num_warps=num_warps,
-                  num_stages=num_stages,
-                  pre_hook=_sm90_host_descriptor_pre_hook,
-                )
-              )
-        else:
-          for num_warps in num_warps_candidates:
-            for num_stages in [2, 3] if autotune_mode == "fast" else [2, 3, 4]:
-              configs.append(
-                triton.Config(
-                  {
-                    "BLOCK_M": block_m,
-                    "BLOCK_N": block_n,
-                    "BLOCK_HEADDIM_QK": block_headdim,
-                    "BLOCK_HEADDIM_V": block_headdim,
-                    "warp_specialize": False,
-                  },
-                  num_warps=num_warps,
-                  num_stages=num_stages,
-                  pre_hook=_sm90_host_descriptor_pre_hook,
-                )
-              )
+  ws_config_set = set(_SM90_WS_CONFIGS)
+  if enable_ws:
+    tile_candidates = _SM90_WS_CONFIGS
+  else:
+    tile_candidates = [(block_m, block_n, block_headdim, block_headdim) for block_m in [64, 128]
+                       for block_n in [64, 128] for block_headdim in _headdim_candidates]
+
+  for block_m, block_n, block_headdim_qk, block_headdim_v in tile_candidates:
+    num_warps_candidates = [4] if autotune_mode == "fast" else [4, 8]
+    if enable_ws:
+      if (block_m, block_n, block_headdim_qk, block_headdim_v) not in ws_config_set:
+        continue
+      for num_warps in num_warps_candidates:
+        for num_stages in [1, 2, 3]:
+          # Config.num_stages is the backend-wide pipeline/warpspec option
+          # that materially changes WS shared-memory use. Stage 1 remains
+          # in autotune so small tiles and resource-bound shapes can
+          # compete without weakening the fixed WS fallback.
+          configs.append(
+            triton.Config(
+              {
+                "BLOCK_M": block_m,
+                "BLOCK_N": block_n,
+                "BLOCK_HEADDIM_QK": block_headdim_qk,
+                "BLOCK_HEADDIM_V": block_headdim_v,
+                "warp_specialize": True,
+              },
+              num_warps=num_warps,
+              num_stages=num_stages,
+              pre_hook=_sm90_host_descriptor_pre_hook,
+            )
+          )
+    else:
+      for num_warps in num_warps_candidates:
+        for num_stages in [2, 3] if autotune_mode == "fast" else [2, 3, 4]:
+          configs.append(
+            triton.Config(
+              {
+                "BLOCK_M": block_m,
+                "BLOCK_N": block_n,
+                "BLOCK_HEADDIM_QK": block_headdim_qk,
+                "BLOCK_HEADDIM_V": block_headdim_v,
+                "warp_specialize": False,
+              },
+              num_warps=num_warps,
+              num_stages=num_stages,
+              pre_hook=_sm90_host_descriptor_pre_hook,
+            )
+          )
   return configs
 
 

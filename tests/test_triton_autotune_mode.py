@@ -110,22 +110,29 @@ def test_sm90_fwd_configs_force_warp_specialize():
   assert {config["warp_specialize"] for config in serialized} == {True}
   assert len(ws_configs) == len(serialized)
   assert len(max_ws_configs) == len(max_serialized)
-  assert all(config["BLOCK_HEADDIM_QK"] == config["BLOCK_HEADDIM_V"] for config in serialized)
   expected_ws_configs = {
-    (64, 64, 64),
-    (64, 64, 128),
-    (64, 128, 64),
-    (128, 64, 64),
+    (64, 64, 64, 64),
+    (64, 64, 128, 128),
+    (64, 128, 64, 64),
+    (128, 64, 64, 64),
+    (32, 64, 64, 64),
+    (32, 128, 64, 64),
+    (64, 64, 32, 64),
+    (64, 128, 32, 64),
+    (32, 64, 32, 64),
+    (32, 128, 32, 64),
   }
-  assert {(config["BLOCK_M"], config["BLOCK_N"], config["BLOCK_HEADDIM_QK"])
+  assert {(config["BLOCK_M"], config["BLOCK_N"], config["BLOCK_HEADDIM_QK"], config["BLOCK_HEADDIM_V"])
           for config in ws_configs} == expected_ws_configs
-  assert all(config["BLOCK_HEADDIM_QK"] == config["BLOCK_HEADDIM_V"] for config in ws_configs)
+  assert any(config["BLOCK_M"] == 32 for config in ws_configs)
+  assert any(config["BLOCK_HEADDIM_QK"] == 32 for config in ws_configs)
+  assert any(config["BLOCK_HEADDIM_QK"] != config["BLOCK_HEADDIM_V"] for config in ws_configs)
   assert all(config["num_warps"] == 4 for config in ws_configs)
-  assert {config["num_stages"] for config in ws_configs} == {2, 3}
-  assert {(config["BLOCK_M"], config["BLOCK_N"], config["BLOCK_HEADDIM_QK"])
+  assert {config["num_stages"] for config in ws_configs} == {1, 2, 3}
+  assert {(config["BLOCK_M"], config["BLOCK_N"], config["BLOCK_HEADDIM_QK"], config["BLOCK_HEADDIM_V"])
           for config in max_ws_configs} == expected_ws_configs
   assert {config["num_warps"] for config in max_ws_configs} == {4, 8}
-  assert {config["num_stages"] for config in max_ws_configs} == {2, 3}
+  assert {config["num_stages"] for config in max_ws_configs} == {1, 2, 3}
 
 
 def test_sm90_fwd_configs_can_disable_warp_specialize():
