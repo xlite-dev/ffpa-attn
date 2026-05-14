@@ -367,8 +367,10 @@ def _entry_base(
   mode: str,
   kernel: str,
   config: dict[str, Any],
+  enable_tma: bool | None = None,
+  enable_ws: bool | None = None,
 ) -> dict[str, Any]:
-  return {
+  entry = {
     "direction": task.direction,
     "kernel": kernel,
     "autotune_mode": mode,
@@ -386,6 +388,11 @@ def _entry_base(
     "case_name": task.case_name,
     "config": config,
   }
+  if enable_tma is not None:
+    entry["enable_tma"] = enable_tma
+  if enable_ws is not None:
+    entry["enable_ws"] = enable_ws
+  return entry
 
 
 def _record_entry(
@@ -405,6 +412,8 @@ def _record_entry(
     entry.get("bias_grad"),
     entry.get("grad_v_storage_dtype"),
     entry.get("use_gemv"),
+    entry.get("enable_tma"),
+    entry.get("enable_ws"),
   )
   if entry["kernel"] != "bwd_preproc":
     key += (
@@ -498,12 +507,26 @@ def _tune_forward(
       enable_ws=use_sm90_ws,
     )
     kernel = "fwd_sm90_generic"
-    entry = _entry_base(task, mode, kernel, config_from_triton_config(wrapper.best_config))
+    entry = _entry_base(
+      task,
+      mode,
+      kernel,
+      config_from_triton_config(wrapper.best_config),
+      enable_tma=True,
+      enable_ws=use_sm90_ws,
+    )
     choices_count = len(wrapper.configs)
   elif num_splits == 1:
     wrapper = _get_fwd_autotune(task.headdim, mode, _dtype_schema_name(task.dtype))
     kernel = "fwd_generic"
-    entry = _entry_base(task, mode, kernel, config_from_triton_config(wrapper.best_config))
+    entry = _entry_base(
+      task,
+      mode,
+      kernel,
+      config_from_triton_config(wrapper.best_config),
+      enable_tma=False,
+      enable_ws=False,
+    )
     choices_count = len(wrapper.configs)
   else:
     use_gemv = task.seqlen_q == 1
@@ -514,7 +537,14 @@ def _tune_forward(
       _dtype_schema_name(task.dtype),
     )
     kernel = "decode_fwd_stage1"
-    entry = _entry_base(task, mode, kernel, config_from_triton_config(wrapper.best_config))
+    entry = _entry_base(
+      task,
+      mode,
+      kernel,
+      config_from_triton_config(wrapper.best_config),
+      enable_tma=False,
+      enable_ws=False,
+    )
     entry["use_gemv"] = use_gemv
     choices_count = len(wrapper.configs)
   _record_entry(entries, entry)

@@ -186,6 +186,8 @@ def test_persistent_tune_forward_records_sm90_tma_config(monkeypatch):
   entry, choices_count = tuned_entries[0]
   assert choices_count == 1
   assert entry["kernel"] == "fwd_sm90_generic"
+  assert entry["enable_tma"] is True
+  assert entry["enable_ws"] is True
   assert entry["config"]["warp_specialize"] is True
   assert seen_kwargs["enable_tma"] is True
   assert seen_kwargs["enable_ws"] is True

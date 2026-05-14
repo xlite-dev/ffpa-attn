@@ -385,6 +385,17 @@ def _lookup_cache_key(request: PersistentConfigRequest) -> tuple[str, int, Persi
   return (os.environ.get(CONFIG_ENV_VAR, ""), device_index, request)
 
 
+def _entry_flag_matches(entry: dict[str, Any], key: str, expected: bool | None, inferred: bool | None = None) -> bool:
+  """Return whether an optional entry flag matches a lookup request."""
+  if expected is None:
+    return True
+  if key in entry:
+    return bool(entry[key]) == expected
+  if inferred is not None:
+    return inferred == expected
+  return True
+
+
 def _debug_lookup_message(prefix: str, request: PersistentConfigRequest, config: dict[str, Any] | None) -> None:
   """Log one DEBUG persistent lookup event.
 
@@ -457,6 +468,16 @@ def _lookup_persistent_config_cached(
       continue
     config = entry.get("config")
     if not isinstance(config, dict):
+      continue
+    # New tuned entries record enable_tma/enable_ws explicitly so TMA-only and
+    # TMA+WS runs with the same shape do not reuse each other's configs. Older
+    # JSON files lack those flags, so infer the safest compatibility meaning
+    # from the kernel name and the persisted warp_specialize meta.
+    inferred_enable_tma = request.kernel == "fwd_sm90_generic"
+    inferred_enable_ws = bool(config.get("warp_specialize", False)) if request.kernel == "fwd_sm90_generic" else False
+    if not _entry_flag_matches(entry, "enable_tma", request.enable_tma, inferred_enable_tma):
+      continue
+    if not _entry_flag_matches(entry, "enable_ws", request.enable_ws, inferred_enable_ws):
       continue
     if request.kernel == "fwd_sm90_generic" and request.enable_ws is False and bool(
       config.get("warp_specialize", False)
