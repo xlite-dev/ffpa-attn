@@ -73,7 +73,7 @@ _MAX_HEADDIM = 1024
 
 
 @triton.jit
-def _update_o_accs(o_accs, v_group: tl.constexpr, o_acc):
+def _update_o_accs(o_accs: tuple[tl.tensor, ...], v_group: tl.constexpr, o_acc: tl.tensor):
   return o_accs[:v_group] + (o_acc, ) + o_accs[v_group + 1:]
 
 

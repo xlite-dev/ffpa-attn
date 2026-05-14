@@ -54,15 +54,15 @@ def _ffpa_fwd_sm90_process_kv_block(
   desc_k: tl.tensor_descriptor,
   desc_v: tl.tensor_descriptor,
   AttnBias: torch.Tensor,
-  q_offset_y,
-  kv_base_y,
-  start_n,
-  off_hb,
-  offs_m,
-  offs_n,
-  o_accs,
-  m_i,
-  l_i,
+  q_offset_y: int,
+  kv_base_y: int,
+  start_n: int,
+  off_hb: int,
+  offs_m: int,
+  offs_n: int,
+  o_accs: tuple[tl.tensor, ...],
+  m_i: tl.tensor_descriptor,
+  l_i: tl.tensor_descriptor,
   softmax_scale: float,
   stride_bm: int,
   stride_bn: int,
@@ -208,6 +208,11 @@ def _ffpa_fwd_sm90_kernel_impl(
   pointer arithmetic replaced by ``desc.load`` / ``desc.store`` calls.
   LSE and attn_bias stay on raw pointers.
   """
+  # Keys for autotuning heuristics and persistent autotune lookup.
+  _ = seqlen_q_bucket
+  _ = seqlen_k_bucket
+  _ = autotune_causal_key
+
   start_m = tl.program_id(0)
   off_hb = tl.program_id(1)
   off_b = off_hb // nheads_q
