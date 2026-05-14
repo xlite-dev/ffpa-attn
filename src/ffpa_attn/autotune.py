@@ -244,7 +244,13 @@ def _iter_forward_tasks(
             )
           )
       if full_tasks:
-        tasks.extend(_iter_full_variant_tasks("forward", dtype, headdim, prefill_seqlens, heads))
+        tasks.extend(_iter_full_variant_tasks(
+          "forward",
+          dtype,
+          headdim,
+          prefill_seqlens,
+          heads,
+        ))
   return tasks
 
 
@@ -291,7 +297,13 @@ def _iter_backward_tasks(
               )
             )
       if full_tasks:
-        tasks.extend(_iter_full_variant_tasks("backward", dtype, headdim, prefill_seqlens, heads))
+        tasks.extend(_iter_full_variant_tasks(
+          "backward",
+          dtype,
+          headdim,
+          prefill_seqlens,
+          heads,
+        ))
   return tasks
 
 
@@ -302,12 +314,30 @@ def _limit_tasks(tasks: list[TuneTask]) -> list[TuneTask]:
   return tasks[:limit]
 
 
-def _make_tensors(task: TuneTask, batch: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def _make_tensors(
+  task: TuneTask,
+  batch: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
   shape_q = (batch, task.nheads_q, task.seqlen_q, task.headdim)
   shape_kv = (batch, task.nheads_kv, task.seqlen_k, task.headdim)
-  q = torch.randn(shape_q, device="cuda", dtype=task.dtype, requires_grad=task.direction == "backward")
-  k = torch.randn(shape_kv, device="cuda", dtype=task.dtype, requires_grad=task.direction == "backward")
-  v = torch.randn(shape_kv, device="cuda", dtype=task.dtype, requires_grad=task.direction == "backward")
+  q = torch.randn(
+    shape_q,
+    device="cuda",
+    dtype=task.dtype,
+    requires_grad=task.direction == "backward",
+  )
+  k = torch.randn(
+    shape_kv,
+    device="cuda",
+    dtype=task.dtype,
+    requires_grad=task.direction == "backward",
+  )
+  v = torch.randn(
+    shape_kv,
+    device="cuda",
+    dtype=task.dtype,
+    requires_grad=task.direction == "backward",
+  )
   return q, k, v
 
 
@@ -332,7 +362,12 @@ def _make_attn_bias(task: TuneTask) -> torch.Tensor | None:
   return torch.randn(1, 1, 1, task.seqlen_k, dtype=task.dtype, device="cuda") * 0.25
 
 
-def _entry_base(task: TuneTask, mode: str, kernel: str, config: dict[str, Any]) -> dict[str, Any]:
+def _entry_base(
+  task: TuneTask,
+  mode: str,
+  kernel: str,
+  config: dict[str, Any],
+) -> dict[str, Any]:
   return {
     "direction": task.direction,
     "kernel": kernel,
@@ -353,7 +388,10 @@ def _entry_base(task: TuneTask, mode: str, kernel: str, config: dict[str, Any]) 
   }
 
 
-def _record_entry(entries: dict[tuple[Any, ...], dict[str, Any]], entry: dict[str, Any]) -> None:
+def _record_entry(
+  entries: dict[tuple[Any, ...], dict[str, Any]],
+  entry: dict[str, Any],
+) -> None:
   key = (
     entry["direction"],
     entry["kernel"],
@@ -400,7 +438,8 @@ def _format_entry(entry: dict[str, Any], choices_count: int, batch: int) -> str:
   nheads_kv = int(entry.get("nheads_kv", nheads_q))
   shape = (
     f"{direction}:{entry['kernel']}("
-    f"case={entry.get('case_name', 'common')},{entry['dtype']},B{batch},Hq/Hkv={nheads_q}/{nheads_kv},"
+    f"case={entry.get('case_name', 'common')},{entry['dtype']},"
+    f"B{batch},Hq/Hkv={nheads_q}/{nheads_kv},"
     f"Q{entry['seqlen_q']},K{entry['seqlen_k']},D{entry['headdim']},"
     f"C{int(bool(entry['causal']))},mask={int(bool(entry.get('has_attn_bias', False)))},"
     f"drop={int(bool(entry.get('has_dropout', False)))},gqa={int(nheads_q != nheads_kv)}"
@@ -514,7 +553,10 @@ def _tune_backward(
     "bwd_preproc",
     config_from_triton_config(pre_wrapper.best_config),
   )
-  pre_entry["config"].setdefault("BLOCK_HEADDIM", max(64, triton.next_power_of_2(task.headdim)))
+  pre_entry["config"].setdefault(
+    "BLOCK_HEADDIM",
+    max(64, triton.next_power_of_2(task.headdim)),
+  )
   pre_entry.update({
     "preprocess_d_chunk": False,
     "has_attn_bias": False,
@@ -631,7 +673,10 @@ def _parse_args() -> argparse.Namespace:
     help="Also tune canonical attn_mask, dropout, GQA, and MQA variants.",
   )
   parser.add_argument(
-    "--dtypes", type=_parse_dtypes, default=[torch.bfloat16], help="Comma-separated dtypes: bf16,fp16."
+    "--dtypes",
+    type=_parse_dtypes,
+    default=[torch.bfloat16],
+    help="Comma-separated dtypes: bf16,fp16.",
   )
   parser.add_argument(
     "--enable-tma",
