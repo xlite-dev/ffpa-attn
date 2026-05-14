@@ -9,7 +9,10 @@ from contextvars import ContextVar
 _AUTOTUNE_SEQLEN_BUCKET_SIZE = 1024
 _AUTOTUNE_SEQLEN_BUCKET_CAP = 8192
 _AUTOTUNE_MAX_SEQLEN_BUCKET_CAP = 16384
-_EXACT_AUTOTUNE_SEQLEN_KEYS: ContextVar[bool] = ContextVar("ffpa_exact_autotune_seqlen_keys", default=False)
+_EXACT_AUTOTUNE_SEQLEN_KEYS: ContextVar[bool] = ContextVar(
+  "ffpa_exact_autotune_seqlen_keys",
+  default=False,
+)
 
 
 def _bucket_upper_edge(seqlen: int, bucket_size: int) -> int:

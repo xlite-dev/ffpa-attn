@@ -43,6 +43,17 @@ _KERNEL_CONFIG_KEYS = {
     "num_ctas",
     "maxnreg",
   },
+  "fwd_sm90_generic": {
+    "BLOCK_M",
+    "BLOCK_N",
+    "BLOCK_HEADDIM_QK",
+    "BLOCK_HEADDIM_V",
+    "warp_specialize",
+    "num_warps",
+    "num_stages",
+    "num_ctas",
+    "maxnreg",
+  },
   "decode_fwd_stage1": {
     "BLOCK_M",
     "BLOCK_N",
@@ -101,6 +112,8 @@ class PersistentConfigRequest:
   :param use_gemv: Decode backward single-query specialization flag.
   :param has_attn_bias: Whether an additive attention bias is active.
   :param has_dropout: Whether dropout is active.
+  :param enable_tma: Whether SM90 forward TMA configs are allowed.
+  :param enable_ws: Whether SM90 forward must use warp-specialized configs.
   :param nheads_q: Optional runtime query-head count, kept for callers that
       want to describe the request. Lookup does not require it to match.
   :param nheads_kv: Optional runtime key/value-head count before backward
@@ -123,6 +136,8 @@ class PersistentConfigRequest:
   use_gemv: bool | None = None
   has_attn_bias: bool | None = None
   has_dropout: bool | None = None
+  enable_tma: bool | None = None
+  enable_ws: bool | None = None
   nheads_q: int | None = None
   nheads_kv: int | None = None
   device_index: int | None = None
@@ -370,6 +385,17 @@ def _lookup_cache_key(request: PersistentConfigRequest) -> tuple[str, int, Persi
   return (os.environ.get(CONFIG_ENV_VAR, ""), device_index, request)
 
 
+def _entry_flag_matches(entry: dict[str, Any], key: str, expected: bool | None, inferred: bool | None = None) -> bool:
+  """Return whether an optional entry flag matches a lookup request."""
+  if expected is None:
+    return True
+  if key in entry:
+    return bool(entry[key]) == expected
+  if inferred is not None:
+    return inferred == expected
+  return True
+
+
 def _debug_lookup_message(prefix: str, request: PersistentConfigRequest, config: dict[str, Any] | None) -> None:
   """Log one DEBUG persistent lookup event.
 
@@ -380,7 +406,7 @@ def _debug_lookup_message(prefix: str, request: PersistentConfigRequest, config:
   logger.debug_once(
     "%s: direction=%s kernel=%s mode=%s dtype=%s D=%d Nq=%d Nkv=%s "
     "causal=%s use_gemv=%s bias_grad=%s has_attn_bias=%s has_dropout=%s "
-    "Hq=%s Hkv=%s config=%s",
+    "enable_tma=%s enable_ws=%s Hq=%s Hkv=%s config=%s",
     prefix,
     request.direction,
     request.kernel,
@@ -394,6 +420,8 @@ def _debug_lookup_message(prefix: str, request: PersistentConfigRequest, config:
     request.bias_grad,
     request.has_attn_bias,
     request.has_dropout,
+    request.enable_tma,
+    request.enable_ws,
     request.nheads_q,
     request.nheads_kv,
     config,
@@ -438,7 +466,22 @@ def _lookup_persistent_config_cached(
       continue
     if request.has_dropout is not None and bool(entry.get("has_dropout", False)) != request.has_dropout:
       continue
-    if not isinstance(entry.get("config"), dict):
+    config = entry.get("config")
+    if not isinstance(config, dict):
+      continue
+    # New tuned entries record enable_tma/enable_ws explicitly so TMA-only and
+    # TMA+WS runs with the same shape do not reuse each other's configs. Older
+    # JSON files lack those flags, so infer the safest compatibility meaning
+    # from the kernel name and the persisted warp_specialize meta.
+    inferred_enable_tma = request.kernel == "fwd_sm90_generic"
+    inferred_enable_ws = bool(config.get("warp_specialize", False)) if request.kernel == "fwd_sm90_generic" else False
+    if not _entry_flag_matches(entry, "enable_tma", request.enable_tma, inferred_enable_tma):
+      continue
+    if not _entry_flag_matches(entry, "enable_ws", request.enable_ws, inferred_enable_ws):
+      continue
+    if request.kernel == "fwd_sm90_generic" and request.enable_ws is not None and bool(
+      config.get("warp_specialize", False)
+    ) != request.enable_ws:
       continue
     try:
       int(entry["headdim"])

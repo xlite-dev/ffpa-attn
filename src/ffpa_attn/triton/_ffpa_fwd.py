@@ -73,7 +73,7 @@ _MAX_HEADDIM = 1024
 
 
 @triton.jit
-def _update_o_accs(o_accs, v_group: tl.constexpr, o_acc):
+def _update_o_accs(o_accs: tl.tensor, v_group: tl.constexpr, o_acc: tl.tensor):
   return o_accs[:v_group] + (o_acc, ) + o_accs[v_group + 1:]
 
 
@@ -358,11 +358,8 @@ def _ffpa_fwd_kernel_impl(
   nheads_kv: int,
   seqlen_q: int,
   seqlen_k: int,
-  # Autotune buckets are passed explicitly to avoid redundant autotune
-  # runs for shapes that differ only in seqlen but fall in the same bucket.
-  # The kernel itself only uses the bucketed values.
-  seqlen_q_bucket: int,
-  seqlen_k_bucket: int,
+  autotune_seqlen_q_bucket: int,
+  autotune_seqlen_k_bucket: int,
   autotune_causal_key: int,
   seqlen_q_rounded: int,
   dropout_p: float,
@@ -387,6 +384,11 @@ def _ffpa_fwd_kernel_impl(
   reconstructs QK over head-dim chunks, applies masking/bias/dropout, and keeps
   an online-softmax accumulator for each V head-dim slice.
   """
+  # Keys for autotuning heuristics and persistent autotune lookup.
+  _ = autotune_seqlen_q_bucket
+  _ = autotune_seqlen_k_bucket
+  _ = autotune_causal_key
+
   start_m = tl.program_id(0)
   off_hb = tl.program_id(1)
   off_b = off_hb // nheads_q
@@ -432,6 +434,7 @@ def _ffpa_fwd_kernel_impl(
     offs_kv = start_n + offs_n
 
     scores = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+    # Phase 1: QK with Split-D reduction structure.
     for qk_d_chunk in range(num_qk_d_chunks):
       qk_d_start = qk_d_chunk * BLOCK_HEADDIM_QK
       qk_d = qk_d_start + offs_d_qk
@@ -465,6 +468,7 @@ def _ffpa_fwd_kernel_impl(
       causal_mask = offs_kv[None, :] <= (offs_m[:, None] + kv_offset)
       scores = tl.where(causal_mask, scores, -float("inf"))
 
+    # Phase 2: Online softmax.
     # Online softmax merge for the next KV block. ``m_i`` and ``l_i`` track the
     # row max and denominator before dropout; ``p`` is dropped only for the O
     # accumulation, while LSE stays the undropped softmax normalizer.
@@ -486,6 +490,7 @@ def _ffpa_fwd_kernel_impl(
     )
     p = p.to(DTYPE)
 
+    # Phase 3: PV with Split-D V accumulation.
     # Reuse the same softmax tile for all V slices, matching FFPA CUDA fwd:
     # R_D[j] = alpha * R_D[j] + P @ V_j. This avoids recomputing QK/softmax
     # per output head-dim group while keeping Split-D register pressure bounded.
@@ -501,6 +506,7 @@ def _ffpa_fwd_kernel_impl(
     m_i = m_new
     l_i = l_new
 
+  # Phase 4: Epilogue - final scale O and write O/LSE to global memory.
   for v_group in tl.static_range(0, NUM_V_GROUPS):
     o_d = BLOCK_HEADDIM_V * v_group + offs_d_v
     out = o_accs[v_group] / (l_i[:, None] + 1.0e-10)
@@ -547,11 +553,8 @@ def _ffpa_decode_fwd_stage1_kernel(
   nheads_kv: int,
   seqlen_q: int,
   seqlen_k: int,
-  # Autotune buckets are passed explicitly to avoid redundant autotune
-  # runs for shapes that differ only in seqlen but fall in the same bucket.
-  # The kernel itself only uses the bucketed values.
-  seqlen_q_bucket: int,
-  seqlen_k_bucket: int,
+  autotune_seqlen_q_bucket: int,
+  autotune_seqlen_k_bucket: int,
   autotune_causal_key: int,
   dropout_p: float,
   philox_offset: int,
@@ -569,6 +572,11 @@ def _ffpa_decode_fwd_stage1_kernel(
   BLOCK_HEADDIM_V: tl.constexpr,
   NUM_V_GROUPS: tl.constexpr,
 ) -> None:
+  # Keys for autotuning heuristics and persistent autotune lookup.
+  _ = autotune_seqlen_q_bucket
+  _ = autotune_seqlen_k_bucket
+  _ = autotune_causal_key
+
   # Split-kv decode stage1. Each program owns (KV chunk, B/Hq, Q block) and
   # writes a partial output plus chunk-local LSE. Stage2 merges chunks using
   # their LSEs, so stage1 never writes the final O/LSE directly.
@@ -857,7 +865,12 @@ def _get_decode_fwd_stage1_autotune(headdim: int, use_gemv: bool, autotune_mode:
     )
     _ffpa_decode_fwd_stage1_autotune_cache[cache_key] = triton.autotune(
       configs=configs,
-      key=["seqlen_q_bucket", "seqlen_k_bucket", "autotune_causal_key", "HEADDIM"],
+      key=[
+        "autotune_seqlen_q_bucket",
+        "autotune_seqlen_k_bucket",
+        "autotune_causal_key",
+        "HEADDIM",
+      ],
       cache_results=True,
     )(_ffpa_decode_fwd_stage1_kernel)
   return _ffpa_decode_fwd_stage1_autotune_cache[cache_key]
@@ -908,8 +921,8 @@ def _ffpa_attn_forward_generic_impl(
   _, nheads_kv, seqlen_k, _ = k.shape
   softmax_scale = softmax_scale or (1.0 / math.sqrt(headdim))
   seqlen_q_rounded = lse.shape[-1]
-  seqlen_q_bucket = autotune_seqlen_key(seqlen_q, autotune_mode)
-  seqlen_k_bucket = autotune_seqlen_key(seqlen_k, autotune_mode)
+  autotune_seqlen_q_bucket = autotune_seqlen_key(seqlen_q, autotune_mode)
+  autotune_seqlen_k_bucket = autotune_seqlen_key(seqlen_k, autotune_mode)
   autotune_causal_key = int(causal)
   DTYPE = tl.float16 if q.dtype == torch.float16 else tl.bfloat16
   has_attn_bias = attn_bias is not None
@@ -949,8 +962,8 @@ def _ffpa_attn_forward_generic_impl(
       nheads_kv,
       seqlen_q,
       seqlen_k,
-      seqlen_q_bucket,
-      seqlen_k_bucket,
+      autotune_seqlen_q_bucket,
+      autotune_seqlen_k_bucket,
       autotune_causal_key,
       seqlen_q_rounded,
       dropout_p,
@@ -1016,8 +1029,8 @@ def _ffpa_attn_forward_generic_impl(
       nheads_kv,
       seqlen_q,
       seqlen_k,
-      seqlen_q_bucket,
-      seqlen_k_bucket,
+      autotune_seqlen_q_bucket,
+      autotune_seqlen_k_bucket,
       autotune_causal_key,
       seqlen_q_rounded,
       dropout_p,
@@ -1082,8 +1095,8 @@ def _ffpa_attn_forward_decode_impl(
   softmax_scale = softmax_scale or (1.0 / math.sqrt(headdim))
   DTYPE = tl.float16 if q.dtype == torch.float16 else tl.bfloat16
   use_gemv = seqlen_q == 1
-  seqlen_q_bucket = autotune_seqlen_key(seqlen_q, autotune_mode)
-  seqlen_k_bucket = autotune_seqlen_key(seqlen_k, autotune_mode)
+  autotune_seqlen_q_bucket = autotune_seqlen_key(seqlen_q, autotune_mode)
+  autotune_seqlen_k_bucket = autotune_seqlen_key(seqlen_k, autotune_mode)
   autotune_causal_key = int(causal)
   if num_splits is None:
     num_splits = _get_decode_num_splits(seqlen_q, seqlen_k, headdim, batch, nheads_q, q.device)
@@ -1118,7 +1131,12 @@ def _ffpa_attn_forward_decode_impl(
     )
 
   if autotune:
-    _get_decode_fwd_stage1_autotune(headdim, use_gemv, autotune_mode, dtype_name(q.dtype))[stage1_grid](
+    _get_decode_fwd_stage1_autotune(
+      headdim,
+      use_gemv,
+      autotune_mode,
+      dtype_name(q.dtype),
+    )[stage1_grid](
       q,
       k,
       v,
@@ -1151,8 +1169,8 @@ def _ffpa_attn_forward_decode_impl(
       nheads_kv,
       seqlen_q,
       seqlen_k,
-      seqlen_q_bucket,
-      seqlen_k_bucket,
+      autotune_seqlen_q_bucket,
+      autotune_seqlen_k_bucket,
       autotune_causal_key,
       dropout_p,
       philox_offset,
@@ -1227,8 +1245,8 @@ def _ffpa_attn_forward_decode_impl(
       nheads_kv,
       seqlen_q,
       seqlen_k,
-      seqlen_q_bucket,
-      seqlen_k_bucket,
+      autotune_seqlen_q_bucket,
+      autotune_seqlen_k_bucket,
       autotune_causal_key,
       dropout_p,
       philox_offset,
@@ -1280,7 +1298,8 @@ def _ffpa_attn_forward_decode_impl(
 
 
 _ffpa_fwd = _ffpa_fwd_kernel_impl
-_ffpa_fwd_autotune_cache: dict[tuple[int, str, str], callable] = {}  # (headdim, mode, dtype) -> callable
+# (headdim, mode, dtype) -> callable
+_ffpa_fwd_autotune_cache: dict[tuple[int, str, str], callable] = {}
 
 
 def _get_fwd_autotune(headdim: int, autotune_mode: str, dtype: str):
@@ -1300,7 +1319,12 @@ def _get_fwd_autotune(headdim: int, autotune_mode: str, dtype: str):
     configs = _gen_fwd_autotune_configs(headdim, autotune_mode=autotune_mode)
     _ffpa_fwd_autotune_cache[cache_key] = triton.autotune(
       configs=configs,
-      key=["seqlen_q_bucket", "seqlen_k_bucket", "autotune_causal_key", "HEADDIM"],
+      key=[
+        "autotune_seqlen_q_bucket",
+        "autotune_seqlen_k_bucket",
+        "autotune_causal_key",
+        "HEADDIM",
+      ],
       cache_results=True,
     )(_ffpa_fwd_kernel_impl)
   return _ffpa_fwd_autotune_cache[cache_key]
@@ -1321,6 +1345,7 @@ def _ffpa_attn_forward_impl(
   philox_seed: int = 0,
   philox_offset: int = 0,
   enable_tma: bool = False,
+  enable_ws: bool = False,
 ) -> None:
   """Run the Triton FFPA Split-D forward kernel.
 
@@ -1354,6 +1379,8 @@ def _ffpa_attn_forward_impl(
   :param enable_tma: Whether the experimental SM90+ TMA forward path may be
       used. Defaults to ``False``. The SM90 path is silently skipped when
       hardware or shape preconditions are not met.
+    :param enable_ws: Whether the SM90 TMA forward path may use warp-specialized
+      configs. Defaults to ``False``.
   """
   batch, nheads_q, seqlen_q, headdim = q.shape
   _, _, seqlen_k, _ = k.shape
@@ -1370,10 +1397,10 @@ def _ffpa_attn_forward_impl(
 
   if enable_tma and num_splits == 1:
     from ._ffpa_fwd_sm90 import is_sm90_tma_forward_supported as _sm90_supported
-    from ._ffpa_fwd_sm90 import _ffpa_attn_forward_sm90_tma_impl as _sm90_impl
+    from ._ffpa_fwd_sm90 import _ffpa_attn_forward_sm90_tma_impl as _fwd_sm90_impl
 
     if _sm90_supported(q, k, v, o, num_splits=num_splits):
-      _sm90_impl(
+      _fwd_sm90_impl(
         q,
         k,
         v,
@@ -1387,6 +1414,7 @@ def _ffpa_attn_forward_impl(
         dropout_p=dropout_p,
         philox_seed=philox_seed,
         philox_offset=philox_offset,
+        enable_ws=enable_ws,
       )
       return
 
@@ -1440,6 +1468,7 @@ def _ffpa_attn_forward_triton(
   philox_seed: int = 0,
   philox_offset: int = 0,
   enable_tma: bool = False,
+  enable_ws: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
   """Call the Triton FFPA forward via registered torch op, returning ``(O, softmax_lse)``.
 
@@ -1465,6 +1494,8 @@ def _ffpa_attn_forward_triton(
     RNG layout.
   :param enable_tma: Whether the experimental SM90+ TMA forward path may be
     used. Defaults to ``False``.
+  :param enable_ws: Whether the SM90 TMA forward path may use warp-specialized
+    configs. Defaults to ``False``.
   :returns: Output tensor and softmax LSE sliced to visible shape ``[B, Nh_q, Nq]``.
   """
   if Q.stride(-1) != 1:
@@ -1489,5 +1520,6 @@ def _ffpa_attn_forward_triton(
     philox_seed,
     philox_offset,
     int(enable_tma),
+    int(enable_ws),
   )
   return O_storage, softmax_lse_storage[..., :seqlen_q]

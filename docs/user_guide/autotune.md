@@ -86,6 +86,18 @@ python -m ffpa_attn.autotune --mode fast --directions both --dtypes bf16,fp16 --
 python -m ffpa_attn.autotune --mode fast --directions both --dtypes bf16,fp16 --overwrite
 ```
 
+On SM90+ devices, add <span style="color:#c77dff;">--enable-tma</span> to generate persistent configs for the descriptor/TMA forward path. Add <span style="color:#c77dff;">--enable-ws</span> with it when you also want warp-specialized TMA forward candidates:
+
+```bash
+python -m ffpa_attn.autotune \
+	--mode fast \
+	--directions forward \
+	--dtypes bf16,fp16 \
+	--enable-tma \
+	--enable-ws \
+	--overwrite
+```
+
 ### Output Location
 
 The default output directory is the package config directory:

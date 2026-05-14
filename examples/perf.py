@@ -209,6 +209,11 @@ def _parse_args() -> argparse.Namespace:
     help="Enable experimental SM90+ TMA forward path (silently falls back on unsupported devices).",
   )
   parser.add_argument(
+    "--enable-ws",
+    action="store_true",
+    help="Force warp-specialized configs for the experimental SM90+ TMA forward path.",
+  )
+  parser.add_argument(
     "--grad-v-storage-dtype",
     "--grad-v-dtype",
     choices=["none", "fp32"],
@@ -901,6 +906,7 @@ def _benchmark_rows(args: argparse.Namespace) -> tuple[list[RESULT_ROW], list[RE
         iters=args.iters,
         print_results=True,
         enable_tma=args.enable_tma,
+        enable_ws=args.enable_ws,
       ),
     )
   if args.backward:

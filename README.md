@@ -29,8 +29,6 @@ pip3 install -U ffpa-attn # (support: sm_{80,...,120})
 git clone https://github.com/xlite-dev/ffpa-attn.git
 # Then, build the wheel package (Triton backend only)
 cd ffpa-attn && pip3 install -e . --no-build-isolation
-# Optional: build the whl with Triton and CUDA backends
-ENABLE_FFPA_CUDA_IMPL=1 MAX_JOBS=8 pip3 install -e .
 ```
 
 Then, try to accelerate the attention for large headdim with just <i><b>one-line</b></i> of code:
@@ -66,9 +64,7 @@ We extend FlashAttention to support large headdim ($D>256$) via **fine-grained t
 Runnable examples are provided under [`examples`](./examples). The performance benchmark for the 5090 with large headdim (D=320~1024) is shown below. Please refer to our [`examples`](./examples) for more details.
 
 <div align='center'>
-  <img src='./docs/assets/perf/ffpa_speedup_nvidia-geforce-rtx-5090_B1_H32_N8192_D320.png' width='750px'>
   <img src='./docs/assets/perf/ffpa_speedup_nvidia-geforce-rtx-5090_B1_H32_N8192_D320_T.png' width='750px'>
-  <img src='./docs/assets/perf/ffpa_speedup_nvidia-geforce-rtx-5090_B1_H32_N8192_D512.png' width='750px'>
   <img src='./docs/assets/perf/ffpa_speedup_nvidia-geforce-rtx-5090_B1_H32_N8192_D512_T.png' width='750px'>
 </div>
 

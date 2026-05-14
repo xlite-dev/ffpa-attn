@@ -269,6 +269,8 @@ def test_ffpa_bwd_triton_internal_v_storage_dtype_option(dtype):
     0.0,
     0,
     0,
+    0,
+    0,
   )
 
   dq_default, dk_default, dv_default, _ = torch.ops.ffpa_attn._bwd_triton(
