@@ -169,7 +169,7 @@ torch.library.define(
   "(Tensor dO, Tensor q, Tensor k, Tensor v, Tensor o, Tensor lse, Tensor? attn_bias, "
   "float softmax_scale, int causal, int autotune, "
   "int autotune_mode_is_max, int preprocess_d_chunk, int return_attn_bias_grad, int grad_v_storage_dtype_is_fp32, "
-  "int original_nheads_kv, float dropout_p, int philox_seed, int philox_offset) "
+  "int original_nheads_kv, float dropout_p, int philox_seed, int philox_offset, int enable_tma, int enable_ws) "
   "-> (Tensor dq, Tensor dk, Tensor dv, Tensor grad_attn_bias)",
 )
 
@@ -194,6 +194,8 @@ def _bwd_triton_torch_op(
   dropout_p: float,
   philox_seed: int,
   philox_offset: int,
+  enable_tma: int,
+  enable_ws: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
   from ._ffpa_bwd import _ffpa_attn_backward_triton_impl as _triton_bwd_kernel
 
@@ -230,6 +232,8 @@ def _bwd_triton_torch_op(
     dropout_p=dropout_p,
     philox_seed=philox_seed,
     philox_offset=philox_offset,
+    enable_tma=bool(enable_tma),
+    enable_ws=bool(enable_ws),
   )
   return dq, dk, dv, grad_attn_bias
 
@@ -254,6 +258,8 @@ def _bwd_triton_fake(
   dropout_p: float,
   philox_seed: int,
   philox_offset: int,
+  enable_tma: int,
+  enable_ws: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
   del (
     softmax_scale,
@@ -265,6 +271,8 @@ def _bwd_triton_fake(
     dropout_p,
     philox_seed,
     philox_offset,
+    enable_tma,
+    enable_ws,
   )
   grad_v_storage_dtype = torch.float32 if grad_v_storage_dtype_is_fp32 else None
   if attn_bias is not None and return_attn_bias_grad:

@@ -30,6 +30,10 @@ from ffpa_attn.triton._ffpa_bwd import (
   _get_decode_bwd_stage1_autotune,
   _get_pre_autotune,
 )
+from ffpa_attn.triton._ffpa_bwd_sm90 import (
+  _get_bwd_sm90_autotune,
+  is_sm90_tma_backward_supported,
+)
 from ffpa_attn.triton._ffpa_fwd import (
   _get_decode_fwd_stage1_autotune,
   _get_decode_num_splits,
@@ -556,9 +560,22 @@ def _tune_backward(
   batch: int,
   mode: str,
   entries: dict[tuple[Any, ...], dict[str, Any]],
+  enable_tma: bool = False,
+  enable_ws: bool = False,
 ) -> list[tuple[dict[str, Any], int]]:
   q, k, v = _make_tensors(task, batch)
   attn_bias = _make_attn_bias(task)
+  use_sm90_tma = enable_tma and is_sm90_tma_backward_supported(
+    q,
+    k,
+    v,
+    q,
+    q,
+    k,
+    v,
+    seqlen_q=task.seqlen_q,
+  )
+  use_sm90_ws = use_sm90_tma and enable_ws
   if task.has_dropout:
     torch.manual_seed(_TUNE_SEED + 17)
   out = ffpa_attn_func(
@@ -573,6 +590,8 @@ def _tune_backward(
     backward_backend="triton",
     triton_autotune=True,
     triton_autotune_mode=mode,
+    enable_tma=use_sm90_tma,
+    enable_ws=use_sm90_ws,
   )
   out.float().sum().backward()
 
@@ -618,12 +637,25 @@ def _tune_backward(
     })
     choices_count = len(wrapper.configs)
   else:
-    wrapper = _get_bwd_autotune(task.headdim, mode, task.has_attn_bias)
+    if use_sm90_tma:
+      wrapper = _get_bwd_sm90_autotune(
+        task.headdim,
+        mode,
+        _dtype_schema_name(task.dtype),
+        task.has_attn_bias,
+        enable_ws=use_sm90_ws,
+      )
+      kernel = "bwd_sm90_generic"
+    else:
+      wrapper = _get_bwd_autotune(task.headdim, mode, task.has_attn_bias)
+      kernel = "bwd_generic"
     entry = _entry_base(
       task,
       mode,
-      "bwd_generic",
+      kernel,
       config_from_triton_config(wrapper.best_config),
+      enable_tma=use_sm90_tma,
+      enable_ws=use_sm90_ws,
     )
     entry.update({
       "bias_grad": task.has_attn_bias,
@@ -799,7 +831,14 @@ def main() -> int:
             enable_ws=args.enable_ws,
           )
         else:
-          tuned_entries = _tune_backward(task, args.B, args.mode, entries)
+          tuned_entries = _tune_backward(
+            task,
+            args.B,
+            args.mode,
+            entries,
+            enable_tma=args.enable_tma,
+            enable_ws=args.enable_ws,
+          )
         torch.cuda.synchronize()
         elapsed = time.perf_counter() - start_time
         total_elapsed = time.perf_counter() - tune_start_time

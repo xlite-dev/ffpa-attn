@@ -585,6 +585,8 @@ class _FFPAAttnFunc(torch.autograd.Function):
           dropout_p=meta.dropout_p,
           philox_seed=int(rng_state[0].item()) if rng_state.numel() else 0,
           philox_offset=int(rng_state[1].item()) if rng_state.numel() else 0,
+          enable_tma=bool(meta.enable_tma),
+          enable_ws=bool(meta.enable_ws),
         )
       else:
         dq, dk, dv, grad_attn_bias = _aten_efficient_attn_backward(

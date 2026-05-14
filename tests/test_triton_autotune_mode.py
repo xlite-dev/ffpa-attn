@@ -7,7 +7,7 @@ import torch
 import triton
 
 import ffpa_attn.autotune as autotune_module
-from ffpa_attn.autotune import TuneTask, _build_payload, _iter_backward_tasks, _iter_forward_tasks, _tune_forward
+from ffpa_attn.autotune import TuneTask, _build_payload, _iter_backward_tasks, _iter_forward_tasks, _tune_backward, _tune_forward
 from ffpa_attn.functional import FFPAAttnMeta
 from ffpa_attn.triton._autotune_utils import autotune_seqlen_key, bucket_autotune_seqlen, exact_autotune_seqlen_keys
 from ffpa_attn.triton._ffpa_bwd import (
@@ -15,6 +15,10 @@ from ffpa_attn.triton._ffpa_bwd import (
   _gen_decode_bwd_stage1_autotune_configs,
   _gen_pre_autotune_configs,
   _get_pre_autotune,
+)
+from ffpa_attn.triton._ffpa_bwd_sm90 import (
+  _gen_bwd_sm90_autotune_configs,
+  _get_bwd_sm90_autotune,
 )
 from ffpa_attn.triton._persistent_autotune import config_from_triton_config
 from ffpa_attn.triton._ffpa_fwd import (
@@ -290,11 +294,72 @@ def test_bwd_max_mode_matches_fast_kernel_search_below_sm90(monkeypatch):
           for config in max_configs] == [config_from_triton_config(config) for config in fast]
 
 
+def test_sm90_bwd_tma_configs_are_tma_only_in_phase1(monkeypatch):
+  monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: (9, 0))
+  fast = _gen_bwd_sm90_autotune_configs(512, autotune_mode="fast", enable_ws=False)
+  max_configs = _gen_bwd_sm90_autotune_configs(512, autotune_mode="max", enable_ws=False)
+  serialized = [config_from_triton_config(config) for config in fast]
+  max_serialized = [config_from_triton_config(config) for config in max_configs]
+
+  assert len(fast) < len(max_configs)
+  assert {config["warp_specialize"] for config in serialized} == {False}
+  assert {config["BLOCK_N"] for config in serialized} == {64}
+  assert {config["BLOCK_HEADDIM"] for config in max_serialized} == {64, 128, 256}
+  assert {config["num_stages"] for config in max_serialized} == {2, 3}
+
+
+def test_persistent_tune_backward_records_sm90_tma_config(monkeypatch):
+  task = TuneTask("backward", torch.float16, 320, 512, 512, False, 8, 8)
+  q = torch.empty(1, 8, 512, 320, requires_grad=True)
+  k = torch.empty_like(q, requires_grad=True)
+  v = torch.empty_like(q, requires_grad=True)
+  pre_config = triton.Config({"BLOCK_M": 128, "BLOCK_HEADDIM": 512, "D_CHUNK": False}, num_warps=8, num_stages=2)
+  bwd_config = triton.Config(
+    {
+      "BLOCK_M": 64,
+      "BLOCK_N": 64,
+      "BLOCK_HEADDIM": 64,
+      "warp_specialize": False,
+    },
+    num_warps=4,
+    num_stages=2,
+  )
+  pre_wrapper = SimpleNamespace(best_config=pre_config, configs=[pre_config])
+  bwd_wrapper = SimpleNamespace(best_config=bwd_config, configs=[bwd_config])
+  seen_kwargs = {}
+
+  def fake_ffpa_attn_func(*args, **kwargs):
+    del args
+    seen_kwargs.update(kwargs)
+    return q * 1.0
+
+  monkeypatch.setattr(autotune_module, "_make_tensors", lambda task, batch: (q, k, v))
+  monkeypatch.setattr(autotune_module, "_make_attn_bias", lambda task: None)
+  monkeypatch.setattr(autotune_module, "is_sm90_tma_backward_supported", lambda *args, **kwargs: True)
+  monkeypatch.setattr(autotune_module, "ffpa_attn_func", fake_ffpa_attn_func)
+  monkeypatch.setattr(autotune_module, "_get_pre_autotune", lambda *args, **kwargs: pre_wrapper)
+  monkeypatch.setattr(autotune_module, "_get_bwd_sm90_autotune", lambda *args, **kwargs: bwd_wrapper)
+
+  entries = {}
+  tuned_entries = _tune_backward(task, 1, "fast", entries, enable_tma=True, enable_ws=False)
+
+  assert len(tuned_entries) == 2
+  entry = tuned_entries[1][0]
+  assert entry["kernel"] == "bwd_sm90_generic"
+  assert entry["enable_tma"] is True
+  assert entry["enable_ws"] is False
+  assert entry["config"]["warp_specialize"] is False
+  assert seen_kwargs["enable_tma"] is True
+  assert seen_kwargs["enable_ws"] is False
+  assert list(entries.values())[-1] == entry
+
+
 def test_forward_autotune_keys_include_causal():
   expected_keys = {"autotune_seqlen_q_bucket", "autotune_seqlen_k_bucket", "autotune_causal_key"}
   assert expected_keys <= set(_get_fwd_autotune(320, "fast", "bf16").keys)
   assert expected_keys <= set(_get_fwd_sm90_autotune(320, "fast", "bf16", enable_ws=False).keys)
   assert expected_keys <= set(_get_decode_fwd_stage1_autotune(320, True, "fast", "bf16").keys)
+  assert expected_keys <= set(_get_bwd_sm90_autotune(320, "fast", "bf16", False, enable_ws=False).keys)
 
 
 def test_autotune_wrappers_are_dtype_scoped():
