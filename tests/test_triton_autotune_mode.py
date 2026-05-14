@@ -132,7 +132,7 @@ def test_sm90_fwd_configs_can_disable_warp_specialize():
   assert {config["warp_specialize"] for config in serialized} == {False}
 
 
-def test_persistent_payload_records_generation_options(monkeypatch):
+def test_persistent_payload_records_hardware_desc(monkeypatch):
   monkeypatch.setattr(autotune_module.torch.cuda, "current_device", lambda: 0)
   monkeypatch.setattr(autotune_module.torch.cuda, "get_device_name", lambda device=0: "NVIDIA L20")
 
@@ -143,9 +143,10 @@ def test_persistent_payload_records_generation_options(monkeypatch):
   monkeypatch.setattr(autotune_module.torch.cuda, "get_device_properties", lambda device=0: Props())
   payload = _build_payload([], "fast", 1, 32, False, [512], enable_tma=True, enable_ws=True)
 
-  assert payload["generation_options"] == {"enable_tma": True, "enable_ws": True}
+  assert payload["hardware_desc"] == {"enable_tma": True, "enable_ws": True}
   assert "enable_tma" not in payload
   assert "enable_ws" not in payload
+  assert "generation_options" not in payload
 
 
 def test_persistent_tune_forward_records_sm90_tma_config(monkeypatch):

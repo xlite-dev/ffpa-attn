@@ -630,7 +630,7 @@ def _build_payload(
     "B": batch,
     "H": heads,
     "full_tasks": full_tasks,
-    "generation_options": {
+    "hardware_desc": {
       "enable_tma": enable_tma,
       "enable_ws": enable_ws,
     },

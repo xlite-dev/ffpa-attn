@@ -346,10 +346,12 @@ def _ffpa_fwd_sm90_kernel_impl(
         NUM_V_GROUPS,
       )
 
-  # Phase 4: Epilogue - write O via descriptor when aligned, raw pointer otherwise
-  # TMA descriptor stores may not correctly clip partial rows on all
-  # Triton versions; use a masked raw-pointer store for non-aligned seqlen
-  # to guarantee correctness.
+  # Phase 4: Epilogue - write O via descriptor when aligned, raw pointer otherwise.
+  # TensorDescriptor.store ignores offsets outside the descriptor's global
+  # [B*H*N, D] bounds, but it cannot see the per-head seqlen_q boundary. On a
+  # partial final M block, rows with offs_m >= seqlen_q may still be inside the
+  # flattened descriptor and alias the next head/batch rows, so non-aligned
+  # seqlen_q still needs an explicit raw-pointer mask.
   if EVEN_M:
     for v_group in tl.static_range(0, NUM_V_GROUPS):
       o_d_start = BLOCK_HEADDIM_V * v_group
