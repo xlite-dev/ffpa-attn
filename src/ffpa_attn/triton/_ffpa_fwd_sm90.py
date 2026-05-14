@@ -260,6 +260,8 @@ _SM90_DEFAULT_CONFIG = {
   "BLOCK_N": 128,
   "BLOCK_HEADDIM_QK": 64,
   "BLOCK_HEADDIM_V": 64,
+  # Fixed-launch fallback is non-WS by default, so launch num_stages=3 does
+  # not hit the WS resource path that forced warp-specialized configs to 2.
   "warp_specialize": False,
   "num_warps": 4,
   "num_stages": 3,
