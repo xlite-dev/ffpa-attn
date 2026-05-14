@@ -24,6 +24,7 @@ from ffpa_attn import __version__, ffpa_attn_func
 from ffpa_attn.triton._autotune_utils import autotune_seqlen_key, exact_autotune_seqlen_keys
 from ffpa_attn.triton._ffpa_bwd import _get_bwd_autotune, _get_decode_bwd_stage1_autotune, _get_pre_autotune
 from ffpa_attn.triton._ffpa_fwd import _get_decode_fwd_stage1_autotune, _get_decode_num_splits, _get_fwd_autotune
+from ffpa_attn.triton._ffpa_fwd_sm90 import _get_fwd_sm90_autotune, is_sm90_tma_forward_supported
 from ffpa_attn.triton._persistent_autotune import (
   DEFAULT_HEADDIMS,
   DEFAULT_SEQLENS,
@@ -331,9 +332,14 @@ def _tune_forward(
   batch: int,
   mode: str,
   entries: dict[tuple[Any, ...], dict[str, Any]],
+  enable_tma: bool = False,
+  enable_ws: bool = False,
 ) -> list[tuple[dict[str, Any], int]]:
   q, k, v = _make_tensors(task, batch)
   attn_bias = _make_attn_bias(task)
+  num_splits = _get_decode_num_splits(task.seqlen_q, task.seqlen_k, task.headdim, batch, task.nheads_q, q.device)
+  use_sm90_tma = enable_tma and is_sm90_tma_forward_supported(q, k, v, torch.empty_like(q), num_splits=num_splits)
+  use_sm90_ws = use_sm90_tma and enable_ws
   if task.has_dropout:
     torch.manual_seed(_TUNE_SEED + 17)
   out = ffpa_attn_func(
@@ -347,10 +353,16 @@ def _tune_forward(
     forward_backend="triton",
     triton_autotune=True,
     triton_autotune_mode=mode,
+    enable_tma=use_sm90_tma,
+    enable_ws=use_sm90_ws,
   )
   del out
-  num_splits = _get_decode_num_splits(task.seqlen_q, task.seqlen_k, task.headdim, batch, task.nheads_q, q.device)
-  if num_splits == 1:
+  if use_sm90_tma:
+    wrapper = _get_fwd_sm90_autotune(task.headdim, mode, _dtype_schema_name(task.dtype), enable_ws=use_sm90_ws)
+    kernel = "fwd_sm90_generic"
+    entry = _entry_base(task, mode, kernel, config_from_triton_config(wrapper.best_config))
+    choices_count = len(wrapper.configs)
+  elif num_splits == 1:
     wrapper = _get_fwd_autotune(task.headdim, mode, _dtype_schema_name(task.dtype))
     kernel = "fwd_generic"
     entry = _entry_base(task, mode, kernel, config_from_triton_config(wrapper.best_config))
@@ -427,7 +439,14 @@ def _tune_backward(
 
 
 def _build_payload(
-  entries: list[dict[str, Any]], mode: str, batch: int, heads: int, full_tasks: bool, seqlens: list[int]
+  entries: list[dict[str, Any]],
+  mode: str,
+  batch: int,
+  heads: int,
+  full_tasks: bool,
+  seqlens: list[int],
+  enable_tma: bool,
+  enable_ws: bool,
 ) -> dict[str, Any]:
   device_index = torch.cuda.current_device()
   device_name = torch.cuda.get_device_name(device_index)
@@ -445,6 +464,10 @@ def _build_payload(
     "B": batch,
     "H": heads,
     "full_tasks": full_tasks,
+    "generation_options": {
+      "enable_tma": enable_tma,
+      "enable_ws": enable_ws,
+    },
     "tune_grid": {
       "headdims": DEFAULT_HEADDIMS,
       "seqlens": seqlens,
@@ -466,6 +489,16 @@ def _parse_args() -> argparse.Namespace:
   )
   parser.add_argument(
     "--dtypes", type=_parse_dtypes, default=[torch.bfloat16], help="Comma-separated dtypes: bf16,fp16."
+  )
+  parser.add_argument(
+    "--enable-tma",
+    action="store_true",
+    help="Generate persistent configs for the SM90+ TMA forward path when supported.",
+  )
+  parser.add_argument(
+    "--enable-ws",
+    action="store_true",
+    help="Allow warp-specialized SM90+ TMA forward configs when --enable-tma is set.",
   )
   parser.add_argument("--overwrite", action="store_true", help="Overwrite an existing device config JSON.")
   parser.add_argument("--output-dir", type=Path, default=None, help="Directory for generated device JSON.")
@@ -520,7 +553,9 @@ def main() -> int:
       try:
         start_time = time.perf_counter()
         if task.direction == "forward":
-          tuned_entries = _tune_forward(task, args.B, args.mode, entries)
+          tuned_entries = _tune_forward(
+            task, args.B, args.mode, entries, enable_tma=args.enable_tma, enable_ws=args.enable_ws
+          )
         else:
           tuned_entries = _tune_backward(task, args.B, args.mode, entries)
         torch.cuda.synchronize()
@@ -567,7 +602,9 @@ def main() -> int:
       item.get("has_dropout", False),
     )
   )
-  payload = _build_payload(ordered_entries, args.mode, args.B, args.H, args.full_tasks, seqlens)
+  payload = _build_payload(
+    ordered_entries, args.mode, args.B, args.H, args.full_tasks, seqlens, args.enable_tma, args.enable_ws
+  )
   write_config_file(payload, output_path, overwrite=args.overwrite)
   logger.info("Wrote %d tuned config entries to %s", len(ordered_entries), output_path)
   return 0

@@ -308,8 +308,9 @@ def test_ffpa_attn_func_large_d_keeps_selected_backend(monkeypatch, forward_back
     philox_seed=0,
     philox_offset=0,
     enable_tma=False,
+    enable_ws=False,
   ):
-    del o_in, causal, softmax_scale, autotune, autotune_mode, attn_bias, dropout_p, philox_seed, philox_offset, enable_tma
+    del o_in, causal, softmax_scale, autotune, autotune_mode, attn_bias, dropout_p, philox_seed, philox_offset, enable_tma, enable_ws
     called["triton"] += 1
     out = q_in + k_in + v_in
     lse = torch.zeros(q_in.size(0), q_in.size(1), q_in.size(2), device=q_in.device)
@@ -351,8 +352,9 @@ def test_ffpa_attn_func_large_d_defaults_to_triton(monkeypatch):
     philox_seed=0,
     philox_offset=0,
     enable_tma=False,
+    enable_ws=False,
   ):
-    del o_in, causal, softmax_scale, autotune, autotune_mode, attn_bias, dropout_p, philox_seed, philox_offset, enable_tma
+    del o_in, causal, softmax_scale, autotune, autotune_mode, attn_bias, dropout_p, philox_seed, philox_offset, enable_tma, enable_ws
     called["triton"] += 1
     out = q_in + k_in + v_in
     lse = torch.zeros(q_in.size(0), q_in.size(1), q_in.size(2), device=q_in.device)
@@ -385,8 +387,9 @@ def test_ffpa_attn_func_backward_autotune_enables_saved_forward_autotune(monkeyp
     philox_seed=0,
     philox_offset=0,
     enable_tma=False,
+    enable_ws=False,
   ):
-    del k_in, v_in, causal, softmax_scale, autotune_mode, attn_bias, dropout_p, philox_seed, philox_offset, enable_tma
+    del k_in, v_in, causal, softmax_scale, autotune_mode, attn_bias, dropout_p, philox_seed, philox_offset, enable_tma, enable_ws
     seen_autotune.append(autotune)
     return torch.empty_like(o_in), torch.empty(q_in.shape[:-1], dtype=torch.float32, device=q_in.device)
 

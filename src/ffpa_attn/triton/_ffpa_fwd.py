@@ -1321,6 +1321,7 @@ def _ffpa_attn_forward_impl(
   philox_seed: int = 0,
   philox_offset: int = 0,
   enable_tma: bool = False,
+  enable_ws: bool = False,
 ) -> None:
   """Run the Triton FFPA Split-D forward kernel.
 
@@ -1354,6 +1355,8 @@ def _ffpa_attn_forward_impl(
   :param enable_tma: Whether the experimental SM90+ TMA forward path may be
       used. Defaults to ``False``. The SM90 path is silently skipped when
       hardware or shape preconditions are not met.
+    :param enable_ws: Whether the SM90 TMA forward path may use warp-specialized
+      configs. Defaults to ``False``.
   """
   batch, nheads_q, seqlen_q, headdim = q.shape
   _, _, seqlen_k, _ = k.shape
@@ -1387,6 +1390,7 @@ def _ffpa_attn_forward_impl(
         dropout_p=dropout_p,
         philox_seed=philox_seed,
         philox_offset=philox_offset,
+        enable_ws=enable_ws,
       )
       return
 
@@ -1440,6 +1444,7 @@ def _ffpa_attn_forward_triton(
   philox_seed: int = 0,
   philox_offset: int = 0,
   enable_tma: bool = False,
+  enable_ws: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
   """Call the Triton FFPA forward via registered torch op, returning ``(O, softmax_lse)``.
 
@@ -1465,6 +1470,8 @@ def _ffpa_attn_forward_triton(
     RNG layout.
   :param enable_tma: Whether the experimental SM90+ TMA forward path may be
     used. Defaults to ``False``.
+  :param enable_ws: Whether the SM90 TMA forward path may use warp-specialized
+    configs. Defaults to ``False``.
   :returns: Output tensor and softmax LSE sliced to visible shape ``[B, Nh_q, Nq]``.
   """
   if Q.stride(-1) != 1:
@@ -1489,5 +1496,6 @@ def _ffpa_attn_forward_triton(
     philox_seed,
     philox_offset,
     int(enable_tma),
+    int(enable_ws),
   )
   return O_storage, softmax_lse_storage[..., :seqlen_q]

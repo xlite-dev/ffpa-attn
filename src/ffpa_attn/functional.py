@@ -35,6 +35,7 @@ _FFPA_ATTN_IMPL_DEFAULTS: dict[str, object] = {
   "stages": 2,
   "acc": "f32",
   "enable_tma": False,
+  "enable_ws": False,
   "high_precision_grad": False,
   "forward_backend": "triton",
   "triton_autotune": False,
@@ -183,6 +184,8 @@ class FFPAAttnMeta:
     Only effective when ``forward_backend='triton'`` and the device capability
     is >= 9.  Falls back silently to the standard Triton forward otherwise.
     Defaults to ``False``.
+  :param enable_ws: Allow warp-specialized SM90 TMA Triton forward configs.
+    Only effective with ``enable_tma=True``. Defaults to ``False``.
   :param dropout_p: Dropout probability (default 0.0).
   :param is_grad_enabled: Grad-mode state captured at the public API.
   :param high_precision_grad: Whether SDPA backward should upcast.
@@ -203,6 +206,7 @@ class FFPAAttnMeta:
   stages: int
   acc: int
   enable_tma: int
+  enable_ws: int
   dropout_p: float
   is_grad_enabled: bool
   high_precision_grad: bool
@@ -233,6 +237,7 @@ class FFPAAttnMeta:
     stages = int(impl_options["stages"])
     acc_str = impl_options["acc"]
     enable_tma = int(bool(impl_options["enable_tma"]))
+    enable_ws = int(bool(impl_options["enable_ws"]))
     high_precision_grad = bool(impl_options["high_precision_grad"])
     forward_backend = str(impl_options["forward_backend"])
     triton_autotune = bool(impl_options["triton_autotune"])
@@ -271,6 +276,7 @@ class FFPAAttnMeta:
       acc=acc,
       stages=stages,
       enable_tma=enable_tma,
+      enable_ws=enable_ws,
       high_precision_grad=high_precision_grad,
       forward_backend=forward_backend,
       triton_autotune=triton_autotune,
@@ -522,6 +528,7 @@ class _FFPAAttnFunc(torch.autograd.Function):
         int(rng_state[0].item()) if rng_state.numel() else 0,
         int(rng_state[1].item()) if rng_state.numel() else 0,
         bool(meta.enable_tma),
+        bool(meta.enable_ws),
       )
     else:
       raise ValueError(f"Unsupported forward_backend={meta.forward_backend!r};")

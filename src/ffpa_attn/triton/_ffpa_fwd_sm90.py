@@ -1,8 +1,8 @@
 """SM90+ Triton forward entry points for experimental TMA kernels.
 
 This module provides an SM90-specialized forward path that replaces raw-pointer
-memory access with TMA descriptor loads/stores.  Phase 1 (current) uses a
-non-warp-specialized kernel; warp specialization will be added in a later phase.
+memory access with TMA descriptor loads/stores and can enable Triton's warp
+specialized TMA pipeline on supported configs.
 
 Design
 ------
@@ -47,8 +47,8 @@ _SM90_FWD_HEURISTICS = {
 def _sm90_host_descriptor_pre_hook(nargs):
   """Set per-descriptor block shapes before a TMA kernel launch.
 
-    Called as a ``pre_hook`` on :class:`triton.Config` so that each autotune
-    candidate updates the block shape to match its compile-time tile sizes.
+  Called as a ``pre_hook`` on :class:`triton.Config` so that each autotune
+  candidate updates the block shape to match its compile-time tile sizes.
   """
   if not isinstance(nargs.get("desc_q"), TensorDescriptor):
     return
@@ -80,12 +80,10 @@ def _ffpa_fwd_sm90_kernel_impl(
   stride_bh: int,
   stride_bm: int,
   stride_bn: int,
-  y_dim_q: int,
-  y_dim_kv: int,
   nheads_q: int,
   nheads_kv: int,
-  seqlen_q: int,
-  seqlen_k: int,
+  seqlen_q: tl.constexpr,
+  seqlen_k: tl.constexpr,
   seqlen_q_bucket: int,
   seqlen_k_bucket: int,
   autotune_causal_key: int,
@@ -105,12 +103,13 @@ def _ffpa_fwd_sm90_kernel_impl(
   BLOCK_HEADDIM_QK: tl.constexpr,
   BLOCK_HEADDIM_V: tl.constexpr,
   NUM_V_GROUPS: tl.constexpr,
+  warp_specialize: tl.constexpr,
 ) -> None:
   """TMA-descriptor variant of the Split-D FFPA generic forward kernel.
 
-    Identical algorithm to ``_ffpa_fwd_kernel_impl`` with Q / K / V / O
-    pointer arithmetic replaced by ``desc.load`` / ``desc.store`` calls.
-    LSE and attn_bias stay on raw pointers.
+  Identical algorithm to ``_ffpa_fwd_kernel_impl`` with Q / K / V / O
+  pointer arithmetic replaced by ``desc.load`` / ``desc.store`` calls.
+  LSE and attn_bias stay on raw pointers.
   """
   start_m = tl.program_id(0)
   off_hb = tl.program_id(1)
@@ -119,7 +118,7 @@ def _ffpa_fwd_sm90_kernel_impl(
   group_size = nheads_q // nheads_kv
   off_hkv = off_hq // group_size
 
-  # --- per-program offsets ---
+  # per-program offsets
   q_base_y = (off_b * nheads_q + off_hq) * seqlen_q
   kv_base_y = (off_b * nheads_kv + off_hkv) * seqlen_k
   q_offset_y = q_base_y + start_m * BLOCK_M
@@ -130,31 +129,57 @@ def _ffpa_fwd_sm90_kernel_impl(
   if HAS_ATTN_BIAS:
     AttnBias += off_b * stride_bb + off_hq * stride_bh
 
-  # --- arange helpers ---
+  # arange helpers
   offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
   offs_n = tl.arange(0, BLOCK_N)
 
   num_qk_d_chunks = tl.cdiv(HEADDIM, BLOCK_HEADDIM_QK)
   kv_offset = seqlen_k - seqlen_q
 
-  # --- online softmax state ---
+  # Online softmax state
   m_i = tl.full([BLOCK_M], -float("inf"), dtype=tl.float32)
   l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
   zero_acc = tl.zeros([BLOCK_M, BLOCK_HEADDIM_V], dtype=tl.float32)
+  # Reuse the same softmax tile for all V slices, matching FFPA CUDA fwd:
+  # R_D[j] = alpha * R_D[j] + P @ V_j. This avoids recomputing QK/softmax
+  # per output head-dim group while keeping Split-D register pressure bounded.
   o_accs = (zero_acc, ) * NUM_V_GROUPS
 
   end_n = seqlen_k
   if IS_CAUSAL:
     end_n = tl.minimum(seqlen_k, (start_m + 1) * BLOCK_M + kv_offset)
 
-  # --- KV loop ---
-  for start_n in range(0, end_n, BLOCK_N):
+  # KV loop / warp-specialization boundary.
+  # num_stages=2 keeps the TMA pipeline shallow enough for the validated WS
+  # tiles; deeper staging is more resource-sensitive here.
+  # disallow_acc_multi_buffer=True is needed for the Split-D accumulator shape.
+  # The total fp32 state is comparable to a FA2-style [BLOCK_M, HEAD_DIM] acc,
+  # but here Triton sees multiple loop-carried dot accumulators in o_accs plus
+  # QK split-D dot sites. Letting it multi-buffer those independent accumulators
+  # makes WS partitioning/resource use much less stable on the validated tiles.
+  # flatten=True gives Triton's WS partitioner a single flattened loop body.
+  # warp_specialize follows the selected config; False keeps this as a normal
+  # software-pipelined loop without producer/consumer warp partitioning.
+  for start_n in tl.range(
+    0,
+    end_n,
+    BLOCK_N,
+    num_stages=2,
+    disallow_acc_multi_buffer=True,
+    flatten=True,
+    warp_specialize=warp_specialize,
+  ):
     start_n = tl.multiple_of(start_n, BLOCK_N)
     offs_kv = start_n + offs_n
     k_offset_y = kv_base_y + start_n
     v_offset_y = kv_base_y + start_n
 
     scores = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+    # Phase 1: QK with Split-D reduction structure
+    # Keep this as a plain head-dim reduction loop. Inner qk_d_chunk WS was
+    # correct in testing but slower: the loop has a short trip count, carries
+    # a serial scores dependency, and excludes the softmax + V/P@V work that
+    # gives the outer KV loop enough work to amortize producer/consumer splits.
     for qk_d_chunk in range(num_qk_d_chunks):
       qk_d_start = qk_d_chunk * BLOCK_HEADDIM_QK
       # TMA descriptor loads — OOB elements return 0 automatically
@@ -177,7 +202,7 @@ def _ffpa_fwd_sm90_kernel_impl(
       causal_mask = offs_kv[None, :] <= (offs_m[:, None] + kv_offset)
       scores = tl.where(causal_mask, scores, -float("inf"))
 
-    # --- online softmax merge ---
+    # Phase 2: Online softmax
     m_new = tl.maximum(m_i, tl.max(scores, axis=1))
     alpha = tl.exp(m_i - m_new)
     p = tl.exp(scores - m_new[:, None])
@@ -196,7 +221,10 @@ def _ffpa_fwd_sm90_kernel_impl(
     )
     p = p.to(DTYPE)
 
-    # --- Split-D V accumulation ---
+    # Phase 3: PV with Split-D V accumulation
+    # Reuse the same softmax tile for all V slices, matching FFPA CUDA fwd:
+    # R_D[j] = alpha * R_D[j] + P @ V_j. This avoids recomputing QK/softmax
+    # per output head-dim group while keeping Split-D register pressure bounded.
     for v_group in tl.static_range(0, NUM_V_GROUPS):
       o_d_start = BLOCK_HEADDIM_V * v_group
       v = desc_v.load([v_offset_y, o_d_start])
@@ -205,7 +233,7 @@ def _ffpa_fwd_sm90_kernel_impl(
     m_i = m_new
     l_i = l_new
 
-  # --- epilogue: write O via descriptor when aligned, raw pointer otherwise ---
+  # Phase 4: Epilogue - write O via descriptor when aligned, raw pointer otherwise
   # TMA descriptor stores may not correctly clip partial rows on all
   # Triton versions; use a masked raw-pointer store for non-aligned seqlen
   # to guarantee correctness.
@@ -232,12 +260,24 @@ _SM90_DEFAULT_CONFIG = {
   "BLOCK_N": 128,
   "BLOCK_HEADDIM_QK": 64,
   "BLOCK_HEADDIM_V": 64,
+  "warp_specialize": False,
   "num_warps": 4,
   "num_stages": 3,
 }
 
+_SM90_WS_CONFIGS = [
+  (64, 64, 64),
+  (64, 64, 128),
+  (64, 128, 64),
+  (128, 64, 64),
+]
 
-def _gen_fwd_sm90_autotune_configs(headdim: int = 256, autotune_mode: str = "max") -> list[triton.Config]:
+
+def _gen_fwd_sm90_autotune_configs(
+  headdim: int = 256,
+  autotune_mode: str = "max",
+  enable_ws: bool = True,
+) -> list[triton.Config]:
   """Generate autotune configs for the SM90 TMA forward kernel.
 
   The search space is compact: tune BLOCK_M, head-dim chunk size, warp
@@ -248,6 +288,7 @@ def _gen_fwd_sm90_autotune_configs(headdim: int = 256, autotune_mode: str = "max
   :param headdim: The actual head dimension for the target shape.
   :param autotune_mode: Triton autotune search-space mode, ``"fast"`` or
       ``"max"``.
+  :param enable_ws: Whether to include warp-specialized configs.
   :return: Triton autotune configurations for the SM90 TMA forward kernel.
   """
   _headdim_candidates = [64, 128]
@@ -268,19 +309,36 @@ def _gen_fwd_sm90_autotune_configs(headdim: int = 256, autotune_mode: str = "max
                   "BLOCK_N": block_n,
                   "BLOCK_HEADDIM_QK": block_headdim,
                   "BLOCK_HEADDIM_V": block_headdim,
+                  "warp_specialize": False,
                 },
                 num_warps=num_warps,
                 num_stages=num_stages,
                 pre_hook=_sm90_host_descriptor_pre_hook,
               )
             )
+        if enable_ws and (block_m, block_n, block_headdim) in _SM90_WS_CONFIGS:
+          for num_warps in num_warps_candidates:
+            configs.append(
+              triton.Config(
+                {
+                  "BLOCK_M": block_m,
+                  "BLOCK_N": block_n,
+                  "BLOCK_HEADDIM_QK": block_headdim,
+                  "BLOCK_HEADDIM_V": block_headdim,
+                  "warp_specialize": True,
+                },
+                num_warps=num_warps,
+                num_stages=2,
+                pre_hook=_sm90_host_descriptor_pre_hook,
+              )
+            )
   return configs
 
 
-_ffpa_fwd_sm90_autotune_cache: dict[tuple[int, str, str], callable] = {}
+_ffpa_fwd_sm90_autotune_cache: dict[tuple[int, str, str, bool], callable] = {}
 
 
-def _get_fwd_sm90_autotune(headdim: int, autotune_mode: str, dtype: str):
+def _get_fwd_sm90_autotune(headdim: int, autotune_mode: str, dtype: str, enable_ws: bool = True):
   """Return a headdim-specific autotune wrapper for the SM90 TMA kernel.
 
   Results are cached by headdim so the autotune overhead is paid at most
@@ -290,12 +348,17 @@ def _get_fwd_sm90_autotune(headdim: int, autotune_mode: str, dtype: str):
   :param autotune_mode: Triton autotune search-space mode, ``"fast"`` or
       ``"max"``.
   :param dtype: Dtype name matching :func:`dtype_name`.
+  :param enable_ws: Whether to include warp-specialized configs.
   :return: A ``triton.autotune``-wrapped version of
       ``_ffpa_fwd_sm90_kernel_impl`` tuned for ``headdim``.
   """
-  cache_key = (headdim, autotune_mode, dtype)
+  cache_key = (headdim, autotune_mode, dtype, enable_ws)
   if cache_key not in _ffpa_fwd_sm90_autotune_cache:
-    configs = _gen_fwd_sm90_autotune_configs(headdim, autotune_mode=autotune_mode)
+    configs = _gen_fwd_sm90_autotune_configs(
+      headdim,
+      autotune_mode=autotune_mode,
+      enable_ws=enable_ws,
+    )
     _ffpa_fwd_sm90_autotune_cache[cache_key] = triton.autotune(
       configs=configs,
       key=["seqlen_q_bucket", "seqlen_k_bucket", "autotune_causal_key", "HEADDIM"],
@@ -318,12 +381,13 @@ def _ffpa_attn_forward_sm90_generic_impl(
   dropout_p: float = 0.0,
   philox_seed: int = 0,
   philox_offset: int = 0,
+  enable_ws: bool = False,
 ) -> None:
   """Launch the SM90 TMA forward kernel (generic prefill path).
 
-    This is the TMA counterpart of ``_ffpa_attn_forward_generic_impl``.
-    Phase 1 uses a fixed launch config; autotune integration is deferred
-    to a later phase.
+  This is the TMA counterpart of ``_ffpa_attn_forward_generic_impl``.
+  Phase 1 uses a fixed launch config; autotune integration is deferred
+  to a later phase.
   """
   batch, nheads_q, seqlen_q, headdim = q.shape
   _, nheads_kv, seqlen_k, _ = k.shape
@@ -335,7 +399,6 @@ def _ffpa_attn_forward_sm90_generic_impl(
   attn_bias_in = attn_bias if attn_bias is not None else q
   bias_strides = _attn_bias_broadcast_strides(attn_bias, batch, nheads_q, seqlen_q, seqlen_k)
 
-  # --- choose config ---
   # When autotune is requested, the autotune wrapper (with pre_hook) manages
   # block_shape updates; the launcher only needs to pick a fallback config.
   launch_config = dict(_SM90_DEFAULT_CONFIG)
@@ -359,16 +422,22 @@ def _ffpa_attn_forward_sm90_generic_impl(
     )
     if persisted is not None:
       launch_config.update(persisted)
+    if not enable_ws:
+      launch_config["warp_specialize"] = False
 
-  # --- build descriptors ---
   y_dim_q = batch * nheads_q * seqlen_q
   y_dim_kv = batch * nheads_kv * seqlen_k
   dummy_block = [1, 1]
 
-  desc_q = TensorDescriptor(q, shape=[y_dim_q, headdim], strides=[headdim, 1], block_shape=dummy_block)
-  desc_k = TensorDescriptor(k, shape=[y_dim_kv, headdim], strides=[headdim, 1], block_shape=dummy_block)
-  desc_v = TensorDescriptor(v, shape=[y_dim_kv, headdim], strides=[headdim, 1], block_shape=dummy_block)
-  desc_o = TensorDescriptor(o, shape=[y_dim_q, headdim], strides=[headdim, 1], block_shape=dummy_block)
+  def _make_tensor_desc(x: torch.Tensor, shape: list[int]) -> TensorDescriptor:
+    # The TMA path uses TensorDescriptors for Q/K/V/O with a simple [B*H*N, D] layout
+    # shape = [B*H*N, D], strides = [D, 1] so that the kernel can index with (y, x) offsets.
+    return TensorDescriptor(x, shape=shape, strides=[shape[1], 1], block_shape=dummy_block)
+
+  desc_q = _make_tensor_desc(q, [y_dim_q, headdim])
+  desc_k = _make_tensor_desc(k, [y_dim_kv, headdim])
+  desc_v = _make_tensor_desc(v, [y_dim_kv, headdim])
+  desc_o = _make_tensor_desc(o, [y_dim_q, headdim])
 
   # For the fixed-config path we set block_shape explicitly.  The autotune
   # path leaves block_shape as dummy because the pre_hook on each Config
@@ -379,19 +448,24 @@ def _ffpa_attn_forward_sm90_generic_impl(
     desc_v.block_shape = [launch_config["BLOCK_N"], launch_config["BLOCK_HEADDIM_V"]]
     desc_o.block_shape = [launch_config["BLOCK_M"], launch_config["BLOCK_HEADDIM_V"]]
 
-  # --- TMA allocator (required for descriptor path) ---
+  # TMA allocator (required for descriptor path)
   def _tma_alloc_fn(size: int, align: int, _):
     return torch.empty(size, dtype=torch.int8, device=q.device)
 
   triton.set_allocator(_tma_alloc_fn)
 
-  # --- bucket keys (used by autotune cache key) ---
+  # bucket keys (used by autotune cache key)
   seqlen_q_bucket = autotune_seqlen_key(seqlen_q, autotune_mode)
   seqlen_k_bucket = autotune_seqlen_key(seqlen_k, autotune_mode)
   autotune_causal_key = int(causal)
 
   if autotune:
-    autotune_fn = _get_fwd_sm90_autotune(headdim, autotune_mode, dtype_name(q.dtype))
+    autotune_fn = _get_fwd_sm90_autotune(
+      headdim,
+      autotune_mode,
+      dtype_name(q.dtype),
+      enable_ws=enable_ws,
+    )
 
     def grid(meta):
       return (triton.cdiv(seqlen_q, meta["BLOCK_M"]), batch * nheads_q)
@@ -412,8 +486,6 @@ def _ffpa_attn_forward_sm90_generic_impl(
       bias_strides[1],
       bias_strides[2],
       bias_strides[3],
-      y_dim_q,
-      y_dim_kv,
       nheads_q,
       nheads_kv,
       seqlen_q,
@@ -433,7 +505,7 @@ def _ffpa_attn_forward_sm90_generic_impl(
     )
     return
 
-  # --- fixed-config launch ---
+  # fixed-config launch
   def grid(meta):
     return (triton.cdiv(seqlen_q, meta["BLOCK_M"]), batch * nheads_q)
 
@@ -453,8 +525,6 @@ def _ffpa_attn_forward_sm90_generic_impl(
     bias_strides[1],
     bias_strides[2],
     bias_strides[3],
-    y_dim_q,
-    y_dim_kv,
     nheads_q,
     nheads_kv,
     seqlen_q,
@@ -485,17 +555,17 @@ def is_sm90_tma_forward_supported(
 ) -> bool:
   """Return whether the experimental SM90 TMA forward path may run.
 
-    The caller must also pass ``enable_tma=True``; this function only checks
-    hardware / shape / dtype preconditions.  On SM < 90 (including Ada L20)
-    it returns ``False`` so the existing generic path is used silently.
+  The caller must also pass ``enable_tma=True``; this function only checks
+  hardware / shape / dtype preconditions.  On SM < 90 (including Ada L20)
+  it returns ``False`` so the existing generic path is used silently.
 
-    :param q: Query tensor in ``[B, Hq, Nq, D]`` layout.
-    :param k: Key tensor in ``[B, Hkv, Nkv, D]`` layout.
-    :param v: Value tensor in ``[B, Hkv, Nkv, D]`` layout.
-    :param o: Output tensor in ``[B, Hq, Nq, D]`` layout.
-    :param num_splits: Decode split count selected by the generic dispatcher.
-    :return: ``True`` when the call is eligible for the SM90 generic prefill
-        path; otherwise ``False`` so the caller can use the existing fallback.
+  :param q: Query tensor in ``[B, Hq, Nq, D]`` layout.
+  :param k: Key tensor in ``[B, Hkv, Nkv, D]`` layout.
+  :param v: Value tensor in ``[B, Hkv, Nkv, D]`` layout.
+  :param o: Output tensor in ``[B, Hq, Nq, D]`` layout.
+  :param num_splits: Decode split count selected by the generic dispatcher.
+  :return: ``True`` when the call is eligible for the SM90 generic prefill
+    path; otherwise ``False`` so the caller can use the existing fallback.
   """
   if num_splits != 1:
     return False
@@ -522,30 +592,31 @@ def _ffpa_attn_forward_sm90_tma_impl(
   dropout_p: float = 0.0,
   philox_seed: int = 0,
   philox_offset: int = 0,
+  enable_ws: bool = False,
 ) -> None:
   """Run the SM90 TMA forward implementation.
 
-    This is the integration scaffold for the descriptor/TMA kernel.  Phase 1
-    implements a non-warp-specialized TMA kernel that replaces raw-pointer
-    memory access with descriptor loads/stores while preserving the Split-D
-    algorithm structure.
+  This is the integration scaffold for the descriptor/TMA kernel.  Phase 1
+  implements a non-warp-specialized TMA kernel that replaces raw-pointer
+  memory access with descriptor loads/stores while preserving the Split-D
+  algorithm structure.
 
-    :param q: Query tensor in ``[B, Hq, Nq, D]`` layout.
-    :param k: Key tensor in ``[B, Hkv, Nkv, D]`` layout.
-    :param v: Value tensor in ``[B, Hkv, Nkv, D]`` layout.
-    :param o: Output tensor in ``[B, Hq, Nq, D]`` layout, written in place.
-    :param lse: Float32 LSE tensor with rounded last-dimension storage.
-    :param attn_bias: Optional additive mask broadcastable to
-        ``[B, Hq, Nq, Nkv]``.
-    :param causal: Whether to apply lower-right causal masking.
-    :param softmax_scale: Scale applied to ``Q @ K.T``.
-    :param autotune: Whether to use the Triton autotuner for the SM90 TMA path.
-    :param autotune_mode: Triton autotune search-space mode, ``"fast"`` or
-        ``"max"``.
-    :param dropout_p: Forward dropout probability.
-    :param philox_seed: Philox seed used for dropout.
-    :param philox_offset: Philox element offset used for dropout replay parity
-        with SDPA.
+  :param q: Query tensor in ``[B, Hq, Nq, D]`` layout.
+  :param k: Key tensor in ``[B, Hkv, Nkv, D]`` layout.
+  :param v: Value tensor in ``[B, Hkv, Nkv, D]`` layout.
+  :param o: Output tensor in ``[B, Hq, Nq, D]`` layout, written in place.
+  :param lse: Float32 LSE tensor with rounded last-dimension storage.
+  :param attn_bias: Optional additive mask broadcastable to
+    ``[B, Hq, Nq, Nkv]``.
+  :param causal: Whether to apply lower-right causal masking.
+  :param softmax_scale: Scale applied to ``Q @ K.T``.
+  :param autotune: Whether to use the Triton autotuner for the SM90 TMA path.
+  :param autotune_mode: Triton autotune search-space mode, ``"fast"`` or
+    ``"max"``.
+  :param dropout_p: Forward dropout probability.
+  :param philox_seed: Philox seed used for dropout.
+  :param philox_offset: Philox element offset used for dropout replay parity
+    with SDPA.
   """
   _ffpa_attn_forward_sm90_generic_impl(
     q,
@@ -561,4 +632,5 @@ def _ffpa_attn_forward_sm90_tma_impl(
     dropout_p=dropout_p,
     philox_seed=philox_seed,
     philox_offset=philox_offset,
+    enable_ws=enable_ws,
   )

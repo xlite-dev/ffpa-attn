@@ -119,14 +119,15 @@ def ffpa_attn_func(
       ``query`` and ``key``/``value`` to have the same number of heads. Pass
       ``True`` to opt into GQA/MQA semantics explicitly.
   :param kwargs: Implementation-specific options for experimentation.
-      Supported keys are ``stages``, ``acc``, ``enable_tma``,
+      Supported keys are ``stages``, ``acc``, ``enable_tma``, ``enable_ws``,
       ``high_precision_grad``, ``forward_backend``,
       ``triton_autotune``, ``triton_autotune_mode``,
       ``backward_backend``,
       ``triton_backward_preprocess_d_chunk``, and
       ``triton_backward_grad_v_storage_dtype``. ``forward_backend`` only affects ``D > 256``.
-      ``enable_tma`` is reserved for future Triton kernels and is currently a
-      no-op. ``backward_backend`` supports ``"triton"`` and ``"sdpa"``.
+      ``enable_tma`` opts into the SM90+ Triton descriptor/TMA forward path
+      when supported. ``enable_ws`` additionally allows warp-specialized TMA
+      configs. ``backward_backend`` supports ``"triton"`` and ``"sdpa"``.
       ``triton_backward_grad_v_storage_dtype`` defaults to ``None`` and
       currently only accepts ``torch.float32`` as an override for Triton
       backward's internal ``DV`` storage dtype. These options do not change

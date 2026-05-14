@@ -43,6 +43,17 @@ _KERNEL_CONFIG_KEYS = {
     "num_ctas",
     "maxnreg",
   },
+  "fwd_sm90_generic": {
+    "BLOCK_M",
+    "BLOCK_N",
+    "BLOCK_HEADDIM_QK",
+    "BLOCK_HEADDIM_V",
+    "warp_specialize",
+    "num_warps",
+    "num_stages",
+    "num_ctas",
+    "maxnreg",
+  },
   "decode_fwd_stage1": {
     "BLOCK_M",
     "BLOCK_N",
