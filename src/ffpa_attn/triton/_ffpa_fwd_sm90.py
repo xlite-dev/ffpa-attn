@@ -318,6 +318,14 @@ def _gen_fwd_sm90_autotune_configs(
             )
         if enable_ws and (block_m, block_n, block_headdim) in _SM90_WS_CONFIGS:
           for num_warps in num_warps_candidates:
+            # Keep WS launch staging at 2. Config.num_stages is a backend-wide
+            # pipeline/warpspec option, while tl.range(num_stages=2) is the
+            # local outer-KV-loop pipeline depth; they are not substitutes for
+            # each other. Raising the launch depth still changes global WS and
+            # latency/pipeline passes around this loop. Unlike the FA2 reference
+            # 2/3/4 NUM_STAGES sweep, FFPA's Split-D WS stage3 has already hit
+            # shared-memory limits on 5090 for the validated tiles, so broader
+            # staging needs explicit retesting.
             configs.append(
               triton.Config(
                 {
