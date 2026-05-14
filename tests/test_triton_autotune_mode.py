@@ -280,9 +280,10 @@ def test_bwd_max_mode_matches_fast_kernel_search_below_sm90(monkeypatch):
 
 
 def test_forward_autotune_keys_include_causal():
-  assert "autotune_causal_key" in _get_fwd_autotune(320, "fast", "bf16").keys
-  assert "autotune_causal_key" in _get_fwd_sm90_autotune(320, "fast", "bf16", enable_ws=False).keys
-  assert "autotune_causal_key" in _get_decode_fwd_stage1_autotune(320, True, "fast", "bf16").keys
+  expected_keys = {"autotune_seqlen_q_bucket", "autotune_seqlen_k_bucket", "autotune_causal_key"}
+  assert expected_keys <= set(_get_fwd_autotune(320, "fast", "bf16").keys)
+  assert expected_keys <= set(_get_fwd_sm90_autotune(320, "fast", "bf16", enable_ws=False).keys)
+  assert expected_keys <= set(_get_decode_fwd_stage1_autotune(320, True, "fast", "bf16").keys)
 
 
 def test_autotune_wrappers_are_dtype_scoped():

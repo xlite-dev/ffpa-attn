@@ -202,7 +202,10 @@ def _dropout_multiplier(
 # D_CHUNK mode the launcher/autotuner supplies the chunk size explicitly.
 _FFPA_BWD_PRE_HEURISTICS = {
   "BLOCK_HEADDIM":
-  lambda args: args["BLOCK_HEADDIM"] if args["D_CHUNK"] else max(64, triton.next_power_of_2(args["headdim"])),
+  lambda args: args["BLOCK_HEADDIM"] if args["D_CHUNK"] else max(
+    64,
+    triton.next_power_of_2(args["headdim"]),
+  ),
 }
 
 
@@ -220,9 +223,6 @@ def _ffpa_bwd_pre_impl(
   stride_dom: int,
   nheads: int,
   seqlen_q: int,
-  # Autotune buckets are passed explicitly to avoid redundant autotune
-  # runs for shapes that differ only in seqlen but fall in the same bucket.
-  # The kernel itself only uses the bucketed values.
   autotune_seqlen_q_bucket: int,
   seqlen_q_rounded: int,
   headdim: int,
@@ -489,9 +489,6 @@ def _ffpa_bwd_kernel_impl(
   nheads: int,
   seqlen_q: int,
   seqlen_k: int,
-  # Autotune buckets are passed explicitly to avoid redundant autotune
-  # runs for shapes that differ only in seqlen but fall in the same bucket.
-  # The kernel itself only uses the bucketed values.
   autotune_seqlen_q_bucket: int,
   autotune_seqlen_k_bucket: int,
   autotune_causal_key: int,
@@ -515,12 +512,14 @@ def _ffpa_bwd_kernel_impl(
   BLOCK_M: tl.constexpr,
   BLOCK_N: tl.constexpr,
 ) -> None:
-  pid = tl.program_id(0)
-  off_hb = tl.program_id(2)
+  # Keys for autotuning heuristics and persistent autotune lookup.
   _ = autotune_seqlen_q_bucket
   _ = autotune_seqlen_k_bucket
   _ = autotune_causal_key
   _ = autotune_dtype_key
+
+  pid = tl.program_id(0)
+  off_hb = tl.program_id(2)
   off_b = off_hb // nheads
   off_h = off_hb % nheads
 
@@ -993,13 +992,15 @@ def _ffpa_bwd_decode_stage1_kernel(
   BLOCK_N: tl.constexpr,
   BLOCK_HEADDIM: tl.constexpr,
 ) -> None:
-  # Decode backward splits work by K block. DK/DV are independent per K block,
-  # but dQ is a sum over all K blocks, so stage1 writes PartialDQ and the reduce
-  # kernel below performs the cross-K accumulation.
+  # Keys for autotuning heuristics and persistent autotune lookup.
   _ = autotune_seqlen_q_bucket
   _ = autotune_seqlen_k_bucket
   _ = autotune_causal_key
   _ = autotune_dtype_key
+
+  # Decode backward splits work by K block. DK/DV are independent per K block,
+  # but dQ is a sum over all K blocks, so stage1 writes PartialDQ and the reduce
+  # kernel below performs the cross-K accumulation.
   start_n_block = tl.program_id(0)
   off_hb = tl.program_id(1)
   off_b = off_hb // nheads

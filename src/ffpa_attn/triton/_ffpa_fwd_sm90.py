@@ -110,10 +110,15 @@ def _ffpa_fwd_sm90_process_kv_block(
   if not EVEN_N:
     scores = tl.where(offs_kv[None, :] < seqlen_k, scores, -float("inf"))
   if IS_CAUSAL:
+    # Lower-right causal semantics for Nq <= Nkv. Query row m can attend to
+    # key positions <= m + (Nkv - Nq), matching PyTorch SDPA.
     causal_mask = offs_kv[None, :] <= (offs_m[:, None] + kv_offset)
     scores = tl.where(causal_mask, scores, -float("inf"))
 
   # Phase 2: Online softmax.
+  # Online softmax merge for the next KV block. ``m_i`` and ``l_i`` track the
+  # row max and denominator before dropout; ``p`` is dropped only for the O
+  # accumulation, while LSE stays the undropped softmax normalizer.
   m_new = tl.maximum(m_i, tl.max(scores, axis=1))
   alpha = tl.exp(m_i - m_new)
   p = tl.exp(scores - m_new[:, None])
@@ -133,6 +138,9 @@ def _ffpa_fwd_sm90_process_kv_block(
   p = p.to(DTYPE)
 
   # Phase 3: PV with Split-D V accumulation.
+  # Reuse the same softmax tile for all V slices, matching FFPA CUDA fwd:
+  # R_D[j] = alpha * R_D[j] + P @ V_j. This avoids recomputing QK/softmax
+  # per output head-dim group while keeping Split-D register pressure bounded.
   for v_group in tl.static_range(0, NUM_V_GROUPS):
     o_d_start = BLOCK_HEADDIM_V * v_group
     v = desc_v.load([v_offset_y, o_d_start])
@@ -181,8 +189,8 @@ def _ffpa_fwd_sm90_kernel_impl(
   nheads_kv: int,
   seqlen_q: tl.constexpr,
   seqlen_k: tl.constexpr,
-  seqlen_q_bucket: int,
-  seqlen_k_bucket: int,
+  autotune_seqlen_q_bucket: int,
+  autotune_seqlen_k_bucket: int,
   autotune_causal_key: int,
   seqlen_q_rounded: int,
   dropout_p: float,
@@ -209,8 +217,8 @@ def _ffpa_fwd_sm90_kernel_impl(
   LSE and attn_bias stay on raw pointers.
   """
   # Keys for autotuning heuristics and persistent autotune lookup.
-  _ = seqlen_q_bucket
-  _ = seqlen_k_bucket
+  _ = autotune_seqlen_q_bucket
+  _ = autotune_seqlen_k_bucket
   _ = autotune_causal_key
 
   start_m = tl.program_id(0)
@@ -346,7 +354,8 @@ def _ffpa_fwd_sm90_kernel_impl(
         NUM_V_GROUPS,
       )
 
-  # Phase 4: Epilogue - write O via descriptor when aligned, raw pointer otherwise.
+  # Phase 4: Epilogue - final scale O and write O/LSE to global memory.
+  # Write O via descriptor when aligned, raw pointer otherwise.
   # TensorDescriptor.store ignores offsets outside the descriptor's global
   # [B*H*N, D] bounds, but it cannot see the per-head seqlen_q boundary. On a
   # partial final M block, rows with offs_m >= seqlen_q may still be inside the
@@ -485,7 +494,7 @@ def _get_fwd_sm90_autotune(headdim: int, autotune_mode: str, dtype: str, enable_
     )
     _ffpa_fwd_sm90_autotune_cache[cache_key] = triton.autotune(
       configs=configs,
-      key=["seqlen_q_bucket", "seqlen_k_bucket", "autotune_causal_key", "HEADDIM"],
+      key=["autotune_seqlen_q_bucket", "autotune_seqlen_k_bucket", "autotune_causal_key", "HEADDIM"],
       cache_results=True,
     )(_ffpa_fwd_sm90_kernel_impl)
   return _ffpa_fwd_sm90_autotune_cache[cache_key]
@@ -581,8 +590,8 @@ def _ffpa_attn_forward_sm90_generic_impl(
   triton.set_allocator(_tma_alloc_fn)
 
   # bucket keys (used by autotune cache key)
-  seqlen_q_bucket = autotune_seqlen_key(seqlen_q, autotune_mode)
-  seqlen_k_bucket = autotune_seqlen_key(seqlen_k, autotune_mode)
+  autotune_seqlen_q_bucket = autotune_seqlen_key(seqlen_q, autotune_mode)
+  autotune_seqlen_k_bucket = autotune_seqlen_key(seqlen_k, autotune_mode)
   autotune_causal_key = int(causal)
 
   if autotune:
@@ -616,8 +625,8 @@ def _ffpa_attn_forward_sm90_generic_impl(
       nheads_kv,
       seqlen_q,
       seqlen_k,
-      seqlen_q_bucket,
-      seqlen_k_bucket,
+      autotune_seqlen_q_bucket,
+      autotune_seqlen_k_bucket,
       autotune_causal_key,
       seqlen_q_rounded,
       dropout_p,
@@ -654,8 +663,8 @@ def _ffpa_attn_forward_sm90_generic_impl(
     nheads_kv,
     seqlen_q,
     seqlen_k,
-    seqlen_q_bucket,
-    seqlen_k_bucket,
+    autotune_seqlen_q_bucket,
+    autotune_seqlen_k_bucket,
     autotune_causal_key,
     seqlen_q_rounded,
     dropout_p,
