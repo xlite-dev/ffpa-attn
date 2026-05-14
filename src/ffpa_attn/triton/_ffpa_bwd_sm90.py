@@ -303,8 +303,8 @@ def _ffpa_bwd_sm90_kernel_impl(
 
 
 _SM90_BWD_DEFAULT_CONFIG = {
-  "BLOCK_M": 64,
-  "BLOCK_N": 128,
+  "BLOCK_M": 128,
+  "BLOCK_N": 64,
   "BLOCK_HEADDIM": 64,
   "warp_specialize": False,
   "num_warps": 8,
