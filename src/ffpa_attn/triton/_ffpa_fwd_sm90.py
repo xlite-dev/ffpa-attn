@@ -494,7 +494,12 @@ def _get_fwd_sm90_autotune(headdim: int, autotune_mode: str, dtype: str, enable_
     )
     _ffpa_fwd_sm90_autotune_cache[cache_key] = triton.autotune(
       configs=configs,
-      key=["autotune_seqlen_q_bucket", "autotune_seqlen_k_bucket", "autotune_causal_key", "HEADDIM"],
+      key=[
+        "autotune_seqlen_q_bucket",
+        "autotune_seqlen_k_bucket",
+        "autotune_causal_key",
+        "HEADDIM",
+      ],
       cache_results=True,
     )(_ffpa_fwd_sm90_kernel_impl)
   return _ffpa_fwd_sm90_autotune_cache[cache_key]

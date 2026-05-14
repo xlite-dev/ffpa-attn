@@ -1314,7 +1314,12 @@ def _get_fwd_autotune(headdim: int, autotune_mode: str, dtype: str):
     configs = _gen_fwd_autotune_configs(headdim, autotune_mode=autotune_mode)
     _ffpa_fwd_autotune_cache[cache_key] = triton.autotune(
       configs=configs,
-      key=["autotune_seqlen_q_bucket", "autotune_seqlen_k_bucket", "autotune_causal_key", "HEADDIM"],
+      key=[
+        "autotune_seqlen_q_bucket",
+        "autotune_seqlen_k_bucket",
+        "autotune_causal_key",
+        "HEADDIM",
+      ],
       cache_results=True,
     )(_ffpa_fwd_kernel_impl)
   return _ffpa_fwd_autotune_cache[cache_key]
