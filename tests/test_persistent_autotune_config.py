@@ -255,7 +255,7 @@ def test_lookup_sm90_forward_respects_enabled_ws_entry_metadata(tmp_path, monkey
           "BLOCK_N": 64,
           "BLOCK_HEADDIM_QK": 64,
           "BLOCK_HEADDIM_V": 64,
-          "warp_specialize": False,
+          "warp_specialize": True,
           "num_warps": 4,
           "num_stages": 2,
         },
@@ -283,7 +283,7 @@ def test_lookup_sm90_forward_respects_enabled_ws_entry_metadata(tmp_path, monkey
     "BLOCK_N": 64,
     "BLOCK_HEADDIM_QK": 64,
     "BLOCK_HEADDIM_V": 64,
-    "warp_specialize": False,
+    "warp_specialize": True,
     "num_warps": 4,
     "num_stages": 2,
   }

@@ -113,7 +113,7 @@ class PersistentConfigRequest:
   :param has_attn_bias: Whether an additive attention bias is active.
   :param has_dropout: Whether dropout is active.
   :param enable_tma: Whether SM90 forward TMA configs are allowed.
-  :param enable_ws: Whether SM90 forward warp-specialized configs are allowed.
+  :param enable_ws: Whether SM90 forward must use warp-specialized configs.
   :param nheads_q: Optional runtime query-head count, kept for callers that
       want to describe the request. Lookup does not require it to match.
   :param nheads_kv: Optional runtime key/value-head count before backward
@@ -479,9 +479,9 @@ def _lookup_persistent_config_cached(
       continue
     if not _entry_flag_matches(entry, "enable_ws", request.enable_ws, inferred_enable_ws):
       continue
-    if request.kernel == "fwd_sm90_generic" and request.enable_ws is False and bool(
+    if request.kernel == "fwd_sm90_generic" and request.enable_ws is not None and bool(
       config.get("warp_specialize", False)
-    ):
+    ) != request.enable_ws:
       continue
     try:
       int(entry["headdim"])

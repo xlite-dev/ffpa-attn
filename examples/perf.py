@@ -211,7 +211,7 @@ def _parse_args() -> argparse.Namespace:
   parser.add_argument(
     "--enable-ws",
     action="store_true",
-    help="Allow warp-specialized configs for the experimental SM90+ TMA forward path.",
+    help="Force warp-specialized configs for the experimental SM90+ TMA forward path.",
   )
   parser.add_argument(
     "--grad-v-storage-dtype",

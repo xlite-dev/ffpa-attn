@@ -99,7 +99,7 @@ def test_fwd_fast_mode_prunes_decode_configs():
   assert len(fast) < len(max_configs)
 
 
-def test_sm90_fwd_configs_include_warp_specialize():
+def test_sm90_fwd_configs_force_warp_specialize():
   fast = _gen_fwd_sm90_autotune_configs(512, autotune_mode="fast", enable_ws=True)
   max_configs = _gen_fwd_sm90_autotune_configs(512, autotune_mode="max", enable_ws=True)
   serialized = [config_from_triton_config(config) for config in fast]
@@ -107,7 +107,9 @@ def test_sm90_fwd_configs_include_warp_specialize():
   ws_configs = [config for config in serialized if config["warp_specialize"]]
   max_ws_configs = [config for config in max_serialized if config["warp_specialize"]]
   assert len(fast) < len(max_configs)
-  assert {config["warp_specialize"] for config in serialized} == {False, True}
+  assert {config["warp_specialize"] for config in serialized} == {True}
+  assert len(ws_configs) == len(serialized)
+  assert len(max_ws_configs) == len(max_serialized)
   assert all(config["BLOCK_HEADDIM_QK"] == config["BLOCK_HEADDIM_V"] for config in serialized)
   expected_ws_configs = {
     (64, 64, 64),

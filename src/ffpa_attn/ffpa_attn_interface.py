@@ -126,7 +126,7 @@ def ffpa_attn_func(
       ``triton_backward_preprocess_d_chunk``, and
       ``triton_backward_grad_v_storage_dtype``. ``forward_backend`` only affects ``D > 256``.
       ``enable_tma`` opts into the SM90+ Triton descriptor/TMA forward path
-      when supported. ``enable_ws`` additionally allows warp-specialized TMA
+      when supported. ``enable_ws`` additionally forces warp-specialized TMA
       configs. ``backward_backend`` supports ``"triton"`` and ``"sdpa"``.
       ``triton_backward_grad_v_storage_dtype`` defaults to ``None`` and
       currently only accepts ``torch.float32`` as an override for Triton

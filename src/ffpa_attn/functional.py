@@ -184,7 +184,7 @@ class FFPAAttnMeta:
     Only effective when ``forward_backend='triton'`` and the device capability
     is >= 9.  Falls back silently to the standard Triton forward otherwise.
     Defaults to ``False``.
-  :param enable_ws: Allow warp-specialized SM90 TMA Triton forward configs.
+  :param enable_ws: Force warp-specialized SM90 TMA Triton forward configs.
     Only effective with ``enable_tma=True``. Defaults to ``False``.
   :param dropout_p: Dropout probability (default 0.0).
   :param is_grad_enabled: Grad-mode state captured at the public API.

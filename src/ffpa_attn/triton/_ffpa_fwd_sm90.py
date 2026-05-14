@@ -415,7 +415,7 @@ def _gen_fwd_sm90_autotune_configs(
   :param headdim: The actual head dimension for the target shape.
   :param autotune_mode: Triton autotune search-space mode, ``"fast"`` or
       ``"max"``.
-  :param enable_ws: Whether to include warp-specialized configs.
+  :param enable_ws: Whether to generate only warp-specialized configs.
   :return: Triton autotune configurations for the SM90 TMA forward kernel.
   """
   _headdim_candidates = [64, 128]
@@ -427,23 +427,9 @@ def _gen_fwd_sm90_autotune_configs(
     for block_n in [64, 128]:
       for block_headdim in _headdim_candidates:
         num_warps_candidates = [4] if autotune_mode == "fast" else [4, 8]
-        for num_warps in num_warps_candidates:
-          for num_stages in [2, 3] if autotune_mode == "fast" else [2, 3, 4]:
-            configs.append(
-              triton.Config(
-                {
-                  "BLOCK_M": block_m,
-                  "BLOCK_N": block_n,
-                  "BLOCK_HEADDIM_QK": block_headdim,
-                  "BLOCK_HEADDIM_V": block_headdim,
-                  "warp_specialize": False,
-                },
-                num_warps=num_warps,
-                num_stages=num_stages,
-                pre_hook=_sm90_host_descriptor_pre_hook,
-              )
-            )
-        if enable_ws and (block_m, block_n, block_headdim) in _SM90_WS_CONFIGS:
+        if enable_ws:
+          if (block_m, block_n, block_headdim) not in _SM90_WS_CONFIGS:
+            continue
           for num_warps in num_warps_candidates:
             for num_stages in [2, 3]:
               # Config.num_stages is a backend-wide pipeline/warpspec option,
@@ -459,6 +445,23 @@ def _gen_fwd_sm90_autotune_configs(
                     "BLOCK_HEADDIM_QK": block_headdim,
                     "BLOCK_HEADDIM_V": block_headdim,
                     "warp_specialize": True,
+                  },
+                  num_warps=num_warps,
+                  num_stages=num_stages,
+                  pre_hook=_sm90_host_descriptor_pre_hook,
+                )
+              )
+        else:
+          for num_warps in num_warps_candidates:
+            for num_stages in [2, 3] if autotune_mode == "fast" else [2, 3, 4]:
+              configs.append(
+                triton.Config(
+                  {
+                    "BLOCK_M": block_m,
+                    "BLOCK_N": block_n,
+                    "BLOCK_HEADDIM_QK": block_headdim,
+                    "BLOCK_HEADDIM_V": block_headdim,
+                    "warp_specialize": False,
                   },
                   num_warps=num_warps,
                   num_stages=num_stages,
@@ -481,7 +484,7 @@ def _get_fwd_sm90_autotune(headdim: int, autotune_mode: str, dtype: str, enable_
   :param autotune_mode: Triton autotune search-space mode, ``"fast"`` or
       ``"max"``.
   :param dtype: Dtype name matching :func:`dtype_name`.
-  :param enable_ws: Whether to include warp-specialized configs.
+  :param enable_ws: Whether to use only warp-specialized configs.
   :return: A ``triton.autotune``-wrapped version of
       ``_ffpa_fwd_sm90_kernel_impl`` tuned for ``headdim``.
   """

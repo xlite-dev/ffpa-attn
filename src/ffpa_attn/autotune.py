@@ -716,7 +716,7 @@ def _parse_args() -> argparse.Namespace:
   parser.add_argument(
     "--enable-ws",
     action="store_true",
-    help="Allow warp-specialized SM90+ TMA forward configs when --enable-tma is set.",
+    help="Force warp-specialized SM90+ TMA forward configs when --enable-tma is set.",
   )
   parser.add_argument(
     "--overwrite",

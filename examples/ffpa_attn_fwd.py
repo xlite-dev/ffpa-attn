@@ -102,7 +102,7 @@ def _parse_args() -> argparse.Namespace:
   parser.add_argument(
     "--enable-ws",
     action="store_true",
-    help="Allow warp-specialized configs for the experimental SM90+ TMA forward path.",
+    help="Force warp-specialized configs for the experimental SM90+ TMA forward path.",
   )
   return parser.parse_args()
 
@@ -441,7 +441,7 @@ def run_forward_examples(
   :param iters: Measured iterations used for timing.
   :param print_results: Whether to print each case result.
   :param enable_tma: Whether to enable the SM90+ TMA forward path.
-  :param enable_ws: Whether to allow warp-specialized SM90 TMA configs.
+  :param enable_ws: Whether to force warp-specialized SM90 TMA configs.
   :return: One structured result per executed case and dtype.
   """
   _validate_timing_args(warmup, iters)
