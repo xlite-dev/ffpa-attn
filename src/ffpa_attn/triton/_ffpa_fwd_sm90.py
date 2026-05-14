@@ -275,6 +275,37 @@ _SM90_WS_CONFIGS = [
 ]
 
 
+def _sm90_config_tile(config: dict) -> tuple[int, int, int]:
+  return (config["BLOCK_M"], config["BLOCK_N"], config["BLOCK_HEADDIM_QK"])
+
+
+def _select_sm90_fixed_launch_config(enable_ws: bool, persisted: dict | None = None) -> dict:
+  """Return a fixed-launch config with the same WS safety policy as autotune.
+
+  :param enable_ws: Whether the fixed launch may use warp specialization.
+  :param persisted: Optional persistent autotune config to use as the base.
+  :return: A fixed launch config for ``_ffpa_fwd_sm90_kernel_impl``.
+  """
+  launch_config = dict(_SM90_DEFAULT_CONFIG)
+  if persisted is not None:
+    launch_config.update(persisted)
+
+  if not enable_ws:
+    launch_config["warp_specialize"] = False
+    return launch_config
+
+  tile = _sm90_config_tile(launch_config)
+  if persisted is None and tile in _SM90_WS_CONFIGS:
+    launch_config["warp_specialize"] = True
+
+  if launch_config.get("warp_specialize", False):
+    if tile in _SM90_WS_CONFIGS:
+      launch_config["num_stages"] = 2
+    else:
+      launch_config["warp_specialize"] = False
+  return launch_config
+
+
 def _gen_fwd_sm90_autotune_configs(
   headdim: int = 256,
   autotune_mode: str = "max",
@@ -410,7 +441,7 @@ def _ffpa_attn_forward_sm90_generic_impl(
   bias_strides = _attn_bias_broadcast_strides(attn_bias, batch, nheads_q, seqlen_q, seqlen_k)
 
   # When autotune is requested, the autotune wrapper (with pre_hook) manages
-  # block_shape updates; the launcher only needs to pick a fallback config.
+  # block_shape updates; the launcher only needs to pick a fixed-path config.
   launch_config = dict(_SM90_DEFAULT_CONFIG)
   if not autotune:
     persisted = lookup_persistent_config(
@@ -430,10 +461,7 @@ def _ffpa_attn_forward_sm90_generic_impl(
         device_index=q.device.index,
       )
     )
-    if persisted is not None:
-      launch_config.update(persisted)
-    if not enable_ws:
-      launch_config["warp_specialize"] = False
+    launch_config = _select_sm90_fixed_launch_config(enable_ws, persisted)
 
   y_dim_q = batch * nheads_q * seqlen_q
   y_dim_kv = batch * nheads_kv * seqlen_k

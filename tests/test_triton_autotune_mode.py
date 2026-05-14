@@ -23,7 +23,11 @@ from ffpa_attn.triton._ffpa_fwd import (
   _get_decode_fwd_stage1_autotune,
   _get_fwd_autotune,
 )
-from ffpa_attn.triton._ffpa_fwd_sm90 import _gen_fwd_sm90_autotune_configs, _get_fwd_sm90_autotune
+from ffpa_attn.triton._ffpa_fwd_sm90 import (
+  _gen_fwd_sm90_autotune_configs,
+  _get_fwd_sm90_autotune,
+  _select_sm90_fixed_launch_config,
+)
 
 
 def test_triton_autotune_mode_defaults_to_fast():
@@ -127,6 +131,47 @@ def test_sm90_fwd_configs_can_disable_warp_specialize():
   configs = _gen_fwd_sm90_autotune_configs(512, autotune_mode="max", enable_ws=False)
   serialized = [config_from_triton_config(config) for config in configs]
   assert {config["warp_specialize"] for config in serialized} == {False}
+
+
+def test_sm90_fixed_launch_config_uses_ws_fallback_without_persistent():
+  config = _select_sm90_fixed_launch_config(enable_ws=True, persisted=None)
+
+  assert config["warp_specialize"] is True
+  assert config["num_stages"] == 2
+  assert (config["BLOCK_M"], config["BLOCK_N"], config["BLOCK_HEADDIM_QK"]) == (64, 128, 64)
+
+
+def test_sm90_fixed_launch_config_can_disable_persistent_ws():
+  persisted = {
+    "BLOCK_M": 64,
+    "BLOCK_N": 128,
+    "BLOCK_HEADDIM_QK": 64,
+    "BLOCK_HEADDIM_V": 64,
+    "warp_specialize": True,
+    "num_warps": 4,
+    "num_stages": 2,
+  }
+
+  config = _select_sm90_fixed_launch_config(enable_ws=False, persisted=persisted)
+
+  assert config["warp_specialize"] is False
+
+
+def test_sm90_fixed_launch_config_clamps_persistent_ws_stage():
+  persisted = {
+    "BLOCK_M": 64,
+    "BLOCK_N": 128,
+    "BLOCK_HEADDIM_QK": 64,
+    "BLOCK_HEADDIM_V": 64,
+    "warp_specialize": True,
+    "num_warps": 4,
+    "num_stages": 3,
+  }
+
+  config = _select_sm90_fixed_launch_config(enable_ws=True, persisted=persisted)
+
+  assert config["warp_specialize"] is True
+  assert config["num_stages"] == 2
 
 
 def test_persistent_payload_records_generation_options(monkeypatch):
