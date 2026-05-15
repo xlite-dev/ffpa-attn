@@ -97,14 +97,29 @@ def _parse_args() -> argparse.Namespace:
   parser.add_argument(
     "--enable-tma",
     action="store_true",
-    help="Enable experimental SM90+ TMA forward path (silently falls back on unsupported devices).",
+    help="Compatibility alias for --enable-fwd-tma.",
   )
   parser.add_argument(
     "--enable-ws",
     action="store_true",
+    help="Compatibility alias for --enable-fwd-ws.",
+  )
+  parser.add_argument(
+    "--enable-fwd-tma",
+    action="store_true",
+    help="Enable experimental SM90+ TMA forward path (silently falls back on unsupported devices).",
+  )
+  parser.add_argument(
+    "--enable-fwd-ws",
+    action="store_true",
     help="Force warp-specialized configs for the experimental SM90+ TMA forward path.",
   )
-  return parser.parse_args()
+  args = parser.parse_args()
+  if args.enable_tma:
+    args.enable_fwd_tma = True
+  if args.enable_ws:
+    args.enable_fwd_ws = True
+  return args
 
 
 def _validate_timing_args(warmup: int, iters: int) -> None:
@@ -326,8 +341,8 @@ def _run_case(
     triton_autotune=triton_autotune,
     triton_autotune_mode=triton_autotune_mode,
     triton_backward_grad_v_storage_dtype=triton_backward_grad_v_storage_dtype,
-    enable_tma=enable_tma,
-    enable_ws=enable_ws,
+    enable_forward_tma=enable_tma,
+    enable_forward_ws=enable_ws,
   )
   k_ref, v_ref = _expand_kv(k, v, Nh_q)
   torch.manual_seed(seed + 17)
@@ -351,8 +366,8 @@ def _run_case(
       triton_autotune=triton_autotune,
       triton_autotune_mode=triton_autotune_mode,
       triton_backward_grad_v_storage_dtype=triton_backward_grad_v_storage_dtype,
-      enable_tma=enable_tma,
-      enable_ws=enable_ws,
+      enable_forward_tma=enable_tma,
+      enable_forward_ws=enable_ws,
     ),
     q,
     k,
@@ -422,6 +437,7 @@ def run_forward_examples(
   print_results: bool = True,
   enable_tma: bool = False,
   enable_ws: bool = False,
+  tasks: set[str] | None = None,
 ) -> list[FORWARD_RESULT]:
   """Run the canonical forward benchmark cases.
 
@@ -442,6 +458,7 @@ def run_forward_examples(
   :param print_results: Whether to print each case result.
   :param enable_tma: Whether to enable the SM90+ TMA forward path.
   :param enable_ws: Whether to force warp-specialized SM90 TMA configs.
+  :param tasks: Optional case-name filter. ``None`` runs all cases.
   :return: One structured result per executed case and dtype.
   """
   _validate_timing_args(warmup, iters)
@@ -454,8 +471,9 @@ def run_forward_examples(
     f"triton_autotune={triton_autotune}, "
     f"triton_autotune_mode={triton_autotune_mode}, "
     f"triton_backward_grad_v_storage_dtype={triton_backward_grad_v_storage_dtype}, "
-    f"enable_tma={enable_tma}, "
-    f"enable_ws={enable_ws}, "
+    f"enable_fwd_tma={enable_tma}, "
+    f"enable_fwd_ws={enable_ws}, "
+    f"tasks={sorted(tasks) if tasks is not None else 'full'}, "
     f"warmup={warmup}, iters={iters}"
   )
 
@@ -525,6 +543,8 @@ def run_forward_examples(
       "Nq": N - 1 if N > 1 else N,
       "Nkv": N - 1 if N > 1 else N,
     })
+    if tasks is not None:
+      case_specs = [case for case in case_specs if case["name"] in tasks]
 
     for case in case_specs:
       results.append(
@@ -578,8 +598,8 @@ def main() -> None:
     warmup=args.warmup,
     iters=args.iters,
     print_results=True,
-    enable_tma=args.enable_tma,
-    enable_ws=args.enable_ws,
+    enable_tma=args.enable_fwd_tma,
+    enable_ws=args.enable_fwd_ws,
   )
 
 

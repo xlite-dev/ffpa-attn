@@ -413,6 +413,79 @@ def test_ffpa_attn_func_backward_autotune_enables_saved_forward_autotune(monkeyp
   assert seen_autotune == [True]
 
 
+def test_ffpa_attn_func_routes_directional_tma_ws_flags(monkeypatch):
+  seen_forward: list[tuple[bool, bool]] = []
+  seen_backward: list[tuple[bool, bool]] = []
+
+  def _fake_forward(
+    q_in,
+    k_in,
+    v_in,
+    o_in,
+    causal,
+    softmax_scale,
+    autotune,
+    autotune_mode,
+    attn_bias,
+    dropout_p=0.0,
+    philox_seed=0,
+    philox_offset=0,
+    enable_tma=False,
+    enable_ws=False,
+  ):
+    del k_in, v_in, causal, softmax_scale, autotune, autotune_mode, attn_bias, dropout_p, philox_seed, philox_offset
+    seen_forward.append((enable_tma, enable_ws))
+    return torch.empty_like(o_in), torch.empty(q_in.shape[:-1], dtype=torch.float32, device=q_in.device)
+
+  def _fake_backward(
+    grad_out,
+    q,
+    k,
+    v,
+    o,
+    lse,
+    causal,
+    softmax_scale,
+    autotune,
+    autotune_mode,
+    preprocess_d_chunk,
+    attn_bias,
+    return_attn_bias_grad,
+    grad_v_storage_dtype,
+    dropout_p=0.0,
+    philox_seed=0,
+    philox_offset=0,
+    enable_tma=False,
+    enable_ws=False,
+  ):
+    del grad_out, o, lse, causal, softmax_scale, autotune, autotune_mode, preprocess_d_chunk
+    del attn_bias, return_attn_bias_grad, grad_v_storage_dtype, dropout_p, philox_seed, philox_offset
+    seen_backward.append((enable_tma, enable_ws))
+    return torch.zeros_like(q), torch.zeros_like(k), torch.zeros_like(v), None
+
+  monkeypatch.setattr(ffpa_attn_functional, "_ffpa_attn_forward_triton", _fake_forward)
+  monkeypatch.setattr(ffpa_attn_functional, "_ffpa_attn_backward_triton", _fake_backward)
+  q = torch.randn(1, 1, 512, 320, dtype=torch.float16, device="cuda", requires_grad=True)
+  k = torch.randn(1, 1, 512, 320, dtype=torch.float16, device="cuda", requires_grad=True)
+  v = torch.randn(1, 1, 512, 320, dtype=torch.float16, device="cuda", requires_grad=True)
+
+  out = ffpa_attn_func(
+    q,
+    k,
+    v,
+    forward_backend="triton",
+    backward_backend="triton",
+    enable_forward_tma=True,
+    enable_forward_ws=True,
+    enable_backward_tma=False,
+    enable_backward_ws=False,
+  )
+  out.sum().backward()
+
+  assert seen_forward == [(True, True)]
+  assert seen_backward == [(False, False)]
+
+
 def test_ffpa_attn_func_cuda_forward_unavailable_raises(monkeypatch):
   _force_cuda_backend_unavailable(monkeypatch)
   q, k, v = _alloc_qkv(1, 4, 512, 320, torch.float16)

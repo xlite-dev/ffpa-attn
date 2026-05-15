@@ -1,12 +1,15 @@
 """Unit tests for benchmark attention FLOPs and TFLOPS helpers."""
 
-from examples._attention_flops import (
+from types import SimpleNamespace
+
+from examples.attention_flops import (
   attention_bwd_flops,
   attention_fwd_flops,
   attention_valid_pairs,
   format_tflops_short,
   tflops_from_ms,
 )
+from examples.perf import _resolve_directional_cli_flags
 
 
 def test_attention_valid_pairs_non_causal_and_cross_attn():
@@ -42,3 +45,37 @@ def test_tflops_from_ms_and_compact_formatting():
   assert format_tflops_short(9.25) == "9.2T"
   assert format_tflops_short(0.256) == "0.26T"
   assert format_tflops_short(None) == "-"
+
+
+def test_perf_legacy_tma_ws_flags_map_to_both_directions():
+  args = SimpleNamespace(
+    enable_tma=True,
+    enable_ws=True,
+    enable_fwd_tma=False,
+    enable_bwd_tma=False,
+    enable_fwd_ws=False,
+    enable_bwd_ws=False,
+  )
+
+  _resolve_directional_cli_flags(args)
+
+  assert args.enable_fwd_tma is True
+  assert args.enable_bwd_tma is True
+  assert args.enable_fwd_ws is True
+  assert args.enable_bwd_ws is True
+
+
+def test_perf_forward_tma_flag_does_not_enable_backward_tma():
+  args = SimpleNamespace(
+    enable_tma=False,
+    enable_ws=False,
+    enable_fwd_tma=True,
+    enable_bwd_tma=False,
+    enable_fwd_ws=False,
+    enable_bwd_ws=False,
+  )
+
+  _resolve_directional_cli_flags(args)
+
+  assert args.enable_fwd_tma is True
+  assert args.enable_bwd_tma is False

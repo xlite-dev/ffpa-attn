@@ -1296,6 +1296,8 @@ def _ffpa_attn_backward_triton_impl(
   dropout_p: float = 0.0,
   philox_seed: int = 0,
   philox_offset: int = 0,
+  enable_tma: bool = False,
+  enable_ws: bool = False,
 ) -> None:
   """Run the Triton FFPA Split-D backward kernels in place.
 
@@ -1339,6 +1341,37 @@ def _ffpa_attn_backward_triton_impl(
   _, _, seqlen_k, _ = k.shape
   original_nheads_kv = original_nheads_kv or nheads
   softmax_scale = softmax_scale or (1.0 / math.sqrt(headdim))
+
+  if enable_tma and seqlen_q >= 8:
+    from ._ffpa_bwd_sm90 import _ffpa_attn_backward_sm90_impl as _bwd_sm90_impl
+    from ._ffpa_bwd_sm90 import is_sm90_tma_backward_supported as _sm90_supported
+
+    if _sm90_supported(q, k, v, do, dq, dk, dv, seqlen_q=seqlen_q):
+      _bwd_sm90_impl(
+        do,
+        q,
+        k,
+        v,
+        o,
+        lse,
+        attn_bias,
+        dq,
+        dk,
+        dv,
+        grad_attn_bias,
+        causal=causal,
+        softmax_scale=softmax_scale,
+        autotune=autotune,
+        autotune_mode=autotune_mode,
+        preprocess_d_chunk=preprocess_d_chunk,
+        original_nheads_kv=original_nheads_kv,
+        dropout_p=dropout_p,
+        philox_seed=philox_seed,
+        philox_offset=philox_offset,
+        enable_ws=enable_ws,
+      )
+      return
+
   seqlen_q_rounded = lse.shape[-1]
   autotune_seqlen_q_bucket = autotune_seqlen_key(seqlen_q, autotune_mode)
   autotune_seqlen_k_bucket = autotune_seqlen_key(seqlen_k, autotune_mode)
@@ -1825,6 +1858,8 @@ def _ffpa_attn_backward_triton(
   dropout_p: float = 0.0,
   philox_seed: int = 0,
   philox_offset: int = 0,
+  enable_tma: bool = False,
+  enable_ws: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
   """Run the Triton FFPA backward path and return ``(dq, dk, dv, d_attn_bias)``.
 
@@ -1916,6 +1951,8 @@ def _ffpa_attn_backward_triton(
     dropout_p,
     philox_seed,
     philox_offset,
+    int(enable_tma),
+    int(enable_ws),
   )
 
   if group_size > 1:

@@ -82,6 +82,16 @@ _KERNEL_CONFIG_KEYS = {
     "num_ctas",
     "maxnreg",
   },
+  "bwd_sm90_generic": {
+    "BLOCK_M",
+    "BLOCK_N",
+    "BLOCK_HEADDIM",
+    "warp_specialize",
+    "num_warps",
+    "num_stages",
+    "num_ctas",
+    "maxnreg",
+  },
   "decode_bwd_stage1": {
     "BLOCK_M",
     "BLOCK_N",
@@ -112,8 +122,10 @@ class PersistentConfigRequest:
   :param use_gemv: Decode backward single-query specialization flag.
   :param has_attn_bias: Whether an additive attention bias is active.
   :param has_dropout: Whether dropout is active.
-  :param enable_tma: Whether SM90 forward TMA configs are allowed.
-  :param enable_ws: Whether SM90 forward must use warp-specialized configs.
+  :param enable_tma: Whether SM90 TMA configs are allowed for this request's
+      direction and kernel.
+  :param enable_ws: Whether SM90 TMA configs must use warp-specialized configs
+      for this request's direction and kernel.
   :param nheads_q: Optional runtime query-head count, kept for callers that
       want to describe the request. Lookup does not require it to match.
   :param nheads_kv: Optional runtime key/value-head count before backward
@@ -444,8 +456,6 @@ def _lookup_persistent_config_cached(
       continue
     if entry.get("kernel") != request.kernel:
       continue
-    if entry.get("autotune_mode") != request.autotune_mode:
-      continue
     if entry.get("dtype") != request.dtype:
       continue
     if request.causal is not None and bool(entry.get("causal", False)) != request.causal:
@@ -473,13 +483,13 @@ def _lookup_persistent_config_cached(
     # TMA+WS runs with the same shape do not reuse each other's configs. Older
     # JSON files lack those flags, so infer the safest compatibility meaning
     # from the kernel name and the persisted warp_specialize meta.
-    inferred_enable_tma = request.kernel == "fwd_sm90_generic"
-    inferred_enable_ws = bool(config.get("warp_specialize", False)) if request.kernel == "fwd_sm90_generic" else False
+    inferred_enable_tma = request.kernel in {"fwd_sm90_generic", "bwd_sm90_generic"}
+    inferred_enable_ws = bool(config.get("warp_specialize", False)) if inferred_enable_tma else False
     if not _entry_flag_matches(entry, "enable_tma", request.enable_tma, inferred_enable_tma):
       continue
     if not _entry_flag_matches(entry, "enable_ws", request.enable_ws, inferred_enable_ws):
       continue
-    if request.kernel == "fwd_sm90_generic" and request.enable_ws is not None and bool(
+    if request.kernel in {"fwd_sm90_generic", "bwd_sm90_generic"} and request.enable_ws is not None and bool(
       config.get("warp_specialize", False)
     ) != request.enable_ws:
       continue

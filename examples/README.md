@@ -1,54 +1,65 @@
 
-# FFPA-Attn Examples
+# FFPA Attention Examples
 
 ## Quick Start
 
 ```bash
-python3 examples/ffpa_attn_fwd.py --forward-backend triton
-python3 examples/ffpa_attn_fwd.py --forward-backend triton --autotune
-ENABLE_FFPA_CUDA_IMPL=1 python3 examples/ffpa_attn_fwd.py --forward-backend cuda
-python3 examples/ffpa_attn_bwd.py --backward-backend sdpa
-python3 examples/ffpa_attn_bwd.py --backward-backend triton
-python3 examples/ffpa_attn_bwd.py --backward-backend triton --autotune
 python3 examples/perf.py
-python3 examples/perf.py --forward --backward --fwd-backend triton --bwd-backend triton --tune fast
+python3 examples/perf.py --no-bwd
+python3 examples/perf.py --no-fwd
+python3 examples/perf.py --tune fast
+python3 examples/perf.py --tune max
+python3 examples/perf.py --tune max --enable-fwd-tma # SM>=90 only
 ```
 
-- `examples/ffpa_attn_fwd.py`: forward-only examples for self-attn, cross-attn, GQA, causal, and non-aligned seqlen.
-- `examples/ffpa_attn_bwd.py`: end2end forward + backward examples for self-attn, cross-attn, GQA, causal, and non-aligned seqlen.
-- `examples/perf.py`: migrated benchmark plotting entrypoint. It preserves the old plot style, can benchmark forward/backward cases on demand, and writes both `ffpa_speedup.png` and `ffpa_speedup.md`.
-- The additive-mask example uses a compact `[1, 1, 1, Nkv]` key-position bias by default. Use `[1, 1, Nq, Nkv]` only when per-query bias is required, since it scales as `O(Nq * Nkv)` memory.
+The `examples/perf.py` migrated benchmark plotting entrypoint. It preserves the old plot style, can benchmark forward/backward cases on demand, and writes both `ffpa_{device}_speedup.png` and `ffpa_{device}_speedup.md`. The additive-mask example uses a compact `[1, 1, 1, Nkv]` key-position bias by default. Use `[1, 1, Nq, Nkv]` only when per-query bias is required, since it scales as `O(Nq * Nkv)` memory.
 
 ## Benchmark
 
-Env: NVIDIA L20 (Ada), PyTorch 2.11, CUDA 13.0, Headdim=512 (FA-2 not supported).
+TFLOPS reports the theoretical dominant attention GEMM throughput only; forward and backward are computed separately from the measured latency. Env: NVIDIA L20 (Ada, 119.5 TFLOPS), PyTorch 2.11, CUDA 13.0, Headdim=512 (FA-2 not supported).
 
-### Forward Pass (Legacy CUDA)
+<div align='center' markdown="1">
 
-| Case | dtype | Nq/Nkv | allclose | FFPA / SDPA | speedup |
+### Forward Pass (Triton)
+
+| Case | dtype | Nq/Nkv | FFPA / SDPA | TFLOPS | speedup |
 |:---:|:---:|:---:|:---:|:---:|:---:|
-| self-attn | fp16 | 8192/8192 | ✅ | 46.7 / 74.7 ms | 1.60x |
-| cross-attn | fp16 | 1024/8192 | ✅ | 6.32 / 9.94 ms | 1.57x |
-| gqa | fp16 | 8192/8192 | ✅ | 46.4 / 74.8 ms | 1.61x |
-| causal | fp16 | 8192/8192 | ✅ | 24.3 / 37.4 ms | 1.54x |
-| non-aligned | fp16 | 8191/8191 | ✅ | 12.3 / 19.0 ms | 1.55x |
-| self-attn | bf16 | 8192/8192 | ✅ | 46.5 / 74.7 ms | 1.61x |
-| cross-attn | bf16 | 1024/8192 | ✅ | 6.29 / 9.95 ms | 1.58x |
-| gqa | bf16 | 8192/8192 | ✅ | 46.2 / 74.7 ms | 1.62x |
-| causal | bf16 | 8192/8192 | ✅ | 24.2 / 37.5 ms | 1.55x |
-| non-aligned | bf16 | 8191/8191 | ✅ | 12.3 / 19.0 ms | 1.55x |
+| self-attn | fp16 | 8192/8192 | 50.33 / 75.32 ms | 87T / 58T | 1.50x |
+| self-attn | bf16 | 8192/8192 | 47.90 / 75.98 ms | 92T / 58T | 1.59x |
+| cross-attn | fp16 | 1024/8192 | 6.42 / 10.05 ms | 86T / 55T | 1.57x |
+| cross-attn | bf16 | 1024/8192 | 6.71 / 9.93 ms | 82T / 55T | 1.48x |
+| decode-attn | fp16 | 1/8192 | 0.77 / 1.00 ms | 0.70T / 0.54T | 1.30x |
+| decode-attn | bf16 | 1/8192 | 0.77 / 0.80 ms | 0.70T / 0.67T | 1.04x |
+| gqa | fp16 | 8192/8192 | 50.72 / 75.27 ms | 87T / 58T | 1.48x |
+| gqa | bf16 | 8192/8192 | 47.21 / 75.41 ms | 93T / 58T | 1.60x |
+| causal | fp16 | 8192/8192 | 26.69 / 38.17 ms | 82T / 58T | 1.43x |
+| causal | bf16 | 8192/8192 | 26.40 / 37.53 ms | 83T / 59T | 1.42x |
+| attn-mask | fp16 | 8192/8192 | 55.57 / 82.04 ms | 79T / 54T | 1.48x |
+| attn-mask | bf16 | 8192/8192 | 52.98 / 81.68 ms | 83T / 54T | 1.54x |
+| dropout | fp16 | 8192/8192 | 55.77 / 83.61 ms | 79T / 53T | 1.50x |
+| dropout | bf16 | 8192/8192 | 52.60 / 84.28 ms | 84T / 52T | 1.60x |
+| non-aligned | fp16 | 8191/8191 | 14.19 / 19.01 ms | 77T / 58T | 1.34x |
+| non-aligned | bf16 | 8191/8191 | 12.36 / 19.12 ms | 89T / 58T | 1.55x |
 
-### Backward Pass (Triton w/ autotune)
+### Backward Pass (Triton)
 
-| Case | dtype | Nq/Nkv | allclose | FFPA / SDPA | speedup |
+| Case | dtype | Nq/Nkv | FFPA / SDPA | TFLOPS | speedup |
 |:---:|:---:|:---:|:---:|:---:|:---:|
-| self-attn | fp16 | 8192/8192 | ✅ | 255.9 / 429.2 ms | 1.68x |
-| cross-attn | fp16 | 1024/8192 | ✅ | 36.54 / 54.41 ms | 1.49x |
-| gqa | fp16 | 8192/8192 | ✅ | 256.4 / 425.3 ms | 1.66x |
-| causal | fp16 | 8192/8192 | ✅ | 132.9 / 240.2 ms | 1.81x |
-| non-aligned | fp16 | 8191/8191 | ✅ | 68.59 / 118.4 ms | 1.73x |
-| self-attn | bf16 | 8192/8192 | ✅ | 255.2 / 425.3 ms | 1.67x |
-| cross-attn | bf16 | 1024/8192 | ✅ | 36.34 / 54.50 ms | 1.50x |
-| gqa | bf16 | 8192/8192 | ✅ | 255.7 / 425.6 ms | 1.66x |
-| causal | bf16 | 8192/8192 | ✅ | 132.6 / 237.7 ms | 1.79x |
-| non-aligned | bf16 | 8191/8191 | ✅ | 68.44 / 118.3 ms | 1.73x |
+| self-attn | fp16 | 8192/8192 | 192.15 / 353.61 ms | 57T / 31T | 1.84x |
+| self-attn | bf16 | 8192/8192 | 196.53 / 353.47 ms | 56T / 31T | 1.80x |
+| cross-attn | fp16 | 1024/8192 | 25.98 / 42.82 ms | 53T / 32T | 1.65x |
+| cross-attn | bf16 | 1024/8192 | 26.24 / 43.49 ms | 52T / 32T | 1.66x |
+| decode-attn | fp16 | 1/8192 | 2.65 / 6.05 ms | 0.51T / 0.22T | 2.28x |
+| decode-attn | bf16 | 1/8192 | 2.65 / 6.01 ms | 0.51T / 0.22T | 2.27x |
+| gqa | fp16 | 8192/8192 | 193.69 / 352.02 ms | 57T / 31T | 1.82x |
+| gqa | bf16 | 8192/8192 | 198.45 / 352.54 ms | 55T / 31T | 1.78x |
+| causal | fp16 | 8192/8192 | 96.86 / 199.46 ms | 57T / 28T | 2.06x |
+| causal | bf16 | 8192/8192 | 96.95 / 199.67 ms | 57T / 28T | 2.06x |
+| attn-mask | fp16 | 8192/8192 | 195.14 / 375.20 ms | 56T / 29T | 1.92x |
+| attn-mask | bf16 | 8192/8192 | 197.66 / 377.68 ms | 56T / 29T | 1.91x |
+| dropout | fp16 | 8192/8192 | 200.19 / 367.95 ms | 55T / 30T | 1.84x |
+| dropout | bf16 | 8192/8192 | 204.05 / 364.58 ms | 54T / 30T | 1.79x |
+| non-aligned | fp16 | 8191/8191 | 52.67 / 101.27 ms | 52T / 27T | 1.92x |
+| non-aligned | bf16 | 8191/8191 | 52.90 / 101.69 ms | 52T / 27T | 1.92x |
+
+</div>

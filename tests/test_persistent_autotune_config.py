@@ -581,6 +581,107 @@ def test_lookup_backward_filters_variants(tmp_path, monkeypatch):
   assert persistent.lookup_persistent_config(request.__class__(**{**request.__dict__, "has_dropout": True})) is None
 
 
+def test_lookup_sm90_backward_preserves_tma_config_and_flags(tmp_path, monkeypatch):
+  _patch_cuda_device(monkeypatch)
+  monkeypatch.setenv(persistent.CONFIG_ENV_VAR, str(tmp_path))
+  persistent.clear_config_cache()
+  path = persistent.device_config_path(tmp_path, "NVIDIA L20")
+  base_entry = {
+    "direction": "backward",
+    "kernel": "bwd_sm90_generic",
+    "autotune_mode": "max",
+    "causal": False,
+    "dtype": "fp16",
+    "headdim": 512,
+    "seqlen_q": 4096,
+    "seqlen_k": 4096,
+    "bias_grad": False,
+    "grad_v_storage_dtype": None,
+    "has_attn_bias": False,
+    "has_dropout": False,
+    "enable_tma": True,
+  }
+  persistent.write_config_file(
+    _payload([
+      {
+        **base_entry,
+        "enable_ws": False,
+        "config": {
+          "BLOCK_M": 64,
+          "BLOCK_N": 64,
+          "BLOCK_HEADDIM": 64,
+          "warp_specialize": False,
+          "num_warps": 8,
+          "num_stages": 2,
+          "maxnreg": 168,
+          "ignored": "field",
+        },
+      },
+      {
+        **base_entry,
+        "enable_ws": True,
+        "config": {
+          "BLOCK_M": 128,
+          "BLOCK_N": 64,
+          "BLOCK_HEADDIM": 64,
+          "warp_specialize": True,
+          "num_warps": 4,
+          "num_stages": 2,
+        },
+      },
+    ]),
+    path,
+  )
+
+  config = persistent.lookup_persistent_config(
+    persistent.PersistentConfigRequest(
+      direction="backward",
+      kernel="bwd_sm90_generic",
+      autotune_mode="max",
+      dtype="fp16",
+      headdim=512,
+      seqlen_q=4096,
+      seqlen_k=4096,
+      causal=False,
+      bias_grad=False,
+      grad_v_storage_dtype=None,
+      has_attn_bias=False,
+      has_dropout=False,
+      enable_tma=True,
+      enable_ws=False,
+    )
+  )
+  assert config == {
+    "BLOCK_M": 64,
+    "BLOCK_N": 64,
+    "BLOCK_HEADDIM": 64,
+    "warp_specialize": False,
+    "num_warps": 8,
+    "num_stages": 2,
+    "maxnreg": 168,
+  }
+
+  ws_config = persistent.lookup_persistent_config(
+    persistent.PersistentConfigRequest(
+      direction="backward",
+      kernel="bwd_sm90_generic",
+      autotune_mode="max",
+      dtype="fp16",
+      headdim=512,
+      seqlen_q=4096,
+      seqlen_k=4096,
+      causal=False,
+      bias_grad=False,
+      grad_v_storage_dtype=None,
+      has_attn_bias=False,
+      has_dropout=False,
+      enable_tma=True,
+      enable_ws=True,
+    )
+  )
+  assert ws_config["warp_specialize"] is True
+
+
 def test_backward_preprocess_config_backfills_block_headdim():
   config = _normalize_bwd_pre_config(
     {

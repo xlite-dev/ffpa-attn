@@ -1,14 +1,17 @@
 <div align="center">
   <p align="center">
     <h2>🤖FFPA: Yet another Faster Flash Prefill Attention <br>with O(1)⚡️GPU SRAM complexity for large headdim🐑</h2>
-    <a href="./bench/README.md#bench-l20"> 📈L20 ~1.9x↑🎉 </a> | <a href="./bench/README.md#bench-a30"> 📈A30 ~1.8x↑🎉 </a> | <a href="./bench/README.md#bench-3080"> 📈3080 ~2.9x↑🎉 </a> | <a href="./bench/README.md#bench-4090"> 📈4090 ~2.1x↑🎉 </a>
-  </p>
-  <img src="docs/assets/ffpa-api.png" width="700px">
+    <img src=https://img.shields.io/badge/Language-CUDA-brightgreen.svg >
+    <a href="https://pepy.tech/projects/ffpa-attn"><img src=https://static.pepy.tech/personalized-badge/ffpa-attn?period=total&units=ABBREVIATION&left_color=GRAY&right_color=BLUE&left_text=downloads/pypi ></a>
+    <a href="https://pypi.org/project/ffpa-attn/"><img src=https://img.shields.io/github/release/xlite-dev/ffpa-attn.svg?color=GREEN ></a>
+    <img src=https://img.shields.io/github/stars/xlite-dev/ffpa-attn.svg?style=dark >
+    <img src="https://img.shields.io/github/license/xlite-dev/ffpa-attn.svg?color=blue"><br>
+    <img src="docs/assets/ffpa-api.png" width="700px">
 </div>
 
-**FFPA(Split-D)**: Yet another **Faster Flash Prefill Attention** with **Split-D** strategy, achieve **O(1) SRAM complexity** and **O(d/4) register complexity** for large headdim (**> 256**), **1.5~3x** 🎉 faster than SDPA. 👇Core features:
+**FFPA(Split-D)**: Yet another **Faster Flash Prefill Attention** with **Split-D** strategy, achieve **O(1) SRAM complexity** and **O(d/4) register complexity** for large headdim (**> 256**), **1.5~3x** 🎉 faster than SDPA. 📚👇The Core features:
 
-<div align='center'>
+<div align='center' markdown="1">
 
 |[Self Attn](./examples)| [GQA/MQA](./examples) |[Cross Attn](./examples)|[Causal/Mask](./examples)|[Dropout](./examples)|[Headdim](#ffpa-design)|[Fwd/Bwd](./examples)|
 |:---:|:---:|:---:|:---:|:---:|:---:|:---:|
@@ -61,13 +64,14 @@ We extend FlashAttention to support large headdim ($D>256$) via **fine-grained t
 
 ## 🎉 Benchmark
 
-Runnable examples are provided under [`examples`](./examples). The performance benchmark for the 5090 with large headdim (D=320~1024) is shown below. Please refer to our [`examples`](./examples) for more details.
+Runnable examples are provided under [`examples`](./examples). The performance benchmark for the NVIDIA Geforce RTX 5090 and NVIDIA H800 PCIE with large headdim is shown below. Please refer to our [`examples`](./examples) for more details.
 
 <div align='center'>
-  <img src='./docs/assets/perf/ffpa_speedup_nvidia-geforce-rtx-5090_B1_H32_N8192_D320_T.png' width='750px'>
-  <img src='./docs/assets/perf/ffpa_speedup_nvidia-geforce-rtx-5090_B1_H32_N8192_D512_T.png' width='750px'>
+  <img src='./docs/assets/perf/ffpa_speedup_nvidia-geforce-rtx-5090_B1_H32_N8192_D320_T.png' width='400px'>
+  <img src='./docs/assets/perf/ffpa_speedup_nvidia-geforce-rtx-5090_B1_H32_N8192_D512_T.png' width='400px'><br>
+  <img src='./docs/assets/perf/ffpa_speedup_nvidia-h800-pcie_B1_H32_N8192_D320_T.png' width='400px'>
+  <img src='./docs/assets/perf/ffpa_speedup_nvidia-h800-pcie_B1_H32_N8192_D512_T.png' width='400px'>
 </div>
-
 
 ## ©️License
 
