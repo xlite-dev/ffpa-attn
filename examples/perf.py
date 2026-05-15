@@ -62,8 +62,8 @@ TFLOPS_PLOT_CASES: list[tuple[str, str]] = [
   ("cross-attn", "cross-attn(F/B)"),
   ("gqa", "gqa(F/B)"),
   ("causal", "causal(F/B)"),
-  ("attn-mask", "attn-mask(F/B)"),
-  ("dropout", "dropout(F/B)"),
+  # ("attn-mask", "attn-mask(F/B)"),
+  # ("dropout", "dropout(F/B)"),
   ("non-aligned", "non-aligned(F/B)"),
 ]
 CASE_LABELS = dict(PLOT_CASES)
@@ -730,7 +730,7 @@ def plot_tflops(
 
   attn_types = [label for _, label in active_plot_cases]
   x = np.arange(len(attn_types))
-  fig, ax = plt.subplots(figsize=(32, 12))
+  fig, ax = plt.subplots(figsize=(20, 12))
 
   def _autolabel(rects) -> None:
     for rect in rects:
