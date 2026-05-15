@@ -86,15 +86,15 @@ python -m ffpa_attn.autotune --mode fast --directions both --dtypes bf16,fp16 --
 python -m ffpa_attn.autotune --mode fast --directions both --dtypes bf16,fp16 --overwrite
 ```
 
-On SM90+ devices, add <span style="color:#c77dff;">--enable-tma</span> to additionally generate persistent configs for the descriptor/TMA forward and backward paths when each task shape supports them. The baseline <span style="color:#c77dff;">fwd_generic</span> and <span style="color:#c77dff;">bwd_generic</span> configs are still generated as compatibility fallbacks. Add <span style="color:#c77dff;">--enable-ws</span> with it when you also want warp-specialized TMA candidates:
+On SM90+ devices, add <span style="color:#c77dff;">--enable-fwd-tma</span> or <span style="color:#c77dff;">--enable-bwd-tma</span> to additionally generate persistent configs for the descriptor/TMA forward or backward path when each task shape supports it. The baseline <span style="color:#c77dff;">fwd_generic</span> and <span style="color:#c77dff;">bwd_generic</span> configs are still generated as compatibility fallbacks. Add <span style="color:#c77dff;">--enable-fwd-ws</span> or <span style="color:#c77dff;">--enable-bwd-ws</span> with the matching TMA flag when you also want warp-specialized TMA candidates. The legacy <span style="color:#c77dff;">--enable-tma</span> and <span style="color:#c77dff;">--enable-ws</span> flags remain as aliases that enable both directions:
 
 ```bash
 python -m ffpa_attn.autotune \
 	--mode fast \
 	--directions forward \
 	--dtypes bf16,fp16 \
-	--enable-tma \
-	--enable-ws \
+	--enable-fwd-tma \
+	--enable-fwd-ws \
 	--overwrite
 ```
 

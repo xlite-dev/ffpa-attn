@@ -216,12 +216,32 @@ def _parse_args() -> argparse.Namespace:
   parser.add_argument(
     "--enable-tma",
     action="store_true",
-    help="Enable experimental SM90+ TMA forward path (silently falls back on unsupported devices).",
+    help="Compatibility alias for --enable-fwd-tma --enable-bwd-tma.",
   )
   parser.add_argument(
     "--enable-ws",
     action="store_true",
+    help="Compatibility alias for --enable-fwd-ws --enable-bwd-ws.",
+  )
+  parser.add_argument(
+    "--enable-fwd-tma",
+    action="store_true",
+    help="Enable experimental SM90+ TMA forward path (silently falls back on unsupported devices).",
+  )
+  parser.add_argument(
+    "--enable-bwd-tma",
+    action="store_true",
+    help="Enable experimental SM90+ TMA backward path (silently falls back on unsupported devices).",
+  )
+  parser.add_argument(
+    "--enable-fwd-ws",
+    action="store_true",
     help="Force warp-specialized configs for the experimental SM90+ TMA forward path.",
+  )
+  parser.add_argument(
+    "--enable-bwd-ws",
+    action="store_true",
+    help="Force warp-specialized configs for the experimental SM90+ TMA backward path.",
   )
   parser.add_argument(
     "--grad-v-storage-dtype",
@@ -241,7 +261,18 @@ def _parse_args() -> argparse.Namespace:
     default=None,
     help="Optional output directory used to save the generated PNG and Markdown artifacts. Defaults to ./.tmp.",
   )
-  return parser.parse_args()
+  return _resolve_directional_cli_flags(parser.parse_args())
+
+
+def _resolve_directional_cli_flags(args: argparse.Namespace) -> argparse.Namespace:
+  """Resolve legacy global TMA/WS flags into directional benchmark flags."""
+  if args.enable_tma:
+    args.enable_fwd_tma = True
+    args.enable_bwd_tma = True
+  if args.enable_ws:
+    args.enable_fwd_ws = True
+    args.enable_bwd_ws = True
+  return args
 
 
 def _parse_tasks_arg(tasks_arg: list[str] | None) -> set[str] | None:
@@ -975,8 +1006,8 @@ def _benchmark_rows(args: argparse.Namespace) -> tuple[list[RESULT_ROW], list[RE
         warmup=args.warmup,
         iters=args.iters,
         print_results=True,
-        enable_tma=args.enable_tma,
-        enable_ws=args.enable_ws,
+        enable_tma=args.enable_fwd_tma,
+        enable_ws=args.enable_fwd_ws,
         tasks=tasks,
       ),
     )
@@ -995,8 +1026,8 @@ def _benchmark_rows(args: argparse.Namespace) -> tuple[list[RESULT_ROW], list[RE
         triton_autotune=args.backward_backend == "triton" and tune_mode is not None,
         triton_autotune_mode=tune_mode or "fast",
         triton_backward_grad_v_storage_dtype=grad_v_dtype,
-        enable_tma=args.enable_tma,
-        enable_ws=args.enable_ws,
+        enable_tma=args.enable_bwd_tma,
+        enable_ws=args.enable_bwd_ws,
         warmup=args.warmup,
         iters=args.iters,
         print_results=True,

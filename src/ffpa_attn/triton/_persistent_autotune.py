@@ -122,8 +122,10 @@ class PersistentConfigRequest:
   :param use_gemv: Decode backward single-query specialization flag.
   :param has_attn_bias: Whether an additive attention bias is active.
   :param has_dropout: Whether dropout is active.
-  :param enable_tma: Whether SM90 forward TMA configs are allowed.
-  :param enable_ws: Whether SM90 forward must use warp-specialized configs.
+  :param enable_tma: Whether SM90 TMA configs are allowed for this request's
+      direction and kernel.
+  :param enable_ws: Whether SM90 TMA configs must use warp-specialized configs
+      for this request's direction and kernel.
   :param nheads_q: Optional runtime query-head count, kept for callers that
       want to describe the request. Lookup does not require it to match.
   :param nheads_kv: Optional runtime key/value-head count before backward

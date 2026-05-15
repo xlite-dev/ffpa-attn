@@ -106,6 +106,17 @@ def _parse_dtypes(value: str) -> list[torch.dtype]:
   return dtypes
 
 
+def _resolve_directional_cli_flags(args: argparse.Namespace) -> argparse.Namespace:
+  """Resolve legacy global TMA/WS CLI flags into directional flags."""
+  if args.enable_tma:
+    args.enable_fwd_tma = True
+    args.enable_bwd_tma = True
+  if args.enable_ws:
+    args.enable_fwd_ws = True
+    args.enable_bwd_ws = True
+  return args
+
+
 def _dtype_schema_name(dtype: torch.dtype) -> str:
   if dtype == torch.float16:
     return "fp16"
@@ -703,8 +714,10 @@ def _build_payload(
   heads: int,
   full_tasks: bool,
   seqlens: list[int],
-  enable_tma: bool,
-  enable_ws: bool,
+  enable_forward_tma: bool,
+  enable_backward_tma: bool,
+  enable_forward_ws: bool,
+  enable_backward_ws: bool,
 ) -> dict[str, Any]:
   device_index = torch.cuda.current_device()
   device_name = torch.cuda.get_device_name(device_index)
@@ -723,8 +736,10 @@ def _build_payload(
     "H": heads,
     "full_tasks": full_tasks,
     "hardware_desc": {
-      "enable_tma": enable_tma,
-      "enable_ws": enable_ws,
+      "enable_forward_tma": enable_forward_tma,
+      "enable_backward_tma": enable_backward_tma,
+      "enable_forward_ws": enable_forward_ws,
+      "enable_backward_ws": enable_backward_ws,
     },
     "tune_grid": {
       "headdims": DEFAULT_HEADDIMS,
@@ -773,12 +788,32 @@ def _parse_args() -> argparse.Namespace:
   parser.add_argument(
     "--enable-tma",
     action="store_true",
-    help="Also generate persistent configs for SM90+ TMA forward/backward paths when supported.",
+    help="Compatibility alias for --enable-fwd-tma --enable-bwd-tma.",
   )
   parser.add_argument(
     "--enable-ws",
     action="store_true",
-    help="Force warp-specialized SM90+ TMA configs when --enable-tma is set.",
+    help="Compatibility alias for --enable-fwd-ws --enable-bwd-ws.",
+  )
+  parser.add_argument(
+    "--enable-fwd-tma",
+    action="store_true",
+    help="Also generate persistent configs for the SM90+ TMA forward path when supported.",
+  )
+  parser.add_argument(
+    "--enable-bwd-tma",
+    action="store_true",
+    help="Also generate persistent configs for the SM90+ TMA backward path when supported.",
+  )
+  parser.add_argument(
+    "--enable-fwd-ws",
+    action="store_true",
+    help="Force warp-specialized SM90+ TMA forward configs when --enable-fwd-tma is set.",
+  )
+  parser.add_argument(
+    "--enable-bwd-ws",
+    action="store_true",
+    help="Force warp-specialized SM90+ TMA backward configs when --enable-bwd-tma is set.",
   )
   parser.add_argument(
     "--overwrite",
@@ -791,7 +826,7 @@ def _parse_args() -> argparse.Namespace:
     default=None,
     help="Directory for generated device JSON.",
   )
-  return parser.parse_args()
+  return _resolve_directional_cli_flags(parser.parse_args())
 
 
 def main() -> int:
@@ -857,8 +892,8 @@ def main() -> int:
             args.B,
             args.mode,
             entries,
-            enable_tma=args.enable_tma,
-            enable_ws=args.enable_ws,
+            enable_tma=args.enable_fwd_tma,
+            enable_ws=args.enable_fwd_ws,
           )
         else:
           tuned_entries = _tune_backward(
@@ -866,8 +901,8 @@ def main() -> int:
             args.B,
             args.mode,
             entries,
-            enable_tma=args.enable_tma,
-            enable_ws=args.enable_ws,
+            enable_tma=args.enable_bwd_tma,
+            enable_ws=args.enable_bwd_ws,
           )
         torch.cuda.synchronize()
         elapsed = time.perf_counter() - start_time
@@ -920,8 +955,10 @@ def main() -> int:
     args.H,
     args.full_tasks,
     seqlens,
-    args.enable_tma,
-    args.enable_ws,
+    args.enable_fwd_tma,
+    args.enable_bwd_tma,
+    args.enable_fwd_ws,
+    args.enable_bwd_ws,
   )
   write_config_file(payload, output_path, overwrite=args.overwrite)
   logger.info("Wrote %d tuned config entries to %s", len(ordered_entries), output_path)

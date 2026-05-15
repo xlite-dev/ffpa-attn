@@ -102,14 +102,29 @@ def _parse_args() -> argparse.Namespace:
   parser.add_argument(
     "--enable-tma",
     action="store_true",
-    help="Enable the SM90+ Triton descriptor/TMA backward path when supported.",
+    help="Compatibility alias for --enable-bwd-tma.",
   )
   parser.add_argument(
     "--enable-ws",
     action="store_true",
-    help="Request warp-specialized SM90+ Triton configs when supported.",
+    help="Compatibility alias for --enable-bwd-ws.",
   )
-  return parser.parse_args()
+  parser.add_argument(
+    "--enable-bwd-tma",
+    action="store_true",
+    help="Enable the SM90+ Triton descriptor/TMA backward path when supported.",
+  )
+  parser.add_argument(
+    "--enable-bwd-ws",
+    action="store_true",
+    help="Request warp-specialized SM90+ Triton backward configs when supported.",
+  )
+  args = parser.parse_args()
+  if args.enable_tma:
+    args.enable_bwd_tma = True
+  if args.enable_ws:
+    args.enable_bwd_ws = True
+  return args
 
 
 def _validate_timing_args(warmup: int, iters: int) -> None:
@@ -445,8 +460,8 @@ def _ffpa_forward(
     triton_autotune=triton_autotune,
     triton_autotune_mode=triton_autotune_mode,
     triton_backward_grad_v_storage_dtype=triton_backward_grad_v_storage_dtype,
-    enable_tma=enable_tma,
-    enable_ws=enable_ws,
+    enable_backward_tma=enable_tma,
+    enable_backward_ws=enable_ws,
   )
 
 
@@ -499,8 +514,8 @@ def _run_ffpa_backward(
     attn_mask=attn_mask,
     dropout_p=dropout_p,
     triton_backward_grad_v_storage_dtype=triton_backward_grad_v_storage_dtype,
-    enable_tma=enable_tma,
-    enable_ws=enable_ws,
+    enable_backward_tma=enable_tma,
+    enable_backward_ws=enable_ws,
   )
   out.sum().backward()
 
@@ -641,8 +656,8 @@ def _run_case(
     triton_autotune=triton_autotune,
     triton_autotune_mode=triton_autotune_mode,
     triton_backward_grad_v_storage_dtype=triton_backward_grad_v_storage_dtype,
-    enable_tma=enable_tma,
-    enable_ws=enable_ws,
+    enable_backward_tma=enable_tma,
+    enable_backward_ws=enable_ws,
   )
   out.sum().backward()
 
@@ -982,8 +997,8 @@ def main() -> None:
     triton_autotune=args.triton_autotune,
     triton_autotune_mode=args.triton_autotune_mode,
     triton_backward_grad_v_storage_dtype=grad_v_dtype,
-    enable_tma=args.enable_tma,
-    enable_ws=args.enable_ws,
+    enable_tma=args.enable_bwd_tma,
+    enable_ws=args.enable_bwd_ws,
     warmup=args.warmup,
     iters=args.iters,
     print_results=True,

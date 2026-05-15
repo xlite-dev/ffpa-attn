@@ -36,6 +36,10 @@ _FFPA_ATTN_IMPL_DEFAULTS: dict[str, object] = {
   "acc": "f32",
   "enable_tma": False,
   "enable_ws": False,
+  "enable_forward_tma": False,
+  "enable_backward_tma": False,
+  "enable_forward_ws": False,
+  "enable_backward_ws": False,
   "high_precision_grad": False,
   "forward_backend": "triton",
   "triton_autotune": False,
@@ -172,6 +176,32 @@ def _require_cuda_backward_impl():
   )
 
 
+def _resolve_directional_flag(
+  kwargs: dict[str, object],
+  impl_options: dict[str, object],
+  legacy_key: str,
+  forward_key: str,
+  backward_key: str,
+) -> tuple[int, int]:
+  """Resolve a legacy global bool into direction-specific bools."""
+  legacy_present = legacy_key in kwargs
+  forward_present = forward_key in kwargs
+  backward_present = backward_key in kwargs
+  legacy_value = bool(impl_options[legacy_key])
+  forward_value = bool(impl_options[forward_key]) if forward_present else legacy_value
+  backward_value = bool(impl_options[backward_key]) if backward_present else legacy_value
+  if legacy_present:
+    conflicts = []
+    if forward_present and forward_value != legacy_value:
+      conflicts.append(forward_key)
+    if backward_present and backward_value != legacy_value:
+      conflicts.append(backward_key)
+    if conflicts:
+      names = ", ".join(conflicts)
+      raise ValueError(f"{legacy_key} conflicts with direction-specific option(s): {names}")
+  return int(forward_value), int(backward_value)
+
+
 @dataclass
 class FFPAAttnMeta:
   """Non-tensor FFPA options passed through the autograd Function.
@@ -180,12 +210,20 @@ class FFPAAttnMeta:
   :param scale: Scale applied to ``QK^T``.
   :param stages: CUDA forward pipeline stages.
   :param acc: Native CUDA accumulator code.
-  :param enable_tma: Experimental SM90+ Triton forward path (descriptor/TMA).
-    Only effective when ``forward_backend='triton'`` and the device capability
-    is >= 9.  Falls back silently to the standard Triton forward otherwise.
-    Defaults to ``False``.
-  :param enable_ws: Force warp-specialized SM90 TMA Triton forward configs.
-    Only effective with ``enable_tma=True``. Defaults to ``False``.
+  :param enable_forward_tma: Experimental SM90+ Triton forward path
+    (descriptor/TMA). Falls back silently when unsupported. Defaults to
+    ``False``.
+  :param enable_backward_tma: Experimental SM90+ Triton backward path
+    (descriptor/TMA). Falls back silently when unsupported. Defaults to
+    ``False``.
+  :param enable_forward_ws: Force warp-specialized SM90 TMA forward configs.
+    Only effective with ``enable_forward_tma=True``. Defaults to ``False``.
+  :param enable_backward_ws: Force warp-specialized SM90 TMA backward configs.
+    Only effective with ``enable_backward_tma=True``. Defaults to ``False``.
+  :param enable_tma: Compatibility alias for setting both
+    ``enable_forward_tma`` and ``enable_backward_tma``.
+  :param enable_ws: Compatibility alias for setting both
+    ``enable_forward_ws`` and ``enable_backward_ws``.
   :param dropout_p: Dropout probability (default 0.0).
   :param is_grad_enabled: Grad-mode state captured at the public API.
   :param high_precision_grad: Whether SDPA backward should upcast.
@@ -205,8 +243,10 @@ class FFPAAttnMeta:
   scale: float
   stages: int
   acc: int
-  enable_tma: int
-  enable_ws: int
+  enable_forward_tma: int
+  enable_backward_tma: int
+  enable_forward_ws: int
+  enable_backward_ws: int
   dropout_p: float
   is_grad_enabled: bool
   high_precision_grad: bool
@@ -236,8 +276,20 @@ class FFPAAttnMeta:
 
     stages = int(impl_options["stages"])
     acc_str = impl_options["acc"]
-    enable_tma = int(bool(impl_options["enable_tma"]))
-    enable_ws = int(bool(impl_options["enable_ws"]))
+    enable_forward_tma, enable_backward_tma = _resolve_directional_flag(
+      kwargs,
+      impl_options,
+      "enable_tma",
+      "enable_forward_tma",
+      "enable_backward_tma",
+    )
+    enable_forward_ws, enable_backward_ws = _resolve_directional_flag(
+      kwargs,
+      impl_options,
+      "enable_ws",
+      "enable_forward_ws",
+      "enable_backward_ws",
+    )
     high_precision_grad = bool(impl_options["high_precision_grad"])
     forward_backend = str(impl_options["forward_backend"])
     triton_autotune = bool(impl_options["triton_autotune"])
@@ -275,8 +327,10 @@ class FFPAAttnMeta:
       is_grad_enabled=False,
       acc=acc,
       stages=stages,
-      enable_tma=enable_tma,
-      enable_ws=enable_ws,
+      enable_forward_tma=enable_forward_tma,
+      enable_backward_tma=enable_backward_tma,
+      enable_forward_ws=enable_forward_ws,
+      enable_backward_ws=enable_backward_ws,
       high_precision_grad=high_precision_grad,
       forward_backend=forward_backend,
       triton_autotune=triton_autotune,
@@ -527,8 +581,8 @@ class _FFPAAttnFunc(torch.autograd.Function):
         meta.dropout_p,
         int(rng_state[0].item()) if rng_state.numel() else 0,
         int(rng_state[1].item()) if rng_state.numel() else 0,
-        bool(meta.enable_tma),
-        bool(meta.enable_ws),
+        bool(meta.enable_forward_tma),
+        bool(meta.enable_forward_ws),
       )
     else:
       raise ValueError(f"Unsupported forward_backend={meta.forward_backend!r};")
@@ -585,8 +639,8 @@ class _FFPAAttnFunc(torch.autograd.Function):
           dropout_p=meta.dropout_p,
           philox_seed=int(rng_state[0].item()) if rng_state.numel() else 0,
           philox_offset=int(rng_state[1].item()) if rng_state.numel() else 0,
-          enable_tma=bool(meta.enable_tma),
-          enable_ws=bool(meta.enable_ws),
+          enable_tma=bool(meta.enable_backward_tma),
+          enable_ws=bool(meta.enable_backward_ws),
         )
       else:
         dq, dk, dv, grad_attn_bias = _aten_efficient_attn_backward(

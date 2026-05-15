@@ -15,7 +15,9 @@ import torch
 
 from ffpa_attn import ffpa_attn_func
 from ffpa_attn.triton._ffpa_bwd import _get_bwd_autotune, _get_decode_bwd_stage1_autotune, _get_pre_autotune
+from ffpa_attn.triton._ffpa_bwd_sm90 import _get_bwd_sm90_autotune, is_sm90_tma_backward_supported
 from ffpa_attn.triton._ffpa_fwd import _get_decode_fwd_stage1_autotune, _get_decode_num_splits, _get_fwd_autotune
+from ffpa_attn.triton._ffpa_fwd_sm90 import _get_fwd_sm90_autotune, is_sm90_tma_forward_supported
 from ffpa_attn.triton._persistent_autotune import (
   PersistentConfigRequest,
   clear_config_cache,
@@ -41,7 +43,22 @@ def _parse_args() -> argparse.Namespace:
   parser.add_argument("--N", type=int, default=8192)
   parser.add_argument("--D", type=int, default=512)
   parser.add_argument("--mode", choices=("fast", "max"), default="fast")
-  return parser.parse_args()
+  parser.add_argument("--enable-tma", action="store_true", help="Compatibility alias for both TMA directions.")
+  parser.add_argument("--enable-ws", action="store_true", help="Compatibility alias for both WS directions.")
+  parser.add_argument("--enable-fwd-tma", action="store_true", help="Verify the SM90+ TMA forward path.")
+  parser.add_argument("--enable-bwd-tma", action="store_true", help="Verify the SM90+ TMA backward path.")
+  parser.add_argument("--enable-fwd-ws", action="store_true", help="Verify warp-specialized SM90+ TMA forward configs.")
+  parser.add_argument(
+    "--enable-bwd-ws", action="store_true", help="Verify warp-specialized SM90+ TMA backward configs."
+  )
+  args = parser.parse_args()
+  if args.enable_tma:
+    args.enable_fwd_tma = True
+    args.enable_bwd_tma = True
+  if args.enable_ws:
+    args.enable_fwd_ws = True
+    args.enable_bwd_ws = True
+  return args
 
 
 def _case_shape(case_name: str, heads: int, seqlen: int) -> tuple[int, int, int, int]:
@@ -87,6 +104,8 @@ def _run_forward(args: argparse.Namespace, q: torch.Tensor, k: torch.Tensor, v: 
     forward_backend="triton",
     triton_autotune=True,
     triton_autotune_mode=args.mode,
+    enable_forward_tma=args.enable_fwd_tma,
+    enable_forward_ws=args.enable_fwd_ws,
   )
   del out
   torch.cuda.synchronize()
@@ -95,7 +114,16 @@ def _run_forward(args: argparse.Namespace, q: torch.Tensor, k: torch.Tensor, v: 
   _, nheads_q, seqlen_q, headdim = q.shape
   _, nheads_kv, seqlen_k, _ = k.shape
   num_splits = _get_decode_num_splits(seqlen_q, seqlen_k, headdim, q.size(0), nheads_q, q.device)
-  if num_splits == 1:
+  use_sm90_tma = args.enable_fwd_tma and is_sm90_tma_forward_supported(
+    q, k, v, torch.empty_like(q), num_splits=num_splits
+  )
+  if use_sm90_tma:
+    kernel = "fwd_sm90_generic"
+    online = config_from_triton_config(
+      _get_fwd_sm90_autotune(headdim, args.mode, dtype, enable_ws=args.enable_fwd_ws).best_config
+    )
+    use_gemv = None
+  elif num_splits == 1:
     kernel = "fwd_generic"
     online = config_from_triton_config(_get_fwd_autotune(headdim, args.mode, dtype).best_config)
     use_gemv = None
@@ -116,6 +144,8 @@ def _run_forward(args: argparse.Namespace, q: torch.Tensor, k: torch.Tensor, v: 
       use_gemv=use_gemv,
       has_attn_bias=False,
       has_dropout=False,
+      enable_tma=True if use_sm90_tma else False,
+      enable_ws=args.enable_fwd_ws if use_sm90_tma else False,
       nheads_q=nheads_q,
       nheads_kv=nheads_kv,
       device_index=q.device.index,
@@ -134,6 +164,8 @@ def _run_backward(args: argparse.Namespace, q: torch.Tensor, k: torch.Tensor, v:
     backward_backend="triton",
     triton_autotune=True,
     triton_autotune_mode=args.mode,
+    enable_backward_tma=args.enable_bwd_tma,
+    enable_backward_ws=args.enable_bwd_ws,
   )
   out.sum().backward()
   torch.cuda.synchronize()
@@ -154,10 +186,26 @@ def _run_backward(args: argparse.Namespace, q: torch.Tensor, k: torch.Tensor, v:
       device_index=q.device.index,
     )
   )
+  use_sm90_tma = args.enable_bwd_tma and seqlen_q >= 8 and is_sm90_tma_backward_supported(
+    q,
+    k,
+    v,
+    q,
+    q,
+    k,
+    v,
+    seqlen_q=seqlen_q,
+  )
   if seqlen_q < 8:
     kernel = "decode_bwd_stage1"
     use_gemv = seqlen_q == 1
     online = config_from_triton_config(_get_decode_bwd_stage1_autotune(headdim, use_gemv, args.mode, False).best_config)
+  elif use_sm90_tma:
+    kernel = "bwd_sm90_generic"
+    use_gemv = None
+    online = config_from_triton_config(
+      _get_bwd_sm90_autotune(headdim, args.mode, dtype, False, enable_ws=args.enable_bwd_ws).best_config
+    )
   else:
     kernel = "bwd_generic"
     use_gemv = None
@@ -177,6 +225,8 @@ def _run_backward(args: argparse.Namespace, q: torch.Tensor, k: torch.Tensor, v:
       use_gemv=use_gemv,
       has_attn_bias=False,
       has_dropout=False,
+      enable_tma=True if use_sm90_tma else False,
+      enable_ws=args.enable_bwd_ws if use_sm90_tma else False,
       nheads_q=nheads_q,
       nheads_kv=nheads_kv,
       device_index=q.device.index,

@@ -48,6 +48,50 @@ def test_triton_autotune_accepts_true():
   assert meta.triton_autotune is True
 
 
+def test_directional_tma_ws_flags_default_to_false():
+  meta = FFPAAttnMeta.from_kwargs()
+  assert meta.enable_forward_tma == 0
+  assert meta.enable_backward_tma == 0
+  assert meta.enable_forward_ws == 0
+  assert meta.enable_backward_ws == 0
+
+
+def test_directional_tma_ws_flags_can_split_forward_and_backward():
+  meta = FFPAAttnMeta.from_kwargs(
+    enable_forward_tma=True,
+    enable_backward_tma=False,
+    enable_forward_ws=True,
+    enable_backward_ws=False,
+  )
+  assert meta.enable_forward_tma == 1
+  assert meta.enable_backward_tma == 0
+  assert meta.enable_forward_ws == 1
+  assert meta.enable_backward_ws == 0
+
+
+def test_legacy_tma_ws_flags_map_to_both_directions():
+  meta = FFPAAttnMeta.from_kwargs(enable_tma=True, enable_ws=True)
+  assert meta.enable_forward_tma == 1
+  assert meta.enable_backward_tma == 1
+  assert meta.enable_forward_ws == 1
+  assert meta.enable_backward_ws == 1
+
+
+def test_legacy_tma_ws_flags_reject_conflicting_directional_values():
+  with pytest.raises(ValueError, match="enable_tma conflicts"):
+    FFPAAttnMeta.from_kwargs(enable_tma=True, enable_forward_tma=False)
+  with pytest.raises(ValueError, match="enable_ws conflicts"):
+    FFPAAttnMeta.from_kwargs(enable_ws=True, enable_backward_ws=False)
+
+
+def test_directional_ws_without_tma_is_allowed_as_noop_option():
+  meta = FFPAAttnMeta.from_kwargs(enable_forward_ws=True, enable_backward_ws=True)
+  assert meta.enable_forward_tma == 0
+  assert meta.enable_backward_tma == 0
+  assert meta.enable_forward_ws == 1
+  assert meta.enable_backward_ws == 1
+
+
 @pytest.mark.parametrize("old_key", ["triton_forward_autotune", "triton_backward_autotune"])
 def test_old_directional_triton_autotune_keys_are_rejected(old_key):
   with pytest.raises(TypeError, match=old_key):
@@ -154,12 +198,64 @@ def test_persistent_payload_records_hardware_desc(monkeypatch):
     minor = 9
 
   monkeypatch.setattr(autotune_module.torch.cuda, "get_device_properties", lambda device=0: Props())
-  payload = _build_payload([], "fast", 1, 32, False, [512], enable_tma=True, enable_ws=True)
+  payload = _build_payload(
+    [],
+    "fast",
+    1,
+    32,
+    False,
+    [512],
+    enable_forward_tma=True,
+    enable_backward_tma=False,
+    enable_forward_ws=True,
+    enable_backward_ws=False,
+  )
 
-  assert payload["hardware_desc"] == {"enable_tma": True, "enable_ws": True}
+  assert payload["hardware_desc"] == {
+    "enable_forward_tma": True,
+    "enable_backward_tma": False,
+    "enable_forward_ws": True,
+    "enable_backward_ws": False,
+  }
   assert "enable_tma" not in payload
   assert "enable_ws" not in payload
   assert "generation_options" not in payload
+
+
+def test_autotune_cli_legacy_flags_map_to_both_directions():
+  args = SimpleNamespace(
+    enable_tma=True,
+    enable_ws=True,
+    enable_fwd_tma=False,
+    enable_bwd_tma=False,
+    enable_fwd_ws=False,
+    enable_bwd_ws=False,
+  )
+
+  autotune_module._resolve_directional_cli_flags(args)
+
+  assert args.enable_fwd_tma is True
+  assert args.enable_bwd_tma is True
+  assert args.enable_fwd_ws is True
+  assert args.enable_bwd_ws is True
+
+
+def test_autotune_cli_directional_flags_do_not_cross_enable():
+  args = SimpleNamespace(
+    enable_tma=False,
+    enable_ws=False,
+    enable_fwd_tma=True,
+    enable_bwd_tma=False,
+    enable_fwd_ws=True,
+    enable_bwd_ws=False,
+  )
+
+  autotune_module._resolve_directional_cli_flags(args)
+
+  assert args.enable_fwd_tma is True
+  assert args.enable_bwd_tma is False
+  assert args.enable_fwd_ws is True
+  assert args.enable_bwd_ws is False
 
 
 def test_persistent_tune_forward_records_sm90_tma_config(monkeypatch):
