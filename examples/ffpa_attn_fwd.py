@@ -422,6 +422,7 @@ def run_forward_examples(
   print_results: bool = True,
   enable_tma: bool = False,
   enable_ws: bool = False,
+  tasks: set[str] | None = None,
 ) -> list[FORWARD_RESULT]:
   """Run the canonical forward benchmark cases.
 
@@ -442,6 +443,7 @@ def run_forward_examples(
   :param print_results: Whether to print each case result.
   :param enable_tma: Whether to enable the SM90+ TMA forward path.
   :param enable_ws: Whether to force warp-specialized SM90 TMA configs.
+  :param tasks: Optional case-name filter. ``None`` runs all cases.
   :return: One structured result per executed case and dtype.
   """
   _validate_timing_args(warmup, iters)
@@ -456,6 +458,7 @@ def run_forward_examples(
     f"triton_backward_grad_v_storage_dtype={triton_backward_grad_v_storage_dtype}, "
     f"enable_tma={enable_tma}, "
     f"enable_ws={enable_ws}, "
+    f"tasks={sorted(tasks) if tasks is not None else 'full'}, "
     f"warmup={warmup}, iters={iters}"
   )
 
@@ -525,6 +528,8 @@ def run_forward_examples(
       "Nq": N - 1 if N > 1 else N,
       "Nkv": N - 1 if N > 1 else N,
     })
+    if tasks is not None:
+      case_specs = [case for case in case_specs if case["name"] in tasks]
 
     for case in case_specs:
       results.append(

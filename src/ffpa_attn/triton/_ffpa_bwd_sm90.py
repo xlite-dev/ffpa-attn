@@ -405,7 +405,7 @@ def is_sm90_tma_backward_supported(
   return all(tensor.stride(-1) == 1 for tensor in (q, k, v, do, dq, dk, dv))
 
 
-def _ffpa_bwd_sm90_make_descriptors(
+def _ffpa_bwd_sm90_make_descs(
   q: torch.Tensor,
   k: torch.Tensor,
   v: torch.Tensor,
@@ -621,8 +621,13 @@ def _ffpa_attn_backward_sm90_impl(
       batch * nheads,
     )
 
-  desc_q, desc_k, desc_v, desc_do = _ffpa_bwd_sm90_make_descriptors(q, k, v, do)
-  set_tma_allocator(q.device)
+  desc_q, desc_k, desc_v, desc_do = _ffpa_bwd_sm90_make_descs(q, k, v, do)
+
+  def _tma_alloc_fn(size: int, align: int, _):
+    return torch.empty(size, dtype=torch.int8, device=q.device)
+
+  triton.set_allocator(_tma_alloc_fn)
+
   kernel_args = (
     desc_q,
     desc_k,
@@ -721,12 +726,3 @@ def _ffpa_attn_backward_sm90_impl(
       num_warps=8,
       num_stages=2,
     )
-
-
-def set_tma_allocator(device: torch.device) -> None:
-  """Install Triton's TMA allocator for descriptor kernels."""
-
-  def _tma_alloc_fn(size: int, align: int, _):
-    return torch.empty(size, dtype=torch.int8, device=device)
-
-  triton.set_allocator(_tma_alloc_fn)

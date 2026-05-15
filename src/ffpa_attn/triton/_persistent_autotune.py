@@ -454,8 +454,6 @@ def _lookup_persistent_config_cached(
       continue
     if entry.get("kernel") != request.kernel:
       continue
-    if entry.get("autotune_mode") != request.autotune_mode:
-      continue
     if entry.get("dtype") != request.dtype:
       continue
     if request.causal is not None and bool(entry.get("causal", False)) != request.causal:

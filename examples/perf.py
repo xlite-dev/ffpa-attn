@@ -67,6 +67,7 @@ TFLOPS_PLOT_CASES: list[tuple[str, str]] = [
   ("non-aligned", "non-aligned(F/B)"),
 ]
 CASE_LABELS = dict(PLOT_CASES)
+VALID_TASKS = tuple(case_name for case_name, _ in PLOT_CASES)
 DTYPE_ORDER = ["fp16", "bf16"]
 DEFAULT_OUTPUT_STEM = "ffpa_speedup"
 DEFAULT_OUTPUT_DIR = Path(".tmp")
@@ -191,6 +192,15 @@ def _parse_args() -> argparse.Namespace:
     help="Backward backend used when --backward is enabled.",
   )
   parser.add_argument("--tune", choices=["fast", "max"], help="Enable Triton autotune with the selected search mode.")
+  parser.add_argument(
+    "--tasks",
+    nargs="*",
+    default=None,
+    help=(
+      "Benchmark cases to run, separated by commas or whitespace, for example self-attn,cross-attn. "
+      "Defaults to full; valid cases: " + ",".join(VALID_TASKS)
+    ),
+  )
   parser.add_argument("--B", type=int, default=1, help="Batch size used by benchmark mode.")
   parser.add_argument("--H", type=int, default=32, help="Base head count used by benchmark mode.")
   parser.add_argument("--N", type=int, default=8192, help="Base sequence length used by benchmark mode.")
@@ -232,6 +242,41 @@ def _parse_args() -> argparse.Namespace:
     help="Optional output directory used to save the generated PNG and Markdown artifacts. Defaults to ./.tmp.",
   )
   return parser.parse_args()
+
+
+def _parse_tasks_arg(tasks_arg: list[str] | None) -> set[str] | None:
+  """Parse the optional benchmark task filter.
+
+  :param tasks_arg: Raw ``--tasks`` values.
+  :return: Selected case names, or ``None`` for the full benchmark suite.
+  :raises SystemExit: If an unknown case name is requested.
+  """
+  if tasks_arg is None:
+    return None
+  normalized = " ".join(tasks_arg).strip()
+  if normalized == "" or normalized.lower() in {"full", "all", "none"}:
+    return None
+  tasks = {task for task in re.split(r"[\s,]+", normalized) if task}
+  if not tasks:
+    return None
+  invalid = sorted(tasks.difference(VALID_TASKS))
+  if invalid:
+    valid = ",".join(VALID_TASKS)
+    raise SystemExit(f"Unknown --tasks value(s): {','.join(invalid)}. Valid cases: {valid}, or full.")
+  return tasks
+
+
+def _active_plot_cases(tasks: set[str] | None, *, include_decode: bool = True) -> list[tuple[str, str]]:
+  """Return plot cases filtered by an optional task set.
+
+  :param tasks: Optional selected case names.
+  :param include_decode: Whether ``decode-attn`` should be included.
+  :return: Ordered plot case list.
+  """
+  source = PLOT_CASES if include_decode else TFLOPS_PLOT_CASES
+  if tasks is None:
+    return list(source)
+  return [(case_name, label) for case_name, label in source if case_name in tasks]
 
 
 def _device_name() -> str:
@@ -364,19 +409,28 @@ def _decorate_rows(direction: str, rows: list[dict[str, Any]]) -> list[RESULT_RO
   return [{"direction": direction, **row} for row in rows]
 
 
-def _build_fallback_rows(B: int, H: int, N: int, D: int) -> tuple[list[RESULT_ROW], list[RESULT_ROW]]:
+def _build_fallback_rows(
+  B: int,
+  H: int,
+  N: int,
+  D: int,
+  tasks: set[str] | None = None,
+) -> tuple[list[RESULT_ROW], list[RESULT_ROW]]:
   """Build structured rows for the legacy hard-coded plot data.
 
   :param B: Batch size shown in metadata.
   :param H: Base head count shown in metadata.
   :param N: Base sequence length shown in metadata.
   :param D: Head dimension shown in metadata.
+  :param tasks: Optional case-name filter.
   :return: ``(forward_rows, backward_rows)``.
   """
   forward_rows: list[RESULT_ROW] = []
   backward_rows: list[RESULT_ROW] = []
   for direction, target in (("forward", forward_rows), ("backward", backward_rows)):
     for case_name, _ in PLOT_CASES:
+      if tasks is not None and case_name not in tasks:
+        continue
       nq, nkv = _case_shape(case_name, N)
       for dtype in DTYPE_ORDER:
         target.append({
@@ -401,22 +455,31 @@ def _build_fallback_rows(B: int, H: int, N: int, D: int) -> tuple[list[RESULT_RO
   return forward_rows, backward_rows
 
 
-def _aggregate_speedups(rows: list[RESULT_ROW], direction: str) -> list[float] | None:
+def _aggregate_speedups(
+  rows: list[RESULT_ROW],
+  direction: str,
+  plot_cases: list[tuple[str, str]] | None = None,
+) -> list[float] | None:
   """Aggregate per-dtype rows into the bar heights used by the plot.
 
   :param rows: Structured rows for one or both directions.
   :param direction: ``forward`` or ``backward``.
+  :param plot_cases: Ordered cases to aggregate for plotting.
   :return: Aggregated bar heights, or ``None`` when the direction is absent.
   """
-  case_to_speedups: dict[str, list[float]] = {case_name: [] for case_name, _ in PLOT_CASES}
+  active_plot_cases = PLOT_CASES if plot_cases is None else plot_cases
+  active_case_names = {case_name for case_name, _ in active_plot_cases}
+  case_to_speedups: dict[str, list[float]] = {case_name: [] for case_name, _ in active_plot_cases}
   for row in rows:
     if row["direction"] != direction:
+      continue
+    if row["case_name"] not in active_case_names:
       continue
     case_to_speedups[row["case_name"]].append(float(row["speedup"]))
   if not any(case_to_speedups.values()):
     return None
   values: list[float] = []
-  for case_name, _ in PLOT_CASES:
+  for case_name, _ in active_plot_cases:
     speeds = case_to_speedups[case_name]
     values.append(float(np.amax(speeds)) if speeds else float("nan"))
   return values
@@ -470,6 +533,7 @@ def plot_speedup(
   N: int,
   D: int,
   output_path: Path,
+  plot_cases: list[tuple[str, str]] | None = None,
 ) -> Path:
   """Render the speedup bar chart while preserving the legacy look.
 
@@ -481,16 +545,18 @@ def plot_speedup(
   :param N: Sequence length shown in the title.
   :param D: Head dimension shown in the title.
   :param output_path: Output PNG path.
+  :param plot_cases: Ordered cases to include in the plot.
   :return: Saved PNG path.
   """
-  fwd_speedups = _aggregate_speedups(forward_rows, "forward")
-  bwd_speedups = _aggregate_speedups(backward_rows, "backward")
+  active_plot_cases = PLOT_CASES if plot_cases is None else plot_cases
+  fwd_speedups = _aggregate_speedups(forward_rows, "forward", active_plot_cases)
+  bwd_speedups = _aggregate_speedups(backward_rows, "backward", active_plot_cases)
   has_forward = fwd_speedups is not None
   has_backward = bwd_speedups is not None
   if not has_forward and not has_backward:
     raise ValueError("No forward or backward rows were provided for plotting.")
 
-  attn_types = [label for _, label in PLOT_CASES]
+  attn_types = [label for _, label in active_plot_cases]
   sdpa_speedups = [1.0] * len(attn_types)
 
   fig, ax = plt.subplots(figsize=(32, 12))
@@ -606,6 +672,7 @@ def plot_tflops(
   N: int,
   D: int,
   output_path: Path,
+  plot_cases: list[tuple[str, str]] | None = None,
 ) -> Path | None:
   """Render the TFLOPS comparison bar chart.
 
@@ -617,18 +684,20 @@ def plot_tflops(
   :param N: Sequence length shown in the title.
   :param D: Head dimension shown in the title.
   :param output_path: Output PNG path.
+  :param plot_cases: Ordered cases to include in the plot.
   :return: Saved PNG path, or ``None`` when no TFLOPS data is available.
   """
-  fwd_ffpa_tflops = _aggregate_metric(forward_rows, "forward", "ffpa_tflops", plot_cases=TFLOPS_PLOT_CASES)
-  fwd_sdpa_tflops = _aggregate_metric(forward_rows, "forward", "sdpa_tflops", plot_cases=TFLOPS_PLOT_CASES)
-  bwd_ffpa_tflops = _aggregate_metric(backward_rows, "backward", "ffpa_tflops", plot_cases=TFLOPS_PLOT_CASES)
-  bwd_sdpa_tflops = _aggregate_metric(backward_rows, "backward", "sdpa_tflops", plot_cases=TFLOPS_PLOT_CASES)
+  active_plot_cases = TFLOPS_PLOT_CASES if plot_cases is None else plot_cases
+  fwd_ffpa_tflops = _aggregate_metric(forward_rows, "forward", "ffpa_tflops", plot_cases=active_plot_cases)
+  fwd_sdpa_tflops = _aggregate_metric(forward_rows, "forward", "sdpa_tflops", plot_cases=active_plot_cases)
+  bwd_ffpa_tflops = _aggregate_metric(backward_rows, "backward", "ffpa_tflops", plot_cases=active_plot_cases)
+  bwd_sdpa_tflops = _aggregate_metric(backward_rows, "backward", "sdpa_tflops", plot_cases=active_plot_cases)
   has_forward = fwd_ffpa_tflops is not None and fwd_sdpa_tflops is not None
   has_backward = bwd_ffpa_tflops is not None and bwd_sdpa_tflops is not None
   if not has_forward and not has_backward:
     return None
 
-  attn_types = [label for _, label in TFLOPS_PLOT_CASES]
+  attn_types = [label for _, label in active_plot_cases]
   x = np.arange(len(attn_types))
   fig, ax = plt.subplots(figsize=(32, 12))
 
@@ -886,6 +955,7 @@ def _benchmark_rows(args: argparse.Namespace) -> tuple[list[RESULT_ROW], list[RE
 
   tune_mode = args.tune
   grad_v_dtype = _parse_grad_v_dtype(args.grad_v_storage_dtype)
+  tasks = _parse_tasks_arg(args.tasks)
   forward_rows: list[RESULT_ROW] = []
   backward_rows: list[RESULT_ROW] = []
   if args.forward:
@@ -907,6 +977,7 @@ def _benchmark_rows(args: argparse.Namespace) -> tuple[list[RESULT_ROW], list[RE
         print_results=True,
         enable_tma=args.enable_tma,
         enable_ws=args.enable_ws,
+        tasks=tasks,
       ),
     )
   if args.backward:
@@ -929,6 +1000,7 @@ def _benchmark_rows(args: argparse.Namespace) -> tuple[list[RESULT_ROW], list[RE
         warmup=args.warmup,
         iters=args.iters,
         print_results=True,
+        tasks=tasks,
       ),
     )
   return forward_rows, backward_rows
@@ -939,14 +1011,18 @@ def main() -> None:
   args = _parse_args()
   fallback = args.show_fallback
   device_name = FALLBACK_DEVICE_NAME if fallback else _device_name()
+  tasks = _parse_tasks_arg(args.tasks)
 
   if not fallback and not args.forward and not args.backward:
     raise SystemExit("At least one direction must remain enabled. Use default settings, --no-fwd, or --no-bwd.")
 
   if fallback:
-    forward_rows, backward_rows = _build_fallback_rows(args.B, args.H, args.N, args.D)
+    forward_rows, backward_rows = _build_fallback_rows(args.B, args.H, args.N, args.D, tasks=tasks)
   else:
     forward_rows, backward_rows = _benchmark_rows(args)
+
+  speedup_plot_cases = _active_plot_cases(tasks)
+  tflops_plot_cases = _active_plot_cases(tasks, include_decode=False)
 
   output_stem = _resolve_output_stem(args.save_path, device_name, args.B, args.H, args.N, args.D)
   speedup_png_path = plot_speedup(
@@ -958,6 +1034,7 @@ def main() -> None:
     N=args.N,
     D=args.D,
     output_path=output_stem.with_name(f"{output_stem.name}.png"),  # speedup
+    plot_cases=speedup_plot_cases,
   )
   tflops_png_path = None if fallback else plot_tflops(
     forward_rows,
@@ -968,6 +1045,7 @@ def main() -> None:
     N=args.N,
     D=args.D,
     output_path=output_stem.with_name(f"{output_stem.name}_T.png"),  # tflops
+    plot_cases=tflops_plot_cases,
   )
   markdown = render_speedup_markdown(
     forward_rows,

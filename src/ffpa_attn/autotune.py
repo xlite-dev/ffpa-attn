@@ -377,7 +377,6 @@ def _entry_base(
   entry = {
     "direction": task.direction,
     "kernel": kernel,
-    "autotune_mode": mode,
     "causal": task.causal,
     "dtype": _dtype_schema_name(task.dtype),
     "headdim": task.headdim,
@@ -406,7 +405,6 @@ def _record_entry(
   key = (
     entry["direction"],
     entry["kernel"],
-    entry["autotune_mode"],
     entry["causal"],
     entry["dtype"],
     entry["headdim"],

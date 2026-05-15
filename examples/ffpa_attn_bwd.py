@@ -822,6 +822,7 @@ def run_backward_examples(
   warmup: int = DEFAULT_WARMUP,
   iters: int = DEFAULT_ITERS,
   print_results: bool = True,
+  tasks: set[str] | None = None,
 ) -> list[BACKWARD_RESULT]:
   """Run the canonical backward benchmark cases.
 
@@ -845,6 +846,7 @@ def run_backward_examples(
   :param warmup: Warmup iterations used for timing.
   :param iters: Measured iterations used for timing.
   :param print_results: Whether to print each case result.
+  :param tasks: Optional case-name filter. ``None`` runs all cases.
   :return: One structured result per executed case and dtype.
   """
   _validate_timing_args(warmup, iters)
@@ -859,7 +861,8 @@ def run_backward_examples(
     f"triton_autotune_mode={triton_autotune_mode}, "
     f"triton_backward_grad_v_storage_dtype={triton_backward_grad_v_storage_dtype}, "
     f"enable_tma={enable_tma}, enable_ws={enable_ws}, "
-    f"timing_mode={timing_mode}, warmup={warmup}, iters={iters}"
+    f"timing_mode={timing_mode}, tasks={sorted(tasks) if tasks is not None else 'full'}, "
+    f"warmup={warmup}, iters={iters}"
   )
 
   for dtype in (torch.float16, torch.bfloat16):
@@ -925,6 +928,8 @@ def run_backward_examples(
         "Nkv": N - 1 if N > 1 else N,
       },
     ]
+    if tasks is not None:
+      case_specs = [case for case in case_specs if case["name"] in tasks]
 
     for case in case_specs:
       results.append(
