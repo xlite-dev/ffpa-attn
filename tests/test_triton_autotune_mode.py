@@ -167,6 +167,16 @@ def test_persistent_tune_forward_records_sm90_tma_config(monkeypatch):
   q = torch.empty(1, 8, 512, 320)
   k = torch.empty_like(q)
   v = torch.empty_like(q)
+  generic_config = triton.Config(
+    {
+      "BLOCK_M": 128,
+      "BLOCK_N": 64,
+      "BLOCK_HEADDIM_QK": 64,
+      "BLOCK_HEADDIM_V": 64,
+    },
+    num_warps=4,
+    num_stages=2,
+  )
   ws_config = triton.Config(
     {
       "BLOCK_M": 64,
@@ -178,7 +188,8 @@ def test_persistent_tune_forward_records_sm90_tma_config(monkeypatch):
     num_warps=4,
     num_stages=2,
   )
-  wrapper = SimpleNamespace(best_config=ws_config, configs=[ws_config])
+  generic_wrapper = SimpleNamespace(best_config=generic_config, configs=[generic_config])
+  sm90_wrapper = SimpleNamespace(best_config=ws_config, configs=[ws_config])
   seen_kwargs = {}
 
   def fake_ffpa_attn_func(*args, **kwargs):
@@ -191,20 +202,23 @@ def test_persistent_tune_forward_records_sm90_tma_config(monkeypatch):
   monkeypatch.setattr(autotune_module, "_get_decode_num_splits", lambda *args, **kwargs: 1)
   monkeypatch.setattr(autotune_module, "is_sm90_tma_forward_supported", lambda *args, **kwargs: True)
   monkeypatch.setattr(autotune_module, "ffpa_attn_func", fake_ffpa_attn_func)
-  monkeypatch.setattr(autotune_module, "_get_fwd_sm90_autotune", lambda *args, **kwargs: wrapper)
+  monkeypatch.setattr(autotune_module, "_get_fwd_autotune", lambda *args, **kwargs: generic_wrapper)
+  monkeypatch.setattr(autotune_module, "_get_fwd_sm90_autotune", lambda *args, **kwargs: sm90_wrapper)
 
   entries = {}
   tuned_entries = _tune_forward(task, 1, "fast", entries, enable_tma=True, enable_ws=True)
 
-  entry, choices_count = tuned_entries[0]
-  assert choices_count == 1
-  assert entry["kernel"] == "fwd_sm90_generic"
-  assert entry["enable_tma"] is True
-  assert entry["enable_ws"] is True
-  assert entry["config"]["warp_specialize"] is True
+  assert [entry["kernel"] for entry, _ in tuned_entries] == ["fwd_generic", "fwd_sm90_generic"]
+  assert [choices_count for _, choices_count in tuned_entries] == [1, 1]
+  generic_entry, sm90_entry = [entry for entry, _ in tuned_entries]
+  assert generic_entry["enable_tma"] is False
+  assert generic_entry["enable_ws"] is False
+  assert sm90_entry["enable_tma"] is True
+  assert sm90_entry["enable_ws"] is True
+  assert sm90_entry["config"]["warp_specialize"] is True
   assert seen_kwargs["enable_tma"] is True
   assert seen_kwargs["enable_ws"] is True
-  assert list(entries.values()) == [entry]
+  assert list(entries.values()) == [generic_entry, sm90_entry]
 
 
 @pytest.mark.parametrize(
@@ -248,6 +262,7 @@ def test_persistent_tune_forward_allows_sm90_ws_for_masked_variants(monkeypatch,
   monkeypatch.setattr(autotune_module, "_get_decode_num_splits", lambda *args, **kwargs: 1)
   monkeypatch.setattr(autotune_module, "is_sm90_tma_forward_supported", lambda *args, **kwargs: True)
   monkeypatch.setattr(autotune_module, "ffpa_attn_func", fake_ffpa_attn_func)
+  monkeypatch.setattr(autotune_module, "_get_fwd_autotune", lambda *args, **kwargs: wrapper)
   monkeypatch.setattr(autotune_module, "_get_fwd_sm90_autotune", fake_get_sm90)
 
   _tune_forward(task, 1, "fast", {}, enable_tma=True, enable_ws=True)
@@ -314,6 +329,15 @@ def test_persistent_tune_backward_records_sm90_tma_config(monkeypatch):
   k = torch.empty_like(q, requires_grad=True)
   v = torch.empty_like(q, requires_grad=True)
   pre_config = triton.Config({"BLOCK_M": 128, "BLOCK_HEADDIM": 512, "D_CHUNK": False}, num_warps=8, num_stages=2)
+  generic_config = triton.Config(
+    {
+      "BLOCK_M": 128,
+      "BLOCK_N": 64,
+      "BLOCK_HEADDIM": 64,
+    },
+    num_warps=8,
+    num_stages=2,
+  )
   bwd_config = triton.Config(
     {
       "BLOCK_M": 64,
@@ -325,7 +349,8 @@ def test_persistent_tune_backward_records_sm90_tma_config(monkeypatch):
     num_stages=2,
   )
   pre_wrapper = SimpleNamespace(best_config=pre_config, configs=[pre_config])
-  bwd_wrapper = SimpleNamespace(best_config=bwd_config, configs=[bwd_config])
+  generic_wrapper = SimpleNamespace(best_config=generic_config, configs=[generic_config])
+  sm90_wrapper = SimpleNamespace(best_config=bwd_config, configs=[bwd_config])
   seen_kwargs = {}
 
   def fake_ffpa_attn_func(*args, **kwargs):
@@ -338,20 +363,23 @@ def test_persistent_tune_backward_records_sm90_tma_config(monkeypatch):
   monkeypatch.setattr(autotune_module, "is_sm90_tma_backward_supported", lambda *args, **kwargs: True)
   monkeypatch.setattr(autotune_module, "ffpa_attn_func", fake_ffpa_attn_func)
   monkeypatch.setattr(autotune_module, "_get_pre_autotune", lambda *args, **kwargs: pre_wrapper)
-  monkeypatch.setattr(autotune_module, "_get_bwd_sm90_autotune", lambda *args, **kwargs: bwd_wrapper)
+  monkeypatch.setattr(autotune_module, "_get_bwd_autotune", lambda *args, **kwargs: generic_wrapper)
+  monkeypatch.setattr(autotune_module, "_get_bwd_sm90_autotune", lambda *args, **kwargs: sm90_wrapper)
 
   entries = {}
   tuned_entries = _tune_backward(task, 1, "fast", entries, enable_tma=True, enable_ws=False)
 
-  assert len(tuned_entries) == 2
-  entry = tuned_entries[1][0]
-  assert entry["kernel"] == "bwd_sm90_generic"
-  assert entry["enable_tma"] is True
-  assert entry["enable_ws"] is False
-  assert entry["config"]["warp_specialize"] is False
+  assert [entry["kernel"] for entry, _ in tuned_entries] == ["bwd_preproc", "bwd_generic", "bwd_sm90_generic"]
+  generic_entry = tuned_entries[1][0]
+  sm90_entry = tuned_entries[2][0]
+  assert generic_entry["enable_tma"] is False
+  assert generic_entry["enable_ws"] is False
+  assert sm90_entry["enable_tma"] is True
+  assert sm90_entry["enable_ws"] is False
+  assert sm90_entry["config"]["warp_specialize"] is False
   assert seen_kwargs["enable_tma"] is True
   assert seen_kwargs["enable_ws"] is False
-  assert list(entries.values())[-1] == entry
+  assert list(entries.values())[-2:] == [generic_entry, sm90_entry]
 
 
 def test_forward_autotune_keys_include_causal():

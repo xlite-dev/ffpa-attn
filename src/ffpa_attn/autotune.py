@@ -468,6 +468,7 @@ def _tune_forward(
 ) -> list[tuple[dict[str, Any], int]]:
   q, k, v = _make_tensors(task, batch)
   attn_bias = _make_attn_bias(task)
+  dtype = _dtype_schema_name(task.dtype)
   num_splits = _get_decode_num_splits(
     task.seqlen_q,
     task.seqlen_k,
@@ -484,47 +485,35 @@ def _tune_forward(
     num_splits=num_splits,
   )
   use_sm90_ws = use_sm90_tma and enable_ws
-  if task.has_dropout:
-    torch.manual_seed(_TUNE_SEED + 17)
-  out = ffpa_attn_func(
-    q,
-    k,
-    v,
-    attn_mask=attn_bias,
-    dropout_p=_FULL_TASK_DROPOUT_P if task.has_dropout else 0.0,
-    is_causal=task.causal,
-    enable_gqa=task.nheads_q != task.nheads_kv,
-    forward_backend="triton",
-    triton_autotune=True,
-    triton_autotune_mode=mode,
-    enable_tma=use_sm90_tma,
-    enable_ws=use_sm90_ws,
-  )
-  del out
-  if use_sm90_tma:
-    wrapper = _get_fwd_sm90_autotune(
-      task.headdim,
-      mode,
-      _dtype_schema_name(task.dtype),
-      enable_ws=use_sm90_ws,
+
+  def run_forward_tune(run_enable_tma: bool, run_enable_ws: bool) -> None:
+    if task.has_dropout:
+      torch.manual_seed(_TUNE_SEED + 17)
+    out = ffpa_attn_func(
+      q,
+      k,
+      v,
+      attn_mask=attn_bias,
+      dropout_p=_FULL_TASK_DROPOUT_P if task.has_dropout else 0.0,
+      is_causal=task.causal,
+      enable_gqa=task.nheads_q != task.nheads_kv,
+      forward_backend="triton",
+      triton_autotune=True,
+      triton_autotune_mode=mode,
+      enable_tma=run_enable_tma,
+      enable_ws=run_enable_ws,
     )
-    kernel = "fwd_sm90_generic"
+    del out
+
+  tuned_entries: list[tuple[dict[str, Any], int]] = []
+
+  run_forward_tune(False, False)
+  if num_splits == 1:
+    wrapper = _get_fwd_autotune(task.headdim, mode, dtype)
     entry = _entry_base(
       task,
       mode,
-      kernel,
-      config_from_triton_config(wrapper.best_config),
-      enable_tma=True,
-      enable_ws=use_sm90_ws,
-    )
-    choices_count = len(wrapper.configs)
-  elif num_splits == 1:
-    wrapper = _get_fwd_autotune(task.headdim, mode, _dtype_schema_name(task.dtype))
-    kernel = "fwd_generic"
-    entry = _entry_base(
-      task,
-      mode,
-      kernel,
+      "fwd_generic",
       config_from_triton_config(wrapper.best_config),
       enable_tma=False,
       enable_ws=False,
@@ -536,13 +525,12 @@ def _tune_forward(
       task.headdim,
       use_gemv,
       mode,
-      _dtype_schema_name(task.dtype),
+      dtype,
     )
-    kernel = "decode_fwd_stage1"
     entry = _entry_base(
       task,
       mode,
-      kernel,
+      "decode_fwd_stage1",
       config_from_triton_config(wrapper.best_config),
       enable_tma=False,
       enable_ws=False,
@@ -550,7 +538,29 @@ def _tune_forward(
     entry["use_gemv"] = use_gemv
     choices_count = len(wrapper.configs)
   _record_entry(entries, entry)
-  return [(entry, choices_count)]
+  tuned_entries.append((entry, choices_count))
+
+  if use_sm90_tma:
+    run_forward_tune(True, use_sm90_ws)
+    wrapper = _get_fwd_sm90_autotune(
+      task.headdim,
+      mode,
+      dtype,
+      enable_ws=use_sm90_ws,
+    )
+    entry = _entry_base(
+      task,
+      mode,
+      "fwd_sm90_generic",
+      config_from_triton_config(wrapper.best_config),
+      enable_tma=True,
+      enable_ws=use_sm90_ws,
+    )
+    choices_count = len(wrapper.configs)
+    _record_entry(entries, entry)
+    tuned_entries.append((entry, choices_count))
+
+  return tuned_entries
 
 
 def _tune_backward(
@@ -563,6 +573,7 @@ def _tune_backward(
 ) -> list[tuple[dict[str, Any], int]]:
   q, k, v = _make_tensors(task, batch)
   attn_bias = _make_attn_bias(task)
+  dtype = _dtype_schema_name(task.dtype)
   use_sm90_tma = enable_tma and is_sm90_tma_backward_supported(
     q,
     k,
@@ -574,26 +585,30 @@ def _tune_backward(
     seqlen_q=task.seqlen_q,
   )
   use_sm90_ws = use_sm90_tma and enable_ws
-  if task.has_dropout:
-    torch.manual_seed(_TUNE_SEED + 17)
-  out = ffpa_attn_func(
-    q,
-    k,
-    v,
-    attn_mask=attn_bias,
-    dropout_p=_FULL_TASK_DROPOUT_P if task.has_dropout else 0.0,
-    is_causal=task.causal,
-    enable_gqa=task.nheads_q != task.nheads_kv,
-    forward_backend="triton",
-    backward_backend="triton",
-    triton_autotune=True,
-    triton_autotune_mode=mode,
-    enable_tma=use_sm90_tma,
-    enable_ws=use_sm90_ws,
-  )
-  out.float().sum().backward()
 
-  pre_wrapper = _get_pre_autotune(False, mode, _dtype_schema_name(task.dtype))
+  def run_backward_tune(run_enable_tma: bool, run_enable_ws: bool) -> None:
+    if task.has_dropout:
+      torch.manual_seed(_TUNE_SEED + 17)
+    out = ffpa_attn_func(
+      q,
+      k,
+      v,
+      attn_mask=attn_bias,
+      dropout_p=_FULL_TASK_DROPOUT_P if task.has_dropout else 0.0,
+      is_causal=task.causal,
+      enable_gqa=task.nheads_q != task.nheads_kv,
+      forward_backend="triton",
+      backward_backend="triton",
+      triton_autotune=True,
+      triton_autotune_mode=mode,
+      enable_tma=run_enable_tma,
+      enable_ws=run_enable_ws,
+    )
+    out.float().sum().backward()
+
+  run_backward_tune(False, False)
+
+  pre_wrapper = _get_pre_autotune(False, mode, dtype)
   pre_entry = _entry_base(
     task,
     mode,
@@ -613,6 +628,7 @@ def _tune_backward(
   })
   _record_entry(entries, pre_entry)
   pre_choices_count = len(pre_wrapper.configs)
+  tuned_entries = [(pre_entry, pre_choices_count)]
 
   if task.seqlen_q < 8:
     use_gemv = task.seqlen_q == 1
@@ -635,25 +651,14 @@ def _tune_backward(
     })
     choices_count = len(wrapper.configs)
   else:
-    if use_sm90_tma:
-      wrapper = _get_bwd_sm90_autotune(
-        task.headdim,
-        mode,
-        _dtype_schema_name(task.dtype),
-        task.has_attn_bias,
-        enable_ws=use_sm90_ws,
-      )
-      kernel = "bwd_sm90_generic"
-    else:
-      wrapper = _get_bwd_autotune(task.headdim, mode, task.has_attn_bias)
-      kernel = "bwd_generic"
+    wrapper = _get_bwd_autotune(task.headdim, mode, task.has_attn_bias)
     entry = _entry_base(
       task,
       mode,
-      kernel,
+      "bwd_generic",
       config_from_triton_config(wrapper.best_config),
-      enable_tma=use_sm90_tma,
-      enable_ws=use_sm90_ws,
+      enable_tma=False,
+      enable_ws=False,
     )
     entry.update({
       "bias_grad": task.has_attn_bias,
@@ -661,7 +666,34 @@ def _tune_backward(
     })
     choices_count = len(wrapper.configs)
   _record_entry(entries, entry)
-  return [(pre_entry, pre_choices_count), (entry, choices_count)]
+  tuned_entries.append((entry, choices_count))
+
+  if task.seqlen_q >= 8 and use_sm90_tma:
+    run_backward_tune(True, use_sm90_ws)
+    wrapper = _get_bwd_sm90_autotune(
+      task.headdim,
+      mode,
+      dtype,
+      task.has_attn_bias,
+      enable_ws=use_sm90_ws,
+    )
+    entry = _entry_base(
+      task,
+      mode,
+      "bwd_sm90_generic",
+      config_from_triton_config(wrapper.best_config),
+      enable_tma=True,
+      enable_ws=use_sm90_ws,
+    )
+    entry.update({
+      "bias_grad": task.has_attn_bias,
+      "grad_v_storage_dtype": None,
+    })
+    choices_count = len(wrapper.configs)
+    _record_entry(entries, entry)
+    tuned_entries.append((entry, choices_count))
+
+  return tuned_entries
 
 
 def _build_payload(
@@ -741,12 +773,12 @@ def _parse_args() -> argparse.Namespace:
   parser.add_argument(
     "--enable-tma",
     action="store_true",
-    help="Generate persistent configs for the SM90+ TMA forward path when supported.",
+    help="Also generate persistent configs for SM90+ TMA forward/backward paths when supported.",
   )
   parser.add_argument(
     "--enable-ws",
     action="store_true",
-    help="Force warp-specialized SM90+ TMA forward configs when --enable-tma is set.",
+    help="Force warp-specialized SM90+ TMA configs when --enable-tma is set.",
   )
   parser.add_argument(
     "--overwrite",
