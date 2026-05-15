@@ -62,9 +62,6 @@ TFLOPS_PLOT_CASES: list[tuple[str, str]] = [
   ("cross-attn", "cross-attn(F/B)"),
   ("gqa", "gqa(F/B)"),
   ("causal", "causal(F/B)"),
-  # ("attn-mask", "attn-mask(F/B)"),
-  # ("dropout", "dropout(F/B)"),
-  ("non-aligned", "non-aligned(F/B)"),
 ]
 CASE_LABELS = dict(PLOT_CASES)
 VALID_TASKS = tuple(case_name for case_name, _ in PLOT_CASES)
