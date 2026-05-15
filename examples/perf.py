@@ -810,7 +810,7 @@ def plot_tflops(
   ax.set_ylabel("Throughput (TFLOPS)", fontsize=18)
   fig.suptitle(
     f"FFPA vs SDPA TFLOPS ({_mode_suffix(has_forward, has_backward)}) | {device_name} | B={B}, N={N}, H={H}, D={D}",
-    fontsize=22,
+    fontsize=18,
     fontweight="bold",
     y=0.958,
   )
@@ -820,7 +820,7 @@ def plot_tflops(
   ymax = max(finite_values) if finite_values else 1.0
   ax.set_ylim(0, ymax * 1.10 if ymax > 0 else 1.0)
   ax.legend(
-    fontsize=20,
+    fontsize=18,
     loc="upper center",
     bbox_to_anchor=(0.5, 1.01),
     ncol=4,
