@@ -189,6 +189,40 @@ def test_sm90_fwd_configs_can_disable_warp_specialize():
   assert {config["warp_specialize"] for config in serialized} == {False}
 
 
+def test_sm90_fwd_max_configs_add_full_headdim_on_large_gpu(monkeypatch):
+  monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+  monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+  monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=0: (9, 0))
+  monkeypatch.setattr(torch.cuda, "get_device_name", lambda device=0: "NVIDIA H800")
+
+  configs = _gen_fwd_sm90_autotune_configs(
+    320,
+    autotune_mode="max",
+    enable_ws=False,
+  )
+  serialized = [config_from_triton_config(config) for config in configs]
+
+  assert any(config["BLOCK_HEADDIM_QK"] == 512 for config in serialized)
+  assert any(config["BLOCK_HEADDIM_V"] == 512 for config in serialized)
+
+
+def test_sm90_fwd_max_configs_skip_full_headdim_on_rtx(monkeypatch):
+  monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+  monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+  monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=0: (12, 0))
+  monkeypatch.setattr(torch.cuda, "get_device_name", lambda device=0: "NVIDIA GeForce RTX 5090")
+
+  configs = _gen_fwd_sm90_autotune_configs(
+    320,
+    autotune_mode="max",
+    enable_ws=False,
+  )
+  serialized = [config_from_triton_config(config) for config in configs]
+
+  assert all(config["BLOCK_HEADDIM_QK"] != 512 for config in serialized)
+  assert all(config["BLOCK_HEADDIM_V"] != 512 for config in serialized)
+
+
 def test_persistent_payload_records_hardware_desc(monkeypatch):
   monkeypatch.setattr(autotune_module.torch.cuda, "current_device", lambda: 0)
   monkeypatch.setattr(autotune_module.torch.cuda, "get_device_name", lambda device=0: "NVIDIA L20")

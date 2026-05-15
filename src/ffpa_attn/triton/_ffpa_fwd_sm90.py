@@ -405,6 +405,20 @@ _SM90_WS_CONFIGS = [
 ]
 
 
+def _is_large_sm90_or_newer_device() -> bool:
+  """Return whether the current CUDA device should try full-D SM90 TMA tiles."""
+  if not torch.cuda.is_available():
+    return False
+  device = torch.cuda.current_device()
+  if torch.cuda.get_device_capability(device)[0] < 9:
+    return False
+  device_name = torch.cuda.get_device_name(device).strip().upper()
+  for prefix in ("NVIDIA ", "GEFORCE "):
+    if device_name.startswith(prefix):
+      device_name = device_name[len(prefix):]
+  return not device_name.startswith("RTX")
+
+
 def _gen_fwd_sm90_autotune_configs(
   headdim: int = 256,
   autotune_mode: str = "max",
@@ -423,10 +437,12 @@ def _gen_fwd_sm90_autotune_configs(
   :param enable_ws: Whether to generate only warp-specialized configs.
   :return: Triton autotune configurations for the SM90 TMA forward kernel.
   """
-  _ = headdim  # unused
   _headdim_candidates = [64, 128]
   if autotune_mode == "max":
     _headdim_candidates.append(256)
+    full_headdim = 1 << (headdim - 1).bit_length()
+    if (full_headdim <= 512 and full_headdim not in _headdim_candidates and _is_large_sm90_or_newer_device()):
+      _headdim_candidates.append(full_headdim)
 
   configs = []
   ws_config_set = set(_SM90_WS_CONFIGS)
