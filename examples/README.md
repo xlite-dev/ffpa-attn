@@ -9,10 +9,10 @@ python3 examples/perf.py --no-bwd
 python3 examples/perf.py --no-fwd
 python3 examples/perf.py --tune fast
 python3 examples/perf.py --tune max
-python3 examples/perf.py --tune max --enable-fwd-tma # Hopper+
+python3 examples/perf.py --tune max --enable-fwd-tma # SM>=90 only
 ```
 
-`examples/perf.py`: migrated benchmark plotting entrypoint. It preserves the old plot style, can benchmark forward/backward cases on demand, and writes both `ffpa_{device}_speedup.png` and `ffpa_{device}_speedup.md`. The additive-mask example uses a compact `[1, 1, 1, Nkv]` key-position bias by default. Use `[1, 1, Nq, Nkv]` only when per-query bias is required, since it scales as `O(Nq * Nkv)` memory.
+The `examples/perf.py` migrated benchmark plotting entrypoint. It preserves the old plot style, can benchmark forward/backward cases on demand, and writes both `ffpa_{device}_speedup.png` and `ffpa_{device}_speedup.md`. The additive-mask example uses a compact `[1, 1, 1, Nkv]` key-position bias by default. Use `[1, 1, Nq, Nkv]` only when per-query bias is required, since it scales as `O(Nq * Nkv)` memory.
 
 ## Benchmark
 
