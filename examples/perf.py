@@ -727,7 +727,7 @@ def plot_tflops(
 
   attn_types = [label for _, label in active_plot_cases]
   x = np.arange(len(attn_types))
-  fig, ax = plt.subplots(figsize=(20, 12))
+  fig, ax = plt.subplots(figsize=(18, 12))
 
   def _autolabel(rects) -> None:
     for rect in rects:
