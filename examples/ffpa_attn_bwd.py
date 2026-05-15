@@ -875,7 +875,7 @@ def run_backward_examples(
     f"triton_autotune={triton_autotune}, "
     f"triton_autotune_mode={triton_autotune_mode}, "
     f"triton_backward_grad_v_storage_dtype={triton_backward_grad_v_storage_dtype}, "
-    f"enable_tma={enable_tma}, enable_ws={enable_ws}, "
+    f"enable_bwd_tma={enable_tma}, enable_bwd_ws={enable_ws}, "
     f"timing_mode={timing_mode}, tasks={sorted(tasks) if tasks is not None else 'full'}, "
     f"warmup={warmup}, iters={iters}"
   )
