@@ -727,7 +727,7 @@ def plot_tflops(
 
   attn_types = [label for _, label in active_plot_cases]
   x = np.arange(len(attn_types))
-  fig, ax = plt.subplots(figsize=(18, 12))
+  fig, ax = plt.subplots(figsize=(16, 12))
 
   def _autolabel(rects) -> None:
     for rect in rects:
@@ -818,19 +818,19 @@ def plot_tflops(
   ax.set_xticklabels(attn_types, rotation=0, ha="center", fontsize=22, fontweight="bold")
   ax.tick_params(axis="y", labelsize=16)
   ymax = max(finite_values) if finite_values else 1.0
-  ax.set_ylim(0, ymax * 1.18 if ymax > 0 else 1.0)
+  ax.set_ylim(0, ymax * 1.10 if ymax > 0 else 1.0)
   ax.legend(
     fontsize=20,
     loc="upper center",
-    bbox_to_anchor=(0.5, 0.968),
+    bbox_to_anchor=(0.5, 1.01),
     ncol=4,
     columnspacing=1.5,
     handletextpad=0.6,
     frameon=True,
   )
-  ax.grid(axis="y", alpha=0.9)
+  ax.grid(axis="y", alpha=0.3)
 
-  fig.tight_layout(rect=(0, 0, 1, 0.955))
+  fig.tight_layout(rect=(0, 0, 1, 0.965))
   fig.savefig(output_path)
   plt.close(fig)
   return output_path
