@@ -73,6 +73,13 @@ Runnable examples are provided under [`examples`](./examples). The performance b
   <img src='./docs/assets/perf/ffpa_speedup_nvidia-h800-pcie_B1_H32_N8192_D512_T.png' width='400px'>
 </div>
 
+We also provide a **CuTe DSL** backend (Hopper SM90, headdim 512). Benchmark on the NVIDIA H200 is shown below:
+
+<div align='center'>
+  <img src='./docs/assets/perf/ffpa_speedup_cutedsl_nvidia-h20z_B1_H32_N8192_D512_T.png' width='400px'>
+  <img src='./docs/assets/perf/ffpa_speedup_cutedsl_nvidia-h20z_B1_H32_N16384_D512_T.png' width='400px'>
+</div>
+
 ## ©️License
 
 <div id="License"></div>

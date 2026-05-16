@@ -37,6 +37,12 @@ bench = [
     "matplotlib",
 ]
 
+cutedsl = [
+    "quack-kernels>=0.3.10",
+    "nvidia-cutlass-dsl>=4.4.2",
+    "apache-tvm-ffi>=0.1.6,<0.2",
+]
+
 docs = [
     # Pinning mkdocs to 1.6.1 and mkdocs-material to 9.7.1 to avoid
     # the breaking changes in mkdocs 2.0.0, which causes the CI failure
@@ -59,6 +65,7 @@ all = [
     "ffpa-attn[dev]",
     "ffpa-attn[tests]",
     "ffpa-attn[bench]",
+    "ffpa-attn[cutedsl]",
 ]
 
 [project.urls]

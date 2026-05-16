@@ -298,10 +298,26 @@ class FFPAAttnMeta:
     triton_backward_preprocess_d_chunk = bool(impl_options["triton_backward_preprocess_d_chunk"])
     triton_backward_grad_v_storage_dtype = impl_options["triton_backward_grad_v_storage_dtype"]
 
-    assert forward_backend in ("cuda", "triton"), \
-      f"Unsupported forward_backend={forward_backend!r}; choose 'cuda' or 'triton'."
-    assert backward_backend in ("sdpa", "triton"), \
-      f"Unsupported backward_backend={backward_backend!r}; choose 'sdpa' or 'triton'."
+    assert forward_backend in ("cuda", "triton", "cutedsl"), \
+      f"Unsupported forward_backend={forward_backend!r}; choose 'cuda', 'triton', or 'cutedsl'."
+    assert backward_backend in ("sdpa", "triton", "cutedsl"), \
+      f"Unsupported backward_backend={backward_backend!r}; choose 'sdpa', 'triton', or 'cutedsl'."
+
+    # cutedsl forward/backward are bound as a pair: switching one implicitly
+    # selects the other, and any cross-backend combination is rejected.
+    backward_backend_explicit = "backward_backend" in kwargs
+    if forward_backend == "cutedsl" and backward_backend != "cutedsl":
+      if backward_backend_explicit:
+        raise ValueError(
+          f"forward_backend='cutedsl' requires backward_backend='cutedsl'; "
+          f"got backward_backend={backward_backend!r}"
+        )
+      backward_backend = "cutedsl"
+    elif backward_backend == "cutedsl" and forward_backend != "cutedsl":
+      raise ValueError(
+        f"backward_backend='cutedsl' requires forward_backend='cutedsl'; "
+        f"got forward_backend={forward_backend!r}"
+      )
     assert triton_autotune_mode in ("fast", "max"), \
       f"Unsupported triton_autotune_mode={triton_autotune_mode!r}; choose 'fast' or 'max'."
     if triton_backward_grad_v_storage_dtype not in (None, torch.float32):
@@ -422,6 +438,24 @@ class FFPAAttnMeta:
       self.scale = 1.0 / math.sqrt(query.size(-1))
     else:
       self.scale = float(scale)
+
+    # Explicit gate for CuTeDSL: every unsupported combo (D!=512, non-SM90,
+    # fp16 training, dropout, attn_mask, ...) is surfaced here so the user
+    # sees an actionable error instead of a silent SDPA fallback or a deep
+    # kernel crash. Skipped for non-cutedsl backends to keep their dispatch
+    # surface unchanged.
+    if self.forward_backend == "cutedsl":
+      from .cutedsl import _require_cutedsl_supported
+      _require_cutedsl_supported(
+        query,
+        key,
+        value,
+        is_causal=is_causal,
+        dropout_p=dropout_p,
+        attn_bias=attn_mask,
+        enable_gqa_user=enable_gqa,
+        requires_grad=any(t.requires_grad for t in (query, key, value)),
+      )
 
     return self
 
@@ -584,6 +618,16 @@ class _FFPAAttnFunc(torch.autograd.Function):
         bool(meta.enable_forward_tma),
         bool(meta.enable_forward_ws),
       )
+    elif meta.forward_backend == "cutedsl":
+      from .cutedsl import _ffpa_attn_forward_cutedsl
+      O, lse = _ffpa_attn_forward_cutedsl(
+        q,
+        k,
+        v,
+        O,
+        causal=meta.is_causal,
+        softmax_scale=meta.scale,
+      )
     else:
       raise ValueError(f"Unsupported forward_backend={meta.forward_backend!r};")
 
@@ -641,6 +685,23 @@ class _FFPAAttnFunc(torch.autograd.Function):
           philox_offset=int(rng_state[1].item()) if rng_state.numel() else 0,
           enable_tma=bool(meta.enable_backward_tma),
           enable_ws=bool(meta.enable_backward_ws),
+        )
+      elif meta.backward_backend == "cutedsl":
+        from .cutedsl import _ffpa_attn_backward_cutedsl
+        dq, dk, dv, grad_attn_bias = _ffpa_attn_backward_cutedsl(
+          grad_out=grad_out,
+          q=q,
+          k=k,
+          v=v,
+          o=O,
+          lse=lse,
+          causal=meta.is_causal,
+          softmax_scale=meta.scale,
+          attn_bias=attn_bias,
+          return_attn_bias_grad=ctx.needs_input_grad[3],
+          dropout_p=meta.dropout_p,
+          philox_seed=int(rng_state[0].item()) if rng_state.numel() else 0,
+          philox_offset=int(rng_state[1].item()) if rng_state.numel() else 0,
         )
       else:
         dq, dk, dv, grad_attn_bias = _aten_efficient_attn_backward(
