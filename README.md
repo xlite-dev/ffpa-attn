@@ -64,7 +64,7 @@ We extend FlashAttention to support large headdim ($D>256$) via **fine-grained t
 
 ## 🎉 Benchmark
 
-Runnable examples are provided under [`examples`](./examples). The performance benchmark for the NVIDIA Geforce RTX 5090, NVIDIA H800 PCIE, NVIDIA H200 (**CuTe DSL** backend, up to **427** TFLOPS!🎉) with large headdim is shown below. Please refer to our [`examples`](./examples) for more details.
+Runnable examples are provided under [`examples`](./examples). The performance benchmark for the NVIDIA Geforce RTX 5090, NVIDIA H800 PCIE, NVIDIA H200 (**CuTe DSL** backend, up to **427** TFLOPS!🎉) with large headdim is shown below:
 
 <div align='center'>
   <img src='./docs/assets/perf/ffpa_speedup_nvidia-geforce-rtx-5090_B1_H32_N8192_D320_T.png' width='400px'>
