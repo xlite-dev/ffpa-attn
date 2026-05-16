@@ -211,13 +211,15 @@ We extend FlashAttention to support large headdim ($D>256$) via **fine-grained t
 
 ## 🎉 Benchmark
 
-Runnable examples are provided under [`examples`](./examples). The performance benchmark for the NVIDIA Geforce RTX 5090 and NVIDIA H800 PCIE with large headdim is shown below. Please refer to our [`examples`](./examples) for more details.
+Runnable examples are provided under [`examples`](./examples). The performance benchmark for the NVIDIA Geforce RTX 5090, NVIDIA H800 PCIE, NVIDIA H200 (**CuTe DSL** backend, up to **427** TFLOPS!🎉) with large headdim is shown below:
 
 <div align='center'>
-  <img src='./assets/perf/ffpa_speedup_nvidia-geforce-rtx-5090_B1_H32_N8192_D320_T.png' width='350px'>
-  <img src='./assets/perf/ffpa_speedup_nvidia-geforce-rtx-5090_B1_H32_N8192_D512_T.png' width='350px'><br>
-  <img src='./assets/perf/ffpa_speedup_nvidia-h800-pcie_B1_H32_N8192_D320_T.png' width='350px'>
-  <img src='./assets/perf/ffpa_speedup_nvidia-h800-pcie_B1_H32_N8192_D512_T.png' width='350px'>
+  <img src='./assets/perf/ffpa_speedup_nvidia-geforce-rtx-5090_B1_H32_N8192_D320_T.png' width='400px'>
+  <img src='./assets/perf/ffpa_speedup_nvidia-geforce-rtx-5090_B1_H32_N8192_D512_T.png' width='400px'><br>
+  <img src='./assets/perf/ffpa_speedup_nvidia-h800-pcie_B1_H32_N8192_D320_T.png' width='400px'>
+  <img src='./assets/perf/ffpa_speedup_nvidia-h800-pcie_B1_H32_N8192_D512_T.png' width='400px'><br>
+  <img src='./assets/perf/ffpa_speedup_cutedsl_nvidia-h20z_B1_H32_N8192_D512_T.png' width='400px'>
+  <img src='./assets/perf/ffpa_speedup_cutedsl_nvidia-h20z_B1_H32_N16384_D512_T.png' width='400px'>
 </div>
 
 ## ©️License
@@ -233,7 +235,7 @@ Apache License 2.0
   title={FFPA: Yet another Faster Flash Prefill Attention for large headdim.},
   url={https://github.com/xlite-dev/ffpa-attn.git},
   note={Open-source software available at https://github.com/xlite-dev/ffpa-attn.git},
-  author={DefTruth},
+  author={DefTruth, Butterfingrz},
   year={2025}
 }
 ```
