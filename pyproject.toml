@@ -3,9 +3,9 @@
 name = "ffpa-attn"
 dynamic = ["version"]
 requires-python = ">=3.10"
-authors = [{name = "DefTruth"}]
-maintainers = [{name = "DefTruth"}]
-description = "FFPA: Yet another Faster Flash Prefill Attention for large headdim, 1.8x~3x faster than SDPA EA."
+authors = [{name = "DefTruth, Butterfingrz"}]
+maintainers = [{name = "DefTruth, Butterfingrz"}]
+description = "FFPA: Yet another Faster Flash Prefill Attention for large headdim, 1.5~3x faster than SDPA."
 readme = "README.md"
 license = {text = "Apache-2.0"}
 
