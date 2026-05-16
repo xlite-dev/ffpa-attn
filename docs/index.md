@@ -2,11 +2,11 @@
   <p align="center">
     <h2>🤖FFPA: Yet another Faster Flash Prefill Attention <br>with O(1)⚡️GPU SRAM complexity for large headdim🐑</h2>
   </p>
-  <img src=https://img.shields.io/badge/language-cuda|python-brightgreen.svg >
-    <a href="https://pepy.tech/projects/ffpa-attn"><img src=https://static.pepy.tech/personalized-badge/ffpa-attn?period=total&units=ABBREVIATION&left_color=GRAY&right_color=BLUE&left_text=downloads/pypi ></a>
-    <a href="https://pypi.org/project/ffpa-attn/"><img src=https://img.shields.io/github/release/xlite-dev/ffpa-attn.svg?color=GREEN ></a>
-    <img src=https://img.shields.io/github/stars/xlite-dev/ffpa-attn.svg?style=dark >
-    <img src="https://img.shields.io/github/license/xlite-dev/ffpa-attn.svg?color=blue"><br>
+  <img src=https://img.shields.io/badge/language-CUDA/Python-brightgreen.svg >
+  <a href="https://pepy.tech/projects/ffpa-attn"><img src=https://static.pepy.tech/personalized-badge/ffpa-attn?period=total&units=ABBREVIATION&left_color=GRAY&right_color=BLUE&left_text=downloads/pypi ></a>
+  <a href="https://pypi.org/project/ffpa-attn/"><img src=https://img.shields.io/github/release/xlite-dev/ffpa-attn.svg?color=GREEN ></a>
+  <img src=https://img.shields.io/github/stars/xlite-dev/ffpa-attn.svg?style=dark >
+  <img src="https://img.shields.io/github/license/xlite-dev/ffpa-attn.svg?color=blue"><br>
   <img src="assets/ffpa-api.png" width="700px">
 </div>
 
@@ -214,10 +214,10 @@ We extend FlashAttention to support large headdim ($D>256$) via **fine-grained t
 Runnable examples are provided under [`examples`](./examples). The performance benchmark for the NVIDIA Geforce RTX 5090 and NVIDIA H800 PCIE with large headdim is shown below. Please refer to our [`examples`](./examples) for more details.
 
 <div align='center'>
-  <img src='./assets/perf/ffpa_speedup_nvidia-geforce-rtx-5090_B1_H32_N8192_D320_T.png' width='400px'>
-  <img src='./assets/perf/ffpa_speedup_nvidia-geforce-rtx-5090_B1_H32_N8192_D512_T.png' width='400px'><br>
-  <img src='./assets/perf/ffpa_speedup_nvidia-h800-pcie_B1_H32_N8192_D320_T.png' width='400px'>
-  <img src='./assets/perf/ffpa_speedup_nvidia-h800-pcie_B1_H32_N8192_D512_T.png' width='400px'>
+  <img src='./assets/perf/ffpa_speedup_nvidia-geforce-rtx-5090_B1_H32_N8192_D320_T.png' width='350px'>
+  <img src='./assets/perf/ffpa_speedup_nvidia-geforce-rtx-5090_B1_H32_N8192_D512_T.png' width='350px'><br>
+  <img src='./assets/perf/ffpa_speedup_nvidia-h800-pcie_B1_H32_N8192_D320_T.png' width='350px'>
+  <img src='./assets/perf/ffpa_speedup_nvidia-h800-pcie_B1_H32_N8192_D512_T.png' width='350px'>
 </div>
 
 ## ©️License
