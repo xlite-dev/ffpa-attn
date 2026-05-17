@@ -1,6 +1,13 @@
 # Copyright (c) DefTruth, qyjdef@163.com
 # Copyright (c) Butterfingrz，13524387014@163.com
-# SM90 Backward dQ Kernel — MVP-4'_dQ: dual asymmetric MMA WG + d_chunk=256
+#
+# The idea of splitting the backward pass into a separate dQ kernel is
+# inspired by
+# https://github.com/Dao-AILab/flash-attention/blob/main/flash_attn/cute/sm100_hd256_2cta_fmha_backward_dqkernel.py
+# The core implementation below is written from scratch for SM90 and follows
+# the SplitD design from the ffpa-attn repo.
+#
+# SM90 Backward dQ Kernel  : dual asymmetric MMA WG + d_chunk=256
 #                          + loop nest reversed (n_block outer, d_pass inner)
 #                          + cooperative ① N-axis split for Phase E.
 #
@@ -71,10 +78,10 @@ from .utils.tile_scheduler import (
 from .utils.named_barrier import NamedBarrierBwd
 
 
-class FlashBwdDQ_SplitD_Sm90:
+class FFPAAttnBwdDQSm90SplitD:
   """SM90 backward dQ kernel (dQ: cooperative dual WG + loop reversal).
 
-    Computes only dQ (no dK/dV). dK/dV is handled by FlashBwdDKDV_SplitD_Sm90.
+    Computes only dQ (no dK/dV). dK/dV is handled by FFPAAttnBwdDKDVSm90SplitD.
     Q-stationary at the work_tile level (each CTA owns one m_block × head × batch),
     Q/dO/K/V streamed per n_block via shared pipelines.
 
@@ -591,7 +598,6 @@ class FlashBwdDQ_SplitD_Sm90:
       self.tile_n,
       self.is_causal,
       False,  # is_local
-      False,  # is_split_kv
     )
     SeqlenInfoCls = partial(
       SeqlenInfoQK.create,

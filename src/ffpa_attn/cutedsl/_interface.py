@@ -1,4 +1,4 @@
-# SplitD Flash Attention interface for head_dim == 512 on SM90 (Hopper).
+# FFPA SplitD attention interface for head_dim == 512 on SM90 (Hopper).
 # Based on https://github.com/Dao-AILab/flash-attention/blob/main/flash_attn/cute/interface.py
 # Copyright (c) 2025, Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar, Pradeep Ramani, Tri Dao.
 #
@@ -12,6 +12,7 @@ from functools import lru_cache
 from typing import Optional, Tuple, Callable
 
 import torch
+from torch._guards import active_fake_mode
 import tvm_ffi
 
 import cutlass
@@ -21,10 +22,9 @@ from cutlass.base_dsl import BaseDSL
 from cutlass.base_dsl.arch import Arch
 from quack.compile_utils import make_fake_tensor as fake_tensor
 from .utils.cache_utils import get_jit_cache
-from .utils.runtime import is_fake_mode
 
 if os.environ.get("CUTE_DSL_PTXAS_PATH", None) is not None:
-  from . import cute_dsl_ptxas  # noqa: F401
+  from .utils import cute_dsl_ptxas  # noqa: F401
 
   cute_dsl_ptxas.patch()
 
@@ -35,12 +35,10 @@ from .utils.cute_dsl_utils import (
   to_cute_aux_tensor,
   get_aux_tensor_metadata,
 )
-from ._ffpa_fwd_d512_sm90 import (
-  FlashAttentionForwardSm90TrainOnly as FlashAttentionForwardSplitD,
-)
-from .flash_bwd_preprocess import FlashAttentionBackwardPreprocess
-from ._ffpa_dkdv_d512_sm90 import FlashBwdDKDV_SplitD_Sm90
-from ._ffpa_dq_d512_sm90 import FlashBwdDQ_SplitD_Sm90
+from ._ffpa_fwd_d512_sm90 import FFPAAttnFwdSm90SplitD
+from ._ffpa_bwd_preprocess import FFPAAttnBwdPreprocess
+from ._ffpa_dkdv_d512_sm90 import FFPAAttnBwdDKDVSm90SplitD
+from ._ffpa_dq_d512_sm90 import FFPAAttnBwdDQSm90SplitD
 
 SUPPORTED_HEAD_DIM = 512
 FWD_TILE_M = 64
@@ -48,6 +46,11 @@ FWD_TILE_N = 128
 BWD_TILE_M = 64
 BWD_TILE_N = 64
 _VARLEN_CUSTOM_OP_NONE_INT = -(2**31)
+
+
+def is_fake_mode() -> bool:
+  return active_fake_mode() is not None
+
 
 # ---------------------------------------------------------------------------
 # Utility functions
@@ -137,7 +140,7 @@ def _validate_sm90_arch() -> tuple[int, str]:
   if arch // 10 != 9:
     raise RuntimeError(
       f"This SM90-only SplitD interface requires Hopper (SM 9.x), got compute capability {arch}. "
-      "Use the full flash-attention interface for other architectures."
+      "Falls back to the generic FFPA dispatcher for other architectures."
     )
   cute_arch = BaseDSL._get_dsl().get_arch_enum()
   if cute_arch < Arch.sm_90a:
@@ -377,7 +380,7 @@ def _validate_varlen_custom_bwd_features(
 # ---------------------------------------------------------------------------
 
 
-def _flash_attn_fwd_sm90(
+def _ffpa_attn_forward_sm90(
   q: torch.Tensor,
   k: torch.Tensor,
   v: torch.Tensor,
@@ -398,7 +401,7 @@ def _flash_attn_fwd_sm90(
   lse: Optional[torch.Tensor] = None,
   aux_tensors: Optional[list[torch.Tensor]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-  """SplitD SM90 forward pass for FlashAttention (training only, head_dim == 512)."""
+  """SplitD SM90 forward pass for FFPA attention (head_dim == 512)."""
   q, k, v = [maybe_contiguous(t) for t in (q, k, v)]
   (
     batch_size,
@@ -514,7 +517,7 @@ def _flash_attn_fwd_sm90(
     kv_same,
     fa_logging.get_fa_log_level(),
   )
-  if compile_key not in _flash_attn_fwd_sm90.compile_cache:
+  if compile_key not in _ffpa_attn_forward_sm90.compile_cache:
     cu_seqlens_q_tensor, cu_seqlens_k_tensor = [
       to_cute_tensor(t, assumed_align=4, leading_dim=0) if t is not None else None
       for t in (cu_seqlens_q, cu_seqlens_k)
@@ -529,7 +532,7 @@ def _flash_attn_fwd_sm90(
     if aux_tensors is not None:
       cute_aux_tensors = [to_cute_aux_tensor(buf) for buf in aux_tensors]
 
-    fa_fwd = FlashAttentionForwardSplitD(
+    ffpa_fwd = FFPAAttnFwdSm90SplitD(
       dtype,
       head_dim,
       head_dim_v,
@@ -545,10 +548,10 @@ def _flash_attn_fwd_sm90(
       has_aux_tensors=aux_tensors is not None,
     )
 
-    # Positional args must match FlashAttentionForwardSplitD.__call__ signature:
+    # Positional args must match FFPAAttnFwdSm90SplitD.__call__ signature:
     # mQ, mK, mV, mO, mLSE, scale, cuseqlens_q, cuseqlens_k, wsl, wsr, aux, stream
     compile_args = [
-      fa_fwd,
+      ffpa_fwd,
       q_tensor,
       k_tensor,
       v_tensor,
@@ -562,7 +565,7 @@ def _flash_attn_fwd_sm90(
       cute_aux_tensors,
       current_stream,
     ]
-    _flash_attn_fwd_sm90.compile_cache[compile_key] = cute.compile(
+    _ffpa_attn_forward_sm90.compile_cache[compile_key] = cute.compile(
       *compile_args,
       options=("--enable-tvm-ffi --ptxas-options '--verbose --warn-on-spills --warn-on-local-memory-usage'"),
     )
@@ -583,14 +586,14 @@ def _flash_attn_fwd_sm90(
       aux_tensors,
     ]
     _call_with_tvm_ffi_current_stream(
-      _flash_attn_fwd_sm90.compile_cache[compile_key],
+      _ffpa_attn_forward_sm90.compile_cache[compile_key],
       *call_args,
       device=device,
     )
   return out, lse
 
 
-_flash_attn_fwd_sm90.compile_cache = get_jit_cache("fwd_sm90")
+_ffpa_attn_forward_sm90.compile_cache = get_jit_cache("fwd_sm90")
 
 # ---------------------------------------------------------------------------
 # Backward helpers
@@ -632,9 +635,9 @@ def _compile_bwd_preprocess(
   mO, mdO, mLSE, mLSElog2, mPdPsum = _make_fake_bwd_preprocess_tensors(dtype, varlen_q=has_cuseqlens_q)
   mCuSeqlensQ = fake_tensor(Int32, (batchp1, ), divisibility=1) if has_cuseqlens_q else None
   mdLSE = fake_tensor(Float32, mLSE.shape, divisibility=1) if has_dlse else None
-  fa_bwd_pre = FlashAttentionBackwardPreprocess(dtype, head_dim, head_dim_v, m_block_size)
+  ffpa_bwd_pre = FFPAAttnBwdPreprocess(dtype, head_dim, head_dim_v, m_block_size)
   return cute.compile(
-    fa_bwd_pre,
+    ffpa_bwd_pre,
     mO,
     mdO,
     mPdPsum,
@@ -701,7 +704,7 @@ _bwd_preprocess.compile_cache = get_jit_cache("bwd_pre_sm90")
 # ---------------------------------------------------------------------------
 
 
-def _flash_attn_bwd_sm90(
+def _ffpa_attn_backward_sm90(
   q: torch.Tensor,
   k: torch.Tensor,
   v: torch.Tensor,
@@ -847,7 +850,7 @@ def _flash_attn_bwd_sm90(
     device_arch,
     cute_arch_key,
   )
-  if bwd_key not in _flash_attn_bwd_sm90.compile_cache_dkdv:
+  if bwd_key not in _ffpa_attn_backward_sm90.compile_cache_dkdv:
     q_t, k_t, v_t, do_t = [to_cute_tensor(t) for t in (q, k, v, dout)]
     dk_t, dv_t = [to_cute_tensor(t) for t in (dk, dv)]
     lse_log2_t = to_cute_tensor(lse_log2, assumed_align=4)
@@ -859,7 +862,7 @@ def _flash_attn_bwd_sm90(
       to_cute_tensor(cu_seqlens_k, assumed_align=4, leading_dim=0) if cu_seqlens_k is not None else None
     )
 
-    fa_dkdv = FlashBwdDKDV_SplitD_Sm90(
+    ffpa_dkdv = FFPAAttnBwdDKDVSm90SplitD(
       dtype,
       head_dim,
       head_dim_v=head_dim_v,
@@ -868,8 +871,8 @@ def _flash_attn_bwd_sm90(
       tile_m=m_block_size,
       tile_n=n_block_size,
     )
-    _flash_attn_bwd_sm90.compile_cache_dkdv[bwd_key] = cute.compile(
-      fa_dkdv,
+    _ffpa_attn_backward_sm90.compile_cache_dkdv[bwd_key] = cute.compile(
+      ffpa_dkdv,
       q_t,
       k_t,
       v_t,
@@ -885,7 +888,7 @@ def _flash_attn_bwd_sm90(
       options=("--enable-tvm-ffi --ptxas-options '--verbose --warn-on-spills --warn-on-local-memory-usage'"),
     )
 
-  if bwd_key not in _flash_attn_bwd_sm90.compile_cache_dq:
+  if bwd_key not in _ffpa_attn_backward_sm90.compile_cache_dq:
     q_t2, k_t2, v_t2, do_t2 = [to_cute_tensor(t) for t in (q, k, v, dout)]
     dq_t = to_cute_tensor(dq)
     lse_log2_t2 = to_cute_tensor(lse_log2, assumed_align=4)
@@ -897,7 +900,7 @@ def _flash_attn_bwd_sm90(
       to_cute_tensor(cu_seqlens_k, assumed_align=4, leading_dim=0) if cu_seqlens_k is not None else None
     )
 
-    fa_dq = FlashBwdDQ_SplitD_Sm90(
+    ffpa_dq = FFPAAttnBwdDQSm90SplitD(
       dtype,
       head_dim,
       head_dim_v=head_dim_v,
@@ -906,8 +909,8 @@ def _flash_attn_bwd_sm90(
       tile_m=m_block_size,
       tile_n=n_block_size,
     )
-    _flash_attn_bwd_sm90.compile_cache_dq[bwd_key] = cute.compile(
-      fa_dq,
+    _ffpa_attn_backward_sm90.compile_cache_dq[bwd_key] = cute.compile(
+      ffpa_dq,
       q_t2,
       k_t2,
       v_t2,
@@ -925,7 +928,7 @@ def _flash_attn_bwd_sm90(
   # Execute dKdV and dQ kernels
   if not is_fake_mode():
     _call_with_tvm_ffi_current_stream(
-      _flash_attn_bwd_sm90.compile_cache_dkdv[bwd_key],
+      _ffpa_attn_backward_sm90.compile_cache_dkdv[bwd_key],
       q.detach(),
       k.detach(),
       v.detach(),
@@ -940,7 +943,7 @@ def _flash_attn_bwd_sm90(
       device=device,
     )
     _call_with_tvm_ffi_current_stream(
-      _flash_attn_bwd_sm90.compile_cache_dq[bwd_key],
+      _ffpa_attn_backward_sm90.compile_cache_dq[bwd_key],
       q.detach(),
       k.detach(),
       v.detach(),
@@ -957,8 +960,8 @@ def _flash_attn_bwd_sm90(
   return dq, dk, dv
 
 
-_flash_attn_bwd_sm90.compile_cache_dkdv = get_jit_cache("bwd_splitd_dkdv_sm90")
-_flash_attn_bwd_sm90.compile_cache_dq = get_jit_cache("bwd_splitd_dq_sm90")
+_ffpa_attn_backward_sm90.compile_cache_dkdv = get_jit_cache("bwd_splitd_dkdv_sm90")
+_ffpa_attn_backward_sm90.compile_cache_dq = get_jit_cache("bwd_splitd_dq_sm90")
 
 # ---------------------------------------------------------------------------
 # PyTorch custom ops — varlen SplitD SM90
@@ -967,14 +970,14 @@ _flash_attn_bwd_sm90.compile_cache_dq = get_jit_cache("bwd_splitd_dq_sm90")
 # These dispatcher ops are intentionally return-oriented and functional from
 # PyTorch's point of view: ``mutates_args=()`` only says input arguments are not
 # mutated.  The CUTE kernels still write output storage directly, but that
-# storage belongs to tensors allocated inside ``_flash_attn_fwd_sm90`` /
-# ``_flash_attn_bwd_sm90`` and returned to the caller.  Do not add Python
+# storage belongs to tensors allocated inside ``_ffpa_attn_forward_sm90`` /
+# ``_ffpa_attn_backward_sm90`` and returned to the caller.  Do not add Python
 # ``copy_`` here; buffer-oriented legacy APIs should call the lower-level
 # wrappers with ``out`` / ``dq`` / ``dk`` / ``dv`` if they need caller-owned
 # storage identity.
 
 
-@torch.library.custom_op("splitd_flash_attn::varlen_fwd", mutates_args=())
+@torch.library.custom_op("ffpa_attn::splitd_fwd_sm90", mutates_args=())
 def _varlen_fwd_custom(
   q: torch.Tensor,
   k: torch.Tensor,
@@ -992,7 +995,7 @@ def _varlen_fwd_custom(
 ) -> tuple[torch.Tensor, torch.Tensor]:
   cu_seqlens_q, cu_seqlens_k = _trim_trailing_empty_varlen_segments(cu_seqlens_q, cu_seqlens_k)
   window_size_left_opt, window_size_right_opt = _decode_custom_op_window(window_size_left, window_size_right)
-  return _flash_attn_fwd_sm90(
+  return _ffpa_attn_forward_sm90(
     q,
     k,
     v,
@@ -1010,7 +1013,7 @@ def _varlen_fwd_custom(
   )
 
 
-@torch.library.register_fake("splitd_flash_attn::varlen_fwd")
+@torch.library.register_fake("ffpa_attn::splitd_fwd_sm90")
 def _varlen_fwd_fake(
   q: torch.Tensor,
   k: torch.Tensor,
@@ -1048,7 +1051,7 @@ def _varlen_fwd_fake(
   return out, lse
 
 
-@torch.library.custom_op("splitd_flash_attn::varlen_bwd", mutates_args=())
+@torch.library.custom_op("ffpa_attn::splitd_bwd_sm90", mutates_args=())
 def _varlen_bwd_custom(
   q: torch.Tensor,
   k: torch.Tensor,
@@ -1069,7 +1072,7 @@ def _varlen_bwd_custom(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
   cu_seqlens_q, cu_seqlens_k = _trim_trailing_empty_varlen_segments(cu_seqlens_q, cu_seqlens_k)
   window_size_left_opt, window_size_right_opt = _decode_custom_op_window(window_size_left, window_size_right)
-  return _flash_attn_bwd_sm90(
+  return _ffpa_attn_backward_sm90(
     q,
     k,
     v,
@@ -1089,7 +1092,7 @@ def _varlen_bwd_custom(
   )
 
 
-@torch.library.register_fake("splitd_flash_attn::varlen_bwd")
+@torch.library.register_fake("ffpa_attn::splitd_bwd_sm90")
 def _varlen_bwd_fake(
   q: torch.Tensor,
   k: torch.Tensor,
@@ -1157,7 +1160,7 @@ def _varlen_fwd_backward(ctx, dout, dlse):
   q, k, v, out, lse, cu_seqlens_q, cu_seqlens_k = ctx.saved_tensors
   if dout is None:
     dout = torch.zeros_like(out)
-  dq, dk, dv = torch.ops.splitd_flash_attn.varlen_bwd(
+  dq, dk, dv = torch.ops.ffpa_attn.splitd_bwd_sm90(
     q,
     k,
     v,
@@ -1179,7 +1182,7 @@ def _varlen_fwd_backward(ctx, dout, dlse):
 
 
 torch.library.register_autograd(
-  "splitd_flash_attn::varlen_fwd",
+  "ffpa_attn::splitd_fwd_sm90",
   _varlen_fwd_backward,
   setup_context=_varlen_fwd_setup_context,
 )
@@ -1189,7 +1192,7 @@ torch.library.register_autograd(
 # ---------------------------------------------------------------------------
 
 
-class FlashAttnFunc(torch.autograd.Function):
+class FFPAAttnSplitDFunc(torch.autograd.Function):
 
   @staticmethod
   def forward(
@@ -1204,7 +1207,7 @@ class FlashAttnFunc(torch.autograd.Function):
     pack_gqa: Optional[bool] = None,
     return_lse: bool = False,
   ):
-    out, lse = _flash_attn_fwd_sm90(
+    out, lse = _ffpa_attn_forward_sm90(
       q,
       k,
       v,
@@ -1232,7 +1235,7 @@ class FlashAttnFunc(torch.autograd.Function):
       dlse = None
     if dout is None:
       dout = torch.zeros_like(out)
-    dq, dk, dv = _flash_attn_bwd_sm90(
+    dq, dk, dv = _ffpa_attn_backward_sm90(
       q,
       k,
       v,
@@ -1263,7 +1266,7 @@ def _normalize_varlen_custom_op_inputs(
   aux_tensors: Optional[list],
 ) -> tuple[torch.Tensor, torch.Tensor, int, int, float, int, int, bool]:
   if cu_seqlens_q is None or cu_seqlens_k is None:
-    raise ValueError("split_flash_attn_varlen_func custom op path requires cu_seqlens_q and cu_seqlens_k")
+    raise ValueError("ffpa_attn_splitd_varlen_func custom op path requires cu_seqlens_q and cu_seqlens_k")
   if max_seqlen_q is None:
     raise ValueError("max_seqlen_q must be provided when cu_seqlens_q is provided")
   if max_seqlen_k is None:
@@ -1331,7 +1334,7 @@ def _trim_trailing_empty_varlen_segments(
 # ---------------------------------------------------------------------------
 
 
-def split_flash_attn_func(
+def ffpa_attn_splitd_func(
   q: torch.Tensor,
   k: torch.Tensor,
   v: torch.Tensor,
@@ -1342,11 +1345,11 @@ def split_flash_attn_func(
   pack_gqa: Optional[bool] = None,
   return_lse: bool = False,
 ):
-  """Batched SplitD FlashAttention for D=512 on SM90.
+  """Batched SplitD FFPA attention for D=512 on SM90.
 
     Training requires bf16 q/k/v. fp16 is accepted only for no-grad forward.
     """
-  out, lse = FlashAttnFunc.apply(
+  out, lse = FFPAAttnSplitDFunc.apply(
     q,
     k,
     v,
@@ -1360,7 +1363,7 @@ def split_flash_attn_func(
   return (out, lse) if return_lse else out
 
 
-def split_flash_attn_varlen_func(
+def ffpa_attn_splitd_varlen_func(
   q: torch.Tensor,
   k: torch.Tensor,
   v: torch.Tensor,
@@ -1377,7 +1380,7 @@ def split_flash_attn_varlen_func(
   aux_tensors: Optional[list] = None,
   return_lse: bool = False,
 ):
-  """Varlen SplitD FlashAttention for D=512 on SM90.
+  """Varlen SplitD FFPA attention for D=512 on SM90.
 
     q/k/v must be packed as (total_tokens, heads, 512). Training requires bf16
     q/k/v, valid CUDA int32 cu_seqlens, and explicit max_seqlen_q/k whenever
@@ -1425,6 +1428,6 @@ def split_flash_attn_varlen_func(
 
 
 __all__ = [
-  "split_flash_attn_func",
-  "split_flash_attn_varlen_func",
+  "ffpa_attn_splitd_func",
+  "ffpa_attn_splitd_varlen_func",
 ]

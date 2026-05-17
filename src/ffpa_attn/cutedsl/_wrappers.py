@@ -1,26 +1,95 @@
-"""Layout-adapting FFPA wrappers around the CuTeDSL D=512 SM90 kernels.
+"""Layout-adapting FFPA entry shims for the CuTeDSL D=512 SM90 kernels.
 
-The CuTeDSL kernels in :mod:`ffpa_attn.cutedsl.interface` operate on the
-``[B, N, H, D]`` (or packed ``[T, H, D]``) layout used by Dao-AILab
-flash-attention. The FFPA dispatch pipeline in
-:mod:`ffpa_attn.functional` operates on the SDPA-style ``[B, H, N, D]``
-layout. This module bridges the two with a minimal transpose-and-call shim
-and centralises the SM90 / D=512 / dtype / unsupported-feature gating that
-:class:`ffpa_attn.functional.FFPAAttnMeta` invokes via
-:func:`_require_cutedsl_supported`.
+The CuTeDSL kernels in :mod:`ffpa_attn.cutedsl._interface` operate on the
+``[B, N, H, D]`` (or packed ``[T, H, D]``) layout (the upstream Dao-AILab
+flash-attention layout convention reused here). The public FFPA APIs
+(:func:`ffpa_attn.ffpa_attn_func`, :func:`ffpa_attn.ffpa_attn_varlen_func`)
+present the SDPA-style ``[B, H, N, D]`` / FA-style ``[T, H, D]`` surface and
+route ``forward_backend='cutedsl'`` directly into :func:`_ffpa_attn_cutedsl`
+and :func:`_ffpa_attn_varlen_cutedsl` defined here, which transpose and
+dispatch into :func:`ffpa_attn_splitd_func` /
+:func:`ffpa_attn_splitd_varlen_func`. Autograd is owned by
+:class:`ffpa_attn.cutedsl._interface.FFPAAttnSplitDFunc`, not by
+:class:`ffpa_attn.functional.FFPAAttnFunc`.
+
+The module also centralises the **tensor-level** SM90 / D=512 / dtype gating
+via :func:`_require_cutedsl_supported` and the **kwarg-level** compatibility
+gating via :func:`_check_supported_options`: any non-default unsupported
+option (``dropout_p``, ``attn_mask``, FlashAttention extensions) raises
+``NotImplementedError`` with a single consolidated message.
 """
 
 from __future__ import annotations
 
+import math
 from typing import Optional
 
 import torch
 
-from .interface import (
-  SUPPORTED_HEAD_DIM,
-  _flash_attn_bwd_sm90,
-  _flash_attn_fwd_sm90,
-)
+from ._interface import SUPPORTED_HEAD_DIM
+
+
+def _check_supported_options(
+  *,
+  source: str,
+  dropout_p: float = 0.0,
+  window_size: object = None,
+  sink: torch.Tensor | None = None,
+  attention_mask: torch.Tensor | None = None,
+  block_mask: object | None = None,
+  softcap: float | None = None,
+  score_mod: object | None = None,
+  aux_tensors: list[torch.Tensor] | None = None,
+  seqused_k: torch.Tensor | None = None,
+  block_table: torch.Tensor | None = None,
+  num_splits: int | None = None,
+  alibi_slopes: torch.Tensor | None = None,
+) -> None:
+  """Raise ``NotImplementedError`` for any non-default cutedsl-unsupported option.
+
+  The cutedsl SplitD D=512 kernels (``ffpa_attn_splitd_func``,
+  ``ffpa_attn_splitd_varlen_func``) only honor dense / varlen D=512
+  attention with optional causal masking. Every other option commonly
+  exposed by attention APIs (mask tensors, sliding window, softcap,
+  score_mod, aux tensors, FlashAttention varlen extensions, dropout)
+  has no kernel-side implementation and is rejected up front so callers
+  see one actionable error rather than a deep kernel crash or silent
+  semantic divergence.
+
+  ``source`` is embedded in the error so the caller can tell which
+  public-API surface produced the message.
+  """
+  unsupported: list[str] = []
+  if dropout_p not in (None, 0.0):
+    unsupported.append("dropout_p")
+  if window_size is not None and window_size != (None, None):
+    unsupported.append("window_size")
+  if sink is not None:
+    unsupported.append("sink")
+  if attention_mask is not None:
+    unsupported.append("attention_mask")
+  if block_mask is not None:
+    unsupported.append("block_mask")
+  if softcap not in (None, 0.0):
+    unsupported.append("softcap")
+  if score_mod is not None:
+    unsupported.append("score_mod")
+  if aux_tensors is not None:
+    unsupported.append("aux_tensors")
+  if seqused_k is not None:
+    unsupported.append("seqused_k")
+  if block_table is not None:
+    unsupported.append("block_table")
+  if num_splits is not None:
+    unsupported.append("num_splits")
+  if alibi_slopes is not None:
+    unsupported.append("alibi_slopes")
+  if unsupported:
+    raise NotImplementedError(
+      f"{source} only supports dense/varlen D=512 attention with optional "
+      f"causal masking; unsupported options: {', '.join(unsupported)}. "
+      f"Use forward_backend='triton' when these options are required."
+    )
 
 
 def cutedsl_forward_available(device: Optional[torch.device] = None) -> bool:
@@ -55,23 +124,26 @@ def _require_cutedsl_supported(
   k: torch.Tensor,
   v: torch.Tensor,
   *,
-  is_causal: bool,
-  dropout_p: float,
-  attn_bias: Optional[torch.Tensor],
-  enable_gqa_user: bool,
   requires_grad: bool,
 ) -> None:
-  """Validate that the FFPA inputs are compatible with the CuTeDSL backend.
+  """Validate tensor-level constraints for the cutedsl backend.
 
-  Raises ``NotImplementedError`` / ``RuntimeError`` / ``TypeError`` for any
-  case the SM90 D=512 kernel cannot handle. Called explicitly by
-  :meth:`FFPAAttnMeta.normalize` so that users who pass
-  ``forward_backend='cutedsl'`` get an actionable error instead of a silent
-  fallback or a deep kernel crash.
+  Checks device, SM90, head_dim==512, q/k/v dtype, and the bf16-only rule
+  for training. Kwarg-level functional compatibility (``dropout_p``,
+  ``attn_mask``, FlashAttention-extension kwargs) is **not** the
+  responsibility of this function; that lives in
+  :func:`_check_supported_options`, applied by the entry shims
+  (:func:`_ffpa_attn_cutedsl`, :func:`_ffpa_attn_varlen_cutedsl`).
+
+  Raises ``NotImplementedError`` / ``RuntimeError`` / ``TypeError`` for
+  any tensor-level violation so users who pass ``forward_backend='cutedsl'``
+  see an actionable error rather than a deep kernel crash.
   """
-  del is_causal, enable_gqa_user  # both natively supported by the CuTeDSL kernel
   if q.device.type != "cuda":
     raise RuntimeError(f"cutedsl backend requires CUDA tensors, got device {q.device}")
+  # Defensive: a CUDA tensor cannot exist unless CUDA was available at
+  # allocation time, but the runtime can be poisoned (e.g. env var flips)
+  # after tensors were created — keep this as a final guard.
   if not torch.cuda.is_available():
     raise RuntimeError("cutedsl backend requires a CUDA-capable build of PyTorch")
   major, _ = torch.cuda.get_device_capability(q.device)
@@ -83,10 +155,6 @@ def _require_cutedsl_supported(
     raise TypeError(f"cutedsl backend requires torch.float16 or torch.bfloat16, got {q.dtype}")
   if requires_grad and q.dtype != torch.bfloat16:
     raise NotImplementedError("cutedsl backward currently supports torch.bfloat16 only; use bf16 inputs for training")
-  if dropout_p > 0.0:
-    raise NotImplementedError("cutedsl backend does not support dropout (dropout_p must be 0.0)")
-  if attn_bias is not None:
-    raise NotImplementedError("cutedsl backend does not support attn_mask / additive attn_bias")
   if k.size(-1) != SUPPORTED_HEAD_DIM or v.size(-1) != SUPPORTED_HEAD_DIM:
     raise NotImplementedError(
       f"cutedsl backend requires k/v head_dim={SUPPORTED_HEAD_DIM}; "
@@ -95,91 +163,216 @@ def _require_cutedsl_supported(
 
 
 def _bhnd_to_bnhd(t: torch.Tensor) -> torch.Tensor:
-  """Reshape ``[B, H, N, D]`` to the CuTeDSL-native ``[B, N, H, D]``."""
+  """Reshape ``[B, H, N, D]`` (SDPA) to the CuTeDSL-native ``[B, N, H, D]`` (FA).
+
+  ``transpose(1, 2)`` always produces a non-contiguous view; the trailing
+  ``.contiguous()`` materializes one copy. The downstream
+  :func:`_ffpa_attn_forward_sm90` re-runs ``maybe_contiguous`` defensively,
+  but materializing at the layout-boundary here keeps the "kernel input is
+  always contiguous" invariant local and robust to future kernel-side changes.
+  """
   return t.transpose(1, 2).contiguous()
 
 
-def _ffpa_attn_forward_cutedsl(
-  Q: torch.Tensor,
-  K: torch.Tensor,
-  V: torch.Tensor,
-  O: Optional[torch.Tensor] = None,
-  causal: bool = False,
-  softmax_scale: float = 0.0,
-) -> tuple[torch.Tensor, torch.Tensor]:
-  """CuTeDSL FFPA forward dispatch shim.
+def _bnhd_to_bhnd(t: torch.Tensor) -> torch.Tensor:
+  """Reverse of :func:`_bhnd_to_bnhd`: FA ``[B, N, H, D]`` → SDPA ``[B, H, N, D]``."""
+  return t.transpose(1, 2).contiguous()
 
-  :param Q: ``[B, Nh_q, Nq, D=512]`` query tensor.
-  :param K: ``[B, Nh_kv, Nkv, D=512]`` key tensor.
-  :param V: ``[B, Nh_kv, Nkv, D=512]`` value tensor.
-  :param O: Ignored. Output is allocated fresh by the CuTeDSL kernel.
-  :param causal: Lower-right (tail-aligned) causal mask flag.
-  :param softmax_scale: Pre-softmax scale applied to ``QK^T``.
-  :returns: ``(O, lse)`` in FFPA layout — ``O`` is ``[B, Nh_q, Nq, D]`` and
-    ``lse`` is ``[B, Nh_q, Nq]`` in fp32.
+
+def _ffpa_attn_cutedsl(
+  query: torch.Tensor,
+  key: torch.Tensor,
+  value: torch.Tensor,
+  *,
+  attn_mask: torch.Tensor | None,
+  dropout_p: float,
+  is_causal: bool,
+  scale: float | None,
+  enable_gqa: bool,
+) -> torch.Tensor:
+  """Dense ``[B, H, N, D]`` cutedsl entry called from
+  :func:`ffpa_attn.ffpa_attn_interface.ffpa_attn_func` whenever
+  ``forward_backend == 'cutedsl'``. Sibling of
+  :func:`_ffpa_attn_varlen_cutedsl`. Routes through
+  :func:`ffpa_attn.cutedsl._interface.ffpa_attn_splitd_func`, which wraps
+  ``FFPAAttnSplitDFunc.apply(...)`` for autograd — the cutedsl backend owns
+  its own autograd boundary and never traverses
+  :class:`ffpa_attn.functional.FFPAAttnFunc`.
+
+  Layout conversion: SDPA ``[B, Nh_q, Nq, D]`` is transposed to FA
+  ``[B, Nq, Nh_q, D]`` on the way in and back on the way out.
+
+  ``attn_mask`` and ``dropout_p`` are accepted for public-API uniformity
+  but the cutedsl SplitD kernel does not implement either: any non-default
+  value raises ``NotImplementedError`` from :func:`_check_supported_options`.
+  Use ``forward_backend='triton'`` if dropout / mask are functionally
+  required.
   """
-  del O  # CuTeDSL allocates output internally; FFPA layout differs anyway.
-  q_nhd, k_nhd, v_nhd = (_bhnd_to_bnhd(t) for t in (Q, K, V))
-  out_nhd, lse = _flash_attn_fwd_sm90(
+  from ._interface import ffpa_attn_splitd_func
+
+  _check_supported_options(
+    source="ffpa_attn_func(forward_backend='cutedsl')",
+    dropout_p=dropout_p,
+    attention_mask=attn_mask,
+  )
+
+  requires_grad = any(t.requires_grad for t in (query, key, value))
+  _require_cutedsl_supported(query, key, value, requires_grad=requires_grad)
+  if not enable_gqa and query.size(1) != key.size(1):
+    raise ValueError(
+      f"ffpa_attn_func: enable_gqa=False but query num_heads ({query.size(1)}) "
+      f"!= key/value num_heads ({key.size(1)}); set enable_gqa=True or match head counts."
+    )
+
+  q_nhd, k_nhd, v_nhd = (_bhnd_to_bnhd(t) for t in (query, key, value))
+
+  softmax_scale = scale if scale is not None else (1.0 / math.sqrt(query.size(-1)))
+  # pack_gqa: omitted; _ffpa_attn_forward_sm90 auto-detects via qhead_per_kvhead > 1.
+  out_nhd = ffpa_attn_splitd_func(
     q_nhd,
     k_nhd,
     v_nhd,
     softmax_scale=softmax_scale,
-    causal=causal,
-    return_lse=True,
+    causal=is_causal,
+    return_lse=False,
   )
-  # out_nhd: [B, Nq, Nh_q, D]; bring back to FFPA's [B, Nh_q, Nq, D].
-  out_bhnd = out_nhd.transpose(1, 2).contiguous()
-  return out_bhnd, lse
+  return _bnhd_to_bhnd(out_nhd)
 
 
-def _ffpa_attn_backward_cutedsl(
-  *,
-  grad_out: torch.Tensor,
+def _ffpa_attn_varlen_cutedsl(
   q: torch.Tensor,
   k: torch.Tensor,
   v: torch.Tensor,
-  o: torch.Tensor,
-  lse: torch.Tensor,
+  cu_seqlens_q: torch.Tensor,
+  cu_seqlens_k: torch.Tensor | None,
+  max_seqlen_q: int,
+  max_seqlen_k: int,
+  *,
+  dropout_p: float,
+  softmax_scale: float | None,
   causal: bool,
-  softmax_scale: float,
-  attn_bias: Optional[torch.Tensor] = None,
-  return_attn_bias_grad: bool = False,
-  dropout_p: float = 0.0,
-  philox_seed: int = 0,
-  philox_offset: int = 0,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, None]:
-  """CuTeDSL FFPA backward dispatch shim.
+  enable_gqa: bool,
+  return_lse: bool,
+  kwargs: dict,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+  """Packed THD cutedsl entry. The varlen path bypasses
+  :class:`ffpa_attn.functional.FFPAAttnFunc` and is autograd-registered via
+  the ``ffpa_attn::splitd_fwd_sm90`` torch op directly.
 
-  Mirrors the keyword surface of :func:`_ffpa_attn_backward_triton` so the
-  ``FFPAAttnFunc.backward`` dispatcher can swap backends without per-backend
-  branching for the call site. Any keyword that CuTeDSL cannot honor must be
-  at its default value, otherwise we raise instead of silently dropping it.
+  CuTeDSL varlen forward called from
+  :func:`ffpa_attn.ffpa_attn_interface.ffpa_attn_varlen_func`. The CuTeDSL
+  kernel consumes packed ``[T, H, D]`` layout natively — no transpose, no
+  per-sequence loop.
+
+  ``kwargs`` is forwarded to :meth:`FFPAAttnMeta.from_kwargs` only for
+  forward/backward backend pair-binding and unknown-key validation; the
+  kernel only consumes ``softmax_scale``, ``causal``, GQA-pack, and the
+  cu_seqlens / max_seqlen tuple. ``forward_backend`` / ``backward_backend``
+  default to ``"cutedsl"`` here so callers do not need to plumb them through
+  every time — the varlen API is cutedsl-only by construction.
+
+  All API-level guard-rail checks (unsupported FA-extension kwargs,
+  dropout_p, forward_backend, q/k/v shape/dtype, cu_seqlens validity) are
+  performed here so :func:`ffpa_attn.ffpa_attn_varlen_func` can remain a
+  thin shim. Kwarg compatibility is enforced by
+  :func:`_check_supported_options`: any non-default value of ``dropout_p``
+  or any of the FlashAttention-extension / mask / softcap / score_mod /
+  aux_tensors / sink / block_mask kwargs raises ``NotImplementedError``
+  with a single consolidated message.
   """
-  del philox_seed, philox_offset  # not used: dropout_p must be 0 here
-  if attn_bias is not None or return_attn_bias_grad:
-    raise NotImplementedError("cutedsl backward does not support attn_bias gradients")
-  if dropout_p != 0.0:
-    raise NotImplementedError("cutedsl backward does not support dropout")
+  _check_supported_options(
+    source="ffpa_attn_varlen_func",
+    dropout_p=dropout_p,
+    window_size=kwargs.get("window_size"),
+    sink=kwargs.get("sink"),
+    attention_mask=kwargs.get("attention_mask", kwargs.get("attn_mask")),
+    block_mask=kwargs.get("block_mask"),
+    softcap=kwargs.get("softcap"),
+    score_mod=kwargs.get("score_mod"),
+    aux_tensors=kwargs.get("aux_tensors"),
+    seqused_k=kwargs.get("seqused_k"),
+    block_table=kwargs.get("block_table"),
+    num_splits=kwargs.get("num_splits"),
+    alibi_slopes=kwargs.get("alibi_slopes"),
+  )
 
-  q_nhd, k_nhd, v_nhd, o_nhd, dout_nhd = (_bhnd_to_bnhd(t) for t in (q, k, v, o, grad_out))
-  dq_nhd, dk_nhd, dv_nhd = _flash_attn_bwd_sm90(
-    q_nhd,
-    k_nhd,
-    v_nhd,
-    o_nhd,
-    dout_nhd,
-    lse,
+  forward_backend = kwargs.get("forward_backend", "cutedsl")
+  if forward_backend != "cutedsl":
+    raise NotImplementedError(
+      f"ffpa_attn_varlen_func: only forward_backend='cutedsl' is supported, "
+      f"got {forward_backend!r}. Unpack the batch and call ffpa_attn_func "
+      f"per sequence for other backends."
+    )
+
+  if q.dim() != 3 or k.dim() != 3 or v.dim() != 3:
+    raise ValueError(
+      f"ffpa_attn_varlen_func: q/k/v must be 3-D packed [T, H, D], "
+      f"got ranks q={q.dim()} k={k.dim()} v={v.dim()}"
+    )
+  if k.shape != v.shape:
+    raise ValueError(f"ffpa_attn_varlen_func: k/v must share shape, got k={tuple(k.shape)} v={tuple(v.shape)}")
+  if q.dtype not in (torch.float16, torch.bfloat16):
+    raise TypeError(f"ffpa_attn_varlen_func: q/k/v must be fp16/bf16, got {q.dtype}")
+  if k.dtype != q.dtype or v.dtype != q.dtype:
+    raise TypeError(f"ffpa_attn_varlen_func: q/k/v must share dtype, got "
+                    f"q={q.dtype} k={k.dtype} v={v.dtype}")
+
+  if cu_seqlens_k is None:
+    cu_seqlens_k = cu_seqlens_q
+  if cu_seqlens_q.dtype != torch.int32 or cu_seqlens_k.dtype != torch.int32:
+    raise TypeError("ffpa_attn_varlen_func: cu_seqlens_q/cu_seqlens_k must be int32")
+  if cu_seqlens_q.numel() != cu_seqlens_k.numel() or cu_seqlens_q.numel() < 2:
+    raise ValueError("ffpa_attn_varlen_func: cu_seqlens_q and cu_seqlens_k must share length >= 2")
+
+  from ..functional import FFPAAttnMeta
+
+  meta_kwargs = dict(kwargs)
+  meta_kwargs.setdefault("forward_backend", "cutedsl")
+  meta_kwargs.setdefault("backward_backend", "cutedsl")
+  meta = FFPAAttnMeta.from_kwargs(**meta_kwargs)
+  if meta.forward_backend != "cutedsl" or meta.backward_backend != "cutedsl":
+    raise ValueError(
+      f"ffpa_attn_varlen_func: backends must both be 'cutedsl'; got "
+      f"forward={meta.forward_backend!r} backward={meta.backward_backend!r}"
+    )
+
+  if not enable_gqa and q.size(-2) != k.size(-2):
+    raise ValueError(
+      f"ffpa_attn_varlen_func: enable_gqa=False but query num_heads "
+      f"({q.size(-2)}) != key/value num_heads ({k.size(-2)}). "
+      f"Set enable_gqa=True or use matching head counts."
+    )
+  if q.size(-2) % k.size(-2) != 0:
+    raise ValueError(
+      f"ffpa_attn_varlen_func: query num_heads ({q.size(-2)}) must be an "
+      f"integer multiple of key/value num_heads ({k.size(-2)}) for GQA/MQA."
+    )
+
+  # dtype was already validated above with a user-facing
+  # "ffpa_attn_varlen_func: ..." prefix; _require_cutedsl_supported re-checks
+  # it as the tensor-level single source of truth.
+  requires_grad = any(t.requires_grad for t in (q, k, v))
+  _require_cutedsl_supported(q, k, v, requires_grad=requires_grad)
+
+  from ._interface import ffpa_attn_splitd_varlen_func
+
+  return ffpa_attn_splitd_varlen_func(
+    q,
+    k,
+    v,
+    cu_seqlens_q=cu_seqlens_q,
+    cu_seqlens_k=cu_seqlens_k,
+    max_seqlen_q=max_seqlen_q,
+    max_seqlen_k=max_seqlen_k,
     softmax_scale=softmax_scale,
     causal=causal,
+    return_lse=return_lse,
   )
-  dq, dk, dv = (t.transpose(1, 2).contiguous() for t in (dq_nhd, dk_nhd, dv_nhd))
-  return dq, dk, dv, None
 
 
 __all__ = [
-  "_ffpa_attn_forward_cutedsl",
-  "_ffpa_attn_backward_cutedsl",
+  "_ffpa_attn_cutedsl",
+  "_ffpa_attn_varlen_cutedsl",
   "cutedsl_forward_available",
   "cutedsl_backward_available",
   "_require_cutedsl_supported",

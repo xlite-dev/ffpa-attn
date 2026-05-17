@@ -16,19 +16,6 @@ class NamedBarrierFwd(enum.IntEnum):
   ScaleReady = enum.auto()
 
 
-class NamedBarrierFwdSm100(enum.IntEnum):
-  Epilogue = enum.auto()  # starts from 1 as barrier 0 is reserved for sync_threads()
-  TmemPtr = enum.auto()
-  SoftmaxStatsW0 = enum.auto()
-  SoftmaxStatsW1 = enum.auto()
-  SoftmaxStatsW2 = enum.auto()
-  SoftmaxStatsW3 = enum.auto()
-  SoftmaxStatsW4 = enum.auto()
-  SoftmaxStatsW5 = enum.auto()
-  SoftmaxStatsW6 = enum.auto()
-  SoftmaxStatsW7 = enum.auto()
-
-
 class NamedBarrierBwd(enum.IntEnum):
   # SM90 PTX `bar.sync`/`bar.arrive` accept barrier IDs 0..15 ONLY. IDs >15 are undefined behavior
   Epilogue = enum.auto()  # 1
@@ -49,20 +36,3 @@ class NamedBarrierBwd(enum.IntEnum):
   PFull = enum.auto()  # 13 WG1 → WG2: sP[0] published (256-thread barrier)
   PEmpty = enum.auto()  # 14 WG2 → WG1: sP[0] consumed; init credit + polite-close
   dSLocal = enum.auto()  # 15 WG2-internal STSM(sdS) → WGMMA(read sdS) fence (128-thread)
-
-
-class NamedBarrierBwdSm100(enum.IntEnum):
-  EpilogueWG1 = enum.auto()
-  EpilogueWG2 = enum.auto()
-  Compute = enum.auto()
-  dQaccReduce = enum.auto()
-  TmemPtr = enum.auto()
-
-
-class NamedBarrierFwdSm100_MLA2CTA(enum.IntEnum):
-  Epilogue = enum.auto()
-  TmemPtr = enum.auto()
-  Cpasync = enum.auto()
-  Softmax = enum.auto()
-  SoftmaxStatsFull = enum.auto()
-  SoftmaxStatsEmpty = enum.auto()

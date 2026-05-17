@@ -439,24 +439,6 @@ class FFPAAttnMeta:
     else:
       self.scale = float(scale)
 
-    # Explicit gate for CuTeDSL: every unsupported combo (D!=512, non-SM90,
-    # fp16 training, dropout, attn_mask, ...) is surfaced here so the user
-    # sees an actionable error instead of a silent SDPA fallback or a deep
-    # kernel crash. Skipped for non-cutedsl backends to keep their dispatch
-    # surface unchanged.
-    if self.forward_backend == "cutedsl":
-      from .cutedsl import _require_cutedsl_supported
-      _require_cutedsl_supported(
-        query,
-        key,
-        value,
-        is_causal=is_causal,
-        dropout_p=dropout_p,
-        attn_bias=attn_mask,
-        enable_gqa_user=enable_gqa,
-        requires_grad=any(t.requires_grad for t in (query, key, value)),
-      )
-
     return self
 
   def normalize_attn_mask(
@@ -618,16 +600,6 @@ class _FFPAAttnFunc(torch.autograd.Function):
         bool(meta.enable_forward_tma),
         bool(meta.enable_forward_ws),
       )
-    elif meta.forward_backend == "cutedsl":
-      from .cutedsl import _ffpa_attn_forward_cutedsl
-      O, lse = _ffpa_attn_forward_cutedsl(
-        q,
-        k,
-        v,
-        O,
-        causal=meta.is_causal,
-        softmax_scale=meta.scale,
-      )
     else:
       raise ValueError(f"Unsupported forward_backend={meta.forward_backend!r};")
 
@@ -685,23 +657,6 @@ class _FFPAAttnFunc(torch.autograd.Function):
           philox_offset=int(rng_state[1].item()) if rng_state.numel() else 0,
           enable_tma=bool(meta.enable_backward_tma),
           enable_ws=bool(meta.enable_backward_ws),
-        )
-      elif meta.backward_backend == "cutedsl":
-        from .cutedsl import _ffpa_attn_backward_cutedsl
-        dq, dk, dv, grad_attn_bias = _ffpa_attn_backward_cutedsl(
-          grad_out=grad_out,
-          q=q,
-          k=k,
-          v=v,
-          o=O,
-          lse=lse,
-          causal=meta.is_causal,
-          softmax_scale=meta.scale,
-          attn_bias=attn_bias,
-          return_attn_bias_grad=ctx.needs_input_grad[3],
-          dropout_p=meta.dropout_p,
-          philox_seed=int(rng_state[0].item()) if rng_state.numel() else 0,
-          philox_offset=int(rng_state[1].item()) if rng_state.numel() else 0,
         )
       else:
         dq, dk, dv, grad_attn_bias = _aten_efficient_attn_backward(

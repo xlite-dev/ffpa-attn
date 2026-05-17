@@ -100,6 +100,8 @@ class TileSchedulerArguments(ParamsBase):
   qhead_per_kvhead_packgqa: cutlass.Constexpr[int] = 1
   element_size: cutlass.Constexpr[int] = 2
   lpt: cutlass.Constexpr[bool] = False
+  # Reserved: enables L2-aware head-major scheduling inside SingleTileVarlenScheduler's
+  # LPT branch (deterministic bwd). No current call site sets this True.
   head_swizzle: cutlass.Constexpr[bool] = False
 
 
@@ -342,6 +344,10 @@ class SingleTileLPTScheduler:
 # ---------------------------------------------------------------------------
 # SingleTileLPTBwdScheduler — deterministic backward (SPT + L2 swizzle)
 # ---------------------------------------------------------------------------
+# Reserved: SM90 deterministic backward scheduler (SPT + L2 swizzle).
+# Currently no call site imports this; bwd kernels (_ffpa_dq, _ffpa_dkdv) default
+# to SingleTileScheduler / SingleTileVarlenScheduler. Wire this in when the
+# deterministic-backward implementation lands.
 
 
 class SingleTileLPTBwdScheduler:

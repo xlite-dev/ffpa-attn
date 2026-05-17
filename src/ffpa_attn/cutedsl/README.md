@@ -12,7 +12,7 @@ The supported entry points live at the top of the `ffpa_attn` namespace:
 
 Both APIs route into this package, but along different paths — see
 [Architecture](#architecture) below. The kernels are bit-identical across
-paths (same `_flash_attn_fwd_sm90` / `_flash_attn_bwd_sm90`).
+paths (same `_ffpa_attn_forward_sm90` / `_ffpa_attn_backward_sm90`).
 
 [cutedsl]: https://github.com/NVIDIA/cutlass/tree/main/python/CuTeDSL
 
@@ -48,7 +48,7 @@ out.sum().backward()
 When the call satisfies all four conditions of `_should_take_cutedsl_fast_path`
 (see `ffpa_attn_interface.py`), `ffpa_attn_func` short-circuits the standard
 multi-backend dispatcher and routes straight to
-`cutedsl.interface.split_flash_attn_func`:
+`cutedsl._interface.ffpa_attn_splitd_func`:
 
 1. `forward_backend == 'cutedsl'`
 2. `query.size(-1) == 512`
@@ -107,7 +107,7 @@ out.sum().backward()
 ```
 
 `ffpa_attn_varlen_func` has no fast/slow split — it always dispatches
-directly to the autograd-registered `torch.ops.splitd_flash_attn.varlen_fwd`
+directly to the autograd-registered `torch.ops.ffpa_attn.splitd_fwd_sm90`
 custom op, which is registered when this package is imported.
 
 The following FlashAttention-compat kwargs are explicitly **rejected**
@@ -150,31 +150,33 @@ is checked at call time (not by the availability probe).
 
 ## Architecture
 
-Three call paths converge on `cutedsl.interface`:
+Three call paths converge on `cutedsl._interface`:
 
 ```
 user code
   │
   ├── ffpa_attn_func(forward_backend='cutedsl', ...)
   │     │
-  │     ├── fast-path: _ffpa_attn_func_cutedsl_fast_path
-  │     │     └── cutedsl.interface.split_flash_attn_func
-  │     │           └── FlashAttnFunc.apply
-  │     │                 → _flash_attn_fwd_sm90 / _flash_attn_bwd_sm90
+  │     ├── Layer-2 (cutedsl-native autograd, bypasses FFPAAttnFunc):
+  │     │     _ffpa_attn_cutedsl
+  │     │       └── cutedsl._interface.ffpa_attn_splitd_func
+  │     │             └── FFPAAttnSplitDFunc.apply
+  │     │                   → _ffpa_attn_forward_sm90 / _ffpa_attn_backward_sm90
   │     │
-  │     └── slow-path: FFPAAttnFunc.apply
-  │           └── cutedsl._wrappers._ffpa_attn_{forward,backward}_cutedsl
-  │                 └── cutedsl.interface._flash_attn_{fwd,bwd}_sm90
+  │     └── Layer-3 (routed through the multi-backend FFPAAttnFunc):
+  │           FFPAAttnFunc.apply
+  │             └── cutedsl._wrappers._ffpa_attn_{forward,backward}_cutedsl
+  │                   └── cutedsl._interface._ffpa_attn_{forward,backward}_sm90
   │
   └── ffpa_attn_varlen_func(...)
-        └── _ffpa_attn_varlen_cutedsl
-              └── torch.ops.splitd_flash_attn.varlen_fwd
-                    (registered in cutedsl.interface)
-                      → _flash_attn_fwd_sm90 / _flash_attn_bwd_sm90
+        └── _ffpa_attn_varlen_cutedsl  (sibling of _ffpa_attn_cutedsl, packed [T,H,D])
+              └── torch.ops.ffpa_attn.splitd_fwd_sm90
+                    (registered in cutedsl._interface)
+                      → _ffpa_attn_forward_sm90 / _ffpa_attn_backward_sm90
 ```
 
-All three paths bottom out at the same `_flash_attn_fwd_sm90` /
-`_flash_attn_bwd_sm90` functions in `interface.py`, which compile and
+All three paths bottom out at the same `_ffpa_attn_forward_sm90` /
+`_ffpa_attn_backward_sm90` functions in `_interface.py`, which compile and
 launch the CuTeDSL kernels. The slow path additionally pays for an
 SDPA↔FA layout transpose (in `_wrappers.py`) and the multi-backend
 `FFPAAttnFunc` autograd boundary; the fast path and the varlen path
@@ -184,13 +186,13 @@ skip both.
 
 | File | Role |
 |---|---|
-| `__init__.py` | Side-effect imports `interface` to register the `splitd_flash_attn::varlen_{fwd,bwd}` torch ops; re-exports the helpers from `_wrappers.py`. |
+| `__init__.py` | Side-effect imports `_interface` to register the `ffpa_attn::splitd_{fwd,bwd}_sm90` torch ops; re-exports the helpers from `_wrappers.py`. |
 | `_wrappers.py` | Slow-path SDPA `[B, H, N, D]` ↔ CuTeDSL-native `[B, N, H, D]` layout adapter. Owns `_require_cutedsl_supported` (the canonical gate: SM major, head_dim, dtype, dropout, attn_bias) and the `cutedsl_{forward,backward}_available` device probes. |
-| `interface.py` | Top of the CuTeDSL-internal stack. Owns `SUPPORTED_HEAD_DIM = 512`, the `_flash_attn_fwd_sm90` / `_flash_attn_bwd_sm90` entry functions, `split_flash_attn_func` (the fast-path target), the `FlashAttnFunc` autograd `Function`, the `splitd_flash_attn::varlen_{fwd,bwd}` torch.library ops + their autograd wiring, and the SM90 arch / dtype / GQA-pack guards. |
+| `_interface.py` | Top of the CuTeDSL-internal stack. Owns `SUPPORTED_HEAD_DIM = 512`, the `_ffpa_attn_forward_sm90` / `_ffpa_attn_backward_sm90` entry functions, `ffpa_attn_splitd_func` (the fast-path target), the `FFPAAttnSplitDFunc` autograd `Function`, the `ffpa_attn::splitd_{fwd,bwd}_sm90` torch.library ops + their autograd wiring, and the SM90 arch / dtype / GQA-pack guards. |
 | `_ffpa_fwd_d512_sm90.py` | Forward kernel: full-D 3-warpgroup pipeline (TMA producer + WG1 QK / softmax / PV-front + WG2 PV-back epilogue). |
 | `_ffpa_dkdv_d512_sm90.py` | Backward `dK` + `dV` kernel: 1 TMA producer + 1 MMA consumer warpgroup, `d_chunk=256`, K/V persistent in SMEM across `d`-passes. |
 | `_ffpa_dq_d512_sm90.py` | Backward `dQ` kernel: dual-asymmetric MMA warpgroups, `d_chunk=256`, cooperative `dQ_front` + `dQ_back`. |
-| `flash_bwd_preprocess.py` | Backward preprocess: computes `D_i = (O ⊙ dO).sum(-1)` with optional `dLSE` adjustment. Called from `_flash_attn_bwd_sm90` before `dK/dV` and `dQ`. |
+| `_ffpa_bwd_preprocess.py` | Backward preprocess: computes `D_i = (O ⊙ dO).sum(-1)` with optional `dLSE` adjustment. Called from `_ffpa_attn_backward_sm90` before `dK/dV` and `dQ`. |
 | `utils/` | Shared kernel helpers. |
 
 #### `utils/` contents

@@ -77,7 +77,15 @@ def test_cutedsl_autograd_matches_triton(is_causal):
 
 
 def test_cutedsl_rejects_non_512_head_dim():
+  """D != 512 with cutedsl backend must raise (no silent SDPA fallback)."""
   q = torch.randn(1, 8, 1024, 320, dtype=torch.bfloat16, device="cuda")
+  with pytest.raises(NotImplementedError, match="head_dim=512"):
+    ffpa_attn_func(q, q, q, forward_backend="cutedsl")
+
+
+def test_cutedsl_rejects_small_head_dim():
+  """D <= 256 with cutedsl backend must raise (no silent SDPA fallback)."""
+  q = torch.randn(1, 8, 1024, 128, dtype=torch.bfloat16, device="cuda")
   with pytest.raises(NotImplementedError, match="head_dim=512"):
     ffpa_attn_func(q, q, q, forward_backend="cutedsl")
 
@@ -88,11 +96,19 @@ def test_cutedsl_rejects_fp16_training():
     ffpa_attn_func(q, q, q, forward_backend="cutedsl")
 
 
-def test_cutedsl_rejects_attn_mask():
+def test_cutedsl_raises_on_attn_mask():
+  """attn_mask != None with cutedsl: raise NotImplementedError (uniform policy)."""
   q = torch.randn(1, 8, 1024, 512, dtype=torch.bfloat16, device="cuda")
   m = torch.zeros(1024, 1024, dtype=torch.bfloat16, device="cuda")
-  with pytest.raises(NotImplementedError, match="attn_mask"):
+  with pytest.raises(NotImplementedError, match="attention_mask"):
     ffpa_attn_func(q, q, q, attn_mask=m, forward_backend="cutedsl")
+
+
+def test_cutedsl_raises_on_dropout():
+  """dropout_p > 0 with cutedsl: raise NotImplementedError (uniform policy)."""
+  q = torch.randn(1, 8, 1024, 512, dtype=torch.bfloat16, device="cuda")
+  with pytest.raises(NotImplementedError, match="dropout_p"):
+    ffpa_attn_func(q, q, q, dropout_p=0.1, forward_backend="cutedsl")
 
 
 def test_cutedsl_rejects_mixed_backward_backend():
@@ -101,20 +117,12 @@ def test_cutedsl_rejects_mixed_backward_backend():
     ffpa_attn_func(q, q, q, forward_backend="cutedsl", backward_backend="triton")
 
 
-def test_cutedsl_fallback_when_small_d():
-  """D <= 256 still falls back to SDPA even if cutedsl was requested."""
-  q = torch.randn(1, 8, 1024, 128, dtype=torch.bfloat16, device="cuda")
-  # Should not raise — fall back to SDPA via the public-API fallback layer.
-  out = ffpa_attn_func(q, q, q, forward_backend="cutedsl")
-  assert out.shape == q.shape and torch.isfinite(out).all()
-
-
 def test_cutedsl_fast_path_bypasses_ffpaattnfunc(monkeypatch):
   """forward_backend='cutedsl' + D=512 + SM90 must short-circuit FFPAAttnFunc.
 
   Patches the dispatcher entry point in ffpa_attn_interface and asserts it is
   never invoked: the fast-path in ffpa_attn_func should route directly to
-  cutedsl.interface.split_flash_attn_func.
+  cutedsl._interface.ffpa_attn_splitd_func.
   """
   import ffpa_attn.ffpa_attn_interface as iface
 

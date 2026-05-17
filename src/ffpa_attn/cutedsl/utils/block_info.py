@@ -1,16 +1,18 @@
-# This file is copied from https://github.com/Dao-AILab/flash-attention/blob/main/flash_attn/cute/block_info.py.
+# This file is adapted from https://github.com/Dao-AILab/flash-attention/blob/main/flash_attn/cute/block_info.py.
 # Copyright (c) 2025, Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar, Pradeep Ramani, Tri Dao.
-# SM90-only simplified version of block_info.py for Hopper training port.
+# SM90-only trimmed version of block_info.py for the Hopper training port.
 #
-# Removed vs upstream block_info.py:
-#   - get_n_block_k_new_min_max method (append-KV, not used in SM90 training)
-#   - SeqlenInfoQKNewK import (removed class)
+# Removed vs upstream:
+#   - get_n_block_k_new_min_max (append-KV, not used in SM90 training)
+#   - SeqlenInfoQKNewK import (class removed upstream)
+#   - is_split_kv field and the split-KV branch in get_n_block_min_max (no SM90 split-KV in this repo)
 #
-# Retained methods (all have active SM90 call sites):
-#   - get_n_block_min_max:              fwd producer (line 757), fwd consumer (line 1087), bwd (line 1818)
-#   - get_m_block_min_max:              bwd (lines 914, 1307, 1778)
-#   - get_n_block_min_causal_local_mask: fwd (line 1128)
-#   - get_n_block_min_before_local_mask: fwd (line 1145)
+# Methods (SM90 call sites in this repo, plus reserved helpers for future masked-iteration splits):
+#   - get_n_block_min_max:              _ffpa_fwd_d512_sm90.py (lines 798, 1005, 1425),
+#                                       _ffpa_dq_d512_sm90.py  (lines 759, 1015, 1317)
+#   - get_m_block_min_max:              _ffpa_dkdv_d512_sm90.py (lines 702, 963, 1211)
+#   - get_n_block_min_causal_local_mask: reserved (no current call sites)
+#   - get_n_block_min_before_local_mask: reserved (no current call sites)
 
 from typing import Tuple, Optional
 from dataclasses import dataclass
@@ -28,7 +30,6 @@ class BlockInfo:
   tile_n: cutlass.Constexpr[int]
   is_causal: cutlass.Constexpr[bool]
   is_local: cutlass.Constexpr[bool] = False
-  is_split_kv: cutlass.Constexpr[bool] = False
   window_size_left: Optional[Int32] = None
   window_size_right: Optional[Int32] = None
   qhead_per_kvhead_packgqa: cutlass.Constexpr[int] = 1
@@ -38,8 +39,6 @@ class BlockInfo:
     self,
     seqlen_info: SeqlenInfoQK,
     m_block: Int32,
-    split_idx: Int32 = 0,
-    num_splits: Int32 = 1,
   ) -> Tuple[Int32, Int32]:
     n_block_max = cute.ceil_div(seqlen_info.seqlen_k, self.tile_n)
     if const_expr(self.is_causal or (self.is_local and self.window_size_right is not None)):
@@ -57,12 +56,6 @@ class BlockInfo:
       n_idx = m_idx_min + seqlen_info.seqlen_k - seqlen_info.seqlen_q
       n_idx_left = n_idx - self.window_size_left
       n_block_min = cutlass.max(n_idx_left // self.tile_n, 0)
-    if cutlass.const_expr(self.is_split_kv):
-      num_n_blocks_per_split = (
-        Int32(0) if n_block_max <= n_block_min else (n_block_max - n_block_min + num_splits - 1) // num_splits
-      )
-      n_block_min = n_block_min + split_idx * num_n_blocks_per_split
-      n_block_max = cutlass.min(n_block_min + num_n_blocks_per_split, n_block_max)
     return n_block_min, n_block_max
 
   @cute.jit
@@ -81,6 +74,7 @@ class BlockInfo:
       m_block_max = min(m_block_max, cute.ceil_div(m_idx_left, self.tile_m))
     return m_block_min, m_block_max
 
+  # Reserved: for casual and sliding window case : lower bound of the n-block range that still needs causal / right-local masking.
   @cute.jit
   def get_n_block_min_causal_local_mask(
     self,
@@ -98,6 +92,7 @@ class BlockInfo:
     )
     return cutlass.max(n_block_min, n_idx_right // self.tile_n)
 
+  # Reserved: for sliding window case : lower bound of the no-mask fast path, i.e. the n-block at which left-local masking begins.
   @cute.jit
   def get_n_block_min_before_local_mask(
     self,

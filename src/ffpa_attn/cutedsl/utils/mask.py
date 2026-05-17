@@ -1,21 +1,24 @@
-# This file is copied from https://github.com/Dao-AILab/flash-attention/blob/main/flash_attn/cute/mask.py
+# This file is adapted from https://github.com/Dao-AILab/flash-attention/blob/main/flash_attn/cute/mask.py
 # Copyright (c) 2025, Tri Dao.
-# SM90-only simplified version of mask.py for Hopper training port.
+# SM90-only trimmed version of mask.py for the Hopper training port.
 #
-# Removed vs upstream mask.py:
+# Removed vs upstream:
 #   - apply_mask_sm100 method (SM100 forward, uses thr_tmem_load / rBitmask / head_divmod)
 #   - apply_mask_sm100_transposed method (SM100 backward, uses thr_tmem_load / row_to_r2p_idx)
 #   - row_to_r2p_idx helper function (only used by apply_mask_sm100_transposed)
 #
-# Retained (all have active SM90 call sites):
+# Retained primitives (all referenced inside apply_mask):
 #   - r2p_bitmask_below / r2p_bitmask_above (R2P bitmask primitives)
 #   - mask_r2p_lambda (R2P masking kernel)
 #   - sm90_col_to_r2p_idx (SM90 MMA column-to-R2P coordinate transform)
-#   - AttentionMask class with:
-#       - apply_mask method — called by flash_fwd_sm90.py:1062 and flash_bwd_sm90.py:1328
-#         Covers: seqlen-only, causal, local/sliding window, mask_mod (FlexAttention),
-#                 PackGQA (fwd only, qhead_per_kvhead_packgqa > 1),
-#                 swap_AB (bwd SdP_swapAB=True)
+#
+# AttentionMask.apply_mask call sites in this repo:
+#   - _ffpa_fwd_d512_sm90.py:982   (seqlen-only / causal / local / mask_mod / PackGQA)
+#   - _ffpa_dq_d512_sm90.py:1027, 1330   (seqlen-only / causal)
+#   - _ffpa_dkdv_d512_sm90.py:982, 1233  (seqlen-only / causal)
+#
+# swap_AB=True branch of apply_mask is reserved for a future SM90 bwd SdP swap_AB path
+# (no current call sites). See `swap_AB` field below and the swap_AB arm inside apply_mask.
 #
 # Dependencies:
 #   - quack.layout_utils.reshape_acc_to_mn (MMA accumulator reshape)
@@ -106,6 +109,7 @@ class AttentionMask:
   window_size_left: Optional[Int32] = None
   window_size_right: Optional[Int32] = None
   qhead_per_kvhead_packgqa: cutlass.Constexpr[int] = 1  # only pass in if we're doing PackGQA
+  # Reserved: enables the bwd SdP swap_AB path of apply_mask (currently no SM90 call site sets this True).
   swap_AB: cutlass.Constexpr[bool] = False
 
   @property
@@ -280,6 +284,7 @@ class AttentionMask:
                 return r2p_bitmask_below(col_limit_right_r2p, s) & r2p_bitmask_above(col_limit_left_r2p, s)
 
               mask_r2p_lambda(acc_S_mn[r, None], mask_gen_fn, rank1=True)
+      # Reserved: future SM90 bwd SdP swap_AB path; not reached under current call sites.
       else:  # swap_AB (backward SdP path)
         assert self.qhead_per_kvhead_packgqa == 1
         thr_row_offset = tScS_mn[0][ROW]

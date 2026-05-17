@@ -13,9 +13,6 @@ from cutlass.pipeline import NamedBarrier as NamedBarrierOg
 from cutlass.pipeline import PipelineAsync as PipelineAsyncOg
 from cutlass.pipeline import PipelineCpAsync as PipelineCpAsyncOg
 from cutlass.pipeline import PipelineTmaAsync as PipelineTmaAsyncOg
-from cutlass.pipeline import PipelineTmaUmma as PipelineTmaUmmaOg
-from cutlass.pipeline import PipelineUmmaAsync as PipelineUmmaAsyncOg
-from cutlass.pipeline import PipelineAsyncUmma as PipelineAsyncUmmaOg
 
 
 def _override_create(parent_cls, child_cls):
@@ -36,6 +33,9 @@ def _make_state(index: Int32, phase: Int32) -> PipelineState:
   return PipelineState(stages=0, count=Int32(0), index=index, phase=phase)
 
 
+# Reserved: alternative pipeline state encoding (single Int32 for index+phase).
+# Current SM90 kernels use cutlass.pipeline.PipelineState directly; this remains
+# for future ports that need the compact encoding.
 class PipelineStateSimple:
   """
     Pipeline state contains an index and phase bit corresponding to the current position in the circular buffer.
@@ -84,6 +84,8 @@ class PipelineStateSimple:
     return PipelineStateSimple(self.stages, Int32(values[0]))
 
 
+# Reserved: factory for PipelineStateSimple; see PipelineStateSimple for the
+# reservation rationale.
 def make_pipeline_state(type: PipelineUserType, stages: int):
   """
     Creates a pipeline state. Producers are assumed to start with an empty buffer and have a flipped phase bit of 1.
@@ -116,6 +118,10 @@ def _call_with_elect_one(parent_method, self, state, elect_one, syncwarp, loc, i
 # PipelineState from (index, phase) and delegate.
 
 
+# Reserved: _w_index_phase / _w_index entry points for pipelines whose
+# producer/consumer state is tracked as explicit (index, phase) ints rather than
+# a PipelineState struct. Inherited by all Pipeline* classes; no SM90 call site
+# uses these methods today.
 class _PipelineIndexPhaseMixin:
   """Mixin providing _w_index_phase / _w_index methods that delegate to PipelineState-based parents."""
 
@@ -160,6 +166,10 @@ class _PipelineIndexPhaseMixin:
 # ── NamedBarrier ─────────────────────────────────────────────────────────────
 
 
+# Reserved: indexed-NamedBarrier wrapper (arrive_w_index / arrive_and_wait_w_index)
+# for cases that need a contiguous run of barrier IDs (barrier_id + index).
+# Current SM90 kernels use the IntEnum-based NamedBarrierFwd/Bwd in
+# utils.named_barrier instead of this wrapper.
 @dataclass(frozen=True)
 class NamedBarrier(NamedBarrierOg):
   create = _override_create(NamedBarrierOg, None)  # patched below
@@ -261,6 +271,9 @@ class PipelineAsync(_PipelineIndexPhaseMixin, PipelineAsyncOg):
 # ── PipelineCpAsync ──────────────────────────────────────────────────────────
 
 
+# Reserved: cp.async producer/consumer pipeline. SM90 attention currently uses
+# TMA (PipelineTmaAsync) exclusively; this remains for non-TMA forward
+# extension or for sm80-class fallback paths.
 @dataclass(frozen=True)
 class PipelineCpAsync(_PipelineIndexPhaseMixin, PipelineCpAsyncOg):
   _elect_one_release: bool = False
@@ -328,68 +341,3 @@ class PipelineTmaAsync(_PipelineIndexPhaseMixin, PipelineTmaAsyncOg):
 
 
 PipelineTmaAsync.create = _override_create(PipelineTmaAsyncOg, PipelineTmaAsync)
-
-# ── PipelineTmaUmma ─────────────────────────────────────────────────────────
-
-
-@dataclass(frozen=True)
-class PipelineTmaUmma(_PipelineIndexPhaseMixin, PipelineTmaUmmaOg):
-  """Override producer_acquire to take in extra_tx_count parameter."""
-
-  @dsl_user_op
-  def producer_acquire(
-    self,
-    state: PipelineState,
-    try_acquire_token: Optional[Boolean] = None,
-    extra_tx_count: int = 0,
-    *,
-    loc=None,
-    ip=None,
-  ):
-    """
-        TMA producer commit conditionally waits on buffer empty and sets the transaction barrier for leader threadblocks.
-        """
-    if_generate(
-      try_acquire_token is None or try_acquire_token == 0,
-      lambda: self.sync_object_empty.wait(state.index, state.phase, loc=loc, ip=ip),
-      loc=loc,
-      ip=ip,
-    )
-    if const_expr(extra_tx_count == 0):
-      if_generate(
-        self.is_leader_cta,
-        lambda: self.sync_object_full.arrive(state.index, self.producer_mask, loc=loc, ip=ip),
-        loc=loc,
-        ip=ip,
-      )
-    else:
-      tx_count = self.sync_object_full.tx_count + extra_tx_count
-      if_generate(
-        self.is_leader_cta,
-        lambda: self.sync_object_full.arrive_and_expect_tx(state.index, tx_count, loc=loc, ip=ip),
-        loc=loc,
-        ip=ip,
-      )
-
-
-PipelineTmaUmma.create = _override_create(PipelineTmaUmmaOg, PipelineTmaUmma)
-
-# ── PipelineUmmaAsync ───────────────────────────────────────────────────────
-
-
-@dataclass(frozen=True)
-class PipelineUmmaAsync(_PipelineIndexPhaseMixin, PipelineUmmaAsyncOg):
-  pass
-
-
-PipelineUmmaAsync.create = _override_create(PipelineUmmaAsyncOg, PipelineUmmaAsync)
-
-# ── PipelineAsyncUmma ───────────────────────────────────────────────────────
-
-
-@dataclass(frozen=True)
-class PipelineAsyncUmma(_PipelineIndexPhaseMixin, PipelineAsyncUmmaOg):
-  pass
-
-
-PipelineAsyncUmma.create = _override_create(PipelineAsyncUmmaOg, PipelineAsyncUmma)

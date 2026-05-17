@@ -35,7 +35,7 @@ from .utils.tile_scheduler import (
 )
 
 
-class FlashAttentionBackwardPreprocess:
+class FFPAAttnBwdPreprocess:
 
   def __init__(
     self,

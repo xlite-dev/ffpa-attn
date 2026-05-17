@@ -1,6 +1,9 @@
 # Copyright (c) DefTruth, qyjdef@163.com
 # Copyright (c) Butterfingrz，13524387014@163.com
-# SM90 (Hopper) forward pass for flash attention — only SplitD for head_dim=512.
+#
+# Adapted from https://github.com/Dao-AILab/flash-attention/blob/main/flash_attn/cute/flash_fwd_sm90.py
+#
+# SM90 (Hopper) forward pass for FFPA attention — only SplitD for head_dim=512.
 #
 # Design:
 #   - Producer WG: warp-0 issues TMA for Q (one-shot per tile), K and V
@@ -66,7 +69,7 @@ from .utils.tile_scheduler import (
 from cutlass.cute import FastDivmodDivisor
 
 
-class FlashAttentionForwardSm90TrainOnly:
+class FFPAAttnFwdSm90SplitD:
   """SM90 forward kernel for head_dim=512 (kv_same must be False for now).
 
     3-role pipeline:
@@ -640,7 +643,6 @@ class FlashAttentionForwardSm90TrainOnly:
       self.tile_n,
       self.is_causal,
       self.is_local,
-      False,
       window_size_left,
       window_size_right,
       qhead_per_kvhead_packgqa=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
@@ -1206,7 +1208,7 @@ class FlashAttentionForwardSm90TrainOnly:
         # ─── Close the tile's K/V pipeline phase ───
         k_consumer_state.advance()
         v_consumer_state.advance()
-      # else: empty tile — interface.py pre-inits O=0, LSE=-inf
+      # else: empty tile — _interface.py pre-inits O=0, LSE=-inf
 
       tile_scheduler.advance_to_next_work()
       work_tile = tile_scheduler.get_current_work()
@@ -1502,7 +1504,7 @@ class FlashAttentionForwardSm90TrainOnly:
 
         # ─── Close the tile's V pipeline phase ───
         v_consumer_state.advance()
-      # else: empty tile; interface.py pre-inits O=0
+      # else: empty tile; _interface.py pre-inits O=0
 
       tile_scheduler.advance_to_next_work()
       work_tile = tile_scheduler.get_current_work()

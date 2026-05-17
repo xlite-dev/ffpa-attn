@@ -19,7 +19,6 @@ CUTE_DSL_PTXAS_PATH = os.environ.get("CUTE_DSL_PTXAS_PATH", None)
 VERBOSE = os.environ.get("CUTE_DSL_PTXAS_VERBOSE", "0") == "1"
 
 _original_load_cuda_library = None
-_user_wanted_ptx = False  # True if user originally set CUTE_DSL_KEEP_PTX=1
 
 
 def _log(msg):
@@ -123,24 +122,17 @@ def _patched_load_cuda_library(self):
 
   _log(f"Loaded kernel from {ptx_path.name}")
 
-  # Delete PTX if user didn't originally want it kept
-  if not _user_wanted_ptx:
-    ptx_path.unlink(missing_ok=True)
-
   return [cuda_runtime.cudaLibrary_t(lib_ptr.value)]
 
 
 def patch():
   """Install system ptxas hook. Call before importing cutlass."""
-  global _original_load_cuda_library, _user_wanted_ptx
+  global _original_load_cuda_library
 
   assert CUTE_DSL_PTXAS_PATH is not None
   if not os.path.isfile(CUTE_DSL_PTXAS_PATH) or not os.access(CUTE_DSL_PTXAS_PATH, os.X_OK):
     raise RuntimeError(f"ptxas not found: {CUTE_DSL_PTXAS_PATH}")
 
-  # Track if user originally wanted PTX kept
-  _user_wanted_ptx = os.environ.get("CUTE_DSL_KEEP_PTX", "0") == "1"
-  # os.environ['CUTE_DSL_KEEP_PTX'] = '1'
   assert os.environ.get("CUTE_DSL_KEEP_PTX", "0") == "1", "Require CUTE_DSL_KEEP_PTX=1 to use system's ptxas"
 
   cls = cutlass.cutlass_dsl.cuda_jit_executor.CudaDialectJitCompiledFunction

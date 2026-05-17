@@ -10,27 +10,11 @@
 #   - dump_kernel_attributes   (SM100 MLA debug only)
 #   - triton.tools.disasm import
 
-from typing import Tuple
-
 import torch
 
 import cutlass
 import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
-
-# ---------------------------------------------------------------------------
-# dtype mapping (fp16 / bf16 only for SM90 training)
-# NOTE: interface_sm90.py defines its own local copy limited to fp16/bf16.
-#       If you use that, this map is redundant — kept here for callers that
-#       import from this module directly.
-# ---------------------------------------------------------------------------
-torch2cute_dtype_map = {
-  torch.float16: cutlass.Float16,
-  torch.bfloat16: cutlass.BFloat16,
-  torch.float32: cutlass.Float32,
-  torch.float8_e4m3fn: cutlass.Float8E4M3FN,
-  torch.float8_e5m2: cutlass.Float8E5M2,
-}
 
 
 # ---------------------------------------------------------------------------
@@ -105,13 +89,3 @@ def get_aux_tensor_metadata(aux_tensors):
     getattr(t, "__leading_dim__", -1),
     hasattr(t, "__leading_dim__"),
   ) for t in aux_tensors)
-
-
-def get_broadcast_dims(tensor: torch.Tensor) -> Tuple[bool, ...]:
-  """Return tuple of bools indicating which dims have stride=0 (broadcast).
-
-    This is useful for compile keys since CuTe's mark_layout_dynamic() keeps
-    stride=0 as static, meaning kernels compiled with different broadcast
-    patterns are not interchangeable.
-    """
-  return tuple(s == 0 for s in tensor.stride())

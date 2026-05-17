@@ -1,5 +1,12 @@
 # Copyright (c) DefTruth, qyjdef@163.com
 # Copyright (c) Butterfingrz，13524387014@163.com
+#
+# The idea of splitting the backward pass into a separate dKdV kernel is
+# inspired by
+# https://github.com/Dao-AILab/flash-attention/blob/main/flash_attn/cute/sm100_hd256_2cta_fmha_backward_dkdvkernel.py
+# The core implementation below is written from scratch for SM90 and follows
+# the SplitD design from the ffpa-attn repo.
+#
 # SM90 Backward dKdV Kernel with 4-Pass D-Split for head_dim=512.
 #
 # Architecture:
@@ -51,7 +58,7 @@ from .utils.tile_scheduler import (
 from .utils.named_barrier import NamedBarrierBwd
 
 
-class FlashBwdDKDV_SplitD_Sm90:
+class FFPAAttnBwdDKDVSm90SplitD:
   """SM90 backward dKdV kernel (dual asymmetric MMA WG + d_chunk=256 + K/V persistence).
 
     Computes only dK and dV (no dQ). dQ is handled by a separate kernel.
@@ -105,7 +112,6 @@ class FlashBwdDKDV_SplitD_Sm90:
     self.num_mma_threads = 256  # WG1 + WG2
     self.num_mma_regs_wg1 = 224
     self.num_mma_regs_wg2 = 224
-    self.num_mma_regs = 256  # legacy; not used in MVP-2' dispatch
     self.num_producer_regs = 56
 
     # ── Pipeline stages──
@@ -555,7 +561,6 @@ class FlashBwdDKDV_SplitD_Sm90:
       self.tile_n,
       self.is_causal,
       False,  # is_local
-      False,  # is_split_kv
     )
     SeqlenInfoCls = partial(
       SeqlenInfoQK.create,
@@ -885,7 +890,7 @@ class FlashBwdDKDV_SplitD_Sm90:
       pipeline_V.producer_tail(producer_state_V)
 
   # ════════════════════════════════════════════════════════════════════
-  # MVP-2': WG1 = S (P1) + softmax→sP→arrive PFull (P2) + dV (P5)
+  # WG1 = S (P1) + softmax→sP→arrive PFull (P2) + dV (P5)
   # ════════════════════════════════════════════════════════════════════
   @cute.jit
   def mma_wg1(
