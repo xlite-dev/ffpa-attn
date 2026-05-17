@@ -55,9 +55,13 @@ def _parse_args() -> argparse.Namespace:
     "--backward-backend",
     "--backend",
     "--bwd",
-    choices=["sdpa", "triton"],
+    choices=["sdpa", "triton", "cutedsl"],
     default="triton",
-    help="Backward backend passed to ffpa_attn_func.",
+    help=(
+      "Backward backend passed to ffpa_attn_func. 'cutedsl' auto-pairs the "
+      "forward to cutedsl and only runs SM90 + D=512 + bf16, with no "
+      "attn_mask/dropout/non-aligned cases (auto-skipped)."
+    ),
   )
   parser.add_argument("--B", type=int, default=1, help="Batch size.")
   parser.add_argument("--N", type=int, default=8192, help="Sequence length (non-aligned uses N-1).")
@@ -124,6 +128,13 @@ def _parse_args() -> argparse.Namespace:
     args.enable_bwd_tma = True
   if args.enable_ws:
     args.enable_bwd_ws = True
+  if args.backward_backend == "cutedsl" and (
+    args.triton_autotune or args.enable_bwd_tma or args.enable_bwd_ws or args.grad_v_storage_dtype != "none"
+  ):
+    print(
+      "[warn] --backward-backend=cutedsl ignores --triton-autotune / "
+      "--enable-bwd-tma / --enable-bwd-ws / --grad-v-storage-dtype."
+    )
   return args
 
 
@@ -456,6 +467,7 @@ def _ffpa_forward(
     dropout_p=dropout_p,
     scale=scale,
     enable_gqa=q_i.size(1) != k_i.size(1),
+    forward_backend="cutedsl" if backward_backend == "cutedsl" else "triton",
     backward_backend=backward_backend,
     triton_autotune=triton_autotune,
     triton_autotune_mode=triton_autotune_mode,
@@ -652,6 +664,7 @@ def _run_case(
     dropout_p=dropout_p,
     scale=scale,
     enable_gqa=Nh_q != Nh_kv,
+    forward_backend="cutedsl" if backward_backend == "cutedsl" else "triton",
     backward_backend=backward_backend,
     triton_autotune=triton_autotune,
     triton_autotune_mode=triton_autotune_mode,
@@ -838,6 +851,7 @@ def run_backward_examples(
   iters: int = DEFAULT_ITERS,
   print_results: bool = True,
   tasks: set[str] | None = None,
+  dtypes: tuple[torch.dtype, ...] = (torch.float16, torch.bfloat16),
 ) -> list[BACKWARD_RESULT]:
   """Run the canonical backward benchmark cases.
 
@@ -862,12 +876,21 @@ def run_backward_examples(
   :param iters: Measured iterations used for timing.
   :param print_results: Whether to print each case result.
   :param tasks: Optional case-name filter. ``None`` runs all cases.
+  :param dtypes: Activation dtypes iterated for each case.
   :return: One structured result per executed case and dtype.
   """
   _validate_timing_args(warmup, iters)
   results: list[BACKWARD_RESULT] = []
   gqa_heads = _resolve_gqa_heads(H)
   non_aligned_heads = _resolve_non_aligned_heads(H)
+
+  if backward_backend == "cutedsl":
+    dtypes = tuple(dt for dt in dtypes if dt == torch.bfloat16)
+    if not dtypes:
+      raise ValueError(
+        "cutedsl backward requires torch.bfloat16; pass dtypes=(torch.bfloat16,) "
+        "or remove fp16 from the dtypes tuple."
+      )
 
   print(
     f"\nRunning FFPA backward examples with backward_backend={backward_backend}, "
@@ -879,8 +902,16 @@ def run_backward_examples(
     f"timing_mode={timing_mode}, tasks={sorted(tasks) if tasks is not None else 'full'}, "
     f"warmup={warmup}, iters={iters}"
   )
+  if backward_backend == "cutedsl":
+    print(
+      "[cutedsl] backend constraints in effect: D=512 + bf16 + no mask/dropout/non-aligned; "
+      "forward auto-paired to cutedsl; triton-* / enable-bwd-tma|ws / grad-v-dtype are ignored."
+    )
 
-  for dtype in (torch.float16, torch.bfloat16):
+  mask_dropout_supported = backward_backend != "cutedsl"
+  non_aligned_supported = backward_backend != "cutedsl"
+
+  for dtype in dtypes:
     mask_n = max(N, 512)
     case_specs: list[dict[str, Any]] = [
       {
@@ -919,30 +950,34 @@ def run_backward_examples(
         "Nkv": N,
         "causal": True
       },
-      {
-        "name": "attn-mask",
-        "Nh_q": H,
-        "Nh_kv": H,
-        "Nq": mask_n,
-        "Nkv": mask_n,
-        "attn_mask": _make_broadcast_additive_attn_mask(mask_n, mask_n, dtype, seed),
-      },
-      {
-        "name": "dropout",
-        "Nh_q": H,
-        "Nh_kv": H,
-        "Nq": N,
-        "Nkv": N,
-        "dropout_p": dropout_p,
-      },
-      {
+    ]
+    if mask_dropout_supported:
+      case_specs.extend([
+        {
+          "name": "attn-mask",
+          "Nh_q": H,
+          "Nh_kv": H,
+          "Nq": mask_n,
+          "Nkv": mask_n,
+          "attn_mask": _make_broadcast_additive_attn_mask(mask_n, mask_n, dtype, seed),
+        },
+        {
+          "name": "dropout",
+          "Nh_q": H,
+          "Nh_kv": H,
+          "Nq": N,
+          "Nkv": N,
+          "dropout_p": dropout_p,
+        },
+      ])
+    if non_aligned_supported:
+      case_specs.append({
         "name": "non-aligned",
         "Nh_q": non_aligned_heads,
         "Nh_kv": non_aligned_heads,
         "Nq": N - 1 if N > 1 else N,
         "Nkv": N - 1 if N > 1 else N,
-      },
-    ]
+      })
     if tasks is not None:
       case_specs = [case for case in case_specs if case["name"] in tasks]
 

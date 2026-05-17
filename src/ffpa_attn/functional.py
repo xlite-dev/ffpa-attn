@@ -298,10 +298,26 @@ class FFPAAttnMeta:
     triton_backward_preprocess_d_chunk = bool(impl_options["triton_backward_preprocess_d_chunk"])
     triton_backward_grad_v_storage_dtype = impl_options["triton_backward_grad_v_storage_dtype"]
 
-    assert forward_backend in ("cuda", "triton"), \
-      f"Unsupported forward_backend={forward_backend!r}; choose 'cuda' or 'triton'."
-    assert backward_backend in ("sdpa", "triton"), \
-      f"Unsupported backward_backend={backward_backend!r}; choose 'sdpa' or 'triton'."
+    assert forward_backend in ("cuda", "triton", "cutedsl"), \
+      f"Unsupported forward_backend={forward_backend!r}; choose 'cuda', 'triton', or 'cutedsl'."
+    assert backward_backend in ("sdpa", "triton", "cutedsl"), \
+      f"Unsupported backward_backend={backward_backend!r}; choose 'sdpa', 'triton', or 'cutedsl'."
+
+    # cutedsl forward/backward are bound as a pair: switching one implicitly
+    # selects the other, and any cross-backend combination is rejected.
+    backward_backend_explicit = "backward_backend" in kwargs
+    if forward_backend == "cutedsl" and backward_backend != "cutedsl":
+      if backward_backend_explicit:
+        raise ValueError(
+          f"forward_backend='cutedsl' requires backward_backend='cutedsl'; "
+          f"got backward_backend={backward_backend!r}"
+        )
+      backward_backend = "cutedsl"
+    elif backward_backend == "cutedsl" and forward_backend != "cutedsl":
+      raise ValueError(
+        f"backward_backend='cutedsl' requires forward_backend='cutedsl'; "
+        f"got forward_backend={forward_backend!r}"
+      )
     assert triton_autotune_mode in ("fast", "max"), \
       f"Unsupported triton_autotune_mode={triton_autotune_mode!r}; choose 'fast' or 'max'."
     if triton_backward_grad_v_storage_dtype not in (None, torch.float32):

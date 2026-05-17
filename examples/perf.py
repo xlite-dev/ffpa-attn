@@ -6,6 +6,12 @@ Usage::
   CUDA_VISIBLE_DEVICES=0 python examples/perf.py --no-bwd --fwd-backend triton --tune fast
   CUDA_VISIBLE_DEVICES=0 python examples/perf.py --no-fwd --bwd-backend triton --tune max
   CUDA_VISIBLE_DEVICES=0 python examples/perf.py --fwd-backend triton --bwd-backend triton --tune fast
+  CUDA_VISIBLE_DEVICES=0 python examples/perf.py --fwd-backend cutedsl --bwd-backend cutedsl
+
+The cutedsl backend is SM90 (Hopper) only and locks D=512 / bf16. Selecting
+``cutedsl`` on either ``--fwd-backend`` or ``--bwd-backend`` auto-pairs the
+other side and restricts tasks to the cutedsl-compatible subset
+(self-attn, cross-attn, gqa, causal).
 """
 
 from __future__ import annotations
@@ -69,6 +75,12 @@ DTYPE_ORDER = ["fp16", "bf16"]
 DEFAULT_OUTPUT_STEM = "ffpa_speedup"
 DEFAULT_OUTPUT_DIR = Path(".tmp")
 FALLBACK_DEVICE_NAME = "NVIDIA RTX 5090 Blackwell"
+CUTEDSL_BACKEND = "cutedsl"
+CUTEDSL_COMPAT_TASKS = frozenset({"self-attn", "cross-attn", "gqa", "causal"})
+CUTEDSL_DTYPES: tuple[torch.dtype, ...] = (torch.bfloat16, )
+CUTEDSL_HEAD_DIM = 512
+CUTEDSL_OUTPUT_STEM = "ffpa_speedup_cutedsl"
+CUTEDSL_SECTION_LABEL = "CuTeDSL (SM90 D=512)"
 TFLOPS_FWD_SDPA_COLOR = "#b0b0b0"
 TFLOPS_FWD_FFPA_COLOR = "#2171b5"
 TFLOPS_BWD_SDPA_COLOR = "#f5a623"
@@ -177,14 +189,14 @@ def _parse_args() -> argparse.Namespace:
   parser.add_argument(
     "--forward-backend",
     "--fwd-backend",
-    choices=["cuda", "triton"],
+    choices=["cuda", "triton", "cutedsl"],
     default="triton",
     help="Forward backend used when --forward is enabled.",
   )
   parser.add_argument(
     "--backward-backend",
     "--bwd-backend",
-    choices=["sdpa", "triton"],
+    choices=["sdpa", "triton", "cutedsl"],
     default="triton",
     help="Backward backend used when --backward is enabled.",
   )
@@ -317,6 +329,47 @@ def _device_name() -> str:
   return "CUDA Unavailable"
 
 
+def _display_device_name(device_name: str) -> str:
+  """Rename H20Z → H200 for cutedsl plot titles only; filenames stay raw."""
+  return re.sub(r"H20Z", "H200", device_name, flags=re.IGNORECASE)
+
+
+def _require_sm90() -> None:
+  """Fail fast on non-Hopper devices when the cutedsl backend is selected."""
+  from ffpa_attn.cutedsl._wrappers import cutedsl_forward_available
+
+  if not torch.cuda.is_available():
+    raise SystemExit("CUDA is required: the CuTeDSL backend only runs on SM90 (Hopper) GPUs.")
+  device = torch.device("cuda", torch.cuda.current_device())
+  if not cutedsl_forward_available(device):
+    major, minor = torch.cuda.get_device_capability(device)
+    raise SystemExit(
+      f"CuTeDSL backend requires SM90 (Hopper). Detected device "
+      f"'{torch.cuda.get_device_name(device)}' with compute capability {major}.{minor}."
+    )
+
+
+def _resolve_cutedsl_backends(args: argparse.Namespace) -> bool:
+  """Auto-pair cutedsl backends; reject mixing cutedsl with a non-cutedsl peer.
+
+  Auto-promotion only fires when the peer side is still at its default
+  ("triton"), so an explicit ``--backward-backend sdpa`` alongside
+  ``--forward-backend cutedsl`` raises instead of being silently overridden.
+  """
+  fwd, bwd = args.forward_backend, args.backward_backend
+  if CUTEDSL_BACKEND not in {fwd, bwd}:
+    return False
+  if fwd == CUTEDSL_BACKEND and bwd != CUTEDSL_BACKEND:
+    if bwd != "triton":
+      raise SystemExit(f"--forward-backend cutedsl requires --backward-backend cutedsl; got {bwd!r}.")
+    args.backward_backend = CUTEDSL_BACKEND
+  if bwd == CUTEDSL_BACKEND and fwd != CUTEDSL_BACKEND:
+    if fwd != "triton":
+      raise SystemExit(f"--backward-backend cutedsl requires --forward-backend cutedsl; got {fwd!r}.")
+    args.forward_backend = CUTEDSL_BACKEND
+  return True
+
+
 def _slugify_device_name(device_name: str) -> str:
   """Convert a device name into a filesystem-friendly slug.
 
@@ -328,7 +381,7 @@ def _slugify_device_name(device_name: str) -> str:
   return slug or "unknown-device"
 
 
-def _output_stem(device_name: str, B: int, H: int, N: int, D: int) -> Path:
+def _output_stem(device_name: str, B: int, H: int, N: int, D: int, *, cutedsl: bool = False) -> Path:
   """Build the output stem shared by the PNG and Markdown files.
 
   :param device_name: Device name used in the run.
@@ -336,13 +389,25 @@ def _output_stem(device_name: str, B: int, H: int, N: int, D: int) -> Path:
   :param H: Head count.
   :param N: Sequence length.
   :param D: Head dimension.
+  :param cutedsl: When ``True``, switch the prefix to keep cutedsl artifacts
+      from clobbering the standard ones.
   :return: Output stem without extension.
   """
+  prefix = CUTEDSL_OUTPUT_STEM if cutedsl else DEFAULT_OUTPUT_STEM
   device_slug = _slugify_device_name(device_name)
-  return Path(f"{DEFAULT_OUTPUT_STEM}_{device_slug}_B{B}_H{H}_N{N}_D{D}")
+  return Path(f"{prefix}_{device_slug}_B{B}_H{H}_N{N}_D{D}")
 
 
-def _resolve_output_stem(save_path: Path | None, device_name: str, B: int, H: int, N: int, D: int) -> Path:
+def _resolve_output_stem(
+  save_path: Path | None,
+  device_name: str,
+  B: int,
+  H: int,
+  N: int,
+  D: int,
+  *,
+  cutedsl: bool = False,
+) -> Path:
   """Resolve the final output stem, optionally rooted at ``save_path``.
 
   :param save_path: Optional output directory.
@@ -351,9 +416,10 @@ def _resolve_output_stem(save_path: Path | None, device_name: str, B: int, H: in
   :param H: Head count.
   :param N: Sequence length.
   :param D: Head dimension.
+  :param cutedsl: Forwarded to :func:`_output_stem` for prefix selection.
   :return: Output stem without extension.
   """
-  default_stem = _output_stem(device_name, B, H, N, D)
+  default_stem = _output_stem(device_name, B, H, N, D, cutedsl=cutedsl)
   output_dir = DEFAULT_OUTPUT_DIR if save_path is None else save_path
   output_dir.mkdir(parents=True, exist_ok=True)
   return output_dir / default_stem.name
@@ -405,6 +471,8 @@ def _forward_section_label(backend: str, tune_mode: str | None, fallback: bool) 
     return "Fallback hard-coded data"
   if backend == "cuda":
     return "Legacy CUDA"
+  if backend == CUTEDSL_BACKEND:
+    return CUTEDSL_SECTION_LABEL
   if tune_mode is not None:
     return f"Triton w/ autotune ({tune_mode})"
   return "Triton"
@@ -422,6 +490,8 @@ def _backward_section_label(backend: str, tune_mode: str | None, fallback: bool)
     return "Fallback hard-coded data"
   if backend == "sdpa":
     return "SDPA backward"
+  if backend == CUTEDSL_BACKEND:
+    return CUTEDSL_SECTION_LABEL
   if tune_mode is not None:
     return f"Triton w/ autotune ({tune_mode})"
   return "Triton"
@@ -562,6 +632,7 @@ def plot_speedup(
   D: int,
   output_path: Path,
   plot_cases: list[tuple[str, str]] | None = None,
+  cutedsl: bool = False,
 ) -> Path:
   """Render the speedup bar chart while preserving the legacy look.
 
@@ -574,6 +645,8 @@ def plot_speedup(
   :param D: Head dimension shown in the title.
   :param output_path: Output PNG path.
   :param plot_cases: Ordered cases to include in the plot.
+  :param cutedsl: When ``True``, swap the title prefix to "FFPA CuTeDSL vs
+      SDPA Speedup" and apply the H20Z → H200 display rename.
   :return: Saved PNG path.
   """
   active_plot_cases = PLOT_CASES if plot_cases is None else plot_cases
@@ -662,8 +735,10 @@ def plot_speedup(
 
   ax.axhline(y=1, color="#555555", linestyle="--", linewidth=2)
   ax.set_ylabel("Speedup Ratio (FFPA / SDPA)", fontsize=18)
+  title_prefix = "FFPA CuTeDSL vs SDPA Speedup" if cutedsl else "FFPA vs SDPA Speedup"
+  title_device = _display_device_name(device_name) if cutedsl else device_name
   fig.suptitle(
-    f"FFPA vs SDPA Speedup ({_mode_suffix(has_forward, has_backward)}) | {device_name} | B={B}, N={N}, H={H}, D={D}",
+    f"{title_prefix} ({_mode_suffix(has_forward, has_backward)}) | {title_device} | B={B}, N={N}, H={H}, D={D}",
     fontsize=22,
     fontweight="bold",
     y=0.958,
@@ -701,6 +776,7 @@ def plot_tflops(
   D: int,
   output_path: Path,
   plot_cases: list[tuple[str, str]] | None = None,
+  cutedsl: bool = False,
 ) -> Path | None:
   """Render the TFLOPS comparison bar chart.
 
@@ -713,6 +789,8 @@ def plot_tflops(
   :param D: Head dimension shown in the title.
   :param output_path: Output PNG path.
   :param plot_cases: Ordered cases to include in the plot.
+  :param cutedsl: When ``True``, swap the title prefix to "FFPA CuTeDSL vs
+      SDPA TFLOPS" and apply the H20Z → H200 display rename.
   :return: Saved PNG path, or ``None`` when no TFLOPS data is available.
   """
   active_plot_cases = TFLOPS_PLOT_CASES if plot_cases is None else plot_cases
@@ -808,8 +886,10 @@ def plot_tflops(
     finite_values.extend(value for value in bwd_ffpa_tflops if np.isfinite(value))
 
   ax.set_ylabel("Throughput (TFLOPS)", fontsize=18)
+  title_prefix = "FFPA CuTeDSL vs SDPA TFLOPS" if cutedsl else "FFPA vs SDPA TFLOPS"
+  title_device = _display_device_name(device_name) if cutedsl else device_name
   fig.suptitle(
-    f"FFPA vs SDPA TFLOPS ({_mode_suffix(has_forward, has_backward)}) | {device_name} | B={B}, N={N}, H={H}, D={D}",
+    f"{title_prefix} ({_mode_suffix(has_forward, has_backward)}) | {title_device} | B={B}, N={N}, H={H}, D={D}",
     fontsize=18,
     fontweight="bold",
     y=0.958,
@@ -936,6 +1016,7 @@ def render_speedup_markdown(
   tune_mode: str | None,
   fallback: bool,
   show_allclose: bool,
+  cutedsl: bool = False,
 ) -> str:
   """Render README-style Markdown benchmark tables.
 
@@ -954,10 +1035,19 @@ def render_speedup_markdown(
   :return: Markdown document fragment.
   """
   lines = ["## Benchmark", "", f"Env: {device_name}, B={B}, N={N}, H={H}, D={D}."]
-  lines.extend([
-    "",
-    "TFLOPS reports the theoretical dominant attention GEMM throughput only; forward and backward are computed separately from the measured latency.",
-  ])
+  if cutedsl:
+    lines.extend([
+      "",
+      "Backend: CuTeDSL D=512 SM90 fast-path (bf16 only). "
+      "TFLOPS reports the theoretical dominant attention GEMM throughput only; "
+      "forward and backward are computed separately from the measured latency.",
+    ])
+  else:
+    lines.extend([
+      "",
+      "TFLOPS reports the theoretical dominant attention GEMM throughput only; "
+      "forward and backward are computed separately from the measured latency.",
+    ])
   if fallback:
     lines.extend([
       "",
@@ -972,10 +1062,39 @@ def render_speedup_markdown(
   return "\n".join(lines) + "\n"
 
 
-def _benchmark_rows(args: argparse.Namespace) -> tuple[list[RESULT_ROW], list[RESULT_ROW]]:
+def _filter_cutedsl_tasks(tasks: set[str] | None) -> set[str]:
+  """Intersect a user-supplied task set with the cutedsl-compatible cases.
+
+  ``None`` (no ``--tasks``) becomes the full cutedsl-compatible set.
+  Unsupported requests are dropped with a stderr note; an empty intersection
+  raises ``SystemExit``.
+  """
+  if tasks is None:
+    return set(CUTEDSL_COMPAT_TASKS)
+  rejected = sorted(tasks - CUTEDSL_COMPAT_TASKS)
+  if rejected:
+    print(
+      f"[cutedsl] Skipping tasks unsupported by the CuTeDSL backend: {rejected}. "
+      f"Supported: {sorted(CUTEDSL_COMPAT_TASKS)}.",
+      file=sys.stderr,
+    )
+  kept = tasks & CUTEDSL_COMPAT_TASKS
+  if not kept:
+    raise SystemExit("No requested tasks are supported by the CuTeDSL backend.")
+  return kept
+
+
+def _benchmark_rows(
+  args: argparse.Namespace,
+  *,
+  tasks: set[str] | None,
+  dtypes: tuple[torch.dtype, ...],
+) -> tuple[list[RESULT_ROW], list[RESULT_ROW]]:
   """Collect benchmark rows for the requested directions.
 
   :param args: Parsed CLI arguments.
+  :param tasks: Pre-filtered case-name set (already restricted to backend-compat cases).
+  :param dtypes: Activation dtypes to iterate.
   :return: ``(forward_rows, backward_rows)``.
   """
   if not torch.cuda.is_available():
@@ -983,7 +1102,6 @@ def _benchmark_rows(args: argparse.Namespace) -> tuple[list[RESULT_ROW], list[RE
 
   tune_mode = args.tune
   grad_v_dtype = _parse_grad_v_dtype(args.grad_v_storage_dtype)
-  tasks = _parse_tasks_arg(args.tasks)
   forward_rows: list[RESULT_ROW] = []
   backward_rows: list[RESULT_ROW] = []
   if args.forward:
@@ -1006,6 +1124,7 @@ def _benchmark_rows(args: argparse.Namespace) -> tuple[list[RESULT_ROW], list[RE
         enable_tma=args.enable_fwd_tma,
         enable_ws=args.enable_fwd_ws,
         tasks=tasks,
+        dtypes=dtypes,
       ),
     )
   if args.backward:
@@ -1029,6 +1148,7 @@ def _benchmark_rows(args: argparse.Namespace) -> tuple[list[RESULT_ROW], list[RE
         iters=args.iters,
         print_results=True,
         tasks=tasks,
+        dtypes=dtypes,
       ),
     )
   return forward_rows, backward_rows
@@ -1038,8 +1158,23 @@ def main() -> None:
   """Run the requested benchmark mode and emit plot plus Markdown outputs."""
   args = _parse_args()
   fallback = args.show_fallback
+  is_cutedsl = _resolve_cutedsl_backends(args)
+  if is_cutedsl:
+    if fallback:
+      raise SystemExit("--show-fallback is not compatible with the cutedsl backend.")
+    if args.D != CUTEDSL_HEAD_DIM:
+      print(
+        f"[cutedsl] Forcing --D from {args.D} to {CUTEDSL_HEAD_DIM} (cutedsl is D=512 only).",
+        file=sys.stderr,
+      )
+      args.D = CUTEDSL_HEAD_DIM
+    _require_sm90()
+
   device_name = FALLBACK_DEVICE_NAME if fallback else _device_name()
   tasks = _parse_tasks_arg(args.tasks)
+  if is_cutedsl:
+    tasks = _filter_cutedsl_tasks(tasks)
+  dtypes = CUTEDSL_DTYPES if is_cutedsl else (torch.float16, torch.bfloat16)
 
   if not fallback and not args.forward and not args.backward:
     raise SystemExit("At least one direction must remain enabled. Use default settings, --no-fwd, or --no-bwd.")
@@ -1047,12 +1182,20 @@ def main() -> None:
   if fallback:
     forward_rows, backward_rows = _build_fallback_rows(args.B, args.H, args.N, args.D, tasks=tasks)
   else:
-    forward_rows, backward_rows = _benchmark_rows(args)
+    forward_rows, backward_rows = _benchmark_rows(args, tasks=tasks, dtypes=dtypes)
 
   speedup_plot_cases = _active_plot_cases(tasks)
   tflops_plot_cases = _active_plot_cases(tasks, include_decode=False)
 
-  output_stem = _resolve_output_stem(args.save_path, device_name, args.B, args.H, args.N, args.D)
+  output_stem = _resolve_output_stem(
+    args.save_path,
+    device_name,
+    args.B,
+    args.H,
+    args.N,
+    args.D,
+    cutedsl=is_cutedsl,
+  )
   speedup_png_path = plot_speedup(
     forward_rows,
     backward_rows,
@@ -1063,6 +1206,7 @@ def main() -> None:
     D=args.D,
     output_path=output_stem.with_name(f"{output_stem.name}.png"),  # speedup
     plot_cases=speedup_plot_cases,
+    cutedsl=is_cutedsl,
   )
   tflops_png_path = None if fallback else plot_tflops(
     forward_rows,
@@ -1074,6 +1218,7 @@ def main() -> None:
     D=args.D,
     output_path=output_stem.with_name(f"{output_stem.name}_T.png"),  # tflops
     plot_cases=tflops_plot_cases,
+    cutedsl=is_cutedsl,
   )
   markdown = render_speedup_markdown(
     forward_rows,
@@ -1088,6 +1233,7 @@ def main() -> None:
     tune_mode=args.tune,
     fallback=fallback,
     show_allclose=args.show_allclose,
+    cutedsl=is_cutedsl,
   )
   md_path = output_stem.with_suffix(".md")
   md_path.write_text(markdown, encoding="utf-8")

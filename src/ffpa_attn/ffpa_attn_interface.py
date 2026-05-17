@@ -9,12 +9,59 @@ functions, routing by headdim and user-selected backend.
 Small-D directly delegates to ``torch.nn.functional.scaled_dot_product_attention``;
 large-D forward continues to use the FFPA Triton kernel by default, with a
 legacy optional CUDA forward backend available only when compiled in.
+
+When the caller opts into the CuTeDSL backend (``forward_backend='cutedsl'``)
+``ffpa_attn_func`` routes straight to
+:func:`ffpa_attn.cutedsl._wrappers._ffpa_attn_cutedsl` (the dense Layer-2
+entry, sibling of the varlen one below), which wraps
+``FFPAAttnSplitDFunc.apply(...)`` and skips ``FFPAAttnMeta`` normalization
+and the ``FFPAAttnFunc`` autograd boundary. CuTeDSL compatibility is split
+in two:
+
+- **Hard (tensor-level)**: ``head_dim != 512``, non-SM90 device, wrong
+  dtype, fp16 training all raise ``NotImplementedError`` / ``TypeError``
+  from :func:`ffpa_attn.cutedsl._wrappers._require_cutedsl_supported`
+  inside the dense entry.
+
+- **Soft (kwarg-level)**: enforced by
+  :func:`ffpa_attn.cutedsl._wrappers._check_supported_options` at each
+  entry shim. The dense ``ffpa_attn_func(forward_backend='cutedsl')``
+  path only forwards ``dropout_p`` and ``attn_mask`` to the helper;
+  other unsupported kwargs reach the dense path via ``**kwargs`` and
+  are rejected later by :meth:`FFPAAttnMeta.from_kwargs`'s unknown-key
+  ``TypeError``. The varlen ``ffpa_attn_varlen_func`` path additionally
+  forwards ``window_size``, ``softcap``, ``sink``, ``block_mask``,
+  ``score_mod``, ``aux_tensors``, ``seqused_k``, ``block_table``,
+  ``num_splits``, ``alibi_slopes`` to the helper. Any non-default
+  value raises ``NotImplementedError`` with a single consolidated
+  message naming every offending option — no silent strip-to-default.
+  Use ``forward_backend='triton'`` when these options are required.
+
+For the dense entry, the two pure hardware mismatches —
+``head_dim != 512`` and a non-SM90 device — fall back to SDPA with a
+``warning_once`` log on the ``FFPA.ffpa_attn.ffpa_attn_interface``
+logger, since neither is fixable at the call site. Every other
+constraint (dtype, fp16 training, ``dropout_p > 0``, explicit
+``attn_mask``, all FA-extension kwargs above, and the entire varlen
+path) continues to raise ``NotImplementedError`` / ``TypeError`` /
+``ValueError``; there is no silent fallback for those.
+
+Variable-length (packed THD) attention is exposed via ``ffpa_attn_varlen_func``,
+which mirrors the FlashAttention varlen surface (``q, k, v, cu_seqlens_q,
+cu_seqlens_k, max_seqlen_q, max_seqlen_k, ...``) and delegates to
+:func:`ffpa_attn.cutedsl._wrappers._ffpa_attn_varlen_cutedsl`, which
+dispatches to the CuTeDSL ``ffpa_attn::splitd_fwd_sm90`` autograd-registered
+torch op. The varlen API is currently CuTeDSL-only (SM90, D=512); other
+shapes / backends raise ``NotImplementedError``.
 """
 
 from __future__ import annotations
 
 import torch
 from .functional import FFPAAttnFunc, FFPAAttnMeta
+from .logger import init_logger
+
+logger = init_logger(__name__)
 
 
 def _should_fallback_to_sdpa(
@@ -38,6 +85,14 @@ def _should_fallback_to_sdpa(
   * ``attn_mask is not None`` when the large-D forward backend is not Triton
   * ``8 <= Nq < 512``
   * ``Nk < 512``
+  * ``forward_backend == 'cutedsl'`` and ``head_dim != 512`` (hardware
+    mismatch — cutedsl is specialised to D=512). Emits a ``warning_once``
+    before returning ``True``.
+  * ``forward_backend == 'cutedsl'`` and the device is not SM90 (Hopper).
+    Emits a ``warning_once`` before returning ``True``. Other cutedsl
+    constraints (dtype, fp16 training, ``dropout_p > 0``, ``attn_mask``,
+    FA-extension kwargs) continue to raise from the cutedsl wrappers
+    rather than fall back here.
 
   As FFPA grows support for these cases, remove the corresponding condition
   here instead of scattering dispatch checks throughout ``ffpa_attn_func``.
@@ -47,7 +102,25 @@ def _should_fallback_to_sdpa(
   B, Nh_q, Nq, D = query.shape  # noqa: F841
   _, Nh_kv, Nkv, D_k = key.shape
   assert D == D_k, "Query and key must have the same head dimension"
-  _fallback = any([
+  # cutedsl is opt-in: the only fallback we apply is the pure hardware
+  # mismatch (head_dim != 512 or non-SM90), with a one-shot warning. All
+  # other cutedsl constraints (dtype, fp16 training, dropout_p > 0, explicit
+  # attn_mask, FA-extension kwargs) must keep raising from
+  # _require_cutedsl_supported / _check_supported_options, so cutedsl
+  # bypasses the legacy any([...]) heuristics below.
+  if forward_backend == "cutedsl":
+    from .cutedsl._wrappers import cutedsl_forward_available
+    cutedsl_hw_unsupported = D != 512 or not cutedsl_forward_available(query.device)
+    if cutedsl_hw_unsupported:
+      logger.warning_once(
+        "forward_backend='cutedsl' falling back to SDPA: head_dim=%d, device=%s "
+        "(cutedsl requires head_dim=512 on SM90 Hopper).",
+        D,
+        query.device,
+      )
+    return cutedsl_hw_unsupported
+
+  return any([
     D <= 256,
     D > 1024,
     # dropout is only supported by triton backend for now.
@@ -57,7 +130,6 @@ def _should_fallback_to_sdpa(
     (8 <= Nq < 512),
     Nkv < 512,
   ])
-  return _fallback
 
 
 def ffpa_attn_func(
@@ -105,8 +177,12 @@ def ffpa_attn_func(
       ``[B, Nh_q, Nq, Nkv]``. Boolean masks follow SDPA semantics where
       ``True`` means the element participates in attention; floating masks are
       additive attention bias. Large-D Triton supports additive mask gradients.
+      ``forward_backend='cutedsl'`` rejects any non-``None`` ``attn_mask``
+      with ``NotImplementedError`` (no silent fallback).
   :param dropout_p: Dropout probability. Large-D Triton implements SDPA-style
-      attention dropout; non-Triton large-D dropout routes to SDPA.
+      attention dropout; non-Triton large-D dropout routes to SDPA, except
+      that ``forward_backend='cutedsl'`` raises ``NotImplementedError`` for
+      ``dropout_p > 0`` instead of falling back.
   :param is_causal: When ``True``, apply a causal attention mask so that
       query row ``r`` only attends to KV positions ``k <= r + (Nkv - Nq)``
       (standard ``queries aligned to KV tail`` convention). Requires
@@ -170,6 +246,28 @@ def ffpa_attn_func(
       enable_gqa=enable_gqa,
     )
 
+  # CuTeDSL backend — opt-in via forward_backend='cutedsl'.
+  # Bypasses FFPAAttnMeta normalization and the FFPAAttnFunc autograd
+  # boundary, dispatching directly to ffpa_attn_splitd_func (autograd via
+  # FFPAAttnSplitDFunc). _should_fallback_to_sdpa above returns False for
+  # the cutedsl branch by construction; unsupported cases raise inside
+  # _ffpa_attn_cutedsl: tensor-level (head_dim != 512, dtype, non-SM90
+  # device) via _require_cutedsl_supported, kwarg-level (dropout_p > 0,
+  # attn_mask is not None) via _check_supported_options. The lazy import
+  # keeps the cutedsl package off the hot path for non-cutedsl callers.
+  if meta.forward_backend == "cutedsl":
+    from .cutedsl import _ffpa_attn_cutedsl
+    return _ffpa_attn_cutedsl(
+      query,
+      key,
+      value,
+      attn_mask=attn_mask,
+      dropout_p=dropout_p,
+      is_causal=is_causal,
+      scale=scale,
+      enable_gqa=enable_gqa,
+    )
+
   meta, query, key, value, attn_bias = meta.normalize_inputs(
     query,
     key,
@@ -184,4 +282,95 @@ def ffpa_attn_func(
   return FFPAAttnFunc.apply(query, key, value, attn_bias, meta)
 
 
-__all__ = ["ffpa_attn_func"]
+def ffpa_attn_varlen_func(
+  q: torch.Tensor,
+  k: torch.Tensor,
+  v: torch.Tensor,
+  cu_seqlens_q: torch.Tensor,
+  cu_seqlens_k: torch.Tensor | None,
+  max_seqlen_q: int,
+  max_seqlen_k: int,
+  *,
+  dropout_p: float = 0.0,
+  softmax_scale: float | None = None,
+  causal: bool = False,
+  enable_gqa: bool = False,
+  return_lse: bool = False,
+  **kwargs: object,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+  """FFPA variable-length attention (packed THD, FlashAttention-style).
+
+  Signature aligned with Dao-AILab ``flash_attn_varlen_func``. Inputs are
+  packed THD: ``q`` is ``[T_q, H_q, D]`` and ``k`` / ``v`` are
+  ``[T_k, H_kv, D]``. Sequence boundaries are described by ``cu_seqlens_q``
+  and ``cu_seqlens_k`` (int32 CUDA tensors of length ``B+1`` starting at 0).
+  When ``cu_seqlens_k is None`` it defaults to ``cu_seqlens_q`` (self-attention).
+
+  Only the CuTeDSL backend is supported: SM90 Hopper, ``D == 512``, fp16 /
+  bf16 (bf16 required for training). Any unsupported case raises an
+  actionable error immediately — there is no silent fallback to dense /
+  per-sequence paths. Callers needing other shapes / backends should
+  unpack the batch and call :func:`ffpa_attn_func` per sequence.
+
+  :param q: Query tensor of shape ``[T_q, H_q, D]``.
+  :param k: Key tensor of shape ``[T_k, H_kv, D]``.
+  :param v: Value tensor of shape ``[T_k, H_kv, D]``.
+  :param cu_seqlens_q: ``[B+1]`` int32 CUDA tensor; ``cu_seqlens_q[0] == 0``
+      and ``cu_seqlens_q[-1] == T_q``.
+  :param cu_seqlens_k: Same convention for keys; defaults to
+      ``cu_seqlens_q`` if ``None``.
+  :param max_seqlen_q: Maximum per-sequence query length across the batch.
+  :param max_seqlen_k: Maximum per-sequence key length across the batch.
+  :param dropout_p: FlashAttention-compat; must be ``0.0`` (CuTeDSL has no
+      dropout support).
+  :param softmax_scale: Pre-softmax scaling factor; defaults to
+      ``1 / sqrt(D)``.
+  :param causal: Apply a lower-right (tail-aligned) causal mask.
+  :param enable_gqa: Opt-in to GQA/MQA (``H_q != H_kv``). When ``False``,
+      ``H_q`` must equal ``H_kv``.
+  :param return_lse: When ``True``, also return the log-sum-exp tensor of
+      shape ``[H_q, T_q]`` in fp32 (CUDA convention).
+  :param kwargs: Most kwargs are recognized-and-rejected by
+      :func:`ffpa_attn.cutedsl._wrappers._check_supported_options` — passing a
+      non-default value for ``window_size``, ``softcap``, ``sink``,
+      ``attention_mask`` / ``attn_mask``, ``block_mask``, ``score_mod``,
+      ``aux_tensors``, ``seqused_k``, ``block_table``, ``num_splits``, or
+      ``alibi_slopes`` raises ``NotImplementedError`` (see ``:raises:``).
+      Only ``forward_backend`` / ``backward_backend`` are forwarded to
+      :meth:`FFPAAttnMeta.from_kwargs` for pair-binding; both must be
+      ``"cutedsl"`` or unset.
+
+  :returns: ``out`` of shape ``[T_q, H_q, D]`` if ``return_lse=False``,
+      otherwise ``(out, lse)``.
+
+  :raises NotImplementedError: for ``D != 512``, non-SM90 hardware,
+      ``dropout_p > 0``, non-CuTeDSL ``forward_backend``, or any non-default
+      unsupported kwarg: ``window_size``, ``softcap``, ``sink``,
+      ``attention_mask`` / ``attn_mask``, ``block_mask``, ``score_mod``,
+      ``aux_tensors``, ``seqused_k``, ``block_table``, ``num_splits``,
+      ``alibi_slopes``.
+  :raises TypeError: if ``cu_seqlens_*`` is not int32, or if dtype is not
+      fp16/bf16.
+  :raises ValueError: for shape mismatches between ``q``/``k``/``v``,
+      malformed ``cu_seqlens_*``, or ``enable_gqa=False`` with
+      ``H_q != H_kv``.
+  """
+  from .cutedsl import _ffpa_attn_varlen_cutedsl
+  return _ffpa_attn_varlen_cutedsl(
+    q,
+    k,
+    v,
+    cu_seqlens_q,
+    cu_seqlens_k,
+    max_seqlen_q,
+    max_seqlen_k,
+    dropout_p=dropout_p,
+    softmax_scale=softmax_scale,
+    causal=causal,
+    enable_gqa=enable_gqa,
+    return_lse=return_lse,
+    kwargs=kwargs,
+  )
+
+
+__all__ = ["ffpa_attn_func", "ffpa_attn_varlen_func"]

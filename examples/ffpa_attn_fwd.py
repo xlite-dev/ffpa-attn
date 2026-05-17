@@ -56,9 +56,12 @@ def _parse_args() -> argparse.Namespace:
     "--forward-backend",
     "--backend",
     "--fwd",
-    choices=["cuda", "triton"],
+    choices=["cuda", "triton", "cutedsl"],
     default="triton",
-    help="Forward backend passed to ffpa_attn_func.",
+    help=(
+      "Forward backend passed to ffpa_attn_func. 'cutedsl' requires SM90 + D=512 "
+      "and does not support attn_mask/dropout/non-aligned cases (auto-skipped)."
+    ),
   )
   parser.add_argument("--B", type=int, default=1, help="Batch size.")
   parser.add_argument("--N", type=int, default=8192, help="Sequence length (non-aligned uses N-1).")
@@ -438,6 +441,7 @@ def run_forward_examples(
   enable_tma: bool = False,
   enable_ws: bool = False,
   tasks: set[str] | None = None,
+  dtypes: tuple[torch.dtype, ...] = (torch.float16, torch.bfloat16),
 ) -> list[FORWARD_RESULT]:
   """Run the canonical forward benchmark cases.
 
@@ -459,6 +463,7 @@ def run_forward_examples(
   :param enable_tma: Whether to enable the SM90+ TMA forward path.
   :param enable_ws: Whether to force warp-specialized SM90 TMA configs.
   :param tasks: Optional case-name filter. ``None`` runs all cases.
+  :param dtypes: Activation dtypes iterated for each case.
   :return: One structured result per executed case and dtype.
   """
   _validate_timing_args(warmup, iters)
@@ -476,8 +481,14 @@ def run_forward_examples(
     f"tasks={sorted(tasks) if tasks is not None else 'full'}, "
     f"warmup={warmup}, iters={iters}"
   )
+  if forward_backend == "cutedsl":
+    print(
+      "[cutedsl] backend constraints in effect: D=512 only, fp16/bf16 forward, "
+      "no attn_mask / dropout / non-aligned cases (auto-skipped); "
+      "triton-* / enable-fwd-tma|ws options are ignored."
+    )
 
-  for dtype in (torch.float16, torch.bfloat16):
+  for dtype in dtypes:
     case_specs: list[dict[str, Any]] = [
       {
         "name": "self-attn",
@@ -516,7 +527,7 @@ def run_forward_examples(
         "causal": True
       },
     ]
-    if forward_backend != "cuda":
+    if forward_backend == "triton":
       mask_n = max(N, 512)
       case_specs.extend([
         {
@@ -536,13 +547,14 @@ def run_forward_examples(
           "dropout_p": dropout_p,
         },
       ])
-    case_specs.append({
-      "name": "non-aligned",
-      "Nh_q": non_aligned_heads,
-      "Nh_kv": non_aligned_heads,
-      "Nq": N - 1 if N > 1 else N,
-      "Nkv": N - 1 if N > 1 else N,
-    })
+    if forward_backend != "cutedsl":
+      case_specs.append({
+        "name": "non-aligned",
+        "Nh_q": non_aligned_heads,
+        "Nh_kv": non_aligned_heads,
+        "Nq": N - 1 if N > 1 else N,
+        "Nkv": N - 1 if N > 1 else N,
+      })
     if tasks is not None:
       case_specs = [case for case in case_specs if case["name"] in tasks]
 
