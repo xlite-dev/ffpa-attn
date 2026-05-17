@@ -8,10 +8,14 @@ kernel internals (covered by the standalone CuTeDSL kernel tests).
 Varlen coverage now lives in ``tests/test_ffpa_varlen.py``.
 """
 
+import logging
+
 import pytest
 import torch
+import torch.nn.functional as F
 
 from ffpa_attn import ffpa_attn_func
+import ffpa_attn.ffpa_attn_interface as iface
 
 
 def _sm90_available() -> bool:
@@ -76,18 +80,21 @@ def test_cutedsl_autograd_matches_triton(is_causal):
   torch.testing.assert_close(v_c.grad, v_t.grad, **_grad_tol())
 
 
-def test_cutedsl_rejects_non_512_head_dim():
-  """D != 512 with cutedsl backend must raise (no silent SDPA fallback)."""
-  q = torch.randn(1, 8, 1024, 320, dtype=torch.bfloat16, device="cuda")
-  with pytest.raises(NotImplementedError, match="head_dim=512"):
-    ffpa_attn_func(q, q, q, forward_backend="cutedsl")
+@pytest.mark.parametrize("D", [320, 128])
+def test_cutedsl_falls_back_for_non_512_head_dim(caplog, monkeypatch, D):
+  """D != 512 with cutedsl backend falls back to SDPA with a one-shot warning."""
+  monkeypatch.setattr(iface.logger, "propagate", True)
+  torch.manual_seed(0)
+  q = torch.randn(1, 8, 1024, D, dtype=torch.bfloat16, device="cuda")
 
+  with caplog.at_level(logging.WARNING, logger=iface.logger.name):
+    out = ffpa_attn_func(q, q, q, forward_backend="cutedsl")
 
-def test_cutedsl_rejects_small_head_dim():
-  """D <= 256 with cutedsl backend must raise (no silent SDPA fallback)."""
-  q = torch.randn(1, 8, 1024, 128, dtype=torch.bfloat16, device="cuda")
-  with pytest.raises(NotImplementedError, match="head_dim=512"):
-    ffpa_attn_func(q, q, q, forward_backend="cutedsl")
+  ref = F.scaled_dot_product_attention(q, q, q)
+  torch.testing.assert_close(out, ref, **_tol())
+  assert any(
+    "falling back to SDPA" in r.getMessage() and f"head_dim={D}" in r.getMessage() for r in caplog.records
+  ), f"expected fallback warning for head_dim={D}, got: {[r.getMessage() for r in caplog.records]}"
 
 
 def test_cutedsl_rejects_fp16_training():

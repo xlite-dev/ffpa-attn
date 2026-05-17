@@ -37,8 +37,14 @@ in two:
   message naming every offending option — no silent strip-to-default.
   Use ``forward_backend='triton'`` when these options are required.
 
-There is no silent SDPA fallback when ``forward_backend='cutedsl'`` was
-explicitly requested.
+For the dense entry, the two pure hardware mismatches —
+``head_dim != 512`` and a non-SM90 device — fall back to SDPA with a
+``warning_once`` log on the ``FFPA.ffpa_attn.ffpa_attn_interface``
+logger, since neither is fixable at the call site. Every other
+constraint (dtype, fp16 training, ``dropout_p > 0``, explicit
+``attn_mask``, all FA-extension kwargs above, and the entire varlen
+path) continues to raise ``NotImplementedError`` / ``TypeError`` /
+``ValueError``; there is no silent fallback for those.
 
 Variable-length (packed THD) attention is exposed via ``ffpa_attn_varlen_func``,
 which mirrors the FlashAttention varlen surface (``q, k, v, cu_seqlens_q,
@@ -53,6 +59,9 @@ from __future__ import annotations
 
 import torch
 from .functional import FFPAAttnFunc, FFPAAttnMeta
+from .logger import init_logger
+
+logger = init_logger(__name__)
 
 
 def _should_fallback_to_sdpa(
@@ -76,6 +85,14 @@ def _should_fallback_to_sdpa(
   * ``attn_mask is not None`` when the large-D forward backend is not Triton
   * ``8 <= Nq < 512``
   * ``Nk < 512``
+  * ``forward_backend == 'cutedsl'`` and ``head_dim != 512`` (hardware
+    mismatch — cutedsl is specialised to D=512). Emits a ``warning_once``
+    before returning ``True``.
+  * ``forward_backend == 'cutedsl'`` and the device is not SM90 (Hopper).
+    Emits a ``warning_once`` before returning ``True``. Other cutedsl
+    constraints (dtype, fp16 training, ``dropout_p > 0``, ``attn_mask``,
+    FA-extension kwargs) continue to raise from the cutedsl wrappers
+    rather than fall back here.
 
   As FFPA grows support for these cases, remove the corresponding condition
   here instead of scattering dispatch checks throughout ``ffpa_attn_func``.
@@ -85,17 +102,25 @@ def _should_fallback_to_sdpa(
   B, Nh_q, Nq, D = query.shape  # noqa: F841
   _, Nh_kv, Nkv, D_k = key.shape
   assert D == D_k, "Query and key must have the same head dimension"
-  # CuTeDSL opt-in is explicit, so unsupported cases must raise rather
-  # than silently fall back to SDPA. cutedsl constraint checks split in
-  # two: tensor-level (head_dim == 512, SM90 device, dtype, training-bf16)
-  # are surfaced by _require_cutedsl_supported, and kwarg-level
-  # (dropout_p == 0, attn_mask is None, FA-extension kwargs) by
-  # _check_supported_options — both invoked from _ffpa_attn_cutedsl with
-  # actionable NotImplementedError / TypeError. Returning False here
-  # guarantees that path is reached.
+  # cutedsl is opt-in: the only fallback we apply is the pure hardware
+  # mismatch (head_dim != 512 or non-SM90), with a one-shot warning. All
+  # other cutedsl constraints (dtype, fp16 training, dropout_p > 0, explicit
+  # attn_mask, FA-extension kwargs) must keep raising from
+  # _require_cutedsl_supported / _check_supported_options, so cutedsl
+  # bypasses the legacy any([...]) heuristics below.
   if forward_backend == "cutedsl":
-    return False
-  _fallback = any([
+    from .cutedsl._wrappers import cutedsl_forward_available
+    cutedsl_hw_unsupported = D != 512 or not cutedsl_forward_available(query.device)
+    if cutedsl_hw_unsupported:
+      logger.warning_once(
+        "forward_backend='cutedsl' falling back to SDPA: head_dim=%d, device=%s "
+        "(cutedsl requires head_dim=512 on SM90 Hopper).",
+        D,
+        query.device,
+      )
+    return cutedsl_hw_unsupported
+
+  return any([
     D <= 256,
     D > 1024,
     # dropout is only supported by triton backend for now.
@@ -105,7 +130,6 @@ def _should_fallback_to_sdpa(
     (8 <= Nq < 512),
     Nkv < 512,
   ])
-  return _fallback
 
 
 def ffpa_attn_func(
