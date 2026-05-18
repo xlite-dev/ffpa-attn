@@ -399,7 +399,6 @@ _SM90_DEFAULT_CONFIG = {
 
 
 def _gen_fwd_sm90_autotune_configs(
-  headdim: int = 256,
   autotune_mode: str = "max",
   enable_ws: bool = True,
 ) -> list[triton.Config]:
@@ -416,8 +415,6 @@ def _gen_fwd_sm90_autotune_configs(
   :param enable_ws: Whether to generate only warp-specialized configs.
   :return: Triton autotune configurations for the SM90 TMA forward kernel.
   """
-  _ = headdim  # for heuristics and autotune cache key
-
   # fast: 2*2*2*1 = 8 configs; max: 2*2*2*2 = 16 configs
   configs = []
   for block_m in [64, 128]:
@@ -461,7 +458,6 @@ def _get_fwd_sm90_autotune(headdim: int, autotune_mode: str, dtype: str, enable_
   cache_key = (headdim, autotune_mode, dtype, enable_ws)
   if cache_key not in _ffpa_fwd_sm90_autotune_cache:
     configs = _gen_fwd_sm90_autotune_configs(
-      headdim,
       autotune_mode=autotune_mode,
       enable_ws=enable_ws,
     )
