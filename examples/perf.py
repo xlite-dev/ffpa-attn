@@ -240,31 +240,37 @@ def _parse_args() -> argparse.Namespace:
   )
   parser.add_argument(
     "--enable-tma",
+    "--tma",
     action="store_true",
     help="Compatibility alias for --enable-fwd-tma --enable-bwd-tma.",
   )
   parser.add_argument(
     "--enable-ws",
+    "--ws",
     action="store_true",
     help="Compatibility alias for --enable-fwd-ws --enable-bwd-ws.",
   )
   parser.add_argument(
     "--enable-fwd-tma",
+    "--fwd-tma",
     action="store_true",
     help="Enable experimental SM90+ TMA forward path (silently falls back on unsupported devices).",
   )
   parser.add_argument(
     "--enable-bwd-tma",
+    "--bwd-tma",
     action="store_true",
     help="Enable experimental SM90+ TMA backward path (silently falls back on unsupported devices).",
   )
   parser.add_argument(
     "--enable-fwd-ws",
+    "--fwd-ws",
     action="store_true",
     help="Force warp-specialized configs for the experimental SM90+ TMA forward path.",
   )
   parser.add_argument(
     "--enable-bwd-ws",
+    "--bwd-ws",
     action="store_true",
     help="Force warp-specialized configs for the experimental SM90+ TMA backward path.",
   )

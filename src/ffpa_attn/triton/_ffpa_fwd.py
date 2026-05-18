@@ -118,15 +118,6 @@ def _apply_dropout_to_p(
   return p
 
 
-def _supports_fwd_generic_max_extra_configs() -> bool:
-  """Return whether the current GPU should try extra fwd_generic max configs."""
-  try:
-    major, _minor = torch.cuda.get_device_capability()
-  except Exception:
-    return False
-  return major >= 9
-
-
 def _gen_fwd_autotune_configs(headdim: int = 256, autotune_mode: str = "max") -> list[triton.Config]:
   """Generate autotune configs for the single FFPA Triton forward kernel.
 
@@ -145,38 +136,25 @@ def _gen_fwd_autotune_configs(headdim: int = 256, autotune_mode: str = "max") ->
       the V-group loop is unrolled to a single iteration.
   :return: Triton autotune configurations for the forward kernel.
   """
-  _headdim_candidates = [64, 128]
-  # Use triton.next_power_of_2(headdim) as a near-full-D single-chunk block size:
-  #   - power-of-2 headdims (512, 1024): next_pow2 == headdim → NUM_V_GROUPS=1,
-  #     eliminates the D-chunk loop entirely.
-  #   - non-power-of-2 headdims (320→512, 640→1024): next_pow2 pads to the next
-  #     power-of-2.  The kernel's load/store masks (qk_d < HEADDIM, o_d < HEADDIM)
-  #     zero out the padding columns, so correctness is preserved.
-  # tl.arange requires a power-of-2 range, so next_power_of_2 always produces a
-  # valid block size.  Only included on high-SMEM devices to keep register pressure
-  # manageable; skip when next_pow2 is already in [64, 128, 256] (dedup).
-  use_extra_max_configs = _supports_fwd_generic_max_extra_configs()
-  if autotune_mode == "max" and use_extra_max_configs:
-    _headdim_candidates.append(256)
-
+  # fast: 2*1*2*2*1 = 8 configs; max: 2*2*2*2*2 = 32 configs
   configs = []
   for block_m in [64, 128]:
-    for block_headdim in _headdim_candidates:
-      num_warps_candidates = [8] if autotune_mode == "fast" else [4, 8]
-      for num_warps in num_warps_candidates:
-        for num_stages in [2, 3]:
-          configs.append(
-            triton.Config(
-              {
-                "BLOCK_M": block_m,
-                "BLOCK_N": 64,
-                "BLOCK_HEADDIM_QK": block_headdim,
-                "BLOCK_HEADDIM_V": block_headdim,
-              },
-              num_warps=num_warps,
-              num_stages=num_stages,
+    for block_n in [64] if autotune_mode == "fast" else [64, 128]:
+      for block_headdim in [64, 128]:
+        for num_warps in [4, 8]:
+          for num_stages in ([2] if autotune_mode == "fast" else [2, 3]):
+            configs.append(
+              triton.Config(
+                {
+                  "BLOCK_M": block_m,
+                  "BLOCK_N": block_n,
+                  "BLOCK_HEADDIM_QK": block_headdim,
+                  "BLOCK_HEADDIM_V": block_headdim,
+                },
+                num_warps=num_warps,
+                num_stages=num_stages,
+              )
             )
-          )
   return configs
 
 
@@ -197,53 +175,25 @@ def _gen_decode_fwd_stage1_autotune_configs(
       GEMV path.
   :return: Triton autotune configurations for decode stage1.
   """
-  _headdim_candidates = [64, 128]
-  use_extra_max_configs = _supports_fwd_generic_max_extra_configs()
-  _next_pow2 = triton.next_power_of_2(headdim)
-  if all([
-    use_gemv,
-    use_extra_max_configs,
-    _next_pow2 > 128,
-    _next_pow2 <= _MAX_HEADDIM,
-    autotune_mode == "max",
-  ]):
-    _headdim_candidates.append(_next_pow2)
-
-  if use_gemv:
-    block_m_candidates = [8]
-    block_n_candidates = [64, 128]
-    if autotune_mode == "max":
-      block_n_candidates.append(256)
-  else:
-    block_m_candidates = [8, 16, 32] if autotune_mode == "max" else [8, 16]
-    block_n_candidates = [64, 128]
-    if autotune_mode == "max":
-      block_n_candidates.append(256)
-
-  if autotune_mode == "fast":
-    _headdim_candidates = [c for c in _headdim_candidates if c <= 128]
-
+  # use_gemv fast: 2*1*2*1*1 = 4 configs; use_gemv max: 2*1*2*2*1 = 8 configs
+  # not use_gemv fast: 2*2*2*1*1 = 8 configs; not use_gemv max: 2*2*2*2*1 = 16 configs
   configs = []
-  for block_n in block_n_candidates:
-    for block_m in block_m_candidates:
-      for block_headdim in _headdim_candidates:
-        num_warps_candidates = [8]
-        if autotune_mode == "max" and not use_gemv and block_m >= 32 and block_n >= 128:
-          num_warps_candidates.append(4)
-        for num_warps in num_warps_candidates:
-          for num_stages in ([2] if autotune_mode == "fast" else [2, 3]):
-            configs.append(
-              triton.Config(
-                {
-                  "BLOCK_M": block_m,
-                  "BLOCK_N": block_n,
-                  "BLOCK_HEADDIM_QK": block_headdim,
-                  "BLOCK_HEADDIM_V": block_headdim,
-                },
-                num_warps=num_warps,
-                num_stages=num_stages,
-              )
+  for block_n in [64, 128]:
+    for block_m in ([8] if use_gemv else [16, 32]):
+      for block_headdim in [64, 128]:
+        for num_warps in ([4] if autotune_mode == "fast" else [4, 8]):
+          configs.append(
+            triton.Config(
+              {
+                "BLOCK_M": block_m,
+                "BLOCK_N": block_n,
+                "BLOCK_HEADDIM_QK": block_headdim,
+                "BLOCK_HEADDIM_V": block_headdim,
+              },
+              num_warps=num_warps,
+              num_stages=2,
             )
+          )
   return configs
 
 

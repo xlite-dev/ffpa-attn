@@ -24,7 +24,6 @@ from ._ffpa_bwd import (
   _ffpa_bwd_pre,
   _get_pre_autotune,
   _normalize_bwd_pre_config,
-  _supports_bwd_main_max_extra_configs,
 )
 from ._persistent_autotune import (
   PersistentConfigRequest,
@@ -327,31 +326,24 @@ _SM90_BWD_DEFAULT_CONFIG = {
 
 
 def _gen_bwd_sm90_autotune_configs(
-  headdim: int = 512,
   autotune_mode: str = "max",
   enable_ws: bool = False,
 ) -> list[triton.Config]:
   """Generate autotune configs for the SM90 TMA backward main kernel."""
-  del headdim
-  use_extra_max_configs = autotune_mode == "max" and _supports_bwd_main_max_extra_configs()
-  block_n_values = (64, 128) if use_extra_max_configs else (64, )
-  headdim_candidates = [64, 128, 256] if use_extra_max_configs else [64, 128]
-  num_warps_candidates = [4, 8]
-  num_stages_candidates = [2, 3]
-
+  # fast: 2*1*2*1*1 = 4 configs; max: 2*2*2*2*2 = 32 configs
   configs = []
   for block_m in [64, 128]:
-    for block_n in block_n_values:
-      for block_headdim in headdim_candidates:
-        for num_warps in num_warps_candidates:
-          for num_stages in num_stages_candidates:
+    for block_n in ([64] if autotune_mode == "fast" else [64, 128]):
+      for block_headdim in [64, 128]:
+        for num_warps in ([4] if autotune_mode == "fast" else [4, 8]):
+          for num_stages in ([2] if autotune_mode == "fast" else [2, 3]):
             configs.append(
               triton.Config(
                 {
                   "BLOCK_M": block_m,
                   "BLOCK_N": block_n,
                   "BLOCK_HEADDIM": block_headdim,
-                  "warp_specialize": False,
+                  "warp_specialize": enable_ws,
                 },
                 num_warps=num_warps,
                 num_stages=num_stages,
@@ -379,7 +371,6 @@ def _get_bwd_sm90_autotune(
       reset_args.append("GradAttnBias")
     _ffpa_bwd_sm90_autotune_cache[cache_key] = triton.autotune(
       configs=_gen_bwd_sm90_autotune_configs(
-        headdim,
         autotune_mode=autotune_mode,
         enable_ws=enable_ws,
       ),

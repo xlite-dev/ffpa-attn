@@ -397,39 +397,8 @@ _SM90_DEFAULT_CONFIG = {
   "num_stages": 3,
 }
 
-# BLOCK_M, BLOCK_N, BLOCK_HEADDIM_QK, BLOCK_HEADDIM_V
-_SM90_WS_CONFIGS = [
-  (64, 64, 64, 64),
-  (64, 64, 128, 128),
-  (64, 128, 64, 64),
-  (128, 64, 64, 64),
-  # Smaller M/QK tiles reduce WS staging pressure while keeping V chunks at 64
-  # to avoid doubling the number of V accumulator groups for D=512.
-  (32, 64, 64, 64),
-  (32, 128, 64, 64),
-  (64, 64, 32, 64),
-  (64, 128, 32, 64),
-  (32, 64, 32, 64),
-  (32, 128, 32, 64),
-]
-
-
-def _is_large_sm90_or_newer_device() -> bool:
-  """Return whether the current CUDA device should try full-D SM90 TMA tiles."""
-  if not torch.cuda.is_available():
-    return False
-  device = torch.cuda.current_device()
-  if torch.cuda.get_device_capability(device)[0] < 9:
-    return False
-  device_name = torch.cuda.get_device_name(device).strip().upper()
-  for prefix in ("NVIDIA ", "GEFORCE "):
-    if device_name.startswith(prefix):
-      device_name = device_name[len(prefix):]
-  return not device_name.startswith("RTX")
-
 
 def _gen_fwd_sm90_autotune_configs(
-  headdim: int = 256,
   autotune_mode: str = "max",
   enable_ws: bool = True,
 ) -> list[triton.Config]:
@@ -446,60 +415,23 @@ def _gen_fwd_sm90_autotune_configs(
   :param enable_ws: Whether to generate only warp-specialized configs.
   :return: Triton autotune configurations for the SM90 TMA forward kernel.
   """
-  _headdim_candidates = [64, 128]
-  if autotune_mode == "max":
-    _headdim_candidates.append(256)
-    full_headdim = 1 << (headdim - 1).bit_length()
-    if (full_headdim <= 512 and full_headdim not in _headdim_candidates and _is_large_sm90_or_newer_device()):
-      _headdim_candidates.append(full_headdim)
-
+  # fast: 2*2*2*1 = 8 configs; max: 2*2*2*2 = 16 configs
   configs = []
-  ws_config_set = set(_SM90_WS_CONFIGS)
-  if enable_ws:
-    tile_candidates = _SM90_WS_CONFIGS
-  else:
-    tile_candidates = [(block_m, block_n, block_headdim, block_headdim) for block_m in [64, 128]
-                       for block_n in [64, 128] for block_headdim in _headdim_candidates]
-
-  for block_m, block_n, block_headdim_qk, block_headdim_v in tile_candidates:
-    num_warps_candidates = [4] if autotune_mode == "fast" else [4, 8]
-    if enable_ws:
-      if (block_m, block_n, block_headdim_qk, block_headdim_v) not in ws_config_set:
-        continue
-      for num_warps in num_warps_candidates:
-        for num_stages in [1, 2, 3]:
-          # Config.num_stages is the backend-wide pipeline/warpspec option
-          # that materially changes WS shared-memory use. Stage 1 remains
-          # in autotune so small tiles and resource-bound shapes can
-          # compete without weakening the fixed WS fallback.
+  for block_m in [64, 128]:
+    for block_n in [64, 128]:
+      for block_headdim in [64, 128]:
+        for num_warps in [4] if autotune_mode == "fast" else [4, 8]:
           configs.append(
             triton.Config(
               {
                 "BLOCK_M": block_m,
                 "BLOCK_N": block_n,
-                "BLOCK_HEADDIM_QK": block_headdim_qk,
-                "BLOCK_HEADDIM_V": block_headdim_v,
-                "warp_specialize": True,
+                "BLOCK_HEADDIM_QK": block_headdim,
+                "BLOCK_HEADDIM_V": block_headdim,
+                "warp_specialize": enable_ws,
               },
               num_warps=num_warps,
-              num_stages=num_stages,
-              pre_hook=_sm90_host_descriptor_pre_hook,
-            )
-          )
-    else:
-      for num_warps in num_warps_candidates:
-        for num_stages in [2, 3] if autotune_mode == "fast" else [2, 3, 4]:
-          configs.append(
-            triton.Config(
-              {
-                "BLOCK_M": block_m,
-                "BLOCK_N": block_n,
-                "BLOCK_HEADDIM_QK": block_headdim_qk,
-                "BLOCK_HEADDIM_V": block_headdim_v,
-                "warp_specialize": False,
-              },
-              num_warps=num_warps,
-              num_stages=num_stages,
+              num_stages=3,  # 3 is almost always the better choice
               pre_hook=_sm90_host_descriptor_pre_hook,
             )
           )
@@ -526,7 +458,6 @@ def _get_fwd_sm90_autotune(headdim: int, autotune_mode: str, dtype: str, enable_
   cache_key = (headdim, autotune_mode, dtype, enable_ws)
   if cache_key not in _ffpa_fwd_sm90_autotune_cache:
     configs = _gen_fwd_sm90_autotune_configs(
-      headdim,
       autotune_mode=autotune_mode,
       enable_ws=enable_ws,
     )
