@@ -7,28 +7,32 @@ void ffpa_attn_fwd_bf16f32_d256(
     torch::Tensor K,
     torch::Tensor V,
     torch::Tensor O,
+    torch::Tensor attn_bias,
     torch::Tensor softmax_lse,
     int stages,
     int causal,
     double softmax_scale,
+    double dropout_p,
+    int64_t philox_seed,
+    int64_t philox_offset,
     int tma) {
   constexpr int kMmaAccFloat32QK = 1;
   constexpr int kMmaAccFloat32PV = 1;
 #ifdef ENABLE_FFPA_ALL_STAGES
   if (stages == 2) {
-    launch_ffpa_attn_fwd_template<__nv_bfloat16, 256, kMmaAccFloat32QK, kMmaAccFloat32PV, 2>(Q, K, V, O, softmax_lse, causal, softmax_scale, tma);
+    launch_ffpa_attn_fwd_template<__nv_bfloat16, 256, kMmaAccFloat32QK, kMmaAccFloat32PV, 2>(Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale, dropout_p, philox_seed, philox_offset, tma);
   } else if (stages == 3) {
-    launch_ffpa_attn_fwd_template<__nv_bfloat16, 256, kMmaAccFloat32QK, kMmaAccFloat32PV, 3>(Q, K, V, O, softmax_lse, causal, softmax_scale, tma);
+    launch_ffpa_attn_fwd_template<__nv_bfloat16, 256, kMmaAccFloat32QK, kMmaAccFloat32PV, 3>(Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale, dropout_p, philox_seed, philox_offset, tma);
   } else if (stages == 4) {
-    launch_ffpa_attn_fwd_template<__nv_bfloat16, 256, kMmaAccFloat32QK, kMmaAccFloat32PV, 4>(Q, K, V, O, softmax_lse, causal, softmax_scale, tma);
+    launch_ffpa_attn_fwd_template<__nv_bfloat16, 256, kMmaAccFloat32QK, kMmaAccFloat32PV, 4>(Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale, dropout_p, philox_seed, philox_offset, tma);
   } else {
-    launch_ffpa_attn_fwd_template<__nv_bfloat16, 256, kMmaAccFloat32QK, kMmaAccFloat32PV, 1>(Q, K, V, O, softmax_lse, causal, softmax_scale, tma);
+    launch_ffpa_attn_fwd_template<__nv_bfloat16, 256, kMmaAccFloat32QK, kMmaAccFloat32PV, 1>(Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale, dropout_p, philox_seed, philox_offset, tma);
   }
 #else
   if (stages == 2) {
-    launch_ffpa_attn_fwd_template<__nv_bfloat16, 256, kMmaAccFloat32QK, kMmaAccFloat32PV, 2>(Q, K, V, O, softmax_lse, causal, softmax_scale, tma);
+    launch_ffpa_attn_fwd_template<__nv_bfloat16, 256, kMmaAccFloat32QK, kMmaAccFloat32PV, 2>(Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale, dropout_p, philox_seed, philox_offset, tma);
   } else {
-    launch_ffpa_attn_fwd_template<__nv_bfloat16, 256, kMmaAccFloat32QK, kMmaAccFloat32PV, 1>(Q, K, V, O, softmax_lse, causal, softmax_scale, tma);
+    launch_ffpa_attn_fwd_template<__nv_bfloat16, 256, kMmaAccFloat32QK, kMmaAccFloat32PV, 1>(Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale, dropout_p, philox_seed, philox_offset, tma);
   }
 #endif
 }

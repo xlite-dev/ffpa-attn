@@ -7,10 +7,14 @@ void ffpa_attn_fwd_fp16f16(
     torch::Tensor K,
     torch::Tensor V,
     torch::Tensor O,
+    torch::Tensor attn_bias,
     torch::Tensor softmax_lse,
     int stages,
     int causal,
     double softmax_scale,
+    double dropout_p,
+    int64_t philox_seed,
+    int64_t philox_offset,
     int tma) {
   CHECK_TORCH_TENSOR_DTYPE(Q, torch::kHalf)
   CHECK_TORCH_TENSOR_DTYPE(K, torch::kHalf)
@@ -18,19 +22,19 @@ void ffpa_attn_fwd_fp16f16(
   CHECK_TORCH_TENSOR_DTYPE(O, torch::kHalf)
   const int d = Q.size(3);
   switch (d) {
-    case 256: ffpa_attn_fwd_fp16f16_d256(Q, K, V, O, softmax_lse, stages, causal, softmax_scale, tma); break;
-    case 320: ffpa_attn_fwd_fp16f16_d320(Q, K, V, O, softmax_lse, stages, causal, softmax_scale, tma); break;
-    case 384: ffpa_attn_fwd_fp16f16_d384(Q, K, V, O, softmax_lse, stages, causal, softmax_scale, tma); break;
-    case 448: ffpa_attn_fwd_fp16f16_d448(Q, K, V, O, softmax_lse, stages, causal, softmax_scale, tma); break;
-    case 512: ffpa_attn_fwd_fp16f16_d512(Q, K, V, O, softmax_lse, stages, causal, softmax_scale, tma); break;
-    case 576: ffpa_attn_fwd_fp16f16_d576(Q, K, V, O, softmax_lse, stages, causal, softmax_scale, tma); break;
-    case 640: ffpa_attn_fwd_fp16f16_d640(Q, K, V, O, softmax_lse, stages, causal, softmax_scale, tma); break;
-    case 704: ffpa_attn_fwd_fp16f16_d704(Q, K, V, O, softmax_lse, stages, causal, softmax_scale, tma); break;
-    case 768: ffpa_attn_fwd_fp16f16_d768(Q, K, V, O, softmax_lse, stages, causal, softmax_scale, tma); break;
-    case 832: ffpa_attn_fwd_fp16f16_d832(Q, K, V, O, softmax_lse, stages, causal, softmax_scale, tma); break;
-    case 896: ffpa_attn_fwd_fp16f16_d896(Q, K, V, O, softmax_lse, stages, causal, softmax_scale, tma); break;
-    case 960: ffpa_attn_fwd_fp16f16_d960(Q, K, V, O, softmax_lse, stages, causal, softmax_scale, tma); break;
-    case 1024: ffpa_attn_fwd_fp16f16_d1024(Q, K, V, O, softmax_lse, stages, causal, softmax_scale, tma); break;
+    case 256: ffpa_attn_fwd_fp16f16_d256(Q, K, V, O, attn_bias, softmax_lse, stages, causal, softmax_scale, dropout_p, philox_seed, philox_offset, tma); break;
+    case 320: ffpa_attn_fwd_fp16f16_d320(Q, K, V, O, attn_bias, softmax_lse, stages, causal, softmax_scale, dropout_p, philox_seed, philox_offset, tma); break;
+    case 384: ffpa_attn_fwd_fp16f16_d384(Q, K, V, O, attn_bias, softmax_lse, stages, causal, softmax_scale, dropout_p, philox_seed, philox_offset, tma); break;
+    case 448: ffpa_attn_fwd_fp16f16_d448(Q, K, V, O, attn_bias, softmax_lse, stages, causal, softmax_scale, dropout_p, philox_seed, philox_offset, tma); break;
+    case 512: ffpa_attn_fwd_fp16f16_d512(Q, K, V, O, attn_bias, softmax_lse, stages, causal, softmax_scale, dropout_p, philox_seed, philox_offset, tma); break;
+    case 576: ffpa_attn_fwd_fp16f16_d576(Q, K, V, O, attn_bias, softmax_lse, stages, causal, softmax_scale, dropout_p, philox_seed, philox_offset, tma); break;
+    case 640: ffpa_attn_fwd_fp16f16_d640(Q, K, V, O, attn_bias, softmax_lse, stages, causal, softmax_scale, dropout_p, philox_seed, philox_offset, tma); break;
+    case 704: ffpa_attn_fwd_fp16f16_d704(Q, K, V, O, attn_bias, softmax_lse, stages, causal, softmax_scale, dropout_p, philox_seed, philox_offset, tma); break;
+    case 768: ffpa_attn_fwd_fp16f16_d768(Q, K, V, O, attn_bias, softmax_lse, stages, causal, softmax_scale, dropout_p, philox_seed, philox_offset, tma); break;
+    case 832: ffpa_attn_fwd_fp16f16_d832(Q, K, V, O, attn_bias, softmax_lse, stages, causal, softmax_scale, dropout_p, philox_seed, philox_offset, tma); break;
+    case 896: ffpa_attn_fwd_fp16f16_d896(Q, K, V, O, attn_bias, softmax_lse, stages, causal, softmax_scale, dropout_p, philox_seed, philox_offset, tma); break;
+    case 960: ffpa_attn_fwd_fp16f16_d960(Q, K, V, O, attn_bias, softmax_lse, stages, causal, softmax_scale, dropout_p, philox_seed, philox_offset, tma); break;
+    case 1024: ffpa_attn_fwd_fp16f16_d1024(Q, K, V, O, attn_bias, softmax_lse, stages, causal, softmax_scale, dropout_p, philox_seed, philox_offset, tma); break;
     default: throw std::runtime_error("headdim not support!");
   }
 }
@@ -40,10 +44,14 @@ void ffpa_attn_fwd_fp16f32(
     torch::Tensor K,
     torch::Tensor V,
     torch::Tensor O,
+    torch::Tensor attn_bias,
     torch::Tensor softmax_lse,
     int stages,
     int causal,
     double softmax_scale,
+    double dropout_p,
+    int64_t philox_seed,
+    int64_t philox_offset,
     int tma) {
   CHECK_TORCH_TENSOR_DTYPE(Q, torch::kHalf)
   CHECK_TORCH_TENSOR_DTYPE(K, torch::kHalf)
@@ -51,19 +59,19 @@ void ffpa_attn_fwd_fp16f32(
   CHECK_TORCH_TENSOR_DTYPE(O, torch::kHalf)
   const int d = Q.size(3);
   switch (d) {
-    case 256: ffpa_attn_fwd_fp16f32_d256(Q, K, V, O, softmax_lse, stages, causal, softmax_scale, tma); break;
-    case 320: ffpa_attn_fwd_fp16f32_d320(Q, K, V, O, softmax_lse, stages, causal, softmax_scale, tma); break;
-    case 384: ffpa_attn_fwd_fp16f32_d384(Q, K, V, O, softmax_lse, stages, causal, softmax_scale, tma); break;
-    case 448: ffpa_attn_fwd_fp16f32_d448(Q, K, V, O, softmax_lse, stages, causal, softmax_scale, tma); break;
-    case 512: ffpa_attn_fwd_fp16f32_d512(Q, K, V, O, softmax_lse, stages, causal, softmax_scale, tma); break;
-    case 576: ffpa_attn_fwd_fp16f32_d576(Q, K, V, O, softmax_lse, stages, causal, softmax_scale, tma); break;
-    case 640: ffpa_attn_fwd_fp16f32_d640(Q, K, V, O, softmax_lse, stages, causal, softmax_scale, tma); break;
-    case 704: ffpa_attn_fwd_fp16f32_d704(Q, K, V, O, softmax_lse, stages, causal, softmax_scale, tma); break;
-    case 768: ffpa_attn_fwd_fp16f32_d768(Q, K, V, O, softmax_lse, stages, causal, softmax_scale, tma); break;
-    case 832: ffpa_attn_fwd_fp16f32_d832(Q, K, V, O, softmax_lse, stages, causal, softmax_scale, tma); break;
-    case 896: ffpa_attn_fwd_fp16f32_d896(Q, K, V, O, softmax_lse, stages, causal, softmax_scale, tma); break;
-    case 960: ffpa_attn_fwd_fp16f32_d960(Q, K, V, O, softmax_lse, stages, causal, softmax_scale, tma); break;
-    case 1024: ffpa_attn_fwd_fp16f32_d1024(Q, K, V, O, softmax_lse, stages, causal, softmax_scale, tma); break;
+    case 256: ffpa_attn_fwd_fp16f32_d256(Q, K, V, O, attn_bias, softmax_lse, stages, causal, softmax_scale, dropout_p, philox_seed, philox_offset, tma); break;
+    case 320: ffpa_attn_fwd_fp16f32_d320(Q, K, V, O, attn_bias, softmax_lse, stages, causal, softmax_scale, dropout_p, philox_seed, philox_offset, tma); break;
+    case 384: ffpa_attn_fwd_fp16f32_d384(Q, K, V, O, attn_bias, softmax_lse, stages, causal, softmax_scale, dropout_p, philox_seed, philox_offset, tma); break;
+    case 448: ffpa_attn_fwd_fp16f32_d448(Q, K, V, O, attn_bias, softmax_lse, stages, causal, softmax_scale, dropout_p, philox_seed, philox_offset, tma); break;
+    case 512: ffpa_attn_fwd_fp16f32_d512(Q, K, V, O, attn_bias, softmax_lse, stages, causal, softmax_scale, dropout_p, philox_seed, philox_offset, tma); break;
+    case 576: ffpa_attn_fwd_fp16f32_d576(Q, K, V, O, attn_bias, softmax_lse, stages, causal, softmax_scale, dropout_p, philox_seed, philox_offset, tma); break;
+    case 640: ffpa_attn_fwd_fp16f32_d640(Q, K, V, O, attn_bias, softmax_lse, stages, causal, softmax_scale, dropout_p, philox_seed, philox_offset, tma); break;
+    case 704: ffpa_attn_fwd_fp16f32_d704(Q, K, V, O, attn_bias, softmax_lse, stages, causal, softmax_scale, dropout_p, philox_seed, philox_offset, tma); break;
+    case 768: ffpa_attn_fwd_fp16f32_d768(Q, K, V, O, attn_bias, softmax_lse, stages, causal, softmax_scale, dropout_p, philox_seed, philox_offset, tma); break;
+    case 832: ffpa_attn_fwd_fp16f32_d832(Q, K, V, O, attn_bias, softmax_lse, stages, causal, softmax_scale, dropout_p, philox_seed, philox_offset, tma); break;
+    case 896: ffpa_attn_fwd_fp16f32_d896(Q, K, V, O, attn_bias, softmax_lse, stages, causal, softmax_scale, dropout_p, philox_seed, philox_offset, tma); break;
+    case 960: ffpa_attn_fwd_fp16f32_d960(Q, K, V, O, attn_bias, softmax_lse, stages, causal, softmax_scale, dropout_p, philox_seed, philox_offset, tma); break;
+    case 1024: ffpa_attn_fwd_fp16f32_d1024(Q, K, V, O, attn_bias, softmax_lse, stages, causal, softmax_scale, dropout_p, philox_seed, philox_offset, tma); break;
     default: throw std::runtime_error("headdim not support!");
   }
 }
@@ -73,10 +81,14 @@ void ffpa_attn_fwd_bf16f32(
     torch::Tensor K,
     torch::Tensor V,
     torch::Tensor O,
+    torch::Tensor attn_bias,
     torch::Tensor softmax_lse,
     int stages,
     int causal,
     double softmax_scale,
+    double dropout_p,
+    int64_t philox_seed,
+    int64_t philox_offset,
     int tma) {
   CHECK_TORCH_TENSOR_DTYPE(Q, torch::kBFloat16)
   CHECK_TORCH_TENSOR_DTYPE(K, torch::kBFloat16)
@@ -84,19 +96,19 @@ void ffpa_attn_fwd_bf16f32(
   CHECK_TORCH_TENSOR_DTYPE(O, torch::kBFloat16)
   const int d = Q.size(3);
   switch (d) {
-    case 256: ffpa_attn_fwd_bf16f32_d256(Q, K, V, O, softmax_lse, stages, causal, softmax_scale, tma); break;
-    case 320: ffpa_attn_fwd_bf16f32_d320(Q, K, V, O, softmax_lse, stages, causal, softmax_scale, tma); break;
-    case 384: ffpa_attn_fwd_bf16f32_d384(Q, K, V, O, softmax_lse, stages, causal, softmax_scale, tma); break;
-    case 448: ffpa_attn_fwd_bf16f32_d448(Q, K, V, O, softmax_lse, stages, causal, softmax_scale, tma); break;
-    case 512: ffpa_attn_fwd_bf16f32_d512(Q, K, V, O, softmax_lse, stages, causal, softmax_scale, tma); break;
-    case 576: ffpa_attn_fwd_bf16f32_d576(Q, K, V, O, softmax_lse, stages, causal, softmax_scale, tma); break;
-    case 640: ffpa_attn_fwd_bf16f32_d640(Q, K, V, O, softmax_lse, stages, causal, softmax_scale, tma); break;
-    case 704: ffpa_attn_fwd_bf16f32_d704(Q, K, V, O, softmax_lse, stages, causal, softmax_scale, tma); break;
-    case 768: ffpa_attn_fwd_bf16f32_d768(Q, K, V, O, softmax_lse, stages, causal, softmax_scale, tma); break;
-    case 832: ffpa_attn_fwd_bf16f32_d832(Q, K, V, O, softmax_lse, stages, causal, softmax_scale, tma); break;
-    case 896: ffpa_attn_fwd_bf16f32_d896(Q, K, V, O, softmax_lse, stages, causal, softmax_scale, tma); break;
-    case 960: ffpa_attn_fwd_bf16f32_d960(Q, K, V, O, softmax_lse, stages, causal, softmax_scale, tma); break;
-    case 1024: ffpa_attn_fwd_bf16f32_d1024(Q, K, V, O, softmax_lse, stages, causal, softmax_scale, tma); break;
+    case 256: ffpa_attn_fwd_bf16f32_d256(Q, K, V, O, attn_bias, softmax_lse, stages, causal, softmax_scale, dropout_p, philox_seed, philox_offset, tma); break;
+    case 320: ffpa_attn_fwd_bf16f32_d320(Q, K, V, O, attn_bias, softmax_lse, stages, causal, softmax_scale, dropout_p, philox_seed, philox_offset, tma); break;
+    case 384: ffpa_attn_fwd_bf16f32_d384(Q, K, V, O, attn_bias, softmax_lse, stages, causal, softmax_scale, dropout_p, philox_seed, philox_offset, tma); break;
+    case 448: ffpa_attn_fwd_bf16f32_d448(Q, K, V, O, attn_bias, softmax_lse, stages, causal, softmax_scale, dropout_p, philox_seed, philox_offset, tma); break;
+    case 512: ffpa_attn_fwd_bf16f32_d512(Q, K, V, O, attn_bias, softmax_lse, stages, causal, softmax_scale, dropout_p, philox_seed, philox_offset, tma); break;
+    case 576: ffpa_attn_fwd_bf16f32_d576(Q, K, V, O, attn_bias, softmax_lse, stages, causal, softmax_scale, dropout_p, philox_seed, philox_offset, tma); break;
+    case 640: ffpa_attn_fwd_bf16f32_d640(Q, K, V, O, attn_bias, softmax_lse, stages, causal, softmax_scale, dropout_p, philox_seed, philox_offset, tma); break;
+    case 704: ffpa_attn_fwd_bf16f32_d704(Q, K, V, O, attn_bias, softmax_lse, stages, causal, softmax_scale, dropout_p, philox_seed, philox_offset, tma); break;
+    case 768: ffpa_attn_fwd_bf16f32_d768(Q, K, V, O, attn_bias, softmax_lse, stages, causal, softmax_scale, dropout_p, philox_seed, philox_offset, tma); break;
+    case 832: ffpa_attn_fwd_bf16f32_d832(Q, K, V, O, attn_bias, softmax_lse, stages, causal, softmax_scale, dropout_p, philox_seed, philox_offset, tma); break;
+    case 896: ffpa_attn_fwd_bf16f32_d896(Q, K, V, O, attn_bias, softmax_lse, stages, causal, softmax_scale, dropout_p, philox_seed, philox_offset, tma); break;
+    case 960: ffpa_attn_fwd_bf16f32_d960(Q, K, V, O, attn_bias, softmax_lse, stages, causal, softmax_scale, dropout_p, philox_seed, philox_offset, tma); break;
+    case 1024: ffpa_attn_fwd_bf16f32_d1024(Q, K, V, O, attn_bias, softmax_lse, stages, causal, softmax_scale, dropout_p, philox_seed, philox_offset, tma); break;
     default: throw std::runtime_error("headdim not support!");
   }
 }

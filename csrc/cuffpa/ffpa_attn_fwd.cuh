@@ -92,7 +92,13 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
                                    const kDataType* __restrict__ V, kDataType* __restrict__ O,
                                    float* __restrict__ softmax_lse, const int Nq, const int Nkv,
                                    const int Nh, const int Nh_kv, const float scale, const int Tc,
-                                   const int causal) {
+                                   const int causal, const void* __restrict__ attn_bias,
+                                   const int attn_bias_dtype, const long long attn_bias_stride_b,
+                                   const long long attn_bias_stride_h,
+                                   const long long attn_bias_stride_m,
+                                   const long long attn_bias_stride_n, const float dropout_p,
+                                   const unsigned long long philox_seed,
+                                   const unsigned long long philox_offset) {
   ffpa::prefill::check_large_d_compiling_states<
       kHeadDim, kMmaAtomM, kMmaAtomN, kMmaAtomK, kMmaTileSeqLenQ, kMmaTileSeqLenK, kMmaTileSeqLenP,
       kMmaTileHeadDimV, kValTileSeqLenQ, kValTileSeqLenK, kValTileSeqLenP, kValTileHeadDimV,
@@ -201,6 +207,7 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
   const int causal_thresh_row0 = Br_base + kv_offset;  // max k for row 0
   const int Tc_eff = causal ? min(Tc, ((Br_base + Br - 1 + kv_offset) / Bc) + 1) : Tc;
   const int mask_start_tile = causal ? max(0, (causal_thresh_row0 + 1) / Bc) : INT_MAX;
+  const float inv_scale = 1.0f / scale;
 
   // Now, N must be mutliples of Bc(32/64) for KV tiling across seqlen.
   // <loop over K seqlen>: for K^T[d,seqlen] with K^T_tile[d,Bc]
@@ -467,9 +474,20 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
       ffpa::prefill::sync_apply_causal_mask<kValTileSeqLenK, kMmaAccFloat32QK, kDataType>(
           &R_S[0][0][0], warp_QP, Br_base, tile_K_seqlen * Bc, kv_offset);
     }
+    if (attn_bias != nullptr) {
+      ffpa::prefill::sync_apply_attn_bias<kValTileSeqLenK, kMmaAccFloat32QK, kDataType>(
+          &R_S[0][0][0], attn_bias, attn_bias_dtype, attn_bias_stride_b, attn_bias_stride_h,
+          attn_bias_stride_m, attn_bias_stride_n, Nb_id, Nh_id, warp_QP, Br_base,
+          tile_K_seqlen * Bc, Nq, Nkv, inv_scale);
+    }
     ffpa::prefill::sync_online_safe_softmax<kValTileSeqLenK, kMmaAccFloat32QK, kDataType>(
         &R_S[0][0][0], scale, &lane_row_max_new[0][0], &lane_row_sum_new[0][0],
         &lane_block_row_max_old[0][0], &lane_block_row_sum_old[0][0]);
+    if (dropout_p > 0.0f) {
+      ffpa::prefill::sync_apply_dropout_to_p<kValTileSeqLenK, kMmaAccFloat32QK, kDataType>(
+          &R_S[0][0][0], dropout_p, philox_seed, philox_offset, Nb_id, Nh_id, Nh, warp_QP, Br_base,
+          tile_K_seqlen * Bc, Nq, Nkv);
+    }
 
     // Wait V g2s stages ready.
     if constexpr (kStagePV > 1) {
@@ -1175,12 +1193,15 @@ template <typename kDataType, const int kHeadDim, const int kMmaAtomM, const int
           const int kPersistQs2r, const int kPersistVs2r, const int kRegPipeKV, const int kStageQK,
           const int kStagePV, const int kPadQ, const int kPadK, const int kPadV>
 __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
-    ffpa_attn_persistent_d_fwd_template(const kDataType* __restrict__ Q,
-                                        const kDataType* __restrict__ K,
-                                        const kDataType* __restrict__ V, kDataType* __restrict__ O,
-                                        float* __restrict__ softmax_lse, const int Nq,
-                                        const int Nkv, const int Nh, const int Nh_kv,
-                                        const float scale, const int Tc, const int causal) {
+    ffpa_attn_persistent_d_fwd_template(
+        const kDataType* __restrict__ Q, const kDataType* __restrict__ K,
+        const kDataType* __restrict__ V, kDataType* __restrict__ O, float* __restrict__ softmax_lse,
+        const int Nq, const int Nkv, const int Nh, const int Nh_kv, const float scale, const int Tc,
+        const int causal, const void* __restrict__ attn_bias, const int attn_bias_dtype,
+        const long long attn_bias_stride_b, const long long attn_bias_stride_h,
+        const long long attn_bias_stride_m, const long long attn_bias_stride_n,
+        const float dropout_p, const unsigned long long philox_seed,
+        const unsigned long long philox_offset) {
   // NOTE: This kernel template is developed for small head dimensions (d <= 128),
   // namely, flash-attention-2. Always persist QKV for flash-attn, apply tiling at
   // the Attention level not the MMA level.
@@ -1294,6 +1315,7 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
   const int causal_thresh_row0 = Br_base + kv_offset;  // max k for row 0
   const int Tc_eff = causal ? min(Tc, ((Br_base + Br - 1 + kv_offset) / Bc) + 1) : Tc;
   const int mask_start_tile = causal ? max(0, (causal_thresh_row0 + 1) / Bc) : INT_MAX;
+  const float inv_scale = 1.0f / scale;
 
 // Now, N must be mutliples of Bc(32/64) for KV tiling across seqlen.
 // <loop over K seqlen>: for K^T[d,seqlen] with K^T_tile[d,Bc]
@@ -1460,9 +1482,20 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
       ffpa::prefill::sync_apply_causal_mask<kValTileSeqLenK, kMmaAccFloat32QK, kDataType>(
           &R_S[0][0][0], warp_QP, Br_base, tile_K_seqlen * Bc, kv_offset);
     }
+    if (attn_bias != nullptr) {
+      ffpa::prefill::sync_apply_attn_bias<kValTileSeqLenK, kMmaAccFloat32QK, kDataType>(
+          &R_S[0][0][0], attn_bias, attn_bias_dtype, attn_bias_stride_b, attn_bias_stride_h,
+          attn_bias_stride_m, attn_bias_stride_n, Nb_id, Nh_id, warp_QP, Br_base,
+          tile_K_seqlen * Bc, Nq, Nkv, inv_scale);
+    }
     ffpa::prefill::sync_online_safe_softmax<kValTileSeqLenK, kMmaAccFloat32QK, kDataType>(
         &R_S[0][0][0], scale, &lane_row_max_new[0][0], &lane_row_sum_new[0][0],
         &lane_block_row_max_old[0][0], &lane_block_row_sum_old[0][0]);
+    if (dropout_p > 0.0f) {
+      ffpa::prefill::sync_apply_dropout_to_p<kValTileSeqLenK, kMmaAccFloat32QK, kDataType>(
+          &R_S[0][0][0], dropout_p, philox_seed, philox_offset, Nb_id, Nh_id, Nh, warp_QP, Br_base,
+          tile_K_seqlen * Bc, Nq, Nkv);
+    }
 
     // Wait V g2s ready.
     ffpa::cp_async::wait_group<0>();
