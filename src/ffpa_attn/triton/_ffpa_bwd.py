@@ -284,7 +284,7 @@ def _gen_pre_autotune_configs(d_chunk: bool, autotune_mode: str = "max") -> list
       expanded max search.
   :return: Triton autotune configurations for the delta preprocess kernel.
   """
-  del autotune_mode
+  _ = autotune_mode
   configs = []
   for block_m in [64, 128, 256]:
     if not d_chunk:
@@ -328,7 +328,6 @@ def _get_pre_autotune(d_chunk: bool, autotune_mode: str, dtype: str):
   return _ffpa_bwd_pre_autotune_cache[cache_key]
 
 
-# Non-autotuned variant.
 _ffpa_bwd_pre = _ffpa_bwd_pre_impl
 
 
@@ -363,19 +362,7 @@ def _normalize_bwd_pre_config(
   return normalized
 
 
-def _supports_bwd_main_max_extra_configs() -> bool:
-  """Return whether the current GPU should try extra bwd_main max configs."""
-  try:
-    major, _minor = torch.cuda.get_device_capability()
-  except Exception:
-    return False
-  return major >= 9
-
-
-def _gen_bwd_autotune_configs(
-  block_n_values: tuple[int, ...],
-  autotune_mode: str = "max",
-) -> list[triton.Config]:
+def _gen_bwd_autotune_configs(autotune_mode: str = "max", ) -> list[triton.Config]:
   """Generate autotune configs over BLOCK_M, BLOCK_N, BLOCK_HEADDIM, num_warps, num_stages.
 
   :param block_n_values: Candidate ``BLOCK_N`` values for the target backward
@@ -383,29 +370,13 @@ def _gen_bwd_autotune_configs(
   :param autotune_mode: Search-space mode, ``"fast"`` or ``"max"``.
   :return: Triton autotune configurations for one backward kernel variant.
   """
-  # BLOCK_M: larger = fewer Q-block iterations (good), more register pressure.
-  # BLOCK_N: controls K/V tile size for dK/dV and dQ recomputation.
-  # BLOCK_HEADDIM:
-  #   64, 128 — classic D-chunk split, low register pressure, widely compatible.
-  #   256     — SM90+ max-only wider split-D candidate.  On SM < 90 measured
-  #             performance is effectively identical, so max intentionally uses
-  #             the fast search space.  Full-D dynamic candidates and stage-4
-  #             pipelines are still pruned because they make offline persistent
-  #             tuning much slower without a clear default win.
-  # TODO: Optimize the autotune time by saving the best config per shape
-  # (device-shape/headdim) in a file and loading it at the start of autotune.
-  use_extra_max_configs = autotune_mode == "max" and _supports_bwd_main_max_extra_configs()
-  if autotune_mode == "max" and not use_extra_max_configs:
-    block_n_values = (64, )
-  _headdim_candidates = [64, 128, 256] if use_extra_max_configs else [64, 128]
-  _num_stages_candidates = [2, 3]
-
+  # fast: 2*1*2*1*1 = 4 configs; max: 2*2*2*2*2 = 32 configs
   configs = []
   for block_m in [64, 128]:
-    for block_n in block_n_values:
-      for block_headdim in _headdim_candidates:
-        for num_warps in [4, 8]:
-          for num_stages in _num_stages_candidates:
+    for block_n in ([64] if autotune_mode == "fast" else [64, 128]):
+      for block_headdim in [64, 128]:
+        for num_warps in ([4] if autotune_mode == "fast" else [4, 8]):
+          for num_stages in ([2] if autotune_mode == "fast" else [2, 3]):
             configs.append(
               triton.Config(
                 {
@@ -799,10 +770,7 @@ def _get_bwd_autotune(headdim: int, autotune_mode: str, bias_requires_grad: bool
   """
   cache_key = (headdim, autotune_mode, bias_requires_grad)
   if cache_key not in _ffpa_bwd_autotune_cache:
-    configs = _gen_bwd_autotune_configs(
-      block_n_values=(64, ) if autotune_mode == "fast" else (64, 128),
-      autotune_mode=autotune_mode,
-    )
+    configs = _gen_bwd_autotune_configs(autotune_mode=autotune_mode, )
     reset_args = []
     if bias_requires_grad:
       reset_args.append("GradAttnBias")
