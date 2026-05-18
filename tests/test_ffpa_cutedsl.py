@@ -146,3 +146,89 @@ def test_cutedsl_fast_path_bypasses_ffpaattnfunc(monkeypatch):
   out = ffpa_attn_func(q, q, q, forward_backend="cutedsl")
   assert call_count[0] == 0, "fast-path should have bypassed FFPAAttnFunc.apply"
   assert out.shape == q.shape and torch.isfinite(out).all()
+
+
+# Each (Nq, Nkv, is_causal) row exercises a distinct boundary path in the dense
+# cutedsl forward kernel. Oracle is torch SDPA — the documented semantic target
+# of ffpa_attn_func — which also keeps the forward and autograd tests in this
+# file using the same reference. SDPA's is_causal=True matches FFPA's
+# tail-aligned causal only when Nq == Nkv, so cross-attn cases stay non-causal.
+NONALIGNED_FORWARD_CASES = [
+  # Nq, Nkv, is_causal  — what each row exercises
+  (8191, 8192, False),  # Q tail only: ceil_div m_block + LSE row bound + O TMA OOB drop
+  (8192, 8191, False),  # KV tail only: R2P column mask on boundary n_block
+  (129, 129, False),  # small both-sided tail, non-causal
+  (129, 129, True),  # small both-sided tail + causal mask x boundary interaction
+  (8191, 8191, False),  # large both-sided tail, non-causal
+  (8191, 8191, True),  # large both-sided tail + causal
+]
+
+
+@pytest.mark.parametrize("Nq,Nkv,is_causal", NONALIGNED_FORWARD_CASES)
+def test_cutedsl_forward_nonaligned_matches_sdpa(Nq, Nkv, is_causal):
+  """Forward parity of the cutedsl backend on non-aligned seqlen (tile_m=64, tile_n=128).
+
+  Verifies the four implicit boundary contracts of the dense cutedsl forward:
+    1. ceil_div m_block scheduling visits the partial Q tail tile
+       (_ffpa_fwd_d512_sm90.py:450)
+    2. mask_seqlen=True on the boundary n_block applies an R2P column bitmask
+       (utils/mask.py:155-167, _ffpa_fwd_d512_sm90.py:1088)
+    3. LSE explicit per-row boundary check on the partial Q tail tile
+       (_ffpa_fwd_d512_sm90.py:1654-1657)
+    4. O TMA descriptor extent + Hopper OOB store-drop on the partial Q tail
+       (_ffpa_fwd_d512_sm90.py:430-441, 1676)
+  """
+  torch.manual_seed(0)
+  B, H, D = 1, 4, 512
+  q = torch.randn(B, H, Nq, D, dtype=torch.bfloat16, device="cuda")
+  k = torch.randn(B, H, Nkv, D, dtype=torch.bfloat16, device="cuda")
+  v = torch.randn(B, H, Nkv, D, dtype=torch.bfloat16, device="cuda")
+
+  out_ref = F.scaled_dot_product_attention(q, k, v, is_causal=is_causal)
+  out_cute = ffpa_attn_func(q, k, v, is_causal=is_causal, forward_backend="cutedsl")
+
+  assert out_cute.shape == out_ref.shape == (B, H, Nq, D)
+  assert torch.isfinite(out_cute).all(), (f"cutedsl output has NaN/Inf at Nq={Nq}, Nkv={Nkv}, is_causal={is_causal}")
+  torch.testing.assert_close(out_cute, out_ref, **_tol())
+
+
+NONALIGNED_AUTOGRAD_SEQLENS = [65, 129, 1023, 8191]
+
+
+@pytest.mark.parametrize("is_causal", [False, True])
+@pytest.mark.parametrize("N", NONALIGNED_AUTOGRAD_SEQLENS)
+def test_cutedsl_autograd_nonaligned_matches_sdpa(is_causal, N):
+  """Autograd parity for cutedsl backend with non-aligned seqlen (Nq == Nkv == N).
+
+  Compared against ``torch.nn.functional.scaled_dot_product_attention`` rather
+  than the Triton FFPA backend: at the time of writing, Triton's bwd produces
+  NaN gradients for non-aligned causal self-attention at D=512, so using it as
+  the oracle masks cutedsl's actual (correct) behavior. SDPA is the documented
+  semantic target of ``ffpa_attn_func`` anyway.
+  """
+  B, H, D = 1, 4, 512
+
+  def make():
+    return (
+      torch.randn(B, H, N, D, dtype=torch.bfloat16, device="cuda", requires_grad=True),
+      torch.randn(B, H, N, D, dtype=torch.bfloat16, device="cuda", requires_grad=True),
+      torch.randn(B, H, N, D, dtype=torch.bfloat16, device="cuda", requires_grad=True),
+    )
+
+  torch.manual_seed(42)
+  q_r, k_r, v_r = make()
+  out_r = F.scaled_dot_product_attention(q_r, k_r, v_r, is_causal=is_causal)
+  out_r.sum().backward()
+
+  torch.manual_seed(42)
+  q_c, k_c, v_c = make()
+  out_c = ffpa_attn_func(q_c, k_c, v_c, is_causal=is_causal, forward_backend="cutedsl")
+  out_c.sum().backward()
+
+  assert torch.isfinite(out_c).all(), f"cutedsl output has NaN/Inf at N={N}, is_causal={is_causal}"
+  for name, t in (("q", q_c), ("k", k_c), ("v", v_c)):
+    assert torch.isfinite(t.grad).all(), f"cutedsl {name}.grad has NaN/Inf at N={N}, is_causal={is_causal}"
+  torch.testing.assert_close(out_c, out_r, **_tol())
+  torch.testing.assert_close(q_c.grad, q_r.grad, **_grad_tol())
+  torch.testing.assert_close(k_c.grad, k_r.grad, **_grad_tol())
+  torch.testing.assert_close(v_c.grad, v_r.grad, **_grad_tol())
