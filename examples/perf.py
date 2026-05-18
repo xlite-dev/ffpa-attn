@@ -63,6 +63,15 @@ PLOT_CASES: list[tuple[str, str]] = [
   ("dropout", "dropout(F/B)"),
   ("non-aligned", "non-aligned(F/B)"),
 ]
+SPEEDUP_PLOT_CASES: list[tuple[str, str]] = [
+  ("self-attn", "self-attn(F/B)"),
+  ("cross-attn", "cross-attn(F/B)"),
+  ("decode-attn", "decode(Nq=1,F/B)"),
+  ("gqa", "gqa(F/B)"),
+  ("causal", "causal(F/B)"),
+  ("attn-mask", "attn-mask(F/B)"),
+  ("dropout", "dropout(F/B)"),
+]
 TFLOPS_PLOT_CASES: list[tuple[str, str]] = [
   ("self-attn", "self-attn(F/B)"),
   ("cross-attn", "cross-attn(F/B)"),
@@ -76,8 +85,8 @@ DEFAULT_OUTPUT_STEM = "ffpa_speedup"
 DEFAULT_OUTPUT_DIR = Path(".tmp")
 FALLBACK_DEVICE_NAME = "NVIDIA RTX 5090 Blackwell"
 CUTEDSL_BACKEND = "cutedsl"
-CUTEDSL_COMPAT_TASKS = frozenset({"self-attn", "cross-attn", "gqa", "causal"})
-CUTEDSL_DTYPES: tuple[torch.dtype, ...] = (torch.bfloat16, )
+CUTEDSL_COMPAT_TASKS = frozenset({"self-attn", "cross-attn", "gqa", "causal", "non-aligned"})
+CUTEDSL_DTYPES: tuple[torch.dtype, ...] = (torch.float16, torch.bfloat16)
 CUTEDSL_HEAD_DIM = 512
 CUTEDSL_OUTPUT_STEM = "ffpa_speedup_cutedsl"
 CUTEDSL_SECTION_LABEL = "CuTeDSL (SM90 D=512)"
@@ -218,6 +227,13 @@ def _parse_args() -> argparse.Namespace:
   parser.add_argument("--iters", type=int, default=10, help="Measured iterations used for timing.")
   parser.add_argument("--seed", type=int, default=42, help="RNG seed used by benchmark mode.")
   parser.add_argument(
+    "--dtype",
+    choices=["fp16", "bf16", "both"],
+    default="both",
+    help="Activation dtype to benchmark. 'both' (default) runs fp16+bf16; "
+    "fp16/bf16 narrows to that single dtype.",
+  )
+  parser.add_argument(
     "--norm",
     action="store_true",
     help="Enable pre-attention LayerNorm on q/k/v for both FFPA and SDPA paths.",
@@ -306,14 +322,22 @@ def _parse_tasks_arg(tasks_arg: list[str] | None) -> set[str] | None:
   return tasks
 
 
-def _active_plot_cases(tasks: set[str] | None, *, include_decode: bool = True) -> list[tuple[str, str]]:
+def _active_plot_cases(tasks: set[str] | None, *, kind: str = "speedup") -> list[tuple[str, str]]:
   """Return plot cases filtered by an optional task set.
 
   :param tasks: Optional selected case names.
-  :param include_decode: Whether ``decode-attn`` should be included.
+  :param kind: ``"speedup"`` (bar chart, omits non-aligned), ``"tflops"`` (TFLOPS
+      chart), or ``"all"`` (full case list used by the Markdown sort order).
   :return: Ordered plot case list.
   """
-  source = PLOT_CASES if include_decode else TFLOPS_PLOT_CASES
+  if kind == "speedup":
+    source = SPEEDUP_PLOT_CASES
+  elif kind == "tflops":
+    source = TFLOPS_PLOT_CASES
+  elif kind == "all":
+    source = PLOT_CASES
+  else:
+    raise ValueError(f"Unknown plot kind={kind!r}; choose 'speedup', 'tflops', or 'all'.")
   if tasks is None:
     return list(source)
   return [(case_name, label) for case_name, label in source if case_name in tasks]
@@ -560,6 +584,10 @@ def _aggregate_speedups(
 ) -> list[float] | None:
   """Aggregate per-dtype rows into the bar heights used by the plot.
 
+  Prefers the bf16 value when present so the bar chart compares against a
+  single canonical dtype; falls back to the max of remaining dtypes when bf16
+  is absent (e.g. ``--dtype fp16``).
+
   :param rows: Structured rows for one or both directions.
   :param direction: ``forward`` or ``backward``.
   :param plot_cases: Ordered cases to aggregate for plotting.
@@ -567,19 +595,24 @@ def _aggregate_speedups(
   """
   active_plot_cases = PLOT_CASES if plot_cases is None else plot_cases
   active_case_names = {case_name for case_name, _ in active_plot_cases}
-  case_to_speedups: dict[str, list[float]] = {case_name: [] for case_name, _ in active_plot_cases}
+  case_to_speedups: dict[str, dict[str, float]] = {case_name: {} for case_name, _ in active_plot_cases}
   for row in rows:
     if row["direction"] != direction:
       continue
     if row["case_name"] not in active_case_names:
       continue
-    case_to_speedups[row["case_name"]].append(float(row["speedup"]))
+    case_to_speedups[row["case_name"]][row["dtype"]] = float(row["speedup"])
   if not any(case_to_speedups.values()):
     return None
   values: list[float] = []
   for case_name, _ in active_plot_cases:
-    speeds = case_to_speedups[case_name]
-    values.append(float(np.amax(speeds)) if speeds else float("nan"))
+    dtyped = case_to_speedups[case_name]
+    if "bf16" in dtyped:
+      values.append(dtyped["bf16"])
+    elif dtyped:
+      values.append(float(np.amax(list(dtyped.values()))))
+    else:
+      values.append(float("nan"))
   return values
 
 
@@ -591,8 +624,9 @@ def _aggregate_metric(
 ) -> list[float] | None:
   """Aggregate one numeric metric per case for plotting.
 
-  The benchmark plots show one bar per case and direction, so rows across dtypes
-  are reduced to the maximum finite value for that case.
+  Prefers the bf16 value when present (single canonical dtype on the bar
+  chart); falls back to the max of remaining dtypes when bf16 is absent
+  (e.g. ``--dtype fp16``).
 
   :param rows: Structured rows for one or both directions.
   :param direction: ``forward`` or ``backward``.
@@ -602,7 +636,7 @@ def _aggregate_metric(
   """
   active_plot_cases = PLOT_CASES if plot_cases is None else plot_cases
   active_case_names = {case_name for case_name, _ in active_plot_cases}
-  case_to_values: dict[str, list[float]] = {case_name: [] for case_name, _ in active_plot_cases}
+  case_to_values: dict[str, dict[str, float]] = {case_name: {} for case_name, _ in active_plot_cases}
   for row in rows:
     if row["direction"] != direction:
       continue
@@ -611,13 +645,18 @@ def _aggregate_metric(
     value = row.get(metric_key)
     if value is None:
       continue
-    case_to_values[row["case_name"]].append(float(value))
+    case_to_values[row["case_name"]][row["dtype"]] = float(value)
   if not any(case_to_values.values()):
     return None
   values: list[float] = []
   for case_name, _ in active_plot_cases:
-    metric_values = case_to_values[case_name]
-    values.append(float(np.amax(metric_values)) if metric_values else float("nan"))
+    dtyped = case_to_values[case_name]
+    if "bf16" in dtyped:
+      values.append(dtyped["bf16"])
+    elif dtyped:
+      values.append(float(np.amax(list(dtyped.values()))))
+    else:
+      values.append(float("nan"))
   return values
 
 
@@ -1038,7 +1077,7 @@ def render_speedup_markdown(
   if cutedsl:
     lines.extend([
       "",
-      "Backend: CuTeDSL D=512 SM90 fast-path (bf16 only). "
+      "Backend: CuTeDSL D=512 SM90 fast-path (fp16/bf16 forward, bf16-only backward). "
       "TFLOPS reports the theoretical dominant attention GEMM throughput only; "
       "forward and backward are computed separately from the measured latency.",
     ])
@@ -1128,6 +1167,20 @@ def _benchmark_rows(
       ),
     )
   if args.backward:
+    bwd_dtypes = dtypes
+    if args.backward_backend == CUTEDSL_BACKEND and torch.float16 in bwd_dtypes:
+      filtered = tuple(d for d in bwd_dtypes if d != torch.float16)
+      if not filtered:
+        raise SystemExit(
+          "Selected --dtype fp16 with CuTeDSL backward, but CuTeDSL "
+          "backward only supports bf16. Use --dtype bf16/both or --no-bwd."
+        )
+      print(
+        "[cutedsl] Skipping fp16 backward: bf16-only (known fp16 dQ launch "
+        "failure in src/ffpa_attn/cutedsl/_interface.py).",
+        file=sys.stderr,
+      )
+      bwd_dtypes = filtered
     backward_rows = _decorate_rows(
       "backward",
       run_backward_examples(
@@ -1148,7 +1201,7 @@ def _benchmark_rows(
         iters=args.iters,
         print_results=True,
         tasks=tasks,
-        dtypes=dtypes,
+        dtypes=bwd_dtypes,
       ),
     )
   return forward_rows, backward_rows
@@ -1175,6 +1228,10 @@ def main() -> None:
   if is_cutedsl:
     tasks = _filter_cutedsl_tasks(tasks)
   dtypes = CUTEDSL_DTYPES if is_cutedsl else (torch.float16, torch.bfloat16)
+  if args.dtype == "fp16":
+    dtypes = tuple(d for d in dtypes if d == torch.float16)
+  elif args.dtype == "bf16":
+    dtypes = tuple(d for d in dtypes if d == torch.bfloat16)
 
   if not fallback and not args.forward and not args.backward:
     raise SystemExit("At least one direction must remain enabled. Use default settings, --no-fwd, or --no-bwd.")
@@ -1184,8 +1241,8 @@ def main() -> None:
   else:
     forward_rows, backward_rows = _benchmark_rows(args, tasks=tasks, dtypes=dtypes)
 
-  speedup_plot_cases = _active_plot_cases(tasks)
-  tflops_plot_cases = _active_plot_cases(tasks, include_decode=False)
+  speedup_plot_cases = _active_plot_cases(tasks, kind="speedup")
+  tflops_plot_cases = _active_plot_cases(tasks, kind="tflops")
 
   output_stem = _resolve_output_stem(
     args.save_path,
