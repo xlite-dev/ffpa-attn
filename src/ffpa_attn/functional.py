@@ -60,7 +60,7 @@ def _reserve_large_d_dropout_rng(
   k: torch.Tensor,
   dropout_p: float,
 ) -> torch.Tensor:
-  """Reserve SDPA-compatible Philox RNG state for large-D Triton dropout.
+  """Reserve SDPA-compatible Philox RNG state for large-D dropout.
 
   PyTorch efficient attention reserves one random number for every logical
   attention score ``[B, Hq, Nq, Nkv]`` and rounds the CUDA generator offset to
@@ -382,9 +382,8 @@ class FFPAAttnMeta:
       raise ValueError(f"ffpa_attn_func: dropout_p must be in [0, 1], got {dropout_p}")
     if dropout_p >= 1.0:
       raise ValueError("ffpa_attn_func: dropout_p=1.0 is not supported by SDPA fused kernels")
-    if dropout_p > 0.0 and query.size(-1) > 256:
-      if self.forward_backend != "triton":
-        raise NotImplementedError("ffpa_attn_func: large-D dropout requires forward_backend='triton'")
+    if dropout_p > 0.0 and query.size(-1) > 256 and self.forward_backend == "cutedsl":
+      raise NotImplementedError("ffpa_attn_func: large-D dropout is not supported by forward_backend='cutedsl'")
     if attn_mask is not None and is_causal:
       raise RuntimeError("ffpa_attn_func: explicit attn_mask should not be set when is_causal=True")
     if attn_mask is not None and attn_mask.dtype == torch.bool and attn_mask.requires_grad:
@@ -540,7 +539,7 @@ class _FFPAAttnFunc(torch.autograd.Function):
     ``ffpa_attn.aten`` / ``ffpa_attn.triton`` / ``ffpa_attn.cuda`` rather than
     inside :meth:`backward` itself.
 
-    Large-D Triton dropout stores SDPA-compatible Philox seed/offset metadata
+    Large-D dropout stores SDPA-compatible Philox seed/offset metadata
     and recomputes the attention dropout mask in backward.
   """
 
@@ -568,8 +567,7 @@ class _FFPAAttnFunc(torch.autograd.Function):
         meta.dropout_p,
       )
     elif meta.forward_backend == "cuda":
-      if meta.dropout_p > 0.0:
-        raise NotImplementedError("ffpa_attn_func: large-D dropout requires forward_backend='triton'")
+      rng_state = _reserve_large_d_dropout_rng(q, k, meta.dropout_p)
       cuda_forward_impl = _require_cuda_forward_impl()
       O, lse = cuda_forward_impl(
         q,
@@ -581,6 +579,9 @@ class _FFPAAttnFunc(torch.autograd.Function):
         meta.acc,
         int(meta.is_causal),
         meta.scale,
+        meta.dropout_p,
+        int(rng_state[0].item()) if rng_state.numel() else 0,
+        int(rng_state[1].item()) if rng_state.numel() else 0,
         0,
       )
     elif meta.forward_backend == "triton":
@@ -604,12 +605,11 @@ class _FFPAAttnFunc(torch.autograd.Function):
     else:
       raise ValueError(f"Unsupported forward_backend={meta.forward_backend!r};")
 
-    # NO rng_state or unused output from the FFPA CUDA forward / backward kernels
-    # due to no dropout, but we need to return something to keep the autograd contract
+    # NO unused output from the FFPA CUDA forward / backward kernels, but we
+    # need to return something to keep the autograd contract
     # consistent across backends. Return empty tensors on large-D paths since the
     # small-D path's backward expects tensors to be returned and saved.
     if head_dim > 256 and meta.forward_backend != "triton":
-      rng_state = torch.empty(0, dtype=torch.int64)
       unused = torch.empty(0, dtype=torch.uint8, device=q.device)
     elif head_dim > 256:
       unused = torch.empty(0, dtype=torch.uint8, device=q.device)

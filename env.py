@@ -474,15 +474,15 @@ class ENV(object):
     for d in headdims:
       lines.append(
         f"void ffpa_attn_fwd_fp16f16_d{d}(torch::Tensor Q, torch::Tensor K, "
-        f"torch::Tensor V, torch::Tensor O, torch::Tensor attn_bias, torch::Tensor softmax_lse, int stages, int causal, double softmax_scale, int tma);"
+        f"torch::Tensor V, torch::Tensor O, torch::Tensor attn_bias, torch::Tensor softmax_lse, int stages, int causal, double softmax_scale, double dropout_p, int64_t philox_seed, int64_t philox_offset, int tma);"
       )
       lines.append(
         f"void ffpa_attn_fwd_fp16f32_d{d}(torch::Tensor Q, torch::Tensor K, "
-        f"torch::Tensor V, torch::Tensor O, torch::Tensor attn_bias, torch::Tensor softmax_lse, int stages, int causal, double softmax_scale, int tma);"
+        f"torch::Tensor V, torch::Tensor O, torch::Tensor attn_bias, torch::Tensor softmax_lse, int stages, int causal, double softmax_scale, double dropout_p, int64_t philox_seed, int64_t philox_offset, int tma);"
       )
       lines.append(
         f"void ffpa_attn_fwd_bf16f32_d{d}(torch::Tensor Q, torch::Tensor K, "
-        f"torch::Tensor V, torch::Tensor O, torch::Tensor attn_bias, torch::Tensor softmax_lse, int stages, int causal, double softmax_scale, int tma);"
+        f"torch::Tensor V, torch::Tensor O, torch::Tensor attn_bias, torch::Tensor softmax_lse, int stages, int causal, double softmax_scale, double dropout_p, int64_t philox_seed, int64_t philox_offset, int tma);"
       )
     lines.append("")
     return "\n".join(lines)
@@ -507,7 +507,8 @@ class ENV(object):
     """
     call = (
       f"launch_ffpa_attn_fwd_template<{t_in}, {d}, {qk}, {pv}, "
-      "{S}>(Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale, tma);"
+      "{S}>(Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale, "
+      "dropout_p, philox_seed, philox_offset, tma);"
     )
     return (
       "#ifdef ENABLE_FFPA_ALL_STAGES\n"
@@ -610,6 +611,9 @@ class ENV(object):
       "    int stages,",
       "    int causal,",
       "    double softmax_scale,",
+      "    double dropout_p,",
+      "    int64_t philox_seed,",
+      "    int64_t philox_offset,",
       "    int tma) {",
     ]
     stage_body = cls._render_stage_body(d, t_in, "kMmaAccFloat32QK", "kMmaAccFloat32PV")
@@ -621,7 +625,8 @@ class ENV(object):
     def _cases(symbol_prefix: str) -> str:
       return "\n".join(
         f"    case {d}: {symbol_prefix}_d{d}"
-        "(Q, K, V, O, attn_bias, softmax_lse, stages, causal, softmax_scale, tma); break;" for d in headdims
+        "(Q, K, V, O, attn_bias, softmax_lse, stages, causal, softmax_scale, "
+        "dropout_p, philox_seed, philox_offset, tma); break;" for d in headdims
       )
 
     def _fn(name: str, symbol_prefix: str, torch_dtype: str) -> str:
@@ -636,6 +641,9 @@ class ENV(object):
         "    int stages,\n"
         "    int causal,\n"
         "    double softmax_scale,\n"
+        "    double dropout_p,\n"
+        "    int64_t philox_seed,\n"
+        "    int64_t philox_offset,\n"
         "    int tma) {\n"
         f"  CHECK_TORCH_TENSOR_DTYPE(Q, {torch_dtype})\n"
         f"  CHECK_TORCH_TENSOR_DTYPE(K, {torch_dtype})\n"

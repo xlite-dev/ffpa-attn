@@ -81,7 +81,7 @@ def _should_fallback_to_sdpa(
 
   * ``head_dim <= 256``
   * ``head_dim > 1024``
-  * ``dropout_p > 0.0`` when the large-D forward backend is not Triton
+  * ``dropout_p > 0.0`` when the large-D forward backend cannot support it
   * ``attn_mask is not None`` when the large-D forward backend cannot support it
   * ``8 <= Nq < 512``
   * ``Nk < 512``
@@ -123,8 +123,7 @@ def _should_fallback_to_sdpa(
   return any([
     D <= 256,
     D > 1024,
-    # dropout is only supported by triton backend for now.
-    dropout_p > 0.0 and forward_backend != "triton",
+    dropout_p > 0.0 and forward_backend == "cutedsl",
     (8 <= Nq < 512),
     Nkv < 512,
   ])
@@ -158,7 +157,7 @@ def ffpa_attn_func(
 
   Backward pass is supported via :class:`FFPAAttnFunc`. The public API falls
   back to SDPA for cases FFPA does not currently support directly (small-D,
-  ``D > 1024``, and non-Triton large-D dropout), and otherwise keeps the
+  ``D > 1024``, and unsupported large-D dropout), and otherwise keeps the
   existing FFPA forward plus SDPA/FFPA backward routing. Large-D Triton forward
   and backward support explicit additive ``attn_mask`` gradients.
   ``forward_backend`` only affects the large-D path.
@@ -177,8 +176,8 @@ def ffpa_attn_func(
       additive attention bias. Large-D Triton supports additive mask gradients.
       ``forward_backend='cutedsl'`` rejects any non-``None`` ``attn_mask``
       with ``NotImplementedError`` (no silent fallback).
-  :param dropout_p: Dropout probability. Large-D Triton implements SDPA-style
-      attention dropout; non-Triton large-D dropout routes to SDPA, except
+    :param dropout_p: Dropout probability. Large-D CUDA and Triton implement
+      SDPA-style attention dropout; unsupported backends route to SDPA, except
       that ``forward_backend='cutedsl'`` raises ``NotImplementedError`` for
       ``dropout_p > 0`` instead of falling back.
   :param is_causal: When ``True``, apply a causal attention mask so that

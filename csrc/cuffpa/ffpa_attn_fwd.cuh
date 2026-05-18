@@ -96,7 +96,9 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
                                    const int attn_bias_dtype, const long long attn_bias_stride_b,
                                    const long long attn_bias_stride_h,
                                    const long long attn_bias_stride_m,
-                                   const long long attn_bias_stride_n) {
+                                   const long long attn_bias_stride_n, const float dropout_p,
+                                   const unsigned long long philox_seed,
+                                   const unsigned long long philox_offset) {
   ffpa::prefill::check_large_d_compiling_states<
       kHeadDim, kMmaAtomM, kMmaAtomN, kMmaAtomK, kMmaTileSeqLenQ, kMmaTileSeqLenK, kMmaTileSeqLenP,
       kMmaTileHeadDimV, kValTileSeqLenQ, kValTileSeqLenK, kValTileSeqLenP, kValTileHeadDimV,
@@ -481,6 +483,11 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
     ffpa::prefill::sync_online_safe_softmax<kValTileSeqLenK, kMmaAccFloat32QK, kDataType>(
         &R_S[0][0][0], scale, &lane_row_max_new[0][0], &lane_row_sum_new[0][0],
         &lane_block_row_max_old[0][0], &lane_block_row_sum_old[0][0]);
+    if (dropout_p > 0.0f) {
+      ffpa::prefill::sync_apply_dropout_to_p<kValTileSeqLenK, kMmaAccFloat32QK, kDataType>(
+          &R_S[0][0][0], dropout_p, philox_seed, philox_offset, Nb_id, Nh_id, Nh, warp_QP, Br_base,
+          tile_K_seqlen * Bc, Nq, Nkv);
+    }
 
     // Wait V g2s stages ready.
     if constexpr (kStagePV > 1) {
@@ -1192,7 +1199,9 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
         const int Nq, const int Nkv, const int Nh, const int Nh_kv, const float scale, const int Tc,
         const int causal, const void* __restrict__ attn_bias, const int attn_bias_dtype,
         const long long attn_bias_stride_b, const long long attn_bias_stride_h,
-        const long long attn_bias_stride_m, const long long attn_bias_stride_n) {
+        const long long attn_bias_stride_m, const long long attn_bias_stride_n,
+        const float dropout_p, const unsigned long long philox_seed,
+        const unsigned long long philox_offset) {
   // NOTE: This kernel template is developed for small head dimensions (d <= 128),
   // namely, flash-attention-2. Always persist QKV for flash-attn, apply tiling at
   // the Attention level not the MMA level.
@@ -1482,6 +1491,11 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
     ffpa::prefill::sync_online_safe_softmax<kValTileSeqLenK, kMmaAccFloat32QK, kDataType>(
         &R_S[0][0][0], scale, &lane_row_max_new[0][0], &lane_row_sum_new[0][0],
         &lane_block_row_max_old[0][0], &lane_block_row_sum_old[0][0]);
+    if (dropout_p > 0.0f) {
+      ffpa::prefill::sync_apply_dropout_to_p<kValTileSeqLenK, kMmaAccFloat32QK, kDataType>(
+          &R_S[0][0][0], dropout_p, philox_seed, philox_offset, Nb_id, Nh_id, Nh, warp_QP, Br_base,
+          tile_K_seqlen * Bc, Nq, Nkv);
+    }
 
     // Wait V g2s ready.
     ffpa::cp_async::wait_group<0>();

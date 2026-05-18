@@ -23,7 +23,8 @@ _OP_NAMESPACE = "ffpa_attn"
 torch.library.define(
   f"{_OP_NAMESPACE}::_fwd_cuda",
   "(Tensor q, Tensor k, Tensor v, Tensor attn_bias, int stages, int acc, int causal, "
-  "float softmax_scale, int tma) -> (Tensor o, Tensor softmax_lse)",
+  "float softmax_scale, float dropout_p, int philox_seed, int philox_offset, int tma) "
+  "-> (Tensor o, Tensor softmax_lse)",
 )
 
 
@@ -37,6 +38,9 @@ def _fwd_cuda_torch_op(
   acc: int,
   causal: int,
   softmax_scale: float,
+  dropout_p: float,
+  philox_seed: int,
+  philox_offset: int,
   tma: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
   if _ffpa_attn_fwd_cuda is None:
@@ -66,6 +70,9 @@ def _fwd_cuda_torch_op(
     acc,
     causal,
     softmax_scale,
+    dropout_p,
+    philox_seed,
+    philox_offset,
     tma,
   )
   return O, softmax_lse
@@ -81,6 +88,9 @@ def _fwd_cuda_fake(
   acc: int,
   causal: int,
   softmax_scale: float,
+  dropout_p: float,
+  philox_seed: int,
+  philox_offset: int,
   tma: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
   seqlen_q_aligned = ((Q.size(2) + 7) // 8) * 8

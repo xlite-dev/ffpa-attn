@@ -537,7 +537,7 @@ def run_forward_examples(
         "Nkv": mask_n,
         "attn_mask": _make_broadcast_additive_attn_mask(mask_n, mask_n, dtype, seed),
       })
-    if forward_backend == "triton":
+    if forward_backend != "cutedsl":
       case_specs.extend([
         {
           "name": "dropout",

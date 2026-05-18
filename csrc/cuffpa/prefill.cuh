@@ -393,6 +393,148 @@ __device__ __forceinline__ float load_attn_bias_value(const void* attn_bias, con
   return reinterpret_cast<const float*>(attn_bias)[offset];
 }
 
+// Reproduce Triton's ``tl.randint4x`` Philox-4x32-10 counter transform.
+// The CUDA forward dropout path uses this exact round function so a logical
+// attention score consumes the same random uint32 as the Triton forward kernel
+// and PyTorch SDPA efficient attention. ``quad_offset`` addresses a group of
+// four consecutive random elements; the caller selects one lane from the
+// returned uint4.
+__device__ __forceinline__ uint4 philox4x32_10(const unsigned long long seed,
+                                               const unsigned long long quad_offset) {
+  constexpr unsigned int kKeyA = 0x9E3779B9U;
+  constexpr unsigned int kKeyB = 0xBB67AE85U;
+  constexpr unsigned int kRoundA = 0xD2511F53U;
+  constexpr unsigned int kRoundB = 0xCD9E8D57U;
+  uint4 counter = make_uint4(static_cast<unsigned int>(quad_offset),
+                             static_cast<unsigned int>(quad_offset >> 32), 0U, 0U);
+  unsigned int key0 = static_cast<unsigned int>(seed);
+  unsigned int key1 = static_cast<unsigned int>(seed >> 32);
+
+#pragma unroll
+  for (int round = 0; round < 10; ++round) {
+    const unsigned int old0 = counter.x;
+    const unsigned int old2 = counter.z;
+    counter.x = __umulhi(kRoundB, old2) ^ counter.y ^ key0;
+    counter.z = __umulhi(kRoundA, old0) ^ counter.w ^ key1;
+    counter.y = kRoundB * old2;
+    counter.w = kRoundA * old0;
+    key0 += kKeyA;
+    key1 += kKeyB;
+  }
+  return counter;
+}
+
+__device__ __forceinline__ unsigned int select_philox_lane(const uint4 values,
+                                                           const unsigned int lane) {
+  unsigned int value = values.x;
+  if (lane == 1U) {
+    value = values.y;
+  } else if (lane == 2U) {
+    value = values.z;
+  } else if (lane == 3U) {
+    value = values.w;
+  }
+  return value;
+}
+
+__device__ __forceinline__ float uniform_from_philox_uint(const unsigned int value) {
+  return (static_cast<float>(value) + 1.0f) * 2.3283064365386963e-10f;
+}
+
+// Convert one SDPA/Triton logical RNG element offset into a uniform value in
+// ``(0, 1]``. Triton maps ``element_offset`` to ``quad_offset = offset / 4``
+// plus a lane inside the uint4 returned by ``tl.randint4x``; mirroring that
+// mapping here keeps CUDA dropout masks bit-aligned with the Triton forward
+// kernel and SDPA when Python reserves the same Philox seed/offset range.
+__device__ __forceinline__ float curand_uniform_from_element_offset(
+    const unsigned long long seed, const unsigned long long element_offset) {
+  const uint4 values = philox4x32_10(seed, element_offset >> 2);
+  const unsigned int lane = static_cast<unsigned int>(element_offset & 3ULL);
+  return uniform_from_philox_uint(select_philox_lane(values, lane));
+}
+
+template <typename kDataType>
+__device__ __forceinline__ kDataType apply_dropout_uniform(const kDataType p, const float uniform,
+                                                           const float dropout_p,
+                                                           const float keep_scale) {
+  using Traits = DtypeTraits<kDataType>;
+  const float keep = (uniform > dropout_p) ? keep_scale : 0.0f;
+  return Traits::from_float(Traits::to_float(p) * keep);
+}
+
+template <typename kDataType>
+__device__ __forceinline__ void apply_dropout_pair(kDataType& p0, kDataType& p1, const bool valid0,
+                                                   const bool valid1,
+                                                   const unsigned long long element_offset0,
+                                                   const float dropout_p, const float keep_scale,
+                                                   const unsigned long long philox_seed) {
+  if (!(valid0 || valid1)) {
+    return;
+  }
+
+  const unsigned long long element_offset1 = element_offset0 + 1ULL;
+  const unsigned long long quad_offset0 = element_offset0 >> 2;
+  if (valid0 && valid1 && quad_offset0 == (element_offset1 >> 2)) {
+    const uint4 values = philox4x32_10(philox_seed, quad_offset0);
+    const unsigned int lane0 = static_cast<unsigned int>(element_offset0 & 3ULL);
+    p0 = apply_dropout_uniform(p0, uniform_from_philox_uint(select_philox_lane(values, lane0)),
+                               dropout_p, keep_scale);
+    p1 = apply_dropout_uniform(p1, uniform_from_philox_uint(select_philox_lane(values, lane0 + 1U)),
+                               dropout_p, keep_scale);
+    return;
+  }
+
+  if (valid0) {
+    p0 = apply_dropout_uniform(p0, curand_uniform_from_element_offset(philox_seed, element_offset0),
+                               dropout_p, keep_scale);
+  }
+  if (valid1) {
+    p1 = apply_dropout_uniform(p1, curand_uniform_from_element_offset(philox_seed, element_offset1),
+                               dropout_p, keep_scale);
+  }
+}
+
+// Apply attention dropout to the already-softmaxed P fragments before P@V.
+// RNG indexing follows the logical score tensor layout [B, Hq, Nq, Nkv]:
+// ``linear = ((b * Hq + h) * Nq + q) * Nkv + k``. This is the same element
+// order used by the Triton forward dropout kernel and by SDPA's fused kernels,
+// so with the seed/offset reserved in Python the CUDA path produces the same
+// dropout mask. Row max and LSE are intentionally left untouched because SDPA
+// applies dropout after softmax normalization.
+template <const int kValTileSeqLenK, const int kMmaAccFloat32, typename kDataType = __half>
+__device__ __forceinline__ void sync_apply_dropout_to_p(
+    uint32_t* R_S, const float dropout_p, const unsigned long long philox_seed,
+    const unsigned long long philox_offset, const int Nb_id, const int Nh_id, const int Nh,
+    const int warp_QP, const int Br_base, const int Bc_base, const int Nq, const int Nkv) {
+  const int lane_id = threadIdx.x % WARP_SIZE;
+  const int row_base = warp_QP * 16 + (lane_id / 4);
+  const int col_base = (lane_id % 4) * 2;
+  const int q0 = Br_base + row_base;
+  const int q8 = q0 + 8;
+  const float keep_scale = 1.0f / (1.0f - dropout_p);
+  const unsigned long long base =
+      (static_cast<unsigned long long>(Nb_id) * static_cast<unsigned long long>(Nh) +
+       static_cast<unsigned long long>(Nh_id)) *
+      static_cast<unsigned long long>(Nq) * static_cast<unsigned long long>(Nkv);
+
+#pragma unroll
+  for (int j = 0; j < kValTileSeqLenK; ++j) {
+    kDataType* t_hptr = reinterpret_cast<kDataType*>(R_S + j * (kMmaAccFloat32 ? 4 : 2));
+    const int k0 = Bc_base + j * 8 + col_base;
+    const int k1 = k0 + 1;
+    const unsigned long long row0_base =
+        base + static_cast<unsigned long long>(q0) * static_cast<unsigned long long>(Nkv);
+    const unsigned long long row8_base =
+        base + static_cast<unsigned long long>(q8) * static_cast<unsigned long long>(Nkv);
+    apply_dropout_pair(t_hptr[0], t_hptr[1], q0 < Nq && k0 < Nkv, q0 < Nq && k1 < Nkv,
+                       philox_offset + row0_base + static_cast<unsigned long long>(k0), dropout_p,
+                       keep_scale, philox_seed);
+    apply_dropout_pair(t_hptr[2], t_hptr[3], q8 < Nq && k0 < Nkv, q8 < Nq && k1 < Nkv,
+                       philox_offset + row8_base + static_cast<unsigned long long>(k0), dropout_p,
+                       keep_scale, philox_seed);
+  }
+}
+
 // Apply normalized additive attention bias to the raw QK accumulator
 // fragments before online softmax. Each lane owns two Q rows (q0/q8) and
 // two adjacent KV columns (k0/k1) per kValTileSeqLenK fragment, matching the

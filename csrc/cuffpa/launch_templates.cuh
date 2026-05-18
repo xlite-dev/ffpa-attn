@@ -315,6 +315,7 @@ template <typename kDataType, const int kHeadDim, const int kMmaAccFloat32QK,
 void launch_ffpa_attn_fwd_template(torch::Tensor Q, torch::Tensor K, torch::Tensor V,
                                    torch::Tensor O, torch::Tensor attn_bias,
                                    torch::Tensor softmax_lse, int causal, double softmax_scale,
+                                   double dropout_p, int64_t philox_seed, int64_t philox_offset,
                                    int tma) {
   (void)tma;
   // Q,K,V,O with [B, H, N, D] layout, B=batch, H=head, N=seqlen, D=dim
@@ -376,6 +377,7 @@ void launch_ffpa_attn_fwd_template(torch::Tensor Q, torch::Tensor K, torch::Tens
   const int Nq = Q.size(2);
   const int Nkv = K.size(2);
   const bool has_attn_bias = attn_bias.numel() != 0;
+  const bool has_dropout = dropout_p > 0.0;
   TORCH_CHECK(causal == 0 || !has_attn_bias,
               "ffpa_attn: explicit attn_mask should not be set when causal attention is enabled");
   const void* attn_bias_ptr = nullptr;
@@ -428,6 +430,9 @@ void launch_ffpa_attn_fwd_template(torch::Tensor Q, torch::Tensor K, torch::Tens
   const dim3 grid = getConfigGrid<Br>(Nb, Nh, Nq);
   const int Tc = utils::div_ceil(Nkv, Bc);  // Tc K_tile[Bc,d]
   const float scale = static_cast<float>(softmax_scale);
+  const float dropout_p_f = static_cast<float>(dropout_p);
+  const unsigned long long philox_seed_u = static_cast<unsigned long long>(philox_seed);
+  const unsigned long long philox_offset_u = static_cast<unsigned long long>(philox_offset);
   float* softmax_lse_ptr = softmax_lse.data_ptr<float>();
 
   // Launch on the caller's current CUDA stream so the kernel participates
@@ -440,7 +445,7 @@ void launch_ffpa_attn_fwd_template(torch::Tensor Q, torch::Tensor K, torch::Tens
     const int num_sms_x2 = max(1, at::cuda::getCurrentDeviceProperties()->multiProcessorCount * 2);
     const int num_splits = select_decode_num_splits(Nb * Nh * utils::div_ceil(Nq, 16), num_sms_x2,
                                                     Tc, 128, min(Nq, 16));
-    if (Nq == 1 && num_splits > 1 && !has_attn_bias) {
+    if (Nq == 1 && num_splits > 1 && !has_attn_bias && !has_dropout) {
       const int split_size = utils::div_ceil(Tc, num_splits) * Bc;
       auto scratch_options = torch::TensorOptions().dtype(torch::kFloat32).device(Q.device());
       auto partial_out = torch::empty({Nb, Nh, num_splits, Nq, kHeadDim}, scratch_options);
@@ -467,14 +472,15 @@ void launch_ffpa_attn_fwd_template(torch::Tensor Q, torch::Tensor K, torch::Tens
 
   const int smem_size_base = kQKVSmemMaxSize;
 
-#define LAUNCH_TEMPLATE_FUNC_BASE(TEMPLATE_FUNC)                                              \
-  cudaFuncSetAttribute(TEMPLATE_FUNC, cudaFuncAttributeMaxDynamicSharedMemorySize,            \
-                       smem_size_base);                                                       \
-  TEMPLATE_FUNC<<<grid, block, smem_size_base, stream>>>(                                     \
-      reinterpret_cast<kDataType*>(Q.data_ptr()), reinterpret_cast<kDataType*>(K.data_ptr()), \
-      reinterpret_cast<kDataType*>(V.data_ptr()), reinterpret_cast<kDataType*>(O.data_ptr()), \
-      softmax_lse_ptr, Nq, Nkv, Nh, Nh_kv, scale, Tc, causal, attn_bias_ptr, attn_bias_dtype, \
-      attn_bias_stride_b, attn_bias_stride_h, attn_bias_stride_m, attn_bias_stride_n);
+#define LAUNCH_TEMPLATE_FUNC_BASE(TEMPLATE_FUNC)                                                   \
+  cudaFuncSetAttribute(TEMPLATE_FUNC, cudaFuncAttributeMaxDynamicSharedMemorySize,                 \
+                       smem_size_base);                                                            \
+  TEMPLATE_FUNC<<<grid, block, smem_size_base, stream>>>(                                          \
+      reinterpret_cast<kDataType*>(Q.data_ptr()), reinterpret_cast<kDataType*>(K.data_ptr()),      \
+      reinterpret_cast<kDataType*>(V.data_ptr()), reinterpret_cast<kDataType*>(O.data_ptr()),      \
+      softmax_lse_ptr, Nq, Nkv, Nh, Nh_kv, scale, Tc, causal, attn_bias_ptr, attn_bias_dtype,      \
+      attn_bias_stride_b, attn_bias_stride_h, attn_bias_stride_m, attn_bias_stride_n, dropout_p_f, \
+      philox_seed_u, philox_offset_u);
 
   constexpr int kEffShareSmemQKV_LargeD = (kPersistQg2s) ? 0 : kShareSmemQKV;
   constexpr int kEffPersistQs2r_LargeD = (kPersistQg2s || kHeadDim > 256) ? 0 : kPersistQs2r;
