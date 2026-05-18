@@ -457,7 +457,7 @@ def lookup_bwd_sm90_persistent_config(
   autotune_mode: str,
   causal: bool,
   bias_grad: bool,
-  grad_v_storage_dtype: str | None,
+  grad_kv_storage_dtype: str | None,
   has_attn_bias: bool,
   has_dropout: bool,
   nheads_q: int,
@@ -476,7 +476,7 @@ def lookup_bwd_sm90_persistent_config(
       seqlen_k=seqlen_k,
       causal=causal,
       bias_grad=bias_grad,
-      grad_v_storage_dtype=grad_v_storage_dtype,
+      grad_kv_storage_dtype=grad_kv_storage_dtype,
       has_attn_bias=has_attn_bias,
       has_dropout=has_dropout,
       enable_tma=True,
@@ -543,7 +543,12 @@ def _ffpa_attn_backward_sm90_impl(
   use_key_bias_grad_reduction = _attn_bias_grad_is_key_bias(grad_attn_bias, seqlen_q, seqlen_k)
   has_dropout = dropout_p > 0.0
   runtime_dtype = dtype_name(q.dtype)
-  grad_v_storage_dtype = "fp32" if dv.dtype == torch.float32 else None
+  if dk.dtype == torch.float32 or dv.dtype == torch.float32:
+    grad_kv_storage_dtype = "fp32"
+  elif (dk.dtype == torch.float16 or dv.dtype == torch.float16) and q.dtype != torch.float16:
+    grad_kv_storage_dtype = "fp16"
+  else:
+    grad_kv_storage_dtype = None
   DTYPE = tl.float16 if q.dtype == torch.float16 else tl.bfloat16
   autotune_dtype_key = 1 if q.dtype == torch.bfloat16 else 0
 
@@ -705,7 +710,7 @@ def _ffpa_attn_backward_sm90_impl(
       autotune_mode=autotune_mode,
       causal=causal,
       bias_grad=bias_requires_grad,
-      grad_v_storage_dtype=grad_v_storage_dtype,
+      grad_kv_storage_dtype=grad_kv_storage_dtype,
       has_attn_bias=has_attn_bias,
       has_dropout=has_dropout,
       nheads_q=nheads,

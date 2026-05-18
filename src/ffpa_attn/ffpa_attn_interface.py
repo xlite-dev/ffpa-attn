@@ -199,16 +199,16 @@ def ffpa_attn_func(
       ``triton_autotune``, ``triton_autotune_mode``,
       ``backward_backend``,
       ``triton_backward_preprocess_d_chunk``, and
-      ``triton_backward_grad_v_storage_dtype``. ``forward_backend`` only affects ``D > 256``.
+      ``triton_backward_grad_kv_storage_dtype``. ``forward_backend`` only affects ``D > 256``.
       ``enable_forward_tma`` and ``enable_backward_tma`` independently opt
       into the SM90+ Triton descriptor/TMA forward and backward paths when
       supported. ``enable_forward_ws`` and ``enable_backward_ws`` request
       warp-specialized TMA configs for the matching direction. ``enable_tma``
       and ``enable_ws`` are compatibility aliases that set both directions.
       ``backward_backend`` supports ``"triton"`` and ``"sdpa"``.
-      ``triton_backward_grad_v_storage_dtype`` defaults to ``None`` and
-      currently only accepts ``torch.float32`` as an override for Triton
-      backward's internal ``DV`` storage dtype. These options do not change
+      ``triton_backward_grad_kv_storage_dtype`` defaults to ``None`` and
+      currently accepts ``torch.float16`` or ``torch.float32`` as overrides for Triton
+      backward's internal ``DK`` / ``DV`` storage dtype. These options do not change
       the autograd contract; unknown keys raise ``TypeError``.
 
   :returns: Output tensor ``O`` with layout ``[B, Nh_q, Nq, D]``,

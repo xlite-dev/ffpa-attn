@@ -247,8 +247,8 @@ def test_ffpa_bwd_triton_preprocess_modes(dtype, preprocess_d_chunk):
 
 
 @pytest.mark.parametrize("dtype", DTYPES, ids=["fp16", "bf16"])
-def test_ffpa_bwd_triton_internal_v_storage_dtype_option(dtype):
-  """The low-level Triton backward op should expose optional fp32 dV storage."""
+def test_ffpa_bwd_triton_internal_kv_storage_dtype_option(dtype):
+  """The low-level Triton backward op should expose optional fp16/fp32 dK/dV storage."""
   B, H, N, D = 1, 2, 128, 320
   torch.manual_seed(0)
   q = torch.randn(B, H, N, D, dtype=dtype, device="cuda")
@@ -292,6 +292,8 @@ def test_ffpa_bwd_triton_internal_v_storage_dtype_option(dtype):
     0.0,
     0,
     0,
+    0,
+    0,
   )
   dq_fp32, dk_fp32, dv_fp32, _ = torch.ops.ffpa_attn._bwd_triton(
     do,
@@ -312,19 +314,47 @@ def test_ffpa_bwd_triton_internal_v_storage_dtype_option(dtype):
     0.0,
     0,
     0,
+    0,
+    0,
+  )
+  dq_fp16, dk_fp16, dv_fp16, _ = torch.ops.ffpa_attn._bwd_triton(
+    do,
+    q,
+    k,
+    v,
+    o,
+    lse,
+    None,
+    scale,
+    0,
+    0,
+    0,
+    0,
+    0,
+    2,
+    H,
+    0.0,
+    0,
+    0,
+    0,
+    0,
   )
 
   assert dq_default.dtype == dtype
   assert dk_default.dtype == dtype
   assert dv_default.dtype == dtype
   assert dq_fp32.dtype == dtype
-  assert dk_fp32.dtype == dtype
+  assert dk_fp32.dtype == torch.float32
   assert dv_fp32.dtype == torch.float32
+  assert dq_fp16.dtype == dtype
+  assert dk_fp16.dtype == torch.float16
+  assert dv_fp16.dtype == torch.float16
 
 
 @pytest.mark.parametrize("dtype", DTYPES, ids=["fp16", "bf16"])
-def test_ffpa_bwd_triton_grad_v_storage_dtype_preserves_public_grad_dtype(dtype):
-  """Public gradients should stay in q/k/v dtype even when Triton dV storage is fp32."""
+@pytest.mark.parametrize("grad_kv_storage_dtype", [torch.float16, torch.float32], ids=["kv-fp16", "kv-fp32"])
+def test_ffpa_bwd_triton_grad_kv_storage_dtype_preserves_public_grad_dtype(dtype, grad_kv_storage_dtype):
+  """Public gradients should stay in q/k/v dtype even when Triton dK/dV storage dtype is overridden."""
   B, H, N, D = 1, 2, 128, 320
   torch.manual_seed(0)
   q = torch.randn(B, H, N, D, dtype=dtype, device="cuda", requires_grad=True)
@@ -340,7 +370,7 @@ def test_ffpa_bwd_triton_grad_v_storage_dtype_preserves_public_grad_dtype(dtype)
     scale=scale,
     acc="f32",
     backward_backend="triton",
-    triton_backward_grad_v_storage_dtype=torch.float32,
+    triton_backward_grad_kv_storage_dtype=grad_kv_storage_dtype,
   )
   out.sum().backward()
 
@@ -390,8 +420,8 @@ def test_ffpa_bwd_triton_additive_attn_mask_matches_sdpa():
   torch.testing.assert_close(attn_mask.grad, dmask_ref, atol=3e-2, rtol=3e-2)
 
 
-def test_ffpa_bwd_triton_key_bias_autotune_fp32_v_storage_matches_sdpa():
-  """Autotuned key-bias backward must keep dMask correct with fp32 dV storage."""
+def test_ffpa_bwd_triton_key_bias_autotune_fp32_kv_storage_matches_sdpa():
+  """Autotuned key-bias backward must keep dMask correct with fp32 dK/dV storage."""
   B, H, N, D = 1, 32, 8192, 512
   dtype = torch.float16
   torch.manual_seed(42)
@@ -411,7 +441,7 @@ def test_ffpa_bwd_triton_key_bias_autotune_fp32_v_storage_matches_sdpa():
     acc="f32",
     backward_backend="triton",
     triton_autotune=True,
-    triton_backward_grad_v_storage_dtype=torch.float32,
+    triton_backward_grad_kv_storage_dtype=torch.float32,
   )
   out.sum().backward()
 
@@ -558,8 +588,8 @@ def test_ffpa_bwd_triton_decode_autotune_matches_sdpa(Nq):
   torch.testing.assert_close(v.grad, dv_ref, atol=3e-2, rtol=3e-2)
 
 
-def test_ffpa_bwd_triton_decode_autotune_fp32_v_storage_matches_sdpa():
-  """Single-query decode autotune must keep dQ correct with fp32 dV storage."""
+def test_ffpa_bwd_triton_decode_autotune_fp32_kv_storage_matches_sdpa():
+  """Single-query decode autotune must keep dQ correct with fp32 dK/dV storage."""
   B, H, Nq, Nkv, D = 1, 32, 1, 8192, 512
   dtype = torch.float16
   torch.manual_seed(42)
@@ -577,7 +607,7 @@ def test_ffpa_bwd_triton_decode_autotune_fp32_v_storage_matches_sdpa():
     acc="f32",
     backward_backend="triton",
     triton_autotune=True,
-    triton_backward_grad_v_storage_dtype=torch.float32,
+    triton_backward_grad_kv_storage_dtype=torch.float32,
   )
   out.sum().backward()
 

@@ -35,17 +35,19 @@ from ffpa_attn_bwd import run_backward_examples
 from ffpa_attn_fwd import run_forward_examples
 
 
-def _parse_grad_v_dtype(arg: str) -> torch.dtype | None:
-  """Parse the CLI grad-v-dtype option.
+def _parse_grad_kv_dtype(arg: str) -> torch.dtype | None:
+  """Parse the CLI grad-kv-dtype option.
 
-  :param arg: CLI value, ``"none"`` or ``"fp32"``.
-  :return: ``None`` or ``torch.float32``.
+  :param arg: CLI value, ``"none"``, ``"fp16"``, or ``"fp32"``.
+  :return: ``None``, ``torch.float16``, or ``torch.float32``.
   """
   if arg == "none":
     return None
+  if arg == "fp16":
+    return torch.float16
   if arg == "fp32":
     return torch.float32
-  raise ValueError(f"Unsupported grad-v-dtype={arg!r}; choose 'none' or 'fp32'.")
+  raise ValueError(f"Unsupported grad-kv-dtype={arg!r}; choose 'none', 'fp16', or 'fp32'.")
 
 
 # Keep the exact legacy plotting style from tools/plot.py.
@@ -275,11 +277,11 @@ def _parse_args() -> argparse.Namespace:
     help="Force warp-specialized configs for the experimental SM90+ TMA backward path.",
   )
   parser.add_argument(
-    "--grad-v-storage-dtype",
-    "--grad-v-dtype",
-    choices=["none", "fp32"],
+    "--grad-kv-storage-dtype",
+    "--grad-kv-dtype",
+    choices=["none", "fp16", "fp32"],
     default="none",
-    help="Optional Triton backward dV storage dtype forwarded to the example runners.",
+    help="Optional Triton backward dK/dV storage dtype forwarded to the example runners.",
   )
   parser.add_argument(
     "--show-allclose",
@@ -1146,7 +1148,7 @@ def _benchmark_rows(
     raise SystemExit("CUDA is required when --forward or --backward is requested.")
 
   tune_mode = args.tune
-  grad_v_dtype = _parse_grad_v_dtype(args.grad_v_storage_dtype)
+  grad_kv_dtype = _parse_grad_kv_dtype(args.grad_kv_storage_dtype)
   forward_rows: list[RESULT_ROW] = []
   backward_rows: list[RESULT_ROW] = []
   if args.forward:
@@ -1162,7 +1164,7 @@ def _benchmark_rows(
         forward_backend=args.forward_backend,
         triton_autotune=args.forward_backend == "triton" and tune_mode is not None,
         triton_autotune_mode=tune_mode or "fast",
-        triton_backward_grad_v_storage_dtype=grad_v_dtype,
+        triton_backward_grad_kv_storage_dtype=grad_kv_dtype,
         warmup=args.warmup,
         iters=args.iters,
         print_results=True,
@@ -1200,7 +1202,7 @@ def _benchmark_rows(
         timing_mode="backward-only",
         triton_autotune=args.backward_backend == "triton" and tune_mode is not None,
         triton_autotune_mode=tune_mode or "fast",
-        triton_backward_grad_v_storage_dtype=grad_v_dtype,
+        triton_backward_grad_kv_storage_dtype=grad_kv_dtype,
         enable_tma=args.enable_bwd_tma,
         enable_ws=args.enable_bwd_ws,
         warmup=args.warmup,

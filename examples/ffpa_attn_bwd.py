@@ -36,17 +36,19 @@ MAX_MASK_GRAD_SEQLEN = 1024 * 16  # 16K, avoid OOM.
 BACKWARD_RESULT = dict[str, Any]
 
 
-def _parse_grad_v_dtype(arg: str) -> torch.dtype | None:
-  """Parse the CLI grad-v-dtype option.
+def _parse_grad_kv_dtype(arg: str) -> torch.dtype | None:
+  """Parse the CLI grad-kv-dtype option.
 
-  :param arg: CLI value, ``"none"`` or ``"fp32"``.
-  :return: ``None`` or ``torch.float32``.
+  :param arg: CLI value, ``"none"``, ``"fp16"``, or ``"fp32"``.
+  :return: ``None``, ``torch.float16``, or ``torch.float32``.
   """
   if arg == "none":
     return None
+  if arg == "fp16":
+    return torch.float16
   if arg == "fp32":
     return torch.float32
-  raise ValueError(f"Unsupported grad-v-dtype={arg!r}; choose 'none' or 'fp32'.")
+  raise ValueError(f"Unsupported grad-kv-dtype={arg!r}; choose 'none', 'fp16', or 'fp32'.")
 
 
 def _parse_args() -> argparse.Namespace:
@@ -97,11 +99,11 @@ def _parse_args() -> argparse.Namespace:
     help="Triton autotune search-space mode.",
   )
   parser.add_argument(
-    "--grad-v-storage-dtype",
-    "--grad-v-dtype",
-    choices=["none", "fp32"],
+    "--grad-kv-storage-dtype",
+    "--grad-kv-dtype",
+    choices=["none", "fp16", "fp32"],
     default="none",
-    help="Optional Triton backward dV storage dtype forwarded to ffpa_attn_func.",
+    help="Optional Triton backward dK/dV storage dtype forwarded to ffpa_attn_func.",
   )
   parser.add_argument(
     "--enable-tma",
@@ -129,11 +131,11 @@ def _parse_args() -> argparse.Namespace:
   if args.enable_ws:
     args.enable_bwd_ws = True
   if args.backward_backend == "cutedsl" and (
-    args.triton_autotune or args.enable_bwd_tma or args.enable_bwd_ws or args.grad_v_storage_dtype != "none"
+    args.triton_autotune or args.enable_bwd_tma or args.enable_bwd_ws or args.grad_kv_storage_dtype != "none"
   ):
     print(
       "[warn] --backward-backend=cutedsl ignores --triton-autotune / "
-      "--enable-bwd-tma / --enable-bwd-ws / --grad-v-storage-dtype."
+      "--enable-bwd-tma / --enable-bwd-ws / --grad-kv-storage-dtype."
     )
   return args
 
@@ -454,7 +456,7 @@ def _ffpa_forward(
   causal: bool = False,
   attn_mask: torch.Tensor | None = None,
   dropout_p: float = 0.0,
-  triton_backward_grad_v_storage_dtype: torch.dtype | None = None,
+  triton_backward_grad_kv_storage_dtype: torch.dtype | None = None,
   enable_tma: bool = False,
   enable_ws: bool = False,
 ) -> torch.Tensor:
@@ -471,7 +473,7 @@ def _ffpa_forward(
     backward_backend=backward_backend,
     triton_autotune=triton_autotune,
     triton_autotune_mode=triton_autotune_mode,
-    triton_backward_grad_v_storage_dtype=triton_backward_grad_v_storage_dtype,
+    triton_backward_grad_kv_storage_dtype=triton_backward_grad_kv_storage_dtype,
     enable_backward_tma=enable_tma,
     enable_backward_ws=enable_ws,
   )
@@ -505,7 +507,7 @@ def _run_ffpa_backward(
   causal: bool = False,
   attn_mask: torch.Tensor | None = None,
   dropout_p: float = 0.0,
-  triton_backward_grad_v_storage_dtype: torch.dtype | None = None,
+  triton_backward_grad_kv_storage_dtype: torch.dtype | None = None,
   enable_tma: bool = False,
   enable_ws: bool = False,
 ) -> None:
@@ -525,7 +527,7 @@ def _run_ffpa_backward(
     causal=causal,
     attn_mask=attn_mask,
     dropout_p=dropout_p,
-    triton_backward_grad_v_storage_dtype=triton_backward_grad_v_storage_dtype,
+    triton_backward_grad_kv_storage_dtype=triton_backward_grad_kv_storage_dtype,
     enable_backward_tma=enable_tma,
     enable_backward_ws=enable_ws,
   )
@@ -632,7 +634,7 @@ def _run_case(
   attn_mask: torch.Tensor | None = None,
   dropout_p: float = 0.0,
   timing_mode: str = "backward-only",
-  triton_backward_grad_v_storage_dtype: torch.dtype | None = None,
+  triton_backward_grad_kv_storage_dtype: torch.dtype | None = None,
   enable_tma: bool = False,
   enable_ws: bool = False,
   apply_norm: bool = False,
@@ -668,7 +670,7 @@ def _run_case(
     backward_backend=backward_backend,
     triton_autotune=triton_autotune,
     triton_autotune_mode=triton_autotune_mode,
-    triton_backward_grad_v_storage_dtype=triton_backward_grad_v_storage_dtype,
+    triton_backward_grad_kv_storage_dtype=triton_backward_grad_kv_storage_dtype,
     enable_backward_tma=enable_tma,
     enable_backward_ws=enable_ws,
   )
@@ -719,7 +721,7 @@ def _run_case(
         causal,
         active_attn_mask,
         dropout_p,
-        triton_backward_grad_v_storage_dtype,
+        triton_backward_grad_kv_storage_dtype,
         enable_tma,
         enable_ws,
       ),
@@ -762,7 +764,7 @@ def _run_case(
       causal,
       active_attn_mask,
       dropout_p,
-      triton_backward_grad_v_storage_dtype,
+      triton_backward_grad_kv_storage_dtype,
       enable_tma,
       enable_ws,
       warmup=warmup,
@@ -844,7 +846,7 @@ def run_backward_examples(
   timing_mode: str = "backward-only",
   triton_autotune: bool = False,
   triton_autotune_mode: str = "fast",
-  triton_backward_grad_v_storage_dtype: torch.dtype | None = None,
+  triton_backward_grad_kv_storage_dtype: torch.dtype | None = None,
   enable_tma: bool = False,
   enable_ws: bool = False,
   warmup: int = DEFAULT_WARMUP,
@@ -866,7 +868,7 @@ def run_backward_examples(
   :param timing_mode: Benchmark timing mode.
   :param triton_autotune: Whether to enable Triton runtime autotune.
   :param triton_autotune_mode: Triton autotune mode.
-  :param triton_backward_grad_v_storage_dtype: Optional Triton backward dV
+  :param triton_backward_grad_kv_storage_dtype: Optional Triton backward dK/dV
     storage dtype forwarded to ``ffpa_attn_func``.
   :param enable_tma: Whether to enable the SM90+ Triton descriptor/TMA
     backward path when supported.
@@ -897,7 +899,7 @@ def run_backward_examples(
     f"apply_norm={apply_norm}, "
     f"triton_autotune={triton_autotune}, "
     f"triton_autotune_mode={triton_autotune_mode}, "
-    f"triton_backward_grad_v_storage_dtype={triton_backward_grad_v_storage_dtype}, "
+    f"triton_backward_grad_kv_storage_dtype={triton_backward_grad_kv_storage_dtype}, "
     f"enable_bwd_tma={enable_tma}, enable_bwd_ws={enable_ws}, "
     f"timing_mode={timing_mode}, tasks={sorted(tasks) if tasks is not None else 'full'}, "
     f"warmup={warmup}, iters={iters}"
@@ -905,7 +907,7 @@ def run_backward_examples(
   if backward_backend == "cutedsl":
     print(
       "[cutedsl] backend constraints in effect: D=512 + bf16 + no mask/dropout; "
-      "forward auto-paired to cutedsl; triton-* / enable-bwd-tma|ws / grad-v-dtype are ignored."
+      "forward auto-paired to cutedsl; triton-* / enable-bwd-tma|ws / grad-kv-dtype are ignored."
     )
 
   mask_dropout_supported = backward_backend != "cutedsl"
@@ -998,7 +1000,7 @@ def run_backward_examples(
           attn_mask=case.get("attn_mask"),
           dropout_p=case.get("dropout_p", 0.0),
           timing_mode=timing_mode,
-          triton_backward_grad_v_storage_dtype=triton_backward_grad_v_storage_dtype,
+          triton_backward_grad_kv_storage_dtype=triton_backward_grad_kv_storage_dtype,
           enable_tma=enable_tma,
           enable_ws=enable_ws,
           apply_norm=apply_norm,
@@ -1017,7 +1019,7 @@ def main() -> None:
 
   if not torch.cuda.is_available():
     raise SystemExit("CUDA is required to run this example.")
-  grad_v_dtype = _parse_grad_v_dtype(args.grad_v_storage_dtype)
+  grad_kv_dtype = _parse_grad_kv_dtype(args.grad_kv_storage_dtype)
   run_backward_examples(
     B=args.B,
     N=args.N,
@@ -1029,7 +1031,7 @@ def main() -> None:
     timing_mode=args.timing_mode,
     triton_autotune=args.triton_autotune,
     triton_autotune_mode=args.triton_autotune_mode,
-    triton_backward_grad_v_storage_dtype=grad_v_dtype,
+    triton_backward_grad_kv_storage_dtype=grad_kv_dtype,
     enable_tma=args.enable_bwd_tma,
     enable_ws=args.enable_bwd_ws,
     warmup=args.warmup,

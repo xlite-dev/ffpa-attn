@@ -46,7 +46,7 @@ _FFPA_ATTN_IMPL_DEFAULTS: dict[str, object] = {
   "triton_autotune_mode": "fast",
   "backward_backend": "triton",
   "triton_backward_preprocess_d_chunk": False,
-  "triton_backward_grad_v_storage_dtype": None,
+  "triton_backward_grad_kv_storage_dtype": None,
 }
 
 _CUDA_BACKEND_LOADED = False
@@ -234,9 +234,9 @@ class FFPAAttnMeta:
   :param backward_backend: Backward backend name. ``"sdpa"`` or ``"triton"``.
   :param triton_backward_preprocess_d_chunk: Whether Triton backward should
     compute delta with the split-D preprocess kernel.
-  :param triton_backward_grad_v_storage_dtype: Optional storage dtype for
-    Triton backward ``DV`` buffer. ``None`` keeps v dtype; currently only
-    ``torch.float32`` is accepted as an override.
+  :param triton_backward_grad_kv_storage_dtype: Optional storage dtype for
+    Triton backward ``DK`` / ``DV`` buffers. ``None`` keeps k/v dtype;
+    currently ``torch.float16`` and ``torch.float32`` are accepted as overrides.
   """
 
   is_causal: bool
@@ -255,7 +255,7 @@ class FFPAAttnMeta:
   triton_autotune_mode: str
   backward_backend: str
   triton_backward_preprocess_d_chunk: bool
-  triton_backward_grad_v_storage_dtype: torch.dtype | None
+  triton_backward_grad_kv_storage_dtype: torch.dtype | None
 
   @classmethod
   def from_kwargs(cls, **kwargs: object) -> FFPAAttnMeta:
@@ -296,7 +296,7 @@ class FFPAAttnMeta:
     triton_autotune_mode = str(impl_options["triton_autotune_mode"])
     backward_backend = str(impl_options["backward_backend"])
     triton_backward_preprocess_d_chunk = bool(impl_options["triton_backward_preprocess_d_chunk"])
-    triton_backward_grad_v_storage_dtype = impl_options["triton_backward_grad_v_storage_dtype"]
+    triton_backward_grad_kv_storage_dtype = impl_options["triton_backward_grad_kv_storage_dtype"]
 
     assert forward_backend in ("cuda", "triton", "cutedsl"), \
       f"Unsupported forward_backend={forward_backend!r}; choose 'cuda', 'triton', or 'cutedsl'."
@@ -320,10 +320,10 @@ class FFPAAttnMeta:
       )
     assert triton_autotune_mode in ("fast", "max"), \
       f"Unsupported triton_autotune_mode={triton_autotune_mode!r}; choose 'fast' or 'max'."
-    if triton_backward_grad_v_storage_dtype not in (None, torch.float32):
+    if triton_backward_grad_kv_storage_dtype not in (None, torch.float16, torch.float32):
       raise ValueError(
-        "triton_backward_grad_v_storage_dtype must be None or torch.float32, "
-        f"got {triton_backward_grad_v_storage_dtype!r}"
+        "triton_backward_grad_kv_storage_dtype must be None, torch.float16, or torch.float32, "
+        f"got {triton_backward_grad_kv_storage_dtype!r}"
       )
 
     if acc_str == "f32":
@@ -353,7 +353,7 @@ class FFPAAttnMeta:
       triton_autotune_mode=triton_autotune_mode,
       backward_backend=backward_backend,
       triton_backward_preprocess_d_chunk=triton_backward_preprocess_d_chunk,
-      triton_backward_grad_v_storage_dtype=triton_backward_grad_v_storage_dtype,
+      triton_backward_grad_kv_storage_dtype=triton_backward_grad_kv_storage_dtype,
     )
 
   def normalize(
@@ -652,7 +652,7 @@ class _FFPAAttnFunc(torch.autograd.Function):
           preprocess_d_chunk=meta.triton_backward_preprocess_d_chunk,
           attn_bias=attn_bias,
           return_attn_bias_grad=ctx.needs_input_grad[3],
-          grad_v_storage_dtype=meta.triton_backward_grad_v_storage_dtype,
+          grad_kv_storage_dtype=meta.triton_backward_grad_kv_storage_dtype,
           dropout_p=meta.dropout_p,
           philox_seed=int(rng_state[0].item()) if rng_state.numel() else 0,
           philox_offset=int(rng_state[1].item()) if rng_state.numel() else 0,

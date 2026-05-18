@@ -118,7 +118,7 @@ class PersistentConfigRequest:
   :param causal: Whether the attention is causal.
   :param preprocess_d_chunk: Backward preprocess D-chunk mode.
   :param bias_grad: Whether the current backward call writes attention-bias gradients.
-  :param grad_v_storage_dtype: Optional Triton backward dV storage dtype name.
+  :param grad_kv_storage_dtype: Optional Triton backward dK/dV storage dtype name.
   :param use_gemv: Decode backward single-query specialization flag.
   :param has_attn_bias: Whether an additive attention bias is active.
   :param has_dropout: Whether dropout is active.
@@ -144,7 +144,7 @@ class PersistentConfigRequest:
   causal: bool | None = None
   preprocess_d_chunk: bool | None = None
   bias_grad: bool | None = None
-  grad_v_storage_dtype: str | None = None
+  grad_kv_storage_dtype: str | None = None
   use_gemv: bool | None = None
   has_attn_bias: bool | None = None
   has_dropout: bool | None = None
@@ -466,9 +466,10 @@ def _lookup_persistent_config_cached(
       continue
     if request.bias_grad is not None and bool(entry.get("bias_grad", False)) != request.bias_grad:
       continue
-    if request.grad_v_storage_dtype is not None and entry.get("grad_v_storage_dtype") != request.grad_v_storage_dtype:
+    entry_grad_kv_storage_dtype = entry.get("grad_kv_storage_dtype", entry.get("grad_v_storage_dtype"))
+    if request.grad_kv_storage_dtype is not None and entry_grad_kv_storage_dtype != request.grad_kv_storage_dtype:
       continue
-    if request.grad_v_storage_dtype is None and entry.get("grad_v_storage_dtype") is not None:
+    if request.grad_kv_storage_dtype is None and entry_grad_kv_storage_dtype is not None:
       continue
     if request.use_gemv is not None and bool(entry.get("use_gemv", False)) != request.use_gemv:
       continue

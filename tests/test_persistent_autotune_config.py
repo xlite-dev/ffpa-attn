@@ -530,7 +530,7 @@ def test_lookup_backward_filters_variants(tmp_path, monkeypatch):
         "seqlen_q": 1024,
         "seqlen_k": 1024,
         "bias_grad": False,
-        "grad_v_storage_dtype": None,
+        "grad_kv_storage_dtype": None,
         "has_dropout": False,
         "config": {
           "BLOCK_M": 64,
@@ -550,7 +550,7 @@ def test_lookup_backward_filters_variants(tmp_path, monkeypatch):
         "seqlen_q": 1024,
         "seqlen_k": 1024,
         "bias_grad": True,
-        "grad_v_storage_dtype": None,
+        "grad_kv_storage_dtype": None,
         "has_dropout": False,
         "config": {
           "BLOCK_M": 128,
@@ -574,7 +574,7 @@ def test_lookup_backward_filters_variants(tmp_path, monkeypatch):
     seqlen_k=1024,
     causal=True,
     bias_grad=False,
-    grad_v_storage_dtype=None,
+    grad_kv_storage_dtype=None,
     has_dropout=False,
   )
   assert persistent.lookup_persistent_config(request)["BLOCK_HEADDIM"] == 128
@@ -596,7 +596,7 @@ def test_lookup_sm90_backward_preserves_tma_config_and_flags(tmp_path, monkeypat
     "seqlen_q": 4096,
     "seqlen_k": 4096,
     "bias_grad": False,
-    "grad_v_storage_dtype": None,
+    "grad_kv_storage_dtype": None,
     "has_attn_bias": False,
     "has_dropout": False,
     "enable_tma": True,
@@ -644,7 +644,7 @@ def test_lookup_sm90_backward_preserves_tma_config_and_flags(tmp_path, monkeypat
       seqlen_k=4096,
       causal=False,
       bias_grad=False,
-      grad_v_storage_dtype=None,
+      grad_kv_storage_dtype=None,
       has_attn_bias=False,
       has_dropout=False,
       enable_tma=True,
@@ -672,7 +672,7 @@ def test_lookup_sm90_backward_preserves_tma_config_and_flags(tmp_path, monkeypat
       seqlen_k=4096,
       causal=False,
       bias_grad=False,
-      grad_v_storage_dtype=None,
+      grad_kv_storage_dtype=None,
       has_attn_bias=False,
       has_dropout=False,
       enable_tma=True,
