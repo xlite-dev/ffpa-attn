@@ -284,11 +284,11 @@ def _gen_pre_autotune_configs(d_chunk: bool, autotune_mode: str = "max") -> list
       expanded max search.
   :return: Triton autotune configurations for the delta preprocess kernel.
   """
-  _ = autotune_mode
   configs = []
-  for block_m in [64, 128, 256]:
+  for block_m in [64, 128]:
+    # fast: 2*1 = 2 configs; max: 2*2 = 4 configs
     if not d_chunk:
-      for num_warps in [4, 8]:
+      for num_warps in ([4] if autotune_mode == "fast" else [4, 8]):
         configs.append(triton.Config(
           {
             "BLOCK_M": block_m,
@@ -298,8 +298,9 @@ def _gen_pre_autotune_configs(d_chunk: bool, autotune_mode: str = "max") -> list
         ))
       continue
 
+    # fast: 2*2*1 = 4 configs; max: 2*2*2 = 8 configs
     for block_headdim in [64, 128]:
-      for num_warps in [4, 8]:
+      for num_warps in ([4] if autotune_mode == "fast" else [4, 8]):
         configs.append(
           triton.Config(
             {
