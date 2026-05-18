@@ -484,7 +484,7 @@ def run_forward_examples(
   if forward_backend == "cutedsl":
     print(
       "[cutedsl] backend constraints in effect: D=512 only, fp16/bf16 forward, "
-      "no attn_mask / dropout / non-aligned cases (auto-skipped); "
+      "no attn_mask / dropout cases (auto-skipped); "
       "triton-* / enable-fwd-tma|ws options are ignored."
     )
 
@@ -547,14 +547,13 @@ def run_forward_examples(
           "dropout_p": dropout_p,
         },
       ])
-    if forward_backend != "cutedsl":
-      case_specs.append({
-        "name": "non-aligned",
-        "Nh_q": non_aligned_heads,
-        "Nh_kv": non_aligned_heads,
-        "Nq": N - 1 if N > 1 else N,
-        "Nkv": N - 1 if N > 1 else N,
-      })
+    case_specs.append({
+      "name": "non-aligned",
+      "Nh_q": non_aligned_heads,
+      "Nh_kv": non_aligned_heads,
+      "Nq": N - 1 if N > 1 else N,
+      "Nkv": N - 1 if N > 1 else N,
+    })
     if tasks is not None:
       case_specs = [case for case in case_specs if case["name"] in tasks]
 

@@ -904,12 +904,11 @@ def run_backward_examples(
   )
   if backward_backend == "cutedsl":
     print(
-      "[cutedsl] backend constraints in effect: D=512 + bf16 + no mask/dropout/non-aligned; "
+      "[cutedsl] backend constraints in effect: D=512 + bf16 + no mask/dropout; "
       "forward auto-paired to cutedsl; triton-* / enable-bwd-tma|ws / grad-v-dtype are ignored."
     )
 
   mask_dropout_supported = backward_backend != "cutedsl"
-  non_aligned_supported = backward_backend != "cutedsl"
 
   for dtype in dtypes:
     mask_n = max(N, 512)
@@ -970,14 +969,13 @@ def run_backward_examples(
           "dropout_p": dropout_p,
         },
       ])
-    if non_aligned_supported:
-      case_specs.append({
-        "name": "non-aligned",
-        "Nh_q": non_aligned_heads,
-        "Nh_kv": non_aligned_heads,
-        "Nq": N - 1 if N > 1 else N,
-        "Nkv": N - 1 if N > 1 else N,
-      })
+    case_specs.append({
+      "name": "non-aligned",
+      "Nh_q": non_aligned_heads,
+      "Nh_kv": non_aligned_heads,
+      "Nq": N - 1 if N > 1 else N,
+      "Nkv": N - 1 if N > 1 else N,
+    })
     if tasks is not None:
       case_specs = [case for case in case_specs if case["name"] in tasks]
 
