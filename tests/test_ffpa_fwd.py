@@ -66,7 +66,6 @@ def _is_sdpa_fallback_shape(q, k, *, attn_mask=None, dropout_p=0.0, forward_back
     D <= 256,
     D > 1024,
     dropout_p > 0.0 and forward_backend != "triton",
-    attn_mask is not None and forward_backend != "triton",
     8 <= Nq < 512,
     Nkv < 512,
   ])
@@ -213,6 +212,50 @@ def test_ffpa_attn_func_triton_additive_attn_mask_matches_sdpa():
   torch.testing.assert_close(out, ref, **_tolerance(torch.float16))
 
 
+@pytest.mark.parametrize("dtype", DTYPES, ids=["fp16", "bf16"])
+@pytest.mark.parametrize("D", [320, 512])
+@pytest.mark.parametrize("mask_kind", ["bool_2d", "additive_broadcast"])
+def test_ffpa_attn_func_cuda_attn_mask_matches_sdpa(dtype, D, mask_kind):
+  _require_cuda_forward_impl()
+  q, k, v = _alloc_qkv(1, 4, 512, D, dtype)
+  if mask_kind == "bool_2d":
+    attn_mask = torch.ones(q.size(2), k.size(2), dtype=torch.bool, device=q.device)
+    attn_mask[:, 3::7] = False
+    attn_mask[:, 0] = True
+  else:
+    torch.manual_seed(1)
+    attn_mask = torch.randn(1, 1, 1, k.size(2), device=q.device, dtype=dtype) * 0.25
+
+  out = ffpa_attn_func(q, k, v, attn_mask=attn_mask, stages=2, acc="f32", forward_backend="cuda")
+  ref = _sdpa_ref(q, k, v, attn_mask=attn_mask)
+  torch.testing.assert_close(out, ref, **_tolerance(dtype))
+
+
+def test_ffpa_attn_func_cuda_attn_mask_cross_gqa_matches_sdpa():
+  _require_cuda_forward_impl()
+  dtype = torch.float16
+  B, Nh_q, Nh_kv, Nq, Nkv, D = 1, 4, 2, 512, 768, 320
+  torch.manual_seed(0)
+  q = torch.randn(B, Nh_q, Nq, D, dtype=dtype, device="cuda")
+  k = torch.randn(B, Nh_kv, Nkv, D, dtype=dtype, device="cuda")
+  v = torch.randn(B, Nh_kv, Nkv, D, dtype=dtype, device="cuda")
+  torch.manual_seed(1)
+  attn_mask = torch.randn(1, 1, Nq, Nkv, device=q.device, dtype=dtype) * 0.125
+
+  out = ffpa_attn_func(
+    q,
+    k,
+    v,
+    attn_mask=attn_mask,
+    stages=2,
+    acc="f32",
+    forward_backend="cuda",
+    enable_gqa=True,
+  )
+  ref = _sdpa_fallback(q, k, v, attn_mask=attn_mask, scale=1.0 / math.sqrt(D), enable_gqa=True)
+  torch.testing.assert_close(out, ref, **_tolerance(dtype))
+
+
 def test_ffpa_attn_func_triton_dropout_matches_sdpa():
   q, k, v = _alloc_qkv(1, 2, 512, 512, torch.float16)
 
@@ -287,8 +330,8 @@ def test_ffpa_attn_func_large_d_keeps_selected_backend(monkeypatch, forward_back
   q, k, v = _alloc_qkv(1, 4, 512, 320, torch.float16)
   called = {"cuda": 0, "triton": 0}
 
-  def _fake_cuda(q_in, k_in, v_in, o_in, stages, acc, causal, softmax_scale, tma):
-    del o_in, stages, acc, causal, softmax_scale, tma
+  def _fake_cuda(q_in, k_in, v_in, o_in, attn_bias, stages, acc, causal, softmax_scale, tma):
+    del o_in, attn_bias, stages, acc, causal, softmax_scale, tma
     called["cuda"] += 1
     out = q_in + k_in + v_in
     lse = torch.zeros(q_in.size(0), q_in.size(1), q_in.size(2), device=q_in.device)

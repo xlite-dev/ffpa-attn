@@ -576,6 +576,7 @@ class _FFPAAttnFunc(torch.autograd.Function):
         k,
         v,
         O,
+        attn_bias,
         meta.stages,
         meta.acc,
         int(meta.is_causal),

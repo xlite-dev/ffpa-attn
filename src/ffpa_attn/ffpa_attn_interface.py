@@ -82,7 +82,7 @@ def _should_fallback_to_sdpa(
   * ``head_dim <= 256``
   * ``head_dim > 1024``
   * ``dropout_p > 0.0`` when the large-D forward backend is not Triton
-  * ``attn_mask is not None`` when the large-D forward backend is not Triton
+  * ``attn_mask is not None`` when the large-D forward backend cannot support it
   * ``8 <= Nq < 512``
   * ``Nk < 512``
   * ``forward_backend == 'cutedsl'`` and ``head_dim != 512`` (hardware
@@ -125,8 +125,6 @@ def _should_fallback_to_sdpa(
     D > 1024,
     # dropout is only supported by triton backend for now.
     dropout_p > 0.0 and forward_backend != "triton",
-    # attn_mask is only supported by triton backend for now.
-    attn_mask is not None and forward_backend != "triton",
     (8 <= Nq < 512),
     Nkv < 512,
   ])

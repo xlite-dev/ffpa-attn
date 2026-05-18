@@ -313,8 +313,9 @@ static constexpr int getConfigQKVSmemMaxSize() {
 template <typename kDataType, const int kHeadDim, const int kMmaAccFloat32QK,
           const int kMmaAccFloat32PV, const int kStage>
 void launch_ffpa_attn_fwd_template(torch::Tensor Q, torch::Tensor K, torch::Tensor V,
-                                   torch::Tensor O, torch::Tensor softmax_lse, int causal,
-                                   double softmax_scale, int tma) {
+                                   torch::Tensor O, torch::Tensor attn_bias,
+                                   torch::Tensor softmax_lse, int causal, double softmax_scale,
+                                   int tma) {
   (void)tma;
   // Q,K,V,O with [B, H, N, D] layout, B=batch, H=head, N=seqlen, D=dim
   // TODO: support BNHD layout, Q,K,V,O with [B, N, H, D] layout.
@@ -374,6 +375,49 @@ void launch_ffpa_attn_fwd_template(torch::Tensor Q, torch::Tensor K, torch::Tens
   // Cross-attention: Q seqlen (Nq) may differ from KV seqlen (Nkv).
   const int Nq = Q.size(2);
   const int Nkv = K.size(2);
+  const bool has_attn_bias = attn_bias.numel() != 0;
+  TORCH_CHECK(causal == 0 || !has_attn_bias,
+              "ffpa_attn: explicit attn_mask should not be set when causal attention is enabled");
+  const void* attn_bias_ptr = nullptr;
+  int attn_bias_dtype = 0;
+  long long attn_bias_stride_b = 0;
+  long long attn_bias_stride_h = 0;
+  long long attn_bias_stride_m = 0;
+  long long attn_bias_stride_n = 0;
+  if (has_attn_bias) {
+    TORCH_CHECK(attn_bias.is_cuda(), "ffpa_attn: attn_mask must be a CUDA tensor");
+    TORCH_CHECK(attn_bias.device() == Q.device(),
+                "ffpa_attn: attn_mask must be on the same device as Q/K/V");
+    TORCH_CHECK(attn_bias.dim() == 4,
+                "ffpa_attn: normalized attn_mask must be 4-D [B, Nh_q, Nq, Nkv]");
+    TORCH_CHECK(attn_bias.size(0) == 1 || attn_bias.size(0) == Nb,
+                "ffpa_attn: attn_mask batch dimension must be 1 or B");
+    TORCH_CHECK(attn_bias.size(1) == 1 || attn_bias.size(1) == Nh,
+                "ffpa_attn: attn_mask head dimension must be 1 or Nh_q");
+    TORCH_CHECK(attn_bias.size(2) == 1 || attn_bias.size(2) == Nq,
+                "ffpa_attn: attn_mask query dimension must be 1 or Nq");
+    TORCH_CHECK(attn_bias.size(3) == 1 || attn_bias.size(3) == Nkv,
+                "ffpa_attn: attn_mask key dimension must be 1 or Nkv");
+    TORCH_CHECK(attn_bias.stride(3) == 1,
+                "ffpa_attn: normalized attn_mask must be contiguous along the key dimension");
+    const auto bias_type = attn_bias.scalar_type();
+    if (bias_type == torch::kHalf) {
+      attn_bias_dtype = 1;
+    } else if (bias_type == torch::kBFloat16) {
+      attn_bias_dtype = 2;
+    } else if (bias_type == torch::kFloat32) {
+      attn_bias_dtype = 3;
+    } else {
+      TORCH_CHECK(false, "ffpa_attn: attn_mask dtype must be fp16, bf16, or fp32");
+    }
+    TORCH_CHECK(bias_type == torch::kFloat32 || bias_type == Q.scalar_type(),
+                "ffpa_attn: attn_mask dtype must be fp32 or match Q dtype");
+    attn_bias_ptr = attn_bias.data_ptr();
+    attn_bias_stride_b = (attn_bias.size(0) == 1 && Nb > 1) ? 0 : attn_bias.stride(0);
+    attn_bias_stride_h = (attn_bias.size(1) == 1 && Nh > 1) ? 0 : attn_bias.stride(1);
+    attn_bias_stride_m = (attn_bias.size(2) == 1 && Nq > 1) ? 0 : attn_bias.stride(2);
+    attn_bias_stride_n = (attn_bias.size(3) == 1 && Nkv > 1) ? 0 : attn_bias.stride(3);
+  }
   // Seqlen (Nq, Nkv) no longer has to be a multiple of max(Br, Bc): the
   // kernel handles the tail tile via cp.async zero-fill, softmax -inf
   // masking and a per-row store predicate. div_ceil(Nkv, Bc) below still
@@ -396,7 +440,7 @@ void launch_ffpa_attn_fwd_template(torch::Tensor Q, torch::Tensor K, torch::Tens
     const int num_sms_x2 = max(1, at::cuda::getCurrentDeviceProperties()->multiProcessorCount * 2);
     const int num_splits = select_decode_num_splits(Nb * Nh * utils::div_ceil(Nq, 16), num_sms_x2,
                                                     Tc, 128, min(Nq, 16));
-    if (Nq == 1 && num_splits > 1) {
+    if (Nq == 1 && num_splits > 1 && !has_attn_bias) {
       const int split_size = utils::div_ceil(Tc, num_splits) * Bc;
       auto scratch_options = torch::TensorOptions().dtype(torch::kFloat32).device(Q.device());
       auto partial_out = torch::empty({Nb, Nh, num_splits, Nq, kHeadDim}, scratch_options);
@@ -429,7 +473,8 @@ void launch_ffpa_attn_fwd_template(torch::Tensor Q, torch::Tensor K, torch::Tens
   TEMPLATE_FUNC<<<grid, block, smem_size_base, stream>>>(                                     \
       reinterpret_cast<kDataType*>(Q.data_ptr()), reinterpret_cast<kDataType*>(K.data_ptr()), \
       reinterpret_cast<kDataType*>(V.data_ptr()), reinterpret_cast<kDataType*>(O.data_ptr()), \
-      softmax_lse_ptr, Nq, Nkv, Nh, Nh_kv, scale, Tc, causal);
+      softmax_lse_ptr, Nq, Nkv, Nh, Nh_kv, scale, Tc, causal, attn_bias_ptr, attn_bias_dtype, \
+      attn_bias_stride_b, attn_bias_stride_h, attn_bias_stride_m, attn_bias_stride_n);
 
   constexpr int kEffShareSmemQKV_LargeD = (kPersistQg2s) ? 0 : kShareSmemQKV;
   constexpr int kEffPersistQs2r_LargeD = (kPersistQg2s || kHeadDim > 256) ? 0 : kPersistQs2r;

@@ -8,6 +8,7 @@ def _ffpa_attn_forward_cuda(
   K: torch.Tensor,
   V: torch.Tensor,
   O: torch.Tensor | None = None,
+  attn_bias: torch.Tensor | None = None,
   stages: int = 2,
   acc: int = 1,
   causal: int = 0,
@@ -25,10 +26,13 @@ def _ffpa_attn_forward_cuda(
   """
   del O
   del tma
+  if attn_bias is None:
+    attn_bias = Q.new_empty((0, ))
   O_storage, softmax_lse_storage = torch.ops.ffpa_attn._fwd_cuda(
     Q,
     K,
     V,
+    attn_bias,
     stages,
     acc,
     causal,

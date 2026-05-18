@@ -527,17 +527,18 @@ def run_forward_examples(
         "causal": True
       },
     ]
-    if forward_backend == "triton":
+    if forward_backend != "cutedsl":
       mask_n = max(N, 512)
+      case_specs.append({
+        "name": "attn-mask",
+        "Nh_q": H,
+        "Nh_kv": H,
+        "Nq": mask_n,
+        "Nkv": mask_n,
+        "attn_mask": _make_broadcast_additive_attn_mask(mask_n, mask_n, dtype, seed),
+      })
+    if forward_backend == "triton":
       case_specs.extend([
-        {
-          "name": "attn-mask",
-          "Nh_q": H,
-          "Nh_kv": H,
-          "Nq": mask_n,
-          "Nkv": mask_n,
-          "attn_mask": _make_broadcast_additive_attn_mask(mask_n, mask_n, dtype, seed),
-        },
         {
           "name": "dropout",
           "Nh_q": H,

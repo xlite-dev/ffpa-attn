@@ -375,6 +375,115 @@ __device__ __forceinline__ void sync_apply_causal_mask(
   }
 }
 
+// Scalar load for one additive attention-bias element. This helper stays
+// scalar on purpose: the generic mask path supports 4-D broadcasting
+// (including stride_n == 0), arbitrary row strides from expanded masks,
+// tail KV tiles where only one of {k0, k1} may be valid, and a runtime bias
+// dtype. A vectorized load is only safe for a narrower fast path with
+// stride_n == 1, proven row alignment, both columns in bounds, and a
+// dtype-specialized branch.
+__device__ __forceinline__ float load_attn_bias_value(const void* attn_bias, const int dtype,
+                                                      const long long offset) {
+  if (dtype == 1) {
+    return __half2float(reinterpret_cast<const __half*>(attn_bias)[offset]);
+  }
+  if (dtype == 2) {
+    return __bfloat162float(reinterpret_cast<const __nv_bfloat16*>(attn_bias)[offset]);
+  }
+  return reinterpret_cast<const float*>(attn_bias)[offset];
+}
+
+// Apply normalized additive attention bias to the raw QK accumulator
+// fragments before online softmax. Each lane owns two Q rows (q0/q8) and
+// two adjacent KV columns (k0/k1) per kValTileSeqLenK fragment, matching the
+// m16n8k16 C-fragment layout used by the QK MMA. The host passes broadcast
+// strides for [B, H, Nq, Nkv], so a zero stride reuses the same bias value
+// across that dimension. The softmax helper multiplies QK by ``scale``
+// internally, while SDPA/Triton define additive bias after scaling; therefore
+// this routine adds ``bias / scale`` to the raw accumulator via ``inv_scale``.
+template <const int kValTileSeqLenK, const int kMmaAccFloat32, typename kDataType = __half>
+__device__ __forceinline__ void sync_apply_attn_bias(
+    uint32_t* R_S, const void* attn_bias, const int attn_bias_dtype,
+    const long long attn_bias_stride_b, const long long attn_bias_stride_h,
+    const long long attn_bias_stride_m, const long long attn_bias_stride_n, const int Nb_id,
+    const int Nh_id, const int warp_QP, const int Br_base, const int Bc_base, const int Nq,
+    const int Nkv, const float inv_scale) {
+  using Traits = DtypeTraits<kDataType>;
+  const int lane_id = threadIdx.x % WARP_SIZE;
+  const int row_base = warp_QP * 16 + (lane_id / 4);
+  const int col_base = (lane_id % 4) * 2;
+  const int q0 = Br_base + row_base;
+  const int q8 = q0 + 8;
+  const long long base = static_cast<long long>(Nb_id) * attn_bias_stride_b +
+                         static_cast<long long>(Nh_id) * attn_bias_stride_h;
+
+  if constexpr (kMmaAccFloat32) {
+#pragma unroll
+    for (int j = 0; j < kValTileSeqLenK; ++j) {
+      float* t_fptr = reinterpret_cast<float*>(R_S + j * 4);
+      const int k0 = Bc_base + j * 8 + col_base;
+      const int k1 = k0 + 1;
+      if (q0 < Nq && k0 < Nkv) {
+        const long long offset = base + static_cast<long long>(q0) * attn_bias_stride_m +
+                                 static_cast<long long>(k0) * attn_bias_stride_n;
+        t_fptr[0] += load_attn_bias_value(attn_bias, attn_bias_dtype, offset) * inv_scale;
+      }
+      if (q0 < Nq && k1 < Nkv) {
+        const long long offset = base + static_cast<long long>(q0) * attn_bias_stride_m +
+                                 static_cast<long long>(k1) * attn_bias_stride_n;
+        t_fptr[1] += load_attn_bias_value(attn_bias, attn_bias_dtype, offset) * inv_scale;
+      }
+      if (q8 < Nq && k0 < Nkv) {
+        const long long offset = base + static_cast<long long>(q8) * attn_bias_stride_m +
+                                 static_cast<long long>(k0) * attn_bias_stride_n;
+        t_fptr[2] += load_attn_bias_value(attn_bias, attn_bias_dtype, offset) * inv_scale;
+      }
+      if (q8 < Nq && k1 < Nkv) {
+        const long long offset = base + static_cast<long long>(q8) * attn_bias_stride_m +
+                                 static_cast<long long>(k1) * attn_bias_stride_n;
+        t_fptr[3] += load_attn_bias_value(attn_bias, attn_bias_dtype, offset) * inv_scale;
+      }
+    }
+  } else {
+    static_assert(std::is_same_v<kDataType, __half>,
+                  "MMA Acc F16 attention bias path is only valid for __half activation dtype.");
+#pragma unroll
+    for (int j = 0; j < kValTileSeqLenK; ++j) {
+      kDataType* t_hptr = reinterpret_cast<kDataType*>(R_S + j * 2);
+      const int k0 = Bc_base + j * 8 + col_base;
+      const int k1 = k0 + 1;
+      if (q0 < Nq && k0 < Nkv) {
+        const long long offset = base + static_cast<long long>(q0) * attn_bias_stride_m +
+                                 static_cast<long long>(k0) * attn_bias_stride_n;
+        const float value = Traits::to_float(t_hptr[0]) +
+                            load_attn_bias_value(attn_bias, attn_bias_dtype, offset) * inv_scale;
+        t_hptr[0] = Traits::from_float(value);
+      }
+      if (q0 < Nq && k1 < Nkv) {
+        const long long offset = base + static_cast<long long>(q0) * attn_bias_stride_m +
+                                 static_cast<long long>(k1) * attn_bias_stride_n;
+        const float value = Traits::to_float(t_hptr[1]) +
+                            load_attn_bias_value(attn_bias, attn_bias_dtype, offset) * inv_scale;
+        t_hptr[1] = Traits::from_float(value);
+      }
+      if (q8 < Nq && k0 < Nkv) {
+        const long long offset = base + static_cast<long long>(q8) * attn_bias_stride_m +
+                                 static_cast<long long>(k0) * attn_bias_stride_n;
+        const float value = Traits::to_float(t_hptr[2]) +
+                            load_attn_bias_value(attn_bias, attn_bias_dtype, offset) * inv_scale;
+        t_hptr[2] = Traits::from_float(value);
+      }
+      if (q8 < Nq && k1 < Nkv) {
+        const long long offset = base + static_cast<long long>(q8) * attn_bias_stride_m +
+                                 static_cast<long long>(k1) * attn_bias_stride_n;
+        const float value = Traits::to_float(t_hptr[3]) +
+                            load_attn_bias_value(attn_bias, attn_bias_dtype, offset) * inv_scale;
+        t_hptr[3] = Traits::from_float(value);
+      }
+    }
+  }
+}
+
 // Online safe-softmax step for one [Br, Bc] S fragment (FA-2 paper algo 1).
 //   1. warp-reduces a per-row max across the Bc axis.
 //   2. ``m_new = max(m_old, m_new)`` for numerical stability.
