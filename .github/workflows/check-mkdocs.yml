@@ -9,15 +9,23 @@ on:
       - '.gitignore'
       - '.gitattributes'
       - 'LICENSE'
-  pull_request:
+  pull_request_target:
     branches:
       - main
+    types: [opened, synchronize, reopened]
     paths-ignore:
       - '.github/**'
       - '.gitignore'
       - '.gitattributes'
       - 'LICENSE'
   workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request_target' }}
+
+permissions:
+  contents: read
 
 jobs:
   build:
@@ -29,8 +37,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ github.event_name == 'pull_request_target' && format('refs/pull/{0}/merge', github.event.pull_request.number) || github.ref }}
           fetch-depth: 0
           fetch-tags: true
+          persist-credentials: false
 
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
