@@ -20,30 +20,31 @@ from typing import Any
 import torch
 import triton
 
-from ffpa_attn import __version__, ffpa_attn_func
-from ffpa_attn.triton._autotune_utils import (
+from . import __version__
+from .ffpa_attn_interface import ffpa_attn_func
+from .triton._autotune_utils import (
   autotune_seqlen_key,
   exact_autotune_seqlen_keys,
 )
-from ffpa_attn.triton._ffpa_bwd import (
+from .triton._ffpa_bwd import (
   _get_bwd_autotune,
   _get_decode_bwd_stage1_autotune,
   _get_pre_autotune,
 )
-from ffpa_attn.triton._ffpa_bwd_sm90 import (
+from .triton._ffpa_bwd_sm90 import (
   _get_bwd_sm90_autotune,
   is_sm90_tma_backward_supported,
 )
-from ffpa_attn.triton._ffpa_fwd import (
+from .triton._ffpa_fwd import (
   _get_decode_fwd_stage1_autotune,
   _get_decode_num_splits,
   _get_fwd_autotune,
 )
-from ffpa_attn.triton._ffpa_fwd_sm90 import (
+from .triton._ffpa_fwd_sm90 import (
   _get_fwd_sm90_autotune,
   is_sm90_tma_forward_supported,
 )
-from ffpa_attn.triton._persistent_autotune import (
+from .triton._persistent_autotune import (
   DEFAULT_HEADDIMS,
   DEFAULT_SEQLENS,
   SCHEMA_VERSION,

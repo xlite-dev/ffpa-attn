@@ -26,7 +26,11 @@ from ._ffpa_bwd import (
   _normalize_bwd_pre_config,
   _supports_bwd_main_max_extra_configs,
 )
-from ._persistent_autotune import PersistentConfigRequest, dtype_name, lookup_persistent_config
+from ._persistent_autotune import (
+  PersistentConfigRequest,
+  dtype_name,
+  lookup_persistent_config,
+)
 
 _SM90_BWD_HEURISTICS = {
   "EVEN_M": lambda args: args["seqlen_q"] % args["BLOCK_M"] == 0,
@@ -106,7 +110,17 @@ def _ffpa_bwd_sm90_kernel_impl(
   BLOCK_N: tl.constexpr,
   warp_specialize: tl.constexpr,
 ) -> None:
-  """TMA-descriptor variant of the main Split-D FFPA backward kernel."""
+  """TMA-descriptor variant of the main Split-D FFPA backward kernel.
+
+  Keep this kernel at Triton's default ``num_ctas=1``. The fused backward
+  body contains multiple ``tt.dot`` ops across the dK / dV and dQ phases.
+  This is a kernel / Triton ``FuncOp`` level limitation, not a loop-local
+  limitation: the current PlanCTA planner can only see one ``DotOp`` per
+  kernel when ``num_ctas=2``. Triton 3.6/3.7 runs the NVIDIA CTA planning
+  pass (``TritonGPUPlanCTAPass``, pipeline name
+  ``triton-nvidia-gpu-plan-cta``) and the second ``DotOp`` hits the
+  PlanCTA.cpp assertion ``!tiled && "CTA tiling is already determined"``.
+  """
   _ = autotune_seqlen_q_bucket
   _ = autotune_seqlen_k_bucket
   _ = autotune_causal_key

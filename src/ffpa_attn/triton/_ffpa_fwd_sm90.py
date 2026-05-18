@@ -215,6 +215,15 @@ def _ffpa_fwd_sm90_kernel_impl(
   Identical algorithm to ``_ffpa_fwd_kernel_impl`` with Q / K / V / O
   pointer arithmetic replaced by ``desc.load`` / ``desc.store`` calls.
   LSE and attn_bias stay on raw pointers.
+
+  Keep this kernel at Triton's default ``num_ctas=1``. The fused Split-D
+  attention body contains multiple ``tt.dot`` ops (QK plus one or more PV
+  dots) in the same kernel. This is a kernel / Triton ``FuncOp`` level
+  limitation, not a loop-local limitation: the current PlanCTA planner can
+  only see one ``DotOp`` per kernel when ``num_ctas=2``. Triton 3.6/3.7 runs
+  the NVIDIA CTA planning pass (``TritonGPUPlanCTAPass``, pipeline name
+  ``triton-nvidia-gpu-plan-cta``) and the second ``DotOp`` hits the
+  PlanCTA.cpp assertion ``!tiled && "CTA tiling is already determined"``.
   """
   # Keys for autotuning heuristics and persistent autotune lookup.
   _ = autotune_seqlen_q_bucket
