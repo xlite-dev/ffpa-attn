@@ -3,24 +3,40 @@ name: pre-commit
 on:
   pull_request:
     branches: [main]
+  pull_request_target:
+    branches: [main]
+    types: [opened, synchronize, reopened]
   push:
     branches: [main]
   workflow_dispatch:
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || github.event_name == 'pull_request_target' }}
 
 permissions:
   contents: read
 
 jobs:
   pre-commit:
+    if: |
+      github.event_name == 'push' ||
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request' &&
+       github.event.pull_request.head.repo.full_name == github.repository) ||
+      (github.event_name == 'pull_request_target' &&
+       github.event.pull_request.head.repo.full_name != github.repository)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ startsWith(github.event_name, 'pull_request') && format('refs/pull/{0}/merge', github.event.pull_request.number) || github.ref }}
+          persist-credentials: false
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
           cache: 'pip'
-      - uses: pre-commit/action@v3.0.1
+      - name: Install pre-commit
+        run: pip install pre-commit
+      - name: Run pre-commit
+        run: pre-commit run --all-files --show-diff-on-failure
