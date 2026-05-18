@@ -936,7 +936,6 @@ class FFPAAttnBwdDKDVSm90SplitD:
       tiled_mma_SdP,
       sP,
       tidx,
-      self.arch,
       transpose=False,
       position_independent=True,
     )
@@ -946,7 +945,6 @@ class FFPAAttnBwdDKDVSm90SplitD:
       tiled_mma_SdP,
       sP_fp32,
       tidx,
-      self.arch,
       transpose=False,
       position_independent=False,
     )
@@ -1184,7 +1182,6 @@ class FFPAAttnBwdDKDVSm90SplitD:
       tiled_mma_SdP,
       sdS,
       tidx,
-      self.arch,
       transpose=False,
       position_independent=True,
     )
@@ -1449,7 +1446,6 @@ class FFPAAttnBwdDKDVSm90SplitD:
       tiled_mma_dV,
       sEpi,
       tidx,
-      self.arch,
       transpose=False,
       position_independent=True,
     )
@@ -1516,7 +1512,6 @@ class FFPAAttnBwdDKDVSm90SplitD:
       tiled_mma_dK,
       sEpi,
       tidx,
-      self.arch,
       transpose=False,
       position_independent=True,
     )

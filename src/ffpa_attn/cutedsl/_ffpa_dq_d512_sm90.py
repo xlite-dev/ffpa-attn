@@ -994,7 +994,6 @@ class FFPAAttnBwdDQSm90SplitD:
       tiled_mma_SdP,
       sP_fp32,
       tidx,
-      self.arch,
       transpose=False,
       position_independent=False,
     )
@@ -1292,7 +1291,6 @@ class FFPAAttnBwdDQSm90SplitD:
       tiled_mma_SdP,
       sdS,
       tidx,
-      self.arch,
       transpose=False,
       position_independent=True,
     )
@@ -1652,7 +1650,6 @@ class FFPAAttnBwdDQSm90SplitD:
       tiled_mma_dQ,
       sEpi_half,
       tidx,
-      self.arch,
       transpose=False,
       position_independent=True,
     )
