@@ -30,9 +30,9 @@ EXAMPLES_DIR = Path(__file__).resolve().parent
 if str(EXAMPLES_DIR) not in sys.path:
   sys.path.insert(0, str(EXAMPLES_DIR))
 
-from attention_flops import format_tflops_short
-from ffpa_attn_bwd import run_backward_examples
-from ffpa_attn_fwd import run_forward_examples
+from _attn_fwd import run_forward_examples
+from _attn_bwd import run_backward_examples
+from _attn_flops import format_tflops_short
 
 
 def _parse_grad_kv_dtype(arg: str) -> torch.dtype | None:

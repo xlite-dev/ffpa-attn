@@ -29,7 +29,7 @@ import torch
 import torch.nn.functional as F
 
 from ffpa_attn import ffpa_attn_func
-from attention_flops import attention_fwd_flops, format_tflops_short, tflops_from_ms
+from _attn_flops import attention_fwd_flops, format_tflops_short, tflops_from_ms
 
 DEFAULT_WARMUP = 2
 DEFAULT_ITERS = 10
