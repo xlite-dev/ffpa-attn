@@ -146,7 +146,8 @@ def test_sm90_tma_persist_dkdv_causal_matches_sdpa(dtype):
   assert torch.allclose(v.grad, dv_ref, **tol)
 
 
-def test_sm90_tma_non_aligned_seqlen_matches_sdpa():
+@pytest.mark.parametrize("enable_persist_dkdv", [False, True])
+def test_sm90_tma_non_aligned_seqlen_matches_sdpa(enable_persist_dkdv):
   _skip_if_no_sm90_tma()
   torch.manual_seed(124)
   B, H, N, D = 1, 2, 129, 512
@@ -162,6 +163,7 @@ def test_sm90_tma_non_aligned_seqlen_matches_sdpa():
     v,
     scale=scale,
     enable_backward_tma=True,
+    triton_backward_enable_persist_dkdv=enable_persist_dkdv,
   )
   out.sum().backward()
 

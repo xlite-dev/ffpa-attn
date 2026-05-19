@@ -51,7 +51,7 @@ def _sm90_bwd_host_descriptor_pre_hook(nargs):
 
 
 @triton.jit
-def _ffpa_bwd_dkdv_sm90_process_q_block(
+def _ffpa_bwd_dkdv_sm90_q_block(
   desc_q: tl.tensor_descriptor,
   desc_k: tl.tensor_descriptor,
   desc_v: tl.tensor_descriptor,
@@ -170,6 +170,9 @@ def _ffpa_bwd_dkdv_sm90_process_q_block(
     dS = (dBias * softmax_scale).to(DTYPE)
   else:
     dS = (P * (dP - Di[:, None]) * softmax_scale).to(DTYPE)
+  if not EVEN_M:
+    dS = tl.where(m_mask[:, None], dS, 0.0)
+    P_drop = tl.where(m_mask[:, None], P_drop, 0.0)
 
   for d_chunk in range(num_d_chunks):
     d_start = d_chunk * BLOCK_HEADDIM
@@ -290,7 +293,7 @@ def _ffpa_bwd_dkdv_sm90(
         flatten=True,
         warp_specialize=True,
       ):
-        _ffpa_bwd_dkdv_sm90_process_q_block(
+        _ffpa_bwd_dkdv_sm90_q_block(
           desc_q, desc_k, desc_v, desc_do, DK, DV, LSE, D, AttnBias, GradAttnBias, softmax_scale, stride_dkn,
           stride_dvn, stride_bm, stride_bn, stride_gbm, stride_gbn, q_base_y, k_offset_y, start_m, begin_m, off_hb,
           offs_m, offs_n, offs_d, seqlen_q, seqlen_k, headdim, dropout_p, philox_offset, IS_CAUSAL, HAS_ATTN_BIAS,
@@ -299,7 +302,7 @@ def _ffpa_bwd_dkdv_sm90(
         )
     else:
       for start_m in range(begin_m, num_block_m * BLOCK_M, BLOCK_M):
-        _ffpa_bwd_dkdv_sm90_process_q_block(
+        _ffpa_bwd_dkdv_sm90_q_block(
           desc_q, desc_k, desc_v, desc_do, DK, DV, LSE, D, AttnBias, GradAttnBias, softmax_scale, stride_dkn,
           stride_dvn, stride_bm, stride_bn, stride_gbm, stride_gbn, q_base_y, k_offset_y, start_m, begin_m, off_hb,
           offs_m, offs_n, offs_d, seqlen_q, seqlen_k, headdim, dropout_p, philox_offset, IS_CAUSAL, HAS_ATTN_BIAS,
@@ -474,6 +477,9 @@ def _ffpa_bwd_dkdv_persist_sm90(
           dS = (dBias * softmax_scale).to(DTYPE)
         else:
           dS = (P * (dP - Di[:, None]) * softmax_scale).to(DTYPE)
+        if not EVEN_M:
+          dS = tl.where(m_mask[:, None], dS, 0.0)
+          P_drop = tl.where(m_mask[:, None], P_drop, 0.0)
 
         q = desc_q.load([q_offset_y, d_start_out])
         do = desc_do.load([q_offset_y, d_start_out])
