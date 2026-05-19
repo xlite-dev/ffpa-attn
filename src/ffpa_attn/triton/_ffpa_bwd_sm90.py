@@ -56,7 +56,6 @@ def _ffpa_bwd_dkdv_sm90(
   desc_k: tl.tensor_descriptor,
   desc_v: tl.tensor_descriptor,
   desc_do: tl.tensor_descriptor,
-  DQ: torch.Tensor,
   DK: torch.Tensor,
   DV: torch.Tensor,
   LSE: torch.Tensor,
@@ -64,9 +63,6 @@ def _ffpa_bwd_dkdv_sm90(
   AttnBias: torch.Tensor,
   GradAttnBias: torch.Tensor,
   softmax_scale: float,
-  stride_dqb: int,
-  stride_dqh: int,
-  stride_dqm: int,
   stride_dkb: int,
   stride_dkh: int,
   stride_dkn: int,
@@ -84,10 +80,6 @@ def _ffpa_bwd_dkdv_sm90(
   nheads: int,
   seqlen_q: int,
   seqlen_k: int,
-  autotune_seqlen_q_bucket: int,
-  autotune_seqlen_k_bucket: int,
-  autotune_causal_key: int,
-  autotune_dtype_key: int,
   seqlen_q_rounded: int,
   headdim: int,
   dropout_p: float,
@@ -102,11 +94,9 @@ def _ffpa_bwd_dkdv_sm90(
   GRAD_BIAS_STORE_PARTIAL: tl.constexpr,
   BLOCK_HEADDIM: tl.constexpr,
   DTYPE: tl.constexpr,
-  EVEN_M: tl.constexpr,
   EVEN_N: tl.constexpr,
   BLOCK_M: tl.constexpr,
   BLOCK_N: tl.constexpr,
-  warp_specialize: tl.constexpr,
 ) -> None:
   """dK/dV half of the SM90 TMA Split-D backward kernel.
 
@@ -114,11 +104,6 @@ def _ffpa_bwd_dkdv_sm90(
   pattern. It is called from ``_ffpa_bwd_sm90_kernel_impl`` so the public SM90
   backward path remains a single Triton launch.
   """
-  _ = autotune_seqlen_q_bucket
-  _ = autotune_seqlen_k_bucket
-  _ = autotune_causal_key
-  _ = autotune_dtype_key
-  _ = warp_specialize
   pid = tl.program_id(0)
   off_hb = tl.program_id(2)
   off_b = off_hb // nheads
@@ -127,7 +112,6 @@ def _ffpa_bwd_dkdv_sm90(
   q_base_y = (off_b * nheads + off_h) * seqlen_q
   kv_base_y = (off_b * nheads + off_h) * seqlen_k
 
-  DQ += off_b * stride_dqb + off_h * stride_dqh
   DK += off_b * stride_dkb + off_h * stride_dkh
   DV += off_b * stride_dvb + off_h * stride_dvh
   D += off_hb * seqlen_q_rounded
@@ -245,7 +229,6 @@ def _ffpa_bwd_dkdv_persist_sm90(
   desc_k: tl.tensor_descriptor,
   desc_v: tl.tensor_descriptor,
   desc_do: tl.tensor_descriptor,
-  DQ: torch.Tensor,
   DK: torch.Tensor,
   DV: torch.Tensor,
   LSE: torch.Tensor,
@@ -253,9 +236,6 @@ def _ffpa_bwd_dkdv_persist_sm90(
   AttnBias: torch.Tensor,
   GradAttnBias: torch.Tensor,
   softmax_scale: float,
-  stride_dqb: int,
-  stride_dqh: int,
-  stride_dqm: int,
   stride_dkb: int,
   stride_dkh: int,
   stride_dkn: int,
@@ -273,10 +253,6 @@ def _ffpa_bwd_dkdv_persist_sm90(
   nheads: int,
   seqlen_q: int,
   seqlen_k: int,
-  autotune_seqlen_q_bucket: int,
-  autotune_seqlen_k_bucket: int,
-  autotune_causal_key: int,
-  autotune_dtype_key: int,
   seqlen_q_rounded: int,
   headdim: int,
   dropout_p: float,
@@ -291,24 +267,11 @@ def _ffpa_bwd_dkdv_persist_sm90(
   GRAD_BIAS_STORE_PARTIAL: tl.constexpr,
   BLOCK_HEADDIM: tl.constexpr,
   DTYPE: tl.constexpr,
-  EVEN_M: tl.constexpr,
   EVEN_N: tl.constexpr,
   BLOCK_M: tl.constexpr,
   BLOCK_N: tl.constexpr,
-  warp_specialize: tl.constexpr,
 ) -> None:
   """dK/dV half with fp32 register accumulation across Q blocks."""
-  _ = DQ
-  _ = stride_dqb
-  _ = stride_dqh
-  _ = stride_dqm
-  _ = autotune_seqlen_q_bucket
-  _ = autotune_seqlen_k_bucket
-  _ = autotune_causal_key
-  _ = autotune_dtype_key
-  _ = EVEN_M
-  _ = warp_specialize
-
   pid = tl.program_id(0)
   off_hb = tl.program_id(2)
   off_b = off_hb // nheads
@@ -428,37 +391,20 @@ def _ffpa_bwd_dq_sm90(
   desc_v: tl.tensor_descriptor,
   desc_do: tl.tensor_descriptor,
   DQ: torch.Tensor,
-  DK: torch.Tensor,
-  DV: torch.Tensor,
   LSE: torch.Tensor,
   D: torch.Tensor,
   AttnBias: torch.Tensor,
-  GradAttnBias: torch.Tensor,
   softmax_scale: float,
   stride_dqb: int,
   stride_dqh: int,
   stride_dqm: int,
-  stride_dkb: int,
-  stride_dkh: int,
-  stride_dkn: int,
-  stride_dvb: int,
-  stride_dvh: int,
-  stride_dvn: int,
   stride_bb: int,
   stride_bh: int,
   stride_bm: int,
   stride_bn: int,
-  stride_gbb: int,
-  stride_gbh: int,
-  stride_gbm: int,
-  stride_gbn: int,
   nheads: int,
   seqlen_q: int,
   seqlen_k: int,
-  autotune_seqlen_q_bucket: int,
-  autotune_seqlen_k_bucket: int,
-  autotune_causal_key: int,
-  autotune_dtype_key: int,
   seqlen_q_rounded: int,
   headdim: int,
   dropout_p: float,
@@ -467,43 +413,13 @@ def _ffpa_bwd_dq_sm90(
   HAS_ATTN_BIAS: tl.constexpr,
   HAS_DROPOUT: tl.constexpr,
   PHILOX_SEED: tl.constexpr,
-  BIAS_REQUIRES_GRAD: tl.constexpr,
-  GRAD_BIAS_NEEDS_REDUCTION: tl.constexpr,
-  GRAD_BIAS_REDUCES_M: tl.constexpr,
-  GRAD_BIAS_STORE_PARTIAL: tl.constexpr,
   BLOCK_HEADDIM: tl.constexpr,
   DTYPE: tl.constexpr,
-  EVEN_M: tl.constexpr,
   EVEN_N: tl.constexpr,
   BLOCK_M: tl.constexpr,
   BLOCK_N: tl.constexpr,
-  warp_specialize: tl.constexpr,
 ) -> None:
   """dQ half of the SM90 TMA Split-D backward kernel."""
-  _ = DK
-  _ = DV
-  _ = GradAttnBias
-  _ = stride_dkb
-  _ = stride_dkh
-  _ = stride_dkn
-  _ = stride_dvb
-  _ = stride_dvh
-  _ = stride_dvn
-  _ = stride_gbb
-  _ = stride_gbh
-  _ = stride_gbm
-  _ = stride_gbn
-  _ = autotune_seqlen_q_bucket
-  _ = autotune_seqlen_k_bucket
-  _ = autotune_causal_key
-  _ = autotune_dtype_key
-  _ = BIAS_REQUIRES_GRAD
-  _ = GRAD_BIAS_NEEDS_REDUCTION
-  _ = GRAD_BIAS_REDUCES_M
-  _ = GRAD_BIAS_STORE_PARTIAL
-  _ = EVEN_M
-  _ = warp_specialize
-
   pid = tl.program_id(0)
   off_hb = tl.program_id(2)
   off_b = off_hb // nheads
@@ -662,34 +578,32 @@ def _ffpa_bwd_sm90_kernel_impl(
   ``triton-nvidia-gpu-plan-cta``) and the second ``DotOp`` hits the
   PlanCTA.cpp assertion ``!tiled && "CTA tiling is already determined"``.
   """
+  # Keys for autotune and heuristics lookups.
+  _ = autotune_seqlen_q_bucket
+  _ = autotune_seqlen_k_bucket
+  _ = autotune_causal_key
+  _ = autotune_dtype_key
+
   if PERSIST_DKDV_ACC:
     _ffpa_bwd_dkdv_persist_sm90(
-      desc_q, desc_k, desc_v, desc_do, DQ, DK, DV, LSE, D, AttnBias, GradAttnBias, softmax_scale, stride_dqb,
-      stride_dqh, stride_dqm, stride_dkb, stride_dkh, stride_dkn, stride_dvb, stride_dvh, stride_dvn, stride_bb,
-      stride_bh, stride_bm, stride_bn, stride_gbb, stride_gbh, stride_gbm, stride_gbn, nheads, seqlen_q, seqlen_k,
-      autotune_seqlen_q_bucket, autotune_seqlen_k_bucket, autotune_causal_key, autotune_dtype_key, seqlen_q_rounded,
-      headdim, dropout_p, philox_offset, IS_CAUSAL, HAS_ATTN_BIAS, HAS_DROPOUT, PHILOX_SEED, BIAS_REQUIRES_GRAD,
-      GRAD_BIAS_NEEDS_REDUCTION, GRAD_BIAS_REDUCES_M, GRAD_BIAS_STORE_PARTIAL, BLOCK_HEADDIM, DTYPE, EVEN_M, EVEN_N,
-      BLOCK_M, BLOCK_N, warp_specialize
+      desc_q, desc_k, desc_v, desc_do, DK, DV, LSE, D, AttnBias, GradAttnBias, softmax_scale, stride_dkb, stride_dkh,
+      stride_dkn, stride_dvb, stride_dvh, stride_dvn, stride_bb, stride_bh, stride_bm, stride_bn, stride_gbb,
+      stride_gbh, stride_gbm, stride_gbn, nheads, seqlen_q, seqlen_k, seqlen_q_rounded, headdim, dropout_p,
+      philox_offset, IS_CAUSAL, HAS_ATTN_BIAS, HAS_DROPOUT, PHILOX_SEED, BIAS_REQUIRES_GRAD, GRAD_BIAS_NEEDS_REDUCTION,
+      GRAD_BIAS_REDUCES_M, GRAD_BIAS_STORE_PARTIAL, BLOCK_HEADDIM, DTYPE, EVEN_N, BLOCK_M, BLOCK_N
     )
   else:
     _ffpa_bwd_dkdv_sm90(
-      desc_q, desc_k, desc_v, desc_do, DQ, DK, DV, LSE, D, AttnBias, GradAttnBias, softmax_scale, stride_dqb,
-      stride_dqh, stride_dqm, stride_dkb, stride_dkh, stride_dkn, stride_dvb, stride_dvh, stride_dvn, stride_bb,
-      stride_bh, stride_bm, stride_bn, stride_gbb, stride_gbh, stride_gbm, stride_gbn, nheads, seqlen_q, seqlen_k,
-      autotune_seqlen_q_bucket, autotune_seqlen_k_bucket, autotune_causal_key, autotune_dtype_key, seqlen_q_rounded,
-      headdim, dropout_p, philox_offset, IS_CAUSAL, HAS_ATTN_BIAS, HAS_DROPOUT, PHILOX_SEED, BIAS_REQUIRES_GRAD,
-      GRAD_BIAS_NEEDS_REDUCTION, GRAD_BIAS_REDUCES_M, GRAD_BIAS_STORE_PARTIAL, BLOCK_HEADDIM, DTYPE, EVEN_M, EVEN_N,
-      BLOCK_M, BLOCK_N, warp_specialize
+      desc_q, desc_k, desc_v, desc_do, DK, DV, LSE, D, AttnBias, GradAttnBias, softmax_scale, stride_dkb, stride_dkh,
+      stride_dkn, stride_dvb, stride_dvh, stride_dvn, stride_bb, stride_bh, stride_bm, stride_bn, stride_gbb,
+      stride_gbh, stride_gbm, stride_gbn, nheads, seqlen_q, seqlen_k, seqlen_q_rounded, headdim, dropout_p,
+      philox_offset, IS_CAUSAL, HAS_ATTN_BIAS, HAS_DROPOUT, PHILOX_SEED, BIAS_REQUIRES_GRAD, GRAD_BIAS_NEEDS_REDUCTION,
+      GRAD_BIAS_REDUCES_M, GRAD_BIAS_STORE_PARTIAL, BLOCK_HEADDIM, DTYPE, EVEN_N, BLOCK_M, BLOCK_N
     )
   _ffpa_bwd_dq_sm90(
-    desc_q, desc_k, desc_v, desc_do, DQ, DK, DV, LSE, D, AttnBias, GradAttnBias, softmax_scale, stride_dqb, stride_dqh,
-    stride_dqm, stride_dkb, stride_dkh, stride_dkn, stride_dvb, stride_dvh, stride_dvn, stride_bb, stride_bh, stride_bm,
-    stride_bn, stride_gbb, stride_gbh, stride_gbm, stride_gbn, nheads, seqlen_q, seqlen_k, autotune_seqlen_q_bucket,
-    autotune_seqlen_k_bucket, autotune_causal_key, autotune_dtype_key, seqlen_q_rounded, headdim, dropout_p,
-    philox_offset, IS_CAUSAL, HAS_ATTN_BIAS, HAS_DROPOUT, PHILOX_SEED, BIAS_REQUIRES_GRAD, GRAD_BIAS_NEEDS_REDUCTION,
-    GRAD_BIAS_REDUCES_M, GRAD_BIAS_STORE_PARTIAL, BLOCK_HEADDIM, DTYPE, EVEN_M, EVEN_N, BLOCK_M, BLOCK_N,
-    warp_specialize
+    desc_q, desc_k, desc_v, desc_do, DQ, LSE, D, AttnBias, softmax_scale, stride_dqb, stride_dqh, stride_dqm, stride_bb,
+    stride_bh, stride_bm, stride_bn, nheads, seqlen_q, seqlen_k, seqlen_q_rounded, headdim, dropout_p, philox_offset,
+    IS_CAUSAL, HAS_ATTN_BIAS, HAS_DROPOUT, PHILOX_SEED, BLOCK_HEADDIM, DTYPE, EVEN_N, BLOCK_M, BLOCK_N
   )
 
 
