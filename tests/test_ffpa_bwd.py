@@ -34,6 +34,13 @@ def _tolerance(dtype):
   return {"atol": 5e-2, "rtol": 5e-2} if dtype == torch.bfloat16 else {"atol": 1e-2, "rtol": 1e-2}
 
 
+def _skip_if_no_sm90_tma():
+  if not torch.cuda.is_available():
+    pytest.skip("CUDA is required for SM90 TMA backward tests")
+  if torch.cuda.get_device_capability()[0] < 9:
+    pytest.skip("SM90+ GPU is required for TMA backward tests")
+
+
 def _make_sdpa_kwargs(causal, Nq, Nkv):
   """Build SDPA keyword args for causal / cross-attention."""
   if causal and Nq != Nkv:
@@ -109,6 +116,34 @@ def _sdpa_ref_grads(
   if return_mask_grad:
     return q2.grad, dk, dv, attn_mask_ref.grad
   return q2.grad, dk, dv
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+def test_sm90_tma_persist_dkdv_causal_matches_sdpa(dtype):
+  _skip_if_no_sm90_tma()
+  torch.manual_seed(123)
+  B, H, N, D = 1, 2, 128, 512
+  q = torch.randn(B, H, N, D, dtype=dtype, device="cuda", requires_grad=True)
+  k = torch.randn(B, H, N, D, dtype=dtype, device="cuda", requires_grad=True)
+  v = torch.randn(B, H, N, D, dtype=dtype, device="cuda", requires_grad=True)
+  scale = 1.0 / math.sqrt(D)
+
+  out = ffpa_attn_func(
+    q,
+    k,
+    v,
+    is_causal=True,
+    scale=scale,
+    enable_backward_tma=True,
+    triton_backward_enable_persist_dkdv=True,
+  )
+  out.sum().backward()
+
+  dq_ref, dk_ref, dv_ref = _sdpa_ref_grads(q, k, v, True, scale)
+  tol = _tolerance(dtype)
+  assert torch.allclose(q.grad, dq_ref, **tol)
+  assert torch.allclose(k.grad, dk_ref, **tol)
+  assert torch.allclose(v.grad, dv_ref, **tol)
 
 
 def _key_position_bias_grad_ref(

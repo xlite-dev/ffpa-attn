@@ -200,13 +200,17 @@ def ffpa_attn_func(
       ``high_precision_grad``, ``forward_backend``,
       ``triton_autotune``, ``triton_autotune_mode``,
       ``backward_backend``,
-      ``triton_backward_preprocess_d_chunk``, and
+      ``triton_backward_preprocess_d_chunk``,
+      ``triton_backward_enable_persist_dkdv``, and
       ``triton_backward_grad_kv_storage_dtype``. ``forward_backend`` only affects ``D > 256``.
       ``enable_forward_tma`` and ``enable_backward_tma`` independently opt
       into the SM90+ Triton descriptor/TMA forward and backward paths when
       supported. ``enable_forward_ws`` and ``enable_backward_ws`` request
       warp-specialized TMA configs for the matching direction. ``enable_tma``
       and ``enable_ws`` are compatibility aliases that set both directions.
+      ``triton_backward_enable_persist_dkdv`` enables an experimental SM90 TMA
+      backward path that keeps dK/dV accumulators in fp32 registers across Q
+      blocks and requires ``enable_backward_tma=True``.
       ``backward_backend`` supports ``"triton"`` and ``"sdpa"``.
       ``triton_backward_grad_kv_storage_dtype`` defaults to ``None`` and
       currently accepts ``torch.float16`` or ``torch.float32`` as overrides for Triton

@@ -231,6 +231,9 @@ def _ffpa_bwd_pre_impl(
   D_CHUNK: tl.constexpr,
 ) -> None:
   """Preprocess kernel to compute delta = rowsum(dO * O) for the backward pass."""
+  # Keys for autotune and heuristics lookups.
+  _ = autotune_seqlen_q_bucket
+
   start_m = tl.program_id(0)
   off_hb = tl.program_id(1)
   off_b = off_hb // nheads
@@ -1370,6 +1373,7 @@ def _ffpa_attn_backward_triton_impl(
   philox_offset: int = 0,
   enable_tma: bool = False,
   enable_ws: bool = False,
+  enable_persist_dkdv: bool = False,
 ) -> None:
   """Run the Triton FFPA Split-D backward kernels in place.
 
@@ -1441,6 +1445,7 @@ def _ffpa_attn_backward_triton_impl(
         philox_seed=philox_seed,
         philox_offset=philox_offset,
         enable_ws=enable_ws,
+        enable_persist_dkdv=enable_persist_dkdv,
       )
       return
 
@@ -1939,6 +1944,7 @@ def _ffpa_attn_backward_triton(
   philox_offset: int = 0,
   enable_tma: bool = False,
   enable_ws: bool = False,
+  enable_persist_dkdv: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
   """Run the Triton FFPA backward path and return ``(dq, dk, dv, d_attn_bias)``.
 
@@ -2032,6 +2038,7 @@ def _ffpa_attn_backward_triton(
     philox_offset,
     int(enable_tma),
     int(enable_ws),
+    int(enable_persist_dkdv),
   )
 
   if group_size > 1:

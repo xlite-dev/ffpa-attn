@@ -48,6 +48,7 @@ _FFPA_ATTN_IMPL_DEFAULTS: dict[str, object] = {
   "enable_backward_tma": False,
   "enable_forward_ws": False,
   "enable_backward_ws": False,
+  "triton_backward_enable_persist_dkdv": False,
   "high_precision_grad": False,
   "forward_backend": "triton",
   "triton_autotune": False,
@@ -228,6 +229,9 @@ class FFPAAttnMeta:
     Only effective with ``enable_forward_tma=True``. Defaults to ``False``.
   :param enable_backward_ws: Force warp-specialized SM90 TMA backward configs.
     Only effective with ``enable_backward_tma=True``. Defaults to ``False``.
+  :param triton_backward_enable_persist_dkdv: Use the experimental SM90 TMA
+    backward dK/dV path that keeps fp32 dK/dV accumulators in registers across
+    Q blocks. Requires ``enable_backward_tma=True``. Defaults to ``False``.
   :param enable_tma: Compatibility alias for setting both
     ``enable_forward_tma`` and ``enable_backward_tma``.
   :param enable_ws: Compatibility alias for setting both
@@ -255,6 +259,7 @@ class FFPAAttnMeta:
   enable_backward_tma: int
   enable_forward_ws: int
   enable_backward_ws: int
+  triton_backward_enable_persist_dkdv: bool
   dropout_p: float
   is_grad_enabled: bool
   high_precision_grad: bool
@@ -305,6 +310,7 @@ class FFPAAttnMeta:
     backward_backend = str(impl_options["backward_backend"])
     triton_backward_preprocess_d_chunk = bool(impl_options["triton_backward_preprocess_d_chunk"])
     triton_backward_grad_kv_storage_dtype = impl_options["triton_backward_grad_kv_storage_dtype"]
+    triton_backward_enable_persist_dkdv = bool(impl_options["triton_backward_enable_persist_dkdv"])
 
     assert forward_backend in ("cuda", "triton", "cutedsl"), \
       f"Unsupported forward_backend={forward_backend!r}; choose 'cuda', 'triton', or 'cutedsl'."
@@ -333,6 +339,8 @@ class FFPAAttnMeta:
         "triton_backward_grad_kv_storage_dtype must be None, torch.float16, or torch.float32, "
         f"got {triton_backward_grad_kv_storage_dtype!r}"
       )
+    if triton_backward_enable_persist_dkdv and not enable_backward_tma:
+      raise ValueError("triton_backward_enable_persist_dkdv requires enable_backward_tma=True")
 
     if acc_str == "f32":
       acc = _ACC_F32
@@ -355,6 +363,7 @@ class FFPAAttnMeta:
       enable_backward_tma=enable_backward_tma,
       enable_forward_ws=enable_forward_ws,
       enable_backward_ws=enable_backward_ws,
+      triton_backward_enable_persist_dkdv=triton_backward_enable_persist_dkdv,
       high_precision_grad=high_precision_grad,
       forward_backend=forward_backend,
       triton_autotune=triton_autotune,
@@ -666,6 +675,7 @@ class _FFPAAttnFunc(torch.autograd.Function):
           philox_offset=int(rng_state[1].item()) if rng_state.numel() else 0,
           enable_tma=bool(meta.enable_backward_tma),
           enable_ws=bool(meta.enable_backward_ws),
+          enable_persist_dkdv=meta.triton_backward_enable_persist_dkdv,
         )
       else:
         dq, dk, dv, grad_attn_bias = _aten_efficient_attn_backward(

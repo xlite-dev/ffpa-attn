@@ -277,6 +277,12 @@ def _parse_args() -> argparse.Namespace:
     help="Force warp-specialized configs for the experimental SM90+ TMA backward path.",
   )
   parser.add_argument(
+    "--enable-persist-dkdv",
+    "--persist-dkdv",
+    action="store_true",
+    help="Enable persistent dK/dV fp32 accumulation in the SM90+ TMA backward path (requires --bwd-tma).",
+  )
+  parser.add_argument(
     "--grad-kv-storage-dtype",
     "--grad-kv-dtype",
     choices=["none", "fp16", "fp32"],
@@ -305,6 +311,8 @@ def _resolve_directional_cli_flags(args: argparse.Namespace) -> argparse.Namespa
   if args.enable_ws:
     args.enable_fwd_ws = True
     args.enable_bwd_ws = True
+  if args.enable_persist_dkdv and not args.enable_bwd_tma:
+    raise SystemExit("--enable-persist-dkdv requires --enable-bwd-tma")
   return args
 
 
@@ -1205,6 +1213,7 @@ def _benchmark_rows(
         triton_backward_grad_kv_storage_dtype=grad_kv_dtype,
         enable_tma=args.enable_bwd_tma,
         enable_ws=args.enable_bwd_ws,
+        enable_persist_dkdv=args.enable_persist_dkdv,
         warmup=args.warmup,
         iters=args.iters,
         print_results=True,

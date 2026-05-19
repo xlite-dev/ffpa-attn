@@ -54,6 +54,21 @@ def test_directional_tma_ws_flags_default_to_false():
   assert meta.enable_backward_tma == 0
   assert meta.enable_forward_ws == 0
   assert meta.enable_backward_ws == 0
+  assert meta.triton_backward_enable_persist_dkdv is False
+
+
+def test_persist_dkdv_requires_backward_tma():
+  with pytest.raises(ValueError, match="requires enable_backward_tma"):
+    FFPAAttnMeta.from_kwargs(triton_backward_enable_persist_dkdv=True)
+
+
+def test_persist_dkdv_accepts_backward_tma():
+  meta = FFPAAttnMeta.from_kwargs(
+    enable_backward_tma=True,
+    triton_backward_enable_persist_dkdv=True,
+  )
+  assert meta.enable_backward_tma == 1
+  assert meta.triton_backward_enable_persist_dkdv is True
 
 
 def test_directional_tma_ws_flags_can_split_forward_and_backward():
@@ -518,6 +533,12 @@ def test_forward_autotune_keys_include_causal():
   assert expected_keys <= set(_get_fwd_sm90_autotune(320, "fast", "bf16", enable_ws=False).keys)
   assert expected_keys <= set(_get_decode_fwd_stage1_autotune(320, True, "fast", "bf16").keys)
   assert expected_keys <= set(_get_bwd_sm90_autotune(320, "fast", "bf16", False, enable_ws=False).keys)
+
+
+def test_sm90_bwd_persist_autotune_is_cache_scoped():
+  normal = _get_bwd_sm90_autotune(320, "fast", "bf16", False, enable_ws=False, enable_persist_dkdv=False)
+  persist = _get_bwd_sm90_autotune(320, "fast", "bf16", False, enable_ws=False, enable_persist_dkdv=True)
+  assert normal is not persist
 
 
 def test_autotune_wrappers_are_dtype_scoped():

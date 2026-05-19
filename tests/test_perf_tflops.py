@@ -1,8 +1,9 @@
 """Unit tests for benchmark attention FLOPs and TFLOPS helpers."""
 
+import pytest
 from types import SimpleNamespace
 
-from examples.attention_flops import (
+from examples._attn_flops import (
   attention_bwd_flops,
   attention_fwd_flops,
   attention_valid_pairs,
@@ -55,6 +56,7 @@ def test_perf_legacy_tma_ws_flags_map_to_both_directions():
     enable_bwd_tma=False,
     enable_fwd_ws=False,
     enable_bwd_ws=False,
+    enable_persist_dkdv=False,
   )
 
   _resolve_directional_cli_flags(args)
@@ -73,9 +75,42 @@ def test_perf_forward_tma_flag_does_not_enable_backward_tma():
     enable_bwd_tma=False,
     enable_fwd_ws=False,
     enable_bwd_ws=False,
+    enable_persist_dkdv=False,
   )
 
   _resolve_directional_cli_flags(args)
 
   assert args.enable_fwd_tma is True
   assert args.enable_bwd_tma is False
+
+
+def test_perf_persist_dkdv_requires_backward_tma():
+  args = SimpleNamespace(
+    enable_tma=False,
+    enable_ws=False,
+    enable_fwd_tma=False,
+    enable_bwd_tma=False,
+    enable_fwd_ws=False,
+    enable_bwd_ws=False,
+    enable_persist_dkdv=True,
+  )
+
+  with pytest.raises(SystemExit, match="requires --enable-bwd-tma"):
+    _resolve_directional_cli_flags(args)
+
+
+def test_perf_persist_dkdv_allows_backward_tma():
+  args = SimpleNamespace(
+    enable_tma=False,
+    enable_ws=False,
+    enable_fwd_tma=False,
+    enable_bwd_tma=True,
+    enable_fwd_ws=False,
+    enable_bwd_ws=False,
+    enable_persist_dkdv=True,
+  )
+
+  _resolve_directional_cli_flags(args)
+
+  assert args.enable_persist_dkdv is True
+  assert args.enable_bwd_tma is True
