@@ -393,6 +393,12 @@ def _ffpa_bwd_dkdv_persist_sm90(
     for out_d_chunk in range(num_d_chunks):
       d_start_out = out_d_chunk * BLOCK_HEADDIM
       d_offs = d_start_out + offs_d
+      # Persistent accumulators for dK/dV across all M blocks for this N block.
+      # Avoid fp32->bf16/fp16->fp32 round-trips until the final dK/dV store at
+      # the end of the N loop. The roud-trips will cause significant precision
+      # loss when the IS_CAUSAL is True. This workaround is only suitable for
+      # devices with large computation throughput like SM90+; SM<90, like Ada
+      # and Ampere should use fp32 HBM storage for dK/dV to get good performance.
       dk_acc = tl.zeros([BLOCK_N, BLOCK_HEADDIM], dtype=tl.float32)
       dv_acc = tl.zeros([BLOCK_N, BLOCK_HEADDIM], dtype=tl.float32)
 
