@@ -9,12 +9,6 @@ PyTorch SDPA for backward correctness and backward runtime by default:
 4. Causal Attention          -- causal=True, queries aligned to KV tail.
 5. Dropout Attention         -- dropout_p > 0, compares against SDPA dropout.
 6. Non-aligned Seqlen        -- N=8191 (not a multiple of Bc=64).
-
-Usage::
-
-    CUDA_VISIBLE_DEVICES=0 python examples/ffpa_attn_bwd.py
-    CUDA_VISIBLE_DEVICES=0 python examples/ffpa_attn_bwd.py --backward-backend triton --autotune
-    CUDA_VISIBLE_DEVICES=0 python examples/ffpa_attn_bwd.py --timing-mode full
 """
 
 from __future__ import annotations

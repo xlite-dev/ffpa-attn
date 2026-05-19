@@ -11,11 +11,6 @@ against ``torch.nn.functional.scaled_dot_product_attention``:
 6. Non-aligned Seqlen        -- N=8191 (not a multiple of Bc=64), exercises
                                cp.async zero-fill + softmax -inf mask +
                                per-row store predicate on the tail tile.
-
-Usage::
-
-    CUDA_VISIBLE_DEVICES=0 python examples/ffpa_attn_fwd.py --forward-backend cuda
-    CUDA_VISIBLE_DEVICES=0 python examples/ffpa_attn_fwd.py --forward-backend triton --autotune
 """
 
 from __future__ import annotations
