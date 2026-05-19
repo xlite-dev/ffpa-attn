@@ -83,7 +83,7 @@ FFPA supports multiple backends for the forward and backward pass, including: `C
 
 <div align='center' markdown="1">
 
-|Backend|Arch|Fwd.|Bwd.|Autotune|Feat.|Headdim|Recomm.|Speedup|
+|Backend|Arch|Fwd|Bwd|Autotune|Features|Headdim|Recommend|Speedup|
 |:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
 |CUDA|Ampere+|✔|❌|❌|All|320~1024|Ampere, Ada|**1.5x~3x**🎉|
 |Triton|Ampere+|✔|✔|✔|All|320~1024|Ampere+|**1.5x~3x**🎉|
