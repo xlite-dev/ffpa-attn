@@ -767,7 +767,11 @@ def _gen_bwd_sm90_autotune_configs(
   del headdim
   # fast: 2*1*2*1*1 = 4 configs; max: 2*2*2*2*2 = 32 configs
   configs = []
-  block_headdim_candidates = [128] if enable_persist_dkdv and autotune_mode == "fast" else [64, 128, 256]
+  if enable_persist_dkdv:
+    block_headdim_candidates = [128] if autotune_mode == "fast" else [64, 128]
+  else:
+    block_headdim_candidates = [64] if autotune_mode == "fast" else [64, 128]
+
   for block_m in [64, 128]:
     for block_n in ([64] if autotune_mode == "fast" else [64, 128]):
       for block_headdim in block_headdim_candidates:
