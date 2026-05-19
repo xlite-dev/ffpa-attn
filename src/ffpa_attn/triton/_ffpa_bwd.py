@@ -497,7 +497,7 @@ def _ffpa_bwd_kernel_impl(
     stride_dkn, stride_dvb, stride_dvh, stride_dvn, stride_bb, stride_bh, stride_bm, stride_bn, stride_gbb, stride_gbh,
     stride_gbm, stride_gbn, nheads, seqlen_q, seqlen_k, seqlen_q_rounded, headdim, dropout_p, philox_offset, IS_CAUSAL,
     HAS_ATTN_BIAS, HAS_DROPOUT, PHILOX_SEED, BIAS_REQUIRES_GRAD, GRAD_BIAS_NEEDS_REDUCTION, GRAD_BIAS_REDUCES_M,
-    GRAD_BIAS_STORE_PARTIAL, BLOCK_HEADDIM, DTYPE, EVEN_N, BLOCK_M, BLOCK_N
+    GRAD_BIAS_STORE_PARTIAL, BLOCK_HEADDIM, DTYPE, EVEN_M, EVEN_N, BLOCK_M, BLOCK_N
   )
   _ffpa_bwd_dq(
     Q, K, V, DO, DQ, LSE, D, AttnBias, softmax_scale, stride_qb, stride_qh, stride_qm, stride_kb, stride_kh, stride_kn,
@@ -565,6 +565,7 @@ def _ffpa_bwd_dkdv(
   GRAD_BIAS_STORE_PARTIAL: tl.constexpr,
   BLOCK_HEADDIM: tl.constexpr,
   DTYPE: tl.constexpr,
+  EVEN_M: tl.constexpr,
   EVEN_N: tl.constexpr,
   BLOCK_M: tl.constexpr,
   BLOCK_N: tl.constexpr,
@@ -598,6 +599,8 @@ def _ffpa_bwd_dkdv(
 
     for start_m in range(begin_m, num_block_m * BLOCK_M, BLOCK_M):
       offs_qm = start_m + offs_m
+      if not EVEN_M:
+        m_mask = offs_qm < seqlen_q
       S = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
       dP = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
 
@@ -628,6 +631,8 @@ def _ffpa_bwd_dkdv(
 
       if not EVEN_N:
         S = tl.where(offs_n[None, :] < seqlen_k, S, float("-inf"))
+      if not EVEN_M:
+        S = tl.where(m_mask[:, None], S, float("-inf"))
       if IS_CAUSAL:
         S = tl.where(offs_qm[:, None] >= (offs_n[None, :]), S, float("-inf"))
       S = S * softmax_scale
@@ -638,7 +643,10 @@ def _ffpa_bwd_dkdv(
           other=0.0,
         )
         S += bias
-      lse_i = tl.load(LSE + offs_qm)
+      if EVEN_M:
+        lse_i = tl.load(LSE + offs_qm)
+      else:
+        lse_i = tl.load(LSE + offs_qm, mask=m_mask, other=0.0)
       P = tl.exp(S - lse_i[:, None])
       dropout_mult = _dropout_multiplier(
         off_hb,
@@ -653,7 +661,10 @@ def _ffpa_bwd_dkdv(
       )
       dP = dP * dropout_mult
       P_drop = P * dropout_mult
-      Di = tl.load(D + offs_qm)
+      if EVEN_M:
+        Di = tl.load(D + offs_qm)
+      else:
+        Di = tl.load(D + offs_qm, mask=m_mask, other=0.0)
       if BIAS_REQUIRES_GRAD:
         dBias = P * (dP - Di[:, None])
         grad_bias_mask = (offs_qm[:, None] < seqlen_q) & (offs_n[None, :] < seqlen_k)
@@ -674,6 +685,9 @@ def _ffpa_bwd_dkdv(
         dS = (dBias * softmax_scale).to(DTYPE)
       else:
         dS = (P * (dP - Di[:, None]) * softmax_scale).to(DTYPE)
+      if not EVEN_M:
+        dS = tl.where(m_mask[:, None], dS, 0.0)
+        P_drop = tl.where(m_mask[:, None], P_drop, 0.0)
 
       for d_chunk in range(num_d_chunks):
         d_offs = d_chunk * BLOCK_HEADDIM + offs_d

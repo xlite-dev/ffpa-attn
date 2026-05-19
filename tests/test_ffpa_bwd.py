@@ -309,6 +309,35 @@ def test_ffpa_bwd_triton_preprocess_modes(dtype, preprocess_d_chunk):
   torch.testing.assert_close(v.grad, dv_ref, **tol)
 
 
+def test_ffpa_bwd_triton_non_aligned_seqlen_matches_sdpa():
+  """Raw-pointer Triton backward must mask the final partial Q block."""
+  torch.manual_seed(124)
+  B, H, N, D = 1, 2, 129, 512
+  dtype = torch.float16
+  q = torch.randn(B, H, N, D, dtype=dtype, device="cuda", requires_grad=True)
+  k = torch.randn(B, H, N, D, dtype=dtype, device="cuda", requires_grad=True)
+  v = torch.randn(B, H, N, D, dtype=dtype, device="cuda", requires_grad=True)
+  scale = 1.0 / math.sqrt(D)
+
+  out = ffpa_attn_func(
+    q,
+    k,
+    v,
+    scale=scale,
+    stages=2,
+    acc="f32",
+    high_precision_grad=True,
+    backward_backend="triton",
+  )
+  out.sum().backward()
+
+  dq_ref, dk_ref, dv_ref = _sdpa_ref_grads(q, k, v, False, scale)
+  tol = _tolerance(dtype)
+  torch.testing.assert_close(q.grad, dq_ref, **tol)
+  torch.testing.assert_close(k.grad, dk_ref, **tol)
+  torch.testing.assert_close(v.grad, dv_ref, **tol)
+
+
 @pytest.mark.parametrize("dtype", DTYPES, ids=["fp16", "bf16"])
 def test_ffpa_bwd_triton_internal_kv_storage_dtype_option(dtype):
   """The low-level Triton backward op should expose optional fp16/fp32 dK/dV storage."""
