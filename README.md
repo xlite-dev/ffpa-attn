@@ -77,6 +77,17 @@ Runnable examples are provided under [`examples`](./examples). The performance b
   <img src='./docs/assets/perf/ffpa_speedup_cutedsl_nvidia-h20z_B1_H32_N16384_D512_T.png' width='400px'>
 </div>
 
+## 🤖 Backends
+
+FFPA supports multiple backends for the forward and backward pass, including: CUDA (forward only), Triton, and CuTeDSL. The CuTeDSL backend is currently in early stage and has some constraints (e.g., D=512 only, no attn_mask/dropout), but it can achieve up to `427🎉` TFLOPS on H200 SXM for forward pass and `243🎉` TFLOPS for backward pass, which is very exciting! We will continue to optimize the CuTeDSL backend and lift the constraints in the future.
+
+|Backend|Architectures|Fwd|Bwd|Features|Headdim|Recommended|
+|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+|CUDA|Ampere, Ada, Hopper, Blackwell|✔|❌|All|320~1024|Ampere, Ada|
+|Triton|Ampere, Ada, Hopper, Blackwell|✔|✔|All|320~1024|All|
+|CuTeDSL|Hopper|✔|✔|No Mask/Dropout|512 (Fastest)|Hopper|
+
+
 ## ©️License
 
 <div id="License"></div>

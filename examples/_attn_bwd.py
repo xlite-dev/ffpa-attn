@@ -909,7 +909,7 @@ def run_backward_examples(
       )
 
   print(
-    f"\nRunning FFPA backward examples with backward_backend={backward_backend}, "
+    f"\nRunning FFPA backward, backend={backward_backend}, "
     f"apply_norm={apply_norm}, "
     f"triton_autotune={triton_autotune}, "
     f"triton_autotune_mode={triton_autotune_mode}, "
@@ -920,10 +920,7 @@ def run_backward_examples(
     f"warmup={warmup}, iters={iters}"
   )
   if backward_backend == "cutedsl":
-    print(
-      "[cutedsl] backend constraints in effect: D=512 + bf16 + no mask/dropout; "
-      "forward auto-paired to cutedsl; triton-* / enable-bwd-tma|ws / grad-kv-dtype are ignored."
-    )
+    print("[CuTeDSL] backend constraints in effect: D=512 + bf16 + no mask/dropout.")
 
   mask_dropout_supported = backward_backend != "cutedsl"
 

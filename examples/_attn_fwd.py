@@ -476,11 +476,7 @@ def run_forward_examples(
     f"warmup={warmup}, iters={iters}"
   )
   if forward_backend == "cutedsl":
-    print(
-      "[cutedsl] backend constraints in effect: D=512 only, fp16/bf16 forward, "
-      "no attn_mask / dropout cases (auto-skipped); "
-      "triton-* / enable-fwd-tma|ws options are ignored."
-    )
+    print("[CuTeDSL] backend constraints in effect: D=512 only, no attn_mask/dropout.")
 
   for dtype in dtypes:
     case_specs: list[dict[str, Any]] = [
