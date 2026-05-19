@@ -699,6 +699,17 @@ def _ffpa_bwd_sm90_kernel_impl(
   pass (``TritonGPUPlanCTAPass``, pipeline name
   ``triton-nvidia-gpu-plan-cta``) and the second ``DotOp`` hits the
   PlanCTA.cpp assertion ``!tiled && "CTA tiling is already determined"``.
+
+  TODO: Consider splitting this wrapper into separate dK/dV and dQ kernel
+  launches. The two phases do not depend on each other's outputs after the
+  preprocess ``D`` kernel: dK/dV writes ``DK`` / ``DV`` / optional bias grad,
+  while dQ writes only ``DQ``. Keeping them in one Triton function may increase
+  register pressure, shared-memory/TMA pipeline pressure, and PlanCTA stress,
+  especially for ``PERSIST_DKDV_ACC`` where dK/dV carries fp32 ``dk_acc`` /
+  ``dv_acc`` accumulators. A split launch would not reduce S/dP recomputation,
+  but it would allow independent resource allocation and autotune configs for
+  the dK/dV and dQ phases. The extra launch overhead should be negligible for
+  large prefill shapes, but may hurt decode or very small sequence lengths.
   """
   # Keys for autotune and heuristics lookups.
   _ = autotune_seqlen_q_bucket
