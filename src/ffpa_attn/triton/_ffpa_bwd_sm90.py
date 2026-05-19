@@ -618,7 +618,7 @@ _SM90_BWD_DEFAULT_CONFIG = {
 
 _SM90_BWD_PERSIST_DKDV_DEFAULT_CONFIG = {
   "BLOCK_M": 64,
-  "BLOCK_N": 64,
+  "BLOCK_N": 128,
   "BLOCK_HEADDIM": 128,
   "warp_specialize": False,
   "num_warps": 8,
