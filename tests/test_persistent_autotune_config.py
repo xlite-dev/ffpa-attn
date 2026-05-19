@@ -729,6 +729,19 @@ def test_lookup_sm90_backward_persist_uses_distinct_kernel_key(tmp_path, monkeyp
           "num_stages": 2,
         },
       },
+      {
+        **base_entry,
+        "enable_ws": True,
+        "kernel": "bwd_sm90_generic_persist_dkdv",
+        "config": {
+          "BLOCK_M": 64,
+          "BLOCK_N": 128,
+          "BLOCK_HEADDIM": 128,
+          "warp_specialize": True,
+          "num_warps": 8,
+          "num_stages": 2,
+        },
+      },
     ]),
     path,
   )
@@ -768,9 +781,27 @@ def test_lookup_sm90_backward_persist_uses_distinct_kernel_key(tmp_path, monkeyp
     enable_ws=False,
     enable_persist_dkdv=True,
   )
+  persist_ws_config = lookup_bwd_sm90_persistent_config(
+    q=q,
+    seqlen_q=8192,
+    seqlen_k=8192,
+    headdim=512,
+    autotune_mode="fast",
+    causal=True,
+    bias_grad=False,
+    grad_kv_storage_dtype=None,
+    has_attn_bias=False,
+    has_dropout=False,
+    nheads_q=32,
+    nheads_kv=32,
+    enable_ws=True,
+    enable_persist_dkdv=True,
+  )
 
   assert generic["BLOCK_HEADDIM"] == 64
   assert persist_config["BLOCK_HEADDIM"] == 128
+  assert persist_ws_config["warp_specialize"] is True
+  assert persist_ws_config["BLOCK_N"] == 128
 
 
 def test_backward_preprocess_config_backfills_block_headdim():

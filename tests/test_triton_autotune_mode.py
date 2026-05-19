@@ -468,6 +468,19 @@ def test_sm90_bwd_tma_configs_are_tma_only_in_phase1(monkeypatch):
   assert {config["num_stages"] for config in max_serialized} == {2, 3}
 
 
+def test_sm90_bwd_tma_configs_force_warp_specialize(monkeypatch):
+  monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: (9, 0))
+  fast = _gen_bwd_sm90_autotune_configs(512, autotune_mode="fast", enable_ws=True)
+  max_configs = _gen_bwd_sm90_autotune_configs(512, autotune_mode="max", enable_ws=True)
+  serialized = [config_from_triton_config(config) for config in fast]
+  max_serialized = [config_from_triton_config(config) for config in max_configs]
+
+  assert len(fast) < len(max_configs)
+  assert {config["warp_specialize"] for config in serialized} == {True}
+  assert {config["warp_specialize"] for config in max_serialized} == {True}
+  assert {config["num_stages"] for config in max_serialized} == {2, 3}
+
+
 def test_persistent_tune_backward_records_sm90_tma_config(monkeypatch):
   task = TuneTask("backward", torch.float16, 320, 512, 512, False, 8, 8)
   q = torch.empty(1, 8, 512, 320, requires_grad=True)
@@ -538,7 +551,11 @@ def test_forward_autotune_keys_include_causal():
 def test_sm90_bwd_persist_autotune_is_cache_scoped():
   normal = _get_bwd_sm90_autotune(320, "fast", "bf16", False, enable_ws=False, enable_persist_dkdv=False)
   persist = _get_bwd_sm90_autotune(320, "fast", "bf16", False, enable_ws=False, enable_persist_dkdv=True)
+  ws = _get_bwd_sm90_autotune(320, "fast", "bf16", False, enable_ws=True, enable_persist_dkdv=False)
+  persist_ws = _get_bwd_sm90_autotune(320, "fast", "bf16", False, enable_ws=True, enable_persist_dkdv=True)
   assert normal is not persist
+  assert normal is not ws
+  assert persist is not persist_ws
 
 
 def test_autotune_wrappers_are_dtype_scoped():

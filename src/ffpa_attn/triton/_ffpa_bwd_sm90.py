@@ -97,6 +97,7 @@ def _ffpa_bwd_dkdv_sm90(
   EVEN_N: tl.constexpr,
   BLOCK_M: tl.constexpr,
   BLOCK_N: tl.constexpr,
+  warp_specialize: tl.constexpr,
 ) -> None:
   """dK/dV half of the SM90 TMA Split-D backward kernel.
 
@@ -135,7 +136,14 @@ def _ffpa_bwd_dkdv_sm90(
     begin_m = 0 if not IS_CAUSAL else start_n // BLOCK_M * BLOCK_M
     k_offset_y = kv_base_y + start_n
 
-    for start_m in range(begin_m, num_block_m * BLOCK_M, BLOCK_M):
+    for start_m in tl.range(
+      begin_m,
+      num_block_m * BLOCK_M,
+      BLOCK_M,
+      disallow_acc_multi_buffer=warp_specialize,
+      flatten=warp_specialize,
+      warp_specialize=warp_specialize,
+    ):
       offs_qm = start_m + offs_m
       q_offset_y = q_base_y + start_m
 
@@ -270,6 +278,7 @@ def _ffpa_bwd_dkdv_persist_sm90(
   EVEN_N: tl.constexpr,
   BLOCK_M: tl.constexpr,
   BLOCK_N: tl.constexpr,
+  warp_specialize: tl.constexpr,
 ) -> None:
   """dK/dV half with fp32 register accumulation across Q blocks."""
   pid = tl.program_id(0)
@@ -306,7 +315,14 @@ def _ffpa_bwd_dkdv_persist_sm90(
       dk_acc = tl.zeros([BLOCK_N, BLOCK_HEADDIM], dtype=tl.float32)
       dv_acc = tl.zeros([BLOCK_N, BLOCK_HEADDIM], dtype=tl.float32)
 
-      for start_m in range(begin_m, num_block_m * BLOCK_M, BLOCK_M):
+      for start_m in tl.range(
+        begin_m,
+        num_block_m * BLOCK_M,
+        BLOCK_M,
+        disallow_acc_multi_buffer=warp_specialize,
+        flatten=warp_specialize,
+        warp_specialize=warp_specialize,
+      ):
         offs_qm = start_m + offs_m
         q_offset_y = q_base_y + start_m
 
@@ -418,6 +434,7 @@ def _ffpa_bwd_dq_sm90(
   EVEN_N: tl.constexpr,
   BLOCK_M: tl.constexpr,
   BLOCK_N: tl.constexpr,
+  warp_specialize: tl.constexpr,
 ) -> None:
   """dQ half of the SM90 TMA Split-D backward kernel."""
   pid = tl.program_id(0)
@@ -447,7 +464,13 @@ def _ffpa_bwd_dq_sm90(
     num_block_n = tl.cdiv(seqlen_k, BLOCK_N)
     end_n_k = start_m + BLOCK_M if IS_CAUSAL else num_block_n * BLOCK_N
 
-    for start_n_k in range(0, end_n_k, BLOCK_N):
+    for start_n_k in tl.range(
+      0,
+      end_n_k,
+      BLOCK_N,
+      flatten=warp_specialize,
+      warp_specialize=warp_specialize,
+    ):
       offs_nk = start_n_k + offs_n
       k_offset_y = kv_base_y + start_n_k
 
@@ -590,7 +613,7 @@ def _ffpa_bwd_sm90_kernel_impl(
       stride_dkn, stride_dvb, stride_dvh, stride_dvn, stride_bb, stride_bh, stride_bm, stride_bn, stride_gbb,
       stride_gbh, stride_gbm, stride_gbn, nheads, seqlen_q, seqlen_k, seqlen_q_rounded, headdim, dropout_p,
       philox_offset, IS_CAUSAL, HAS_ATTN_BIAS, HAS_DROPOUT, PHILOX_SEED, BIAS_REQUIRES_GRAD, GRAD_BIAS_NEEDS_REDUCTION,
-      GRAD_BIAS_REDUCES_M, GRAD_BIAS_STORE_PARTIAL, BLOCK_HEADDIM, DTYPE, EVEN_N, BLOCK_M, BLOCK_N
+      GRAD_BIAS_REDUCES_M, GRAD_BIAS_STORE_PARTIAL, BLOCK_HEADDIM, DTYPE, EVEN_N, BLOCK_M, BLOCK_N, warp_specialize
     )
   else:
     _ffpa_bwd_dkdv_sm90(
@@ -598,12 +621,12 @@ def _ffpa_bwd_sm90_kernel_impl(
       stride_dkn, stride_dvb, stride_dvh, stride_dvn, stride_bb, stride_bh, stride_bm, stride_bn, stride_gbb,
       stride_gbh, stride_gbm, stride_gbn, nheads, seqlen_q, seqlen_k, seqlen_q_rounded, headdim, dropout_p,
       philox_offset, IS_CAUSAL, HAS_ATTN_BIAS, HAS_DROPOUT, PHILOX_SEED, BIAS_REQUIRES_GRAD, GRAD_BIAS_NEEDS_REDUCTION,
-      GRAD_BIAS_REDUCES_M, GRAD_BIAS_STORE_PARTIAL, BLOCK_HEADDIM, DTYPE, EVEN_N, BLOCK_M, BLOCK_N
+      GRAD_BIAS_REDUCES_M, GRAD_BIAS_STORE_PARTIAL, BLOCK_HEADDIM, DTYPE, EVEN_N, BLOCK_M, BLOCK_N, warp_specialize
     )
   _ffpa_bwd_dq_sm90(
     desc_q, desc_k, desc_v, desc_do, DQ, LSE, D, AttnBias, softmax_scale, stride_dqb, stride_dqh, stride_dqm, stride_bb,
     stride_bh, stride_bm, stride_bn, nheads, seqlen_q, seqlen_k, seqlen_q_rounded, headdim, dropout_p, philox_offset,
-    IS_CAUSAL, HAS_ATTN_BIAS, HAS_DROPOUT, PHILOX_SEED, BLOCK_HEADDIM, DTYPE, EVEN_N, BLOCK_M, BLOCK_N
+    IS_CAUSAL, HAS_ATTN_BIAS, HAS_DROPOUT, PHILOX_SEED, BLOCK_HEADDIM, DTYPE, EVEN_N, BLOCK_M, BLOCK_N, warp_specialize
   )
 
 
@@ -749,7 +772,7 @@ def _ffpa_bwd_sm90_make_descs(
   )
 
 
-def _ffpa_bwd_sm90_prepare_descriptors(
+def _ffpa_bwd_sm90_prepare_descs(
   desc_q: TensorDescriptor,
   desc_k: TensorDescriptor,
   desc_v: TensorDescriptor,
@@ -1039,8 +1062,10 @@ def _ffpa_attn_backward_sm90_impl(
     )
     if persisted_config is not None:
       launch_config.update(persisted_config)
-    launch_config["warp_specialize"] = False
-    _ffpa_bwd_sm90_prepare_descriptors(desc_q, desc_k, desc_v, desc_do, launch_config)
+    launch_config["warp_specialize"] = bool(enable_ws)
+    if enable_ws:
+      launch_config["num_stages"] = 2
+    _ffpa_bwd_sm90_prepare_descs(desc_q, desc_k, desc_v, desc_do, launch_config)
     _ffpa_bwd_sm90_kernel_impl[grid](*kernel_args, **kernel_meta, **launch_config)
 
   if use_key_bias_grad_reduction:
