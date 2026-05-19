@@ -83,9 +83,9 @@ FFPA supports multiple backends for the forward and backward pass, including: CU
 
 |Backend|Architectures|Fwd|Bwd|Features|Headdim|Recommended|
 |:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-|CUDA|Ampere, Ada, Hopper, Blackwell|✔|❌|All|320~1024|Ampere, Ada|
-|Triton|Ampere, Ada, Hopper, Blackwell|✔|✔|All|320~1024|All|
-|CuTeDSL|Hopper|✔|✔|No Mask/Dropout|512 (Fastest)|Hopper|
+|CUDA|Ampere+|✔|❌|All|320~1024|Ampere, Ada|
+|Triton|Ampere+|✔|✔|All|320~1024|Ampere+|
+|CuTeDSL|Hopper only|✔|✔|No Mask/Dropout|512 (Fastest)|Hopper|
 
 
 ## ©️License
