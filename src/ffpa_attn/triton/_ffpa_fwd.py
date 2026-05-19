@@ -1329,7 +1329,7 @@ def _ffpa_attn_forward_impl(
   :param enable_tma: Whether the experimental SM90+ TMA forward path may be
       used. Defaults to ``False``. The SM90 path is silently skipped when
       hardware or shape preconditions are not met.
-    :param enable_ws: Whether the SM90 TMA forward path may use warp-specialized
+  :param enable_ws: Whether the SM90 forward path may use warp-specialized
       configs. Defaults to ``False``.
   """
   batch, nheads_q, seqlen_q, headdim = q.shape
@@ -1346,8 +1346,8 @@ def _ffpa_attn_forward_impl(
   num_splits = _get_decode_num_splits(seqlen_q, seqlen_k, headdim, batch, nheads_q, q.device)
 
   if enable_tma and num_splits == 1:
+    from ._ffpa_fwd_sm90 import _ffpa_attn_forward_sm90_impl as _fwd_sm90_impl
     from ._ffpa_fwd_sm90 import is_sm90_tma_forward_supported as _sm90_supported
-    from ._ffpa_fwd_sm90 import _ffpa_attn_forward_sm90_tma_impl as _fwd_sm90_impl
 
     if _sm90_supported(q, k, v, o, num_splits=num_splits):
       _fwd_sm90_impl(

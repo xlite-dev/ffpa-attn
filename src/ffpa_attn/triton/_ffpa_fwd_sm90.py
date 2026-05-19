@@ -687,7 +687,7 @@ def is_sm90_tma_forward_supported(
   return q.stride(-1) == k.stride(-1) == v.stride(-1) == o.stride(-1) == 1
 
 
-def _ffpa_attn_forward_sm90_tma_impl(
+def _ffpa_attn_forward_sm90_impl(
   q: torch.Tensor,
   k: torch.Tensor,
   v: torch.Tensor,
@@ -703,7 +703,7 @@ def _ffpa_attn_forward_sm90_tma_impl(
   philox_offset: int = 0,
   enable_ws: bool = False,
 ) -> None:
-  """Run the SM90 TMA forward implementation.
+  """Run the SM90 forward implementation.
 
   This is the integration scaffold for the descriptor/TMA kernel.  Phase 1
   implements a non-warp-specialized TMA kernel that replaces raw-pointer
