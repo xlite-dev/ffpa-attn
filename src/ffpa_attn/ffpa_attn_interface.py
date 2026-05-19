@@ -123,6 +123,8 @@ def _should_fallback_to_sdpa(
   return any([
     D <= 256,
     D > 1024,
+    # attn_mask and dropout only supported in triton backend for now.
+    attn_mask is not None and forward_backend == "cutedsl",
     dropout_p > 0.0 and forward_backend == "cutedsl",
     (8 <= Nq < 512),
     Nkv < 512,
@@ -198,17 +200,21 @@ def ffpa_attn_func(
       ``high_precision_grad``, ``forward_backend``,
       ``triton_autotune``, ``triton_autotune_mode``,
       ``backward_backend``,
-      ``triton_backward_preprocess_d_chunk``, and
-      ``triton_backward_grad_v_storage_dtype``. ``forward_backend`` only affects ``D > 256``.
+      ``triton_backward_preprocess_d_chunk``,
+      ``triton_backward_enable_persist_dkdv``, and
+      ``triton_backward_grad_kv_storage_dtype``. ``forward_backend`` only affects ``D > 256``.
       ``enable_forward_tma`` and ``enable_backward_tma`` independently opt
       into the SM90+ Triton descriptor/TMA forward and backward paths when
       supported. ``enable_forward_ws`` and ``enable_backward_ws`` request
       warp-specialized TMA configs for the matching direction. ``enable_tma``
       and ``enable_ws`` are compatibility aliases that set both directions.
+      ``triton_backward_enable_persist_dkdv`` enables an experimental SM90 TMA
+      backward path that keeps dK/dV accumulators in fp32 registers across Q
+      blocks and requires ``enable_backward_tma=True``.
       ``backward_backend`` supports ``"triton"`` and ``"sdpa"``.
-      ``triton_backward_grad_v_storage_dtype`` defaults to ``None`` and
-      currently only accepts ``torch.float32`` as an override for Triton
-      backward's internal ``DV`` storage dtype. These options do not change
+      ``triton_backward_grad_kv_storage_dtype`` defaults to ``None`` and
+      currently accepts ``torch.float16`` or ``torch.float32`` as overrides for Triton
+      backward's internal ``DK`` / ``DV`` storage dtype. These options do not change
       the autograd contract; unknown keys raise ``TypeError``.
 
   :returns: Output tensor ``O`` with layout ``[B, Nh_q, Nq, D]``,

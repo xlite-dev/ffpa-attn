@@ -49,7 +49,7 @@ _SM90_FWD_HEURISTICS = {
 
 
 @triton.jit
-def _ffpa_fwd_sm90_process_kv_block(
+def _ffpa_fwd_sm90_kv_block(
   desc_q: tl.tensor_descriptor,
   desc_k: tl.tensor_descriptor,
   desc_v: tl.tensor_descriptor,
@@ -284,7 +284,7 @@ def _ffpa_fwd_sm90_kernel_impl(
       flatten=True,
       warp_specialize=True,
     ):
-      o_accs, m_i, l_i = _ffpa_fwd_sm90_process_kv_block(
+      o_accs, m_i, l_i = _ffpa_fwd_sm90_kv_block(
         desc_q,
         desc_k,
         desc_v,
@@ -324,7 +324,7 @@ def _ffpa_fwd_sm90_kernel_impl(
     # WS-only attrs still changes non-WS codegen and caps the stage3/4 TMA
     # candidates that were the fast path before WS was added.
     for start_n in range(0, end_n, BLOCK_N):
-      o_accs, m_i, l_i = _ffpa_fwd_sm90_process_kv_block(
+      o_accs, m_i, l_i = _ffpa_fwd_sm90_kv_block(
         desc_q,
         desc_k,
         desc_v,

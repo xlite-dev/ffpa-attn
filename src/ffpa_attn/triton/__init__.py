@@ -44,7 +44,7 @@ def _triton_bwd_grad_tensor_like(
   ``tl.load`` / ``tl.store`` traffic on ``DQ`` / ``DK`` / ``DV``. For example,
   when ``_triton_bwd_grad_tensor_like(k)`` returns bf16 storage, the backward
   kernel's ``tl.load(dk_ptrs)`` / ``tl.store(dk_ptrs, ...)`` sites operate on
-  bf16 values. Returning fp32 here therefore upgrades the kernel's cross-tile
+  bf16 values. Returning fp16/fp32 here therefore changes the kernel's cross-tile
   global accumulation dtype, not just the Python-visible output tensor dtype.
 
   Memory note:
@@ -63,19 +63,30 @@ def _triton_bwd_grad_tensor_like(
   had fewer heads.
 
   Recommendation:
-  keep fp32 storage targeted to the gradient that needs higher cross-tile
-  accumulation precision. For the current Triton backward path this is dV.
+  keep fp32 storage targeted to gradients that need higher cross-tile
+  accumulation precision. For the current Triton backward path this is dK/dV.
 
   :param tensor: Reference tensor that provides shape, device, and default
     dtype.
   :param grad_storage_dtype: Optional storage dtype for this internal gradient
-    buffer. ``None`` keeps the user-visible activation dtype; ``torch.float32``
-    upgrades cross-tile global accumulation storage to fp32.
+    buffer. ``None`` keeps the user-visible activation dtype; ``torch.float16``
+    or ``torch.float32`` overrides cross-tile global accumulation storage.
   :return: Newly allocated gradient buffer.
   """
   if grad_storage_dtype is None:
     return torch.empty_like(tensor)
   return torch.empty_like(tensor, dtype=grad_storage_dtype)
+
+
+def _grad_kv_storage_dtype_from_code(code: int) -> torch.dtype | None:
+  """Decode the internal dK/dV storage dtype selector."""
+  if code == 0:
+    return None
+  if code == 1:
+    return torch.float32
+  if code == 2:
+    return torch.float16
+  raise ValueError(f"Unsupported grad_kv_storage_dtype code {code}; expected 0, 1, or 2.")
 
 
 torch.library.define(
@@ -168,8 +179,9 @@ torch.library.define(
   f"{_OP_NAMESPACE}::_bwd_triton",
   "(Tensor dO, Tensor q, Tensor k, Tensor v, Tensor o, Tensor lse, Tensor? attn_bias, "
   "float softmax_scale, int causal, int autotune, "
-  "int autotune_mode_is_max, int preprocess_d_chunk, int return_attn_bias_grad, int grad_v_storage_dtype_is_fp32, "
-  "int original_nheads_kv, float dropout_p, int philox_seed, int philox_offset, int enable_tma, int enable_ws) "
+  "int autotune_mode_is_max, int preprocess_d_chunk, int return_attn_bias_grad, int grad_kv_storage_dtype_code, "
+  "int original_nheads_kv, float dropout_p, int philox_seed, int philox_offset, int enable_tma, int enable_ws, "
+  "int enable_persist_dkdv) "
   "-> (Tensor dq, Tensor dk, Tensor dv, Tensor grad_attn_bias)",
 )
 
@@ -189,20 +201,21 @@ def _bwd_triton_torch_op(
   autotune_mode_is_max: int,
   preprocess_d_chunk: int,
   return_attn_bias_grad: int,
-  grad_v_storage_dtype_is_fp32: int,
+  grad_kv_storage_dtype_code: int,
   original_nheads_kv: int,
   dropout_p: float,
   philox_seed: int,
   philox_offset: int,
   enable_tma: int,
   enable_ws: int,
+  enable_persist_dkdv: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
   from ._ffpa_bwd import _ffpa_attn_backward_triton_impl as _triton_bwd_kernel
 
-  grad_v_storage_dtype = torch.float32 if grad_v_storage_dtype_is_fp32 else None
+  grad_kv_storage_dtype = _grad_kv_storage_dtype_from_code(grad_kv_storage_dtype_code)
   dq = _triton_bwd_grad_tensor_like(q)
-  dk = _triton_bwd_grad_tensor_like(k)
-  dv = _triton_bwd_grad_tensor_like(v, grad_v_storage_dtype)
+  dk = _triton_bwd_grad_tensor_like(k, grad_kv_storage_dtype)
+  dv = _triton_bwd_grad_tensor_like(v, grad_kv_storage_dtype)
   if attn_bias is not None and return_attn_bias_grad:
     grad_dtype = _attn_bias_grad_dtype(attn_bias, q, k)
     grad_attn_bias = torch.empty_like(attn_bias, dtype=grad_dtype)
@@ -234,6 +247,7 @@ def _bwd_triton_torch_op(
     philox_offset=philox_offset,
     enable_tma=bool(enable_tma),
     enable_ws=bool(enable_ws),
+    enable_persist_dkdv=bool(enable_persist_dkdv),
   )
   return dq, dk, dv, grad_attn_bias
 
@@ -253,13 +267,14 @@ def _bwd_triton_fake(
   autotune_mode_is_max: int,
   preprocess_d_chunk: int,
   return_attn_bias_grad: int,
-  grad_v_storage_dtype_is_fp32: int,
+  grad_kv_storage_dtype_code: int,
   original_nheads_kv: int,
   dropout_p: float,
   philox_seed: int,
   philox_offset: int,
   enable_tma: int,
   enable_ws: int,
+  enable_persist_dkdv: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
   del (
     softmax_scale,
@@ -273,8 +288,9 @@ def _bwd_triton_fake(
     philox_offset,
     enable_tma,
     enable_ws,
+    enable_persist_dkdv,
   )
-  grad_v_storage_dtype = torch.float32 if grad_v_storage_dtype_is_fp32 else None
+  grad_kv_storage_dtype = _grad_kv_storage_dtype_from_code(grad_kv_storage_dtype_code)
   if attn_bias is not None and return_attn_bias_grad:
     grad_dtype = _attn_bias_grad_dtype(attn_bias, q, k)
     grad_attn_bias = torch.empty_like(attn_bias, dtype=grad_dtype)
@@ -282,8 +298,8 @@ def _bwd_triton_fake(
     grad_attn_bias = q.new_empty(0)
   return (
     _triton_bwd_grad_tensor_like(q),
-    _triton_bwd_grad_tensor_like(k),
-    _triton_bwd_grad_tensor_like(v, grad_v_storage_dtype),
+    _triton_bwd_grad_tensor_like(k, grad_kv_storage_dtype),
+    _triton_bwd_grad_tensor_like(v, grad_kv_storage_dtype),
     grad_attn_bias,
   )
 

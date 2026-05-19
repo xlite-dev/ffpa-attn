@@ -77,6 +77,22 @@ Runnable examples are provided under [`examples`](./examples). The performance b
   <img src='./docs/assets/perf/ffpa_speedup_cutedsl_nvidia-h20z_B1_H32_N16384_D512_T.png' width='400px'>
 </div>
 
+## 🤖 Backends
+
+FFPA supports multiple backends for the forward and backward pass, including: `CUDA` (forward only), `Triton`, and `CuTeDSL`. The CuTeDSL backend is currently in early stage and has some constraints (e.g., D=512 only), but it can achieve up to `427🎉` TFLOPS on H200! We will continue to optimize the CuTeDSL backend in the future.
+
+<div align='center' markdown="1">
+
+|Backend|Arch|Fwd|Bwd|Headdim|Autotune|Speedup|Recommend|
+|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+|CUDA|Ampere+|✔|❌|320~1024|❌|**1.5x~3x**🎉|Ampere, Ada|
+|Triton|Ampere+|✔|✔|320~1024|✔|**1.5x~3x**🎉|Ampere+|
+|CuTeDSL|Hopper|✔|✔|512|❌|**3x~6x**🎉|Hopper|
+
+<i>Special thanks to [Butterfingrz](https://github.com/Butterfingrz) for contributing to the CuTeDSL backend! Awesome work!🎉</i>
+
+</div>
+
 ## ©️License
 
 <div id="License"></div>
@@ -101,3 +117,5 @@ Apache License 2.0
 - [flash-attention](https://github.com/Dao-AILab/flash-attention)
 - [LeetCUDA](https://github.com/xlite-dev/LeetCUDA)
 - [flashinfer](https://github.com/flashinfer-ai/flashinfer)
+- [quack](https://github.com/Dao-AILab/quack)
+- [cutlass](https://github.com/NVIDIA/cutlass)

@@ -92,6 +92,16 @@ _KERNEL_CONFIG_KEYS = {
     "num_ctas",
     "maxnreg",
   },
+  "bwd_sm90_generic_persist_dkdv": {
+    "BLOCK_M",
+    "BLOCK_N",
+    "BLOCK_HEADDIM",
+    "warp_specialize",
+    "num_warps",
+    "num_stages",
+    "num_ctas",
+    "maxnreg",
+  },
   "decode_bwd_stage1": {
     "BLOCK_M",
     "BLOCK_N",
@@ -118,7 +128,7 @@ class PersistentConfigRequest:
   :param causal: Whether the attention is causal.
   :param preprocess_d_chunk: Backward preprocess D-chunk mode.
   :param bias_grad: Whether the current backward call writes attention-bias gradients.
-  :param grad_v_storage_dtype: Optional Triton backward dV storage dtype name.
+  :param grad_kv_storage_dtype: Optional Triton backward dK/dV storage dtype name.
   :param use_gemv: Decode backward single-query specialization flag.
   :param has_attn_bias: Whether an additive attention bias is active.
   :param has_dropout: Whether dropout is active.
@@ -144,7 +154,7 @@ class PersistentConfigRequest:
   causal: bool | None = None
   preprocess_d_chunk: bool | None = None
   bias_grad: bool | None = None
-  grad_v_storage_dtype: str | None = None
+  grad_kv_storage_dtype: str | None = None
   use_gemv: bool | None = None
   has_attn_bias: bool | None = None
   has_dropout: bool | None = None
@@ -466,9 +476,10 @@ def _lookup_persistent_config_cached(
       continue
     if request.bias_grad is not None and bool(entry.get("bias_grad", False)) != request.bias_grad:
       continue
-    if request.grad_v_storage_dtype is not None and entry.get("grad_v_storage_dtype") != request.grad_v_storage_dtype:
+    entry_grad_kv_storage_dtype = entry.get("grad_kv_storage_dtype", entry.get("grad_v_storage_dtype"))
+    if request.grad_kv_storage_dtype is not None and entry_grad_kv_storage_dtype != request.grad_kv_storage_dtype:
       continue
-    if request.grad_v_storage_dtype is None and entry.get("grad_v_storage_dtype") is not None:
+    if request.grad_kv_storage_dtype is None and entry_grad_kv_storage_dtype is not None:
       continue
     if request.use_gemv is not None and bool(entry.get("use_gemv", False)) != request.use_gemv:
       continue
@@ -483,13 +494,14 @@ def _lookup_persistent_config_cached(
     # TMA+WS runs with the same shape do not reuse each other's configs. Older
     # JSON files lack those flags, so infer the safest compatibility meaning
     # from the kernel name and the persisted warp_specialize meta.
-    inferred_enable_tma = request.kernel in {"fwd_sm90_generic", "bwd_sm90_generic"}
+    sm90_tma_kernels = {"fwd_sm90_generic", "bwd_sm90_generic", "bwd_sm90_generic_persist_dkdv"}
+    inferred_enable_tma = request.kernel in sm90_tma_kernels
     inferred_enable_ws = bool(config.get("warp_specialize", False)) if inferred_enable_tma else False
     if not _entry_flag_matches(entry, "enable_tma", request.enable_tma, inferred_enable_tma):
       continue
     if not _entry_flag_matches(entry, "enable_ws", request.enable_ws, inferred_enable_ws):
       continue
-    if request.kernel in {"fwd_sm90_generic", "bwd_sm90_generic"} and request.enable_ws is not None and bool(
+    if request.kernel in sm90_tma_kernels and request.enable_ws is not None and bool(
       config.get("warp_specialize", False)
     ) != request.enable_ws:
       continue

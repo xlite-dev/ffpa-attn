@@ -31,8 +31,16 @@ if TYPE_CHECKING:
 _ACC_F16 = 0
 _ACC_F32 = 1
 
+
+def _is_hopper_or_later() -> bool:
+  if not torch.cuda.is_available():
+    return False
+  major, minor = torch.cuda.get_device_capability()
+  return (major, minor) >= (9, 0)
+
+
 _FFPA_ATTN_IMPL_DEFAULTS: dict[str, object] = {
-  "stages": 2,
+  "stages": 4 if _is_hopper_or_later() else 3,
   "acc": "f32",
   "enable_tma": False,
   "enable_ws": False,
@@ -40,13 +48,14 @@ _FFPA_ATTN_IMPL_DEFAULTS: dict[str, object] = {
   "enable_backward_tma": False,
   "enable_forward_ws": False,
   "enable_backward_ws": False,
+  "triton_backward_enable_persist_dkdv": False,
   "high_precision_grad": False,
   "forward_backend": "triton",
   "triton_autotune": False,
   "triton_autotune_mode": "fast",
   "backward_backend": "triton",
   "triton_backward_preprocess_d_chunk": False,
-  "triton_backward_grad_v_storage_dtype": None,
+  "triton_backward_grad_kv_storage_dtype": None,
 }
 
 _CUDA_BACKEND_LOADED = False
@@ -220,6 +229,9 @@ class FFPAAttnMeta:
     Only effective with ``enable_forward_tma=True``. Defaults to ``False``.
   :param enable_backward_ws: Force warp-specialized SM90 TMA backward configs.
     Only effective with ``enable_backward_tma=True``. Defaults to ``False``.
+  :param triton_backward_enable_persist_dkdv: Use the experimental SM90 TMA
+    backward dK/dV path that keeps fp32 dK/dV accumulators in registers across
+    Q blocks. Requires ``enable_backward_tma=True``. Defaults to ``False``.
   :param enable_tma: Compatibility alias for setting both
     ``enable_forward_tma`` and ``enable_backward_tma``.
   :param enable_ws: Compatibility alias for setting both
@@ -234,9 +246,9 @@ class FFPAAttnMeta:
   :param backward_backend: Backward backend name. ``"sdpa"`` or ``"triton"``.
   :param triton_backward_preprocess_d_chunk: Whether Triton backward should
     compute delta with the split-D preprocess kernel.
-  :param triton_backward_grad_v_storage_dtype: Optional storage dtype for
-    Triton backward ``DV`` buffer. ``None`` keeps v dtype; currently only
-    ``torch.float32`` is accepted as an override.
+  :param triton_backward_grad_kv_storage_dtype: Optional storage dtype for
+    Triton backward ``DK`` / ``DV`` buffers. ``None`` keeps k/v dtype;
+    currently ``torch.float16`` and ``torch.float32`` are accepted as overrides.
   """
 
   is_causal: bool
@@ -247,6 +259,7 @@ class FFPAAttnMeta:
   enable_backward_tma: int
   enable_forward_ws: int
   enable_backward_ws: int
+  triton_backward_enable_persist_dkdv: bool
   dropout_p: float
   is_grad_enabled: bool
   high_precision_grad: bool
@@ -255,7 +268,7 @@ class FFPAAttnMeta:
   triton_autotune_mode: str
   backward_backend: str
   triton_backward_preprocess_d_chunk: bool
-  triton_backward_grad_v_storage_dtype: torch.dtype | None
+  triton_backward_grad_kv_storage_dtype: torch.dtype | None
 
   @classmethod
   def from_kwargs(cls, **kwargs: object) -> FFPAAttnMeta:
@@ -296,7 +309,8 @@ class FFPAAttnMeta:
     triton_autotune_mode = str(impl_options["triton_autotune_mode"])
     backward_backend = str(impl_options["backward_backend"])
     triton_backward_preprocess_d_chunk = bool(impl_options["triton_backward_preprocess_d_chunk"])
-    triton_backward_grad_v_storage_dtype = impl_options["triton_backward_grad_v_storage_dtype"]
+    triton_backward_grad_kv_storage_dtype = impl_options["triton_backward_grad_kv_storage_dtype"]
+    triton_backward_enable_persist_dkdv = bool(impl_options["triton_backward_enable_persist_dkdv"])
 
     assert forward_backend in ("cuda", "triton", "cutedsl"), \
       f"Unsupported forward_backend={forward_backend!r}; choose 'cuda', 'triton', or 'cutedsl'."
@@ -320,11 +334,13 @@ class FFPAAttnMeta:
       )
     assert triton_autotune_mode in ("fast", "max"), \
       f"Unsupported triton_autotune_mode={triton_autotune_mode!r}; choose 'fast' or 'max'."
-    if triton_backward_grad_v_storage_dtype not in (None, torch.float32):
+    if triton_backward_grad_kv_storage_dtype not in (None, torch.float16, torch.float32):
       raise ValueError(
-        "triton_backward_grad_v_storage_dtype must be None or torch.float32, "
-        f"got {triton_backward_grad_v_storage_dtype!r}"
+        "triton_backward_grad_kv_storage_dtype must be None, torch.float16, or torch.float32, "
+        f"got {triton_backward_grad_kv_storage_dtype!r}"
       )
+    if triton_backward_enable_persist_dkdv and not enable_backward_tma:
+      raise ValueError("triton_backward_enable_persist_dkdv requires enable_backward_tma=True")
 
     if acc_str == "f32":
       acc = _ACC_F32
@@ -347,13 +363,14 @@ class FFPAAttnMeta:
       enable_backward_tma=enable_backward_tma,
       enable_forward_ws=enable_forward_ws,
       enable_backward_ws=enable_backward_ws,
+      triton_backward_enable_persist_dkdv=triton_backward_enable_persist_dkdv,
       high_precision_grad=high_precision_grad,
       forward_backend=forward_backend,
       triton_autotune=triton_autotune,
       triton_autotune_mode=triton_autotune_mode,
       backward_backend=backward_backend,
       triton_backward_preprocess_d_chunk=triton_backward_preprocess_d_chunk,
-      triton_backward_grad_v_storage_dtype=triton_backward_grad_v_storage_dtype,
+      triton_backward_grad_kv_storage_dtype=triton_backward_grad_kv_storage_dtype,
     )
 
   def normalize(
@@ -652,12 +669,13 @@ class _FFPAAttnFunc(torch.autograd.Function):
           preprocess_d_chunk=meta.triton_backward_preprocess_d_chunk,
           attn_bias=attn_bias,
           return_attn_bias_grad=ctx.needs_input_grad[3],
-          grad_v_storage_dtype=meta.triton_backward_grad_v_storage_dtype,
+          grad_kv_storage_dtype=meta.triton_backward_grad_kv_storage_dtype,
           dropout_p=meta.dropout_p,
           philox_seed=int(rng_state[0].item()) if rng_state.numel() else 0,
           philox_offset=int(rng_state[1].item()) if rng_state.numel() else 0,
           enable_tma=bool(meta.enable_backward_tma),
           enable_ws=bool(meta.enable_backward_ws),
+          enable_persist_dkdv=meta.triton_backward_enable_persist_dkdv,
         )
       else:
         dq, dk, dv, grad_attn_bias = _aten_efficient_attn_backward(

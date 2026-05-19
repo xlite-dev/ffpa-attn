@@ -563,7 +563,7 @@ def test_ffpa_attn_func_routes_directional_tma_ws_flags(monkeypatch):
     preprocess_d_chunk,
     attn_bias,
     return_attn_bias_grad,
-    grad_v_storage_dtype,
+    grad_kv_storage_dtype,
     dropout_p=0.0,
     philox_seed=0,
     philox_offset=0,
@@ -571,7 +571,7 @@ def test_ffpa_attn_func_routes_directional_tma_ws_flags(monkeypatch):
     enable_ws=False,
   ):
     del grad_out, o, lse, causal, softmax_scale, autotune, autotune_mode, preprocess_d_chunk
-    del attn_bias, return_attn_bias_grad, grad_v_storage_dtype, dropout_p, philox_seed, philox_offset
+    del attn_bias, return_attn_bias_grad, grad_kv_storage_dtype, dropout_p, philox_seed, philox_offset
     seen_backward.append((enable_tma, enable_ws))
     return torch.zeros_like(q), torch.zeros_like(k), torch.zeros_like(v), None
 

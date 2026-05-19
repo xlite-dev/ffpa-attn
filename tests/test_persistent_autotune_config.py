@@ -3,6 +3,7 @@
 import logging
 
 import pytest
+import torch
 
 from ffpa_attn.triton import _persistent_autotune as persistent
 from ffpa_attn.triton._ffpa_bwd import _normalize_bwd_pre_config
@@ -530,7 +531,7 @@ def test_lookup_backward_filters_variants(tmp_path, monkeypatch):
         "seqlen_q": 1024,
         "seqlen_k": 1024,
         "bias_grad": False,
-        "grad_v_storage_dtype": None,
+        "grad_kv_storage_dtype": None,
         "has_dropout": False,
         "config": {
           "BLOCK_M": 64,
@@ -550,7 +551,7 @@ def test_lookup_backward_filters_variants(tmp_path, monkeypatch):
         "seqlen_q": 1024,
         "seqlen_k": 1024,
         "bias_grad": True,
-        "grad_v_storage_dtype": None,
+        "grad_kv_storage_dtype": None,
         "has_dropout": False,
         "config": {
           "BLOCK_M": 128,
@@ -574,7 +575,7 @@ def test_lookup_backward_filters_variants(tmp_path, monkeypatch):
     seqlen_k=1024,
     causal=True,
     bias_grad=False,
-    grad_v_storage_dtype=None,
+    grad_kv_storage_dtype=None,
     has_dropout=False,
   )
   assert persistent.lookup_persistent_config(request)["BLOCK_HEADDIM"] == 128
@@ -596,7 +597,7 @@ def test_lookup_sm90_backward_preserves_tma_config_and_flags(tmp_path, monkeypat
     "seqlen_q": 4096,
     "seqlen_k": 4096,
     "bias_grad": False,
-    "grad_v_storage_dtype": None,
+    "grad_kv_storage_dtype": None,
     "has_attn_bias": False,
     "has_dropout": False,
     "enable_tma": True,
@@ -644,7 +645,7 @@ def test_lookup_sm90_backward_preserves_tma_config_and_flags(tmp_path, monkeypat
       seqlen_k=4096,
       causal=False,
       bias_grad=False,
-      grad_v_storage_dtype=None,
+      grad_kv_storage_dtype=None,
       has_attn_bias=False,
       has_dropout=False,
       enable_tma=True,
@@ -672,7 +673,7 @@ def test_lookup_sm90_backward_preserves_tma_config_and_flags(tmp_path, monkeypat
       seqlen_k=4096,
       causal=False,
       bias_grad=False,
-      grad_v_storage_dtype=None,
+      grad_kv_storage_dtype=None,
       has_attn_bias=False,
       has_dropout=False,
       enable_tma=True,
@@ -680,6 +681,127 @@ def test_lookup_sm90_backward_preserves_tma_config_and_flags(tmp_path, monkeypat
     )
   )
   assert ws_config["warp_specialize"] is True
+
+
+def test_lookup_sm90_backward_persist_uses_distinct_kernel_key(tmp_path, monkeypatch):
+  _patch_cuda_device(monkeypatch)
+  monkeypatch.setenv(persistent.CONFIG_ENV_VAR, str(tmp_path))
+  persistent.clear_config_cache()
+  path = persistent.device_config_path(tmp_path, "NVIDIA L20")
+  base_entry = {
+    "direction": "backward",
+    "autotune_mode": "fast",
+    "causal": True,
+    "dtype": "bf16",
+    "headdim": 512,
+    "seqlen_q": 8192,
+    "seqlen_k": 8192,
+    "bias_grad": False,
+    "grad_kv_storage_dtype": None,
+    "has_attn_bias": False,
+    "has_dropout": False,
+    "enable_tma": True,
+    "enable_ws": False,
+  }
+  persistent.write_config_file(
+    _payload([
+      {
+        **base_entry,
+        "kernel": "bwd_sm90_generic",
+        "config": {
+          "BLOCK_M": 64,
+          "BLOCK_N": 64,
+          "BLOCK_HEADDIM": 64,
+          "warp_specialize": False,
+          "num_warps": 4,
+          "num_stages": 2,
+        },
+      },
+      {
+        **base_entry,
+        "kernel": "bwd_sm90_generic_persist_dkdv",
+        "config": {
+          "BLOCK_M": 128,
+          "BLOCK_N": 64,
+          "BLOCK_HEADDIM": 128,
+          "warp_specialize": False,
+          "num_warps": 8,
+          "num_stages": 2,
+        },
+      },
+      {
+        **base_entry,
+        "enable_ws": True,
+        "kernel": "bwd_sm90_generic_persist_dkdv",
+        "config": {
+          "BLOCK_M": 64,
+          "BLOCK_N": 128,
+          "BLOCK_HEADDIM": 128,
+          "warp_specialize": True,
+          "num_warps": 8,
+          "num_stages": 2,
+        },
+      },
+    ]),
+    path,
+  )
+
+  from ffpa_attn.triton._ffpa_bwd_sm90 import lookup_bwd_sm90_persistent_config
+
+  q = torch.empty(1, 32, 8192, 512, dtype=torch.bfloat16)
+  generic = lookup_bwd_sm90_persistent_config(
+    q=q,
+    seqlen_q=8192,
+    seqlen_k=8192,
+    headdim=512,
+    autotune_mode="fast",
+    causal=True,
+    bias_grad=False,
+    grad_kv_storage_dtype=None,
+    has_attn_bias=False,
+    has_dropout=False,
+    nheads_q=32,
+    nheads_kv=32,
+    enable_ws=False,
+    enable_persist_dkdv=False,
+  )
+  persist_config = lookup_bwd_sm90_persistent_config(
+    q=q,
+    seqlen_q=8192,
+    seqlen_k=8192,
+    headdim=512,
+    autotune_mode="fast",
+    causal=True,
+    bias_grad=False,
+    grad_kv_storage_dtype=None,
+    has_attn_bias=False,
+    has_dropout=False,
+    nheads_q=32,
+    nheads_kv=32,
+    enable_ws=False,
+    enable_persist_dkdv=True,
+  )
+  persist_ws_config = lookup_bwd_sm90_persistent_config(
+    q=q,
+    seqlen_q=8192,
+    seqlen_k=8192,
+    headdim=512,
+    autotune_mode="fast",
+    causal=True,
+    bias_grad=False,
+    grad_kv_storage_dtype=None,
+    has_attn_bias=False,
+    has_dropout=False,
+    nheads_q=32,
+    nheads_kv=32,
+    enable_ws=True,
+    enable_persist_dkdv=True,
+  )
+
+  assert generic["BLOCK_HEADDIM"] == 64
+  assert persist_config["BLOCK_HEADDIM"] == 128
+  assert persist_ws_config["warp_specialize"] is True
+  assert persist_ws_config["BLOCK_N"] == 128
 
 
 def test_backward_preprocess_config_backfills_block_headdim():

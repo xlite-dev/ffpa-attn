@@ -424,7 +424,7 @@ def _record_entry(
     entry["seqlen_k"],
     entry.get("preprocess_d_chunk"),
     entry.get("bias_grad"),
-    entry.get("grad_v_storage_dtype"),
+    entry.get("grad_kv_storage_dtype"),
     entry.get("use_gemv"),
     entry.get("enable_tma"),
     entry.get("enable_ws"),
@@ -658,7 +658,7 @@ def _tune_backward(
     )
     entry.update({
       "bias_grad": task.has_attn_bias,
-      "grad_v_storage_dtype": None,
+      "grad_kv_storage_dtype": None,
       "use_gemv": use_gemv,
     })
     choices_count = len(wrapper.configs)
@@ -674,7 +674,7 @@ def _tune_backward(
     )
     entry.update({
       "bias_grad": task.has_attn_bias,
-      "grad_v_storage_dtype": None,
+      "grad_kv_storage_dtype": None,
     })
     choices_count = len(wrapper.configs)
   _record_entry(entries, entry)
@@ -699,7 +699,7 @@ def _tune_backward(
     )
     entry.update({
       "bias_grad": task.has_attn_bias,
-      "grad_v_storage_dtype": None,
+      "grad_kv_storage_dtype": None,
     })
     choices_count = len(wrapper.configs)
     _record_entry(entries, entry)
