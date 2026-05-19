@@ -483,6 +483,11 @@ def _ffpa_bwd_kernel_impl(
   BLOCK_M: tl.constexpr,
   BLOCK_N: tl.constexpr,
 ) -> None:
+  # Keys for autotune and heuristics lookups.
+  _ = autotune_seqlen_q_bucket
+  _ = autotune_seqlen_k_bucket
+  _ = autotune_causal_key
+  _ = autotune_dtype_key
   _ffpa_bwd_dkdv(
     Q, K, V, DO, DK, DV, LSE, D, AttnBias, GradAttnBias, softmax_scale, stride_qb, stride_qh, stride_qm, stride_kb,
     stride_kh, stride_kn, stride_vb, stride_vh, stride_vn, stride_dob, stride_doh, stride_dom, stride_dkb, stride_dkh,
@@ -1059,6 +1064,12 @@ def _ffpa_bwd_decode_stage1_kernel(
   BLOCK_N: tl.constexpr,
   BLOCK_HEADDIM: tl.constexpr,
 ) -> None:
+  # Keys for autotune and heuristics lookups.
+  _ = autotune_seqlen_q_bucket
+  _ = autotune_seqlen_k_bucket
+  _ = autotune_causal_key
+  _ = autotune_dtype_key
+
   # Decode backward splits work by K block. DK/DV are independent per K block,
   # but dQ is a sum over all K blocks, so stage1 writes PartialDQ and the reduce
   # kernel below performs the cross-K accumulation.
@@ -2030,17 +2041,17 @@ def _ffpa_attn_backward_triton(
       group_size,
       k.size(2),
       k.size(3),
-    ).sum(dim=2).to(k.dtype)
+    ).sum(dim=2).to(k.dtype)  # type: torch.Tensor
     dv = dv_expanded.reshape(
       v.size(0),
       v.size(1),
       group_size,
       v.size(2),
       v.size(3),
-    ).sum(dim=2).to(v.dtype)
+    ).sum(dim=2).to(v.dtype)  # type: torch.Tensor
   else:
-    dk = dk_expanded.to(k.dtype)
-    dv = dv_expanded.to(v.dtype)
+    dk = dk_expanded.to(k.dtype)  # type: torch.Tensor
+    dv = dv_expanded.to(v.dtype)  # type: torch.Tensor
   if grad_attn_bias.numel() == 0:
     grad_attn_bias_out = None
   else:

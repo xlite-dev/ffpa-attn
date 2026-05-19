@@ -123,6 +123,8 @@ def _should_fallback_to_sdpa(
   return any([
     D <= 256,
     D > 1024,
+    # attn_mask and dropout only supported in triton backend for now.
+    attn_mask is not None and forward_backend == "cutedsl",
     dropout_p > 0.0 and forward_backend == "cutedsl",
     (8 <= Nq < 512),
     Nkv < 512,

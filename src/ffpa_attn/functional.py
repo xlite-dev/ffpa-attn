@@ -31,8 +31,16 @@ if TYPE_CHECKING:
 _ACC_F16 = 0
 _ACC_F32 = 1
 
+
+def _is_hopper_or_later() -> bool:
+  if not torch.cuda.is_available():
+    return False
+  major, minor = torch.cuda.get_device_capability()
+  return (major, minor) >= (9, 0)
+
+
 _FFPA_ATTN_IMPL_DEFAULTS: dict[str, object] = {
-  "stages": 2,
+  "stages": 4 if _is_hopper_or_later() else 3,
   "acc": "f32",
   "enable_tma": False,
   "enable_ws": False,
