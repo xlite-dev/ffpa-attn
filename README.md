@@ -117,3 +117,5 @@ Apache License 2.0
 - [flash-attention](https://github.com/Dao-AILab/flash-attention)
 - [LeetCUDA](https://github.com/xlite-dev/LeetCUDA)
 - [flashinfer](https://github.com/flashinfer-ai/flashinfer)
+- [quack](https://github.com/Dao-AILab/quack)
+- [cutlass](https://github.com/NVIDIA/cutlass)
