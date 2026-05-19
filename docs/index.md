@@ -236,6 +236,8 @@ FFPA supports multiple backends for the forward and backward pass, including: `C
 |Triton|Ampere+|✔|✔|320~1024|✔|**1.5x~3x**🎉|Ampere+|
 |CuTeDSL|Hopper|✔|✔|512|❌|**3x~5x**🎉|Hopper|
 
+<i>Special thanks to [Butterfingrz](https://github.com/Butterfingrz) for contributing to the CuTeDSL backend! Awesome work!🎉</i>
+
 </div>
 
 ## ©️License
