@@ -146,6 +146,32 @@ def test_sm90_tma_persist_dkdv_causal_matches_sdpa(dtype):
   assert torch.allclose(v.grad, dv_ref, **tol)
 
 
+def test_sm90_tma_non_aligned_seqlen_matches_sdpa():
+  _skip_if_no_sm90_tma()
+  torch.manual_seed(124)
+  B, H, N, D = 1, 2, 129, 512
+  dtype = torch.float16
+  q = torch.randn(B, H, N, D, dtype=dtype, device="cuda", requires_grad=True)
+  k = torch.randn(B, H, N, D, dtype=dtype, device="cuda", requires_grad=True)
+  v = torch.randn(B, H, N, D, dtype=dtype, device="cuda", requires_grad=True)
+  scale = 1.0 / math.sqrt(D)
+
+  out = ffpa_attn_func(
+    q,
+    k,
+    v,
+    scale=scale,
+    enable_backward_tma=True,
+  )
+  out.sum().backward()
+
+  dq_ref, dk_ref, dv_ref = _sdpa_ref_grads(q, k, v, False, scale)
+  tol = _tolerance(dtype)
+  assert torch.allclose(q.grad, dq_ref, **tol)
+  assert torch.allclose(k.grad, dk_ref, **tol)
+  assert torch.allclose(v.grad, dv_ref, **tol)
+
+
 def _key_position_bias_grad_ref(
   q: torch.Tensor,
   k: torch.Tensor,
