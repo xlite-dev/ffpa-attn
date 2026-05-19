@@ -79,9 +79,9 @@ Runnable examples are provided under [`examples`](./examples). The performance b
 
 ## 🤖 Backends
 
-FFPA supports multiple backends for the forward and backward pass, including: CUDA (forward only), Triton, and CuTeDSL. The CuTeDSL backend is currently in early stage and has some constraints (e.g., D=512 only, no attn_mask/dropout), but it can achieve up to `427🎉` TFLOPS on H200 SXM for forward pass and `243🎉` TFLOPS for backward pass, which is very exciting! We will continue to optimize the CuTeDSL backend and lift the constraints in the future.
+FFPA supports multiple backends for the forward and backward pass, including: `CUDA` (forward only), `Triton`, and `CuTeDSL`. The CuTeDSL backend is currently in early stage and has some constraints (e.g., D=512 only), but it can achieve up to `427🎉` TFLOPS on H200 SXM, which is very exciting! We will continue to optimize the CuTeDSL backend and lift the constraints in the future.
 
-|Backend|Architectures|Fwd|Bwd|Features|Headdim|Recommended|
+|Backend|Architectures|Forward|Backward|Features|Headdim|Recommended|
 |:---:|:---:|:---:|:---:|:---:|:---:|:---:|
 |CUDA|Ampere+|✔|❌|All|320~1024|Ampere, Ada|
 |Triton|Ampere+|✔|✔|All|320~1024|Ampere+|
