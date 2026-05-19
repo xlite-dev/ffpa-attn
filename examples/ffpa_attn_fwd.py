@@ -31,7 +31,6 @@ import torch.nn.functional as F
 from ffpa_attn import ffpa_attn_func
 from attention_flops import attention_fwd_flops, format_tflops_short, tflops_from_ms
 
-STAGES = 2
 DEFAULT_WARMUP = 2
 DEFAULT_ITERS = 10
 FORWARD_RESULT = dict[str, Any]
@@ -336,7 +335,6 @@ def _run_case(
     q,
     k,
     v,
-    stages=STAGES,
     acc=acc,
     attn_mask=attn_mask,
     is_causal=causal,
@@ -361,7 +359,6 @@ def _run_case(
       q,
       k,
       v,
-      stages=STAGES,
       acc=acc,
       attn_mask=attn_mask,
       is_causal=causal,
