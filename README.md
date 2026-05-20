@@ -99,12 +99,9 @@ How to use different backends for your own scenario? Users can simply pass the B
 
 ```python
 >>> from ffpa_attn import ffpa_attn_func, CuteDSLBackend
->>> # CuTeDSL backend for D=512 senario, fastest on H200!
->>> output = ffpa_attn_func(
->>>   query, key, value, is_causal=True, # D=512
->>>   forward_backend=CuteDSLBackend(forward=True),
->>>   backward_backend=CuteDSLBackend(backward=True),
->>> )
+>>> # CuTeDSL backend for D=512 senario, fastest on H200!🎉
+>>> fwd, bwd =CuteDSLBackend(forward=True), CuteDSLBackend(backward=True)
+>>> o = ffpa_attn_func(q, k, v, forward_backend=fwd, backward_backend=bwd)
 ```
 
 ## ©️License
