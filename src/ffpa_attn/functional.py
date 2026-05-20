@@ -24,8 +24,8 @@ from .aten import (
   _aten_efficient_attn_backward,
 )  # D <= 256
 from .cutedsl import (
-  _ffpa_attn_cutedsl_forward,
-  _ffpa_attn_cutedsl_backward,
+  _ffpa_attn_forward_cutedsl,
+  _ffpa_attn_backward_cutedsl,
 )  # D == 512 SM90
 
 if TYPE_CHECKING:
@@ -576,8 +576,8 @@ class _FFPAAttnFunc(torch.autograd.Function):
       )
     elif isinstance(meta.forward_meta, CuTeDSLBackend):
       # CuTeDSL backend. Layout conversion (B,H,N,D ↔ B,N,H,D) is
-      # handled inside _ffpa_attn_cutedsl_forward.
-      O, lse = _ffpa_attn_cutedsl_forward(
+      # handled inside _ffpa_attn_forward_cutedsl.
+      O, lse = _ffpa_attn_forward_cutedsl(
         q,
         k,
         v,
@@ -650,8 +650,8 @@ class _FFPAAttnFunc(torch.autograd.Function):
         )
       elif isinstance(meta.backward_meta, CuTeDSLBackend):
         # CuTeDSL backward. Layout conversion and kernel dispatch are
-        # handled inside _ffpa_attn_cutedsl_backward.
-        dq, dk, dv = _ffpa_attn_cutedsl_backward(
+        # handled inside _ffpa_attn_backward_cutedsl.
+        dq, dk, dv = _ffpa_attn_backward_cutedsl(
           grad_out=grad_out,
           q=q,
           k=k,

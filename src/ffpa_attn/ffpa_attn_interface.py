@@ -14,8 +14,8 @@ When the caller opts into the CuTeDSL backend (``forward_backend='cutedsl'``)
 the dispatch goes through the same :class:`FFPAAttnMeta` normalization and
 :class:`FFPAAttnFunc` autograd boundary as all other backends.
 :meth:`_FFPAAttnFunc.forward` and :meth:`_FFPAAttnFunc.backward` route to
-:func:`ffpa_attn.cutedsl._wrappers._ffpa_attn_cutedsl_forward` and
-:func:`ffpa_attn.cutedsl._wrappers._ffpa_attn_cutedsl_backward`, which
+:func:`ffpa_attn.cutedsl._wrappers._ffpa_attn_forward_cutedsl` and
+:func:`ffpa_attn.cutedsl._wrappers._ffpa_attn_backward_cutedsl`, which
 handle the SDPA ``[B, H, N, D]`` ↔ FA ``[B, N, H, D]`` layout conversion
 internally. CuTeDSL compatibility constraints are enforced in two layers:
 

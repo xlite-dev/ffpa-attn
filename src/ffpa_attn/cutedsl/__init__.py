@@ -10,8 +10,8 @@ are registered.
 
 from . import _interface  # noqa: F401  # register torch ops
 from ._wrappers import (
-  _ffpa_attn_cutedsl_forward,
-  _ffpa_attn_cutedsl_backward,
+  _ffpa_attn_forward_cutedsl,
+  _ffpa_attn_backward_cutedsl,
   _ffpa_attn_varlen_cutedsl,
   _require_cutedsl_supported,
   cutedsl_backward_available,
@@ -19,8 +19,8 @@ from ._wrappers import (
 )
 
 __all__ = [
-  "_ffpa_attn_cutedsl_forward",
-  "_ffpa_attn_cutedsl_backward",
+  "_ffpa_attn_forward_cutedsl",
+  "_ffpa_attn_backward_cutedsl",
   "_ffpa_attn_varlen_cutedsl",
   "_require_cutedsl_supported",
   "cutedsl_forward_available",

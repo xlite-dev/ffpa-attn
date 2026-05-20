@@ -7,7 +7,7 @@ flash-attention layout convention reused here). The public FFPA APIs
 present the SDPA-style ``[B, H, N, D]`` / FA-style ``[T, H, D]`` surface and
 route ``forward_backend='cutedsl'`` through the unified
 :class:`ffpa_attn.functional.FFPAAttnFunc` autograd boundary.
-:func:`_ffpa_attn_cutedsl_forward` and :func:`_ffpa_attn_cutedsl_backward`
+:func:`_ffpa_attn_forward_cutedsl` and :func:`_ffpa_attn_backward_cutedsl`
 transpose between SDPA and FA layouts and dispatch into
 :func:`_ffpa_attn_forward_sm90` / :func:`_ffpa_attn_backward_sm90`.
 
@@ -46,7 +46,7 @@ def _check_supported_options(
   """Raise ``NotImplementedError`` for any non-default cutedsl-unsupported option.
 
   The cutedsl SplitD D=512 kernels (``ffpa_attn_splitd_varlen_func``,
-  ``_ffpa_attn_cutedsl_forward``, ``_ffpa_attn_cutedsl_backward``) only
+  ``_ffpa_attn_forward_cutedsl``, ``_ffpa_attn_backward_cutedsl``) only
   honor dense / varlen D=512 attention with optional causal masking. Every other option commonly
   exposed by attention APIs (mask tensors, sliding window, softcap,
   score_mod, aux tensors, FlashAttention varlen extensions, dropout)
@@ -131,7 +131,7 @@ def _require_cutedsl_supported(
   ``attn_mask``, FlashAttention-extension kwargs) is **not** the
   responsibility of this function; that lives in
   :func:`_check_supported_options`, applied by the entry shims
-  (:func:`_ffpa_attn_cutedsl_forward`, :func:`_ffpa_attn_varlen_cutedsl`).
+  (:func:`_ffpa_attn_forward_cutedsl`, :func:`_ffpa_attn_varlen_cutedsl`).
 
   Raises ``NotImplementedError`` / ``RuntimeError`` / ``TypeError`` for
   any tensor-level violation so users who pass ``forward_backend='cutedsl'``
@@ -177,7 +177,7 @@ def _bnhd_to_bhnd(t: torch.Tensor) -> torch.Tensor:
   return t.transpose(1, 2).contiguous()
 
 
-def _ffpa_attn_cutedsl_forward(
+def _ffpa_attn_forward_cutedsl(
   q: torch.Tensor,
   k: torch.Tensor,
   v: torch.Tensor,
@@ -225,7 +225,7 @@ def _ffpa_attn_cutedsl_forward(
   return out_bhnd, lse
 
 
-def _ffpa_attn_cutedsl_backward(
+def _ffpa_attn_backward_cutedsl(
   grad_out: torch.Tensor,
   q: torch.Tensor,
   k: torch.Tensor,
@@ -380,8 +380,8 @@ def _ffpa_attn_varlen_cutedsl(
 
 
 __all__ = [
-  "_ffpa_attn_cutedsl_forward",
-  "_ffpa_attn_cutedsl_backward",
+  "_ffpa_attn_forward_cutedsl",
+  "_ffpa_attn_backward_cutedsl",
   "_ffpa_attn_varlen_cutedsl",
   "cutedsl_forward_available",
   "cutedsl_backward_available",
