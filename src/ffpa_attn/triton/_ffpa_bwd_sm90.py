@@ -244,6 +244,7 @@ def _ffpa_bwd_dkdv_sm90(
   GRAD_BIAS_REDUCES_M: tl.constexpr,
   GRAD_BIAS_STORE_PARTIAL: tl.constexpr,
   BLOCK_HEADDIM: tl.constexpr,
+  HEADDIM: tl.constexpr,
   DTYPE: tl.constexpr,
   EVEN_M: tl.constexpr,
   EVEN_N: tl.constexpr,
@@ -275,7 +276,7 @@ def _ffpa_bwd_dkdv_sm90(
   if BIAS_REQUIRES_GRAD:
     GradAttnBias += off_b * stride_gbb + off_h * stride_gbh
 
-  num_d_chunks = tl.cdiv(headdim, BLOCK_HEADDIM)
+  num_d_chunks = tl.cdiv(HEADDIM, BLOCK_HEADDIM)
 
   # Part 1: dK / dV, pid as K-column block index.
   start_n = pid * BLOCK_N
@@ -487,6 +488,7 @@ def _ffpa_bwd_dkdv_persist_sm90(
   GRAD_BIAS_REDUCES_M: tl.constexpr,
   GRAD_BIAS_STORE_PARTIAL: tl.constexpr,
   BLOCK_HEADDIM: tl.constexpr,
+  HEADDIM: tl.constexpr,
   DTYPE: tl.constexpr,
   EVEN_M: tl.constexpr,
   EVEN_N: tl.constexpr,
@@ -513,7 +515,7 @@ def _ffpa_bwd_dkdv_persist_sm90(
   if BIAS_REQUIRES_GRAD:
     GradAttnBias += off_b * stride_gbb + off_h * stride_gbh
 
-  num_d_chunks = tl.cdiv(headdim, BLOCK_HEADDIM)
+  num_d_chunks = tl.cdiv(HEADDIM, BLOCK_HEADDIM)
   start_n = pid * BLOCK_N
   if start_n < seqlen_k:
     offs_n = start_n + tl.arange(0, BLOCK_N)
@@ -694,6 +696,7 @@ def _ffpa_bwd_dq_sm90(
   HAS_DROPOUT: tl.constexpr,
   PHILOX_SEED: tl.constexpr,
   BLOCK_HEADDIM: tl.constexpr,
+  HEADDIM: tl.constexpr,
   DTYPE: tl.constexpr,
   EVEN_N: tl.constexpr,
   BLOCK_M: tl.constexpr,
@@ -716,7 +719,7 @@ def _ffpa_bwd_dq_sm90(
   if HAS_ATTN_BIAS:
     AttnBias += off_b * stride_bb + off_h * stride_bh
 
-  num_d_chunks = tl.cdiv(headdim, BLOCK_HEADDIM)
+  num_d_chunks = tl.cdiv(HEADDIM, BLOCK_HEADDIM)
 
   start_m = pid * BLOCK_M
   if start_m < seqlen_q:
@@ -733,6 +736,7 @@ def _ffpa_bwd_dq_sm90(
         0,
         end_n_k,
         BLOCK_N,
+        disallow_acc_multi_buffer=True,
         flatten=True,
         warp_specialize=True,
       ):
@@ -801,6 +805,7 @@ def _ffpa_bwd_dkdv_sm90_kernel_impl(
   GRAD_BIAS_STORE_PARTIAL: tl.constexpr,
   PERSIST_DKDV_ACC: tl.constexpr,
   BLOCK_HEADDIM: tl.constexpr,
+  HEADDIM: tl.constexpr,
   DTYPE: tl.constexpr,
   EVEN_M: tl.constexpr,
   EVEN_N: tl.constexpr,
@@ -820,7 +825,7 @@ def _ffpa_bwd_dkdv_sm90_kernel_impl(
       stride_dkn, stride_dvb, stride_dvh, stride_dvn, stride_bb, stride_bh, stride_bm, stride_bn, stride_gbb,
       stride_gbh, stride_gbm, stride_gbn, nheads, seqlen_q, seqlen_k, seqlen_q_rounded, headdim, dropout_p,
       philox_offset, IS_CAUSAL, HAS_ATTN_BIAS, HAS_DROPOUT, PHILOX_SEED, BIAS_REQUIRES_GRAD, GRAD_BIAS_NEEDS_REDUCTION,
-      GRAD_BIAS_REDUCES_M, GRAD_BIAS_STORE_PARTIAL, BLOCK_HEADDIM, DTYPE, EVEN_M, EVEN_N, BLOCK_M, BLOCK_N,
+      GRAD_BIAS_REDUCES_M, GRAD_BIAS_STORE_PARTIAL, BLOCK_HEADDIM, HEADDIM, DTYPE, EVEN_M, EVEN_N, BLOCK_M, BLOCK_N,
       warp_specialize
     )
   else:
@@ -829,7 +834,7 @@ def _ffpa_bwd_dkdv_sm90_kernel_impl(
       stride_dkn, stride_dvb, stride_dvh, stride_dvn, stride_bb, stride_bh, stride_bm, stride_bn, stride_gbb,
       stride_gbh, stride_gbm, stride_gbn, nheads, seqlen_q, seqlen_k, seqlen_q_rounded, headdim, dropout_p,
       philox_offset, IS_CAUSAL, HAS_ATTN_BIAS, HAS_DROPOUT, PHILOX_SEED, BIAS_REQUIRES_GRAD, GRAD_BIAS_NEEDS_REDUCTION,
-      GRAD_BIAS_REDUCES_M, GRAD_BIAS_STORE_PARTIAL, BLOCK_HEADDIM, DTYPE, EVEN_M, EVEN_N, BLOCK_M, BLOCK_N,
+      GRAD_BIAS_REDUCES_M, GRAD_BIAS_STORE_PARTIAL, BLOCK_HEADDIM, HEADDIM, DTYPE, EVEN_M, EVEN_N, BLOCK_M, BLOCK_N,
       warp_specialize
     )
 
@@ -869,6 +874,7 @@ def _ffpa_bwd_dq_sm90_kernel_impl(
   HAS_DROPOUT: tl.constexpr,
   PHILOX_SEED: tl.constexpr,
   BLOCK_HEADDIM: tl.constexpr,
+  HEADDIM: tl.constexpr,
   DTYPE: tl.constexpr,
   EVEN_N: tl.constexpr,
   BLOCK_M: tl.constexpr,
@@ -884,7 +890,8 @@ def _ffpa_bwd_dq_sm90_kernel_impl(
   _ffpa_bwd_dq_sm90(
     desc_q, desc_k, desc_v, desc_do, DQ, LSE, D, AttnBias, softmax_scale, stride_dqb, stride_dqh, stride_dqm, stride_bb,
     stride_bh, stride_bm, stride_bn, nheads, seqlen_q, seqlen_k, seqlen_q_rounded, headdim, dropout_p, philox_offset,
-    IS_CAUSAL, HAS_ATTN_BIAS, HAS_DROPOUT, PHILOX_SEED, BLOCK_HEADDIM, DTYPE, EVEN_N, BLOCK_M, BLOCK_N, warp_specialize
+    IS_CAUSAL, HAS_ATTN_BIAS, HAS_DROPOUT, PHILOX_SEED, BLOCK_HEADDIM, HEADDIM, DTYPE, EVEN_N, BLOCK_M, BLOCK_N,
+    warp_specialize
   )
 
 
@@ -941,6 +948,7 @@ def _ffpa_bwd_sm90_kernel_impl(
   GRAD_BIAS_STORE_PARTIAL: tl.constexpr,
   PERSIST_DKDV_ACC: tl.constexpr,
   BLOCK_HEADDIM: tl.constexpr,
+  HEADDIM: tl.constexpr,
   DTYPE: tl.constexpr,
   EVEN_M: tl.constexpr,
   EVEN_N: tl.constexpr,
@@ -969,6 +977,25 @@ def _ffpa_bwd_sm90_kernel_impl(
   _ = autotune_seqlen_k_bucket
   _ = autotune_causal_key
   _ = autotune_dtype_key
+
+  if PERSIST_DKDV_ACC:
+    _ffpa_bwd_dkdv_persist_sm90(
+      desc_q, desc_k, desc_v, desc_do, DK, DV, LSE, D, AttnBias, GradAttnBias, softmax_scale, stride_dkb, stride_dkh,
+      stride_dkn, stride_dvb, stride_dvh, stride_dvn, stride_bb, stride_bh, stride_bm, stride_bn, stride_gbb,
+      stride_gbh, stride_gbm, stride_gbn, nheads, seqlen_q, seqlen_k, seqlen_q_rounded, headdim, dropout_p,
+      philox_offset, IS_CAUSAL, HAS_ATTN_BIAS, HAS_DROPOUT, PHILOX_SEED, BIAS_REQUIRES_GRAD, GRAD_BIAS_NEEDS_REDUCTION,
+      GRAD_BIAS_REDUCES_M, GRAD_BIAS_STORE_PARTIAL, BLOCK_HEADDIM, HEADDIM, DTYPE, EVEN_M, EVEN_N, BLOCK_M, BLOCK_N,
+      warp_specialize
+    )
+  else:
+    _ffpa_bwd_dkdv_sm90(
+      desc_q, desc_k, desc_v, desc_do, DK, DV, LSE, D, AttnBias, GradAttnBias, softmax_scale, stride_dkb, stride_dkh,
+      stride_dkn, stride_dvb, stride_dvh, stride_dvn, stride_bb, stride_bh, stride_bm, stride_bn, stride_gbb,
+      stride_gbh, stride_gbm, stride_gbn, nheads, seqlen_q, seqlen_k, seqlen_q_rounded, headdim, dropout_p,
+      philox_offset, IS_CAUSAL, HAS_ATTN_BIAS, HAS_DROPOUT, PHILOX_SEED, BIAS_REQUIRES_GRAD, GRAD_BIAS_NEEDS_REDUCTION,
+      GRAD_BIAS_REDUCES_M, GRAD_BIAS_STORE_PARTIAL, BLOCK_HEADDIM, HEADDIM, DTYPE, EVEN_M, EVEN_N, BLOCK_M, BLOCK_N,
+      warp_specialize
+    )
 
   _ffpa_bwd_dq_sm90(
     desc_q,
@@ -999,30 +1026,13 @@ def _ffpa_bwd_sm90_kernel_impl(
     HAS_DROPOUT,
     PHILOX_SEED,
     BLOCK_HEADDIM,
+    HEADDIM,
     DTYPE,
     EVEN_N,
     BLOCK_M,
     BLOCK_N,
     False  # warp_specialize
   )
-  if PERSIST_DKDV_ACC:
-    _ffpa_bwd_dkdv_persist_sm90(
-      desc_q, desc_k, desc_v, desc_do, DK, DV, LSE, D, AttnBias, GradAttnBias, softmax_scale, stride_dkb, stride_dkh,
-      stride_dkn, stride_dvb, stride_dvh, stride_dvn, stride_bb, stride_bh, stride_bm, stride_bn, stride_gbb,
-      stride_gbh, stride_gbm, stride_gbn, nheads, seqlen_q, seqlen_k, seqlen_q_rounded, headdim, dropout_p,
-      philox_offset, IS_CAUSAL, HAS_ATTN_BIAS, HAS_DROPOUT, PHILOX_SEED, BIAS_REQUIRES_GRAD, GRAD_BIAS_NEEDS_REDUCTION,
-      GRAD_BIAS_REDUCES_M, GRAD_BIAS_STORE_PARTIAL, BLOCK_HEADDIM, DTYPE, EVEN_M, EVEN_N, BLOCK_M, BLOCK_N,
-      warp_specialize
-    )
-  else:
-    _ffpa_bwd_dkdv_sm90(
-      desc_q, desc_k, desc_v, desc_do, DK, DV, LSE, D, AttnBias, GradAttnBias, softmax_scale, stride_dkb, stride_dkh,
-      stride_dkn, stride_dvb, stride_dvh, stride_dvn, stride_bb, stride_bh, stride_bm, stride_bn, stride_gbb,
-      stride_gbh, stride_gbm, stride_gbn, nheads, seqlen_q, seqlen_k, seqlen_q_rounded, headdim, dropout_p,
-      philox_offset, IS_CAUSAL, HAS_ATTN_BIAS, HAS_DROPOUT, PHILOX_SEED, BIAS_REQUIRES_GRAD, GRAD_BIAS_NEEDS_REDUCTION,
-      GRAD_BIAS_REDUCES_M, GRAD_BIAS_STORE_PARTIAL, BLOCK_HEADDIM, DTYPE, EVEN_M, EVEN_N, BLOCK_M, BLOCK_N,
-      warp_specialize
-    )
 
 
 _SM90_BWD_DEFAULT_CONFIG = {
@@ -1044,18 +1054,18 @@ _SM90_BWD_PERSIST_DKDV_DEFAULT_CONFIG = {
 }
 
 _SM90_BWD_SPLIT_DKDV_DEFAULT_CONFIG = {
-  "BLOCK_M": 128,
+  "BLOCK_M": 64,
   "BLOCK_N": 64,
   "BLOCK_HEADDIM": 64,
   "warp_specialize": False,
-  "num_warps": 4,
+  "num_warps": 8,
   "num_stages": 2,
 }
 
 _SM90_BWD_SPLIT_PERSIST_DKDV_DEFAULT_CONFIG = {
-  "BLOCK_M": 128,
-  "BLOCK_N": 64,
-  "BLOCK_HEADDIM": 128,
+  "BLOCK_M": 64,
+  "BLOCK_N": 128,
+  "BLOCK_HEADDIM": 64,
   "warp_specialize": False,
   "num_warps": 4,
   "num_stages": 2,
@@ -1644,6 +1654,7 @@ def _ffpa_attn_backward_sm90_impl(
     GRAD_BIAS_REDUCES_M=grad_bias_reduces_m,
     GRAD_BIAS_STORE_PARTIAL=use_key_bias_grad_reduction,
     PERSIST_DKDV_ACC=enable_persist_dkdv,
+    HEADDIM=headdim,
     DTYPE=DTYPE,
   )
   dkdv_meta = dict(
@@ -1656,6 +1667,7 @@ def _ffpa_attn_backward_sm90_impl(
     GRAD_BIAS_REDUCES_M=grad_bias_reduces_m,
     GRAD_BIAS_STORE_PARTIAL=use_key_bias_grad_reduction,
     PERSIST_DKDV_ACC=enable_persist_dkdv,
+    HEADDIM=headdim,
     DTYPE=DTYPE,
   )
   dq_meta = dict(
@@ -1663,6 +1675,7 @@ def _ffpa_attn_backward_sm90_impl(
     HAS_ATTN_BIAS=has_attn_bias,
     HAS_DROPOUT=has_dropout,
     PHILOX_SEED=philox_seed,
+    HEADDIM=headdim,
     DTYPE=DTYPE,
   )
   split_launch = enable_split_launch
@@ -1717,7 +1730,6 @@ def _ffpa_attn_backward_sm90_impl(
       dkdv_config["warp_specialize"] = bool(enable_ws)
       if enable_ws:
         dkdv_config["num_stages"] = 2
-        dkdv_config["maxnreg"] = 80
       _ffpa_bwd_sm90_prepare_descs(desc_q, desc_k, desc_v, desc_do, dkdv_config)
       _ffpa_bwd_dkdv_sm90_kernel_impl[dkdv_grid](*dkdv_args, **dkdv_meta, **dkdv_config)
 
@@ -1743,7 +1755,6 @@ def _ffpa_attn_backward_sm90_impl(
       dq_config["warp_specialize"] = bool(enable_ws)
       if enable_ws:
         dq_config["num_stages"] = 2
-        dq_config["maxnreg"] = 80
       _ffpa_bwd_sm90_prepare_descs(desc_q, desc_k, desc_v, desc_do, dq_config)
       _ffpa_bwd_dq_sm90_kernel_impl[dq_grid](*dq_args, **dq_meta, **dq_config)
     else:
