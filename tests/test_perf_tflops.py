@@ -120,7 +120,7 @@ def test_perf_persist_dkdv_allows_backward_tma():
   assert args.enable_bwd_tma is True
 
 
-def test_perf_bwd_split_launch_requires_backward_tma():
+def test_perf_bwd_split_launch_allows_without_backward_tma():
   args = SimpleNamespace(
     enable_tma=False,
     enable_ws=False,
@@ -132,8 +132,10 @@ def test_perf_bwd_split_launch_requires_backward_tma():
     enable_bwd_split_launch=True,
   )
 
-  with pytest.raises(SystemExit, match="requires --enable-bwd-tma"):
-    _resolve_directional_cli_flags(args)
+  _resolve_directional_cli_flags(args)
+
+  assert args.enable_bwd_split_launch is True
+  assert args.enable_bwd_tma is False
 
 
 def test_perf_bwd_split_launch_allows_backward_tma():

@@ -287,7 +287,7 @@ def _parse_args() -> argparse.Namespace:
     "--bwd-split-launch",
     "--bwd-split",
     action="store_true",
-    help="Enable separate SM90+ TMA backward launches for dK/dV and dQ (requires --bwd-tma).",
+    help="Enable separate backward launches for dK/dV and dQ on generic Triton or SM90+ TMA paths.",
   )
   parser.add_argument(
     "--grad-kv-storage-dtype",
@@ -320,8 +320,6 @@ def _resolve_directional_cli_flags(args: argparse.Namespace) -> argparse.Namespa
     args.enable_bwd_ws = True
   if args.enable_persist_dkdv and not args.enable_bwd_tma:
     raise SystemExit("--enable-persist-dkdv requires --enable-bwd-tma")
-  if args.enable_bwd_split_launch and not args.enable_bwd_tma:
-    raise SystemExit("--enable-bwd-split-launch requires --enable-bwd-tma")
   return args
 
 

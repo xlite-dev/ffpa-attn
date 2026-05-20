@@ -48,107 +48,6 @@ _SM90_FWD_HEURISTICS = {
 }
 
 
-@triton.jit
-def _ffpa_fwd_sm90_kv_block(
-  desc_q: tl.tensor_descriptor,
-  desc_k: tl.tensor_descriptor,
-  desc_v: tl.tensor_descriptor,
-  AttnBias: torch.Tensor,
-  q_offset_y: int,
-  kv_base_y: int,
-  start_n: int,
-  off_hb: int,
-  offs_m: int,
-  offs_n: int,
-  o_accs: tl.tensor,
-  m_i: tl.tensor,
-  l_i: tl.tensor,
-  softmax_scale: float,
-  stride_bm: int,
-  stride_bn: int,
-  seqlen_q: tl.constexpr,
-  seqlen_k: tl.constexpr,
-  kv_offset: tl.constexpr,
-  dropout_p: float,
-  philox_offset: int,
-  IS_CAUSAL: tl.constexpr,
-  HAS_ATTN_BIAS: tl.constexpr,
-  HAS_DROPOUT: tl.constexpr,
-  PHILOX_SEED: tl.constexpr,
-  DTYPE: tl.constexpr,
-  EVEN_N: tl.constexpr,
-  BLOCK_M: tl.constexpr,
-  BLOCK_N: tl.constexpr,
-  BLOCK_HEADDIM_QK: tl.constexpr,
-  BLOCK_HEADDIM_V: tl.constexpr,
-  NUM_QK_D_CHUNKS: tl.constexpr,
-  NUM_V_GROUPS: tl.constexpr,
-):
-  start_n = tl.multiple_of(start_n, BLOCK_N)
-  offs_kv = start_n + offs_n
-  k_offset_y = kv_base_y + start_n
-  v_offset_y = kv_base_y + start_n
-
-  scores = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
-  # Phase 1: QK with Split-D reduction structure.
-  for qk_d_chunk in range(NUM_QK_D_CHUNKS):
-    qk_d_start = qk_d_chunk * BLOCK_HEADDIM_QK
-    # TMA descriptor loads — OOB elements return 0 automatically.
-    q = desc_q.load([q_offset_y, qk_d_start])
-    k = desc_k.load([k_offset_y, qk_d_start])
-    scores = tl.dot(q, tl.trans(k), acc=scores)
-
-  scores = scores * softmax_scale
-  if HAS_ATTN_BIAS:
-    # attn_bias stays on raw pointer — may be stride-0 broadcast.
-    bias = tl.load(
-      AttnBias + offs_m[:, None] * stride_bm + offs_kv[None, :] * stride_bn,
-      mask=(offs_m[:, None] < seqlen_q) & (offs_kv[None, :] < seqlen_k),
-      other=0.0,
-    )
-    scores += bias
-  if not EVEN_N:
-    scores = tl.where(offs_kv[None, :] < seqlen_k, scores, -float("inf"))
-  if IS_CAUSAL:
-    # Lower-right causal semantics for Nq <= Nkv. Query row m can attend to
-    # key positions <= m + (Nkv - Nq), matching PyTorch SDPA.
-    causal_mask = offs_kv[None, :] <= (offs_m[:, None] + kv_offset)
-    scores = tl.where(causal_mask, scores, -float("inf"))
-
-  # Phase 2: Online softmax.
-  # Online softmax merge for the next KV block. ``m_i`` and ``l_i`` track the
-  # row max and denominator before dropout; ``p`` is dropped only for the O
-  # accumulation, while LSE stays the undropped softmax normalizer.
-  m_new = tl.maximum(m_i, tl.max(scores, axis=1))
-  alpha = tl.exp(m_i - m_new)
-  p = tl.exp(scores - m_new[:, None])
-  l_new = l_i * alpha + tl.sum(p, axis=1)
-  p = _apply_dropout_to_p(
-    p,
-    off_hb,
-    offs_m,
-    offs_kv,
-    seqlen_q,
-    seqlen_k,
-    dropout_p,
-    PHILOX_SEED,
-    philox_offset,
-    HAS_DROPOUT,
-  )
-  p = p.to(DTYPE)
-
-  # Phase 3: PV with Split-D V accumulation.
-  # Reuse the same softmax tile for all V slices, matching FFPA CUDA fwd:
-  # R_D[j] = alpha * R_D[j] + P @ V_j. This avoids recomputing QK/softmax
-  # per output head-dim group while keeping Split-D register pressure bounded.
-  for v_group in tl.static_range(0, NUM_V_GROUPS):
-    o_d_start = BLOCK_HEADDIM_V * v_group
-    v = desc_v.load([v_offset_y, o_d_start])
-    o_acc = o_accs[v_group] * alpha[:, None] + tl.dot(p, v)
-    o_accs = _update_o_accs(o_accs, v_group, o_acc)
-  return o_accs, m_new, l_new
-
-
 def _sm90_host_descriptor_pre_hook(nargs):
   """Set per-descriptor block shapes before a TMA kernel launch.
 
@@ -268,97 +167,88 @@ def _ffpa_fwd_sm90_kernel_impl(
   if IS_CAUSAL:
     end_n = tl.minimum(seqlen_k, (start_m + 1) * BLOCK_M + kv_offset)
 
-  if warp_specialize:
-    # KV loop / warp-specialization boundary.
-    # disallow_acc_multi_buffer=True is needed for the Split-D accumulator shape.
-    # The total fp32 state is comparable to a FA2-style [BLOCK_M, HEAD_DIM] acc,
-    # but here Triton sees multiple loop-carried dot accumulators in o_accs plus
-    # QK split-D dot sites. Letting it multi-buffer those independent accumulators
-    # makes WS partitioning/resource use much less stable on the validated tiles.
-    # flatten=True gives Triton's WS partitioner a single flattened loop body.
-    for start_n in tl.range(
-      0,
-      end_n,
-      BLOCK_N,
-      disallow_acc_multi_buffer=True,
-      flatten=True,
-      warp_specialize=True,
-    ):
-      o_accs, m_i, l_i = _ffpa_fwd_sm90_kv_block(
-        desc_q,
-        desc_k,
-        desc_v,
-        AttnBias,
-        q_offset_y,
-        kv_base_y,
-        start_n,
-        off_hb,
-        offs_m,
-        offs_n,
-        o_accs,
-        m_i,
-        l_i,
-        softmax_scale,
-        stride_bm,
-        stride_bn,
-        seqlen_q,
-        seqlen_k,
-        kv_offset,
-        dropout_p,
-        philox_offset,
-        IS_CAUSAL,
-        HAS_ATTN_BIAS,
-        HAS_DROPOUT,
-        PHILOX_SEED,
-        DTYPE,
-        EVEN_N,
-        BLOCK_M,
-        BLOCK_N,
-        BLOCK_HEADDIM_QK,
-        BLOCK_HEADDIM_V,
+  for start_n in range(0, end_n, BLOCK_N):
+    start_n = tl.multiple_of(start_n, BLOCK_N)
+    offs_kv = start_n + offs_n
+    k_offset_y = kv_base_y + start_n
+    v_offset_y = kv_base_y + start_n
+
+    scores = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+    # Phase 1: QK with Split-D reduction structure.
+    # Keep warp-specialization local to the QK D-chunk loop; outer KV-loop WS
+    # has not shown a performance win on the validated Split-D configs.
+    if warp_specialize:
+      for qk_d_chunk in tl.range(
+        0,
         num_qk_d_chunks,
-        NUM_V_GROUPS,
+        1,
+        disallow_acc_multi_buffer=True,
+        flatten=True,
+        warp_specialize=True,
+      ):
+        qk_d_start = qk_d_chunk * BLOCK_HEADDIM_QK
+        # TMA descriptor loads — OOB elements return 0 automatically.
+        q = desc_q.load([q_offset_y, qk_d_start])
+        k = desc_k.load([k_offset_y, qk_d_start])
+        scores = tl.dot(q, tl.trans(k), acc=scores)
+    else:
+      for qk_d_chunk in range(num_qk_d_chunks):
+        qk_d_start = qk_d_chunk * BLOCK_HEADDIM_QK
+        # TMA descriptor loads — OOB elements return 0 automatically.
+        q = desc_q.load([q_offset_y, qk_d_start])
+        k = desc_k.load([k_offset_y, qk_d_start])
+        scores = tl.dot(q, tl.trans(k), acc=scores)
+
+    scores = scores * softmax_scale
+    if HAS_ATTN_BIAS:
+      # attn_bias stays on raw pointer — may be stride-0 broadcast.
+      bias = tl.load(
+        AttnBias + offs_m[:, None] * stride_bm + offs_kv[None, :] * stride_bn,
+        mask=(offs_m[:, None] < seqlen_q) & (offs_kv[None, :] < seqlen_k),
+        other=0.0,
       )
-  else:
-    # Keep the non-WS TMA path on the original plain range. A tl.range with
-    # WS-only attrs still changes non-WS codegen and caps the stage3/4 TMA
-    # candidates that were the fast path before WS was added.
-    for start_n in range(0, end_n, BLOCK_N):
-      o_accs, m_i, l_i = _ffpa_fwd_sm90_kv_block(
-        desc_q,
-        desc_k,
-        desc_v,
-        AttnBias,
-        q_offset_y,
-        kv_base_y,
-        start_n,
-        off_hb,
-        offs_m,
-        offs_n,
-        o_accs,
-        m_i,
-        l_i,
-        softmax_scale,
-        stride_bm,
-        stride_bn,
-        seqlen_q,
-        seqlen_k,
-        kv_offset,
-        dropout_p,
-        philox_offset,
-        IS_CAUSAL,
-        HAS_ATTN_BIAS,
-        HAS_DROPOUT,
-        PHILOX_SEED,
-        DTYPE,
-        EVEN_N,
-        BLOCK_M,
-        BLOCK_N,
-        BLOCK_HEADDIM_QK,
-        BLOCK_HEADDIM_V,
-        num_qk_d_chunks,
-        NUM_V_GROUPS,
-      )
+      scores += bias
+    if not EVEN_N:
+      scores = tl.where(offs_kv[None, :] < seqlen_k, scores, -float("inf"))
+    if IS_CAUSAL:
+      # Lower-right causal semantics for Nq <= Nkv. Query row m can attend to
+      # key positions <= m + (Nkv - Nq), matching PyTorch SDPA.
+      causal_mask = offs_kv[None, :] <= (offs_m[:, None] + kv_offset)
+      scores = tl.where(causal_mask, scores, -float("inf"))
+
+    # Phase 2: Online softmax.
+    # Online softmax merge for the next KV block. ``m_i`` and ``l_i`` track the
+    # row max and denominator before dropout; ``p`` is dropped only for the O
+    # accumulation, while LSE stays the undropped softmax normalizer.
+    m_new = tl.maximum(m_i, tl.max(scores, axis=1))
+    alpha = tl.exp(m_i - m_new)
+    p = tl.exp(scores - m_new[:, None])
+    l_new = l_i * alpha + tl.sum(p, axis=1)
+    p = _apply_dropout_to_p(
+      p,
+      off_hb,
+      offs_m,
+      offs_kv,
+      seqlen_q,
+      seqlen_k,
+      dropout_p,
+      PHILOX_SEED,
+      philox_offset,
+      HAS_DROPOUT,
+    )
+    p = p.to(DTYPE)
+
+    # Phase 3: PV with Split-D V accumulation.
+    # Reuse the same softmax tile for all V slices, matching FFPA CUDA fwd:
+    # R_D[j] = alpha * R_D[j] + P @ V_j. This avoids recomputing QK/softmax
+    # per output head-dim group while keeping Split-D register pressure bounded.
+    for v_group in tl.static_range(0, NUM_V_GROUPS):
+      o_d_start = BLOCK_HEADDIM_V * v_group
+      v = desc_v.load([v_offset_y, o_d_start])
+      o_acc = o_accs[v_group] * alpha[:, None] + tl.dot(p, v)
+      o_accs = _update_o_accs(o_accs, v_group, o_acc)
+    m_i = m_new
+    l_i = l_new
 
   # Phase 4: Epilogue - final scale O and write O/LSE to global memory.
   # Write O via descriptor when aligned, raw pointer otherwise.
@@ -385,7 +275,7 @@ def _ffpa_fwd_sm90_kernel_impl(
   tl.store(LSE + offs_m, m_i + tl.log(l_i), mask=offs_m < seqlen_q)
 
 
-_SM90_DEFAULT_CONFIG = {
+_SM90_FWD_DEFAULT_CONFIG = {
   "BLOCK_M": 64,
   "BLOCK_N": 128,
   "BLOCK_HEADDIM_QK": 64,
@@ -506,7 +396,7 @@ def _ffpa_attn_forward_sm90_generic_impl(
   attn_bias_in = attn_bias if attn_bias is not None else q
   bias_strides = _attn_bias_broadcast_strides(attn_bias, batch, nheads_q, seqlen_q, seqlen_k)
 
-  launch_config = dict(_SM90_DEFAULT_CONFIG)
+  launch_config = dict(_SM90_FWD_DEFAULT_CONFIG)
   if enable_ws:
     launch_config["warp_specialize"] = True
     launch_config["num_stages"] = 2

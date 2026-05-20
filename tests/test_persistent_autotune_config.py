@@ -582,6 +582,111 @@ def test_lookup_backward_filters_variants(tmp_path, monkeypatch):
   assert persistent.lookup_persistent_config(request.__class__(**{**request.__dict__, "has_dropout": True})) is None
 
 
+def test_lookup_generic_backward_split_kernel_configs(tmp_path, monkeypatch):
+  _patch_cuda_device(monkeypatch)
+  monkeypatch.setenv(persistent.CONFIG_ENV_VAR, str(tmp_path))
+  persistent.clear_config_cache()
+  path = persistent.device_config_path(tmp_path, "NVIDIA L20")
+  base_entry = {
+    "direction": "backward",
+    "autotune_mode": "fast",
+    "causal": False,
+    "dtype": "fp16",
+    "headdim": 512,
+    "seqlen_q": 4096,
+    "seqlen_k": 4096,
+    "grad_kv_storage_dtype": None,
+    "has_attn_bias": False,
+    "has_dropout": False,
+    "enable_tma": False,
+    "enable_ws": False,
+  }
+  persistent.write_config_file(
+    _payload([
+      {
+        **base_entry,
+        "kernel": "bwd_generic_dkdv",
+        "bias_grad": True,
+        "config": {
+          "BLOCK_M": 128,
+          "BLOCK_N": 64,
+          "BLOCK_HEADDIM": 64,
+          "num_warps": 8,
+          "num_stages": 2,
+          "warp_specialize": True,
+          "ignored": "field",
+        },
+      },
+      {
+        **base_entry,
+        "kernel": "bwd_generic_dq",
+        "bias_grad": False,
+        "config": {
+          "BLOCK_M": 64,
+          "BLOCK_N": 128,
+          "BLOCK_HEADDIM": 64,
+          "num_warps": 4,
+          "num_stages": 2,
+          "warp_specialize": True,
+        },
+      },
+    ]),
+    path,
+  )
+
+  dkdv = persistent.lookup_persistent_config(
+    persistent.PersistentConfigRequest(
+      direction="backward",
+      kernel="bwd_generic_dkdv",
+      autotune_mode="fast",
+      dtype="fp16",
+      headdim=512,
+      seqlen_q=4096,
+      seqlen_k=4096,
+      causal=False,
+      bias_grad=True,
+      grad_kv_storage_dtype=None,
+      has_attn_bias=False,
+      has_dropout=False,
+      enable_tma=False,
+      enable_ws=False,
+    )
+  )
+  dq = persistent.lookup_persistent_config(
+    persistent.PersistentConfigRequest(
+      direction="backward",
+      kernel="bwd_generic_dq",
+      autotune_mode="fast",
+      dtype="fp16",
+      headdim=512,
+      seqlen_q=4096,
+      seqlen_k=4096,
+      causal=False,
+      bias_grad=False,
+      grad_kv_storage_dtype=None,
+      has_attn_bias=False,
+      has_dropout=False,
+      enable_tma=False,
+      enable_ws=False,
+    )
+  )
+
+  assert dkdv == {
+    "BLOCK_M": 128,
+    "BLOCK_N": 64,
+    "BLOCK_HEADDIM": 64,
+    "num_warps": 8,
+    "num_stages": 2,
+  }
+  assert dq == {
+    "BLOCK_M": 64,
+    "BLOCK_N": 128,
+    "BLOCK_HEADDIM": 64,
+    "num_warps": 4,
+    "num_stages": 2,
+  }
+
+
 def test_lookup_sm90_backward_preserves_tma_config_and_flags(tmp_path, monkeypatch):
   _patch_cuda_device(monkeypatch)
   monkeypatch.setenv(persistent.CONFIG_ENV_VAR, str(tmp_path))

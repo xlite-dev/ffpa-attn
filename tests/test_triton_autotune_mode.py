@@ -14,17 +14,21 @@ from ffpa_attn.triton._ffpa_bwd import (
   _gen_bwd_autotune_configs,
   _gen_decode_bwd_stage1_autotune_configs,
   _gen_pre_autotune_configs,
+  _get_bwd_autotune,
+  _get_bwd_dkdv_autotune,
+  _get_bwd_dq_autotune,
   _get_pre_autotune,
 )
 from ffpa_attn.triton._ffpa_bwd_sm90 import (
-  _default_bwd_sm90_dkdv_config,
-  _default_bwd_sm90_dq_config,
   _gen_bwd_sm90_dkdv_autotune_configs,
   _gen_bwd_sm90_dq_autotune_configs,
   _gen_bwd_sm90_autotune_configs,
   _get_bwd_sm90_dkdv_autotune,
   _get_bwd_sm90_dq_autotune,
   _get_bwd_sm90_autotune,
+  _SM90_BWD_SPLIT_DKDV_DEFAULT_CONFIG,
+  _SM90_BWD_SPLIT_DQ_DEFAULT_CONFIG,
+  _SM90_BWD_SPLIT_PERSIST_DKDV_DEFAULT_CONFIG,
 )
 from ffpa_attn.triton._persistent_autotune import config_from_triton_config
 from ffpa_attn.triton._ffpa_fwd import (
@@ -78,9 +82,10 @@ def test_persist_dkdv_accepts_backward_tma():
   assert meta.triton_backward_enable_persist_dkdv is True
 
 
-def test_split_launch_requires_backward_tma():
-  with pytest.raises(ValueError, match="requires enable_backward_tma"):
-    FFPAAttnMeta.from_kwargs(triton_backward_enable_split_launch=True)
+def test_split_launch_accepts_without_backward_tma():
+  meta = FFPAAttnMeta.from_kwargs(triton_backward_enable_split_launch=True)
+  assert meta.enable_backward_tma == 0
+  assert meta.triton_backward_enable_split_launch is True
 
 
 def test_split_launch_accepts_backward_tma():
@@ -332,7 +337,7 @@ def test_autotune_cli_directional_flags_do_not_cross_enable():
   assert args.enable_bwd_ws is False
 
 
-def test_autotune_cli_bwd_split_launch_requires_backward_tma():
+def test_autotune_cli_bwd_split_launch_allows_without_backward_tma():
   args = SimpleNamespace(
     enable_tma=False,
     enable_ws=False,
@@ -343,8 +348,10 @@ def test_autotune_cli_bwd_split_launch_requires_backward_tma():
     enable_bwd_split_launch=True,
   )
 
-  with pytest.raises(SystemExit, match="requires --enable-bwd-tma"):
-    autotune_module._resolve_directional_cli_flags(args)
+  autotune_module._resolve_directional_cli_flags(args)
+
+  assert args.enable_bwd_tma is False
+  assert args.enable_bwd_split_launch is True
 
 
 def test_persistent_tune_forward_records_sm90_tma_config(monkeypatch):
@@ -568,11 +575,7 @@ def test_sm90_bwd_split_configs_use_split_launch_autotune_flag(monkeypatch):
 
 
 def test_sm90_bwd_split_default_configs_match_5090_fast_autotune():
-  dkdv_config = _default_bwd_sm90_dkdv_config(enable_persist_dkdv=False)
-  dkdv_persist_config = _default_bwd_sm90_dkdv_config(enable_persist_dkdv=True)
-  dq_config = _default_bwd_sm90_dq_config()
-
-  assert dkdv_config == {
+  assert _SM90_BWD_SPLIT_DKDV_DEFAULT_CONFIG == {
     "BLOCK_M": 128,
     "BLOCK_N": 64,
     "BLOCK_HEADDIM": 64,
@@ -580,7 +583,7 @@ def test_sm90_bwd_split_default_configs_match_5090_fast_autotune():
     "num_warps": 4,
     "num_stages": 2,
   }
-  assert dkdv_persist_config == {
+  assert _SM90_BWD_SPLIT_PERSIST_DKDV_DEFAULT_CONFIG == {
     "BLOCK_M": 64,
     "BLOCK_N": 64,
     "BLOCK_HEADDIM": 64,
@@ -588,7 +591,7 @@ def test_sm90_bwd_split_default_configs_match_5090_fast_autotune():
     "num_warps": 4,
     "num_stages": 2,
   }
-  assert dq_config == {
+  assert _SM90_BWD_SPLIT_DQ_DEFAULT_CONFIG == {
     "BLOCK_M": 64,
     "BLOCK_N": 64,
     "BLOCK_HEADDIM": 64,
@@ -702,6 +705,8 @@ def test_persistent_tune_backward_records_split_sm90_tma_configs(monkeypatch):
   monkeypatch.setattr(autotune_module, "ffpa_attn_func", fake_ffpa_attn_func)
   monkeypatch.setattr(autotune_module, "_get_pre_autotune", lambda *args, **kwargs: pre_wrapper)
   monkeypatch.setattr(autotune_module, "_get_bwd_autotune", lambda *args, **kwargs: generic_wrapper)
+  monkeypatch.setattr(autotune_module, "_get_bwd_dkdv_autotune", lambda *args, **kwargs: generic_wrapper)
+  monkeypatch.setattr(autotune_module, "_get_bwd_dq_autotune", lambda *args, **kwargs: generic_wrapper)
   monkeypatch.setattr(autotune_module, "_get_bwd_sm90_autotune", lambda *args, **kwargs: generic_wrapper)
   monkeypatch.setattr(autotune_module, "_get_bwd_sm90_dkdv_autotune", lambda *args, **kwargs: dkdv_wrapper)
   monkeypatch.setattr(autotune_module, "_get_bwd_sm90_dq_autotune", lambda *args, **kwargs: dq_wrapper)
@@ -712,20 +717,65 @@ def test_persistent_tune_backward_records_split_sm90_tma_configs(monkeypatch):
   assert [entry["kernel"] for entry, _ in tuned_entries] == [
     "bwd_preproc",
     "bwd_generic",
+    "bwd_generic_dkdv",
+    "bwd_generic_dq",
     "bwd_sm90_generic",
     "bwd_sm90_dkdv",
     "bwd_sm90_dq",
   ]
-  sm90_entry = tuned_entries[2][0]
-  dkdv_entry = tuned_entries[3][0]
-  dq_entry = tuned_entries[4][0]
+  generic_dkdv_entry = tuned_entries[2][0]
+  generic_dq_entry = tuned_entries[3][0]
+  sm90_entry = tuned_entries[4][0]
+  dkdv_entry = tuned_entries[5][0]
+  dq_entry = tuned_entries[6][0]
+  assert generic_dkdv_entry["enable_tma"] is False
+  assert generic_dq_entry["enable_tma"] is False
   assert sm90_entry["enable_tma"] is True
   assert dkdv_entry["enable_tma"] is True
   assert dq_entry["enable_tma"] is True
-  assert dkdv_entry["bias_grad"] is False
+  assert generic_dkdv_entry["bias_grad"] is False
+  assert generic_dq_entry["bias_grad"] is False
   assert dq_entry["bias_grad"] is False
-  assert [kwargs["triton_backward_enable_split_launch"] for kwargs in seen_kwargs] == [False, False, True]
+  assert [kwargs["triton_backward_enable_split_launch"] for kwargs in seen_kwargs] == [False, True, False, True]
   assert seen_kwargs[-1]["enable_tma"] is True
+
+
+def test_persistent_tune_backward_records_generic_split_without_tma(monkeypatch):
+  task = TuneTask("backward", torch.float16, 320, 512, 512, False, 8, 8)
+  q = torch.empty(1, 8, 512, 320, requires_grad=True)
+  k = torch.empty_like(q, requires_grad=True)
+  v = torch.empty_like(q, requires_grad=True)
+  pre_config = triton.Config({"BLOCK_M": 128, "BLOCK_HEADDIM": 512, "D_CHUNK": False}, num_warps=8, num_stages=2)
+  generic_config = triton.Config({"BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_HEADDIM": 64}, num_warps=8, num_stages=2)
+  pre_wrapper = SimpleNamespace(best_config=pre_config, configs=[pre_config])
+  generic_wrapper = SimpleNamespace(best_config=generic_config, configs=[generic_config])
+  seen_kwargs = []
+
+  def fake_ffpa_attn_func(*args, **kwargs):
+    del args
+    seen_kwargs.append(kwargs)
+    return q * 1.0
+
+  monkeypatch.setattr(autotune_module, "_make_tensors", lambda task, batch: (q, k, v))
+  monkeypatch.setattr(autotune_module, "_make_attn_bias", lambda task: None)
+  monkeypatch.setattr(autotune_module, "is_sm90_tma_backward_supported", lambda *args, **kwargs: False)
+  monkeypatch.setattr(autotune_module, "ffpa_attn_func", fake_ffpa_attn_func)
+  monkeypatch.setattr(autotune_module, "_get_pre_autotune", lambda *args, **kwargs: pre_wrapper)
+  monkeypatch.setattr(autotune_module, "_get_bwd_autotune", lambda *args, **kwargs: generic_wrapper)
+  monkeypatch.setattr(autotune_module, "_get_bwd_dkdv_autotune", lambda *args, **kwargs: generic_wrapper)
+  monkeypatch.setattr(autotune_module, "_get_bwd_dq_autotune", lambda *args, **kwargs: generic_wrapper)
+
+  entries = {}
+  tuned_entries = _tune_backward(task, 1, "fast", entries, enable_tma=False, enable_ws=False, enable_split_launch=True)
+
+  assert [entry["kernel"] for entry, _ in tuned_entries] == [
+    "bwd_preproc",
+    "bwd_generic",
+    "bwd_generic_dkdv",
+    "bwd_generic_dq",
+  ]
+  assert [kwargs["enable_tma"] for kwargs in seen_kwargs] == [False, False]
+  assert [kwargs["triton_backward_enable_split_launch"] for kwargs in seen_kwargs] == [False, True]
 
 
 def test_forward_autotune_keys_include_causal():
@@ -733,6 +783,9 @@ def test_forward_autotune_keys_include_causal():
   assert expected_keys <= set(_get_fwd_autotune(320, "fast", "bf16").keys)
   assert expected_keys <= set(_get_fwd_sm90_autotune(320, "fast", "bf16", enable_ws=False).keys)
   assert expected_keys <= set(_get_decode_fwd_stage1_autotune(320, True, "fast", "bf16").keys)
+  assert expected_keys <= set(_get_bwd_autotune(320, "fast", False).keys)
+  assert expected_keys <= set(_get_bwd_dkdv_autotune(320, "fast", False).keys)
+  assert expected_keys <= set(_get_bwd_dq_autotune(320, "fast").keys)
   assert expected_keys <= set(_get_bwd_sm90_autotune(320, "fast", "bf16", False, enable_ws=False).keys)
   assert expected_keys <= set(_get_bwd_sm90_dkdv_autotune(320, "fast", "bf16", False, enable_ws=False).keys)
   assert expected_keys <= set(_get_bwd_sm90_dq_autotune(320, "fast", "bf16", enable_ws=False).keys)
@@ -758,6 +811,18 @@ def test_sm90_bwd_split_autotune_is_cache_scoped():
   assert dkdv is not dkdv_ws
   assert dq is not dq_ws
   assert dkdv is not dq
+
+
+def test_generic_bwd_split_autotune_is_cache_scoped():
+  fused = _get_bwd_autotune(320, "fast", False)
+  dkdv = _get_bwd_dkdv_autotune(320, "fast", False)
+  dkdv_bias = _get_bwd_dkdv_autotune(320, "fast", True)
+  dq = _get_bwd_dq_autotune(320, "fast")
+  dq_max = _get_bwd_dq_autotune(320, "max")
+  assert fused is not dkdv
+  assert dkdv is not dkdv_bias
+  assert dkdv is not dq
+  assert dq is not dq_max
 
 
 def test_autotune_wrappers_are_dtype_scoped():
