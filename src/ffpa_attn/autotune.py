@@ -21,6 +21,7 @@ import torch
 import triton
 
 from . import __version__
+from .functional import TritonBackend
 from .ffpa_attn_interface import ffpa_attn_func
 from .triton._autotune_utils import (
   autotune_seqlen_key,
@@ -513,11 +514,13 @@ def _tune_forward(
       dropout_p=_FULL_TASK_DROPOUT_P if task.has_dropout else 0.0,
       is_causal=task.causal,
       enable_gqa=task.nheads_q != task.nheads_kv,
-      forward_backend="triton",
-      triton_autotune=True,
-      triton_autotune_mode=mode,
-      enable_tma=run_enable_tma,
-      enable_ws=run_enable_ws,
+      forward_backend=TritonBackend(
+        forward=True,
+        autotune=True,
+        autotune_mode=mode,
+        enable_tma=run_enable_tma,
+        enable_ws=run_enable_ws,
+      ),
     )
     del out
 
@@ -614,13 +617,19 @@ def _tune_backward(
       dropout_p=_FULL_TASK_DROPOUT_P if task.has_dropout else 0.0,
       is_causal=task.causal,
       enable_gqa=task.nheads_q != task.nheads_kv,
-      forward_backend="triton",
-      backward_backend="triton",
-      triton_autotune=True,
-      triton_autotune_mode=mode,
-      enable_tma=run_enable_tma,
-      enable_ws=run_enable_ws,
-      triton_backward_enable_split_launch=run_enable_split_launch,
+      forward_backend=TritonBackend(
+        forward=True,
+        autotune=True,
+        autotune_mode=mode,
+      ),
+      backward_backend=TritonBackend(
+        backward=True,
+        autotune=True,
+        autotune_mode=mode,
+        enable_tma=run_enable_tma,
+        enable_ws=run_enable_ws,
+        split_launch=run_enable_split_launch,
+      ),
     )
     out.float().sum().backward()
 

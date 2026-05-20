@@ -15,6 +15,8 @@ python3 examples/perf.py --fwd-backend cutedsl --bwd-backend cutedsl # SM==90 + 
 
 The `examples/perf.py` migrated benchmark plotting entrypoint. It preserves the old plot style, can benchmark forward/backward cases on demand, and writes both `ffpa_{device}_speedup.png` and `ffpa_{device}_speedup.md`. The additive-mask example uses a compact `[1, 1, 1, Nkv]` key-position bias by default. Use `[1, 1, Nq, Nkv]` only when per-query bias is required, since it scales as `O(Nq * Nkv)` memory.
 
+The CLI remains string-based for convenience, but the script now instantiates backend config objects before calling `ffpa_attn_func`.
+
 ## Benchmark
 
 TFLOPS reports the theoretical dominant attention GEMM throughput only; forward and backward are computed separately from the measured latency. Env: NVIDIA L20 (Ada, 119.5 TFLOPS), PyTorch 2.11, CUDA 13.0, Headdim=512 (FA-2 not supported).

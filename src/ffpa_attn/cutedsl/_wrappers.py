@@ -264,17 +264,14 @@ def _ffpa_attn_varlen_cutedsl(
   kernel consumes packed ``[T, H, D]`` layout natively — no transpose, no
   per-sequence loop.
 
-  ``kwargs`` is forwarded to :meth:`FFPAAttnMeta.from_kwargs` only for
-  forward/backward backend pair-binding and unknown-key validation; the
-  kernel only consumes ``softmax_scale``, ``causal``, GQA-pack, and the
-  cu_seqlens / max_seqlen tuple. ``forward_backend`` / ``backward_backend``
-  default to ``"cutedsl"`` here so callers do not need to plumb them through
-  every time — the varlen API is cutedsl-only by construction.
+  The kernel only consumes ``softmax_scale``, ``causal``, GQA-pack, and the
+  cu_seqlens / max_seqlen tuple. Backend selection is already fixed by the
+  public varlen API before reaching this wrapper, so this entry only enforces
+  tensor and kwarg compatibility for the CuTeDSL path itself.
 
   All API-level guard-rail checks (unsupported FA-extension kwargs,
-  dropout_p, forward_backend, q/k/v shape/dtype, cu_seqlens validity) are
-  performed here so :func:`ffpa_attn.ffpa_attn_varlen_func` can remain a
-  thin shim. Kwarg compatibility is enforced by
+  dropout_p, q/k/v shape/dtype, cu_seqlens validity) are performed here.
+  Kwarg compatibility is enforced by
   :func:`_check_supported_options`: any non-default value of ``dropout_p``
   or any of the FlashAttention-extension / mask / softcap / score_mod /
   aux_tensors / sink / block_mask kwargs raises ``NotImplementedError``
@@ -296,14 +293,6 @@ def _ffpa_attn_varlen_cutedsl(
     alibi_slopes=kwargs.get("alibi_slopes"),
   )
 
-  forward_backend = kwargs.get("forward_backend", "cutedsl")
-  if forward_backend != "cutedsl":
-    raise NotImplementedError(
-      f"ffpa_attn_varlen_func: only forward_backend='cutedsl' is supported, "
-      f"got {forward_backend!r}. Unpack the batch and call ffpa_attn_func "
-      f"per sequence for other backends."
-    )
-
   if q.dim() != 3 or k.dim() != 3 or v.dim() != 3:
     raise ValueError(
       f"ffpa_attn_varlen_func: q/k/v must be 3-D packed [T, H, D], "
@@ -323,18 +312,6 @@ def _ffpa_attn_varlen_cutedsl(
     raise TypeError("ffpa_attn_varlen_func: cu_seqlens_q/cu_seqlens_k must be int32")
   if cu_seqlens_q.numel() != cu_seqlens_k.numel() or cu_seqlens_q.numel() < 2:
     raise ValueError("ffpa_attn_varlen_func: cu_seqlens_q and cu_seqlens_k must share length >= 2")
-
-  from ..functional import FFPAAttnMeta
-
-  meta_kwargs = dict(kwargs)
-  meta_kwargs.setdefault("forward_backend", "cutedsl")
-  meta_kwargs.setdefault("backward_backend", "cutedsl")
-  meta = FFPAAttnMeta.from_kwargs(**meta_kwargs)
-  if meta.forward_backend != "cutedsl" or meta.backward_backend != "cutedsl":
-    raise ValueError(
-      f"ffpa_attn_varlen_func: backends must both be 'cutedsl'; got "
-      f"forward={meta.forward_backend!r} backward={meta.backward_backend!r}"
-    )
 
   if not enable_gqa and q.size(-2) != k.size(-2):
     raise ValueError(

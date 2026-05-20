@@ -32,6 +32,8 @@ pip3 install -U ffpa-attn # (support: sm_{80,...,120})
 git clone https://github.com/xlite-dev/ffpa-attn.git
 # Then, build the wheel package (Triton backend only)
 cd ffpa-attn && pip3 install -e . --no-build-isolation
+# Optional: install ffpa-attn with CuTeDSL backend
+pip3 install -e ".[cutedsl]" --no-build-isolation
 ```
 
 Then, try to accelerate the attention for large headdim with just <i><b>one-line</b></i> of code:
@@ -92,6 +94,15 @@ FFPA supports multiple backends for the forward and backward pass, including: [`
 <i>Special thanks to [Butterfingrz](https://github.com/Butterfingrz) for contributing to the CuTeDSL backend! Awesome work!🎉</i>
 
 </div>
+
+How to use different backends for your own scenario? Users can simply pass the Backend configs (**CUDABackend**, **TritonBackend** or **CuteDSLBackend**) to [ffpa_attn_func](https://ffpa-attn.readthedocs.io/en/latest/api/ffpa_attn/), for example:
+
+```python
+>>> from ffpa_attn import ffpa_attn_func, CuteDSLBackend
+>>> # CuTeDSL backend for D=512 senario, fastest on H200!🎉
+>>> fwd, bwd = CuteDSLBackend(forward=True), CuteDSLBackend(backward=True)
+>>> o = ffpa_attn_func(q, k, v, forward_backend=fwd, backward_backend=bwd)
+```
 
 ## ©️License
 

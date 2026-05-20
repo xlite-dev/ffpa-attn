@@ -9,7 +9,7 @@ to access the low-level dispatch layer.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 import torch
@@ -39,25 +39,121 @@ def _is_hopper_or_later() -> bool:
   return (major, minor) >= (9, 0)
 
 
-_FFPA_ATTN_IMPL_DEFAULTS: dict[str, object] = {
-  "stages": 4 if _is_hopper_or_later() else 3,
-  "acc": "f32",
-  "enable_tma": False,
-  "enable_ws": False,
-  "enable_forward_tma": False,
-  "enable_backward_tma": False,
-  "enable_forward_ws": False,
-  "enable_backward_ws": False,
-  "triton_backward_enable_persist_dkdv": False,
-  "triton_backward_enable_split_launch": False,
-  "high_precision_grad": False,
-  "forward_backend": "triton",
-  "triton_autotune": False,
-  "triton_autotune_mode": "fast",
-  "backward_backend": "triton",
-  "triton_backward_preprocess_d_chunk": False,
-  "triton_backward_grad_kv_storage_dtype": None,
-}
+def _normalize_grad_kv_storage_dtype(dtype: torch.dtype | str | None) -> torch.dtype | None:
+  if dtype is None:
+    return None
+  if dtype == "fp16":
+    return torch.float16
+  if dtype == "fp32":
+    return torch.float32
+  if dtype in (torch.float16, torch.float32):
+    return dtype
+  raise ValueError(
+    "grad_kv_storage_dtype must be None, 'fp16', 'fp32', torch.float16, or torch.float32, "
+    f"got {dtype!r}"
+  )
+
+
+@dataclass
+class Backend:
+  name: str
+  forward: bool = False
+  backward: bool = False
+
+  def __post_init__(self) -> None:
+    assert self.forward != self.backward, f"{self.name} backend must select exactly one direction"
+
+
+@dataclass
+class SDPABackend(Backend):
+  name: str = "sdpa"
+  high_precision_grad: bool = False
+
+  def __post_init__(self) -> None:
+    super().__post_init__()
+    assert not self.forward, "sdpa backend does not support forward"
+
+
+@dataclass
+class CUDABackend(Backend):
+  name: str = "cuda"
+  acc: str = "f32"
+  stages: int = 4 if _is_hopper_or_later() else 3
+
+  def __post_init__(self) -> None:
+    super().__post_init__()
+    assert not self.backward, "cuda backend does not support backward"
+    assert self.acc in ("f16", "f32"), f"acc must be 'f16' or 'f32', got {self.acc!r}"
+
+  @property
+  def acc_code(self) -> int:
+    return _ACC_F32 if self.acc == "f32" else _ACC_F16
+
+
+@dataclass
+class TritonBackend(Backend):
+  name: str = "triton"
+  autotune: bool = False
+  autotune_mode: str = "fast"
+  enable_tma: bool = False
+  enable_ws: bool = False
+  persist_dkdv: bool = False
+  split_launch: bool = False
+  preprocess_d_chunk: bool = False
+  grad_kv_storage_dtype: torch.dtype | str | None = None
+
+  def __post_init__(self) -> None:
+    super().__post_init__()
+    assert self.autotune_mode in ("fast", "max"), \
+      f"Unsupported autotune_mode={self.autotune_mode!r}; choose 'fast' or 'max'."
+    self.grad_kv_storage_dtype = _normalize_grad_kv_storage_dtype(self.grad_kv_storage_dtype)
+    if self.persist_dkdv:
+      assert self.backward, "persist_dkdv is only valid for Triton backward"
+      assert self.enable_tma, "persist_dkdv requires enable_tma=True"
+    if self.split_launch or self.preprocess_d_chunk or self.grad_kv_storage_dtype is not None:
+      assert self.backward, "backward-only Triton options require backward=True"
+
+
+@dataclass
+class CuTeDSLBackend(Backend):
+  name: str = "cutedsl"
+  pass
+
+
+@dataclass
+class AttentionMeta:
+  is_causal: bool = False
+  scale: float = 0.0
+  dropout_p: float = 0.0
+  is_grad_enabled: bool = False
+
+
+def _resolve_backend_pair(
+  forward_backend: Backend | None,
+  backward_backend: Backend | None,
+) -> tuple[Backend, Backend]:
+  forward_backend = TritonBackend(forward=True) if forward_backend is None else forward_backend
+  backward_backend = TritonBackend(backward=True) if backward_backend is None else backward_backend
+
+  if not isinstance(forward_backend, Backend):
+    raise TypeError("forward_backend must be a Backend object")
+  if not isinstance(backward_backend, Backend):
+    raise TypeError("backward_backend must be a Backend object")
+
+  assert forward_backend.forward, "forward_backend must be configured with forward=True"
+  assert backward_backend.backward, "backward_backend must be configured with backward=True"
+
+  # CuTeDSL is currently modeled as its own backend family rather than as a
+  # generic FFPA forward implementation that can freely mix with Triton/SDPA
+  # backward. Keep the pair invariant here so unsupported hybrid combinations
+  # fail immediately at metadata construction time instead of leaking deeper
+  # into dispatch or autograd.
+  if forward_backend.name == "cutedsl" or backward_backend.name == "cutedsl":
+    assert forward_backend.name == "cutedsl" and backward_backend.name == "cutedsl", \
+      "cutedsl forward and backward must be selected as a pair"
+
+  return forward_backend, backward_backend
+
 
 _CUDA_BACKEND_LOADED = False
 _CUDA_BACKEND_IMPORT_ERROR: Exception | None = None
@@ -186,200 +282,37 @@ def _require_cuda_backward_impl():
   )
 
 
-def _resolve_directional_flag(
-  kwargs: dict[str, object],
-  impl_options: dict[str, object],
-  legacy_key: str,
-  forward_key: str,
-  backward_key: str,
-) -> tuple[int, int]:
-  """Resolve a legacy global bool into direction-specific bools."""
-  legacy_present = legacy_key in kwargs
-  forward_present = forward_key in kwargs
-  backward_present = backward_key in kwargs
-  legacy_value = bool(impl_options[legacy_key])
-  forward_value = bool(impl_options[forward_key]) if forward_present else legacy_value
-  backward_value = bool(impl_options[backward_key]) if backward_present else legacy_value
-  if legacy_present:
-    conflicts = []
-    if forward_present and forward_value != legacy_value:
-      conflicts.append(forward_key)
-    if backward_present and backward_value != legacy_value:
-      conflicts.append(backward_key)
-    if conflicts:
-      names = ", ".join(conflicts)
-      raise ValueError(f"{legacy_key} conflicts with direction-specific option(s): {names}")
-  return int(forward_value), int(backward_value)
-
-
 @dataclass
 class FFPAAttnMeta:
-  """Non-tensor FFPA options passed through the autograd Function.
+  """Non-tensor FFPA options passed through the autograd Function."""
 
-  :param is_causal: Whether to apply lower-right causal masking.
-  :param scale: Scale applied to ``QK^T``.
-  :param stages: CUDA forward pipeline stages.
-  :param acc: Native CUDA accumulator code.
-  :param enable_forward_tma: Experimental SM90+ Triton forward path
-    (descriptor/TMA). Falls back silently when unsupported. Defaults to
-    ``False``.
-  :param enable_backward_tma: Experimental SM90+ Triton backward path
-    (descriptor/TMA). Falls back silently when unsupported. Defaults to
-    ``False``.
-  :param enable_forward_ws: Force warp-specialized SM90 TMA forward configs.
-    Only effective with ``enable_forward_tma=True``. Defaults to ``False``.
-  :param enable_backward_ws: Force warp-specialized SM90 TMA backward configs.
-    Only effective with ``enable_backward_tma=True``. Defaults to ``False``.
-  :param triton_backward_enable_persist_dkdv: Use the experimental SM90 TMA
-    backward dK/dV path that keeps fp32 dK/dV accumulators in registers across
-    Q blocks. Requires ``enable_backward_tma=True``. Defaults to ``False``.
-  :param triton_backward_enable_split_launch: Use separate Triton backward
-    launches for dK/dV and dQ. On SM90/TMA this selects the TMA split kernels;
-    otherwise it selects the generic non-TMA split kernels. Defaults to
-    ``False``.
-  :param enable_tma: Compatibility alias for setting both
-    ``enable_forward_tma`` and ``enable_backward_tma``.
-  :param enable_ws: Compatibility alias for setting both
-    ``enable_forward_ws`` and ``enable_backward_ws``.
-  :param dropout_p: Dropout probability (default 0.0).
-  :param is_grad_enabled: Grad-mode state captured at the public API.
-  :param high_precision_grad: Whether SDPA backward should upcast.
-  :param forward_backend: Forward backend name, ``"cuda"`` or ``"triton"``.
-  :param triton_autotune: Whether to enable Triton runtime autotune.
-  :param triton_autotune_mode: Triton autotune search-space mode,
-    ``"fast"`` or ``"max"``.
-  :param backward_backend: Backward backend name. ``"sdpa"`` or ``"triton"``.
-  :param triton_backward_preprocess_d_chunk: Whether Triton backward should
-    compute delta with the split-D preprocess kernel.
-  :param triton_backward_grad_kv_storage_dtype: Optional storage dtype for
-    Triton backward ``DK`` / ``DV`` buffers. ``None`` keeps k/v dtype;
-    currently ``torch.float16`` and ``torch.float32`` are accepted as overrides.
-  """
+  attn_meta: AttentionMeta = field(default_factory=AttentionMeta)
+  forward_meta: Backend = field(default_factory=lambda: TritonBackend(forward=True))
+  backward_meta: Backend = field(default_factory=lambda: TritonBackend(backward=True))
 
-  is_causal: bool
-  scale: float
-  stages: int
-  acc: int
-  enable_forward_tma: int
-  enable_backward_tma: int
-  enable_forward_ws: int
-  enable_backward_ws: int
-  triton_backward_enable_persist_dkdv: bool
-  triton_backward_enable_split_launch: bool
-  dropout_p: float
-  is_grad_enabled: bool
-  high_precision_grad: bool
-  forward_backend: str
-  triton_autotune: bool
-  triton_autotune_mode: str
-  backward_backend: str
-  triton_backward_preprocess_d_chunk: bool
-  triton_backward_grad_kv_storage_dtype: torch.dtype | None
+  def __post_init__(self) -> None:
+    self.forward_meta, self.backward_meta = _resolve_backend_pair(self.forward_meta, self.backward_meta)
 
   @classmethod
-  def from_kwargs(cls, **kwargs: object) -> FFPAAttnMeta:
-    """Build a meta from the impl-specific ``**kwargs``.
-
-    Merges the given kwargs with :data:`_FFPA_ATTN_IMPL_DEFAULTS`, validates
-    unknown keys, backends and ``acc``, and returns a fully populated meta
-    instance.  User-facing fields (``is_causal``, ``scale``, ``dropout_p``,
-    ``is_grad_enabled``) are set to safe defaults; call :meth:`normalize`
-    to fill and validate them from the public-API inputs.
-    """
-    unknown = sorted(set(kwargs) - set(_FFPA_ATTN_IMPL_DEFAULTS))
-    if unknown:
-      keys = ", ".join(unknown)
-      raise TypeError(f"ffpa_attn_func got unexpected keyword argument(s): {keys}")
-
-    impl_options = {**_FFPA_ATTN_IMPL_DEFAULTS, **kwargs}
-
-    stages = int(impl_options["stages"])
-    acc_str = impl_options["acc"]
-    enable_forward_tma, enable_backward_tma = _resolve_directional_flag(
-      kwargs,
-      impl_options,
-      "enable_tma",
-      "enable_forward_tma",
-      "enable_backward_tma",
-    )
-    enable_forward_ws, enable_backward_ws = _resolve_directional_flag(
-      kwargs,
-      impl_options,
-      "enable_ws",
-      "enable_forward_ws",
-      "enable_backward_ws",
-    )
-    high_precision_grad = bool(impl_options["high_precision_grad"])
-    forward_backend = str(impl_options["forward_backend"])
-    triton_autotune = bool(impl_options["triton_autotune"])
-    triton_autotune_mode = str(impl_options["triton_autotune_mode"])
-    backward_backend = str(impl_options["backward_backend"])
-    triton_backward_preprocess_d_chunk = bool(impl_options["triton_backward_preprocess_d_chunk"])
-    triton_backward_grad_kv_storage_dtype = impl_options["triton_backward_grad_kv_storage_dtype"]
-    triton_backward_enable_persist_dkdv = bool(impl_options["triton_backward_enable_persist_dkdv"])
-    triton_backward_enable_split_launch = bool(impl_options["triton_backward_enable_split_launch"])
-
-    assert forward_backend in ("cuda", "triton", "cutedsl"), \
-      f"Unsupported forward_backend={forward_backend!r}; choose 'cuda', 'triton', or 'cutedsl'."
-    assert backward_backend in ("sdpa", "triton", "cutedsl"), \
-      f"Unsupported backward_backend={backward_backend!r}; choose 'sdpa', 'triton', or 'cutedsl'."
-
-    # cutedsl forward/backward are bound as a pair: switching one implicitly
-    # selects the other, and any cross-backend combination is rejected.
-    backward_backend_explicit = "backward_backend" in kwargs
-    if forward_backend == "cutedsl" and backward_backend != "cutedsl":
-      if backward_backend_explicit:
-        raise ValueError(
-          f"forward_backend='cutedsl' requires backward_backend='cutedsl'; "
-          f"got backward_backend={backward_backend!r}"
-        )
-      backward_backend = "cutedsl"
-    elif backward_backend == "cutedsl" and forward_backend != "cutedsl":
-      raise ValueError(
-        f"backward_backend='cutedsl' requires forward_backend='cutedsl'; "
-        f"got forward_backend={forward_backend!r}"
-      )
-    assert triton_autotune_mode in ("fast", "max"), \
-      f"Unsupported triton_autotune_mode={triton_autotune_mode!r}; choose 'fast' or 'max'."
-    if triton_backward_grad_kv_storage_dtype not in (None, torch.float16, torch.float32):
-      raise ValueError(
-        "triton_backward_grad_kv_storage_dtype must be None, torch.float16, or torch.float32, "
-        f"got {triton_backward_grad_kv_storage_dtype!r}"
-      )
-    if triton_backward_enable_persist_dkdv and not enable_backward_tma:
-      raise ValueError("triton_backward_enable_persist_dkdv requires enable_backward_tma=True")
-
-    if acc_str == "f32":
-      acc = _ACC_F32
-    elif acc_str == "f16":
-      acc = _ACC_F16
-    else:
-      raise ValueError(f"acc must be 'f16' or 'f32', got {acc_str!r}")
-
+  def from_backends(
+    cls,
+    forward_backend: Backend | None = None,
+    backward_backend: Backend | None = None,
+  ) -> FFPAAttnMeta:
+    forward_backend, backward_backend = _resolve_backend_pair(forward_backend, backward_backend)
     return cls(
-      # NOTE: Some of these fields maybe updated later by normalize() based on
-      # the public API inputs, but we need to set them to some value here to create
-      # the instance.
-      is_causal=False,
-      scale=0.0,
-      dropout_p=0.0,
-      is_grad_enabled=False,
-      acc=acc,
-      stages=stages,
-      enable_forward_tma=enable_forward_tma,
-      enable_backward_tma=enable_backward_tma,
-      enable_forward_ws=enable_forward_ws,
-      enable_backward_ws=enable_backward_ws,
-      triton_backward_enable_persist_dkdv=triton_backward_enable_persist_dkdv,
-      triton_backward_enable_split_launch=triton_backward_enable_split_launch,
-      high_precision_grad=high_precision_grad,
-      forward_backend=forward_backend,
-      triton_autotune=triton_autotune,
-      triton_autotune_mode=triton_autotune_mode,
-      backward_backend=backward_backend,
-      triton_backward_preprocess_d_chunk=triton_backward_preprocess_d_chunk,
-      triton_backward_grad_kv_storage_dtype=triton_backward_grad_kv_storage_dtype,
+      attn_meta=AttentionMeta(),
+      forward_meta=forward_backend,
+      backward_meta=backward_backend,
     )
+
+  @classmethod
+  def from_options(
+    cls,
+    forward_backend: Backend | None = None,
+    backward_backend: Backend | None = None,
+  ) -> FFPAAttnMeta:
+    return cls.from_backends(forward_backend, backward_backend)
 
   def normalize(
     self,
@@ -394,9 +327,9 @@ class FFPAAttnMeta:
   ) -> FFPAAttnMeta:
     """Fill user-facing fields and validate all inputs in place.
 
-    Call this right after :meth:`from_kwargs` to get a fully validated meta::
+    Call this right after :meth:`from_backends` to get a fully validated meta::
 
-        meta = FFPAAttnMeta.from_kwargs(**kwargs).normalize(
+      meta = FFPAAttnMeta.from_backends(forward_backend, backward_backend).normalize(
             query, key, value, attn_mask, dropout_p, is_causal, scale, enable_gqa,
         )
 
@@ -407,7 +340,7 @@ class FFPAAttnMeta:
       raise ValueError(f"ffpa_attn_func: dropout_p must be in [0, 1], got {dropout_p}")
     if dropout_p >= 1.0:
       raise ValueError("ffpa_attn_func: dropout_p=1.0 is not supported by SDPA fused kernels")
-    if dropout_p > 0.0 and query.size(-1) > 256 and self.forward_backend == "cutedsl":
+    if dropout_p > 0.0 and query.size(-1) > 256 and isinstance(self.forward_meta, CuTeDSLBackend):
       raise NotImplementedError("ffpa_attn_func: large-D dropout is not supported by forward_backend='cutedsl'")
     if attn_mask is not None and is_causal:
       raise RuntimeError("ffpa_attn_func: explicit attn_mask should not be set when is_causal=True")
@@ -415,12 +348,14 @@ class FFPAAttnMeta:
       raise TypeError("ffpa_attn_func: boolean attn_mask cannot require gradients")
 
     # Fill in user-facing fields.
-    self.is_causal = is_causal
-    self.dropout_p = float(dropout_p)
-    self.is_grad_enabled = torch.is_grad_enabled()
+    self.attn_meta.is_causal = is_causal
+    self.attn_meta.dropout_p = float(dropout_p)
+    self.attn_meta.is_grad_enabled = torch.is_grad_enabled()
 
     # Validate that acc-code is compatible with activation dtype.
-    if query.dtype == torch.bfloat16 and self.acc == _ACC_F16:
+    if isinstance(
+      self.forward_meta, CUDABackend
+    ) and query.dtype == torch.bfloat16 and self.forward_meta.acc_code == _ACC_F16:
       raise ValueError("bf16 activations require acc='f32'; no bf16-acc mma PTX exists.")
     if query.dtype not in (torch.float16, torch.bfloat16):
       raise TypeError(f"ffpa_attn_func only supports fp16/bf16, got {query.dtype}")
@@ -459,9 +394,9 @@ class FFPAAttnMeta:
       )
 
     if scale is None:
-      self.scale = 1.0 / math.sqrt(query.size(-1))
+      self.attn_meta.scale = 1.0 / math.sqrt(query.size(-1))
     else:
-      self.scale = float(scale)
+      self.attn_meta.scale = float(scale)
 
     return self
 
@@ -577,7 +512,7 @@ class _FFPAAttnFunc(torch.autograd.Function):
     attn_bias: torch.Tensor | None,
     meta: FFPAAttnMeta,
   ) -> torch.Tensor:
-    is_grad = meta.is_grad_enabled and any(x.requires_grad for x in (q, k, v, attn_bias) if x is not None)
+    is_grad = meta.attn_meta.is_grad_enabled and any(x.requires_grad for x in (q, k, v, attn_bias) if x is not None)
     head_dim = q.size(-1)
     O = torch.empty_like(q)  # noqa: E741
 
@@ -587,12 +522,13 @@ class _FFPAAttnFunc(torch.autograd.Function):
         k,
         v,
         O,
-        meta.is_causal,
-        meta.scale,
-        meta.dropout_p,
+        meta.attn_meta.is_causal,
+        meta.attn_meta.scale,
+        meta.attn_meta.dropout_p,
       )
-    elif meta.forward_backend == "cuda":
-      rng_state = _reserve_large_d_dropout_rng(q, k, meta.dropout_p)
+    elif isinstance(meta.forward_meta, CUDABackend):
+      forward_meta = meta.forward_meta
+      rng_state = _reserve_large_d_dropout_rng(q, k, meta.attn_meta.dropout_p)
       cuda_forward_impl = _require_cuda_forward_impl()
       O, lse = cuda_forward_impl(
         q,
@@ -600,41 +536,43 @@ class _FFPAAttnFunc(torch.autograd.Function):
         v,
         O,
         attn_bias,
-        meta.stages,
-        meta.acc,
-        int(meta.is_causal),
-        meta.scale,
-        meta.dropout_p,
+        forward_meta.stages,
+        forward_meta.acc_code,
+        int(meta.attn_meta.is_causal),
+        meta.attn_meta.scale,
+        meta.attn_meta.dropout_p,
         int(rng_state[0].item()) if rng_state.numel() else 0,
         int(rng_state[1].item()) if rng_state.numel() else 0,
         0,
       )
-    elif meta.forward_backend == "triton":
-      rng_state = _reserve_large_d_dropout_rng(q, k, meta.dropout_p)
+    elif isinstance(meta.forward_meta, TritonBackend):
+      forward_meta = meta.forward_meta
+      assert forward_meta.forward, "forward_meta must be configured with forward=True"
+      rng_state = _reserve_large_d_dropout_rng(q, k, meta.attn_meta.dropout_p)
       O, lse = _ffpa_attn_forward_triton(
         q,
         k,
         v,
         O,
-        meta.is_causal,
-        meta.scale,
-        meta.triton_autotune,
-        meta.triton_autotune_mode,
+        meta.attn_meta.is_causal,
+        meta.attn_meta.scale,
+        forward_meta.autotune,
+        forward_meta.autotune_mode,
         attn_bias,
-        meta.dropout_p,
+        meta.attn_meta.dropout_p,
         int(rng_state[0].item()) if rng_state.numel() else 0,
         int(rng_state[1].item()) if rng_state.numel() else 0,
-        bool(meta.enable_forward_tma),
-        bool(meta.enable_forward_ws),
+        forward_meta.enable_tma,
+        forward_meta.enable_ws,
       )
     else:
-      raise ValueError(f"Unsupported forward_backend={meta.forward_backend!r};")
+      raise ValueError(f"Unsupported forward_backend={meta.forward_meta.name!r};")
 
     # NO unused output from the FFPA CUDA forward / backward kernels, but we
     # need to return something to keep the autograd contract
     # consistent across backends. Return empty tensors on large-D paths since the
     # small-D path's backward expects tensors to be returned and saved.
-    if head_dim > 256 and meta.forward_backend != "triton":
+    if head_dim > 256 and not isinstance(meta.forward_meta, TritonBackend):
       unused = torch.empty(0, dtype=torch.uint8, device=q.device)
     elif head_dim > 256:
       unused = torch.empty(0, dtype=torch.uint8, device=q.device)
@@ -662,7 +600,9 @@ class _FFPAAttnFunc(torch.autograd.Function):
     D = q.size(-1)
 
     if D > 256:
-      if meta.backward_backend == "triton":
+      if isinstance(meta.backward_meta, TritonBackend):
+        backward_meta = meta.backward_meta
+        assert backward_meta.backward, "backward_meta must be configured with backward=True"
         dq, dk, dv, grad_attn_bias = _ffpa_attn_backward_triton(
           grad_out=grad_out,
           q=q,
@@ -670,23 +610,25 @@ class _FFPAAttnFunc(torch.autograd.Function):
           v=v,
           o=O,
           lse=lse,
-          causal=meta.is_causal,
-          softmax_scale=meta.scale,
-          autotune=meta.triton_autotune,
-          autotune_mode=meta.triton_autotune_mode,
-          preprocess_d_chunk=meta.triton_backward_preprocess_d_chunk,
+          causal=meta.attn_meta.is_causal,
+          softmax_scale=meta.attn_meta.scale,
+          autotune=backward_meta.autotune,
+          autotune_mode=backward_meta.autotune_mode,
+          preprocess_d_chunk=backward_meta.preprocess_d_chunk,
           attn_bias=attn_bias,
           return_attn_bias_grad=ctx.needs_input_grad[3],
-          grad_kv_storage_dtype=meta.triton_backward_grad_kv_storage_dtype,
-          dropout_p=meta.dropout_p,
+          grad_kv_storage_dtype=backward_meta.grad_kv_storage_dtype,
+          dropout_p=meta.attn_meta.dropout_p,
           philox_seed=int(rng_state[0].item()) if rng_state.numel() else 0,
           philox_offset=int(rng_state[1].item()) if rng_state.numel() else 0,
-          enable_tma=bool(meta.enable_backward_tma),
-          enable_ws=bool(meta.enable_backward_ws),
-          enable_persist_dkdv=meta.triton_backward_enable_persist_dkdv,
-          enable_split_launch=meta.triton_backward_enable_split_launch,
+          enable_tma=backward_meta.enable_tma,
+          enable_ws=backward_meta.enable_ws,
+          enable_persist_dkdv=backward_meta.persist_dkdv,
+          enable_split_launch=backward_meta.split_launch,
         )
       else:
+        assert isinstance(meta.backward_meta, SDPABackend), \
+          f"Unsupported backward_backend={meta.backward_meta.name!r}"
         dq, dk, dv, grad_attn_bias = _aten_efficient_attn_backward(
           grad_out=grad_out,
           q=q,
@@ -694,12 +636,12 @@ class _FFPAAttnFunc(torch.autograd.Function):
           v=v,
           o=O,
           lse=lse,
-          causal=meta.is_causal,
-          softmax_scale=meta.scale,
-          high_precision_grad=meta.high_precision_grad,
+          causal=meta.attn_meta.is_causal,
+          softmax_scale=meta.attn_meta.scale,
+          high_precision_grad=meta.backward_meta.high_precision_grad,
           attn_bias=attn_bias,
           return_attn_bias_grad=ctx.needs_input_grad[3],
-          dropout_p=meta.dropout_p,
+          dropout_p=meta.attn_meta.dropout_p,
           philox_seed=int(rng_state[0].item()) if rng_state.numel() else 0,
           philox_offset=int(rng_state[1].item()) if rng_state.numel() else 0,
         )
@@ -713,11 +655,11 @@ class _FFPAAttnFunc(torch.autograd.Function):
         v,
         O,
         lse,
-        meta.is_causal,
+        meta.attn_meta.is_causal,
         rng_state,
         unused,
-        meta.scale,
-        meta.dropout_p,
+        meta.attn_meta.scale,
+        meta.attn_meta.dropout_p,
       )
       grad_attn_bias = None
 

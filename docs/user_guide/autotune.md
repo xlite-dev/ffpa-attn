@@ -11,16 +11,22 @@ There are two ways to use Triton tuned configs:
 1. Run with runtime autotune enabled for one process:
 
 ```python
-from ffpa_attn import ffpa_attn_func
+from ffpa_attn import TritonBackend, ffpa_attn_func
 
 out = ffpa_attn_func(
 	q,
 	k,
 	v,
-	forward_backend="triton", # default is 'triton'
-	backward_backend="triton", # default is 'triton'
-	triton_autotune=True, # default is False
-	triton_autotune_mode="fast", # default is 'fast'.
+	forward_backend=TritonBackend(
+		forward=True,
+		autotune=True,
+		autotune_mode="fast"
+	),
+	backward_backend=TritonBackend(
+		backward=True,
+		autotune=True,
+		autotune_mode="fast"
+	),
 )
 ```
 
@@ -34,7 +40,7 @@ python -m ffpa_attn.autotune --mode fast --directions both --dtypes bf16,fp16 --
 
 The generated JSON is saved under <span style="color:#c77dff;">src/ffpa_attn/triton/configs/{device_name}.json </span>, for example <span style="color:#c77dff;">src/ffpa_attn/triton/configs/NVIDIA_L20.json</span>.
 
-Later calls with <span style="color:#c77dff;">triton_autotune=False</span> will automatically load the matching
+Later calls with <span style="color:#c77dff;">TritonBackend(..., autotune=False)</span> will automatically load the matching
 device config when it exists.
 
 ## Generate Persistent Configs

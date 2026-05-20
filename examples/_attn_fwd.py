@@ -23,7 +23,7 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
-from ffpa_attn import ffpa_attn_func
+from ffpa_attn import CUDABackend, CuTeDSLBackend, TritonBackend, ffpa_attn_func
 from _attn_flops import attention_fwd_flops, format_tflops_short, tflops_from_ms
 
 DEFAULT_WARMUP = 2
@@ -294,6 +294,30 @@ def _format_forward_result(result: FORWARD_RESULT) -> str:
   )
 
 
+def _make_forward_backend(
+  name: str,
+  *,
+  acc: str,
+  triton_autotune: bool,
+  triton_autotune_mode: str,
+  enable_tma: bool,
+  enable_ws: bool,
+):
+  if name == "cuda":
+    return CUDABackend(forward=True, acc=acc)
+  if name == "triton":
+    return TritonBackend(
+      forward=True,
+      autotune=triton_autotune,
+      autotune_mode=triton_autotune_mode,
+      enable_tma=enable_tma,
+      enable_ws=enable_ws,
+    )
+  if name == "cutedsl":
+    return CuTeDSLBackend(forward=True)
+  raise ValueError(f"Unsupported forward_backend={name!r}")
+
+
 def _run_case(
   name: str,
   dtype: torch.dtype,
@@ -311,7 +335,6 @@ def _run_case(
   attn_mask: torch.Tensor | None = None,
   dropout_p: float = 0.0,
   acc: str = "f32",
-  triton_backward_grad_kv_storage_dtype: torch.dtype | None = None,
   apply_norm: bool = False,
   warmup: int = DEFAULT_WARMUP,
   iters: int = DEFAULT_ITERS,
@@ -324,23 +347,27 @@ def _run_case(
   k = torch.randn(B, Nh_kv, Nkv, D, dtype=dtype, device="cuda")
   v = torch.randn(B, Nh_kv, Nkv, D, dtype=dtype, device="cuda")
   q, k, v = _maybe_norm_qkv(q, k, v, apply_norm)
+  forward_backend = _make_forward_backend(
+    forward_backend,
+    acc=acc,
+    triton_autotune=triton_autotune,
+    triton_autotune_mode=triton_autotune_mode,
+    enable_tma=enable_tma,
+    enable_ws=enable_ws,
+  )
+  backward_backend = CuTeDSLBackend(backward=True) if forward_backend.name == "cutedsl" else None
 
   torch.manual_seed(seed + 17)
   out_ffpa = ffpa_attn_func(
     q,
     k,
     v,
-    acc=acc,
     attn_mask=attn_mask,
     is_causal=causal,
     dropout_p=dropout_p,
     enable_gqa=Nh_q != Nh_kv,
     forward_backend=forward_backend,
-    triton_autotune=triton_autotune,
-    triton_autotune_mode=triton_autotune_mode,
-    triton_backward_grad_kv_storage_dtype=triton_backward_grad_kv_storage_dtype,
-    enable_forward_tma=enable_tma,
-    enable_forward_ws=enable_ws,
+    backward_backend=backward_backend,
   )
   k_ref, v_ref = _expand_kv(k, v, Nh_q)
   torch.manual_seed(seed + 17)
@@ -354,17 +381,12 @@ def _run_case(
       q,
       k,
       v,
-      acc=acc,
       attn_mask=attn_mask,
       is_causal=causal,
       dropout_p=dropout_p,
       enable_gqa=Nh_q != Nh_kv,
       forward_backend=forward_backend,
-      triton_autotune=triton_autotune,
-      triton_autotune_mode=triton_autotune_mode,
-      triton_backward_grad_kv_storage_dtype=triton_backward_grad_kv_storage_dtype,
-      enable_forward_tma=enable_tma,
-      enable_forward_ws=enable_ws,
+      backward_backend=backward_backend,
     ),
     q,
     k,
@@ -387,7 +409,7 @@ def _run_case(
   result: FORWARD_RESULT = {
     "case_name": name,
     "dtype": _dtype_tag(dtype),
-    "forward_backend": forward_backend,
+    "forward_backend": forward_backend.name,
     "B": B,
     "Hq": Nh_q,
     "Hkv": Nh_kv,
@@ -567,7 +589,6 @@ def run_forward_examples(
           attn_mask=case.get("attn_mask"),
           dropout_p=case.get("dropout_p", 0.0),
           apply_norm=apply_norm,
-          triton_backward_grad_kv_storage_dtype=triton_backward_grad_kv_storage_dtype,
           warmup=warmup,
           iters=iters,
           print_result=print_results,
