@@ -915,6 +915,7 @@ def _parse_args() -> argparse.Namespace:
   parser.add_argument(
     "--enable-bwd-split-launch",
     "--bwd-split-launch",
+    "--bwd-split",
     action="store_true",
     help="Additionally tune SM90+ TMA backward split-launch dK/dV and dQ kernels when --enable-bwd-tma is set.",
   )
@@ -938,6 +939,7 @@ def main() -> int:
   :return: Process exit code.
   """
   args = _parse_args()
+  logger.info("Starting FFPA Triton autotune with args: %s", args)
   if args.B <= 0 or args.H <= 0:
     raise SystemExit("ffpa_attn.autotune requires positive --B and --H values")
   if not torch.cuda.is_available():
