@@ -8,8 +8,8 @@ present the SDPA-style ``[B, H, N, D]`` / FA-style ``[T, H, D]`` surface and
 route ``forward_backend='cutedsl'`` through the unified
 :class:`ffpa_attn.functional.FFPAAttnFunc` autograd boundary.
 :func:`_ffpa_attn_forward_cutedsl` and :func:`_ffpa_attn_backward_cutedsl`
-transpose between SDPA and FA layouts and dispatch into
-:func:`_ffpa_attn_forward_sm90` / :func:`_ffpa_attn_backward_sm90`.
+transpose between SDPA and FA layouts and dispatch through the registered
+torch ops ``ffpa_attn::_fwd_cutedsl`` / ``ffpa_attn::_bwd_cutedsl``.
 
 The module also centralises the **tensor-level** SM90 / D=512 / dtype gating
 via :func:`_require_cutedsl_supported` and the **kwarg-level** compatibility
@@ -189,9 +189,9 @@ def _ffpa_attn_forward_cutedsl(
   """CuTeDSL SplitD forward for D=512 on SM90 with SDPA-layout in/out.
 
   Accepts ``[B, H, N, D]`` (SDPA) layout, transposes to the CuTeDSL-native
-  ``[B, N, H, D]`` (FA) layout, calls :func:`_ffpa_attn_forward_sm90`, and
-  transposes the output back. ``lse`` is always in ``[B, H, N]`` shape and
-  does not require a transpose.
+  ``[B, N, H, D]`` (FA) layout, calls the registered torch op
+  ``torch.ops.ffpa_attn._fwd_cutedsl``, and transposes the output back.
+  ``lse`` is always in ``[B, H, N]`` shape and does not require a transpose.
 
   Called from :meth:`_FFPAAttnFunc.forward` when the dispatch selects
   ``CuTeDSLBackend`` — the autograd boundary is owned by
@@ -207,19 +207,17 @@ def _ffpa_attn_forward_cutedsl(
   :returns: ``(out, lse)`` where ``out`` is ``[B, H_q, N_q, D]`` and
       ``lse`` is ``[B, H_q, N_q]`` float32.
   """
-  from ._interface import _ffpa_attn_forward_sm90
-
   requires_grad = any(t.requires_grad for t in (q, k, v))
   _require_cutedsl_supported(q, k, v, requires_grad=requires_grad)
 
   q_nhd, k_nhd, v_nhd = (_bhnd_to_bnhd(t) for t in (q, k, v))
-  out_nhd, lse = _ffpa_attn_forward_sm90(
+  out_nhd, lse = torch.ops.ffpa_attn._fwd_cutedsl(
     q_nhd,
     k_nhd,
     v_nhd,
-    softmax_scale=softmax_scale,
-    causal=causal,
-    return_lse=return_lse,
+    softmax_scale,
+    int(causal),
+    int(return_lse),
   )
   out_bhnd = _bnhd_to_bhnd(out_nhd)
   return out_bhnd, lse
@@ -238,8 +236,9 @@ def _ffpa_attn_backward_cutedsl(
   """CuTeDSL SplitD backward for D=512 on SM90 with SDPA-layout in/out.
 
   Accepts all tensors in ``[B, H, N, D]`` (SDPA) layout, transposes to
-  ``[B, N, H, D]`` (FA) for the CuTeDSL kernel, and transposes the
-  gradient outputs back to SDPA layout.
+  ``[B, N, H, D]`` (FA) for the registered torch op
+  ``torch.ops.ffpa_attn._bwd_cutedsl``, and transposes the gradient outputs
+  back to SDPA layout.
 
   Called from :meth:`_FFPAAttnFunc.backward` when the dispatch selects
   ``CuTeDSLBackend``.
@@ -254,18 +253,16 @@ def _ffpa_attn_backward_cutedsl(
   :param causal: Whether causal masking was applied.
   :returns: ``(dq, dk, dv)`` all in ``[B, H, N, D]`` SDPA layout.
   """
-  from ._interface import _ffpa_attn_backward_sm90
-
   q_nhd, k_nhd, v_nhd, out_nhd, dout_nhd = (_bhnd_to_bnhd(t) for t in (q, k, v, out, grad_out))
-  dq_nhd, dk_nhd, dv_nhd = _ffpa_attn_backward_sm90(
+  dq_nhd, dk_nhd, dv_nhd = torch.ops.ffpa_attn._bwd_cutedsl(
+    dout_nhd,
     q_nhd,
     k_nhd,
     v_nhd,
     out_nhd,
-    dout_nhd,
     lse,
-    softmax_scale=softmax_scale,
-    causal=causal,
+    softmax_scale,
+    int(causal),
   )
   dq, dk, dv = (_bnhd_to_bhnd(t) for t in (dq_nhd, dk_nhd, dv_nhd))
   return dq, dk, dv
