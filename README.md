@@ -95,12 +95,12 @@ FFPA supports multiple backends for the forward and backward pass, including: [`
 
 </div>
 
-How to use different backends for your own scenario? Users can simply pass the Backend configs (**CUDABackend**, **TritonBackend** or **CuteDSLBackend**) to [ffpa_attn_func](https://ffpa-attn.readthedocs.io/en/latest/api/ffpa_attn/), for example:
+How to use different backends for your own scenario? Users can simply pass the Backend configs (**CUDABackend**, **TritonBackend** or **CuTeDSLBackend**) to [ffpa_attn_func](https://ffpa-attn.readthedocs.io/en/latest/api/ffpa_attn/), for example:
 
 ```python
->>> from ffpa_attn import ffpa_attn_func, CuteDSLBackend
+>>> from ffpa_attn import ffpa_attn_func, CuTeDSLBackend
 >>> # CuTeDSL backend for D=512 senario, fastest on H200!🎉
->>> fwd, bwd = CuteDSLBackend(forward=True), CuteDSLBackend(backward=True)
+>>> fwd, bwd = CuTeDSLBackend(forward=True), CuTeDSLBackend(backward=True)
 >>> o = ffpa_attn_func(q, k, v, forward_backend=fwd, backward_backend=bwd)
 ```
 
