@@ -275,7 +275,7 @@ def _ffpa_fwd_sm90_kernel_impl(
   tl.store(LSE + offs_m, m_i + tl.log(l_i), mask=offs_m < seqlen_q)
 
 
-_SM90_DEFAULT_CONFIG = {
+_SM90_FWD_DEFAULT_CONFIG = {
   "BLOCK_M": 64,
   "BLOCK_N": 128,
   "BLOCK_HEADDIM_QK": 64,
@@ -396,7 +396,7 @@ def _ffpa_attn_forward_sm90_generic_impl(
   attn_bias_in = attn_bias if attn_bias is not None else q
   bias_strides = _attn_bias_broadcast_strides(attn_bias, batch, nheads_q, seqlen_q, seqlen_k)
 
-  launch_config = dict(_SM90_DEFAULT_CONFIG)
+  launch_config = dict(_SM90_FWD_DEFAULT_CONFIG)
   if enable_ws:
     launch_config["warp_specialize"] = True
     launch_config["num_stages"] = 2

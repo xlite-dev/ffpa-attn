@@ -1029,26 +1029,21 @@ def _ffpa_bwd_dq_kernel_impl(
 _ffpa_bwd_dkdv_kernel = _ffpa_bwd_dkdv_kernel_impl
 _ffpa_bwd_dq_kernel = _ffpa_bwd_dq_kernel_impl
 
+_BWD_DKDV_DEFAULT_CONFIG = {
+  "BLOCK_M": 128,
+  "BLOCK_N": 64,
+  "BLOCK_HEADDIM": 64,
+  "num_warps": 8,
+  "num_stages": 2,
+}
 
-def _default_bwd_dkdv_config() -> dict[str, object]:
-  return {
-    "BLOCK_M": 128,
-    "BLOCK_N": 64,
-    "BLOCK_HEADDIM": 64,
-    "num_warps": 8,
-    "num_stages": 2,
-  }
-
-
-def _default_bwd_dq_config() -> dict[str, object]:
-  return {
-    "BLOCK_M": 128,
-    "BLOCK_N": 64,
-    "BLOCK_HEADDIM": 64,
-    "num_warps": 8,
-    "num_stages": 2,
-  }
-
+_BWD_DQ_DEFAULT_CONFIG = {
+  "BLOCK_M": 128,
+  "BLOCK_N": 64,
+  "BLOCK_HEADDIM": 64,
+  "num_warps": 8,
+  "num_stages": 2,
+}
 
 # (headdim, mode, bias_grad) -> callable
 _ffpa_bwd_autotune_cache: dict[tuple[int, str, bool], callable] = {}
@@ -2145,7 +2140,7 @@ def _ffpa_attn_backward_triton_impl(
           nheads_kv=original_nheads_kv,
           device_index=q.device.index,
         )
-      ) or _default_bwd_dkdv_config()
+      ) or dict(_BWD_DKDV_DEFAULT_CONFIG)
       dq_config = lookup_persistent_config(
         PersistentConfigRequest(
           direction="backward",
@@ -2164,7 +2159,7 @@ def _ffpa_attn_backward_triton_impl(
           nheads_kv=original_nheads_kv,
           device_index=q.device.index,
         )
-      ) or _default_bwd_dq_config()
+      ) or dict(_BWD_DQ_DEFAULT_CONFIG)
       _ffpa_bwd_dkdv_kernel[dkdv_grid](*dkdv_args, **dkdv_meta, **dkdv_config)
       _ffpa_bwd_dq_kernel[dq_grid](*dq_args, **dq_meta, **dq_config)
   elif autotune:

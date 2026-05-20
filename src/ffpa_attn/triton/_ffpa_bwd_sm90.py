@@ -916,25 +916,6 @@ _SM90_BWD_SPLIT_DQ_DEFAULT_CONFIG = {
 }
 
 
-def _default_bwd_sm90_config(enable_persist_dkdv: bool) -> dict:
-  """Return the fixed SM90 backward launch config for the selected dKdV mode."""
-  if enable_persist_dkdv:
-    return dict(_SM90_BWD_PERSIST_DKDV_DEFAULT_CONFIG)
-  return dict(_SM90_BWD_DEFAULT_CONFIG)
-
-
-def _default_bwd_sm90_dkdv_config(enable_persist_dkdv: bool) -> dict:
-  """Return the fixed split-launch dK/dV config for the selected mode."""
-  if enable_persist_dkdv:
-    return dict(_SM90_BWD_SPLIT_PERSIST_DKDV_DEFAULT_CONFIG)
-  return dict(_SM90_BWD_SPLIT_DKDV_DEFAULT_CONFIG)
-
-
-def _default_bwd_sm90_dq_config() -> dict:
-  """Return the fixed split-launch dQ config."""
-  return dict(_SM90_BWD_SPLIT_DQ_DEFAULT_CONFIG)
-
-
 def _gen_bwd_sm90_autotune_configs(
   headdim: int = 512,
   autotune_mode: str = "max",
@@ -1539,7 +1520,9 @@ def _ffpa_attn_backward_sm90_impl(
       )[grid](*kernel_args, **kernel_meta)
   else:
     if split_launch:
-      dkdv_config = _default_bwd_sm90_dkdv_config(enable_persist_dkdv)
+      dkdv_config = dict(
+        _SM90_BWD_SPLIT_PERSIST_DKDV_DEFAULT_CONFIG if enable_persist_dkdv else _SM90_BWD_SPLIT_DKDV_DEFAULT_CONFIG
+      )
       persisted_dkdv_config = lookup_bwd_sm90_persistent_config(
         q=q,
         seqlen_q=seqlen_q,
@@ -1565,7 +1548,7 @@ def _ffpa_attn_backward_sm90_impl(
       _ffpa_bwd_sm90_prepare_descs(desc_q, desc_k, desc_v, desc_do, dkdv_config)
       _ffpa_bwd_dkdv_sm90_kernel_impl[dkdv_grid](*dkdv_args, **dkdv_meta, **dkdv_config)
 
-      dq_config = _default_bwd_sm90_dq_config()
+      dq_config = dict(_SM90_BWD_SPLIT_DQ_DEFAULT_CONFIG)
       persisted_dq_config = lookup_bwd_sm90_persistent_config(
         q=q,
         seqlen_q=seqlen_q,
@@ -1590,7 +1573,7 @@ def _ffpa_attn_backward_sm90_impl(
       _ffpa_bwd_sm90_prepare_descs(desc_q, desc_k, desc_v, desc_do, dq_config)
       _ffpa_bwd_dq_sm90_kernel_impl[dq_grid](*dq_args, **dq_meta, **dq_config)
     else:
-      launch_config = _default_bwd_sm90_config(enable_persist_dkdv)
+      launch_config = dict(_SM90_BWD_PERSIST_DKDV_DEFAULT_CONFIG if enable_persist_dkdv else _SM90_BWD_DEFAULT_CONFIG)
       persisted_config = lookup_bwd_sm90_persistent_config(
         q=q,
         seqlen_q=seqlen_q,

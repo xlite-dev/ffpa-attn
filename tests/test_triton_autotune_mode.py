@@ -20,14 +20,15 @@ from ffpa_attn.triton._ffpa_bwd import (
   _get_pre_autotune,
 )
 from ffpa_attn.triton._ffpa_bwd_sm90 import (
-  _default_bwd_sm90_dkdv_config,
-  _default_bwd_sm90_dq_config,
   _gen_bwd_sm90_dkdv_autotune_configs,
   _gen_bwd_sm90_dq_autotune_configs,
   _gen_bwd_sm90_autotune_configs,
   _get_bwd_sm90_dkdv_autotune,
   _get_bwd_sm90_dq_autotune,
   _get_bwd_sm90_autotune,
+  _SM90_BWD_SPLIT_DKDV_DEFAULT_CONFIG,
+  _SM90_BWD_SPLIT_DQ_DEFAULT_CONFIG,
+  _SM90_BWD_SPLIT_PERSIST_DKDV_DEFAULT_CONFIG,
 )
 from ffpa_attn.triton._persistent_autotune import config_from_triton_config
 from ffpa_attn.triton._ffpa_fwd import (
@@ -574,11 +575,7 @@ def test_sm90_bwd_split_configs_use_split_launch_autotune_flag(monkeypatch):
 
 
 def test_sm90_bwd_split_default_configs_match_5090_fast_autotune():
-  dkdv_config = _default_bwd_sm90_dkdv_config(enable_persist_dkdv=False)
-  dkdv_persist_config = _default_bwd_sm90_dkdv_config(enable_persist_dkdv=True)
-  dq_config = _default_bwd_sm90_dq_config()
-
-  assert dkdv_config == {
+  assert _SM90_BWD_SPLIT_DKDV_DEFAULT_CONFIG == {
     "BLOCK_M": 128,
     "BLOCK_N": 64,
     "BLOCK_HEADDIM": 64,
@@ -586,7 +583,7 @@ def test_sm90_bwd_split_default_configs_match_5090_fast_autotune():
     "num_warps": 4,
     "num_stages": 2,
   }
-  assert dkdv_persist_config == {
+  assert _SM90_BWD_SPLIT_PERSIST_DKDV_DEFAULT_CONFIG == {
     "BLOCK_M": 64,
     "BLOCK_N": 64,
     "BLOCK_HEADDIM": 64,
@@ -594,7 +591,7 @@ def test_sm90_bwd_split_default_configs_match_5090_fast_autotune():
     "num_warps": 4,
     "num_stages": 2,
   }
-  assert dq_config == {
+  assert _SM90_BWD_SPLIT_DQ_DEFAULT_CONFIG == {
     "BLOCK_M": 64,
     "BLOCK_N": 64,
     "BLOCK_HEADDIM": 64,
