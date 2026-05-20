@@ -57,6 +57,7 @@ def test_perf_legacy_tma_ws_flags_map_to_both_directions():
     enable_fwd_ws=False,
     enable_bwd_ws=False,
     enable_persist_dkdv=False,
+    enable_bwd_split_launch=False,
   )
 
   _resolve_directional_cli_flags(args)
@@ -76,6 +77,7 @@ def test_perf_forward_tma_flag_does_not_enable_backward_tma():
     enable_fwd_ws=False,
     enable_bwd_ws=False,
     enable_persist_dkdv=False,
+    enable_bwd_split_launch=False,
   )
 
   _resolve_directional_cli_flags(args)
@@ -93,6 +95,7 @@ def test_perf_persist_dkdv_requires_backward_tma():
     enable_fwd_ws=False,
     enable_bwd_ws=False,
     enable_persist_dkdv=True,
+    enable_bwd_split_launch=False,
   )
 
   with pytest.raises(SystemExit, match="requires --enable-bwd-tma"):
@@ -108,9 +111,44 @@ def test_perf_persist_dkdv_allows_backward_tma():
     enable_fwd_ws=False,
     enable_bwd_ws=False,
     enable_persist_dkdv=True,
+    enable_bwd_split_launch=False,
   )
 
   _resolve_directional_cli_flags(args)
 
   assert args.enable_persist_dkdv is True
+  assert args.enable_bwd_tma is True
+
+
+def test_perf_bwd_split_launch_requires_backward_tma():
+  args = SimpleNamespace(
+    enable_tma=False,
+    enable_ws=False,
+    enable_fwd_tma=False,
+    enable_bwd_tma=False,
+    enable_fwd_ws=False,
+    enable_bwd_ws=False,
+    enable_persist_dkdv=False,
+    enable_bwd_split_launch=True,
+  )
+
+  with pytest.raises(SystemExit, match="requires --enable-bwd-tma"):
+    _resolve_directional_cli_flags(args)
+
+
+def test_perf_bwd_split_launch_allows_backward_tma():
+  args = SimpleNamespace(
+    enable_tma=False,
+    enable_ws=False,
+    enable_fwd_tma=False,
+    enable_bwd_tma=True,
+    enable_fwd_ws=False,
+    enable_bwd_ws=False,
+    enable_persist_dkdv=False,
+    enable_bwd_split_launch=True,
+  )
+
+  _resolve_directional_cli_flags(args)
+
+  assert args.enable_bwd_split_launch is True
   assert args.enable_bwd_tma is True

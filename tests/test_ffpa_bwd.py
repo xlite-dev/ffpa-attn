@@ -174,6 +174,77 @@ def test_sm90_tma_non_aligned_seqlen_matches_sdpa(enable_persist_dkdv):
   assert torch.allclose(v.grad, dv_ref, **tol)
 
 
+@pytest.mark.parametrize(
+  ("dtype", "enable_persist_dkdv", "causal", "N"),
+  [
+    (torch.float16, False, False, 129),
+    (torch.bfloat16, True, True, 128),
+  ],
+)
+def test_sm90_tma_split_launch_matches_sdpa(dtype, enable_persist_dkdv, causal, N):
+  _skip_if_no_sm90_tma()
+  torch.manual_seed(125)
+  B, H, D = 1, 2, 512
+  q = torch.randn(B, H, N, D, dtype=dtype, device="cuda", requires_grad=True)
+  k = torch.randn(B, H, N, D, dtype=dtype, device="cuda", requires_grad=True)
+  v = torch.randn(B, H, N, D, dtype=dtype, device="cuda", requires_grad=True)
+  grad_out = torch.randn_like(q)
+  scale = 1.0 / math.sqrt(D)
+
+  out = ffpa_attn_func(
+    q,
+    k,
+    v,
+    is_causal=causal,
+    scale=scale,
+    enable_backward_tma=True,
+    triton_backward_enable_persist_dkdv=enable_persist_dkdv,
+    triton_backward_enable_split_launch=True,
+  )
+  out.backward(grad_out)
+
+  dq_ref, dk_ref, dv_ref = _sdpa_ref_grads(q, k, v, causal, scale, grad_out=grad_out)
+  tol = _tolerance(dtype)
+  assert torch.allclose(q.grad, dq_ref, **tol)
+  assert torch.allclose(k.grad, dk_ref, **tol)
+  assert torch.allclose(v.grad, dv_ref, **tol)
+
+
+@pytest.mark.parametrize("enable_persist_dkdv", [False, True])
+def test_sm90_tma_split_launch_matches_fused(enable_persist_dkdv):
+  _skip_if_no_sm90_tma()
+  torch.manual_seed(126)
+  B, H, N, D = 1, 2, 129, 512
+  dtype = torch.float16
+  q = torch.randn(B, H, N, D, dtype=dtype, device="cuda")
+  k = torch.randn(B, H, N, D, dtype=dtype, device="cuda")
+  v = torch.randn(B, H, N, D, dtype=dtype, device="cuda")
+  grad_out = torch.randn_like(q)
+  scale = 1.0 / math.sqrt(D)
+
+  def run_backward(split_launch: bool):
+    q_i = q.detach().clone().requires_grad_(True)
+    k_i = k.detach().clone().requires_grad_(True)
+    v_i = v.detach().clone().requires_grad_(True)
+    out = ffpa_attn_func(
+      q_i,
+      k_i,
+      v_i,
+      scale=scale,
+      enable_backward_tma=True,
+      triton_backward_enable_persist_dkdv=enable_persist_dkdv,
+      triton_backward_enable_split_launch=split_launch,
+    )
+    out.backward(grad_out)
+    return q_i.grad, k_i.grad, v_i.grad
+
+  fused = run_backward(False)
+  split = run_backward(True)
+  tol = _tolerance(dtype)
+  for split_grad, fused_grad in zip(split, fused):
+    assert torch.allclose(split_grad, fused_grad, **tol)
+
+
 def _key_position_bias_grad_ref(
   q: torch.Tensor,
   k: torch.Tensor,

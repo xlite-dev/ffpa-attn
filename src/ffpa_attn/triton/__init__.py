@@ -181,7 +181,7 @@ torch.library.define(
   "float softmax_scale, int causal, int autotune, "
   "int autotune_mode_is_max, int preprocess_d_chunk, int return_attn_bias_grad, int grad_kv_storage_dtype_code, "
   "int original_nheads_kv, float dropout_p, int philox_seed, int philox_offset, int enable_tma, int enable_ws, "
-  "int enable_persist_dkdv) "
+  "int enable_persist_dkdv, int enable_split_launch) "
   "-> (Tensor dq, Tensor dk, Tensor dv, Tensor grad_attn_bias)",
 )
 
@@ -209,6 +209,7 @@ def _bwd_triton_torch_op(
   enable_tma: int,
   enable_ws: int,
   enable_persist_dkdv: int,
+  enable_split_launch: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
   from ._ffpa_bwd import _ffpa_attn_backward_triton_impl as _triton_bwd_kernel
 
@@ -248,6 +249,7 @@ def _bwd_triton_torch_op(
     enable_tma=bool(enable_tma),
     enable_ws=bool(enable_ws),
     enable_persist_dkdv=bool(enable_persist_dkdv),
+    enable_split_launch=bool(enable_split_launch),
   )
   return dq, dk, dv, grad_attn_bias
 
@@ -275,6 +277,7 @@ def _bwd_triton_fake(
   enable_tma: int,
   enable_ws: int,
   enable_persist_dkdv: int,
+  enable_split_launch: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
   del (
     softmax_scale,
@@ -289,6 +292,7 @@ def _bwd_triton_fake(
     enable_tma,
     enable_ws,
     enable_persist_dkdv,
+    enable_split_launch,
   )
   grad_kv_storage_dtype = _grad_kv_storage_dtype_from_code(grad_kv_storage_dtype_code)
   if attn_bias is not None and return_attn_bias_grad:

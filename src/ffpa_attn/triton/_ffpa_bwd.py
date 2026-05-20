@@ -1388,6 +1388,7 @@ def _ffpa_attn_backward_triton_impl(
   enable_tma: bool = False,
   enable_ws: bool = False,
   enable_persist_dkdv: bool = False,
+  enable_split_launch: bool = False,
 ) -> None:
   """Run the Triton FFPA Split-D backward kernels in place.
 
@@ -1431,6 +1432,7 @@ def _ffpa_attn_backward_triton_impl(
   _, _, seqlen_k, _ = k.shape
   original_nheads_kv = original_nheads_kv or nheads
   softmax_scale = softmax_scale or (1.0 / math.sqrt(headdim))
+  split_launch = enable_split_launch and seqlen_q >= 8
 
   if enable_tma and seqlen_q >= 8:
     from ._ffpa_bwd_sm90 import _ffpa_attn_backward_sm90_impl as _bwd_sm90_impl
@@ -1460,8 +1462,12 @@ def _ffpa_attn_backward_triton_impl(
         philox_offset=philox_offset,
         enable_ws=enable_ws,
         enable_persist_dkdv=enable_persist_dkdv,
+        enable_split_launch=split_launch,
       )
       return
+
+  if split_launch:
+    raise NotImplementedError("SM90 backward split launch requires a supported SM90+ TMA path")
 
   seqlen_q_rounded = lse.shape[-1]
   autotune_seqlen_q_bucket = autotune_seqlen_key(seqlen_q, autotune_mode)
@@ -1959,6 +1965,7 @@ def _ffpa_attn_backward_triton(
   enable_tma: bool = False,
   enable_ws: bool = False,
   enable_persist_dkdv: bool = False,
+  enable_split_launch: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
   """Run the Triton FFPA backward path and return ``(dq, dk, dv, d_attn_bias)``.
 
@@ -2053,6 +2060,7 @@ def _ffpa_attn_backward_triton(
     int(enable_tma),
     int(enable_ws),
     int(enable_persist_dkdv),
+    int(enable_split_launch),
   )
 
   if group_size > 1:
