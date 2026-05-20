@@ -286,7 +286,7 @@ def _ffpa_attn_varlen_cutedsl(
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
   """Packed THD cutedsl entry. The varlen path bypasses
   :class:`ffpa_attn.functional.FFPAAttnFunc` and is autograd-registered via
-  the ``ffpa_attn::splitd_fwd_sm90`` torch op directly.
+  the ``ffpa_attn::_varlen_fwd_cutedsl`` torch op directly.
 
   CuTeDSL varlen forward called from
   :func:`ffpa_attn.ffpa_attn_interface.ffpa_attn_varlen_func`. The CuTeDSL
@@ -360,7 +360,7 @@ def _ffpa_attn_varlen_cutedsl(
   requires_grad = any(t.requires_grad for t in (q, k, v))
   _require_cutedsl_supported(q, k, v, requires_grad=requires_grad)
 
-  from ._interface import ffpa_attn_splitd_varlen_func
+  from . import ffpa_attn_splitd_varlen_func
 
   return ffpa_attn_splitd_varlen_func(
     q,

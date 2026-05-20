@@ -55,7 +55,7 @@ Variable-length (packed THD) attention is exposed via ``ffpa_attn_varlen_func``,
 which mirrors the FlashAttention varlen surface (``q, k, v, cu_seqlens_q,
 cu_seqlens_k, max_seqlen_q, max_seqlen_k, ...``) and delegates to
 :func:`ffpa_attn.cutedsl._wrappers._ffpa_attn_varlen_cutedsl`, which
-dispatches to the CuTeDSL ``ffpa_attn::splitd_fwd_sm90`` autograd-registered
+dispatches to the CuTeDSL ``ffpa_attn::_varlen_fwd_cutedsl`` autograd-registered
 torch op. The varlen API is currently CuTeDSL-only (SM90, D=512); other
 shapes / backends raise ``NotImplementedError``.
 """
