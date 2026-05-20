@@ -285,6 +285,7 @@ def _parse_args() -> argparse.Namespace:
   parser.add_argument(
     "--enable-bwd-split-launch",
     "--bwd-split-launch",
+    "--bwd-split",
     action="store_true",
     help="Enable separate SM90+ TMA backward launches for dK/dV and dQ (requires --bwd-tma).",
   )
