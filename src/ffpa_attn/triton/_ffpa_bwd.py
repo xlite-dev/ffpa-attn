@@ -1432,6 +1432,7 @@ def _ffpa_attn_backward_triton_impl(
   _, _, seqlen_k, _ = k.shape
   original_nheads_kv = original_nheads_kv or nheads
   softmax_scale = softmax_scale or (1.0 / math.sqrt(headdim))
+  split_launch = enable_split_launch and seqlen_q >= 8
 
   if enable_tma and seqlen_q >= 8:
     from ._ffpa_bwd_sm90 import _ffpa_attn_backward_sm90_impl as _bwd_sm90_impl
@@ -1461,11 +1462,11 @@ def _ffpa_attn_backward_triton_impl(
         philox_offset=philox_offset,
         enable_ws=enable_ws,
         enable_persist_dkdv=enable_persist_dkdv,
-        enable_split_launch=enable_split_launch,
+        enable_split_launch=split_launch,
       )
       return
 
-  if enable_split_launch:
+  if split_launch:
     raise NotImplementedError("SM90 backward split launch requires a supported SM90+ TMA path")
 
   seqlen_q_rounded = lse.shape[-1]
