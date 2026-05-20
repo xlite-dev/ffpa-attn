@@ -102,6 +102,36 @@ _KERNEL_CONFIG_KEYS = {
     "num_ctas",
     "maxnreg",
   },
+  "bwd_sm90_dkdv": {
+    "BLOCK_M",
+    "BLOCK_N",
+    "BLOCK_HEADDIM",
+    "warp_specialize",
+    "num_warps",
+    "num_stages",
+    "num_ctas",
+    "maxnreg",
+  },
+  "bwd_sm90_dkdv_persist": {
+    "BLOCK_M",
+    "BLOCK_N",
+    "BLOCK_HEADDIM",
+    "warp_specialize",
+    "num_warps",
+    "num_stages",
+    "num_ctas",
+    "maxnreg",
+  },
+  "bwd_sm90_dq": {
+    "BLOCK_M",
+    "BLOCK_N",
+    "BLOCK_HEADDIM",
+    "warp_specialize",
+    "num_warps",
+    "num_stages",
+    "num_ctas",
+    "maxnreg",
+  },
   "decode_bwd_stage1": {
     "BLOCK_M",
     "BLOCK_N",
@@ -494,7 +524,14 @@ def _lookup_persistent_config_cached(
     # TMA+WS runs with the same shape do not reuse each other's configs. Older
     # JSON files lack those flags, so infer the safest compatibility meaning
     # from the kernel name and the persisted warp_specialize meta.
-    sm90_tma_kernels = {"fwd_sm90_generic", "bwd_sm90_generic", "bwd_sm90_generic_persist_dkdv"}
+    sm90_tma_kernels = {
+      "fwd_sm90_generic",
+      "bwd_sm90_generic",
+      "bwd_sm90_generic_persist_dkdv",
+      "bwd_sm90_dkdv",
+      "bwd_sm90_dkdv_persist",
+      "bwd_sm90_dq",
+    }
     inferred_enable_tma = request.kernel in sm90_tma_kernels
     inferred_enable_ws = bool(config.get("warp_specialize", False)) if inferred_enable_tma else False
     if not _entry_flag_matches(entry, "enable_tma", request.enable_tma, inferred_enable_tma):

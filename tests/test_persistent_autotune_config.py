@@ -804,6 +804,139 @@ def test_lookup_sm90_backward_persist_uses_distinct_kernel_key(tmp_path, monkeyp
   assert persist_ws_config["BLOCK_N"] == 128
 
 
+def test_lookup_sm90_backward_split_kernel_configs(tmp_path, monkeypatch):
+  _patch_cuda_device(monkeypatch)
+  monkeypatch.setenv(persistent.CONFIG_ENV_VAR, str(tmp_path))
+  persistent.clear_config_cache()
+  path = persistent.device_config_path(tmp_path, "NVIDIA L20")
+  base_entry = {
+    "direction": "backward",
+    "autotune_mode": "fast",
+    "causal": False,
+    "dtype": "fp16",
+    "headdim": 512,
+    "seqlen_q": 4096,
+    "seqlen_k": 4096,
+    "grad_kv_storage_dtype": None,
+    "has_attn_bias": False,
+    "has_dropout": False,
+    "enable_tma": True,
+    "enable_ws": False,
+  }
+  persistent.write_config_file(
+    _payload([
+      {
+        **base_entry,
+        "kernel": "bwd_sm90_dkdv",
+        "bias_grad": True,
+        "config": {
+          "BLOCK_M": 128,
+          "BLOCK_N": 64,
+          "BLOCK_HEADDIM": 64,
+          "warp_specialize": False,
+          "num_warps": 8,
+          "num_stages": 2,
+          "ignored": "field",
+        },
+      },
+      {
+        **base_entry,
+        "kernel": "bwd_sm90_dkdv_persist",
+        "bias_grad": False,
+        "config": {
+          "BLOCK_M": 128,
+          "BLOCK_N": 64,
+          "BLOCK_HEADDIM": 128,
+          "warp_specialize": False,
+          "num_warps": 8,
+          "num_stages": 2,
+        },
+      },
+      {
+        **base_entry,
+        "kernel": "bwd_sm90_dq",
+        "bias_grad": False,
+        "config": {
+          "BLOCK_M": 64,
+          "BLOCK_N": 128,
+          "BLOCK_HEADDIM": 64,
+          "warp_specialize": False,
+          "num_warps": 4,
+          "num_stages": 2,
+        },
+      },
+    ]),
+    path,
+  )
+
+  dkdv = persistent.lookup_persistent_config(
+    persistent.PersistentConfigRequest(
+      direction="backward",
+      kernel="bwd_sm90_dkdv",
+      autotune_mode="fast",
+      dtype="fp16",
+      headdim=512,
+      seqlen_q=4096,
+      seqlen_k=4096,
+      causal=False,
+      bias_grad=True,
+      grad_kv_storage_dtype=None,
+      has_attn_bias=False,
+      has_dropout=False,
+      enable_tma=True,
+      enable_ws=False,
+    )
+  )
+  dkdv_persist = persistent.lookup_persistent_config(
+    persistent.PersistentConfigRequest(
+      direction="backward",
+      kernel="bwd_sm90_dkdv_persist",
+      autotune_mode="fast",
+      dtype="fp16",
+      headdim=512,
+      seqlen_q=4096,
+      seqlen_k=4096,
+      causal=False,
+      bias_grad=False,
+      grad_kv_storage_dtype=None,
+      has_attn_bias=False,
+      has_dropout=False,
+      enable_tma=True,
+      enable_ws=False,
+    )
+  )
+  dq = persistent.lookup_persistent_config(
+    persistent.PersistentConfigRequest(
+      direction="backward",
+      kernel="bwd_sm90_dq",
+      autotune_mode="fast",
+      dtype="fp16",
+      headdim=512,
+      seqlen_q=4096,
+      seqlen_k=4096,
+      causal=False,
+      bias_grad=False,
+      grad_kv_storage_dtype=None,
+      has_attn_bias=False,
+      has_dropout=False,
+      enable_tma=True,
+      enable_ws=False,
+    )
+  )
+
+  assert dkdv == {
+    "BLOCK_M": 128,
+    "BLOCK_N": 64,
+    "BLOCK_HEADDIM": 64,
+    "warp_specialize": False,
+    "num_warps": 8,
+    "num_stages": 2,
+  }
+  assert dkdv_persist["BLOCK_HEADDIM"] == 128
+  assert dq["BLOCK_M"] == 64
+  assert dq["BLOCK_N"] == 128
+
+
 def test_backward_preprocess_config_backfills_block_headdim():
   config = _normalize_bwd_pre_config(
     {

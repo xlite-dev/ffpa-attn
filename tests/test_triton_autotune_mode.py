@@ -17,7 +17,11 @@ from ffpa_attn.triton._ffpa_bwd import (
   _get_pre_autotune,
 )
 from ffpa_attn.triton._ffpa_bwd_sm90 import (
+  _gen_bwd_sm90_dkdv_autotune_configs,
+  _gen_bwd_sm90_dq_autotune_configs,
   _gen_bwd_sm90_autotune_configs,
+  _get_bwd_sm90_dkdv_autotune,
+  _get_bwd_sm90_dq_autotune,
   _get_bwd_sm90_autotune,
 )
 from ffpa_attn.triton._persistent_autotune import config_from_triton_config
@@ -481,6 +485,27 @@ def test_sm90_bwd_tma_configs_force_warp_specialize(monkeypatch):
   assert {config["num_stages"] for config in max_serialized} == {2, 3}
 
 
+def test_sm90_bwd_split_configs_are_independently_generated(monkeypatch):
+  monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: (9, 0))
+  dkdv_fast = _gen_bwd_sm90_dkdv_autotune_configs(512, autotune_mode="fast", enable_ws=False)
+  dkdv_persist_fast = _gen_bwd_sm90_dkdv_autotune_configs(
+    512,
+    autotune_mode="fast",
+    enable_ws=False,
+    enable_persist_dkdv=True,
+  )
+  dq_fast = _gen_bwd_sm90_dq_autotune_configs(512, autotune_mode="fast", enable_ws=False)
+  dq_max = _gen_bwd_sm90_dq_autotune_configs(512, autotune_mode="max", enable_ws=True)
+  dkdv_serialized = [config_from_triton_config(config) for config in dkdv_fast]
+  dkdv_persist_serialized = [config_from_triton_config(config) for config in dkdv_persist_fast]
+  dq_max_serialized = [config_from_triton_config(config) for config in dq_max]
+
+  assert len(dq_fast) < len(dq_max)
+  assert {config["BLOCK_HEADDIM"] for config in dkdv_serialized} == {64}
+  assert {config["BLOCK_HEADDIM"] for config in dkdv_persist_serialized} == {128}
+  assert {config["warp_specialize"] for config in dq_max_serialized} == {True}
+
+
 def test_persistent_tune_backward_records_sm90_tma_config(monkeypatch):
   task = TuneTask("backward", torch.float16, 320, 512, 512, False, 8, 8)
   q = torch.empty(1, 8, 512, 320, requires_grad=True)
@@ -540,12 +565,80 @@ def test_persistent_tune_backward_records_sm90_tma_config(monkeypatch):
   assert list(entries.values())[-2:] == [generic_entry, sm90_entry]
 
 
+def test_persistent_tune_backward_records_split_sm90_tma_configs(monkeypatch):
+  task = TuneTask("backward", torch.float16, 320, 512, 512, False, 8, 8)
+  q = torch.empty(1, 8, 512, 320, requires_grad=True)
+  k = torch.empty_like(q, requires_grad=True)
+  v = torch.empty_like(q, requires_grad=True)
+  pre_config = triton.Config({"BLOCK_M": 128, "BLOCK_HEADDIM": 512, "D_CHUNK": False}, num_warps=8, num_stages=2)
+  generic_config = triton.Config({"BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_HEADDIM": 64}, num_warps=8, num_stages=2)
+  dkdv_config = triton.Config(
+    {
+      "BLOCK_M": 128,
+      "BLOCK_N": 64,
+      "BLOCK_HEADDIM": 64,
+      "warp_specialize": False
+    },
+    num_warps=4,
+    num_stages=2,
+  )
+  dq_config = triton.Config(
+    {
+      "BLOCK_M": 64,
+      "BLOCK_N": 128,
+      "BLOCK_HEADDIM": 64,
+      "warp_specialize": False
+    },
+    num_warps=4,
+    num_stages=2,
+  )
+  pre_wrapper = SimpleNamespace(best_config=pre_config, configs=[pre_config])
+  generic_wrapper = SimpleNamespace(best_config=generic_config, configs=[generic_config])
+  dkdv_wrapper = SimpleNamespace(best_config=dkdv_config, configs=[dkdv_config])
+  dq_wrapper = SimpleNamespace(best_config=dq_config, configs=[dq_config])
+  seen_kwargs = {}
+
+  def fake_ffpa_attn_func(*args, **kwargs):
+    del args
+    seen_kwargs.update(kwargs)
+    return q * 1.0
+
+  monkeypatch.setenv("FFPA_BWD_SM90_SPLIT_LAUNCH", "1")
+  monkeypatch.setattr(autotune_module, "_make_tensors", lambda task, batch: (q, k, v))
+  monkeypatch.setattr(autotune_module, "_make_attn_bias", lambda task: None)
+  monkeypatch.setattr(autotune_module, "is_sm90_tma_backward_supported", lambda *args, **kwargs: True)
+  monkeypatch.setattr(autotune_module, "ffpa_attn_func", fake_ffpa_attn_func)
+  monkeypatch.setattr(autotune_module, "_get_pre_autotune", lambda *args, **kwargs: pre_wrapper)
+  monkeypatch.setattr(autotune_module, "_get_bwd_autotune", lambda *args, **kwargs: generic_wrapper)
+  monkeypatch.setattr(autotune_module, "_get_bwd_sm90_dkdv_autotune", lambda *args, **kwargs: dkdv_wrapper)
+  monkeypatch.setattr(autotune_module, "_get_bwd_sm90_dq_autotune", lambda *args, **kwargs: dq_wrapper)
+
+  entries = {}
+  tuned_entries = _tune_backward(task, 1, "fast", entries, enable_tma=True, enable_ws=False)
+
+  assert [entry["kernel"] for entry, _ in tuned_entries] == [
+    "bwd_preproc",
+    "bwd_generic",
+    "bwd_sm90_dkdv",
+    "bwd_sm90_dq",
+  ]
+  dkdv_entry = tuned_entries[2][0]
+  dq_entry = tuned_entries[3][0]
+  assert dkdv_entry["enable_tma"] is True
+  assert dq_entry["enable_tma"] is True
+  assert dkdv_entry["bias_grad"] is False
+  assert dq_entry["bias_grad"] is False
+  assert seen_kwargs["enable_tma"] is True
+
+
 def test_forward_autotune_keys_include_causal():
   expected_keys = {"autotune_seqlen_q_bucket", "autotune_seqlen_k_bucket", "autotune_causal_key"}
   assert expected_keys <= set(_get_fwd_autotune(320, "fast", "bf16").keys)
   assert expected_keys <= set(_get_fwd_sm90_autotune(320, "fast", "bf16", enable_ws=False).keys)
   assert expected_keys <= set(_get_decode_fwd_stage1_autotune(320, True, "fast", "bf16").keys)
   assert expected_keys <= set(_get_bwd_sm90_autotune(320, "fast", "bf16", False, enable_ws=False).keys)
+  assert expected_keys <= set(_get_bwd_sm90_dkdv_autotune(320, "fast", "bf16", False, enable_ws=False).keys)
+  assert expected_keys <= set(_get_bwd_sm90_dq_autotune(320, "fast", "bf16", enable_ws=False).keys)
 
 
 def test_sm90_bwd_persist_autotune_is_cache_scoped():
@@ -556,6 +649,18 @@ def test_sm90_bwd_persist_autotune_is_cache_scoped():
   assert normal is not persist
   assert normal is not ws
   assert persist is not persist_ws
+
+
+def test_sm90_bwd_split_autotune_is_cache_scoped():
+  dkdv = _get_bwd_sm90_dkdv_autotune(320, "fast", "bf16", False, enable_ws=False, enable_persist_dkdv=False)
+  dkdv_persist = _get_bwd_sm90_dkdv_autotune(320, "fast", "bf16", False, enable_ws=False, enable_persist_dkdv=True)
+  dkdv_ws = _get_bwd_sm90_dkdv_autotune(320, "fast", "bf16", False, enable_ws=True, enable_persist_dkdv=False)
+  dq = _get_bwd_sm90_dq_autotune(320, "fast", "bf16", enable_ws=False)
+  dq_ws = _get_bwd_sm90_dq_autotune(320, "fast", "bf16", enable_ws=True)
+  assert dkdv is not dkdv_persist
+  assert dkdv is not dkdv_ws
+  assert dq is not dq_ws
+  assert dkdv is not dq
 
 
 def test_autotune_wrappers_are_dtype_scoped():

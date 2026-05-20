@@ -32,6 +32,9 @@ from .triton._ffpa_bwd import (
   _get_pre_autotune,
 )
 from .triton._ffpa_bwd_sm90 import (
+  _bwd_sm90_split_launch_enabled,
+  _get_bwd_sm90_dkdv_autotune,
+  _get_bwd_sm90_dq_autotune,
   _get_bwd_sm90_autotune,
   is_sm90_tma_backward_supported,
 )
@@ -682,28 +685,72 @@ def _tune_backward(
 
   if task.seqlen_q >= 8 and use_sm90_tma:
     run_backward_tune(True, use_sm90_ws)
-    wrapper = _get_bwd_sm90_autotune(
-      task.headdim,
-      mode,
-      dtype,
-      task.has_attn_bias,
-      enable_ws=use_sm90_ws,
-    )
-    entry = _entry_base(
-      task,
-      mode,
-      "bwd_sm90_generic",
-      config_from_triton_config(wrapper.best_config),
-      enable_tma=True,
-      enable_ws=use_sm90_ws,
-    )
-    entry.update({
-      "bias_grad": task.has_attn_bias,
-      "grad_kv_storage_dtype": None,
-    })
-    choices_count = len(wrapper.configs)
-    _record_entry(entries, entry)
-    tuned_entries.append((entry, choices_count))
+    if _bwd_sm90_split_launch_enabled():
+      dkdv_wrapper = _get_bwd_sm90_dkdv_autotune(
+        task.headdim,
+        mode,
+        dtype,
+        task.has_attn_bias,
+        enable_ws=use_sm90_ws,
+      )
+      dkdv_entry = _entry_base(
+        task,
+        mode,
+        "bwd_sm90_dkdv",
+        config_from_triton_config(dkdv_wrapper.best_config),
+        enable_tma=True,
+        enable_ws=use_sm90_ws,
+      )
+      dkdv_entry.update({
+        "bias_grad": task.has_attn_bias,
+        "grad_kv_storage_dtype": None,
+      })
+      _record_entry(entries, dkdv_entry)
+      tuned_entries.append((dkdv_entry, len(dkdv_wrapper.configs)))
+
+      dq_wrapper = _get_bwd_sm90_dq_autotune(
+        task.headdim,
+        mode,
+        dtype,
+        enable_ws=use_sm90_ws,
+      )
+      dq_entry = _entry_base(
+        task,
+        mode,
+        "bwd_sm90_dq",
+        config_from_triton_config(dq_wrapper.best_config),
+        enable_tma=True,
+        enable_ws=use_sm90_ws,
+      )
+      dq_entry.update({
+        "bias_grad": False,
+        "grad_kv_storage_dtype": None,
+      })
+      _record_entry(entries, dq_entry)
+      tuned_entries.append((dq_entry, len(dq_wrapper.configs)))
+    else:
+      wrapper = _get_bwd_sm90_autotune(
+        task.headdim,
+        mode,
+        dtype,
+        task.has_attn_bias,
+        enable_ws=use_sm90_ws,
+      )
+      entry = _entry_base(
+        task,
+        mode,
+        "bwd_sm90_generic",
+        config_from_triton_config(wrapper.best_config),
+        enable_tma=True,
+        enable_ws=use_sm90_ws,
+      )
+      entry.update({
+        "bias_grad": task.has_attn_bias,
+        "grad_kv_storage_dtype": None,
+      })
+      choices_count = len(wrapper.configs)
+      _record_entry(entries, entry)
+      tuned_entries.append((entry, choices_count))
 
   return tuned_entries
 

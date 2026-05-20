@@ -8,6 +8,8 @@ raw masked stores in this first TMA phase.
 
 from __future__ import annotations
 
+import os
+
 import torch
 import triton
 import triton.language as tl
@@ -35,6 +37,15 @@ _SM90_BWD_HEURISTICS = {
   "EVEN_M": lambda args: args["seqlen_q"] % args["BLOCK_M"] == 0,
   "EVEN_N": lambda args: args["seqlen_k"] % args["BLOCK_N"] == 0,
 }
+
+_SM90_BWD_DQ_HEURISTICS = {
+  "EVEN_N": lambda args: args["seqlen_k"] % args["BLOCK_N"] == 0,
+}
+
+
+def _bwd_sm90_split_launch_enabled() -> bool:
+  """Return whether the SM90 backward main kernel should use split launches."""
+  return os.environ.get("FFPA_BWD_SM90_SPLIT_LAUNCH") == "1"
 
 
 def _sm90_bwd_host_descriptor_pre_hook(nargs):
@@ -631,6 +642,142 @@ def _ffpa_bwd_dq_sm90(
 
 @triton.heuristics(_SM90_BWD_HEURISTICS)
 @triton.jit
+def _ffpa_bwd_dkdv_sm90_kernel_impl(
+  desc_q: tl.tensor_descriptor,
+  desc_k: tl.tensor_descriptor,
+  desc_v: tl.tensor_descriptor,
+  desc_do: tl.tensor_descriptor,
+  DK: torch.Tensor,
+  DV: torch.Tensor,
+  LSE: torch.Tensor,
+  D: torch.Tensor,
+  AttnBias: torch.Tensor,
+  GradAttnBias: torch.Tensor,
+  softmax_scale: float,
+  stride_dkb: int,
+  stride_dkh: int,
+  stride_dkn: int,
+  stride_dvb: int,
+  stride_dvh: int,
+  stride_dvn: int,
+  stride_bb: int,
+  stride_bh: int,
+  stride_bm: int,
+  stride_bn: int,
+  stride_gbb: int,
+  stride_gbh: int,
+  stride_gbm: int,
+  stride_gbn: int,
+  nheads: int,
+  seqlen_q: int,
+  seqlen_k: int,
+  autotune_seqlen_q_bucket: int,
+  autotune_seqlen_k_bucket: int,
+  autotune_causal_key: int,
+  autotune_dtype_key: int,
+  seqlen_q_rounded: int,
+  headdim: int,
+  dropout_p: float,
+  philox_offset: int,
+  IS_CAUSAL: tl.constexpr,
+  HAS_ATTN_BIAS: tl.constexpr,
+  HAS_DROPOUT: tl.constexpr,
+  PHILOX_SEED: tl.constexpr,
+  BIAS_REQUIRES_GRAD: tl.constexpr,
+  GRAD_BIAS_NEEDS_REDUCTION: tl.constexpr,
+  GRAD_BIAS_REDUCES_M: tl.constexpr,
+  GRAD_BIAS_STORE_PARTIAL: tl.constexpr,
+  PERSIST_DKDV_ACC: tl.constexpr,
+  BLOCK_HEADDIM: tl.constexpr,
+  DTYPE: tl.constexpr,
+  EVEN_M: tl.constexpr,
+  EVEN_N: tl.constexpr,
+  BLOCK_M: tl.constexpr,
+  BLOCK_N: tl.constexpr,
+  warp_specialize: tl.constexpr,
+) -> None:
+  """Standalone dK/dV half for the SM90 TMA backward split-launch path."""
+  _ = autotune_seqlen_q_bucket
+  _ = autotune_seqlen_k_bucket
+  _ = autotune_causal_key
+  _ = autotune_dtype_key
+
+  if PERSIST_DKDV_ACC:
+    _ffpa_bwd_dkdv_persist_sm90(
+      desc_q, desc_k, desc_v, desc_do, DK, DV, LSE, D, AttnBias, GradAttnBias, softmax_scale, stride_dkb, stride_dkh,
+      stride_dkn, stride_dvb, stride_dvh, stride_dvn, stride_bb, stride_bh, stride_bm, stride_bn, stride_gbb,
+      stride_gbh, stride_gbm, stride_gbn, nheads, seqlen_q, seqlen_k, seqlen_q_rounded, headdim, dropout_p,
+      philox_offset, IS_CAUSAL, HAS_ATTN_BIAS, HAS_DROPOUT, PHILOX_SEED, BIAS_REQUIRES_GRAD, GRAD_BIAS_NEEDS_REDUCTION,
+      GRAD_BIAS_REDUCES_M, GRAD_BIAS_STORE_PARTIAL, BLOCK_HEADDIM, DTYPE, EVEN_M, EVEN_N, BLOCK_M, BLOCK_N,
+      warp_specialize
+    )
+  else:
+    _ffpa_bwd_dkdv_sm90(
+      desc_q, desc_k, desc_v, desc_do, DK, DV, LSE, D, AttnBias, GradAttnBias, softmax_scale, stride_dkb, stride_dkh,
+      stride_dkn, stride_dvb, stride_dvh, stride_dvn, stride_bb, stride_bh, stride_bm, stride_bn, stride_gbb,
+      stride_gbh, stride_gbm, stride_gbn, nheads, seqlen_q, seqlen_k, seqlen_q_rounded, headdim, dropout_p,
+      philox_offset, IS_CAUSAL, HAS_ATTN_BIAS, HAS_DROPOUT, PHILOX_SEED, BIAS_REQUIRES_GRAD, GRAD_BIAS_NEEDS_REDUCTION,
+      GRAD_BIAS_REDUCES_M, GRAD_BIAS_STORE_PARTIAL, BLOCK_HEADDIM, DTYPE, EVEN_M, EVEN_N, BLOCK_M, BLOCK_N,
+      warp_specialize
+    )
+
+
+@triton.heuristics(_SM90_BWD_DQ_HEURISTICS)
+@triton.jit
+def _ffpa_bwd_dq_sm90_kernel_impl(
+  desc_q: tl.tensor_descriptor,
+  desc_k: tl.tensor_descriptor,
+  desc_v: tl.tensor_descriptor,
+  desc_do: tl.tensor_descriptor,
+  DQ: torch.Tensor,
+  LSE: torch.Tensor,
+  D: torch.Tensor,
+  AttnBias: torch.Tensor,
+  softmax_scale: float,
+  stride_dqb: int,
+  stride_dqh: int,
+  stride_dqm: int,
+  stride_bb: int,
+  stride_bh: int,
+  stride_bm: int,
+  stride_bn: int,
+  nheads: int,
+  seqlen_q: int,
+  seqlen_k: int,
+  autotune_seqlen_q_bucket: int,
+  autotune_seqlen_k_bucket: int,
+  autotune_causal_key: int,
+  autotune_dtype_key: int,
+  seqlen_q_rounded: int,
+  headdim: int,
+  dropout_p: float,
+  philox_offset: int,
+  IS_CAUSAL: tl.constexpr,
+  HAS_ATTN_BIAS: tl.constexpr,
+  HAS_DROPOUT: tl.constexpr,
+  PHILOX_SEED: tl.constexpr,
+  BLOCK_HEADDIM: tl.constexpr,
+  DTYPE: tl.constexpr,
+  EVEN_N: tl.constexpr,
+  BLOCK_M: tl.constexpr,
+  BLOCK_N: tl.constexpr,
+  warp_specialize: tl.constexpr,
+) -> None:
+  """Standalone dQ half for the SM90 TMA backward split-launch path."""
+  _ = autotune_seqlen_q_bucket
+  _ = autotune_seqlen_k_bucket
+  _ = autotune_causal_key
+  _ = autotune_dtype_key
+
+  _ffpa_bwd_dq_sm90(
+    desc_q, desc_k, desc_v, desc_do, DQ, LSE, D, AttnBias, softmax_scale, stride_dqb, stride_dqh, stride_dqm, stride_bb,
+    stride_bh, stride_bm, stride_bn, nheads, seqlen_q, seqlen_k, seqlen_q_rounded, headdim, dropout_p, philox_offset,
+    IS_CAUSAL, HAS_ATTN_BIAS, HAS_DROPOUT, PHILOX_SEED, BLOCK_HEADDIM, DTYPE, EVEN_N, BLOCK_M, BLOCK_N, warp_specialize
+  )
+
+
+@triton.heuristics(_SM90_BWD_HEURISTICS)
+@triton.jit
 def _ffpa_bwd_sm90_kernel_impl(
   desc_q: tl.tensor_descriptor,
   desc_k: tl.tensor_descriptor,
@@ -768,6 +915,21 @@ def _default_bwd_sm90_config(enable_persist_dkdv: bool) -> dict:
   return dict(_SM90_BWD_DEFAULT_CONFIG)
 
 
+def _default_bwd_sm90_dkdv_config(enable_persist_dkdv: bool) -> dict:
+  """Return the fixed split-launch dK/dV config for the selected mode."""
+  config = _default_bwd_sm90_config(enable_persist_dkdv)
+  config["num_warps"] = 4
+  return config
+
+
+def _default_bwd_sm90_dq_config() -> dict:
+  """Return the fixed split-launch dQ config."""
+  config = dict(_SM90_BWD_DEFAULT_CONFIG)
+  config["BLOCK_M"] = 64
+  config["num_warps"] = 4
+  return config
+
+
 def _gen_bwd_sm90_autotune_configs(
   headdim: int = 512,
   autotune_mode: str = "max",
@@ -804,7 +966,38 @@ def _gen_bwd_sm90_autotune_configs(
   return configs
 
 
+def _gen_bwd_sm90_dkdv_autotune_configs(
+  headdim: int = 512,
+  autotune_mode: str = "max",
+  enable_ws: bool = False,
+  enable_persist_dkdv: bool = False,
+) -> list[triton.Config]:
+  """Generate autotune configs for the split-launch dK/dV kernel."""
+  return _gen_bwd_sm90_autotune_configs(
+    headdim=headdim,
+    autotune_mode=autotune_mode,
+    enable_ws=enable_ws,
+    enable_persist_dkdv=enable_persist_dkdv,
+  )
+
+
+def _gen_bwd_sm90_dq_autotune_configs(
+  headdim: int = 512,
+  autotune_mode: str = "max",
+  enable_ws: bool = False,
+) -> list[triton.Config]:
+  """Generate autotune configs for the split-launch dQ kernel."""
+  return _gen_bwd_sm90_autotune_configs(
+    headdim=headdim,
+    autotune_mode=autotune_mode,
+    enable_ws=enable_ws,
+    enable_persist_dkdv=False,
+  )
+
+
 _ffpa_bwd_sm90_autotune_cache: dict[tuple[int, str, str, bool, bool, bool], callable] = {}
+_ffpa_bwd_sm90_dkdv_autotune_cache: dict[tuple[int, str, str, bool, bool, bool], callable] = {}
+_ffpa_bwd_sm90_dq_autotune_cache: dict[tuple[int, str, str, bool], callable] = {}
 
 
 def _get_bwd_sm90_autotune(
@@ -839,6 +1032,67 @@ def _get_bwd_sm90_autotune(
       cache_results=True,
     )(_ffpa_bwd_sm90_kernel_impl)
   return _ffpa_bwd_sm90_autotune_cache[cache_key]
+
+
+def _get_bwd_sm90_dkdv_autotune(
+  headdim: int,
+  autotune_mode: str,
+  dtype: str,
+  bias_requires_grad: bool,
+  enable_ws: bool = False,
+  enable_persist_dkdv: bool = False,
+):
+  """Return an autotune wrapper for the split-launch SM90 dK/dV kernel."""
+  cache_key = (headdim, autotune_mode, dtype, bias_requires_grad, enable_ws, enable_persist_dkdv)
+  if cache_key not in _ffpa_bwd_sm90_dkdv_autotune_cache:
+    reset_args = []
+    if bias_requires_grad:
+      reset_args.append("GradAttnBias")
+    _ffpa_bwd_sm90_dkdv_autotune_cache[cache_key] = triton.autotune(
+      configs=_gen_bwd_sm90_dkdv_autotune_configs(
+        headdim=headdim,
+        autotune_mode=autotune_mode,
+        enable_ws=enable_ws,
+        enable_persist_dkdv=enable_persist_dkdv,
+      ),
+      key=[
+        "autotune_seqlen_q_bucket",
+        "autotune_seqlen_k_bucket",
+        "headdim",
+        "autotune_causal_key",
+        "autotune_dtype_key",
+      ],
+      reset_to_zero=reset_args,
+      cache_results=True,
+    )(_ffpa_bwd_dkdv_sm90_kernel_impl)
+  return _ffpa_bwd_sm90_dkdv_autotune_cache[cache_key]
+
+
+def _get_bwd_sm90_dq_autotune(
+  headdim: int,
+  autotune_mode: str,
+  dtype: str,
+  enable_ws: bool = False,
+):
+  """Return an autotune wrapper for the split-launch SM90 dQ kernel."""
+  cache_key = (headdim, autotune_mode, dtype, enable_ws)
+  if cache_key not in _ffpa_bwd_sm90_dq_autotune_cache:
+    _ffpa_bwd_sm90_dq_autotune_cache[cache_key] = triton.autotune(
+      configs=_gen_bwd_sm90_dq_autotune_configs(
+        headdim=headdim,
+        autotune_mode=autotune_mode,
+        enable_ws=enable_ws,
+      ),
+      key=[
+        "autotune_seqlen_q_bucket",
+        "autotune_seqlen_k_bucket",
+        "headdim",
+        "autotune_causal_key",
+        "autotune_dtype_key",
+      ],
+      cache_results=True,
+    )(_ffpa_bwd_dq_sm90_kernel_impl)
+  return _ffpa_bwd_sm90_dq_autotune_cache[cache_key]
 
 
 def is_sm90_tma_backward_supported(
@@ -918,12 +1172,14 @@ def lookup_bwd_sm90_persistent_config(
   nheads_kv: int,
   enable_ws: bool,
   enable_persist_dkdv: bool = False,
+  kernel: str | None = None,
 ) -> dict | None:
   """Lookup a persisted SM90 TMA backward config."""
+  kernel = kernel or ("bwd_sm90_generic_persist_dkdv" if enable_persist_dkdv else "bwd_sm90_generic")
   return lookup_persistent_config(
     PersistentConfigRequest(
       direction="backward",
-      kernel="bwd_sm90_generic_persist_dkdv" if enable_persist_dkdv else "bwd_sm90_generic",
+      kernel=kernel,
       autotune_mode=autotune_mode,
       dtype=dtype_name(q.dtype),
       headdim=headdim,
@@ -1087,6 +1343,12 @@ def _ffpa_attn_backward_sm90_impl(
       batch * nheads,
     )
 
+  def dkdv_grid(meta: dict) -> tuple[int, ...]:
+    return (triton.cdiv(seqlen_k, meta["BLOCK_N"]), 1, batch * nheads)
+
+  def dq_grid(meta: dict) -> tuple[int, ...]:
+    return (triton.cdiv(seqlen_q, meta["BLOCK_M"]), 1, batch * nheads)
+
   desc_q, desc_k, desc_v, desc_do = _ffpa_bwd_sm90_make_descs(q, k, v, do)
 
   def _tma_alloc_fn(size: int, align: int, _):
@@ -1136,6 +1398,73 @@ def _ffpa_attn_backward_sm90_impl(
     dropout_p,
     philox_offset,
   )
+  dkdv_args = (
+    desc_q,
+    desc_k,
+    desc_v,
+    desc_do,
+    dk,
+    dv,
+    lse,
+    delta,
+    attn_bias_in,
+    grad_attn_bias_in,
+    softmax_scale,
+    dk.stride(0),
+    dk.stride(1),
+    dk.stride(2),
+    dv.stride(0),
+    dv.stride(1),
+    dv.stride(2),
+    bias_strides[0],
+    bias_strides[1],
+    bias_strides[2],
+    bias_strides[3],
+    grad_bias_strides[0],
+    grad_bias_strides[1],
+    grad_bias_strides[2],
+    grad_bias_strides[3],
+    nheads,
+    seqlen_q,
+    seqlen_k,
+    autotune_seqlen_q_bucket,
+    autotune_seqlen_k_bucket,
+    autotune_causal_key,
+    autotune_dtype_key,
+    seqlen_q_rounded,
+    headdim,
+    dropout_p,
+    philox_offset,
+  )
+  dq_args = (
+    desc_q,
+    desc_k,
+    desc_v,
+    desc_do,
+    dq,
+    lse,
+    delta,
+    attn_bias_in,
+    softmax_scale,
+    dq.stride(0),
+    dq.stride(1),
+    dq.stride(2),
+    bias_strides[0],
+    bias_strides[1],
+    bias_strides[2],
+    bias_strides[3],
+    nheads,
+    seqlen_q,
+    seqlen_k,
+    autotune_seqlen_q_bucket,
+    autotune_seqlen_k_bucket,
+    autotune_causal_key,
+    autotune_dtype_key,
+    seqlen_q_rounded,
+    headdim,
+    dropout_p,
+    philox_offset,
+  )
   kernel_meta = dict(
     IS_CAUSAL=causal,
     HAS_ATTN_BIAS=has_attn_bias,
@@ -1148,41 +1477,129 @@ def _ffpa_attn_backward_sm90_impl(
     PERSIST_DKDV_ACC=enable_persist_dkdv,
     DTYPE=DTYPE,
   )
+  dkdv_meta = dict(
+    IS_CAUSAL=causal,
+    HAS_ATTN_BIAS=has_attn_bias,
+    HAS_DROPOUT=has_dropout,
+    PHILOX_SEED=philox_seed,
+    BIAS_REQUIRES_GRAD=bias_requires_grad,
+    GRAD_BIAS_NEEDS_REDUCTION=grad_bias_needs_reduction,
+    GRAD_BIAS_REDUCES_M=grad_bias_reduces_m,
+    GRAD_BIAS_STORE_PARTIAL=use_key_bias_grad_reduction,
+    PERSIST_DKDV_ACC=enable_persist_dkdv,
+    DTYPE=DTYPE,
+  )
+  dq_meta = dict(
+    IS_CAUSAL=causal,
+    HAS_ATTN_BIAS=has_attn_bias,
+    HAS_DROPOUT=has_dropout,
+    PHILOX_SEED=philox_seed,
+    DTYPE=DTYPE,
+  )
+  split_launch = _bwd_sm90_split_launch_enabled()
 
   if autotune:
-    _get_bwd_sm90_autotune(
-      headdim,
-      autotune_mode,
-      runtime_dtype,
-      bias_requires_grad,
-      enable_ws=enable_ws,
-      enable_persist_dkdv=enable_persist_dkdv,
-    )[grid](*kernel_args, **kernel_meta)
+    if split_launch:
+      _get_bwd_sm90_dkdv_autotune(
+        headdim,
+        autotune_mode,
+        runtime_dtype,
+        bias_requires_grad,
+        enable_ws=enable_ws,
+        enable_persist_dkdv=enable_persist_dkdv,
+      )[dkdv_grid](*dkdv_args, **dkdv_meta)
+      _get_bwd_sm90_dq_autotune(
+        headdim,
+        autotune_mode,
+        runtime_dtype,
+        enable_ws=enable_ws,
+      )[dq_grid](*dq_args, **dq_meta)
+    else:
+      _get_bwd_sm90_autotune(
+        headdim,
+        autotune_mode,
+        runtime_dtype,
+        bias_requires_grad,
+        enable_ws=enable_ws,
+        enable_persist_dkdv=enable_persist_dkdv,
+      )[grid](*kernel_args, **kernel_meta)
   else:
-    launch_config = _default_bwd_sm90_config(enable_persist_dkdv)
-    persisted_config = lookup_bwd_sm90_persistent_config(
-      q=q,
-      seqlen_q=seqlen_q,
-      seqlen_k=seqlen_k,
-      headdim=headdim,
-      autotune_mode=autotune_mode,
-      causal=causal,
-      bias_grad=bias_requires_grad,
-      grad_kv_storage_dtype=grad_kv_storage_dtype,
-      has_attn_bias=has_attn_bias,
-      has_dropout=has_dropout,
-      nheads_q=nheads,
-      nheads_kv=original_nheads_kv,
-      enable_ws=enable_ws,
-      enable_persist_dkdv=enable_persist_dkdv,
-    )
-    if persisted_config is not None:
-      launch_config.update(persisted_config)
-    launch_config["warp_specialize"] = bool(enable_ws)
-    if enable_ws:
-      launch_config["num_stages"] = 2
-    _ffpa_bwd_sm90_prepare_descs(desc_q, desc_k, desc_v, desc_do, launch_config)
-    _ffpa_bwd_sm90_kernel_impl[grid](*kernel_args, **kernel_meta, **launch_config)
+    if split_launch:
+      dkdv_config = _default_bwd_sm90_dkdv_config(enable_persist_dkdv)
+      persisted_dkdv_config = lookup_bwd_sm90_persistent_config(
+        q=q,
+        seqlen_q=seqlen_q,
+        seqlen_k=seqlen_k,
+        headdim=headdim,
+        autotune_mode=autotune_mode,
+        causal=causal,
+        bias_grad=bias_requires_grad,
+        grad_kv_storage_dtype=grad_kv_storage_dtype,
+        has_attn_bias=has_attn_bias,
+        has_dropout=has_dropout,
+        nheads_q=nheads,
+        nheads_kv=original_nheads_kv,
+        enable_ws=enable_ws,
+        enable_persist_dkdv=enable_persist_dkdv,
+        kernel="bwd_sm90_dkdv_persist" if enable_persist_dkdv else "bwd_sm90_dkdv",
+      )
+      if persisted_dkdv_config is not None:
+        dkdv_config.update(persisted_dkdv_config)
+      dkdv_config["warp_specialize"] = bool(enable_ws)
+      if enable_ws:
+        dkdv_config["num_stages"] = 2
+      _ffpa_bwd_sm90_prepare_descs(desc_q, desc_k, desc_v, desc_do, dkdv_config)
+      _ffpa_bwd_dkdv_sm90_kernel_impl[dkdv_grid](*dkdv_args, **dkdv_meta, **dkdv_config)
+
+      dq_config = _default_bwd_sm90_dq_config()
+      persisted_dq_config = lookup_bwd_sm90_persistent_config(
+        q=q,
+        seqlen_q=seqlen_q,
+        seqlen_k=seqlen_k,
+        headdim=headdim,
+        autotune_mode=autotune_mode,
+        causal=causal,
+        bias_grad=False,
+        grad_kv_storage_dtype=grad_kv_storage_dtype,
+        has_attn_bias=has_attn_bias,
+        has_dropout=has_dropout,
+        nheads_q=nheads,
+        nheads_kv=original_nheads_kv,
+        enable_ws=enable_ws,
+        kernel="bwd_sm90_dq",
+      )
+      if persisted_dq_config is not None:
+        dq_config.update(persisted_dq_config)
+      dq_config["warp_specialize"] = bool(enable_ws)
+      if enable_ws:
+        dq_config["num_stages"] = 2
+      _ffpa_bwd_sm90_prepare_descs(desc_q, desc_k, desc_v, desc_do, dq_config)
+      _ffpa_bwd_dq_sm90_kernel_impl[dq_grid](*dq_args, **dq_meta, **dq_config)
+    else:
+      launch_config = _default_bwd_sm90_config(enable_persist_dkdv)
+      persisted_config = lookup_bwd_sm90_persistent_config(
+        q=q,
+        seqlen_q=seqlen_q,
+        seqlen_k=seqlen_k,
+        headdim=headdim,
+        autotune_mode=autotune_mode,
+        causal=causal,
+        bias_grad=bias_requires_grad,
+        grad_kv_storage_dtype=grad_kv_storage_dtype,
+        has_attn_bias=has_attn_bias,
+        has_dropout=has_dropout,
+        nheads_q=nheads,
+        nheads_kv=original_nheads_kv,
+        enable_ws=enable_ws,
+        enable_persist_dkdv=enable_persist_dkdv,
+      )
+      if persisted_config is not None:
+        launch_config.update(persisted_config)
+      launch_config["warp_specialize"] = bool(enable_ws)
+      if enable_ws:
+        launch_config["num_stages"] = 2
+      _ffpa_bwd_sm90_prepare_descs(desc_q, desc_k, desc_v, desc_do, launch_config)
+      _ffpa_bwd_sm90_kernel_impl[grid](*kernel_args, **kernel_meta, **launch_config)
 
   if use_key_bias_grad_reduction:
     key_bias_block_n = 64
