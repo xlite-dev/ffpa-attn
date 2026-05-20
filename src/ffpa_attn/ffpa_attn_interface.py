@@ -14,23 +14,23 @@ When the caller opts into the CuTeDSL backend (``forward_backend='cutedsl'``)
 the dispatch goes through the same :class:`FFPAAttnMeta` normalization and
 :class:`FFPAAttnFunc` autograd boundary as all other backends.
 :meth:`_FFPAAttnFunc.forward` and :meth:`_FFPAAttnFunc.backward` route to
-:func:`ffpa_attn.cutedsl._wrappers._ffpa_attn_forward_cutedsl` and
-:func:`ffpa_attn.cutedsl._wrappers._ffpa_attn_backward_cutedsl`, which
+:func:`ffpa_attn.cutedsl._ffpa_attn_forward_cutedsl` and
+:func:`ffpa_attn.cutedsl._ffpa_attn_backward_cutedsl`, which
 handle the SDPA ``[B, H, N, D]`` ↔ FA ``[B, N, H, D]`` layout conversion
 internally. CuTeDSL compatibility constraints are enforced in two layers:
 
 - **Tensor-level** (device, SM90, head_dim, dtype, bf16 training):
-  enforced by :func:`ffpa_attn.cutedsl._wrappers._require_cutedsl_supported`,
+  enforced by :func:`ffpa_attn.cutedsl._require_cutedsl_supported`,
   now called from :meth:`FFPAAttnMeta.normalize` so all callers see
   consistent validation before kernel dispatch.
 - **Kwarg-level** (``dropout_p``, ``attn_mask``): enforced directly in
   :meth:`FFPAAttnMeta.normalize`, which raises ``NotImplementedError``
   for unsupported combinations. The varlen path additionally uses
-  :func:`ffpa_attn.cutedsl._wrappers._check_supported_options` for the
+  :func:`ffpa_attn.cutedsl._check_supported_options` for the
   full FlashAttention-extension kwarg surface.
 
 - **Soft (kwarg-level)**: enforced by
-  :func:`ffpa_attn.cutedsl._wrappers._check_supported_options` at each
+  :func:`ffpa_attn.cutedsl._check_supported_options` at each
   entry shim. The dense ``ffpa_attn_func(forward_backend='cutedsl')``
   path only forwards ``dropout_p`` and ``attn_mask`` to the helper;
   other unsupported kwargs reach the dense path via ``**kwargs`` and
@@ -54,7 +54,7 @@ constraint (dtype, fp16 training, ``dropout_p > 0``, explicit
 Variable-length (packed THD) attention is exposed via ``ffpa_attn_varlen_func``,
 which mirrors the FlashAttention varlen surface (``q, k, v, cu_seqlens_q,
 cu_seqlens_k, max_seqlen_q, max_seqlen_k, ...``) and delegates to
-:func:`ffpa_attn.cutedsl._wrappers._ffpa_attn_varlen_cutedsl`, which
+:func:`ffpa_attn.cutedsl._ffpa_attn_varlen_cutedsl`, which
 dispatches to the CuTeDSL ``ffpa_attn::_varlen_fwd_cutedsl`` autograd-registered
 torch op. The varlen API is currently CuTeDSL-only (SM90, D=512); other
 shapes / backends raise ``NotImplementedError``.
@@ -114,7 +114,7 @@ def _should_fallback_to_sdpa(
   # _require_cutedsl_supported / _check_supported_options, so cutedsl
   # bypasses the legacy any([...]) heuristics below.
   if forward_backend.name == "cutedsl":
-    from .cutedsl._wrappers import cutedsl_forward_available
+    from .cutedsl import cutedsl_forward_available
     cutedsl_hw_unsupported = D != 512 or not cutedsl_forward_available(query.device)
     if cutedsl_hw_unsupported:
       logger.warning_once(
