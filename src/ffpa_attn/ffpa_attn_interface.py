@@ -11,17 +11,23 @@ large-D forward continues to use the FFPA Triton kernel by default, with a
 legacy optional CUDA forward backend available only when compiled in.
 
 When the caller opts into the CuTeDSL backend (``forward_backend='cutedsl'``)
-``ffpa_attn_func`` routes straight to
-:func:`ffpa_attn.cutedsl._wrappers._ffpa_attn_cutedsl` (the dense Layer-2
-entry, sibling of the varlen one below), which wraps
-``FFPAAttnSplitDFunc.apply(...)`` and skips ``FFPAAttnMeta`` normalization
-and the ``FFPAAttnFunc`` autograd boundary. CuTeDSL compatibility is split
-in two:
+the dispatch goes through the same :class:`FFPAAttnMeta` normalization and
+:class:`FFPAAttnFunc` autograd boundary as all other backends.
+:meth:`_FFPAAttnFunc.forward` and :meth:`_FFPAAttnFunc.backward` route to
+:func:`ffpa_attn.cutedsl._wrappers._ffpa_attn_cutedsl_forward` and
+:func:`ffpa_attn.cutedsl._wrappers._ffpa_attn_cutedsl_backward`, which
+handle the SDPA ``[B, H, N, D]`` ↔ FA ``[B, N, H, D]`` layout conversion
+internally. CuTeDSL compatibility constraints are enforced in two layers:
 
-- **Hard (tensor-level)**: ``head_dim != 512``, non-SM90 device, wrong
-  dtype, fp16 training all raise ``NotImplementedError`` / ``TypeError``
-  from :func:`ffpa_attn.cutedsl._wrappers._require_cutedsl_supported`
-  inside the dense entry.
+- **Tensor-level** (device, SM90, head_dim, dtype, bf16 training):
+  enforced by :func:`ffpa_attn.cutedsl._wrappers._require_cutedsl_supported`,
+  now called from :meth:`FFPAAttnMeta.normalize` so all callers see
+  consistent validation before kernel dispatch.
+- **Kwarg-level** (``dropout_p``, ``attn_mask``): enforced directly in
+  :meth:`FFPAAttnMeta.normalize`, which raises ``NotImplementedError``
+  for unsupported combinations. The varlen path additionally uses
+  :func:`ffpa_attn.cutedsl._wrappers._check_supported_options` for the
+  full FlashAttention-extension kwarg surface.
 
 - **Soft (kwarg-level)**: enforced by
   :func:`ffpa_attn.cutedsl._wrappers._check_supported_options` at each
@@ -42,8 +48,7 @@ For the dense entry, the two pure hardware mismatches —
 ``warning_once`` log on the ``FFPA.ffpa_attn.ffpa_attn_interface``
 logger, since neither is fixable at the call site. Every other
 constraint (dtype, fp16 training, ``dropout_p > 0``, explicit
-``attn_mask``, all FA-extension kwargs above, and the entire varlen
-path) continues to raise ``NotImplementedError`` / ``TypeError`` /
+``attn_mask``) continues to raise ``NotImplementedError`` / ``TypeError`` /
 ``ValueError``; there is no silent fallback for those.
 
 Variable-length (packed THD) attention is exposed via ``ffpa_attn_varlen_func``,
@@ -227,28 +232,6 @@ def ffpa_attn_func(
     # >>> from ffpa_attn import ffpa_attn_func
     # >>> F.scaled_dot_product_attention = ffpa_attn_func
     return torch._C._nn.scaled_dot_product_attention(
-      query,
-      key,
-      value,
-      attn_mask=attn_mask,
-      dropout_p=dropout_p,
-      is_causal=is_causal,
-      scale=scale,
-      enable_gqa=enable_gqa,
-    )
-
-  # CuTeDSL backend — opt-in via forward_backend='cutedsl'.
-  # Bypasses FFPAAttnMeta normalization and the FFPAAttnFunc autograd
-  # boundary, dispatching directly to ffpa_attn_splitd_func (autograd via
-  # FFPAAttnSplitDFunc). _should_fallback_to_sdpa above returns False for
-  # the cutedsl branch by construction; unsupported cases raise inside
-  # _ffpa_attn_cutedsl: tensor-level (head_dim != 512, dtype, non-SM90
-  # device) via _require_cutedsl_supported, kwarg-level (dropout_p > 0,
-  # attn_mask is not None) via _check_supported_options. The lazy import
-  # keeps the cutedsl package off the hot path for non-cutedsl callers.
-  if meta.forward_meta.name == "cutedsl":
-    from .cutedsl import _ffpa_attn_cutedsl
-    return _ffpa_attn_cutedsl(
       query,
       key,
       value,

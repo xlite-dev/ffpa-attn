@@ -1187,70 +1187,6 @@ torch.library.register_autograd(
   setup_context=_varlen_fwd_setup_context,
 )
 
-# ---------------------------------------------------------------------------
-# Autograd classes
-# ---------------------------------------------------------------------------
-
-
-class FFPAAttnSplitDFunc(torch.autograd.Function):
-
-  @staticmethod
-  def forward(
-    ctx,
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    softmax_scale: Optional[float] = None,
-    causal: bool = False,
-    window_size: Tuple[Optional[int], Optional[int]] = (None, None),
-    softcap: float = 0.0,
-    pack_gqa: Optional[bool] = None,
-    return_lse: bool = False,
-  ):
-    out, lse = _ffpa_attn_forward_sm90(
-      q,
-      k,
-      v,
-      softmax_scale=softmax_scale,
-      causal=causal,
-      window_size_left=window_size[0],
-      window_size_right=window_size[1],
-      softcap=softcap,
-      pack_gqa=pack_gqa,
-      return_lse=return_lse,
-    )
-    ctx.save_for_backward(q, k, v, out, lse)
-    ctx.softmax_scale = softmax_scale
-    ctx.causal = causal
-    ctx.window_size = window_size
-    ctx.softcap = softcap
-    ctx.return_lse = return_lse
-    ctx.set_materialize_grads(False)
-    return out, lse
-
-  @staticmethod
-  def backward(ctx, dout, dlse):
-    q, k, v, out, lse = ctx.saved_tensors
-    if not ctx.return_lse:
-      dlse = None
-    if dout is None:
-      dout = torch.zeros_like(out)
-    dq, dk, dv = _ffpa_attn_backward_sm90(
-      q,
-      k,
-      v,
-      out,
-      dout,
-      lse,
-      ctx.softmax_scale,
-      ctx.causal,
-      ctx.softcap,
-      window_size_left=ctx.window_size[0],
-      window_size_right=ctx.window_size[1],
-      dlse=dlse,
-    )
-    return dq, dk, dv, *((None, ) * 6)
-
 
 def _normalize_varlen_custom_op_inputs(
   q: torch.Tensor,
@@ -1334,35 +1270,6 @@ def _trim_trailing_empty_varlen_segments(
 # ---------------------------------------------------------------------------
 
 
-def ffpa_attn_splitd_func(
-  q: torch.Tensor,
-  k: torch.Tensor,
-  v: torch.Tensor,
-  softmax_scale: Optional[float] = None,
-  causal: bool = False,
-  window_size: Tuple[Optional[int], Optional[int]] = (None, None),
-  softcap: float = 0.0,
-  pack_gqa: Optional[bool] = None,
-  return_lse: bool = False,
-):
-  """Batched SplitD FFPA attention for D=512 on SM90.
-
-    Training requires bf16 q/k/v. fp16 is accepted only for no-grad forward.
-    """
-  out, lse = FFPAAttnSplitDFunc.apply(
-    q,
-    k,
-    v,
-    softmax_scale,
-    causal,
-    window_size,
-    softcap,
-    pack_gqa,
-    return_lse,
-  )
-  return (out, lse) if return_lse else out
-
-
 def ffpa_attn_splitd_varlen_func(
   q: torch.Tensor,
   k: torch.Tensor,
@@ -1428,6 +1335,5 @@ def ffpa_attn_splitd_varlen_func(
 
 
 __all__ = [
-  "ffpa_attn_splitd_func",
   "ffpa_attn_splitd_varlen_func",
 ]

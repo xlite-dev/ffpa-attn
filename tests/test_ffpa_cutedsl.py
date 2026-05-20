@@ -124,12 +124,12 @@ def test_cutedsl_rejects_mixed_backward_backend():
     ffpa_attn_func(q, q, q, forward_backend="cutedsl", backward_backend="triton")
 
 
-def test_cutedsl_fast_path_bypasses_ffpaattnfunc(monkeypatch):
-  """forward_backend='cutedsl' + D=512 + SM90 must short-circuit FFPAAttnFunc.
+def test_cutedsl_routes_through_ffpaattnfunc(monkeypatch):
+  """forward_backend='cutedsl' + D=512 + SM90 must go through FFPAAttnFunc.
 
-  Patches the dispatcher entry point in ffpa_attn_interface and asserts it is
-  never invoked: the fast-path in ffpa_attn_func should route directly to
-  cutedsl._interface.ffpa_attn_splitd_func.
+  After the dispatch refactor, cutedsl follows the same code path as other
+  backends: ffpa_attn_func → FFPAAttnMeta.normalize_inputs →
+  FFPAAttnFunc.apply → _FFPAAttnFunc.forward (CuTeDSLBackend branch).
   """
   import ffpa_attn.ffpa_attn_interface as iface
 
@@ -144,7 +144,7 @@ def test_cutedsl_fast_path_bypasses_ffpaattnfunc(monkeypatch):
 
   q = torch.randn(1, 8, 1024, 512, dtype=torch.bfloat16, device="cuda")
   out = ffpa_attn_func(q, q, q, forward_backend="cutedsl")
-  assert call_count[0] == 0, "fast-path should have bypassed FFPAAttnFunc.apply"
+  assert call_count[0] == 1, "cutedsl should route through FFPAAttnFunc.apply"
   assert out.shape == q.shape and torch.isfinite(out).all()
 
 

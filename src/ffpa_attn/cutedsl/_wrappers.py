@@ -5,12 +5,11 @@ The CuTeDSL kernels in :mod:`ffpa_attn.cutedsl._interface` operate on the
 flash-attention layout convention reused here). The public FFPA APIs
 (:func:`ffpa_attn.ffpa_attn_func`, :func:`ffpa_attn.ffpa_attn_varlen_func`)
 present the SDPA-style ``[B, H, N, D]`` / FA-style ``[T, H, D]`` surface and
-route ``forward_backend='cutedsl'`` directly into :func:`_ffpa_attn_cutedsl`
-and :func:`_ffpa_attn_varlen_cutedsl` defined here, which transpose and
-dispatch into :func:`ffpa_attn_splitd_func` /
-:func:`ffpa_attn_splitd_varlen_func`. Autograd is owned by
-:class:`ffpa_attn.cutedsl._interface.FFPAAttnSplitDFunc`, not by
-:class:`ffpa_attn.functional.FFPAAttnFunc`.
+route ``forward_backend='cutedsl'`` through the unified
+:class:`ffpa_attn.functional.FFPAAttnFunc` autograd boundary.
+:func:`_ffpa_attn_cutedsl_forward` and :func:`_ffpa_attn_cutedsl_backward`
+transpose between SDPA and FA layouts and dispatch into
+:func:`_ffpa_attn_forward_sm90` / :func:`_ffpa_attn_backward_sm90`.
 
 The module also centralises the **tensor-level** SM90 / D=512 / dtype gating
 via :func:`_require_cutedsl_supported` and the **kwarg-level** compatibility
@@ -21,7 +20,6 @@ option (``dropout_p``, ``attn_mask``, FlashAttention extensions) raises
 
 from __future__ import annotations
 
-import math
 from typing import Optional
 
 import torch
@@ -47,9 +45,9 @@ def _check_supported_options(
 ) -> None:
   """Raise ``NotImplementedError`` for any non-default cutedsl-unsupported option.
 
-  The cutedsl SplitD D=512 kernels (``ffpa_attn_splitd_func``,
-  ``ffpa_attn_splitd_varlen_func``) only honor dense / varlen D=512
-  attention with optional causal masking. Every other option commonly
+  The cutedsl SplitD D=512 kernels (``ffpa_attn_splitd_varlen_func``,
+  ``_ffpa_attn_cutedsl_forward``, ``_ffpa_attn_cutedsl_backward``) only
+  honor dense / varlen D=512 attention with optional causal masking. Every other option commonly
   exposed by attention APIs (mask tensors, sliding window, softcap,
   score_mod, aux tensors, FlashAttention varlen extensions, dropout)
   has no kernel-side implementation and is rejected up front so callers
@@ -133,7 +131,7 @@ def _require_cutedsl_supported(
   ``attn_mask``, FlashAttention-extension kwargs) is **not** the
   responsibility of this function; that lives in
   :func:`_check_supported_options`, applied by the entry shims
-  (:func:`_ffpa_attn_cutedsl`, :func:`_ffpa_attn_varlen_cutedsl`).
+  (:func:`_ffpa_attn_cutedsl_forward`, :func:`_ffpa_attn_varlen_cutedsl`).
 
   Raises ``NotImplementedError`` / ``RuntimeError`` / ``TypeError`` for
   any tensor-level violation so users who pass ``forward_backend='cutedsl'``
@@ -179,64 +177,98 @@ def _bnhd_to_bhnd(t: torch.Tensor) -> torch.Tensor:
   return t.transpose(1, 2).contiguous()
 
 
-def _ffpa_attn_cutedsl(
-  query: torch.Tensor,
-  key: torch.Tensor,
-  value: torch.Tensor,
+def _ffpa_attn_cutedsl_forward(
+  q: torch.Tensor,
+  k: torch.Tensor,
+  v: torch.Tensor,
+  softmax_scale: float,
+  causal: bool,
   *,
-  attn_mask: torch.Tensor | None,
-  dropout_p: float,
-  is_causal: bool,
-  scale: float | None,
-  enable_gqa: bool,
-) -> torch.Tensor:
-  """Dense ``[B, H, N, D]`` cutedsl entry called from
-  :func:`ffpa_attn.ffpa_attn_interface.ffpa_attn_func` whenever
-  ``forward_backend == 'cutedsl'``. Sibling of
-  :func:`_ffpa_attn_varlen_cutedsl`. Routes through
-  :func:`ffpa_attn.cutedsl._interface.ffpa_attn_splitd_func`, which wraps
-  ``FFPAAttnSplitDFunc.apply(...)`` for autograd — the cutedsl backend owns
-  its own autograd boundary and never traverses
-  :class:`ffpa_attn.functional.FFPAAttnFunc`.
+  return_lse: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor]:
+  """CuTeDSL SplitD forward for D=512 on SM90 with SDPA-layout in/out.
 
-  Layout conversion: SDPA ``[B, Nh_q, Nq, D]`` is transposed to FA
-  ``[B, Nq, Nh_q, D]`` on the way in and back on the way out.
+  Accepts ``[B, H, N, D]`` (SDPA) layout, transposes to the CuTeDSL-native
+  ``[B, N, H, D]`` (FA) layout, calls :func:`_ffpa_attn_forward_sm90`, and
+  transposes the output back. ``lse`` is always in ``[B, H, N]`` shape and
+  does not require a transpose.
 
-  ``attn_mask`` and ``dropout_p`` are accepted for public-API uniformity
-  but the cutedsl SplitD kernel does not implement either: any non-default
-  value raises ``NotImplementedError`` from :func:`_check_supported_options`.
-  Use ``forward_backend='triton'`` if dropout / mask are functionally
-  required.
+  Called from :meth:`_FFPAAttnFunc.forward` when the dispatch selects
+  ``CuTeDSLBackend`` — the autograd boundary is owned by
+  :class:`ffpa_attn.functional.FFPAAttnFunc`, not by this function.
+
+  :param q: Query tensor ``[B, H_q, N_q, D]``.
+  :param k: Key tensor ``[B, H_kv, N_kv, D]``.
+  :param v: Value tensor ``[B, H_kv, N_kv, D]``.
+  :param softmax_scale: Pre-softmax scaling factor (already resolved, never None).
+  :param causal: Whether causal masking is applied.
+  :param return_lse: Always ``True`` when called from the training path so lse
+      is saved for backward.
+  :returns: ``(out, lse)`` where ``out`` is ``[B, H_q, N_q, D]`` and
+      ``lse`` is ``[B, H_q, N_q]`` float32.
   """
-  from ._interface import ffpa_attn_splitd_func
+  from ._interface import _ffpa_attn_forward_sm90
 
-  _check_supported_options(
-    source="ffpa_attn_func(forward_backend='cutedsl')",
-    dropout_p=dropout_p,
-    attention_mask=attn_mask,
-  )
+  requires_grad = any(t.requires_grad for t in (q, k, v))
+  _require_cutedsl_supported(q, k, v, requires_grad=requires_grad)
 
-  requires_grad = any(t.requires_grad for t in (query, key, value))
-  _require_cutedsl_supported(query, key, value, requires_grad=requires_grad)
-  if not enable_gqa and query.size(1) != key.size(1):
-    raise ValueError(
-      f"ffpa_attn_func: enable_gqa=False but query num_heads ({query.size(1)}) "
-      f"!= key/value num_heads ({key.size(1)}); set enable_gqa=True or match head counts."
-    )
-
-  q_nhd, k_nhd, v_nhd = (_bhnd_to_bnhd(t) for t in (query, key, value))
-
-  softmax_scale = scale if scale is not None else (1.0 / math.sqrt(query.size(-1)))
-  # pack_gqa: omitted; _ffpa_attn_forward_sm90 auto-detects via qhead_per_kvhead > 1.
-  out_nhd = ffpa_attn_splitd_func(
+  q_nhd, k_nhd, v_nhd = (_bhnd_to_bnhd(t) for t in (q, k, v))
+  out_nhd, lse = _ffpa_attn_forward_sm90(
     q_nhd,
     k_nhd,
     v_nhd,
     softmax_scale=softmax_scale,
-    causal=is_causal,
-    return_lse=False,
+    causal=causal,
+    return_lse=return_lse,
   )
-  return _bnhd_to_bhnd(out_nhd)
+  out_bhnd = _bnhd_to_bhnd(out_nhd)
+  return out_bhnd, lse
+
+
+def _ffpa_attn_cutedsl_backward(
+  grad_out: torch.Tensor,
+  q: torch.Tensor,
+  k: torch.Tensor,
+  v: torch.Tensor,
+  out: torch.Tensor,
+  lse: torch.Tensor,
+  softmax_scale: float,
+  causal: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+  """CuTeDSL SplitD backward for D=512 on SM90 with SDPA-layout in/out.
+
+  Accepts all tensors in ``[B, H, N, D]`` (SDPA) layout, transposes to
+  ``[B, N, H, D]`` (FA) for the CuTeDSL kernel, and transposes the
+  gradient outputs back to SDPA layout.
+
+  Called from :meth:`_FFPAAttnFunc.backward` when the dispatch selects
+  ``CuTeDSLBackend``.
+
+  :param grad_out: Gradient w.r.t. output ``[B, H_q, N_q, D]``.
+  :param q: Query tensor ``[B, H_q, N_q, D]`` (saved from forward).
+  :param k: Key tensor ``[B, H_kv, N_kv, D]`` (saved from forward).
+  :param v: Value tensor ``[B, H_kv, N_kv, D]`` (saved from forward).
+  :param out: Output tensor ``[B, H_q, N_q, D]`` (saved from forward).
+  :param lse: Log-sum-exp ``[B, H_q, N_q]`` float32 (saved from forward).
+  :param softmax_scale: Pre-softmax scaling factor.
+  :param causal: Whether causal masking was applied.
+  :returns: ``(dq, dk, dv)`` all in ``[B, H, N, D]`` SDPA layout.
+  """
+  from ._interface import _ffpa_attn_backward_sm90
+
+  q_nhd, k_nhd, v_nhd, out_nhd, dout_nhd = (_bhnd_to_bnhd(t) for t in (q, k, v, out, grad_out))
+  dq_nhd, dk_nhd, dv_nhd = _ffpa_attn_backward_sm90(
+    q_nhd,
+    k_nhd,
+    v_nhd,
+    out_nhd,
+    dout_nhd,
+    lse,
+    softmax_scale=softmax_scale,
+    causal=causal,
+  )
+  dq, dk, dv = (_bnhd_to_bhnd(t) for t in (dq_nhd, dk_nhd, dv_nhd))
+  return dq, dk, dv
 
 
 def _ffpa_attn_varlen_cutedsl(
@@ -348,7 +380,8 @@ def _ffpa_attn_varlen_cutedsl(
 
 
 __all__ = [
-  "_ffpa_attn_cutedsl",
+  "_ffpa_attn_cutedsl_forward",
+  "_ffpa_attn_cutedsl_backward",
   "_ffpa_attn_varlen_cutedsl",
   "cutedsl_forward_available",
   "cutedsl_backward_available",

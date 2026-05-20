@@ -23,6 +23,10 @@ from .aten import (
   _aten_flash_attn_backward,
   _aten_efficient_attn_backward,
 )  # D <= 256
+from .cutedsl import (
+  _ffpa_attn_cutedsl_forward,
+  _ffpa_attn_cutedsl_backward,
+)  # D == 512 SM90
 
 if TYPE_CHECKING:
   from typing import Tuple, Union, Optional  # noqa: F401
@@ -342,6 +346,11 @@ class FFPAAttnMeta:
       raise ValueError("ffpa_attn_func: dropout_p=1.0 is not supported by SDPA fused kernels")
     if dropout_p > 0.0 and query.size(-1) > 256 and isinstance(self.forward_meta, CuTeDSLBackend):
       raise NotImplementedError("ffpa_attn_func: large-D dropout is not supported by forward_backend='cutedsl'")
+    if attn_mask is not None and isinstance(self.forward_meta, CuTeDSLBackend):
+      raise NotImplementedError(
+        "ffpa_attn_func: attn_mask is not supported by forward_backend='cutedsl'. "
+        "Use forward_backend='triton' when attn_mask is required."
+      )
     if attn_mask is not None and is_causal:
       raise RuntimeError("ffpa_attn_func: explicit attn_mask should not be set when is_causal=True")
     if attn_mask is not None and attn_mask.dtype == torch.bool and attn_mask.requires_grad:
@@ -565,6 +574,19 @@ class _FFPAAttnFunc(torch.autograd.Function):
         forward_meta.enable_tma,
         forward_meta.enable_ws,
       )
+    elif isinstance(meta.forward_meta, CuTeDSLBackend):
+      # CuTeDSL backend. Layout conversion (B,H,N,D ↔ B,N,H,D) is
+      # handled inside _ffpa_attn_cutedsl_forward.
+      O, lse = _ffpa_attn_cutedsl_forward(
+        q,
+        k,
+        v,
+        softmax_scale=meta.attn_meta.scale,
+        causal=meta.attn_meta.is_causal,
+        return_lse=True,
+      )
+      # CuTeDSL does not implement dropout.
+      rng_state = torch.empty(0, dtype=torch.uint8, device=q.device)
     else:
       raise ValueError(f"Unsupported forward_backend={meta.forward_meta.name!r};")
 
@@ -626,6 +648,20 @@ class _FFPAAttnFunc(torch.autograd.Function):
           enable_persist_dkdv=backward_meta.persist_dkdv,
           enable_split_launch=backward_meta.split_launch,
         )
+      elif isinstance(meta.backward_meta, CuTeDSLBackend):
+        # CuTeDSL backward. Layout conversion and kernel dispatch are
+        # handled inside _ffpa_attn_cutedsl_backward.
+        dq, dk, dv = _ffpa_attn_cutedsl_backward(
+          grad_out=grad_out,
+          q=q,
+          k=k,
+          v=v,
+          out=O,
+          lse=lse,
+          softmax_scale=meta.attn_meta.scale,
+          causal=meta.attn_meta.is_causal,
+        )
+        grad_attn_bias = None  # CuTeDSL does not support attn_mask
       else:
         assert isinstance(meta.backward_meta, SDPABackend), \
           f"Unsupported backward_backend={meta.backward_meta.name!r}"
