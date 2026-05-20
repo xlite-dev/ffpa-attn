@@ -840,16 +840,10 @@ def _ffpa_bwd_sm90_kernel_impl(
   ``triton-nvidia-gpu-plan-cta``) and the second ``DotOp`` hits the
   PlanCTA.cpp assertion ``!tiled && "CTA tiling is already determined"``.
 
-  NOTE: Consider splitting this wrapper into separate dK/dV and dQ kernel
-  launches. The two phases do not depend on each other's outputs after the
-  preprocess ``D`` kernel: dK/dV writes ``DK`` / ``DV`` / optional bias grad,
-  while dQ writes only ``DQ``. Keeping them in one Triton function may increase
-  register pressure, shared-memory/TMA pipeline pressure, and PlanCTA stress,
-  especially for ``PERSIST_DKDV_ACC`` where dK/dV carries fp32 ``dk_acc`` /
-  ``dv_acc`` accumulators. A split launch would not reduce S/dP recomputation,
-  but it would allow independent resource allocation and autotune configs for
-  the dK/dV and dQ phases. The extra launch overhead should be negligible for
-  large prefill shapes, but may hurt decode or very small sequence lengths.
+  Triton's current automatic warp-specialization pass can only handle one WS
+  loop region in a kernel. The fused wrapper lets the dK/dV helper own that
+  region when ``warp_specialize=True`` and calls the dQ helper with
+  ``warp_specialize=False``. Standalone split-launch dQ still supports WS.
   """
   # Keys for autotune and heuristics lookups.
   _ = autotune_seqlen_q_bucket
@@ -876,9 +870,39 @@ def _ffpa_bwd_sm90_kernel_impl(
       warp_specialize
     )
   _ffpa_bwd_dq_sm90(
-    desc_q, desc_k, desc_v, desc_do, DQ, LSE, D, AttnBias, softmax_scale, stride_dqb, stride_dqh, stride_dqm, stride_bb,
-    stride_bh, stride_bm, stride_bn, nheads, seqlen_q, seqlen_k, seqlen_q_rounded, headdim, dropout_p, philox_offset,
-    IS_CAUSAL, HAS_ATTN_BIAS, HAS_DROPOUT, PHILOX_SEED, BLOCK_HEADDIM, DTYPE, EVEN_N, BLOCK_M, BLOCK_N, warp_specialize
+    desc_q,
+    desc_k,
+    desc_v,
+    desc_do,
+    DQ,
+    LSE,
+    D,
+    AttnBias,
+    softmax_scale,
+    stride_dqb,
+    stride_dqh,
+    stride_dqm,
+    stride_bb,
+    stride_bh,
+    stride_bm,
+    stride_bn,
+    nheads,
+    seqlen_q,
+    seqlen_k,
+    seqlen_q_rounded,
+    headdim,
+    dropout_p,
+    philox_offset,
+    IS_CAUSAL,
+    HAS_ATTN_BIAS,
+    HAS_DROPOUT,
+    PHILOX_SEED,
+    BLOCK_HEADDIM,
+    DTYPE,
+    EVEN_N,
+    BLOCK_M,
+    BLOCK_N,
+    False  # warp_specialize=False
   )
 
 
