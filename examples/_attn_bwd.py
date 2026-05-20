@@ -129,7 +129,7 @@ def _parse_args() -> argparse.Namespace:
     "--enable-bwd-split-launch",
     "--bwd-split-launch",
     action="store_true",
-    help="Enable separate SM90+ TMA backward launches for dK/dV and dQ (requires --enable-bwd-tma).",
+    help="Enable separate backward launches for dK/dV and dQ on generic Triton or SM90+ TMA paths.",
   )
   args = parser.parse_args()
   if args.enable_tma:
@@ -138,8 +138,6 @@ def _parse_args() -> argparse.Namespace:
     args.enable_bwd_ws = True
   if args.enable_persist_dkdv and not args.enable_bwd_tma:
     raise SystemExit("--enable-persist-dkdv requires --enable-bwd-tma")
-  if args.enable_bwd_split_launch and not args.enable_bwd_tma:
-    raise SystemExit("--enable-bwd-split-launch requires --enable-bwd-tma")
   if args.backward_backend == "cutedsl" and (
     args.triton_autotune or args.enable_bwd_tma or args.enable_bwd_ws or args.enable_persist_dkdv
     or args.enable_bwd_split_launch or args.grad_kv_storage_dtype != "none"
@@ -906,8 +904,8 @@ def run_backward_examples(
     when supported.
   :param enable_persist_dkdv: Whether to enable persistent fp32 dK/dV
     accumulation in the SM90+ TMA backward path. Requires ``enable_tma``.
-  :param enable_split_launch: Whether to enable separate SM90+ TMA backward
-    launches for dK/dV and dQ. Requires ``enable_tma``.
+  :param enable_split_launch: Whether to enable separate backward launches for
+    dK/dV and dQ on generic Triton or SM90+ TMA paths.
   :param warmup: Warmup iterations used for timing.
   :param iters: Measured iterations used for timing.
   :param print_results: Whether to print each case result.

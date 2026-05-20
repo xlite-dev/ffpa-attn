@@ -233,9 +233,10 @@ class FFPAAttnMeta:
   :param triton_backward_enable_persist_dkdv: Use the experimental SM90 TMA
     backward dK/dV path that keeps fp32 dK/dV accumulators in registers across
     Q blocks. Requires ``enable_backward_tma=True``. Defaults to ``False``.
-  :param triton_backward_enable_split_launch: Use separate SM90 TMA backward
-    launches for dK/dV and dQ. Requires ``enable_backward_tma=True``. Defaults
-    to ``False``.
+  :param triton_backward_enable_split_launch: Use separate Triton backward
+    launches for dK/dV and dQ. On SM90/TMA this selects the TMA split kernels;
+    otherwise it selects the generic non-TMA split kernels. Defaults to
+    ``False``.
   :param enable_tma: Compatibility alias for setting both
     ``enable_forward_tma`` and ``enable_backward_tma``.
   :param enable_ws: Compatibility alias for setting both
@@ -347,8 +348,6 @@ class FFPAAttnMeta:
       )
     if triton_backward_enable_persist_dkdv and not enable_backward_tma:
       raise ValueError("triton_backward_enable_persist_dkdv requires enable_backward_tma=True")
-    if triton_backward_enable_split_launch and not enable_backward_tma:
-      raise ValueError("triton_backward_enable_split_launch requires enable_backward_tma=True")
 
     if acc_str == "f32":
       acc = _ACC_F32

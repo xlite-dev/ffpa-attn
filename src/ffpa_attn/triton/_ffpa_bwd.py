@@ -399,6 +399,10 @@ _FFPA_BWD_HEURISTICS = {
   "EVEN_N": lambda args: args["seqlen_k"] % args["BLOCK_N"] == 0,
 }
 
+_FFPA_BWD_DQ_HEURISTICS = {
+  "EVEN_N": lambda args: args["seqlen_k"] % args["BLOCK_N"] == 0,
+}
+
 
 # Shared-pid split-D backward kernel (no dQ atomic_add)
 #
@@ -876,8 +880,180 @@ def _ffpa_bwd_dq(
 
 # Non-autotuned main backward variant.
 _ffpa_bwd = _ffpa_bwd_kernel_impl
+
+
+@triton.heuristics(_FFPA_BWD_HEURISTICS)
+@triton.jit
+def _ffpa_bwd_dkdv_kernel_impl(
+  Q: torch.Tensor,
+  K: torch.Tensor,
+  V: torch.Tensor,
+  DO: torch.Tensor,
+  DK: torch.Tensor,
+  DV: torch.Tensor,
+  LSE: torch.Tensor,
+  D: torch.Tensor,
+  AttnBias: torch.Tensor,
+  GradAttnBias: torch.Tensor,
+  softmax_scale: float,
+  stride_qb: int,
+  stride_qh: int,
+  stride_qm: int,
+  stride_kb: int,
+  stride_kh: int,
+  stride_kn: int,
+  stride_vb: int,
+  stride_vh: int,
+  stride_vn: int,
+  stride_dob: int,
+  stride_doh: int,
+  stride_dom: int,
+  stride_dkb: int,
+  stride_dkh: int,
+  stride_dkn: int,
+  stride_dvb: int,
+  stride_dvh: int,
+  stride_dvn: int,
+  stride_bb: int,
+  stride_bh: int,
+  stride_bm: int,
+  stride_bn: int,
+  stride_gbb: int,
+  stride_gbh: int,
+  stride_gbm: int,
+  stride_gbn: int,
+  nheads: int,
+  seqlen_q: int,
+  seqlen_k: int,
+  autotune_seqlen_q_bucket: int,
+  autotune_seqlen_k_bucket: int,
+  autotune_causal_key: int,
+  autotune_dtype_key: int,
+  seqlen_q_rounded: int,
+  headdim: int,
+  dropout_p: float,
+  philox_offset: int,
+  IS_CAUSAL: tl.constexpr,
+  HAS_ATTN_BIAS: tl.constexpr,
+  HAS_DROPOUT: tl.constexpr,
+  PHILOX_SEED: tl.constexpr,
+  BIAS_REQUIRES_GRAD: tl.constexpr,
+  GRAD_BIAS_NEEDS_REDUCTION: tl.constexpr,
+  GRAD_BIAS_REDUCES_M: tl.constexpr,
+  GRAD_BIAS_STORE_PARTIAL: tl.constexpr,
+  BLOCK_HEADDIM: tl.constexpr,
+  DTYPE: tl.constexpr,
+  EVEN_M: tl.constexpr,
+  EVEN_N: tl.constexpr,
+  BLOCK_M: tl.constexpr,
+  BLOCK_N: tl.constexpr,
+) -> None:
+  _ = autotune_seqlen_q_bucket
+  _ = autotune_seqlen_k_bucket
+  _ = autotune_causal_key
+  _ = autotune_dtype_key
+  _ffpa_bwd_dkdv(
+    Q, K, V, DO, DK, DV, LSE, D, AttnBias, GradAttnBias, softmax_scale, stride_qb, stride_qh, stride_qm, stride_kb,
+    stride_kh, stride_kn, stride_vb, stride_vh, stride_vn, stride_dob, stride_doh, stride_dom, stride_dkb, stride_dkh,
+    stride_dkn, stride_dvb, stride_dvh, stride_dvn, stride_bb, stride_bh, stride_bm, stride_bn, stride_gbb, stride_gbh,
+    stride_gbm, stride_gbn, nheads, seqlen_q, seqlen_k, seqlen_q_rounded, headdim, dropout_p, philox_offset, IS_CAUSAL,
+    HAS_ATTN_BIAS, HAS_DROPOUT, PHILOX_SEED, BIAS_REQUIRES_GRAD, GRAD_BIAS_NEEDS_REDUCTION, GRAD_BIAS_REDUCES_M,
+    GRAD_BIAS_STORE_PARTIAL, BLOCK_HEADDIM, DTYPE, EVEN_M, EVEN_N, BLOCK_M, BLOCK_N
+  )
+
+
+@triton.heuristics(_FFPA_BWD_DQ_HEURISTICS)
+@triton.jit
+def _ffpa_bwd_dq_kernel_impl(
+  Q: torch.Tensor,
+  K: torch.Tensor,
+  V: torch.Tensor,
+  DO: torch.Tensor,
+  DQ: torch.Tensor,
+  LSE: torch.Tensor,
+  D: torch.Tensor,
+  AttnBias: torch.Tensor,
+  softmax_scale: float,
+  stride_qb: int,
+  stride_qh: int,
+  stride_qm: int,
+  stride_kb: int,
+  stride_kh: int,
+  stride_kn: int,
+  stride_vb: int,
+  stride_vh: int,
+  stride_vn: int,
+  stride_dob: int,
+  stride_doh: int,
+  stride_dom: int,
+  stride_dqb: int,
+  stride_dqh: int,
+  stride_dqm: int,
+  stride_bb: int,
+  stride_bh: int,
+  stride_bm: int,
+  stride_bn: int,
+  nheads: int,
+  seqlen_q: int,
+  seqlen_k: int,
+  autotune_seqlen_q_bucket: int,
+  autotune_seqlen_k_bucket: int,
+  autotune_causal_key: int,
+  autotune_dtype_key: int,
+  seqlen_q_rounded: int,
+  headdim: int,
+  dropout_p: float,
+  philox_offset: int,
+  IS_CAUSAL: tl.constexpr,
+  HAS_ATTN_BIAS: tl.constexpr,
+  HAS_DROPOUT: tl.constexpr,
+  PHILOX_SEED: tl.constexpr,
+  BLOCK_HEADDIM: tl.constexpr,
+  DTYPE: tl.constexpr,
+  EVEN_N: tl.constexpr,
+  BLOCK_M: tl.constexpr,
+  BLOCK_N: tl.constexpr,
+) -> None:
+  _ = autotune_seqlen_q_bucket
+  _ = autotune_seqlen_k_bucket
+  _ = autotune_causal_key
+  _ = autotune_dtype_key
+  _ffpa_bwd_dq(
+    Q, K, V, DO, DQ, LSE, D, AttnBias, softmax_scale, stride_qb, stride_qh, stride_qm, stride_kb, stride_kh, stride_kn,
+    stride_vb, stride_vh, stride_vn, stride_dob, stride_doh, stride_dom, stride_dqb, stride_dqh, stride_dqm, stride_bb,
+    stride_bh, stride_bm, stride_bn, nheads, seqlen_q, seqlen_k, seqlen_q_rounded, headdim, dropout_p, philox_offset,
+    IS_CAUSAL, HAS_ATTN_BIAS, HAS_DROPOUT, PHILOX_SEED, BLOCK_HEADDIM, DTYPE, EVEN_N, BLOCK_M, BLOCK_N
+  )
+
+
+_ffpa_bwd_dkdv_kernel = _ffpa_bwd_dkdv_kernel_impl
+_ffpa_bwd_dq_kernel = _ffpa_bwd_dq_kernel_impl
+
+
+def _default_bwd_dkdv_config() -> dict[str, object]:
+  return {
+    "BLOCK_M": 128,
+    "BLOCK_N": 64,
+    "BLOCK_HEADDIM": 64,
+    "num_warps": 8,
+    "num_stages": 2,
+  }
+
+
+def _default_bwd_dq_config() -> dict[str, object]:
+  return {
+    "BLOCK_M": 128,
+    "BLOCK_N": 64,
+    "BLOCK_HEADDIM": 64,
+    "num_warps": 8,
+    "num_stages": 2,
+  }
+
+
 # (headdim, mode, bias_grad) -> callable
 _ffpa_bwd_autotune_cache: dict[tuple[int, str, bool], callable] = {}
+_ffpa_bwd_dkdv_autotune_cache: dict[tuple[int, str, bool], callable] = {}
+_ffpa_bwd_dq_autotune_cache: dict[tuple[int, str], callable] = {}
 
 
 def _get_bwd_autotune(headdim: int, autotune_mode: str, bias_requires_grad: bool):
@@ -908,6 +1084,47 @@ def _get_bwd_autotune(headdim: int, autotune_mode: str, bias_requires_grad: bool
       cache_results=True,
     )(_ffpa_bwd_kernel_impl)
   return _ffpa_bwd_autotune_cache[cache_key]
+
+
+def _get_bwd_dkdv_autotune(headdim: int, autotune_mode: str, bias_requires_grad: bool):
+  """Return an autotune wrapper for the generic split dK/dV kernel."""
+  cache_key = (headdim, autotune_mode, bias_requires_grad)
+  if cache_key not in _ffpa_bwd_dkdv_autotune_cache:
+    reset_args = ["DK", "DV"]
+    if bias_requires_grad:
+      reset_args.append("GradAttnBias")
+    _ffpa_bwd_dkdv_autotune_cache[cache_key] = triton.autotune(
+      configs=_gen_bwd_autotune_configs(autotune_mode=autotune_mode),
+      key=[
+        "autotune_seqlen_q_bucket",
+        "autotune_seqlen_k_bucket",
+        "headdim",
+        "autotune_causal_key",
+        "autotune_dtype_key",
+      ],
+      reset_to_zero=reset_args,
+      cache_results=True,
+    )(_ffpa_bwd_dkdv_kernel_impl)
+  return _ffpa_bwd_dkdv_autotune_cache[cache_key]
+
+
+def _get_bwd_dq_autotune(headdim: int, autotune_mode: str):
+  """Return an autotune wrapper for the generic split dQ kernel."""
+  cache_key = (headdim, autotune_mode)
+  if cache_key not in _ffpa_bwd_dq_autotune_cache:
+    _ffpa_bwd_dq_autotune_cache[cache_key] = triton.autotune(
+      configs=_gen_bwd_autotune_configs(autotune_mode=autotune_mode),
+      key=[
+        "autotune_seqlen_q_bucket",
+        "autotune_seqlen_k_bucket",
+        "headdim",
+        "autotune_causal_key",
+        "autotune_dtype_key",
+      ],
+      reset_to_zero=["DQ"],
+      cache_results=True,
+    )(_ffpa_bwd_dq_kernel_impl)
+  return _ffpa_bwd_dq_autotune_cache[cache_key]
 
 
 def _gen_decode_bwd_stage1_autotune_configs(
@@ -1466,9 +1683,6 @@ def _ffpa_attn_backward_triton_impl(
       )
       return
 
-  if split_launch:
-    raise NotImplementedError("SM90 backward split launch requires a supported SM90+ TMA path")
-
   seqlen_q_rounded = lse.shape[-1]
   autotune_seqlen_q_bucket = autotune_seqlen_key(seqlen_q, autotune_mode)
   autotune_seqlen_k_bucket = autotune_seqlen_key(seqlen_k, autotune_mode)
@@ -1502,7 +1716,7 @@ def _ffpa_attn_backward_triton_impl(
   else:
     grad_kv_storage_dtype = None
   persisted_main_config = None
-  if not autotune and seqlen_q >= 8:
+  if not autotune and seqlen_q >= 8 and not split_launch:
     persisted_main_config = lookup_persistent_config(
       PersistentConfigRequest(
         direction="backward",
@@ -1524,7 +1738,9 @@ def _ffpa_attn_backward_triton_impl(
     )
   partial_grad_bias = None
   if use_key_bias_grad_reduction:
-    min_block_m_for_bias = 64 if autotune else int((persisted_main_config or {"BLOCK_M": 128})["BLOCK_M"])
+    min_block_m_for_bias = 64 if autotune or split_launch else int((persisted_main_config or {
+      "BLOCK_M": 128
+    })["BLOCK_M"])
     num_m_blocks_for_bias = triton.cdiv(seqlen_q, min_block_m_for_bias)
     # Main-path autotune can switch between BLOCK_M=64 and BLOCK_M=128. Size the
     # partial key-bias buffer for the smallest candidate so BLOCK_M=64 has room
@@ -1790,7 +2006,168 @@ def _ffpa_attn_backward_triton_impl(
       batch * nheads,
     )
 
-  if autotune:
+  if split_launch:
+    dkdv_args = (
+      q,
+      k,
+      v,
+      do,
+      dk,
+      dv,
+      lse,
+      delta,
+      attn_bias_in,
+      grad_attn_bias_in,
+      softmax_scale,
+      q.stride(0),
+      q.stride(1),
+      q.stride(2),
+      k.stride(0),
+      k.stride(1),
+      k.stride(2),
+      v.stride(0),
+      v.stride(1),
+      v.stride(2),
+      do.stride(0),
+      do.stride(1),
+      do.stride(2),
+      dk.stride(0),
+      dk.stride(1),
+      dk.stride(2),
+      dv.stride(0),
+      dv.stride(1),
+      dv.stride(2),
+      bias_strides[0],
+      bias_strides[1],
+      bias_strides[2],
+      bias_strides[3],
+      grad_bias_strides[0],
+      grad_bias_strides[1],
+      grad_bias_strides[2],
+      grad_bias_strides[3],
+      nheads,
+      seqlen_q,
+      seqlen_k,
+      autotune_seqlen_q_bucket,
+      autotune_seqlen_k_bucket,
+      autotune_causal_key,
+      autotune_dtype_key,
+      seqlen_q_rounded,
+      headdim,
+      dropout_p,
+      philox_offset,
+    )
+    dkdv_meta = dict(
+      IS_CAUSAL=causal,
+      HAS_ATTN_BIAS=has_attn_bias,
+      HAS_DROPOUT=has_dropout,
+      PHILOX_SEED=philox_seed,
+      BIAS_REQUIRES_GRAD=main_bias_requires_grad,
+      GRAD_BIAS_NEEDS_REDUCTION=grad_bias_needs_reduction,
+      GRAD_BIAS_REDUCES_M=grad_bias_reduces_m,
+      GRAD_BIAS_STORE_PARTIAL=grad_bias_store_partial,
+      DTYPE=DTYPE,
+    )
+    dq_args = (
+      q,
+      k,
+      v,
+      do,
+      dq,
+      lse,
+      delta,
+      attn_bias_in,
+      softmax_scale,
+      q.stride(0),
+      q.stride(1),
+      q.stride(2),
+      k.stride(0),
+      k.stride(1),
+      k.stride(2),
+      v.stride(0),
+      v.stride(1),
+      v.stride(2),
+      do.stride(0),
+      do.stride(1),
+      do.stride(2),
+      dq.stride(0),
+      dq.stride(1),
+      dq.stride(2),
+      bias_strides[0],
+      bias_strides[1],
+      bias_strides[2],
+      bias_strides[3],
+      nheads,
+      seqlen_q,
+      seqlen_k,
+      autotune_seqlen_q_bucket,
+      autotune_seqlen_k_bucket,
+      autotune_causal_key,
+      autotune_dtype_key,
+      seqlen_q_rounded,
+      headdim,
+      dropout_p,
+      philox_offset,
+    )
+    dq_meta = dict(
+      IS_CAUSAL=causal,
+      HAS_ATTN_BIAS=has_attn_bias,
+      HAS_DROPOUT=has_dropout,
+      PHILOX_SEED=philox_seed,
+      DTYPE=DTYPE,
+    )
+
+    def dkdv_grid(meta: dict) -> tuple[int, ...]:
+      return (triton.cdiv(seqlen_k, meta["BLOCK_N"]), 1, batch * nheads)
+
+    def dq_grid(meta: dict) -> tuple[int, ...]:
+      return (triton.cdiv(seqlen_q, meta["BLOCK_M"]), 1, batch * nheads)
+
+    if autotune:
+      _get_bwd_dkdv_autotune(headdim, autotune_mode, main_bias_requires_grad)[dkdv_grid](*dkdv_args, **dkdv_meta)
+      _get_bwd_dq_autotune(headdim, autotune_mode)[dq_grid](*dq_args, **dq_meta)
+    else:
+      dkdv_config = lookup_persistent_config(
+        PersistentConfigRequest(
+          direction="backward",
+          kernel="bwd_generic_dkdv",
+          autotune_mode=autotune_mode,
+          dtype=runtime_dtype,
+          headdim=headdim,
+          seqlen_q=seqlen_q,
+          seqlen_k=seqlen_k,
+          causal=causal,
+          bias_grad=main_bias_requires_grad,
+          grad_kv_storage_dtype=grad_kv_storage_dtype,
+          has_attn_bias=has_attn_bias,
+          has_dropout=has_dropout,
+          nheads_q=nheads,
+          nheads_kv=original_nheads_kv,
+          device_index=q.device.index,
+        )
+      ) or _default_bwd_dkdv_config()
+      dq_config = lookup_persistent_config(
+        PersistentConfigRequest(
+          direction="backward",
+          kernel="bwd_generic_dq",
+          autotune_mode=autotune_mode,
+          dtype=runtime_dtype,
+          headdim=headdim,
+          seqlen_q=seqlen_q,
+          seqlen_k=seqlen_k,
+          causal=causal,
+          bias_grad=False,
+          grad_kv_storage_dtype=grad_kv_storage_dtype,
+          has_attn_bias=has_attn_bias,
+          has_dropout=has_dropout,
+          nheads_q=nheads,
+          nheads_kv=original_nheads_kv,
+          device_index=q.device.index,
+        )
+      ) or _default_bwd_dq_config()
+      _ffpa_bwd_dkdv_kernel[dkdv_grid](*dkdv_args, **dkdv_meta, **dkdv_config)
+      _ffpa_bwd_dq_kernel[dq_grid](*dq_args, **dq_meta, **dq_config)
+  elif autotune:
     _get_bwd_autotune(headdim, autotune_mode, main_bias_requires_grad)[grid](
       q,
       k,

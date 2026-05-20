@@ -212,8 +212,8 @@ def ffpa_attn_func(
       ``triton_backward_enable_persist_dkdv`` enables an experimental SM90 TMA
       backward path that keeps dK/dV accumulators in fp32 registers across Q
       blocks and requires ``enable_backward_tma=True``.
-      ``triton_backward_enable_split_launch`` enables separate SM90 TMA
-      backward launches for dK/dV and dQ and requires ``enable_backward_tma=True``.
+      ``triton_backward_enable_split_launch`` enables separate backward
+      launches for dK/dV and dQ on either generic Triton or SM90 TMA paths.
       ``backward_backend`` supports ``"triton"`` and ``"sdpa"``.
       ``triton_backward_grad_kv_storage_dtype`` defaults to ``None`` and
       currently accepts ``torch.float16`` or ``torch.float32`` as overrides for Triton

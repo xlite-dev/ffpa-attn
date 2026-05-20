@@ -28,6 +28,8 @@ from .triton._autotune_utils import (
 )
 from .triton._ffpa_bwd import (
   _get_bwd_autotune,
+  _get_bwd_dkdv_autotune,
+  _get_bwd_dq_autotune,
   _get_decode_bwd_stage1_autotune,
   _get_pre_autotune,
 )
@@ -117,8 +119,6 @@ def _resolve_directional_cli_flags(args: argparse.Namespace) -> argparse.Namespa
   if args.enable_ws:
     args.enable_fwd_ws = True
     args.enable_bwd_ws = True
-  if args.enable_bwd_split_launch and not args.enable_bwd_tma:
-    raise SystemExit("--enable-bwd-split-launch requires --enable-bwd-tma")
   return args
 
 
@@ -685,6 +685,40 @@ def _tune_backward(
     choices_count = len(wrapper.configs)
   _record_entry(entries, entry)
   tuned_entries.append((entry, choices_count))
+
+  if task.seqlen_q >= 8 and enable_split_launch:
+    run_backward_tune(False, False, run_enable_split_launch=True)
+    dkdv_wrapper = _get_bwd_dkdv_autotune(task.headdim, mode, task.has_attn_bias)
+    dkdv_entry = _entry_base(
+      task,
+      mode,
+      "bwd_generic_dkdv",
+      config_from_triton_config(dkdv_wrapper.best_config),
+      enable_tma=False,
+      enable_ws=False,
+    )
+    dkdv_entry.update({
+      "bias_grad": task.has_attn_bias,
+      "grad_kv_storage_dtype": None,
+    })
+    _record_entry(entries, dkdv_entry)
+    tuned_entries.append((dkdv_entry, len(dkdv_wrapper.configs)))
+
+    dq_wrapper = _get_bwd_dq_autotune(task.headdim, mode)
+    dq_entry = _entry_base(
+      task,
+      mode,
+      "bwd_generic_dq",
+      config_from_triton_config(dq_wrapper.best_config),
+      enable_tma=False,
+      enable_ws=False,
+    )
+    dq_entry.update({
+      "bias_grad": False,
+      "grad_kv_storage_dtype": None,
+    })
+    _record_entry(entries, dq_entry)
+    tuned_entries.append((dq_entry, len(dq_wrapper.configs)))
 
   if task.seqlen_q >= 8 and use_sm90_tma:
     run_backward_tune(True, use_sm90_ws)
