@@ -101,6 +101,7 @@ def _ffpa_bwd_dkdv_sm90_q_block(
   BLOCK_M: tl.constexpr,
   BLOCK_N: tl.constexpr,
   num_d_chunks: tl.constexpr,
+  warp_specialize: tl.constexpr,
 ) -> None:
   offs_qm = start_m + offs_m
   q_offset_y = q_base_y + start_m
@@ -108,14 +109,31 @@ def _ffpa_bwd_dkdv_sm90_q_block(
   S = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
   dP = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
 
-  for d_chunk in range(num_d_chunks):
-    d_start = d_chunk * BLOCK_HEADDIM
-    q = desc_q.load([q_offset_y, d_start])
-    k = desc_k.load([k_offset_y, d_start])
-    v = desc_v.load([k_offset_y, d_start])
-    do = desc_do.load([q_offset_y, d_start])
-    S = tl.dot(q, tl.trans(k), acc=S)
-    dP = tl.dot(do, tl.trans(v), acc=dP)
+  if warp_specialize:
+    for d_chunk in tl.range(
+      0,
+      num_d_chunks,
+      1,
+      disallow_acc_multi_buffer=True,
+      flatten=True,
+      warp_specialize=True,
+    ):
+      d_start = d_chunk * BLOCK_HEADDIM
+      q = desc_q.load([q_offset_y, d_start])
+      k = desc_k.load([k_offset_y, d_start])
+      v = desc_v.load([k_offset_y, d_start])
+      do = desc_do.load([q_offset_y, d_start])
+      S = tl.dot(q, tl.trans(k), acc=S)
+      dP = tl.dot(do, tl.trans(v), acc=dP)
+  else:
+    for d_chunk in range(num_d_chunks):
+      d_start = d_chunk * BLOCK_HEADDIM
+      q = desc_q.load([q_offset_y, d_start])
+      k = desc_k.load([k_offset_y, d_start])
+      v = desc_v.load([k_offset_y, d_start])
+      do = desc_do.load([q_offset_y, d_start])
+      S = tl.dot(q, tl.trans(k), acc=S)
+      dP = tl.dot(do, tl.trans(v), acc=dP)
 
   if not EVEN_N:
     S = tl.where(offs_n[None, :] < seqlen_k, S, float("-inf"))
@@ -290,20 +308,13 @@ def _ffpa_bwd_dkdv_sm90(
     k_offset_y = kv_base_y + start_n
 
     if warp_specialize:
-      for start_m in tl.range(
-        begin_m,
-        num_block_m * BLOCK_M,
-        BLOCK_M,
-        disallow_acc_multi_buffer=True,
-        flatten=True,
-        warp_specialize=True,
-      ):
+      for start_m in range(begin_m, num_block_m * BLOCK_M, BLOCK_M):
         _ffpa_bwd_dkdv_sm90_q_block(
           desc_q, desc_k, desc_v, desc_do, DK, DV, LSE, D, AttnBias, GradAttnBias, softmax_scale, stride_dkn,
           stride_dvn, stride_bm, stride_bn, stride_gbm, stride_gbn, q_base_y, k_offset_y, start_m, begin_m, off_hb,
           offs_m, offs_n, offs_d, seqlen_q, seqlen_k, headdim, dropout_p, philox_offset, IS_CAUSAL, HAS_ATTN_BIAS,
           HAS_DROPOUT, PHILOX_SEED, BIAS_REQUIRES_GRAD, GRAD_BIAS_NEEDS_REDUCTION, GRAD_BIAS_REDUCES_M,
-          GRAD_BIAS_STORE_PARTIAL, BLOCK_HEADDIM, DTYPE, EVEN_M, EVEN_N, BLOCK_M, BLOCK_N, num_d_chunks
+          GRAD_BIAS_STORE_PARTIAL, BLOCK_HEADDIM, DTYPE, EVEN_M, EVEN_N, BLOCK_M, BLOCK_N, num_d_chunks, True
         )
     else:
       for start_m in range(begin_m, num_block_m * BLOCK_M, BLOCK_M):
@@ -312,7 +323,7 @@ def _ffpa_bwd_dkdv_sm90(
           stride_dvn, stride_bm, stride_bn, stride_gbm, stride_gbn, q_base_y, k_offset_y, start_m, begin_m, off_hb,
           offs_m, offs_n, offs_d, seqlen_q, seqlen_k, headdim, dropout_p, philox_offset, IS_CAUSAL, HAS_ATTN_BIAS,
           HAS_DROPOUT, PHILOX_SEED, BIAS_REQUIRES_GRAD, GRAD_BIAS_NEEDS_REDUCTION, GRAD_BIAS_REDUCES_M,
-          GRAD_BIAS_STORE_PARTIAL, BLOCK_HEADDIM, DTYPE, EVEN_M, EVEN_N, BLOCK_M, BLOCK_N, num_d_chunks
+          GRAD_BIAS_STORE_PARTIAL, BLOCK_HEADDIM, DTYPE, EVEN_M, EVEN_N, BLOCK_M, BLOCK_N, num_d_chunks, False
         )
 
 
@@ -360,6 +371,7 @@ def _ffpa_bwd_dkdv_persist_sm90_q_block(
   BLOCK_M: tl.constexpr,
   BLOCK_N: tl.constexpr,
   num_d_chunks: tl.constexpr,
+  warp_specialize: tl.constexpr,
 ):
   offs_qm = start_m + offs_m
   q_offset_y = q_base_y + start_m
@@ -367,14 +379,31 @@ def _ffpa_bwd_dkdv_persist_sm90_q_block(
   S = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
   dP = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
 
-  for in_d_chunk in range(num_d_chunks):
-    d_start = in_d_chunk * BLOCK_HEADDIM
-    q = desc_q.load([q_offset_y, d_start])
-    k = desc_k.load([k_offset_y, d_start])
-    v = desc_v.load([k_offset_y, d_start])
-    do = desc_do.load([q_offset_y, d_start])
-    S = tl.dot(q, tl.trans(k), acc=S)
-    dP = tl.dot(do, tl.trans(v), acc=dP)
+  if warp_specialize:
+    for in_d_chunk in tl.range(
+      0,
+      num_d_chunks,
+      1,
+      disallow_acc_multi_buffer=True,
+      flatten=True,
+      warp_specialize=True,
+    ):
+      d_start = in_d_chunk * BLOCK_HEADDIM
+      q = desc_q.load([q_offset_y, d_start])
+      k = desc_k.load([k_offset_y, d_start])
+      v = desc_v.load([k_offset_y, d_start])
+      do = desc_do.load([q_offset_y, d_start])
+      S = tl.dot(q, tl.trans(k), acc=S)
+      dP = tl.dot(do, tl.trans(v), acc=dP)
+  else:
+    for in_d_chunk in range(num_d_chunks):
+      d_start = in_d_chunk * BLOCK_HEADDIM
+      q = desc_q.load([q_offset_y, d_start])
+      k = desc_k.load([k_offset_y, d_start])
+      v = desc_v.load([k_offset_y, d_start])
+      do = desc_do.load([q_offset_y, d_start])
+      S = tl.dot(q, tl.trans(k), acc=S)
+      dP = tl.dot(do, tl.trans(v), acc=dP)
 
   if not EVEN_N:
     S = tl.where(offs_n[None, :] < seqlen_k, S, float("-inf"))
@@ -538,20 +567,13 @@ def _ffpa_bwd_dkdv_persist_sm90(
       dv_acc = tl.zeros([BLOCK_N, BLOCK_HEADDIM], dtype=tl.float32)
 
       if warp_specialize:
-        for start_m in tl.range(
-          begin_m,
-          num_block_m * BLOCK_M,
-          BLOCK_M,
-          disallow_acc_multi_buffer=True,
-          flatten=True,
-          warp_specialize=True,
-        ):
+        for start_m in range(begin_m, num_block_m * BLOCK_M, BLOCK_M):
           dk_acc, dv_acc = _ffpa_bwd_dkdv_persist_sm90_q_block(
             desc_q, desc_k, desc_v, desc_do, LSE, D, AttnBias, GradAttnBias, softmax_scale, stride_bm, stride_bn,
             stride_gbm, stride_gbn, q_base_y, k_offset_y, start_m, off_hb, offs_m, offs_n, seqlen_q, seqlen_k,
             dropout_p, philox_offset, dk_acc, dv_acc, d_start_out, out_d_chunk, IS_CAUSAL, HAS_ATTN_BIAS, HAS_DROPOUT,
             PHILOX_SEED, BIAS_REQUIRES_GRAD, GRAD_BIAS_NEEDS_REDUCTION, GRAD_BIAS_REDUCES_M, GRAD_BIAS_STORE_PARTIAL,
-            BLOCK_HEADDIM, DTYPE, EVEN_M, EVEN_N, BLOCK_M, BLOCK_N, num_d_chunks
+            BLOCK_HEADDIM, DTYPE, EVEN_M, EVEN_N, BLOCK_M, BLOCK_N, num_d_chunks, True
           )
       else:
         for start_m in range(begin_m, num_block_m * BLOCK_M, BLOCK_M):
@@ -560,7 +582,7 @@ def _ffpa_bwd_dkdv_persist_sm90(
             stride_gbm, stride_gbn, q_base_y, k_offset_y, start_m, off_hb, offs_m, offs_n, seqlen_q, seqlen_k,
             dropout_p, philox_offset, dk_acc, dv_acc, d_start_out, out_d_chunk, IS_CAUSAL, HAS_ATTN_BIAS, HAS_DROPOUT,
             PHILOX_SEED, BIAS_REQUIRES_GRAD, GRAD_BIAS_NEEDS_REDUCTION, GRAD_BIAS_REDUCES_M, GRAD_BIAS_STORE_PARTIAL,
-            BLOCK_HEADDIM, DTYPE, EVEN_M, EVEN_N, BLOCK_M, BLOCK_N, num_d_chunks
+            BLOCK_HEADDIM, DTYPE, EVEN_M, EVEN_N, BLOCK_M, BLOCK_N, num_d_chunks, False
           )
 
       grad_mask = (offs_n[:, None] < seqlen_k) & (d_offs[None, :] < headdim)
@@ -606,6 +628,7 @@ def _ffpa_bwd_dq_sm90_k_block(
   BLOCK_M: tl.constexpr,
   BLOCK_N: tl.constexpr,
   num_d_chunks: tl.constexpr,
+  warp_specialize: tl.constexpr,
 ) -> None:
   offs_nk = start_n_k + offs_n
   k_offset_y = kv_base_y + start_n_k
@@ -613,14 +636,31 @@ def _ffpa_bwd_dq_sm90_k_block(
   S_qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
   dP_qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
 
-  for d_chunk in range(num_d_chunks):
-    d_start = d_chunk * BLOCK_HEADDIM
-    q = desc_q.load([q_offset_y, d_start])
-    k = desc_k.load([k_offset_y, d_start])
-    v = desc_v.load([k_offset_y, d_start])
-    do = desc_do.load([q_offset_y, d_start])
-    S_qk = tl.dot(q, tl.trans(k), acc=S_qk)
-    dP_qk = tl.dot(do, tl.trans(v), acc=dP_qk)
+  if warp_specialize:
+    for d_chunk in tl.range(
+      0,
+      num_d_chunks,
+      1,
+      disallow_acc_multi_buffer=True,
+      flatten=True,
+      warp_specialize=True,
+    ):
+      d_start = d_chunk * BLOCK_HEADDIM
+      q = desc_q.load([q_offset_y, d_start])
+      k = desc_k.load([k_offset_y, d_start])
+      v = desc_v.load([k_offset_y, d_start])
+      do = desc_do.load([q_offset_y, d_start])
+      S_qk = tl.dot(q, tl.trans(k), acc=S_qk)
+      dP_qk = tl.dot(do, tl.trans(v), acc=dP_qk)
+  else:
+    for d_chunk in range(num_d_chunks):
+      d_start = d_chunk * BLOCK_HEADDIM
+      q = desc_q.load([q_offset_y, d_start])
+      k = desc_k.load([k_offset_y, d_start])
+      v = desc_v.load([k_offset_y, d_start])
+      do = desc_do.load([q_offset_y, d_start])
+      S_qk = tl.dot(q, tl.trans(k), acc=S_qk)
+      dP_qk = tl.dot(do, tl.trans(v), acc=dP_qk)
 
   if not EVEN_N:
     S_qk = tl.where(offs_nk[None, :] < seqlen_k, S_qk, float("-inf"))
@@ -732,19 +772,12 @@ def _ffpa_bwd_dq_sm90(
     end_n_k = start_m + BLOCK_M if IS_CAUSAL else num_block_n * BLOCK_N
 
     if warp_specialize:
-      for start_n_k in tl.range(
-        0,
-        end_n_k,
-        BLOCK_N,
-        disallow_acc_multi_buffer=True,
-        flatten=True,
-        warp_specialize=True,
-      ):
+      for start_n_k in range(0, end_n_k, BLOCK_N):
         _ffpa_bwd_dq_sm90_k_block(
           desc_q, desc_k, desc_v, desc_do, DQ, LSE, D, AttnBias, softmax_scale, stride_dqm, stride_bm, stride_bn,
           q_offset_y, kv_base_y, start_n_k, off_hb, offs_m, offs_n, offs_d, seqlen_q, seqlen_k, headdim, dropout_p,
           philox_offset, IS_CAUSAL, HAS_ATTN_BIAS, HAS_DROPOUT, PHILOX_SEED, BLOCK_HEADDIM, DTYPE, EVEN_N, BLOCK_M,
-          BLOCK_N, num_d_chunks
+          BLOCK_N, num_d_chunks, True
         )
     else:
       for start_n_k in range(0, end_n_k, BLOCK_N):
@@ -752,7 +785,7 @@ def _ffpa_bwd_dq_sm90(
           desc_q, desc_k, desc_v, desc_do, DQ, LSE, D, AttnBias, softmax_scale, stride_dqm, stride_bm, stride_bn,
           q_offset_y, kv_base_y, start_n_k, off_hb, offs_m, offs_n, offs_d, seqlen_q, seqlen_k, headdim, dropout_p,
           philox_offset, IS_CAUSAL, HAS_ATTN_BIAS, HAS_DROPOUT, PHILOX_SEED, BLOCK_HEADDIM, DTYPE, EVEN_N, BLOCK_M,
-          BLOCK_N, num_d_chunks
+          BLOCK_N, num_d_chunks, False
         )
 
 
@@ -1054,18 +1087,18 @@ _SM90_BWD_PERSIST_DKDV_DEFAULT_CONFIG = {
 }
 
 _SM90_BWD_SPLIT_DKDV_DEFAULT_CONFIG = {
-  "BLOCK_M": 64,
+  "BLOCK_M": 128,
   "BLOCK_N": 64,
   "BLOCK_HEADDIM": 64,
   "warp_specialize": False,
-  "num_warps": 8,
+  "num_warps": 4,
   "num_stages": 2,
 }
 
 _SM90_BWD_SPLIT_PERSIST_DKDV_DEFAULT_CONFIG = {
-  "BLOCK_M": 64,
-  "BLOCK_N": 128,
-  "BLOCK_HEADDIM": 64,
+  "BLOCK_M": 128,
+  "BLOCK_N": 64,
+  "BLOCK_HEADDIM": 128,
   "warp_specialize": False,
   "num_warps": 4,
   "num_stages": 2,
