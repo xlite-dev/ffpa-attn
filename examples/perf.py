@@ -383,7 +383,7 @@ def _display_device_name(device_name: str) -> str:
 
 def _require_sm90() -> None:
   """Fail fast on non-Hopper devices when the cutedsl backend is selected."""
-  from ffpa_attn.cutedsl._wrappers import cutedsl_forward_available
+  from ffpa_attn.cutedsl import cutedsl_forward_available
 
   if not torch.cuda.is_available():
     raise SystemExit("CUDA is required: the CuTeDSL backend only runs on SM90 (Hopper) GPUs.")
