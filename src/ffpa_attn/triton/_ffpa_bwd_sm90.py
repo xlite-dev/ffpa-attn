@@ -316,6 +316,135 @@ def _ffpa_bwd_dkdv_sm90(
 
 
 @triton.jit
+def _ffpa_bwd_dkdv_persist_sm90_q_block(
+  desc_q: tl.tensor_descriptor,
+  desc_k: tl.tensor_descriptor,
+  desc_v: tl.tensor_descriptor,
+  desc_do: tl.tensor_descriptor,
+  LSE: torch.Tensor,
+  D: torch.Tensor,
+  AttnBias: torch.Tensor,
+  GradAttnBias: torch.Tensor,
+  softmax_scale: float,
+  stride_bm: int,
+  stride_bn: int,
+  stride_gbm: int,
+  stride_gbn: int,
+  q_base_y: int,
+  k_offset_y: int,
+  start_m: int,
+  off_hb: int,
+  offs_m: torch.Tensor,
+  offs_n: torch.Tensor,
+  seqlen_q: int,
+  seqlen_k: int,
+  dropout_p: float,
+  philox_offset: int,
+  dk_acc: torch.Tensor,
+  dv_acc: torch.Tensor,
+  d_start_out: tl.constexpr,
+  out_d_chunk: tl.constexpr,
+  IS_CAUSAL: tl.constexpr,
+  HAS_ATTN_BIAS: tl.constexpr,
+  HAS_DROPOUT: tl.constexpr,
+  PHILOX_SEED: tl.constexpr,
+  BIAS_REQUIRES_GRAD: tl.constexpr,
+  GRAD_BIAS_NEEDS_REDUCTION: tl.constexpr,
+  GRAD_BIAS_REDUCES_M: tl.constexpr,
+  GRAD_BIAS_STORE_PARTIAL: tl.constexpr,
+  BLOCK_HEADDIM: tl.constexpr,
+  DTYPE: tl.constexpr,
+  EVEN_M: tl.constexpr,
+  EVEN_N: tl.constexpr,
+  BLOCK_M: tl.constexpr,
+  BLOCK_N: tl.constexpr,
+  num_d_chunks: tl.constexpr,
+):
+  offs_qm = start_m + offs_m
+  q_offset_y = q_base_y + start_m
+
+  S = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+  dP = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+
+  for in_d_chunk in range(num_d_chunks):
+    d_start = in_d_chunk * BLOCK_HEADDIM
+    q = desc_q.load([q_offset_y, d_start])
+    k = desc_k.load([k_offset_y, d_start])
+    v = desc_v.load([k_offset_y, d_start])
+    do = desc_do.load([q_offset_y, d_start])
+    S = tl.dot(q, tl.trans(k), acc=S)
+    dP = tl.dot(do, tl.trans(v), acc=dP)
+
+  if not EVEN_N:
+    S = tl.where(offs_n[None, :] < seqlen_k, S, float("-inf"))
+  if not EVEN_M:
+    m_mask = offs_qm < seqlen_q
+    S = tl.where(m_mask[:, None], S, float("-inf"))
+  if IS_CAUSAL:
+    S = tl.where(offs_qm[:, None] >= (offs_n[None, :]), S, float("-inf"))
+  S = S * softmax_scale
+  if HAS_ATTN_BIAS:
+    bias = tl.load(
+      AttnBias + offs_qm[:, None] * stride_bm + offs_n[None, :] * stride_bn,
+      mask=(offs_qm[:, None] < seqlen_q) & (offs_n[None, :] < seqlen_k),
+      other=0.0,
+    )
+    S += bias
+  if EVEN_M:
+    lse_i = tl.load(LSE + offs_qm)
+  else:
+    lse_i = tl.load(LSE + offs_qm, mask=offs_qm < seqlen_q, other=0.0)
+  P = tl.exp(S - lse_i[:, None])
+  dropout_mult = _dropout_multiplier(
+    off_hb,
+    offs_qm,
+    offs_n,
+    seqlen_q,
+    seqlen_k,
+    dropout_p,
+    PHILOX_SEED,
+    philox_offset,
+    HAS_DROPOUT,
+  )
+  dP = dP * dropout_mult
+  P_drop = P * dropout_mult
+  if EVEN_M:
+    Di = tl.load(D + offs_qm)
+  else:
+    Di = tl.load(D + offs_qm, mask=offs_qm < seqlen_q, other=0.0)
+  if BIAS_REQUIRES_GRAD:
+    dBias = P * (dP - Di[:, None])
+    grad_bias_mask = (offs_qm[:, None] < seqlen_q) & (offs_n[None, :] < seqlen_k)
+    if out_d_chunk == 0:
+      if GRAD_BIAS_REDUCES_M:
+        m_block = start_m // BLOCK_M
+        grad_bias_ptrs = GradAttnBias + m_block * stride_gbm + offs_n * stride_gbn
+        grad_bias = tl.sum(tl.where(grad_bias_mask, dBias, 0.0), axis=0)
+        if GRAD_BIAS_STORE_PARTIAL:
+          tl.store(grad_bias_ptrs, grad_bias, mask=offs_n < seqlen_k)
+        else:
+          tl.atomic_add(grad_bias_ptrs, grad_bias, sem="relaxed", mask=offs_n < seqlen_k)
+      elif GRAD_BIAS_NEEDS_REDUCTION:
+        grad_bias_ptrs = GradAttnBias + offs_qm[:, None] * stride_gbm + offs_n[None, :] * stride_gbn
+        tl.atomic_add(grad_bias_ptrs, dBias, sem="relaxed", mask=grad_bias_mask)
+      else:
+        grad_bias_ptrs = GradAttnBias + offs_qm[:, None] * stride_gbm + offs_n[None, :] * stride_gbn
+        tl.store(grad_bias_ptrs, dBias, mask=grad_bias_mask)
+    dS = (dBias * softmax_scale).to(DTYPE)
+  else:
+    dS = (P * (dP - Di[:, None]) * softmax_scale).to(DTYPE)
+  if not EVEN_M:
+    dS = tl.where(m_mask[:, None], dS, 0.0)
+    P_drop = tl.where(m_mask[:, None], P_drop, 0.0)
+
+  q = desc_q.load([q_offset_y, d_start_out])
+  do = desc_do.load([q_offset_y, d_start_out])
+  dk_acc += tl.trans(tl.dot(tl.trans(q), dS, out_dtype=tl.float32))
+  dv_acc += tl.trans(tl.dot(tl.trans(do), P_drop.to(DTYPE), out_dtype=tl.float32))
+  return dk_acc, dv_acc
+
+
+@triton.jit
 def _ffpa_bwd_dkdv_persist_sm90(
   desc_q: tl.tensor_descriptor,
   desc_k: tl.tensor_descriptor,
@@ -406,101 +535,133 @@ def _ffpa_bwd_dkdv_persist_sm90(
       dk_acc = tl.zeros([BLOCK_N, BLOCK_HEADDIM], dtype=tl.float32)
       dv_acc = tl.zeros([BLOCK_N, BLOCK_HEADDIM], dtype=tl.float32)
 
-      for start_m in tl.range(
-        begin_m,
-        num_block_m * BLOCK_M,
-        BLOCK_M,
-        disallow_acc_multi_buffer=warp_specialize,
-        flatten=warp_specialize,
-        warp_specialize=warp_specialize,
-      ):
-        offs_qm = start_m + offs_m
-        q_offset_y = q_base_y + start_m
-
-        S = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
-        dP = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
-
-        for in_d_chunk in range(num_d_chunks):
-          d_start = in_d_chunk * BLOCK_HEADDIM
-          q = desc_q.load([q_offset_y, d_start])
-          k = desc_k.load([k_offset_y, d_start])
-          v = desc_v.load([k_offset_y, d_start])
-          do = desc_do.load([q_offset_y, d_start])
-          S = tl.dot(q, tl.trans(k), acc=S)
-          dP = tl.dot(do, tl.trans(v), acc=dP)
-
-        if not EVEN_N:
-          S = tl.where(offs_n[None, :] < seqlen_k, S, float("-inf"))
-        if not EVEN_M:
-          m_mask = offs_qm < seqlen_q
-          S = tl.where(m_mask[:, None], S, float("-inf"))
-        if IS_CAUSAL:
-          S = tl.where(offs_qm[:, None] >= (offs_n[None, :]), S, float("-inf"))
-        S = S * softmax_scale
-        if HAS_ATTN_BIAS:
-          bias = tl.load(
-            AttnBias + offs_qm[:, None] * stride_bm + offs_n[None, :] * stride_bn,
-            mask=(offs_qm[:, None] < seqlen_q) & (offs_n[None, :] < seqlen_k),
-            other=0.0,
+      if warp_specialize:
+        for start_m in tl.range(
+          begin_m,
+          num_block_m * BLOCK_M,
+          BLOCK_M,
+          disallow_acc_multi_buffer=True,
+          flatten=True,
+          warp_specialize=True,
+        ):
+          dk_acc, dv_acc = _ffpa_bwd_dkdv_persist_sm90_q_block(
+            desc_q, desc_k, desc_v, desc_do, LSE, D, AttnBias, GradAttnBias, softmax_scale, stride_bm, stride_bn,
+            stride_gbm, stride_gbn, q_base_y, k_offset_y, start_m, off_hb, offs_m, offs_n, seqlen_q, seqlen_k,
+            dropout_p, philox_offset, dk_acc, dv_acc, d_start_out, out_d_chunk, IS_CAUSAL, HAS_ATTN_BIAS, HAS_DROPOUT,
+            PHILOX_SEED, BIAS_REQUIRES_GRAD, GRAD_BIAS_NEEDS_REDUCTION, GRAD_BIAS_REDUCES_M, GRAD_BIAS_STORE_PARTIAL,
+            BLOCK_HEADDIM, DTYPE, EVEN_M, EVEN_N, BLOCK_M, BLOCK_N, num_d_chunks
           )
-          S += bias
-        if EVEN_M:
-          lse_i = tl.load(LSE + offs_qm)
-        else:
-          lse_i = tl.load(LSE + offs_qm, mask=offs_qm < seqlen_q, other=0.0)
-        P = tl.exp(S - lse_i[:, None])
-        dropout_mult = _dropout_multiplier(
-          off_hb,
-          offs_qm,
-          offs_n,
-          seqlen_q,
-          seqlen_k,
-          dropout_p,
-          PHILOX_SEED,
-          philox_offset,
-          HAS_DROPOUT,
-        )
-        dP = dP * dropout_mult
-        P_drop = P * dropout_mult
-        if EVEN_M:
-          Di = tl.load(D + offs_qm)
-        else:
-          Di = tl.load(D + offs_qm, mask=offs_qm < seqlen_q, other=0.0)
-        if BIAS_REQUIRES_GRAD:
-          dBias = P * (dP - Di[:, None])
-          grad_bias_mask = (offs_qm[:, None] < seqlen_q) & (offs_n[None, :] < seqlen_k)
-          if out_d_chunk == 0:
-            if GRAD_BIAS_REDUCES_M:
-              m_block = start_m // BLOCK_M
-              grad_bias_ptrs = GradAttnBias + m_block * stride_gbm + offs_n * stride_gbn
-              grad_bias = tl.sum(tl.where(grad_bias_mask, dBias, 0.0), axis=0)
-              if GRAD_BIAS_STORE_PARTIAL:
-                tl.store(grad_bias_ptrs, grad_bias, mask=offs_n < seqlen_k)
-              else:
-                tl.atomic_add(grad_bias_ptrs, grad_bias, sem="relaxed", mask=offs_n < seqlen_k)
-            elif GRAD_BIAS_NEEDS_REDUCTION:
-              grad_bias_ptrs = GradAttnBias + offs_qm[:, None] * stride_gbm + offs_n[None, :] * stride_gbn
-              tl.atomic_add(grad_bias_ptrs, dBias, sem="relaxed", mask=grad_bias_mask)
-            else:
-              grad_bias_ptrs = GradAttnBias + offs_qm[:, None] * stride_gbm + offs_n[None, :] * stride_gbn
-              tl.store(grad_bias_ptrs, dBias, mask=grad_bias_mask)
-          dS = (dBias * softmax_scale).to(DTYPE)
-        else:
-          dS = (P * (dP - Di[:, None]) * softmax_scale).to(DTYPE)
-        if not EVEN_M:
-          dS = tl.where(m_mask[:, None], dS, 0.0)
-          P_drop = tl.where(m_mask[:, None], P_drop, 0.0)
-
-        q = desc_q.load([q_offset_y, d_start_out])
-        do = desc_do.load([q_offset_y, d_start_out])
-        dk_acc += tl.trans(tl.dot(tl.trans(q), dS, out_dtype=tl.float32))
-        dv_acc += tl.trans(tl.dot(tl.trans(do), P_drop.to(DTYPE), out_dtype=tl.float32))
+      else:
+        for start_m in range(begin_m, num_block_m * BLOCK_M, BLOCK_M):
+          dk_acc, dv_acc = _ffpa_bwd_dkdv_persist_sm90_q_block(
+            desc_q, desc_k, desc_v, desc_do, LSE, D, AttnBias, GradAttnBias, softmax_scale, stride_bm, stride_bn,
+            stride_gbm, stride_gbn, q_base_y, k_offset_y, start_m, off_hb, offs_m, offs_n, seqlen_q, seqlen_k,
+            dropout_p, philox_offset, dk_acc, dv_acc, d_start_out, out_d_chunk, IS_CAUSAL, HAS_ATTN_BIAS, HAS_DROPOUT,
+            PHILOX_SEED, BIAS_REQUIRES_GRAD, GRAD_BIAS_NEEDS_REDUCTION, GRAD_BIAS_REDUCES_M, GRAD_BIAS_STORE_PARTIAL,
+            BLOCK_HEADDIM, DTYPE, EVEN_M, EVEN_N, BLOCK_M, BLOCK_N, num_d_chunks
+          )
 
       grad_mask = (offs_n[:, None] < seqlen_k) & (d_offs[None, :] < headdim)
       dk_ptrs = DK + offs_n[:, None] * stride_dkn + d_offs[None, :]
       dv_ptrs = DV + offs_n[:, None] * stride_dvn + d_offs[None, :]
       tl.store(dk_ptrs, dk_acc, mask=grad_mask, eviction_policy="evict_last")
       tl.store(dv_ptrs, dv_acc, mask=grad_mask, eviction_policy="evict_last")
+
+
+@triton.jit
+def _ffpa_bwd_dq_sm90_k_block(
+  desc_q: tl.tensor_descriptor,
+  desc_k: tl.tensor_descriptor,
+  desc_v: tl.tensor_descriptor,
+  desc_do: tl.tensor_descriptor,
+  DQ: torch.Tensor,
+  LSE: torch.Tensor,
+  D: torch.Tensor,
+  AttnBias: torch.Tensor,
+  softmax_scale: float,
+  stride_dqm: int,
+  stride_bm: int,
+  stride_bn: int,
+  q_offset_y: int,
+  kv_base_y: int,
+  start_n_k: int,
+  off_hb: int,
+  offs_m: torch.Tensor,
+  offs_n: torch.Tensor,
+  offs_d: torch.Tensor,
+  seqlen_q: int,
+  seqlen_k: int,
+  headdim: int,
+  dropout_p: float,
+  philox_offset: int,
+  IS_CAUSAL: tl.constexpr,
+  HAS_ATTN_BIAS: tl.constexpr,
+  HAS_DROPOUT: tl.constexpr,
+  PHILOX_SEED: tl.constexpr,
+  BLOCK_HEADDIM: tl.constexpr,
+  DTYPE: tl.constexpr,
+  EVEN_N: tl.constexpr,
+  BLOCK_M: tl.constexpr,
+  BLOCK_N: tl.constexpr,
+  num_d_chunks: tl.constexpr,
+) -> None:
+  offs_nk = start_n_k + offs_n
+  k_offset_y = kv_base_y + start_n_k
+
+  S_qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+  dP_qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+
+  for d_chunk in range(num_d_chunks):
+    d_start = d_chunk * BLOCK_HEADDIM
+    q = desc_q.load([q_offset_y, d_start])
+    k = desc_k.load([k_offset_y, d_start])
+    v = desc_v.load([k_offset_y, d_start])
+    do = desc_do.load([q_offset_y, d_start])
+    S_qk = tl.dot(q, tl.trans(k), acc=S_qk)
+    dP_qk = tl.dot(do, tl.trans(v), acc=dP_qk)
+
+  if not EVEN_N:
+    S_qk = tl.where(offs_nk[None, :] < seqlen_k, S_qk, float("-inf"))
+  if IS_CAUSAL:
+    S_qk = tl.where(offs_m[:, None] >= (offs_nk[None, :]), S_qk, float("-inf"))
+  S_qk = S_qk * softmax_scale
+  if HAS_ATTN_BIAS:
+    bias = tl.load(
+      AttnBias + offs_m[:, None] * stride_bm + offs_nk[None, :] * stride_bn,
+      mask=(offs_m[:, None] < seqlen_q) & (offs_nk[None, :] < seqlen_k),
+      other=0.0,
+    )
+    S_qk += bias
+  lse_i = tl.load(LSE + offs_m)
+  P_qk = tl.exp(S_qk - lse_i[:, None])
+  dropout_mult_qk = _dropout_multiplier(
+    off_hb,
+    offs_m,
+    offs_nk,
+    seqlen_q,
+    seqlen_k,
+    dropout_p,
+    PHILOX_SEED,
+    philox_offset,
+    HAS_DROPOUT,
+  )
+  dP_qk = dP_qk * dropout_mult_qk
+  Di = tl.load(D + offs_m)
+  dS_qk = (P_qk * (dP_qk - Di[:, None]) * softmax_scale).to(DTYPE)
+
+  for d_chunk in range(num_d_chunks):
+    d_start = d_chunk * BLOCK_HEADDIM
+    d_offs = d_start + offs_d
+    k = desc_k.load([k_offset_y, d_start])
+    dq_ptrs = DQ + offs_m[:, None] * stride_dqm + d_offs[None, :]
+    dq_mask = (offs_m[:, None] < seqlen_q) & (d_offs[None, :] < headdim)
+    if start_n_k == 0:
+      dq_d = tl.dot(dS_qk, k, out_dtype=tl.float32)
+      tl.store(dq_ptrs, dq_d, mask=dq_mask, eviction_policy="evict_last")
+    else:
+      dq_val = tl.load(dq_ptrs, mask=dq_mask, other=0., eviction_policy="evict_last")
+      dq_d = tl.dot(dS_qk, k, out_dtype=tl.float32)
+      tl.store(dq_ptrs, dq_val + dq_d, mask=dq_mask, eviction_policy="evict_last")
 
 
 @triton.jit
@@ -567,70 +728,28 @@ def _ffpa_bwd_dq_sm90(
     num_block_n = tl.cdiv(seqlen_k, BLOCK_N)
     end_n_k = start_m + BLOCK_M if IS_CAUSAL else num_block_n * BLOCK_N
 
-    for start_n_k in tl.range(
-      0,
-      end_n_k,
-      BLOCK_N,
-      flatten=warp_specialize,
-      warp_specialize=warp_specialize,
-    ):
-      offs_nk = start_n_k + offs_n
-      k_offset_y = kv_base_y + start_n_k
-
-      S_qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
-      dP_qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
-
-      for d_chunk in range(num_d_chunks):
-        d_start = d_chunk * BLOCK_HEADDIM
-        q = desc_q.load([q_offset_y, d_start])
-        k = desc_k.load([k_offset_y, d_start])
-        v = desc_v.load([k_offset_y, d_start])
-        do = desc_do.load([q_offset_y, d_start])
-        S_qk = tl.dot(q, tl.trans(k), acc=S_qk)
-        dP_qk = tl.dot(do, tl.trans(v), acc=dP_qk)
-
-      if not EVEN_N:
-        S_qk = tl.where(offs_nk[None, :] < seqlen_k, S_qk, float("-inf"))
-      if IS_CAUSAL:
-        S_qk = tl.where(offs_m[:, None] >= (offs_nk[None, :]), S_qk, float("-inf"))
-      S_qk = S_qk * softmax_scale
-      if HAS_ATTN_BIAS:
-        bias = tl.load(
-          AttnBias + offs_m[:, None] * stride_bm + offs_nk[None, :] * stride_bn,
-          mask=(offs_m[:, None] < seqlen_q) & (offs_nk[None, :] < seqlen_k),
-          other=0.0,
+    if warp_specialize:
+      for start_n_k in tl.range(
+        0,
+        end_n_k,
+        BLOCK_N,
+        flatten=True,
+        warp_specialize=True,
+      ):
+        _ffpa_bwd_dq_sm90_k_block(
+          desc_q, desc_k, desc_v, desc_do, DQ, LSE, D, AttnBias, softmax_scale, stride_dqm, stride_bm, stride_bn,
+          q_offset_y, kv_base_y, start_n_k, off_hb, offs_m, offs_n, offs_d, seqlen_q, seqlen_k, headdim, dropout_p,
+          philox_offset, IS_CAUSAL, HAS_ATTN_BIAS, HAS_DROPOUT, PHILOX_SEED, BLOCK_HEADDIM, DTYPE, EVEN_N, BLOCK_M,
+          BLOCK_N, num_d_chunks
         )
-        S_qk += bias
-      lse_i = tl.load(LSE + offs_m)
-      P_qk = tl.exp(S_qk - lse_i[:, None])
-      dropout_mult_qk = _dropout_multiplier(
-        off_hb,
-        offs_m,
-        offs_nk,
-        seqlen_q,
-        seqlen_k,
-        dropout_p,
-        PHILOX_SEED,
-        philox_offset,
-        HAS_DROPOUT,
-      )
-      dP_qk = dP_qk * dropout_mult_qk
-      Di = tl.load(D + offs_m)
-      dS_qk = (P_qk * (dP_qk - Di[:, None]) * softmax_scale).to(DTYPE)
-
-      for d_chunk in range(num_d_chunks):
-        d_start = d_chunk * BLOCK_HEADDIM
-        d_offs = d_start + offs_d
-        k = desc_k.load([k_offset_y, d_start])
-        dq_ptrs = DQ + offs_m[:, None] * stride_dqm + d_offs[None, :]
-        dq_mask = (offs_m[:, None] < seqlen_q) & (d_offs[None, :] < headdim)
-        if start_n_k == 0:
-          dq_d = tl.dot(dS_qk, k, out_dtype=tl.float32)
-          tl.store(dq_ptrs, dq_d, mask=dq_mask, eviction_policy="evict_last")
-        else:
-          dq_val = tl.load(dq_ptrs, mask=dq_mask, other=0., eviction_policy="evict_last")
-          dq_d = tl.dot(dS_qk, k, out_dtype=tl.float32)
-          tl.store(dq_ptrs, dq_val + dq_d, mask=dq_mask, eviction_policy="evict_last")
+    else:
+      for start_n_k in range(0, end_n_k, BLOCK_N):
+        _ffpa_bwd_dq_sm90_k_block(
+          desc_q, desc_k, desc_v, desc_do, DQ, LSE, D, AttnBias, softmax_scale, stride_dqm, stride_bm, stride_bn,
+          q_offset_y, kv_base_y, start_n_k, off_hb, offs_m, offs_n, offs_d, seqlen_q, seqlen_k, headdim, dropout_p,
+          philox_offset, IS_CAUSAL, HAS_ATTN_BIAS, HAS_DROPOUT, PHILOX_SEED, BLOCK_HEADDIM, DTYPE, EVEN_N, BLOCK_M,
+          BLOCK_N, num_d_chunks
+        )
 
 
 @triton.heuristics(_SM90_BWD_HEURISTICS)
