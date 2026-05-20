@@ -335,7 +335,6 @@ def _run_case(
   attn_mask: torch.Tensor | None = None,
   dropout_p: float = 0.0,
   acc: str = "f32",
-  triton_backward_grad_kv_storage_dtype: torch.dtype | None = None,
   apply_norm: bool = False,
   warmup: int = DEFAULT_WARMUP,
   iters: int = DEFAULT_ITERS,
@@ -348,7 +347,7 @@ def _run_case(
   k = torch.randn(B, Nh_kv, Nkv, D, dtype=dtype, device="cuda")
   v = torch.randn(B, Nh_kv, Nkv, D, dtype=dtype, device="cuda")
   q, k, v = _maybe_norm_qkv(q, k, v, apply_norm)
-  backend = _make_forward_backend(
+  forward_backend = _make_forward_backend(
     forward_backend,
     acc=acc,
     triton_autotune=triton_autotune,
@@ -356,6 +355,7 @@ def _run_case(
     enable_tma=enable_tma,
     enable_ws=enable_ws,
   )
+  backward_backend = CuTeDSLBackend(backward=True) if forward_backend.name == "cutedsl" else None
 
   torch.manual_seed(seed + 17)
   out_ffpa = ffpa_attn_func(
@@ -366,7 +366,8 @@ def _run_case(
     is_causal=causal,
     dropout_p=dropout_p,
     enable_gqa=Nh_q != Nh_kv,
-    forward_backend=backend,
+    forward_backend=forward_backend,
+    backward_backend=backward_backend,
   )
   k_ref, v_ref = _expand_kv(k, v, Nh_q)
   torch.manual_seed(seed + 17)
@@ -384,7 +385,8 @@ def _run_case(
       is_causal=causal,
       dropout_p=dropout_p,
       enable_gqa=Nh_q != Nh_kv,
-      forward_backend=backend,
+      forward_backend=forward_backend,
+      backward_backend=backward_backend,
     ),
     q,
     k,
@@ -407,7 +409,7 @@ def _run_case(
   result: FORWARD_RESULT = {
     "case_name": name,
     "dtype": _dtype_tag(dtype),
-    "forward_backend": forward_backend,
+    "forward_backend": forward_backend.name,
     "B": B,
     "Hq": Nh_q,
     "Hkv": Nh_kv,
@@ -587,7 +589,6 @@ def run_forward_examples(
           attn_mask=case.get("attn_mask"),
           dropout_p=case.get("dropout_p", 0.0),
           apply_norm=apply_norm,
-          triton_backward_grad_kv_storage_dtype=triton_backward_grad_kv_storage_dtype,
           warmup=warmup,
           iters=iters,
           print_result=print_results,
