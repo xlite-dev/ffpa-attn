@@ -40,7 +40,7 @@ __all__ = [
   "_ffpa_attn_forward_cutedsl",
   "_ffpa_attn_backward_cutedsl",
   "_ffpa_attn_varlen_cutedsl",
-  "ffpa_attn_splitd_varlen_func",
+  "_ffpa_attn_varlen_impl",
   "_require_cutedsl_supported",
   "cutedsl_forward_available",
   "cutedsl_backward_available",
@@ -70,8 +70,6 @@ def _fwd_cutedsl_torch_op(
   causal: int,
   return_lse: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-  from ._interface import _ffpa_attn_forward_sm90
-
   batch, seqlen_q, num_head, head_dim_v = q.shape
   o = torch.empty(batch, seqlen_q, num_head, head_dim_v, dtype=q.dtype, device=q.device)
   need_lse = bool(return_lse)
@@ -124,8 +122,6 @@ def _bwd_cutedsl_torch_op(
   softmax_scale: float,
   causal: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-  from ._interface import _ffpa_attn_backward_sm90
-
   dq = torch.empty_like(q)
   dk = torch.empty_like(k)
   dv = torch.empty_like(v)
@@ -410,7 +406,7 @@ def _normalize_varlen_custom_op_inputs(
   aux_tensors: Optional[list],
 ) -> tuple[torch.Tensor, torch.Tensor, int, int, float, int, int, bool]:
   if cu_seqlens_q is None or cu_seqlens_k is None:
-    raise ValueError("ffpa_attn_splitd_varlen_func custom op path requires cu_seqlens_q and cu_seqlens_k")
+    raise ValueError("_ffpa_attn_varlen_impl custom op path requires cu_seqlens_q and cu_seqlens_k")
   if max_seqlen_q is None:
     raise ValueError("max_seqlen_q must be provided when cu_seqlens_q is provided")
   if max_seqlen_k is None:
@@ -441,7 +437,7 @@ def _normalize_varlen_custom_op_inputs(
   )
 
 
-def ffpa_attn_splitd_varlen_func(
+def _ffpa_attn_varlen_impl(
   q: torch.Tensor,
   k: torch.Tensor,
   v: torch.Tensor,

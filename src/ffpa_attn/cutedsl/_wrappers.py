@@ -45,7 +45,7 @@ def _check_supported_options(
 ) -> None:
   """Raise ``NotImplementedError`` for any non-default cutedsl-unsupported option.
 
-  The cutedsl SplitD D=512 kernels (``ffpa_attn_splitd_varlen_func``,
+  The cutedsl SplitD D=512 kernels (``_ffpa_attn_varlen_impl``,
   ``_ffpa_attn_forward_cutedsl``, ``_ffpa_attn_backward_cutedsl``) only
   honor dense / varlen D=512 attention with optional causal masking. Every other option commonly
   exposed by attention APIs (mask tensors, sliding window, softcap,
@@ -360,9 +360,9 @@ def _ffpa_attn_varlen_cutedsl(
   requires_grad = any(t.requires_grad for t in (q, k, v))
   _require_cutedsl_supported(q, k, v, requires_grad=requires_grad)
 
-  from . import ffpa_attn_splitd_varlen_func
+  from . import _ffpa_attn_varlen_impl
 
-  return ffpa_attn_splitd_varlen_func(
+  return _ffpa_attn_varlen_impl(
     q,
     k,
     v,
