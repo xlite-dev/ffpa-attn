@@ -960,9 +960,9 @@ def _ffpa_bwd_sm90_kernel_impl(
   PlanCTA.cpp assertion ``!tiled && "CTA tiling is already determined"``.
 
   Triton's current automatic warp-specialization pass can only handle one WS
-  loop region in a kernel. The fused wrapper lets the dK/dV helper own that
-  region when ``warp_specialize=True`` and calls the dQ helper with
-  ``warp_specialize=False``. Standalone split-launch dQ still supports WS.
+  loop region in a kernel. The fused wrapper runs non-WS dQ first, then lets
+  the dK/dV helper own that region when ``warp_specialize=True``. Standalone
+  split-launch dQ still supports WS.
   """
   # Keys for autotune and heuristics lookups.
   _ = autotune_seqlen_q_bucket
@@ -970,24 +970,6 @@ def _ffpa_bwd_sm90_kernel_impl(
   _ = autotune_causal_key
   _ = autotune_dtype_key
 
-  if PERSIST_DKDV_ACC:
-    _ffpa_bwd_dkdv_persist_sm90(
-      desc_q, desc_k, desc_v, desc_do, DK, DV, LSE, D, AttnBias, GradAttnBias, softmax_scale, stride_dkb, stride_dkh,
-      stride_dkn, stride_dvb, stride_dvh, stride_dvn, stride_bb, stride_bh, stride_bm, stride_bn, stride_gbb,
-      stride_gbh, stride_gbm, stride_gbn, nheads, seqlen_q, seqlen_k, seqlen_q_rounded, headdim, dropout_p,
-      philox_offset, IS_CAUSAL, HAS_ATTN_BIAS, HAS_DROPOUT, PHILOX_SEED, BIAS_REQUIRES_GRAD, GRAD_BIAS_NEEDS_REDUCTION,
-      GRAD_BIAS_REDUCES_M, GRAD_BIAS_STORE_PARTIAL, BLOCK_HEADDIM, DTYPE, EVEN_M, EVEN_N, BLOCK_M, BLOCK_N,
-      warp_specialize
-    )
-  else:
-    _ffpa_bwd_dkdv_sm90(
-      desc_q, desc_k, desc_v, desc_do, DK, DV, LSE, D, AttnBias, GradAttnBias, softmax_scale, stride_dkb, stride_dkh,
-      stride_dkn, stride_dvb, stride_dvh, stride_dvn, stride_bb, stride_bh, stride_bm, stride_bn, stride_gbb,
-      stride_gbh, stride_gbm, stride_gbn, nheads, seqlen_q, seqlen_k, seqlen_q_rounded, headdim, dropout_p,
-      philox_offset, IS_CAUSAL, HAS_ATTN_BIAS, HAS_DROPOUT, PHILOX_SEED, BIAS_REQUIRES_GRAD, GRAD_BIAS_NEEDS_REDUCTION,
-      GRAD_BIAS_REDUCES_M, GRAD_BIAS_STORE_PARTIAL, BLOCK_HEADDIM, DTYPE, EVEN_M, EVEN_N, BLOCK_M, BLOCK_N,
-      warp_specialize
-    )
   _ffpa_bwd_dq_sm90(
     desc_q,
     desc_k,
@@ -1021,8 +1003,26 @@ def _ffpa_bwd_sm90_kernel_impl(
     EVEN_N,
     BLOCK_M,
     BLOCK_N,
-    False  # warp_specialize=False
+    False  # warp_specialize
   )
+  if PERSIST_DKDV_ACC:
+    _ffpa_bwd_dkdv_persist_sm90(
+      desc_q, desc_k, desc_v, desc_do, DK, DV, LSE, D, AttnBias, GradAttnBias, softmax_scale, stride_dkb, stride_dkh,
+      stride_dkn, stride_dvb, stride_dvh, stride_dvn, stride_bb, stride_bh, stride_bm, stride_bn, stride_gbb,
+      stride_gbh, stride_gbm, stride_gbn, nheads, seqlen_q, seqlen_k, seqlen_q_rounded, headdim, dropout_p,
+      philox_offset, IS_CAUSAL, HAS_ATTN_BIAS, HAS_DROPOUT, PHILOX_SEED, BIAS_REQUIRES_GRAD, GRAD_BIAS_NEEDS_REDUCTION,
+      GRAD_BIAS_REDUCES_M, GRAD_BIAS_STORE_PARTIAL, BLOCK_HEADDIM, DTYPE, EVEN_M, EVEN_N, BLOCK_M, BLOCK_N,
+      warp_specialize
+    )
+  else:
+    _ffpa_bwd_dkdv_sm90(
+      desc_q, desc_k, desc_v, desc_do, DK, DV, LSE, D, AttnBias, GradAttnBias, softmax_scale, stride_dkb, stride_dkh,
+      stride_dkn, stride_dvb, stride_dvh, stride_dvn, stride_bb, stride_bh, stride_bm, stride_bn, stride_gbb,
+      stride_gbh, stride_gbm, stride_gbn, nheads, seqlen_q, seqlen_k, seqlen_q_rounded, headdim, dropout_p,
+      philox_offset, IS_CAUSAL, HAS_ATTN_BIAS, HAS_DROPOUT, PHILOX_SEED, BIAS_REQUIRES_GRAD, GRAD_BIAS_NEEDS_REDUCTION,
+      GRAD_BIAS_REDUCES_M, GRAD_BIAS_STORE_PARTIAL, BLOCK_HEADDIM, DTYPE, EVEN_M, EVEN_N, BLOCK_M, BLOCK_N,
+      warp_specialize
+    )
 
 
 _SM90_BWD_DEFAULT_CONFIG = {
@@ -1717,6 +1717,7 @@ def _ffpa_attn_backward_sm90_impl(
       dkdv_config["warp_specialize"] = bool(enable_ws)
       if enable_ws:
         dkdv_config["num_stages"] = 2
+        dkdv_config["maxnreg"] = 80
       _ffpa_bwd_sm90_prepare_descs(desc_q, desc_k, desc_v, desc_do, dkdv_config)
       _ffpa_bwd_dkdv_sm90_kernel_impl[dkdv_grid](*dkdv_args, **dkdv_meta, **dkdv_config)
 
@@ -1742,6 +1743,7 @@ def _ffpa_attn_backward_sm90_impl(
       dq_config["warp_specialize"] = bool(enable_ws)
       if enable_ws:
         dq_config["num_stages"] = 2
+        dq_config["maxnreg"] = 80
       _ffpa_bwd_sm90_prepare_descs(desc_q, desc_k, desc_v, desc_do, dq_config)
       _ffpa_bwd_dq_sm90_kernel_impl[dq_grid](*dq_args, **dq_meta, **dq_config)
     else:
@@ -1767,6 +1769,7 @@ def _ffpa_attn_backward_sm90_impl(
       launch_config["warp_specialize"] = bool(enable_ws)
       if enable_ws:
         launch_config["num_stages"] = 2
+        launch_config["maxnreg"] = 80
       _ffpa_bwd_sm90_prepare_descs(desc_q, desc_k, desc_v, desc_do, launch_config)
       _ffpa_bwd_sm90_kernel_impl[grid](*kernel_args, **kernel_meta, **launch_config)
 
