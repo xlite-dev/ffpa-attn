@@ -125,6 +125,12 @@ def _parse_args() -> argparse.Namespace:
     action="store_true",
     help="Enable persistent dK/dV fp32 accumulation in the SM90+ TMA backward path (requires --enable-bwd-tma).",
   )
+  parser.add_argument(
+    "--enable-bwd-split-launch",
+    "--bwd-split-launch",
+    action="store_true",
+    help="Enable separate SM90+ TMA backward launches for dK/dV and dQ (requires --enable-bwd-tma).",
+  )
   args = parser.parse_args()
   if args.enable_tma:
     args.enable_bwd_tma = True
@@ -132,13 +138,16 @@ def _parse_args() -> argparse.Namespace:
     args.enable_bwd_ws = True
   if args.enable_persist_dkdv and not args.enable_bwd_tma:
     raise SystemExit("--enable-persist-dkdv requires --enable-bwd-tma")
+  if args.enable_bwd_split_launch and not args.enable_bwd_tma:
+    raise SystemExit("--enable-bwd-split-launch requires --enable-bwd-tma")
   if args.backward_backend == "cutedsl" and (
     args.triton_autotune or args.enable_bwd_tma or args.enable_bwd_ws or args.enable_persist_dkdv
-    or args.grad_kv_storage_dtype != "none"
+    or args.enable_bwd_split_launch or args.grad_kv_storage_dtype != "none"
   ):
     print(
       "[warn] --backward-backend=cutedsl ignores --triton-autotune / "
-      "--enable-bwd-tma / --enable-bwd-ws / --enable-persist-dkdv / --grad-kv-storage-dtype."
+      "--enable-bwd-tma / --enable-bwd-ws / --enable-persist-dkdv / "
+      "--bwd-split-launch / --grad-kv-storage-dtype."
     )
   return args
 
@@ -463,6 +472,7 @@ def _ffpa_forward(
   enable_tma: bool = False,
   enable_ws: bool = False,
   enable_persist_dkdv: bool = False,
+  enable_split_launch: bool = False,
 ) -> torch.Tensor:
   return ffpa_attn_func(
     q_i,
@@ -481,6 +491,7 @@ def _ffpa_forward(
     enable_backward_tma=enable_tma,
     enable_backward_ws=enable_ws,
     triton_backward_enable_persist_dkdv=enable_persist_dkdv,
+    triton_backward_enable_split_launch=enable_split_launch,
   )
 
 
@@ -516,6 +527,7 @@ def _run_ffpa_backward(
   enable_tma: bool = False,
   enable_ws: bool = False,
   enable_persist_dkdv: bool = False,
+  enable_split_launch: bool = False,
 ) -> None:
   if attn_mask is not None:
     attn_mask.grad = None
@@ -537,6 +549,7 @@ def _run_ffpa_backward(
     enable_tma=enable_tma,
     enable_ws=enable_ws,
     enable_persist_dkdv=enable_persist_dkdv,
+    enable_split_launch=enable_split_launch,
   )
   out.sum().backward()
 
@@ -645,6 +658,7 @@ def _run_case(
   enable_tma: bool = False,
   enable_ws: bool = False,
   enable_persist_dkdv: bool = False,
+  enable_split_launch: bool = False,
   apply_norm: bool = False,
   warmup: int = DEFAULT_WARMUP,
   iters: int = DEFAULT_ITERS,
@@ -682,6 +696,7 @@ def _run_case(
     enable_backward_tma=enable_tma,
     enable_backward_ws=enable_ws,
     triton_backward_enable_persist_dkdv=enable_persist_dkdv,
+    triton_backward_enable_split_launch=enable_split_launch,
   )
   out.sum().backward()
 
@@ -734,6 +749,7 @@ def _run_case(
         enable_tma,
         enable_ws,
         enable_persist_dkdv,
+        enable_split_launch,
       ),
       q,
       k,
@@ -778,6 +794,7 @@ def _run_case(
       enable_tma,
       enable_ws,
       enable_persist_dkdv,
+      enable_split_launch,
       warmup=warmup,
       iters=iters,
       rng_seed=dropout_seed if dropout_p > 0.0 else None,
@@ -861,6 +878,7 @@ def run_backward_examples(
   enable_tma: bool = False,
   enable_ws: bool = False,
   enable_persist_dkdv: bool = False,
+  enable_split_launch: bool = False,
   warmup: int = DEFAULT_WARMUP,
   iters: int = DEFAULT_ITERS,
   print_results: bool = True,
@@ -888,6 +906,8 @@ def run_backward_examples(
     when supported.
   :param enable_persist_dkdv: Whether to enable persistent fp32 dK/dV
     accumulation in the SM90+ TMA backward path. Requires ``enable_tma``.
+  :param enable_split_launch: Whether to enable separate SM90+ TMA backward
+    launches for dK/dV and dQ. Requires ``enable_tma``.
   :param warmup: Warmup iterations used for timing.
   :param iters: Measured iterations used for timing.
   :param print_results: Whether to print each case result.
@@ -915,7 +935,7 @@ def run_backward_examples(
     f"triton_autotune_mode={triton_autotune_mode}, "
     f"triton_backward_grad_kv_storage_dtype={triton_backward_grad_kv_storage_dtype}, "
     f"enable_bwd_tma={enable_tma}, enable_bwd_ws={enable_ws}, "
-    f"enable_persist_dkdv={enable_persist_dkdv}, "
+    f"enable_persist_dkdv={enable_persist_dkdv}, enable_split_launch={enable_split_launch}, "
     f"timing_mode={timing_mode}, tasks={sorted(tasks) if tasks is not None else 'full'}, "
     f"warmup={warmup}, iters={iters}"
   )
@@ -1016,6 +1036,7 @@ def run_backward_examples(
           enable_tma=enable_tma,
           enable_ws=enable_ws,
           enable_persist_dkdv=enable_persist_dkdv,
+          enable_split_launch=enable_split_launch,
           apply_norm=apply_norm,
           warmup=warmup,
           iters=iters,
@@ -1048,6 +1069,7 @@ def main() -> None:
     enable_tma=args.enable_bwd_tma,
     enable_ws=args.enable_bwd_ws,
     enable_persist_dkdv=args.enable_persist_dkdv,
+    enable_split_launch=args.enable_bwd_split_launch,
     warmup=args.warmup,
     iters=args.iters,
     print_results=True,

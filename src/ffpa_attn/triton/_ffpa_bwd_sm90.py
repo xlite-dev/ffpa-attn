@@ -8,8 +8,6 @@ raw masked stores in this first TMA phase.
 
 from __future__ import annotations
 
-import os
-
 import torch
 import triton
 import triton.language as tl
@@ -41,11 +39,6 @@ _SM90_BWD_HEURISTICS = {
 _SM90_BWD_DQ_HEURISTICS = {
   "EVEN_N": lambda args: args["seqlen_k"] % args["BLOCK_N"] == 0,
 }
-
-
-def _bwd_sm90_split_launch_enabled() -> bool:
-  """Return whether the SM90 backward main kernel should use split launches."""
-  return os.environ.get("FFPA_BWD_SM90_SPLIT_LAUNCH") == "1"
 
 
 def _sm90_bwd_host_descriptor_pre_hook(nargs):
@@ -847,7 +840,7 @@ def _ffpa_bwd_sm90_kernel_impl(
   ``triton-nvidia-gpu-plan-cta``) and the second ``DotOp`` hits the
   PlanCTA.cpp assertion ``!tiled && "CTA tiling is already determined"``.
 
-  TODO: Consider splitting this wrapper into separate dK/dV and dQ kernel
+  NOTE: Consider splitting this wrapper into separate dK/dV and dQ kernel
   launches. The two phases do not depend on each other's outputs after the
   preprocess ``D`` kernel: dK/dV writes ``DK`` / ``DV`` / optional bias grad,
   while dQ writes only ``DQ``. Keeping them in one Triton function may increase
@@ -907,6 +900,33 @@ _SM90_BWD_PERSIST_DKDV_DEFAULT_CONFIG = {
   "num_stages": 2,
 }
 
+_SM90_BWD_SPLIT_DKDV_DEFAULT_CONFIG = {
+  "BLOCK_M": 128,
+  "BLOCK_N": 64,
+  "BLOCK_HEADDIM": 64,
+  "warp_specialize": False,
+  "num_warps": 4,
+  "num_stages": 2,
+}
+
+_SM90_BWD_SPLIT_PERSIST_DKDV_DEFAULT_CONFIG = {
+  "BLOCK_M": 128,
+  "BLOCK_N": 64,
+  "BLOCK_HEADDIM": 128,
+  "warp_specialize": False,
+  "num_warps": 4,
+  "num_stages": 2,
+}
+
+_SM90_BWD_SPLIT_DQ_DEFAULT_CONFIG = {
+  "BLOCK_M": 64,
+  "BLOCK_N": 64,
+  "BLOCK_HEADDIM": 64,
+  "warp_specialize": False,
+  "num_warps": 4,
+  "num_stages": 2,
+}
+
 
 def _default_bwd_sm90_config(enable_persist_dkdv: bool) -> dict:
   """Return the fixed SM90 backward launch config for the selected dKdV mode."""
@@ -917,17 +937,14 @@ def _default_bwd_sm90_config(enable_persist_dkdv: bool) -> dict:
 
 def _default_bwd_sm90_dkdv_config(enable_persist_dkdv: bool) -> dict:
   """Return the fixed split-launch dK/dV config for the selected mode."""
-  config = _default_bwd_sm90_config(enable_persist_dkdv)
-  config["num_warps"] = 4
-  return config
+  if enable_persist_dkdv:
+    return dict(_SM90_BWD_SPLIT_PERSIST_DKDV_DEFAULT_CONFIG)
+  return dict(_SM90_BWD_SPLIT_DKDV_DEFAULT_CONFIG)
 
 
 def _default_bwd_sm90_dq_config() -> dict:
   """Return the fixed split-launch dQ config."""
-  config = dict(_SM90_BWD_DEFAULT_CONFIG)
-  config["BLOCK_M"] = 64
-  config["num_warps"] = 4
-  return config
+  return dict(_SM90_BWD_SPLIT_DQ_DEFAULT_CONFIG)
 
 
 def _gen_bwd_sm90_autotune_configs(
@@ -935,13 +952,19 @@ def _gen_bwd_sm90_autotune_configs(
   autotune_mode: str = "max",
   enable_ws: bool = False,
   enable_persist_dkdv: bool = False,
+  enable_split_launch: bool = False,
 ) -> list[triton.Config]:
   """Generate autotune configs for the SM90 TMA backward main kernel."""
   del headdim
   # fast: 2*1*2*1*1 = 4 configs; max: 2*2*2*2*2 = 32 configs
   configs = []
   if enable_persist_dkdv:
-    block_headdim_candidates = [128] if autotune_mode == "fast" else [64, 128]
+    if autotune_mode == "fast":
+      block_headdim_candidates = [128]
+    elif enable_split_launch:
+      block_headdim_candidates = [128, 256]
+    else:
+      block_headdim_candidates = [64, 128]
   else:
     block_headdim_candidates = [64] if autotune_mode == "fast" else [64, 128]
 
@@ -978,6 +1001,7 @@ def _gen_bwd_sm90_dkdv_autotune_configs(
     autotune_mode=autotune_mode,
     enable_ws=enable_ws,
     enable_persist_dkdv=enable_persist_dkdv,
+    enable_split_launch=True,
   )
 
 
@@ -992,6 +1016,7 @@ def _gen_bwd_sm90_dq_autotune_configs(
     autotune_mode=autotune_mode,
     enable_ws=enable_ws,
     enable_persist_dkdv=False,
+    enable_split_launch=True,
   )
 
 
@@ -1222,6 +1247,7 @@ def _ffpa_attn_backward_sm90_impl(
   philox_offset: int = 0,
   enable_ws: bool = False,
   enable_persist_dkdv: bool = False,
+  enable_split_launch: bool = False,
 ) -> None:
   """Run the SM90+ TMA backward main path.
 
@@ -1496,7 +1522,7 @@ def _ffpa_attn_backward_sm90_impl(
     PHILOX_SEED=philox_seed,
     DTYPE=DTYPE,
   )
-  split_launch = _bwd_sm90_split_launch_enabled()
+  split_launch = enable_split_launch
 
   if autotune:
     if split_launch:

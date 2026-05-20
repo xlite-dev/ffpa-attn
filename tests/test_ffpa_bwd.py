@@ -181,9 +181,8 @@ def test_sm90_tma_non_aligned_seqlen_matches_sdpa(enable_persist_dkdv):
     (torch.bfloat16, True, True, 128),
   ],
 )
-def test_sm90_tma_split_launch_matches_sdpa(monkeypatch, dtype, enable_persist_dkdv, causal, N):
+def test_sm90_tma_split_launch_matches_sdpa(dtype, enable_persist_dkdv, causal, N):
   _skip_if_no_sm90_tma()
-  monkeypatch.setenv("FFPA_BWD_SM90_SPLIT_LAUNCH", "1")
   torch.manual_seed(125)
   B, H, D = 1, 2, 512
   q = torch.randn(B, H, N, D, dtype=dtype, device="cuda", requires_grad=True)
@@ -200,6 +199,7 @@ def test_sm90_tma_split_launch_matches_sdpa(monkeypatch, dtype, enable_persist_d
     scale=scale,
     enable_backward_tma=True,
     triton_backward_enable_persist_dkdv=enable_persist_dkdv,
+    triton_backward_enable_split_launch=True,
   )
   out.backward(grad_out)
 
@@ -211,7 +211,7 @@ def test_sm90_tma_split_launch_matches_sdpa(monkeypatch, dtype, enable_persist_d
 
 
 @pytest.mark.parametrize("enable_persist_dkdv", [False, True])
-def test_sm90_tma_split_launch_matches_fused(monkeypatch, enable_persist_dkdv):
+def test_sm90_tma_split_launch_matches_fused(enable_persist_dkdv):
   _skip_if_no_sm90_tma()
   torch.manual_seed(126)
   B, H, N, D = 1, 2, 129, 512
@@ -223,7 +223,6 @@ def test_sm90_tma_split_launch_matches_fused(monkeypatch, enable_persist_dkdv):
   scale = 1.0 / math.sqrt(D)
 
   def run_backward(split_launch: bool):
-    monkeypatch.setenv("FFPA_BWD_SM90_SPLIT_LAUNCH", "1" if split_launch else "0")
     q_i = q.detach().clone().requires_grad_(True)
     k_i = k.detach().clone().requires_grad_(True)
     v_i = v.detach().clone().requires_grad_(True)
@@ -234,6 +233,7 @@ def test_sm90_tma_split_launch_matches_fused(monkeypatch, enable_persist_dkdv):
       scale=scale,
       enable_backward_tma=True,
       triton_backward_enable_persist_dkdv=enable_persist_dkdv,
+      triton_backward_enable_split_launch=split_launch,
     )
     out.backward(grad_out)
     return q_i.grad, k_i.grad, v_i.grad

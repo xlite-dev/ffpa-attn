@@ -32,7 +32,6 @@ from .triton._ffpa_bwd import (
   _get_pre_autotune,
 )
 from .triton._ffpa_bwd_sm90 import (
-  _bwd_sm90_split_launch_enabled,
   _get_bwd_sm90_dkdv_autotune,
   _get_bwd_sm90_dq_autotune,
   _get_bwd_sm90_autotune,
@@ -118,6 +117,8 @@ def _resolve_directional_cli_flags(args: argparse.Namespace) -> argparse.Namespa
   if args.enable_ws:
     args.enable_fwd_ws = True
     args.enable_bwd_ws = True
+  if args.enable_bwd_split_launch and not args.enable_bwd_tma:
+    raise SystemExit("--enable-bwd-split-launch requires --enable-bwd-tma")
   return args
 
 
@@ -585,6 +586,7 @@ def _tune_backward(
   entries: dict[tuple[Any, ...], dict[str, Any]],
   enable_tma: bool = False,
   enable_ws: bool = False,
+  enable_split_launch: bool = False,
 ) -> list[tuple[dict[str, Any], int]]:
   q, k, v = _make_tensors(task, batch)
   attn_bias = _make_attn_bias(task)
@@ -601,7 +603,7 @@ def _tune_backward(
   )
   use_sm90_ws = use_sm90_tma and enable_ws
 
-  def run_backward_tune(run_enable_tma: bool, run_enable_ws: bool) -> None:
+  def run_backward_tune(run_enable_tma: bool, run_enable_ws: bool, run_enable_split_launch: bool = False) -> None:
     if task.has_dropout:
       torch.manual_seed(_TUNE_SEED + 17)
     out = ffpa_attn_func(
@@ -618,6 +620,7 @@ def _tune_backward(
       triton_autotune_mode=mode,
       enable_tma=run_enable_tma,
       enable_ws=run_enable_ws,
+      triton_backward_enable_split_launch=run_enable_split_launch,
     )
     out.float().sum().backward()
 
@@ -685,7 +688,31 @@ def _tune_backward(
 
   if task.seqlen_q >= 8 and use_sm90_tma:
     run_backward_tune(True, use_sm90_ws)
-    if _bwd_sm90_split_launch_enabled():
+    wrapper = _get_bwd_sm90_autotune(
+      task.headdim,
+      mode,
+      dtype,
+      task.has_attn_bias,
+      enable_ws=use_sm90_ws,
+    )
+    entry = _entry_base(
+      task,
+      mode,
+      "bwd_sm90_generic",
+      config_from_triton_config(wrapper.best_config),
+      enable_tma=True,
+      enable_ws=use_sm90_ws,
+    )
+    entry.update({
+      "bias_grad": task.has_attn_bias,
+      "grad_kv_storage_dtype": None,
+    })
+    choices_count = len(wrapper.configs)
+    _record_entry(entries, entry)
+    tuned_entries.append((entry, choices_count))
+
+    if enable_split_launch:
+      run_backward_tune(True, use_sm90_ws, run_enable_split_launch=True)
       dkdv_wrapper = _get_bwd_sm90_dkdv_autotune(
         task.headdim,
         mode,
@@ -728,29 +755,6 @@ def _tune_backward(
       })
       _record_entry(entries, dq_entry)
       tuned_entries.append((dq_entry, len(dq_wrapper.configs)))
-    else:
-      wrapper = _get_bwd_sm90_autotune(
-        task.headdim,
-        mode,
-        dtype,
-        task.has_attn_bias,
-        enable_ws=use_sm90_ws,
-      )
-      entry = _entry_base(
-        task,
-        mode,
-        "bwd_sm90_generic",
-        config_from_triton_config(wrapper.best_config),
-        enable_tma=True,
-        enable_ws=use_sm90_ws,
-      )
-      entry.update({
-        "bias_grad": task.has_attn_bias,
-        "grad_kv_storage_dtype": None,
-      })
-      choices_count = len(wrapper.configs)
-      _record_entry(entries, entry)
-      tuned_entries.append((entry, choices_count))
 
   return tuned_entries
 
@@ -766,6 +770,7 @@ def _build_payload(
   enable_backward_tma: bool,
   enable_forward_ws: bool,
   enable_backward_ws: bool,
+  enable_backward_split_launch: bool = False,
 ) -> dict[str, Any]:
   device_index = torch.cuda.current_device()
   device_name = torch.cuda.get_device_name(device_index)
@@ -788,6 +793,7 @@ def _build_payload(
       "enable_backward_tma": enable_backward_tma,
       "enable_forward_ws": enable_forward_ws,
       "enable_backward_ws": enable_backward_ws,
+      "enable_backward_split_launch": enable_backward_split_launch,
     },
     "tune_grid": {
       "headdims": DEFAULT_HEADDIMS,
@@ -862,6 +868,12 @@ def _parse_args() -> argparse.Namespace:
     "--enable-bwd-ws",
     action="store_true",
     help="Force warp-specialized SM90+ TMA backward configs when --enable-bwd-tma is set.",
+  )
+  parser.add_argument(
+    "--enable-bwd-split-launch",
+    "--bwd-split-launch",
+    action="store_true",
+    help="Additionally tune SM90+ TMA backward split-launch dK/dV and dQ kernels when --enable-bwd-tma is set.",
   )
   parser.add_argument(
     "--overwrite",
@@ -951,6 +963,7 @@ def main() -> int:
             entries,
             enable_tma=args.enable_bwd_tma,
             enable_ws=args.enable_bwd_ws,
+            enable_split_launch=args.enable_bwd_split_launch,
           )
         torch.cuda.synchronize()
         elapsed = time.perf_counter() - start_time
@@ -1007,6 +1020,7 @@ def main() -> int:
     args.enable_bwd_tma,
     args.enable_fwd_ws,
     args.enable_bwd_ws,
+    args.enable_bwd_split_launch,
   )
   write_config_file(payload, output_path, overwrite=args.overwrite)
   logger.info("Wrote %d tuned config entries to %s", len(ordered_entries), output_path)

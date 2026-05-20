@@ -283,6 +283,12 @@ def _parse_args() -> argparse.Namespace:
     help="Enable persistent dK/dV fp32 accumulation in the SM90+ TMA backward path (requires --bwd-tma).",
   )
   parser.add_argument(
+    "--enable-bwd-split-launch",
+    "--bwd-split-launch",
+    action="store_true",
+    help="Enable separate SM90+ TMA backward launches for dK/dV and dQ (requires --bwd-tma).",
+  )
+  parser.add_argument(
     "--grad-kv-storage-dtype",
     "--grad-kv-dtype",
     choices=["none", "fp16", "fp32"],
@@ -313,6 +319,8 @@ def _resolve_directional_cli_flags(args: argparse.Namespace) -> argparse.Namespa
     args.enable_bwd_ws = True
   if args.enable_persist_dkdv and not args.enable_bwd_tma:
     raise SystemExit("--enable-persist-dkdv requires --enable-bwd-tma")
+  if args.enable_bwd_split_launch and not args.enable_bwd_tma:
+    raise SystemExit("--enable-bwd-split-launch requires --enable-bwd-tma")
   return args
 
 
@@ -1214,6 +1222,7 @@ def _benchmark_rows(
         enable_tma=args.enable_bwd_tma,
         enable_ws=args.enable_bwd_ws,
         enable_persist_dkdv=args.enable_persist_dkdv,
+        enable_split_launch=args.enable_bwd_split_launch,
         warmup=args.warmup,
         iters=args.iters,
         print_results=True,
