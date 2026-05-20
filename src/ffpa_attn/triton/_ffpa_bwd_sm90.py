@@ -1096,9 +1096,9 @@ _SM90_BWD_SPLIT_DKDV_DEFAULT_CONFIG = {
 }
 
 _SM90_BWD_SPLIT_PERSIST_DKDV_DEFAULT_CONFIG = {
-  "BLOCK_M": 128,
+  "BLOCK_M": 64,
   "BLOCK_N": 64,
-  "BLOCK_HEADDIM": 128,
+  "BLOCK_HEADDIM": 64,
   "warp_specialize": False,
   "num_warps": 4,
   "num_stages": 2,

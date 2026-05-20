@@ -581,9 +581,9 @@ def test_sm90_bwd_split_default_configs_match_5090_fast_autotune():
     "num_stages": 2,
   }
   assert dkdv_persist_config == {
-    "BLOCK_M": 128,
+    "BLOCK_M": 64,
     "BLOCK_N": 64,
-    "BLOCK_HEADDIM": 128,
+    "BLOCK_HEADDIM": 64,
     "warp_specialize": False,
     "num_warps": 4,
     "num_stages": 2,
