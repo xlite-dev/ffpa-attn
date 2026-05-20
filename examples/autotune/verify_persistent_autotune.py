@@ -13,7 +13,7 @@ from typing import Any
 
 import torch
 
-from ffpa_attn import ffpa_attn_func
+from ffpa_attn import TritonBackend, ffpa_attn_func
 from ffpa_attn.triton._ffpa_bwd import _get_bwd_autotune, _get_decode_bwd_stage1_autotune, _get_pre_autotune
 from ffpa_attn.triton._ffpa_bwd_sm90 import _get_bwd_sm90_autotune, is_sm90_tma_backward_supported
 from ffpa_attn.triton._ffpa_fwd import _get_decode_fwd_stage1_autotune, _get_decode_num_splits, _get_fwd_autotune
@@ -101,11 +101,13 @@ def _run_forward(args: argparse.Namespace, q: torch.Tensor, k: torch.Tensor, v: 
     k,
     v,
     scale=1 / math.sqrt(args.D),
-    forward_backend="triton",
-    triton_autotune=True,
-    triton_autotune_mode=args.mode,
-    enable_forward_tma=args.enable_fwd_tma,
-    enable_forward_ws=args.enable_fwd_ws,
+    forward_backend=TritonBackend(
+      forward=True,
+      autotune=True,
+      autotune_mode=args.mode,
+      enable_tma=args.enable_fwd_tma,
+      enable_ws=args.enable_fwd_ws,
+    ),
   )
   del out
   torch.cuda.synchronize()
@@ -161,11 +163,19 @@ def _run_backward(args: argparse.Namespace, q: torch.Tensor, k: torch.Tensor, v:
     k,
     v,
     scale=1 / math.sqrt(args.D),
-    backward_backend="triton",
-    triton_autotune=True,
-    triton_autotune_mode=args.mode,
-    enable_backward_tma=args.enable_bwd_tma,
-    enable_backward_ws=args.enable_bwd_ws,
+    forward_backend=TritonBackend(
+      forward=True,
+      autotune=True,
+      autotune_mode=args.mode,
+    ),
+    backward_backend=TritonBackend(
+      forward=False,
+      backward=True,
+      autotune=True,
+      autotune_mode=args.mode,
+      enable_tma=args.enable_bwd_tma,
+      enable_ws=args.enable_bwd_ws,
+    ),
   )
   out.sum().backward()
   torch.cuda.synchronize()

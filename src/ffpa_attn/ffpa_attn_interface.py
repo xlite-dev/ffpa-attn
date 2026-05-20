@@ -58,7 +58,7 @@ shapes / backends raise ``NotImplementedError``.
 from __future__ import annotations
 
 import torch
-from .functional import FFPAAttnFunc, FFPAAttnMeta
+from .functional import Backend, FFPAAttnMeta, FFPAAttnFunc
 from .logger import init_logger
 
 logger = init_logger(__name__)
@@ -69,7 +69,7 @@ def _should_fallback_to_sdpa(
   key: torch.Tensor,
   attn_mask: torch.Tensor | None,
   dropout_p: float,
-  forward_backend: str,
+  forward_backend: Backend,
 ) -> bool:
   """Return whether the public API should delegate to SDPA directly.
 
@@ -108,7 +108,7 @@ def _should_fallback_to_sdpa(
   # attn_mask, FA-extension kwargs) must keep raising from
   # _require_cutedsl_supported / _check_supported_options, so cutedsl
   # bypasses the legacy any([...]) heuristics below.
-  if forward_backend == "cutedsl":
+  if forward_backend.name == "cutedsl":
     from .cutedsl._wrappers import cutedsl_forward_available
     cutedsl_hw_unsupported = D != 512 or not cutedsl_forward_available(query.device)
     if cutedsl_hw_unsupported:
@@ -124,8 +124,8 @@ def _should_fallback_to_sdpa(
     D <= 256,
     D > 1024,
     # attn_mask and dropout only supported in triton backend for now.
-    attn_mask is not None and forward_backend == "cutedsl",
-    dropout_p > 0.0 and forward_backend == "cutedsl",
+    attn_mask is not None and forward_backend.name == "cutedsl",
+    dropout_p > 0.0 and forward_backend.name == "cutedsl",
     (8 <= Nq < 512),
     Nkv < 512,
   ])
@@ -162,7 +162,9 @@ def ffpa_attn_func(
   ``D > 1024``, and unsupported large-D dropout), and otherwise keeps the
   existing FFPA forward plus SDPA/FFPA backward routing. Large-D Triton forward
   and backward support explicit additive ``attn_mask`` gradients.
-  ``forward_backend`` only affects the large-D path.
+  ``forward_backend`` only affects the large-D path and is accepted as an
+  FFPA-specific keyword inside ``**kwargs`` so the explicit signature remains
+  aligned with :func:`torch.nn.functional.scaled_dot_product_attention`.
 
   :param query: Query tensor with layout ``[B, Nh_q, Nq, D]``; dtype must be
       ``torch.float16`` or ``torch.bfloat16`` and match ``key`` / ``value``.
@@ -193,46 +195,29 @@ def ffpa_attn_func(
       match SDPA exactly. When ``False``, the large-D FFPA path requires
       ``query`` and ``key``/``value`` to have the same number of heads. Pass
       ``True`` to opt into GQA/MQA semantics explicitly.
-  :param kwargs: Implementation-specific options for experimentation.
-      Supported keys are ``stages``, ``acc``, ``enable_forward_tma``,
-      ``enable_backward_tma``, ``enable_forward_ws``,
-      ``enable_backward_ws``, ``enable_tma``, ``enable_ws``,
-      ``high_precision_grad``, ``forward_backend``,
-      ``triton_autotune``, ``triton_autotune_mode``,
-      ``backward_backend``,
-      ``triton_backward_preprocess_d_chunk``,
-      ``triton_backward_enable_persist_dkdv``,
-      ``triton_backward_enable_split_launch``, and
-      ``triton_backward_grad_kv_storage_dtype``. ``forward_backend`` only affects ``D > 256``.
-      ``enable_forward_tma`` and ``enable_backward_tma`` independently opt
-      into the SM90+ Triton descriptor/TMA forward and backward paths when
-      supported. ``enable_forward_ws`` and ``enable_backward_ws`` request
-      warp-specialized TMA configs for the matching direction. ``enable_tma``
-      and ``enable_ws`` are compatibility aliases that set both directions.
-      ``triton_backward_enable_persist_dkdv`` enables an experimental SM90 TMA
-      backward path that keeps dK/dV accumulators in fp32 registers across Q
-      blocks and requires ``enable_backward_tma=True``.
-      ``triton_backward_enable_split_launch`` enables separate backward
-      launches for dK/dV and dQ on either generic Triton or SM90 TMA paths.
-      ``backward_backend`` supports ``"triton"`` and ``"sdpa"``.
-      ``triton_backward_grad_kv_storage_dtype`` defaults to ``None`` and
-      currently accepts ``torch.float16`` or ``torch.float32`` as overrides for Triton
-      backward's internal ``DK`` / ``DV`` storage dtype. These options do not change
-      the autograd contract; unknown keys raise ``TypeError``.
+  :param kwargs: FFPA-specific extension kwargs. Supported keys are
+      ``forward_backend`` and ``backward_backend``, both expecting backend
+      config objects. Any other kwarg raises ``TypeError``.
 
   :returns: Output tensor ``O`` with layout ``[B, Nh_q, Nq, D]``,
       filled with the attention output ``softmax(scale * QK^T) V``.
 
   :raises TypeError: if ``query.dtype`` is neither fp16 nor bf16.
-  :raises ValueError: if ``acc`` is not one of ``{'f16', 'f32'}``, if
+  :raises ValueError: if the selected backend config is invalid, if ``acc`` is
+      not one of ``{'f16', 'f32'}``, if
       bf16 activations are combined with ``acc='f16'`` (no bf16-acc mma
       PTX instruction exists on supported architectures), or if
       ``is_causal=True`` is combined with ``Nkv < Nq``.
   :raises NotImplementedError: propagated from SDPA or FFPA backends for
       unsupported backend-specific combinations.
   """
-  meta = FFPAAttnMeta.from_kwargs(**kwargs)
-  if _should_fallback_to_sdpa(query, key, attn_mask, dropout_p, meta.forward_backend):
+  forward_backend = kwargs.pop("forward_backend", None)
+  backward_backend = kwargs.pop("backward_backend", None)
+  if kwargs:
+    unexpected = ", ".join(sorted(kwargs))
+    raise TypeError(f"ffpa_attn_func() got unexpected keyword argument(s): {unexpected}")
+  meta = FFPAAttnMeta.from_options(forward_backend, backward_backend)
+  if _should_fallback_to_sdpa(query, key, attn_mask, dropout_p, meta.forward_meta):
     # Fallback intentionally delegates to SDPA exactly as the user called it.
     # Do not synthesize masks or reinterpret GQA semantics here.
     # HACK: Use the native SDPA op directly to avoid recursive calls to this function
@@ -261,7 +246,7 @@ def ffpa_attn_func(
   # device) via _require_cutedsl_supported, kwarg-level (dropout_p > 0,
   # attn_mask is not None) via _check_supported_options. The lazy import
   # keeps the cutedsl package off the hot path for non-cutedsl callers.
-  if meta.forward_backend == "cutedsl":
+  if meta.forward_meta.name == "cutedsl":
     from .cutedsl import _ffpa_attn_cutedsl
     return _ffpa_attn_cutedsl(
       query,
@@ -342,25 +327,25 @@ def ffpa_attn_varlen_func(
       ``attention_mask`` / ``attn_mask``, ``block_mask``, ``score_mod``,
       ``aux_tensors``, ``seqused_k``, ``block_table``, ``num_splits``, or
       ``alibi_slopes`` raises ``NotImplementedError`` (see ``:raises:``).
-      Only ``forward_backend`` / ``backward_backend`` are forwarded to
-      :meth:`FFPAAttnMeta.from_kwargs` for pair-binding; both must be
-      ``"cutedsl"`` or unset.
+      Remaining kwargs are forwarded to the cutedsl wrapper for unsupported
+      option checking.
 
   :returns: ``out`` of shape ``[T_q, H_q, D]`` if ``return_lse=False``,
       otherwise ``(out, lse)``.
 
   :raises NotImplementedError: for ``D != 512``, non-SM90 hardware,
-      ``dropout_p > 0``, non-CuTeDSL ``forward_backend``, or any non-default
-      unsupported kwarg: ``window_size``, ``softcap``, ``sink``,
+      ``dropout_p > 0``, or any non-default unsupported kwarg:
+      ``window_size``, ``softcap``, ``sink``,
       ``attention_mask`` / ``attn_mask``, ``block_mask``, ``score_mod``,
       ``aux_tensors``, ``seqused_k``, ``block_table``, ``num_splits``,
       ``alibi_slopes``.
-  :raises TypeError: if ``cu_seqlens_*`` is not int32, or if dtype is not
+    :raises TypeError: if ``cu_seqlens_*`` is not int32, or if dtype is not
       fp16/bf16.
   :raises ValueError: for shape mismatches between ``q``/``k``/``v``,
       malformed ``cu_seqlens_*``, or ``enable_gqa=False`` with
       ``H_q != H_kv``.
   """
+
   from .cutedsl import _ffpa_attn_varlen_cutedsl
   return _ffpa_attn_varlen_cutedsl(
     q,
@@ -375,7 +360,7 @@ def ffpa_attn_varlen_func(
     causal=causal,
     enable_gqa=enable_gqa,
     return_lse=return_lse,
-    kwargs=kwargs,
+    **kwargs,
   )
 
 

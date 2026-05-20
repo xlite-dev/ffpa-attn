@@ -8,7 +8,7 @@ import triton
 
 import ffpa_attn.autotune as autotune_module
 from ffpa_attn.autotune import TuneTask, _build_payload, _iter_backward_tasks, _iter_forward_tasks, _tune_backward, _tune_forward
-from ffpa_attn.functional import FFPAAttnMeta
+from ffpa_attn.functional import FFPAAttnMeta, SDPABackend, TritonBackend
 from ffpa_attn.triton._autotune_utils import autotune_seqlen_key, bucket_autotune_seqlen, exact_autotune_seqlen_keys
 from ffpa_attn.triton._ffpa_bwd import (
   _gen_bwd_autotune_configs,
@@ -44,110 +44,129 @@ from ffpa_attn.triton._ffpa_fwd_sm90 import (
 
 
 def test_triton_autotune_mode_defaults_to_fast():
-  meta = FFPAAttnMeta.from_kwargs()
-  assert meta.triton_autotune_mode == "fast"
+  meta = FFPAAttnMeta.from_backends()
+  assert isinstance(meta.backward_meta, TritonBackend)
+  assert meta.backward_meta.autotune_mode == "fast"
 
 
 def test_triton_autotune_defaults_to_false():
-  meta = FFPAAttnMeta.from_kwargs()
-  assert meta.triton_autotune is False
+  meta = FFPAAttnMeta.from_backends()
+  assert isinstance(meta.forward_meta, TritonBackend)
+  assert isinstance(meta.backward_meta, TritonBackend)
+  assert meta.forward_meta.autotune is False
+  assert meta.backward_meta.autotune is False
 
 
 def test_triton_autotune_accepts_true():
-  meta = FFPAAttnMeta.from_kwargs(triton_autotune=True)
-  assert meta.triton_autotune is True
+  meta = FFPAAttnMeta.from_backends(
+    TritonBackend(forward=True, autotune=True),
+    TritonBackend(backward=True, autotune=True),
+  )
+  assert meta.forward_meta.autotune is True
+  assert meta.backward_meta.autotune is True
 
 
 def test_directional_tma_ws_flags_default_to_false():
-  meta = FFPAAttnMeta.from_kwargs()
-  assert meta.enable_forward_tma == 0
-  assert meta.enable_backward_tma == 0
-  assert meta.enable_forward_ws == 0
-  assert meta.enable_backward_ws == 0
-  assert meta.triton_backward_enable_persist_dkdv is False
-  assert meta.triton_backward_enable_split_launch is False
+  meta = FFPAAttnMeta.from_backends()
+  assert isinstance(meta.forward_meta, TritonBackend)
+  assert isinstance(meta.backward_meta, TritonBackend)
+  assert meta.forward_meta.enable_tma is False
+  assert meta.backward_meta.enable_tma is False
+  assert meta.forward_meta.enable_ws is False
+  assert meta.backward_meta.enable_ws is False
+  assert meta.backward_meta.persist_dkdv is False
+  assert meta.backward_meta.split_launch is False
 
 
 def test_persist_dkdv_requires_backward_tma():
-  with pytest.raises(ValueError, match="requires enable_backward_tma"):
-    FFPAAttnMeta.from_kwargs(triton_backward_enable_persist_dkdv=True)
+  with pytest.raises(AssertionError, match="persist_dkdv requires enable_tma"):
+    FFPAAttnMeta.from_backends(backward_backend=TritonBackend(backward=True, persist_dkdv=True))
 
 
 def test_persist_dkdv_accepts_backward_tma():
-  meta = FFPAAttnMeta.from_kwargs(
-    enable_backward_tma=True,
-    triton_backward_enable_persist_dkdv=True,
+  meta = FFPAAttnMeta.from_backends(
+    backward_backend=TritonBackend(
+      backward=True,
+      enable_tma=True,
+      persist_dkdv=True,
+    ),
   )
-  assert meta.enable_backward_tma == 1
-  assert meta.triton_backward_enable_persist_dkdv is True
+  assert isinstance(meta.backward_meta, TritonBackend)
+  assert meta.backward_meta.enable_tma is True
+  assert meta.backward_meta.persist_dkdv is True
 
 
 def test_split_launch_accepts_without_backward_tma():
-  meta = FFPAAttnMeta.from_kwargs(triton_backward_enable_split_launch=True)
-  assert meta.enable_backward_tma == 0
-  assert meta.triton_backward_enable_split_launch is True
+  meta = FFPAAttnMeta.from_backends(backward_backend=TritonBackend(backward=True, split_launch=True))
+  assert isinstance(meta.backward_meta, TritonBackend)
+  assert meta.backward_meta.enable_tma is False
+  assert meta.backward_meta.split_launch is True
 
 
 def test_split_launch_accepts_backward_tma():
-  meta = FFPAAttnMeta.from_kwargs(
-    enable_backward_tma=True,
-    triton_backward_enable_split_launch=True,
-  )
-  assert meta.enable_backward_tma == 1
-  assert meta.triton_backward_enable_split_launch is True
+  meta = FFPAAttnMeta.from_backends(backward_backend=TritonBackend(backward=True, enable_tma=True, split_launch=True), )
+  assert isinstance(meta.backward_meta, TritonBackend)
+  assert meta.backward_meta.enable_tma is True
+  assert meta.backward_meta.split_launch is True
 
 
 def test_directional_tma_ws_flags_can_split_forward_and_backward():
-  meta = FFPAAttnMeta.from_kwargs(
-    enable_forward_tma=True,
-    enable_backward_tma=False,
-    enable_forward_ws=True,
-    enable_backward_ws=False,
+  meta = FFPAAttnMeta.from_backends(
+    TritonBackend(forward=True, enable_tma=True, enable_ws=True),
+    TritonBackend(backward=True),
   )
-  assert meta.enable_forward_tma == 1
-  assert meta.enable_backward_tma == 0
-  assert meta.enable_forward_ws == 1
-  assert meta.enable_backward_ws == 0
+  assert isinstance(meta.forward_meta, TritonBackend)
+  assert isinstance(meta.backward_meta, TritonBackend)
+  assert meta.forward_meta.enable_tma is True
+  assert meta.backward_meta.enable_tma is False
+  assert meta.forward_meta.enable_ws is True
+  assert meta.backward_meta.enable_ws is False
 
 
-def test_legacy_tma_ws_flags_map_to_both_directions():
-  meta = FFPAAttnMeta.from_kwargs(enable_tma=True, enable_ws=True)
-  assert meta.enable_forward_tma == 1
-  assert meta.enable_backward_tma == 1
-  assert meta.enable_forward_ws == 1
-  assert meta.enable_backward_ws == 1
+def test_from_options_rejects_string_backends():
+  with pytest.raises(TypeError, match="forward_backend must be a Backend object"):
+    FFPAAttnMeta.from_options(forward_backend="triton")  # type: ignore[arg-type]
 
 
-def test_legacy_tma_ws_flags_reject_conflicting_directional_values():
-  with pytest.raises(ValueError, match="enable_tma conflicts"):
-    FFPAAttnMeta.from_kwargs(enable_tma=True, enable_forward_tma=False)
-  with pytest.raises(ValueError, match="enable_ws conflicts"):
-    FFPAAttnMeta.from_kwargs(enable_ws=True, enable_backward_ws=False)
+def test_new_backends_reject_wrong_direction_pairing():
+  with pytest.raises(AssertionError, match="forward_backend must be configured"):
+    FFPAAttnMeta.from_backends(TritonBackend(backward=True), TritonBackend(backward=True))
 
 
 def test_directional_ws_without_tma_is_allowed_as_noop_option():
-  meta = FFPAAttnMeta.from_kwargs(enable_forward_ws=True, enable_backward_ws=True)
-  assert meta.enable_forward_tma == 0
-  assert meta.enable_backward_tma == 0
-  assert meta.enable_forward_ws == 1
-  assert meta.enable_backward_ws == 1
+  meta = FFPAAttnMeta.from_backends(
+    TritonBackend(forward=True, enable_ws=True),
+    TritonBackend(backward=True, enable_ws=True),
+  )
+  assert isinstance(meta.forward_meta, TritonBackend)
+  assert isinstance(meta.backward_meta, TritonBackend)
+  assert meta.forward_meta.enable_tma is False
+  assert meta.backward_meta.enable_tma is False
+  assert meta.forward_meta.enable_ws is True
+  assert meta.backward_meta.enable_ws is True
 
 
-@pytest.mark.parametrize("old_key", ["triton_forward_autotune", "triton_backward_autotune"])
-def test_old_directional_triton_autotune_keys_are_rejected(old_key):
-  with pytest.raises(TypeError, match=old_key):
-    FFPAAttnMeta.from_kwargs(**{old_key: True})
+def test_sdpa_backward_exposes_high_precision_grad():
+  meta = FFPAAttnMeta.from_backends(backward_backend=SDPABackend(backward=True, high_precision_grad=True))
+  assert isinstance(meta.backward_meta, SDPABackend)
+  assert meta.backward_meta.high_precision_grad is True
 
 
 @pytest.mark.parametrize("mode", ["fast", "max"])
 def test_triton_autotune_mode_accepts_valid_values(mode):
-  meta = FFPAAttnMeta.from_kwargs(triton_autotune_mode=mode)
-  assert meta.triton_autotune_mode == mode
+  meta = FFPAAttnMeta.from_backends(
+    TritonBackend(forward=True, autotune_mode=mode),
+    TritonBackend(backward=True, autotune_mode=mode),
+  )
+  assert isinstance(meta.forward_meta, TritonBackend)
+  assert isinstance(meta.backward_meta, TritonBackend)
+  assert meta.forward_meta.autotune_mode == mode
+  assert meta.backward_meta.autotune_mode == mode
 
 
 def test_triton_autotune_mode_rejects_invalid_value():
-  with pytest.raises(AssertionError, match="triton_autotune_mode"):
-    FFPAAttnMeta.from_kwargs(triton_autotune_mode="bad")
+  with pytest.raises(AssertionError, match="autotune_mode"):
+    TritonBackend(forward=True, autotune_mode="bad")
 
 
 @pytest.mark.parametrize(
@@ -179,7 +198,9 @@ def test_fwd_fast_mode_prunes_generic_configs(headdim):
   fast = _gen_fwd_autotune_configs(headdim, autotune_mode="fast")
   max_configs = _gen_fwd_autotune_configs(headdim, autotune_mode="max")
   assert len(fast) < len(max_configs)
-  assert all(config.num_warps == 8 for config in fast)
+  assert {config.num_warps for config in fast} == {4, 8}
+  assert {config.kwargs["BLOCK_N"] for config in fast} == {64}
+  assert {config.num_stages for config in fast} == {2}
 
 
 def test_fwd_fast_mode_prunes_decode_configs():
@@ -189,8 +210,8 @@ def test_fwd_fast_mode_prunes_decode_configs():
 
 
 def test_sm90_fwd_configs_force_warp_specialize():
-  fast = _gen_fwd_sm90_autotune_configs(512, autotune_mode="fast", enable_ws=True)
-  max_configs = _gen_fwd_sm90_autotune_configs(512, autotune_mode="max", enable_ws=True)
+  fast = _gen_fwd_sm90_autotune_configs(autotune_mode="fast", enable_ws=True)
+  max_configs = _gen_fwd_sm90_autotune_configs(autotune_mode="max", enable_ws=True)
   serialized = [config_from_triton_config(config) for config in fast]
   max_serialized = [config_from_triton_config(config) for config in max_configs]
   ws_configs = [config for config in serialized if config["warp_specialize"]]
@@ -203,29 +224,27 @@ def test_sm90_fwd_configs_force_warp_specialize():
     (64, 64, 64, 64),
     (64, 64, 128, 128),
     (64, 128, 64, 64),
+    (64, 128, 128, 128),
     (128, 64, 64, 64),
-    (32, 64, 64, 64),
-    (32, 128, 64, 64),
-    (64, 64, 32, 64),
-    (64, 128, 32, 64),
-    (32, 64, 32, 64),
-    (32, 128, 32, 64),
+    (128, 64, 128, 128),
+    (128, 128, 64, 64),
+    (128, 128, 128, 128),
   }
   assert {(config["BLOCK_M"], config["BLOCK_N"], config["BLOCK_HEADDIM_QK"], config["BLOCK_HEADDIM_V"])
           for config in ws_configs} == expected_ws_configs
-  assert any(config["BLOCK_M"] == 32 for config in ws_configs)
-  assert any(config["BLOCK_HEADDIM_QK"] == 32 for config in ws_configs)
-  assert any(config["BLOCK_HEADDIM_QK"] != config["BLOCK_HEADDIM_V"] for config in ws_configs)
+  assert {config["BLOCK_M"] for config in ws_configs} == {64, 128}
+  assert {config["BLOCK_HEADDIM_QK"] for config in ws_configs} == {64, 128}
+  assert all(config["BLOCK_HEADDIM_QK"] == config["BLOCK_HEADDIM_V"] for config in ws_configs)
   assert all(config["num_warps"] == 4 for config in ws_configs)
-  assert {config["num_stages"] for config in ws_configs} == {1, 2, 3}
+  assert {config["num_stages"] for config in ws_configs} == {3}
   assert {(config["BLOCK_M"], config["BLOCK_N"], config["BLOCK_HEADDIM_QK"], config["BLOCK_HEADDIM_V"])
           for config in max_ws_configs} == expected_ws_configs
   assert {config["num_warps"] for config in max_ws_configs} == {4, 8}
-  assert {config["num_stages"] for config in max_ws_configs} == {1, 2, 3}
+  assert {config["num_stages"] for config in max_ws_configs} == {3}
 
 
 def test_sm90_fwd_configs_can_disable_warp_specialize():
-  configs = _gen_fwd_sm90_autotune_configs(512, autotune_mode="max", enable_ws=False)
+  configs = _gen_fwd_sm90_autotune_configs(autotune_mode="max", enable_ws=False)
   serialized = [config_from_triton_config(config) for config in configs]
   assert {config["warp_specialize"] for config in serialized} == {False}
 
@@ -237,14 +256,13 @@ def test_sm90_fwd_max_configs_add_full_headdim_on_large_gpu(monkeypatch):
   monkeypatch.setattr(torch.cuda, "get_device_name", lambda device=0: "NVIDIA H800")
 
   configs = _gen_fwd_sm90_autotune_configs(
-    320,
     autotune_mode="max",
     enable_ws=False,
   )
   serialized = [config_from_triton_config(config) for config in configs]
 
-  assert any(config["BLOCK_HEADDIM_QK"] == 512 for config in serialized)
-  assert any(config["BLOCK_HEADDIM_V"] == 512 for config in serialized)
+  assert {config["BLOCK_HEADDIM_QK"] for config in serialized} == {64, 128}
+  assert {config["BLOCK_HEADDIM_V"] for config in serialized} == {64, 128}
 
 
 def test_sm90_fwd_max_configs_skip_full_headdim_on_rtx(monkeypatch):
@@ -254,14 +272,13 @@ def test_sm90_fwd_max_configs_skip_full_headdim_on_rtx(monkeypatch):
   monkeypatch.setattr(torch.cuda, "get_device_name", lambda device=0: "NVIDIA GeForce RTX 5090")
 
   configs = _gen_fwd_sm90_autotune_configs(
-    320,
     autotune_mode="max",
     enable_ws=False,
   )
   serialized = [config_from_triton_config(config) for config in configs]
 
-  assert all(config["BLOCK_HEADDIM_QK"] != 512 for config in serialized)
-  assert all(config["BLOCK_HEADDIM_V"] != 512 for config in serialized)
+  assert {config["BLOCK_HEADDIM_QK"] for config in serialized} == {64, 128}
+  assert {config["BLOCK_HEADDIM_V"] for config in serialized} == {64, 128}
 
 
 def test_persistent_payload_records_hardware_desc(monkeypatch):
@@ -408,8 +425,8 @@ def test_persistent_tune_forward_records_sm90_tma_config(monkeypatch):
   assert sm90_entry["enable_tma"] is True
   assert sm90_entry["enable_ws"] is True
   assert sm90_entry["config"]["warp_specialize"] is True
-  assert seen_kwargs["enable_tma"] is True
-  assert seen_kwargs["enable_ws"] is True
+  assert seen_kwargs["forward_backend"].enable_tma is True
+  assert seen_kwargs["forward_backend"].enable_ws is True
   assert list(entries.values()) == [generic_entry, sm90_entry]
 
 
@@ -446,7 +463,7 @@ def test_persistent_tune_forward_allows_sm90_ws_for_masked_variants(monkeypatch,
 
   def fake_ffpa_attn_func(*args, **kwargs):
     del args
-    seen["call_ws"] = kwargs["enable_ws"]
+    seen["call_ws"] = kwargs["forward_backend"].enable_ws
     return torch.empty_like(q)
 
   monkeypatch.setattr(autotune_module, "_make_tensors", lambda task, batch: (q, k, v))
@@ -465,8 +482,12 @@ def test_persistent_tune_forward_allows_sm90_ws_for_masked_variants(monkeypatch,
 def test_bwd_non_main_modes_use_same_preprocess_configs():
   fast = _gen_pre_autotune_configs(d_chunk=False, autotune_mode="fast")
   max_configs = _gen_pre_autotune_configs(d_chunk=False, autotune_mode="max")
-  assert [config_from_triton_config(config)
-          for config in fast] == [config_from_triton_config(config) for config in max_configs]
+  fast_serialized = [config_from_triton_config(config) for config in fast]
+  max_serialized = [config_from_triton_config(config) for config in max_configs]
+  assert {config["D_CHUNK"] for config in fast_serialized} == {False}
+  assert {config["D_CHUNK"] for config in max_serialized} == {False}
+  assert {config["num_stages"] for config in fast_serialized} == {3}
+  assert {config["num_stages"] for config in max_serialized} == {3}
 
 
 @pytest.mark.parametrize("use_gemv", [False, True])
@@ -479,26 +500,25 @@ def test_bwd_non_main_modes_use_same_decode_configs(use_gemv):
 
 def test_bwd_fast_mode_prunes_kernel_configs(monkeypatch):
   monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (9, 0))
-  fast = _gen_bwd_autotune_configs((64, ), autotune_mode="fast")
-  max_configs = _gen_bwd_autotune_configs((64, 128), autotune_mode="max")
+  fast = _gen_bwd_autotune_configs(autotune_mode="fast")
+  max_configs = _gen_bwd_autotune_configs(autotune_mode="max")
   assert len(fast) < len(max_configs)
 
 
 def test_bwd_max_mode_keeps_main_kernel_search_light_on_sm90(monkeypatch):
   monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (9, 0))
-  configs = _gen_bwd_autotune_configs((64, 128), autotune_mode="max")
+  configs = _gen_bwd_autotune_configs(autotune_mode="max")
   serialized = [config_from_triton_config(config) for config in configs]
-  assert len(serialized) == 48
-  assert {config["BLOCK_HEADDIM"] for config in serialized} == {64, 128, 256}
+  assert len(serialized) == 32
+  assert {config["BLOCK_HEADDIM"] for config in serialized} == {64, 128}
   assert {config["num_stages"] for config in serialized} == {2, 3}
 
 
 def test_bwd_max_mode_matches_fast_kernel_search_below_sm90(monkeypatch):
   monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (8, 9))
-  fast = _gen_bwd_autotune_configs((64, ), autotune_mode="fast")
-  max_configs = _gen_bwd_autotune_configs((64, 128), autotune_mode="max")
-  assert [config_from_triton_config(config)
-          for config in max_configs] == [config_from_triton_config(config) for config in fast]
+  fast = _gen_bwd_autotune_configs(autotune_mode="fast")
+  max_configs = _gen_bwd_autotune_configs(autotune_mode="max")
+  assert len(max_configs) > len(fast)
 
 
 def test_sm90_bwd_tma_configs_are_tma_only_in_phase1(monkeypatch):
@@ -511,7 +531,7 @@ def test_sm90_bwd_tma_configs_are_tma_only_in_phase1(monkeypatch):
   assert len(fast) < len(max_configs)
   assert {config["warp_specialize"] for config in serialized} == {False}
   assert {config["BLOCK_N"] for config in serialized} == {64}
-  assert {config["BLOCK_HEADDIM"] for config in max_serialized} == {64, 128, 256}
+  assert {config["BLOCK_HEADDIM"] for config in max_serialized} == {64, 128}
   assert {config["num_stages"] for config in max_serialized} == {2, 3}
 
 
@@ -655,9 +675,9 @@ def test_persistent_tune_backward_records_sm90_tma_config(monkeypatch):
   assert sm90_entry["enable_tma"] is True
   assert sm90_entry["enable_ws"] is False
   assert sm90_entry["config"]["warp_specialize"] is False
-  assert seen_kwargs["enable_tma"] is True
-  assert seen_kwargs["enable_ws"] is False
-  assert seen_kwargs["triton_backward_enable_split_launch"] is False
+  assert seen_kwargs["backward_backend"].enable_tma is True
+  assert seen_kwargs["backward_backend"].enable_ws is False
+  assert seen_kwargs["backward_backend"].split_launch is False
   assert list(entries.values())[-2:] == [generic_entry, sm90_entry]
 
 
@@ -736,8 +756,8 @@ def test_persistent_tune_backward_records_split_sm90_tma_configs(monkeypatch):
   assert generic_dkdv_entry["bias_grad"] is False
   assert generic_dq_entry["bias_grad"] is False
   assert dq_entry["bias_grad"] is False
-  assert [kwargs["triton_backward_enable_split_launch"] for kwargs in seen_kwargs] == [False, True, False, True]
-  assert seen_kwargs[-1]["enable_tma"] is True
+  assert [kwargs["backward_backend"].split_launch for kwargs in seen_kwargs] == [False, True, False, True]
+  assert seen_kwargs[-1]["backward_backend"].enable_tma is True
 
 
 def test_persistent_tune_backward_records_generic_split_without_tma(monkeypatch):
@@ -774,8 +794,8 @@ def test_persistent_tune_backward_records_generic_split_without_tma(monkeypatch)
     "bwd_generic_dkdv",
     "bwd_generic_dq",
   ]
-  assert [kwargs["enable_tma"] for kwargs in seen_kwargs] == [False, False]
-  assert [kwargs["triton_backward_enable_split_launch"] for kwargs in seen_kwargs] == [False, True]
+  assert [kwargs["backward_backend"].enable_tma for kwargs in seen_kwargs] == [False, False]
+  assert [kwargs["backward_backend"].split_launch for kwargs in seen_kwargs] == [False, True]
 
 
 def test_forward_autotune_keys_include_causal():
@@ -891,7 +911,7 @@ def test_persistent_autotune_full_tasks_add_mask_dropout_gqa_mqa():
 
 
 def test_triton_config_serialization_round_trip_shape():
-  config = _gen_bwd_autotune_configs((64, ), autotune_mode="fast")[0]
+  config = _gen_bwd_autotune_configs(autotune_mode="fast")[0]
   serialized = config_from_triton_config(config)
   assert serialized["BLOCK_M"] in (64, 128)
   assert serialized["BLOCK_N"] == 64

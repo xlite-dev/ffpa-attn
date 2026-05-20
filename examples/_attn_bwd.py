@@ -21,7 +21,7 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
-from ffpa_attn import ffpa_attn_func
+from ffpa_attn import CuTeDSLBackend, SDPABackend, TritonBackend, ffpa_attn_func
 from _attn_flops import attention_bwd_flops, format_tflops_short, tflops_from_ms
 
 DEFAULT_WARMUP = 2
@@ -472,6 +472,31 @@ def _ffpa_forward(
   enable_persist_dkdv: bool = False,
   enable_split_launch: bool = False,
 ) -> torch.Tensor:
+  if backward_backend == "cutedsl":
+    forward_meta = CuTeDSLBackend(forward=True)
+    backward_meta = CuTeDSLBackend(backward=True)
+  else:
+    forward_meta = TritonBackend(
+      forward=True,
+      autotune=triton_autotune,
+      autotune_mode=triton_autotune_mode,
+    )
+    if backward_backend == "triton":
+      backward_meta = TritonBackend(
+        backward=True,
+        autotune=triton_autotune,
+        autotune_mode=triton_autotune_mode,
+        enable_tma=enable_tma,
+        enable_ws=enable_ws,
+        persist_dkdv=enable_persist_dkdv,
+        split_launch=enable_split_launch,
+        grad_kv_storage_dtype=triton_backward_grad_kv_storage_dtype,
+      )
+    elif backward_backend == "sdpa":
+      backward_meta = SDPABackend(backward=True)
+    else:
+      raise ValueError(f"Unsupported backward_backend={backward_backend!r}")
+
   return ffpa_attn_func(
     q_i,
     k_i,
@@ -481,15 +506,8 @@ def _ffpa_forward(
     dropout_p=dropout_p,
     scale=scale,
     enable_gqa=q_i.size(1) != k_i.size(1),
-    forward_backend="cutedsl" if backward_backend == "cutedsl" else "triton",
-    backward_backend=backward_backend,
-    triton_autotune=triton_autotune,
-    triton_autotune_mode=triton_autotune_mode,
-    triton_backward_grad_kv_storage_dtype=triton_backward_grad_kv_storage_dtype,
-    enable_backward_tma=enable_tma,
-    enable_backward_ws=enable_ws,
-    triton_backward_enable_persist_dkdv=enable_persist_dkdv,
-    triton_backward_enable_split_launch=enable_split_launch,
+    forward_backend=forward_meta,
+    backward_backend=backward_meta,
   )
 
 
@@ -686,15 +704,23 @@ def _run_case(
     dropout_p=dropout_p,
     scale=scale,
     enable_gqa=Nh_q != Nh_kv,
-    forward_backend="cutedsl" if backward_backend == "cutedsl" else "triton",
-    backward_backend=backward_backend,
-    triton_autotune=triton_autotune,
-    triton_autotune_mode=triton_autotune_mode,
-    triton_backward_grad_kv_storage_dtype=triton_backward_grad_kv_storage_dtype,
-    enable_backward_tma=enable_tma,
-    enable_backward_ws=enable_ws,
-    triton_backward_enable_persist_dkdv=enable_persist_dkdv,
-    triton_backward_enable_split_launch=enable_split_launch,
+    forward_backend=CuTeDSLBackend(forward=True) if backward_backend == "cutedsl" else TritonBackend(
+      forward=True,
+      autotune=triton_autotune,
+      autotune_mode=triton_autotune_mode,
+    ),
+    backward_backend=CuTeDSLBackend(backward=True) if backward_backend == "cutedsl" else (
+      TritonBackend(
+        backward=True,
+        autotune=triton_autotune,
+        autotune_mode=triton_autotune_mode,
+        enable_tma=enable_tma,
+        enable_ws=enable_ws,
+        persist_dkdv=enable_persist_dkdv,
+        split_launch=enable_split_launch,
+        grad_kv_storage_dtype=triton_backward_grad_kv_storage_dtype,
+      ) if backward_backend == "triton" else SDPABackend(backward=True)
+    ),
   )
   out.sum().backward()
 
@@ -1010,6 +1036,8 @@ def run_backward_examples(
     })
     if tasks is not None:
       case_specs = [case for case in case_specs if case["name"] in tasks]
+    if backward_backend not in {"cutedsl", "triton", "sdpa"}:
+      raise ValueError(f"Unsupported backward_backend={backward_backend!r}")
 
     for case in case_specs:
       results.append(
@@ -1019,13 +1047,13 @@ def run_backward_examples(
           backward_backend,
           triton_autotune,
           triton_autotune_mode,
-          seed=seed,
-          B=B,
-          Nh_q=case["Nh_q"],
-          Nh_kv=case["Nh_kv"],
-          Nq=case["Nq"],
-          Nkv=case["Nkv"],
-          D=D,
+          seed,
+          B,
+          case["Nh_q"],
+          case["Nh_kv"],
+          case["Nq"],
+          case["Nkv"],
+          D,
           causal=case.get("causal", False),
           attn_mask=case.get("attn_mask"),
           dropout_p=case.get("dropout_p", 0.0),

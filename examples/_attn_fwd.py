@@ -23,7 +23,7 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
-from ffpa_attn import ffpa_attn_func
+from ffpa_attn import CUDABackend, CuTeDSLBackend, TritonBackend, ffpa_attn_func
 from _attn_flops import attention_fwd_flops, format_tflops_short, tflops_from_ms
 
 DEFAULT_WARMUP = 2
@@ -294,6 +294,30 @@ def _format_forward_result(result: FORWARD_RESULT) -> str:
   )
 
 
+def _make_forward_backend(
+  name: str,
+  *,
+  acc: str,
+  triton_autotune: bool,
+  triton_autotune_mode: str,
+  enable_tma: bool,
+  enable_ws: bool,
+):
+  if name == "cuda":
+    return CUDABackend(forward=True, acc=acc)
+  if name == "triton":
+    return TritonBackend(
+      forward=True,
+      autotune=triton_autotune,
+      autotune_mode=triton_autotune_mode,
+      enable_tma=enable_tma,
+      enable_ws=enable_ws,
+    )
+  if name == "cutedsl":
+    return CuTeDSLBackend(forward=True)
+  raise ValueError(f"Unsupported forward_backend={name!r}")
+
+
 def _run_case(
   name: str,
   dtype: torch.dtype,
@@ -324,23 +348,25 @@ def _run_case(
   k = torch.randn(B, Nh_kv, Nkv, D, dtype=dtype, device="cuda")
   v = torch.randn(B, Nh_kv, Nkv, D, dtype=dtype, device="cuda")
   q, k, v = _maybe_norm_qkv(q, k, v, apply_norm)
+  backend = _make_forward_backend(
+    forward_backend,
+    acc=acc,
+    triton_autotune=triton_autotune,
+    triton_autotune_mode=triton_autotune_mode,
+    enable_tma=enable_tma,
+    enable_ws=enable_ws,
+  )
 
   torch.manual_seed(seed + 17)
   out_ffpa = ffpa_attn_func(
     q,
     k,
     v,
-    acc=acc,
     attn_mask=attn_mask,
     is_causal=causal,
     dropout_p=dropout_p,
     enable_gqa=Nh_q != Nh_kv,
-    forward_backend=forward_backend,
-    triton_autotune=triton_autotune,
-    triton_autotune_mode=triton_autotune_mode,
-    triton_backward_grad_kv_storage_dtype=triton_backward_grad_kv_storage_dtype,
-    enable_forward_tma=enable_tma,
-    enable_forward_ws=enable_ws,
+    forward_backend=backend,
   )
   k_ref, v_ref = _expand_kv(k, v, Nh_q)
   torch.manual_seed(seed + 17)
@@ -354,17 +380,11 @@ def _run_case(
       q,
       k,
       v,
-      acc=acc,
       attn_mask=attn_mask,
       is_causal=causal,
       dropout_p=dropout_p,
       enable_gqa=Nh_q != Nh_kv,
-      forward_backend=forward_backend,
-      triton_autotune=triton_autotune,
-      triton_autotune_mode=triton_autotune_mode,
-      triton_backward_grad_kv_storage_dtype=triton_backward_grad_kv_storage_dtype,
-      enable_forward_tma=enable_tma,
-      enable_forward_ws=enable_ws,
+      forward_backend=backend,
     ),
     q,
     k,
