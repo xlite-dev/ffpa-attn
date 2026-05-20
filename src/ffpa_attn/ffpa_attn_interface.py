@@ -305,7 +305,7 @@ def ffpa_attn_varlen_func(
   :param return_lse: When ``True``, also return the log-sum-exp tensor of
       shape ``[H_q, T_q]`` in fp32 (CUDA convention).
   :param kwargs: Most kwargs are recognized-and-rejected by
-      :func:`ffpa_attn.cutedsl._wrappers._check_supported_options` — passing a
+      :func:`ffpa_attn.cutedsl._check_supported_options` — passing a
       non-default value for ``window_size``, ``softcap``, ``sink``,
       ``attention_mask`` / ``attn_mask``, ``block_mask``, ``score_mod``,
       ``aux_tensors``, ``seqused_k``, ``block_table``, ``num_splits``, or
