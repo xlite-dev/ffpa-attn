@@ -66,6 +66,14 @@ def _normalize_grad_kv_storage_dtype(dtype: torch.dtype | str | None) -> torch.d
 
 @dataclass
 class Backend:
+  """Base backend configuration.
+
+  :ivar name: Backend identifier (e.g. "triton", "cutedsl").
+  :ivar forward: Whether this instance configures the forward pass.  ``None``
+      (default) means "not explicitly set"; resolved by :meth:`__post_init__`.
+  :ivar backward: Whether this instance configures the backward pass.
+      Same ``None`` semantics as *forward*.
+  """
   name: str
   forward: bool | None = None
   backward: bool | None = None
@@ -82,6 +90,15 @@ class Backend:
 
 @dataclass
 class SDPABackend(Backend):
+  """PyTorch native ``scaled_dot_product_attention`` backend.
+
+  Forward always short-circuits via :meth:`FFPAAttnMeta.fallback`.
+  When used as ``backward_backend`` it delegates to
+  :func:`_aten_efficient_attn_backward`.
+
+  :ivar high_precision_grad: When ``True`` request higher numerical
+      precision for the backward pass (passed through to aten).
+  """
   name: str = "sdpa"
   high_precision_grad: bool = False
 
@@ -91,6 +108,12 @@ class SDPABackend(Backend):
 
 @dataclass
 class CUDABackend(Backend):
+  """Hand-written CUDA forward-only backend.
+
+  :ivar acc: MMA accumulator precision (``"f16"`` or ``"f32"``).
+  :ivar stages: Pipeline stages for the CUDA kernel (3 on Ampere/Ada,
+      4 on Hopper+).
+  """
   name: str = "cuda"
   acc: str = "f32"
   stages: int = 4 if _is_hopper_or_later() else 3
@@ -107,6 +130,20 @@ class CUDABackend(Backend):
 
 @dataclass
 class TritonBackend(Backend):
+  """Triton forward + backward backend (default).
+
+  :ivar autotune: Enable Triton autotuning for kernel parameters.
+  :ivar autotune_mode: Autotune search granularity (``"fast"`` or ``"max"``).
+  :ivar enable_tma: Enable experimental SM90+ TMA hardware acceleration.
+  :ivar enable_ws: Force warp-specialized configs (requires *enable_tma*).
+  :ivar persist_dkdv: Keep ``dK``/``dV`` accumulator in fp32 across
+      backward invocations (requires *enable_tma* and ``backward=True``).
+  :ivar split_launch: Issue separate backward launches for ``dKdV`` and
+      ``dQ`` for finer-grained scheduling.
+  :ivar preprocess_d_chunk: Split the ``d_chunk`` preprocess across tiles.
+  :ivar grad_kv_storage_dtype: Optional ``torch.float32`` / ``torch.float16``
+      storage dtype for ``dK``/``dV``, workaround for causal bf16 precision.
+  """
   name: str = "triton"
   autotune: bool = False
   autotune_mode: str = "fast"
@@ -131,6 +168,11 @@ class TritonBackend(Backend):
 
 @dataclass
 class CuTeDSLBackend(Backend):
+  """CuTeDSL SM90-specialized backend (Hopper only, D=512, bf16 training).
+
+  No additional configuration knobs — kernel parameters are hard-coded
+  for the SplitD ``tile_m=64, tile_n=128`` pipeline.
+  """
   name: str = "cutedsl"
 
 
