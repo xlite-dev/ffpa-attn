@@ -120,15 +120,13 @@ class FFPAAttnBwdDQSm90SplitDD384:
     self.buffer_align_bytes = 1024
 
     # ── SplitD parameters for physical D=384 ──
-    self.d_chunk = 128
-    self.num_d_passes = self.tile_hdim // self.d_chunk  # = 3
-    self.num_d_inner = self.tile_hdim // self.d_chunk  # = 3 (Phase A/C reduction along D)
+    self.d_chunk = 256
+    self.num_d_passes = 2  # pass 0 handles 0:256, pass 1 handles 256:384 plus OOB
+    self.num_d_inner = 2  # Phase A/C reduction along D with OOB zero-fill for the tail
 
     # Cooperative N-axis half size for Phase E (dQ += dS @ K_d_pass).
     # Each WG handles d_chunk//2 columns of the dQ output tile.
-    self.dQ_n_half = self.d_chunk // 2  # = 64
-    assert self.tile_hdim % self.d_chunk == 0
-    assert self.tile_hdimv % self.d_chunk == 0
+    self.dQ_n_half = self.d_chunk // 2  # = 128
     assert self.d_chunk % 2 == 0, "cooperative ① requires d_chunk divisible by 2"
 
     # ── MMA WG configuration (dual asymmetric + cooperative on dQ) ──
@@ -1048,9 +1046,6 @@ class FFPAAttnBwdDQSm90SplitDD384:
     acc_dQ_pass_1_front = cute.make_rmem_tensor(
       tiled_mma_dQ.partition_shape_C(shape_mnk_dQ_half[:2]), Float32
     )
-    acc_dQ_pass_2_front = cute.make_rmem_tensor(
-      tiled_mma_dQ.partition_shape_C(shape_mnk_dQ_half[:2]), Float32
-    )
     _, tDQrA, tDQrB_front = sm90_utils.partition_fragment_ABC(
       wg_mma_dQ, shape_mnk_dQ_half, sdS, sKt_front_t, swap_AB=False
     )
@@ -1127,7 +1122,6 @@ class FFPAAttnBwdDQSm90SplitDD384:
           shape_mnk_SdP,
           acc_dQ_pass_0_front,
           acc_dQ_pass_1_front,
-          acc_dQ_pass_2_front,
           copy_P_fp32_r2s,
           pipeline_QdO,
           pipeline_B,
@@ -1146,7 +1140,6 @@ class FFPAAttnBwdDQSm90SplitDD384:
         self.epilogue_dQ_half_slice(
           acc_dQ_pass_0_front,
           acc_dQ_pass_1_front,
-          acc_dQ_pass_2_front,
           mdQ_half,
           sEpi_front,
           seqlen,
@@ -1194,7 +1187,6 @@ class FFPAAttnBwdDQSm90SplitDD384:
     shape_mnk_SdP: cute.Shape,
     acc_dQ_pass_0_front: cute.Tensor,
     acc_dQ_pass_1_front: cute.Tensor,
-    acc_dQ_pass_2_front: cute.Tensor,
     copy_P_fp32_r2s: Callable,
     pipeline_QdO: pipeline.PipelineAsync,
     pipeline_B: pipeline.PipelineAsync,
@@ -1317,17 +1309,6 @@ class FFPAAttnBwdDQSm90SplitDD384:
           B_idx=consumer_state_Kt.index,
           wg_wait=0,
         )
-      else:
-        gemm_w_idx(
-          tiled_mma_dQ,
-          acc_dQ_pass_2_front,
-          tDQrA,
-          tDQrB_front,
-          zero_init=not dQ_accumulate,
-          A_idx=p_stage,
-          B_idx=consumer_state_Kt.index,
-          wg_wait=0,
-        )
       with cute.arch.elect_one():
         pipeline_Kt.consumer_release(consumer_state_Kt)
       consumer_state_Kt.advance()
@@ -1390,9 +1371,6 @@ class FFPAAttnBwdDQSm90SplitDD384:
       tiled_mma_dQ.partition_shape_C(shape_mnk_dQ_half[:2]), Float32
     )
     acc_dQ_pass_1_back = cute.make_rmem_tensor(
-      tiled_mma_dQ.partition_shape_C(shape_mnk_dQ_half[:2]), Float32
-    )
-    acc_dQ_pass_2_back = cute.make_rmem_tensor(
       tiled_mma_dQ.partition_shape_C(shape_mnk_dQ_half[:2]), Float32
     )
     _, tDQrA, tDQrB_back = sm90_utils.partition_fragment_ABC(
@@ -1477,7 +1455,6 @@ class FFPAAttnBwdDQSm90SplitDD384:
           shape_mnk_SdP,
           acc_dQ_pass_0_back,
           acc_dQ_pass_1_back,
-          acc_dQ_pass_2_back,
           copy_dS_r2s,
           tSsP_fp32_partition,
           sB,
@@ -1500,7 +1477,6 @@ class FFPAAttnBwdDQSm90SplitDD384:
         self.epilogue_dQ_half_slice(
           acc_dQ_pass_0_back,
           acc_dQ_pass_1_back,
-          acc_dQ_pass_2_back,
           mdQ_half,
           sEpi_back,
           seqlen,
@@ -1552,7 +1528,6 @@ class FFPAAttnBwdDQSm90SplitDD384:
     shape_mnk_SdP: cute.Shape,
     acc_dQ_pass_0_back: cute.Tensor,
     acc_dQ_pass_1_back: cute.Tensor,
-    acc_dQ_pass_2_back: cute.Tensor,
     copy_dS_r2s: Callable,
     tSsP_fp32_partition: cute.Tensor,
     sB: cute.Tensor,
@@ -1710,17 +1685,6 @@ class FFPAAttnBwdDQSm90SplitDD384:
           B_idx=consumer_state_Kt.index,
           wg_wait=0,
         )
-      else:
-        gemm_w_idx(
-          tiled_mma_dQ,
-          acc_dQ_pass_2_back,
-          tDQrA,
-          tDQrB_back,
-          zero_init=not dQ_accumulate,
-          A_idx=p_stage,
-          B_idx=consumer_state_Kt.index,
-          wg_wait=0,
-        )
       with cute.arch.elect_one():
         pipeline_Kt.consumer_release(consumer_state_Kt)
       consumer_state_Kt.advance()
@@ -1780,7 +1744,6 @@ class FFPAAttnBwdDQSm90SplitDD384:
     self,
     acc_dQ_pass_0_half: cute.Tensor,
     acc_dQ_pass_1_half: cute.Tensor,
-    acc_dQ_pass_2_half: cute.Tensor,
     mdQ_half: cute.Tensor,
     sEpi_half: cute.Tensor,
     seqlen: SeqlenInfoQK,
@@ -1843,10 +1806,8 @@ class FFPAAttnBwdDQSm90SplitDD384:
       # Select the d_pass accumulator at compile time (constexpr branch).
       if cutlass.const_expr(d_pass == 0):
         copy_dQ_r2s(acc_dQ_pass_0_half, dst_idx=None)
-      elif cutlass.const_expr(d_pass == 1):
-        copy_dQ_r2s(acc_dQ_pass_1_half, dst_idx=None)
       else:
-        copy_dQ_r2s(acc_dQ_pass_2_half, dst_idx=None)
+        copy_dQ_r2s(acc_dQ_pass_1_half, dst_idx=None)
       cute.arch.fence_view_async_shared()
       # WG-internal 128-thread fence (different barrier IDs per WG so they don't collide).
       cute.arch.barrier(

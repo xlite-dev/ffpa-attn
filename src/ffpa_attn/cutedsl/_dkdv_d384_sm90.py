@@ -98,11 +98,10 @@ class FFPAAttnBwdDKDVSm90SplitDD384:
     self.buffer_align_bytes = 1024
 
     # ── SplitD parameters for physical D=384 ──
-    self.d_chunk = 128  # output slice width for dK/dV
-    self.num_d_passes = self.tile_hdim // self.d_chunk  # = 3
-    self.num_d_inner = self.tile_hdim // self.d_chunk  # = 3
-    assert self.tile_hdim % self.d_chunk == 0
-    assert self.tile_hdimv % self.d_chunk == 0
+    self.d_chunk = 256  # output slice width for dK/dV
+    self.num_d_passes = 2  # pass 0 handles 0:256, pass 1 handles 256:384 plus OOB
+    self.num_d_inner = 2
+    assert self.d_chunk <= 256
 
     # ── MMA WG configuration──
     # SdP MMA stays num_wg_mma=1 (each WG independently holds acc_S or acc_dP).
@@ -125,8 +124,8 @@ class FFPAAttnBwdDKDVSm90SplitDD384:
     self.PdS_stage = 1
 
     # ── K/V persistence : preload ONCE per work_tile, reused across d_pass ──
-    self.K_persist_chunks = self.num_d_inner  # = 2 chunks of d_chunk=256
-    self.V_persist_chunks = self.num_d_inner  # = 2
+    self.K_persist_chunks = self.num_d_inner
+    self.V_persist_chunks = self.num_d_inner
 
     # ── MMA layout configuration ──
     self.SdP_swapAB = False
