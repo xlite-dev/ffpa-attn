@@ -17,6 +17,7 @@ import cutlass
 from cutlass.base_dsl import BaseDSL
 from cutlass.base_dsl.arch import Arch
 
+MIN_GENERIC_HEAD_DIM = 256
 SUPPORTED_HEAD_DIM = 512
 FWD_TILE_M = 64
 FWD_TILE_N = 128
@@ -56,13 +57,14 @@ def _get_device_arch():
 
 
 def _validate_head_dims(head_dim: int, head_dim_v: int) -> None:
-  """Validate SplitD head dimension constraints: head_dim == head_dim_v == 512."""
-  if head_dim != SUPPORTED_HEAD_DIM or head_dim_v != SUPPORTED_HEAD_DIM:
+  """Validate dense SplitD head dimension constraints."""
+  if head_dim != head_dim_v or not (
+    MIN_GENERIC_HEAD_DIM < head_dim <= SUPPORTED_HEAD_DIM
+  ):
     raise ValueError(
       f"(head_dim, head_dim_v)=({head_dim}, {head_dim_v}) is not supported. "
-      f"This SplitD interface requires q/k head_dim == {SUPPORTED_HEAD_DIM} and "
-      f"v head_dim_v == {SUPPORTED_HEAD_DIM}, matching the kernel's fixed "
-      "8x64 D-slice layout."
+      f"This dense SplitD interface requires q/k head_dim == v head_dim_v and "
+      f"{MIN_GENERIC_HEAD_DIM} < head_dim <= {SUPPORTED_HEAD_DIM}."
     )
 
 

@@ -30,6 +30,8 @@ from ._utils import (
 from ._bwd_preprocess import FFPAAttnBwdPreprocess
 from ._dkdv_d512_sm90 import FFPAAttnBwdDKDVSm90SplitD
 from ._dq_d512_sm90 import FFPAAttnBwdDQSm90SplitD
+from ._dkdv_generic_sm90 import FFPAAttnBwdDKDVSm90SplitDGeneric
+from ._dq_generic_sm90 import FFPAAttnBwdDQSm90SplitDGeneric
 from .utils.cache_utils import get_jit_cache
 from .utils.cute_dsl_utils import (
   to_cute_tensor,
@@ -338,7 +340,11 @@ def _ffpa_attn_backward_sm90(
       if cu_seqlens_k is not None else None
     )
 
-    ffpa_dkdv = FFPAAttnBwdDKDVSm90SplitD(
+    dkdv_kernel_cls = (
+      FFPAAttnBwdDKDVSm90SplitD if head_dim == 512 and head_dim_v == 512 else
+      FFPAAttnBwdDKDVSm90SplitDGeneric
+    )
+    ffpa_dkdv = dkdv_kernel_cls(
       dtype,
       head_dim,
       head_dim_v=head_dim_v,
@@ -380,7 +386,11 @@ def _ffpa_attn_backward_sm90(
       if cu_seqlens_k is not None else None
     )
 
-    ffpa_dq = FFPAAttnBwdDQSm90SplitD(
+    dq_kernel_cls = (
+      FFPAAttnBwdDQSm90SplitD if head_dim == 512 and head_dim_v == 512 else
+      FFPAAttnBwdDQSm90SplitDGeneric
+    )
+    ffpa_dq = dq_kernel_cls(
       dtype,
       head_dim,
       head_dim_v=head_dim_v,

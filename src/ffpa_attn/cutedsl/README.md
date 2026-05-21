@@ -1,6 +1,6 @@
 # FFPA CuTeDSL Backend (`ffpa_attn.cutedsl`)
 
-SM90 (Hopper) + `head_dim == 512` specialized forward and backward kernels
+SM90 (Hopper) dense `256 < head_dim <= 512` forward and backward kernels
 for FFPA, implemented in [CuTeDSL][cutedsl]. This package is an **internal
 backend**: end users should not import from `ffpa_attn.cutedsl` directly.
 The supported entry points live at the top of the `ffpa_attn` namespace:
@@ -110,7 +110,7 @@ from ffpa_attn.cutedsl import cutedsl_forward_available, cutedsl_backward_availa
 
 dev = torch.device("cuda", 0)
 if cutedsl_forward_available(dev):
-    # SM 9.x Hopper — D=512 / dtype / no-mask / no-dropout are still
+    # SM 9.x Hopper — dense head_dim / dtype / no-mask / no-dropout are still
     # validated per-call inside _require_cutedsl_supported.
     ...
 ```
@@ -161,7 +161,7 @@ Kernel class names are implementation details. File paths are the stable contrac
 | Constraint | Detail |
 |---|---|
 | **GPU** | SM 9.x (Hopper). WGMMA, TMA, named barriers. |
-| **Head dim** | `D == 512` only. |
+| **Head dim** | Dense path supports `256 < D <= 512`; varlen remains `D == 512`. |
 | **Dtype (fwd)** | fp16 or bf16. |
 | **Dtype (bwd)** | bf16 required for training. |
 | **attn_mask** | Not supported. |

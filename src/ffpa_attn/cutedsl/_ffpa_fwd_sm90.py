@@ -28,6 +28,7 @@ from ._utils import (
   torch2cute_dtype_map,
 )
 from ._fwd_d512_sm90 import FFPAAttnFwdSm90SplitD
+from ._fwd_generic_sm90 import FFPAAttnFwdSm90SplitDGeneric
 from .utils.cache_utils import get_jit_cache
 from . import utils
 from .utils import fa_logging
@@ -224,7 +225,11 @@ def _ffpa_attn_forward_sm90(
     if aux_tensors is not None:
       cute_aux_tensors = [to_cute_aux_tensor(buf) for buf in aux_tensors]
 
-    ffpa_fwd = FFPAAttnFwdSm90SplitD(
+    fwd_kernel_cls = (
+      FFPAAttnFwdSm90SplitD
+      if head_dim == 512 and head_dim_v == 512 else FFPAAttnFwdSm90SplitDGeneric
+    )
+    ffpa_fwd = fwd_kernel_cls(
       dtype,
       head_dim,
       head_dim_v,

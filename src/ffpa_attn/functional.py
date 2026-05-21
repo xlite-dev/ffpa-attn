@@ -174,7 +174,7 @@ class TritonBackend(Backend):
 
 @dataclass
 class CuTeDSLBackend(Backend):
-  """CuTeDSL SM90-specialized backend (Hopper only, D=512, bf16 training).
+  """CuTeDSL SM90-specialized backend (Hopper only, dense 256<D<=512, bf16 training).
 
   No additional configuration knobs — kernel parameters are hard-coded
   for the SplitD ``tile_m=64, tile_n=128`` pipeline.
@@ -209,7 +209,45 @@ def _resolve_backend_pair(
   assert forward_backend.forward, "forward_backend must be configured with forward=True"
   assert backward_backend.backward, "backward_backend must be configured with backward=True"
 
+  if forward_backend.name == "cutedsl" and backward_backend.name != "cutedsl":
+    raise ValueError(
+      "forward_backend='cutedsl' requires backward_backend='cutedsl'"
+    )
+  if backward_backend.name == "cutedsl" and forward_backend.name != "cutedsl":
+    raise ValueError(
+      "backward_backend='cutedsl' requires forward_backend='cutedsl'"
+    )
+
   return forward_backend, backward_backend
+
+
+def _coerce_backend(backend: Backend | str, *, source: str) -> Backend:
+  if isinstance(backend, str):
+    _BACKEND_MAP = {
+      "cuda": CUDABackend,
+      "triton": TritonBackend,
+      "cutedsl": CuTeDSLBackend,
+      "sdpa": SDPABackend,
+    }
+    cls_name = _BACKEND_MAP.get(backend)
+    if cls_name is None:
+      raise ValueError(
+        f"ffpa_attn_func: {source} must be 'cuda', 'triton', 'cutedsl', or 'sdpa', got {backend!r}"
+      )
+    return cls_name()
+  if not isinstance(backend, Backend):
+    raise TypeError(
+      f"ffpa_attn_func: {source} must be a str or Backend instance, got {type(backend).__name__}"
+    )
+  return backend
+
+
+def _coerce_optional_backend(
+  backend: Backend | str | None,
+  *,
+  source: str,
+) -> Backend | None:
+  return None if backend is None else _coerce_backend(backend, source=source)
 
 
 def _reserve_large_d_dropout_rng(
@@ -317,8 +355,12 @@ class FFPAAttnMeta:
     Raises ``TypeError`` for any unexpected keyword arguments.
     """
     backend = kwargs.pop("backend", None)
-    forward_backend = kwargs.pop("forward_backend", None)
-    backward_backend = kwargs.pop("backward_backend", None)
+    forward_backend = _coerce_optional_backend(
+      kwargs.pop("forward_backend", None), source="forward_backend"
+    )
+    backward_backend = _coerce_optional_backend(
+      kwargs.pop("backward_backend", None), source="backward_backend"
+    )
 
     if kwargs:
       unexpected = ", ".join(sorted(kwargs))
@@ -327,25 +369,14 @@ class FFPAAttnMeta:
       )
 
     if forward_backend is None and backward_backend is None and backend is not None:
-      if isinstance(backend, str):
-        _BACKEND_MAP = {
-          "cuda": CUDABackend,
-          "triton": TritonBackend,
-          "cutedsl": CuTeDSLBackend,
-          "sdpa": SDPABackend
-        }
-        cls_name = _BACKEND_MAP.get(backend)
-        if cls_name is None:
-          raise ValueError(
-            f"ffpa_attn_func: backend must be 'cuda', 'triton', or 'cutedsl', got {backend!r}"
-          )
-        backend = cls_name()
-      if not isinstance(backend, Backend):
-        raise TypeError(
-          f"ffpa_attn_func: backend must be a str or Backend instance, got {type(backend).__name__}"
-        )
+      backend = _coerce_backend(backend, source="backend")
       forward_backend = backend
       backward_backend = backend
+
+    if forward_backend is not None and backward_backend is None and forward_backend.name == "cutedsl":
+      backward_backend = CuTeDSLBackend()
+    if backward_backend is not None and forward_backend is None and backward_backend.name == "cutedsl":
+      forward_backend = CuTeDSLBackend()
 
     forward_backend, backward_backend = _resolve_backend_pair(
       forward_backend, backward_backend
@@ -406,7 +437,7 @@ class FFPAAttnMeta:
 
     if self.forward_meta.name == "cutedsl":
       from .cutedsl import cutedsl_forward_available
-      cutedsl_hw_unsupported = D != 512 or not cutedsl_forward_available(
+      cutedsl_hw_unsupported = D <= 256 or D > 512 or not cutedsl_forward_available(
         query.device
       )
       return cutedsl_hw_unsupported

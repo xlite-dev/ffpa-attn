@@ -10,7 +10,7 @@ python3 examples/perf.py --no-fwd # only backward pass
 python3 examples/perf.py --fwd-backend triton --bwd-backend triton --tune fast
 python3 examples/perf.py --fwd-backend triton --bwd-backend triton --tune max
 python3 examples/perf.py --fwd-backend triton --bwd-backend triton --tune max --fwd-tma --bwd-tma # SM>=90
-python3 examples/perf.py --fwd-backend cutedsl --bwd-backend cutedsl # SM==90 + D=512 only
+python3 examples/perf.py --fwd-backend cutedsl --bwd-backend cutedsl # SM==90 + dense 256<D<=512
 ```
 
 The `examples/perf.py` migrated benchmark plotting entrypoint. It preserves the old plot style, can benchmark forward/backward cases on demand, and writes both `ffpa_{device}_speedup.png` and `ffpa_{device}_speedup.md`. The additive-mask example uses a compact `[1, 1, 1, Nkv]` key-position bias by default. Use `[1, 1, Nq, Nkv]` only when per-query bias is required, since it scales as `O(Nq * Nkv)` memory.

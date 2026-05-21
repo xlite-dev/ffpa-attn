@@ -550,7 +550,7 @@ def run_forward_examples(
   )
   if forward_backend == "cutedsl":
     print(
-      "[CuTeDSL] backend constraints in effect: D=512 only, no attn_mask/dropout."
+      "[CuTeDSL] backend constraints in effect: dense 256<D<=512, no attn_mask/dropout."
     )
 
   for dtype in dtypes:
