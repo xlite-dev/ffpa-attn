@@ -28,11 +28,11 @@ from ._utils import (
   torch2cute_dtype_map,
 )
 from ._fwd_d512_sm90 import FFPAAttnFwdSm90SplitD
-from ._fwd_generic_sm90 import (
+from ._fwd_d384_sm90 import (
   D384_AWARE_HEAD_DIM,
   FFPAAttnFwdSm90SplitDD384Aware,
-  FFPAAttnFwdSm90SplitDGeneric,
 )
+from ._fwd_generic_sm90 import FFPAAttnFwdSm90SplitDGeneric
 from .utils.cache_utils import get_jit_cache
 from . import utils
 from .utils import fa_logging
