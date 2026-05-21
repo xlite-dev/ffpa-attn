@@ -101,7 +101,9 @@ def make_pipeline_state(type: PipelineUserType, stages: int):
 # ── Shared helpers ───────────────────────────────────────────────────────────
 
 
-def _call_with_elect_one(parent_method, self, state, elect_one, syncwarp, loc, ip):
+def _call_with_elect_one(
+  parent_method, self, state, elect_one, syncwarp, loc, ip
+):
   """Optionally wrap a parent pipeline method call in sync_warp + elect_one."""
   if const_expr(elect_one):
     if const_expr(syncwarp):
@@ -329,15 +331,20 @@ class PipelineTmaAsync(_PipelineIndexPhaseMixin, PipelineTmaAsyncOg):
         """
     if_generate(
       try_acquire_token is None or try_acquire_token == 0,
-      lambda: self.sync_object_empty.wait(state.index, state.phase, loc=loc, ip=ip),
+      lambda: self.sync_object_empty.
+      wait(state.index, state.phase, loc=loc, ip=ip),
       loc=loc,
       ip=ip,
     )
     if const_expr(extra_tx_count == 0):
-      self.sync_object_full.arrive(state.index, self.producer_mask, loc=loc, ip=ip)
+      self.sync_object_full.arrive(
+        state.index, self.producer_mask, loc=loc, ip=ip
+      )
     else:
       tx_count = self.sync_object_full.tx_count + extra_tx_count
-      self.sync_object_full.arrive_and_expect_tx(state.index, tx_count, loc=loc, ip=ip)
+      self.sync_object_full.arrive_and_expect_tx(
+        state.index, tx_count, loc=loc, ip=ip
+      )
 
 
 PipelineTmaAsync.create = _override_create(PipelineTmaAsyncOg, PipelineTmaAsync)

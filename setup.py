@@ -125,11 +125,16 @@ if BUILD_CUDA_EXT:
       sources=[
         # Convert to repo-relative paths; setuptools rejects absolute paths
         # in ``sources`` for editable installs (``pip install -e .``).
-        os.path.relpath(s, _ROOT) for s in ENV.get_build_sources(build_pkg=True)
+        os.path.relpath(s, _ROOT)
+        for s in ENV.get_build_sources(build_pkg=True)
       ],
       extra_compile_args={
         "cxx": [flag for flag in ENV.extra_gcc_flags() if flag.strip()],
-        "nvcc": [flag for flag in (ENV.get_build_cuda_cflags(build_pkg=True) + cc_flag) if flag.strip()],
+        "nvcc": [
+          flag
+          for flag in (ENV.get_build_cuda_cflags(build_pkg=True) + cc_flag)
+          if flag.strip()
+        ],
       },
       include_dirs=[
         Path(ENV.project_dir()) / "csrc" / "cuffpa",

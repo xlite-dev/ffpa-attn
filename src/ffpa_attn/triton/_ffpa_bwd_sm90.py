@@ -212,7 +212,8 @@ def _ffpa_bwd_dkdv_sm90(
         Di = tl.load(D + offs_qm, mask=offs_qm < seqlen_q, other=0.0)
       if BIAS_REQUIRES_GRAD:
         dBias = P * (dP - Di[:, None])
-        grad_bias_mask = (offs_qm[:, None] < seqlen_q) & (offs_n[None, :] < seqlen_k)
+        grad_bias_mask = (offs_qm[:, None]
+                          < seqlen_q) & (offs_n[None, :] < seqlen_k)
         if GRAD_BIAS_REDUCES_M:
           m_block = start_m // BLOCK_M
           grad_bias_ptrs = GradAttnBias + m_block * stride_gbm + offs_n * stride_gbn
@@ -220,12 +221,22 @@ def _ffpa_bwd_dkdv_sm90(
           if GRAD_BIAS_STORE_PARTIAL:
             tl.store(grad_bias_ptrs, grad_bias, mask=offs_n < seqlen_k)
           else:
-            tl.atomic_add(grad_bias_ptrs, grad_bias, sem="relaxed", mask=offs_n < seqlen_k)
+            tl.atomic_add(
+              grad_bias_ptrs, grad_bias, sem="relaxed", mask=offs_n < seqlen_k
+            )
         elif GRAD_BIAS_NEEDS_REDUCTION:
-          grad_bias_ptrs = GradAttnBias + offs_qm[:, None] * stride_gbm + offs_n[None, :] * stride_gbn
-          tl.atomic_add(grad_bias_ptrs, dBias, sem="relaxed", mask=grad_bias_mask)
+          grad_bias_ptrs = (
+            GradAttnBias + offs_qm[:, None] * stride_gbm +
+            offs_n[None, :] * stride_gbn
+          )
+          tl.atomic_add(
+            grad_bias_ptrs, dBias, sem="relaxed", mask=grad_bias_mask
+          )
         else:
-          grad_bias_ptrs = GradAttnBias + offs_qm[:, None] * stride_gbm + offs_n[None, :] * stride_gbn
+          grad_bias_ptrs = (
+            GradAttnBias + offs_qm[:, None] * stride_gbm +
+            offs_n[None, :] * stride_gbn
+          )
           tl.store(grad_bias_ptrs, dBias, mask=grad_bias_mask)
         dS = (dBias * softmax_scale).to(DTYPE)
       else:
@@ -246,15 +257,33 @@ def _ffpa_bwd_dkdv_sm90(
         if start_m == begin_m:
           dk_d = tl.trans(tl.dot(tl.trans(q), dS, out_dtype=tl.float32))
           tl.store(dk_ptrs, dk_d, mask=grad_mask, eviction_policy="evict_last")
-          dv_d = tl.trans(tl.dot(tl.trans(do), P_drop.to(DTYPE), out_dtype=tl.float32))
+          dv_d = tl.trans(
+            tl.dot(tl.trans(do), P_drop.to(DTYPE), out_dtype=tl.float32)
+          )
           tl.store(dv_ptrs, dv_d, mask=grad_mask, eviction_policy="evict_last")
         else:
-          dk_val = tl.load(dk_ptrs, mask=grad_mask, other=0., eviction_policy="evict_last")
+          dk_val = tl.load(
+            dk_ptrs, mask=grad_mask, other=0., eviction_policy="evict_last"
+          )
           dk_d = tl.trans(tl.dot(tl.trans(q), dS, out_dtype=tl.float32))
-          tl.store(dk_ptrs, dk_val + dk_d, mask=grad_mask, eviction_policy="evict_last")
-          dv_val = tl.load(dv_ptrs, mask=grad_mask, other=0., eviction_policy="evict_last")
-          dv_d = tl.trans(tl.dot(tl.trans(do), P_drop.to(DTYPE), out_dtype=tl.float32))
-          tl.store(dv_ptrs, dv_val + dv_d, mask=grad_mask, eviction_policy="evict_last")
+          tl.store(
+            dk_ptrs,
+            dk_val + dk_d,
+            mask=grad_mask,
+            eviction_policy="evict_last"
+          )
+          dv_val = tl.load(
+            dv_ptrs, mask=grad_mask, other=0., eviction_policy="evict_last"
+          )
+          dv_d = tl.trans(
+            tl.dot(tl.trans(do), P_drop.to(DTYPE), out_dtype=tl.float32)
+          )
+          tl.store(
+            dv_ptrs,
+            dv_val + dv_d,
+            mask=grad_mask,
+            eviction_policy="evict_last"
+          )
 
 
 @triton.jit
@@ -391,7 +420,8 @@ def _ffpa_bwd_dkdv_persist_sm90(
         S = S * softmax_scale
         if HAS_ATTN_BIAS:
           bias = tl.load(
-            AttnBias + offs_qm[:, None] * stride_bm + offs_n[None, :] * stride_bn,
+            AttnBias + offs_qm[:, None] * stride_bm +
+            offs_n[None, :] * stride_bn,
             mask=(offs_qm[:, None] < seqlen_q) & (offs_n[None, :] < seqlen_k),
             other=0.0,
           )
@@ -420,7 +450,8 @@ def _ffpa_bwd_dkdv_persist_sm90(
           Di = tl.load(D + offs_qm, mask=offs_qm < seqlen_q, other=0.0)
         if BIAS_REQUIRES_GRAD:
           dBias = P * (dP - Di[:, None])
-          grad_bias_mask = (offs_qm[:, None] < seqlen_q) & (offs_n[None, :] < seqlen_k)
+          grad_bias_mask = (offs_qm[:, None]
+                            < seqlen_q) & (offs_n[None, :] < seqlen_k)
           if out_d_chunk == 0:
             if GRAD_BIAS_REDUCES_M:
               m_block = start_m // BLOCK_M
@@ -429,12 +460,25 @@ def _ffpa_bwd_dkdv_persist_sm90(
               if GRAD_BIAS_STORE_PARTIAL:
                 tl.store(grad_bias_ptrs, grad_bias, mask=offs_n < seqlen_k)
               else:
-                tl.atomic_add(grad_bias_ptrs, grad_bias, sem="relaxed", mask=offs_n < seqlen_k)
+                tl.atomic_add(
+                  grad_bias_ptrs,
+                  grad_bias,
+                  sem="relaxed",
+                  mask=offs_n < seqlen_k
+                )
             elif GRAD_BIAS_NEEDS_REDUCTION:
-              grad_bias_ptrs = GradAttnBias + offs_qm[:, None] * stride_gbm + offs_n[None, :] * stride_gbn
-              tl.atomic_add(grad_bias_ptrs, dBias, sem="relaxed", mask=grad_bias_mask)
+              grad_bias_ptrs = (
+                GradAttnBias + offs_qm[:, None] * stride_gbm +
+                offs_n[None, :] * stride_gbn
+              )
+              tl.atomic_add(
+                grad_bias_ptrs, dBias, sem="relaxed", mask=grad_bias_mask
+              )
             else:
-              grad_bias_ptrs = GradAttnBias + offs_qm[:, None] * stride_gbm + offs_n[None, :] * stride_gbn
+              grad_bias_ptrs = (
+                GradAttnBias + offs_qm[:, None] * stride_gbm +
+                offs_n[None, :] * stride_gbn
+              )
               tl.store(grad_bias_ptrs, dBias, mask=grad_bias_mask)
           dS = (dBias * softmax_scale).to(DTYPE)
         else:
@@ -446,7 +490,9 @@ def _ffpa_bwd_dkdv_persist_sm90(
         q = desc_q.load([q_offset_y, d_start_out])
         do = desc_do.load([q_offset_y, d_start_out])
         dk_acc += tl.trans(tl.dot(tl.trans(q), dS, out_dtype=tl.float32))
-        dv_acc += tl.trans(tl.dot(tl.trans(do), P_drop.to(DTYPE), out_dtype=tl.float32))
+        dv_acc += tl.trans(
+          tl.dot(tl.trans(do), P_drop.to(DTYPE), out_dtype=tl.float32)
+        )
 
       grad_mask = (offs_n[:, None] < seqlen_k) & (d_offs[None, :] < headdim)
       dk_ptrs = DK + offs_n[:, None] * stride_dkn + d_offs[None, :]
@@ -555,7 +601,9 @@ def _ffpa_bwd_dq_sm90(
       if not EVEN_N:
         S_qk = tl.where(offs_nk[None, :] < seqlen_k, S_qk, float("-inf"))
       if IS_CAUSAL:
-        S_qk = tl.where(offs_m[:, None] >= (offs_nk[None, :]), S_qk, float("-inf"))
+        S_qk = tl.where(
+          offs_m[:, None] >= (offs_nk[None, :]), S_qk, float("-inf")
+        )
       S_qk = S_qk * softmax_scale
       if HAS_ATTN_BIAS:
         bias = tl.load(
@@ -591,9 +639,13 @@ def _ffpa_bwd_dq_sm90(
           dq_d = tl.dot(dS_qk, k, out_dtype=tl.float32)
           tl.store(dq_ptrs, dq_d, mask=dq_mask, eviction_policy="evict_last")
         else:
-          dq_val = tl.load(dq_ptrs, mask=dq_mask, other=0., eviction_policy="evict_last")
+          dq_val = tl.load(
+            dq_ptrs, mask=dq_mask, other=0., eviction_policy="evict_last"
+          )
           dq_d = tl.dot(dS_qk, k, out_dtype=tl.float32)
-          tl.store(dq_ptrs, dq_val + dq_d, mask=dq_mask, eviction_policy="evict_last")
+          tl.store(
+            dq_ptrs, dq_val + dq_d, mask=dq_mask, eviction_policy="evict_last"
+          )
 
 
 @triton.heuristics(_SM90_BWD_HEURISTICS)
@@ -660,21 +712,25 @@ def _ffpa_bwd_dkdv_sm90_kernel_impl(
 
   if PERSIST_DKDV_ACC:
     _ffpa_bwd_dkdv_persist_sm90(
-      desc_q, desc_k, desc_v, desc_do, DK, DV, LSE, D, AttnBias, GradAttnBias, softmax_scale, stride_dkb, stride_dkh,
-      stride_dkn, stride_dvb, stride_dvh, stride_dvn, stride_bb, stride_bh, stride_bm, stride_bn, stride_gbb,
-      stride_gbh, stride_gbm, stride_gbn, nheads, seqlen_q, seqlen_k, seqlen_q_rounded, headdim, dropout_p,
-      philox_offset, IS_CAUSAL, HAS_ATTN_BIAS, HAS_DROPOUT, PHILOX_SEED, BIAS_REQUIRES_GRAD, GRAD_BIAS_NEEDS_REDUCTION,
-      GRAD_BIAS_REDUCES_M, GRAD_BIAS_STORE_PARTIAL, BLOCK_HEADDIM, DTYPE, EVEN_M, EVEN_N, BLOCK_M, BLOCK_N,
-      warp_specialize
+      desc_q, desc_k, desc_v, desc_do, DK, DV, LSE, D, AttnBias, GradAttnBias,
+      softmax_scale, stride_dkb, stride_dkh, stride_dkn, stride_dvb, stride_dvh,
+      stride_dvn, stride_bb, stride_bh, stride_bm, stride_bn, stride_gbb,
+      stride_gbh, stride_gbm, stride_gbn, nheads, seqlen_q, seqlen_k,
+      seqlen_q_rounded, headdim, dropout_p, philox_offset, IS_CAUSAL,
+      HAS_ATTN_BIAS, HAS_DROPOUT, PHILOX_SEED, BIAS_REQUIRES_GRAD,
+      GRAD_BIAS_NEEDS_REDUCTION, GRAD_BIAS_REDUCES_M, GRAD_BIAS_STORE_PARTIAL,
+      BLOCK_HEADDIM, DTYPE, EVEN_M, EVEN_N, BLOCK_M, BLOCK_N, warp_specialize
     )
   else:
     _ffpa_bwd_dkdv_sm90(
-      desc_q, desc_k, desc_v, desc_do, DK, DV, LSE, D, AttnBias, GradAttnBias, softmax_scale, stride_dkb, stride_dkh,
-      stride_dkn, stride_dvb, stride_dvh, stride_dvn, stride_bb, stride_bh, stride_bm, stride_bn, stride_gbb,
-      stride_gbh, stride_gbm, stride_gbn, nheads, seqlen_q, seqlen_k, seqlen_q_rounded, headdim, dropout_p,
-      philox_offset, IS_CAUSAL, HAS_ATTN_BIAS, HAS_DROPOUT, PHILOX_SEED, BIAS_REQUIRES_GRAD, GRAD_BIAS_NEEDS_REDUCTION,
-      GRAD_BIAS_REDUCES_M, GRAD_BIAS_STORE_PARTIAL, BLOCK_HEADDIM, DTYPE, EVEN_M, EVEN_N, BLOCK_M, BLOCK_N,
-      warp_specialize
+      desc_q, desc_k, desc_v, desc_do, DK, DV, LSE, D, AttnBias, GradAttnBias,
+      softmax_scale, stride_dkb, stride_dkh, stride_dkn, stride_dvb, stride_dvh,
+      stride_dvn, stride_bb, stride_bh, stride_bm, stride_bn, stride_gbb,
+      stride_gbh, stride_gbm, stride_gbn, nheads, seqlen_q, seqlen_k,
+      seqlen_q_rounded, headdim, dropout_p, philox_offset, IS_CAUSAL,
+      HAS_ATTN_BIAS, HAS_DROPOUT, PHILOX_SEED, BIAS_REQUIRES_GRAD,
+      GRAD_BIAS_NEEDS_REDUCTION, GRAD_BIAS_REDUCES_M, GRAD_BIAS_STORE_PARTIAL,
+      BLOCK_HEADDIM, DTYPE, EVEN_M, EVEN_N, BLOCK_M, BLOCK_N, warp_specialize
     )
 
 
@@ -726,9 +782,11 @@ def _ffpa_bwd_dq_sm90_kernel_impl(
   _ = autotune_dtype_key
 
   _ffpa_bwd_dq_sm90(
-    desc_q, desc_k, desc_v, desc_do, DQ, LSE, D, AttnBias, softmax_scale, stride_dqb, stride_dqh, stride_dqm, stride_bb,
-    stride_bh, stride_bm, stride_bn, nheads, seqlen_q, seqlen_k, seqlen_q_rounded, headdim, dropout_p, philox_offset,
-    IS_CAUSAL, HAS_ATTN_BIAS, HAS_DROPOUT, PHILOX_SEED, BLOCK_HEADDIM, DTYPE, EVEN_N, BLOCK_M, BLOCK_N, warp_specialize
+    desc_q, desc_k, desc_v, desc_do, DQ, LSE, D, AttnBias, softmax_scale,
+    stride_dqb, stride_dqh, stride_dqm, stride_bb, stride_bh, stride_bm,
+    stride_bn, nheads, seqlen_q, seqlen_k, seqlen_q_rounded, headdim, dropout_p,
+    philox_offset, IS_CAUSAL, HAS_ATTN_BIAS, HAS_DROPOUT, PHILOX_SEED,
+    BLOCK_HEADDIM, DTYPE, EVEN_N, BLOCK_M, BLOCK_N, warp_specialize
   )
 
 
@@ -816,21 +874,25 @@ def _ffpa_bwd_sm90_kernel_impl(
 
   if PERSIST_DKDV_ACC:
     _ffpa_bwd_dkdv_persist_sm90(
-      desc_q, desc_k, desc_v, desc_do, DK, DV, LSE, D, AttnBias, GradAttnBias, softmax_scale, stride_dkb, stride_dkh,
-      stride_dkn, stride_dvb, stride_dvh, stride_dvn, stride_bb, stride_bh, stride_bm, stride_bn, stride_gbb,
-      stride_gbh, stride_gbm, stride_gbn, nheads, seqlen_q, seqlen_k, seqlen_q_rounded, headdim, dropout_p,
-      philox_offset, IS_CAUSAL, HAS_ATTN_BIAS, HAS_DROPOUT, PHILOX_SEED, BIAS_REQUIRES_GRAD, GRAD_BIAS_NEEDS_REDUCTION,
-      GRAD_BIAS_REDUCES_M, GRAD_BIAS_STORE_PARTIAL, BLOCK_HEADDIM, DTYPE, EVEN_M, EVEN_N, BLOCK_M, BLOCK_N,
-      warp_specialize
+      desc_q, desc_k, desc_v, desc_do, DK, DV, LSE, D, AttnBias, GradAttnBias,
+      softmax_scale, stride_dkb, stride_dkh, stride_dkn, stride_dvb, stride_dvh,
+      stride_dvn, stride_bb, stride_bh, stride_bm, stride_bn, stride_gbb,
+      stride_gbh, stride_gbm, stride_gbn, nheads, seqlen_q, seqlen_k,
+      seqlen_q_rounded, headdim, dropout_p, philox_offset, IS_CAUSAL,
+      HAS_ATTN_BIAS, HAS_DROPOUT, PHILOX_SEED, BIAS_REQUIRES_GRAD,
+      GRAD_BIAS_NEEDS_REDUCTION, GRAD_BIAS_REDUCES_M, GRAD_BIAS_STORE_PARTIAL,
+      BLOCK_HEADDIM, DTYPE, EVEN_M, EVEN_N, BLOCK_M, BLOCK_N, warp_specialize
     )
   else:
     _ffpa_bwd_dkdv_sm90(
-      desc_q, desc_k, desc_v, desc_do, DK, DV, LSE, D, AttnBias, GradAttnBias, softmax_scale, stride_dkb, stride_dkh,
-      stride_dkn, stride_dvb, stride_dvh, stride_dvn, stride_bb, stride_bh, stride_bm, stride_bn, stride_gbb,
-      stride_gbh, stride_gbm, stride_gbn, nheads, seqlen_q, seqlen_k, seqlen_q_rounded, headdim, dropout_p,
-      philox_offset, IS_CAUSAL, HAS_ATTN_BIAS, HAS_DROPOUT, PHILOX_SEED, BIAS_REQUIRES_GRAD, GRAD_BIAS_NEEDS_REDUCTION,
-      GRAD_BIAS_REDUCES_M, GRAD_BIAS_STORE_PARTIAL, BLOCK_HEADDIM, DTYPE, EVEN_M, EVEN_N, BLOCK_M, BLOCK_N,
-      warp_specialize
+      desc_q, desc_k, desc_v, desc_do, DK, DV, LSE, D, AttnBias, GradAttnBias,
+      softmax_scale, stride_dkb, stride_dkh, stride_dkn, stride_dvb, stride_dvh,
+      stride_dvn, stride_bb, stride_bh, stride_bm, stride_bn, stride_gbb,
+      stride_gbh, stride_gbm, stride_gbn, nheads, seqlen_q, seqlen_k,
+      seqlen_q_rounded, headdim, dropout_p, philox_offset, IS_CAUSAL,
+      HAS_ATTN_BIAS, HAS_DROPOUT, PHILOX_SEED, BIAS_REQUIRES_GRAD,
+      GRAD_BIAS_NEEDS_REDUCTION, GRAD_BIAS_REDUCES_M, GRAD_BIAS_STORE_PARTIAL,
+      BLOCK_HEADDIM, DTYPE, EVEN_M, EVEN_N, BLOCK_M, BLOCK_N, warp_specialize
     )
 
   _ffpa_bwd_dq_sm90(
@@ -989,9 +1051,12 @@ def _gen_bwd_sm90_dq_autotune_configs(
   )
 
 
-_ffpa_bwd_sm90_autotune_cache: dict[tuple[int, str, str, bool, bool, bool], callable] = {}
-_ffpa_bwd_sm90_dkdv_autotune_cache: dict[tuple[int, str, str, bool, bool, bool], callable] = {}
-_ffpa_bwd_sm90_dq_autotune_cache: dict[tuple[int, str, str, bool], callable] = {}
+_ffpa_bwd_sm90_autotune_cache: dict[tuple[int, str, str, bool, bool, bool],
+                                    callable] = {}
+_ffpa_bwd_sm90_dkdv_autotune_cache: dict[tuple[int, str, str, bool, bool, bool],
+                                         callable] = {}
+_ffpa_bwd_sm90_dq_autotune_cache: dict[tuple[int, str, str, bool],
+                                       callable] = {}
 
 
 def _get_bwd_sm90_autotune(
@@ -1003,7 +1068,10 @@ def _get_bwd_sm90_autotune(
   enable_persist_dkdv: bool = False,
 ):
   """Return an autotune wrapper for the SM90 TMA backward main kernel."""
-  cache_key = (headdim, autotune_mode, dtype, bias_requires_grad, enable_ws, enable_persist_dkdv)
+  cache_key = (
+    headdim, autotune_mode, dtype, bias_requires_grad, enable_ws,
+    enable_persist_dkdv
+  )
   if cache_key not in _ffpa_bwd_sm90_autotune_cache:
     reset_args = []
     if bias_requires_grad:
@@ -1037,7 +1105,10 @@ def _get_bwd_sm90_dkdv_autotune(
   enable_persist_dkdv: bool = False,
 ):
   """Return an autotune wrapper for the split-launch SM90 dK/dV kernel."""
-  cache_key = (headdim, autotune_mode, dtype, bias_requires_grad, enable_ws, enable_persist_dkdv)
+  cache_key = (
+    headdim, autotune_mode, dtype, bias_requires_grad, enable_ws,
+    enable_persist_dkdv
+  )
   if cache_key not in _ffpa_bwd_sm90_dkdv_autotune_cache:
     reset_args = []
     if bias_requires_grad:
@@ -1117,14 +1188,17 @@ def _ffpa_bwd_sm90_make_descs(
   k: torch.Tensor,
   v: torch.Tensor,
   do: torch.Tensor,
-) -> tuple[TensorDescriptor, TensorDescriptor, TensorDescriptor, TensorDescriptor]:
+) -> tuple[TensorDescriptor, TensorDescriptor, TensorDescriptor,
+           TensorDescriptor]:
   """Create flattened TMA descriptors for backward input tensors."""
   batch, nheads, seqlen_q, headdim = q.shape
   _, _, seqlen_k, _ = k.shape
   dummy_block = [1, 1]
 
   def _make_tensor_desc(x: torch.Tensor, shape: list[int]) -> TensorDescriptor:
-    return TensorDescriptor(x, shape=shape, strides=[shape[1], 1], block_shape=dummy_block)
+    return TensorDescriptor(
+      x, shape=shape, strides=[shape[1], 1], block_shape=dummy_block
+    )
 
   y_dim_q = batch * nheads * seqlen_q
   y_dim_kv = batch * nheads * seqlen_k
@@ -1144,10 +1218,18 @@ def _ffpa_bwd_sm90_prepare_descs(
   launch_config: dict,
 ) -> None:
   """Set descriptor block shapes for a fixed-config launch."""
-  desc_q.block_shape = [launch_config["BLOCK_M"], launch_config["BLOCK_HEADDIM"]]
-  desc_k.block_shape = [launch_config["BLOCK_N"], launch_config["BLOCK_HEADDIM"]]
-  desc_v.block_shape = [launch_config["BLOCK_N"], launch_config["BLOCK_HEADDIM"]]
-  desc_do.block_shape = [launch_config["BLOCK_M"], launch_config["BLOCK_HEADDIM"]]
+  desc_q.block_shape = [
+    launch_config["BLOCK_M"], launch_config["BLOCK_HEADDIM"]
+  ]
+  desc_k.block_shape = [
+    launch_config["BLOCK_N"], launch_config["BLOCK_HEADDIM"]
+  ]
+  desc_v.block_shape = [
+    launch_config["BLOCK_N"], launch_config["BLOCK_HEADDIM"]
+  ]
+  desc_do.block_shape = [
+    launch_config["BLOCK_M"], launch_config["BLOCK_HEADDIM"]
+  ]
 
 
 def lookup_bwd_sm90_persistent_config(
@@ -1169,7 +1251,10 @@ def lookup_bwd_sm90_persistent_config(
   kernel: str | None = None,
 ) -> dict | None:
   """Lookup a persisted SM90 TMA backward config."""
-  kernel = kernel or ("bwd_sm90_generic_persist_dkdv" if enable_persist_dkdv else "bwd_sm90_generic")
+  kernel = kernel or (
+    "bwd_sm90_generic_persist_dkdv"
+    if enable_persist_dkdv else "bwd_sm90_generic"
+  )
   return lookup_persistent_config(
     PersistentConfigRequest(
       direction="backward",
@@ -1237,7 +1322,9 @@ def _ffpa_attn_backward_sm90_impl(
   autotune_causal_key = int(causal)
   has_attn_bias = attn_bias is not None
   attn_bias_in = attn_bias if attn_bias is not None else q
-  bias_strides = _attn_bias_broadcast_strides(attn_bias, batch, nheads, seqlen_q, seqlen_k)
+  bias_strides = _attn_bias_broadcast_strides(
+    attn_bias, batch, nheads, seqlen_q, seqlen_k
+  )
   bias_requires_grad = grad_attn_bias is not None
   grad_bias_needs_reduction = _attn_bias_grad_needs_reduction(
     grad_attn_bias,
@@ -1247,12 +1334,16 @@ def _ffpa_attn_backward_sm90_impl(
     seqlen_k,
   )
   grad_bias_reduces_m = _attn_bias_grad_reduces_query(grad_attn_bias, seqlen_q)
-  use_key_bias_grad_reduction = _attn_bias_grad_is_key_bias(grad_attn_bias, seqlen_q, seqlen_k)
+  use_key_bias_grad_reduction = _attn_bias_grad_is_key_bias(
+    grad_attn_bias, seqlen_q, seqlen_k
+  )
   has_dropout = dropout_p > 0.0
   runtime_dtype = dtype_name(q.dtype)
   if dk.dtype == torch.float32 or dv.dtype == torch.float32:
     grad_kv_storage_dtype = "fp32"
-  elif (dk.dtype == torch.float16 or dv.dtype == torch.float16) and q.dtype != torch.float16:
+  elif (
+    dk.dtype == torch.float16 or dv.dtype == torch.float16
+  ) and q.dtype != torch.float16:
     grad_kv_storage_dtype = "fp16"
   else:
     grad_kv_storage_dtype = None
@@ -1284,7 +1375,9 @@ def _ffpa_attn_backward_sm90_impl(
       seqlen_k,
     )
 
-  block_headdim_delta = 64 if preprocess_d_chunk else max(64, triton.next_power_of_2(headdim))
+  block_headdim_delta = 64 if preprocess_d_chunk else max(
+    64, triton.next_power_of_2(headdim)
+  )
   delta = torch.empty_like(lse)
 
   def pre_grid(meta: dict) -> tuple[int, int]:
@@ -1307,7 +1400,8 @@ def _ffpa_attn_backward_sm90_impl(
     headdim,
   )
   if autotune:
-    _get_pre_autotune(preprocess_d_chunk, autotune_mode, runtime_dtype)[pre_grid](*pre_args)
+    _get_pre_autotune(preprocess_d_chunk, autotune_mode,
+                      runtime_dtype)[pre_grid](*pre_args)
   else:
     persisted_pre_config = lookup_persistent_config(
       PersistentConfigRequest(
@@ -1326,14 +1420,18 @@ def _ffpa_attn_backward_sm90_impl(
       preprocess_d_chunk=preprocess_d_chunk,
       block_headdim_delta=block_headdim_delta,
     )
-    _ffpa_bwd_pre[(triton.cdiv(seqlen_q, pre_config["BLOCK_M"]), batch * nheads)](
-      *pre_args,
-      **pre_config,
-    )
+    _ffpa_bwd_pre[
+      (triton.cdiv(seqlen_q, pre_config["BLOCK_M"]), batch * nheads)](
+        *pre_args,
+        **pre_config,
+      )
 
   def grid(meta: dict) -> tuple[int, ...]:
     return (
-      max(triton.cdiv(seqlen_k, meta["BLOCK_N"]), triton.cdiv(seqlen_q, meta["BLOCK_M"])),
+      max(
+        triton.cdiv(seqlen_k, meta["BLOCK_N"]),
+        triton.cdiv(seqlen_q, meta["BLOCK_M"])
+      ),
       1,
       batch * nheads,
     )
@@ -1521,7 +1619,8 @@ def _ffpa_attn_backward_sm90_impl(
   else:
     if split_launch:
       dkdv_config = dict(
-        _SM90_BWD_SPLIT_PERSIST_DKDV_DEFAULT_CONFIG if enable_persist_dkdv else _SM90_BWD_SPLIT_DKDV_DEFAULT_CONFIG
+        _SM90_BWD_SPLIT_PERSIST_DKDV_DEFAULT_CONFIG
+        if enable_persist_dkdv else _SM90_BWD_SPLIT_DKDV_DEFAULT_CONFIG
       )
       persisted_dkdv_config = lookup_bwd_sm90_persistent_config(
         q=q,
@@ -1538,7 +1637,8 @@ def _ffpa_attn_backward_sm90_impl(
         nheads_kv=original_nheads_kv,
         enable_ws=enable_ws,
         enable_persist_dkdv=enable_persist_dkdv,
-        kernel="bwd_sm90_dkdv_persist" if enable_persist_dkdv else "bwd_sm90_dkdv",
+        kernel="bwd_sm90_dkdv_persist"
+        if enable_persist_dkdv else "bwd_sm90_dkdv",
       )
       if persisted_dkdv_config is not None:
         dkdv_config.update(persisted_dkdv_config)
@@ -1546,7 +1646,9 @@ def _ffpa_attn_backward_sm90_impl(
       if enable_ws:
         dkdv_config["num_stages"] = 2
       _ffpa_bwd_sm90_prepare_descs(desc_q, desc_k, desc_v, desc_do, dkdv_config)
-      _ffpa_bwd_dkdv_sm90_kernel_impl[dkdv_grid](*dkdv_args, **dkdv_meta, **dkdv_config)
+      _ffpa_bwd_dkdv_sm90_kernel_impl[dkdv_grid](
+        *dkdv_args, **dkdv_meta, **dkdv_config
+      )
 
       dq_config = dict(_SM90_BWD_SPLIT_DQ_DEFAULT_CONFIG)
       persisted_dq_config = lookup_bwd_sm90_persistent_config(
@@ -1573,7 +1675,10 @@ def _ffpa_attn_backward_sm90_impl(
       _ffpa_bwd_sm90_prepare_descs(desc_q, desc_k, desc_v, desc_do, dq_config)
       _ffpa_bwd_dq_sm90_kernel_impl[dq_grid](*dq_args, **dq_meta, **dq_config)
     else:
-      launch_config = dict(_SM90_BWD_PERSIST_DKDV_DEFAULT_CONFIG if enable_persist_dkdv else _SM90_BWD_DEFAULT_CONFIG)
+      launch_config = dict(
+        _SM90_BWD_PERSIST_DKDV_DEFAULT_CONFIG
+        if enable_persist_dkdv else _SM90_BWD_DEFAULT_CONFIG
+      )
       persisted_config = lookup_bwd_sm90_persistent_config(
         q=q,
         seqlen_q=seqlen_q,
@@ -1596,19 +1701,24 @@ def _ffpa_attn_backward_sm90_impl(
       if enable_ws:
         launch_config["num_stages"] = 2
         launch_config["maxnreg"] = 80
-      _ffpa_bwd_sm90_prepare_descs(desc_q, desc_k, desc_v, desc_do, launch_config)
-      _ffpa_bwd_sm90_kernel_impl[grid](*kernel_args, **kernel_meta, **launch_config)
+      _ffpa_bwd_sm90_prepare_descs(
+        desc_q, desc_k, desc_v, desc_do, launch_config
+      )
+      _ffpa_bwd_sm90_kernel_impl[grid](
+        *kernel_args, **kernel_meta, **launch_config
+      )
 
   if use_key_bias_grad_reduction:
     key_bias_block_n = 64
-    _ffpa_bwd_key_bias_grad_reduce_kernel[(triton.cdiv(seqlen_k, key_bias_block_n), )](
-      partial_grad_bias,
-      grad_attn_bias,
-      seqlen_k,
-      partial_grad_bias.numel() // seqlen_k,
-      grad_attn_bias.stride(3),
-      BLOCK_N=key_bias_block_n,
-      BLOCK_R=64,
-      num_warps=8,
-      num_stages=2,
-    )
+    _ffpa_bwd_key_bias_grad_reduce_kernel[
+      (triton.cdiv(seqlen_k, key_bias_block_n), )](
+        partial_grad_bias,
+        grad_attn_bias,
+        seqlen_k,
+        partial_grad_bias.numel() // seqlen_k,
+        grad_attn_bias.stride(3),
+        BLOCK_N=key_bias_block_n,
+        BLOCK_R=64,
+        num_warps=8,
+        num_stages=2,
+      )

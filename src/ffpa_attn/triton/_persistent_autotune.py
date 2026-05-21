@@ -242,7 +242,9 @@ def sanitize_device_name(device_name: str) -> str:
   return stem or "unknown_device"
 
 
-def device_config_path(config_dir: Path | None = None, device_name: str | None = None) -> Path:
+def device_config_path(
+  config_dir: Path | None = None, device_name: str | None = None
+) -> Path:
   """Return the tuned config path for a CUDA device.
 
   :param config_dir: Optional directory override.
@@ -353,10 +355,14 @@ def config_from_triton_config(config: Any) -> dict[str, Any]:
   :return: JSON-serializable config metadata.
   """
   raw = dict(config.all_kwargs())
-  return {key: value for key, value in raw.items() if value is not None and key != "ir_override"}
+  return {
+    key: value
+    for key, value in raw.items() if value is not None and key != "ir_override"
+  }
 
 
-def sanitize_kernel_config(kernel: str, config: dict[str, Any]) -> dict[str, Any] | None:
+def sanitize_kernel_config(kernel: str,
+                           config: dict[str, Any]) -> dict[str, Any] | None:
   """Validate and filter a persisted config for a kernel.
 
   :param kernel: Persisted kernel name.
@@ -366,11 +372,16 @@ def sanitize_kernel_config(kernel: str, config: dict[str, Any]) -> dict[str, Any
   allowed = _KERNEL_CONFIG_KEYS.get(kernel)
   if allowed is None:
     return None
-  filtered = {key: value for key, value in config.items() if key in allowed and value is not None}
+  filtered = {
+    key: value
+    for key, value in config.items() if key in allowed and value is not None
+  }
   return filtered or None
 
 
-def write_config_file(payload: dict[str, Any], path: Path, overwrite: bool = False) -> None:
+def write_config_file(
+  payload: dict[str, Any], path: Path, overwrite: bool = False
+) -> None:
   """Write a tuned config JSON file.
 
   :param payload: JSON-serializable tuned config payload.
@@ -384,7 +395,10 @@ def write_config_file(payload: dict[str, Any], path: Path, overwrite: bool = Fal
   path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
 
 
-def load_config_entries(config_dir: Path | None = None, device_name: str | None = None) -> list[dict[str, Any]]:
+def load_config_entries(
+  config_dir: Path | None = None,
+  device_name: str | None = None
+) -> list[dict[str, Any]]:
   """Load entries for the current device.
 
   Missing or malformed files return an empty list so runtime launchers can keep
@@ -426,7 +440,9 @@ def clear_config_cache() -> None:
   _lookup_persistent_config_cached.cache_clear()
 
 
-def _head_layout_rank(entry: dict[str, Any], request: PersistentConfigRequest) -> int:
+def _head_layout_rank(
+  entry: dict[str, Any], request: PersistentConfigRequest
+) -> int:
   """Rank head-layout metadata without making it a compatibility filter.
 
   Head layout is intentionally a preference, not a hard filter.  The bundled
@@ -442,20 +458,30 @@ def _head_layout_rank(entry: dict[str, Any], request: PersistentConfigRequest) -
   if request.nheads_q is None or request.nheads_kv is None:
     return 1
   try:
-    if int(entry.get("nheads_q")) == request.nheads_q and int(entry.get("nheads_kv")) == request.nheads_kv:
+    if int(entry.get("nheads_q")) == request.nheads_q and int(
+      entry.get("nheads_kv")
+    ) == request.nheads_kv:
       return 0
   except (TypeError, ValueError):
     pass
   return 1
 
 
-def _lookup_cache_key(request: PersistentConfigRequest) -> tuple[str, int, PersistentConfigRequest]:
+def _lookup_cache_key(
+  request: PersistentConfigRequest
+) -> tuple[str, int, PersistentConfigRequest]:
   """Return the cache key for one persistent lookup request."""
-  device_index = request.device_index if request.device_index is not None else torch.cuda.current_device()
+  device_index = request.device_index if request.device_index is not None else torch.cuda.current_device(
+  )
   return (os.environ.get(CONFIG_ENV_VAR, ""), device_index, request)
 
 
-def _entry_flag_matches(entry: dict[str, Any], key: str, expected: bool | None, inferred: bool | None = None) -> bool:
+def _entry_flag_matches(
+  entry: dict[str, Any],
+  key: str,
+  expected: bool | None,
+  inferred: bool | None = None
+) -> bool:
   """Return whether an optional entry flag matches a lookup request."""
   if expected is None:
     return True
@@ -466,7 +492,9 @@ def _entry_flag_matches(entry: dict[str, Any], key: str, expected: bool | None, 
   return True
 
 
-def _debug_lookup_message(prefix: str, request: PersistentConfigRequest, config: dict[str, Any] | None) -> None:
+def _debug_lookup_message(
+  prefix: str, request: PersistentConfigRequest, config: dict[str, Any] | None
+) -> None:
   """Log one DEBUG persistent lookup event.
 
   :param prefix: Event prefix describing lookup state.
@@ -516,24 +544,36 @@ def _lookup_persistent_config_cached(
       continue
     if entry.get("dtype") != request.dtype:
       continue
-    if request.causal is not None and bool(entry.get("causal", False)) != request.causal:
+    if request.causal is not None and bool(
+      entry.get("causal", False)
+    ) != request.causal:
       continue
     if request.preprocess_d_chunk is not None and bool(
       entry.get("preprocess_d_chunk", False)
     ) != request.preprocess_d_chunk:
       continue
-    if request.bias_grad is not None and bool(entry.get("bias_grad", False)) != request.bias_grad:
+    if request.bias_grad is not None and bool(
+      entry.get("bias_grad", False)
+    ) != request.bias_grad:
       continue
-    entry_grad_kv_storage_dtype = entry.get("grad_kv_storage_dtype", entry.get("grad_v_storage_dtype"))
+    entry_grad_kv_storage_dtype = entry.get(
+      "grad_kv_storage_dtype", entry.get("grad_v_storage_dtype")
+    )
     if request.grad_kv_storage_dtype is not None and entry_grad_kv_storage_dtype != request.grad_kv_storage_dtype:
       continue
     if request.grad_kv_storage_dtype is None and entry_grad_kv_storage_dtype is not None:
       continue
-    if request.use_gemv is not None and bool(entry.get("use_gemv", False)) != request.use_gemv:
+    if request.use_gemv is not None and bool(
+      entry.get("use_gemv", False)
+    ) != request.use_gemv:
       continue
-    if request.has_attn_bias is not None and bool(entry.get("has_attn_bias", False)) != request.has_attn_bias:
+    if request.has_attn_bias is not None and bool(
+      entry.get("has_attn_bias", False)
+    ) != request.has_attn_bias:
       continue
-    if request.has_dropout is not None and bool(entry.get("has_dropout", False)) != request.has_dropout:
+    if request.has_dropout is not None and bool(
+      entry.get("has_dropout", False)
+    ) != request.has_dropout:
       continue
     config = entry.get("config")
     if not isinstance(config, dict):
@@ -551,10 +591,16 @@ def _lookup_persistent_config_cached(
       "bwd_sm90_dq",
     }
     inferred_enable_tma = request.kernel in sm90_tma_kernels
-    inferred_enable_ws = bool(config.get("warp_specialize", False)) if inferred_enable_tma else False
-    if not _entry_flag_matches(entry, "enable_tma", request.enable_tma, inferred_enable_tma):
+    inferred_enable_ws = bool(
+      config.get("warp_specialize", False)
+    ) if inferred_enable_tma else False
+    if not _entry_flag_matches(
+      entry, "enable_tma", request.enable_tma, inferred_enable_tma
+    ):
       continue
-    if not _entry_flag_matches(entry, "enable_ws", request.enable_ws, inferred_enable_ws):
+    if not _entry_flag_matches(
+      entry, "enable_ws", request.enable_ws, inferred_enable_ws
+    ):
       continue
     if request.kernel in sm90_tma_kernels and request.enable_ws is not None and bool(
       config.get("warp_specialize", False)
@@ -572,29 +618,51 @@ def _lookup_persistent_config_cached(
   if not candidates:
     return None
 
-  headdim_target = nearest_value(sorted({int(entry["headdim"]) for entry in candidates}), request.headdim)
+  headdim_target = nearest_value(
+    sorted({int(entry["headdim"])
+            for entry in candidates}), request.headdim
+  )
   if headdim_target is None:
     return None
-  candidates = [entry for entry in candidates if int(entry.get("headdim", -1)) == headdim_target]
+  candidates = [
+    entry for entry in candidates
+    if int(entry.get("headdim", -1)) == headdim_target
+  ]
 
-  seqlen_q_target = upper_or_max_value(sorted({int(entry["seqlen_q"]) for entry in candidates}), request.seqlen_q)
+  seqlen_q_target = upper_or_max_value(
+    sorted({int(entry["seqlen_q"])
+            for entry in candidates}), request.seqlen_q
+  )
   if seqlen_q_target is None:
     return None
-  candidates = [entry for entry in candidates if int(entry.get("seqlen_q", -1)) == seqlen_q_target]
+  candidates = [
+    entry for entry in candidates
+    if int(entry.get("seqlen_q", -1)) == seqlen_q_target
+  ]
 
   if request.seqlen_k is not None:
-    seqlen_k_target = upper_or_max_value(sorted({int(entry["seqlen_k"]) for entry in candidates}), request.seqlen_k)
+    seqlen_k_target = upper_or_max_value(
+      sorted({int(entry["seqlen_k"])
+              for entry in candidates}), request.seqlen_k
+    )
     if seqlen_k_target is None:
       return None
-    candidates = [entry for entry in candidates if int(entry.get("seqlen_k", -1)) == seqlen_k_target]
+    candidates = [
+      entry for entry in candidates
+      if int(entry.get("seqlen_k", -1)) == seqlen_k_target
+    ]
 
   if not candidates:
     return None
-  selected = min(candidates, key=lambda entry: _head_layout_rank(entry, request))
+  selected = min(
+    candidates, key=lambda entry: _head_layout_rank(entry, request)
+  )
   return sanitize_kernel_config(request.kernel, selected["config"])
 
 
-def lookup_persistent_config(request: PersistentConfigRequest) -> dict[str, Any] | None:
+def lookup_persistent_config(
+  request: PersistentConfigRequest
+) -> dict[str, Any] | None:
   """Find the best persisted launch config for a runtime request.
 
   :param request: Runtime shape and variant filters.
@@ -602,7 +670,9 @@ def lookup_persistent_config(request: PersistentConfigRequest) -> dict[str, Any]
   """
   if skip_persistent_tuned_config_from_env():
     if logger.isEnabledFor(logging.DEBUG):
-      _debug_lookup_message("Persistent autotune lookup skipped by env", request, None)
+      _debug_lookup_message(
+        "Persistent autotune lookup skipped by env", request, None
+      )
     return None
 
   cache_key = _lookup_cache_key(request)
@@ -615,7 +685,9 @@ def lookup_persistent_config(request: PersistentConfigRequest) -> dict[str, Any]
   if hits_after > hits_before and config is not None:
     _debug_lookup_message("Persistent autotune cache hit", request, config)
   elif config is not None:
-    _debug_lookup_message("Persistent autotune selected config", request, config)
+    _debug_lookup_message(
+      "Persistent autotune selected config", request, config
+    )
   else:
     _debug_lookup_message("Persistent autotune lookup miss", request, None)
   return config

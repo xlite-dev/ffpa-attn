@@ -32,18 +32,23 @@ CompileKeyType: TypeAlias = tuple[Hashable, ...]
 CallableFunction: TypeAlias = JitCompiledFunction | tvm_ffi.Function
 
 # Enable cache via `FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED=1`
-CUTE_DSL_CACHE_ENABLED: bool = os.getenv("FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED", "0") == "1"
+CUTE_DSL_CACHE_ENABLED: bool = os.getenv(
+  "FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED", "0"
+) == "1"
 
 # Customize cache dir via `FLASH_ATTENTION_CUTE_DSL_CACHE_DIR`, default is
 # `/tmp/${USER}/flash_attention_cute_dsl_cache``
-CUTE_DSL_CACHE_DIR: str | None = os.getenv("FLASH_ATTENTION_CUTE_DSL_CACHE_DIR", None)
+CUTE_DSL_CACHE_DIR: str | None = os.getenv(
+  "FLASH_ATTENTION_CUTE_DSL_CACHE_DIR", None
+)
 
 
 def get_cache_path() -> Path:
   if CUTE_DSL_CACHE_DIR is not None:
     cache_dir = Path(CUTE_DSL_CACHE_DIR)
   else:
-    cache_dir = Path(tempfile.gettempdir()) / getuser() / "flash_attention_cute_dsl_cache"
+    cache_dir = Path(tempfile.gettempdir()
+                     ) / getuser() / "flash_attention_cute_dsl_cache"
   cache_dir.mkdir(parents=True, exist_ok=True)
   return cache_dir
 
@@ -134,7 +139,9 @@ class FileLock:
     if not acquired:
       os.close(self._fd)
       self._fd = None
-      raise RuntimeError(f"Timed out after {self.timeout}s waiting for {self._lock_label} lock: {self.lock_path}")
+      raise RuntimeError(
+        f"Timed out after {self.timeout}s waiting for {self._lock_label} lock: {self.lock_path}"
+      )
 
     return self
 
@@ -223,7 +230,9 @@ class JITPersistentCache(JITCache):
         fa_log(1, f"Cache miss on disk for key hash {sha256_hex}")
     return False
 
-  def _try_export_to_storage(self, key: CompileKeyType, fn: JitCompiledFunction) -> None:
+  def _try_export_to_storage(
+    self, key: CompileKeyType, fn: JitCompiledFunction
+  ) -> None:
     """Export a compiled function to persistent storage under exclusive lock."""
     sha256_hex = self._key_to_hash(key)
     with FileLock(

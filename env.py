@@ -25,65 +25,95 @@ class ENV(object):
   PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 
   # Enable all multi stages kernels or not, if True (1~4) else (1~2), default True.
-  ENABLE_FFPA_ALL_STAGES = bool(int(os.environ.get("ENABLE_FFPA_ALL_STAGES", 1)))
+  ENABLE_FFPA_ALL_STAGES = bool(
+    int(os.environ.get("ENABLE_FFPA_ALL_STAGES", 1))
+  )
 
   # Enable all headdims for FFPA kernels or not, default False.
   # True, headdim will range from 32 to 1024 with step = 32, range(32, 1024, 32)
   # False, headdim will range from 256 to 1024 with step = 64, range(256, 1024, 64)
-  ENABLE_FFPA_ALL_HEADDIM = bool(int(os.environ.get("ENABLE_FFPA_ALL_HEADDIM", 0)))
+  ENABLE_FFPA_ALL_HEADDIM = bool(
+    int(os.environ.get("ENABLE_FFPA_ALL_HEADDIM", 0))
+  )
 
   # Enable force Q@K^T use fp16 as MMA Acc dtype for FFPA Acc F32 kernels, default False.
   # FFPA Acc F32 kernels MMA Acc = Mixed Q@K^T MMA Acc F16 + P@V MMA Acc F32.
-  ENABLE_FFPA_FORCE_QK_F16 = bool(int(os.environ.get("ENABLE_FFPA_FORCE_QK_F16", 0)))
+  ENABLE_FFPA_FORCE_QK_F16 = bool(
+    int(os.environ.get("ENABLE_FFPA_FORCE_QK_F16", 0))
+  )
 
   # Enable force P@V use fp16 as MMA Acc dtype, for FFPA Acc F32 kernels, default False.
   # FFPA Acc F32 kernels MMA Acc = Mixed Q@K^T MMA Acc F32 + P@V MMA Acc F16.
-  ENABLE_FFPA_FORCE_PV_F16 = bool(int(os.environ.get("ENABLE_FFPA_FORCE_PV_F16", 0)))
+  ENABLE_FFPA_FORCE_PV_F16 = bool(
+    int(os.environ.get("ENABLE_FFPA_FORCE_PV_F16", 0))
+  )
 
   # Enable FFPA Prefetch QKV at the Appropriate Time Point, default True, boost 5%~10%.
-  ENABLE_FFPA_PREFETCH_QKV = bool(int(os.environ.get("ENABLE_FFPA_PREFETCH_QKV", 1)))
+  ENABLE_FFPA_PREFETCH_QKV = bool(
+    int(os.environ.get("ENABLE_FFPA_PREFETCH_QKV", 1))
+  )
 
   # Enable QKV smem shared policy, default False (perfered for MMA & g2s overlap).
   # Please, set it as True if you want to run FFPA on low SRAM device.
-  ENABLE_FFPA_QKV_SMEM_SHARE = bool(int(os.environ.get("ENABLE_FFPA_QKV_SMEM_SHARE", 0)))
+  ENABLE_FFPA_QKV_SMEM_SHARE = bool(
+    int(os.environ.get("ENABLE_FFPA_QKV_SMEM_SHARE", 0))
+  )
 
   # Enable smem swizzle for Q, default True. True: bank conflicts free for Q smem
   # via swizzle; False: bank conflicts free for Q smem via padding.
-  ENABLE_FFPA_SMEM_SWIZZLE_Q = bool(int(os.environ.get("ENABLE_FFPA_SMEM_SWIZZLE_Q", 1)))
+  ENABLE_FFPA_SMEM_SWIZZLE_Q = bool(
+    int(os.environ.get("ENABLE_FFPA_SMEM_SWIZZLE_Q", 1))
+  )
 
   # Enable smem swizzle for K, default True. True: bank conflicts free for K smem
   # via swizzle; False: bank conflicts free for K smem via padding.
-  ENABLE_FFPA_SMEM_SWIZZLE_K = bool(int(os.environ.get("ENABLE_FFPA_SMEM_SWIZZLE_K", 1)))
+  ENABLE_FFPA_SMEM_SWIZZLE_K = bool(
+    int(os.environ.get("ENABLE_FFPA_SMEM_SWIZZLE_K", 1))
+  )
 
   # Enable smem swizzle for V, now default True. True: bank conflicts free for V smem
   # via swizzle; False: bank conflicts free for V smem via padding. FIXME(DefTruth):
   # swizzle V seems can not get good performance. why? Will enable it by default untill
   # I have fixed the performance issue. (Fixed)
-  ENABLE_FFPA_SMEM_SWIZZLE_V = bool(int(os.environ.get("ENABLE_FFPA_SMEM_SWIZZLE_V", 1)))
+  ENABLE_FFPA_SMEM_SWIZZLE_V = bool(
+    int(os.environ.get("ENABLE_FFPA_SMEM_SWIZZLE_V", 1))
+  )
 
   # Persist load Q g2s for headdim <= 320, more SRAM, but still keep register usage.
-  ENABLE_FFPA_PERSIST_Q_G2S = bool(int(os.environ.get("ENABLE_FFPA_PERSIST_Q_G2S", 1)))
+  ENABLE_FFPA_PERSIST_Q_G2S = bool(
+    int(os.environ.get("ENABLE_FFPA_PERSIST_Q_G2S", 1))
+  )
 
   # Persist load KV g2s for headdim <= 256, more SRAM. If True, auto use flash-attn
   # algo that tiling at attention level for headdim <= 256 and auto use ffpa-attn
   # fined-grain tiling at MMA level for headdim > 256.
-  ENABLE_FFPA_PERSIST_KV_G2S = bool(int(os.environ.get("ENABLE_FFPA_PERSIST_KV_G2S", 1)))
+  ENABLE_FFPA_PERSIST_KV_G2S = bool(
+    int(os.environ.get("ENABLE_FFPA_PERSIST_KV_G2S", 1))
+  )
 
   # Persist load Q from s2r for headdim < 512 to reduce Q from g2s and s2r IO access,
   # but still keep O(1) SRAM complexity. Default value is False. This option will
   # introduce more registers for Q frags as the headdim becomes larger. We should
   # choose to enable it or not according to the balance between register usage and
   # IO access reduction.
-  ENABLE_FFPA_PERSIST_Q_S2R = bool(int(os.environ.get("ENABLE_FFPA_PERSIST_Q_S2R", 0)))
+  ENABLE_FFPA_PERSIST_Q_S2R = bool(
+    int(os.environ.get("ENABLE_FFPA_PERSIST_Q_S2R", 0))
+  )
 
   # Persist V s2r only for small d kernel, more registers.
-  ENABLE_FFPA_PERSIST_V_S2R = bool(int(os.environ.get("ENABLE_FFPA_PERSIST_V_S2R", 1)))
+  ENABLE_FFPA_PERSIST_V_S2R = bool(
+    int(os.environ.get("ENABLE_FFPA_PERSIST_V_S2R", 1))
+  )
 
   # Registers Ping pong double buffers for ldmatrix & mma computation overlapping.
-  ENABLE_FFPA_REGISTERS_PIPE_KV = bool(int(os.environ.get("ENABLE_FFPA_REGISTERS_PIPE_KV", 0)))
+  ENABLE_FFPA_REGISTERS_PIPE_KV = bool(
+    int(os.environ.get("ENABLE_FFPA_REGISTERS_PIPE_KV", 0))
+  )
 
   # if True: grid(N/Br, H, B) else: grid(N/Br, B * H)
-  ENABLE_FFPA_LAUNCH_GRID_DNHB = bool(int(os.environ.get("ENABLE_FFPA_LAUNCH_GRID_DNHB", 0)))
+  ENABLE_FFPA_LAUNCH_GRID_DNHB = bool(
+    int(os.environ.get("ENABLE_FFPA_LAUNCH_GRID_DNHB", 0))
+  )
 
   # Enable legacy native CUDA kernel generation/compilation. Defaults to
   # disabled so the package can be built and used in Triton-only mode.
@@ -92,7 +122,11 @@ class ENV(object):
   # ``ENABLE_FFPA_FWD_CUDA_IMPL`` is accepted as a temporary compatibility
   # alias for older scripts. Native CUDA backward is no longer generated.
   ENABLE_FFPA_CUDA_IMPL = bool(
-    int(os.environ.get("ENABLE_FFPA_CUDA_IMPL", os.environ.get("ENABLE_FFPA_FWD_CUDA_IMPL", 0)))
+    int(
+      os.environ.get(
+        "ENABLE_FFPA_CUDA_IMPL", os.environ.get("ENABLE_FFPA_FWD_CUDA_IMPL", 0)
+      )
+    )
   )
 
   # --- Build-time tuning knobs ---------------------------------------------
@@ -150,7 +184,9 @@ class ENV(object):
         if norm not in archs:
           archs.append(norm)
       if not archs:
-        raise RuntimeError(f"FFPA_BUILD_ARCH={raw!r} parsed to an empty arch list.")
+        raise RuntimeError(
+          f"FFPA_BUILD_ARCH={raw!r} parsed to an empty arch list."
+        )
       return archs
     # No explicit list -> use the current device's SM capability.
     if not torch.cuda.is_available() or torch.cuda.device_count() == 0:
@@ -272,17 +308,22 @@ class ENV(object):
       extra_env_cflags.append("-DENABLE_FFPA_CUDA_IMPL")
 
     if cls.enable_persist_kv_g2s():
-      assert (cls.enable_persist_q_g2s()), "PERSIST_Q_G2S must be enable if PERSIST_KV_G2S is enabled."
+      assert (
+        cls.enable_persist_q_g2s()
+      ), "PERSIST_Q_G2S must be enable if PERSIST_KV_G2S is enabled."
       if cls.enable_qkv_smem_share():
-        assert (cls.enable_persist_q_s2r()), "PERSIST_Q_S2R must be enable if QKV_SMEM_SHARE and "
+        assert (
+          cls.enable_persist_q_s2r()
+        ), "PERSIST_Q_S2R must be enable if QKV_SMEM_SHARE and "
         "PERSIST_KV_G2S are enabled."
     else:
       assert not all((cls.enable_persist_q_s2r(), cls.enable_persist_q_g2s())
                      ), "PERSIST_Q_G2S and PERSIST_Q_S2R can not both enabled."
       assert not all((cls.enable_qkv_smem_share(), cls.enable_persist_q_g2s())
                      ), "PERSIST_Q_G2S and QKV_SMEM_SHARE can not both enabled."
-      assert not all((cls.enable_qkv_smem_share(), cls.enable_persist_kv_g2s())
-                     ), "PERSIST_KV_G2S and QKV_SMEM_SHARE can not both enabled."
+      assert not all(
+        (cls.enable_qkv_smem_share(), cls.enable_persist_kv_g2s())
+      ), "PERSIST_KV_G2S and QKV_SMEM_SHARE can not both enabled."
     return extra_env_cflags
 
   @classmethod
@@ -297,8 +338,10 @@ class ENV(object):
 
     def formatenv(name, value):
       try:
-        print(f"{name:<30}: {str(value):<5} -> command:"
-              f" export {name}={int(value)}")
+        print(
+          f"{name:<30}: {str(value):<5} -> command:"
+          f" export {name}={int(value)}"
+        )
       except Exception:
         print(f"{name:<30}: {value}")
 
@@ -308,8 +351,10 @@ class ENV(object):
     formatenv("FFPA_NVCC_THREADS", cls.FFPA_NVCC_THREADS)
     formatenv("FFPA_PTXAS_VERBOSE", cls.FFPA_PTXAS_VERBOSE)
     formatenv(
-      "FFPA_DEV_HEADDIMS", cls.FFPA_DEV_HEADDIMS
-      or ("range(32, 1024, 32)" if cls.enable_all_headdim() else "range(320, 1024, 64)")
+      "FFPA_DEV_HEADDIMS", cls.FFPA_DEV_HEADDIMS or (
+        "range(32, 1024, 32)"
+        if cls.enable_all_headdim() else "range(320, 1024, 64)"
+      )
     )
     formatenv("ENABLE_FFPA_ALL_STAGES", cls.enable_all_mutistages())
     formatenv("ENABLE_FFPA_ALL_HEADDIM", cls.enable_all_headdim())
@@ -362,7 +407,9 @@ class ENV(object):
         if d not in subset:
           subset.append(d)
       if not subset:
-        raise RuntimeError(f"FFPA_DEV_HEADDIMS={raw!r} parsed to an empty list.")
+        raise RuntimeError(
+          f"FFPA_DEV_HEADDIMS={raw!r} parsed to an empty list."
+        )
       return sorted(subset)
     if cls.enable_all_headdim():
       return list(range(32, 1025, 32))
@@ -441,10 +488,12 @@ class ENV(object):
     # so the default forward-only build does not leave confusing bwd artifacts.
     stale_file_names = {"ffpa_attn_L1_decls.h", "ffpa_attn_L1_dispatch.cu"}
     for fname in os.listdir(gen_dir):
-      is_stale = ((fname.startswith("ffpa_attn_L1_acc_") and fname.endswith(".cu"))
-                  or (fname.startswith("ffpa_attn_L1_hdim") and fname.endswith(".cu"))
-                  or (not cls.enable_fwd_cuda_impl() and fname.startswith("ffpa_attn_fwd_"))
-                  or fname.startswith("ffpa_attn_bwd_") or fname in stale_file_names)
+      is_stale = (
+        (fname.startswith("ffpa_attn_L1_acc_") and fname.endswith(".cu"))
+        or (fname.startswith("ffpa_attn_L1_hdim") and fname.endswith(".cu")) or
+        (not cls.enable_fwd_cuda_impl() and fname.startswith("ffpa_attn_fwd_"))
+        or fname.startswith("ffpa_attn_bwd_") or fname in stale_file_names
+      )
       if is_stale:
         stale = os.path.join(gen_dir, fname)
         try:
@@ -568,8 +617,12 @@ class ENV(object):
     ]
 
     body = "\n".join(lines) + "\n"
-    body += cls._render_entry(d, f"ffpa_attn_fwd_fp16f16_d{d}", "__half", f16_prefix) + "\n"
-    body += cls._render_entry(d, f"ffpa_attn_fwd_fp16f32_d{d}", "__half", f32_prefix)
+    body += cls._render_entry(
+      d, f"ffpa_attn_fwd_fp16f16_d{d}", "__half", f16_prefix
+    ) + "\n"
+    body += cls._render_entry(
+      d, f"ffpa_attn_fwd_fp16f32_d{d}", "__half", f32_prefix
+    )
     return body
 
   @classmethod
@@ -593,13 +646,17 @@ class ENV(object):
       "  constexpr int kMmaAccFloat32PV = 1;",
     ]
     body = "\n".join(lines) + "\n"
-    body += cls._render_entry(d, f"ffpa_attn_fwd_bf16f32_d{d}", "__nv_bfloat16", bf16_prefix)
+    body += cls._render_entry(
+      d, f"ffpa_attn_fwd_bf16f32_d{d}", "__nv_bfloat16", bf16_prefix
+    )
     return body
 
   # -------------------- forward entry rendering --------------------
 
   @classmethod
-  def _render_entry(cls, d: int, symbol: str, t_in: str, body_prefix: list) -> str:
+  def _render_entry(
+    cls, d: int, symbol: str, t_in: str, body_prefix: list
+  ) -> str:
     head = [
       f"void {symbol}(",
       "    torch::Tensor Q,",
@@ -616,8 +673,13 @@ class ENV(object):
       "    int64_t philox_offset,",
       "    int tma) {",
     ]
-    stage_body = cls._render_stage_body(d, t_in, "kMmaAccFloat32QK", "kMmaAccFloat32PV")
-    return ("\n".join(head) + "\n" + "\n".join(body_prefix) + "\n" + stage_body + "}\n")
+    stage_body = cls._render_stage_body(
+      d, t_in, "kMmaAccFloat32QK", "kMmaAccFloat32PV"
+    )
+    return (
+      "\n".join(head) + "\n" + "\n".join(body_prefix) + "\n" + stage_body +
+      "}\n"
+    )
 
   @staticmethod
   def _render_dispatch_tu(headdims) -> str:
@@ -661,8 +723,11 @@ class ENV(object):
       "// AUTO-GENERATED by env.py. DO NOT EDIT.\n"
       '#include "logging.cuh"\n'
       '#include "ffpa_attn_fwd_decls.h"\n'
-      "\n" + _fn("ffpa_attn_fwd_fp16f16", "ffpa_attn_fwd_fp16f16", "torch::kHalf") + "\n" +
-      _fn("ffpa_attn_fwd_fp16f32", "ffpa_attn_fwd_fp16f32", "torch::kHalf") + "\n" +
+      "\n" +
+      _fn("ffpa_attn_fwd_fp16f16", "ffpa_attn_fwd_fp16f16", "torch::kHalf") +
+      "\n" +
+      _fn("ffpa_attn_fwd_fp16f32", "ffpa_attn_fwd_fp16f32", "torch::kHalf") +
+      "\n" +
       _fn("ffpa_attn_fwd_bf16f32", "ffpa_attn_fwd_bf16f32", "torch::kBFloat16")
     )
 
@@ -756,7 +821,8 @@ class ENV(object):
 
     from packaging.version import parse
 
-    raw_output = subprocess.check_output([cuda_dir + "/bin/nvcc", "-V"], universal_newlines=True)
+    raw_output = subprocess.check_output([cuda_dir + "/bin/nvcc", "-V"],
+                                         universal_newlines=True)
     output = raw_output.split()
     release_idx = output.index("release") + 1
     bare_metal_version = parse(output[release_idx].split(",")[0])
@@ -801,8 +867,10 @@ class ENV(object):
         return ffpa_attn, use_ffpa_attn_package
       except Exception:
         pretty_print_line("Can't import ffpa_attn, force build from sources")
-        pretty_print_line("Also may need export LD_LIBRARY_PATH="
-                          "PATH-TO/torch/lib:$LD_LIBRARY_PATH")
+        pretty_print_line(
+          "Also may need export LD_LIBRARY_PATH="
+          "PATH-TO/torch/lib:$LD_LIBRARY_PATH"
+        )
         ffpa_attn = ENV.build_ffpa_from_sources(verbose=verbose)
         use_ffpa_attn_package = False
         return ffpa_attn, use_ffpa_attn_package
@@ -813,7 +881,9 @@ class ENV(object):
       return ffpa_attn, use_ffpa_attn_package
 
 
-def pretty_print_line(m: str = "", sep: str = "-", mode: str = "center", width: int = 150):
+def pretty_print_line(
+  m: str = "", sep: str = "-", mode: str = "center", width: int = 150
+):
   res_len = width - len(m)
   if mode == "center":
     left_len = int(res_len / 2)

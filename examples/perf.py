@@ -47,7 +47,9 @@ def _parse_grad_kv_dtype(arg: str) -> torch.dtype | None:
     return torch.float16
   if arg == "fp32":
     return torch.float32
-  raise ValueError(f"Unsupported grad-kv-dtype={arg!r}; choose 'none', 'fp16', or 'fp32'.")
+  raise ValueError(
+    f"Unsupported grad-kv-dtype={arg!r}; choose 'none', 'fp16', or 'fp32'."
+  )
 
 
 # Keep the exact legacy plotting style from tools/plot.py.
@@ -87,7 +89,9 @@ DEFAULT_OUTPUT_STEM = "ffpa_speedup"
 DEFAULT_OUTPUT_DIR = Path(".tmp")
 FALLBACK_DEVICE_NAME = "NVIDIA Geforce RTX 5090"
 CUTEDSL_BACKEND = "cutedsl"
-CUTEDSL_COMPAT_TASKS = frozenset({"self-attn", "cross-attn", "gqa", "causal", "non-aligned"})
+CUTEDSL_COMPAT_TASKS = frozenset({
+  "self-attn", "cross-attn", "gqa", "causal", "non-aligned"
+})
 CUTEDSL_DTYPES: tuple[torch.dtype, ...] = (torch.float16, torch.bfloat16)
 CUTEDSL_HEAD_DIM = 512
 CUTEDSL_OUTPUT_STEM = "ffpa_speedup_cutedsl"
@@ -175,7 +179,8 @@ def _parse_args() -> argparse.Namespace:
   :return: Parsed CLI namespace.
   """
   parser = argparse.ArgumentParser(
-    description="Benchmark FFPA forward/backward cases and generate plot plus Markdown tables."
+    description=
+    "Benchmark FFPA forward/backward cases and generate plot plus Markdown tables."
   )
   parser.add_argument(
     "--no-forward",
@@ -195,7 +200,8 @@ def _parse_args() -> argparse.Namespace:
   parser.add_argument(
     "--show-fallback",
     action="store_true",
-    help="Render the legacy hard-coded fallback plot and Markdown table instead of running real benchmarks.",
+    help=
+    "Render the legacy hard-coded fallback plot and Markdown table instead of running real benchmarks.",
   )
   parser.add_argument(
     "--forward-backend",
@@ -211,7 +217,11 @@ def _parse_args() -> argparse.Namespace:
     default="triton",
     help="Backward backend used when --backward is enabled.",
   )
-  parser.add_argument("--tune", choices=["fast", "max"], help="Enable Triton autotune with the selected search mode.")
+  parser.add_argument(
+    "--tune",
+    choices=["fast", "max"],
+    help="Enable Triton autotune with the selected search mode."
+  )
   parser.add_argument(
     "--tasks",
     nargs="*",
@@ -221,13 +231,33 @@ def _parse_args() -> argparse.Namespace:
       "Defaults to full; valid cases: " + ",".join(VALID_TASKS)
     ),
   )
-  parser.add_argument("--B", type=int, default=1, help="Batch size used by benchmark mode.")
-  parser.add_argument("--H", type=int, default=32, help="Base head count used by benchmark mode.")
-  parser.add_argument("--N", type=int, default=8192, help="Base sequence length used by benchmark mode.")
-  parser.add_argument("--D", type=int, default=512, help="Head dimension used by benchmark mode.")
-  parser.add_argument("--warmup", type=int, default=2, help="Warmup iterations used for timing.")
-  parser.add_argument("--iters", type=int, default=10, help="Measured iterations used for timing.")
-  parser.add_argument("--seed", type=int, default=42, help="RNG seed used by benchmark mode.")
+  parser.add_argument(
+    "--B", type=int, default=1, help="Batch size used by benchmark mode."
+  )
+  parser.add_argument(
+    "--H", type=int, default=32, help="Base head count used by benchmark mode."
+  )
+  parser.add_argument(
+    "--N",
+    type=int,
+    default=8192,
+    help="Base sequence length used by benchmark mode."
+  )
+  parser.add_argument(
+    "--D", type=int, default=512, help="Head dimension used by benchmark mode."
+  )
+  parser.add_argument(
+    "--warmup", type=int, default=2, help="Warmup iterations used for timing."
+  )
+  parser.add_argument(
+    "--iters",
+    type=int,
+    default=10,
+    help="Measured iterations used for timing."
+  )
+  parser.add_argument(
+    "--seed", type=int, default=42, help="RNG seed used by benchmark mode."
+  )
   parser.add_argument(
     "--dtype",
     choices=["fp16", "bf16", "both"],
@@ -256,45 +286,52 @@ def _parse_args() -> argparse.Namespace:
     "--enable-fwd-tma",
     "--fwd-tma",
     action="store_true",
-    help="Enable experimental SM90+ TMA forward path (silently falls back on unsupported devices).",
+    help=
+    "Enable experimental SM90+ TMA forward path (silently falls back on unsupported devices).",
   )
   parser.add_argument(
     "--enable-bwd-tma",
     "--bwd-tma",
     action="store_true",
-    help="Enable experimental SM90+ TMA backward path (silently falls back on unsupported devices).",
+    help=
+    "Enable experimental SM90+ TMA backward path (silently falls back on unsupported devices).",
   )
   parser.add_argument(
     "--enable-fwd-ws",
     "--fwd-ws",
     action="store_true",
-    help="Force warp-specialized configs for the experimental SM90+ TMA forward path.",
+    help=
+    "Force warp-specialized configs for the experimental SM90+ TMA forward path.",
   )
   parser.add_argument(
     "--enable-bwd-ws",
     "--bwd-ws",
     action="store_true",
-    help="Force warp-specialized configs for the experimental SM90+ TMA backward path.",
+    help=
+    "Force warp-specialized configs for the experimental SM90+ TMA backward path.",
   )
   parser.add_argument(
     "--enable-persist-dkdv",
     "--persist-dkdv",
     action="store_true",
-    help="Enable persistent dK/dV fp32 accumulation in the SM90+ TMA backward path (requires --bwd-tma).",
+    help=
+    "Enable persistent dK/dV fp32 accumulation in the SM90+ TMA backward path (requires --bwd-tma).",
   )
   parser.add_argument(
     "--enable-bwd-split-launch",
     "--bwd-split-launch",
     "--bwd-split",
     action="store_true",
-    help="Enable separate backward launches for dK/dV and dQ on generic Triton or SM90+ TMA paths.",
+    help=
+    "Enable separate backward launches for dK/dV and dQ on generic Triton or SM90+ TMA paths.",
   )
   parser.add_argument(
     "--grad-kv-storage-dtype",
     "--grad-kv-dtype",
     choices=["none", "fp16", "fp32"],
     default="none",
-    help="Optional Triton backward dK/dV storage dtype forwarded to the example runners.",
+    help=
+    "Optional Triton backward dK/dV storage dtype forwarded to the example runners.",
   )
   parser.add_argument(
     "--show-allclose",
@@ -305,12 +342,15 @@ def _parse_args() -> argparse.Namespace:
     "--save-path",
     type=Path,
     default=None,
-    help="Optional output directory used to save the generated PNG and Markdown artifacts. Defaults to ./.tmp.",
+    help=
+    "Optional output directory used to save the generated PNG and Markdown artifacts. Defaults to ./.tmp.",
   )
   return _resolve_directional_cli_flags(parser.parse_args())
 
 
-def _resolve_directional_cli_flags(args: argparse.Namespace) -> argparse.Namespace:
+def _resolve_directional_cli_flags(
+  args: argparse.Namespace
+) -> argparse.Namespace:
   """Resolve legacy global TMA/WS flags into directional benchmark flags."""
   if args.enable_tma:
     args.enable_fwd_tma = True
@@ -341,11 +381,15 @@ def _parse_tasks_arg(tasks_arg: list[str] | None) -> set[str] | None:
   invalid = sorted(tasks.difference(VALID_TASKS))
   if invalid:
     valid = ",".join(VALID_TASKS)
-    raise SystemExit(f"Unknown --tasks value(s): {','.join(invalid)}. Valid cases: {valid}, or full.")
+    raise SystemExit(
+      f"Unknown --tasks value(s): {','.join(invalid)}. Valid cases: {valid}, or full."
+    )
   return tasks
 
 
-def _active_plot_cases(tasks: set[str] | None, *, kind: str = "speedup") -> list[tuple[str, str]]:
+def _active_plot_cases(tasks: set[str] | None,
+                       *,
+                       kind: str = "speedup") -> list[tuple[str, str]]:
   """Return plot cases filtered by an optional task set.
 
   :param tasks: Optional selected case names.
@@ -360,10 +404,13 @@ def _active_plot_cases(tasks: set[str] | None, *, kind: str = "speedup") -> list
   elif kind == "all":
     source = PLOT_CASES
   else:
-    raise ValueError(f"Unknown plot kind={kind!r}; choose 'speedup', 'tflops', or 'all'.")
+    raise ValueError(
+      f"Unknown plot kind={kind!r}; choose 'speedup', 'tflops', or 'all'."
+    )
   if tasks is None:
     return list(source)
-  return [(case_name, label) for case_name, label in source if case_name in tasks]
+  return [(case_name, label) for case_name, label in source
+          if case_name in tasks]
 
 
 def _device_name() -> str:
@@ -386,7 +433,9 @@ def _require_sm90() -> None:
   from ffpa_attn.cutedsl import cutedsl_forward_available
 
   if not torch.cuda.is_available():
-    raise SystemExit("CUDA is required: the CuTeDSL backend only runs on SM90 (Hopper) GPUs.")
+    raise SystemExit(
+      "CUDA is required: the CuTeDSL backend only runs on SM90 (Hopper) GPUs."
+    )
   device = torch.device("cuda", torch.cuda.current_device())
   if not cutedsl_forward_available(device):
     major, minor = torch.cuda.get_device_capability(device)
@@ -408,11 +457,15 @@ def _resolve_cutedsl_backends(args: argparse.Namespace) -> bool:
     return False
   if fwd == CUTEDSL_BACKEND and bwd != CUTEDSL_BACKEND:
     if bwd != "triton":
-      raise SystemExit(f"--forward-backend cutedsl requires --backward-backend cutedsl; got {bwd!r}.")
+      raise SystemExit(
+        f"--forward-backend cutedsl requires --backward-backend cutedsl; got {bwd!r}."
+      )
     args.backward_backend = CUTEDSL_BACKEND
   if bwd == CUTEDSL_BACKEND and fwd != CUTEDSL_BACKEND:
     if fwd != "triton":
-      raise SystemExit(f"--backward-backend cutedsl requires --forward-backend cutedsl; got {fwd!r}.")
+      raise SystemExit(
+        f"--backward-backend cutedsl requires --forward-backend cutedsl; got {fwd!r}."
+      )
     args.forward_backend = CUTEDSL_BACKEND
   return True
 
@@ -428,7 +481,15 @@ def _slugify_device_name(device_name: str) -> str:
   return slug or "unknown-device"
 
 
-def _output_stem(device_name: str, B: int, H: int, N: int, D: int, *, cutedsl: bool = False) -> Path:
+def _output_stem(
+  device_name: str,
+  B: int,
+  H: int,
+  N: int,
+  D: int,
+  *,
+  cutedsl: bool = False
+) -> Path:
   """Build the output stem shared by the PNG and Markdown files.
 
   :param device_name: Device name used in the run.
@@ -506,7 +567,9 @@ def _mode_suffix(has_forward: bool, has_backward: bool) -> str:
   return "BWD"
 
 
-def _forward_section_label(backend: str, tune_mode: str | None, fallback: bool) -> str:
+def _forward_section_label(
+  backend: str, tune_mode: str | None, fallback: bool
+) -> str:
   """Describe the forward data source for Markdown headings.
 
   :param backend: Forward backend.
@@ -525,7 +588,9 @@ def _forward_section_label(backend: str, tune_mode: str | None, fallback: bool) 
   return "Triton"
 
 
-def _backward_section_label(backend: str, tune_mode: str | None, fallback: bool) -> str:
+def _backward_section_label(
+  backend: str, tune_mode: str | None, fallback: bool
+) -> str:
   """Describe the backward data source for Markdown headings.
 
   :param backend: Backward backend.
@@ -544,7 +609,8 @@ def _backward_section_label(backend: str, tune_mode: str | None, fallback: bool)
   return "Triton"
 
 
-def _decorate_rows(direction: str, rows: list[dict[str, Any]]) -> list[RESULT_ROW]:
+def _decorate_rows(direction: str, rows: list[dict[str,
+                                                   Any]]) -> list[RESULT_ROW]:
   """Attach the direction field to benchmark results.
 
   :param direction: ``forward`` or ``backward``.
@@ -572,30 +638,48 @@ def _build_fallback_rows(
   """
   forward_rows: list[RESULT_ROW] = []
   backward_rows: list[RESULT_ROW] = []
-  for direction, target in (("forward", forward_rows), ("backward", backward_rows)):
+  for direction, target in (("forward", forward_rows),
+                            ("backward", backward_rows)):
     for case_name, _ in PLOT_CASES:
       if tasks is not None and case_name not in tasks:
         continue
       nq, nkv = _case_shape(case_name, N)
       for dtype in DTYPE_ORDER:
         target.append({
-          "direction": direction,
-          "case_name": case_name,
-          "dtype": dtype,
-          "B": B,
-          "Hq": H,
-          "Hkv": H,
-          "Nq": nq,
-          "Nkv": nkv,
-          "D": D,
-          "allclose": None,
-          "ffpa_ms": None,
-          "sdpa_ms": None,
-          "speedup": FALLBACK_SPEEDUPS[direction][case_name][dtype],
-          "forward_backend": "hard-coded" if direction == "forward" else None,
-          "backward_backend": "hard-coded" if direction == "backward" else None,
-          "dropout_p": 0.1 if case_name == "dropout" else 0.0,
-          "causal": case_name == "causal",
+          "direction":
+          direction,
+          "case_name":
+          case_name,
+          "dtype":
+          dtype,
+          "B":
+          B,
+          "Hq":
+          H,
+          "Hkv":
+          H,
+          "Nq":
+          nq,
+          "Nkv":
+          nkv,
+          "D":
+          D,
+          "allclose":
+          None,
+          "ffpa_ms":
+          None,
+          "sdpa_ms":
+          None,
+          "speedup":
+          FALLBACK_SPEEDUPS[direction][case_name][dtype],
+          "forward_backend":
+          "hard-coded" if direction == "forward" else None,
+          "backward_backend":
+          "hard-coded" if direction == "backward" else None,
+          "dropout_p":
+          0.1 if case_name == "dropout" else 0.0,
+          "causal":
+          case_name == "causal",
         })
   return forward_rows, backward_rows
 
@@ -618,7 +702,10 @@ def _aggregate_speedups(
   """
   active_plot_cases = PLOT_CASES if plot_cases is None else plot_cases
   active_case_names = {case_name for case_name, _ in active_plot_cases}
-  case_to_speedups: dict[str, dict[str, float]] = {case_name: {} for case_name, _ in active_plot_cases}
+  case_to_speedups: dict[str, dict[str, float]] = {
+    case_name: {}
+    for case_name, _ in active_plot_cases
+  }
   for row in rows:
     if row["direction"] != direction:
       continue
@@ -659,7 +746,10 @@ def _aggregate_metric(
   """
   active_plot_cases = PLOT_CASES if plot_cases is None else plot_cases
   active_case_names = {case_name for case_name, _ in active_plot_cases}
-  case_to_values: dict[str, dict[str, float]] = {case_name: {} for case_name, _ in active_plot_cases}
+  case_to_values: dict[str, dict[str, float]] = {
+    case_name: {}
+    for case_name, _ in active_plot_cases
+  }
   for row in rows:
     if row["direction"] != direction:
       continue
@@ -713,7 +803,9 @@ def plot_speedup(
   """
   active_plot_cases = PLOT_CASES if plot_cases is None else plot_cases
   fwd_speedups = _aggregate_speedups(forward_rows, "forward", active_plot_cases)
-  bwd_speedups = _aggregate_speedups(backward_rows, "backward", active_plot_cases)
+  bwd_speedups = _aggregate_speedups(
+    backward_rows, "backward", active_plot_cases
+  )
   has_forward = fwd_speedups is not None
   has_backward = bwd_speedups is not None
   if not has_forward and not has_backward:
@@ -806,7 +898,9 @@ def plot_speedup(
     y=0.958,
   )
   ax.set_xticks(x)
-  ax.set_xticklabels(attn_types, rotation=0, ha="center", fontsize=22, fontweight="bold")
+  ax.set_xticklabels(
+    attn_types, rotation=0, ha="center", fontsize=22, fontweight="bold"
+  )
   ax.tick_params(axis="y", labelsize=16)
   ymax = max(finite_values) if finite_values else 1.0
   ax.set_ylim(0, ymax * 1.17 if ymax > 0 else 1.0)
@@ -856,10 +950,18 @@ def plot_tflops(
   :return: Saved PNG path, or ``None`` when no TFLOPS data is available.
   """
   active_plot_cases = TFLOPS_PLOT_CASES if plot_cases is None else plot_cases
-  fwd_ffpa_tflops = _aggregate_metric(forward_rows, "forward", "ffpa_tflops", plot_cases=active_plot_cases)
-  fwd_sdpa_tflops = _aggregate_metric(forward_rows, "forward", "sdpa_tflops", plot_cases=active_plot_cases)
-  bwd_ffpa_tflops = _aggregate_metric(backward_rows, "backward", "ffpa_tflops", plot_cases=active_plot_cases)
-  bwd_sdpa_tflops = _aggregate_metric(backward_rows, "backward", "sdpa_tflops", plot_cases=active_plot_cases)
+  fwd_ffpa_tflops = _aggregate_metric(
+    forward_rows, "forward", "ffpa_tflops", plot_cases=active_plot_cases
+  )
+  fwd_sdpa_tflops = _aggregate_metric(
+    forward_rows, "forward", "sdpa_tflops", plot_cases=active_plot_cases
+  )
+  bwd_ffpa_tflops = _aggregate_metric(
+    backward_rows, "backward", "ffpa_tflops", plot_cases=active_plot_cases
+  )
+  bwd_sdpa_tflops = _aggregate_metric(
+    backward_rows, "backward", "sdpa_tflops", plot_cases=active_plot_cases
+  )
   has_forward = fwd_ffpa_tflops is not None and fwd_sdpa_tflops is not None
   has_backward = bwd_ffpa_tflops is not None and bwd_sdpa_tflops is not None
   if not has_forward and not has_backward:
@@ -920,8 +1022,12 @@ def plot_tflops(
     )
     _autolabel(rect_fwd_sdpa)
     _autolabel(rect_fwd_ffpa)
-    finite_values.extend(value for value in fwd_sdpa_tflops if np.isfinite(value))
-    finite_values.extend(value for value in fwd_ffpa_tflops if np.isfinite(value))
+    finite_values.extend(
+      value for value in fwd_sdpa_tflops if np.isfinite(value)
+    )
+    finite_values.extend(
+      value for value in fwd_ffpa_tflops if np.isfinite(value)
+    )
 
   if has_backward and x_bwd_sdpa is not None and x_bwd_ffpa is not None:
     rect_bwd_sdpa = ax.bar(
@@ -944,8 +1050,12 @@ def plot_tflops(
     )
     _autolabel(rect_bwd_sdpa)
     _autolabel(rect_bwd_ffpa)
-    finite_values.extend(value for value in bwd_sdpa_tflops if np.isfinite(value))
-    finite_values.extend(value for value in bwd_ffpa_tflops if np.isfinite(value))
+    finite_values.extend(
+      value for value in bwd_sdpa_tflops if np.isfinite(value)
+    )
+    finite_values.extend(
+      value for value in bwd_ffpa_tflops if np.isfinite(value)
+    )
 
   ax.set_ylabel("Throughput (TFLOPS)", fontsize=18)
   title_prefix = "FFPA CuTeDSL vs SDPA TFLOPS" if cutedsl else "FFPA vs SDPA TFLOPS"
@@ -957,7 +1067,9 @@ def plot_tflops(
     y=0.958,
   )
   ax.set_xticks(x)
-  ax.set_xticklabels(attn_types, rotation=0, ha="center", fontsize=22, fontweight="bold")
+  ax.set_xticklabels(
+    attn_types, rotation=0, ha="center", fontsize=22, fontweight="bold"
+  )
   ax.tick_params(axis="y", labelsize=16)
   ymax = max(finite_values) if finite_values else 1.0
   ax.set_ylim(0, ymax * 1.10 if ymax > 0 else 1.0)
@@ -984,9 +1096,16 @@ def _sort_rows(rows: list[RESULT_ROW]) -> list[RESULT_ROW]:
   :param rows: Structured result rows.
   :return: Sorted rows.
   """
-  case_rank = {case_name: index for index, (case_name, _) in enumerate(PLOT_CASES)}
+  case_rank = {
+    case_name: index
+    for index, (case_name, _) in enumerate(PLOT_CASES)
+  }
   dtype_rank = {dtype: index for index, dtype in enumerate(DTYPE_ORDER)}
-  return sorted(rows, key=lambda row: (case_rank[row["case_name"]], dtype_rank.get(row["dtype"], 999)))
+  return sorted(
+    rows,
+    key=lambda row:
+    (case_rank[row["case_name"]], dtype_rank.get(row["dtype"], 999))
+  )
 
 
 def _allclose_marker(row: RESULT_ROW) -> str:
@@ -1096,7 +1215,9 @@ def render_speedup_markdown(
   :param show_allclose: Whether to include the allclose column.
   :return: Markdown document fragment.
   """
-  lines = ["## Benchmark", "", f"Env: {device_name}, B={B}, N={N}, H={H}, D={D}."]
+  lines = [
+    "## Benchmark", "", f"Env: {device_name}, B={B}, N={N}, H={H}, D={D}."
+  ]
   if cutedsl:
     lines.extend([
       "",
@@ -1116,10 +1237,18 @@ def render_speedup_markdown(
       "Note: fallback mode reuses hard-coded plot speedups only, so FFPA / SDPA latency, TFLOPS, and allclose are unavailable."
     ])
   if forward_rows:
-    lines.extend(["", f"### Forward Pass ({_forward_section_label(forward_backend, tune_mode, fallback)})", ""])
+    lines.extend([
+      "",
+      f"### Forward Pass ({_forward_section_label(forward_backend, tune_mode, fallback)})",
+      ""
+    ])
     lines.extend(_render_table(forward_rows, show_allclose))
   if backward_rows:
-    lines.extend(["", f"### Backward Pass ({_backward_section_label(backward_backend, tune_mode, fallback)})", ""])
+    lines.extend([
+      "",
+      f"### Backward Pass ({_backward_section_label(backward_backend, tune_mode, fallback)})",
+      ""
+    ])
     lines.extend(_render_table(backward_rows, show_allclose))
   return "\n".join(lines) + "\n"
 
@@ -1160,7 +1289,9 @@ def _benchmark_rows(
   :return: ``(forward_rows, backward_rows)``.
   """
   if not torch.cuda.is_available():
-    raise SystemExit("CUDA is required when --forward or --backward is requested.")
+    raise SystemExit(
+      "CUDA is required when --forward or --backward is requested."
+    )
 
   tune_mode = args.tune
   grad_kv_dtype = _parse_grad_kv_dtype(args.grad_kv_storage_dtype)
@@ -1177,7 +1308,8 @@ def _benchmark_rows(
         seed=args.seed,
         apply_norm=args.norm,
         forward_backend=args.forward_backend,
-        triton_autotune=args.forward_backend == "triton" and tune_mode is not None,
+        triton_autotune=args.forward_backend == "triton"
+        and tune_mode is not None,
         triton_autotune_mode=tune_mode or "fast",
         triton_backward_grad_kv_storage_dtype=grad_kv_dtype,
         warmup=args.warmup,
@@ -1215,7 +1347,8 @@ def _benchmark_rows(
         apply_norm=args.norm,
         backward_backend=args.backward_backend,
         timing_mode="backward-only",
-        triton_autotune=args.backward_backend == "triton" and tune_mode is not None,
+        triton_autotune=args.backward_backend == "triton"
+        and tune_mode is not None,
         triton_autotune_mode=tune_mode or "fast",
         triton_backward_grad_kv_storage_dtype=grad_kv_dtype,
         enable_tma=args.enable_bwd_tma,
@@ -1239,7 +1372,9 @@ def main() -> None:
   is_cutedsl = _resolve_cutedsl_backends(args)
   if is_cutedsl:
     if fallback:
-      raise SystemExit("--show-fallback is not compatible with the cutedsl backend.")
+      raise SystemExit(
+        "--show-fallback is not compatible with the cutedsl backend."
+      )
     if args.D != CUTEDSL_HEAD_DIM:
       print(
         f"[cutedsl] Forcing --D from {args.D} to {CUTEDSL_HEAD_DIM} (cutedsl is D=512 only).",
@@ -1259,12 +1394,18 @@ def main() -> None:
     dtypes = tuple(d for d in dtypes if d == torch.bfloat16)
 
   if not fallback and not args.forward and not args.backward:
-    raise SystemExit("At least one direction must remain enabled. Use default settings, --no-fwd, or --no-bwd.")
+    raise SystemExit(
+      "At least one direction must remain enabled. Use default settings, --no-fwd, or --no-bwd."
+    )
 
   if fallback:
-    forward_rows, backward_rows = _build_fallback_rows(args.B, args.H, args.N, args.D, tasks=tasks)
+    forward_rows, backward_rows = _build_fallback_rows(
+      args.B, args.H, args.N, args.D, tasks=tasks
+    )
   else:
-    forward_rows, backward_rows = _benchmark_rows(args, tasks=tasks, dtypes=dtypes)
+    forward_rows, backward_rows = _benchmark_rows(
+      args, tasks=tasks, dtypes=dtypes
+    )
 
   speedup_plot_cases = _active_plot_cases(tasks, kind="speedup")
   tflops_plot_cases = _active_plot_cases(tasks, kind="tflops")
@@ -1325,7 +1466,9 @@ def main() -> None:
   if tflops_png_path is not None:
     print(f"Saved TFLOPS plot to {tflops_png_path}")
   elif fallback:
-    print("Skipped TFLOPS plot in fallback mode because no TFLOPS data is available.")
+    print(
+      "Skipped TFLOPS plot in fallback mode because no TFLOPS data is available."
+    )
   print(f"Saved Markdown to {md_path}")
 
 

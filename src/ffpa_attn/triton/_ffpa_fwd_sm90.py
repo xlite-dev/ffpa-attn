@@ -331,7 +331,9 @@ def _gen_fwd_sm90_autotune_configs(
 _ffpa_fwd_sm90_autotune_cache: dict[tuple[int, str, str, bool], callable] = {}
 
 
-def _get_fwd_sm90_autotune(headdim: int, autotune_mode: str, dtype: str, enable_ws: bool = True):
+def _get_fwd_sm90_autotune(
+  headdim: int, autotune_mode: str, dtype: str, enable_ws: bool = True
+):
   """Return a headdim-specific autotune wrapper for the SM90 TMA kernel.
 
   Results are cached by headdim so the autotune overhead is paid at most
@@ -394,7 +396,9 @@ def _ffpa_attn_forward_sm90_generic_impl(
   has_attn_bias = attn_bias is not None
   has_dropout = dropout_p > 0.0
   attn_bias_in = attn_bias if attn_bias is not None else q
-  bias_strides = _attn_bias_broadcast_strides(attn_bias, batch, nheads_q, seqlen_q, seqlen_k)
+  bias_strides = _attn_bias_broadcast_strides(
+    attn_bias, batch, nheads_q, seqlen_q, seqlen_k
+  )
 
   launch_config = dict(_SM90_FWD_DEFAULT_CONFIG)
   if enable_ws:
@@ -433,7 +437,9 @@ def _ffpa_attn_forward_sm90_generic_impl(
   def _make_tensor_desc(x: torch.Tensor, shape: list[int]) -> TensorDescriptor:
     # The TMA path uses TensorDescriptors for Q/K/V/O with a simple [B*H*N, D] layout
     # shape = [B*H*N, D], strides = [D, 1] so that the kernel can index with (y, x) offsets.
-    return TensorDescriptor(x, shape=shape, strides=[shape[1], 1], block_shape=dummy_block)
+    return TensorDescriptor(
+      x, shape=shape, strides=[shape[1], 1], block_shape=dummy_block
+    )
 
   desc_q = _make_tensor_desc(q, [y_dim_q, headdim])
   desc_k = _make_tensor_desc(k, [y_dim_kv, headdim])
@@ -444,10 +450,18 @@ def _ffpa_attn_forward_sm90_generic_impl(
   # path leaves block_shape as dummy because the pre_hook on each Config
   # updates them before every trial and final invocation.
   if not autotune:
-    desc_q.block_shape = [launch_config["BLOCK_M"], launch_config["BLOCK_HEADDIM_QK"]]
-    desc_k.block_shape = [launch_config["BLOCK_N"], launch_config["BLOCK_HEADDIM_QK"]]
-    desc_v.block_shape = [launch_config["BLOCK_N"], launch_config["BLOCK_HEADDIM_V"]]
-    desc_o.block_shape = [launch_config["BLOCK_M"], launch_config["BLOCK_HEADDIM_V"]]
+    desc_q.block_shape = [
+      launch_config["BLOCK_M"], launch_config["BLOCK_HEADDIM_QK"]
+    ]
+    desc_k.block_shape = [
+      launch_config["BLOCK_N"], launch_config["BLOCK_HEADDIM_QK"]
+    ]
+    desc_v.block_shape = [
+      launch_config["BLOCK_N"], launch_config["BLOCK_HEADDIM_V"]
+    ]
+    desc_o.block_shape = [
+      launch_config["BLOCK_M"], launch_config["BLOCK_HEADDIM_V"]
+    ]
 
   # TMA allocator (required for descriptor path)
   def _tma_alloc_fn(size: int, align: int, _):

@@ -61,8 +61,12 @@ class FFPAAttnBwdPreprocess:
     self.tile_m = tile_m
     # padding head_dim to a multiple of 32 as k_block_size
     hdim_multiple_of = 32
-    self.head_dim_padded = int(math.ceil(head_dim / hdim_multiple_of) * hdim_multiple_of)
-    self.head_dim_v_padded = int(math.ceil(head_dim_v / hdim_multiple_of) * hdim_multiple_of)
+    self.head_dim_padded = int(
+      math.ceil(head_dim / hdim_multiple_of) * hdim_multiple_of
+    )
+    self.head_dim_v_padded = int(
+      math.ceil(head_dim_v / hdim_multiple_of) * hdim_multiple_of
+    )
     self.check_hdim_v_oob = head_dim_v != self.head_dim_v_padded
     self.num_threads = num_threads
 
@@ -100,30 +104,41 @@ class FFPAAttnBwdPreprocess:
     # We want kBlockKGmem to be a power of 2 so that when we do the summing,
     # it's just between threads in the same warp
     gmem_k_block_size = (
-      128 if self.head_dim_v_padded % 128 == 0 else
-      (64 if self.head_dim_v_padded % 64 == 0 else (32 if self.head_dim_v_padded % 32 == 0 else 16))
+      128 if self.head_dim_v_padded % 128 == 0 else (
+        64 if self.head_dim_v_padded % 64 == 0 else
+        (32 if self.head_dim_v_padded % 32 == 0 else 16)
+      )
     )
     num_copy_elems = 128 // self.dtype.width
     threads_per_row = gmem_k_block_size // num_copy_elems  # note: per-row cal by bytes , not elements
-    self.gmem_tiled_copy_O = copy_utils.tiled_copy_2d(self.dtype, threads_per_row, self.num_threads, num_copy_elems)
+    self.gmem_tiled_copy_O = copy_utils.tiled_copy_2d(
+      self.dtype, threads_per_row, self.num_threads, num_copy_elems
+    )
     universal_copy_bits = 128
     num_copy_elems_dQaccum = universal_copy_bits // Float32.width
-    assert (self.tile_m * self.head_dim_padded // num_copy_elems_dQaccum) % self.num_threads == 0
-    self.gmem_tiled_copy_dQaccum = copy_utils.tiled_copy_1d(Float32, self.num_threads, num_copy_elems_dQaccum)
+    assert (
+      self.tile_m * self.head_dim_padded // num_copy_elems_dQaccum
+    ) % self.num_threads == 0
+    self.gmem_tiled_copy_dQaccum = copy_utils.tiled_copy_1d(
+      Float32, self.num_threads, num_copy_elems_dQaccum
+    )
 
   @cute.jit
   def __call__(
     self,
-    mO: cute.Tensor,  # (batch, seqlen, nheads, head_dim_v) or (total_q, nheads, head_dim_v)
+    mO: cute.
+    Tensor,  # (batch, seqlen, nheads, head_dim_v) or (total_q, nheads, head_dim_v)
     mdO: cute.Tensor,  # same shape as mO
-    mPdPsum: cute.Tensor,  # (batch, nheads, seqlen_padded) or (nheads, total_q_padded)
+    mPdPsum: cute.
+    Tensor,  # (batch, nheads, seqlen_padded) or (nheads, total_q_padded)
     mLSE: Optional[cute.Tensor],  # (batch, nheads, seqlen) or (nheads, total_q)
     mLSElog2: Optional[cute.Tensor],  # same shape as mPdPsum
     # (batch, nheads, seqlen_padded * head_dim_v) or (nheads, total_q_padded * head_dim_v)
     mdQaccum: Optional[cute.Tensor],
     mCuSeqlensQ: Optional[cute.Tensor],  # (batch + 1,)
     mSeqUsedQ: Optional[cute.Tensor],  # (batch,)
-    mdLSE: Optional[cute.Tensor],  # (batch, nheads, seqlen) or (nheads, total_q)
+    mdLSE: Optional[cute.Tensor
+                    ],  # (batch, nheads, seqlen) or (nheads, total_q)
     # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
     stream: cuda.CUstream = None,
   ):
@@ -151,7 +166,9 @@ class FFPAAttnBwdPreprocess:
 
     # (batch, nheads, seqlen) -> (seqlen, nheads, batch) or (total_q, nheads) -> (nheads, total_q)
     transpose = [2, 1, 0] if const_expr(mCuSeqlensQ is None) else [1, 0]
-    mPdPsum = layout_utils.select(mPdPsum, transpose)  # dsl way to take transpose layout
+    mPdPsum = layout_utils.select(
+      mPdPsum, transpose
+    )  # dsl way to take transpose layout
     if const_expr(mLSE is not None):
       mLSE = layout_utils.select(mLSE, transpose)
       mLSElog2 = layout_utils.select(mLSElog2, transpose)
@@ -235,10 +252,15 @@ class FFPAAttnBwdPreprocess:
       # ///////////////////////////////////////////////////////////////////////////////
       # Get the appropriate tiles for this thread block.
       # ///////////////////////////////////////////////////////////////////////////////
-      seqlen = SeqlenInfo.create(batch_idx, mO.shape[1], mCuSeqlensQ, tile=self.tile_m)
-      mO_cur = seqlen.offset_batch(mO, batch_idx, dim=0)[None, head_idx, None]  # reduce alng head dim
+      seqlen = SeqlenInfo.create(
+        batch_idx, mO.shape[1], mCuSeqlensQ, tile=self.tile_m
+      )
+      mO_cur = seqlen.offset_batch(mO, batch_idx,
+                                   dim=0)[None, head_idx,
+                                          None]  # reduce alng head dim
       mdO_cur = seqlen.offset_batch(mdO, batch_idx, dim=0)[None, head_idx, None]
-      mPdPsum_cur = seqlen.offset_batch(mPdPsum, batch_idx, dim=2, padded=True)[None, head_idx]
+      mPdPsum_cur = seqlen.offset_batch(mPdPsum, batch_idx, dim=2,
+                                        padded=True)[None, head_idx]
       headdim_v = mO_cur.shape[cute.rank(mO_cur) - 1]
       seqlen_q = seqlen.seqlen
       seqlen_q_rounded = cute.round_up(seqlen_q, self.tile_m)
@@ -285,11 +307,14 @@ class FFPAAttnBwdPreprocess:
       if const_expr(self.use_pdl):
         cute.arch.griddepcontrol_launch_dependents()  # pdl launch way
       # Sum across the "k" dimension
-      pdpsum = (tOrO.load().to(Float32) *
-                tOrdO.load().to(Float32)).reduce(cute.ReductionOp.ADD, init_val=0.0, reduction_profile=(0, None, 1))
+      pdpsum = (tOrO.load().to(Float32) * tOrdO.load().to(Float32)).reduce(
+        cute.ReductionOp.ADD, init_val=0.0, reduction_profile=(0, None, 1)
+      )
       threads_per_row = gmem_tiled_copy_O.layout_src_tv_tiled[0].shape[0]
       assert cute.arch.WARP_SIZE % threads_per_row == 0
-      pdpsum = utils.warp_reduce(pdpsum, operator.add, width=threads_per_row)  # reduce
+      pdpsum = utils.warp_reduce(
+        pdpsum, operator.add, width=threads_per_row
+      )  # reduce
       PdP_sum = cute.make_rmem_tensor(cute.size(tOrO, mode=[1]), Float32)
       PdP_sum.store(pdpsum)
 
@@ -314,8 +339,13 @@ class FFPAAttnBwdPreprocess:
 
       # Clear dQaccum
       if const_expr(mdQaccum is not None):
-        mdQaccum_cur = seqlen.offset_batch(mdQaccum, batch_idx, dim=2, padded=True,
-                                           multiple=self.head_dim_padded)[None, head_idx]
+        mdQaccum_cur = seqlen.offset_batch(
+          mdQaccum,
+          batch_idx,
+          dim=2,
+          padded=True,
+          multiple=self.head_dim_padded
+        )[None, head_idx]
         blkdQaccum_shape = (self.tile_m * self.head_dim_padded, )
         gdQaccum = cute.local_tile(mdQaccum_cur, blkdQaccum_shape, (m_block, ))
         gmem_thr_copy_dQaccum = gmem_tiled_copy_dQaccum.get_slice(tidx)
@@ -325,7 +355,9 @@ class FFPAAttnBwdPreprocess:
         cute.copy(gmem_tiled_copy_dQaccum, zero, tdQgdQaccum)
 
       if const_expr(mLSE is not None):
-        mLSElog2_cur = seqlen.offset_batch(mLSElog2, batch_idx, dim=2, padded=True)[None, head_idx]
+        mLSElog2_cur = seqlen.offset_batch(
+          mLSElog2, batch_idx, dim=2, padded=True
+        )[None, head_idx]
         gLSElog2 = cute.local_tile(mLSElog2_cur, (self.tile_m, ), (m_block, ))
         LOG2_E = math.log2(math.e)
         if tidx < seqlen_q_rounded - m_block * self.tile_m:

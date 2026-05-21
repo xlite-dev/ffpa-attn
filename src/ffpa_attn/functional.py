@@ -49,7 +49,9 @@ def _is_hopper_or_later() -> bool:
   return (major, minor) >= (9, 0)
 
 
-def _normalize_grad_kv_storage_dtype(dtype: torch.dtype | str | None) -> torch.dtype | None:
+def _normalize_grad_kv_storage_dtype(
+  dtype: torch.dtype | str | None
+) -> torch.dtype | None:
   if dtype is None:
     return None
   if dtype == "fp16":
@@ -121,7 +123,9 @@ class CUDABackend(Backend):
   def __post_init__(self) -> None:
     super().__post_init__()
     assert not self.backward, "cuda backend does not support backward"
-    assert self.acc in ("f16", "f32"), f"acc must be 'f16' or 'f32', got {self.acc!r}"
+    assert self.acc in (
+      "f16", "f32"
+    ), f"acc must be 'f16' or 'f32', got {self.acc!r}"
 
   @property
   def acc_code(self) -> int:
@@ -158,7 +162,9 @@ class TritonBackend(Backend):
     super().__post_init__()
     assert self.autotune_mode in ("fast", "max"), \
       f"Unsupported autotune_mode={self.autotune_mode!r}; choose 'fast' or 'max'."
-    self.grad_kv_storage_dtype = _normalize_grad_kv_storage_dtype(self.grad_kv_storage_dtype)
+    self.grad_kv_storage_dtype = _normalize_grad_kv_storage_dtype(
+      self.grad_kv_storage_dtype
+    )
     if self.persist_dkdv:
       assert self.backward, "persist_dkdv is only valid for Triton backward"
       assert self.enable_tma, "persist_dkdv requires enable_tma=True"
@@ -188,8 +194,12 @@ def _resolve_backend_pair(
   forward_backend: Backend | None,
   backward_backend: Backend | None,
 ) -> tuple[Backend, Backend]:
-  forward_backend = TritonBackend(forward=True) if forward_backend is None else forward_backend
-  backward_backend = TritonBackend(backward=True) if backward_backend is None else backward_backend
+  forward_backend = TritonBackend(
+    forward=True
+  ) if forward_backend is None else forward_backend
+  backward_backend = TritonBackend(
+    backward=True
+  ) if backward_backend is None else backward_backend
 
   if not isinstance(forward_backend, Backend):
     raise TypeError("forward_backend must be a Backend object")
@@ -245,16 +255,20 @@ def _validate_attn_mask_shape(
     ``[B, Nh_q, Nq, Nkv]`` under SDPA fused-kernel conventions.
   """
   if attn_mask.dim() not in (2, 3, 4):
-    raise ValueError("ffpa_attn_func: attn_mask must be 2-D, 3-D, or 4-D and broadcastable "
-                     "to [B, Nh_q, Nq, Nkv]")
+    raise ValueError(
+      "ffpa_attn_func: attn_mask must be 2-D, 3-D, or 4-D and broadcastable "
+      "to [B, Nh_q, Nq, Nkv]"
+    )
   if attn_mask.size(-2) not in (1, seqlen_q):
     raise ValueError(
       f"ffpa_attn_func: attn_mask query dimension must be 1 or {seqlen_q}, "
       f"got {attn_mask.size(-2)}"
     )
   if attn_mask.size(-1) not in (1, seqlen_k):
-    raise ValueError(f"ffpa_attn_func: attn_mask key dimension must be 1 or {seqlen_k}, "
-                     f"got {attn_mask.size(-1)}")
+    raise ValueError(
+      f"ffpa_attn_func: attn_mask key dimension must be 1 or {seqlen_k}, "
+      f"got {attn_mask.size(-1)}"
+    )
   if attn_mask.dim() == 3 and attn_mask.size(0) not in (1, batch):
     raise ValueError(
       f"ffpa_attn_func: 3-D attn_mask batch dimension must be 1 or {batch}, "
@@ -278,11 +292,17 @@ class FFPAAttnMeta:
   """Non-tensor FFPA options passed through the autograd Function."""
 
   attn_meta: AttentionMeta = field(default_factory=AttentionMeta)
-  forward_meta: Backend = field(default_factory=lambda: TritonBackend(forward=True))
-  backward_meta: Backend = field(default_factory=lambda: TritonBackend(backward=True))
+  forward_meta: Backend = field(
+    default_factory=lambda: TritonBackend(forward=True)
+  )
+  backward_meta: Backend = field(
+    default_factory=lambda: TritonBackend(backward=True)
+  )
 
   def __post_init__(self) -> None:
-    self.forward_meta, self.backward_meta = _resolve_backend_pair(self.forward_meta, self.backward_meta)
+    self.forward_meta, self.backward_meta = _resolve_backend_pair(
+      self.forward_meta, self.backward_meta
+    )
 
   @classmethod
   def from_kwargs(cls, **kwargs) -> FFPAAttnMeta:
@@ -302,21 +322,34 @@ class FFPAAttnMeta:
 
     if kwargs:
       unexpected = ", ".join(sorted(kwargs))
-      raise TypeError(f"ffpa_attn_func() got unexpected keyword argument(s): {unexpected}")
+      raise TypeError(
+        f"ffpa_attn_func() got unexpected keyword argument(s): {unexpected}"
+      )
 
     if forward_backend is None and backward_backend is None and backend is not None:
       if isinstance(backend, str):
-        _BACKEND_MAP = {"cuda": CUDABackend, "triton": TritonBackend, "cutedsl": CuTeDSLBackend, "sdpa": SDPABackend}
+        _BACKEND_MAP = {
+          "cuda": CUDABackend,
+          "triton": TritonBackend,
+          "cutedsl": CuTeDSLBackend,
+          "sdpa": SDPABackend
+        }
         cls_name = _BACKEND_MAP.get(backend)
         if cls_name is None:
-          raise ValueError(f"ffpa_attn_func: backend must be 'cuda', 'triton', or 'cutedsl', got {backend!r}")
+          raise ValueError(
+            f"ffpa_attn_func: backend must be 'cuda', 'triton', or 'cutedsl', got {backend!r}"
+          )
         backend = cls_name()
       if not isinstance(backend, Backend):
-        raise TypeError(f"ffpa_attn_func: backend must be a str or Backend instance, got {type(backend).__name__}")
+        raise TypeError(
+          f"ffpa_attn_func: backend must be a str or Backend instance, got {type(backend).__name__}"
+        )
       forward_backend = backend
       backward_backend = backend
 
-    forward_backend, backward_backend = _resolve_backend_pair(forward_backend, backward_backend)
+    forward_backend, backward_backend = _resolve_backend_pair(
+      forward_backend, backward_backend
+    )
     return cls(
       forward_meta=forward_backend,
       backward_meta=backward_backend,
@@ -328,7 +361,9 @@ class FFPAAttnMeta:
     forward_backend: Backend | None = None,
     backward_backend: Backend | None = None,
   ) -> FFPAAttnMeta:
-    forward_backend, backward_backend = _resolve_backend_pair(forward_backend, backward_backend)
+    forward_backend, backward_backend = _resolve_backend_pair(
+      forward_backend, backward_backend
+    )
     return cls(
       forward_meta=forward_backend,
       backward_meta=backward_backend,
@@ -371,7 +406,9 @@ class FFPAAttnMeta:
 
     if self.forward_meta.name == "cutedsl":
       from .cutedsl import cutedsl_forward_available
-      cutedsl_hw_unsupported = D != 512 or not cutedsl_forward_available(query.device)
+      cutedsl_hw_unsupported = D != 512 or not cutedsl_forward_available(
+        query.device
+      )
       return cutedsl_hw_unsupported
 
     return any([
@@ -406,20 +443,32 @@ class FFPAAttnMeta:
     invalid or unsupported combinations.
     """
     if not 0.0 <= dropout_p <= 1.0:
-      raise ValueError(f"ffpa_attn_func: dropout_p must be in [0, 1], got {dropout_p}")
+      raise ValueError(
+        f"ffpa_attn_func: dropout_p must be in [0, 1], got {dropout_p}"
+      )
     if dropout_p >= 1.0:
-      raise ValueError("ffpa_attn_func: dropout_p=1.0 is not supported by SDPA fused kernels")
-    if dropout_p > 0.0 and query.size(-1) > 256 and isinstance(self.forward_meta, CuTeDSLBackend):
-      raise NotImplementedError("ffpa_attn_func: large-D dropout is not supported by forward_backend='cutedsl'")
+      raise ValueError(
+        "ffpa_attn_func: dropout_p=1.0 is not supported by SDPA fused kernels"
+      )
+    if dropout_p > 0.0 and query.size(-1) > 256 and isinstance(
+      self.forward_meta, CuTeDSLBackend
+    ):
+      raise NotImplementedError(
+        "ffpa_attn_func: large-D dropout is not supported by forward_backend='cutedsl'"
+      )
     if attn_mask is not None and isinstance(self.forward_meta, CuTeDSLBackend):
       raise NotImplementedError(
         "ffpa_attn_func: attn_mask is not supported by forward_backend='cutedsl'. "
         "Use forward_backend='triton' when attn_mask is required."
       )
     if attn_mask is not None and is_causal:
-      raise RuntimeError("ffpa_attn_func: explicit attn_mask should not be set when is_causal=True")
+      raise RuntimeError(
+        "ffpa_attn_func: explicit attn_mask should not be set when is_causal=True"
+      )
     if attn_mask is not None and attn_mask.dtype == torch.bool and attn_mask.requires_grad:
-      raise TypeError("ffpa_attn_func: boolean attn_mask cannot require gradients")
+      raise TypeError(
+        "ffpa_attn_func: boolean attn_mask cannot require gradients"
+      )
 
     # Fill in user-facing fields.
     self.attn_meta.is_causal = is_causal
@@ -430,9 +479,13 @@ class FFPAAttnMeta:
     if isinstance(
       self.forward_meta, CUDABackend
     ) and query.dtype == torch.bfloat16 and self.forward_meta.acc_code == _ACC_F16:
-      raise ValueError("bf16 activations require acc='f32'; no bf16-acc mma PTX exists.")
+      raise ValueError(
+        "bf16 activations require acc='f32'; no bf16-acc mma PTX exists."
+      )
     if query.dtype not in (torch.float16, torch.bfloat16):
-      raise TypeError(f"ffpa_attn_func only supports fp16/bf16, got {query.dtype}")
+      raise TypeError(
+        f"ffpa_attn_func only supports fp16/bf16, got {query.dtype}"
+      )
 
     # Validate tensor shapes.
     if query.dim() != 4 or key.dim() != 4 or value.dim() != 4:
@@ -450,7 +503,9 @@ class FFPAAttnMeta:
         f"got Nh_q={query.size(1)}, Nh_kv={key.size(1)}"
       )
     if key.size(2) != value.size(2):
-      raise ValueError(f"key and value must share the same seqlen, got Nk={key.size(2)}, Nv={value.size(2)}")
+      raise ValueError(
+        f"key and value must share the same seqlen, got Nk={key.size(2)}, Nv={value.size(2)}"
+      )
     if query.size(3) != key.size(3) or query.size(3) != value.size(3):
       raise ValueError("query/key/value must share the same head dim")
 
@@ -515,15 +570,22 @@ class FFPAAttnMeta:
     _validate_attn_mask_shape(attn_mask, batch, nheads_q, seqlen_q, seqlen_k)
 
     if attn_mask.dtype == torch.bool:
-      neg_inf = torch.tensor(float("-inf"), dtype=query.dtype, device=query.device)
-      attn_bias = torch.where(attn_mask, torch.zeros((), dtype=query.dtype, device=query.device), neg_inf)
+      neg_inf = torch.tensor(
+        float("-inf"), dtype=query.dtype, device=query.device
+      )
+      attn_bias = torch.where(
+        attn_mask, torch.zeros((), dtype=query.dtype, device=query.device),
+        neg_inf
+      )
     else:
       attn_bias = attn_mask
 
     if attn_bias.dim() == 2:
       attn_bias = attn_bias.view(1, 1, attn_bias.size(0), attn_bias.size(1))
     elif attn_bias.dim() == 3:
-      attn_bias = attn_bias.view(attn_bias.size(0), 1, attn_bias.size(1), attn_bias.size(2))
+      attn_bias = attn_bias.view(
+        attn_bias.size(0), 1, attn_bias.size(1), attn_bias.size(2)
+      )
 
     if attn_bias.stride(-1) != 1:
       attn_bias = attn_bias.contiguous()
@@ -539,7 +601,8 @@ class FFPAAttnMeta:
     is_causal: bool,
     scale: float | None,
     enable_gqa: bool,
-  ) -> tuple[FFPAAttnMeta, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
+  ) -> tuple[FFPAAttnMeta, torch.Tensor, torch.Tensor, torch.Tensor,
+             torch.Tensor | None]:
     """Validate public inputs and return metadata plus autograd inputs.
 
     :param query: Query tensor passed to the public API.
@@ -554,7 +617,9 @@ class FFPAAttnMeta:
       dispatch state; the remaining values are passed directly to
       :class:`FFPAAttnFunc` so autograd sees all differentiable inputs.
     """
-    self.normalize_inputs(query, key, value, attn_mask, dropout_p, is_causal, scale, enable_gqa)
+    self.normalize_inputs(
+      query, key, value, attn_mask, dropout_p, is_causal, scale, enable_gqa
+    )
     attn_bias = self.normalize_attn_mask(query, key, attn_mask)
     return self, query, key, value, attn_bias
 
@@ -586,7 +651,9 @@ class _FFPAAttnFunc(torch.autograd.Function):
     attn_bias: torch.Tensor | None,
     meta: FFPAAttnMeta,
   ) -> torch.Tensor:
-    is_grad = meta.attn_meta.is_grad_enabled and any(x.requires_grad for x in (q, k, v, attn_bias) if x is not None)
+    is_grad = meta.attn_meta.is_grad_enabled and any(
+      x.requires_grad for x in (q, k, v, attn_bias) if x is not None
+    )
     head_dim = q.size(-1)
     O = torch.empty_like(q)  # noqa: E741
 
@@ -653,15 +720,14 @@ class _FFPAAttnFunc(torch.autograd.Function):
       # CuTeDSL does not implement dropout.
       rng_state = torch.empty(0, dtype=torch.uint8, device=q.device)
     else:
-      raise ValueError(f"Unsupported forward_backend={meta.forward_meta.name!r};")
+      raise ValueError(
+        f"Unsupported forward_backend={meta.forward_meta.name!r};"
+      )
 
-    # NO unused output from the FFPA CUDA forward / backward kernels, but we
-    # need to return something to keep the autograd contract
-    # consistent across backends. Return empty tensors on large-D paths since the
-    # small-D path's backward expects tensors to be returned and saved.
-    if head_dim > 256 and not isinstance(meta.forward_meta, TritonBackend):
-      unused = torch.empty(0, dtype=torch.uint8, device=q.device)
-    elif head_dim > 256:
+    # No unused output from the FFPA large-D forward kernels, but the
+    # autograd contract requires a consistent number of saved tensors across
+    # all backends. The small-D aten path already fills unused above.
+    if head_dim > 256:
       unused = torch.empty(0, dtype=torch.uint8, device=q.device)
 
     if is_grad:

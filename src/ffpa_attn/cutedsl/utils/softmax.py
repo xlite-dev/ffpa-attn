@@ -39,10 +39,18 @@ class Softmax(ParamsBase):
     self.row_max.fill(-Float32.inf)
     self.row_sum.fill(0.0)
 
-  def _compute_row_max(self, acc_S_row: cute.TensorSSA, init_val: float | Float32 | None = None) -> Float32:
+  def _compute_row_max(
+    self,
+    acc_S_row: cute.TensorSSA,
+    init_val: float | Float32 | None = None
+  ) -> Float32:
     return fmax_reduce(acc_S_row, init_val, arch=self.arch)
 
-  def _compute_row_sum(self, acc_S_row_exp: cute.TensorSSA, init_val: float | Float32 | None = None) -> Float32:
+  def _compute_row_sum(
+    self,
+    acc_S_row_exp: cute.TensorSSA,
+    init_val: float | Float32 | None = None
+  ) -> Float32:
     return fadd_reduce(acc_S_row_exp, init_val, arch=self.arch)
 
   @cute.jit
@@ -78,7 +86,9 @@ class Softmax(ParamsBase):
         arch=arch,
       )
 
-      row_max_cur = cute.arch.warp_reduction_max(row_max_cur, threads_in_group=4)
+      row_max_cur = cute.arch.warp_reduction_max(
+        row_max_cur, threads_in_group=4
+      )
       # Update row_max before changing row_max_cur to safe value for -inf
       row_max_prev = row_max[r]
       row_max[r] = row_max_cur
@@ -88,15 +98,22 @@ class Softmax(ParamsBase):
 
       if cutlass.const_expr(is_first):
         row_max_cur_scaled = row_max_cur * scale_log2
-        acc_S_row_exp = cute.math.exp2(acc_S_row * scale_log2 - row_max_cur_scaled, fastmath=True)
+        acc_S_row_exp = cute.math.exp2(
+          acc_S_row * scale_log2 - row_max_cur_scaled, fastmath=True
+        )
         acc_S_row_sum = fadd_reduce(acc_S_row_exp, init_val=None, arch=arch)
         row_scale[r] = 1.0
       else:
         row_max_cur_scaled = row_max_cur * scale_log2
-        acc_S_row_exp = cute.math.exp2(acc_S_row * scale_log2 - row_max_cur_scaled, fastmath=True)
+        acc_S_row_exp = cute.math.exp2(
+          acc_S_row * scale_log2 - row_max_cur_scaled, fastmath=True
+        )
         # row_scale[r] = cute.math.exp2(row_max_prev * self.scale_log2 - row_max_cur_scaled)
-        row_scale[r] = cute.math.exp2((row_max_prev - row_max_cur) * scale_log2, fastmath=True)
-        acc_S_row_sum = fadd_reduce(acc_S_row_exp, init_val=row_sum[r] * row_scale[r], arch=arch)
+        row_scale[r] = cute.math.exp2((row_max_prev - row_max_cur) * scale_log2,
+                                      fastmath=True)
+        acc_S_row_sum = fadd_reduce(
+          acc_S_row_exp, init_val=row_sum[r] * row_scale[r], arch=arch
+        )
 
       row_sum[r] = acc_S_row_sum
       acc_S_mn[r, None].store(acc_S_row_exp)
@@ -104,9 +121,15 @@ class Softmax(ParamsBase):
     return row_scale
 
   @cute.jit
-  def finalize(self, final_scale: Float32 = 1.0, sink_val: Float32 | cute.Tensor | None = None) -> cute.Tensor:
+  def finalize(
+    self,
+    final_scale: Float32 = 1.0,
+    sink_val: Float32 | cute.Tensor | None = None
+  ) -> cute.Tensor:
     """Finalize the online softmax by computing the scale and logsumexp."""
-    if cutlass.const_expr(sink_val is not None and isinstance(sink_val, cute.Tensor)):
+    if cutlass.const_expr(
+      sink_val is not None and isinstance(sink_val, cute.Tensor)
+    ):
       assert cute.size(sink_val) == cute.size(self.row_sum)
     row_sum = self.row_sum
     row_max = self.row_max
@@ -118,17 +141,25 @@ class Softmax(ParamsBase):
 
     for r in cutlass.range(cute.size(row_sum), unroll_full=True):
       if cutlass.const_expr(sink_val is not None):
-        sink_val_cur = sink_val if not isinstance(sink_val, cute.Tensor) else sink_val[r]
+        sink_val_cur = sink_val if not isinstance(sink_val,
+                                                  cute.Tensor) else sink_val[r]
         LOG2_E = math.log2(math.e)
-        row_sum[r] += cute.math.exp2(sink_val_cur * LOG2_E - row_max[r] * scale_log2, fastmath=True)
+        row_sum[r] += cute.math.exp2(
+          sink_val_cur * LOG2_E - row_max[r] * scale_log2, fastmath=True
+        )
 
       # if row_sum is zero or nan, set acc_O_mn_row to 1.0
       acc_O_mn_row_is_zero_or_nan = row_sum[r] == 0.0 or row_sum[r] != row_sum[r]
-      row_scale[r] = (cute.arch.rcp_approx(row_sum[r] if not acc_O_mn_row_is_zero_or_nan else 1.0)) * final_scale
+      row_scale[r] = (
+        cute.arch.
+        rcp_approx(row_sum[r] if not acc_O_mn_row_is_zero_or_nan else 1.0)
+      ) * final_scale
       row_sum_cur = row_sum[r]
       LN2 = math.log(2.0)
-      row_sum[r] = ((row_max[r] * scale_log2 + cute.math.log2(row_sum_cur, fastmath=True)) *
-                    LN2 if not acc_O_mn_row_is_zero_or_nan else -Float32.inf)
+      row_sum[r] = (
+        (row_max[r] * scale_log2 + cute.math.log2(row_sum_cur, fastmath=True)) *
+        LN2 if not acc_O_mn_row_is_zero_or_nan else -Float32.inf
+      )
     return row_scale
 
   @cute.jit
@@ -282,7 +313,8 @@ def apply_score_mod_inner(
   kv_idx_vec = cute.make_rmem_tensor(vec_size, cutlass.Int32)
 
   # SSA values for batch (constant across all elements)
-  batch_idx_ssa = scalar_to_ssa(batch_idx, cutlass.Int32).broadcast_to((vec_size, ))
+  batch_idx_ssa = scalar_to_ssa(batch_idx,
+                                cutlass.Int32).broadcast_to((vec_size, ))
 
   # Handle q_idx based on whether it's constant
   q_idx_vec = cute.make_rmem_tensor(vec_size, cutlass.Int32)
@@ -305,21 +337,29 @@ def apply_score_mod_inner(
         head_idx_vec[j] = head_idx * qhead_per_kvhead + head_offset
 
       # If we will do loads we mod, in order to not read OOB
-      if cutlass.const_expr(aux_tensors is not None and fastdiv_mods is not None):
+      if cutlass.const_expr(
+        aux_tensors is not None and fastdiv_mods is not None
+      ):
         if cutlass.const_expr(constant_q_idx is None):
           seqlen_q_divmod, seqlen_k_divmod = fastdiv_mods
-          q_idx_floored = floor_if_packed(index_tensor[i + j][q_idx_pos], qhead_per_kvhead)
+          q_idx_floored = floor_if_packed(
+            index_tensor[i + j][q_idx_pos], qhead_per_kvhead
+          )
           _, q_idx_wrapped = divmod(q_idx_floored, seqlen_q_divmod)
           q_idx_vec[j] = q_idx_wrapped
         else:
           _, seqlen_k_divmod = fastdiv_mods
 
-        _, kv_idx_wrapped = divmod(index_tensor[i + j][kv_idx_pos], seqlen_k_divmod)
+        _, kv_idx_wrapped = divmod(
+          index_tensor[i + j][kv_idx_pos], seqlen_k_divmod
+        )
         kv_idx_vec[j] = kv_idx_wrapped
       else:
         # No bounds checking - direct indexing
         if constant_q_idx is None:
-          q_idx_vec[j] = floor_if_packed(index_tensor[i + j][q_idx_pos], qhead_per_kvhead)
+          q_idx_vec[j] = floor_if_packed(
+            index_tensor[i + j][q_idx_pos], qhead_per_kvhead
+          )
         kv_idx_vec[j] = index_tensor[i + j][kv_idx_pos]
 
     # Convert to SSA for score_mod call
@@ -330,13 +370,15 @@ def apply_score_mod_inner(
     else:
       # NB we do not apply Pack-GQA division here, as constant_q_idx is assumed to already be logical
       q_idx_const = constant_q_idx
-      q_idx_ssa = scalar_to_ssa(q_idx_const, cutlass.Int32).broadcast_to((vec_size, ))
+      q_idx_ssa = scalar_to_ssa(q_idx_const,
+                                cutlass.Int32).broadcast_to((vec_size, ))
 
     # Compute head_idx_ssa: per-element for Pack-GQA with non-constant q_idx, constant otherwise
     if cutlass.const_expr(qhead_per_kvhead > 1 and constant_q_idx is None):
       head_idx_ssa = head_idx_vec.load()
     else:
-      head_idx_ssa = scalar_to_ssa(head_idx, cutlass.Int32).broadcast_to((vec_size, ))
+      head_idx_ssa = scalar_to_ssa(head_idx,
+                                   cutlass.Int32).broadcast_to((vec_size, ))
 
     aux_args = []
     if cutlass.const_expr(aux_tensors is not None):
@@ -409,7 +451,8 @@ def apply_score_mod_bwd_inner(
   grad_vec = cute.make_fragment(vec_size, qk_acc_dtype)
   score_vec = cute.make_fragment(vec_size, qk_acc_dtype)
   kv_idx_vec = cute.make_fragment(vec_size, cutlass.Int32)
-  batch_idx_ssa = scalar_to_ssa(batch_idx, cutlass.Int32).broadcast_to((vec_size, ))
+  batch_idx_ssa = scalar_to_ssa(batch_idx,
+                                cutlass.Int32).broadcast_to((vec_size, ))
   q_idx_vec = cute.make_fragment(vec_size, cutlass.Int32)
 
   # For Pack-GQA with non-constant q_idx, we need per-element head indices
@@ -428,21 +471,29 @@ def apply_score_mod_bwd_inner(
         head_offset = q_idx_packed - q_idx_logical * qhead_per_kvhead
         head_idx_vec[j] = head_idx * qhead_per_kvhead + head_offset
 
-      if cutlass.const_expr(aux_tensors is not None and fastdiv_mods is not None):
+      if cutlass.const_expr(
+        aux_tensors is not None and fastdiv_mods is not None
+      ):
         if cutlass.const_expr(constant_q_idx is None):
           seqlen_q_divmod, seqlen_k_divmod = fastdiv_mods
-          q_idx_floored = floor_if_packed(index_tensor[i + j][q_idx_pos], qhead_per_kvhead)
+          q_idx_floored = floor_if_packed(
+            index_tensor[i + j][q_idx_pos], qhead_per_kvhead
+          )
           _, q_idx_wrapped = divmod(q_idx_floored, seqlen_q_divmod)
           q_idx_vec[j] = q_idx_wrapped
         else:
           _, seqlen_k_divmod = fastdiv_mods
 
-        _, kv_idx_wrapped = divmod(index_tensor[i + j][kv_idx_pos], seqlen_k_divmod)
+        _, kv_idx_wrapped = divmod(
+          index_tensor[i + j][kv_idx_pos], seqlen_k_divmod
+        )
         kv_idx_vec[j] = kv_idx_wrapped
       else:
         # No bounds checking - direct indexing
         if constant_q_idx is None:
-          q_idx_vec[j] = floor_if_packed(index_tensor[i + j][q_idx_pos], qhead_per_kvhead)
+          q_idx_vec[j] = floor_if_packed(
+            index_tensor[i + j][q_idx_pos], qhead_per_kvhead
+          )
         kv_idx_vec[j] = index_tensor[i + j][kv_idx_pos]
 
     grad_ssa = grad_vec.load()
@@ -452,12 +503,14 @@ def apply_score_mod_bwd_inner(
     if cutlass.const_expr(constant_q_idx is None):
       q_idx_ssa = q_idx_vec.load()
     else:
-      q_idx_ssa = scalar_to_ssa(constant_q_idx, cutlass.Int32).broadcast_to((vec_size, ))
+      q_idx_ssa = scalar_to_ssa(constant_q_idx,
+                                cutlass.Int32).broadcast_to((vec_size, ))
 
     if cutlass.const_expr(qhead_per_kvhead > 1 and constant_q_idx is None):
       head_idx_ssa = head_idx_vec.load()
     else:
-      head_idx_ssa = scalar_to_ssa(head_idx, cutlass.Int32).broadcast_to((vec_size, ))
+      head_idx_ssa = scalar_to_ssa(head_idx,
+                                   cutlass.Int32).broadcast_to((vec_size, ))
 
     aux_args = []
     if cutlass.const_expr(aux_tensors is not None):

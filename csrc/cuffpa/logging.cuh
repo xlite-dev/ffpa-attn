@@ -14,7 +14,8 @@
 #include <torch/extension.h>
 
 #define STRINGFY(str) #str
-#define TORCH_BINDING_COMMON_EXTENSION(func) m.def(STRINGFY(func), &func, STRINGFY(func));
+#define TORCH_BINDING_COMMON_EXTENSION(func) \
+  m.def(STRINGFY(func), &func, STRINGFY(func));
 
 #define CHECK_TORCH_TENSOR_DTYPE(T, th_type)                   \
   if (((T).options().dtype() != (th_type))) {                  \

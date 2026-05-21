@@ -104,7 +104,9 @@ def _parse_dtypes(value: str) -> list[torch.dtype]:
   for item in value.split(","):
     key = item.strip().lower()
     if key not in mapping:
-      raise argparse.ArgumentTypeError(f"Unsupported dtype {item!r}; choose from fp16,bf16")
+      raise argparse.ArgumentTypeError(
+        f"Unsupported dtype {item!r}; choose from fp16,bf16"
+      )
     if mapping[key] not in dtypes:
       dtypes.append(mapping[key])
   if not dtypes:
@@ -112,7 +114,9 @@ def _parse_dtypes(value: str) -> list[torch.dtype]:
   return dtypes
 
 
-def _resolve_directional_cli_flags(args: argparse.Namespace) -> argparse.Namespace:
+def _resolve_directional_cli_flags(
+  args: argparse.Namespace
+) -> argparse.Namespace:
   """Resolve legacy global TMA/WS CLI flags into directional flags."""
   if args.enable_tma:
     args.enable_fwd_tma = True
@@ -132,7 +136,9 @@ def _dtype_schema_name(dtype: torch.dtype) -> str:
 
 
 def _available_seqlens() -> list[int]:
-  total_memory = torch.cuda.get_device_properties(torch.cuda.current_device()).total_memory
+  total_memory = torch.cuda.get_device_properties(
+    torch.cuda.current_device()
+  ).total_memory
   if total_memory >= 48 * 1024**3:
     return list(DEFAULT_SEQLENS)
   return [value for value in DEFAULT_SEQLENS if value < 16384]
@@ -198,29 +204,33 @@ def _iter_full_variant_tasks(
       ),
     ])
     if 1 < gqa_heads < heads:
-      tasks.append(TuneTask(
-        direction,
-        dtype,
-        headdim,
-        seqlen,
-        seqlen,
-        False,
-        heads,
-        gqa_heads,
-        case_name="gqa",
-      ))
+      tasks.append(
+        TuneTask(
+          direction,
+          dtype,
+          headdim,
+          seqlen,
+          seqlen,
+          False,
+          heads,
+          gqa_heads,
+          case_name="gqa",
+        )
+      )
     if heads > 1:
-      tasks.append(TuneTask(
-        direction,
-        dtype,
-        headdim,
-        seqlen,
-        seqlen,
-        False,
-        heads,
-        1,
-        case_name="mqa",
-      ))
+      tasks.append(
+        TuneTask(
+          direction,
+          dtype,
+          headdim,
+          seqlen,
+          seqlen,
+          False,
+          heads,
+          1,
+          case_name="mqa",
+        )
+      )
   return tasks
 
 
@@ -240,16 +250,18 @@ def _iter_forward_tasks(
           for seqlen_k in prefill_seqlens:
             if causal and seqlen_k < seqlen_q:
               continue
-            tasks.append(TuneTask(
-              "forward",
-              dtype,
-              headdim,
-              seqlen_q,
-              seqlen_k,
-              causal,
-              heads,
-              heads,
-            ))
+            tasks.append(
+              TuneTask(
+                "forward",
+                dtype,
+                headdim,
+                seqlen_q,
+                seqlen_k,
+                causal,
+                heads,
+                heads,
+              )
+            )
         for seqlen_k in decode_kv_seqlens:
           tasks.append(
             TuneTask(
@@ -265,13 +277,15 @@ def _iter_forward_tasks(
             )
           )
       if full_tasks:
-        tasks.extend(_iter_full_variant_tasks(
-          "forward",
-          dtype,
-          headdim,
-          prefill_seqlens,
-          heads,
-        ))
+        tasks.extend(
+          _iter_full_variant_tasks(
+            "forward",
+            dtype,
+            headdim,
+            prefill_seqlens,
+            heads,
+          )
+        )
   return tasks
 
 
@@ -292,16 +306,18 @@ def _iter_backward_tasks(
           for seqlen_k in prefill_seqlens:
             if causal and seqlen_k < seqlen_q:
               continue
-            tasks.append(TuneTask(
-              "backward",
-              dtype,
-              headdim,
-              seqlen_q,
-              seqlen_k,
-              causal,
-              heads,
-              heads,
-            ))
+            tasks.append(
+              TuneTask(
+                "backward",
+                dtype,
+                headdim,
+                seqlen_q,
+                seqlen_k,
+                causal,
+                heads,
+                heads,
+              )
+            )
         for seqlen_q in decode_query_seqlens:
           for seqlen_k in decode_kv_seqlens:
             tasks.append(
@@ -318,13 +334,15 @@ def _iter_backward_tasks(
               )
             )
       if full_tasks:
-        tasks.extend(_iter_full_variant_tasks(
-          "backward",
-          dtype,
-          headdim,
-          prefill_seqlens,
-          heads,
-        ))
+        tasks.extend(
+          _iter_full_variant_tasks(
+            "backward",
+            dtype,
+            headdim,
+            prefill_seqlens,
+            heads,
+          )
+        )
   return tasks
 
 
@@ -372,15 +390,19 @@ def _make_attn_bias(task: TuneTask) -> torch.Tensor | None:
     return None
   torch.manual_seed(_TUNE_SEED + 1)
   if task.direction == "backward":
-    return (torch.randn(
-      1,
-      1,
-      1,
-      task.seqlen_k,
-      dtype=torch.float32,
-      device="cuda",
-    ) * 0.25).requires_grad_(True)
-  return torch.randn(1, 1, 1, task.seqlen_k, dtype=task.dtype, device="cuda") * 0.25
+    return (
+      torch.randn(
+        1,
+        1,
+        1,
+        task.seqlen_k,
+        dtype=torch.float32,
+        device="cuda",
+      ) * 0.25
+    ).requires_grad_(True)
+  return torch.randn(
+    1, 1, 1, task.seqlen_k, dtype=task.dtype, device="cuda"
+  ) * 0.25
 
 
 def _entry_base(
@@ -606,7 +628,11 @@ def _tune_backward(
   )
   use_sm90_ws = use_sm90_tma and enable_ws
 
-  def run_backward_tune(run_enable_tma: bool, run_enable_ws: bool, run_enable_split_launch: bool = False) -> None:
+  def run_backward_tune(
+    run_enable_tma: bool,
+    run_enable_ws: bool,
+    run_enable_split_launch: bool = False
+  ) -> None:
     if task.has_dropout:
       torch.manual_seed(_TUNE_SEED + 17)
     out = ffpa_attn_func(
@@ -697,7 +723,9 @@ def _tune_backward(
 
   if task.seqlen_q >= 8 and enable_split_launch:
     run_backward_tune(False, False, run_enable_split_launch=True)
-    dkdv_wrapper = _get_bwd_dkdv_autotune(task.headdim, mode, task.has_attn_bias)
+    dkdv_wrapper = _get_bwd_dkdv_autotune(
+      task.headdim, mode, task.has_attn_bias
+    )
     dkdv_entry = _entry_base(
       task,
       mode,
@@ -847,7 +875,9 @@ def _build_payload(
 
 
 def _parse_args() -> argparse.Namespace:
-  parser = argparse.ArgumentParser(description="Generate persistent FFPA Triton tuned configs.")
+  parser = argparse.ArgumentParser(
+    description="Generate persistent FFPA Triton tuned configs."
+  )
   parser.add_argument(
     "--mode",
     choices=("fast", "max"),
@@ -895,29 +925,34 @@ def _parse_args() -> argparse.Namespace:
   parser.add_argument(
     "--enable-fwd-tma",
     action="store_true",
-    help="Also generate persistent configs for the SM90+ TMA forward path when supported.",
+    help=
+    "Also generate persistent configs for the SM90+ TMA forward path when supported.",
   )
   parser.add_argument(
     "--enable-bwd-tma",
     action="store_true",
-    help="Also generate persistent configs for the SM90+ TMA backward path when supported.",
+    help=
+    "Also generate persistent configs for the SM90+ TMA backward path when supported.",
   )
   parser.add_argument(
     "--enable-fwd-ws",
     action="store_true",
-    help="Force warp-specialized SM90+ TMA forward configs when --enable-fwd-tma is set.",
+    help=
+    "Force warp-specialized SM90+ TMA forward configs when --enable-fwd-tma is set.",
   )
   parser.add_argument(
     "--enable-bwd-ws",
     action="store_true",
-    help="Force warp-specialized SM90+ TMA backward configs when --enable-bwd-tma is set.",
+    help=
+    "Force warp-specialized SM90+ TMA backward configs when --enable-bwd-tma is set.",
   )
   parser.add_argument(
     "--enable-bwd-split-launch",
     "--bwd-split-launch",
     "--bwd-split",
     action="store_true",
-    help="Additionally tune SM90+ TMA backward split-launch dK/dV and dQ kernels when --enable-bwd-tma is set.",
+    help=
+    "Additionally tune SM90+ TMA backward split-launch dK/dV and dQ kernels when --enable-bwd-tma is set.",
   )
   parser.add_argument(
     "--overwrite",
@@ -954,23 +989,29 @@ def main() -> int:
   seqlens = _available_seqlens()
   tasks: list[TuneTask] = []
   if args.directions in ("forward", "both"):
-    tasks.extend(_iter_forward_tasks(
-      args.dtypes,
-      seqlens,
-      heads=args.H,
-      full_tasks=args.full_tasks,
-    ))
+    tasks.extend(
+      _iter_forward_tasks(
+        args.dtypes,
+        seqlens,
+        heads=args.H,
+        full_tasks=args.full_tasks,
+      )
+    )
   if args.directions in ("backward", "both"):
-    tasks.extend(_iter_backward_tasks(
-      args.dtypes,
-      seqlens,
-      heads=args.H,
-      full_tasks=args.full_tasks,
-    ))
+    tasks.extend(
+      _iter_backward_tasks(
+        args.dtypes,
+        seqlens,
+        heads=args.H,
+        full_tasks=args.full_tasks,
+      )
+    )
   tasks = _limit_tasks(tasks)
 
   entries: dict[tuple[Any, ...], dict[str, Any]] = {}
-  full_variant_count = sum(task.case_name in {"attn-mask", "dropout", "gqa", "mqa"} for task in tasks)
+  full_variant_count = sum(
+    task.case_name in {"attn-mask", "dropout", "gqa", "mqa"} for task in tasks
+  )
   logger.info(
     "Generating %d FFPA Triton tuned config task(s) for %s "
     "mode=%s directions=%s B=%d H=%d full_tasks=%s full_variants=%d",
@@ -1068,7 +1109,9 @@ def main() -> int:
     args.enable_bwd_split_launch,
   )
   write_config_file(payload, output_path, overwrite=args.overwrite)
-  logger.info("Wrote %d tuned config entries to %s", len(ordered_entries), output_path)
+  logger.info(
+    "Wrote %d tuned config entries to %s", len(ordered_entries), output_path
+  )
   return 0
 
 

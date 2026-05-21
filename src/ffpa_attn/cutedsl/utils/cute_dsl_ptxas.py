@@ -56,8 +56,11 @@ def _compile_ptx(ptx_path: Path, ptx_content: str) -> bytes:
   try:
     assert CUTE_DSL_PTXAS_PATH is not None
     result = subprocess.run(
-      [CUTE_DSL_PTXAS_PATH, f"-arch={arch}", "-O3", "-o",
-       str(cubin_tmp), str(ptx_path)],
+      [
+        CUTE_DSL_PTXAS_PATH, f"-arch={arch}", "-O3", "-o",
+        str(cubin_tmp),
+        str(ptx_path)
+      ],
       capture_output=True,
       text=True,
     )
@@ -97,7 +100,9 @@ def _patched_load_cuda_library(self):
   # Load cubin
   import cuda.bindings.runtime as cuda_runtime
 
-  err, library = cuda_runtime.cudaLibraryLoadData(cubin, None, None, 0, None, None, 0)
+  err, library = cuda_runtime.cudaLibraryLoadData(
+    cubin, None, None, 0, None, None, 0
+  )
   if err != cuda_runtime.cudaError_t.cudaSuccess:
     _log(f"cudaLibraryLoadData failed ({err}), falling back to embedded ptxas")
     return _original_load_cuda_library(self)
@@ -130,10 +135,13 @@ def patch():
   global _original_load_cuda_library
 
   assert CUTE_DSL_PTXAS_PATH is not None
-  if not os.path.isfile(CUTE_DSL_PTXAS_PATH) or not os.access(CUTE_DSL_PTXAS_PATH, os.X_OK):
+  if not os.path.isfile(CUTE_DSL_PTXAS_PATH
+                        ) or not os.access(CUTE_DSL_PTXAS_PATH, os.X_OK):
     raise RuntimeError(f"ptxas not found: {CUTE_DSL_PTXAS_PATH}")
 
-  assert os.environ.get("CUTE_DSL_KEEP_PTX", "0") == "1", "Require CUTE_DSL_KEEP_PTX=1 to use system's ptxas"
+  assert os.environ.get(
+    "CUTE_DSL_KEEP_PTX", "0"
+  ) == "1", "Require CUTE_DSL_KEEP_PTX=1 to use system's ptxas"
 
   cls = cutlass.cutlass_dsl.cuda_jit_executor.CudaDialectJitCompiledFunction
   _original_load_cuda_library = cls._load_cuda_library

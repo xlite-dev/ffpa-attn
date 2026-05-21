@@ -73,14 +73,18 @@ namespace swizzle {
 //   * 128B(B=3) : chunk(3b) ^ {i&1, (i>>1)&1, (i>>2)&1} [{0..7}]
 template <const int kColStride = 16, const int kStep = 8>
 static __device__ __forceinline__ int permuted(int i, int j) {
-  static_assert(kColStride == 16 || kColStride == 32 || kColStride == 64 || kColStride == 8,
-                "kColStride must be one of {8, 16, 32, 64} (matches SWIZZLE_32B/64B/128B + the "
+  static_assert(kColStride == 16 || kColStride == 32 || kColStride == 64 ||
+                    kColStride == 8,
+                "kColStride must be one of {8, 16, 32, 64} (matches "
+                "SWIZZLE_32B/64B/128B + the "
                 "kStep=4 narrow legacy case).");
   static_assert(kStep == 4 || kStep == 8, "kStep must be 8 or 4.");
-  static_assert(kColStride % kStep == 0, "kColStride must be multiple of kStep.");
+  static_assert(kColStride % kStep == 0,
+                "kColStride must be multiple of kStep.");
   if constexpr (kStep == 4) {
-    static_assert(kColStride <= 16,
-                  "kStep=4 only supports the legacy narrow swizzle (kColStride <= 16).");
+    static_assert(
+        kColStride <= 16,
+        "kStep=4 only supports the legacy narrow swizzle (kColStride <= 16).");
     return (((j >> 2) ^ (i >> 2)) % (kColStride >> 2)) << 2;
   } else if constexpr (kColStride == 16) {
     return (((j >> 3) ^ (i >> 2)) & 1) << 3;  // SWIZZLE_32B
@@ -90,7 +94,8 @@ static __device__ __forceinline__ int permuted(int i, int j) {
     return (chunk ^ xor_mask) << 3;  // SWIZZLE_64B
   } else {                           // kColStride == 64
     const int chunk = (j >> 3) & 7;
-    const int xor_mask = (i & 1) | (((i >> 1) & 1) << 1) | (((i >> 2) & 1) << 2);
+    const int xor_mask =
+        (i & 1) | (((i >> 1) & 1) << 1) | (((i >> 2) & 1) << 2);
     return (chunk ^ xor_mask) << 3;  // SWIZZLE_128B
   }
 }

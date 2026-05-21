@@ -87,7 +87,9 @@ def _curand_uniform_from_element_offset(seed: tl.constexpr, element_offset):
   quad_offset = element_offset // 4
   lane = element_offset - quad_offset * 4
   r0, r1, r2, r3 = tl.randint4x(seed, quad_offset)
-  r = tl.where(lane == 0, r0, tl.where(lane == 1, r1, tl.where(lane == 2, r2, r3)))
+  r = tl.where(
+    lane == 0, r0, tl.where(lane == 1, r1, tl.where(lane == 2, r2, r3))
+  )
   r_u32 = r.to(tl.uint32, bitcast=True)
   return (r_u32.to(tl.float32) + 1.0) * 2.3283064365386963e-10
 
@@ -111,14 +113,19 @@ def _apply_dropout_to_p(
   if HAS_DROPOUT:
     # Keep this in SDPA's logical score order.  In split-kv decode, offs_n is
     # passed as the global KV index, so no extra chunk offset should be added.
-    linear = off_hb * seqlen_q * seqlen_k + offs_m[:, None] * seqlen_k + offs_n[None, :]
-    rand = _curand_uniform_from_element_offset(philox_seed, philox_offset + linear)
+    linear = off_hb * seqlen_q * seqlen_k + offs_m[:, None] * seqlen_k + offs_n[
+      None, :]
+    rand = _curand_uniform_from_element_offset(
+      philox_seed, philox_offset + linear
+    )
     keep = rand > dropout_p
     p = p * keep * (1.0 / (1.0 - dropout_p))
   return p
 
 
-def _gen_fwd_autotune_configs(headdim: int = 256, autotune_mode: str = "max") -> list[triton.Config]:
+def _gen_fwd_autotune_configs(headdim: int = 256,
+                              autotune_mode: str = "max"
+                              ) -> list[triton.Config]:
   """Generate autotune configs for the single FFPA Triton forward kernel.
 
   The search space is compact: tune Q-block size, QK/V D-chunk size, warp
@@ -254,7 +261,10 @@ def _get_decode_num_splits(
   device: torch.device,
 ) -> int:
   """Choose a decode split count using FlashAttention's split-kv heuristic."""
-  num_sms = max(1, torch.cuda.get_device_properties(device).multi_processor_count * 2)
+  num_sms = max(
+    1,
+    torch.cuda.get_device_properties(device).multi_processor_count * 2
+  )
   block_n = 256 if headdim <= 64 else (128 if headdim <= 128 else 64)
   num_n_blocks = triton.cdiv(seqlen_k, block_n)
   num_m_blocks = triton.cdiv(seqlen_q, 64)
@@ -268,13 +278,17 @@ def _get_decode_num_splits(
 
 
 _FFPA_FWD_HEURISTICS = {
-  "EVEN_M": lambda args: args["seqlen_q"] % args["BLOCK_M"] == 0,
-  "EVEN_N": lambda args: args["seqlen_k"] % args["BLOCK_N"] == 0,
-  "NUM_V_GROUPS": lambda args: triton.cdiv(args["HEADDIM"], args["BLOCK_HEADDIM_V"]),
+  "EVEN_M":
+  lambda args: args["seqlen_q"] % args["BLOCK_M"] == 0,
+  "EVEN_N":
+  lambda args: args["seqlen_k"] % args["BLOCK_N"] == 0,
+  "NUM_V_GROUPS":
+  lambda args: triton.cdiv(args["HEADDIM"], args["BLOCK_HEADDIM_V"]),
 }
 
 _FFPA_DECODE_FWD_HEURISTICS = {
-  "NUM_V_GROUPS": lambda args: triton.cdiv(args["HEADDIM"], args["BLOCK_HEADDIM_V"]),
+  "NUM_V_GROUPS":
+  lambda args: triton.cdiv(args["HEADDIM"], args["BLOCK_HEADDIM_V"]),
 }
 
 
@@ -610,8 +624,12 @@ def _ffpa_decode_fwd_stage1_kernel(
       if HAS_DROPOUT:
         # offs_kv already includes chunk_start, matching the global Nkv axis in
         # SDPA's [B, H, Nq, Nkv] dropout RNG layout.
-        linear = off_hb * seqlen_q * seqlen_k + (q_block * BLOCK_M) * seqlen_k + offs_kv
-        rand = _curand_uniform_from_element_offset(PHILOX_SEED, philox_offset + linear)
+        linear = off_hb * seqlen_q * seqlen_k + (
+          q_block * BLOCK_M
+        ) * seqlen_k + offs_kv
+        rand = _curand_uniform_from_element_offset(
+          PHILOX_SEED, philox_offset + linear
+        )
         keep = rand > dropout_p
         p = p * keep * (1.0 / (1.0 - dropout_p))
       p = p.to(DTYPE)
@@ -801,10 +819,13 @@ def _ffpa_decode_fwd_stage2_kernel(
 
 
 _ffpa_decode_fwd_stage1 = _ffpa_decode_fwd_stage1_kernel
-_ffpa_decode_fwd_stage1_autotune_cache: dict[tuple[int, bool, str, str], callable] = {}
+_ffpa_decode_fwd_stage1_autotune_cache: dict[tuple[int, bool, str, str],
+                                             callable] = {}
 
 
-def _get_decode_fwd_stage1_autotune(headdim: int, use_gemv: bool, autotune_mode: str, dtype: str):
+def _get_decode_fwd_stage1_autotune(
+  headdim: int, use_gemv: bool, autotune_mode: str, dtype: str
+):
   """Return a shape-class-specific autotune wrapper for decode stage1."""
   cache_key = (headdim, use_gemv, autotune_mode, dtype)
   if cache_key not in _ffpa_decode_fwd_stage1_autotune_cache:
@@ -878,7 +899,9 @@ def _ffpa_attn_forward_generic_impl(
   has_attn_bias = attn_bias is not None
   has_dropout = dropout_p > 0.0
   attn_bias_in = attn_bias if attn_bias is not None else q
-  bias_strides = _attn_bias_broadcast_strides(attn_bias, batch, nheads_q, seqlen_q, seqlen_k)
+  bias_strides = _attn_bias_broadcast_strides(
+    attn_bias, batch, nheads_q, seqlen_q, seqlen_k
+  )
 
   def grid(meta: dict) -> tuple[int, int]:
     return (triton.cdiv(seqlen_q, meta["BLOCK_M"]), batch * nheads_q)
@@ -1049,11 +1072,15 @@ def _ffpa_attn_forward_decode_impl(
   autotune_seqlen_k_bucket = autotune_seqlen_key(seqlen_k, autotune_mode)
   autotune_causal_key = int(causal)
   if num_splits is None:
-    num_splits = _get_decode_num_splits(seqlen_q, seqlen_k, headdim, batch, nheads_q, q.device)
+    num_splits = _get_decode_num_splits(
+      seqlen_q, seqlen_k, headdim, batch, nheads_q, q.device
+    )
   has_attn_bias = attn_bias is not None
   has_dropout = dropout_p > 0.0
   attn_bias_in = attn_bias if attn_bias is not None else q
-  bias_strides = _attn_bias_broadcast_strides(attn_bias, batch, nheads_q, seqlen_q, seqlen_k)
+  bias_strides = _attn_bias_broadcast_strides(
+    attn_bias, batch, nheads_q, seqlen_q, seqlen_k
+  )
 
   n_chunks = num_splits
   chunk_size = triton.cdiv(seqlen_k, n_chunks)
@@ -1210,7 +1237,9 @@ def _ffpa_attn_forward_decode_impl(
       **launch_config,
     )
 
-  stage2_block_headdim_v = triton.next_power_of_2(headdim) if headdim <= 512 else 128
+  stage2_block_headdim_v = triton.next_power_of_2(
+    headdim
+  ) if headdim <= 512 else 128
   block_chunks = triton.next_power_of_2(n_chunks)
 
   def stage2_grid(meta: dict) -> tuple[int, int]:
@@ -1341,9 +1370,13 @@ def _ffpa_attn_forward_impl(
   assert lse.dtype == torch.float32
   assert q.stride(-1) == k.stride(-1) == v.stride(-1) == o.stride(-1) == 1
   if headdim > _MAX_HEADDIM:
-    raise ValueError(f"Triton forward supports headdim <= {_MAX_HEADDIM}, got {headdim}")
+    raise ValueError(
+      f"Triton forward supports headdim <= {_MAX_HEADDIM}, got {headdim}"
+    )
 
-  num_splits = _get_decode_num_splits(seqlen_q, seqlen_k, headdim, batch, nheads_q, q.device)
+  num_splits = _get_decode_num_splits(
+    seqlen_q, seqlen_k, headdim, batch, nheads_q, q.device
+  )
 
   if enable_tma and num_splits == 1:
     from ._ffpa_fwd_sm90 import _ffpa_attn_forward_sm90_impl as _fwd_sm90_impl

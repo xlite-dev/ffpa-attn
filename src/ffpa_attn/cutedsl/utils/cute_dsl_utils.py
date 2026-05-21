@@ -27,7 +27,10 @@ def assume_strides_aligned(t):
     since they're static and don't need alignment assumptions.
     """
   divby = 128 // t.element_type.width
-  strides = tuple(s if isinstance(s, int) else cute.assume(s, divby=divby) for s in t.stride[:-1])
+  strides = tuple(
+    s if isinstance(s, int) else cute.assume(s, divby=divby)
+    for s in t.stride[:-1]
+  )
   return (*strides, t.stride[-1])
 
 
@@ -35,13 +38,21 @@ def assume_tensor_aligned(t):
   """Rebuild a tensor with 128-bit aligned stride assumptions. Passes through None."""
   if t is None:
     return None
-  return cute.make_tensor(t.iterator, cute.make_layout(t.shape, stride=assume_strides_aligned(t)))
+  return cute.make_tensor(
+    t.iterator, cute.make_layout(t.shape, stride=assume_strides_aligned(t))
+  )
 
 
 # ---------------------------------------------------------------------------
 # torch → CuTE tensor conversion  (used at compile time in interface_sm90.py)
 # ---------------------------------------------------------------------------
-def to_cute_tensor(t, assumed_align=16, leading_dim=-1, fully_dynamic=False, enable_tvm_ffi=True):
+def to_cute_tensor(
+  t,
+  assumed_align=16,
+  leading_dim=-1,
+  fully_dynamic=False,
+  enable_tvm_ffi=True
+):
   """Convert torch tensor to cute tensor for TVM FFI. leading_dim=-1 defaults to t.ndim-1."""
   # NOTE: torch 2.9.1 doesn't support fp8 via DLPack but 2.11.0 nightly does
   # currently export raw bytes as uint8 and tell cutlass correct type
@@ -54,7 +65,9 @@ def to_cute_tensor(t, assumed_align=16, leading_dim=-1, fully_dynamic=False, ena
     )
     tensor.element_type = cutlass.Float8E4M3FN if t.dtype == torch.float8_e4m3fn else cutlass.Float8E5M2
   else:
-    tensor = from_dlpack(t.detach(), assumed_align=assumed_align, enable_tvm_ffi=enable_tvm_ffi)
+    tensor = from_dlpack(
+      t.detach(), assumed_align=assumed_align, enable_tvm_ffi=enable_tvm_ffi
+    )
   if fully_dynamic:
     return tensor.mark_layout_dynamic()
   if leading_dim == -1:

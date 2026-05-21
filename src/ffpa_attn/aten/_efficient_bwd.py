@@ -136,7 +136,9 @@ def _aten_efficient_attn_backward(
       dtype=q_in.dtype,
       device=q.device,
     )
-    attn_bias.masked_fill_(~attn_bias_mask.view(1, 1, q.size(2), k.size(2)), float("-inf"))
+    attn_bias.masked_fill_(
+      ~attn_bias_mask.view(1, 1, q.size(2), k.size(2)), float("-inf")
+    )
   elif attn_bias is not None:
     attn_bias = attn_bias.to(dtype=q_in.dtype)
     bias_shape = (q.size(0), q_in.size(1), q.size(2), k.size(2))
@@ -168,7 +170,10 @@ def _aten_efficient_attn_backward(
       philox_seed_t,
       philox_offset_t,
       dropout_p,
-      (True, True, True, bool(return_attn_bias_grad and original_attn_bias is not None)),
+      (
+        True, True, True,
+        bool(return_attn_bias_grad and original_attn_bias is not None)
+      ),
       causal_for_op,
       scale=softmax_scale,
     )
@@ -177,7 +182,8 @@ def _aten_efficient_attn_backward(
   if not return_attn_bias_grad or original_attn_bias is None:
     grad_attn_bias = None
   else:
-    grad_attn_bias = grad_attn_bias.sum_to_size(original_attn_bias.shape).to(original_attn_bias.dtype)
+    grad_attn_bias = grad_attn_bias.sum_to_size(original_attn_bias.shape
+                                                ).to(original_attn_bias.dtype)
   return dq.to(q.dtype), dk, dv, grad_attn_bias
 
 

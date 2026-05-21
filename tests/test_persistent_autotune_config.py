@@ -19,17 +19,23 @@ def _payload(entries):
 
 def _patch_cuda_device(monkeypatch):
   monkeypatch.setattr(persistent.torch.cuda, "current_device", lambda: 0)
-  monkeypatch.setattr(persistent.torch.cuda, "get_device_name", lambda device=0: "NVIDIA L20")
+  monkeypatch.setattr(
+    persistent.torch.cuda, "get_device_name", lambda device=0: "NVIDIA L20"
+  )
 
 
 def test_sanitize_device_name_and_nearest_values():
   assert persistent.sanitize_device_name("NVIDIA L20") == "NVIDIA_L20"
-  assert persistent.sanitize_device_name("  NVIDIA GeForce RTX 5090  ") == "NVIDIA_GeForce_RTX_5090"
+  assert persistent.sanitize_device_name(
+    "  NVIDIA GeForce RTX 5090  "
+  ) == "NVIDIA_GeForce_RTX_5090"
   assert persistent.nearest_value([320, 512, 640], 384) == 320
   assert persistent.nearest_value([320, 512, 640], 448) == 512
   assert persistent.nearest_value([320, 512, 640, 768, 1024], 900) == 1024
-  assert persistent.upper_or_max_value([1, 512, 1024, 2048, 4096, 8192], 3000) == 4096
-  assert persistent.upper_or_max_value([1, 512, 1024, 2048, 4096, 8192], 32768) == 8192
+  assert persistent.upper_or_max_value([1, 512, 1024, 2048, 4096, 8192],
+                                       3000) == 4096
+  assert persistent.upper_or_max_value([1, 512, 1024, 2048, 4096, 8192],
+                                       32768) == 8192
 
 
 def test_lookup_forward_uses_shape_grid_nearest(tmp_path, monkeypatch):
@@ -89,7 +95,13 @@ def test_lookup_forward_uses_shape_grid_nearest(tmp_path, monkeypatch):
       causal=False,
     )
   )
-  assert config == {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_HEADDIM_QK": 128, "BLOCK_HEADDIM_V": 128, "num_warps": 8}
+  assert config == {
+    "BLOCK_M": 64,
+    "BLOCK_N": 64,
+    "BLOCK_HEADDIM_QK": 128,
+    "BLOCK_HEADDIM_V": 128,
+    "num_warps": 8
+  }
 
 
 def test_lookup_sm90_forward_preserves_tma_ws_config(tmp_path, monkeypatch):
@@ -217,7 +229,9 @@ def test_lookup_sm90_forward_respects_disabled_ws(tmp_path, monkeypatch):
   }
 
 
-def test_lookup_sm90_forward_respects_enabled_ws_entry_metadata(tmp_path, monkeypatch):
+def test_lookup_sm90_forward_respects_enabled_ws_entry_metadata(
+  tmp_path, monkeypatch
+):
   _patch_cuda_device(monkeypatch)
   monkeypatch.setenv(persistent.CONFIG_ENV_VAR, str(tmp_path))
   persistent.clear_config_cache()
@@ -325,9 +339,12 @@ def test_lookup_reuses_cached_request_result(tmp_path, monkeypatch):
     load_calls += 1
     return original_load_config_entries(*args, **kwargs)
 
-  monkeypatch.setattr(persistent, "load_config_entries", counted_load_config_entries)
   monkeypatch.setattr(
-    persistent.torch.cuda, "current_device", lambda: (_ for _ in ()).throw(RuntimeError("unexpected"))
+    persistent, "load_config_entries", counted_load_config_entries
+  )
+  monkeypatch.setattr(
+    persistent.torch.cuda, "current_device", lambda:
+    (_ for _ in ()).throw(RuntimeError("unexpected"))
   )
   request = persistent.PersistentConfigRequest(
     direction="forward",
@@ -346,7 +363,9 @@ def test_lookup_reuses_cached_request_result(tmp_path, monkeypatch):
   assert load_calls == 1
 
 
-def test_lookup_skip_persistent_tuned_config_env_returns_none(tmp_path, monkeypatch):
+def test_lookup_skip_persistent_tuned_config_env_returns_none(
+  tmp_path, monkeypatch
+):
   _patch_cuda_device(monkeypatch)
   monkeypatch.setenv(persistent.CONFIG_ENV_VAR, str(tmp_path))
   persistent.clear_config_cache()
@@ -425,7 +444,9 @@ def test_lookup_caches_device_name_by_device_index(tmp_path, monkeypatch):
     assert device == 0
     return "NVIDIA L20"
 
-  monkeypatch.setattr(persistent.torch.cuda, "get_device_name", counted_get_device_name)
+  monkeypatch.setattr(
+    persistent.torch.cuda, "get_device_name", counted_get_device_name
+  )
   request = persistent.PersistentConfigRequest(
     direction="forward",
     kernel="fwd_generic",
@@ -439,13 +460,17 @@ def test_lookup_caches_device_name_by_device_index(tmp_path, monkeypatch):
   )
 
   assert persistent.lookup_persistent_config(request)["BLOCK_M"] == 128
-  assert persistent.lookup_persistent_config(request.__class__(**{
-    **request.__dict__, "headdim": 384
-  }))["BLOCK_M"] == 128
+  assert persistent.lookup_persistent_config(
+    request.__class__(**{
+      **request.__dict__, "headdim": 384
+    })
+  )["BLOCK_M"] == 128
   assert device_name_calls == 1
 
 
-def test_lookup_debug_logs_selected_config_cached_hit_and_miss(tmp_path, monkeypatch):
+def test_lookup_debug_logs_selected_config_cached_hit_and_miss(
+  tmp_path, monkeypatch
+):
   _patch_cuda_device(monkeypatch)
   monkeypatch.setenv(persistent.CONFIG_ENV_VAR, str(tmp_path))
   persistent.clear_config_cache()
@@ -478,7 +503,9 @@ def test_lookup_debug_logs_selected_config_cached_hit_and_miss(tmp_path, monkeyp
     del kwargs
     debug_messages.append(message % args)
 
-  monkeypatch.setattr(persistent.logger, "isEnabledFor", lambda level: level == logging.DEBUG)
+  monkeypatch.setattr(
+    persistent.logger, "isEnabledFor", lambda level: level == logging.DEBUG
+  )
   monkeypatch.setattr(persistent.logger, "debug_once", debug_once)
   request = persistent.PersistentConfigRequest(
     direction="forward",
@@ -579,7 +606,11 @@ def test_lookup_backward_filters_variants(tmp_path, monkeypatch):
     has_dropout=False,
   )
   assert persistent.lookup_persistent_config(request)["BLOCK_HEADDIM"] == 128
-  assert persistent.lookup_persistent_config(request.__class__(**{**request.__dict__, "has_dropout": True})) is None
+  assert persistent.lookup_persistent_config(
+    request.__class__(**{
+      **request.__dict__, "has_dropout": True
+    })
+  ) is None
 
 
 def test_lookup_generic_backward_split_kernel_configs(tmp_path, monkeypatch):
@@ -687,7 +718,9 @@ def test_lookup_generic_backward_split_kernel_configs(tmp_path, monkeypatch):
   }
 
 
-def test_lookup_sm90_backward_preserves_tma_config_and_flags(tmp_path, monkeypatch):
+def test_lookup_sm90_backward_preserves_tma_config_and_flags(
+  tmp_path, monkeypatch
+):
   _patch_cuda_device(monkeypatch)
   monkeypatch.setenv(persistent.CONFIG_ENV_VAR, str(tmp_path))
   persistent.clear_config_cache()
@@ -788,7 +821,9 @@ def test_lookup_sm90_backward_preserves_tma_config_and_flags(tmp_path, monkeypat
   assert ws_config["warp_specialize"] is True
 
 
-def test_lookup_sm90_backward_persist_uses_distinct_kernel_key(tmp_path, monkeypatch):
+def test_lookup_sm90_backward_persist_uses_distinct_kernel_key(
+  tmp_path, monkeypatch
+):
   _patch_cuda_device(monkeypatch)
   monkeypatch.setenv(persistent.CONFIG_ENV_VAR, str(tmp_path))
   persistent.clear_config_cache()
@@ -1052,7 +1087,12 @@ def test_backward_preprocess_config_backfills_block_headdim():
     preprocess_d_chunk=False,
     block_headdim_delta=512,
   )
-  assert config == {"BLOCK_M": 128, "BLOCK_HEADDIM": 512, "D_CHUNK": False, "num_warps": 4}
+  assert config == {
+    "BLOCK_M": 128,
+    "BLOCK_HEADDIM": 512,
+    "D_CHUNK": False,
+    "num_warps": 4
+  }
 
   d_chunk_config = _normalize_bwd_pre_config(
     {
@@ -1194,19 +1234,27 @@ def test_lookup_filters_mask_dropout_but_not_head_layout(tmp_path, monkeypatch):
     nheads_kv=8,
   )
   assert persistent.lookup_persistent_config(request)["BLOCK_M"] == 64
-  assert persistent.lookup_persistent_config(request.__class__(**{
-    **request.__dict__, "has_attn_bias": True
-  }))["BLOCK_M"] == 128
-  assert persistent.lookup_persistent_config(request.__class__(**{
-    **request.__dict__, "has_dropout": True
-  }))["BLOCK_HEADDIM_QK"] == 128
-  assert persistent.lookup_persistent_config(request.__class__(**{
-    **request.__dict__, "nheads_kv": 1
-  }))["BLOCK_HEADDIM_QK"] == 128
-  assert persistent.lookup_persistent_config(request.__class__(**{
-    **request.__dict__, "nheads_q": 16,
-    "nheads_kv": 4
-  }))["BLOCK_M"] == 64
+  assert persistent.lookup_persistent_config(
+    request.__class__(**{
+      **request.__dict__, "has_attn_bias": True
+    })
+  )["BLOCK_M"] == 128
+  assert persistent.lookup_persistent_config(
+    request.__class__(**{
+      **request.__dict__, "has_dropout": True
+    })
+  )["BLOCK_HEADDIM_QK"] == 128
+  assert persistent.lookup_persistent_config(
+    request.__class__(**{
+      **request.__dict__, "nheads_kv": 1
+    })
+  )["BLOCK_HEADDIM_QK"] == 128
+  assert persistent.lookup_persistent_config(
+    request.__class__(**{
+      **request.__dict__, "nheads_q": 16,
+      "nheads_kv": 4
+    })
+  )["BLOCK_M"] == 64
 
 
 def test_missing_or_wrong_schema_config_falls_back(tmp_path, monkeypatch):

@@ -71,7 +71,9 @@ class Rank0Filter(logging.Filter):
     del record
     if not _truthy_env(RANK0_LOGGING_ENV_VAR):
       return True
-    return not (dist.is_available() and dist.is_initialized() and dist.get_rank() != 0)
+    return not (
+      dist.is_available() and dist.is_initialized() and dist.get_rank() != 0
+    )
 
 
 def _setup_logger() -> None:
@@ -91,12 +93,16 @@ def _setup_logger() -> None:
     setattr(_default_handler, "_ffpa_default_handler", True)
     _root_logger.addHandler(_default_handler)
   _default_handler.setFormatter(NewLineFormatter(_FORMAT, datefmt=_DATE_FORMAT))
-  if not any(isinstance(item, Rank0Filter) for item in _default_handler.filters):
+  if not any(
+    isinstance(item, Rank0Filter) for item in _default_handler.filters
+  ):
     _default_handler.addFilter(Rank0Filter())
   _default_handler.setLevel(level)
 
 
-def _render_message(logger: logging.Logger, level: int, msg: object, args: tuple[Any, ...]) -> str:
+def _render_message(
+  logger: logging.Logger, level: int, msg: object, args: tuple[Any, ...]
+) -> str:
   """Render a logging message with standard ``%`` interpolation.
 
   :param logger: Logger receiving the message.
@@ -116,7 +122,9 @@ def _render_message(logger: logging.Logger, level: int, msg: object, args: tuple
   ).getMessage()
 
 
-def _log_once(logger: logging.Logger, level: int, msg: object, *args: Any, **kwargs: Any) -> None:
+def _log_once(
+  logger: logging.Logger, level: int, msg: object, *args: Any, **kwargs: Any
+) -> None:
   """Emit one log message only once per logger, level, and rendered text.
 
   :param logger: Logger receiving the message.
@@ -133,15 +141,21 @@ def _log_once(logger: logging.Logger, level: int, msg: object, *args: Any, **kwa
   logger.log(level, msg, *args, **kwargs)
 
 
-def _info_once(self: logging.Logger, msg: object, *args: Any, **kwargs: Any) -> None:
+def _info_once(
+  self: logging.Logger, msg: object, *args: Any, **kwargs: Any
+) -> None:
   _log_once(self, logging.INFO, msg, *args, **kwargs)
 
 
-def _debug_once(self: logging.Logger, msg: object, *args: Any, **kwargs: Any) -> None:
+def _debug_once(
+  self: logging.Logger, msg: object, *args: Any, **kwargs: Any
+) -> None:
   _log_once(self, logging.DEBUG, msg, *args, **kwargs)
 
 
-def _warning_once(self: logging.Logger, msg: object, *args: Any, **kwargs: Any) -> None:
+def _warning_once(
+  self: logging.Logger, msg: object, *args: Any, **kwargs: Any
+) -> None:
   _log_once(self, logging.WARNING, msg, *args, **kwargs)
 
 

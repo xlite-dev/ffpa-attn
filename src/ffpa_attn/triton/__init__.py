@@ -9,7 +9,9 @@ from ._ffpa_bwd import _ffpa_attn_backward_triton
 _OP_NAMESPACE = "ffpa_attn"
 
 
-def _attn_bias_grad_needs_reduction(attn_bias: torch.Tensor | None, q: torch.Tensor, k: torch.Tensor) -> bool:
+def _attn_bias_grad_needs_reduction(
+  attn_bias: torch.Tensor | None, q: torch.Tensor, k: torch.Tensor
+) -> bool:
   """Return whether compact bias gradients are reduced across broadcast dimensions."""
   if attn_bias is None:
     return False
@@ -21,7 +23,9 @@ def _attn_bias_grad_needs_reduction(attn_bias: torch.Tensor | None, q: torch.Ten
   ])
 
 
-def _attn_bias_grad_dtype(attn_bias: torch.Tensor, q: torch.Tensor, k: torch.Tensor) -> torch.dtype:
+def _attn_bias_grad_dtype(
+  attn_bias: torch.Tensor, q: torch.Tensor, k: torch.Tensor
+) -> torch.dtype:
   """Return the internal accumulation dtype for Triton bias gradients.
 
   BF16 additive-bias gradients are numerically sensitive even when the logical
@@ -29,7 +33,9 @@ def _attn_bias_grad_dtype(attn_bias: torch.Tensor, q: torch.Tensor, k: torch.Ten
   buffer in fp32 and cast back to the user dtype at the Python wrapper
   boundary so the kernel only rounds once.
   """
-  if attn_bias.dtype == torch.bfloat16 or _attn_bias_grad_needs_reduction(attn_bias, q, k):
+  if attn_bias.dtype == torch.bfloat16 or _attn_bias_grad_needs_reduction(
+    attn_bias, q, k
+  ):
     return torch.float32
   return attn_bias.dtype
 
@@ -86,7 +92,9 @@ def _grad_kv_storage_dtype_from_code(code: int) -> torch.dtype | None:
     return torch.float32
   if code == 2:
     return torch.float16
-  raise ValueError(f"Unsupported grad_kv_storage_dtype code {code}; expected 0, 1, or 2.")
+  raise ValueError(
+    f"Unsupported grad_kv_storage_dtype code {code}; expected 0, 1, or 2."
+  )
 
 
 torch.library.define(
@@ -171,7 +179,9 @@ def _fwd_triton_fake(
 ) -> tuple[torch.Tensor, torch.Tensor]:
   seqlen_q_aligned = ((q.size(2) + 127) // 128) * 128
   o = torch.empty_like(q)
-  softmax_lse = q.new_empty(q.size(0), q.size(1), seqlen_q_aligned, dtype=torch.float32)
+  softmax_lse = q.new_empty(
+    q.size(0), q.size(1), seqlen_q_aligned, dtype=torch.float32
+  )
   return o, softmax_lse
 
 
@@ -213,7 +223,9 @@ def _bwd_triton_torch_op(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
   from ._ffpa_bwd import _ffpa_attn_backward_triton_impl as _triton_bwd_kernel
 
-  grad_kv_storage_dtype = _grad_kv_storage_dtype_from_code(grad_kv_storage_dtype_code)
+  grad_kv_storage_dtype = _grad_kv_storage_dtype_from_code(
+    grad_kv_storage_dtype_code
+  )
   dq = _triton_bwd_grad_tensor_like(q)
   dk = _triton_bwd_grad_tensor_like(k, grad_kv_storage_dtype)
   dv = _triton_bwd_grad_tensor_like(v, grad_kv_storage_dtype)
@@ -294,7 +306,9 @@ def _bwd_triton_fake(
     enable_persist_dkdv,
     enable_split_launch,
   )
-  grad_kv_storage_dtype = _grad_kv_storage_dtype_from_code(grad_kv_storage_dtype_code)
+  grad_kv_storage_dtype = _grad_kv_storage_dtype_from_code(
+    grad_kv_storage_dtype_code
+  )
   if attn_bias is not None and return_attn_bias_grad:
     grad_dtype = _attn_bias_grad_dtype(attn_bias, q, k)
     grad_attn_bias = torch.empty_like(attn_bias, dtype=grad_dtype)

@@ -74,7 +74,9 @@ def bucket_autotune_seqlen(seqlen: int, autotune_mode: str = "fast") -> int:
     if seqlen <= _AUTOTUNE_MAX_SEQLEN_BUCKET_CAP:
       return _bucket_upper_edge(seqlen, 1024)
     return _AUTOTUNE_MAX_SEQLEN_BUCKET_CAP
-  raise ValueError(f"Unsupported autotune_mode={autotune_mode!r}; choose 'fast' or 'max'.")
+  raise ValueError(
+    f"Unsupported autotune_mode={autotune_mode!r}; choose 'fast' or 'max'."
+  )
 
 
 def autotune_seqlen_key(seqlen: int, autotune_mode: str = "fast") -> int:

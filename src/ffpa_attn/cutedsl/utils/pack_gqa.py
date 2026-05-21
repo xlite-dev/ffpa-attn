@@ -37,7 +37,9 @@ def pack_gqa_layout(T, qhead_per_kvhead, nheads_kv, head_idx):
     head_stride * qhead_per_kvhead,
     *[T.stride[i] for i in range(head_idx + 1, len(T.shape))],
   )
-  return cute.make_tensor(T.iterator, cute.make_layout(shape_packed, stride=stride_packed))
+  return cute.make_tensor(
+    T.iterator, cute.make_layout(shape_packed, stride=stride_packed)
+  )
 
 
 def make_packgqa_tiled_tma_atom(
@@ -54,7 +56,8 @@ def make_packgqa_tiled_tma_atom(
   # If we instead pack directly to ((qhead_per_kvhead, seqlen), d, nheads_kv, b) we'd have 5D TMA.
   # Pack headdim and seqlen dim into 1: (seqlen, d, nheads, b) -> ((nheads, seqlen), d, b)
   gmem_tensor = layout_utils.select(
-    gmem_tensor, [head_idx, *range(head_idx), *range(head_idx + 1, cute.rank(gmem_tensor))]
+    gmem_tensor,
+    [head_idx, *range(head_idx), *range(head_idx + 1, cute.rank(gmem_tensor))]
   )
   gmem_tensor = cute.group_modes(gmem_tensor, 0, 2)
   assert cta_tiler[0] % qhead_per_kvhead == 0, (
@@ -64,7 +67,8 @@ def make_packgqa_tiled_tma_atom(
     op,
     gmem_tensor,
     smem_layout,
-    ((qhead_per_kvhead, cta_tiler[0] // qhead_per_kvhead), cta_tiler[1]),  # No mcast
+    ((qhead_per_kvhead, cta_tiler[0] // qhead_per_kvhead),
+     cta_tiler[1]),  # No mcast
   )
   # Unpack from ((nheads, seqlen), d, b) -> ((qhead_per_kvhead, seqlen), d, nheads_kv, b)
   T = tma_tensor
@@ -79,7 +83,9 @@ def make_packgqa_tiled_tma_atom(
     T.stride[0][0] * qhead_per_kvhead,
     *[T.stride[i] for i in range(head_idx, len(T.shape))],
   )
-  tma_tensor = cute.make_tensor(T.iterator, cute.make_layout(shape_packed, stride=stride_packed))
+  tma_tensor = cute.make_tensor(
+    T.iterator, cute.make_layout(shape_packed, stride=stride_packed)
+  )
   return tma_atom, tma_tensor
 
 
@@ -131,11 +137,22 @@ class PackGQA:
     threads_per_row = gmem_tiled_copy.layout_tv_tiled.shape[0][0]
     assert cute.arch.WARP_SIZE % threads_per_row == 0, "threads_per_row must divide WARP_SIZE"
     num_threads = gmem_tiled_copy.size
-    tPrQPtr = self.compute_ptr(mQ[None, 0], tQcQ_row, tidx, block, threads_per_row, num_threads)
+    tPrQPtr = self.compute_ptr(
+      mQ[None, 0], tQcQ_row, tidx, block, threads_per_row, num_threads
+    )
     for m in cutlass.range_constexpr(cute.size(tQsQ.shape[1])):
-      q_ptr_i64 = shuffle_sync(tPrQPtr[m // threads_per_row], m % threads_per_row, width=threads_per_row)
-      q_gmem_ptr = cute.make_ptr(mQ.element_type, q_ptr_i64, cute.AddressSpace.gmem, assumed_align=16)
-      if t0QcQ[0, m, 0][0] < seqlen * self.qhead_per_kvhead - block * self.m_block_size - tQcQ_row[0][0]:
+      q_ptr_i64 = shuffle_sync(
+        tPrQPtr[m // threads_per_row],
+        m % threads_per_row,
+        width=threads_per_row
+      )
+      q_gmem_ptr = cute.make_ptr(
+        mQ.element_type, q_ptr_i64, cute.AddressSpace.gmem, assumed_align=16
+      )
+      if t0QcQ[0, m, 0][
+        0
+      ] < seqlen * self.qhead_per_kvhead - block * self.m_block_size - tQcQ_row[
+        0][0]:
         mQ_cur = cute.make_tensor(q_gmem_ptr, (self.head_dim_padded, ))
         elems_per_load = cute.size(tQsQ.shape[0][0])
         mQ_cur_copy = cute.tiled_divide(mQ_cur, (elems_per_load, ))
@@ -145,7 +162,8 @@ class PackGQA:
             gmem_thr_copy,
             mQ_cur_copy[None, ki],
             tQsQ[None, m, k],
-            pred=tQpQ[None, m, k] if cutlass.const_expr(self.check_hdim_oob) else None,
+            pred=tQpQ[None, m,
+                      k] if cutlass.const_expr(self.check_hdim_oob) else None,
           )
       # We don't need to clear the sQ smem tiles since we'll only write out the valid outputs
 
@@ -168,14 +186,18 @@ class PackGQA:
     assert cute.arch.WARP_SIZE % threads_per_row == 0, "threads_per_row must divide WARP_SIZE"
     assert cute.size(tLSErLSE) <= threads_per_row
     num_threads = tiled_mma.size
-    tPrLSEPtr = self.compute_ptr(mLSE, taccOcO_row, tidx, block, threads_per_row, num_threads)
+    tPrLSEPtr = self.compute_ptr(
+      mLSE, taccOcO_row, tidx, block, threads_per_row, num_threads
+    )
     for m in cutlass.range_constexpr(cute.size(tLSErLSE)):
       lse_ptr_i64 = shuffle_sync(
         tPrLSEPtr[m // threads_per_row],
         m % threads_per_row,
         width=threads_per_row,
       )
-      lse_gmem_ptr = cute.make_ptr(mLSE.element_type, lse_ptr_i64, cute.AddressSpace.gmem, assumed_align=4)
+      lse_gmem_ptr = cute.make_ptr(
+        mLSE.element_type, lse_ptr_i64, cute.AddressSpace.gmem, assumed_align=4
+      )
       row = block * self.m_block_size + taccOcO_row[m][0]
       # Only the thread corresponding to column 0 writes out the lse to gmem
       if taccOcO[0][1] == 0 and row < seqlen * self.qhead_per_kvhead:
@@ -187,7 +209,8 @@ class PackGQA:
   def store_O(
     self,
     mO: cute.Tensor,  # ((qhead_per_kvhead, seqlen_q), headdim)
-    tOrO: cute.Tensor,  # (m_block_size, head_dim_padded) split across threads according to gmem_tiled_copy
+    tOrO: cute.
+    Tensor,  # (m_block_size, head_dim_padded) split across threads according to gmem_tiled_copy
     gmem_tiled_copy: cute.TiledCopy,
     tidx: cutlass.Int32,
     block: cutlass.Int32,
@@ -202,11 +225,22 @@ class PackGQA:
     threads_per_row = gmem_tiled_copy.layout_tv_tiled.shape[0][0]
     assert cute.arch.WARP_SIZE % threads_per_row == 0, "threads_per_row must divide WARP_SIZE"
     num_threads = gmem_tiled_copy.size
-    tPrOPtr = self.compute_ptr(mO[None, 0], tOcO_row, tidx, block, threads_per_row, num_threads)
+    tPrOPtr = self.compute_ptr(
+      mO[None, 0], tOcO_row, tidx, block, threads_per_row, num_threads
+    )
     for m in cutlass.range_constexpr(cute.size(tOrO.shape[1])):
-      o_ptr_i64 = shuffle_sync(tPrOPtr[m // threads_per_row], m % threads_per_row, width=threads_per_row)
-      o_gmem_ptr = cute.make_ptr(mO.element_type, o_ptr_i64, cute.AddressSpace.gmem, assumed_align=16)
-      if t0OcO[0, m, 0][0] < seqlen * self.qhead_per_kvhead - block * self.m_block_size - tOcO_row[0][0]:
+      o_ptr_i64 = shuffle_sync(
+        tPrOPtr[m // threads_per_row],
+        m % threads_per_row,
+        width=threads_per_row
+      )
+      o_gmem_ptr = cute.make_ptr(
+        mO.element_type, o_ptr_i64, cute.AddressSpace.gmem, assumed_align=16
+      )
+      if t0OcO[0, m, 0][
+        0
+      ] < seqlen * self.qhead_per_kvhead - block * self.m_block_size - tOcO_row[
+        0][0]:
         mO_cur = cute.make_tensor(o_gmem_ptr, (self.head_dim_padded, ))
         elems_per_load = cute.size(tOrO.shape[0][0])
         mO_cur_copy = cute.tiled_divide(mO_cur, (elems_per_load, ))
@@ -216,5 +250,6 @@ class PackGQA:
             gmem_thr_copy,
             tOrO[None, m, k],
             mO_cur_copy[None, ki],
-            pred=tOpO[None, m, k] if cutlass.const_expr(self.check_hdim_oob) else None,
+            pred=tOpO[None, m,
+                      k] if cutlass.const_expr(self.check_hdim_oob) else None,
           )

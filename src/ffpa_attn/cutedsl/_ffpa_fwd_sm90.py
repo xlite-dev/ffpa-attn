@@ -75,12 +75,18 @@ def _ffpa_attn_forward_sm90(
     num_head_kv,
     head_dim,
     head_dim_v,
-  ) = _validate_qkv_common(q, k, v, cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k)
+  ) = _validate_qkv_common(
+    q, k, v, cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k
+  )
 
   requires_grad = q.requires_grad or k.requires_grad or v.requires_grad
   _validate_training_dtype(q, k, v, requires_grad)
-  _validate_max_seqlen_for_cu_seqlens(cu_seqlens_q, "cu_seqlens_q", max_seqlen_q, "max_seqlen_q")
-  _validate_max_seqlen_for_cu_seqlens(cu_seqlens_k, "cu_seqlens_k", max_seqlen_k, "max_seqlen_k")
+  _validate_max_seqlen_for_cu_seqlens(
+    cu_seqlens_q, "cu_seqlens_q", max_seqlen_q, "max_seqlen_q"
+  )
+  _validate_max_seqlen_for_cu_seqlens(
+    cu_seqlens_k, "cu_seqlens_k", max_seqlen_k, "max_seqlen_k"
+  )
 
   device_arch, cute_arch_key = _validate_sm90_arch()
   if softmax_scale is None:
@@ -93,16 +99,29 @@ def _ffpa_attn_forward_sm90(
 
   device = q.device
   out_torch_dtype = q.dtype
-  q_batch_seqlen_shape = (batch_size, seqlen_q) if cu_seqlens_q is None else (total_q, )
-  lse_shape = (batch_size, num_head, seqlen_q) if cu_seqlens_q is None else (num_head, total_q)
+  q_batch_seqlen_shape = (batch_size,
+                          seqlen_q) if cu_seqlens_q is None else (total_q, )
+  lse_shape = (batch_size, num_head,
+               seqlen_q) if cu_seqlens_q is None else (num_head, total_q)
 
   if out is None:
-    out = torch.empty(*q_batch_seqlen_shape, num_head, head_dim_v, dtype=out_torch_dtype, device=device)
+    out = torch.empty(
+      *q_batch_seqlen_shape,
+      num_head,
+      head_dim_v,
+      dtype=out_torch_dtype,
+      device=device
+    )
   else:
-    _validate_tensor(out, "out", (*q_batch_seqlen_shape, num_head, head_dim_v), out_torch_dtype, device)
+    _validate_tensor(
+      out, "out", (*q_batch_seqlen_shape, num_head, head_dim_v),
+      out_torch_dtype, device
+    )
 
   if lse is None:
-    lse = torch.empty(lse_shape, dtype=torch.float32, device=device) if requires_grad or return_lse else None
+    lse = torch.empty(
+      lse_shape, dtype=torch.float32, device=device
+    ) if requires_grad or return_lse else None
   elif lse is not None:
     _validate_tensor(lse, "lse", lse_shape, torch.float32, device)
 
@@ -111,7 +130,9 @@ def _ffpa_attn_forward_sm90(
   causal, local, window_size_left, window_size_right = _resolve_causal_local_window(
     causal, window_size_left, window_size_right, mask_mod
   )
-  _unsupported_training_features(requires_grad, softcap, local, score_mod, mask_mod, aux_tensors)
+  _unsupported_training_features(
+    requires_grad, softcap, local, score_mod, mask_mod, aux_tensors
+  )
 
   current_stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
 
@@ -132,13 +153,19 @@ def _ffpa_attn_forward_sm90(
       raise ValueError("softcap and score_mod cannot be used together")
     score_mod = utils.create_softcap_scoremod(softcap)
 
-  score_mod_hash = utils.hash_callable(score_mod) if score_mod is not None else False
-  mask_mod_hash = utils.hash_callable(mask_mod) if mask_mod is not None else False
+  score_mod_hash = utils.hash_callable(
+    score_mod
+  ) if score_mod is not None else False
+  mask_mod_hash = utils.hash_callable(
+    mask_mod
+  ) if mask_mod is not None else False
 
   is_varlen = cu_seqlens_q is not None or cu_seqlens_k is not None
 
   if mask_mod is not None and is_varlen:
-    raise NotImplementedError("mask_mod with aux_tensors is not yet supported for varlen sequences.")
+    raise NotImplementedError(
+      "mask_mod with aux_tensors is not yet supported for varlen sequences."
+    )
 
   if aux_tensors is not None:
     aux_tensor_metadata = get_aux_tensor_metadata(aux_tensors)
@@ -182,10 +209,12 @@ def _ffpa_attn_forward_sm90(
   )
   if compile_key not in _ffpa_attn_forward_sm90.compile_cache:
     cu_seqlens_q_tensor, cu_seqlens_k_tensor = [
-      to_cute_tensor(t, assumed_align=4, leading_dim=0) if t is not None else None
-      for t in (cu_seqlens_q, cu_seqlens_k)
+      to_cute_tensor(t, assumed_align=4, leading_dim=0)
+      if t is not None else None for t in (cu_seqlens_q, cu_seqlens_k)
     ]
-    q_tensor, k_tensor, v_tensor, o_tensor = [to_cute_tensor(t) for t in (q, k, v, out)]
+    q_tensor, k_tensor, v_tensor, o_tensor = [
+      to_cute_tensor(t) for t in (q, k, v, out)
+    ]
     if lse is not None:
       lse_tensor = to_cute_tensor(lse, assumed_align=4)
     else:
@@ -230,7 +259,9 @@ def _ffpa_attn_forward_sm90(
     ]
     _ffpa_attn_forward_sm90.compile_cache[compile_key] = cute.compile(
       *compile_args,
-      options=("--enable-tvm-ffi --ptxas-options '--verbose --warn-on-spills --warn-on-local-memory-usage'"),
+      options=(
+        "--enable-tvm-ffi --ptxas-options '--verbose --warn-on-spills --warn-on-local-memory-usage'"
+      ),
     )
 
   if not is_fake_mode():

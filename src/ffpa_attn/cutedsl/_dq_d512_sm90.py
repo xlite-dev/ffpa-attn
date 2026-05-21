@@ -101,9 +101,13 @@ class FFPAAttnBwdDQSm90SplitD:
   ):
     self.dtype = dtype
     hdim_multiple_of = 16
-    self.tile_hdim = int(math.ceil(head_dim / hdim_multiple_of) * hdim_multiple_of)
+    self.tile_hdim = int(
+      math.ceil(head_dim / hdim_multiple_of) * hdim_multiple_of
+    )
     head_dim_v = head_dim_v if head_dim_v is not None else head_dim
-    self.tile_hdimv = int(math.ceil(head_dim_v / hdim_multiple_of) * hdim_multiple_of)
+    self.tile_hdimv = int(
+      math.ceil(head_dim_v / hdim_multiple_of) * hdim_multiple_of
+    )
     self.check_hdim_oob = head_dim != self.tile_hdim
     self.check_hdim_v_oob = head_dim_v != self.tile_hdimv
 
@@ -216,8 +220,12 @@ class FFPAAttnBwdDQSm90SplitD:
     """Create tiled MMA objects for SdP and dQ GEMMs (dQ cooperative ①)."""
     # ── SdP: S = Q @ K^T (WG1), dP = dO @ V^T (WG2) ──
     # shape_mnk: (tile_m, tile_n, d_chunk) = (64, 64, 256). Both WGs independently
-    atom_layout_SdP = (self.AtomLayoutMSdP, self.num_wg_mma // self.AtomLayoutMSdP, 1)
-    tiler_mn_SdP = (self.tile_m // atom_layout_SdP[0], self.tile_n // atom_layout_SdP[1])
+    atom_layout_SdP = (
+      self.AtomLayoutMSdP, self.num_wg_mma // self.AtomLayoutMSdP, 1
+    )
+    tiler_mn_SdP = (
+      self.tile_m // atom_layout_SdP[0], self.tile_n // atom_layout_SdP[1]
+    )
     tiled_mma_SdP = sm90_utils_basic.make_trivial_tiled_mma(
       self.dtype,
       self.dtype,
@@ -230,8 +238,12 @@ class FFPAAttnBwdDQSm90SplitD:
 
     # ── dQ_half: dQ_half = dS @ K_d_pass_half (cooperative ①) ──
     # shape_mnk: (tile_m, dQ_n_half, tile_n) = (64, 128, 64)
-    atom_layout_dQ = (self.AtomLayoutMdQ, self.num_wg_mma // self.AtomLayoutMdQ, 1)
-    tiler_mn_dQ = (self.tile_m // atom_layout_dQ[0], self.dQ_n_half // atom_layout_dQ[1])
+    atom_layout_dQ = (
+      self.AtomLayoutMdQ, self.num_wg_mma // self.AtomLayoutMdQ, 1
+    )
+    tiler_mn_dQ = (
+      self.tile_m // atom_layout_dQ[0], self.dQ_n_half // atom_layout_dQ[1]
+    )
     tiled_mma_dQ = sm90_utils_basic.make_trivial_tiled_mma(
       self.dtype,
       self.dtype,
@@ -254,12 +266,14 @@ class FFPAAttnBwdDQSm90SplitD:
     ]
     # sKt is physically split into front+back halves; each (tile_n, dQ_n_half)
     sKt_half_struct = cute.struct.Align[
-      cute.struct.MemRange[self.dtype, cute.cosize(self.sKt_half_layout)],
+      cute.struct.MemRange[self.dtype,
+                           cute.cosize(self.sKt_half_layout)],
       self.buffer_align_bytes,
     ]
     # sEpi half (single-stage per WG-side, used only during epilogue).
     sEpi_half_struct = cute.struct.Align[
-      cute.struct.MemRange[self.dtype, cute.cosize(self.sEpi_half_layout)],
+      cute.struct.MemRange[self.dtype,
+                           cute.cosize(self.sEpi_half_layout)],
       self.buffer_align_bytes,
     ]
 
@@ -296,7 +310,8 @@ class FFPAAttnBwdDQSm90SplitD:
         1024,
       ]
       sdS: cute.struct.Align[
-        cute.struct.MemRange[self.dtype, cute.cosize(self.sdS_layout)],
+        cute.struct.MemRange[self.dtype,
+                             cute.cosize(self.sdS_layout)],
         1024,
       ]
 
@@ -317,12 +332,16 @@ class FFPAAttnBwdDQSm90SplitD:
     mCuSeqlensK: Optional[cute.Tensor] = None,
     stream: cuda.CUstream = None,
   ):
-    mQ, mK, mV, mdO, mdQ = [assume_tensor_aligned(t) for t in (mQ, mK, mV, mdO, mdQ)]
+    mQ, mK, mV, mdO, mdQ = [
+      assume_tensor_aligned(t) for t in (mQ, mK, mV, mdO, mdQ)
+    ]
     mLSE, mdPsum = [assume_tensor_aligned(t) for t in (mLSE, mdPsum)]
 
     # Transpose: (b, s, n, h) -> (s, h, n, b)
     def _qkv_transpose(t):
-      return layout_utils.select(t, [1, 3, 2, 0] if cute.rank(t.shape) == 4 else [0, 2, 1])
+      return layout_utils.select(
+        t, [1, 3, 2, 0] if cute.rank(t.shape) == 4 else [0, 2, 1]
+      )
 
     mQ, mK, mV, mdO, mdQ = [_qkv_transpose(t) for t in (mQ, mK, mV, mdO, mdQ)]
     # Stats: (b, n, s) -> (s, n, b)
@@ -345,8 +364,10 @@ class FFPAAttnBwdDQSm90SplitD:
     # Producer issues 2 TMA per d_pass (one per half); both finish before commit.
     kt_half_bytes = cute.size_in_bytes(mK.element_type, sKt_half_layout_sel)
     self.tma_copy_bytes = {
-      "A": cute.size_in_bytes(mQ.element_type, sA_layout_sel),  # Q or dO chunk: 32KB
-      "B": cute.size_in_bytes(mK.element_type, sB_layout_sel),  # K or V chunk:  32KB
+      "A": cute.size_in_bytes(mQ.element_type,
+                              sA_layout_sel),  # Q or dO chunk: 32KB
+      "B": cute.size_in_bytes(mK.element_type,
+                              sB_layout_sel),  # K or V chunk:  32KB
       "Kt_half": kt_half_bytes,  # one Kt half:   16KB
       "Kt": 2 * kt_half_bytes,  # both halves:   32KB
     }
@@ -396,7 +417,9 @@ class FFPAAttnBwdDQSm90SplitD:
     self.varlen_q = mCuSeqlensQ is not None
     self.is_varlen_k = mCuSeqlensK is not None
     gmem_tiled_copy_s2g = cpasync.CopyBulkTensorTileS2GOp()
-    mdQ_tma = copy_utils.create_ragged_tensor_for_tma(mdQ, ragged_dim=0, ptr_shift=True) if self.varlen_q else mdQ
+    mdQ_tma = copy_utils.create_ragged_tensor_for_tma(
+      mdQ, ragged_dim=0, ptr_shift=True
+    ) if self.varlen_q else mdQ
     tma_atom_dQ_half, tma_tensor_dQ_half = cpasync.make_tiled_tma_atom(
       gmem_tiled_copy_s2g,
       mdQ_tma,
@@ -409,7 +432,9 @@ class FFPAAttnBwdDQSm90SplitD:
     else:
       TileScheduler = SingleTileScheduler
     num_m_blocks = cute.ceil_div(cute.size(mQ.shape[0]), self.tile_m)
-    num_batch = cute.size(mQ.shape[3]) if cute.rank(mQ.shape) == 4 else cute.size(mCuSeqlensQ.shape[0] - 1)
+    num_batch = cute.size(mQ.shape[3]) if cute.rank(
+      mQ.shape
+    ) == 4 else cute.size(mCuSeqlensQ.shape[0] - 1)
     tile_sched_args = TileSchedulerArguments(
       num_m_blocks,
       cute.size(mQ.shape[2]),  # num_heads
@@ -498,7 +523,8 @@ class FFPAAttnBwdDQSm90SplitD:
     sA_layout: cute.ComposedLayout,
     sB_layout: cute.ComposedLayout,
     sKt_half_layout: cute.ComposedLayout,
-    sEpi_half_layout: cute.ComposedLayout,  # fix: kernel-region SSA def for sEpi half tensor
+    sEpi_half_layout: cute.
+    ComposedLayout,  # fix: kernel-region SSA def for sEpi half tensor
     sdS_layout: cute.ComposedLayout,
     sP_fp32_layout: cute.ComposedLayout,
     tiled_mma_SdP: cute.TiledMma,
@@ -511,13 +537,18 @@ class FFPAAttnBwdDQSm90SplitD:
     warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
 
     if warp_idx == 0:
-      for atom in [tma_atom_Q, tma_atom_dO, tma_atom_K, tma_atom_V, tma_atom_Kt_half, tma_atom_dQ_half]:
+      for atom in [
+        tma_atom_Q, tma_atom_dO, tma_atom_K, tma_atom_V, tma_atom_Kt_half,
+        tma_atom_dQ_half
+      ]:
         cpasync.prefetch_descriptor(atom)
 
     smem = cutlass.utils.SmemAllocator()
     storage = smem.allocate(SharedStorage)
 
-    pipeline_producer_group = cutlass.pipeline.CooperativeGroup(cutlass.pipeline.Agent.Thread)
+    pipeline_producer_group = cutlass.pipeline.CooperativeGroup(
+      cutlass.pipeline.Agent.Thread
+    )
     # pipeline_QdO / pipeline_B / pipeline_Kt: 8-warp shared consumer (WG1+WG2).
     pipeline_consumer_8warp = cutlass.pipeline.CooperativeGroup(
       cutlass.pipeline.Agent.Thread,
@@ -569,7 +600,9 @@ class FFPAAttnBwdDQSm90SplitD:
       swizzle=sKt_half_layout.inner,
     )
     sdS = storage.sdS.get_tensor(sdS_layout.outer, swizzle=sdS_layout.inner)
-    sP_fp32 = storage.sP_fp32.get_tensor(sP_fp32_layout.outer, swizzle=sP_fp32_layout.inner)
+    sP_fp32 = storage.sP_fp32.get_tensor(
+      sP_fp32_layout.outer, swizzle=sP_fp32_layout.inner
+    )
 
     # Single-stage SMEM views for half epilogue TMA stores (alias sKt halves' physical slots).
     sEpi_front = storage.sKtEpi_front.sEpi_front.get_tensor(
@@ -614,7 +647,9 @@ class FFPAAttnBwdDQSm90SplitD:
     # WG1 now owns acc_dQ_pass[d]_front (cooperative ① N-front halves);
     # WG2 owns acc_dQ_pass[d]_back. Both participate in cooperative Phase E.
     tidx, _, _ = cute.arch.thread_idx()
-    warp_group_idx = cute.arch.make_warp_uniform(tidx // self.num_threads_per_warp_group)
+    warp_group_idx = cute.arch.make_warp_uniform(
+      tidx // self.num_threads_per_warp_group
+    )
 
     if warp_group_idx == 0:
       cute.arch.setmaxregister_decrease(self.num_producer_regs)
@@ -730,9 +765,15 @@ class FFPAAttnBwdDQSm90SplitD:
     TileSchedulerCls: Callable,
     qhead_per_kvhead_divmod: Optional[FastDivmodDivisor] = None,
   ):
-    producer_state_QdO = cutlass.pipeline.make_pipeline_state(cutlass.pipeline.PipelineUserType.Producer, self.A_stage)
-    producer_state_B = cutlass.pipeline.make_pipeline_state(cutlass.pipeline.PipelineUserType.Producer, self.B_stage)
-    producer_state_Kt = cutlass.pipeline.make_pipeline_state(cutlass.pipeline.PipelineUserType.Producer, self.Kt_stage)
+    producer_state_QdO = cutlass.pipeline.make_pipeline_state(
+      cutlass.pipeline.PipelineUserType.Producer, self.A_stage
+    )
+    producer_state_B = cutlass.pipeline.make_pipeline_state(
+      cutlass.pipeline.PipelineUserType.Producer, self.B_stage
+    )
+    producer_state_Kt = cutlass.pipeline.make_pipeline_state(
+      cutlass.pipeline.PipelineUserType.Producer, self.Kt_stage
+    )
 
     tile_scheduler = TileSchedulerCls()
     work_tile = tile_scheduler.initial_work_tile_info()
@@ -745,15 +786,23 @@ class FFPAAttnBwdDQSm90SplitD:
       seqlen = SeqlenInfoCls(batch_idx)
 
       # GQA: map Q head index to KV head index for K/V loading
-      head_idx_kv = head_idx if const_expr(self.qhead_per_kvhead == 1) else head_idx // qhead_per_kvhead_divmod
+      head_idx_kv = head_idx if const_expr(
+        self.qhead_per_kvhead == 1
+      ) else head_idx // qhead_per_kvhead_divmod
 
       mQ_cur = seqlen.offset_batch_Q(mQ, batch_idx, dim=3)[None, None, head_idx]
-      mK_cur = seqlen.offset_batch_K(mK, batch_idx, dim=3)[None, None, head_idx_kv]
-      mV_cur = seqlen.offset_batch_K(mV, batch_idx, dim=3)[None, None, head_idx_kv]
-      mdO_cur = seqlen.offset_batch_Q(mdO, batch_idx, dim=3)[None, None, head_idx]
-      mKt_half_cur = seqlen.offset_batch_K(mKt_half, batch_idx, dim=3)[None, None, head_idx_kv]
-      mLSE_cur = seqlen.offset_batch_Q(mLSE, batch_idx, dim=2, padded=True)[None, head_idx]
-      mdPsum_cur = seqlen.offset_batch_Q(mdPsum, batch_idx, dim=2, padded=True)[None, head_idx]
+      mK_cur = seqlen.offset_batch_K(mK, batch_idx, dim=3)[None, None,
+                                                           head_idx_kv]
+      mV_cur = seqlen.offset_batch_K(mV, batch_idx, dim=3)[None, None,
+                                                           head_idx_kv]
+      mdO_cur = seqlen.offset_batch_Q(mdO, batch_idx, dim=3)[None, None,
+                                                             head_idx]
+      mKt_half_cur = seqlen.offset_batch_K(mKt_half, batch_idx,
+                                           dim=3)[None, None, head_idx_kv]
+      mLSE_cur = seqlen.offset_batch_Q(mLSE, batch_idx, dim=2,
+                                       padded=True)[None, head_idx]
+      mdPsum_cur = seqlen.offset_batch_Q(mdPsum, batch_idx, dim=2,
+                                         padded=True)[None, head_idx]
 
       gLSE = cute.local_tile(mLSE_cur, (self.tile_m, ), (None, ))
       gdPsum = cute.local_tile(mdPsum_cur, (self.tile_m, ), (None, ))
@@ -775,7 +824,9 @@ class FFPAAttnBwdDQSm90SplitD:
         # ── Push (Q_{d_inner}, K_{d_inner}) pairs for WG1 Phase A ──
         # LSE piggybacks on last Q chunk (extra_tx_count on the corresponding acquire).
         for d_inner in cutlass.range_constexpr(self.num_d_inner):
-          gQ_d = cute.local_tile(mQ_cur, (self.tile_m, self.d_chunk), (None, d_inner))
+          gQ_d = cute.local_tile(
+            mQ_cur, (self.tile_m, self.d_chunk), (None, d_inner)
+          )
           load_Q_d, _, _ = copy_utils.tma_get_copy_fn(
             tma_atom_Q,
             0,
@@ -805,7 +856,9 @@ class FFPAAttnBwdDQSm90SplitD:
           did_produce_A = Boolean(True)
           producer_state_QdO.advance()
 
-          gK_d = cute.local_tile(mK_cur, (self.tile_n, self.d_chunk), (None, d_inner))
+          gK_d = cute.local_tile(
+            mK_cur, (self.tile_n, self.d_chunk), (None, d_inner)
+          )
           load_K_d, _, _ = copy_utils.tma_get_copy_fn(
             tma_atom_K,
             0,
@@ -826,7 +879,9 @@ class FFPAAttnBwdDQSm90SplitD:
         # ── Push (dO_{d_inner}, V_{d_inner}) pairs for WG2 Phase C ──
         # dPsum piggybacks on last dO chunk.
         for d_inner in cutlass.range_constexpr(self.num_d_inner):
-          gdO_d = cute.local_tile(mdO_cur, (self.tile_m, self.d_chunk), (None, d_inner))
+          gdO_d = cute.local_tile(
+            mdO_cur, (self.tile_m, self.d_chunk), (None, d_inner)
+          )
           load_dO_d, _, _ = copy_utils.tma_get_copy_fn(
             tma_atom_dO,
             0,
@@ -856,7 +911,9 @@ class FFPAAttnBwdDQSm90SplitD:
           did_produce_A = Boolean(True)
           producer_state_QdO.advance()
 
-          gV_d = cute.local_tile(mV_cur, (self.tile_n, self.d_chunk), (None, d_inner))
+          gV_d = cute.local_tile(
+            mV_cur, (self.tile_n, self.d_chunk), (None, d_inner)
+          )
           load_V_d, _, _ = copy_utils.tma_get_copy_fn(
             tma_atom_V,
             0,
@@ -977,14 +1034,20 @@ class FFPAAttnBwdDQSm90SplitD:
 
     # ── SdP fragments (WG1 uses Q from sA, K from sB) ──
     shape_mnk_SdP = (self.tile_m, self.tile_n, self.d_chunk)
-    _, tSrA, tSrB = sm90_utils.partition_fragment_ABC(wg_mma_SdP, shape_mnk_SdP, sA, sB, swap_AB=False)
+    _, tSrA, tSrB = sm90_utils.partition_fragment_ABC(
+      wg_mma_SdP, shape_mnk_SdP, sA, sB, swap_AB=False
+    )
 
     # ── dQ_half fragments (cooperative ①, WG1 front half) ──
     # A = sdS (K_MAJOR), B = sKt_front (MN_MAJOR after transpose). Shape (64, 128, 64).
     sKt_front_t = layout_utils.transpose_view(sKt_front)
     shape_mnk_dQ_half = (self.tile_m, self.dQ_n_half, self.tile_n)
-    acc_dQ_pass_0_front = cute.make_rmem_tensor(tiled_mma_dQ.partition_shape_C(shape_mnk_dQ_half[:2]), Float32)
-    acc_dQ_pass_1_front = cute.make_rmem_tensor(tiled_mma_dQ.partition_shape_C(shape_mnk_dQ_half[:2]), Float32)
+    acc_dQ_pass_0_front = cute.make_rmem_tensor(
+      tiled_mma_dQ.partition_shape_C(shape_mnk_dQ_half[:2]), Float32
+    )
+    acc_dQ_pass_1_front = cute.make_rmem_tensor(
+      tiled_mma_dQ.partition_shape_C(shape_mnk_dQ_half[:2]), Float32
+    )
     _, tDQrA, tDQrB_front = sm90_utils.partition_fragment_ABC(
       wg_mma_dQ, shape_mnk_dQ_half, sdS, sKt_front_t, swap_AB=False
     )
@@ -999,11 +1062,19 @@ class FFPAAttnBwdDQSm90SplitD:
     )
 
     # ── LSE per-thread row mapping ──
-    tLSEsLSE = layout_utils.mma_partition_C_vec(sLSE, thr_mma_SdP, expand_shape=self.tile_n, is_colvec=True)
+    tLSEsLSE = layout_utils.mma_partition_C_vec(
+      sLSE, thr_mma_SdP, expand_shape=self.tile_n, is_colvec=True
+    )
 
-    consumer_state_QdO = cutlass.pipeline.make_pipeline_state(cutlass.pipeline.PipelineUserType.Consumer, self.A_stage)
-    consumer_state_B = cutlass.pipeline.make_pipeline_state(cutlass.pipeline.PipelineUserType.Consumer, self.B_stage)
-    consumer_state_Kt = cutlass.pipeline.make_pipeline_state(cutlass.pipeline.PipelineUserType.Consumer, self.Kt_stage)
+    consumer_state_QdO = cutlass.pipeline.make_pipeline_state(
+      cutlass.pipeline.PipelineUserType.Consumer, self.A_stage
+    )
+    consumer_state_B = cutlass.pipeline.make_pipeline_state(
+      cutlass.pipeline.PipelineUserType.Consumer, self.B_stage
+    )
+    consumer_state_Kt = cutlass.pipeline.make_pipeline_state(
+      cutlass.pipeline.PipelineUserType.Consumer, self.Kt_stage
+    )
 
     # startup credit (common_err_kernel.md #2):
     cute.arch.barrier_arrive(
@@ -1018,7 +1089,9 @@ class FFPAAttnBwdDQSm90SplitD:
       m_block, head_idx, batch_idx, _ = work_tile.tile_idx
       seqlen = SeqlenInfoCls(batch_idx)
       n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block)
-      process_tile = const_expr(not self.is_varlen_k) or n_block_min < n_block_max
+      process_tile = const_expr(
+        not self.is_varlen_k
+      ) or n_block_min < n_block_max
 
       mask = AttentionMask(self.tile_m, self.tile_n, seqlen)
 
@@ -1129,11 +1202,17 @@ class FFPAAttnBwdDQSm90SplitD:
   ):
     p_stage = Int32(0)  # sP_fp32 / sdS single-buffered
 
-    acc_S = cute.make_rmem_tensor(tiled_mma_SdP.partition_shape_C(shape_mnk_SdP[:2]), Float32)
+    acc_S = cute.make_rmem_tensor(
+      tiled_mma_SdP.partition_shape_C(shape_mnk_SdP[:2]), Float32
+    )
     # ═══ Phase A: S = ΣQ_d @ K_d^T (num_d_inner WGMMA, real consume Q + K) ═══
     for d_inner in cutlass.range_constexpr(self.num_d_inner):
-      pipeline_QdO.consumer_wait(consumer_state_QdO, pipeline_QdO.consumer_try_wait(consumer_state_QdO))
-      pipeline_B.consumer_wait(consumer_state_B, pipeline_B.consumer_try_wait(consumer_state_B))
+      pipeline_QdO.consumer_wait(
+        consumer_state_QdO, pipeline_QdO.consumer_try_wait(consumer_state_QdO)
+      )
+      pipeline_B.consumer_wait(
+        consumer_state_B, pipeline_B.consumer_try_wait(consumer_state_B)
+      )
       gemm_w_idx(
         tiled_mma_SdP,
         acc_S,
@@ -1155,14 +1234,18 @@ class FFPAAttnBwdDQSm90SplitD:
 
     # ═══ Empty release: dO0..dO_{num_d_inner-1} (consumed by WG2 Phase C) ═══
     for _ in cutlass.range_constexpr(self.num_d_inner):
-      pipeline_QdO.consumer_wait(consumer_state_QdO, pipeline_QdO.consumer_try_wait(consumer_state_QdO))
+      pipeline_QdO.consumer_wait(
+        consumer_state_QdO, pipeline_QdO.consumer_try_wait(consumer_state_QdO)
+      )
       with cute.arch.elect_one():
         pipeline_QdO.consumer_release(consumer_state_QdO)
       consumer_state_QdO.advance()
 
     # ═══ Empty release: V0..V_{num_d_inner-1} (consumed by WG2 Phase C) ═══
     for _ in cutlass.range_constexpr(self.num_d_inner):
-      pipeline_B.consumer_wait(consumer_state_B, pipeline_B.consumer_try_wait(consumer_state_B))
+      pipeline_B.consumer_wait(
+        consumer_state_B, pipeline_B.consumer_try_wait(consumer_state_B)
+      )
       with cute.arch.elect_one():
         pipeline_B.consumer_release(consumer_state_B)
       consumer_state_B.advance()
@@ -1173,7 +1256,9 @@ class FFPAAttnBwdDQSm90SplitD:
     for r in cutlass.range_constexpr(cute.size(acc_S_mn, mode=[0])):
       lse_val = tLSErLSE[r]
       for c in cutlass.range(cute.size(acc_S_mn, mode=[1]), unroll_full=True):
-        acc_S_mn[r, c] = cute.math.exp2(acc_S_mn[r, c] * softmax_scale_log2 - lse_val, fastmath=True)
+        acc_S_mn[r, c] = cute.math.exp2(
+          acc_S_mn[r, c] * softmax_scale_log2 - lse_val, fastmath=True
+        )
 
     # ═══ Cross-WG handshake: wait WG2 done with prior sP_fp32, then write ═══
     cute.arch.barrier(
@@ -1201,7 +1286,9 @@ class FFPAAttnBwdDQSm90SplitD:
     # Each d_pass consumes one pipeline_Kt stage; both WGs cooperatively release each
     # stage (8-warp consumer group, elect_one per WG).
     for d_pass in cutlass.range_constexpr(self.num_d_passes):
-      pipeline_Kt.consumer_wait(consumer_state_Kt, pipeline_Kt.consumer_try_wait(consumer_state_Kt))
+      pipeline_Kt.consumer_wait(
+        consumer_state_Kt, pipeline_Kt.consumer_try_wait(consumer_state_Kt)
+      )
       if cutlass.const_expr(d_pass == 0):
         gemm_w_idx(
           tiled_mma_dQ,
@@ -1274,14 +1361,20 @@ class FFPAAttnBwdDQSm90SplitD:
 
     # ── SdP fragments (WG2 uses dO from sA, V from sB) ──
     shape_mnk_SdP = (self.tile_m, self.tile_n, self.d_chunk)
-    _, tSrA, tSrB = sm90_utils.partition_fragment_ABC(wg_mma_SdP, shape_mnk_SdP, sA, sB, swap_AB=False)
+    _, tSrA, tSrB = sm90_utils.partition_fragment_ABC(
+      wg_mma_SdP, shape_mnk_SdP, sA, sB, swap_AB=False
+    )
 
     # ── dQ_half fragments (cooperative ①, WG2 back half) ──
     # A = sdS (K_MAJOR), B = sKt_back (MN_MAJOR after transpose). Shape (64, 128, 64).
     sKt_back_t = layout_utils.transpose_view(sKt_back)
     shape_mnk_dQ_half = (self.tile_m, self.dQ_n_half, self.tile_n)
-    acc_dQ_pass_0_back = cute.make_rmem_tensor(tiled_mma_dQ.partition_shape_C(shape_mnk_dQ_half[:2]), Float32)
-    acc_dQ_pass_1_back = cute.make_rmem_tensor(tiled_mma_dQ.partition_shape_C(shape_mnk_dQ_half[:2]), Float32)
+    acc_dQ_pass_0_back = cute.make_rmem_tensor(
+      tiled_mma_dQ.partition_shape_C(shape_mnk_dQ_half[:2]), Float32
+    )
+    acc_dQ_pass_1_back = cute.make_rmem_tensor(
+      tiled_mma_dQ.partition_shape_C(shape_mnk_dQ_half[:2]), Float32
+    )
     _, tDQrA, tDQrB_back = sm90_utils.partition_fragment_ABC(
       wg_mma_dQ, shape_mnk_dQ_half, sdS, sKt_back_t, swap_AB=False
     )
@@ -1299,7 +1392,9 @@ class FFPAAttnBwdDQSm90SplitD:
     tSsP_fp32_partition = thr_mma_SdP.partition_C(sP_fp32)
 
     # ── dPsum per-thread row mapping ──
-    tLSEsdPsum = layout_utils.mma_partition_C_vec(sdPsum, thr_mma_SdP, expand_shape=self.tile_n, is_colvec=True)
+    tLSEsdPsum = layout_utils.mma_partition_C_vec(
+      sdPsum, thr_mma_SdP, expand_shape=self.tile_n, is_colvec=True
+    )
 
     # startup: pre-arrive PEmpty so WG1's first barrier(PEmpty, 256) finds
     # 128 arrivals from WG2 and only waits for WG1's own 128. (common_err_kernel #2)
@@ -1308,9 +1403,15 @@ class FFPAAttnBwdDQSm90SplitD:
       number_of_threads=self.num_mma_threads,  # 256
     )
 
-    consumer_state_QdO = cutlass.pipeline.make_pipeline_state(cutlass.pipeline.PipelineUserType.Consumer, self.A_stage)
-    consumer_state_B = cutlass.pipeline.make_pipeline_state(cutlass.pipeline.PipelineUserType.Consumer, self.B_stage)
-    consumer_state_Kt = cutlass.pipeline.make_pipeline_state(cutlass.pipeline.PipelineUserType.Consumer, self.Kt_stage)
+    consumer_state_QdO = cutlass.pipeline.make_pipeline_state(
+      cutlass.pipeline.PipelineUserType.Consumer, self.A_stage
+    )
+    consumer_state_B = cutlass.pipeline.make_pipeline_state(
+      cutlass.pipeline.PipelineUserType.Consumer, self.B_stage
+    )
+    consumer_state_Kt = cutlass.pipeline.make_pipeline_state(
+      cutlass.pipeline.PipelineUserType.Consumer, self.Kt_stage
+    )
 
     tile_scheduler = TileSchedulerCls()
     work_tile = tile_scheduler.initial_work_tile_info()
@@ -1320,7 +1421,9 @@ class FFPAAttnBwdDQSm90SplitD:
       seqlen = SeqlenInfoCls(batch_idx)
       n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block)
 
-      process_tile = const_expr(not self.is_varlen_k) or n_block_min < n_block_max
+      process_tile = const_expr(
+        not self.is_varlen_k
+      ) or n_block_min < n_block_max
 
       mask = AttentionMask(self.tile_m, self.tile_n, seqlen)
 
@@ -1446,23 +1549,33 @@ class FFPAAttnBwdDQSm90SplitD:
 
     # ═══ Empty release: Q0..Q_{num_d_inner-1} (consumed by WG1 Phase A) ═══
     for _ in cutlass.range_constexpr(self.num_d_inner):
-      pipeline_QdO.consumer_wait(consumer_state_QdO, pipeline_QdO.consumer_try_wait(consumer_state_QdO))
+      pipeline_QdO.consumer_wait(
+        consumer_state_QdO, pipeline_QdO.consumer_try_wait(consumer_state_QdO)
+      )
       with cute.arch.elect_one():
         pipeline_QdO.consumer_release(consumer_state_QdO)
       consumer_state_QdO.advance()
 
     # ═══ Empty release: K0..K_{num_d_inner-1} (consumed by WG1 Phase A) ═══
     for _ in cutlass.range_constexpr(self.num_d_inner):
-      pipeline_B.consumer_wait(consumer_state_B, pipeline_B.consumer_try_wait(consumer_state_B))
+      pipeline_B.consumer_wait(
+        consumer_state_B, pipeline_B.consumer_try_wait(consumer_state_B)
+      )
       with cute.arch.elect_one():
         pipeline_B.consumer_release(consumer_state_B)
       consumer_state_B.advance()
 
     # ═══ Phase C: dP = ΣdO_d @ V_d^T (num_d_inner WGMMA, real consume dO + V) ═══
-    acc_dP = cute.make_rmem_tensor(tiled_mma_SdP.partition_shape_C(shape_mnk_SdP[:2]), Float32)
+    acc_dP = cute.make_rmem_tensor(
+      tiled_mma_SdP.partition_shape_C(shape_mnk_SdP[:2]), Float32
+    )
     for d_inner in cutlass.range_constexpr(self.num_d_inner):
-      pipeline_QdO.consumer_wait(consumer_state_QdO, pipeline_QdO.consumer_try_wait(consumer_state_QdO))
-      pipeline_B.consumer_wait(consumer_state_B, pipeline_B.consumer_try_wait(consumer_state_B))
+      pipeline_QdO.consumer_wait(
+        consumer_state_QdO, pipeline_QdO.consumer_try_wait(consumer_state_QdO)
+      )
+      pipeline_B.consumer_wait(
+        consumer_state_B, pipeline_B.consumer_try_wait(consumer_state_B)
+      )
       self.zero_kv_tail_smem_wg2(
         smem=sB,
         stage_idx=consumer_state_B.index,
@@ -1482,7 +1595,9 @@ class FFPAAttnBwdDQSm90SplitD:
         wg_wait=0,
       )
       if cutlass.const_expr(d_inner == self.num_d_inner - 1):
-        tLSErdPsum = copy_utils.load_s2r(tLSEsdPsum[None, consumer_state_QdO.index])
+        tLSErdPsum = copy_utils.load_s2r(
+          tLSEsdPsum[None, consumer_state_QdO.index]
+        )
       with cute.arch.elect_one():
         pipeline_QdO.consumer_release(consumer_state_QdO)
       with cute.arch.elect_one():
@@ -1495,13 +1610,17 @@ class FFPAAttnBwdDQSm90SplitD:
       barrier_id=int(NamedBarrierBwd.PFull),
       number_of_threads=self.num_mma_threads,  # 256
     )
-    tdSrP_fp32 = copy_utils.load_s2r(tSsP_fp32_partition[None, None, None, p_stage])
+    tdSrP_fp32 = copy_utils.load_s2r(
+      tSsP_fp32_partition[None, None, None, p_stage]
+    )
     tdSrP_mn = layout_utils.reshape_acc_to_mn(tdSrP_fp32, transpose=False)
     acc_dP_mn = layout_utils.reshape_acc_to_mn(acc_dP, transpose=False)
     for r in cutlass.range_constexpr(cute.size(acc_dP_mn, mode=[0])):
       dpsum_val = tLSErdPsum[r]
       for c in cutlass.range(cute.size(acc_dP_mn, mode=[1]), unroll_full=True):
-        acc_dP_mn[r, c] = (tdSrP_mn[r, c] * (acc_dP_mn[r, c] - dpsum_val) * softmax_scale)
+        acc_dP_mn[
+          r,
+          c] = (tdSrP_mn[r, c] * (acc_dP_mn[r, c] - dpsum_val) * softmax_scale)
 
     # ═══ Wait sdS-empty (from WG1 + WG2 prior round acks). For first n_block, WG1's
     # startup pre-arrive provides the missing 128 credit so this sync doesn't deadlock.
@@ -1533,7 +1652,9 @@ class FFPAAttnBwdDQSm90SplitD:
     # ═══ Inner d_pass loop: cooperative Phase E_back ═══
     # WG2 owns acc_dQ_pass[d]_back; reads sdS (full tile) + sKt_back[stage] (half).
     for d_pass in cutlass.range_constexpr(self.num_d_passes):
-      pipeline_Kt.consumer_wait(consumer_state_Kt, pipeline_Kt.consumer_try_wait(consumer_state_Kt))
+      pipeline_Kt.consumer_wait(
+        consumer_state_Kt, pipeline_Kt.consumer_try_wait(consumer_state_Kt)
+      )
       # Zero Kt back-half tail rows for masked seqlen — only need once per Kt push,
       # but doing it per-stage keeps logic simple and is idempotent.
       self.zero_kv_tail_smem_wg2(
@@ -1598,7 +1719,9 @@ class FFPAAttnBwdDQSm90SplitD:
     valid_rows = seqlen.seqlen_k - n_block * self.tile_n
     if valid_rows < self.tile_n:
       tail_elems = (self.tile_n - valid_rows) * d_chunk_eff
-      for linear_idx in cutlass.range(tidx, tail_elems, self.num_threads_per_warp_group, unroll=1):
+      for linear_idx in cutlass.range(
+        tidx, tail_elems, self.num_threads_per_warp_group, unroll=1
+      ):
         row_offset = linear_idx // d_chunk_eff
         col = linear_idx - row_offset * d_chunk_eff
         smem[valid_rows + row_offset, col, stage_idx] = smem.element_type(0.0)
@@ -1644,7 +1767,9 @@ class FFPAAttnBwdDQSm90SplitD:
     # CTA-absolute warp positions: producer=warp 0..3, WG1=warp 4..7, WG2=warp 8..11.
     tma_warp = const_expr(4 if is_front_wg else 8)
 
-    mdQ_cur = seqlen.offset_batch_Q(mdQ_half, batch_idx, dim=3, ragged=self.varlen_q)[None, None, head_idx]
+    mdQ_cur = seqlen.offset_batch_Q(
+      mdQ_half, batch_idx, dim=3, ragged=self.varlen_q
+    )[None, None, head_idx]
 
     copy_dQ_r2s, _, _ = copy_utils.get_smem_store_C(
       tiled_mma_dQ,
@@ -1688,7 +1813,10 @@ class FFPAAttnBwdDQSm90SplitD:
       cute.arch.fence_view_async_shared()
       # WG-internal 128-thread fence (different barrier IDs per WG so they don't collide).
       cute.arch.barrier(
-        barrier_id=int(NamedBarrierBwd.WarpSchedulerWG2 if is_front_wg else NamedBarrierBwd.WarpSchedulerWG3),
+        barrier_id=int(
+          NamedBarrierBwd.WarpSchedulerWG2 if is_front_wg else NamedBarrierBwd.
+          WarpSchedulerWG3
+        ),
         number_of_threads=self.num_threads_per_warp_group,
       )
       if warp_idx == tma_warp:
@@ -1697,7 +1825,10 @@ class FFPAAttnBwdDQSm90SplitD:
       # Wait for THIS d_pass's TMA before the next d_pass's R2S overwrites sEpi_half.
       cute.arch.cp_async_bulk_wait_group(0, read=True)
       cute.arch.barrier(
-        barrier_id=int(NamedBarrierBwd.WarpSchedulerWG2 if is_front_wg else NamedBarrierBwd.WarpSchedulerWG3),
+        barrier_id=int(
+          NamedBarrierBwd.WarpSchedulerWG2 if is_front_wg else NamedBarrierBwd.
+          WarpSchedulerWG3
+        ),
         number_of_threads=self.num_threads_per_warp_group,
       )
 

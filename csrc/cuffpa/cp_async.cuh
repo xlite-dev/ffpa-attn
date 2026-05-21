@@ -50,7 +50,8 @@ __device__ __forceinline__ void cp_async(uint32_t smem_ptr, const T* gmem_ptr) {
 // cp.async. Needed for seqlen boundary handling where rows beyond
 // ``QKV_seqlen`` must appear as zero in shared memory.
 template <const int kBytes = 16, typename T = half>
-__device__ __forceinline__ void cp_async_zfill(uint32_t smem_ptr, const T* gmem_ptr,
+__device__ __forceinline__ void cp_async_zfill(uint32_t smem_ptr,
+                                               const T* gmem_ptr,
                                                bool row_valid) {
   static_assert(kBytes == 16 || kBytes == 8);
   const int copy_bytes = row_valid ? kBytes : 0;
@@ -70,7 +71,8 @@ __device__ __forceinline__ void cp_async_zfill(uint32_t smem_ptr, const T* gmem_
 // e.g ldg_sync_128b<half, uint32_t>(...);
 // Source pointer is const: 128-bit load never writes to gmem.
 template <typename T0, typename T1>
-__device__ __forceinline__ void ldg_sync_128b(T0* mem_dst_ptr, const T1* gmem_src_ptr) {
+__device__ __forceinline__ void ldg_sync_128b(T0* mem_dst_ptr,
+                                              const T1* gmem_src_ptr) {
   using _128b_t = uint4;
   _128b_t* dst_128b_ptr = reinterpret_cast<_128b_t*>(mem_dst_ptr);
   const _128b_t* src_128b_ptr = reinterpret_cast<const _128b_t*>(gmem_src_ptr);
@@ -79,7 +81,8 @@ __device__ __forceinline__ void ldg_sync_128b(T0* mem_dst_ptr, const T1* gmem_sr
 
 // e.g stg_sync_128b<half, uint32_t>(...);
 template <typename T0, typename T1>
-__device__ __forceinline__ void stg_sync_128b(T0* gmem_dst_ptr, T1* mem_src_ptr) {
+__device__ __forceinline__ void stg_sync_128b(T0* gmem_dst_ptr,
+                                              T1* mem_src_ptr) {
   using _128b_t = uint4;
   _128b_t* dst_128b_ptr = reinterpret_cast<_128b_t*>(gmem_dst_ptr);
   _128b_t* src_128b_ptr = reinterpret_cast<_128b_t*>(mem_src_ptr);
