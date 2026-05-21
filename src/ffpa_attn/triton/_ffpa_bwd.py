@@ -712,16 +712,18 @@ def _ffpa_bwd_dkdv(
               grad_bias_ptrs, grad_bias, sem="relaxed", mask=offs_n < seqlen_k
             )
         elif GRAD_BIAS_NEEDS_REDUCTION:
-          grad_bias_ptrs = GradAttnBias + offs_qm[:,
-                                                  None] * stride_gbm + offs_n[
-                                                    None, :] * stride_gbn
+          grad_bias_ptrs = (
+            GradAttnBias + offs_qm[:, None] * stride_gbm +
+            offs_n[None, :] * stride_gbn
+          )
           tl.atomic_add(
             grad_bias_ptrs, dBias, sem="relaxed", mask=grad_bias_mask
           )
         else:
-          grad_bias_ptrs = GradAttnBias + offs_qm[:,
-                                                  None] * stride_gbm + offs_n[
-                                                    None, :] * stride_gbn
+          grad_bias_ptrs = (
+            GradAttnBias + offs_qm[:, None] * stride_gbm +
+            offs_n[None, :] * stride_gbn
+          )
           tl.store(grad_bias_ptrs, dBias, mask=grad_bias_mask)
         dS = (dBias * softmax_scale).to(DTYPE)
       else:
