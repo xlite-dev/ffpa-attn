@@ -26,6 +26,7 @@ from .aten import (
 from .cutedsl import (
   _ffpa_attn_forward_cutedsl,
   _ffpa_attn_backward_cutedsl,
+  _ffpa_attn_varlen_cutedsl,
 )  # D == 512 SM90
 
 if TYPE_CHECKING:
@@ -836,7 +837,6 @@ def _ffpa_varlen_apply(
   return_lse,
   **kwargs,
 ):
-  from .cutedsl import _ffpa_attn_varlen_cutedsl
   return _ffpa_attn_varlen_cutedsl(
     q,
     k,
