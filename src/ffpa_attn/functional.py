@@ -26,7 +26,13 @@ from .aten import (
 from .cutedsl import (
   _ffpa_attn_forward_cutedsl,
   _ffpa_attn_backward_cutedsl,
+  _ffpa_attn_varlen_cutedsl,
 )  # D == 512 SM90
+
+try:
+  from .cuda import _ffpa_attn_forward_cuda  # D > 256
+except Exception:
+  _ffpa_attn_forward_cuda = None
 
 if TYPE_CHECKING:
   from typing import Tuple, Union, Optional  # noqa: F401
@@ -60,26 +66,54 @@ def _normalize_grad_kv_storage_dtype(dtype: torch.dtype | str | None) -> torch.d
 
 @dataclass
 class Backend:
+  """Base backend configuration.
+
+  :ivar name: Backend identifier (e.g. "triton", "cutedsl").
+  :ivar forward: Whether this instance configures the forward pass.  ``None``
+      (default) means "not explicitly set"; resolved by :meth:`__post_init__`.
+  :ivar backward: Whether this instance configures the backward pass.
+      Same ``None`` semantics as *forward*.
+  """
   name: str
-  forward: bool = False
-  backward: bool = False
+  forward: bool | None = None
+  backward: bool | None = None
 
   def __post_init__(self) -> None:
-    assert self.forward != self.backward, f"{self.name} backend must select exactly one direction"
+    if self.forward is None and self.backward is None:
+      self.forward = True
+      self.backward = True
+    elif self.forward is None:
+      self.forward = not self.backward
+    elif self.backward is None:
+      self.backward = not self.forward
 
 
 @dataclass
 class SDPABackend(Backend):
+  """PyTorch native ``scaled_dot_product_attention`` backend.
+
+  Forward always short-circuits via :meth:`FFPAAttnMeta.fallback`.
+  When used as ``backward_backend`` it delegates to
+  :func:`_aten_efficient_attn_backward`.
+
+  :ivar high_precision_grad: When ``True`` request higher numerical
+      precision for the backward pass (passed through to aten).
+  """
   name: str = "sdpa"
   high_precision_grad: bool = False
 
   def __post_init__(self) -> None:
     super().__post_init__()
-    assert not self.forward, "sdpa backend does not support forward"
 
 
 @dataclass
 class CUDABackend(Backend):
+  """Hand-written CUDA forward-only backend.
+
+  :ivar acc: MMA accumulator precision (``"f16"`` or ``"f32"``).
+  :ivar stages: Pipeline stages for the CUDA kernel (3 on Ampere/Ada,
+      4 on Hopper+).
+  """
   name: str = "cuda"
   acc: str = "f32"
   stages: int = 4 if _is_hopper_or_later() else 3
@@ -96,6 +130,20 @@ class CUDABackend(Backend):
 
 @dataclass
 class TritonBackend(Backend):
+  """Triton forward + backward backend (default).
+
+  :ivar autotune: Enable Triton autotuning for kernel parameters.
+  :ivar autotune_mode: Autotune search granularity (``"fast"`` or ``"max"``).
+  :ivar enable_tma: Enable experimental SM90+ TMA hardware acceleration.
+  :ivar enable_ws: Force warp-specialized configs (requires *enable_tma*).
+  :ivar persist_dkdv: Keep ``dK``/``dV`` accumulator in fp32 across
+      backward invocations (requires *enable_tma* and ``backward=True``).
+  :ivar split_launch: Issue separate backward launches for ``dKdV`` and
+      ``dQ`` for finer-grained scheduling.
+  :ivar preprocess_d_chunk: Split the ``d_chunk`` preprocess across tiles.
+  :ivar grad_kv_storage_dtype: Optional ``torch.float32`` / ``torch.float16``
+      storage dtype for ``dK``/``dV``, workaround for causal bf16 precision.
+  """
   name: str = "triton"
   autotune: bool = False
   autotune_mode: str = "fast"
@@ -120,8 +168,12 @@ class TritonBackend(Backend):
 
 @dataclass
 class CuTeDSLBackend(Backend):
+  """CuTeDSL SM90-specialized backend (Hopper only, D=512, bf16 training).
+
+  No additional configuration knobs — kernel parameters are hard-coded
+  for the SplitD ``tile_m=64, tile_n=128`` pipeline.
+  """
   name: str = "cutedsl"
-  pass
 
 
 @dataclass
@@ -147,22 +199,7 @@ def _resolve_backend_pair(
   assert forward_backend.forward, "forward_backend must be configured with forward=True"
   assert backward_backend.backward, "backward_backend must be configured with backward=True"
 
-  # CuTeDSL is currently modeled as its own backend family rather than as a
-  # generic FFPA forward implementation that can freely mix with Triton/SDPA
-  # backward. Keep the pair invariant here so unsupported hybrid combinations
-  # fail immediately at metadata construction time instead of leaking deeper
-  # into dispatch or autograd.
-  if forward_backend.name == "cutedsl" or backward_backend.name == "cutedsl":
-    assert forward_backend.name == "cutedsl" and backward_backend.name == "cutedsl", \
-      "cutedsl forward and backward must be selected as a pair"
-
   return forward_backend, backward_backend
-
-
-_CUDA_BACKEND_LOADED = False
-_CUDA_BACKEND_IMPORT_ERROR: Exception | None = None
-_CUDA_FWD_AVAILABLE = False
-_CUDA_FORWARD_IMPL = None
 
 
 def _reserve_large_d_dropout_rng(
@@ -236,56 +273,6 @@ def _validate_attn_mask_shape(
       )
 
 
-def _load_cuda_backend() -> None:
-  global _CUDA_BACKEND_LOADED
-  global _CUDA_BACKEND_IMPORT_ERROR
-  global _CUDA_FWD_AVAILABLE
-  global _CUDA_FORWARD_IMPL
-
-  if _CUDA_BACKEND_LOADED:
-    return
-
-  _CUDA_BACKEND_LOADED = True
-  try:
-    from . import cuda as cuda_backend
-  except Exception as exc:
-    _CUDA_BACKEND_IMPORT_ERROR = exc
-    return
-
-  _CUDA_FORWARD_IMPL = cuda_backend._ffpa_attn_forward_cuda
-  _CUDA_FWD_AVAILABLE = bool(getattr(cuda_backend, "CUDA_FWD_AVAILABLE", False))
-
-
-def cuda_forward_available() -> bool:
-  _load_cuda_backend()
-  return _CUDA_FWD_AVAILABLE
-
-
-def cuda_backward_available() -> bool:
-  return False
-
-
-def _require_cuda_forward_impl():
-  _load_cuda_backend()
-  if _CUDA_FWD_AVAILABLE and _CUDA_FORWARD_IMPL is not None:
-    return _CUDA_FORWARD_IMPL
-
-  message = (
-    "ffpa_attn_func: forward_backend='cuda' requested but the CUDA forward backend is unavailable. "
-    "Rebuild with ENABLE_FFPA_CUDA_IMPL=1 to enable it."
-  )
-  if _CUDA_BACKEND_IMPORT_ERROR is not None:
-    message = f"{message} Original import error: {_CUDA_BACKEND_IMPORT_ERROR}"
-  raise RuntimeError(message)
-
-
-def _require_cuda_backward_impl():
-  raise RuntimeError(
-    "ffpa_attn_func: backward_backend='cuda' has been removed from the active backend. "
-    "Use backward_backend='triton' or backward_backend='sdpa'."
-  )
-
-
 @dataclass
 class FFPAAttnMeta:
   """Non-tensor FFPA options passed through the autograd Function."""
@@ -298,6 +285,44 @@ class FFPAAttnMeta:
     self.forward_meta, self.backward_meta = _resolve_backend_pair(self.forward_meta, self.backward_meta)
 
   @classmethod
+  def from_kwargs(cls, **kwargs) -> FFPAAttnMeta:
+    """Create a validated ``FFPAAttnMeta`` from ``ffpa_attn_func`` kwargs.
+
+    Pops ``backend``, ``forward_backend``, and ``backward_backend`` from
+    ``kwargs``.  The ``backend`` shorthand (str or ``Backend`` instance)
+    auto-fills both ``forward_backend`` and ``backward_backend`` when
+    neither is explicitly set.  Priority: explicit ``forward_backend`` /
+    ``backward_backend`` > ``backend`` > default Triton.
+
+    Raises ``TypeError`` for any unexpected keyword arguments.
+    """
+    backend = kwargs.pop("backend", None)
+    forward_backend = kwargs.pop("forward_backend", None)
+    backward_backend = kwargs.pop("backward_backend", None)
+
+    if kwargs:
+      unexpected = ", ".join(sorted(kwargs))
+      raise TypeError(f"ffpa_attn_func() got unexpected keyword argument(s): {unexpected}")
+
+    if forward_backend is None and backward_backend is None and backend is not None:
+      if isinstance(backend, str):
+        _BACKEND_MAP = {"cuda": CUDABackend, "triton": TritonBackend, "cutedsl": CuTeDSLBackend, "sdpa": SDPABackend}
+        cls_name = _BACKEND_MAP.get(backend)
+        if cls_name is None:
+          raise ValueError(f"ffpa_attn_func: backend must be 'cuda', 'triton', or 'cutedsl', got {backend!r}")
+        backend = cls_name()
+      if not isinstance(backend, Backend):
+        raise TypeError(f"ffpa_attn_func: backend must be a str or Backend instance, got {type(backend).__name__}")
+      forward_backend = backend
+      backward_backend = backend
+
+    forward_backend, backward_backend = _resolve_backend_pair(forward_backend, backward_backend)
+    return cls(
+      forward_meta=forward_backend,
+      backward_meta=backward_backend,
+    )
+
+  @classmethod
   def from_backends(
     cls,
     forward_backend: Backend | None = None,
@@ -305,7 +330,6 @@ class FFPAAttnMeta:
   ) -> FFPAAttnMeta:
     forward_backend, backward_backend = _resolve_backend_pair(forward_backend, backward_backend)
     return cls(
-      attn_meta=AttentionMeta(),
       forward_meta=forward_backend,
       backward_meta=backward_backend,
     )
@@ -318,7 +342,48 @@ class FFPAAttnMeta:
   ) -> FFPAAttnMeta:
     return cls.from_backends(forward_backend, backward_backend)
 
-  def normalize(
+  def fallback(
+    self,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    attn_mask: torch.Tensor | None,
+    dropout_p: float,
+  ) -> bool:
+    """Return whether the public API should delegate to SDPA directly.
+
+    This is a method on ``FFPAAttnMeta`` so callers do not need to
+    re-derive the backend name or hardware check outside the meta object.
+    """
+    assert query.dim() == 4, "Expected query shape [B, Nh_q, Nq, D]"
+    assert key.dim() == 4, "Expected key shape [B, Nh_kv, Nkv, D]"
+    B, Nh_q, Nq, D = query.shape  # noqa: F841
+    _, Nh_kv, Nkv, D_k = key.shape
+    assert D == D_k, "Query and key must have the same head dimension"
+
+    # sdpa forward always short-circuits to the native aten path regardless
+    # of backward_meta. _FFPAAttnFunc has no general dispatch for sdpa-based
+    # forward, and aten flash-attention only handles D<=256.  Letting sdpa
+    # forward pass through fallback keeps the public API layer responsible for
+    # the full sdpa forward+backward path instead of routing through the
+    # incomplete Function dispatch below.
+    if self.forward_meta.name == "sdpa":
+      return True
+
+    if self.forward_meta.name == "cutedsl":
+      from .cutedsl import cutedsl_forward_available
+      cutedsl_hw_unsupported = D != 512 or not cutedsl_forward_available(query.device)
+      return cutedsl_hw_unsupported
+
+    return any([
+      D <= 256,
+      D > 1024,
+      attn_mask is not None and self.forward_meta.name == "cutedsl",
+      dropout_p > 0.0 and self.forward_meta.name == "cutedsl",
+      (8 <= Nq < 512),
+      Nkv < 512,
+    ])
+
+  def normalize_inputs(
     self,
     query: torch.Tensor,
     key: torch.Tensor,
@@ -464,7 +529,7 @@ class FFPAAttnMeta:
       attn_bias = attn_bias.contiguous()
     return attn_bias
 
-  def normalize_inputs(
+  def normalize(
     self,
     query: torch.Tensor,
     key: torch.Tensor,
@@ -489,7 +554,7 @@ class FFPAAttnMeta:
       dispatch state; the remaining values are passed directly to
       :class:`FFPAAttnFunc` so autograd sees all differentiable inputs.
     """
-    self.normalize(query, key, value, attn_mask, dropout_p, is_causal, scale, enable_gqa)
+    self.normalize_inputs(query, key, value, attn_mask, dropout_p, is_causal, scale, enable_gqa)
     attn_bias = self.normalize_attn_mask(query, key, attn_mask)
     return self, query, key, value, attn_bias
 
@@ -537,9 +602,9 @@ class _FFPAAttnFunc(torch.autograd.Function):
       )
     elif isinstance(meta.forward_meta, CUDABackend):
       forward_meta = meta.forward_meta
+      assert _ffpa_attn_forward_cuda is not None, "CUDA backend is not available."
       rng_state = _reserve_large_d_dropout_rng(q, k, meta.attn_meta.dropout_p)
-      cuda_forward_impl = _require_cuda_forward_impl()
-      O, lse = cuda_forward_impl(
+      O, lse = _ffpa_attn_forward_cuda(
         q,
         k,
         v,
@@ -709,8 +774,10 @@ class _FFPAAttnFunc(torch.autograd.Function):
 #
 #   forward_backend   │  backward_backend
 #   ──────────────────┼───────────────────
+#   sdpa              │  (n/a — always short-circuits via meta.fallback())
 #   cuda              │  triton, sdpa
 #   triton            │  triton, sdpa
+#   cutedsl           │  cutedsl, triton, sdpa
 #
 # ``register_autograd`` binds a forward op to exactly one backward formula.
 # Hard-coding one backward (e.g. always Triton) would silently ignore the
@@ -745,9 +812,54 @@ class FFPAAttnFunc:
     return _ffpa_apply(*args, **kwargs)
 
 
+@torch._dynamo.disable
+def _ffpa_varlen_apply(
+  q,
+  k,
+  v,
+  cu_seqlens_q,
+  cu_seqlens_k,
+  max_seqlen_q,
+  max_seqlen_k,
+  dropout_p,
+  softmax_scale,
+  causal,
+  enable_gqa,
+  return_lse,
+  **kwargs,
+):
+  return _ffpa_attn_varlen_cutedsl(
+    q,
+    k,
+    v,
+    cu_seqlens_q,
+    cu_seqlens_k,
+    max_seqlen_q,
+    max_seqlen_k,
+    dropout_p=dropout_p,
+    softmax_scale=softmax_scale,
+    causal=causal,
+    enable_gqa=enable_gqa,
+    return_lse=return_lse,
+    kwargs=kwargs,
+  )
+
+
+class FFPAAttnVarlenFunc:
+  """Public-facing varlen autograd Function wrapper.
+
+  Follows the same pattern as :class:`FFPAAttnFunc`: delegates through
+  :func:`_ffpa_varlen_apply` which is guarded by ``torch._dynamo.disable``
+  so ``torch.compile`` leaves the autograd boundary intact.
+  """
+
+  @classmethod
+  def apply(cls, *args, **kwargs):
+    return _ffpa_varlen_apply(*args, **kwargs)
+
+
 __all__ = [
   "FFPAAttnMeta",
   "FFPAAttnFunc",
-  "cuda_forward_available",
-  "cuda_backward_available",
+  "FFPAAttnVarlenFunc",
 ]

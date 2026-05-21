@@ -13,9 +13,9 @@
 #   - sm90_col_to_r2p_idx (SM90 MMA column-to-R2P coordinate transform)
 #
 # AttentionMask.apply_mask call sites in this repo:
-#   - _ffpa_fwd_d512_sm90.py:982   (seqlen-only / causal / local / mask_mod / PackGQA)
-#   - _ffpa_dq_d512_sm90.py:1027, 1330   (seqlen-only / causal)
-#   - _ffpa_dkdv_d512_sm90.py:982, 1233  (seqlen-only / causal)
+#   - _fwd_d512_sm90.py:982   (seqlen-only / causal / local / mask_mod / PackGQA)
+#   - _dq_d512_sm90.py:1027, 1330   (seqlen-only / causal)
+#   - _dkdv_d512_sm90.py:982, 1233  (seqlen-only / causal)
 #
 # swap_AB=True branch of apply_mask is reserved for a future SM90 bwd SdP swap_AB path
 # (no current call sites). See `swap_AB` field below and the swap_AB arm inside apply_mask.

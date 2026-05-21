@@ -81,12 +81,13 @@ Runnable examples are provided under [`examples`](./examples). The performance b
 
 ## 🤖 Backends
 
-FFPA supports multiple backends for the forward and backward pass, including: [`CUDA`](./examples/) (forward only), [`Triton`](./examples/), and [`CuTeDSL`](./examples/). The CuTeDSL backend is currently in early stage and has some constraints (e.g., D=512 only), but it can achieve up to `427🎉` TFLOPS on H200! We will continue to optimize the CuTeDSL backend in the future.
+FFPA supports multiple backends for the forward and backward pass, including: [`SDPA`](./examples/) (baseline), [`CUDA`](./examples/) (forward only), [`Triton`](./examples/), and [`CuTeDSL`](./examples/). The CuTeDSL backend is currently in early stage and has some constraints (e.g., D=512 only), but it can achieve up to `427🎉` TFLOPS on H200! Stay tuned for future updates.
 
 <div align='center' markdown="1">
 
 |Backend|Arch|Fwd|Bwd|Headdim|Autotune|Speedup|Recommend|
 |:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+|SDPA|Ampere+|✔|✔|All|❌|**1.0x**|Ampere+|
 |CUDA|Ampere+|✔|❌|320~1024|❌|**1.5x~3x**🎉|Ampere, Ada|
 |Triton|Ampere+|✔|✔|320~1024|✔|**1.5x~3x**🎉|Ampere+|
 |CuTeDSL|Hopper|✔|✔|512|❌|**3x~6x**🎉|Hopper|
@@ -95,13 +96,12 @@ FFPA supports multiple backends for the forward and backward pass, including: [`
 
 </div>
 
-How to use different backends for your own scenario? Users can simply pass the Backend configs (**CUDABackend**, **TritonBackend** or **CuTeDSLBackend**) to [ffpa_attn_func](https://ffpa-attn.readthedocs.io/en/latest/api/ffpa_attn/), for example:
+How to use different backends for your own scenario? Users can simply pass the Backend configs (SDPABackend, CUDABackend, TritonBackend or CuTeDSLBackend) to [ffpa_attn_func](https://ffpa-attn.readthedocs.io/en/latest/api/ffpa_attn/), for example:
 
 ```python
 >>> from ffpa_attn import ffpa_attn_func, CuTeDSLBackend
 >>> # CuTeDSL backend for D=512 senario, fastest on H200!🎉
->>> fwd, bwd = CuTeDSLBackend(forward=True), CuTeDSLBackend(backward=True)
->>> o = ffpa_attn_func(q, k, v, forward_backend=fwd, backward_backend=bwd)
+>>> o = ffpa_attn_func(q, k, v, backend=CuTeDSLBackend())
 ```
 
 ## ©️License

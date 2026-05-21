@@ -97,15 +97,12 @@ def _acc_for(dtype):
 
 
 def _require_cuda_forward_impl() -> None:
-  if not ffpa_attn_functional.cuda_forward_available():
+  if ffpa_attn_functional._ffpa_attn_forward_cuda is None:
     pytest.skip("CUDA forward backend was not compiled")
 
 
 def _force_cuda_backend_unavailable(monkeypatch) -> None:
-  monkeypatch.setattr(ffpa_attn_functional, "_CUDA_BACKEND_LOADED", True)
-  monkeypatch.setattr(ffpa_attn_functional, "_CUDA_BACKEND_IMPORT_ERROR", RuntimeError("missing ffpa_attn._C"))
-  monkeypatch.setattr(ffpa_attn_functional, "_CUDA_FWD_AVAILABLE", False)
-  monkeypatch.setattr(ffpa_attn_functional, "_CUDA_FORWARD_IMPL", None)
+  monkeypatch.setattr(ffpa_attn_functional, "_ffpa_attn_forward_cuda", None)
 
 
 @pytest.fixture(scope="module", autouse=True)

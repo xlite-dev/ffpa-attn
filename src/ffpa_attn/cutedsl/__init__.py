@@ -3,7 +3,8 @@
 Exposes the dense and varlen CuTeDSL entry shims used by
 :mod:`ffpa_attn.ffpa_attn_interface` and :mod:`ffpa_attn.functional`.
 
-The CuTeDSL kernels in :mod:`ffpa_attn.cutedsl._compile` operate on the
+The CuTeDSL kernels in :mod:`ffpa_attn.cutedsl._ffpa_fwd_sm90` and
+:mod:`ffpa_attn.cutedsl._ffpa_bwd_sm90` operate on the
 ``[B, N, H, D]`` (or packed ``[T, H, D]``) layout. The SDPA-style
 ``[B, H, N, D]`` wrappers (:func:`_ffpa_attn_forward_cutedsl`,
 :func:`_ffpa_attn_backward_cutedsl`, :func:`_ffpa_attn_varlen_cutedsl`)
@@ -22,12 +23,10 @@ from typing import Optional, Tuple, Callable
 
 import torch
 
-from ._compile import (
+from ._utils import (
   SUPPORTED_HEAD_DIM,
   _decode_custom_op_window,
   _encode_optional_int_for_custom_op,
-  _ffpa_attn_backward_sm90,
-  _ffpa_attn_forward_sm90,
   _validate_max_seqlen_for_cu_seqlens,
   _validate_qkv_common,
   _validate_tensor,
@@ -36,6 +35,8 @@ from ._compile import (
   _validate_varlen_custom_fwd_features,
   is_fake_mode,
 )
+from ._ffpa_fwd_sm90 import _ffpa_attn_forward_sm90
+from ._ffpa_bwd_sm90 import _ffpa_attn_backward_sm90
 
 __all__ = [
   "_ffpa_attn_forward_cutedsl",
