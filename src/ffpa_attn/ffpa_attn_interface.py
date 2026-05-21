@@ -156,8 +156,7 @@ def ffpa_attn_func(
   """
   meta = FFPAAttnMeta.from_kwargs(**kwargs)
   if meta.fallback(query, key, attn_mask, dropout_p):
-    # HACK: Use the native SDPA op directly to avoid recursive calls to this function
-    # if the user has monkey-patched SDPA to point to this function.
+    # HACK: Avoid recursive for monkey-patch usage.
     return torch._C._nn.scaled_dot_product_attention(
       query,
       key,
