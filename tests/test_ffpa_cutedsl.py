@@ -37,7 +37,7 @@ def _grad_tol():
 
 @pytest.mark.parametrize("is_causal", [False, True])
 @pytest.mark.parametrize("Hq,Hkv", [(8, 8), (16, 4)])
-@pytest.mark.parametrize("D", [320, 512])
+@pytest.mark.parametrize("D", [320, 384, 512])
 def test_cutedsl_forward_matches_triton(is_causal, Hq, Hkv, D):
   torch.manual_seed(0)
   B, Nq, Nkv = 1, 1024, 1024
@@ -67,7 +67,7 @@ def test_cutedsl_forward_matches_triton(is_causal, Hq, Hkv, D):
 
 
 @pytest.mark.parametrize("is_causal", [False, True])
-@pytest.mark.parametrize("D", [320, 512])
+@pytest.mark.parametrize("D", [320, 384, 512])
 def test_cutedsl_autograd_matches_triton(is_causal, D):
   torch.manual_seed(42)
   B, H, N = 1, 4, 1024
@@ -151,7 +151,7 @@ def test_cutedsl_rejects_mixed_backward_backend():
     )
 
 
-@pytest.mark.parametrize("D", [320, 512])
+@pytest.mark.parametrize("D", [320, 384, 512])
 def test_cutedsl_routes_through_ffpaattnfunc(monkeypatch, D):
   """forward_backend='cutedsl' + dense large D + SM90 must go through FFPAAttnFunc.
 
