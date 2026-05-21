@@ -368,6 +368,12 @@ class FFPAAttnMeta:
     _, Nh_kv, Nkv, D_k = key.shape
     assert D == D_k, "Query and key must have the same head dimension"
 
+    # sdpa forward always short-circuits to the native aten path regardless
+    # of backward_meta. _FFPAAttnFunc has no general dispatch for sdpa-based
+    # forward, and aten flash-attention only handles D<=256.  Letting sdpa
+    # forward pass through fallback keeps the public API layer responsible for
+    # the full sdpa forward+backward path instead of routing through the
+    # incomplete Function dispatch below.
     if self.forward_meta.name == "sdpa":
       return True
 

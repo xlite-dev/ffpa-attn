@@ -98,17 +98,9 @@ FFPA supports multiple backends for the forward and backward pass, including: [`
 How to use different backends for your own scenario? Users can simply pass the Backend configs (**CUDABackend**, **TritonBackend** or **CuTeDSLBackend**) to [ffpa_attn_func](https://ffpa-attn.readthedocs.io/en/latest/api/ffpa_attn/), for example:
 
 ```python
->>> from ffpa_attn import ffpa_attn_func
->>> # Shorthand: pass a backend name string
->>> o = ffpa_attn_func(q, k, v, backend="cutedsl")
->>> # Or pass a Backend instance directly
->>> from ffpa_attn import CuTeDSLBackend
+>>> from ffpa_attn import ffpa_attn_func, CuTeDSLBackend
+>>> # CuTeDSL backend for D=512 senario, fastest on H200!🎉
 >>> o = ffpa_attn_func(q, k, v, backend=CuTeDSLBackend())
->>> # Fine-grained: configure forward and backward separately
->>> from ffpa_attn import TritonBackend
->>> fwd = TritonBackend(forward=True, enable_tma=True)
->>> bwd = TritonBackend(backward=True, persist_dkdv=True, grad_kv_storage_dtype="fp32")
->>> o = ffpa_attn_func(q, k, v, forward_backend=fwd, backward_backend=bwd)
 ```
 
 ## ©️License
