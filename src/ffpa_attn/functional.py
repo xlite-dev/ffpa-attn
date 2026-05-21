@@ -81,7 +81,6 @@ class SDPABackend(Backend):
 
   def __post_init__(self) -> None:
     super().__post_init__()
-    assert not self.forward, "sdpa backend does not support forward"
 
 
 @dataclass
@@ -127,7 +126,6 @@ class TritonBackend(Backend):
 @dataclass
 class CuTeDSLBackend(Backend):
   name: str = "cutedsl"
-  pass
 
 
 @dataclass
@@ -316,7 +314,7 @@ class FFPAAttnMeta:
 
     if forward_backend is None and backward_backend is None and backend is not None:
       if isinstance(backend, str):
-        _BACKEND_MAP = {"cuda": CUDABackend, "triton": TritonBackend, "cutedsl": CuTeDSLBackend}
+        _BACKEND_MAP = {"cuda": CUDABackend, "triton": TritonBackend, "cutedsl": CuTeDSLBackend, "sdpa": SDPABackend}
         cls_name = _BACKEND_MAP.get(backend)
         if cls_name is None:
           raise ValueError(f"ffpa_attn_func: backend must be 'cuda', 'triton', or 'cutedsl', got {backend!r}")
@@ -370,6 +368,9 @@ class FFPAAttnMeta:
     _, Nh_kv, Nkv, D_k = key.shape
     assert D == D_k, "Query and key must have the same head dimension"
 
+    if self.forward_meta.name == "sdpa":
+      return True
+
     if self.forward_meta.name == "cutedsl":
       from .cutedsl import cutedsl_forward_available
       cutedsl_hw_unsupported = D != 512 or not cutedsl_forward_available(query.device)
@@ -384,7 +385,7 @@ class FFPAAttnMeta:
       Nkv < 512,
     ])
 
-  def normalize(
+  def normalize_inputs(
     self,
     query: torch.Tensor,
     key: torch.Tensor,
@@ -530,7 +531,7 @@ class FFPAAttnMeta:
       attn_bias = attn_bias.contiguous()
     return attn_bias
 
-  def normalize_inputs(
+  def normalize(
     self,
     query: torch.Tensor,
     key: torch.Tensor,
@@ -555,7 +556,7 @@ class FFPAAttnMeta:
       dispatch state; the remaining values are passed directly to
       :class:`FFPAAttnFunc` so autograd sees all differentiable inputs.
     """
-    self.normalize(query, key, value, attn_mask, dropout_p, is_causal, scale, enable_gqa)
+    self.normalize_inputs(query, key, value, attn_mask, dropout_p, is_causal, scale, enable_gqa)
     attn_bias = self.normalize_attn_mask(query, key, attn_mask)
     return self, query, key, value, attn_bias
 

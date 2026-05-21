@@ -156,14 +156,8 @@ def ffpa_attn_func(
   """
   meta = FFPAAttnMeta.from_kwargs(**kwargs)
   if meta.fallback(query, key, attn_mask, dropout_p):
-    # Fallback intentionally delegates to SDPA exactly as the user called it.
-    # Do not synthesize masks or reinterpret GQA semantics here.
     # HACK: Use the native SDPA op directly to avoid recursive calls to this function
-    # if the user has monkey-patched torch.nn.functional.scaled_dot_product_attention
-    # to point to this function (e.g., for benchmarking). For example:
-    # >>> import torch.nn.functional as F
-    # >>> from ffpa_attn import ffpa_attn_func
-    # >>> F.scaled_dot_product_attention = ffpa_attn_func
+    # if the user has monkey-patched SDPA to point to this function.
     return torch._C._nn.scaled_dot_product_attention(
       query,
       key,
@@ -175,7 +169,7 @@ def ffpa_attn_func(
       enable_gqa=enable_gqa,
     )
 
-  meta, query, key, value, attn_bias = meta.normalize_inputs(
+  meta, query, key, value, attn_bias = meta.normalize(
     query,
     key,
     value,
