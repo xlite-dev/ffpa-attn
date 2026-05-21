@@ -782,8 +782,10 @@ class _FFPAAttnFunc(torch.autograd.Function):
 #
 #   forward_backend   │  backward_backend
 #   ──────────────────┼───────────────────
+#   sdpa              │  (n/a — always short-circuits via meta.fallback())
 #   cuda              │  triton, sdpa
 #   triton            │  triton, sdpa
+#   cutedsl           │  cutedsl, triton, sdpa
 #
 # ``register_autograd`` binds a forward op to exactly one backward formula.
 # Hard-coding one backward (e.g. always Triton) would silently ignore the
@@ -816,6 +818,53 @@ class FFPAAttnFunc:
   @classmethod
   def apply(cls, *args, **kwargs):
     return _ffpa_apply(*args, **kwargs)
+
+
+@torch._dynamo.disable
+def _ffpa_varlen_apply(
+  q,
+  k,
+  v,
+  cu_seqlens_q,
+  cu_seqlens_k,
+  max_seqlen_q,
+  max_seqlen_k,
+  dropout_p,
+  softmax_scale,
+  causal,
+  enable_gqa,
+  return_lse,
+  **kwargs,
+):
+  from .cutedsl import _ffpa_attn_varlen_cutedsl
+  return _ffpa_attn_varlen_cutedsl(
+    q,
+    k,
+    v,
+    cu_seqlens_q,
+    cu_seqlens_k,
+    max_seqlen_q,
+    max_seqlen_k,
+    dropout_p=dropout_p,
+    softmax_scale=softmax_scale,
+    causal=causal,
+    enable_gqa=enable_gqa,
+    return_lse=return_lse,
+    kwargs=kwargs,
+  )
+
+
+class FFPAAttnVarlenFunc:
+  """Public-facing varlen autograd Function wrapper.
+
+  Follows the same pattern as :class:`FFPAAttnFunc`: delegates through
+  :func:`_ffpa_varlen_apply` which is guarded by ``torch._dynamo.disable``
+  so ``torch.compile`` leaves the autograd boundary intact.
+  """
+
+  @classmethod
+  def apply(cls, *args, **kwargs):
+    return _ffpa_varlen_apply(*args, **kwargs)
 
 
 __all__ = [

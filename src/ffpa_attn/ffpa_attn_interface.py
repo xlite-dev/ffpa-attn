@@ -63,7 +63,7 @@ shapes / backends raise ``NotImplementedError``.
 from __future__ import annotations
 
 import torch
-from .functional import FFPAAttnMeta, FFPAAttnFunc
+from .functional import FFPAAttnMeta, FFPAAttnFunc, FFPAAttnVarlenFunc
 from .logger import init_logger
 
 logger = init_logger(__name__)
@@ -255,8 +255,7 @@ def ffpa_attn_varlen_func(
       ``H_q != H_kv``.
   """
 
-  from .cutedsl import _ffpa_attn_varlen_cutedsl
-  return _ffpa_attn_varlen_cutedsl(
+  return FFPAAttnVarlenFunc.apply(
     q,
     k,
     v,
