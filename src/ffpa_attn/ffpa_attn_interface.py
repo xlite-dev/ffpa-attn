@@ -63,77 +63,10 @@ shapes / backends raise ``NotImplementedError``.
 from __future__ import annotations
 
 import torch
-from .functional import Backend, FFPAAttnMeta, FFPAAttnFunc
+from .functional import FFPAAttnMeta, FFPAAttnFunc
 from .logger import init_logger
 
 logger = init_logger(__name__)
-
-
-def _should_fallback_to_sdpa(
-  query: torch.Tensor,
-  key: torch.Tensor,
-  attn_mask: torch.Tensor | None,
-  dropout_p: float,
-  forward_backend: Backend,
-) -> bool:
-  """Return whether the public API should delegate to SDPA directly.
-
-  For now, as FFPA is mainly designed for prefill and may not outperform SDPA
-  for short sequences. While Nq == 1 is a common case for decode attention and
-  FFPA does support it by flash-decoding algorithm, the speedup over SDPA is may
-  not be significant (~10% speedup on Ada). FFPA currently falls back to SDPA for
-  the following cases:
-
-  * ``head_dim <= 256``
-  * ``head_dim > 1024``
-  * ``dropout_p > 0.0`` when the large-D forward backend cannot support it
-  * ``attn_mask is not None`` when the large-D forward backend cannot support it
-  * ``8 <= Nq < 512``
-  * ``Nk < 512``
-  * ``forward_backend == 'cutedsl'`` and ``head_dim != 512`` (hardware
-    mismatch — cutedsl is specialised to D=512). Emits a ``warning_once``
-    before returning ``True``.
-  * ``forward_backend == 'cutedsl'`` and the device is not SM90 (Hopper).
-    Emits a ``warning_once`` before returning ``True``. Other cutedsl
-    constraints (dtype, fp16 training, ``dropout_p > 0``, ``attn_mask``,
-    FA-extension kwargs) continue to raise from the cutedsl wrappers
-    rather than fall back here.
-
-  As FFPA grows support for these cases, remove the corresponding condition
-  here instead of scattering dispatch checks throughout ``ffpa_attn_func``.
-  """
-  assert query.dim() == 4, "Expected query shape [B, Nh_q, Nq, D]"
-  assert key.dim() == 4, "Expected key shape [B, Nh_kv, Nkv, D]"
-  B, Nh_q, Nq, D = query.shape  # noqa: F841
-  _, Nh_kv, Nkv, D_k = key.shape
-  assert D == D_k, "Query and key must have the same head dimension"
-  # cutedsl is opt-in: the only fallback we apply is the pure hardware
-  # mismatch (head_dim != 512 or non-SM90), with a one-shot warning. All
-  # other cutedsl constraints (dtype, fp16 training, dropout_p > 0, explicit
-  # attn_mask, FA-extension kwargs) must keep raising from
-  # _require_cutedsl_supported / _check_supported_options, so cutedsl
-  # bypasses the legacy any([...]) heuristics below.
-  if forward_backend.name == "cutedsl":
-    from .cutedsl import cutedsl_forward_available
-    cutedsl_hw_unsupported = D != 512 or not cutedsl_forward_available(query.device)
-    if cutedsl_hw_unsupported:
-      logger.warning_once(
-        "forward_backend='cutedsl' falling back to SDPA: head_dim=%d, device=%s "
-        "(cutedsl requires head_dim=512 on SM90 Hopper).",
-        D,
-        query.device,
-      )
-    return cutedsl_hw_unsupported
-
-  return any([
-    D <= 256,
-    D > 1024,
-    # attn_mask and dropout only supported in triton backend for now.
-    attn_mask is not None and forward_backend.name == "cutedsl",
-    dropout_p > 0.0 and forward_backend.name == "cutedsl",
-    (8 <= Nq < 512),
-    Nkv < 512,
-  ])
 
 
 def ffpa_attn_func(
@@ -221,32 +154,8 @@ def ffpa_attn_func(
   :raises NotImplementedError: propagated from SDPA or FFPA backends for
       unsupported backend-specific combinations.
   """
-  forward_backend = kwargs.pop("forward_backend", None)
-  backward_backend = kwargs.pop("backward_backend", None)
-  backend = kwargs.pop("backend", None)
-
-  # backend str/instance shorthand: auto-fill forward_backend/backward_backend
-  # when neither is explicitly provided.  Priority: explicit forward_backend /
-  # backward_backend > backend > default Triton.
-  if forward_backend is None and backward_backend is None and backend is not None:
-    from .functional import CUDABackend, TritonBackend, CuTeDSLBackend
-
-    if isinstance(backend, str):
-      _BACKEND_MAP = {"cuda": CUDABackend, "triton": TritonBackend, "cutedsl": CuTeDSLBackend}
-      cls = _BACKEND_MAP.get(backend)
-      if cls is None:
-        raise ValueError(f"ffpa_attn_func: backend must be 'cuda', 'triton', or 'cutedsl', got {backend!r}")
-      backend = cls()
-    if not isinstance(backend, Backend):
-      raise TypeError(f"ffpa_attn_func: backend must be a str or Backend instance, got {type(backend).__name__}")
-    forward_backend = backend
-    backward_backend = backend
-
-  if kwargs:
-    unexpected = ", ".join(sorted(kwargs))
-    raise TypeError(f"ffpa_attn_func() got unexpected keyword argument(s): {unexpected}")
-  meta = FFPAAttnMeta.from_options(forward_backend, backward_backend)
-  if _should_fallback_to_sdpa(query, key, attn_mask, dropout_p, meta.forward_meta):
+  meta = FFPAAttnMeta.from_kwargs(**kwargs)
+  if meta.fallback(query, key, attn_mask, dropout_p):
     # Fallback intentionally delegates to SDPA exactly as the user called it.
     # Do not synthesize masks or reinterpret GQA semantics here.
     # HACK: Use the native SDPA op directly to avoid recursive calls to this function
