@@ -30,6 +30,8 @@ from ._utils import (
 from ._bwd_preprocess import FFPAAttnBwdPreprocess
 from ._dkdv_d512_sm90 import FFPAAttnBwdDKDVSm90SplitD
 from ._dq_d512_sm90 import FFPAAttnBwdDQSm90SplitD
+from ._dkdv_d384_sm90 import FFPAAttnBwdDKDVSm90SplitDD384
+from ._dq_d384_sm90 import FFPAAttnBwdDQSm90SplitDD384
 from ._dkdv_generic_sm90 import FFPAAttnBwdDKDVSm90SplitDGeneric
 from ._dq_generic_sm90 import FFPAAttnBwdDQSm90SplitDGeneric
 from .utils.cache_utils import get_jit_cache
@@ -313,7 +315,15 @@ def _ffpa_attn_backward_sm90(
   )
 
   # (2) Compile and execute SplitD dKdV and dQ kernels
+  if head_dim == 512 and head_dim_v == 512:
+    bwd_kernel_kind = "d512"
+  elif head_dim <= 384 and head_dim_v <= 384:
+    bwd_kernel_kind = "d384"
+  else:
+    bwd_kernel_kind = "d512_generic"
+
   bwd_key = (
+    bwd_kernel_kind,
     dtype,
     head_dim,
     head_dim_v,
@@ -340,10 +350,12 @@ def _ffpa_attn_backward_sm90(
       if cu_seqlens_k is not None else None
     )
 
-    dkdv_kernel_cls = (
-      FFPAAttnBwdDKDVSm90SplitD if head_dim == 512 and head_dim_v == 512 else
-      FFPAAttnBwdDKDVSm90SplitDGeneric
-    )
+    if bwd_kernel_kind == "d512":
+      dkdv_kernel_cls = FFPAAttnBwdDKDVSm90SplitD
+    elif bwd_kernel_kind == "d384":
+      dkdv_kernel_cls = FFPAAttnBwdDKDVSm90SplitDD384
+    else:
+      dkdv_kernel_cls = FFPAAttnBwdDKDVSm90SplitDGeneric
     ffpa_dkdv = dkdv_kernel_cls(
       dtype,
       head_dim,
@@ -386,10 +398,12 @@ def _ffpa_attn_backward_sm90(
       if cu_seqlens_k is not None else None
     )
 
-    dq_kernel_cls = (
-      FFPAAttnBwdDQSm90SplitD if head_dim == 512 and head_dim_v == 512 else
-      FFPAAttnBwdDQSm90SplitDGeneric
-    )
+    if bwd_kernel_kind == "d512":
+      dq_kernel_cls = FFPAAttnBwdDQSm90SplitD
+    elif bwd_kernel_kind == "d384":
+      dq_kernel_cls = FFPAAttnBwdDQSm90SplitDD384
+    else:
+      dq_kernel_cls = FFPAAttnBwdDQSm90SplitDGeneric
     ffpa_dq = dq_kernel_cls(
       dtype,
       head_dim,

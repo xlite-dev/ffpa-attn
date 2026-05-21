@@ -58,8 +58,8 @@ from .utils.tile_scheduler import (
 from .utils.named_barrier import NamedBarrierBwd
 
 
-class FFPAAttnBwdDKDVSm90SplitD:
-  """SM90 backward dKdV kernel (dual asymmetric MMA WG + d_chunk=256 + K/V persistence).
+class FFPAAttnBwdDKDVSm90SplitDD384:
+  """SM90 backward dK/dV kernel for dense D<=384.
 
     Computes only dK and dV (no dQ). dQ is handled by a separate kernel.
     Each CTA has 3 warp groups: 1 TMA producer + WG1 (S/softmax/dV) + WG2 (dP/dS/dK).
@@ -78,14 +78,14 @@ class FFPAAttnBwdDKDVSm90SplitD:
     tile_n: int = 64,
   ):
     self.dtype = dtype
-    hdim_multiple_of = 16
-    self.tile_hdim = int(
-      math.ceil(head_dim / hdim_multiple_of) * hdim_multiple_of
-    )
     head_dim_v = head_dim_v if head_dim_v is not None else head_dim
-    self.tile_hdimv = int(
-      math.ceil(head_dim_v / hdim_multiple_of) * hdim_multiple_of
-    )
+    if head_dim != head_dim_v or not 256 < head_dim <= 384:
+      raise ValueError(
+        f"D384 dK/dV kernel requires q/k head_dim == v head_dim_v and "
+        f"256 < head_dim <= 384, got {head_dim} and {head_dim_v}"
+      )
+    self.tile_hdim = 384
+    self.tile_hdimv = 384
     self.check_hdim_oob = head_dim != self.tile_hdim
     self.check_hdim_v_oob = head_dim_v != self.tile_hdimv
 
@@ -97,10 +97,10 @@ class FFPAAttnBwdDKDVSm90SplitD:
     self.qk_acc_dtype = Float32
     self.buffer_align_bytes = 1024
 
-    # ── SplitD parameters (d_chunk=256, num_d_passes=2, num_d_inner=2) ──
-    self.d_chunk = 256  # output slice width for dK/dV
-    self.num_d_passes = self.tile_hdim // self.d_chunk  # = 2
-    self.num_d_inner = self.tile_hdim // self.d_chunk  # = 2
+    # ── SplitD parameters for physical D=384 ──
+    self.d_chunk = 128  # output slice width for dK/dV
+    self.num_d_passes = self.tile_hdim // self.d_chunk  # = 3
+    self.num_d_inner = self.tile_hdim // self.d_chunk  # = 3
     assert self.tile_hdim % self.d_chunk == 0
     assert self.tile_hdimv % self.d_chunk == 0
 
