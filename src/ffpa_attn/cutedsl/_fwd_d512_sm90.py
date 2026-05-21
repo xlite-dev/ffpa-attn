@@ -122,7 +122,7 @@ class FFPAAttnFwdSm90SplitD:
     # ── kv_same not support for yet  ──
     self.kv_same = kv_same
     assert not kv_same, (
-      "_ffpa_fwd_d512_sm90 only supports kv_same=False. "
+      "_fwd_d512_sm90 only supports kv_same=False. "
       "Use the V1 kv_same=True forward path if you need that variant."
     )
 

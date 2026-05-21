@@ -8,9 +8,9 @@
 #   - is_split_kv field and the split-KV branch in get_n_block_min_max (no SM90 split-KV in this repo)
 #
 # Methods (SM90 call sites in this repo, plus reserved helpers for future masked-iteration splits):
-#   - get_n_block_min_max:              _ffpa_fwd_d512_sm90.py (lines 798, 1005, 1425),
-#                                       _ffpa_dq_d512_sm90.py  (lines 759, 1015, 1317)
-#   - get_m_block_min_max:              _ffpa_dkdv_d512_sm90.py (lines 702, 963, 1211)
+#   - get_n_block_min_max:              _fwd_d512_sm90.py (lines 798, 1005, 1425),
+#                                       _dq_d512_sm90.py  (lines 759, 1015, 1317)
+#   - get_m_block_min_max:              _dkdv_d512_sm90.py (lines 702, 963, 1211)
 #   - get_n_block_min_causal_local_mask: reserved (no current call sites)
 #   - get_n_block_min_before_local_mask: reserved (no current call sites)
 
