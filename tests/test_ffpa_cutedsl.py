@@ -25,7 +25,9 @@ def _sm90_available() -> bool:
   return major == 9
 
 
-pytestmark = pytest.mark.skipif(not _sm90_available(), reason="cutedsl backend requires SM90 (Hopper)")
+pytestmark = pytest.mark.skipif(
+  not _sm90_available(), reason="cutedsl backend requires SM90 (Hopper)"
+)
 
 
 def _tol():
@@ -46,8 +48,22 @@ def test_cutedsl_forward_matches_triton(is_causal, Hq, Hkv):
   v = torch.randn(B, Hkv, Nkv, D, dtype=torch.bfloat16, device="cuda")
   enable_gqa = Hq != Hkv
 
-  out_tri = ffpa_attn_func(q, k, v, is_causal=is_causal, enable_gqa=enable_gqa, forward_backend="triton")
-  out_cute = ffpa_attn_func(q, k, v, is_causal=is_causal, enable_gqa=enable_gqa, forward_backend="cutedsl")
+  out_tri = ffpa_attn_func(
+    q,
+    k,
+    v,
+    is_causal=is_causal,
+    enable_gqa=enable_gqa,
+    forward_backend="triton"
+  )
+  out_cute = ffpa_attn_func(
+    q,
+    k,
+    v,
+    is_causal=is_causal,
+    enable_gqa=enable_gqa,
+    forward_backend="cutedsl"
+  )
   assert out_cute.shape == out_tri.shape
   torch.testing.assert_close(out_cute, out_tri, **_tol())
 
@@ -59,19 +75,29 @@ def test_cutedsl_autograd_matches_triton(is_causal):
 
   def make():
     return (
-      torch.randn(B, H, N, D, dtype=torch.bfloat16, device="cuda", requires_grad=True),
-      torch.randn(B, H, N, D, dtype=torch.bfloat16, device="cuda", requires_grad=True),
-      torch.randn(B, H, N, D, dtype=torch.bfloat16, device="cuda", requires_grad=True),
+      torch.randn(
+        B, H, N, D, dtype=torch.bfloat16, device="cuda", requires_grad=True
+      ),
+      torch.randn(
+        B, H, N, D, dtype=torch.bfloat16, device="cuda", requires_grad=True
+      ),
+      torch.randn(
+        B, H, N, D, dtype=torch.bfloat16, device="cuda", requires_grad=True
+      ),
     )
 
   torch.manual_seed(42)
   q_t, k_t, v_t = make()
-  out_t = ffpa_attn_func(q_t, k_t, v_t, is_causal=is_causal, forward_backend="triton")
+  out_t = ffpa_attn_func(
+    q_t, k_t, v_t, is_causal=is_causal, forward_backend="triton"
+  )
   out_t.sum().backward()
 
   torch.manual_seed(42)
   q_c, k_c, v_c = make()
-  out_c = ffpa_attn_func(q_c, k_c, v_c, is_causal=is_causal, forward_backend="cutedsl")
+  out_c = ffpa_attn_func(
+    q_c, k_c, v_c, is_causal=is_causal, forward_backend="cutedsl"
+  )
   out_c.sum().backward()
 
   torch.testing.assert_close(out_c, out_t, **_tol())
@@ -93,12 +119,15 @@ def test_cutedsl_falls_back_for_non_512_head_dim(caplog, monkeypatch, D):
   ref = F.scaled_dot_product_attention(q, q, q)
   torch.testing.assert_close(out, ref, **_tol())
   assert any(
-    "falling back to SDPA" in r.getMessage() and f"head_dim={D}" in r.getMessage() for r in caplog.records
+    "falling back to SDPA" in r.getMessage()
+    and f"head_dim={D}" in r.getMessage() for r in caplog.records
   ), f"expected fallback warning for head_dim={D}, got: {[r.getMessage() for r in caplog.records]}"
 
 
 def test_cutedsl_rejects_fp16_training():
-  q = torch.randn(1, 8, 1024, 512, dtype=torch.float16, device="cuda", requires_grad=True)
+  q = torch.randn(
+    1, 8, 1024, 512, dtype=torch.float16, device="cuda", requires_grad=True
+  )
   with pytest.raises(NotImplementedError, match="bfloat16"):
     ffpa_attn_func(q, q, q, forward_backend="cutedsl")
 
@@ -120,8 +149,13 @@ def test_cutedsl_raises_on_dropout():
 
 def test_cutedsl_rejects_mixed_backward_backend():
   q = torch.randn(1, 8, 1024, 512, dtype=torch.bfloat16, device="cuda")
-  with pytest.raises(ValueError, match="forward_backend='cutedsl' requires backward_backend='cutedsl'"):
-    ffpa_attn_func(q, q, q, forward_backend="cutedsl", backward_backend="triton")
+  with pytest.raises(
+    ValueError,
+    match="forward_backend='cutedsl' requires backward_backend='cutedsl'"
+  ):
+    ffpa_attn_func(
+      q, q, q, forward_backend="cutedsl", backward_backend="triton"
+    )
 
 
 def test_cutedsl_routes_through_ffpaattnfunc(monkeypatch):
@@ -155,10 +189,12 @@ def test_cutedsl_routes_through_ffpaattnfunc(monkeypatch):
 # tail-aligned causal only when Nq == Nkv, so cross-attn cases stay non-causal.
 NONALIGNED_FORWARD_CASES = [
   # Nq, Nkv, is_causal  — what each row exercises
-  (8191, 8192, False),  # Q tail only: ceil_div m_block + LSE row bound + O TMA OOB drop
+  (8191, 8192, False
+   ),  # Q tail only: ceil_div m_block + LSE row bound + O TMA OOB drop
   (8192, 8191, False),  # KV tail only: R2P column mask on boundary n_block
   (129, 129, False),  # small both-sided tail, non-causal
-  (129, 129, True),  # small both-sided tail + causal mask x boundary interaction
+  (129, 129,
+   True),  # small both-sided tail + causal mask x boundary interaction
   (8191, 8191, False),  # large both-sided tail, non-causal
   (8191, 8191, True),  # large both-sided tail + causal
 ]
@@ -185,10 +221,14 @@ def test_cutedsl_forward_nonaligned_matches_sdpa(Nq, Nkv, is_causal):
   v = torch.randn(B, H, Nkv, D, dtype=torch.bfloat16, device="cuda")
 
   out_ref = F.scaled_dot_product_attention(q, k, v, is_causal=is_causal)
-  out_cute = ffpa_attn_func(q, k, v, is_causal=is_causal, forward_backend="cutedsl")
+  out_cute = ffpa_attn_func(
+    q, k, v, is_causal=is_causal, forward_backend="cutedsl"
+  )
 
   assert out_cute.shape == out_ref.shape == (B, H, Nq, D)
-  assert torch.isfinite(out_cute).all(), (f"cutedsl output has NaN/Inf at Nq={Nq}, Nkv={Nkv}, is_causal={is_causal}")
+  assert torch.isfinite(out_cute).all(), (
+    f"cutedsl output has NaN/Inf at Nq={Nq}, Nkv={Nkv}, is_causal={is_causal}"
+  )
   torch.testing.assert_close(out_cute, out_ref, **_tol())
 
 
@@ -210,9 +250,15 @@ def test_cutedsl_autograd_nonaligned_matches_sdpa(is_causal, N):
 
   def make():
     return (
-      torch.randn(B, H, N, D, dtype=torch.bfloat16, device="cuda", requires_grad=True),
-      torch.randn(B, H, N, D, dtype=torch.bfloat16, device="cuda", requires_grad=True),
-      torch.randn(B, H, N, D, dtype=torch.bfloat16, device="cuda", requires_grad=True),
+      torch.randn(
+        B, H, N, D, dtype=torch.bfloat16, device="cuda", requires_grad=True
+      ),
+      torch.randn(
+        B, H, N, D, dtype=torch.bfloat16, device="cuda", requires_grad=True
+      ),
+      torch.randn(
+        B, H, N, D, dtype=torch.bfloat16, device="cuda", requires_grad=True
+      ),
     )
 
   torch.manual_seed(42)
@@ -222,12 +268,17 @@ def test_cutedsl_autograd_nonaligned_matches_sdpa(is_causal, N):
 
   torch.manual_seed(42)
   q_c, k_c, v_c = make()
-  out_c = ffpa_attn_func(q_c, k_c, v_c, is_causal=is_causal, forward_backend="cutedsl")
+  out_c = ffpa_attn_func(
+    q_c, k_c, v_c, is_causal=is_causal, forward_backend="cutedsl"
+  )
   out_c.sum().backward()
 
-  assert torch.isfinite(out_c).all(), f"cutedsl output has NaN/Inf at N={N}, is_causal={is_causal}"
+  assert torch.isfinite(out_c).all(
+  ), f"cutedsl output has NaN/Inf at N={N}, is_causal={is_causal}"
   for name, t in (("q", q_c), ("k", k_c), ("v", v_c)):
-    assert torch.isfinite(t.grad).all(), f"cutedsl {name}.grad has NaN/Inf at N={N}, is_causal={is_causal}"
+    assert torch.isfinite(
+      t.grad
+    ).all(), f"cutedsl {name}.grad has NaN/Inf at N={N}, is_causal={is_causal}"
   torch.testing.assert_close(out_c, out_r, **_tol())
   torch.testing.assert_close(q_c.grad, q_r.grad, **_grad_tol())
   torch.testing.assert_close(k_c.grad, k_r.grad, **_grad_tol())

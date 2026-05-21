@@ -43,11 +43,15 @@ def _parse_grad_kv_dtype(arg: str) -> torch.dtype | None:
     return torch.float16
   if arg == "fp32":
     return torch.float32
-  raise ValueError(f"Unsupported grad-kv-dtype={arg!r}; choose 'none', 'fp16', or 'fp32'.")
+  raise ValueError(
+    f"Unsupported grad-kv-dtype={arg!r}; choose 'none', 'fp16', or 'fp32'."
+  )
 
 
 def _parse_args() -> argparse.Namespace:
-  parser = argparse.ArgumentParser(description="FFPA forward example and SDPA comparison.")
+  parser = argparse.ArgumentParser(
+    description="FFPA forward example and SDPA comparison."
+  )
   parser.add_argument(
     "--forward-backend",
     "--backend",
@@ -60,12 +64,34 @@ def _parse_args() -> argparse.Namespace:
     ),
   )
   parser.add_argument("--B", type=int, default=1, help="Batch size.")
-  parser.add_argument("--N", type=int, default=8192, help="Sequence length (non-aligned uses N-1).")
+  parser.add_argument(
+    "--N",
+    type=int,
+    default=8192,
+    help="Sequence length (non-aligned uses N-1)."
+  )
   parser.add_argument("--D", type=int, default=512, help="Head dimension.")
-  parser.add_argument("--warmup", type=int, default=DEFAULT_WARMUP, help="Warmup iterations used for timing.")
-  parser.add_argument("--iters", type=int, default=DEFAULT_ITERS, help="Measured iterations used for timing.")
-  parser.add_argument("--dropout-p", type=float, default=0.1, help="Dropout probability for the dropout example case.")
-  parser.add_argument("--seed", type=int, default=42, help="Random seed for input tensors.")
+  parser.add_argument(
+    "--warmup",
+    type=int,
+    default=DEFAULT_WARMUP,
+    help="Warmup iterations used for timing."
+  )
+  parser.add_argument(
+    "--iters",
+    type=int,
+    default=DEFAULT_ITERS,
+    help="Measured iterations used for timing."
+  )
+  parser.add_argument(
+    "--dropout-p",
+    type=float,
+    default=0.1,
+    help="Dropout probability for the dropout example case."
+  )
+  parser.add_argument(
+    "--seed", type=int, default=42, help="Random seed for input tensors."
+  )
   parser.add_argument(
     "--norm",
     action="store_true",
@@ -76,7 +102,8 @@ def _parse_args() -> argparse.Namespace:
     "--autotune",
     "--tune",
     action="store_true",
-    help="Enable Triton runtime autotuning (only effective when --forward-backend=triton).",
+    help=
+    "Enable Triton runtime autotuning (only effective when --forward-backend=triton).",
   )
   parser.add_argument(
     "--triton-autotune-mode",
@@ -91,7 +118,8 @@ def _parse_args() -> argparse.Namespace:
     "--grad-kv-dtype",
     choices=["none", "fp16", "fp32"],
     default="none",
-    help="Optional Triton backward dK/dV storage dtype forwarded to ffpa_attn_func.",
+    help=
+    "Optional Triton backward dK/dV storage dtype forwarded to ffpa_attn_func.",
   )
   parser.add_argument(
     "--enable-tma",
@@ -106,12 +134,14 @@ def _parse_args() -> argparse.Namespace:
   parser.add_argument(
     "--enable-fwd-tma",
     action="store_true",
-    help="Enable experimental SM90+ TMA forward path (silently falls back on unsupported devices).",
+    help=
+    "Enable experimental SM90+ TMA forward path (silently falls back on unsupported devices).",
   )
   parser.add_argument(
     "--enable-fwd-ws",
     action="store_true",
-    help="Force warp-specialized configs for the experimental SM90+ TMA forward path.",
+    help=
+    "Force warp-specialized configs for the experimental SM90+ TMA forward path.",
   )
   args = parser.parse_args()
   if args.enable_tma:
@@ -134,7 +164,14 @@ def _validate_timing_args(warmup: int, iters: int) -> None:
     raise ValueError(f"iters must be positive, got {iters}")
 
 
-def _sdpa_ref(q, k, v, is_causal: bool = False, attn_mask: torch.Tensor | None = None, dropout_p: float = 0.0):
+def _sdpa_ref(
+  q,
+  k,
+  v,
+  is_causal: bool = False,
+  attn_mask: torch.Tensor | None = None,
+  dropout_p: float = 0.0
+):
   return F.scaled_dot_product_attention(
     q,
     k,
@@ -146,14 +183,22 @@ def _sdpa_ref(q, k, v, is_causal: bool = False, attn_mask: torch.Tensor | None =
   )
 
 
-def _make_broadcast_additive_attn_mask(nq: int, nkv: int, dtype: torch.dtype, seed: int) -> torch.Tensor:
+def _make_broadcast_additive_attn_mask(
+  nq: int, nkv: int, dtype: torch.dtype, seed: int
+) -> torch.Tensor:
   """Build a key-position additive attention bias for SDPA/FFPA."""
   torch.manual_seed(seed + 1)
   del nq
   return torch.randn(1, 1, 1, nkv, dtype=dtype, device="cuda") * 0.25
 
 
-def _time_fn(fn, *args, warmup: int = DEFAULT_WARMUP, iters: int = DEFAULT_ITERS, rng_seed: int | None = None) -> float:
+def _time_fn(
+  fn,
+  *args,
+  warmup: int = DEFAULT_WARMUP,
+  iters: int = DEFAULT_ITERS,
+  rng_seed: int | None = None
+) -> float:
   _validate_timing_args(warmup, iters)
   for _ in range(warmup):
     if rng_seed is not None:
@@ -355,7 +400,9 @@ def _run_case(
     enable_tma=enable_tma,
     enable_ws=enable_ws,
   )
-  backward_backend = CuTeDSLBackend(backward=True) if forward_backend.name == "cutedsl" else None
+  backward_backend = CuTeDSLBackend(
+    backward=True
+  ) if forward_backend.name == "cutedsl" else None
 
   torch.manual_seed(seed + 17)
   out_ffpa = ffpa_attn_func(
@@ -371,7 +418,9 @@ def _run_case(
   )
   k_ref, v_ref = _expand_kv(k, v, Nh_q)
   torch.manual_seed(seed + 17)
-  out_sdpa = _sdpa_ref(q, k_ref, v_ref, is_causal=causal, attn_mask=attn_mask, dropout_p=dropout_p)
+  out_sdpa = _sdpa_ref(
+    q, k_ref, v_ref, is_causal=causal, attn_mask=attn_mask, dropout_p=dropout_p
+  )
 
   tol = 5e-2 if dtype == torch.bfloat16 else 2e-2
   ok = _tensor_allclose(out_ffpa, out_sdpa, tol)
@@ -396,7 +445,9 @@ def _run_case(
     rng_seed=seed + 17 if dropout_p > 0.0 else None,
   )
   ms_sdpa = _time_fn(
-    lambda q, k, v: _sdpa_ref(q, k, v, is_causal=causal, attn_mask=attn_mask, dropout_p=dropout_p),
+    lambda q, k, v: _sdpa_ref(
+      q, k, v, is_causal=causal, attn_mask=attn_mask, dropout_p=dropout_p
+    ),
     q,
     k_ref,
     v_ref,
@@ -498,7 +549,9 @@ def run_forward_examples(
     f"warmup={warmup}, iters={iters}"
   )
   if forward_backend == "cutedsl":
-    print("[CuTeDSL] backend constraints in effect: D=512 only, no attn_mask/dropout.")
+    print(
+      "[CuTeDSL] backend constraints in effect: D=512 only, no attn_mask/dropout."
+    )
 
   for dtype in dtypes:
     case_specs: list[dict[str, Any]] = [
@@ -542,12 +595,18 @@ def run_forward_examples(
     if forward_backend != "cutedsl":
       mask_n = max(N, 512)
       case_specs.append({
-        "name": "attn-mask",
-        "Nh_q": H,
-        "Nh_kv": H,
-        "Nq": mask_n,
-        "Nkv": mask_n,
-        "attn_mask": _make_broadcast_additive_attn_mask(mask_n, mask_n, dtype, seed),
+        "name":
+        "attn-mask",
+        "Nh_q":
+        H,
+        "Nh_kv":
+        H,
+        "Nq":
+        mask_n,
+        "Nkv":
+        mask_n,
+        "attn_mask":
+        _make_broadcast_additive_attn_mask(mask_n, mask_n, dtype, seed),
       })
     if forward_backend != "cutedsl":
       case_specs.extend([

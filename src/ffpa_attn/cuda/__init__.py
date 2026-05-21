@@ -95,7 +95,9 @@ def _fwd_cuda_fake(
 ) -> tuple[torch.Tensor, torch.Tensor]:
   seqlen_q_aligned = ((Q.size(2) + 7) // 8) * 8
   O = torch.empty_like(Q)  # noqa: E741
-  softmax_lse = Q.new_empty(Q.size(0), Q.size(1), seqlen_q_aligned, dtype=torch.float32)
+  softmax_lse = Q.new_empty(
+    Q.size(0), Q.size(1), seqlen_q_aligned, dtype=torch.float32
+  )
   return O, softmax_lse
 
 

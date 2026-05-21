@@ -5,7 +5,8 @@ import enum
 
 
 class NamedBarrierFwd(enum.IntEnum):
-  Epilogue = enum.auto()  # starts from 1 as barrier 0 is reserved for sync_threads()
+  Epilogue = enum.auto(
+  )  # starts from 1 as barrier 0 is reserved for sync_threads()
   WarpSchedulerWG1 = enum.auto()
   WarpSchedulerWG2 = enum.auto()
   WarpSchedulerWG3 = enum.auto()
@@ -34,5 +35,7 @@ class NamedBarrierBwd(enum.IntEnum):
   VTailZero = enum.auto()  # 12
   # cross-WG handshake on single-buffered sP.
   PFull = enum.auto()  # 13 WG1 → WG2: sP[0] published (256-thread barrier)
-  PEmpty = enum.auto()  # 14 WG2 → WG1: sP[0] consumed; init credit + polite-close
-  dSLocal = enum.auto()  # 15 WG2-internal STSM(sdS) → WGMMA(read sdS) fence (128-thread)
+  PEmpty = enum.auto(
+  )  # 14 WG2 → WG1: sP[0] consumed; init credit + polite-close
+  dSLocal = enum.auto(
+  )  # 15 WG2-internal STSM(sdS) → WGMMA(read sdS) fence (128-thread)

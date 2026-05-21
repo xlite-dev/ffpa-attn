@@ -32,10 +32,17 @@ def _parse_args() -> argparse.Namespace:
 
   :return: Parsed arguments.
   """
-  parser = argparse.ArgumentParser(description="Compare online fast autotune config with persistent lookup config.")
-  parser.add_argument("--direction", choices=("forward", "backward"), default="backward")
+  parser = argparse.ArgumentParser(
+    description=
+    "Compare online fast autotune config with persistent lookup config."
+  )
   parser.add_argument(
-    "--case", choices=("self-attn", "cross-attn", "decode-attn", "non-aligned"), default="decode-attn"
+    "--direction", choices=("forward", "backward"), default="backward"
+  )
+  parser.add_argument(
+    "--case",
+    choices=("self-attn", "cross-attn", "decode-attn", "non-aligned"),
+    default="decode-attn"
   )
   parser.add_argument("--dtype", choices=("fp16", "bf16"), default="fp16")
   parser.add_argument("--B", type=int, default=1)
@@ -43,13 +50,35 @@ def _parse_args() -> argparse.Namespace:
   parser.add_argument("--N", type=int, default=8192)
   parser.add_argument("--D", type=int, default=512)
   parser.add_argument("--mode", choices=("fast", "max"), default="fast")
-  parser.add_argument("--enable-tma", action="store_true", help="Compatibility alias for both TMA directions.")
-  parser.add_argument("--enable-ws", action="store_true", help="Compatibility alias for both WS directions.")
-  parser.add_argument("--enable-fwd-tma", action="store_true", help="Verify the SM90+ TMA forward path.")
-  parser.add_argument("--enable-bwd-tma", action="store_true", help="Verify the SM90+ TMA backward path.")
-  parser.add_argument("--enable-fwd-ws", action="store_true", help="Verify warp-specialized SM90+ TMA forward configs.")
   parser.add_argument(
-    "--enable-bwd-ws", action="store_true", help="Verify warp-specialized SM90+ TMA backward configs."
+    "--enable-tma",
+    action="store_true",
+    help="Compatibility alias for both TMA directions."
+  )
+  parser.add_argument(
+    "--enable-ws",
+    action="store_true",
+    help="Compatibility alias for both WS directions."
+  )
+  parser.add_argument(
+    "--enable-fwd-tma",
+    action="store_true",
+    help="Verify the SM90+ TMA forward path."
+  )
+  parser.add_argument(
+    "--enable-bwd-tma",
+    action="store_true",
+    help="Verify the SM90+ TMA backward path."
+  )
+  parser.add_argument(
+    "--enable-fwd-ws",
+    action="store_true",
+    help="Verify warp-specialized SM90+ TMA forward configs."
+  )
+  parser.add_argument(
+    "--enable-bwd-ws",
+    action="store_true",
+    help="Verify warp-specialized SM90+ TMA backward configs."
   )
   args = parser.parse_args()
   if args.enable_tma:
@@ -61,7 +90,8 @@ def _parse_args() -> argparse.Namespace:
   return args
 
 
-def _case_shape(case_name: str, heads: int, seqlen: int) -> tuple[int, int, int, int]:
+def _case_shape(case_name: str, heads: int,
+                seqlen: int) -> tuple[int, int, int, int]:
   """Return ``(Hq, Hkv, Nq, Nkv)`` for one canonical benchmark case.
 
   :param case_name: Benchmark case name.
@@ -80,12 +110,16 @@ def _case_shape(case_name: str, heads: int, seqlen: int) -> tuple[int, int, int,
   return heads, heads, seqlen, seqlen
 
 
-def _same_config(lhs: dict[str, Any] | None, rhs: dict[str, Any] | None) -> bool:
+def _same_config(
+  lhs: dict[str, Any] | None, rhs: dict[str, Any] | None
+) -> bool:
   """Return whether two config dictionaries match exactly."""
   return lhs == rhs
 
 
-def _print_comparison(name: str, online: dict[str, Any] | None, persistent: dict[str, Any] | None) -> bool:
+def _print_comparison(
+  name: str, online: dict[str, Any] | None, persistent: dict[str, Any] | None
+) -> bool:
   """Print one config comparison and return whether it matched."""
   matched = _same_config(online, persistent)
   print(f"{name}: {'MATCH' if matched else 'MISMATCH'}")
@@ -94,7 +128,9 @@ def _print_comparison(name: str, online: dict[str, Any] | None, persistent: dict
   return matched
 
 
-def _run_forward(args: argparse.Namespace, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> list[bool]:
+def _run_forward(
+  args: argparse.Namespace, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
+) -> list[bool]:
   """Run online forward autotune and compare persistent lookup."""
   out = ffpa_attn_func(
     q,
@@ -115,24 +151,33 @@ def _run_forward(args: argparse.Namespace, q: torch.Tensor, k: torch.Tensor, v: 
   dtype = dtype_name(q.dtype)
   _, nheads_q, seqlen_q, headdim = q.shape
   _, nheads_kv, seqlen_k, _ = k.shape
-  num_splits = _get_decode_num_splits(seqlen_q, seqlen_k, headdim, q.size(0), nheads_q, q.device)
+  num_splits = _get_decode_num_splits(
+    seqlen_q, seqlen_k, headdim, q.size(0), nheads_q, q.device
+  )
   use_sm90_tma = args.enable_fwd_tma and is_sm90_tma_forward_supported(
     q, k, v, torch.empty_like(q), num_splits=num_splits
   )
   if use_sm90_tma:
     kernel = "fwd_sm90_generic"
     online = config_from_triton_config(
-      _get_fwd_sm90_autotune(headdim, args.mode, dtype, enable_ws=args.enable_fwd_ws).best_config
+      _get_fwd_sm90_autotune(
+        headdim, args.mode, dtype, enable_ws=args.enable_fwd_ws
+      ).best_config
     )
     use_gemv = None
   elif num_splits == 1:
     kernel = "fwd_generic"
-    online = config_from_triton_config(_get_fwd_autotune(headdim, args.mode, dtype).best_config)
+    online = config_from_triton_config(
+      _get_fwd_autotune(headdim, args.mode, dtype).best_config
+    )
     use_gemv = None
   else:
     kernel = "decode_fwd_stage1"
     use_gemv = seqlen_q == 1
-    online = config_from_triton_config(_get_decode_fwd_stage1_autotune(headdim, use_gemv, args.mode, dtype).best_config)
+    online = config_from_triton_config(
+      _get_decode_fwd_stage1_autotune(headdim, use_gemv, args.mode,
+                                      dtype).best_config
+    )
   persistent = lookup_persistent_config(
     PersistentConfigRequest(
       direction="forward",
@@ -156,7 +201,9 @@ def _run_forward(args: argparse.Namespace, q: torch.Tensor, k: torch.Tensor, v: 
   return [_print_comparison(kernel, online, persistent)]
 
 
-def _run_backward(args: argparse.Namespace, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> list[bool]:
+def _run_backward(
+  args: argparse.Namespace, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
+) -> list[bool]:
   """Run online backward autotune and compare persistent lookup."""
   out = ffpa_attn_func(
     q,
@@ -183,7 +230,9 @@ def _run_backward(args: argparse.Namespace, q: torch.Tensor, k: torch.Tensor, v:
   dtype = dtype_name(q.dtype)
   _, nheads_q, seqlen_q, headdim = q.shape
   _, nheads_kv, seqlen_k, _ = k.shape
-  pre_online = config_from_triton_config(_get_pre_autotune(False, args.mode, dtype).best_config)
+  pre_online = config_from_triton_config(
+    _get_pre_autotune(False, args.mode, dtype).best_config
+  )
   pre_persistent = lookup_persistent_config(
     PersistentConfigRequest(
       direction="backward",
@@ -209,17 +258,24 @@ def _run_backward(args: argparse.Namespace, q: torch.Tensor, k: torch.Tensor, v:
   if seqlen_q < 8:
     kernel = "decode_bwd_stage1"
     use_gemv = seqlen_q == 1
-    online = config_from_triton_config(_get_decode_bwd_stage1_autotune(headdim, use_gemv, args.mode, False).best_config)
+    online = config_from_triton_config(
+      _get_decode_bwd_stage1_autotune(headdim, use_gemv, args.mode,
+                                      False).best_config
+    )
   elif use_sm90_tma:
     kernel = "bwd_sm90_generic"
     use_gemv = None
     online = config_from_triton_config(
-      _get_bwd_sm90_autotune(headdim, args.mode, dtype, False, enable_ws=args.enable_bwd_ws).best_config
+      _get_bwd_sm90_autotune(
+        headdim, args.mode, dtype, False, enable_ws=args.enable_bwd_ws
+      ).best_config
     )
   else:
     kernel = "bwd_generic"
     use_gemv = None
-    online = config_from_triton_config(_get_bwd_autotune(headdim, args.mode, False).best_config)
+    online = config_from_triton_config(
+      _get_bwd_autotune(headdim, args.mode, False).best_config
+    )
   persistent = lookup_persistent_config(
     PersistentConfigRequest(
       direction="backward",
@@ -259,11 +315,37 @@ def main() -> int:
   dtype = torch.float16 if args.dtype == "fp16" else torch.bfloat16
   hq, hkv, nq, nkv = _case_shape(args.case, args.H, args.N)
   torch.manual_seed(42)
-  q = torch.randn(args.B, hq, nq, args.D, device="cuda", dtype=dtype, requires_grad=args.direction == "backward")
-  k = torch.randn(args.B, hkv, nkv, args.D, device="cuda", dtype=dtype, requires_grad=args.direction == "backward")
-  v = torch.randn(args.B, hkv, nkv, args.D, device="cuda", dtype=dtype, requires_grad=args.direction == "backward")
+  q = torch.randn(
+    args.B,
+    hq,
+    nq,
+    args.D,
+    device="cuda",
+    dtype=dtype,
+    requires_grad=args.direction == "backward"
+  )
+  k = torch.randn(
+    args.B,
+    hkv,
+    nkv,
+    args.D,
+    device="cuda",
+    dtype=dtype,
+    requires_grad=args.direction == "backward"
+  )
+  v = torch.randn(
+    args.B,
+    hkv,
+    nkv,
+    args.D,
+    device="cuda",
+    dtype=dtype,
+    requires_grad=args.direction == "backward"
+  )
   clear_config_cache()
-  results = _run_forward(args, q, k, v) if args.direction == "forward" else _run_backward(args, q, k, v)
+  results = _run_forward(
+    args, q, k, v
+  ) if args.direction == "forward" else _run_backward(args, q, k, v)
   return 0 if all(results) else 1
 
 

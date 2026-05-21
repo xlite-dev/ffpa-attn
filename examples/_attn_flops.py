@@ -34,7 +34,9 @@ def attention_valid_pairs(nq: int, nkv: int, causal: bool) -> int:
   return total
 
 
-def attention_fwd_flops(batch: int, num_heads_q: int, nq: int, nkv: int, headdim: int, causal: bool) -> int:
+def attention_fwd_flops(
+  batch: int, num_heads_q: int, nq: int, nkv: int, headdim: int, causal: bool
+) -> int:
   """Return the theoretical forward dominant-GEMM FLOPs.
 
   Forward attention is approximated as the two GEMMs ``QK^T`` and ``PV``.
@@ -51,7 +53,9 @@ def attention_fwd_flops(batch: int, num_heads_q: int, nq: int, nkv: int, headdim
   return 4 * batch * num_heads_q * headdim * valid_pairs
 
 
-def attention_bwd_flops(batch: int, num_heads_q: int, nq: int, nkv: int, headdim: int, causal: bool) -> int:
+def attention_bwd_flops(
+  batch: int, num_heads_q: int, nq: int, nkv: int, headdim: int, causal: bool
+) -> int:
   """Return the theoretical backward dominant-GEMM FLOPs.
 
   Backward attention is approximated as five dominant GEMMs: one ``QK^T``
@@ -66,7 +70,9 @@ def attention_bwd_flops(batch: int, num_heads_q: int, nq: int, nkv: int, headdim
   :param causal: Whether causal masking is active.
   :return: Theoretical backward FLOPs.
   """
-  return 5 * attention_fwd_flops(batch, num_heads_q, nq, nkv, headdim, causal) // 2
+  return 5 * attention_fwd_flops(
+    batch, num_heads_q, nq, nkv, headdim, causal
+  ) // 2
 
 
 def tflops_from_ms(flops: int, latency_ms: float | None) -> float | None:

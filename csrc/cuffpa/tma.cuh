@@ -34,8 +34,8 @@ inline bool is_experimental_tma_enabled() {
 
 inline bool device_supports_tma(int device_index) {
   int major = 0;
-  cudaError_t status =
-      cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device_index);
+  cudaError_t status = cudaDeviceGetAttribute(
+      &major, cudaDevAttrComputeCapabilityMajor, device_index);
   if (status != cudaSuccess) {
     return false;
   }
@@ -47,14 +47,15 @@ inline PFN_cuTensorMapEncodeTiled_v12000 get_cu_tensor_map_encode_tiled() {
   void* entry_point = nullptr;
 
 #if CUDA_VERSION >= 12050
-  cudaGetDriverEntryPointByVersion("cuTensorMapEncodeTiled", &entry_point, 12000, cudaEnableDefault,
-                                   &driver_status);
+  cudaGetDriverEntryPointByVersion("cuTensorMapEncodeTiled", &entry_point,
+                                   12000, cudaEnableDefault, &driver_status);
 #else
-  cudaGetDriverEntryPoint("cuTensorMapEncodeTiled", &entry_point, cudaEnableDefault,
-                          &driver_status);
+  cudaGetDriverEntryPoint("cuTensorMapEncodeTiled", &entry_point,
+                          cudaEnableDefault, &driver_status);
 #endif
   if (driver_status != cudaDriverEntryPointSuccess || entry_point == nullptr) {
-    throw std::runtime_error("Failed to resolve cuTensorMapEncodeTiled entry point");
+    throw std::runtime_error(
+        "Failed to resolve cuTensorMapEncodeTiled entry point");
   }
   return reinterpret_cast<PFN_cuTensorMapEncodeTiled_v12000>(entry_point);
 }
@@ -83,11 +84,13 @@ inline CUtensorMap make_2d_copy_desc(const Copy2DDescriptorParams<T>& params) {
 
   auto encode = get_cu_tensor_map_encode_tiled();
   CUresult result =
-      encode(&tensor_map, get_tensor_map_dtype<T>(), rank, params.global_address, global_dims,
-             global_stride, box_dims, elem_strides, CU_TENSOR_MAP_INTERLEAVE_NONE, params.swizzle,
+      encode(&tensor_map, get_tensor_map_dtype<T>(), rank,
+             params.global_address, global_dims, global_stride, box_dims,
+             elem_strides, CU_TENSOR_MAP_INTERLEAVE_NONE, params.swizzle,
              params.l2_promotion, params.oob_fill);
   if (result != CUDA_SUCCESS) {
-    throw std::runtime_error("cuTensorMapEncodeTiled failed for FFPA experimental TMA descriptor");
+    throw std::runtime_error(
+        "cuTensorMapEncodeTiled failed for FFPA experimental TMA descriptor");
   }
   return tensor_map;
 }
@@ -95,7 +98,8 @@ inline CUtensorMap make_2d_copy_desc(const Copy2DDescriptorParams<T>& params) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
 namespace cde = cuda::device::experimental;
 
-__device__ __forceinline__ void init_barrier(barrier_t* barrier, int arrive_count) {
+__device__ __forceinline__ void init_barrier(barrier_t* barrier,
+                                             int arrive_count) {
   init(barrier, arrive_count);
   cde::fence_proxy_async_shared_cta();
 }
@@ -111,7 +115,8 @@ __device__ __forceinline__ void wait_barrier(barrier_t& barrier) {
 // on the *current* phase bit (0 on the first reuse, 1 on the second,
 // alternating thereafter) instead of using ``wait(arrive())`` -- the
 // latter would over-arrive and corrupt the next phase.
-__device__ __forceinline__ void wait_barrier_parity(barrier_t& barrier, uint32_t phase) {
+__device__ __forceinline__ void wait_barrier_parity(barrier_t& barrier,
+                                                    uint32_t phase) {
   barrier.wait_parity(phase != 0);
   // The TMA bulk-tensor copy writes via the async proxy; ldmatrix.sync (used
   // by the consumer) reads via the generic proxy. mbarrier wait_parity
@@ -162,13 +167,16 @@ __device__ __forceinline__ void bulk_wait_group() {
 // smem and barrier slots are still distinct per call (the kernel rotates
 // stage / d_tile), so multi-issuer is safe; only the SASS dispatcher
 // changes.
-__device__ __forceinline__ void load_2d(void* smem_ptr, const CUtensorMap* tensor_map,
-                                        int32_t minor_coord, int32_t major_coord,
-                                        barrier_t& barrier, uint32_t bytes, int issuer_lane = 0) {
+__device__ __forceinline__ void load_2d(void* smem_ptr,
+                                        const CUtensorMap* tensor_map,
+                                        int32_t minor_coord,
+                                        int32_t major_coord, barrier_t& barrier,
+                                        uint32_t bytes, int issuer_lane = 0) {
   if (static_cast<int>(threadIdx.x) == issuer_lane) {
-    cde::cp_async_bulk_tensor_2d_global_to_shared(smem_ptr, tensor_map, minor_coord, major_coord,
-                                                  barrier);
-    [[maybe_unused]] auto token = cuda::device::barrier_arrive_tx(barrier, 1, bytes);
+    cde::cp_async_bulk_tensor_2d_global_to_shared(
+        smem_ptr, tensor_map, minor_coord, major_coord, barrier);
+    [[maybe_unused]] auto token =
+        cuda::device::barrier_arrive_tx(barrier, 1, bytes);
   }
 }
 
@@ -192,10 +200,12 @@ __device__ __forceinline__ void load_2d(void* smem_ptr, const CUtensorMap* tenso
 //
 // MUST be paired with ``wait_barrier`` on the same barrier slot before
 // the destination smem is read.
-template <const int BrOrBc, const int kHeadDim, const int kCols, const int kTileSize, typename T>
+template <const int BrOrBc, const int kHeadDim, const int kCols,
+          const int kTileSize, typename T>
 __device__ __forceinline__ bool issue_load_2d_to_dst_swizzled(
-    T* dst_smem_base_ptr, const CUtensorMap* tensor_map, const int major_coord, const int d_tile_id,
-    const int dst_stage, barrier_t& barrier, int issuer_lane = 0) {
+    T* dst_smem_base_ptr, const CUtensorMap* tensor_map, const int major_coord,
+    const int d_tile_id, const int dst_stage, barrier_t& barrier,
+    int issuer_lane = 0) {
   if (tensor_map == nullptr || d_tile_id >= (kHeadDim / kCols)) {
     return false;
   }
@@ -210,11 +220,10 @@ __device__ __forceinline__ bool issue_load_2d_to_dst_swizzled(
 // of ``tmp_smem_base_ptr``. Kept for the scratch+repack flow; new code
 // on SM90+ should prefer ``issue_load_2d_to_dst_swizzled`` above.
 template <const int BrOrBc, const int kHeadDim, const int kCols, typename T>
-__device__ __forceinline__ bool issue_load_2d_to_tmp(T* tmp_smem_base_ptr,
-                                                     const CUtensorMap* tensor_map,
-                                                     const int major_coord, const int d_tile_id,
-                                                     const int tmp_stage, const int seqlen_bound,
-                                                     barrier_t& barrier) {
+__device__ __forceinline__ bool issue_load_2d_to_tmp(
+    T* tmp_smem_base_ptr, const CUtensorMap* tensor_map, const int major_coord,
+    const int d_tile_id, const int tmp_stage, const int seqlen_bound,
+    barrier_t& barrier) {
   if (tensor_map == nullptr || d_tile_id >= (kHeadDim / kCols) ||
       ((major_coord + BrOrBc) > seqlen_bound)) {
     return false;
@@ -233,11 +242,12 @@ __device__ __forceinline__ bool issue_load_2d_to_tmp(T* tmp_smem_base_ptr,
 //
 // MUST only be invoked when the matching ``issue_load_2d_to_tmp`` returned
 // ``true``; otherwise the wait will block forever (no producer arrival).
-template <const int BrOrBc, const int kTileSize, const int kCols, const int kNumThreads,
-          const int kPad, typename T>
+template <const int BrOrBc, const int kTileSize, const int kCols,
+          const int kNumThreads, const int kPad, typename T>
 __device__ __forceinline__ void wait_and_repack_tmp_to_dst(T* dst_smem_base_ptr,
                                                            T* tmp_smem_base_ptr,
-                                                           const int dst_stage, const int tmp_stage,
+                                                           const int dst_stage,
+                                                           const int tmp_stage,
                                                            barrier_t& barrier) {
   constexpr bool kSwizzle = (kPad == 0);
   constexpr int kElemsPerThread = kCols / (kNumThreads / BrOrBc);
@@ -263,16 +273,15 @@ __device__ __forceinline__ void wait_and_repack_tmp_to_dst(T* dst_smem_base_ptr,
 // ``wait_and_repack_tmp_to_dst`` back-to-back. New code should prefer
 // the split helpers so that the issue and the wait can be hoisted apart
 // to enable multi-stage TMA pipelining.
-template <const int BrOrBc, const int kTileSize, const int kHeadDim, const int kCols,
-          const int kNumThreads, const int kPad, typename T>
-__device__ __forceinline__ bool load_2d_to_smem_repack(T* dst_smem_base_ptr, T* tmp_smem_base_ptr,
-                                                       const CUtensorMap* tensor_map,
-                                                       const int major_coord, const int d_tile_id,
-                                                       const int dst_stage, const int tmp_stage,
-                                                       const int seqlen_bound, barrier_t& barrier) {
-  if (!issue_load_2d_to_tmp<BrOrBc, kHeadDim, kCols, T>(tmp_smem_base_ptr, tensor_map, major_coord,
-                                                        d_tile_id, tmp_stage, seqlen_bound,
-                                                        barrier)) {
+template <const int BrOrBc, const int kTileSize, const int kHeadDim,
+          const int kCols, const int kNumThreads, const int kPad, typename T>
+__device__ __forceinline__ bool load_2d_to_smem_repack(
+    T* dst_smem_base_ptr, T* tmp_smem_base_ptr, const CUtensorMap* tensor_map,
+    const int major_coord, const int d_tile_id, const int dst_stage,
+    const int tmp_stage, const int seqlen_bound, barrier_t& barrier) {
+  if (!issue_load_2d_to_tmp<BrOrBc, kHeadDim, kCols, T>(
+          tmp_smem_base_ptr, tensor_map, major_coord, d_tile_id, tmp_stage,
+          seqlen_bound, barrier)) {
     return false;
   }
   wait_and_repack_tmp_to_dst<BrOrBc, kTileSize, kCols, kNumThreads, kPad, T>(
@@ -280,7 +289,8 @@ __device__ __forceinline__ bool load_2d_to_smem_repack(T* dst_smem_base_ptr, T* 
   return true;
 }
 #else
-__device__ __forceinline__ void init_barrier(barrier_t* barrier, int arrive_count) {
+__device__ __forceinline__ void init_barrier(barrier_t* barrier,
+                                             int arrive_count) {
   (void)barrier;
   (void)arrive_count;
 }
@@ -289,7 +299,8 @@ __device__ __forceinline__ void wait_barrier(barrier_t& barrier) {
   (void)barrier;
 }
 
-__device__ __forceinline__ void wait_barrier_parity(barrier_t& barrier, uint32_t phase) {
+__device__ __forceinline__ void wait_barrier_parity(barrier_t& barrier,
+                                                    uint32_t phase) {
   (void)barrier;
   (void)phase;
 }
@@ -299,9 +310,11 @@ __device__ __forceinline__ void bulk_commit_group() {}
 template <size_t n>
 __device__ __forceinline__ void bulk_wait_group() {}
 
-__device__ __forceinline__ void load_2d(void* smem_ptr, const CUtensorMap* tensor_map,
-                                        int32_t minor_coord, int32_t major_coord,
-                                        barrier_t& barrier, uint32_t bytes, int issuer_lane = 0) {
+__device__ __forceinline__ void load_2d(void* smem_ptr,
+                                        const CUtensorMap* tensor_map,
+                                        int32_t minor_coord,
+                                        int32_t major_coord, barrier_t& barrier,
+                                        uint32_t bytes, int issuer_lane = 0) {
   (void)smem_ptr;
   (void)tensor_map;
   (void)minor_coord;
@@ -311,10 +324,12 @@ __device__ __forceinline__ void load_2d(void* smem_ptr, const CUtensorMap* tenso
   (void)issuer_lane;
 }
 
-template <const int BrOrBc, const int kHeadDim, const int kCols, const int kTileSize, typename T>
+template <const int BrOrBc, const int kHeadDim, const int kCols,
+          const int kTileSize, typename T>
 __device__ __forceinline__ bool issue_load_2d_to_dst_swizzled(
-    T* dst_smem_base_ptr, const CUtensorMap* tensor_map, const int major_coord, const int d_tile_id,
-    const int dst_stage, barrier_t& barrier, int issuer_lane = 0) {
+    T* dst_smem_base_ptr, const CUtensorMap* tensor_map, const int major_coord,
+    const int d_tile_id, const int dst_stage, barrier_t& barrier,
+    int issuer_lane = 0) {
   (void)dst_smem_base_ptr;
   (void)tensor_map;
   (void)major_coord;
@@ -326,11 +341,10 @@ __device__ __forceinline__ bool issue_load_2d_to_dst_swizzled(
 }
 
 template <const int BrOrBc, const int kHeadDim, const int kCols, typename T>
-__device__ __forceinline__ bool issue_load_2d_to_tmp(T* tmp_smem_base_ptr,
-                                                     const CUtensorMap* tensor_map,
-                                                     const int major_coord, const int d_tile_id,
-                                                     const int tmp_stage, const int seqlen_bound,
-                                                     barrier_t& barrier) {
+__device__ __forceinline__ bool issue_load_2d_to_tmp(
+    T* tmp_smem_base_ptr, const CUtensorMap* tensor_map, const int major_coord,
+    const int d_tile_id, const int tmp_stage, const int seqlen_bound,
+    barrier_t& barrier) {
   (void)tmp_smem_base_ptr;
   (void)tensor_map;
   (void)major_coord;
@@ -341,11 +355,12 @@ __device__ __forceinline__ bool issue_load_2d_to_tmp(T* tmp_smem_base_ptr,
   return false;
 }
 
-template <const int BrOrBc, const int kTileSize, const int kCols, const int kNumThreads,
-          const int kPad, typename T>
+template <const int BrOrBc, const int kTileSize, const int kCols,
+          const int kNumThreads, const int kPad, typename T>
 __device__ __forceinline__ void wait_and_repack_tmp_to_dst(T* dst_smem_base_ptr,
                                                            T* tmp_smem_base_ptr,
-                                                           const int dst_stage, const int tmp_stage,
+                                                           const int dst_stage,
+                                                           const int tmp_stage,
                                                            barrier_t& barrier) {
   (void)dst_smem_base_ptr;
   (void)tmp_smem_base_ptr;
@@ -354,13 +369,12 @@ __device__ __forceinline__ void wait_and_repack_tmp_to_dst(T* dst_smem_base_ptr,
   (void)barrier;
 }
 
-template <const int BrOrBc, const int kTileSize, const int kHeadDim, const int kCols,
-          const int kNumThreads, const int kPad, typename T>
-__device__ __forceinline__ bool load_2d_to_smem_repack(T* dst_smem_base_ptr, T* tmp_smem_base_ptr,
-                                                       const CUtensorMap* tensor_map,
-                                                       const int major_coord, const int d_tile_id,
-                                                       const int dst_stage, const int tmp_stage,
-                                                       const int seqlen_bound, barrier_t& barrier) {
+template <const int BrOrBc, const int kTileSize, const int kHeadDim,
+          const int kCols, const int kNumThreads, const int kPad, typename T>
+__device__ __forceinline__ bool load_2d_to_smem_repack(
+    T* dst_smem_base_ptr, T* tmp_smem_base_ptr, const CUtensorMap* tensor_map,
+    const int major_coord, const int d_tile_id, const int dst_stage,
+    const int tmp_stage, const int seqlen_bound, barrier_t& barrier) {
   (void)dst_smem_base_ptr;
   (void)tmp_smem_base_ptr;
   (void)tensor_map;

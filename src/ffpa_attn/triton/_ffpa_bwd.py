@@ -134,7 +134,9 @@ def _attn_bias_grad_reduces_query(
   main kernel either atomically accumulates this reduction directly or writes
   per-Q-block partials for the dedicated fp32 reducer below.
   """
-  return grad_attn_bias is not None and grad_attn_bias.size(2) == 1 and seqlen_q > 1
+  return grad_attn_bias is not None and grad_attn_bias.size(
+    2
+  ) == 1 and seqlen_q > 1
 
 
 def _attn_bias_grad_is_key_bias(
@@ -166,7 +168,9 @@ def _curand_uniform_from_element_offset(seed: tl.constexpr, element_offset):
   quad_offset = element_offset // 4
   lane = element_offset - quad_offset * 4
   r0, r1, r2, r3 = tl.randint4x(seed, quad_offset)
-  r = tl.where(lane == 0, r0, tl.where(lane == 1, r1, tl.where(lane == 2, r2, r3)))
+  r = tl.where(
+    lane == 0, r0, tl.where(lane == 1, r1, tl.where(lane == 2, r2, r3))
+  )
   r_u32 = r.to(tl.uint32, bitcast=True)
   return (r_u32.to(tl.float32) + 1.0) * 2.3283064365386963e-10
 
@@ -190,8 +194,11 @@ def _dropout_multiplier(
   mult = tl.full([offs_m.shape[0], offs_n.shape[0]], 1.0, dtype=tl.float32)
   if HAS_DROPOUT:
     # Replay the exact forward dropout mask using SDPA's logical score layout.
-    linear = off_hb * seqlen_q * seqlen_k + offs_m[:, None] * seqlen_k + offs_n[None, :]
-    rand = _curand_uniform_from_element_offset(philox_seed, philox_offset + linear)
+    linear = off_hb * seqlen_q * seqlen_k + offs_m[:, None] * seqlen_k + offs_n[
+      None, :]
+    rand = _curand_uniform_from_element_offset(
+      philox_seed, philox_offset + linear
+    )
     keep = rand > dropout_p
     mult = keep * (1.0 / (1.0 - dropout_p))
   return mult
@@ -247,33 +254,41 @@ def _ffpa_bwd_pre_impl(
     for d_chunk in range(num_d_chunks):
       d_offs = d_chunk * BLOCK_HEADDIM + offs_d
       o = tl.load(
-        Out + off_b * stride_ob + off_h * stride_oh + offs_m[:, None] * stride_om + d_offs[None, :],
+        Out + off_b * stride_ob + off_h * stride_oh +
+        offs_m[:, None] * stride_om + d_offs[None, :],
         mask=(offs_m[:, None] < seqlen_q) & (d_offs[None, :] < headdim),
         other=0.0,
       ).to(tl.float32)
       do = tl.load(
-        DO + off_b * stride_dob + off_h * stride_doh + offs_m[:, None] * stride_dom + d_offs[None, :],
+        DO + off_b * stride_dob + off_h * stride_doh +
+        offs_m[:, None] * stride_dom + d_offs[None, :],
         mask=(offs_m[:, None] < seqlen_q) & (d_offs[None, :] < headdim),
         other=0.0,
       ).to(tl.float32)
       delta += tl.sum(o * do, axis=1)
   else:
     o = tl.load(
-      Out + off_b * stride_ob + off_h * stride_oh + offs_m[:, None] * stride_om + offs_d[None, :],
+      Out + off_b * stride_ob + off_h * stride_oh +
+      offs_m[:, None] * stride_om + offs_d[None, :],
       mask=(offs_m[:, None] < seqlen_q) & (offs_d[None, :] < headdim),
       other=0.0,
     ).to(tl.float32)
     do = tl.load(
-      DO + off_b * stride_dob + off_h * stride_doh + offs_m[:, None] * stride_dom + offs_d[None, :],
+      DO + off_b * stride_dob + off_h * stride_doh +
+      offs_m[:, None] * stride_dom + offs_d[None, :],
       mask=(offs_m[:, None] < seqlen_q) & (offs_d[None, :] < headdim),
       other=0.0,
     ).to(tl.float32)
     delta = tl.sum(o * do, axis=1)
 
-  tl.store(Delta + off_hb * seqlen_q_rounded + offs_m, delta, mask=offs_m < seqlen_q)
+  tl.store(
+    Delta + off_hb * seqlen_q_rounded + offs_m, delta, mask=offs_m < seqlen_q
+  )
 
 
-def _gen_pre_autotune_configs(d_chunk: bool, autotune_mode: str = "max") -> list[triton.Config]:
+def _gen_pre_autotune_configs(d_chunk: bool,
+                              autotune_mode: str = "max"
+                              ) -> list[triton.Config]:
   """Generate autotune configs for the preprocess delta kernel.
 
   ``BLOCK_HEADDIM`` participates in autotune only for D_CHUNK mode.  Full-D
@@ -291,13 +306,15 @@ def _gen_pre_autotune_configs(d_chunk: bool, autotune_mode: str = "max") -> list
     # fast: 2*1 = 2 configs; max: 2*2 = 4 configs
     if not d_chunk:
       for num_warps in ([4] if autotune_mode == "fast" else [4, 8]):
-        configs.append(triton.Config(
-          {
-            "BLOCK_M": block_m,
-            "D_CHUNK": False
-          },
-          num_warps=num_warps,
-        ))
+        configs.append(
+          triton.Config(
+            {
+              "BLOCK_M": block_m,
+              "D_CHUNK": False
+            },
+            num_warps=num_warps,
+          )
+        )
       continue
 
     # fast: 2*2*1 = 4 configs; max: 2*2*2 = 8 configs
@@ -323,7 +340,9 @@ def _get_pre_autotune(d_chunk: bool, autotune_mode: str, dtype: str):
   cache_key = (d_chunk, autotune_mode, dtype)
   if cache_key not in _ffpa_bwd_pre_autotune_cache:
     _ffpa_bwd_pre_autotune_cache[cache_key] = triton.autotune(
-      configs=_gen_pre_autotune_configs(d_chunk=d_chunk, autotune_mode=autotune_mode),
+      configs=_gen_pre_autotune_configs(
+        d_chunk=d_chunk, autotune_mode=autotune_mode
+      ),
       key=["autotune_seqlen_q_bucket", "headdim"],
       reset_to_zero=["Delta"],
       cache_results=True,
@@ -365,7 +384,9 @@ def _normalize_bwd_pre_config(
   return normalized
 
 
-def _gen_bwd_autotune_configs(autotune_mode: str = "max", ) -> list[triton.Config]:
+def _gen_bwd_autotune_configs(
+  autotune_mode: str = "max",
+) -> list[triton.Config]:
   """Generate autotune configs over BLOCK_M, BLOCK_N, BLOCK_HEADDIM, num_warps, num_stages.
 
   :param block_n_values: Candidate ``BLOCK_N`` values for the target backward
@@ -496,18 +517,25 @@ def _ffpa_bwd_kernel_impl(
   _ = autotune_causal_key
   _ = autotune_dtype_key
   _ffpa_bwd_dkdv(
-    Q, K, V, DO, DK, DV, LSE, D, AttnBias, GradAttnBias, softmax_scale, stride_qb, stride_qh, stride_qm, stride_kb,
-    stride_kh, stride_kn, stride_vb, stride_vh, stride_vn, stride_dob, stride_doh, stride_dom, stride_dkb, stride_dkh,
-    stride_dkn, stride_dvb, stride_dvh, stride_dvn, stride_bb, stride_bh, stride_bm, stride_bn, stride_gbb, stride_gbh,
-    stride_gbm, stride_gbn, nheads, seqlen_q, seqlen_k, seqlen_q_rounded, headdim, dropout_p, philox_offset, IS_CAUSAL,
-    HAS_ATTN_BIAS, HAS_DROPOUT, PHILOX_SEED, BIAS_REQUIRES_GRAD, GRAD_BIAS_NEEDS_REDUCTION, GRAD_BIAS_REDUCES_M,
-    GRAD_BIAS_STORE_PARTIAL, BLOCK_HEADDIM, DTYPE, EVEN_M, EVEN_N, BLOCK_M, BLOCK_N
+    Q, K, V, DO, DK, DV, LSE, D, AttnBias, GradAttnBias, softmax_scale,
+    stride_qb, stride_qh, stride_qm, stride_kb, stride_kh, stride_kn, stride_vb,
+    stride_vh, stride_vn, stride_dob, stride_doh, stride_dom, stride_dkb,
+    stride_dkh, stride_dkn, stride_dvb, stride_dvh, stride_dvn, stride_bb,
+    stride_bh, stride_bm, stride_bn, stride_gbb, stride_gbh, stride_gbm,
+    stride_gbn, nheads, seqlen_q, seqlen_k, seqlen_q_rounded, headdim,
+    dropout_p, philox_offset, IS_CAUSAL, HAS_ATTN_BIAS, HAS_DROPOUT,
+    PHILOX_SEED, BIAS_REQUIRES_GRAD, GRAD_BIAS_NEEDS_REDUCTION,
+    GRAD_BIAS_REDUCES_M, GRAD_BIAS_STORE_PARTIAL, BLOCK_HEADDIM, DTYPE, EVEN_M,
+    EVEN_N, BLOCK_M, BLOCK_N
   )
   _ffpa_bwd_dq(
-    Q, K, V, DO, DQ, LSE, D, AttnBias, softmax_scale, stride_qb, stride_qh, stride_qm, stride_kb, stride_kh, stride_kn,
-    stride_vb, stride_vh, stride_vn, stride_dob, stride_doh, stride_dom, stride_dqb, stride_dqh, stride_dqm, stride_bb,
-    stride_bh, stride_bm, stride_bn, nheads, seqlen_q, seqlen_k, seqlen_q_rounded, headdim, dropout_p, philox_offset,
-    IS_CAUSAL, HAS_ATTN_BIAS, HAS_DROPOUT, PHILOX_SEED, BLOCK_HEADDIM, DTYPE, EVEN_N, BLOCK_M, BLOCK_N
+    Q, K, V, DO, DQ, LSE, D, AttnBias, softmax_scale, stride_qb, stride_qh,
+    stride_qm, stride_kb, stride_kh, stride_kn, stride_vb, stride_vh, stride_vn,
+    stride_dob, stride_doh, stride_dom, stride_dqb, stride_dqh, stride_dqm,
+    stride_bb, stride_bh, stride_bm, stride_bn, nheads, seqlen_q, seqlen_k,
+    seqlen_q_rounded, headdim, dropout_p, philox_offset, IS_CAUSAL,
+    HAS_ATTN_BIAS, HAS_DROPOUT, PHILOX_SEED, BLOCK_HEADDIM, DTYPE, EVEN_N,
+    BLOCK_M, BLOCK_N
   )
 
 
@@ -671,7 +699,8 @@ def _ffpa_bwd_dkdv(
         Di = tl.load(D + offs_qm, mask=m_mask, other=0.0)
       if BIAS_REQUIRES_GRAD:
         dBias = P * (dP - Di[:, None])
-        grad_bias_mask = (offs_qm[:, None] < seqlen_q) & (offs_n[None, :] < seqlen_k)
+        grad_bias_mask = (offs_qm[:, None]
+                          < seqlen_q) & (offs_n[None, :] < seqlen_k)
         if GRAD_BIAS_REDUCES_M:
           m_block = start_m // BLOCK_M
           grad_bias_ptrs = GradAttnBias + m_block * stride_gbm + offs_n * stride_gbn
@@ -679,12 +708,20 @@ def _ffpa_bwd_dkdv(
           if GRAD_BIAS_STORE_PARTIAL:
             tl.store(grad_bias_ptrs, grad_bias, mask=offs_n < seqlen_k)
           else:
-            tl.atomic_add(grad_bias_ptrs, grad_bias, sem="relaxed", mask=offs_n < seqlen_k)
+            tl.atomic_add(
+              grad_bias_ptrs, grad_bias, sem="relaxed", mask=offs_n < seqlen_k
+            )
         elif GRAD_BIAS_NEEDS_REDUCTION:
-          grad_bias_ptrs = GradAttnBias + offs_qm[:, None] * stride_gbm + offs_n[None, :] * stride_gbn
-          tl.atomic_add(grad_bias_ptrs, dBias, sem="relaxed", mask=grad_bias_mask)
+          grad_bias_ptrs = GradAttnBias + offs_qm[:,
+                                                  None] * stride_gbm + offs_n[
+                                                    None, :] * stride_gbn
+          tl.atomic_add(
+            grad_bias_ptrs, dBias, sem="relaxed", mask=grad_bias_mask
+          )
         else:
-          grad_bias_ptrs = GradAttnBias + offs_qm[:, None] * stride_gbm + offs_n[None, :] * stride_gbn
+          grad_bias_ptrs = GradAttnBias + offs_qm[:,
+                                                  None] * stride_gbm + offs_n[
+                                                    None, :] * stride_gbn
           tl.store(grad_bias_ptrs, dBias, mask=grad_bias_mask)
         dS = (dBias * softmax_scale).to(DTYPE)
       else:
@@ -716,15 +753,33 @@ def _ffpa_bwd_dkdv(
         if start_m == begin_m:
           dk_d = tl.trans(tl.dot(tl.trans(q), dS, out_dtype=tl.float32))
           tl.store(dk_ptrs, dk_d, mask=grad_mask, eviction_policy="evict_last")
-          dv_d = tl.trans(tl.dot(tl.trans(do), P_drop.to(DTYPE), out_dtype=tl.float32))
+          dv_d = tl.trans(
+            tl.dot(tl.trans(do), P_drop.to(DTYPE), out_dtype=tl.float32)
+          )
           tl.store(dv_ptrs, dv_d, mask=grad_mask, eviction_policy="evict_last")
         else:
-          dk_val = tl.load(dk_ptrs, mask=grad_mask, other=0., eviction_policy="evict_last")
+          dk_val = tl.load(
+            dk_ptrs, mask=grad_mask, other=0., eviction_policy="evict_last"
+          )
           dk_d = tl.trans(tl.dot(tl.trans(q), dS, out_dtype=tl.float32))
-          tl.store(dk_ptrs, dk_val + dk_d, mask=grad_mask, eviction_policy="evict_last")
-          dv_val = tl.load(dv_ptrs, mask=grad_mask, other=0., eviction_policy="evict_last")
-          dv_d = tl.trans(tl.dot(tl.trans(do), P_drop.to(DTYPE), out_dtype=tl.float32))
-          tl.store(dv_ptrs, dv_val + dv_d, mask=grad_mask, eviction_policy="evict_last")
+          tl.store(
+            dk_ptrs,
+            dk_val + dk_d,
+            mask=grad_mask,
+            eviction_policy="evict_last"
+          )
+          dv_val = tl.load(
+            dv_ptrs, mask=grad_mask, other=0., eviction_policy="evict_last"
+          )
+          dv_d = tl.trans(
+            tl.dot(tl.trans(do), P_drop.to(DTYPE), out_dtype=tl.float32)
+          )
+          tl.store(
+            dv_ptrs,
+            dv_val + dv_d,
+            mask=grad_mask,
+            eviction_policy="evict_last"
+          )
 
 
 # dQ-only half of the main backward path. Each program owns one Q tile, so dQ
@@ -834,7 +889,9 @@ def _ffpa_bwd_dq(
       if not EVEN_N:
         S_qk = tl.where(offs_nk[None, :] < seqlen_k, S_qk, float("-inf"))
       if IS_CAUSAL:
-        S_qk = tl.where(offs_m[:, None] >= (offs_nk[None, :]), S_qk, float("-inf"))
+        S_qk = tl.where(
+          offs_m[:, None] >= (offs_nk[None, :]), S_qk, float("-inf")
+        )
       S_qk = S_qk * softmax_scale
       if HAS_ATTN_BIAS:
         bias = tl.load(
@@ -873,9 +930,13 @@ def _ffpa_bwd_dq(
           dq_d = tl.dot(dS_qk, k, out_dtype=tl.float32)
           tl.store(dq_ptrs, dq_d, mask=dq_mask, eviction_policy="evict_last")
         else:
-          dq_val = tl.load(dq_ptrs, mask=dq_mask, other=0., eviction_policy="evict_last")
+          dq_val = tl.load(
+            dq_ptrs, mask=dq_mask, other=0., eviction_policy="evict_last"
+          )
           dq_d = tl.dot(dS_qk, k, out_dtype=tl.float32)
-          tl.store(dq_ptrs, dq_val + dq_d, mask=dq_mask, eviction_policy="evict_last")
+          tl.store(
+            dq_ptrs, dq_val + dq_d, mask=dq_mask, eviction_policy="evict_last"
+          )
 
 
 # Non-autotuned main backward variant.
@@ -953,12 +1014,16 @@ def _ffpa_bwd_dkdv_kernel_impl(
   _ = autotune_causal_key
   _ = autotune_dtype_key
   _ffpa_bwd_dkdv(
-    Q, K, V, DO, DK, DV, LSE, D, AttnBias, GradAttnBias, softmax_scale, stride_qb, stride_qh, stride_qm, stride_kb,
-    stride_kh, stride_kn, stride_vb, stride_vh, stride_vn, stride_dob, stride_doh, stride_dom, stride_dkb, stride_dkh,
-    stride_dkn, stride_dvb, stride_dvh, stride_dvn, stride_bb, stride_bh, stride_bm, stride_bn, stride_gbb, stride_gbh,
-    stride_gbm, stride_gbn, nheads, seqlen_q, seqlen_k, seqlen_q_rounded, headdim, dropout_p, philox_offset, IS_CAUSAL,
-    HAS_ATTN_BIAS, HAS_DROPOUT, PHILOX_SEED, BIAS_REQUIRES_GRAD, GRAD_BIAS_NEEDS_REDUCTION, GRAD_BIAS_REDUCES_M,
-    GRAD_BIAS_STORE_PARTIAL, BLOCK_HEADDIM, DTYPE, EVEN_M, EVEN_N, BLOCK_M, BLOCK_N
+    Q, K, V, DO, DK, DV, LSE, D, AttnBias, GradAttnBias, softmax_scale,
+    stride_qb, stride_qh, stride_qm, stride_kb, stride_kh, stride_kn, stride_vb,
+    stride_vh, stride_vn, stride_dob, stride_doh, stride_dom, stride_dkb,
+    stride_dkh, stride_dkn, stride_dvb, stride_dvh, stride_dvn, stride_bb,
+    stride_bh, stride_bm, stride_bn, stride_gbb, stride_gbh, stride_gbm,
+    stride_gbn, nheads, seqlen_q, seqlen_k, seqlen_q_rounded, headdim,
+    dropout_p, philox_offset, IS_CAUSAL, HAS_ATTN_BIAS, HAS_DROPOUT,
+    PHILOX_SEED, BIAS_REQUIRES_GRAD, GRAD_BIAS_NEEDS_REDUCTION,
+    GRAD_BIAS_REDUCES_M, GRAD_BIAS_STORE_PARTIAL, BLOCK_HEADDIM, DTYPE, EVEN_M,
+    EVEN_N, BLOCK_M, BLOCK_N
   )
 
 
@@ -1019,10 +1084,13 @@ def _ffpa_bwd_dq_kernel_impl(
   _ = autotune_causal_key
   _ = autotune_dtype_key
   _ffpa_bwd_dq(
-    Q, K, V, DO, DQ, LSE, D, AttnBias, softmax_scale, stride_qb, stride_qh, stride_qm, stride_kb, stride_kh, stride_kn,
-    stride_vb, stride_vh, stride_vn, stride_dob, stride_doh, stride_dom, stride_dqb, stride_dqh, stride_dqm, stride_bb,
-    stride_bh, stride_bm, stride_bn, nheads, seqlen_q, seqlen_k, seqlen_q_rounded, headdim, dropout_p, philox_offset,
-    IS_CAUSAL, HAS_ATTN_BIAS, HAS_DROPOUT, PHILOX_SEED, BLOCK_HEADDIM, DTYPE, EVEN_N, BLOCK_M, BLOCK_N
+    Q, K, V, DO, DQ, LSE, D, AttnBias, softmax_scale, stride_qb, stride_qh,
+    stride_qm, stride_kb, stride_kh, stride_kn, stride_vb, stride_vh, stride_vn,
+    stride_dob, stride_doh, stride_dom, stride_dqb, stride_dqh, stride_dqm,
+    stride_bb, stride_bh, stride_bm, stride_bn, nheads, seqlen_q, seqlen_k,
+    seqlen_q_rounded, headdim, dropout_p, philox_offset, IS_CAUSAL,
+    HAS_ATTN_BIAS, HAS_DROPOUT, PHILOX_SEED, BLOCK_HEADDIM, DTYPE, EVEN_N,
+    BLOCK_M, BLOCK_N
   )
 
 
@@ -1051,7 +1119,9 @@ _ffpa_bwd_dkdv_autotune_cache: dict[tuple[int, str, bool], callable] = {}
 _ffpa_bwd_dq_autotune_cache: dict[tuple[int, str], callable] = {}
 
 
-def _get_bwd_autotune(headdim: int, autotune_mode: str, bias_requires_grad: bool):
+def _get_bwd_autotune(
+  headdim: int, autotune_mode: str, bias_requires_grad: bool
+):
   """Return an autotune wrapper for the main backward kernel.
 
   :param headdim: Runtime head dimension used by the config generator.
@@ -1081,7 +1151,9 @@ def _get_bwd_autotune(headdim: int, autotune_mode: str, bias_requires_grad: bool
   return _ffpa_bwd_autotune_cache[cache_key]
 
 
-def _get_bwd_dkdv_autotune(headdim: int, autotune_mode: str, bias_requires_grad: bool):
+def _get_bwd_dkdv_autotune(
+  headdim: int, autotune_mode: str, bias_requires_grad: bool
+):
   """Return an autotune wrapper for the generic split dK/dV kernel."""
   cache_key = (headdim, autotune_mode, bias_requires_grad)
   if cache_key not in _ffpa_bwd_dkdv_autotune_cache:
@@ -1161,7 +1233,8 @@ def _gen_decode_bwd_stage1_autotune_configs(
   return configs
 
 
-_ffpa_bwd_decode_stage1_autotune_cache: dict[tuple[int, bool, str, bool], callable] = {}
+_ffpa_bwd_decode_stage1_autotune_cache: dict[tuple[int, bool, str, bool],
+                                             callable] = {}
 
 
 def _get_decode_bwd_stage1_autotune(
@@ -1369,7 +1442,9 @@ def _ffpa_bwd_decode_stage1_kernel(
     dropout_mult = tl.full([BLOCK_N], 1.0, dtype=tl.float32)
     if HAS_DROPOUT:
       linear = off_hb * seqlen_q * seqlen_k + offs_n
-      rand = _curand_uniform_from_element_offset(PHILOX_SEED, philox_offset + linear)
+      rand = _curand_uniform_from_element_offset(
+        PHILOX_SEED, philox_offset + linear
+      )
       keep = rand > dropout_p
       dropout_mult = keep * (1.0 / (1.0 - dropout_p))
     dP = dP * dropout_mult
@@ -1485,10 +1560,12 @@ def _ffpa_bwd_decode_stage1_kernel(
         grad_bias = tl.sum(tl.where(grad_bias_mask, dBias, 0.0), axis=0)
         tl.atomic_add(grad_bias_ptrs, grad_bias, sem="relaxed", mask=mask_n)
       elif GRAD_BIAS_NEEDS_REDUCTION:
-        grad_bias_ptrs = GradAttnBias + offs_m[:, None] * stride_gbm + offs_n[None, :] * stride_gbn
+        grad_bias_ptrs = GradAttnBias + offs_m[:, None] * stride_gbm + offs_n[
+          None, :] * stride_gbn
         tl.atomic_add(grad_bias_ptrs, dBias, sem="relaxed", mask=grad_bias_mask)
       else:
-        grad_bias_ptrs = GradAttnBias + offs_m[:, None] * stride_gbm + offs_n[None, :] * stride_gbn
+        grad_bias_ptrs = GradAttnBias + offs_m[:, None] * stride_gbm + offs_n[
+          None, :] * stride_gbn
         tl.store(grad_bias_ptrs, dBias, mask=grad_bias_mask)
 
     for d_chunk in range(num_d_chunks):
@@ -1563,8 +1640,10 @@ def _ffpa_bwd_decode_dq_reduce_kernel(
   for start_k in range(0, written_k_blocks, BLOCK_K):
     k_blocks = start_k + offs_k
     partial = tl.load(
-      PartialDQ + k_blocks[:, None, None] * stride_pqk + offs_m[None, :, None] * stride_pqm + offs_d[None, None, :],
-      mask=(k_blocks[:, None, None] < written_k_blocks) & mask_m[None, :, None] & (offs_d[None, None, :] < headdim),
+      PartialDQ + k_blocks[:, None, None] * stride_pqk +
+      offs_m[None, :, None] * stride_pqm + offs_d[None, None, :],
+      mask=(k_blocks[:, None, None] < written_k_blocks) & mask_m[None, :, None]
+      & (offs_d[None, None, :] < headdim),
       other=0.0,
     )
     acc += tl.sum(partial, axis=0)
@@ -1684,7 +1763,9 @@ def _ffpa_attn_backward_triton_impl(
   autotune_causal_key = int(causal)
   has_attn_bias = attn_bias is not None
   attn_bias_in = attn_bias if attn_bias is not None else q
-  bias_strides = _attn_bias_broadcast_strides(attn_bias, batch, nheads, seqlen_q, seqlen_k)
+  bias_strides = _attn_bias_broadcast_strides(
+    attn_bias, batch, nheads, seqlen_q, seqlen_k
+  )
   bias_requires_grad = grad_attn_bias is not None
   grad_bias_needs_reduction = _attn_bias_grad_needs_reduction(
     grad_attn_bias,
@@ -1699,14 +1780,18 @@ def _ffpa_attn_backward_triton_impl(
   # partial-buffer path in both autotune and non-autotune modes so compact
   # key-bias dMask keeps one reduction semantic instead of switching to
   # score-level atomics only because autotune is enabled.
-  use_key_bias_grad_reduction = _attn_bias_grad_is_key_bias(grad_attn_bias, seqlen_q, seqlen_k)
+  use_key_bias_grad_reduction = _attn_bias_grad_is_key_bias(
+    grad_attn_bias, seqlen_q, seqlen_k
+  )
   main_bias_requires_grad = bias_requires_grad
   grad_bias_store_partial = use_key_bias_grad_reduction
   has_dropout = dropout_p > 0.0
   runtime_dtype = dtype_name(q.dtype)
   if dk.dtype == torch.float32 or dv.dtype == torch.float32:
     grad_kv_storage_dtype = "fp32"
-  elif (dk.dtype == torch.float16 or dv.dtype == torch.float16) and q.dtype != torch.float16:
+  elif (
+    dk.dtype == torch.float16 or dv.dtype == torch.float16
+  ) and q.dtype != torch.float16:
     grad_kv_storage_dtype = "fp16"
   else:
     grad_kv_storage_dtype = None
@@ -1733,9 +1818,11 @@ def _ffpa_attn_backward_triton_impl(
     )
   partial_grad_bias = None
   if use_key_bias_grad_reduction:
-    min_block_m_for_bias = 64 if autotune or split_launch else int((persisted_main_config or {
-      "BLOCK_M": 128
-    })["BLOCK_M"])
+    min_block_m_for_bias = 64 if autotune or split_launch else int(
+      (persisted_main_config or {
+        "BLOCK_M": 128
+      })["BLOCK_M"]
+    )
     num_m_blocks_for_bias = triton.cdiv(seqlen_q, min_block_m_for_bias)
     # Main-path autotune can switch between BLOCK_M=64 and BLOCK_M=128. Size the
     # partial key-bias buffer for the smallest candidate so BLOCK_M=64 has room
@@ -1797,7 +1884,9 @@ def _ffpa_attn_backward_triton_impl(
     headdim,
   )
   if autotune:
-    pre_kernel = _get_pre_autotune(preprocess_d_chunk, autotune_mode, runtime_dtype)
+    pre_kernel = _get_pre_autotune(
+      preprocess_d_chunk, autotune_mode, runtime_dtype
+    )
     pre_kernel[pre_grid](*pre_args)
   else:
     block_headdim_delta = 64 if preprocess_d_chunk else BLOCK_HEADDIM_DELTA
@@ -1818,10 +1907,11 @@ def _ffpa_attn_backward_triton_impl(
       preprocess_d_chunk=preprocess_d_chunk,
       block_headdim_delta=block_headdim_delta,
     )
-    _ffpa_bwd_pre[(triton.cdiv(seqlen_q, pre_config["BLOCK_M"]), batch * nheads)](
-      *pre_args,
-      **pre_config,
-    )
+    _ffpa_bwd_pre[
+      (triton.cdiv(seqlen_q, pre_config["BLOCK_M"]), batch * nheads)](
+        *pre_args,
+        **pre_config,
+      )
 
   # Very short query lengths are decode-like: many K tiles contribute to one or
   # a few query rows. The dedicated path keeps DK/DV per K block and reduces dQ
@@ -1873,7 +1963,9 @@ def _ffpa_attn_backward_triton_impl(
       dtype=torch.float32,
       device=q.device,
     )
-    written_k_blocks = torch.empty((batch * nheads, ), dtype=torch.int32, device=q.device)
+    written_k_blocks = torch.empty((batch * nheads, ),
+                                   dtype=torch.int32,
+                                   device=q.device)
 
     def decode_grid(meta: dict) -> tuple[int, int]:
       return (triton.cdiv(seqlen_k, meta["BLOCK_N"]), batch * nheads)
@@ -1996,7 +2088,10 @@ def _ffpa_attn_backward_triton_impl(
 
   def grid(meta: dict) -> tuple[int, ...]:
     return (
-      max(triton.cdiv(seqlen_k, meta["BLOCK_N"]), triton.cdiv(seqlen_q, meta["BLOCK_M"])),
+      max(
+        triton.cdiv(seqlen_k, meta["BLOCK_N"]),
+        triton.cdiv(seqlen_q, meta["BLOCK_M"])
+      ),
       1,
       batch * nheads,
     )
@@ -2119,7 +2214,8 @@ def _ffpa_attn_backward_triton_impl(
       return (triton.cdiv(seqlen_q, meta["BLOCK_M"]), 1, batch * nheads)
 
     if autotune:
-      _get_bwd_dkdv_autotune(headdim, autotune_mode, main_bias_requires_grad)[dkdv_grid](*dkdv_args, **dkdv_meta)
+      _get_bwd_dkdv_autotune(headdim, autotune_mode, main_bias_requires_grad
+                             )[dkdv_grid](*dkdv_args, **dkdv_meta)
       _get_bwd_dq_autotune(headdim, autotune_mode)[dq_grid](*dq_args, **dq_meta)
     else:
       dkdv_config = lookup_persistent_config(
@@ -2303,17 +2399,18 @@ def _ffpa_attn_backward_triton_impl(
 
   if use_key_bias_grad_reduction:
     key_bias_block_n = 64
-    _ffpa_bwd_key_bias_grad_reduce_kernel[(triton.cdiv(seqlen_k, key_bias_block_n), )](
-      partial_grad_bias,
-      grad_attn_bias,
-      seqlen_k,
-      partial_grad_bias.numel() // seqlen_k,
-      grad_attn_bias.stride(3),
-      BLOCK_N=key_bias_block_n,
-      BLOCK_R=64,
-      num_warps=8,
-      num_stages=2,
-    )
+    _ffpa_bwd_key_bias_grad_reduce_kernel[
+      (triton.cdiv(seqlen_k, key_bias_block_n), )](
+        partial_grad_bias,
+        grad_attn_bias,
+        seqlen_k,
+        partial_grad_bias.numel() // seqlen_k,
+        grad_attn_bias.stride(3),
+        BLOCK_N=key_bias_block_n,
+        BLOCK_R=64,
+        num_warps=8,
+        num_stages=2,
+      )
 
 
 def _ffpa_attn_backward_triton(
@@ -2424,7 +2521,8 @@ def _ffpa_attn_backward_triton(
     int(autotune_mode == "max"),
     int(preprocess_d_chunk),
     int(return_attn_bias_grad and attn_bias is not None),
-    2 if grad_kv_storage_dtype == torch.float16 else int(grad_kv_storage_dtype == torch.float32),
+    2 if grad_kv_storage_dtype == torch.float16 else
+    int(grad_kv_storage_dtype == torch.float32),
     original_nheads_kv,
     dropout_p,
     philox_seed,
@@ -2456,5 +2554,7 @@ def _ffpa_attn_backward_triton(
   if grad_attn_bias.numel() == 0:
     grad_attn_bias_out = None
   else:
-    grad_attn_bias_out = grad_attn_bias.to(attn_bias.dtype) if attn_bias is not None else grad_attn_bias
+    grad_attn_bias_out = grad_attn_bias.to(
+      attn_bias.dtype
+    ) if attn_bias is not None else grad_attn_bias
   return dq.to(q.dtype), dk, dv, grad_attn_bias_out

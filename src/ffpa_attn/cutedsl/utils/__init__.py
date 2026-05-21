@@ -61,7 +61,11 @@ def _compute_base_hash(func: Callable) -> str:
   return hasher.hexdigest()
 
 
-def hash_callable(func: Callable, mixer_attrs: Tuple[str] = _MIXER_ATTRS, set_cute_hash: bool = True) -> str:
+def hash_callable(
+  func: Callable,
+  mixer_attrs: Tuple[str] = _MIXER_ATTRS,
+  set_cute_hash: bool = True
+) -> str:
   """Hash a callable based on the source code or bytecode and closure values.
     Fast-path: if the callable (or its __wrapped__ base) has a ``__cute_hash__``
     attribute, that value is returned immediately as the base hash, then
@@ -103,7 +107,9 @@ def hash_callable(func: Callable, mixer_attrs: Tuple[str] = _MIXER_ATTRS, set_cu
 def create_softcap_scoremod(softcap_val):
 
   @cute.jit
-  def scoremod_premask_fn(acc_S_SSA, batch_idx, head_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
+  def scoremod_premask_fn(
+    acc_S_SSA, batch_idx, head_idx, q_idx, kv_idx, seqlen_info, aux_tensors
+  ):
     scores = acc_S_SSA / softcap_val
     return softcap_val * cute.math.tanh(scores, fastmath=True)
 
@@ -113,7 +119,10 @@ def create_softcap_scoremod(softcap_val):
 def create_softcap_scoremod_bwd(softcap_val):
 
   @cute.jit
-  def scoremod_bwd_fn(grad_out_SSA, score_SSA, batch_idx, head_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
+  def scoremod_bwd_fn(
+    grad_out_SSA, score_SSA, batch_idx, head_idx, q_idx, kv_idx, seqlen_info,
+    aux_tensors
+  ):
     scores = score_SSA / softcap_val
     tanh_scores = cute.math.tanh(scores, fastmath=True)
     return grad_out_SSA * (1.0 - tanh_scores * tanh_scores)
@@ -140,15 +149,20 @@ def compute_softmax_scale_log2(softmax_scale, score_mod):
     return _LOG2_E, softmax_scale
 
 
-def compute_fastdiv_mods(mQ, mK, qhead_per_kvhead, pack_gqa, aux_tensors, mPageTable=None):
+def compute_fastdiv_mods(
+  mQ, mK, qhead_per_kvhead, pack_gqa, aux_tensors, mPageTable=None
+):
   """Compute FastDivmodDivisor pairs for aux_tensors index computation.
 
     Returns a (seqlen_q_divmod, seqlen_k_divmod) tuple, or None if aux_tensors is None.
     """
   if const_expr(aux_tensors is None):
     return None
-  seqlen_q = cute.size(mQ.shape[0]) // (qhead_per_kvhead if const_expr(pack_gqa) else 1)
-  seqlen_k = cute.size(mK.shape[0]) if const_expr(mPageTable is None) else mK.shape[0] * mPageTable.shape[1]
+  seqlen_q = cute.size(mQ.shape[0]
+                       ) // (qhead_per_kvhead if const_expr(pack_gqa) else 1)
+  seqlen_k = cute.size(mK.shape[0]) if const_expr(
+    mPageTable is None
+  ) else mK.shape[0] * mPageTable.shape[1]
   return (FastDivmodDivisor(seqlen_q), FastDivmodDivisor(seqlen_k))
 
 
@@ -156,7 +170,11 @@ def compute_fastdiv_mods(mQ, mK, qhead_per_kvhead, pack_gqa, aux_tensors, mPageT
 # DLPack conversion  (used by interface_sm90.py for semaphore tensors)
 # ---------------------------------------------------------------------------
 def convert_from_dlpack_leading_static(
-  x, leading_dim, alignment=16, static_modes=None, stride_order=None
+  x,
+  leading_dim,
+  alignment=16,
+  static_modes=None,
+  stride_order=None
 ) -> cute.Tensor:
   if stride_order is None:
     stride_order = x.dim_order()
@@ -171,7 +189,9 @@ def convert_from_dlpack_leading_static(
 # Tiled copy / MMA fragment helpers  (used by flash_fwd.py / flash_bwd.py base classes)
 # ---------------------------------------------------------------------------
 def make_tiled_copy_A(
-  copy_atom: cute.CopyAtom, tiled_mma: cute.TiledMma, swapAB: cutlass.Constexpr[bool] = False
+  copy_atom: cute.CopyAtom,
+  tiled_mma: cute.TiledMma,
+  swapAB: cutlass.Constexpr[bool] = False
 ) -> cute.TiledCopy:
   if const_expr(swapAB):
     return cute.make_tiled_copy_B(copy_atom, tiled_mma)
@@ -180,7 +200,9 @@ def make_tiled_copy_A(
 
 
 def make_tiled_copy_B(
-  copy_atom: cute.CopyAtom, tiled_mma: cute.TiledMma, swapAB: cutlass.Constexpr[bool] = False
+  copy_atom: cute.CopyAtom,
+  tiled_mma: cute.TiledMma,
+  swapAB: cutlass.Constexpr[bool] = False
 ) -> cute.TiledCopy:
   if const_expr(swapAB):
     return cute.make_tiled_copy_A(copy_atom, tiled_mma)
@@ -189,7 +211,9 @@ def make_tiled_copy_B(
 
 
 def mma_make_fragment_A(
-  smem: cute.Tensor, thr_mma: cute.core.ThrMma, swapAB: cutlass.Constexpr[bool] = False
+  smem: cute.Tensor,
+  thr_mma: cute.core.ThrMma,
+  swapAB: cutlass.Constexpr[bool] = False
 ) -> cute.Tensor:
   if const_expr(swapAB):
     return mma_make_fragment_B(smem, thr_mma)
@@ -198,7 +222,9 @@ def mma_make_fragment_A(
 
 
 def mma_make_fragment_B(
-  smem: cute.Tensor, thr_mma: cute.core.ThrMma, swapAB: cutlass.Constexpr[bool] = False
+  smem: cute.Tensor,
+  thr_mma: cute.core.ThrMma,
+  swapAB: cutlass.Constexpr[bool] = False
 ) -> cute.Tensor:
   if const_expr(swapAB):
     return mma_make_fragment_A(smem, thr_mma)
@@ -210,7 +236,9 @@ def mma_make_fragment_B(
 # SMEM store atom  (SM90-only: always use StMatrix for 16-bit types)
 # ---------------------------------------------------------------------------
 def get_smem_store_atom(
-  arch: cutlass.Constexpr[int], element_type: Type[cute.Numeric], transpose: bool = False
+  arch: cutlass.Constexpr[int],
+  element_type: Type[cute.Numeric],
+  transpose: bool = False
 ) -> cute.CopyAtom:
   # SM90 with 16-bit element types always uses StMatrix.
   # The arch < 90 branch (CopyUniversalOp) is removed for SM90-only builds.
@@ -254,7 +282,9 @@ def warp_reduce(
 # fmax / fmax_reduce / fadd_reduce  (SM90-only: arch < 100 paths only)
 # ---------------------------------------------------------------------------
 @dsl_user_op
-def fmax(a: float | Float32, b: float | Float32, *, loc=None, ip=None) -> Float32:
+def fmax(
+  a: float | Float32, b: float | Float32, *, loc=None, ip=None
+) -> Float32:
   """2-input fmax for SM90. The 3-input (c) variant is SM100+ only and removed."""
   from cutlass import CUDA_VERSION
 
@@ -281,7 +311,9 @@ def fmax(a: float | Float32, b: float | Float32, *, loc=None, ip=None) -> Float3
 
 @cute.jit
 def fmax_reduce(
-  x: cute.TensorSSA, init_val: float | Float32 | None = None, arch: cutlass.Constexpr[int] = 80
+  x: cute.TensorSSA,
+  init_val: float | Float32 | None = None,
+  arch: cutlass.Constexpr[int] = 80
 ) -> Float32:
   """Row-max reduction. SM90 only uses the arch < 100 path (4-accumulator loop)."""
   res = cute.make_fragment(x.shape, Float32)
@@ -295,12 +327,15 @@ def fmax_reduce(
   local_max[0] = fmax(local_max[0], local_max[1])
   local_max[2] = fmax(local_max[2], local_max[3])
   local_max[0] = fmax(local_max[0], local_max[2])
-  return local_max[0] if const_expr(init_val is None) else fmax(local_max[0], init_val)
+  return local_max[0] if const_expr(init_val is None
+                                    ) else fmax(local_max[0], init_val)
 
 
 @cute.jit
 def fadd_reduce(
-  x: cute.TensorSSA, init_val: float | Float32 | None = None, arch: cutlass.Constexpr[int] = 80
+  x: cute.TensorSSA,
+  init_val: float | Float32 | None = None,
+  arch: cutlass.Constexpr[int] = 80
 ) -> Float32:
   """Row-sum reduction. SM90 only uses the arch < 100 path (cute reduce ADD)."""
   if const_expr(init_val is None):
@@ -312,12 +347,21 @@ def fadd_reduce(
 # Atomic add  (used by flash_bwd.py for dQ accumulation)
 # ---------------------------------------------------------------------------
 @dsl_user_op
-def atomic_add_fp32(a: float | Float32, gmem_ptr: cute.Pointer, *, loc=None, ip=None) -> None:
-  nvvm.atomicrmw(res=T.f32(), op=nvvm.AtomicOpKind.FADD, ptr=gmem_ptr.llvm_ptr, a=Float32(a).ir_value())
+def atomic_add_fp32(
+  a: float | Float32, gmem_ptr: cute.Pointer, *, loc=None, ip=None
+) -> None:
+  nvvm.atomicrmw(
+    res=T.f32(),
+    op=nvvm.AtomicOpKind.FADD,
+    ptr=gmem_ptr.llvm_ptr,
+    a=Float32(a).ir_value()
+  )
 
 
 @dsl_user_op
-def elem_pointer(x: cute.Tensor, coord: cute.Coord, *, loc=None, ip=None) -> cute.Pointer:
+def elem_pointer(
+  x: cute.Tensor, coord: cute.Coord, *, loc=None, ip=None
+) -> cute.Pointer:
   return x.iterator + cute.crd2idx(coord, x.layout, loc=loc, ip=ip)
 
 
@@ -329,14 +373,18 @@ def predicate_k(tAcA: cute.Tensor, limit: cutlass.Int32) -> cute.Tensor:
   # Only compute predicates for the "k" dimension. For the mn dimension, we will use "if"
   tApA = cute.make_fragment(
     cute.make_layout(
-      (cute.size(tAcA, mode=[0, 1]), cute.size(tAcA, mode=[1]), cute.size(tAcA, mode=[2])),
+      (
+        cute.size(tAcA, mode=[0, 1]), cute.size(tAcA, mode=[1]),
+        cute.size(tAcA, mode=[2])
+      ),
       stride=(cute.size(tAcA, mode=[2]), 0, 1),
     ),
     cutlass.Boolean,
   )
   for rest_v in cutlass.range_constexpr(tApA.shape[0]):
     for rest_k in cutlass.range_constexpr(tApA.shape[2]):
-      tApA[rest_v, 0, rest_k] = cute.elem_less(tAcA[(0, rest_v), 0, rest_k][1], limit)
+      tApA[rest_v, 0,
+           rest_k] = cute.elem_less(tAcA[(0, rest_v), 0, rest_k][1], limit)
   return tApA
 
 
@@ -365,11 +413,15 @@ def shuffle_sync(
   clamp = cute.arch.WARP_SIZE - 1
   mask_and_clamp = mask << 8 | clamp
   # important: need stride 1 and not 0 for recast_tensor to work
-  val = cute.make_rmem_tensor(cute.make_layout((1, ), stride=(1, )), type(value))
+  val = cute.make_rmem_tensor(
+    cute.make_layout((1, ), stride=(1, )), type(value)
+  )
   val[0] = value
   val_i32 = cute.recast_tensor(val, cutlass.Int32)
   for i in cutlass.range_constexpr(cute.size(val_i32)):
-    val_i32[i] = cute.arch.shuffle_sync(val_i32[i], offset, mask_and_clamp=mask_and_clamp)
+    val_i32[i] = cute.arch.shuffle_sync(
+      val_i32[i], offset, mask_and_clamp=mask_and_clamp
+    )
   return val[0]
 
 
@@ -377,7 +429,13 @@ def shuffle_sync(
 # Bit-shift ops  (used by mask.py for R2P bitmask generation)
 # ---------------------------------------------------------------------------
 @dsl_user_op
-def shl_u32(val: cutlass.Uint32, shift: cutlass.Uint32, *, loc=None, ip=None) -> cutlass.Uint32:
+def shl_u32(
+  val: cutlass.Uint32,
+  shift: cutlass.Uint32,
+  *,
+  loc=None,
+  ip=None
+) -> cutlass.Uint32:
   """
     Left-shift val by shift bits using PTX shl.b32 (sign-agnostic).
 
@@ -401,7 +459,13 @@ def shl_u32(val: cutlass.Uint32, shift: cutlass.Uint32, *, loc=None, ip=None) ->
 
 
 @dsl_user_op
-def shr_u32(val: cutlass.Uint32, shift: cutlass.Uint32, *, loc=None, ip=None) -> cutlass.Uint32:
+def shr_u32(
+  val: cutlass.Uint32,
+  shift: cutlass.Uint32,
+  *,
+  loc=None,
+  ip=None
+) -> cutlass.Uint32:
   """
     Unsigned right-shift val by shift bits using PTX shr.u32 (zero-fills).
 
@@ -440,13 +504,17 @@ def clz(x: Int32) -> Int32:
 # Warp prefix sum  (used by tile_scheduler.py)
 # ---------------------------------------------------------------------------
 @cute.jit
-def warp_prefix_sum(val: cutlass.Int32, lane: Optional[cutlass.Int32] = None) -> cutlass.Int32:
+def warp_prefix_sum(
+  val: cutlass.Int32, lane: Optional[cutlass.Int32] = None
+) -> cutlass.Int32:
   if const_expr(lane is None):
     lane = cute.arch.lane_idx()
   for i in cutlass.range_constexpr(int(math.log2(cute.arch.WARP_SIZE))):
     offset = 1 << i
     # Very important that we set mask_and_clamp to 0
-    partial_sum = cute.arch.shuffle_sync_up(val, offset=offset, mask_and_clamp=0)
+    partial_sum = cute.arch.shuffle_sync_up(
+      val, offset=offset, mask_and_clamp=0
+    )
     if lane >= offset:
       val += partial_sum
   return val
@@ -456,12 +524,24 @@ def warp_prefix_sum(val: cutlass.Int32, lane: Optional[cutlass.Int32] = None) ->
 # f32 → f16/bf16 conversion  (used by flash_fwd_sm90.py, flash_bwd_sm90.py)
 # ---------------------------------------------------------------------------
 @dsl_user_op
-def cvt_f16x2_f32(a: float | Float32, b: float | Float32, to_dtype: Type, *, loc=None, ip=None) -> cutlass.Int32:
-  assert to_dtype in [cutlass.BFloat16, cutlass.Float16], "to_dtype must be BFloat16 or Float16"
+def cvt_f16x2_f32(
+  a: float | Float32,
+  b: float | Float32,
+  to_dtype: Type,
+  *,
+  loc=None,
+  ip=None
+) -> cutlass.Int32:
+  assert to_dtype in [
+    cutlass.BFloat16, cutlass.Float16
+  ], "to_dtype must be BFloat16 or Float16"
   return cutlass.Int32(
     llvm.inline_asm(
       T.i32(),
-      [Float32(a).ir_value(loc=loc, ip=ip), Float32(b).ir_value(loc=loc, ip=ip)],
+      [
+        Float32(a).ir_value(loc=loc, ip=ip),
+        Float32(b).ir_value(loc=loc, ip=ip)
+      ],
       f"cvt.rn.{'bf16x2' if to_dtype is cutlass.BFloat16 else 'f16x2'}.f32 $0, $2, $1;",
       "=r,f,f",
       has_side_effects=False,
@@ -501,9 +581,15 @@ def cvt_f16(src: cute.Tensor, dst_or_dtype):
   else:
     # tensor variant: write to dst
     dst = dst_or_dtype
-    assert cute.size(dst.shape) == cute.size(src.shape), "dst and src must have the same size"
-    assert cute.size(src.shape) % 2 == 0, "src must have an even number of elements"
-    assert dst.element_type in [cutlass.BFloat16, cutlass.Float16], "dst must be BFloat16 or Float16"
+    assert cute.size(dst.shape) == cute.size(
+      src.shape
+    ), "dst and src must have the same size"
+    assert cute.size(
+      src.shape
+    ) % 2 == 0, "src must have an even number of elements"
+    assert dst.element_type in [
+      cutlass.BFloat16, cutlass.Float16
+    ], "dst must be BFloat16 or Float16"
     assert src.element_type is Float32, "src must be Float32"
     dst_i32 = cute.recast_tensor(dst, cutlass.Int32)
     assert cute.size(dst_i32.shape) * 2 == cute.size(src.shape)

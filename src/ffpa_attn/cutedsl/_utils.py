@@ -97,15 +97,23 @@ def _decode_custom_op_window(
   )
 
 
-def _validate_tensor(tensor, name, expected_shape, expected_dtype, expected_device):
+def _validate_tensor(
+  tensor, name, expected_shape, expected_dtype, expected_device
+):
   if tensor is None:
     raise ValueError(f"{name} must not be None")
   if tensor.shape != expected_shape:
-    raise ValueError(f"{name} has shape {tensor.shape}, expected {expected_shape}")
+    raise ValueError(
+      f"{name} has shape {tensor.shape}, expected {expected_shape}"
+    )
   if tensor.dtype != expected_dtype:
-    raise TypeError(f"{name} has dtype {tensor.dtype}, expected {expected_dtype}")
+    raise TypeError(
+      f"{name} has dtype {tensor.dtype}, expected {expected_dtype}"
+    )
   if tensor.device != expected_device:
-    raise RuntimeError(f"{name} is on {tensor.device}, expected {expected_device}")
+    raise RuntimeError(
+      f"{name} is on {tensor.device}, expected {expected_device}"
+    )
 
 
 def _cute_arch_cache_key(arch: Arch) -> str:
@@ -128,7 +136,9 @@ def _validate_sm90_arch() -> tuple[int, str]:
   return arch, _cute_arch_cache_key(cute_arch)
 
 
-def _validate_training_dtype(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, requires_grad: bool) -> None:
+def _validate_training_dtype(
+  q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, requires_grad: bool
+) -> None:
   if requires_grad and q.dtype != torch.bfloat16:
     raise NotImplementedError(
       "SplitD training currently supports torch.bfloat16 only. "
@@ -149,7 +159,9 @@ def _validate_cu_seqlens(
   if tensor.numel() == 0:
     raise ValueError(f"{name} must have at least one element")
   if batch_size is not None and tensor.shape != (batch_size + 1, ):
-    raise ValueError(f"{name} must have shape ({batch_size + 1},), got {tensor.shape}")
+    raise ValueError(
+      f"{name} must have shape ({batch_size + 1},), got {tensor.shape}"
+    )
   if tensor.dtype != torch.int32:
     raise TypeError(f"{name} must have dtype torch.int32, got {tensor.dtype}")
   if tensor.stride(0) != 1:
@@ -165,18 +177,24 @@ def _validate_cu_seqlens(
   if total_tokens is not None:
     last = int(tensor[-1].item())
     if last != total_tokens:
-      raise ValueError(f"{name}[-1] must equal total tokens ({total_tokens}), got {last}")
+      raise ValueError(
+        f"{name}[-1] must equal total tokens ({total_tokens}), got {last}"
+      )
   if tensor.numel() > 1 and bool(torch.any(tensor[1:] < tensor[:-1]).item()):
     raise ValueError(f"{name} must be monotonically non-decreasing")
 
 
-def _validate_max_seqlen_for_cu_seqlens(tensor, name, max_seqlen, max_name) -> None:
+def _validate_max_seqlen_for_cu_seqlens(
+  tensor, name, max_seqlen, max_name
+) -> None:
   if tensor is None:
     return
   if max_seqlen is None:
     raise ValueError(f"{max_name} must be provided when {name} is provided")
   if isinstance(max_seqlen, bool) or not isinstance(max_seqlen, int):
-    raise TypeError(f"{max_name} must be an int, got {type(max_seqlen).__name__}")
+    raise TypeError(
+      f"{max_name} must be an int, got {type(max_seqlen).__name__}"
+    )
   if max_seqlen < 0:
     raise ValueError(f"{max_name} must be non-negative, got {max_seqlen}")
   if is_fake_mode():
@@ -185,7 +203,9 @@ def _validate_max_seqlen_for_cu_seqlens(tensor, name, max_seqlen, max_name) -> N
   lengths = tensor[1:] - tensor[:-1]
   actual_max = int(lengths.max().item()) if lengths.numel() > 0 else 0
   if max_seqlen < actual_max:
-    raise ValueError(f"{max_name} ({max_seqlen}) must be >= max sequence length from {name} ({actual_max})")
+    raise ValueError(
+      f"{max_name} ({max_seqlen}) must be >= max sequence length from {name} ({actual_max})"
+    )
 
 
 def _ensure_cuda_tensors(*named_tensors) -> None:
@@ -193,7 +213,9 @@ def _ensure_cuda_tensors(*named_tensors) -> None:
     return
   for name, tensor in named_tensors:
     if tensor is not None and not tensor.is_cuda:
-      raise RuntimeError(f"{name} must be on a CUDA device, got {tensor.device}")
+      raise RuntimeError(
+        f"{name} must be on a CUDA device, got {tensor.device}"
+      )
 
 
 def _validate_qkv_common(
@@ -224,7 +246,9 @@ def _validate_qkv_common(
     batch_size = cu_seqlens_q.numel() - 1
     seqlen_q = None
     total_q = q.shape[0]
-    _validate_cu_seqlens(cu_seqlens_q, "cu_seqlens_q", batch_size, total_tokens=total_q)
+    _validate_cu_seqlens(
+      cu_seqlens_q, "cu_seqlens_q", batch_size, total_tokens=total_q
+    )
 
   if k.shape[-1] != head_dim:
     raise ValueError(f"k head_dim is {k.shape[-1]}, expected {head_dim}")
@@ -237,7 +261,9 @@ def _validate_qkv_common(
     expected_k_shape = (batch_size, seqlen_k, num_head_kv, head_dim)
     expected_v_shape = (batch_size, seqlen_k, num_head_kv, head_dim_v)
   else:
-    _validate_cu_seqlens(cu_seqlens_k, "cu_seqlens_k", batch_size, total_tokens=seqlen_k)
+    _validate_cu_seqlens(
+      cu_seqlens_k, "cu_seqlens_k", batch_size, total_tokens=seqlen_k
+    )
     expected_k_shape = (seqlen_k, num_head_kv, head_dim)
     expected_v_shape = (seqlen_k, num_head_kv, head_dim_v)
   if k.shape != expected_k_shape:
@@ -247,7 +273,9 @@ def _validate_qkv_common(
   if q.dtype not in torch2cute_dtype_map:
     raise TypeError("SM90 CuTe inputs must be torch.float16 or torch.bfloat16")
   if q.dtype != k.dtype or q.dtype != v.dtype:
-    raise TypeError(f"q, k, and v must have the same dtype, got {q.dtype}, {k.dtype}, {v.dtype}")
+    raise TypeError(
+      f"q, k, and v must have the same dtype, got {q.dtype}, {k.dtype}, {v.dtype}"
+    )
   _ensure_cuda_tensors(
     ("q", q),
     ("k", k),
@@ -256,7 +284,9 @@ def _validate_qkv_common(
     ("cu_seqlens_k", cu_seqlens_k),
   )
   if num_head % num_head_kv != 0:
-    raise ValueError(f"num_head ({num_head}) must be divisible by num_head_kv ({num_head_kv})")
+    raise ValueError(
+      f"num_head ({num_head}) must be divisible by num_head_kv ({num_head_kv})"
+    )
   _validate_head_dims(head_dim, head_dim_v)
   return batch_size, seqlen_q, total_q, seqlen_k, num_head, num_head_kv, head_dim, head_dim_v
 
@@ -283,10 +313,15 @@ def _unsupported_training_features(
   if aux_tensors is not None:
     unsupported.append("aux_tensors")
   if unsupported:
-    raise NotImplementedError("SplitD backward does not support training with " + ", ".join(unsupported) + ".")
+    raise NotImplementedError(
+      "SplitD backward does not support training with " +
+      ", ".join(unsupported) + "."
+    )
 
 
-def _resolve_causal_local_window(causal, window_size_left, window_size_right, mask_mod=None):
+def _resolve_causal_local_window(
+  causal, window_size_left, window_size_right, mask_mod=None
+):
   local = False
   if window_size_left is not None or window_size_right is not None:
     if causal:
@@ -319,9 +354,13 @@ def _validate_varlen_custom_fwd_features(
   window_size_right: int,
   softcap: float,
 ) -> None:
-  window_size_left_opt, window_size_right_opt = _decode_custom_op_window(window_size_left, window_size_right)
+  window_size_left_opt, window_size_right_opt = _decode_custom_op_window(
+    window_size_left, window_size_right
+  )
   softcap_opt = None if softcap == 0.0 else softcap
-  _, local, _, _ = _resolve_causal_local_window(causal, window_size_left_opt, window_size_right_opt)
+  _, local, _, _ = _resolve_causal_local_window(
+    causal, window_size_left_opt, window_size_right_opt
+  )
   _unsupported_training_features(
     q.requires_grad or k.requires_grad or v.requires_grad,
     softcap_opt,
@@ -340,7 +379,13 @@ def _validate_varlen_custom_bwd_features(
 ) -> None:
   if softcap != 0.0:
     raise NotImplementedError("SplitD backward does not support softcap yet")
-  window_size_left_opt, window_size_right_opt = _decode_custom_op_window(window_size_left, window_size_right)
-  _, local, _, _ = _resolve_causal_local_window(causal, window_size_left_opt, window_size_right_opt)
+  window_size_left_opt, window_size_right_opt = _decode_custom_op_window(
+    window_size_left, window_size_right
+  )
+  _, local, _, _ = _resolve_causal_local_window(
+    causal, window_size_left_opt, window_size_right_opt
+  )
   if local:
-    raise NotImplementedError("SplitD backward does not support local/window attention yet")
+    raise NotImplementedError(
+      "SplitD backward does not support local/window attention yet"
+    )

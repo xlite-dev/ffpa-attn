@@ -79,9 +79,13 @@ class FFPAAttnBwdDKDVSm90SplitD:
   ):
     self.dtype = dtype
     hdim_multiple_of = 16
-    self.tile_hdim = int(math.ceil(head_dim / hdim_multiple_of) * hdim_multiple_of)
+    self.tile_hdim = int(
+      math.ceil(head_dim / hdim_multiple_of) * hdim_multiple_of
+    )
     head_dim_v = head_dim_v if head_dim_v is not None else head_dim
-    self.tile_hdimv = int(math.ceil(head_dim_v / hdim_multiple_of) * hdim_multiple_of)
+    self.tile_hdimv = int(
+      math.ceil(head_dim_v / hdim_multiple_of) * hdim_multiple_of
+    )
     self.check_hdim_oob = head_dim != self.tile_hdim
     self.check_hdim_v_oob = head_dim_v != self.tile_hdimv
 
@@ -164,7 +168,9 @@ class FFPAAttnBwdDKDVSm90SplitD:
       LayoutEnum.ROW_MAJOR,
       (self.tile_m, self.tile_n),
       stage=self.PdS_stage,
-      major_mode_size=math.gcd(self.tile_n // wg_n_SdP, self.tile_n // wg_n_dKV),
+      major_mode_size=math.gcd(
+        self.tile_n // wg_n_SdP, self.tile_n // wg_n_dKV
+      ),
     )
     # bf16-roundtrip-free P channel:
     # sP_fp32 holds the SAME P values as sP (bf16) but in fp32. WG1 writes both;
@@ -175,14 +181,20 @@ class FFPAAttnBwdDKDVSm90SplitD:
       LayoutEnum.ROW_MAJOR,
       (self.tile_m, self.tile_n),
       stage=self.PdS_stage,
-      major_mode_size=math.gcd(self.tile_n // wg_n_SdP, self.tile_n // wg_n_dKV),
+      major_mode_size=math.gcd(
+        self.tile_n // wg_n_SdP, self.tile_n // wg_n_dKV
+      ),
     )
 
   def _get_tiled_mma(self):
     # ── SdP: S = Q @ K^T, dP = dO @ V^T ──
     # shape_mnk: (tile_m, tile_n, d_chunk) = (64, 64, 128)
-    atom_layout_SdP = (self.AtomLayoutMSdP, self.num_wg_mma // self.AtomLayoutMSdP, 1)
-    tiler_mn_SdP = (self.tile_m // atom_layout_SdP[0], self.tile_n // atom_layout_SdP[1])
+    atom_layout_SdP = (
+      self.AtomLayoutMSdP, self.num_wg_mma // self.AtomLayoutMSdP, 1
+    )
+    tiler_mn_SdP = (
+      self.tile_m // atom_layout_SdP[0], self.tile_n // atom_layout_SdP[1]
+    )
     tiled_mma_SdP = sm90_utils_basic.make_trivial_tiled_mma(
       self.dtype,
       self.dtype,
@@ -195,9 +207,13 @@ class FFPAAttnBwdDKDVSm90SplitD:
 
     # ── dKV: dV = P^T @ dO_d, dK = dS^T @ Q_d ──
     # shape_mnk: (tile_n, d_chunk, tile_m) = (64, 128, 64)
-    atom_layout_dKV = (self.AtomLayoutNdKV, self.num_wg_mma // self.AtomLayoutNdKV, 1)
+    atom_layout_dKV = (
+      self.AtomLayoutNdKV, self.num_wg_mma // self.AtomLayoutNdKV, 1
+    )
     # dV: M=tile_n, N=d_chunk
-    tiler_mn_dV = (self.tile_n // atom_layout_dKV[0], self.d_chunk // atom_layout_dKV[1])
+    tiler_mn_dV = (
+      self.tile_n // atom_layout_dKV[0], self.d_chunk // atom_layout_dKV[1]
+    )
     tiled_mma_dV = sm90_utils_basic.make_trivial_tiled_mma(
       self.dtype,
       self.dtype,
@@ -208,7 +224,9 @@ class FFPAAttnBwdDKDVSm90SplitD:
       tiler_mn=tiler_mn_dV,
     )
     # dK: same shape as dV
-    tiler_mn_dK = (self.tile_n // atom_layout_dKV[0], self.d_chunk // atom_layout_dKV[1])
+    tiler_mn_dK = (
+      self.tile_n // atom_layout_dKV[0], self.d_chunk // atom_layout_dKV[1]
+    )
     tiled_mma_dK = sm90_utils_basic.make_trivial_tiled_mma(
       self.dtype,
       self.dtype,
@@ -226,16 +244,19 @@ class FFPAAttnBwdDKDVSm90SplitD:
       self.buffer_align_bytes,
     ]
     sK_persist_struct = cute.struct.Align[
-      cute.struct.MemRange[self.dtype, cute.cosize(self.sK_persist_layout)],
+      cute.struct.MemRange[self.dtype,
+                           cute.cosize(self.sK_persist_layout)],
       self.buffer_align_bytes,
     ]
     sV_persist_struct = cute.struct.Align[
-      cute.struct.MemRange[self.dtype, cute.cosize(self.sV_persist_layout)],
+      cute.struct.MemRange[self.dtype,
+                           cute.cosize(self.sV_persist_layout)],
       self.buffer_align_bytes,
     ]
     # Dedicated single-stage epilogue buffer for TMA dK/dV store.
     sEpi_struct = cute.struct.Align[
-      cute.struct.MemRange[self.dtype, cute.cosize(self.sB_epi_layout)],
+      cute.struct.MemRange[self.dtype,
+                           cute.cosize(self.sB_epi_layout)],
       self.buffer_align_bytes,
     ]
 
@@ -261,11 +282,15 @@ class FFPAAttnBwdDKDVSm90SplitD:
       sAEpi: SmemAEpi_t  # sA (mainloop) | sEpi (epilogue)
       sK_persist: sK_persist_struct
       sV_persist: sV_persist_struct
-      sP: cute.struct.Align[cute.struct.MemRange[self.dtype, cute.cosize(self.sPdS_layout)], 1024]
+      sP: cute.struct.Align[cute.struct.MemRange[self.dtype,
+                                                 cute.cosize(self.sPdS_layout)],
+                            1024]
       # Bf16-roundtrip-free P channel: WG1 writes fp32 P here in P2,
       # WG2 reads it in P4 for dS computation. Avoids fp32→bf16→fp32 precision loss.
-      sP_fp32: cute.struct.Align[cute.struct.MemRange[Float32, cute.cosize(self.sP_fp32_layout)], 1024]
-      sdS: cute.struct.Align[cute.struct.MemRange[self.dtype, cute.cosize(self.sPdS_layout)], 1024]
+      sP_fp32: cute.struct.Align[cute.struct.MemRange[
+        Float32, cute.cosize(self.sP_fp32_layout)], 1024]
+      sdS: cute.struct.Align[cute.struct.MemRange[
+        self.dtype, cute.cosize(self.sPdS_layout)], 1024]
 
     return SharedStorageDKDV
 
@@ -285,14 +310,20 @@ class FFPAAttnBwdDKDVSm90SplitD:
     mCuSeqlensK: Optional[cute.Tensor] = None,
     stream: cuda.CUstream = None,
   ):
-    mQ, mK, mV, mdO, mdK, mdV = [assume_tensor_aligned(t) for t in (mQ, mK, mV, mdO, mdK, mdV)]
+    mQ, mK, mV, mdO, mdK, mdV = [
+      assume_tensor_aligned(t) for t in (mQ, mK, mV, mdO, mdK, mdV)
+    ]
     mLSE, mdPsum = [assume_tensor_aligned(t) for t in (mLSE, mdPsum)]
 
     # Transpose: (b, s, n, h) → (s, h, n, b)
     def _qkv_transpose(t):
-      return layout_utils.select(t, [1, 3, 2, 0] if cute.rank(t.shape) == 4 else [0, 2, 1])
+      return layout_utils.select(
+        t, [1, 3, 2, 0] if cute.rank(t.shape) == 4 else [0, 2, 1]
+      )
 
-    mQ, mK, mV, mdO, mdK, mdV = [_qkv_transpose(t) for t in (mQ, mK, mV, mdO, mdK, mdV)]
+    mQ, mK, mV, mdO, mdK, mdV = [
+      _qkv_transpose(t) for t in (mQ, mK, mV, mdO, mdK, mdV)
+    ]
     # Stats: (b, n, s) → (s, n, b)
     LSE_transpose = [2, 1, 0] if cute.rank(mLSE.shape) == 3 else [1, 0]
     mLSE = layout_utils.select(mLSE, LSE_transpose)
@@ -308,7 +339,8 @@ class FFPAAttnBwdDKDVSm90SplitD:
 
     sK_layout_sel = cute.select(self.sK_persist_layout, mode=[0, 1])
     self.tma_copy_bytes = {
-      name: cute.size_in_bytes(mX.element_type, cute.select(layout, mode=[0, 1]))
+      name:
+      cute.size_in_bytes(mX.element_type, cute.select(layout, mode=[0, 1]))
       for name, mX, layout in [
         ("A", mQ, self.sA_layout),
         ("KV", mK, self.sK_persist_layout),
@@ -353,8 +385,12 @@ class FFPAAttnBwdDKDVSm90SplitD:
     gmem_tiled_copy_s2g = cpasync.CopyBulkTensorTileS2GOp()
     sB_epi_sel = cute.select(self.sK_persist_layout, mode=[0, 1])
     # Varlen K: create ragged TMA tensors for dK/dV output writes
-    mdK_tma = copy_utils.create_ragged_tensor_for_tma(mdK, ragged_dim=0, ptr_shift=True) if self.varlen_k else mdK
-    mdV_tma = copy_utils.create_ragged_tensor_for_tma(mdV, ragged_dim=0, ptr_shift=True) if self.varlen_k else mdV
+    mdK_tma = copy_utils.create_ragged_tensor_for_tma(
+      mdK, ragged_dim=0, ptr_shift=True
+    ) if self.varlen_k else mdK
+    mdV_tma = copy_utils.create_ragged_tensor_for_tma(
+      mdV, ragged_dim=0, ptr_shift=True
+    ) if self.varlen_k else mdV
     tma_atom_dK, tma_tensor_dK = cpasync.make_tiled_tma_atom(
       gmem_tiled_copy_s2g,
       mdK_tma,
@@ -374,7 +410,9 @@ class FFPAAttnBwdDKDVSm90SplitD:
     else:
       TileScheduler = SingleTileScheduler
     num_n_blocks = cute.ceil_div(cute.size(mK.shape[0]), self.tile_n)
-    num_batch = cute.size(mK.shape[3]) if cute.rank(mK.shape) == 4 else cute.size(mCuSeqlensK.shape[0] - 1)
+    num_batch = cute.size(mK.shape[3]) if cute.rank(
+      mK.shape
+    ) == 4 else cute.size(mCuSeqlensK.shape[0] - 1)
     tile_sched_args = TileSchedulerArguments(
       num_n_blocks,  # num_m_blocks (but backward swaps M/N)
       cute.size(mK.shape[2]),  # num_heads
@@ -475,13 +513,18 @@ class FFPAAttnBwdDKDVSm90SplitD:
     warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
 
     if warp_idx == 0:
-      for atom in [tma_atom_Q, tma_atom_dO, tma_atom_K, tma_atom_V, tma_atom_dK, tma_atom_dV]:
+      for atom in [
+        tma_atom_Q, tma_atom_dO, tma_atom_K, tma_atom_V, tma_atom_dK,
+        tma_atom_dV
+      ]:
         cpasync.prefetch_descriptor(atom)
 
     smem = cutlass.utils.SmemAllocator()
     storage = smem.allocate(SharedStorage)
 
-    pipeline_producer_group = cutlass.pipeline.CooperativeGroup(cutlass.pipeline.Agent.Thread)
+    pipeline_producer_group = cutlass.pipeline.CooperativeGroup(
+      cutlass.pipeline.Agent.Thread
+    )
     # pipeline_K consumed only by WG1, pipeline_V only by WG2.
     # Each WG = 4 warps → consumer_group size = 4 (1 elect_one release per warp).
     # pipeline_A consumed by both WG1+WG2 (each m_block, real consumer + empty release) → 8 warps.
@@ -532,17 +575,25 @@ class FFPAAttnBwdDKDVSm90SplitD:
     # sA / sEpi share physical SMEM via union; mainloop uses sA view,
     # epilogue uses sEpi view (with explicit fence + Epilogue barrier at transition).
     sA = storage.sAEpi.sA.get_tensor(sA_layout.outer, swizzle=sA_layout.inner)
-    sK_persist = storage.sK_persist.get_tensor(sK_persist_layout.outer, swizzle=sK_persist_layout.inner)
-    sV_persist = storage.sV_persist.get_tensor(sV_persist_layout.outer, swizzle=sV_persist_layout.inner)
+    sK_persist = storage.sK_persist.get_tensor(
+      sK_persist_layout.outer, swizzle=sK_persist_layout.inner
+    )
+    sV_persist = storage.sV_persist.get_tensor(
+      sV_persist_layout.outer, swizzle=sV_persist_layout.inner
+    )
     sP = storage.sP.get_tensor(sPdS_layout.outer, swizzle=sPdS_layout.inner)
 
     # fp32 P buffer: WG1 writes here (alongside bf16 sP); WG2 reads here for dS computation.
-    sP_fp32 = storage.sP_fp32.get_tensor(sP_fp32_layout.outer, swizzle=sP_fp32_layout.inner)
+    sP_fp32 = storage.sP_fp32.get_tensor(
+      sP_fp32_layout.outer, swizzle=sP_fp32_layout.inner
+    )
     sdS = storage.sdS.get_tensor(sPdS_layout.outer, swizzle=sPdS_layout.inner)
 
     # Single-stage SMEM view for epilogue TMA store (alias of sA's physical slot).
     sB_epi_layout_sel = cute.select(sK_persist_layout, mode=[0, 1])
-    sB_epi = storage.sAEpi.sEpi.get_tensor(sB_epi_layout_sel.outer, swizzle=sB_epi_layout_sel.inner)
+    sB_epi = storage.sAEpi.sEpi.get_tensor(
+      sB_epi_layout_sel.outer, swizzle=sB_epi_layout_sel.inner
+    )
     sLSE = storage.sLSE.get_tensor(
       cute.make_layout(
         (self.tile_m, self.A_stage),
@@ -575,7 +626,9 @@ class FFPAAttnBwdDKDVSm90SplitD:
 
     # three-role dispatch — producer WG (warp 0..3) / WG1 (warp 4..7) / WG2 (warp 8..11)
     tidx, _, _ = cute.arch.thread_idx()
-    warp_group_idx = cute.arch.make_warp_uniform(tidx // self.num_threads_per_warp_group)
+    warp_group_idx = cute.arch.make_warp_uniform(
+      tidx // self.num_threads_per_warp_group
+    )
 
     if warp_group_idx == 0:
       # Producer WG: only warp 0 issues TMA; others idle (held by setmaxregister_decrease).
@@ -682,7 +735,9 @@ class FFPAAttnBwdDKDVSm90SplitD:
     TileSchedulerCls: Callable,
     qhead_per_kvhead_divmod: Optional[FastDivmodDivisor] = None,
   ):
-    producer_state_A = cutlass.pipeline.make_pipeline_state(cutlass.pipeline.PipelineUserType.Producer, self.A_stage)
+    producer_state_A = cutlass.pipeline.make_pipeline_state(
+      cutlass.pipeline.PipelineUserType.Producer, self.A_stage
+    )
     producer_state_K = cutlass.pipeline.make_pipeline_state(
       cutlass.pipeline.PipelineUserType.Producer, self.K_persist_chunks
     )
@@ -701,17 +756,23 @@ class FFPAAttnBwdDKDVSm90SplitD:
       seqlen = SeqlenInfoCls(batch_idx)
 
       # K/V slicing — invariant across Q heads in GQA group
-      mK_cur = seqlen.offset_batch_K(mK, batch_idx, dim=3)[None, None, head_idx_kv]
-      mV_cur = seqlen.offset_batch_K(mV, batch_idx, dim=3)[None, None, head_idx_kv]
+      mK_cur = seqlen.offset_batch_K(mK, batch_idx, dim=3)[None, None,
+                                                           head_idx_kv]
+      mV_cur = seqlen.offset_batch_K(mV, batch_idx, dim=3)[None, None,
+                                                           head_idx_kv]
 
       m_block_min, m_block_max = block_info.get_m_block_min_max(seqlen, n_block)
-      process_tile = const_expr(not self.is_varlen_q) or m_block_min < m_block_max
+      process_tile = const_expr(
+        not self.is_varlen_q
+      ) or m_block_min < m_block_max
 
       if process_tile:
         # ═══ K/V preload ONCE per work_tile (Cross-pass reuse) ═══
         # K (= num_d_inner chunks of d_chunk=256) → sK_persist via pipeline_K
         for d_inner in cutlass.range_constexpr(self.num_d_inner):
-          gK_d = cute.local_tile(mK_cur, (self.tile_n, self.d_chunk), (None, d_inner))
+          gK_d = cute.local_tile(
+            mK_cur, (self.tile_n, self.d_chunk), (None, d_inner)
+          )
           load_K_d, _, _ = copy_utils.tma_get_copy_fn(
             tma_atom_K,
             0,
@@ -731,7 +792,9 @@ class FFPAAttnBwdDKDVSm90SplitD:
 
         # V (= num_d_inner chunks) → sV_persist via pipeline_V
         for d_inner in cutlass.range_constexpr(self.num_d_inner):
-          gV_d = cute.local_tile(mV_cur, (self.tile_n, self.d_chunk), (None, d_inner))
+          gV_d = cute.local_tile(
+            mV_cur, (self.tile_n, self.d_chunk), (None, d_inner)
+          )
           load_V_d, _, _ = copy_utils.tma_get_copy_fn(
             tma_atom_V,
             0,
@@ -756,10 +819,16 @@ class FFPAAttnBwdDKDVSm90SplitD:
             head_idx_q = head_idx_kv * self.qhead_per_kvhead + q_head_offset
 
             # Q/dO/LSE/dPsum slicing — per Q head
-            mQ_cur = seqlen.offset_batch_Q(mQ, batch_idx, dim=3)[None, None, head_idx_q]
-            mdO_cur = seqlen.offset_batch_Q(mdO, batch_idx, dim=3)[None, None, head_idx_q]
-            mLSE_cur = seqlen.offset_batch_Q(mLSE, batch_idx, dim=2, padded=True)[None, head_idx_q]
-            mdPsum_cur = seqlen.offset_batch_Q(mdPsum, batch_idx, dim=2, padded=True)[None, head_idx_q]
+            mQ_cur = seqlen.offset_batch_Q(mQ, batch_idx, dim=3)[None, None,
+                                                                 head_idx_q]
+            mdO_cur = seqlen.offset_batch_Q(mdO, batch_idx, dim=3)[None, None,
+                                                                   head_idx_q]
+            mLSE_cur = seqlen.offset_batch_Q(
+              mLSE, batch_idx, dim=2, padded=True
+            )[None, head_idx_q]
+            mdPsum_cur = seqlen.offset_batch_Q(
+              mdPsum, batch_idx, dim=2, padded=True
+            )[None, head_idx_q]
 
             gLSE = cute.local_tile(mLSE_cur, (self.tile_m, ), (None, ))
             gdPsum = cute.local_tile(mdPsum_cur, (self.tile_m, ), (None, ))
@@ -771,7 +840,9 @@ class FFPAAttnBwdDKDVSm90SplitD:
             for m_block in cutlass.range(m_block_min, m_block_max, unroll=1):
               # ═══ Phase 1: Q0..Q{num_d_inner-1} → sA. LSE piggyback on last Q. ═══
               for d_inner in cutlass.range_constexpr(self.num_d_inner):
-                gQ_d = cute.local_tile(mQ_cur, (self.tile_m, self.d_chunk), (None, d_inner))
+                gQ_d = cute.local_tile(
+                  mQ_cur, (self.tile_m, self.d_chunk), (None, d_inner)
+                )
                 load_Q_d, _, _ = copy_utils.tma_get_copy_fn(
                   tma_atom_Q,
                   0,
@@ -795,7 +866,8 @@ class FFPAAttnBwdDKDVSm90SplitD:
                   load_LSE(
                     src_idx=m_block,
                     dst_idx=producer_state_A.index,
-                    tma_bar_ptr=pipeline_A.producer_get_barrier(producer_state_A),
+                    tma_bar_ptr=pipeline_A.
+                    producer_get_barrier(producer_state_A),
                   )
                 pipeline_A.producer_commit(producer_state_A)
                 did_produce_A = Boolean(True)
@@ -803,7 +875,9 @@ class FFPAAttnBwdDKDVSm90SplitD:
 
               # ═══ Phase 3: dO0..dO{num_d_inner-1} → sA. dPsum on last dO. ═══
               for d_inner in cutlass.range_constexpr(self.num_d_inner):
-                gdO_d = cute.local_tile(mdO_cur, (self.tile_m, self.d_chunk), (None, d_inner))
+                gdO_d = cute.local_tile(
+                  mdO_cur, (self.tile_m, self.d_chunk), (None, d_inner)
+                )
                 load_dO_d, _, _ = copy_utils.tma_get_copy_fn(
                   tma_atom_dO,
                   0,
@@ -827,14 +901,17 @@ class FFPAAttnBwdDKDVSm90SplitD:
                   load_dPsum(
                     src_idx=m_block,
                     dst_idx=producer_state_A.index,
-                    tma_bar_ptr=pipeline_A.producer_get_barrier(producer_state_A),
+                    tma_bar_ptr=pipeline_A.
+                    producer_get_barrier(producer_state_A),
                   )
                 pipeline_A.producer_commit(producer_state_A)
                 did_produce_A = Boolean(True)
                 producer_state_A.advance()
 
               # ═══ Phase 5: dO_d_pass → sA (for WG1 dV GEMM) ═══
-              gdO_pass = cute.local_tile(mdO_cur, (self.tile_m, self.d_chunk), (None, d_pass))
+              gdO_pass = cute.local_tile(
+                mdO_cur, (self.tile_m, self.d_chunk), (None, d_pass)
+              )
               load_dO_pass, _, _ = copy_utils.tma_get_copy_fn(
                 tma_atom_dO,
                 0,
@@ -853,7 +930,9 @@ class FFPAAttnBwdDKDVSm90SplitD:
               producer_state_A.advance()
 
               # ═══ Phase 6: Q_d_pass → sA (for WG2 dK GEMM) ═══
-              gQ_pass = cute.local_tile(mQ_cur, (self.tile_m, self.d_chunk), (None, d_pass))
+              gQ_pass = cute.local_tile(
+                mQ_cur, (self.tile_m, self.d_chunk), (None, d_pass)
+              )
               load_Q_pass, _, _ = copy_utils.tma_get_copy_fn(
                 tma_atom_Q,
                 0,
@@ -921,14 +1000,20 @@ class FFPAAttnBwdDKDVSm90SplitD:
 
     # ── SdP fragments (WG1 needs only K, not V) ──
     shape_mnk_SdP = (self.tile_m, self.tile_n, self.d_chunk)
-    _, tSrA, tSrB_K = sm90_utils.partition_fragment_ABC(wg_mma_SdP, shape_mnk_SdP, sA, sK_persist, swap_AB=False)
+    _, tSrA, tSrB_K = sm90_utils.partition_fragment_ABC(
+      wg_mma_SdP, shape_mnk_SdP, sA, sK_persist, swap_AB=False
+    )
 
     # ── dV GEMM fragments: dV = P^T @ dO_d_pass ──
     sPt = layout_utils.transpose_view(sP)
     sAt = layout_utils.transpose_view(sA)
     shape_mnk_dV = (self.tile_n, self.d_chunk, self.tile_m)
-    acc_dV, tdVrPt, tdVrdOt = sm90_utils.partition_fragment_ABC(wg_mma_dV, shape_mnk_dV, sPt, sAt, swap_AB=False)
-    mma_dV_fn = partial(gemm_w_idx, tiled_mma_dV, acc_dV, tdVrPt, tdVrdOt, swap_AB=False)
+    acc_dV, tdVrPt, tdVrdOt = sm90_utils.partition_fragment_ABC(
+      wg_mma_dV, shape_mnk_dV, sPt, sAt, swap_AB=False
+    )
+    mma_dV_fn = partial(
+      gemm_w_idx, tiled_mma_dV, acc_dV, tdVrPt, tdVrdOt, swap_AB=False
+    )
 
     # ── P R2S copies: ──
     #   (a) bf16 sP for WG1 dV WGMMA SS-mode (must be fp16/bf16 for WGMMA A operand)
@@ -950,9 +1035,13 @@ class FFPAAttnBwdDKDVSm90SplitD:
     )
 
     # ── LSE partitioning (per-thread row mapping via MMA C partition) ──
-    tLSEsLSE = layout_utils.mma_partition_C_vec(sLSE, thr_mma_SdP, expand_shape=self.tile_n, is_colvec=True)
+    tLSEsLSE = layout_utils.mma_partition_C_vec(
+      sLSE, thr_mma_SdP, expand_shape=self.tile_n, is_colvec=True
+    )
 
-    consumer_state_A = cutlass.pipeline.make_pipeline_state(cutlass.pipeline.PipelineUserType.Consumer, self.A_stage)
+    consumer_state_A = cutlass.pipeline.make_pipeline_state(
+      cutlass.pipeline.PipelineUserType.Consumer, self.A_stage
+    )
     consumer_state_K = cutlass.pipeline.make_pipeline_state(
       cutlass.pipeline.PipelineUserType.Consumer, self.K_persist_chunks
     )
@@ -964,12 +1053,16 @@ class FFPAAttnBwdDKDVSm90SplitD:
       n_block, head_idx_kv, batch_idx, _ = work_tile.tile_idx
       seqlen = SeqlenInfoCls(batch_idx)
       m_block_min, m_block_max = block_info.get_m_block_min_max(seqlen, n_block)
-      process_tile = const_expr(not self.is_varlen_q) or m_block_min < m_block_max
+      process_tile = const_expr(
+        not self.is_varlen_q
+      ) or m_block_min < m_block_max
 
       if process_tile:
         # K preload wait & release ONCE per work_tile (Cross-pass reuse)
         for _k in cutlass.range_constexpr(self.K_persist_chunks):
-          pipeline_K.consumer_wait(consumer_state_K, pipeline_K.consumer_try_wait(consumer_state_K))
+          pipeline_K.consumer_wait(
+            consumer_state_K, pipeline_K.consumer_try_wait(consumer_state_K)
+          )
           with cute.arch.elect_one():
             pipeline_K.consumer_release(consumer_state_K)
           consumer_state_K.advance()
@@ -1051,7 +1144,8 @@ class FFPAAttnBwdDKDVSm90SplitD:
     shape_mnk_SdP: cute.Shape,
     mma_dV_fn: Callable,
     copy_P_r2s: Callable,
-    copy_P_fp32_r2s: Callable,  # fp32 sP_fp32 store via CopyUniversalOp atom in C-operand layout
+    copy_P_fp32_r2s:
+    Callable,  # fp32 sP_fp32 store via CopyUniversalOp atom in C-operand layout
     pipeline_A: pipeline.PipelineAsync,
     tLSEsLSE: cute.Tensor,
     softmax_scale_log2: Float32,
@@ -1061,9 +1155,13 @@ class FFPAAttnBwdDKDVSm90SplitD:
     p_stage = Int32(0)  # sP single-buffered
 
     # ═══ Phase 1: S = ΣQ_d @ K_d^T (num_d_inner WGMMA, real consume Q) ═══
-    acc_S = cute.make_rmem_tensor(tiled_mma_SdP.partition_shape_C(shape_mnk_SdP[:2]), Float32)
+    acc_S = cute.make_rmem_tensor(
+      tiled_mma_SdP.partition_shape_C(shape_mnk_SdP[:2]), Float32
+    )
     for d_inner in cutlass.range_constexpr(self.num_d_inner):
-      pipeline_A.consumer_wait(consumer_state_A, pipeline_A.consumer_try_wait(consumer_state_A))
+      pipeline_A.consumer_wait(
+        consumer_state_A, pipeline_A.consumer_try_wait(consumer_state_A)
+      )
       gemm_w_idx(
         tiled_mma_SdP,
         acc_S,
@@ -1083,7 +1181,9 @@ class FFPAAttnBwdDKDVSm90SplitD:
 
     # ═══ Empty release: dO0..dO_{num_d_inner-1} (consumed by WG2) ═══
     for _ in cutlass.range_constexpr(self.num_d_inner):
-      pipeline_A.consumer_wait(consumer_state_A, pipeline_A.consumer_try_wait(consumer_state_A))
+      pipeline_A.consumer_wait(
+        consumer_state_A, pipeline_A.consumer_try_wait(consumer_state_A)
+      )
       with cute.arch.elect_one():
         pipeline_A.consumer_release(consumer_state_A)
       consumer_state_A.advance()
@@ -1094,7 +1194,9 @@ class FFPAAttnBwdDKDVSm90SplitD:
     for r in cutlass.range_constexpr(cute.size(acc_S_mn, mode=[0])):
       lse_val = tLSErLSE[r]
       for c in cutlass.range(cute.size(acc_S_mn, mode=[1]), unroll_full=True):
-        acc_S_mn[r, c] = cute.math.exp2(acc_S_mn[r, c] * softmax_scale_log2 - lse_val, fastmath=True)
+        acc_S_mn[r, c] = cute.math.exp2(
+          acc_S_mn[r, c] * softmax_scale_log2 - lse_val, fastmath=True
+        )
 
     # bf16 P (frgA layout) for STSM into sP (WG1's dV WGMMA A operand).
     tdVrP = utils.cvt_f16(layout_utils.reshape_acc_to_frgA(acc_S), self.dtype)
@@ -1116,7 +1218,9 @@ class FFPAAttnBwdDKDVSm90SplitD:
     )
 
     # ═══ Phase 5: dV += P^T @ dO_d_pass (sP self-read via SMEM) ═══
-    pipeline_A.consumer_wait(consumer_state_A, pipeline_A.consumer_try_wait(consumer_state_A))
+    pipeline_A.consumer_wait(
+      consumer_state_A, pipeline_A.consumer_try_wait(consumer_state_A)
+    )
     smem_idx_dO_pass = consumer_state_A.index
     mma_dV_fn(
       A_idx=p_stage,
@@ -1129,7 +1233,9 @@ class FFPAAttnBwdDKDVSm90SplitD:
     consumer_state_A.advance()
 
     # ═══ Empty release Q_d_pass (consumed by WG2 P6) ═══
-    pipeline_A.consumer_wait(consumer_state_A, pipeline_A.consumer_try_wait(consumer_state_A))
+    pipeline_A.consumer_wait(
+      consumer_state_A, pipeline_A.consumer_try_wait(consumer_state_A)
+    )
     with cute.arch.elect_one():
       pipeline_A.consumer_release(consumer_state_A)
     consumer_state_A.advance()
@@ -1147,7 +1253,8 @@ class FFPAAttnBwdDKDVSm90SplitD:
     mdK: cute.Tensor,
     sA: cute.Tensor,
     sV_persist: cute.Tensor,
-    sP_fp32: cute.Tensor,  # fp32 P buffer (replaces bf16 sP; WG2 no longer needs bf16)
+    sP_fp32: cute.
+    Tensor,  # fp32 P buffer (replaces bf16 sP; WG2 no longer needs bf16)
     sdS: cute.Tensor,
     sdPsum: cute.Tensor,
     sB_epi: cute.Tensor,
@@ -1168,14 +1275,20 @@ class FFPAAttnBwdDKDVSm90SplitD:
 
     # ── SdP fragments (WG2 needs only V, not K) ──
     shape_mnk_SdP = (self.tile_m, self.tile_n, self.d_chunk)
-    _, tSrA, tSrB_V = sm90_utils.partition_fragment_ABC(wg_mma_SdP, shape_mnk_SdP, sA, sV_persist, swap_AB=False)
+    _, tSrA, tSrB_V = sm90_utils.partition_fragment_ABC(
+      wg_mma_SdP, shape_mnk_SdP, sA, sV_persist, swap_AB=False
+    )
 
     # ── dK GEMM fragments: dK = dS^T @ Q_d_pass ──
     sdSt = layout_utils.transpose_view(sdS)
     sAt = layout_utils.transpose_view(sA)
     shape_mnk_dK = (self.tile_n, self.d_chunk, self.tile_m)
-    acc_dK, tdKrdSt, tdKrQt = sm90_utils.partition_fragment_ABC(wg_mma_dK, shape_mnk_dK, sdSt, sAt, swap_AB=False)
-    mma_dK_fn = partial(gemm_w_idx, tiled_mma_dK, acc_dK, tdKrdSt, tdKrQt, swap_AB=False)
+    acc_dK, tdKrdSt, tdKrQt = sm90_utils.partition_fragment_ABC(
+      wg_mma_dK, shape_mnk_dK, sdSt, sAt, swap_AB=False
+    )
+    mma_dK_fn = partial(
+      gemm_w_idx, tiled_mma_dK, acc_dK, tdKrdSt, tdKrQt, swap_AB=False
+    )
 
     # ── dS R2S copy (WG2-internal: STSM rmem dS → sdS[0]) ──
     copy_dS_r2s, _, _ = copy_utils.get_smem_store_C(
@@ -1187,10 +1300,14 @@ class FFPAAttnBwdDKDVSm90SplitD:
     )
 
     # ── sP_fp32 s2r partition (WG2 reads fp32 P from sP_fp32, NOT bf16 sP).
-    tSsP_fp32_partition = thr_mma_SdP.partition_C(sP_fp32)  # ((atom), MMA_M, MMA_N, stage)
+    tSsP_fp32_partition = thr_mma_SdP.partition_C(
+      sP_fp32
+    )  # ((atom), MMA_M, MMA_N, stage)
 
     # ── dPsum partitioning (per-thread row mapping) ──
-    tLSEsdPsum = layout_utils.mma_partition_C_vec(sdPsum, thr_mma_SdP, expand_shape=self.tile_n, is_colvec=True)
+    tLSEsdPsum = layout_utils.mma_partition_C_vec(
+      sdPsum, thr_mma_SdP, expand_shape=self.tile_n, is_colvec=True
+    )
 
     #   pre-arrive PEmpty so WG1's first barrier(PEmpty, 256) finds
     #   128 arrivals from WG2 and only waits for WG1's own 128.
@@ -1199,7 +1316,9 @@ class FFPAAttnBwdDKDVSm90SplitD:
       number_of_threads=self.num_mma_threads,  # 256
     )
 
-    consumer_state_A = cutlass.pipeline.make_pipeline_state(cutlass.pipeline.PipelineUserType.Consumer, self.A_stage)
+    consumer_state_A = cutlass.pipeline.make_pipeline_state(
+      cutlass.pipeline.PipelineUserType.Consumer, self.A_stage
+    )
     consumer_state_V = cutlass.pipeline.make_pipeline_state(
       cutlass.pipeline.PipelineUserType.Consumer, self.V_persist_chunks
     )
@@ -1211,18 +1330,24 @@ class FFPAAttnBwdDKDVSm90SplitD:
       n_block, head_idx_kv, batch_idx, _ = work_tile.tile_idx
       seqlen = SeqlenInfoCls(batch_idx)
       m_block_min, m_block_max = block_info.get_m_block_min_max(seqlen, n_block)
-      process_tile = const_expr(not self.is_varlen_q) or m_block_min < m_block_max
+      process_tile = const_expr(
+        not self.is_varlen_q
+      ) or m_block_min < m_block_max
 
       if process_tile:
         # ★ V preload wait & release ONCE per work_tile (跨 d_pass 复用)
         for _v in cutlass.range_constexpr(self.V_persist_chunks):
-          pipeline_V.consumer_wait(consumer_state_V, pipeline_V.consumer_try_wait(consumer_state_V))
+          pipeline_V.consumer_wait(
+            consumer_state_V, pipeline_V.consumer_try_wait(consumer_state_V)
+          )
           with cute.arch.elect_one():
             pipeline_V.consumer_release(consumer_state_V)
           consumer_state_V.advance()
 
         # ★ V tail zero (WG2 internal, 128 thread; ONCE per work_tile)
-        self.zero_v_tail_smem_wg2(sV_persist=sV_persist, seqlen=seqlen, n_block=n_block, tidx=tidx)
+        self.zero_v_tail_smem_wg2(
+          sV_persist=sV_persist, seqlen=seqlen, n_block=n_block, tidx=tidx
+        )
 
         for d_pass in cutlass.range_constexpr(self.num_d_passes):
           dKV_accumulate = Boolean(False)
@@ -1302,7 +1427,8 @@ class FFPAAttnBwdDKDVSm90SplitD:
     shape_mnk_SdP: cute.Shape,
     mma_dK_fn: Callable,
     copy_dS_r2s: Callable,
-    tSsP_fp32_partition: cute.Tensor,  # thr_mma_SdP.partition_C(sP_fp32) — fp32 per-thread C-acc view
+    tSsP_fp32_partition: cute.
+    Tensor,  # thr_mma_SdP.partition_C(sP_fp32) — fp32 per-thread C-acc view
     pipeline_A: pipeline.PipelineAsync,
     tLSEsdPsum: cute.Tensor,
     softmax_scale: Float32,
@@ -1313,15 +1439,21 @@ class FFPAAttnBwdDKDVSm90SplitD:
 
     # ═══ Empty release: Q0..Q_{num_d_inner-1} (consumed by WG1) ═══
     for _ in cutlass.range_constexpr(self.num_d_inner):
-      pipeline_A.consumer_wait(consumer_state_A, pipeline_A.consumer_try_wait(consumer_state_A))
+      pipeline_A.consumer_wait(
+        consumer_state_A, pipeline_A.consumer_try_wait(consumer_state_A)
+      )
       with cute.arch.elect_one():
         pipeline_A.consumer_release(consumer_state_A)
       consumer_state_A.advance()
 
     # ═══ Phase 3  all d_inner iters sync; release immediately ═══
-    acc_dP = cute.make_rmem_tensor(tiled_mma_SdP.partition_shape_C(shape_mnk_SdP[:2]), Float32)
+    acc_dP = cute.make_rmem_tensor(
+      tiled_mma_SdP.partition_shape_C(shape_mnk_SdP[:2]), Float32
+    )
     for d_inner in cutlass.range_constexpr(self.num_d_inner):
-      pipeline_A.consumer_wait(consumer_state_A, pipeline_A.consumer_try_wait(consumer_state_A))
+      pipeline_A.consumer_wait(
+        consumer_state_A, pipeline_A.consumer_try_wait(consumer_state_A)
+      )
       gemm_w_idx(
         tiled_mma_SdP,
         acc_dP,
@@ -1334,7 +1466,9 @@ class FFPAAttnBwdDKDVSm90SplitD:
       )
       if cutlass.const_expr(d_inner == self.num_d_inner - 1):
         # dPsum piggybacked on last dO chunk — read before release.
-        tLSErdPsum = copy_utils.load_s2r(tLSEsdPsum[None, consumer_state_A.index])
+        tLSErdPsum = copy_utils.load_s2r(
+          tLSEsdPsum[None, consumer_state_A.index]
+        )
       with cute.arch.elect_one():
         pipeline_A.consumer_release(consumer_state_A)
       consumer_state_A.advance()
@@ -1345,7 +1479,9 @@ class FFPAAttnBwdDKDVSm90SplitD:
       number_of_threads=self.num_mma_threads,  # 256
     )
     # Step 14: read fp32 P from sP_fp32 — no precision loss.
-    tdSrP_fp32 = copy_utils.load_s2r(tSsP_fp32_partition[None, None, None, p_stage])
+    tdSrP_fp32 = copy_utils.load_s2r(
+      tSsP_fp32_partition[None, None, None, p_stage]
+    )
 
     # dS = P * (dP - dpsum) * scale — acc_dP from sync WGMMAs above, P from LDS.
     tdSrP_mn = layout_utils.reshape_acc_to_mn(tdSrP_fp32, transpose=False)
@@ -1353,7 +1489,9 @@ class FFPAAttnBwdDKDVSm90SplitD:
     for r in cutlass.range_constexpr(cute.size(acc_dP_mn, mode=[0])):
       dpsum_val = tLSErdPsum[r]
       for c in cutlass.range(cute.size(acc_dP_mn, mode=[1]), unroll_full=True):
-        acc_dP_mn[r, c] = (tdSrP_mn[r, c] * (acc_dP_mn[r, c] - dpsum_val) * softmax_scale)
+        acc_dP_mn[
+          r,
+          c] = (tdSrP_mn[r, c] * (acc_dP_mn[r, c] - dpsum_val) * softmax_scale)
 
     # Convert dS (now in acc_dP rmem, fp32) → fp16 frgA → STSM into sdS[0].
     tdKrdS = utils.cvt_f16(layout_utils.reshape_acc_to_frgA(acc_dP), self.dtype)
@@ -1371,13 +1509,17 @@ class FFPAAttnBwdDKDVSm90SplitD:
     )
 
     # ═══ Empty release: dO_d_pass (consumed by WG1 P5) ═══
-    pipeline_A.consumer_wait(consumer_state_A, pipeline_A.consumer_try_wait(consumer_state_A))
+    pipeline_A.consumer_wait(
+      consumer_state_A, pipeline_A.consumer_try_wait(consumer_state_A)
+    )
     with cute.arch.elect_one():
       pipeline_A.consumer_release(consumer_state_A)
     consumer_state_A.advance()
 
     # ═══ Phase 6: dK += dS^T @ Q_d_pass ═══
-    pipeline_A.consumer_wait(consumer_state_A, pipeline_A.consumer_try_wait(consumer_state_A))
+    pipeline_A.consumer_wait(
+      consumer_state_A, pipeline_A.consumer_try_wait(consumer_state_A)
+    )
     smem_idx_Q_pass = consumer_state_A.index
     mma_dK_fn(
       A_idx=p_stage,
@@ -1403,10 +1545,13 @@ class FFPAAttnBwdDKDVSm90SplitD:
     if valid_rows < self.tile_n:
       tail_elems = (self.tile_n - valid_rows) * self.d_chunk
       for d_inner in cutlass.range_constexpr(self.num_d_inner):
-        for linear_idx in cutlass.range(tidx, tail_elems, self.num_threads_per_warp_group, unroll=1):
+        for linear_idx in cutlass.range(
+          tidx, tail_elems, self.num_threads_per_warp_group, unroll=1
+        ):
           row_offset = linear_idx // self.d_chunk
           col = linear_idx - row_offset * self.d_chunk
-          sV_persist[valid_rows + row_offset, col, d_inner] = sV_persist.element_type(0.0)
+          sV_persist[valid_rows + row_offset, col,
+                     d_inner] = sV_persist.element_type(0.0)
       cute.arch.fence_view_async_shared()
       cute.arch.barrier(
         barrier_id=int(NamedBarrierBwd.VTailZero),
@@ -1439,9 +1584,15 @@ class FFPAAttnBwdDKDVSm90SplitD:
     # WG1 occupies warp 4..7 (CTA-absolute). warp_idx == 4 issues the TMA store.
 
     # Build dV gmem slice for this (n_block, d_pass).
-    mdV_cur = seqlen.offset_batch_K(mdV, batch_idx, dim=3, ragged=self.varlen_k)[None, None, head_idx]
-    gdV = cute.local_tile(mdV_cur, (self.tile_n, self.d_chunk), (n_block, d_pass))
-    store_dV, _, _ = copy_utils.tma_get_copy_fn(tma_atom_dV, 0, cute.make_layout(1), sEpi, gdV, single_stage=True)
+    mdV_cur = seqlen.offset_batch_K(
+      mdV, batch_idx, dim=3, ragged=self.varlen_k
+    )[None, None, head_idx]
+    gdV = cute.local_tile(
+      mdV_cur, (self.tile_n, self.d_chunk), (n_block, d_pass)
+    )
+    store_dV, _, _ = copy_utils.tma_get_copy_fn(
+      tma_atom_dV, 0, cute.make_layout(1), sEpi, gdV, single_stage=True
+    )
     copy_dV_r2s, _, _ = copy_utils.get_smem_store_C(
       tiled_mma_dV,
       sEpi,
@@ -1505,9 +1656,15 @@ class FFPAAttnBwdDKDVSm90SplitD:
     warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
     # WG2 occupies warp 8..11 (CTA-absolute). warp_idx == 8 issues TMA store.
 
-    mdK_cur = seqlen.offset_batch_K(mdK, batch_idx, dim=3, ragged=self.varlen_k)[None, None, head_idx]
-    gdK = cute.local_tile(mdK_cur, (self.tile_n, self.d_chunk), (n_block, d_pass))
-    store_dK, _, _ = copy_utils.tma_get_copy_fn(tma_atom_dK, 0, cute.make_layout(1), sEpi, gdK, single_stage=True)
+    mdK_cur = seqlen.offset_batch_K(
+      mdK, batch_idx, dim=3, ragged=self.varlen_k
+    )[None, None, head_idx]
+    gdK = cute.local_tile(
+      mdK_cur, (self.tile_n, self.d_chunk), (n_block, d_pass)
+    )
+    store_dK, _, _ = copy_utils.tma_get_copy_fn(
+      tma_atom_dK, 0, cute.make_layout(1), sEpi, gdK, single_stage=True
+    )
     copy_dK_r2s, _, _ = copy_utils.get_smem_store_C(
       tiled_mma_dK,
       sEpi,

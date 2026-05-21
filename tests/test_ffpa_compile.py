@@ -104,7 +104,9 @@ _BACKEND_PAIRS = [
 
 @pytest.mark.parametrize("dtype", DTYPES, ids=["fp16", "bf16"])
 @pytest.mark.parametrize("B,H,N,D", BWD_SHAPES)
-@pytest.mark.parametrize("fw,bw", _BACKEND_PAIRS, ids=lambda p: f"{p[0]}-{p[1]}")
+@pytest.mark.parametrize(
+  "fw,bw", _BACKEND_PAIRS, ids=lambda p: f"{p[0]}-{p[1]}"
+)
 def test_compile_backward(dtype, B, H, N, D, fw, bw):
   """torch.compile forward+backward matches eager grads across backend pairs."""
   if fw == "cuda":
@@ -164,8 +166,12 @@ def test_compile_gqa(dtype):
   torch.manual_seed(0)
   device = "cuda"
   q = torch.randn(B, Nh_q, N, D, dtype=dtype, device=device, requires_grad=True)
-  k = torch.randn(B, Nh_kv, N, D, dtype=dtype, device=device, requires_grad=True)
-  v = torch.randn(B, Nh_kv, N, D, dtype=dtype, device=device, requires_grad=True)
+  k = torch.randn(
+    B, Nh_kv, N, D, dtype=dtype, device=device, requires_grad=True
+  )
+  v = torch.randn(
+    B, Nh_kv, N, D, dtype=dtype, device=device, requires_grad=True
+  )
 
   # Eager (CUDA fwd + Triton bwd)
   qr = q.detach().requires_grad_(True)
@@ -203,7 +209,10 @@ def test_compile_gqa(dtype):
 
 # Causal compile test
 @pytest.mark.parametrize("dtype", DTYPES, ids=["fp16", "bf16"])
-@pytest.mark.parametrize("fw,bw", [("cuda", "triton"), ("triton", "triton")], ids=["cuda-triton", "triton-triton"])
+@pytest.mark.parametrize(
+  "fw,bw", [("cuda", "triton"), ("triton", "triton")],
+  ids=["cuda-triton", "triton-triton"]
+)
 def test_compile_causal(dtype, fw, bw):
   """torch.compile with causal masking matches eager across backend pairs."""
   if fw == "cuda":

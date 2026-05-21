@@ -73,10 +73,16 @@ def _compile_bwd_preprocess(
 ):
   """Compile bwd preprocess kernel using cute fake tensors."""
   batchp1 = cute.sym_int()
-  mO, mdO, mLSE, mLSElog2, mPdPsum = _make_fake_bwd_preprocess_tensors(dtype, varlen_q=has_cuseqlens_q)
-  mCuSeqlensQ = fake_tensor(Int32, (batchp1, ), divisibility=1) if has_cuseqlens_q else None
+  mO, mdO, mLSE, mLSElog2, mPdPsum = _make_fake_bwd_preprocess_tensors(
+    dtype, varlen_q=has_cuseqlens_q
+  )
+  mCuSeqlensQ = fake_tensor(
+    Int32, (batchp1, ), divisibility=1
+  ) if has_cuseqlens_q else None
   mdLSE = fake_tensor(Float32, mLSE.shape, divisibility=1) if has_dlse else None
-  ffpa_bwd_pre = FFPAAttnBwdPreprocess(dtype, head_dim, head_dim_v, m_block_size)
+  ffpa_bwd_pre = FFPAAttnBwdPreprocess(
+    dtype, head_dim, head_dim_v, m_block_size
+  )
   return cute.compile(
     ffpa_bwd_pre,
     mO,
@@ -121,7 +127,9 @@ def _bwd_preprocess(
     cute_arch_key,
   )
   if compile_key not in _bwd_preprocess.compile_cache:
-    _bwd_preprocess.compile_cache[compile_key] = _compile_bwd_preprocess(*compile_key)
+    _bwd_preprocess.compile_cache[compile_key] = _compile_bwd_preprocess(
+      *compile_key
+    )
   if not is_fake_mode():
     _call_with_tvm_ffi_current_stream(
       _bwd_preprocess.compile_cache[compile_key],
@@ -172,14 +180,17 @@ def _ffpa_attn_backward_sm90(
     causal, window_size_left, window_size_right
   )
   if local:
-    raise NotImplementedError("SplitD backward does not support local/window attention yet")
+    raise NotImplementedError(
+      "SplitD backward does not support local/window attention yet"
+    )
 
   # SplitD tile sizes (hardcoded)
   m_block_size = BWD_TILE_M
   n_block_size = BWD_TILE_N
 
   q, k, v, out, dout, lse, cu_seqlens_q, cu_seqlens_k = [
-    maybe_contiguous(t) for t in (q, k, v, out, dout, lse, cu_seqlens_q, cu_seqlens_k)
+    maybe_contiguous(t)
+    for t in (q, k, v, out, dout, lse, cu_seqlens_q, cu_seqlens_k)
   ]
   (
     batch_size,
@@ -190,9 +201,15 @@ def _ffpa_attn_backward_sm90(
     num_head_kv,
     head_dim,
     head_dim_v,
-  ) = _validate_qkv_common(q, k, v, cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k)
-  _validate_max_seqlen_for_cu_seqlens(cu_seqlens_q, "cu_seqlens_q", max_seqlen_q, "max_seqlen_q")
-  _validate_max_seqlen_for_cu_seqlens(cu_seqlens_k, "cu_seqlens_k", max_seqlen_k, "max_seqlen_k")
+  ) = _validate_qkv_common(
+    q, k, v, cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k
+  )
+  _validate_max_seqlen_for_cu_seqlens(
+    cu_seqlens_q, "cu_seqlens_q", max_seqlen_q, "max_seqlen_q"
+  )
+  _validate_max_seqlen_for_cu_seqlens(
+    cu_seqlens_k, "cu_seqlens_k", max_seqlen_k, "max_seqlen_k"
+  )
   if q.dtype == torch.float16:
     raise NotImplementedError(
       "SplitD backward currently supports bfloat16 only; the fp16 dQ path has a known launch failure."
@@ -202,7 +219,9 @@ def _ffpa_attn_backward_sm90(
   else:
     seqlen_q_for_rounding = max_seqlen_q if max_seqlen_q is not None else total_q
 
-  seqlen_q_rounded = (seqlen_q_for_rounding + m_block_size - 1) // m_block_size * m_block_size
+  seqlen_q_rounded = (
+    seqlen_q_for_rounding + m_block_size - 1
+  ) // m_block_size * m_block_size
   device = q.device
   out_torch_dtype = q.dtype
   if cu_seqlens_q is not None:
@@ -246,12 +265,30 @@ def _ffpa_attn_backward_sm90(
     return dq, dk, dv
 
   if cu_seqlens_q is None:
-    dpsum = torch.empty(batch_size, num_head, seqlen_q_rounded, dtype=torch.float32, device=device)
-    lse_log2 = torch.empty(batch_size, num_head, seqlen_q_rounded, dtype=torch.float32, device=device)
+    dpsum = torch.empty(
+      batch_size,
+      num_head,
+      seqlen_q_rounded,
+      dtype=torch.float32,
+      device=device
+    )
+    lse_log2 = torch.empty(
+      batch_size,
+      num_head,
+      seqlen_q_rounded,
+      dtype=torch.float32,
+      device=device
+    )
   else:
-    total_q_rounded_padded = (total_q + cu_seqlens_q.shape[0] * m_block_size - 1) // m_block_size * m_block_size
-    dpsum = torch.empty(num_head, total_q_rounded_padded, dtype=torch.float32, device=device)
-    lse_log2 = torch.empty(num_head, total_q_rounded_padded, dtype=torch.float32, device=device)
+    total_q_rounded_padded = (
+      total_q + cu_seqlens_q.shape[0] * m_block_size - 1
+    ) // m_block_size * m_block_size
+    dpsum = torch.empty(
+      num_head, total_q_rounded_padded, dtype=torch.float32, device=device
+    )
+    lse_log2 = torch.empty(
+      num_head, total_q_rounded_padded, dtype=torch.float32, device=device
+    )
 
   dtype = torch2cute_dtype_map[q.dtype]
   current_stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
@@ -293,10 +330,12 @@ def _ffpa_attn_backward_sm90(
     lse_log2_t = to_cute_tensor(lse_log2, assumed_align=4)
     dpsum_t = to_cute_tensor(dpsum, assumed_align=4)
     cu_seqlens_q_t = (
-      to_cute_tensor(cu_seqlens_q, assumed_align=4, leading_dim=0) if cu_seqlens_q is not None else None
+      to_cute_tensor(cu_seqlens_q, assumed_align=4, leading_dim=0)
+      if cu_seqlens_q is not None else None
     )
     cu_seqlens_k_t = (
-      to_cute_tensor(cu_seqlens_k, assumed_align=4, leading_dim=0) if cu_seqlens_k is not None else None
+      to_cute_tensor(cu_seqlens_k, assumed_align=4, leading_dim=0)
+      if cu_seqlens_k is not None else None
     )
 
     ffpa_dkdv = FFPAAttnBwdDKDVSm90SplitD(
@@ -322,7 +361,9 @@ def _ffpa_attn_backward_sm90(
       cu_seqlens_q_t,
       cu_seqlens_k_t,
       current_stream,
-      options=("--enable-tvm-ffi --ptxas-options '--verbose --warn-on-spills --warn-on-local-memory-usage'"),
+      options=(
+        "--enable-tvm-ffi --ptxas-options '--verbose --warn-on-spills --warn-on-local-memory-usage'"
+      ),
     )
 
   if bwd_key not in _ffpa_attn_backward_sm90.compile_cache_dq:
@@ -331,10 +372,12 @@ def _ffpa_attn_backward_sm90(
     lse_log2_t2 = to_cute_tensor(lse_log2, assumed_align=4)
     dpsum_t2 = to_cute_tensor(dpsum, assumed_align=4)
     cu_seqlens_q_t2 = (
-      to_cute_tensor(cu_seqlens_q, assumed_align=4, leading_dim=0) if cu_seqlens_q is not None else None
+      to_cute_tensor(cu_seqlens_q, assumed_align=4, leading_dim=0)
+      if cu_seqlens_q is not None else None
     )
     cu_seqlens_k_t2 = (
-      to_cute_tensor(cu_seqlens_k, assumed_align=4, leading_dim=0) if cu_seqlens_k is not None else None
+      to_cute_tensor(cu_seqlens_k, assumed_align=4, leading_dim=0)
+      if cu_seqlens_k is not None else None
     )
 
     ffpa_dq = FFPAAttnBwdDQSm90SplitD(
@@ -359,7 +402,9 @@ def _ffpa_attn_backward_sm90(
       cu_seqlens_q_t2,
       cu_seqlens_k_t2,
       current_stream,
-      options=("--enable-tvm-ffi --ptxas-options '--verbose --warn-on-spills --warn-on-local-memory-usage'"),
+      options=(
+        "--enable-tvm-ffi --ptxas-options '--verbose --warn-on-spills --warn-on-local-memory-usage'"
+      ),
     )
 
   # Execute dKdV and dQ kernels
@@ -397,5 +442,7 @@ def _ffpa_attn_backward_sm90(
   return dq, dk, dv
 
 
-_ffpa_attn_backward_sm90.compile_cache_dkdv = get_jit_cache("bwd_splitd_dkdv_sm90")
+_ffpa_attn_backward_sm90.compile_cache_dkdv = get_jit_cache(
+  "bwd_splitd_dkdv_sm90"
+)
 _ffpa_attn_backward_sm90.compile_cache_dq = get_jit_cache("bwd_splitd_dq_sm90")

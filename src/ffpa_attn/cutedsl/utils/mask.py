@@ -74,7 +74,9 @@ def mask_r2p_lambda(
         Returns a 32-bit bitmask for the chunk. Bit i set means column
         chunk_idx * chunk_size + i is KEPT; bit i clear means masked to -inf.
     """
-  ncol = const_expr(cute.size(X.shape[cute.rank(X) - 1]) if not rank1 else cute.size(X.shape))
+  ncol = const_expr(
+    cute.size(X.shape[cute.rank(X) - 1]) if not rank1 else cute.size(X.shape)
+  )
   # 32-column chunks. The mask_gen_fn returns a Uint32 bitmask (1=keep).
   CHUNK_SIZE = MASK_R2P_CHUNK_SIZE
   for s in cutlass.range_constexpr(cute.ceil_div(ncol, CHUNK_SIZE)):
@@ -108,7 +110,8 @@ class AttentionMask:
   seqlen_info: SeqlenInfoQK
   window_size_left: Optional[Int32] = None
   window_size_right: Optional[Int32] = None
-  qhead_per_kvhead_packgqa: cutlass.Constexpr[int] = 1  # only pass in if we're doing PackGQA
+  qhead_per_kvhead_packgqa: cutlass.Constexpr[
+    int] = 1  # only pass in if we're doing PackGQA
   # Reserved: enables the bwd SdP swap_AB path of apply_mask (currently no SM90 call site sets this True).
   swap_AB: cutlass.Constexpr[bool] = False
 
@@ -136,14 +139,22 @@ class AttentionMask:
     aux_tensors: Optional[list] = None,
     fastdiv_mods=(None, None),
   ) -> None:
-    assert not (mask_causal and mask_local), "mask_causal and mask_local cannot be both True"
+    assert not (
+      mask_causal and mask_local
+    ), "mask_causal and mask_local cannot be both True"
     acc_S_mn = layout_utils.reshape_acc_to_mn(acc_S, transpose=self.swap_AB)
     acc_shape = (self.tile_m, self.tile_n)
-    cS = cute.make_identity_tensor(acc_shape if not self.swap_AB else acc_shape[::-1])
-    tScS_mn = layout_utils.reshape_acc_to_mn(thr_mma.partition_C(cS), transpose=self.swap_AB)
+    cS = cute.make_identity_tensor(
+      acc_shape if not self.swap_AB else acc_shape[::-1]
+    )
+    tScS_mn = layout_utils.reshape_acc_to_mn(
+      thr_mma.partition_C(cS), transpose=self.swap_AB
+    )
     # We use t0ScS as these indices are known at compile time. We then must subtract the
     # column limit by the thread column offset.
-    t0ScS_mn = layout_utils.reshape_acc_to_mn(thr_mma.get_slice(0).partition_C(cS), transpose=self.swap_AB)
+    t0ScS_mn = layout_utils.reshape_acc_to_mn(
+      thr_mma.get_slice(0).partition_C(cS), transpose=self.swap_AB
+    )
     ROW = 0 if const_expr(not self.swap_AB) else 1
     COL = 1 if const_expr(not self.swap_AB) else 0
     thr_col_offset = tScS_mn[0][COL]
@@ -160,17 +171,28 @@ class AttentionMask:
           # traverse column index.
           for c in cutlass.range(cute.size(tScS_mn.shape[1]), unroll_full=True):
             oob = t0ScS_mn[0, c][COL] >= seqlenk_col_limit
-            for r in cutlass.range(cute.size(tScS_mn.shape[0]), unroll_full=True):
+            for r in cutlass.range(
+              cute.size(tScS_mn.shape[0]), unroll_full=True
+            ):
               acc_S_mn[r, c] = -Float32.inf if oob else acc_S_mn[r, c]
         else:
           seqlenk_col_limit_r2p = sm90_col_to_r2p_idx(seqlenk_col_limit)
-          mask_r2p_lambda(acc_S_mn, lambda s: r2p_bitmask_below(seqlenk_col_limit_r2p, s))
+          mask_r2p_lambda(
+            acc_S_mn, lambda s: r2p_bitmask_below(seqlenk_col_limit_r2p, s)
+          )
 
-    elif const_expr(not mask_causal and not mask_local and mask_mod is not None):  # FlexAttention mask mod
+    elif const_expr(
+      not mask_causal and not mask_local and mask_mod is not None
+    ):  # FlexAttention mask mod
       nrow = const_expr(cute.size(tScS_mn.shape[0]))
       ncol = const_expr(cute.size(tScS_mn.shape[1]))
-      has_fastdiv = const_expr(fastdiv_mods is not None and fastdiv_mods[0] is not None and fastdiv_mods[1] is not None)
-      wrap_aux_indices = const_expr(has_fastdiv and mask_seqlen and const_expr(aux_tensors is not None))
+      has_fastdiv = const_expr(
+        fastdiv_mods is not None and fastdiv_mods[0] is not None
+        and fastdiv_mods[1] is not None
+      )
+      wrap_aux_indices = const_expr(
+        has_fastdiv and mask_seqlen and const_expr(aux_tensors is not None)
+      )
 
       for r in cutlass.range_constexpr(nrow):
         # Respect swap_AB: ROW/COL determine which coordinate component corresponds to Q/KV.
@@ -208,13 +230,16 @@ class AttentionMask:
           )
           cond = cutlass.Boolean(ssa_to_scalar(mask_value))
           if const_expr(mask_seqlen):
-            out_of_bounds = (row_for_seqlen >= self.seqlen_q) or (global_col_idx >= self.seqlen_k)
+            out_of_bounds = (row_for_seqlen >= self.seqlen_q
+                             ) or (global_col_idx >= self.seqlen_k)
             if out_of_bounds:
               acc_S_mn[r, col] = -cutlass.Float32.inf
             else:
-              acc_S_mn[r, col] = acc_S_mn[r, col] if cond else -cutlass.Float32.inf
+              acc_S_mn[r, col] = acc_S_mn[r,
+                                          col] if cond else -cutlass.Float32.inf
           else:
-            acc_S_mn[r, col] = acc_S_mn[r, col] if cond else -cutlass.Float32.inf
+            acc_S_mn[r, col] = acc_S_mn[r,
+                                        col] if cond else -cutlass.Float32.inf
 
     else:  # Causal or local
       if const_expr(not self.swap_AB):
@@ -226,7 +251,9 @@ class AttentionMask:
           assert cute.arch.WARP_SIZE % threads_per_row == 0, "threads_per_row must divide WARP_SIZE"
           assert cute.size(acc_S_mn.shape[0]) <= threads_per_row
           tidx = thr_mma.thr_idx
-          mma_m_idx = (m_block * self.tile_m + tScS_mn[tidx % threads_per_row, 0][0]) // self.qhead_per_kvhead_packgqa
+          mma_m_idx = (
+            m_block * self.tile_m + tScS_mn[tidx % threads_per_row, 0][0]
+          ) // self.qhead_per_kvhead_packgqa
         causal_row_offset = 1 + self.seqlen_k - n_block * self.tile_n - self.seqlen_q - thr_col_offset
         if const_expr(mask_causal):
           r2p = const_expr(not self.swap_AB)  # R2P trick, see apply_mask_sm100
@@ -235,14 +262,21 @@ class AttentionMask:
             if const_expr(self.qhead_per_kvhead_packgqa == 1):
               row_idx = tScS_mn[r, 0][0] + m_block * self.tile_m
             else:
-              row_idx = shuffle_sync(mma_m_idx, r % threads_per_row, width=threads_per_row)
+              row_idx = shuffle_sync(
+                mma_m_idx, r % threads_per_row, width=threads_per_row
+              )
             col_limit_right = row_idx + causal_row_offset
             if const_expr(mask_seqlen):
               col_limit_right = cutlass.min(col_limit_right, seqlenk_col_limit)
             if const_expr(not r2p):
               # traverse column index.
-              for c in cutlass.range(cute.size(tScS_mn.shape[1]), unroll_full=True):
-                acc_S_mn[r, c] = (-Float32.inf if t0ScS_mn[0, c][1] >= col_limit_right else acc_S_mn[r, c])
+              for c in cutlass.range(
+                cute.size(tScS_mn.shape[1]), unroll_full=True
+              ):
+                acc_S_mn[r, c] = (
+                  -Float32.inf
+                  if t0ScS_mn[0, c][1] >= col_limit_right else acc_S_mn[r, c]
+                )
             else:
               col_limit_r2p = sm90_col_to_r2p_idx(col_limit_right)
               mask_r2p_lambda(
@@ -252,27 +286,36 @@ class AttentionMask:
               )
         else:  # Local
           local_row_offset_right = (
-            causal_row_offset + self.window_size_right if const_expr(self.window_size_right is not None) else None
+            causal_row_offset + self.window_size_right
+            if const_expr(self.window_size_right is not None) else None
           )
           local_row_offset_left = (
-            causal_row_offset - 1 - self.window_size_left if const_expr(self.window_size_left is not None) else None
+            causal_row_offset - 1 - self.window_size_left
+            if const_expr(self.window_size_left is not None) else None
           )
           r2p_local = const_expr(not self.swap_AB)
           for r in cutlass.range(cute.size(tScS_mn.shape[0]), unroll_full=True):
             if const_expr(self.qhead_per_kvhead_packgqa == 1):
               row_idx = tScS_mn[r, 0][0] + m_block * self.tile_m
             else:
-              row_idx = shuffle_sync(mma_m_idx, r % threads_per_row, width=threads_per_row)
+              row_idx = shuffle_sync(
+                mma_m_idx, r % threads_per_row, width=threads_per_row
+              )
             if const_expr(self.window_size_right is not None):
               col_limit_right = row_idx + local_row_offset_right
             else:
               col_limit_right = self.tile_n
             if const_expr(mask_seqlen):
               col_limit_right = cutlass.min(col_limit_right, seqlenk_col_limit)
-            col_limit_left = (row_idx + local_row_offset_left if const_expr(self.window_size_left is not None) else 0)
+            col_limit_left = (
+              row_idx + local_row_offset_left
+              if const_expr(self.window_size_left is not None) else 0
+            )
             if const_expr(not r2p_local):
               # traverse column index.
-              for c in cutlass.range(cute.size(tScS_mn.shape[1]), unroll_full=True):
+              for c in cutlass.range(
+                cute.size(tScS_mn.shape[1]), unroll_full=True
+              ):
                 col_idx = t0ScS_mn[0, c][1]
                 if col_idx >= col_limit_right or col_idx < col_limit_left:
                   acc_S_mn[r, c] = -Float32.inf
@@ -281,7 +324,9 @@ class AttentionMask:
               col_limit_left_r2p = sm90_col_to_r2p_idx(col_limit_left)
 
               def mask_gen_fn(s: int) -> Uint32:
-                return r2p_bitmask_below(col_limit_right_r2p, s) & r2p_bitmask_above(col_limit_left_r2p, s)
+                return r2p_bitmask_below(
+                  col_limit_right_r2p, s
+                ) & r2p_bitmask_above(col_limit_left_r2p, s)
 
               mask_r2p_lambda(acc_S_mn[r, None], mask_gen_fn, rank1=True)
       # Reserved: future SM90 bwd SdP swap_AB path; not reached under current call sites.
@@ -294,9 +339,15 @@ class AttentionMask:
             col0 = t0ScS_mn[0, c][COL]
             # If col0 is beyond the column limit, we want to mask out the entire
             # column, by setting row limit to be self.tile_m.
-            row_limit_top = (self.tile_m if col0 >= seqlenk_col_limit and mask_seqlen else col0 - causal_row_offset)
-            for r in cutlass.range(cute.size(tScS_mn.shape[0]), unroll_full=True):
-              acc_S_mn[r, c] = -Float32.inf if t0ScS_mn[r, 0][ROW] < row_limit_top else acc_S_mn[r, c]
+            row_limit_top = (
+              self.tile_m if col0 >= seqlenk_col_limit and mask_seqlen else
+              col0 - causal_row_offset
+            )
+            for r in cutlass.range(
+              cute.size(tScS_mn.shape[0]), unroll_full=True
+            ):
+              acc_S_mn[r, c] = -Float32.inf if t0ScS_mn[
+                r, 0][ROW] < row_limit_top else acc_S_mn[r, c]
         else:
           for c in cutlass.range(cute.size(tScS_mn.shape[1]), unroll_full=True):
             col0 = t0ScS_mn[0, c][COL]
@@ -304,14 +355,19 @@ class AttentionMask:
             # column, by setting row limit to be self.tile_m.
             row_limit_top = (
               self.tile_m if col0 >= seqlenk_col_limit and mask_seqlen else (
-                col0 - causal_row_offset -
-                self.window_size_right if const_expr(self.window_size_right is not None) else 0
+                col0 - causal_row_offset - self.window_size_right
+                if const_expr(self.window_size_right is not None) else 0
               )
             )
             row_limit_bot = (
-              col0 - causal_row_offset +
-              self.window_size_left if const_expr(self.window_size_left is not None) else self.tile_m
+              col0 - causal_row_offset + self.window_size_left
+              if const_expr(self.window_size_left is not None) else self.tile_m
             )
-            for r in cutlass.range(cute.size(tScS_mn.shape[0]), unroll_full=True):
+            for r in cutlass.range(
+              cute.size(tScS_mn.shape[0]), unroll_full=True
+            ):
               row_idx = t0ScS_mn[r, 0][ROW]
-              acc_S_mn[r, c] = (-Float32.inf if row_idx < row_limit_top or row_idx > row_limit_bot else acc_S_mn[r, c])
+              acc_S_mn[r, c] = (
+                -Float32.inf if row_idx < row_limit_top
+                or row_idx > row_limit_bot else acc_S_mn[r, c]
+              )

@@ -165,18 +165,30 @@ def _require_cutedsl_supported(
   see an actionable error rather than a deep kernel crash.
   """
   if q.device.type != "cuda":
-    raise RuntimeError(f"cutedsl backend requires CUDA tensors, got device {q.device}")
+    raise RuntimeError(
+      f"cutedsl backend requires CUDA tensors, got device {q.device}"
+    )
   if not torch.cuda.is_available():
-    raise RuntimeError("cutedsl backend requires a CUDA-capable build of PyTorch")
+    raise RuntimeError(
+      "cutedsl backend requires a CUDA-capable build of PyTorch"
+    )
   major, _ = torch.cuda.get_device_capability(q.device)
   if major != 9:
-    raise NotImplementedError(f"cutedsl backend only supports SM90 (Hopper); got compute capability {major}.x")
+    raise NotImplementedError(
+      f"cutedsl backend only supports SM90 (Hopper); got compute capability {major}.x"
+    )
   if q.size(-1) != SUPPORTED_HEAD_DIM:
-    raise NotImplementedError(f"cutedsl backend only supports head_dim={SUPPORTED_HEAD_DIM}; got {q.size(-1)}")
+    raise NotImplementedError(
+      f"cutedsl backend only supports head_dim={SUPPORTED_HEAD_DIM}; got {q.size(-1)}"
+    )
   if q.dtype not in (torch.float16, torch.bfloat16):
-    raise TypeError(f"cutedsl backend requires torch.float16 or torch.bfloat16, got {q.dtype}")
+    raise TypeError(
+      f"cutedsl backend requires torch.float16 or torch.bfloat16, got {q.dtype}"
+    )
   if requires_grad and q.dtype != torch.bfloat16:
-    raise NotImplementedError("cutedsl backward currently supports torch.bfloat16 only; use bf16 inputs for training")
+    raise NotImplementedError(
+      "cutedsl backward currently supports torch.bfloat16 only; use bf16 inputs for training"
+    )
   if k.size(-1) != SUPPORTED_HEAD_DIM or v.size(-1) != SUPPORTED_HEAD_DIM:
     raise NotImplementedError(
       f"cutedsl backend requires k/v head_dim={SUPPORTED_HEAD_DIM}; "
@@ -270,7 +282,9 @@ def _ffpa_attn_backward_cutedsl(
   :param causal: Whether causal masking was applied.
   :returns: ``(dq, dk, dv)`` all in ``[B, H, N, D]`` SDPA layout.
   """
-  q_nhd, k_nhd, v_nhd, out_nhd, dout_nhd = (_bhnd_to_bnhd(t) for t in (q, k, v, out, grad_out))
+  q_nhd, k_nhd, v_nhd, out_nhd, dout_nhd = (
+    _bhnd_to_bnhd(t) for t in (q, k, v, out, grad_out)
+  )
   dq_nhd, dk_nhd, dv_nhd = torch.ops.ffpa_attn._bwd_cutedsl(
     dout_nhd,
     q_nhd,
@@ -332,20 +346,30 @@ def _ffpa_attn_varlen_cutedsl(
       f"got ranks q={q.dim()} k={k.dim()} v={v.dim()}"
     )
   if k.shape != v.shape:
-    raise ValueError(f"ffpa_attn_varlen_func: k/v must share shape, "
-                     f"got k={tuple(k.shape)} v={tuple(v.shape)}")
+    raise ValueError(
+      f"ffpa_attn_varlen_func: k/v must share shape, "
+      f"got k={tuple(k.shape)} v={tuple(v.shape)}"
+    )
   if q.dtype not in (torch.float16, torch.bfloat16):
-    raise TypeError(f"ffpa_attn_varlen_func: q/k/v must be fp16/bf16, got {q.dtype}")
+    raise TypeError(
+      f"ffpa_attn_varlen_func: q/k/v must be fp16/bf16, got {q.dtype}"
+    )
   if k.dtype != q.dtype or v.dtype != q.dtype:
-    raise TypeError(f"ffpa_attn_varlen_func: q/k/v must share dtype, got "
-                    f"q={q.dtype} k={k.dtype} v={v.dtype}")
+    raise TypeError(
+      f"ffpa_attn_varlen_func: q/k/v must share dtype, got "
+      f"q={q.dtype} k={k.dtype} v={v.dtype}"
+    )
 
   if cu_seqlens_k is None:
     cu_seqlens_k = cu_seqlens_q
   if cu_seqlens_q.dtype != torch.int32 or cu_seqlens_k.dtype != torch.int32:
-    raise TypeError("ffpa_attn_varlen_func: cu_seqlens_q/cu_seqlens_k must be int32")
+    raise TypeError(
+      "ffpa_attn_varlen_func: cu_seqlens_q/cu_seqlens_k must be int32"
+    )
   if cu_seqlens_q.numel() != cu_seqlens_k.numel() or cu_seqlens_q.numel() < 2:
-    raise ValueError("ffpa_attn_varlen_func: cu_seqlens_q and cu_seqlens_k must share length >= 2")
+    raise ValueError(
+      "ffpa_attn_varlen_func: cu_seqlens_q and cu_seqlens_k must share length >= 2"
+    )
 
   if not enable_gqa and q.size(-2) != k.size(-2):
     raise ValueError(
@@ -402,11 +426,14 @@ def _fwd_cutedsl_torch_op(
   return_lse: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
   batch, seqlen_q, num_head, head_dim_v = q.shape
-  o = torch.empty(batch, seqlen_q, num_head, head_dim_v, dtype=q.dtype, device=q.device)
+  o = torch.empty(
+    batch, seqlen_q, num_head, head_dim_v, dtype=q.dtype, device=q.device
+  )
   need_lse = bool(return_lse)
   lse = (
-    torch.empty(batch, num_head, seqlen_q, dtype=torch.float32, device=q.device)
-    if need_lse else torch.empty(0, device=q.device)
+    torch.empty(
+      batch, num_head, seqlen_q, dtype=torch.float32, device=q.device
+    ) if need_lse else torch.empty(0, device=q.device)
   )
   _ffpa_attn_forward_sm90(
     q,
@@ -431,7 +458,10 @@ def _fwd_cutedsl_fake(
   return_lse: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
   o = torch.empty_like(q)
-  lse = (q.new_empty(q.size(0), q.size(-2), q.size(-3), dtype=torch.float32) if return_lse else q.new_empty(0))
+  lse = (
+    q.new_empty(q.size(0), q.size(-2), q.size(-3), dtype=torch.float32)
+    if return_lse else q.new_empty(0)
+  )
   return o, lse
 
 
@@ -534,8 +564,12 @@ def _varlen_fwd_custom(
   softcap: float,
   pack_gqa: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-  cu_seqlens_q, cu_seqlens_k = _trim_trailing_empty_varlen_segments(cu_seqlens_q, cu_seqlens_k)
-  window_size_left_opt, window_size_right_opt = _decode_custom_op_window(window_size_left, window_size_right)
+  cu_seqlens_q, cu_seqlens_k = _trim_trailing_empty_varlen_segments(
+    cu_seqlens_q, cu_seqlens_k
+  )
+  window_size_left_opt, window_size_right_opt = _decode_custom_op_window(
+    window_size_left, window_size_right
+  )
   return _ffpa_attn_forward_sm90(
     q,
     k,
@@ -579,11 +613,21 @@ def _varlen_fwd_fake(
     _num_head_kv,
     _head_dim,
     head_dim_v,
-  ) = _validate_qkv_common(q, k, v, cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k)
-  _validate_training_dtype(q, k, v, q.requires_grad or k.requires_grad or v.requires_grad)
-  _validate_max_seqlen_for_cu_seqlens(cu_seqlens_q, "cu_seqlens_q", max_seqlen_q, "max_seqlen_q")
-  _validate_max_seqlen_for_cu_seqlens(cu_seqlens_k, "cu_seqlens_k", max_seqlen_k, "max_seqlen_k")
-  _validate_varlen_custom_fwd_features(q, k, v, causal, window_size_left, window_size_right, softcap)
+  ) = _validate_qkv_common(
+    q, k, v, cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k
+  )
+  _validate_training_dtype(
+    q, k, v, q.requires_grad or k.requires_grad or v.requires_grad
+  )
+  _validate_max_seqlen_for_cu_seqlens(
+    cu_seqlens_q, "cu_seqlens_q", max_seqlen_q, "max_seqlen_q"
+  )
+  _validate_max_seqlen_for_cu_seqlens(
+    cu_seqlens_k, "cu_seqlens_k", max_seqlen_k, "max_seqlen_k"
+  )
+  _validate_varlen_custom_fwd_features(
+    q, k, v, causal, window_size_left, window_size_right, softcap
+  )
   out = q.new_empty((total_q, num_head, head_dim_v))
   lse = q.new_empty((num_head, total_q), dtype=torch.float32)
   return out, lse
@@ -608,8 +652,12 @@ def _varlen_bwd_custom(
   softcap: float,
   dlse: Optional[torch.Tensor],
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-  cu_seqlens_q, cu_seqlens_k = _trim_trailing_empty_varlen_segments(cu_seqlens_q, cu_seqlens_k)
-  window_size_left_opt, window_size_right_opt = _decode_custom_op_window(window_size_left, window_size_right)
+  cu_seqlens_q, cu_seqlens_k = _trim_trailing_empty_varlen_segments(
+    cu_seqlens_q, cu_seqlens_k
+  )
+  window_size_left_opt, window_size_right_opt = _decode_custom_op_window(
+    window_size_left, window_size_right
+  )
   return _ffpa_attn_backward_sm90(
     q,
     k,
@@ -658,17 +706,27 @@ def _varlen_bwd_fake(
     _num_head_kv,
     _head_dim,
     head_dim_v,
-  ) = _validate_qkv_common(q, k, v, cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k)
-  _validate_max_seqlen_for_cu_seqlens(cu_seqlens_q, "cu_seqlens_q", max_seqlen_q, "max_seqlen_q")
-  _validate_max_seqlen_for_cu_seqlens(cu_seqlens_k, "cu_seqlens_k", max_seqlen_k, "max_seqlen_k")
+  ) = _validate_qkv_common(
+    q, k, v, cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k
+  )
+  _validate_max_seqlen_for_cu_seqlens(
+    cu_seqlens_q, "cu_seqlens_q", max_seqlen_q, "max_seqlen_q"
+  )
+  _validate_max_seqlen_for_cu_seqlens(
+    cu_seqlens_k, "cu_seqlens_k", max_seqlen_k, "max_seqlen_k"
+  )
   if q.dtype == torch.float16:
     raise NotImplementedError(
       "SplitD backward currently supports bfloat16 only; the fp16 dQ path has a known launch failure."
     )
-  _validate_varlen_custom_bwd_features(causal, window_size_left, window_size_right, softcap)
+  _validate_varlen_custom_bwd_features(
+    causal, window_size_left, window_size_right, softcap
+  )
   device = q.device
   _validate_tensor(out, "out", (total_q, num_head, head_dim_v), q.dtype, device)
-  _validate_tensor(dout, "dout", (total_q, num_head, head_dim_v), q.dtype, device)
+  _validate_tensor(
+    dout, "dout", (total_q, num_head, head_dim_v), q.dtype, device
+  )
   _validate_tensor(lse, "lse", (num_head, total_q), torch.float32, device)
   if dlse is not None:
     _validate_tensor(dlse, "dlse", (num_head, total_q), torch.float32, device)
@@ -737,15 +795,25 @@ def _normalize_varlen_custom_op_inputs(
   aux_tensors: Optional[list],
 ) -> tuple[torch.Tensor, torch.Tensor, int, int, float, int, int, bool]:
   if cu_seqlens_q is None or cu_seqlens_k is None:
-    raise ValueError("_ffpa_attn_varlen_impl custom op path requires cu_seqlens_q and cu_seqlens_k")
+    raise ValueError(
+      "_ffpa_attn_varlen_impl custom op path requires cu_seqlens_q and cu_seqlens_k"
+    )
   if max_seqlen_q is None:
-    raise ValueError("max_seqlen_q must be provided when cu_seqlens_q is provided")
+    raise ValueError(
+      "max_seqlen_q must be provided when cu_seqlens_q is provided"
+    )
   if max_seqlen_k is None:
-    raise ValueError("max_seqlen_k must be provided when cu_seqlens_k is provided")
+    raise ValueError(
+      "max_seqlen_k must be provided when cu_seqlens_k is provided"
+    )
   if score_mod is not None:
-    raise NotImplementedError("score_mod is not supported by the SplitD varlen custom op schema")
+    raise NotImplementedError(
+      "score_mod is not supported by the SplitD varlen custom op schema"
+    )
   if aux_tensors is not None:
-    raise NotImplementedError("aux_tensors is not supported by the SplitD varlen custom op schema")
+    raise NotImplementedError(
+      "aux_tensors is not supported by the SplitD varlen custom op schema"
+    )
   if not isinstance(window_size, tuple) or len(window_size) != 2:
     raise TypeError("window_size must be a tuple of (left, right)")
 

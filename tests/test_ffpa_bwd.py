@@ -31,7 +31,13 @@ def _seqlen_q_rounded(seqlen_q):
 
 
 def _tolerance(dtype):
-  return {"atol": 5e-2, "rtol": 5e-2} if dtype == torch.bfloat16 else {"atol": 1e-2, "rtol": 1e-2}
+  return {
+    "atol": 5e-2,
+    "rtol": 5e-2
+  } if dtype == torch.bfloat16 else {
+    "atol": 1e-2,
+    "rtol": 1e-2
+  }
 
 
 def _skip_if_no_sm90_tma():
@@ -58,7 +64,11 @@ def _sdpa_ref(q, k, v, causal, scale, attn_mask=None):
   group_size = q.size(1) // k.size(1)
   k2 = k.repeat_interleave(group_size, dim=1) if group_size > 1 else k
   v2 = v.repeat_interleave(group_size, dim=1) if group_size > 1 else v
-  kw = {"attn_mask": attn_mask} if attn_mask is not None else _make_sdpa_kwargs(causal, q.size(2), k.size(2))
+  kw = {
+    "attn_mask": attn_mask
+  } if attn_mask is not None else _make_sdpa_kwargs(
+    causal, q.size(2), k.size(2)
+  )
   return F.scaled_dot_product_attention(q, k2, v2, scale=scale, **kw)
 
 
@@ -91,12 +101,18 @@ def _sdpa_ref_grads(
   k_in = k2.repeat_interleave(group_size, dim=1) if group_size > 1 else k2
   v_in = v2.repeat_interleave(group_size, dim=1) if group_size > 1 else v2
 
-  kw = {"attn_mask": attn_mask_ref} if attn_mask_ref is not None else _make_sdpa_kwargs(causal, q.size(2), k.size(2))
+  kw = {
+    "attn_mask": attn_mask_ref
+  } if attn_mask_ref is not None else _make_sdpa_kwargs(
+    causal, q.size(2), k.size(2)
+  )
   if rng_seed is not None:
     torch.manual_seed(rng_seed)
   if dropout_p > 0.0:
     with sdpa_kernel(SDPBackend.EFFICIENT_ATTENTION):
-      out_ref = F.scaled_dot_product_attention(q2, k_in, v_in, scale=scale, dropout_p=dropout_p, **kw)
+      out_ref = F.scaled_dot_product_attention(
+        q2, k_in, v_in, scale=scale, dropout_p=dropout_p, **kw
+      )
   else:
     out_ref = F.scaled_dot_product_attention(q2, k_in, v_in, scale=scale, **kw)
   if grad_out is None:
@@ -181,7 +197,9 @@ def test_sm90_tma_non_aligned_seqlen_matches_sdpa(enable_persist_dkdv):
     (torch.bfloat16, True, True, 128),
   ],
 )
-def test_sm90_tma_split_launch_matches_sdpa(dtype, enable_persist_dkdv, causal, N):
+def test_sm90_tma_split_launch_matches_sdpa(
+  dtype, enable_persist_dkdv, causal, N
+):
   _skip_if_no_sm90_tma()
   torch.manual_seed(125)
   B, H, D = 1, 2, 512
@@ -203,7 +221,9 @@ def test_sm90_tma_split_launch_matches_sdpa(dtype, enable_persist_dkdv, causal, 
   )
   out.backward(grad_out)
 
-  dq_ref, dk_ref, dv_ref = _sdpa_ref_grads(q, k, v, causal, scale, grad_out=grad_out)
+  dq_ref, dk_ref, dv_ref = _sdpa_ref_grads(
+    q, k, v, causal, scale, grad_out=grad_out
+  )
   tol = _tolerance(dtype)
   assert torch.allclose(q.grad, dq_ref, **tol)
   assert torch.allclose(k.grad, dk_ref, **tol)
@@ -257,8 +277,10 @@ def _key_position_bias_grad_ref(
   """Compute a fp32 reference gradient for compact [1, 1, 1, Nkv] key bias."""
   with torch.no_grad():
     group_size = q.size(1) // k.size(1)
-    k_ref = k.detach().repeat_interleave(group_size, dim=1) if group_size > 1 else k.detach()
-    v_ref = v.detach().repeat_interleave(group_size, dim=1) if group_size > 1 else v.detach()
+    k_ref = k.detach().repeat_interleave(group_size, dim=1
+                                         ) if group_size > 1 else k.detach()
+    v_ref = v.detach().repeat_interleave(group_size, dim=1
+                                         ) if group_size > 1 else v.detach()
     q_f = q.detach().float()
     k_f = k_ref.float()
     key_value_sum = v_ref.float().sum(dim=-1)
@@ -269,24 +291,36 @@ def _key_position_bias_grad_ref(
 
     for m_start in range(0, seqlen_q, block_m):
       q_block = q_f[:, :, m_start:m_start + block_m, :]
-      lse = torch.full(q_block.shape[:-1], -torch.inf, dtype=torch.float32, device=q.device)
+      lse = torch.full(
+        q_block.shape[:-1], -torch.inf, dtype=torch.float32, device=q.device
+      )
       for n_start in range(0, seqlen_k, block_n):
-        scores = torch.matmul(q_block, k_f[:, :, n_start:n_start + block_n, :].transpose(-2, -1)) * scale
+        scores = torch.matmul(
+          q_block, k_f[:, :, n_start:n_start + block_n, :].transpose(-2, -1)
+        ) * scale
         scores = scores + key_bias[n_start:n_start + block_n].view(1, 1, 1, -1)
         lse = torch.logaddexp(lse, torch.logsumexp(scores, dim=-1))
 
       delta = torch.zeros_like(lse)
       for n_start in range(0, seqlen_k, block_n):
-        scores = torch.matmul(q_block, k_f[:, :, n_start:n_start + block_n, :].transpose(-2, -1)) * scale
+        scores = torch.matmul(
+          q_block, k_f[:, :, n_start:n_start + block_n, :].transpose(-2, -1)
+        ) * scale
         scores = scores + key_bias[n_start:n_start + block_n].view(1, 1, 1, -1)
         prob = torch.exp(scores - lse[..., None])
-        delta += (prob * key_value_sum[:, :, None, n_start:n_start + block_n]).sum(dim=-1)
+        block_value_sum = key_value_sum[:, :, None, n_start:n_start + block_n]
+        delta += (prob * block_value_sum).sum(dim=-1)
 
       for n_start in range(0, seqlen_k, block_n):
-        scores = torch.matmul(q_block, k_f[:, :, n_start:n_start + block_n, :].transpose(-2, -1)) * scale
+        scores = torch.matmul(
+          q_block, k_f[:, :, n_start:n_start + block_n, :].transpose(-2, -1)
+        ) * scale
         scores = scores + key_bias[n_start:n_start + block_n].view(1, 1, 1, -1)
         prob = torch.exp(scores - lse[..., None])
-        d_bias = prob * (key_value_sum[:, :, None, n_start:n_start + block_n] - delta[..., None])
+        d_bias = prob * (
+          key_value_sum[:, :, None, n_start:n_start + block_n] -
+          delta[..., None]
+        )
         grad[n_start:n_start + block_n] += d_bias.sum(dim=(0, 1, 2))
 
     return grad.view(1, 1, 1, seqlen_k)
@@ -303,8 +337,12 @@ def _run_bwd_pre(o, do, d_chunk, block_headdim=64):
   """
   B, H, N, D = o.shape
   seqlen_q_rounded = _seqlen_q_rounded(N)
-  delta = torch.empty(B, H, seqlen_q_rounded, dtype=torch.float32, device=o.device)
-  full_block_headdim = max(64, triton.next_power_of_2(D)) if not d_chunk else block_headdim
+  delta = torch.empty(
+    B, H, seqlen_q_rounded, dtype=torch.float32, device=o.device
+  )
+  full_block_headdim = max(
+    64, triton.next_power_of_2(D)
+  ) if not d_chunk else block_headdim
   _ffpa_bwd_pre[(triton.cdiv(N, 128), B * H)](
     o,
     do,
@@ -329,7 +367,9 @@ def _run_bwd_pre(o, do, d_chunk, block_headdim=64):
 
 
 @pytest.mark.parametrize("dtype", DTYPES, ids=["fp16", "bf16"])
-@pytest.mark.parametrize("N,D", [(191, 64), (191, 320), (257, 512), (129, 1024)])
+@pytest.mark.parametrize(
+  "N,D", [(191, 64), (191, 320), (257, 512), (129, 1024)]
+)
 def test_ffpa_bwd_preprocess_full_and_d_chunk(dtype, N, D):
   """Full-D and split-D preprocess modes must match PyTorch delta."""
   B, H = 1, 2
@@ -341,14 +381,22 @@ def test_ffpa_bwd_preprocess_full_and_d_chunk(dtype, N, D):
   delta_full = _run_bwd_pre(o, do, d_chunk=False)
   delta_d_chunk = _run_bwd_pre(o, do, d_chunk=True, block_headdim=64)
 
-  tol = {"atol": 2e-2, "rtol": 2e-2} if dtype == torch.bfloat16 else {"atol": 1e-2, "rtol": 1e-2}
+  tol = {
+    "atol": 2e-2,
+    "rtol": 2e-2
+  } if dtype == torch.bfloat16 else {
+    "atol": 1e-2,
+    "rtol": 1e-2
+  }
   torch.testing.assert_close(delta_full, ref, **tol)
   torch.testing.assert_close(delta_d_chunk, ref, **tol)
   torch.testing.assert_close(delta_d_chunk, delta_full, **tol)
 
 
 @pytest.mark.parametrize("dtype", DTYPES, ids=["fp16", "bf16"])
-@pytest.mark.parametrize("preprocess_d_chunk", [False, True], ids=["pre_full", "pre_d_chunk"])
+@pytest.mark.parametrize(
+  "preprocess_d_chunk", [False, True], ids=["pre_full", "pre_d_chunk"]
+)
 def test_ffpa_bwd_triton_preprocess_modes(dtype, preprocess_d_chunk):
   """Triton backward must stay accurate with either preprocess mode."""
   B, H, N, D = 1, 2, 128, 320
@@ -515,8 +563,13 @@ def test_ffpa_bwd_triton_internal_kv_storage_dtype_option(dtype):
 
 
 @pytest.mark.parametrize("dtype", DTYPES, ids=["fp16", "bf16"])
-@pytest.mark.parametrize("grad_kv_storage_dtype", [torch.float16, torch.float32], ids=["kv-fp16", "kv-fp32"])
-def test_ffpa_bwd_triton_grad_kv_storage_dtype_preserves_public_grad_dtype(dtype, grad_kv_storage_dtype):
+@pytest.mark.parametrize(
+  "grad_kv_storage_dtype", [torch.float16, torch.float32],
+  ids=["kv-fp16", "kv-fp32"]
+)
+def test_ffpa_bwd_triton_grad_kv_storage_dtype_preserves_public_grad_dtype(
+  dtype, grad_kv_storage_dtype
+):
   """Public gradients should stay in q/k/v dtype even when Triton dK/dV storage dtype is overridden."""
   B, H, N, D = 1, 2, 128, 320
   torch.manual_seed(0)
@@ -550,7 +603,8 @@ def test_ffpa_bwd_triton_additive_attn_mask_matches_sdpa():
   q = torch.randn(B, H, N, D, dtype=dtype, device="cuda", requires_grad=True)
   k = torch.randn(B, H, N, D, dtype=dtype, device="cuda", requires_grad=True)
   v = torch.randn(B, H, N, D, dtype=dtype, device="cuda", requires_grad=True)
-  attn_mask = (torch.randn(1, 1, 1, N, dtype=dtype, device="cuda") * 0.25).requires_grad_(True)
+  attn_mask = (torch.randn(1, 1, 1, N, dtype=dtype, device="cuda") *
+               0.25).requires_grad_(True)
 
   scale = 1.0 / math.sqrt(D)
   out = ffpa_attn_func(
@@ -591,7 +645,9 @@ def test_ffpa_bwd_triton_key_bias_autotune_fp32_kv_storage_matches_sdpa():
   q = torch.randn(B, H, N, D, dtype=dtype, device="cuda", requires_grad=True)
   k = torch.randn(B, H, N, D, dtype=dtype, device="cuda", requires_grad=True)
   v = torch.randn(B, H, N, D, dtype=dtype, device="cuda", requires_grad=True)
-  attn_mask = (torch.randn(1, 1, 1, N, dtype=torch.float32, device="cuda") * 0.25).requires_grad_(True)
+  attn_mask = (
+    torch.randn(1, 1, 1, N, dtype=torch.float32, device="cuda") * 0.25
+  ).requires_grad_(True)
 
   scale = 1.0 / math.sqrt(D)
   out = ffpa_attn_func(
@@ -633,7 +689,8 @@ def test_ffpa_bwd_triton_additive_attn_mask_only_grad_matches_sdpa():
   q = torch.randn(B, H, N, D, dtype=dtype, device="cuda")
   k = torch.randn(B, H, N, D, dtype=dtype, device="cuda")
   v = torch.randn(B, H, N, D, dtype=dtype, device="cuda")
-  attn_mask = (torch.randn(1, 1, 1, N, dtype=dtype, device="cuda") * 0.25).requires_grad_(True)
+  attn_mask = (torch.randn(1, 1, 1, N, dtype=dtype, device="cuda") *
+               0.25).requires_grad_(True)
 
   scale = 1.0 / math.sqrt(D)
   out = ffpa_attn_func(
@@ -650,7 +707,9 @@ def test_ffpa_bwd_triton_additive_attn_mask_only_grad_matches_sdpa():
   assert attn_mask.grad is not None
   assert attn_mask.grad.shape == (1, 1, 1, N)
 
-  _, _, _, dmask_ref = _sdpa_ref_grads(q, k, v, False, scale, attn_mask=attn_mask, return_mask_grad=True)
+  _, _, _, dmask_ref = _sdpa_ref_grads(
+    q, k, v, False, scale, attn_mask=attn_mask, return_mask_grad=True
+  )
   torch.testing.assert_close(attn_mask.grad, dmask_ref, atol=3e-2, rtol=3e-2)
 
 
@@ -676,11 +735,16 @@ def test_ffpa_bwd_triton_decode_matches_sdpa(dtype, Nq, case):
 
   torch.manual_seed(7)
   q = torch.randn(B, Hq, Nq, D, dtype=dtype, device="cuda", requires_grad=True)
-  k = torch.randn(B, Hkv, Nkv, D, dtype=dtype, device="cuda", requires_grad=True)
-  v = torch.randn(B, Hkv, Nkv, D, dtype=dtype, device="cuda", requires_grad=True)
+  k = torch.randn(
+    B, Hkv, Nkv, D, dtype=dtype, device="cuda", requires_grad=True
+  )
+  v = torch.randn(
+    B, Hkv, Nkv, D, dtype=dtype, device="cuda", requires_grad=True
+  )
   grad_out = torch.randn_like(q)
   if case == "mask":
-    attn_mask = (torch.randn(1, 1, Nq, Nkv, dtype=dtype, device="cuda") * 0.25).requires_grad_(True)
+    attn_mask = (torch.randn(1, 1, Nq, Nkv, dtype=dtype, device="cuda") *
+                 0.25).requires_grad_(True)
 
   scale = 1.0 / math.sqrt(D)
   out = ffpa_attn_func(
@@ -713,7 +777,13 @@ def test_ffpa_bwd_triton_decode_matches_sdpa(dtype, Nq, case):
   else:
     dq_ref, dk_ref, dv_ref, dmask_ref = ref
 
-  tol = {"atol": 8e-2, "rtol": 8e-2} if dtype == torch.bfloat16 or (causal and Nq > 1) else {"atol": 3e-2, "rtol": 3e-2}
+  tol = {
+    "atol": 8e-2,
+    "rtol": 8e-2
+  } if dtype == torch.bfloat16 or (causal and Nq > 1) else {
+    "atol": 3e-2,
+    "rtol": 3e-2
+  }
   torch.testing.assert_close(q.grad, dq_ref, **tol)
   torch.testing.assert_close(k.grad, dk_ref, **tol)
   torch.testing.assert_close(v.grad, dv_ref, **tol)
@@ -745,7 +815,9 @@ def test_ffpa_bwd_triton_decode_autotune_matches_sdpa(Nq):
   )
   out.backward(grad_out)
 
-  dq_ref, dk_ref, dv_ref = _sdpa_ref_grads(q, k, v, False, scale, grad_out=grad_out)
+  dq_ref, dk_ref, dv_ref = _sdpa_ref_grads(
+    q, k, v, False, scale, grad_out=grad_out
+  )
   torch.testing.assert_close(q.grad, dq_ref, atol=3e-2, rtol=3e-2)
   torch.testing.assert_close(k.grad, dk_ref, atol=3e-2, rtol=3e-2)
   torch.testing.assert_close(v.grad, dv_ref, atol=3e-2, rtol=3e-2)
@@ -813,7 +885,13 @@ def test_ffpa_bwd_triton_decode_single_query_causal_large_matches_sdpa(dtype):
     grad_out=grad_out,
   )
 
-  tol = {"atol": 1e-2, "rtol": 1e-2} if dtype == torch.bfloat16 else {"atol": 3e-3, "rtol": 3e-3}
+  tol = {
+    "atol": 1e-2,
+    "rtol": 1e-2
+  } if dtype == torch.bfloat16 else {
+    "atol": 3e-3,
+    "rtol": 3e-3
+  }
   torch.testing.assert_close(out, out_ref, **tol)
   torch.testing.assert_close(q.grad, dq_ref, **tol)
   torch.testing.assert_close(k.grad, dk_ref, **tol)
@@ -911,7 +989,8 @@ def test_ffpa_bwd_triton_dropout_additive_attn_mask_matches_sdpa():
   q = torch.randn(B, H, N, D, dtype=dtype, device="cuda", requires_grad=True)
   k = torch.randn(B, H, N, D, dtype=dtype, device="cuda", requires_grad=True)
   v = torch.randn(B, H, N, D, dtype=dtype, device="cuda", requires_grad=True)
-  attn_mask = (torch.randn(1, 1, 1, N, dtype=dtype, device="cuda") * 0.25).requires_grad_(True)
+  attn_mask = (torch.randn(1, 1, 1, N, dtype=dtype, device="cuda") *
+               0.25).requires_grad_(True)
   grad_out = torch.randn_like(q)
 
   scale = 1.0 / math.sqrt(D)
@@ -1060,8 +1139,12 @@ def test_ffpa_bwd_gqa(dtype, Nh_q, Nh_kv, N, D):
   B = 1
   torch.manual_seed(0)
   q = torch.randn(B, Nh_q, N, D, dtype=dtype, device="cuda", requires_grad=True)
-  k = torch.randn(B, Nh_kv, N, D, dtype=dtype, device="cuda", requires_grad=True)
-  v = torch.randn(B, Nh_kv, N, D, dtype=dtype, device="cuda", requires_grad=True)
+  k = torch.randn(
+    B, Nh_kv, N, D, dtype=dtype, device="cuda", requires_grad=True
+  )
+  v = torch.randn(
+    B, Nh_kv, N, D, dtype=dtype, device="cuda", requires_grad=True
+  )
 
   scale = 1.0 / math.sqrt(D)
   out = ffpa_attn_func(
@@ -1087,14 +1170,20 @@ def test_ffpa_bwd_gqa(dtype, Nh_q, Nh_kv, N, D):
 
 
 @pytest.mark.parametrize("dtype", DTYPES, ids=["fp16", "bf16"])
-@pytest.mark.parametrize("Nh_q,Nh_kv,N,D", [(32, 4, 8192, 320), (8, 1, 8192, 320)])
+@pytest.mark.parametrize(
+  "Nh_q,Nh_kv,N,D", [(32, 4, 8192, 320), (8, 1, 8192, 320)]
+)
 def test_ffpa_bwd_sdpa_backend_gqa(dtype, Nh_q, Nh_kv, N, D):
   """The SDPA backward backend must preserve high-precision GQA gradients."""
   B = 1
   torch.manual_seed(0)
   q = torch.randn(B, Nh_q, N, D, dtype=dtype, device="cuda", requires_grad=True)
-  k = torch.randn(B, Nh_kv, N, D, dtype=dtype, device="cuda", requires_grad=True)
-  v = torch.randn(B, Nh_kv, N, D, dtype=dtype, device="cuda", requires_grad=True)
+  k = torch.randn(
+    B, Nh_kv, N, D, dtype=dtype, device="cuda", requires_grad=True
+  )
+  v = torch.randn(
+    B, Nh_kv, N, D, dtype=dtype, device="cuda", requires_grad=True
+  )
 
   scale = 1.0 / math.sqrt(D)
   out = ffpa_attn_func(
@@ -1127,7 +1216,8 @@ def test_ffpa_bwd_sdpa_backend_additive_attn_mask_matches_sdpa(dtype):
   q = torch.randn(B, H, N, D, dtype=dtype, device="cuda", requires_grad=True)
   k = torch.randn(B, H, N, D, dtype=dtype, device="cuda", requires_grad=True)
   v = torch.randn(B, H, N, D, dtype=dtype, device="cuda", requires_grad=True)
-  attn_mask = (torch.randn(1, 1, 1, N, dtype=dtype, device="cuda") * 0.25).requires_grad_(True)
+  attn_mask = (torch.randn(1, 1, 1, N, dtype=dtype, device="cuda") *
+               0.25).requires_grad_(True)
 
   scale = 1.0 / math.sqrt(D)
   out = ffpa_attn_func(
@@ -1178,8 +1268,12 @@ def test_ffpa_bwd_causal_gqa(dtype, Nh_q, Nh_kv, N, D):
   B = 1
   torch.manual_seed(0)
   q = torch.randn(B, Nh_q, N, D, dtype=dtype, device="cuda", requires_grad=True)
-  k = torch.randn(B, Nh_kv, N, D, dtype=dtype, device="cuda", requires_grad=True)
-  v = torch.randn(B, Nh_kv, N, D, dtype=dtype, device="cuda", requires_grad=True)
+  k = torch.randn(
+    B, Nh_kv, N, D, dtype=dtype, device="cuda", requires_grad=True
+  )
+  v = torch.randn(
+    B, Nh_kv, N, D, dtype=dtype, device="cuda", requires_grad=True
+  )
 
   scale = 1.0 / math.sqrt(D)
   out = ffpa_attn_func(

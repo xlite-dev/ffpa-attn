@@ -42,11 +42,15 @@ def _parse_grad_kv_dtype(arg: str) -> torch.dtype | None:
     return torch.float16
   if arg == "fp32":
     return torch.float32
-  raise ValueError(f"Unsupported grad-kv-dtype={arg!r}; choose 'none', 'fp16', or 'fp32'.")
+  raise ValueError(
+    f"Unsupported grad-kv-dtype={arg!r}; choose 'none', 'fp16', or 'fp32'."
+  )
 
 
 def _parse_args() -> argparse.Namespace:
-  parser = argparse.ArgumentParser(description="FFPA backward example and SDPA comparison.")
+  parser = argparse.ArgumentParser(
+    description="FFPA backward example and SDPA comparison."
+  )
   parser.add_argument(
     "--backward-backend",
     "--backend",
@@ -60,12 +64,34 @@ def _parse_args() -> argparse.Namespace:
     ),
   )
   parser.add_argument("--B", type=int, default=1, help="Batch size.")
-  parser.add_argument("--N", type=int, default=8192, help="Sequence length (non-aligned uses N-1).")
+  parser.add_argument(
+    "--N",
+    type=int,
+    default=8192,
+    help="Sequence length (non-aligned uses N-1)."
+  )
   parser.add_argument("--D", type=int, default=512, help="Head dimension.")
-  parser.add_argument("--warmup", type=int, default=DEFAULT_WARMUP, help="Warmup iterations used for timing.")
-  parser.add_argument("--iters", type=int, default=DEFAULT_ITERS, help="Measured iterations used for timing.")
-  parser.add_argument("--dropout-p", type=float, default=0.1, help="Dropout probability for the dropout example case.")
-  parser.add_argument("--seed", type=int, default=42, help="Random seed for input tensors.")
+  parser.add_argument(
+    "--warmup",
+    type=int,
+    default=DEFAULT_WARMUP,
+    help="Warmup iterations used for timing."
+  )
+  parser.add_argument(
+    "--iters",
+    type=int,
+    default=DEFAULT_ITERS,
+    help="Measured iterations used for timing."
+  )
+  parser.add_argument(
+    "--dropout-p",
+    type=float,
+    default=0.1,
+    help="Dropout probability for the dropout example case."
+  )
+  parser.add_argument(
+    "--seed", type=int, default=42, help="Random seed for input tensors."
+  )
   parser.add_argument(
     "--norm",
     action="store_true",
@@ -82,7 +108,8 @@ def _parse_args() -> argparse.Namespace:
     "--autotune",
     "--tune",
     action="store_true",
-    help="Enable Triton autotuning (only effective when --backward-backend=triton).",
+    help=
+    "Enable Triton autotuning (only effective when --backward-backend=triton).",
   )
   parser.add_argument(
     "--triton-autotune-mode",
@@ -97,7 +124,8 @@ def _parse_args() -> argparse.Namespace:
     "--grad-kv-dtype",
     choices=["none", "fp16", "fp32"],
     default="none",
-    help="Optional Triton backward dK/dV storage dtype forwarded to ffpa_attn_func.",
+    help=
+    "Optional Triton backward dK/dV storage dtype forwarded to ffpa_attn_func.",
   )
   parser.add_argument(
     "--enable-tma",
@@ -117,19 +145,22 @@ def _parse_args() -> argparse.Namespace:
   parser.add_argument(
     "--enable-bwd-ws",
     action="store_true",
-    help="Request warp-specialized SM90+ Triton backward configs when supported.",
+    help=
+    "Request warp-specialized SM90+ Triton backward configs when supported.",
   )
   parser.add_argument(
     "--enable-persist-dkdv",
     "--persist-dkdv",
     action="store_true",
-    help="Enable persistent dK/dV fp32 accumulation in the SM90+ TMA backward path (requires --enable-bwd-tma).",
+    help=
+    "Enable persistent dK/dV fp32 accumulation in the SM90+ TMA backward path (requires --enable-bwd-tma).",
   )
   parser.add_argument(
     "--enable-bwd-split-launch",
     "--bwd-split-launch",
     action="store_true",
-    help="Enable separate backward launches for dK/dV and dQ on generic Triton or SM90+ TMA paths.",
+    help=
+    "Enable separate backward launches for dK/dV and dQ on generic Triton or SM90+ TMA paths.",
   )
   args = parser.parse_args()
   if args.enable_tma:
@@ -139,8 +170,9 @@ def _parse_args() -> argparse.Namespace:
   if args.enable_persist_dkdv and not args.enable_bwd_tma:
     raise SystemExit("--enable-persist-dkdv requires --enable-bwd-tma")
   if args.backward_backend == "cutedsl" and (
-    args.triton_autotune or args.enable_bwd_tma or args.enable_bwd_ws or args.enable_persist_dkdv
-    or args.enable_bwd_split_launch or args.grad_kv_storage_dtype != "none"
+    args.triton_autotune or args.enable_bwd_tma or args.enable_bwd_ws
+    or args.enable_persist_dkdv or args.enable_bwd_split_launch
+    or args.grad_kv_storage_dtype != "none"
   ):
     print(
       "[warn] --backward-backend=cutedsl ignores --triton-autotune / "
@@ -230,7 +262,8 @@ def _mask_grad_status(
   :return: ``(error, status)`` pair.
   """
   if dmask_ffpa is not None and dmask_ref is not None:
-    return (dmask_ffpa.float() - dmask_ref.float()).abs().max().item(), "compared"
+    return (dmask_ffpa.float() -
+            dmask_ref.float()).abs().max().item(), "compared"
   if attn_mask is not None and mask_grad_skip_reason is not None:
     return None, mask_grad_skip_reason
   return None, "no-grad"
@@ -336,12 +369,15 @@ def _format_backward_result(result: BACKWARD_RESULT) -> str:
   )
 
 
-def _make_broadcast_additive_attn_mask(nq: int, nkv: int, dtype: torch.dtype, seed: int) -> torch.Tensor:
+def _make_broadcast_additive_attn_mask(
+  nq: int, nkv: int, dtype: torch.dtype, seed: int
+) -> torch.Tensor:
   """Build a differentiable key-position additive attention bias."""
   del dtype
   torch.manual_seed(seed + 1)
   del nq
-  return (torch.randn(1, 1, 1, nkv, dtype=torch.float32, device="cuda") * 0.25).requires_grad_(True)
+  return (torch.randn(1, 1, 1, nkv, dtype=torch.float32, device="cuda") *
+          0.25).requires_grad_(True)
 
 
 def _is_key_position_bias(attn_mask: torch.Tensor | None, Nkv: int) -> bool:
@@ -361,8 +397,10 @@ def _key_position_bias_grad_ref(
   """Compute a fp32 reference gradient for compact key-position additive bias."""
   with torch.no_grad():
     group_size = q.size(1) // k.size(1)
-    k_ref = k.detach().repeat_interleave(group_size, dim=1) if group_size > 1 else k.detach()
-    v_ref = v.detach().repeat_interleave(group_size, dim=1) if group_size > 1 else v.detach()
+    k_ref = k.detach().repeat_interleave(group_size, dim=1
+                                         ) if group_size > 1 else k.detach()
+    v_ref = v.detach().repeat_interleave(group_size, dim=1
+                                         ) if group_size > 1 else v.detach()
     q_f = q.detach().float()
     k_f = k_ref.float()
     key_value_sum = v_ref.float().sum(dim=-1)
@@ -373,30 +411,48 @@ def _key_position_bias_grad_ref(
 
     for m_start in range(0, Nq, block_m):
       q_block = q_f[:, :, m_start:m_start + block_m, :]
-      lse = torch.full(q_block.shape[:-1], -torch.inf, dtype=torch.float32, device=q.device)
+      lse = torch.full(
+        q_block.shape[:-1], -torch.inf, dtype=torch.float32, device=q.device
+      )
       for n_start in range(0, Nkv, block_n):
-        scores = torch.matmul(q_block, k_f[:, :, n_start:n_start + block_n, :].transpose(-2, -1)) * scale
+        scores = torch.matmul(
+          q_block, k_f[:, :, n_start:n_start + block_n, :].transpose(-2, -1)
+        ) * scale
         scores = scores + key_bias[n_start:n_start + block_n].view(1, 1, 1, -1)
         lse = torch.logaddexp(lse, torch.logsumexp(scores, dim=-1))
 
       delta = torch.zeros_like(lse)
       for n_start in range(0, Nkv, block_n):
-        scores = torch.matmul(q_block, k_f[:, :, n_start:n_start + block_n, :].transpose(-2, -1)) * scale
+        scores = torch.matmul(
+          q_block, k_f[:, :, n_start:n_start + block_n, :].transpose(-2, -1)
+        ) * scale
         scores = scores + key_bias[n_start:n_start + block_n].view(1, 1, 1, -1)
         prob = torch.exp(scores - lse[..., None])
-        delta += (prob * key_value_sum[:, :, None, n_start:n_start + block_n]).sum(dim=-1)
+        block_value_sum = key_value_sum[:, :, None, n_start:n_start + block_n]
+        delta += (prob * block_value_sum).sum(dim=-1)
 
       for n_start in range(0, Nkv, block_n):
-        scores = torch.matmul(q_block, k_f[:, :, n_start:n_start + block_n, :].transpose(-2, -1)) * scale
+        scores = torch.matmul(
+          q_block, k_f[:, :, n_start:n_start + block_n, :].transpose(-2, -1)
+        ) * scale
         scores = scores + key_bias[n_start:n_start + block_n].view(1, 1, 1, -1)
         prob = torch.exp(scores - lse[..., None])
-        d_bias = prob * (key_value_sum[:, :, None, n_start:n_start + block_n] - delta[..., None])
+        d_bias = prob * (
+          key_value_sum[:, :, None, n_start:n_start + block_n] -
+          delta[..., None]
+        )
         grad[n_start:n_start + block_n] += d_bias.sum(dim=(0, 1, 2))
 
     return grad.view(1, 1, 1, Nkv)
 
 
-def _time_fn(fn, *args, warmup: int = DEFAULT_WARMUP, iters: int = DEFAULT_ITERS, rng_seed: int | None = None) -> float:
+def _time_fn(
+  fn,
+  *args,
+  warmup: int = DEFAULT_WARMUP,
+  iters: int = DEFAULT_ITERS,
+  rng_seed: int | None = None
+) -> float:
   _validate_timing_args(warmup, iters)
   for _ in range(warmup):
     if rng_seed is not None:
@@ -523,9 +579,17 @@ def _sdpa_forward(
   group_size = q_i.size(1) // k_i.size(1)
   k_in = k_i.repeat_interleave(group_size, dim=1) if group_size > 1 else k_i
   v_in = v_i.repeat_interleave(group_size, dim=1) if group_size > 1 else v_i
-  sdpa_mask = attn_mask.to(q_i.dtype) if attn_mask is not None and attn_mask.dtype != q_i.dtype else attn_mask
-  kw = {"attn_mask": sdpa_mask} if sdpa_mask is not None else _make_sdpa_kwargs(causal, q_i.size(2), k_i.size(2))
-  return F.scaled_dot_product_attention(q_i, k_in, v_in, scale=scale, dropout_p=dropout_p, **kw)
+  sdpa_mask = attn_mask.to(
+    q_i.dtype
+  ) if attn_mask is not None and attn_mask.dtype != q_i.dtype else attn_mask
+  kw = {
+    "attn_mask": sdpa_mask
+  } if sdpa_mask is not None else _make_sdpa_kwargs(
+    causal, q_i.size(2), k_i.size(2)
+  )
+  return F.scaled_dot_product_attention(
+    q_i, k_in, v_in, scale=scale, dropout_p=dropout_p, **kw
+  )
 
 
 def _run_ffpa_backward(
@@ -585,7 +649,15 @@ def _run_sdpa_backward(
   k_i = k.detach().clone().requires_grad_(True)
   v_i = v.detach().clone().requires_grad_(True)
 
-  out = _sdpa_forward(q_i, k_i, v_i, scale, causal=causal, attn_mask=attn_mask, dropout_p=dropout_p)
+  out = _sdpa_forward(
+    q_i,
+    k_i,
+    v_i,
+    scale,
+    causal=causal,
+    attn_mask=attn_mask,
+    dropout_p=dropout_p
+  )
   out.sum().backward()
 
 
@@ -616,10 +688,14 @@ def _sdpa_ref_grads(
     attn_mask_ref.requires_grad_(return_mask_grad and attn_mask.requires_grad)
   kw = {
     "attn_mask": attn_mask_ref
-  } if attn_mask_ref is not None else _make_sdpa_kwargs(causal, q_ref.size(2), k_ref.size(2))
+  } if attn_mask_ref is not None else _make_sdpa_kwargs(
+    causal, q_ref.size(2), k_ref.size(2)
+  )
   if dropout_seed is not None:
     torch.manual_seed(dropout_seed)
-  out_ref = F.scaled_dot_product_attention(q_ref, k_in, v_in, scale=scale, dropout_p=dropout_p, **kw)
+  out_ref = F.scaled_dot_product_attention(
+    q_ref, k_in, v_in, scale=scale, dropout_p=dropout_p, **kw
+  )
   out_ref.sum().backward()
   return q_ref.grad, k_ref.grad, v_ref.grad, attn_mask_ref.grad if attn_mask_ref is not None else None
 
@@ -704,12 +780,14 @@ def _run_case(
     dropout_p=dropout_p,
     scale=scale,
     enable_gqa=Nh_q != Nh_kv,
-    forward_backend=CuTeDSLBackend(forward=True) if backward_backend == "cutedsl" else TritonBackend(
+    forward_backend=CuTeDSLBackend(forward=True)
+    if backward_backend == "cutedsl" else TritonBackend(
       forward=True,
       autotune=triton_autotune,
       autotune_mode=triton_autotune_mode,
     ),
-    backward_backend=CuTeDSLBackend(backward=True) if backward_backend == "cutedsl" else (
+    backward_backend=CuTeDSLBackend(backward=True)
+    if backward_backend == "cutedsl" else (
       TritonBackend(
         backward=True,
         autotune=triton_autotune,
@@ -843,9 +921,12 @@ def _run_case(
   dq_err = _max_abs_diff(dq_ffpa, dq_ref)
   dk_err = _max_abs_diff(dk_ffpa, dk_ref)
   dv_err = _max_abs_diff(dv_ffpa, dv_ref)
-  dmask_err, dmask_status = _mask_grad_status(dmask_ffpa, dmask_ref, mask_grad_skip_reason, attn_mask)
+  dmask_err, dmask_status = _mask_grad_status(
+    dmask_ffpa, dmask_ref, mask_grad_skip_reason, attn_mask
+  )
   allclose = (
-    _tensor_allclose(dq_ffpa, dq_ref, tol) and _tensor_allclose(dk_ffpa, dk_ref, tol)
+    _tensor_allclose(dq_ffpa, dq_ref, tol)
+    and _tensor_allclose(dk_ffpa, dk_ref, tol)
     and _tensor_allclose(dv_ffpa, dv_ref, tol)
   )
   if dmask_ffpa is not None and dmask_ref is not None:
@@ -964,7 +1045,9 @@ def run_backward_examples(
     f"warmup={warmup}, iters={iters}"
   )
   if backward_backend == "cutedsl":
-    print("[CuTeDSL] backend constraints in effect: D=512 + bf16 + no mask/dropout.")
+    print(
+      "[CuTeDSL] backend constraints in effect: D=512 + bf16 + no mask/dropout."
+    )
 
   mask_dropout_supported = backward_backend != "cutedsl"
 
@@ -1011,12 +1094,18 @@ def run_backward_examples(
     if mask_dropout_supported:
       case_specs.extend([
         {
-          "name": "attn-mask",
-          "Nh_q": H,
-          "Nh_kv": H,
-          "Nq": mask_n,
-          "Nkv": mask_n,
-          "attn_mask": _make_broadcast_additive_attn_mask(mask_n, mask_n, dtype, seed),
+          "name":
+          "attn-mask",
+          "Nh_q":
+          H,
+          "Nh_kv":
+          H,
+          "Nq":
+          mask_n,
+          "Nkv":
+          mask_n,
+          "attn_mask":
+          _make_broadcast_additive_attn_mask(mask_n, mask_n, dtype, seed),
         },
         {
           "name": "dropout",
@@ -1058,7 +1147,8 @@ def run_backward_examples(
           attn_mask=case.get("attn_mask"),
           dropout_p=case.get("dropout_p", 0.0),
           timing_mode=timing_mode,
-          triton_backward_grad_kv_storage_dtype=triton_backward_grad_kv_storage_dtype,
+          triton_backward_grad_kv_storage_dtype=
+          triton_backward_grad_kv_storage_dtype,
           enable_tma=enable_tma,
           enable_ws=enable_ws,
           enable_persist_dkdv=enable_persist_dkdv,

@@ -130,10 +130,11 @@ namespace sm90 {
 //                           skip.
 // * ``kSupportsAllStages``: multi-stage is supported (kStageQK and
 //                           kStagePV may each be >= 1).
-template <const int kHeadDim, const int kStageQK, const int kStagePV, const int kPadQ,
-          const int kPadK, const int kPadV>
+template <const int kHeadDim, const int kStageQK, const int kStagePV,
+          const int kPadQ, const int kPadK, const int kPadV>
 struct ExperimentalTmaLargeDConfig {
-  static constexpr bool kEligibleHeadDim = (kHeadDim >= 128 && (kHeadDim % 64) == 0);
+  static constexpr bool kEligibleHeadDim =
+      (kHeadDim >= 128 && (kHeadDim % 64) == 0);
   // TMA writes directly into the kPad==0 XOR-swizzled destination slot.
   // FFPA's ``swizzle::permuted<16>`` (V, K when ``kKvBoxCols == 16``) is
   // bit-for-bit equivalent to ``CU_TENSOR_MAP_SWIZZLE_32B`` (Cute
@@ -146,8 +147,9 @@ struct ExperimentalTmaLargeDConfig {
   // in swizzled rows -- it cannot leave per-row pad gaps.
   static constexpr bool kRequiresSwizzledSmem = (kPadK == 0 && kPadV == 0);
   static constexpr bool kSupportsAllStages = (kStageQK >= 1 && kStagePV >= 1);
-  static constexpr bool kCanAttempt =
-      kEligibleHeadDim && kRequiresSwizzledSmem && kSupportsAllStages && (kPadQ >= 0);
+  static constexpr bool kCanAttempt = kEligibleHeadDim &&
+                                      kRequiresSwizzledSmem &&
+                                      kSupportsAllStages && (kPadQ >= 0);
 };
 
 }  // namespace sm90
@@ -166,29 +168,32 @@ struct ExperimentalTmaLargeDConfig {
 // options) is identical to the fallback kernel; do NOT diverge those paths
 // here.
 // ============================================================================
-template <typename kDataType, const int kHeadDim, const int kMmaAtomM, const int kMmaAtomN,
-          const int kMmaAtomK, const int kMmaTileSeqLenQ, const int kMmaTileSeqLenK,
-          const int kMmaTileSeqLenP, const int kMmaTileHeadDimV, const int kValTileSeqLenQ,
-          const int kValTileSeqLenK, const int kValTileSeqLenP, const int kValTileHeadDimV,
-          const int kMmaAccFloat32QK, const int kMmaAccFloat32PV, const int kOStorageAccFloat32,
+template <typename kDataType, const int kHeadDim, const int kMmaAtomM,
+          const int kMmaAtomN, const int kMmaAtomK, const int kMmaTileSeqLenQ,
+          const int kMmaTileSeqLenK, const int kMmaTileSeqLenP,
+          const int kMmaTileHeadDimV, const int kValTileSeqLenQ,
+          const int kValTileSeqLenK, const int kValTileSeqLenP,
+          const int kValTileHeadDimV, const int kMmaAccFloat32QK,
+          const int kMmaAccFloat32PV, const int kOStorageAccFloat32,
           const int kPrefetchQK, const int kPrefetchPV, const int kShareSmemQKV,
-          const int kPersistQs2r, const int kPersistQg2s, const int kRegPipeKV, const int kStageQK,
-          const int kStagePV, const int kPadQ, const int kPadK, const int kPadV>
+          const int kPersistQs2r, const int kPersistQg2s, const int kRegPipeKV,
+          const int kStageQK, const int kStagePV, const int kPadQ,
+          const int kPadK, const int kPadV>
 __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
-    ffpa_attn_split_d_fwd_sm90_template(const kDataType* __restrict__ Q,
-                                        const kDataType* __restrict__ K,
-                                        const kDataType* __restrict__ V, kDataType* __restrict__ O,
-                                        float* __restrict__ softmax_lse, const int Nq,
-                                        const int Nkv, const int Nh, const int Nh_kv,
-                                        const float scale, const int Tc, const int causal,
-                                        const CUtensorMap* __restrict__ K_tma_desc,
-                                        const CUtensorMap* __restrict__ V_tma_desc) {
+    ffpa_attn_split_d_fwd_sm90_template(
+        const kDataType* __restrict__ Q, const kDataType* __restrict__ K,
+        const kDataType* __restrict__ V, kDataType* __restrict__ O,
+        float* __restrict__ softmax_lse, const int Nq, const int Nkv,
+        const int Nh, const int Nh_kv, const float scale, const int Tc,
+        const int causal, const CUtensorMap* __restrict__ K_tma_desc,
+        const CUtensorMap* __restrict__ V_tma_desc) {
   ffpa::prefill::check_large_d_compiling_states<
-      kHeadDim, kMmaAtomM, kMmaAtomN, kMmaAtomK, kMmaTileSeqLenQ, kMmaTileSeqLenK, kMmaTileSeqLenP,
-      kMmaTileHeadDimV, kValTileSeqLenQ, kValTileSeqLenK, kValTileSeqLenP, kValTileHeadDimV,
-      kMmaAccFloat32QK, kMmaAccFloat32PV, kOStorageAccFloat32, kPrefetchQK, kPrefetchPV,
-      kShareSmemQKV, kPersistQs2r, kPersistQg2s, kRegPipeKV, kStageQK, kStagePV, kPadQ, kPadK,
-      kPadV>();
+      kHeadDim, kMmaAtomM, kMmaAtomN, kMmaAtomK, kMmaTileSeqLenQ,
+      kMmaTileSeqLenK, kMmaTileSeqLenP, kMmaTileHeadDimV, kValTileSeqLenQ,
+      kValTileSeqLenK, kValTileSeqLenP, kValTileHeadDimV, kMmaAccFloat32QK,
+      kMmaAccFloat32PV, kOStorageAccFloat32, kPrefetchQK, kPrefetchPV,
+      kShareSmemQKV, kPersistQs2r, kPersistQg2s, kRegPipeKV, kStageQK, kStagePV,
+      kPadQ, kPadK, kPadV>();
   constexpr int Br = kMmaAtomM * kMmaTileSeqLenQ * kValTileSeqLenQ;
   constexpr int Bc = kMmaAtomN * kMmaTileSeqLenK * kValTileSeqLenK;
   constexpr int kNumThreads = WARP_SIZE * kMmaTileSeqLenQ * kMmaTileSeqLenK;
@@ -206,8 +211,10 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
   constexpr int warp_KV = 0;
   const int group_size = Nh / Nh_kv;
   const int kv_head_idx = Nh_id / group_size;
-  const int Q_gmem_offset = ((Nb_id * Nh * Nq * kHeadDim) + (Nh_id * Nq * kHeadDim));
-  const int K_gmem_offset = ((Nb_id * Nh_kv * Nkv * kHeadDim) + (kv_head_idx * Nkv * kHeadDim));
+  const int Q_gmem_offset =
+      ((Nb_id * Nh * Nq * kHeadDim) + (Nh_id * Nq * kHeadDim));
+  const int K_gmem_offset =
+      ((Nb_id * Nh_kv * Nkv * kHeadDim) + (kv_head_idx * Nkv * kHeadDim));
   const int V_gmem_offset = K_gmem_offset;
   // K/V global pointers are only addressed via the TMA descriptors on
   // this path; suppress unused-variable warnings without touching the
@@ -253,14 +260,17 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
   // of K's and widening V doubles the V-side smem with smaller
   // marginal payoff).
   constexpr int kKvBoxCols =
-      ((kPadK == 0) && (kHeadDim % 64 == 0) && (kHeadDim >= 128)) ? 64 : kMmaAtomK;
+      ((kPadK == 0) && (kHeadDim % 64 == 0) && (kHeadDim >= 128)) ? 64
+                                                                  : kMmaAtomK;
   constexpr int kSubtilesPerKBox = kKvBoxCols / kMmaAtomK;
   constexpr int K_tile_size = Bc * (kKvBoxCols + kPadK);
   constexpr int V_tile_size = Bc * (kMmaAtomN * 2 + kPadV);
   kDataType* Q_tile_smem = smem;
-  kDataType* K_tile_smem = (Q_tile_smem + (kPersistQg2s ? ((kHeadDim / kMmaAtomK) * Q_tile_size)
-                                                        : (kStageQK * Q_tile_size)));
-  kDataType* V_tile_smem = (kShareSmemQKV ? Q_tile_smem : K_tile_smem + kStageQK * K_tile_size);
+  kDataType* K_tile_smem =
+      (Q_tile_smem + (kPersistQg2s ? ((kHeadDim / kMmaAtomK) * Q_tile_size)
+                                   : (kStageQK * Q_tile_size)));
+  kDataType* V_tile_smem =
+      (kShareSmemQKV ? Q_tile_smem : K_tile_smem + kStageQK * K_tile_size);
   // TMA writes directly into the K/V destination slots above (kPad==0
   // XOR-swizzled, layout matches the chosen TMA swizzle mode). No
   // scratch buffer is needed: the launcher allocates ``kQKVSmemMaxSize
@@ -338,7 +348,9 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
   // LSU schedulers.
   constexpr int kIssuerStep = WARP_SIZE;
   constexpr int kVIssuerOffset = (kNumThreads >= 64) ? (kNumThreads / 2) : 0;
-  auto k_issuer_lane = [](int idx) -> int { return (idx * kIssuerStep) % kNumThreads; };
+  auto k_issuer_lane = [](int idx) -> int {
+    return (idx * kIssuerStep) % kNumThreads;
+  };
   auto v_issuer_lane = [](int idx) -> int {
     return ((idx * kIssuerStep) + kVIssuerOffset) % kNumThreads;
   };
@@ -348,13 +360,15 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
     // d_tile is in units of ``kKvBoxCols`` (one wide TMA box per stage
     // covering kSubtilesPerKBox consumed sub-tiles).
     K_tma_used[dst_stage] =
-        ffpa::tma::issue_load_2d_to_dst_swizzled<Bc, kHeadDim, kKvBoxCols, K_tile_size>(
-            K_tile_smem, K_tma_desc, kv_row_base + tile_K_seqlen * Bc, d_tile, dst_stage,
-            K_tma_barriers[dst_stage], issuer_lane);
+        ffpa::tma::issue_load_2d_to_dst_swizzled<Bc, kHeadDim, kKvBoxCols,
+                                                 K_tile_size>(
+            K_tile_smem, K_tma_desc, kv_row_base + tile_K_seqlen * Bc, d_tile,
+            dst_stage, K_tma_barriers[dst_stage], issuer_lane);
   };
   auto consume_K_tile = [&](int dst_stage) -> void {
     if (K_tma_used[dst_stage]) {
-      ffpa::tma::wait_barrier_parity(K_tma_barriers[dst_stage], K_tma_phase[dst_stage]);
+      ffpa::tma::wait_barrier_parity(K_tma_barriers[dst_stage],
+                                     K_tma_phase[dst_stage]);
       K_tma_phase[dst_stage] ^= 1u;
       K_tma_used[dst_stage] = false;
       __syncthreads();
@@ -363,13 +377,15 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
   auto issue_V_tile = [&](int tile_K_seqlen, int d_tile, int dst_stage,
                           int issuer_lane = 0) -> void {
     V_tma_used[dst_stage] =
-        ffpa::tma::issue_load_2d_to_dst_swizzled<Bc, kHeadDim, kMmaAtomN * 2, V_tile_size>(
-            V_tile_smem, V_tma_desc, kv_row_base + tile_K_seqlen * Bc, d_tile, dst_stage,
-            V_tma_barriers[dst_stage], issuer_lane);
+        ffpa::tma::issue_load_2d_to_dst_swizzled<Bc, kHeadDim, kMmaAtomN * 2,
+                                                 V_tile_size>(
+            V_tile_smem, V_tma_desc, kv_row_base + tile_K_seqlen * Bc, d_tile,
+            dst_stage, V_tma_barriers[dst_stage], issuer_lane);
   };
   auto consume_V_tile = [&](int dst_stage) -> void {
     if (V_tma_used[dst_stage]) {
-      ffpa::tma::wait_barrier_parity(V_tma_barriers[dst_stage], V_tma_phase[dst_stage]);
+      ffpa::tma::wait_barrier_parity(V_tma_barriers[dst_stage],
+                                     V_tma_phase[dst_stage]);
       V_tma_phase[dst_stage] ^= 1u;
       V_tma_used[dst_stage] = false;
       __syncthreads();
@@ -379,7 +395,8 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
   if constexpr (kPersistQg2s) {
 #pragma unroll
     for (int tile_K_d = 0; tile_K_d < (kHeadDim / kMmaAtomK); ++tile_K_d) {
-      ffpa::prefill::cp_async_qkv_g2s<Br, Q_tile_size, kHeadDim, kMmaAtomK, kNumThreads, kPadQ>(
+      ffpa::prefill::cp_async_qkv_g2s<Br, Q_tile_size, kHeadDim, kMmaAtomK,
+                                      kNumThreads, kPadQ>(
           smem_Q_base_ptr, Q, Q_gmem_offset, Q_tile_id, tile_K_d, tile_K_d, Nq);
       ffpa::cp_async::commit_group();
     }
@@ -387,15 +404,18 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
 
   float lane_block_row_max_old[kValTileSeqLenQ][2];
   float lane_block_row_sum_old[kValTileSeqLenQ][2];
-  ffpa::utils::fill_2D_regs<float, kValTileSeqLenQ, 2>(lane_block_row_max_old, -INFINITY);
-  ffpa::utils::fill_2D_regs<float, kValTileSeqLenQ, 2>(lane_block_row_sum_old, 0.0f);
+  ffpa::utils::fill_2D_regs<float, kValTileSeqLenQ, 2>(lane_block_row_max_old,
+                                                       -INFINITY);
+  ffpa::utils::fill_2D_regs<float, kValTileSeqLenQ, 2>(lane_block_row_sum_old,
+                                                       0.0f);
 
   uint32_t R_Q[kValTileSeqLenQ][(kPersistQs2r) ? (kHeadDim / kMmaAtomK) : 1][4];
   uint32_t R_K[(kRegPipeKV) ? 2 : kValTileSeqLenK][2];
   uint32_t R_V[(kRegPipeKV) ? 2 : 1][2];
   uint32_t R_S[kValTileSeqLenQ][kValTileSeqLenK][(kMmaAccFloat32QK) ? 4 : 2];
   uint32_t R_O[(kMmaAccFloat32PV) ? 4 : 2];
-  uint32_t R_D[kValTileSeqLenP][kValTileHeadDimV][(kOStorageAccFloat32) ? 4 : 2];
+  uint32_t R_D[kValTileSeqLenP][kValTileHeadDimV]
+              [(kOStorageAccFloat32) ? 4 : 2];
   ffpa::utils::fill_3D_regs<uint32_t, kValTileSeqLenP, kValTileHeadDimV,
                             ((kOStorageAccFloat32) ? 4 : 2)>(R_D, 0);
 
@@ -405,8 +425,10 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
   const int Br_base = Q_tile_id * Br;
   const int kv_offset = Nkv - Nq;
   const int causal_thresh_row0 = Br_base + kv_offset;
-  const int Tc_eff = causal ? min(Tc, ((Br_base + Br - 1 + kv_offset) / Bc) + 1) : Tc;
-  const int mask_start_tile = causal ? max(0, (causal_thresh_row0 + 1) / Bc) : INT_MAX;
+  const int Tc_eff =
+      causal ? min(Tc, ((Br_base + Br - 1 + kv_offset) / Bc) + 1) : Tc;
+  const int mask_start_tile =
+      causal ? max(0, (causal_thresh_row0 + 1) / Bc) : INT_MAX;
 
 #pragma unroll 1
   for (int tile_K_seqlen = 0; tile_K_seqlen < Tc_eff; ++tile_K_seqlen) {
@@ -423,9 +445,10 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
                          k_issuer_lane(stage));  // TMA: dispatched first
             ffpa::tma::bulk_commit_group();
             if constexpr (!kPersistQg2s) {
-              ffpa::prefill::cp_async_qkv_g2s<Br, Q_tile_size, kHeadDim, kMmaAtomK, kNumThreads,
-                                              kPadQ>(smem_Q_base_ptr, Q, Q_gmem_offset, Q_tile_id,
-                                                     stage, stage, Nq);
+              ffpa::prefill::cp_async_qkv_g2s<Br, Q_tile_size, kHeadDim,
+                                              kMmaAtomK, kNumThreads, kPadQ>(
+                  smem_Q_base_ptr, Q, Q_gmem_offset, Q_tile_id, stage, stage,
+                  Nq);
             }
             ffpa::cp_async::commit_group();
           }
@@ -445,15 +468,17 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
           ffpa::tma::bulk_commit_group();
           if constexpr (kPersistQs2r) {
             if (tile_K_seqlen == 0) {
-              ffpa::prefill::cp_async_qkv_g2s<Br, Q_tile_size, kHeadDim, kMmaAtomK, kNumThreads,
-                                              kPadQ>(smem_Q_base_ptr, Q, Q_gmem_offset, Q_tile_id,
-                                                     stage, stage, Nq);
+              ffpa::prefill::cp_async_qkv_g2s<Br, Q_tile_size, kHeadDim,
+                                              kMmaAtomK, kNumThreads, kPadQ>(
+                  smem_Q_base_ptr, Q, Q_gmem_offset, Q_tile_id, stage, stage,
+                  Nq);
             }
           } else {
             if constexpr (!kPersistQg2s) {
-              ffpa::prefill::cp_async_qkv_g2s<Br, Q_tile_size, kHeadDim, kMmaAtomK, kNumThreads,
-                                              kPadQ>(smem_Q_base_ptr, Q, Q_gmem_offset, Q_tile_id,
-                                                     stage, stage, Nq);
+              ffpa::prefill::cp_async_qkv_g2s<Br, Q_tile_size, kHeadDim,
+                                              kMmaAtomK, kNumThreads, kPadQ>(
+                  smem_Q_base_ptr, Q, Q_gmem_offset, Q_tile_id, stage, stage,
+                  Nq);
             }
           }
           ffpa::cp_async::commit_group();
@@ -511,31 +536,37 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
       // on-the-wire before the cp.async submission (overlap dispatch).
       // With wider K boxes we issue one TMA per box, not per sub-tile.
       if (is_box_head) {
-        const int issue_box = (kStageQK > 1) ? (box_idx + (kStageQK - 1)) : box_idx;
+        const int issue_box =
+            (kStageQK > 1) ? (box_idx + (kStageQK - 1)) : box_idx;
         // The OOB guard inside ``issue_load_2d_to_dst_swizzled`` skips
         // box_idx >= kKBoxCount; but the prefetch can speculatively
         // address beyond, so we keep the call and rely on its guard.
         (void)kKBoxCount;
-        issue_K_tile(tile_K_seqlen, issue_box, (kStageQK > 1) ? smem_sel_next : smem_sel,
+        issue_K_tile(tile_K_seqlen, issue_box,
+                     (kStageQK > 1) ? smem_sel_next : smem_sel,
                      k_issuer_lane(box_idx));
-        ffpa::tma::bulk_commit_group();  // K -> TMA bulk counter (mbarrier-waited)
+        ffpa::tma::bulk_commit_group();  // K -> TMA bulk counter
+                                         // (mbarrier-waited)
       }
       if constexpr (kPersistQs2r) {
         if (tile_K_seqlen == 0) {
-          ffpa::prefill::cp_async_qkv_g2s<Br, Q_tile_size, kHeadDim, kMmaAtomK, kNumThreads, kPadQ>(
+          ffpa::prefill::cp_async_qkv_g2s<Br, Q_tile_size, kHeadDim, kMmaAtomK,
+                                          kNumThreads, kPadQ>(
               smem_Q_base_ptr, Q, Q_gmem_offset, Q_tile_id,
               (kStageQK > 1) ? (tile_K_d + (kStageQK - 1)) : tile_K_d,
               (kStageQK > 1) ? q_smem_sel_next : q_smem_sel, Nq);
         }
       } else {
         if constexpr (!kPersistQg2s) {
-          ffpa::prefill::cp_async_qkv_g2s<Br, Q_tile_size, kHeadDim, kMmaAtomK, kNumThreads, kPadQ>(
+          ffpa::prefill::cp_async_qkv_g2s<Br, Q_tile_size, kHeadDim, kMmaAtomK,
+                                          kNumThreads, kPadQ>(
               smem_Q_base_ptr, Q, Q_gmem_offset, Q_tile_id,
               (kStageQK > 1) ? (tile_K_d + (kStageQK - 1)) : tile_K_d,
               (kStageQK > 1) ? q_smem_sel_next : q_smem_sel, Nq);
         }
       }
-      ffpa::cp_async::commit_group();  // Q (when loaded above) -> cp.async counter
+      ffpa::cp_async::commit_group();  // Q (when loaded above) -> cp.async
+                                       // counter
 
       if constexpr (kStageQK <= 1) {
         ffpa::cp_async::wait_group<0>();  // drain Q
@@ -555,19 +586,22 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
       {
         if constexpr (kPersistQs2r) {
           if (tile_K_seqlen == 0) {
-            ffpa::prefill::sync_fetch_qkv_frags_s2r<0, 4, Q_tile_size, kMmaAtomM, kMmaAtomN,
-                                                    kMmaAtomK, kPadQ, kDataType>(
-                smem_Q_base_ptr, &R_Q[0][tile_K_d][0], warp_QP, 0, 0, q_smem_sel);
+            ffpa::prefill::sync_fetch_qkv_frags_s2r<
+                0, 4, Q_tile_size, kMmaAtomM, kMmaAtomN, kMmaAtomK, kPadQ,
+                kDataType>(smem_Q_base_ptr, &R_Q[0][tile_K_d][0], warp_QP, 0, 0,
+                           q_smem_sel);
           }
         } else {
           if constexpr (!kPersistQg2s) {
-            ffpa::prefill::sync_fetch_qkv_frags_s2r<0, 4, Q_tile_size, kMmaAtomM, kMmaAtomN,
-                                                    kMmaAtomK, kPadQ, kDataType>(
-                smem_Q_base_ptr, &R_Q[0][0][0], warp_QP, 0, 0, q_smem_sel);
+            ffpa::prefill::sync_fetch_qkv_frags_s2r<
+                0, 4, Q_tile_size, kMmaAtomM, kMmaAtomN, kMmaAtomK, kPadQ,
+                kDataType>(smem_Q_base_ptr, &R_Q[0][0][0], warp_QP, 0, 0,
+                           q_smem_sel);
           } else {
-            ffpa::prefill::sync_fetch_qkv_frags_s2r<0, 4, Q_tile_size, kMmaAtomM, kMmaAtomN,
-                                                    kMmaAtomK, kPadQ, kDataType>(
-                smem_Q_base_ptr, &R_Q[0][0][0], warp_QP, 0, 0, tile_K_d);
+            ffpa::prefill::sync_fetch_qkv_frags_s2r<
+                0, 4, Q_tile_size, kMmaAtomM, kMmaAtomN, kMmaAtomK, kPadQ,
+                kDataType>(smem_Q_base_ptr, &R_Q[0][0][0], warp_QP, 0, 0,
+                           tile_K_d);
           }
         }
       }
@@ -577,14 +611,18 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
       if constexpr (!kRegPipeKV) {
 #pragma unroll
         for (int j = 0; j < kValTileSeqLenK; ++j) {
-          ffpa::prefill::sync_fetch_qkv_frags_s2r<0, 2, K_tile_size, kMmaAtomM, kMmaAtomN,
-                                                  kMmaAtomK, kPadK, kDataType, kKvBoxCols>(
-              smem_K_base_ptr, &R_K[j][0], warp_KV, j, 0, smem_sel, subtile_col_off);
+          ffpa::prefill::sync_fetch_qkv_frags_s2r<0, 2, K_tile_size, kMmaAtomM,
+                                                  kMmaAtomN, kMmaAtomK, kPadK,
+                                                  kDataType, kKvBoxCols>(
+              smem_K_base_ptr, &R_K[j][0], warp_KV, j, 0, smem_sel,
+              subtile_col_off);
         }
       } else {
-        ffpa::prefill::sync_fetch_qkv_frags_s2r<0, 2, K_tile_size, kMmaAtomM, kMmaAtomN, kMmaAtomK,
-                                                kPadK, kDataType, kKvBoxCols>(
-            smem_K_base_ptr, &R_K[reg_st_idx][0], warp_KV, 0, 0, smem_sel, subtile_col_off);
+        ffpa::prefill::sync_fetch_qkv_frags_s2r<0, 2, K_tile_size, kMmaAtomM,
+                                                kMmaAtomN, kMmaAtomK, kPadK,
+                                                kDataType, kKvBoxCols>(
+            smem_K_base_ptr, &R_K[reg_st_idx][0], warp_KV, 0, 0, smem_sel,
+            subtile_col_off);
       }
 
       if constexpr ((kShareSmemQKV) && kPrefetchPV && kStagePV > 1) {
@@ -609,22 +647,26 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
           reg_ld_idx ^= 1;
           if constexpr (kRegPipeKV) {
             if ((j + 1) < kValTileSeqLenK) {
-              ffpa::prefill::sync_fetch_qkv_frags_s2r<0, 2, K_tile_size, kMmaAtomM, kMmaAtomN,
-                                                      kMmaAtomK, kPadK, kDataType, kKvBoxCols>(
-                  smem_K_base_ptr, &R_K[reg_st_idx][0], warp_KV, (j + 1), 0, smem_sel,
-                  subtile_col_off);
+              ffpa::prefill::sync_fetch_qkv_frags_s2r<
+                  0, 2, K_tile_size, kMmaAtomM, kMmaAtomN, kMmaAtomK, kPadK,
+                  kDataType, kKvBoxCols>(smem_K_base_ptr, &R_K[reg_st_idx][0],
+                                         warp_KV, (j + 1), 0, smem_sel,
+                                         subtile_col_off);
             }
           }
           const int k_offset = (kRegPipeKV) ? reg_ld_idx : j;
           if constexpr (kMmaAccFloat32QK) {
-            ffpa::mma::m16n8k16_abf32<kDataType, ffpa::mma::MMAMode::kInplaceUpdate>(
-                &R_S[0][j][0], &R_S[0][j][1], &R_S[0][j][2], &R_S[0][j][3], &R_Q[0][q_offset][0],
-                &R_Q[0][q_offset][1], &R_Q[0][q_offset][2], &R_Q[0][q_offset][3], &R_K[k_offset][0],
+            ffpa::mma::m16n8k16_abf32<kDataType,
+                                      ffpa::mma::MMAMode::kInplaceUpdate>(
+                &R_S[0][j][0], &R_S[0][j][1], &R_S[0][j][2], &R_S[0][j][3],
+                &R_Q[0][q_offset][0], &R_Q[0][q_offset][1],
+                &R_Q[0][q_offset][2], &R_Q[0][q_offset][3], &R_K[k_offset][0],
                 &R_K[k_offset][1]);
           } else {
             ffpa::mma::m16n8k16_f16f16f16<ffpa::mma::MMAMode::kInplaceUpdate>(
-                &R_S[0][j][0], &R_S[0][j][1], &R_Q[0][q_offset][0], &R_Q[0][q_offset][1],
-                &R_Q[0][q_offset][2], &R_Q[0][q_offset][3], &R_K[k_offset][0], &R_K[k_offset][1]);
+                &R_S[0][j][0], &R_S[0][j][1], &R_Q[0][q_offset][0],
+                &R_Q[0][q_offset][1], &R_Q[0][q_offset][2],
+                &R_Q[0][q_offset][3], &R_K[k_offset][0], &R_K[k_offset][1]);
           }
         }
       }
@@ -654,22 +696,27 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
 
     float lane_row_max_new[kValTileSeqLenQ][2];
     float lane_row_sum_new[kValTileSeqLenQ][2];
-    ffpa::utils::fill_2D_regs<float, kValTileSeqLenQ, 2>(lane_row_max_new, -INFINITY);
-    ffpa::utils::fill_2D_regs<float, kValTileSeqLenQ, 2>(lane_row_sum_new, 0.0f);
+    ffpa::utils::fill_2D_regs<float, kValTileSeqLenQ, 2>(lane_row_max_new,
+                                                         -INFINITY);
+    ffpa::utils::fill_2D_regs<float, kValTileSeqLenQ, 2>(lane_row_sum_new,
+                                                         0.0f);
 
     static_assert(kValTileSeqLenQ == 1);
     {
       const int kv_valid_local = Nkv - tile_K_seqlen * Bc;
       if (kv_valid_local < Bc) {
-        ffpa::prefill::sync_apply_kv_mask<kValTileSeqLenK, kMmaAccFloat32QK, kDataType>(
-            &R_S[0][0][0], kv_valid_local);
+        ffpa::prefill::sync_apply_kv_mask<kValTileSeqLenK, kMmaAccFloat32QK,
+                                          kDataType>(&R_S[0][0][0],
+                                                     kv_valid_local);
       }
     }
     if (tile_K_seqlen >= mask_start_tile) {
-      ffpa::prefill::sync_apply_causal_mask<kValTileSeqLenK, kMmaAccFloat32QK, kDataType>(
+      ffpa::prefill::sync_apply_causal_mask<kValTileSeqLenK, kMmaAccFloat32QK,
+                                            kDataType>(
           &R_S[0][0][0], warp_QP, Br_base, tile_K_seqlen * Bc, kv_offset);
     }
-    ffpa::prefill::sync_online_safe_softmax<kValTileSeqLenK, kMmaAccFloat32QK, kDataType>(
+    ffpa::prefill::sync_online_safe_softmax<kValTileSeqLenK, kMmaAccFloat32QK,
+                                            kDataType>(
         &R_S[0][0][0], scale, &lane_row_max_new[0][0], &lane_row_sum_new[0][0],
         &lane_block_row_max_old[0][0], &lane_block_row_sum_old[0][0]);
 
@@ -689,9 +736,9 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
                        k_issuer_lane(stage));  // TMA: dispatched first
           ffpa::tma::bulk_commit_group();
           if constexpr (!kPersistQs2r) {
-            ffpa::prefill::cp_async_qkv_g2s<Br, Q_tile_size, kHeadDim, kMmaAtomK, kNumThreads,
-                                            kPadQ>(smem_Q_base_ptr, Q, Q_gmem_offset, Q_tile_id,
-                                                   stage, stage, Nq);
+            ffpa::prefill::cp_async_qkv_g2s<Br, Q_tile_size, kHeadDim,
+                                            kMmaAtomK, kNumThreads, kPadQ>(
+                smem_Q_base_ptr, Q, Q_gmem_offset, Q_tile_id, stage, stage, Nq);
           }
           ffpa::cp_async::commit_group();
         }
@@ -702,9 +749,10 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
     {
       float rescale_o_factor_0[1];
       float rescale_o_factor_1[1];
-      ffpa::prefill::sync_precompute_rescale_factors(&rescale_o_factor_0[0], &rescale_o_factor_1[0],
-                                                     &lane_row_max_new[0][0],
-                                                     &lane_block_row_max_old[0][0], tile_K_seqlen);
+      ffpa::prefill::sync_precompute_rescale_factors(
+          &rescale_o_factor_0[0], &rescale_o_factor_1[0],
+          &lane_row_max_new[0][0], &lane_block_row_max_old[0][0],
+          tile_K_seqlen);
 
 #pragma unroll
       for (int j = 0; j < kValTileHeadDimV; ++j) {
@@ -712,8 +760,10 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
         const int smem_sel_v = (tile_V_d) % kStagePV;
         const int smem_sel_v_next = (tile_V_d + (kStagePV - 1)) % kStagePV;
         if (j % 2 == 0) {
-          issue_V_tile(tile_K_seqlen, (kStagePV > 1) ? (tile_V_d + (kStagePV - 1)) : tile_V_d,
-                       (kStagePV > 1) ? smem_sel_v_next : smem_sel_v, v_issuer_lane(tile_V_d));
+          issue_V_tile(tile_K_seqlen,
+                       (kStagePV > 1) ? (tile_V_d + (kStagePV - 1)) : tile_V_d,
+                       (kStagePV > 1) ? smem_sel_v_next : smem_sel_v,
+                       v_issuer_lane(tile_V_d));
           ffpa::tma::bulk_commit_group();  // V is TMA, not cp.async
           if constexpr (kStagePV <= 1) {
             ffpa::tma::bulk_wait_group<0>();
@@ -730,16 +780,19 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
         reg_st_idx = 0;
         reg_ld_idx = 1;
         if constexpr (kRegPipeKV) {
-          ffpa::prefill::sync_fetch_qkv_frags_s2r<1, 2, V_tile_size, kMmaAtomM, kMmaAtomN,
-                                                  kMmaAtomK, kPadV, kDataType>(
-              smem_V_base_ptr, &R_V[reg_st_idx][0], warp_KV, (j % 2), 0, smem_sel_v);
+          ffpa::prefill::sync_fetch_qkv_frags_s2r<1, 2, V_tile_size, kMmaAtomM,
+                                                  kMmaAtomN, kMmaAtomK, kPadV,
+                                                  kDataType>(
+              smem_V_base_ptr, &R_V[reg_st_idx][0], warp_KV, (j % 2), 0,
+              smem_sel_v);
         }
 
         ffpa::utils::fill_1D_regs<uint32_t, (kMmaAccFloat32PV) ? 4 : 2>(R_O, 0);
 #pragma unroll
         for (int tile_V_Bc = 0; tile_V_Bc < (Bc / kMmaAtomK); ++tile_V_Bc) {
           if constexpr ((kShareSmemQKV) && kPrefetchQK && kStageQK > 1) {
-            if (j == (kValTileHeadDimV - 1) && tile_V_Bc == (Bc / kMmaAtomK - 1) &&
+            if (j == (kValTileHeadDimV - 1) &&
+                tile_V_Bc == (Bc / kMmaAtomK - 1) &&
                 (tile_K_seqlen + 1) < Tc_eff) {
               __syncthreads();
               if constexpr (kStageQK > 1) {
@@ -749,9 +802,11 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
                                k_issuer_lane(stage));  // TMA: dispatched first
                   ffpa::tma::bulk_commit_group();
                   if constexpr (!kPersistQs2r) {
-                    ffpa::prefill::cp_async_qkv_g2s<Br, Q_tile_size, kHeadDim, kMmaAtomK,
-                                                    kNumThreads, kPadQ>(
-                        smem_Q_base_ptr, Q, Q_gmem_offset, Q_tile_id, stage, stage, Nq);
+                    ffpa::prefill::cp_async_qkv_g2s<Br, Q_tile_size, kHeadDim,
+                                                    kMmaAtomK, kNumThreads,
+                                                    kPadQ>(
+                        smem_Q_base_ptr, Q, Q_gmem_offset, Q_tile_id, stage,
+                        stage, Nq);
                   }
                   ffpa::cp_async::commit_group();
                 }
@@ -762,39 +817,42 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
           reg_st_idx ^= 1;
           reg_ld_idx ^= 1;
           if constexpr (!kRegPipeKV) {
-            ffpa::prefill::sync_fetch_qkv_frags_s2r<1, 2, V_tile_size, kMmaAtomM, kMmaAtomN,
-                                                    kMmaAtomK, kPadV, kDataType>(
-                smem_V_base_ptr, &R_V[0][0], warp_KV, (j % 2), tile_V_Bc, smem_sel_v);
+            ffpa::prefill::sync_fetch_qkv_frags_s2r<
+                1, 2, V_tile_size, kMmaAtomM, kMmaAtomN, kMmaAtomK, kPadV,
+                kDataType>(smem_V_base_ptr, &R_V[0][0], warp_KV, (j % 2),
+                           tile_V_Bc, smem_sel_v);
           } else {
             if ((tile_V_Bc + 1) < (Bc / kMmaAtomK)) {
-              ffpa::prefill::sync_fetch_qkv_frags_s2r<1, 2, V_tile_size, kMmaAtomM, kMmaAtomN,
-                                                      kMmaAtomK, kPadV, kDataType>(
-                  smem_V_base_ptr, &R_V[reg_st_idx][0], warp_KV, (j % 2), (tile_V_Bc + 1),
-                  smem_sel_v);
+              ffpa::prefill::sync_fetch_qkv_frags_s2r<
+                  1, 2, V_tile_size, kMmaAtomM, kMmaAtomN, kMmaAtomK, kPadV,
+                  kDataType>(smem_V_base_ptr, &R_V[reg_st_idx][0], warp_KV,
+                             (j % 2), (tile_V_Bc + 1), smem_sel_v);
             }
           }
 
           const int p_offset = tile_V_Bc * 2;
           const int v_offset = (kRegPipeKV) ? reg_ld_idx : 0;
           if constexpr (kMmaAccFloat32PV) {
-            ffpa::mma::m16n8k16_abf32<kDataType, ffpa::mma::MMAMode::kInplaceUpdate>(
-                &R_O[0], &R_O[1], &R_O[2], &R_O[3], &R_S[0][p_offset][0], &R_S[0][p_offset][1],
-                &R_S[0][p_offset + 1][0], &R_S[0][p_offset + 1][1], &R_V[v_offset][0],
-                &R_V[v_offset][1]);
+            ffpa::mma::m16n8k16_abf32<kDataType,
+                                      ffpa::mma::MMAMode::kInplaceUpdate>(
+                &R_O[0], &R_O[1], &R_O[2], &R_O[3], &R_S[0][p_offset][0],
+                &R_S[0][p_offset][1], &R_S[0][p_offset + 1][0],
+                &R_S[0][p_offset + 1][1], &R_V[v_offset][0], &R_V[v_offset][1]);
           } else {
             ffpa::mma::m16n8k16_f16f16f16<ffpa::mma::MMAMode::kInplaceUpdate>(
                 &R_O[0], &R_O[1], &R_S[0][p_offset][0], &R_S[0][p_offset][1],
-                &R_S[0][p_offset + 1][0], &R_S[0][p_offset + 1][1], &R_V[v_offset][0],
-                &R_V[v_offset][1]);
+                &R_S[0][p_offset + 1][0], &R_S[0][p_offset + 1][1],
+                &R_V[v_offset][0], &R_V[v_offset][1]);
           }
         }
         if constexpr (kStagePV < 2) {
           __syncthreads();
         }
 
-        ffpa::prefill::sync_rescaling_tiling_o<kOStorageAccFloat32, kMmaAccFloat32PV, kDataType>(
-            &R_D[0][0][0], &R_O[0], &rescale_o_factor_0[0], &rescale_o_factor_1[0], tile_K_seqlen,
-            j);
+        ffpa::prefill::sync_rescaling_tiling_o<kOStorageAccFloat32,
+                                               kMmaAccFloat32PV, kDataType>(
+            &R_D[0][0][0], &R_O[0], &rescale_o_factor_0[0],
+            &rescale_o_factor_1[0], tile_K_seqlen, j);
 
         if constexpr (kStagePV > 1) {
           if (j < (kValTileHeadDimV - 1)) {
@@ -805,24 +863,28 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
       }
 
       ffpa::prefill::sync_update_max_expsum(
-          &lane_row_max_new[0][0], &lane_row_sum_new[0][0], &lane_block_row_max_old[0][0],
-          &lane_block_row_sum_old[0][0], &rescale_o_factor_0[0], &rescale_o_factor_1[0]);
+          &lane_row_max_new[0][0], &lane_row_sum_new[0][0],
+          &lane_block_row_max_old[0][0], &lane_block_row_sum_old[0][0],
+          &rescale_o_factor_0[0], &rescale_o_factor_1[0]);
     }
     __syncthreads();
   }
   __syncthreads();
 
   static_assert(kValTileSeqLenP == 1);
-  ffpa::prefill::sync_rescaling_final_o<kValTileHeadDimV, kOStorageAccFloat32, kDataType>(
+  ffpa::prefill::sync_rescaling_final_o<kValTileHeadDimV, kOStorageAccFloat32,
+                                        kDataType>(
       &R_D[0][0][0], &lane_block_row_sum_old[0][0]);
 
   static_assert(kValTileSeqLenP == 1);
-  ffpa::prefill::sync_store_o_r2g<Br, kHeadDim, kMmaAtomM, kMmaAtomN, kValTileHeadDimV,
-                                  kOStorageAccFloat32, kDataType>(
-      O, O_gmem_offset, O_tile_id, warp_QP, &R_D[0][0][0], &R_Q[0][0][0], &R_K[0][0], Nq);
+  ffpa::prefill::sync_store_o_r2g<Br, kHeadDim, kMmaAtomM, kMmaAtomN,
+                                  kValTileHeadDimV, kOStorageAccFloat32,
+                                  kDataType>(O, O_gmem_offset, O_tile_id,
+                                             warp_QP, &R_D[0][0][0],
+                                             &R_Q[0][0][0], &R_K[0][0], Nq);
 
   const int softmax_lse_offset = Nb_id * Nh * Nq + Nh_id * Nq;
   ffpa::prefill::sync_store_lse_r2g<Br, kMmaAtomM, kValTileSeqLenQ>(
-      softmax_lse, softmax_lse_offset, O_tile_id, warp_QP, &lane_block_row_max_old[0][0],
-      &lane_block_row_sum_old[0][0], Nq);
+      softmax_lse, softmax_lse_offset, O_tile_id, warp_QP,
+      &lane_block_row_max_old[0][0], &lane_block_row_sum_old[0][0], Nq);
 }

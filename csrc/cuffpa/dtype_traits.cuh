@@ -17,11 +17,17 @@ template <>
 struct DtypeTraits<__half> {
   using type = __half;
 
-  static __device__ __forceinline__ __half from_float(float x) { return __float2half_rn(x); }
+  static __device__ __forceinline__ __half from_float(float x) {
+    return __float2half_rn(x);
+  }
 
-  static __device__ __forceinline__ float to_float(__half x) { return __half2float(x); }
+  static __device__ __forceinline__ float to_float(__half x) {
+    return __half2float(x);
+  }
 
-  static __device__ __forceinline__ __half hmax(__half a, __half b) { return __hmax(a, b); }
+  static __device__ __forceinline__ __half hmax(__half a, __half b) {
+    return __hmax(a, b);
+  }
 };
 
 template <>
@@ -32,9 +38,12 @@ struct DtypeTraits<__nv_bfloat16> {
     return __float2bfloat16_rn(x);
   }
 
-  static __device__ __forceinline__ float to_float(__nv_bfloat16 x) { return __bfloat162float(x); }
+  static __device__ __forceinline__ float to_float(__nv_bfloat16 x) {
+    return __bfloat162float(x);
+  }
 
-  static __device__ __forceinline__ __nv_bfloat16 hmax(__nv_bfloat16 a, __nv_bfloat16 b) {
+  static __device__ __forceinline__ __nv_bfloat16 hmax(__nv_bfloat16 a,
+                                                       __nv_bfloat16 b) {
     return __hmax(a, b);
   }
 };
