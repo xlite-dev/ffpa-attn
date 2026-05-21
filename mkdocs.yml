@@ -66,6 +66,11 @@ plugins:
           options:
             docstring_style: sphinx
             show_source: false
+            show_root_heading: true
+            show_signature_annotations: true
+            separate_signature: true
+            group_by_category: true
+            filters: ["!^_"]
 
 markdown_extensions:
   - admonition
