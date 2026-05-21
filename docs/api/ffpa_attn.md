@@ -24,33 +24,38 @@
     options:
       show_root_heading: true
       show_source: false
-      members: false
       docstring_style: sphinx
+      group_by_category: true
+      filters: ["!^_"]
 
 ::: ffpa_attn.TritonBackend
     options:
       show_root_heading: true
       show_source: false
-      members: false
       docstring_style: sphinx
+      group_by_category: true
+      filters: ["!^_"]
 
 ::: ffpa_attn.CUDABackend
     options:
       show_root_heading: true
       show_source: false
-      members: false
       docstring_style: sphinx
+      group_by_category: true
+      filters: ["!^_"]
 
 ::: ffpa_attn.CuTeDSLBackend
     options:
       show_root_heading: true
       show_source: false
-      members: false
       docstring_style: sphinx
+      group_by_category: true
+      filters: ["!^_"]
 
 ::: ffpa_attn.SDPABackend
     options:
       show_root_heading: true
       show_source: false
-      members: false
       docstring_style: sphinx
+      group_by_category: true
+      filters: ["!^_"]
