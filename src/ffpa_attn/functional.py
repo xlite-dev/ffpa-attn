@@ -29,6 +29,11 @@ from .cutedsl import (
   _ffpa_attn_varlen_cutedsl,
 )  # D == 512 SM90
 
+try:
+  from .cuda import _ffpa_attn_forward_cuda  # D > 256
+except Exception:
+  _ffpa_attn_forward_cuda = None
+
 if TYPE_CHECKING:
   from typing import Tuple, Union, Optional  # noqa: F401
 
@@ -155,12 +160,6 @@ def _resolve_backend_pair(
   return forward_backend, backward_backend
 
 
-_CUDA_BACKEND_LOADED = False
-_CUDA_BACKEND_IMPORT_ERROR: Exception | None = None
-_CUDA_FWD_AVAILABLE = False
-_CUDA_FORWARD_IMPL = None
-
-
 def _reserve_large_d_dropout_rng(
   q: torch.Tensor,
   k: torch.Tensor,
@@ -230,56 +229,6 @@ def _validate_attn_mask_shape(
         f"ffpa_attn_func: 4-D attn_mask head dimension must be 1 or {nheads_q}, "
         f"got {attn_mask.size(1)}"
       )
-
-
-def _load_cuda_backend() -> None:
-  global _CUDA_BACKEND_LOADED
-  global _CUDA_BACKEND_IMPORT_ERROR
-  global _CUDA_FWD_AVAILABLE
-  global _CUDA_FORWARD_IMPL
-
-  if _CUDA_BACKEND_LOADED:
-    return
-
-  _CUDA_BACKEND_LOADED = True
-  try:
-    from . import cuda as cuda_backend
-  except Exception as exc:
-    _CUDA_BACKEND_IMPORT_ERROR = exc
-    return
-
-  _CUDA_FORWARD_IMPL = cuda_backend._ffpa_attn_forward_cuda
-  _CUDA_FWD_AVAILABLE = bool(getattr(cuda_backend, "CUDA_FWD_AVAILABLE", False))
-
-
-def cuda_forward_available() -> bool:
-  _load_cuda_backend()
-  return _CUDA_FWD_AVAILABLE
-
-
-def cuda_backward_available() -> bool:
-  return False
-
-
-def _require_cuda_forward_impl():
-  _load_cuda_backend()
-  if _CUDA_FWD_AVAILABLE and _CUDA_FORWARD_IMPL is not None:
-    return _CUDA_FORWARD_IMPL
-
-  message = (
-    "ffpa_attn_func: forward_backend='cuda' requested but the CUDA forward backend is unavailable. "
-    "Rebuild with ENABLE_FFPA_CUDA_IMPL=1 to enable it."
-  )
-  if _CUDA_BACKEND_IMPORT_ERROR is not None:
-    message = f"{message} Original import error: {_CUDA_BACKEND_IMPORT_ERROR}"
-  raise RuntimeError(message)
-
-
-def _require_cuda_backward_impl():
-  raise RuntimeError(
-    "ffpa_attn_func: backward_backend='cuda' has been removed from the active backend. "
-    "Use backward_backend='triton' or backward_backend='sdpa'."
-  )
 
 
 @dataclass
@@ -611,9 +560,9 @@ class _FFPAAttnFunc(torch.autograd.Function):
       )
     elif isinstance(meta.forward_meta, CUDABackend):
       forward_meta = meta.forward_meta
+      assert _ffpa_attn_forward_cuda is not None, "CUDA backend is not available."
       rng_state = _reserve_large_d_dropout_rng(q, k, meta.attn_meta.dropout_p)
-      cuda_forward_impl = _require_cuda_forward_impl()
-      O, lse = cuda_forward_impl(
+      O, lse = _ffpa_attn_forward_cuda(
         q,
         k,
         v,
@@ -870,6 +819,5 @@ class FFPAAttnVarlenFunc:
 __all__ = [
   "FFPAAttnMeta",
   "FFPAAttnFunc",
-  "cuda_forward_available",
-  "cuda_backward_available",
+  "FFPAAttnVarlenFunc",
 ]

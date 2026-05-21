@@ -43,7 +43,7 @@ DTYPES = [torch.float16, torch.bfloat16]
 
 
 def _require_cuda_forward_impl() -> None:
-  if not ffpa_attn_functional.cuda_forward_available():
+  if ffpa_attn_functional._ffpa_attn_forward_cuda is None:
     pytest.skip("CUDA forward backend was not compiled")
 
 
