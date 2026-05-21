@@ -61,11 +61,17 @@ def _normalize_grad_kv_storage_dtype(dtype: torch.dtype | str | None) -> torch.d
 @dataclass
 class Backend:
   name: str
-  forward: bool = False
-  backward: bool = False
+  forward: bool | None = None
+  backward: bool | None = None
 
   def __post_init__(self) -> None:
-    assert self.forward != self.backward, f"{self.name} backend must select exactly one direction"
+    if self.forward is None and self.backward is None:
+      self.forward = True
+      self.backward = True
+    elif self.forward is None:
+      self.forward = not self.backward
+    elif self.backward is None:
+      self.backward = not self.forward
 
 
 @dataclass
@@ -146,15 +152,6 @@ def _resolve_backend_pair(
 
   assert forward_backend.forward, "forward_backend must be configured with forward=True"
   assert backward_backend.backward, "backward_backend must be configured with backward=True"
-
-  # CuTeDSL is currently modeled as its own backend family rather than as a
-  # generic FFPA forward implementation that can freely mix with Triton/SDPA
-  # backward. Keep the pair invariant here so unsupported hybrid combinations
-  # fail immediately at metadata construction time instead of leaking deeper
-  # into dispatch or autograd.
-  if forward_backend.name == "cutedsl" or backward_backend.name == "cutedsl":
-    assert forward_backend.name == "cutedsl" and backward_backend.name == "cutedsl", \
-      "cutedsl forward and backward must be selected as a pair"
 
   return forward_backend, backward_backend
 

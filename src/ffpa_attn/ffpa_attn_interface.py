@@ -201,8 +201,13 @@ def ffpa_attn_func(
       ``query`` and ``key``/``value`` to have the same number of heads. Pass
       ``True`` to opt into GQA/MQA semantics explicitly.
   :param kwargs: FFPA-specific extension kwargs. Supported keys are
-      ``forward_backend`` and ``backward_backend``, both expecting backend
-      config objects. Any other kwarg raises ``TypeError``.
+      ``backend`` (str or Backend instance), ``forward_backend``, and
+      ``backward_backend``.  ``backend`` is a shorthand that auto-fills both
+      ``forward_backend`` and ``backward_backend`` with the same config:
+      ``backend=\"cutedsl\"`` is equivalent to passing
+      ``forward_backend=CuTeDSLBackend(), backward_backend=CuTeDSLBackend()``.
+      Explicit ``forward_backend`` / ``backward_backend`` take priority over
+      ``backend``.  Any other kwarg raises ``TypeError``.
 
   :returns: Output tensor ``O`` with layout ``[B, Nh_q, Nq, D]``,
       filled with the attention output ``softmax(scale * QK^T) V``.
@@ -218,6 +223,25 @@ def ffpa_attn_func(
   """
   forward_backend = kwargs.pop("forward_backend", None)
   backward_backend = kwargs.pop("backward_backend", None)
+  backend = kwargs.pop("backend", None)
+
+  # backend str/instance shorthand: auto-fill forward_backend/backward_backend
+  # when neither is explicitly provided.  Priority: explicit forward_backend /
+  # backward_backend > backend > default Triton.
+  if forward_backend is None and backward_backend is None and backend is not None:
+    from .functional import CUDABackend, TritonBackend, CuTeDSLBackend
+
+    if isinstance(backend, str):
+      _BACKEND_MAP = {"cuda": CUDABackend, "triton": TritonBackend, "cutedsl": CuTeDSLBackend}
+      cls = _BACKEND_MAP.get(backend)
+      if cls is None:
+        raise ValueError(f"ffpa_attn_func: backend must be 'cuda', 'triton', or 'cutedsl', got {backend!r}")
+      backend = cls()
+    if not isinstance(backend, Backend):
+      raise TypeError(f"ffpa_attn_func: backend must be a str or Backend instance, got {type(backend).__name__}")
+    forward_backend = backend
+    backward_backend = backend
+
   if kwargs:
     unexpected = ", ".join(sorted(kwargs))
     raise TypeError(f"ffpa_attn_func() got unexpected keyword argument(s): {unexpected}")
