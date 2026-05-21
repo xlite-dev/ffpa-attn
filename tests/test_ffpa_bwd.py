@@ -308,8 +308,10 @@ def _key_position_bias_grad_ref(
         ) * scale
         scores = scores + key_bias[n_start:n_start + block_n].view(1, 1, 1, -1)
         prob = torch.exp(scores - lse[..., None])
-        block_value_sum = key_value_sum[:, :, None, n_start:n_start + block_n]
-        delta += (prob * block_value_sum).sum(dim=-1)
+        delta += (prob *
+                  key_value_sum[:, :, None, n_start:n_start + block_n]).sum(
+                    dim=-1
+                  )
 
       for n_start in range(0, seqlen_k, block_n):
         scores = torch.matmul(
