@@ -35,6 +35,8 @@ from .utils.cache_utils import get_jit_cache
 from .utils import fa_logging
 from .utils.cute_dsl_utils import to_cute_tensor
 
+SM80_FWD_NUM_STAGES = 1
+
 
 def _ffpa_attn_forward_sm80(
   q: torch.Tensor,
@@ -175,6 +177,23 @@ def _ffpa_attn_forward_sm80(
   dtype = torch2cute_dtype_map[q.dtype]
   current_stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
   is_varlen = cu_seqlens_q is not None or cu_seqlens_k is not None
+  smem_capacity_arch = f"sm_{device_arch // 10}{device_arch % 10}"
+  if not FFPAAttnFwdSm80SplitD.can_implement(
+    dtype,
+    head_dim,
+    head_dim_v,
+    FWD_TILE_M,
+    FWD_TILE_N,
+    SM80_FWD_NUM_STAGES,
+    128,
+    causal,
+    smem_capacity_arch=smem_capacity_arch,
+  ):
+    raise RuntimeError(
+      "SM80/SM89 CuTeDSL forward configuration exceeds kernel resource limits: "
+      f"head_dim={head_dim}, tile=({FWD_TILE_M}, {FWD_TILE_N}), "
+      f"num_stages={SM80_FWD_NUM_STAGES}, arch={smem_capacity_arch}."
+    )
 
   if (is_varlen or causal) and not is_fake_mode():
     out.zero_()
@@ -189,12 +208,13 @@ def _ffpa_attn_forward_sm80(
     return out, lse
 
   compile_key = (
-    "sm80_fwd_vtail_zero_v7",
+    "sm80_fwd_stage_kv_v8",
     dtype,
     head_dim,
     head_dim_v,
     qhead_per_kvhead,
     causal,
+    SM80_FWD_NUM_STAGES,
     lse is None,
     cu_seqlens_q is None,
     cu_seqlens_k is None,
@@ -225,6 +245,7 @@ def _ffpa_attn_forward_sm80(
       pack_gqa=False,
       tile_m=FWD_TILE_M,
       tile_n=FWD_TILE_N,
+      num_stages=SM80_FWD_NUM_STAGES,
     )
     compile_args = [
       ffpa_fwd,
