@@ -1025,13 +1025,13 @@ def run_backward_examples(
   gqa_heads = _resolve_gqa_heads(H)
   non_aligned_heads = _resolve_non_aligned_heads(H)
 
-  if backward_backend == "cutedsl":
-    dtypes = tuple(dt for dt in dtypes if dt == torch.bfloat16)
-    if not dtypes:
-      raise ValueError(
-        "cutedsl backward requires torch.bfloat16; pass dtypes=(torch.bfloat16,) "
-        "or remove fp16 from the dtypes tuple."
-      )
+  # if backward_backend == "cutedsl":
+  #   dtypes = tuple(dt for dt in dtypes if dt == torch.bfloat16)
+  #   if not dtypes:
+  #     raise ValueError(
+  #       "cutedsl backward requires torch.bfloat16; pass dtypes=(torch.bfloat16,) "
+  #       "or remove fp16 from the dtypes tuple."
+  #     )
 
   print(
     f"\nRunning FFPA backward, backend={backward_backend}, "
