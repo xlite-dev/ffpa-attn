@@ -1,6 +1,6 @@
 # FFPA CuTeDSL Backend (`ffpa_attn.cutedsl`)
 
-SM90 (Hopper) dense `320 <= head_dim (D) <= 512` forward and backward kernels
+SM90 (Hopper) dense `320<D<=512` forward and backward kernels
 for FFPA, implemented in [CuTeDSL][cutedsl]. This package is an **internal
 backend**: end users should not import from `ffpa_attn.cutedsl` directly.
 The supported entry points live at the top of the `ffpa_attn` namespace:
@@ -46,7 +46,7 @@ out = ffpa_attn_func(q, k, v, is_causal=True, forward_backend=fwd, backward_back
 
 The cutedsl path flows through the standard `FFPAAttnMeta` → `FFPAAttnFunc`
 dispatch.  `meta.fallback()` handles cutedsl hardware mismatches
-(head_dim outside `320 <= head_dim (D) <= 512` or non-SM90) by falling back to native SDPA with a
+(head_dim outside `320<D<=512` or non-SM90) by falling back to native SDPA with a
 `warning_once`.  All other constraints (dtype, dropout>0,
 explicit attn_mask, FA-extension kwargs) raise `NotImplementedError`
 immediately — there is no silent fallback.
@@ -147,7 +147,7 @@ ffpa_attn_varlen_func(...)
 | `_ffpa_bwd_sm90.py` | Backward entry: `_ffpa_attn_backward_sm90()`, `_bwd_preprocess()`, compile caches. |
 | `_fwd_d512_sm90.py` | Forward kernel class `FFPAAttnFwdSm90SplitD`: D512 full-D 3-warpgroup pipeline. |
 | `_fwd_generic_sm90.py` | Generic dense forward wrapper `FFPAAttnFwdSm90SplitDGeneric`: dispatches logical large-D tensors through the D512 physical tile. |
-| `_fwd_d384_sm90.py` | D384-aware forward wrapper `FFPAAttnFwdSm90SplitDD384Aware`: uses a D384 physical tile for `320 <= head_dim (D) <= 384`. |
+| `_fwd_d384_sm90.py` | D384-aware forward wrapper `FFPAAttnFwdSm90SplitDD384Aware`: uses a D384 physical tile for `320<D<=384`. |
 | `_bwd_preprocess.py` | Bwd preprocess kernel class `FFPAAttnBwdPreprocess`: computes `D_i = (O⊙dO).sum(-1)`. |
 | `_dkdv_d512_sm90.py` | D512 `dK`+`dV` kernel class `FFPAAttnBwdDKDVSm90SplitD`. |
 | `_dkdv_generic_sm90.py` | Generic dense `dK`+`dV` wrapper `FFPAAttnBwdDKDVSm90SplitDGeneric`: dispatches logical large-D tensors through the D512 physical tile. |
@@ -166,7 +166,7 @@ Kernel class names are implementation details. File paths are the stable contrac
 | Constraint | Detail |
 |---|---|
 | **GPU** | SM 9.x (Hopper). WGMMA, TMA, named barriers. |
-| **Head dim** | Dense path supports `320 <= head_dim (D) <= 512`; varlen remains `D == 512`. |
+| **Head dim** | Dense path supports `320<D<=512`; varlen remains `D == 512`. |
 | **Dtype (fwd)** | fp16 or bf16. |
 | **Dtype (bwd)** | fp16 or bf16. |
 | **attn_mask** | Not supported. |

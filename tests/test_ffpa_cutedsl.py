@@ -1,6 +1,6 @@
 """CuTeDSL backend integration tests for ffpa_attn_func.
 
-The CuTeDSL kernels are specialised for SM90 (Hopper) and dense 256<D<=512.
+The CuTeDSL kernels are specialised for SM90 (Hopper) and dense 320<D<=512.
 These tests gate on the device capability and only validate the dispatch
 wiring + numerical parity against the existing Triton backend, not the
 kernel internals (covered by the standalone CuTeDSL kernel tests).
