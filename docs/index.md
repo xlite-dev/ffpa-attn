@@ -226,7 +226,7 @@ Runnable examples are provided under [`examples`](./examples). The performance b
 
 ## 🤖 Backends
 
-FFPA supports multiple backends for the forward and backward pass, including: [`SDPA`](./examples/) (baseline), [`CUDA`](./examples/) (forward only), [`Triton`](./examples/), and [`CuTeDSL`](./examples/). The CuTeDSL backend is currently in early stage and has some constraints (e.g., `D<=512`), but it can achieve up to `427🎉` TFLOPS on H200! Stay tuned for future updates.
+FFPA supports multiple backends for the forward and backward pass, including: [`SDPA`](./examples/) (baseline), [`CUDA`](./examples/) (forward only), [`Triton`](./examples/), and [`CuTeDSL`](./examples/). The `CuTeDSL` backend is currently in early stage and has some constraints (e.g., D <= 512), but it can achieve up to `427🎉` TFLOPS on H200! Stay tuned for future updates.
 
 <div align='center' markdown="1">
 
@@ -245,7 +245,7 @@ How to use different backends for your own scenario? Users can simply pass the B
 
 ```python
 >>> from ffpa_attn import ffpa_attn_func, CuTeDSLBackend
->>> # CuTeDSL backend for dense large-D scenarios, fastest on H200!🎉
+>>> # CuTeDSL backend for D=512 scenarios, fastest on H200!🎉
 >>> o = ffpa_attn_func(q, k, v, backend=CuTeDSLBackend())
 ```
 
