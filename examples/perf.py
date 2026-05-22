@@ -1323,19 +1323,18 @@ def _benchmark_rows(
     )
   if args.backward:
     bwd_dtypes = dtypes
-    if args.backward_backend == CUTEDSL_BACKEND and torch.float16 in bwd_dtypes:
-      filtered = tuple(d for d in bwd_dtypes if d != torch.float16)
-      if not filtered:
-        raise SystemExit(
-          "Selected --dtype fp16 with CuTeDSL backward, but CuTeDSL "
-          "backward only supports bf16. Use --dtype bf16/both or --no-bwd."
-        )
-      print(
-        "[cutedsl] Skipping fp16 backward: bf16-only (known fp16 dQ launch "
-        "failure in src/ffpa_attn/cutedsl/_interface.py).",
-        file=sys.stderr,
-      )
-      bwd_dtypes = filtered
+    # if args.backward_backend == CUTEDSL_BACKEND and torch.float16 in bwd_dtypes:
+    #   filtered = tuple(d for d in bwd_dtypes if d != torch.float16)
+    #   if not filtered:
+    #     raise SystemExit(
+    #       "Selected --dtype fp16 with CuTeDSL backward, but CuTeDSL "
+    #       "backward only supports bf16. Use --dtype bf16/both or --no-bwd."
+    #     )
+    #   print(
+    #     "[cutedsl] Skipping fp16 backward: only bf16 is supported for now.",
+    #     file=sys.stderr,
+    #   )
+    #   bwd_dtypes = filtered
     backward_rows = _decorate_rows(
       "backward",
       run_backward_examples(
