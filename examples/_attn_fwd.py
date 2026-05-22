@@ -538,7 +538,7 @@ def run_forward_examples(
   gqa_heads = _resolve_gqa_heads(H)
   non_aligned_heads = _resolve_non_aligned_heads(H)
   print(
-    f"\nRunning FFPA forward examples with forward_backend={forward_backend}, "
+    f"\nRunning FFPA forward, backend={forward_backend}, "
     f"apply_norm={apply_norm}, "
     f"triton_autotune={triton_autotune}, "
     f"triton_autotune_mode={triton_autotune_mode}, "
@@ -550,7 +550,7 @@ def run_forward_examples(
   )
   if forward_backend == "cutedsl":
     print(
-      "[CuTeDSL] backend constraints in effect: dense 256<D<=512, no attn_mask/dropout."
+      "[CuTeDSL] backend constraints in effect: 320<=D<=512, no attn_mask/dropout."
     )
 
   for dtype in dtypes:
