@@ -182,7 +182,7 @@ Any ineligible call surfaces `NotImplementedError` — no silent fallback.
 
 The current kernels are not made Blackwell-compatible by simply relaxing the
 Python-side `sm == 90` checks to `sm >= 90`. A May 2026 experiment on
-`AutoDL.VIP.6000_1.CU130` (`NVIDIA RTX PRO 6000 Blackwell Server Edition`,
+`NVIDIA RTX PRO 6000 Blackwell Server Edition`,
 compute capability 12.0) showed that the D512 path reaches CuTeDSL JIT after
 the local gates are relaxed, but then fails inside CUTLASS DSL's Hopper
 warpgroup MMA implementation:
