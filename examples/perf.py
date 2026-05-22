@@ -8,8 +8,8 @@ Usage::
   CUDA_VISIBLE_DEVICES=0 python examples/perf.py --fwd-backend triton --bwd-backend triton --tune fast
   CUDA_VISIBLE_DEVICES=0 python examples/perf.py --fwd-backend cutedsl --bwd-backend cutedsl
 
-The cutedsl backend is SM90 (Hopper) only and supports dense 256<D<=512 / bf16
-backward. Selecting
+The cutedsl backend is SM90 (Hopper) only and supports dense 320<=D<=512 /
+fp16 or bf16 backward. Selecting
 ``cutedsl`` on either ``--fwd-backend`` or ``--bwd-backend`` auto-pairs the
 other side and restricts tasks to the cutedsl-compatible subset
 (self-attn, cross-attn, gqa, causal).
