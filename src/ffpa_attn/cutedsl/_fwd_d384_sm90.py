@@ -1,4 +1,8 @@
-"""D384-aware SM90 CuTeDSL forward kernel wrapper for dense large head dimensions."""
+"""D384-aware SM90 CuTeDSL forward wrapper for dense large head dimensions.
+
+This wrapper reuses the generic SplitD forward implementation and only narrows
+the physical Q/K/V tile from D512 to D384 for dense ``256 < D <= 384`` inputs.
+"""
 
 from typing import Optional, Type
 
@@ -11,7 +15,7 @@ D384_AWARE_HEAD_DIM = 384
 
 
 class FFPAAttnFwdSm90SplitDD384Aware(FFPAAttnFwdSm90SplitDGeneric):
-  """Dense forward path using a 384-wide physical SplitD tile for D<=384."""
+  """Dense forward path using a 384-wide physical SplitD tile."""
 
   def __init__(
     self,

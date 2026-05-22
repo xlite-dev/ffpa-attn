@@ -7,17 +7,18 @@
 # The core implementation below is written from scratch for SM90 and follows
 # the SplitD design from the ffpa-attn repo.
 #
-# SM90 Backward dKdV Kernel with 4-Pass D-Split for head_dim=512.
+# SM90 Backward dKdV Kernel with 2-pass D-split for dense D<=384.
 #
 # Architecture:
-#   - 2 WGs: 1 producer (TMA, 128 threads), 1 consumer (MMA, 128 threads)
-#   - tile_m=64, tile_n=64, d_chunk=128, num_d_passes=4
-#   - K/V persistent SMEM: pre-loaded once per d_pass (4 K + 4 V chunks)
-#   - Q/dO streaming via pipeline_A (3 stages)
-#   - Per d_pass, 6 phases per (n_block, m_block):
-#       Phase 1: S = Q @ K^T (4 × d_inner=128 reduction, K from persistent SMEM)
+#   - 3 WGs: 1 producer WG (warp 0 issues TMA), WG1 (S/softmax/dV), WG2 (dP/dS/dK)
+#   - tile_m=64, tile_n=64, d_chunk=256, num_d_passes=2, num_d_inner=2
+#   - K/V persistent SMEM: two 256-wide chunks pre-loaded once per work_tile
+#   - Q/dO streaming via pipeline_A (2 stages)
+#   - Per d_pass, 6 phases per (n_block, m_block). Pass 1 covers logical D 256:384;
+#     the physical 256-wide tile relies on OOB guards for the unused 384:512 region.
+#       Phase 1: S = Q @ K^T (2 × d_inner=256 reduction, K from persistent SMEM)
 #       Phase 2: P = exp2(S * scale_log2 - LSE)
-#       Phase 3: dP = dO @ V^T (4 × d_inner=128 reduction, V from persistent SMEM)
+#       Phase 3: dP = dO @ V^T (2 × d_inner=256 reduction, V from persistent SMEM)
 #       Phase 4: dS = P * (dP - dPsum)
 #       Phase 5: dV += P^T @ dO_d_pass  (via SMEM)
 #       Phase 6: dK += dS^T @ Q_d_pass  (via SMEM)
@@ -123,7 +124,7 @@ class FFPAAttnBwdDKDVSm90SplitDD384:
     # sP/sdS single-buffered; PFull/PEmpty (256-thread named barrier) serializes cross-WG handoff.
     self.PdS_stage = 1
 
-    # ── K/V persistence : preload ONCE per work_tile, reused across d_pass ──
+    # ── K/V persistence: preload both physical D chunks once per work_tile ──
     self.K_persist_chunks = self.num_d_inner
     self.V_persist_chunks = self.num_d_inner
 
@@ -187,7 +188,7 @@ class FFPAAttnBwdDKDVSm90SplitDD384:
 
   def _get_tiled_mma(self):
     # ── SdP: S = Q @ K^T, dP = dO @ V^T ──
-    # shape_mnk: (tile_m, tile_n, d_chunk) = (64, 64, 128)
+    # shape_mnk: (tile_m, tile_n, d_chunk) = (64, 64, 256)
     atom_layout_SdP = (
       self.AtomLayoutMSdP, self.num_wg_mma // self.AtomLayoutMSdP, 1
     )
@@ -205,7 +206,7 @@ class FFPAAttnBwdDKDVSm90SplitDD384:
     )
 
     # ── dKV: dV = P^T @ dO_d, dK = dS^T @ Q_d ──
-    # shape_mnk: (tile_n, d_chunk, tile_m) = (64, 128, 64)
+    # shape_mnk: (tile_n, d_chunk, tile_m) = (64, 256, 64)
     atom_layout_dKV = (
       self.AtomLayoutNdKV, self.num_wg_mma // self.AtomLayoutNdKV, 1
     )
@@ -350,28 +351,28 @@ class FFPAAttnBwdDKDVSm90SplitDD384:
 
     sA_layout_sel = cute.select(self.sA_layout, mode=[0, 1])
     gmem_tiled_copy_g2s = cpasync.CopyBulkTensorTileG2SOp()
-    # Q: tile shape (tile_m, d_chunk) = (64, 128)
+    # Q: tile shape (tile_m, d_chunk) = (64, 256)
     tma_atom_Q, tma_tensor_Q = cpasync.make_tiled_tma_atom(
       gmem_tiled_copy_g2s,
       mQ,
       sA_layout_sel,
       (self.tile_m, self.d_chunk),
     )
-    # dO: tile shape (tile_m, d_chunk) = (64, 128)
+    # dO: tile shape (tile_m, d_chunk) = (64, 256)
     tma_atom_dO, tma_tensor_dO = cpasync.make_tiled_tma_atom(
       gmem_tiled_copy_g2s,
       mdO,
       sA_layout_sel,
       (self.tile_m, self.d_chunk),
     )
-    # K: tile shape (tile_n, d_chunk) = (64, 128), persistent in SMEM
+    # K: tile shape (tile_n, d_chunk) = (64, 256), persistent in SMEM
     tma_atom_K, tma_tensor_K = cpasync.make_tiled_tma_atom(
       gmem_tiled_copy_g2s,
       mK,
       sK_layout_sel,
       (self.tile_n, self.d_chunk),
     )
-    # V: tile shape (tile_n, d_chunk) = (64, 128), persistent in SMEM
+    # V: tile shape (tile_n, d_chunk) = (64, 256), persistent in SMEM
     tma_atom_V, tma_tensor_V = cpasync.make_tiled_tma_atom(
       gmem_tiled_copy_g2s,
       mV,
