@@ -22,8 +22,7 @@ paths (same `_ffpa_attn_forward_sm90` / `_ffpa_attn_backward_sm90`).
 
 ### 1. `ffpa_attn_func` — fixed-shape batched attention (opt-in)
 
-Tensors use SDPA layout `[B, Nh, N, D]`. Forward accepts fp16 or bf16;
-backward (`requires_grad=True`) requires bf16.
+Tensors use SDPA layout `[B, Nh, N, D]`. Forward and backward accept fp16 or bf16.
 
 ```python
 import torch
@@ -48,7 +47,7 @@ out = ffpa_attn_func(q, k, v, is_causal=True, forward_backend=fwd, backward_back
 The cutedsl path flows through the standard `FFPAAttnMeta` → `FFPAAttnFunc`
 dispatch.  `meta.fallback()` handles cutedsl hardware mismatches
 (head_dim≠512 or non-SM90) by falling back to native SDPA with a
-`warning_once`.  All other constraints (dtype, fp16 training, dropout>0,
+`warning_once`.  All other constraints (dtype, dropout>0,
 explicit attn_mask, FA-extension kwargs) raise `NotImplementedError`
 immediately — there is no silent fallback.
 
@@ -163,7 +162,7 @@ Kernel class names are implementation details. File paths are the stable contrac
 | **GPU** | SM 9.x (Hopper). WGMMA, TMA, named barriers. |
 | **Head dim** | Dense path supports `256 < D <= 512`; varlen remains `D == 512`. |
 | **Dtype (fwd)** | fp16 or bf16. |
-| **Dtype (bwd)** | bf16 required for training. |
+| **Dtype (bwd)** | fp16 or bf16. |
 | **attn_mask** | Not supported. |
 | **Dropout** | `dropout_p == 0.0`. |
 | **Varlen extras** | seqused_k, block_table, num_splits, window_size, alibi_slopes, softcap rejected. |

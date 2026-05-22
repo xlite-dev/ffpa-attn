@@ -139,8 +139,8 @@ def cutedsl_forward_available(device: Optional[torch.device] = None) -> bool:
 def cutedsl_backward_available(device: Optional[torch.device] = None) -> bool:
   """Whether the CuTeDSL backward kernel can run on ``device``.
 
-  Identical hardware requirement to forward; the backward kernel additionally
-  requires bf16 inputs which is validated per-call.
+  Identical hardware requirement to forward; tensor dtype and shape constraints
+  are validated per-call.
   """
   return cutedsl_forward_available(device)
 
@@ -154,8 +154,8 @@ def _require_cutedsl_supported(
 ) -> None:
   """Validate tensor-level constraints for the cutedsl backend.
 
-  Checks device, SM90, dense large head_dim, q/k/v dtype, and the bf16-only rule
-  for training. Kwarg-level functional compatibility (``dropout_p``,
+  Checks device, SM90, dense large head_dim, and q/k/v dtype. Kwarg-level
+  functional compatibility (``dropout_p``,
   ``attn_mask``, FlashAttention-extension kwargs) is **not** the
   responsibility of this function; that lives in
   :func:`_check_supported_options`, applied by the entry shims
@@ -187,10 +187,7 @@ def _require_cutedsl_supported(
     raise TypeError(
       f"cutedsl backend requires torch.float16 or torch.bfloat16, got {q.dtype}"
     )
-  if requires_grad and q.dtype != torch.bfloat16:
-    raise NotImplementedError(
-      "cutedsl backward currently supports torch.bfloat16 only; use bf16 inputs for training"
-    )
+  del requires_grad
   if k.size(-1) != q.size(-1) or v.size(-1) != q.size(-1):
     raise NotImplementedError(
       f"cutedsl backend requires q/k/v to share head_dim={q.size(-1)}; "
@@ -722,10 +719,6 @@ def _varlen_bwd_fake(
   _validate_max_seqlen_for_cu_seqlens(
     cu_seqlens_k, "cu_seqlens_k", max_seqlen_k, "max_seqlen_k"
   )
-  if q.dtype == torch.float16:
-    raise NotImplementedError(
-      "SplitD backward currently supports bfloat16 only; the fp16 dQ path has a known launch failure."
-    )
   _validate_varlen_custom_bwd_features(
     causal, window_size_left, window_size_right, softcap
   )
@@ -862,10 +855,10 @@ def _ffpa_attn_varlen_impl(
 ):
   """Varlen SplitD FFPA attention for D=512 on SM90.
 
-  q/k/v must be packed as (total_tokens, heads, 512). Training requires bf16
-  q/k/v, valid CUDA int32 cu_seqlens, and explicit max_seqlen_q/k whenever
-  the corresponding cu_seqlens tensor is provided. If return_lse=False, LSE is
-  still computed internally when needed for backward.
+  q/k/v must be packed as (total_tokens, heads, 512). Training supports fp16
+  and bf16 q/k/v, valid CUDA int32 cu_seqlens, and explicit max_seqlen_q/k
+  whenever the corresponding cu_seqlens tensor is provided. If return_lse=False,
+  LSE is still computed internally when needed for backward.
   """
   (
     cu_seqlens_q,

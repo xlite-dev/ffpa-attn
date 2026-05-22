@@ -214,10 +214,6 @@ def _ffpa_attn_backward_sm90(
   _validate_max_seqlen_for_cu_seqlens(
     cu_seqlens_k, "cu_seqlens_k", max_seqlen_k, "max_seqlen_k"
   )
-  if q.dtype == torch.float16:
-    raise NotImplementedError(
-      "SplitD backward currently supports bfloat16 only; the fp16 dQ path has a known launch failure."
-    )
   if cu_seqlens_q is None:
     seqlen_q_for_rounding = seqlen_q
   else:

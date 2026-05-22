@@ -141,10 +141,16 @@ def _validate_sm90_arch() -> tuple[int, str]:
 def _validate_training_dtype(
   q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, requires_grad: bool
 ) -> None:
-  if requires_grad and q.dtype != torch.bfloat16:
-    raise NotImplementedError(
-      "SplitD training currently supports torch.bfloat16 only. "
-      f"Got q/k/v dtype {q.dtype}; use bfloat16 inputs or a different attention backend."
+  """Validate training dtype constraints shared by SplitD fwd/bwd paths.
+
+  The common q/k/v validator already enforces fp16 or bf16 and matching dtypes.
+  Training follows the same dtype support matrix; this helper remains as the
+  single call site for any future training-only dtype restriction.
+  """
+  del k, v, requires_grad
+  if q.dtype not in torch2cute_dtype_map:
+    raise TypeError(
+      "SplitD training inputs must be torch.float16 or torch.bfloat16"
     )
 
 

@@ -68,21 +68,18 @@ def test_cutedsl_forward_matches_triton(is_causal, Hq, Hkv, D):
 
 @pytest.mark.parametrize("is_causal", [False, True])
 @pytest.mark.parametrize("D", [320, 384, 512])
-def test_cutedsl_autograd_matches_triton(is_causal, D):
+@pytest.mark.parametrize(
+  "dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"]
+)
+def test_cutedsl_autograd_matches_triton(is_causal, D, dtype):
   torch.manual_seed(42)
   B, H, N = 1, 4, 1024
 
   def make():
     return (
-      torch.randn(
-        B, H, N, D, dtype=torch.bfloat16, device="cuda", requires_grad=True
-      ),
-      torch.randn(
-        B, H, N, D, dtype=torch.bfloat16, device="cuda", requires_grad=True
-      ),
-      torch.randn(
-        B, H, N, D, dtype=torch.bfloat16, device="cuda", requires_grad=True
-      ),
+      torch.randn(B, H, N, D, dtype=dtype, device="cuda", requires_grad=True),
+      torch.randn(B, H, N, D, dtype=dtype, device="cuda", requires_grad=True),
+      torch.randn(B, H, N, D, dtype=dtype, device="cuda", requires_grad=True),
     )
 
   torch.manual_seed(42)
@@ -117,12 +114,14 @@ def test_cutedsl_falls_back_for_small_head_dim(D):
   torch.testing.assert_close(out, ref, **_tol())
 
 
-def test_cutedsl_rejects_fp16_training():
+def test_cutedsl_accepts_fp16_training():
   q = torch.randn(
-    1, 8, 1024, 512, dtype=torch.float16, device="cuda", requires_grad=True
+    1, 8, 256, 384, dtype=torch.float16, device="cuda", requires_grad=True
   )
-  with pytest.raises(NotImplementedError, match="bfloat16"):
-    ffpa_attn_func(q, q, q, forward_backend="cutedsl")
+  out = ffpa_attn_func(q, q, q, forward_backend="cutedsl")
+  out.sum().backward()
+  assert out.dtype == torch.float16
+  assert q.grad is not None and torch.isfinite(q.grad).all()
 
 
 def test_cutedsl_raises_on_attn_mask():

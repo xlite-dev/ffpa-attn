@@ -174,7 +174,7 @@ class TritonBackend(Backend):
 
 @dataclass
 class CuTeDSLBackend(Backend):
-  """CuTeDSL SM90-specialized backend (Hopper only, dense 256<D<=512, bf16 training).
+  """CuTeDSL SM90-specialized backend (Hopper only, dense 256<D<=512, fp16/bf16 training).
 
   No additional configuration knobs — kernel parameters are hard-coded
   for the SplitD ``tile_m=64, tile_n=128`` pipeline.
