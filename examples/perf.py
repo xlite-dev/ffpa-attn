@@ -95,7 +95,7 @@ CUTEDSL_COMPAT_TASKS = frozenset({
 })
 CUTEDSL_DTYPES: tuple[torch.dtype, ...] = (torch.float16, torch.bfloat16)
 CUTEDSL_OUTPUT_STEM = "ffpa_speedup_cutedsl"
-CUTEDSL_SECTION_LABEL = "CuTeDSL (SM90 320<D<=512)"
+CUTEDSL_SECTION_LABEL = "CuTeDSL (SM90 320<=D<=512)"
 TFLOPS_FWD_SDPA_COLOR = "#b0b0b0"
 TFLOPS_FWD_FFPA_COLOR = "#2171b5"
 TFLOPS_BWD_SDPA_COLOR = "#f5a623"
