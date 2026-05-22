@@ -151,7 +151,7 @@ ffpa_attn_varlen_func(...)
 | `_bwd_preprocess.py` | Bwd preprocess kernel class `FFPAAttnBwdPreprocess`: computes `D_i = (O⊙dO).sum(-1)`. |
 | `_dkdv_d512_sm90.py` | D512 `dK`+`dV` kernel class `FFPAAttnBwdDKDVSm90SplitD`. |
 | `_dkdv_generic_sm90.py` | Generic dense `dK`+`dV` wrapper `FFPAAttnBwdDKDVSm90SplitDGeneric`: dispatches logical large-D tensors through the D512 physical tile. |
-| `_dkdv_d384_sm90.py` | D384 `dK`+`dV` kernel class `FFPAAttnBwdDKDVSm90SplitDD384`: sfull/tail D split with D384-aware stores. |
+| `_dkdv_d384_sm90.py` | D384 `dK`+`dV` kernel class `FFPAAttnBwdDKDVSm90SplitDD384`: full/tail D split with D384-aware stores. |
 | `_dq_d512_sm90.py` | D512 `dQ` kernel class `FFPAAttnBwdDQSm90SplitD`: dual-asymmetric MMA warpgroups. |
 | `_dq_generic_sm90.py` | Generic dense `dQ` wrapper `FFPAAttnBwdDQSm90SplitDGeneric`: dispatches logical large-D tensors through the D512 physical tile. |
 | `_dq_d384_sm90.py` | D384 `dQ` kernel class `FFPAAttnBwdDQSm90SplitDD384`: full/tail D split with D384-aware stores. |
@@ -175,6 +175,47 @@ Kernel class names are implementation details. File paths are the stable contrac
 | **GQA / MQA** | Supported; pass `enable_gqa=True`. |
 
 Any ineligible call surfaces `NotImplementedError` — no silent fallback.
+
+---
+
+## Blackwell / SM120 investigation note
+
+The current kernels are not made Blackwell-compatible by simply relaxing the
+Python-side `sm == 90` checks to `sm >= 90`. A May 2026 experiment on
+`AutoDL.VIP.6000_1.CU130` (`NVIDIA RTX PRO 6000 Blackwell Server Edition`,
+compute capability 12.0) showed that the D512 path reaches CuTeDSL JIT after
+the local gates are relaxed, but then fails inside CUTLASS DSL's Hopper
+warpgroup MMA implementation:
+
+```text
+cutlass.cute.nvgpu.common.OpError: expects arch to be Arch.sm_90a, but got Arch.sm_120a
+```
+
+Forcing `CUTE_DSL_ARCH=sm_90a` can compile the Hopper target, but it fails at
+runtime on Blackwell with `cudaErrorNoKernelImageForDevice`. Temporarily
+relaxing the installed CUTLASS DSL `warpgroup.MmaOp` arch check from
+`Arch.sm_90a` to `>= Arch.sm_90a` only moves the failure to NVVM module
+serialization for `sm_120` / `sm_120a`. In other words, the blocker is not just
+an over-strict guard in this package.
+
+Future Blackwell work should add a real SM100+/SM120 CuTeDSL path instead of
+trying to reuse the Hopper `warpgroup` path. CUTLASS provides a separate
+Blackwell stack based on `cutlass.cute.nvgpu.tcgen05` and
+`cutlass.utils.blackwell_helpers.make_trivial_tiled_mma`. That helper constructs
+`tcgen05.MmaF16BF16Op`, whose signature includes `CtaGroup` and uses Blackwell
+operand sources such as `tcgen05.OperandSource.SMEM` / `TMEM`. This differs from
+the current Hopper helper, which constructs `warpgroup.MmaF16BF16Op` and only
+accepts `Arch.sm_90a`.
+
+Useful references for a future port:
+
+- `cutlass/utils/blackwell_helpers.py` - Blackwell `make_trivial_tiled_mma` and
+  TMEM/TMA helper utilities.
+- `cutlass/cute/nvgpu/tcgen05/mma.py` - Blackwell MMA op definitions and arch
+  admissibility checks.
+- `examples/python/CuTeDSL/cute/blackwell/kernel/attention/mixed_input_fmha/`
+  in the CUTLASS checkout - attention examples using `tcgen05`, `CtaGroup`, and
+  TMEM-backed PV-style MMA.
 
 ---
 
