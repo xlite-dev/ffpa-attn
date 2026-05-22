@@ -8,8 +8,8 @@ Usage::
   CUDA_VISIBLE_DEVICES=0 python examples/perf.py --fwd-backend triton --bwd-backend triton --tune fast
   CUDA_VISIBLE_DEVICES=0 python examples/perf.py --fwd-backend cutedsl --bwd-backend cutedsl
 
-The cutedsl backend is SM90 (Hopper) only and supports dense 320<=D<=512 /
-fp16 or bf16 backward. Selecting
+The cutedsl backend supports SM80/SM89 via the Split-D path and SM90 via the
+Hopper path. Selecting
 ``cutedsl`` on either ``--fwd-backend`` or ``--bwd-backend`` auto-pairs the
 other side and restricts tasks to the cutedsl-compatible subset
 (self-attn, cross-attn, gqa, causal).
@@ -95,7 +95,7 @@ CUTEDSL_COMPAT_TASKS = frozenset({
 })
 CUTEDSL_DTYPES: tuple[torch.dtype, ...] = (torch.float16, torch.bfloat16)
 CUTEDSL_OUTPUT_STEM = "ffpa_speedup_cutedsl"
-CUTEDSL_SECTION_LABEL = "CuTeDSL (SM90 320<=D<=512)"
+CUTEDSL_SECTION_LABEL = "CuTeDSL"
 TFLOPS_FWD_SDPA_COLOR = "#b0b0b0"
 TFLOPS_FWD_FFPA_COLOR = "#2171b5"
 TFLOPS_BWD_SDPA_COLOR = "#f5a623"
@@ -428,21 +428,25 @@ def _display_device_name(device_name: str) -> str:
   return re.sub(r"H20Z", "H200", device_name, flags=re.IGNORECASE)
 
 
-def _require_sm90() -> None:
-  """Fail fast on non-Hopper devices when the cutedsl backend is selected."""
-  from ffpa_attn.cutedsl import cutedsl_forward_available
+def _require_cutedsl_device() -> int:
+  """Fail fast on devices unsupported by the CuTeDSL backend.
+
+  :return: Maximum CuTeDSL head dimension for the active device.
+  """
+  from ffpa_attn.cutedsl import cutedsl_forward_available, cutedsl_max_supported_head_dim
 
   if not torch.cuda.is_available():
     raise SystemExit(
-      "CUDA is required: the CuTeDSL backend only runs on SM90 (Hopper) GPUs."
+      "CUDA is required: the CuTeDSL backend only runs on SM80/SM89/SM90 GPUs."
     )
   device = torch.device("cuda", torch.cuda.current_device())
   if not cutedsl_forward_available(device):
     major, minor = torch.cuda.get_device_capability(device)
     raise SystemExit(
-      f"CuTeDSL backend requires SM90 (Hopper). Detected device "
+      f"CuTeDSL backend requires SM80/SM89/SM90. Detected device "
       f"'{torch.cuda.get_device_name(device)}' with compute capability {major}.{minor}."
     )
+  return cutedsl_max_supported_head_dim(device)
 
 
 def _resolve_cutedsl_backends(args: argparse.Namespace) -> bool:
@@ -1221,7 +1225,7 @@ def render_speedup_markdown(
   if cutedsl:
     lines.extend([
       "",
-      "Backend: CuTeDSL SM90 dense 320<D<=512 path (fp16/bf16 forward/backward). "
+      "Backend: CuTeDSL dense large-D path (fp16/bf16 forward/backward). "
       "TFLOPS reports the theoretical dominant attention GEMM throughput only; "
       "forward and backward are computed separately from the measured latency.",
     ])
@@ -1362,11 +1366,11 @@ def main() -> None:
       raise SystemExit(
         "--show-fallback is not compatible with the cutedsl backend."
       )
-    if args.D <= 256 or args.D > 512:
+    max_head_dim = _require_cutedsl_device()
+    if args.D <= 256 or args.D > max_head_dim or args.D % 64 != 0:
       raise SystemExit(
-        f"[cutedsl] --D must satisfy 320 < D <= 512; got {args.D}."
+        f"[cutedsl] --D must be divisible by 64 and satisfy 256 < D <= {max_head_dim}; got {args.D}."
       )
-    _require_sm90()
 
   device_name = FALLBACK_DEVICE_NAME if fallback else _device_name()
   tasks = _parse_tasks_arg(args.tasks)

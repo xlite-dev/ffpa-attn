@@ -1,10 +1,10 @@
-"""CuTeDSL FFPA backend: SM90 + D=512 specialised forward/backward.
+"""CuTeDSL FFPA backend with SM8x Split-D and SM90 specialised paths.
 
 Exposes the dense and varlen CuTeDSL entry shims used by
 :mod:`ffpa_attn.ffpa_attn_interface` and :mod:`ffpa_attn.functional`.
 
-The CuTeDSL kernels in :mod:`ffpa_attn.cutedsl._ffpa_fwd_sm90` and
-:mod:`ffpa_attn.cutedsl._ffpa_bwd_sm90` operate on the
+The CuTeDSL kernels in :mod:`ffpa_attn.cutedsl._ffpa_fwd_sm80`,
+:mod:`ffpa_attn.cutedsl._ffpa_fwd_sm90`, and their backward launchers operate on the
 ``[B, N, H, D]`` (or packed ``[T, H, D]``) layout. The SDPA-style
 ``[B, H, N, D]`` wrappers (:func:`_ffpa_attn_forward_cutedsl`,
 :func:`_ffpa_attn_backward_cutedsl`, :func:`_ffpa_attn_varlen_cutedsl`)
@@ -25,18 +25,22 @@ import torch
 
 from ._utils import (
   MIN_GENERIC_HEAD_DIM,
+  SM80_SUPPORTED_HEAD_DIM,
   SUPPORTED_HEAD_DIM,
   _decode_custom_op_window,
   _encode_optional_int_for_custom_op,
   _validate_max_seqlen_for_cu_seqlens,
   _validate_qkv_common,
+  _validate_sm80_head_dims,
   _validate_tensor,
   _validate_training_dtype,
   _validate_varlen_custom_bwd_features,
   _validate_varlen_custom_fwd_features,
   is_fake_mode,
 )
+from ._ffpa_fwd_sm80 import _ffpa_attn_forward_sm80
 from ._ffpa_fwd_sm90 import _ffpa_attn_forward_sm90
+from ._ffpa_bwd_sm80 import _ffpa_attn_backward_sm80
 from ._ffpa_bwd_sm90 import _ffpa_attn_backward_sm90
 
 __all__ = [
@@ -47,6 +51,7 @@ __all__ = [
   "_require_cutedsl_supported",
   "cutedsl_forward_available",
   "cutedsl_backward_available",
+  "cutedsl_max_supported_head_dim",
 ]
 
 # ---------------------------------------------------------------------------
@@ -73,9 +78,9 @@ def _check_supported_options(
 ) -> None:
   """Raise ``NotImplementedError`` for any non-default cutedsl-unsupported option.
 
-  The cutedsl SplitD D=512 kernels (``_ffpa_attn_varlen_impl``,
+  The cutedsl SplitD kernels (``_ffpa_attn_varlen_impl``,
   ``_ffpa_attn_forward_cutedsl``, ``_ffpa_attn_backward_cutedsl``) only
-  honor dense / varlen D=512 attention with optional causal masking.
+  honor dense / varlen attention with optional causal masking.
   Every other option commonly exposed by attention APIs (mask tensors,
   sliding window, softcap, score_mod, aux tensors, FlashAttention varlen
   extensions, dropout) has no kernel-side implementation and is rejected
@@ -112,7 +117,7 @@ def _check_supported_options(
     unsupported.append("alibi_slopes")
   if unsupported:
     raise NotImplementedError(
-      f"{source} only supports dense/varlen D=512 attention with optional "
+      f"{source} only supports dense/varlen attention with optional "
       f"causal masking; unsupported options: {', '.join(unsupported)}. "
       f"Use forward_backend='triton' when these options are required."
     )
@@ -121,8 +126,9 @@ def _check_supported_options(
 def cutedsl_forward_available(device: Optional[torch.device] = None) -> bool:
   """Return whether the CuTeDSL forward kernel can run on ``device``.
 
-  CuTeDSL requires a Hopper (SM 9.x) CUDA device. Other backend constraints
-  (head_dim, dtype, no mask/dropout) are enforced per-call by
+  CuTeDSL forward supports SM80/SM89 through the Ampere Split-D path and SM90
+  through the existing Hopper path. Other backend constraints (head_dim, dtype,
+  no mask/dropout) are enforced per-call by
   :func:`_require_cutedsl_supported`; this only checks the device-level
   prerequisite so callers can pre-select a backend before allocating tensors.
   """
@@ -133,16 +139,72 @@ def cutedsl_forward_available(device: Optional[torch.device] = None) -> bool:
   if device.type != "cuda":
     return False
   major, _ = torch.cuda.get_device_capability(device)
-  return major == 9
+  return major in (8, 9)
+
+
+def cutedsl_max_supported_head_dim(
+  device: Optional[torch.device] = None
+) -> int:
+  """Return the current CuTeDSL dense head-dim ceiling for ``device``.
+
+  SM90 keeps the existing specialised implementation and supports up to 512.
+  The SM80/SM89 Split-D implementation uses 64-wide D chunks and supports up
+  to 1024.
+  """
+  if not torch.cuda.is_available():
+    return SUPPORTED_HEAD_DIM
+  if device is None:
+    device = torch.device("cuda", torch.cuda.current_device())
+  if device.type != "cuda":
+    return SUPPORTED_HEAD_DIM
+  major, _ = torch.cuda.get_device_capability(device)
+  return SM80_SUPPORTED_HEAD_DIM if major == 8 else SUPPORTED_HEAD_DIM
 
 
 def cutedsl_backward_available(device: Optional[torch.device] = None) -> bool:
   """Whether the CuTeDSL backward kernel can run on ``device``.
 
-  Identical hardware requirement to forward; tensor dtype and shape constraints
-  are validated per-call.
+  SM80/SM89 currently uses a Split-D Triton adapter from inside the CuTeDSL
+  module while the native CuTeDSL backward kernel is under development. SM90
+  keeps the existing Hopper implementation.
   """
-  return cutedsl_forward_available(device)
+  if not torch.cuda.is_available():
+    return False
+  if device is None:
+    device = torch.device("cuda", torch.cuda.current_device())
+  if device.type != "cuda":
+    return False
+  major, _ = torch.cuda.get_device_capability(device)
+  return major in (8, 9)
+
+
+def _cutedsl_device_major(device: torch.device) -> int:
+  if device.type == "cuda" and torch.cuda.is_available():
+    major, _ = torch.cuda.get_device_capability(device)
+    return major
+  return 9
+
+
+def _forward_impl_for_device(device: torch.device):
+  major = _cutedsl_device_major(device)
+  if major == 8:
+    return _ffpa_attn_forward_sm80
+  if major == 9:
+    return _ffpa_attn_forward_sm90
+  raise NotImplementedError(
+    f"cutedsl forward supports SM80/SM89 and SM90; got compute capability {major}.x"
+  )
+
+
+def _backward_impl_for_device(device: torch.device):
+  major = _cutedsl_device_major(device)
+  if major == 8:
+    return _ffpa_attn_backward_sm80
+  if major == 9:
+    return _ffpa_attn_backward_sm90
+  raise NotImplementedError(
+    f"cutedsl backward supports SM80/SM89 and SM90; got compute capability {major}.x"
+  )
 
 
 def _require_cutedsl_supported(
@@ -154,7 +216,7 @@ def _require_cutedsl_supported(
 ) -> None:
   """Validate tensor-level constraints for the cutedsl backend.
 
-  Checks device, SM90, dense large head_dim, and q/k/v dtype. Kwarg-level
+  Checks device, supported CUDA architecture, dense large head_dim, and q/k/v dtype. Kwarg-level
   functional compatibility (``dropout_p``,
   ``attn_mask``, FlashAttention-extension kwargs) is **not** the
   responsibility of this function; that lives in
@@ -174,14 +236,19 @@ def _require_cutedsl_supported(
       "cutedsl backend requires a CUDA-capable build of PyTorch"
     )
   major, _ = torch.cuda.get_device_capability(q.device)
-  if major != 9:
+  if major not in (8, 9):
     raise NotImplementedError(
-      f"cutedsl backend only supports SM90 (Hopper); got compute capability {major}.x"
+      f"cutedsl backend only supports SM80/SM89 and SM90; got compute capability {major}.x"
     )
-  if not (MIN_GENERIC_HEAD_DIM < q.size(-1) <= SUPPORTED_HEAD_DIM):
+  max_head_dim = SM80_SUPPORTED_HEAD_DIM if major == 8 else SUPPORTED_HEAD_DIM
+  if not (MIN_GENERIC_HEAD_DIM < q.size(-1) <= max_head_dim):
     raise NotImplementedError(
       f"cutedsl backend only supports dense head_dim in "
-      f"({MIN_GENERIC_HEAD_DIM}, {SUPPORTED_HEAD_DIM}]; got {q.size(-1)}"
+      f"({MIN_GENERIC_HEAD_DIM}, {max_head_dim}]; got {q.size(-1)}"
+    )
+  if major == 8 and q.size(-1) % 64 != 0:
+    raise NotImplementedError(
+      f"SM80/SM89 cutedsl backend requires head_dim divisible by 64; got {q.size(-1)}"
     )
   if q.dtype not in (torch.float16, torch.bfloat16):
     raise TypeError(
@@ -214,7 +281,7 @@ def _ffpa_attn_forward_cutedsl(
   *,
   return_lse: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-  """CuTeDSL SplitD forward for D=512 on SM90 with SDPA-layout in/out.
+  """CuTeDSL Split-D forward with SDPA-layout in/out.
 
   Accepts ``[B, H, N, D]`` (SDPA) layout, transposes to the CuTeDSL-native
   ``[B, N, H, D]`` (FA) layout, calls the registered torch op
@@ -261,7 +328,7 @@ def _ffpa_attn_backward_cutedsl(
   softmax_scale: float,
   causal: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-  """CuTeDSL SplitD backward for D=512 on SM90 with SDPA-layout in/out.
+  """CuTeDSL backward with SDPA-layout in/out.
 
   Accepts all tensors in ``[B, H, N, D]`` (SDPA) layout, transposes to
   ``[B, N, H, D]`` (FA) for the registered torch op
@@ -383,9 +450,10 @@ def _ffpa_attn_varlen_cutedsl(
     )
 
   requires_grad = any(t.requires_grad for t in (q, k, v))
-  if q.size(-1) != SUPPORTED_HEAD_DIM:
+  max_head_dim = cutedsl_max_supported_head_dim(q.device)
+  if not (MIN_GENERIC_HEAD_DIM < q.size(-1) <= max_head_dim):
     raise NotImplementedError(
-      f"ffpa_attn_varlen_func cutedsl currently supports head_dim={SUPPORTED_HEAD_DIM}; "
+      f"ffpa_attn_varlen_func cutedsl supports head_dim in ({MIN_GENERIC_HEAD_DIM}, {max_head_dim}]; "
       f"got {q.size(-1)}"
     )
   _require_cutedsl_supported(q, k, v, requires_grad=requires_grad)
@@ -439,7 +507,7 @@ def _fwd_cutedsl_torch_op(
       batch, num_head, seqlen_q, dtype=torch.float32, device=q.device
     ) if need_lse else torch.empty(0, device=q.device)
   )
-  _ffpa_attn_forward_sm90(
+  _forward_impl_for_device(q.device)(
     q,
     k,
     v,
@@ -490,7 +558,7 @@ def _bwd_cutedsl_torch_op(
   dq = torch.empty_like(q)
   dk = torch.empty_like(k)
   dv = torch.empty_like(v)
-  _ffpa_attn_backward_sm90(
+  _backward_impl_for_device(q.device)(
     q,
     k,
     v,
@@ -574,7 +642,7 @@ def _varlen_fwd_custom(
   window_size_left_opt, window_size_right_opt = _decode_custom_op_window(
     window_size_left, window_size_right
   )
-  return _ffpa_attn_forward_sm90(
+  return _forward_impl_for_device(q.device)(
     q,
     k,
     v,
@@ -608,6 +676,9 @@ def _varlen_fwd_fake(
   softcap: float,
   pack_gqa: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+  validate_kwargs = {}
+  if _cutedsl_device_major(q.device) == 8:
+    validate_kwargs["validate_head_dims"] = _validate_sm80_head_dims
   (
     _batch_size,
     _seqlen_q,
@@ -618,7 +689,12 @@ def _varlen_fwd_fake(
     _head_dim,
     head_dim_v,
   ) = _validate_qkv_common(
-    q, k, v, cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k
+    q,
+    k,
+    v,
+    cu_seqlens_q=cu_seqlens_q,
+    cu_seqlens_k=cu_seqlens_k,
+    **validate_kwargs,
   )
   _validate_training_dtype(
     q, k, v, q.requires_grad or k.requires_grad or v.requires_grad
@@ -662,7 +738,7 @@ def _varlen_bwd_custom(
   window_size_left_opt, window_size_right_opt = _decode_custom_op_window(
     window_size_left, window_size_right
   )
-  return _ffpa_attn_backward_sm90(
+  return _backward_impl_for_device(q.device)(
     q,
     k,
     v,

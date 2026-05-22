@@ -1,7 +1,7 @@
-"""Shared utilities for FFPA cutedsl SplitD D=512 forward and backward paths.
+"""Shared utilities for FFPA cutedsl SplitD forward and backward paths.
 
 Constants, validation helpers, tensor utilities, and optional-int encoding used
-by both :mod:`_ffpa_fwd_sm90` and :mod:`_ffpa_bwd_sm90` (and also imported by
+by both SM90 and SM80/SM89 CuTeDSL paths (and also imported by
 :mod:`cutedsl.__init__` for the torch custom op entry points).
 """
 
@@ -19,6 +19,8 @@ from cutlass.base_dsl.arch import Arch
 
 MIN_GENERIC_HEAD_DIM = 256
 SUPPORTED_HEAD_DIM = 512
+SM80_SUPPORTED_HEAD_DIM = 1024
+SM80_SPLIT_D_CHUNK = 64
 FWD_TILE_M = 64
 FWD_TILE_N = 128
 BWD_TILE_M = 64
@@ -57,7 +59,7 @@ def _get_device_arch():
 
 
 def _validate_head_dims(head_dim: int, head_dim_v: int) -> None:
-  """Validate dense SplitD head dimension constraints."""
+  """Validate dense SM90 SplitD head dimension constraints."""
   if head_dim != head_dim_v or not (
     MIN_GENERIC_HEAD_DIM < head_dim <= SUPPORTED_HEAD_DIM
   ):
@@ -65,6 +67,19 @@ def _validate_head_dims(head_dim: int, head_dim_v: int) -> None:
       f"(head_dim, head_dim_v)=({head_dim}, {head_dim_v}) is not supported. "
       f"This dense SplitD interface requires q/k head_dim == v head_dim_v and "
       f"{MIN_GENERIC_HEAD_DIM} < head_dim <= {SUPPORTED_HEAD_DIM}."
+    )
+
+
+def _validate_sm80_head_dims(head_dim: int, head_dim_v: int) -> None:
+  """Validate dense SM80/SM89 Split-D head dimension constraints."""
+  if head_dim != head_dim_v or not (
+    MIN_GENERIC_HEAD_DIM < head_dim <= SM80_SUPPORTED_HEAD_DIM
+  ) or head_dim % SM80_SPLIT_D_CHUNK != 0:
+    raise ValueError(
+      f"(head_dim, head_dim_v)=({head_dim}, {head_dim_v}) is not supported. "
+      f"The SM80/SM89 Split-D interface requires q/k head_dim == v "
+      f"head_dim_v, {MIN_GENERIC_HEAD_DIM} < head_dim <= "
+      f"{SM80_SUPPORTED_HEAD_DIM}, and head_dim % {SM80_SPLIT_D_CHUNK} == 0."
     )
 
 
@@ -134,6 +149,22 @@ def _validate_sm90_arch() -> tuple[int, str]:
     raise RuntimeError(
       "This SplitD D=512 path emits Hopper SM90a instructions such as WGMMA, TMA, "
       f"and setmaxnreg. CuTeDSL selected {cute_arch}, but Arch.sm_90a or newer is required."
+    )
+  return arch, _cute_arch_cache_key(cute_arch)
+
+
+def _validate_sm80_arch() -> tuple[int, str]:
+  """Validate that the active CuTeDSL target is Ampere/Ada SM80-SM89."""
+  arch = _get_device_arch()
+  if arch // 10 != 8:
+    raise RuntimeError(
+      f"This SM80/SM89 Split-D interface requires compute capability 8.x, got {arch}."
+    )
+  cute_arch = BaseDSL._get_dsl().get_arch_enum()
+  if cute_arch < Arch.sm_80 or cute_arch >= Arch.sm_90a:
+    raise RuntimeError(
+      "This Split-D path emits Ampere/Ada warp-level MMA and cp.async code. "
+      f"CuTeDSL selected {cute_arch}, but an SM80-SM89 target is required."
     )
   return arch, _cute_arch_cache_key(cute_arch)
 
@@ -232,6 +263,7 @@ def _validate_qkv_common(
   v: torch.Tensor,
   cu_seqlens_q: Optional[torch.Tensor] = None,
   cu_seqlens_k: Optional[torch.Tensor] = None,
+  validate_head_dims: Callable[[int, int], None] = _validate_head_dims,
 ):
   q_rank = 3 if cu_seqlens_q is not None else 4
   kv_rank = 3 if cu_seqlens_k is not None else 4
@@ -295,7 +327,7 @@ def _validate_qkv_common(
     raise ValueError(
       f"num_head ({num_head}) must be divisible by num_head_kv ({num_head_kv})"
     )
-  _validate_head_dims(head_dim, head_dim_v)
+  validate_head_dims(head_dim, head_dim_v)
   return batch_size, seqlen_q, total_q, seqlen_k, num_head, num_head_kv, head_dim, head_dim_v
 
 

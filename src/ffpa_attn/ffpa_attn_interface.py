@@ -19,7 +19,7 @@ the dispatch goes through the same :class:`FFPAAttnMeta` normalization and
 handle the SDPA ``[B, H, N, D]`` ↔ FA ``[B, N, H, D]`` layout conversion
 internally. CuTeDSL compatibility constraints are enforced in two layers:
 
-- **Tensor-level** (device, SM90, head_dim, dtype):
+- **Tensor-level** (device architecture, head_dim, dtype):
   enforced by :func:`ffpa_attn.cutedsl._require_cutedsl_supported`,
   now called from :meth:`FFPAAttnMeta.normalize` so all callers see
   consistent validation before kernel dispatch.
@@ -43,10 +43,9 @@ internally. CuTeDSL compatibility constraints are enforced in two layers:
   message naming every offending option — no silent strip-to-default.
   Use ``forward_backend='triton'`` when these options are required.
 
-For the dense entry, the two pure hardware mismatches —
-``head_dim != 512`` and a non-SM90 device — fall back to SDPA with a
+For the dense entry, pure hardware/head-dim mismatches fall back to SDPA with a
 ``warning_once`` log on the ``FFPA.ffpa_attn.ffpa_attn_interface``
-logger, since neither is fixable at the call site. Every other
+logger when the backend was not explicitly forced. Every other
 constraint (dtype, ``dropout_p > 0``, explicit
 ``attn_mask``) continues to raise ``NotImplementedError`` / ``TypeError`` /
 ``ValueError``; there is no silent fallback for those.
@@ -56,8 +55,8 @@ which mirrors the FlashAttention varlen surface (``q, k, v, cu_seqlens_q,
 cu_seqlens_k, max_seqlen_q, max_seqlen_k, ...``) and delegates to
 :func:`ffpa_attn.cutedsl._ffpa_attn_varlen_cutedsl`, which
 dispatches to the CuTeDSL ``ffpa_attn::_varlen_fwd_cutedsl`` autograd-registered
-torch op. The varlen API is currently CuTeDSL-only (SM90, D=512); other
-shapes / backends raise ``NotImplementedError``.
+torch op. The varlen API is currently CuTeDSL-only on supported SM8x/SM90
+large-D shapes; other shapes / backends raise ``NotImplementedError``.
 """
 
 from __future__ import annotations
@@ -206,8 +205,8 @@ def ffpa_attn_varlen_func(
   and ``cu_seqlens_k`` (int32 CUDA tensors of length ``B+1`` starting at 0).
   When ``cu_seqlens_k is None`` it defaults to ``cu_seqlens_q`` (self-attention).
 
-  Only the CuTeDSL backend is supported: SM90 Hopper, ``D == 512``, fp16 /
-  bf16. Any unsupported case raises an
+  Only the CuTeDSL backend is supported: SM8x/SM90, large 64-aligned head dims,
+  fp16 / bf16. Any unsupported case raises an
   actionable error immediately — there is no silent fallback to dense /
   per-sequence paths. Callers needing other shapes / backends should
   unpack the batch and call :func:`ffpa_attn_func` per sequence.
@@ -242,7 +241,7 @@ def ffpa_attn_varlen_func(
   :returns: ``out`` of shape ``[T_q, H_q, D]`` if ``return_lse=False``,
       otherwise ``(out, lse)``.
 
-  :raises NotImplementedError: for ``D != 512``, non-SM90 hardware,
+  :raises NotImplementedError: for unsupported CuTeDSL head dims or hardware,
       ``dropout_p > 0``, or any non-default unsupported kwarg:
       ``window_size``, ``softcap``, ``sink``,
       ``attention_mask`` / ``attn_mask``, ``block_mask``, ``score_mod``,
