@@ -245,7 +245,7 @@ How to use different backends for your own scenario? Users can simply pass the B
 
 ```python
 >>> from ffpa_attn import ffpa_attn_func, CuTeDSLBackend
->>> # CuTeDSL backend for D=512 scenarios, fastest on H200!🎉
+>>> # CuTeDSL backend, D=512 scenario, fastest on H200!🎉
 >>> o = ffpa_attn_func(q, k, v, backend=CuTeDSLBackend())
 ```
 
