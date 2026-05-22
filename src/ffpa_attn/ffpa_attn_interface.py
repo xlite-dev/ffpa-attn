@@ -19,7 +19,7 @@ the dispatch goes through the same :class:`FFPAAttnMeta` normalization and
 handle the SDPA ``[B, H, N, D]`` ↔ FA ``[B, N, H, D]`` layout conversion
 internally. CuTeDSL compatibility constraints are enforced in two layers:
 
-- **Tensor-level** (device, SM90, head_dim, dtype, bf16 training):
+- **Tensor-level** (device, SM90, head_dim, dtype):
   enforced by :func:`ffpa_attn.cutedsl._require_cutedsl_supported`,
   now called from :meth:`FFPAAttnMeta.normalize` so all callers see
   consistent validation before kernel dispatch.
@@ -47,7 +47,7 @@ For the dense entry, the two pure hardware mismatches —
 ``head_dim != 512`` and a non-SM90 device — fall back to SDPA with a
 ``warning_once`` log on the ``FFPA.ffpa_attn.ffpa_attn_interface``
 logger, since neither is fixable at the call site. Every other
-constraint (dtype, fp16 training, ``dropout_p > 0``, explicit
+constraint (dtype, ``dropout_p > 0``, explicit
 ``attn_mask``) continues to raise ``NotImplementedError`` / ``TypeError`` /
 ``ValueError``; there is no silent fallback for those.
 
@@ -207,7 +207,7 @@ def ffpa_attn_varlen_func(
   When ``cu_seqlens_k is None`` it defaults to ``cu_seqlens_q`` (self-attention).
 
   Only the CuTeDSL backend is supported: SM90 Hopper, ``D == 512``, fp16 /
-  bf16 (bf16 required for training). Any unsupported case raises an
+  bf16. Any unsupported case raises an
   actionable error immediately — there is no silent fallback to dense /
   per-sequence paths. Callers needing other shapes / backends should
   unpack the batch and call :func:`ffpa_attn_func` per sequence.

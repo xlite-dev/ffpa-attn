@@ -24,6 +24,7 @@ from typing import Optional, Tuple, Callable
 import torch
 
 from ._utils import (
+  MIN_GENERIC_HEAD_DIM,
   SUPPORTED_HEAD_DIM,
   _decode_custom_op_window,
   _encode_optional_int_for_custom_op,
@@ -138,8 +139,8 @@ def cutedsl_forward_available(device: Optional[torch.device] = None) -> bool:
 def cutedsl_backward_available(device: Optional[torch.device] = None) -> bool:
   """Whether the CuTeDSL backward kernel can run on ``device``.
 
-  Identical hardware requirement to forward; the backward kernel additionally
-  requires bf16 inputs which is validated per-call.
+  Identical hardware requirement to forward; tensor dtype and shape constraints
+  are validated per-call.
   """
   return cutedsl_forward_available(device)
 
@@ -153,8 +154,8 @@ def _require_cutedsl_supported(
 ) -> None:
   """Validate tensor-level constraints for the cutedsl backend.
 
-  Checks device, SM90, head_dim==512, q/k/v dtype, and the bf16-only rule
-  for training. Kwarg-level functional compatibility (``dropout_p``,
+  Checks device, SM90, dense large head_dim, and q/k/v dtype. Kwarg-level
+  functional compatibility (``dropout_p``,
   ``attn_mask``, FlashAttention-extension kwargs) is **not** the
   responsibility of this function; that lives in
   :func:`_check_supported_options`, applied by the entry shims
@@ -177,21 +178,19 @@ def _require_cutedsl_supported(
     raise NotImplementedError(
       f"cutedsl backend only supports SM90 (Hopper); got compute capability {major}.x"
     )
-  if q.size(-1) != SUPPORTED_HEAD_DIM:
+  if not (MIN_GENERIC_HEAD_DIM < q.size(-1) <= SUPPORTED_HEAD_DIM):
     raise NotImplementedError(
-      f"cutedsl backend only supports head_dim={SUPPORTED_HEAD_DIM}; got {q.size(-1)}"
+      f"cutedsl backend only supports dense head_dim in "
+      f"({MIN_GENERIC_HEAD_DIM}, {SUPPORTED_HEAD_DIM}]; got {q.size(-1)}"
     )
   if q.dtype not in (torch.float16, torch.bfloat16):
     raise TypeError(
       f"cutedsl backend requires torch.float16 or torch.bfloat16, got {q.dtype}"
     )
-  if requires_grad and q.dtype != torch.bfloat16:
+  del requires_grad
+  if k.size(-1) != q.size(-1) or v.size(-1) != q.size(-1):
     raise NotImplementedError(
-      "cutedsl backward currently supports torch.bfloat16 only; use bf16 inputs for training"
-    )
-  if k.size(-1) != SUPPORTED_HEAD_DIM or v.size(-1) != SUPPORTED_HEAD_DIM:
-    raise NotImplementedError(
-      f"cutedsl backend requires k/v head_dim={SUPPORTED_HEAD_DIM}; "
+      f"cutedsl backend requires q/k/v to share head_dim={q.size(-1)}; "
       f"got k={k.size(-1)} v={v.size(-1)}"
     )
 
@@ -384,6 +383,11 @@ def _ffpa_attn_varlen_cutedsl(
     )
 
   requires_grad = any(t.requires_grad for t in (q, k, v))
+  if q.size(-1) != SUPPORTED_HEAD_DIM:
+    raise NotImplementedError(
+      f"ffpa_attn_varlen_func cutedsl currently supports head_dim={SUPPORTED_HEAD_DIM}; "
+      f"got {q.size(-1)}"
+    )
   _require_cutedsl_supported(q, k, v, requires_grad=requires_grad)
 
   # _ffpa_attn_varlen_impl is defined below in this module.
@@ -715,10 +719,6 @@ def _varlen_bwd_fake(
   _validate_max_seqlen_for_cu_seqlens(
     cu_seqlens_k, "cu_seqlens_k", max_seqlen_k, "max_seqlen_k"
   )
-  if q.dtype == torch.float16:
-    raise NotImplementedError(
-      "SplitD backward currently supports bfloat16 only; the fp16 dQ path has a known launch failure."
-    )
   _validate_varlen_custom_bwd_features(
     causal, window_size_left, window_size_right, softcap
   )
@@ -855,10 +855,10 @@ def _ffpa_attn_varlen_impl(
 ):
   """Varlen SplitD FFPA attention for D=512 on SM90.
 
-  q/k/v must be packed as (total_tokens, heads, 512). Training requires bf16
-  q/k/v, valid CUDA int32 cu_seqlens, and explicit max_seqlen_q/k whenever
-  the corresponding cu_seqlens tensor is provided. If return_lse=False, LSE is
-  still computed internally when needed for backward.
+  q/k/v must be packed as (total_tokens, heads, 512). Training supports fp16
+  and bf16 q/k/v, valid CUDA int32 cu_seqlens, and explicit max_seqlen_q/k
+  whenever the corresponding cu_seqlens tensor is provided. If return_lse=False,
+  LSE is still computed internally when needed for backward.
   """
   (
     cu_seqlens_q,

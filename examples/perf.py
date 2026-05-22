@@ -8,7 +8,8 @@ Usage::
   CUDA_VISIBLE_DEVICES=0 python examples/perf.py --fwd-backend triton --bwd-backend triton --tune fast
   CUDA_VISIBLE_DEVICES=0 python examples/perf.py --fwd-backend cutedsl --bwd-backend cutedsl
 
-The cutedsl backend is SM90 (Hopper) only and locks D=512 / bf16. Selecting
+The cutedsl backend is SM90 (Hopper) only and supports dense 320<=D<=512 /
+fp16 or bf16 backward. Selecting
 ``cutedsl`` on either ``--fwd-backend`` or ``--bwd-backend`` auto-pairs the
 other side and restricts tasks to the cutedsl-compatible subset
 (self-attn, cross-attn, gqa, causal).
@@ -93,9 +94,8 @@ CUTEDSL_COMPAT_TASKS = frozenset({
   "self-attn", "cross-attn", "gqa", "causal", "non-aligned"
 })
 CUTEDSL_DTYPES: tuple[torch.dtype, ...] = (torch.float16, torch.bfloat16)
-CUTEDSL_HEAD_DIM = 512
 CUTEDSL_OUTPUT_STEM = "ffpa_speedup_cutedsl"
-CUTEDSL_SECTION_LABEL = "CuTeDSL (SM90 D=512)"
+CUTEDSL_SECTION_LABEL = "CuTeDSL (SM90 320<=D<=512)"
 TFLOPS_FWD_SDPA_COLOR = "#b0b0b0"
 TFLOPS_FWD_FFPA_COLOR = "#2171b5"
 TFLOPS_BWD_SDPA_COLOR = "#f5a623"
@@ -1221,7 +1221,7 @@ def render_speedup_markdown(
   if cutedsl:
     lines.extend([
       "",
-      "Backend: CuTeDSL D=512 SM90 fast-path (fp16/bf16 forward, bf16-only backward). "
+      "Backend: CuTeDSL SM90 dense 320<D<=512 path (fp16/bf16 forward/backward). "
       "TFLOPS reports the theoretical dominant attention GEMM throughput only; "
       "forward and backward are computed separately from the measured latency.",
     ])
@@ -1323,19 +1323,6 @@ def _benchmark_rows(
     )
   if args.backward:
     bwd_dtypes = dtypes
-    if args.backward_backend == CUTEDSL_BACKEND and torch.float16 in bwd_dtypes:
-      filtered = tuple(d for d in bwd_dtypes if d != torch.float16)
-      if not filtered:
-        raise SystemExit(
-          "Selected --dtype fp16 with CuTeDSL backward, but CuTeDSL "
-          "backward only supports bf16. Use --dtype bf16/both or --no-bwd."
-        )
-      print(
-        "[cutedsl] Skipping fp16 backward: bf16-only (known fp16 dQ launch "
-        "failure in src/ffpa_attn/cutedsl/_interface.py).",
-        file=sys.stderr,
-      )
-      bwd_dtypes = filtered
     backward_rows = _decorate_rows(
       "backward",
       run_backward_examples(
@@ -1375,12 +1362,10 @@ def main() -> None:
       raise SystemExit(
         "--show-fallback is not compatible with the cutedsl backend."
       )
-    if args.D != CUTEDSL_HEAD_DIM:
-      print(
-        f"[cutedsl] Forcing --D from {args.D} to {CUTEDSL_HEAD_DIM} (cutedsl is D=512 only).",
-        file=sys.stderr,
+    if args.D <= 256 or args.D > 512:
+      raise SystemExit(
+        f"[cutedsl] --D must satisfy 320 < D <= 512; got {args.D}."
       )
-      args.D = CUTEDSL_HEAD_DIM
     _require_sm90()
 
   device_name = FALLBACK_DEVICE_NAME if fallback else _device_name()

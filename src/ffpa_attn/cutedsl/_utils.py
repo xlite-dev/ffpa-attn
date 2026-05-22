@@ -17,6 +17,7 @@ import cutlass
 from cutlass.base_dsl import BaseDSL
 from cutlass.base_dsl.arch import Arch
 
+MIN_GENERIC_HEAD_DIM = 256
 SUPPORTED_HEAD_DIM = 512
 FWD_TILE_M = 64
 FWD_TILE_N = 128
@@ -56,13 +57,14 @@ def _get_device_arch():
 
 
 def _validate_head_dims(head_dim: int, head_dim_v: int) -> None:
-  """Validate SplitD head dimension constraints: head_dim == head_dim_v == 512."""
-  if head_dim != SUPPORTED_HEAD_DIM or head_dim_v != SUPPORTED_HEAD_DIM:
+  """Validate dense SplitD head dimension constraints."""
+  if head_dim != head_dim_v or not (
+    MIN_GENERIC_HEAD_DIM < head_dim <= SUPPORTED_HEAD_DIM
+  ):
     raise ValueError(
       f"(head_dim, head_dim_v)=({head_dim}, {head_dim_v}) is not supported. "
-      f"This SplitD interface requires q/k head_dim == {SUPPORTED_HEAD_DIM} and "
-      f"v head_dim_v == {SUPPORTED_HEAD_DIM}, matching the kernel's fixed "
-      "8x64 D-slice layout."
+      f"This dense SplitD interface requires q/k head_dim == v head_dim_v and "
+      f"{MIN_GENERIC_HEAD_DIM} < head_dim <= {SUPPORTED_HEAD_DIM}."
     )
 
 
@@ -139,10 +141,16 @@ def _validate_sm90_arch() -> tuple[int, str]:
 def _validate_training_dtype(
   q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, requires_grad: bool
 ) -> None:
-  if requires_grad and q.dtype != torch.bfloat16:
-    raise NotImplementedError(
-      "SplitD training currently supports torch.bfloat16 only. "
-      f"Got q/k/v dtype {q.dtype}; use bfloat16 inputs or a different attention backend."
+  """Validate training dtype constraints shared by SplitD fwd/bwd paths.
+
+  The common q/k/v validator already enforces fp16 or bf16 and matching dtypes.
+  Training follows the same dtype support matrix; this helper remains as the
+  single call site for any future training-only dtype restriction.
+  """
+  del k, v, requires_grad
+  if q.dtype not in torch2cute_dtype_map:
+    raise TypeError(
+      "SplitD training inputs must be torch.float16 or torch.bfloat16"
     )
 
 

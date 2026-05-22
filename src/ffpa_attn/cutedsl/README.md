@@ -1,6 +1,6 @@
 # FFPA CuTeDSL Backend (`ffpa_attn.cutedsl`)
 
-SM90 (Hopper) + `head_dim == 512` specialized forward and backward kernels
+SM90 (Hopper) dense `320<D<=512` forward and backward kernels
 for FFPA, implemented in [CuTeDSL][cutedsl]. This package is an **internal
 backend**: end users should not import from `ffpa_attn.cutedsl` directly.
 The supported entry points live at the top of the `ffpa_attn` namespace:
@@ -22,8 +22,7 @@ paths (same `_ffpa_attn_forward_sm90` / `_ffpa_attn_backward_sm90`).
 
 ### 1. `ffpa_attn_func` — fixed-shape batched attention (opt-in)
 
-Tensors use SDPA layout `[B, Nh, N, D]`. Forward accepts fp16 or bf16;
-backward (`requires_grad=True`) requires bf16.
+Tensors use SDPA layout `[B, Nh, N, D]`. Forward and backward accept fp16 or bf16.
 
 ```python
 import torch
@@ -47,8 +46,8 @@ out = ffpa_attn_func(q, k, v, is_causal=True, forward_backend=fwd, backward_back
 
 The cutedsl path flows through the standard `FFPAAttnMeta` → `FFPAAttnFunc`
 dispatch.  `meta.fallback()` handles cutedsl hardware mismatches
-(head_dim≠512 or non-SM90) by falling back to native SDPA with a
-`warning_once`.  All other constraints (dtype, fp16 training, dropout>0,
+(head_dim outside `320<D<=512` or non-SM90) by falling back to native SDPA with a
+`warning_once`.  All other constraints (dtype, dropout>0,
 explicit attn_mask, FA-extension kwargs) raise `NotImplementedError`
 immediately — there is no silent fallback.
 
@@ -110,7 +109,7 @@ from ffpa_attn.cutedsl import cutedsl_forward_available, cutedsl_backward_availa
 
 dev = torch.device("cuda", 0)
 if cutedsl_forward_available(dev):
-    # SM 9.x Hopper — D=512 / dtype / no-mask / no-dropout are still
+    # SM 9.x Hopper — dense head_dim / dtype / no-mask / no-dropout are still
     # validated per-call inside _require_cutedsl_supported.
     ...
 ```
@@ -146,10 +145,16 @@ ffpa_attn_varlen_func(...)
 | `_utils.py` | Shared constants (`SUPPORTED_HEAD_DIM`, tile sizes, dtype map) and validation helpers. |
 | `_ffpa_fwd_sm90.py` | Forward entry: `_ffpa_attn_forward_sm90()` + JIT compile cache. |
 | `_ffpa_bwd_sm90.py` | Backward entry: `_ffpa_attn_backward_sm90()`, `_bwd_preprocess()`, compile caches. |
-| `_fwd_d512_sm90.py` | Forward kernel class `FFPAAttnFwdSm90SplitD`: full-D 3-warpgroup pipeline. |
+| `_fwd_d512_sm90.py` | Forward kernel class `FFPAAttnFwdSm90SplitD`: D512 full-D 3-warpgroup pipeline. |
+| `_fwd_generic_sm90.py` | Generic dense forward wrapper `FFPAAttnFwdSm90SplitDGeneric`: dispatches logical large-D tensors through the D512 physical tile. |
+| `_fwd_d384_sm90.py` | D384-aware forward wrapper `FFPAAttnFwdSm90SplitDD384Aware`: uses a D384 physical tile for `320<D<=384`. |
 | `_bwd_preprocess.py` | Bwd preprocess kernel class `FFPAAttnBwdPreprocess`: computes `D_i = (O⊙dO).sum(-1)`. |
-| `_dkdv_d512_sm90.py` | `dK`+`dV` kernel class `FFPAAttnBwdDKDVSm90SplitD`. |
-| `_dq_d512_sm90.py` | `dQ` kernel class `FFPAAttnBwdDQSm90SplitD`: dual-asymmetric MMA warpgroups. |
+| `_dkdv_d512_sm90.py` | D512 `dK`+`dV` kernel class `FFPAAttnBwdDKDVSm90SplitD`. |
+| `_dkdv_generic_sm90.py` | Generic dense `dK`+`dV` wrapper `FFPAAttnBwdDKDVSm90SplitDGeneric`: dispatches logical large-D tensors through the D512 physical tile. |
+| `_dkdv_d384_sm90.py` | D384 `dK`+`dV` kernel class `FFPAAttnBwdDKDVSm90SplitDD384`: sfull/tail D split with D384-aware stores. |
+| `_dq_d512_sm90.py` | D512 `dQ` kernel class `FFPAAttnBwdDQSm90SplitD`: dual-asymmetric MMA warpgroups. |
+| `_dq_generic_sm90.py` | Generic dense `dQ` wrapper `FFPAAttnBwdDQSm90SplitDGeneric`: dispatches logical large-D tensors through the D512 physical tile. |
+| `_dq_d384_sm90.py` | D384 `dQ` kernel class `FFPAAttnBwdDQSm90SplitDD384`: full/tail D split with D384-aware stores. |
 | `utils/` | Shared kernel helpers (tile scheduling, softmax, mask, pipeline, etc.). |
 
 Kernel class names are implementation details. File paths are the stable contract.
@@ -161,9 +166,9 @@ Kernel class names are implementation details. File paths are the stable contrac
 | Constraint | Detail |
 |---|---|
 | **GPU** | SM 9.x (Hopper). WGMMA, TMA, named barriers. |
-| **Head dim** | `D == 512` only. |
+| **Head dim** | Dense path supports `320<D<=512`; varlen remains `D == 512`. |
 | **Dtype (fwd)** | fp16 or bf16. |
-| **Dtype (bwd)** | bf16 required for training. |
+| **Dtype (bwd)** | fp16 or bf16. |
 | **attn_mask** | Not supported. |
 | **Dropout** | `dropout_p == 0.0`. |
 | **Varlen extras** | seqused_k, block_table, num_splits, window_size, alibi_slopes, softcap rejected. |
