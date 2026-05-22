@@ -151,7 +151,7 @@ ffpa_attn_varlen_func(...)
 | `_bwd_preprocess.py` | Bwd preprocess kernel class `FFPAAttnBwdPreprocess`: computes `D_i = (O⊙dO).sum(-1)`. |
 | `_dkdv_d512_sm90.py` | D512 `dK`+`dV` kernel class `FFPAAttnBwdDKDVSm90SplitD`. |
 | `_dkdv_generic_sm90.py` | Generic dense `dK`+`dV` wrapper `FFPAAttnBwdDKDVSm90SplitDGeneric`: dispatches logical large-D tensors through the D512 physical tile. |
-| `_dkdv_d384_sm90.py` | D384 `dK`+`dV` kernel class `FFPAAttnBwdDKDVSm90SplitDD384`: specializes the logical D384 case. |
+| `_dkdv_d384_sm90.py` | D384 `dK`+`dV` kernel class `FFPAAttnBwdDKDVSm90SplitDD384`: sfull/tail D split with D384-aware stores. |
 | `_dq_d512_sm90.py` | D512 `dQ` kernel class `FFPAAttnBwdDQSm90SplitD`: dual-asymmetric MMA warpgroups. |
 | `_dq_generic_sm90.py` | Generic dense `dQ` wrapper `FFPAAttnBwdDQSm90SplitDGeneric`: dispatches logical large-D tensors through the D512 physical tile. |
 | `_dq_d384_sm90.py` | D384 `dQ` kernel class `FFPAAttnBwdDQSm90SplitDD384`: full/tail D split with D384-aware stores. |
