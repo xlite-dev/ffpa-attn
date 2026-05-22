@@ -40,7 +40,7 @@ class FFPAAttnBwdDQSm80SplitDGeneric:
     tile_n: int = 64,
     num_stages_Q: int = 2,
     num_stages_dO: int = 2,
-    num_threads: int = 128,
+    num_threads: int = 256,
   ):
     self.dtype = dtype
     self.head_dim = head_dim
@@ -343,28 +343,32 @@ class FFPAAttnBwdDQSm80SplitDGeneric:
       acc_dP = cute.make_rmem_tensor(acc_shape_S, Float32)
       acc_S.fill(0.0)
       acc_dP.fill(0.0)
-      gQ0 = cute.local_tile(
-        mQ[batch_idx, None, q_head_idx, None],
-        (self.tile_m, self.d_chunk),
-        (block_m, 0),
-      )
-      gdO0 = cute.local_tile(
-        mdO[batch_idx, None, q_head_idx, None],
-        (self.tile_m, self.d_chunk),
-        (block_m, 0),
-      )
-      self.load_m_tile(
-        gmem_tiled_copy_QK.get_slice(tidx), gQ0, sQ[None, None, 0], block_m,
-        seqlen_q
-      )
-      self.load_m_tile(
-        gmem_tiled_copy_VdO.get_slice(tidx), gdO0, sdO[None, None, 0], block_m,
-        seqlen_q
-      )
-      cute.arch.cp_async_commit_group()
       for score_d_block in cutlass.range_constexpr(self.num_d_chunks):
         q_stage = score_d_block % self.num_stages_Q
         do_stage = score_d_block % self.num_stages_dO
+        if const_expr(
+          self.num_stages_Q == 1 or self.num_stages_dO == 1 or
+          score_d_block == 0
+        ):
+          gQ = cute.local_tile(
+            mQ[batch_idx, None, q_head_idx, None],
+            (self.tile_m, self.d_chunk),
+            (block_m, score_d_block),
+          )
+          gdO = cute.local_tile(
+            mdO[batch_idx, None, q_head_idx, None],
+            (self.tile_m, self.d_chunk),
+            (block_m, score_d_block),
+          )
+          self.load_m_tile(
+            gmem_tiled_copy_QK.get_slice(tidx), gQ, sQ[None, None, q_stage],
+            block_m, seqlen_q
+          )
+          self.load_m_tile(
+            gmem_tiled_copy_VdO.get_slice(tidx), gdO,
+            sdO[None, None, do_stage], block_m, seqlen_q
+          )
+          cute.arch.cp_async_commit_group()
         gK = cute.local_tile(
           mK[batch_idx, None, kv_head_idx, None],
           (self.tile_n, self.d_chunk),
@@ -388,27 +392,32 @@ class FFPAAttnBwdDQSm80SplitDGeneric:
         self.zero_m_tail(sdO[None, None, do_stage], block_m, seqlen_q, tidx)
         self.zero_n_tail(sK, n_block, seqlen_k, tidx)
         self.zero_n_tail(sV, n_block, seqlen_k, tidx)
-        if const_expr(score_d_block + 1 < self.num_d_chunks):
+        if const_expr(
+          (self.num_stages_Q > 1 or self.num_stages_dO > 1) and
+          score_d_block + 1 < self.num_d_chunks
+        ):
           next_q_stage = (score_d_block + 1) % self.num_stages_Q
           next_do_stage = (score_d_block + 1) % self.num_stages_dO
-          gQ_next = cute.local_tile(
-            mQ[batch_idx, None, q_head_idx, None],
-            (self.tile_m, self.d_chunk),
-            (block_m, score_d_block + 1),
-          )
-          gdO_next = cute.local_tile(
-            mdO[batch_idx, None, q_head_idx, None],
-            (self.tile_m, self.d_chunk),
-            (block_m, score_d_block + 1),
-          )
-          self.load_m_tile(
-            gmem_tiled_copy_QK.get_slice(tidx), gQ_next,
-            sQ[None, None, next_q_stage], block_m, seqlen_q
-          )
-          self.load_m_tile(
-            gmem_tiled_copy_VdO.get_slice(tidx), gdO_next,
-            sdO[None, None, next_do_stage], block_m, seqlen_q
-          )
+          if const_expr(self.num_stages_Q > 1):
+            gQ_next = cute.local_tile(
+              mQ[batch_idx, None, q_head_idx, None],
+              (self.tile_m, self.d_chunk),
+              (block_m, score_d_block + 1),
+            )
+            self.load_m_tile(
+              gmem_tiled_copy_QK.get_slice(tidx), gQ_next,
+              sQ[None, None, next_q_stage], block_m, seqlen_q
+            )
+          if const_expr(self.num_stages_dO > 1):
+            gdO_next = cute.local_tile(
+              mdO[batch_idx, None, q_head_idx, None],
+              (self.tile_m, self.d_chunk),
+              (block_m, score_d_block + 1),
+            )
+            self.load_m_tile(
+              gmem_tiled_copy_VdO.get_slice(tidx), gdO_next,
+              sdO[None, None, next_do_stage], block_m, seqlen_q
+            )
           cute.arch.cp_async_commit_group()
         sm80_utils.gemm(
           thr_mma_sdp, acc_S, tSrQ, tSrK, tSsQ[None, None, None, q_stage], tSsK,

@@ -30,10 +30,12 @@ from ._utils import (
 from .utils.cache_utils import get_jit_cache
 from .utils.cute_dsl_utils import to_cute_tensor
 
-SM80_BWD_TILE_M = BWD_TILE_M
-SM80_BWD_TILE_N = BWD_TILE_N
-SM80_BWD_NUM_STAGES_Q = 2
-SM80_BWD_NUM_STAGES_DO = 2
+SM80_BWD_DKDV_TILE_M = BWD_TILE_M
+SM80_BWD_DKDV_TILE_N = 128
+SM80_BWD_DQ_TILE_M = 128
+SM80_BWD_DQ_TILE_N = BWD_TILE_N
+SM80_BWD_NUM_STAGES_Q = 1
+SM80_BWD_NUM_STAGES_DO = 1
 
 
 def _make_fake_bwd_preprocess_tensors(dtype, varlen_q):
@@ -169,25 +171,28 @@ def _ffpa_attn_backward_sm80_dense(
   num_head_kv = k.shape[2]
   head_dim_v = v.shape[-1]
   qhead_per_kvhead = num_head // num_head_kv
-  tile_m = SM80_BWD_TILE_M
-  tile_n = SM80_BWD_TILE_N
+  dkdv_tile_m = SM80_BWD_DKDV_TILE_M
+  dkdv_tile_n = SM80_BWD_DKDV_TILE_N
+  dq_tile_m = SM80_BWD_DQ_TILE_M
+  dq_tile_n = SM80_BWD_DQ_TILE_N
+  pre_tile_m = dq_tile_m
   dtype = torch2cute_dtype_map[q.dtype]
   smem_capacity_arch = f"sm_{device_arch // 10}{device_arch % 10}"
   if not FFPAAttnBwdDKDVSm80SplitDGeneric.can_implement(
     dtype,
     head_dim,
     head_dim_v,
-    tile_m,
-    tile_n,
+    dkdv_tile_m,
+    dkdv_tile_n,
     SM80_BWD_NUM_STAGES_Q,
     SM80_BWD_NUM_STAGES_DO,
-    128,
+    256,
     causal,
     smem_capacity_arch=smem_capacity_arch,
   ):
     raise RuntimeError(
       "SM80/SM89 CuTeDSL dK/dV configuration exceeds kernel resource limits: "
-      f"head_dim={head_dim}, tile=({tile_m}, {tile_n}), "
+      f"head_dim={head_dim}, tile=({dkdv_tile_m}, {dkdv_tile_n}), "
       f"num_stages_Q={SM80_BWD_NUM_STAGES_Q}, "
       f"num_stages_dO={SM80_BWD_NUM_STAGES_DO}, arch={smem_capacity_arch}."
     )
@@ -195,21 +200,21 @@ def _ffpa_attn_backward_sm80_dense(
     dtype,
     head_dim,
     head_dim_v,
-    tile_m,
-    tile_n,
+    dq_tile_m,
+    dq_tile_n,
     SM80_BWD_NUM_STAGES_Q,
     SM80_BWD_NUM_STAGES_DO,
-    128,
+    256,
     causal,
     smem_capacity_arch=smem_capacity_arch,
   ):
     raise RuntimeError(
       "SM80/SM89 CuTeDSL dQ configuration exceeds kernel resource limits: "
-      f"head_dim={head_dim}, tile=({tile_m}, {tile_n}), "
+      f"head_dim={head_dim}, tile=({dq_tile_m}, {dq_tile_n}), "
       f"num_stages_Q={SM80_BWD_NUM_STAGES_Q}, "
       f"num_stages_dO={SM80_BWD_NUM_STAGES_DO}, arch={smem_capacity_arch}."
     )
-  seqlen_q_rounded = (seqlen_q + tile_m - 1) // tile_m * tile_m
+  seqlen_q_rounded = (seqlen_q + pre_tile_m - 1) // pre_tile_m * pre_tile_m
 
   dpsum = torch.empty(
     batch_size,
@@ -232,19 +237,21 @@ def _ffpa_attn_backward_sm80_dense(
     dtype,
     head_dim,
     head_dim_v,
-    tile_m,
+    pre_tile_m,
     device_arch,
     cute_arch_key,
   )
 
   bwd_key = (
-    "sm80_mma_split_v4_can_impl",
+    "sm80_mma_split_v6_asym_tile",
     dtype,
     head_dim,
     head_dim_v,
     causal,
-    tile_m,
-    tile_n,
+    dkdv_tile_m,
+    dkdv_tile_n,
+    dq_tile_m,
+    dq_tile_n,
     SM80_BWD_NUM_STAGES_Q,
     SM80_BWD_NUM_STAGES_DO,
     seqlen_q,
@@ -264,8 +271,8 @@ def _ffpa_attn_backward_sm80_dense(
       head_dim_v=head_dim_v,
       qhead_per_kvhead=qhead_per_kvhead,
       is_causal=causal,
-      tile_m=tile_m,
-      tile_n=tile_n,
+      tile_m=dkdv_tile_m,
+      tile_n=dkdv_tile_n,
       num_stages_Q=SM80_BWD_NUM_STAGES_Q,
       num_stages_dO=SM80_BWD_NUM_STAGES_DO,
     )
@@ -295,8 +302,8 @@ def _ffpa_attn_backward_sm80_dense(
       head_dim_v=head_dim_v,
       qhead_per_kvhead=qhead_per_kvhead,
       is_causal=causal,
-      tile_m=tile_m,
-      tile_n=tile_n,
+      tile_m=dq_tile_m,
+      tile_n=dq_tile_n,
       num_stages_Q=SM80_BWD_NUM_STAGES_Q,
       num_stages_dO=SM80_BWD_NUM_STAGES_DO,
     )
