@@ -82,9 +82,10 @@ def test_sm80_cutedsl_forward_zeroes_v_tail_smem_after_dirty_kernel():
   torch.testing.assert_close(out_cute, out_ref, **_tol(torch.bfloat16))
 
 
-def test_sm80_cutedsl_dense_autograd_matches_sdpa():
+@pytest.mark.parametrize("D", [320, 512])
+def test_sm80_cutedsl_dense_autograd_matches_sdpa(D):
   torch.manual_seed(3)
-  B, H, N, D = 1, 2, 64, 320
+  B, H, N = 1, 2, 64
   scale = 1.0 / math.sqrt(D)
 
   def make():

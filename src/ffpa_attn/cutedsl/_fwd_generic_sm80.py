@@ -20,6 +20,7 @@ from ._utils import SM80_SPLIT_D_CHUNK
 from .utils import ampere_helpers as sm80_utils
 from .utils.block_info import BlockInfo
 from .utils.cute_dsl_utils import assume_tensor_aligned
+from .utils.mask import AttentionMask
 from .utils.seqlen_info import SeqlenInfoQK
 from .utils.softmax import Softmax
 from .utils.tile_scheduler import (
@@ -116,6 +117,8 @@ class FFPAAttnFwdSm80SplitD:
       return False
     smem_usage_Q = tile_m * d_chunk * 2
     smem_usage_K = tile_n * d_chunk * num_stages * 2
+    # V stages improve overlap for small d-chunks, but they also duplicate the
+    # tile_n x d_chunk V buffer and can lower occupancy on large head dims.
     smem_usage_V = tile_n * d_chunk * num_stages * 2
     smem_usage = max(smem_usage_Q, smem_usage_V) + smem_usage_K
     smem_capacity = utils_basic.get_smem_capacity_in_bytes(smem_capacity_arch)
@@ -224,8 +227,8 @@ class FFPAAttnFwdSm80SplitD:
 
     @cute.struct
     class SharedStorage:
-      sQV: sQV_struct
-      sK: sK_struct
+      sQV: sQV_struct # type: ignore
+      sK: sK_struct # type: ignore
 
     return SharedStorage
 
@@ -449,6 +452,13 @@ class FFPAAttnFwdSm80SplitD:
     softmax.reset()
 
     if work_tile.is_valid_tile and n_block_max > 0:
+      # The source peels the first KV tile instead of spelling the loop as
+      # ``for n_block in range(n_block_max)``.  The d_group/v_group loops below
+      # first handle n_block=0, then the later n_iter loop repeats the same QK
+      # and PV work for n_block>=1.  Algorithmically this is still an outer
+      # n_block loop with inner d_group (QK over D chunks) and v_group (PV over
+      # V/O chunks) loops; the peel exists because online softmax needs
+      # is_first=True only for the first KV tile.
       n_block = Int32(0)
       acc_shape_S = thr_mma_qk.partition_shape_C((self.tile_m, self.tile_n))
       acc_S = cute.make_rmem_tensor(acc_shape_S, Float32)
@@ -510,7 +520,15 @@ class FFPAAttnFwdSm80SplitD:
           )
           cute.arch.cp_async_commit_group()
 
-      self.apply_mask(acc_S, thr_mma_qk, m_block, n_block, seqlen)
+      if const_expr(not self.is_causal):
+        if n_block + 1 == n_block_max:
+          self.apply_mask(
+            acc_S, thr_mma_qk, batch_idx, head_idx, m_block, n_block, seqlen
+          )
+      else:
+        self.apply_mask(
+          acc_S, thr_mma_qk, batch_idx, head_idx, m_block, n_block, seqlen
+        )
       row_scale = softmax.online_softmax(acc_S, is_first=True)
       rP = cute.make_fragment_like(acc_S, self.dtype)
       rP.store(acc_S.load().to(self.dtype))
@@ -628,7 +646,15 @@ class FFPAAttnFwdSm80SplitD:
             )
             cute.arch.cp_async_commit_group()
 
-        self.apply_mask(acc_S, thr_mma_qk, m_block, n_block, seqlen)
+        if const_expr(not self.is_causal):
+          if n_block + 1 == n_block_max:
+            self.apply_mask(
+              acc_S, thr_mma_qk, batch_idx, head_idx, m_block, n_block, seqlen
+            )
+        else:
+          self.apply_mask(
+            acc_S, thr_mma_qk, batch_idx, head_idx, m_block, n_block, seqlen
+          )
         row_scale = softmax.online_softmax(acc_S, is_first=False)
         rP = cute.make_fragment_like(acc_S, self.dtype)
         rP.store(acc_S.load().to(self.dtype))
@@ -704,22 +730,41 @@ class FFPAAttnFwdSm80SplitD:
     self,
     acc_S: cute.Tensor,
     thr_mma: cute.TiledMma,
+    batch_idx: Int32,
+    head_idx: Int32,
     m_block: Int32,
     n_block: Int32,
     seqlen: SeqlenInfoQK,
   ) -> None:
-    acc_S_mn = layout_utils.reshape_acc_to_mn(acc_S)
-    cS = cute.make_identity_tensor((self.tile_m, self.tile_n))
-    tScS_mn = layout_utils.reshape_acc_to_mn(thr_mma.partition_C(cS))
-    kv_offset = seqlen.seqlen_k - seqlen.seqlen_q
-    for row in cutlass.range(cute.size(tScS_mn.shape[0]), unroll_full=True):
-      for col in cutlass.range(cute.size(tScS_mn.shape[1]), unroll_full=True):
-        q_idx = m_block * self.tile_m + tScS_mn[row, col][0]
-        k_idx = n_block * self.tile_n + tScS_mn[row, col][1]
-        valid = (q_idx < seqlen.seqlen_q) and (k_idx < seqlen.seqlen_k)
-        if const_expr(self.is_causal):
-          valid = valid and (k_idx <= q_idx + kv_offset)
-        acc_S_mn[row, col] = acc_S_mn[row, col] if valid else -Float32.inf
+    mask = AttentionMask(
+      self.tile_m,
+      self.tile_n,
+      seqlen,
+      qhead_per_kvhead_packgqa=self.qhead_per_kvhead
+      if const_expr(self.pack_gqa) else 1,
+    )
+    if const_expr(not self.is_causal):
+      mask.apply_mask(
+        acc_S,
+        batch_idx,
+        head_idx,
+        m_block,
+        n_block,
+        thr_mma,
+        mask_seqlen=True,
+        mask_causal=False,
+      )
+    else:
+      mask.apply_mask(
+        acc_S,
+        batch_idx,
+        head_idx,
+        m_block,
+        n_block,
+        thr_mma,
+        mask_seqlen=True,
+        mask_causal=True,
+      )
 
   @cute.jit
   def load_Q(
@@ -782,13 +827,11 @@ class FFPAAttnFwdSm80SplitD:
   ) -> None:
     valid_rows = seqlen - block * self.tile_n
     if valid_rows < self.tile_n:
-      tail_elems = (self.tile_n - valid_rows) * self.tile_hdimv
-      for linear_idx in cutlass.range(
-        tidx, tail_elems, self.num_threads, unroll=1
+      tail_rows = self.tile_n - valid_rows
+      for row_offset in cutlass.range(
+        tidx, tail_rows, self.num_threads, unroll=1
       ):
-        row_offset = linear_idx // self.tile_hdimv
-        col = linear_idx - row_offset * self.tile_hdimv
-        sV[valid_rows + row_offset, col] = sV.element_type(0.0)
+        sV[valid_rows + row_offset, None].fill(0.0)
     cute.arch.barrier()
 
   @cute.jit

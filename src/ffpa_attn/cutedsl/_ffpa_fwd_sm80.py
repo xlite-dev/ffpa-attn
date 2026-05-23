@@ -35,7 +35,7 @@ from .utils.cache_utils import get_jit_cache
 from .utils import fa_logging
 from .utils.cute_dsl_utils import to_cute_tensor
 
-SM80_FWD_NUM_STAGES = 1
+SM80_FWD_NUM_STAGES = 2
 
 
 def _ffpa_attn_forward_sm80(
@@ -208,7 +208,7 @@ def _ffpa_attn_forward_sm80(
     return out, lse
 
   compile_key = (
-    "sm80_fwd_stage_kv_v8",
+    "sm80_fwd_stage_kv_d32_v1",
     dtype,
     head_dim,
     head_dim_v,

@@ -14,8 +14,7 @@ from ._bwd_preprocess import FFPAAttnBwdPreprocess
 from ._dkdv_generic_sm80 import FFPAAttnBwdDKDVSm80SplitDGeneric
 from ._dq_generic_sm80 import FFPAAttnBwdDQSm80SplitDGeneric
 from ._utils import (
-  BWD_TILE_M,
-  BWD_TILE_N,
+  SM80_BWD_SPLIT_D_CHUNK,
   is_fake_mode,
   maybe_contiguous,
   _call_with_tvm_ffi_current_stream,
@@ -30,12 +29,14 @@ from ._utils import (
 from .utils.cache_utils import get_jit_cache
 from .utils.cute_dsl_utils import to_cute_tensor
 
-SM80_BWD_DKDV_TILE_M = BWD_TILE_M
-SM80_BWD_DKDV_TILE_N = 128
-SM80_BWD_DQ_TILE_M = 128
-SM80_BWD_DQ_TILE_N = BWD_TILE_N
+SM80_BWD_DKDV_TILE_M = 64
+SM80_BWD_DKDV_TILE_N = 64
+SM80_BWD_DQ_TILE_M = 64
+SM80_BWD_DQ_TILE_N = 64
 SM80_BWD_NUM_STAGES_Q = 1
 SM80_BWD_NUM_STAGES_DO = 1
+SM80_BWD_DKDV_NUM_THREADS = 128
+SM80_BWD_DQ_NUM_THREADS = 128
 
 
 def _make_fake_bwd_preprocess_tensors(dtype, varlen_q):
@@ -186,7 +187,7 @@ def _ffpa_attn_backward_sm80_dense(
     dkdv_tile_n,
     SM80_BWD_NUM_STAGES_Q,
     SM80_BWD_NUM_STAGES_DO,
-    256,
+    SM80_BWD_DKDV_NUM_THREADS,
     causal,
     smem_capacity_arch=smem_capacity_arch,
   ):
@@ -204,7 +205,7 @@ def _ffpa_attn_backward_sm80_dense(
     dq_tile_n,
     SM80_BWD_NUM_STAGES_Q,
     SM80_BWD_NUM_STAGES_DO,
-    256,
+    SM80_BWD_DQ_NUM_THREADS,
     causal,
     smem_capacity_arch=smem_capacity_arch,
   ):
@@ -243,7 +244,7 @@ def _ffpa_attn_backward_sm80_dense(
   )
 
   bwd_key = (
-    "sm80_mma_split_v6_asym_tile",
+    "sm80_bwd_splitd_dkdv_dq_d64_q1_do1_v1",
     dtype,
     head_dim,
     head_dim_v,
@@ -254,6 +255,9 @@ def _ffpa_attn_backward_sm80_dense(
     dq_tile_n,
     SM80_BWD_NUM_STAGES_Q,
     SM80_BWD_NUM_STAGES_DO,
+    SM80_BWD_SPLIT_D_CHUNK,
+    SM80_BWD_DKDV_NUM_THREADS,
+    SM80_BWD_DQ_NUM_THREADS,
     seqlen_q,
     seqlen_k,
     qhead_per_kvhead,
@@ -275,6 +279,7 @@ def _ffpa_attn_backward_sm80_dense(
       tile_n=dkdv_tile_n,
       num_stages_Q=SM80_BWD_NUM_STAGES_Q,
       num_stages_dO=SM80_BWD_NUM_STAGES_DO,
+      num_threads=SM80_BWD_DKDV_NUM_THREADS,
     )
     _ffpa_attn_backward_sm80_dense.compile_cache_dkdv[bwd_key] = cute.compile(
       ffpa_dkdv,
@@ -306,6 +311,7 @@ def _ffpa_attn_backward_sm80_dense(
       tile_n=dq_tile_n,
       num_stages_Q=SM80_BWD_NUM_STAGES_Q,
       num_stages_dO=SM80_BWD_NUM_STAGES_DO,
+      num_threads=SM80_BWD_DQ_NUM_THREADS,
     )
     _ffpa_attn_backward_sm80_dense.compile_cache_dq[bwd_key] = cute.compile(
       ffpa_dq,
@@ -499,9 +505,15 @@ def _ffpa_attn_backward_sm80(
       lse_seg = lse[:, q_start:q_end].unsqueeze(0).contiguous()
       dlse_seg = dlse[:, q_start:q_end].unsqueeze(0).contiguous(
       ) if dlse is not None else None
-      dq_seg = torch.empty_like(q_seg)
-      dk_seg = torch.empty_like(k_seg)
-      dv_seg = torch.empty_like(v_seg)
+      q_len = q_end - q_start
+      k_len = k_end - k_start
+      q_len_rounded = (q_len + SM80_BWD_DQ_TILE_M - 1
+                       ) // SM80_BWD_DQ_TILE_M * SM80_BWD_DQ_TILE_M
+      k_len_rounded = (k_len + SM80_BWD_DKDV_TILE_N - 1
+                       ) // SM80_BWD_DKDV_TILE_N * SM80_BWD_DKDV_TILE_N
+      dq_seg = q_seg.new_empty((1, q_len_rounded, num_head, head_dim))
+      dk_seg = k_seg.new_empty((1, k_len_rounded, _num_head_kv, head_dim))
+      dv_seg = v_seg.new_empty((1, k_len_rounded, _num_head_kv, head_dim_v))
       _ffpa_attn_backward_sm80_dense(
         q_seg,
         k_seg,
@@ -518,9 +530,9 @@ def _ffpa_attn_backward_sm80(
         device_arch,
         cute_arch_key,
       )
-      dq[q_start:q_end].copy_(dq_seg.squeeze(0))
-      dk[k_start:k_end].copy_(dk_seg.squeeze(0))
-      dv[k_start:k_end].copy_(dv_seg.squeeze(0))
+      dq[q_start:q_end].copy_(dq_seg[:, :q_len].squeeze(0))
+      dk[k_start:k_end].copy_(dk_seg[:, :k_len].squeeze(0))
+      dv[k_start:k_end].copy_(dv_seg[:, :k_len].squeeze(0))
     return dq, dk, dv
 
   q_batch_seqlen_shape = (batch_size, seqlen_q)
