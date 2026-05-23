@@ -507,10 +507,12 @@ def _ffpa_attn_backward_sm80(
       ) if dlse is not None else None
       q_len = q_end - q_start
       k_len = k_end - k_start
-      q_len_rounded = (q_len + SM80_BWD_DQ_TILE_M - 1
-                       ) // SM80_BWD_DQ_TILE_M * SM80_BWD_DQ_TILE_M
-      k_len_rounded = (k_len + SM80_BWD_DKDV_TILE_N - 1
-                       ) // SM80_BWD_DKDV_TILE_N * SM80_BWD_DKDV_TILE_N
+      q_len_rounded = (
+        q_len + SM80_BWD_DQ_TILE_M - 1
+      ) // SM80_BWD_DQ_TILE_M * SM80_BWD_DQ_TILE_M
+      k_len_rounded = (
+        k_len + SM80_BWD_DKDV_TILE_N - 1
+      ) // SM80_BWD_DKDV_TILE_N * SM80_BWD_DKDV_TILE_N
       dq_seg = q_seg.new_empty((1, q_len_rounded, num_head, head_dim))
       dk_seg = k_seg.new_empty((1, k_len_rounded, _num_head_kv, head_dim))
       dv_seg = v_seg.new_empty((1, k_len_rounded, _num_head_kv, head_dim_v))

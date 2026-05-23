@@ -367,7 +367,8 @@ class FFPAAttnBwdDKDVSm80SplitDGeneric:
     tPsP = r2s_thr_copy_PdS.partition_D(sP)
     tdSsdS = r2s_thr_copy_PdS.partition_D(sdS)
     gmem_copy_atom_DKV = cute.make_copy_atom(
-      cute.nvgpu.CopyUniversalOp(), self.dtype,
+      cute.nvgpu.CopyUniversalOp(),
+      self.dtype,
       num_bits_per_copy=2 * self.dtype.width
     )
     acc2g_thr_copy_DKV = cute.make_tiled_copy_C(
@@ -387,8 +388,8 @@ class FFPAAttnBwdDKDVSm80SplitDGeneric:
           q_stage = score_d_block % self.num_stages_Q
           do_stage = score_d_block % self.num_stages_dO
           if const_expr(
-            self.num_stages_Q == 1 or self.num_stages_dO == 1 or
-            score_d_block == 0
+            self.num_stages_Q == 1 or self.num_stages_dO == 1
+            or score_d_block == 0
           ):
             # Mixed Q/dO stage counts are correct but lose the staged operand's
             # benefit here because this path reloads both operands together.
@@ -411,9 +412,7 @@ class FFPAAttnBwdDKDVSm80SplitDGeneric:
               gmem_tiled_copy_VdO.get_slice(tidx), gdO,
               sdO[None, None, do_stage], m_block, seqlen_q
             )
-            if const_expr(
-              self.num_stages_Q != 1 or self.num_stages_dO != 1
-            ):
+            if const_expr(self.num_stages_Q != 1 or self.num_stages_dO != 1):
               cute.arch.cp_async_commit_group()
           gK = cute.local_tile(
             mK[batch_idx, None, kv_head_idx, None],
@@ -439,10 +438,8 @@ class FFPAAttnBwdDKDVSm80SplitDGeneric:
           self.zero_n_tail(sK, block_n, seqlen_k, tidx)
           self.zero_n_tail(sV, block_n, seqlen_k, tidx)
           cute.arch.barrier()
-          if const_expr(
-            (self.num_stages_Q > 1 or self.num_stages_dO > 1) and
-            score_d_block + 1 < self.num_d_chunks
-          ):
+          if const_expr((self.num_stages_Q > 1 or self.num_stages_dO > 1)
+                        and score_d_block + 1 < self.num_d_chunks):
             next_q_stage = (score_d_block + 1) % self.num_stages_Q
             next_do_stage = (score_d_block + 1) % self.num_stages_dO
             if const_expr(self.num_stages_Q > 1):
@@ -536,10 +533,8 @@ class FFPAAttnBwdDKDVSm80SplitDGeneric:
           self.zero_m_tail(sQ[None, None, q_stage], m_block, seqlen_q, tidx)
           self.zero_m_tail(sdO[None, None, do_stage], m_block, seqlen_q, tidx)
           cute.arch.barrier()
-          if const_expr(
-            (self.num_stages_Q > 1 or self.num_stages_dO > 1) and
-            d_block + 1 < self.num_d_chunks
-          ):
+          if const_expr((self.num_stages_Q > 1 or self.num_stages_dO > 1)
+                        and d_block + 1 < self.num_d_chunks):
             next_q_stage = (d_block + 1) % self.num_stages_Q
             next_do_stage = (d_block + 1) % self.num_stages_dO
             if const_expr(self.num_stages_Q > 1):
@@ -623,13 +618,11 @@ class FFPAAttnBwdDKDVSm80SplitDGeneric:
     cS = cute.make_identity_tensor((self.tile_m, self.tile_n))
     tScS_mn = layout_utils.reshape_acc_to_mn(thr_mma.partition_C(cS))
     kv_offset = seqlen_k - seqlen_q
-    tile_in_bounds = ((m_block + 1) * self.tile_m <= seqlen_q
-                      ) and ((n_block + 1) * self.tile_n <= seqlen_k)
+    tile_in_bounds = ((m_block + 1) * self.tile_m
+                      <= seqlen_q) and ((n_block + 1) * self.tile_n <= seqlen_k)
     if const_expr(not self.is_causal):
       if tile_in_bounds:
-        for row in cutlass.range(
-          cute.size(tScS_mn.shape[0]), unroll_full=True
-        ):
+        for row in cutlass.range(cute.size(tScS_mn.shape[0]), unroll_full=True):
           q_idx = m_block * self.tile_m + tScS_mn[row, 0][0]
           p_row = cute.math.exp2(
             acc_S_mn[row, None].load() * softmax_scale_log2 -
@@ -638,14 +631,12 @@ class FFPAAttnBwdDKDVSm80SplitDGeneric:
           )
           acc_S_mn[row, None].store(p_row)
           acc_dP_mn[row, None].store(
-            p_row * (
-              acc_dP_mn[row, None].load() - mD[batch_idx, q_head_idx, q_idx]
-            ) * softmax_scale
+            p_row *
+            (acc_dP_mn[row, None].load() - mD[batch_idx, q_head_idx, q_idx]) *
+            softmax_scale
           )
       else:
-        for row in cutlass.range(
-          cute.size(tScS_mn.shape[0]), unroll_full=True
-        ):
+        for row in cutlass.range(cute.size(tScS_mn.shape[0]), unroll_full=True):
           for col in cutlass.range(
             cute.size(tScS_mn.shape[1]), unroll_full=True
           ):

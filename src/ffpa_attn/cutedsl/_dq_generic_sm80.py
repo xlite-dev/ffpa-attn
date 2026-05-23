@@ -116,6 +116,7 @@ class FFPAAttnBwdDQSm80SplitDGeneric:
     assert mQ_type == self.dtype
 
   def _get_shared_storage_cls(self):
+
     @cute.struct
     class SharedStorage:
       sQ: cute.struct.Align[cute.struct.MemRange[self.dtype,
@@ -321,12 +322,12 @@ class FFPAAttnBwdDQSm80SplitDGeneric:
     tdPsV = smem_thr_copy_V.partition_S(sV)
     tdQsKt = smem_thr_copy_Kt.partition_S(sKt)
     gmem_copy_atom_DQ = cute.make_copy_atom(
-      cute.nvgpu.CopyUniversalOp(), self.dtype,
+      cute.nvgpu.CopyUniversalOp(),
+      self.dtype,
       num_bits_per_copy=2 * self.dtype.width
     )
-    acc2g_thr_copy_DQ = cute.make_tiled_copy_C(
-      gmem_copy_atom_DQ, tiled_mma_dq
-    ).get_slice(tidx)
+    acc2g_thr_copy_DQ = cute.make_tiled_copy_C(gmem_copy_atom_DQ,
+                                               tiled_mma_dq).get_slice(tidx)
 
     for n_block in cutlass.range(num_n_blocks, unroll=1):
       start_n = n_block * self.tile_n
@@ -355,12 +356,12 @@ class FFPAAttnBwdDQSm80SplitDGeneric:
             (block_m, score_d_block),
           )
           self.load_m_tile(
-            gmem_tiled_copy_VdO.get_slice(tidx), gdO,
-            sdO[None, None, do_stage], block_m, seqlen_q
+            gmem_tiled_copy_VdO.get_slice(tidx), gdO, sdO[None, None, do_stage],
+            block_m, seqlen_q
           )
         if const_expr(
-          self.num_stages_Q == 1 or self.num_stages_dO == 1 or
-          score_d_block == 0
+          self.num_stages_Q == 1 or self.num_stages_dO == 1
+          or score_d_block == 0
         ):
           # Mixed Q/dO stage counts are correct but not fully pipelined here:
           # the commit condition is shared, so tune them as a pair unless this
@@ -391,10 +392,8 @@ class FFPAAttnBwdDQSm80SplitDGeneric:
         self.zero_n_tail(sK, n_block, seqlen_k, tidx)
         self.zero_n_tail(sV, n_block, seqlen_k, tidx)
         cute.arch.barrier()
-        if const_expr(
-          (self.num_stages_Q > 1 or self.num_stages_dO > 1) and
-          score_d_block + 1 < self.num_d_chunks
-        ):
+        if const_expr((self.num_stages_Q > 1 or self.num_stages_dO > 1)
+                      and score_d_block + 1 < self.num_d_chunks):
           next_q_stage = (score_d_block + 1) % self.num_stages_Q
           next_do_stage = (score_d_block + 1) % self.num_stages_dO
           if const_expr(self.num_stages_Q > 1):
@@ -504,13 +503,11 @@ class FFPAAttnBwdDQSm80SplitDGeneric:
     cS = cute.make_identity_tensor((self.tile_m, self.tile_n))
     tScS_mn = layout_utils.reshape_acc_to_mn(thr_mma.partition_C(cS))
     kv_offset = seqlen_k - seqlen_q
-    tile_in_bounds = ((m_block + 1) * self.tile_m <= seqlen_q
-                      ) and ((n_block + 1) * self.tile_n <= seqlen_k)
+    tile_in_bounds = ((m_block + 1) * self.tile_m
+                      <= seqlen_q) and ((n_block + 1) * self.tile_n <= seqlen_k)
     if const_expr(not self.is_causal):
       if tile_in_bounds:
-        for row in cutlass.range(
-          cute.size(tScS_mn.shape[0]), unroll_full=True
-        ):
+        for row in cutlass.range(cute.size(tScS_mn.shape[0]), unroll_full=True):
           q_idx = m_block * self.tile_m + tScS_mn[row, 0][0]
           p_row = cute.math.exp2(
             acc_S_mn[row, None].load() * softmax_scale_log2 -
@@ -518,14 +515,12 @@ class FFPAAttnBwdDQSm80SplitDGeneric:
             fastmath=True,
           )
           acc_dP_mn[row, None].store(
-            p_row * (
-              acc_dP_mn[row, None].load() - mD[batch_idx, q_head_idx, q_idx]
-            ) * softmax_scale
+            p_row *
+            (acc_dP_mn[row, None].load() - mD[batch_idx, q_head_idx, q_idx]) *
+            softmax_scale
           )
       else:
-        for row in cutlass.range(
-          cute.size(tScS_mn.shape[0]), unroll_full=True
-        ):
+        for row in cutlass.range(cute.size(tScS_mn.shape[0]), unroll_full=True):
           for col in cutlass.range(
             cute.size(tScS_mn.shape[1]), unroll_full=True
           ):

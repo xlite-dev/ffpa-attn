@@ -227,8 +227,8 @@ class FFPAAttnFwdSm80SplitD:
 
     @cute.struct
     class SharedStorage:
-      sQV: sQV_struct # type: ignore
-      sK: sK_struct # type: ignore
+      sQV: sQV_struct  # type: ignore
+      sK: sK_struct  # type: ignore
 
     return SharedStorage
 
