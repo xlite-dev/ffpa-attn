@@ -357,7 +357,7 @@ class FFPAAttnBwdDKDVSm80SplitDGeneric:
       gmem_copy_atom_DKV, tiled_mma_dkv
     ).get_slice(tidx)
 
-    for q_head_group in cutlass.range_constexpr(self.qhead_per_kvhead):
+    for q_head_group in cutlass.range(self.qhead_per_kvhead, unroll=1):
       q_head_idx = kv_head_idx * self.qhead_per_kvhead + q_head_group
       for m_block in cutlass.range(num_m_blocks, unroll=1):
         acc_shape_S = thr_mma_sdp.partition_shape_C((self.tile_m, self.tile_n))
