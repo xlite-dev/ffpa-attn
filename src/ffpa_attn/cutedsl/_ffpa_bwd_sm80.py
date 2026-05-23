@@ -244,7 +244,7 @@ def _ffpa_attn_backward_sm80_dense(
   )
 
   bwd_key = (
-    "sm80_bwd_splitd_dkdv_dqreuse_d64_q1_do1_v1",
+    "sm80_bwd_splitd_dkdvreuse_dqreuse_d64_q1_do1_v1",
     dtype,
     head_dim,
     head_dim_v,
