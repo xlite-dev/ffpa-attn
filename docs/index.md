@@ -232,10 +232,11 @@ FFPA supports multiple backends for the forward and backward pass, including: [`
 
 |Backend|Arch|Fwd|Bwd|Headdim|Autotune|Speedup|Recommend|
 |:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-|SDPA|Ampere+|✔|✔|All|❌|**1.0x**|Ampere+|
-|CUDA|Ampere+|✔|❌|320~1024|❌|**1.5x~3x**🎉|Ampere, Ada|
-|Triton|Ampere+|✔|✔|320~1024|✔|**1.5x~3x**🎉|Ampere+|
-|CuTeDSL|Hopper|✔|✔|320~512|❌|**3x~6x**🎉|Hopper|
+|SDPA|sm>=75|✔|✔|All|❌|**1.0x**|sm>=75|
+|CUDA|sm>=80|✔|❌|320~1024|❌|**1.5x~3x**🎉|sm80~89|
+|Triton|sm>=80|✔|✔|320~1024|✔|**1.5x~3x**🎉|sm>=80|
+|CuTeDSL|sm80~89|✔|✔|320~1024|❌|**1.5x~3x**🎉|sm80~89|
+|CuTeDSL|sm90|✔|✔|320~512|❌|**3x~6x**🎉|sm90|
 
 <i>Special thanks to [Butterfingrz](https://github.com/Butterfingrz) for contributing to the CuTeDSL backend! Awesome work!🎉</i>
 

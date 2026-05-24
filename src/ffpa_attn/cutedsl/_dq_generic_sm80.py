@@ -309,120 +309,122 @@ class FFPAAttnBwdDQSm80SplitDGeneric:
                                                tiled_mma_dq).get_slice(tidx)
 
     for n_block in cutlass.range(num_n_blocks, unroll=1):
-      acc_shape_S = thr_mma_sdp.partition_shape_C((self.tile_m, self.tile_n))
-      acc_S = cute.make_rmem_tensor(acc_shape_S, Float32)
-      acc_dP = cute.make_rmem_tensor(acc_shape_S, Float32)
-      acc_S.fill(0.0)
-      acc_dP.fill(0.0)
-      for score_d_block in cutlass.range_constexpr(self.num_d_chunks):
-        gQ = cute.local_tile(
-          mQ[batch_idx, None, q_head_idx, None],
-          (self.tile_m, self.d_chunk),
-          (block_m, score_d_block),
-        )
-        gK = cute.local_tile(
-          mK[batch_idx, None, kv_head_idx, None],
-          (self.tile_n, self.d_chunk),
-          (n_block, score_d_block),
-        )
-        self.load_m_tile(
-          gmem_tiled_copy_QK.get_slice(tidx), gQ, sQdO, block_m, seqlen_q
-        )
-        self.load_n_tile(
-          gmem_tiled_copy_QK.get_slice(tidx), gK, sKV, n_block, seqlen_k
-        )
-        cute.arch.cp_async_commit_group()
-        cute.arch.cp_async_wait_group(0)
-        cute.arch.barrier()
-        self.zero_m_tail(sQdO, block_m, seqlen_q, tidx)
-        self.zero_n_tail(sKV, n_block, seqlen_k, tidx)
-        cute.arch.barrier()
-        sm80_utils.gemm(
-          thr_mma_sdp, acc_S, tSrQ, tSrK, tSsQ, tSsK, smem_thr_copy_Q,
-          smem_thr_copy_K
-        )
-        cute.arch.barrier()
+      if const_expr(not self.is_causal
+                    ) or (seqlen_q == seqlen_k and n_block <= block_m):
+        acc_shape_S = thr_mma_sdp.partition_shape_C((self.tile_m, self.tile_n))
+        acc_S = cute.make_rmem_tensor(acc_shape_S, Float32)
+        acc_dP = cute.make_rmem_tensor(acc_shape_S, Float32)
+        acc_S.fill(0.0)
+        acc_dP.fill(0.0)
+        for score_d_block in cutlass.range_constexpr(self.num_d_chunks):
+          gQ = cute.local_tile(
+            mQ[batch_idx, None, q_head_idx, None],
+            (self.tile_m, self.d_chunk),
+            (block_m, score_d_block),
+          )
+          gK = cute.local_tile(
+            mK[batch_idx, None, kv_head_idx, None],
+            (self.tile_n, self.d_chunk),
+            (n_block, score_d_block),
+          )
+          self.load_m_tile(
+            gmem_tiled_copy_QK.get_slice(tidx), gQ, sQdO, block_m, seqlen_q
+          )
+          self.load_n_tile(
+            gmem_tiled_copy_QK.get_slice(tidx), gK, sKV, n_block, seqlen_k
+          )
+          cute.arch.cp_async_commit_group()
+          cute.arch.cp_async_wait_group(0)
+          cute.arch.barrier()
+          self.zero_m_tail(sQdO, block_m, seqlen_q, tidx)
+          self.zero_n_tail(sKV, n_block, seqlen_k, tidx)
+          cute.arch.barrier()
+          sm80_utils.gemm(
+            thr_mma_sdp, acc_S, tSrQ, tSrK, tSsQ, tSsK, smem_thr_copy_Q,
+            smem_thr_copy_K
+          )
+          cute.arch.barrier()
 
-        gdO = cute.local_tile(
-          mdO[batch_idx, None, q_head_idx, None],
-          (self.tile_m, self.d_chunk),
-          (block_m, score_d_block),
-        )
-        gV = cute.local_tile(
-          mV[batch_idx, None, kv_head_idx, None],
-          (self.tile_n, self.d_chunk),
-          (n_block, score_d_block),
-        )
-        self.load_m_tile(
-          gmem_tiled_copy_VdO.get_slice(tidx), gdO, sQdO, block_m, seqlen_q
-        )
-        self.load_n_tile(
-          gmem_tiled_copy_VdO.get_slice(tidx), gV, sKV, n_block, seqlen_k
-        )
-        cute.arch.cp_async_commit_group()
-        cute.arch.cp_async_wait_group(0)
-        cute.arch.barrier()
-        self.zero_m_tail(sQdO, block_m, seqlen_q, tidx)
-        self.zero_n_tail(sKV, n_block, seqlen_k, tidx)
-        cute.arch.barrier()
-        sm80_utils.gemm(
-          thr_mma_sdp, acc_dP, tdPrdO, tdPrV, tdPsdO, tdPsV, smem_thr_copy_dO,
-          smem_thr_copy_V
-        )
-        cute.arch.barrier()
+          gdO = cute.local_tile(
+            mdO[batch_idx, None, q_head_idx, None],
+            (self.tile_m, self.d_chunk),
+            (block_m, score_d_block),
+          )
+          gV = cute.local_tile(
+            mV[batch_idx, None, kv_head_idx, None],
+            (self.tile_n, self.d_chunk),
+            (n_block, score_d_block),
+          )
+          self.load_m_tile(
+            gmem_tiled_copy_VdO.get_slice(tidx), gdO, sQdO, block_m, seqlen_q
+          )
+          self.load_n_tile(
+            gmem_tiled_copy_VdO.get_slice(tidx), gV, sKV, n_block, seqlen_k
+          )
+          cute.arch.cp_async_commit_group()
+          cute.arch.cp_async_wait_group(0)
+          cute.arch.barrier()
+          self.zero_m_tail(sQdO, block_m, seqlen_q, tidx)
+          self.zero_n_tail(sKV, n_block, seqlen_k, tidx)
+          cute.arch.barrier()
+          sm80_utils.gemm(
+            thr_mma_sdp, acc_dP, tdPrdO, tdPrV, tdPsdO, tdPsV, smem_thr_copy_dO,
+            smem_thr_copy_V
+          )
+          cute.arch.barrier()
 
-      self.make_ds(
-        acc_S,
-        acc_dP,
-        thr_mma_sdp,
-        mLSElog2,
-        mD,
-        softmax_scale,
-        softmax_scale_log2,
-        batch_idx,
-        q_head_idx,
-        block_m,
-        n_block,
-        seqlen_q,
-        seqlen_k,
-      )
-      rdS = cute.make_fragment_like(acc_dP, self.dtype)
-      rdS.store(acc_dP.load().to(self.dtype))
-      tdQrdS = layout_utils.reshape_acc_to_frgA(rdS)
-
-      for d_block in cutlass.range_constexpr(self.num_d_chunks):
-        acc_dQ = cute.make_rmem_tensor(acc_shape_dQ, Float32)
-        acc_dQ.fill(0.0)
-        gK_out = cute.local_tile(
-          mK[batch_idx, None, kv_head_idx, None],
-          (self.tile_n, self.d_chunk),
-          (n_block, d_block),
-        )
-        self.load_n_tile(
-          gmem_tiled_copy_QK.get_slice(tidx), gK_out, sKV, n_block, seqlen_k
-        )
-        cute.arch.cp_async_commit_group()
-        cute.arch.cp_async_wait_group(0)
-        cute.arch.barrier()
-        self.zero_n_tail(sKV, n_block, seqlen_k, tidx)
-        cute.arch.barrier()
-        sm80_utils.gemm_rs(
-          thr_mma_dq, acc_dQ, tdQrdS, tdQrK, tdQsKt, smem_thr_copy_Kt
-        )
-        cute.arch.barrier()
-        self.store_dq_tile(
-          acc_dQ,
-          mdQ,
-          acc2g_thr_copy_DQ,
-          gmem_copy_atom_DQ,
+        self.make_ds(
+          acc_S,
+          acc_dP,
+          thr_mma_sdp,
+          mLSElog2,
+          mD,
+          softmax_scale,
+          softmax_scale_log2,
           batch_idx,
           q_head_idx,
           block_m,
-          d_block,
+          n_block,
           seqlen_q,
-          n_block != 0,
+          seqlen_k,
         )
-        cute.arch.barrier()
+        rdS = cute.make_fragment_like(acc_dP, self.dtype)
+        rdS.store(acc_dP.load().to(self.dtype))
+        tdQrdS = layout_utils.reshape_acc_to_frgA(rdS)
+
+        for d_block in cutlass.range_constexpr(self.num_d_chunks):
+          acc_dQ = cute.make_rmem_tensor(acc_shape_dQ, Float32)
+          acc_dQ.fill(0.0)
+          gK_out = cute.local_tile(
+            mK[batch_idx, None, kv_head_idx, None],
+            (self.tile_n, self.d_chunk),
+            (n_block, d_block),
+          )
+          self.load_n_tile(
+            gmem_tiled_copy_QK.get_slice(tidx), gK_out, sKV, n_block, seqlen_k
+          )
+          cute.arch.cp_async_commit_group()
+          cute.arch.cp_async_wait_group(0)
+          cute.arch.barrier()
+          self.zero_n_tail(sKV, n_block, seqlen_k, tidx)
+          cute.arch.barrier()
+          sm80_utils.gemm_rs(
+            thr_mma_dq, acc_dQ, tdQrdS, tdQrK, tdQsKt, smem_thr_copy_Kt
+          )
+          cute.arch.barrier()
+          self.store_dq_tile(
+            acc_dQ,
+            mdQ,
+            acc2g_thr_copy_DQ,
+            gmem_copy_atom_DQ,
+            batch_idx,
+            q_head_idx,
+            block_m,
+            d_block,
+            seqlen_q,
+            True,
+          )
+          cute.arch.barrier()
 
   @cute.jit
   def make_ds(

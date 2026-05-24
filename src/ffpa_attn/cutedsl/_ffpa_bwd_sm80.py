@@ -494,6 +494,8 @@ def _ffpa_attn_backward_sm80(
     # dense calls, padding each segment to a tile multiple and copying
     # only the valid rows back.  This avoids reworking the kernel itself
     # for a workload that is rare on Ampere/Ada inference silicon.
+    # TODO: Implement a native varlen path for SM80 if there is demand,
+    # potentially reusing some of the SM90 infrastructure.
     for batch_idx in range(cu_seqlens_q.numel() - 1):
       q_start = int(cu_seqlens_q[batch_idx].item())
       q_end = int(cu_seqlens_q[batch_idx + 1].item())
@@ -520,9 +522,9 @@ def _ffpa_attn_backward_sm80(
       k_len_rounded = (
         k_len + SM80_BWD_DKDV_TILE_N - 1
       ) // SM80_BWD_DKDV_TILE_N * SM80_BWD_DKDV_TILE_N
-      dq_seg = q_seg.new_empty((1, q_len_rounded, num_head, head_dim))
-      dk_seg = k_seg.new_empty((1, k_len_rounded, _num_head_kv, head_dim))
-      dv_seg = v_seg.new_empty((1, k_len_rounded, _num_head_kv, head_dim_v))
+      dq_seg = q_seg.new_zeros((1, q_len_rounded, num_head, head_dim))
+      dk_seg = k_seg.new_zeros((1, k_len_rounded, _num_head_kv, head_dim))
+      dv_seg = v_seg.new_zeros((1, k_len_rounded, _num_head_kv, head_dim_v))
       _ffpa_attn_backward_sm80_dense(
         q_seg,
         k_seg,
