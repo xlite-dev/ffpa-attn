@@ -12,8 +12,11 @@ license = {text = "Apache-2.0"}
 dependencies = [
     "packaging",
     "ninja",
-    "torch>=2.7.0",
     "numpy",
+    "torch>=2.11.0",
+    "quack-kernels>=0.4.1",
+    "nvidia-cutlass-dsl>=4.5.1",
+    "apache-tvm-ffi>=0.1.11,<0.2",
 ]
 
 [project.optional-dependencies]
@@ -35,12 +38,6 @@ tests = [
 
 bench = [
     "matplotlib",
-]
-
-cutedsl = [
-    "quack-kernels>=0.4.1",
-    "nvidia-cutlass-dsl>=4.5.1",
-    "apache-tvm-ffi>=0.1.11,<0.2",
 ]
 
 docs = [
@@ -65,7 +62,6 @@ all = [
     "ffpa-attn[dev]",
     "ffpa-attn[tests]",
     "ffpa-attn[bench]",
-    "ffpa-attn[cutedsl]",
 ]
 
 [project.urls]
