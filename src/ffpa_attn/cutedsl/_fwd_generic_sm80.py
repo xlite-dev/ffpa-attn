@@ -37,6 +37,63 @@ class FFPAAttnFwdSm80SplitD:
   reconstructs the full QK score tile by reducing over 64-wide Q/K chunks,
   then reuses the same softmax tile for every 64-wide V slice. This mirrors
   the Triton FFPA forward path: ``R_D[j] = alpha * R_D[j] + P @ V_j``.
+
+  .. todo:: Persistent-Q optimization (future work)
+
+     Current design re-loads Q from global memory for every key tile because
+     ``sQ`` and ``sV`` share the same ``sQV`` buffer; V load overwrites Q
+     between PV MMA phases.  For a 16-key-tile CTA this means 16 redundant
+     full-D Q loads (each 64×512×2B = 64 KB), wasting ~1 MB / CTA of
+     global→shared bandwidth and adding one ``cp_async_commit_group`` +
+     ``cp_async_wait_group(0)`` pair per d-chunk per key tile.
+
+     **Proposed change**: load Q once (full head_dim, not d-chunked) into a
+     dedicated persistent ``sQ_full`` buffer before the key-tile loop, and
+     slice it by d-chunk inside the QK MMA loop.  This requires:
+
+     1. **New SMEM layout** — replace ``sQV`` with independent ``sQ_full``
+        and ``sV`` buffers.  ``sQ_full`` is ``[tile_m, head_dim]`` (64×512×2B
+        = 64 KB), ``sV`` is ``[tile_n, d_chunk, num_stages]`` (128×32×2×2B
+        = 16 KB), ``sK`` unchanged (16 KB).  Total ~96 KB, fits within SM86
+        100 KB cap.  Occupancy drops to 1 CTA/SM on SM86 (2×96 > 100), but
+        the reduced global traffic should more than compensate.
+
+     2. **SharedStorage** — ``sQ_full``, ``sK``, ``sV`` as three independent
+        fields (no ``recast_ptr`` reuse).
+
+     3. **Q load hoisted** — single ``self.load_Q_full(gmem_tiled_copy_Q_new,
+        gQ_full, sQ_full, m_block, seqlen_q)`` before entering the key-tile
+        loop.  Need a new ``gmem_tiled_copy_Q`` with value layout
+        ``[1, head_dim // elem_per_128b]`` (16 elements per 128B copy for
+        fp16/bf16 with D=512).
+
+     4. **MMA fragment adaptation** — in the d-chunk loop, ``tSrQ`` is
+        currently ``partition_A(sQ)`` where ``sQ`` is ``[tile_m, d_chunk]``.
+        With persistent Q, slice the d-chunk from ``sQ_full``:
+
+        .. code-block:: python
+
+           sQ_d = cute.local_tile(sQ_full, (tile_m, tile_hdim), (0, d_group))
+           tSrQ_d = thr_mma_qk.make_fragment_A(thr_mma_qk.partition_A(sQ_d))
+
+        The ``tSsQ`` partition (smem→register copy) similarly needs to
+        reference ``sQ_d`` instead of the old ``sQ``.
+
+     5. **can_implement update** — bump ``smem_usage_Q`` from
+        ``tile_m * d_chunk * 2`` to ``tile_m * head_dim * 2`` and replace
+        ``max(smem_usage_Q, smem_usage_V)`` with ``smem_usage_Q +
+        smem_usage_V`` since the buffers are no longer aliased.
+
+     6. **Remove Q re-load from key-tile loop** — the ``load_Q`` calls
+        inside the ``d_group`` loops (both peel and ``n_iter`` paths) are
+        no-ops; the Q→register ldmatrix step still reads from ``sQ_d`` on
+        each d-chunk iteration.
+
+     Expected benefit: eliminates ~15 redundant 64 KB Q loads per CTA for
+     non-causal (saving ~1 GB global→shared traffic across 1024 CTAs);
+     reduces per-d-chunk barrier count by removing the Q load commit/wait
+     pair.  Most impactful for non-causal forward; marginal for causal
+     (where early m_blocks already process few key tiles).
   """
 
   def __init__(
