@@ -38,9 +38,9 @@ bench = [
 ]
 
 cutedsl = [
-    "quack-kernels>=0.3.10",
-    "nvidia-cutlass-dsl>=4.4.2",
-    "apache-tvm-ffi>=0.1.6,<0.2",
+    "quack-kernels>=0.4.1",
+    "nvidia-cutlass-dsl>=4.5.1",
+    "apache-tvm-ffi>=0.1.11,<0.2",
 ]
 
 docs = [
