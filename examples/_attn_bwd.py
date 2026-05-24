@@ -59,7 +59,7 @@ def _parse_args() -> argparse.Namespace:
     default="triton",
     help=(
       "Backward backend passed to ffpa_attn_func. 'cutedsl' auto-pairs the "
-      "forward to cutedsl and only runs SM90 + dense 320<D<=512 + fp16/bf16, with no "
+      "forward to cutedsl and only runs SM8x/SM90 large-D fp16/bf16, with no "
       "attn_mask/dropout/non-aligned cases (auto-skipped)."
     ),
   )
@@ -1038,7 +1038,7 @@ def run_backward_examples(
   )
   if backward_backend == "cutedsl":
     print(
-      "[CuTeDSL] backend constraints in effect: 320<=D<=512, no mask/dropout."
+      "[CuTeDSL] backend constraints in effect: SM8x/SM90 large-D, no mask/dropout."
     )
 
   mask_dropout_supported = backward_backend != "cutedsl"

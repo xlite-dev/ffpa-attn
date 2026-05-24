@@ -436,9 +436,13 @@ class FFPAAttnMeta:
       return True
 
     if self.forward_meta.name == "cutedsl":
-      from .cutedsl import cutedsl_forward_available
-      cutedsl_hw_unsupported = D <= 256 or D > 512 or not cutedsl_forward_available(
-        query.device
+      from .cutedsl import (
+        cutedsl_forward_available,
+        cutedsl_max_supported_head_dim,
+      )
+      cutedsl_hw_unsupported = (
+        D <= 256 or D > cutedsl_max_supported_head_dim(query.device)
+        or not cutedsl_forward_available(query.device)
       )
       return cutedsl_hw_unsupported
 

@@ -267,7 +267,7 @@ def warp_reduce(
   width: cutlass.Constexpr[int] = cute.arch.WARP_SIZE,
 ) -> cute.TensorSSA | cute.Numeric:
   if const_expr(isinstance(val, cute.TensorSSA)):
-    res = cute.make_fragment(val.shape, val.dtype)
+    res = cute.make_rmem_tensor(val.shape, val.dtype)
     res.store(val)
     for i in cutlass.range_constexpr(cute.size(val.shape)):
       res[i] = warp_reduce(res[i], op, width)
@@ -316,7 +316,7 @@ def fmax_reduce(
   arch: cutlass.Constexpr[int] = 80
 ) -> Float32:
   """Row-max reduction. SM90 only uses the arch < 100 path (4-accumulator loop)."""
-  res = cute.make_fragment(x.shape, Float32)
+  res = cute.make_rmem_tensor(x.shape, Float32)
   res.store(x)
   local_max = [res[0], res[1], res[2], res[3]]
   for i in cutlass.range_constexpr(4, cute.size(x.shape), 4):
@@ -371,7 +371,7 @@ def elem_pointer(
 @cute.jit
 def predicate_k(tAcA: cute.Tensor, limit: cutlass.Int32) -> cute.Tensor:
   # Only compute predicates for the "k" dimension. For the mn dimension, we will use "if"
-  tApA = cute.make_fragment(
+  tApA = cute.make_rmem_tensor(
     cute.make_layout(
       (
         cute.size(tAcA, mode=[0, 1]), cute.size(tAcA, mode=[1]),
@@ -575,7 +575,7 @@ def cvt_f16(src: cute.Tensor, dst_or_dtype):
   if const_expr(isinstance(dst_or_dtype, type)):
     # dtype variant: create new tensor and call the tensor variant
     dtype = dst_or_dtype
-    dst = cute.make_fragment(src.shape, dtype)
+    dst = cute.make_rmem_tensor(src.shape, dtype)
     cvt_f16(src, dst)
     return dst
   else:
@@ -603,7 +603,7 @@ def cvt_f16(src: cute.Tensor, dst_or_dtype):
 @cute.jit
 def scalar_to_ssa(a: cute.Numeric, dtype) -> cute.TensorSSA:
   """Convert a scalar to a cute TensorSSA of shape (1,) and given dtype"""
-  vec = cute.make_fragment(1, dtype)
+  vec = cute.make_rmem_tensor(1, dtype)
   vec[0] = a
   return vec.load()
 

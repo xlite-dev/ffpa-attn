@@ -59,7 +59,7 @@ def _parse_args() -> argparse.Namespace:
     choices=["cuda", "triton", "cutedsl"],
     default="triton",
     help=(
-      "Forward backend passed to ffpa_attn_func. 'cutedsl' requires SM90 + D=512 "
+      "Forward backend passed to ffpa_attn_func. 'cutedsl' requires SM80/SM89/SM90 + 64-aligned large D "
       "and does not support attn_mask/dropout/non-aligned cases (auto-skipped)."
     ),
   )
@@ -550,7 +550,7 @@ def run_forward_examples(
   )
   if forward_backend == "cutedsl":
     print(
-      "[CuTeDSL] backend constraints in effect: 320<=D<=512, no attn_mask/dropout."
+      "[CuTeDSL] backend constraints in effect: SM8x/SM90 large-D, no attn_mask/dropout."
     )
 
   for dtype in dtypes:
