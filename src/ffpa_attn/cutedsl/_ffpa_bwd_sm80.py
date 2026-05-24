@@ -244,7 +244,7 @@ def _ffpa_attn_backward_sm80_dense(
   )
 
   bwd_key = (
-    "sm80_bwd_splitd_dkdvreuse_dqreuse_d64_q1_do1_v1",
+    "sm80_bwd_generic",
     dtype,
     head_dim,
     head_dim_v,
@@ -487,6 +487,13 @@ def _ffpa_attn_backward_sm80(
       dq.zero_()
       dk.zero_()
       dv.zero_()
+    # The SM80 dK/dV and dQ kernels use a dense grid (grid dimensions
+    # derived from batch * seqlen) and a fixed tile loop inside the CTA,
+    # without the TileScheduler / cu_seqlens awareness that the SM90 path
+    # has.  For varlen inputs we therefore decompose into per-segment
+    # dense calls, padding each segment to a tile multiple and copying
+    # only the valid rows back.  This avoids reworking the kernel itself
+    # for a workload that is rare on Ampere/Ada inference silicon.
     for batch_idx in range(cu_seqlens_q.numel() - 1):
       q_start = int(cu_seqlens_q[batch_idx].item())
       q_end = int(cu_seqlens_q[batch_idx + 1].item())

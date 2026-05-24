@@ -82,6 +82,11 @@ def _ffpa_attn_forward_sm80(
   :param aux_tensors: Unsupported auxiliary tensors.
   :returns: ``(out, lse)`` matching the SM90 launcher contract.
   """
+  # This SM80 forward launcher handles varlen natively (no per-segment
+  # Python fallback) because the kernel itself is built on the same
+  # TileScheduler + SeqlenInfoQK abstraction as the SM90 forward path.
+  # The SM80 backward kernels (dK/dV, dQ) lack this infrastructure and
+  # therefore rely on per-segment dense calls in their launcher.
   q, k, v = [maybe_contiguous(t) for t in (q, k, v)]
   (
     batch_size,
@@ -208,7 +213,7 @@ def _ffpa_attn_forward_sm80(
     return out, lse
 
   compile_key = (
-    "sm80_fwd_stage_kv_d32_v1",
+    "sm80_fwd_generic",
     dtype,
     head_dim,
     head_dim_v,
