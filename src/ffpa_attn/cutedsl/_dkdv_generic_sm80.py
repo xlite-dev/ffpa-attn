@@ -93,10 +93,8 @@ class FFPAAttnBwdDKDVSm80SplitDGeneric:
     if num_stages_Q != 1 or num_stages_dO != 1:
       return False
     elem_bytes = 2
-    smem_usage = (
-      tile_m * d_chunk * elem_bytes + tile_n * d_chunk * elem_bytes +
-      tile_m * tile_n * elem_bytes + tile_m * tile_n * elem_bytes
-    )
+    # P/dS kept in registers via SdP swapAB + reshape_acc_to_frgA
+    smem_usage = (tile_m * d_chunk * elem_bytes + tile_n * d_chunk * elem_bytes)
     smem_capacity = utils_basic.get_smem_capacity_in_bytes(smem_capacity_arch)
     return smem_usage <= smem_capacity
 
@@ -122,10 +120,6 @@ class FFPAAttnBwdDKDVSm80SplitDGeneric:
     assert mQ_type == self.dtype
 
   def _get_shared_storage_cls(self):
-    sP_layout_atom = sm80_utils.get_smem_layout_atom(self.dtype, self.tile_n)
-    p_layout = cute.tile_to_shape(
-      sP_layout_atom, (self.tile_m, self.tile_n), (0, 1)
-    )
 
     @cute.struct
     class SharedStorage:
@@ -134,14 +128,8 @@ class FFPAAttnBwdDKDVSm80SplitDGeneric:
       sKV: cute.struct.Align[cute.struct.MemRange[self.dtype,
                                                   cute.cosize(self.sKV_layout)],
                              1024]
-      # TODO: sP/sdS may be eliminated after we handle the register-layout
-      # transform needed for the transposed MMA operands.
-      sP: cute.struct.Align[cute.struct.MemRange[self.dtype,
-                                                 cute.cosize(p_layout)], 128]
-      sdS: cute.struct.Align[cute.struct.MemRange[self.dtype,
-                                                  cute.cosize(p_layout)], 128]
 
-    return SharedStorage, p_layout
+    return SharedStorage
 
   def _setup_attributes(self) -> None:
     sQ_layout_atom = sm80_utils.get_smem_layout_atom(self.dtype, self.tile_hdim)
@@ -217,7 +205,7 @@ class FFPAAttnBwdDKDVSm80SplitDGeneric:
     ]
     self._setup_attributes()
     tiled_mma_sdp, tiled_mma_dkv = self._get_tiled_mma()
-    SharedStorage, p_layout = self._get_shared_storage_cls()
+    SharedStorage = self._get_shared_storage_cls()
     batch = mQ.shape[0]
     num_head_kv = mK.shape[2]
     seqlen_k = mK.shape[1]
@@ -236,7 +224,6 @@ class FFPAAttnBwdDKDVSm80SplitDGeneric:
       mdK,
       mdV,
       softmax_scale,
-      p_layout,
       self.sQdO_layout,
       self.sKV_layout,
       self.gmem_tiled_copy_QK,
@@ -263,7 +250,6 @@ class FFPAAttnBwdDKDVSm80SplitDGeneric:
     mdK: cute.Tensor,
     mdV: cute.Tensor,
     softmax_scale: Float32,
-    p_layout: cute.ComposedLayout,
     sQdO_layout: cute.ComposedLayout,
     sKV_layout: cute.ComposedLayout,
     gmem_tiled_copy_QK: cute.TiledCopy,
@@ -287,22 +273,18 @@ class FFPAAttnBwdDKDVSm80SplitDGeneric:
     storage = smem.allocate(SharedStorage)
     sQdO = storage.sQdO.get_tensor(sQdO_layout)
     sKV = storage.sKV.get_tensor(sKV_layout)
-    sP = storage.sP.get_tensor(p_layout)
-    sdS = storage.sdS.get_tensor(p_layout)
 
     sQdOt = layout_utils.transpose_view(sQdO)
-    sPt = layout_utils.transpose_view(sP)
-    sdSt = layout_utils.transpose_view(sdS)
 
+    # SdP uses swapAB so S^T / dP^T accumulators have per-warp rows aligned to
+    # tile_n, matching dKV's A-operand layout for in-register P / dS transfer.
     thr_mma_sdp = tiled_mma_sdp.get_slice(tidx)
     thr_mma_dkv = tiled_mma_dkv.get_slice(tidx)
-    tSrQ = utils.mma_make_fragment_A(sQdO, thr_mma_sdp)
-    tSrK = utils.mma_make_fragment_B(sKV, thr_mma_sdp)
-    tdPrdO = utils.mma_make_fragment_A(sQdO, thr_mma_sdp)
-    tdPrV = utils.mma_make_fragment_B(sKV, thr_mma_sdp)
-    tdVrP = utils.mma_make_fragment_A(sPt, thr_mma_dkv)
+    tSrQ = utils.mma_make_fragment_A(sQdO, thr_mma_sdp, swapAB=True)
+    tSrK = utils.mma_make_fragment_B(sKV, thr_mma_sdp, swapAB=True)
+    tdPrdO = utils.mma_make_fragment_A(sQdO, thr_mma_sdp, swapAB=True)
+    tdPrV = utils.mma_make_fragment_B(sKV, thr_mma_sdp, swapAB=True)
     tdVrdO = utils.mma_make_fragment_B(sQdOt, thr_mma_dkv)
-    tdKrdS = utils.mma_make_fragment_A(sdSt, thr_mma_dkv)
     tdKrQ = utils.mma_make_fragment_B(sQdOt, thr_mma_dkv)
     acc_shape_dK = thr_mma_dkv.partition_shape_C((self.tile_n, self.d_chunk))
 
@@ -312,20 +294,19 @@ class FFPAAttnBwdDKDVSm80SplitDGeneric:
     smem_copy_atom_t = cute.make_copy_atom(
       warp.LdMatrix8x8x16bOp(transpose=True, num_matrices=4), self.dtype
     )
-    smem_thr_copy_Q = utils.make_tiled_copy_A(smem_copy_atom,
-                                              tiled_mma_sdp).get_slice(tidx)
-    smem_thr_copy_K = utils.make_tiled_copy_B(smem_copy_atom,
-                                              tiled_mma_sdp).get_slice(tidx)
-    smem_thr_copy_dO = utils.make_tiled_copy_A(smem_copy_atom,
-                                               tiled_mma_sdp).get_slice(tidx)
-    smem_thr_copy_V = utils.make_tiled_copy_B(smem_copy_atom,
-                                              tiled_mma_sdp).get_slice(tidx)
-    smem_thr_copy_Pt = utils.make_tiled_copy_A(smem_copy_atom_t,
-                                               tiled_mma_dkv).get_slice(tidx)
-    smem_thr_copy_dOt = utils.make_tiled_copy_B(
-      smem_copy_atom_t, tiled_mma_dkv
+    smem_thr_copy_Q = utils.make_tiled_copy_A(
+      smem_copy_atom, tiled_mma_sdp, swapAB=True
     ).get_slice(tidx)
-    smem_thr_copy_dSt = utils.make_tiled_copy_A(
+    smem_thr_copy_K = utils.make_tiled_copy_B(
+      smem_copy_atom, tiled_mma_sdp, swapAB=True
+    ).get_slice(tidx)
+    smem_thr_copy_dO = utils.make_tiled_copy_A(
+      smem_copy_atom, tiled_mma_sdp, swapAB=True
+    ).get_slice(tidx)
+    smem_thr_copy_V = utils.make_tiled_copy_B(
+      smem_copy_atom, tiled_mma_sdp, swapAB=True
+    ).get_slice(tidx)
+    smem_thr_copy_dOt = utils.make_tiled_copy_B(
       smem_copy_atom_t, tiled_mma_dkv
     ).get_slice(tidx)
     smem_thr_copy_Qt = utils.make_tiled_copy_B(smem_copy_atom_t,
@@ -334,20 +315,8 @@ class FFPAAttnBwdDKDVSm80SplitDGeneric:
     tSsK = smem_thr_copy_K.partition_S(sKV)
     tdPsdO = smem_thr_copy_dO.partition_S(sQdO)
     tdPsV = smem_thr_copy_V.partition_S(sKV)
-    tdVsPt = smem_thr_copy_Pt.partition_S(sPt)
     tdVsdOt = smem_thr_copy_dOt.partition_S(sQdOt)
-    tdKsdSt = smem_thr_copy_dSt.partition_S(sdSt)
     tdKsQt = smem_thr_copy_Qt.partition_S(sQdOt)
-    r2s_thr_copy_PdS = cute.make_tiled_copy_C(
-      cute.make_copy_atom(
-        cute.nvgpu.CopyUniversalOp(),
-        self.dtype,
-        num_bits_per_copy=2 * self.dtype.width
-      ),
-      tiled_mma_sdp,
-    ).get_slice(tidx)
-    tPsP = r2s_thr_copy_PdS.partition_D(sP)
-    tdSsdS = r2s_thr_copy_PdS.partition_D(sdS)
     gmem_copy_atom_DKV = cute.make_copy_atom(
       cute.nvgpu.CopyUniversalOp(),
       self.dtype,
@@ -363,7 +332,7 @@ class FFPAAttnBwdDKDVSm80SplitDGeneric:
         if const_expr(not self.is_causal
                       ) or (seqlen_q == seqlen_k and m_block >= block_n):
           acc_shape_S = thr_mma_sdp.partition_shape_C(
-            (self.tile_m, self.tile_n)
+            (self.tile_n, self.tile_m)
           )
           acc_S = cute.make_rmem_tensor(acc_shape_S, Float32)
           acc_dP = cute.make_rmem_tensor(acc_shape_S, Float32)
@@ -393,8 +362,15 @@ class FFPAAttnBwdDKDVSm80SplitDGeneric:
             self.zero_n_tail(sKV, block_n, seqlen_k, tidx)
             cute.arch.barrier()
             sm80_utils.gemm(
-              thr_mma_sdp, acc_S, tSrQ, tSrK, tSsQ, tSsK, smem_thr_copy_Q,
-              smem_thr_copy_K
+              thr_mma_sdp,
+              acc_S,
+              tSrQ,
+              tSrK,
+              tSsQ,
+              tSsK,
+              smem_thr_copy_Q,
+              smem_thr_copy_K,
+              swap_AB=True
             )
             cute.arch.barrier()
 
@@ -421,8 +397,15 @@ class FFPAAttnBwdDKDVSm80SplitDGeneric:
             self.zero_n_tail(sKV, block_n, seqlen_k, tidx)
             cute.arch.barrier()
             sm80_utils.gemm(
-              thr_mma_sdp, acc_dP, tdPrdO, tdPrV, tdPsdO, tdPsV,
-              smem_thr_copy_dO, smem_thr_copy_V
+              thr_mma_sdp,
+              acc_dP,
+              tdPrdO,
+              tdPrV,
+              tdPsdO,
+              tdPsV,
+              smem_thr_copy_dO,
+              smem_thr_copy_V,
+              swap_AB=True
             )
             cute.arch.barrier()
 
@@ -445,9 +428,8 @@ class FFPAAttnBwdDKDVSm80SplitDGeneric:
           rdS = cute.make_fragment_like(acc_dP, self.dtype)
           rP.store(acc_S.load().to(self.dtype))
           rdS.store(acc_dP.load().to(self.dtype))
-          cute.copy(r2s_thr_copy_PdS, r2s_thr_copy_PdS.retile(rP), tPsP)
-          cute.copy(r2s_thr_copy_PdS, r2s_thr_copy_PdS.retile(rdS), tdSsdS)
-          cute.arch.barrier()
+          tdVrP = layout_utils.reshape_acc_to_frgA(rP)
+          tdKrdS = layout_utils.reshape_acc_to_frgA(rdS)
 
           for d_block in cutlass.range_constexpr(self.num_d_chunks):
             acc_dK = cute.make_rmem_tensor(acc_shape_dK, Float32)
@@ -469,14 +451,12 @@ class FFPAAttnBwdDKDVSm80SplitDGeneric:
             self.zero_m_tail(sQdO, m_block, seqlen_q, tidx)
             cute.arch.barrier()
 
-            sm80_utils.gemm(
+            sm80_utils.gemm_rs(
               thr_mma_dkv,
               acc_dV,
               tdVrP,
               tdVrdO,
-              tdVsPt,
               tdVsdOt,
-              smem_thr_copy_Pt,
               smem_thr_copy_dOt,
             )
             cute.arch.barrier()
@@ -495,14 +475,12 @@ class FFPAAttnBwdDKDVSm80SplitDGeneric:
             cute.arch.barrier()
             self.zero_m_tail(sQdO, m_block, seqlen_q, tidx)
             cute.arch.barrier()
-            sm80_utils.gemm(
+            sm80_utils.gemm_rs(
               thr_mma_dkv,
               acc_dK,
               tdKrdS,
               tdKrQ,
-              tdKsdSt,
               tdKsQt,
-              smem_thr_copy_dSt,
               smem_thr_copy_Qt,
             )
             cute.arch.barrier()
@@ -539,17 +517,21 @@ class FFPAAttnBwdDKDVSm80SplitDGeneric:
     seqlen_q: Int32,
     seqlen_k: Int32,
   ) -> None:
-    acc_S_mn = layout_utils.reshape_acc_to_mn(acc_S)
-    acc_dP_mn = layout_utils.reshape_acc_to_mn(acc_dP)
-    cS = cute.make_identity_tensor((self.tile_m, self.tile_n))
-    tScS_mn = layout_utils.reshape_acc_to_mn(thr_mma.partition_C(cS))
+    # acc_S / acc_dP were produced with SdP swapAB, so pass transpose=True to
+    # recover (M, N) row/col indexing matching the identity tile below.
+    acc_S_mn = layout_utils.reshape_acc_to_mn(acc_S, transpose=True)
+    acc_dP_mn = layout_utils.reshape_acc_to_mn(acc_dP, transpose=True)
+    cS = cute.make_identity_tensor((self.tile_n, self.tile_m))
+    tScS_mn = layout_utils.reshape_acc_to_mn(
+      thr_mma.partition_C(cS), transpose=True
+    )
     kv_offset = seqlen_k - seqlen_q
     tile_in_bounds = ((m_block + 1) * self.tile_m
                       <= seqlen_q) and ((n_block + 1) * self.tile_n <= seqlen_k)
     if const_expr(not self.is_causal):
       if tile_in_bounds:
         for row in cutlass.range(cute.size(tScS_mn.shape[0]), unroll_full=True):
-          q_idx = m_block * self.tile_m + tScS_mn[row, 0][0]
+          q_idx = m_block * self.tile_m + tScS_mn[row, 0][1]
           p_row = cute.math.exp2(
             acc_S_mn[row, None].load() * softmax_scale_log2 -
             mLSElog2[batch_idx, q_head_idx, q_idx],
@@ -566,8 +548,8 @@ class FFPAAttnBwdDKDVSm80SplitDGeneric:
           for col in cutlass.range(
             cute.size(tScS_mn.shape[1]), unroll_full=True
           ):
-            q_idx = m_block * self.tile_m + tScS_mn[row, col][0]
-            k_idx = n_block * self.tile_n + tScS_mn[row, col][1]
+            q_idx = m_block * self.tile_m + tScS_mn[row, col][1]
+            k_idx = n_block * self.tile_n + tScS_mn[row, col][0]
             valid = (q_idx < seqlen_q) and (k_idx < seqlen_k)
             if valid:
               p = cute.math.exp2(
@@ -585,8 +567,8 @@ class FFPAAttnBwdDKDVSm80SplitDGeneric:
     else:
       for row in cutlass.range(cute.size(tScS_mn.shape[0]), unroll_full=True):
         for col in cutlass.range(cute.size(tScS_mn.shape[1]), unroll_full=True):
-          q_idx = m_block * self.tile_m + tScS_mn[row, col][0]
-          k_idx = n_block * self.tile_n + tScS_mn[row, col][1]
+          q_idx = m_block * self.tile_m + tScS_mn[row, col][1]
+          k_idx = n_block * self.tile_n + tScS_mn[row, col][0]
           valid = (q_idx < seqlen_q) and (k_idx < seqlen_k)
           valid = valid and (k_idx <= q_idx + kv_offset)
           if valid:
