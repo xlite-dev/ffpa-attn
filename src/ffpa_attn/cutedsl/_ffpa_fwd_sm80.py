@@ -19,6 +19,7 @@ from ._utils import (
   SM80_FWD_TILE_M,
   SM80_FWD_TILE_N,
   SM80_FWD_NUM_STAGES,
+  SM80_FWD_NUM_THREADS,
   is_fake_mode,
   maybe_contiguous,
   _call_with_tvm_ffi_current_stream,
@@ -189,7 +190,7 @@ def _ffpa_attn_forward_sm80(
     SM80_FWD_TILE_M,
     SM80_FWD_TILE_N,
     SM80_FWD_NUM_STAGES,
-    128,
+    SM80_FWD_NUM_THREADS,
     causal,
     smem_capacity_arch=smem_capacity_arch,
   ):
