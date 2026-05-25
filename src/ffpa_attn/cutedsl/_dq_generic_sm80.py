@@ -345,6 +345,12 @@ class FFPAAttnBwdDQSm80SplitDGeneric:
     tdPsdO = [smem_thr_copy_dO.partition_S(t) for t in sdO_stage]
     tdPsV = [smem_thr_copy_V.partition_S(t) for t in sV_stage]
     tdQsKt = [smem_thr_copy_Kt.partition_S(t) for t in sKt_stage]
+    # reg->gmem direct STG: atom width is capped at the MMA C partition's
+    # per-thread contiguous extent. For SM80 m16n8k16 with fp16/bf16 that is
+    # only 2 elements (= 32 bit), so STG.32 here is the maximum achievable on
+    # this path. Upgrading to STG.128 would require a reg->smem(swizzled)->
+    # gmem epilogue (see ``_fwd_generic_sm80.store_O_and_lse`` for the
+    # reference pattern); tracked as a separate optimisation.
     gmem_copy_atom_DQ = cute.make_copy_atom(
       cute.nvgpu.CopyUniversalOp(),
       self.dtype,
