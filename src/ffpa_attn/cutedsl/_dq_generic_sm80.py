@@ -351,6 +351,13 @@ class FFPAAttnBwdDQSm80SplitDGeneric:
     # this path. Upgrading to STG.128 would require a reg->smem(swizzled)->
     # gmem epilogue (see ``_fwd_generic_sm80.store_O_and_lse`` for the
     # reference pattern); tracked as a separate optimisation.
+    # Alt approach: ``sync_store_o_r2g`` in ``csrc/cuffpa/prefill.cuh`` uses
+    # ``__shfl_sync(..., width=4)`` to gather the 4 lanes of an MMA quad's
+    # 32-bit fragments into ``lane%4==0`` and emit one ``st.global.v4``. The
+    # CuTeDSL equivalent (``cute.arch.shuffle_sync`` / ``utils.shuffle_sync``
+    # + 128-bit CopyUniversalOp atom guarded by a lane predicate) saves smem
+    # and one barrier vs the staged epilogue, but the expected speedup over
+    # an already smem-staged STG.128 is small.
     gmem_copy_atom_DQ = cute.make_copy_atom(
       cute.nvgpu.CopyUniversalOp(),
       self.dtype,
