@@ -66,19 +66,9 @@ static inline int select_decode_num_splits(int batch_nheads_mblocks,
 template <const int kHeadDim>
 static constexpr int getConfigMmaTileSeqLenQP() {
 #ifdef ENABLE_FFPA_PERSIST_KV_G2S
-#if defined(BUILD_FFPA_ATTN_MMA_L20)
-  constexpr int kMmaTileSeqLenQP = (kHeadDim <= kMaxDForSmallBlockTile) ? 4 : 8;
+  constexpr int kMmaTileSeqLenQP = (kHeadDim <= kMaxDForSmallBlockTile) ? 8 : 8;
 #else
   constexpr int kMmaTileSeqLenQP = (kHeadDim <= kMaxDForSmallBlockTile) ? 8 : 8;
-#endif
-#else  // if undef ENABLE_FFPA_PERSIST_KV_G2S
-  // O(1) SRAM complexity, may always use large tile for
-  // ffpa large d kernel. TODO: tune block size for L20/4090/3080 etc.
-#if defined(BUILD_FFPA_ATTN_MMA_L20)
-  constexpr int kMmaTileSeqLenQP = (kHeadDim <= kMaxDForSmallBlockTile) ? 4 : 8;
-#else
-  constexpr int kMmaTileSeqLenQP = (kHeadDim <= kMaxDForSmallBlockTile) ? 8 : 8;
-#endif
 #endif
   return kMmaTileSeqLenQP;
 }
@@ -86,19 +76,11 @@ static constexpr int getConfigMmaTileSeqLenQP() {
 template <const int kHeadDim>
 static constexpr int getConfigWarpTileSeqLenK() {
 #ifdef ENABLE_FFPA_PERSIST_KV_G2S
-#if defined(BUILD_FFPA_ATTN_MMA_L20)
-  constexpr int kValTileSeqLenK = (kHeadDim <= kMaxDForSmallBlockTile) ? 8 : 16;
+  constexpr int kValTileSeqLenK =
+      (kHeadDim <= kMaxDForSmallBlockTile) ? 16 : 16;
 #else
   constexpr int kValTileSeqLenK =
       (kHeadDim <= kMaxDForSmallBlockTile) ? 16 : 16;
-#endif
-#else  // if undef ENABLE_FFPA_PERSIST_KV_G2S
-#if defined(BUILD_FFPA_ATTN_MMA_L20)
-  constexpr int kValTileSeqLenK = (kHeadDim <= kMaxDForSmallBlockTile) ? 8 : 16;
-#else
-  constexpr int kValTileSeqLenK =
-      (kHeadDim <= kMaxDForSmallBlockTile) ? 16 : 16;
-#endif
 #endif
   return kValTileSeqLenK;
 }
