@@ -64,7 +64,7 @@ _SPLIT_D_CHUNK_CANDIDATES = (256, 128, 64)
 # Hopper / server Blackwell ~228KB). On sm_89/sm_86 and sm_120/sm_121 the
 # per-SM SMEM is ~100KB, where a wider chunk eats into occupancy and measured
 # slower than the conservative default in microbenchmarks (D=640 on L20).
-_WIDE_SPLIT_D_MIN_SMEM_BYTES = 160 * 1024
+_WIDE_SPLIT_D_MIN_SMEM_BYTES = 128 * 1024
 
 _VARLEN_CUSTOM_OP_NONE_INT = -(2**31)
 
