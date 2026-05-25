@@ -234,7 +234,8 @@ def _coerce_backend(backend: Backend | str, *, source: str) -> Backend:
       raise ValueError(
         f"ffpa_attn_func: {source} must be 'cuda', 'triton', 'cutedsl', or 'sdpa', got {backend!r}"
       )
-    return cls_name()
+    is_forward = source.startswith("forward")
+    return cls_name(forward=is_forward, backward=not is_forward)
   if not isinstance(backend, Backend):
     raise TypeError(
       f"ffpa_attn_func: {source} must be a str or Backend instance, got {type(backend).__name__}"
