@@ -28,6 +28,7 @@ from ._utils import (
   is_fake_mode,
   maybe_contiguous,
   _call_with_tvm_ffi_current_stream,
+  _pick_split_d_chunk,
   _resolve_causal_local_window,
   _validate_max_seqlen_for_cu_seqlens,
   _validate_qkv_common,
@@ -180,6 +181,34 @@ def _ffpa_attn_backward_sm80_dense(
   pre_tile_m = dq_tile_m
   dtype = torch2cute_dtype_map[q.dtype]
   smem_capacity_arch = f"sm_{device_arch // 10}{device_arch % 10}"
+  dkdv_d_chunk = _pick_split_d_chunk(
+    FFPAAttnBwdDKDVSm80SplitDGeneric.can_implement,
+    SM80_BWD_SPLIT_D_CHUNK,
+    dtype=dtype,
+    head_dim=head_dim,
+    head_dim_v=head_dim_v,
+    tile_m=dkdv_tile_m,
+    tile_n=dkdv_tile_n,
+    num_stages_Q=SM80_BWD_DKDV_NUM_STAGES_Q,
+    num_stages_dO=SM80_BWD_DKDV_NUM_STAGES_DO,
+    num_threads=SM80_BWD_DKDV_NUM_THREADS,
+    is_causal=causal,
+    smem_capacity_arch=smem_capacity_arch,
+  )
+  dq_d_chunk = _pick_split_d_chunk(
+    FFPAAttnBwdDQSm80SplitDGeneric.can_implement,
+    SM80_BWD_SPLIT_D_CHUNK,
+    dtype=dtype,
+    head_dim=head_dim,
+    head_dim_v=head_dim_v,
+    tile_m=dq_tile_m,
+    tile_n=dq_tile_n,
+    num_stages_Q=SM80_BWD_DQ_NUM_STAGES_Q,
+    num_stages_dO=SM80_BWD_DQ_NUM_STAGES_DO,
+    num_threads=SM80_BWD_DQ_NUM_THREADS,
+    is_causal=causal,
+    smem_capacity_arch=smem_capacity_arch,
+  )
   if not FFPAAttnBwdDKDVSm80SplitDGeneric.can_implement(
     dtype,
     head_dim,
@@ -191,6 +220,7 @@ def _ffpa_attn_backward_sm80_dense(
     SM80_BWD_DKDV_NUM_THREADS,
     causal,
     smem_capacity_arch=smem_capacity_arch,
+    d_chunk=dkdv_d_chunk,
   ):
     raise RuntimeError(
       "SM80/SM89 CuTeDSL dK/dV configuration exceeds kernel resource limits: "
@@ -209,6 +239,7 @@ def _ffpa_attn_backward_sm80_dense(
     SM80_BWD_DQ_NUM_THREADS,
     causal,
     smem_capacity_arch=smem_capacity_arch,
+    d_chunk=dq_d_chunk,
   ):
     raise RuntimeError(
       "SM80/SM89 CuTeDSL dQ configuration exceeds kernel resource limits: "
@@ -266,6 +297,8 @@ def _ffpa_attn_backward_sm80_dense(
     qhead_per_kvhead,
     device_arch,
     cute_arch_key,
+    dkdv_d_chunk,
+    dq_d_chunk,
   )
   if bwd_key not in _ffpa_attn_backward_sm80_dense.compile_cache_dkdv:
     q_t, k_t, v_t, do_t = [to_cute_tensor(t) for t in (q, k, v, dout)]
@@ -283,6 +316,7 @@ def _ffpa_attn_backward_sm80_dense(
       num_stages_Q=SM80_BWD_DKDV_NUM_STAGES_Q,
       num_stages_dO=SM80_BWD_DKDV_NUM_STAGES_DO,
       num_threads=SM80_BWD_DKDV_NUM_THREADS,
+      d_chunk=dkdv_d_chunk,
     )
     _ffpa_attn_backward_sm80_dense.compile_cache_dkdv[bwd_key] = cute.compile(
       ffpa_dkdv,
@@ -315,6 +349,7 @@ def _ffpa_attn_backward_sm80_dense(
       num_stages_Q=SM80_BWD_DQ_NUM_STAGES_Q,
       num_stages_dO=SM80_BWD_DQ_NUM_STAGES_DO,
       num_threads=SM80_BWD_DQ_NUM_THREADS,
+      d_chunk=dq_d_chunk,
     )
     _ffpa_attn_backward_sm80_dense.compile_cache_dq[bwd_key] = cute.compile(
       ffpa_dq,

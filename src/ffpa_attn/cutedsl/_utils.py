@@ -53,6 +53,12 @@ SM80_BWD_DQ_NUM_THREADS = 128
 
 SM80_BWD_SPLIT_D_CHUNK = 64
 
+# Wider Split-D candidates probed by ``_pick_split_d_chunk`` before falling back
+# to the per-kernel default. Larger chunks shorten the d-loop and amortise epilogue
+# cost but proportionally grow shared-memory usage; ``can_implement`` decides per
+# arch whether each candidate fits the SMEM_CAPACITY_MAP entry for that target.
+_SPLIT_D_CHUNK_CANDIDATES = (256, 128, 64)
+
 _VARLEN_CUSTOM_OP_NONE_INT = -(2**31)
 
 torch2cute_dtype_map = {
@@ -213,6 +219,46 @@ def _validate_sm80_arch() -> tuple[int, str]:
       f"CuTeDSL selected {cute_arch}, but Arch.sm_80 or newer is required."
     )
   return arch, _cute_arch_cache_key(cute_arch)
+
+
+def _pick_split_d_chunk(
+  can_implement_fn: Callable[..., bool],
+  default_chunk: int,
+  **can_implement_kwargs,
+) -> int:
+  """Pick the largest Split-D chunk that divides ``head_dim`` and fits in SMEM.
+
+  Candidates are probed from widest to narrowest (256 → 128 → 64) before
+  falling back to ``default_chunk``. The kernel's own ``can_implement`` is the
+  source of truth for whether a given chunk fits the target arch's SMEM
+  capacity (see :data:`cutlass.cutlass_dsl.SMEM_CAPACITY_MAP`), so this picker
+  works uniformly for SM80/SM89 (~100/164 KB), SM90/SM100/SM103 (~228 KB), and
+  SM120/SM121 (~100 KB) without per-arch hard-coding.
+
+  :param can_implement_fn: Bound ``can_implement`` of the target kernel class.
+  :param default_chunk: Conservative chunk used as the final fallback.
+  :param can_implement_kwargs: Forwarded to ``can_implement`` for each probe;
+      must include ``head_dim`` so chunk divisibility can be checked.
+  :returns: The selected chunk width.
+  :raises RuntimeError: If no candidate (including ``default_chunk``) fits.
+  """
+  head_dim = can_implement_kwargs["head_dim"]
+  seen = set()
+  ordered: list[int] = []
+  for cand in (*_SPLIT_D_CHUNK_CANDIDATES, default_chunk):
+    if cand in seen:
+      continue
+    seen.add(cand)
+    if head_dim % cand != 0:
+      continue
+    ordered.append(cand)
+  for cand in ordered:
+    if can_implement_fn(d_chunk=cand, **can_implement_kwargs):
+      return cand
+  raise RuntimeError(
+    f"No Split-D chunk in {ordered or list(seen)} fits the kernel resource "
+    f"limits for head_dim={head_dim}; default_chunk={default_chunk}."
+  )
 
 
 def _validate_training_dtype(

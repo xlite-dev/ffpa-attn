@@ -41,11 +41,12 @@ class FFPAAttnBwdDQSm80SplitDGeneric:
     num_stages_Q: int = 1,
     num_stages_dO: int = 1,
     num_threads: int = 128,
+    d_chunk: Optional[int] = None,
   ):
     self.dtype = dtype
     self.head_dim = head_dim
     self.head_dim_v = head_dim if head_dim_v is None else head_dim_v
-    self.d_chunk = SM80_BWD_SPLIT_D_CHUNK
+    self.d_chunk = SM80_BWD_SPLIT_D_CHUNK if d_chunk is None else d_chunk
     self.num_d_chunks = head_dim // self.d_chunk
     self.qhead_per_kvhead = qhead_per_kvhead
     self.is_causal = is_causal
@@ -68,12 +69,14 @@ class FFPAAttnBwdDQSm80SplitDGeneric:
     num_threads,
     is_causal,
     smem_capacity_arch: str = "sm_80",
+    d_chunk: Optional[int] = None,
   ) -> bool:
     """Check whether the SM80 Split-D dQ configuration fits resources."""
     del is_causal
     if head_dim_v is None:
       head_dim_v = head_dim
-    d_chunk = SM80_BWD_SPLIT_D_CHUNK
+    if d_chunk is None:
+      d_chunk = SM80_BWD_SPLIT_D_CHUNK
     if dtype not in [cutlass.Float16, cutlass.BFloat16]:
       return False
     if head_dim != head_dim_v:

@@ -20,9 +20,11 @@ from ._utils import (
   SM80_FWD_TILE_N,
   SM80_FWD_NUM_STAGES,
   SM80_FWD_NUM_THREADS,
+  SM80_FWD_SPLIT_D_CHUNK,
   is_fake_mode,
   maybe_contiguous,
   _call_with_tvm_ffi_current_stream,
+  _pick_split_d_chunk,
   _resolve_causal_local_window,
   _unsupported_training_features,
   _validate_max_seqlen_for_cu_seqlens,
@@ -183,6 +185,19 @@ def _ffpa_attn_forward_sm80(
   current_stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
   is_varlen = cu_seqlens_q is not None or cu_seqlens_k is not None
   smem_capacity_arch = f"sm_{device_arch // 10}{device_arch % 10}"
+  fwd_d_chunk = _pick_split_d_chunk(
+    FFPAAttnFwdSm80SplitD.can_implement,
+    SM80_FWD_SPLIT_D_CHUNK,
+    dtype=dtype,
+    head_dim=head_dim,
+    head_dim_v=head_dim_v,
+    tile_m=SM80_FWD_TILE_M,
+    tile_n=SM80_FWD_TILE_N,
+    num_stages=SM80_FWD_NUM_STAGES,
+    num_threads=SM80_FWD_NUM_THREADS,
+    is_causal=causal,
+    smem_capacity_arch=smem_capacity_arch,
+  )
   if not FFPAAttnFwdSm80SplitD.can_implement(
     dtype,
     head_dim,
@@ -193,11 +208,13 @@ def _ffpa_attn_forward_sm80(
     SM80_FWD_NUM_THREADS,
     causal,
     smem_capacity_arch=smem_capacity_arch,
+    d_chunk=fwd_d_chunk,
   ):
     raise RuntimeError(
       "SM80/SM89 CuTeDSL forward configuration exceeds kernel resource limits: "
       f"head_dim={head_dim}, tile=({SM80_FWD_TILE_M}, {SM80_FWD_TILE_N}), "
-      f"num_stages={SM80_FWD_NUM_STAGES}, arch={smem_capacity_arch}."
+      f"num_stages={SM80_FWD_NUM_STAGES}, arch={smem_capacity_arch}, "
+      f"d_chunk={fwd_d_chunk}."
     )
 
   if (is_varlen or causal) and not is_fake_mode():
@@ -227,6 +244,7 @@ def _ffpa_attn_forward_sm80(
     SM80_FWD_TILE_N,
     device_arch,
     cute_arch_key,
+    fwd_d_chunk,
     fa_logging.get_fa_log_level(),
   )
   if compile_key not in _ffpa_attn_forward_sm80.compile_cache:
@@ -251,6 +269,7 @@ def _ffpa_attn_forward_sm80(
       tile_m=SM80_FWD_TILE_M,
       tile_n=SM80_FWD_TILE_N,
       num_stages=SM80_FWD_NUM_STAGES,
+      d_chunk=fwd_d_chunk,
     )
     compile_args = [
       ffpa_fwd,
