@@ -231,7 +231,7 @@ def _validate_sm80_arch() -> tuple[int, str]:
 def _pick_split_d_chunk(
   can_implement_fn: Callable[..., bool],
   default_chunk: int,
-  wide_min_smem_bytes: int = 0,
+  wide_min_smem_bytes: int | None = None,
   **can_implement_kwargs,
 ) -> int:
   """Pick the largest Split-D chunk that divides ``head_dim`` and fits in SMEM.
@@ -263,6 +263,7 @@ def _pick_split_d_chunk(
   head_dim = can_implement_kwargs["head_dim"]
   smem_capacity_arch = can_implement_kwargs.get("smem_capacity_arch", "sm_80")
   smem_capacity = utils_basic.get_smem_capacity_in_bytes(smem_capacity_arch)
+  wide_min_smem_bytes = wide_min_smem_bytes if wide_min_smem_bytes is not None else _WIDE_SPLIT_D_MIN_SMEM_BYTES
   wide_candidates = (
     _SPLIT_D_CHUNK_CANDIDATES if smem_capacity >= wide_min_smem_bytes else ()
   )
