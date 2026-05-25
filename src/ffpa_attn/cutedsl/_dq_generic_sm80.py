@@ -84,15 +84,15 @@ class FFPAAttnBwdDQSm80SplitDGeneric:
       return False
     if num_threads % 32 != 0:
       return False
-    # This smem-saving version intentionally keeps a single sQdO/sKV slice and
-    # reuses it as Q/dO and K/V storage. Multi-stage support should add a stage
-    # dimension or ring-buffered slices, index the gmem copies and ldmatrix
-    # views by stage, prefetch stage+1 while MMA consumes the current stage,
-    # and move wait_group/barriers to protect only the consumed slice.
-    if num_stages_Q != 1 or num_stages_dO != 1:
+    if num_stages_Q < 1 or num_stages_dO < 1:
       return False
     elem_bytes = 2
-    smem_usage = (tile_m * d_chunk * elem_bytes + tile_n * d_chunk * elem_bytes)
+    # 4 rings: sQ (ns_Q M-tiles), sdO (ns_dO M-tiles),
+    # sK (ns_Q N-tiles), sV (ns_dO N-tiles).
+    smem_usage = (
+      (num_stages_Q + num_stages_dO) * tile_m * d_chunk * elem_bytes +
+      (num_stages_Q + num_stages_dO) * tile_n * d_chunk * elem_bytes
+    )
     smem_capacity = utils_basic.get_smem_capacity_in_bytes(smem_capacity_arch)
     return smem_usage <= smem_capacity
 
@@ -120,11 +120,18 @@ class FFPAAttnBwdDQSm80SplitDGeneric:
 
     @cute.struct
     class SharedStorage:
-      sQdO: cute.struct.Align[cute.struct.MemRange[
-        self.dtype, cute.cosize(self.sQdO_layout)], 1024]
-      sKV: cute.struct.Align[cute.struct.MemRange[self.dtype,
-                                                  cute.cosize(self.sKV_layout)],
+      sQ: cute.struct.Align[cute.struct.MemRange[self.dtype,
+                                                 cute.cosize(self.sQ_layout)],
+                            1024]
+      sdO: cute.struct.Align[cute.struct.MemRange[self.dtype,
+                                                  cute.cosize(self.sdO_layout)],
                              1024]
+      sK: cute.struct.Align[cute.struct.MemRange[self.dtype,
+                                                 cute.cosize(self.sK_layout)],
+                            1024]
+      sV: cute.struct.Align[cute.struct.MemRange[self.dtype,
+                                                 cute.cosize(self.sV_layout)],
+                            1024]
 
     return SharedStorage
 
@@ -132,11 +139,27 @@ class FFPAAttnBwdDQSm80SplitDGeneric:
     sQ_layout_atom = sm80_utils.get_smem_layout_atom(self.dtype, self.tile_hdim)
     sK_layout_atom = sQ_layout_atom
     sV_layout_atom = sm80_utils.get_smem_layout_atom(self.dtype, self.tile_hdim)
-    self.sQdO_layout = cute.tile_to_shape(
-      sQ_layout_atom, (self.tile_m, self.tile_hdim), (0, 1)
+    # Stage axis is the slowest-varying dim so per-stage slice keeps the
+    # canonical (rows, d_chunk) layout that ldmatrix / mma_make_fragment expect.
+    self.sQ_layout = cute.tile_to_shape(
+      sQ_layout_atom,
+      (self.tile_m, self.tile_hdim, self.num_stages_Q),
+      (0, 1, 2),
     )
-    self.sKV_layout = cute.tile_to_shape(
-      sK_layout_atom, (self.tile_n, self.tile_hdim), (0, 1)
+    self.sdO_layout = cute.tile_to_shape(
+      sQ_layout_atom,
+      (self.tile_m, self.tile_hdim, self.num_stages_dO),
+      (0, 1, 2),
+    )
+    self.sK_layout = cute.tile_to_shape(
+      sK_layout_atom,
+      (self.tile_n, self.tile_hdim, self.num_stages_Q),
+      (0, 1, 2),
+    )
+    self.sV_layout = cute.tile_to_shape(
+      sV_layout_atom,
+      (self.tile_n, self.tile_hdim, self.num_stages_dO),
+      (0, 1, 2),
     )
 
     universal_copy_bits = 128
@@ -218,8 +241,10 @@ class FFPAAttnBwdDQSm80SplitDGeneric:
       mD,
       mdQ,
       softmax_scale,
-      self.sQdO_layout,
-      self.sKV_layout,
+      self.sQ_layout,
+      self.sdO_layout,
+      self.sK_layout,
+      self.sV_layout,
       self.gmem_tiled_copy_QK,
       self.gmem_tiled_copy_VdO,
       tiled_mma_sdp,
@@ -243,8 +268,10 @@ class FFPAAttnBwdDQSm80SplitDGeneric:
     mD: cute.Tensor,
     mdQ: cute.Tensor,
     softmax_scale: Float32,
-    sQdO_layout: cute.ComposedLayout,
-    sKV_layout: cute.ComposedLayout,
+    sQ_layout: cute.ComposedLayout,
+    sdO_layout: cute.ComposedLayout,
+    sK_layout: cute.ComposedLayout,
+    sV_layout: cute.ComposedLayout,
     gmem_tiled_copy_QK: cute.TiledCopy,
     gmem_tiled_copy_VdO: cute.TiledCopy,
     tiled_mma_sdp: cute.TiledMma,
@@ -265,18 +292,33 @@ class FFPAAttnBwdDQSm80SplitDGeneric:
 
     smem = cutlass.utils.SmemAllocator()
     storage = smem.allocate(SharedStorage)
-    sQdO = storage.sQdO.get_tensor(sQdO_layout)
-    sKV = storage.sKV.get_tensor(sKV_layout)
+    sQ_all = storage.sQ.get_tensor(sQ_layout)
+    sdO_all = storage.sdO.get_tensor(sdO_layout)
+    sK_all = storage.sK.get_tensor(sK_layout)
+    sV_all = storage.sV.get_tensor(sV_layout)
 
-    sKVt = layout_utils.transpose_view(sKV)
+    ns_Q = const_expr(self.num_stages_Q)
+    ns_dO = const_expr(self.num_stages_dO)
+    ND = const_expr(self.num_d_chunks)
+    # Each of the 3 phases owns ONE ring with a single commit_group per inner
+    # iter, so the wait formula is simply (ns - 1): drain all but the just-
+    # issued prefetch. ns=1 collapses to wait(0) (inline load).
+    wait_count_q = const_expr(ns_Q - 1 if ns_Q >= 2 else 0)
+    wait_count_do = const_expr(ns_dO - 1 if ns_dO >= 2 else 0)
+
+    sQ_stage = [sQ_all[None, None, s] for s in range(self.num_stages_Q)]
+    sdO_stage = [sdO_all[None, None, s] for s in range(self.num_stages_dO)]
+    sK_stage = [sK_all[None, None, s] for s in range(self.num_stages_Q)]
+    sV_stage = [sV_all[None, None, s] for s in range(self.num_stages_dO)]
+    sKt_stage = [layout_utils.transpose_view(t) for t in sK_stage]
 
     thr_mma_sdp = tiled_mma_sdp.get_slice(tidx)
     thr_mma_dq = tiled_mma_dq.get_slice(tidx)
-    tSrQ = utils.mma_make_fragment_A(sQdO, thr_mma_sdp)
-    tSrK = utils.mma_make_fragment_B(sKV, thr_mma_sdp)
-    tdPrdO = utils.mma_make_fragment_A(sQdO, thr_mma_sdp)
-    tdPrV = utils.mma_make_fragment_B(sKV, thr_mma_sdp)
-    tdQrK = utils.mma_make_fragment_B(sKVt, thr_mma_dq)
+    tSrQ = [utils.mma_make_fragment_A(t, thr_mma_sdp) for t in sQ_stage]
+    tSrK = [utils.mma_make_fragment_B(t, thr_mma_sdp) for t in sK_stage]
+    tdPrdO = [utils.mma_make_fragment_A(t, thr_mma_sdp) for t in sdO_stage]
+    tdPrV = [utils.mma_make_fragment_B(t, thr_mma_sdp) for t in sV_stage]
+    tdQrK = [utils.mma_make_fragment_B(t, thr_mma_dq) for t in sKt_stage]
     acc_shape_dQ = thr_mma_dq.partition_shape_C((self.tile_m, self.d_chunk))
 
     smem_copy_atom = cute.make_copy_atom(
@@ -295,11 +337,11 @@ class FFPAAttnBwdDQSm80SplitDGeneric:
                                               tiled_mma_sdp).get_slice(tidx)
     smem_thr_copy_Kt = utils.make_tiled_copy_B(smem_copy_atom_t,
                                                tiled_mma_dq).get_slice(tidx)
-    tSsQ = smem_thr_copy_Q.partition_S(sQdO)
-    tSsK = smem_thr_copy_K.partition_S(sKV)
-    tdPsdO = smem_thr_copy_dO.partition_S(sQdO)
-    tdPsV = smem_thr_copy_V.partition_S(sKV)
-    tdQsKt = smem_thr_copy_Kt.partition_S(sKVt)
+    tSsQ = [smem_thr_copy_Q.partition_S(t) for t in sQ_stage]
+    tSsK = [smem_thr_copy_K.partition_S(t) for t in sK_stage]
+    tdPsdO = [smem_thr_copy_dO.partition_S(t) for t in sdO_stage]
+    tdPsV = [smem_thr_copy_V.partition_S(t) for t in sV_stage]
+    tdQsKt = [smem_thr_copy_Kt.partition_S(t) for t in sKt_stage]
     gmem_copy_atom_DQ = cute.make_copy_atom(
       cute.nvgpu.CopyUniversalOp(),
       self.dtype,
@@ -316,62 +358,142 @@ class FFPAAttnBwdDQSm80SplitDGeneric:
         acc_dP = cute.make_rmem_tensor(acc_shape_S, Float32)
         acc_S.fill(0.0)
         acc_dP.fill(0.0)
-        for score_d_block in cutlass.range_constexpr(self.num_d_chunks):
-          gQ = cute.local_tile(
-            mQ[batch_idx, None, q_head_idx, None],
-            (self.tile_m, self.d_chunk),
-            (block_m, score_d_block),
-          )
-          gK = cute.local_tile(
-            mK[batch_idx, None, kv_head_idx, None],
-            (self.tile_n, self.d_chunk),
-            (n_block, score_d_block),
-          )
-          self.load_m_tile(
-            gmem_tiled_copy_QK.get_slice(tidx), gQ, sQdO, block_m, seqlen_q
-          )
-          self.load_n_tile(
-            gmem_tiled_copy_QK.get_slice(tidx), gK, sKV, n_block, seqlen_k
-          )
+
+        # Phase A1 prologue: prefetch ns_Q-1 (Q,K) pairs.
+        for s in cutlass.range_constexpr(ns_Q - 1):
+          if s < ND:
+            gQ_pre = cute.local_tile(
+              mQ[batch_idx, None, q_head_idx, None],
+              (self.tile_m, self.d_chunk),
+              (block_m, s),
+            )
+            gK_pre = cute.local_tile(
+              mK[batch_idx, None, kv_head_idx, None],
+              (self.tile_n, self.d_chunk),
+              (n_block, s),
+            )
+            self.load_m_tile(
+              gmem_tiled_copy_QK.get_slice(tidx), gQ_pre, sQ_stage[s], block_m,
+              seqlen_q
+            )
+            self.load_n_tile(
+              gmem_tiled_copy_QK.get_slice(tidx), gK_pre, sK_stage[s], n_block,
+              seqlen_k
+            )
           cute.arch.cp_async_commit_group()
-          cute.arch.cp_async_wait_group(0)
+
+        for score_d_block in cutlass.range_constexpr(self.num_d_chunks):
+          stage_q = score_d_block % ns_Q
+          prefetch_d_qk = score_d_block + ns_Q - 1
+          if prefetch_d_qk < ND:
+            prefetch_slot = prefetch_d_qk % ns_Q
+            gQp = cute.local_tile(
+              mQ[batch_idx, None, q_head_idx, None],
+              (self.tile_m, self.d_chunk),
+              (block_m, prefetch_d_qk),
+            )
+            gKp = cute.local_tile(
+              mK[batch_idx, None, kv_head_idx, None],
+              (self.tile_n, self.d_chunk),
+              (n_block, prefetch_d_qk),
+            )
+            self.load_m_tile(
+              gmem_tiled_copy_QK.get_slice(tidx), gQp, sQ_stage[prefetch_slot],
+              block_m, seqlen_q
+            )
+            self.load_n_tile(
+              gmem_tiled_copy_QK.get_slice(tidx), gKp, sK_stage[prefetch_slot],
+              n_block, seqlen_k
+            )
+          cute.arch.cp_async_commit_group()
+          cute.arch.cp_async_wait_group(wait_count_q)
           cute.arch.barrier()
-          self.zero_m_tail(sQdO, block_m, seqlen_q, tidx)
-          self.zero_n_tail(sKV, n_block, seqlen_k, tidx)
+          self.zero_m_tail(sQ_stage[stage_q], block_m, seqlen_q, tidx)
+          self.zero_n_tail(sK_stage[stage_q], n_block, seqlen_k, tidx)
           cute.arch.barrier()
           sm80_utils.gemm(
-            thr_mma_sdp, acc_S, tSrQ, tSrK, tSsQ, tSsK, smem_thr_copy_Q,
-            smem_thr_copy_K
+            thr_mma_sdp,
+            acc_S,
+            tSrQ[stage_q],
+            tSrK[stage_q],
+            tSsQ[stage_q],
+            tSsK[stage_q],
+            smem_thr_copy_Q,
+            smem_thr_copy_K,
           )
           cute.arch.barrier()
 
-          gdO = cute.local_tile(
-            mdO[batch_idx, None, q_head_idx, None],
-            (self.tile_m, self.d_chunk),
-            (block_m, score_d_block),
-          )
-          gV = cute.local_tile(
-            mV[batch_idx, None, kv_head_idx, None],
-            (self.tile_n, self.d_chunk),
-            (n_block, score_d_block),
-          )
-          self.load_m_tile(
-            gmem_tiled_copy_VdO.get_slice(tidx), gdO, sQdO, block_m, seqlen_q
-          )
-          self.load_n_tile(
-            gmem_tiled_copy_VdO.get_slice(tidx), gV, sKV, n_block, seqlen_k
-          )
+        # Drain Phase A1 ring before reusing stages for Phase A2.
+        cute.arch.cp_async_wait_group(0)
+        cute.arch.barrier()
+
+        # Phase A2 prologue: prefetch ns_dO-1 (dO,V) pairs.
+        for s in cutlass.range_constexpr(ns_dO - 1):
+          if s < ND:
+            gdO_pre = cute.local_tile(
+              mdO[batch_idx, None, q_head_idx, None],
+              (self.tile_m, self.d_chunk),
+              (block_m, s),
+            )
+            gV_pre = cute.local_tile(
+              mV[batch_idx, None, kv_head_idx, None],
+              (self.tile_n, self.d_chunk),
+              (n_block, s),
+            )
+            self.load_m_tile(
+              gmem_tiled_copy_VdO.get_slice(tidx), gdO_pre, sdO_stage[s],
+              block_m, seqlen_q
+            )
+            self.load_n_tile(
+              gmem_tiled_copy_VdO.get_slice(tidx), gV_pre, sV_stage[s], n_block,
+              seqlen_k
+            )
           cute.arch.cp_async_commit_group()
-          cute.arch.cp_async_wait_group(0)
+
+        for score_d_block in cutlass.range_constexpr(self.num_d_chunks):
+          stage_do = score_d_block % ns_dO
+          prefetch_d_dov = score_d_block + ns_dO - 1
+          if prefetch_d_dov < ND:
+            prefetch_slot = prefetch_d_dov % ns_dO
+            gdOp = cute.local_tile(
+              mdO[batch_idx, None, q_head_idx, None],
+              (self.tile_m, self.d_chunk),
+              (block_m, prefetch_d_dov),
+            )
+            gVp = cute.local_tile(
+              mV[batch_idx, None, kv_head_idx, None],
+              (self.tile_n, self.d_chunk),
+              (n_block, prefetch_d_dov),
+            )
+            self.load_m_tile(
+              gmem_tiled_copy_VdO.get_slice(tidx), gdOp,
+              sdO_stage[prefetch_slot], block_m, seqlen_q
+            )
+            self.load_n_tile(
+              gmem_tiled_copy_VdO.get_slice(tidx), gVp, sV_stage[prefetch_slot],
+              n_block, seqlen_k
+            )
+          cute.arch.cp_async_commit_group()
+          cute.arch.cp_async_wait_group(wait_count_do)
           cute.arch.barrier()
-          self.zero_m_tail(sQdO, block_m, seqlen_q, tidx)
-          self.zero_n_tail(sKV, n_block, seqlen_k, tidx)
+          self.zero_m_tail(sdO_stage[stage_do], block_m, seqlen_q, tidx)
+          self.zero_n_tail(sV_stage[stage_do], n_block, seqlen_k, tidx)
           cute.arch.barrier()
           sm80_utils.gemm(
-            thr_mma_sdp, acc_dP, tdPrdO, tdPrV, tdPsdO, tdPsV, smem_thr_copy_dO,
-            smem_thr_copy_V
+            thr_mma_sdp,
+            acc_dP,
+            tdPrdO[stage_do],
+            tdPrV[stage_do],
+            tdPsdO[stage_do],
+            tdPsV[stage_do],
+            smem_thr_copy_dO,
+            smem_thr_copy_V,
           )
           cute.arch.barrier()
+
+        # Drain Phase A2 ring before Phase B reuses the K ring.
+        cute.arch.cp_async_wait_group(0)
+        cute.arch.barrier()
 
         self.make_ds(
           acc_S,
@@ -392,24 +514,44 @@ class FFPAAttnBwdDQSm80SplitDGeneric:
         rdS.store(acc_dP.load().to(self.dtype))
         tdQrdS = layout_utils.reshape_acc_to_frgA(rdS)
 
+        # Phase B prologue: prefetch ns_Q-1 K_out tiles into sK ring.
+        for s in cutlass.range_constexpr(ns_Q - 1):
+          if s < ND:
+            gK_pre = cute.local_tile(
+              mK[batch_idx, None, kv_head_idx, None],
+              (self.tile_n, self.d_chunk),
+              (n_block, s),
+            )
+            self.load_n_tile(
+              gmem_tiled_copy_QK.get_slice(tidx), gK_pre, sK_stage[s], n_block,
+              seqlen_k
+            )
+          cute.arch.cp_async_commit_group()
+
         for d_block in cutlass.range_constexpr(self.num_d_chunks):
+          stage_q = d_block % ns_Q
           acc_dQ = cute.make_rmem_tensor(acc_shape_dQ, Float32)
           acc_dQ.fill(0.0)
-          gK_out = cute.local_tile(
-            mK[batch_idx, None, kv_head_idx, None],
-            (self.tile_n, self.d_chunk),
-            (n_block, d_block),
-          )
-          self.load_n_tile(
-            gmem_tiled_copy_QK.get_slice(tidx), gK_out, sKV, n_block, seqlen_k
-          )
+          prefetch_d = d_block + ns_Q - 1
+          if prefetch_d < ND:
+            prefetch_slot = prefetch_d % ns_Q
+            gK_out = cute.local_tile(
+              mK[batch_idx, None, kv_head_idx, None],
+              (self.tile_n, self.d_chunk),
+              (n_block, prefetch_d),
+            )
+            self.load_n_tile(
+              gmem_tiled_copy_QK.get_slice(tidx), gK_out,
+              sK_stage[prefetch_slot], n_block, seqlen_k
+            )
           cute.arch.cp_async_commit_group()
-          cute.arch.cp_async_wait_group(0)
+          cute.arch.cp_async_wait_group(wait_count_q)
           cute.arch.barrier()
-          self.zero_n_tail(sKV, n_block, seqlen_k, tidx)
+          self.zero_n_tail(sK_stage[stage_q], n_block, seqlen_k, tidx)
           cute.arch.barrier()
           sm80_utils.gemm_rs(
-            thr_mma_dq, acc_dQ, tdQrdS, tdQrK, tdQsKt, smem_thr_copy_Kt
+            thr_mma_dq, acc_dQ, tdQrdS, tdQrK[stage_q], tdQsKt[stage_q],
+            smem_thr_copy_Kt
           )
           cute.arch.barrier()
           self.store_dq_tile(
@@ -425,6 +567,10 @@ class FFPAAttnBwdDQSm80SplitDGeneric:
             True,
           )
           cute.arch.barrier()
+
+        # Drain Phase B ring before the next n_block reuses stages.
+        cute.arch.cp_async_wait_group(0)
+        cute.arch.barrier()
 
   @cute.jit
   def make_ds(

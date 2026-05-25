@@ -14,14 +14,16 @@ from ._bwd_preprocess import FFPAAttnBwdPreprocess
 from ._dkdv_generic_sm80 import FFPAAttnBwdDKDVSm80SplitDGeneric
 from ._dq_generic_sm80 import FFPAAttnBwdDQSm80SplitDGeneric
 from ._utils import (
+  SM80_BWD_DKDV_NUM_STAGES_DO,
+  SM80_BWD_DKDV_NUM_STAGES_Q,
   SM80_BWD_DKDV_NUM_THREADS,
   SM80_BWD_DKDV_TILE_M,
   SM80_BWD_DKDV_TILE_N,
+  SM80_BWD_DQ_NUM_STAGES_DO,
+  SM80_BWD_DQ_NUM_STAGES_Q,
   SM80_BWD_DQ_NUM_THREADS,
   SM80_BWD_DQ_TILE_M,
   SM80_BWD_DQ_TILE_N,
-  SM80_BWD_NUM_STAGES_DO,
-  SM80_BWD_NUM_STAGES_Q,
   SM80_BWD_SPLIT_D_CHUNK,
   is_fake_mode,
   maybe_contiguous,
@@ -184,8 +186,8 @@ def _ffpa_attn_backward_sm80_dense(
     head_dim_v,
     dkdv_tile_m,
     dkdv_tile_n,
-    SM80_BWD_NUM_STAGES_Q,
-    SM80_BWD_NUM_STAGES_DO,
+    SM80_BWD_DKDV_NUM_STAGES_Q,
+    SM80_BWD_DKDV_NUM_STAGES_DO,
     SM80_BWD_DKDV_NUM_THREADS,
     causal,
     smem_capacity_arch=smem_capacity_arch,
@@ -193,8 +195,8 @@ def _ffpa_attn_backward_sm80_dense(
     raise RuntimeError(
       "SM80/SM89 CuTeDSL dK/dV configuration exceeds kernel resource limits: "
       f"head_dim={head_dim}, tile=({dkdv_tile_m}, {dkdv_tile_n}), "
-      f"num_stages_Q={SM80_BWD_NUM_STAGES_Q}, "
-      f"num_stages_dO={SM80_BWD_NUM_STAGES_DO}, arch={smem_capacity_arch}."
+      f"num_stages_Q={SM80_BWD_DKDV_NUM_STAGES_Q}, "
+      f"num_stages_dO={SM80_BWD_DKDV_NUM_STAGES_DO}, arch={smem_capacity_arch}."
     )
   if not FFPAAttnBwdDQSm80SplitDGeneric.can_implement(
     dtype,
@@ -202,8 +204,8 @@ def _ffpa_attn_backward_sm80_dense(
     head_dim_v,
     dq_tile_m,
     dq_tile_n,
-    SM80_BWD_NUM_STAGES_Q,
-    SM80_BWD_NUM_STAGES_DO,
+    SM80_BWD_DQ_NUM_STAGES_Q,
+    SM80_BWD_DQ_NUM_STAGES_DO,
     SM80_BWD_DQ_NUM_THREADS,
     causal,
     smem_capacity_arch=smem_capacity_arch,
@@ -211,8 +213,8 @@ def _ffpa_attn_backward_sm80_dense(
     raise RuntimeError(
       "SM80/SM89 CuTeDSL dQ configuration exceeds kernel resource limits: "
       f"head_dim={head_dim}, tile=({dq_tile_m}, {dq_tile_n}), "
-      f"num_stages_Q={SM80_BWD_NUM_STAGES_Q}, "
-      f"num_stages_dO={SM80_BWD_NUM_STAGES_DO}, arch={smem_capacity_arch}."
+      f"num_stages_Q={SM80_BWD_DQ_NUM_STAGES_Q}, "
+      f"num_stages_dO={SM80_BWD_DQ_NUM_STAGES_DO}, arch={smem_capacity_arch}."
     )
   seqlen_q_rounded = (seqlen_q + pre_tile_m - 1) // pre_tile_m * pre_tile_m
 
@@ -252,8 +254,10 @@ def _ffpa_attn_backward_sm80_dense(
     dkdv_tile_n,
     dq_tile_m,
     dq_tile_n,
-    SM80_BWD_NUM_STAGES_Q,
-    SM80_BWD_NUM_STAGES_DO,
+    SM80_BWD_DQ_NUM_STAGES_Q,
+    SM80_BWD_DQ_NUM_STAGES_DO,
+    SM80_BWD_DKDV_NUM_STAGES_Q,
+    SM80_BWD_DKDV_NUM_STAGES_DO,
     SM80_BWD_SPLIT_D_CHUNK,
     SM80_BWD_DKDV_NUM_THREADS,
     SM80_BWD_DQ_NUM_THREADS,
@@ -276,8 +280,8 @@ def _ffpa_attn_backward_sm80_dense(
       is_causal=causal,
       tile_m=dkdv_tile_m,
       tile_n=dkdv_tile_n,
-      num_stages_Q=SM80_BWD_NUM_STAGES_Q,
-      num_stages_dO=SM80_BWD_NUM_STAGES_DO,
+      num_stages_Q=SM80_BWD_DKDV_NUM_STAGES_Q,
+      num_stages_dO=SM80_BWD_DKDV_NUM_STAGES_DO,
       num_threads=SM80_BWD_DKDV_NUM_THREADS,
     )
     _ffpa_attn_backward_sm80_dense.compile_cache_dkdv[bwd_key] = cute.compile(
@@ -308,8 +312,8 @@ def _ffpa_attn_backward_sm80_dense(
       is_causal=causal,
       tile_m=dq_tile_m,
       tile_n=dq_tile_n,
-      num_stages_Q=SM80_BWD_NUM_STAGES_Q,
-      num_stages_dO=SM80_BWD_NUM_STAGES_DO,
+      num_stages_Q=SM80_BWD_DQ_NUM_STAGES_Q,
+      num_stages_dO=SM80_BWD_DQ_NUM_STAGES_DO,
       num_threads=SM80_BWD_DQ_NUM_THREADS,
     )
     _ffpa_attn_backward_sm80_dense.compile_cache_dq[bwd_key] = cute.compile(
