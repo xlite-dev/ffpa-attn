@@ -50,7 +50,7 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import cutlass.utils.hopper_helpers as sm90_utils_basic
-from cutlass.cute.nvgpu import cpasync, warpgroup
+from cutlass.cute.nvgpu import OperandMajorMode, cpasync
 from cutlass.cute import FastDivmodDivisor
 from cutlass import Float32, Int32, Boolean, const_expr
 from cutlass.utils import LayoutEnum
@@ -280,8 +280,8 @@ class FFPAAttnBwdDKDVSm90SplitDD384:
     tiled_mma_SdP = sm90_utils_basic.make_trivial_tiled_mma(
       self.dtype,
       self.dtype,
-      warpgroup.OperandMajorMode.K,
-      warpgroup.OperandMajorMode.K,
+      OperandMajorMode.K,
+      OperandMajorMode.K,
       self.qk_acc_dtype,
       atom_layout_mnk=atom_layout_SdP,
       tiler_mn=tiler_mn_SdP,
@@ -299,8 +299,8 @@ class FFPAAttnBwdDKDVSm90SplitDD384:
     tiled_mma_dV = sm90_utils_basic.make_trivial_tiled_mma(
       self.dtype,
       self.dtype,
-      warpgroup.OperandMajorMode.MN,
-      warpgroup.OperandMajorMode.MN,
+      OperandMajorMode.MN,
+      OperandMajorMode.MN,
       Float32,
       atom_layout_mnk=atom_layout_dKV,
       tiler_mn=tiler_mn_dV,
@@ -312,8 +312,8 @@ class FFPAAttnBwdDKDVSm90SplitDD384:
     tiled_mma_dK = sm90_utils_basic.make_trivial_tiled_mma(
       self.dtype,
       self.dtype,
-      warpgroup.OperandMajorMode.MN,
-      warpgroup.OperandMajorMode.MN,
+      OperandMajorMode.MN,
+      OperandMajorMode.MN,
       Float32,
       atom_layout_mnk=atom_layout_dKV,
       tiler_mn=tiler_mn_dK,
@@ -324,8 +324,8 @@ class FFPAAttnBwdDKDVSm90SplitDD384:
     tiled_mma_dV_tail = sm90_utils_basic.make_trivial_tiled_mma(
       self.dtype,
       self.dtype,
-      warpgroup.OperandMajorMode.MN,
-      warpgroup.OperandMajorMode.MN,
+      OperandMajorMode.MN,
+      OperandMajorMode.MN,
       Float32,
       atom_layout_mnk=atom_layout_dKV,
       tiler_mn=tiler_mn_dV_tail,
@@ -336,8 +336,8 @@ class FFPAAttnBwdDKDVSm90SplitDD384:
     tiled_mma_dK_tail = sm90_utils_basic.make_trivial_tiled_mma(
       self.dtype,
       self.dtype,
-      warpgroup.OperandMajorMode.MN,
-      warpgroup.OperandMajorMode.MN,
+      OperandMajorMode.MN,
+      OperandMajorMode.MN,
       Float32,
       atom_layout_mnk=atom_layout_dKV,
       tiler_mn=tiler_mn_dK_tail,
