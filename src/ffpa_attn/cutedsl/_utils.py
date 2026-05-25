@@ -37,18 +37,20 @@ SM80_FWD_SPLIT_D_CHUNK = 32
 
 SM80_BWD_DKDV_TILE_M = 64
 SM80_BWD_DKDV_TILE_N = 64
-SM80_BWD_DQ_TILE_M = 64
-SM80_BWD_DQ_TILE_N = 64
-# DQ kernel multi-stage prefetch (per-ring commit groups, per-ring wait counts).
-SM80_BWD_DQ_NUM_STAGES_Q = 1
-SM80_BWD_DQ_NUM_STAGES_DO = 1
 # DKDV kernel supports multi-stage prefetch over the d_chunk dim.
 # Each ring uses an independent commit_group; per-ring wait counts let
 # asymmetric (ns_Q, ns_dO) be correct.
 SM80_BWD_DKDV_NUM_STAGES_Q = 1
 SM80_BWD_DKDV_NUM_STAGES_DO = 2
 SM80_BWD_DKDV_NUM_THREADS = 128
+
+SM80_BWD_DQ_TILE_M = 64
+SM80_BWD_DQ_TILE_N = 64
+# DQ kernel multi-stage prefetch (per-ring commit groups, per-ring wait counts).
+SM80_BWD_DQ_NUM_STAGES_Q = 1
+SM80_BWD_DQ_NUM_STAGES_DO = 1
 SM80_BWD_DQ_NUM_THREADS = 128
+
 SM80_BWD_SPLIT_D_CHUNK = 64
 
 _VARLEN_CUSTOM_OP_NONE_INT = -(2**31)
