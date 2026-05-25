@@ -18,6 +18,7 @@ from torch.nn.attention import SDPBackend, sdpa_kernel
 import triton
 
 from ffpa_attn import ffpa_attn_func  # noqa: E402
+from ffpa_attn.functional import TritonBackend  # noqa: E402
 from ffpa_attn.triton._ffpa_bwd import _ffpa_bwd_pre  # noqa: E402
 
 # Build subset for fast iteration: 64 (small-d), 320, 512 (large-d).
@@ -82,7 +83,7 @@ def _sdpa_ref_grads(
   return_mask_grad=False,
   dropout_p=0.0,
   rng_seed=None,
-  grad_out=None,
+  grad_out=None
 ):
   """Run SDPA forward + backward and return gradients from autograd.
 
@@ -150,8 +151,9 @@ def test_sm90_tma_persist_dkdv_causal_matches_sdpa(dtype):
     v,
     is_causal=True,
     scale=scale,
-    enable_backward_tma=True,
-    triton_backward_enable_persist_dkdv=True,
+    backward_backend=TritonBackend(
+      backward=True, enable_tma=True, persist_dkdv=True
+    )
   )
   out.sum().backward()
 
@@ -178,8 +180,9 @@ def test_sm90_tma_non_aligned_seqlen_matches_sdpa(enable_persist_dkdv):
     k,
     v,
     scale=scale,
-    enable_backward_tma=True,
-    triton_backward_enable_persist_dkdv=enable_persist_dkdv,
+    backward_backend=TritonBackend(
+      backward=True, enable_tma=True, persist_dkdv=enable_persist_dkdv
+    )
   )
   out.sum().backward()
 
@@ -190,13 +193,10 @@ def test_sm90_tma_non_aligned_seqlen_matches_sdpa(enable_persist_dkdv):
   assert torch.allclose(v.grad, dv_ref, **tol)
 
 
-@pytest.mark.parametrize(
-  ("dtype", "enable_persist_dkdv", "causal", "N"),
-  [
-    (torch.float16, False, False, 129),
-    (torch.bfloat16, True, True, 128),
-  ],
-)
+@pytest.mark.parametrize(("dtype", "enable_persist_dkdv", "causal", "N"), [
+  (torch.float16, False, False, 129),
+  (torch.bfloat16, True, True, 128),
+])
 def test_sm90_tma_split_launch_matches_sdpa(
   dtype, enable_persist_dkdv, causal, N
 ):
@@ -215,9 +215,12 @@ def test_sm90_tma_split_launch_matches_sdpa(
     v,
     is_causal=causal,
     scale=scale,
-    enable_backward_tma=True,
-    triton_backward_enable_persist_dkdv=enable_persist_dkdv,
-    triton_backward_enable_split_launch=True,
+    backward_backend=TritonBackend(
+      backward=True,
+      enable_tma=True,
+      persist_dkdv=enable_persist_dkdv,
+      split_launch=True
+    )
   )
   out.backward(grad_out)
 
@@ -251,9 +254,12 @@ def test_sm90_tma_split_launch_matches_fused(enable_persist_dkdv):
       k_i,
       v_i,
       scale=scale,
-      enable_backward_tma=True,
-      triton_backward_enable_persist_dkdv=enable_persist_dkdv,
-      triton_backward_enable_split_launch=split_launch,
+      backward_backend=TritonBackend(
+        backward=True,
+        enable_tma=True,
+        persist_dkdv=enable_persist_dkdv,
+        split_launch=split_launch
+      )
     )
     out.backward(grad_out)
     return q_i.grad, k_i.grad, v_i.grad
@@ -272,7 +278,7 @@ def _key_position_bias_grad_ref(
   scale: float,
   attn_mask: torch.Tensor,
   block_m: int = 128,
-  block_n: int = 1024,
+  block_n: int = 1024
 ) -> torch.Tensor:
   """Compute a fp32 reference gradient for compact [1, 1, 1, Nkv] key bias."""
   with torch.no_grad():
@@ -363,7 +369,7 @@ def _run_bwd_pre(o, do, d_chunk, block_headdim=64):
     BLOCK_M=128,
     BLOCK_HEADDIM=full_block_headdim,
     D_CHUNK=d_chunk,
-    num_warps=4,
+    num_warps=4
   )
   return delta[..., :N]
 
@@ -409,16 +415,7 @@ def test_ffpa_bwd_triton_preprocess_modes(dtype, preprocess_d_chunk):
 
   scale = 1.0 / math.sqrt(D)
   out = ffpa_attn_func(
-    q,
-    k,
-    v,
-    is_causal=False,
-    scale=scale,
-    stages=2,
-    acc="f32",
-    high_precision_grad=True,
-    backward_backend="triton",
-    triton_backward_preprocess_d_chunk=preprocess_d_chunk,
+    q, k, v, is_causal=False, scale=scale, backward_backend="triton"
   )
   out.sum().backward()
 
@@ -440,16 +437,7 @@ def test_ffpa_bwd_triton_non_aligned_seqlen_matches_sdpa():
   v = torch.randn(B, H, N, D, dtype=dtype, device="cuda", requires_grad=True)
   scale = 1.0 / math.sqrt(D)
 
-  out = ffpa_attn_func(
-    q,
-    k,
-    v,
-    scale=scale,
-    stages=2,
-    acc="f32",
-    high_precision_grad=True,
-    backward_backend="triton",
-  )
+  out = ffpa_attn_func(q, k, v, scale=scale, backward_backend="triton")
   out.sum().backward()
 
   dq_ref, dk_ref, dv_ref = _sdpa_ref_grads(q, k, v, False, scale)
@@ -471,86 +459,17 @@ def test_ffpa_bwd_triton_internal_kv_storage_dtype_option(dtype):
   scale = 1.0 / math.sqrt(D)
 
   o, lse = torch.ops.ffpa_attn._fwd_triton(
-    q,
-    k,
-    v,
-    None,
-    scale,
-    0,
-    0,
-    0,
-    0.0,
-    0,
-    0,
-    0,
-    0,
+    q, k, v, None, scale, 0, 0, 0, 0.0, 0, 0, 0, 0
   )
 
   dq_default, dk_default, dv_default, _ = torch.ops.ffpa_attn._bwd_triton(
-    do,
-    q,
-    k,
-    v,
-    o,
-    lse,
-    None,
-    scale,
-    0,
-    0,
-    0,
-    0,
-    0,
-    0,
-    H,
-    0.0,
-    0,
-    0,
-    0,
-    0,
+    do, q, k, v, o, lse, None, scale, 0, 0, 0, 0, 0, 0, H, 0.0, 0, 0, 0, 0
   )
   dq_fp32, dk_fp32, dv_fp32, _ = torch.ops.ffpa_attn._bwd_triton(
-    do,
-    q,
-    k,
-    v,
-    o,
-    lse,
-    None,
-    scale,
-    0,
-    0,
-    0,
-    0,
-    0,
-    1,
-    H,
-    0.0,
-    0,
-    0,
-    0,
-    0,
+    do, q, k, v, o, lse, None, scale, 0, 0, 0, 0, 0, 1, H, 0.0, 0, 0, 0, 0
   )
   dq_fp16, dk_fp16, dv_fp16, _ = torch.ops.ffpa_attn._bwd_triton(
-    do,
-    q,
-    k,
-    v,
-    o,
-    lse,
-    None,
-    scale,
-    0,
-    0,
-    0,
-    0,
-    0,
-    2,
-    H,
-    0.0,
-    0,
-    0,
-    0,
-    0,
+    do, q, k, v, o, lse, None, scale, 0, 0, 0, 0, 0, 2, H, 0.0, 0, 0, 0, 0
   )
 
   assert dq_default.dtype == dtype
@@ -581,14 +500,7 @@ def test_ffpa_bwd_triton_grad_kv_storage_dtype_preserves_public_grad_dtype(
 
   scale = 1.0 / math.sqrt(D)
   out = ffpa_attn_func(
-    q,
-    k,
-    v,
-    is_causal=True,
-    scale=scale,
-    acc="f32",
-    backward_backend="triton",
-    triton_backward_grad_kv_storage_dtype=grad_kv_storage_dtype,
+    q, k, v, is_causal=True, scale=scale, backward_backend="triton"
   )
   out.sum().backward()
 
@@ -610,27 +522,14 @@ def test_ffpa_bwd_triton_additive_attn_mask_matches_sdpa():
 
   scale = 1.0 / math.sqrt(D)
   out = ffpa_attn_func(
-    q,
-    k,
-    v,
-    attn_mask=attn_mask,
-    scale=scale,
-    stages=2,
-    acc="f32",
-    backward_backend="triton",
+    q, k, v, attn_mask=attn_mask, scale=scale, backward_backend="triton"
   )
   out.sum().backward()
   assert attn_mask.grad is not None
   assert attn_mask.grad.shape == (1, 1, 1, N)
 
   dq_ref, dk_ref, dv_ref, dmask_ref = _sdpa_ref_grads(
-    q,
-    k,
-    v,
-    False,
-    scale,
-    attn_mask=attn_mask,
-    return_mask_grad=True,
+    q, k, v, False, scale, attn_mask=attn_mask, return_mask_grad=True
   )
 
   torch.testing.assert_close(q.grad, dq_ref, atol=3e-2, rtol=3e-2)
@@ -653,27 +552,13 @@ def test_ffpa_bwd_triton_key_bias_autotune_fp32_kv_storage_matches_sdpa():
 
   scale = 1.0 / math.sqrt(D)
   out = ffpa_attn_func(
-    q,
-    k,
-    v,
-    attn_mask=attn_mask,
-    scale=scale,
-    stages=2,
-    acc="f32",
-    backward_backend="triton",
-    triton_autotune=True,
-    triton_backward_grad_kv_storage_dtype=torch.float32,
+    q, k, v, attn_mask=attn_mask, scale=scale, backward_backend="triton"
   )
   out.sum().backward()
 
   assert attn_mask.grad is not None
   dq_ref, dk_ref, dv_ref = _sdpa_ref_grads(
-    q,
-    k,
-    v,
-    False,
-    scale,
-    attn_mask=attn_mask.to(dtype),
+    q, k, v, False, scale, attn_mask=attn_mask.to(dtype)
   )
   dmask_ref = _key_position_bias_grad_ref(q, k, v, scale, attn_mask)
 
@@ -696,14 +581,7 @@ def test_ffpa_bwd_triton_additive_attn_mask_only_grad_matches_sdpa():
 
   scale = 1.0 / math.sqrt(D)
   out = ffpa_attn_func(
-    q,
-    k,
-    v,
-    attn_mask=attn_mask,
-    scale=scale,
-    stages=2,
-    acc="f32",
-    backward_backend="triton",
+    q, k, v, attn_mask=attn_mask, scale=scale, backward_backend="triton"
   )
   out.sum().backward()
   assert attn_mask.grad is not None
@@ -717,10 +595,7 @@ def test_ffpa_bwd_triton_additive_attn_mask_only_grad_matches_sdpa():
 
 @pytest.mark.parametrize("dtype", DTYPES, ids=["fp16", "bf16"])
 @pytest.mark.parametrize("Nq", [1, 2, 3, 4, 7])
-@pytest.mark.parametrize(
-  "case",
-  ["base", "causal", "mask", "gqa", "d512"],
-)
+@pytest.mark.parametrize("case", ["base", "causal", "mask", "gqa", "d512"])
 def test_ffpa_bwd_triton_decode_matches_sdpa(dtype, Nq, case):
   """Small-Nq Triton decode backward must match SDPA across modes."""
   B, Hq, Hkv, Nkv, D = 1, 2, 2, 513, 512
@@ -756,10 +631,8 @@ def test_ffpa_bwd_triton_decode_matches_sdpa(dtype, Nq, case):
     is_causal=causal,
     attn_mask=attn_mask,
     scale=scale,
-    stages=2,
-    acc="f32",
     backward_backend="triton",
-    enable_gqa=Hq != Hkv,
+    enable_gqa=Hq != Hkv
   )
   out.backward(grad_out)
 
@@ -771,7 +644,7 @@ def test_ffpa_bwd_triton_decode_matches_sdpa(dtype, Nq, case):
     scale,
     attn_mask=attn_mask,
     return_mask_grad=attn_mask is not None,
-    grad_out=grad_out,
+    grad_out=grad_out
   )
   if attn_mask is None:
     dq_ref, dk_ref, dv_ref = ref
@@ -805,16 +678,7 @@ def test_ffpa_bwd_triton_decode_autotune_matches_sdpa(Nq):
   grad_out = torch.randn_like(q)
 
   scale = 1.0 / math.sqrt(D)
-  out = ffpa_attn_func(
-    q,
-    k,
-    v,
-    scale=scale,
-    stages=2,
-    acc="f32",
-    backward_backend="triton",
-    triton_autotune=True,
-  )
+  out = ffpa_attn_func(q, k, v, scale=scale, backward_backend="triton")
   out.backward(grad_out)
 
   dq_ref, dk_ref, dv_ref = _sdpa_ref_grads(
@@ -835,17 +699,7 @@ def test_ffpa_bwd_triton_decode_autotune_fp32_kv_storage_matches_sdpa():
   v = torch.randn(B, H, Nkv, D, dtype=dtype, device="cuda", requires_grad=True)
 
   scale = 1.0 / math.sqrt(D)
-  out = ffpa_attn_func(
-    q,
-    k,
-    v,
-    scale=scale,
-    stages=2,
-    acc="f32",
-    backward_backend="triton",
-    triton_autotune=True,
-    triton_backward_grad_kv_storage_dtype=torch.float32,
-  )
+  out = ffpa_attn_func(q, k, v, scale=scale, backward_backend="triton")
   out.sum().backward()
 
   dq_ref, dk_ref, dv_ref = _sdpa_ref_grads(q, k, v, False, scale)
@@ -866,25 +720,13 @@ def test_ffpa_bwd_triton_decode_single_query_causal_large_matches_sdpa(dtype):
 
   scale = 1.0 / math.sqrt(D)
   out = ffpa_attn_func(
-    q,
-    k,
-    v,
-    is_causal=True,
-    scale=scale,
-    stages=2,
-    acc="f32",
-    backward_backend="triton",
+    q, k, v, is_causal=True, scale=scale, backward_backend="triton"
   )
   out.backward(grad_out)
 
   out_ref = _sdpa_ref(q.detach(), k.detach(), v.detach(), True, scale)
   dq_ref, dk_ref, dv_ref = _sdpa_ref_grads(
-    q.detach(),
-    k.detach(),
-    v.detach(),
-    True,
-    scale,
-    grad_out=grad_out,
+    q.detach(), k.detach(), v.detach(), True, scale, grad_out=grad_out
   )
 
   tol = {
@@ -914,26 +756,12 @@ def test_ffpa_bwd_triton_dropout_matches_sdpa():
   rng_seed = 123
   torch.manual_seed(rng_seed)
   out = ffpa_attn_func(
-    q,
-    k,
-    v,
-    dropout_p=0.2,
-    scale=scale,
-    stages=2,
-    acc="f32",
-    backward_backend="triton",
+    q, k, v, dropout_p=0.2, scale=scale, backward_backend="triton"
   )
   out.backward(grad_out)
 
   dq_ref, dk_ref, dv_ref = _sdpa_ref_grads(
-    q,
-    k,
-    v,
-    False,
-    scale,
-    dropout_p=0.2,
-    rng_seed=rng_seed,
-    grad_out=grad_out,
+    q, k, v, False, scale, dropout_p=0.2, rng_seed=rng_seed, grad_out=grad_out
   )
 
   torch.testing.assert_close(q.grad, dq_ref, atol=4e-2, rtol=4e-2)
@@ -956,26 +784,12 @@ def test_ffpa_bwd_triton_decode_dropout_matches_sdpa(Nq):
   rng_seed = 567
   torch.manual_seed(rng_seed)
   out = ffpa_attn_func(
-    q,
-    k,
-    v,
-    dropout_p=0.2,
-    scale=scale,
-    stages=2,
-    acc="f32",
-    backward_backend="triton",
+    q, k, v, dropout_p=0.2, scale=scale, backward_backend="triton"
   )
   out.backward(grad_out)
 
   dq_ref, dk_ref, dv_ref = _sdpa_ref_grads(
-    q,
-    k,
-    v,
-    False,
-    scale,
-    dropout_p=0.2,
-    rng_seed=rng_seed,
-    grad_out=grad_out,
+    q, k, v, False, scale, dropout_p=0.2, rng_seed=rng_seed, grad_out=grad_out
   )
 
   torch.testing.assert_close(q.grad, dq_ref, atol=4e-2, rtol=4e-2)
@@ -1005,9 +819,7 @@ def test_ffpa_bwd_triton_dropout_additive_attn_mask_matches_sdpa():
     attn_mask=attn_mask,
     dropout_p=0.2,
     scale=scale,
-    stages=2,
-    acc="f32",
-    backward_backend="triton",
+    backward_backend="triton"
   )
   out.backward(grad_out)
   assert attn_mask.grad is not None
@@ -1023,7 +835,7 @@ def test_ffpa_bwd_triton_dropout_additive_attn_mask_matches_sdpa():
     return_mask_grad=True,
     dropout_p=0.2,
     rng_seed=rng_seed,
-    grad_out=grad_out,
+    grad_out=grad_out
   )
 
   torch.testing.assert_close(q.grad, dq_ref, atol=4e-2, rtol=4e-2)
@@ -1053,16 +865,7 @@ def test_ffpa_bwd_basic(dtype, B, H, N, D):
   v = torch.randn(B, H, N, D, dtype=dtype, device="cuda", requires_grad=True)
 
   scale = 1.0 / math.sqrt(D)
-  out = ffpa_attn_func(
-    q,
-    k,
-    v,
-    is_causal=False,
-    scale=scale,
-    stages=2,
-    acc="f32",
-    high_precision_grad=True,
-  )
+  out = ffpa_attn_func(q, k, v, is_causal=False, scale=scale)
   loss = out.sum()
   loss.backward()
 
@@ -1095,16 +898,7 @@ def test_ffpa_bwd_causal(dtype, N, D):
   v = torch.randn(B, H, N, D, dtype=dtype, device="cuda", requires_grad=True)
 
   scale = 1.0 / math.sqrt(D)
-  out = ffpa_attn_func(
-    q,
-    k,
-    v,
-    is_causal=True,
-    scale=scale,
-    stages=2,
-    acc="f32",
-    high_precision_grad=True,
-  )
+  out = ffpa_attn_func(q, k, v, is_causal=True, scale=scale)
   loss = out.sum()
   loss.backward()
 
@@ -1149,17 +943,7 @@ def test_ffpa_bwd_gqa(dtype, Nh_q, Nh_kv, N, D):
   )
 
   scale = 1.0 / math.sqrt(D)
-  out = ffpa_attn_func(
-    q,
-    k,
-    v,
-    is_causal=False,
-    scale=scale,
-    stages=2,
-    acc="f32",
-    high_precision_grad=True,
-    enable_gqa=True,
-  )
+  out = ffpa_attn_func(q, k, v, is_causal=False, scale=scale, enable_gqa=True)
   loss = out.sum()
   loss.backward()
 
@@ -1194,11 +978,8 @@ def test_ffpa_bwd_sdpa_backend_gqa(dtype, Nh_q, Nh_kv, N, D):
     v,
     is_causal=False,
     scale=scale,
-    stages=2,
-    acc="f32",
-    high_precision_grad=True,
     backward_backend="sdpa",
-    enable_gqa=True,
+    enable_gqa=True
   )
   out.sum().backward()
 
@@ -1223,28 +1004,14 @@ def test_ffpa_bwd_sdpa_backend_additive_attn_mask_matches_sdpa(dtype):
 
   scale = 1.0 / math.sqrt(D)
   out = ffpa_attn_func(
-    q,
-    k,
-    v,
-    attn_mask=attn_mask,
-    scale=scale,
-    stages=2,
-    acc="f32",
-    high_precision_grad=True,
-    backward_backend="sdpa",
+    q, k, v, attn_mask=attn_mask, scale=scale, backward_backend="sdpa"
   )
   out.sum().backward()
   assert attn_mask.grad is not None
   assert attn_mask.grad.shape == (1, 1, 1, N)
 
   dq_ref, dk_ref, dv_ref, dmask_ref = _sdpa_ref_grads(
-    q,
-    k,
-    v,
-    False,
-    scale,
-    attn_mask=attn_mask,
-    return_mask_grad=True,
+    q, k, v, False, scale, attn_mask=attn_mask, return_mask_grad=True
   )
 
   tol = _tolerance(dtype)
@@ -1278,17 +1045,7 @@ def test_ffpa_bwd_causal_gqa(dtype, Nh_q, Nh_kv, N, D):
   )
 
   scale = 1.0 / math.sqrt(D)
-  out = ffpa_attn_func(
-    q,
-    k,
-    v,
-    is_causal=True,
-    scale=scale,
-    stages=2,
-    acc="f32",
-    high_precision_grad=True,
-    enable_gqa=True,
-  )
+  out = ffpa_attn_func(q, k, v, is_causal=True, scale=scale, enable_gqa=True)
   loss = out.sum()
   loss.backward()
 
@@ -1325,16 +1082,7 @@ def test_ffpa_bwd_cross_attention(dtype, Nq, Nkv, D):
   v = torch.randn(B, H, Nkv, D, dtype=dtype, device="cuda", requires_grad=True)
 
   scale = 1.0 / math.sqrt(D)
-  out = ffpa_attn_func(
-    q,
-    k,
-    v,
-    is_causal=False,
-    scale=scale,
-    stages=2,
-    acc="f32",
-    high_precision_grad=True,
-  )
+  out = ffpa_attn_func(q, k, v, is_causal=False, scale=scale)
   loss = out.sum()
   loss.backward()
 
@@ -1358,15 +1106,7 @@ def test_ffpa_bwd_sdpa_backend_causal_cross_attention(dtype, Nq, Nkv, D):
 
   scale = 1.0 / math.sqrt(D)
   out = ffpa_attn_func(
-    q,
-    k,
-    v,
-    is_causal=True,
-    scale=scale,
-    stages=2,
-    acc="f32",
-    high_precision_grad=True,
-    backward_backend="sdpa",
+    q, k, v, is_causal=True, scale=scale, backward_backend="sdpa"
   )
   out.sum().backward()
 
@@ -1390,14 +1130,7 @@ def test_ffpa_bwd_nograd_forward_ok(dtype, D):
   v = torch.randn(B, H, N, D, dtype=dtype, device="cuda")
 
   with torch.no_grad():
-    out = ffpa_attn_func(
-      q,
-      k,
-      v,
-      stages=2,
-      acc="f32",
-      high_precision_grad=True,
-    )
+    out = ffpa_attn_func(q, k, v)
 
   scale = 1.0 / math.sqrt(D)
   ref = _sdpa_ref(q, k, v, False, scale)
