@@ -14,6 +14,14 @@ from ._bwd_preprocess import FFPAAttnBwdPreprocess
 from ._dkdv_generic_sm80 import FFPAAttnBwdDKDVSm80SplitDGeneric
 from ._dq_generic_sm80 import FFPAAttnBwdDQSm80SplitDGeneric
 from ._utils import (
+  SM80_BWD_DKDV_NUM_THREADS,
+  SM80_BWD_DKDV_TILE_M,
+  SM80_BWD_DKDV_TILE_N,
+  SM80_BWD_DQ_NUM_THREADS,
+  SM80_BWD_DQ_TILE_M,
+  SM80_BWD_DQ_TILE_N,
+  SM80_BWD_NUM_STAGES_DO,
+  SM80_BWD_NUM_STAGES_Q,
   SM80_BWD_SPLIT_D_CHUNK,
   is_fake_mode,
   maybe_contiguous,
@@ -28,15 +36,6 @@ from ._utils import (
 )
 from .utils.cache_utils import get_jit_cache
 from .utils.cute_dsl_utils import to_cute_tensor
-
-SM80_BWD_DKDV_TILE_M = 64
-SM80_BWD_DKDV_TILE_N = 64
-SM80_BWD_DQ_TILE_M = 64
-SM80_BWD_DQ_TILE_N = 64
-SM80_BWD_NUM_STAGES_Q = 1
-SM80_BWD_NUM_STAGES_DO = 1
-SM80_BWD_DKDV_NUM_THREADS = 128
-SM80_BWD_DQ_NUM_THREADS = 128
 
 
 def _make_fake_bwd_preprocess_tensors(dtype, varlen_q):

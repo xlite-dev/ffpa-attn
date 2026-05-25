@@ -16,7 +16,7 @@ from cutlass.cute.nvgpu import cpasync, warp
 from quack import layout_utils
 
 from . import utils
-from ._utils import SM80_SPLIT_D_CHUNK
+from ._utils import SM80_FWD_SPLIT_D_CHUNK
 from .utils import ampere_helpers as sm80_utils
 from .utils.block_info import BlockInfo
 from .utils.cute_dsl_utils import assume_tensor_aligned
@@ -112,7 +112,7 @@ class FFPAAttnFwdSm80SplitD:
     self.dtype = dtype
     self.head_dim = head_dim
     self.head_dim_v = head_dim if head_dim_v is None else head_dim_v
-    self.d_chunk = SM80_SPLIT_D_CHUNK
+    self.d_chunk = SM80_FWD_SPLIT_D_CHUNK
     self.num_d_chunks = head_dim // self.d_chunk
     self.num_v_chunks = self.head_dim_v // self.d_chunk
     self.tile_hdim = self.d_chunk
@@ -157,7 +157,7 @@ class FFPAAttnFwdSm80SplitD:
     del is_causal
     if head_dim_v is None:
       head_dim_v = head_dim
-    d_chunk = SM80_SPLIT_D_CHUNK
+    d_chunk = SM80_FWD_SPLIT_D_CHUNK
     if dtype not in [cutlass.Float16, cutlass.BFloat16]:
       return False
     if head_dim != head_dim_v:

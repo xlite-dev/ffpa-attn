@@ -142,7 +142,7 @@ ffpa_attn_varlen_func(...)
 | File | Role |
 |---|---|
 | `__init__.py` | Public API wrappers, SDPA↔FA layout adapters, torch custom ops, varlen autograd, `_require_cutedsl_supported`, `cutedsl_{forward,backward}_available`. |
-| `_utils.py` | Shared constants (`SUPPORTED_HEAD_DIM`, tile sizes, dtype map) and validation helpers. |
+| `_utils.py` | Shared constants (`SM90_SUPPORTED_HEAD_DIM`, SM80/SM90 tile sizes, dtype map) and validation helpers. |
 | `_ffpa_fwd_sm90.py` | Forward entry: `_ffpa_attn_forward_sm90()` + JIT compile cache. |
 | `_ffpa_bwd_sm90.py` | Backward entry: `_ffpa_attn_backward_sm90()`, `_bwd_preprocess()`, compile caches. |
 | `_fwd_d512_sm90.py` | Forward kernel class `FFPAAttnFwdSm90SplitD`: D512 full-D 3-warpgroup pipeline. |

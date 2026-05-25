@@ -24,9 +24,9 @@ from typing import Optional, Tuple, Callable
 import torch
 
 from ._utils import (
-  MIN_GENERIC_HEAD_DIM,
+  MIN_SUPPORTED_HEAD_DIM,
   SM80_SUPPORTED_HEAD_DIM,
-  SUPPORTED_HEAD_DIM,
+  SM90_SUPPORTED_HEAD_DIM,
   _decode_custom_op_window,
   _encode_optional_int_for_custom_op,
   _validate_max_seqlen_for_cu_seqlens,
@@ -152,13 +152,13 @@ def cutedsl_max_supported_head_dim(
   to 1024.
   """
   if not torch.cuda.is_available():
-    return SUPPORTED_HEAD_DIM
+    return SM90_SUPPORTED_HEAD_DIM
   if device is None:
     device = torch.device("cuda", torch.cuda.current_device())
   if device.type != "cuda":
-    return SUPPORTED_HEAD_DIM
+    return SM90_SUPPORTED_HEAD_DIM
   major, _ = torch.cuda.get_device_capability(device)
-  return SM80_SUPPORTED_HEAD_DIM if major == 8 else SUPPORTED_HEAD_DIM
+  return SM80_SUPPORTED_HEAD_DIM if major == 8 else SM90_SUPPORTED_HEAD_DIM
 
 
 def cutedsl_backward_available(device: Optional[torch.device] = None) -> bool:
@@ -240,11 +240,11 @@ def _require_cutedsl_supported(
     raise NotImplementedError(
       f"cutedsl backend only supports SM80/SM89 and SM90; got compute capability {major}.x"
     )
-  max_head_dim = SM80_SUPPORTED_HEAD_DIM if major == 8 else SUPPORTED_HEAD_DIM
-  if not (MIN_GENERIC_HEAD_DIM < q.size(-1) <= max_head_dim):
+  max_head_dim = SM80_SUPPORTED_HEAD_DIM if major == 8 else SM90_SUPPORTED_HEAD_DIM
+  if not (MIN_SUPPORTED_HEAD_DIM <= q.size(-1) <= max_head_dim):
     raise NotImplementedError(
       f"cutedsl backend only supports dense head_dim in "
-      f"({MIN_GENERIC_HEAD_DIM}, {max_head_dim}]; got {q.size(-1)}"
+      f"[{MIN_SUPPORTED_HEAD_DIM}, {max_head_dim}]; got {q.size(-1)}"
     )
   if major == 8 and q.size(-1) % 64 != 0:
     raise NotImplementedError(
@@ -451,9 +451,9 @@ def _ffpa_attn_varlen_cutedsl(
 
   requires_grad = any(t.requires_grad for t in (q, k, v))
   max_head_dim = cutedsl_max_supported_head_dim(q.device)
-  if not (MIN_GENERIC_HEAD_DIM < q.size(-1) <= max_head_dim):
+  if not (MIN_SUPPORTED_HEAD_DIM <= q.size(-1) <= max_head_dim):
     raise NotImplementedError(
-      f"ffpa_attn_varlen_func cutedsl supports head_dim in ({MIN_GENERIC_HEAD_DIM}, {max_head_dim}]; "
+      f"ffpa_attn_varlen_func cutedsl supports head_dim in [{MIN_SUPPORTED_HEAD_DIM}, {max_head_dim}]; "
       f"got {q.size(-1)}"
     )
   _require_cutedsl_supported(q, k, v, requires_grad=requires_grad)

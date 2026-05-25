@@ -11,7 +11,7 @@ from typing import Optional, Type
 import cutlass
 
 from ._fwd_d512_sm90 import FFPAAttnFwdSm90SplitD
-from ._utils import SUPPORTED_HEAD_DIM, MIN_GENERIC_HEAD_DIM
+from ._utils import SM90_SUPPORTED_HEAD_DIM, MIN_SUPPORTED_HEAD_DIM
 
 
 def _generic_tile_head_dim(head_dim: int, head_dim_v: int) -> int:
@@ -20,12 +20,12 @@ def _generic_tile_head_dim(head_dim: int, head_dim_v: int) -> int:
       f"generic CuTeDSL dense path requires q/k head_dim == v head_dim_v, "
       f"got {head_dim} and {head_dim_v}"
     )
-  if head_dim <= MIN_GENERIC_HEAD_DIM or head_dim > SUPPORTED_HEAD_DIM:
+  if head_dim < MIN_SUPPORTED_HEAD_DIM or head_dim > SM90_SUPPORTED_HEAD_DIM:
     raise ValueError(
-      f"generic CuTeDSL dense path supports {MIN_GENERIC_HEAD_DIM} < head_dim <= "
-      f"{SUPPORTED_HEAD_DIM}, got {head_dim}"
+      f"generic CuTeDSL dense path supports {MIN_SUPPORTED_HEAD_DIM} <= head_dim <= "
+      f"{SM90_SUPPORTED_HEAD_DIM}, got {head_dim}"
     )
-  return SUPPORTED_HEAD_DIM
+  return SM90_SUPPORTED_HEAD_DIM
 
 
 class FFPAAttnFwdSm90SplitDGeneric(FFPAAttnFwdSm90SplitD):

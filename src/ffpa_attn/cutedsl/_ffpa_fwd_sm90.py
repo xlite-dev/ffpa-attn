@@ -13,8 +13,8 @@ import torch
 import cutlass.cute as cute
 
 from ._utils import (
-  FWD_TILE_M,
-  FWD_TILE_N,
+  SM90_FWD_TILE_M,
+  SM90_FWD_TILE_N,
   is_fake_mode,
   maybe_contiguous,
   _call_with_tvm_ffi_current_stream,
@@ -142,8 +142,8 @@ def _ffpa_attn_forward_sm90(
   current_stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
 
   # SplitD tile sizes (hardcoded)
-  tile_m = FWD_TILE_M  # tile_m=64 required by num_wg_mma==1 for register headroom
-  tile_n = FWD_TILE_N  # tile_n=128 with sO_spill for register pressure management
+  tile_m = SM90_FWD_TILE_M  # tile_m=64 required by num_wg_mma==1 for register headroom
+  tile_n = SM90_FWD_TILE_N  # tile_n=128 with sO_spill for register pressure management
 
   # Auto-detect K=V: same data pointer means same tensor
   kv_same = k is v if is_fake_mode() else k.data_ptr() == v.data_ptr()

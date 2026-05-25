@@ -17,15 +17,33 @@ import cutlass
 from cutlass.base_dsl import BaseDSL
 from cutlass.base_dsl.arch import Arch
 
-MIN_GENERIC_HEAD_DIM = 256
-SUPPORTED_HEAD_DIM = 512
+MIN_SUPPORTED_HEAD_DIM = 320
+
+# SM90 ENVIRONMENT VARIABLES
+SM90_SUPPORTED_HEAD_DIM = 512
+SM90_FWD_TILE_M = 64
+SM90_FWD_TILE_N = 128
+SM90_BWD_TILE_M = 64
+SM90_BWD_TILE_N = 64
+
+# SM80/SM89 ENVIRONMENT VARIABLES
 SM80_SUPPORTED_HEAD_DIM = 1024
-SM80_SPLIT_D_CHUNK = 32
+SM80_FWD_SPLIT_D_CHUNK = 32
+SM80_FWD_NUM_STAGES = 2
 SM80_BWD_SPLIT_D_CHUNK = 64
-FWD_TILE_M = 64
-FWD_TILE_N = 128
-BWD_TILE_M = 64
-BWD_TILE_N = 64
+SM80_FWD_TILE_M = 64
+SM80_FWD_TILE_N = 128
+SM80_BWD_TILE_M = 64
+SM80_BWD_TILE_N = 64
+SM80_BWD_DKDV_TILE_M = 64
+SM80_BWD_DKDV_TILE_N = 64
+SM80_BWD_DQ_TILE_M = 64
+SM80_BWD_DQ_TILE_N = 64
+SM80_BWD_NUM_STAGES_Q = 1
+SM80_BWD_NUM_STAGES_DO = 1
+SM80_BWD_DKDV_NUM_THREADS = 128
+SM80_BWD_DQ_NUM_THREADS = 128
+
 _VARLEN_CUSTOM_OP_NONE_INT = -(2**31)
 
 torch2cute_dtype_map = {
@@ -62,25 +80,25 @@ def _get_device_arch():
 def _validate_head_dims(head_dim: int, head_dim_v: int) -> None:
   """Validate dense SM90 SplitD head dimension constraints."""
   if head_dim != head_dim_v or not (
-    MIN_GENERIC_HEAD_DIM < head_dim <= SUPPORTED_HEAD_DIM
+    MIN_SUPPORTED_HEAD_DIM <= head_dim <= SM90_SUPPORTED_HEAD_DIM
   ):
     raise ValueError(
       f"(head_dim, head_dim_v)=({head_dim}, {head_dim_v}) is not supported. "
       f"This dense SplitD interface requires q/k head_dim == v head_dim_v and "
-      f"{MIN_GENERIC_HEAD_DIM} < head_dim <= {SUPPORTED_HEAD_DIM}."
+      f"{MIN_SUPPORTED_HEAD_DIM} <= head_dim <= {SM90_SUPPORTED_HEAD_DIM}."
     )
 
 
 def _validate_sm80_head_dims(head_dim: int, head_dim_v: int) -> None:
   """Validate dense SM80/SM89 Split-D head dimension constraints."""
   if head_dim != head_dim_v or not (
-    MIN_GENERIC_HEAD_DIM < head_dim <= SM80_SUPPORTED_HEAD_DIM
-  ) or head_dim % SM80_SPLIT_D_CHUNK != 0:
+    MIN_SUPPORTED_HEAD_DIM <= head_dim <= SM80_SUPPORTED_HEAD_DIM
+  ) or head_dim % SM80_FWD_SPLIT_D_CHUNK != 0:
     raise ValueError(
       f"(head_dim, head_dim_v)=({head_dim}, {head_dim_v}) is not supported. "
       f"The SM80/SM89 Split-D interface requires q/k head_dim == v "
-      f"head_dim_v, {MIN_GENERIC_HEAD_DIM} < head_dim <= "
-      f"{SM80_SUPPORTED_HEAD_DIM}, and head_dim % {SM80_SPLIT_D_CHUNK} == 0."
+      f"head_dim_v, {MIN_SUPPORTED_HEAD_DIM} <= head_dim <= "
+      f"{SM80_SUPPORTED_HEAD_DIM}, and head_dim % {SM80_FWD_SPLIT_D_CHUNK} == 0."
     )
 
 

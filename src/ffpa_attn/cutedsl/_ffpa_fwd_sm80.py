@@ -16,8 +16,9 @@ import cutlass.cute as cute
 
 from ._fwd_generic_sm80 import FFPAAttnFwdSm80SplitD
 from ._utils import (
-  FWD_TILE_M,
-  FWD_TILE_N,
+  SM80_FWD_TILE_M,
+  SM80_FWD_TILE_N,
+  SM80_FWD_NUM_STAGES,
   is_fake_mode,
   maybe_contiguous,
   _call_with_tvm_ffi_current_stream,
@@ -34,8 +35,6 @@ from ._utils import (
 from .utils.cache_utils import get_jit_cache
 from .utils import fa_logging
 from .utils.cute_dsl_utils import to_cute_tensor
-
-SM80_FWD_NUM_STAGES = 2
 
 
 def _ffpa_attn_forward_sm80(
@@ -187,8 +186,8 @@ def _ffpa_attn_forward_sm80(
     dtype,
     head_dim,
     head_dim_v,
-    FWD_TILE_M,
-    FWD_TILE_N,
+    SM80_FWD_TILE_M,
+    SM80_FWD_TILE_N,
     SM80_FWD_NUM_STAGES,
     128,
     causal,
@@ -196,7 +195,7 @@ def _ffpa_attn_forward_sm80(
   ):
     raise RuntimeError(
       "SM80/SM89 CuTeDSL forward configuration exceeds kernel resource limits: "
-      f"head_dim={head_dim}, tile=({FWD_TILE_M}, {FWD_TILE_N}), "
+      f"head_dim={head_dim}, tile=({SM80_FWD_TILE_M}, {SM80_FWD_TILE_N}), "
       f"num_stages={SM80_FWD_NUM_STAGES}, arch={smem_capacity_arch}."
     )
 
@@ -223,8 +222,8 @@ def _ffpa_attn_forward_sm80(
     lse is None,
     cu_seqlens_q is None,
     cu_seqlens_k is None,
-    FWD_TILE_M,
-    FWD_TILE_N,
+    SM80_FWD_TILE_M,
+    SM80_FWD_TILE_N,
     device_arch,
     cute_arch_key,
     fa_logging.get_fa_log_level(),
@@ -248,8 +247,8 @@ def _ffpa_attn_forward_sm80(
       qhead_per_kvhead,
       is_causal=causal,
       pack_gqa=False,
-      tile_m=FWD_TILE_M,
-      tile_n=FWD_TILE_N,
+      tile_m=SM80_FWD_TILE_M,
+      tile_n=SM80_FWD_TILE_N,
       num_stages=SM80_FWD_NUM_STAGES,
     )
     compile_args = [

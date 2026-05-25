@@ -9,7 +9,7 @@ from typing import Optional, Type
 import cutlass
 
 from ._fwd_generic_sm90 import FFPAAttnFwdSm90SplitDGeneric
-from ._utils import MIN_GENERIC_HEAD_DIM
+from ._utils import MIN_SUPPORTED_HEAD_DIM
 
 D384_AWARE_HEAD_DIM = 384
 
@@ -39,9 +39,9 @@ class FFPAAttnFwdSm90SplitDD384Aware(FFPAAttnFwdSm90SplitDGeneric):
         f"D384-aware CuTeDSL dense path requires q/k head_dim == v head_dim_v, "
         f"got {head_dim} and {logical_head_dim_v}"
       )
-    if not MIN_GENERIC_HEAD_DIM < head_dim <= D384_AWARE_HEAD_DIM:
+    if not MIN_SUPPORTED_HEAD_DIM <= head_dim <= D384_AWARE_HEAD_DIM:
       raise ValueError(
-        f"D384-aware CuTeDSL dense path supports {MIN_GENERIC_HEAD_DIM} < head_dim <= "
+        f"D384-aware CuTeDSL dense path supports {MIN_SUPPORTED_HEAD_DIM} <= head_dim <= "
         f"{D384_AWARE_HEAD_DIM}, got {head_dim}"
       )
     super().__init__(
