@@ -14,6 +14,7 @@ from torch._guards import active_fake_mode
 import tvm_ffi
 
 import cutlass
+import cutlass.utils as utils_basic
 from cutlass.base_dsl import BaseDSL
 from cutlass.base_dsl.arch import Arch
 
@@ -58,6 +59,12 @@ SM80_BWD_SPLIT_D_CHUNK = 64
 # cost but proportionally grow shared-memory usage; ``can_implement`` decides per
 # arch whether each candidate fits the SMEM_CAPACITY_MAP entry for that target.
 _SPLIT_D_CHUNK_CANDIDATES = (256, 128, 64)
+
+# Wider chunks are only worthwhile on archs with abundant SMEM (A100 ~164KB,
+# Hopper / server Blackwell ~228KB). On sm_89/sm_86 and sm_120/sm_121 the
+# per-SM SMEM is ~100KB, where a wider chunk eats into occupancy and measured
+# slower than the conservative default in microbenchmarks (D=640 on L20).
+_WIDE_SPLIT_D_MIN_SMEM_BYTES = 160 * 1024
 
 _VARLEN_CUSTOM_OP_NONE_INT = -(2**31)
 
@@ -224,6 +231,7 @@ def _validate_sm80_arch() -> tuple[int, str]:
 def _pick_split_d_chunk(
   can_implement_fn: Callable[..., bool],
   default_chunk: int,
+  wide_min_smem_bytes: int = 0,
   **can_implement_kwargs,
 ) -> int:
   """Pick the largest Split-D chunk that divides ``head_dim`` and fits in SMEM.
@@ -231,21 +239,39 @@ def _pick_split_d_chunk(
   Candidates are probed from widest to narrowest (256 → 128 → 64) before
   falling back to ``default_chunk``. The kernel's own ``can_implement`` is the
   source of truth for whether a given chunk fits the target arch's SMEM
-  capacity (see :data:`cutlass.cutlass_dsl.SMEM_CAPACITY_MAP`), so this picker
-  works uniformly for SM80/SM89 (~100/164 KB), SM90/SM100/SM103 (~228 KB), and
-  SM120/SM121 (~100 KB) without per-arch hard-coding.
+  capacity (see :data:`cutlass.cutlass_dsl.SMEM_CAPACITY_MAP`).
+
+  ``wide_min_smem_bytes`` gates whether wide candidates are tried at all:
+
+  - The forward path passes :data:`_WIDE_SPLIT_D_MIN_SMEM_BYTES` (160KB) so
+    only Hopper / server Blackwell (sm_90/sm_100/sm_103/sm_110 with ~228KB)
+    upgrade the chunk; SMEM-tight archs (sm_89/sm_86/sm_120/sm_121 ≈ 100KB)
+    keep the conservative default that micro-benchmarks favoured.
+  - The backward path passes ``0`` to always probe the wider candidates,
+    because dK/dV and dQ default to a larger ``d_chunk=64`` whose smem
+    footprint is small enough that wider variants often still fit even on
+    SMEM-tight archs and just shorten the d-loop.
 
   :param can_implement_fn: Bound ``can_implement`` of the target kernel class.
   :param default_chunk: Conservative chunk used as the final fallback.
+  :param wide_min_smem_bytes: Minimum arch SMEM capacity (bytes) required
+      before the wide candidates are considered. ``0`` always probes; set to
+      :data:`_WIDE_SPLIT_D_MIN_SMEM_BYTES` to restrict to large-SMEM archs.
   :param can_implement_kwargs: Forwarded to ``can_implement`` for each probe;
-      must include ``head_dim`` so chunk divisibility can be checked.
+      must include ``head_dim`` so chunk divisibility can be checked, and
+      ``smem_capacity_arch`` so the wide-chunk gate can be evaluated.
   :returns: The selected chunk width.
   :raises RuntimeError: If no candidate (including ``default_chunk``) fits.
   """
   head_dim = can_implement_kwargs["head_dim"]
+  smem_capacity_arch = can_implement_kwargs.get("smem_capacity_arch", "sm_80")
+  smem_capacity = utils_basic.get_smem_capacity_in_bytes(smem_capacity_arch)
+  wide_candidates = (
+    _SPLIT_D_CHUNK_CANDIDATES if smem_capacity >= wide_min_smem_bytes else ()
+  )
   seen = set()
   ordered: list[int] = []
-  for cand in (*_SPLIT_D_CHUNK_CANDIDATES, default_chunk):
+  for cand in (*wide_candidates, default_chunk):
     if cand in seen:
       continue
     seen.add(cand)
