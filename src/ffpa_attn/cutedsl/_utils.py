@@ -194,17 +194,23 @@ def _validate_sm90_arch() -> tuple[int, str]:
 
 
 def _validate_sm80_arch() -> tuple[int, str]:
-  """Validate that the active CuTeDSL target is Ampere/Ada SM80-SM89."""
+  """Validate that the active CuTeDSL target is SM80 or newer.
+
+  The Split-D path emits Ampere-class warp MMA + cp.async, which is
+  forward-compatible on SM89/SM90/SM120. The dispatcher routes Hopper-only
+  D<=512 to the specialised SM90 kernel; everything else (including D>512
+  on Hopper and all kernels on Blackwell) lands here.
+  """
   arch = _get_device_arch()
-  if arch // 10 != 8:
+  if arch < 80:
     raise RuntimeError(
-      f"This SM80/SM89 Split-D interface requires compute capability 8.x, got {arch}."
+      f"This Split-D interface requires compute capability >= 8.0, got {arch}."
     )
   cute_arch = BaseDSL._get_dsl().get_arch_enum()
-  if cute_arch < Arch.sm_80 or cute_arch >= Arch.sm_90a:
+  if cute_arch < Arch.sm_80:
     raise RuntimeError(
-      "This Split-D path emits Ampere/Ada warp-level MMA and cp.async code. "
-      f"CuTeDSL selected {cute_arch}, but an SM80-SM89 target is required."
+      "This Split-D path emits Ampere-class warp-level MMA and cp.async code. "
+      f"CuTeDSL selected {cute_arch}, but Arch.sm_80 or newer is required."
     )
   return arch, _cute_arch_cache_key(cute_arch)
 
