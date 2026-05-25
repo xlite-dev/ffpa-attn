@@ -64,7 +64,7 @@ _SPLIT_D_CHUNK_CANDIDATES = (256, 128, 64)
 # Hopper / server Blackwell ~228KB). On sm_89/sm_86 and sm_120/sm_121 the
 # per-SM SMEM is ~100KB, where a wider chunk eats into occupancy and measured
 # slower than the conservative default in microbenchmarks (D=640 on L20).
-_WIDE_SPLIT_D_MIN_SMEM_BYTES = 160 * 1024
+_WIDE_SPLIT_D_MIN_SMEM_BYTES = 128 * 1024
 
 _VARLEN_CUSTOM_OP_NONE_INT = -(2**31)
 
@@ -231,7 +231,7 @@ def _validate_sm80_arch() -> tuple[int, str]:
 def _pick_split_d_chunk(
   can_implement_fn: Callable[..., bool],
   default_chunk: int,
-  wide_min_smem_bytes: int = 0,
+  wide_min_smem_bytes: int | None = None,
   **can_implement_kwargs,
 ) -> int:
   """Pick the largest Split-D chunk that divides ``head_dim`` and fits in SMEM.
@@ -263,6 +263,8 @@ def _pick_split_d_chunk(
   head_dim = can_implement_kwargs["head_dim"]
   smem_capacity_arch = can_implement_kwargs.get("smem_capacity_arch", "sm_80")
   smem_capacity = utils_basic.get_smem_capacity_in_bytes(smem_capacity_arch)
+  if wide_min_smem_bytes is None:
+    wide_min_smem_bytes = _WIDE_SPLIT_D_MIN_SMEM_BYTES
   wide_candidates = (
     _SPLIT_D_CHUNK_CANDIDATES if smem_capacity >= wide_min_smem_bytes else ()
   )

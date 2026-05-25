@@ -21,7 +21,6 @@ from ._utils import (
   SM80_FWD_NUM_STAGES,
   SM80_FWD_NUM_THREADS,
   SM80_FWD_SPLIT_D_CHUNK,
-  _WIDE_SPLIT_D_MIN_SMEM_BYTES,
   is_fake_mode,
   maybe_contiguous,
   _call_with_tvm_ffi_current_stream,
@@ -189,7 +188,6 @@ def _ffpa_attn_forward_sm80(
   fwd_d_chunk = _pick_split_d_chunk(
     FFPAAttnFwdSm80SplitD.can_implement,
     SM80_FWD_SPLIT_D_CHUNK,
-    wide_min_smem_bytes=_WIDE_SPLIT_D_MIN_SMEM_BYTES,
     dtype=dtype,
     head_dim=head_dim,
     head_dim_v=head_dim_v,

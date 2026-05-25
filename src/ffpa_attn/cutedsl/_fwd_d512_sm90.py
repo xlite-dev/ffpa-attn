@@ -32,7 +32,7 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Int32, Boolean, const_expr
-from cutlass.cute.nvgpu import cpasync, warpgroup
+from cutlass.cute.nvgpu import OperandMajorMode, cpasync, warpgroup
 from cutlass.utils import LayoutEnum
 import cutlass.utils.hopper_helpers as sm90_utils_basic
 from cutlass import pipeline
@@ -177,8 +177,8 @@ class FFPAAttnFwdSm90SplitD:
     tiled_mma_qk = sm90_utils_basic.make_trivial_tiled_mma(
       self.dtype,
       self.dtype,
-      warpgroup.OperandMajorMode.K,
-      warpgroup.OperandMajorMode.K,
+      OperandMajorMode.K,
+      OperandMajorMode.K,
       Float32,
       atom_layout_mnk=(self.tile_m // 64, 1, 1),
       tiler_mn=(64, self.tile_n),
@@ -187,8 +187,8 @@ class FFPAAttnFwdSm90SplitD:
     tiled_mma_pv = sm90_utils_basic.make_trivial_tiled_mma(
       self.dtype,
       self.dtype,
-      warpgroup.OperandMajorMode.K,
-      warpgroup.OperandMajorMode.MN,
+      OperandMajorMode.K,
+      OperandMajorMode.MN,
       Float32,
       atom_layout_mnk=(1, 2, 1),
       tiler_mn=(64, self.tile_hdimv_half),
@@ -199,8 +199,8 @@ class FFPAAttnFwdSm90SplitD:
     tiled_mma_pv_wg1 = sm90_utils_basic.make_trivial_tiled_mma(
       self.dtype,
       self.dtype,
-      warpgroup.OperandMajorMode.K,
-      warpgroup.OperandMajorMode.MN,
+      OperandMajorMode.K,
+      OperandMajorMode.MN,
       Float32,
       atom_layout_mnk=(1, 2, 1),
       tiler_mn=(64, self.tile_hdimv_half),
@@ -211,8 +211,8 @@ class FFPAAttnFwdSm90SplitD:
     tiled_mma_pv_epi = sm90_utils_basic.make_trivial_tiled_mma(
       self.dtype,
       self.dtype,
-      warpgroup.OperandMajorMode.K,
-      warpgroup.OperandMajorMode.MN,
+      OperandMajorMode.K,
+      OperandMajorMode.MN,
       Float32,
       atom_layout_mnk=(1, 1, 1),
       tiler_mn=(64, self.tile_hdimv_half),

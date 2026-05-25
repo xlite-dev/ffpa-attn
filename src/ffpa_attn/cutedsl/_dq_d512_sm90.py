@@ -52,7 +52,7 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import cutlass.utils.hopper_helpers as sm90_utils_basic
-from cutlass.cute.nvgpu import cpasync, warpgroup
+from cutlass.cute.nvgpu import OperandMajorMode, cpasync
 from cutlass.cute import FastDivmodDivisor
 from cutlass import Float32, Int32, Boolean, const_expr
 from cutlass.utils import LayoutEnum
@@ -229,8 +229,8 @@ class FFPAAttnBwdDQSm90SplitD:
     tiled_mma_SdP = sm90_utils_basic.make_trivial_tiled_mma(
       self.dtype,
       self.dtype,
-      warpgroup.OperandMajorMode.K,
-      warpgroup.OperandMajorMode.K,
+      OperandMajorMode.K,
+      OperandMajorMode.K,
       self.qk_acc_dtype,
       atom_layout_mnk=atom_layout_SdP,
       tiler_mn=tiler_mn_SdP,
@@ -247,8 +247,8 @@ class FFPAAttnBwdDQSm90SplitD:
     tiled_mma_dQ = sm90_utils_basic.make_trivial_tiled_mma(
       self.dtype,
       self.dtype,
-      warpgroup.OperandMajorMode.K,
-      warpgroup.OperandMajorMode.MN,
+      OperandMajorMode.K,
+      OperandMajorMode.MN,
       Float32,
       atom_layout_mnk=atom_layout_dQ,
       tiler_mn=tiler_mn_dQ,
