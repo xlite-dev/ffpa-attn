@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import math
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Type
 
+import cutlass
 import torch
 import cutlass.cute as cute
 from cutlass import Float32, Int32
@@ -14,10 +15,22 @@ from ._bwd_preprocess import FFPAAttnBwdPreprocess
 from ._dkdv_generic_sm80 import FFPAAttnBwdDKDVSm80SplitDGeneric
 from ._dq_generic_sm80 import FFPAAttnBwdDQSm80SplitDGeneric
 from ._utils import (
+  SM80_BWD_DKDV_NUM_STAGES_DO,
+  SM80_BWD_DKDV_NUM_STAGES_Q,
+  SM80_BWD_DKDV_NUM_THREADS,
+  SM80_BWD_DKDV_TILE_M,
+  SM80_BWD_DKDV_TILE_N,
+  SM80_BWD_DQ_NUM_STAGES_DO,
+  SM80_BWD_DQ_NUM_STAGES_Q,
+  SM80_BWD_DQ_NUM_THREADS,
+  SM80_BWD_DQ_TILE_M,
+  SM80_BWD_DQ_TILE_N,
   SM80_BWD_SPLIT_D_CHUNK,
+  _WIDE_SPLIT_D_MIN_SMEM_BYTES,
   is_fake_mode,
   maybe_contiguous,
   _call_with_tvm_ffi_current_stream,
+  _pick_split_d_chunk,
   _resolve_causal_local_window,
   _validate_max_seqlen_for_cu_seqlens,
   _validate_qkv_common,
@@ -28,15 +41,6 @@ from ._utils import (
 )
 from .utils.cache_utils import get_jit_cache
 from .utils.cute_dsl_utils import to_cute_tensor
-
-SM80_BWD_DKDV_TILE_M = 64
-SM80_BWD_DKDV_TILE_N = 64
-SM80_BWD_DQ_TILE_M = 64
-SM80_BWD_DQ_TILE_N = 64
-SM80_BWD_NUM_STAGES_Q = 1
-SM80_BWD_NUM_STAGES_DO = 1
-SM80_BWD_DKDV_NUM_THREADS = 128
-SM80_BWD_DQ_NUM_THREADS = 128
 
 
 def _make_fake_bwd_preprocess_tensors(dtype, varlen_q):
@@ -150,6 +154,25 @@ def _bwd_preprocess(
 _bwd_preprocess.compile_cache = get_jit_cache("bwd_pre_sm80")
 
 
+def _torch_to_cute_storage_dtype(dtype: torch.dtype, ) -> Type[cutlass.Numeric]:
+  """Map a torch dtype to the cutlass type used for dK/dV HBM storage.
+
+  Accepts fp16/bf16 (default activation dtype) and fp32 (the
+  ``grad_kv_storage_dtype`` override). Inputs are restricted by
+  ``_validate_training_dtype`` to fp16/bf16, so we do not need the
+  general-purpose ``torch2cute_dtype_map`` here.
+  """
+  if dtype == torch.float16:
+    return cutlass.Float16
+  if dtype == torch.bfloat16:
+    return cutlass.BFloat16
+  if dtype == torch.float32:
+    return cutlass.Float32
+  raise TypeError(
+    f"Unsupported dK/dV storage dtype {dtype!r}; expected fp16, bf16, or fp32."
+  )
+
+
 def _ffpa_attn_backward_sm80_dense(
   q: torch.Tensor,
   k: torch.Tensor,
@@ -166,7 +189,14 @@ def _ffpa_attn_backward_sm80_dense(
   device_arch: int,
   cute_arch_key: str,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-  """Run the native dense SM80 backward kernels."""
+  """Run the native dense SM80 backward kernels.
+
+  When ``dk`` / ``dv`` are pre-allocated with a dtype that differs from
+  ``q.dtype`` (e.g. fp32 buffers for higher cross-tile accumulation
+  precision), the dK/dV kernel is specialised to write directly into that
+  storage. The caller is responsible for the final cast back to the
+  user-visible activation dtype.
+  """
   batch_size, seqlen_q, num_head, head_dim = q.shape
   seqlen_k = k.shape[1]
   num_head_kv = k.shape[2]
@@ -178,24 +208,57 @@ def _ffpa_attn_backward_sm80_dense(
   dq_tile_n = SM80_BWD_DQ_TILE_N
   pre_tile_m = dq_tile_m
   dtype = torch2cute_dtype_map[q.dtype]
+  dkdv_storage_dtype = _torch_to_cute_storage_dtype(dk.dtype)
   smem_capacity_arch = f"sm_{device_arch // 10}{device_arch % 10}"
+  dkdv_d_chunk = _pick_split_d_chunk(
+    FFPAAttnBwdDKDVSm80SplitDGeneric.can_implement,
+    SM80_BWD_SPLIT_D_CHUNK,
+    wide_min_smem_bytes=_WIDE_SPLIT_D_MIN_SMEM_BYTES,
+    dtype=dtype,
+    head_dim=head_dim,
+    head_dim_v=head_dim_v,
+    tile_m=dkdv_tile_m,
+    tile_n=dkdv_tile_n,
+    num_stages_Q=SM80_BWD_DKDV_NUM_STAGES_Q,
+    num_stages_dO=SM80_BWD_DKDV_NUM_STAGES_DO,
+    num_threads=SM80_BWD_DKDV_NUM_THREADS,
+    is_causal=causal,
+    smem_capacity_arch=smem_capacity_arch,
+  )
+  dq_d_chunk = _pick_split_d_chunk(
+    FFPAAttnBwdDQSm80SplitDGeneric.can_implement,
+    SM80_BWD_SPLIT_D_CHUNK,
+    wide_min_smem_bytes=_WIDE_SPLIT_D_MIN_SMEM_BYTES,
+    dtype=dtype,
+    head_dim=head_dim,
+    head_dim_v=head_dim_v,
+    tile_m=dq_tile_m,
+    tile_n=dq_tile_n,
+    num_stages_Q=SM80_BWD_DQ_NUM_STAGES_Q,
+    num_stages_dO=SM80_BWD_DQ_NUM_STAGES_DO,
+    num_threads=SM80_BWD_DQ_NUM_THREADS,
+    is_causal=causal,
+    smem_capacity_arch=smem_capacity_arch,
+  )
   if not FFPAAttnBwdDKDVSm80SplitDGeneric.can_implement(
     dtype,
     head_dim,
     head_dim_v,
     dkdv_tile_m,
     dkdv_tile_n,
-    SM80_BWD_NUM_STAGES_Q,
-    SM80_BWD_NUM_STAGES_DO,
+    SM80_BWD_DKDV_NUM_STAGES_Q,
+    SM80_BWD_DKDV_NUM_STAGES_DO,
     SM80_BWD_DKDV_NUM_THREADS,
     causal,
     smem_capacity_arch=smem_capacity_arch,
+    d_chunk=dkdv_d_chunk,
+    dkdv_storage_dtype=dkdv_storage_dtype,
   ):
     raise RuntimeError(
       "SM80/SM89 CuTeDSL dK/dV configuration exceeds kernel resource limits: "
       f"head_dim={head_dim}, tile=({dkdv_tile_m}, {dkdv_tile_n}), "
-      f"num_stages_Q={SM80_BWD_NUM_STAGES_Q}, "
-      f"num_stages_dO={SM80_BWD_NUM_STAGES_DO}, arch={smem_capacity_arch}."
+      f"num_stages_Q={SM80_BWD_DKDV_NUM_STAGES_Q}, "
+      f"num_stages_dO={SM80_BWD_DKDV_NUM_STAGES_DO}, arch={smem_capacity_arch}."
     )
   if not FFPAAttnBwdDQSm80SplitDGeneric.can_implement(
     dtype,
@@ -203,17 +266,18 @@ def _ffpa_attn_backward_sm80_dense(
     head_dim_v,
     dq_tile_m,
     dq_tile_n,
-    SM80_BWD_NUM_STAGES_Q,
-    SM80_BWD_NUM_STAGES_DO,
+    SM80_BWD_DQ_NUM_STAGES_Q,
+    SM80_BWD_DQ_NUM_STAGES_DO,
     SM80_BWD_DQ_NUM_THREADS,
     causal,
     smem_capacity_arch=smem_capacity_arch,
+    d_chunk=dq_d_chunk,
   ):
     raise RuntimeError(
       "SM80/SM89 CuTeDSL dQ configuration exceeds kernel resource limits: "
       f"head_dim={head_dim}, tile=({dq_tile_m}, {dq_tile_n}), "
-      f"num_stages_Q={SM80_BWD_NUM_STAGES_Q}, "
-      f"num_stages_dO={SM80_BWD_NUM_STAGES_DO}, arch={smem_capacity_arch}."
+      f"num_stages_Q={SM80_BWD_DQ_NUM_STAGES_Q}, "
+      f"num_stages_dO={SM80_BWD_DQ_NUM_STAGES_DO}, arch={smem_capacity_arch}."
     )
   seqlen_q_rounded = (seqlen_q + pre_tile_m - 1) // pre_tile_m * pre_tile_m
 
@@ -246,6 +310,7 @@ def _ffpa_attn_backward_sm80_dense(
   bwd_key = (
     "sm80_bwd_generic",
     dtype,
+    dkdv_storage_dtype,
     head_dim,
     head_dim_v,
     causal,
@@ -253,8 +318,10 @@ def _ffpa_attn_backward_sm80_dense(
     dkdv_tile_n,
     dq_tile_m,
     dq_tile_n,
-    SM80_BWD_NUM_STAGES_Q,
-    SM80_BWD_NUM_STAGES_DO,
+    SM80_BWD_DQ_NUM_STAGES_Q,
+    SM80_BWD_DQ_NUM_STAGES_DO,
+    SM80_BWD_DKDV_NUM_STAGES_Q,
+    SM80_BWD_DKDV_NUM_STAGES_DO,
     SM80_BWD_SPLIT_D_CHUNK,
     SM80_BWD_DKDV_NUM_THREADS,
     SM80_BWD_DQ_NUM_THREADS,
@@ -263,6 +330,8 @@ def _ffpa_attn_backward_sm80_dense(
     qhead_per_kvhead,
     device_arch,
     cute_arch_key,
+    dkdv_d_chunk,
+    dq_d_chunk,
   )
   if bwd_key not in _ffpa_attn_backward_sm80_dense.compile_cache_dkdv:
     q_t, k_t, v_t, do_t = [to_cute_tensor(t) for t in (q, k, v, dout)]
@@ -277,9 +346,11 @@ def _ffpa_attn_backward_sm80_dense(
       is_causal=causal,
       tile_m=dkdv_tile_m,
       tile_n=dkdv_tile_n,
-      num_stages_Q=SM80_BWD_NUM_STAGES_Q,
-      num_stages_dO=SM80_BWD_NUM_STAGES_DO,
+      num_stages_Q=SM80_BWD_DKDV_NUM_STAGES_Q,
+      num_stages_dO=SM80_BWD_DKDV_NUM_STAGES_DO,
       num_threads=SM80_BWD_DKDV_NUM_THREADS,
+      d_chunk=dkdv_d_chunk,
+      dkdv_storage_dtype=dkdv_storage_dtype,
     )
     _ffpa_attn_backward_sm80_dense.compile_cache_dkdv[bwd_key] = cute.compile(
       ffpa_dkdv,
@@ -309,9 +380,10 @@ def _ffpa_attn_backward_sm80_dense(
       is_causal=causal,
       tile_m=dq_tile_m,
       tile_n=dq_tile_n,
-      num_stages_Q=SM80_BWD_NUM_STAGES_Q,
-      num_stages_dO=SM80_BWD_NUM_STAGES_DO,
+      num_stages_Q=SM80_BWD_DQ_NUM_STAGES_Q,
+      num_stages_dO=SM80_BWD_DQ_NUM_STAGES_DO,
       num_threads=SM80_BWD_DQ_NUM_THREADS,
+      d_chunk=dq_d_chunk,
     )
     _ffpa_attn_backward_sm80_dense.compile_cache_dq[bwd_key] = cute.compile(
       ffpa_dq,
@@ -456,13 +528,21 @@ def _ffpa_attn_backward_sm80(
   if dk is None:
     dk = torch.zeros_like(k)
   else:
-    _validate_tensor(dk, "dk", k.shape, k.dtype, k.device)
+    if dk.dtype not in (k.dtype, torch.float32):
+      raise TypeError(
+        f"dk dtype must be {k.dtype} or torch.float32, got {dk.dtype}"
+      )
+    _validate_tensor(dk, "dk", k.shape, dk.dtype, k.device)
     if not is_fake_mode():
       dk.zero_()
   if dv is None:
     dv = torch.zeros_like(v)
   else:
-    _validate_tensor(dv, "dv", v.shape, v.dtype, v.device)
+    if dv.dtype not in (v.dtype, torch.float32):
+      raise TypeError(
+        f"dv dtype must be {v.dtype} or torch.float32, got {dv.dtype}"
+      )
+    _validate_tensor(dv, "dv", v.shape, dv.dtype, v.device)
     if not is_fake_mode():
       dv.zero_()
 

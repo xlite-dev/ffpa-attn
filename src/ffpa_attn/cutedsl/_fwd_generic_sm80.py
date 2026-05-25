@@ -16,7 +16,7 @@ from cutlass.cute.nvgpu import cpasync, warp
 from quack import layout_utils
 
 from . import utils
-from ._utils import SM80_SPLIT_D_CHUNK
+from ._utils import SM80_FWD_SPLIT_D_CHUNK
 from .utils import ampere_helpers as sm80_utils
 from .utils.block_info import BlockInfo
 from .utils.cute_dsl_utils import assume_tensor_aligned
@@ -108,11 +108,12 @@ class FFPAAttnFwdSm80SplitD:
     tile_n: int = 128,
     num_stages: int = 2,
     num_threads: int = 128,
+    d_chunk: Optional[int] = None,
   ):
     self.dtype = dtype
     self.head_dim = head_dim
     self.head_dim_v = head_dim if head_dim_v is None else head_dim_v
-    self.d_chunk = SM80_SPLIT_D_CHUNK
+    self.d_chunk = SM80_FWD_SPLIT_D_CHUNK if d_chunk is None else d_chunk
     self.num_d_chunks = head_dim // self.d_chunk
     self.num_v_chunks = self.head_dim_v // self.d_chunk
     self.tile_hdim = self.d_chunk
@@ -140,6 +141,7 @@ class FFPAAttnFwdSm80SplitD:
     num_threads,
     is_causal,
     smem_capacity_arch: str = "sm_80",
+    d_chunk: Optional[int] = None,
   ) -> bool:
     """Check whether the SM80 Split-D forward configuration fits resources.
 
@@ -152,12 +154,14 @@ class FFPAAttnFwdSm80SplitD:
     :param num_threads: Threads per CTA.
     :param is_causal: Whether causal masking is enabled.
     :param smem_capacity_arch: Architecture key for shared-memory capacity.
+    :param d_chunk: Optional Split-D chunk width; defaults to the module constant.
     :returns: Whether this configuration can be compiled and launched.
     """
     del is_causal
     if head_dim_v is None:
       head_dim_v = head_dim
-    d_chunk = SM80_SPLIT_D_CHUNK
+    if d_chunk is None:
+      d_chunk = SM80_FWD_SPLIT_D_CHUNK
     if dtype not in [cutlass.Float16, cutlass.BFloat16]:
       return False
     if head_dim != head_dim_v:

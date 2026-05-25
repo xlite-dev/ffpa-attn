@@ -8,18 +8,19 @@ import torch.nn.functional as F
 
 from ffpa_attn import ffpa_attn_func, ffpa_attn_varlen_func
 from ffpa_attn.cutedsl import _ffpa_attn_forward_cutedsl, _ffpa_attn_varlen_impl
+from ffpa_attn.functional import CuTeDSLBackend
 
 
 def _cutedsl_large_d_available() -> bool:
   if not torch.cuda.is_available():
     return False
   major, _ = torch.cuda.get_device_capability()
-  return major in (8, 9)
+  return major >= 8
 
 
 pytestmark = pytest.mark.skipif(
   not _cutedsl_large_d_available(),
-  reason="CuTeDSL large-D tests require compute capability 8.x or 9.x",
+  reason="CuTeDSL large-D tests require compute capability >= 8.0",
 )
 
 
@@ -121,6 +122,72 @@ def test_sm80_cutedsl_dense_autograd_matches_sdpa(D):
   torch.testing.assert_close(
     v_cute.grad, v_ref.grad, **_grad_tol(torch.bfloat16)
   )
+
+
+@pytest.mark.parametrize("causal", [False, True])
+def test_sm80_cutedsl_dkdv_fp32_buffer_matches_sdpa(causal):
+  """CuTeDSL SM80 dKdV with grad_kv_storage_dtype=fp32 must keep public
+  gradient dtype = bf16 and improve dK/dV cross-tile precision under
+  causal bf16 vs the default activation-dtype buffer."""
+  torch.manual_seed(7)
+  B, H, N, D = 1, 4, 256, 512
+  dtype = torch.bfloat16
+  scale = 1.0 / math.sqrt(D)
+  q0 = torch.randn(B, H, N, D, dtype=dtype, device="cuda")
+  k0 = torch.randn(B, H, N, D, dtype=dtype, device="cuda")
+  v0 = torch.randn(B, H, N, D, dtype=dtype, device="cuda")
+  dout = torch.randn(B, H, N, D, dtype=dtype, device="cuda")
+
+  def run(storage_dtype):
+    q = q0.detach().clone().requires_grad_(True)
+    k = k0.detach().clone().requires_grad_(True)
+    v = v0.detach().clone().requires_grad_(True)
+    out = ffpa_attn_func(
+      q,
+      k,
+      v,
+      is_causal=causal,
+      scale=scale,
+      forward_backend=CuTeDSLBackend(forward=True),
+      backward_backend=CuTeDSLBackend(
+        backward=True, grad_kv_storage_dtype=storage_dtype
+      ),
+    )
+    out.backward(dout)
+    return q.grad, k.grad, v.grad
+
+  q_ref = q0.detach().clone().requires_grad_(True)
+  k_ref = k0.detach().clone().requires_grad_(True)
+  v_ref = v0.detach().clone().requires_grad_(True)
+  F.scaled_dot_product_attention(
+    q_ref,
+    k_ref,
+    v_ref,
+    dropout_p=0.0,
+    is_causal=causal,
+    scale=scale,
+  ).backward(dout)
+
+  dq_def, dk_def, dv_def = run(None)
+  dq_f32, dk_f32, dv_f32 = run(torch.float32)
+
+  # Public gradient dtype must remain activation dtype.
+  for g in (dq_def, dk_def, dv_def, dq_f32, dk_f32, dv_f32):
+    assert g.dtype == dtype
+
+  # fp32 buffer matches SDPA within the standard grad tol.
+  torch.testing.assert_close(dq_f32, q_ref.grad, **_grad_tol(dtype))
+  torch.testing.assert_close(dk_f32, k_ref.grad, **_grad_tol(dtype))
+  torch.testing.assert_close(dv_f32, v_ref.grad, **_grad_tol(dtype))
+
+  # fp32 buffer is at least as accurate as the default storage on dK/dV.
+  for g_def, g_f32, g_ref in (
+    (dk_def, dk_f32, k_ref.grad),
+    (dv_def, dv_f32, v_ref.grad),
+  ):
+    err_def = (g_def - g_ref).abs().max().item()
+    err_f32 = (g_f32 - g_ref).abs().max().item()
+    assert err_f32 <= err_def + 1e-6, (err_def, err_f32)
 
 
 def test_sm80_cutedsl_varlen_forward_matches_sdpa():

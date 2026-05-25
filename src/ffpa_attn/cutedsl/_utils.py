@@ -14,18 +14,58 @@ from torch._guards import active_fake_mode
 import tvm_ffi
 
 import cutlass
+import cutlass.utils as utils_basic
 from cutlass.base_dsl import BaseDSL
 from cutlass.base_dsl.arch import Arch
 
-MIN_GENERIC_HEAD_DIM = 256
-SUPPORTED_HEAD_DIM = 512
+MIN_SUPPORTED_HEAD_DIM = 320
+
+# SM90 ENVIRONMENT VARIABLES
+SM90_SUPPORTED_HEAD_DIM = 512
+SM90_FWD_TILE_M = 64
+SM90_FWD_TILE_N = 128
+SM90_BWD_TILE_M = 64
+SM90_BWD_TILE_N = 64
+
+# SM80/SM89 ENVIRONMENT VARIABLES
 SM80_SUPPORTED_HEAD_DIM = 1024
-SM80_SPLIT_D_CHUNK = 32
+
+SM80_FWD_TILE_M = 64
+SM80_FWD_TILE_N = 128
+SM80_FWD_NUM_STAGES = 2
+SM80_FWD_NUM_THREADS = 128
+SM80_FWD_SPLIT_D_CHUNK = 32
+
+SM80_BWD_DKDV_TILE_M = 64
+SM80_BWD_DKDV_TILE_N = 64
+# DKDV kernel supports multi-stage prefetch over the d_chunk dim.
+# Each ring uses an independent commit_group; per-ring wait counts let
+# asymmetric (ns_Q, ns_dO) be correct.
+SM80_BWD_DKDV_NUM_STAGES_Q = 1
+SM80_BWD_DKDV_NUM_STAGES_DO = 2
+SM80_BWD_DKDV_NUM_THREADS = 128
+
+SM80_BWD_DQ_TILE_M = 64
+SM80_BWD_DQ_TILE_N = 64
+# DQ kernel multi-stage prefetch (per-ring commit groups, per-ring wait counts).
+SM80_BWD_DQ_NUM_STAGES_Q = 1
+SM80_BWD_DQ_NUM_STAGES_DO = 1
+SM80_BWD_DQ_NUM_THREADS = 128
+
 SM80_BWD_SPLIT_D_CHUNK = 64
-FWD_TILE_M = 64
-FWD_TILE_N = 128
-BWD_TILE_M = 64
-BWD_TILE_N = 64
+
+# Wider Split-D candidates probed by ``_pick_split_d_chunk`` before falling back
+# to the per-kernel default. Larger chunks shorten the d-loop and amortise epilogue
+# cost but proportionally grow shared-memory usage; ``can_implement`` decides per
+# arch whether each candidate fits the SMEM_CAPACITY_MAP entry for that target.
+_SPLIT_D_CHUNK_CANDIDATES = (256, 128, 64)
+
+# Wider chunks are only worthwhile on archs with abundant SMEM (A100 ~164KB,
+# Hopper / server Blackwell ~228KB). On sm_89/sm_86 and sm_120/sm_121 the
+# per-SM SMEM is ~100KB, where a wider chunk eats into occupancy and measured
+# slower than the conservative default in microbenchmarks (D=640 on L20).
+_WIDE_SPLIT_D_MIN_SMEM_BYTES = 160 * 1024
+
 _VARLEN_CUSTOM_OP_NONE_INT = -(2**31)
 
 torch2cute_dtype_map = {
@@ -60,27 +100,39 @@ def _get_device_arch():
 
 
 def _validate_head_dims(head_dim: int, head_dim_v: int) -> None:
-  """Validate dense SM90 SplitD head dimension constraints."""
+  """Validate the SM90 specialised cutedsl Split-D head dimension constraints.
+
+  Used only when the dispatcher routes to the SM90 Hopper specialised
+  forward/backward kernels (``major == 9`` and ``head_dim <= 512``);
+  every other cutedsl path goes through :func:`_validate_sm80_head_dims`.
+  """
   if head_dim != head_dim_v or not (
-    MIN_GENERIC_HEAD_DIM < head_dim <= SUPPORTED_HEAD_DIM
+    MIN_SUPPORTED_HEAD_DIM <= head_dim <= SM90_SUPPORTED_HEAD_DIM
   ):
     raise ValueError(
       f"(head_dim, head_dim_v)=({head_dim}, {head_dim_v}) is not supported. "
       f"This dense SplitD interface requires q/k head_dim == v head_dim_v and "
-      f"{MIN_GENERIC_HEAD_DIM} < head_dim <= {SUPPORTED_HEAD_DIM}."
+      f"{MIN_SUPPORTED_HEAD_DIM} <= head_dim <= {SM90_SUPPORTED_HEAD_DIM}."
     )
 
 
 def _validate_sm80_head_dims(head_dim: int, head_dim_v: int) -> None:
-  """Validate dense SM80/SM89 Split-D head dimension constraints."""
+  """Validate the SM80 Ampere Split-D head dimension constraints.
+
+  Used for the SM80 Split-D fallback path, which now covers every
+  non-SM90 architecture (SM80/SM89, SM100/SM103/SM120, ...) and any
+  ``head_dim > 512`` on SM90. Requires symmetric q/k/v head_dim in
+  ``[MIN_SUPPORTED_HEAD_DIM, SM80_SUPPORTED_HEAD_DIM]`` and
+  ``head_dim % SM80_FWD_SPLIT_D_CHUNK == 0``.
+  """
   if head_dim != head_dim_v or not (
-    MIN_GENERIC_HEAD_DIM < head_dim <= SM80_SUPPORTED_HEAD_DIM
-  ) or head_dim % SM80_SPLIT_D_CHUNK != 0:
+    MIN_SUPPORTED_HEAD_DIM <= head_dim <= SM80_SUPPORTED_HEAD_DIM
+  ) or head_dim % SM80_FWD_SPLIT_D_CHUNK != 0:
     raise ValueError(
       f"(head_dim, head_dim_v)=({head_dim}, {head_dim_v}) is not supported. "
       f"The SM80/SM89 Split-D interface requires q/k head_dim == v "
-      f"head_dim_v, {MIN_GENERIC_HEAD_DIM} < head_dim <= "
-      f"{SM80_SUPPORTED_HEAD_DIM}, and head_dim % {SM80_SPLIT_D_CHUNK} == 0."
+      f"head_dim_v, {MIN_SUPPORTED_HEAD_DIM} <= head_dim <= "
+      f"{SM80_SUPPORTED_HEAD_DIM}, and head_dim % {SM80_FWD_SPLIT_D_CHUNK} == 0."
     )
 
 
@@ -155,19 +207,81 @@ def _validate_sm90_arch() -> tuple[int, str]:
 
 
 def _validate_sm80_arch() -> tuple[int, str]:
-  """Validate that the active CuTeDSL target is Ampere/Ada SM80-SM89."""
+  """Validate that the active CuTeDSL target is SM80 or newer.
+
+  The Split-D path emits Ampere-class warp MMA + cp.async, which is
+  forward-compatible on SM89/SM90/SM120. The dispatcher routes Hopper-only
+  D<=512 to the specialised SM90 kernel; everything else (including D>512
+  on Hopper and all kernels on Blackwell) lands here.
+  """
   arch = _get_device_arch()
-  if arch // 10 != 8:
+  if arch < 80:
     raise RuntimeError(
-      f"This SM80/SM89 Split-D interface requires compute capability 8.x, got {arch}."
+      f"This Split-D interface requires compute capability >= 8.0, got {arch}."
     )
   cute_arch = BaseDSL._get_dsl().get_arch_enum()
-  if cute_arch < Arch.sm_80 or cute_arch >= Arch.sm_90a:
+  if cute_arch < Arch.sm_80:
     raise RuntimeError(
-      "This Split-D path emits Ampere/Ada warp-level MMA and cp.async code. "
-      f"CuTeDSL selected {cute_arch}, but an SM80-SM89 target is required."
+      "This Split-D path emits Ampere-class warp-level MMA and cp.async code. "
+      f"CuTeDSL selected {cute_arch}, but Arch.sm_80 or newer is required."
     )
   return arch, _cute_arch_cache_key(cute_arch)
+
+
+def _pick_split_d_chunk(
+  can_implement_fn: Callable[..., bool],
+  default_chunk: int,
+  wide_min_smem_bytes: int = 0,
+  **can_implement_kwargs,
+) -> int:
+  """Pick the largest Split-D chunk that divides ``head_dim`` and fits in SMEM.
+
+  Candidates are probed from widest to narrowest (256 → 128 → 64) before
+  falling back to ``default_chunk``. The kernel's own ``can_implement`` is the
+  source of truth for whether a given chunk fits the target arch's SMEM
+  capacity (see :data:`cutlass.cutlass_dsl.SMEM_CAPACITY_MAP`).
+
+  ``wide_min_smem_bytes`` gates whether wide candidates are tried at all.
+  Both forward and backward pass :data:`_WIDE_SPLIT_D_MIN_SMEM_BYTES` (160KB)
+  so only Hopper / server Blackwell (sm_90/sm_100/sm_103/sm_110 with ~228KB)
+  upgrade the chunk; SMEM-tight archs (sm_89/sm_86/sm_120/sm_121 ≈ 100KB)
+  keep the conservative default that micro-benchmarks favoured. For the bwd
+  path, probing wider chunks on L20 (sm_89) was measured ~45% slower than the
+  default ``d_chunk=64`` on D=512 self-attn bf16.
+
+  :param can_implement_fn: Bound ``can_implement`` of the target kernel class.
+  :param default_chunk: Conservative chunk used as the final fallback.
+  :param wide_min_smem_bytes: Minimum arch SMEM capacity (bytes) required
+      before the wide candidates are considered. ``0`` always probes; set to
+      :data:`_WIDE_SPLIT_D_MIN_SMEM_BYTES` to restrict to large-SMEM archs.
+  :param can_implement_kwargs: Forwarded to ``can_implement`` for each probe;
+      must include ``head_dim`` so chunk divisibility can be checked, and
+      ``smem_capacity_arch`` so the wide-chunk gate can be evaluated.
+  :returns: The selected chunk width.
+  :raises RuntimeError: If no candidate (including ``default_chunk``) fits.
+  """
+  head_dim = can_implement_kwargs["head_dim"]
+  smem_capacity_arch = can_implement_kwargs.get("smem_capacity_arch", "sm_80")
+  smem_capacity = utils_basic.get_smem_capacity_in_bytes(smem_capacity_arch)
+  wide_candidates = (
+    _SPLIT_D_CHUNK_CANDIDATES if smem_capacity >= wide_min_smem_bytes else ()
+  )
+  seen = set()
+  ordered: list[int] = []
+  for cand in (*wide_candidates, default_chunk):
+    if cand in seen:
+      continue
+    seen.add(cand)
+    if head_dim % cand != 0:
+      continue
+    ordered.append(cand)
+  for cand in ordered:
+    if can_implement_fn(d_chunk=cand, **can_implement_kwargs):
+      return cand
+  raise RuntimeError(
+    f"No Split-D chunk in {ordered or list(seen)} fits the kernel resource "
+    f"limits for head_dim={head_dim}; default_chunk={default_chunk}."
+  )
 
 
 def _validate_training_dtype(

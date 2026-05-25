@@ -176,10 +176,24 @@ class TritonBackend(Backend):
 class CuTeDSLBackend(Backend):
   """CuTeDSL SM90-specialized backend (Hopper only, dense 320<D<=512, fp16/bf16 training).
 
-  No additional configuration knobs — kernel parameters are hard-coded
-  for the SplitD ``tile_m=64, tile_n=128`` pipeline.
+  :ivar grad_kv_storage_dtype: Optional ``torch.float32`` / ``torch.float16``
+      storage dtype for the internal SM80 dK/dV HBM buffer; final gradients
+      are always cast back to ``k.dtype`` / ``v.dtype``. Workaround for
+      causal bf16 cross-tile accumulation precision (mirrors the Triton
+      option of the same name). SM90 path currently ignores this knob and
+      will raise if it is set.
   """
   name: str = "cutedsl"
+  grad_kv_storage_dtype: torch.dtype | str | None = None
+
+  def __post_init__(self) -> None:
+    super().__post_init__()
+    self.grad_kv_storage_dtype = _normalize_grad_kv_storage_dtype(
+      self.grad_kv_storage_dtype
+    )
+    if self.grad_kv_storage_dtype is not None:
+      assert self.backward, \
+        "grad_kv_storage_dtype is a backward-only option; requires backward=True"
 
 
 @dataclass
@@ -827,6 +841,7 @@ class _FFPAAttnFunc(torch.autograd.Function):
           lse=lse,
           softmax_scale=meta.attn_meta.scale,
           causal=meta.attn_meta.is_causal,
+          grad_kv_storage_dtype=meta.backward_meta.grad_kv_storage_dtype,
         )
         grad_attn_bias = None  # CuTeDSL does not support attn_mask
       else:

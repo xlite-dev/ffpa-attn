@@ -125,7 +125,7 @@ def _parse_args() -> argparse.Namespace:
     choices=["none", "fp16", "fp32"],
     default="none",
     help=
-    "Optional Triton backward dK/dV storage dtype forwarded to ffpa_attn_func.",
+    "Optional backward dK/dV storage dtype (Triton or CuTeDSL) forwarded to ffpa_attn_func.",
   )
   parser.add_argument(
     "--enable-tma",
@@ -172,12 +172,11 @@ def _parse_args() -> argparse.Namespace:
   if args.backward_backend == "cutedsl" and (
     args.triton_autotune or args.enable_bwd_tma or args.enable_bwd_ws
     or args.enable_persist_dkdv or args.enable_bwd_split_launch
-    or args.grad_kv_storage_dtype != "none"
   ):
     print(
       "[warn] --backward-backend=cutedsl ignores --triton-autotune / "
       "--enable-bwd-tma / --enable-bwd-ws / --enable-persist-dkdv / "
-      "--bwd-split-launch / --grad-kv-storage-dtype."
+      "--bwd-split-launch."
     )
   return args
 
@@ -522,7 +521,7 @@ def _ffpa_forward(
   causal: bool = False,
   attn_mask: torch.Tensor | None = None,
   dropout_p: float = 0.0,
-  triton_backward_grad_kv_storage_dtype: torch.dtype | None = None,
+  grad_kv_storage_dtype: torch.dtype | None = None,
   enable_tma: bool = False,
   enable_ws: bool = False,
   enable_persist_dkdv: bool = False,
@@ -530,7 +529,10 @@ def _ffpa_forward(
 ) -> torch.Tensor:
   if backward_backend == "cutedsl":
     forward_meta = CuTeDSLBackend(forward=True)
-    backward_meta = CuTeDSLBackend(backward=True)
+    backward_meta = CuTeDSLBackend(
+      backward=True,
+      grad_kv_storage_dtype=grad_kv_storage_dtype,
+    )
   else:
     forward_meta = TritonBackend(
       forward=True,
@@ -546,7 +548,7 @@ def _ffpa_forward(
         enable_ws=enable_ws,
         persist_dkdv=enable_persist_dkdv,
         split_launch=enable_split_launch,
-        grad_kv_storage_dtype=triton_backward_grad_kv_storage_dtype,
+        grad_kv_storage_dtype=grad_kv_storage_dtype,
       )
     elif backward_backend == "sdpa":
       backward_meta = SDPABackend(backward=True)
@@ -603,7 +605,7 @@ def _run_ffpa_backward(
   causal: bool = False,
   attn_mask: torch.Tensor | None = None,
   dropout_p: float = 0.0,
-  triton_backward_grad_kv_storage_dtype: torch.dtype | None = None,
+  grad_kv_storage_dtype: torch.dtype | None = None,
   enable_tma: bool = False,
   enable_ws: bool = False,
   enable_persist_dkdv: bool = False,
@@ -625,7 +627,7 @@ def _run_ffpa_backward(
     causal=causal,
     attn_mask=attn_mask,
     dropout_p=dropout_p,
-    triton_backward_grad_kv_storage_dtype=triton_backward_grad_kv_storage_dtype,
+    grad_kv_storage_dtype=grad_kv_storage_dtype,
     enable_tma=enable_tma,
     enable_ws=enable_ws,
     enable_persist_dkdv=enable_persist_dkdv,
@@ -746,7 +748,7 @@ def _run_case(
   attn_mask: torch.Tensor | None = None,
   dropout_p: float = 0.0,
   timing_mode: str = "backward-only",
-  triton_backward_grad_kv_storage_dtype: torch.dtype | None = None,
+  grad_kv_storage_dtype: torch.dtype | None = None,
   enable_tma: bool = False,
   enable_ws: bool = False,
   enable_persist_dkdv: bool = False,
@@ -786,8 +788,10 @@ def _run_case(
       autotune=triton_autotune,
       autotune_mode=triton_autotune_mode,
     ),
-    backward_backend=CuTeDSLBackend(backward=True)
-    if backward_backend == "cutedsl" else (
+    backward_backend=CuTeDSLBackend(
+      backward=True,
+      grad_kv_storage_dtype=grad_kv_storage_dtype,
+    ) if backward_backend == "cutedsl" else (
       TritonBackend(
         backward=True,
         autotune=triton_autotune,
@@ -796,7 +800,7 @@ def _run_case(
         enable_ws=enable_ws,
         persist_dkdv=enable_persist_dkdv,
         split_launch=enable_split_launch,
-        grad_kv_storage_dtype=triton_backward_grad_kv_storage_dtype,
+        grad_kv_storage_dtype=grad_kv_storage_dtype,
       ) if backward_backend == "triton" else SDPABackend(backward=True)
     ),
   )
@@ -847,7 +851,7 @@ def _run_case(
         causal,
         active_attn_mask,
         dropout_p,
-        triton_backward_grad_kv_storage_dtype,
+        grad_kv_storage_dtype,
         enable_tma,
         enable_ws,
         enable_persist_dkdv,
@@ -892,7 +896,7 @@ def _run_case(
       causal,
       active_attn_mask,
       dropout_p,
-      triton_backward_grad_kv_storage_dtype,
+      grad_kv_storage_dtype,
       enable_tma,
       enable_ws,
       enable_persist_dkdv,
@@ -979,7 +983,7 @@ def run_backward_examples(
   timing_mode: str = "backward-only",
   triton_autotune: bool = False,
   triton_autotune_mode: str = "fast",
-  triton_backward_grad_kv_storage_dtype: torch.dtype | None = None,
+  grad_kv_storage_dtype: torch.dtype | None = None,
   enable_tma: bool = False,
   enable_ws: bool = False,
   enable_persist_dkdv: bool = False,
@@ -1003,7 +1007,7 @@ def run_backward_examples(
   :param timing_mode: Benchmark timing mode.
   :param triton_autotune: Whether to enable Triton runtime autotune.
   :param triton_autotune_mode: Triton autotune mode.
-  :param triton_backward_grad_kv_storage_dtype: Optional Triton backward dK/dV
+  :param grad_kv_storage_dtype: Optional backward dK/dV (Triton or CuTeDSL)
     storage dtype forwarded to ``ffpa_attn_func``.
   :param enable_tma: Whether to enable the SM90+ Triton descriptor/TMA
     backward path when supported.
@@ -1030,7 +1034,7 @@ def run_backward_examples(
     f"apply_norm={apply_norm}, "
     f"triton_autotune={triton_autotune}, "
     f"triton_autotune_mode={triton_autotune_mode}, "
-    f"triton_backward_grad_kv_storage_dtype={triton_backward_grad_kv_storage_dtype}, "
+    f"grad_kv_storage_dtype={grad_kv_storage_dtype}, "
     f"enable_bwd_tma={enable_tma}, enable_bwd_ws={enable_ws}, "
     f"enable_persist_dkdv={enable_persist_dkdv}, enable_split_launch={enable_split_launch}, "
     f"timing_mode={timing_mode}, tasks={sorted(tasks) if tasks is not None else 'full'}, "
@@ -1139,8 +1143,7 @@ def run_backward_examples(
           attn_mask=case.get("attn_mask"),
           dropout_p=case.get("dropout_p", 0.0),
           timing_mode=timing_mode,
-          triton_backward_grad_kv_storage_dtype=
-          triton_backward_grad_kv_storage_dtype,
+          grad_kv_storage_dtype=grad_kv_storage_dtype,
           enable_tma=enable_tma,
           enable_ws=enable_ws,
           enable_persist_dkdv=enable_persist_dkdv,
@@ -1173,7 +1176,7 @@ def main() -> None:
     timing_mode=args.timing_mode,
     triton_autotune=args.triton_autotune,
     triton_autotune_mode=args.triton_autotune_mode,
-    triton_backward_grad_kv_storage_dtype=grad_kv_dtype,
+    grad_kv_storage_dtype=grad_kv_dtype,
     enable_tma=args.enable_bwd_tma,
     enable_ws=args.enable_bwd_ws,
     enable_persist_dkdv=args.enable_persist_dkdv,

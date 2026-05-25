@@ -119,7 +119,7 @@ def _parse_args() -> argparse.Namespace:
     choices=["none", "fp16", "fp32"],
     default="none",
     help=
-    "Optional Triton backward dK/dV storage dtype forwarded to ffpa_attn_func.",
+    "Optional backward dK/dV storage dtype (Triton or CuTeDSL) forwarded to ffpa_attn_func.",
   )
   parser.add_argument(
     "--enable-tma",
@@ -501,7 +501,7 @@ def run_forward_examples(
   forward_backend: str = "triton",
   triton_autotune: bool = False,
   triton_autotune_mode: str = "fast",
-  triton_backward_grad_kv_storage_dtype: torch.dtype | None = None,
+  grad_kv_storage_dtype: torch.dtype | None = None,
   warmup: int = DEFAULT_WARMUP,
   iters: int = DEFAULT_ITERS,
   print_results: bool = True,
@@ -522,7 +522,7 @@ def run_forward_examples(
   :param forward_backend: Forward backend passed to ``ffpa_attn_func``.
   :param triton_autotune: Whether to enable Triton runtime autotune.
   :param triton_autotune_mode: Triton autotune mode.
-  :param triton_backward_grad_kv_storage_dtype: Optional Triton backward dK/dV
+  :param grad_kv_storage_dtype: Optional backward dK/dV (Triton or CuTeDSL)
     storage dtype forwarded to ``ffpa_attn_func``.
   :param warmup: Warmup iterations used for timing.
   :param iters: Measured iterations used for timing.
@@ -542,7 +542,7 @@ def run_forward_examples(
     f"apply_norm={apply_norm}, "
     f"triton_autotune={triton_autotune}, "
     f"triton_autotune_mode={triton_autotune_mode}, "
-    f"triton_backward_grad_kv_storage_dtype={triton_backward_grad_kv_storage_dtype}, "
+    f"grad_kv_storage_dtype={grad_kv_storage_dtype}, "
     f"enable_fwd_tma={enable_tma}, "
     f"enable_fwd_ws={enable_ws}, "
     f"tasks={sorted(tasks) if tasks is not None else 'full'}, "
@@ -676,7 +676,7 @@ def main() -> None:
     forward_backend=args.forward_backend,
     triton_autotune=args.triton_autotune,
     triton_autotune_mode=args.triton_autotune_mode,
-    triton_backward_grad_kv_storage_dtype=grad_kv_dtype,
+    grad_kv_storage_dtype=grad_kv_dtype,
     warmup=args.warmup,
     iters=args.iters,
     print_results=True,

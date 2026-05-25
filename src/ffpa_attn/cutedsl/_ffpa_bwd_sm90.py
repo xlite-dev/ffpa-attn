@@ -15,8 +15,8 @@ from cutlass import Int32, Float32
 from quack.compile_utils import make_fake_tensor as fake_tensor
 
 from ._utils import (
-  BWD_TILE_M,
-  BWD_TILE_N,
+  SM90_BWD_TILE_M,
+  SM90_BWD_TILE_N,
   is_fake_mode,
   maybe_contiguous,
   _call_with_tvm_ffi_current_stream,
@@ -189,8 +189,8 @@ def _ffpa_attn_backward_sm90(
     )
 
   # SplitD tile sizes (hardcoded)
-  m_block_size = BWD_TILE_M
-  n_block_size = BWD_TILE_N
+  m_block_size = SM90_BWD_TILE_M
+  n_block_size = SM90_BWD_TILE_N
 
   q, k, v, out, dout, lse, cu_seqlens_q, cu_seqlens_k = [
     maybe_contiguous(t)
