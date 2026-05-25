@@ -241,16 +241,13 @@ def _pick_split_d_chunk(
   source of truth for whether a given chunk fits the target arch's SMEM
   capacity (see :data:`cutlass.cutlass_dsl.SMEM_CAPACITY_MAP`).
 
-  ``wide_min_smem_bytes`` gates whether wide candidates are tried at all:
-
-  - The forward path passes :data:`_WIDE_SPLIT_D_MIN_SMEM_BYTES` (160KB) so
-    only Hopper / server Blackwell (sm_90/sm_100/sm_103/sm_110 with ~228KB)
-    upgrade the chunk; SMEM-tight archs (sm_89/sm_86/sm_120/sm_121 ≈ 100KB)
-    keep the conservative default that micro-benchmarks favoured.
-  - The backward path passes ``0`` to always probe the wider candidates,
-    because dK/dV and dQ default to a larger ``d_chunk=64`` whose smem
-    footprint is small enough that wider variants often still fit even on
-    SMEM-tight archs and just shorten the d-loop.
+  ``wide_min_smem_bytes`` gates whether wide candidates are tried at all.
+  Both forward and backward pass :data:`_WIDE_SPLIT_D_MIN_SMEM_BYTES` (160KB)
+  so only Hopper / server Blackwell (sm_90/sm_100/sm_103/sm_110 with ~228KB)
+  upgrade the chunk; SMEM-tight archs (sm_89/sm_86/sm_120/sm_121 ≈ 100KB)
+  keep the conservative default that micro-benchmarks favoured. For the bwd
+  path, probing wider chunks on L20 (sm_89) was measured ~45% slower than the
+  default ``d_chunk=64`` on D=512 self-attn bf16.
 
   :param can_implement_fn: Bound ``can_implement`` of the target kernel class.
   :param default_chunk: Conservative chunk used as the final fallback.

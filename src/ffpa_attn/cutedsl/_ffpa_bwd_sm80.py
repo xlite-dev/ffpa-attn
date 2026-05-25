@@ -26,6 +26,7 @@ from ._utils import (
   SM80_BWD_DQ_TILE_M,
   SM80_BWD_DQ_TILE_N,
   SM80_BWD_SPLIT_D_CHUNK,
+  _WIDE_SPLIT_D_MIN_SMEM_BYTES,
   is_fake_mode,
   maybe_contiguous,
   _call_with_tvm_ffi_current_stream,
@@ -212,6 +213,7 @@ def _ffpa_attn_backward_sm80_dense(
   dkdv_d_chunk = _pick_split_d_chunk(
     FFPAAttnBwdDKDVSm80SplitDGeneric.can_implement,
     SM80_BWD_SPLIT_D_CHUNK,
+    wide_min_smem_bytes=_WIDE_SPLIT_D_MIN_SMEM_BYTES,
     dtype=dtype,
     head_dim=head_dim,
     head_dim_v=head_dim_v,
@@ -226,6 +228,7 @@ def _ffpa_attn_backward_sm80_dense(
   dq_d_chunk = _pick_split_d_chunk(
     FFPAAttnBwdDQSm80SplitDGeneric.can_implement,
     SM80_BWD_SPLIT_D_CHUNK,
+    wide_min_smem_bytes=_WIDE_SPLIT_D_MIN_SMEM_BYTES,
     dtype=dtype,
     head_dim=head_dim,
     head_dim_v=head_dim_v,
