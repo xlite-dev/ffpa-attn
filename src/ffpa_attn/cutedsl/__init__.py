@@ -25,6 +25,7 @@ import torch
 
 from ._utils import (
   MIN_SUPPORTED_HEAD_DIM,
+  SM80_FWD_SPLIT_D_CHUNK,
   SM80_SUPPORTED_HEAD_DIM,
   SM90_SUPPORTED_HEAD_DIM,
   _decode_custom_op_window,
@@ -126,9 +127,11 @@ def _check_supported_options(
 def cutedsl_forward_available(device: Optional[torch.device] = None) -> bool:
   """Return whether the CuTeDSL forward kernel can run on ``device``.
 
-  CuTeDSL forward supports SM80/SM89 through the Ampere Split-D path and SM90
-  through the existing Hopper path. Other backend constraints (head_dim, dtype,
-  no mask/dropout) are enforced per-call by
+  CuTeDSL forward supports SM90 through the existing Hopper specialised path
+  for ``head_dim <= 512`` and falls back to the SM80 Ampere Split-D path for
+  every other supported architecture (SM80/SM89, SM100/SM103/SM120, ...) and
+  for any ``head_dim > 512``. Other backend constraints (head_dim ceiling,
+  dtype, no mask/dropout) are enforced per-call by
   :func:`_require_cutedsl_supported`; this only checks the device-level
   prerequisite so callers can pre-select a backend before allocating tensors.
   """
@@ -139,7 +142,7 @@ def cutedsl_forward_available(device: Optional[torch.device] = None) -> bool:
   if device.type != "cuda":
     return False
   major, _ = torch.cuda.get_device_capability(device)
-  return major in (8, 9)
+  return major >= 8
 
 
 def cutedsl_max_supported_head_dim(
@@ -147,26 +150,24 @@ def cutedsl_max_supported_head_dim(
 ) -> int:
   """Return the current CuTeDSL dense head-dim ceiling for ``device``.
 
-  SM90 keeps the existing specialised implementation and supports up to 512.
-  The SM80/SM89 Split-D implementation uses 64-wide D chunks and supports up
-  to 1024.
+  The SM80 Ampere Split-D implementation acts as a cross-architecture
+  fallback and supports up to ``SM80_SUPPORTED_HEAD_DIM`` on every
+  supported architecture. SM90 keeps the existing specialised path only
+  in the ``head_dim <= SM90_SUPPORTED_HEAD_DIM`` range, but the SM80
+  fallback covers the rest, so the effective ceiling is the SM80 value
+  everywhere. ``device`` is kept for API compatibility but is unused.
   """
-  if not torch.cuda.is_available():
-    return SM90_SUPPORTED_HEAD_DIM
-  if device is None:
-    device = torch.device("cuda", torch.cuda.current_device())
-  if device.type != "cuda":
-    return SM90_SUPPORTED_HEAD_DIM
-  major, _ = torch.cuda.get_device_capability(device)
-  return SM80_SUPPORTED_HEAD_DIM if major == 8 else SM90_SUPPORTED_HEAD_DIM
+  del device
+  return SM80_SUPPORTED_HEAD_DIM
 
 
 def cutedsl_backward_available(device: Optional[torch.device] = None) -> bool:
   """Whether the CuTeDSL backward kernel can run on ``device``.
 
-  SM80/SM89 currently uses a Split-D Triton adapter from inside the CuTeDSL
-  module while the native CuTeDSL backward kernel is under development. SM90
-  keeps the existing Hopper implementation.
+  Mirrors :func:`cutedsl_forward_available`: SM90 keeps the existing Hopper
+  specialised backward for ``head_dim <= 512``; every other supported
+  architecture (SM80/SM89, SM100/SM103/SM120, ...) and every
+  ``head_dim > 512`` uses the SM80 Ampere Split-D backward as a fallback.
   """
   if not torch.cuda.is_available():
     return False
@@ -175,7 +176,7 @@ def cutedsl_backward_available(device: Optional[torch.device] = None) -> bool:
   if device.type != "cuda":
     return False
   major, _ = torch.cuda.get_device_capability(device)
-  return major in (8, 9)
+  return major >= 8
 
 
 def _cutedsl_device_major(device: torch.device) -> int:
@@ -185,26 +186,45 @@ def _cutedsl_device_major(device: torch.device) -> int:
   return 9
 
 
-def _forward_impl_for_device(device: torch.device):
+def _use_sm90_specialized(major: int, head_dim: int, head_dim_v: int) -> bool:
+  """Return ``True`` when the SM90 specialised cutedsl path should be used.
+
+  Single routing predicate shared by forward/backward dispatch and by the
+  fake-mode varlen validator selection. The SM90 specialised kernels only
+  cover Hopper with symmetric ``head_dim <= SM90_SUPPORTED_HEAD_DIM``;
+  every other case (other archs, or ``head_dim > 512``, or asymmetric q/v
+  head_dim) falls back to the SM80 Ampere Split-D path.
+  """
+  return (
+    major == 9 and head_dim <= SM90_SUPPORTED_HEAD_DIM
+    and head_dim_v <= SM90_SUPPORTED_HEAD_DIM
+  )
+
+
+def _forward_impl_for_device(
+  device: torch.device, head_dim: int, head_dim_v: int
+):
   major = _cutedsl_device_major(device)
-  if major == 8:
-    return _ffpa_attn_forward_sm80
-  if major == 9:
+  if major < 8:
+    raise NotImplementedError(
+      f"cutedsl forward requires compute capability >= 8.0; got {major}.x"
+    )
+  if _use_sm90_specialized(major, head_dim, head_dim_v):
     return _ffpa_attn_forward_sm90
-  raise NotImplementedError(
-    f"cutedsl forward supports SM80/SM89 and SM90; got compute capability {major}.x"
-  )
+  return _ffpa_attn_forward_sm80
 
 
-def _backward_impl_for_device(device: torch.device):
+def _backward_impl_for_device(
+  device: torch.device, head_dim: int, head_dim_v: int
+):
   major = _cutedsl_device_major(device)
-  if major == 8:
-    return _ffpa_attn_backward_sm80
-  if major == 9:
+  if major < 8:
+    raise NotImplementedError(
+      f"cutedsl backward requires compute capability >= 8.0; got {major}.x"
+    )
+  if _use_sm90_specialized(major, head_dim, head_dim_v):
     return _ffpa_attn_backward_sm90
-  raise NotImplementedError(
-    f"cutedsl backward supports SM80/SM89 and SM90; got compute capability {major}.x"
-  )
+  return _ffpa_attn_backward_sm80
 
 
 def _require_cutedsl_supported(
@@ -236,19 +256,25 @@ def _require_cutedsl_supported(
       "cutedsl backend requires a CUDA-capable build of PyTorch"
     )
   major, _ = torch.cuda.get_device_capability(q.device)
-  if major not in (8, 9):
+  if major < 8:
     raise NotImplementedError(
-      f"cutedsl backend only supports SM80/SM89 and SM90; got compute capability {major}.x"
+      f"cutedsl backend requires compute capability >= 8.0; got {major}.x"
     )
-  max_head_dim = SM80_SUPPORTED_HEAD_DIM if major == 8 else SM90_SUPPORTED_HEAD_DIM
-  if not (MIN_SUPPORTED_HEAD_DIM <= q.size(-1) <= max_head_dim):
+  head_dim_q = q.size(-1)
+  head_dim_v = v.size(-1)
+  use_sm90 = _use_sm90_specialized(major, head_dim_q, head_dim_v)
+  max_head_dim = (
+    SM90_SUPPORTED_HEAD_DIM if use_sm90 else SM80_SUPPORTED_HEAD_DIM
+  )
+  if not (MIN_SUPPORTED_HEAD_DIM <= head_dim_q <= max_head_dim):
     raise NotImplementedError(
       f"cutedsl backend only supports dense head_dim in "
-      f"[{MIN_SUPPORTED_HEAD_DIM}, {max_head_dim}]; got {q.size(-1)}"
+      f"[{MIN_SUPPORTED_HEAD_DIM}, {max_head_dim}]; got {head_dim_q}"
     )
-  if major == 8 and q.size(-1) % 64 != 0:
+  if not use_sm90 and head_dim_q % SM80_FWD_SPLIT_D_CHUNK != 0:
     raise NotImplementedError(
-      f"SM80/SM89 cutedsl backend requires head_dim divisible by 64; got {q.size(-1)}"
+      f"cutedsl SM80 Split-D fallback requires head_dim divisible by "
+      f"{SM80_FWD_SPLIT_D_CHUNK}; got {head_dim_q}"
     )
   if q.dtype not in (torch.float16, torch.bfloat16):
     raise TypeError(
@@ -507,7 +533,7 @@ def _fwd_cutedsl_torch_op(
       batch, num_head, seqlen_q, dtype=torch.float32, device=q.device
     ) if need_lse else torch.empty(0, device=q.device)
   )
-  _forward_impl_for_device(q.device)(
+  _forward_impl_for_device(q.device, q.size(-1), v.size(-1))(
     q,
     k,
     v,
@@ -558,7 +584,7 @@ def _bwd_cutedsl_torch_op(
   dq = torch.empty_like(q)
   dk = torch.empty_like(k)
   dv = torch.empty_like(v)
-  _backward_impl_for_device(q.device)(
+  _backward_impl_for_device(q.device, q.size(-1), v.size(-1))(
     q,
     k,
     v,
@@ -642,7 +668,7 @@ def _varlen_fwd_custom(
   window_size_left_opt, window_size_right_opt = _decode_custom_op_window(
     window_size_left, window_size_right
   )
-  return _forward_impl_for_device(q.device)(
+  return _forward_impl_for_device(q.device, q.size(-1), v.size(-1))(
     q,
     k,
     v,
@@ -677,7 +703,9 @@ def _varlen_fwd_fake(
   pack_gqa: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
   validate_kwargs = {}
-  if _cutedsl_device_major(q.device) == 8:
+  if not _use_sm90_specialized(
+    _cutedsl_device_major(q.device), q.size(-1), v.size(-1)
+  ):
     validate_kwargs["validate_head_dims"] = _validate_sm80_head_dims
   (
     _batch_size,
@@ -738,7 +766,7 @@ def _varlen_bwd_custom(
   window_size_left_opt, window_size_right_opt = _decode_custom_op_window(
     window_size_left, window_size_right
   )
-  return _backward_impl_for_device(q.device)(
+  return _backward_impl_for_device(q.device, q.size(-1), v.size(-1))(
     q,
     k,
     v,

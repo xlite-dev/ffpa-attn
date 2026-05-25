@@ -1,9 +1,10 @@
 """CuTeDSL backend integration tests for ffpa_attn_func.
 
-The CuTeDSL kernels are specialised for SM90 (Hopper) and dense 320<D<=512.
-These tests gate on the device capability and only validate the dispatch
-wiring + numerical parity against the existing Triton backend, not the
-kernel internals (covered by the standalone CuTeDSL kernel tests).
+The CuTeDSL backend now spans SM80+ via dispatcher: SM90 with D<=512 uses
+the Hopper-specialised kernels, every other arch (SM80/SM89/SM120) and D>512
+on SM90 fall back to the SM80 Split-D path. These tests validate dispatch
+wiring + numerical parity against the Triton backend, not the kernel internals
+(covered by the standalone CuTeDSL kernel tests).
 
 Varlen coverage now lives in ``tests/test_ffpa_varlen.py``.
 """
@@ -15,15 +16,16 @@ import torch.nn.functional as F
 from ffpa_attn import ffpa_attn_func
 
 
-def _sm90_available() -> bool:
+def _cutedsl_available() -> bool:
   if not torch.cuda.is_available():
     return False
   major, _ = torch.cuda.get_device_capability()
-  return major == 9
+  return major >= 8
 
 
 pytestmark = pytest.mark.skipif(
-  not _sm90_available(), reason="cutedsl backend requires SM90 (Hopper)"
+  not _cutedsl_available(),
+  reason="cutedsl backend requires compute capability >= 8.0",
 )
 
 

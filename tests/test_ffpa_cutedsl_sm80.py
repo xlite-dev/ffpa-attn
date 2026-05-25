@@ -14,12 +14,12 @@ def _cutedsl_large_d_available() -> bool:
   if not torch.cuda.is_available():
     return False
   major, _ = torch.cuda.get_device_capability()
-  return major in (8, 9)
+  return major >= 8
 
 
 pytestmark = pytest.mark.skipif(
   not _cutedsl_large_d_available(),
-  reason="CuTeDSL large-D tests require compute capability 8.x or 9.x",
+  reason="CuTeDSL large-D tests require compute capability >= 8.0",
 )
 
 

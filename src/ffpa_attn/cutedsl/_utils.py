@@ -87,7 +87,12 @@ def _get_device_arch():
 
 
 def _validate_head_dims(head_dim: int, head_dim_v: int) -> None:
-  """Validate dense SM90 SplitD head dimension constraints."""
+  """Validate the SM90 specialised cutedsl Split-D head dimension constraints.
+
+  Used only when the dispatcher routes to the SM90 Hopper specialised
+  forward/backward kernels (``major == 9`` and ``head_dim <= 512``);
+  every other cutedsl path goes through :func:`_validate_sm80_head_dims`.
+  """
   if head_dim != head_dim_v or not (
     MIN_SUPPORTED_HEAD_DIM <= head_dim <= SM90_SUPPORTED_HEAD_DIM
   ):
@@ -99,7 +104,14 @@ def _validate_head_dims(head_dim: int, head_dim_v: int) -> None:
 
 
 def _validate_sm80_head_dims(head_dim: int, head_dim_v: int) -> None:
-  """Validate dense SM80/SM89 Split-D head dimension constraints."""
+  """Validate the SM80 Ampere Split-D head dimension constraints.
+
+  Used for the SM80 Split-D fallback path, which now covers every
+  non-SM90 architecture (SM80/SM89, SM100/SM103/SM120, ...) and any
+  ``head_dim > 512`` on SM90. Requires symmetric q/k/v head_dim in
+  ``[MIN_SUPPORTED_HEAD_DIM, SM80_SUPPORTED_HEAD_DIM]`` and
+  ``head_dim % SM80_FWD_SPLIT_D_CHUNK == 0``.
+  """
   if head_dim != head_dim_v or not (
     MIN_SUPPORTED_HEAD_DIM <= head_dim <= SM80_SUPPORTED_HEAD_DIM
   ) or head_dim % SM80_FWD_SPLIT_D_CHUNK != 0:
