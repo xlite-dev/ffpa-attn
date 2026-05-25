@@ -353,6 +353,8 @@ def _ffpa_attn_backward_cutedsl(
   lse: torch.Tensor,
   softmax_scale: float,
   causal: bool,
+  *,
+  grad_kv_storage_dtype: torch.dtype | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
   """CuTeDSL backward with SDPA-layout in/out.
 
@@ -372,6 +374,10 @@ def _ffpa_attn_backward_cutedsl(
   :param lse: Log-sum-exp ``[B, H_q, N_q]`` float32 (saved from forward).
   :param softmax_scale: Pre-softmax scaling factor.
   :param causal: Whether causal masking was applied.
+  :param grad_kv_storage_dtype: Optional ``torch.float32`` / ``torch.float16``
+      storage dtype for the internal dK/dV HBM buffer; final returned
+      gradients are always cast back to ``k.dtype`` / ``v.dtype``. ``None``
+      keeps today's behaviour (buffer dtype = activation dtype).
   :returns: ``(dq, dk, dv)`` all in ``[B, H, N, D]`` SDPA layout.
   """
   q_nhd, k_nhd, v_nhd, out_nhd, dout_nhd = (
@@ -386,6 +392,7 @@ def _ffpa_attn_backward_cutedsl(
     lse,
     softmax_scale,
     int(causal),
+    _grad_kv_storage_dtype_to_code(grad_kv_storage_dtype),
   )
   dq, dk, dv = (_bnhd_to_bhnd(t) for t in (dq_nhd, dk_nhd, dv_nhd))
   return dq, dk, dv
@@ -566,8 +573,40 @@ def _fwd_cutedsl_fake(
 torch.library.define(
   "ffpa_attn::_bwd_cutedsl",
   "(Tensor dout, Tensor q, Tensor k, Tensor v, Tensor out, Tensor lse, "
-  "float softmax_scale, int causal) -> (Tensor dq, Tensor dk, Tensor dv)",
+  "float softmax_scale, int causal, int grad_kv_storage_dtype_code) "
+  "-> (Tensor dq, Tensor dk, Tensor dv)",
 )
+
+
+def _grad_kv_storage_dtype_to_code(dtype: torch.dtype | None, ) -> int:
+  """Encode the dK/dV storage dtype selector for the torch op boundary.
+
+  Matches Triton's encoding: ``0=None`` (use activation dtype),
+  ``1=fp32``, ``2=fp16``.
+  """
+  if dtype is None:
+    return 0
+  if dtype == torch.float32:
+    return 1
+  if dtype == torch.float16:
+    return 2
+  raise ValueError(
+    f"Unsupported grad_kv_storage_dtype {dtype!r}; expected None, "
+    "torch.float32, or torch.float16."
+  )
+
+
+def _grad_kv_storage_dtype_from_code(code: int) -> torch.dtype | None:
+  """Decode the dK/dV storage dtype selector at the torch op boundary."""
+  if code == 0:
+    return None
+  if code == 1:
+    return torch.float32
+  if code == 2:
+    return torch.float16
+  raise ValueError(
+    f"Unsupported grad_kv_storage_dtype code {code}; expected 0, 1, or 2."
+  )
 
 
 @torch.library.impl("ffpa_attn::_bwd_cutedsl", "CUDA")
@@ -580,11 +619,26 @@ def _bwd_cutedsl_torch_op(
   lse: torch.Tensor,
   softmax_scale: float,
   causal: int,
+  grad_kv_storage_dtype_code: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+  storage_dtype = _grad_kv_storage_dtype_from_code(grad_kv_storage_dtype_code)
+  backward_impl = _backward_impl_for_device(q.device, q.size(-1), v.size(-1))
+  if storage_dtype is not None and backward_impl is not _ffpa_attn_backward_sm80:
+    raise NotImplementedError(
+      "grad_kv_storage_dtype is only supported by the generic SM80 CuTeDSL "
+      "dKdV backward path; the SM90-specialised kernel does not accept a "
+      f"dK/dV storage-dtype override (head_dim={q.size(-1)}, "
+      f"head_dim_v={v.size(-1)}, device_major="
+      f"{torch.cuda.get_device_capability(q.device)[0]})."
+    )
   dq = torch.empty_like(q)
-  dk = torch.empty_like(k)
-  dv = torch.empty_like(v)
-  _backward_impl_for_device(q.device, q.size(-1), v.size(-1))(
+  if storage_dtype is None:
+    dk = torch.empty_like(k)
+    dv = torch.empty_like(v)
+  else:
+    dk = torch.empty_like(k, dtype=storage_dtype)
+    dv = torch.empty_like(v, dtype=storage_dtype)
+  backward_impl(
     q,
     k,
     v,
@@ -597,6 +651,9 @@ def _bwd_cutedsl_torch_op(
     dk=dk,
     dv=dv,
   )
+  if storage_dtype is not None and storage_dtype != k.dtype:
+    dk = dk.to(k.dtype)
+    dv = dv.to(v.dtype)
   return dq, dk, dv
 
 
@@ -610,6 +667,7 @@ def _bwd_cutedsl_fake(
   lse: torch.Tensor,
   softmax_scale: float,
   causal: int,
+  grad_kv_storage_dtype_code: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
   return torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
 

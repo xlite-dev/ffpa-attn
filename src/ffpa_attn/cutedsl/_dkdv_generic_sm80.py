@@ -43,8 +43,14 @@ class FFPAAttnBwdDKDVSm80SplitDGeneric:
     num_stages_dO: int = 1,
     num_threads: int = 128,
     d_chunk: Optional[int] = None,
+    dkdv_storage_dtype: Optional[Type[cutlass.Numeric]] = None,
   ):
     self.dtype = dtype
+    # HBM storage dtype for dK/dV. None falls back to ``dtype`` (today's
+    # behaviour). Float32 keeps the cross-tile accumulation precision when
+    # the q/k/v activation dtype is bf16 / fp16 (mirrors Triton's
+    # ``grad_kv_storage_dtype`` option).
+    self.dkdv_storage_dtype = dtype if dkdv_storage_dtype is None else dkdv_storage_dtype
     self.head_dim = head_dim
     self.head_dim_v = head_dim if head_dim_v is None else head_dim_v
     self.d_chunk = SM80_BWD_SPLIT_D_CHUNK if d_chunk is None else d_chunk
@@ -71,6 +77,7 @@ class FFPAAttnBwdDKDVSm80SplitDGeneric:
     is_causal,
     smem_capacity_arch: str = "sm_80",
     d_chunk: Optional[int] = None,
+    dkdv_storage_dtype: Optional[Type[cutlass.Numeric]] = None,
   ) -> bool:
     """Check whether the SM80 Split-D dK/dV configuration fits resources."""
     del is_causal
@@ -79,6 +86,10 @@ class FFPAAttnBwdDKDVSm80SplitDGeneric:
     if d_chunk is None:
       d_chunk = SM80_BWD_SPLIT_D_CHUNK
     if dtype not in [cutlass.Float16, cutlass.BFloat16]:
+      return False
+    if dkdv_storage_dtype is not None and dkdv_storage_dtype not in (
+      dtype, cutlass.Float32
+    ):
       return False
     if head_dim != head_dim_v:
       return False
@@ -118,8 +129,13 @@ class FFPAAttnBwdDKDVSm80SplitDGeneric:
       raise TypeError("Only Float16 and BFloat16 are supported")
     if const_expr(mLSE_type is not Float32 or mD_type is not Float32):
       raise TypeError("lse_log2 and dpsum must be Float32")
-    if const_expr(mdK_type != mQ_type or mdV_type != mQ_type):
-      raise TypeError("dk and dv must match the input dtype")
+    if const_expr(
+      mdK_type != self.dkdv_storage_dtype or mdV_type != self.dkdv_storage_dtype
+    ):
+      raise TypeError(
+        "dk and dv dtype must match dkdv_storage_dtype "
+        "(defaults to the q/k/v dtype when not overridden)"
+      )
     assert mQ_type == self.dtype
 
   def _get_shared_storage_cls(self):
@@ -379,8 +395,8 @@ class FFPAAttnBwdDKDVSm80SplitDGeneric:
     tdKsQt = [smem_thr_copy_Qt.partition_S(t) for t in sQt_stage]
     gmem_copy_atom_DKV = cute.make_copy_atom(
       cute.nvgpu.CopyUniversalOp(),
-      self.dtype,
-      num_bits_per_copy=2 * self.dtype.width
+      self.dkdv_storage_dtype,
+      num_bits_per_copy=2 * self.dkdv_storage_dtype.width
     )
     acc2g_thr_copy_DKV = cute.make_tiled_copy_C(
       gmem_copy_atom_DKV, tiled_mma_dkv
@@ -850,18 +866,25 @@ class FFPAAttnBwdDKDVSm80SplitDGeneric:
     tDgDV = acc2g_thr_copy_DKV.partition_D(gDV)
     tRgDK = acc2g_thr_copy_DKV.retile(acc_dK)
     tRgDV = acc2g_thr_copy_DKV.retile(acc_dV)
-    rDK = cute.make_fragment_like(tRgDK, self.dtype)
-    rDV = cute.make_fragment_like(tRgDV, self.dtype)
+    # When ``dkdv_storage_dtype`` is fp32 the in-register store fragment is
+    # already fp32, so the trailing ``.to(self.dtype)`` cast becomes a no-op
+    # and we skip rounding to keep cross-tile accumulation precision.
+    rDK = cute.make_fragment_like(tRgDK, self.dkdv_storage_dtype)
+    rDV = cute.make_fragment_like(tRgDV, self.dkdv_storage_dtype)
     if add_to_existing:
-      rOldDK = cute.make_fragment_like(tRgDK, self.dtype)
-      rOldDV = cute.make_fragment_like(tRgDV, self.dtype)
+      rOldDK = cute.make_fragment_like(tRgDK, self.dkdv_storage_dtype)
+      rOldDV = cute.make_fragment_like(tRgDV, self.dkdv_storage_dtype)
       cute.copy(gmem_copy_atom_DKV, tDgDK, rOldDK)
       cute.copy(gmem_copy_atom_DKV, tDgDV, rOldDV)
-      rDK.store((tRgDK.load() + rOldDK.load().to(Float32)).to(self.dtype))
-      rDV.store((tRgDV.load() + rOldDV.load().to(Float32)).to(self.dtype))
+      rDK.store(
+        (tRgDK.load() + rOldDK.load().to(Float32)).to(self.dkdv_storage_dtype)
+      )
+      rDV.store(
+        (tRgDV.load() + rOldDV.load().to(Float32)).to(self.dkdv_storage_dtype)
+      )
     else:
-      rDK.store(tRgDK.load().to(self.dtype))
-      rDV.store(tRgDV.load().to(self.dtype))
+      rDK.store(tRgDK.load().to(self.dkdv_storage_dtype))
+      rDV.store(tRgDV.load().to(self.dkdv_storage_dtype))
     cute.copy(gmem_copy_atom_DKV, rDK, tDgDK)
     cute.copy(gmem_copy_atom_DKV, rDV, tDgDV)
 
