@@ -32,7 +32,7 @@ pip3 install -U ffpa-attn # (support: sm_{80,...,120})
 git clone https://github.com/xlite-dev/ffpa-attn.git
 # Then, build the wheel package (Triton + CuTeDSL backends)
 cd ffpa-attn && pip3 install -e . --no-build-isolation
-# Optional: install ffpa-attn with CUDA backend support
+# Optional: install ffpa-attn w/ CUDA backend (forward only)
 ENABLE_FFPA_CUDA_IMPL=1 MAX_JOBS=32 pip3 install -e .
 ```
 
@@ -66,13 +66,9 @@ We extend FlashAttention to support large headdim ($D>256$) via **fine-grained t
 
 ## 🎉 Benchmark
 
-Runnable examples are provided under [`examples`](./examples). The performance benchmarks for the NVIDIA L20 (**Ada**), NVIDIA Geforce RTX 5090 (**Blackwell**), NVIDIA H800 PCIE (**Hopper**), NVIDIA H200 SXM (**Hopper**, **CuTeDSL** backend, up to **427** TFLOPS!🎉) with large headdim are shown below:
+Runnable examples are provided under [`examples`](./examples). The performance benchmarks for the NVIDIA L20 (**Ada**), NVIDIA Geforce RTX 5090 (**Blackwell**), NVIDIA H800 PCIE (**Hopper**), NVIDIA H200 SXM (**Hopper**, **CuTeDSL** backend, up to **427** TFLOPS!🎉) with large headdims can be found at [`examples`](./examples).
 
 <div align='center'>
-  <img src='./docs/assets/perf/ffpa_speedup_nvidia-l20_B1_H32_N8192_D320_T.png' width='400px'>
-  <img src='./docs/assets/perf/ffpa_speedup_nvidia-l20_B1_H32_N8192_D512_T.png' width='400px'><br>
-  <img src='./docs/assets/perf/ffpa_speedup_nvidia-geforce-rtx-5090_B1_H32_N8192_D320_T.png' width='400px'>
-  <img src='./docs/assets/perf/ffpa_speedup_nvidia-geforce-rtx-5090_B1_H32_N8192_D512_T.png' width='400px'><br>
   <img src='./docs/assets/perf/ffpa_speedup_nvidia-h800-pcie_B1_H32_N8192_D320_T.png' width='400px'>
   <img src='./docs/assets/perf/ffpa_speedup_nvidia-h800-pcie_B1_H32_N8192_D512_T.png' width='400px'><br>
   <img src='./docs/assets/perf/ffpa_speedup_cutedsl_nvidia-h20z_B1_H32_N8192_D512_T.png' width='400px'>
@@ -81,7 +77,7 @@ Runnable examples are provided under [`examples`](./examples). The performance b
 
 ## 🤖 Backends
 
-FFPA supports multiple backends for the forward and backward pass, including: [`SDPA`](./examples/) (baseline), [`CUDA`](./examples/) (forward only), [`Triton`](./examples/), and [`CuTeDSL`](./examples/). The `CuTeDSL` backend is currently in early stage and has some constraints (e.g., D <= 512), but it can achieve up to `427🎉` TFLOPS on H200! Stay tuned for future updates.
+FFPA supports multiple backends for the forward and backward pass, including: [`SDPA`](./examples/) (baseline), [`CUDA`](./examples/) (forward only), [`Triton`](./examples/), and [`CuTeDSL`](./examples/). The `CuTeDSL` backend is currently in early stage and has some constraints, but it can achieve up to `427🎉` TFLOPS on H200! Stay tuned for future updates.
 
 <div align='center' markdown="1">
 

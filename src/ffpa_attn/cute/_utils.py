@@ -1,8 +1,8 @@
-"""Shared utilities for FFPA cutedsl SplitD forward and backward paths.
+"""Shared utilities for FFPA cute SplitD forward and backward paths.
 
 Constants, validation helpers, tensor utilities, and optional-int encoding used
 by both SM90 and SM80/SM89 CuTeDSL paths (and also imported by
-:mod:`cutedsl.__init__` for the torch custom op entry points).
+:mod:`cute.__init__` for the torch custom op entry points).
 """
 
 import os

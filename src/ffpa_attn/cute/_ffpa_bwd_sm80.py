@@ -304,6 +304,19 @@ def _ffpa_attn_backward_sm80_dense(
     cute_arch_key,
   )
 
+  dq_work = dq
+  dk_work = dk
+  dv_work = dv
+  if seqlen_q % dq_tile_m != 0:
+    dq_shape = list(q.shape)
+    dq_shape[1] = (seqlen_q + dq_tile_m - 1) // dq_tile_m * dq_tile_m
+    dq_work = torch.zeros(dq_shape, dtype=dq.dtype, device=dq.device)
+  if seqlen_k % dkdv_tile_n != 0:
+    dkdv_shape = list(k.shape)
+    dkdv_shape[1] = (seqlen_k + dkdv_tile_n - 1) // dkdv_tile_n * dkdv_tile_n
+    dk_work = torch.zeros(dkdv_shape, dtype=dk.dtype, device=dk.device)
+    dv_work = torch.zeros(dkdv_shape, dtype=dv.dtype, device=dv.device)
+
   bwd_key = (
     "sm80_bwd_generic",
     dtype,
@@ -334,7 +347,7 @@ def _ffpa_attn_backward_sm80_dense(
     q_t, k_t, v_t, do_t = [to_cute_tensor(t) for t in (q, k, v, dout)]
     lse_log2_t = to_cute_tensor(lse_log2, assumed_align=4)
     dpsum_t = to_cute_tensor(dpsum, assumed_align=4)
-    dk_t, dv_t = [to_cute_tensor(t) for t in (dk, dv)]
+    dk_t, dv_t = [to_cute_tensor(t) for t in (dk_work, dv_work)]
     ffpa_dkdv = FFPAAttnBwdDKDVSm80SplitDGeneric(
       dtype,
       head_dim,
@@ -368,7 +381,7 @@ def _ffpa_attn_backward_sm80_dense(
     q_t, k_t, v_t, do_t = [to_cute_tensor(t) for t in (q, k, v, dout)]
     lse_log2_t = to_cute_tensor(lse_log2, assumed_align=4)
     dpsum_t = to_cute_tensor(dpsum, assumed_align=4)
-    dq_t = to_cute_tensor(dq)
+    dq_t = to_cute_tensor(dq_work)
     ffpa_dq = FFPAAttnBwdDQSm80SplitDGeneric(
       dtype,
       head_dim,
@@ -405,8 +418,8 @@ def _ffpa_attn_backward_sm80_dense(
       dout,
       lse_log2,
       dpsum,
-      dk,
-      dv,
+      dk_work,
+      dv_work,
       softmax_scale,
       device=q.device,
     )
@@ -418,10 +431,16 @@ def _ffpa_attn_backward_sm80_dense(
       dout,
       lse_log2,
       dpsum,
-      dq,
+      dq_work,
       softmax_scale,
       device=q.device,
     )
+  if dq_work is not dq:
+    dq.copy_(dq_work[:, :seqlen_q])
+  if dk_work is not dk:
+    dk.copy_(dk_work[:, :seqlen_k])
+  if dv_work is not dv:
+    dv.copy_(dv_work[:, :seqlen_k])
   return dq, dk, dv
 
 

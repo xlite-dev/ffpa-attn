@@ -19,15 +19,15 @@ from .triton import (
   _ffpa_attn_backward_triton,
 )  # D > 256
 from .aten import (
-  _aten_flash_attn_forward,
-  _aten_flash_attn_backward,
-  _aten_efficient_attn_backward,
+  _flash_attn_forward_aten,
+  _flash_attn_backward_aten,
+  _efficient_attn_backward_aten,
 )  # D <= 256
-from .cutedsl import (
-  _ffpa_attn_forward_cutedsl,
-  _ffpa_attn_backward_cutedsl,
-  _ffpa_attn_varlen_cutedsl,
-)  # D == 512 SM90
+from .cute import (
+  _ffpa_attn_forward_cute,
+  _ffpa_attn_backward_cute,
+  _ffpa_attn_varlen_cute,
+)  # D > 256
 
 try:
   from .cuda import _ffpa_attn_forward_cuda  # D > 256
@@ -96,7 +96,7 @@ class SDPABackend(Backend):
 
   Forward always short-circuits via :meth:`FFPAAttnMeta.fallback`.
   When used as ``backward_backend`` it delegates to
-  :func:`_aten_efficient_attn_backward`.
+  :func:`_efficient_attn_backward_aten`.
 
   :ivar high_precision_grad: When ``True`` request higher numerical
       precision for the backward pass (passed through to aten).
@@ -248,6 +248,8 @@ def _coerce_backend(backend: Backend | str, *, source: str) -> Backend:
       raise ValueError(
         f"ffpa_attn_func: {source} must be 'cuda', 'triton', 'cutedsl', or 'sdpa', got {backend!r}"
       )
+    if source == "backend":
+      return cls_name()
     is_forward = source.startswith("forward")
     return cls_name(forward=is_forward, backward=not is_forward)
   if not isinstance(backend, Backend):
@@ -451,13 +453,13 @@ class FFPAAttnMeta:
       return True
 
     if self.forward_meta.name == "cutedsl":
-      from .cutedsl import (
-        cutedsl_forward_available,
-        cutedsl_max_supported_head_dim,
+      from .cute import (
+        cute_forward_available,
+        cute_max_supported_head_dim,
       )
       cutedsl_hw_unsupported = (
-        D <= 256 or D > cutedsl_max_supported_head_dim(query.device)
-        or not cutedsl_forward_available(query.device)
+        D <= 256 or D > cute_max_supported_head_dim(query.device)
+        or not cute_forward_available(query.device)
       )
       return cutedsl_hw_unsupported
 
@@ -708,7 +710,7 @@ class _FFPAAttnFunc(torch.autograd.Function):
     O = torch.empty_like(q)  # noqa: E741
 
     if head_dim <= 256:
-      O, lse, rng_state, unused = _aten_flash_attn_forward(
+      O, lse, rng_state, unused = _flash_attn_forward_aten(
         q,
         k,
         v,
@@ -758,8 +760,8 @@ class _FFPAAttnFunc(torch.autograd.Function):
       )
     elif isinstance(meta.forward_meta, CuTeDSLBackend):
       # CuTeDSL backend. Layout conversion (B,H,N,D ↔ B,N,H,D) is
-      # handled inside _ffpa_attn_forward_cutedsl.
-      O, lse = _ffpa_attn_forward_cutedsl(
+      # handled inside _ffpa_attn_forward_cute.
+      O, lse = _ffpa_attn_forward_cute(
         q,
         k,
         v,
@@ -831,8 +833,8 @@ class _FFPAAttnFunc(torch.autograd.Function):
         )
       elif isinstance(meta.backward_meta, CuTeDSLBackend):
         # CuTeDSL backward. Layout conversion and kernel dispatch are
-        # handled inside _ffpa_attn_backward_cutedsl.
-        dq, dk, dv = _ffpa_attn_backward_cutedsl(
+        # handled inside _ffpa_attn_backward_cute.
+        dq, dk, dv = _ffpa_attn_backward_cute(
           grad_out=grad_out,
           q=q,
           k=k,
@@ -847,7 +849,7 @@ class _FFPAAttnFunc(torch.autograd.Function):
       else:
         assert isinstance(meta.backward_meta, SDPABackend), \
           f"Unsupported backward_backend={meta.backward_meta.name!r}"
-        dq, dk, dv, grad_attn_bias = _aten_efficient_attn_backward(
+        dq, dk, dv, grad_attn_bias = _efficient_attn_backward_aten(
           grad_out=grad_out,
           q=q,
           k=k,
@@ -866,7 +868,7 @@ class _FFPAAttnFunc(torch.autograd.Function):
     else:
       # Aten flash-attention backward for D <= 256, which also supports dropout gradients
       # (currently always 0.0 since dropout is not supported).
-      dq, dk, dv = _aten_flash_attn_backward(
+      dq, dk, dv = _flash_attn_backward_aten(
         grad_out,
         q,
         k,
@@ -945,7 +947,7 @@ def _ffpa_varlen_apply(
   return_lse,
   **kwargs,
 ):
-  return _ffpa_attn_varlen_cutedsl(
+  return _ffpa_attn_varlen_cute(
     q,
     k,
     v,

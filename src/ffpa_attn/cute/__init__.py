@@ -3,16 +3,16 @@
 Exposes the dense and varlen CuTeDSL entry shims used by
 :mod:`ffpa_attn.ffpa_attn_interface` and :mod:`ffpa_attn.functional`.
 
-The CuTeDSL kernels in :mod:`ffpa_attn.cutedsl._ffpa_fwd_sm80`,
-:mod:`ffpa_attn.cutedsl._ffpa_fwd_sm90`, and their backward launchers operate on the
+The CuTeDSL kernels in :mod:`ffpa_attn.cute._ffpa_fwd_sm80`,
+:mod:`ffpa_attn.cute._ffpa_fwd_sm90`, and their backward launchers operate on the
 ``[B, N, H, D]`` (or packed ``[T, H, D]``) layout. The SDPA-style
-``[B, H, N, D]`` wrappers (:func:`_ffpa_attn_forward_cutedsl`,
-:func:`_ffpa_attn_backward_cutedsl`, :func:`_ffpa_attn_varlen_cutedsl`)
+``[B, H, N, D]`` wrappers (:func:`_ffpa_attn_forward_cute`,
+:func:`_ffpa_attn_backward_cute`, :func:`_ffpa_attn_varlen_cute`)
 handle layout conversion and dispatch through the registered torch ops below.
 
-Dense-path ops ``ffpa_attn::_fwd_cutedsl`` / ``ffpa_attn::_bwd_cutedsl``
-and varlen-path ops ``ffpa_attn::_varlen_fwd_cutedsl`` /
-``ffpa_attn::_varlen_bwd_cutedsl`` are registered below so both paths
+Dense-path ops ``ffpa_attn::_fwd_cute`` / ``ffpa_attn::_bwd_cute``
+and varlen-path ops ``ffpa_attn::_varlen_fwd_cute`` /
+``ffpa_attn::_varlen_bwd_cute`` are registered below so both paths
 are ``torch.compile``-compatible.
 """
 
@@ -45,14 +45,14 @@ from ._ffpa_bwd_sm80 import _ffpa_attn_backward_sm80
 from ._ffpa_bwd_sm90 import _ffpa_attn_backward_sm90
 
 __all__ = [
-  "_ffpa_attn_forward_cutedsl",
-  "_ffpa_attn_backward_cutedsl",
-  "_ffpa_attn_varlen_cutedsl",
+  "_ffpa_attn_forward_cute",
+  "_ffpa_attn_backward_cute",
+  "_ffpa_attn_varlen_cute",
   "_ffpa_attn_varlen_impl",
-  "_require_cutedsl_supported",
-  "cutedsl_forward_available",
-  "cutedsl_backward_available",
-  "cutedsl_max_supported_head_dim",
+  "_require_cute_supported",
+  "cute_forward_available",
+  "cute_backward_available",
+  "cute_max_supported_head_dim",
 ]
 
 # ---------------------------------------------------------------------------
@@ -80,7 +80,7 @@ def _check_supported_options(
   """Raise ``NotImplementedError`` for any non-default cutedsl-unsupported option.
 
   The cutedsl SplitD kernels (``_ffpa_attn_varlen_impl``,
-  ``_ffpa_attn_forward_cutedsl``, ``_ffpa_attn_backward_cutedsl``) only
+  ``_ffpa_attn_forward_cute``, ``_ffpa_attn_backward_cute``) only
   honor dense / varlen attention with optional causal masking.
   Every other option commonly exposed by attention APIs (mask tensors,
   sliding window, softcap, score_mod, aux tensors, FlashAttention varlen
@@ -124,7 +124,7 @@ def _check_supported_options(
     )
 
 
-def cutedsl_forward_available(device: Optional[torch.device] = None) -> bool:
+def cute_forward_available(device: Optional[torch.device] = None) -> bool:
   """Return whether the CuTeDSL forward kernel can run on ``device``.
 
   CuTeDSL forward supports SM90 through the existing Hopper specialised path
@@ -132,7 +132,7 @@ def cutedsl_forward_available(device: Optional[torch.device] = None) -> bool:
   every other supported architecture (SM80/SM89, SM100/SM103/SM120, ...) and
   for any ``head_dim > 512``. Other backend constraints (head_dim ceiling,
   dtype, no mask/dropout) are enforced per-call by
-  :func:`_require_cutedsl_supported`; this only checks the device-level
+  :func:`_require_cute_supported`; this only checks the device-level
   prerequisite so callers can pre-select a backend before allocating tensors.
   """
   if not torch.cuda.is_available():
@@ -145,9 +145,7 @@ def cutedsl_forward_available(device: Optional[torch.device] = None) -> bool:
   return major >= 8
 
 
-def cutedsl_max_supported_head_dim(
-  device: Optional[torch.device] = None
-) -> int:
+def cute_max_supported_head_dim(device: Optional[torch.device] = None) -> int:
   """Return the current CuTeDSL dense head-dim ceiling for ``device``.
 
   The SM80 Ampere Split-D implementation acts as a cross-architecture
@@ -161,10 +159,10 @@ def cutedsl_max_supported_head_dim(
   return SM80_SUPPORTED_HEAD_DIM
 
 
-def cutedsl_backward_available(device: Optional[torch.device] = None) -> bool:
+def cute_backward_available(device: Optional[torch.device] = None) -> bool:
   """Whether the CuTeDSL backward kernel can run on ``device``.
 
-  Mirrors :func:`cutedsl_forward_available`: SM90 keeps the existing Hopper
+  Mirrors :func:`cute_forward_available`: SM90 keeps the existing Hopper
   specialised backward for ``head_dim <= 512``; every other supported
   architecture (SM80/SM89, SM100/SM103/SM120, ...) and every
   ``head_dim > 512`` uses the SM80 Ampere Split-D backward as a fallback.
@@ -179,7 +177,7 @@ def cutedsl_backward_available(device: Optional[torch.device] = None) -> bool:
   return major >= 8
 
 
-def _cutedsl_device_major(device: torch.device) -> int:
+def _cute_device_major(device: torch.device) -> int:
   if device.type == "cuda" and torch.cuda.is_available():
     major, _ = torch.cuda.get_device_capability(device)
     return major
@@ -204,7 +202,7 @@ def _use_sm90_specialized(major: int, head_dim: int, head_dim_v: int) -> bool:
 def _forward_impl_for_device(
   device: torch.device, head_dim: int, head_dim_v: int
 ):
-  major = _cutedsl_device_major(device)
+  major = _cute_device_major(device)
   if major < 8:
     raise NotImplementedError(
       f"cutedsl forward requires compute capability >= 8.0; got {major}.x"
@@ -217,7 +215,7 @@ def _forward_impl_for_device(
 def _backward_impl_for_device(
   device: torch.device, head_dim: int, head_dim_v: int
 ):
-  major = _cutedsl_device_major(device)
+  major = _cute_device_major(device)
   if major < 8:
     raise NotImplementedError(
       f"cutedsl backward requires compute capability >= 8.0; got {major}.x"
@@ -227,7 +225,7 @@ def _backward_impl_for_device(
   return _ffpa_attn_backward_sm80
 
 
-def _require_cutedsl_supported(
+def _require_cute_supported(
   q: torch.Tensor,
   k: torch.Tensor,
   v: torch.Tensor,
@@ -241,7 +239,7 @@ def _require_cutedsl_supported(
   ``attn_mask``, FlashAttention-extension kwargs) is **not** the
   responsibility of this function; that lives in
   :func:`_check_supported_options`, applied by the entry shims
-  (:func:`_ffpa_attn_forward_cutedsl`, :func:`_ffpa_attn_varlen_cutedsl`).
+  (:func:`_ffpa_attn_forward_cute`, :func:`_ffpa_attn_varlen_cute`).
 
   Raises ``NotImplementedError`` / ``RuntimeError`` / ``TypeError`` for
   any tensor-level violation so users who pass ``forward_backend='cutedsl'``
@@ -298,7 +296,7 @@ def _bnhd_to_bhnd(t: torch.Tensor) -> torch.Tensor:
   return t.transpose(1, 2).contiguous()
 
 
-def _ffpa_attn_forward_cutedsl(
+def _ffpa_attn_forward_cute(
   q: torch.Tensor,
   k: torch.Tensor,
   v: torch.Tensor,
@@ -311,7 +309,7 @@ def _ffpa_attn_forward_cutedsl(
 
   Accepts ``[B, H, N, D]`` (SDPA) layout, transposes to the CuTeDSL-native
   ``[B, N, H, D]`` (FA) layout, calls the registered torch op
-  ``torch.ops.ffpa_attn._fwd_cutedsl``, and transposes the output back.
+  ``torch.ops.ffpa_attn._fwd_cute``, and transposes the output back.
   ``lse`` is always in ``[B, H, N]`` shape and does not require a transpose.
 
   Called from :meth:`_FFPAAttnFunc.forward` when the dispatch selects
@@ -329,10 +327,10 @@ def _ffpa_attn_forward_cutedsl(
       ``lse`` is ``[B, H_q, N_q]`` float32.
   """
   requires_grad = any(t.requires_grad for t in (q, k, v))
-  _require_cutedsl_supported(q, k, v, requires_grad=requires_grad)
+  _require_cute_supported(q, k, v, requires_grad=requires_grad)
 
   q_nhd, k_nhd, v_nhd = (_bhnd_to_bnhd(t) for t in (q, k, v))
-  out_nhd, lse = torch.ops.ffpa_attn._fwd_cutedsl(
+  out_nhd, lse = torch.ops.ffpa_attn._fwd_cute(
     q_nhd,
     k_nhd,
     v_nhd,
@@ -344,7 +342,7 @@ def _ffpa_attn_forward_cutedsl(
   return out_bhnd, lse
 
 
-def _ffpa_attn_backward_cutedsl(
+def _ffpa_attn_backward_cute(
   grad_out: torch.Tensor,
   q: torch.Tensor,
   k: torch.Tensor,
@@ -360,7 +358,7 @@ def _ffpa_attn_backward_cutedsl(
 
   Accepts all tensors in ``[B, H, N, D]`` (SDPA) layout, transposes to
   ``[B, N, H, D]`` (FA) for the registered torch op
-  ``torch.ops.ffpa_attn._bwd_cutedsl``, and transposes the gradient outputs
+  ``torch.ops.ffpa_attn._bwd_cute``, and transposes the gradient outputs
   back to SDPA layout.
 
   Called from :meth:`_FFPAAttnFunc.backward` when the dispatch selects
@@ -383,7 +381,7 @@ def _ffpa_attn_backward_cutedsl(
   q_nhd, k_nhd, v_nhd, out_nhd, dout_nhd = (
     _bhnd_to_bnhd(t) for t in (q, k, v, out, grad_out)
   )
-  dq_nhd, dk_nhd, dv_nhd = torch.ops.ffpa_attn._bwd_cutedsl(
+  dq_nhd, dk_nhd, dv_nhd = torch.ops.ffpa_attn._bwd_cute(
     dout_nhd,
     q_nhd,
     k_nhd,
@@ -398,7 +396,7 @@ def _ffpa_attn_backward_cutedsl(
   return dq, dk, dv
 
 
-def _ffpa_attn_varlen_cutedsl(
+def _ffpa_attn_varlen_cute(
   q: torch.Tensor,
   k: torch.Tensor,
   v: torch.Tensor,
@@ -416,7 +414,7 @@ def _ffpa_attn_varlen_cutedsl(
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
   """Packed THD cutedsl entry. The varlen path bypasses
   :class:`ffpa_attn.functional.FFPAAttnFunc` and is autograd-registered via
-  the ``ffpa_attn::_varlen_fwd_cutedsl`` torch op directly.
+  the ``ffpa_attn::_varlen_fwd_cute`` torch op directly.
 
   CuTeDSL varlen forward called from
   :func:`ffpa_attn.ffpa_attn_interface.ffpa_attn_varlen_func`. The CuTeDSL
@@ -483,13 +481,13 @@ def _ffpa_attn_varlen_cutedsl(
     )
 
   requires_grad = any(t.requires_grad for t in (q, k, v))
-  max_head_dim = cutedsl_max_supported_head_dim(q.device)
+  max_head_dim = cute_max_supported_head_dim(q.device)
   if not (MIN_SUPPORTED_HEAD_DIM <= q.size(-1) <= max_head_dim):
     raise NotImplementedError(
       f"ffpa_attn_varlen_func cutedsl supports head_dim in [{MIN_SUPPORTED_HEAD_DIM}, {max_head_dim}]; "
       f"got {q.size(-1)}"
     )
-  _require_cutedsl_supported(q, k, v, requires_grad=requires_grad)
+  _require_cute_supported(q, k, v, requires_grad=requires_grad)
 
   # _ffpa_attn_varlen_impl is defined below in this module.
   return _ffpa_attn_varlen_impl(
@@ -515,14 +513,14 @@ def _ffpa_attn_varlen_cutedsl(
 # ---------------------------------------------------------------------------
 
 torch.library.define(
-  "ffpa_attn::_fwd_cutedsl",
+  "ffpa_attn::_fwd_cute",
   "(Tensor q, Tensor k, Tensor v, float softmax_scale, int causal, int return_lse) "
   "-> (Tensor o, Tensor lse)",
 )
 
 
-@torch.library.impl("ffpa_attn::_fwd_cutedsl", "CUDA")
-def _fwd_cutedsl_torch_op(
+@torch.library.impl("ffpa_attn::_fwd_cute", "CUDA")
+def _fwd_cute_torch_op(
   q: torch.Tensor,
   k: torch.Tensor,
   v: torch.Tensor,
@@ -553,8 +551,8 @@ def _fwd_cutedsl_torch_op(
   return o, lse
 
 
-@torch.library.register_fake("ffpa_attn::_fwd_cutedsl")
-def _fwd_cutedsl_fake(
+@torch.library.register_fake("ffpa_attn::_fwd_cute")
+def _fwd_cute_fake(
   q: torch.Tensor,
   k: torch.Tensor,
   v: torch.Tensor,
@@ -571,7 +569,7 @@ def _fwd_cutedsl_fake(
 
 
 torch.library.define(
-  "ffpa_attn::_bwd_cutedsl",
+  "ffpa_attn::_bwd_cute",
   "(Tensor dout, Tensor q, Tensor k, Tensor v, Tensor out, Tensor lse, "
   "float softmax_scale, int causal, int grad_kv_storage_dtype_code) "
   "-> (Tensor dq, Tensor dk, Tensor dv)",
@@ -609,8 +607,8 @@ def _grad_kv_storage_dtype_from_code(code: int) -> torch.dtype | None:
   )
 
 
-@torch.library.impl("ffpa_attn::_bwd_cutedsl", "CUDA")
-def _bwd_cutedsl_torch_op(
+@torch.library.impl("ffpa_attn::_bwd_cute", "CUDA")
+def _bwd_cute_torch_op(
   dout: torch.Tensor,
   q: torch.Tensor,
   k: torch.Tensor,
@@ -657,8 +655,8 @@ def _bwd_cutedsl_torch_op(
   return dq, dk, dv
 
 
-@torch.library.register_fake("ffpa_attn::_bwd_cutedsl")
-def _bwd_cutedsl_fake(
+@torch.library.register_fake("ffpa_attn::_bwd_cute")
+def _bwd_cute_fake(
   dout: torch.Tensor,
   q: torch.Tensor,
   k: torch.Tensor,
@@ -704,7 +702,7 @@ def _trim_trailing_empty_varlen_segments(
   return cu_seqlens_q[:keep_numel], cu_seqlens_k[:keep_numel]
 
 
-@torch.library.custom_op("ffpa_attn::_varlen_fwd_cutedsl", mutates_args=())
+@torch.library.custom_op("ffpa_attn::_varlen_fwd_cute", mutates_args=())
 def _varlen_fwd_custom(
   q: torch.Tensor,
   k: torch.Tensor,
@@ -744,7 +742,7 @@ def _varlen_fwd_custom(
   )
 
 
-@torch.library.register_fake("ffpa_attn::_varlen_fwd_cutedsl")
+@torch.library.register_fake("ffpa_attn::_varlen_fwd_cute")
 def _varlen_fwd_fake(
   q: torch.Tensor,
   k: torch.Tensor,
@@ -762,7 +760,7 @@ def _varlen_fwd_fake(
 ) -> tuple[torch.Tensor, torch.Tensor]:
   validate_kwargs = {}
   if not _use_sm90_specialized(
-    _cutedsl_device_major(q.device), q.size(-1), v.size(-1)
+    _cute_device_major(q.device), q.size(-1), v.size(-1)
   ):
     validate_kwargs["validate_head_dims"] = _validate_sm80_head_dims
   (
@@ -799,7 +797,7 @@ def _varlen_fwd_fake(
   return out, lse
 
 
-@torch.library.custom_op("ffpa_attn::_varlen_bwd_cutedsl", mutates_args=())
+@torch.library.custom_op("ffpa_attn::_varlen_bwd_cute", mutates_args=())
 def _varlen_bwd_custom(
   q: torch.Tensor,
   k: torch.Tensor,
@@ -844,7 +842,7 @@ def _varlen_bwd_custom(
   )
 
 
-@torch.library.register_fake("ffpa_attn::_varlen_bwd_cutedsl")
+@torch.library.register_fake("ffpa_attn::_varlen_bwd_cute")
 def _varlen_bwd_fake(
   q: torch.Tensor,
   k: torch.Tensor,
@@ -915,7 +913,7 @@ def _varlen_fwd_backward(ctx, dout, dlse):
   q, k, v, out, lse, cu_seqlens_q, cu_seqlens_k = ctx.saved_tensors
   if dout is None:
     dout = torch.zeros_like(out)
-  dq, dk, dv = torch.ops.ffpa_attn._varlen_bwd_cutedsl(
+  dq, dk, dv = torch.ops.ffpa_attn._varlen_bwd_cute(
     q,
     k,
     v,
@@ -937,7 +935,7 @@ def _varlen_fwd_backward(ctx, dout, dlse):
 
 
 torch.library.register_autograd(
-  "ffpa_attn::_varlen_fwd_cutedsl",
+  "ffpa_attn::_varlen_fwd_cute",
   _varlen_fwd_backward,
   setup_context=_varlen_fwd_setup_context,
 )

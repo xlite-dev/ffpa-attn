@@ -33,7 +33,7 @@ pip3 install -U ffpa-attn # (support: sm_{80,...,120})
 git clone https://github.com/xlite-dev/ffpa-attn.git
 # Then, build the wheel package (Triton + CuTeDSL backends)
 cd ffpa-attn && pip3 install -e . --no-build-isolation
-# Optional: install ffpa-attn with CUDA backend support
+# Optional: install ffpa-attn w/ CUDA backend (forward only)
 ENABLE_FFPA_CUDA_IMPL=1 MAX_JOBS=32 pip3 install -e .
 ```
 
@@ -228,7 +228,7 @@ Runnable examples are provided under [`examples`](./examples). The performance b
 
 ## 🤖 Backends
 
-FFPA supports multiple backends for the forward and backward pass, including: [`SDPA`](./examples/) (baseline), [`CUDA`](./examples/) (forward only), [`Triton`](./examples/), and [`CuTeDSL`](./examples/). The `CuTeDSL` backend is currently in early stage and has some constraints (e.g., D <= 512), but it can achieve up to `427🎉` TFLOPS on H200! Stay tuned for future updates.
+FFPA supports multiple backends for the forward and backward pass, including: [`SDPA`](./examples/) (baseline), [`CUDA`](./examples/) (forward only), [`Triton`](./examples/), and [`CuTeDSL`](./examples/). The `CuTeDSL` backend is currently in early stage and has some constraints, but it can achieve up to `427🎉` TFLOPS on H200! Stay tuned for future updates.
 
 <div align='center' markdown="1">
 

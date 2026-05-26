@@ -124,3 +124,16 @@ TFLOPS reports the theoretical dominant attention GEMM throughput only; forward 
 | non-aligned | bf16 | 16383/16383 | 45.80 / 253.24 ms | 240T / 43T | 5.53x |
 
 </div>
+
+The performance benchmarks for the NVIDIA L20 (**Ada**), NVIDIA Geforce RTX 5090 (**Blackwell**), NVIDIA H800 PCIE (**Hopper**), NVIDIA H200 SXM (**Hopper**, **CuTeDSL** backend, up to **427** TFLOPS!🎉) with large headdim are shown below:
+
+<div align='center'>
+  <img src='../assets/perf/ffpa_speedup_nvidia-l20_B1_H32_N8192_D320_T.png' width='350px'>
+  <img src='../assets/perf/ffpa_speedup_nvidia-l20_B1_H32_N8192_D512_T.png' width='350px'><br>
+  <img src='../assets/perf/ffpa_speedup_nvidia-geforce-rtx-5090_B1_H32_N8192_D320_T.png' width='350px'>
+  <img src='../assets/perf/ffpa_speedup_nvidia-geforce-rtx-5090_B1_H32_N8192_D512_T.png' width='350px'><br>
+  <img src='../assets/perf/ffpa_speedup_nvidia-h800-pcie_B1_H32_N8192_D320_T.png' width='350px'>
+  <img src='../assets/perf/ffpa_speedup_nvidia-h800-pcie_B1_H32_N8192_D512_T.png' width='350px'><br>
+  <img src='../assets/perf/ffpa_speedup_cutedsl_nvidia-h20z_B1_H32_N8192_D512_T.png' width='350px'>
+  <img src='../assets/perf/ffpa_speedup_cutedsl_nvidia-h20z_B1_H32_N16384_D512_T.png' width='350px'>
+</div>
