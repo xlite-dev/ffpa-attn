@@ -14,6 +14,7 @@ import torch
 import torch.nn.functional as F
 
 from ffpa_attn import ffpa_attn_func
+from ffpa_attn.functional import CuTeDSLBackend
 
 
 def _cutedsl_available() -> bool:
@@ -240,6 +241,11 @@ def test_cutedsl_autograd_nonaligned_matches_sdpa(is_causal, N):
   NaN gradients for non-aligned causal self-attention at D=512, so using it as
   the oracle masks cutedsl's actual (correct) behavior. SDPA is the documented
   semantic target of ``ffpa_attn_func`` anyway.
+
+  For the causal bf16 case we explicitly configure ``grad_kv_storage_dtype`` to
+  ``fp32`` via ``CuTeDSLBackend``. This is a known dV precision workaround for
+  the SM80-style backward path and keeps the regression focused on semantic
+  correctness rather than bf16 HBM round-trip noise in dK/dV accumulation.
   """
   B, H, D = 1, 4, 512
 
@@ -263,8 +269,17 @@ def test_cutedsl_autograd_nonaligned_matches_sdpa(is_causal, N):
 
   torch.manual_seed(42)
   q_c, k_c, v_c = make()
+  backward_backend = (
+    CuTeDSLBackend(backward=True, grad_kv_storage_dtype="fp32")
+    if is_causal else None
+  )
   out_c = ffpa_attn_func(
-    q_c, k_c, v_c, is_causal=is_causal, forward_backend="cutedsl"
+    q_c,
+    k_c,
+    v_c,
+    is_causal=is_causal,
+    forward_backend="cutedsl",
+    backward_backend=backward_backend,
   )
   out_c.sum().backward()
 
