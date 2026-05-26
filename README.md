@@ -32,7 +32,7 @@ pip3 install -U ffpa-attn # (support: sm_{80,...,120})
 git clone https://github.com/xlite-dev/ffpa-attn.git
 # Then, build the wheel package (Triton + CuTeDSL backends)
 cd ffpa-attn && pip3 install -e . --no-build-isolation
-# Optional: install ffpa-attn with CUDA backend support
+# Optional: install ffpa-attn w/ CUDA backend (forward only)
 ENABLE_FFPA_CUDA_IMPL=1 MAX_JOBS=32 pip3 install -e .
 ```
 
