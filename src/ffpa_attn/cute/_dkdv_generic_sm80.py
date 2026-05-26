@@ -882,12 +882,11 @@ class FFPAAttnBwdDKDVSm80SplitDGeneric:
     tDgDV = acc2g_thr_copy_DKV.partition_D(gDV)
     tRgDK = acc2g_thr_copy_DKV.retile(acc_dK)
     tRgDV = acc2g_thr_copy_DKV.retile(acc_dV)
+    cDKV = cute.make_identity_tensor((self.tile_n, self.d_chunk))
+    tRcDKV = acc2g_thr_copy_DKV.partition_S(cDKV)
+    tR0cDKV = gmem_tiled_copy_DKV.get_slice(0).partition_S(cDKV)
     valid_rows = seqlen_k - n_block * self.tile_n
     has_tail = valid_rows < self.tile_n
-    if has_tail:
-      cDKV = cute.make_identity_tensor((self.tile_n, self.d_chunk))
-      tRcDKV = acc2g_thr_copy_DKV.partition_S(cDKV)
-      tR0cDKV = gmem_tiled_copy_DKV.get_slice(0).partition_S(cDKV)
     # When ``dkdv_storage_dtype`` is fp32 the in-register store fragment is
     # already fp32, so the trailing ``.to(self.dtype)`` cast becomes a no-op
     # and we skip rounding to keep cross-tile accumulation precision.

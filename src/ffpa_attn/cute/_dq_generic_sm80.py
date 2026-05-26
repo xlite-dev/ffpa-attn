@@ -755,12 +755,11 @@ class FFPAAttnBwdDQSm80SplitDGeneric:
     )
     tDgDQ = acc2g_thr_copy_DQ.partition_D(gDQ)
     tRgDQ = acc2g_thr_copy_DQ.retile(acc_dQ)
+    cDQ = cute.make_identity_tensor((self.tile_m, self.d_chunk))
+    tRcDQ = acc2g_thr_copy_DQ.partition_S(cDQ)
+    tR0cDQ = gmem_tiled_copy_DQ.get_slice(0).partition_S(cDQ)
     valid_rows = seqlen_q - m_block * self.tile_m
     has_tail = valid_rows < self.tile_m
-    if has_tail:
-      cDQ = cute.make_identity_tensor((self.tile_m, self.d_chunk))
-      tRcDQ = acc2g_thr_copy_DQ.partition_S(cDQ)
-      tR0cDQ = gmem_tiled_copy_DQ.get_slice(0).partition_S(cDQ)
     rDQ = cute.make_fragment_like(tRgDQ, self.dtype)
     if add_to_existing:
       rOldDQ = cute.make_fragment_like(tRgDQ, self.dtype)
