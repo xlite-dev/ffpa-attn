@@ -1,8 +1,8 @@
-"""FFPA cutedsl backward pass — SplitD SM90 for head_dim == 512.
+"""FFPA cute backward pass — SplitD SM90 for head_dim == 512.
 
 Exposes :func:`_ffpa_attn_backward_sm90` and its compile caches, together with
 the bwd preprocess kernel (:func:`_bwd_preprocess`), imported by
-:mod:`cutedsl.__init__` for the ``ffpa_attn::_bwd_cutedsl`` torch custom op.
+:mod:`cute.__init__` for the ``ffpa_attn::_bwd_cute`` torch custom op.
 """
 
 import os

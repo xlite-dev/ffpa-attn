@@ -47,7 +47,7 @@ def _reduce_expanded_kv_grads(
   return reduced_k.to(k.dtype), reduced_v.to(v.dtype)
 
 
-def _aten_efficient_attn_backward(
+def _efficient_attn_backward_aten(
   grad_out: torch.Tensor,
   q: torch.Tensor,
   k: torch.Tensor,
@@ -187,4 +187,4 @@ def _aten_efficient_attn_backward(
   return dq.to(q.dtype), dk, dv, grad_attn_bias
 
 
-__all__ = ["_aten_efficient_attn_backward"]
+__all__ = ["_efficient_attn_backward_aten"]

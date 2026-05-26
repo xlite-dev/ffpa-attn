@@ -428,28 +428,28 @@ def _display_device_name(device_name: str) -> str:
   return re.sub(r"H20Z", "H200", device_name, flags=re.IGNORECASE)
 
 
-def _require_cutedsl_device() -> int:
+def _require_cute_device() -> int:
   """Fail fast on devices unsupported by the CuTeDSL backend.
 
   :return: Maximum CuTeDSL head dimension for the active device.
   """
-  from ffpa_attn.cutedsl import cutedsl_forward_available, cutedsl_max_supported_head_dim
+  from ffpa_attn.cute import cute_forward_available, cute_max_supported_head_dim
 
   if not torch.cuda.is_available():
     raise SystemExit(
       "CUDA is required: the CuTeDSL backend only runs on SM80/SM89/SM90 GPUs."
     )
   device = torch.device("cuda", torch.cuda.current_device())
-  if not cutedsl_forward_available(device):
+  if not cute_forward_available(device):
     major, minor = torch.cuda.get_device_capability(device)
     raise SystemExit(
       f"CuTeDSL backend requires SM80/SM89/SM90. Detected device "
       f"'{torch.cuda.get_device_name(device)}' with compute capability {major}.{minor}."
     )
-  return cutedsl_max_supported_head_dim(device)
+  return cute_max_supported_head_dim(device)
 
 
-def _resolve_cutedsl_backends(args: argparse.Namespace) -> bool:
+def _resolve_cute_backends(args: argparse.Namespace) -> bool:
   """Auto-pair cutedsl backends; reject mixing cutedsl with a non-cutedsl peer.
 
   Auto-promotion only fires when the peer side is still at its default
@@ -1360,13 +1360,13 @@ def main() -> None:
   """Run the requested benchmark mode and emit plot plus Markdown outputs."""
   args = _parse_args()
   fallback = args.show_fallback
-  is_cutedsl = _resolve_cutedsl_backends(args)
+  is_cutedsl = _resolve_cute_backends(args)
   if is_cutedsl:
     if fallback:
       raise SystemExit(
         "--show-fallback is not compatible with the cutedsl backend."
       )
-    max_head_dim = _require_cutedsl_device()
+    max_head_dim = _require_cute_device()
     if args.D <= 256 or args.D > max_head_dim or args.D % 64 != 0:
       raise SystemExit(
         f"[cutedsl] --D must be divisible by 64 and satisfy 256 < D <= {max_head_dim}; got {args.D}."

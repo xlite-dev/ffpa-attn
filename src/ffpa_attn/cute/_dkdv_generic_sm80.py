@@ -411,9 +411,10 @@ class FFPAAttnBwdDKDVSm80SplitDGeneric:
       self.dkdv_storage_dtype,
       num_bits_per_copy=2 * self.dkdv_storage_dtype.width
     )
-    acc2g_thr_copy_DKV = cute.make_tiled_copy_C(
+    gmem_tiled_copy_DKV = cute.make_tiled_copy_C(
       gmem_copy_atom_DKV, tiled_mma_dkv
-    ).get_slice(tidx)
+    )
+    acc2g_thr_copy_DKV = gmem_tiled_copy_DKV.get_slice(tidx)
 
     for q_head_group in cutlass.range(self.qhead_per_kvhead, unroll=1):
       q_head_idx = kv_head_idx * self.qhead_per_kvhead + q_head_group
@@ -681,6 +682,7 @@ class FFPAAttnBwdDKDVSm80SplitDGeneric:
               acc_dV,
               mdK,
               mdV,
+              gmem_tiled_copy_DKV,
               acc2g_thr_copy_DKV,
               gmem_copy_atom_DKV,
               batch_idx,
@@ -856,6 +858,7 @@ class FFPAAttnBwdDKDVSm80SplitDGeneric:
     acc_dV: cute.Tensor,
     mdK: cute.Tensor,
     mdV: cute.Tensor,
+    gmem_tiled_copy_DKV: cute.TiledCopy,
     acc2g_thr_copy_DKV: cute.TiledCopy,
     gmem_copy_atom_DKV: cute.CopyAtom,
     batch_idx: Int32,
@@ -879,6 +882,12 @@ class FFPAAttnBwdDKDVSm80SplitDGeneric:
     tDgDV = acc2g_thr_copy_DKV.partition_D(gDV)
     tRgDK = acc2g_thr_copy_DKV.retile(acc_dK)
     tRgDV = acc2g_thr_copy_DKV.retile(acc_dV)
+    valid_rows = seqlen_k - n_block * self.tile_n
+    has_tail = valid_rows < self.tile_n
+    if has_tail:
+      cDKV = cute.make_identity_tensor((self.tile_n, self.d_chunk))
+      tRcDKV = acc2g_thr_copy_DKV.partition_S(cDKV)
+      tR0cDKV = gmem_tiled_copy_DKV.get_slice(0).partition_S(cDKV)
     # When ``dkdv_storage_dtype`` is fp32 the in-register store fragment is
     # already fp32, so the trailing ``.to(self.dtype)`` cast becomes a no-op
     # and we skip rounding to keep cross-tile accumulation precision.
@@ -887,8 +896,20 @@ class FFPAAttnBwdDKDVSm80SplitDGeneric:
     if add_to_existing:
       rOldDK = cute.make_fragment_like(tRgDK, self.dkdv_storage_dtype)
       rOldDV = cute.make_fragment_like(tRgDV, self.dkdv_storage_dtype)
-      cute.copy(gmem_copy_atom_DKV, tDgDK, rOldDK)
-      cute.copy(gmem_copy_atom_DKV, tDgDV, rOldDV)
+      if has_tail:
+        rOldDK.fill(0.0)
+        rOldDV.fill(0.0)
+        for n in cutlass.range_constexpr(cute.size(tRgDK.shape[1])):
+          if tR0cDKV[0, n, 0][0] < valid_rows - tRcDKV[0][0]:
+            cute.copy(
+              gmem_copy_atom_DKV, tDgDK[None, n, None], rOldDK[None, n, None]
+            )
+            cute.copy(
+              gmem_copy_atom_DKV, tDgDV[None, n, None], rOldDV[None, n, None]
+            )
+      else:
+        cute.copy(gmem_copy_atom_DKV, tDgDK, rOldDK)
+        cute.copy(gmem_copy_atom_DKV, tDgDV, rOldDV)
       rDK.store(
         (tRgDK.load() + rOldDK.load().to(Float32)).to(self.dkdv_storage_dtype)
       )
@@ -898,8 +919,18 @@ class FFPAAttnBwdDKDVSm80SplitDGeneric:
     else:
       rDK.store(tRgDK.load().to(self.dkdv_storage_dtype))
       rDV.store(tRgDV.load().to(self.dkdv_storage_dtype))
-    cute.copy(gmem_copy_atom_DKV, rDK, tDgDK)
-    cute.copy(gmem_copy_atom_DKV, rDV, tDgDV)
+    if not has_tail:
+      cute.copy(gmem_copy_atom_DKV, rDK, tDgDK)
+      cute.copy(gmem_copy_atom_DKV, rDV, tDgDV)
+    else:
+      for n in cutlass.range_constexpr(cute.size(tRgDK.shape[1])):
+        if tR0cDKV[0, n, 0][0] < valid_rows - tRcDKV[0][0]:
+          cute.copy(
+            gmem_copy_atom_DKV, rDK[None, n, None], tDgDK[None, n, None]
+          )
+          cute.copy(
+            gmem_copy_atom_DKV, rDV[None, n, None], tDgDV[None, n, None]
+          )
 
 
 __all__ = ["FFPAAttnBwdDKDVSm80SplitDGeneric"]

@@ -1,7 +1,7 @@
 """FFPA CuTeDSL forward pass scaffold for SM80/SM89 Split-D kernels.
 
 This module owns the SM80/SM89 orchestration surface. The public signature is
-kept aligned with :func:`ffpa_attn.cutedsl._ffpa_fwd_sm90._ffpa_attn_forward_sm90`
+kept aligned with :func:`ffpa_attn.cute._ffpa_fwd_sm90._ffpa_attn_forward_sm90`
 so the existing CuTeDSL custom ops can dispatch by architecture without adding
 new torch op schemas.
 """

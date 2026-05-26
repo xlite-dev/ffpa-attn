@@ -1,7 +1,7 @@
-"""FFPA cutedsl forward pass — SplitD SM90 for head_dim == 512.
+"""FFPA cute forward pass — SplitD SM90 for head_dim == 512.
 
 Exposes :func:`_ffpa_attn_forward_sm90` and its compile cache, imported by
-:mod:`cutedsl.__init__` for the ``ffpa_attn::_fwd_cutedsl`` torch custom op
+:mod:`cute.__init__` for the ``ffpa_attn::_fwd_cute`` torch custom op
 and the varlen forward path.
 """
 

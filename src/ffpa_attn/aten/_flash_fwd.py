@@ -5,7 +5,7 @@ from __future__ import annotations
 import torch
 
 
-def _aten_flash_attn_forward(
+def _flash_attn_forward_aten(
   q: torch.Tensor,
   k: torch.Tensor,
   v: torch.Tensor,

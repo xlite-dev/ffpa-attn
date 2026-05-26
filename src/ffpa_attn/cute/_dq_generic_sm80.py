@@ -363,8 +363,8 @@ class FFPAAttnBwdDQSm80SplitDGeneric:
       self.dtype,
       num_bits_per_copy=2 * self.dtype.width
     )
-    acc2g_thr_copy_DQ = cute.make_tiled_copy_C(gmem_copy_atom_DQ,
-                                               tiled_mma_dq).get_slice(tidx)
+    gmem_tiled_copy_DQ = cute.make_tiled_copy_C(gmem_copy_atom_DQ, tiled_mma_dq)
+    acc2g_thr_copy_DQ = gmem_tiled_copy_DQ.get_slice(tidx)
 
     for n_block in cutlass.range(num_n_blocks, unroll=1):
       if const_expr(not self.is_causal
@@ -573,6 +573,7 @@ class FFPAAttnBwdDQSm80SplitDGeneric:
           self.store_dq_tile(
             acc_dQ,
             mdQ,
+            gmem_tiled_copy_DQ,
             acc2g_thr_copy_DQ,
             gmem_copy_atom_DQ,
             batch_idx,
@@ -737,6 +738,7 @@ class FFPAAttnBwdDQSm80SplitDGeneric:
     self,
     acc_dQ: cute.Tensor,
     mdQ: cute.Tensor,
+    gmem_tiled_copy_DQ: cute.TiledCopy,
     acc2g_thr_copy_DQ: cute.TiledCopy,
     gmem_copy_atom_DQ: cute.CopyAtom,
     batch_idx: Int32,
@@ -753,14 +755,33 @@ class FFPAAttnBwdDQSm80SplitDGeneric:
     )
     tDgDQ = acc2g_thr_copy_DQ.partition_D(gDQ)
     tRgDQ = acc2g_thr_copy_DQ.retile(acc_dQ)
+    valid_rows = seqlen_q - m_block * self.tile_m
+    has_tail = valid_rows < self.tile_m
+    if has_tail:
+      cDQ = cute.make_identity_tensor((self.tile_m, self.d_chunk))
+      tRcDQ = acc2g_thr_copy_DQ.partition_S(cDQ)
+      tR0cDQ = gmem_tiled_copy_DQ.get_slice(0).partition_S(cDQ)
     rDQ = cute.make_fragment_like(tRgDQ, self.dtype)
     if add_to_existing:
       rOldDQ = cute.make_fragment_like(tRgDQ, self.dtype)
-      cute.copy(gmem_copy_atom_DQ, tDgDQ, rOldDQ)
+      if has_tail:
+        rOldDQ.fill(0.0)
+        for m in cutlass.range_constexpr(cute.size(tRgDQ.shape[1])):
+          if tR0cDQ[0, m, 0][0] < valid_rows - tRcDQ[0][0]:
+            cute.copy(
+              gmem_copy_atom_DQ, tDgDQ[None, m, None], rOldDQ[None, m, None]
+            )
+      else:
+        cute.copy(gmem_copy_atom_DQ, tDgDQ, rOldDQ)
       rDQ.store((tRgDQ.load() + rOldDQ.load().to(Float32)).to(self.dtype))
     else:
       rDQ.store(tRgDQ.load().to(self.dtype))
-    cute.copy(gmem_copy_atom_DQ, rDQ, tDgDQ)
+    if not has_tail:
+      cute.copy(gmem_copy_atom_DQ, rDQ, tDgDQ)
+    else:
+      for m in cutlass.range_constexpr(cute.size(tRgDQ.shape[1])):
+        if tR0cDQ[0, m, 0][0] < valid_rows - tRcDQ[0][0]:
+          cute.copy(gmem_copy_atom_DQ, rDQ[None, m, None], tDgDQ[None, m, None])
 
 
 __all__ = ["FFPAAttnBwdDQSm80SplitDGeneric"]

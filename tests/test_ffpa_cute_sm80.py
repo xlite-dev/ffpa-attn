@@ -7,11 +7,11 @@ import torch
 import torch.nn.functional as F
 
 from ffpa_attn import ffpa_attn_func, ffpa_attn_varlen_func
-from ffpa_attn.cutedsl import _ffpa_attn_forward_cutedsl, _ffpa_attn_varlen_impl
+from ffpa_attn.cute import _ffpa_attn_forward_cute, _ffpa_attn_varlen_impl
 from ffpa_attn.functional import CuTeDSLBackend
 
 
-def _cutedsl_large_d_available() -> bool:
+def _cute_large_d_available() -> bool:
   if not torch.cuda.is_available():
     return False
   major, _ = torch.cuda.get_device_capability()
@@ -19,7 +19,7 @@ def _cutedsl_large_d_available() -> bool:
 
 
 pytestmark = pytest.mark.skipif(
-  not _cutedsl_large_d_available(),
+  not _cute_large_d_available(),
   reason="CuTeDSL large-D tests require compute capability >= 8.0",
 )
 
@@ -47,7 +47,7 @@ def test_sm80_cutedsl_forward_matches_sdpa(dtype, causal, D):
   v = torch.randn(B, H, N, D, dtype=dtype, device="cuda")
   scale = 1.0 / math.sqrt(D)
 
-  out_cute, lse = _ffpa_attn_forward_cutedsl(
+  out_cute, lse = _ffpa_attn_forward_cute(
     q, k, v, scale, causal, return_lse=True
   )
   out_ref = F.scaled_dot_product_attention(
@@ -73,7 +73,7 @@ def test_sm80_cutedsl_forward_zeroes_v_tail_smem_after_dirty_kernel():
                                  dropout_p=0.0).sum().backward()
 
   scale = 1.0 / math.sqrt(D)
-  out_cute, lse = _ffpa_attn_forward_cutedsl(
+  out_cute, lse = _ffpa_attn_forward_cute(
     q, k, v, scale, causal=False, return_lse=True
   )
   out_ref = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, scale=scale)

@@ -14,23 +14,23 @@ When the caller opts into the CuTeDSL backend (``forward_backend='cutedsl'``)
 the dispatch goes through the same :class:`FFPAAttnMeta` normalization and
 :class:`FFPAAttnFunc` autograd boundary as all other backends.
 :meth:`_FFPAAttnFunc.forward` and :meth:`_FFPAAttnFunc.backward` route to
-:func:`ffpa_attn.cutedsl._ffpa_attn_forward_cutedsl` and
-:func:`ffpa_attn.cutedsl._ffpa_attn_backward_cutedsl`, which
+:func:`ffpa_attn.cute._ffpa_attn_forward_cute` and
+:func:`ffpa_attn.cute._ffpa_attn_backward_cute`, which
 handle the SDPA ``[B, H, N, D]`` ↔ FA ``[B, N, H, D]`` layout conversion
 internally. CuTeDSL compatibility constraints are enforced in two layers:
 
 - **Tensor-level** (device architecture, head_dim, dtype):
-  enforced by :func:`ffpa_attn.cutedsl._require_cutedsl_supported`,
+  enforced by :func:`ffpa_attn.cute._require_cute_supported`,
   now called from :meth:`FFPAAttnMeta.normalize` so all callers see
   consistent validation before kernel dispatch.
 - **Kwarg-level** (``dropout_p``, ``attn_mask``): enforced directly in
   :meth:`FFPAAttnMeta.normalize`, which raises ``NotImplementedError``
   for unsupported combinations. The varlen path additionally uses
-  :func:`ffpa_attn.cutedsl._check_supported_options` for the
+  :func:`ffpa_attn.cute._check_supported_options` for the
   full FlashAttention-extension kwarg surface.
 
 - **Soft (kwarg-level)**: enforced by
-  :func:`ffpa_attn.cutedsl._check_supported_options` at each
+  :func:`ffpa_attn.cute._check_supported_options` at each
   entry shim. The dense ``ffpa_attn_func(forward_backend='cutedsl')``
   path only forwards ``dropout_p`` and ``attn_mask`` to the helper;
   other unsupported kwargs reach the dense path via ``**kwargs`` and
@@ -53,8 +53,8 @@ constraint (dtype, ``dropout_p > 0``, explicit
 Variable-length (packed THD) attention is exposed via ``ffpa_attn_varlen_func``,
 which mirrors the FlashAttention varlen surface (``q, k, v, cu_seqlens_q,
 cu_seqlens_k, max_seqlen_q, max_seqlen_k, ...``) and delegates to
-:func:`ffpa_attn.cutedsl._ffpa_attn_varlen_cutedsl`, which
-dispatches to the CuTeDSL ``ffpa_attn::_varlen_fwd_cutedsl`` autograd-registered
+:func:`ffpa_attn.cute._ffpa_attn_varlen_cute`, which
+dispatches to the CuTeDSL ``ffpa_attn::_varlen_fwd_cute`` autograd-registered
 torch op. The varlen API is currently CuTeDSL-only on supported SM8x/SM90
 large-D shapes; other shapes / backends raise ``NotImplementedError``.
 """
@@ -230,7 +230,7 @@ def ffpa_attn_varlen_func(
   :param return_lse: When ``True``, also return the log-sum-exp tensor of
       shape ``[H_q, T_q]`` in fp32 (CUDA convention).
   :param kwargs: Most kwargs are recognized-and-rejected by
-      :func:`ffpa_attn.cutedsl._check_supported_options` — passing a
+      :func:`ffpa_attn.cute._check_supported_options` — passing a
       non-default value for ``window_size``, ``softcap``, ``sink``,
       ``attention_mask`` / ``attn_mask``, ``block_mask``, ``score_mod``,
       ``aux_tensors``, ``seqused_k``, ``block_table``, ``num_splits``, or
