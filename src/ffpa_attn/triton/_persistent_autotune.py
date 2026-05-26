@@ -31,6 +31,7 @@ DEFAULT_SEQLENS = [1, 512, 1024, 2048, 4096, 8192, 16384]
 
 _CONFIG_CACHE: dict[tuple[str, str], list[dict[str, Any]]] = {}
 _DEVICE_NAME_CACHE: dict[int, str] = {}
+_ARCH_CONFIG_CACHE: dict[tuple[str, str], list[dict[str, Any]]] = {}
 
 _KERNEL_CONFIG_KEYS = {
   "fwd_generic": {
@@ -267,6 +268,16 @@ def _device_name(device_index: int) -> str:
   return _DEVICE_NAME_CACHE[device_index]
 
 
+def _get_compute_capability(device_index: int) -> str:
+  """Return the compute capability string for a CUDA device.
+
+  :param device_index: CUDA device index.
+  :return: Compute capability in ``"major.minor"`` format.
+  """
+  props = torch.cuda.get_device_properties(device_index)
+  return f"{props.major}.{props.minor}"
+
+
 def dtype_name(dtype: torch.dtype) -> str:
   """Return the schema dtype name for a torch dtype.
 
@@ -433,9 +444,58 @@ def load_config_entries(
   return []
 
 
+def _load_arch_config_entries(config_dir: Path,
+                              device_index: int) -> list[dict[str, Any]]:
+  """Load entries from the first arch-matched config file in *config_dir*.
+
+  Used as a fallback when no device-specific config file exists.  Scans all
+  ``.json`` and ``.config.json`` files in *config_dir*, parses their
+  ``compute_capability`` field, and returns the entries of the first match.
+
+  Results are cached in ``_ARCH_CONFIG_CACHE`` keyed by
+  ``(str(config_dir), compute_capability)``.
+
+  :param config_dir: Directory to scan for config files.
+  :param device_index: CUDA device index used to determine the target
+      compute capability.
+  :return: Persisted config entries from an arch-matched file, or an empty
+      list when no match is found.
+  """
+  arch = _get_compute_capability(device_index)
+  cache_key = (str(config_dir), arch)
+  if cache_key in _ARCH_CONFIG_CACHE:
+    return _ARCH_CONFIG_CACHE[cache_key]
+
+  if not config_dir.is_dir():
+    _ARCH_CONFIG_CACHE[cache_key] = []
+    return []
+
+  json_files = sorted([
+    p for p in config_dir.iterdir()
+    if p.suffix == ".json" or p.name.endswith(".config.json")
+  ])
+  for candidate in json_files:
+    try:
+      payload = json.loads(candidate.read_text())
+      if int(payload.get("schema_version", -1)) != SCHEMA_VERSION:
+        continue
+      if payload.get("compute_capability") != arch:
+        continue
+      loaded = payload.get("entries", [])
+      entries = loaded if isinstance(loaded, list) else []
+      _ARCH_CONFIG_CACHE[cache_key] = entries
+      return entries
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+      continue
+
+  _ARCH_CONFIG_CACHE[cache_key] = []
+  return []
+
+
 def clear_config_cache() -> None:
   """Clear the in-process JSON entry cache."""
   _CONFIG_CACHE.clear()
+  _ARCH_CONFIG_CACHE.clear()
   _DEVICE_NAME_CACHE.clear()
   _lookup_persistent_config_cached.cache_clear()
 
@@ -536,13 +596,24 @@ def _lookup_persistent_config_cached(
   del config_dir_key
   device_name = _device_name(device_index)
 
-  candidates: list[dict[str, Any]] = []
-  for entry in load_config_entries(device_name=device_name):
+  entries = load_config_entries(device_name=device_name)
+  if not entries:
+    config_dir = runtime_config_dir()
+    entries = _load_arch_config_entries(config_dir, device_index)
+
+  exact_candidates: list[dict[str, Any]] = []
+  fallback_candidates: list[dict[str, Any]] = []
+  for entry in entries:
     if entry.get("direction") != request.direction:
       continue
     if entry.get("kernel") != request.kernel:
       continue
-    if entry.get("dtype") != request.dtype:
+    entry_dtype = entry.get("dtype")
+    if entry_dtype == request.dtype:
+      target = exact_candidates
+    elif request.dtype == "fp16" and entry_dtype == "bf16":
+      target = fallback_candidates
+    else:
       continue
     if request.causal is not None and bool(
       entry.get("causal", False)
@@ -613,8 +684,9 @@ def _lookup_persistent_config_cached(
         int(entry["seqlen_k"])
     except (KeyError, TypeError, ValueError):
       continue
-    candidates.append(entry)
+    target.append(entry)
 
+  candidates = exact_candidates if exact_candidates else fallback_candidates
   if not candidates:
     return None
 

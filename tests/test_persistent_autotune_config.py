@@ -534,11 +534,13 @@ def test_lookup_debug_logs_selected_config_cached_hit_and_miss(
   assert "'BLOCK_M': 128" in debug_messages[1]
 
   missing_request = request.__class__(**{**request.__dict__, "dtype": "fp16"})
-  assert persistent.lookup_persistent_config(missing_request) is None
+  # fp16 falls back to bf16 entries → should match now, not miss
+  assert persistent.lookup_persistent_config(missing_request)["BLOCK_M"] == 128
   assert len(debug_messages) == 3
-  assert debug_messages[2].startswith("Persistent autotune lookup miss")
+  assert debug_messages[2].startswith("Persistent autotune selected config")
   assert "kernel=fwd_generic" in debug_messages[2]
-  assert "config=None" in debug_messages[2]
+  assert "dtype=fp16" in debug_messages[2]
+  assert "config={" in debug_messages[2]
 
 
 def test_lookup_backward_filters_variants(tmp_path, monkeypatch):
@@ -1284,3 +1286,465 @@ def test_max_configs_from_env(monkeypatch):
   monkeypatch.setenv(persistent.MAX_CONFIGS_ENV_VAR, "0")
   with pytest.raises(ValueError):
     persistent.max_configs_from_env()
+
+
+# dtype fallback tests
+
+
+def test_fp16_fallback_to_bf16_forward(tmp_path, monkeypatch):
+  """fp16 lookup falls back to bf16 entries when no fp16 entry exists."""
+  _patch_cuda_device(monkeypatch)
+  monkeypatch.setenv(persistent.CONFIG_ENV_VAR, str(tmp_path))
+  persistent.clear_config_cache()
+  path = persistent.device_config_path(tmp_path, "NVIDIA L20")
+  persistent.write_config_file(
+    _payload([
+      {
+        "direction": "forward",
+        "kernel": "fwd_generic",
+        "autotune_mode": "fast",
+        "causal": False,
+        "dtype": "bf16",
+        "headdim": 512,
+        "seqlen_q": 1024,
+        "seqlen_k": 8192,
+        "config": {
+          "BLOCK_M": 128,
+          "BLOCK_N": 64,
+          "BLOCK_HEADDIM_QK": 64,
+          "BLOCK_HEADDIM_V": 64,
+          "num_warps": 8
+        },
+      },
+    ]),
+    path,
+  )
+
+  # fp16 request with same shape → should fallback to bf16 entry
+  fp16_config = persistent.lookup_persistent_config(
+    persistent.PersistentConfigRequest(
+      direction="forward",
+      kernel="fwd_generic",
+      autotune_mode="fast",
+      dtype="fp16",
+      headdim=512,
+      seqlen_q=1024,
+      seqlen_k=8192,
+      causal=False,
+    )
+  )
+  assert fp16_config is not None
+  assert fp16_config["BLOCK_M"] == 128
+
+  # bf16 request → normal exact match
+  bf16_config = persistent.lookup_persistent_config(
+    persistent.PersistentConfigRequest(
+      direction="forward",
+      kernel="fwd_generic",
+      autotune_mode="fast",
+      dtype="bf16",
+      headdim=512,
+      seqlen_q=1024,
+      seqlen_k=8192,
+      causal=False,
+    )
+  )
+  assert bf16_config is not None
+  assert bf16_config["BLOCK_M"] == 128
+
+
+def test_fp16_prefers_exact_over_fallback(tmp_path, monkeypatch):
+  """When both fp16 and bf16 entries exist, fp16 lookup prefers fp16."""
+  _patch_cuda_device(monkeypatch)
+  monkeypatch.setenv(persistent.CONFIG_ENV_VAR, str(tmp_path))
+  persistent.clear_config_cache()
+  path = persistent.device_config_path(tmp_path, "NVIDIA L20")
+  persistent.write_config_file(
+    _payload([
+      {
+        "direction": "forward",
+        "kernel": "fwd_generic",
+        "autotune_mode": "fast",
+        "causal": False,
+        "dtype": "bf16",
+        "headdim": 512,
+        "seqlen_q": 1024,
+        "seqlen_k": 8192,
+        "config": {
+          "BLOCK_M": 64,
+          "BLOCK_N": 64,
+          "BLOCK_HEADDIM_QK": 64,
+          "BLOCK_HEADDIM_V": 64,
+          "num_warps": 4
+        },
+      },
+      {
+        "direction": "forward",
+        "kernel": "fwd_generic",
+        "autotune_mode": "fast",
+        "causal": False,
+        "dtype": "fp16",
+        "headdim": 512,
+        "seqlen_q": 1024,
+        "seqlen_k": 8192,
+        "config": {
+          "BLOCK_M": 128,
+          "BLOCK_N": 64,
+          "BLOCK_HEADDIM_QK": 64,
+          "BLOCK_HEADDIM_V": 64,
+          "num_warps": 8
+        },
+      },
+    ]),
+    path,
+  )
+
+  # fp16 should pick fp16 entry (BLOCK_M=128), not the bf16 one (BLOCK_M=64)
+  fp16_config = persistent.lookup_persistent_config(
+    persistent.PersistentConfigRequest(
+      direction="forward",
+      kernel="fwd_generic",
+      autotune_mode="fast",
+      dtype="fp16",
+      headdim=512,
+      seqlen_q=1024,
+      seqlen_k=8192,
+      causal=False,
+    )
+  )
+  assert fp16_config is not None
+  assert fp16_config["BLOCK_M"] == 128
+  assert fp16_config["num_warps"] == 8
+
+
+def test_bf16_does_not_fallback_to_fp16(tmp_path, monkeypatch):
+  """bf16 lookup should NOT fallback to fp16 entries."""
+  _patch_cuda_device(monkeypatch)
+  monkeypatch.setenv(persistent.CONFIG_ENV_VAR, str(tmp_path))
+  persistent.clear_config_cache()
+  path = persistent.device_config_path(tmp_path, "NVIDIA L20")
+  persistent.write_config_file(
+    _payload([
+      {
+        "direction": "forward",
+        "kernel": "fwd_generic",
+        "autotune_mode": "fast",
+        "causal": False,
+        "dtype": "fp16",
+        "headdim": 512,
+        "seqlen_q": 1024,
+        "seqlen_k": 8192,
+        "config": {
+          "BLOCK_M": 128,
+          "BLOCK_N": 64,
+          "BLOCK_HEADDIM_QK": 64,
+          "BLOCK_HEADDIM_V": 64,
+          "num_warps": 8
+        },
+      },
+    ]),
+    path,
+  )
+
+  config = persistent.lookup_persistent_config(
+    persistent.PersistentConfigRequest(
+      direction="forward",
+      kernel="fwd_generic",
+      autotune_mode="fast",
+      dtype="bf16",
+      headdim=512,
+      seqlen_q=1024,
+      seqlen_k=8192,
+      causal=False,
+    )
+  )
+  # bf16 should NOT fallback to fp16 — miss expected
+  assert config is None
+
+
+def test_fp16_fallback_backward_with_grad_kv_storage(tmp_path, monkeypatch):
+  """fp16 backward fallback respects grad_kv_storage_dtype filter."""
+  _patch_cuda_device(monkeypatch)
+  monkeypatch.setenv(persistent.CONFIG_ENV_VAR, str(tmp_path))
+  persistent.clear_config_cache()
+  path = persistent.device_config_path(tmp_path, "NVIDIA L20")
+  persistent.write_config_file(
+    _payload([
+      {
+        "direction": "backward",
+        "kernel": "bwd_generic",
+        "autotune_mode": "fast",
+        "causal": True,
+        "dtype": "bf16",
+        "headdim": 512,
+        "seqlen_q": 1024,
+        "seqlen_k": 1024,
+        "bias_grad": False,
+        "grad_kv_storage_dtype": None,
+        "has_dropout": False,
+        "config": {
+          "BLOCK_M": 64,
+          "BLOCK_N": 64,
+          "BLOCK_HEADDIM": 128,
+          "num_warps": 4,
+          "num_stages": 2
+        },
+      },
+    ]),
+    path,
+  )
+
+  # fp16 request with matching grad_kv_storage_dtype=None → should fallback
+  fp16_config = persistent.lookup_persistent_config(
+    persistent.PersistentConfigRequest(
+      direction="backward",
+      kernel="bwd_generic",
+      autotune_mode="fast",
+      dtype="fp16",
+      headdim=512,
+      seqlen_q=1024,
+      seqlen_k=1024,
+      causal=True,
+      bias_grad=False,
+      grad_kv_storage_dtype=None,
+      has_dropout=False,
+    )
+  )
+  assert fp16_config is not None
+  assert fp16_config["BLOCK_HEADDIM"] == 128
+
+  # fp16 request with mismatched grad_kv_storage_dtype → should miss
+  fp16_mismatch = persistent.lookup_persistent_config(
+    persistent.PersistentConfigRequest(
+      direction="backward",
+      kernel="bwd_generic",
+      autotune_mode="fast",
+      dtype="fp16",
+      headdim=512,
+      seqlen_q=1024,
+      seqlen_k=1024,
+      causal=True,
+      bias_grad=False,
+      grad_kv_storage_dtype="fp32",
+      has_dropout=False,
+    )
+  )
+  assert fp16_mismatch is None
+
+
+# arch fallback tests
+
+
+def _payload_with_arch(
+  entries, device_name="NVIDIA L20", compute_capability="8.9"
+):
+  return {
+    "schema_version": persistent.SCHEMA_VERSION,
+    "device_name": device_name,
+    "compute_capability": compute_capability,
+    "entries": entries,
+  }
+
+
+def test_arch_fallback_loads_matching_capability(tmp_path, monkeypatch):
+  """When device-specific file is missing, fallback via compute_capability."""
+  monkeypatch.setattr(persistent.torch.cuda, "current_device", lambda: 0)
+  # Simulate an "Unknown GPU" with arch 8.9
+  monkeypatch.setattr(
+    persistent.torch.cuda, "get_device_name", lambda device=0: "Unknown GPU"
+  )
+  monkeypatch.setattr(
+    persistent.torch.cuda,
+    "get_device_properties",
+    lambda device=0:
+    type("props", (), {
+      "major": 8,
+      "minor": 9,
+      "total_memory": 24 * 1024**3
+    })()
+  )
+  monkeypatch.setenv(persistent.CONFIG_ENV_VAR, str(tmp_path))
+  persistent.clear_config_cache()
+  # Place an arch-matched file with a different device name
+  arch_path = tmp_path / "NVIDIA_L20.json"
+  persistent.write_config_file(
+    _payload_with_arch(
+      [
+        {
+          "direction": "forward",
+          "kernel": "fwd_generic",
+          "autotune_mode": "fast",
+          "causal": False,
+          "dtype": "bf16",
+          "headdim": 512,
+          "seqlen_q": 1024,
+          "seqlen_k": 8192,
+          "config": {
+            "BLOCK_M": 128,
+            "BLOCK_N": 64,
+            "BLOCK_HEADDIM_QK": 64,
+            "BLOCK_HEADDIM_V": 64,
+            "num_warps": 8
+          },
+        },
+      ],
+      device_name="NVIDIA L20",
+      compute_capability="8.9",
+    ),
+    arch_path,
+  )
+
+  config = persistent.lookup_persistent_config(
+    persistent.PersistentConfigRequest(
+      direction="forward",
+      kernel="fwd_generic",
+      autotune_mode="fast",
+      dtype="bf16",
+      headdim=512,
+      seqlen_q=1024,
+      seqlen_k=8192,
+      causal=False,
+      device_index=0,
+    )
+  )
+  assert config is not None
+  assert config["BLOCK_M"] == 128
+
+
+def test_device_specific_skips_arch_fallback(tmp_path, monkeypatch):
+  """Device-specific config is used even when arch-matched files also exist."""
+  _patch_cuda_device(monkeypatch)
+  monkeypatch.setenv(persistent.CONFIG_ENV_VAR, str(tmp_path))
+  persistent.clear_config_cache()
+  # Write device-specific config
+  device_path = persistent.device_config_path(tmp_path, "NVIDIA L20")
+  persistent.write_config_file(
+    _payload([
+      {
+        "direction": "forward",
+        "kernel": "fwd_generic",
+        "autotune_mode": "fast",
+        "causal": False,
+        "dtype": "bf16",
+        "headdim": 512,
+        "seqlen_q": 1024,
+        "seqlen_k": 8192,
+        "config": {
+          "BLOCK_M": 128,
+          "BLOCK_N": 64,
+          "BLOCK_HEADDIM_QK": 64,
+          "BLOCK_HEADDIM_V": 64,
+          "num_warps": 8
+        },
+      },
+    ]),
+    device_path,
+  )
+  # Write a different arch-matched file with conflicting config
+  arch_path = tmp_path / "NVIDIA_Other_GPU.json"
+  persistent.write_config_file(
+    _payload_with_arch(
+      [
+        {
+          "direction": "forward",
+          "kernel": "fwd_generic",
+          "autotune_mode": "fast",
+          "causal": False,
+          "dtype": "bf16",
+          "headdim": 512,
+          "seqlen_q": 1024,
+          "seqlen_k": 8192,
+          "config": {
+            "BLOCK_M": 64,
+            "BLOCK_N": 64,
+            "BLOCK_HEADDIM_QK": 64,
+            "BLOCK_HEADDIM_V": 64,
+            "num_warps": 4
+          },
+        },
+      ],
+      device_name="NVIDIA Other GPU",
+      compute_capability="8.9",
+    ),
+    arch_path,
+  )
+
+  config = persistent.lookup_persistent_config(
+    persistent.PersistentConfigRequest(
+      direction="forward",
+      kernel="fwd_generic",
+      autotune_mode="fast",
+      dtype="bf16",
+      headdim=512,
+      seqlen_q=1024,
+      seqlen_k=8192,
+      causal=False,
+    )
+  )
+  # Should use device-specific config (BLOCK_M=128), not arch fallback (BLOCK_M=64)
+  assert config is not None
+  assert config["BLOCK_M"] == 128
+
+
+def test_arch_fallback_skips_wrong_arch(tmp_path, monkeypatch):
+  """Arch fallback ignores files whose compute_capability doesn't match."""
+  monkeypatch.setattr(persistent.torch.cuda, "current_device", lambda: 0)
+  monkeypatch.setattr(
+    persistent.torch.cuda, "get_device_name", lambda device=0: "Unknown GPU"
+  )
+  monkeypatch.setattr(
+    persistent.torch.cuda,
+    "get_device_properties",
+    lambda device=0:
+    type("props", (), {
+      "major": 12,
+      "minor": 0,
+      "total_memory": 32 * 1024**3
+    })()
+  )
+  monkeypatch.setenv(persistent.CONFIG_ENV_VAR, str(tmp_path))
+  persistent.clear_config_cache()
+  # Place a file with mismatched arch (8.9, but current device is 12.0)
+  arch_path = tmp_path / "NVIDIA_L20.json"
+  persistent.write_config_file(
+    _payload_with_arch(
+      [
+        {
+          "direction": "forward",
+          "kernel": "fwd_generic",
+          "autotune_mode": "fast",
+          "causal": False,
+          "dtype": "bf16",
+          "headdim": 512,
+          "seqlen_q": 1024,
+          "seqlen_k": 8192,
+          "config": {
+            "BLOCK_M": 128,
+            "BLOCK_N": 64,
+            "BLOCK_HEADDIM_QK": 64,
+            "BLOCK_HEADDIM_V": 64,
+            "num_warps": 8
+          },
+        },
+      ],
+      device_name="NVIDIA L20",
+      compute_capability="8.9",
+    ),
+    arch_path,
+  )
+
+  config = persistent.lookup_persistent_config(
+    persistent.PersistentConfigRequest(
+      direction="forward",
+      kernel="fwd_generic",
+      autotune_mode="fast",
+      dtype="bf16",
+      headdim=512,
+      seqlen_q=1024,
+      seqlen_k=8192,
+      causal=False,
+      device_index=0,
+    )
+  )
+  # Arch mismatch → no fallback
+  assert config is None
