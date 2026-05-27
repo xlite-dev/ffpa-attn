@@ -14,7 +14,7 @@ from typing import Callable, Optional, Tuple
 import torch
 import cutlass.cute as cute
 
-from ._fwd_generic_sm80 import FFPAAttnFwdSm80SplitD
+from ._fwd_generic_sm80 import FFPAAttnFwdSm80SplitD, FFPAAttnSm80SplitDPersistQ
 from ._utils import (
   SM80_FWD_TILE_M,
   SM80_FWD_TILE_N,
@@ -185,6 +185,30 @@ def _ffpa_attn_forward_sm80(
   current_stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
   is_varlen = cu_seqlens_q is not None or cu_seqlens_k is not None
   smem_capacity_arch = f"sm_{device_arch // 10}{device_arch % 10}"
+  # Probe best num_stages for the original kernel (fallback).
+  # Higher stages give better pipeline overlap; try from high to low.
+  orig_num_stages = SM80_FWD_NUM_STAGES
+  for ns_candidate in (
+    SM80_FWD_NUM_STAGES + 1,
+    SM80_FWD_NUM_STAGES,
+    SM80_FWD_NUM_STAGES - 1,
+  ):
+    if FFPAAttnFwdSm80SplitD.can_implement(
+      dtype,
+      head_dim,
+      head_dim_v,
+      SM80_FWD_TILE_M,
+      SM80_FWD_TILE_N,
+      ns_candidate,
+      SM80_FWD_NUM_THREADS,
+      causal,
+      smem_capacity_arch=smem_capacity_arch,
+      d_chunk=SM80_FWD_SPLIT_D_CHUNK,
+    ):
+      orig_num_stages = ns_candidate
+      break
+
+  # Original-kernel d-chunk selection with the best found num_stages.
   fwd_d_chunk = _pick_split_d_chunk(
     FFPAAttnFwdSm80SplitD.can_implement,
     SM80_FWD_SPLIT_D_CHUNK,
@@ -193,28 +217,109 @@ def _ffpa_attn_forward_sm80(
     head_dim_v=head_dim_v,
     tile_m=SM80_FWD_TILE_M,
     tile_n=SM80_FWD_TILE_N,
-    num_stages=SM80_FWD_NUM_STAGES,
+    num_stages=orig_num_stages,
     num_threads=SM80_FWD_NUM_THREADS,
     is_causal=causal,
     smem_capacity_arch=smem_capacity_arch,
   )
-  if not FFPAAttnFwdSm80SplitD.can_implement(
+
+  # PersistQ dispatch: search best num_stages at the narrowest d_chunk
+  # (same pre-search strategy as the original kernel), then widen the
+  # chunk via _pick_split_d_chunk to amortise epilogue cost.
+  # TODO: Autotuning: consider other d_chunk candidates for the PersistQ
+  # kernel instead of just the widest one that fits, as the optimal d_chunk
+  # for PersistQ may differ from the original kernel's optimal d_chunk.
+  persist_q_kernel = False
+  persist_q_num_stages = SM80_FWD_NUM_STAGES
+  persist_q_d_chunk = SM80_FWD_SPLIT_D_CHUNK
+  for ns_candidate in (
+    SM80_FWD_NUM_STAGES + 1,
+    SM80_FWD_NUM_STAGES,
+    SM80_FWD_NUM_STAGES - 1,
+  ):
+    if FFPAAttnSm80SplitDPersistQ.can_implement(
+      dtype,
+      head_dim,
+      head_dim_v,
+      SM80_FWD_TILE_M,
+      SM80_FWD_TILE_N,
+      ns_candidate,
+      SM80_FWD_NUM_THREADS,
+      causal,
+      smem_capacity_arch=smem_capacity_arch,
+      d_chunk=SM80_FWD_SPLIT_D_CHUNK,
+    ):
+      persist_q_num_stages = ns_candidate
+      break
+  # Do not use PersistQ when only a single stage fits — the lost
+  # pipeline depth outweighs the saved Q-reload traffic.
+  if persist_q_num_stages > 1:
+    persist_q_d_chunk = _pick_split_d_chunk(
+      FFPAAttnSm80SplitDPersistQ.can_implement,
+      SM80_FWD_SPLIT_D_CHUNK,
+      dtype=dtype,
+      head_dim=head_dim,
+      head_dim_v=head_dim_v,
+      tile_m=SM80_FWD_TILE_M,
+      tile_n=SM80_FWD_TILE_N,
+      num_stages=persist_q_num_stages,
+      num_threads=SM80_FWD_NUM_THREADS,
+      is_causal=causal,
+      smem_capacity_arch=smem_capacity_arch,
+    )
+    persist_q_kernel = True
+
+  if persist_q_kernel:
+    KernelClass = FFPAAttnSm80SplitDPersistQ
+    actual_num_stages = persist_q_num_stages
+    actual_d_chunk = persist_q_d_chunk
+  else:
+    KernelClass = FFPAAttnFwdSm80SplitD
+    # Re-search best num_stages for the original kernel using the actual
+    # fwd_d_chunk chosen by _pick_split_d_chunk (which may be wider than
+    # the d_chunk=32 used in the pre-search above).  Try from high to low
+    # so the deepest pipeline that fits is selected.
+    # TODO: Autotuning: consider other d_chunk candidates for the original
+    # kernel instead of just the widest one that fits.
+    actual_num_stages = SM80_FWD_NUM_STAGES
+    for ns_candidate in (
+      SM80_FWD_NUM_STAGES + 1,  # 3
+      SM80_FWD_NUM_STAGES,  # 2
+      SM80_FWD_NUM_STAGES - 1,  # 1
+    ):
+      if FFPAAttnFwdSm80SplitD.can_implement(
+        dtype,
+        head_dim,
+        head_dim_v,
+        SM80_FWD_TILE_M,
+        SM80_FWD_TILE_N,
+        ns_candidate,
+        SM80_FWD_NUM_THREADS,
+        causal,
+        smem_capacity_arch=smem_capacity_arch,
+        d_chunk=fwd_d_chunk,
+      ):
+        actual_num_stages = ns_candidate
+        break
+    actual_d_chunk = fwd_d_chunk
+
+  if not KernelClass.can_implement(
     dtype,
     head_dim,
     head_dim_v,
     SM80_FWD_TILE_M,
     SM80_FWD_TILE_N,
-    SM80_FWD_NUM_STAGES,
+    actual_num_stages,
     SM80_FWD_NUM_THREADS,
     causal,
     smem_capacity_arch=smem_capacity_arch,
-    d_chunk=fwd_d_chunk,
+    d_chunk=actual_d_chunk,
   ):
     raise RuntimeError(
       "SM80/SM89 CuTeDSL forward configuration exceeds kernel resource limits: "
       f"head_dim={head_dim}, tile=({SM80_FWD_TILE_M}, {SM80_FWD_TILE_N}), "
-      f"num_stages={SM80_FWD_NUM_STAGES}, arch={smem_capacity_arch}, "
-      f"d_chunk={fwd_d_chunk}."
+      f"num_stages={actual_num_stages}, arch={smem_capacity_arch}, "
+      f"d_chunk={actual_d_chunk}."
     )
 
   if (is_varlen or causal) and not is_fake_mode():
@@ -230,13 +335,13 @@ def _ffpa_attn_forward_sm80(
     return out, lse
 
   compile_key = (
-    "sm80_fwd_generic",
+    "sm80_fwd_persist_q" if persist_q_kernel else "sm80_fwd_generic",
     dtype,
     head_dim,
     head_dim_v,
     qhead_per_kvhead,
     causal,
-    SM80_FWD_NUM_STAGES,
+    actual_num_stages,
     lse is None,
     cu_seqlens_q is None,
     cu_seqlens_k is None,
@@ -244,7 +349,7 @@ def _ffpa_attn_forward_sm80(
     SM80_FWD_TILE_N,
     device_arch,
     cute_arch_key,
-    fwd_d_chunk,
+    actual_d_chunk,
     fa_logging.get_fa_log_level(),
   )
   if compile_key not in _ffpa_attn_forward_sm80.compile_cache:
@@ -259,7 +364,7 @@ def _ffpa_attn_forward_sm80(
       lse, assumed_align=4
     ) if lse is not None else None
 
-    ffpa_fwd = FFPAAttnFwdSm80SplitD(
+    ffpa_fwd = KernelClass(
       dtype,
       head_dim,
       head_dim_v,
@@ -268,8 +373,8 @@ def _ffpa_attn_forward_sm80(
       pack_gqa=False,
       tile_m=SM80_FWD_TILE_M,
       tile_n=SM80_FWD_TILE_N,
-      num_stages=SM80_FWD_NUM_STAGES,
-      d_chunk=fwd_d_chunk,
+      num_stages=actual_num_stages,
+      d_chunk=actual_d_chunk,
     )
     compile_args = [
       ffpa_fwd,
