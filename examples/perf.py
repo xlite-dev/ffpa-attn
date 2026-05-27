@@ -18,6 +18,7 @@ other side and restricts tasks to the cutedsl-compatible subset
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 import re
 import sys
@@ -90,6 +91,13 @@ DEFAULT_OUTPUT_STEM = "ffpa_speedup"
 DEFAULT_OUTPUT_DIR = Path(".tmp")
 FALLBACK_DEVICE_NAME = "NVIDIA Geforce RTX 5090"
 CUTEDSL_BACKEND = "cutedsl"
+TRITON_BACKEND = "triton"
+CUDA_BACKEND = "cuda"
+MIN_BENCHMARK_HEAD_DIM = 64
+MAX_FFPA_BENCHMARK_HEAD_DIM = 1024
+HEAD_DIM_ALIGNMENT = 64
+TRITON_SMALL_D_ENV = "FFPA_TRITON_ALLOW_SMALL_D"
+CUTEDSL_SMALL_D_ENV = "FFPA_CUTE_ALLOW_SMALL_D"
 CUTEDSL_COMPAT_TASKS = frozenset({
   "self-attn", "cross-attn", "gqa", "causal", "non-aligned"
 })
@@ -447,6 +455,74 @@ def _require_cute_device() -> int:
       f"'{torch.cuda.get_device_name(device)}' with compute capability {major}.{minor}."
     )
   return cute_max_supported_head_dim(device)
+
+
+def _env_flag_enabled(name: str) -> bool:
+  return bool(int(os.environ.get(name, "0")))
+
+
+def _benchmark_effective_forward_backends(
+  args: argparse.Namespace,
+) -> set[str]:
+  effective: set[str] = set()
+  if args.forward:
+    effective.add(args.forward_backend)
+  if args.backward:
+    effective.add(
+      CUTEDSL_BACKEND if args.backward_backend ==
+      CUTEDSL_BACKEND else TRITON_BACKEND
+    )
+  return effective
+
+
+def _validate_benchmark_head_dim(
+  args: argparse.Namespace,
+  *,
+  max_head_dim: int,
+) -> None:
+  if (
+    args.D < MIN_BENCHMARK_HEAD_DIM or args.D > max_head_dim
+    or args.D % HEAD_DIM_ALIGNMENT != 0
+  ):
+    raise SystemExit(
+      "[bench] --D must be divisible by "
+      f"{HEAD_DIM_ALIGNMENT} and satisfy "
+      f"{MIN_BENCHMARK_HEAD_DIM} <= D <= {max_head_dim}; got {args.D}."
+    )
+
+
+def _emit_small_d_backend_notes(args: argparse.Namespace) -> None:
+  effective_forward_backends = _benchmark_effective_forward_backends(args)
+  if CUDA_BACKEND in effective_forward_backends and args.D <= 256:
+    raise SystemExit(
+      "[cuda] D <= 256 is not supported by the FFPA CUDA backend. "
+      f"Use {TRITON_SMALL_D_ENV}=1 with --fwd-backend triton, or "
+      f"{CUTEDSL_SMALL_D_ENV}=1 with --fwd-backend cutedsl."
+    )
+
+  if TRITON_BACKEND in effective_forward_backends and args.D <= 256:
+    if _env_flag_enabled(TRITON_SMALL_D_ENV):
+      print(
+        f"[triton] D <= 256 is enabled for FFPA benchmarking via {TRITON_SMALL_D_ENV}=1.",
+        file=sys.stderr,
+      )
+    else:
+      print(
+        f"[triton] D <= 256 stays on the SDPA fallback path unless {TRITON_SMALL_D_ENV}=1.",
+        file=sys.stderr,
+      )
+
+  if CUTEDSL_BACKEND in effective_forward_backends and args.D < 320:
+    if _env_flag_enabled(CUTEDSL_SMALL_D_ENV):
+      print(
+        f"[cutedsl] D < 320 is enabled via {CUTEDSL_SMALL_D_ENV}=1 and runs through the SM80 Split-D fallback path.",
+        file=sys.stderr,
+      )
+    else:
+      print(
+        f"[cutedsl] D < 320 stays on the SDPA fallback path unless {CUTEDSL_SMALL_D_ENV}=1.",
+        file=sys.stderr,
+      )
 
 
 def _resolve_cute_backends(args: argparse.Namespace) -> bool:
@@ -1225,7 +1301,7 @@ def render_speedup_markdown(
   if cutedsl:
     lines.extend([
       "",
-      "Backend: CuTeDSL dense large-D path (fp16/bf16 forward/backward). "
+      "Backend: CuTeDSL dense path (fp16/bf16 forward/backward; D<320 uses the SM80 fallback when enabled). "
       "TFLOPS reports the theoretical dominant attention GEMM throughput only; "
       "forward and backward are computed separately from the measured latency.",
     ])
@@ -1366,11 +1442,10 @@ def main() -> None:
       raise SystemExit(
         "--show-fallback is not compatible with the cutedsl backend."
       )
-    max_head_dim = _require_cute_device()
-    if args.D <= 256 or args.D > max_head_dim or args.D % 64 != 0:
-      raise SystemExit(
-        f"[cutedsl] --D must be divisible by 64 and satisfy 256 < D <= {max_head_dim}; got {args.D}."
-      )
+  max_head_dim = _require_cute_device(
+  ) if is_cutedsl else MAX_FFPA_BENCHMARK_HEAD_DIM
+  _validate_benchmark_head_dim(args, max_head_dim=max_head_dim)
+  _emit_small_d_backend_notes(args)
 
   device_name = FALLBACK_DEVICE_NAME if fallback else _device_name()
   tasks = _parse_tasks_arg(args.tasks)

@@ -123,9 +123,10 @@ def _apply_dropout_to_p(
   return p
 
 
-def _gen_fwd_autotune_configs(headdim: int = 256,
-                              autotune_mode: str = "max"
-                              ) -> list[triton.Config]:
+def _gen_fwd_autotune_configs(
+  headdim: int = 256,
+  autotune_mode: str = "max",
+) -> list[triton.Config]:
   """Generate autotune configs for the single FFPA Triton forward kernel.
 
   The search space is compact: tune Q-block size, QK/V D-chunk size, warp
@@ -144,10 +145,13 @@ def _gen_fwd_autotune_configs(headdim: int = 256,
   :return: Triton autotune configurations for the forward kernel.
   """
   # fast: 2*1*2*2*1 = 8 configs; max: 2*2*2*2*2 = 32 configs
+  headdim_candidates = [64, 128]
+  if headdim == 256:
+    headdim_candidates.append(256)
   configs = []
   for block_m in [64, 128]:
     for block_n in [64] if autotune_mode == "fast" else [64, 128]:
-      for block_headdim in [64, 128]:
+      for block_headdim in headdim_candidates:
         for num_warps in [4, 8]:
           for num_stages in ([2] if autotune_mode == "fast" else [2, 3]):
             configs.append(
@@ -185,9 +189,12 @@ def _gen_decode_fwd_stage1_autotune_configs(
   # use_gemv fast: 2*1*2*1*1 = 4 configs; use_gemv max: 2*1*2*2*1 = 8 configs
   # not use_gemv fast: 2*2*2*1*1 = 8 configs; not use_gemv max: 2*2*2*2*1 = 16 configs
   configs = []
+  headdim_candidates = [64, 128]
+  if headdim == 256:
+    headdim_candidates.append(256)
   for block_n in [64, 128]:
     for block_m in ([8] if use_gemv else [16, 32]):
-      for block_headdim in [64, 128]:
+      for block_headdim in headdim_candidates:
         for num_warps in ([4] if autotune_mode == "fast" else [4, 8]):
           configs.append(
             triton.Config(

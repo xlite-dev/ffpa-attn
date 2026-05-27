@@ -135,6 +135,33 @@ def _sdpa_ref_grads(
   return q2.grad, dk, dv
 
 
+@pytest.mark.parametrize("dtype", DTYPES, ids=["fp16", "bf16"])
+def test_triton_small_d_env_backward_matches_sdpa(dtype, monkeypatch):
+  monkeypatch.setenv("FFPA_TRITON_ALLOW_SMALL_D", "1")
+  torch.manual_seed(127)
+  B, H, N, D = 1, 4, 1024, 256
+  q = torch.randn(B, H, N, D, dtype=dtype, device="cuda", requires_grad=True)
+  k = torch.randn(B, H, N, D, dtype=dtype, device="cuda", requires_grad=True)
+  v = torch.randn(B, H, N, D, dtype=dtype, device="cuda", requires_grad=True)
+  scale = 1.0 / math.sqrt(D)
+
+  out = ffpa_attn_func(
+    q,
+    k,
+    v,
+    scale=scale,
+    forward_backend="triton",
+    backward_backend="triton",
+  )
+  out.sum().backward()
+
+  dq_ref, dk_ref, dv_ref = _sdpa_ref_grads(q, k, v, False, scale)
+  tol = _tolerance(dtype)
+  assert torch.allclose(q.grad, dq_ref, **tol)
+  assert torch.allclose(k.grad, dk_ref, **tol)
+  assert torch.allclose(v.grad, dv_ref, **tol)
+
+
 @pytest.mark.parametrize("dtype", DTYPES)
 def test_sm90_tma_persist_dkdv_causal_matches_sdpa(dtype):
   _skip_if_no_sm90_tma()

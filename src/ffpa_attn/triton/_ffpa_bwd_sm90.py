@@ -986,8 +986,7 @@ def _gen_bwd_sm90_autotune_configs(
   enable_split_launch: bool = False,
 ) -> list[triton.Config]:
   """Generate autotune configs for the SM90 TMA backward main kernel."""
-  del headdim
-  # fast: 2*1*2*1*1 = 4 configs; max: 2*2*2*2*2 = 32 configs
+  # D=256 adds one extra BLOCK_HEADDIM candidate to the base search space.
   configs = []
   if enable_persist_dkdv:
     if autotune_mode == "fast":
@@ -998,6 +997,8 @@ def _gen_bwd_sm90_autotune_configs(
       block_headdim_candidates = [64, 128]
   else:
     block_headdim_candidates = [64] if autotune_mode == "fast" else [64, 128]
+  if headdim == 256 and 256 not in block_headdim_candidates:
+    block_headdim_candidates.append(256)
 
   for block_m in [64, 128]:
     for block_n in ([64] if autotune_mode == "fast" else [64, 128]):

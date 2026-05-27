@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import os
 import time
 from typing import Any
 
@@ -22,12 +23,15 @@ import torch
 import torch.nn.functional as F
 
 from ffpa_attn import CuTeDSLBackend, SDPABackend, TritonBackend, ffpa_attn_func
+from ffpa_attn.functional import _should_use_aten_small_d_forward
 from _attn_flops import attention_bwd_flops, format_tflops_short, tflops_from_ms
 
 DEFAULT_WARMUP = 2
 DEFAULT_ITERS = 10
 MAX_MASK_GRAD_SEQLEN = 1024 * 16  # 16K, avoid OOM.
 BACKWARD_RESULT = dict[str, Any]
+TRITON_SMALL_D_ENV = "FFPA_TRITON_ALLOW_SMALL_D"
+CUTEDSL_SMALL_D_ENV = "FFPA_CUTE_ALLOW_SMALL_D"
 
 
 def _parse_grad_kv_dtype(arg: str) -> torch.dtype | None:
@@ -709,6 +713,9 @@ def _mask_grad_skip_reason(
   Nkv: int,
   D: int,
   attn_mask: torch.Tensor | None,
+  *,
+  forward_backend: str,
+  dropout_p: float,
 ) -> str | None:
   """Return why additive mask-gradient comparison should be skipped.
 
@@ -726,7 +733,17 @@ def _mask_grad_skip_reason(
     return "no-grad"
   if Nq > MAX_MASK_GRAD_SEQLEN or Nkv > MAX_MASK_GRAD_SEQLEN:
     return "skipped-large-logical-mask"
-  if D <= 256 or D > 1024 or (8 <= Nq < 512) or Nkv < 512:
+  effective_forward_backend = CuTeDSLBackend(
+    forward=True
+  ) if forward_backend == "cutedsl" else TritonBackend(forward=True)
+  if any([
+    _should_use_aten_small_d_forward(effective_forward_backend, D),
+    D > 1024,
+    attn_mask is not None and effective_forward_backend.name == "cutedsl",
+    dropout_p > 0.0 and effective_forward_backend.name == "cutedsl",
+    (8 <= Nq < 512),
+    Nkv < 512,
+  ]):
     return "skipped-ffpa-forward-fallback"
   return None
 
@@ -768,7 +785,17 @@ def _run_case(
   v = v.requires_grad_(True)
   scale = 1.0 / math.sqrt(D)
   dropout_seed = seed + 17
-  mask_grad_skip_reason = _mask_grad_skip_reason(B, Nh_q, Nq, Nkv, D, attn_mask)
+  forward_backend_name = "cutedsl" if backward_backend == "cutedsl" else "triton"
+  mask_grad_skip_reason = _mask_grad_skip_reason(
+    B,
+    Nh_q,
+    Nq,
+    Nkv,
+    D,
+    attn_mask,
+    forward_backend=forward_backend_name,
+    dropout_p=dropout_p,
+  )
   compare_mask_grad = mask_grad_skip_reason is None
   active_attn_mask = _prepare_attn_mask(attn_mask, q.dtype, compare_mask_grad)
 
@@ -1040,10 +1067,25 @@ def run_backward_examples(
     f"timing_mode={timing_mode}, tasks={sorted(tasks) if tasks is not None else 'full'}, "
     f"warmup={warmup}, iters={iters}"
   )
-  if backward_backend == "cutedsl":
+  if backward_backend != "cutedsl" and D <= 256:
+    triton_small_d_enabled = bool(int(os.environ.get(TRITON_SMALL_D_ENV, "0")))
     print(
-      "[CuTeDSL] backend constraints in effect: SM8x/SM90 large-D, no mask/dropout."
+      f"[Triton-forward] D <= 256 {'runs FFPA Triton' if triton_small_d_enabled else 'stays on the SDPA fallback path'} "
+      f"when {TRITON_SMALL_D_ENV}={'1' if triton_small_d_enabled else '0'}."
     )
+  if backward_backend == "cutedsl":
+    cutedsl_small_d_enabled = bool(
+      int(os.environ.get(CUTEDSL_SMALL_D_ENV, "0"))
+    )
+    if D < 320:
+      print(
+        f"[CuTeDSL] D < 320 {'runs the SM80 Split-D fallback path' if cutedsl_small_d_enabled else 'stays on the SDPA fallback path'} "
+        f"when {CUTEDSL_SMALL_D_ENV}={'1' if cutedsl_small_d_enabled else '0'}."
+      )
+    else:
+      print(
+        "[CuTeDSL] backend constraints in effect: SM8x/SM90 dense path, no mask/dropout."
+      )
 
   mask_dropout_supported = backward_backend != "cutedsl"
 
