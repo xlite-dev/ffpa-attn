@@ -226,6 +226,9 @@ def _ffpa_attn_forward_sm80(
   # PersistQ dispatch: search best num_stages at the narrowest d_chunk
   # (same pre-search strategy as the original kernel), then widen the
   # chunk via _pick_split_d_chunk to amortise epilogue cost.
+  # TODO: Autotuning: consider other d_chunk candidates for the PersistQ
+  # kernel instead of just the widest one that fits, as the optimal d_chunk
+  # for PersistQ may differ from the original kernel's optimal d_chunk.
   persist_q_kernel = False
   persist_q_num_stages = SM80_FWD_NUM_STAGES
   persist_q_d_chunk = SM80_FWD_SPLIT_D_CHUNK
@@ -276,6 +279,8 @@ def _ffpa_attn_forward_sm80(
     # fwd_d_chunk chosen by _pick_split_d_chunk (which may be wider than
     # the d_chunk=32 used in the pre-search above).  Try from high to low
     # so the deepest pipeline that fits is selected.
+    # TODO: Autotuning: consider other d_chunk candidates for the original
+    # kernel instead of just the widest one that fits.
     actual_num_stages = SM80_FWD_NUM_STAGES
     for ns_candidate in (
       SM80_FWD_NUM_STAGES + 1,  # 3
