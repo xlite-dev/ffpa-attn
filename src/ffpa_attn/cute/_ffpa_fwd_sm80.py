@@ -231,7 +231,8 @@ def _ffpa_attn_forward_sm80(
   # kernel instead of just the widest one that fits, as the optimal d_chunk
   # for PersistQ may differ from the original kernel's optimal d_chunk.
   persist_q_kernel = False
-  if SM80_FWD_USE_PERSIST_Q:  # default to False, stay tuned for future updates.
+  # NOTE: Default to False, stay tuned for future updates.
+  if SM80_FWD_USE_PERSIST_Q:
     persist_q_num_stages = SM80_FWD_NUM_STAGES
     persist_q_d_chunk = SM80_FWD_SPLIT_D_CHUNK
     for ns_candidate in (
