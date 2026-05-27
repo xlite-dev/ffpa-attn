@@ -8,6 +8,7 @@ to access the low-level dispatch layer.
 
 from __future__ import annotations
 
+import os
 import math
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
@@ -17,7 +18,7 @@ import torch
 from .triton import (
   _ffpa_attn_forward_triton,
   _ffpa_attn_backward_triton,
-)  # D > 256
+)  # Large-D by default; small-D when FFPA_TRITON_ALLOW_SMALL_D=1.
 from .aten import (
   _flash_attn_forward_aten,
   _flash_attn_backward_aten,
@@ -27,7 +28,7 @@ from .cute import (
   _ffpa_attn_forward_cute,
   _ffpa_attn_backward_cute,
   _ffpa_attn_varlen_cute,
-)  # D > 256
+)  # Large-D by default; small-D when FFPA_CUTE_ALLOW_SMALL_D=1.
 
 try:
   from .cuda import _ffpa_attn_forward_cuda  # D > 256
@@ -40,6 +41,39 @@ if TYPE_CHECKING:
 # MMA Acc encoding kept in sync with csrc/pybind/ffpa_attn_api.cc::ffpa_attn.
 _ACC_F16 = 0
 _ACC_F32 = 1
+_ATEN_SMALL_HEAD_DIM_MAX = 256
+_FFPA_SMALL_HEAD_DIM_MIN = 64
+
+
+def _env_flag_enabled(name: str) -> bool:
+  return bool(int(os.environ.get(name, "0")))
+
+
+def _allow_triton_small_d() -> bool:
+  return _env_flag_enabled("FFPA_TRITON_ALLOW_SMALL_D")
+
+
+def _allow_cute_small_d() -> bool:
+  return _env_flag_enabled("FFPA_CUTE_ALLOW_SMALL_D")
+
+
+def _backend_allows_small_d(backend: Backend, head_dim: int) -> bool:
+  if not (_FFPA_SMALL_HEAD_DIM_MIN <= head_dim <= _ATEN_SMALL_HEAD_DIM_MAX):
+    return False
+  if isinstance(backend, TritonBackend):
+    return _allow_triton_small_d()
+  if isinstance(backend, CuTeDSLBackend):
+    return _allow_cute_small_d()
+  return False
+
+
+def _should_use_aten_small_d_forward(
+  forward_backend: Backend,
+  head_dim: int,
+) -> bool:
+  return head_dim <= _ATEN_SMALL_HEAD_DIM_MAX and not _backend_allows_small_d(
+    forward_backend, head_dim
+  )
 
 
 def _is_hopper_or_later() -> bool:
@@ -457,14 +491,17 @@ class FFPAAttnMeta:
         cute_forward_available,
         cute_max_supported_head_dim,
       )
-      cutedsl_hw_unsupported = (
-        D <= 256 or D > cute_max_supported_head_dim(query.device)
-        or not cute_forward_available(query.device)
-      )
+      cutedsl_hw_unsupported = ((
+        D < _FFPA_SMALL_HEAD_DIM_MIN or (
+          D <= _ATEN_SMALL_HEAD_DIM_MAX
+          and not _backend_allows_small_d(self.forward_meta, D)
+        )
+      ) or D > cute_max_supported_head_dim(query.device)
+                                or not cute_forward_available(query.device))
       return cutedsl_hw_unsupported
 
     return any([
-      D <= 256,
+      _should_use_aten_small_d_forward(self.forward_meta, D),
       D > 1024,
       attn_mask is not None and self.forward_meta.name == "cutedsl",
       dropout_p > 0.0 and self.forward_meta.name == "cutedsl",
@@ -707,9 +744,12 @@ class _FFPAAttnFunc(torch.autograd.Function):
       x.requires_grad for x in (q, k, v, attn_bias) if x is not None
     )
     head_dim = q.size(-1)
+    use_aten_small_d_forward = _should_use_aten_small_d_forward(
+      meta.forward_meta, head_dim
+    )
     O = torch.empty_like(q)  # noqa: E741
 
-    if head_dim <= 256:
+    if use_aten_small_d_forward:
       O, lse, rng_state, unused = _flash_attn_forward_aten(
         q,
         k,
@@ -779,7 +819,7 @@ class _FFPAAttnFunc(torch.autograd.Function):
     # No unused output from the FFPA large-D forward kernels, but the
     # autograd contract requires a consistent number of saved tensors across
     # all backends. The small-D aten path already fills unused above.
-    if head_dim > 256:
+    if not use_aten_small_d_forward:
       unused = torch.empty(0, dtype=torch.uint8, device=q.device)
 
     if is_grad:
@@ -803,8 +843,11 @@ class _FFPAAttnFunc(torch.autograd.Function):
     attn_bias = getattr(ctx, "attn_bias", None)
     meta: FFPAAttnMeta = ctx.meta
     D = q.size(-1)
+    use_aten_small_d_forward = _should_use_aten_small_d_forward(
+      meta.forward_meta, D
+    )
 
-    if D > 256:
+    if not use_aten_small_d_forward:
       if isinstance(meta.backward_meta, TritonBackend):
         backward_meta = meta.backward_meta
         assert backward_meta.backward, "backward_meta must be configured with backward=True"

@@ -78,8 +78,14 @@ def _is_sdpa_fallback_shape(
   D = q.size(-1)
   Nq = q.size(2)
   Nkv = k.size(2)
+  if forward_backend == "cutedsl":
+    backend = ffpa_attn_functional.CuTeDSLBackend(forward=True)
+  elif forward_backend == "cuda":
+    backend = ffpa_attn_functional.CUDABackend(forward=True)
+  else:
+    backend = ffpa_attn_functional.TritonBackend(forward=True)
   return any([
-    D <= 256,
+    ffpa_attn_functional._should_use_aten_small_d_forward(backend, D),
     D > 1024,
     dropout_p > 0.0 and forward_backend == "cutedsl",
     8 <= Nq < 512,
@@ -235,6 +241,47 @@ def test_ffpa_attn_func_triton_additive_attn_mask_matches_sdpa():
   out = ffpa_attn_func(q, k, v, attn_mask=attn_mask, forward_backend="triton")
   ref = _sdpa_ref(q, k, v, attn_mask=attn_mask)
   torch.testing.assert_close(out, ref, **_tolerance(torch.float16))
+
+
+def test_ffpa_attn_func_triton_small_d_default_falls_back_to_sdpa(monkeypatch):
+  import ffpa_attn.ffpa_attn_interface as iface
+
+  q, k, v = _alloc_qkv(1, 4, 1024, 256, torch.float16)
+
+  def _unexpected_apply(*args, **kwargs):
+    raise AssertionError(
+      "small-D triton should fall back before FFPAAttnFunc.apply"
+    )
+
+  monkeypatch.setattr(iface.FFPAAttnFunc, "apply", _unexpected_apply)
+
+  out = ffpa_attn_func(q, k, v, forward_backend="triton")
+
+  torch.testing.assert_close(
+    out, _sdpa_ref(q, k, v), **_tolerance(torch.float16)
+  )
+
+
+def test_ffpa_attn_func_triton_small_d_env_uses_triton(monkeypatch):
+  monkeypatch.setenv("FFPA_TRITON_ALLOW_SMALL_D", "1")
+  q, k, v = _alloc_qkv(1, 4, 1024, 256, torch.float16)
+
+  def _unexpected_flash(*args, **kwargs):
+    raise AssertionError(
+      "small-D triton should bypass aten flash when env is enabled"
+    )
+
+  monkeypatch.setattr(
+    ffpa_attn_functional, "_flash_attn_forward_aten", _unexpected_flash
+  )
+
+  out = ffpa_attn_func(q, k, v, forward_backend="triton")
+
+  assert out.shape == q.shape
+  assert torch.isfinite(out).all()
+  torch.testing.assert_close(
+    out, _sdpa_ref(q, k, v), **_tolerance(torch.float16)
+  )
 
 
 @pytest.mark.parametrize("dtype", DTYPES, ids=["fp16", "bf16"])

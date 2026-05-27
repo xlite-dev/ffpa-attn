@@ -19,6 +19,7 @@ from cutlass.base_dsl import BaseDSL
 from cutlass.base_dsl.arch import Arch
 
 MIN_SUPPORTED_HEAD_DIM = 320
+SMALL_D_MIN_SUPPORTED_HEAD_DIM = 64
 
 # SM90 ENVIRONMENT VARIABLES
 SM90_SUPPORTED_HEAD_DIM = 512
@@ -70,13 +71,22 @@ _VARLEN_CUSTOM_OP_NONE_INT = -(2**31)
 
 # ENV variable to control the FWD/BWD behavior
 SM80_FWD_USE_PERSIST_Q = bool(
-  int(os.environ.get("FFPA_CUTEDSL_SM80_FWD_USE_PERSIST_Q", "0"))
+  int(os.environ.get("FFPA_CUTE_SM80_FWD_USE_PERSIST_Q", "0"))
 )
 
 torch2cute_dtype_map = {
   torch.float16: cutlass.Float16,
   torch.bfloat16: cutlass.BFloat16,
 }
+
+
+def cute_small_d_enabled() -> bool:
+  return bool(int(os.environ.get("FFPA_CUTE_ALLOW_SMALL_D", "0")))
+
+
+def dense_min_supported_head_dim() -> int:
+  return SMALL_D_MIN_SUPPORTED_HEAD_DIM if cute_small_d_enabled(
+  ) else MIN_SUPPORTED_HEAD_DIM
 
 
 def is_fake_mode() -> bool:
@@ -127,16 +137,17 @@ def _validate_sm80_head_dims(head_dim: int, head_dim_v: int) -> None:
   Used for the SM80 Split-D fallback path, which now covers every
   non-SM90 architecture (SM80/SM89, SM100/SM103/SM120, ...) and any
   ``head_dim > 512`` on SM90. Requires symmetric q/k/v head_dim in
-  ``[MIN_SUPPORTED_HEAD_DIM, SM80_SUPPORTED_HEAD_DIM]`` and
+  ``[dense_min_supported_head_dim(), SM80_SUPPORTED_HEAD_DIM]`` and
   ``head_dim % SM80_FWD_SPLIT_D_CHUNK == 0``.
   """
+  min_head_dim = dense_min_supported_head_dim()
   if head_dim != head_dim_v or not (
-    MIN_SUPPORTED_HEAD_DIM <= head_dim <= SM80_SUPPORTED_HEAD_DIM
+    min_head_dim <= head_dim <= SM80_SUPPORTED_HEAD_DIM
   ) or head_dim % SM80_FWD_SPLIT_D_CHUNK != 0:
     raise ValueError(
       f"(head_dim, head_dim_v)=({head_dim}, {head_dim_v}) is not supported. "
       f"The SM80/SM89 Split-D interface requires q/k head_dim == v "
-      f"head_dim_v, {MIN_SUPPORTED_HEAD_DIM} <= head_dim <= "
+      f"head_dim_v, {min_head_dim} <= head_dim <= "
       f"{SM80_SUPPORTED_HEAD_DIM}, and head_dim % {SM80_FWD_SPLIT_D_CHUNK} == 0."
     )
 

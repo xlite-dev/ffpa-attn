@@ -17,11 +17,13 @@ from __future__ import annotations
 
 import argparse
 import math
+import os
 import time
 from typing import Any
 
 import torch
 import torch.nn.functional as F
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from ffpa_attn import CUDABackend, CuTeDSLBackend, TritonBackend, ffpa_attn_func
 from _attn_flops import attention_fwd_flops, format_tflops_short, tflops_from_ms
@@ -29,6 +31,8 @@ from _attn_flops import attention_fwd_flops, format_tflops_short, tflops_from_ms
 DEFAULT_WARMUP = 2
 DEFAULT_ITERS = 10
 FORWARD_RESULT = dict[str, Any]
+TRITON_SMALL_D_ENV = "FFPA_TRITON_ALLOW_SMALL_D"
+CUTEDSL_SMALL_D_ENV = "FFPA_CUTE_ALLOW_SMALL_D"
 
 
 def _parse_grad_kv_dtype(arg: str) -> torch.dtype | None:
@@ -172,15 +176,20 @@ def _sdpa_ref(
   attn_mask: torch.Tensor | None = None,
   dropout_p: float = 0.0
 ):
-  return F.scaled_dot_product_attention(
-    q,
-    k,
-    v,
-    attn_mask=attn_mask,
-    scale=1.0 / math.sqrt(q.size(-1)),
-    is_causal=is_causal,
-    dropout_p=dropout_p,
-  )
+  sdpa_kwargs = {
+    "attn_mask": attn_mask,
+    "scale": 1.0 / math.sqrt(q.size(-1)),
+    "is_causal": is_causal,
+    "dropout_p": dropout_p,
+  }
+  if dropout_p > 0.0:
+    # Triton dropout parity is intentionally aligned to SDPA's efficient
+    # attention backend. The default SDPA dispatcher may pick flash-attention
+    # for D<=256, which uses a different RNG stream and breaks apples-to-apples
+    # dropout comparisons in the examples/perf benchmark.
+    with sdpa_kernel(SDPBackend.EFFICIENT_ATTENTION):
+      return F.scaled_dot_product_attention(q, k, v, **sdpa_kwargs)
+  return F.scaled_dot_product_attention(q, k, v, **sdpa_kwargs)
 
 
 def _make_broadcast_additive_attn_mask(
@@ -548,10 +557,25 @@ def run_forward_examples(
     f"tasks={sorted(tasks) if tasks is not None else 'full'}, "
     f"warmup={warmup}, iters={iters}"
   )
-  if forward_backend == "cutedsl":
+  if forward_backend == "triton" and D <= 256:
+    triton_small_d_enabled = bool(int(os.environ.get(TRITON_SMALL_D_ENV, "0")))
     print(
-      "[CuTeDSL] backend constraints in effect: SM8x/SM90 large-D, no attn_mask/dropout."
+      f"[Triton] D <= 256 {'runs FFPA Triton' if triton_small_d_enabled else 'stays on the SDPA fallback path'} "
+      f"when {TRITON_SMALL_D_ENV}={'1' if triton_small_d_enabled else '0'}."
     )
+  if forward_backend == "cutedsl":
+    cutedsl_small_d_enabled = bool(
+      int(os.environ.get(CUTEDSL_SMALL_D_ENV, "0"))
+    )
+    if D < 320:
+      print(
+        f"[CuTeDSL] D < 320 {'runs the SM80 Split-D fallback path' if cutedsl_small_d_enabled else 'stays on the SDPA fallback path'} "
+        f"when {CUTEDSL_SMALL_D_ENV}={'1' if cutedsl_small_d_enabled else '0'}."
+      )
+    else:
+      print(
+        "[CuTeDSL] backend constraints in effect: SM8x/SM90 dense path, no attn_mask/dropout."
+      )
 
   for dtype in dtypes:
     case_specs: list[dict[str, Any]] = [

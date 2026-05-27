@@ -25,6 +25,7 @@ import torch
 
 from ._utils import (
   MIN_SUPPORTED_HEAD_DIM,
+  dense_min_supported_head_dim,
   SM80_FWD_SPLIT_D_CHUNK,
   SM80_SUPPORTED_HEAD_DIM,
   SM90_SUPPORTED_HEAD_DIM,
@@ -194,8 +195,8 @@ def _use_sm90_specialized(major: int, head_dim: int, head_dim_v: int) -> bool:
   head_dim) falls back to the SM80 Ampere Split-D path.
   """
   return (
-    major == 9 and head_dim <= SM90_SUPPORTED_HEAD_DIM
-    and head_dim_v <= SM90_SUPPORTED_HEAD_DIM
+    major == 9 and MIN_SUPPORTED_HEAD_DIM <= head_dim <= SM90_SUPPORTED_HEAD_DIM
+    and MIN_SUPPORTED_HEAD_DIM <= head_dim_v <= SM90_SUPPORTED_HEAD_DIM
   )
 
 
@@ -261,13 +262,15 @@ def _require_cute_supported(
   head_dim_q = q.size(-1)
   head_dim_v = v.size(-1)
   use_sm90 = _use_sm90_specialized(major, head_dim_q, head_dim_v)
+  min_head_dim = MIN_SUPPORTED_HEAD_DIM if use_sm90 else dense_min_supported_head_dim(
+  )
   max_head_dim = (
     SM90_SUPPORTED_HEAD_DIM if use_sm90 else SM80_SUPPORTED_HEAD_DIM
   )
-  if not (MIN_SUPPORTED_HEAD_DIM <= head_dim_q <= max_head_dim):
+  if not (min_head_dim <= head_dim_q <= max_head_dim):
     raise NotImplementedError(
       f"cutedsl backend only supports dense head_dim in "
-      f"[{MIN_SUPPORTED_HEAD_DIM}, {max_head_dim}]; got {head_dim_q}"
+      f"[{min_head_dim}, {max_head_dim}]; got {head_dim_q}"
     )
   if not use_sm90 and head_dim_q % SM80_FWD_SPLIT_D_CHUNK != 0:
     raise NotImplementedError(

@@ -14,6 +14,7 @@ import torch
 import torch.nn.functional as F
 
 from ffpa_attn import ffpa_attn_func
+import ffpa_attn.functional as ffpa_attn_functional
 from ffpa_attn.functional import CuTeDSLBackend
 
 
@@ -105,7 +106,7 @@ def test_cutedsl_autograd_matches_triton(is_causal, D, dtype):
   torch.testing.assert_close(v_c.grad, v_t.grad, **_grad_tol())
 
 
-@pytest.mark.parametrize("D", [128])
+@pytest.mark.parametrize("D", [128, 256])
 def test_cutedsl_falls_back_for_small_head_dim(D):
   """D <= 256 with cutedsl backend falls back to SDPA."""
   torch.manual_seed(0)
@@ -115,6 +116,66 @@ def test_cutedsl_falls_back_for_small_head_dim(D):
 
   ref = F.scaled_dot_product_attention(q, q, q)
   torch.testing.assert_close(out, ref, **_tol())
+
+
+def test_cutedsl_small_head_dim_env_routes_through_ffpaattnfunc(monkeypatch):
+  import ffpa_attn.ffpa_attn_interface as iface
+
+  monkeypatch.setenv("FFPA_CUTE_ALLOW_SMALL_D", "1")
+  q = torch.randn(1, 8, 1024, 256, dtype=torch.bfloat16, device="cuda")
+  call_count = [0]
+  orig = iface.FFPAAttnFunc.apply
+
+  def spy(*args, **kwargs):
+    call_count[0] += 1
+    return orig(*args, **kwargs)
+
+  def _unexpected_flash(*args, **kwargs):
+    raise AssertionError(
+      "small-D cutedsl should bypass aten flash when env is enabled"
+    )
+
+  monkeypatch.setattr(iface.FFPAAttnFunc, "apply", spy)
+  monkeypatch.setattr(
+    ffpa_attn_functional, "_flash_attn_forward_aten", _unexpected_flash
+  )
+
+  out = ffpa_attn_func(q, q, q, forward_backend="cutedsl")
+
+  assert call_count[0] == 1
+  assert out.shape == q.shape and torch.isfinite(out).all()
+
+
+def test_cutedsl_small_head_dim_env_autograd_matches_triton(monkeypatch):
+  monkeypatch.setenv("FFPA_CUTE_ALLOW_SMALL_D", "1")
+  monkeypatch.setenv("FFPA_TRITON_ALLOW_SMALL_D", "1")
+  torch.manual_seed(42)
+  B, H, N, D = 1, 4, 1024, 256
+  dtype = torch.bfloat16
+
+  def make():
+    return (
+      torch.randn(B, H, N, D, dtype=dtype, device="cuda", requires_grad=True),
+      torch.randn(B, H, N, D, dtype=dtype, device="cuda", requires_grad=True),
+      torch.randn(B, H, N, D, dtype=dtype, device="cuda", requires_grad=True),
+    )
+
+  torch.manual_seed(42)
+  q_t, k_t, v_t = make()
+  out_t = ffpa_attn_func(
+    q_t, k_t, v_t, forward_backend="triton", backward_backend="triton"
+  )
+  out_t.sum().backward()
+
+  torch.manual_seed(42)
+  q_c, k_c, v_c = make()
+  out_c = ffpa_attn_func(q_c, k_c, v_c, forward_backend="cutedsl")
+  out_c.sum().backward()
+
+  torch.testing.assert_close(out_c, out_t, **_tol())
+  torch.testing.assert_close(q_c.grad, q_t.grad, **_grad_tol())
+  torch.testing.assert_close(k_c.grad, k_t.grad, **_grad_tol())
+  torch.testing.assert_close(v_c.grad, v_t.grad, **_grad_tol())
 
 
 def test_cutedsl_accepts_fp16_training():

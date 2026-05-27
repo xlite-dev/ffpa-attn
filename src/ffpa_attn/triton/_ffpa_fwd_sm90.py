@@ -289,6 +289,7 @@ _SM90_FWD_DEFAULT_CONFIG = {
 
 
 def _gen_fwd_sm90_autotune_configs(
+  headdim: int = 512,
   autotune_mode: str = "max",
   enable_ws: bool = True,
 ) -> list[triton.Config]:
@@ -305,11 +306,14 @@ def _gen_fwd_sm90_autotune_configs(
   :param enable_ws: Whether to generate only warp-specialized configs.
   :return: Triton autotune configurations for the SM90 TMA forward kernel.
   """
-  # fast: 2*2*2*1 = 8 configs; max: 2*2*2*2 = 16 configs
+  # D=256 adds one extra BLOCK_HEADDIM candidate to the base search space.
   configs = []
+  headdim_candidates = [64, 128]
+  if headdim == 256:
+    headdim_candidates.append(256)
   for block_m in [64, 128]:
     for block_n in [64, 128]:
-      for block_headdim in [64, 128]:
+      for block_headdim in headdim_candidates:
         for num_warps in [4] if autotune_mode == "fast" else [4, 8]:
           configs.append(
             triton.Config(
@@ -350,6 +354,7 @@ def _get_fwd_sm90_autotune(
   cache_key = (headdim, autotune_mode, dtype, enable_ws)
   if cache_key not in _ffpa_fwd_sm90_autotune_cache:
     configs = _gen_fwd_sm90_autotune_configs(
+      headdim=headdim,
       autotune_mode=autotune_mode,
       enable_ws=enable_ws,
     )

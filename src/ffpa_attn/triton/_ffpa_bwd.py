@@ -286,9 +286,11 @@ def _ffpa_bwd_pre_impl(
   )
 
 
-def _gen_pre_autotune_configs(d_chunk: bool,
-                              autotune_mode: str = "max"
-                              ) -> list[triton.Config]:
+def _gen_pre_autotune_configs(
+  d_chunk: bool,
+  headdim: int = 512,
+  autotune_mode: str = "max",
+) -> list[triton.Config]:
   """Generate autotune configs for the preprocess delta kernel.
 
   ``BLOCK_HEADDIM`` participates in autotune only for D_CHUNK mode.  Full-D
@@ -296,12 +298,17 @@ def _gen_pre_autotune_configs(d_chunk: bool,
   never benchmarked for large head dimensions.
 
   :param d_chunk: Whether generated configs should enable D_CHUNK mode.
+  :param headdim: Runtime head dimension used to widen the BLOCK_HEADDIM
+      search space for D=256.
   :param autotune_mode: Accepted for API symmetry; backward preprocess uses the
       same bounded search space for fast and max because only bwd_main gets an
       expanded max search.
   :return: Triton autotune configurations for the delta preprocess kernel.
   """
   configs = []
+  headdim_candidates = [64, 128]
+  if headdim == 256:
+    headdim_candidates.append(256)
   for block_m in [64, 128]:
     # fast: 2*1 = 2 configs; max: 2*2 = 4 configs
     if not d_chunk:
@@ -318,7 +325,7 @@ def _gen_pre_autotune_configs(d_chunk: bool,
       continue
 
     # fast: 2*2*1 = 4 configs; max: 2*2*2 = 8 configs
-    for block_headdim in [64, 128]:
+    for block_headdim in headdim_candidates:
       for num_warps in ([4] if autotune_mode == "fast" else [4, 8]):
         configs.append(
           triton.Config(
@@ -333,15 +340,19 @@ def _gen_pre_autotune_configs(d_chunk: bool,
   return configs
 
 
-_ffpa_bwd_pre_autotune_cache: dict[tuple[bool, str, str], callable] = {}
+_ffpa_bwd_pre_autotune_cache: dict[tuple[bool, int, str, str], callable] = {}
 
 
-def _get_pre_autotune(d_chunk: bool, autotune_mode: str, dtype: str):
-  cache_key = (d_chunk, autotune_mode, dtype)
+def _get_pre_autotune(
+  d_chunk: bool, headdim: int, autotune_mode: str, dtype: str
+):
+  cache_key = (d_chunk, headdim, autotune_mode, dtype)
   if cache_key not in _ffpa_bwd_pre_autotune_cache:
     _ffpa_bwd_pre_autotune_cache[cache_key] = triton.autotune(
       configs=_gen_pre_autotune_configs(
-        d_chunk=d_chunk, autotune_mode=autotune_mode
+        d_chunk=d_chunk,
+        headdim=headdim,
+        autotune_mode=autotune_mode,
       ),
       key=["autotune_seqlen_q_bucket", "headdim"],
       reset_to_zero=["Delta"],
@@ -385,20 +396,24 @@ def _normalize_bwd_pre_config(
 
 
 def _gen_bwd_autotune_configs(
+  headdim: int = 512,
   autotune_mode: str = "max",
 ) -> list[triton.Config]:
   """Generate autotune configs over BLOCK_M, BLOCK_N, BLOCK_HEADDIM, num_warps, num_stages.
 
-  :param block_n_values: Candidate ``BLOCK_N`` values for the target backward
-      kernel variant.
+  :param headdim: Runtime head dimension used to widen the BLOCK_HEADDIM
+      search space for D=256.
   :param autotune_mode: Search-space mode, ``"fast"`` or ``"max"``.
   :return: Triton autotune configurations for one backward kernel variant.
   """
-  # fast: 2*1*2*1*1 = 4 configs; max: 2*2*2*2*2 = 32 configs
+  # D=256 adds one extra BLOCK_HEADDIM candidate to the base search space.
   configs = []
+  headdim_candidates = [64, 128]
+  if headdim == 256:
+    headdim_candidates.append(256)
   for block_m in [64, 128]:
     for block_n in ([64] if autotune_mode == "fast" else [64, 128]):
-      for block_headdim in [64, 128]:
+      for block_headdim in headdim_candidates:
         for num_warps in ([4] if autotune_mode == "fast" else [4, 8]):
           for num_stages in ([2] if autotune_mode == "fast" else [2, 3]):
             configs.append(
@@ -1134,7 +1149,10 @@ def _get_bwd_autotune(
   """
   cache_key = (headdim, autotune_mode, bias_requires_grad)
   if cache_key not in _ffpa_bwd_autotune_cache:
-    configs = _gen_bwd_autotune_configs(autotune_mode=autotune_mode, )
+    configs = _gen_bwd_autotune_configs(
+      headdim=headdim,
+      autotune_mode=autotune_mode,
+    )
     reset_args = []
     if bias_requires_grad:
       reset_args.append("GradAttnBias")
@@ -1163,7 +1181,10 @@ def _get_bwd_dkdv_autotune(
     if bias_requires_grad:
       reset_args.append("GradAttnBias")
     _ffpa_bwd_dkdv_autotune_cache[cache_key] = triton.autotune(
-      configs=_gen_bwd_autotune_configs(autotune_mode=autotune_mode),
+      configs=_gen_bwd_autotune_configs(
+        headdim=headdim,
+        autotune_mode=autotune_mode,
+      ),
       key=[
         "autotune_seqlen_q_bucket",
         "autotune_seqlen_k_bucket",
@@ -1182,7 +1203,10 @@ def _get_bwd_dq_autotune(headdim: int, autotune_mode: str):
   cache_key = (headdim, autotune_mode)
   if cache_key not in _ffpa_bwd_dq_autotune_cache:
     _ffpa_bwd_dq_autotune_cache[cache_key] = triton.autotune(
-      configs=_gen_bwd_autotune_configs(autotune_mode=autotune_mode),
+      configs=_gen_bwd_autotune_configs(
+        headdim=headdim,
+        autotune_mode=autotune_mode,
+      ),
       key=[
         "autotune_seqlen_q_bucket",
         "autotune_seqlen_k_bucket",
@@ -1210,9 +1234,11 @@ def _gen_decode_bwd_stage1_autotune_configs(
   :param autotune_mode: Accepted search-space mode, ``"fast"`` or ``"max"``.
   :return: Triton autotune configs for the decode backward stage1 kernel.
   """
-  del headdim, autotune_mode
+  del autotune_mode
 
   headdim_candidates = [64, 128]
+  if headdim == 256:
+    headdim_candidates.append(256)
   block_n_candidates = [64, 128]
   block_m_candidates = [8] if use_gemv else [16]
 
@@ -1887,7 +1913,7 @@ def _ffpa_attn_backward_triton_impl(
   )
   if autotune:
     pre_kernel = _get_pre_autotune(
-      preprocess_d_chunk, autotune_mode, runtime_dtype
+      preprocess_d_chunk, headdim, autotune_mode, runtime_dtype
     )
     pre_kernel[pre_grid](*pre_args)
   else:

@@ -16,7 +16,7 @@ from cutlass.cute.nvgpu import cpasync, warp
 from quack import layout_utils
 
 from . import utils
-from ._utils import SM80_FWD_SPLIT_D_CHUNK
+from ._utils import SM80_FWD_SPLIT_D_CHUNK, dense_min_supported_head_dim
 from .utils import ampere_helpers as sm80_utils
 from .utils.block_info import BlockInfo
 from .utils.cute_dsl_utils import assume_tensor_aligned
@@ -166,7 +166,8 @@ class FFPAAttnFwdSm80SplitD:
       return False
     if head_dim != head_dim_v:
       return False
-    if head_dim <= 256 or head_dim > 1024 or head_dim % d_chunk != 0:
+    if head_dim < dense_min_supported_head_dim(
+    ) or head_dim > 1024 or head_dim % d_chunk != 0:
       return False
     if head_dim_v % d_chunk != 0:
       return False
@@ -1055,7 +1056,8 @@ class FFPAAttnSm80SplitDPersistQ:
       return False
     if head_dim != head_dim_v:
       return False
-    if head_dim <= 256 or head_dim > 1024 or head_dim % d_chunk != 0:
+    if head_dim < dense_min_supported_head_dim(
+    ) or head_dim > 1024 or head_dim % d_chunk != 0:
       return False
     if head_dim_v % d_chunk != 0:
       return False
