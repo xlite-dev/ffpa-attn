@@ -47,10 +47,26 @@ Main path (Nq >= 8):
        allocates bf16/fp16 buffers, every partial update is rounded at store
        time and reloaded at that lower precision on the next iteration.
 
+    The current kernel structure also forces the main path to reconstruct the
+    same score tile twice: once in the dKdV role and once again in the dQ
+    role. This is true even when the generic path uses the single-launch
+    wrapper. In other words, the duplicated S/dP/dS recompute is a kernel
+    design issue, not a launch-shape issue. For small head dimensions such as
+    D<=256, where ``num_d_chunks`` is often 1 and split-D itself is not the
+    bottleneck, that duplicate recompute can dominate and make Triton backward
+    notably less friendly to small-D workloads than SDPA.
+
     Because of this, the repeated DQ/DK/DV load/store pattern is both a major
     performance bottleneck and the reason output-buffer dtype materially
     affects backward accuracy. A future rewrite should prefer register or
     local-scratch fp32 accumulation with one final cast/store per output tile.
+
+    TODO: If small-D backward becomes a priority, the first optimization to
+    prototype is a fused small-D main path that computes one local ``dS`` and
+    reuses it for both dKdV and dQ. The most practical ownership change is to
+    keep DK/DV owned by the K-tile sweep and accumulate DQ through fp32 scratch
+    or atomic-add reduction, rather than preserving the current double
+    recompute to keep both outputs non-atomic.
 
 Decode path (Nq < 8):
   The stage1 kernel is split by K tile because a tiny query window would
@@ -1751,6 +1767,10 @@ def _ffpa_attn_backward_triton_impl(
   _, _, seqlen_k, _ = k.shape
   original_nheads_kv = original_nheads_kv or nheads
   softmax_scale = softmax_scale or (1.0 / math.sqrt(headdim))
+  # ``split_launch`` only changes whether the generic main path invokes dKdV
+  # and dQ as separate launches. The duplicated S/dP/dS recompute exists in
+  # both modes: the single-launch wrapper still calls the dKdV and dQ roles
+  # sequentially, so the root cause is the kernel structure itself.
   split_launch = enable_split_launch and seqlen_q >= 8
 
   if enable_tma and seqlen_q >= 8:
