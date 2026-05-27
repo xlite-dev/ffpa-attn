@@ -68,6 +68,11 @@ _WIDE_SPLIT_D_MIN_SMEM_BYTES = 128 * 1024
 
 _VARLEN_CUSTOM_OP_NONE_INT = -(2**31)
 
+# ENV variable to control the FWD/BWD behavior
+SM80_FWD_USE_PERSIST_Q = bool(
+  int(os.environ.get("FFPA_CUTEDSL_SM80_FWD_USE_PERSIST_Q", "0"))
+)
+
 torch2cute_dtype_map = {
   torch.float16: cutlass.Float16,
   torch.bfloat16: cutlass.BFloat16,

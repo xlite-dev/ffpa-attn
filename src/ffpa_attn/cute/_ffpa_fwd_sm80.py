@@ -21,6 +21,7 @@ from ._utils import (
   SM80_FWD_NUM_STAGES,
   SM80_FWD_NUM_THREADS,
   SM80_FWD_SPLIT_D_CHUNK,
+  SM80_FWD_USE_PERSIST_Q,
   is_fake_mode,
   maybe_contiguous,
   _call_with_tvm_ffi_current_stream,
@@ -230,44 +231,46 @@ def _ffpa_attn_forward_sm80(
   # kernel instead of just the widest one that fits, as the optimal d_chunk
   # for PersistQ may differ from the original kernel's optimal d_chunk.
   persist_q_kernel = False
-  persist_q_num_stages = SM80_FWD_NUM_STAGES
-  persist_q_d_chunk = SM80_FWD_SPLIT_D_CHUNK
-  for ns_candidate in (
-    SM80_FWD_NUM_STAGES + 1,
-    SM80_FWD_NUM_STAGES,
-    SM80_FWD_NUM_STAGES - 1,
-  ):
-    if FFPAAttnSm80SplitDPersistQ.can_implement(
-      dtype,
-      head_dim,
-      head_dim_v,
-      SM80_FWD_TILE_M,
-      SM80_FWD_TILE_N,
-      ns_candidate,
-      SM80_FWD_NUM_THREADS,
-      causal,
-      smem_capacity_arch=smem_capacity_arch,
-      d_chunk=SM80_FWD_SPLIT_D_CHUNK,
+  # NOTE: Default to False, stay tuned for future updates.
+  if SM80_FWD_USE_PERSIST_Q:
+    persist_q_num_stages = SM80_FWD_NUM_STAGES
+    persist_q_d_chunk = SM80_FWD_SPLIT_D_CHUNK
+    for ns_candidate in (
+      SM80_FWD_NUM_STAGES + 1,
+      SM80_FWD_NUM_STAGES,
+      SM80_FWD_NUM_STAGES - 1,
     ):
-      persist_q_num_stages = ns_candidate
-      break
-  # Do not use PersistQ when only a single stage fits — the lost
-  # pipeline depth outweighs the saved Q-reload traffic.
-  if persist_q_num_stages > 1:
-    persist_q_d_chunk = _pick_split_d_chunk(
-      FFPAAttnSm80SplitDPersistQ.can_implement,
-      SM80_FWD_SPLIT_D_CHUNK,
-      dtype=dtype,
-      head_dim=head_dim,
-      head_dim_v=head_dim_v,
-      tile_m=SM80_FWD_TILE_M,
-      tile_n=SM80_FWD_TILE_N,
-      num_stages=persist_q_num_stages,
-      num_threads=SM80_FWD_NUM_THREADS,
-      is_causal=causal,
-      smem_capacity_arch=smem_capacity_arch,
-    )
-    persist_q_kernel = True
+      if FFPAAttnSm80SplitDPersistQ.can_implement(
+        dtype,
+        head_dim,
+        head_dim_v,
+        SM80_FWD_TILE_M,
+        SM80_FWD_TILE_N,
+        ns_candidate,
+        SM80_FWD_NUM_THREADS,
+        causal,
+        smem_capacity_arch=smem_capacity_arch,
+        d_chunk=SM80_FWD_SPLIT_D_CHUNK,
+      ):
+        persist_q_num_stages = ns_candidate
+        break
+    # Do not use PersistQ when only a single stage fits — the lost
+    # pipeline depth outweighs the saved Q-reload traffic.
+    if persist_q_num_stages > 1:
+      persist_q_d_chunk = _pick_split_d_chunk(
+        FFPAAttnSm80SplitDPersistQ.can_implement,
+        SM80_FWD_SPLIT_D_CHUNK,
+        dtype=dtype,
+        head_dim=head_dim,
+        head_dim_v=head_dim_v,
+        tile_m=SM80_FWD_TILE_M,
+        tile_n=SM80_FWD_TILE_N,
+        num_stages=persist_q_num_stages,
+        num_threads=SM80_FWD_NUM_THREADS,
+        is_causal=causal,
+        smem_capacity_arch=smem_capacity_arch,
+      )
+      persist_q_kernel = True
 
   if persist_q_kernel:
     KernelClass = FFPAAttnSm80SplitDPersistQ
