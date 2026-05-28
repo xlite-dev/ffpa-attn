@@ -356,6 +356,7 @@ torch.library.define(
   "(Tensor dO, Tensor q, Tensor k, Tensor v, Tensor o, Tensor lse, Tensor? attn_bias, "
   "float softmax_scale, int causal, int autotune, "
   "int autotune_mode_is_max, int preprocess_d_chunk, int return_attn_bias_grad, int grad_kv_storage_dtype_code, "
+  "int grad_q_storage_dtype_code, "
   "int original_nheads_kv, float dropout_p, int philox_seed, int philox_offset, int enable_tma, int enable_ws, "
   "int enable_persist_dkdv, int enable_split_launch) "
   "-> (Tensor dq, Tensor dk, Tensor dv, Tensor grad_attn_bias)",
@@ -378,6 +379,7 @@ def _bwd_triton_torch_op(
   preprocess_d_chunk: int,
   return_attn_bias_grad: int,
   grad_kv_storage_dtype_code: int,
+  grad_q_storage_dtype_code: int,
   original_nheads_kv: int,
   dropout_p: float,
   philox_seed: int,
@@ -392,7 +394,11 @@ def _bwd_triton_torch_op(
   grad_kv_storage_dtype = _grad_kv_storage_dtype_from_code(
     grad_kv_storage_dtype_code
   )
-  dq = _triton_bwd_grad_tensor_like(q)
+  grad_q_storage_dtype = _grad_kv_storage_dtype_from_code(
+    grad_q_storage_dtype_code
+  )
+  dq = _triton_bwd_grad_tensor_like(q, grad_q_storage_dtype)
+  dq.zero_()  # atomic_add accumulates from the initial value; must be zero.
   dk = _triton_bwd_grad_tensor_like(k, grad_kv_storage_dtype)
   dv = _triton_bwd_grad_tensor_like(v, grad_kv_storage_dtype)
   if attn_bias is not None and return_attn_bias_grad:
@@ -448,6 +454,7 @@ def _bwd_triton_fake(
   preprocess_d_chunk: int,
   return_attn_bias_grad: int,
   grad_kv_storage_dtype_code: int,
+  grad_q_storage_dtype_code: int,
   original_nheads_kv: int,
   dropout_p: float,
   philox_seed: int,
@@ -475,13 +482,16 @@ def _bwd_triton_fake(
   grad_kv_storage_dtype = _grad_kv_storage_dtype_from_code(
     grad_kv_storage_dtype_code
   )
+  grad_q_storage_dtype = _grad_kv_storage_dtype_from_code(
+    grad_q_storage_dtype_code
+  )
   if attn_bias is not None and return_attn_bias_grad:
     grad_dtype = _attn_bias_grad_dtype(attn_bias, q, k)
     grad_attn_bias = torch.empty_like(attn_bias, dtype=grad_dtype)
   else:
     grad_attn_bias = q.new_empty(0)
   return (
-    _triton_bwd_grad_tensor_like(q),
+    _triton_bwd_grad_tensor_like(q, grad_q_storage_dtype),
     _triton_bwd_grad_tensor_like(k, grad_kv_storage_dtype),
     _triton_bwd_grad_tensor_like(v, grad_kv_storage_dtype),
     grad_attn_bias,

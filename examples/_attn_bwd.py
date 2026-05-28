@@ -526,6 +526,7 @@ def _ffpa_forward(
   attn_mask: torch.Tensor | None = None,
   dropout_p: float = 0.0,
   grad_kv_storage_dtype: torch.dtype | None = None,
+  grad_q_storage_dtype: torch.dtype | None = None,
   enable_tma: bool = False,
   enable_ws: bool = False,
   enable_persist_dkdv: bool = False,
@@ -553,6 +554,7 @@ def _ffpa_forward(
         persist_dkdv=enable_persist_dkdv,
         split_launch=enable_split_launch,
         grad_kv_storage_dtype=grad_kv_storage_dtype,
+        grad_q_storage_dtype=grad_q_storage_dtype,
       )
     elif backward_backend == "sdpa":
       backward_meta = SDPABackend(backward=True)
@@ -610,6 +612,7 @@ def _run_ffpa_backward(
   attn_mask: torch.Tensor | None = None,
   dropout_p: float = 0.0,
   grad_kv_storage_dtype: torch.dtype | None = None,
+  grad_q_storage_dtype: torch.dtype | None = None,
   enable_tma: bool = False,
   enable_ws: bool = False,
   enable_persist_dkdv: bool = False,
@@ -632,6 +635,7 @@ def _run_ffpa_backward(
     attn_mask=attn_mask,
     dropout_p=dropout_p,
     grad_kv_storage_dtype=grad_kv_storage_dtype,
+    grad_q_storage_dtype=grad_q_storage_dtype,
     enable_tma=enable_tma,
     enable_ws=enable_ws,
     enable_persist_dkdv=enable_persist_dkdv,
@@ -766,6 +770,7 @@ def _run_case(
   dropout_p: float = 0.0,
   timing_mode: str = "backward-only",
   grad_kv_storage_dtype: torch.dtype | None = None,
+  grad_q_storage_dtype: torch.dtype | None = None,
   enable_tma: bool = False,
   enable_ws: bool = False,
   enable_persist_dkdv: bool = False,
@@ -828,6 +833,7 @@ def _run_case(
         persist_dkdv=enable_persist_dkdv,
         split_launch=enable_split_launch,
         grad_kv_storage_dtype=grad_kv_storage_dtype,
+        grad_q_storage_dtype=grad_q_storage_dtype,
       ) if backward_backend == "triton" else SDPABackend(backward=True)
     ),
   )
@@ -879,6 +885,7 @@ def _run_case(
         active_attn_mask,
         dropout_p,
         grad_kv_storage_dtype,
+        grad_q_storage_dtype,
         enable_tma,
         enable_ws,
         enable_persist_dkdv,
@@ -1011,6 +1018,7 @@ def run_backward_examples(
   triton_autotune: bool = False,
   triton_autotune_mode: str = "fast",
   grad_kv_storage_dtype: torch.dtype | None = None,
+  grad_q_storage_dtype: torch.dtype | None = None,
   enable_tma: bool = False,
   enable_ws: bool = False,
   enable_persist_dkdv: bool = False,
@@ -1035,6 +1043,8 @@ def run_backward_examples(
   :param triton_autotune: Whether to enable Triton runtime autotune.
   :param triton_autotune_mode: Triton autotune mode.
   :param grad_kv_storage_dtype: Optional backward dK/dV (Triton or CuTeDSL)
+    storage dtype forwarded to ``ffpa_attn_func``.
+  :param grad_q_storage_dtype: Optional backward dQ (Triton)
     storage dtype forwarded to ``ffpa_attn_func``.
   :param enable_tma: Whether to enable the SM90+ Triton descriptor/TMA
     backward path when supported.
@@ -1062,6 +1072,7 @@ def run_backward_examples(
     f"triton_autotune={triton_autotune}, "
     f"triton_autotune_mode={triton_autotune_mode}, "
     f"grad_kv_storage_dtype={grad_kv_storage_dtype}, "
+    f"grad_q_storage_dtype={grad_q_storage_dtype}, "
     f"enable_bwd_tma={enable_tma}, enable_bwd_ws={enable_ws}, "
     f"enable_persist_dkdv={enable_persist_dkdv}, enable_split_launch={enable_split_launch}, "
     f"timing_mode={timing_mode}, tasks={sorted(tasks) if tasks is not None else 'full'}, "
@@ -1186,6 +1197,7 @@ def run_backward_examples(
           dropout_p=case.get("dropout_p", 0.0),
           timing_mode=timing_mode,
           grad_kv_storage_dtype=grad_kv_storage_dtype,
+          grad_q_storage_dtype=grad_q_storage_dtype,
           enable_tma=enable_tma,
           enable_ws=enable_ws,
           enable_persist_dkdv=enable_persist_dkdv,

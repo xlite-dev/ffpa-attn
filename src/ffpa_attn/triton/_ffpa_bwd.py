@@ -81,6 +81,7 @@ Decode path (Nq < 8):
 
 import math
 
+import os
 import torch
 import triton
 import triton.language as tl
@@ -541,33 +542,48 @@ def _ffpa_bwd_kernel_impl(
   EVEN_N: tl.constexpr,
   BLOCK_M: tl.constexpr,
   BLOCK_N: tl.constexpr,
+  USE_DKDVDQ_FUSION: tl.constexpr,
 ) -> None:
   # Keys for autotune and heuristics lookups.
   _ = autotune_seqlen_q_bucket
   _ = autotune_seqlen_k_bucket
   _ = autotune_causal_key
   _ = autotune_dtype_key
-  _ffpa_bwd_dkdv(
-    Q, K, V, DO, DK, DV, LSE, D, AttnBias, GradAttnBias, softmax_scale,
-    stride_qb, stride_qh, stride_qm, stride_kb, stride_kh, stride_kn, stride_vb,
-    stride_vh, stride_vn, stride_dob, stride_doh, stride_dom, stride_dkb,
-    stride_dkh, stride_dkn, stride_dvb, stride_dvh, stride_dvn, stride_bb,
-    stride_bh, stride_bm, stride_bn, stride_gbb, stride_gbh, stride_gbm,
-    stride_gbn, nheads, seqlen_q, seqlen_k, seqlen_q_rounded, headdim,
-    dropout_p, philox_offset, IS_CAUSAL, HAS_ATTN_BIAS, HAS_DROPOUT,
-    PHILOX_SEED, BIAS_REQUIRES_GRAD, GRAD_BIAS_NEEDS_REDUCTION,
-    GRAD_BIAS_REDUCES_M, GRAD_BIAS_STORE_PARTIAL, BLOCK_HEADDIM, DTYPE, EVEN_M,
-    EVEN_N, BLOCK_M, BLOCK_N
-  )
-  _ffpa_bwd_dq(
-    Q, K, V, DO, DQ, LSE, D, AttnBias, softmax_scale, stride_qb, stride_qh,
-    stride_qm, stride_kb, stride_kh, stride_kn, stride_vb, stride_vh, stride_vn,
-    stride_dob, stride_doh, stride_dom, stride_dqb, stride_dqh, stride_dqm,
-    stride_bb, stride_bh, stride_bm, stride_bn, nheads, seqlen_q, seqlen_k,
-    seqlen_q_rounded, headdim, dropout_p, philox_offset, IS_CAUSAL,
-    HAS_ATTN_BIAS, HAS_DROPOUT, PHILOX_SEED, BLOCK_HEADDIM, DTYPE, EVEN_N,
-    BLOCK_M, BLOCK_N
-  )
+  if USE_DKDVDQ_FUSION:
+    _ffpa_bwd_dkdvdq(
+      Q, K, V, DO, DQ, DK, DV, LSE, D, AttnBias, GradAttnBias, softmax_scale,
+      stride_qb, stride_qh, stride_qm, stride_kb, stride_kh, stride_kn,
+      stride_vb, stride_vh, stride_vn, stride_dob, stride_doh, stride_dom,
+      stride_dqb, stride_dqh, stride_dqm, stride_dkb, stride_dkh, stride_dkn,
+      stride_dvb, stride_dvh, stride_dvn, stride_bb, stride_bh, stride_bm,
+      stride_bn, stride_gbb, stride_gbh, stride_gbm, stride_gbn, nheads,
+      seqlen_q, seqlen_k, seqlen_q_rounded, headdim, dropout_p, philox_offset,
+      IS_CAUSAL, HAS_ATTN_BIAS, HAS_DROPOUT, PHILOX_SEED, BIAS_REQUIRES_GRAD,
+      GRAD_BIAS_NEEDS_REDUCTION, GRAD_BIAS_REDUCES_M, GRAD_BIAS_STORE_PARTIAL,
+      BLOCK_HEADDIM, DTYPE, EVEN_M, EVEN_N, BLOCK_M, BLOCK_N
+    )
+  else:
+    _ffpa_bwd_dkdv(
+      Q, K, V, DO, DK, DV, LSE, D, AttnBias, GradAttnBias, softmax_scale,
+      stride_qb, stride_qh, stride_qm, stride_kb, stride_kh, stride_kn,
+      stride_vb, stride_vh, stride_vn, stride_dob, stride_doh, stride_dom,
+      stride_dkb, stride_dkh, stride_dkn, stride_dvb, stride_dvh, stride_dvn,
+      stride_bb, stride_bh, stride_bm, stride_bn, stride_gbb, stride_gbh,
+      stride_gbm, stride_gbn, nheads, seqlen_q, seqlen_k, seqlen_q_rounded,
+      headdim, dropout_p, philox_offset, IS_CAUSAL, HAS_ATTN_BIAS, HAS_DROPOUT,
+      PHILOX_SEED, BIAS_REQUIRES_GRAD, GRAD_BIAS_NEEDS_REDUCTION,
+      GRAD_BIAS_REDUCES_M, GRAD_BIAS_STORE_PARTIAL, BLOCK_HEADDIM, DTYPE,
+      EVEN_M, EVEN_N, BLOCK_M, BLOCK_N
+    )
+    _ffpa_bwd_dq(
+      Q, K, V, DO, DQ, LSE, D, AttnBias, softmax_scale, stride_qb, stride_qh,
+      stride_qm, stride_kb, stride_kh, stride_kn, stride_vb, stride_vh,
+      stride_vn, stride_dob, stride_doh, stride_dom, stride_dqb, stride_dqh,
+      stride_dqm, stride_bb, stride_bh, stride_bm, stride_bn, nheads, seqlen_q,
+      seqlen_k, seqlen_q_rounded, headdim, dropout_p, philox_offset, IS_CAUSAL,
+      HAS_ATTN_BIAS, HAS_DROPOUT, PHILOX_SEED, BLOCK_HEADDIM, DTYPE, EVEN_N,
+      BLOCK_M, BLOCK_N
+    )
 
 
 # dKdV-only half of the main backward path. It keeps the original cross-Q
@@ -813,6 +829,319 @@ def _ffpa_bwd_dkdv(
             mask=grad_mask,
             eviction_policy="evict_last"
           )
+
+
+# Fused dKdV + dQ main backward path.  Computes dS once per (K-tile, Q-tile)
+# pair and reuses it for dK, dV, and dQ, eliminating the duplicated S/dP/dS
+# recompute and the repeated Q/V/DO loads of the separate dKdV + dQ kernels.
+#
+# Design:
+#   pid -> K tile (grid = cdiv(Nk, BLOCK_N)).
+#   For each Q tile in the contributing range:
+#     Phase 1 — accumulate S and dP across head-dim chunks (split-D).
+#     Phase 2 — compute dS (causal / bias / dropout), then loop over
+#               head-dim chunks to accumulate dk (load/add/store), dv
+#               (load/add/store), and dq (atomic_add).
+#
+# Split-D note:
+#   dK/dV use global load/add/store identical to the existing dKdV-only
+#   kernel.  This is inherent to split-D: the full head dimension does not
+#   fit in registers.  TODO: full-D optimization would keep dk_acc / dv_acc
+#   in registers with a single final cast+store per output tile.
+#
+#   dQ uses ``tl.atomic_add`` because multiple K-tile programs contribute to
+#   the same Q tile.  The caller should allocate ``DQ`` in ``torch.float32``
+#   (via ``grad_q_storage_dtype``) when cross-tile atomic-add precision is
+#   a concern.
+#
+# NOTE: bf16 / fp16 native-DQ atomic_add precision collapse
+#   (observed with N=8192, D=512, BLOCK_N=64, L20)
+#
+#   When DQ is stored in bf16 (7-bit mantissa) or fp16 (10-bit mantissa),
+#   every ``tl.atomic_add(dq_ptrs, dq_contrib)`` performs an implicit
+#   load→fp32-add→round-to-storage-dtype→store round-trip.  With
+#   ``num_k_blocks = ceil(Nk / BLOCK_N) = 128`` K-tile programs each
+#   contributing to the same Q-tile element, precision loss depends on
+#   the *ratio* of each contribution to the running accumulator.
+@triton.jit
+def _ffpa_bwd_dkdvdq(
+  Q: torch.Tensor,
+  K: torch.Tensor,
+  V: torch.Tensor,
+  DO: torch.Tensor,
+  DQ: torch.Tensor,
+  DK: torch.Tensor,
+  DV: torch.Tensor,
+  LSE: torch.Tensor,
+  D: torch.Tensor,
+  AttnBias: torch.Tensor,
+  GradAttnBias: torch.Tensor,
+  softmax_scale: float,
+  stride_qb: int,
+  stride_qh: int,
+  stride_qm: int,
+  stride_kb: int,
+  stride_kh: int,
+  stride_kn: int,
+  stride_vb: int,
+  stride_vh: int,
+  stride_vn: int,
+  stride_dob: int,
+  stride_doh: int,
+  stride_dom: int,
+  stride_dqb: int,
+  stride_dqh: int,
+  stride_dqm: int,
+  stride_dkb: int,
+  stride_dkh: int,
+  stride_dkn: int,
+  stride_dvb: int,
+  stride_dvh: int,
+  stride_dvn: int,
+  stride_bb: int,
+  stride_bh: int,
+  stride_bm: int,
+  stride_bn: int,
+  stride_gbb: int,
+  stride_gbh: int,
+  stride_gbm: int,
+  stride_gbn: int,
+  nheads: int,
+  seqlen_q: int,
+  seqlen_k: int,
+  seqlen_q_rounded: int,
+  headdim: int,
+  dropout_p: float,
+  philox_offset: int,
+  IS_CAUSAL: tl.constexpr,
+  HAS_ATTN_BIAS: tl.constexpr,
+  HAS_DROPOUT: tl.constexpr,
+  PHILOX_SEED: tl.constexpr,
+  BIAS_REQUIRES_GRAD: tl.constexpr,
+  GRAD_BIAS_NEEDS_REDUCTION: tl.constexpr,
+  GRAD_BIAS_REDUCES_M: tl.constexpr,
+  GRAD_BIAS_STORE_PARTIAL: tl.constexpr,
+  BLOCK_HEADDIM: tl.constexpr,
+  DTYPE: tl.constexpr,
+  EVEN_M: tl.constexpr,
+  EVEN_N: tl.constexpr,
+  BLOCK_M: tl.constexpr,
+  BLOCK_N: tl.constexpr,
+) -> None:
+  pid = tl.program_id(0)
+  off_hb = tl.program_id(2)
+  off_b = off_hb // nheads
+  off_h = off_hb % nheads
+
+  Q += off_b * stride_qb + off_h * stride_qh
+  K += off_b * stride_kb + off_h * stride_kh
+  V += off_b * stride_vb + off_h * stride_vh
+  DO += off_b * stride_dob + off_h * stride_doh
+  DQ += off_b * stride_dqb + off_h * stride_dqh
+  DK += off_b * stride_dkb + off_h * stride_dkh
+  DV += off_b * stride_dvb + off_h * stride_dvh
+  D += off_hb * seqlen_q_rounded
+  LSE += off_hb * seqlen_q_rounded
+  if HAS_ATTN_BIAS:
+    AttnBias += off_b * stride_bb + off_h * stride_bh
+  if BIAS_REQUIRES_GRAD:
+    GradAttnBias += off_b * stride_gbb + off_h * stride_gbh
+
+  num_d_chunks = tl.cdiv(headdim, BLOCK_HEADDIM)
+  start_n = pid * BLOCK_N
+  if start_n < seqlen_k:
+    offs_n = start_n + tl.arange(0, BLOCK_N)
+    offs_m = tl.arange(0, BLOCK_M)
+    offs_d = tl.arange(0, BLOCK_HEADDIM)
+    num_block_m = tl.cdiv(seqlen_q, BLOCK_M)
+    begin_m = 0 if not IS_CAUSAL else start_n // BLOCK_M * BLOCK_M
+
+    for start_m in range(begin_m, num_block_m * BLOCK_M, BLOCK_M):
+      offs_qm = start_m + offs_m
+      if not EVEN_M:
+        m_mask = offs_qm < seqlen_q
+      S = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+      dP = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+
+      # Phase 1 — accumulate S and dP over head-dim chunks.
+      for d_chunk in range(num_d_chunks):
+        d_offs = d_chunk * BLOCK_HEADDIM + offs_d
+        q = tl.load(
+          Q + offs_qm[:, None] * stride_qm + d_offs[None, :],
+          mask=(offs_qm[:, None] < seqlen_q) & (d_offs[None, :] < headdim),
+          other=0.,
+        )
+        k = tl.load(
+          K + offs_n[:, None] * stride_kn + d_offs[None, :],
+          mask=(offs_n[:, None] < seqlen_k) & (d_offs[None, :] < headdim),
+          other=0.,
+        )
+        v = tl.load(
+          V + offs_n[:, None] * stride_vn + d_offs[None, :],
+          mask=(offs_n[:, None] < seqlen_k) & (d_offs[None, :] < headdim),
+          other=0.,
+        )
+        do = tl.load(
+          DO + offs_qm[:, None] * stride_dom + d_offs[None, :],
+          mask=(offs_qm[:, None] < seqlen_q) & (d_offs[None, :] < headdim),
+          other=0.,
+        )
+        S = tl.dot(q, tl.trans(k), acc=S)
+        dP = tl.dot(do, tl.trans(v), acc=dP)
+
+      # Apply causal / bias / dropout — identical to _ffpa_bwd_dkdv.
+      if not EVEN_N:
+        S = tl.where(offs_n[None, :] < seqlen_k, S, float("-inf"))
+      if not EVEN_M:
+        S = tl.where(m_mask[:, None], S, float("-inf"))
+      if IS_CAUSAL:
+        S = tl.where(offs_qm[:, None] >= (offs_n[None, :]), S, float("-inf"))
+      S = S * softmax_scale
+      if HAS_ATTN_BIAS:
+        bias = tl.load(
+          AttnBias + offs_qm[:, None] * stride_bm + offs_n[None, :] * stride_bn,
+          mask=(offs_qm[:, None] < seqlen_q) & (offs_n[None, :] < seqlen_k),
+          other=0.0,
+        )
+        S += bias
+      if EVEN_M:
+        lse_i = tl.load(LSE + offs_qm)
+      else:
+        lse_i = tl.load(LSE + offs_qm, mask=m_mask, other=0.0)
+      P = tl.exp(S - lse_i[:, None])
+      dropout_mult = _dropout_multiplier(
+        off_hb,
+        offs_qm,
+        offs_n,
+        seqlen_q,
+        seqlen_k,
+        dropout_p,
+        PHILOX_SEED,
+        philox_offset,
+        HAS_DROPOUT,
+      )
+      dP = dP * dropout_mult
+      P_drop = P * dropout_mult
+      if EVEN_M:
+        Di = tl.load(D + offs_qm)
+      else:
+        Di = tl.load(D + offs_qm, mask=m_mask, other=0.0)
+      if BIAS_REQUIRES_GRAD:
+        dBias = P * (dP - Di[:, None])
+        grad_bias_mask = (offs_qm[:, None]
+                          < seqlen_q) & (offs_n[None, :] < seqlen_k)
+        if GRAD_BIAS_REDUCES_M:
+          m_block = start_m // BLOCK_M
+          grad_bias_ptrs = GradAttnBias + m_block * stride_gbm + offs_n * stride_gbn
+          grad_bias = tl.sum(tl.where(grad_bias_mask, dBias, 0.0), axis=0)
+          if GRAD_BIAS_STORE_PARTIAL:
+            tl.store(grad_bias_ptrs, grad_bias, mask=offs_n < seqlen_k)
+          else:
+            tl.atomic_add(
+              grad_bias_ptrs, grad_bias, sem="relaxed", mask=offs_n < seqlen_k
+            )
+        elif GRAD_BIAS_NEEDS_REDUCTION:
+          grad_bias_ptrs = (
+            GradAttnBias + offs_qm[:, None] * stride_gbm +
+            offs_n[None, :] * stride_gbn
+          )
+          tl.atomic_add(
+            grad_bias_ptrs, dBias, sem="relaxed", mask=grad_bias_mask
+          )
+        else:
+          grad_bias_ptrs = (
+            GradAttnBias + offs_qm[:, None] * stride_gbm +
+            offs_n[None, :] * stride_gbn
+          )
+          tl.store(grad_bias_ptrs, dBias, mask=grad_bias_mask)
+        dS = (dBias * softmax_scale).to(DTYPE)
+      else:
+        dS = (P * (dP - Di[:, None]) * softmax_scale).to(DTYPE)
+      if not EVEN_M:
+        dS = tl.where(m_mask[:, None], dS, 0.0)
+        P_drop = tl.where(m_mask[:, None], P_drop, 0.0)
+
+      # Phase 2 — accumulate dk, dv, and dq over head-dim chunks.
+      for d_chunk in range(num_d_chunks):
+        d_offs = d_chunk * BLOCK_HEADDIM + offs_d
+        grad_mask_kv = (offs_n[:, None]
+                        < seqlen_k) & (d_offs[None, :] < headdim)
+        grad_mask_q = (offs_qm[:, None]
+                       < seqlen_q) & (d_offs[None, :] < headdim)
+
+        # dk: reload Q -> dk_contrib = dS^T @ Q -> load/add/store DK.
+        q = tl.load(
+          Q + offs_qm[:, None] * stride_qm + d_offs[None, :],
+          mask=grad_mask_q,
+          other=0.,
+        )
+        dk_ptrs = DK + offs_n[:, None] * stride_dkn + d_offs[None, :]
+        dk_d = tl.trans(tl.dot(tl.trans(q), dS, out_dtype=tl.float32))
+        if start_m == begin_m:
+          tl.store(
+            dk_ptrs, dk_d, mask=grad_mask_kv, eviction_policy="evict_last"
+          )
+        else:
+          dk_val = tl.load(
+            dk_ptrs, mask=grad_mask_kv, other=0., eviction_policy="evict_last"
+          )
+          tl.store(
+            dk_ptrs,
+            dk_val + dk_d,
+            mask=grad_mask_kv,
+            eviction_policy="evict_last",
+          )
+
+        # dv: reload DO -> dv_contrib = P_drop^T @ DO -> load/add/store DV.
+        do = tl.load(
+          DO + offs_qm[:, None] * stride_dom + d_offs[None, :],
+          mask=grad_mask_q,
+          other=0.,
+        )
+        dv_ptrs = DV + offs_n[:, None] * stride_dvn + d_offs[None, :]
+        dv_d = tl.trans(
+          tl.dot(tl.trans(do), P_drop.to(DTYPE), out_dtype=tl.float32)
+        )
+        if start_m == begin_m:
+          tl.store(
+            dv_ptrs, dv_d, mask=grad_mask_kv, eviction_policy="evict_last"
+          )
+        else:
+          dv_val = tl.load(
+            dv_ptrs, mask=grad_mask_kv, other=0., eviction_policy="evict_last"
+          )
+          tl.store(
+            dv_ptrs,
+            dv_val + dv_d,
+            mask=grad_mask_kv,
+            eviction_policy="evict_last",
+          )
+
+        # dq: reload K -> dq_contrib = dS @ K -> atomic_add to DQ.
+        k = tl.load(
+          K + offs_n[:, None] * stride_kn + d_offs[None, :],
+          mask=grad_mask_kv,
+          other=0.,
+        )
+        dq_ptrs = DQ + offs_qm[:, None] * stride_dqm + d_offs[None, :]
+        dq_d = tl.dot(dS, k, out_dtype=tl.float32)
+        # bf16 hardware atomicAdd is only available on SM90+ (Hopper).
+        # On SM<90 (Ampere SM80 / Ada SM89), the hardware does NOT support
+        # atom.add.bf16; CUDA and Triton both fall back to a CAS loop.
+        # On L20 (SM89) with 128 K-block programs contending on the same dq
+        # elements, the CAS loop causes severe performance degradation
+        # (2.4x slower vs fp16).
+        #
+        # Mitigations:
+        #   1. Non-fused path (FFPA_TRITON_BWD_FUSE_DKDVDQ=0): avoids
+        #      atomic_add entirely via load/add/store (bf16 ~= fp16 perf).
+        #   2. grad_q_storage_dtype=torch.float32: uses fp32 hardware atomics
+        #      (1.9x faster than bf16 CAS, but 2x dq memory).
+        #
+        # Refs:
+        #   https://github.com/triton-lang/triton/issues/1387
+        #   https://github.com/triton-lang/triton/pull/6519
+        tl.atomic_add(dq_ptrs, dq_d, sem="relaxed", mask=grad_mask_q)
 
 
 # dQ-only half of the main backward path. Each program owns one Q tile, so dQ
@@ -1169,7 +1498,7 @@ def _get_bwd_autotune(
       headdim=headdim,
       autotune_mode=autotune_mode,
     )
-    reset_args = []
+    reset_args = ["DK", "DV", "DQ"]
     if bias_requires_grad:
       reset_args.append("GradAttnBias")
     _ffpa_bwd_autotune_cache[cache_key] = triton.autotune(
@@ -1772,6 +2101,10 @@ def _ffpa_attn_backward_triton_impl(
   # both modes: the single-launch wrapper still calls the dKdV and dQ roles
   # sequentially, so the root cause is the kernel structure itself.
   split_launch = enable_split_launch and seqlen_q >= 8
+  use_dkdvdq_fusion = (
+    bool(int(os.environ.get("FFPA_TRITON_BWD_FUSE_DKDVDQ", "0")))
+    and seqlen_q >= 8 and not split_launch
+  )
 
   if enable_tma and seqlen_q >= 8:
     from ._ffpa_bwd_sm90 import _ffpa_attn_backward_sm90_impl as _bwd_sm90_impl
@@ -2135,6 +2468,12 @@ def _ffpa_attn_backward_triton_impl(
     return
 
   def grid(meta: dict) -> tuple[int, ...]:
+    if use_dkdvdq_fusion:
+      return (
+        triton.cdiv(seqlen_k, meta["BLOCK_N"]),
+        1,
+        batch * nheads,
+      )
     return (
       max(
         triton.cdiv(seqlen_k, meta["BLOCK_N"]),
@@ -2369,6 +2708,7 @@ def _ffpa_attn_backward_triton_impl(
       GRAD_BIAS_REDUCES_M=grad_bias_reduces_m,
       GRAD_BIAS_STORE_PARTIAL=grad_bias_store_partial,
       DTYPE=DTYPE,
+      USE_DKDVDQ_FUSION=use_dkdvdq_fusion,
     )
   else:
     main_config = persisted_main_config or {
@@ -2442,6 +2782,7 @@ def _ffpa_attn_backward_triton_impl(
       GRAD_BIAS_REDUCES_M=grad_bias_reduces_m,
       GRAD_BIAS_STORE_PARTIAL=grad_bias_store_partial,
       DTYPE=DTYPE,
+      USE_DKDVDQ_FUSION=use_dkdvdq_fusion,
     )
     _ffpa_bwd[grid](*main_args, **main_meta, **main_config)
 
@@ -2476,6 +2817,7 @@ def _ffpa_attn_backward_triton(
   attn_bias: torch.Tensor | None = None,
   return_attn_bias_grad: bool = False,
   grad_kv_storage_dtype: torch.dtype | None = None,
+  grad_q_storage_dtype: torch.dtype | None = None,
   dropout_p: float = 0.0,
   philox_seed: int = 0,
   philox_offset: int = 0,
@@ -2522,6 +2864,9 @@ def _ffpa_attn_backward_triton(
     ``DK`` / ``DV`` buffers. ``None`` keeps k/v dtype; ``torch.float16`` or
     ``torch.float32`` changes dK/dV cross-tile global accumulation storage
     while leaving dQ storage in the original q dtype.
+  :param grad_q_storage_dtype: Optional storage dtype for the internal Triton
+    ``DQ`` buffer. ``None`` keeps q dtype; ``torch.float16`` or
+    ``torch.float32`` changes dQ cross-tile accumulation storage.
   :returns: ``(dq, dk, dv, d_attn_bias)`` where ``dq`` has shape ``[B, Nh_q, Nq, D]`` and
     ``dk`` / ``dv`` have shape ``[B, Nh_kv, Nkv, D]``. Returned tensors use
     the original ``q`` / ``k`` / ``v`` dtypes and head layouts. ``d_attn_bias``
@@ -2531,6 +2876,11 @@ def _ffpa_attn_backward_triton(
     raise ValueError(
       "_ffpa_attn_backward_triton: grad_kv_storage_dtype must be None, torch.float16, or torch.float32, "
       f"got {grad_kv_storage_dtype!r}"
+    )
+  if grad_q_storage_dtype not in (None, torch.float16, torch.float32):
+    raise ValueError(
+      "_ffpa_attn_backward_triton: grad_q_storage_dtype must be None, torch.float16, or torch.float32, "
+      f"got {grad_q_storage_dtype!r}"
     )
   seqlen_q = q.size(2)
   seqlen_q_rounded = ((seqlen_q + 127) // 128) * 128
@@ -2571,6 +2921,8 @@ def _ffpa_attn_backward_triton(
     int(return_attn_bias_grad and attn_bias is not None),
     2 if grad_kv_storage_dtype == torch.float16 else
     int(grad_kv_storage_dtype == torch.float32),
+    2 if grad_q_storage_dtype == torch.float16 else
+    int(grad_q_storage_dtype == torch.float32),
     original_nheads_kv,
     dropout_p,
     philox_seed,

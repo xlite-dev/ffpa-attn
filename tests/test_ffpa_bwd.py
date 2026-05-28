@@ -490,13 +490,16 @@ def test_ffpa_bwd_triton_internal_kv_storage_dtype_option(dtype):
   )
 
   dq_default, dk_default, dv_default, _ = torch.ops.ffpa_attn._bwd_triton(
-    do, q, k, v, o, lse, None, scale, 0, 0, 0, 0, 0, 0, H, 0.0, 0, 0, 0, 0, 0, 0
+    do, q, k, v, o, lse, None, scale, 0, 0, 0, 0, 0, 0, 0, H, 0.0, 0, 0, 0, 0,
+    0, 0
   )
   dq_fp32, dk_fp32, dv_fp32, _ = torch.ops.ffpa_attn._bwd_triton(
-    do, q, k, v, o, lse, None, scale, 0, 0, 0, 0, 0, 1, H, 0.0, 0, 0, 0, 0, 0, 0
+    do, q, k, v, o, lse, None, scale, 0, 0, 0, 0, 0, 1, 0, H, 0.0, 0, 0, 0, 0,
+    0, 0
   )
   dq_fp16, dk_fp16, dv_fp16, _ = torch.ops.ffpa_attn._bwd_triton(
-    do, q, k, v, o, lse, None, scale, 0, 0, 0, 0, 0, 2, H, 0.0, 0, 0, 0, 0, 0, 0
+    do, q, k, v, o, lse, None, scale, 0, 0, 0, 0, 0, 2, 0, H, 0.0, 0, 0, 0, 0,
+    0, 0
   )
 
   assert dq_default.dtype == dtype
