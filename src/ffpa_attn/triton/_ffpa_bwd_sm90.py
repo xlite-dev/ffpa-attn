@@ -1401,8 +1401,9 @@ def _ffpa_attn_backward_sm90_impl(
     headdim,
   )
   if autotune:
-    _get_pre_autotune(preprocess_d_chunk, autotune_mode,
-                      runtime_dtype)[pre_grid](*pre_args)
+    _get_pre_autotune(
+      preprocess_d_chunk, headdim, autotune_mode, runtime_dtype
+    )[pre_grid](*pre_args)
   else:
     persisted_pre_config = lookup_persistent_config(
       PersistentConfigRequest(
