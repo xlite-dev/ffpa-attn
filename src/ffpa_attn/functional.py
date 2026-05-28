@@ -181,6 +181,9 @@ class TritonBackend(Backend):
   :ivar preprocess_d_chunk: Split the ``d_chunk`` preprocess across tiles.
   :ivar grad_kv_storage_dtype: Optional ``torch.float32`` / ``torch.float16``
       storage dtype for ``dK``/``dV``, workaround for causal bf16 precision.
+  :ivar grad_q_storage_dtype: Optional ``torch.float32`` / ``torch.float16``
+      storage dtype for ``dQ``, workaround for cross-tile atomic-add precision
+      when ``USE_DKDVDQ_FUSION`` is enabled (also effective in non-fused path).
   """
   name: str = "triton"
   autotune: bool = False
@@ -191,6 +194,7 @@ class TritonBackend(Backend):
   split_launch: bool = False
   preprocess_d_chunk: bool = False
   grad_kv_storage_dtype: torch.dtype | str | None = None
+  grad_q_storage_dtype: torch.dtype | str | None = None
 
   def __post_init__(self) -> None:
     super().__post_init__()
@@ -199,10 +203,13 @@ class TritonBackend(Backend):
     self.grad_kv_storage_dtype = _normalize_grad_kv_storage_dtype(
       self.grad_kv_storage_dtype
     )
+    self.grad_q_storage_dtype = _normalize_grad_kv_storage_dtype(
+      self.grad_q_storage_dtype
+    )
     if self.persist_dkdv:
       assert self.backward, "persist_dkdv is only valid for Triton backward"
       assert self.enable_tma, "persist_dkdv requires enable_tma=True"
-    if self.split_launch or self.preprocess_d_chunk or self.grad_kv_storage_dtype is not None:
+    if self.split_launch or self.preprocess_d_chunk or self.grad_kv_storage_dtype is not None or self.grad_q_storage_dtype is not None:
       assert self.backward, "backward-only Triton options require backward=True"
 
 
@@ -866,6 +873,7 @@ class _FFPAAttnFunc(torch.autograd.Function):
           attn_bias=attn_bias,
           return_attn_bias_grad=ctx.needs_input_grad[3],
           grad_kv_storage_dtype=backward_meta.grad_kv_storage_dtype,
+          grad_q_storage_dtype=backward_meta.grad_q_storage_dtype,
           dropout_p=meta.attn_meta.dropout_p,
           philox_seed=int(rng_state[0].item()) if rng_state.numel() else 0,
           philox_offset=int(rng_state[1].item()) if rng_state.numel() else 0,

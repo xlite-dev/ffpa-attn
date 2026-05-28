@@ -342,6 +342,14 @@ def _parse_args() -> argparse.Namespace:
     "Optional backward dK/dV storage dtype (Triton or CuTeDSL) forwarded to the example runners.",
   )
   parser.add_argument(
+    "--grad-q-storage-dtype",
+    "--grad-q-dtype",
+    choices=["none", "fp16", "fp32"],
+    default="none",
+    help=
+    "Optional backward dQ storage dtype (Triton) forwarded to the example runners.",
+  )
+  parser.add_argument(
     "--show-allclose",
     action="store_true",
     help="Include the allclose column in the generated Markdown tables.",
@@ -1375,6 +1383,7 @@ def _benchmark_rows(
 
   tune_mode = args.tune
   grad_kv_dtype = _parse_grad_kv_dtype(args.grad_kv_storage_dtype)
+  grad_q_dtype = _parse_grad_kv_dtype(args.grad_q_storage_dtype)
   forward_rows: list[RESULT_ROW] = []
   backward_rows: list[RESULT_ROW] = []
   if args.forward:
@@ -1418,6 +1427,7 @@ def _benchmark_rows(
         and tune_mode is not None,
         triton_autotune_mode=tune_mode or "fast",
         grad_kv_storage_dtype=grad_kv_dtype,
+        grad_q_storage_dtype=grad_q_dtype,
         enable_tma=args.enable_bwd_tma,
         enable_ws=args.enable_bwd_ws,
         enable_persist_dkdv=args.enable_persist_dkdv,
