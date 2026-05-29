@@ -1390,7 +1390,7 @@ def _get_bwd_sm90_autotune(
     enable_persist_dkdv
   )
   if cache_key not in _ffpa_bwd_sm90_autotune_cache:
-    reset_args = []
+    reset_args = ["DK", "DV", "DQ"]
     if bias_requires_grad:
       reset_args.append("GradAttnBias")
     _ffpa_bwd_sm90_autotune_cache[cache_key] = triton.autotune(
@@ -1427,7 +1427,7 @@ def _get_bwd_sm90_dkdv_autotune(
     enable_persist_dkdv
   )
   if cache_key not in _ffpa_bwd_sm90_dkdv_autotune_cache:
-    reset_args = []
+    reset_args = ["DK", "DV"]
     if bias_requires_grad:
       reset_args.append("GradAttnBias")
     _ffpa_bwd_sm90_dkdv_autotune_cache[cache_key] = triton.autotune(
@@ -1459,6 +1459,7 @@ def _get_bwd_sm90_dq_autotune(
   """Return an autotune wrapper for the split-launch SM90 dQ kernel."""
   cache_key = (headdim, autotune_mode, dtype, enable_ws)
   if cache_key not in _ffpa_bwd_sm90_dq_autotune_cache:
+    reset_args = ["DQ"]
     _ffpa_bwd_sm90_dq_autotune_cache[cache_key] = triton.autotune(
       configs=_gen_bwd_sm90_dq_autotune_configs(
         headdim=headdim,
@@ -1472,6 +1473,7 @@ def _get_bwd_sm90_dq_autotune(
         "autotune_causal_key",
         "autotune_dtype_key",
       ],
+      reset_to_zero=reset_args,
       cache_results=True,
     )(_ffpa_bwd_dq_sm90_kernel_impl)
   return _ffpa_bwd_sm90_dq_autotune_cache[cache_key]
