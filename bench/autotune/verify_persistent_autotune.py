@@ -2,7 +2,7 @@
 
 Usage::
 
-  CUDA_VISIBLE_DEVICES=7 python examples/verify_persistent_autotune.py --case decode-attn --direction backward --dtype fp16
+  CUDA_VISIBLE_DEVICES=7 python bench/autotune/verify_persistent_autotune.py --case decode-attn --direction backward --dtype fp16
 """
 
 from __future__ import annotations

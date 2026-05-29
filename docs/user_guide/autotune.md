@@ -67,7 +67,7 @@ python -m ffpa_attn.autotune --mode fast --B 1 --H 32 --overwrite
 
 By default, the generated task grid covers the baseline no-mask, no-dropout,
 equal-head cases. Add <span style="color:#c77dff;">--full-tasks</span> to also tune canonical <span style="color:#c77dff;">attn_mask</span>,
-dropout, GQA, and MQA variants modeled after `examples/perf.py`:
+dropout, GQA, and MQA variants modeled after `python -m ffpa_attn.bench`:
 
 ```bash
 python -m ffpa_attn.autotune \
@@ -86,7 +86,7 @@ python -m ffpa_attn.autotune --mode fast --directions backward --overwrite
 python -m ffpa_attn.autotune --mode fast --directions both --dtypes bf16,fp16 --overwrite
 ```
 
-<span style="color:#c77dff;">both</span> is the default. The default dtype set is <span style="color:#c77dff;">bf16</span>. For benchmarks such as <span style="color:#c77dff;">examples/perf.py</span> that run both <span style="color:#c77dff;">fp16</span> and <span style="color:#c77dff;">bf16</span>, generate both dtype configs explicitly:
+<span style="color:#c77dff;">both</span> is the default. The default dtype set is <span style="color:#c77dff;">bf16</span>. For benchmarks such as <span style="color:#c77dff;">python -m ffpa_attn.bench</span> that run both <span style="color:#c77dff;">fp16</span> and <span style="color:#c77dff;">bf16</span>, generate both dtype configs explicitly:
 
 ```bash
 python -m ffpa_attn.autotune --mode fast --directions both --dtypes bf16,fp16 --overwrite
@@ -184,7 +184,7 @@ each tuned sequence length:
 | --- | --- |
 | <span style="color:#c77dff;">attn-mask</span> | Compact additive key-position mask <span style="color:#c77dff;">[1, 1, 1, Nkv]</span>. Backward tunes the bias-gradient path. |
 | <span style="color:#c77dff;">dropout</span> | <span style="color:#c77dff;">dropout_p=0.1</span>, using the Triton dropout path. |
-| <span style="color:#c77dff;">gqa</span> | <span style="color:#c77dff;">Hq=H</span>, <span style="color:#c77dff;">Hkv</span> chosen with the same divisor rule as <span style="color:#c77dff;">examples/perf.py</span>. |
+| <span style="color:#c77dff;">gqa</span> | <span style="color:#c77dff;">Hq=H</span>, <span style="color:#c77dff;">Hkv</span> chosen with the same divisor rule as <span style="color:#c77dff;">python -m ffpa_attn.bench</span>. |
 | <span style="color:#c77dff;">mqa</span> | <span style="color:#c77dff;">Hq=H</span>, <span style="color:#c77dff;">Hkv=1</span>. |
 
 These are single-feature canonical variants, not a full Cartesian product. For
@@ -248,7 +248,7 @@ using persistent tuned configs instead of falling back to the built-in defaults:
 ```bash
 FFPA_LOGGER_LEVEL=DEBUG \
 FFPA_TUNED_CONFIG_DIR=/tmp/ffpa-config-smoke \
-python examples/perf.py --case decode-attn --backend ffpa-triton
+python -m ffpa_attn.bench --fwd-backend triton --bwd-backend triton
 ```
 
 On repeated runtime lookup hits, FFPA logs the kernel name and sanitized launch config selected from the in-process persistent config cache. The message uses <span style="color:#c77dff;">debug_once</span> semantics, so the same cache-hit/config line is emitted once per process instead of repeating on every attention call.

@@ -49,8 +49,8 @@ theme:
 
 nav:
   - Home: index.md
-  - Examples: examples/README.md
-  - Environment Variables: env.md
+  - Bench: bench/README.md
+  - Env: env.md
   - User Guide:
       - Triton Autotune: user_guide/autotune.md
   - Developer Guide:
