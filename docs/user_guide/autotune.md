@@ -248,7 +248,7 @@ using persistent tuned configs instead of falling back to the built-in defaults:
 ```bash
 FFPA_LOGGER_LEVEL=DEBUG \
 FFPA_TUNED_CONFIG_DIR=/tmp/ffpa-config-smoke \
-python -m ffpa_attn.bench --case decode-attn --backend ffpa-triton
+python -m ffpa_attn.bench --fwd-backend triton --bwd-backend triton
 ```
 
 On repeated runtime lookup hits, FFPA logs the kernel name and sanitized launch config selected from the in-process persistent config cache. The message uses <span style="color:#c77dff;">debug_once</span> semantics, so the same cache-hit/config line is emitted once per process instead of repeating on every attention call.
