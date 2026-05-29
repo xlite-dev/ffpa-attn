@@ -287,6 +287,264 @@ def _ffpa_bwd_dkdv_sm90(
 
 
 @triton.jit
+def _ffpa_bwd_dkdvdq_sm90(
+  desc_q: tl.tensor_descriptor,
+  desc_k: tl.tensor_descriptor,
+  desc_v: tl.tensor_descriptor,
+  desc_do: tl.tensor_descriptor,
+  DQ: torch.Tensor,
+  DK: torch.Tensor,
+  DV: torch.Tensor,
+  LSE: torch.Tensor,
+  D: torch.Tensor,
+  AttnBias: torch.Tensor,
+  GradAttnBias: torch.Tensor,
+  softmax_scale: float,
+  stride_dqb: int,
+  stride_dqh: int,
+  stride_dqm: int,
+  stride_dkb: int,
+  stride_dkh: int,
+  stride_dkn: int,
+  stride_dvb: int,
+  stride_dvh: int,
+  stride_dvn: int,
+  stride_bb: int,
+  stride_bh: int,
+  stride_bm: int,
+  stride_bn: int,
+  stride_gbb: int,
+  stride_gbh: int,
+  stride_gbm: int,
+  stride_gbn: int,
+  nheads: int,
+  seqlen_q: int,
+  seqlen_k: int,
+  seqlen_q_rounded: int,
+  headdim: int,
+  dropout_p: float,
+  philox_offset: int,
+  IS_CAUSAL: tl.constexpr,
+  HAS_ATTN_BIAS: tl.constexpr,
+  HAS_DROPOUT: tl.constexpr,
+  PHILOX_SEED: tl.constexpr,
+  BIAS_REQUIRES_GRAD: tl.constexpr,
+  GRAD_BIAS_NEEDS_REDUCTION: tl.constexpr,
+  GRAD_BIAS_REDUCES_M: tl.constexpr,
+  GRAD_BIAS_STORE_PARTIAL: tl.constexpr,
+  BLOCK_HEADDIM: tl.constexpr,
+  DTYPE: tl.constexpr,
+  EVEN_M: tl.constexpr,
+  EVEN_N: tl.constexpr,
+  BLOCK_M: tl.constexpr,
+  BLOCK_N: tl.constexpr,
+  warp_specialize: tl.constexpr,
+) -> None:
+  """Fused dK/dV + dQ SM90 TMA Split-D backward kernel.
+
+  K-tile-centric: each pid owns one K tile and iterates over all contributing
+  Q tiles.  S and dP are accumulated once per (K,Q) tile pair across head-dim
+  chunks (Phase 1), dS is computed once (Phase 2, with full causal / bias /
+  dropout support), and then dk, dv, **and** dq contributions are accumulated
+  in a single head-dim chunk sweep (Phase 3).
+
+  This eliminates the duplicate S/dP/dS recompute and Q/V/DO reload that the
+  separated dKdV + dQ kernel pair incurs.  dq uses ``tl.atomic_add`` because
+  the K-tile-centric grid lets multiple programs contribute to the same Q tile.
+
+  When ``warp_specialize=True``, the Phase-1 d-chunk loop is compiled with
+  Triton's automatic warp specialization.  Phase 3 uses a plain ``range`` loop
+  regardless of the flag, matching the existing dK/dV kernel convention.
+  """
+  pid = tl.program_id(0)
+  off_hb = tl.program_id(2)
+  off_b = off_hb // nheads
+  off_h = off_hb % nheads
+
+  q_base_y = (off_b * nheads + off_h) * seqlen_q
+  kv_base_y = (off_b * nheads + off_h) * seqlen_k
+
+  DQ += off_b * stride_dqb + off_h * stride_dqh
+  DK += off_b * stride_dkb + off_h * stride_dkh
+  DV += off_b * stride_dvb + off_h * stride_dvh
+  D += off_hb * seqlen_q_rounded
+  LSE += off_hb * seqlen_q_rounded
+
+  if HAS_ATTN_BIAS:
+    AttnBias += off_b * stride_bb + off_h * stride_bh
+  if BIAS_REQUIRES_GRAD:
+    GradAttnBias += off_b * stride_gbb + off_h * stride_gbh
+
+  num_d_chunks = tl.cdiv(headdim, BLOCK_HEADDIM)
+
+  start_n = pid * BLOCK_N
+  if start_n >= seqlen_k:
+    return
+
+  offs_n = start_n + tl.arange(0, BLOCK_N)
+  offs_m = tl.arange(0, BLOCK_M)
+  offs_d = tl.arange(0, BLOCK_HEADDIM)
+
+  num_block_m = tl.cdiv(seqlen_q, BLOCK_M)
+  begin_m = 0 if not IS_CAUSAL else start_n // BLOCK_M * BLOCK_M
+  k_offset_y = kv_base_y + start_n
+
+  for start_m in range(begin_m, num_block_m * BLOCK_M, BLOCK_M):
+    offs_qm = start_m + offs_m
+    q_offset_y = q_base_y + start_m
+
+    # Phase 1 — accumulate S and dP over head-dim chunks.
+    S = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+    dP = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+
+    if warp_specialize:
+      for d_chunk in tl.range(
+        0,
+        num_d_chunks,
+        1,
+        disallow_acc_multi_buffer=True,
+        flatten=True,
+        warp_specialize=True,
+      ):
+        d_start = d_chunk * BLOCK_HEADDIM
+        q = desc_q.load([q_offset_y, d_start])
+        k = desc_k.load([k_offset_y, d_start])
+        v = desc_v.load([k_offset_y, d_start])
+        do = desc_do.load([q_offset_y, d_start])
+        S = tl.dot(q, tl.trans(k), acc=S)
+        dP = tl.dot(do, tl.trans(v), acc=dP)
+    else:
+      for d_chunk in range(num_d_chunks):
+        d_start = d_chunk * BLOCK_HEADDIM
+        q = desc_q.load([q_offset_y, d_start])
+        k = desc_k.load([k_offset_y, d_start])
+        v = desc_v.load([k_offset_y, d_start])
+        do = desc_do.load([q_offset_y, d_start])
+        S = tl.dot(q, tl.trans(k), acc=S)
+        dP = tl.dot(do, tl.trans(v), acc=dP)
+
+    # Phase 2 — compute dS (causal / bias / dropout, identical to dK/dV).
+    if not EVEN_N:
+      S = tl.where(offs_n[None, :] < seqlen_k, S, float("-inf"))
+    if not EVEN_M:
+      m_mask = offs_qm < seqlen_q
+      S = tl.where(m_mask[:, None], S, float("-inf"))
+    if IS_CAUSAL:
+      S = tl.where(offs_qm[:, None] >= (offs_n[None, :]), S, float("-inf"))
+    S = S * softmax_scale
+    if HAS_ATTN_BIAS:
+      bias = tl.load(
+        AttnBias + offs_qm[:, None] * stride_bm + offs_n[None, :] * stride_bn,
+        mask=(offs_qm[:, None] < seqlen_q) & (offs_n[None, :] < seqlen_k),
+        other=0.0,
+      )
+      S += bias
+    if EVEN_M:
+      lse_i = tl.load(LSE + offs_qm)
+    else:
+      lse_i = tl.load(LSE + offs_qm, mask=offs_qm < seqlen_q, other=0.0)
+    P = tl.exp(S - lse_i[:, None])
+    dropout_mult = _dropout_multiplier(
+      off_hb,
+      offs_qm,
+      offs_n,
+      seqlen_q,
+      seqlen_k,
+      dropout_p,
+      PHILOX_SEED,
+      philox_offset,
+      HAS_DROPOUT,
+    )
+    dP = dP * dropout_mult
+    P_drop = P * dropout_mult
+    if EVEN_M:
+      Di = tl.load(D + offs_qm)
+    else:
+      Di = tl.load(D + offs_qm, mask=offs_qm < seqlen_q, other=0.0)
+    if BIAS_REQUIRES_GRAD:
+      dBias = P * (dP - Di[:, None])
+      grad_bias_mask = (offs_qm[:, None]
+                        < seqlen_q) & (offs_n[None, :] < seqlen_k)
+      if GRAD_BIAS_REDUCES_M:
+        m_block = start_m // BLOCK_M
+        grad_bias_ptrs = GradAttnBias + m_block * stride_gbm + offs_n * stride_gbn
+        grad_bias = tl.sum(tl.where(grad_bias_mask, dBias, 0.0), axis=0)
+        if GRAD_BIAS_STORE_PARTIAL:
+          tl.store(grad_bias_ptrs, grad_bias, mask=offs_n < seqlen_k)
+        else:
+          tl.atomic_add(
+            grad_bias_ptrs, grad_bias, sem="relaxed", mask=offs_n < seqlen_k
+          )
+      elif GRAD_BIAS_NEEDS_REDUCTION:
+        grad_bias_ptrs = (
+          GradAttnBias + offs_qm[:, None] * stride_gbm +
+          offs_n[None, :] * stride_gbn
+        )
+        tl.atomic_add(grad_bias_ptrs, dBias, sem="relaxed", mask=grad_bias_mask)
+      else:
+        grad_bias_ptrs = (
+          GradAttnBias + offs_qm[:, None] * stride_gbm +
+          offs_n[None, :] * stride_gbn
+        )
+        tl.store(grad_bias_ptrs, dBias, mask=grad_bias_mask)
+      dS = (dBias * softmax_scale).to(DTYPE)
+    else:
+      dS = (P * (dP - Di[:, None]) * softmax_scale).to(DTYPE)
+    if not EVEN_M:
+      dS = tl.where(m_mask[:, None], dS, 0.0)
+      P_drop = tl.where(m_mask[:, None], P_drop, 0.0)
+
+    # Phase 3 — accumulate dk, dv, and dq over head-dim chunks.
+    for d_chunk in range(num_d_chunks):
+      d_start = d_chunk * BLOCK_HEADDIM
+      d_offs = d_start + offs_d
+
+      # dk: reload Q via TMA -> dk_contrib = dS^T @ Q -> load/add/store DK.
+      q = desc_q.load([q_offset_y, d_start])
+      dk_ptrs = DK + offs_n[:, None] * stride_dkn + d_offs[None, :]
+      grad_mask_kv = (offs_n[:, None] < seqlen_k) & (d_offs[None, :] < headdim)
+      dk_d = tl.trans(tl.dot(tl.trans(q), dS, out_dtype=tl.float32))
+      if start_m == begin_m:
+        tl.store(dk_ptrs, dk_d, mask=grad_mask_kv, eviction_policy="evict_last")
+      else:
+        dk_val = tl.load(
+          dk_ptrs, mask=grad_mask_kv, other=0., eviction_policy="evict_last"
+        )
+        tl.store(
+          dk_ptrs,
+          dk_val + dk_d,
+          mask=grad_mask_kv,
+          eviction_policy="evict_last",
+        )
+
+      # dv: reload DO via TMA -> dv_contrib = P_drop^T @ DO -> load/add/store DV.
+      do = desc_do.load([q_offset_y, d_start])
+      dv_ptrs = DV + offs_n[:, None] * stride_dvn + d_offs[None, :]
+      dv_d = tl.trans(
+        tl.dot(tl.trans(do), P_drop.to(DTYPE), out_dtype=tl.float32)
+      )
+      if start_m == begin_m:
+        tl.store(dv_ptrs, dv_d, mask=grad_mask_kv, eviction_policy="evict_last")
+      else:
+        dv_val = tl.load(
+          dv_ptrs, mask=grad_mask_kv, other=0., eviction_policy="evict_last"
+        )
+        tl.store(
+          dv_ptrs,
+          dv_val + dv_d,
+          mask=grad_mask_kv,
+          eviction_policy="evict_last",
+        )
+
+      # dq: reload K via TMA -> dq_contrib = dS @ K -> atomic_add to DQ.
+      k = desc_k.load([k_offset_y, d_start])
+      dq_ptrs = DQ + offs_qm[:, None] * stride_dqm + d_offs[None, :]
+      grad_mask_q = (offs_qm[:, None] < seqlen_q) & (d_offs[None, :] < headdim)
+      dq_d = tl.dot(dS, k, out_dtype=tl.float32)
+      tl.atomic_add(dq_ptrs, dq_d, sem="relaxed", mask=grad_mask_q)
+
+
+@triton.jit
 def _ffpa_bwd_dkdv_persist_sm90(
   desc_q: tl.tensor_descriptor,
   desc_k: tl.tensor_descriptor,
@@ -849,6 +1107,7 @@ def _ffpa_bwd_sm90_kernel_impl(
   BLOCK_M: tl.constexpr,
   BLOCK_N: tl.constexpr,
   warp_specialize: tl.constexpr,
+  USE_DKDVDQ_FUSION: tl.constexpr,
 ) -> None:
   """TMA-descriptor variant of the main Split-D FFPA backward kernel.
 
@@ -861,10 +1120,12 @@ def _ffpa_bwd_sm90_kernel_impl(
   ``triton-nvidia-gpu-plan-cta``) and the second ``DotOp`` hits the
   PlanCTA.cpp assertion ``!tiled && "CTA tiling is already determined"``.
 
-  Triton's current automatic warp-specialization pass can only handle one WS
-  loop region in a kernel. The fused wrapper runs non-WS dQ first, then lets
-  the dK/dV D-chunk loop own that region when ``warp_specialize=True``.
-  Standalone split-launch dQ still supports WS.
+  When ``USE_DKDVDQ_FUSION=True``, a single fused kernel handles dK, dV,
+  and dQ in one K-tile-centric pass, eliminating the duplicate S/dP/dS
+  recompute.  Warp specialization applies to the single d-chunk loop;
+  ``PERSIST_DKDV_ACC`` is ignored in this mode.  When
+  ``USE_DKDVDQ_FUSION=False`` (default), the existing separated dK/dV
+  then dQ dispatch is used.
   """
   # Keys for autotune and heuristics lookups.
   _ = autotune_seqlen_q_bucket
@@ -872,64 +1133,119 @@ def _ffpa_bwd_sm90_kernel_impl(
   _ = autotune_causal_key
   _ = autotune_dtype_key
 
-  if PERSIST_DKDV_ACC:
-    _ffpa_bwd_dkdv_persist_sm90(
-      desc_q, desc_k, desc_v, desc_do, DK, DV, LSE, D, AttnBias, GradAttnBias,
-      softmax_scale, stride_dkb, stride_dkh, stride_dkn, stride_dvb, stride_dvh,
-      stride_dvn, stride_bb, stride_bh, stride_bm, stride_bn, stride_gbb,
-      stride_gbh, stride_gbm, stride_gbn, nheads, seqlen_q, seqlen_k,
-      seqlen_q_rounded, headdim, dropout_p, philox_offset, IS_CAUSAL,
-      HAS_ATTN_BIAS, HAS_DROPOUT, PHILOX_SEED, BIAS_REQUIRES_GRAD,
-      GRAD_BIAS_NEEDS_REDUCTION, GRAD_BIAS_REDUCES_M, GRAD_BIAS_STORE_PARTIAL,
-      BLOCK_HEADDIM, DTYPE, EVEN_M, EVEN_N, BLOCK_M, BLOCK_N, warp_specialize
+  if USE_DKDVDQ_FUSION:
+    _ffpa_bwd_dkdvdq_sm90(
+      desc_q,
+      desc_k,
+      desc_v,
+      desc_do,
+      DQ,
+      DK,
+      DV,
+      LSE,
+      D,
+      AttnBias,
+      GradAttnBias,
+      softmax_scale,
+      stride_dqb,
+      stride_dqh,
+      stride_dqm,
+      stride_dkb,
+      stride_dkh,
+      stride_dkn,
+      stride_dvb,
+      stride_dvh,
+      stride_dvn,
+      stride_bb,
+      stride_bh,
+      stride_bm,
+      stride_bn,
+      stride_gbb,
+      stride_gbh,
+      stride_gbm,
+      stride_gbn,
+      nheads,
+      seqlen_q,
+      seqlen_k,
+      seqlen_q_rounded,
+      headdim,
+      dropout_p,
+      philox_offset,
+      IS_CAUSAL,
+      HAS_ATTN_BIAS,
+      HAS_DROPOUT,
+      PHILOX_SEED,
+      BIAS_REQUIRES_GRAD,
+      GRAD_BIAS_NEEDS_REDUCTION,
+      GRAD_BIAS_REDUCES_M,
+      GRAD_BIAS_STORE_PARTIAL,
+      BLOCK_HEADDIM,
+      DTYPE,
+      EVEN_M,
+      EVEN_N,
+      BLOCK_M,
+      BLOCK_N,
+      warp_specialize,
     )
   else:
-    _ffpa_bwd_dkdv_sm90(
-      desc_q, desc_k, desc_v, desc_do, DK, DV, LSE, D, AttnBias, GradAttnBias,
-      softmax_scale, stride_dkb, stride_dkh, stride_dkn, stride_dvb, stride_dvh,
-      stride_dvn, stride_bb, stride_bh, stride_bm, stride_bn, stride_gbb,
-      stride_gbh, stride_gbm, stride_gbn, nheads, seqlen_q, seqlen_k,
-      seqlen_q_rounded, headdim, dropout_p, philox_offset, IS_CAUSAL,
-      HAS_ATTN_BIAS, HAS_DROPOUT, PHILOX_SEED, BIAS_REQUIRES_GRAD,
-      GRAD_BIAS_NEEDS_REDUCTION, GRAD_BIAS_REDUCES_M, GRAD_BIAS_STORE_PARTIAL,
-      BLOCK_HEADDIM, DTYPE, EVEN_M, EVEN_N, BLOCK_M, BLOCK_N, warp_specialize
-    )
+    if PERSIST_DKDV_ACC:
+      _ffpa_bwd_dkdv_persist_sm90(
+        desc_q, desc_k, desc_v, desc_do, DK, DV, LSE, D, AttnBias, GradAttnBias,
+        softmax_scale, stride_dkb, stride_dkh, stride_dkn, stride_dvb,
+        stride_dvh, stride_dvn, stride_bb, stride_bh, stride_bm, stride_bn,
+        stride_gbb, stride_gbh, stride_gbm, stride_gbn, nheads, seqlen_q,
+        seqlen_k, seqlen_q_rounded, headdim, dropout_p, philox_offset,
+        IS_CAUSAL, HAS_ATTN_BIAS, HAS_DROPOUT, PHILOX_SEED, BIAS_REQUIRES_GRAD,
+        GRAD_BIAS_NEEDS_REDUCTION, GRAD_BIAS_REDUCES_M, GRAD_BIAS_STORE_PARTIAL,
+        BLOCK_HEADDIM, DTYPE, EVEN_M, EVEN_N, BLOCK_M, BLOCK_N, warp_specialize
+      )
+    else:
+      _ffpa_bwd_dkdv_sm90(
+        desc_q, desc_k, desc_v, desc_do, DK, DV, LSE, D, AttnBias, GradAttnBias,
+        softmax_scale, stride_dkb, stride_dkh, stride_dkn, stride_dvb,
+        stride_dvh, stride_dvn, stride_bb, stride_bh, stride_bm, stride_bn,
+        stride_gbb, stride_gbh, stride_gbm, stride_gbn, nheads, seqlen_q,
+        seqlen_k, seqlen_q_rounded, headdim, dropout_p, philox_offset,
+        IS_CAUSAL, HAS_ATTN_BIAS, HAS_DROPOUT, PHILOX_SEED, BIAS_REQUIRES_GRAD,
+        GRAD_BIAS_NEEDS_REDUCTION, GRAD_BIAS_REDUCES_M, GRAD_BIAS_STORE_PARTIAL,
+        BLOCK_HEADDIM, DTYPE, EVEN_M, EVEN_N, BLOCK_M, BLOCK_N, warp_specialize
+      )
 
-  _ffpa_bwd_dq_sm90(
-    desc_q,
-    desc_k,
-    desc_v,
-    desc_do,
-    DQ,
-    LSE,
-    D,
-    AttnBias,
-    softmax_scale,
-    stride_dqb,
-    stride_dqh,
-    stride_dqm,
-    stride_bb,
-    stride_bh,
-    stride_bm,
-    stride_bn,
-    nheads,
-    seqlen_q,
-    seqlen_k,
-    seqlen_q_rounded,
-    headdim,
-    dropout_p,
-    philox_offset,
-    IS_CAUSAL,
-    HAS_ATTN_BIAS,
-    HAS_DROPOUT,
-    PHILOX_SEED,
-    BLOCK_HEADDIM,
-    DTYPE,
-    EVEN_N,
-    BLOCK_M,
-    BLOCK_N,
-    False  # warp_specialize
-  )
+    _ffpa_bwd_dq_sm90(
+      desc_q,
+      desc_k,
+      desc_v,
+      desc_do,
+      DQ,
+      LSE,
+      D,
+      AttnBias,
+      softmax_scale,
+      stride_dqb,
+      stride_dqh,
+      stride_dqm,
+      stride_bb,
+      stride_bh,
+      stride_bm,
+      stride_bn,
+      nheads,
+      seqlen_q,
+      seqlen_k,
+      seqlen_q_rounded,
+      headdim,
+      dropout_p,
+      philox_offset,
+      IS_CAUSAL,
+      HAS_ATTN_BIAS,
+      HAS_DROPOUT,
+      PHILOX_SEED,
+      BLOCK_HEADDIM,
+      DTYPE,
+      EVEN_N,
+      BLOCK_M,
+      BLOCK_N,
+      False  # warp_specialize
+    )
 
 
 _SM90_BWD_DEFAULT_CONFIG = {
@@ -1003,8 +1319,8 @@ def _gen_bwd_sm90_autotune_configs(
   for block_m in [64, 128]:
     for block_n in ([64] if autotune_mode == "fast" else [64, 128]):
       for block_headdim in block_headdim_candidates:
-        for num_warps in ([4] if autotune_mode == "fast" else [4, 8]):
-          for num_stages in ([2] if autotune_mode == "fast" else [2, 3]):
+        for num_warps in [4, 8]:
+          for num_stages in [2, 3]:
             configs.append(
               triton.Config(
                 {
@@ -1074,7 +1390,7 @@ def _get_bwd_sm90_autotune(
     enable_persist_dkdv
   )
   if cache_key not in _ffpa_bwd_sm90_autotune_cache:
-    reset_args = []
+    reset_args = ["DK", "DV", "DQ"]
     if bias_requires_grad:
       reset_args.append("GradAttnBias")
     _ffpa_bwd_sm90_autotune_cache[cache_key] = triton.autotune(
@@ -1111,7 +1427,7 @@ def _get_bwd_sm90_dkdv_autotune(
     enable_persist_dkdv
   )
   if cache_key not in _ffpa_bwd_sm90_dkdv_autotune_cache:
-    reset_args = []
+    reset_args = ["DK", "DV"]
     if bias_requires_grad:
       reset_args.append("GradAttnBias")
     _ffpa_bwd_sm90_dkdv_autotune_cache[cache_key] = triton.autotune(
@@ -1143,6 +1459,7 @@ def _get_bwd_sm90_dq_autotune(
   """Return an autotune wrapper for the split-launch SM90 dQ kernel."""
   cache_key = (headdim, autotune_mode, dtype, enable_ws)
   if cache_key not in _ffpa_bwd_sm90_dq_autotune_cache:
+    reset_args = ["DQ"]
     _ffpa_bwd_sm90_dq_autotune_cache[cache_key] = triton.autotune(
       configs=_gen_bwd_sm90_dq_autotune_configs(
         headdim=headdim,
@@ -1156,6 +1473,7 @@ def _get_bwd_sm90_dq_autotune(
         "autotune_causal_key",
         "autotune_dtype_key",
       ],
+      reset_to_zero=reset_args,
       cache_results=True,
     )(_ffpa_bwd_dq_sm90_kernel_impl)
   return _ffpa_bwd_sm90_dq_autotune_cache[cache_key]
@@ -1303,6 +1621,7 @@ def _ffpa_attn_backward_sm90_impl(
   enable_ws: bool = False,
   enable_persist_dkdv: bool = False,
   enable_split_launch: bool = False,
+  use_dkdvdq_fusion: bool = False,
 ) -> None:
   """Run the SM90+ TMA backward main path.
 
@@ -1429,6 +1748,12 @@ def _ffpa_attn_backward_sm90_impl(
       )
 
   def grid(meta: dict) -> tuple[int, ...]:
+    if use_dkdvdq_fusion:
+      return (
+        triton.cdiv(seqlen_k, meta["BLOCK_N"]),
+        1,
+        batch * nheads,
+      )
     return (
       max(
         triton.cdiv(seqlen_k, meta["BLOCK_N"]),
@@ -1570,6 +1895,7 @@ def _ffpa_attn_backward_sm90_impl(
     GRAD_BIAS_REDUCES_M=grad_bias_reduces_m,
     GRAD_BIAS_STORE_PARTIAL=use_key_bias_grad_reduction,
     PERSIST_DKDV_ACC=enable_persist_dkdv,
+    USE_DKDVDQ_FUSION=use_dkdvdq_fusion,
     DTYPE=DTYPE,
   )
   dkdv_meta = dict(
@@ -1677,26 +2003,45 @@ def _ffpa_attn_backward_sm90_impl(
       _ffpa_bwd_sm90_prepare_descs(desc_q, desc_k, desc_v, desc_do, dq_config)
       _ffpa_bwd_dq_sm90_kernel_impl[dq_grid](*dq_args, **dq_meta, **dq_config)
     else:
-      launch_config = dict(
-        _SM90_BWD_PERSIST_DKDV_DEFAULT_CONFIG
-        if enable_persist_dkdv else _SM90_BWD_DEFAULT_CONFIG
-      )
-      persisted_config = lookup_bwd_sm90_persistent_config(
-        q=q,
-        seqlen_q=seqlen_q,
-        seqlen_k=seqlen_k,
-        headdim=headdim,
-        autotune_mode=autotune_mode,
-        causal=causal,
-        bias_grad=bias_requires_grad,
-        grad_kv_storage_dtype=grad_kv_storage_dtype,
-        has_attn_bias=has_attn_bias,
-        has_dropout=has_dropout,
-        nheads_q=nheads,
-        nheads_kv=original_nheads_kv,
-        enable_ws=enable_ws,
-        enable_persist_dkdv=enable_persist_dkdv,
-      )
+      if use_dkdvdq_fusion:
+        launch_config = dict(_SM90_BWD_DEFAULT_CONFIG)
+        persisted_config = lookup_bwd_sm90_persistent_config(
+          q=q,
+          seqlen_q=seqlen_q,
+          seqlen_k=seqlen_k,
+          headdim=headdim,
+          autotune_mode=autotune_mode,
+          causal=causal,
+          bias_grad=bias_requires_grad,
+          grad_kv_storage_dtype=grad_kv_storage_dtype,
+          has_attn_bias=has_attn_bias,
+          has_dropout=has_dropout,
+          nheads_q=nheads,
+          nheads_kv=original_nheads_kv,
+          enable_ws=enable_ws,
+          kernel="bwd_sm90_generic_fused",
+        )
+      else:
+        launch_config = dict(
+          _SM90_BWD_PERSIST_DKDV_DEFAULT_CONFIG
+          if enable_persist_dkdv else _SM90_BWD_DEFAULT_CONFIG
+        )
+        persisted_config = lookup_bwd_sm90_persistent_config(
+          q=q,
+          seqlen_q=seqlen_q,
+          seqlen_k=seqlen_k,
+          headdim=headdim,
+          autotune_mode=autotune_mode,
+          causal=causal,
+          bias_grad=bias_requires_grad,
+          grad_kv_storage_dtype=grad_kv_storage_dtype,
+          has_attn_bias=has_attn_bias,
+          has_dropout=has_dropout,
+          nheads_q=nheads,
+          nheads_kv=original_nheads_kv,
+          enable_ws=enable_ws,
+          enable_persist_dkdv=enable_persist_dkdv,
+        )
       if persisted_config is not None:
         launch_config.update(persisted_config)
       launch_config["warp_specialize"] = bool(enable_ws)
