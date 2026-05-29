@@ -431,8 +431,8 @@ def _gen_bwd_autotune_configs(
   for block_m in [64, 128]:
     for block_n in ([64] if autotune_mode == "fast" else [64, 128]):
       for block_headdim in headdim_candidates:
-        for num_warps in ([4] if autotune_mode == "fast" else [4, 8]):
-          for num_stages in ([2] if autotune_mode == "fast" else [2, 3]):
+        for num_warps in [4, 8]:
+          for num_stages in [2, 3]:
             configs.append(
               triton.Config(
                 {
@@ -2135,6 +2135,7 @@ def _ffpa_attn_backward_triton_impl(
         enable_ws=enable_ws,
         enable_persist_dkdv=enable_persist_dkdv,
         enable_split_launch=split_launch,
+        use_dkdvdq_fusion=use_dkdvdq_fusion,
       )
       return
 
