@@ -15,7 +15,6 @@ against ``torch.nn.functional.scaled_dot_product_attention``:
 
 from __future__ import annotations
 
-import argparse
 import math
 import os
 import time
@@ -26,133 +25,13 @@ import torch.nn.functional as F
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from ffpa_attn import CUDABackend, CuTeDSLBackend, TritonBackend, ffpa_attn_func
-from _attn_flops import attention_fwd_flops, format_tflops_short, tflops_from_ms
+from ._flops import attention_fwd_flops, format_tflops_short, tflops_from_ms
 
 DEFAULT_WARMUP = 2
 DEFAULT_ITERS = 10
 FORWARD_RESULT = dict[str, Any]
 TRITON_SMALL_D_ENV = "FFPA_TRITON_ALLOW_SMALL_D"
 CUTEDSL_SMALL_D_ENV = "FFPA_CUTE_ALLOW_SMALL_D"
-
-
-def _parse_grad_kv_dtype(arg: str) -> torch.dtype | None:
-  """Parse the CLI grad-kv-dtype option.
-
-  :param arg: CLI value, ``"none"``, ``"fp16"``, or ``"fp32"``.
-  :return: ``None``, ``torch.float16``, or ``torch.float32``.
-  """
-  if arg == "none":
-    return None
-  if arg == "fp16":
-    return torch.float16
-  if arg == "fp32":
-    return torch.float32
-  raise ValueError(
-    f"Unsupported grad-kv-dtype={arg!r}; choose 'none', 'fp16', or 'fp32'."
-  )
-
-
-def _parse_args() -> argparse.Namespace:
-  parser = argparse.ArgumentParser(
-    description="FFPA forward example and SDPA comparison."
-  )
-  parser.add_argument(
-    "--forward-backend",
-    "--backend",
-    "--fwd",
-    choices=["cuda", "triton", "cutedsl"],
-    default="triton",
-    help=(
-      "Forward backend passed to ffpa_attn_func. 'cutedsl' requires SM80/SM89/SM90 + 64-aligned large D "
-      "and does not support attn_mask/dropout/non-aligned cases (auto-skipped)."
-    ),
-  )
-  parser.add_argument("--B", type=int, default=1, help="Batch size.")
-  parser.add_argument(
-    "--N",
-    type=int,
-    default=8192,
-    help="Sequence length (non-aligned uses N-1)."
-  )
-  parser.add_argument("--D", type=int, default=512, help="Head dimension.")
-  parser.add_argument(
-    "--warmup",
-    type=int,
-    default=DEFAULT_WARMUP,
-    help="Warmup iterations used for timing."
-  )
-  parser.add_argument(
-    "--iters",
-    type=int,
-    default=DEFAULT_ITERS,
-    help="Measured iterations used for timing."
-  )
-  parser.add_argument(
-    "--dropout-p",
-    type=float,
-    default=0.1,
-    help="Dropout probability for the dropout example case."
-  )
-  parser.add_argument(
-    "--seed", type=int, default=42, help="Random seed for input tensors."
-  )
-  parser.add_argument(
-    "--norm",
-    action="store_true",
-    help="Enable pre-attention LayerNorm on q/k/v for both FFPA and SDPA paths.",
-  )
-  parser.add_argument(
-    "--triton-autotune",
-    "--autotune",
-    "--tune",
-    action="store_true",
-    help=
-    "Enable Triton runtime autotuning (only effective when --forward-backend=triton).",
-  )
-  parser.add_argument(
-    "--triton-autotune-mode",
-    "--autotune-mode",
-    "--mode",
-    choices=["fast", "max"],
-    default="fast",
-    help="Triton autotune search-space mode.",
-  )
-  parser.add_argument(
-    "--grad-kv-storage-dtype",
-    "--grad-kv-dtype",
-    choices=["none", "fp16", "fp32"],
-    default="none",
-    help=
-    "Optional backward dK/dV storage dtype (Triton or CuTeDSL) forwarded to ffpa_attn_func.",
-  )
-  parser.add_argument(
-    "--enable-tma",
-    action="store_true",
-    help="Compatibility alias for --enable-fwd-tma.",
-  )
-  parser.add_argument(
-    "--enable-ws",
-    action="store_true",
-    help="Compatibility alias for --enable-fwd-ws.",
-  )
-  parser.add_argument(
-    "--enable-fwd-tma",
-    action="store_true",
-    help=
-    "Enable experimental SM90+ TMA forward path (silently falls back on unsupported devices).",
-  )
-  parser.add_argument(
-    "--enable-fwd-ws",
-    action="store_true",
-    help=
-    "Force warp-specialized configs for the experimental SM90+ TMA forward path.",
-  )
-  args = parser.parse_args()
-  if args.enable_tma:
-    args.enable_fwd_tma = True
-  if args.enable_ws:
-    args.enable_fwd_ws = True
-  return args
 
 
 def _validate_timing_args(warmup: int, iters: int) -> None:
@@ -681,33 +560,3 @@ def run_forward_examples(
       )
 
   return results
-
-
-def main() -> None:
-  args = _parse_args()
-  print(args)
-
-  if not torch.cuda.is_available():
-    raise SystemExit("CUDA is required to run this example.")
-  grad_kv_dtype = _parse_grad_kv_dtype(args.grad_kv_storage_dtype)
-  run_forward_examples(
-    B=args.B,
-    N=args.N,
-    D=args.D,
-    dropout_p=args.dropout_p,
-    seed=args.seed,
-    apply_norm=args.norm,
-    forward_backend=args.forward_backend,
-    triton_autotune=args.triton_autotune,
-    triton_autotune_mode=args.triton_autotune_mode,
-    grad_kv_storage_dtype=grad_kv_dtype,
-    warmup=args.warmup,
-    iters=args.iters,
-    print_results=True,
-    enable_tma=args.enable_fwd_tma,
-    enable_ws=args.enable_fwd_ws,
-  )
-
-
-if __name__ == "__main__":
-  main()

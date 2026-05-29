@@ -2,11 +2,11 @@
 
 Usage::
 
-  CUDA_VISIBLE_DEVICES=0 python examples/perf.py
-  CUDA_VISIBLE_DEVICES=0 python examples/perf.py --no-bwd --fwd-backend triton --tune fast
-  CUDA_VISIBLE_DEVICES=0 python examples/perf.py --no-fwd --bwd-backend triton --tune max
-  CUDA_VISIBLE_DEVICES=0 python examples/perf.py --fwd-backend triton --bwd-backend triton --tune fast
-  CUDA_VISIBLE_DEVICES=0 python examples/perf.py --fwd-backend cutedsl --bwd-backend cutedsl
+  CUDA_VISIBLE_DEVICES=0 python -m ffpa_attn.bench
+  CUDA_VISIBLE_DEVICES=0 python -m ffpa_attn.bench --no-bwd --fwd-backend triton --tune fast
+  CUDA_VISIBLE_DEVICES=0 python -m ffpa_attn.bench --no-fwd --bwd-backend triton --tune max
+  CUDA_VISIBLE_DEVICES=0 python -m ffpa_attn.bench --fwd-backend triton --bwd-backend triton --tune fast
+  CUDA_VISIBLE_DEVICES=0 python -m ffpa_attn.bench --fwd-backend cutedsl --bwd-backend cutedsl
 
 The cutedsl backend supports SM80/SM89 via the Split-D path and SM90 via the
 Hopper path. Selecting
@@ -28,13 +28,9 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
-EXAMPLES_DIR = Path(__file__).resolve().parent
-if str(EXAMPLES_DIR) not in sys.path:
-  sys.path.insert(0, str(EXAMPLES_DIR))
-
-from _attn_fwd import run_forward_examples
-from _attn_bwd import run_backward_examples
-from _attn_flops import format_tflops_short
+from ._runner_fwd import run_forward_examples
+from ._runner_bwd import run_backward_examples
+from ._flops import format_tflops_short
 
 
 def _parse_grad_kv_dtype(arg: str) -> torch.dtype | None:

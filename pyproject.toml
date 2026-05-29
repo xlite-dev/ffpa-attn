@@ -100,7 +100,6 @@ exclude = [
     "tmp*",
     "docs*",
     "tools*",
-    "examples*",
     "third_party*",
     "*.egg-info",
 ]

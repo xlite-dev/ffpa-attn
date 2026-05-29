@@ -4,16 +4,16 @@
 ## Quick Start
 
 ```bash
-python3 examples/perf.py # default: forward + backward w/o autotuning
-python3 examples/perf.py --no-bwd # only forward pass
-python3 examples/perf.py --no-fwd # only backward pass
-python3 examples/perf.py --fwd-backend triton --bwd-backend triton --tune fast
-python3 examples/perf.py --fwd-backend triton --bwd-backend triton --tune max
-python3 examples/perf.py --fwd-backend triton --bwd-backend triton --tune max --fwd-tma --bwd-tma # SM>=90
-python3 examples/perf.py --fwd-backend cutedsl --bwd-backend cutedsl # SM==90 + dense 320<D<=512
+python3 -m ffpa_attn.bench # default: forward + backward w/o autotuning
+python3 -m ffpa_attn.bench --no-bwd # only forward pass
+python3 -m ffpa_attn.bench --no-fwd # only backward pass
+python3 -m ffpa_attn.bench --fwd-backend triton --bwd-backend triton --tune fast
+python3 -m ffpa_attn.bench --fwd-backend triton --bwd-backend triton --tune max
+python3 -m ffpa_attn.bench --fwd-backend triton --bwd-backend triton --tune max --fwd-tma --bwd-tma # SM>=90
+python3 -m ffpa_attn.bench --fwd-backend cutedsl --bwd-backend cutedsl # SM==90 + dense 320<D<=512
 ```
 
-The `examples/perf.py` migrated benchmark plotting entrypoint. It preserves the old plot style, can benchmark forward/backward cases on demand, and writes both `ffpa_{device}_speedup.png` and `ffpa_{device}_speedup.md`. The additive-mask example uses a compact `[1, 1, 1, Nkv]` key-position bias by default. Use `[1, 1, Nq, Nkv]` only when per-query bias is required, since it scales as `O(Nq * Nkv)` memory.
+The `ffpa-attn bench CLI` migrated benchmark plotting entrypoint. It preserves the old plot style, can benchmark forward/backward cases on demand, and writes both `ffpa_{device}_speedup.png` and `ffpa_{device}_speedup.md`. The additive-mask example uses a compact `[1, 1, 1, Nkv]` key-position bias by default. Use `[1, 1, Nq, Nkv]` only when per-query bias is required, since it scales as `O(Nq * Nkv)` memory.
 
 ## Benchmark
 
@@ -128,12 +128,12 @@ TFLOPS reports the theoretical dominant attention GEMM throughput only; forward 
 The performance benchmarks for the NVIDIA L20 (**Ada**), NVIDIA Geforce RTX 5090 (**Blackwell**), NVIDIA H800 PCIE (**Hopper**), NVIDIA H200 SXM (**Hopper**, **CuTeDSL** backend, up to **427** TFLOPS!🎉) with large headdim are shown below:
 
 <div align='center'>
-  <img src='../docs/assets/perf/ffpa_speedup_nvidia-l20_B1_H32_N8192_D320_T.png' width='350px'>
-  <img src='../docs/assets/perf/ffpa_speedup_nvidia-l20_B1_H32_N8192_D512_T.png' width='350px'><br>
-  <img src='../docs/assets/perf/ffpa_speedup_nvidia-geforce-rtx-5090_B1_H32_N8192_D320_T.png' width='350px'>
-  <img src='../docs/assets/perf/ffpa_speedup_nvidia-geforce-rtx-5090_B1_H32_N8192_D512_T.png' width='350px'><br>
-  <img src='../docs/assets/perf/ffpa_speedup_nvidia-h800-pcie_B1_H32_N8192_D320_T.png' width='350px'>
-  <img src='../docs/assets/perf/ffpa_speedup_nvidia-h800-pcie_B1_H32_N8192_D512_T.png' width='350px'><br>
-  <img src='../docs/assets/perf/ffpa_speedup_cutedsl_nvidia-h20z_B1_H32_N8192_D512_T.png' width='350px'>
-  <img src='../docs/assets/perf/ffpa_speedup_cutedsl_nvidia-h20z_B1_H32_N16384_D512_T.png' width='350px'>
+  <img src='../assets/perf/ffpa_speedup_nvidia-l20_B1_H32_N8192_D320_T.png' width='350px'>
+  <img src='../assets/perf/ffpa_speedup_nvidia-l20_B1_H32_N8192_D512_T.png' width='350px'><br>
+  <img src='../assets/perf/ffpa_speedup_nvidia-geforce-rtx-5090_B1_H32_N8192_D320_T.png' width='350px'>
+  <img src='../assets/perf/ffpa_speedup_nvidia-geforce-rtx-5090_B1_H32_N8192_D512_T.png' width='350px'><br>
+  <img src='../assets/perf/ffpa_speedup_nvidia-h800-pcie_B1_H32_N8192_D320_T.png' width='350px'>
+  <img src='../assets/perf/ffpa_speedup_nvidia-h800-pcie_B1_H32_N8192_D512_T.png' width='350px'><br>
+  <img src='../assets/perf/ffpa_speedup_cutedsl_nvidia-h20z_B1_H32_N8192_D512_T.png' width='350px'>
+  <img src='../assets/perf/ffpa_speedup_cutedsl_nvidia-h20z_B1_H32_N16384_D512_T.png' width='350px'>
 </div>

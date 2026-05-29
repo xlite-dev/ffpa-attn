@@ -13,7 +13,6 @@ PyTorch SDPA for backward correctness and backward runtime by default:
 
 from __future__ import annotations
 
-import argparse
 import math
 import os
 import time
@@ -24,7 +23,7 @@ import torch.nn.functional as F
 
 from ffpa_attn import CuTeDSLBackend, SDPABackend, TritonBackend, ffpa_attn_func
 from ffpa_attn.functional import _should_use_aten_small_d_forward
-from _attn_flops import attention_bwd_flops, format_tflops_short, tflops_from_ms
+from ._flops import attention_bwd_flops, format_tflops_short, tflops_from_ms
 
 DEFAULT_WARMUP = 2
 DEFAULT_ITERS = 10
@@ -32,157 +31,6 @@ MAX_MASK_GRAD_SEQLEN = 1024 * 16  # 16K, avoid OOM.
 BACKWARD_RESULT = dict[str, Any]
 TRITON_SMALL_D_ENV = "FFPA_TRITON_ALLOW_SMALL_D"
 CUTEDSL_SMALL_D_ENV = "FFPA_CUTE_ALLOW_SMALL_D"
-
-
-def _parse_grad_kv_dtype(arg: str) -> torch.dtype | None:
-  """Parse the CLI grad-kv-dtype option.
-
-  :param arg: CLI value, ``"none"``, ``"fp16"``, or ``"fp32"``.
-  :return: ``None``, ``torch.float16``, or ``torch.float32``.
-  """
-  if arg == "none":
-    return None
-  if arg == "fp16":
-    return torch.float16
-  if arg == "fp32":
-    return torch.float32
-  raise ValueError(
-    f"Unsupported grad-kv-dtype={arg!r}; choose 'none', 'fp16', or 'fp32'."
-  )
-
-
-def _parse_args() -> argparse.Namespace:
-  parser = argparse.ArgumentParser(
-    description="FFPA backward example and SDPA comparison."
-  )
-  parser.add_argument(
-    "--backward-backend",
-    "--backend",
-    "--bwd",
-    choices=["sdpa", "triton", "cutedsl"],
-    default="triton",
-    help=(
-      "Backward backend passed to ffpa_attn_func. 'cutedsl' auto-pairs the "
-      "forward to cutedsl and only runs SM8x/SM90 large-D fp16/bf16, with no "
-      "attn_mask/dropout/non-aligned cases (auto-skipped)."
-    ),
-  )
-  parser.add_argument("--B", type=int, default=1, help="Batch size.")
-  parser.add_argument(
-    "--N",
-    type=int,
-    default=8192,
-    help="Sequence length (non-aligned uses N-1)."
-  )
-  parser.add_argument("--D", type=int, default=512, help="Head dimension.")
-  parser.add_argument(
-    "--warmup",
-    type=int,
-    default=DEFAULT_WARMUP,
-    help="Warmup iterations used for timing."
-  )
-  parser.add_argument(
-    "--iters",
-    type=int,
-    default=DEFAULT_ITERS,
-    help="Measured iterations used for timing."
-  )
-  parser.add_argument(
-    "--dropout-p",
-    type=float,
-    default=0.1,
-    help="Dropout probability for the dropout example case."
-  )
-  parser.add_argument(
-    "--seed", type=int, default=42, help="Random seed for input tensors."
-  )
-  parser.add_argument(
-    "--norm",
-    action="store_true",
-    help="Enable pre-attention LayerNorm on q/k/v for both FFPA and SDPA paths.",
-  )
-  parser.add_argument(
-    "--timing-mode",
-    choices=["backward-only", "full"],
-    default="backward-only",
-    help="Whether to time only backward or end-to-end forward+backward.",
-  )
-  parser.add_argument(
-    "--triton-autotune",
-    "--autotune",
-    "--tune",
-    action="store_true",
-    help=
-    "Enable Triton autotuning (only effective when --backward-backend=triton).",
-  )
-  parser.add_argument(
-    "--triton-autotune-mode",
-    "--autotune-mode",
-    "--mode",
-    choices=["fast", "max"],
-    default="fast",
-    help="Triton autotune search-space mode.",
-  )
-  parser.add_argument(
-    "--grad-kv-storage-dtype",
-    "--grad-kv-dtype",
-    choices=["none", "fp16", "fp32"],
-    default="none",
-    help=
-    "Optional backward dK/dV storage dtype (Triton or CuTeDSL) forwarded to ffpa_attn_func.",
-  )
-  parser.add_argument(
-    "--enable-tma",
-    action="store_true",
-    help="Compatibility alias for --enable-bwd-tma.",
-  )
-  parser.add_argument(
-    "--enable-ws",
-    action="store_true",
-    help="Compatibility alias for --enable-bwd-ws.",
-  )
-  parser.add_argument(
-    "--enable-bwd-tma",
-    action="store_true",
-    help="Enable the SM90+ Triton descriptor/TMA backward path when supported.",
-  )
-  parser.add_argument(
-    "--enable-bwd-ws",
-    action="store_true",
-    help=
-    "Request warp-specialized SM90+ Triton backward configs when supported.",
-  )
-  parser.add_argument(
-    "--enable-persist-dkdv",
-    "--persist-dkdv",
-    action="store_true",
-    help=
-    "Enable persistent dK/dV fp32 accumulation in the SM90+ TMA backward path (requires --enable-bwd-tma).",
-  )
-  parser.add_argument(
-    "--enable-bwd-split-launch",
-    "--bwd-split-launch",
-    action="store_true",
-    help=
-    "Enable separate backward launches for dK/dV and dQ on generic Triton or SM90+ TMA paths.",
-  )
-  args = parser.parse_args()
-  if args.enable_tma:
-    args.enable_bwd_tma = True
-  if args.enable_ws:
-    args.enable_bwd_ws = True
-  if args.enable_persist_dkdv and not args.enable_bwd_tma:
-    raise SystemExit("--enable-persist-dkdv requires --enable-bwd-tma")
-  if args.backward_backend == "cutedsl" and (
-    args.triton_autotune or args.enable_bwd_tma or args.enable_bwd_ws
-    or args.enable_persist_dkdv or args.enable_bwd_split_launch
-  ):
-    print(
-      "[warn] --backward-backend=cutedsl ignores --triton-autotune / "
-      "--enable-bwd-tma / --enable-bwd-ws / --enable-persist-dkdv / "
-      "--bwd-split-launch."
-    )
-  return args
 
 
 def _validate_timing_args(warmup: int, iters: int) -> None:
@@ -1210,36 +1058,3 @@ def run_backward_examples(
       )
 
   return results
-
-
-def main() -> None:
-  args = _parse_args()
-  print(args)
-
-  if not torch.cuda.is_available():
-    raise SystemExit("CUDA is required to run this example.")
-  grad_kv_dtype = _parse_grad_kv_dtype(args.grad_kv_storage_dtype)
-  run_backward_examples(
-    B=args.B,
-    N=args.N,
-    D=args.D,
-    dropout_p=args.dropout_p,
-    seed=args.seed,
-    apply_norm=args.norm,
-    backward_backend=args.backward_backend,
-    timing_mode=args.timing_mode,
-    triton_autotune=args.triton_autotune,
-    triton_autotune_mode=args.triton_autotune_mode,
-    grad_kv_storage_dtype=grad_kv_dtype,
-    enable_tma=args.enable_bwd_tma,
-    enable_ws=args.enable_bwd_ws,
-    enable_persist_dkdv=args.enable_persist_dkdv,
-    enable_split_launch=args.enable_bwd_split_launch,
-    warmup=args.warmup,
-    iters=args.iters,
-    print_results=True,
-  )
-
-
-if __name__ == "__main__":
-  main()

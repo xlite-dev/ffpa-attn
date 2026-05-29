@@ -3,14 +3,14 @@
 import pytest
 from types import SimpleNamespace
 
-from examples._attn_flops import (
+from ffpa_attn.cli._flops import (
   attention_bwd_flops,
   attention_fwd_flops,
   attention_valid_pairs,
   format_tflops_short,
   tflops_from_ms,
 )
-from examples.perf import _resolve_directional_cli_flags
+from ffpa_attn.cli._bench import _resolve_directional_cli_flags
 
 
 def test_attention_valid_pairs_non_causal_and_cross_attn():
