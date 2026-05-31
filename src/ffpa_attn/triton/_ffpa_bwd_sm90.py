@@ -1319,7 +1319,7 @@ def _gen_bwd_sm90_autotune_configs(
   for block_m in [64, 128]:
     for block_n in ([64] if autotune_mode == "fast" else [64, 128]):
       for block_headdim in block_headdim_candidates:
-        for num_warps in [4, 8]:
+        for num_warps in [8, 16] if enable_ws else [4, 8]:
           for num_stages in [2, 3]:
             configs.append(
               triton.Config(
