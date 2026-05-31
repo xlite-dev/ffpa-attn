@@ -267,14 +267,14 @@ def test_sm90_fwd_configs_force_warp_specialize():
     config["BLOCK_HEADDIM_QK"] == config["BLOCK_HEADDIM_V"]
     for config in ws_configs
   )
-  assert all(config["num_warps"] == 4 for config in ws_configs)
+  assert all(config["num_warps"] == 8 for config in ws_configs)
   assert {config["num_stages"] for config in ws_configs} == {3}
   assert {(
     config["BLOCK_M"], config["BLOCK_N"], config["BLOCK_HEADDIM_QK"],
     config["BLOCK_HEADDIM_V"]
   )
           for config in max_ws_configs} == expected_ws_configs
-  assert {config["num_warps"] for config in max_ws_configs} == {4, 8}
+  assert {config["num_warps"] for config in max_ws_configs} == {8, 16}
   assert {config["num_stages"] for config in max_ws_configs} == {3}
 
 
@@ -648,6 +648,9 @@ def test_sm90_bwd_tma_configs_force_warp_specialize(monkeypatch):
   assert len(fast) < len(max_configs)
   assert {config["warp_specialize"] for config in serialized} == {True}
   assert {config["warp_specialize"] for config in max_serialized} == {True}
+  # bwd fast 和 max 模式下 num_warps 均使用 [8, 16]（无区分）
+  assert {config["num_warps"] for config in serialized} == {8, 16}
+  assert {config["num_warps"] for config in max_serialized} == {8, 16}
   assert {config["num_stages"] for config in max_serialized} == {2, 3}
 
 
