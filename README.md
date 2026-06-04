@@ -27,7 +27,7 @@ First, install the prebuilt package from [PyPI](https://pypi.org/project/ffpa-at
 
 ```bash
 # Fisrt, install the prebuilt package from PyPI
-pip3 install -U ffpa-attn # (support: sm_{80,...,120})
+pip3 install -U ffpa-attn # CUDA 13.0+, PyTorch 2.11+
 # Or, build ffpa-attn from source, just follow the cmds
 git clone https://github.com/xlite-dev/ffpa-attn.git
 # Then, build the wheel package (Triton + CuTeDSL backends)
