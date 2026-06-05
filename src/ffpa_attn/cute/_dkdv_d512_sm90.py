@@ -7,21 +7,29 @@
 # The core implementation below is written from scratch for SM90 and follows
 # the SplitD design from the ffpa-attn repo.
 #
-# SM90 Backward dKdV Kernel with 4-Pass D-Split for head_dim=512.
+# SM90 Backward dKdV Kernel with 2-Pass D-Split + Dual-MMA-WG for head_dim=512.
 #
 # Architecture:
-#   - 2 WGs: 1 producer (TMA, 128 threads), 1 consumer (MMA, 128 threads)
-#   - tile_m=64, tile_n=64, d_chunk=128, num_d_passes=4
-#   - K/V persistent SMEM: pre-loaded once per d_pass (4 K + 4 V chunks)
-#   - Q/dO streaming via pipeline_A (3 stages)
-#   - Per d_pass, 6 phases per (n_block, m_block):
-#       Phase 1: S = Q @ K^T (4 × d_inner=128 reduction, K from persistent SMEM)
-#       Phase 2: P = exp2(S * scale_log2 - LSE)
-#       Phase 3: dP = dO @ V^T (4 × d_inner=128 reduction, V from persistent SMEM)
-#       Phase 4: dS = P * (dP - dPsum)
-#       Phase 5: dV += P^T @ dO_d_pass  (via SMEM)
-#       Phase 6: dK += dS^T @ Q_d_pass  (via SMEM)
-#   - mma_dkv_is_rs = False (P/dS through SMEM for simplicity)
+#   - 3 WGs / 384 threads:
+#       WG0 producer (warp 0 issues TMA; warps 1–3 idle, regs decreased to 56)
+#       WG1 MMA: S (P1) + softmax→P (P2) + dV (P5), 224 regs
+#       WG2 MMA: dP (P3) + dS (P4) + dK (P6), 224 regs
+#   - tile_m=64, tile_n=64, d_chunk=256, num_d_passes=2, num_d_inner=2
+#   - K/V persistent SMEM: pre-loaded ONCE per work_tile (n_block) and reused
+#     across all d_passes (K_persist_chunks=V_persist_chunks=2)
+#   - Q/dO streaming via pipeline_A (2 stages)
+#   - PdS_stage=1 (single buffer); WG1↔WG2 cross-WG handoff via PFull/PEmpty
+#     NamedBarrier over 256 MMA threads
+#   - sP_fp32 channel: WG1 writes both bf16 sP (for its own dV WGMMA SS A-operand)
+#     and fp32 sP_fp32 in P2; WG2 reads sP_fp32 in P4 → no fp32→bf16→fp32 precision loss
+#   - Per d_pass, 6 phases per (n_block, m_block), split across WG1/WG2:
+#       Phase 1 [WG1]: S  = Σ_{d_inner=0..1} Q_d @ K_d^T   (K from sK_persist)
+#       Phase 2 [WG1]: P  = exp2(S * scale_log2 - LSE); STSM → sP (bf16) + sP_fp32
+#       Phase 3 [WG2]: dP = Σ_{d_inner=0..1} dO_d @ V_d^T  (V from sV_persist)
+#       Phase 4 [WG2]: dS = P * (dP - dPsum) * softmax_scale; STSM → sdS
+#       Phase 5 [WG1]: dV += P^T  @ dO_d_pass   (sP   via SMEM, SS-mode WGMMA)
+#       Phase 6 [WG2]: dK += dS^T @ Q_d_pass    (sdS  via SMEM, SS-mode WGMMA)
+#   - mma_dkv_is_rs = False (P/dS routed through SMEM rather than registers)
 
 import math
 from typing import Callable, Optional, Type
@@ -144,14 +152,16 @@ class FFPAAttnBwdDKDVSm90SplitD:
       stage=self.A_stage,
       major_mode_size=self.d_chunk,  # accommodate sA^T
     )
-    # sK_persist: (tile_n, d_chunk) × num_d_inner — persistent K across m_blocks
+    # sK_persist: (tile_n, d_chunk) × num_d_inner — persistent K across all
+    # d_passes / q_heads / m_blocks within one work_tile (n_block).
     self.sK_persist_layout = sm90_utils.make_smem_layout(
       self.dtype,
       LayoutEnum.ROW_MAJOR,
       (self.tile_n, self.d_chunk),
       stage=self.K_persist_chunks,
     )
-    # sV_persist: (tile_n, d_chunk) × num_d_inner — persistent V across m_blocks
+    # sV_persist: (tile_n, d_chunk) × num_d_inner — persistent V across all
+    # d_passes / q_heads / m_blocks within one work_tile (n_block).
     self.sV_persist_layout = sm90_utils.make_smem_layout(
       self.dtype,
       LayoutEnum.ROW_MAJOR,
@@ -188,7 +198,7 @@ class FFPAAttnBwdDKDVSm90SplitD:
 
   def _get_tiled_mma(self):
     # ── SdP: S = Q @ K^T, dP = dO @ V^T ──
-    # shape_mnk: (tile_m, tile_n, d_chunk) = (64, 64, 128)
+    # shape_mnk: (tile_m, tile_n, d_chunk) = (64, 64, 256)
     atom_layout_SdP = (
       self.AtomLayoutMSdP, self.num_wg_mma // self.AtomLayoutMSdP, 1
     )
@@ -206,7 +216,7 @@ class FFPAAttnBwdDKDVSm90SplitD:
     )
 
     # ── dKV: dV = P^T @ dO_d, dK = dS^T @ Q_d ──
-    # shape_mnk: (tile_n, d_chunk, tile_m) = (64, 128, 64)
+    # shape_mnk: (tile_n, d_chunk, tile_m) = (64, 256, 64)
     atom_layout_dKV = (
       self.AtomLayoutNdKV, self.num_wg_mma // self.AtomLayoutNdKV, 1
     )
@@ -253,7 +263,8 @@ class FFPAAttnBwdDKDVSm90SplitD:
                            cute.cosize(self.sV_persist_layout)],
       self.buffer_align_bytes,
     ]
-    # Dedicated single-stage epilogue buffer for TMA dK/dV store.
+    # Single-stage epilogue staging buffer for per-d_pass dK/dV TMA store.
+    # NOTE: shares physical SMEM with sA via SmemAEpi_t union (see below).
     sEpi_struct = cute.struct.Align[
       cute.struct.MemRange[self.dtype,
                            cute.cosize(self.sB_epi_layout)],
@@ -351,28 +362,28 @@ class FFPAAttnBwdDKDVSm90SplitD:
 
     sA_layout_sel = cute.select(self.sA_layout, mode=[0, 1])
     gmem_tiled_copy_g2s = cpasync.CopyBulkTensorTileG2SOp()
-    # Q: tile shape (tile_m, d_chunk) = (64, 128)
+    # Q: tile shape (tile_m, d_chunk) = (64, 256)
     tma_atom_Q, tma_tensor_Q = cpasync.make_tiled_tma_atom(
       gmem_tiled_copy_g2s,
       mQ,
       sA_layout_sel,
       (self.tile_m, self.d_chunk),
     )
-    # dO: tile shape (tile_m, d_chunk) = (64, 128)
+    # dO: tile shape (tile_m, d_chunk) = (64, 256)
     tma_atom_dO, tma_tensor_dO = cpasync.make_tiled_tma_atom(
       gmem_tiled_copy_g2s,
       mdO,
       sA_layout_sel,
       (self.tile_m, self.d_chunk),
     )
-    # K: tile shape (tile_n, d_chunk) = (64, 128), persistent in SMEM
+    # K: tile shape (tile_n, d_chunk) = (64, 256), persistent in SMEM
     tma_atom_K, tma_tensor_K = cpasync.make_tiled_tma_atom(
       gmem_tiled_copy_g2s,
       mK,
       sK_layout_sel,
       (self.tile_n, self.d_chunk),
     )
-    # V: tile shape (tile_n, d_chunk) = (64, 128), persistent in SMEM
+    # V: tile shape (tile_n, d_chunk) = (64, 256), persistent in SMEM
     tma_atom_V, tma_tensor_V = cpasync.make_tiled_tma_atom(
       gmem_tiled_copy_g2s,
       mV,
@@ -1208,7 +1219,8 @@ class FFPAAttnBwdDKDVSm90SplitD:
     )
     # (a) STSM bf16 P → sP (for WG1's own dV WGMMA SS-mode read)
     copy_P_r2s(tdVrP, dst_idx=p_stage)
-    # (b) Universal-op store fp32 acc_S → sP_fp32 in C-operand layout (Step 14).
+    # (b) Universal-op store fp32 acc_S → sP_fp32 in C-operand layout
+    # (bf16-roundtrip-free P channel for WG2 to read in P4).
     copy_P_fp32_r2s(acc_S, dst_idx=p_stage)
     cute.arch.fence_view_async_shared()  # orders both STSM and direct stores
     cute.arch.sync_warp()
@@ -1407,8 +1419,6 @@ class FFPAAttnBwdDKDVSm90SplitD:
             number_of_threads=self.num_producer_threads + self.num_mma_threads,
           )
 
-        # No polite-close on PEmpty: per-m_block (WG1 barrier + WG2 arrive = 256)
-
       tile_scheduler.advance_to_next_work()
       work_tile = tile_scheduler.get_current_work()
 
@@ -1446,7 +1456,7 @@ class FFPAAttnBwdDKDVSm90SplitD:
         pipeline_A.consumer_release(consumer_state_A)
       consumer_state_A.advance()
 
-    # ═══ Phase 3  all d_inner iters sync; release immediately ═══
+    # ═══ Phase 3: dP = Σ dO_d @ V_d^T (num_d_inner WGMMA, real consume dO) ═══
     acc_dP = cute.make_rmem_tensor(
       tiled_mma_SdP.partition_shape_C(shape_mnk_SdP[:2]), Float32
     )
@@ -1478,12 +1488,12 @@ class FFPAAttnBwdDKDVSm90SplitD:
       barrier_id=int(NamedBarrierBwd.PFull),
       number_of_threads=self.num_mma_threads,  # 256
     )
-    # Step 14: read fp32 P from sP_fp32 — no precision loss.
+    # Read fp32 P from sP_fp32 — no fp32→bf16→fp32 precision loss.
     tdSrP_fp32 = copy_utils.load_s2r(
       tSsP_fp32_partition[None, None, None, p_stage]
     )
 
-    # dS = P * (dP - dpsum) * scale — acc_dP from sync WGMMAs above, P from LDS.
+    # dS = P * (dP - dPsum) * scale — acc_dP from sync WGMMAs above, P from LDS.
     tdSrP_mn = layout_utils.reshape_acc_to_mn(tdSrP_fp32, transpose=False)
     acc_dP_mn = layout_utils.reshape_acc_to_mn(acc_dP, transpose=False)
     for r in cutlass.range_constexpr(cute.size(acc_dP_mn, mode=[0])):
