@@ -965,6 +965,21 @@ def _parse_args() -> argparse.Namespace:
     default=None,
     help="Directory for generated device JSON.",
   )
+  parser.add_argument(
+    "--num-gpus",
+    type=int,
+    default=None,
+    help="Number of GPUs for parallel autotune via Ray. "
+    "In local mode, must not exceed CUDA_VISIBLE_DEVICES count. "
+    "In remote mode (--ray-address), requests GPUs from the cluster. "
+    "Omit for single-GPU mode (no Ray dependency).",
+  )
+  parser.add_argument(
+    "--ray-address",
+    type=str,
+    default=None,
+    help="Optional Ray cluster address. Uses local Ray when unset.",
+  )
   return _resolve_directional_cli_flags(parser.parse_args())
 
 
@@ -1024,59 +1039,76 @@ def main() -> int:
     args.full_tasks,
     full_variant_count,
   )
-  tune_start_time = time.perf_counter()
-  # Offline persistent tuning deliberately bypasses runtime seqlen bucketing so
-  # target grid points such as 2048 are tuned on their exact shapes instead of
-  # being intercepted by a coarser online autotune bucket.
-  with exact_autotune_seqlen_keys():
-    for index, task in enumerate(tasks, start=1):
-      try:
-        start_time = time.perf_counter()
-        if task.direction == "forward":
-          tuned_entries = _tune_forward(
-            task,
-            args.B,
-            args.mode,
-            entries,
-            enable_tma=args.enable_fwd_tma,
-            enable_ws=args.enable_fwd_ws,
-          )
-        else:
-          tuned_entries = _tune_backward(
-            task,
-            args.B,
-            args.mode,
-            entries,
-            enable_tma=args.enable_bwd_tma,
-            enable_ws=args.enable_bwd_ws,
-            enable_split_launch=args.enable_bwd_split_launch,
-          )
-        torch.cuda.synchronize()
-        elapsed = time.perf_counter() - start_time
-        total_elapsed = time.perf_counter() - tune_start_time
-        for tuned_entry, choices_count in tuned_entries:
+
+  if args.num_gpus is not None:
+    # Ray multi-GPU path
+    try:
+      import ray  # noqa: F401  early check for a friendly error message
+    except ImportError:
+      raise SystemExit(
+        "ray is required when --num-gpus is set. Install: pip install ray"
+      )
+
+    from .ray import run_ray_autotune
+
+    all_entries = run_ray_autotune(tasks, args)
+    for entry in all_entries:
+      _record_entry(entries, entry)
+  else:
+    # Single-GPU path
+    tune_start_time = time.perf_counter()
+    # Offline persistent tuning deliberately bypasses runtime seqlen bucketing
+    # so target grid points such as 2048 are tuned on their exact shapes
+    # instead of being intercepted by a coarser online autotune bucket.
+    with exact_autotune_seqlen_keys():
+      for index, task in enumerate(tasks, start=1):
+        try:
+          start_time = time.perf_counter()
+          if task.direction == "forward":
+            tuned_entries = _tune_forward(
+              task,
+              args.B,
+              args.mode,
+              entries,
+              enable_tma=args.enable_fwd_tma,
+              enable_ws=args.enable_fwd_ws,
+            )
+          else:
+            tuned_entries = _tune_backward(
+              task,
+              args.B,
+              args.mode,
+              entries,
+              enable_tma=args.enable_bwd_tma,
+              enable_ws=args.enable_bwd_ws,
+              enable_split_launch=args.enable_bwd_split_launch,
+            )
+          torch.cuda.synchronize()
+          elapsed = time.perf_counter() - start_time
+          total_elapsed = time.perf_counter() - tune_start_time
+          for tuned_entry, choices_count in tuned_entries:
+            logger.info(
+              "[AUTOTUNED][%d/%d] %s, t=%.3fs, T=%.3fs",
+              index,
+              len(tasks),
+              _format_entry(tuned_entry, choices_count, args.B),
+              elapsed,
+              total_elapsed,
+            )
+        except RuntimeError as exc:
+          if "out of memory" not in str(exc).lower():
+            raise
+          elapsed = time.perf_counter() - start_time
+          total_elapsed = time.perf_counter() - tune_start_time
           logger.info(
-            "[AUTOTUNED][%d/%d] %s, t=%.3fs, T=%.3fs",
+            "[AUTOTUNE-SKIPPED][%d/%d] OOM after t=%.3fs, T=%.3fs: %s",
             index,
             len(tasks),
-            _format_entry(tuned_entry, choices_count, args.B),
             elapsed,
             total_elapsed,
+            exc,
           )
-      except RuntimeError as exc:
-        if "out of memory" not in str(exc).lower():
-          raise
-        elapsed = time.perf_counter() - start_time
-        total_elapsed = time.perf_counter() - tune_start_time
-        logger.info(
-          "[AUTOTUNE-SKIPPED][%d/%d] OOM after t=%.3fs, T=%.3fs: %s",
-          index,
-          len(tasks),
-          elapsed,
-          total_elapsed,
-          exc,
-        )
-        torch.cuda.empty_cache()
+          torch.cuda.empty_cache()
 
   ordered_entries = sorted(
     entries.values(),

@@ -13,6 +13,7 @@ dependencies = [
     "packaging",
     "ninja",
     "numpy",
+    "ray", # autotuning
     "torch>=2.11.0",
     "quack-kernels>=0.4.1",
     "nvidia-cutlass-dsl>=4.5.1",
