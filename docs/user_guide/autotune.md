@@ -136,6 +136,72 @@ At runtime, FFPA can also load configs from a custom directory with <span style=
 FFPA_TUNED_CONFIG_DIR=/tmp/ffpa-config-smoke python your_script.py
 ```
 
+### Multi-GPU Parallel Autotune
+
+When multiple GPUs are available, you can distribute autotune tasks across
+them with <span style="color:#c77dff;">--num-gpus</span>. This uses [Ray](https://docs.ray.io/) actors to ensure each
+GPU runs exactly one autotune task at a time, avoiding resource contention:
+
+```bash
+CUDA_VISIBLE_DEVICES=4,5,6,7 \
+python -m ffpa_attn.autotune \
+  --mode max \
+  --directions both \
+  --dtypes bf16,fp16 \
+  --full-tasks \
+  --num-gpus 4 \
+  --overwrite
+```
+
+<span style="color:#c77dff;">--num-gpus</span> must not exceed the number of GPUs exposed by
+<span style="color:#c77dff;">CUDA_VISIBLE_DEVICES</span>. The generator validates this at startup and exits with
+a clear message when fewer GPUs are available than requested.
+
+The parallel path uses a pool of Ray actors (one per GPU) and a queue-based
+scheduler: each worker starts with one task, and as soon as a worker finishes
+its task, it immediately receives the next pending task. This keeps all GPUs
+busy while respecting the one-task-per-GPU constraint.
+
+Results from all workers are merged into the same device JSON. The output
+format, structure, and file path are identical to the single-GPU path. No
+intermediate files are written by the workers.
+
+<span style="color:#c77dff;">--num-gpus</span> defaults to <span style="color:#c77dff;">None</span>, which keeps the existing single-GPU
+serial tuning path. On machines where Ray is not installed, omitting
+<span style="color:#c77dff;">--num-gpus</span> avoids any Ray dependency. The Ray runtime is only imported
+when <span style="color:#c77dff;">--num-gpus</span> is explicitly set.
+
+#### Remote Ray Cluster
+
+You can also submit autotune tasks to a remote Ray cluster by setting
+<span style="color:#c77dff;">--ray-address</span>:
+
+```bash
+python -m ffpa_attn.autotune \
+  --mode max --full-tasks \
+  --num-gpus 8 \
+  --ray-address ray://my-cluster-head:6379 \
+  --overwrite
+```
+
+When <span style="color:#c77dff;">--ray-address</span> is used, <span style="color:#c77dff;">--num-gpus</span> requests that many GPUs
+from the cluster. The local <span style="color:#c77dff;">CUDA_VISIBLE_DEVICES</span> setting is ignored.
+
+#### Development Smoke Tests with Ray
+
+During development, combine <span style="color:#c77dff;">FFPA_AUTOTUNE_MAX_CONFIGS</span> with
+<span style="color:#c77dff;">--num-gpus</span> for fast smoke tests:
+
+```bash
+CUDA_VISIBLE_DEVICES=4,5,6,7 \
+FFPA_AUTOTUNE_MAX_CONFIGS=4 \
+python -m ffpa_attn.autotune \
+  --mode fast \
+  --num-gpus 4 \
+  --overwrite \
+  --output-dir /tmp/ffpa-config-smoke
+```
+
 ## Autotune Modes
 
 The generator supports the same mode names as the runtime Triton autotune path:
