@@ -5,6 +5,10 @@ existing ``_tune_forward`` / ``_tune_backward`` functions from
 :mod:`ffpa_attn.autotune`.  Imports are deferred to ``run_task`` to
 avoid circular import risks when the worker module is loaded by Ray.
 
+Each worker is assigned an isolated Triton cache directory via
+``TRITON_CACHE_DIR`` to prevent concurrent cache-file races when
+multiple workers compile the same kernel family on the same machine.
+
 Results are returned as entry dicts; the caller is responsible for
 merging and deduplication.
 
@@ -16,6 +20,8 @@ and returns entry dicts.
 
 from __future__ import annotations
 
+import os
+import tempfile
 from typing import TYPE_CHECKING
 
 import ray
@@ -32,13 +38,15 @@ class TritonAutotuneWorker:
     Ray isolates the actor to a single GPU via ``num_gpus=1``, so the
     actor only ever sees device index 0.
 
-    All backend-specific imports are deferred to :meth:`run_task` to
-    avoid circular imports when the worker module is loaded by Ray's
-    serialization machinery.
+    Each actor creates a private Triton cache directory so that
+    concurrent JIT compilations across workers do not race on
+    ``~/.triton/cache``.
     """
 
   def __init__(self) -> None:
     torch.cuda.set_device(0)
+    self._triton_cache = tempfile.mkdtemp(prefix="ffpa_triton_cache_")
+    os.environ["TRITON_CACHE_DIR"] = self._triton_cache
 
   def run_task(
     self,
@@ -93,8 +101,18 @@ class TritonAutotuneWorker:
           )
         torch.cuda.synchronize()
         return [entry for entry, _ in tuned]
-      except RuntimeError as exc:
-        if "out of memory" not in str(exc).lower():
-          raise
-        torch.cuda.empty_cache()
+      except Exception as exc:
+        if isinstance(exc,
+                      RuntimeError) and "out of memory" in str(exc).lower():
+          torch.cuda.empty_cache()
+          return []
+        import logging
+        logging.getLogger(__name__).warning(
+          "Task failed: %s D=%d Q=%dxK=%d: %s",
+          task.direction,
+          task.headdim,
+          task.seqlen_q,
+          task.seqlen_k,
+          exc,
+        )
         return []

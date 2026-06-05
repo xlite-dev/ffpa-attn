@@ -11,7 +11,7 @@ import time
 from typing import Any
 
 import ray
-from ray.exceptions import RayActorError
+from ray.exceptions import RayActorError, RayTaskError
 
 from ..logger import init_logger
 
@@ -99,11 +99,12 @@ def run_ray_autotune(tasks: list[Any], args: Any) -> list[dict[str, Any]]:
         try:
           entries = ray.get(future)
           all_entries.extend(entries)
-        except RayActorError:
+        except (RayActorError, RayTaskError) as exc:
           logger.warning(
-            "Worker %d crashed on task %s, skipping",
+            "Worker %d failed on task %s: %s",
             worker_idx,
             _task_desc(task),
+            exc,
           )
         elapsed = time.perf_counter() - submit_time
         done = total - len(pending) - (total - task_index)
