@@ -34,14 +34,14 @@ if TYPE_CHECKING:
 class TritonAutotuneWorker:
   """Ray actor that benchmarks Triton autotune configs on its assigned GPU.
 
-    Ray isolates the actor to a single GPU via ``num_gpus=1``, so the
-    actor only ever sees device index 0.
+  Ray isolates the actor to a single GPU via ``num_gpus=1``, so the
+  actor only ever sees device index 0.
 
-    Each actor creates a private Triton cache directory keyed by the
-    physical GPU's PCI bus ID, so concurrent JIT compilations never
-    race and the same physical GPU reuses its cache across autotune
-    sessions regardless of ``CUDA_VISIBLE_DEVICES`` ordering.
-    """
+  Each actor creates a private Triton cache directory keyed by the
+  physical GPU's PCI bus ID, so concurrent JIT compilations never
+  race and the same physical GPU reuses its cache across autotune
+  sessions regardless of ``CUDA_VISIBLE_DEVICES`` ordering.
+  """
 
   def __init__(self) -> None:
     torch.cuda.set_device(0)

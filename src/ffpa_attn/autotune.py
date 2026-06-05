@@ -1040,7 +1040,7 @@ def main() -> int:
     full_variant_count,
   )
 
-  if args.num_gpus is not None:
+  if args.num_gpus is not None and args.num_gpus > 1:
     # Ray multi-GPU path
     try:
       import ray  # noqa: F401  early check for a friendly error message

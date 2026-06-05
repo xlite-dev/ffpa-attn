@@ -22,9 +22,9 @@ logger = init_logger(__name__)
 def _task_desc(task: Any) -> str:
   """Return a compact human-readable label for a tuning task.
 
-    :param task: :class:`~ffpa_attn.autotune.TuneTask` instance.
-    :returns: Short description string for progress logs.
-    """
+  :param task: :class:`~ffpa_attn.autotune.TuneTask` instance.
+  :returns: Short description string for progress logs.
+  """
   return (
     f"{task.direction}:{task.case_name},"
     f"D{task.headdim},Q{task.seqlen_q}xK{task.seqlen_k}"
@@ -34,11 +34,11 @@ def _task_desc(task: Any) -> str:
 def _submit_task(worker: Any, task: Any, args: Any) -> ray.ObjectRef:
   """Submit one task to a worker and return the future.
 
-    :param worker: :class:`TritonAutotuneWorker` actor handle.
-    :param task: :class:`TuneTask` to run.
-    :param args: Parsed CLI namespace.
-    :returns: Ray ObjectRef for the pending task.
-    """
+  :param worker: :class:`TritonAutotuneWorker` actor handle.
+  :param task: :class:`TuneTask` to run.
+  :param args: Parsed CLI namespace.
+  :returns: Ray ObjectRef for the pending task.
+  """
   return worker.run_task.remote(
     task,
     args.B,
@@ -54,14 +54,15 @@ def _submit_task(worker: Any, task: Any, args: Any) -> ray.ObjectRef:
 def run_ray_autotune(tasks: list[Any], args: Any) -> list[dict[str, Any]]:
   """Run all *tasks* across *args.num_gpus* GPUs via Ray.
 
-    :param tasks: List of :class:`~ffpa_attn.autotune.TuneTask` objects.
-    :param args: Parsed CLI namespace.
-    :returns: Merged entry dicts ready for ``_record_entry``.
-    :raises SystemExit: If fewer GPUs are available than requested.
-    """
+  :param tasks: List of :class:`~ffpa_attn.autotune.TuneTask` objects.
+  :param args: Parsed CLI namespace.
+  :returns: Merged entry dicts ready for ``_record_entry``.
+  :raises SystemExit: If fewer GPUs are available than requested.
+  """
   if not tasks:
     return []
 
+  t_start = time.perf_counter()
   os.environ.setdefault("RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO", "0")
   ray.init(
     address=args.ray_address, ignore_reinit_error=True, include_dashboard=False
@@ -129,6 +130,13 @@ def run_ray_autotune(tasks: list[Any], args: Any) -> list[dict[str, Any]]:
           )
           task_index += 1
 
+    total_elapsed = time.perf_counter() - t_start
+    logger.info(
+      "[AUTOTUNED] all %d tasks done in %.1fs (%.1fs/task)",
+      total,
+      total_elapsed,
+      total_elapsed / total,
+    )
     return all_entries
   finally:
     ray.shutdown()
