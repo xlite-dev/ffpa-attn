@@ -661,7 +661,7 @@ def _tune_backward(
 
   run_backward_tune(False, False)
 
-  pre_wrapper = _get_pre_autotune(False, mode, dtype)
+  pre_wrapper = _get_pre_autotune(False, task.headdim, mode, dtype)
   pre_entry = _entry_base(
     task,
     mode,
@@ -1040,7 +1040,7 @@ def main() -> int:
     full_variant_count,
   )
 
-  if args.num_gpus is not None:
+  if args.num_gpus is not None and args.num_gpus > 1:
     # Ray multi-GPU path
     try:
       import ray  # noqa: F401  early check for a friendly error message

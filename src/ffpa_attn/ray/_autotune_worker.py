@@ -34,17 +34,20 @@ if TYPE_CHECKING:
 class TritonAutotuneWorker:
   """Ray actor that benchmarks Triton autotune configs on its assigned GPU.
 
-    Ray isolates the actor to a single GPU via ``num_gpus=1``, so the
-    actor only ever sees device index 0.
+  Ray isolates the actor to a single GPU via ``num_gpus=1``, so the
+  actor only ever sees device index 0.
 
-    Each actor creates a per-worker Triton cache directory so concurrent
-    JIT compilations never race.  The directory is keyed by a simple
-    worker index (0..N-1) and persists across runs so kernels are reused.
-    """
+  Each actor creates a private Triton cache directory keyed by the
+  physical GPU's PCI bus ID, so concurrent JIT compilations never
+  race and the same physical GPU reuses its cache across autotune
+  sessions regardless of ``CUDA_VISIBLE_DEVICES`` ordering.
+  """
 
-  def __init__(self, worker_index: int) -> None:
+  def __init__(self) -> None:
     torch.cuda.set_device(0)
-    self._triton_cache = f"/tmp/ffpa_triton_cache/gpu_{worker_index}"
+    bus_id = str(torch.cuda.get_device_properties(0).pci_bus_id)
+    safe_id = bus_id.replace(":", "_").replace(".", "_")
+    self._triton_cache = f"/tmp/ffpa_triton_cache/gpu_bus_id_{safe_id}"
     os.makedirs(self._triton_cache, exist_ok=True)
     os.environ["TRITON_CACHE_DIR"] = self._triton_cache
 
@@ -61,20 +64,20 @@ class TritonAutotuneWorker:
   ) -> list[dict]:
     """Run one Triton autotune task and return the resulting entry dicts.
 
-        Imports are deferred to this method to break potential circular
-        dependencies between :mod:`ffpa_attn.ray` and
-        :mod:`ffpa_attn.autotune`.
+    Imports are deferred to this method to break potential circular
+    dependencies between :mod:`ffpa_attn.ray` and
+    :mod:`ffpa_attn.autotune`.
 
-        :param task: Shape / dtype / direction descriptor.
-        :param batch: Batch size for tuning.
-        :param mode: Triton autotune search-space mode (``"fast"`` or ``"max"``).
-        :param enable_fwd_tma: Enable SM90 TMA forward path.
-        :param enable_fwd_ws: Force warp-specialized forward configs.
-        :param enable_bwd_tma: Enable SM90 TMA backward path.
-        :param enable_bwd_ws: Force warp-specialized backward configs.
-        :param enable_bwd_split_launch: Also tune split-launch dK/dV + dQ.
-        :returns: List of entry dicts, or an empty list on OOM.
-        """
+    :param task: Shape / dtype / direction descriptor.
+    :param batch: Batch size for tuning.
+    :param mode: Triton autotune search-space mode (``"fast"`` or ``"max"``).
+    :param enable_fwd_tma: Enable SM90 TMA forward path.
+    :param enable_fwd_ws: Force warp-specialized forward configs.
+    :param enable_bwd_tma: Enable SM90 TMA backward path.
+    :param enable_bwd_ws: Force warp-specialized backward configs.
+    :param enable_bwd_split_launch: Also tune split-launch dK/dV + dQ.
+    :returns: List of entry dicts, or an empty list on OOM.
+    """
     from ..autotune import _tune_backward, _tune_forward
     from ..triton._autotune_utils import exact_autotune_seqlen_keys
 
