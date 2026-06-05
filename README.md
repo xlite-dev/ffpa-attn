@@ -108,7 +108,7 @@ Generate device-specific tuned configs for production deployment (currently, [`T
 ```bash
 python -m ffpa_attn.autotune --mode max --full-tasks --overwrite # Single GPU
 
-export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 # Multi-GPU (requires `pip install ray`)
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 # Multi-GPU (requires `ray`)
 python -m ffpa_attn.autotune --mode max --full-tasks --num-gpus 8 --overwrite
 ```
 
