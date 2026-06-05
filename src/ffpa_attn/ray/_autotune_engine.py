@@ -7,6 +7,7 @@ collects the merged results.
 
 from __future__ import annotations
 
+import os
 import time
 from typing import Any
 
@@ -61,7 +62,10 @@ def run_ray_autotune(tasks: list[Any], args: Any) -> list[dict[str, Any]]:
   if not tasks:
     return []
 
-  ray.init(address=args.ray_address, ignore_reinit_error=True)
+  os.environ.setdefault("RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO", "0")
+  ray.init(
+    address=args.ray_address, ignore_reinit_error=True, include_dashboard=False
+  )
   try:
     gpu_count = int(ray.cluster_resources().get("GPU", 0))
     if gpu_count < args.num_gpus:
