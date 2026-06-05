@@ -45,9 +45,9 @@ class TritonAutotuneWorker:
 
   def __init__(self) -> None:
     torch.cuda.set_device(0)
-    bus_id = torch.cuda.get_device_properties(0).pci_bus_id
+    bus_id = str(torch.cuda.get_device_properties(0).pci_bus_id)
     safe_id = bus_id.replace(":", "_").replace(".", "_")
-    self._triton_cache = f"/tmp/ffpa_triton_cache/gpu_{safe_id}"
+    self._triton_cache = f"/tmp/ffpa_triton_cache/gpu_bus_id_{safe_id}"
     os.makedirs(self._triton_cache, exist_ok=True)
     os.environ["TRITON_CACHE_DIR"] = self._triton_cache
 
@@ -64,20 +64,20 @@ class TritonAutotuneWorker:
   ) -> list[dict]:
     """Run one Triton autotune task and return the resulting entry dicts.
 
-        Imports are deferred to this method to break potential circular
-        dependencies between :mod:`ffpa_attn.ray` and
-        :mod:`ffpa_attn.autotune`.
+    Imports are deferred to this method to break potential circular
+    dependencies between :mod:`ffpa_attn.ray` and
+    :mod:`ffpa_attn.autotune`.
 
-        :param task: Shape / dtype / direction descriptor.
-        :param batch: Batch size for tuning.
-        :param mode: Triton autotune search-space mode (``"fast"`` or ``"max"``).
-        :param enable_fwd_tma: Enable SM90 TMA forward path.
-        :param enable_fwd_ws: Force warp-specialized forward configs.
-        :param enable_bwd_tma: Enable SM90 TMA backward path.
-        :param enable_bwd_ws: Force warp-specialized backward configs.
-        :param enable_bwd_split_launch: Also tune split-launch dK/dV + dQ.
-        :returns: List of entry dicts, or an empty list on OOM.
-        """
+    :param task: Shape / dtype / direction descriptor.
+    :param batch: Batch size for tuning.
+    :param mode: Triton autotune search-space mode (``"fast"`` or ``"max"``).
+    :param enable_fwd_tma: Enable SM90 TMA forward path.
+    :param enable_fwd_ws: Force warp-specialized forward configs.
+    :param enable_bwd_tma: Enable SM90 TMA backward path.
+    :param enable_bwd_ws: Force warp-specialized backward configs.
+    :param enable_bwd_split_launch: Also tune split-launch dK/dV + dQ.
+    :returns: List of entry dicts, or an empty list on OOM.
+    """
     from ..autotune import _tune_backward, _tune_forward
     from ..triton._autotune_utils import exact_autotune_seqlen_keys
 

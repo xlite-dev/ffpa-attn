@@ -26,7 +26,7 @@ def _task_desc(task: Any) -> str:
     :returns: Short description string for progress logs.
     """
   return (
-    f"{task.direction[:3]}:{task.case_name},"
+    f"{task.direction}:{task.case_name},"
     f"D{task.headdim},Q{task.seqlen_q}xK{task.seqlen_k}"
   )
 
