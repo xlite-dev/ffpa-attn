@@ -21,7 +21,6 @@ and returns entry dicts.
 from __future__ import annotations
 
 import os
-import tempfile
 from typing import TYPE_CHECKING
 
 import ray
@@ -38,14 +37,15 @@ class TritonAutotuneWorker:
     Ray isolates the actor to a single GPU via ``num_gpus=1``, so the
     actor only ever sees device index 0.
 
-    Each actor creates a private Triton cache directory so that
-    concurrent JIT compilations across workers do not race on
-    ``~/.triton/cache``.
+    Each actor creates a per-worker Triton cache directory so concurrent
+    JIT compilations never race.  The directory is keyed by a simple
+    worker index (0..N-1) and persists across runs so kernels are reused.
     """
 
-  def __init__(self) -> None:
+  def __init__(self, worker_index: int) -> None:
     torch.cuda.set_device(0)
-    self._triton_cache = tempfile.mkdtemp(prefix="ffpa_triton_cache_")
+    self._triton_cache = f"/tmp/ffpa_triton_cache/gpu_{worker_index}"
+    os.makedirs(self._triton_cache, exist_ok=True)
     os.environ["TRITON_CACHE_DIR"] = self._triton_cache
 
   def run_task(
