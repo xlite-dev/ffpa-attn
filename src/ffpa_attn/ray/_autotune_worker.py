@@ -37,14 +37,17 @@ class TritonAutotuneWorker:
     Ray isolates the actor to a single GPU via ``num_gpus=1``, so the
     actor only ever sees device index 0.
 
-    Each actor creates a per-worker Triton cache directory so concurrent
-    JIT compilations never race.  The directory is keyed by a simple
-    worker index (0..N-1) and persists across runs so kernels are reused.
+    Each actor creates a private Triton cache directory keyed by the
+    physical GPU's PCI bus ID, so concurrent JIT compilations never
+    race and the same physical GPU reuses its cache across autotune
+    sessions regardless of ``CUDA_VISIBLE_DEVICES`` ordering.
     """
 
-  def __init__(self, worker_index: int) -> None:
+  def __init__(self) -> None:
     torch.cuda.set_device(0)
-    self._triton_cache = f"/tmp/ffpa_triton_cache/gpu_{worker_index}"
+    bus_id = torch.cuda.get_device_properties(0).pci_bus_id
+    safe_id = bus_id.replace(":", "_").replace(".", "_")
+    self._triton_cache = f"/tmp/ffpa_triton_cache/gpu_{safe_id}"
     os.makedirs(self._triton_cache, exist_ok=True)
     os.environ["TRITON_CACHE_DIR"] = self._triton_cache
 
