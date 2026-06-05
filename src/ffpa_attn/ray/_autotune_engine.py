@@ -77,8 +77,8 @@ def run_ray_autotune(tasks: list[Any], args: Any) -> list[dict[str, Any]]:
     from ._autotune_worker import TritonAutotuneWorker
 
     workers = [
-      TritonAutotuneWorker.options(num_gpus=1).remote()
-      for _ in range(args.num_gpus)
+      TritonAutotuneWorker.options(num_gpus=1).remote(i)
+      for i in range(args.num_gpus)
     ]
 
     all_entries: list[dict[str, Any]] = []
