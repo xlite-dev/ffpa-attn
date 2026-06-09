@@ -1,7 +1,7 @@
 <div align="center">
   <p align="center">
     <h2>🤖FFPA: Yet another Faster Flash Prefill Attention <br>with O(1)⚡️GPU SRAM complexity for large headdim🐑</h2>
-    <img src=https://img.shields.io/badge/language-CUDA/Python-brightgreen.svg >
+    <a href="docs/assets/papers/ffpa-tech-report-v1.pdf"><img src=https://img.shields.io/badge/paper-available-hotpink.svg ></a>
     <a href="https://pepy.tech/projects/ffpa-attn"><img src=https://static.pepy.tech/personalized-badge/ffpa-attn?period=total&units=ABBREVIATION&left_color=GRAY&right_color=BLUE&left_text=downloads/pypi ></a>
     <a href="https://pypi.org/project/ffpa-attn/"><img src=https://img.shields.io/github/release/xlite-dev/ffpa-attn.svg?color=GREEN ></a>
     <img src=https://img.shields.io/github/stars/xlite-dev/ffpa-attn.svg?style=dark >
@@ -17,6 +17,14 @@
 |:---:|:---:|:---:|:---:|:---:|:---:|:---:|
 |✔️(`Nq=Nkv`)|✔️(`Hq!=Hkv`)|✔️(`Nq!=Nkv`)|✔️(`attn_mask`)|✔️(`p>0`)|**320~1024** |**1.5~3x↑** |
 
+</div>
+
+## 🎉🎉 Latest News
+
+- [2026-06-10] FFPA Technical Report is available. The PDF can be found at [FFPA: Efficient Flash Prefill Attention for Large Head Dimensions via Split-D](docs/assets/papers/ffpa-tech-report-v1.pdf).
+
+<div align='center'>
+  <img src="docs/assets/papers/attention-variants.png" width="600px">
 </div>
 
 ## 📖 Quick Start

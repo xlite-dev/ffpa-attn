@@ -29,3 +29,4 @@ build*
 *.txt
 site
 .plans
+docs/paper
