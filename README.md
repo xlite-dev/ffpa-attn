@@ -1,10 +1,9 @@
 <div align="center">
   <p align="center">
     <h2>🤖FFPA: Yet another Faster Flash Prefill Attention <br>with O(1)⚡️GPU SRAM complexity for large headdim🐑</h2>
-    <a href="docs/assets/papers/ffpa-tech-report-v1.pdf"><img src=https://img.shields.io/badge/paper-available-hotpink.svg ></a>
+    <a href=https://doi.org/10.5281/zenodo.20623364><img src=https://zenodo.org/badge/DOI/10.5281/zenodo.20623364.svg ></a>
     <a href="https://pepy.tech/projects/ffpa-attn"><img src=https://static.pepy.tech/personalized-badge/ffpa-attn?period=total&units=ABBREVIATION&left_color=GRAY&right_color=BLUE&left_text=downloads/pypi ></a>
     <a href="https://pypi.org/project/ffpa-attn/"><img src=https://img.shields.io/github/release/xlite-dev/ffpa-attn.svg?color=GREEN ></a>
-    <img src=https://img.shields.io/github/stars/xlite-dev/ffpa-attn.svg?style=dark >
     <img src="https://img.shields.io/github/license/xlite-dev/ffpa-attn.svg?color=blue"><br>
     <img src="docs/assets/ffpa-api.png" width="700px">
 </div>
@@ -21,7 +20,8 @@
 
 ## 🎉🎉 Latest News
 
-- [2026-06-10] FFPA Technical Report is available. The PDF can be found at [FFPA: Efficient Flash Prefill Attention for Large Head Dimensions via Split-D](docs/assets/papers/ffpa-tech-report-v1.pdf).
+- [2026-06-10] DefTruth, Butterfingrz. FFPA: Efficient Flash Prefill Attention for Large Head Dimensions via Split-D. Zenodo, 2026. [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.20623364.svg)](https://doi.org/10.5281/zenodo.20623364)
+
 
 <div align='center'>
   <img src="docs/assets/papers/attention-variants.png" width="600px">
@@ -136,16 +136,19 @@ Apache License 2.0
 ## ©️Citations
 
 ```BibTeX
-@misc{ffpa-attn@2025,
-  title={FFPA: Yet another Faster Flash Prefill Attention for large headdim.},
-  url={https://github.com/xlite-dev/ffpa-attn.git},
-  note={Open-source software available at https://github.com/xlite-dev/ffpa-attn.git},
-  author={DefTruth, Butterfingrz},
-  year={2025}
+@misc{deftruth2026ffpa,
+  author       = {DefTruth and Butterfingrz},
+  title        = {FFPA: Efficient Flash Prefill Attention for Large Head Dimensions via Split-D},
+  year         = {2026},
+  publisher    = {Zenodo},
+  version      = {v1.0},
+  doi          = {10.5281/zenodo.20623364},
+  url          = {https://doi.org/10.5281/zenodo.20623364}
 }
 ```
 
 ## 📖 References
+
 <div id="ref"></div>
 
 - [flash-attention](https://github.com/Dao-AILab/flash-attention)
