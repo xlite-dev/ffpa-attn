@@ -20,7 +20,7 @@
 
 ## 🎉🎉 Latest News
 
-- [2026-06-10] DefTruth, Butterfingrz. FFPA: Efficient Flash Prefill Attention for Large Head Dimensions via Split-D. Zenodo, 2026. [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.20623364.svg)](https://doi.org/10.5281/zenodo.20623364)
+- [2026-06-10] DefTruth, Butterfingrz. [FFPA: Efficient Flash Prefill Attention for Large Head Dimensions via Split-D.](docs/assets/papers/ffpa-tech-report-v1.pdf) Zenodo, 2026. [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.20623364.svg)](https://doi.org/10.5281/zenodo.20623364)
 
 
 <div align='center'>
