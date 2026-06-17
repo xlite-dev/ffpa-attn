@@ -93,6 +93,9 @@ FFPA supports multiple backends for the forward and backward pass, including: [`
 
 </div>
 
+> [!NOTE]
+> 🔴 **AMD ROCm/HIP support**: the `Triton` backend (forward + backward) also runs on AMD GPUs through Triton's AMD backend, so no extra build flags are needed -- install ffpa-attn into a ROCm build of PyTorch and `ffpa_attn_func` will dispatch to Triton automatically (`pip3 install -e . --no-build-isolation`). The `CUDA` and `CuTeDSL` backends are NVIDIA-only (they rely on NVIDIA PTX such as MMA, ldmatrix and TMA) and are simply unavailable on AMD. Validated on AMD Instinct MI250X (`gfx90a`, Linux) and Radeon RX 9070 XT (`gfx1201`, Windows).
+
 How to use different backends for your own scenario? Users can simply pass the Backend configs (SDPABackend, CUDABackend, TritonBackend or CuTeDSLBackend) to [ffpa_attn_func](https://ffpa-attn.readthedocs.io/en/latest/api/ffpa_attn/), for example:
 
 ```python

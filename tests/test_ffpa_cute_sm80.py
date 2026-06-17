@@ -7,12 +7,19 @@ import torch
 import torch.nn.functional as F
 
 from ffpa_attn import ffpa_attn_func, ffpa_attn_varlen_func
-from ffpa_attn.cute import _ffpa_attn_forward_cute, _ffpa_attn_varlen_impl
+try:
+  from ffpa_attn.cute import _ffpa_attn_forward_cute, _ffpa_attn_varlen_impl
+except Exception:
+  _ffpa_attn_forward_cute = None
+  _ffpa_attn_varlen_impl = None
 from ffpa_attn.functional import CuTeDSLBackend
 
 
 def _cute_large_d_available() -> bool:
   if not torch.cuda.is_available():
+    return False
+  # CuTeDSL is NVIDIA-only; skip on AMD/ROCm
+  if hasattr(torch.version, 'hip') and torch.version.hip is not None:
     return False
   major, _ = torch.cuda.get_device_capability()
   return major >= 8

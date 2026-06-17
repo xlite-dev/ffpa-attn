@@ -24,11 +24,16 @@ from .aten import (
   _flash_attn_backward_aten,
   _efficient_attn_backward_aten,
 )  # D <= 256
-from .cute import (
-  _ffpa_attn_forward_cute,
-  _ffpa_attn_backward_cute,
-  _ffpa_attn_varlen_cute,
-)  # Large-D by default; small-D when FFPA_CUTE_ALLOW_SMALL_D=1.
+try:
+  from .cute import (
+    _ffpa_attn_forward_cute,
+    _ffpa_attn_backward_cute,
+    _ffpa_attn_varlen_cute,
+  )  # Large-D by default; small-D when FFPA_CUTE_ALLOW_SMALL_D=1.
+except Exception:
+  _ffpa_attn_forward_cute = None
+  _ffpa_attn_backward_cute = None
+  _ffpa_attn_varlen_cute = None
 
 try:
   from .cuda import _ffpa_attn_forward_cuda  # D > 256

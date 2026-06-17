@@ -21,6 +21,9 @@ from ffpa_attn.functional import CuTeDSLBackend
 def _cutedsl_available() -> bool:
   if not torch.cuda.is_available():
     return False
+  # CuTeDSL is NVIDIA-only; skip on AMD/ROCm
+  if hasattr(torch.version, 'hip') and torch.version.hip is not None:
+    return False
   major, _ = torch.cuda.get_device_capability()
   return major >= 8
 

@@ -8,7 +8,6 @@ import pytest
 import torch
 
 from ffpa_attn import ffpa_attn_func
-import ffpa_attn.functional as ffpa_attn_functional
 
 # Parametrized tests produce many shape/dtype/backend variants; allow
 # enough recompilations to avoid hitting the default limit of 8.
@@ -43,7 +42,8 @@ DTYPES = [torch.float16, torch.bfloat16]
 
 
 def _require_cuda_forward_impl() -> None:
-  if ffpa_attn_functional._ffpa_attn_forward_cuda is None:
+  from ffpa_attn.cuda import CUDA_FWD_AVAILABLE
+  if not CUDA_FWD_AVAILABLE:
     pytest.skip("CUDA forward backend was not compiled")
 
 
