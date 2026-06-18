@@ -22,6 +22,9 @@ import torch.nn.functional as F
 
 from ffpa_attn import ffpa_attn_func
 
+# ROCm detection: dropout mask RNG differs between Triton-AMD and native SDPA
+IS_ROCM = hasattr(torch.version, 'hip') and torch.version.hip is not None
+
 
 def _native_sdpa(*args, **kwargs):
   return torch._C._nn.scaled_dot_product_attention(*args, **kwargs)
@@ -98,6 +101,8 @@ def test_monkey_patched_sdpa_small_d_fallback_matches_native(
 def test_monkey_patched_sdpa_large_d_ffpa_paths_match_native(
   dtype, case, monkeypatch
 ):
+  if IS_ROCM and case == "dropout":
+    pytest.skip("Dropout mask RNG differs between Triton-AMD and native SDPA")
   if case == "cross":
     q, k, v = _alloc_cross_qkv(dtype, nq=512, nkv=1024)
   else:

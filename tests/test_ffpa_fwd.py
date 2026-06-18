@@ -18,6 +18,9 @@ import ffpa_attn.functional as ffpa_attn_functional  # noqa: E402
 from ffpa_attn.functional import TritonBackend  # noqa: E402
 from ffpa_attn.triton._ffpa_fwd import _ffpa_attn_forward_decode_impl  # noqa: E402
 
+# ROCm/AMD detection: dropout mask RNG differs between Triton-AMD and PyTorch SDPA
+IS_ROCM = hasattr(torch.version, 'hip') and torch.version.hip is not None
+
 SEQLENS = [1024, 4096, 8192]
 HEADDIMS = [64, 128, 320, 512, 640]
 HEADNUMS = [8, 16, 32, 48]
@@ -119,7 +122,8 @@ def _alloc_qkv(B, H, N, D, dtype):
 
 
 def _require_cuda_forward_impl() -> None:
-  if ffpa_attn_functional._ffpa_attn_forward_cuda is None:
+  from ffpa_attn.cuda import CUDA_FWD_AVAILABLE
+  if not CUDA_FWD_AVAILABLE:
     pytest.skip("CUDA forward backend was not compiled")
 
 
@@ -332,6 +336,10 @@ def test_ffpa_attn_func_cuda_attn_mask_cross_gqa_matches_sdpa():
   torch.testing.assert_close(out, ref, **_tolerance(dtype))
 
 
+@pytest.mark.skipif(
+  IS_ROCM,
+  reason="Dropout mask RNG differs between Triton-AMD and PyTorch SDPA"
+)
 def test_ffpa_attn_func_triton_dropout_matches_sdpa():
   q, k, v = _alloc_qkv(1, 2, 512, 512, torch.float16)
 
@@ -406,6 +414,10 @@ def test_ffpa_attn_func_cuda_decode_dropout_matches_sdpa():
   torch.testing.assert_close(out, ref, atol=4e-2, rtol=4e-2)
 
 
+@pytest.mark.skipif(
+  IS_ROCM,
+  reason="Dropout mask RNG differs between Triton-AMD and PyTorch SDPA"
+)
 @pytest.mark.parametrize("dtype", DTYPES, ids=["fp16", "bf16"])
 @pytest.mark.parametrize(
   "Nq,Nkv,D,causal",
@@ -689,6 +701,7 @@ def test_ffpa_attn_func_routes_directional_tma_ws_flags(monkeypatch):
     attn_bias,
     return_attn_bias_grad,
     grad_kv_storage_dtype,
+    grad_q_storage_dtype=None,
     dropout_p=0.0,
     philox_seed=0,
     philox_offset=0,
@@ -698,7 +711,8 @@ def test_ffpa_attn_func_routes_directional_tma_ws_flags(monkeypatch):
     enable_split_launch=False,
   ):
     del grad_out, o, lse, causal, softmax_scale, autotune, autotune_mode, preprocess_d_chunk
-    del attn_bias, return_attn_bias_grad, grad_kv_storage_dtype, dropout_p, philox_seed, philox_offset, enable_persist_dkdv, enable_split_launch
+    del attn_bias, return_attn_bias_grad, grad_kv_storage_dtype, grad_q_storage_dtype
+    del dropout_p, philox_seed, philox_offset, enable_persist_dkdv, enable_split_launch
     seen_backward.append((enable_tma, enable_ws))
     return torch.zeros_like(q), torch.zeros_like(k), torch.zeros_like(v), None
 
