@@ -179,9 +179,7 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
     }
   }
 
-  // --------------------- Registers/SMEM for thread block
-  // ------------------------- block m_old, l_old, store in lane, use float to
-  // keep precision.
+  // Registers/SMEM for thread block: m|l_old, store in lane.
   float lane_block_row_max_old[kValTileSeqLenQ][2];  // [1][2]
   float lane_block_row_sum_old[kValTileSeqLenQ][2];  // [1][2]
   ffpa::utils::fill_2D_regs<float, kValTileSeqLenQ, 2>(lane_block_row_max_old,
@@ -189,8 +187,7 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
   ffpa::utils::fill_2D_regs<float, kValTileSeqLenQ, 2>(lane_block_row_sum_old,
                                                        0.0f);
 
-  // ---------------------- Registers for S=Q@K^T/O=P@V
-  // ---------------------------- e.g, 64, !kPersistQs2r -> [1][4] 4 regs,
+  // Registers for S=Q@K^T/O=P@V, e.g, 64, !kPersistQs2r -> [1][4] 4 regs,
   // kPersistQs2r -> [1][4*4] 16 regs.
   uint32_t R_Q[kValTileSeqLenQ][(kPersistQs2r) ? (kHeadDim / kMmaAtomK) : 1][4];
   // R_K [8][2] w/o registers ping pong buffers, [2][2] w/ registers ping pong
@@ -911,7 +908,7 @@ __global__ void __launch_bounds__(((kHeadDim / 8 + WARP_SIZE - 1) / WARP_SIZE) *
   }
 
   for (int global_k = split_start; global_k < split_end; ++global_k) {
-    // ---- Pipeline stage 1: issue V async (overlaps with QK dot product) ----
+    // Pipeline stage 1: issue V async (overlaps with QK dot product)
     if (global_k > split_start) {
       for (int i = tid; i < kNumVecRow; i += kNumThreads) {
         uint32_t v_smem = __cvta_generic_to_shared(&V_tile[i * kVecRow]);
@@ -927,7 +924,7 @@ __global__ void __launch_bounds__(((kHeadDim / 8 + WARP_SIZE - 1) / WARP_SIZE) *
       score_partial[row] = 0.0f;
     }
 
-    // ---- QK dot product (128-bit smem loads) ----
+    // QK dot product (128-bit smem loads)
     for (int row = 0; row < active_rows; ++row) {
       float qk = 0.0f;
       if (tid < kNumActiveThreads) {
@@ -940,6 +937,8 @@ __global__ void __launch_bounds__(((kHeadDim / 8 + WARP_SIZE - 1) / WARP_SIZE) *
                                         &K[kv_base + global_k * kHeadDim + d]);
           const kDataType* qh = reinterpret_cast<const kDataType*>(&qv);
           const kDataType* kh = reinterpret_cast<const kDataType*>(&kv_g);
+          // TODO: Warp reduction here instead of register reduction for better
+          // ILP.
 #pragma unroll
           for (int v = 0; v < kElemsPerThread; ++v) {
             qk += Traits::to_float(qh[v]) * Traits::to_float(kh[v]);
@@ -960,8 +959,7 @@ __global__ void __launch_bounds__(((kHeadDim / 8 + WARP_SIZE - 1) / WARP_SIZE) *
         score_partial[row] = qk;
       }
 
-      // ---- Pipeline stage 2: issue K async (overlaps with reduce + softmax)
-      // ----
+      // Pipeline stage 2: issue K async (overlaps with reduce + softmax)
       if constexpr (kStage > 1) {
         const int prefetch_k = global_k + kStage - 1;
         if (prefetch_k < split_end) {
@@ -1384,9 +1382,7 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
   }
   ffpa::cp_async::commit_group();
 
-  // --------------------- Registers/SMEM for thread block
-  // ------------------------- block m_old, l_old, store in lane, use float to
-  // keep precision.
+  // Registers/SMEM for thread block m|l_old, store in lane.
   float lane_block_row_max_old[kValTileSeqLenQ][2];  // [1][2]
   float lane_block_row_sum_old[kValTileSeqLenQ][2];  // [1][2]
   ffpa::utils::fill_2D_regs<float, kValTileSeqLenQ, 2>(lane_block_row_max_old,
@@ -1394,8 +1390,7 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
   ffpa::utils::fill_2D_regs<float, kValTileSeqLenQ, 2>(lane_block_row_sum_old,
                                                        0.0f);
 
-  // ---------------------- Registers for S=Q@K^T/O=P@V
-  // ---------------------------- e.g, 64, !kPersistQs2r -> [1][4] 4 regs,
+  // Registers for S=Q@K^T/O=P@V, e.g, 64, !kPersistQs2r -> [1][4] 4 regs,
   // kPersistQs2r -> [1][4][4] 16 regs.
   uint32_t R_Q[kValTileSeqLenQ][(kPersistQs2r) ? (kHeadDim / kMmaAtomK) : 1][4];
   // R_K [8][2] w/o registers ping pong buffers, [2][2] w/ registers ping pong
