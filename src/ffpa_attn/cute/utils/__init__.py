@@ -210,9 +210,19 @@ def make_tiled_copy_B(
     return cute.make_tiled_copy_B(copy_atom, tiled_mma)
 
 
+# ``ThrMma`` was relocated from ``cute.core`` (cutlass-dsl 4.5.x) to
+# the ``cute`` top level in 4.6. ``cute.ThrMma`` exists on both 4.5.2 and
+# 4.6.0.dev0, but resolve it defensively so the annotations below also
+# hold on any build that exposes only one of the two names (mirrors the
+# signature-based detection used for ``nvvm.fmax`` / ``nvvm.atomicrmw``
+# below). Evaluated at import because the annotations are evaluated at
+# function-definition time (no PEP 563 here).
+_ThrMma = getattr(cute, "ThrMma", None) or cute.core.ThrMma
+
+
 def mma_make_fragment_A(
   smem: cute.Tensor,
-  thr_mma: cute.core.ThrMma,
+  thr_mma: _ThrMma,
   swapAB: cutlass.Constexpr[bool] = False
 ) -> cute.Tensor:
   if const_expr(swapAB):
@@ -223,7 +233,7 @@ def mma_make_fragment_A(
 
 def mma_make_fragment_B(
   smem: cute.Tensor,
-  thr_mma: cute.core.ThrMma,
+  thr_mma: _ThrMma,
   swapAB: cutlass.Constexpr[bool] = False
 ) -> cute.Tensor:
   if const_expr(swapAB):
@@ -281,14 +291,20 @@ def warp_reduce(
 # ---------------------------------------------------------------------------
 # fmax / fmax_reduce / fadd_reduce  (SM90-only: arch < 100 paths only)
 # ---------------------------------------------------------------------------
+# ``nvvm.fmax`` dropped its leading result-type positional argument in
+# cutlass-dsl 4.6 (4.5.x: ``fmax(res, a, b, ...)``; 4.6.x: ``fmax(a, b, *,
+# results=...)``). The convention tracks the cutlass version, not the CUDA
+# version (both 4.5.2 and 4.6.0.dev0 report CUDA 12.9 here), so detect it by
+# inspecting the binding's signature instead of branching on ``CUDA_VERSION``.
+_NVVM_FMAX_TAKES_RESULT_TYPE = "res" in inspect.signature(nvvm.fmax).parameters
+
+
 @dsl_user_op
 def fmax(
   a: float | Float32, b: float | Float32, *, loc=None, ip=None
 ) -> Float32:
   """2-input fmax for SM90. The 3-input (c) variant is SM100+ only and removed."""
-  from cutlass import CUDA_VERSION
-
-  if CUDA_VERSION.major == 12 and CUDA_VERSION.minor == 9:
+  if _NVVM_FMAX_TAKES_RESULT_TYPE:
     return Float32(
       nvvm.fmax(
         T.f32(),
@@ -346,16 +362,30 @@ def fadd_reduce(
 # ---------------------------------------------------------------------------
 # Atomic add  (used by flash_bwd.py for dQ accumulation)
 # ---------------------------------------------------------------------------
+# ``nvvm.atomicrmw`` likewise dropped its leading ``res`` result-type argument
+# in cutlass-dsl 4.6 (see ``_NVVM_FMAX_TAKES_RESULT_TYPE`` above for rationale).
+_NVVM_ATOMICRMW_TAKES_RESULT_TYPE = (
+  "res" in inspect.signature(nvvm.atomicrmw).parameters
+)
+
+
 @dsl_user_op
 def atomic_add_fp32(
   a: float | Float32, gmem_ptr: cute.Pointer, *, loc=None, ip=None
 ) -> None:
-  nvvm.atomicrmw(
-    res=T.f32(),
-    op=nvvm.AtomicOpKind.FADD,
-    ptr=gmem_ptr.llvm_ptr,
-    a=Float32(a).ir_value()
-  )
+  if _NVVM_ATOMICRMW_TAKES_RESULT_TYPE:
+    nvvm.atomicrmw(
+      res=T.f32(),
+      op=nvvm.AtomicOpKind.FADD,
+      ptr=gmem_ptr.llvm_ptr,
+      a=Float32(a).ir_value(),
+    )
+  else:
+    nvvm.atomicrmw(
+      op=nvvm.AtomicOpKind.FADD,
+      ptr=gmem_ptr.llvm_ptr,
+      a=Float32(a).ir_value(),
+    )
 
 
 @dsl_user_op
