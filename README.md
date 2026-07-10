@@ -73,7 +73,7 @@ We extend FlashAttention to support large headdim ($D>256$) via **fine-grained t
 
 ## 🎉 Benchmark
 
-Runnable benchmark are provided under [`bench`](./bench). The performance benchmarks for the NVIDIA L20 (**Ada**), NVIDIA Geforce RTX 5090 (**Blackwell**), NVIDIA H800 PCIE (**Hopper**), NVIDIA H200 SXM (**Hopper**, **CuTeDSL** backend, up to **427** TFLOPS!🎉) with large headdims can be found at [`bench`](./bench).
+Runnable benchmark are provided under [`bench`](./bench). The performance benchmarks for the NVIDIA L20 (**Ada**), NVIDIA Geforce RTX 5090 (**Blackwell**), NVIDIA H800 PCIE (**Hopper**), NVIDIA H200 SXM (**Hopper**, **CuTeDSL** backend, up to **513** TFLOPS!🎉) with large headdims can be found at [`bench`](./bench).
 
 <div align='center'>
   <img src='./docs/assets/perf/ffpa_speedup_nvidia-h800-pcie_B1_H32_N8192_D320_T.png' width='400px'>
@@ -84,7 +84,7 @@ Runnable benchmark are provided under [`bench`](./bench). The performance benchm
 
 ## 🤖 Backends
 
-FFPA supports multiple backends for the forward and backward pass, including: [`SDPA`](./bench/) (baseline), [`CUDA`](./bench/) (forward only), [`Triton`](./bench/), and [`CuTeDSL`](./bench/). The `CuTeDSL` backend is currently in early stage and has some constraints, but it can achieve up to `427🎉` TFLOPS on H200! Stay tuned for future updates.
+FFPA supports multiple backends for the forward and backward pass, including: [`SDPA`](./bench/) (baseline), [`CUDA`](./bench/) (forward only), [`Triton`](./bench/), and [`CuTeDSL`](./bench/). The `CuTeDSL` backend is currently in early stage and has some constraints, but it can achieve up to `513🎉` TFLOPS on H200! Stay tuned for future updates.
 
 <div align='center' markdown="1">
 
