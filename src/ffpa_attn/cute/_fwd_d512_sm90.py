@@ -5,9 +5,14 @@
 #
 # SM90 (Hopper) forward pass for FFPA attention — only SplitD for head_dim=512.
 #
+# QK uses the "widen narrow-N" shape: tile_n=64 → QK is m64×n64×k512 (one WGMMA
+# at the n64 sweet-spot floor) and PV-front is m64×n256×k64. sK/sV are 64-wide,
+# so K/V/P are single-stage (2-stage would exceed the 232KB SM90 cap; SMEM ≈
+# 217KB), which makes QK and PV-front synchronous (wg_wait=0).
+#
 # Design:
 #   - Producer WG: warp-0 issues TMA for Q (one-shot per tile), K and V
-#     (per n_block, K/V double-staged for TMA-WGMMA overlap).
+#     (per n_block, K/V single-staged — synchronously consumed within the cap).
 #   - WG1: QK-GEMM (full-D in one WGMMA) → online softmax → PV-front (atom 0,
 #     gO cols 0:256) + LSE.
 #   - WG2: PV-back only (atom 1, gO cols 256:512). Cross-WG sP/sScale handoff
@@ -18,7 +23,7 @@
 #
 # Constraints:
 #   - tile_m == 64 (single M-atom WGMMA)
-#   - tile_n == 32 (so K can carry a true 2-stage pipeline at hdim=512)
+#   - tile_n == 64 (n64 QK; K/V single-staged within the 232KB SM90 SMEM cap)
 #   - tile_hdimv % 256 == 0 (PV (1,2,1) split)
 #   - kv_same must be False (requires an independent V buffer)
 #   - No paged KV / learnable_sink / seqused / block_sparsity
@@ -148,17 +153,23 @@ class FFPAAttnFwdSm90SplitD:
     # ════════════════════════════════════════════════════════════════════
     # 3-role pipeline — 1 TMA producer WG + 2 MMA WGs
     # ════════════════════════════════════════════════════════════════════
-    self.tile_n = 32
+    # ── V1 experiment: widen QK N from 32 → 64 ──────────────────────────────
+    # tile_n=64 makes QK m64×n64×k512 (one WGMMA, n64 at the sweet-spot floor)
+    # and PV m64×n256×k64 (deeper K). But sK/sV at 64-wide × 2 stages = 128KB
+    # EACH → over the 232KB cap, so K and V drop to 1 stage (64KB each). That
+    # sacrifices the TMA↔WGMMA double-buffer: QK becomes synchronous (no step-C
+    # pre-issue) and softmax is no longer hidden under the next block's QK. This
+    # is the "shape win vs pipeline loss" A/B probe; if it wins, the d-chunk K
+    # pipeline (keeps n64 AND 2-stage) is the follow-up. SMEM ≈ 217KB.
+    self.tile_n = 64
     self.tile_hdimv_half = self.tile_hdimv // 2  # 256
     self.tile_hdim_full = self.tile_hdim  # 512
 
     self.num_stages_q = 1
-    self.num_stages_k = 2  # double-stage K
-    self.num_stages_v = 2  # multi-stage V (PV pipeline)
-    # sScale double-stage: required when stages_k>=2 because WG1 iter
-    # k+2 store_scales(s_{k+1}) may overlap WG2 iter k+1 load_scales(s_k);
-    # double buffer lets them physically separate
-    self.num_stages_p = 2
+    self.num_stages_k = 1  # single-stage K (64-wide × 2 would blow the cap)
+    self.num_stages_v = 1  # single-stage V (64-wide × 2 would blow the cap)
+    # sScale stages track K stages; single-stage K → single-stage scale.
+    self.num_stages_p = 1
     # Defense: sScale must be at least as deeply staged as K to avoid
     # the race described above.
     assert self.num_stages_p >= self.num_stages_k, (
@@ -914,7 +925,6 @@ class FFPAAttnFwdSm90SplitD:
           pipeline_q.producer_commit(q_producer_state)
           did_produce_q = Boolean(True)
           q_producer_state.advance()
-
           # ── K/V loop along n_blocks (reverse order matches consumer) ──
           for i_n in cutlass.range(n_block_count, unroll=1):
             n_block = n_block_max - 1 - i_n
@@ -958,7 +968,6 @@ class FFPAAttnFwdSm90SplitD:
             pipeline_v.producer_commit(v_producer_state)
             did_produce_v = Boolean(True)
             v_producer_state.advance()
-
         tile_scheduler.advance_to_next_work()
         work_tile = tile_scheduler.get_current_work()
 
@@ -1153,28 +1162,10 @@ class FFPAAttnFwdSm90SplitD:
 
       if n_block_count > 0:
         # ─── Wait Q (one-shot per work-tile, full-D) ───
+        # (No QK[0] pre-issue: 1-stage K → synchronous QK inside the body.)
         pipeline_q.consumer_wait(
           q_consumer_state, pipeline_q.consumer_try_wait(q_consumer_state)
         )
-
-        # ─── pre-issue QK[0] async into acc_S_a (overlaps with
-        # iter 0 body's later work). The iter-0 body picks this up via
-        # wait_group(0) at step A. Don't release K[0] here — iter 0's
-        # step B handles release after the wait_group drains.
-        pipeline_k.consumer_wait(
-          k_consumer_state, pipeline_k.consumer_try_wait(k_consumer_state)
-        )
-        sm90_utils.gemm_w_idx(
-          tiled_mma_qk,
-          acc_S_a,
-          tSrQ,
-          tSrK,
-          zero_init=True,
-          A_idx=q_consumer_state.index,
-          B_idx=k_consumer_state.index,
-          wg_wait=-1,
-        )
-
         mma_one_n_block = partial(
           self._mma_wg1_one_n_block,
           acc_O_front=acc_O_front,
@@ -1216,40 +1207,13 @@ class FFPAAttnFwdSm90SplitD:
           is_first_n_block=True,
           is_last_n_block=(n_block_count == 1),
         )
-
-        # ─── remaining iters processed in PAIRS. Each pair runs 2
-        # n_blocks with cur/nxt swapped so the Python-level tensor refs
-        # alternate without runtime dispatch.
-        # Iter alternation (post-first):
-        #   iter 1: cur=b, nxt=a (b holds QK[1] from first iter's step C)
-        #   iter 2: cur=a, nxt=b
-        #   iter 3: cur=b, nxt=a
-        #   ...
-        remaining = n_block_count - 1
-        pair_count = remaining // 2
-        has_tail = (remaining % 2) == 1
-
-        for i_pair in cutlass.range(pair_count, unroll=1):
-          # Pair iter A (overall iter index = 2*i_pair + 1): cur=b, nxt=a
-          n_block_A = n_block_max - 2 - 2 * i_pair
+        # ─── remaining iters: simple sequential loop. Synchronous QK per
+        # block → no cur/nxt pipeline alternation. acc_S_a is the single QK
+        # buffer; acc_S_b is unused in the V1-exp path.
+        for i_n in cutlass.range(n_block_count - 1, unroll=1):
+          n_block = n_block_max - 2 - i_n
           k_consumer_state, v_consumer_state, pipeline_state_P_producer, pipeline_state_Scale_producer = mma_one_n_block(
-            n_block=n_block_A,
-            acc_S_cur=acc_S_b,
-            acc_S_nxt=acc_S_a,
-            k_consumer_state=k_consumer_state,
-            v_consumer_state=v_consumer_state,
-            pipeline_state_P_producer=pipeline_state_P_producer,
-            pipeline_state_Scale_producer=pipeline_state_Scale_producer,
-            mask_seqlen=False,
-            is_first_n_block=False,
-            is_last_n_block=False,  # A never last (B follows; or tail handles)
-          )
-          # Pair iter B (overall iter index = 2*i_pair + 2): cur=a, nxt=b
-          n_block_B = n_block_max - 3 - 2 * i_pair
-          # B is last iff there is no tail AND this is the final pair
-          is_last_B = (not has_tail) and (i_pair == pair_count - 1)
-          k_consumer_state, v_consumer_state, pipeline_state_P_producer, pipeline_state_Scale_producer = mma_one_n_block(
-            n_block=n_block_B,
+            n_block=n_block,
             acc_S_cur=acc_S_a,
             acc_S_nxt=acc_S_b,
             k_consumer_state=k_consumer_state,
@@ -1258,32 +1222,12 @@ class FFPAAttnFwdSm90SplitD:
             pipeline_state_Scale_producer=pipeline_state_Scale_producer,
             mask_seqlen=False,
             is_first_n_block=False,
-            is_last_n_block=is_last_B,
+            is_last_n_block=False,
           )
-
-        # ─── tail iter (if remaining is odd): cur=b, nxt=a, is_last=True
-        if has_tail:
-          n_block_tail = n_block_max - 2 - 2 * pair_count
-          k_consumer_state, v_consumer_state, pipeline_state_P_producer, pipeline_state_Scale_producer = mma_one_n_block(
-            n_block=n_block_tail,
-            acc_S_cur=acc_S_b,
-            acc_S_nxt=acc_S_a,
-            k_consumer_state=k_consumer_state,
-            v_consumer_state=v_consumer_state,
-            pipeline_state_P_producer=pipeline_state_P_producer,
-            pipeline_state_Scale_producer=pipeline_state_Scale_producer,
-            mask_seqlen=False,
-            is_first_n_block=False,
-            is_last_n_block=True,
-          )
-
-        # ─── drain the last PV-front WGMMA ───
-        cute.nvgpu.warpgroup.wait_group(0)
-        with cute.arch.elect_one():
-          pipeline_v.consumer_release(v_consumer_state)
-
-        # ─── Finalize: write final row_scale to sScale[current] for WG2 ───
-        final_stage_idx = Int32(k_consumer_state.index)
+        # ─── Finalize: write final row_scale to sScale for WG2 ───
+        # (PV-front synchronous → nothing to drain; V released each iter; K/V
+        #  consumer states already advanced per-iter inside the body.)
+        final_stage_idx = Int32(0)  # single-stage sScale slot
         row_scale_final = softmax.finalize(sink_val=None)
 
         # PFull/PEmpty bridge two warpgroups in producer/consumer style
@@ -1331,10 +1275,7 @@ class FFPAAttnFwdSm90SplitD:
           wg_idx=0,
           write_lse=True,
         )
-
-        # ─── Close the tile's K/V pipeline phase ───
-        k_consumer_state.advance()
-        v_consumer_state.advance()
+        # (K/V consumer states already advanced per-iter in the body.)
       # else: empty tile — _interface.py pre-inits O=0, LSE=-inf
 
       tile_scheduler.advance_to_next_work()
@@ -1386,36 +1327,29 @@ class FFPAAttnFwdSm90SplitD:
         """
     p_stage = Int32(pipeline_state_P_producer.index)
 
-    # ═══ step A: drain pre-issued QK[n_block] (and prev iter's PV-front) ═══
-    cute.nvgpu.warpgroup.wait_group(0)
-
-    # ═══ step B: release K[n_block]; release V[n_block-1] if not first ═══
-    cur_k_stage = Int32(k_consumer_state.index)
-    prev_stage_idx = (cur_k_stage +
-                      Int32(self.num_stages_k - 1)) % Int32(self.num_stages_k)
+    # ═══ V1-exp step A: SYNCHRONOUS n64 QK[n_block] into acc_S_cur ═══
+    # (1-stage K → no double buffer → no step-C pre-issue; QK is wg_wait=0 and
+    #  drained before softmax reads it. This is the pipeline sacrifice that pays
+    #  for the wider n64 K buffer within the SMEM cap.)
+    # single-stage sScale slot (num_stages_p == 1)
+    prev_stage_idx = Int32(0)
+    pipeline_k.consumer_wait(
+      k_consumer_state, pipeline_k.consumer_try_wait(k_consumer_state)
+    )
+    sm90_utils.gemm_w_idx(
+      tiled_mma_qk,
+      acc_S_cur,
+      tSrQ,
+      tSrK,
+      zero_init=True,
+      A_idx=q_consumer_state.index,  # sQ stage = 0 (single Q buf per tile)
+      B_idx=k_consumer_state.index,  # K[n_block] stage (single buffer)
+      wg_wait=0,  # SYNCHRONOUS — acc_S_cur ready for softmax below
+    )
+    # release K[n] immediately (single buffer → producer reloads K[n+1])
     with cute.arch.elect_one():
       pipeline_k.consumer_release(k_consumer_state)
-    if const_expr(not is_first_n_block):
-      with cute.arch.elect_one():
-        pipeline_v.consumer_release(v_consumer_state)
-
-    # ═══ step C: pre-issue QK[n_block+1] async into acc_S_nxt ═══
-    if not is_last_n_block:
-      k_consumer_state.advance()
-      pipeline_k.consumer_wait(
-        k_consumer_state, pipeline_k.consumer_try_wait(k_consumer_state)
-      )
-      sm90_utils.gemm_w_idx(
-        tiled_mma_qk,
-        acc_S_nxt,
-        tSrQ,
-        tSrK,
-        zero_init=True,
-        A_idx=q_consumer_state.index,  # sQ stage = 0 (single Q buf per tile)
-        B_idx=k_consumer_state.index,  # K[n_block+1] stage (post-advance)
-        wg_wait=-1,  # async — drained at next iter's step A
-      )
-      # K[n_block+1] is held; next iter's step B (or finalize) releases.
+    k_consumer_state.advance()
 
     # ═══ step D: softmax on acc_S_cur (overlaps with step C's WGMMA on TC) ═══
     if const_expr(score_mod_fn is not None):
@@ -1454,6 +1388,8 @@ class FFPAAttnFwdSm90SplitD:
 
     # ═══ step F pipeline_P producer_acquire → STSM(sP) → rescale_O →
     # fence → pipeline_P producer_commit
+    # w1_Pacq isolates the producer_acquire — the cross-WG bubble where WG1 waits
+    # for WG2 to free the sP slot (the PEmpty-equivalent handshake).
     pipeline_P.producer_acquire(pipeline_state_P_producer)
     cute.copy(
       smem_copy_atom_P,
@@ -1466,17 +1402,11 @@ class FFPAAttnFwdSm90SplitD:
     cute.arch.sync_warp()
     pipeline_P.producer_commit(pipeline_state_P_producer)
     pipeline_state_P_producer.advance()
-
-    # ═══ step G: advance V (skip on first), wait V[n_block], PV-front async ═══
-    if const_expr(not is_first_n_block):
-      v_consumer_state.advance()
+    # ═══ V1-exp step G: wait V[n], SYNCHRONOUS PV-front, release V[n] ═══
     pipeline_v.consumer_wait(
       v_consumer_state, pipeline_v.consumer_try_wait(v_consumer_state)
     )
-    # RS-mode PV-front. A operand = tOrP (rmem); WG2 still uses SS-mode
-    # via tiled_mma_pv. Eliminates SS-mode SMEM descriptor read for WG1's
-    # own PV-front WGMMA — modest TC pipeline startup latency saving (+3
-    # TFLOPS empirically).
+    # RS-mode PV-front. A operand = tOrP (rmem); WG2 uses SS-mode via tiled_mma_pv.
     sm90_utils.gemm_w_idx(
       tiled_mma_pv_wg1,
       acc_O_front,
@@ -1485,9 +1415,12 @@ class FFPAAttnFwdSm90SplitD:
       zero_init=is_first_n_block,
       A_idx=None,
       B_idx=v_consumer_state.index,
-      wg_wait=-1,  # async — drained at next iter's step A or finalize
+      wg_wait=0,  # SYNCHRONOUS — drain before releasing V (single buffer)
     )
-    # V[n_block] is held; next iter's step B (or finalize) releases.
+    # release V[n] immediately (single buffer → producer reloads V[n+1])
+    with cute.arch.elect_one():
+      pipeline_v.consumer_release(v_consumer_state)
+    v_consumer_state.advance()
     return k_consumer_state, v_consumer_state, pipeline_state_P_producer, pipeline_state_Scale_producer
 
   @cute.jit
@@ -1544,7 +1477,6 @@ class FFPAAttnFwdSm90SplitD:
       barrier_id=int(NamedBarrierFwd.PEmpty),
       number_of_threads=self.num_mma_threads,
     )
-
     v_consumer_state = pipeline.make_pipeline_state(
       pipeline.PipelineUserType.Consumer, self.num_stages_v
     )
@@ -1585,6 +1517,7 @@ class FFPAAttnFwdSm90SplitD:
           tidx_global=tidx_global,
         )
         # First n_block: is_first=True. No stage advance; consume stage 0.
+        # Coarse w2_nblk lumps PV-back per n_block (suppressed under --fine).
         v_consumer_state, pipeline_state_P_consumer, pipeline_state_Scale_consumer = mma_one_n_block(
           n_block=n_block_max - 1,
           v_consumer_state=v_consumer_state,
@@ -1602,7 +1535,6 @@ class FFPAAttnFwdSm90SplitD:
             pipeline_state_Scale_consumer=pipeline_state_Scale_consumer,
             is_first_n_block=False,
           )
-
         # ─── Finalize: receive final row_scale from WG1 ───
         # Stage index alignment:
         cute.arch.barrier(
@@ -1642,7 +1574,6 @@ class FFPAAttnFwdSm90SplitD:
           wg_idx=1,
           write_lse=False,
         )
-
         # ─── Close the tile's V pipeline phase ───
         v_consumer_state.advance()
       # else: empty tile; _interface.py pre-inits O=0
