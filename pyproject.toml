@@ -17,7 +17,7 @@ dependencies = [
     "torch>=2.10.0",
     "quack-kernels==0.6.1",
     "nvidia-cutlass-dsl>=4.6,<4.7",
-    "apache-tvm-ffi>=0.1.6,<0.2",
+    "apache-tvm-ffi>=0.1.12,<0.2",
 ]
 
 [project.optional-dependencies]
