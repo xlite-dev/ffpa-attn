@@ -15,8 +15,8 @@ dependencies = [
     "numpy",
     "ray", # autotuning
     "torch>=2.10.0",
-    "quack-kernels>=0.4.1",
-    "nvidia-cutlass-dsl>=4.5.1",
+    "quack-kernels==0.6.1",
+    "nvidia-cutlass-dsl>=4.6,<4.7",
     "apache-tvm-ffi>=0.1.6,<0.2",
 ]
 
@@ -76,6 +76,20 @@ Documentation = "https://ffpa-attn.readthedocs.io"
 
 requires = ["setuptools>=64", "setuptools_scm>=8", "torch>=2.7.0", "packaging", "ninja", "wheel"]
 build-backend = "setuptools.build_meta"
+
+# ---------------------------------------------------------------------------
+# uv resolver: pin PyTorch's *source* to the CUDA 12.8 wheel index so uv.lock
+# records the GPU build (torch==*+cu128) the cutedsl backend is validated
+# against. The version stays open (`torch>=2.10.0` in [project]); this only
+# fixes where torch is fetched from, not which version resolves.
+# ---------------------------------------------------------------------------
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu128" }
 
 [tool.setuptools_scm]
 version_scheme = "python-simplified-semver"
