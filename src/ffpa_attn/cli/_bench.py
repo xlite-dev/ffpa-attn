@@ -360,7 +360,8 @@ def _parse_args() -> argparse.Namespace:
   parser.add_argument(
     "--verbose",
     action="store_true",
-    help="Print full per-case accuracy details (max|diff, allclose, backend, etc.) "
+    help=
+    "Print full per-case accuracy details (max|diff, allclose, backend, etc.) "
     "instead of compact performance-only lines.",
   )
   parser.add_argument(
@@ -1279,13 +1280,22 @@ def _render_table(rows: list[RESULT_ROW], show_allclose: bool) -> list[str]:
     speedup = f"{row['speedup']:.2f}x"
     if show_allclose:
       raw_rows.append([
-        row["case_name"], row["dtype"], nq_nkv,
-        _allclose_marker(row), latency, tflops, speedup,
+        row["case_name"],
+        row["dtype"],
+        nq_nkv,
+        _allclose_marker(row),
+        latency,
+        tflops,
+        speedup,
       ])
     else:
       raw_rows.append([
-        row["case_name"], row["dtype"], nq_nkv,
-        latency, tflops, speedup,
+        row["case_name"],
+        row["dtype"],
+        nq_nkv,
+        latency,
+        tflops,
+        speedup,
       ])
 
   header_cells = [c.strip() for c in header.strip("|").split("|")]
@@ -1296,12 +1306,17 @@ def _render_table(rows: list[RESULT_ROW], show_allclose: bool) -> list[str]:
       col_widths[i] = max(col_widths[i], len(cell))
 
   lines = [
-    "| " + " | ".join(h.ljust(col_widths[i]) for i, h in enumerate(header_cells)) + " |",
-    "| " + " | ".join(a.ljust(col_widths[i]) for i, a in enumerate(align_cells)) + " |",
+    "| " +
+    " | ".join(h.ljust(col_widths[i])
+               for i, h in enumerate(header_cells)) + " |",
+    "| " +
+    " | ".join(a.ljust(col_widths[i])
+               for i, a in enumerate(align_cells)) + " |",
   ]
   for cells in raw_rows:
     lines.append(
-      "| " + " | ".join(c.ljust(col_widths[i]) for i, c in enumerate(cells)) + " |"
+      "| " + " | ".join(c.ljust(col_widths[i])
+                        for i, c in enumerate(cells)) + " |"
     )
   return lines
 
@@ -1321,6 +1336,7 @@ def render_speedup_markdown(
   fallback: bool,
   show_allclose: bool,
   cutedsl: bool = False,
+  verbose: bool = False,
 ) -> str:
   """Render README-style Markdown benchmark tables.
 
@@ -1341,19 +1357,20 @@ def render_speedup_markdown(
   lines = [
     "## Benchmark", "", f"Env: {device_name}, B={B}, N={N}, H={H}, D={D}."
   ]
-  if cutedsl:
-    lines.extend([
-      "",
-      "Backend: CuTeDSL dense path (fp16/bf16 forward/backward; D<320 uses the SM80 fallback when enabled). "
-      "TFLOPS reports the theoretical dominant attention GEMM throughput only; "
-      "forward and backward are computed separately from the measured latency.",
-    ])
-  else:
-    lines.extend([
-      "",
-      "TFLOPS reports the theoretical dominant attention GEMM throughput only; "
-      "forward and backward are computed separately from the measured latency.",
-    ])
+  if verbose:
+    if cutedsl:
+      lines.extend([
+        "",
+        "Backend: CuTeDSL dense path (fp16/bf16 forward/backward; D<320 uses the SM80 fallback when enabled). "
+        "TFLOPS reports the theoretical dominant attention GEMM throughput only; "
+        "forward and backward are computed separately from the measured latency.",
+      ])
+    else:
+      lines.extend([
+        "",
+        "TFLOPS reports the theoretical dominant attention GEMM throughput only; "
+        "forward and backward are computed separately from the measured latency.",
+      ])
   if fallback:
     lines.extend([
       "",
@@ -1568,6 +1585,7 @@ def main() -> None:
     fallback=fallback,
     show_allclose=args.show_allclose,
     cutedsl=is_cutedsl,
+    verbose=args.verbose,
   )
   md_path = output_stem.with_suffix(".md")
   md_path.write_text(markdown, encoding="utf-8")
