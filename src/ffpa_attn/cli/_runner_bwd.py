@@ -192,31 +192,46 @@ def _maybe_norm_qkv(
   return q, k, v
 
 
-def _format_backward_result(result: BACKWARD_RESULT) -> str:
+def _format_backward_result(result: BACKWARD_RESULT, *, verbose: bool = False) -> str:
   """Format one backward benchmark result for CLI output.
 
   :param result: Structured backward result.
-  :return: Human-readable one-line summary.
+  :param verbose: If True, always print full accuracy details.
+  :return: Human-readable one-line summary. Compact when accuracy passes,
+      full detail when it fails or verbose is enabled.
   """
+  if not verbose:
+    max_grad_err = max(result["dq_err"], result["dk_err"], result["dv_err"])
+  if not verbose and max_grad_err < 1.0:
+    ffpa_t = format_tflops_short(result["ffpa_tflops"])
+    sdpa_t = format_tflops_short(result["sdpa_tflops"])
+    return (
+      f"[{result['case_name']:<14} {result['dtype']:<8}] "
+      f"B={result['B']:<1} Hq={result['Hq']:<2} Hkv={result['Hkv']:<2} "
+      f"Nq={result['Nq']:<4} Nkv={result['Nkv']:<4} D={result['D']:<3}  "
+      f"FFPA={result['ffpa_ms']:<6.2f} ms  SDPA={result['sdpa_ms']:<6.2f} ms  "
+      f"TFLOPS={ffpa_t:<5}/{sdpa_t:<5}  "
+      f"speedup={result['speedup']:<4.2f}x"
+    )
   if result["dmask_err"] is not None:
-    dmask_msg = f"dMask_err={result['dmask_err']:.4e}  "
+    dmask_msg = f"dMask_err={result['dmask_err']:.4e}"
   elif result["dmask_status"] == "skipped-large-logical-mask":
-    dmask_msg = "dMask_err=(SKIPPED large logical mask)  "
+    dmask_msg = "dMask_err=(SKIPPED large logical mask)"
   elif result["dmask_status"] == "skipped-ffpa-forward-fallback":
-    dmask_msg = "dMask_err=(SKIPPED FFPA fwd fallback)  "
+    dmask_msg = "dMask_err=(SKIPPED FFPA fwd fallback)"
   else:
-    dmask_msg = "dMask_err=(NO Grad)  "
+    dmask_msg = "dMask_err=(NO Grad)"
+  ffpa_t = format_tflops_short(result["ffpa_tflops"])
+  sdpa_t = format_tflops_short(result["sdpa_tflops"])
   return (
     f"[{result['case_name']:<14} {result['dtype']:<8}] "
-    f"B={result['B']} Hq={result['Hq']} Hkv={result['Hkv']} "
-    f"Nq={result['Nq']} Nkv={result['Nkv']} D={result['D']} "
-    f"causal={int(result['causal'])} dropout_p={result['dropout_p']:g}  "
+    f"B={result['B']:<1} Hq={result['Hq']:<2} Hkv={result['Hkv']:<2} "
+    f"Nq={result['Nq']:<4} Nkv={result['Nkv']:<4} D={result['D']:<3}  "
     f"dQ_err={result['dq_err']:.4e}  dK_err={result['dk_err']:.4e}  "
-    f"dV_err={result['dv_err']:.4e}  {dmask_msg}"
-    f"backend={result['backward_backend']}  "
-    f"FFPA={result['ffpa_ms']:.2f} ms  SDPA={result['sdpa_ms']:.2f} ms  "
-    f"TFLOPS={format_tflops_short(result['ffpa_tflops'])}/{format_tflops_short(result['sdpa_tflops'])}  "
-    f"speedup={result['speedup']:.2f}x"
+    f"dV_err={result['dv_err']:.4e}  {dmask_msg:<20}  "
+    f"FFPA={result['ffpa_ms']:<6.2f} ms  SDPA={result['sdpa_ms']:<6.2f} ms  "
+    f"TFLOPS={ffpa_t:<5}/{sdpa_t:<5}  "
+    f"speedup={result['speedup']:<4.2f}x"
   )
 
 
@@ -627,6 +642,7 @@ def _run_case(
   warmup: int = DEFAULT_WARMUP,
   iters: int = DEFAULT_ITERS,
   print_result: bool = True,
+  verbose: bool = False,
 ) -> BACKWARD_RESULT:
   torch.manual_seed(seed)
   q = torch.randn(B, Nh_q, Nq, D, dtype=dtype, device="cuda")
@@ -848,7 +864,7 @@ def _run_case(
     "speedup": ms_sdpa / ms_ffpa,
   }
   if print_result:
-    print(_format_backward_result(result))
+    print(_format_backward_result(result, verbose=verbose))
   return result
 
 
@@ -876,6 +892,7 @@ def run_backward_examples(
   print_results: bool = True,
   tasks: set[str] | None = None,
   dtypes: tuple[torch.dtype, ...] = (torch.float16, torch.bfloat16),
+  verbose: bool = False,
 ) -> list[BACKWARD_RESULT]:
   """Run the canonical backward benchmark cases.
 
@@ -914,18 +931,35 @@ def run_backward_examples(
   gqa_heads = _resolve_gqa_heads(H)
   non_aligned_heads = _resolve_non_aligned_heads(H)
 
-  print(
-    f"\nRunning FFPA backward, backend={backward_backend}, "
-    f"apply_norm={apply_norm}, "
-    f"triton_autotune={triton_autotune}, "
-    f"triton_autotune_mode={triton_autotune_mode}, "
-    f"grad_kv_storage_dtype={grad_kv_storage_dtype}, "
-    f"grad_q_storage_dtype={grad_q_storage_dtype}, "
-    f"enable_bwd_tma={enable_tma}, enable_bwd_ws={enable_ws}, "
-    f"enable_persist_dkdv={enable_persist_dkdv}, enable_split_launch={enable_split_launch}, "
-    f"timing_mode={timing_mode}, tasks={sorted(tasks) if tasks is not None else 'full'}, "
-    f"warmup={warmup}, iters={iters}"
-  )
+  tasks_str = ",".join(sorted(tasks)) if tasks is not None else "self-attn,cross-attn,decode-attn,gqa,causal,attn-mask,dropout,non-aligned"
+  config_items: list[tuple[str, str]] = [
+    ("backend", backward_backend),
+    ("apply_norm", str(apply_norm)),
+    ("triton_autotune", str(triton_autotune)),
+    ("triton_autotune_mode", triton_autotune_mode),
+    ("grad_kv_storage_dtype", str(grad_kv_storage_dtype)),
+    ("grad_q_storage_dtype", str(grad_q_storage_dtype)),
+    ("enable_bwd_tma", str(enable_tma)),
+    ("enable_bwd_ws", str(enable_ws)),
+    ("enable_persist_dkdv", str(enable_persist_dkdv)),
+    ("enable_split_launch", str(enable_split_launch)),
+    ("timing_mode", timing_mode),
+    ("tasks", tasks_str),
+    ("warmup", str(warmup)),
+    ("iters", str(iters)),
+  ]
+  key_w = max(len(k) for k, _ in config_items)
+  val_w = max(len(v) for _, v in config_items)
+  _backend_label = {"cuda": "CUDA", "triton": "Triton", "cutedsl": "CuTeDSL", "sdpa": "SDPA"}
+  title = f"FFPA Backward ({_backend_label.get(backward_backend, backward_backend)})"
+  title_w = max(key_w + val_w + 3, len(title))
+  bar = "+" + "=" * (title_w + 2) + "+"
+  print(f"\n{bar}")
+  print(f"| {title:^{title_w}} |")
+  print(bar)
+  for key, val in config_items:
+    print(f"| {key:<{key_w}} | {val:<{val_w}} |")
+  print(bar)
   if backward_backend != "cutedsl" and D <= 256:
     triton_small_d_enabled = bool(int(os.environ.get(TRITON_SMALL_D_ENV, "0")))
     print(
@@ -1054,6 +1088,7 @@ def run_backward_examples(
           warmup=warmup,
           iters=iters,
           print_result=print_results,
+          verbose=verbose,
         )
       )
 

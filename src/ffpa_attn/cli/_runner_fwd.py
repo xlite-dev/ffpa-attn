@@ -205,25 +205,36 @@ def _tensor_allclose(lhs: torch.Tensor, rhs: torch.Tensor, tol: float) -> bool:
   return torch.allclose(lhs.float(), rhs.float(), atol=tol, rtol=tol)
 
 
-def _format_forward_result(result: FORWARD_RESULT) -> str:
+def _format_forward_result(result: FORWARD_RESULT, *, verbose: bool = False) -> str:
   """Format one forward benchmark result for CLI output.
 
   :param result: Structured forward result.
-  :return: Human-readable one-line summary.
+  :param verbose: If True, always print full accuracy details.
+  :return: Human-readable one-line summary. Compact when accuracy passes,
+      full detail when it fails or verbose is enabled.
   """
+  if not verbose and result["allclose"]:
+    ffpa_t = format_tflops_short(result["ffpa_tflops"])
+    sdpa_t = format_tflops_short(result["sdpa_tflops"])
+    return (
+      f"[{result['case_name']:<16} {result['dtype']:<8} acc={result['acc']}] "
+      f"B={result['B']:<1} Hq={result['Hq']:<2} Hkv={result['Hkv']:<2} "
+      f"Nq={result['Nq']:<4} Nkv={result['Nkv']:<4} D={result['D']:<3}  "
+      f"FFPA={result['ffpa_ms']:<6.2f} ms  SDPA={result['sdpa_ms']:<6.2f} ms  "
+      f"TFLOPS={ffpa_t:<5}/{sdpa_t:<5}  "
+      f"speedup={result['speedup']:<4.2f}x"
+    )
+  ffpa_t = format_tflops_short(result["ffpa_tflops"])
+  sdpa_t = format_tflops_short(result["sdpa_tflops"])
   return (
     f"[{result['case_name']:<16} {result['dtype']:<8} acc={result['acc']}] "
-    f"B={result['B']} Hq={result['Hq']} Hkv={result['Hkv']} "
-    f"Nq={result['Nq']} Nkv={result['Nkv']} D={result['D']} "
-    f"causal={int(result['causal'])} dropout_p={result['dropout_p']:g}  "
-    f"max|diff|={result['max_diff']:.4f}  mean|diff|={result['mean_diff']:.5f}  "
-    f"allclose(atol={result['tolerance']})={result['allclose']}  "
-    f"backend={result['forward_backend']}  "
-    f"tma={int(result.get('enable_tma', False))}  "
-    f"ws={int(result.get('enable_ws', False))}  "
-    f"FFPA={result['ffpa_ms']:.2f} ms  SDPA={result['sdpa_ms']:.2f} ms  "
-    f"TFLOPS={format_tflops_short(result['ffpa_tflops'])}/{format_tflops_short(result['sdpa_tflops'])}  "
-    f"speedup={result['speedup']:.2f}x"
+    f"B={result['B']:<1} Hq={result['Hq']:<2} Hkv={result['Hkv']:<2} "
+    f"Nq={result['Nq']:<4} Nkv={result['Nkv']:<4} D={result['D']:<3}  "
+    f"O_err={result['max_diff']:<9.4f} "
+    f"allclose(atol={result['tolerance']:.2f})={str(result['allclose']):<5}  "
+    f"FFPA={result['ffpa_ms']:<6.2f} ms  SDPA={result['sdpa_ms']:<6.2f} ms  "
+    f"TFLOPS={ffpa_t:<5}/{sdpa_t:<5}  "
+    f"speedup={result['speedup']:<4.2f}x"
   )
 
 
@@ -274,6 +285,7 @@ def _run_case(
   print_result: bool = True,
   enable_tma: bool = False,
   enable_ws: bool = False,
+  verbose: bool = False,
 ) -> FORWARD_RESULT:
   torch.manual_seed(seed)
   q = torch.randn(B, Nh_q, Nq, D, dtype=dtype, device="cuda")
@@ -373,7 +385,7 @@ def _run_case(
     "enable_ws": enable_ws,
   }
   if print_result:
-    print(_format_forward_result(result))
+    print(_format_forward_result(result, verbose=verbose))
   return result
 
 
@@ -397,6 +409,7 @@ def run_forward_examples(
   enable_ws: bool = False,
   tasks: set[str] | None = None,
   dtypes: tuple[torch.dtype, ...] = (torch.float16, torch.bfloat16),
+  verbose: bool = False,
 ) -> list[FORWARD_RESULT]:
   """Run the canonical forward benchmark cases.
 
@@ -425,17 +438,31 @@ def run_forward_examples(
   results: list[FORWARD_RESULT] = []
   gqa_heads = _resolve_gqa_heads(H)
   non_aligned_heads = _resolve_non_aligned_heads(H)
-  print(
-    f"\nRunning FFPA forward, backend={forward_backend}, "
-    f"apply_norm={apply_norm}, "
-    f"triton_autotune={triton_autotune}, "
-    f"triton_autotune_mode={triton_autotune_mode}, "
-    f"grad_kv_storage_dtype={grad_kv_storage_dtype}, "
-    f"enable_fwd_tma={enable_tma}, "
-    f"enable_fwd_ws={enable_ws}, "
-    f"tasks={sorted(tasks) if tasks is not None else 'full'}, "
-    f"warmup={warmup}, iters={iters}"
-  )
+  tasks_str = ",".join(sorted(tasks)) if tasks is not None else "self-attn,cross-attn,decode-attn,gqa,causal,attn-mask,dropout,non-aligned"
+  config_items: list[tuple[str, str]] = [
+    ("backend", forward_backend),
+    ("apply_norm", str(apply_norm)),
+    ("triton_autotune", str(triton_autotune)),
+    ("triton_autotune_mode", triton_autotune_mode),
+    ("grad_kv_storage_dtype", str(grad_kv_storage_dtype)),
+    ("enable_fwd_tma", str(enable_tma)),
+    ("enable_fwd_ws", str(enable_ws)),
+    ("tasks", tasks_str),
+    ("warmup", str(warmup)),
+    ("iters", str(iters)),
+  ]
+  key_w = max(len(k) for k, _ in config_items)
+  val_w = max(len(v) for _, v in config_items)
+  _backend_label = {"cuda": "CUDA", "triton": "Triton", "cutedsl": "CuTeDSL"}
+  title = f"FFPA Forward ({_backend_label.get(forward_backend, forward_backend)})"
+  title_w = max(key_w + val_w + 3, len(title))
+  bar = "+" + "=" * (title_w + 2) + "+"
+  print(f"\n{bar}")
+  print(f"| {title:^{title_w}} |")
+  print(bar)
+  for key, val in config_items:
+    print(f"| {key:<{key_w}} | {val:<{val_w}} |")
+  print(bar)
   if forward_backend == "triton" and D <= 256:
     triton_small_d_enabled = bool(int(os.environ.get(TRITON_SMALL_D_ENV, "0")))
     print(
@@ -556,6 +583,7 @@ def run_forward_examples(
           print_result=print_results,
           enable_tma=enable_tma,
           enable_ws=enable_ws,
+          verbose=verbose,
         )
       )
 
