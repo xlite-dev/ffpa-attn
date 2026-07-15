@@ -192,19 +192,18 @@ def _maybe_norm_qkv(
   return q, k, v
 
 
-def _format_backward_result(result: BACKWARD_RESULT, *, verbose: bool = False) -> str:
+def _format_backward_result(
+  result: BACKWARD_RESULT, *, verbose: bool = False
+) -> str:
   """Format one backward benchmark result for CLI output.
 
   :param result: Structured backward result.
-  :param verbose: If True, always print full accuracy details.
-  :return: Human-readable one-line summary. Compact when accuracy passes,
-      full detail when it fails or verbose is enabled.
+  :param verbose: If True, include accuracy fields (dQ_err, dK_err, dV_err, dMask_err).
+  :return: Human-readable one-line summary.
   """
+  ffpa_t = format_tflops_short(result["ffpa_tflops"])
+  sdpa_t = format_tflops_short(result["sdpa_tflops"])
   if not verbose:
-    max_grad_err = max(result["dq_err"], result["dk_err"], result["dv_err"])
-  if not verbose and max_grad_err < 1.0:
-    ffpa_t = format_tflops_short(result["ffpa_tflops"])
-    sdpa_t = format_tflops_short(result["sdpa_tflops"])
     return (
       f"[{result['case_name']:<14} {result['dtype']:<8}] "
       f"B={result['B']:<1} Hq={result['Hq']:<2} Hkv={result['Hkv']:<2} "
@@ -221,8 +220,6 @@ def _format_backward_result(result: BACKWARD_RESULT, *, verbose: bool = False) -
     dmask_msg = "dMask_err=(SKIPPED FFPA fwd fallback)"
   else:
     dmask_msg = "dMask_err=(NO Grad)"
-  ffpa_t = format_tflops_short(result["ffpa_tflops"])
-  sdpa_t = format_tflops_short(result["sdpa_tflops"])
   return (
     f"[{result['case_name']:<14} {result['dtype']:<8}] "
     f"B={result['B']:<1} Hq={result['Hq']:<2} Hkv={result['Hkv']:<2} "
@@ -931,7 +928,9 @@ def run_backward_examples(
   gqa_heads = _resolve_gqa_heads(H)
   non_aligned_heads = _resolve_non_aligned_heads(H)
 
-  tasks_str = ",".join(sorted(tasks)) if tasks is not None else "self-attn,cross-attn,decode-attn,gqa,causal,attn-mask,dropout,non-aligned"
+  tasks_str = ",".join(
+    sorted(tasks)
+  ) if tasks is not None else "self-attn,cross-attn,decode-attn,gqa,causal,attn-mask,dropout,non-aligned"
   config_items: list[tuple[str, str]] = [
     ("backend", backward_backend),
     ("apply_norm", str(apply_norm)),
@@ -950,7 +949,12 @@ def run_backward_examples(
   ]
   key_w = max(len(k) for k, _ in config_items)
   val_w = max(len(v) for _, v in config_items)
-  _backend_label = {"cuda": "CUDA", "triton": "Triton", "cutedsl": "CuTeDSL", "sdpa": "SDPA"}
+  _backend_label = {
+    "cuda": "CUDA",
+    "triton": "Triton",
+    "cutedsl": "CuTeDSL",
+    "sdpa": "SDPA"
+  }
   title = f"FFPA Backward ({_backend_label.get(backward_backend, backward_backend)})"
   title_w = max(key_w + val_w + 3, len(title))
   bar = "+" + "=" * (title_w + 2) + "+"

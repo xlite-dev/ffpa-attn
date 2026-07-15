@@ -205,17 +205,18 @@ def _tensor_allclose(lhs: torch.Tensor, rhs: torch.Tensor, tol: float) -> bool:
   return torch.allclose(lhs.float(), rhs.float(), atol=tol, rtol=tol)
 
 
-def _format_forward_result(result: FORWARD_RESULT, *, verbose: bool = False) -> str:
+def _format_forward_result(
+  result: FORWARD_RESULT, *, verbose: bool = False
+) -> str:
   """Format one forward benchmark result for CLI output.
 
   :param result: Structured forward result.
-  :param verbose: If True, always print full accuracy details.
-  :return: Human-readable one-line summary. Compact when accuracy passes,
-      full detail when it fails or verbose is enabled.
+  :param verbose: If True, include accuracy fields (O_err, allclose).
+  :return: Human-readable one-line summary.
   """
-  if not verbose and result["allclose"]:
-    ffpa_t = format_tflops_short(result["ffpa_tflops"])
-    sdpa_t = format_tflops_short(result["sdpa_tflops"])
+  ffpa_t = format_tflops_short(result["ffpa_tflops"])
+  sdpa_t = format_tflops_short(result["sdpa_tflops"])
+  if not verbose:
     return (
       f"[{result['case_name']:<16} {result['dtype']:<8} acc={result['acc']}] "
       f"B={result['B']:<1} Hq={result['Hq']:<2} Hkv={result['Hkv']:<2} "
@@ -224,8 +225,6 @@ def _format_forward_result(result: FORWARD_RESULT, *, verbose: bool = False) -> 
       f"TFLOPS={ffpa_t:<5}/{sdpa_t:<5}  "
       f"speedup={result['speedup']:<4.2f}x"
     )
-  ffpa_t = format_tflops_short(result["ffpa_tflops"])
-  sdpa_t = format_tflops_short(result["sdpa_tflops"])
   return (
     f"[{result['case_name']:<16} {result['dtype']:<8} acc={result['acc']}] "
     f"B={result['B']:<1} Hq={result['Hq']:<2} Hkv={result['Hkv']:<2} "
@@ -438,7 +437,9 @@ def run_forward_examples(
   results: list[FORWARD_RESULT] = []
   gqa_heads = _resolve_gqa_heads(H)
   non_aligned_heads = _resolve_non_aligned_heads(H)
-  tasks_str = ",".join(sorted(tasks)) if tasks is not None else "self-attn,cross-attn,decode-attn,gqa,causal,attn-mask,dropout,non-aligned"
+  tasks_str = ",".join(
+    sorted(tasks)
+  ) if tasks is not None else "self-attn,cross-attn,decode-attn,gqa,causal,attn-mask,dropout,non-aligned"
   config_items: list[tuple[str, str]] = [
     ("backend", forward_backend),
     ("apply_norm", str(apply_norm)),
