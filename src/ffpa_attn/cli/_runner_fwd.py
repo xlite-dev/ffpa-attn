@@ -216,24 +216,25 @@ def _format_forward_result(
   """
   ffpa_t = format_tflops_short(result["ffpa_tflops"])
   sdpa_t = format_tflops_short(result["sdpa_tflops"])
+  tflops_str = f"{ffpa_t}/{sdpa_t}"
   if not verbose:
     return (
-      f"[{result['case_name']:<16} {result['dtype']:<8} acc={result['acc']}] "
+      f"[{result['case_name']:<12} {result['dtype']:>4}] "
       f"B={result['B']:<1} Hq={result['Hq']:<2} Hkv={result['Hkv']:<2} "
-      f"Nq={result['Nq']:<4} Nkv={result['Nkv']:<4} D={result['D']:<3}  "
-      f"FFPA={result['ffpa_ms']:<6.2f} ms  SDPA={result['sdpa_ms']:<6.2f} ms  "
-      f"TFLOPS={ffpa_t:<5}/{sdpa_t:<5}  "
-      f"speedup={result['speedup']:<4.2f}x"
+      f"Nq={result['Nq']:<5} Nkv={result['Nkv']:<5} D={result['D']:<3} "
+      f"FFPA={result['ffpa_ms']:<6.2f}ms SDPA={result['sdpa_ms']:<6.2f}ms "
+      f"TFLOPS={tflops_str:<9} "
+      f"🎉{result['speedup']:<4.2f}x"
     )
   return (
-    f"[{result['case_name']:<16} {result['dtype']:<8} acc={result['acc']}] "
+    f"[{result['case_name']:<12} {result['dtype']:>4}] "
     f"B={result['B']:<1} Hq={result['Hq']:<2} Hkv={result['Hkv']:<2} "
-    f"Nq={result['Nq']:<4} Nkv={result['Nkv']:<4} D={result['D']:<3}  "
+    f"Nq={result['Nq']:<5} Nkv={result['Nkv']:<5} D={result['D']:<3} "
     f"O_err={result['max_diff']:<9.4f} "
-    f"allclose(atol={result['tolerance']:.2f})={str(result['allclose']):<5}  "
-    f"FFPA={result['ffpa_ms']:<6.2f} ms  SDPA={result['sdpa_ms']:<6.2f} ms  "
-    f"TFLOPS={ffpa_t:<5}/{sdpa_t:<5}  "
-    f"speedup={result['speedup']:<4.2f}x"
+    f"allclose(atol={result['tolerance']:.2f})={str(result['allclose']):<5} "
+    f"FFPA={result['ffpa_ms']:<6.2f}ms SDPA={result['sdpa_ms']:<6.2f}ms "
+    f"TFLOPS={tflops_str:<9} "
+    f"🎉{result['speedup']:<4.2f}x"
   )
 
 

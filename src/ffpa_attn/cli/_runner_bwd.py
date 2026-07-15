@@ -203,14 +203,15 @@ def _format_backward_result(
   """
   ffpa_t = format_tflops_short(result["ffpa_tflops"])
   sdpa_t = format_tflops_short(result["sdpa_tflops"])
+  tflops_str = f"{ffpa_t}/{sdpa_t}"
   if not verbose:
     return (
-      f"[{result['case_name']:<14} {result['dtype']:<8}] "
+      f"[{result['case_name']:<12} {result['dtype']:>4}] "
       f"B={result['B']:<1} Hq={result['Hq']:<2} Hkv={result['Hkv']:<2} "
-      f"Nq={result['Nq']:<4} Nkv={result['Nkv']:<4} D={result['D']:<3}  "
-      f"FFPA={result['ffpa_ms']:<6.2f} ms  SDPA={result['sdpa_ms']:<6.2f} ms  "
-      f"TFLOPS={ffpa_t:<5}/{sdpa_t:<5}  "
-      f"speedup={result['speedup']:<4.2f}x"
+      f"Nq={result['Nq']:<5} Nkv={result['Nkv']:<5} D={result['D']:<3} "
+      f"FFPA={result['ffpa_ms']:<6.2f}ms SDPA={result['sdpa_ms']:<6.2f}ms "
+      f"TFLOPS={tflops_str:<9} "
+      f"🎉{result['speedup']:<4.2f}x"
     )
   if result["dmask_err"] is not None:
     dmask_msg = f"dMask_err={result['dmask_err']:.4e}"
@@ -221,14 +222,14 @@ def _format_backward_result(
   else:
     dmask_msg = "dMask_err=(NO Grad)"
   return (
-    f"[{result['case_name']:<14} {result['dtype']:<8}] "
+    f"[{result['case_name']:<12} {result['dtype']:>4}] "
     f"B={result['B']:<1} Hq={result['Hq']:<2} Hkv={result['Hkv']:<2} "
-    f"Nq={result['Nq']:<4} Nkv={result['Nkv']:<4} D={result['D']:<3}  "
-    f"dQ_err={result['dq_err']:.4e}  dK_err={result['dk_err']:.4e}  "
-    f"dV_err={result['dv_err']:.4e}  {dmask_msg:<20}  "
-    f"FFPA={result['ffpa_ms']:<6.2f} ms  SDPA={result['sdpa_ms']:<6.2f} ms  "
-    f"TFLOPS={ffpa_t:<5}/{sdpa_t:<5}  "
-    f"speedup={result['speedup']:<4.2f}x"
+    f"Nq={result['Nq']:<5} Nkv={result['Nkv']:<5} D={result['D']:<3} "
+    f"dQ_err={result['dq_err']:.4e} dK_err={result['dk_err']:.4e} "
+    f"dV_err={result['dv_err']:.4e} {dmask_msg:<20}  "
+    f"FFPA={result['ffpa_ms']:<6.2f}ms SDPA={result['sdpa_ms']:<6.2f}ms  "
+    f"TFLOPS={tflops_str:<9} "
+    f"🎉{result['speedup']:<4.2f}x"
   )
 
 

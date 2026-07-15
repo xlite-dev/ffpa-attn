@@ -99,4 +99,4 @@ def format_tflops_short(tflops: float | None) -> str:
     return f"{tflops:.0f}T"
   if tflops >= 1.0:
     return f"{tflops:.1f}T"
-  return f"{tflops:.2f}T"
+  return f"{tflops:.1f}T".lstrip("0")
