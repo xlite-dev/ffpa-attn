@@ -1,8 +1,10 @@
 <div align="center">
   <p align="center">
     <h2>🤖FFPA: Yet another Faster Flash Prefill Attention <br>with O(1)⚡️GPU SRAM complexity for large headdim🐑</h2>
+    <img src=https://img.shields.io/badge/language-CUDA/Python-brightgreen.svg >
     <a href="https://pepy.tech/projects/ffpa-attn"><img src=https://static.pepy.tech/personalized-badge/ffpa-attn?period=total&units=ABBREVIATION&left_color=GRAY&right_color=BLUE&left_text=downloads/pypi ></a>
     <a href="https://pypi.org/project/ffpa-attn/"><img src=https://img.shields.io/github/release/xlite-dev/ffpa-attn.svg?color=GREEN ></a>
+    <img src=https://img.shields.io/github/stars/xlite-dev/ffpa-attn.svg?style=dark >
     <img src="https://img.shields.io/github/license/xlite-dev/ffpa-attn.svg?color=blue"><br>
     <img src="docs/assets/ffpa-api.png" width="700px">
 </div>
