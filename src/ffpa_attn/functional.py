@@ -62,6 +62,10 @@ def _allow_cute_small_d() -> bool:
   return _env_flag_enabled("FFPA_CUTE_ALLOW_SMALL_D")
 
 
+def _allow_cuda_small_d() -> bool:
+  return _env_flag_enabled("FFPA_CUDA_ALLOW_SMALL_D")
+
+
 def _backend_allows_small_d(backend: Backend, head_dim: int) -> bool:
   if not (_FFPA_SMALL_HEAD_DIM_MIN <= head_dim <= _ATEN_SMALL_HEAD_DIM_MAX):
     return False
@@ -69,6 +73,8 @@ def _backend_allows_small_d(backend: Backend, head_dim: int) -> bool:
     return _allow_triton_small_d()
   if isinstance(backend, CuTeDSLBackend):
     return _allow_cute_small_d()
+  if isinstance(backend, CUDABackend):
+    return _allow_cuda_small_d()
   return False
 
 

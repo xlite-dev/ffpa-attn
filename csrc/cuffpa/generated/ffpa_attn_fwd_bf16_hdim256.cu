@@ -25,6 +25,14 @@ void ffpa_attn_fwd_bf16f32_d256(
     launch_ffpa_attn_fwd_template<__nv_bfloat16, 256, kMmaAccFloat32QK, kMmaAccFloat32PV, 3>(Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale, dropout_p, philox_seed, philox_offset, tma);
   } else if (stages == 4) {
     launch_ffpa_attn_fwd_template<__nv_bfloat16, 256, kMmaAccFloat32QK, kMmaAccFloat32PV, 4>(Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale, dropout_p, philox_seed, philox_offset, tma);
+  } else if (stages == 5) {
+    launch_ffpa_attn_fwd_template<__nv_bfloat16, 256, kMmaAccFloat32QK, kMmaAccFloat32PV, 5>(Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale, dropout_p, philox_seed, philox_offset, tma);
+  } else if (stages == 6) {
+    launch_ffpa_attn_fwd_template<__nv_bfloat16, 256, kMmaAccFloat32QK, kMmaAccFloat32PV, 6>(Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale, dropout_p, philox_seed, philox_offset, tma);
+  } else if (stages == 7) {
+    launch_ffpa_attn_fwd_template<__nv_bfloat16, 256, kMmaAccFloat32QK, kMmaAccFloat32PV, 7>(Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale, dropout_p, philox_seed, philox_offset, tma);
+  } else if (stages == 8) {
+    launch_ffpa_attn_fwd_template<__nv_bfloat16, 256, kMmaAccFloat32QK, kMmaAccFloat32PV, 8>(Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale, dropout_p, philox_seed, philox_offset, tma);
   } else {
     launch_ffpa_attn_fwd_template<__nv_bfloat16, 256, kMmaAccFloat32QK, kMmaAccFloat32PV, 1>(Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale, dropout_p, philox_seed, philox_offset, tma);
   }
