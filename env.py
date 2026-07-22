@@ -529,7 +529,7 @@ class ENV(object):
     )
     max_stages = ENV.FFPA_BUILD_MAX_STAGES
     full_lines = ["#ifdef ENABLE_FFPA_ALL_STAGES"]
-    full_lines.append("  if (stages == 2) {{")
+    full_lines.append("  if (stages == 2) {")
     full_lines.append(f"    {call.replace('{S}', '2')}")
     for s in range(3, max_stages + 1):
       full_lines.append(f"  }} else if (stages == {s}) {{")
