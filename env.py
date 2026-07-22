@@ -25,21 +25,21 @@ class ENV(object):
   PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 
   # Enable all multi stages kernels or not, if True (1~N) else (1~2), default True.
-  # FFPA_BUILD_MAX_STAGES controls N, default 5.
+  # FFPA_BUILD_MAX_STAGES controls N, default 8.
   ENABLE_FFPA_ALL_STAGES = bool(
     int(os.environ.get("ENABLE_FFPA_ALL_STAGES", 1))
   )
 
   # Maximum cp.async pipeline stages to generate at build time.
   # Controls the range dispatched in generated TUs and the static_assert
-  # bounds in prefill.cuh. Default 5 (stages 1-5).
-  FFPA_BUILD_MAX_STAGES = int(os.environ.get("FFPA_BUILD_MAX_STAGES", 5))
+  # bounds in prefill.cuh. Default 8 (stages 1-8).
+  FFPA_BUILD_MAX_STAGES = int(os.environ.get("FFPA_BUILD_MAX_STAGES", 8))
 
-  # Enable all headdims for FFPA kernels or not, default False.
+  # Enable all headdims for FFPA kernels or not, default True.
   # True, headdim will range from 32 to 1024 with step = 32, range(32, 1024, 32)
   # False, headdim will range from 256 to 1024 with step = 64, range(256, 1024, 64)
   ENABLE_FFPA_ALL_HEADDIM = bool(
-    int(os.environ.get("ENABLE_FFPA_ALL_HEADDIM", 0))
+    int(os.environ.get("ENABLE_FFPA_ALL_HEADDIM", 1))
   )
 
   # Enable force Q@K^T use fp16 as MMA Acc dtype for FFPA Acc F32 kernels, default False.
