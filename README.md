@@ -1,7 +1,6 @@
 <div align="center">
   <p align="center">
     <h2>🤖FFPA: Yet another Faster Flash Prefill Attention <br>with O(1)⚡️GPU SRAM complexity for large headdim🐑</h2>
-    <a href=https://doi.org/10.5281/zenodo.20638547><img src=https://zenodo.org/badge/DOI/10.5281/zenodo.20638547.svg ></a>
     <a href="https://pepy.tech/projects/ffpa-attn"><img src=https://static.pepy.tech/personalized-badge/ffpa-attn?period=total&units=ABBREVIATION&left_color=GRAY&right_color=BLUE&left_text=downloads/pypi ></a>
     <a href="https://pypi.org/project/ffpa-attn/"><img src=https://img.shields.io/github/release/xlite-dev/ffpa-attn.svg?color=GREEN ></a>
     <img src="https://img.shields.io/github/license/xlite-dev/ffpa-attn.svg?color=blue"><br>
@@ -20,7 +19,7 @@
 
 ## 🎉🎉 Latest News
 
-- [2026-06-10] DefTruth, Butterfingrz (2026). [FFPA: Efficient Flash Prefill Attention for Large Head Dimensions via Split-D.](docs/assets/papers/ffpa-tech-report-v1.pdf) Zenodo, 2026. [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.20638547.svg)](https://doi.org/10.5281/zenodo.20638547) 🎉🎉🎉
+- [2026-06-10] DefTruth, Butterfingrz (2026). [FFPA: Efficient Flash Prefill Attention for Large Head Dimensions via Split-D.](https://doi.org/10.5281/zenodo.20638547) Zenodo, 2026. 🎉🎉🎉
 
 <div align='center'>
   <img src="docs/assets/papers/attention-variants.png" width="600px">
