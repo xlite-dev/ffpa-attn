@@ -31,6 +31,7 @@ DEFAULT_WARMUP = 2
 DEFAULT_ITERS = 10
 FORWARD_RESULT = dict[str, Any]
 TRITON_SMALL_D_ENV = "FFPA_TRITON_ALLOW_SMALL_D"
+CUDA_SMALL_D_ENV = "FFPA_CUDA_ALLOW_SMALL_D"
 CUTEDSL_SMALL_D_ENV = "FFPA_CUTE_ALLOW_SMALL_D"
 
 
@@ -246,9 +247,13 @@ def _make_forward_backend(
   triton_autotune_mode: str,
   enable_tma: bool,
   enable_ws: bool,
+  cuda_stages: int | None = None,
 ):
   if name == "cuda":
-    return CUDABackend(forward=True, acc=acc)
+    kwargs = {"forward": True, "acc": acc}
+    if cuda_stages is not None:
+      kwargs["stages"] = cuda_stages
+    return CUDABackend(**kwargs)
   if name == "triton":
     return TritonBackend(
       forward=True,
@@ -286,6 +291,7 @@ def _run_case(
   enable_tma: bool = False,
   enable_ws: bool = False,
   verbose: bool = False,
+  stages: int | None = None,
 ) -> FORWARD_RESULT:
   torch.manual_seed(seed)
   q = torch.randn(B, Nh_q, Nq, D, dtype=dtype, device="cuda")
@@ -299,6 +305,7 @@ def _run_case(
     triton_autotune_mode=triton_autotune_mode,
     enable_tma=enable_tma,
     enable_ws=enable_ws,
+    cuda_stages=stages,
   )
   backward_backend = CuTeDSLBackend(
     backward=True
@@ -410,6 +417,7 @@ def run_forward_examples(
   tasks: set[str] | None = None,
   dtypes: tuple[torch.dtype, ...] = (torch.float16, torch.bfloat16),
   verbose: bool = False,
+  stages: int | None = None,
 ) -> list[FORWARD_RESULT]:
   """Run the canonical forward benchmark cases.
 
@@ -449,6 +457,7 @@ def run_forward_examples(
     ("grad_kv_storage_dtype", str(grad_kv_storage_dtype)),
     ("enable_fwd_tma", str(enable_tma)),
     ("enable_fwd_ws", str(enable_ws)),
+    ("cuda_stages", str(stages)),
     ("tasks", tasks_str),
     ("warmup", str(warmup)),
     ("iters", str(iters)),
@@ -470,6 +479,12 @@ def run_forward_examples(
     print(
       f"[Triton] D <= 256 {'runs FFPA Triton' if triton_small_d_enabled else 'stays on the SDPA fallback path'} "
       f"when {TRITON_SMALL_D_ENV}={'1' if triton_small_d_enabled else '0'}."
+    )
+  if forward_backend == "cuda" and D <= 256:
+    cuda_small_d_enabled = bool(int(os.environ.get(CUDA_SMALL_D_ENV, "0")))
+    print(
+      f"[CUDA] D <= 256 {'runs FFPA CUDA' if cuda_small_d_enabled else 'stays on the SDPA fallback path'} "
+      f"when {CUDA_SMALL_D_ENV}={'1' if cuda_small_d_enabled else '0'}."
     )
   if forward_backend == "cutedsl":
     cutedsl_small_d_enabled = bool(
@@ -586,6 +601,7 @@ def run_forward_examples(
           enable_tma=enable_tma,
           enable_ws=enable_ws,
           verbose=verbose,
+          stages=stages,
         )
       )
 

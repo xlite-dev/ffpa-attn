@@ -27,6 +27,9 @@ template <const int kHeadDim, const int kMmaAtomM, const int kMmaAtomN,
           const int kStageQK, const int kStagePV, const int kPadQ,
           const int kPadK, const int kPadV>
 __device__ __forceinline__ void check_large_d_compiling_states() {
+#ifndef FFPA_BUILD_MAX_STAGES
+#define FFPA_BUILD_MAX_STAGES 4
+#endif
   // Matmul Layout: Q[Br,d]@K^T[d,Bc] NT, P[Br,Bc]@V[Bc,d] NN.
   // NOTE: K[Bc,d] with row major means K^T[d,Bc] in col major.
   static_assert(kMmaAtomM == 16 && kMmaAtomN == 8 &&
@@ -60,65 +63,8 @@ __device__ __forceinline__ void check_large_d_compiling_states() {
   // overlapping.
   static_assert(kRegPipeKV == 0 || kRegPipeKV == 1);
   // May apply different multi stages policy for QK and V.
-  static_assert(kStageQK < 5 && kStageQK > 0);  // QK (<=4)
-  static_assert(kStagePV < 5 && kStagePV > 0);  // V  (<=4)
-  static_assert(kPadQ >= 0 && kPadQ % 8 == 0);  // 0,8,16
-  static_assert(kPadK >= 0 && kPadK % 8 == 0);  // 0,8,16
-  static_assert(kPadV >= 0 && kPadV % 8 == 0);  // 0,8,16
-}
-
-// Compile-time sanity checks for the small-d (D <= 256) FFPA kernel
-// template. Enforces the FA-2-style small-d invariants (e.g. kStageQK ==
-// kStagePV == 1, Br >= Bc, kRegPipeKV and kPersistVs2r mutually exclusive).
-// See ``ffpa_stages_split_q_small_d_template`` for the full parameter
-// contract.
-template <const int kHeadDim, const int kMmaAtomM, const int kMmaAtomN,
-          const int kMmaAtomK, const int kMmaTileSeqLenQ,
-          const int kMmaTileSeqLenK, const int kMmaTileSeqLenP,
-          const int kMmaTileHeadDimV, const int kValTileSeqLenQ,
-          const int kValTileSeqLenK, const int kValTileSeqLenP,
-          const int kValTileHeadDimV, const int kMmaAccFloat32QK,
-          const int kMmaAccFloat32PV, const int kOStorageAccFloat32,
-          const int kPrefetchQK, const int kPrefetchPV, const int kShareSmemQKV,
-          const int kPersistQs2r, const int kPersistVs2r, const int kRegPipeKV,
-          const int kStageQK, const int kStagePV, const int kPadQ,
-          const int kPadK, const int kPadV>
-__device__ __forceinline__ void check_small_d_compiling_states() {
-  // Matmul Layout: Q[Br,d]@K^T[d,Bc] NT, P[Br,Bc]@V[Bc,d] NN.
-  // NOTE: K[Bc,d] with row major means K^T[d,Bc] in col major.
-  static_assert(kMmaAtomM == 16 && kMmaAtomN == 8 &&
-                kMmaAtomK == 16);                                // m16n8k16
-  static_assert(kMmaTileSeqLenQ <= 8 && kMmaTileSeqLenK == 1);   // Q@K^T
-  static_assert(kMmaTileSeqLenP <= 8 && kMmaTileHeadDimV == 1);  // P@V
-  static_assert(kValTileSeqLenQ == 1 && kValTileSeqLenK <= 16);  // Q@K^T
-  static_assert(kValTileSeqLenP == 1 &&
-                kValTileHeadDimV ==
-                    (kHeadDim / (kMmaAtomN * kMmaTileHeadDimV)));  // P@V
-  static_assert(kMmaAccFloat32QK == 0 || kMmaAccFloat32QK == 1);
-  static_assert(kMmaAccFloat32PV == 0 || kMmaAccFloat32PV == 1);
-  static_assert(kOStorageAccFloat32 == 0 || kOStorageAccFloat32 == 1);
-  // Make sure that Br >= Bc, for shared memory reuse.
-  static_assert((kMmaAtomM * kMmaTileSeqLenQ * kValTileSeqLenQ) >=
-                (kMmaAtomN * kMmaTileSeqLenK * kValTileSeqLenK));
-  static_assert(kPrefetchQK == 0 || kPrefetchQK == 1);
-  static_assert(kPrefetchPV == 0 || kPrefetchPV == 1);
-  static_assert(kShareSmemQKV == 0 || kShareSmemQKV == 1);
-  // Persist load Q s2r for headdim <= 128, more registers.
-  static_assert(kPersistQs2r == 0 || kPersistQs2r == 1);
-  // Persist load V s2r for headdim <= 128, more registers.
-  static_assert(kPersistVs2r == 0 || kPersistVs2r == 1);
-  if constexpr (kShareSmemQKV) {
-    // kPersistQs2r must be enabled is set kShareSmemQKV as 1
-    static_assert(kPersistQs2r == 1);
-  }
-  // Registers Ping pong double buffers for ldmatrix s2r & mma
-  // computation overlapping.
-  static_assert(kRegPipeKV == 0 || kRegPipeKV == 1);
-  // kRegPipeKV and kPersistVs2r can not both enabled.
-  static_assert((kRegPipeKV & kPersistVs2r) == 0);
-  // May apply different multi stages policy for QK and V.
-  static_assert(kStageQK < 5 && kStageQK > 0);  // QK (<=4)
-  static_assert(kStagePV < 5 && kStagePV > 0);  // V  (<=4)
+  static_assert(kStageQK < (FFPA_BUILD_MAX_STAGES + 1) && kStageQK > 0);
+  static_assert(kStagePV < (FFPA_BUILD_MAX_STAGES + 1) && kStagePV > 0);
   static_assert(kPadQ >= 0 && kPadQ % 8 == 0);  // 0,8,16
   static_assert(kPadK >= 0 && kPadK % 8 == 0);  // 0,8,16
   static_assert(kPadV >= 0 && kPadV % 8 == 0);  // 0,8,16

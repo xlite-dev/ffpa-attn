@@ -24,10 +24,16 @@ class ENV(object):
   # Project dir, path to faster-prefill-attention
   PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 
-  # Enable all multi stages kernels or not, if True (1~4) else (1~2), default True.
+  # Enable all multi stages kernels or not, if True (1~N) else (1~2), default True.
+  # FFPA_BUILD_MAX_STAGES controls N, default 5.
   ENABLE_FFPA_ALL_STAGES = bool(
     int(os.environ.get("ENABLE_FFPA_ALL_STAGES", 1))
   )
+
+  # Maximum cp.async pipeline stages to generate at build time.
+  # Controls the range dispatched in generated TUs and the static_assert
+  # bounds in prefill.cuh. Default 5 (stages 1-5).
+  FFPA_BUILD_MAX_STAGES = int(os.environ.get("FFPA_BUILD_MAX_STAGES", 5))
 
   # Enable all headdims for FFPA kernels or not, default False.
   # True, headdim will range from 32 to 1024 with step = 32, range(32, 1024, 32)
@@ -84,13 +90,6 @@ class ENV(object):
     int(os.environ.get("ENABLE_FFPA_PERSIST_Q_G2S", 1))
   )
 
-  # Persist load KV g2s for headdim <= 256, more SRAM. If True, auto use flash-attn
-  # algo that tiling at attention level for headdim <= 256 and auto use ffpa-attn
-  # fined-grain tiling at MMA level for headdim > 256.
-  ENABLE_FFPA_PERSIST_KV_G2S = bool(
-    int(os.environ.get("ENABLE_FFPA_PERSIST_KV_G2S", 1))
-  )
-
   # Persist load Q from s2r for headdim < 512 to reduce Q from g2s and s2r IO access,
   # but still keep O(1) SRAM complexity. Default value is False. This option will
   # introduce more registers for Q frags as the headdim becomes larger. We should
@@ -98,11 +97,6 @@ class ENV(object):
   # IO access reduction.
   ENABLE_FFPA_PERSIST_Q_S2R = bool(
     int(os.environ.get("ENABLE_FFPA_PERSIST_Q_S2R", 0))
-  )
-
-  # Persist V s2r only for small d kernel, more registers.
-  ENABLE_FFPA_PERSIST_V_S2R = bool(
-    int(os.environ.get("ENABLE_FFPA_PERSIST_V_S2R", 1))
   )
 
   # Registers Ping pong double buffers for ldmatrix & mma computation overlapping.
@@ -238,18 +232,8 @@ class ENV(object):
     return cls.ENABLE_FFPA_PERSIST_Q_G2S
 
   @classmethod
-  def enable_persist_kv_g2s(cls):
-    return cls.ENABLE_FFPA_PERSIST_KV_G2S
-
-  @classmethod
   def enable_persist_q_s2r(cls):
     return cls.ENABLE_FFPA_PERSIST_Q_S2R
-
-  @classmethod
-  def enable_persist_v_s2r(cls):
-    if cls.enable_persist_kv_g2s():
-      return cls.ENABLE_FFPA_PERSIST_V_S2R
-    return False
 
   @classmethod
   def enable_registers_pipe_kv(cls):
@@ -276,6 +260,9 @@ class ENV(object):
     extra_env_cflags = []
     if cls.enable_all_mutistages():
       extra_env_cflags.append("-DENABLE_FFPA_ALL_STAGES")
+    extra_env_cflags.append(
+      f"-DFFPA_BUILD_MAX_STAGES={cls.FFPA_BUILD_MAX_STAGES}"
+    )
     if cls.enable_all_headdim():
       extra_env_cflags.append("-DENABLE_FFPA_ALL_HEADDIM")
     if cls.enable_force_qk_fp16():
@@ -294,12 +281,8 @@ class ENV(object):
       extra_env_cflags.append("-DENABLE_FFPA_SMEM_SWIZZLE_V")
     if cls.enable_persist_q_g2s():
       extra_env_cflags.append("-DENABLE_FFPA_PERSIST_Q_G2S")
-    if cls.enable_persist_kv_g2s():
-      extra_env_cflags.append("-DENABLE_FFPA_PERSIST_KV_G2S")
     if cls.enable_persist_q_s2r():
       extra_env_cflags.append("-DENABLE_FFPA_PERSIST_Q_S2R")
-    if cls.enable_persist_v_s2r():
-      extra_env_cflags.append("-DENABLE_FFPA_PERSIST_V_S2R")
     if cls.enable_registers_pipe_kv():
       extra_env_cflags.append("-DENABLE_FFPA_REGISTERS_PIPE_KV")
     if cls.enable_launch_grid_dnhb():
@@ -307,23 +290,10 @@ class ENV(object):
     if cls.enable_cuda_impl():
       extra_env_cflags.append("-DENABLE_FFPA_CUDA_IMPL")
 
-    if cls.enable_persist_kv_g2s():
-      assert (
-        cls.enable_persist_q_g2s()
-      ), "PERSIST_Q_G2S must be enable if PERSIST_KV_G2S is enabled."
-      if cls.enable_qkv_smem_share():
-        assert (
-          cls.enable_persist_q_s2r()
-        ), "PERSIST_Q_S2R must be enable if QKV_SMEM_SHARE and "
-        "PERSIST_KV_G2S are enabled."
-    else:
-      assert not all((cls.enable_persist_q_s2r(), cls.enable_persist_q_g2s())
-                     ), "PERSIST_Q_G2S and PERSIST_Q_S2R can not both enabled."
-      assert not all((cls.enable_qkv_smem_share(), cls.enable_persist_q_g2s())
-                     ), "PERSIST_Q_G2S and QKV_SMEM_SHARE can not both enabled."
-      assert not all(
-        (cls.enable_qkv_smem_share(), cls.enable_persist_kv_g2s())
-      ), "PERSIST_KV_G2S and QKV_SMEM_SHARE can not both enabled."
+    assert not all((cls.enable_persist_q_s2r(), cls.enable_persist_q_g2s())
+                   ), "PERSIST_Q_G2S and PERSIST_Q_S2R can not both enabled."
+    assert not all((cls.enable_qkv_smem_share(), cls.enable_persist_q_g2s())
+                   ), "PERSIST_Q_G2S and QKV_SMEM_SHARE can not both enabled."
     return extra_env_cflags
 
   @classmethod
@@ -357,14 +327,13 @@ class ENV(object):
       )
     )
     formatenv("ENABLE_FFPA_ALL_STAGES", cls.enable_all_mutistages())
+    formatenv("FFPA_BUILD_MAX_STAGES", cls.FFPA_BUILD_MAX_STAGES)
     formatenv("ENABLE_FFPA_ALL_HEADDIM", cls.enable_all_headdim())
     formatenv("ENABLE_FFPA_PREFETCH_QKV", cls.enable_prefetch_qkv())
     formatenv("ENABLE_FFPA_FORCE_QK_F16", cls.enable_force_qk_fp16())
     formatenv("ENABLE_FFPA_FORCE_PV_F16", cls.enable_force_pv_fp16())
     formatenv("ENABLE_FFPA_PERSIST_Q_G2S", cls.enable_persist_q_g2s())
-    formatenv("ENABLE_FFPA_PERSIST_KV_G2S", cls.enable_persist_kv_g2s())
     formatenv("ENABLE_FFPA_PERSIST_Q_S2R", cls.enable_persist_q_s2r())
-    formatenv("ENABLE_FFPA_PERSIST_V_S2R", cls.enable_persist_v_s2r())
     formatenv("ENABLE_FFPA_QKV_SMEM_SHARE", cls.enable_qkv_smem_share())
     formatenv("ENABLE_FFPA_SMEM_SWIZZLE_Q", cls.enable_smem_swizzle_q())
     formatenv("ENABLE_FFPA_SMEM_SWIZZLE_K", cls.enable_smem_swizzle_k())
@@ -540,9 +509,8 @@ class ENV(object):
   def _render_stage_body(d: int, t_in: str, qk: str, pv: str) -> str:
     """Render the stage-dispatch body at body scope (2-space indent).
 
-    Preprocessor directives intentionally start at column 0 as required
-    by strict compilers, while normal statements use the 2-space indent
-    that matches the surrounding function body.
+    Stages dispatched: ``ENABLE_FFPA_ALL_STAGES=1`` → 2..max_stages plus
+    fallback to 1; ``=0`` → only 2 plus fallback to 1.
 
     :param d: Headdim value to bake into the kernel template arguments.
     :param t_in: C++ activation type name (e.g. ``__half`` or
@@ -559,25 +527,24 @@ class ENV(object):
       "{S}>(Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale, "
       "dropout_p, philox_seed, philox_offset, tma);"
     )
-    return (
-      "#ifdef ENABLE_FFPA_ALL_STAGES\n"
-      "  if (stages == 2) {\n"
-      f"    {call.replace('{S}', '2')}\n"
-      "  } else if (stages == 3) {\n"
-      f"    {call.replace('{S}', '3')}\n"
-      "  } else if (stages == 4) {\n"
-      f"    {call.replace('{S}', '4')}\n"
-      "  } else {\n"
-      f"    {call.replace('{S}', '1')}\n"
-      "  }\n"
-      "#else\n"
-      "  if (stages == 2) {\n"
-      f"    {call.replace('{S}', '2')}\n"
-      "  } else {\n"
-      f"    {call.replace('{S}', '1')}\n"
-      "  }\n"
-      "#endif\n"
-    )
+    max_stages = ENV.FFPA_BUILD_MAX_STAGES
+    full_lines = ["#ifdef ENABLE_FFPA_ALL_STAGES"]
+    full_lines.append("  if (stages == 2) {{")
+    full_lines.append(f"    {call.replace('{S}', '2')}")
+    for s in range(3, max_stages + 1):
+      full_lines.append(f"  }} else if (stages == {s}) {{")
+      full_lines.append(f"    {call.replace('{S}', str(s))}")
+    full_lines.append("  } else {")
+    full_lines.append(f"    {call.replace('{S}', '1')}")
+    full_lines.append("  }")
+    full_lines.append("#else")
+    full_lines.append("  if (stages == 2) {")
+    full_lines.append(f"    {call.replace('{S}', '2')}")
+    full_lines.append("  } else {")
+    full_lines.append(f"    {call.replace('{S}', '1')}")
+    full_lines.append("  }")
+    full_lines.append("#endif")
+    return "\n".join(full_lines) + "\n"
 
   @classmethod
   def _render_per_headdim_fp16_tu(cls, d: int) -> str:

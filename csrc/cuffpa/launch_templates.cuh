@@ -2,14 +2,11 @@
 #include <c10/cuda/CUDAGuard.h>
 
 #include "ffpa_attn_fwd.cuh"
+#include "ffpa_attn_fwd_split_kv.cuh"
 using namespace ffpa;
 
-static constexpr int kMaxDForSmallDKernel = 128;
-// Always use fp32 accumulators for O to reduce numerical instability
-// for D up to 512; Use fp16/bf16 for D > 512 to save registers, since
-// the larger D may cuase register spilling when using fp32 accumulators.
 static constexpr int kMaxDForOStoreFloat32 = 512;
-static constexpr int kMaxDForSmallBlockTile = 256;
+// for D up to 512; Use fp16/bf16 for D > 512 to save registers, since
 
 static inline int select_decode_num_splits(int batch_nheads_mblocks,
                                            int num_sms, int num_n_blocks,
@@ -65,28 +62,16 @@ static inline int select_decode_num_splits(int batch_nheads_mblocks,
 
 template <const int kHeadDim>
 static constexpr int getConfigMmaTileSeqLenQP() {
-#ifdef ENABLE_FFPA_PERSIST_KV_G2S
-  constexpr int kMmaTileSeqLenQP = (kHeadDim <= kMaxDForSmallBlockTile) ? 8 : 8;
-#else
-  constexpr int kMmaTileSeqLenQP = (kHeadDim <= kMaxDForSmallBlockTile) ? 8 : 8;
-#endif
-  return kMmaTileSeqLenQP;
+  return 8;
 }
 
 template <const int kHeadDim>
-static constexpr int getConfigWarpTileSeqLenK() {
-#ifdef ENABLE_FFPA_PERSIST_KV_G2S
-  constexpr int kValTileSeqLenK =
-      (kHeadDim <= kMaxDForSmallBlockTile) ? 16 : 16;
-#else
-  constexpr int kValTileSeqLenK =
-      (kHeadDim <= kMaxDForSmallBlockTile) ? 16 : 16;
-#endif
-  return kValTileSeqLenK;
+static constexpr int getConfigValTileSeqLenK() {
+  return 16;
 }
 
 template <const int kHeadDim>
-static constexpr int getConfigWarpTileHeadDimV() {
+static constexpr int getConfigValTileHeadDimV() {
   constexpr int kMmaAtomN = 8;
   constexpr int kMmaTileHeadDimV = 1;
   constexpr int kValTileHeadDimV = (kHeadDim / (kMmaAtomN * kMmaTileHeadDimV));
@@ -116,11 +101,7 @@ template <const int kStageQKV>
 static constexpr int getConfigPrefetchQKV() {
   // Prefetch QKV at the appropriate time point.
 #if defined(ENABLE_FFPA_PREFETCH_QKV)
-#if defined(ENABLE_FFPA_PERSIST_KV_G2S)
-  constexpr int kPrefetchQKV = 1;  // kStageQKV is unused
-#else
   constexpr int kPrefetchQKV = (kStageQKV > 1) ? 1 : 0;
-#endif
 #else
   constexpr int kPrefetchQKV = 0;
 #endif
@@ -149,15 +130,6 @@ static constexpr int getConfigPersistQs2r() {
   constexpr int kPersistQs2r = 0;
 #endif
   return kPersistQs2r;
-}
-
-static constexpr int getConfigPersistVs2r() {
-#ifdef ENABLE_FFPA_PERSIST_V_S2R
-  constexpr int kPersistVs2r = 1;
-#else
-  constexpr int kPersistVs2r = 0;
-#endif
-  return kPersistVs2r;
 }
 
 static constexpr int getConfigRegistersPipeKV() {
@@ -219,51 +191,7 @@ template <const int Br, const int Bc, const int kMmaAtomM, const int kMmaAtomN,
           const int kPersistQg2s, const int kPersistQs2r, const int kStageQK,
           const int kStagePV, const int kPadQ, const int kPadK, const int kPadV>
 static constexpr int getConfigQKVSmemMaxSize() {
-#ifdef ENABLE_FFPA_PERSIST_KV_G2S
-  if constexpr (kHeadDim <=
-                kMaxDForSmallDKernel) {  // e.g > 128 will use large d kernel
-    // Calculate SRAM size needed per block, Q,K,V smem size, V shared the QK
-    // smem.
-    constexpr int Q_smem_size =
-        ((kHeadDim / kMmaAtomK) * (Br * (kMmaAtomK + kPadQ)));
-    constexpr int K_smem_size =
-        ((kHeadDim / kMmaAtomK) * (Bc * (kMmaAtomK + kPadK)));
-    constexpr int V_smem_size =
-        ((kHeadDim / (kMmaAtomN * 2)) * (Bc * (kMmaAtomN * 2 + kPadV)));
-    constexpr int kQSmemMaxSize = Q_smem_size * 2;
-    constexpr int kKSmemMaxSize = K_smem_size * 2;
-    constexpr int kVSmemMaxSize = V_smem_size * 2;
-    constexpr int kQKSmemMaxSize =
-        (kQSmemMaxSize > kKSmemMaxSize ? kQSmemMaxSize : kKSmemMaxSize);
-    constexpr int kQKVSmemMaxSize =
-        ((kShareSmemQKV && kPersistQs2r) ? (kQKSmemMaxSize + kVSmemMaxSize)
-                                         :  // QK shared the same smem
-             (kQSmemMaxSize + kKSmemMaxSize + kVSmemMaxSize));
-    return kQKVSmemMaxSize;
-  } else {
-    // Calculate SRAM size needed per block, Q,K,V smem size, V shared the QK
-    // smem.
-    constexpr int Q_smem_size =
-        ((kPersistQg2s ? (kHeadDim / kMmaAtomK) : kStageQK) *
-         (Br * (kMmaAtomK + kPadQ))) *
-        2;
-    constexpr int K_smem_size = ((kStageQK) * (Bc * (kMmaAtomK + kPadK))) * 2;
-    constexpr int V_smem_size = (kStagePV * (Bc * (kMmaAtomN * 2 + kPadV))) * 2;
-    constexpr int kQKSmemMaxSize = (Q_smem_size + K_smem_size);
-    constexpr int kVSmemMaxSize = V_smem_size;
-    // try to let V reuse all Q+K smem after Q@K^T, reduce smem usage.
-    constexpr int kQKVSmemMaxSize =
-        ((kShareSmemQKV && (!kPersistQg2s))
-             ? ((kQKSmemMaxSize > kVSmemMaxSize) ? kQKSmemMaxSize
-                                                 : kVSmemMaxSize)
-             : (kQKSmemMaxSize + kVSmemMaxSize));
-    // NOTE: R_D registers usage, s=2, d=64, 16 regs; d=128, 32 regs;
-    // d=256, 64 regs; d=512, 128 regs; d=1024, 256 regs;
-    return kQKVSmemMaxSize;
-  }
-#else
-  // Calculate SRAM size needed per block, Q,K,V smem size, V shared the QK
-  // smem.
+  // Unified split-D SMEM size calculation for all headdims.
   constexpr int Q_smem_size =
       ((kPersistQg2s ? (kHeadDim / kMmaAtomK) : kStageQK) *
        (Br * (kMmaAtomK + kPadQ))) *
@@ -280,22 +208,21 @@ static constexpr int getConfigQKVSmemMaxSize() {
   // NOTE: R_D registers usage, s=2, d=64, 16 regs; d=128, 32 regs;
   // d=256, 64 regs; d=512, 128 regs; d=1024, 256 regs;
   return kQKVSmemMaxSize;
-#endif
 }
 
 // Host-side launcher that picks compile-time configuration (block tile,
 // stages, prefetch / share-smem flags, pad vs swizzle, etc.) based on
-// ``kHeadDim`` and build macros, then launches the correct FFPA kernel
-// template (small-d FA-2 style vs large-d split-Q) on the caller's
-// current CUDA stream. Validates Q/K/V/O shape invariants up-front via
-// ``TORCH_CHECK`` (GQA/MQA head ratio, matching Nkv / D, and the
+// ``kHeadDim`` and build macros, then launches the
+// ``ffpa_attn_split_d_fwd_template`` kernel on the caller's current CUDA
+// stream. Validates Q/K/V/O shape invariants up-front via ``TORCH_CHECK``
+// (GQA/MQA head ratio, matching Nkv / D, and the
 // ``causal => Nkv >= Nq`` rule).
 //
 // Template parameters:
 //   kDataType            Activation dtype: ``__half`` or ``__nv_bfloat16``.
-//   kHeadDim             Head dim D (32, 64, ..., 1024); selects the
-//                        small-d vs large-d kernel and the block tile.
-//   kMmaAccFloat32QK/PV  0 -> fp16 MMA accumulator, 1 -> fp32 accumulator.
+//   kHeadDim             Head dim D (32, 64, ..., 1024); selects block tile
+//   config. kMmaAccFloat32QK/PV  0 -> fp16 MMA accumulator, 1 -> fp32
+//   accumulator.
 //                        Must both be 1 for bf16 activations.
 //   kStage               cp.async pipeline depth used for QK (the PV
 //                        depth is derived inside the launcher).
@@ -331,9 +258,9 @@ void launch_ffpa_attn_fwd_template(torch::Tensor Q, torch::Tensor K,
   constexpr int kMmaTileSeqLenP = getConfigMmaTileSeqLenQP<kHeadDim>();
   constexpr int kMmaTileHeadDimV = 1;
   constexpr int kValTileSeqLenQ = 1;
-  constexpr int kValTileSeqLenK = getConfigWarpTileSeqLenK<kHeadDim>();
+  constexpr int kValTileSeqLenK = getConfigValTileSeqLenK<kHeadDim>();
   constexpr int kValTileSeqLenP = 1;
-  constexpr int kValTileHeadDimV = getConfigWarpTileHeadDimV<kHeadDim>();
+  constexpr int kValTileHeadDimV = getConfigValTileHeadDimV<kHeadDim>();
   constexpr int Br = kMmaAtomM * kMmaTileSeqLenQ * kValTileSeqLenQ;
   constexpr int Bc = kMmaAtomN * kMmaTileSeqLenK * kValTileSeqLenK;
   static_assert(Br == Bc,
@@ -342,8 +269,8 @@ void launch_ffpa_attn_fwd_template(torch::Tensor Q, torch::Tensor K,
   constexpr int kOStorageAccFloat32 = getConfigOStorageAccFloat32<kHeadDim>();
   // Apply different multi stages policy for QK and V.
   // TODO: tune stages for Q@K and P@V.
-  constexpr int kStageQK = kStage;  // <= 4
-  constexpr int kStagePV = kStage;  // <= 4
+  constexpr int kStageQK = kStage;  // <= FFPA_BUILD_MAX_STAGES
+  constexpr int kStagePV = kStage;  // <= FFPA_BUILD_MAX_STAGES
   // Prefetch QKV, Persist Q g2s/s2r, Shared QKV smem.
   constexpr int kShareSmemQKV = getConfigShareSmemQKV();
   constexpr int kPrefetchQK = getConfigPrefetchQKV<kStageQK>();
@@ -458,41 +385,39 @@ void launch_ffpa_attn_fwd_template(torch::Tensor Q, torch::Tensor K,
   const c10::cuda::OptionalCUDAGuard device_guard(Q.device());
   auto stream = at::cuda::getCurrentCUDAStream();
 
-  if constexpr (kHeadDim > kMaxDForSmallDKernel) {
-    const int num_sms_x2 =
-        max(1, at::cuda::getCurrentDeviceProperties()->multiProcessorCount * 2);
-    const int num_splits = select_decode_num_splits(
-        Nb * Nh * utils::div_ceil(Nq, 16), num_sms_x2, Tc, 128, min(Nq, 16));
-    if (Nq == 1 && num_splits > 1 && !has_attn_bias && !has_dropout) {
-      const int split_size = utils::div_ceil(Tc, num_splits) * Bc;
-      auto scratch_options =
-          torch::TensorOptions().dtype(torch::kFloat32).device(Q.device());
-      auto partial_out =
-          torch::empty({Nb, Nh, num_splits, Nq, kHeadDim}, scratch_options);
-      auto chunk_lse = torch::empty({Nb, Nh, num_splits, Nq}, scratch_options);
-      const dim3 decode_stage1_grid = dim3(num_splits, Nb * Nh, 1);
-      const dim3 decode_stage2_grid = dim3(Nq, Nb * Nh, 1);
-      const int decode_threads =
-          ((kHeadDim / 8) + WARP_SIZE - 1) / WARP_SIZE * WARP_SIZE;
-      const dim3 decode_block = dim3(decode_threads, 1, 1);
-      // Pure gemv implementation for Nq=1 case, do the reduction in stage 2.
-      auto decode_stage1_kernel =
-          (ffpa_attn_splitkv_decode_stage1_template<kDataType, kHeadDim, true>);
-      decode_stage1_kernel<<<decode_stage1_grid, decode_block, 0, stream>>>(
-          reinterpret_cast<kDataType*>(Q.data_ptr()),
-          reinterpret_cast<kDataType*>(K.data_ptr()),
-          reinterpret_cast<kDataType*>(V.data_ptr()),
-          partial_out.data_ptr<float>(), chunk_lse.data_ptr<float>(), Nq, Nkv,
-          Nh, Nh_kv, scale, num_splits, split_size, causal);
+  const int num_sms_x2 =
+      max(1, at::cuda::getCurrentDeviceProperties()->multiProcessorCount * 2);
+  const int num_splits = select_decode_num_splits(
+      Nb * Nh * utils::div_ceil(Nq, 16), num_sms_x2, Tc, 128, min(Nq, 16));
+  if (Nq == 1 && num_splits > 1 && !has_attn_bias && !has_dropout) {
+    const int split_size = utils::div_ceil(Tc, num_splits) * Bc;
+    auto scratch_options =
+        torch::TensorOptions().dtype(torch::kFloat32).device(Q.device());
+    auto partial_out =
+        torch::empty({Nb, Nh, num_splits, Nq, kHeadDim}, scratch_options);
+    auto chunk_lse = torch::empty({Nb, Nh, num_splits, Nq}, scratch_options);
+    const dim3 decode_stage1_grid = dim3(num_splits, Nb * Nh, 1);
+    const dim3 decode_stage2_grid = dim3(Nq, Nb * Nh, 1);
+    const int decode_threads =
+        ((kHeadDim / 8) + WARP_SIZE - 1) / WARP_SIZE * WARP_SIZE;
+    const dim3 decode_block = dim3(decode_threads, 1, 1);
+    // Pure gemv implementation for Nq=1 case, do the reduction in stage 2.
+    auto decode_stage1_kernel =
+        (ffpa_attn_split_kv_decode_stage1_template<kDataType, kHeadDim, true>);
+    decode_stage1_kernel<<<decode_stage1_grid, decode_block, 0, stream>>>(
+        reinterpret_cast<kDataType*>(Q.data_ptr()),
+        reinterpret_cast<kDataType*>(K.data_ptr()),
+        reinterpret_cast<kDataType*>(V.data_ptr()),
+        partial_out.data_ptr<float>(), chunk_lse.data_ptr<float>(), Nq, Nkv, Nh,
+        Nh_kv, scale, num_splits, split_size, causal);
 
-      auto decode_stage2_kernel =
-          (ffpa_attn_splitkv_decode_stage2_template<kDataType, kHeadDim>);
-      decode_stage2_kernel<<<decode_stage2_grid, decode_block, 0, stream>>>(
-          partial_out.data_ptr<float>(), chunk_lse.data_ptr<float>(),
-          reinterpret_cast<kDataType*>(O.data_ptr()), softmax_lse_ptr, Nq, Nh,
-          num_splits);
-      return;
-    }
+    auto decode_stage2_kernel =
+        (ffpa_attn_split_kv_decode_stage2_template<kDataType, kHeadDim>);
+    decode_stage2_kernel<<<decode_stage2_grid, decode_block, 0, stream>>>(
+        partial_out.data_ptr<float>(), chunk_lse.data_ptr<float>(),
+        reinterpret_cast<kDataType*>(O.data_ptr()), softmax_lse_ptr, Nq, Nh,
+        num_splits);
+    return;
   }
 
   const int smem_size_base = kQKVSmemMaxSize;
@@ -514,38 +439,6 @@ void launch_ffpa_attn_fwd_template(torch::Tensor Q, torch::Tensor K,
   constexpr int kEffPersistQs2r_LargeD =
       (kPersistQg2s || kHeadDim > 256) ? 0 : kPersistQs2r;
 
-#ifdef ENABLE_FFPA_PERSIST_KV_G2S
-  if constexpr (kHeadDim <=
-                kMaxDForSmallDKernel) {  // e.g > 128 will use large d kernel
-    constexpr int kPersistVs2r = getConfigPersistVs2r();  // only for d < 256
-
-    auto ffpa_mma_small_d_kernel_func =
-        (ffpa_attn_persistent_d_fwd_template < kDataType, kHeadDim, kMmaAtomM,
-         kMmaAtomN, kMmaAtomK, kMmaTileSeqLenQ, kMmaTileSeqLenK,
-         kMmaTileSeqLenP, kMmaTileHeadDimV, kValTileSeqLenQ, kValTileSeqLenK,
-         kValTileSeqLenP, kValTileHeadDimV, kMmaAccFloat32QK, kMmaAccFloat32PV,
-         kOStorageAccFloat32, kPrefetchQK, kPrefetchPV, kShareSmemQKV,
-         kPersistQs2r, kPersistVs2r,
-         // Force disable KV registers ping pong buffers
-         // while V s2r is enabled.
-         (kPersistVs2r) ? 0 : kRegPipeKV, 1, /*kStageQK unused*/
-         1,                                  /*kStagePV unused*/
-         kPadQ, kPadK, kPadV >);
-    // Small-d kernel never takes the TMA path.
-    LAUNCH_TEMPLATE_FUNC_BASE(ffpa_mma_small_d_kernel_func);
-  } else {  // large headdim > kMaxDForSmallDKernel (e.g 128)
-    auto ffpa_mma_large_d_kernel_func =
-        (ffpa_attn_split_d_fwd_template<
-            kDataType, kHeadDim, kMmaAtomM, kMmaAtomN, kMmaAtomK,
-            kMmaTileSeqLenQ, kMmaTileSeqLenK, kMmaTileSeqLenP, kMmaTileHeadDimV,
-            kValTileSeqLenQ, kValTileSeqLenK, kValTileSeqLenP, kValTileHeadDimV,
-            kMmaAccFloat32QK, kMmaAccFloat32PV, kOStorageAccFloat32,
-            kPrefetchQK, kPrefetchPV, kEffShareSmemQKV_LargeD,
-            kEffPersistQs2r_LargeD, kPersistQg2s, kRegPipeKV, kStageQK,
-            kStagePV, kPadQ, kPadK, kPadV>);
-    LAUNCH_TEMPLATE_FUNC_BASE(ffpa_mma_large_d_kernel_func);
-  }
-#else
   auto ffpa_mma_large_d_kernel_func =
       (ffpa_attn_split_d_fwd_template<
           kDataType, kHeadDim, kMmaAtomM, kMmaAtomN, kMmaAtomK, kMmaTileSeqLenQ,
@@ -555,7 +448,6 @@ void launch_ffpa_attn_fwd_template(torch::Tensor Q, torch::Tensor K,
           kEffShareSmemQKV_LargeD, kEffPersistQs2r_LargeD, kPersistQg2s,
           kRegPipeKV, kStageQK, kStagePV, kPadQ, kPadK, kPadV>);
   LAUNCH_TEMPLATE_FUNC_BASE(ffpa_mma_large_d_kernel_func);
-#endif
 
 #undef LAUNCH_TEMPLATE_FUNC_BASE
 }

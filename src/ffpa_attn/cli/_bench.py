@@ -93,6 +93,7 @@ MIN_BENCHMARK_HEAD_DIM = 64
 MAX_FFPA_BENCHMARK_HEAD_DIM = 1024
 HEAD_DIM_ALIGNMENT = 64
 TRITON_SMALL_D_ENV = "FFPA_TRITON_ALLOW_SMALL_D"
+CUDA_SMALL_D_ENV = "FFPA_CUDA_ALLOW_SMALL_D"
 CUTEDSL_SMALL_D_ENV = "FFPA_CUTE_ALLOW_SMALL_D"
 CUTEDSL_COMPAT_TASKS = frozenset({
   "self-attn", "cross-attn", "gqa", "causal", "non-aligned"
@@ -232,6 +233,14 @@ def _parse_args() -> argparse.Namespace:
     "--tune",
     choices=["fast", "max"],
     help="Enable Triton autotune with the selected search mode."
+  )
+  parser.add_argument(
+    "--stages",
+    type=int,
+    default=None,
+    choices=[1, 2, 3, 4, 5, 6, 7, 8],
+    help=
+    "CUDA forward kernel pipeline stages (1-8). When unset, uses CUDABackend default (4 on Hopper+, 3 otherwise). Only effective when --fwd-backend=cuda. Maximum supported depends on FFPA_BUILD_MAX_STAGES at build time.",
   )
   parser.add_argument(
     "--tasks",
@@ -517,11 +526,18 @@ def _validate_benchmark_head_dim(
 def _emit_small_d_backend_notes(args: argparse.Namespace) -> None:
   effective_forward_backends = _benchmark_effective_forward_backends(args)
   if CUDA_BACKEND in effective_forward_backends and args.D <= 256:
-    raise SystemExit(
-      "[cuda] D <= 256 is not supported by the FFPA CUDA backend. "
-      f"Use {TRITON_SMALL_D_ENV}=1 with --fwd-backend triton, or "
-      f"{CUTEDSL_SMALL_D_ENV}=1 with --fwd-backend cutedsl."
-    )
+    if _env_flag_enabled(CUDA_SMALL_D_ENV):
+      print(
+        f"[cuda] D <= 256 is enabled for FFPA benchmarking via {CUDA_SMALL_D_ENV}=1.",
+        file=sys.stderr,
+      )
+    else:
+      raise SystemExit(
+        "[cuda] D <= 256 requires FFPA_CUDA_ALLOW_SMALL_D=1 "
+        f"when using --fwd-backend cuda. "
+        f"Alternatively, use {TRITON_SMALL_D_ENV}=1 with --fwd-backend triton, or "
+        f"{CUTEDSL_SMALL_D_ENV}=1 with --fwd-backend cutedsl."
+      )
 
   if TRITON_BACKEND in effective_forward_backends and args.D <= 256:
     if _env_flag_enabled(TRITON_SMALL_D_ENV):
@@ -1461,6 +1477,7 @@ def _benchmark_rows(
         tasks=tasks,
         dtypes=dtypes,
         verbose=args.verbose,
+        stages=args.stages,
       ),
     )
   if args.backward:
