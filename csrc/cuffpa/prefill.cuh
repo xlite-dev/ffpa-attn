@@ -7,6 +7,11 @@
 #include "cp_async.cuh"      // ffpa::cp_async
 #include "utils.cuh"         // ffpa::utils
 
+// exp2f softmax optimization: expf(x) == exp2f(x * M_LOG2E).
+// See /memories/repo/exp2f-softmax-optimization.md for profiling data.
+#define FFPA_M_LOG2E 1.44269504088896340736f
+#define FFPA_M_LN2 0.69314718055994530942f
+
 namespace ffpa {
 namespace prefill {
 // prefill utils: prefetch/load QKV g2s funcs, rescale/softmax funcs etc.
@@ -670,16 +675,17 @@ __device__ __forceinline__ void sync_online_safe_softmax(
 ) {
   using Traits = DtypeTraits<kDataType>;
   if constexpr (kMmaAccFloat32) {
-    // Row max for [Br,Bc] tile, Thread -> Warp -> Block.
+    // Pre-scale by M_LOG2E for exp2f: expf(x) == exp2f(x * M_LOG2E).
+    const float scale_2 = scale * FFPA_M_LOG2E;
+    // Row max for [Br,Bc] tile, Thread -> Warp -> Block (in log2 space).
     {  // kValTileSeqLenQ = 1
 // Thread level reduce max across kValTileSeqLenK dim, namely Bc.
 #pragma unroll
       for (int j = 0; j < kValTileSeqLenK; ++j) {
         const float* t_fptr_S_0_1 =
             reinterpret_cast<float*>(R_S + j * 4);  // &R_S[0][j][0]
-        // This should be the row max after S = (Q @ K^T) / sqrt(d)
-        const float tmp_max_0 = max(t_fptr_S_0_1[0], t_fptr_S_0_1[1]) * scale;
-        const float tmp_max_1 = max(t_fptr_S_0_1[2], t_fptr_S_0_1[3]) * scale;
+        const float tmp_max_0 = max(t_fptr_S_0_1[0], t_fptr_S_0_1[1]) * scale_2;
+        const float tmp_max_1 = max(t_fptr_S_0_1[2], t_fptr_S_0_1[3]) * scale_2;
         lane_row_max_new[0] = max(lane_row_max_new[0], tmp_max_0);
         lane_row_max_new[1] = max(lane_row_max_new[1], tmp_max_1);
       }  // end for kValTileSeqLenK
@@ -697,11 +703,12 @@ __device__ __forceinline__ void sync_online_safe_softmax(
       // Use latest global row max without update.
       // Br 0, row_id, 0~7,  16~23, 32~39, 48~55;
       // Br 1, row_id, 8~15, 24~31, 40~47, 56~63;
-      // Apply m_new = max(m_old, m_new) here.
-      const float block_row_max_new_0 =
-          max(lane_block_row_max_old[0], lane_row_max_new[0]);
-      const float block_row_max_new_1 =
-          max(lane_block_row_max_old[1], lane_row_max_new[1]);
+      // Convert m_old from natural-log to log2 space, then compute m_new in
+      // log2 so exp2f receives internally-consistent values.
+      const float block_row_max_new_0_2 =
+          max(lane_block_row_max_old[0] * FFPA_M_LOG2E, lane_row_max_new[0]);
+      const float block_row_max_new_1_2 =
+          max(lane_block_row_max_old[1] * FFPA_M_LOG2E, lane_row_max_new[1]);
 
 #pragma unroll
       for (int j = 0; j < kValTileSeqLenK; ++j) {
@@ -709,18 +716,18 @@ __device__ __forceinline__ void sync_online_safe_softmax(
         // (x,y) 0~7->{c0, c1}, (z,w)->8~15 {c2, c3}
         float* t_fptr_S_0_1 = reinterpret_cast<float*>(R_S + j * 4);
         kDataType* t_hptr_S_0_1 = reinterpret_cast<kDataType*>(R_S + j * 4);
-        // P = Exp(S - m_new), fmaf(x, y, z) = x * y + z in registers;
+        // P = 2^(S * scale_2 - m_new), fmaf(x, y, z) = x * y + z;
         t_fptr_S_0_1[0] =
-            expf(__fmaf_rn(t_fptr_S_0_1[0], scale, -block_row_max_new_0));
+            exp2f(__fmaf_rn(t_fptr_S_0_1[0], scale_2, -block_row_max_new_0_2));
         t_fptr_S_0_1[1] =
-            expf(__fmaf_rn(t_fptr_S_0_1[1], scale, -block_row_max_new_0));
+            exp2f(__fmaf_rn(t_fptr_S_0_1[1], scale_2, -block_row_max_new_0_2));
         t_fptr_S_0_1[2] =
-            expf(__fmaf_rn(t_fptr_S_0_1[2], scale, -block_row_max_new_1));
+            exp2f(__fmaf_rn(t_fptr_S_0_1[2], scale_2, -block_row_max_new_1_2));
         t_fptr_S_0_1[3] =
-            expf(__fmaf_rn(t_fptr_S_0_1[3], scale, -block_row_max_new_1));
+            exp2f(__fmaf_rn(t_fptr_S_0_1[3], scale_2, -block_row_max_new_1_2));
         lane_row_sum_new[0] += (t_fptr_S_0_1[0] + t_fptr_S_0_1[1]);
         lane_row_sum_new[1] += (t_fptr_S_0_1[2] + t_fptr_S_0_1[3]);
-        // Update R_S for P[Br,Bc] = Exp(S-m), point wise.
+        // Update R_S for P[Br,Bc] = 2^(S*scale_2 - m_new), point wise.
         // Also convert F32 -> kDataType for P@V MMA, reuse R_S as P.
         t_hptr_S_0_1[0] = Traits::from_float(t_fptr_S_0_1[0]);
         t_hptr_S_0_1[1] = Traits::from_float(t_fptr_S_0_1[1]);
@@ -731,6 +738,11 @@ __device__ __forceinline__ void sync_online_safe_softmax(
       // Warp level reduce sum, warp_size = 4
       lane_row_sum_new[0] = warp::reduce_sum<float, 4>(lane_row_sum_new[0]);
       lane_row_sum_new[1] = warp::reduce_sum<float, 4>(lane_row_sum_new[1]);
+
+      // Convert row_max_new back to natural-log space for persistent state
+      // (LSE, rescale factors) so callers and backward pass stay unchanged.
+      lane_row_max_new[0] = block_row_max_new_0_2 * FFPA_M_LN2;
+      lane_row_max_new[1] = block_row_max_new_1_2 * FFPA_M_LN2;
     }
 
   } else {
@@ -739,20 +751,21 @@ __device__ __forceinline__ void sync_online_safe_softmax(
     static_assert(
         std::is_same_v<kDataType, __half>,
         "MMA Acc F16 path is only valid for __half activation dtype.");
-    // Row max for [Br,Bc] tile, Thread -> Warp -> Block.
+    // Pre-scale by M_LOG2E for exp2f: expf(x) == exp2f(x * M_LOG2E).
+    const float scale_2 = scale * FFPA_M_LOG2E;
+    // Row max for [Br,Bc] tile, Thread -> Warp -> Block (in log2 space).
     {  // kValTileSeqLenQ = 1
 // Thread level reduce max across kValTileSeqLenK dim, namely Bc.
 #pragma unroll
       for (int j = 0; j < kValTileSeqLenK; ++j) {
         const kDataType* t_hptr_S_0_1 =
             reinterpret_cast<kDataType*>(R_S + j * 2);
-        // This should be the row max after S = (Q @ K^T) / sqrt(d)
         const float tmp_max_0 =
             Traits::to_float(Traits::hmax(t_hptr_S_0_1[0], t_hptr_S_0_1[1])) *
-            scale;
+            scale_2;
         const float tmp_max_1 =
             Traits::to_float(Traits::hmax(t_hptr_S_0_1[2], t_hptr_S_0_1[3])) *
-            scale;
+            scale_2;
         lane_row_max_new[0] = max(lane_row_max_new[0], tmp_max_0);
         lane_row_max_new[1] = max(lane_row_max_new[1], tmp_max_1);
       }  // end for kValTileSeqLenK
@@ -767,28 +780,29 @@ __device__ __forceinline__ void sync_online_safe_softmax(
     // static_assert(kValTileSeqLenQ == 1);
     // Exp sum and mul scale_factor for [Br,Bc] tile, Thread -> Warp -> Block.
     {  // kValTileSeqLenQ = 1
-      // Apply m_new = max(m_old, m_new) here.
-      const float block_row_max_new_0 =
-          max(lane_block_row_max_old[0], lane_row_max_new[0]);
-      const float block_row_max_new_1 =
-          max(lane_block_row_max_old[1], lane_row_max_new[1]);
+      // Convert m_old from natural-log to log2 space, then compute m_new in
+      // log2 so exp2f receives internally-consistent values.
+      const float block_row_max_new_0_2 =
+          max(lane_block_row_max_old[0] * FFPA_M_LOG2E, lane_row_max_new[0]);
+      const float block_row_max_new_1_2 =
+          max(lane_block_row_max_old[1] * FFPA_M_LOG2E, lane_row_max_new[1]);
 
 #pragma unroll
       for (int j = 0; j < kValTileSeqLenK; ++j) {
         kDataType* t_hptr_S_0_1 = reinterpret_cast<kDataType*>(R_S + j * 2);
-        // P = Exp(S - m_new), fmaf(x, y, z) = x * y + z;
+        // P = 2^(S * scale_2 - m_new), fmaf(x, y, z) = x * y + z;
         float4 t_reg_S_0_1;
-        t_reg_S_0_1.x = expf(__fmaf_rn(Traits::to_float(t_hptr_S_0_1[0]), scale,
-                                       -block_row_max_new_0));
-        t_reg_S_0_1.y = expf(__fmaf_rn(Traits::to_float(t_hptr_S_0_1[1]), scale,
-                                       -block_row_max_new_0));
-        t_reg_S_0_1.z = expf(__fmaf_rn(Traits::to_float(t_hptr_S_0_1[2]), scale,
-                                       -block_row_max_new_1));
-        t_reg_S_0_1.w = expf(__fmaf_rn(Traits::to_float(t_hptr_S_0_1[3]), scale,
-                                       -block_row_max_new_1));
+        t_reg_S_0_1.x = exp2f(__fmaf_rn(Traits::to_float(t_hptr_S_0_1[0]),
+                                        scale_2, -block_row_max_new_0_2));
+        t_reg_S_0_1.y = exp2f(__fmaf_rn(Traits::to_float(t_hptr_S_0_1[1]),
+                                        scale_2, -block_row_max_new_0_2));
+        t_reg_S_0_1.z = exp2f(__fmaf_rn(Traits::to_float(t_hptr_S_0_1[2]),
+                                        scale_2, -block_row_max_new_1_2));
+        t_reg_S_0_1.w = exp2f(__fmaf_rn(Traits::to_float(t_hptr_S_0_1[3]),
+                                        scale_2, -block_row_max_new_1_2));
         lane_row_sum_new[0] += (t_reg_S_0_1.x + t_reg_S_0_1.y);
         lane_row_sum_new[1] += (t_reg_S_0_1.z + t_reg_S_0_1.w);
-        // Update R_S for P[Br,Bc] = Exp(S-m), point wise.
+        // Update R_S for P[Br,Bc] = 2^(S*scale_2 - m_new), point wise.
         t_hptr_S_0_1[0] = Traits::from_float(t_reg_S_0_1.x);
         t_hptr_S_0_1[1] = Traits::from_float(t_reg_S_0_1.y);
         t_hptr_S_0_1[2] = Traits::from_float(t_reg_S_0_1.z);
@@ -798,6 +812,10 @@ __device__ __forceinline__ void sync_online_safe_softmax(
       // Warp level reduce sum, warp_size = 4
       lane_row_sum_new[0] = warp::reduce_sum<float, 4>(lane_row_sum_new[0]);
       lane_row_sum_new[1] = warp::reduce_sum<float, 4>(lane_row_sum_new[1]);
+
+      // Convert row_max_new back to natural-log space for persistent state.
+      lane_row_max_new[0] = block_row_max_new_0_2 * FFPA_M_LN2;
+      lane_row_max_new[1] = block_row_max_new_1_2 * FFPA_M_LN2;
     }
   }
 }
@@ -826,9 +844,12 @@ __device__ __forceinline__ void sync_precompute_rescale_factors(
       (n_tile_id > 0 ? block_row_max_old_0 : block_row_max_new_0);
   block_row_max_old_1 =
       (n_tile_id > 0 ? block_row_max_old_1 : block_row_max_new_1);
-  // Precompute rescale_o_factor_0 & rescale_o_factor_1, avoid redundant exp.
-  rescale_o_factor_0[0] = expf(block_row_max_old_0 - block_row_max_new_0);
-  rescale_o_factor_1[0] = expf(block_row_max_old_1 - block_row_max_new_1);
+  // Precompute rescale_o_factor_0 & rescale_o_factor_1 using exp2f.
+  // Inputs are in natural-log space; expf(x) == exp2f(x * M_LOG2E).
+  rescale_o_factor_0[0] =
+      exp2f((block_row_max_old_0 - block_row_max_new_0) * FFPA_M_LOG2E);
+  rescale_o_factor_1[0] =
+      exp2f((block_row_max_old_1 - block_row_max_new_1) * FFPA_M_LOG2E);
 }
 
 // Apply the rescale ``O_new = exp(m_old - m_new) * O_old + P @ V`` to
@@ -1106,7 +1127,8 @@ __device__ __forceinline__ void sync_store_o_r2g(
 
 // ---- backward pass helpers ----
 
-// Reconstruct P from S and LSE: P = exp(S*scale - LSE).
+// Reconstruct P from S and LSE using exp2f:
+//   expf(S*scale - LSE) == exp2f((S*scale - LSE) * M_LOG2E).
 template <const int kValTileSeqLenK, const int kMmaAccFloat32,
           typename kDataType>
 __device__ __forceinline__ void sync_compute_p_from_lse(uint32_t* R_S,
@@ -1117,21 +1139,24 @@ __device__ __forceinline__ void sync_compute_p_from_lse(uint32_t* R_S,
   const int lid = threadIdx.x % WARP_SIZE;
   const float l0 = lse_ptr[lid / 4];
   const float l1 = lse_ptr[lid / 4 + 8];
+  const float scale_2 = scale * FFPA_M_LOG2E;
+  const float l0_2 = l0 * FFPA_M_LOG2E;
+  const float l1_2 = l1 * FFPA_M_LOG2E;
 #pragma unroll
   for (int c = 0; c < kValTileSeqLenK; ++c) {
     if constexpr (kMmaAccFloat32) {
       float* fp = reinterpret_cast<float*>(&R_S[c * 4]);
       kDataType* hp = reinterpret_cast<kDataType*>(&R_S[c * 2]);
-      hp[0] = Traits::from_float(expf(__fmaf_rn(fp[0], scale, -l0)));
-      hp[1] = Traits::from_float(expf(__fmaf_rn(fp[1], scale, -l0)));
-      hp[2] = Traits::from_float(expf(__fmaf_rn(fp[2], scale, -l1)));
-      hp[3] = Traits::from_float(expf(__fmaf_rn(fp[3], scale, -l1)));
+      hp[0] = Traits::from_float(exp2f(__fmaf_rn(fp[0], scale_2, -l0_2)));
+      hp[1] = Traits::from_float(exp2f(__fmaf_rn(fp[1], scale_2, -l0_2)));
+      hp[2] = Traits::from_float(exp2f(__fmaf_rn(fp[2], scale_2, -l1_2)));
+      hp[3] = Traits::from_float(exp2f(__fmaf_rn(fp[3], scale_2, -l1_2)));
     } else {
       kDataType* hp = reinterpret_cast<kDataType*>(&R_S[c * 2]);
-      float v0 = expf(__fmaf_rn(Traits::to_float(hp[0]), scale, -l0));
-      float v1 = expf(__fmaf_rn(Traits::to_float(hp[1]), scale, -l0));
-      float v2 = expf(__fmaf_rn(Traits::to_float(hp[2]), scale, -l1));
-      float v3 = expf(__fmaf_rn(Traits::to_float(hp[3]), scale, -l1));
+      float v0 = exp2f(__fmaf_rn(Traits::to_float(hp[0]), scale_2, -l0_2));
+      float v1 = exp2f(__fmaf_rn(Traits::to_float(hp[1]), scale_2, -l0_2));
+      float v2 = exp2f(__fmaf_rn(Traits::to_float(hp[2]), scale_2, -l1_2));
+      float v3 = exp2f(__fmaf_rn(Traits::to_float(hp[3]), scale_2, -l1_2));
       hp[0] = Traits::from_float(v0);
       hp[1] = Traits::from_float(v1);
       hp[2] = Traits::from_float(v2);
