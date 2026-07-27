@@ -238,9 +238,10 @@ __global__ void __launch_bounds__(((kHeadDim / 8 + WARP_SIZE - 1) / WARP_SIZE) *
           const float m_old = row_m[row];
           const float l_old = row_l[row];
           const float m_new = max(m_old, score);
-          const float rescale =
-              (m_old > -INFINITY) ? expf(m_old - m_new) : 0.0f;
-          const float p = expf(score - m_new);
+          const float rescale = (m_old > -INFINITY)
+                                    ? exp2f((m_old - m_new) * FFPA_M_LOG2E)
+                                    : 0.0f;
+          const float p = exp2f((score - m_new) * FFPA_M_LOG2E);
           row_m[row] = m_new;
           row_l[row] = l_old * rescale + p;
           row_p[row] = p;
@@ -368,7 +369,8 @@ __global__ void __launch_bounds__(((kHeadDim / 8 + WARP_SIZE - 1) / WARP_SIZE) *
     } else {
       float denom = 0.0f;
       for (int split = 0; split < num_splits; ++split) {
-        denom += expf(chunk_lse[split_row_base + split * Nq] - max_lse);
+        denom += exp2f((chunk_lse[split_row_base + split * Nq] - max_lse) *
+                       FFPA_M_LOG2E);
       }
       row_max = max_lse;
       row_inv_denom = (denom > 0.0f) ? (1.0f / denom) : 0.0f;
@@ -392,8 +394,8 @@ __global__ void __launch_bounds__(((kHeadDim / 8 + WARP_SIZE - 1) / WARP_SIZE) *
     float out4 = 0.0f, out5 = 0.0f, out6 = 0.0f, out7 = 0.0f;
     if (row_inv_denom > 0.0f) {
       for (int split = 0; split < num_splits; ++split) {
-        const float weight =
-            expf(chunk_lse[split_row_base + split * Nq] - row_max);
+        const float weight = exp2f(
+            (chunk_lse[split_row_base + split * Nq] - row_max) * FFPA_M_LOG2E);
 
         // First 128-bit load: partial_out[d..d+3].
         const int partial_offset0 =
