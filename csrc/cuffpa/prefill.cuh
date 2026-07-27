@@ -8,7 +8,6 @@
 #include "utils.cuh"         // ffpa::utils
 
 // exp2f softmax optimization: expf(x) == exp2f(x * M_LOG2E).
-// See /memories/repo/exp2f-softmax-optimization.md for profiling data.
 #define FFPA_M_LOG2E 1.44269504088896340736f
 #define FFPA_M_LN2 0.69314718055994530942f
 
