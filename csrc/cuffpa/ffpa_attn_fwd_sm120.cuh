@@ -43,7 +43,7 @@ template <typename kDataType, const int kHeadDim, const int kMmaAtomM,
           const int kValTileHeadDimV, const int kMmaAccFloat32QK,
           const int kMmaAccFloat32PV, const int kOStorageAccFloat32,
           const int kStageQK, const int kStagePV, const int kPadQ,
-          const int kPadK, const int kPadV>
+          const int kPadK, const int kPadV, const int kDChunk = kMmaAtomK>
 __global__ void
 // minBlocksPerMultiprocessor=1: let the compiler use the full per-thread
 // register budget (65536/384 = 170 regs). Without this hint the compiler's
@@ -51,8 +51,7 @@ __global__ void
 // registers at ~85 and forcing massive R_D spilling. Note: the compiler still
 // allocates only ~168 regs (vs baseline's 255) due to the if/else WS
 // structure confusing the register allocator; R_D[1][64][4]=256-reg spilling
-// remains the main overhead (~12% vs baseline). See
-// /memories/repo/ffpa-sm120-tma-ws-perf.md.
+// remains the main overhead (~12% vs baseline).
 __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK + 128, 1)
     ffpa_attn_split_d_fwd_template_sm120(
         const CUtensorMap* __restrict__ tma_q,
@@ -74,7 +73,14 @@ __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK + 128, 1)
       WARP_SIZE * kMmaTileSeqLenQ * kMmaTileSeqLenK;
   constexpr int kProducerThreads = 128;
   constexpr int kTotalThreads = kConsumerThreads + kProducerThreads;
-  constexpr int kDChunks = kHeadDim / kMmaAtomK;
+  // kDChunk: headdim chunk per TMA load for QK (16/32/64). V always uses
+  // kMmaAtomN*2=16 (PV consumes V in 16-col strips). kSubTiles = number of
+  // 16-col m16n8k16 sub-tiles inside one TMA box (1/2/4).
+  static_assert(kDChunk == 16 || kDChunk == 32 || kDChunk == 64);
+  constexpr int kDChunks = kHeadDim / kDChunk;
+  constexpr int kSubTiles = kDChunk / kMmaAtomK;
+  // V chunks remain at 16-col granularity (kMmaAtomN*2).
+  constexpr int kVDChunks = kHeadDim / (kMmaAtomN * 2);
 
 #ifdef ENABLE_FFPA_LAUNCH_GRID_DNHB
   const int Nb_id = blockIdx.z;
@@ -104,8 +110,8 @@ __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK + 128, 1)
   // addresses). See /memories/repo/leetcuda-sm120-tma-mma-ws.md.
   extern __shared__ __align__(1024) unsigned char ffpa_smem_raw[];
   kDataType* smem = reinterpret_cast<kDataType*>(ffpa_smem_raw);
-  constexpr int Q_tile_size = Br * (kMmaAtomK + kPadQ);
-  constexpr int K_tile_size = Bc * (kMmaAtomK + kPadK);
+  constexpr int Q_tile_size = Br * (kDChunk + kPadQ);
+  constexpr int K_tile_size = Bc * (kDChunk + kPadK);
   constexpr int V_tile_size = Bc * (kMmaAtomN * 2 + kPadV);
   kDataType* Q_tile_smem = smem;
   kDataType* K_tile_smem = Q_tile_smem + kStageQK * Q_tile_size;
@@ -156,8 +162,8 @@ __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK + 128, 1)
   const int warp_QP = wg_tid / WARP_SIZE;
   constexpr int warp_KV = 0;
 
-  constexpr int kQTileBytes = Br * kMmaAtomK * sizeof(kDataType);
-  constexpr int kKTileBytes = Bc * kMmaAtomK * sizeof(kDataType);
+  constexpr int kQTileBytes = Br * kDChunk * sizeof(kDataType);
+  constexpr int kKTileBytes = Bc * kDChunk * sizeof(kDataType);
   constexpr int kVTileBytes = Bc * (kMmaAtomN * 2) * sizeof(kDataType);
 
   const int Br_base = Q_tile_id * Br;
@@ -180,7 +186,11 @@ __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK + 128, 1)
     //   - load_2d_no_arrive x2 (Q+K) + arrive_expect_tx(combined bytes):
     //     arrive_expect_tx contributes 1 arrival + sets tx-count; the 256
     //     consumer arrives (from wait(arrive()) on full) provide the rest.
-    //   - fence_async_shared: make TMA writes visible to generic proxy.
+    //   - NO explicit fence_async_shared() here: the consumer's
+    //     wait_barrier(full) already includes the required
+    //     fence.proxy.async.shared::cta (see tma.cuh). Placing fence on
+    //     the producer side would stall the producer on TMA completion
+    //     before the barrier signal, reducing pipeline overlap.
     // ======================================================================
     if (wg_tid == 0) {
       for (int kv_tile = 0; kv_tile < Tc_eff; ++kv_tile) {
@@ -190,24 +200,22 @@ __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK + 128, 1)
           ffpa::tma::wait_barrier(qk_empty[d_chunk % kStageQK]);
           kDataType* q_dst = Q_tile_smem + (d_chunk % kStageQK) * Q_tile_size;
           kDataType* k_dst = K_tile_smem + (d_chunk % kStageQK) * K_tile_size;
-          const int minor = d_chunk * kMmaAtomK;
+          const int minor = d_chunk * kDChunk;
           ffpa::tma::load_2d_no_arrive(q_dst, tma_q, minor, Q_major_base,
                                        qk_full[d_chunk % kStageQK]);
           ffpa::tma::load_2d_no_arrive(k_dst, tma_k, minor, kv_major,
                                        qk_full[d_chunk % kStageQK]);
           ffpa::tma::arrive_expect_tx(qk_full[d_chunk % kStageQK],
                                       kQTileBytes + kKTileBytes);
-          ffpa::tma::fence_async_shared();
         }
-        // V phase: one V tile per v_chunk.
-        for (int v_chunk = 0; v_chunk < kDChunks; ++v_chunk) {
+        // V phase: one V tile per v_chunk (V always uses 16-col strips).
+        for (int v_chunk = 0; v_chunk < kVDChunks; ++v_chunk) {
           ffpa::tma::wait_barrier(v_empty[v_chunk % kStagePV]);
           kDataType* v_dst = V_tile_smem + (v_chunk % kStagePV) * V_tile_size;
           const int minor = v_chunk * (kMmaAtomN * 2);
           ffpa::tma::load_2d_no_arrive(v_dst, tma_v, minor, kv_major,
                                        v_full[v_chunk % kStagePV]);
           ffpa::tma::arrive_expect_tx(v_full[v_chunk % kStagePV], kVTileBytes);
-          ffpa::tma::fence_async_shared();
         }
       }
     }
@@ -248,7 +256,8 @@ __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK + 128, 1)
     for (int tile_K_seqlen = 0; tile_K_seqlen < Tc_eff; ++tile_K_seqlen) {
       ffpa::utils::fill_3D_regs<uint32_t, kValTileSeqLenQ, kValTileSeqLenK,
                                 (kMmaAccFloat32QK) ? 4 : 2>(R_S, 0);
-      // QK phase: D/16 d_chunks, each loads Q[Br,16]+K[Bc,16] via TMA.
+      // QK phase: kDChunks TMA loads, each Q[Br,kDChunk]+K[Bc,kDChunk]. Each
+      // TMA tile is consumed by kSubTiles m16n8k16 sub-tiles (kDChunk/16).
 #pragma unroll
       for (int tile_K_d = 0; tile_K_d < kDChunks; ++tile_K_d) {
         const int stage = tile_K_d % kStageQK;
@@ -257,32 +266,37 @@ __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK + 128, 1)
         // = 257 -> phase flips), wait(token) blocks until flip. fence inside.
         ffpa::tma::wait_barrier(qk_full[stage]);
 
-        // Q s2r
-        ffpa::prefill::sync_fetch_qkv_frags_s2r<0, 4, Q_tile_size, kMmaAtomM,
-                                                kMmaAtomN, kMmaAtomK, kPadQ,
-                                                kDataType>(
-            smem_Q_base_ptr, &R_Q[0][0][0], warp_QP, 0, 0, stage);
-        // K s2r
 #pragma unroll
-        for (int j = 0; j < kValTileSeqLenK; ++j) {
-          ffpa::prefill::sync_fetch_qkv_frags_s2r<0, 2, K_tile_size, kMmaAtomM,
-                                                  kMmaAtomN, kMmaAtomK, kPadK,
-                                                  kDataType>(
-              smem_K_base_ptr, &R_K[j][0], warp_KV, j, 0, stage);
-        }
-        // Q@K^T MMA
+        for (int sub = 0; sub < kSubTiles; ++sub) {
+          const int sub_col = sub * kMmaAtomK;
+          // Q s2r: kSmemColStride=kDChunk selects the wide-tile row stride +
+          // swizzle width; subtile_col_offset picks the 16-col sub-block.
+          ffpa::prefill::sync_fetch_qkv_frags_s2r<0, 4, Q_tile_size, kMmaAtomM,
+                                                  kMmaAtomN, kMmaAtomK, kPadQ,
+                                                  kDataType, kDChunk>(
+              smem_Q_base_ptr, &R_Q[0][0][0], warp_QP, 0, 0, stage, sub_col);
+          // K s2r
 #pragma unroll
-        for (int j = 0; j < kValTileSeqLenK; ++j) {
-          if constexpr (kMmaAccFloat32QK) {
-            ffpa::mma::m16n8k16_abf32<kDataType,
-                                      ffpa::mma::MMAMode::kInplaceUpdate>(
-                &R_S[0][j][0], &R_S[0][j][1], &R_S[0][j][2], &R_S[0][j][3],
-                &R_Q[0][0][0], &R_Q[0][0][1], &R_Q[0][0][2], &R_Q[0][0][3],
-                &R_K[j][0], &R_K[j][1]);
-          } else {
-            ffpa::mma::m16n8k16_f16f16f16<ffpa::mma::MMAMode::kInplaceUpdate>(
-                &R_S[0][j][0], &R_S[0][j][1], &R_Q[0][0][0], &R_Q[0][0][1],
-                &R_Q[0][0][2], &R_Q[0][0][3], &R_K[j][0], &R_K[j][1]);
+          for (int j = 0; j < kValTileSeqLenK; ++j) {
+            ffpa::prefill::sync_fetch_qkv_frags_s2r<
+                0, 2, K_tile_size, kMmaAtomM, kMmaAtomN, kMmaAtomK, kPadK,
+                kDataType, kDChunk>(smem_K_base_ptr, &R_K[j][0], warp_KV, j, 0,
+                                    stage, sub_col);
+          }
+          // Q@K^T MMA
+#pragma unroll
+          for (int j = 0; j < kValTileSeqLenK; ++j) {
+            if constexpr (kMmaAccFloat32QK) {
+              ffpa::mma::m16n8k16_abf32<kDataType,
+                                        ffpa::mma::MMAMode::kInplaceUpdate>(
+                  &R_S[0][j][0], &R_S[0][j][1], &R_S[0][j][2], &R_S[0][j][3],
+                  &R_Q[0][0][0], &R_Q[0][0][1], &R_Q[0][0][2], &R_Q[0][0][3],
+                  &R_K[j][0], &R_K[j][1]);
+            } else {
+              ffpa::mma::m16n8k16_f16f16f16<ffpa::mma::MMAMode::kInplaceUpdate>(
+                  &R_S[0][j][0], &R_S[0][j][1], &R_Q[0][0][0], &R_Q[0][0][1],
+                  &R_Q[0][0][2], &R_Q[0][0][3], &R_K[j][0], &R_K[j][1]);
+            }
           }
         }
         // Release QK stage for producer reuse (256 consumer arrives; producer's

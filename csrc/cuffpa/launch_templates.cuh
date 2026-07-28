@@ -1,10 +1,13 @@
+#pragma once
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 
 #include "ffpa_attn_fwd.cuh"
 #include "ffpa_attn_fwd_split_kv.cuh"
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
 #include "ffpa_attn_fwd_sm120.cuh"
 #include "tma.cuh"
+#endif
 using namespace ffpa;
 
 static constexpr int kMaxDForOStoreFloat32 = 512;
@@ -229,6 +232,21 @@ static constexpr int getConfigQKVSmemMaxSize() {
 //   kStage               cp.async pipeline depth used for QK (the PV
 //                        depth is derived inside the launcher).
 //
+// The SM120 TMA path is called from inside this function when ``tma`` is set;
+// forward declaration (definition follows after the legacy launcher).
+
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+template <typename kDataType, const int kHeadDim, const int kAccQK,
+          const int kAccPV, const int kStage, const int kDChunk>
+void launch_ffpa_attn_fwd_template_sm120(torch::Tensor Q, torch::Tensor K,
+                                         torch::Tensor V, torch::Tensor O,
+                                         torch::Tensor attn_bias,
+                                         torch::Tensor softmax_lse, int causal,
+                                         double softmax_scale, double dropout_p,
+                                         int64_t philox_seed,
+                                         int64_t philox_offset);
+#endif  // __CUDA_ARCH__ >= 900
+
 // Runtime arguments:
 //   Q, K, V, O     : BHND tensors as described in the kernel template docs.
 //   causal         : 0/1 runtime flag. Non-zero enables causal masking with
@@ -248,7 +266,6 @@ void launch_ffpa_attn_fwd_template(torch::Tensor Q, torch::Tensor K,
                                    double softmax_scale, double dropout_p,
                                    int64_t philox_seed, int64_t philox_offset,
                                    int tma) {
-  (void)tma;
   // Q,K,V,O with [B, H, N, D] layout, B=batch, H=head, N=seqlen, D=dim
   // TODO: support BNHD layout, Q,K,V,O with [B, N, H, D] layout.
   constexpr int kMmaAtomM = 16;
@@ -391,6 +408,8 @@ void launch_ffpa_attn_fwd_template(torch::Tensor Q, torch::Tensor K,
       max(1, at::cuda::getCurrentDeviceProperties()->multiProcessorCount * 2);
   const int num_splits = select_decode_num_splits(
       Nb * Nh * utils::div_ceil(Nq, 16), num_sms_x2, Tc, 128, min(Nq, 16));
+
+  // Fast path for Nq=1, num_splits>1, no attn_bias, no dropout. (decode cases)
   if (Nq == 1 && num_splits > 1 && !has_attn_bias && !has_dropout) {
     const int split_size = utils::div_ceil(Tc, num_splits) * Bc;
     auto scratch_options =
@@ -422,20 +441,37 @@ void launch_ffpa_attn_fwd_template(torch::Tensor Q, torch::Tensor K,
     return;
   }
 
-  const int smem_size_base = kQKVSmemMaxSize;
+  // SM120 TMA path: when ``tma`` is set and the device is TMA-capable
+  // (sm_90+), delegate to the warp-specialised launcher.  Falls back to the
+  // legacy cp.async path on older hardware. (NOTE: NO WGMMA used here,
+  // since sm_120a is not yet supported by WGMMA.)
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+#ifdef FFPA_BUILD_SM120
+  if (tma) {
+    auto prop = at::cuda::getCurrentDeviceProperties();
+    if (prop->major >= 9) {
+      // sm_90/100 (228 KB smem) → kDChunk=64; sm_120a (99 KB) → kDChunk=32.
+      if (prop->major == 9 || prop->major == 10) {
+        launch_ffpa_attn_fwd_template_sm120<kDataType, kHeadDim,
+                                            kMmaAccFloat32QK, kMmaAccFloat32PV,
+                                            kStage, 64>(
+            Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
+            dropout_p, philox_seed, philox_offset);
+      } else {
+        launch_ffpa_attn_fwd_template_sm120<kDataType, kHeadDim,
+                                            kMmaAccFloat32QK, kMmaAccFloat32PV,
+                                            kStage, 32>(
+            Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
+            dropout_p, philox_seed, philox_offset);
+      }
+      return;
+    }
+  }
+#endif  // FFPA_BUILD_SM120
+#endif  // __CUDA_ARCH__ >= 900
 
-#define LAUNCH_TEMPLATE_FUNC_BASE(TEMPLATE_FUNC)                            \
-  cudaFuncSetAttribute(TEMPLATE_FUNC,                                       \
-                       cudaFuncAttributeMaxDynamicSharedMemorySize,         \
-                       smem_size_base);                                     \
-  TEMPLATE_FUNC<<<grid, block, smem_size_base, stream>>>(                   \
-      reinterpret_cast<kDataType*>(Q.data_ptr()),                           \
-      reinterpret_cast<kDataType*>(K.data_ptr()),                           \
-      reinterpret_cast<kDataType*>(V.data_ptr()),                           \
-      reinterpret_cast<kDataType*>(O.data_ptr()), softmax_lse_ptr, Nq, Nkv, \
-      Nh, Nh_kv, scale, Tc, causal, attn_bias_ptr, attn_bias_dtype,         \
-      attn_bias_stride_b, attn_bias_stride_h, attn_bias_stride_m,           \
-      attn_bias_stride_n, dropout_p_f, philox_seed_u, philox_offset_u);
+  // General path for sm>=80 architectures.
+  const int smem_size_base = kQKVSmemMaxSize;
 
   constexpr int kEffShareSmemQKV_LargeD = (kPersistQg2s) ? 0 : kShareSmemQKV;
   constexpr int kEffPersistQs2r_LargeD =
@@ -449,26 +485,29 @@ void launch_ffpa_attn_fwd_template(torch::Tensor Q, torch::Tensor K,
           kMmaAccFloat32PV, kOStorageAccFloat32, kPrefetchQK, kPrefetchPV,
           kEffShareSmemQKV_LargeD, kEffPersistQs2r_LargeD, kPersistQg2s,
           kRegPipeKV, kStageQK, kStagePV, kPadQ, kPadK, kPadV>);
-  LAUNCH_TEMPLATE_FUNC_BASE(ffpa_mma_large_d_kernel_func);
-
-#undef LAUNCH_TEMPLATE_FUNC_BASE
+  cudaFuncSetAttribute(ffpa_mma_large_d_kernel_func,
+                       cudaFuncAttributeMaxDynamicSharedMemorySize,
+                       smem_size_base);
+  ffpa_mma_large_d_kernel_func<<<grid, block, smem_size_base, stream>>>(
+      reinterpret_cast<kDataType*>(Q.data_ptr()),
+      reinterpret_cast<kDataType*>(K.data_ptr()),
+      reinterpret_cast<kDataType*>(V.data_ptr()),
+      reinterpret_cast<kDataType*>(O.data_ptr()), softmax_lse_ptr, Nq, Nkv, Nh,
+      Nh_kv, scale, Tc, causal, attn_bias_ptr, attn_bias_dtype,
+      attn_bias_stride_b, attn_bias_stride_h, attn_bias_stride_m,
+      attn_bias_stride_n, dropout_p_f, philox_seed_u, philox_offset_u);
 }
 
 // ============================================================================
 // launch_ffpa_attn_fwd_template_sm120
 // ----------------------------------------------------------------------------
-// SM120a (Blackwell) TMA + MMA warp-specialised launcher. Builds TMA
-// descriptors for Q/K/V (SWIZZLE_32B, box=[Br/Bc, 16], gmem_prob_shape covers
-// [B*H*N, D]) and launches ``ffpa_attn_split_d_fwd_template_sm120`` with
-// 384 threads (128 producer + 256 consumer). Falls back to the architecture-
-// agnostic ``launch_ffpa_attn_fwd_template`` on non-sm_120a devices.
-//
-// First version: kStageQK=2, kStagePV=2, kPadQ/K/V=0 (SWIZZLE_32B),
-// kPersistQg2s=0, kPersistQs2r=0, kShareSmemQKV=0, kRegPipeKV=0. Only D=512
-// is wired through the dispatch chain initially.
+// SM120+ (TMA-capable) launcher.  kDChunk=32 (SWIZZLE_64B) or 64 (SWIZZLE_128B)
+// is selected by the caller based on compute capability (sm_90/100 → 64,
+// sm_120a → 32, constrained by per-SM shared memory).
 // ============================================================================
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
 template <typename kDataType, const int kHeadDim, const int kMmaAccFloat32QK,
-          const int kMmaAccFloat32PV, const int kStageQK, const int kStagePV>
+          const int kMmaAccFloat32PV, const int kStage, const int kDChunk>
 void launch_ffpa_attn_fwd_template_sm120(torch::Tensor Q, torch::Tensor K,
                                          torch::Tensor V, torch::Tensor O,
                                          torch::Tensor attn_bias,
@@ -497,8 +536,10 @@ void launch_ffpa_attn_fwd_template_sm120(torch::Tensor Q, torch::Tensor K,
   constexpr int kPadQ = 0;
   constexpr int kPadK = 0;
   constexpr int kPadV = 0;
+  constexpr int kStageQK = kStage;
+  constexpr int kStagePV = kStage;
   constexpr int kOStorageAccFloat32 = getConfigOStorageAccFloat32<kHeadDim>();
-  constexpr int kDChunks = kHeadDim / kMmaAtomK;
+  constexpr int kDChunks = kHeadDim / kDChunk;
 
   const int Nb = Q.size(0);
   const int Nh = Q.size(1);
@@ -540,38 +581,32 @@ void launch_ffpa_attn_fwd_template_sm120(torch::Tensor Q, torch::Tensor K,
   const c10::cuda::OptionalCUDAGuard device_guard(Q.device());
   auto stream = at::cuda::getCurrentCUDAStream();
 
-  // Build TMA descriptors. minor_dim = D, major_dim = B*H*N so the
-  // descriptor covers the full flattened [B*H*N, D] gmem tensor (required for
-  // multi-head correctness; see /memories/repo/leetcuda-tma-fa-multihead.md).
-  // box = [Br/Bc, 16] (innermost = 16 half = 32B -> SWIZZLE_32B), matching
-  // the kernel's kMmaAtomK=16 split-D smem layout + swizzle::permuted<16>.
   const int total_rows = Nb * Nh * Nq;
   const int total_kv_rows = Nb * Nh_kv * Nkv;
-  const CUtensorMapSwizzle swizzle_mode = CU_TENSOR_MAP_SWIZZLE_32B;
+  constexpr CUtensorMapSwizzle qk_swizzle =
+      (kDChunk == 64) ? CU_TENSOR_MAP_SWIZZLE_128B : CU_TENSOR_MAP_SWIZZLE_64B;
 
-  auto make_desc = [&](void* gmem_ptr, int rows) -> CUtensorMap {
+  auto make_desc = [&](void* gmem_ptr, int rows, int box_minor,
+                       CUtensorMapSwizzle sw) -> CUtensorMap {
     ffpa::tma::Copy2DDescriptorParams<kDataType> params;
     params.global_address = reinterpret_cast<kDataType*>(gmem_ptr);
     params.minor_dim = kHeadDim;
     params.major_dim = rows;
     params.major_stride_bytes = kHeadDim * sizeof(kDataType);
-    params.box_minor_dim = 16;  // kMmaAtomK
-    params.box_major_dim = Bc;  // Br for Q is also fine (Br==Bc asserted)
-    params.swizzle = swizzle_mode;
+    params.box_minor_dim = box_minor;
+    params.box_major_dim = Bc;
+    params.swizzle = sw;
     params.l2_promotion = CU_TENSOR_MAP_L2_PROMOTION_L2_128B;
     params.oob_fill = CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE;
     return ffpa::tma::make_2d_copy_desc<kDataType>(params);
   };
-  CUtensorMap tma_q_desc = make_desc(Q.data_ptr(), total_rows);
-  CUtensorMap tma_k_desc = make_desc(K.data_ptr(), total_kv_rows);
-  CUtensorMap tma_v_desc = make_desc(V.data_ptr(), total_kv_rows);
-  // CUtensorMap descriptors must reside in device memory: the TMA instruction
-  // dereferences the descriptor pointer on the device, so a host-stack address
-  // would be an illegal device-side access. Copy each descriptor to a small
-  // device buffer and pass device pointers to the kernel.
-  CUtensorMap* tma_q_d = nullptr;
-  CUtensorMap* tma_k_d = nullptr;
-  CUtensorMap* tma_v_d = nullptr;
+  CUtensorMap tma_q_desc =
+      make_desc(Q.data_ptr(), total_rows, kDChunk, qk_swizzle);
+  CUtensorMap tma_k_desc =
+      make_desc(K.data_ptr(), total_kv_rows, kDChunk, qk_swizzle);
+  CUtensorMap tma_v_desc =
+      make_desc(V.data_ptr(), total_kv_rows, 16, CU_TENSOR_MAP_SWIZZLE_32B);
+  CUtensorMap *tma_q_d = nullptr, *tma_k_d = nullptr, *tma_v_d = nullptr;
   cudaMalloc(&tma_q_d, sizeof(CUtensorMap));
   cudaMalloc(&tma_k_d, sizeof(CUtensorMap));
   cudaMalloc(&tma_v_d, sizeof(CUtensorMap));
@@ -579,12 +614,8 @@ void launch_ffpa_attn_fwd_template_sm120(torch::Tensor Q, torch::Tensor K,
   cudaMemcpy(tma_k_d, &tma_k_desc, sizeof(CUtensorMap), cudaMemcpyHostToDevice);
   cudaMemcpy(tma_v_d, &tma_v_desc, sizeof(CUtensorMap), cudaMemcpyHostToDevice);
 
-  // SMEM = Q[K*K stages] + K[K*K stages] + V[K*V stages] + barriers.
-  // Q tile = Br * 16 * 2B, K/V tile = Bc * 16 * 2B (each a 1024B multiple,
-  // so the barrier base inherits the 1024B alignment from __align__(1024)).
-  // Barriers: 4 arrays of cuda::barrier (8B each), kStageQK*2 + kStagePV*2.
-  constexpr int kQTileBytes = Br * kMmaAtomK * sizeof(kDataType);
-  constexpr int kKTileBytes = Bc * kMmaAtomK * sizeof(kDataType);
+  constexpr int kQTileBytes = Br * kDChunk * sizeof(kDataType);
+  constexpr int kKTileBytes = Bc * kDChunk * sizeof(kDataType);
   constexpr int kVTileBytes = Bc * (kMmaAtomN * 2) * sizeof(kDataType);
   constexpr int kQKVSmemBytes =
       kStageQK * (kQTileBytes + kKTileBytes) + kStagePV * kVTileBytes;
@@ -598,7 +629,7 @@ void launch_ffpa_attn_fwd_template_sm120(torch::Tensor Q, torch::Tensor K,
           kMmaTileSeqLenK, kMmaTileSeqLenP, kMmaTileHeadDimV, kValTileSeqLenQ,
           kValTileSeqLenK, kValTileSeqLenP, kValTileHeadDimV, kMmaAccFloat32QK,
           kMmaAccFloat32PV, kOStorageAccFloat32, kStageQK, kStagePV, kPadQ,
-          kPadK, kPadV>);
+          kPadK, kPadV, kDChunk>);
   cudaFuncSetAttribute(kernel_func, cudaFuncAttributeMaxDynamicSharedMemorySize,
                        kSmemBytes);
   kernel_func<<<grid, block, kSmemBytes, stream>>>(
@@ -611,3 +642,4 @@ void launch_ffpa_attn_fwd_template_sm120(torch::Tensor Q, torch::Tensor K,
   cudaFree(tma_k_d);
   cudaFree(tma_v_d);
 }
+#endif  // __CUDA_ARCH__ >= 900

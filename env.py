@@ -289,6 +289,8 @@ class ENV(object):
       extra_env_cflags.append("-DENBALE_FFPA_LAUNCH_GRID_DNHB")
     if cls.enable_cuda_impl():
       extra_env_cflags.append("-DENABLE_FFPA_CUDA_IMPL")
+    if cls._has_sm120_arch():
+      extra_env_cflags.append("-DFFPA_BUILD_SM120")
 
     assert not all((cls.enable_persist_q_s2r(), cls.enable_persist_q_g2s())
                    ), "PERSIST_Q_G2S and PERSIST_Q_S2R can not both enabled."
@@ -383,6 +385,14 @@ class ENV(object):
     if cls.enable_all_headdim():
       return list(range(32, 1025, 32))
     return list(range(256, 1025, 64))
+
+  @classmethod
+  def _has_sm120_arch(cls):
+    """Return True if sm_120a (Blackwell) is in the build arch list."""
+    return '120a' in cls.get_build_arch_list(
+    ) or '120' in cls.get_build_arch_list()
+
+  # --- end SM120 dispatch code generation ---
 
   @classmethod
   def generated_sources_dir(cls):
@@ -565,7 +575,6 @@ class ENV(object):
       "using namespace ffpa;",
       "",
     ]
-
     f16_prefix = [
       "  constexpr int kMmaAccFloat32QK = 0;",
       "  constexpr int kMmaAccFloat32PV = 0;",
@@ -640,6 +649,7 @@ class ENV(object):
       "    int64_t philox_offset,",
       "    int tma) {",
     ]
+
     stage_body = cls._render_stage_body(
       d, t_in, "kMmaAccFloat32QK", "kMmaAccFloat32PV"
     )
@@ -721,7 +731,6 @@ class ENV(object):
         pretty_print_line(f"csrc_file: {gs}", sep="", mode="left")
     build_sources = [
       csrc("cuffpa", "ffpa_attn_api.cc"),
-      csrc("cuffpa", "ffpa_attn_fwd_sm120_dispatch.cu")
     ] + generated_sources
     if build_pkg:
       pretty_print_line()

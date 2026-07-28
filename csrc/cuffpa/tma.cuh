@@ -27,11 +27,6 @@ constexpr CUtensorMapDataType get_tensor_map_dtype() {
   }
 }
 
-inline bool is_experimental_tma_enabled() {
-  const char* env = std::getenv("ENABLE_FFPA_EXPERIMENTAL_TMA");
-  return env != nullptr && env[0] != '\0' && env[0] != '0';
-}
-
 inline bool device_supports_tma(int device_index) {
   int major = 0;
   cudaError_t status = cudaDeviceGetAttribute(
@@ -101,7 +96,11 @@ namespace cde = cuda::device::experimental;
 __device__ __forceinline__ void init_barrier(barrier_t* barrier,
                                              int arrive_count) {
   init(barrier, arrive_count);
+#if CUDART_VERSION >= 13020
+  cuda::ptx::fence_proxy_async(cuda::ptx::space_shared);
+#else
   cde::fence_proxy_async_shared_cta();
+#endif
 }
 
 __device__ __forceinline__ void wait_barrier(barrier_t& barrier) {
@@ -111,7 +110,11 @@ __device__ __forceinline__ void wait_barrier(barrier_t& barrier) {
   // provides only completion of the TMA, not cross-proxy visibility for
   // sm_120 / Blackwell, where a generic-proxy reader must observe an explicit
   // fence.proxy.async.shared::cta after the producer arrival.
+#if CUDART_VERSION >= 13020
+  cuda::ptx::fence_proxy_async(cuda::ptx::space_shared);
+#else
   cde::fence_proxy_async_shared_cta();
+#endif
 }
 
 // Parity-based wait for the direct-write consumers. mbarriers initialised
@@ -129,7 +132,11 @@ __device__ __forceinline__ void wait_barrier_parity(barrier_t& barrier,
   // alone provides only completion of the TMA, not cross-proxy visibility
   // for sm_120 / Blackwell, where a generic-proxy reader must observe an
   // explicit ``fence.proxy.async.shared::cta`` after the producer arrival.
+#if CUDART_VERSION >= 13020
+  cuda::ptx::fence_proxy_async(cuda::ptx::space_shared);
+#else
   cde::fence_proxy_async_shared_cta();
+#endif
 }
 
 // Standalone async-proxy -> generic-proxy fence for shared memory. Producers
@@ -140,7 +147,11 @@ __device__ __forceinline__ void wait_barrier_parity(barrier_t& barrier,
 // single ``arrive_expect_tx``, with a fence in between to order the TMA
 // writes before the arrival signal).
 __device__ __forceinline__ void fence_async_shared() {
+#if CUDART_VERSION >= 13020
+  cuda::ptx::fence_proxy_async(cuda::ptx::space_shared);
+#else
   cde::fence_proxy_async_shared_cta();
+#endif
 }
 
 // ------------------------------------------------------------------
@@ -190,10 +201,21 @@ __device__ __forceinline__ void load_2d(void* smem_ptr,
                                         int32_t major_coord, barrier_t& barrier,
                                         uint32_t bytes, int issuer_lane = 0) {
   if (static_cast<int>(threadIdx.x) == issuer_lane) {
+#if CUDART_VERSION >= 13020
+    const int32_t coords[]{minor_coord, major_coord};
+    auto* barrier_handle = cuda::device::barrier_native_handle(barrier);
+    cuda::ptx::cp_async_bulk_tensor(cuda::ptx::space_cluster,
+                                    cuda::ptx::space_global, smem_ptr,
+                                    tensor_map, coords, barrier_handle);
+    [[maybe_unused]] auto token = cuda::ptx::mbarrier_arrive_expect_tx(
+        cuda::ptx::sem_release, cuda::ptx::scope_cta, cuda::ptx::space_shared,
+        barrier_handle, bytes);
+#else
     cde::cp_async_bulk_tensor_2d_global_to_shared(
         smem_ptr, tensor_map, minor_coord, major_coord, barrier);
     [[maybe_unused]] auto token =
         cuda::device::barrier_arrive_tx(barrier, 1, bytes);
+#endif
   }
 }
 
@@ -208,8 +230,16 @@ __device__ __forceinline__ void load_2d_no_arrive(
     void* smem_ptr, const CUtensorMap* tensor_map, int32_t minor_coord,
     int32_t major_coord, barrier_t& barrier, int issuer_lane = 0) {
   if (static_cast<int>(threadIdx.x) == issuer_lane) {
+#if CUDART_VERSION >= 13020
+    const int32_t coords[]{minor_coord, major_coord};
+    auto* barrier_handle = cuda::device::barrier_native_handle(barrier);
+    cuda::ptx::cp_async_bulk_tensor(cuda::ptx::space_cluster,
+                                    cuda::ptx::space_global, smem_ptr,
+                                    tensor_map, coords, barrier_handle);
+#else
     cde::cp_async_bulk_tensor_2d_global_to_shared(
         smem_ptr, tensor_map, minor_coord, major_coord, barrier);
+#endif
   }
 }
 
@@ -223,8 +253,15 @@ __device__ __forceinline__ void arrive_expect_tx(barrier_t& barrier,
                                                  uint32_t bytes,
                                                  int issuer_lane = 0) {
   if (static_cast<int>(threadIdx.x) == issuer_lane) {
+#if CUDART_VERSION >= 13020
+    auto* barrier_handle = cuda::device::barrier_native_handle(barrier);
+    [[maybe_unused]] auto token = cuda::ptx::mbarrier_arrive_expect_tx(
+        cuda::ptx::sem_release, cuda::ptx::scope_cta, cuda::ptx::space_shared,
+        barrier_handle, bytes);
+#else
     [[maybe_unused]] auto token =
         cuda::device::barrier_arrive_tx(barrier, 1, bytes);
+#endif
   }
 }
 
@@ -335,125 +372,6 @@ __device__ __forceinline__ bool load_2d_to_smem_repack(
   wait_and_repack_tmp_to_dst<BrOrBc, kTileSize, kCols, kNumThreads, kPad, T>(
       dst_smem_base_ptr, tmp_smem_base_ptr, dst_stage, tmp_stage, barrier);
   return true;
-}
-#else
-__device__ __forceinline__ void init_barrier(barrier_t* barrier,
-                                             int arrive_count) {
-  (void)barrier;
-  (void)arrive_count;
-}
-
-__device__ __forceinline__ void wait_barrier(barrier_t& barrier) {
-  (void)barrier;
-}
-
-__device__ __forceinline__ void wait_barrier_parity(barrier_t& barrier,
-                                                    uint32_t phase) {
-  (void)barrier;
-  (void)phase;
-}
-
-__device__ __forceinline__ void fence_async_shared() {}
-
-__device__ __forceinline__ void bulk_commit_group() {}
-
-template <size_t n>
-__device__ __forceinline__ void bulk_wait_group() {}
-
-__device__ __forceinline__ void load_2d(void* smem_ptr,
-                                        const CUtensorMap* tensor_map,
-                                        int32_t minor_coord,
-                                        int32_t major_coord, barrier_t& barrier,
-                                        uint32_t bytes, int issuer_lane = 0) {
-  (void)smem_ptr;
-  (void)tensor_map;
-  (void)minor_coord;
-  (void)major_coord;
-  (void)barrier;
-  (void)bytes;
-  (void)issuer_lane;
-}
-
-__device__ __forceinline__ void load_2d_no_arrive(
-    void* smem_ptr, const CUtensorMap* tensor_map, int32_t minor_coord,
-    int32_t major_coord, barrier_t& barrier, int issuer_lane = 0) {
-  (void)smem_ptr;
-  (void)tensor_map;
-  (void)minor_coord;
-  (void)major_coord;
-  (void)barrier;
-  (void)issuer_lane;
-}
-
-__device__ __forceinline__ void arrive_expect_tx(barrier_t& barrier,
-                                                 uint32_t bytes,
-                                                 int issuer_lane = 0) {
-  (void)barrier;
-  (void)bytes;
-  (void)issuer_lane;
-}
-
-template <const int BrOrBc, const int kHeadDim, const int kCols,
-          const int kTileSize, typename T>
-__device__ __forceinline__ bool issue_load_2d_to_dst_swizzled(
-    T* dst_smem_base_ptr, const CUtensorMap* tensor_map, const int major_coord,
-    const int d_tile_id, const int dst_stage, barrier_t& barrier,
-    int issuer_lane = 0) {
-  (void)dst_smem_base_ptr;
-  (void)tensor_map;
-  (void)major_coord;
-  (void)d_tile_id;
-  (void)dst_stage;
-  (void)barrier;
-  (void)issuer_lane;
-  return false;
-}
-
-template <const int BrOrBc, const int kHeadDim, const int kCols, typename T>
-__device__ __forceinline__ bool issue_load_2d_to_tmp(
-    T* tmp_smem_base_ptr, const CUtensorMap* tensor_map, const int major_coord,
-    const int d_tile_id, const int tmp_stage, const int seqlen_bound,
-    barrier_t& barrier) {
-  (void)tmp_smem_base_ptr;
-  (void)tensor_map;
-  (void)major_coord;
-  (void)d_tile_id;
-  (void)tmp_stage;
-  (void)seqlen_bound;
-  (void)barrier;
-  return false;
-}
-
-template <const int BrOrBc, const int kTileSize, const int kCols,
-          const int kNumThreads, const int kPad, typename T>
-__device__ __forceinline__ void wait_and_repack_tmp_to_dst(T* dst_smem_base_ptr,
-                                                           T* tmp_smem_base_ptr,
-                                                           const int dst_stage,
-                                                           const int tmp_stage,
-                                                           barrier_t& barrier) {
-  (void)dst_smem_base_ptr;
-  (void)tmp_smem_base_ptr;
-  (void)dst_stage;
-  (void)tmp_stage;
-  (void)barrier;
-}
-
-template <const int BrOrBc, const int kTileSize, const int kHeadDim,
-          const int kCols, const int kNumThreads, const int kPad, typename T>
-__device__ __forceinline__ bool load_2d_to_smem_repack(
-    T* dst_smem_base_ptr, T* tmp_smem_base_ptr, const CUtensorMap* tensor_map,
-    const int major_coord, const int d_tile_id, const int dst_stage,
-    const int tmp_stage, const int seqlen_bound, barrier_t& barrier) {
-  (void)dst_smem_base_ptr;
-  (void)tmp_smem_base_ptr;
-  (void)tensor_map;
-  (void)major_coord;
-  (void)d_tile_id;
-  (void)dst_stage;
-  (void)tmp_stage;
-  (void)seqlen_bound;
-  (void)barrier;
-  return false;
 }
 #endif
 
