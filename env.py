@@ -14,7 +14,7 @@ _ARCH_ALIASES = {
   "ada": "89",
   "hopper": "90",
   "blackwell": "100",
-  "blackwell_geforce": "120",
+  "blackwell_geforce": "120a",  # sm_120a need for TMA instructions.
 }
 
 
@@ -719,7 +719,10 @@ class ENV(object):
     if build_pkg:
       for gs in generated_sources:
         pretty_print_line(f"csrc_file: {gs}", sep="", mode="left")
-    build_sources = [csrc("cuffpa", "ffpa_attn_api.cc")] + generated_sources
+    build_sources = [
+      csrc("cuffpa", "ffpa_attn_api.cc"),
+      csrc("cuffpa", "ffpa_attn_fwd_sm120_dispatch.cu")
+    ] + generated_sources
     if build_pkg:
       pretty_print_line()
     return build_sources

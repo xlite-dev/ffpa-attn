@@ -20,15 +20,15 @@ def _ffpa_attn_forward_cuda(
 ) -> tuple[torch.Tensor, torch.Tensor]:
   """Call FFPA CUDA forward via registered torch op, returning ``(O, softmax_lse)``.
 
-  The ``O`` parameter is accepted for API compatibility but ignored — the
+  The ``O`` parameter is accepted for API compatibility but ignored - the
   registered op always allocates a fresh output buffer.
-  The ``tma`` parameter is also accepted for API compatibility; legacy CUDA
-  TMA dispatch has been removed from the active backend and is forced off.
+  The ``tma`` parameter enables the SM120a TMA + MMA warp-specialised kernel
+  when non-zero and the device is sm_120a (Blackwell); otherwise it is
+  ignored and the architecture-agnostic path is used.
 
   :returns: Output tensor and softmax LSE sliced to visible shape ``[B, H, Nq]``.
   """
   del O
-  del tma
   if attn_bias is None:
     attn_bias = Q.new_empty((0, ))
   O_storage, softmax_lse_storage = torch.ops.ffpa_attn._fwd_cuda(
@@ -43,6 +43,6 @@ def _ffpa_attn_forward_cuda(
     dropout_p,
     philox_seed,
     philox_offset,
-    0,
+    tma,
   )
   return O_storage, softmax_lse_storage[..., :Q.size(2)]

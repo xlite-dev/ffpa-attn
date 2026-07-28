@@ -3,6 +3,8 @@
 
 #include "ffpa_attn_fwd.cuh"
 #include "ffpa_attn_fwd_split_kv.cuh"
+#include "ffpa_attn_fwd_sm120.cuh"
+#include "tma.cuh"
 using namespace ffpa;
 
 static constexpr int kMaxDForOStoreFloat32 = 512;
@@ -450,4 +452,162 @@ void launch_ffpa_attn_fwd_template(torch::Tensor Q, torch::Tensor K,
   LAUNCH_TEMPLATE_FUNC_BASE(ffpa_mma_large_d_kernel_func);
 
 #undef LAUNCH_TEMPLATE_FUNC_BASE
+}
+
+// ============================================================================
+// launch_ffpa_attn_fwd_template_sm120
+// ----------------------------------------------------------------------------
+// SM120a (Blackwell) TMA + MMA warp-specialised launcher. Builds TMA
+// descriptors for Q/K/V (SWIZZLE_32B, box=[Br/Bc, 16], gmem_prob_shape covers
+// [B*H*N, D]) and launches ``ffpa_attn_split_d_fwd_template_sm120`` with
+// 384 threads (128 producer + 256 consumer). Falls back to the architecture-
+// agnostic ``launch_ffpa_attn_fwd_template`` on non-sm_120a devices.
+//
+// First version: kStageQK=2, kStagePV=2, kPadQ/K/V=0 (SWIZZLE_32B),
+// kPersistQg2s=0, kPersistQs2r=0, kShareSmemQKV=0, kRegPipeKV=0. Only D=512
+// is wired through the dispatch chain initially.
+// ============================================================================
+template <typename kDataType, const int kHeadDim, const int kMmaAccFloat32QK,
+          const int kMmaAccFloat32PV, const int kStageQK, const int kStagePV>
+void launch_ffpa_attn_fwd_template_sm120(torch::Tensor Q, torch::Tensor K,
+                                         torch::Tensor V, torch::Tensor O,
+                                         torch::Tensor attn_bias,
+                                         torch::Tensor softmax_lse, int causal,
+                                         double softmax_scale, double dropout_p,
+                                         int64_t philox_seed,
+                                         int64_t philox_offset) {
+  constexpr int kMmaAtomM = 16;
+  constexpr int kMmaAtomN = 8;
+  constexpr int kMmaAtomK = 16;
+  constexpr int kMmaTileSeqLenQ = getConfigMmaTileSeqLenQP<kHeadDim>();
+  constexpr int kMmaTileSeqLenK = 1;
+  constexpr int kMmaTileSeqLenP = getConfigMmaTileSeqLenQP<kHeadDim>();
+  constexpr int kMmaTileHeadDimV = 1;
+  constexpr int kValTileSeqLenQ = 1;
+  constexpr int kValTileSeqLenK = getConfigValTileSeqLenK<kHeadDim>();
+  constexpr int kValTileSeqLenP = 1;
+  constexpr int kValTileHeadDimV = getConfigValTileHeadDimV<kHeadDim>();
+  constexpr int Br = kMmaAtomM * kMmaTileSeqLenQ * kValTileSeqLenQ;
+  constexpr int Bc = kMmaAtomN * kMmaTileSeqLenK * kValTileSeqLenK;
+  static_assert(Br == Bc);
+  constexpr int kConsumerThreads =
+      WARP_SIZE * kMmaTileSeqLenQ * kMmaTileSeqLenK;
+  constexpr int kProducerThreads = 128;
+  constexpr int kTotalThreads = kConsumerThreads + kProducerThreads;
+  constexpr int kPadQ = 0;
+  constexpr int kPadK = 0;
+  constexpr int kPadV = 0;
+  constexpr int kOStorageAccFloat32 = getConfigOStorageAccFloat32<kHeadDim>();
+  constexpr int kDChunks = kHeadDim / kMmaAtomK;
+
+  const int Nb = Q.size(0);
+  const int Nh = Q.size(1);
+  const int Nh_kv = K.size(1);
+  const int Nq = Q.size(2);
+  const int Nkv = K.size(2);
+  const bool has_attn_bias = attn_bias.numel() != 0;
+  const bool has_dropout = dropout_p > 0.0;
+  const void* attn_bias_ptr = nullptr;
+  int attn_bias_dtype = 0;
+  long long attn_bias_stride_b = 0, attn_bias_stride_h = 0,
+            attn_bias_stride_m = 0, attn_bias_stride_n = 0;
+  if (has_attn_bias) {
+    attn_bias_ptr = attn_bias.data_ptr();
+    attn_bias_dtype = attn_bias.scalar_type() == torch::kHalf       ? 1
+                      : attn_bias.scalar_type() == torch::kBFloat16 ? 2
+                                                                    : 3;
+    attn_bias_stride_b =
+        (attn_bias.size(0) == 1 && Nb > 1) ? 0 : attn_bias.stride(0);
+    attn_bias_stride_h =
+        (attn_bias.size(1) == 1 && Nh > 1) ? 0 : attn_bias.stride(1);
+    attn_bias_stride_m =
+        (attn_bias.size(2) == 1 && Nq > 1) ? 0 : attn_bias.stride(2);
+    attn_bias_stride_n =
+        (attn_bias.size(3) == 1 && Nkv > 1) ? 0 : attn_bias.stride(3);
+  }
+
+  const dim3 block(kTotalThreads, 1, 1);
+  const dim3 grid = getConfigGrid<Br>(Nb, Nh, Nq);
+  const int Tc = utils::div_ceil(Nkv, Bc);
+  const float scale = static_cast<float>(softmax_scale);
+  const float dropout_p_f = static_cast<float>(dropout_p);
+  const unsigned long long philox_seed_u =
+      static_cast<unsigned long long>(philox_seed);
+  const unsigned long long philox_offset_u =
+      static_cast<unsigned long long>(philox_offset);
+  float* softmax_lse_ptr = softmax_lse.data_ptr<float>();
+
+  const c10::cuda::OptionalCUDAGuard device_guard(Q.device());
+  auto stream = at::cuda::getCurrentCUDAStream();
+
+  // Build TMA descriptors. minor_dim = D, major_dim = B*H*N so the
+  // descriptor covers the full flattened [B*H*N, D] gmem tensor (required for
+  // multi-head correctness; see /memories/repo/leetcuda-tma-fa-multihead.md).
+  // box = [Br/Bc, 16] (innermost = 16 half = 32B -> SWIZZLE_32B), matching
+  // the kernel's kMmaAtomK=16 split-D smem layout + swizzle::permuted<16>.
+  const int total_rows = Nb * Nh * Nq;
+  const int total_kv_rows = Nb * Nh_kv * Nkv;
+  const CUtensorMapSwizzle swizzle_mode = CU_TENSOR_MAP_SWIZZLE_32B;
+
+  auto make_desc = [&](void* gmem_ptr, int rows) -> CUtensorMap {
+    ffpa::tma::Copy2DDescriptorParams<kDataType> params;
+    params.global_address = reinterpret_cast<kDataType*>(gmem_ptr);
+    params.minor_dim = kHeadDim;
+    params.major_dim = rows;
+    params.major_stride_bytes = kHeadDim * sizeof(kDataType);
+    params.box_minor_dim = 16;  // kMmaAtomK
+    params.box_major_dim = Bc;  // Br for Q is also fine (Br==Bc asserted)
+    params.swizzle = swizzle_mode;
+    params.l2_promotion = CU_TENSOR_MAP_L2_PROMOTION_L2_128B;
+    params.oob_fill = CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE;
+    return ffpa::tma::make_2d_copy_desc<kDataType>(params);
+  };
+  CUtensorMap tma_q_desc = make_desc(Q.data_ptr(), total_rows);
+  CUtensorMap tma_k_desc = make_desc(K.data_ptr(), total_kv_rows);
+  CUtensorMap tma_v_desc = make_desc(V.data_ptr(), total_kv_rows);
+  // CUtensorMap descriptors must reside in device memory: the TMA instruction
+  // dereferences the descriptor pointer on the device, so a host-stack address
+  // would be an illegal device-side access. Copy each descriptor to a small
+  // device buffer and pass device pointers to the kernel.
+  CUtensorMap* tma_q_d = nullptr;
+  CUtensorMap* tma_k_d = nullptr;
+  CUtensorMap* tma_v_d = nullptr;
+  cudaMalloc(&tma_q_d, sizeof(CUtensorMap));
+  cudaMalloc(&tma_k_d, sizeof(CUtensorMap));
+  cudaMalloc(&tma_v_d, sizeof(CUtensorMap));
+  cudaMemcpy(tma_q_d, &tma_q_desc, sizeof(CUtensorMap), cudaMemcpyHostToDevice);
+  cudaMemcpy(tma_k_d, &tma_k_desc, sizeof(CUtensorMap), cudaMemcpyHostToDevice);
+  cudaMemcpy(tma_v_d, &tma_v_desc, sizeof(CUtensorMap), cudaMemcpyHostToDevice);
+
+  // SMEM = Q[K*K stages] + K[K*K stages] + V[K*V stages] + barriers.
+  // Q tile = Br * 16 * 2B, K/V tile = Bc * 16 * 2B (each a 1024B multiple,
+  // so the barrier base inherits the 1024B alignment from __align__(1024)).
+  // Barriers: 4 arrays of cuda::barrier (8B each), kStageQK*2 + kStagePV*2.
+  constexpr int kQTileBytes = Br * kMmaAtomK * sizeof(kDataType);
+  constexpr int kKTileBytes = Bc * kMmaAtomK * sizeof(kDataType);
+  constexpr int kVTileBytes = Bc * (kMmaAtomN * 2) * sizeof(kDataType);
+  constexpr int kQKVSmemBytes =
+      kStageQK * (kQTileBytes + kKTileBytes) + kStagePV * kVTileBytes;
+  constexpr int kBarrierBytes =
+      (kStageQK * 2 + kStagePV * 2) * sizeof(ffpa::tma::barrier_t);
+  constexpr int kSmemBytes = kQKVSmemBytes + kBarrierBytes;
+
+  auto kernel_func =
+      (ffpa_attn_split_d_fwd_template_sm120<
+          kDataType, kHeadDim, kMmaAtomM, kMmaAtomN, kMmaAtomK, kMmaTileSeqLenQ,
+          kMmaTileSeqLenK, kMmaTileSeqLenP, kMmaTileHeadDimV, kValTileSeqLenQ,
+          kValTileSeqLenK, kValTileSeqLenP, kValTileHeadDimV, kMmaAccFloat32QK,
+          kMmaAccFloat32PV, kOStorageAccFloat32, kStageQK, kStagePV, kPadQ,
+          kPadK, kPadV>);
+  cudaFuncSetAttribute(kernel_func, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                       kSmemBytes);
+  kernel_func<<<grid, block, kSmemBytes, stream>>>(
+      tma_q_d, tma_k_d, tma_v_d, reinterpret_cast<kDataType*>(O.data_ptr()),
+      softmax_lse_ptr, Nq, Nkv, Nh, Nh_kv, scale, Tc, causal, attn_bias_ptr,
+      attn_bias_dtype, attn_bias_stride_b, attn_bias_stride_h,
+      attn_bias_stride_m, attn_bias_stride_n, dropout_p_f, philox_seed_u,
+      philox_offset_u);
+  cudaFree(tma_q_d);
+  cudaFree(tma_k_d);
+  cudaFree(tma_v_d);
 }

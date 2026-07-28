@@ -106,6 +106,12 @@ __device__ __forceinline__ void init_barrier(barrier_t* barrier,
 
 __device__ __forceinline__ void wait_barrier(barrier_t& barrier) {
   barrier.wait(barrier.arrive());
+  // The TMA bulk-tensor copy writes via the async proxy; ldmatrix.sync (used
+  // by the consumer) reads via the generic proxy. mbarrier wait alone
+  // provides only completion of the TMA, not cross-proxy visibility for
+  // sm_120 / Blackwell, where a generic-proxy reader must observe an explicit
+  // fence.proxy.async.shared::cta after the producer arrival.
+  cde::fence_proxy_async_shared_cta();
 }
 
 // Parity-based wait for the direct-write consumers. mbarriers initialised
@@ -123,6 +129,17 @@ __device__ __forceinline__ void wait_barrier_parity(barrier_t& barrier,
   // alone provides only completion of the TMA, not cross-proxy visibility
   // for sm_120 / Blackwell, where a generic-proxy reader must observe an
   // explicit ``fence.proxy.async.shared::cta`` after the producer arrival.
+  cde::fence_proxy_async_shared_cta();
+}
+
+// Standalone async-proxy -> generic-proxy fence for shared memory. Producers
+// call this after issuing TMA copies (so the writes become visible to the
+// consumer's ldmatrix); consumers implicitly get it via ``wait_barrier`` /
+// ``wait_barrier_parity``. Exposed for producers that issue TMA without an
+// immediate wait (e.g. combined Q+K stage: two ``load_2d_no_arrive`` then a
+// single ``arrive_expect_tx``, with a fence in between to order the TMA
+// writes before the arrival signal).
+__device__ __forceinline__ void fence_async_shared() {
   cde::fence_proxy_async_shared_cta();
 }
 
@@ -175,6 +192,37 @@ __device__ __forceinline__ void load_2d(void* smem_ptr,
   if (static_cast<int>(threadIdx.x) == issuer_lane) {
     cde::cp_async_bulk_tensor_2d_global_to_shared(
         smem_ptr, tensor_map, minor_coord, major_coord, barrier);
+    [[maybe_unused]] auto token =
+        cuda::device::barrier_arrive_tx(barrier, 1, bytes);
+  }
+}
+
+// Issue a TMA bulk-tensor copy WITHOUT arriving on the barrier. Used by
+// the SM120 warp-specialised producer when multiple TMA copies (e.g. Q+K
+// in a combined stage) must share a SINGLE ``arrive_expect_tx`` with the
+// combined byte count -- calling ``load_2d`` (which arrives per-copy)
+// would add extra producer arrivals and corrupt the full/empty phase
+// protocol. Pair with an explicit ``arrive_expect_tx`` after all
+// ``load_2d_no_arrive`` calls for the same barrier.
+__device__ __forceinline__ void load_2d_no_arrive(
+    void* smem_ptr, const CUtensorMap* tensor_map, int32_t minor_coord,
+    int32_t major_coord, barrier_t& barrier, int issuer_lane = 0) {
+  if (static_cast<int>(threadIdx.x) == issuer_lane) {
+    cde::cp_async_bulk_tensor_2d_global_to_shared(
+        smem_ptr, tensor_map, minor_coord, major_coord, barrier);
+  }
+}
+
+// Arrive on ``barrier`` with an expected transaction byte count. This is
+// the producer-side signal that, once the TMA hardware has delivered
+// ``bytes`` worth of data (decrementing the barrier's tx-count to zero)
+// AND this arrival has been counted, the barrier phase flips and waiting
+// consumers proceed. Use after one or more ``load_2d_no_arrive`` calls
+// that target the same barrier, passing the SUM of their byte counts.
+__device__ __forceinline__ void arrive_expect_tx(barrier_t& barrier,
+                                                 uint32_t bytes,
+                                                 int issuer_lane = 0) {
+  if (static_cast<int>(threadIdx.x) == issuer_lane) {
     [[maybe_unused]] auto token =
         cuda::device::barrier_arrive_tx(barrier, 1, bytes);
   }
@@ -305,6 +353,8 @@ __device__ __forceinline__ void wait_barrier_parity(barrier_t& barrier,
   (void)phase;
 }
 
+__device__ __forceinline__ void fence_async_shared() {}
+
 __device__ __forceinline__ void bulk_commit_group() {}
 
 template <size_t n>
@@ -319,6 +369,25 @@ __device__ __forceinline__ void load_2d(void* smem_ptr,
   (void)tensor_map;
   (void)minor_coord;
   (void)major_coord;
+  (void)barrier;
+  (void)bytes;
+  (void)issuer_lane;
+}
+
+__device__ __forceinline__ void load_2d_no_arrive(
+    void* smem_ptr, const CUtensorMap* tensor_map, int32_t minor_coord,
+    int32_t major_coord, barrier_t& barrier, int issuer_lane = 0) {
+  (void)smem_ptr;
+  (void)tensor_map;
+  (void)minor_coord;
+  (void)major_coord;
+  (void)barrier;
+  (void)issuer_lane;
+}
+
+__device__ __forceinline__ void arrive_expect_tx(barrier_t& barrier,
+                                                 uint32_t bytes,
+                                                 int issuer_lane = 0) {
   (void)barrier;
   (void)bytes;
   (void)issuer_lane;

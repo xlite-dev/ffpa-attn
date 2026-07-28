@@ -3,6 +3,20 @@
 
 #include <stdexcept>
 
+#ifdef ENABLE_FFPA_CUDA_IMPL
+// Forward-declare the SM120a TMA+MMA WS dispatch entry (defined in
+// ffpa_attn_fwd_sm120_dispatch.cu, compiled by nvcc). Returns true if the
+// sm120 path handled the call; false if the caller should fall back to the
+// architecture-agnostic generated dispatch.
+bool ffpa_attn_fwd_sm120_dispatch(torch::Tensor Q, torch::Tensor K,
+                                  torch::Tensor V, torch::Tensor O,
+                                  torch::Tensor attn_bias,
+                                  torch::Tensor softmax_lse, int64_t acc,
+                                  int causal, double softmax_scale,
+                                  double dropout_p, int64_t philox_seed,
+                                  int64_t philox_offset);
+#endif
+
 namespace py = pybind11;
 
 #ifdef ENABLE_FFPA_CUDA_IMPL
@@ -35,11 +49,18 @@ void ffpa_attn_forward(torch::Tensor Q, torch::Tensor K, torch::Tensor V,
   const auto dtype = Q.scalar_type();
   const int stages_i = static_cast<int>(stages);
   const int causal_i = static_cast<int>(causal);
-  // Legacy CUDA TMA dispatch has been removed from the active backend
-  // and is forced off; the parameter is accepted for API compatibility
-  // but ignored.
-  (void)tma;
-  constexpr int tma_i = 0;
+
+  // SM120a TMA + MMA warp-specialised dispatch: when ``tma`` is requested and
+  // the current device is sm_120a (Blackwell), delegate to the sm120 dispatch
+  // (defined in ffpa_attn_fwd_sm120_dispatch.cu, compiled by nvcc). The host
+  // compiler cannot include launch_templates.cuh (it pulls <cuda/barrier>).
+  const int tma_i = static_cast<int>(tma);
+  if (tma_i != 0 && ffpa_attn_fwd_sm120_dispatch(
+                        Q, K, V, O, attn_bias, softmax_lse, acc, causal_i,
+                        softmax_scale, dropout_p, philox_seed, philox_offset)) {
+    return;
+  }
+  const int tma_legacy = 0;
 
   if (softmax_lse.numel() == 0) {
     const int B = Q.size(0);
@@ -54,11 +75,11 @@ void ffpa_attn_forward(torch::Tensor Q, torch::Tensor K, torch::Tensor V,
     if (acc == 0) {
       ffpa_attn_fwd_fp16f16(Q, K, V, O, attn_bias, softmax_lse, stages_i,
                             causal_i, softmax_scale, dropout_p, philox_seed,
-                            philox_offset, tma_i);
+                            philox_offset, tma_legacy);
     } else if (acc == 1) {
       ffpa_attn_fwd_fp16f32(Q, K, V, O, attn_bias, softmax_lse, stages_i,
                             causal_i, softmax_scale, dropout_p, philox_seed,
-                            philox_offset, tma_i);
+                            philox_offset, tma_legacy);
     } else {
       throw std::invalid_argument("ffpa_attn: acc must be 0 (f16) or 1 (f32)");
     }
@@ -70,7 +91,7 @@ void ffpa_attn_forward(torch::Tensor Q, torch::Tensor K, torch::Tensor V,
     }
     ffpa_attn_fwd_bf16f32(Q, K, V, O, attn_bias, softmax_lse, stages_i,
                           causal_i, softmax_scale, dropout_p, philox_seed,
-                          philox_offset, tma_i);
+                          philox_offset, tma_legacy);
   } else {
     throw std::invalid_argument(
         "ffpa_attn: Q.dtype must be torch.float16 or torch.bfloat16");
