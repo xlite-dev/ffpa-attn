@@ -135,8 +135,7 @@ __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK + 128, 1)
 
   // Barrier init (thread 0 only): arrive_count=257 for all barriers
   // (256 consumer arrives + 1 producer arrive/arrive_expect_tx). Uses the
-  // ``wait(arrive())`` protocol (aligned with
-  // flash_attn_tma_mma_ws_stages_split_q):
+  // ``wait(arrive())`` protocol:
   //   - full: 256 consumer ``wait(arrive())`` (arrive contributes 1 each) +
   //           1 producer ``arrive_expect_tx`` (contributes 1 + sets tx-count).
   //   - empty: 256 consumer ``arrive()`` + 1 producer ``wait(arrive())``.
