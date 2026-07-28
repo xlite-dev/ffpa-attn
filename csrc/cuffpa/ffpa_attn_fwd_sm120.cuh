@@ -51,7 +51,7 @@ template <typename kDataType, const int kHeadDim, const int kMmaAtomM,
           const int kMmaAccFloat32PV, const int kOStorageAccFloat32,
           const int kStageQK, const int kStagePV, const int kPadQ,
           const int kPadK, const int kPadV, const int kQKDChunk = kMmaAtomK,
-          const int kVDChunk = kMmaAtomN * 2>
+          const int kVDChunk = kMmaAtomN * 2, const int kShareSmemQKV = 0>
 __global__ void
 // minBlocksPerMultiprocessor=1: let the compiler use the full per-thread
 // register budget (65536/384 = 170 regs). Without this hint the compiler's
@@ -93,6 +93,12 @@ __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK + 128, 1)
   static_assert(kVDChunk == 16 || kVDChunk == 32 || kVDChunk == 64);
   constexpr int kVDChunks = kHeadDim / kVDChunk;
   constexpr int kSubTilesV = kVDChunk / (kMmaAtomN * 2);
+  // kShareSmemQKV: V reuses QK smem after QK phase completes. The barrier
+  // protocol guarantees the consumer has finished all QK ldmatrix before the
+  // producer starts V TMA writes (the producer's last QK wait on qk_empty
+  // requires the consumer's arrive after the last QK d_chunk ldmatrix).
+  static_assert(!kShareSmemQKV || (kStageQK == kStagePV),
+                "kShareSmemQKV requires kStageQK == kStagePV");
 
 #ifdef ENABLE_FFPA_LAUNCH_GRID_DNHB
   const int Nb_id = blockIdx.z;
@@ -125,25 +131,43 @@ __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK + 128, 1)
   constexpr int Q_tile_size = Br * (kQKDChunk + kPadQ);
   constexpr int K_tile_size = Bc * (kQKDChunk + kPadK);
   constexpr int V_tile_size = Bc * (kVDChunk + kPadV);
+  // kShareSmemQKV: V reuses QK smem. Stage stride = max(QK combined, V).
+  // Q[stage] = base + stage * kStageStride
+  // K[stage] = base + Q_tile_size + stage * kStageStride
+  // V[stage] = base + stage * kStageStride (overlaps Q+K)
+  constexpr int kStageStride = kShareSmemQKV
+                                   ? ((Q_tile_size + K_tile_size) > V_tile_size
+                                          ? (Q_tile_size + K_tile_size)
+                                          : V_tile_size)
+                                   : 0;
+  constexpr int kQSmemStride = kShareSmemQKV ? kStageStride : Q_tile_size;
+  constexpr int kKSmemStride = kShareSmemQKV ? kStageStride : K_tile_size;
+  constexpr int kVSmemStride = kShareSmemQKV ? kStageStride : V_tile_size;
   kDataType* Q_tile_smem = smem;
-  kDataType* K_tile_smem = Q_tile_smem + kStageQK * Q_tile_size;
-  kDataType* V_tile_smem = K_tile_smem + kStageQK * K_tile_size;
+  kDataType* K_tile_smem = kShareSmemQKV
+                               ? (Q_tile_smem + Q_tile_size)
+                               : (Q_tile_smem + kStageQK * Q_tile_size);
+  kDataType* V_tile_smem =
+      kShareSmemQKV ? Q_tile_smem : (K_tile_smem + kStageQK * K_tile_size);
   const uint32_t smem_Q_base_ptr = __cvta_generic_to_shared(Q_tile_smem);
   const uint32_t smem_K_base_ptr = __cvta_generic_to_shared(K_tile_smem);
   const uint32_t smem_V_base_ptr = __cvta_generic_to_shared(V_tile_smem);
 
-  // Barriers live at the end of dynamic smem (after Q/K/V tiles). The
-  // ``__align__(1024)`` above already guarantees a 1024B-aligned smem base,
-  // and each Q/K/V tile is ``Br/Bc * kMmaAtomK * 2B`` = a 1024B multiple
-  // (kMmaAtomK=16, Br/Bc multiples of 32), so the barrier base inherits
-  // 1024B alignment without extra padding.
+  // Barriers live at the end of dynamic smem (after Q/K/V tiles).
   constexpr int kQKVSmemElems =
-      kStageQK * Q_tile_size + kStageQK * K_tile_size + kStagePV * V_tile_size;
+      kShareSmemQKV ? kStageQK * kStageStride
+                    : (kStageQK * Q_tile_size + kStageQK * K_tile_size +
+                       kStagePV * V_tile_size);
   ffpa::tma::barrier_t* qk_full =
       reinterpret_cast<ffpa::tma::barrier_t*>(smem + kQKVSmemElems);
   ffpa::tma::barrier_t* qk_empty = qk_full + kStageQK;
   ffpa::tma::barrier_t* v_full = qk_empty + kStageQK;
   ffpa::tma::barrier_t* v_empty = v_full + kStagePV;
+  // kShareSmemQKV: dedicated phase-transition barriers.
+  // qk_done: consumer signals after QK loop → producer waits before V writes.
+  // v_done: consumer signals after V loop → producer waits before next QK.
+  ffpa::tma::barrier_t* qk_done = v_empty + kStagePV;
+  ffpa::tma::barrier_t* v_done = qk_done + (kShareSmemQKV ? 1 : 0);
 
   // Barrier init (thread 0 only): arrive_count=257 for all barriers
   // (256 consumer arrives + 1 producer arrive/arrive_expect_tx). Uses the
@@ -162,6 +186,11 @@ __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK + 128, 1)
     for (int s = 0; s < kStagePV; ++s) {
       ffpa::tma::init_barrier(&v_full[s], kConsumerThreads + 1);
       ffpa::tma::init_barrier(&v_empty[s], kConsumerThreads + 1);
+    }
+    if constexpr (kShareSmemQKV) {
+      // Phase-transition barriers: 256 consumer arrives + 1 producer wait.
+      ffpa::tma::init_barrier(qk_done, kConsumerThreads + 1);
+      ffpa::tma::init_barrier(v_done, kConsumerThreads + 1);
     }
     ffpa::tma::fence_async_shared();
   }
@@ -206,11 +235,17 @@ __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK + 128, 1)
     if (wg_tid == 0) {
       for (int kv_tile = 0; kv_tile < Tc_eff; ++kv_tile) {
         const int kv_major = KV_major_base + kv_tile * Bc;
+        // kShareSmemQKV: wait for consumer to finish V phase of previous
+        // kv_tile before overwriting shared smem with new QK data.
+        if constexpr (kShareSmemQKV) {
+          if (kv_tile > 0)
+            ffpa::tma::wait_barrier(*v_done);
+        }
         // QK phase: combined Q+K per d_chunk into one qk_full stage.
         for (int d_chunk = 0; d_chunk < kQKDChunks; ++d_chunk) {
           ffpa::tma::wait_barrier(qk_empty[d_chunk % kStageQK]);
-          kDataType* q_dst = Q_tile_smem + (d_chunk % kStageQK) * Q_tile_size;
-          kDataType* k_dst = K_tile_smem + (d_chunk % kStageQK) * K_tile_size;
+          kDataType* q_dst = Q_tile_smem + (d_chunk % kStageQK) * kQSmemStride;
+          kDataType* k_dst = K_tile_smem + (d_chunk % kStageQK) * kKSmemStride;
           const int minor = d_chunk * kQKDChunk;
           ffpa::tma::load_2d_no_arrive(q_dst, tma_q, minor, Q_major_base,
                                        qk_full[d_chunk % kStageQK]);
@@ -219,10 +254,15 @@ __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK + 128, 1)
           ffpa::tma::arrive_expect_tx(qk_full[d_chunk % kStageQK],
                                       kQTileBytes + kKTileBytes);
         }
+        // kShareSmemQKV: wait for consumer to finish all QK ldmatrix before
+        // writing V into the shared smem region.
+        if constexpr (kShareSmemQKV) {
+          ffpa::tma::wait_barrier(*qk_done);
+        }
         // V phase: one V tile per v_chunk (kVDChunk cols per TMA load).
         for (int v_chunk = 0; v_chunk < kVDChunks; ++v_chunk) {
           ffpa::tma::wait_barrier(v_empty[v_chunk % kStagePV]);
-          kDataType* v_dst = V_tile_smem + (v_chunk % kStagePV) * V_tile_size;
+          kDataType* v_dst = V_tile_smem + (v_chunk % kStagePV) * kVSmemStride;
           const int minor = v_chunk * kVDChunk;
           ffpa::tma::load_2d_no_arrive(v_dst, tma_v, minor, kv_major,
                                        v_full[v_chunk % kStagePV]);
@@ -283,7 +323,7 @@ __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK + 128, 1)
           const int sub_col = sub * kMmaAtomK;
           // Q s2r: kSmemColStride=kQKDChunk selects the wide-tile row stride +
           // swizzle width; subtile_col_offset picks the 16-col sub-block.
-          ffpa::prefill::sync_fetch_qkv_frags_s2r<0, 4, Q_tile_size, kMmaAtomM,
+          ffpa::prefill::sync_fetch_qkv_frags_s2r<0, 4, kQSmemStride, kMmaAtomM,
                                                   kMmaAtomN, kMmaAtomK, kPadQ,
                                                   kDataType, kQKDChunk>(
               smem_Q_base_ptr, &R_Q[0][0][0], warp_QP, 0, 0, stage, sub_col);
@@ -291,7 +331,7 @@ __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK + 128, 1)
 #pragma unroll
           for (int j = 0; j < kValTileSeqLenK; ++j) {
             ffpa::prefill::sync_fetch_qkv_frags_s2r<
-                0, 2, K_tile_size, kMmaAtomM, kMmaAtomN, kMmaAtomK, kPadK,
+                0, 2, kKSmemStride, kMmaAtomM, kMmaAtomN, kMmaAtomK, kPadK,
                 kDataType, kQKDChunk>(smem_K_base_ptr, &R_K[j][0], warp_KV, j,
                                       0, stage, sub_col);
           }
@@ -319,6 +359,14 @@ __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK + 128, 1)
       // consumer loop and would deadlock on a CTA-wide barrier. The QK MMA
       // results live entirely in registers (R_S); softmax below uses only
       // warp shuffles, so no cross-warp smem ordering is needed.
+
+      // kShareSmemQKV: signal producer that all QK ldmatrix is done and the
+      // shared smem is safe to overwrite with V data.
+      if constexpr (kShareSmemQKV) {
+        {
+          [[maybe_unused]] auto token = qk_done->arrive();
+        }
+      }
 
       // Online safe softmax (reused unchanged).
       float lane_row_max_new[kValTileSeqLenQ][2];
@@ -390,7 +438,7 @@ __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK + 128, 1)
               for (int tile_V_Bc = 0; tile_V_Bc < (Bc / kMmaAtomK);
                    ++tile_V_Bc) {
                 ffpa::prefill::sync_fetch_qkv_frags_s2r<
-                    1, 2, V_tile_size, kMmaAtomM, kMmaAtomN, kMmaAtomK, kPadV,
+                    1, 2, kVSmemStride, kMmaAtomM, kMmaAtomN, kMmaAtomK, kPadV,
                     kDataType, kVDChunk>(smem_V_base_ptr, &R_V[0][0], warp_KV,
                                          jj, tile_V_Bc, v_stage,
                                          subtile_col_offset);
@@ -423,9 +471,13 @@ __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK + 128, 1)
             &lane_block_row_max_old[0][0], &lane_block_row_sum_old[0][0],
             &rescale_o_factor_0[0], &rescale_o_factor_1[0]);
       }
-      // NOTE: no __syncthreads() here -- V smem is protected by the v_empty
-      // barrier (producer waits for it before overwriting), so no CTA-wide
-      // sync is needed. Producer does not reach this point.
+      // kShareSmemQKV: signal producer that all V ldmatrix is done and the
+      // shared smem is safe to overwrite with next kv_tile's QK data.
+      if constexpr (kShareSmemQKV) {
+        {
+          [[maybe_unused]] auto token = v_done->arrive();
+        }
+      }
     }
 
     // Epilogue: final rescale + store O + LSE (reused unchanged).

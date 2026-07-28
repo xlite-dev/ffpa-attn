@@ -238,7 +238,7 @@ static constexpr int getConfigQKVSmemMaxSize() {
 #ifdef ENABLE_FFPA_TMA_EXT
 template <typename kDataType, const int kHeadDim, const int kAccQK,
           const int kAccPV, const int kStage, const int kQKDChunk,
-          const int kVDChunk = kQKDChunk>
+          const int kVDChunk = kQKDChunk, const int kShareSmemQKV = 0>
 void launch_ffpa_attn_fwd_template_sm120(torch::Tensor Q, torch::Tensor K,
                                          torch::Tensor V, torch::Tensor O,
                                          torch::Tensor attn_bias,
@@ -454,15 +454,24 @@ void launch_ffpa_attn_fwd_template(torch::Tensor Q, torch::Tensor K,
       if (prop->major == 9 || prop->major == 10) {
         launch_ffpa_attn_fwd_template_sm120<kDataType, kHeadDim,
                                             kMmaAccFloat32QK, kMmaAccFloat32PV,
-                                            kStage, 64>(
+                                            kStage, 64, 64, 0>(
             Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
             dropout_p, philox_seed, philox_offset);
       } else {
-        launch_ffpa_attn_fwd_template_sm120<kDataType, kHeadDim,
-                                            kMmaAccFloat32QK, kMmaAccFloat32PV,
-                                            kStage, 32, 64>(
-            Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
-            dropout_p, philox_seed, philox_offset);
+        // sm_120a: kQKDChunk=32, kVDChunk=64. Share smem when no attn_bias
+        // and no dropout (self-attn/causal/gqa benefit; attn-mask/dropout
+        // regress due to transition barrier serialization overhead).
+        if (!has_attn_bias && !has_dropout) {
+          launch_ffpa_attn_fwd_template_sm120<
+              kDataType, kHeadDim, kMmaAccFloat32QK, kMmaAccFloat32PV, kStage,
+              32, 64, 1>(Q, K, V, O, attn_bias, softmax_lse, causal,
+                         softmax_scale, dropout_p, philox_seed, philox_offset);
+        } else {
+          launch_ffpa_attn_fwd_template_sm120<
+              kDataType, kHeadDim, kMmaAccFloat32QK, kMmaAccFloat32PV, kStage,
+              32, 64, 0>(Q, K, V, O, attn_bias, softmax_lse, causal,
+                         softmax_scale, dropout_p, philox_seed, philox_offset);
+        }
       }
       return;
     }
@@ -507,7 +516,7 @@ void launch_ffpa_attn_fwd_template(torch::Tensor Q, torch::Tensor K,
 #ifdef ENABLE_FFPA_TMA_EXT
 template <typename kDataType, const int kHeadDim, const int kMmaAccFloat32QK,
           const int kMmaAccFloat32PV, const int kStage, const int kQKDChunk,
-          const int kVDChunk>
+          const int kVDChunk, const int kShareSmemQKV>
 void launch_ffpa_attn_fwd_template_sm120(torch::Tensor Q, torch::Tensor K,
                                          torch::Tensor V, torch::Tensor O,
                                          torch::Tensor attn_bias,
@@ -623,9 +632,14 @@ void launch_ffpa_attn_fwd_template_sm120(torch::Tensor Q, torch::Tensor K,
   constexpr int kKTileBytes = Bc * kQKDChunk * sizeof(kDataType);
   constexpr int kVTileBytes = Bc * kVDChunk * sizeof(kDataType);
   constexpr int kQKVSmemBytes =
-      kStageQK * (kQTileBytes + kKTileBytes) + kStagePV * kVTileBytes;
+      kShareSmemQKV
+          ? kStageQK * ((kQTileBytes + kKTileBytes) > kVTileBytes
+                            ? (kQTileBytes + kKTileBytes)
+                            : kVTileBytes)
+          : (kStageQK * (kQTileBytes + kKTileBytes) + kStagePV * kVTileBytes);
   constexpr int kBarrierBytes =
-      (kStageQK * 2 + kStagePV * 2) * sizeof(ffpa::tma::barrier_t);
+      (kStageQK * 2 + kStagePV * 2 + (kShareSmemQKV ? 2 : 0)) *
+      sizeof(ffpa::tma::barrier_t);
   constexpr int kSmemBytes = kQKVSmemBytes + kBarrierBytes;
 
   auto kernel_func =
@@ -634,7 +648,7 @@ void launch_ffpa_attn_fwd_template_sm120(torch::Tensor Q, torch::Tensor K,
           kMmaTileSeqLenK, kMmaTileSeqLenP, kMmaTileHeadDimV, kValTileSeqLenQ,
           kValTileSeqLenK, kValTileSeqLenP, kValTileHeadDimV, kMmaAccFloat32QK,
           kMmaAccFloat32PV, kOStorageAccFloat32, kStageQK, kStagePV, kPadQ,
-          kPadK, kPadV, kQKDChunk, kVDChunk>);
+          kPadK, kPadV, kQKDChunk, kVDChunk, kShareSmemQKV>);
   cudaFuncSetAttribute(kernel_func, cudaFuncAttributeMaxDynamicSharedMemorySize,
                        kSmemBytes);
   kernel_func<<<grid, block, kSmemBytes, stream>>>(

@@ -22,7 +22,8 @@ void ffpa_attn_fwd_fp16f16(
   CHECK_TORCH_TENSOR_DTYPE(O, torch::kHalf)
   const int d = Q.size(3);
   switch (d) {
-    case 256: ffpa_attn_fwd_fp16f16_d256(Q, K, V, O, attn_bias, softmax_lse, stages, causal, softmax_scale, dropout_p, philox_seed, philox_offset, tma); break;
+    case 320: ffpa_attn_fwd_fp16f16_d320(Q, K, V, O, attn_bias, softmax_lse, stages, causal, softmax_scale, dropout_p, philox_seed, philox_offset, tma); break;
+    case 384: ffpa_attn_fwd_fp16f16_d384(Q, K, V, O, attn_bias, softmax_lse, stages, causal, softmax_scale, dropout_p, philox_seed, philox_offset, tma); break;
     case 512: ffpa_attn_fwd_fp16f16_d512(Q, K, V, O, attn_bias, softmax_lse, stages, causal, softmax_scale, dropout_p, philox_seed, philox_offset, tma); break;
     default: throw std::runtime_error("headdim not support!");
   }
@@ -48,7 +49,8 @@ void ffpa_attn_fwd_fp16f32(
   CHECK_TORCH_TENSOR_DTYPE(O, torch::kHalf)
   const int d = Q.size(3);
   switch (d) {
-    case 256: ffpa_attn_fwd_fp16f32_d256(Q, K, V, O, attn_bias, softmax_lse, stages, causal, softmax_scale, dropout_p, philox_seed, philox_offset, tma); break;
+    case 320: ffpa_attn_fwd_fp16f32_d320(Q, K, V, O, attn_bias, softmax_lse, stages, causal, softmax_scale, dropout_p, philox_seed, philox_offset, tma); break;
+    case 384: ffpa_attn_fwd_fp16f32_d384(Q, K, V, O, attn_bias, softmax_lse, stages, causal, softmax_scale, dropout_p, philox_seed, philox_offset, tma); break;
     case 512: ffpa_attn_fwd_fp16f32_d512(Q, K, V, O, attn_bias, softmax_lse, stages, causal, softmax_scale, dropout_p, philox_seed, philox_offset, tma); break;
     default: throw std::runtime_error("headdim not support!");
   }
@@ -74,7 +76,8 @@ void ffpa_attn_fwd_bf16f32(
   CHECK_TORCH_TENSOR_DTYPE(O, torch::kBFloat16)
   const int d = Q.size(3);
   switch (d) {
-    case 256: ffpa_attn_fwd_bf16f32_d256(Q, K, V, O, attn_bias, softmax_lse, stages, causal, softmax_scale, dropout_p, philox_seed, philox_offset, tma); break;
+    case 320: ffpa_attn_fwd_bf16f32_d320(Q, K, V, O, attn_bias, softmax_lse, stages, causal, softmax_scale, dropout_p, philox_seed, philox_offset, tma); break;
+    case 384: ffpa_attn_fwd_bf16f32_d384(Q, K, V, O, attn_bias, softmax_lse, stages, causal, softmax_scale, dropout_p, philox_seed, philox_offset, tma); break;
     case 512: ffpa_attn_fwd_bf16f32_d512(Q, K, V, O, attn_bias, softmax_lse, stages, causal, softmax_scale, dropout_p, philox_seed, philox_offset, tma); break;
     default: throw std::runtime_error("headdim not support!");
   }
