@@ -34,6 +34,13 @@
 // First version: kStageQK=2, kStagePV=2, D=512. Q persistence and register
 // ping-pong are disabled (kPersistQg2s=0, kPersistQs2r=0, kRegPipeKV=0,
 // kShareSmemQKV=0) for simplicity.
+//
+// V TMA d_chunk (kVDChunk): V TMA loads use a kVDChunk-wide box (16/32/64)
+// instead of the original fixed 16-col strips, reducing the number of TMA
+// issues per kv_tile from D/16 to D/kVDChunk. The consumer PV loop iterates
+// v_chunk -> sub (kSubTilesV = kVDChunk/16 sub-tiles) -> jj (2 halves of each
+// 16-col sub-tile); ldmatrix.x2.trans selects the 8-col half via ``jj`` and
+// the sub-tile base via ``subtile_col_offset`` (kSmemColStride=kVDChunk).
 // ============================================================================
 template <typename kDataType, const int kHeadDim, const int kMmaAtomM,
           const int kMmaAtomN, const int kMmaAtomK, const int kMmaTileSeqLenQ,
@@ -43,7 +50,8 @@ template <typename kDataType, const int kHeadDim, const int kMmaAtomM,
           const int kValTileHeadDimV, const int kMmaAccFloat32QK,
           const int kMmaAccFloat32PV, const int kOStorageAccFloat32,
           const int kStageQK, const int kStagePV, const int kPadQ,
-          const int kPadK, const int kPadV, const int kDChunk = kMmaAtomK>
+          const int kPadK, const int kPadV, const int kQKDChunk = kMmaAtomK,
+          const int kVDChunk = kMmaAtomN * 2>
 __global__ void
 // minBlocksPerMultiprocessor=1: let the compiler use the full per-thread
 // register budget (65536/384 = 170 regs). Without this hint the compiler's
@@ -73,14 +81,18 @@ __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK + 128, 1)
       WARP_SIZE * kMmaTileSeqLenQ * kMmaTileSeqLenK;
   constexpr int kProducerThreads = 128;
   constexpr int kTotalThreads = kConsumerThreads + kProducerThreads;
-  // kDChunk: headdim chunk per TMA load for QK (16/32/64). V always uses
-  // kMmaAtomN*2=16 (PV consumes V in 16-col strips). kSubTiles = number of
-  // 16-col m16n8k16 sub-tiles inside one TMA box (1/2/4).
-  static_assert(kDChunk == 16 || kDChunk == 32 || kDChunk == 64);
-  constexpr int kDChunks = kHeadDim / kDChunk;
-  constexpr int kSubTiles = kDChunk / kMmaAtomK;
-  // V chunks remain at 16-col granularity (kMmaAtomN*2).
-  constexpr int kVDChunks = kHeadDim / (kMmaAtomN * 2);
+  // kQKDChunk: headdim chunk per TMA load for QK (16/32/64). kQKSubTiles =
+  // number of 16-col m16n8k16 sub-tiles inside one QK TMA box (1/2/4).
+  static_assert(kQKDChunk == 16 || kQKDChunk == 32 || kQKDChunk == 64);
+  constexpr int kQKDChunks = kHeadDim / kQKDChunk;
+  constexpr int kQKSubTiles = kQKDChunk / kMmaAtomK;
+  // kVDChunk: headdim chunk per TMA load for V (16/32/64). kVDChunks = number
+  // of V TMA loads per kv_tile. kSubTilesV = number of 16-col m16n8k16
+  // sub-tiles inside one V TMA box (1/2/4). Each sub-tile is consumed by 2
+  // j iterations (j even/odd select the 8-col halves via ldmatrix.x2.trans).
+  static_assert(kVDChunk == 16 || kVDChunk == 32 || kVDChunk == 64);
+  constexpr int kVDChunks = kHeadDim / kVDChunk;
+  constexpr int kSubTilesV = kVDChunk / (kMmaAtomN * 2);
 
 #ifdef ENABLE_FFPA_LAUNCH_GRID_DNHB
   const int Nb_id = blockIdx.z;
@@ -110,9 +122,9 @@ __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK + 128, 1)
   // addresses). See /memories/repo/leetcuda-sm120-tma-mma-ws.md.
   extern __shared__ __align__(1024) unsigned char ffpa_smem_raw[];
   kDataType* smem = reinterpret_cast<kDataType*>(ffpa_smem_raw);
-  constexpr int Q_tile_size = Br * (kDChunk + kPadQ);
-  constexpr int K_tile_size = Bc * (kDChunk + kPadK);
-  constexpr int V_tile_size = Bc * (kMmaAtomN * 2 + kPadV);
+  constexpr int Q_tile_size = Br * (kQKDChunk + kPadQ);
+  constexpr int K_tile_size = Bc * (kQKDChunk + kPadK);
+  constexpr int V_tile_size = Bc * (kVDChunk + kPadV);
   kDataType* Q_tile_smem = smem;
   kDataType* K_tile_smem = Q_tile_smem + kStageQK * Q_tile_size;
   kDataType* V_tile_smem = K_tile_smem + kStageQK * K_tile_size;
@@ -161,9 +173,9 @@ __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK + 128, 1)
   const int warp_QP = wg_tid / WARP_SIZE;
   constexpr int warp_KV = 0;
 
-  constexpr int kQTileBytes = Br * kDChunk * sizeof(kDataType);
-  constexpr int kKTileBytes = Bc * kDChunk * sizeof(kDataType);
-  constexpr int kVTileBytes = Bc * (kMmaAtomN * 2) * sizeof(kDataType);
+  constexpr int kQTileBytes = Br * kQKDChunk * sizeof(kDataType);
+  constexpr int kKTileBytes = Bc * kQKDChunk * sizeof(kDataType);
+  constexpr int kVTileBytes = Bc * kVDChunk * sizeof(kDataType);
 
   const int Br_base = Q_tile_id * Br;
   const int kv_offset = Nkv - Nq;
@@ -195,11 +207,11 @@ __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK + 128, 1)
       for (int kv_tile = 0; kv_tile < Tc_eff; ++kv_tile) {
         const int kv_major = KV_major_base + kv_tile * Bc;
         // QK phase: combined Q+K per d_chunk into one qk_full stage.
-        for (int d_chunk = 0; d_chunk < kDChunks; ++d_chunk) {
+        for (int d_chunk = 0; d_chunk < kQKDChunks; ++d_chunk) {
           ffpa::tma::wait_barrier(qk_empty[d_chunk % kStageQK]);
           kDataType* q_dst = Q_tile_smem + (d_chunk % kStageQK) * Q_tile_size;
           kDataType* k_dst = K_tile_smem + (d_chunk % kStageQK) * K_tile_size;
-          const int minor = d_chunk * kDChunk;
+          const int minor = d_chunk * kQKDChunk;
           ffpa::tma::load_2d_no_arrive(q_dst, tma_q, minor, Q_major_base,
                                        qk_full[d_chunk % kStageQK]);
           ffpa::tma::load_2d_no_arrive(k_dst, tma_k, minor, kv_major,
@@ -207,11 +219,11 @@ __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK + 128, 1)
           ffpa::tma::arrive_expect_tx(qk_full[d_chunk % kStageQK],
                                       kQTileBytes + kKTileBytes);
         }
-        // V phase: one V tile per v_chunk (V always uses 16-col strips).
+        // V phase: one V tile per v_chunk (kVDChunk cols per TMA load).
         for (int v_chunk = 0; v_chunk < kVDChunks; ++v_chunk) {
           ffpa::tma::wait_barrier(v_empty[v_chunk % kStagePV]);
           kDataType* v_dst = V_tile_smem + (v_chunk % kStagePV) * V_tile_size;
-          const int minor = v_chunk * (kMmaAtomN * 2);
+          const int minor = v_chunk * kVDChunk;
           ffpa::tma::load_2d_no_arrive(v_dst, tma_v, minor, kv_major,
                                        v_full[v_chunk % kStagePV]);
           ffpa::tma::arrive_expect_tx(v_full[v_chunk % kStagePV], kVTileBytes);
@@ -255,10 +267,11 @@ __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK + 128, 1)
     for (int tile_K_seqlen = 0; tile_K_seqlen < Tc_eff; ++tile_K_seqlen) {
       ffpa::utils::fill_3D_regs<uint32_t, kValTileSeqLenQ, kValTileSeqLenK,
                                 (kMmaAccFloat32QK) ? 4 : 2>(R_S, 0);
-      // QK phase: kDChunks TMA loads, each Q[Br,kDChunk]+K[Bc,kDChunk]. Each
-      // TMA tile is consumed by kSubTiles m16n8k16 sub-tiles (kDChunk/16).
+      // QK phase: kQKDChunks TMA loads, each Q[Br,kQKDChunk]+K[Bc,kQKDChunk].
+      // Each TMA tile is consumed by kQKSubTiles m16n8k16 sub-tiles
+      // (kQKDChunk/16).
 #pragma unroll
-      for (int tile_K_d = 0; tile_K_d < kDChunks; ++tile_K_d) {
+      for (int tile_K_d = 0; tile_K_d < kQKDChunks; ++tile_K_d) {
         const int stage = tile_K_d % kStageQK;
         // wait_barrier = barrier.wait(barrier.arrive()): the arrive()
         // contributes 1 arrival (256 consumer + 1 producer arrive_expect_tx
@@ -266,21 +279,21 @@ __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK + 128, 1)
         ffpa::tma::wait_barrier(qk_full[stage]);
 
 #pragma unroll
-        for (int sub = 0; sub < kSubTiles; ++sub) {
+        for (int sub = 0; sub < kQKSubTiles; ++sub) {
           const int sub_col = sub * kMmaAtomK;
-          // Q s2r: kSmemColStride=kDChunk selects the wide-tile row stride +
+          // Q s2r: kSmemColStride=kQKDChunk selects the wide-tile row stride +
           // swizzle width; subtile_col_offset picks the 16-col sub-block.
           ffpa::prefill::sync_fetch_qkv_frags_s2r<0, 4, Q_tile_size, kMmaAtomM,
                                                   kMmaAtomN, kMmaAtomK, kPadQ,
-                                                  kDataType, kDChunk>(
+                                                  kDataType, kQKDChunk>(
               smem_Q_base_ptr, &R_Q[0][0][0], warp_QP, 0, 0, stage, sub_col);
           // K s2r
 #pragma unroll
           for (int j = 0; j < kValTileSeqLenK; ++j) {
             ffpa::prefill::sync_fetch_qkv_frags_s2r<
                 0, 2, K_tile_size, kMmaAtomM, kMmaAtomN, kMmaAtomK, kPadK,
-                kDataType, kDChunk>(smem_K_base_ptr, &R_K[j][0], warp_KV, j, 0,
-                                    stage, sub_col);
+                kDataType, kQKDChunk>(smem_K_base_ptr, &R_K[j][0], warp_KV, j,
+                                      0, stage, sub_col);
           }
           // Q@K^T MMA
 #pragma unroll
@@ -346,7 +359,10 @@ __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK + 128, 1)
             Nh, warp_QP, Br_base, tile_K_seqlen * Bc, Nq, Nkv);
       }
 
-      // PV phase: D/8 j iterations, each V[16] shared by 2 j's (j, j+1).
+      // PV phase: kVDChunks V TMA stages, each containing kSubTilesV 16-col
+      // sub-tiles. Each sub-tile is consumed by 2 j iterations (jj=0,1 select
+      // the 8-col halves via ldmatrix.x2.trans). Global j index maps as:
+      //   j = v_chunk * kSubTilesV * 2 + sub * 2 + jj
       static_assert(kValTileSeqLenP == 1);
       {
         float rescale_o_factor_0[1];
@@ -357,49 +373,50 @@ __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK + 128, 1)
             tile_K_seqlen);
 
 #pragma unroll
-        for (int j = 0; j < kValTileHeadDimV; ++j) {
-          const int tile_V_d = (j >> 1);
-          const int v_stage = tile_V_d % kStagePV;
-          // Wait for V tile on first use (j even). wait_barrier =
-          // barrier.wait(barrier.arrive()): arrive contributes 1, wait blocks
-          // until producer's arrive_expect_tx + 256 consumer arrives complete.
-          if (j % 2 == 0) {
-            ffpa::tma::wait_barrier(v_full[v_stage]);
-          }
+        for (int v_chunk = 0; v_chunk < kVDChunks; ++v_chunk) {
+          const int v_stage = v_chunk % kStagePV;
+          // Wait for V TMA stage (one wait per kVDChunk-wide tile).
+          ffpa::tma::wait_barrier(v_full[v_stage]);
 
-          ffpa::utils::fill_1D_regs<uint32_t, (kMmaAccFloat32PV) ? 4 : 2>(R_O,
-                                                                          0);
 #pragma unroll
-          for (int tile_V_Bc = 0; tile_V_Bc < (Bc / kMmaAtomK); ++tile_V_Bc) {
-            ffpa::prefill::sync_fetch_qkv_frags_s2r<
-                1, 2, V_tile_size, kMmaAtomM, kMmaAtomN, kMmaAtomK, kPadV,
-                kDataType>(smem_V_base_ptr, &R_V[0][0], warp_KV, (j % 2),
-                           tile_V_Bc, v_stage);
-            const int p_offset = tile_V_Bc * 2;
-            if constexpr (kMmaAccFloat32PV) {
-              ffpa::mma::m16n8k16_abf32<kDataType,
-                                        ffpa::mma::MMAMode::kInplaceUpdate>(
-                  &R_O[0], &R_O[1], &R_O[2], &R_O[3], &R_S[0][p_offset][0],
-                  &R_S[0][p_offset][1], &R_S[0][p_offset + 1][0],
-                  &R_S[0][p_offset + 1][1], &R_V[0][0], &R_V[0][1]);
-            } else {
-              ffpa::mma::m16n8k16_f16f16f16<ffpa::mma::MMAMode::kInplaceUpdate>(
-                  &R_O[0], &R_O[1], &R_S[0][p_offset][0], &R_S[0][p_offset][1],
-                  &R_S[0][p_offset + 1][0], &R_S[0][p_offset + 1][1],
-                  &R_V[0][0], &R_V[0][1]);
+          for (int sub = 0; sub < kSubTilesV; ++sub) {
+            const int subtile_col_offset = sub * (kMmaAtomN * 2);
+#pragma unroll
+            for (int jj = 0; jj < 2; ++jj) {
+              const int j = v_chunk * (kSubTilesV * 2) + sub * 2 + jj;
+              ffpa::utils::fill_1D_regs<uint32_t, (kMmaAccFloat32PV) ? 4 : 2>(
+                  R_O, 0);
+#pragma unroll
+              for (int tile_V_Bc = 0; tile_V_Bc < (Bc / kMmaAtomK);
+                   ++tile_V_Bc) {
+                ffpa::prefill::sync_fetch_qkv_frags_s2r<
+                    1, 2, V_tile_size, kMmaAtomM, kMmaAtomN, kMmaAtomK, kPadV,
+                    kDataType, kVDChunk>(smem_V_base_ptr, &R_V[0][0], warp_KV,
+                                         jj, tile_V_Bc, v_stage,
+                                         subtile_col_offset);
+                const int p_offset = tile_V_Bc * 2;
+                if constexpr (kMmaAccFloat32PV) {
+                  ffpa::mma::m16n8k16_abf32<kDataType,
+                                            ffpa::mma::MMAMode::kInplaceUpdate>(
+                      &R_O[0], &R_O[1], &R_O[2], &R_O[3], &R_S[0][p_offset][0],
+                      &R_S[0][p_offset][1], &R_S[0][p_offset + 1][0],
+                      &R_S[0][p_offset + 1][1], &R_V[0][0], &R_V[0][1]);
+                } else {
+                  ffpa::mma::m16n8k16_f16f16f16<
+                      ffpa::mma::MMAMode::kInplaceUpdate>(
+                      &R_O[0], &R_O[1], &R_S[0][p_offset][0],
+                      &R_S[0][p_offset][1], &R_S[0][p_offset + 1][0],
+                      &R_S[0][p_offset + 1][1], &R_V[0][0], &R_V[0][1]);
+                }
+              }
+              ffpa::prefill::sync_rescaling_tiling_o<
+                  kOStorageAccFloat32, kMmaAccFloat32PV, kDataType>(
+                  &R_D[0][0][0], &R_O[0], &rescale_o_factor_0[0],
+                  &rescale_o_factor_1[0], tile_K_seqlen, j);
             }
           }
-          // Release V stage on second use (j odd): V[16] fully consumed.
-          // 256 consumer arrives; producer's wait(arrive()) provides 257th.
-          if (j % 2 == 1) {
-            {
-              [[maybe_unused]] auto token = v_empty[v_stage].arrive();
-            }
-          }
-          ffpa::prefill::sync_rescaling_tiling_o<kOStorageAccFloat32,
-                                                 kMmaAccFloat32PV, kDataType>(
-              &R_D[0][0][0], &R_O[0], &rescale_o_factor_0[0],
-              &rescale_o_factor_1[0], tile_K_seqlen, j);
+          // Release V stage: all kSubTilesV*2 j's consumed this tile.
+          { [[maybe_unused]] auto token = v_empty[v_stage].arrive(); }
         }
         ffpa::prefill::sync_update_max_expsum(
             &lane_row_max_new[0][0], &lane_row_sum_new[0][0],

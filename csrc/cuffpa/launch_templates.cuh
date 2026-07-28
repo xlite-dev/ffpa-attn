@@ -237,7 +237,8 @@ static constexpr int getConfigQKVSmemMaxSize() {
 
 #ifdef ENABLE_FFPA_TMA_EXT
 template <typename kDataType, const int kHeadDim, const int kAccQK,
-          const int kAccPV, const int kStage, const int kDChunk>
+          const int kAccPV, const int kStage, const int kQKDChunk,
+          const int kVDChunk = kQKDChunk>
 void launch_ffpa_attn_fwd_template_sm120(torch::Tensor Q, torch::Tensor K,
                                          torch::Tensor V, torch::Tensor O,
                                          torch::Tensor attn_bias,
@@ -449,7 +450,7 @@ void launch_ffpa_attn_fwd_template(torch::Tensor Q, torch::Tensor K,
   if (tma) {
     auto prop = at::cuda::getCurrentDeviceProperties();
     if (prop->major >= 9) {
-      // sm_90/100 (228 KB smem) → kDChunk=64; sm_120a (99 KB) → kDChunk=32.
+      // sm_90/100 (228 KB smem) → kQKDChunk=64; sm_120a (99 KB) → kQKDChunk=32.
       if (prop->major == 9 || prop->major == 10) {
         launch_ffpa_attn_fwd_template_sm120<kDataType, kHeadDim,
                                             kMmaAccFloat32QK, kMmaAccFloat32PV,
@@ -459,7 +460,7 @@ void launch_ffpa_attn_fwd_template(torch::Tensor Q, torch::Tensor K,
       } else {
         launch_ffpa_attn_fwd_template_sm120<kDataType, kHeadDim,
                                             kMmaAccFloat32QK, kMmaAccFloat32PV,
-                                            kStage, 32>(
+                                            kStage, 32, 64>(
             Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
             dropout_p, philox_seed, philox_offset);
       }
@@ -499,13 +500,14 @@ void launch_ffpa_attn_fwd_template(torch::Tensor Q, torch::Tensor K,
 // ============================================================================
 // launch_ffpa_attn_fwd_template_sm120
 // ----------------------------------------------------------------------------
-// SM120+ (TMA-capable) launcher.  kDChunk=32 (SWIZZLE_64B) or 64 (SWIZZLE_128B)
-// is selected by the caller based on compute capability (sm_90/100 → 64,
-// sm_120a → 32, constrained by per-SM shared memory).
+// SM120+ (TMA-capable) launcher.  kQKDChunk=32 (SWIZZLE_64B) or 64
+// (SWIZZLE_128B) is selected by the caller based on compute capability
+// (sm_90/100 → 64, sm_120a → 32, constrained by per-SM shared memory).
 // ============================================================================
 #ifdef ENABLE_FFPA_TMA_EXT
 template <typename kDataType, const int kHeadDim, const int kMmaAccFloat32QK,
-          const int kMmaAccFloat32PV, const int kStage, const int kDChunk>
+          const int kMmaAccFloat32PV, const int kStage, const int kQKDChunk,
+          const int kVDChunk>
 void launch_ffpa_attn_fwd_template_sm120(torch::Tensor Q, torch::Tensor K,
                                          torch::Tensor V, torch::Tensor O,
                                          torch::Tensor attn_bias,
@@ -537,7 +539,7 @@ void launch_ffpa_attn_fwd_template_sm120(torch::Tensor Q, torch::Tensor K,
   constexpr int kStageQK = kStage;
   constexpr int kStagePV = kStage;
   constexpr int kOStorageAccFloat32 = getConfigOStorageAccFloat32<kHeadDim>();
-  constexpr int kDChunks = kHeadDim / kDChunk;
+  constexpr int kQKDChunks = kHeadDim / kQKDChunk;
 
   const int Nb = Q.size(0);
   const int Nh = Q.size(1);
@@ -581,8 +583,13 @@ void launch_ffpa_attn_fwd_template_sm120(torch::Tensor Q, torch::Tensor K,
 
   const int total_rows = Nb * Nh * Nq;
   const int total_kv_rows = Nb * Nh_kv * Nkv;
-  constexpr CUtensorMapSwizzle qk_swizzle =
-      (kDChunk == 64) ? CU_TENSOR_MAP_SWIZZLE_128B : CU_TENSOR_MAP_SWIZZLE_64B;
+  constexpr CUtensorMapSwizzle qk_swizzle = (kQKDChunk == 64)
+                                                ? CU_TENSOR_MAP_SWIZZLE_128B
+                                                : CU_TENSOR_MAP_SWIZZLE_64B;
+  constexpr CUtensorMapSwizzle v_swizzle =
+      (kVDChunk == 64)   ? CU_TENSOR_MAP_SWIZZLE_128B
+      : (kVDChunk == 32) ? CU_TENSOR_MAP_SWIZZLE_64B
+                         : CU_TENSOR_MAP_SWIZZLE_32B;
 
   auto make_desc = [&](void* gmem_ptr, int rows, int box_minor,
                        CUtensorMapSwizzle sw) -> CUtensorMap {
@@ -599,11 +606,11 @@ void launch_ffpa_attn_fwd_template_sm120(torch::Tensor Q, torch::Tensor K,
     return ffpa::tma::make_2d_copy_desc<kDataType>(params);
   };
   CUtensorMap tma_q_desc =
-      make_desc(Q.data_ptr(), total_rows, kDChunk, qk_swizzle);
+      make_desc(Q.data_ptr(), total_rows, kQKDChunk, qk_swizzle);
   CUtensorMap tma_k_desc =
-      make_desc(K.data_ptr(), total_kv_rows, kDChunk, qk_swizzle);
+      make_desc(K.data_ptr(), total_kv_rows, kQKDChunk, qk_swizzle);
   CUtensorMap tma_v_desc =
-      make_desc(V.data_ptr(), total_kv_rows, 16, CU_TENSOR_MAP_SWIZZLE_32B);
+      make_desc(V.data_ptr(), total_kv_rows, kVDChunk, v_swizzle);
   CUtensorMap *tma_q_d = nullptr, *tma_k_d = nullptr, *tma_v_d = nullptr;
   cudaMalloc(&tma_q_d, sizeof(CUtensorMap));
   cudaMalloc(&tma_k_d, sizeof(CUtensorMap));
@@ -612,9 +619,9 @@ void launch_ffpa_attn_fwd_template_sm120(torch::Tensor Q, torch::Tensor K,
   cudaMemcpy(tma_k_d, &tma_k_desc, sizeof(CUtensorMap), cudaMemcpyHostToDevice);
   cudaMemcpy(tma_v_d, &tma_v_desc, sizeof(CUtensorMap), cudaMemcpyHostToDevice);
 
-  constexpr int kQTileBytes = Br * kDChunk * sizeof(kDataType);
-  constexpr int kKTileBytes = Bc * kDChunk * sizeof(kDataType);
-  constexpr int kVTileBytes = Bc * (kMmaAtomN * 2) * sizeof(kDataType);
+  constexpr int kQTileBytes = Br * kQKDChunk * sizeof(kDataType);
+  constexpr int kKTileBytes = Bc * kQKDChunk * sizeof(kDataType);
+  constexpr int kVTileBytes = Bc * kVDChunk * sizeof(kDataType);
   constexpr int kQKVSmemBytes =
       kStageQK * (kQTileBytes + kKTileBytes) + kStagePV * kVTileBytes;
   constexpr int kBarrierBytes =
@@ -627,7 +634,7 @@ void launch_ffpa_attn_fwd_template_sm120(torch::Tensor Q, torch::Tensor K,
           kMmaTileSeqLenK, kMmaTileSeqLenP, kMmaTileHeadDimV, kValTileSeqLenQ,
           kValTileSeqLenK, kValTileSeqLenP, kValTileHeadDimV, kMmaAccFloat32QK,
           kMmaAccFloat32PV, kOStorageAccFloat32, kStageQK, kStagePV, kPadQ,
-          kPadK, kPadV, kDChunk>);
+          kPadK, kPadV, kQKDChunk, kVDChunk>);
   cudaFuncSetAttribute(kernel_func, cudaFuncAttributeMaxDynamicSharedMemorySize,
                        kSmemBytes);
   kernel_func<<<grid, block, kSmemBytes, stream>>>(
