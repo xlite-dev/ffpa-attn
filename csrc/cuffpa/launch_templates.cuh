@@ -4,7 +4,7 @@
 
 #include "ffpa_attn_fwd.cuh"
 #include "ffpa_attn_fwd_split_kv.cuh"
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+#ifdef ENABLE_FFPA_TMA_EXT
 #include "ffpa_attn_fwd_sm120.cuh"
 #include "tma.cuh"
 #endif
@@ -235,7 +235,7 @@ static constexpr int getConfigQKVSmemMaxSize() {
 // The SM120 TMA path is called from inside this function when ``tma`` is set;
 // forward declaration (definition follows after the legacy launcher).
 
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+#ifdef ENABLE_FFPA_TMA_EXT
 template <typename kDataType, const int kHeadDim, const int kAccQK,
           const int kAccPV, const int kStage, const int kDChunk>
 void launch_ffpa_attn_fwd_template_sm120(torch::Tensor Q, torch::Tensor K,
@@ -245,7 +245,7 @@ void launch_ffpa_attn_fwd_template_sm120(torch::Tensor Q, torch::Tensor K,
                                          double softmax_scale, double dropout_p,
                                          int64_t philox_seed,
                                          int64_t philox_offset);
-#endif  // __CUDA_ARCH__ >= 900
+#endif  // ENABLE_FFPA_TMA_EXT
 
 // Runtime arguments:
 //   Q, K, V, O     : BHND tensors as described in the kernel template docs.
@@ -445,8 +445,7 @@ void launch_ffpa_attn_fwd_template(torch::Tensor Q, torch::Tensor K,
   // (sm_90+), delegate to the warp-specialised launcher.  Falls back to the
   // legacy cp.async path on older hardware. (NOTE: NO WGMMA used here,
   // since sm_120a is not yet supported by WGMMA.)
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
-#ifdef FFPA_BUILD_SM120
+#ifdef ENABLE_FFPA_TMA_EXT
   if (tma) {
     auto prop = at::cuda::getCurrentDeviceProperties();
     if (prop->major >= 9) {
@@ -467,8 +466,7 @@ void launch_ffpa_attn_fwd_template(torch::Tensor Q, torch::Tensor K,
       return;
     }
   }
-#endif  // FFPA_BUILD_SM120
-#endif  // __CUDA_ARCH__ >= 900
+#endif  // ENABLE_FFPA_TMA_EXT
 
   // General path for sm>=80 architectures.
   const int smem_size_base = kQKVSmemMaxSize;
@@ -505,7 +503,7 @@ void launch_ffpa_attn_fwd_template(torch::Tensor Q, torch::Tensor K,
 // is selected by the caller based on compute capability (sm_90/100 → 64,
 // sm_120a → 32, constrained by per-SM shared memory).
 // ============================================================================
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+#ifdef ENABLE_FFPA_TMA_EXT
 template <typename kDataType, const int kHeadDim, const int kMmaAccFloat32QK,
           const int kMmaAccFloat32PV, const int kStage, const int kDChunk>
 void launch_ffpa_attn_fwd_template_sm120(torch::Tensor Q, torch::Tensor K,
@@ -642,4 +640,4 @@ void launch_ffpa_attn_fwd_template_sm120(torch::Tensor Q, torch::Tensor K,
   cudaFree(tma_k_d);
   cudaFree(tma_v_d);
 }
-#endif  // __CUDA_ARCH__ >= 900
+#endif  // ENABLE_FFPA_TMA_EXT

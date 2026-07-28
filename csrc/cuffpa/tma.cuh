@@ -90,116 +90,74 @@ inline CUtensorMap make_2d_copy_desc(const Copy2DDescriptorParams<T>& params) {
   return tensor_map;
 }
 
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
-namespace cde = cuda::device::experimental;
-
-__device__ __forceinline__ void init_barrier(barrier_t* barrier,
-                                             int arrive_count) {
+__host__ __device__ __forceinline__ void init_barrier(barrier_t* barrier,
+                                                      int arrive_count) {
+#if __CUDA_ARCH__
+  namespace cde = cuda::device::experimental;
   init(barrier, arrive_count);
 #if CUDART_VERSION >= 13020
   cuda::ptx::fence_proxy_async(cuda::ptx::space_shared);
 #else
   cde::fence_proxy_async_shared_cta();
 #endif
+#endif
 }
 
-__device__ __forceinline__ void wait_barrier(barrier_t& barrier) {
+__host__ __device__ __forceinline__ void wait_barrier(barrier_t& barrier) {
+#if __CUDA_ARCH__
+  namespace cde = cuda::device::experimental;
   barrier.wait(barrier.arrive());
-  // The TMA bulk-tensor copy writes via the async proxy; ldmatrix.sync (used
-  // by the consumer) reads via the generic proxy. mbarrier wait alone
-  // provides only completion of the TMA, not cross-proxy visibility for
-  // sm_120 / Blackwell, where a generic-proxy reader must observe an explicit
-  // fence.proxy.async.shared::cta after the producer arrival.
 #if CUDART_VERSION >= 13020
   cuda::ptx::fence_proxy_async(cuda::ptx::space_shared);
 #else
   cde::fence_proxy_async_shared_cta();
 #endif
+#endif
 }
 
-// Parity-based wait for the direct-write consumers. mbarriers initialised
-// with ``arrive_count == 1`` and signalled exclusively by the producer's
-// ``cuda::device::barrier_arrive_tx`` (inside ``load_2d``) flip phase as
-// soon as the TMA's tx-count is satisfied. Consumers must therefore wait
-// on the *current* phase bit (0 on the first reuse, 1 on the second,
-// alternating thereafter) instead of using ``wait(arrive())`` -- the
-// latter would over-arrive and corrupt the next phase.
-__device__ __forceinline__ void wait_barrier_parity(barrier_t& barrier,
-                                                    uint32_t phase) {
+__host__ __device__ __forceinline__ void wait_barrier_parity(barrier_t& barrier,
+                                                             uint32_t phase) {
+#if __CUDA_ARCH__
+  namespace cde = cuda::device::experimental;
   barrier.wait_parity(phase != 0);
-  // The TMA bulk-tensor copy writes via the async proxy; ldmatrix.sync (used
-  // by the consumer) reads via the generic proxy. mbarrier wait_parity
-  // alone provides only completion of the TMA, not cross-proxy visibility
-  // for sm_120 / Blackwell, where a generic-proxy reader must observe an
-  // explicit ``fence.proxy.async.shared::cta`` after the producer arrival.
 #if CUDART_VERSION >= 13020
   cuda::ptx::fence_proxy_async(cuda::ptx::space_shared);
 #else
   cde::fence_proxy_async_shared_cta();
 #endif
+#endif
 }
 
-// Standalone async-proxy -> generic-proxy fence for shared memory. Producers
-// call this after issuing TMA copies (so the writes become visible to the
-// consumer's ldmatrix); consumers implicitly get it via ``wait_barrier`` /
-// ``wait_barrier_parity``. Exposed for producers that issue TMA without an
-// immediate wait (e.g. combined Q+K stage: two ``load_2d_no_arrive`` then a
-// single ``arrive_expect_tx``, with a fence in between to order the TMA
-// writes before the arrival signal).
-__device__ __forceinline__ void fence_async_shared() {
+__host__ __device__ __forceinline__ void fence_async_shared() {
+#if __CUDA_ARCH__
+  namespace cde = cuda::device::experimental;
 #if CUDART_VERSION >= 13020
   cuda::ptx::fence_proxy_async(cuda::ptx::space_shared);
 #else
   cde::fence_proxy_async_shared_cta();
 #endif
+#endif
 }
 
-// ------------------------------------------------------------------
-// TMA bulk-copy commit / wait wrappers
-// ------------------------------------------------------------------
-// ``cp.async.bulk.commit_group`` / ``cp.async.bulk.wait_group`` are the
-// TMA-specific counterparts of the cp.async commit/wait primitives in
-// ``ffpa::cp_async``. They track ONLY ``cp.async.bulk{,.tensor}`` copies
-// and are independent of ``cp.async.commit_group`` (the legacy cp.async
-// group counter does NOT track TMA, and vice versa).
-//
-// The SM90 K/V data path uses mbarrier-based completion (every TMA copy in
-// ``load_2d`` arrives on its per-stage mbarrier via
-// ``cuda::device::barrier_arrive_tx`` and is awaited in the kernel via
-// ``wait_barrier_parity``). Mbarrier-tracking is strictly more
-// expressive than the bulk-group counter (per-slot phases, no FIFO
-// constraint), so the kernel does not currently call ``bulk_commit_group``
-// / ``bulk_wait_group``. They are exposed here for two reasons:
-//
-//   1. Code-review clarity: it makes the cp.async vs TMA wait split
-//      explicit. ``ffpa::cp_async::commit_group/wait_group`` only sync Q
-//      (which is still on cp.async); K/V are synced via
-//      ``consume_X_tile`` -> ``wait_barrier_parity``.
-//   2. Future use: a fused bulk_wait_group<0> at the very end of the
-//      kernel would let us drop the per-slot mbarrier waits if we later
-//      decide to coarsen the schedule.
-__device__ __forceinline__ void bulk_commit_group() {
+__host__ __device__ __forceinline__ void bulk_commit_group() {
+#if __CUDA_ARCH__
   asm volatile("cp.async.bulk.commit_group;\n" ::);
+#endif
 }
 
 template <size_t n>
-__device__ __forceinline__ void bulk_wait_group() {
+__host__ __device__ __forceinline__ void bulk_wait_group() {
+#if __CUDA_ARCH__
   asm volatile("cp.async.bulk.wait_group %0;\n" ::"n"(n));
+#endif
 }
 
-// Issue a TMA bulk-tensor copy + arrive_tx on the given barrier from
-// ``issuer_lane`` (default 0). Spreading the issuer across different
-// lanes / warps splits the per-warp-scheduler LSU dispatch port so that
-// multiple in-flight issues can be queued in parallel by the hardware
-// instead of strictly serialising on warp-0 lane-0. The destination
-// smem and barrier slots are still distinct per call (the kernel rotates
-// stage / d_tile), so multi-issuer is safe; only the SASS dispatcher
-// changes.
-__device__ __forceinline__ void load_2d(void* smem_ptr,
-                                        const CUtensorMap* tensor_map,
-                                        int32_t minor_coord,
-                                        int32_t major_coord, barrier_t& barrier,
-                                        uint32_t bytes, int issuer_lane = 0) {
+__host__ __device__ __forceinline__ void load_2d(
+    void* smem_ptr, const CUtensorMap* tensor_map, int32_t minor_coord,
+    int32_t major_coord, barrier_t& barrier, uint32_t bytes,
+    int issuer_lane = 0) {
+#if __CUDA_ARCH__
+  namespace cde = cuda::device::experimental;
   if (static_cast<int>(threadIdx.x) == issuer_lane) {
 #if CUDART_VERSION >= 13020
     const int32_t coords[]{minor_coord, major_coord};
@@ -217,18 +175,14 @@ __device__ __forceinline__ void load_2d(void* smem_ptr,
         cuda::device::barrier_arrive_tx(barrier, 1, bytes);
 #endif
   }
+#endif
 }
 
-// Issue a TMA bulk-tensor copy WITHOUT arriving on the barrier. Used by
-// the SM120 warp-specialised producer when multiple TMA copies (e.g. Q+K
-// in a combined stage) must share a SINGLE ``arrive_expect_tx`` with the
-// combined byte count -- calling ``load_2d`` (which arrives per-copy)
-// would add extra producer arrivals and corrupt the full/empty phase
-// protocol. Pair with an explicit ``arrive_expect_tx`` after all
-// ``load_2d_no_arrive`` calls for the same barrier.
-__device__ __forceinline__ void load_2d_no_arrive(
+__host__ __device__ __forceinline__ void load_2d_no_arrive(
     void* smem_ptr, const CUtensorMap* tensor_map, int32_t minor_coord,
     int32_t major_coord, barrier_t& barrier, int issuer_lane = 0) {
+#if __CUDA_ARCH__
+  namespace cde = cuda::device::experimental;
   if (static_cast<int>(threadIdx.x) == issuer_lane) {
 #if CUDART_VERSION >= 13020
     const int32_t coords[]{minor_coord, major_coord};
@@ -241,17 +195,14 @@ __device__ __forceinline__ void load_2d_no_arrive(
         smem_ptr, tensor_map, minor_coord, major_coord, barrier);
 #endif
   }
+#endif
 }
 
-// Arrive on ``barrier`` with an expected transaction byte count. This is
-// the producer-side signal that, once the TMA hardware has delivered
-// ``bytes`` worth of data (decrementing the barrier's tx-count to zero)
-// AND this arrival has been counted, the barrier phase flips and waiting
-// consumers proceed. Use after one or more ``load_2d_no_arrive`` calls
-// that target the same barrier, passing the SUM of their byte counts.
-__device__ __forceinline__ void arrive_expect_tx(barrier_t& barrier,
-                                                 uint32_t bytes,
-                                                 int issuer_lane = 0) {
+__host__ __device__ __forceinline__ void arrive_expect_tx(barrier_t& barrier,
+                                                          uint32_t bytes,
+                                                          int issuer_lane = 0) {
+#if __CUDA_ARCH__
+  namespace cde = cuda::device::experimental;
   if (static_cast<int>(threadIdx.x) == issuer_lane) {
 #if CUDART_VERSION >= 13020
     auto* barrier_handle = cuda::device::barrier_native_handle(barrier);
@@ -263,34 +214,16 @@ __device__ __forceinline__ void arrive_expect_tx(barrier_t& barrier,
         cuda::device::barrier_arrive_tx(barrier, 1, bytes);
 #endif
   }
+#endif
 }
 
-// Issue a TMA bulk-tensor copy directly into the destination swizzled
-// smem slot. The destination layout is the kernel's existing
-// ``kPad==0`` XOR-swizzled K/V slot, which (for ``kCols == 16`` fp16,
-// i.e. 32B per row) is bit-for-bit equivalent to
-// ``CU_TENSOR_MAP_SWIZZLE_32B`` (Cute ``Swizzle<1, 4, 3>``: address bit
-// 4 XOR bit 7), and (for ``kCols == 64`` fp16, i.e. 128B per row) is
-// equivalent to ``CU_TENSOR_MAP_SWIZZLE_128B`` (Cute
-// ``Swizzle<3, 4, 3>``). The TMA descriptor MUST be configured with
-// the swizzle mode that matches ``kCols`` so the hardware writes the
-// same byte pattern that the existing ldmatrix kPad==0 path expects.
-//
-// Returns ``false`` and skips the issue when (a) the descriptor is null
-// or (b) ``d_tile_id`` is past the head-dim end (so speculative prefetch
-// loops beyond ``kHeadDim/kCols`` are safe to call). KV-axis tail tiles
-// (``major_coord + BrOrBc > seqlen_bound``) are NOT skipped; the TMA
-// descriptor's OOB-fill (``CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE``) zero-fills
-// out-of-bounds rows so no cp.async fallback is needed.
-//
-// MUST be paired with ``wait_barrier`` on the same barrier slot before
-// the destination smem is read.
 template <const int BrOrBc, const int kHeadDim, const int kCols,
           const int kTileSize, typename T>
-__device__ __forceinline__ bool issue_load_2d_to_dst_swizzled(
+__host__ __device__ __forceinline__ bool issue_load_2d_to_dst_swizzled(
     T* dst_smem_base_ptr, const CUtensorMap* tensor_map, const int major_coord,
     const int d_tile_id, const int dst_stage, barrier_t& barrier,
     int issuer_lane = 0) {
+#if __CUDA_ARCH__
   if (tensor_map == nullptr || d_tile_id >= (kHeadDim / kCols)) {
     return false;
   }
@@ -298,17 +231,17 @@ __device__ __forceinline__ bool issue_load_2d_to_dst_swizzled(
   load_2d(dst_stage_ptr, tensor_map, d_tile_id * kCols, major_coord, barrier,
           BrOrBc * kCols * sizeof(T), issuer_lane);
   return true;
+#else
+  return false;
+#endif
 }
 
-// Legacy scratch+repack issuer: issue an asynchronous TMA load of one
-// (BrOrBc, kCols) tile into the caller-owned scratch slot ``tmp_stage``
-// of ``tmp_smem_base_ptr``. Kept for the scratch+repack flow; new code
-// on SM90+ should prefer ``issue_load_2d_to_dst_swizzled`` above.
 template <const int BrOrBc, const int kHeadDim, const int kCols, typename T>
-__device__ __forceinline__ bool issue_load_2d_to_tmp(
+__host__ __device__ __forceinline__ bool issue_load_2d_to_tmp(
     T* tmp_smem_base_ptr, const CUtensorMap* tensor_map, const int major_coord,
     const int d_tile_id, const int tmp_stage, const int seqlen_bound,
     barrier_t& barrier) {
+#if __CUDA_ARCH__
   if (tensor_map == nullptr || d_tile_id >= (kHeadDim / kCols) ||
       ((major_coord + BrOrBc) > seqlen_bound)) {
     return false;
@@ -317,23 +250,17 @@ __device__ __forceinline__ bool issue_load_2d_to_tmp(
   load_2d(tmp_stage_ptr, tensor_map, d_tile_id * kCols, major_coord, barrier,
           BrOrBc * kCols * sizeof(T));
   return true;
+#else
+  return false;
+#endif
 }
 
-// Wait on ``barrier`` (signalled by the matching ``issue_load_2d_to_tmp``
-// call with the same ``tmp_stage``) and repack the contiguous TMA scratch
-// tile at ``tmp_smem_base_ptr[tmp_stage]`` into the kernel's existing
-// padded (kPad>0) or XOR-swizzled (kPad==0) destination slot
-// ``dst_smem_base_ptr[dst_stage]``. All threads in the block participate.
-//
-// MUST only be invoked when the matching ``issue_load_2d_to_tmp`` returned
-// ``true``; otherwise the wait will block forever (no producer arrival).
 template <const int BrOrBc, const int kTileSize, const int kCols,
           const int kNumThreads, const int kPad, typename T>
-__device__ __forceinline__ void wait_and_repack_tmp_to_dst(T* dst_smem_base_ptr,
-                                                           T* tmp_smem_base_ptr,
-                                                           const int dst_stage,
-                                                           const int tmp_stage,
-                                                           barrier_t& barrier) {
+__host__ __device__ __forceinline__ void wait_and_repack_tmp_to_dst(
+    T* dst_smem_base_ptr, T* tmp_smem_base_ptr, const int dst_stage,
+    const int tmp_stage, barrier_t& barrier) {
+#if __CUDA_ARCH__
   constexpr bool kSwizzle = (kPad == 0);
   constexpr int kElemsPerThread = kCols / (kNumThreads / BrOrBc);
   static_assert(kElemsPerThread * sizeof(T) == 16,
@@ -351,19 +278,16 @@ __device__ __forceinline__ void wait_and_repack_tmp_to_dst(T* dst_smem_base_ptr,
            (kSwizzle ? (((col >> 3) ^ (row >> 2)) % (kCols >> 3)) << 3 : col);
   *reinterpret_cast<uint4*>(dst) = *reinterpret_cast<uint4*>(src);
   __syncthreads();
+#endif
 }
 
-// Legacy synchronous helper kept for completeness: issues, waits and
-// repacks in a single call. Equivalent to ``issue_load_2d_to_tmp`` +
-// ``wait_and_repack_tmp_to_dst`` back-to-back. New code should prefer
-// the split helpers so that the issue and the wait can be hoisted apart
-// to enable multi-stage TMA pipelining.
 template <const int BrOrBc, const int kTileSize, const int kHeadDim,
           const int kCols, const int kNumThreads, const int kPad, typename T>
-__device__ __forceinline__ bool load_2d_to_smem_repack(
+__host__ __device__ __forceinline__ bool load_2d_to_smem_repack(
     T* dst_smem_base_ptr, T* tmp_smem_base_ptr, const CUtensorMap* tensor_map,
     const int major_coord, const int d_tile_id, const int dst_stage,
     const int tmp_stage, const int seqlen_bound, barrier_t& barrier) {
+#if __CUDA_ARCH__
   if (!issue_load_2d_to_tmp<BrOrBc, kHeadDim, kCols, T>(
           tmp_smem_base_ptr, tensor_map, major_coord, d_tile_id, tmp_stage,
           seqlen_bound, barrier)) {
@@ -372,8 +296,10 @@ __device__ __forceinline__ bool load_2d_to_smem_repack(
   wait_and_repack_tmp_to_dst<BrOrBc, kTileSize, kCols, kNumThreads, kPad, T>(
       dst_smem_base_ptr, tmp_smem_base_ptr, dst_stage, tmp_stage, barrier);
   return true;
-}
+#else
+  return false;
 #endif
+}
 
 }  // namespace tma
 }  // namespace ffpa

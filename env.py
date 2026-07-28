@@ -48,7 +48,12 @@ class ENV(object):
     int(os.environ.get("ENABLE_FFPA_FORCE_QK_F16", 0))
   )
 
-  # Enable force P@V use fp16 as MMA Acc dtype, for FFPA Acc F32 kernels, default False.
+  # Enable TMA+MMA warp-specialised extension for sm_90+ (opt-in, default off).
+  # When enabled, the build compiles the SM120 TMA kernel and dispatches to it
+  # at runtime on TMA-capable devices. Requires CUDA Toolkit >= 13.0.
+  ENABLE_FFPA_TMA_EXT = bool(int(os.environ.get("ENABLE_FFPA_TMA_EXT", 0)))
+
+  # Enable force P@V use fp16 as MMA Acc dtype, for FFPA cc F32 kernels, default False.
   # FFPA Acc F32 kernels MMA Acc = Mixed Q@K^T MMA Acc F32 + P@V MMA Acc F16.
   ENABLE_FFPA_FORCE_PV_F16 = bool(
     int(os.environ.get("ENABLE_FFPA_FORCE_PV_F16", 0))
@@ -256,6 +261,10 @@ class ENV(object):
     return False
 
   @classmethod
+  def enable_tma_ext(cls):
+    return cls.ENABLE_FFPA_TMA_EXT
+
+  @classmethod
   def env_cuda_cflags(cls):
     extra_env_cflags = []
     if cls.enable_all_mutistages():
@@ -286,11 +295,11 @@ class ENV(object):
     if cls.enable_registers_pipe_kv():
       extra_env_cflags.append("-DENABLE_FFPA_REGISTERS_PIPE_KV")
     if cls.enable_launch_grid_dnhb():
-      extra_env_cflags.append("-DENBALE_FFPA_LAUNCH_GRID_DNHB")
+      extra_env_cflags.append("-DENABLE_FFPA_LAUNCH_GRID_DNHB")
     if cls.enable_cuda_impl():
       extra_env_cflags.append("-DENABLE_FFPA_CUDA_IMPL")
-    if cls._has_sm120_arch():
-      extra_env_cflags.append("-DFFPA_BUILD_SM120")
+    if cls.enable_tma_ext():
+      extra_env_cflags.append("-DENABLE_FFPA_TMA_EXT")
 
     assert not all((cls.enable_persist_q_s2r(), cls.enable_persist_q_g2s())
                    ), "PERSIST_Q_G2S and PERSIST_Q_S2R can not both enabled."
@@ -343,6 +352,7 @@ class ENV(object):
     formatenv("ENABLE_FFPA_REGISTERS_PIPE_KV", cls.enable_registers_pipe_kv())
     formatenv("ENABLE_FFPA_LAUNCH_GRID_DNHB", cls.enable_launch_grid_dnhb())
     formatenv("ENABLE_FFPA_CUDA_IMPL", cls.enable_cuda_impl())
+    formatenv("ENABLE_FFPA_TMA_EXT", cls.enable_tma_ext())
     pretty_print_line()
 
   @staticmethod
@@ -386,13 +396,7 @@ class ENV(object):
       return list(range(32, 1025, 32))
     return list(range(256, 1025, 64))
 
-  @classmethod
-  def _has_sm120_arch(cls):
-    """Return True if sm_120a (Blackwell) is in the build arch list."""
-    return '120a' in cls.get_build_arch_list(
-    ) or '120' in cls.get_build_arch_list()
-
-  # --- end SM120 dispatch code generation ---
+  # --- SM120 dispatch code generation ---
 
   @classmethod
   def generated_sources_dir(cls):
