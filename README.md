@@ -61,7 +61,7 @@ For more advanced features, please refer to our online docs at 📘[ffpa-attn.io
 
 <a id="ffpa-design"></a>
 
-We extend FlashAttention to support large headdim ($D>256$) via **fine-grained tiling** at the **MMA** level for $QK^\top$ and $PV$ matrix multiplication, referred to as **Split-D**. This design keeps SRAM usage fixed at $B_r \times 16$ (with $B_r=B_c$) for Q, K and V, yielding constant SRAM complexity $O(B_r \times 16) \approx O(1)$ and register complexity $O(d/4)$.
+We extend FlashAttention to support large headdim ($D>256$) via **fine-grained tiling** at the **MMA** level for $QK^\top$ and $PV$ matrix multiplication, referred to as **Split-D**. This design keeps SRAM usage fixed at $B_r \times 16$ (with $B_r=B_c$) for Q, K and V, yielding constant SRAM complexity $O(B_r \times 16) \approx O(1)$ and register complexity $O(d/2)$.
 
 <div align='center'>
   <img src="./docs/assets/split-d.png" width="700px">
@@ -97,10 +97,6 @@ FFPA supports multiple backends for the forward and backward pass, including: [`
 |Triton|sm>=80|✔|✔|320~1024|✔|**1.5x~5x**🎉|sm>=80|
 |CuTeDSL|sm>=80|✔|✔|320~1024|❌|**1.5x~2x**🎉|sm80~89,120|
 |CuTeDSL|sm90|✔|✔|320~512|❌|**3x~6x**🎉|sm90|
-
-<!--
-<i>Special thanks to [Butterfingrz](https://github.com/Butterfingrz) for contributing to the CuTeDSL backend! Awesome work!🎉</i>
--->
 
 </div>
 
@@ -144,7 +140,7 @@ Apache License 2.0
 ```BibTeX
 @misc{deftruth2026ffpa,
   author       = {DefTruth and Butterfingrz},
-  title        = {FFPA: Efficient Flash Prefill Attention for Large Head Dimensions via Split-D},
+  title        = {FFPA: Kernel Library for Large Headdim Attention},
   year         = {2026},
   publisher    = {Zenodo},
   version      = {v1.0},
