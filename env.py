@@ -766,6 +766,11 @@ class ENV(object):
       extra_cuda_cflags.append("-v")
     else:
       extra_cuda_cflags.append("--ptxas-options=-O3")
+    # NOTE: ptxas C7506 (setmaxnreg ignored on sm_120a) is an *info*-level
+    # message that only appears under --ptxas-options=-v (FFPA_PTXAS_VERBOSE).
+    # Normal builds are unaffected. ptxas --diag-suppress does not accept
+    # info-level codes (only warning/error diag numbers), so it cannot be
+    # suppressed via command-line flags. See sm120.cuh header for details.
 
     if ENV.FFPA_NVCC_THREADS > 1:
       extra_cuda_cflags.append(f"--threads={ENV.FFPA_NVCC_THREADS}")

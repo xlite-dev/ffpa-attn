@@ -238,6 +238,10 @@ __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK + 128, 1)
   const float inv_scale = 1.0f / scale;
 
   if (is_producer) {
+    // setmaxnreg.dec: release registers from the producer warpgroup so the
+    // consumer can borrow more. Effective on sm_90a/sm_100a; no-op on sm_120a
+    // (ptxas C7506, suppressed in env.py). All 128 producer threads execute.
+    ffpa::tma::warpgroup_reg_dealloc<40>();
     // ======================================================================
     // Producer warp-group (WG0): only tid==0 issues TMA. For each kv_tile,
     // load all QK d_chunks then all V v_chunks into barrier-gated stages.
@@ -305,6 +309,12 @@ __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK + 128, 1)
       }
     }
   } else {
+    // setmaxnreg.inc: borrow registers released by the producer, raising the
+    // consumer per-thread budget from the static 170 (65536/384) toward ~232
+    // so R_D stops spilling for D>=320. Effective on sm_90a/sm_100a; no-op on
+    // sm_120a (ptxas C7506, suppressed in env.py). All 256 consumer threads
+    // (2 warpgroups) execute.
+    ffpa::tma::warpgroup_reg_alloc<232>();
     // ======================================================================
     // Consumer warp-group (WG1): 256 threads, 8 warps. Reuses the existing
     // split-D compute pipeline; cp.async wait is replaced by barrier waits.

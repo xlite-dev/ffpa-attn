@@ -14,6 +14,27 @@ namespace tma {
 
 using barrier_t = cuda::barrier<cuda::thread_scope_block>;
 
+// Warpgroup-level register rebalancing via setmaxnreg.
+// Effective on sm_90a / sm_100a where ptxas honours the hint.
+// On sm_120 / sm_120a (__CUDA_ARCH__ == 1200) the instruction is either
+// unsupported (sm_120) or silently ignored by ptxas (sm_120a, C7506:
+// cp.async.bulk.tensor treated as implicit extern boundary).  Gate to no-op
+// on arch 1200 so builds targeting sm_120 or sm_120a compile cleanly.
+// See /memories/repo/ffpa-sm120-setmaxnreg-ineffective.md.
+template <uint32_t kNumRegs>
+__device__ __forceinline__ void warpgroup_reg_dealloc() {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900 && __CUDA_ARCH__ != 1200
+  asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;\n" : : "n"(kNumRegs));
+#endif
+}
+
+template <uint32_t kNumRegs>
+__device__ __forceinline__ void warpgroup_reg_alloc() {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900 && __CUDA_ARCH__ != 1200
+  asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;\n" : : "n"(kNumRegs));
+#endif
+}
+
 template <typename T>
 constexpr CUtensorMapDataType get_tensor_map_dtype() {
   if constexpr (std::is_same_v<T, __half>) {
