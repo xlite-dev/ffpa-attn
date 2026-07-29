@@ -21,7 +21,7 @@
 
 ## 🎉 Latest News
 
-- [2026-06-10] DefTruth, Butterfingrz (2026). [FFPA: Kernel Library for Large Headdim Attention](https://doi.org/10.5281/zenodo.20638547). 
+- [2026-06-10] DefTruth, Butterfingrz (2026), [FFPA: Kernel Library for Large Headdim Attention](https://doi.org/10.5281/zenodo.20638547). 🎉🎉🎉
 
 ## 📖 Quick Start
 
