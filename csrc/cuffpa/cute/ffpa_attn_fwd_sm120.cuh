@@ -7,6 +7,9 @@
 #include <cutlass/cutlass.h>
 #include <cutlass/device_kernel.h>
 
+// exp2f log-domain constants (FFPA_M_LOG2E / FFPA_M_LN2) live in common.cuh.
+#include "common.cuh"
+
 using TmaBarrier = cutlass::arch::ClusterTransactionBarrier;
 using CtaBarrier = cutlass::arch::ClusterBarrier;
 
@@ -74,6 +77,7 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
   const int group_size = Nh / Nh_kv;
   const int kv_head_idx = Nh_id / group_size;
   const int Br_base = Q_tile_id * kBr;
+  const int tid = threadIdx.x;
 
   if (Br_base >= Nq)
     return;
@@ -85,9 +89,13 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
   const int mask_start_tile =
       causal ? max(0, (causal_thresh_row0 + 1) / kBc) : INT_MAX;
 
-  const int q_tile = (Nb_id * Nh + Nh_id) * ((Nq + kBr - 1) / kBr) + Q_tile_id;
-  const int kv_tiles_total = (Nkv + kBc - 1) / kBc;
-  const int kv_base = (Nb_id * Nh_kv + kv_head_idx) * kv_tiles_total;
+  // Per-head global row origins injected into the TMA views via domain_offset
+  // below. Using the true per-head row count (Nq / Nkv) rather than
+  // ceil(N/kBr)*kBr keeps the TMA row coordinate correct when N % kBr != 0
+  // (the non-aligned case); folding the head dim into the tile index would
+  // accumulate a (kBr - N%kBr) row misalignment per head.
+  const int q_row_offset = (Nb_id * Nh + Nh_id) * Nq;
+  const int kv_row_offset = (Nb_id * Nh_kv + kv_head_idx) * Nkv;
 
   // SMEM layout: [q_base | k_base | v_base], each with kStages copies.
   extern __shared__ __align__(1024) Element shm[];
@@ -102,7 +110,7 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
 
   // Barrier init: qk_full/v_full are TmaBarriers (tid=0 arrive_expect_tx),
   // qk_empty/v_empty are CtaBarriers (all threads arrive after consume).
-  if (threadIdx.x == 0) {
+  if (tid == 0) {
     for (int s = 0; s < kStagesQK; ++s) {
       TmaBarrier::init(&qk_full[s], 1);
       CtaBarrier::init(&qk_empty[s], kNumThreads);
@@ -114,10 +122,23 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
   }
   __syncthreads();
 
-  // TMA tensor views: 2D [total_rows, kHeadDim] with row-major stride.
-  auto mQ = tma_q.get_tma_tensor(make_shape(total_q_rows, Int<kHeadDim>{}));
-  auto mK = tma_k.get_tma_tensor(make_shape(total_kv_rows, Int<kHeadDim>{}));
-  auto mV = tma_v.get_tma_tensor(make_shape(total_kv_rows, Int<kHeadDim>{}));
+  // TMA tensor views: 2D [total_rows, kHeadDim] with row-major stride. The
+  // per-head row origin (q_row_offset / kv_row_offset) is injected via
+  // domain_offset so the TMA row coordinate equals head*N + tile*kBr, which
+  // stays correct when N % kBr != 0 (non-aligned). The tile coordinate passed
+  // to local_tile below is then the per-head local tile id (Q_tile_id /
+  // kv_tile_idx), not a head-folded global tile index. Out-of-range rows on
+  // the last tile are zero-padded by the TMA descriptor (K tail is masked to
+  // -inf in softmax; Q/O tail rows are dropped by the store predicate).
+  auto mQ = domain_offset(
+      make_coord(q_row_offset, 0),
+      tma_q.get_tma_tensor(make_shape(total_q_rows, Int<kHeadDim>{})));
+  auto mK = domain_offset(
+      make_coord(kv_row_offset, 0),
+      tma_k.get_tma_tensor(make_shape(total_kv_rows, Int<kHeadDim>{})));
+  auto mV = domain_offset(
+      make_coord(kv_row_offset, 0),
+      tma_v.get_tma_tensor(make_shape(total_kv_rows, Int<kHeadDim>{})));
   auto q_slice = tma_q.get_slice(_0{});
   auto k_slice = tma_k.get_slice(_0{});
   auto v_slice = tma_v.get_slice(_0{});
@@ -126,17 +147,17 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
   // PV uses Tile<kBr,kVDChunk,16> (output d-direction is N of MMA).
   TiledMmaQK tiled_mma_qk;
   TiledMmaPV tiled_mma_pv;
-  auto thr_mma_qk = tiled_mma_qk.get_thread_slice(threadIdx.x);
-  auto thr_mma_pv = tiled_mma_pv.get_thread_slice(threadIdx.x);
+  auto thr_mma_qk = tiled_mma_qk.get_thread_slice(tid);
+  auto thr_mma_pv = tiled_mma_pv.get_thread_slice(tid);
 
   // S2R copy atoms: LDSM_N for Q/K (A/B operands of QK GEMM),
   // LDSM_T for V (transposed B operand of PV GEMM via SmemLayoutVt).
   auto s2r_copy_q = make_tiled_copy_A(SmemCopyAtom{}, tiled_mma_qk);
   auto s2r_copy_k = make_tiled_copy_B(SmemCopyAtom{}, tiled_mma_qk);
   auto s2r_copy_v = make_tiled_copy_B(SmemCopyAtomTransposed{}, tiled_mma_pv);
-  auto s2r_thr_q = s2r_copy_q.get_thread_slice(threadIdx.x);
-  auto s2r_thr_k = s2r_copy_k.get_thread_slice(threadIdx.x);
-  auto s2r_thr_v = s2r_copy_v.get_thread_slice(threadIdx.x);
+  auto s2r_thr_q = s2r_copy_q.get_thread_slice(tid);
+  auto s2r_thr_k = s2r_copy_k.get_thread_slice(tid);
+  auto s2r_thr_v = s2r_copy_v.get_thread_slice(tid);
 
   // V fragment layout: precompute the register layout for PV B-operand
   // so we can reinterpret raw LDSM_T data without extra copies.
@@ -162,6 +183,13 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
       tScS.data(), ffpa_cute::convert_layout_acc_rowcol(tScS.layout()));
   constexpr int kSRows = decltype(size<0>(tScS_rc))::value;
   constexpr int kSCols = decltype(size<1>(tScS_rc))::value;
+
+  // Online softmax below uses exp2f, which requires the scale in log2 domain:
+  // exp(x) == exp2(x * log2(e)). The caller passes the linear-domain scale
+  // (1/sqrt(D)); convert it once here so exp2f(scores*scale - max) is correct.
+  // (This was the accuracy bug: without log2(e) the P and row_scale were
+  // 2^(...) instead of e^(...), compounding across kv_tiles.)
+  scale *= FFPA_M_LOG2E;
 
   float row_max[kORows];
   float row_sum[kORows];
@@ -192,9 +220,9 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
     auto sK = make_tensor(make_smem_ptr(k_base + stage * kKChunkElements),
                           SmemLayoutK{});
     auto gQ = local_tile(mQ, Shape<Int<kBr>, Int<kQKDChunk>>{},
-                         make_coord(q_tile, d_chunk));
+                         make_coord(Q_tile_id, d_chunk));
     auto gK = local_tile(mK, Shape<Int<kBc>, Int<kQKDChunk>>{},
-                         make_coord(kv_base + kv_tile_idx, d_chunk));
+                         make_coord(kv_tile_idx, d_chunk));
     auto tQgQ = q_slice.partition_S(gQ);
     auto tQsQ = q_slice.partition_D(sQ);
     auto tKgK = k_slice.partition_S(gK);
@@ -209,7 +237,7 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
     auto sV = make_tensor(make_smem_ptr(v_base + stage * kVChunkElements),
                           SmemLayoutV{});
     auto gV = local_tile(mV, Shape<Int<kBc>, Int<kVDChunk>>{},
-                         make_coord(kv_base + kv_tile_idx, v_chunk));
+                         make_coord(kv_tile_idx, v_chunk));
     auto tVgV = v_slice.partition_S(gV);
     auto tVsV = v_slice.partition_D(sV);
     TmaBarrier::arrive_and_expect_tx(&v_full[stage],
@@ -218,23 +246,39 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
   };
 
   // Initial QK prefetch: fill pipeline with first kStagesQK chunks.
-  if (threadIdx.x == 0) {
+  if (tid == 0) {
     for (int d = 0; d < kStagesQK && d < kDChunksQK; ++d) {
       CtaBarrier::wait(&qk_empty[d], 0);
       issue_qk_tma(d, d, 0);
     }
   }
 
+  // Initial V prefetch for kv_tile 0: issue first kStagesPV V chunks so the
+  // V TMA overlaps the entire first QK GEMM + softmax window (V is independent
+  // of QK, so it can be launched before the QK loop).
+  if (tid == 0) {
+    for (int v = 0; v < kStagesPV && v < kDChunksV; ++v) {
+      const int chunk_index = v;  // kv_tile == 0
+      const int v_stage = chunk_index % kStagesPV;
+      const int v_phase = (chunk_index / kStagesPV) & 1;
+      CtaBarrier::wait(&v_empty[v_stage], v_phase);
+      issue_v_tma(v, v_stage, 0);
+    }
+  }
+
 #pragma unroll 1
   for (int kv_tile = 0; kv_tile < Tc_eff; ++kv_tile) {
-    // QK prefetch for kv_tile > 0: issue first kStagesQK chunks.
-    if (kv_tile > 0 && threadIdx.x == 0) {
-      for (int d = 0; d < kStagesQK && d < kDChunksQK; ++d) {
-        const int chunk_index = kv_tile * kDChunksQK + d;
-        const int stage = chunk_index % kStagesQK;
-        const int phase = (chunk_index / kStagesQK) & 1;
-        CtaBarrier::wait(&qk_empty[stage], phase);
-        issue_qk_tma(d, stage, kv_tile);
+    // V prefetch for kv_tile > 0: issue first kStagesPV V chunks before the
+    // QK loop so the V TMA overlaps QK GEMM + softmax. (kv_tile 0's V initial
+    // was issued before the loop; subsequent kv_tiles' QK initial is issued at
+    // the end of the previous kv_tile's QK loop, see below.)
+    if (kv_tile > 0 && tid == 0) {
+      for (int v = 0; v < kStagesPV && v < kDChunksV; ++v) {
+        const int chunk_index = kv_tile * kDChunksV + v;
+        const int v_stage = chunk_index % kStagesPV;
+        const int v_phase = (chunk_index / kStagesPV) & 1;
+        CtaBarrier::wait(&v_empty[v_stage], v_phase);
+        issue_v_tma(v, v_stage, kv_tile);
       }
     }
 
@@ -267,7 +311,7 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
       // Signal stage consumed; tid=0 prefetches next chunk if available.
       CtaBarrier::arrive(&qk_empty[stage]);
 
-      if (threadIdx.x == 0) {
+      if (tid == 0) {
         const int d_next = d_chunk + kStagesQK;
         if (d_next < kDChunksQK) {
           const int next_index = kv_tile * kDChunksQK + d_next;
@@ -276,6 +320,21 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
           CtaBarrier::wait(&qk_empty[s_next], phase_next);
           issue_qk_tma(d_next, s_next, kv_tile);
         }
+      }
+    }
+
+    // Prefetch next kv_tile's QK initial chunks so the QK TMA overlaps this
+    // kv_tile's softmax + PV loop. The QK barriers are disjoint from the
+    // softmax/PV barriers, so placing this here is safe (zero-deadlock by the
+    // disjoint-barrier-set invariant). kv_tile 0's QK initial was issued
+    // before the loop; this replaces the old "kv_tile > 0 top" QK prefetch.
+    if (kv_tile < Tc_eff - 1 && tid == 0) {
+      for (int d = 0; d < kStagesQK && d < kDChunksQK; ++d) {
+        const int chunk_index = (kv_tile + 1) * kDChunksQK + d;
+        const int stage = chunk_index % kStagesQK;
+        const int phase = (chunk_index / kStagesQK) & 1;
+        CtaBarrier::wait(&qk_empty[stage], phase);
+        issue_qk_tma(d, stage, kv_tile + 1);
       }
     }
 
@@ -346,16 +405,8 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
           tCrP.data(),
           ffpa_cute::convert_layout_acc_Aregs<TiledMmaPV>(tCrP.layout()));
 
-      // V prefetch: issue first kStagesPV V chunks for this kv_tile.
-      if (threadIdx.x == 0) {
-        for (int v = 0; v < kStagesPV && v < kDChunksV; ++v) {
-          const int chunk_index = kv_tile * kDChunksV + v;
-          const int v_stage = chunk_index % kStagesPV;
-          const int v_phase = (chunk_index / kStagesPV) & 1;
-          CtaBarrier::wait(&v_empty[v_stage], v_phase);
-          issue_v_tma(v, v_stage, kv_tile);
-        }
-      }
+      // (V initial prefetch moved to the top of the kv_tile loop so it overlaps
+      // QK GEMM + softmax; see the kv_tile > 0 block and the pre-loop block.)
 
 #pragma unroll
       for (int v_chunk = 0; v_chunk < kDChunksV; ++v_chunk) {
@@ -393,7 +444,7 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
         // Signal stage consumed; tid=0 prefetches next chunk if available.
         CtaBarrier::arrive(&v_empty[v_stage]);
 
-        if (threadIdx.x == 0) {
+        if (tid == 0) {
           const int v_next = v_chunk + kStagesPV;
           if (v_next < kDChunksV) {
             const int next_index = kv_tile * kDChunksV + v_next;
@@ -453,7 +504,9 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
     const int lse_base = Nb_id * Nh * Nq + Nh_id * Nq;
 #pragma unroll
     for (int row = 0; row < kORows; ++row) {
-      const float lse = row_max[row] + log2f(row_sum[row]);
+      // row_max / row_sum are in log2 domain (exp2f softmax), so convert the
+      // log-sum-exp back to the natural-log convention flash-attn expects.
+      const float lse = (row_max[row] + log2f(row_sum[row])) * FFPA_M_LN2;
       const int global_row = Br_base + get<0>(tScS_rc(row, 0));
       if (global_row < Nq)
         softmax_lse[lse_base + global_row] = lse;
