@@ -1,6 +1,6 @@
 <div align="center">
   <p align="center">
-    <h2>🤖FFPA: Yet another Faster Flash Prefill Attention <br>with O(1)⚡️GPU SRAM complexity for large headdim🐑</h2>
+    <h2>🤖FFPA: Kernel Library for Large Headdim Attention</h2>
     <img src=https://img.shields.io/badge/language-CUDA/Python-brightgreen.svg >
     <a href="https://pepy.tech/projects/ffpa-attn"><img src=https://static.pepy.tech/personalized-badge/ffpa-attn?period=total&units=ABBREVIATION&left_color=GRAY&right_color=BLUE&left_text=downloads/pypi ></a>
     <a href="https://pypi.org/project/ffpa-attn/"><img src=https://img.shields.io/github/release/xlite-dev/ffpa-attn.svg?color=GREEN ></a>
@@ -9,13 +9,13 @@
     <img src="docs/assets/ffpa-api.png" width="700px">
 </div>
 
-**FFPA(Split-D)**: Yet another **Faster Flash Prefill Attention** with **Split-D** strategy, achieve **O(1) SRAM complexity** and **O(d/4) register complexity** for large headdim (**> 256**), **1.5~3x** 🎉 faster than SDPA. 📚👇The Core features:
+**FFPA**: A production-ready Kernel Library with **Split-D** strategy for **Large Headdim Attention**, achieve **~O(1)** SRAM complexity and **O(d/2)** register complexity, **1.5~6x** 🎉 faster than SDPA. 📚👇The Core features:
 
 <div align='center' markdown="1">
 
 |[Self Attn](./bench)| [GQA/MQA](./bench) |[Cross Attn](./bench)|[Causal/Mask](./bench)|[Dropout](./bench)|[Headdim](#ffpa-design)|[Fwd/Bwd](./bench)|
 |:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-|✔️(`Nq=Nkv`)|✔️(`Hq!=Hkv`)|✔️(`Nq!=Nkv`)|✔️(`attn_mask`)|✔️(`p>0`)|**320~1024** |**1.5~3x↑** |
+|✔️(`Nq=Nkv`)|✔️(`Hq!=Hkv`)|✔️(`Nq!=Nkv`)|✔️(`attn_mask`)|✔️(`p>0`)|**320~1024** |**1.5~6x↑** |
 
 </div>
 
@@ -85,7 +85,7 @@ Runnable benchmark are provided under [`bench`](./bench). The performance benchm
 
 ## 🤖 Backends
 
-FFPA supports multiple backends for the forward and backward pass, including: [`SDPA`](./bench/) (baseline), [`CUDA`](./bench/) (forward only), [`Triton`](./bench/), and [`CuTeDSL`](./bench/). The `CuTeDSL` backend is currently in early stage and has some constraints, but it can achieve up to `513🎉` TFLOPS on H200! Stay tuned for future updates.
+FFPA supports multiple backends for the forward and backward pass, including: [`SDPA`](./bench/) (baseline), [`CUDA`](./bench/) (forward only), [`Triton`](./bench/), and [`CuTeDSL`](./bench/). The `CuTeDSL` backend is currently in early stage and has some constraints, but it can achieve up to `513~535🎉` TFLOPS on H200! Stay tuned for future updates.
 
 <div align='center' markdown="1">
 
@@ -97,7 +97,9 @@ FFPA supports multiple backends for the forward and backward pass, including: [`
 |CuTeDSL|sm>=80|✔|✔|320~1024|❌|**1.5x~2x**🎉|sm80~89,120|
 |CuTeDSL|sm90|✔|✔|320~512|❌|**3x~6x**🎉|sm90|
 
+<!--
 <i>Special thanks to [Butterfingrz](https://github.com/Butterfingrz) for contributing to the CuTeDSL backend! Awesome work!🎉</i>
+-->
 
 </div>
 
