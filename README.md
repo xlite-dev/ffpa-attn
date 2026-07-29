@@ -19,7 +19,7 @@
 
 </div>
 
-## 🎉🎉 Latest News
+## 🎉 Latest News
 
 - [2026-06-10] DefTruth, Butterfingrz (2026). [FFPA: Efficient Flash Prefill Attention for Large Head Dimensions via Split-D.](https://doi.org/10.5281/zenodo.20638547) Zenodo, 2026. 🎉🎉🎉
 <!---
