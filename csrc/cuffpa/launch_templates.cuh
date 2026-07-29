@@ -239,7 +239,9 @@ static constexpr int getConfigQKVSmemMaxSize() {
 template <typename kDataType, const int kHeadDim, const int kAccQK,
           const int kAccPV, const int kStage, const int kQKDChunk,
           const int kVDChunk = kQKDChunk, const int kShareSmemQKV = 0,
-          const int kPersistQg2s = 0>
+          const int kPersistQg2s = 0, const int kMmaTileSeqLenQ = 8,
+          const int kValTileSeqLenK = 16, const int kProducerThreads = 128,
+          const int kNonWS = 0>
 void launch_ffpa_attn_fwd_template_sm120(torch::Tensor Q, torch::Tensor K,
                                          torch::Tensor V, torch::Tensor O,
                                          torch::Tensor attn_bias,
@@ -444,82 +446,52 @@ void launch_ffpa_attn_fwd_template(torch::Tensor Q, torch::Tensor K,
   }
 
   // SM120 TMA path: when ``tma`` is set and the device is TMA-capable
-  // (sm_90+), delegate to the warp-specialised launcher.  Falls back to the
-  // legacy cp.async path on older hardware. (NOTE: NO WGMMA used here,
-  // since sm_120a is not yet supported by WGMMA.)
+  // (sm_90+), delegate to the TMA launcher. Falls back to the legacy
+  // cp.async path on older hardware. NOTE: NO WGMMA on sm_120a.
+  // See ffpa_attn_fwd_sm120.cuh header for register pressure analysis
+  // and why sm_120a uses non-WS mode (kNonWS=1).
   //
-  // Register pressure & persist Q analysis (sm_120a, RTX PRO 5000):
-  //   Each SM has 65536 32-bit registers. Per-thread budget = 65536 /
-  //   (threads × blocks_per_SM). With __launch_bounds__(N, 1):
-  //     Legacy cp.async: 256 threads → 256 regs/thread
-  //     TMA WS:          384 threads → 170 regs/thread
-  //   R_D (PV accumulator) = kValTileHeadDimV × 4 regs = (D/8) × 4:
-  //     D=256 → 128 regs, D=320 → 160 regs, D=512 → 256 regs.
-  //   Legacy 256T: R_D fits without spill for D≤512 (256 ≥ 256).
-  //   TMA WS 384T: R_D spills for D≥320 (160+overhead > 170).
-  //
-  //   persist Q saves ~33% GMEM BW (Q not reloaded per kv_tile), but:
-  //   1) On sm_120a (99KB smem), persist Q for D≥256 forces kVDChunk≤32
-  //      (smem constraint), doubling V TMA issues and requiring transition
-  //      barriers (qk_done/v_done) that serialize QK→V phases.
-  //   2) Even in legacy cp.async (256T, no smem constraint), persist Q
-  //      is negative for D≥256: D=320 S=2+persist=144T vs S=4 no-persist=
-  //      167T; D=256 S=2+persist=147T vs S=5 no-persist=172T.
-  //   3) In TMA WS (384T), register spills dominate for D≥320; BW saving
-  //      cannot compensate: D=320 persist=144T vs share S=3=152T.
-  //
-  //   EXCEPTION: D≤128 persist Q IS positive on sm_120a TMA WS:
-  //     R_D = 64 regs (no spill), Q_persist = 32KB, KV S=3 = 48KB,
-  //     total 80KB < 99KB → kVD=64 preserved, no downgrade needed.
-  //     Measured: D=128 persist S=3 = 165T vs share S=3 = 159T (+4%).
-  //
-  //   Conclusion: sm_120a uses persist Q for D≤128, share smem for
-  //   D>128. sm_90/100 (228KB smem) can use kQKD=64+kVD=64+S=3 without
-  //   downgrade, but this is unverified (needs remote H800 testing).
+  // TMA path dispatch:
+  //   sm_120a: non-WS (kNonWS=1). All 256 threads do MMA, thread 0 issues
+  //     TMA inline. Eliminates WS if/else register allocation penalty
+  //     (168→255 regs, 0 spills). +2-7% vs legacy cp.async baseline.
+  //   sm_90/100: WS (kNonWS=0). setmaxnreg effective, 228KB smem allows
+  //     deep pipeline. Unverified on real hardware.
 #ifdef ENABLE_FFPA_TMA_EXT
   if (tma) {
     auto prop = at::cuda::getCurrentDeviceProperties();
     if (prop->major >= 9) {
       if (prop->major == 9 || prop->major == 10) {
-        // sm_90/100 (228 KB smem): persist Q for D<=512 when no bias/dropout.
-        // NOTE: unverified on real hardware; legacy data suggests deep
-        // pipeline may still outperform. Kept for remote H800 validation.
+        // sm_90/100 (228 KB smem): WS path, setmaxnreg effective.
         if (!has_attn_bias && !has_dropout && kHeadDim <= 512) {
           launch_ffpa_attn_fwd_template_sm120<
               kDataType, kHeadDim, kMmaAccFloat32QK, kMmaAccFloat32PV, kStage,
-              64, 64, 0, 1>(Q, K, V, O, attn_bias, softmax_lse, causal,
-                            softmax_scale, dropout_p, philox_seed,
-                            philox_offset);
+              64 /*kQKDChunk*/, 64 /*kVDChunk*/, 0 /*kShareSmemQKV*/,
+              1 /*kPersistQg2s*/, 8 /*kMmaTileSeqLenQ*/, 16 /*kValTileSeqLenK*/,
+              128 /*kProducerThreads*/, 0 /*kNonWS*/>(
+              Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
+              dropout_p, philox_seed, philox_offset);
         } else {
           launch_ffpa_attn_fwd_template_sm120<
               kDataType, kHeadDim, kMmaAccFloat32QK, kMmaAccFloat32PV, kStage,
-              64, 64, 0, 0>(Q, K, V, O, attn_bias, softmax_lse, causal,
-                            softmax_scale, dropout_p, philox_seed,
-                            philox_offset);
+              64 /*kQKDChunk*/, 64 /*kVDChunk*/, 0 /*kShareSmemQKV*/,
+              0 /*kPersistQg2s*/, 8 /*kMmaTileSeqLenQ*/, 16 /*kValTileSeqLenK*/,
+              128 /*kProducerThreads*/, 0 /*kNonWS*/>(
+              Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
+              dropout_p, philox_seed, philox_offset);
         }
       } else {
-        // sm_120a (99 KB smem): D<=128 uses persist Q (R_D=64 regs, no
-        // spill; Q_persist=32KB leaves 67KB for KV stages). D>128 uses
-        // share smem. persist Q disabled for D>=256 (see analysis above).
-        if (!has_attn_bias && !has_dropout && kHeadDim <= 128) {
-          launch_ffpa_attn_fwd_template_sm120<
-              kDataType, kHeadDim, kMmaAccFloat32QK, kMmaAccFloat32PV,
-              (kStage > 3 ? 3 : kStage), 32, 64, 0, 1>(
-              Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
-              dropout_p, philox_seed, philox_offset);
-        } else if (!has_attn_bias && !has_dropout) {
-          launch_ffpa_attn_fwd_template_sm120<
-              kDataType, kHeadDim, kMmaAccFloat32QK, kMmaAccFloat32PV,
-              (kStage > 3 ? 3 : kStage), 32, 64, 1, 0>(
-              Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
-              dropout_p, philox_seed, philox_offset);
-        } else {
-          launch_ffpa_attn_fwd_template_sm120<
-              kDataType, kHeadDim, kMmaAccFloat32QK, kMmaAccFloat32PV,
-              (kStage > 3 ? 3 : kStage), 32, 64, 0, 0>(
-              Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
-              dropout_p, philox_seed, philox_offset);
-        }
+        // sm_120a (99 KB smem): non-WS path.
+        // kQKDChunk=32 (SWIZZLE_64B), kVDChunk=64, S≤3.
+        // smem per stage: Q=128×32×2B=8KB, K=128×32×2B=8KB, V=128×64×2B=16KB
+        // total: 3×(8+8+16)KB = 96KB < 99KB.
+        launch_ffpa_attn_fwd_template_sm120<
+            kDataType, kHeadDim, kMmaAccFloat32QK, kMmaAccFloat32PV,
+            (kStage > 3 ? 3 : kStage), 32 /*kQKDChunk*/, 64 /*kVDChunk*/,
+            0 /*kShareSmemQKV*/, 0 /*kPersistQg2s*/, 8 /*kMmaTileSeqLenQ*/,
+            16 /*kValTileSeqLenK*/, 128 /*kProducerThreads*/, 1 /*kNonWS*/>(
+            Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
+            dropout_p, philox_seed, philox_offset);
       }
       return;
     }
@@ -564,7 +536,9 @@ void launch_ffpa_attn_fwd_template(torch::Tensor Q, torch::Tensor K,
 #ifdef ENABLE_FFPA_TMA_EXT
 template <typename kDataType, const int kHeadDim, const int kMmaAccFloat32QK,
           const int kMmaAccFloat32PV, const int kStage, const int kQKDChunk,
-          const int kVDChunk, const int kShareSmemQKV, const int kPersistQg2s>
+          const int kVDChunk, const int kShareSmemQKV, const int kPersistQg2s,
+          const int kMmaTileSeqLenQ, const int kValTileSeqLenK,
+          const int kProducerThreads, const int kNonWS>
 void launch_ffpa_attn_fwd_template_sm120(torch::Tensor Q, torch::Tensor K,
                                          torch::Tensor V, torch::Tensor O,
                                          torch::Tensor attn_bias,
@@ -575,12 +549,10 @@ void launch_ffpa_attn_fwd_template_sm120(torch::Tensor Q, torch::Tensor K,
   constexpr int kMmaAtomM = 16;
   constexpr int kMmaAtomN = 8;
   constexpr int kMmaAtomK = 16;
-  constexpr int kMmaTileSeqLenQ = getConfigMmaTileSeqLenQP<kHeadDim>();
   constexpr int kMmaTileSeqLenK = 1;
-  constexpr int kMmaTileSeqLenP = getConfigMmaTileSeqLenQP<kHeadDim>();
+  constexpr int kMmaTileSeqLenP = kMmaTileSeqLenQ;
   constexpr int kMmaTileHeadDimV = 1;
   constexpr int kValTileSeqLenQ = 1;
-  constexpr int kValTileSeqLenK = getConfigValTileSeqLenK<kHeadDim>();
   constexpr int kValTileSeqLenP = 1;
   constexpr int kValTileHeadDimV = getConfigValTileHeadDimV<kHeadDim>();
   constexpr int Br = kMmaAtomM * kMmaTileSeqLenQ * kValTileSeqLenQ;
@@ -588,8 +560,8 @@ void launch_ffpa_attn_fwd_template_sm120(torch::Tensor Q, torch::Tensor K,
   static_assert(Br == Bc);
   constexpr int kConsumerThreads =
       WARP_SIZE * kMmaTileSeqLenQ * kMmaTileSeqLenK;
-  constexpr int kProducerThreads = 128;
-  constexpr int kTotalThreads = kConsumerThreads + kProducerThreads;
+  constexpr int kEffProducerThreads = kNonWS ? 0 : kProducerThreads;
+  constexpr int kTotalThreads = kConsumerThreads + kEffProducerThreads;
   constexpr int kPadQ = 0;
   constexpr int kPadK = 0;
   constexpr int kPadV = 0;
@@ -702,7 +674,8 @@ void launch_ffpa_attn_fwd_template_sm120(torch::Tensor Q, torch::Tensor K,
           kMmaTileSeqLenK, kMmaTileSeqLenP, kMmaTileHeadDimV, kValTileSeqLenQ,
           kValTileSeqLenK, kValTileSeqLenP, kValTileHeadDimV, kMmaAccFloat32QK,
           kMmaAccFloat32PV, kOStorageAccFloat32, kStageQK, kStagePV, kPadQ,
-          kPadK, kPadV, kQKDChunk, kVDChunk, kShareSmemQKV, kPersistQg2s>);
+          kPadK, kPadV, kQKDChunk, kVDChunk, kShareSmemQKV, kPersistQg2s,
+          kProducerThreads, kNonWS>);
   cudaFuncSetAttribute(kernel_func, cudaFuncAttributeMaxDynamicSharedMemorySize,
                        kSmemBytes);
   kernel_func<<<grid, block, kSmemBytes, stream>>>(
