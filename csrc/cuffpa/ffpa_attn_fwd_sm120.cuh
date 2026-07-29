@@ -129,8 +129,7 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK +
 
   // TMA SWIZZLE (32B/128B) requires a 1024B-aligned smem base so the hardware
   // swizzle phase starts at zero; ``__align__(16)`` would shift the phase and
-  // corrupt every TMA-written tile (illegal instruction / wrong ldmatrix
-  // addresses). See /memories/repo/leetcuda-sm120-tma-mma-ws.md.
+  // corrupt every TMA-written tile.
   extern __shared__ __align__(1024) unsigned char ffpa_smem_raw[];
   kDataType* smem = reinterpret_cast<kDataType*>(ffpa_smem_raw);
   constexpr int Q_tile_size = Br * (kQKDChunk + kPadQ);

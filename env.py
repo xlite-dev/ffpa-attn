@@ -53,6 +53,11 @@ class ENV(object):
   # at runtime on TMA-capable devices. Requires CUDA Toolkit >= 13.0.
   ENABLE_FFPA_TMA_EXT = bool(int(os.environ.get("ENABLE_FFPA_TMA_EXT", 0)))
 
+  # Enable CuTe C++ kernel extension for sm_120+ (opt-in, default off).
+  # Requires ENABLE_FFPA_TMA_EXT=1 AND ENABLE_FFPA_CUTE_EXT=1 to activate
+  # the cute-based kernel path. Uses cutlass headers from third_party/cutlass.
+  ENABLE_FFPA_CUTE_EXT = bool(int(os.environ.get("ENABLE_FFPA_CUTE_EXT", 0)))
+
   # Enable force P@V use fp16 as MMA Acc dtype, for FFPA cc F32 kernels, default False.
   # FFPA Acc F32 kernels MMA Acc = Mixed Q@K^T MMA Acc F32 + P@V MMA Acc F16.
   ENABLE_FFPA_FORCE_PV_F16 = bool(
@@ -194,7 +199,12 @@ class ENV(object):
         "to infer the target arch. Set FFPA_BUILD_ARCH=<sm list>, e.g. 80,89,90."
       )
     cap = torch.cuda.get_device_capability(torch.cuda.current_device())
-    return [f"{cap[0]}{cap[1]}"]
+    arch = f"{cap[0]}{cap[1]}"
+    # sm_90a/100a/120a: the 'a' suffix enables arch-specific instructions
+    # (TMA, WGMMA, etc.) that are unavailable in the base ISA.
+    if arch in ("90", "100", "120"):
+      arch += "a"
+    return [arch]
 
   @classmethod
   def enable_all_mutistages(cls):
@@ -265,6 +275,10 @@ class ENV(object):
     return cls.ENABLE_FFPA_TMA_EXT
 
   @classmethod
+  def enable_cute_ext(cls):
+    return cls.ENABLE_FFPA_CUTE_EXT
+
+  @classmethod
   def env_cuda_cflags(cls):
     extra_env_cflags = []
     if cls.enable_all_mutistages():
@@ -300,6 +314,8 @@ class ENV(object):
       extra_env_cflags.append("-DENABLE_FFPA_CUDA_IMPL")
     if cls.enable_tma_ext():
       extra_env_cflags.append("-DENABLE_FFPA_TMA_EXT")
+    if cls.enable_cute_ext():
+      extra_env_cflags.append("-DENABLE_FFPA_CUTE_EXT")
 
     assert not all((cls.enable_persist_q_s2r(), cls.enable_persist_q_g2s())
                    ), "PERSIST_Q_G2S and PERSIST_Q_S2R can not both enabled."
@@ -353,6 +369,7 @@ class ENV(object):
     formatenv("ENABLE_FFPA_LAUNCH_GRID_DNHB", cls.enable_launch_grid_dnhb())
     formatenv("ENABLE_FFPA_CUDA_IMPL", cls.enable_cuda_impl())
     formatenv("ENABLE_FFPA_TMA_EXT", cls.enable_tma_ext())
+    formatenv("ENABLE_FFPA_CUTE_EXT", cls.enable_cute_ext())
     pretty_print_line()
 
   @staticmethod
@@ -756,6 +773,10 @@ class ENV(object):
     extra_cuda_cflags.append("--use_fast_math")
     extra_cuda_cflags.extend(ENV.env_cuda_cflags())
     extra_cuda_cflags.append(f"-I {ENV.project_dir()}/csrc/cuffpa")
+    if ENV.enable_cute_ext():
+      extra_cuda_cflags.append(
+        f"-I {ENV.project_dir()}/third_party/cutlass/include"
+      )
     extra_cuda_cflags.append("-diag-suppress")
     extra_cuda_cflags.append("177")
     extra_cuda_cflags.append("-diag-suppress")

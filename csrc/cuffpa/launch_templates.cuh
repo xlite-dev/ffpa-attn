@@ -7,6 +7,9 @@
 #ifdef ENABLE_FFPA_TMA_EXT
 #include "ffpa_attn_fwd_sm120.cuh"
 #include "tma.cuh"
+#ifdef ENABLE_FFPA_CUTE_EXT
+#include "cute/ffpa_attn_fwd_sm120.cuh"
+#endif
 #endif
 using namespace ffpa;
 
@@ -251,6 +254,14 @@ void launch_ffpa_attn_fwd_template_sm120(torch::Tensor Q, torch::Tensor K,
                                          int64_t philox_offset);
 #endif  // ENABLE_FFPA_TMA_EXT
 
+#ifdef ENABLE_FFPA_CUTE_EXT
+template <typename kDataType, const int kHeadDim, const int kStage>
+void launch_ffpa_attn_split_d_fwd_cute_sm120(torch::Tensor Q, torch::Tensor K,
+                                             torch::Tensor V, torch::Tensor O,
+                                             torch::Tensor softmax_lse,
+                                             int causal, double softmax_scale);
+#endif  // ENABLE_FFPA_CUTE_EXT
+
 // Runtime arguments:
 //   Q, K, V, O     : BHND tensors as described in the kernel template docs.
 //   causal         : 0/1 runtime flag. Non-zero enables causal masking with
@@ -482,6 +493,22 @@ void launch_ffpa_attn_fwd_template(torch::Tensor Q, torch::Tensor K,
         }
       } else {
         // sm_120a (99 KB smem): non-WS path.
+#ifdef ENABLE_FFPA_CUTE_EXT
+        // CuTe kernel does not support attn_bias or dropout; fall back to
+        // the non-WS TMA kernel which handles both via runtime arguments.
+        if (!has_attn_bias && !has_dropout) {
+          launch_ffpa_attn_split_d_fwd_cute_sm120<kDataType, kHeadDim, kStage>(
+              Q, K, V, O, softmax_lse, causal, softmax_scale);
+        } else {
+          launch_ffpa_attn_fwd_template_sm120<
+              kDataType, kHeadDim, kMmaAccFloat32QK, kMmaAccFloat32PV,
+              (kStage > 3 ? 3 : kStage), 32 /*kQKDChunk*/, 64 /*kVDChunk*/,
+              0 /*kShareSmemQKV*/, 0 /*kPersistQg2s*/, 8 /*kMmaTileSeqLenQ*/,
+              16 /*kValTileSeqLenK*/, 128 /*kProducerThreads*/, 1 /*kNonWS*/>(
+              Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
+              dropout_p, philox_seed, philox_offset);
+        }
+#else
         // kQKDChunk=32 (SWIZZLE_64B), kVDChunk=64, S≤3.
         // smem per stage: Q=128×32×2B=8KB, K=128×32×2B=8KB, V=128×64×2B=16KB
         // total: 3×(8+8+16)KB = 96KB < 99KB.
@@ -492,6 +519,7 @@ void launch_ffpa_attn_fwd_template(torch::Tensor Q, torch::Tensor K,
             16 /*kValTileSeqLenK*/, 128 /*kProducerThreads*/, 1 /*kNonWS*/>(
             Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
             dropout_p, philox_seed, philox_offset);
+#endif
       }
       return;
     }
@@ -689,3 +717,85 @@ void launch_ffpa_attn_fwd_template_sm120(torch::Tensor Q, torch::Tensor K,
   cudaFree(tma_v_d);
 }
 #endif  // ENABLE_FFPA_TMA_EXT
+
+#ifdef ENABLE_FFPA_CUTE_EXT
+template <typename kDataType, const int kHeadDim, const int kStage>
+void launch_ffpa_attn_split_d_fwd_cute_sm120(torch::Tensor Q, torch::Tensor K,
+                                             torch::Tensor V, torch::Tensor O,
+                                             torch::Tensor softmax_lse,
+                                             int causal, double softmax_scale) {
+  using namespace cute;
+
+  constexpr int kBr = 128;
+  constexpr int kBc = 128;
+  constexpr int kQKDChunk = 32;
+  constexpr int kVDChunk = 64;
+  constexpr int kStagesQK = (kStage > 3 ? 3 : kStage);
+  constexpr int kStagesPV = kStagesQK;
+  constexpr int kNumThreads = kBr / 16 * 32;
+
+  using CuteElement = std::conditional_t<std::is_same_v<kDataType, __half>,
+                                         cutlass::half_t, cutlass::bfloat16_t>;
+  using Traits = ffpa_cute::FFPAAttnCuTeTraits<kHeadDim, kBr, kBc, kQKDChunk,
+                                               kVDChunk, CuteElement>;
+  using SmemLayoutQ = typename Traits::SmemLayoutQ;
+  using SmemLayoutK = typename Traits::SmemLayoutK;
+  using SmemLayoutV = typename Traits::SmemLayoutV;
+
+  const int Nb = Q.size(0);
+  const int Nh = Q.size(1);
+  const int Nh_kv = K.size(1);
+  const int Nq = Q.size(2);
+  const int Nkv = K.size(2);
+  const int Tc = utils::div_ceil(Nkv, kBc);
+  const float scale = static_cast<float>(softmax_scale);
+
+  const dim3 block(kNumThreads, 1, 1);
+  const dim3 grid(utils::div_ceil(Nq, kBr), Nb * Nh, 1);
+
+  const c10::cuda::OptionalCUDAGuard device_guard(Q.device());
+  auto stream = at::cuda::getCurrentCUDAStream();
+
+  const int total_q_rows = Nb * Nh * Nq;
+  const int total_kv_rows = Nb * Nh_kv * Nkv;
+
+  auto gQ =
+      make_tensor(make_gmem_ptr(reinterpret_cast<CuteElement*>(Q.data_ptr())),
+                  make_shape(total_q_rows, Int<kHeadDim>{}),
+                  make_stride(Int<kHeadDim>{}, _1{}));
+  auto gK =
+      make_tensor(make_gmem_ptr(reinterpret_cast<CuteElement*>(K.data_ptr())),
+                  make_shape(total_kv_rows, Int<kHeadDim>{}),
+                  make_stride(Int<kHeadDim>{}, _1{}));
+  auto gV =
+      make_tensor(make_gmem_ptr(reinterpret_cast<CuteElement*>(V.data_ptr())),
+                  make_shape(total_kv_rows, Int<kHeadDim>{}),
+                  make_stride(Int<kHeadDim>{}, _1{}));
+
+  auto tma_q = make_tma_copy(SM90_TMA_LOAD{}, gQ, SmemLayoutQ{},
+                             Shape<Int<kBr>, Int<kQKDChunk>>{}, _1{});
+  auto tma_k = make_tma_copy(SM90_TMA_LOAD{}, gK, SmemLayoutK{},
+                             Shape<Int<kBc>, Int<kQKDChunk>>{}, _1{});
+  auto tma_v = make_tma_copy(SM90_TMA_LOAD{}, gV, SmemLayoutV{},
+                             Shape<Int<kBc>, Int<kVDChunk>>{}, _1{});
+
+  constexpr int kQTileBytes = kBr * kQKDChunk * sizeof(CuteElement);
+  constexpr int kKTileBytes = kBc * kQKDChunk * sizeof(CuteElement);
+  constexpr int kVTileBytes = kBc * kVDChunk * sizeof(CuteElement);
+  constexpr int kSmemBytes = kStagesQK * kQTileBytes + kStagesQK * kKTileBytes +
+                             kStagesPV * kVTileBytes;
+
+  auto kernel_func =
+      (ffpa_attn_split_d_fwd_cute_sm120<Traits, decltype(tma_q),
+                                        decltype(tma_k), decltype(tma_v),
+                                        kStagesQK, kStagesPV>);
+  cudaFuncSetAttribute(kernel_func, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                       kSmemBytes);
+  float* softmax_lse_ptr =
+      softmax_lse.numel() > 0 ? softmax_lse.data_ptr<float>() : nullptr;
+  kernel_func<<<grid, block, kSmemBytes, stream>>>(
+      tma_q, tma_k, tma_v, reinterpret_cast<CuteElement*>(O.data_ptr()),
+      softmax_lse_ptr, Nq, Nkv, Nh, Nh_kv, scale, Tc, causal, total_q_rows,
+      total_kv_rows);
+}
+#endif  // ENABLE_FFPA_CUTE_EXT
