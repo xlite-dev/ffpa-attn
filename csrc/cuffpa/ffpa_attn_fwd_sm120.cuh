@@ -51,7 +51,8 @@ template <typename kDataType, const int kHeadDim, const int kMmaAtomM,
           const int kMmaAccFloat32PV, const int kOStorageAccFloat32,
           const int kStageQK, const int kStagePV, const int kPadQ,
           const int kPadK, const int kPadV, const int kQKDChunk = kMmaAtomK,
-          const int kVDChunk = kMmaAtomN * 2, const int kShareSmemQKV = 0>
+          const int kVDChunk = kMmaAtomN * 2, const int kShareSmemQKV = 0,
+          const int kPersistQg2s = 0>
 __global__ void
 // minBlocksPerMultiprocessor=1: let the compiler use the full per-thread
 // register budget (65536/384 = 170 regs). Without this hint the compiler's
@@ -99,6 +100,10 @@ __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK + 128, 1)
   // requires the consumer's arrive after the last QK d_chunk ldmatrix).
   static_assert(!kShareSmemQKV || (kStageQK == kStagePV),
                 "kShareSmemQKV requires kStageQK == kStagePV");
+  static_assert(!(kPersistQg2s && kShareSmemQKV),
+                "kPersistQg2s and kShareSmemQKV are mutually exclusive");
+  static_assert(!kPersistQg2s || (kStageQK == kStagePV),
+                "kPersistQg2s requires kStageQK == kStagePV (KV share)");
 
 #ifdef ENABLE_FFPA_LAUNCH_GRID_DNHB
   const int Nb_id = blockIdx.z;
@@ -131,43 +136,58 @@ __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK + 128, 1)
   constexpr int Q_tile_size = Br * (kQKDChunk + kPadQ);
   constexpr int K_tile_size = Bc * (kQKDChunk + kPadK);
   constexpr int V_tile_size = Bc * (kVDChunk + kPadV);
+  // kPersistQg2s: Q persisted in dedicated region, K/V share staged region.
   // kShareSmemQKV: V reuses QK smem. Stage stride = max(QK combined, V).
-  // Q[stage] = base + stage * kStageStride
-  // K[stage] = base + Q_tile_size + stage * kStageStride
-  // V[stage] = base + stage * kStageStride (overlaps Q+K)
+  // Neither: Q/K/V fully independent staged regions.
+  constexpr int kKVStageStride =
+      kPersistQg2s ? (K_tile_size > V_tile_size ? K_tile_size : V_tile_size)
+                   : 0;
   constexpr int kStageStride = kShareSmemQKV
                                    ? ((Q_tile_size + K_tile_size) > V_tile_size
                                           ? (Q_tile_size + K_tile_size)
                                           : V_tile_size)
                                    : 0;
-  constexpr int kQSmemStride = kShareSmemQKV ? kStageStride : Q_tile_size;
-  constexpr int kKSmemStride = kShareSmemQKV ? kStageStride : K_tile_size;
-  constexpr int kVSmemStride = kShareSmemQKV ? kStageStride : V_tile_size;
+  constexpr int kQSmemStride =
+      kPersistQg2s ? Q_tile_size : (kShareSmemQKV ? kStageStride : Q_tile_size);
+  constexpr int kKSmemStride =
+      kPersistQg2s ? kKVStageStride
+                   : (kShareSmemQKV ? kStageStride : K_tile_size);
+  constexpr int kVSmemStride =
+      kPersistQg2s ? kKVStageStride
+                   : (kShareSmemQKV ? kStageStride : V_tile_size);
   kDataType* Q_tile_smem = smem;
-  kDataType* K_tile_smem = kShareSmemQKV
-                               ? (Q_tile_smem + Q_tile_size)
-                               : (Q_tile_smem + kStageQK * Q_tile_size);
-  kDataType* V_tile_smem =
-      kShareSmemQKV ? Q_tile_smem : (K_tile_smem + kStageQK * K_tile_size);
+  kDataType* K_tile_smem =
+      kPersistQg2s    ? (Q_tile_smem + kQKDChunks * Q_tile_size)
+      : kShareSmemQKV ? (Q_tile_smem + Q_tile_size)
+                      : (Q_tile_smem + kStageQK * Q_tile_size);
+  kDataType* V_tile_smem = kPersistQg2s ? K_tile_smem
+                           : kShareSmemQKV
+                               ? Q_tile_smem
+                               : (K_tile_smem + kStageQK * K_tile_size);
   const uint32_t smem_Q_base_ptr = __cvta_generic_to_shared(Q_tile_smem);
   const uint32_t smem_K_base_ptr = __cvta_generic_to_shared(K_tile_smem);
   const uint32_t smem_V_base_ptr = __cvta_generic_to_shared(V_tile_smem);
 
   // Barriers live at the end of dynamic smem (after Q/K/V tiles).
   constexpr int kQKVSmemElems =
-      kShareSmemQKV ? kStageQK * kStageStride
-                    : (kStageQK * Q_tile_size + kStageQK * K_tile_size +
-                       kStagePV * V_tile_size);
+      kPersistQg2s    ? (kQKDChunks * Q_tile_size + kStageQK * kKVStageStride)
+      : kShareSmemQKV ? kStageQK * kStageStride
+                      : (kStageQK * Q_tile_size + kStageQK * K_tile_size +
+                         kStagePV * V_tile_size);
   ffpa::tma::barrier_t* qk_full =
       reinterpret_cast<ffpa::tma::barrier_t*>(smem + kQKVSmemElems);
   ffpa::tma::barrier_t* qk_empty = qk_full + kStageQK;
   ffpa::tma::barrier_t* v_full = qk_empty + kStageQK;
   ffpa::tma::barrier_t* v_empty = v_full + kStagePV;
-  // kShareSmemQKV: dedicated phase-transition barriers.
+  // kShareSmemQKV / kPersistQg2s: dedicated phase-transition barriers.
   // qk_done: consumer signals after QK loop → producer waits before V writes.
   // v_done: consumer signals after V loop → producer waits before next QK.
   ffpa::tma::barrier_t* qk_done = v_empty + kStagePV;
-  ffpa::tma::barrier_t* v_done = qk_done + (kShareSmemQKV ? 1 : 0);
+  ffpa::tma::barrier_t* v_done =
+      qk_done + ((kShareSmemQKV || kPersistQg2s) ? 1 : 0);
+  // kPersistQg2s: q_ready barrier for initial Q load completion.
+  ffpa::tma::barrier_t* q_ready =
+      v_done + ((kShareSmemQKV || kPersistQg2s) ? 1 : 0);
 
   // Barrier init (thread 0 only): arrive_count=257 for all barriers
   // (256 consumer arrives + 1 producer arrive/arrive_expect_tx). Uses the
@@ -187,10 +207,12 @@ __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK + 128, 1)
       ffpa::tma::init_barrier(&v_full[s], kConsumerThreads + 1);
       ffpa::tma::init_barrier(&v_empty[s], kConsumerThreads + 1);
     }
-    if constexpr (kShareSmemQKV) {
-      // Phase-transition barriers: 256 consumer arrives + 1 producer wait.
+    if constexpr (kShareSmemQKV || kPersistQg2s) {
       ffpa::tma::init_barrier(qk_done, kConsumerThreads + 1);
       ffpa::tma::init_barrier(v_done, kConsumerThreads + 1);
+    }
+    if constexpr (kPersistQg2s) {
+      ffpa::tma::init_barrier(q_ready, kConsumerThreads + 1);
     }
     ffpa::tma::fence_async_shared();
   }
@@ -233,33 +255,45 @@ __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK + 128, 1)
     //     before the barrier signal, reducing pipeline overlap.
     // ======================================================================
     if (wg_tid == 0) {
+      // kPersistQg2s: one-time Q load into persistent region before kv loop.
+      if constexpr (kPersistQg2s) {
+        for (int d_chunk = 0; d_chunk < kQKDChunks; ++d_chunk) {
+          kDataType* q_dst = Q_tile_smem + d_chunk * Q_tile_size;
+          const int minor = d_chunk * kQKDChunk;
+          ffpa::tma::load_2d_no_arrive(q_dst, tma_q, minor, Q_major_base,
+                                       *q_ready);
+        }
+        ffpa::tma::arrive_expect_tx(*q_ready, kQKDChunks * kQTileBytes);
+      }
       for (int kv_tile = 0; kv_tile < Tc_eff; ++kv_tile) {
         const int kv_major = KV_major_base + kv_tile * Bc;
-        // kShareSmemQKV: wait for consumer to finish V phase of previous
-        // kv_tile before overwriting shared smem with new QK data.
-        if constexpr (kShareSmemQKV) {
+        // Transition: wait for consumer V phase before overwriting shared smem.
+        if constexpr (kShareSmemQKV || kPersistQg2s) {
           if (kv_tile > 0)
             ffpa::tma::wait_barrier(*v_done);
         }
-        // QK phase: combined Q+K per d_chunk into one qk_full stage.
+        // QK phase: load Q+K (or K-only if persist) per d_chunk.
         for (int d_chunk = 0; d_chunk < kQKDChunks; ++d_chunk) {
           ffpa::tma::wait_barrier(qk_empty[d_chunk % kStageQK]);
-          kDataType* q_dst = Q_tile_smem + (d_chunk % kStageQK) * kQSmemStride;
           kDataType* k_dst = K_tile_smem + (d_chunk % kStageQK) * kKSmemStride;
           const int minor = d_chunk * kQKDChunk;
-          ffpa::tma::load_2d_no_arrive(q_dst, tma_q, minor, Q_major_base,
-                                       qk_full[d_chunk % kStageQK]);
+          if constexpr (!kPersistQg2s) {
+            kDataType* q_dst =
+                Q_tile_smem + (d_chunk % kStageQK) * kQSmemStride;
+            ffpa::tma::load_2d_no_arrive(q_dst, tma_q, minor, Q_major_base,
+                                         qk_full[d_chunk % kStageQK]);
+          }
           ffpa::tma::load_2d_no_arrive(k_dst, tma_k, minor, kv_major,
                                        qk_full[d_chunk % kStageQK]);
-          ffpa::tma::arrive_expect_tx(qk_full[d_chunk % kStageQK],
-                                      kQTileBytes + kKTileBytes);
+          ffpa::tma::arrive_expect_tx(
+              qk_full[d_chunk % kStageQK],
+              kPersistQg2s ? kKTileBytes : (kQTileBytes + kKTileBytes));
         }
-        // kShareSmemQKV: wait for consumer to finish all QK ldmatrix before
-        // writing V into the shared smem region.
-        if constexpr (kShareSmemQKV) {
+        // Transition: wait for consumer QK ldmatrix before V overwrites.
+        if constexpr (kShareSmemQKV || kPersistQg2s) {
           ffpa::tma::wait_barrier(*qk_done);
         }
-        // V phase: one V tile per v_chunk (kVDChunk cols per TMA load).
+        // V phase: one V tile per v_chunk.
         for (int v_chunk = 0; v_chunk < kVDChunks; ++v_chunk) {
           ffpa::tma::wait_barrier(v_empty[v_chunk % kStagePV]);
           kDataType* v_dst = V_tile_smem + (v_chunk % kStagePV) * kVSmemStride;
@@ -302,6 +336,10 @@ __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK + 128, 1)
     for (int s = 0; s < kStagePV; ++s) {
       [[maybe_unused]] auto token = v_empty[s].arrive();
     }
+    // kPersistQg2s: wait for Q initial load to complete before entering loop.
+    if constexpr (kPersistQg2s) {
+      ffpa::tma::wait_barrier(*q_ready);
+    }
 
 #pragma unroll 1
     for (int tile_K_seqlen = 0; tile_K_seqlen < Tc_eff; ++tile_K_seqlen) {
@@ -323,10 +361,12 @@ __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK + 128, 1)
           const int sub_col = sub * kMmaAtomK;
           // Q s2r: kSmemColStride=kQKDChunk selects the wide-tile row stride +
           // swizzle width; subtile_col_offset picks the 16-col sub-block.
+          // kPersistQg2s: Q read from persistent region (stage=tile_K_d).
           ffpa::prefill::sync_fetch_qkv_frags_s2r<0, 4, kQSmemStride, kMmaAtomM,
                                                   kMmaAtomN, kMmaAtomK, kPadQ,
                                                   kDataType, kQKDChunk>(
-              smem_Q_base_ptr, &R_Q[0][0][0], warp_QP, 0, 0, stage, sub_col);
+              smem_Q_base_ptr, &R_Q[0][0][0], warp_QP, 0, 0,
+              kPersistQg2s ? tile_K_d : stage, sub_col);
           // K s2r
 #pragma unroll
           for (int j = 0; j < kValTileSeqLenK; ++j) {
@@ -360,9 +400,9 @@ __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK + 128, 1)
       // results live entirely in registers (R_S); softmax below uses only
       // warp shuffles, so no cross-warp smem ordering is needed.
 
-      // kShareSmemQKV: signal producer that all QK ldmatrix is done and the
-      // shared smem is safe to overwrite with V data.
-      if constexpr (kShareSmemQKV) {
+      // kShareSmemQKV / kPersistQg2s: signal producer that all QK ldmatrix is
+      // done and the shared smem is safe to overwrite with V data.
+      if constexpr (kShareSmemQKV || kPersistQg2s) {
         {
           [[maybe_unused]] auto token = qk_done->arrive();
         }
@@ -471,9 +511,9 @@ __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK + 128, 1)
             &lane_block_row_max_old[0][0], &lane_block_row_sum_old[0][0],
             &rescale_o_factor_0[0], &rescale_o_factor_1[0]);
       }
-      // kShareSmemQKV: signal producer that all V ldmatrix is done and the
-      // shared smem is safe to overwrite with next kv_tile's QK data.
-      if constexpr (kShareSmemQKV) {
+      // kShareSmemQKV / kPersistQg2s: signal producer that all V ldmatrix is
+      // done and the shared smem is safe to overwrite with next kv_tile's QK.
+      if constexpr (kShareSmemQKV || kPersistQg2s) {
         {
           [[maybe_unused]] auto token = v_done->arrive();
         }
