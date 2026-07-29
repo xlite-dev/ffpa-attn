@@ -9,7 +9,7 @@
     <img src="docs/assets/ffpa-api.png" width="700px">
 </div>
 
-**FFPA**: A production-ready Kernel Library with **Split-D** strategy for **Large Headdim Attention**, achieve **~O(1)** SRAM complexity and **O(d/2)** register complexity, **1.5~6x** 🎉 faster than SDPA. 📚👇The Core features:
+**FFPA**: A production-ready Kernel Library with **Split-D** strategy for **Large Headdim Attention**, achieve **O(1)** SRAM complexity and **O(d/2)** register complexity, **1.5~6x** 🎉 speedup over standard PyTorch SDPA.
 
 <div align='center' markdown="1">
 
@@ -22,10 +22,11 @@
 ## 🎉🎉 Latest News
 
 - [2026-06-10] DefTruth, Butterfingrz (2026). [FFPA: Efficient Flash Prefill Attention for Large Head Dimensions via Split-D.](https://doi.org/10.5281/zenodo.20638547) Zenodo, 2026. 🎉🎉🎉
-
+<!---
 <div align='center'>
   <img src="docs/assets/papers/attention-variants.png" width="600px">
 </div>
+-->
 
 ## 📖 Quick Start
 
