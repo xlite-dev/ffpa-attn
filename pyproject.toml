@@ -5,7 +5,7 @@ dynamic = ["version"]
 requires-python = ">=3.10"
 authors = [{name = "DefTruth, Butterfingrz"}]
 maintainers = [{name = "DefTruth, Butterfingrz"}]
-description = "FFPA: Yet another Faster Flash Prefill Attention for large headdim, 1.5~3x faster than SDPA."
+description = "🤖FFPA: Kernel Library for Large Headdim Attention."
 readme = "README.md"
 license = {text = "Apache-2.0"}
 

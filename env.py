@@ -14,7 +14,7 @@ _ARCH_ALIASES = {
   "ada": "89",
   "hopper": "90",
   "blackwell": "100",
-  "blackwell_geforce": "120",
+  "blackwell_geforce": "120a",  # sm_120a need for TMA instructions.
 }
 
 
@@ -48,7 +48,12 @@ class ENV(object):
     int(os.environ.get("ENABLE_FFPA_FORCE_QK_F16", 0))
   )
 
-  # Enable force P@V use fp16 as MMA Acc dtype, for FFPA Acc F32 kernels, default False.
+  # Enable TMA+MMA warp-specialised extension for sm_90+ (opt-in, default off).
+  # When enabled, the build compiles the SM120 TMA kernel and dispatches to it
+  # at runtime on TMA-capable devices. Requires CUDA Toolkit >= 13.0.
+  ENABLE_FFPA_TMA_EXT = bool(int(os.environ.get("ENABLE_FFPA_TMA_EXT", 0)))
+
+  # Enable force P@V use fp16 as MMA Acc dtype, for FFPA cc F32 kernels, default False.
   # FFPA Acc F32 kernels MMA Acc = Mixed Q@K^T MMA Acc F32 + P@V MMA Acc F16.
   ENABLE_FFPA_FORCE_PV_F16 = bool(
     int(os.environ.get("ENABLE_FFPA_FORCE_PV_F16", 0))
@@ -256,6 +261,10 @@ class ENV(object):
     return False
 
   @classmethod
+  def enable_tma_ext(cls):
+    return cls.ENABLE_FFPA_TMA_EXT
+
+  @classmethod
   def env_cuda_cflags(cls):
     extra_env_cflags = []
     if cls.enable_all_mutistages():
@@ -286,9 +295,11 @@ class ENV(object):
     if cls.enable_registers_pipe_kv():
       extra_env_cflags.append("-DENABLE_FFPA_REGISTERS_PIPE_KV")
     if cls.enable_launch_grid_dnhb():
-      extra_env_cflags.append("-DENBALE_FFPA_LAUNCH_GRID_DNHB")
+      extra_env_cflags.append("-DENABLE_FFPA_LAUNCH_GRID_DNHB")
     if cls.enable_cuda_impl():
       extra_env_cflags.append("-DENABLE_FFPA_CUDA_IMPL")
+    if cls.enable_tma_ext():
+      extra_env_cflags.append("-DENABLE_FFPA_TMA_EXT")
 
     assert not all((cls.enable_persist_q_s2r(), cls.enable_persist_q_g2s())
                    ), "PERSIST_Q_G2S and PERSIST_Q_S2R can not both enabled."
@@ -341,6 +352,7 @@ class ENV(object):
     formatenv("ENABLE_FFPA_REGISTERS_PIPE_KV", cls.enable_registers_pipe_kv())
     formatenv("ENABLE_FFPA_LAUNCH_GRID_DNHB", cls.enable_launch_grid_dnhb())
     formatenv("ENABLE_FFPA_CUDA_IMPL", cls.enable_cuda_impl())
+    formatenv("ENABLE_FFPA_TMA_EXT", cls.enable_tma_ext())
     pretty_print_line()
 
   @staticmethod
@@ -383,6 +395,8 @@ class ENV(object):
     if cls.enable_all_headdim():
       return list(range(32, 1025, 32))
     return list(range(256, 1025, 64))
+
+  # --- SM120 dispatch code generation ---
 
   @classmethod
   def generated_sources_dir(cls):
@@ -565,7 +579,6 @@ class ENV(object):
       "using namespace ffpa;",
       "",
     ]
-
     f16_prefix = [
       "  constexpr int kMmaAccFloat32QK = 0;",
       "  constexpr int kMmaAccFloat32PV = 0;",
@@ -640,6 +653,7 @@ class ENV(object):
       "    int64_t philox_offset,",
       "    int tma) {",
     ]
+
     stage_body = cls._render_stage_body(
       d, t_in, "kMmaAccFloat32QK", "kMmaAccFloat32PV"
     )
@@ -719,7 +733,9 @@ class ENV(object):
     if build_pkg:
       for gs in generated_sources:
         pretty_print_line(f"csrc_file: {gs}", sep="", mode="left")
-    build_sources = [csrc("cuffpa", "ffpa_attn_api.cc")] + generated_sources
+    build_sources = [
+      csrc("cuffpa", "ffpa_attn_api.cc"),
+    ] + generated_sources
     if build_pkg:
       pretty_print_line()
     return build_sources
@@ -750,6 +766,11 @@ class ENV(object):
       extra_cuda_cflags.append("-v")
     else:
       extra_cuda_cflags.append("--ptxas-options=-O3")
+    # NOTE: ptxas C7506 (setmaxnreg ignored on sm_120a) is an *info*-level
+    # message that only appears under --ptxas-options=-v (FFPA_PTXAS_VERBOSE).
+    # Normal builds are unaffected. ptxas --diag-suppress does not accept
+    # info-level codes (only warning/error diag numbers), so it cannot be
+    # suppressed via command-line flags. See sm120.cuh header for details.
 
     if ENV.FFPA_NVCC_THREADS > 1:
       extra_cuda_cflags.append(f"--threads={ENV.FFPA_NVCC_THREADS}")

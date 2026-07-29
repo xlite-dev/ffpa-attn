@@ -200,13 +200,22 @@ __device__ __forceinline__ void sync_fetch_qkv_frags_s2r(
       // mma_tile_id = warp_QP, kValTileSeqLenQ=1
       // warp_smem_Q_Br = warp_QP * (kMmaAtomM * kValTileSeqLenQ) + 0 *
       // kMmaAtomM
+      // Supports wide TMA tiles (d_chunk=16/32/64): kSmemColStride overrides
+      // the row stride + swizzle width (e.g. 64 for SWIZZLE_128B), and
+      // subtile_col_offset selects which 16-col sub-block to load. When
+      // kSmemColStride==0 (d_chunk=16), falls back to kMmaAtomK=16.
+      constexpr int kQRowStride =
+          (kSmemColStride > 0) ? kSmemColStride : kMmaAtomK;
+      constexpr int kQSwizzleW =
+          (kSmemColStride > 0) ? kSmemColStride : kMmaAtomK;
       const int warp_smem_Br = mma_tile_id * (kMmaAtomM);
       const int lane_smem_Br = warp_smem_Br + lane_id % 16;  // 0~15
-      const int lane_smem_d = (lane_id / 16) * 8;            // 0,8
+      const int lane_smem_d =
+          subtile_col_offset + (lane_id / 16) * 8;  // 0,8 (+ box subtile base)
       const uint32_t lane_smem_ptr =
           (smem_base_ptr +
-           (stage * kTileSize + lane_smem_Br * (kMmaAtomK + kPad) +
-            (kSwizzle ? swizzle::permuted<kMmaAtomK>(lane_smem_Br, lane_smem_d)
+           (stage * kTileSize + lane_smem_Br * (kQRowStride + kPad) +
+            (kSwizzle ? swizzle::permuted<kQSwizzleW>(lane_smem_Br, lane_smem_d)
                       : lane_smem_d)) *
                sizeof(kDataType));
       mma::ldmatrix_m8n8x4(&R[0], &R[1], &R[2], &R[3], lane_smem_ptr);

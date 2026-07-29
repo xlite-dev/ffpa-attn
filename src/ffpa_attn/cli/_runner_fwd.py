@@ -250,7 +250,12 @@ def _make_forward_backend(
   cuda_stages: int | None = None,
 ):
   if name == "cuda":
-    kwargs = {"forward": True, "acc": acc}
+    kwargs = {
+      "forward": True,
+      "acc": acc,
+      "enable_tma": enable_tma,
+      "enable_ws": enable_ws
+    }
     if cuda_stages is not None:
       kwargs["stages"] = cuda_stages
     return CUDABackend(**kwargs)

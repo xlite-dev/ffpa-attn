@@ -160,10 +160,16 @@ class CUDABackend(Backend):
   :ivar acc: MMA accumulator precision (``"f16"`` or ``"f32"``).
   :ivar stages: Pipeline stages for the CUDA kernel (3 on Ampere/Ada,
       4 on Hopper+).
+  :ivar enable_tma: Enable SM120a TMA + MMA warp-specialised kernel when the
+      device is sm_120a (Blackwell). Ignored on other architectures.
+  :ivar enable_ws: Accepted for API compatibility with the Triton backend;
+      the CUDA sm120 path is always warp-specialised when ``enable_tma`` is on.
   """
   name: str = "cuda"
   acc: str = "f32"
   stages: int = 4 if _is_hopper_or_later() else 3
+  enable_tma: bool = False
+  enable_ws: bool = False
 
   def __post_init__(self) -> None:
     super().__post_init__()
@@ -794,7 +800,7 @@ class _FFPAAttnFunc(torch.autograd.Function):
         meta.attn_meta.dropout_p,
         int(rng_state[0].item()) if rng_state.numel() else 0,
         int(rng_state[1].item()) if rng_state.numel() else 0,
-        0,
+        int(forward_meta.enable_tma),
       )
     elif isinstance(meta.forward_meta, TritonBackend):
       forward_meta = meta.forward_meta

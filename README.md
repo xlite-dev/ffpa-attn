@@ -1,6 +1,6 @@
 <div align="center">
   <p align="center">
-    <h2>🤖FFPA: Yet another Faster Flash Prefill Attention <br>with O(1)⚡️GPU SRAM complexity for large headdim🐑</h2>
+    <h2>🤖FFPA: Kernel Library for Large Headdim Attention</h2>
     <img src=https://img.shields.io/badge/language-CUDA/Python-brightgreen.svg >
     <a href="https://pepy.tech/projects/ffpa-attn"><img src=https://static.pepy.tech/personalized-badge/ffpa-attn?period=total&units=ABBREVIATION&left_color=GRAY&right_color=BLUE&left_text=downloads/pypi ></a>
     <a href="https://pypi.org/project/ffpa-attn/"><img src=https://img.shields.io/github/release/xlite-dev/ffpa-attn.svg?color=GREEN ></a>
@@ -9,23 +9,19 @@
     <img src="docs/assets/ffpa-api.png" width="700px">
 </div>
 
-**FFPA(Split-D)**: Yet another **Faster Flash Prefill Attention** with **Split-D** strategy, achieve **O(1) SRAM complexity** and **O(d/4) register complexity** for large headdim (**> 256**), **1.5~3x** 🎉 faster than SDPA. 📚👇The Core features:
+**FFPA**: A production-ready Kernel Library with **Split-D** strategy for **Large Headdim Attention**, achieve **O(1)** SRAM complexity and **O(d/2)** register complexity, **1.5~6x** 🎉 speedup over standard PyTorch SDPA.
 
 <div align='center' markdown="1">
 
 |[Self Attn](./bench)| [GQA/MQA](./bench) |[Cross Attn](./bench)|[Causal/Mask](./bench)|[Dropout](./bench)|[Headdim](#ffpa-design)|[Fwd/Bwd](./bench)|
 |:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-|✔️(`Nq=Nkv`)|✔️(`Hq!=Hkv`)|✔️(`Nq!=Nkv`)|✔️(`attn_mask`)|✔️(`p>0`)|**320~1024** |**1.5~3x↑** |
+|✔️(`Nq=Nkv`)|✔️(`Hq!=Hkv`)|✔️(`Nq!=Nkv`)|✔️(`attn_mask`)|✔️(`p>0`)|**320~1024** |**1.5~6x↑** |
 
 </div>
 
-## 🎉🎉 Latest News
+## 🎉 Latest News
 
-- [2026-06-10] DefTruth, Butterfingrz (2026). [FFPA: Efficient Flash Prefill Attention for Large Head Dimensions via Split-D.](https://doi.org/10.5281/zenodo.20638547) Zenodo, 2026. 🎉🎉🎉
-
-<div align='center'>
-  <img src="docs/assets/papers/attention-variants.png" width="600px">
-</div>
+- [2026-06-10] DefTruth, Butterfingrz (2026), [FFPA: Kernel Library for Large Headdim Attention](https://doi.org/10.5281/zenodo.20638547). 🎉🎉🎉
 
 ## 📖 Quick Start
 
@@ -60,21 +56,21 @@ For more advanced features, please refer to our online docs at 📘[ffpa-attn.io
 
 <a id="ffpa-design"></a>
 
-We extend FlashAttention to support large headdim ($D>256$) via **fine-grained tiling** at the **MMA** level for $QK^\top$ and $PV$ matrix multiplication, referred to as **Split-D**. This design keeps SRAM usage fixed at $B_r \times 16$ (with $B_r=B_c$) for Q, K and V, yielding constant SRAM complexity $O(B_r \times 16) \approx O(1)$ and register complexity $O(d/4)$.
+We extend FlashAttention to support large headdim ($D>256$) via **fine-grained tiling** at the **MMA** level for $QK^\top$ and $PV$ matrix multiplication, referred to as **Split-D**. This design keeps SRAM usage fixed at $B_r \times 16$ (with $B_r=B_c$) for Q, K and V, yielding constant SRAM complexity $O(B_r \times 16) \approx O(1)$ and register complexity $O(d/2)$.
 
 <div align='center'>
   <img src="./docs/assets/split-d.png" width="700px">
   </p><i>
-    <b>FFPA</b> enables headdim <b> > 256</b>, and outperforms standard SDPA by <b>1.5~3x</b>🎉.
+    <b>FFPA</b> enables headdim <b> > 256</b>, and outperforms standard SDPA by <b>1.5~6x</b>🎉.
   </i></p>
 </div>
 
 > [!NOTE]
-> FFPA has been tested on `Ampere`, `Ada`, `Hopper`, and `Blackwell` architectures (e.g., A30, L20, 4090, H200, 5090), achieves `1.5~3×↑🎉` speedup over SDPA. FFPA is mainly design for **prefill** and large headdim, and may not be faster than SDPA for 😈 small sequence length (`N<512`) or small headdim (`D<=256`).
+> FFPA has been tested on `Ampere`, `Ada`, `Hopper`, and `Blackwell` architectures (e.g., A30, L20, 4090, H200, 5090), achieves `1.5~6×↑🎉` speedup over SDPA. FFPA is mainly design for **prefill** and large headdim, and may not be faster than SDPA for 😈 small sequence length (`N<512`) or small headdim (`D<=256`).
 
 ## 🎉 Benchmark
 
-Runnable benchmark are provided under [`bench`](./bench). The performance benchmarks for the NVIDIA L20 (**Ada**), NVIDIA Geforce RTX 5090 (**Blackwell**), NVIDIA H800 PCIE (**Hopper**), NVIDIA H200 SXM (**Hopper**, **CuTeDSL** backend, up to **513** TFLOPS!🎉) with large headdims can be found at [`bench`](./bench).
+Runnable benchmark are provided under [`bench`](./bench). The performance benchmarks for the NVIDIA L20 (**Ada**), NVIDIA Geforce RTX 5090 (**Blackwell**), NVIDIA H800 PCIE (**Hopper**), NVIDIA H200 SXM (**Hopper**, **CuTeDSL** backend, up to **513-535** TFLOPS!🎉) with large headdims can be found at [`bench`](./bench).
 
 <div align='center'>
   <img src='./docs/assets/perf/ffpa_speedup_nvidia-h800-pcie_B1_H32_N8192_D320_T.png' width='400px'>
@@ -85,7 +81,7 @@ Runnable benchmark are provided under [`bench`](./bench). The performance benchm
 
 ## 🤖 Backends
 
-FFPA supports multiple backends for the forward and backward pass, including: [`SDPA`](./bench/) (baseline), [`CUDA`](./bench/) (forward only), [`Triton`](./bench/), and [`CuTeDSL`](./bench/). The `CuTeDSL` backend is currently in early stage and has some constraints, but it can achieve up to `513🎉` TFLOPS on H200! Stay tuned for future updates.
+FFPA supports multiple backends for the forward and backward pass, including: [`SDPA`](./bench/) (baseline), [`CUDA`](./bench/) (forward only), [`Triton`](./bench/), and [`CuTeDSL`](./bench/). The `CuTeDSL` backend is currently in early stage and has some constraints, but it can achieve up to `513~535🎉` TFLOPS on H200! Stay tuned for future updates.
 
 <div align='center' markdown="1">
 
@@ -96,8 +92,6 @@ FFPA supports multiple backends for the forward and backward pass, including: [`
 |Triton|sm>=80|✔|✔|320~1024|✔|**1.5x~5x**🎉|sm>=80|
 |CuTeDSL|sm>=80|✔|✔|320~1024|❌|**1.5x~2x**🎉|sm80~89,120|
 |CuTeDSL|sm90|✔|✔|320~512|❌|**3x~6x**🎉|sm90|
-
-<i>Special thanks to [Butterfingrz](https://github.com/Butterfingrz) for contributing to the CuTeDSL backend! Awesome work!🎉</i>
 
 </div>
 
@@ -124,7 +118,7 @@ python -m ffpa_attn.autotune --mode max --full-tasks --num-gpus 8 --overwrite
 
 ## End-to-End (E2E) Training
 
-NVIDIA-NeMo Automodel PR [#2436](https://github.com/NVIDIA-NeMo/Automodel/pull/2436) shows that on Gemma4-31B training (L=8192, 8xH200, FSDP2 + Activation Checkpointing), accelerating the **10/60** `D=512` full-attention layers with ffpa-attn delivers about [`1.4x-1.5x🎉`](https://github.com/NVIDIA-NeMo/Automodel/pull/2436) higher throughput (**E2E**) than SDPA at similar memory footprint, with loss aligned within normal bf16 noise.
+NVIDIA-NeMo Automodel PR [#2436](https://github.com/NVIDIA-NeMo/Automodel/pull/2436) shows that on Gemma4-31B training (L=8192, 8xH200, FSDP2 + Activation Checkpointing), accelerating the **10/60** `D=512` full-attention layers with ffpa-attn delivers about [`1.2x-1.5x🎉`](https://github.com/NVIDIA-NeMo/Automodel/pull/2436) higher throughput (**E2E**) than SDPA at similar memory footprint, with loss aligned within normal bf16 noise.
 
 <div align='center'>
   <img src="./docs/assets/e2e/gemma4-31b-8k.png" width="800px">
@@ -141,7 +135,7 @@ Apache License 2.0
 ```BibTeX
 @misc{deftruth2026ffpa,
   author       = {DefTruth and Butterfingrz},
-  title        = {FFPA: Efficient Flash Prefill Attention for Large Head Dimensions via Split-D},
+  title        = {FFPA: Kernel Library for Large Headdim Attention},
   year         = {2026},
   publisher    = {Zenodo},
   version      = {v1.0},
