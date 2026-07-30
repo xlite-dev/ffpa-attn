@@ -256,6 +256,28 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
     row_sum[r] = 0.0f;
   }
 
+  // Persistent O accumulators across the whole KV-tile loop -- the root
+  // cause of register pressure and the hardest part of large-D FA.
+  // PV reduces over Bc (P[Br,Bc] @ V[Bc,D]); split-D tiles the D axis into
+  // kDChunksV disjoint [Bc,kVDChunk] slices, so each v_chunk's O slice must
+  // stay live across ALL kv_tiles for online partial rescaling (tCrO *=
+  // row_scale each kv_tile, see PV loop): FA2's O_i = diag(e^{m_{i-1}-m_i})
+  // O_{i-1} + P_i V_i. Equivalent to R_D in the sm80 large-d kernel (sm80
+  // splits a transient R_O from the persistent R_D; here gemm_rs writes the
+  // MMA-C operand directly into o_acc_storage, no transient acc).
+  // Unlike SMEM -- which large-D FA keeps O(1) by tiling D into chunks --
+  // this register footprint is O(D/kVDChunk) per-thread and is a structural
+  // cost of single-pass online softmax: rescale needs all kDChunksV slices
+  // resident every kv_tile, so none can be streamed out early. Only raising
+  // kVDChunk (fewer slices, SMEM/MMA limited) or a two-pass algorithm
+  // (finalize m before PV -> no rescale -> serial v_chunk, but QK redone
+  // kDChunksVx) can lower it.
+  // Register budget: kOElemsPerFrag = kBr*kVDChunk/kNumThreads = 128*64/256 =
+  // 32 fp32/thread, so o_acc_storage = kDChunksV*32 = (D/kVDChunk)*32 regs.
+  // D=512/kVDChunk=64 -> 256 regs, saturating the 255-reg/thread ceiling (the
+  // rest of the kernel -- QK acc, P, V frags, softmax state -- spills to
+  // local mem); D>512 -> o_acc_storage alone >256, heavy spill. This is the
+  // hard ceiling on head-D for single-pass split-D FA.
   float o_acc_storage[kDChunksV][kOElemsPerFrag];
 #pragma unroll
   for (int v = 0; v < kDChunksV; ++v)
