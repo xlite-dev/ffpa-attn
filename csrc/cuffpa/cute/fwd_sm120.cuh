@@ -320,6 +320,8 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
       // Signal stage consumed; tid=0 prefetches next chunk if available.
       CtaBarrier::arrive(&qk_empty[stage]);
 
+      // TODO: May be we can move this prefetch to the very beginning of the
+      // loop to overlap with the current chunk's GEMM.
       if (tid == 0) {
         const int d_next = d_chunk + kStagesQK;
         if (d_next < kDChunksQK) {
@@ -476,6 +478,8 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
         // Signal stage consumed; tid=0 prefetches next chunk if available.
         CtaBarrier::arrive(&v_empty[v_stage]);
 
+        // TODO: May be we can move this prefetch to the very beginning of the
+        // loop to overlap with the current chunk's GEMM.
         if (tid == 0) {
           const int v_next = v_chunk + kStagesPV;
           if (v_next < kDChunksV) {
