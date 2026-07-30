@@ -382,14 +382,19 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
         }
       }
 
-      // Additive attention bias (applied to raw scores before softmax).
+      // Additive attention bias (pre-softmax, separate pass).
+      // NOTE: attn_bias/dropout on CuTe kernel is ~3x slower than the non-WS
+      // TMA (../fwd_sm120.cuh) template kernel due to 1 block/SM occupancy (8
+      // warps cannot hide scalar gmem load / Philox RNG latency). The launcher
+      // should prefer the non-WS TMA fallback when bias/dropout is active;
+      // these constexpr paths exist for correctness and future optimization
+      // (e.g. vectorized bias load via TMA).
       if constexpr (kHasAttnBias) {
         ffpa_cute::apply_attn_bias_rowcol<decltype(scores), decltype(tScS_rc),
                                           kSRows, kSCols>(
-            scores, tScS_rc, attn_bias, attn_bias_dtype,
-            (int)attn_bias_stride_b, (int)attn_bias_stride_h,
-            (int)attn_bias_stride_m, (int)attn_bias_stride_n, Nb_id, Nh_id,
-            Br_base, kv_tile, kBc, inv_scale);
+            scores, tScS_rc, attn_bias, attn_bias_dtype, attn_bias_stride_b,
+            attn_bias_stride_h, attn_bias_stride_m, attn_bias_stride_n, Nb_id,
+            Nh_id, Br_base, kv_tile, kBc, inv_scale);
       }
 
       // Row-max + exp2 + row-sum (warp-level reduction via shfl_xor).
@@ -417,8 +422,7 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
         row_max[row] = next_max;
       }
 
-      // Dropout on P (post-softmax, pre-PV). SDPA semantics: mask/scale P
-      // without modifying row_sum (normalization happens in epilogue).
+      // Dropout on P (post-softmax, pre-PV, separate pass).
       if constexpr (kHasDropout) {
         ffpa_cute::apply_dropout_rowcol<decltype(scores), decltype(tScS_rc),
                                         kORows, kSCols>(

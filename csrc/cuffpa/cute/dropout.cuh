@@ -6,7 +6,7 @@ namespace ffpa_cute {
 
 // Dropout on P (post-softmax, pre-PV). SDPA semantics: mask/scale P
 // without modifying row_sum (normalization happens in epilogue).
-// Register-optimized: int offsets, paired Philox (2 cols per RNG call).
+// Partial unroll + paired Philox to reduce icache/register pressure.
 template <typename ScoresTensor, typename CoordTensor, int kRows, int kCols>
 __device__ __forceinline__ void apply_dropout_rowcol(
     ScoresTensor& scores, const CoordTensor& tScS_rc, float dropout_p,
@@ -15,16 +15,15 @@ __device__ __forceinline__ void apply_dropout_rowcol(
   const float keep_scale = 1.0f / (1.0f - dropout_p);
   const int head_base = (Nb_id * Nh + Nh_id) * Nq;
   const int bc_base = kv_tile * kBc;
-#pragma unroll
+#pragma unroll 1
   for (int row = 0; row < kRows; ++row) {
     const int q_row = Br_base + cute::get<0>(tScS_rc(row, 0));
     const int row_off = (head_base + q_row) * Nkv;
-#pragma unroll
+#pragma unroll 1
     for (int col = 0; col < kCols; col += 2) {
       const int k0 = bc_base + cute::get<1>(tScS_rc(row, col));
       const unsigned long long off0 =
           philox_offset + (unsigned long long)(row_off + k0);
-      // k1 = k0+1 (consecutive within MMA N-atom), same quad unless off0%4==3
       const uint4 rng = ffpa::prefill::philox4x32_10(philox_seed, off0 >> 2);
       const unsigned lane0 = (unsigned)(off0 & 3);
       const float u0 = ffpa::prefill::uniform_from_philox_uint(
