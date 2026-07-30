@@ -955,12 +955,9 @@ void launch_ffpa_attn_split_d_fwd_cute(torch::Tensor Q, torch::Tensor K,
 
   constexpr int kBr = 128;
   constexpr int kBc = 128;
-  // smem per stage = kQKDChunk*128*2 + kQKDChunk*128*2 + kVDChunk*128*2 bytes
-  // kQKDChunk=32,kVDChunk=64: 32KB/stage → max 3 stages (96KB < 99KB)
-  // kQKDChunk=16,kVDChunk=32: 16KB/stage → max 4 stages (64KB < 99KB)
-  constexpr int kSmemPerStageKB =
-      (kQKDChunk * kBr + kQKDChunk * kBc + kVDChunk * kBc) * 2 / 1024;
-  constexpr int kMaxStages = (kSmemPerStageKB <= 24) ? 4 : 3;
+  // kVDChunk=32: stages=2 optimal (lower reg pressure, validated 141T@D=512)
+  // kVDChunk=64: stages=3 optimal (96KB smem limit on sm_120a)
+  constexpr int kMaxStages = (kVDChunk <= 32) ? 2 : 3;
   constexpr int kStagesQK = (kStage > kMaxStages ? kMaxStages : kStage);
   constexpr int kStagesPV = kStagesQK;
   constexpr int kNumThreads = kBr / 16 * 32;

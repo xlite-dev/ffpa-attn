@@ -8,6 +8,13 @@
 namespace ffpa_cute {
 using namespace cute;
 
+// convert_layout_acc_rowcol: reshape an MMA C-fragment (MMA=4, MMA_M, MMA_N)
+// into ((2, MMA_M), (2, MMA_N)) = (nrow, ncol) so online softmax can scan a
+// row. m16n8k16 scatters one logical row across 4 lanes in MMA modes 0/1;
+// logical_divide(_, _2) regroups so all columns of a row land in one thread,
+// enabling 4-lane __shfl_xor<1>/<2> row max/sum. NOT a general property --
+// tied to the m16n8k16 fragment convention (attn_traits.cuh MmaAtom).
+// Ref: flash-attention/csrc/flash_attn/src/utils.h:188, softmax.h:139.
 template <typename Layout>
 CUTE_DEVICE auto convert_layout_acc_rowcol(Layout acc_layout) {
   auto divided = logical_divide(acc_layout, Shape<_2>{});
@@ -15,6 +22,13 @@ CUTE_DEVICE auto convert_layout_acc_rowcol(Layout acc_layout) {
                      make_layout(get<0, 0>(divided), get<2>(divided)));
 }
 
+// convert_layout_acc_Aregs: reshape an MMA C-fragment into A-operand register
+// layout (MMA', MMA_M, MMA_N/2). QK and PV share one TiledMma, but C's 4 regs
+// pack as (2 row, 2 col) while A needs (2 row, 2 K-slice); the 2-col pair is
+// repacked into the K direction by logical_divide(_, _, _2). This lets
+// softmax-P feed PV's MMA-A directly without writing back to smem -- the FA
+// "register reuse" trick. Depends on m16n8k16 fragment convention, NOT general.
+// Ref: flash-attention/csrc/flash_attn/src/utils.h:200, fwd_kernel.h:365.
 template <typename TiledMma, typename Layout>
 CUTE_DEVICE auto convert_layout_acc_Aregs(Layout acc_layout) {
   using X = Underscore;
@@ -23,6 +37,11 @@ CUTE_DEVICE auto convert_layout_acc_Aregs(Layout acc_layout) {
                      get<1>(divided), get<2, 1>(divided));
 }
 
+// convert_type: in-register dtype conversion via NumericArrayConverter.
+// Returns a tensor over the SAME memory (make_rmem_ptr<To>), zero copy.
+// Needed because the MMA accumulator is f32 (for softmax exp/sum precision) but
+// PV's A-operand and the final O store require f16.
+// Ref: flash-attention/csrc/flash_attn/src/epilogue/epilogue.hpp.
 template <typename To, typename Engine, typename Layout>
 CUTE_DEVICE auto convert_type(Tensor<Engine, Layout> const& tensor) {
   using From = typename Engine::value_type;
@@ -33,6 +52,13 @@ CUTE_DEVICE auto convert_type(Tensor<Engine, Layout> const& tensor) {
   return make_tensor(make_rmem_ptr<To>(&fragment), tensor.layout());
 }
 
+// gemm_ss: Shared-Shared GEMM -- A (Q) and B (K) are both ldmatrix'd from smem.
+// Software pipeline: retile_D aligns the reg fragment to the TiledCopy source
+// view so copy() writes the regs the next MMA consumes; preload tile_k=0, then
+// each iter loads tile_k+1 overlapping the current gemm() to hide S->R latency.
+// Used by the QK step (S = Q @ K^T).
+// Ref: flash-attention/csrc/flash_attn/src/utils.h:166,
+// FlashMLA/sm90/helpers.h:97.
 template <typename TensorC, typename TensorA, typename TensorB,
           typename TensorSA, typename TensorSB, typename TiledMma,
           typename TiledCopyA, typename TiledCopyB, typename ThreadCopyA,
@@ -58,6 +84,11 @@ CUTE_DEVICE void gemm_ss(TensorC& acc, TensorA& fragment_a, TensorB& fragment_b,
   }
 }
 
+// gemm_rs: Register-Shared GEMM -- A (P) is already in regs after softmax, only
+// B (V) is ldmatrix'd from smem. Symmetric pipeline but only B is preloaded;
+// this is the payoff of convert_layout_acc_Aregs: softmax-P never touches smem
+// again. Used by the PV step (O = P @ V). Ref:
+// flash-attention/csrc/flash_attn/src/utils.h:166, fwd_kernel.h:367.
 template <typename TensorC, typename TensorA, typename TensorB,
           typename TensorSB, typename TiledMma, typename TiledCopyB,
           typename ThreadCopyB>
@@ -76,7 +107,9 @@ CUTE_DEVICE void gemm_rs(TensorC& acc, TensorA& fragment_a, TensorB& fragment_b,
   }
 }
 
-// No-prefetch variants: load→MMA serial per tile_k, lower register pressure.
+// No-prefetch variants: load->MMA serial per tile_k, lower register pressure
+// (no live next-tile regs). Trade-off: no S->R / MMA overlap, slower per tile;
+// pick these when RF is tight (large head_dim / many d-chunks). See gemm_ss.
 template <typename TensorC, typename TensorA, typename TensorB,
           typename TensorSA, typename TensorSB, typename TiledMma,
           typename TiledCopyA, typename TiledCopyB, typename ThreadCopyA,
@@ -97,6 +130,8 @@ CUTE_DEVICE void gemm_ss_nobuf(TensorC& acc, TensorA& fragment_a,
   }
 }
 
+// gemm_rs_nobuf: serial load->MMA, A (P) in regs, only B (V) preloaded per
+// tile_k. Same RF/throughput trade-off as gemm_ss_nobuf. See gemm_rs.
 template <typename TensorC, typename TensorA, typename TensorB,
           typename TensorSB, typename TiledMma, typename TiledCopyB,
           typename ThreadCopyB>

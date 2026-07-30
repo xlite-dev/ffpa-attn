@@ -253,19 +253,26 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
     int qk_write = (kStagesQK > 1) ? (kStagesQK - 1) : 0;
 
     for (int d_chunk = 0; d_chunk < kDChunksQK; ++d_chunk) {
-      // Issue prefetch (non-blocking, overlaps with gemm below).
       const int d_next = d_chunk + kStagesQK - 1;
-      if (d_next < kDChunksQK) {
-        g2s_load_q(d_next, qk_write);
-        g2s_load_k(kv_tile, d_next, qk_write);
-        cp_async_fence();
-        qk_write = (qk_write + 1) % kStagesQK;
-      }
 
-      // kStagesQK==1: prefetch and gemm share the same stage, must wait first.
       if constexpr (kStagesQK == 1) {
+        // stages=1: prefetch and gemm share the same stage.
+        // Sync before prefetch to ensure previous gemm's smem reads are done.
+        if (d_chunk > 0)
+          __syncthreads();
+        g2s_load_q(d_chunk, 0);
+        g2s_load_k(kv_tile, d_chunk, 0);
+        cp_async_fence();
         cp_async_wait<0>();
         __syncthreads();
+      } else {
+        // stages>=2: issue prefetch (non-blocking, overlaps with gemm below).
+        if (d_next < kDChunksQK) {
+          g2s_load_q(d_next, qk_write);
+          g2s_load_k(kv_tile, d_next, qk_write);
+          cp_async_fence();
+          qk_write = (qk_write + 1) % kStagesQK;
+        }
       }
 
       // Compute on current stage (overlaps with prefetch DMA for stages>=2).
@@ -282,7 +289,7 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
                          s2r_copy_k, s2r_thr_q, s2r_thr_k);
       qk_read = (qk_read + 1) % kStagesQK;
 
-      // kStagesQK>=2: post-wait ensures next iteration's data is ready.
+      // stages>=2: post-wait ensures next iteration's data is ready.
       if constexpr (kStagesQK > 1) {
         if (d_chunk < kDChunksQK - 1) {
           if (d_next < kDChunksQK) {
@@ -397,19 +404,24 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
       int v_write_pv = (kStagesPV > 1) ? (kStagesPV - 1) : 0;
 
       for (int v_chunk = 0; v_chunk < kDChunksV; ++v_chunk) {
-        // Issue prefetch (non-blocking, overlaps with gemm below).
         const int v_next = v_chunk + kStagesPV - 1;
-        if (v_next < kDChunksV) {
-          g2s_load_v(kv_tile, v_next, v_write_pv);
-          cp_async_fence();
-          v_write_pv = (v_write_pv + 1) % kStagesPV;
-        }
 
-        // kStagesPV==1: prefetch and gemm share the same stage, must wait
-        // first.
         if constexpr (kStagesPV == 1) {
+          // stages=1: prefetch and gemm share the same stage.
+          // Sync before prefetch to ensure previous gemm's smem reads are done.
+          if (v_chunk > 0)
+            __syncthreads();
+          g2s_load_v(kv_tile, v_chunk, 0);
+          cp_async_fence();
           cp_async_wait<0>();
           __syncthreads();
+        } else {
+          // stages>=2: issue prefetch (non-blocking, overlaps with gemm below).
+          if (v_next < kDChunksV) {
+            g2s_load_v(kv_tile, v_next, v_write_pv);
+            cp_async_fence();
+            v_write_pv = (v_write_pv + 1) % kStagesPV;
+          }
         }
 
         // O rescaling.
@@ -437,7 +449,7 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
                            s2r_thr_v);
         v_read = (v_read + 1) % kStagesPV;
 
-        // kStagesPV>=2: post-wait ensures next iteration's data is ready.
+        // stages>=2: post-wait ensures next iteration's data is ready.
         if constexpr (kStagesPV > 1) {
           if (v_chunk < kDChunksV - 1) {
             if (v_next < kDChunksV) {

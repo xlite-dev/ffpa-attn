@@ -48,10 +48,16 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
   // consumed. Phase tracking: chunk_index = kv_tile*kDChunks + d_chunk,
   // phase = (chunk_index / kStages) & 1.
   //
-  // Layout transforms:
-  //   convert_layout_acc_rowcol: MMA C-fragment → [rows, cols] for softmax.
+  // Layout transforms (all defined in gemm.cuh; see those headers for the
+  // m16n8k16-fragment rationale and upstream references):
+  //   convert_layout_acc_rowcol: MMA C-fragment → [rows, cols] for softmax
+  //     row-max/exp/sum (each row's columns land in one thread so __shfl_xor
+  //     reduces across the 4 lanes sharing a row).
   //   convert_layout_acc_Aregs:  MMA C-fragment → A-operand regs for PV
-  //     (reuses P registers as MMA-A without data movement).
+  //     (reuses P registers as MMA-A without writing back to smem).
+  //   convert_type:              f32 acc → f16 P/O in-register, zero copy.
+  //   gemm_ss / gemm_rs:         software-pipelined ldmatrix + mma.sync
+  //     (gemm_rs only preloads B=V since A=P is already in regs).
   //   SmemLayoutVt: transposed V layout for gemm_rs B-operand (LDSM_T).
   // Why NOT WS? Please check ../fwd_sm120.cuh for more details.
 
@@ -116,8 +122,19 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
   __shared__ uint64_t v_full[kStagesPV];
   __shared__ uint64_t v_empty[kStagesPV];
 
-  // Barrier init: qk_full/v_full are TmaBarriers (tid=0 arrive_expect_tx),
-  // qk_empty/v_empty are CtaBarriers (all threads arrive after consume).
+  // Barrier roles:
+  //   *_full  (TmaBarrier, init=1):   producer→consumer. The `1` is the single
+  //     TMA-issuing thread (tid=0) that arrives via arrive_and_expect_tx(bytes)
+  //     once its TMA writes land; consumers block on wait(*_full, phase).
+  //   *_empty (CtaBarrier, init=kNumThreads): consumer→producer. The
+  //     kNumThreads arrivals = every consumer thread has finished reading the
+  //     stage; the next producer TMA blocks on wait(*_empty, phase) so it can
+  //     safely overwrite that stage's smem.
+  //   wait(bar, phase): phase is a 1-bit flip counter for ping-pong reuse of
+  //     the SAME stage slot across passes; producer and consumer must pass
+  //     matching phases so a stale arrival from pass N-1 cannot release
+  //     pass N early. phase = (chunk_index / kStages) & 1 flips every kStages
+  //     chunks (0,0,...,0 | 1,1,...,1 | 0,...).
   if (tid == 0) {
     for (int s = 0; s < kStagesQK; ++s) {
       TmaBarrier::init(&qk_full[s], 1);
@@ -138,6 +155,10 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
   // kv_tile_idx), not a head-folded global tile index. Out-of-range rows on
   // the last tile are zero-padded by the TMA descriptor (K tail is masked to
   // -inf in softmax; Q/O tail rows are dropped by the store predicate).
+  // domain_offset(coord, layout) returns (same_layout, layout(coord)) -- i.e.
+  // the SAME tensor layout with its origin pointer advanced by coord, so the
+  // TMA row coordinate equals head*N + tile*kBr without re-wrapping the TMA
+  // tensor descriptor. local_tile below then uses per-head local tile ids.
   auto mQ = domain_offset(
       make_coord(q_row_offset, 0),
       tma_q.get_tma_tensor(make_shape(total_q_rows, Int<kHeadDim>{})));
@@ -169,11 +190,24 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
 
   // V fragment layout: precompute the register layout for PV B-operand
   // so we can reinterpret raw LDSM_T data without extra copies.
+  // sVt0_ns uses get_nonswizzle_portion ONLY to derive which register slots
+  // each thread holds (partition_fragment_B's thread↔data map); the register
+  // layout is swizzle-independent. V's smem bank conflicts are handled by the
+  // TMA write (SmemLayoutV has swizzle) + the ldmatrix read (partition_S on
+  // the swizzled sVt inside the PV loop applies swizzle). Doing
+  // partition_fragment_B on the swizzled sVt0 would conflict the LDSM_T
+  // thread mapping with the swizzle composition.
+  // Ref: flash-attention/csrc/flash_attn/src/kernel_traits.h
+  //      SmemLayoutVtransposedNoSwizzle (same trick).
   auto sV0 = make_tensor(make_smem_ptr(v_base), SmemLayoutV{});
   auto sVt0_ns =
       make_tensor(sV0.data(), get_nonswizzle_portion(SmemLayoutVt{}));
   auto tCrV_layout = thr_mma_pv.partition_fragment_B(sVt0_ns).layout();
 
+  // OFragType/OFragLayout are compile-time aliases over partition_fragment_C
+  // used ONLY to size the o_acc_storage scratch (kOElemsPerFrag) and to derive
+  // kORows/kOCols for the rowcol reshape; the runtime O fragment is rebuilt
+  // fresh each iteration from o_acc_storage[v_chunk] (see the PV loop).
   using OFragType = decltype(partition_fragment_C(
       tiled_mma_pv, Shape<Int<kBr>, Int<kVDChunk>>{}));
   using OFragLayout = typename OFragType::layout_type;
@@ -265,6 +299,11 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
   // Initial V prefetch for kv_tile 0: issue first kStagesPV V chunks so the
   // V TMA overlaps the entire first QK GEMM + softmax window (V is independent
   // of QK, so it can be launched before the QK loop).
+  // v_stage = chunk_index % kStagesPV (the smem slot), v_phase flips 0→1→0
+  //   every kStagesPV chunks PER slot so a slot's pass N arrival can't be
+  //   mistaken for its pass N-1 arrival. Example kStagesPV=2, kDChunksV=2:
+  //   chunk 0→slot0 phase0, 1→slot1 phase0, 2→slot0 phase1, 3→slot1 phase1,
+  //   4→slot0 phase0, ... (phase flips 0,0,1,1,0,0 across chunk_index).
   if (tid == 0) {
     for (int v = 0; v < kStagesPV && v < kDChunksV; ++v) {
       const int chunk_index = v;  // kv_tile == 0
@@ -299,6 +338,8 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
 #pragma unroll
     for (int d_chunk = 0; d_chunk < kDChunksQK; ++d_chunk) {
       // Wait for TMA data, fence, then gemm_ss (smem→regs→MMA).
+      // TmaBarrier::wait(qk_full[stage], phase): consumers block until tid=0's
+      // arrive_and_expect_tx for this stage's Q+K TMA lands.
       const int chunk_index = kv_tile * kDChunksQK + d_chunk;
       const int stage = chunk_index % kStagesQK;
       const int phase = (chunk_index / kStagesQK) & 1;
@@ -318,6 +359,9 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
                          s2r_copy_k, s2r_thr_q, s2r_thr_k);
 
       // Signal stage consumed; tid=0 prefetches next chunk if available.
+      // CtaBarrier::arrive(qk_empty[stage]): each consumer thread arrives once
+      // it has finished reading stage's smem; once all kNumThreads arrive, the
+      // producer's wait(qk_empty[stage], phase_next) unblocks to overwrite it.
       CtaBarrier::arrive(&qk_empty[stage]);
 
       // Cannot move this prefetch before gemm_ss: s_next == stage and
