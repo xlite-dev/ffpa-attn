@@ -76,4 +76,40 @@ CUTE_DEVICE void gemm_rs(TensorC& acc, TensorA& fragment_a, TensorB& fragment_b,
   }
 }
 
+// No-prefetch variants: load→MMA serial per tile_k, lower register pressure.
+template <typename TensorC, typename TensorA, typename TensorB,
+          typename TensorSA, typename TensorSB, typename TiledMma,
+          typename TiledCopyA, typename TiledCopyB, typename ThreadCopyA,
+          typename ThreadCopyB>
+CUTE_DEVICE void gemm_ss_nobuf(TensorC& acc, TensorA& fragment_a,
+                               TensorB& fragment_b, TensorSA const& shared_a,
+                               TensorSB const& shared_b, TiledMma tiled_mma,
+                               TiledCopyA tiled_copy_a, TiledCopyB tiled_copy_b,
+                               ThreadCopyA thread_copy_a,
+                               ThreadCopyB thread_copy_b) {
+  auto copy_view_a = thread_copy_a.retile_D(fragment_a);
+  auto copy_view_b = thread_copy_b.retile_D(fragment_b);
+#pragma unroll
+  for (int tile_k = 0; tile_k < size<2>(fragment_a); ++tile_k) {
+    copy(tiled_copy_a, shared_a(_, _, tile_k), copy_view_a(_, _, tile_k));
+    copy(tiled_copy_b, shared_b(_, _, tile_k), copy_view_b(_, _, tile_k));
+    gemm(tiled_mma, fragment_a(_, _, tile_k), fragment_b(_, _, tile_k), acc);
+  }
+}
+
+template <typename TensorC, typename TensorA, typename TensorB,
+          typename TensorSB, typename TiledMma, typename TiledCopyB,
+          typename ThreadCopyB>
+CUTE_DEVICE void gemm_rs_nobuf(TensorC& acc, TensorA& fragment_a,
+                               TensorB& fragment_b, TensorSB const& shared_b,
+                               TiledMma tiled_mma, TiledCopyB tiled_copy_b,
+                               ThreadCopyB thread_copy_b) {
+  auto copy_view_b = thread_copy_b.retile_D(fragment_b);
+#pragma unroll
+  for (int tile_k = 0; tile_k < size<2>(fragment_a); ++tile_k) {
+    copy(tiled_copy_b, shared_b(_, _, tile_k), copy_view_b(_, _, tile_k));
+    gemm(tiled_mma, fragment_a(_, _, tile_k), fragment_b(_, _, tile_k), acc);
+  }
+}
+
 }  // namespace ffpa_cute

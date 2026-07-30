@@ -577,12 +577,12 @@ void launch_ffpa_attn_fwd_template(torch::Tensor Q, torch::Tensor K,
 #ifdef ENABLE_FFPA_CUTE_EXT
   // CuTe cp.async path: sm_80+ without TMA (tma=0 or sm<90).
   if constexpr (kHeadDim % 64 == 0) {
-    launch_ffpa_attn_split_d_fwd_cute<kDataType, kHeadDim, kStage, 16, 64>(
+    launch_ffpa_attn_split_d_fwd_cute<kDataType, kHeadDim, kStage, 32, 64>(
         Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale, dropout_p,
         philox_seed, philox_offset);
     return;
   } else if constexpr (kHeadDim % 32 == 0) {
-    launch_ffpa_attn_split_d_fwd_cute<kDataType, kHeadDim, kStage, 16, 32>(
+    launch_ffpa_attn_split_d_fwd_cute<kDataType, kHeadDim, kStage, 32, 32>(
         Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale, dropout_p,
         philox_seed, philox_offset);
     return;
