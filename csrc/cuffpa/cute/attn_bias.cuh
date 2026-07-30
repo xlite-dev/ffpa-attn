@@ -14,11 +14,11 @@ __device__ __forceinline__ void apply_attn_bias_rowcol(
     int kv_tile, int kBc, float inv_scale) {
   const int bias_base = Nb_id * stride_b + Nh_id * stride_h;
   const int bc_base = kv_tile * kBc;
-#pragma unroll 1
+#pragma unroll
   for (int row = 0; row < kRows; ++row) {
     const int q_row = Br_base + cute::get<0>(tScS_rc(row, 0));
     const int row_off = bias_base + q_row * stride_m;
-#pragma unroll 1
+#pragma unroll
     for (int col = 0; col < kCols; ++col) {
       const int k_col = bc_base + cute::get<1>(tScS_rc(row, col));
       scores(row, col) += ffpa::prefill::load_attn_bias_value(

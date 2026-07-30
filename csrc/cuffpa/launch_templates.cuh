@@ -499,16 +499,41 @@ void launch_ffpa_attn_fwd_template(torch::Tensor Q, torch::Tensor K,
         // sm_120a (99 KB smem): non-WS path.
 #ifdef ENABLE_FFPA_CUTE_EXT
         // CuTe kernel: kHeadDim%64==0 → kVDChunk=64; %32==0 → kVDChunk=32.
+        // NOTE: CuTe kernel's bias/dropout paths are functional but ~2x slower
+        // than the non-WS TMA template kernel due to register pressure from
+        // the 128x128 rowcol tensor abstraction (64 score regs simultaneously
+        // live + addressing temps → spills). Prefer the non-WS TMA fallback
+        // when bias/dropout is active; CuTe handles the clean path only.
         if constexpr (kHeadDim % 64 == 0) {
-          launch_ffpa_attn_split_d_fwd_cute_sm120<kDataType, kHeadDim, kStage,
-                                                  32, 64>(
-              Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
-              dropout_p, philox_seed, philox_offset);
+          if (!has_attn_bias && !has_dropout) {
+            launch_ffpa_attn_split_d_fwd_cute_sm120<kDataType, kHeadDim, kStage,
+                                                    32, 64>(
+                Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
+                dropout_p, philox_seed, philox_offset);
+          } else {
+            launch_ffpa_attn_fwd_template_sm120<
+                kDataType, kHeadDim, kMmaAccFloat32QK, kMmaAccFloat32PV,
+                (kStage > 3 ? 3 : kStage), 32 /*kQKDChunk*/, 64 /*kVDChunk*/,
+                0 /*kShareSmemQKV*/, 0 /*kPersistQg2s*/, 8 /*kMmaTileSeqLenQ*/,
+                16 /*kValTileSeqLenK*/, 128 /*kProducerThreads*/, 1 /*kNonWS*/>(
+                Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
+                dropout_p, philox_seed, philox_offset);
+          }
         } else if constexpr (kHeadDim % 32 == 0) {
-          launch_ffpa_attn_split_d_fwd_cute_sm120<kDataType, kHeadDim, kStage,
-                                                  32, 32>(
-              Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
-              dropout_p, philox_seed, philox_offset);
+          if (!has_attn_bias && !has_dropout) {
+            launch_ffpa_attn_split_d_fwd_cute_sm120<kDataType, kHeadDim, kStage,
+                                                    32, 32>(
+                Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
+                dropout_p, philox_seed, philox_offset);
+          } else {
+            launch_ffpa_attn_fwd_template_sm120<
+                kDataType, kHeadDim, kMmaAccFloat32QK, kMmaAccFloat32PV,
+                (kStage > 3 ? 3 : kStage), 32 /*kQKDChunk*/, 64 /*kVDChunk*/,
+                0 /*kShareSmemQKV*/, 0 /*kPersistQg2s*/, 8 /*kMmaTileSeqLenQ*/,
+                16 /*kValTileSeqLenK*/, 128 /*kProducerThreads*/, 1 /*kNonWS*/>(
+                Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
+                dropout_p, philox_seed, philox_offset);
+          }
         } else {
           launch_ffpa_attn_fwd_template_sm120<
               kDataType, kHeadDim, kMmaAccFloat32QK, kMmaAccFloat32PV,
