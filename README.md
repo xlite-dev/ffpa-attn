@@ -9,13 +9,13 @@
     <img src="docs/assets/ffpa-api.png" width="700px">
 </div>
 
-**FFPA**: A production-ready Kernel Library with **Split-D** strategy for **Large Headdim Attention**, achieve **O(1)** SRAM complexity and **O(d/2)** register complexity, **1.5~6x** 🎉 speedup over standard PyTorch SDPA.
+**FFPA**: A production-ready Kernel Library with **Split-D** strategy for **Large Headdim Attention**, achieve **O(1)** SRAM complexity and **O(d/2)** register complexity, **1.5x~6x** 🎉 speedup over standard PyTorch SDPA.
 
 <div align='center' markdown="1">
 
 |[Self Attn](./bench)| [GQA/MQA](./bench) |[Cross Attn](./bench)|[Causal/Mask](./bench)|[Dropout](./bench)|[Headdim](#ffpa-design)|[Fwd/Bwd](./bench)|
 |:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-|✔️(`Nq=Nkv`)|✔️(`Hq!=Hkv`)|✔️(`Nq!=Nkv`)|✔️(`attn_mask`)|✔️(`p>0`)|**320~1024** |**1.5~6x↑** |
+|✔️(`Nq=Nkv`)|✔️(`Hq!=Hkv`)|✔️(`Nq!=Nkv`)|✔️(`attn_mask`)|✔️(`p>0`)|**320~1024** |**1.5x~6x↑** |
 
 </div>
 
@@ -61,12 +61,12 @@ We extend FlashAttention to support large headdim ($D>256$) via **fine-grained t
 <div align='center'>
   <img src="./docs/assets/split-d.png" width="700px">
   </p><i>
-    <b>FFPA</b> enables headdim <b> > 256</b>, and outperforms standard SDPA by <b>1.5~6x</b>🎉.
+    <b>FFPA</b> enables headdim <b> > 256</b>, and outperforms standard SDPA by <b>1.5x~6x</b>🎉.
   </i></p>
 </div>
 
 > [!NOTE]
-> FFPA has been tested on `Ampere`, `Ada`, `Hopper`, and `Blackwell` architectures (e.g., A30, L20, 4090, H200, 5090), achieves `1.5~6×↑🎉` speedup over SDPA. FFPA is mainly design for **prefill** and large headdim, and may not be faster than SDPA for 😈 small sequence length (`N<512`) or small headdim (`D<=256`).
+> FFPA has been tested on `Ampere`, `Ada`, `Hopper`, and `Blackwell` architectures (e.g., A30, L20, 4090, H200, 5090), achieves `1.5x~6x↑🎉` speedup over SDPA. FFPA is mainly design for **prefill** and large headdim, and may not be faster than SDPA for 😈 small sequence length (`N<512`) or small headdim (`D<=256`).
 
 ## 🎉 Benchmark
 
@@ -116,7 +116,7 @@ python -m ffpa_attn.autotune --mode max --full-tasks --num-gpus 8 --overwrite
 
 ## End-to-End (E2E) Training
 
-NVIDIA-NeMo Automodel PR [#2436](https://github.com/NVIDIA-NeMo/Automodel/pull/2436) shows that on Gemma4-31B training (L=8192, 8xH200, FSDP2 + Activation Checkpointing), accelerating the **10/60** `D=512` full-attention layers with ffpa-attn delivers about [`1.2x-1.5x🎉`](https://github.com/NVIDIA-NeMo/Automodel/pull/2436) higher throughput (**E2E**) than SDPA at similar memory footprint, with loss aligned within normal bf16 noise.
+NVIDIA-NeMo Automodel PR [#2436](https://github.com/NVIDIA-NeMo/Automodel/pull/2436) shows that on Gemma4-31B training (L=8192, 8xH200, FSDP2 + Activation Checkpointing), accelerating the **10/60** `D=512` full-attention layers with ffpa-attn delivers about [`1.4x-1.5x🎉`](https://github.com/NVIDIA-NeMo/Automodel/pull/2436) higher throughput (**E2E**) than SDPA at similar memory footprint, with loss aligned within normal bf16 noise.
 
 <div align='center'>
   <img src="./docs/assets/e2e/gemma4-31b-8k.png" width="800px">
