@@ -838,8 +838,9 @@ void launch_ffpa_attn_split_d_fwd_cute_sm120(
 
   using CuteElement = std::conditional_t<std::is_same_v<kDataType, __half>,
                                          cutlass::half_t, cutlass::bfloat16_t>;
-  using Traits = ffpa_cute::FFPAAttnCuTeTraits<kHeadDim, kBr, kBc, kQKDChunk,
-                                               kVDChunk, CuteElement>;
+  using Traits =
+      ffpa_cute::FFPAAttnCuTeTraits<kHeadDim, kBr, kBc, kQKDChunk, kVDChunk,
+                                    kStagesQK, kStagesPV, CuteElement>;
   using SmemLayoutQ = typename Traits::SmemLayoutQ;
   using SmemLayoutK = typename Traits::SmemLayoutK;
   using SmemLayoutV = typename Traits::SmemLayoutV;
@@ -967,20 +968,16 @@ void launch_ffpa_attn_split_d_fwd_cute_sm120(
   using TmaO = decltype(tma_o);
   if (has_attn_bias && has_dropout) {
     launch_variant(
-        ffpa_attn_split_d_fwd_cute_sm120<Traits, TmaQ, TmaK, TmaV, TmaO,
-                                         kStagesQK, kStagesPV, 1, 1>);
+        ffpa_attn_split_d_fwd_cute_sm120<Traits, TmaQ, TmaK, TmaV, TmaO, 1, 1>);
   } else if (has_attn_bias) {
     launch_variant(
-        ffpa_attn_split_d_fwd_cute_sm120<Traits, TmaQ, TmaK, TmaV, TmaO,
-                                         kStagesQK, kStagesPV, 1, 0>);
+        ffpa_attn_split_d_fwd_cute_sm120<Traits, TmaQ, TmaK, TmaV, TmaO, 1, 0>);
   } else if (has_dropout) {
     launch_variant(
-        ffpa_attn_split_d_fwd_cute_sm120<Traits, TmaQ, TmaK, TmaV, TmaO,
-                                         kStagesQK, kStagesPV, 0, 1>);
+        ffpa_attn_split_d_fwd_cute_sm120<Traits, TmaQ, TmaK, TmaV, TmaO, 0, 1>);
   } else {
     launch_variant(
-        ffpa_attn_split_d_fwd_cute_sm120<Traits, TmaQ, TmaK, TmaV, TmaO,
-                                         kStagesQK, kStagesPV, 0, 0>);
+        ffpa_attn_split_d_fwd_cute_sm120<Traits, TmaQ, TmaK, TmaV, TmaO, 0, 0>);
   }
 }
 #endif  // ENABLE_FFPA_TMA_EXT
@@ -1002,15 +999,16 @@ void launch_ffpa_attn_split_d_fwd_cute(torch::Tensor Q, torch::Tensor K,
 
   using CuteElement = std::conditional_t<std::is_same_v<kDataType, __half>,
                                          cutlass::half_t, cutlass::bfloat16_t>;
-  using Traits = ffpa_cute::FFPAAttnCuTeTraits<kHeadDim, kBr, kBc, kQKDChunk,
-                                               kVDChunk, CuteElement>;
+  constexpr int kStagesQK = kStage;
+  constexpr int kStagesPV = kStagesQK;
+  using Traits =
+      ffpa_cute::FFPAAttnCuTeTraits<kHeadDim, kBr, kBc, kQKDChunk, kVDChunk,
+                                    kStagesQK, kStagesPV, CuteElement>;
 
   constexpr int kQTileBytes = kBr * kQKDChunk * sizeof(CuteElement);
   constexpr int kKTileBytes = kBc * kQKDChunk * sizeof(CuteElement);
   constexpr int kVTileBytes = kBc * kVDChunk * sizeof(CuteElement);
   constexpr int kSmemPerStage = kQTileBytes + kKTileBytes + kVTileBytes;
-  constexpr int kStagesQK = kStage;
-  constexpr int kStagesPV = kStagesQK;
   constexpr int kSmemBytes = kStagesQK * kSmemPerStage;
 
   int max_smem_optin = 0;

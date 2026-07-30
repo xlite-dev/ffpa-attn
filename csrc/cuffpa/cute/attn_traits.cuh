@@ -9,6 +9,20 @@
 namespace ffpa_cute {
 using namespace cute;
 
+// Largest v_chunks-per-batch for the TMA-O epilogue: pick the smallest
+// n_batches (divisor of kDChunksV) such that [kBr, kHeadDim/n_batches] fits in
+// kSmemElems.
+constexpr int compute_vchunks_per_batch(int kDChunksV, int kHeadDim, int kBr,
+                                        int kSmemElems) {
+  for (int n = 1; n <= kDChunksV; ++n) {
+    if (kDChunksV % n != 0)
+      continue;
+    if (kBr * (kHeadDim / n) <= kSmemElems)
+      return kDChunksV / n;
+  }
+  return 1;
+}
+
 template <int kChunk, typename Element>
 struct SelectSmemAtom {
   using type = GMMA::Layout_K_SW128_Atom<Element>;
@@ -25,7 +39,8 @@ struct SelectSmemAtom<16, Element> {
 };
 
 template <int kHeadDim_, int kBr_ = 64, int kBc_ = 64, int kQKDChunk_ = 64,
-          int kVDChunk_ = 64, typename Element_ = cutlass::half_t>
+          int kVDChunk_ = 64, int kStagesQK_ = 2, int kStagesPV_ = 2,
+          typename Element_ = cutlass::half_t>
 struct FFPAAttnCuTeTraits {
   static_assert(kHeadDim_ % kQKDChunk_ == 0);
   static_assert(kHeadDim_ % kVDChunk_ == 0);
@@ -41,6 +56,14 @@ struct FFPAAttnCuTeTraits {
   static constexpr int kDChunksV = kHeadDim / kVDChunk;
   static constexpr int kNumWarps = kBr / 16;
   static constexpr int kNumThreads = kNumWarps * 32;
+  static constexpr int kStagesQK = kStagesQK_;
+  static constexpr int kStagesPV = kStagesPV_;
+  static constexpr int kSmemElems = kStagesQK * kBr * kQKDChunk +
+                                    kStagesQK * kBc * kQKDChunk +
+                                    kStagesPV * kBc * kVDChunk;
+  static constexpr int kVChunksPerBatch =
+      compute_vchunks_per_batch(kDChunksV, kHeadDim, kBr, kSmemElems);
+  static constexpr int kNBatches = kDChunksV / kVChunksPerBatch;
 
   using Element = Element_;
   using SmemAtomQK = typename SelectSmemAtom<kQKDChunk, Element>::type;
