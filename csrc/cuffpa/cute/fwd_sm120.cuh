@@ -9,21 +9,28 @@
 
 // exp2f log-domain constants (FFPA_M_LOG2E / FFPA_M_LN2) live in common.cuh.
 #include "common.cuh"
+#include "attn_bias.cuh"
+#include "dropout.cuh"
 
 using TmaBarrier = cutlass::arch::ClusterTransactionBarrier;
 using CtaBarrier = cutlass::arch::ClusterBarrier;
 
 template <typename Traits, typename TmaQ, typename TmaK, typename TmaV,
-          int kStagesQK = 2, int kStagesPV = 2>
+          int kStagesQK = 2, int kStagesPV = 2, int kHasAttnBias = 0,
+          int kHasDropout = 0>
 __global__ void __launch_bounds__(Traits::kNumThreads, 1)
-    ffpa_attn_split_d_fwd_cute_sm120(CUTLASS_GRID_CONSTANT TmaQ const tma_q,
-                                     CUTLASS_GRID_CONSTANT TmaK const tma_k,
-                                     CUTLASS_GRID_CONSTANT TmaV const tma_v,
-                                     typename Traits::Element* __restrict__ O,
-                                     float* __restrict__ softmax_lse, int Nq,
-                                     int Nkv, int Nh, int Nh_kv, float scale,
-                                     int Tc, int causal, int total_q_rows,
-                                     int total_kv_rows) {
+    ffpa_attn_split_d_fwd_cute_sm120(
+        CUTLASS_GRID_CONSTANT TmaQ const tma_q,
+        CUTLASS_GRID_CONSTANT TmaK const tma_k,
+        CUTLASS_GRID_CONSTANT TmaV const tma_v,
+        typename Traits::Element* __restrict__ O,
+        float* __restrict__ softmax_lse, int Nq, int Nkv, int Nh, int Nh_kv,
+        float scale, int Tc, int causal, int total_q_rows, int total_kv_rows,
+        const void* __restrict__ attn_bias = nullptr, int attn_bias_dtype = 0,
+        long long attn_bias_stride_b = 0, long long attn_bias_stride_h = 0,
+        long long attn_bias_stride_m = 0, long long attn_bias_stride_n = 0,
+        float dropout_p = 0.0f, unsigned long long philox_seed = 0,
+        unsigned long long philox_offset = 0) {
   // Split-D Flash Attention forward (non-WS, CuTe TMA).
   //
   // Algorithm per KV tile:
@@ -189,6 +196,7 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
   // (1/sqrt(D)); convert it once here so exp2f(scores*scale - max) is correct.
   // (This was the accuracy bug: without log2(e) the P and row_scale were
   // 2^(...) instead of e^(...), compounding across kv_tiles.)
+  const float inv_scale = 1.0f / scale;
   scale *= FFPA_M_LOG2E;
 
   float row_max[kORows];
@@ -373,6 +381,15 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
         }
       }
 
+      // Additive attention bias (applied to raw scores before softmax).
+      if constexpr (kHasAttnBias) {
+        ffpa_cute::apply_attn_bias_rowcol<decltype(scores), decltype(tScS_rc),
+                                          kSRows, kSCols>(
+            scores, tScS_rc, attn_bias, attn_bias_dtype, attn_bias_stride_b,
+            attn_bias_stride_h, attn_bias_stride_m, attn_bias_stride_n, Nb_id,
+            Nh_id, Br_base, kv_tile, kBc, inv_scale);
+      }
+
       // Row-max + exp2 + row-sum (warp-level reduction via shfl_xor).
       // row_scale = exp2(old_max - new_max) for O rescaling.
 #pragma unroll
@@ -396,6 +413,15 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
         tile_sum += __shfl_xor_sync(0xffffffff, tile_sum, 2);
         row_sum[row] = row_sum[row] * row_scale[row] + tile_sum;
         row_max[row] = next_max;
+      }
+
+      // Dropout on P (post-softmax, pre-PV). SDPA semantics: mask/scale P
+      // without modifying row_sum (normalization happens in epilogue).
+      if constexpr (kHasDropout) {
+        ffpa_cute::apply_dropout_rowcol<decltype(scores), decltype(tScS_rc),
+                                        kORows, kSCols>(
+            scores, tScS_rc, dropout_p, philox_seed, philox_offset, Nb_id, Nh,
+            Nh_id, Nq, Nkv, Br_base, kv_tile, kBc);
       }
 
       // P fragment: convert fp32 scores → Element, then reinterpret

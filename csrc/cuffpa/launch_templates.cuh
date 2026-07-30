@@ -2,13 +2,13 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 
-#include "ffpa_attn_fwd.cuh"
-#include "ffpa_attn_fwd_split_kv.cuh"
+#include "fwd_sm80.cuh"
+#include "split_kv.cuh"
 #ifdef ENABLE_FFPA_TMA_EXT
-#include "ffpa_attn_fwd_sm120.cuh"
+#include "fwd_sm120.cuh"
 #include "tma.cuh"
 #ifdef ENABLE_FFPA_CUTE_EXT
-#include "cute/ffpa_attn_fwd_sm120.cuh"
+#include "cute/fwd_sm120.cuh"
 #endif
 #endif
 using namespace ffpa;
@@ -255,11 +255,13 @@ void launch_ffpa_attn_fwd_template_sm120(torch::Tensor Q, torch::Tensor K,
 #endif  // ENABLE_FFPA_TMA_EXT
 
 #ifdef ENABLE_FFPA_CUTE_EXT
-template <typename kDataType, const int kHeadDim, const int kStage>
-void launch_ffpa_attn_split_d_fwd_cute_sm120(torch::Tensor Q, torch::Tensor K,
-                                             torch::Tensor V, torch::Tensor O,
-                                             torch::Tensor softmax_lse,
-                                             int causal, double softmax_scale);
+template <typename kDataType, const int kHeadDim, const int kStage,
+          const int kQKDChunk = 32, const int kVDChunk = 64>
+void launch_ffpa_attn_split_d_fwd_cute_sm120(
+    torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O,
+    torch::Tensor attn_bias, torch::Tensor softmax_lse, int causal,
+    double softmax_scale, double dropout_p, int64_t philox_seed,
+    int64_t philox_offset);
 #endif  // ENABLE_FFPA_CUTE_EXT
 
 // Runtime arguments:
@@ -459,7 +461,7 @@ void launch_ffpa_attn_fwd_template(torch::Tensor Q, torch::Tensor K,
   // SM120 TMA path: when ``tma`` is set and the device is TMA-capable
   // (sm_90+), delegate to the TMA launcher. Falls back to the legacy
   // cp.async path on older hardware. NOTE: NO WGMMA on sm_120a.
-  // See ffpa_attn_fwd_sm120.cuh header for register pressure analysis
+  // See fwd_sm120.cuh header for register pressure analysis
   // and why sm_120a uses non-WS mode (kNonWS=1).
   //
   // TMA path dispatch:
@@ -494,11 +496,17 @@ void launch_ffpa_attn_fwd_template(torch::Tensor Q, torch::Tensor K,
       } else {
         // sm_120a (99 KB smem): non-WS path.
 #ifdef ENABLE_FFPA_CUTE_EXT
-        // CuTe kernel does not support attn_bias or dropout; fall back to
-        // the non-WS TMA kernel which handles both via runtime arguments.
-        if (!has_attn_bias && !has_dropout) {
-          launch_ffpa_attn_split_d_fwd_cute_sm120<kDataType, kHeadDim, kStage>(
-              Q, K, V, O, softmax_lse, causal, softmax_scale);
+        // CuTe kernel: kHeadDim%64==0 → kVDChunk=64; %32==0 → kVDChunk=32.
+        if constexpr (kHeadDim % 64 == 0) {
+          launch_ffpa_attn_split_d_fwd_cute_sm120<kDataType, kHeadDim, kStage,
+                                                  32, 64>(
+              Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
+              dropout_p, philox_seed, philox_offset);
+        } else if constexpr (kHeadDim % 32 == 0) {
+          launch_ffpa_attn_split_d_fwd_cute_sm120<kDataType, kHeadDim, kStage,
+                                                  32, 32>(
+              Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
+              dropout_p, philox_seed, philox_offset);
         } else {
           launch_ffpa_attn_fwd_template_sm120<
               kDataType, kHeadDim, kMmaAccFloat32QK, kMmaAccFloat32PV,
@@ -719,17 +727,17 @@ void launch_ffpa_attn_fwd_template_sm120(torch::Tensor Q, torch::Tensor K,
 #endif  // ENABLE_FFPA_TMA_EXT
 
 #ifdef ENABLE_FFPA_CUTE_EXT
-template <typename kDataType, const int kHeadDim, const int kStage>
-void launch_ffpa_attn_split_d_fwd_cute_sm120(torch::Tensor Q, torch::Tensor K,
-                                             torch::Tensor V, torch::Tensor O,
-                                             torch::Tensor softmax_lse,
-                                             int causal, double softmax_scale) {
+template <typename kDataType, const int kHeadDim, const int kStage,
+          const int kQKDChunk, const int kVDChunk>
+void launch_ffpa_attn_split_d_fwd_cute_sm120(
+    torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O,
+    torch::Tensor attn_bias, torch::Tensor softmax_lse, int causal,
+    double softmax_scale, double dropout_p, int64_t philox_seed,
+    int64_t philox_offset) {
   using namespace cute;
 
   constexpr int kBr = 128;
   constexpr int kBc = 128;
-  constexpr int kQKDChunk = 32;
-  constexpr int kVDChunk = 64;
   constexpr int kStagesQK = (kStage > 3 ? 3 : kStage);
   constexpr int kStagesPV = kStagesQK;
   constexpr int kNumThreads = kBr / 16 * 32;
@@ -749,6 +757,53 @@ void launch_ffpa_attn_split_d_fwd_cute_sm120(torch::Tensor Q, torch::Tensor K,
   const int Nkv = K.size(2);
   const int Tc = utils::div_ceil(Nkv, kBc);
   const float scale = static_cast<float>(softmax_scale);
+
+  const bool has_attn_bias = attn_bias.numel() != 0;
+  const bool has_dropout = dropout_p > 0.0;
+
+  const void* attn_bias_ptr = nullptr;
+  int attn_bias_dtype = 0;
+  long long attn_bias_stride_b = 0;
+  long long attn_bias_stride_h = 0;
+  long long attn_bias_stride_m = 0;
+  long long attn_bias_stride_n = 0;
+  if (has_attn_bias) {
+    TORCH_CHECK(attn_bias.is_cuda(),
+                "ffpa_attn: attn_mask must be a CUDA tensor");
+    TORCH_CHECK(attn_bias.device() == Q.device(),
+                "ffpa_attn: attn_mask must be on the same device as Q/K/V");
+    TORCH_CHECK(
+        attn_bias.dim() == 4,
+        "ffpa_attn: normalized attn_mask must be 4-D [B, Nh_q, Nq, Nkv]");
+    TORCH_CHECK(attn_bias.size(0) == 1 || attn_bias.size(0) == Nb,
+                "ffpa_attn: attn_mask batch dimension must be 1 or B");
+    TORCH_CHECK(attn_bias.size(1) == 1 || attn_bias.size(1) == Nh,
+                "ffpa_attn: attn_mask head dimension must be 1 or Nh_q");
+    TORCH_CHECK(attn_bias.size(2) == 1 || attn_bias.size(2) == Nq,
+                "ffpa_attn: attn_mask query dimension must be 1 or Nq");
+    TORCH_CHECK(attn_bias.size(3) == 1 || attn_bias.size(3) == Nkv,
+                "ffpa_attn: attn_mask kv dimension must be 1 or Nkv");
+    attn_bias_ptr = attn_bias.data_ptr();
+    if (attn_bias.scalar_type() == at::ScalarType::Half)
+      attn_bias_dtype = 1;
+    else if (attn_bias.scalar_type() == at::ScalarType::BFloat16)
+      attn_bias_dtype = 2;
+    else
+      attn_bias_dtype = 3;
+    attn_bias_stride_b =
+        (attn_bias.size(0) == 1 && Nb > 1) ? 0 : attn_bias.stride(0);
+    attn_bias_stride_h =
+        (attn_bias.size(1) == 1 && Nh > 1) ? 0 : attn_bias.stride(1);
+    attn_bias_stride_m =
+        (attn_bias.size(2) == 1 && Nq > 1) ? 0 : attn_bias.stride(2);
+    attn_bias_stride_n =
+        (attn_bias.size(3) == 1 && Nkv > 1) ? 0 : attn_bias.stride(3);
+  }
+  const float dropout_p_f = static_cast<float>(dropout_p);
+  const unsigned long long philox_seed_u =
+      static_cast<unsigned long long>(philox_seed);
+  const unsigned long long philox_offset_u =
+      static_cast<unsigned long long>(philox_offset);
 
   const dim3 block(kNumThreads, 1, 1);
   const dim3 grid(utils::div_ceil(Nq, kBr), Nb * Nh, 1);
@@ -785,17 +840,39 @@ void launch_ffpa_attn_split_d_fwd_cute_sm120(torch::Tensor Q, torch::Tensor K,
   constexpr int kSmemBytes = kStagesQK * kQTileBytes + kStagesQK * kKTileBytes +
                              kStagesPV * kVTileBytes;
 
-  auto kernel_func =
-      (ffpa_attn_split_d_fwd_cute_sm120<Traits, decltype(tma_q),
-                                        decltype(tma_k), decltype(tma_v),
-                                        kStagesQK, kStagesPV>);
-  cudaFuncSetAttribute(kernel_func, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                       kSmemBytes);
   float* softmax_lse_ptr =
       softmax_lse.numel() > 0 ? softmax_lse.data_ptr<float>() : nullptr;
-  kernel_func<<<grid, block, kSmemBytes, stream>>>(
-      tma_q, tma_k, tma_v, reinterpret_cast<CuteElement*>(O.data_ptr()),
-      softmax_lse_ptr, Nq, Nkv, Nh, Nh_kv, scale, Tc, causal, total_q_rows,
-      total_kv_rows);
+  auto O_ptr = reinterpret_cast<CuteElement*>(O.data_ptr());
+
+  auto launch_variant = [&](auto kernel_func) {
+    cudaFuncSetAttribute(
+        kernel_func, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes);
+    kernel_func<<<grid, block, kSmemBytes, stream>>>(
+        tma_q, tma_k, tma_v, O_ptr, softmax_lse_ptr, Nq, Nkv, Nh, Nh_kv, scale,
+        Tc, causal, total_q_rows, total_kv_rows, attn_bias_ptr, attn_bias_dtype,
+        attn_bias_stride_b, attn_bias_stride_h, attn_bias_stride_m,
+        attn_bias_stride_n, dropout_p_f, philox_seed_u, philox_offset_u);
+  };
+
+  using TmaQ = decltype(tma_q);
+  using TmaK = decltype(tma_k);
+  using TmaV = decltype(tma_v);
+  if (has_attn_bias && has_dropout) {
+    launch_variant(
+        ffpa_attn_split_d_fwd_cute_sm120<Traits, TmaQ, TmaK, TmaV, kStagesQK,
+                                         kStagesPV, 1, 1>);
+  } else if (has_attn_bias) {
+    launch_variant(
+        ffpa_attn_split_d_fwd_cute_sm120<Traits, TmaQ, TmaK, TmaV, kStagesQK,
+                                         kStagesPV, 1, 0>);
+  } else if (has_dropout) {
+    launch_variant(
+        ffpa_attn_split_d_fwd_cute_sm120<Traits, TmaQ, TmaK, TmaV, kStagesQK,
+                                         kStagesPV, 0, 1>);
+  } else {
+    launch_variant(
+        ffpa_attn_split_d_fwd_cute_sm120<Traits, TmaQ, TmaK, TmaV, kStagesQK,
+                                         kStagesPV, 0, 0>);
+  }
 }
 #endif  // ENABLE_FFPA_CUTE_EXT
