@@ -262,7 +262,13 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
         qk_write = (qk_write + 1) % kStagesQK;
       }
 
-      // Compute on current stage (overlaps with prefetch DMA).
+      // kStagesQK==1: prefetch and gemm share the same stage, must wait first.
+      if constexpr (kStagesQK == 1) {
+        cp_async_wait<0>();
+        __syncthreads();
+      }
+
+      // Compute on current stage (overlaps with prefetch DMA for stages>=2).
       auto sQ = make_tensor(make_smem_ptr(q_base + qk_read * kQChunkElements),
                             SmemLayoutQ{});
       auto sK = make_tensor(make_smem_ptr(k_base + qk_read * kKChunkElements),
@@ -276,14 +282,16 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
                          s2r_copy_k, s2r_thr_q, s2r_thr_k);
       qk_read = (qk_read + 1) % kStagesQK;
 
-      // Wait for prefetched data before next iteration reads it.
-      if (d_chunk < kDChunksQK - 1) {
-        if constexpr (kStagesQK > 1) {
-          cp_async_wait<kStagesQK - 2>();
-        } else {
-          cp_async_wait<0>();
+      // kStagesQK>=2: post-wait ensures next iteration's data is ready.
+      if constexpr (kStagesQK > 1) {
+        if (d_chunk < kDChunksQK - 1) {
+          if (d_next < kDChunksQK) {
+            cp_async_wait<kStagesQK - 2>();
+          } else {
+            cp_async_wait<0>();
+          }
+          __syncthreads();
         }
-        __syncthreads();
       }
     }
 
@@ -397,6 +405,13 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
           v_write_pv = (v_write_pv + 1) % kStagesPV;
         }
 
+        // kStagesPV==1: prefetch and gemm share the same stage, must wait
+        // first.
+        if constexpr (kStagesPV == 1) {
+          cp_async_wait<0>();
+          __syncthreads();
+        }
+
         // O rescaling.
         auto tCrO = make_tensor(make_rmem_ptr(&o_acc_storage[v_chunk][0]),
                                 OFragLayout{});
@@ -410,7 +425,7 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
               tCrO_rc(row, col) *= row_scale[row];
         }
 
-        // Compute on current stage (overlaps with prefetch DMA).
+        // Compute on current stage (overlaps with prefetch DMA for stages>=2).
         auto sV = make_tensor(make_smem_ptr(v_base + v_read * kVChunkElements),
                               SmemLayoutV{});
         auto sVt = make_tensor(sV.data(), SmemLayoutVt{});
@@ -422,14 +437,16 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
                            s2r_thr_v);
         v_read = (v_read + 1) % kStagesPV;
 
-        // Wait for prefetched data before next iteration reads it.
-        if (v_chunk < kDChunksV - 1) {
-          if constexpr (kStagesPV > 1) {
-            cp_async_wait<kStagesPV - 2>();
-          } else {
-            cp_async_wait<0>();
+        // kStagesPV>=2: post-wait ensures next iteration's data is ready.
+        if constexpr (kStagesPV > 1) {
+          if (v_chunk < kDChunksV - 1) {
+            if (v_next < kDChunksV) {
+              cp_async_wait<kStagesPV - 2>();
+            } else {
+              cp_async_wait<0>();
+            }
+            __syncthreads();
           }
-          __syncthreads();
         }
       }
       __syncthreads();
