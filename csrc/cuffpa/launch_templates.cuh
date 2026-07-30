@@ -578,7 +578,14 @@ void launch_ffpa_attn_fwd_template(torch::Tensor Q, torch::Tensor K,
 
 #ifdef ENABLE_FFPA_CUTE_EXT
   // CuTe cp.async path: sm_80+ without TMA (tma=0 or sm<90).
-  if constexpr (kHeadDim % 64 == 0) {
+  // D < 320: kVDChunk=64 (fewer PV iters, large tile arithmetic intensity)
+  // D >= 320: kVDChunk=32 (lower register pressure, better compiler scheduling)
+  if constexpr (kHeadDim >= 320) {
+    launch_ffpa_attn_split_d_fwd_cute<kDataType, kHeadDim, kStage, 32, 32>(
+        Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale, dropout_p,
+        philox_seed, philox_offset);
+    return;
+  } else if constexpr (kHeadDim % 64 == 0) {
     launch_ffpa_attn_split_d_fwd_cute<kDataType, kHeadDim, kStage, 32, 64>(
         Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale, dropout_p,
         philox_seed, philox_offset);
@@ -948,7 +955,13 @@ void launch_ffpa_attn_split_d_fwd_cute(torch::Tensor Q, torch::Tensor K,
 
   constexpr int kBr = 128;
   constexpr int kBc = 128;
-  constexpr int kStagesQK = (kStage > 3 ? 3 : kStage);
+  // smem per stage = kQKDChunk*128*2 + kQKDChunk*128*2 + kVDChunk*128*2 bytes
+  // kQKDChunk=32,kVDChunk=64: 32KB/stage → max 3 stages (96KB < 99KB)
+  // kQKDChunk=16,kVDChunk=32: 16KB/stage → max 4 stages (64KB < 99KB)
+  constexpr int kSmemPerStageKB =
+      (kQKDChunk * kBr + kQKDChunk * kBc + kVDChunk * kBc) * 2 / 1024;
+  constexpr int kMaxStages = (kSmemPerStageKB <= 24) ? 4 : 3;
+  constexpr int kStagesQK = (kStage > kMaxStages ? kMaxStages : kStage);
   constexpr int kStagesPV = kStagesQK;
   constexpr int kNumThreads = kBr / 16 * 32;
 
