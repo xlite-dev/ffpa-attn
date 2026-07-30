@@ -6,9 +6,11 @@ namespace ffpa_cute {
 
 // Online safe softmax (no bias, no dropout). Baseline hot path.
 template <typename ScoresTensor, typename CoordTensor, int kRows>
-__device__ __forceinline__ void online_softmax_plain(
-    ScoresTensor& scores, const CoordTensor& tScS_rc, float scale,
-    float* row_max, float* row_sum, float* row_scale) {
+__device__ __forceinline__ void online_safe_softmax(ScoresTensor& scores,
+                                                    const CoordTensor& tScS_rc,
+                                                    float scale, float* row_max,
+                                                    float* row_sum,
+                                                    float* row_scale) {
 #pragma unroll
   for (int row = 0; row < kRows; ++row) {
     float tile_max = -INFINITY;

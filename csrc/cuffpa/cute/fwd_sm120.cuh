@@ -11,6 +11,7 @@
 #include "common.cuh"
 #include "attn_bias.cuh"
 #include "dropout.cuh"
+#include "softmax.cuh"
 
 using TmaBarrier = cutlass::arch::ClusterTransactionBarrier;
 using CtaBarrier = cutlass::arch::ClusterBarrier;
@@ -446,29 +447,9 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
       }
 
       // Row-max + exp2 + row-sum (warp-level reduction via shfl_xor).
-      // row_scale = exp2(old_max - new_max) for O rescaling.
-#pragma unroll
-      for (int row = 0; row < kORows; ++row) {
-        float tile_max = -INFINITY;
-#pragma unroll
-        for (int col = 0; col < size<1>(scores); ++col)
-          tile_max = fmaxf(tile_max, scores(row, col) * scale);
-        tile_max = fmaxf(tile_max, __shfl_xor_sync(0xffffffff, tile_max, 1));
-        tile_max = fmaxf(tile_max, __shfl_xor_sync(0xffffffff, tile_max, 2));
-        const float next_max = fmaxf(row_max[row], tile_max);
-        row_scale[row] = exp2f(row_max[row] - next_max);
-        float tile_sum = 0.0f;
-#pragma unroll
-        for (int col = 0; col < size<1>(scores); ++col) {
-          const float p = exp2f(scores(row, col) * scale - next_max);
-          scores(row, col) = p;
-          tile_sum += p;
-        }
-        tile_sum += __shfl_xor_sync(0xffffffff, tile_sum, 1);
-        tile_sum += __shfl_xor_sync(0xffffffff, tile_sum, 2);
-        row_sum[row] = row_sum[row] * row_scale[row] + tile_sum;
-        row_max[row] = next_max;
-      }
+      ffpa_cute::online_safe_softmax<decltype(scores), decltype(tScS_rc),
+                                     kORows>(scores, tScS_rc, scale, row_max,
+                                             row_sum, row_scale);
 
       // Dropout on P (post-softmax, pre-PV, separate pass).
       if constexpr (kHasDropout) {
