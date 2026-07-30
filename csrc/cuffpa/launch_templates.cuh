@@ -258,6 +258,7 @@ void launch_ffpa_attn_fwd_template_sm120(torch::Tensor Q, torch::Tensor K,
 #endif  // ENABLE_FFPA_TMA_EXT
 
 #ifdef ENABLE_FFPA_CUTE_EXT
+#ifdef ENABLE_FFPA_TMA_EXT
 template <typename kDataType, const int kHeadDim, const int kStage,
           const int kQKDChunk = 32, const int kVDChunk = 64>
 void launch_ffpa_attn_split_d_fwd_cute_sm120(
@@ -265,6 +266,7 @@ void launch_ffpa_attn_split_d_fwd_cute_sm120(
     torch::Tensor attn_bias, torch::Tensor softmax_lse, int causal,
     double softmax_scale, double dropout_p, int64_t philox_seed,
     int64_t philox_offset);
+#endif  // ENABLE_FFPA_TMA_EXT
 
 template <typename kDataType, const int kHeadDim, const int kStage,
           const int kQKDChunk = 32, const int kVDChunk = 64>
@@ -782,6 +784,7 @@ void launch_ffpa_attn_fwd_template_sm120(torch::Tensor Q, torch::Tensor K,
 #endif  // ENABLE_FFPA_TMA_EXT
 
 #ifdef ENABLE_FFPA_CUTE_EXT
+#ifdef ENABLE_FFPA_TMA_EXT
 template <typename kDataType, const int kHeadDim, const int kStage,
           const int kQKDChunk, const int kVDChunk>
 void launch_ffpa_attn_split_d_fwd_cute_sm120(
@@ -930,6 +933,7 @@ void launch_ffpa_attn_split_d_fwd_cute_sm120(
                                          kStagesPV, 0, 0>);
   }
 }
+#endif  // ENABLE_FFPA_TMA_EXT
 
 template <typename kDataType, const int kHeadDim, const int kStage,
           const int kQKDChunk, const int kVDChunk>
