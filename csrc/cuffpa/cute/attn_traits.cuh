@@ -64,6 +64,9 @@ struct FFPAAttnCuTeTraits {
   static constexpr int kVChunksPerBatch =
       compute_vchunks_per_batch(kDChunksV, kHeadDim, kBr, kSmemElems);
   static constexpr int kNBatches = kDChunksV / kVChunksPerBatch;
+  // FA-4 conditional rescaling threshold (log2 domain). 0.0 = disabled.
+  // FP16/BF16: 8.0 = log2(256); FP8 would use 4.0 = log2(16).
+  static constexpr float kRescaleThreshold = 8.0f;
 
   using Element = Element_;
   using SmemAtomQK = typename SelectSmemAtom<kQKDChunk, Element>::type;

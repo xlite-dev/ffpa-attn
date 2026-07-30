@@ -484,7 +484,16 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
       // Row-max + exp2 + row-sum (warp-level reduction via shfl_xor).
       ffpa_cute::online_safe_softmax<decltype(scores), decltype(tScS_rc),
                                      kORows>(scores, tScS_rc, scale, row_max,
-                                             row_sum, row_scale);
+                                             row_sum, row_scale,
+                                             Traits::kRescaleThreshold);
+
+      // FA-4 conditional rescaling: warp-uniform vote so the O-rescale loop
+      // below is skipped without divergence when every row's scale stayed 1.0.
+      bool local_need_rescale = false;
+#pragma unroll
+      for (int r = 0; r < kORows; ++r)  // exp(<0) -> scale < 1.0
+        local_need_rescale = local_need_rescale || (row_scale[r] < 1.0f);
+      const bool need_rescale = __any_sync(0xffffffff, local_need_rescale);
 
       // Dropout on P (post-softmax, pre-PV, separate pass).
       if constexpr (kHasDropout) {
@@ -523,7 +532,8 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
         // O rescaling: multiply accumulated O by row_scale (kv_tile > 0).
         auto tCrO = make_tensor(make_rmem_ptr(&o_acc_storage[v_chunk][0]),
                                 OFragLayout{});
-        if (kv_tile > 0) {
+        // Partial online rescaling for current v_chunk in this kv_tile.
+        if (kv_tile > 0 && need_rescale) {
           auto tCrO_rc = make_tensor(
               tCrO.data(), ffpa_cute::convert_layout_acc_rowcol(tCrO.layout()));
 #pragma unroll
@@ -602,6 +612,8 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
                                   OFragLayout{});
           auto tCrO_rc = make_tensor(
               tCrO.data(), ffpa_cute::convert_layout_acc_rowcol(tCrO.layout()));
+          // Final O rescaling: multiply accumulated O by 1/row_sum (last
+          // kv_tile).
 #pragma unroll
           for (int row = 0; row < kORows; ++row) {
             const float inv_sum = 1.0f / row_sum[row];

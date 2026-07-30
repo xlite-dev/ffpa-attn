@@ -5,12 +5,36 @@
 namespace ffpa_cute {
 
 // Online safe softmax (no bias, no dropout). Baseline hot path.
+//
+// FA-4 conditional rescaling (paper §3.1.4 /
+// SoftmaxSm100.update_row_max_from_local):
+//   FA-4 stores raw max; its log2-domain scale factor is
+//     acc_scale_ = (m_old - m_new) * scale_log2
+//   with skip condition acc_scale_ >= -rescale_threshold.
+//   ffpa stores row_max in log2 domain already: row_max = max(scores * scale)
+//   where the caller pre-multiplied scale by FFPA_M_LOG2E (see fwd_sm120.cuh
+//   `scale *= FFPA_M_LOG2E`). Therefore row_max[row] - next_max IS acc_scale_
+//   directly — no extra * scale_log2 needed. Skip condition becomes
+//     row_max[row] - next_max >= -rescale_threshold   (threshold 8.0 =
+//     log2(256))
+//   Sign note: log2_diff = m_old - m_new <= 0 always, since next_max =
+//     max(old, tile_max) >= old. The paper's skip test bounds the *positive*
+//     max-growth, m_new - m_old <= tau; negating both sides gives
+//     m_old - m_new >= -tau, i.e. log2_diff >= -rescale_threshold. We compare
+//     against -threshold (not +threshold) because log2_diff points the opposite
+//     way from the threshold. FA-4's acc_scale_ = (old-new)*scale_log2 is
+//     likewise non-positive and tested as acc_scale_ >= -threshold.
+//   Skip actions map 1:1 to FA-4:
+//     row_scale = 1.0          <->  acc_scale = 1.0
+//     row_max not updated      <->  row_max_new = row_max_old
+//     P uses stale row_max     <->  row_max_safe = row_max_old
+//   Equivalence: O and row_sum accumulate with the same stale max; the epilogue
+//   O / row_sum cancels all deferred scaling (FA-4 finalize does the same).
 template <typename ScoresTensor, typename CoordTensor, int kRows>
-__device__ __forceinline__ void online_safe_softmax(ScoresTensor& scores,
-                                                    const CoordTensor& tScS_rc,
-                                                    float scale, float* row_max,
-                                                    float* row_sum,
-                                                    float* row_scale) {
+__device__ __forceinline__ void online_safe_softmax(
+    ScoresTensor& scores, const CoordTensor& tScS_rc, float scale,
+    float* row_max, float* row_sum, float* row_scale,
+    float rescale_threshold = 0.0f) {
 #pragma unroll
   for (int row = 0; row < kRows; ++row) {
     float tile_max = -INFINITY;
@@ -20,18 +44,26 @@ __device__ __forceinline__ void online_safe_softmax(ScoresTensor& scores,
     tile_max = fmaxf(tile_max, __shfl_xor_sync(0xffffffff, tile_max, 1));
     tile_max = fmaxf(tile_max, __shfl_xor_sync(0xffffffff, tile_max, 2));
     const float next_max = fmaxf(row_max[row], tile_max);
-    row_scale[row] = exp2f(row_max[row] - next_max);
+    // log2_diff == FA-4 acc_scale_: already in log2 domain, no * scale_log2.
+    const float log2_diff = row_max[row] - next_max;
+    float eff_max = next_max;
+    if (rescale_threshold > 0.0f && log2_diff >= -rescale_threshold) {
+      row_scale[row] = 1.0f;
+      eff_max = row_max[row];  // stale max; row_max NOT updated
+    } else {
+      row_scale[row] = exp2f(log2_diff);  // exp(<0) -> scale < 1.0
+      row_max[row] = next_max;
+    }
     float tile_sum = 0.0f;
 #pragma unroll
     for (int col = 0; col < cute::size<1>(scores); ++col) {
-      const float p = exp2f(scores(row, col) * scale - next_max);
+      const float p = exp2f(scores(row, col) * scale - eff_max);
       scores(row, col) = p;
       tile_sum += p;
     }
     tile_sum += __shfl_xor_sync(0xffffffff, tile_sum, 1);
     tile_sum += __shfl_xor_sync(0xffffffff, tile_sum, 2);
     row_sum[row] = row_sum[row] * row_scale[row] + tile_sum;
-    row_max[row] = next_max;
   }
 }
 
@@ -42,7 +74,7 @@ __device__ __forceinline__ void online_softmax_bias(
     float* row_max, float* row_sum, float* row_scale,
     const void* __restrict__ attn_bias, int attn_bias_dtype, int stride_b,
     int stride_h, int stride_m, int stride_n, int Nb_id, int Nh_id, int Br_base,
-    int kv_tile, int kBc, float inv_scale) {
+    int kv_tile, int kBc, float inv_scale, float rescale_threshold = 0.0f) {
   const int bias_base = Nb_id * stride_b + Nh_id * stride_h;
   const int bc_base = kv_tile * kBc;
 #pragma unroll
@@ -62,18 +94,27 @@ __device__ __forceinline__ void online_softmax_bias(
     tile_max = fmaxf(tile_max, __shfl_xor_sync(0xffffffff, tile_max, 1));
     tile_max = fmaxf(tile_max, __shfl_xor_sync(0xffffffff, tile_max, 2));
     const float next_max = fmaxf(row_max[row], tile_max);
-    row_scale[row] = exp2f(row_max[row] - next_max);
+    // FA-4 conditional rescaling; see online_safe_softmax for the domain
+    // mapping.
+    const float log2_diff = row_max[row] - next_max;
+    float eff_max = next_max;
+    if (rescale_threshold > 0.0f && log2_diff >= -rescale_threshold) {
+      row_scale[row] = 1.0f;
+      eff_max = row_max[row];
+    } else {
+      row_scale[row] = exp2f(log2_diff);
+      row_max[row] = next_max;
+    }
     float tile_sum = 0.0f;
 #pragma unroll
     for (int col = 0; col < cute::size<1>(scores); ++col) {
-      const float p = exp2f(scores(row, col) * scale - next_max);
+      const float p = exp2f(scores(row, col) * scale - eff_max);
       scores(row, col) = p;
       tile_sum += p;
     }
     tile_sum += __shfl_xor_sync(0xffffffff, tile_sum, 1);
     tile_sum += __shfl_xor_sync(0xffffffff, tile_sum, 2);
     row_sum[row] = row_sum[row] * row_scale[row] + tile_sum;
-    row_max[row] = next_max;
   }
 }
 
@@ -83,7 +124,8 @@ __device__ __forceinline__ void online_softmax_dropout(
     ScoresTensor& scores, const CoordTensor& tScS_rc, float scale,
     float* row_max, float* row_sum, float* row_scale, float dropout_p,
     unsigned long long philox_seed, unsigned long long philox_offset, int Nb_id,
-    int Nh, int Nh_id, int Nq, int Nkv, int Br_base, int kv_tile, int kBc) {
+    int Nh, int Nh_id, int Nq, int Nkv, int Br_base, int kv_tile, int kBc,
+    float rescale_threshold = 0.0f) {
   const float keep_scale = 1.0f / (1.0f - dropout_p);
   const int head_base = (Nb_id * Nh + Nh_id) * Nq;
   const int bc_base = kv_tile * kBc;
@@ -96,13 +138,23 @@ __device__ __forceinline__ void online_softmax_dropout(
     tile_max = fmaxf(tile_max, __shfl_xor_sync(0xffffffff, tile_max, 1));
     tile_max = fmaxf(tile_max, __shfl_xor_sync(0xffffffff, tile_max, 2));
     const float next_max = fmaxf(row_max[row], tile_max);
-    row_scale[row] = exp2f(row_max[row] - next_max);
+    // FA-4 conditional rescaling; see online_safe_softmax for the domain
+    // mapping.
+    const float log2_diff = row_max[row] - next_max;
+    float eff_max = next_max;
+    if (rescale_threshold > 0.0f && log2_diff >= -rescale_threshold) {
+      row_scale[row] = 1.0f;
+      eff_max = row_max[row];
+    } else {
+      row_scale[row] = exp2f(log2_diff);
+      row_max[row] = next_max;
+    }
     const int q_row = Br_base + cute::get<0>(tScS_rc(row, 0));
     const int row_off = (head_base + q_row) * Nkv;
     float tile_sum = 0.0f;
 #pragma unroll
     for (int col = 0; col < cute::size<1>(scores); ++col) {
-      float p = exp2f(scores(row, col) * scale - next_max);
+      float p = exp2f(scores(row, col) * scale - eff_max);
       const int k_col = bc_base + cute::get<1>(tScS_rc(row, col));
       const unsigned long long off =
           philox_offset + (unsigned long long)(row_off + k_col);
@@ -115,7 +167,6 @@ __device__ __forceinline__ void online_softmax_dropout(
     tile_sum += __shfl_xor_sync(0xffffffff, tile_sum, 1);
     tile_sum += __shfl_xor_sync(0xffffffff, tile_sum, 2);
     row_sum[row] = row_sum[row] * row_scale[row] + tile_sum;
-    row_max[row] = next_max;
   }
 }
 
