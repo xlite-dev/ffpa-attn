@@ -54,6 +54,11 @@ struct FFPAAttnCuTeTraits {
   using SmemLayoutVt = decltype(composition(
       SmemLayoutV{},
       make_layout(Shape<Int<kVDChunk>, Int<kBc>>{}, GenRowMajor{})));
+  // O output staging buffer: same K_SW128 atom as V, tiled to O's
+  // [kBr,kVDChunk]. Reuses v_base smem in the epilogue (V is free after the
+  // last PV GEMM).
+  using SmemLayoutO =
+      decltype(tile_to_shape(SmemAtomV{}, Shape<Int<kBr>, Int<kVDChunk>>{}));
 
   using MmaAtom =
       std::conditional_t<std::is_same<Element, cutlass::half_t>::value,

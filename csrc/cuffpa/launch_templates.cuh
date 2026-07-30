@@ -843,6 +843,7 @@ void launch_ffpa_attn_split_d_fwd_cute_sm120(
   using SmemLayoutQ = typename Traits::SmemLayoutQ;
   using SmemLayoutK = typename Traits::SmemLayoutK;
   using SmemLayoutV = typename Traits::SmemLayoutV;
+  using SmemLayoutO = typename Traits::SmemLayoutO;
 
   const int Nb = Q.size(0);
   const int Nh = Q.size(1);
@@ -928,6 +929,17 @@ void launch_ffpa_attn_split_d_fwd_cute_sm120(
   auto tma_v = make_tma_copy(SM90_TMA_LOAD{}, gV, SmemLayoutV{},
                              Shape<Int<kBc>, Int<kVDChunk>>{}, _1{});
 
+  // O output TMA store descriptor: full O tensor [total_q_rows,kHeadDim],
+  // same shape/stride as gQ; per-head origin injected via domain_offset in
+  // kernel. Direction = SM90_TMA_STORE (first arg); swizzle auto-inferred
+  // from SmemLayoutO (matches the sO staging buffer's actual swizzle).
+  auto gO =
+      make_tensor(make_gmem_ptr(reinterpret_cast<CuteElement*>(O.data_ptr())),
+                  make_shape(total_q_rows, Int<kHeadDim>{}),
+                  make_stride(Int<kHeadDim>{}, _1{}));
+  auto tma_o = make_tma_copy(SM90_TMA_STORE{}, gO, SmemLayoutO{},
+                             Shape<Int<kBr>, Int<kVDChunk>>{}, _1{});
+
   constexpr int kQTileBytes = kBr * kQKDChunk * sizeof(CuteElement);
   constexpr int kKTileBytes = kBc * kQKDChunk * sizeof(CuteElement);
   constexpr int kVTileBytes = kBc * kVDChunk * sizeof(CuteElement);
@@ -942,31 +954,33 @@ void launch_ffpa_attn_split_d_fwd_cute_sm120(
     cudaFuncSetAttribute(
         kernel_func, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes);
     kernel_func<<<grid, block, kSmemBytes, stream>>>(
-        tma_q, tma_k, tma_v, O_ptr, softmax_lse_ptr, Nq, Nkv, Nh, Nh_kv, scale,
-        Tc, causal, total_q_rows, total_kv_rows, attn_bias_ptr, attn_bias_dtype,
-        attn_bias_stride_b, attn_bias_stride_h, attn_bias_stride_m,
-        attn_bias_stride_n, dropout_p_f, philox_seed_u, philox_offset_u);
+        tma_q, tma_k, tma_v, tma_o, O_ptr, softmax_lse_ptr, Nq, Nkv, Nh, Nh_kv,
+        scale, Tc, causal, total_q_rows, total_kv_rows, attn_bias_ptr,
+        attn_bias_dtype, attn_bias_stride_b, attn_bias_stride_h,
+        attn_bias_stride_m, attn_bias_stride_n, dropout_p_f, philox_seed_u,
+        philox_offset_u);
   };
 
   using TmaQ = decltype(tma_q);
   using TmaK = decltype(tma_k);
   using TmaV = decltype(tma_v);
+  using TmaO = decltype(tma_o);
   if (has_attn_bias && has_dropout) {
     launch_variant(
-        ffpa_attn_split_d_fwd_cute_sm120<Traits, TmaQ, TmaK, TmaV, kStagesQK,
-                                         kStagesPV, 1, 1>);
+        ffpa_attn_split_d_fwd_cute_sm120<Traits, TmaQ, TmaK, TmaV, TmaO,
+                                         kStagesQK, kStagesPV, 1, 1>);
   } else if (has_attn_bias) {
     launch_variant(
-        ffpa_attn_split_d_fwd_cute_sm120<Traits, TmaQ, TmaK, TmaV, kStagesQK,
-                                         kStagesPV, 1, 0>);
+        ffpa_attn_split_d_fwd_cute_sm120<Traits, TmaQ, TmaK, TmaV, TmaO,
+                                         kStagesQK, kStagesPV, 1, 0>);
   } else if (has_dropout) {
     launch_variant(
-        ffpa_attn_split_d_fwd_cute_sm120<Traits, TmaQ, TmaK, TmaV, kStagesQK,
-                                         kStagesPV, 0, 1>);
+        ffpa_attn_split_d_fwd_cute_sm120<Traits, TmaQ, TmaK, TmaV, TmaO,
+                                         kStagesQK, kStagesPV, 0, 1>);
   } else {
     launch_variant(
-        ffpa_attn_split_d_fwd_cute_sm120<Traits, TmaQ, TmaK, TmaV, kStagesQK,
-                                         kStagesPV, 0, 0>);
+        ffpa_attn_split_d_fwd_cute_sm120<Traits, TmaQ, TmaK, TmaV, TmaO,
+                                         kStagesQK, kStagesPV, 0, 0>);
   }
 }
 #endif  // ENABLE_FFPA_TMA_EXT

@@ -17,13 +17,14 @@ using TmaBarrier = cutlass::arch::ClusterTransactionBarrier;
 using CtaBarrier = cutlass::arch::ClusterBarrier;
 
 template <typename Traits, typename TmaQ, typename TmaK, typename TmaV,
-          int kStagesQK = 2, int kStagesPV = 2, int kHasAttnBias = 0,
-          int kHasDropout = 0>
+          typename TmaO, int kStagesQK = 2, int kStagesPV = 2,
+          int kHasAttnBias = 0, int kHasDropout = 0>
 __global__ void __launch_bounds__(Traits::kNumThreads, 1)
     ffpa_attn_split_d_fwd_cute_sm120(
         CUTLASS_GRID_CONSTANT TmaQ const tma_q,
         CUTLASS_GRID_CONSTANT TmaK const tma_k,
         CUTLASS_GRID_CONSTANT TmaV const tma_v,
+        CUTLASS_GRID_CONSTANT TmaO const tma_o,
         typename Traits::Element* __restrict__ O,
         float* __restrict__ softmax_lse, int Nq, int Nkv, int Nh, int Nh_kv,
         float scale, int Tc, int causal, int total_q_rows, int total_kv_rows,
@@ -63,11 +64,14 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
   // Why NOT WS? Please check ../fwd_sm120.cuh for more details.
 
   using namespace cute;
+  using cute::tma_store_arrive;
+  using cute::tma_store_wait;
   using Element = typename Traits::Element;
   using SmemLayoutQ = typename Traits::SmemLayoutQ;
   using SmemLayoutK = typename Traits::SmemLayoutK;
   using SmemLayoutV = typename Traits::SmemLayoutV;
   using SmemLayoutVt = typename Traits::SmemLayoutVt;
+  using SmemLayoutO = typename Traits::SmemLayoutO;
   using TiledMmaQK = typename Traits::TiledMmaQK;
   using TiledMmaPV = typename Traits::TiledMmaPV;
   using SmemCopyAtom = typename Traits::SmemCopyAtom;
@@ -85,6 +89,14 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
   constexpr int kQChunkElements = cosize(SmemLayoutQ{});
   constexpr int kKChunkElements = cosize(SmemLayoutK{});
   constexpr int kVChunkElements = cosize(SmemLayoutV{});
+
+  // TMA-O epilogue reuses v_base smem as the O staging buffer; guard that it
+  // fits. The "no in-flight V TMA at epilogue entry" invariant holds for any
+  // kDChunksV/kStagesPV: every v_chunk's V is consumed via TmaBarrier::wait
+  // (v_full) inside the PV loop, so by loop exit all V loads are drained and
+  // v_base is safe to overwrite after the epilogue's __syncthreads().
+  static_assert(cosize(SmemLayoutO{}) <= kStagesPV * cosize(SmemLayoutV{}),
+                "TMA-O: O staging buffer must fit in reused V-stage smem");
 
   const int Nb_id = blockIdx.y / Nh;
   const int Nh_id = blockIdx.y % Nh;
@@ -523,10 +535,33 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
     }
   }
 
-  // Phase 4: Epilogue. Normalize O by 1/row_sum, convert to Element,
-  // and store to gmem. Aligned tiles use vectorized copy(); the last
-  // partial tile (if any) uses per-element predicated store.
+  // Phase 4: Epilogue. Normalize O by 1/row_sum, convert to Element, store.
+  //   aligned tile (Br_base+kBr<=Nq): R->S(stmatrix)->swizzled smem->TMA store.
+  //   tail tile: per-element predicated R->G (unchanged, zero risk).
+  // sO reuses v_base (V free after last kv_tile's PV GEMM). Single sO buffer
+  // -> serial per-v_chunk tma_store_wait<0> (correctness for buffer reuse).
   {
+    // ONE sync guarantees V smem reads finished before R->S overwrites v_base.
+    // Assumes no in-flight V TMA at epilogue entry (static_assert above:
+    // kDChunksV<=kStagesPV; last kv_tile issues no further V prefetch).
+    __syncthreads();
+
+    // TMA-store gmem view: full O tensor [total_q_rows,kHeadDim], per-head
+    // origin via domain_offset (mirrors mQ/mK/mV construction).
+    auto mO_tma = domain_offset(
+        make_coord(q_row_offset, 0),
+        tma_o.get_tma_tensor(make_shape(total_q_rows, Int<kHeadDim>{})));
+    auto o_slice = tma_o.get_slice(_0{});
+
+    // sO: reuse v_base as [kBr,kVDChunk] swizzled O buffer (same K_SW128 atom).
+    auto sO = make_tensor(make_smem_ptr(v_base), SmemLayoutO{});
+
+    // R->S TiledCopy: MMA C-fragment regs -> swizzled smem (stmatrix.x4).
+    auto r2s_copy = make_tiled_copy_C(Copy_Atom<SM90_U32x4_STSM_N, Element>{},
+                                      tiled_mma_pv);
+    auto r2s_thr = r2s_copy.get_slice(tid);
+
+    // Tail-tile R->G fallback view (kept for the partial last tile).
     const int O_gmem_offset =
         (Nb_id * Nh * Nq * kHeadDim) + (Nh_id * Nq * kHeadDim);
     auto mO = make_tensor(make_gmem_ptr(O + O_gmem_offset),
@@ -534,6 +569,7 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
                           make_stride(Int<kHeadDim>{}, _1{}));
     auto cO = make_identity_tensor(Shape<Int<kBr>, Int<kVDChunk>>{});
     auto tOcO = thr_mma_pv.partition_C(cO);
+
 #pragma unroll
     for (int v_chunk = 0; v_chunk < kDChunksV; ++v_chunk) {
       auto tCrO =
@@ -548,11 +584,28 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
           tCrO_rc(row, col) *= inv_sum;
       }
       auto tCrOHalf = ffpa_cute::convert_type<Element>(tCrO);
+
       auto gO = local_tile(mO, Shape<Int<kBr>, Int<kVDChunk>>{},
                            make_coord(Q_tile_id, v_chunk));
-      auto tCgO = thr_mma_pv.partition_C(gO);
+      auto tCgO = thr_mma_pv.partition_C(gO);  // for tail R->G fallback
       if (Br_base + kBr <= Nq) {
-        copy(tCrOHalf, tCgO);
+        // aligned: R->S->G via TMA store. retile_S (NOT partition_S) because
+        // tCrOHalf is already a per-thread C-fragment register tensor.
+        auto tCrOHalf_src = r2s_thr.retile_S(tCrOHalf);
+        auto tCsO_dst = r2s_thr.partition_D(sO);
+        copy(r2s_copy, tCrOHalf_src, tCsO_dst);
+        cutlass::arch::fence_view_async_shared();
+        __syncthreads();
+
+        auto gO_tma = local_tile(mO_tma, Shape<Int<kBr>, Int<kVDChunk>>{},
+                                 make_coord(Q_tile_id, v_chunk));
+        auto tCgO_tma = o_slice.partition_D(gO_tma);
+        auto tOsO = o_slice.partition_S(sO);
+        if (tid == 0) {
+          copy(tma_o, tOsO, tCgO_tma);
+        }
+        tma_store_arrive();
+        tma_store_wait<0>();  // drain before next v_chunk reuses sO
       } else {
 #pragma unroll
         for (int i = 0; i < size(tCrOHalf); ++i) {
@@ -562,6 +615,9 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
         }
       }
     }
+    // Final drain: required when a tail tile took R->G while earlier v_chunks
+    // have in-flight TMA stores; no-op on pure-aligned paths.
+    tma_store_wait<0>();
   }
 
   // Optional: write log-sum-exp for backward pass compatibility.
