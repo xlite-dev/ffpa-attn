@@ -1,4 +1,6 @@
 """CUDA FFPA attention forward/backward implementations for large-D (D > 256)."""
+import enum
+
 import torch
 
 try:
@@ -14,6 +16,28 @@ except Exception as exc:
   CUDA_BWD_AVAILABLE = False
   _CUDA_IMPORT_ERROR = exc
 
+
+class CudaBackendImpl(enum.IntEnum):
+  AUTO = 0
+  NATIVE = 1
+  TMA = 2
+  CUTE = 3
+  CUTE_TMA = 4
+
+
+def set_cuda_backend_impl(impl: CudaBackendImpl) -> None:
+  """Set the CUDA backend implementation hint for kernel dispatch."""
+  if _cuda_ext is not None:
+    _cuda_ext.set_cuda_backend_impl(int(impl))
+
+
+def get_cuda_backend_impl() -> CudaBackendImpl:
+  """Get the current CUDA backend implementation hint."""
+  if _cuda_ext is not None:
+    return CudaBackendImpl(_cuda_ext.get_cuda_backend_impl())
+  return CudaBackendImpl.AUTO
+
+
 from ._ffpa_bwd import _ffpa_attn_backward_cuda
 from ._ffpa_fwd import _ffpa_attn_forward_cuda
 
@@ -23,7 +47,7 @@ _OP_NAMESPACE = "ffpa_attn"
 torch.library.define(
   f"{_OP_NAMESPACE}::_fwd_cuda",
   "(Tensor q, Tensor k, Tensor v, Tensor attn_bias, int stages, int acc, int causal, "
-  "float softmax_scale, float dropout_p, int philox_seed, int philox_offset, int tma) "
+  "float softmax_scale, float dropout_p, int philox_seed, int philox_offset) "
   "-> (Tensor o, Tensor softmax_lse)",
 )
 
@@ -41,7 +65,6 @@ def _fwd_cuda_torch_op(
   dropout_p: float,
   philox_seed: int,
   philox_offset: int,
-  tma: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
   if _ffpa_attn_fwd_cuda is None:
     raise RuntimeError(
@@ -73,7 +96,6 @@ def _fwd_cuda_torch_op(
     dropout_p,
     philox_seed,
     philox_offset,
-    tma,
   )
   return O, softmax_lse
 
@@ -91,7 +113,6 @@ def _fwd_cuda_fake(
   dropout_p: float,
   philox_seed: int,
   philox_offset: int,
-  tma: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
   seqlen_q_aligned = ((Q.size(2) + 7) // 8) * 8
   O = torch.empty_like(Q)  # noqa: E741

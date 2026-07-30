@@ -247,6 +247,7 @@ def _make_forward_backend(
   triton_autotune_mode: str,
   enable_tma: bool,
   enable_ws: bool,
+  enable_cute: bool = False,
   cuda_stages: int | None = None,
 ):
   if name == "cuda":
@@ -254,7 +255,8 @@ def _make_forward_backend(
       "forward": True,
       "acc": acc,
       "enable_tma": enable_tma,
-      "enable_ws": enable_ws
+      "enable_ws": enable_ws,
+      "enable_cute": enable_cute,
     }
     if cuda_stages is not None:
       kwargs["stages"] = cuda_stages
@@ -295,6 +297,7 @@ def _run_case(
   print_result: bool = True,
   enable_tma: bool = False,
   enable_ws: bool = False,
+  enable_cute: bool = False,
   verbose: bool = False,
   stages: int | None = None,
 ) -> FORWARD_RESULT:
@@ -310,6 +313,7 @@ def _run_case(
     triton_autotune_mode=triton_autotune_mode,
     enable_tma=enable_tma,
     enable_ws=enable_ws,
+    enable_cute=enable_cute,
     cuda_stages=stages,
   )
   backward_backend = CuTeDSLBackend(
@@ -419,6 +423,7 @@ def run_forward_examples(
   print_results: bool = True,
   enable_tma: bool = False,
   enable_ws: bool = False,
+  enable_cute: bool = False,
   tasks: set[str] | None = None,
   dtypes: tuple[torch.dtype, ...] = (torch.float16, torch.bfloat16),
   verbose: bool = False,
@@ -462,6 +467,7 @@ def run_forward_examples(
     ("grad_kv_storage_dtype", str(grad_kv_storage_dtype)),
     ("enable_fwd_tma", str(enable_tma)),
     ("enable_fwd_ws", str(enable_ws)),
+    ("enable_fwd_cute", str(enable_cute)),
     ("cuda_stages", str(stages)),
     ("tasks", tasks_str),
     ("warmup", str(warmup)),
@@ -605,6 +611,7 @@ def run_forward_examples(
           print_result=print_results,
           enable_tma=enable_tma,
           enable_ws=enable_ws,
+          enable_cute=enable_cute,
           verbose=verbose,
           stages=stages,
         )

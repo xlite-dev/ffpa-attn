@@ -2,6 +2,7 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 
+#include "backend_hint.h"
 #include "fwd_sm80.cuh"
 #include "split_kv.cuh"
 #ifdef ENABLE_FFPA_TMA_EXT
@@ -296,8 +297,7 @@ void launch_ffpa_attn_fwd_template(torch::Tensor Q, torch::Tensor K,
                                    torch::Tensor attn_bias,
                                    torch::Tensor softmax_lse, int causal,
                                    double softmax_scale, double dropout_p,
-                                   int64_t philox_seed, int64_t philox_offset,
-                                   int tma) {
+                                   int64_t philox_seed, int64_t philox_offset) {
   // Q,K,V,O with [B, H, N, D] layout, B=batch, H=head, N=seqlen, D=dim
   // TODO: support BNHD layout, Q,K,V,O with [B, N, H, D] layout.
   constexpr int kMmaAtomM = 16;
@@ -473,6 +473,15 @@ void launch_ffpa_attn_fwd_template(torch::Tensor Q, torch::Tensor K,
     return;
   }
 
+  // Backend implementation hint: override path selection when explicitly set.
+  // AUTO is treated as NATIVE: tma/cute paths are opt-in only.
+  const auto impl_hint = ffpa::get_backend_impl_hint();
+  const bool force_native = (impl_hint == ffpa::CudaBackendImpl::NATIVE ||
+                             impl_hint == ffpa::CudaBackendImpl::AUTO);
+  const bool force_tma = (impl_hint == ffpa::CudaBackendImpl::TMA);
+  const bool force_cute = (impl_hint == ffpa::CudaBackendImpl::CUTE);
+  const bool force_cute_tma = (impl_hint == ffpa::CudaBackendImpl::CUTE_TMA);
+
   // SM120 TMA path: when ``tma`` is set and the device is TMA-capable
   // (sm_90+), delegate to the TMA launcher. Falls back to the legacy
   // cp.async path on older hardware. NOTE: NO WGMMA on sm_120a.
@@ -486,7 +495,7 @@ void launch_ffpa_attn_fwd_template(torch::Tensor Q, torch::Tensor K,
   //   sm_90/100: WS (kNonWS=0). setmaxnreg effective, 228KB smem allows
   //     deep pipeline. Unverified on real hardware.
 #ifdef ENABLE_FFPA_TMA_EXT
-  if (tma) {
+  if ((force_tma || force_cute_tma) && !force_native && !force_cute) {
     auto prop = at::cuda::getCurrentDeviceProperties();
     if (prop->major >= 9) {
       if (prop->major == 9 || prop->major == 10) {
@@ -519,23 +528,21 @@ void launch_ffpa_attn_fwd_template(torch::Tensor Q, torch::Tensor K,
         // the 128x128 rowcol tensor abstraction (64 score regs simultaneously
         // live + addressing temps → spills). Prefer the non-WS TMA fallback
         // when bias/dropout is active; CuTe handles the clean path only.
-        if constexpr (kHeadDim % 64 == 0) {
-          if (!has_attn_bias && !has_dropout) {
+        if (force_tma) {
+          launch_ffpa_attn_fwd_template_sm120<
+              kDataType, kHeadDim, kMmaAccFloat32QK, kMmaAccFloat32PV,
+              (kStage > 3 ? 3 : kStage), 32 /*kQKDChunk*/, 64 /*kVDChunk*/,
+              0 /*kShareSmemQKV*/, 0 /*kPersistQg2s*/, 8 /*kMmaTileSeqLenQ*/,
+              16 /*kValTileSeqLenK*/, 128 /*kProducerThreads*/, 1 /*kNonWS*/>(
+              Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
+              dropout_p, philox_seed, philox_offset);
+        } else if (force_cute_tma || (!has_attn_bias && !has_dropout)) {
+          if constexpr (kHeadDim % 64 == 0) {
             launch_ffpa_attn_split_d_fwd_cute_sm120<kDataType, kHeadDim, kStage,
                                                     32, 64>(
                 Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
                 dropout_p, philox_seed, philox_offset);
-          } else {
-            launch_ffpa_attn_fwd_template_sm120<
-                kDataType, kHeadDim, kMmaAccFloat32QK, kMmaAccFloat32PV,
-                (kStage > 3 ? 3 : kStage), 32 /*kQKDChunk*/, 64 /*kVDChunk*/,
-                0 /*kShareSmemQKV*/, 0 /*kPersistQg2s*/, 8 /*kMmaTileSeqLenQ*/,
-                16 /*kValTileSeqLenK*/, 128 /*kProducerThreads*/, 1 /*kNonWS*/>(
-                Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
-                dropout_p, philox_seed, philox_offset);
-          }
-        } else if constexpr (kHeadDim % 32 == 0) {
-          if (!has_attn_bias && !has_dropout) {
+          } else if constexpr (kHeadDim % 32 == 0) {
             launch_ffpa_attn_split_d_fwd_cute_sm120<kDataType, kHeadDim, kStage,
                                                     32, 32>(
                 Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
@@ -578,22 +585,44 @@ void launch_ffpa_attn_fwd_template(torch::Tensor Q, torch::Tensor K,
 
 #ifdef ENABLE_FFPA_CUTE_EXT
   // CuTe cp.async path: sm_80+ without TMA (tma=0 or sm<90).
-  // D < 320: kVDChunk=64 (fewer PV iters, large tile arithmetic intensity)
-  // D >= 320: kVDChunk=32 (lower register pressure, better compiler scheduling)
-  if constexpr (kHeadDim >= 320) {
-    launch_ffpa_attn_split_d_fwd_cute<kDataType, kHeadDim, kStage, 32, 32>(
-        Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale, dropout_p,
-        philox_seed, philox_offset);
-    return;
-  } else if constexpr (kHeadDim % 64 == 0) {
-    launch_ffpa_attn_split_d_fwd_cute<kDataType, kHeadDim, kStage, 32, 64>(
-        Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale, dropout_p,
-        philox_seed, philox_offset);
-    return;
-  } else if constexpr (kHeadDim % 32 == 0) {
-    launch_ffpa_attn_split_d_fwd_cute<kDataType, kHeadDim, kStage, 32, 32>(
-        Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale, dropout_p,
-        philox_seed, philox_offset);
+  // Architecture-aware dispatch:
+  //   sm >= 120 (Blackwell, high compute): stages capped at 2 for (32,32),
+  //     3 for (32,64) — sync overhead dominates on fast MMA.
+  //   sm < 120 (Ada/Ampere, lower compute): prefer (32,64) for D%64==0,
+  //     deeper pipeline (Python-controlled, smem physics cap applies).
+  if (!force_native) {
+    auto cute_prop = at::cuda::getCurrentDeviceProperties();
+    const int sm_arch = cute_prop->major * 10 + cute_prop->minor;
+    if (sm_arch >= 120) {
+      constexpr int kCuteStage32 = (kStage > 2) ? 2 : kStage;
+      constexpr int kCuteStage64 = (kStage > 3) ? 3 : kStage;
+      if constexpr (kHeadDim >= 320) {
+        launch_ffpa_attn_split_d_fwd_cute<kDataType, kHeadDim, kCuteStage32, 32,
+                                          32>(
+            Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
+            dropout_p, philox_seed, philox_offset);
+      } else if constexpr (kHeadDim % 64 == 0) {
+        launch_ffpa_attn_split_d_fwd_cute<kDataType, kHeadDim, kCuteStage64, 32,
+                                          64>(
+            Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
+            dropout_p, philox_seed, philox_offset);
+      } else if constexpr (kHeadDim % 32 == 0) {
+        launch_ffpa_attn_split_d_fwd_cute<kDataType, kHeadDim, kCuteStage32, 32,
+                                          32>(
+            Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
+            dropout_p, philox_seed, philox_offset);
+      }
+    } else {
+      if constexpr (kHeadDim % 64 == 0) {
+        launch_ffpa_attn_split_d_fwd_cute<kDataType, kHeadDim, kStage, 32, 64>(
+            Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
+            dropout_p, philox_seed, philox_offset);
+      } else if constexpr (kHeadDim % 32 == 0) {
+        launch_ffpa_attn_split_d_fwd_cute<kDataType, kHeadDim, kStage, 32, 32>(
+            Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
+            dropout_p, philox_seed, philox_offset);
+      }
+    }
     return;
   }
 #endif  // ENABLE_FFPA_CUTE_EXT
@@ -955,17 +984,29 @@ void launch_ffpa_attn_split_d_fwd_cute(torch::Tensor Q, torch::Tensor K,
 
   constexpr int kBr = 128;
   constexpr int kBc = 128;
-  // kVDChunk=32: stages=2 optimal (lower reg pressure, validated 141T@D=512)
-  // kVDChunk=64: stages=3 optimal (96KB smem limit on sm_120a)
-  constexpr int kMaxStages = (kVDChunk <= 32) ? 2 : 3;
-  constexpr int kStagesQK = (kStage > kMaxStages ? kMaxStages : kStage);
-  constexpr int kStagesPV = kStagesQK;
   constexpr int kNumThreads = kBr / 16 * 32;
 
   using CuteElement = std::conditional_t<std::is_same_v<kDataType, __half>,
                                          cutlass::half_t, cutlass::bfloat16_t>;
   using Traits = ffpa_cute::FFPAAttnCuTeTraits<kHeadDim, kBr, kBc, kQKDChunk,
                                                kVDChunk, CuteElement>;
+
+  constexpr int kQTileBytes = kBr * kQKDChunk * sizeof(CuteElement);
+  constexpr int kKTileBytes = kBc * kQKDChunk * sizeof(CuteElement);
+  constexpr int kVTileBytes = kBc * kVDChunk * sizeof(CuteElement);
+  constexpr int kSmemPerStage = kQTileBytes + kKTileBytes + kVTileBytes;
+  constexpr int kStagesQK = kStage;
+  constexpr int kStagesPV = kStagesQK;
+  constexpr int kSmemBytes = kStagesQK * kSmemPerStage;
+
+  int max_smem_optin = 0;
+  cudaDeviceGetAttribute(&max_smem_optin,
+                         cudaDevAttrMaxSharedMemoryPerBlockOptin,
+                         Q.device().index());
+  TORCH_CHECK(kSmemBytes <= max_smem_optin, "ffpa_attn: CuTe kernel requires ",
+              kSmemBytes, " bytes smem (stages=", kStagesQK,
+              ", chunk=", kQKDChunk, "/", kVDChunk, ") but device supports ",
+              max_smem_optin, " bytes opt-in smem");
 
   const int Nb = Q.size(0);
   const int Nh = Q.size(1);
@@ -1027,12 +1068,6 @@ void launch_ffpa_attn_split_d_fwd_cute(torch::Tensor Q, torch::Tensor K,
 
   const c10::cuda::OptionalCUDAGuard device_guard(Q.device());
   auto stream = at::cuda::getCurrentCUDAStream();
-
-  constexpr int kQTileBytes = kBr * kQKDChunk * sizeof(CuteElement);
-  constexpr int kKTileBytes = kBc * kQKDChunk * sizeof(CuteElement);
-  constexpr int kVTileBytes = kBc * kVDChunk * sizeof(CuteElement);
-  constexpr int kSmemBytes = kStagesQK * kQTileBytes + kStagesQK * kKTileBytes +
-                             kStagesPV * kVTileBytes;
 
   float* softmax_lse_ptr =
       softmax_lse.numel() > 0 ? softmax_lse.data_ptr<float>() : nullptr;

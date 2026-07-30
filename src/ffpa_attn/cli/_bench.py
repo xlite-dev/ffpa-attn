@@ -310,6 +310,13 @@ def _parse_args() -> argparse.Namespace:
     "Enable experimental SM90+ TMA forward path (silently falls back on unsupported devices).",
   )
   parser.add_argument(
+    "--enable-fwd-cute",
+    "--cute",
+    action="store_true",
+    help=
+    "Enable the CuTe cp.async forward kernel (CUDA backend only; ignored by other backends).",
+  )
+  parser.add_argument(
     "--enable-bwd-tma",
     "--bwd-tma",
     action="store_true",
@@ -398,6 +405,10 @@ def _resolve_directional_cli_flags(
   if args.enable_ws:
     args.enable_fwd_ws = True
     args.enable_bwd_ws = True
+  if args.enable_fwd_cute and args.forward_backend != "cuda":
+    raise SystemExit(
+      "--cute/--enable-fwd-cute is only valid with --forward-backend cuda"
+    )
   if args.enable_persist_dkdv and not args.enable_bwd_tma:
     raise SystemExit("--enable-persist-dkdv requires --enable-bwd-tma")
   return args
@@ -1474,6 +1485,7 @@ def _benchmark_rows(
         print_results=True,
         enable_tma=args.enable_fwd_tma,
         enable_ws=args.enable_fwd_ws,
+        enable_cute=args.enable_fwd_cute,
         tasks=tasks,
         dtypes=dtypes,
         verbose=args.verbose,
