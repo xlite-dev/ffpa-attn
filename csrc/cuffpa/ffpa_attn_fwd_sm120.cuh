@@ -217,7 +217,7 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK +
   }
   __syncthreads();
 
-  const bool is_producer = threadIdx.x < kEffProducerThreads ? true : false;
+  const bool is_producer = threadIdx.x < kEffProducerThreads;
   const int wg_tid =
       is_producer ? threadIdx.x : (threadIdx.x - kEffProducerThreads);
   const int warp_QP = wg_tid / WARP_SIZE;

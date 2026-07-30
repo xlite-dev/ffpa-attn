@@ -1,6 +1,6 @@
 <div align="center">
   <p align="center">
-    <h2>🤖FFPA: Yet another Faster Flash Prefill Attention <br>with O(1)⚡️GPU SRAM complexity for large headdim🐑</h2>
+    <h2>🤖FFPA: Kernel Library for Large Headdim Attention</h2>
   </p>
   <img src=https://img.shields.io/badge/language-CUDA/Python-brightgreen.svg >
   <a href="https://pepy.tech/projects/ffpa-attn"><img src=https://static.pepy.tech/personalized-badge/ffpa-attn?period=total&units=ABBREVIATION&left_color=GRAY&right_color=BLUE&left_text=downloads/pypi ></a>
@@ -10,19 +10,19 @@
   <img src="assets/ffpa-api.png" width="700px">
 </div>
 
-**FFPA(Split-D)**: Yet another **Faster Flash Prefill Attention** with **Split-D** strategy, achieve **O(1) SRAM complexity** and **O(d/4) register complexity** for large headdim (**> 256**), **1.5~3x** 🎉 faster than SDPA. 📚👇The Core features:
+**FFPA**: A production-ready Kernel Library with **Split-D** strategy for **Large Headdim Attention**, achieve **O(1)** SRAM complexity and **O(d/2)** register complexity, **1.5x~6x** 🎉 speedup over standard PyTorch SDPA.
 
 <div align='center' markdown="1">
 
 |[Self Attn](./bench)| [GQA/MQA](./bench) |[Cross Attn](./bench)|[Causal/Mask](./bench)|[Dropout](./bench)|[Headdim](#ffpa-design)|[Fwd/Bwd](./bench)|
 |:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-|✔️(`Nq=Nkv`)|✔️(`Hq!=Hkv`)|✔️(`Nq!=Nkv`)|✔️(`attn_mask`)|✔️(`p>0`)|**320~1024** |**1.5~3x↑** |
+|✔️(`Nq=Nkv`)|✔️(`Hq!=Hkv`)|✔️(`Nq!=Nkv`)|✔️(`attn_mask`)|✔️(`p>0`)|**320~1024** |**1.5x~6x↑** |
 
 </div>
 
-## 🎉🎉 Latest News
+## 🎉 Latest News
 
-- [2026-06-10] DefTruth, Butterfingrz (2026). [FFPA: Efficient Flash Prefill Attention for Large Head Dimensions via Split-D.](assets/papers/ffpa-tech-report-v1.pdf) Zenodo, 2026. [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.20638547.svg)](https://doi.org/10.5281/zenodo.20638547) 🎉🎉🎉
+- [2026-06-10] DefTruth, Butterfingrz (2026), [FFPA: Kernel Library for Large Headdim Attention](https://doi.org/10.5281/zenodo.20638547). 🎉🎉🎉
 
 ## 📖 Quick Start
 
@@ -203,21 +203,21 @@ print(f"dV vs SDPA dV max_abs_err={(dv - v_ref.grad).abs().max().item():.4e}")
 
 <a id="ffpa-design"></a>
 
-We extend FlashAttention to support large headdim ($D>256$) via **fine-grained tiling** at the **MMA** level for $QK^\top$ and $PV$ matrix multiplication, referred to as **Split-D**. This design keeps SRAM usage fixed at $B_r \times 16$ (with $B_r=B_c$) for Q, K and V, yielding constant SRAM complexity $O(B_r \times 16) \approx O(1)$ and register complexity $O(d/4)$.
+We extend FlashAttention to support large headdim ($D>256$) via **fine-grained tiling** at the **MMA** level for $QK^\top$ and $PV$ matrix multiplication, referred to as **Split-D**. This design keeps SRAM usage fixed at $B_r \times 16$ (with $B_r=B_c$) for Q, K and V, yielding constant SRAM complexity $O(B_r \times 16) \approx O(1)$ and register complexity $O(d/2)$.
 
 <div align='center'>
   <img src="./assets/split-d.png" width="700px">
   </p><i>
-    <b>FFPA</b> enables headdim <b> > 256</b>, and outperforms standard SDPA by <b>1.5~3x</b>🎉.
+    <b>FFPA</b> enables headdim <b> > 256</b>, and outperforms standard SDPA by <b>1.5x~6x</b>🎉.
   </i></p>
 </div>
 
 > [!NOTE]
-> FFPA has been tested on `Ampere`, `Ada`, `Hopper`, and `Blackwell` architectures (e.g., A30, L20, 4090, H200, 5090), achieves `1.5~3×↑🎉` speedup over SDPA. FFPA is mainly design for **prefill** and large headdim, and may not be faster than SDPA for 😈 small sequence length (`N<512`) or small headdim (`D<=256`).
+> FFPA has been tested on `Ampere`, `Ada`, `Hopper`, and `Blackwell` architectures (e.g., A30, L20, 4090, H200, 5090), achieves `1.5x~6x↑🎉` speedup over SDPA. FFPA is mainly design for **prefill** and large headdim, and may not be faster than SDPA for 😈 small sequence length (`N<512`) or small headdim (`D<=256`).
 
 ## 🎉 Benchmark
 
-Runnable benchmark are provided under [`bench`](./bench). The performance benchmarks for the NVIDIA L20 (**Ada**), NVIDIA Geforce RTX 5090 (**Blackwell**), NVIDIA H800 PCIE (**Hopper**), NVIDIA H200 SXM (**Hopper**, **CuTeDSL** backend, up to **427** TFLOPS!🎉) with large headdims can be found at [`bench`](./bench).
+Runnable benchmark are provided under [`bench`](./bench). The performance benchmarks for the NVIDIA L20 (**Ada**), NVIDIA Geforce RTX 5090 (**Blackwell**), NVIDIA H800 PCIE (**Hopper**), NVIDIA H200 SXM (**Hopper**, **CuTeDSL** backend, up to **513-535** TFLOPS!🎉) with large headdims can be found at [`bench`](./bench).
 
 <div align='center'>
   <img src='./assets/perf/ffpa_speedup_nvidia-l20_B1_H32_N8192_D320_T.png' width='350px'>
@@ -232,32 +232,49 @@ Runnable benchmark are provided under [`bench`](./bench). The performance benchm
 
 ## 🤖 Backends
 
-FFPA supports multiple backends for the forward and backward pass, including: [`SDPA`](./bench/) (baseline), [`CUDA`](./bench/) (forward only), [`Triton`](./bench/), and [`CuTeDSL`](./bench/). The `CuTeDSL` backend is currently in early stage and has some constraints, but it can achieve up to `427🎉` TFLOPS on H200! Stay tuned for future updates.
+FFPA supports multiple backends for the forward and backward pass, including: [`SDPA`](https://github.com/xlite-dev/ffpa-attn/tree/main/bench/) (baseline), [`CUDA`](https://github.com/xlite-dev/ffpa-attn/tree/main/bench/) (forward only), [`Triton`](https://github.com/xlite-dev/ffpa-attn/tree/main/bench/), and [`CuTe-DSL`](https://github.com/xlite-dev/ffpa-attn/tree/main/bench/). The `CuTe-DSL` backend is currently in early stage and has some constraints, but it can achieve up to `513-535🎉` TFLOPS on H200! Stay tuned for future updates.
 
 <div align='center' markdown="1">
 
 |Backend|Arch|Fwd|Bwd|Headdim|Autotune|Speedup|Recommend|
 |:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
 |SDPA|sm>=75|✔|✔|All|❌|**1.0x**🤗|sm>=75|
-|CUDA|sm>=80|✔|❌|320~1024|❌|**1.5x~3x**🎉|sm80~89,120|
+|CUDA|sm>=80|✔|❌|320~1024|❌|**1.5x~3x**🎉|sm_80~89,120a|
 |Triton|sm>=80|✔|✔|320~1024|✔|**1.5x~5x**🎉|sm>=80|
-|CuTeDSL|sm>=80|✔|✔|320~1024|❌|**1.5x~2x**🎉|sm80~89,120|
-|CuTeDSL|sm90|✔|✔|320~512|❌|**3x~6x**🎉|sm90|
-
-<i>Special thanks to [Butterfingrz](https://github.com/Butterfingrz) for contributing to the CuTeDSL backend! Awesome work!🎉</i>
+|CuTe-DSL|sm>=80|✔|✔|320~1024|❌|**1.5x~2x**🎉|sm_80~89,120a|
+|CuTe-DSL|sm_90a|✔|✔|320~512|❌|**3x~6x**🎉|sm_90a|
 
 </div>
 
 > [!NOTE]
-> 🔴 **AMD ROCm/HIP support**: the `Triton` backend (forward + backward) also runs on AMD GPUs through Triton's AMD backend, so no extra build flags are needed -- install ffpa-attn into a ROCm build of PyTorch and `ffpa_attn_func` will dispatch to Triton automatically (`pip3 install -e . --no-build-isolation`). The `CUDA` and `CuTeDSL` backends are NVIDIA-only (they rely on NVIDIA PTX such as MMA, ldmatrix and TMA) and are simply unavailable on AMD. Validated on AMD Instinct MI250X (`gfx90a`, Linux) and Radeon RX 9070 XT (`gfx1201`, Windows).
+> 🔴 **AMD ROCm/HIP support**: the `Triton` backend (forward + backward) also runs on AMD GPUs, install **ffpa-attn** into a **ROCm** build of PyTorch and it will dispatch to Triton AMD automatically. Validated on AMD Instinct MI250X (`gfx90a`, Linux) and Radeon RX 9070 XT (`gfx1201`, Windows).
 
 How to use different backends for your own scenario? Users can simply pass the Backend configs (SDPABackend, CUDABackend, TritonBackend or CuTeDSLBackend) to [ffpa_attn_func](https://ffpa-attn.readthedocs.io/en/latest/api/ffpa_attn/), for example:
 
 ```python
 >>> from ffpa_attn import ffpa_attn_func, CuTeDSLBackend
->>> # CuTeDSL backend, D=512 scenario, fastest on H200!🎉
+>>> # CuTe-DSL backend, D=512 scenario, fastest on H200!🎉
 >>> o = ffpa_attn_func(q, k, v, backend=CuTeDSLBackend())
 ```
+
+## Persistent Autotune
+
+Generate device-specific tuned configs for production deployment (currently, [`Triton`](https://ffpa-attn.readthedocs.io/en/latest/user_guide/autotune/) only), avoiding per-process autotune cost. The generated JSON is saved under [configs](https://github.com/xlite-dev/ffpa-attn/tree/main/src/ffpa_attn/triton/configs) dir and automatically loaded when runtime autotune is disabled (the default). See the docs of [Triton Autotune](https://ffpa-attn.readthedocs.io/en/latest/user_guide/autotune/) for details.
+
+```bash
+python -m ffpa_attn.autotune --mode max --full-tasks --overwrite # 1 GPU
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 # Multi-GPU (`pip install ray`)
+python -m ffpa_attn.autotune --mode max --full-tasks --num-gpus 8 --overwrite
+```
+
+## End-to-End (E2E) Training
+
+NVIDIA-NeMo Automodel PR [#2436](https://github.com/NVIDIA-NeMo/Automodel/pull/2436) shows that on Gemma4-31B training (L=8192, 8xH200, FSDP2 + Activation Checkpointing), accelerating the **10/60** `D=512` full-attention layers with ffpa-attn delivers about [`1.4x-1.5x🎉`](https://github.com/NVIDIA-NeMo/Automodel/pull/2436) higher throughput (**E2E**) than SDPA at similar memory footprint, with loss aligned within normal bf16 noise.
+
+<div align='center'>
+  <img src="./assets/e2e/gemma4-31b-8k.png" width="800px">
+</div>
+
 
 ## ©️License
 
