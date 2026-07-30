@@ -10,11 +10,11 @@
   <img src="assets/ffpa-api.png" width="700px">
 </div>
 
-**FFPA**: A production-ready Kernel Library with **Split-D** strategy for **Large Headdim Attention**, achieve **O(1)** SRAM complexity and **O(d/2)** register complexity, **1.5x~6x** 🎉 speedup over standard PyTorch SDPA.
+**FFPA**: A production-ready **Kernel Library** with **Split-D** strategy for **Large Headdim Attention**, achieve **O(1)** SRAM complexity and **O(d/2)** register complexity, **1.5x~6x** 🎉 speedup over standard PyTorch SDPA.
 
 <div align='center' markdown="1">
 
-|[Self Attn](./bench)| [GQA/MQA](./bench) |[Cross Attn](./bench)|[Causal/Mask](./bench)|[Dropout](./bench)|[Headdim](#ffpa-design)|[Fwd/Bwd](./bench)|
+|[Self Attn](https://github.com/xlite-dev/ffpa-attn/tree/main/bench)| [GQA/MQA](https://github.com/xlite-dev/ffpa-attn/tree/main/bench) |[Cross Attn](https://github.com/xlite-dev/ffpa-attn/tree/main/bench)|[Causal/Mask](https://github.com/xlite-dev/ffpa-attn/tree/main/bench)|[Dropout](https://github.com/xlite-dev/ffpa-attn/tree/main/bench)|[Headdim](#ffpa-design)|[Fwd/Bwd](https://github.com/xlite-dev/ffpa-attn/tree/main/bench)|
 |:---:|:---:|:---:|:---:|:---:|:---:|:---:|
 |✔️(`Nq=Nkv`)|✔️(`Hq!=Hkv`)|✔️(`Nq!=Nkv`)|✔️(`attn_mask`)|✔️(`p>0`)|**320~1024** |**1.5x~6x↑** |
 

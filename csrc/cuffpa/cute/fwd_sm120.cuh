@@ -53,6 +53,7 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
   //   convert_layout_acc_Aregs:  MMA C-fragment → A-operand regs for PV
   //     (reuses P registers as MMA-A without data movement).
   //   SmemLayoutVt: transposed V layout for gemm_rs B-operand (LDSM_T).
+  // Why NOT WS? Please check ../fwd_sm120.cuh for more details.
 
   using namespace cute;
   using Element = typename Traits::Element;
@@ -385,9 +386,10 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
       if constexpr (kHasAttnBias) {
         ffpa_cute::apply_attn_bias_rowcol<decltype(scores), decltype(tScS_rc),
                                           kSRows, kSCols>(
-            scores, tScS_rc, attn_bias, attn_bias_dtype, attn_bias_stride_b,
-            attn_bias_stride_h, attn_bias_stride_m, attn_bias_stride_n, Nb_id,
-            Nh_id, Br_base, kv_tile, kBc, inv_scale);
+            scores, tScS_rc, attn_bias, attn_bias_dtype,
+            (int)attn_bias_stride_b, (int)attn_bias_stride_h,
+            (int)attn_bias_stride_m, (int)attn_bias_stride_n, Nb_id, Nh_id,
+            Br_base, kv_tile, kBc, inv_scale);
       }
 
       // Row-max + exp2 + row-sum (warp-level reduction via shfl_xor).

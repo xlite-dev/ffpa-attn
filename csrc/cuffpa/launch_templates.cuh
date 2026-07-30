@@ -477,6 +477,7 @@ void launch_ffpa_attn_fwd_template(torch::Tensor Q, torch::Tensor K,
       if (prop->major == 9 || prop->major == 10) {
         // sm_90/100 (228 KB smem): WS path, setmaxnreg effective.
         if (!has_attn_bias && !has_dropout && kHeadDim <= 512) {
+          // w/ kPersistQg2s = 1
           launch_ffpa_attn_fwd_template_sm120<
               kDataType, kHeadDim, kMmaAccFloat32QK, kMmaAccFloat32PV, kStage,
               64 /*kQKDChunk*/, 64 /*kVDChunk*/, 0 /*kShareSmemQKV*/,
@@ -485,6 +486,7 @@ void launch_ffpa_attn_fwd_template(torch::Tensor Q, torch::Tensor K,
               Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
               dropout_p, philox_seed, philox_offset);
         } else {
+          // w/ kPersistQg2s = 0
           launch_ffpa_attn_fwd_template_sm120<
               kDataType, kHeadDim, kMmaAccFloat32QK, kMmaAccFloat32PV, kStage,
               64 /*kQKDChunk*/, 64 /*kVDChunk*/, 0 /*kShareSmemQKV*/,

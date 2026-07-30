@@ -9,7 +9,7 @@
     <img src="docs/assets/ffpa-api.png" width="700px">
 </div>
 
-**FFPA**: A production-ready Kernel Library with **Split-D** strategy for **Large Headdim Attention**, achieve **O(1)** SRAM complexity and **O(d/2)** register complexity, **1.5x~6x** 🎉 speedup over standard PyTorch SDPA.
+**FFPA**: A production-ready **Kernel Library** with **Split-D** strategy for **Large Headdim Attention**, achieve **O(1)** SRAM complexity and **O(d/2)** register complexity, **1.5x~6x** 🎉 speedup over standard PyTorch SDPA.
 
 <div align='center' markdown="1">
 
