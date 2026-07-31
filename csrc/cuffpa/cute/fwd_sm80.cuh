@@ -7,6 +7,8 @@
 #include <cutlass/cutlass.h>
 
 #include "common.cuh"
+#include "gemm.cuh"
+#include "attn_traits.cuh"
 #include "attn_bias.cuh"
 #include "dropout.cuh"
 #include "softmax.cuh"

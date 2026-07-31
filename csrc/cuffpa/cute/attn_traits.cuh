@@ -107,4 +107,51 @@ struct FFPAAttnCuTeTraits {
   static constexpr int kVTileBytes = kBc * kVDChunk * sizeof(Element);
 };
 
+// Persist-D traits: full-D TMA + full-D GEMM (no D-chunking).
+// Q persisted in smem; K/V pipelined with independent stages.
+// TiledMma uses large N tiles: QK=[kBr,kBc], PV=[kBr,kHeadDim].
+template <int kHeadDim_, int kBr_ = 128, int kBc_ = 64, int kStagesK_ = 2,
+          int kStagesV_ = 2, typename Element_ = cutlass::half_t>
+struct FFPAAttnCuTePersistDTraits {
+  static constexpr int kHeadDim = kHeadDim_;
+  static constexpr int kBr = kBr_;
+  static constexpr int kBc = kBc_;
+  static constexpr int kNumWarps = kBr / 16;
+  static constexpr int kNumThreads = kNumWarps * 32;
+  static constexpr int kStagesK = kStagesK_;
+  static constexpr int kStagesV = kStagesV_;
+  static constexpr float kRescaleThreshold = 8.0f;
+
+  static constexpr int kSmemElems =
+      kBr * kHeadDim + kStagesK * kBc * kHeadDim + kStagesV * kBc * kHeadDim;
+
+  using Element = Element_;
+  using SmemAtom = GMMA::Layout_K_SW128_Atom<Element>;
+  using SmemLayoutQ =
+      decltype(tile_to_shape(SmemAtom{}, Shape<Int<kBr>, Int<kHeadDim>>{}));
+  using SmemLayoutKV =
+      decltype(tile_to_shape(SmemAtom{}, Shape<Int<kBc>, Int<kHeadDim>>{}));
+  using SmemLayoutKVt = decltype(composition(
+      SmemLayoutKV{},
+      make_layout(Shape<Int<kHeadDim>, Int<kBc>>{}, GenRowMajor{})));
+  using SmemLayoutO =
+      decltype(tile_to_shape(SmemAtom{}, Shape<Int<kBr>, Int<kHeadDim>>{}));
+
+  using MmaAtom =
+      std::conditional_t<std::is_same<Element, cutlass::half_t>::value,
+                         MMA_Atom<SM80_16x8x16_F32F16F16F32_TN>,
+                         MMA_Atom<SM80_16x8x16_F32BF16BF16F32_TN>>;
+
+  using TiledMmaQK = decltype(make_tiled_mma(
+      MmaAtom{}, Layout<Shape<Int<kNumWarps>, _1, _1>>{},
+      Tile<Int<kBr>, Int<kBc>, _16>{}));
+
+  using TiledMmaPV = decltype(make_tiled_mma(
+      MmaAtom{}, Layout<Shape<Int<kNumWarps>, _1, _1>>{},
+      Tile<Int<kBr>, Int<kHeadDim>, _16>{}));
+
+  using SmemCopyAtom = Copy_Atom<SM75_U32x4_LDSM_N, Element>;
+  using SmemCopyAtomTransposed = Copy_Atom<SM75_U16x8_LDSM_T, Element>;
+};
+
 }  // namespace ffpa_cute

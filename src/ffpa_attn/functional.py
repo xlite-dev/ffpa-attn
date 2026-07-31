@@ -94,11 +94,6 @@ def _is_hopper_or_later() -> bool:
   return (major, minor) >= (9, 0)
 
 
-def _default_cuda_stages() -> int:
-  """Default pipeline depth for CUDA backend (non-TMA path)."""
-  return 4
-
-
 def _apply_cuda_backend_hint(backend: CUDABackend) -> None:
   """Set C++ backend impl hint from CUDABackend flags before kernel launch.
 
@@ -192,7 +187,7 @@ class CUDABackend(Backend):
   """
   name: str = "cuda"
   acc: str = "f32"
-  stages: int = _default_cuda_stages()
+  stages: int = None
   enable_tma: bool = False
   enable_cute: bool = False
   enable_ws: bool = False
@@ -203,10 +198,31 @@ class CUDABackend(Backend):
     assert self.acc in (
       "f16", "f32"
     ), f"acc must be 'f16' or 'f32', got {self.acc!r}"
+    self.stages = self._default_cuda_stages(
+    ) if self.stages is None else self.stages
 
   @property
   def acc_code(self) -> int:
     return _ACC_F32 if self.acc == "f32" else _ACC_F16
+
+  def _default_cuda_stages(self) -> int:
+    from .cuda import CudaBackendImpl
+    """Default pipeline depth for CUDA backend (non-TMA path)."""
+    if _is_hopper_or_later(
+    ) and self.impl_hint in (CudaBackendImpl.NATIVE, CudaBackendImpl.TMA):
+      return 4
+    return 3
+
+  @property
+  def impl_hint(self) -> int:
+    from .cuda import CudaBackendImpl
+    if self.enable_tma and self.enable_cute:
+      return CudaBackendImpl.CUTE_TMA
+    if self.enable_tma:
+      return CudaBackendImpl.TMA
+    if self.enable_cute:
+      return CudaBackendImpl.CUTE
+    return CudaBackendImpl.NATIVE
 
 
 @dataclass
