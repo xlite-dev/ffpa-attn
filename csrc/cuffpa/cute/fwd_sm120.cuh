@@ -1169,14 +1169,11 @@ __global__ void __launch_bounds__(384, 1) ffpa_attn_persist_d_ws_fwd_cute_sm120(
 }
 
 // WS split-D: 128 producer (TMA-only) + 256 consumer (MMA-only), 384 threads.
-// Same D-chunked QK/PV algorithm as ffpa_attn_split_d_fwd_cute_sm120; the
-// producer warpgroup owns ALL TMA issue (Q/K + V prefetch-ahead loops) and
-// the consumer warpgroups run QK->softmax->PV with no TMA state.
-// Register strategy: kBr=64 + M4N2 (see FFPAAttnCuTeSplitDWsTraits) cuts the
-// O accumulator to D/4; setmaxnreg (sm_120f only, see header note) lifts the
-// consumer to 232 regs so D=512 (O acc 128 + ~84 working set) does not spill.
-// D=256/320 fit the static 168-reg budget (O acc 64/80), so setmaxnreg is
-// gated to kHeadDim >= 512 to avoid the TRY_ALLOC overhead.
+// Same D-chunked QK/PV algorithm and SAME consumer MMA layout (FA-2 split-Q
+// M8N1 via FFPAAttnCuTeTraits, kBr=128) as ffpa_attn_split_d_fwd_cute_sm120;
+// the only difference is a dedicated 128-thread TMA producer warpgroup.
+// Register strategy: consumer reuses the non-WS M8N1 layout (256 threads);
+// setmaxnreg (sm_120f) gated to kHeadDim >= 512.
 // Epilogue: batched R->S->TMA store (aligned) or R->G (tail); a __syncthreads
 // would deadlock since the producer warpgroup has already fallen through the
 // early-return below, so sync with a named barrier (consumer threads only).
@@ -1196,6 +1193,8 @@ __global__ void __launch_bounds__(384, 1) ffpa_attn_split_d_ws_fwd_cute_sm120(
     float dropout_p = 0.0f, unsigned long long philox_seed = 0,
     unsigned long long philox_offset = 0) {
   using namespace cute;
+  using cute::tma_store_arrive;
+  using cute::tma_store_wait;
   using Element = typename Traits::Element;
   using SmemLayoutQ = typename Traits::SmemLayoutQ;
   using SmemLayoutK = typename Traits::SmemLayoutK;
@@ -1222,6 +1221,10 @@ __global__ void __launch_bounds__(384, 1) ffpa_attn_split_d_ws_fwd_cute_sm120(
   constexpr int kQChunkElements = cosize(SmemLayoutQ{});
   constexpr int kKChunkElements = cosize(SmemLayoutK{});
   constexpr int kVChunkElements = cosize(SmemLayoutV{});
+
+  // TMA-O epilogue reuses shm as the O staging buffer; guard that it fits.
+  static_assert(cosize(SmemLayoutO{}) <= kStagesPV * cosize(SmemLayoutV{}),
+                "TMA-O: O staging buffer must fit in reused V-stage smem");
 
   const int Nb_id = blockIdx.y / Nh;
   const int Nh_id = blockIdx.y % Nh;
@@ -1258,8 +1261,13 @@ __global__ void __launch_bounds__(384, 1) ffpa_attn_split_d_ws_fwd_cute_sm120(
   __shared__ uint64_t v_full[kStagesPV];
   __shared__ uint64_t v_empty[kStagesPV];
 
-  // Barrier roles match the non-WS split-D kernel, except *_empty count
-  // kConsumerThreads: only consumers arrive (the producer only waits).
+  // Barrier roles match the non-WS split-D kernel: *_full (TmaBarrier,
+  // init=1) signals TMA data ready; *_empty (CtaBarrier, init=kConsumerThreads)
+  // signals the stage consumed. The producer follows the consumer chunk-by-
+  // chunk (wait(empty, phase) then issue), so it stays at most kStages-1
+  // chunks ahead and the phase parity never aliases -- a deeper prefetch
+  // would run >= 2 slot rounds ahead and let wait(parity) pass against an
+  // older round, overwriting a stage the consumer is still reading.
   if (tid == 0) {
     for (int s = 0; s < kStagesQK; ++s) {
       TmaBarrier::init(&qk_full[s], 1);
@@ -1277,10 +1285,14 @@ __global__ void __launch_bounds__(384, 1) ffpa_attn_split_d_ws_fwd_cute_sm120(
   // formula (chunk_index / kStages) & 1 matches the consumer's wait sequence
   // chunk-for-chunk (each consumer arrive round = one consumed chunk).
   if (is_producer) {
-    // Release regs to the CTA pool for the consumer warpgroups. Gated to
-    // kHeadDim >= 512: D=256/320 (O acc 64/80) fit the static 168-reg budget
-    // and TRY_ALLOC costs a blocking allocation.
-    if constexpr (kHeadDim >= 512) {
+    // warpgroup_reg_dealloc<N>: sets this warpgroup's per-thread register
+    // CEILING to N (regs above N go back to the CTA pool). It bounds the
+    // count, not "frees N regs"; the producer (TMA-only) needs ~32.
+    // Gated on D<512: the matching consumer alloc<232> (CTA-pool max) cannot
+    // hold D=512's 256-reg o_acc; regs past the ceiling read undefined (PTX),
+    // so non-deterministic junk accumulates per kv_tile (randn FAIL at N>=512,
+    // verified). D<512 (128 regs) sits safely under 232.
+    if constexpr (kHeadDim < 512) {
       cutlass::arch::warpgroup_reg_dealloc<32>();
     }
     if (wg_tid == 0) {
@@ -1328,50 +1340,25 @@ __global__ void __launch_bounds__(384, 1) ffpa_attn_split_d_ws_fwd_cute_sm120(
         copy(tma_v.with(v_full[stage]), tVgV, tVsV);
       };
 
-      // P1: prefetch Q/K and V for tiles 0..S-2. The wait below gates each
-      // slot's reuse; with kStages < kDChunks the same stage is reused across
-      // d_chunks and the phase formula keeps producer/consumer lockstep.
-      for (int s = 0; s < kStagesQK - 1; ++s) {
-        if (s < Tc_eff) {
-          for (int d = 0; d < kDChunksQK; ++d) {
-            const int chunk_index = s * kDChunksQK + d;
-            CtaBarrier::wait(&qk_empty[chunk_index % kStagesQK],
-                             (chunk_index / kStagesQK) & 1);
-            issue_qk_tma(d, chunk_index % kStagesQK, s);
-          }
+      // Follow the consumer chunk-by-chunk (same protocol as the LeetCUDA
+      // ffpa_attn_tma_mma_ws_split_d_cute kernel): wait(empty, phase) then
+      // issue, per chunk. This keeps the producer at most kStages - 1 chunks
+      // ahead of the consumer, so the wait parity always matches the round
+      // the consumer just completed (never aliasing against an older one).
+      for (int kv_tile = 0; kv_tile < Tc_eff; ++kv_tile) {
+        for (int d = 0; d < kDChunksQK; ++d) {
+          const int chunk_index = kv_tile * kDChunksQK + d;
+          const int stage = chunk_index % kStagesQK;
+          const int phase = (chunk_index / kStagesQK) & 1;
+          CtaBarrier::wait(&qk_empty[stage], phase);
+          issue_qk_tma(d, stage, kv_tile);
         }
-      }
-      for (int s = 0; s < kStagesPV - 1; ++s) {
-        if (s < Tc_eff) {
-          for (int v = 0; v < kDChunksV; ++v) {
-            const int chunk_index = s * kDChunksV + v;
-            CtaBarrier::wait(&v_empty[chunk_index % kStagesPV],
-                             (chunk_index / kStagesPV) & 1);
-            issue_v_tma(v, chunk_index % kStagesPV, s);
-          }
-        }
-      }
-      // P2: prefetch-ahead loop (K-first, matching the consumer's QK-then-PV
-      // order). k_tile == tile + kStages - 1 keeps exactly kStages - 1 tiles
-      // in flight beyond the consumer's current tile.
-      for (int tile = 0; tile < Tc_eff; ++tile) {
-        const int k_tile = tile + kStagesQK - 1;
-        if (k_tile < Tc_eff) {
-          for (int d = 0; d < kDChunksQK; ++d) {
-            const int chunk_index = k_tile * kDChunksQK + d;
-            CtaBarrier::wait(&qk_empty[chunk_index % kStagesQK],
-                             (chunk_index / kStagesQK) & 1);
-            issue_qk_tma(d, chunk_index % kStagesQK, k_tile);
-          }
-        }
-        const int v_tile = tile + kStagesPV - 1;
-        if (v_tile < Tc_eff) {
-          for (int v = 0; v < kDChunksV; ++v) {
-            const int chunk_index = v_tile * kDChunksV + v;
-            CtaBarrier::wait(&v_empty[chunk_index % kStagesPV],
-                             (chunk_index / kStagesPV) & 1);
-            issue_v_tma(v, chunk_index % kStagesPV, v_tile);
-          }
+        for (int v = 0; v < kDChunksV; ++v) {
+          const int chunk_index = kv_tile * kDChunksV + v;
+          const int stage = chunk_index % kStagesPV;
+          const int phase = (chunk_index / kStagesPV) & 1;
+          CtaBarrier::wait(&v_empty[stage], phase);
+          issue_v_tma(v, stage, kv_tile);
         }
       }
     }
@@ -1379,8 +1366,13 @@ __global__ void __launch_bounds__(384, 1) ffpa_attn_split_d_ws_fwd_cute_sm120(
   }
 
   // Consumer warpgroups (wg_tid 0..255): no TMA issue, no __syncthreads
-  // (single-WG sync points only). Take the producer's released registers.
-  if constexpr (kHeadDim >= 512) {
+  // (single-WG sync points only).
+  // warpgroup_reg_alloc<N>: sets this warpgroup's per-thread register CEILING
+  // to N (pulls regs from the CTA pool; new regs hold undefined contents per
+  // PTX). It bounds, not "grants N"; 232 is the pool's max here.
+  // Gated on D<512: D=512 o_acc (256 regs) exceeds both 232 and the per-thread
+  // hard cap (255, R255=RZ) -> no valid ceiling, so setmaxnreg is skipped.
+  if constexpr (kHeadDim < 512) {
     cutlass::arch::warpgroup_reg_alloc<232>();
   }
 
@@ -1472,8 +1464,7 @@ __global__ void __launch_bounds__(384, 1) ffpa_attn_split_d_ws_fwd_cute_sm120(
       ffpa_cute::gemm_ss(tCrS, tCrQ, tCrK, tQsQ, tKsK, tiled_mma_qk, s2r_copy_q,
                          s2r_copy_k, s2r_thr_q, s2r_thr_k);
 
-      // Release the slot to the producer; no inline prefetch here (the
-      // producer owns the pipeline and waits on this arrive).
+      // Release the slot to the producer (it follows chunk-by-chunk).
       CtaBarrier::arrive(&qk_empty[stage]);
     }
 

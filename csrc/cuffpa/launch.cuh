@@ -558,9 +558,9 @@ void launch_ffpa_attn_fwd_template(torch::Tensor Q, torch::Tensor K,
                 Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
                 dropout_p, philox_seed, philox_offset);
           } else if constexpr (kHeadDim <= 512 && kHeadDim % 64 == 0) {
-            // WS split-D: D=256/320/512. D=256 avoids persist-D's Q-persist
-            // smem hog (S=1 there) for a deep pipeline; D=320/512 need the
-            // M4N2 D/4 O accumulator + setmaxnreg (D=512) to stay spill-free.
+            // WS split-D: D=256/320/512 (M8N1, same consumer as non-WS
+            // split-D). D=256 avoids persist-D's Q-persist smem hog (S=1
+            // there) for a deep pipeline.
             launch_ffpa_attn_split_d_ws_fwd_cute_sm120<kDataType, kHeadDim,
                                                        kStage>(
                 Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
@@ -1165,12 +1165,11 @@ void launch_ffpa_attn_split_d_ws_fwd_cute_sm120(
     int64_t philox_offset) {
   using namespace cute;
 
-  // WS split-D consumer is fixed 256T (8 warps, M4N2 grid, kBr=64): each
-  // thread's O accumulator is kBr*kHeadDim/256 = D/4, so D=512 needs 128 regs
-  // and fits the 232-reg consumer budget (setmaxnreg, gated to D>=512 in the
-  // kernel) with zero spills. kBc=64 keeps the per-stage footprint at 16KB,
-  // so up to S=6 fits the 99KB smem budget.
-  constexpr int kBr = 64;
+  // WS split-D reuses FFPAAttnCuTeTraits (FA-2 split-Q M8N1: 8 warps along M,
+  // 1 along N), identical to the non-WS split-D consumer (kBr=128). The WS
+  // layer only adds a 128-thread TMA producer warpgroup; the consumer MMA
+  // layout is the same proven M8N1 used by ffpa_attn_split_d_fwd_cute_sm120.
+  constexpr int kBr = 128;
   constexpr int kBc = 64;
   constexpr int kQKDChunk = 32;
   constexpr int kVDChunk = 64;
@@ -1183,15 +1182,14 @@ void launch_ffpa_attn_split_d_ws_fwd_cute_sm120(
   constexpr int kStagesQK =
       (kStage < 2) ? 2 : (kStage > kMaxStages ? kMaxStages : kStage);
   constexpr int kStagesPV = kStagesQK;
-  // WS: 128 producer + 256 consumer = 384 threads
+  // WS: 128 producer + 256 consumer (M8N1) = 384 threads
   constexpr int kNumThreads = 384;
 
   using CuteElement = std::conditional_t<std::is_same_v<kDataType, __half>,
                                          cutlass::half_t, cutlass::bfloat16_t>;
   using Traits =
-      ffpa_cute::FFPAAttnCuTeSplitDWsTraits<kHeadDim, kBr, kBc, kQKDChunk,
-                                            kVDChunk, kStagesQK, kStagesPV,
-                                            CuteElement>;
+      ffpa_cute::FFPAAttnCuTeTraits<kHeadDim, kBr, kBc, kQKDChunk, kVDChunk,
+                                    kStagesQK, kStagesPV, CuteElement>;
   using SmemLayoutQ = typename Traits::SmemLayoutQ;
   using SmemLayoutK = typename Traits::SmemLayoutK;
   using SmemLayoutV = typename Traits::SmemLayoutV;
