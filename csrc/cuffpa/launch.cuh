@@ -557,15 +557,15 @@ void launch_ffpa_attn_fwd_template(torch::Tensor Q, torch::Tensor K,
                                                          kStage>(
                 Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
                 dropout_p, philox_seed, philox_offset);
-          } else if constexpr (kHeadDim <= 512 && kHeadDim % 64 == 0) {
-            // WS split-D: D=256/320/512 (M8N1, same consumer as non-WS
-            // split-D). D=256 avoids persist-D's Q-persist smem hog (S=1
-            // there) for a deep pipeline.
-            launch_ffpa_attn_split_d_ws_fwd_cute_sm120<kDataType, kHeadDim,
-                                                       kStage>(
-                Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
-                dropout_p, philox_seed, philox_offset);
           } else if constexpr (kHeadDim % 64 == 0) {
+            // split-D (non-WS): D=256/320/512/640. The WS variant
+            // (launch_ffpa_attn_split_d_ws_fwd_cute_sm120) is disabled:
+            // setmaxnreg's consumer ceiling (232, CTA-pool max) cannot hold
+            // D=512's 256-reg o_acc (per-thread hard cap 255), and D=256/320/
+            // 512 show no perf gain over non-WS (o_acc=D*kBr/256 regs spills
+            // to local mem either way). WS kernel kept in cute/fwd_sm120.cuh
+            // for reference; FA-1 M4N2 is the path to lower large-D reg
+            // pressure (.tmp/plans/ffpa_fa1.md).
             launch_ffpa_attn_split_d_fwd_cute_sm120<kDataType, kHeadDim, kStage,
                                                     32, 64>(
                 Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
