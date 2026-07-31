@@ -694,31 +694,35 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
   }
 }
 
-// Persist-D FA forward: full-D TMA + full-D GEMM, no D-chunking.
+// WS persist-D: 128 producer (TMA-only) + 256 consumer (MMA-only), 384 threads.
+// sm_120a: setmaxnreg is ineffective (ptxas C7506), per-thread reg budget is
+// the static 65536/384; WS wins only via TMA latency hiding, not extra
+// registers. Epilogue is direct R->G: a __syncthreads here would deadlock since
+// the producer warpgroup has already fallen through the early-return below.
+// NOTE: Only 64-multiple small D (D=64/128) is supported today. Non-64-multiple
+// small D (D=32/96, SW128 swizzle requires headdim % 64 == 0) is handled by the
+// split-D kernel; 32-multiple small D WS support is planned (dispatch already
+// splits on %64==0).
 template <typename Traits, typename TmaQ, typename TmaK, typename TmaV,
           typename TmaO, int kHasAttnBias = 0, int kHasDropout = 0>
-__global__ void __launch_bounds__(Traits::kNumThreads, 1)
-    ffpa_attn_persist_d_fwd_cute_sm120(
-        CUTLASS_GRID_CONSTANT TmaQ const tma_q,
-        CUTLASS_GRID_CONSTANT TmaK const tma_k,
-        CUTLASS_GRID_CONSTANT TmaV const tma_v,
-        CUTLASS_GRID_CONSTANT TmaO const tma_o,
-        typename Traits::Element* __restrict__ O,
-        float* __restrict__ softmax_lse, int Nq, int Nkv, int Nh, int Nh_kv,
-        float scale, int Tc, int causal, int total_q_rows, int total_kv_rows,
-        const void* __restrict__ attn_bias = nullptr, int attn_bias_dtype = 0,
-        long long attn_bias_stride_b = 0, long long attn_bias_stride_h = 0,
-        long long attn_bias_stride_m = 0, long long attn_bias_stride_n = 0,
-        float dropout_p = 0.0f, unsigned long long philox_seed = 0,
-        unsigned long long philox_offset = 0) {
+__global__ void __launch_bounds__(384, 1) ffpa_attn_persist_d_ws_fwd_cute_sm120(
+    CUTLASS_GRID_CONSTANT TmaQ const tma_q,
+    CUTLASS_GRID_CONSTANT TmaK const tma_k,
+    CUTLASS_GRID_CONSTANT TmaV const tma_v,
+    CUTLASS_GRID_CONSTANT TmaO const tma_o,
+    typename Traits::Element* __restrict__ O, float* __restrict__ softmax_lse,
+    int Nq, int Nkv, int Nh, int Nh_kv, float scale, int Tc, int causal,
+    int total_q_rows, int total_kv_rows,
+    const void* __restrict__ attn_bias = nullptr, int attn_bias_dtype = 0,
+    long long attn_bias_stride_b = 0, long long attn_bias_stride_h = 0,
+    long long attn_bias_stride_m = 0, long long attn_bias_stride_n = 0,
+    float dropout_p = 0.0f, unsigned long long philox_seed = 0,
+    unsigned long long philox_offset = 0) {
   using namespace cute;
-  using cute::tma_store_arrive;
-  using cute::tma_store_wait;
   using Element = typename Traits::Element;
   using SmemLayoutQ = typename Traits::SmemLayoutQ;
   using SmemLayoutKV = typename Traits::SmemLayoutKV;
   using SmemLayoutKVt = typename Traits::SmemLayoutKVt;
-  using SmemLayoutO = typename Traits::SmemLayoutO;
   using TiledMmaQK = typename Traits::TiledMmaQK;
   using TiledMmaPV = typename Traits::TiledMmaPV;
   using SmemCopyAtom = typename Traits::SmemCopyAtom;
@@ -727,9 +731,10 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
   constexpr int kBr = Traits::kBr;
   constexpr int kBc = Traits::kBc;
   constexpr int kHeadDim = Traits::kHeadDim;
-  constexpr int kNumThreads = Traits::kNumThreads;
   constexpr int kStagesK = Traits::kStagesK;
   constexpr int kStagesV = Traits::kStagesV;
+  constexpr int kProducerThreads = 128;
+  constexpr int kConsumerThreads = 256;
 
   constexpr int kQTileElements = cosize(SmemLayoutQ{});
   constexpr int kKVTileElements = cosize(SmemLayoutKV{});
@@ -741,6 +746,8 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
   const int kv_head_idx = Nh_id / group_size;
   const int Br_base = Q_tile_id * kBr;
   const int tid = threadIdx.x;
+  const bool is_producer = tid < kProducerThreads;
+  const int wg_tid = is_producer ? tid : tid - kProducerThreads;
 
   if (Br_base >= Nq)
     return;
@@ -771,39 +778,146 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
     TmaBarrier::init(&q_full, 1);
     for (int s = 0; s < kStagesK; ++s) {
       TmaBarrier::init(&k_full[s], 1);
-      CtaBarrier::init(&k_empty[s], kNumThreads);
+      CtaBarrier::init(&k_empty[s], kConsumerThreads);
     }
     for (int s = 0; s < kStagesV; ++s) {
       TmaBarrier::init(&v_full[s], 1);
-      CtaBarrier::init(&v_empty[s], kNumThreads);
+      CtaBarrier::init(&v_empty[s], kConsumerThreads);
     }
   }
   __syncthreads();
 
-  auto mQ = domain_offset(
-      make_coord(q_row_offset, 0),
-      tma_q.get_tma_tensor(make_shape(total_q_rows, Int<kHeadDim>{})));
-  auto mK = domain_offset(
-      make_coord(kv_row_offset, 0),
-      tma_k.get_tma_tensor(make_shape(total_kv_rows, Int<kHeadDim>{})));
-  auto mV = domain_offset(
-      make_coord(kv_row_offset, 0),
-      tma_v.get_tma_tensor(make_shape(total_kv_rows, Int<kHeadDim>{})));
-  auto q_slice = tma_q.get_slice(_0{});
-  auto k_slice = tma_k.get_slice(_0{});
-  auto v_slice = tma_v.get_slice(_0{});
+  // Producer warpgroup: only wg_tid==0 issues TMA; the other 127 threads idle.
+  // P0 loads Q once; P1 prefetches K/V[0..S-2]; P2 prefetches ahead by S-1
+  // tiles (V-first then K-after) so consumer's K/V waits never stall.
+  if (is_producer) {
+    if (wg_tid == 0) {
+      auto mQ = domain_offset(
+          make_coord(q_row_offset, 0),
+          tma_q.get_tma_tensor(make_shape(total_q_rows, Int<kHeadDim>{})));
+      auto mK = domain_offset(
+          make_coord(kv_row_offset, 0),
+          tma_k.get_tma_tensor(make_shape(total_kv_rows, Int<kHeadDim>{})));
+      auto mV = domain_offset(
+          make_coord(kv_row_offset, 0),
+          tma_v.get_tma_tensor(make_shape(total_kv_rows, Int<kHeadDim>{})));
+      auto q_slice = tma_q.get_slice(_0{});
+      auto k_slice = tma_k.get_slice(_0{});
+      auto v_slice = tma_v.get_slice(_0{});
+
+      // P0: Q one-shot full-D TMA
+      auto sQ = make_tensor(make_smem_ptr(q_base), SmemLayoutQ{});
+      auto gQ = local_tile(mQ, Shape<Int<kBr>, Int<kHeadDim>>{},
+                           make_coord(Q_tile_id, _0{}));
+      auto tQgQ = q_slice.partition_S(gQ);
+      auto tQsQ = q_slice.partition_D(sQ);
+      TmaBarrier::arrive_and_expect_tx(&q_full, sizeof(Element) * size(sQ));
+      copy(tma_q.with(q_full), tQgQ, tQsQ);
+
+      // P1: prefetch K[0..Sk-2]; waits unblock once consumer arrives k_empty
+      for (int s = 0; s < kStagesK - 1; ++s) {
+        if (s < Tc_eff) {
+          CtaBarrier::wait(&k_empty[s], 0);
+          auto sK = make_tensor(make_smem_ptr(k_base + s * kKVTileElements),
+                                SmemLayoutKV{});
+          auto gK = local_tile(mK, Shape<Int<kBc>, Int<kHeadDim>>{},
+                               make_coord(s, _0{}));
+          auto tKgK = k_slice.partition_S(gK);
+          auto tKsK = k_slice.partition_D(sK);
+          TmaBarrier::arrive_and_expect_tx(&k_full[s],
+                                           sizeof(Element) * size(sK));
+          copy(tma_k.with(k_full[s]), tKgK, tKsK);
+        }
+      }
+      // P1b: prefetch V[0..Sv-2]
+      for (int s = 0; s < kStagesV - 1; ++s) {
+        if (s < Tc_eff) {
+          CtaBarrier::wait(&v_empty[s], 0);
+          auto sV = make_tensor(make_smem_ptr(v_base + s * kKVTileElements),
+                                SmemLayoutKV{});
+          auto gV = local_tile(mV, Shape<Int<kBc>, Int<kHeadDim>>{},
+                               make_coord(s, _0{}));
+          auto tVgV = v_slice.partition_S(gV);
+          auto tVsV = v_slice.partition_D(sV);
+          TmaBarrier::arrive_and_expect_tx(&v_full[s],
+                                           sizeof(Element) * size(sV));
+          copy(tma_v.with(v_full[s]), tVgV, tVsV);
+        }
+      }
+      // P2: prefetch-ahead loop. s_next == k_stg since
+      // (tile+kStagesK)%kStagesK == tile%kStagesK; only the phase flips.
+      // phase/stage transform (kStagesK=2): same slot reused, phase flips/cycle
+      //   kv_tile  k_stg  k_phase  k_next  s_next  p_next
+      //   0        0      0        2       0       1
+      //   1        1      0        3       1       1
+      //   2        0      1        4       0       0
+      //   3        1      1        5       1       0
+      for (int tile = 0; tile < Tc_eff; ++tile) {
+        // V: prefetch V[tile+Sv-1]
+        {
+          const int v_tile = tile + kStagesV - 1;
+          if (v_tile < Tc_eff) {
+            const int stage_v = v_tile % kStagesV;
+            const int phase_v = (v_tile / kStagesV) & 1;
+            CtaBarrier::wait(&v_empty[stage_v], phase_v);
+            auto sV =
+                make_tensor(make_smem_ptr(v_base + stage_v * kKVTileElements),
+                            SmemLayoutKV{});
+            auto gV = local_tile(mV, Shape<Int<kBc>, Int<kHeadDim>>{},
+                                 make_coord(v_tile, _0{}));
+            auto tVgV = v_slice.partition_S(gV);
+            auto tVsV = v_slice.partition_D(sV);
+            TmaBarrier::arrive_and_expect_tx(&v_full[stage_v],
+                                             sizeof(Element) * size(sV));
+            copy(tma_v.with(v_full[stage_v]), tVgV, tVsV);
+          }
+        }
+        // K: prefetch K[tile+Sk-1] (phase/stage table same as K above)
+        {
+          const int k_tile = tile + kStagesK - 1;
+          if (k_tile < Tc_eff) {
+            const int stage_k = k_tile % kStagesK;
+            const int phase_k = (k_tile / kStagesK) & 1;
+            CtaBarrier::wait(&k_empty[stage_k], phase_k);
+            auto sK =
+                make_tensor(make_smem_ptr(k_base + stage_k * kKVTileElements),
+                            SmemLayoutKV{});
+            auto gK = local_tile(mK, Shape<Int<kBc>, Int<kHeadDim>>{},
+                                 make_coord(k_tile, _0{}));
+            auto tKgK = k_slice.partition_S(gK);
+            auto tKsK = k_slice.partition_D(sK);
+            TmaBarrier::arrive_and_expect_tx(&k_full[stage_k],
+                                             sizeof(Element) * size(sK));
+            copy(tma_k.with(k_full[stage_k]), tKgK, tKsK);
+          }
+        }
+      }
+    }
+    return;
+  }
+
+  // Consumer path (wg_tid 0..255): wait Q, release K/V slots, then the full
+  // QK->softmax->PV loop. No TMA issue here; no __syncthreads (single WG).
+  TmaBarrier::wait(&q_full, 0);
+  cutlass::arch::fence_view_async_shared();
+
+  // Mark all K/V slots empty so the producer prefetch can proceed.
+  for (int s = 0; s < kStagesK; ++s)
+    CtaBarrier::arrive(&k_empty[s]);
+  for (int s = 0; s < kStagesV; ++s)
+    CtaBarrier::arrive(&v_empty[s]);
 
   TiledMmaQK tiled_mma_qk;
   TiledMmaPV tiled_mma_pv;
-  auto thr_mma_qk = tiled_mma_qk.get_thread_slice(tid);
-  auto thr_mma_pv = tiled_mma_pv.get_thread_slice(tid);
+  auto thr_mma_qk = tiled_mma_qk.get_thread_slice(wg_tid);
+  auto thr_mma_pv = tiled_mma_pv.get_thread_slice(wg_tid);
 
   auto s2r_copy_q = make_tiled_copy_A(SmemCopyAtom{}, tiled_mma_qk);
   auto s2r_copy_k = make_tiled_copy_B(SmemCopyAtom{}, tiled_mma_qk);
   auto s2r_copy_v = make_tiled_copy_B(SmemCopyAtomTransposed{}, tiled_mma_pv);
-  auto s2r_thr_q = s2r_copy_q.get_thread_slice(tid);
-  auto s2r_thr_k = s2r_copy_k.get_thread_slice(tid);
-  auto s2r_thr_v = s2r_copy_v.get_thread_slice(tid);
+  auto s2r_thr_q = s2r_copy_q.get_thread_slice(wg_tid);
+  auto s2r_thr_k = s2r_copy_k.get_thread_slice(wg_tid);
+  auto s2r_thr_v = s2r_copy_v.get_thread_slice(wg_tid);
 
   auto sV0 = make_tensor(make_smem_ptr(v_base), SmemLayoutKV{});
   auto sVt0_ns =
@@ -844,65 +958,10 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
   for (int i = 0; i < kOElemsPerFrag; ++i)
     o_acc[i] = 0.0f;
 
-  for (int s = 0; s < kStagesK; ++s)
-    CtaBarrier::arrive(&k_empty[s]);
-  for (int s = 0; s < kStagesV; ++s)
-    CtaBarrier::arrive(&v_empty[s]);
-
-  // Q load: single TMA copy, full-D
-  if (tid == 0) {
-    auto sQ = make_tensor(make_smem_ptr(q_base), SmemLayoutQ{});
-    auto gQ = local_tile(mQ, Shape<Int<kBr>, Int<kHeadDim>>{},
-                         make_coord(Q_tile_id, _0{}));
-    auto tQgQ = q_slice.partition_S(gQ);
-    auto tQsQ = q_slice.partition_D(sQ);
-    TmaBarrier::arrive_and_expect_tx(&q_full, sizeof(Element) * size(sQ));
-    copy(tma_q.with(q_full), tQgQ, tQsQ);
-  }
-  TmaBarrier::wait(&q_full, 0);
-  cutlass::arch::fence_view_async_shared();
-  __syncthreads();
-
   // Persistent Q smem tensor (read-only in main loop)
   auto sQ = make_tensor(make_smem_ptr(q_base), SmemLayoutQ{});
   auto tCrQ = thr_mma_qk.partition_fragment_A(sQ);
   auto tQsQ_s2r = s2r_thr_q.partition_S(sQ);
-
-  auto issue_k_tma = [&](int stage, int kv_tile_idx) {
-    auto sK = make_tensor(make_smem_ptr(k_base + stage * kKVTileElements),
-                          SmemLayoutKV{});
-    auto gK = local_tile(mK, Shape<Int<kBc>, Int<kHeadDim>>{},
-                         make_coord(kv_tile_idx, _0{}));
-    auto tKgK = k_slice.partition_S(gK);
-    auto tKsK = k_slice.partition_D(sK);
-    TmaBarrier::arrive_and_expect_tx(&k_full[stage],
-                                     sizeof(Element) * size(sK));
-    copy(tma_k.with(k_full[stage]), tKgK, tKsK);
-  };
-
-  auto issue_v_tma = [&](int stage, int kv_tile_idx) {
-    auto sV = make_tensor(make_smem_ptr(v_base + stage * kKVTileElements),
-                          SmemLayoutKV{});
-    auto gV = local_tile(mV, Shape<Int<kBc>, Int<kHeadDim>>{},
-                         make_coord(kv_tile_idx, _0{}));
-    auto tVgV = v_slice.partition_S(gV);
-    auto tVsV = v_slice.partition_D(sV);
-    TmaBarrier::arrive_and_expect_tx(&v_full[stage],
-                                     sizeof(Element) * size(sV));
-    copy(tma_v.with(v_full[stage]), tVgV, tVsV);
-  };
-
-  // Prefetch K[0..kStagesK-1] and V[0..kStagesV-1] for kv_tile 0
-  if (tid == 0) {
-    for (int s = 0; s < kStagesK && s < Tc_eff; ++s) {
-      CtaBarrier::wait(&k_empty[s], 0);
-      issue_k_tma(s, s);
-    }
-    for (int s = 0; s < kStagesV && s < Tc_eff; ++s) {
-      CtaBarrier::wait(&v_empty[s], 0);
-      issue_v_tma(s, s);
-    }
-  }
 
 #pragma unroll 1
   for (int kv_tile = 0; kv_tile < Tc_eff; ++kv_tile) {
@@ -924,18 +983,8 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
     clear(tCrS);
     ffpa_cute::gemm_ss(tCrS, tCrQ, tCrK, tQsQ_s2r, tKsK_s2r, tiled_mma_qk,
                        s2r_copy_q, s2r_copy_k, s2r_thr_q, s2r_thr_k);
+    // Release K slot to producer; no inline prefetch here (producer owns it).
     CtaBarrier::arrive(&k_empty[k_stg]);
-
-    // Prefetch next K
-    if (tid == 0) {
-      const int k_next = kv_tile + kStagesK;
-      if (k_next < Tc_eff) {
-        const int s_next = k_next % kStagesK;
-        const int p_next = (k_next / kStagesK) & 1;
-        CtaBarrier::wait(&k_empty[s_next], p_next);
-        issue_k_tma(s_next, k_next);
-      }
-    }
 
     // Online softmax
     auto scores = make_tensor(
@@ -1023,24 +1072,12 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
     auto tCrO = make_tensor(make_rmem_ptr(o_acc), OFragLayout{});
     ffpa_cute::gemm_rs(tCrO, tCrPv, tCrV, tVsVt_s2r, tiled_mma_pv, s2r_copy_v,
                        s2r_thr_v);
+    // Release V slot to producer; no inline prefetch here (producer owns it).
     CtaBarrier::arrive(&v_empty[v_stg]);
-
-    // Prefetch next V
-    if (tid == 0) {
-      const int v_next = kv_tile + kStagesV;
-      if (v_next < Tc_eff) {
-        const int s_next = v_next % kStagesV;
-        const int p_next = (v_next / kStagesV) & 1;
-        CtaBarrier::wait(&v_empty[s_next], p_next);
-        issue_v_tma(s_next, v_next);
-      }
-    }
   }
 
-  // Epilogue: O /= row_sum, R->S, TMA store (single full-D tile)
+  // Epilogue: normalize + direct R->G (no __syncthreads; producer fell through)
   {
-    __syncthreads();
-
     auto tCrO = make_tensor(make_rmem_ptr(o_acc), OFragLayout{});
     auto tCrO_rc = make_tensor(
         tCrO.data(), ffpa_cute::convert_layout_acc_rowcol(tCrO.layout()));
@@ -1053,49 +1090,21 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
     }
     auto tCrOHalf = ffpa_cute::convert_type<Element>(tCrO);
 
-    auto r2s_copy = make_tiled_copy_C(Copy_Atom<SM90_U32x4_STSM_N, Element>{},
-                                      tiled_mma_pv);
-    auto r2s_thr = r2s_copy.get_slice(tid);
-
-    if (Br_base + kBr <= Nq) {
-      // Aligned path: R->S via STSM, then TMA store
-      auto sO = make_tensor(make_smem_ptr(q_base), SmemLayoutO{});
-      auto tCrOHalf_src = r2s_thr.retile_S(tCrOHalf);
-      auto tCsO_dst = r2s_thr.partition_D(sO);
-      copy(r2s_copy, tCrOHalf_src, tCsO_dst);
-      cutlass::arch::fence_view_async_shared();
-      __syncthreads();
-
-      auto mO_tma = domain_offset(
-          make_coord(q_row_offset, 0),
-          tma_o.get_tma_tensor(make_shape(total_q_rows, Int<kHeadDim>{})));
-      auto o_slice = tma_o.get_slice(_0{});
-      auto gO_tma = local_tile(mO_tma, Shape<Int<kBr>, Int<kHeadDim>>{},
-                               make_coord(Q_tile_id, _0{}));
-      auto tCgO_tma = o_slice.partition_D(gO_tma);
-      auto tOsO = o_slice.partition_S(sO);
-      if (tid == 0)
-        copy(tma_o, tOsO, tCgO_tma);
-      tma_store_arrive();
-      tma_store_wait<0>();
-    } else {
-      // Boundary path: direct R->G store
-      const int O_gmem_offset =
-          (Nb_id * Nh * Nq * kHeadDim) + (Nh_id * Nq * kHeadDim);
-      auto mO = make_tensor(make_gmem_ptr(O + O_gmem_offset),
-                            make_shape(Nq, Int<kHeadDim>{}),
-                            make_stride(Int<kHeadDim>{}, _1{}));
-      auto gO = local_tile(mO, Shape<Int<kBr>, Int<kHeadDim>>{},
-                           make_coord(Q_tile_id, _0{}));
-      auto tCgO = thr_mma_pv.partition_C(gO);
-      auto cO = make_identity_tensor(Shape<Int<kBr>, Int<kHeadDim>>{});
-      auto tOcO = thr_mma_pv.partition_C(cO);
+    const int O_gmem_offset =
+        (Nb_id * Nh * Nq * kHeadDim) + (Nh_id * Nq * kHeadDim);
+    auto mO = make_tensor(make_gmem_ptr(O + O_gmem_offset),
+                          make_shape(Nq, Int<kHeadDim>{}),
+                          make_stride(Int<kHeadDim>{}, _1{}));
+    auto gO = local_tile(mO, Shape<Int<kBr>, Int<kHeadDim>>{},
+                         make_coord(Q_tile_id, _0{}));
+    auto tCgO = thr_mma_pv.partition_C(gO);
+    auto cO = make_identity_tensor(Shape<Int<kBr>, Int<kHeadDim>>{});
+    auto tOcO = thr_mma_pv.partition_C(cO);
 #pragma unroll
-      for (int i = 0; i < size(tCrOHalf); ++i) {
-        const int global_row = Br_base + get<0>(tOcO(i));
-        if (global_row < Nq)
-          tCgO(i) = tCrOHalf(i);
-      }
+    for (int i = 0; i < size(tCrOHalf); ++i) {
+      const int global_row = Br_base + get<0>(tOcO(i));
+      if (global_row < Nq)
+        tCgO(i) = tCrOHalf(i);
     }
 
     if (softmax_lse != nullptr) {

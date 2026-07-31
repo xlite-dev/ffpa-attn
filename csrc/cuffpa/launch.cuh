@@ -269,7 +269,7 @@ void launch_ffpa_attn_split_d_fwd_cute_sm120(
     int64_t philox_offset);
 
 template <typename kDataType, const int kHeadDim, const int kStage>
-void launch_ffpa_attn_persist_d_fwd_cute_sm120(
+void launch_ffpa_attn_persist_d_ws_fwd_cute_sm120(
     torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O,
     torch::Tensor attn_bias, torch::Tensor softmax_lse, int causal,
     double softmax_scale, double dropout_p, int64_t philox_seed,
@@ -544,9 +544,11 @@ void launch_ffpa_attn_fwd_template(torch::Tensor Q, torch::Tensor K,
               Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
               dropout_p, philox_seed, philox_offset);
         } else if (force_cute_tma || (!has_attn_bias && !has_dropout)) {
-          if constexpr (kHeadDim <= 256) {
-            launch_ffpa_attn_persist_d_fwd_cute_sm120<kDataType, kHeadDim,
-                                                      kStage>(
+          if constexpr (kHeadDim <= 128 && kHeadDim % 64 == 0) {
+            // WS persist-D: only 64-multiple small D (64/128). Non-64-multiple
+            // small D (32/96) falls to split-D; 32-multiple support is planned.
+            launch_ffpa_attn_persist_d_ws_fwd_cute_sm120<kDataType, kHeadDim,
+                                                         kStage>(
                 Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
                 dropout_p, philox_seed, philox_offset);
           } else if constexpr (kHeadDim % 64 == 0) {
@@ -995,7 +997,7 @@ void launch_ffpa_attn_split_d_fwd_cute_sm120(
 }
 
 template <typename kDataType, const int kHeadDim, const int kStage>
-void launch_ffpa_attn_persist_d_fwd_cute_sm120(
+void launch_ffpa_attn_persist_d_ws_fwd_cute_sm120(
     torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O,
     torch::Tensor attn_bias, torch::Tensor softmax_lse, int causal,
     double softmax_scale, double dropout_p, int64_t philox_seed,
@@ -1013,7 +1015,8 @@ void launch_ffpa_attn_persist_d_fwd_cute_sm120(
   constexpr int kStagesK =
       (kStage < 1) ? 1 : (kStage > kMaxStages ? kMaxStages : kStage);
   constexpr int kStagesV = kStagesK;
-  constexpr int kNumThreads = kBr / 16 * 32;
+  // WS: 128 producer + 256 consumer = 384 threads
+  constexpr int kNumThreads = 384;
 
   using CuteElement = std::conditional_t<std::is_same_v<kDataType, __half>,
                                          cutlass::half_t, cutlass::bfloat16_t>;
@@ -1121,17 +1124,17 @@ void launch_ffpa_attn_persist_d_fwd_cute_sm120(
   using TmaV = decltype(tma_v);
   using TmaO = decltype(tma_o);
   if (has_attn_bias && has_dropout) {
-    launch_variant(ffpa_attn_persist_d_fwd_cute_sm120<Traits, TmaQ, TmaK, TmaV,
-                                                      TmaO, 1, 1>);
+    launch_variant(ffpa_attn_persist_d_ws_fwd_cute_sm120<Traits, TmaQ, TmaK,
+                                                         TmaV, TmaO, 1, 1>);
   } else if (has_attn_bias) {
-    launch_variant(ffpa_attn_persist_d_fwd_cute_sm120<Traits, TmaQ, TmaK, TmaV,
-                                                      TmaO, 1, 0>);
+    launch_variant(ffpa_attn_persist_d_ws_fwd_cute_sm120<Traits, TmaQ, TmaK,
+                                                         TmaV, TmaO, 1, 0>);
   } else if (has_dropout) {
-    launch_variant(ffpa_attn_persist_d_fwd_cute_sm120<Traits, TmaQ, TmaK, TmaV,
-                                                      TmaO, 0, 1>);
+    launch_variant(ffpa_attn_persist_d_ws_fwd_cute_sm120<Traits, TmaQ, TmaK,
+                                                         TmaV, TmaO, 0, 1>);
   } else {
-    launch_variant(ffpa_attn_persist_d_fwd_cute_sm120<Traits, TmaQ, TmaK, TmaV,
-                                                      TmaO, 0, 0>);
+    launch_variant(ffpa_attn_persist_d_ws_fwd_cute_sm120<Traits, TmaQ, TmaK,
+                                                         TmaV, TmaO, 0, 0>);
   }
 }
 #endif  // ENABLE_FFPA_TMA_EXT
