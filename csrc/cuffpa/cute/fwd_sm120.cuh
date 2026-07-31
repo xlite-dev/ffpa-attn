@@ -698,8 +698,9 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
 // WS persist-D: 128 producer (TMA-only) + 256 consumer (MMA-only), 384 threads.
 // sm_120f target: setmaxnreg effective (producer dec 32 / consumer inc 232);
 // sm_120a target hits ptxas C7506 and silently ignores it, so build with 120f.
-// Epilogue is direct R->G: a __syncthreads here would deadlock since
-// the producer warpgroup has already fallen through the early-return below.
+// Epilogue: R->S->TMA store (aligned) or R->G (tail); a __syncthreads would
+// deadlock since the producer warpgroup has already fallen through the
+// early-return below, so sync with a named barrier (consumer threads only).
 // NOTE: Only 64-multiple small D (D=64/128) is supported today. Non-64-multiple
 // small D (D=32/96, SW128 swizzle requires headdim % 64 == 0) is handled by the
 // split-D kernel; 32-multiple small D WS support is planned (dispatch already
@@ -724,6 +725,7 @@ __global__ void __launch_bounds__(384, 1) ffpa_attn_persist_d_ws_fwd_cute_sm120(
   using SmemLayoutQ = typename Traits::SmemLayoutQ;
   using SmemLayoutKV = typename Traits::SmemLayoutKV;
   using SmemLayoutKVt = typename Traits::SmemLayoutKVt;
+  using SmemLayoutO = typename Traits::SmemLayoutO;
   using TiledMmaQK = typename Traits::TiledMmaQK;
   using TiledMmaPV = typename Traits::TiledMmaPV;
   using SmemCopyAtom = typename Traits::SmemCopyAtom;
@@ -1089,8 +1091,13 @@ __global__ void __launch_bounds__(384, 1) ffpa_attn_persist_d_ws_fwd_cute_sm120(
     CtaBarrier::arrive(&v_empty[v_stg]);
   }
 
-  // Epilogue: normalize + direct R->G (no __syncthreads; producer fell through)
+  // Epilogue: O /= row_sum, R->S->TMA store (aligned, single full-D tile) or
+  // direct R->G (tail). The producer warpgroup has returned, so CTA-wide
+  // __syncthreads would deadlock; sync with a named barrier limited to the
+  // consumer threads instead.
   {
+    cutlass::arch::NamedBarrier::sync(kConsumerThreads, 0);
+
     auto tCrO = make_tensor(make_rmem_ptr(o_acc), OFragLayout{});
     auto tCrO_rc = make_tensor(
         tCrO.data(), ffpa_cute::convert_layout_acc_rowcol(tCrO.layout()));
@@ -1103,21 +1110,49 @@ __global__ void __launch_bounds__(384, 1) ffpa_attn_persist_d_ws_fwd_cute_sm120(
     }
     auto tCrOHalf = ffpa_cute::convert_type<Element>(tCrO);
 
-    const int O_gmem_offset =
-        (Nb_id * Nh * Nq * kHeadDim) + (Nh_id * Nq * kHeadDim);
-    auto mO = make_tensor(make_gmem_ptr(O + O_gmem_offset),
-                          make_shape(Nq, Int<kHeadDim>{}),
-                          make_stride(Int<kHeadDim>{}, _1{}));
-    auto gO = local_tile(mO, Shape<Int<kBr>, Int<kHeadDim>>{},
-                         make_coord(Q_tile_id, _0{}));
-    auto tCgO = thr_mma_pv.partition_C(gO);
-    auto cO = make_identity_tensor(Shape<Int<kBr>, Int<kHeadDim>>{});
-    auto tOcO = thr_mma_pv.partition_C(cO);
+    auto r2s_copy = make_tiled_copy_C(Copy_Atom<SM90_U32x4_STSM_N, Element>{},
+                                      tiled_mma_pv);
+    auto r2s_thr = r2s_copy.get_slice(wg_tid);
+
+    if (Br_base + kBr <= Nq) {
+      // aligned: R->S via STSM (reuse the freed Q smem), then TMA store
+      auto sO = make_tensor(make_smem_ptr(q_base), SmemLayoutO{});
+      auto tCrOHalf_src = r2s_thr.retile_S(tCrOHalf);
+      auto tCsO_dst = r2s_thr.partition_D(sO);
+      copy(r2s_copy, tCrOHalf_src, tCsO_dst);
+      cutlass::arch::fence_view_async_shared();
+      cutlass::arch::NamedBarrier::sync(kConsumerThreads, 0);
+
+      auto mO_tma = domain_offset(
+          make_coord(q_row_offset, 0),
+          tma_o.get_tma_tensor(make_shape(total_q_rows, Int<kHeadDim>{})));
+      auto o_slice = tma_o.get_slice(_0{});
+      auto gO_tma = local_tile(mO_tma, Shape<Int<kBr>, Int<kHeadDim>>{},
+                               make_coord(Q_tile_id, _0{}));
+      auto tCgO_tma = o_slice.partition_D(gO_tma);
+      auto tOsO = o_slice.partition_S(sO);
+      if (wg_tid == 0)
+        copy(tma_o, tOsO, tCgO_tma);
+      tma_store_arrive();
+      tma_store_wait<0>();
+    } else {
+      // tail: direct R->G store
+      const int O_gmem_offset =
+          (Nb_id * Nh * Nq * kHeadDim) + (Nh_id * Nq * kHeadDim);
+      auto mO = make_tensor(make_gmem_ptr(O + O_gmem_offset),
+                            make_shape(Nq, Int<kHeadDim>{}),
+                            make_stride(Int<kHeadDim>{}, _1{}));
+      auto gO = local_tile(mO, Shape<Int<kBr>, Int<kHeadDim>>{},
+                           make_coord(Q_tile_id, _0{}));
+      auto tCgO = thr_mma_pv.partition_C(gO);
+      auto cO = make_identity_tensor(Shape<Int<kBr>, Int<kHeadDim>>{});
+      auto tOcO = thr_mma_pv.partition_C(cO);
 #pragma unroll
-    for (int i = 0; i < size(tCrOHalf); ++i) {
-      const int global_row = Br_base + get<0>(tOcO(i));
-      if (global_row < Nq)
-        tCgO(i) = tCrOHalf(i);
+      for (int i = 0; i < size(tCrOHalf); ++i) {
+        const int global_row = Br_base + get<0>(tOcO(i));
+        if (global_row < Nq)
+          tCgO(i) = tCrOHalf(i);
+      }
     }
 
     if (softmax_lse != nullptr) {
@@ -1130,5 +1165,533 @@ __global__ void __launch_bounds__(384, 1) ffpa_attn_persist_d_ws_fwd_cute_sm120(
           softmax_lse[lse_base + global_row] = lse;
       }
     }
+  }
+}
+
+// WS split-D: 128 producer (TMA-only) + 256 consumer (MMA-only), 384 threads.
+// Same D-chunked QK/PV algorithm as ffpa_attn_split_d_fwd_cute_sm120; the
+// producer warpgroup owns ALL TMA issue (Q/K + V prefetch-ahead loops) and
+// the consumer warpgroups run QK->softmax->PV with no TMA state.
+// Register strategy: kBr=64 + M4N2 (see FFPAAttnCuTeSplitDWsTraits) cuts the
+// O accumulator to D/4; setmaxnreg (sm_120f only, see header note) lifts the
+// consumer to 232 regs so D=512 (O acc 128 + ~84 working set) does not spill.
+// D=256/320 fit the static 168-reg budget (O acc 64/80), so setmaxnreg is
+// gated to kHeadDim >= 512 to avoid the TRY_ALLOC overhead.
+// Epilogue: batched R->S->TMA store (aligned) or R->G (tail); a __syncthreads
+// would deadlock since the producer warpgroup has already fallen through the
+// early-return below, so sync with a named barrier (consumer threads only).
+template <typename Traits, typename TmaQ, typename TmaK, typename TmaV,
+          typename TmaO, int kHasAttnBias = 0, int kHasDropout = 0>
+__global__ void __launch_bounds__(384, 1) ffpa_attn_split_d_ws_fwd_cute_sm120(
+    CUTLASS_GRID_CONSTANT TmaQ const tma_q,
+    CUTLASS_GRID_CONSTANT TmaK const tma_k,
+    CUTLASS_GRID_CONSTANT TmaV const tma_v,
+    CUTLASS_GRID_CONSTANT TmaO const tma_o,
+    typename Traits::Element* __restrict__ O, float* __restrict__ softmax_lse,
+    int Nq, int Nkv, int Nh, int Nh_kv, float scale, int Tc, int causal,
+    int total_q_rows, int total_kv_rows,
+    const void* __restrict__ attn_bias = nullptr, int attn_bias_dtype = 0,
+    long long attn_bias_stride_b = 0, long long attn_bias_stride_h = 0,
+    long long attn_bias_stride_m = 0, long long attn_bias_stride_n = 0,
+    float dropout_p = 0.0f, unsigned long long philox_seed = 0,
+    unsigned long long philox_offset = 0) {
+  using namespace cute;
+  using Element = typename Traits::Element;
+  using SmemLayoutQ = typename Traits::SmemLayoutQ;
+  using SmemLayoutK = typename Traits::SmemLayoutK;
+  using SmemLayoutV = typename Traits::SmemLayoutV;
+  using SmemLayoutVt = typename Traits::SmemLayoutVt;
+  using SmemLayoutO = typename Traits::SmemLayoutO;
+  using TiledMmaQK = typename Traits::TiledMmaQK;
+  using TiledMmaPV = typename Traits::TiledMmaPV;
+  using SmemCopyAtom = typename Traits::SmemCopyAtom;
+  using SmemCopyAtomTransposed = typename Traits::SmemCopyAtomTransposed;
+
+  constexpr int kBr = Traits::kBr;
+  constexpr int kBc = Traits::kBc;
+  constexpr int kQKDChunk = Traits::kQKDChunk;
+  constexpr int kVDChunk = Traits::kVDChunk;
+  constexpr int kHeadDim = Traits::kHeadDim;
+  constexpr int kDChunksQK = Traits::kDChunksQK;
+  constexpr int kDChunksV = Traits::kDChunksV;
+  constexpr int kStagesQK = Traits::kStagesQK;
+  constexpr int kStagesPV = Traits::kStagesPV;
+  constexpr int kProducerThreads = 128;
+  constexpr int kConsumerThreads = 256;
+
+  constexpr int kQChunkElements = cosize(SmemLayoutQ{});
+  constexpr int kKChunkElements = cosize(SmemLayoutK{});
+  constexpr int kVChunkElements = cosize(SmemLayoutV{});
+
+  const int Nb_id = blockIdx.y / Nh;
+  const int Nh_id = blockIdx.y % Nh;
+  const int Q_tile_id = blockIdx.x;
+  const int group_size = Nh / Nh_kv;
+  const int kv_head_idx = Nh_id / group_size;
+  const int Br_base = Q_tile_id * kBr;
+  const int tid = threadIdx.x;
+  const bool is_producer = tid < kProducerThreads;
+  const int wg_tid = is_producer ? tid : tid - kProducerThreads;
+
+  if (Br_base >= Nq)
+    return;
+
+  const int kv_offset = Nkv - Nq;
+  const int causal_thresh_row0 = Br_base + kv_offset;
+  const int Tc_eff =
+      causal ? min(Tc, ((Br_base + kBr - 1 + kv_offset) / kBc) + 1) : Tc;
+  const int mask_start_tile =
+      causal ? max(0, (causal_thresh_row0 + 1) / kBc) : INT_MAX;
+
+  const int q_row_offset = (Nb_id * Nh + Nh_id) * Nq;
+  const int kv_row_offset = (Nb_id * Nh_kv + kv_head_idx) * Nkv;
+
+  // SMEM: [q_base | k_base | v_base], same as the non-WS split-D kernel
+  // (Q rides K's stage via the shared qk_full barrier, no extra Q storage).
+  extern __shared__ __align__(1024) Element shm[];
+  Element* q_base = shm;
+  Element* k_base = q_base + kStagesQK * kQChunkElements;
+  Element* v_base = k_base + kStagesQK * kKChunkElements;
+
+  __shared__ uint64_t qk_full[kStagesQK];
+  __shared__ uint64_t qk_empty[kStagesQK];
+  __shared__ uint64_t v_full[kStagesPV];
+  __shared__ uint64_t v_empty[kStagesPV];
+
+  // Barrier roles match the non-WS split-D kernel, except *_empty count
+  // kConsumerThreads: only consumers arrive (the producer only waits).
+  if (tid == 0) {
+    for (int s = 0; s < kStagesQK; ++s) {
+      TmaBarrier::init(&qk_full[s], 1);
+      CtaBarrier::init(&qk_empty[s], kConsumerThreads);
+    }
+    for (int s = 0; s < kStagesPV; ++s) {
+      TmaBarrier::init(&v_full[s], 1);
+      CtaBarrier::init(&v_empty[s], kConsumerThreads);
+    }
+  }
+  __syncthreads();
+
+  // Producer warpgroup: only wg_tid==0 issues TMA; the other 127 threads
+  // idle. Owns the full Q/K + V prefetch pipelines; the chunk_index phase
+  // formula (chunk_index / kStages) & 1 matches the consumer's wait sequence
+  // chunk-for-chunk (each consumer arrive round = one consumed chunk).
+  if (is_producer) {
+    // Release regs to the CTA pool for the consumer warpgroups. Gated to
+    // kHeadDim >= 512: D=256/320 (O acc 64/80) fit the static 168-reg budget
+    // and TRY_ALLOC costs a blocking allocation.
+    if constexpr (kHeadDim >= 512) {
+      cutlass::arch::warpgroup_reg_dealloc<32>();
+    }
+    if (wg_tid == 0) {
+      auto mQ = domain_offset(
+          make_coord(q_row_offset, 0),
+          tma_q.get_tma_tensor(make_shape(total_q_rows, Int<kHeadDim>{})));
+      auto mK = domain_offset(
+          make_coord(kv_row_offset, 0),
+          tma_k.get_tma_tensor(make_shape(total_kv_rows, Int<kHeadDim>{})));
+      auto mV = domain_offset(
+          make_coord(kv_row_offset, 0),
+          tma_v.get_tma_tensor(make_shape(total_kv_rows, Int<kHeadDim>{})));
+      auto q_slice = tma_q.get_slice(_0{});
+      auto k_slice = tma_k.get_slice(_0{});
+      auto v_slice = tma_v.get_slice(_0{});
+
+      auto issue_qk_tma = [&](int d_chunk, int stage, int kv_tile_idx) {
+        auto sQ = make_tensor(make_smem_ptr(q_base + stage * kQChunkElements),
+                              SmemLayoutQ{});
+        auto sK = make_tensor(make_smem_ptr(k_base + stage * kKChunkElements),
+                              SmemLayoutK{});
+        auto gQ = local_tile(mQ, Shape<Int<kBr>, Int<kQKDChunk>>{},
+                             make_coord(Q_tile_id, d_chunk));
+        auto gK = local_tile(mK, Shape<Int<kBc>, Int<kQKDChunk>>{},
+                             make_coord(kv_tile_idx, d_chunk));
+        auto tQgQ = q_slice.partition_S(gQ);
+        auto tQsQ = q_slice.partition_D(sQ);
+        auto tKgK = k_slice.partition_S(gK);
+        auto tKsK = k_slice.partition_D(sK);
+        TmaBarrier::arrive_and_expect_tx(
+            &qk_full[stage], sizeof(Element) * (size(sQ) + size(sK)));
+        copy(tma_q.with(qk_full[stage]), tQgQ, tQsQ);
+        copy(tma_k.with(qk_full[stage]), tKgK, tKsK);
+      };
+
+      auto issue_v_tma = [&](int v_chunk, int stage, int kv_tile_idx) {
+        auto sV = make_tensor(make_smem_ptr(v_base + stage * kVChunkElements),
+                              SmemLayoutV{});
+        auto gV = local_tile(mV, Shape<Int<kBc>, Int<kVDChunk>>{},
+                             make_coord(kv_tile_idx, v_chunk));
+        auto tVgV = v_slice.partition_S(gV);
+        auto tVsV = v_slice.partition_D(sV);
+        TmaBarrier::arrive_and_expect_tx(&v_full[stage],
+                                         sizeof(Element) * size(sV));
+        copy(tma_v.with(v_full[stage]), tVgV, tVsV);
+      };
+
+      // P1: prefetch Q/K and V for tiles 0..S-2. The wait below gates each
+      // slot's reuse; with kStages < kDChunks the same stage is reused across
+      // d_chunks and the phase formula keeps producer/consumer lockstep.
+      for (int s = 0; s < kStagesQK - 1; ++s) {
+        if (s < Tc_eff) {
+          for (int d = 0; d < kDChunksQK; ++d) {
+            const int chunk_index = s * kDChunksQK + d;
+            CtaBarrier::wait(&qk_empty[chunk_index % kStagesQK],
+                             (chunk_index / kStagesQK) & 1);
+            issue_qk_tma(d, chunk_index % kStagesQK, s);
+          }
+        }
+      }
+      for (int s = 0; s < kStagesPV - 1; ++s) {
+        if (s < Tc_eff) {
+          for (int v = 0; v < kDChunksV; ++v) {
+            const int chunk_index = s * kDChunksV + v;
+            CtaBarrier::wait(&v_empty[chunk_index % kStagesPV],
+                             (chunk_index / kStagesPV) & 1);
+            issue_v_tma(v, chunk_index % kStagesPV, s);
+          }
+        }
+      }
+      // P2: prefetch-ahead loop (K-first, matching the consumer's QK-then-PV
+      // order). k_tile == tile + kStages - 1 keeps exactly kStages - 1 tiles
+      // in flight beyond the consumer's current tile.
+      for (int tile = 0; tile < Tc_eff; ++tile) {
+        const int k_tile = tile + kStagesQK - 1;
+        if (k_tile < Tc_eff) {
+          for (int d = 0; d < kDChunksQK; ++d) {
+            const int chunk_index = k_tile * kDChunksQK + d;
+            CtaBarrier::wait(&qk_empty[chunk_index % kStagesQK],
+                             (chunk_index / kStagesQK) & 1);
+            issue_qk_tma(d, chunk_index % kStagesQK, k_tile);
+          }
+        }
+        const int v_tile = tile + kStagesPV - 1;
+        if (v_tile < Tc_eff) {
+          for (int v = 0; v < kDChunksV; ++v) {
+            const int chunk_index = v_tile * kDChunksV + v;
+            CtaBarrier::wait(&v_empty[chunk_index % kStagesPV],
+                             (chunk_index / kStagesPV) & 1);
+            issue_v_tma(v, chunk_index % kStagesPV, v_tile);
+          }
+        }
+      }
+    }
+    return;
+  }
+
+  // Consumer warpgroups (wg_tid 0..255): no TMA issue, no __syncthreads
+  // (single-WG sync points only). Take the producer's released registers.
+  if constexpr (kHeadDim >= 512) {
+    cutlass::arch::warpgroup_reg_alloc<232>();
+  }
+
+  // Mark all slots empty so the producer prefetch can proceed.
+  for (int s = 0; s < kStagesQK; ++s)
+    CtaBarrier::arrive(&qk_empty[s]);
+  for (int s = 0; s < kStagesPV; ++s)
+    CtaBarrier::arrive(&v_empty[s]);
+
+  TiledMmaQK tiled_mma_qk;
+  TiledMmaPV tiled_mma_pv;
+  auto thr_mma_qk = tiled_mma_qk.get_thread_slice(wg_tid);
+  auto thr_mma_pv = tiled_mma_pv.get_thread_slice(wg_tid);
+
+  auto s2r_copy_q = make_tiled_copy_A(SmemCopyAtom{}, tiled_mma_qk);
+  auto s2r_copy_k = make_tiled_copy_B(SmemCopyAtom{}, tiled_mma_qk);
+  auto s2r_copy_v = make_tiled_copy_B(SmemCopyAtomTransposed{}, tiled_mma_pv);
+  auto s2r_thr_q = s2r_copy_q.get_thread_slice(wg_tid);
+  auto s2r_thr_k = s2r_copy_k.get_thread_slice(wg_tid);
+  auto s2r_thr_v = s2r_copy_v.get_thread_slice(wg_tid);
+
+  // V fragment layout: precompute the register layout for PV B-operand so we
+  // can reinterpret raw LDSM_T data without extra copies (same trick as the
+  // split-D kernel; see its comment for the swizzle rationale).
+  auto sV0 = make_tensor(make_smem_ptr(v_base), SmemLayoutV{});
+  auto sVt0_ns =
+      make_tensor(sV0.data(), get_nonswizzle_portion(SmemLayoutVt{}));
+  auto tCrV_layout = thr_mma_pv.partition_fragment_B(sVt0_ns).layout();
+
+  using OFragType = decltype(partition_fragment_C(
+      tiled_mma_pv, Shape<Int<kBr>, Int<kVDChunk>>{}));
+  using OFragLayout = typename OFragType::layout_type;
+  constexpr int kOElemsPerFrag = decltype(size(OFragType{}))::value;
+  constexpr int kORows = decltype(size<0>(
+      make_tensor((float*)nullptr,
+                  ffpa_cute::convert_layout_acc_rowcol(OFragLayout{}))))::value;
+  constexpr int kOCols = decltype(size<1>(
+      make_tensor((float*)nullptr,
+                  ffpa_cute::convert_layout_acc_rowcol(OFragLayout{}))))::value;
+
+  auto cS = make_identity_tensor(Shape<Int<kBr>, Int<kBc>>{});
+  auto tScS = thr_mma_qk.partition_C(cS);
+  auto tScS_rc = make_tensor(
+      tScS.data(), ffpa_cute::convert_layout_acc_rowcol(tScS.layout()));
+  constexpr int kSRows = decltype(size<0>(tScS_rc))::value;
+  constexpr int kSCols = decltype(size<1>(tScS_rc))::value;
+
+  const float inv_scale = 1.0f / scale;
+  scale *= FFPA_M_LOG2E;
+
+  float row_max[kORows];
+  float row_sum[kORows];
+#pragma unroll
+  for (int r = 0; r < kORows; ++r) {
+    row_max[r] = -INFINITY;
+    row_sum[r] = 0.0f;
+  }
+
+  float o_acc_storage[kDChunksV][kOElemsPerFrag];
+#pragma unroll
+  for (int v = 0; v < kDChunksV; ++v)
+#pragma unroll
+    for (int i = 0; i < kOElemsPerFrag; ++i)
+      o_acc_storage[v][i] = 0.0f;
+
+#pragma unroll 1
+  for (int kv_tile = 0; kv_tile < Tc_eff; ++kv_tile) {
+    // Phase 1: QK GEMM with split-D accumulation.
+    auto tCrS = partition_fragment_C(tiled_mma_qk, Shape<Int<kBr>, Int<kBc>>{});
+    clear(tCrS);
+
+#pragma unroll
+    for (int d_chunk = 0; d_chunk < kDChunksQK; ++d_chunk) {
+      const int chunk_index = kv_tile * kDChunksQK + d_chunk;
+      const int stage = chunk_index % kStagesQK;
+      const int phase = (chunk_index / kStagesQK) & 1;
+      TmaBarrier::wait(&qk_full[stage], phase);
+      cutlass::arch::fence_view_async_shared();
+
+      auto sQ = make_tensor(make_smem_ptr(q_base + stage * kQChunkElements),
+                            SmemLayoutQ{});
+      auto sK = make_tensor(make_smem_ptr(k_base + stage * kKChunkElements),
+                            SmemLayoutK{});
+      auto tCrQ = thr_mma_qk.partition_fragment_A(sQ);
+      auto tCrK = thr_mma_qk.partition_fragment_B(sK);
+      auto tQsQ = s2r_thr_q.partition_S(sQ);
+      auto tKsK = s2r_thr_k.partition_S(sK);
+
+      ffpa_cute::gemm_ss(tCrS, tCrQ, tCrK, tQsQ, tKsK, tiled_mma_qk, s2r_copy_q,
+                         s2r_copy_k, s2r_thr_q, s2r_thr_k);
+
+      // Release the slot to the producer; no inline prefetch here (the
+      // producer owns the pipeline and waits on this arrive).
+      CtaBarrier::arrive(&qk_empty[stage]);
+    }
+
+    // Phase 2: online softmax (identical to the split-D kernel).
+    auto scores = make_tensor(
+        tCrS.data(), ffpa_cute::convert_layout_acc_rowcol(tCrS.layout()));
+    float row_scale[kORows];
+
+    {
+      const int kv_valid = Nkv - kv_tile * kBc;
+      if (kv_valid < kBc) {
+#pragma unroll
+        for (int row = 0; row < kSRows; ++row)
+#pragma unroll
+          for (int col = 0; col < kSCols; ++col) {
+            if (get<1>(tScS_rc(row, col)) >= kv_valid)
+              scores(row, col) = -INFINITY;
+          }
+      }
+    }
+
+    if (kv_tile >= mask_start_tile) {
+#pragma unroll
+      for (int row = 0; row < kSRows; ++row) {
+        const int q_pos = Br_base + get<0>(tScS_rc(row, 0)) + kv_offset;
+#pragma unroll
+        for (int col = 0; col < kSCols; ++col) {
+          const int k_pos = kv_tile * kBc + get<1>(tScS_rc(row, col));
+          if (k_pos > q_pos)
+            scores(row, col) = -INFINITY;
+        }
+      }
+    }
+
+    if constexpr (kHasAttnBias) {
+      ffpa_cute::apply_attn_bias_rowcol<decltype(scores), decltype(tScS_rc),
+                                        kSRows, kSCols>(
+          scores, tScS_rc, attn_bias, attn_bias_dtype, attn_bias_stride_b,
+          attn_bias_stride_h, attn_bias_stride_m, attn_bias_stride_n, Nb_id,
+          Nh_id, Br_base, kv_tile, kBc, inv_scale);
+    }
+
+    ffpa_cute::online_safe_softmax<decltype(scores), decltype(tScS_rc), kORows>(
+        scores, tScS_rc, scale, row_max, row_sum, row_scale,
+        Traits::kRescaleThreshold);
+
+    bool local_need_rescale = false;
+#pragma unroll
+    for (int r = 0; r < kORows; ++r)
+      local_need_rescale = local_need_rescale || (row_scale[r] < 1.0f);
+    const bool need_rescale = __any_sync(0xffffffff, local_need_rescale);
+
+    if constexpr (kHasDropout) {
+      ffpa_cute::apply_dropout_rowcol<decltype(scores), decltype(tScS_rc),
+                                      kSRows, kSCols>(
+          scores, tScS_rc, dropout_p, philox_seed, philox_offset, Nb_id, Nh,
+          Nh_id, Nq, Nkv, Br_base, kv_tile, kBc);
+    }
+
+    // Phase 3: PV GEMM with split-D accumulation (O acc kept across kv_tiles
+    // for online partial rescaling, same as the split-D kernel).
+    auto tCrP = ffpa_cute::convert_type<Element>(tCrS);
+    auto tCrPv = make_tensor(
+        tCrP.data(),
+        ffpa_cute::convert_layout_acc_Aregs<TiledMmaPV>(tCrP.layout()));
+
+#pragma unroll
+    for (int v_chunk = 0; v_chunk < kDChunksV; ++v_chunk) {
+      const int chunk_index = kv_tile * kDChunksV + v_chunk;
+      const int v_stage = chunk_index % kStagesPV;
+      const int v_phase = (chunk_index / kStagesPV) & 1;
+      TmaBarrier::wait(&v_full[v_stage], v_phase);
+      cutlass::arch::fence_view_async_shared();
+
+      auto sV = make_tensor(make_smem_ptr(v_base + v_stage * kVChunkElements),
+                            SmemLayoutV{});
+      auto sVt = make_tensor(sV.data(), SmemLayoutVt{});
+      auto tCrVStorage = thr_mma_pv.partition_fragment_B(sV);
+      auto tCrV = make_tensor(tCrVStorage.data(), tCrV_layout);
+      auto tVsVt = s2r_thr_v.partition_S(sVt);
+
+      auto tCrO =
+          make_tensor(make_rmem_ptr(&o_acc_storage[v_chunk][0]), OFragLayout{});
+      if (kv_tile > 0 && need_rescale) {
+        auto tCrO_rc = make_tensor(
+            tCrO.data(), ffpa_cute::convert_layout_acc_rowcol(tCrO.layout()));
+#pragma unroll
+        for (int row = 0; row < kORows; ++row)
+#pragma unroll
+          for (int col = 0; col < kOCols; ++col)
+            tCrO_rc(row, col) *= row_scale[row];
+      }
+
+      ffpa_cute::gemm_rs(tCrO, tCrPv, tCrV, tVsVt, tiled_mma_pv, s2r_copy_v,
+                         s2r_thr_v);
+      CtaBarrier::arrive(&v_empty[v_stage]);
+    }
+  }
+
+  // Epilogue: normalize + batched R->S->TMA store (aligned tile) or
+  // predicated R->G (tail tile), same as the split-D kernel. The producer
+  // warpgroup has returned, so CTA-wide __syncthreads would deadlock; sync
+  // with a named barrier limited to the consumer threads instead.
+  {
+    constexpr int kVChunksPerBatch = Traits::kVChunksPerBatch;
+    constexpr int kNBatches = Traits::kNBatches;
+    constexpr int kOTileElems = cosize(SmemLayoutO{});
+
+    // V smem reads done before R->S overwrites shm
+    cutlass::arch::NamedBarrier::sync(kConsumerThreads, 0);
+
+    auto mO_tma = domain_offset(
+        make_coord(q_row_offset, 0),
+        tma_o.get_tma_tensor(make_shape(total_q_rows, Int<kHeadDim>{})));
+    auto o_slice = tma_o.get_slice(_0{});
+
+    auto r2s_copy = make_tiled_copy_C(Copy_Atom<SM90_U32x4_STSM_N, Element>{},
+                                      tiled_mma_pv);
+    auto r2s_thr = r2s_copy.get_slice(wg_tid);
+
+    const int O_gmem_offset =
+        (Nb_id * Nh * Nq * kHeadDim) + (Nh_id * Nq * kHeadDim);
+    auto mO = make_tensor(make_gmem_ptr(O + O_gmem_offset),
+                          make_shape(Nq, Int<kHeadDim>{}),
+                          make_stride(Int<kHeadDim>{}, _1{}));
+    auto cO = make_identity_tensor(Shape<Int<kBr>, Int<kVDChunk>>{});
+    auto tOcO = thr_mma_pv.partition_C(cO);
+
+    if (Br_base + kBr <= Nq) {
+      // aligned: batched R->S->G via TMA store
+#pragma unroll
+      for (int batch = 0; batch < kNBatches; ++batch) {
+        // R->S: stage kVChunksPerBatch v_chunks into disjoint shm regions
+#pragma unroll
+        for (int v_in = 0; v_in < kVChunksPerBatch; ++v_in) {
+          int v_chunk = batch * kVChunksPerBatch + v_in;
+          auto tCrO = make_tensor(make_rmem_ptr(&o_acc_storage[v_chunk][0]),
+                                  OFragLayout{});
+          auto tCrO_rc = make_tensor(
+              tCrO.data(), ffpa_cute::convert_layout_acc_rowcol(tCrO.layout()));
+          // Final O rescaling: multiply accumulated O by 1/row_sum (last
+          // kv_tile).
+#pragma unroll
+          for (int row = 0; row < kORows; ++row) {
+            const float inv_sum = 1.0f / row_sum[row];
+#pragma unroll
+            for (int col = 0; col < kOCols; ++col)
+              tCrO_rc(row, col) *= inv_sum;
+          }
+          auto tCrOHalf = ffpa_cute::convert_type<Element>(tCrO);
+          auto sO_v = make_tensor(make_smem_ptr(shm + v_in * kOTileElems),
+                                  SmemLayoutO{});
+          auto tCrOHalf_src = r2s_thr.retile_S(tCrOHalf);
+          auto tCsO_dst = r2s_thr.partition_D(sO_v);
+          copy(r2s_copy, tCrOHalf_src, tCsO_dst);
+        }
+        cutlass::arch::fence_view_async_shared();
+        cutlass::arch::NamedBarrier::sync(kConsumerThreads, 0);
+        // TMA stores: issue all v_chunks in this batch into one bulk group
+#pragma unroll
+        for (int v_in = 0; v_in < kVChunksPerBatch; ++v_in) {
+          int v_chunk = batch * kVChunksPerBatch + v_in;
+          auto sO_v = make_tensor(make_smem_ptr(shm + v_in * kOTileElems),
+                                  SmemLayoutO{});
+          auto gO_tma = local_tile(mO_tma, Shape<Int<kBr>, Int<kVDChunk>>{},
+                                   make_coord(Q_tile_id, v_chunk));
+          auto tCgO_tma = o_slice.partition_D(gO_tma);
+          auto tOsO = o_slice.partition_S(sO_v);
+          if (wg_tid == 0) {
+            copy(tma_o, tOsO, tCgO_tma);
+          }
+        }
+        tma_store_arrive();
+        if (batch < kNBatches - 1)
+          tma_store_wait<0>();  // drain for shm reuse
+      }
+    } else {
+      // tail: per-element predicated R->G
+#pragma unroll
+      for (int v_chunk = 0; v_chunk < kDChunksV; ++v_chunk) {
+        auto tCrO = make_tensor(make_rmem_ptr(&o_acc_storage[v_chunk][0]),
+                                OFragLayout{});
+        auto tCrO_rc = make_tensor(
+            tCrO.data(), ffpa_cute::convert_layout_acc_rowcol(tCrO.layout()));
+#pragma unroll
+        for (int row = 0; row < kORows; ++row) {
+          const float inv_sum = 1.0f / row_sum[row];
+#pragma unroll
+          for (int col = 0; col < kOCols; ++col)
+            tCrO_rc(row, col) *= inv_sum;
+        }
+        auto tCrOHalf = ffpa_cute::convert_type<Element>(tCrO);
+        auto gO = local_tile(mO, Shape<Int<kBr>, Int<kVDChunk>>{},
+                             make_coord(Q_tile_id, v_chunk));
+        auto tCgO = thr_mma_pv.partition_C(gO);
+#pragma unroll
+        for (int i = 0; i < size(tCrOHalf); ++i) {
+          const int global_row = Br_base + get<0>(tOcO(i));
+          if (global_row < Nq)
+            tCgO(i) = tCrOHalf(i);
+        }
+      }
+    }
+
+    // LSE write: overlaps last batch's TMA drain (aligned) or serial (tail).
+    if (softmax_lse != nullptr) {
+      const int lse_base = Nb_id * Nh * Nq + Nh_id * Nq;
+#pragma unroll
+      for (int row = 0; row < kORows; ++row) {
+        const float lse = (row_max[row] + log2f(row_sum[row])) * FFPA_M_LN2;
+        const int global_row = Br_base + get<0>(tScS_rc(row, 0));
+        if (global_row < Nq)
+          softmax_lse[lse_base + global_row] = lse;
+      }
+    }
+
+    // Final drain: only if TMA stores were issued (aligned path).
+    if (Br_base + kBr <= Nq)
+      tma_store_wait<0>();
   }
 }

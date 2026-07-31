@@ -274,6 +274,13 @@ void launch_ffpa_attn_persist_d_ws_fwd_cute_sm120(
     torch::Tensor attn_bias, torch::Tensor softmax_lse, int causal,
     double softmax_scale, double dropout_p, int64_t philox_seed,
     int64_t philox_offset);
+
+template <typename kDataType, const int kHeadDim, const int kStage>
+void launch_ffpa_attn_split_d_ws_fwd_cute_sm120(
+    torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O,
+    torch::Tensor attn_bias, torch::Tensor softmax_lse, int causal,
+    double softmax_scale, double dropout_p, int64_t philox_seed,
+    int64_t philox_offset);
 #endif  // ENABLE_FFPA_TMA_EXT
 
 template <typename kDataType, const int kHeadDim, const int kStage,
@@ -544,13 +551,18 @@ void launch_ffpa_attn_fwd_template(torch::Tensor Q, torch::Tensor K,
               Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
               dropout_p, philox_seed, philox_offset);
         } else if (force_cute_tma || (!has_attn_bias && !has_dropout)) {
-          if constexpr (kHeadDim <= 256 && kHeadDim % 64 == 0) {
-            // WS persist-D: 64-multiple D (64/128/256). Non-64-multiple
-            // small D (32/96) falls to split-D; 32-multiple support is planned.
-            // TODO: D=256 dispatch widened temporarily for setmaxnreg
-            // validation.
+          if constexpr (kHeadDim <= 128 && kHeadDim % 64 == 0) {
+            // WS persist-D: D=64/128 (Q persist fits the smem budget).
             launch_ffpa_attn_persist_d_ws_fwd_cute_sm120<kDataType, kHeadDim,
                                                          kStage>(
+                Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
+                dropout_p, philox_seed, philox_offset);
+          } else if constexpr (kHeadDim <= 512 && kHeadDim % 64 == 0) {
+            // WS split-D: D=256/320/512. D=256 avoids persist-D's Q-persist
+            // smem hog (S=1 there) for a deep pipeline; D=320/512 need the
+            // M4N2 D/4 O accumulator + setmaxnreg (D=512) to stay spill-free.
+            launch_ffpa_attn_split_d_ws_fwd_cute_sm120<kDataType, kHeadDim,
+                                                       kStage>(
                 Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
                 dropout_p, philox_seed, philox_offset);
           } else if constexpr (kHeadDim % 64 == 0) {
@@ -1142,6 +1154,157 @@ void launch_ffpa_attn_persist_d_ws_fwd_cute_sm120(
   } else {
     launch_variant(ffpa_attn_persist_d_ws_fwd_cute_sm120<Traits, TmaQ, TmaK,
                                                          TmaV, TmaO, 0, 0>);
+  }
+}
+
+template <typename kDataType, const int kHeadDim, const int kStage>
+void launch_ffpa_attn_split_d_ws_fwd_cute_sm120(
+    torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O,
+    torch::Tensor attn_bias, torch::Tensor softmax_lse, int causal,
+    double softmax_scale, double dropout_p, int64_t philox_seed,
+    int64_t philox_offset) {
+  using namespace cute;
+
+  // WS split-D consumer is fixed 256T (8 warps, M4N2 grid, kBr=64): each
+  // thread's O accumulator is kBr*kHeadDim/256 = D/4, so D=512 needs 128 regs
+  // and fits the 232-reg consumer budget (setmaxnreg, gated to D>=512 in the
+  // kernel) with zero spills. kBc=64 keeps the per-stage footprint at 16KB,
+  // so up to S=6 fits the 99KB smem budget.
+  constexpr int kBr = 64;
+  constexpr int kBc = 64;
+  constexpr int kQKDChunk = 32;
+  constexpr int kVDChunk = 64;
+  constexpr int kSmemBudgetBytes = 99 * 1024;
+  constexpr int kElemSize = sizeof(kDataType);
+  constexpr int kPerStageBytes =
+      (kBr * kQKDChunk + kBc * kQKDChunk + kBc * kVDChunk) * kElemSize;
+  constexpr int kMaxStages = kSmemBudgetBytes / kPerStageBytes;
+  // stages=1 has a barrier-protocol race on sm_120a; clamp to >=2.
+  constexpr int kStagesQK =
+      (kStage < 2) ? 2 : (kStage > kMaxStages ? kMaxStages : kStage);
+  constexpr int kStagesPV = kStagesQK;
+  // WS: 128 producer + 256 consumer = 384 threads
+  constexpr int kNumThreads = 384;
+
+  using CuteElement = std::conditional_t<std::is_same_v<kDataType, __half>,
+                                         cutlass::half_t, cutlass::bfloat16_t>;
+  using Traits =
+      ffpa_cute::FFPAAttnCuTeSplitDWsTraits<kHeadDim, kBr, kBc, kQKDChunk,
+                                            kVDChunk, kStagesQK, kStagesPV,
+                                            CuteElement>;
+  using SmemLayoutQ = typename Traits::SmemLayoutQ;
+  using SmemLayoutK = typename Traits::SmemLayoutK;
+  using SmemLayoutV = typename Traits::SmemLayoutV;
+  using SmemLayoutO = typename Traits::SmemLayoutO;
+
+  const int Nb = Q.size(0);
+  const int Nh = Q.size(1);
+  const int Nh_kv = K.size(1);
+  const int Nq = Q.size(2);
+  const int Nkv = K.size(2);
+  const int Tc = utils::div_ceil(Nkv, kBc);
+  const float scale = static_cast<float>(softmax_scale);
+
+  const bool has_attn_bias = attn_bias.numel() != 0;
+  const bool has_dropout = dropout_p > 0.0;
+
+  const void* attn_bias_ptr = nullptr;
+  int attn_bias_dtype = 0;
+  long long attn_bias_stride_b = 0, attn_bias_stride_h = 0,
+            attn_bias_stride_m = 0, attn_bias_stride_n = 0;
+  if (has_attn_bias) {
+    TORCH_CHECK(attn_bias.is_cuda() && attn_bias.device() == Q.device());
+    TORCH_CHECK(attn_bias.dim() == 4);
+    attn_bias_ptr = attn_bias.data_ptr();
+    if (attn_bias.scalar_type() == at::ScalarType::Half)
+      attn_bias_dtype = 1;
+    else if (attn_bias.scalar_type() == at::ScalarType::BFloat16)
+      attn_bias_dtype = 2;
+    else
+      attn_bias_dtype = 3;
+    attn_bias_stride_b =
+        (attn_bias.size(0) == 1 && Nb > 1) ? 0 : attn_bias.stride(0);
+    attn_bias_stride_h =
+        (attn_bias.size(1) == 1 && Nh > 1) ? 0 : attn_bias.stride(1);
+    attn_bias_stride_m =
+        (attn_bias.size(2) == 1 && Nq > 1) ? 0 : attn_bias.stride(2);
+    attn_bias_stride_n =
+        (attn_bias.size(3) == 1 && Nkv > 1) ? 0 : attn_bias.stride(3);
+  }
+  const float dropout_p_f = static_cast<float>(dropout_p);
+  const unsigned long long philox_seed_u =
+      static_cast<unsigned long long>(philox_seed);
+  const unsigned long long philox_offset_u =
+      static_cast<unsigned long long>(philox_offset);
+
+  const dim3 block(kNumThreads, 1, 1);
+  const dim3 grid(utils::div_ceil(Nq, kBr), Nb * Nh, 1);
+
+  const c10::cuda::OptionalCUDAGuard device_guard(Q.device());
+  auto stream = at::cuda::getCurrentCUDAStream();
+
+  const int total_q_rows = Nb * Nh * Nq;
+  const int total_kv_rows = Nb * Nh_kv * Nkv;
+
+  auto gQ =
+      make_tensor(make_gmem_ptr(reinterpret_cast<CuteElement*>(Q.data_ptr())),
+                  make_shape(total_q_rows, Int<kHeadDim>{}),
+                  make_stride(Int<kHeadDim>{}, _1{}));
+  auto gK =
+      make_tensor(make_gmem_ptr(reinterpret_cast<CuteElement*>(K.data_ptr())),
+                  make_shape(total_kv_rows, Int<kHeadDim>{}),
+                  make_stride(Int<kHeadDim>{}, _1{}));
+  auto gV =
+      make_tensor(make_gmem_ptr(reinterpret_cast<CuteElement*>(V.data_ptr())),
+                  make_shape(total_kv_rows, Int<kHeadDim>{}),
+                  make_stride(Int<kHeadDim>{}, _1{}));
+  auto gO =
+      make_tensor(make_gmem_ptr(reinterpret_cast<CuteElement*>(O.data_ptr())),
+                  make_shape(total_q_rows, Int<kHeadDim>{}),
+                  make_stride(Int<kHeadDim>{}, _1{}));
+
+  auto tma_q = make_tma_copy(SM90_TMA_LOAD{}, gQ, SmemLayoutQ{},
+                             Shape<Int<kBr>, Int<kQKDChunk>>{}, _1{});
+  auto tma_k = make_tma_copy(SM90_TMA_LOAD{}, gK, SmemLayoutK{},
+                             Shape<Int<kBc>, Int<kQKDChunk>>{}, _1{});
+  auto tma_v = make_tma_copy(SM90_TMA_LOAD{}, gV, SmemLayoutV{},
+                             Shape<Int<kBc>, Int<kVDChunk>>{}, _1{});
+  auto tma_o = make_tma_copy(SM90_TMA_STORE{}, gO, SmemLayoutO{},
+                             Shape<Int<kBr>, Int<kVDChunk>>{}, _1{});
+
+  constexpr int kSmemBytes = Traits::kSmemElems * sizeof(CuteElement);
+
+  float* softmax_lse_ptr =
+      softmax_lse.numel() > 0 ? softmax_lse.data_ptr<float>() : nullptr;
+  auto O_ptr = reinterpret_cast<CuteElement*>(O.data_ptr());
+
+  auto launch_variant = [&](auto kernel_func) {
+    cudaFuncSetAttribute(
+        kernel_func, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes);
+    kernel_func<<<grid, block, kSmemBytes, stream>>>(
+        tma_q, tma_k, tma_v, tma_o, O_ptr, softmax_lse_ptr, Nq, Nkv, Nh, Nh_kv,
+        scale, Tc, causal, total_q_rows, total_kv_rows, attn_bias_ptr,
+        attn_bias_dtype, attn_bias_stride_b, attn_bias_stride_h,
+        attn_bias_stride_m, attn_bias_stride_n, dropout_p_f, philox_seed_u,
+        philox_offset_u);
+  };
+
+  using TmaQ = decltype(tma_q);
+  using TmaK = decltype(tma_k);
+  using TmaV = decltype(tma_v);
+  using TmaO = decltype(tma_o);
+  if (has_attn_bias && has_dropout) {
+    launch_variant(ffpa_attn_split_d_ws_fwd_cute_sm120<Traits, TmaQ, TmaK, TmaV,
+                                                       TmaO, 1, 1>);
+  } else if (has_attn_bias) {
+    launch_variant(ffpa_attn_split_d_ws_fwd_cute_sm120<Traits, TmaQ, TmaK, TmaV,
+                                                       TmaO, 1, 0>);
+  } else if (has_dropout) {
+    launch_variant(ffpa_attn_split_d_ws_fwd_cute_sm120<Traits, TmaQ, TmaK, TmaV,
+                                                       TmaO, 0, 1>);
+  } else {
+    launch_variant(ffpa_attn_split_d_ws_fwd_cute_sm120<Traits, TmaQ, TmaK, TmaV,
+                                                       TmaO, 0, 0>);
   }
 }
 #endif  // ENABLE_FFPA_TMA_EXT
