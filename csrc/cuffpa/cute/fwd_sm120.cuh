@@ -796,7 +796,7 @@ __global__ void __launch_bounds__(384, 1) ffpa_attn_persist_d_ws_fwd_cute_sm120(
     // D=128 keeps the static 168-reg budget: O acc is only 64 regs there and
     // setmaxnreg costs a blocking TRY_ALLOC with no benefit.
     if constexpr (kHeadDim != 128) {
-      cutlass::arch::warpgroup_reg_dealloc<32>();
+      cutlass::arch::warpgroup_reg_dealloc<32>();  // sm_120f
     }
     if (wg_tid == 0) {
       auto mQ = domain_offset(
@@ -906,8 +906,10 @@ __global__ void __launch_bounds__(384, 1) ffpa_attn_persist_d_ws_fwd_cute_sm120(
   // Consumer path (wg_tid 0..255): wait Q, release K/V slots, then the full
   // QK->softmax->PV loop. No TMA issue here; no __syncthreads (single WG).
   // Take the 200 regs/thread released by the producer warpgroup.
+  // D=128 keeps the static 168-reg budget: O acc is only 64 regs there and
+  // setmaxnreg costs a blocking TRY_ALLOC with no benefit.
   if constexpr (kHeadDim != 128) {
-    cutlass::arch::warpgroup_reg_alloc<232>();
+    cutlass::arch::warpgroup_reg_alloc<232>();  // sm_120f
   }
   TmaBarrier::wait(&q_full, 0);
   cutlass::arch::fence_view_async_shared();
