@@ -544,9 +544,11 @@ void launch_ffpa_attn_fwd_template(torch::Tensor Q, torch::Tensor K,
               Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
               dropout_p, philox_seed, philox_offset);
         } else if (force_cute_tma || (!has_attn_bias && !has_dropout)) {
-          if constexpr (kHeadDim <= 128 && kHeadDim % 64 == 0) {
-            // WS persist-D: only 64-multiple small D (64/128). Non-64-multiple
+          if constexpr (kHeadDim <= 256 && kHeadDim % 64 == 0) {
+            // WS persist-D: 64-multiple D (64/128/256). Non-64-multiple
             // small D (32/96) falls to split-D; 32-multiple support is planned.
+            // TODO: D=256 dispatch widened temporarily for setmaxnreg
+            // validation.
             launch_ffpa_attn_persist_d_ws_fwd_cute_sm120<kDataType, kHeadDim,
                                                          kStage>(
                 Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
@@ -1004,8 +1006,13 @@ void launch_ffpa_attn_persist_d_ws_fwd_cute_sm120(
     int64_t philox_offset) {
   using namespace cute;
 
-  constexpr int kBr = (kHeadDim <= 128) ? 128 : 64;
-  constexpr int kBc = (kHeadDim <= 64) ? 128 : 64;
+  // WS consumer is fixed 256T (8 warps); TiledMma must be 8 warps -> kBr=128.
+  // kBc scaled with D so K/V stages fit the 99KB smem budget:
+  //   D<=64  -> kBc=128 (per-stage 32KB, S=2)
+  //   D=128  -> kBc=64  (per-stage 32KB, S=2; kBc=32 costs ~8%: Tc doubles)
+  //   D=256  -> kBc=32  (per-stage 32KB, S=1; Q persist alone is 64KB)
+  constexpr int kBr = 128;
+  constexpr int kBc = (kHeadDim <= 64) ? 128 : (kHeadDim <= 128) ? 64 : 32;
   constexpr int kSmemBudgetBytes = 99 * 1024;
   constexpr int kElemSize = sizeof(kDataType);
   constexpr int kQPersistBytes = kBr * kHeadDim * kElemSize;

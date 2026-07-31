@@ -2,6 +2,7 @@
 
 #include <cute/atom/copy_traits_sm90_tma.hpp>
 #include <cutlass/arch/barrier.h>
+#include <cutlass/arch/reg_reconfig.h>
 #include <cutlass/cutlass.h>
 #include <cutlass/device_kernel.h>
 
@@ -695,9 +696,9 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
 }
 
 // WS persist-D: 128 producer (TMA-only) + 256 consumer (MMA-only), 384 threads.
-// sm_120a: setmaxnreg is ineffective (ptxas C7506), per-thread reg budget is
-// the static 65536/384; WS wins only via TMA latency hiding, not extra
-// registers. Epilogue is direct R->G: a __syncthreads here would deadlock since
+// sm_120f target: setmaxnreg effective (producer dec 32 / consumer inc 232);
+// sm_120a target hits ptxas C7506 and silently ignores it, so build with 120f.
+// Epilogue is direct R->G: a __syncthreads here would deadlock since
 // the producer warpgroup has already fallen through the early-return below.
 // NOTE: Only 64-multiple small D (D=64/128) is supported today. Non-64-multiple
 // small D (D=32/96, SW128 swizzle requires headdim % 64 == 0) is handled by the
@@ -791,6 +792,12 @@ __global__ void __launch_bounds__(384, 1) ffpa_attn_persist_d_ws_fwd_cute_sm120(
   // P0 loads Q once; P1 prefetches K/V[0..S-2]; P2 prefetches ahead by S-1
   // tiles (V-first then K-after) so consumer's K/V waits never stall.
   if (is_producer) {
+    // Release 200 regs/thread to the CTA pool for the consumer warpgroups.
+    // D=128 keeps the static 168-reg budget: O acc is only 64 regs there and
+    // setmaxnreg costs a blocking TRY_ALLOC with no benefit.
+    if constexpr (kHeadDim != 128) {
+      cutlass::arch::warpgroup_reg_dealloc<32>();
+    }
     if (wg_tid == 0) {
       auto mQ = domain_offset(
           make_coord(q_row_offset, 0),
@@ -898,6 +905,10 @@ __global__ void __launch_bounds__(384, 1) ffpa_attn_persist_d_ws_fwd_cute_sm120(
 
   // Consumer path (wg_tid 0..255): wait Q, release K/V slots, then the full
   // QK->softmax->PV loop. No TMA issue here; no __syncthreads (single WG).
+  // Take the 200 regs/thread released by the producer warpgroup.
+  if constexpr (kHeadDim != 128) {
+    cutlass::arch::warpgroup_reg_alloc<232>();
+  }
   TmaBarrier::wait(&q_full, 0);
   cutlass::arch::fence_view_async_shared();
 
