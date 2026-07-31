@@ -367,7 +367,15 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
       // Row-max + exp2 + row-sum.
       ffpa_cute::online_safe_softmax<decltype(scores), decltype(tScS_rc),
                                      kORows>(scores, tScS_rc, scale, row_max,
-                                             row_sum, row_scale);
+                                             row_sum, row_scale,
+                                             Traits::kRescaleThreshold);
+
+      // FA-4 warp-uniform vote: skip O rescale when all row_scale are 1.0.
+      bool local_need_rescale = false;
+#pragma unroll
+      for (int r = 0; r < kORows; ++r)
+        local_need_rescale = local_need_rescale || (row_scale[r] < 1.0f);
+      const bool need_rescale = __any_sync(0xffffffff, local_need_rescale);
 
       // Dropout on P (post-softmax, pre-PV).
       if constexpr (kHasDropout) {
@@ -411,7 +419,7 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
         // O rescaling.
         auto tCrO = make_tensor(make_rmem_ptr(&o_acc_storage[v_chunk][0]),
                                 OFragLayout{});
-        if (kv_tile > 0) {
+        if (kv_tile > 0 && need_rescale) {
           auto tCrO_rc = make_tensor(
               tCrO.data(), ffpa_cute::convert_layout_acc_rowcol(tCrO.layout()));
 #pragma unroll

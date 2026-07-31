@@ -58,7 +58,7 @@ template <typename kDataType, const int kHeadDim, const int kMmaAtomM,
           const int kPadK, const int kPadV, const int kQKDChunk = kMmaAtomK,
           const int kVDChunk = kMmaAtomN * 2, const int kShareSmemQKV = 0,
           const int kPersistQg2s = 0, const int kProducerThreads = 128,
-          const int kNonWS = 0>
+          const int kNonWS = 0, const int kLazyRescale = 1>
 __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK +
                                       (kNonWS ? 0 : kProducerThreads),
                                   1)
@@ -510,7 +510,8 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK +
     ffpa::prefill::sync_online_safe_softmax<kValTileSeqLenK, kMmaAccFloat32QK,
                                             kDataType>(
         &R_S[0][0][0], scale, &lane_row_max_new[0][0], &lane_row_sum_new[0][0],
-        &lane_block_row_max_old[0][0], &lane_block_row_sum_old[0][0]);
+        &lane_block_row_max_old[0][0], &lane_block_row_sum_old[0][0],
+        kLazyRescale ? 8.0f : 0.0f);
     if (dropout_p > 0.0f) {
       ffpa::prefill::sync_apply_dropout_to_p<kValTileSeqLenK, kMmaAccFloat32QK,
                                              kDataType>(
@@ -530,6 +531,11 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK +
           &rescale_o_factor_0[0], &rescale_o_factor_1[0],
           &lane_row_max_new[0][0], &lane_block_row_max_old[0][0],
           tile_K_seqlen);
+
+      // FA-4 warp-uniform vote: skip O rescale when all factors are 1.0.
+      const bool local_need_rescale =
+          (rescale_o_factor_0[0] < 1.0f) || (rescale_o_factor_1[0] < 1.0f);
+      const bool need_rescale = __any_sync(0xffffffff, local_need_rescale);
 
       // kNonWS: thread 0 prefetches first kStagePV V stages.
       if constexpr (kNonWS) {
@@ -584,7 +590,7 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK +
             ffpa::prefill::sync_rescaling_tiling_o<kOStorageAccFloat32,
                                                    kMmaAccFloat32PV, kDataType>(
                 &R_D[0][0][0], &R_O[0], &rescale_o_factor_0[0],
-                &rescale_o_factor_1[0], tile_K_seqlen, j);
+                &rescale_o_factor_1[0], tile_K_seqlen, j, need_rescale);
           }
         }
         // Release V stage: all kSubTilesV*2 j's consumed this tile.
