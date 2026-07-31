@@ -9,3 +9,6 @@
 #define FFPA_M_LOG2E 1.44269504088896340736f
 // Inverse of FFPA_M_LOG2E: convert a log2-domain value back to natural-log.
 #define FFPA_M_LN2 0.69314718055994530942f
+// FA-4 conditional rescaling threshold (log2 domain). Skip O rescale when the
+// row-max growth stays below this. FP16/BF16: 8.0 = log2(256); FP8: 4.0.
+#define FFPA_RESCALE_THRESHOLD 8.0f

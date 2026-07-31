@@ -1,5 +1,6 @@
 #pragma once
 
+#include "common.cuh"
 #include "gemm.cuh"
 
 #include <cute/atom/copy_traits_sm90_tma.hpp>
@@ -64,9 +65,8 @@ struct FFPAAttnCuTeTraits {
   static constexpr int kVChunksPerBatch =
       compute_vchunks_per_batch(kDChunksV, kHeadDim, kBr, kSmemElems);
   static constexpr int kNBatches = kDChunksV / kVChunksPerBatch;
-  // FA-4 conditional rescaling threshold (log2 domain). 0.0 = disabled.
-  // FP16/BF16: 8.0 = log2(256); FP8 would use 4.0 = log2(16).
-  static constexpr float kRescaleThreshold = 8.0f;
+  // FA-4 conditional rescaling threshold (log2 domain), shared via macro.
+  static constexpr float kRescaleThreshold = FFPA_RESCALE_THRESHOLD;
 
   using Element = Element_;
   using SmemAtomQK = typename SelectSmemAtom<kQKDChunk, Element>::type;
@@ -120,7 +120,7 @@ struct FFPAAttnCuTePersistDTraits {
   static constexpr int kNumThreads = kNumWarps * 32;
   static constexpr int kStagesK = kStagesK_;
   static constexpr int kStagesV = kStagesV_;
-  static constexpr float kRescaleThreshold = 8.0f;
+  static constexpr float kRescaleThreshold = FFPA_RESCALE_THRESHOLD;
 
   static constexpr int kSmemElems =
       kBr * kHeadDim + kStagesK * kBc * kHeadDim + kStagesV * kBc * kHeadDim;

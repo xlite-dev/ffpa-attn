@@ -58,7 +58,7 @@ template <typename kDataType, const int kHeadDim, const int kMmaAtomM,
           const int kPadK, const int kPadV, const int kQKDChunk = kMmaAtomK,
           const int kVDChunk = kMmaAtomN * 2, const int kShareSmemQKV = 0,
           const int kPersistQg2s = 0, const int kProducerThreads = 128,
-          const int kNonWS = 0, const int kLazyRescale = 1>
+          const int kNonWS = 0>
 __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK +
                                       (kNonWS ? 0 : kProducerThreads),
                                   1)
@@ -511,7 +511,7 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK +
                                             kDataType>(
         &R_S[0][0][0], scale, &lane_row_max_new[0][0], &lane_row_sum_new[0][0],
         &lane_block_row_max_old[0][0], &lane_block_row_sum_old[0][0],
-        kLazyRescale ? 8.0f : 0.0f);
+        FFPA_RESCALE_THRESHOLD);
     if (dropout_p > 0.0f) {
       ffpa::prefill::sync_apply_dropout_to_p<kValTileSeqLenK, kMmaAccFloat32QK,
                                              kDataType>(

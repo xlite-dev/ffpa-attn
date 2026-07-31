@@ -92,7 +92,7 @@ template <typename kDataType, const int kHeadDim, const int kMmaAtomM,
           const int kPrefetchQK, const int kPrefetchPV, const int kShareSmemQKV,
           const int kPersistQs2r, const int kPersistQg2s, const int kRegPipeKV,
           const int kStageQK, const int kStagePV, const int kPadQ,
-          const int kPadK, const int kPadV, const int kLazyRescale = 1>
+          const int kPadK, const int kPadV>
 __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
     ffpa_attn_split_d_fwd_template(
         const kDataType* __restrict__ Q, const kDataType* __restrict__ K,
@@ -530,7 +530,7 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
                                             kDataType>(
         &R_S[0][0][0], scale, &lane_row_max_new[0][0], &lane_row_sum_new[0][0],
         &lane_block_row_max_old[0][0], &lane_block_row_sum_old[0][0],
-        kLazyRescale ? 8.0f : 0.0f);
+        FFPA_RESCALE_THRESHOLD);
     if (dropout_p > 0.0f) {
       ffpa::prefill::sync_apply_dropout_to_p<kValTileSeqLenK, kMmaAccFloat32QK,
                                              kDataType>(
