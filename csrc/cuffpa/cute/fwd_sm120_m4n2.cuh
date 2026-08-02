@@ -187,7 +187,7 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
     CtaBarrier::arrive(&v_empty[s]);
 
   auto issue_qk_tma = [&](int d_chunk, int stage, int kv_tile_idx) {
-    asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+    cutlass::arch::fence_view_async_shared();
     auto sQ = make_tensor(make_smem_ptr(q_base + stage * kQChunkElements),
                           SmemLayoutQ{});
     auto sK = make_tensor(make_smem_ptr(k_base + stage * kKChunkElements),
@@ -207,7 +207,7 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
   };
 
   auto issue_v_tma = [&](int v_chunk, int stage, int kv_tile_idx) {
-    asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+    cutlass::arch::fence_view_async_shared();
     auto sV = make_tensor(make_smem_ptr(v_base + stage * kVChunkElements),
                           SmemLayoutV{});
     auto gV = local_tile(mV, Shape<Int<kBc>, Int<kVDChunk>>{},
