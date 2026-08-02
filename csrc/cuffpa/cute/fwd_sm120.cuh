@@ -2097,6 +2097,9 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
       copy(r2s_copy_p, tCrP_src, tCsP_dst);
       cutlass::arch::fence_view_async_shared();
       __syncthreads();
+      // Reuses the P write-read barrier above as the sum-publish sync.
+      ffpa_cute::finalize_row_sum_m4n2<kORows>(row_sum, row_scale,
+                                               smem_exchange, warp_id, lane_id);
 
       auto tCrPv_storage = thr_mma_pv.partition_fragment_A(sP);
       auto tPsP = s2r_thr_p.partition_S(sP);

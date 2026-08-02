@@ -70,8 +70,12 @@ __device__ __forceinline__ void online_safe_softmax(
 // Cross-N-warp online softmax for M4N2 layout.
 // Each N-warp holds half the Bc columns; row-max and row-sum must be reduced
 // across peer warps (warp_id ^ 4) via SMEM exchange.
-// smem_exchange layout: [8 warps][16 rows] floats, reused for max then sum.
+// smem_exchange layout: [8 warps][16 rows] floats per region (max then sum).
 // Precondition: caller has applied masking and scale *= FFPA_M_LOG2E.
+// One barrier only (max exchange): the peer sum is NOT read here — the
+// caller's P write-read __syncthreads() (stmatrix -> LDSM_N) also publishes
+// the sum writes, so finalize_row_sum_m4n2 runs after it and reuses that
+// barrier. Saves one CTA barrier per KV tile vs. the 3-sync version.
 template <typename ScoresTensor, typename CoordTensor, int kRows,
           int kNumWarps = 8>
 __device__ __forceinline__ void online_safe_softmax_m4n2(
@@ -134,7 +138,20 @@ __device__ __forceinline__ void online_safe_softmax_m4n2(
     if (is_writer)
       smem_exchange[kMaxSlots + warp_id * 16 + row_local] = tile_sum;
   }
-  __syncthreads();
+}
+
+// M4N2 softmax phase 2: fold peer tile sums into row_sum. Called AFTER the
+// caller's P write-read __syncthreads(), which doubles as the barrier that
+// publishes the sum writes above.
+template <int kRows, int kNumWarps = 8>
+__device__ __forceinline__ void finalize_row_sum_m4n2(float* row_sum,
+                                                      float* row_scale,
+                                                      float* smem_exchange,
+                                                      int warp_id,
+                                                      int lane_id) {
+  const int peer_warp = warp_id ^ 4;
+  const int row_base = lane_id / 4;
+  constexpr int kMaxSlots = kNumWarps * 16;
 
 #pragma unroll
   for (int row = 0; row < kRows; ++row) {
