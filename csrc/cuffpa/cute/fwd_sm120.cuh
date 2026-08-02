@@ -295,6 +295,7 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
   // TMA load helpers: tid=0 issues Q+K (or V) TMA copies with
   // arrive_and_expect_tx on the full barrier for the target stage.
   auto issue_qk_tma = [&](int d_chunk, int stage, int kv_tile_idx) {
+    cutlass::arch::fence_view_async_shared();
     auto sQ = make_tensor(make_smem_ptr(q_base + stage * kQChunkElements),
                           SmemLayoutQ{});
     auto sK = make_tensor(make_smem_ptr(k_base + stage * kKChunkElements),
@@ -314,6 +315,7 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
   };
 
   auto issue_v_tma = [&](int v_chunk, int stage, int kv_tile_idx) {
+    cutlass::arch::fence_view_async_shared();
     auto sV = make_tensor(make_smem_ptr(v_base + stage * kVChunkElements),
                           SmemLayoutV{});
     auto gV = local_tile(mV, Shape<Int<kBc>, Int<kVDChunk>>{},
@@ -646,8 +648,10 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
           }
         }
         tma_store_arrive();
-        if (batch < kNBatches - 1)
+        if (batch < kNBatches - 1) {
           tma_store_wait<0>();  // drain for shm reuse
+          __syncthreads();  // all threads wait (tma_store_wait is tid=0-only)
+        }
       }
     } else {
       // tail: per-element predicated R->G (unchanged)
@@ -1310,6 +1314,7 @@ __global__ void __launch_bounds__(384, 1) ffpa_attn_split_d_ws_fwd_cute_sm120(
       auto v_slice = tma_v.get_slice(_0{});
 
       auto issue_qk_tma = [&](int d_chunk, int stage, int kv_tile_idx) {
+        cutlass::arch::fence_view_async_shared();
         auto sQ = make_tensor(make_smem_ptr(q_base + stage * kQChunkElements),
                               SmemLayoutQ{});
         auto sK = make_tensor(make_smem_ptr(k_base + stage * kKChunkElements),
@@ -1329,6 +1334,7 @@ __global__ void __launch_bounds__(384, 1) ffpa_attn_split_d_ws_fwd_cute_sm120(
       };
 
       auto issue_v_tma = [&](int v_chunk, int stage, int kv_tile_idx) {
+        cutlass::arch::fence_view_async_shared();
         auto sV = make_tensor(make_smem_ptr(v_base + stage * kVChunkElements),
                               SmemLayoutV{});
         auto gV = local_tile(mV, Shape<Int<kBc>, Int<kVDChunk>>{},
@@ -1638,8 +1644,10 @@ __global__ void __launch_bounds__(384, 1) ffpa_attn_split_d_ws_fwd_cute_sm120(
           }
         }
         tma_store_arrive();
-        if (batch < kNBatches - 1)
+        if (batch < kNBatches - 1) {
           tma_store_wait<0>();  // drain for shm reuse
+          cutlass::arch::NamedBarrier::sync(kConsumerThreads, 0);
+        }
       }
     } else {
       // tail: per-element predicated R->G

@@ -67,6 +67,84 @@ __device__ __forceinline__ void online_safe_softmax(
   }
 }
 
+// Cross-N-warp online softmax for M4N2 layout.
+// Each N-warp holds half the Bc columns; row-max and row-sum must be reduced
+// across peer warps (warp_id ^ 4) via SMEM exchange.
+// smem_exchange layout: [8 warps][16 rows] floats, reused for max then sum.
+// Precondition: caller has applied masking and scale *= FFPA_M_LOG2E.
+template <typename ScoresTensor, typename CoordTensor, int kRows,
+          int kNumWarps = 8>
+__device__ __forceinline__ void online_safe_softmax_m4n2(
+    ScoresTensor& scores, const CoordTensor& tScS_rc, float scale,
+    float* row_max, float* row_sum, float* row_scale, float* smem_exchange,
+    int warp_id, int lane_id, float rescale_threshold = 0.0f) {
+  // warp_id layout: m_warp = warp_id % 4, n_warp = warp_id / 4
+  // peer = warp_id ^ 4 (flips n_warp bit)
+  const int peer_warp = warp_id ^ 4;
+  // m16n8k16 C-fragment: 4 lanes share one row. row_base = lane_id/4 gives the
+  // first owned row; the second (kRows==2) is row_base + 8.
+  const bool is_writer = (lane_id % 4 == 0);
+  const int row_base = lane_id / 4;
+  // Max and sum use SEPARATE SMEM regions to avoid cross-warp RAW hazard:
+  // without separation, a fast warp could overwrite max with sum before the
+  // peer warp reads it (no __syncthreads between max-read and sum-write).
+  constexpr int kMaxSlots = kNumWarps * 16;
+
+#pragma unroll
+  for (int row = 0; row < kRows; ++row) {
+    float tile_max = -INFINITY;
+#pragma unroll
+    for (int col = 0; col < cute::size<1>(scores); ++col)
+      tile_max = fmaxf(tile_max, scores(row, col) * scale);
+    tile_max = fmaxf(tile_max, __shfl_xor_sync(0xffffffff, tile_max, 1));
+    tile_max = fmaxf(tile_max, __shfl_xor_sync(0xffffffff, tile_max, 2));
+    const int row_local = row_base + row * 8;
+    if (is_writer)
+      smem_exchange[warp_id * 16 + row_local] = tile_max;
+  }
+  __syncthreads();
+
+#pragma unroll
+  for (int row = 0; row < kRows; ++row) {
+    const int row_local = row_base + row * 8;
+    float tile_max = smem_exchange[warp_id * 16 + row_local];
+    float peer_max = smem_exchange[peer_warp * 16 + row_local];
+    float global_tile_max = fmaxf(tile_max, peer_max);
+
+    const float next_max = fmaxf(row_max[row], global_tile_max);
+    const float log2_diff = row_max[row] - next_max;
+    float eff_max = next_max;
+    if (rescale_threshold > 0.0f && log2_diff >= -rescale_threshold) {
+      row_scale[row] = 1.0f;
+      eff_max = row_max[row];
+    } else {
+      row_scale[row] = exp2f(log2_diff);
+      row_max[row] = next_max;
+    }
+
+    float tile_sum = 0.0f;
+#pragma unroll
+    for (int col = 0; col < cute::size<1>(scores); ++col) {
+      const float p = exp2f(scores(row, col) * scale - eff_max);
+      scores(row, col) = p;
+      tile_sum += p;
+    }
+    tile_sum += __shfl_xor_sync(0xffffffff, tile_sum, 1);
+    tile_sum += __shfl_xor_sync(0xffffffff, tile_sum, 2);
+    if (is_writer)
+      smem_exchange[kMaxSlots + warp_id * 16 + row_local] = tile_sum;
+  }
+  __syncthreads();
+
+#pragma unroll
+  for (int row = 0; row < kRows; ++row) {
+    const int row_local = row_base + row * 8;
+    float local_sum = smem_exchange[kMaxSlots + warp_id * 16 + row_local];
+    float peer_sum = smem_exchange[kMaxSlots + peer_warp * 16 + row_local];
+    row_sum[row] = row_sum[row] * row_scale[row] + (local_sum + peer_sum);
+  }
+}
+
 // Online softmax with additive bias fused into the row-max pass.
 template <typename ScoresTensor, typename CoordTensor, int kRows>
 __device__ __forceinline__ void online_softmax_bias(
