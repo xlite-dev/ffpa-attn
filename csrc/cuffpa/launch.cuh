@@ -1,4 +1,5 @@
 #pragma once
+#include <cstdlib>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 
@@ -567,26 +568,39 @@ void launch_ffpa_attn_fwd_template(torch::Tensor Q, torch::Tensor K,
                                                          kStage>(
                 Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
                 dropout_p, philox_seed, philox_offset);
-          } else if constexpr (kHeadDim >= 512 && kHeadDim % 64 == 0) {
-            // split-D M4N2 (non-WS): D>=512 register pressure forces kBr=64,
-            // atom_layout=(4,2,1). O regs = D/4 (vs M8N1's D/2 which spills).
-            launch_ffpa_attn_split_d_m4n2_fwd_cute_sm120<kDataType, kHeadDim,
-                                                         kStage>(
-                Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
-                dropout_p, philox_seed, philox_offset);
           } else if constexpr (kHeadDim % 64 == 0) {
-            // split-D (non-WS): D=256/320/384/448. The WS variant
-            // (launch_ffpa_attn_split_d_ws_fwd_cute_sm120) is disabled:
-            // setmaxnreg's consumer ceiling (232, CTA-pool max) cannot hold
-            // D=512's 256-reg o_acc (per-thread hard cap 255), and D=256/320/
-            // 512 show no perf gain over non-WS (o_acc=D*kBr/256 regs spills
-            // to local mem either way). WS kernel kept in cute/fwd_sm120.cuh
-            // for reference; FA-1 M4N2 is the path to lower large-D reg
-            // pressure (.tmp/plans/ffpa_fa1.md).
-            launch_ffpa_attn_split_d_fwd_cute_sm120<kDataType, kHeadDim, kStage,
-                                                    32, 64>(
-                Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
-                dropout_p, philox_seed, philox_offset);
+            // A/B experiment dispatch for %64==0 headdims (D=256..1024):
+            //   FFPA_FORCE_M8N1=1 -> ALL route to the M8N1 split-D kernel
+            //     (register spill for D>=512: o_acc = D/2 regs/thread).
+            //   FFPA_FORCE_M4N2=1 -> ALL route to M4N2 (P SMEM roundtrip +
+            //     cross-N-warp softmax overhead for D<512).
+            // Default = production policy: M8N1 for D<512, M4N2 for D>=512
+            // (M4N2 halves O regs to D/4 via kBr=64).
+            static const bool force_m8n1 =
+                std::getenv("FFPA_FORCE_M8N1") != nullptr;
+            static const bool force_m4n2 =
+                std::getenv("FFPA_FORCE_M4N2") != nullptr;
+            if (force_m4n2 || (!force_m8n1 && kHeadDim >= 512)) {
+              // split-D M4N2 (non-WS): kBr=64, atom_layout=(4,2,1). O regs =
+              // D/4 per thread (vs M8N1's D/2 which spills for D>=512).
+              launch_ffpa_attn_split_d_m4n2_fwd_cute_sm120<kDataType, kHeadDim,
+                                                           kStage>(
+                  Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
+                  dropout_p, philox_seed, philox_offset);
+            } else {
+              // split-D (non-WS) M8N1. The WS variant
+              // (launch_ffpa_attn_split_d_ws_fwd_cute_sm120) is disabled:
+              // setmaxnreg's consumer ceiling (232, CTA-pool max) cannot hold
+              // D=512's 256-reg o_acc (per-thread hard cap 255), and D=256/320/
+              // 512 show no perf gain over non-WS (o_acc=D*kBr/256 regs spills
+              // to local mem either way). WS kernel kept in cute/fwd_sm120.cuh
+              // for reference; FA-1 M4N2 is the path to lower large-D reg
+              // pressure (.tmp/plans/ffpa_fa1.md).
+              launch_ffpa_attn_split_d_fwd_cute_sm120<kDataType, kHeadDim,
+                                                      kStage, 32, 64>(
+                  Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
+                  dropout_p, philox_seed, philox_offset);
+            }
           } else if constexpr (kHeadDim % 32 == 0) {
             launch_ffpa_attn_split_d_fwd_cute_sm120<kDataType, kHeadDim, kStage,
                                                     32, 32>(
