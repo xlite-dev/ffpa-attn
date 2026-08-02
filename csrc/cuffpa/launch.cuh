@@ -574,13 +574,17 @@ void launch_ffpa_attn_fwd_template(torch::Tensor Q, torch::Tensor K,
             //     (register spill for D>=512: o_acc = D/2 regs/thread).
             //   FFPA_FORCE_M4N2=1 -> ALL route to M4N2 (P SMEM roundtrip +
             //     cross-N-warp softmax overhead for D<512).
-            // Default = production policy: M8N1 for D<512, M4N2 for D>=512
-            // (M4N2 halves O regs to D/4 via kBr=64).
+            // Default = production policy from the A/B benchmark (RTX 5090,
+            // self-attn fp16/bf16, D=320..1024): M8N1 wins for D<768
+            // (+2..16%, cross at D=640), M4N2 wins for D>=768 (+7% @768,
+            // +11% @896, +55% @1024 where M8N1's o_acc=D/2 regs spills to
+            // local mem and collapses to ~100T). Both are exact (O_err
+            // ~1e-4) at every D.
             static const bool force_m8n1 =
                 std::getenv("FFPA_FORCE_M8N1") != nullptr;
             static const bool force_m4n2 =
                 std::getenv("FFPA_FORCE_M4N2") != nullptr;
-            if (force_m4n2 || (!force_m8n1 && kHeadDim >= 512)) {
+            if (force_m4n2 || (!force_m8n1 && kHeadDim >= 768)) {
               // split-D M4N2 (non-WS): kBr=64, atom_layout=(4,2,1). O regs =
               // D/4 per thread (vs M8N1's D/2 which spills for D>=512).
               launch_ffpa_attn_split_d_m4n2_fwd_cute_sm120<kDataType, kHeadDim,
