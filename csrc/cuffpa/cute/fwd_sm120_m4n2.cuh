@@ -11,6 +11,24 @@
 //   2. Softmax: cross-N-warp reduction via SMEM exchange (2 syncs)
 //   3. P→PV: SMEM roundtrip (stmatrix→LDSM_N) instead of register reinterpret
 //   4. Epilogue: only n_warp==0 writes LSE (both N-warps share same rows)
+//
+// A/B benchmark vs M8N1 (launch.cuh FFPA_FORCE_M8N1/FFPA_FORCE_M4N2),
+// RTX 5090 (SM120), torch 2.13.0+cu132, self-attn N=8192, stages=2.
+// Table: FFPA time (ms) / TFLOPS, fp16 (bf16 within ±2%); O_err≈1e-4 both.
+//   D     M8N1 (ms/TFLOPS)      M4N2 (ms/TFLOPS)       winner
+//   320   13.21/13.20  208T     15.35/15.30  179T      M8N1 +16%
+//   384   16.37/16.22  202T     18.13/18.04  182T      M8N1 +11%
+//   448   20.33/20.25  189T     20.77/20.55  185T      M8N1  +2%
+//   512   22.69/22.58  194T     23.73/23.48  185T      M8N1  +4%
+//   576   26.54/26.36  186T     26.42/26.07  187T      M4N2  +0.5%
+//   640   29.99/29.83  183T     31.28/30.96  176T      M8N1  +4%
+//   768   40.55/39.79  163T     37.78/37.31  175T      M4N2  +7%
+//   896   54.03/57.97  142T     49.16/48.72  157T      M4N2 +11%
+//   1024  88.37/87.75  100T     57.11/56.60  154T      M4N2 +55%
+// Cross point lies between 640 and 768. Final dispatch (launch.cuh):
+// D<768 -> M8N1 (P regs stay under the 255-reg ceiling), D>=768 -> this
+// M4N2 kernel. At D=1024 M8N1's o_acc = D/2 = 512 regs/thread spills to
+// local mem and collapses to ~100T; M4N2's D/4 = 256 regs keeps 154T.
 template <typename Traits, typename TmaQ, typename TmaK, typename TmaV,
           typename TmaO, int kHasAttnBias = 0, int kHasDropout = 0>
 __global__ void __launch_bounds__(Traits::kNumThreads, 1)
