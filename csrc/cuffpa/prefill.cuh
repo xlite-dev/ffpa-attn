@@ -6,10 +6,7 @@
 #include "swizzle.cuh"       // ffpa::swizzle
 #include "cp_async.cuh"      // ffpa::cp_async
 #include "utils.cuh"         // ffpa::utils
-
-// exp2f softmax optimization: expf(x) == exp2f(x * M_LOG2E).
-#define FFPA_M_LOG2E 1.44269504088896340736f
-#define FFPA_M_LN2 0.69314718055994530942f
+#include "common.cuh"        // FFPA_M_LOG2E / FFPA_M_LN2
 
 namespace ffpa {
 namespace prefill {
@@ -679,7 +676,8 @@ __device__ __forceinline__ void sync_online_safe_softmax(
     float* lane_row_max_new,        // &lane_row_max_new[0][0]
     float* lane_row_sum_new,        // &lane_row_sum_new[0][0]
     float* lane_block_row_max_old,  // &lane_block_row_max_old[0][0]
-    float* lane_block_row_sum_old   // &lane_block_row_sum_old[0][0]
+    float* lane_block_row_sum_old,  // &lane_block_row_sum_old[0][0]
+    float rescale_threshold = 0.0f  // FA-4 lazy rescale: 0.0 = disabled
 ) {
   using Traits = DtypeTraits<kDataType>;
   if constexpr (kMmaAccFloat32) {
@@ -718,24 +716,45 @@ __device__ __forceinline__ void sync_online_safe_softmax(
       const float block_row_max_new_1_2 =
           max(lane_block_row_max_old[1] * FFPA_M_LOG2E, lane_row_max_new[1]);
 
+      // FA-4 conditional rescaling: small max growth keeps stale row_max so
+      // the downstream rescale factor becomes 1.0 (skip O rescale). Both
+      // m_old and next_max are in log2 domain, so log2_diff needs no extra
+      // * scale_log2.
+      const float m_old_log2_0 = lane_block_row_max_old[0] * FFPA_M_LOG2E;
+      const float m_old_log2_1 = lane_block_row_max_old[1] * FFPA_M_LOG2E;
+      const bool skip_0 =
+          rescale_threshold > 0.0f &&
+          (m_old_log2_0 - block_row_max_new_0_2) >= -rescale_threshold;
+      const bool skip_1 =
+          rescale_threshold > 0.0f &&
+          (m_old_log2_1 - block_row_max_new_1_2) >= -rescale_threshold;
+      // On skip, P uses stale m_old; reuse block_row_max_new as eff_max so
+      // the exp2f loop below and the ln-domain row_max_new output stay as-is.
+      float eff_max_0_2 = block_row_max_new_0_2;
+      float eff_max_1_2 = block_row_max_new_1_2;
+      if (skip_0)
+        eff_max_0_2 = m_old_log2_0;
+      if (skip_1)
+        eff_max_1_2 = m_old_log2_1;
+
 #pragma unroll
       for (int j = 0; j < kValTileSeqLenK; ++j) {
         // R_S[][][4] 4 32bit registers with each contains 1 F32 element.
         // (x,y) 0~7->{c0, c1}, (z,w)->8~15 {c2, c3}
         float* t_fptr_S_0_1 = reinterpret_cast<float*>(R_S + j * 4);
         kDataType* t_hptr_S_0_1 = reinterpret_cast<kDataType*>(R_S + j * 4);
-        // P = 2^(S * scale_2 - m_new), fmaf(x, y, z) = x * y + z;
+        // P = 2^(S * scale_2 - eff_max), fmaf(x, y, z) = x * y + z;
         t_fptr_S_0_1[0] =
-            exp2f(__fmaf_rn(t_fptr_S_0_1[0], scale_2, -block_row_max_new_0_2));
+            exp2f(__fmaf_rn(t_fptr_S_0_1[0], scale_2, -eff_max_0_2));
         t_fptr_S_0_1[1] =
-            exp2f(__fmaf_rn(t_fptr_S_0_1[1], scale_2, -block_row_max_new_0_2));
+            exp2f(__fmaf_rn(t_fptr_S_0_1[1], scale_2, -eff_max_0_2));
         t_fptr_S_0_1[2] =
-            exp2f(__fmaf_rn(t_fptr_S_0_1[2], scale_2, -block_row_max_new_1_2));
+            exp2f(__fmaf_rn(t_fptr_S_0_1[2], scale_2, -eff_max_1_2));
         t_fptr_S_0_1[3] =
-            exp2f(__fmaf_rn(t_fptr_S_0_1[3], scale_2, -block_row_max_new_1_2));
+            exp2f(__fmaf_rn(t_fptr_S_0_1[3], scale_2, -eff_max_1_2));
         lane_row_sum_new[0] += (t_fptr_S_0_1[0] + t_fptr_S_0_1[1]);
         lane_row_sum_new[1] += (t_fptr_S_0_1[2] + t_fptr_S_0_1[3]);
-        // Update R_S for P[Br,Bc] = 2^(S*scale_2 - m_new), point wise.
+        // Update R_S for P[Br,Bc] = 2^(S*scale_2 - eff_max), point wise.
         // Also convert F32 -> kDataType for P@V MMA, reuse R_S as P.
         t_hptr_S_0_1[0] = Traits::from_float(t_fptr_S_0_1[0]);
         t_hptr_S_0_1[1] = Traits::from_float(t_fptr_S_0_1[1]);
@@ -747,10 +766,12 @@ __device__ __forceinline__ void sync_online_safe_softmax(
       lane_row_sum_new[0] = warp::reduce_sum<float, 4>(lane_row_sum_new[0]);
       lane_row_sum_new[1] = warp::reduce_sum<float, 4>(lane_row_sum_new[1]);
 
-      // Convert row_max_new back to natural-log space for persistent state
-      // (LSE, rescale factors) so callers and backward pass stay unchanged.
-      lane_row_max_new[0] = block_row_max_new_0_2 * FFPA_M_LN2;
-      lane_row_max_new[1] = block_row_max_new_1_2 * FFPA_M_LN2;
+      // Convert row_max_new back to natural-log space. On lazy skip emit
+      // stale m_old (ln) so downstream rescale factor = 1.0 and m stays.
+      lane_row_max_new[0] =
+          skip_0 ? lane_block_row_max_old[0] : eff_max_0_2 * FFPA_M_LN2;
+      lane_row_max_new[1] =
+          skip_1 ? lane_block_row_max_old[1] : eff_max_1_2 * FFPA_M_LN2;
     }
 
   } else {
@@ -795,22 +816,39 @@ __device__ __forceinline__ void sync_online_safe_softmax(
       const float block_row_max_new_1_2 =
           max(lane_block_row_max_old[1] * FFPA_M_LOG2E, lane_row_max_new[1]);
 
+      // FA-4 conditional rescaling: small max growth keeps stale row_max so
+      // the downstream rescale factor becomes 1.0 (skip O rescale).
+      const float m_old_log2_0 = lane_block_row_max_old[0] * FFPA_M_LOG2E;
+      const float m_old_log2_1 = lane_block_row_max_old[1] * FFPA_M_LOG2E;
+      const bool skip_0 =
+          rescale_threshold > 0.0f &&
+          (m_old_log2_0 - block_row_max_new_0_2) >= -rescale_threshold;
+      const bool skip_1 =
+          rescale_threshold > 0.0f &&
+          (m_old_log2_1 - block_row_max_new_1_2) >= -rescale_threshold;
+      float eff_max_0_2 = block_row_max_new_0_2;
+      float eff_max_1_2 = block_row_max_new_1_2;
+      if (skip_0)
+        eff_max_0_2 = m_old_log2_0;
+      if (skip_1)
+        eff_max_1_2 = m_old_log2_1;
+
 #pragma unroll
       for (int j = 0; j < kValTileSeqLenK; ++j) {
         kDataType* t_hptr_S_0_1 = reinterpret_cast<kDataType*>(R_S + j * 2);
-        // P = 2^(S * scale_2 - m_new), fmaf(x, y, z) = x * y + z;
+        // P = 2^(S * scale_2 - eff_max), fmaf(x, y, z) = x * y + z;
         float4 t_reg_S_0_1;
         t_reg_S_0_1.x = exp2f(__fmaf_rn(Traits::to_float(t_hptr_S_0_1[0]),
-                                        scale_2, -block_row_max_new_0_2));
+                                        scale_2, -eff_max_0_2));
         t_reg_S_0_1.y = exp2f(__fmaf_rn(Traits::to_float(t_hptr_S_0_1[1]),
-                                        scale_2, -block_row_max_new_0_2));
+                                        scale_2, -eff_max_0_2));
         t_reg_S_0_1.z = exp2f(__fmaf_rn(Traits::to_float(t_hptr_S_0_1[2]),
-                                        scale_2, -block_row_max_new_1_2));
+                                        scale_2, -eff_max_1_2));
         t_reg_S_0_1.w = exp2f(__fmaf_rn(Traits::to_float(t_hptr_S_0_1[3]),
-                                        scale_2, -block_row_max_new_1_2));
+                                        scale_2, -eff_max_1_2));
         lane_row_sum_new[0] += (t_reg_S_0_1.x + t_reg_S_0_1.y);
         lane_row_sum_new[1] += (t_reg_S_0_1.z + t_reg_S_0_1.w);
-        // Update R_S for P[Br,Bc] = 2^(S*scale_2 - m_new), point wise.
+        // Update R_S for P[Br,Bc] = 2^(S*scale_2 - eff_max), point wise.
         t_hptr_S_0_1[0] = Traits::from_float(t_reg_S_0_1.x);
         t_hptr_S_0_1[1] = Traits::from_float(t_reg_S_0_1.y);
         t_hptr_S_0_1[2] = Traits::from_float(t_reg_S_0_1.z);
@@ -821,9 +859,12 @@ __device__ __forceinline__ void sync_online_safe_softmax(
       lane_row_sum_new[0] = warp::reduce_sum<float, 4>(lane_row_sum_new[0]);
       lane_row_sum_new[1] = warp::reduce_sum<float, 4>(lane_row_sum_new[1]);
 
-      // Convert row_max_new back to natural-log space for persistent state.
-      lane_row_max_new[0] = block_row_max_new_0_2 * FFPA_M_LN2;
-      lane_row_max_new[1] = block_row_max_new_1_2 * FFPA_M_LN2;
+      // Convert row_max_new back to natural-log space. On lazy skip emit
+      // stale m_old (ln) so downstream rescale factor = 1.0 and m stays.
+      lane_row_max_new[0] =
+          skip_0 ? lane_block_row_max_old[0] : eff_max_0_2 * FFPA_M_LN2;
+      lane_row_max_new[1] =
+          skip_1 ? lane_block_row_max_old[1] : eff_max_1_2 * FFPA_M_LN2;
     }
   }
 }
@@ -873,9 +914,14 @@ __device__ __forceinline__ void sync_rescaling_tiling_o(
     const float* rescale_o_factor_0,  // rescale factor
     const float* rescale_o_factor_1,  // rescale factor
     const int n_tile_id,              // tile_K_seqlen
-    const int d_tile_id               // j
+    const int d_tile_id,              // j
+    const bool need_rescale = true  // FA-4: false -> factor=1, accumulate only
 ) {
   using Traits = DtypeTraits<kDataType>;
+  // need_rescale is warp-uniform (from __any_sync). When false, force
+  // factor=1.0 so fmaf collapses to D += O (skip O rescale).
+  const float f0 = need_rescale ? rescale_o_factor_0[0] : 1.0f;
+  const float f1 = need_rescale ? rescale_o_factor_1[0] : 1.0f;
   // Now, we get [Br,8] slice of [Br,d], each warp(MMA) contains m16n8.
   // 0. Rescale O: Online rescaling O each tile_K_seqlen step, need m_new,
   // m_old. m = max(m_old, m_new), O_new[Br,d] = exp(m_old - m) * O_old + P@V m
@@ -886,29 +932,21 @@ __device__ __forceinline__ void sync_rescaling_tiling_o(
       // (x,y) 0~7->{c0, c1}, (z,w)->8~15 {c2, c3} kValTileSeqLenP=1
       float* t_fptr_D_0_1 =
           reinterpret_cast<float*>(R_D + d_tile_id * 4);  // &(R_D[0][j][0])
-      t_fptr_D_0_1[0] =
-          __fmaf_rn(rescale_o_factor_0[0], t_fptr_D_0_1[0], t_fptr_O_0_1[0]);
-      t_fptr_D_0_1[1] =
-          __fmaf_rn(rescale_o_factor_0[0], t_fptr_D_0_1[1], t_fptr_O_0_1[1]);
-      t_fptr_D_0_1[2] =
-          __fmaf_rn(rescale_o_factor_1[0], t_fptr_D_0_1[2], t_fptr_O_0_1[2]);
-      t_fptr_D_0_1[3] =
-          __fmaf_rn(rescale_o_factor_1[0], t_fptr_D_0_1[3], t_fptr_O_0_1[3]);
+      t_fptr_D_0_1[0] = __fmaf_rn(f0, t_fptr_D_0_1[0], t_fptr_O_0_1[0]);
+      t_fptr_D_0_1[1] = __fmaf_rn(f0, t_fptr_D_0_1[1], t_fptr_O_0_1[1]);
+      t_fptr_D_0_1[2] = __fmaf_rn(f1, t_fptr_D_0_1[2], t_fptr_O_0_1[2]);
+      t_fptr_D_0_1[3] = __fmaf_rn(f1, t_fptr_D_0_1[3], t_fptr_O_0_1[3]);
     } else {
       kDataType* t_hptr_D_0_1 =
           reinterpret_cast<kDataType*>(R_D + d_tile_id * 2);
       t_hptr_D_0_1[0] = Traits::from_float(
-          __fmaf_rn(rescale_o_factor_0[0], Traits::to_float(t_hptr_D_0_1[0]),
-                    t_fptr_O_0_1[0]));
+          __fmaf_rn(f0, Traits::to_float(t_hptr_D_0_1[0]), t_fptr_O_0_1[0]));
       t_hptr_D_0_1[1] = Traits::from_float(
-          __fmaf_rn(rescale_o_factor_0[0], Traits::to_float(t_hptr_D_0_1[1]),
-                    t_fptr_O_0_1[1]));
+          __fmaf_rn(f0, Traits::to_float(t_hptr_D_0_1[1]), t_fptr_O_0_1[1]));
       t_hptr_D_0_1[2] = Traits::from_float(
-          __fmaf_rn(rescale_o_factor_1[0], Traits::to_float(t_hptr_D_0_1[2]),
-                    t_fptr_O_0_1[2]));
+          __fmaf_rn(f1, Traits::to_float(t_hptr_D_0_1[2]), t_fptr_O_0_1[2]));
       t_hptr_D_0_1[3] = Traits::from_float(
-          __fmaf_rn(rescale_o_factor_1[0], Traits::to_float(t_hptr_D_0_1[3]),
-                    t_fptr_O_0_1[3]));
+          __fmaf_rn(f1, Traits::to_float(t_hptr_D_0_1[3]), t_fptr_O_0_1[3]));
     }
   } else {
     // MMA Acc F16 (only valid when kDataType == __half; bf16 forces
@@ -920,29 +958,29 @@ __device__ __forceinline__ void sync_rescaling_tiling_o(
     if constexpr (kOStorageAccFloat32) {
       // (x,y) 0~7->{c0, c1}, (z,w)->8~15 {c2, c3} kValTileSeqLenP=1
       float* t_fptr_D_0_1 = reinterpret_cast<float*>(R_D + d_tile_id * 4);
-      t_fptr_D_0_1[0] = __fmaf_rn(rescale_o_factor_0[0], t_fptr_D_0_1[0],
-                                  Traits::to_float(t_hptr_O_0_1[0]));
-      t_fptr_D_0_1[1] = __fmaf_rn(rescale_o_factor_0[0], t_fptr_D_0_1[1],
-                                  Traits::to_float(t_hptr_O_0_1[1]));
-      t_fptr_D_0_1[2] = __fmaf_rn(rescale_o_factor_1[0], t_fptr_D_0_1[2],
-                                  Traits::to_float(t_hptr_O_0_1[2]));
-      t_fptr_D_0_1[3] = __fmaf_rn(rescale_o_factor_1[0], t_fptr_D_0_1[3],
-                                  Traits::to_float(t_hptr_O_0_1[3]));
+      t_fptr_D_0_1[0] =
+          __fmaf_rn(f0, t_fptr_D_0_1[0], Traits::to_float(t_hptr_O_0_1[0]));
+      t_fptr_D_0_1[1] =
+          __fmaf_rn(f0, t_fptr_D_0_1[1], Traits::to_float(t_hptr_O_0_1[1]));
+      t_fptr_D_0_1[2] =
+          __fmaf_rn(f1, t_fptr_D_0_1[2], Traits::to_float(t_hptr_O_0_1[2]));
+      t_fptr_D_0_1[3] =
+          __fmaf_rn(f1, t_fptr_D_0_1[3], Traits::to_float(t_hptr_O_0_1[3]));
     } else {
       kDataType* t_hptr_D_0_1 =
           reinterpret_cast<kDataType*>(R_D + d_tile_id * 2);
-      t_hptr_D_0_1[0] = Traits::from_float(
-          __fmaf_rn(rescale_o_factor_0[0], Traits::to_float(t_hptr_D_0_1[0]),
-                    Traits::to_float(t_hptr_O_0_1[0])));
-      t_hptr_D_0_1[1] = Traits::from_float(
-          __fmaf_rn(rescale_o_factor_0[0], Traits::to_float(t_hptr_D_0_1[1]),
-                    Traits::to_float(t_hptr_O_0_1[1])));
-      t_hptr_D_0_1[2] = Traits::from_float(
-          __fmaf_rn(rescale_o_factor_1[0], Traits::to_float(t_hptr_D_0_1[2]),
-                    Traits::to_float(t_hptr_O_0_1[2])));
-      t_hptr_D_0_1[3] = Traits::from_float(
-          __fmaf_rn(rescale_o_factor_1[0], Traits::to_float(t_hptr_D_0_1[3]),
-                    Traits::to_float(t_hptr_O_0_1[3])));
+      t_hptr_D_0_1[0] =
+          Traits::from_float(__fmaf_rn(f0, Traits::to_float(t_hptr_D_0_1[0]),
+                                       Traits::to_float(t_hptr_O_0_1[0])));
+      t_hptr_D_0_1[1] =
+          Traits::from_float(__fmaf_rn(f0, Traits::to_float(t_hptr_D_0_1[1]),
+                                       Traits::to_float(t_hptr_O_0_1[1])));
+      t_hptr_D_0_1[2] =
+          Traits::from_float(__fmaf_rn(f1, Traits::to_float(t_hptr_D_0_1[2]),
+                                       Traits::to_float(t_hptr_O_0_1[2])));
+      t_hptr_D_0_1[3] =
+          Traits::from_float(__fmaf_rn(f1, Traits::to_float(t_hptr_D_0_1[3]),
+                                       Traits::to_float(t_hptr_O_0_1[3])));
     }
   }
 }

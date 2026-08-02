@@ -20,7 +20,6 @@ using barrier_t = cuda::barrier<cuda::thread_scope_block>;
 // unsupported (sm_120) or silently ignored by ptxas (sm_120a, C7506:
 // cp.async.bulk.tensor treated as implicit extern boundary).  Gate to no-op
 // on arch 1200 so builds targeting sm_120 or sm_120a compile cleanly.
-// See /memories/repo/ffpa-sm120-setmaxnreg-ineffective.md.
 template <uint32_t kNumRegs>
 __device__ __forceinline__ void warpgroup_reg_dealloc() {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900 && __CUDA_ARCH__ != 1200

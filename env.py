@@ -53,6 +53,11 @@ class ENV(object):
   # at runtime on TMA-capable devices. Requires CUDA Toolkit >= 13.0.
   ENABLE_FFPA_TMA_EXT = bool(int(os.environ.get("ENABLE_FFPA_TMA_EXT", 0)))
 
+  # Enable CuTe C++ kernel extension for sm_120+ (opt-in, default off).
+  # Requires ENABLE_FFPA_TMA_EXT=1 AND ENABLE_FFPA_CUTE_EXT=1 to activate
+  # the cute-based kernel path. Uses cutlass headers from third_party/cutlass.
+  ENABLE_FFPA_CUTE_EXT = bool(int(os.environ.get("ENABLE_FFPA_CUTE_EXT", 0)))
+
   # Enable force P@V use fp16 as MMA Acc dtype, for FFPA cc F32 kernels, default False.
   # FFPA Acc F32 kernels MMA Acc = Mixed Q@K^T MMA Acc F32 + P@V MMA Acc F16.
   ENABLE_FFPA_FORCE_PV_F16 = bool(
@@ -83,14 +88,13 @@ class ENV(object):
   )
 
   # Enable smem swizzle for V, now default True. True: bank conflicts free for V smem
-  # via swizzle; False: bank conflicts free for V smem via padding. FIXME(DefTruth):
-  # swizzle V seems can not get good performance. why? Will enable it by default untill
-  # I have fixed the performance issue. (Fixed)
+  # via swizzle; False: bank conflicts free for V smem via padding.
   ENABLE_FFPA_SMEM_SWIZZLE_V = bool(
     int(os.environ.get("ENABLE_FFPA_SMEM_SWIZZLE_V", 1))
   )
 
-  # Persist load Q g2s for headdim <= 320, more SRAM, but still keep register usage.
+  # Persist load Q g2s for headdim <= 320 && stages < 3, more SRAM. May not suitable
+  # for headdim > 320 due to the SRAM pressure.
   ENABLE_FFPA_PERSIST_Q_G2S = bool(
     int(os.environ.get("ENABLE_FFPA_PERSIST_Q_G2S", 1))
   )
@@ -194,7 +198,12 @@ class ENV(object):
         "to infer the target arch. Set FFPA_BUILD_ARCH=<sm list>, e.g. 80,89,90."
       )
     cap = torch.cuda.get_device_capability(torch.cuda.current_device())
-    return [f"{cap[0]}{cap[1]}"]
+    arch = f"{cap[0]}{cap[1]}"
+    # sm_90a/100a/120a: the 'a' suffix enables arch-specific instructions
+    # (TMA, WGMMA, etc.) that are unavailable in the base ISA.
+    if arch in ("90", "100", "120"):
+      arch += "a"
+    return [arch]
 
   @classmethod
   def enable_all_mutistages(cls):
@@ -265,6 +274,10 @@ class ENV(object):
     return cls.ENABLE_FFPA_TMA_EXT
 
   @classmethod
+  def enable_cute_ext(cls):
+    return cls.ENABLE_FFPA_CUTE_EXT
+
+  @classmethod
   def env_cuda_cflags(cls):
     extra_env_cflags = []
     if cls.enable_all_mutistages():
@@ -300,6 +313,8 @@ class ENV(object):
       extra_env_cflags.append("-DENABLE_FFPA_CUDA_IMPL")
     if cls.enable_tma_ext():
       extra_env_cflags.append("-DENABLE_FFPA_TMA_EXT")
+    if cls.enable_cute_ext():
+      extra_env_cflags.append("-DENABLE_FFPA_CUTE_EXT")
 
     assert not all((cls.enable_persist_q_s2r(), cls.enable_persist_q_g2s())
                    ), "PERSIST_Q_G2S and PERSIST_Q_S2R can not both enabled."
@@ -353,6 +368,7 @@ class ENV(object):
     formatenv("ENABLE_FFPA_LAUNCH_GRID_DNHB", cls.enable_launch_grid_dnhb())
     formatenv("ENABLE_FFPA_CUDA_IMPL", cls.enable_cuda_impl())
     formatenv("ENABLE_FFPA_TMA_EXT", cls.enable_tma_ext())
+    formatenv("ENABLE_FFPA_CUTE_EXT", cls.enable_cute_ext())
     pretty_print_line()
 
   @staticmethod
@@ -447,46 +463,26 @@ class ENV(object):
     fwd_generated_count = 0
     if cls.enable_fwd_cuda_impl():
       # ---- declarations header shared by per-D TUs + dispatch TU ----
-      decls_path = os.path.join(gen_dir, "ffpa_attn_fwd_decls.h")
+      decls_path = os.path.join(gen_dir, "fwd_decls.h")
       cls._write_if_changed(decls_path, cls._render_decls_header(headdims))
       generated.append(decls_path)
 
       # ---- two forward TUs per headdim, one per dtype ----
       for d in headdims:
-        fp16_path = os.path.join(gen_dir, f"ffpa_attn_fwd_fp16_hdim{d}.cu")
-        bf16_path = os.path.join(gen_dir, f"ffpa_attn_fwd_bf16_hdim{d}.cu")
+        fp16_path = os.path.join(gen_dir, f"fwd_fp16_hdim{d}.cu")
+        bf16_path = os.path.join(gen_dir, f"fwd_bf16_hdim{d}.cu")
         cls._write_if_changed(fp16_path, cls._render_per_headdim_fp16_tu(d))
         cls._write_if_changed(bf16_path, cls._render_per_headdim_bf16_tu(d))
         generated.append(fp16_path)
         generated.append(bf16_path)
-      dispatch_path = os.path.join(gen_dir, "ffpa_attn_fwd_dispatch.cu")
+      dispatch_path = os.path.join(gen_dir, "fwd_dispatch.cu")
       cls._write_if_changed(dispatch_path, cls._render_dispatch_tu(headdims))
       generated.append(dispatch_path)
       fwd_generated_count = len(headdims) * 2 + 1
 
-    bwd_generated_count = 0
-
-    # Clean up stale TUs from previous generator layouts. When native backward
-    # is disabled, also remove generated backward files from earlier dev builds
-    # so the default forward-only build does not leave confusing bwd artifacts.
-    stale_file_names = {"ffpa_attn_L1_decls.h", "ffpa_attn_L1_dispatch.cu"}
-    for fname in os.listdir(gen_dir):
-      is_stale = (
-        (fname.startswith("ffpa_attn_L1_acc_") and fname.endswith(".cu"))
-        or (fname.startswith("ffpa_attn_L1_hdim") and fname.endswith(".cu")) or
-        (not cls.enable_fwd_cuda_impl() and fname.startswith("ffpa_attn_fwd_"))
-        or fname.startswith("ffpa_attn_bwd_") or fname in stale_file_names
-      )
-      if is_stale:
-        stale = os.path.join(gen_dir, fname)
-        try:
-          os.remove(stale)
-        except OSError:
-          pass
-
     if build_pkg:
       pretty_print_line(
-        f"Generated {fwd_generated_count + bwd_generated_count} CUDA TUs under {gen_dir}",
+        f"Generated {fwd_generated_count} CUDA TUs under {gen_dir}",
         sep="",
         mode="left",
       )
@@ -506,15 +502,15 @@ class ENV(object):
     for d in headdims:
       lines.append(
         f"void ffpa_attn_fwd_fp16f16_d{d}(torch::Tensor Q, torch::Tensor K, "
-        f"torch::Tensor V, torch::Tensor O, torch::Tensor attn_bias, torch::Tensor softmax_lse, int stages, int causal, double softmax_scale, double dropout_p, int64_t philox_seed, int64_t philox_offset, int tma);"
+        f"torch::Tensor V, torch::Tensor O, torch::Tensor attn_bias, torch::Tensor softmax_lse, int stages, int causal, double softmax_scale, double dropout_p, int64_t philox_seed, int64_t philox_offset);"
       )
       lines.append(
         f"void ffpa_attn_fwd_fp16f32_d{d}(torch::Tensor Q, torch::Tensor K, "
-        f"torch::Tensor V, torch::Tensor O, torch::Tensor attn_bias, torch::Tensor softmax_lse, int stages, int causal, double softmax_scale, double dropout_p, int64_t philox_seed, int64_t philox_offset, int tma);"
+        f"torch::Tensor V, torch::Tensor O, torch::Tensor attn_bias, torch::Tensor softmax_lse, int stages, int causal, double softmax_scale, double dropout_p, int64_t philox_seed, int64_t philox_offset);"
       )
       lines.append(
         f"void ffpa_attn_fwd_bf16f32_d{d}(torch::Tensor Q, torch::Tensor K, "
-        f"torch::Tensor V, torch::Tensor O, torch::Tensor attn_bias, torch::Tensor softmax_lse, int stages, int causal, double softmax_scale, double dropout_p, int64_t philox_seed, int64_t philox_offset, int tma);"
+        f"torch::Tensor V, torch::Tensor O, torch::Tensor attn_bias, torch::Tensor softmax_lse, int stages, int causal, double softmax_scale, double dropout_p, int64_t philox_seed, int64_t philox_offset);"
       )
     lines.append("")
     return "\n".join(lines)
@@ -539,7 +535,7 @@ class ENV(object):
     call = (
       f"launch_ffpa_attn_fwd_template<{t_in}, {d}, {qk}, {pv}, "
       "{S}>(Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale, "
-      "dropout_p, philox_seed, philox_offset, tma);"
+      "dropout_p, philox_seed, philox_offset);"
     )
     max_stages = ENV.FFPA_BUILD_MAX_STAGES
     full_lines = ["#ifdef ENABLE_FFPA_ALL_STAGES"]
@@ -575,7 +571,7 @@ class ENV(object):
     """
     lines = [
       "// AUTO-GENERATED by env.py. DO NOT EDIT.",
-      '#include "launch_templates.cuh"',
+      '#include "launch.cuh"',
       "using namespace ffpa;",
       "",
     ]
@@ -617,7 +613,7 @@ class ENV(object):
     """
     lines = [
       "// AUTO-GENERATED by env.py. DO NOT EDIT.",
-      '#include "launch_templates.cuh"',
+      '#include "launch.cuh"',
       "using namespace ffpa;",
       "",
     ]
@@ -650,8 +646,7 @@ class ENV(object):
       "    double softmax_scale,",
       "    double dropout_p,",
       "    int64_t philox_seed,",
-      "    int64_t philox_offset,",
-      "    int tma) {",
+      "    int64_t philox_offset) {",
     ]
 
     stage_body = cls._render_stage_body(
@@ -669,7 +664,7 @@ class ENV(object):
       return "\n".join(
         f"    case {d}: {symbol_prefix}_d{d}"
         "(Q, K, V, O, attn_bias, softmax_lse, stages, causal, softmax_scale, "
-        "dropout_p, philox_seed, philox_offset, tma); break;" for d in headdims
+        "dropout_p, philox_seed, philox_offset); break;" for d in headdims
       )
 
     def _fn(name: str, symbol_prefix: str, torch_dtype: str) -> str:
@@ -686,8 +681,7 @@ class ENV(object):
         "    double softmax_scale,\n"
         "    double dropout_p,\n"
         "    int64_t philox_seed,\n"
-        "    int64_t philox_offset,\n"
-        "    int tma) {\n"
+        "    int64_t philox_offset) {\n"
         f"  CHECK_TORCH_TENSOR_DTYPE(Q, {torch_dtype})\n"
         f"  CHECK_TORCH_TENSOR_DTYPE(K, {torch_dtype})\n"
         f"  CHECK_TORCH_TENSOR_DTYPE(V, {torch_dtype})\n"
@@ -703,7 +697,7 @@ class ENV(object):
     return (
       "// AUTO-GENERATED by env.py. DO NOT EDIT.\n"
       '#include "logging.cuh"\n'
-      '#include "ffpa_attn_fwd_decls.h"\n'
+      '#include "fwd_decls.h"\n'
       "\n" +
       _fn("ffpa_attn_fwd_fp16f16", "ffpa_attn_fwd_fp16f16", "torch::kHalf") +
       "\n" +
@@ -724,7 +718,7 @@ class ENV(object):
     if build_pkg:
       pretty_print_line()
     # Generate per-headdim TUs under csrc/cuffpa/generated/ and use them as
-    # the actual build sources. The generated TUs include launch_templates.cuh,
+    # the actual build sources. The generated TUs include launch.cuh,
     # which in turn includes ffpa_attn_fwd.cuh. Splitting by headdim enables
     # MAX_JOBS to drive nvcc on many small files in parallel and cuts the build
     # time of the heavy launch_ffpa_attn_fwd_template instantiations.
@@ -734,7 +728,7 @@ class ENV(object):
       for gs in generated_sources:
         pretty_print_line(f"csrc_file: {gs}", sep="", mode="left")
     build_sources = [
-      csrc("cuffpa", "ffpa_attn_api.cc"),
+      csrc("cuffpa", "ffpa_api.cc"),
     ] + generated_sources
     if build_pkg:
       pretty_print_line()
@@ -756,6 +750,10 @@ class ENV(object):
     extra_cuda_cflags.append("--use_fast_math")
     extra_cuda_cflags.extend(ENV.env_cuda_cflags())
     extra_cuda_cflags.append(f"-I {ENV.project_dir()}/csrc/cuffpa")
+    if ENV.enable_cute_ext():
+      extra_cuda_cflags.append(
+        f"-I {ENV.project_dir()}/third_party/cutlass/include"
+      )
     extra_cuda_cflags.append("-diag-suppress")
     extra_cuda_cflags.append("177")
     extra_cuda_cflags.append("-diag-suppress")

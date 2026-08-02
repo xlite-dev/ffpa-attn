@@ -138,6 +138,7 @@ if BUILD_CUDA_EXT:
       },
       include_dirs=[
         Path(ENV.project_dir()) / "csrc" / "cuffpa",
+        Path(ENV.project_dir()) / "third_party" / "cutlass" / "include",
       ],
     )
   )

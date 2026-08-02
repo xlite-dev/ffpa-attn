@@ -89,9 +89,9 @@ FALLBACK_DEVICE_NAME = "NVIDIA Geforce RTX 5090"
 CUTEDSL_BACKEND = "cutedsl"
 TRITON_BACKEND = "triton"
 CUDA_BACKEND = "cuda"
-MIN_BENCHMARK_HEAD_DIM = 64
+MIN_BENCHMARK_HEAD_DIM = 32
 MAX_FFPA_BENCHMARK_HEAD_DIM = 1024
-HEAD_DIM_ALIGNMENT = 64
+HEAD_DIM_ALIGNMENT = 32
 TRITON_SMALL_D_ENV = "FFPA_TRITON_ALLOW_SMALL_D"
 CUDA_SMALL_D_ENV = "FFPA_CUDA_ALLOW_SMALL_D"
 CUTEDSL_SMALL_D_ENV = "FFPA_CUTE_ALLOW_SMALL_D"
@@ -310,6 +310,13 @@ def _parse_args() -> argparse.Namespace:
     "Enable experimental SM90+ TMA forward path (silently falls back on unsupported devices).",
   )
   parser.add_argument(
+    "--enable-fwd-cute",
+    "--cute",
+    action="store_true",
+    help=
+    "Enable the CuTe cp.async forward kernel (CUDA backend only; ignored by other backends).",
+  )
+  parser.add_argument(
     "--enable-bwd-tma",
     "--bwd-tma",
     action="store_true",
@@ -398,6 +405,10 @@ def _resolve_directional_cli_flags(
   if args.enable_ws:
     args.enable_fwd_ws = True
     args.enable_bwd_ws = True
+  if args.enable_fwd_cute and args.forward_backend != "cuda":
+    raise SystemExit(
+      "--cute/--enable-fwd-cute is only valid with --forward-backend cuda"
+    )
   if args.enable_persist_dkdv and not args.enable_bwd_tma:
     raise SystemExit("--enable-persist-dkdv requires --enable-bwd-tma")
   return args
@@ -1474,6 +1485,7 @@ def _benchmark_rows(
         print_results=True,
         enable_tma=args.enable_fwd_tma,
         enable_ws=args.enable_fwd_ws,
+        enable_cute=args.enable_fwd_cute,
         tasks=tasks,
         dtypes=dtypes,
         verbose=args.verbose,

@@ -94,6 +94,22 @@ def _is_hopper_or_later() -> bool:
   return (major, minor) >= (9, 0)
 
 
+def _apply_cuda_backend_hint(backend: CUDABackend) -> None:
+  """Set C++ backend impl hint from CUDABackend flags before kernel launch.
+
+  Mapping: (enable_tma, enable_cute) → hint. No flag set → NATIVE (Legacy).
+  """
+  from .cuda import set_cuda_backend_impl, CudaBackendImpl
+  if backend.enable_tma and backend.enable_cute:
+    set_cuda_backend_impl(CudaBackendImpl.CUTE_TMA)
+  elif backend.enable_tma:
+    set_cuda_backend_impl(CudaBackendImpl.TMA)
+  elif backend.enable_cute:
+    set_cuda_backend_impl(CudaBackendImpl.CUTE)
+  else:
+    set_cuda_backend_impl(CudaBackendImpl.NATIVE)
+
+
 def _normalize_grad_kv_storage_dtype(
   dtype: torch.dtype | str | None
 ) -> torch.dtype | None:
@@ -158,17 +174,22 @@ class CUDABackend(Backend):
   """Hand-written CUDA forward-only backend.
 
   :ivar acc: MMA accumulator precision (``"f16"`` or ``"f32"``).
-  :ivar stages: Pipeline stages for the CUDA kernel (3 on Ampere/Ada,
-      4 on Hopper+).
-  :ivar enable_tma: Enable SM120a TMA + MMA warp-specialised kernel when the
-      device is sm_120a (Blackwell). Ignored on other architectures.
+  :ivar stages: Pipeline stages for the CUDA kernel (default 4; C++ smem
+      physics cap may reduce for large V chunks or TMA path).
+  :ivar enable_tma: Select the TMA-based kernel implementation. Combined with
+      ``enable_cute`` it picks the C++ backend hint: neither → NATIVE (legacy
+      cp.async), tma only → TMA, cute only → CUTE (CuTe cp.async), both →
+      CUTE_TMA (CuTe TMA). Ignored on architectures lacking the path.
+  :ivar enable_cute: Select the CuTe-based kernel implementation. See
+      ``enable_tma`` for the combined hint mapping. CUDA-backend only.
   :ivar enable_ws: Accepted for API compatibility with the Triton backend;
       the CUDA sm120 path is always warp-specialised when ``enable_tma`` is on.
   """
   name: str = "cuda"
   acc: str = "f32"
-  stages: int = 4 if _is_hopper_or_later() else 3
+  stages: int = None
   enable_tma: bool = False
+  enable_cute: bool = False
   enable_ws: bool = False
 
   def __post_init__(self) -> None:
@@ -177,10 +198,31 @@ class CUDABackend(Backend):
     assert self.acc in (
       "f16", "f32"
     ), f"acc must be 'f16' or 'f32', got {self.acc!r}"
+    self.stages = self._default_cuda_stages(
+    ) if self.stages is None else self.stages
 
   @property
   def acc_code(self) -> int:
     return _ACC_F32 if self.acc == "f32" else _ACC_F16
+
+  def _default_cuda_stages(self) -> int:
+    from .cuda import CudaBackendImpl
+    """Default pipeline depth for CUDA backend (non-TMA path)."""
+    if _is_hopper_or_later(
+    ) and self.impl_hint in (CudaBackendImpl.NATIVE, CudaBackendImpl.TMA):
+      return 4
+    return 3
+
+  @property
+  def impl_hint(self) -> int:
+    from .cuda import CudaBackendImpl
+    if self.enable_tma and self.enable_cute:
+      return CudaBackendImpl.CUTE_TMA
+    if self.enable_tma:
+      return CudaBackendImpl.TMA
+    if self.enable_cute:
+      return CudaBackendImpl.CUTE
+    return CudaBackendImpl.NATIVE
 
 
 @dataclass
@@ -786,6 +828,7 @@ class _FFPAAttnFunc(torch.autograd.Function):
     elif isinstance(meta.forward_meta, CUDABackend):
       forward_meta = meta.forward_meta
       assert _ffpa_attn_forward_cuda is not None, "CUDA backend is not available."
+      _apply_cuda_backend_hint(forward_meta)
       rng_state = _reserve_large_d_dropout_rng(q, k, meta.attn_meta.dropout_p)
       O, lse = _ffpa_attn_forward_cuda(
         q,
@@ -800,7 +843,6 @@ class _FFPAAttnFunc(torch.autograd.Function):
         meta.attn_meta.dropout_p,
         int(rng_state[0].item()) if rng_state.numel() else 0,
         int(rng_state[1].item()) if rng_state.numel() else 0,
-        int(forward_meta.enable_tma),
       )
     elif isinstance(meta.forward_meta, TritonBackend):
       forward_meta = meta.forward_meta
