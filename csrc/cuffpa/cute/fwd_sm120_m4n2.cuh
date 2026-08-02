@@ -422,6 +422,15 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
 
   // Phase 5: Epilogue — O /= row_sum, R→S→TMA store or predicated R→G.
   // Only n_warp==0 writes LSE (both N-warps share the same Q rows).
+  // TMA-store drain race (fixed): only tid=0 issues the store, so
+  // tma_store_wait<0>() is a no-op for every other thread. Without a CTA
+  // barrier the next batch's R->S would overwrite shm the in-flight TMA
+  // store is still reading -> deterministic O corruption whenever
+  // kNBatches >= 2 (D=640 stages=2 -> kNBatches=5 fails; stages=3 -> 1
+  // passes; D=512 stages=2 -> kNBatches=2 passes only because each batch
+  // writes 16KB, long enough for the store to drain). The __syncthreads()
+  // after tma_store_wait below gates all threads on the drain; the batch
+  // condition is CTA-uniform so it cannot deadlock.
   {
     constexpr int kVChunksPerBatch = Traits::kVChunksPerBatch;
     constexpr int kNBatches = Traits::kNBatches;

@@ -579,6 +579,14 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
   //     count from kDChunksV to kNBatches. LSE write deferred to overlap last
   //     drain.
   //   tail tile: per-element predicated R->G (unchanged, zero risk).
+  //   TMA-store drain race (fixed): only tid=0 issues the store, so
+  //     tma_store_wait<0>() is a no-op for every other thread. Without a CTA
+  //     barrier the next batch's R->S would overwrite shm the in-flight TMA
+  //     store is still reading -> deterministic O corruption whenever
+  //     kNBatches >= 2 (D=320 stages=2 -> kNBatches=5 fails; stages=3 ->
+  //     kNBatches=1 passes, which is why stages=3 looked correct). The
+  //     __syncthreads() after tma_store_wait below gates all threads on the
+  //     drain; the batch condition is CTA-uniform so it cannot deadlock.
   {
     constexpr int kVChunksPerBatch = Traits::kVChunksPerBatch;
     constexpr int kNBatches = Traits::kNBatches;
@@ -1099,6 +1107,10 @@ __global__ void __launch_bounds__(384, 1) ffpa_attn_persist_d_ws_fwd_cute_sm120(
   // direct R->G (tail). The producer warpgroup has returned, so CTA-wide
   // __syncthreads would deadlock; sync with a named barrier limited to the
   // consumer threads instead.
+  // NOTE: single full-D tile, no shm reuse after the TMA store -> unlike the
+  // split-D kernels' batched epilogue (which must __syncthreads/NamedBarrier
+  // after tma_store_wait to avoid the next batch overwriting shm the store
+  // still reads), no drain barrier is required here.
   {
     cutlass::arch::NamedBarrier::sync(kConsumerThreads, 0);
 
@@ -1574,6 +1586,14 @@ __global__ void __launch_bounds__(384, 1) ffpa_attn_split_d_ws_fwd_cute_sm120(
   // predicated R->G (tail tile), same as the split-D kernel. The producer
   // warpgroup has returned, so CTA-wide __syncthreads would deadlock; sync
   // with a named barrier limited to the consumer threads instead.
+  // TMA-store drain race (fixed): only wg_tid==0 issues the store, so
+  // tma_store_wait<0>() is a no-op for every other consumer thread. Without
+  // a consumer barrier the next batch's R->S would overwrite shm the
+  // in-flight TMA store is still reading -> deterministic O corruption
+  // whenever kNBatches >= 2 (D=320 stages=2 -> kNBatches=5 fails; stages=3
+  // -> kNBatches=1 passes). The NamedBarrier after tma_store_wait below
+  // gates all consumer threads on the drain; the batch condition is
+  // consumer-uniform so it cannot deadlock.
   {
     constexpr int kVChunksPerBatch = Traits::kVChunksPerBatch;
     constexpr int kNBatches = Traits::kNBatches;
