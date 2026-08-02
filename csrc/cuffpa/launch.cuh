@@ -1,5 +1,4 @@
 #pragma once
-#include <cstdlib>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 
@@ -569,22 +568,13 @@ void launch_ffpa_attn_fwd_template(torch::Tensor Q, torch::Tensor K,
                 Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
                 dropout_p, philox_seed, philox_offset);
           } else if constexpr (kHeadDim % 64 == 0) {
-            // A/B experiment dispatch for %64==0 headdims (D=256..1024):
-            //   FFPA_FORCE_M8N1=1 -> ALL route to the M8N1 split-D kernel
-            //     (register spill for D>=512: o_acc = D/2 regs/thread).
-            //   FFPA_FORCE_M4N2=1 -> ALL route to M4N2 (P SMEM roundtrip +
-            //     cross-N-warp softmax overhead for D<512).
-            // Default = production policy from the A/B benchmark (RTX 5090,
-            // self-attn fp16/bf16, D=320..1024): M8N1 wins for D<768
-            // (+2..16%, cross at D=640), M4N2 wins for D>=768 (+7% @768,
+            // Production dispatch for %64==0 headdims, from the A/B benchmark
+            // (RTX 5090, self-attn fp16/bf16, D=320..1024): M8N1 wins for
+            // D<768 (+2..16%, cross at D=640), M4N2 wins for D>=768 (+7% @768,
             // +11% @896, +55% @1024 where M8N1's o_acc=D/2 regs spills to
-            // local mem and collapses to ~100T). Both are exact (O_err
-            // ~1e-4) at every D.
-            static const bool force_m8n1 =
-                std::getenv("FFPA_FORCE_M8N1") != nullptr;
-            static const bool force_m4n2 =
-                std::getenv("FFPA_FORCE_M4N2") != nullptr;
-            if (force_m4n2 || (!force_m8n1 && kHeadDim >= 768)) {
+            // local mem and collapses to ~100T). Both are exact (O_err ~1e-4)
+            // at every D. Table in fwd_sm120_m4n2.cuh header.
+            if constexpr (kHeadDim >= 768) {
               // split-D M4N2 (non-WS): kBr=64, atom_layout=(4,2,1). O regs =
               // D/4 per thread (vs M8N1's D/2 which spills for D>=512).
               launch_ffpa_attn_split_d_m4n2_fwd_cute_sm120<kDataType, kHeadDim,
