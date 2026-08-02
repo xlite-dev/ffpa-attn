@@ -13,7 +13,6 @@
 #include "cute/fwd_sm80.cuh"
 #ifdef ENABLE_FFPA_TMA_EXT
 #include "cute/fwd_sm120.cuh"
-#include "cute/fwd_sm120_m4n2.cuh"
 #endif
 #endif
 using namespace ffpa;
@@ -573,7 +572,7 @@ void launch_ffpa_attn_fwd_template(torch::Tensor Q, torch::Tensor K,
             // D<768 (+2..16%, cross at D=640), M4N2 wins for D>=768 (+7% @768,
             // +11% @896, +55% @1024 where M8N1's o_acc=D/2 regs spills to
             // local mem and collapses to ~100T). Both are exact (O_err ~1e-4)
-            // at every D. Table in fwd_sm120_m4n2.cuh header.
+            // at every D. Table in fwd_sm120.cuh M4N2 header.
             if constexpr (kHeadDim >= 768) {
               // split-D M4N2 (non-WS): kBr=64, atom_layout=(4,2,1). O regs =
               // D/4 per thread (vs M8N1's D/2 which spills for D>=512).
