@@ -64,7 +64,7 @@ We extend FlashAttention to support large headdim ($D>256$) via **fine-grained t
 
 ## Benchmark
 
-Runnable benchmark are provided under [`bench`](./bench). The performance benchmarks for the NVIDIA L20 (**Ada**), NVIDIA Geforce RTX 5090 (**Blackwell**), NVIDIA H800 PCIE (**Hopper**), NVIDIA H200 SXM (**Hopper**, **CuTeDSL** backend, up to **513-535** TFLOPS!🎉) with large headdims can be found at [`bench`](./bench).
+Runnable benchmark are provided under [`bench`](./bench). The performance benchmarks for the NVIDIA L20 (**Ada**), NVIDIA Geforce RTX 5090 (**Blackwell**), NVIDIA H800 PCIE (**Hopper**), NVIDIA H200 SXM (**Hopper**, **CuTeDSL** backend, up to **535** TFLOPS!) with large headdims can be found at [`bench`](./bench).
 
 <div align='center'>
   <img src='./docs/assets/perf/ffpa_speedup_nvidia-geforce-rtx-5090_B1_H32_N8192_D320_T.png' width='400px'>
@@ -75,7 +75,7 @@ Runnable benchmark are provided under [`bench`](./bench). The performance benchm
 
 ## Backends
 
-FFPA supports multiple backends for the forward and backward pass, including: [`SDPA`](./bench/) (baseline), [`CUDA`](./bench/) (forward only), [`Triton`](./bench/), and [`CuTe-DSL`](./bench/). The `CuTe-DSL` backend is currently in early stage, stay tuned for future updates. The `Triton` backend (forward + backward) also runs on AMD GPUs.
+FFPA supports multiple backends for the forward and backward pass, including: [`SDPA`](./bench/) (baseline), [`CUDA`](./bench/) (forward only), [`Triton`](./bench/), and [`CuTe-DSL`](./bench/). The `CuTe-DSL` backend is currently in early stage, stay tuned for future updates. The **Triton** backend (forward + backward) also runs on AMD GPUs.
 
 <div align='center' markdown="1">
 
@@ -88,11 +88,6 @@ FFPA supports multiple backends for the forward and backward pass, including: [`
 |CuTe-DSL|sm_90a|✔|✔|320~512|✖️|**3x~6x**|sm_90a|
 
 </div>
-
-<!---
-> [!NOTE]
-> 🔴 **AMD ROCm/HIP support**: the `Triton` backend (forward + backward) also runs on AMD GPUs, install **ffpa-attn** into a **ROCm** build of PyTorch and it will dispatch to Triton AMD automatically. Validated on AMD Instinct MI250X (`gfx90a`, Linux) and Radeon RX 9070 XT (`gfx1201`, Windows).
---->
 
 How to use different backends for your own scenario? Users can simply pass the Backend configs (SDPABackend, CUDABackend, TritonBackend or CuTeDSLBackend) to [ffpa_attn_func](https://ffpa-attn.readthedocs.io/en/latest/api/ffpa_attn/), for example:
 
