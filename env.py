@@ -14,7 +14,8 @@ _ARCH_ALIASES = {
   "ada": "89",
   "hopper": "90",
   "blackwell": "100",
-  "blackwell_geforce": "120a",  # sm_120a need for TMA instructions.
+  "blackwell_geforce":
+  "120f",  # sm_120f need for TMA & setmaxnreg instructions.
 }
 
 
@@ -201,8 +202,10 @@ class ENV(object):
     arch = f"{cap[0]}{cap[1]}"
     # sm_90a/100a/120a: the 'a' suffix enables arch-specific instructions
     # (TMA, WGMMA, etc.) that are unavailable in the base ISA.
-    if arch in ("90", "100", "120"):
+    if arch in ("90", "100"):
       arch += "a"
+    if arch in ("120"):
+      arch += "f"  # sm_120f is required for setmaxnreg instruction
     return [arch]
 
   @classmethod
@@ -324,7 +327,7 @@ class ENV(object):
 
   @classmethod
   def extra_gcc_flags(cls):
-    extra_gcc_flags = ["-O3", "-std=c++17"]
+    extra_gcc_flags = ["-O3", "-std=c++20"]
     if cls.enable_cuda_impl():
       extra_gcc_flags.append("-DENABLE_FFPA_CUDA_IMPL")
     return extra_gcc_flags
@@ -341,7 +344,7 @@ class ENV(object):
       except Exception:
         print(f"{name:<30}: {value}")
 
-    pretty_print_line("FFPA-ATTN ENVs")
+    _logging_msg("FFPA-ATTN ENVs")
     formatenv("PROJECT_DIR", cls.project_dir())
     formatenv("FFPA_BUILD_ARCH", ",".join(cls.get_build_arch_list()))
     formatenv("FFPA_NVCC_THREADS", cls.FFPA_NVCC_THREADS)
@@ -369,7 +372,7 @@ class ENV(object):
     formatenv("ENABLE_FFPA_CUDA_IMPL", cls.enable_cuda_impl())
     formatenv("ENABLE_FFPA_TMA_EXT", cls.enable_tma_ext())
     formatenv("ENABLE_FFPA_CUTE_EXT", cls.enable_cute_ext())
-    pretty_print_line()
+    _logging_msg()
 
   @staticmethod
   def get_device_name():
@@ -412,8 +415,6 @@ class ENV(object):
       return list(range(32, 1025, 32))
     return list(range(256, 1025, 64))
 
-  # --- SM120 dispatch code generation ---
-
   @classmethod
   def generated_sources_dir(cls):
     return os.path.join(cls.project_dir(), "csrc", "cuffpa", "generated")
@@ -450,7 +451,7 @@ class ENV(object):
     stay fast.
 
     :param build_pkg: When ``True``, emit a per-call summary line via
-        ``pretty_print_line`` (suitable for the ``setup.py`` invocation).
+        ``_logging_msg`` (suitable for the ``setup.py`` invocation).
     :returns: List of generated file paths (declarations header first,
         then per-headdim ``.cu`` sources, then the dispatch TU).
     """
@@ -462,12 +463,12 @@ class ENV(object):
 
     fwd_generated_count = 0
     if cls.enable_fwd_cuda_impl():
-      # ---- declarations header shared by per-D TUs + dispatch TU ----
+      # declarations header shared by per-D TUs + dispatch TU
       decls_path = os.path.join(gen_dir, "fwd_decls.h")
       cls._write_if_changed(decls_path, cls._render_decls_header(headdims))
       generated.append(decls_path)
 
-      # ---- two forward TUs per headdim, one per dtype ----
+      # two forward TUs per headdim, one per dtype
       for d in headdims:
         fp16_path = os.path.join(gen_dir, f"fwd_fp16_hdim{d}.cu")
         bf16_path = os.path.join(gen_dir, f"fwd_bf16_hdim{d}.cu")
@@ -481,15 +482,13 @@ class ENV(object):
       fwd_generated_count = len(headdims) * 2 + 1
 
     if build_pkg:
-      pretty_print_line(
+      _logging_msg(
         f"Generated {fwd_generated_count} CUDA TUs under {gen_dir}",
         sep="",
         mode="left",
       )
 
     return generated
-
-  # -------------------- code generation helpers --------------------
 
   @staticmethod
   def _render_decls_header(headdims):
@@ -627,8 +626,6 @@ class ENV(object):
     )
     return body
 
-  # -------------------- forward entry rendering --------------------
-
   @classmethod
   def _render_entry(
     cls, d: int, symbol: str, t_in: str, body_prefix: list
@@ -712,11 +709,11 @@ class ENV(object):
     def csrc(sub_dir, filename):
       csrc_file = f"{ENV.project_dir()}/csrc/{sub_dir}/{filename}"
       if build_pkg:
-        pretty_print_line(f"csrc_file: {csrc_file}", sep="", mode="left")
+        _logging_msg(f"csrc_file: {csrc_file}", sep="", mode="left")
       return csrc_file
 
     if build_pkg:
-      pretty_print_line()
+      _logging_msg()
     # Generate per-headdim TUs under csrc/cuffpa/generated/ and use them as
     # the actual build sources. The generated TUs include launch.cuh,
     # which in turn includes ffpa_attn_fwd.cuh. Splitting by headdim enables
@@ -726,19 +723,19 @@ class ENV(object):
     generated_sources = [p for p in generated_files if p.endswith(".cu")]
     if build_pkg:
       for gs in generated_sources:
-        pretty_print_line(f"csrc_file: {gs}", sep="", mode="left")
+        _logging_msg(f"csrc_file: {gs}", sep="", mode="left")
     build_sources = [
       csrc("cuffpa", "ffpa_api.cc"),
     ] + generated_sources
     if build_pkg:
-      pretty_print_line()
+      _logging_msg()
     return build_sources
 
   @staticmethod
   def get_build_cuda_cflags(build_pkg: bool = False):
     extra_cuda_cflags = []
     extra_cuda_cflags.append("-O3")
-    extra_cuda_cflags.append("-std=c++17")
+    extra_cuda_cflags.append("-std=c++20")
     extra_cuda_cflags.append("-Xcompiler")
     extra_cuda_cflags.append("-fPIC")
     extra_cuda_cflags.append("-U__CUDA_NO_HALF_OPERATORS__")
@@ -779,7 +776,7 @@ class ENV(object):
   @staticmethod
   def get_build_cflags():
     extra_cflags = []
-    extra_cflags.append("-std=c++17")
+    extra_cflags.append("-std=c++20")
     return extra_cflags
 
   @staticmethod
@@ -798,7 +795,7 @@ class ENV(object):
     return raw_output, bare_metal_version
 
   @staticmethod
-  def build_ffpa_from_sources(verbose: bool = False):
+  def build(verbose: bool = False):
     from torch.utils.cpp_extension import load
 
     if not ENV.enable_fwd_cuda_impl():
@@ -809,7 +806,7 @@ class ENV(object):
 
     torch_arch_list_env = os.environ.get("TORCH_CUDA_ARCH_LIST", None)
     # Load the CUDA kernel as a python module
-    pretty_print_line(
+    _logging_msg(
       f"Loading ffpa_attn lib on device: {ENV.get_device_name()}, "
       f"capability: {ENV.get_device_capability()}, "
       f"Arch ENV: {torch_arch_list_env}"
@@ -823,33 +820,33 @@ class ENV(object):
     )
 
   @staticmethod
-  def try_load_ffpa_library(force_build: bool = False, verbose: bool = False):
+  def load(force_build: bool = False, verbose: bool = False):
     use_ffpa_attn_package = False
     if not force_build:
       # check if can import ffpa_attn
       try:
         import ffpa_attn
 
-        pretty_print_line("Import ffpa_attn library done, use it!")
+        _logging_msg("Import ffpa_attn library done, use it!")
         use_ffpa_attn_package = True
         return ffpa_attn, use_ffpa_attn_package
       except Exception:
-        pretty_print_line("Can't import ffpa_attn, force build from sources")
-        pretty_print_line(
+        _logging_msg("Can't import ffpa_attn, force build from sources")
+        _logging_msg(
           "Also may need export LD_LIBRARY_PATH="
           "PATH-TO/torch/lib:$LD_LIBRARY_PATH"
         )
-        ffpa_attn = ENV.build_ffpa_from_sources(verbose=verbose)
+        ffpa_attn = ENV.build(verbose=verbose)
         use_ffpa_attn_package = False
         return ffpa_attn, use_ffpa_attn_package
     else:
-      pretty_print_line("Force ffpa_attn lib build from sources")
-      ffpa_attn = ENV.build_ffpa_from_sources(verbose=verbose)
+      _logging_msg("Force ffpa_attn lib build from sources")
+      ffpa_attn = ENV.build(verbose=verbose)
       use_ffpa_attn_package = False
       return ffpa_attn, use_ffpa_attn_package
 
 
-def pretty_print_line(
+def _logging_msg(
   m: str = "", sep: str = "-", mode: str = "center", width: int = 150
 ):
   res_len = width - len(m)
