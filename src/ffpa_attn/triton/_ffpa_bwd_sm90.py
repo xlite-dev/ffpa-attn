@@ -941,6 +941,8 @@ def _ffpa_bwd_dkdv_sm90_kernel_impl(
   autotune_seqlen_k_bucket: int,
   autotune_causal_key: int,
   autotune_dtype_key: int,
+  autotune_bias_key: int,
+  autotune_dropout_key: int,
   seqlen_q_rounded: int,
   headdim: int,
   dropout_p: float,
@@ -967,6 +969,8 @@ def _ffpa_bwd_dkdv_sm90_kernel_impl(
   _ = autotune_seqlen_k_bucket
   _ = autotune_causal_key
   _ = autotune_dtype_key
+  _ = autotune_bias_key
+  _ = autotune_dropout_key
 
   if PERSIST_DKDV_ACC:
     _ffpa_bwd_dkdv_persist_sm90(
@@ -1018,6 +1022,8 @@ def _ffpa_bwd_dq_sm90_kernel_impl(
   autotune_seqlen_k_bucket: int,
   autotune_causal_key: int,
   autotune_dtype_key: int,
+  autotune_bias_key: int,
+  autotune_dropout_key: int,
   seqlen_q_rounded: int,
   headdim: int,
   dropout_p: float,
@@ -1038,6 +1044,8 @@ def _ffpa_bwd_dq_sm90_kernel_impl(
   _ = autotune_seqlen_k_bucket
   _ = autotune_causal_key
   _ = autotune_dtype_key
+  _ = autotune_bias_key
+  _ = autotune_dropout_key
 
   _ffpa_bwd_dq_sm90(
     desc_q, desc_k, desc_v, desc_do, DQ, LSE, D, AttnBias, softmax_scale,
@@ -1087,6 +1095,8 @@ def _ffpa_bwd_sm90_kernel_impl(
   autotune_seqlen_k_bucket: int,
   autotune_causal_key: int,
   autotune_dtype_key: int,
+  autotune_bias_key: int,
+  autotune_dropout_key: int,
   seqlen_q_rounded: int,
   headdim: int,
   dropout_p: float,
@@ -1132,6 +1142,8 @@ def _ffpa_bwd_sm90_kernel_impl(
   _ = autotune_seqlen_k_bucket
   _ = autotune_causal_key
   _ = autotune_dtype_key
+  _ = autotune_bias_key
+  _ = autotune_dropout_key
 
   if USE_DKDVDQ_FUSION:
     _ffpa_bwd_dkdvdq_sm90(
@@ -1406,6 +1418,8 @@ def _get_bwd_sm90_autotune(
         "headdim",
         "autotune_causal_key",
         "autotune_dtype_key",
+        "autotune_bias_key",
+        "autotune_dropout_key",
       ],
       reset_to_zero=reset_args,
       cache_results=True,
@@ -1443,6 +1457,8 @@ def _get_bwd_sm90_dkdv_autotune(
         "headdim",
         "autotune_causal_key",
         "autotune_dtype_key",
+        "autotune_bias_key",
+        "autotune_dropout_key",
       ],
       reset_to_zero=reset_args,
       cache_results=True,
@@ -1472,6 +1488,8 @@ def _get_bwd_sm90_dq_autotune(
         "headdim",
         "autotune_causal_key",
         "autotune_dtype_key",
+        "autotune_bias_key",
+        "autotune_dropout_key",
       ],
       reset_to_zero=reset_args,
       cache_results=True,
@@ -1640,6 +1658,8 @@ def _ffpa_attn_backward_sm90_impl(
   autotune_seqlen_q_bucket = autotune_seqlen_key(seqlen_q, autotune_mode)
   autotune_seqlen_k_bucket = autotune_seqlen_key(seqlen_k, autotune_mode)
   autotune_causal_key = int(causal)
+  autotune_bias_key = int(attn_bias is not None)
+  autotune_dropout_key = int(dropout_p > 0.0)
   has_attn_bias = attn_bias is not None
   attn_bias_in = attn_bias if attn_bias is not None else q
   bias_strides = _attn_bias_broadcast_strides(
@@ -1813,6 +1833,8 @@ def _ffpa_attn_backward_sm90_impl(
     autotune_seqlen_k_bucket,
     autotune_causal_key,
     autotune_dtype_key,
+    autotune_bias_key,
+    autotune_dropout_key,
     seqlen_q_rounded,
     headdim,
     dropout_p,
@@ -1851,6 +1873,8 @@ def _ffpa_attn_backward_sm90_impl(
     autotune_seqlen_k_bucket,
     autotune_causal_key,
     autotune_dtype_key,
+    autotune_bias_key,
+    autotune_dropout_key,
     seqlen_q_rounded,
     headdim,
     dropout_p,
@@ -1880,6 +1904,8 @@ def _ffpa_attn_backward_sm90_impl(
     autotune_seqlen_k_bucket,
     autotune_causal_key,
     autotune_dtype_key,
+    autotune_bias_key,
+    autotune_dropout_key,
     seqlen_q_rounded,
     headdim,
     dropout_p,

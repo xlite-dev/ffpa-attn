@@ -91,6 +91,9 @@ def _ffpa_fwd_sm90_kernel_impl(
   autotune_seqlen_q_bucket: int,
   autotune_seqlen_k_bucket: int,
   autotune_causal_key: int,
+  autotune_bias_key: int,
+  autotune_dtype_key: int,
+  autotune_dropout_key: int,
   seqlen_q_rounded: int,
   dropout_p: float,
   philox_offset: int,
@@ -128,6 +131,9 @@ def _ffpa_fwd_sm90_kernel_impl(
   _ = autotune_seqlen_q_bucket
   _ = autotune_seqlen_k_bucket
   _ = autotune_causal_key
+  _ = autotune_bias_key
+  _ = autotune_dtype_key
+  _ = autotune_dropout_key
 
   start_m = tl.program_id(0)
   off_hb = tl.program_id(1)
@@ -368,6 +374,9 @@ def _get_fwd_sm90_autotune(
         "autotune_seqlen_q_bucket",
         "autotune_seqlen_k_bucket",
         "autotune_causal_key",
+        "autotune_bias_key",
+        "autotune_dtype_key",
+        "autotune_dropout_key",
         "HEADDIM",
       ],
       cache_results=True,
@@ -482,6 +491,9 @@ def _ffpa_attn_forward_sm90_generic_impl(
   autotune_seqlen_q_bucket = autotune_seqlen_key(seqlen_q, autotune_mode)
   autotune_seqlen_k_bucket = autotune_seqlen_key(seqlen_k, autotune_mode)
   autotune_causal_key = int(causal)
+  autotune_bias_key = int(attn_bias is not None)
+  autotune_dtype_key = int(q.dtype == torch.float16)
+  autotune_dropout_key = int(dropout_p > 0.0)
 
   if autotune:
 
@@ -516,6 +528,9 @@ def _ffpa_attn_forward_sm90_generic_impl(
       autotune_seqlen_q_bucket,
       autotune_seqlen_k_bucket,
       autotune_causal_key,
+      autotune_bias_key,
+      autotune_dtype_key,
+      autotune_dropout_key,
       seqlen_q_rounded,
       dropout_p,
       philox_offset,
@@ -554,6 +569,9 @@ def _ffpa_attn_forward_sm90_generic_impl(
     autotune_seqlen_q_bucket,
     autotune_seqlen_k_bucket,
     autotune_causal_key,
+    autotune_bias_key,
+    autotune_dtype_key,
+    autotune_dropout_key,
     seqlen_q_rounded,
     dropout_p,
     philox_offset,
