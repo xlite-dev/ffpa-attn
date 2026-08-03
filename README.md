@@ -9,7 +9,7 @@
     <img src="docs/assets/ffpa-api.png" width="700px">
 </div>
 
-**FFPA**: Fast and Memory-Efficient Exact Attention for **Large Headdim**, achieving **O(1)** SRAM complexity (w/ [**Split-D**](#-split-d)) and **O(d/4)** register complexity, **1.5x~6x** speedup over PyTorch SDPA. FFPA extends the headdim support beyond **D > 256** (up to **1024**) without any precision loss.
+**FFPA**: Fast and Memory-Efficient Exact Attention for **Large Headdim**, achieving **O(1)** SRAM complexity (w/ [**Split-D**](#-split-d)) and **O(d/4)** register complexity, **1.5x~6x** speedup over standard PyTorch SDPA. FFPA extends the headdim support beyond **D > 256** (up to **1024**) without any precision loss.
 
 <div align='center' markdown="1">
 
@@ -34,10 +34,10 @@ First, install the prebuilt package from [PyPI](https://pypi.org/project/ffpa-at
 pip3 install -U ffpa-attn # CUDA 13.0+, PyTorch 2.11+
 # Or, build ffpa-attn from source, just follow the cmds
 git clone https://github.com/xlite-dev/ffpa-attn.git
-# Then, build the wheel package (Triton + CuTeDSL backends)
+# Then, build the wheel package (Triton + CuTe-DSL backends)
 cd ffpa-attn && pip3 install -e . --no-build-isolation
 # Optional: install ffpa-attn w/ CUDA backend (forward only)
-./tools/build_fast.sh --arch sm_120f --ext all --headdim all
+tools/build_fast.sh --arch sm_120f --ext all --headdim all
 ```
 
 Then, try to accelerate the attention for large headdim with just <i><b>one-line</b></i> of code:
@@ -64,7 +64,7 @@ We extend FlashAttention to support large headdim ($D>256$) via **fine-grained t
 
 ## Benchmark
 
-Runnable benchmark are provided under [`bench`](./bench). The performance benchmarks for the NVIDIA L20 (**Ada**), NVIDIA Geforce RTX 5090 (**Blackwell**), NVIDIA H800 PCIE (**Hopper**), NVIDIA H200 SXM (**Hopper**, **CuTeDSL** backend, up to **535** TFLOPS!) with large headdims can be found at [`bench`](./bench).
+Runnable benchmark are provided under [`bench`](./bench). The performance benchmarks for the NVIDIA L20 (**Ada**), NVIDIA Geforce RTX 5090 (**Blackwell**), NVIDIA H800 PCIE (**Hopper**), NVIDIA H200 SXM (**Hopper**, **CuTe-DSL** backend, up to **535** TFLOPS!) with large headdims can be found at [`bench`](./bench).
 
 <div align='center'>
   <img src='./docs/assets/perf/ffpa_speedup_nvidia-geforce-rtx-5090_B1_H32_N8192_D320_T.png' width='400px'>
@@ -75,7 +75,7 @@ Runnable benchmark are provided under [`bench`](./bench). The performance benchm
 
 ## Backends
 
-FFPA supports multiple backends for the forward and backward pass, including: [`SDPA`](./bench/) (baseline), [`CUDA`](./bench/) (forward only), [`Triton`](./bench/), and [`CuTe-DSL`](./bench/). The `CuTe-DSL` backend is currently in early stage, stay tuned for future updates. The **Triton** backend (forward + backward) also runs on AMD GPUs.
+FFPA supports multiple backends for the forward and backward pass, including: [`SDPA`](./bench/) (baseline), [`CUDA`](./bench/) (forward only), [`Triton`](./bench/), and [`CuTe-DSL`](./bench/). The **CuTe-DSL** backend is currently in early stage, stay tuned for future updates. The **Triton** backend (forward + backward) also runs on AMD GPUs.
 
 <div align='center' markdown="1">
 
@@ -99,7 +99,7 @@ How to use different backends for your own scenario? Users can simply pass the B
 
 ## Persistent Autotune
 
-Generate device-specific tuned configs for production deployment (currently, [`Triton`](https://ffpa-attn.readthedocs.io/en/latest/user_guide/autotune/) only), avoiding per-process autotune cost. The generated JSON is saved under [configs](https://github.com/xlite-dev/ffpa-attn/tree/main/src/ffpa_attn/triton/configs) dir and automatically loaded when runtime autotune is disabled (the default). See the docs of [Triton Autotune](https://ffpa-attn.readthedocs.io/en/latest/user_guide/autotune/) for details.
+Generate device-specific tuned configs for production deployment (currently, [**Triton**](https://ffpa-attn.readthedocs.io/en/latest/user_guide/autotune/) only), avoiding per-process autotune cost. The generated JSON is saved under [configs](https://github.com/xlite-dev/ffpa-attn/tree/main/src/ffpa_attn/triton/configs) dir and automatically loaded when runtime autotune is disabled (the default). See the docs of [Triton Autotune](https://ffpa-attn.readthedocs.io/en/latest/user_guide/autotune/) for details.
 
 ```bash
 python -m ffpa_attn.autotune --mode max --full-tasks --overwrite # 1 GPU
@@ -109,7 +109,7 @@ python -m ffpa_attn.autotune --mode max --full-tasks --num-gpus 8 --overwrite
 
 ## End-to-End (E2E) Training
 
-NVIDIA-NeMo Automodel PR [#2436](https://github.com/NVIDIA-NeMo/Automodel/pull/2436) shows that on Gemma4-31B training (L=8192, 8xH200, FSDP2 + Activation Checkpointing), accelerating the **10/60** `D=512` full-attention layers with ffpa-attn delivers about [`1.4x-1.5x`](https://github.com/NVIDIA-NeMo/Automodel/pull/2436) higher throughput (**E2E**) than SDPA at similar memory footprint, with loss aligned within normal bf16 noise.
+NVIDIA-NeMo Automodel PR [#2436](https://github.com/NVIDIA-NeMo/Automodel/pull/2436) shows that on Gemma4-31B training (L=8192, 8xH200, FSDP2 + Activation Checkpointing), accelerating the **10/60 (D=512)** full-attention layers with ffpa-attn delivers about [`1.4x-1.5x`](https://github.com/NVIDIA-NeMo/Automodel/pull/2436) higher throughput (**E2E**) than SDPA at similar memory footprint, with loss aligned within normal bf16 noise.
 
 <!--
 <div align='center'>
