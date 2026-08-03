@@ -216,10 +216,160 @@ static constexpr int getConfigQKVSmemMaxSize() {
   return kQKVSmemMaxSize;
 }
 
+// General native cp.async forward launcher (sm>=80). Computes the native
+// block-tile config (MMA atoms, Br/Bc, stages, smem/pad flags) from
+// kHeadDim/kStage, then dispatches the Nq==1 split-KV decode fast-path or
+// the general split-D FA-2 kernel. Shape invariants are validated upstream
+// by launch_ffpa_attn_fwd_template; this launcher only extracts dims.
+template <typename kDataType, const int kHeadDim, const int kMmaAccFloat32QK,
+          const int kMmaAccFloat32PV, const int kStage>
+void launch_native_fwd_split_d_sm80(torch::Tensor Q, torch::Tensor K,
+                                    torch::Tensor V, torch::Tensor O,
+                                    torch::Tensor attn_bias,
+                                    torch::Tensor softmax_lse, int causal,
+                                    double softmax_scale, double dropout_p,
+                                    int64_t philox_seed,
+                                    int64_t philox_offset) {
+  constexpr int kMmaAtomM = 16;
+  constexpr int kMmaAtomN = 8;
+  constexpr int kMmaAtomK = 16;
+  constexpr int kMmaTileSeqLenQ = getConfigMmaTileSeqLenQP<kHeadDim>();
+  constexpr int kMmaTileSeqLenK = 1;
+  constexpr int kMmaTileSeqLenP = getConfigMmaTileSeqLenQP<kHeadDim>();
+  constexpr int kMmaTileHeadDimV = 1;
+  constexpr int kValTileSeqLenQ = 1;
+  constexpr int kValTileSeqLenK = getConfigValTileSeqLenK<kHeadDim>();
+  constexpr int kValTileSeqLenP = 1;
+  constexpr int kValTileHeadDimV = getConfigValTileHeadDimV<kHeadDim>();
+  constexpr int Br = kMmaAtomM * kMmaTileSeqLenQ * kValTileSeqLenQ;
+  constexpr int Bc = kMmaAtomN * kMmaTileSeqLenK * kValTileSeqLenK;
+  static_assert(Br == Bc,
+                "Br must be equal Bc to avoid illegal memory access.");
+  constexpr int kNumThreads = WARP_SIZE * kMmaTileSeqLenQ * kMmaTileSeqLenK;
+  constexpr int kOStorageAccFloat32 = getConfigOStorageAccFloat32<kHeadDim>();
+  constexpr int kStageQK = kStage;
+  constexpr int kStagePV = kStage;
+  constexpr int kShareSmemQKV = getConfigShareSmemQKV();
+  constexpr int kPrefetchQK = getConfigPrefetchQKV<kStageQK>();
+  constexpr int kPrefetchPV = getConfigPrefetchQKV<kStagePV>();
+  constexpr int kPersistQs2r = getConfigPersistQs2r();
+  constexpr int kPersistQg2s = getConfigPersistQg2s<kStageQK, kHeadDim>();
+  constexpr int kRegPipeKV = getConfigRegistersPipeKV();
+  constexpr int kPadQ = getConfigPadQ();
+  constexpr int kPadK = getConfigPadK();
+  constexpr int kPadV = getConfigPadV();
+  constexpr int kQKVSmemMaxSize =
+      getConfigQKVSmemMaxSize<Br, Bc, kMmaAtomM, kMmaAtomN, kMmaAtomK, kHeadDim,
+                              kShareSmemQKV, kPersistQg2s, kPersistQs2r,
+                              kStageQK, kStagePV, kPadQ, kPadK, kPadV>();
+
+  const int Nb = Q.size(0);
+  const int Nh = Q.size(1);
+  const int Nh_kv = K.size(1);
+  const int Nq = Q.size(2);
+  const int Nkv = K.size(2);
+  const bool has_attn_bias = attn_bias.numel() != 0;
+  const bool has_dropout = dropout_p > 0.0;
+  const void* attn_bias_ptr = nullptr;
+  int attn_bias_dtype = 0;
+  long long attn_bias_stride_b = 0, attn_bias_stride_h = 0,
+            attn_bias_stride_m = 0, attn_bias_stride_n = 0;
+  if (has_attn_bias) {
+    attn_bias_ptr = attn_bias.data_ptr();
+    attn_bias_dtype = attn_bias.scalar_type() == torch::kHalf       ? 1
+                      : attn_bias.scalar_type() == torch::kBFloat16 ? 2
+                                                                    : 3;
+    attn_bias_stride_b =
+        (attn_bias.size(0) == 1 && Nb > 1) ? 0 : attn_bias.stride(0);
+    attn_bias_stride_h =
+        (attn_bias.size(1) == 1 && Nh > 1) ? 0 : attn_bias.stride(1);
+    attn_bias_stride_m =
+        (attn_bias.size(2) == 1 && Nq > 1) ? 0 : attn_bias.stride(2);
+    attn_bias_stride_n =
+        (attn_bias.size(3) == 1 && Nkv > 1) ? 0 : attn_bias.stride(3);
+  }
+
+  const dim3 block = getConfigBlock<kNumThreads>();
+  const dim3 grid = getConfigGrid<Br>(Nb, Nh, Nq);
+  const int Tc = utils::div_ceil(Nkv, Bc);
+  const float scale = static_cast<float>(softmax_scale);
+  const float dropout_p_f = static_cast<float>(dropout_p);
+  const unsigned long long philox_seed_u =
+      static_cast<unsigned long long>(philox_seed);
+  const unsigned long long philox_offset_u =
+      static_cast<unsigned long long>(philox_offset);
+  float* softmax_lse_ptr = softmax_lse.data_ptr<float>();
+
+  const c10::cuda::OptionalCUDAGuard device_guard(Q.device());
+  auto stream = at::cuda::getCurrentCUDAStream();
+
+  const int num_sms_x2 =
+      max(1, at::cuda::getCurrentDeviceProperties()->multiProcessorCount * 2);
+  const int num_splits = select_decode_num_splits(
+      Nb * Nh * utils::div_ceil(Nq, 16), num_sms_x2, Tc, 128, min(Nq, 16));
+
+  // Fast path for Nq=1, num_splits>1, no attn_bias, no dropout (decode).
+  if (Nq == 1 && num_splits > 1 && !has_attn_bias && !has_dropout) {
+    const int split_size = utils::div_ceil(Tc, num_splits) * Bc;
+    auto scratch_options =
+        torch::TensorOptions().dtype(torch::kFloat32).device(Q.device());
+    auto partial_out =
+        torch::empty({Nb, Nh, num_splits, Nq, kHeadDim}, scratch_options);
+    auto chunk_lse = torch::empty({Nb, Nh, num_splits, Nq}, scratch_options);
+    const dim3 decode_stage1_grid = dim3(num_splits, Nb * Nh, 1);
+    const dim3 decode_stage2_grid = dim3(Nq, Nb * Nh, 1);
+    const int decode_threads =
+        ((kHeadDim / 8) + WARP_SIZE - 1) / WARP_SIZE * WARP_SIZE;
+    const dim3 decode_block = dim3(decode_threads, 1, 1);
+    auto decode_stage1_kernel =
+        (split_kv_decode_s1_fwd_sm80<kDataType, kHeadDim, true>);
+    decode_stage1_kernel<<<decode_stage1_grid, decode_block, 0, stream>>>(
+        reinterpret_cast<kDataType*>(Q.data_ptr()),
+        reinterpret_cast<kDataType*>(K.data_ptr()),
+        reinterpret_cast<kDataType*>(V.data_ptr()),
+        partial_out.data_ptr<float>(), chunk_lse.data_ptr<float>(), Nq, Nkv, Nh,
+        Nh_kv, scale, num_splits, split_size, causal);
+
+    auto decode_stage2_kernel =
+        (split_kv_decode_s2_fwd_sm80<kDataType, kHeadDim>);
+    decode_stage2_kernel<<<decode_stage2_grid, decode_block, 0, stream>>>(
+        partial_out.data_ptr<float>(), chunk_lse.data_ptr<float>(),
+        reinterpret_cast<kDataType*>(O.data_ptr()), softmax_lse_ptr, Nq, Nh,
+        num_splits);
+    return;
+  }
+
+  // General split-D FA-2 cp.async path for sm>=80.
+  const int smem_size_base = kQKVSmemMaxSize;
+  constexpr int kEffShareSmemQKV_LargeD = (kPersistQg2s) ? 0 : kShareSmemQKV;
+  constexpr int kEffPersistQs2r_LargeD =
+      (kPersistQg2s || kHeadDim > 256) ? 0 : kPersistQs2r;
+
+  auto ffpa_mma_large_d_kernel_func =
+      (split_d_fwd_sm80<
+          kDataType, kHeadDim, kMmaAtomM, kMmaAtomN, kMmaAtomK, kMmaTileSeqLenQ,
+          kMmaTileSeqLenK, kMmaTileSeqLenP, kMmaTileHeadDimV, kValTileSeqLenQ,
+          kValTileSeqLenK, kValTileSeqLenP, kValTileHeadDimV, kMmaAccFloat32QK,
+          kMmaAccFloat32PV, kOStorageAccFloat32, kPrefetchQK, kPrefetchPV,
+          kEffShareSmemQKV_LargeD, kEffPersistQs2r_LargeD, kPersistQg2s,
+          kRegPipeKV, kStageQK, kStagePV, kPadQ, kPadK, kPadV>);
+  cudaFuncSetAttribute(ffpa_mma_large_d_kernel_func,
+                       cudaFuncAttributeMaxDynamicSharedMemorySize,
+                       smem_size_base);
+  ffpa_mma_large_d_kernel_func<<<grid, block, smem_size_base, stream>>>(
+      reinterpret_cast<kDataType*>(Q.data_ptr()),
+      reinterpret_cast<kDataType*>(K.data_ptr()),
+      reinterpret_cast<kDataType*>(V.data_ptr()),
+      reinterpret_cast<kDataType*>(O.data_ptr()), softmax_lse_ptr, Nq, Nkv, Nh,
+      Nh_kv, scale, Tc, causal, attn_bias_ptr, attn_bias_dtype,
+      attn_bias_stride_b, attn_bias_stride_h, attn_bias_stride_m,
+      attn_bias_stride_n, dropout_p_f, philox_seed_u, philox_offset_u);
+}
+
 // Host-side launcher that picks compile-time configuration (block tile,
 // stages, prefetch / share-smem flags, pad vs swizzle, etc.) based on
 // ``kHeadDim`` and build macros, then launches the
-// ``ffpa_attn_split_d_fwd_template`` kernel on the caller's current CUDA
+// ``split_d_fwd_sm80`` kernel on the caller's current CUDA
 // stream. Validates Q/K/V/O shape invariants up-front via ``TORCH_CHECK``
 // (GQA/MQA head ratio, matching Nkv / D, and the
 // ``causal => Nkv >= Nq`` rule).
@@ -236,7 +386,7 @@ static constexpr int getConfigQKVSmemMaxSize() {
 // The SM120 TMA path is called from inside this function when ``tma`` is set;
 
 // ============================================================================
-// launch_ffpa_attn_fwd_template_sm120
+// launch_native_fwd_split_d_sm120
 // ----------------------------------------------------------------------------
 // SM120+ (TMA-capable) launcher.  kQKDChunk=32 (SWIZZLE_64B) or 64
 // (SWIZZLE_128B) is selected by the caller based on compute capability
@@ -248,13 +398,13 @@ template <typename kDataType, const int kHeadDim, const int kMmaAccFloat32QK,
           const int kVDChunk, const int kShareSmemQKV, const int kPersistQg2s,
           const int kMmaTileSeqLenQ, const int kValTileSeqLenK,
           const int kProducerThreads, const int kNonWS>
-void launch_ffpa_attn_fwd_template_sm120(torch::Tensor Q, torch::Tensor K,
-                                         torch::Tensor V, torch::Tensor O,
-                                         torch::Tensor attn_bias,
-                                         torch::Tensor softmax_lse, int causal,
-                                         double softmax_scale, double dropout_p,
-                                         int64_t philox_seed,
-                                         int64_t philox_offset) {
+void launch_native_fwd_split_d_sm120(torch::Tensor Q, torch::Tensor K,
+                                     torch::Tensor V, torch::Tensor O,
+                                     torch::Tensor attn_bias,
+                                     torch::Tensor softmax_lse, int causal,
+                                     double softmax_scale, double dropout_p,
+                                     int64_t philox_seed,
+                                     int64_t philox_offset) {
   constexpr int kMmaAtomM = 16;
   constexpr int kMmaAtomN = 8;
   constexpr int kMmaAtomK = 16;
@@ -378,7 +528,7 @@ void launch_ffpa_attn_fwd_template_sm120(torch::Tensor Q, torch::Tensor K,
   constexpr int kSmemBytes = kQKVSmemBytes + kBarrierBytes;
 
   auto kernel_func =
-      (ffpa_attn_split_d_fwd_template_sm120<
+      (split_d_fwd_sm120<
           kDataType, kHeadDim, kMmaAtomM, kMmaAtomN, kMmaAtomK, kMmaTileSeqLenQ,
           kMmaTileSeqLenK, kMmaTileSeqLenP, kMmaTileHeadDimV, kValTileSeqLenQ,
           kValTileSeqLenK, kValTileSeqLenP, kValTileHeadDimV, kMmaAccFloat32QK,

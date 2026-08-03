@@ -1,5 +1,7 @@
 #pragma once
 
+// tensor.hpp MUST precede any cute/atom/* header (see sm_80/split_d.cuh).
+#include <cute/tensor.hpp>
 #include <cute/atom/copy_traits_sm90_tma.hpp>
 #include <cutlass/arch/barrier.h>
 #include <cutlass/arch/reg_reconfig.h>
@@ -7,11 +9,11 @@
 #include <cutlass/device_kernel.h>
 
 // namespace ffpa_cute
-#include "cute/gemm.cuh"
-#include "cute/attn_traits.cuh"
-#include "cute/attn_bias.cuh"
-#include "cute/dropout.cuh"
-#include "cute/softmax.cuh"
+#include "../gemm.cuh"
+#include "../attn_traits.cuh"
+#include "../attn_bias.cuh"
+#include "../dropout.cuh"
+#include "../softmax.cuh"
 
 using TmaBarrier = cutlass::arch::ClusterTransactionBarrier;
 using CtaBarrier = cutlass::arch::ClusterBarrier;
@@ -28,7 +30,7 @@ using CtaBarrier = cutlass::arch::ClusterBarrier;
 // splits on %64==0).
 template <typename Traits, typename TmaQ, typename TmaK, typename TmaV,
           typename TmaO, int kHasAttnBias = 0, int kHasDropout = 0>
-__global__ void __launch_bounds__(384, 1) ffpa_attn_persist_d_ws_fwd_cute_sm120(
+__global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_sm120(
     CUTLASS_GRID_CONSTANT TmaQ const tma_q,
     CUTLASS_GRID_CONSTANT TmaK const tma_k,
     CUTLASS_GRID_CONSTANT TmaV const tma_v,

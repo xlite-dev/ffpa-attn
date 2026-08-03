@@ -1,7 +1,10 @@
 #pragma once
 
-#include <cute/atom/copy_atom.hpp>
+// tensor.hpp MUST precede any cute/atom/* header: nvcc 13.2 EDG misparses
+// copy.hpp's copy_if/prefetch overloads (pack-not-at-end) when copy_atom.hpp
+// pulls copy.hpp in via its deep mma_atom->partitioner chain first.
 #include <cute/tensor.hpp>
+#include <cute/atom/copy_atom.hpp>
 #include <cutlass/cutlass.h>
 
 #include "../gemm.cuh"
@@ -15,19 +18,17 @@
 // cp.async G2S (all 256 threads) instead of TMA (tid=0 only).
 template <typename Traits, int kStagesQK = 2, int kStagesPV = 2,
           int kHasAttnBias = 0, int kHasDropout = 0>
-__global__ void __launch_bounds__(Traits::kNumThreads, 1)
-    ffpa_attn_split_d_fwd_cute(
-        typename Traits::Element* __restrict__ Q,
-        typename Traits::Element* __restrict__ K,
-        typename Traits::Element* __restrict__ V,
-        typename Traits::Element* __restrict__ O,
-        float* __restrict__ softmax_lse, int Nq, int Nkv, int Nh, int Nh_kv,
-        float scale, int Tc, int causal,
-        const void* __restrict__ attn_bias = nullptr, int attn_bias_dtype = 0,
-        long long attn_bias_stride_b = 0, long long attn_bias_stride_h = 0,
-        long long attn_bias_stride_m = 0, long long attn_bias_stride_n = 0,
-        float dropout_p = 0.0f, unsigned long long philox_seed = 0,
-        unsigned long long philox_offset = 0) {
+__global__ void __launch_bounds__(Traits::kNumThreads, 1) split_d_fwd_cute_sm80(
+    typename Traits::Element* __restrict__ Q,
+    typename Traits::Element* __restrict__ K,
+    typename Traits::Element* __restrict__ V,
+    typename Traits::Element* __restrict__ O, float* __restrict__ softmax_lse,
+    int Nq, int Nkv, int Nh, int Nh_kv, float scale, int Tc, int causal,
+    const void* __restrict__ attn_bias = nullptr, int attn_bias_dtype = 0,
+    long long attn_bias_stride_b = 0, long long attn_bias_stride_h = 0,
+    long long attn_bias_stride_m = 0, long long attn_bias_stride_n = 0,
+    float dropout_p = 0.0f, unsigned long long philox_seed = 0,
+    unsigned long long philox_offset = 0) {
   using namespace cute;
   using Element = typename Traits::Element;
   using SmemLayoutQ = typename Traits::SmemLayoutQ;

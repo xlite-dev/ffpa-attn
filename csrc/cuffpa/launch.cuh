@@ -28,44 +28,11 @@ void launch_ffpa_attn_fwd_template(torch::Tensor Q, torch::Tensor K,
                                    int64_t philox_seed, int64_t philox_offset) {
   // Q,K,V,O with [B, H, N, D] layout, B=batch, H=head, N=seqlen, D=dim
   // TODO: support BNHD layout, Q,K,V,O with [B, N, H, D] layout.
-  constexpr int kMmaAtomM = 16;
-  constexpr int kMmaAtomN = 8;
-  constexpr int kMmaAtomK = 16;
-  // Split-Q(FA-2) Algo, Tile MMA across Q and keep KV access for all MMAs.
-  constexpr int kMmaTileSeqLenQ = getConfigMmaTileSeqLenQP<kHeadDim>();
-  constexpr int kMmaTileSeqLenK = 1;
-  constexpr int kMmaTileSeqLenP = getConfigMmaTileSeqLenQP<kHeadDim>();
-  constexpr int kMmaTileHeadDimV = 1;
-  constexpr int kValTileSeqLenQ = 1;
-  constexpr int kValTileSeqLenK = getConfigValTileSeqLenK<kHeadDim>();
-  constexpr int kValTileSeqLenP = 1;
-  constexpr int kValTileHeadDimV = getConfigValTileHeadDimV<kHeadDim>();
-  constexpr int Br = kMmaAtomM * kMmaTileSeqLenQ * kValTileSeqLenQ;
-  constexpr int Bc = kMmaAtomN * kMmaTileSeqLenK * kValTileSeqLenK;
-  static_assert(Br == Bc,
-                "Br must be equal Bc to avoid illegal memory access.");
-  constexpr int kNumThreads = WARP_SIZE * kMmaTileSeqLenQ * kMmaTileSeqLenK;
-  constexpr int kOStorageAccFloat32 = getConfigOStorageAccFloat32<kHeadDim>();
-  // Apply different multi stages policy for QK and V.
-  // TODO: tune stages for Q@K and P@V.
-  constexpr int kStageQK = kStage;  // <= FFPA_BUILD_MAX_STAGES
-  constexpr int kStagePV = kStage;  // <= FFPA_BUILD_MAX_STAGES
-  // Prefetch QKV, Persist Q g2s/s2r, Shared QKV smem.
-  constexpr int kShareSmemQKV = getConfigShareSmemQKV();
-  constexpr int kPrefetchQK = getConfigPrefetchQKV<kStageQK>();
-  constexpr int kPrefetchPV = getConfigPrefetchQKV<kStagePV>();
-  constexpr int kPersistQs2r = getConfigPersistQs2r();
-  constexpr int kPersistQg2s = getConfigPersistQg2s<kStageQK, kHeadDim>();
-  constexpr int kRegPipeKV = getConfigRegistersPipeKV();
-  // QKV smem swizzle, 0 for smem swizzle, !0 for smem padding.
-  constexpr int kPadQ = getConfigPadQ();
-  constexpr int kPadK = getConfigPadK();
-  constexpr int kPadV = getConfigPadV();
-  // Calculate SRAM size needed for per block.
-  constexpr int kQKVSmemMaxSize =
-      getConfigQKVSmemMaxSize<Br, Bc, kMmaAtomM, kMmaAtomN, kMmaAtomK, kHeadDim,
-                              kShareSmemQKV, kPersistQg2s, kPersistQs2r,
-                              kStageQK, kStagePV, kPadQ, kPadK, kPadV>();
+  // Native block-tile config (MMA atoms, Br/Bc, stages, smem/pad flags) and
+  // the Nq==1 decode fast-path live in
+  // native/launch.cuh::launch_native_fwd_split_d_sm80. CuTe uses its own
+  // traits. This top-level entry only validates shapes and dispatches to a
+  // backend.
   TORCH_CHECK(K.size(0) == Q.size(0) && V.size(0) == Q.size(0),
               "ffpa_attn: Q/K/V must share the same batch size");
   TORCH_CHECK(K.size(1) == V.size(1),
@@ -82,10 +49,8 @@ void launch_ffpa_attn_fwd_template(torch::Tensor Q, torch::Tensor K,
               "ffpa_attn: causal attention requires Nkv >= Nq (queries are "
               "aligned to the tail of the KV sequence)");
   const int Nb = Q.size(0);
-  const int Nh = Q.size(1);  // Q head count (Nh_q); used for grid fan-out.
-  const int Nh_kv =
-      K.size(1);  // K/V head count; Nh % Nh_kv == 0 asserted above.
-  // Cross-attention: Q seqlen (Nq) may differ from KV seqlen (Nkv).
+  const int Nh = Q.size(1);
+  const int Nh_kv = K.size(1);
   const int Nq = Q.size(2);
   const int Nkv = K.size(2);
   const bool has_attn_bias = attn_bias.numel() != 0;
@@ -93,12 +58,6 @@ void launch_ffpa_attn_fwd_template(torch::Tensor Q, torch::Tensor K,
   TORCH_CHECK(causal == 0 || !has_attn_bias,
               "ffpa_attn: explicit attn_mask should not be set when causal "
               "attention is enabled");
-  const void* attn_bias_ptr = nullptr;
-  int attn_bias_dtype = 0;
-  long long attn_bias_stride_b = 0;
-  long long attn_bias_stride_h = 0;
-  long long attn_bias_stride_m = 0;
-  long long attn_bias_stride_n = 0;
   if (has_attn_bias) {
     TORCH_CHECK(attn_bias.is_cuda(),
                 "ffpa_attn: attn_mask must be a CUDA tensor");
@@ -119,88 +78,12 @@ void launch_ffpa_attn_fwd_template(torch::Tensor Q, torch::Tensor K,
                 "ffpa_attn: normalized attn_mask must be contiguous along the "
                 "key dimension");
     const auto bias_type = attn_bias.scalar_type();
-    if (bias_type == torch::kHalf) {
-      attn_bias_dtype = 1;
-    } else if (bias_type == torch::kBFloat16) {
-      attn_bias_dtype = 2;
-    } else if (bias_type == torch::kFloat32) {
-      attn_bias_dtype = 3;
-    } else {
-      TORCH_CHECK(false,
-                  "ffpa_attn: attn_mask dtype must be fp16, bf16, or fp32");
-    }
+    TORCH_CHECK(bias_type == torch::kFloat32 || bias_type == torch::kHalf ||
+                    bias_type == torch::kBFloat16,
+                "ffpa_attn: attn_mask dtype must be fp16, bf16, or fp32");
     TORCH_CHECK(bias_type == torch::kFloat32 || bias_type == Q.scalar_type(),
                 "ffpa_attn: attn_mask dtype must be fp32 or match Q dtype");
-    attn_bias_ptr = attn_bias.data_ptr();
-    attn_bias_stride_b =
-        (attn_bias.size(0) == 1 && Nb > 1) ? 0 : attn_bias.stride(0);
-    attn_bias_stride_h =
-        (attn_bias.size(1) == 1 && Nh > 1) ? 0 : attn_bias.stride(1);
-    attn_bias_stride_m =
-        (attn_bias.size(2) == 1 && Nq > 1) ? 0 : attn_bias.stride(2);
-    attn_bias_stride_n =
-        (attn_bias.size(3) == 1 && Nkv > 1) ? 0 : attn_bias.stride(3);
   }
-  // Seqlen (Nq, Nkv) no longer has to be a multiple of max(Br, Bc): the
-  // kernel handles the tail tile via cp.async zero-fill, softmax -inf
-  // masking and a per-row store predicate. div_ceil(Nkv, Bc) below still
-  // yields the right Tc for partial last KV tiles.
-
-  const dim3 block = getConfigBlock<kNumThreads>();  // 4/8 warps per block
-  // grid is driven by Q row tiles; KV tile count Tc is driven by Nkv.
-  const dim3 grid = getConfigGrid<Br>(Nb, Nh, Nq);
-  const int Tc = utils::div_ceil(Nkv, Bc);  // Tc K_tile[Bc,d]
-  const float scale = static_cast<float>(softmax_scale);
-  const float dropout_p_f = static_cast<float>(dropout_p);
-  const unsigned long long philox_seed_u =
-      static_cast<unsigned long long>(philox_seed);
-  const unsigned long long philox_offset_u =
-      static_cast<unsigned long long>(philox_offset);
-  float* softmax_lse_ptr = softmax_lse.data_ptr<float>();
-
-  // Launch on the caller's current CUDA stream so the kernel participates
-  // correctly in multi-stream pipelines. Without this the kernel would
-  // default to stream 0 and race against user-side non-default streams.
-  const c10::cuda::OptionalCUDAGuard device_guard(Q.device());
-  auto stream = at::cuda::getCurrentCUDAStream();
-
-  const int num_sms_x2 =
-      max(1, at::cuda::getCurrentDeviceProperties()->multiProcessorCount * 2);
-  const int num_splits = select_decode_num_splits(
-      Nb * Nh * utils::div_ceil(Nq, 16), num_sms_x2, Tc, 128, min(Nq, 16));
-
-  // Fast path for Nq=1, num_splits>1, no attn_bias, no dropout. (decode cases)
-  if (Nq == 1 && num_splits > 1 && !has_attn_bias && !has_dropout) {
-    const int split_size = utils::div_ceil(Tc, num_splits) * Bc;
-    auto scratch_options =
-        torch::TensorOptions().dtype(torch::kFloat32).device(Q.device());
-    auto partial_out =
-        torch::empty({Nb, Nh, num_splits, Nq, kHeadDim}, scratch_options);
-    auto chunk_lse = torch::empty({Nb, Nh, num_splits, Nq}, scratch_options);
-    const dim3 decode_stage1_grid = dim3(num_splits, Nb * Nh, 1);
-    const dim3 decode_stage2_grid = dim3(Nq, Nb * Nh, 1);
-    const int decode_threads =
-        ((kHeadDim / 8) + WARP_SIZE - 1) / WARP_SIZE * WARP_SIZE;
-    const dim3 decode_block = dim3(decode_threads, 1, 1);
-    // Pure gemv implementation for Nq=1 case, do the reduction in stage 2.
-    auto decode_stage1_kernel =
-        (ffpa_attn_split_kv_decode_stage1_template<kDataType, kHeadDim, true>);
-    decode_stage1_kernel<<<decode_stage1_grid, decode_block, 0, stream>>>(
-        reinterpret_cast<kDataType*>(Q.data_ptr()),
-        reinterpret_cast<kDataType*>(K.data_ptr()),
-        reinterpret_cast<kDataType*>(V.data_ptr()),
-        partial_out.data_ptr<float>(), chunk_lse.data_ptr<float>(), Nq, Nkv, Nh,
-        Nh_kv, scale, num_splits, split_size, causal);
-
-    auto decode_stage2_kernel =
-        (ffpa_attn_split_kv_decode_stage2_template<kDataType, kHeadDim>);
-    decode_stage2_kernel<<<decode_stage2_grid, decode_block, 0, stream>>>(
-        partial_out.data_ptr<float>(), chunk_lse.data_ptr<float>(),
-        reinterpret_cast<kDataType*>(O.data_ptr()), softmax_lse_ptr, Nq, Nh,
-        num_splits);
-    return;
-  }
-
   // Backend implementation hint: override path selection when explicitly set.
   // AUTO is treated as NATIVE: tma/cute paths are opt-in only.
   const auto impl_hint = ffpa::get_backend_impl_hint();
@@ -230,7 +113,7 @@ void launch_ffpa_attn_fwd_template(torch::Tensor Q, torch::Tensor K,
         // sm_90/100 (228 KB smem): WS path, setmaxnreg effective.
         if (!has_attn_bias && !has_dropout && kHeadDim <= 512) {
           // w/ kPersistQg2s = 1
-          launch_ffpa_attn_fwd_template_sm120<
+          launch_native_fwd_split_d_sm120<
               kDataType, kHeadDim, kMmaAccFloat32QK, kMmaAccFloat32PV, kStage,
               64 /*kQKDChunk*/, 64 /*kVDChunk*/, 0 /*kShareSmemQKV*/,
               1 /*kPersistQg2s*/, 8 /*kMmaTileSeqLenQ*/, 16 /*kValTileSeqLenK*/,
@@ -239,7 +122,7 @@ void launch_ffpa_attn_fwd_template(torch::Tensor Q, torch::Tensor K,
               dropout_p, philox_seed, philox_offset);
         } else {
           // w/ kPersistQg2s = 0
-          launch_ffpa_attn_fwd_template_sm120<
+          launch_native_fwd_split_d_sm120<
               kDataType, kHeadDim, kMmaAccFloat32QK, kMmaAccFloat32PV, kStage,
               64 /*kQKDChunk*/, 64 /*kVDChunk*/, 0 /*kShareSmemQKV*/,
               0 /*kPersistQg2s*/, 8 /*kMmaTileSeqLenQ*/, 16 /*kValTileSeqLenK*/,
@@ -257,7 +140,7 @@ void launch_ffpa_attn_fwd_template(torch::Tensor Q, torch::Tensor K,
         // live + addressing temps → spills). Prefer the non-WS TMA fallback
         // when bias/dropout is active; CuTe handles the clean path only.
         if (force_tma) {
-          launch_ffpa_attn_fwd_template_sm120<
+          launch_native_fwd_split_d_sm120<
               kDataType, kHeadDim, kMmaAccFloat32QK, kMmaAccFloat32PV,
               (kStage > 3 ? 3 : kStage), 32 /*kQKDChunk*/, 64 /*kVDChunk*/,
               0 /*kShareSmemQKV*/, 0 /*kPersistQg2s*/, 8 /*kMmaTileSeqLenQ*/,
@@ -267,8 +150,7 @@ void launch_ffpa_attn_fwd_template(torch::Tensor Q, torch::Tensor K,
         } else if (force_cute_tma || (!has_attn_bias && !has_dropout)) {
           if constexpr (kHeadDim <= 128 && kHeadDim % 64 == 0) {
             // WS persist-D: D=64/128 (Q persist fits the smem budget).
-            launch_ffpa_attn_persist_d_ws_fwd_cute_sm120<kDataType, kHeadDim,
-                                                         kStage>(
+            launch_cute_fwd_persist_d_sm120<kDataType, kHeadDim, kStage>(
                 Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
                 dropout_p, philox_seed, philox_offset);
           } else if constexpr (kHeadDim % 64 == 0) {
@@ -281,31 +163,29 @@ void launch_ffpa_attn_fwd_template(torch::Tensor Q, torch::Tensor K,
             if constexpr (kHeadDim >= 768) {
               // split-D M4N2 (non-WS): kBr=64, atom_layout=(4,2,1). O regs =
               // D/4 per thread (vs M8N1's D/2 which spills for D>=512).
-              launch_ffpa_attn_split_d_m4n2_fwd_cute_sm120<kDataType, kHeadDim,
-                                                           kStage>(
+              launch_cute_fwd_split_d_m4n2_sm120<kDataType, kHeadDim, kStage>(
                   Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
                   dropout_p, philox_seed, philox_offset);
             } else {
               // split-D (non-WS) M8N1. The WS variant
-              // (launch_ffpa_attn_split_d_ws_fwd_cute_sm120) is disabled:
+              // (launch_cute_fwd_split_d_ws_sm120) is disabled:
               // setmaxnreg's consumer ceiling (232, CTA-pool max) cannot hold
               // D=512's 256-reg o_acc (per-thread hard cap 255), and D=256/320/
               // 512 show no perf gain over non-WS (o_acc=D*kBr/256 regs spills
               // to local mem either way). WS kernel kept in
               // cute/sm_120/split_d.cuh for reference; FA-1 M4N2 is the path to
               // lower large-D reg pressure (.tmp/plans/ffpa_fa1.md).
-              launch_ffpa_attn_split_d_fwd_cute_sm120<kDataType, kHeadDim,
-                                                      kStage, 32, 64>(
+              launch_cute_fwd_split_d_sm120<kDataType, kHeadDim, kStage, 32,
+                                            64>(
                   Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
                   dropout_p, philox_seed, philox_offset);
             }
           } else if constexpr (kHeadDim % 32 == 0) {
-            launch_ffpa_attn_split_d_fwd_cute_sm120<kDataType, kHeadDim, kStage,
-                                                    32, 32>(
+            launch_cute_fwd_split_d_sm120<kDataType, kHeadDim, kStage, 32, 32>(
                 Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
                 dropout_p, philox_seed, philox_offset);
           } else {
-            launch_ffpa_attn_fwd_template_sm120<
+            launch_native_fwd_split_d_sm120<
                 kDataType, kHeadDim, kMmaAccFloat32QK, kMmaAccFloat32PV,
                 (kStage > 3 ? 3 : kStage), 32 /*kQKDChunk*/, 64 /*kVDChunk*/,
                 0 /*kShareSmemQKV*/, 0 /*kPersistQg2s*/, 8 /*kMmaTileSeqLenQ*/,
@@ -314,7 +194,7 @@ void launch_ffpa_attn_fwd_template(torch::Tensor Q, torch::Tensor K,
                 dropout_p, philox_seed, philox_offset);
           }
         } else {
-          launch_ffpa_attn_fwd_template_sm120<
+          launch_native_fwd_split_d_sm120<
               kDataType, kHeadDim, kMmaAccFloat32QK, kMmaAccFloat32PV,
               (kStage > 3 ? 3 : kStage), 32 /*kQKDChunk*/, 64 /*kVDChunk*/,
               0 /*kShareSmemQKV*/, 0 /*kPersistQg2s*/, 8 /*kMmaTileSeqLenQ*/,
@@ -326,7 +206,7 @@ void launch_ffpa_attn_fwd_template(torch::Tensor Q, torch::Tensor K,
         // kQKDChunk=32 (SWIZZLE_64B), kVDChunk=64, S≤3.
         // smem per stage: Q=128×32×2B=8KB, K=128×32×2B=8KB, V=128×64×2B=16KB
         // total: 3×(8+8+16)KB = 96KB < 99KB.
-        launch_ffpa_attn_fwd_template_sm120<
+        launch_native_fwd_split_d_sm120<
             kDataType, kHeadDim, kMmaAccFloat32QK, kMmaAccFloat32PV,
             (kStage > 3 ? 3 : kStage), 32 /*kQKDChunk*/, 64 /*kVDChunk*/,
             0 /*kShareSmemQKV*/, 0 /*kPersistQg2s*/, 8 /*kMmaTileSeqLenQ*/,
@@ -354,28 +234,25 @@ void launch_ffpa_attn_fwd_template(torch::Tensor Q, torch::Tensor K,
       constexpr int kCuteStage32 = (kStage > 2) ? 2 : kStage;
       constexpr int kCuteStage64 = (kStage > 3) ? 3 : kStage;
       if constexpr (kHeadDim >= 320) {
-        launch_ffpa_attn_split_d_fwd_cute<kDataType, kHeadDim, kCuteStage32, 32,
-                                          32>(
+        launch_cute_fwd_split_d_sm80<kDataType, kHeadDim, kCuteStage32, 32, 32>(
             Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
             dropout_p, philox_seed, philox_offset);
       } else if constexpr (kHeadDim % 64 == 0) {
-        launch_ffpa_attn_split_d_fwd_cute<kDataType, kHeadDim, kCuteStage64, 32,
-                                          64>(
+        launch_cute_fwd_split_d_sm80<kDataType, kHeadDim, kCuteStage64, 32, 64>(
             Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
             dropout_p, philox_seed, philox_offset);
       } else if constexpr (kHeadDim % 32 == 0) {
-        launch_ffpa_attn_split_d_fwd_cute<kDataType, kHeadDim, kCuteStage32, 32,
-                                          32>(
+        launch_cute_fwd_split_d_sm80<kDataType, kHeadDim, kCuteStage32, 32, 32>(
             Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
             dropout_p, philox_seed, philox_offset);
       }
     } else {
       if constexpr (kHeadDim % 64 == 0) {
-        launch_ffpa_attn_split_d_fwd_cute<kDataType, kHeadDim, kStage, 32, 64>(
+        launch_cute_fwd_split_d_sm80<kDataType, kHeadDim, kStage, 32, 64>(
             Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
             dropout_p, philox_seed, philox_offset);
       } else if constexpr (kHeadDim % 32 == 0) {
-        launch_ffpa_attn_split_d_fwd_cute<kDataType, kHeadDim, kStage, 32, 32>(
+        launch_cute_fwd_split_d_sm80<kDataType, kHeadDim, kStage, 32, 32>(
             Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
             dropout_p, philox_seed, philox_offset);
       }
@@ -384,30 +261,10 @@ void launch_ffpa_attn_fwd_template(torch::Tensor Q, torch::Tensor K,
   }
 #endif  // ENABLE_FFPA_CUTE_EXT
 
-  // General path for sm>=80 architectures.
-  const int smem_size_base = kQKVSmemMaxSize;
-
-  constexpr int kEffShareSmemQKV_LargeD = (kPersistQg2s) ? 0 : kShareSmemQKV;
-  constexpr int kEffPersistQs2r_LargeD =
-      (kPersistQg2s || kHeadDim > 256) ? 0 : kPersistQs2r;
-
-  auto ffpa_mma_large_d_kernel_func =
-      (ffpa_attn_split_d_fwd_template<
-          kDataType, kHeadDim, kMmaAtomM, kMmaAtomN, kMmaAtomK, kMmaTileSeqLenQ,
-          kMmaTileSeqLenK, kMmaTileSeqLenP, kMmaTileHeadDimV, kValTileSeqLenQ,
-          kValTileSeqLenK, kValTileSeqLenP, kValTileHeadDimV, kMmaAccFloat32QK,
-          kMmaAccFloat32PV, kOStorageAccFloat32, kPrefetchQK, kPrefetchPV,
-          kEffShareSmemQKV_LargeD, kEffPersistQs2r_LargeD, kPersistQg2s,
-          kRegPipeKV, kStageQK, kStagePV, kPadQ, kPadK, kPadV>);
-  cudaFuncSetAttribute(ffpa_mma_large_d_kernel_func,
-                       cudaFuncAttributeMaxDynamicSharedMemorySize,
-                       smem_size_base);
-  ffpa_mma_large_d_kernel_func<<<grid, block, smem_size_base, stream>>>(
-      reinterpret_cast<kDataType*>(Q.data_ptr()),
-      reinterpret_cast<kDataType*>(K.data_ptr()),
-      reinterpret_cast<kDataType*>(V.data_ptr()),
-      reinterpret_cast<kDataType*>(O.data_ptr()), softmax_lse_ptr, Nq, Nkv, Nh,
-      Nh_kv, scale, Tc, causal, attn_bias_ptr, attn_bias_dtype,
-      attn_bias_stride_b, attn_bias_stride_h, attn_bias_stride_m,
-      attn_bias_stride_n, dropout_p_f, philox_seed_u, philox_offset_u);
+  // Native general cp.async path + Nq==1 split-KV decode fast-path (fallback
+  // when no TMA/CuTe backend is selected). Config + decode live in native/.
+  launch_native_fwd_split_d_sm80<kDataType, kHeadDim, kMmaAccFloat32QK,
+                                 kMmaAccFloat32PV, kStage>(
+      Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale, dropout_p,
+      philox_seed, philox_offset);
 }

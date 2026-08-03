@@ -15,11 +15,12 @@
 #ifdef ENABLE_FFPA_TMA_EXT
 template <typename kDataType, const int kHeadDim, const int kStage,
           const int kQKDChunk, const int kVDChunk>
-void launch_ffpa_attn_split_d_fwd_cute_sm120(
-    torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O,
-    torch::Tensor attn_bias, torch::Tensor softmax_lse, int causal,
-    double softmax_scale, double dropout_p, int64_t philox_seed,
-    int64_t philox_offset) {
+void launch_cute_fwd_split_d_sm120(torch::Tensor Q, torch::Tensor K,
+                                   torch::Tensor V, torch::Tensor O,
+                                   torch::Tensor attn_bias,
+                                   torch::Tensor softmax_lse, int causal,
+                                   double softmax_scale, double dropout_p,
+                                   int64_t philox_seed, int64_t philox_offset) {
   using namespace cute;
 
   constexpr int kBr = 128;
@@ -162,16 +163,16 @@ void launch_ffpa_attn_split_d_fwd_cute_sm120(
   using TmaO = decltype(tma_o);
   if (has_attn_bias && has_dropout) {
     launch_variant(
-        ffpa_attn_split_d_fwd_cute_sm120<Traits, TmaQ, TmaK, TmaV, TmaO, 1, 1>);
+        split_d_fwd_cute_sm120<Traits, TmaQ, TmaK, TmaV, TmaO, 1, 1>);
   } else if (has_attn_bias) {
     launch_variant(
-        ffpa_attn_split_d_fwd_cute_sm120<Traits, TmaQ, TmaK, TmaV, TmaO, 1, 0>);
+        split_d_fwd_cute_sm120<Traits, TmaQ, TmaK, TmaV, TmaO, 1, 0>);
   } else if (has_dropout) {
     launch_variant(
-        ffpa_attn_split_d_fwd_cute_sm120<Traits, TmaQ, TmaK, TmaV, TmaO, 0, 1>);
+        split_d_fwd_cute_sm120<Traits, TmaQ, TmaK, TmaV, TmaO, 0, 1>);
   } else {
     launch_variant(
-        ffpa_attn_split_d_fwd_cute_sm120<Traits, TmaQ, TmaK, TmaV, TmaO, 0, 0>);
+        split_d_fwd_cute_sm120<Traits, TmaQ, TmaK, TmaV, TmaO, 0, 0>);
   }
 }
 
@@ -179,11 +180,13 @@ void launch_ffpa_attn_split_d_fwd_cute_sm120(
 // FFPAAttnCuTeSplitDM4N2Traits (P SMEM roundtrip + cross-N-warp softmax).
 // Dispatched for D>=512 to avoid M8N1's register spill (O=D/2 > 255).
 template <typename kDataType, const int kHeadDim, const int kStage>
-void launch_ffpa_attn_split_d_m4n2_fwd_cute_sm120(
-    torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O,
-    torch::Tensor attn_bias, torch::Tensor softmax_lse, int causal,
-    double softmax_scale, double dropout_p, int64_t philox_seed,
-    int64_t philox_offset) {
+void launch_cute_fwd_split_d_m4n2_sm120(torch::Tensor Q, torch::Tensor K,
+                                        torch::Tensor V, torch::Tensor O,
+                                        torch::Tensor attn_bias,
+                                        torch::Tensor softmax_lse, int causal,
+                                        double softmax_scale, double dropout_p,
+                                        int64_t philox_seed,
+                                        int64_t philox_offset) {
   using namespace cute;
 
   constexpr int kBr = 64;
@@ -318,26 +321,28 @@ void launch_ffpa_attn_split_d_m4n2_fwd_cute_sm120(
   using TmaV = decltype(tma_v);
   using TmaO = decltype(tma_o);
   if (has_attn_bias && has_dropout) {
-    launch_variant(ffpa_attn_split_d_m4n2_fwd_cute_sm120<Traits, TmaQ, TmaK,
-                                                         TmaV, TmaO, 1, 1>);
+    launch_variant(
+        split_d_m4n2_fwd_cute_sm120<Traits, TmaQ, TmaK, TmaV, TmaO, 1, 1>);
   } else if (has_attn_bias) {
-    launch_variant(ffpa_attn_split_d_m4n2_fwd_cute_sm120<Traits, TmaQ, TmaK,
-                                                         TmaV, TmaO, 1, 0>);
+    launch_variant(
+        split_d_m4n2_fwd_cute_sm120<Traits, TmaQ, TmaK, TmaV, TmaO, 1, 0>);
   } else if (has_dropout) {
-    launch_variant(ffpa_attn_split_d_m4n2_fwd_cute_sm120<Traits, TmaQ, TmaK,
-                                                         TmaV, TmaO, 0, 1>);
+    launch_variant(
+        split_d_m4n2_fwd_cute_sm120<Traits, TmaQ, TmaK, TmaV, TmaO, 0, 1>);
   } else {
-    launch_variant(ffpa_attn_split_d_m4n2_fwd_cute_sm120<Traits, TmaQ, TmaK,
-                                                         TmaV, TmaO, 0, 0>);
+    launch_variant(
+        split_d_m4n2_fwd_cute_sm120<Traits, TmaQ, TmaK, TmaV, TmaO, 0, 0>);
   }
 }
 
 template <typename kDataType, const int kHeadDim, const int kStage>
-void launch_ffpa_attn_persist_d_ws_fwd_cute_sm120(
-    torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O,
-    torch::Tensor attn_bias, torch::Tensor softmax_lse, int causal,
-    double softmax_scale, double dropout_p, int64_t philox_seed,
-    int64_t philox_offset) {
+void launch_cute_fwd_persist_d_sm120(torch::Tensor Q, torch::Tensor K,
+                                     torch::Tensor V, torch::Tensor O,
+                                     torch::Tensor attn_bias,
+                                     torch::Tensor softmax_lse, int causal,
+                                     double softmax_scale, double dropout_p,
+                                     int64_t philox_seed,
+                                     int64_t philox_offset) {
   using namespace cute;
 
   // WS consumer is fixed 256T (8 warps); TiledMma must be 8 warps -> kBr=128.
@@ -465,33 +470,35 @@ void launch_ffpa_attn_persist_d_ws_fwd_cute_sm120(
   using TmaV = decltype(tma_v);
   using TmaO = decltype(tma_o);
   if (has_attn_bias && has_dropout) {
-    launch_variant(ffpa_attn_persist_d_ws_fwd_cute_sm120<Traits, TmaQ, TmaK,
-                                                         TmaV, TmaO, 1, 1>);
+    launch_variant(
+        persist_d_ws_fwd_cute_sm120<Traits, TmaQ, TmaK, TmaV, TmaO, 1, 1>);
   } else if (has_attn_bias) {
-    launch_variant(ffpa_attn_persist_d_ws_fwd_cute_sm120<Traits, TmaQ, TmaK,
-                                                         TmaV, TmaO, 1, 0>);
+    launch_variant(
+        persist_d_ws_fwd_cute_sm120<Traits, TmaQ, TmaK, TmaV, TmaO, 1, 0>);
   } else if (has_dropout) {
-    launch_variant(ffpa_attn_persist_d_ws_fwd_cute_sm120<Traits, TmaQ, TmaK,
-                                                         TmaV, TmaO, 0, 1>);
+    launch_variant(
+        persist_d_ws_fwd_cute_sm120<Traits, TmaQ, TmaK, TmaV, TmaO, 0, 1>);
   } else {
-    launch_variant(ffpa_attn_persist_d_ws_fwd_cute_sm120<Traits, TmaQ, TmaK,
-                                                         TmaV, TmaO, 0, 0>);
+    launch_variant(
+        persist_d_ws_fwd_cute_sm120<Traits, TmaQ, TmaK, TmaV, TmaO, 0, 0>);
   }
 }
 
 template <typename kDataType, const int kHeadDim, const int kStage>
-void launch_ffpa_attn_split_d_ws_fwd_cute_sm120(
-    torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O,
-    torch::Tensor attn_bias, torch::Tensor softmax_lse, int causal,
-    double softmax_scale, double dropout_p, int64_t philox_seed,
-    int64_t philox_offset) {
+void launch_cute_fwd_split_d_ws_sm120(torch::Tensor Q, torch::Tensor K,
+                                      torch::Tensor V, torch::Tensor O,
+                                      torch::Tensor attn_bias,
+                                      torch::Tensor softmax_lse, int causal,
+                                      double softmax_scale, double dropout_p,
+                                      int64_t philox_seed,
+                                      int64_t philox_offset) {
   using namespace cute;
 
   // WS split-D reuses FFPAAttnCuTeSplitDTraits (FA-2 split-Q M8N1: 8 warps
   // along M, 1 along N), identical to the non-WS split-D consumer (kBr=128).
   // The WS layer only adds a 128-thread TMA producer warpgroup; the consumer
   // MMA layout is the same proven M8N1 used by
-  // ffpa_attn_split_d_fwd_cute_sm120.
+  // split_d_fwd_cute_sm120.
   constexpr int kBr = 128;
   constexpr int kBc = 64;
   constexpr int kQKDChunk = 32;
@@ -616,30 +623,29 @@ void launch_ffpa_attn_split_d_ws_fwd_cute_sm120(
   using TmaV = decltype(tma_v);
   using TmaO = decltype(tma_o);
   if (has_attn_bias && has_dropout) {
-    launch_variant(ffpa_attn_split_d_ws_fwd_cute_sm120<Traits, TmaQ, TmaK, TmaV,
-                                                       TmaO, 1, 1>);
+    launch_variant(
+        split_d_ws_fwd_cute_sm120<Traits, TmaQ, TmaK, TmaV, TmaO, 1, 1>);
   } else if (has_attn_bias) {
-    launch_variant(ffpa_attn_split_d_ws_fwd_cute_sm120<Traits, TmaQ, TmaK, TmaV,
-                                                       TmaO, 1, 0>);
+    launch_variant(
+        split_d_ws_fwd_cute_sm120<Traits, TmaQ, TmaK, TmaV, TmaO, 1, 0>);
   } else if (has_dropout) {
-    launch_variant(ffpa_attn_split_d_ws_fwd_cute_sm120<Traits, TmaQ, TmaK, TmaV,
-                                                       TmaO, 0, 1>);
+    launch_variant(
+        split_d_ws_fwd_cute_sm120<Traits, TmaQ, TmaK, TmaV, TmaO, 0, 1>);
   } else {
-    launch_variant(ffpa_attn_split_d_ws_fwd_cute_sm120<Traits, TmaQ, TmaK, TmaV,
-                                                       TmaO, 0, 0>);
+    launch_variant(
+        split_d_ws_fwd_cute_sm120<Traits, TmaQ, TmaK, TmaV, TmaO, 0, 0>);
   }
 }
 #endif  // ENABLE_FFPA_TMA_EXT
 
 template <typename kDataType, const int kHeadDim, const int kStage,
           const int kQKDChunk, const int kVDChunk>
-void launch_ffpa_attn_split_d_fwd_cute(torch::Tensor Q, torch::Tensor K,
-                                       torch::Tensor V, torch::Tensor O,
-                                       torch::Tensor attn_bias,
-                                       torch::Tensor softmax_lse, int causal,
-                                       double softmax_scale, double dropout_p,
-                                       int64_t philox_seed,
-                                       int64_t philox_offset) {
+void launch_cute_fwd_split_d_sm80(torch::Tensor Q, torch::Tensor K,
+                                  torch::Tensor V, torch::Tensor O,
+                                  torch::Tensor attn_bias,
+                                  torch::Tensor softmax_lse, int causal,
+                                  double softmax_scale, double dropout_p,
+                                  int64_t philox_seed, int64_t philox_offset) {
   using namespace cute;
 
   constexpr int kBr = 128;
@@ -749,17 +755,13 @@ void launch_ffpa_attn_split_d_fwd_cute(torch::Tensor Q, torch::Tensor K,
   };
 
   if (has_attn_bias && has_dropout) {
-    launch_variant(
-        ffpa_attn_split_d_fwd_cute<Traits, kStagesQK, kStagesPV, 1, 1>);
+    launch_variant(split_d_fwd_cute_sm80<Traits, kStagesQK, kStagesPV, 1, 1>);
   } else if (has_attn_bias) {
-    launch_variant(
-        ffpa_attn_split_d_fwd_cute<Traits, kStagesQK, kStagesPV, 1, 0>);
+    launch_variant(split_d_fwd_cute_sm80<Traits, kStagesQK, kStagesPV, 1, 0>);
   } else if (has_dropout) {
-    launch_variant(
-        ffpa_attn_split_d_fwd_cute<Traits, kStagesQK, kStagesPV, 0, 1>);
+    launch_variant(split_d_fwd_cute_sm80<Traits, kStagesQK, kStagesPV, 0, 1>);
   } else {
-    launch_variant(
-        ffpa_attn_split_d_fwd_cute<Traits, kStagesQK, kStagesPV, 0, 0>);
+    launch_variant(split_d_fwd_cute_sm80<Traits, kStagesQK, kStagesPV, 0, 0>);
   }
 }
 #endif  // ENABLE_FFPA_CUTE_EXT

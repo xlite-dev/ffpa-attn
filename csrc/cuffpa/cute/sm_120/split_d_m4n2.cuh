@@ -1,5 +1,7 @@
 #pragma once
 
+// tensor.hpp MUST precede any cute/atom/* header (see sm_80/split_d.cuh).
+#include <cute/tensor.hpp>
 #include <cute/atom/copy_traits_sm90_tma.hpp>
 #include <cutlass/arch/barrier.h>
 #include <cutlass/arch/reg_reconfig.h>
@@ -7,17 +9,17 @@
 #include <cutlass/device_kernel.h>
 
 // namespace ffpa_cute
-#include "cute/gemm.cuh"
-#include "cute/attn_traits.cuh"
-#include "cute/attn_bias.cuh"
-#include "cute/dropout.cuh"
-#include "cute/softmax.cuh"
+#include "../gemm.cuh"
+#include "../attn_traits.cuh"
+#include "../attn_bias.cuh"
+#include "../dropout.cuh"
+#include "../softmax.cuh"
 
 using TmaBarrier = cutlass::arch::ClusterTransactionBarrier;
 using CtaBarrier = cutlass::arch::ClusterBarrier;
 
 // O regs = D/4 per thread.
-// Key differences from ffpa_attn_split_d_fwd_cute_sm120 (M8N1):
+// Key differences from split_d_fwd_cute_sm120 (M8N1):
 //   1. atom_layout=(4,2,1): 2 N-warps split Bc/kVDChunk columns
 //   2. Softmax: cross-N-warp reduction via SMEM exchange (2 syncs)
 //   3. P→PV: SMEM roundtrip (stmatrix→LDSM_N) instead of register reinterpret
@@ -43,7 +45,7 @@ using CtaBarrier = cutlass::arch::ClusterBarrier;
 template <typename Traits, typename TmaQ, typename TmaK, typename TmaV,
           typename TmaO, int kHasAttnBias = 0, int kHasDropout = 0>
 __global__ void __launch_bounds__(Traits::kNumThreads, 1)
-    ffpa_attn_split_d_m4n2_fwd_cute_sm120(
+    split_d_m4n2_fwd_cute_sm120(
         CUTLASS_GRID_CONSTANT TmaQ const tma_q,
         CUTLASS_GRID_CONSTANT TmaK const tma_k,
         CUTLASS_GRID_CONSTANT TmaV const tma_v,

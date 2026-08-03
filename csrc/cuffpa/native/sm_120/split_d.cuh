@@ -1,9 +1,9 @@
 #pragma once
-#include "native/prefill.cuh"  // ffpa::prefill
-#include "native/tma.cuh"      // ffpa::tma
+#include "../prefill.cuh"  // ffpa::prefill
+#include "../tma.cuh"      // ffpa::tma
 
 // ============================================================================
-// ffpa_attn_split_d_fwd_template_sm120
+// split_d_fwd_sm120
 // ----------------------------------------------------------------------------
 // SM120a (Blackwell) TMA + MMA variant of the split-D prefill attention
 // kernel. Supports two execution modes controlled by ``kNonWS``:
@@ -62,7 +62,7 @@ template <typename kDataType, const int kHeadDim, const int kMmaAtomM,
 __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK +
                                       (kNonWS ? 0 : kProducerThreads),
                                   1)
-    ffpa_attn_split_d_fwd_template_sm120(
+    split_d_fwd_sm120(
         const CUtensorMap* __restrict__ tma_q,
         const CUtensorMap* __restrict__ tma_k,
         const CUtensorMap* __restrict__ tma_v, kDataType* __restrict__ O,
