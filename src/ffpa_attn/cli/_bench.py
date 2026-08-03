@@ -710,7 +710,7 @@ def _forward_section_label(
   if fallback:
     return "Fallback hard-coded data"
   if backend == "cuda":
-    return "Legacy CUDA"
+    return "CUDA"
   if backend == CUTEDSL_BACKEND:
     return CUTEDSL_SECTION_LABEL
   if tune_mode is not None:

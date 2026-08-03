@@ -1,8 +1,8 @@
 #pragma once
-#include "prefill.cuh"  // ffpa::prefill
+#include "../prefill.cuh"  // ffpa::prefill
 
 // ============================================================================
-// ffpa_attn_split_d_fwd_template
+// split_d_fwd_sm80
 // ----------------------------------------------------------------------------
 // Split-Q (FlashAttention-2) prefill attention kernel tuned for *large* head
 // dimensions (D > ~128). Each thread block owns a fixed slice of Q rows
@@ -94,7 +94,7 @@ template <typename kDataType, const int kHeadDim, const int kMmaAtomM,
           const int kStageQK, const int kStagePV, const int kPadQ,
           const int kPadK, const int kPadV>
 __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
-    ffpa_attn_split_d_fwd_template(
+    split_d_fwd_sm80(
         const kDataType* __restrict__ Q, const kDataType* __restrict__ K,
         const kDataType* __restrict__ V, kDataType* __restrict__ O,
         float* __restrict__ softmax_lse, const int Nq, const int Nkv,

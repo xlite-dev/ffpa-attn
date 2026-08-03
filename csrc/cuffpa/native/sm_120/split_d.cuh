@@ -1,9 +1,9 @@
 #pragma once
-#include "prefill.cuh"  // ffpa::prefill
-#include "tma.cuh"      // ffpa::tma
+#include "../prefill.cuh"  // ffpa::prefill
+#include "../tma.cuh"      // ffpa::tma
 
 // ============================================================================
-// ffpa_attn_split_d_fwd_template_sm120
+// split_d_fwd_sm120
 // ----------------------------------------------------------------------------
 // SM120a (Blackwell) TMA + MMA variant of the split-D prefill attention
 // kernel. Supports two execution modes controlled by ``kNonWS``:
@@ -62,7 +62,7 @@ template <typename kDataType, const int kHeadDim, const int kMmaAtomM,
 __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK +
                                       (kNonWS ? 0 : kProducerThreads),
                                   1)
-    ffpa_attn_split_d_fwd_template_sm120(
+    split_d_fwd_sm120(
         const CUtensorMap* __restrict__ tma_q,
         const CUtensorMap* __restrict__ tma_k,
         const CUtensorMap* __restrict__ tma_v, kDataType* __restrict__ O,
@@ -74,6 +74,15 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK +
         const long long attn_bias_stride_n, const float dropout_p,
         const unsigned long long philox_seed,
         const unsigned long long philox_offset) {
+  // Body-level arch guard: TMA instructions require sm>=90, but in mixed
+  // -gencode builds the sm_89 device pass still compiles this TU; the guard
+  // compiles the body into a no-op stub there. Body-level (not file-level)
+  // is required because the host launcher references this kernel via <<<>>>
+  // and nvcc must see the declaration in every device pass; hiding it
+  // file-level fails with "identifier undefined". Runtime safety: launch.cuh
+  // dispatches TMA kernels only when prop->major >= 9, so pre-90 devices
+  // never execute the stub.
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
   static_assert(kMmaAtomM == 16 && kMmaAtomN == 8 && kMmaAtomK == 16);
   static_assert(kValTileSeqLenQ == 1 && kValTileSeqLenP == 1);
   constexpr int Br = kMmaAtomM * kMmaTileSeqLenQ * kValTileSeqLenQ;
@@ -637,4 +646,5 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK +
   ffpa::prefill::sync_store_lse_r2g<Br, kMmaAtomM, kValTileSeqLenQ>(
       softmax_lse, softmax_lse_offset, Q_tile_id, warp_QP,
       &lane_block_row_max_old[0][0], &lane_block_row_sum_old[0][0], Nq);
+#endif  // defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
 }

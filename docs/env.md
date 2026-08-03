@@ -20,6 +20,25 @@ These are read once during `pip install .` / `python setup.py build_ext` and dec
 
 These only affect the ccache-based fast-build wrapper.
 
+The wrapper also accepts CLI flags that map onto the variables below (flags override same-named env vars; unknown args pass through to `setup.py build_ext` / `pip install -e`):
+
+```bash
+# cuda impl + cute + tma, editable install, all headdims, 32 jobs
+bash tools/build_fast.sh --arch sm_120f --ext all --editable --headdim all --jobs 32
+# equivalent env-var form:
+FFPA_BUILD_ARCH=sm_120f ENABLE_FFPA_CUDA_IMPL=1 ENABLE_FFPA_CUTE_EXT=1 \
+ENABLE_FFPA_TMA_EXT=1 FFPA_EDITABLE=1 MAX_JOBS=32 bash tools/build_fast.sh
+```
+
+| flag | maps to |
+|---|---|
+| `--arch <spec>` | `FFPA_BUILD_ARCH`; full names (`sm_120f`, `sm_89`), short forms (`120f`) or aliases; comma-separate or repeat the flag for multiple archs |
+| `--ext all\|none\|<csv of cuda,cute,tma>` | `ENABLE_FFPA_CUDA_IMPL` / `ENABLE_FFPA_CUTE_EXT` / `ENABLE_FFPA_TMA_EXT`; `all` sets all three; default when omitted: `ENABLE_FFPA_CUDA_IMPL=1`. TMA auto-disables when every target arch is sm<90 |
+| `--headdim all\|<list>` | `FFPA_DEV_HEADDIMS`; `all` (or omitting the flag) builds the full headdim set |
+| `--editable` / `--clean` / `--shm` | `FFPA_EDITABLE` / `FFPA_CLEAN` / `FFPA_BUILD_IN_SHM` |
+| `-j, --jobs N` / `--nvcc-threads N` / `--ptxas-verbose` | `MAX_JOBS` / `FFPA_NVCC_THREADS` / `FFPA_PTXAS_VERBOSE` |
+| `--dry-run` / `-h, --help` | print resolved env + command and exit before side effects / show usage |
+
 - <span style="color:#c77dff;">FFPA_CLEAN</span>, default `0`, When `1`, removes `build/`, `dist/`, `ffpa_attn.egg-info/`, compiled `*.so`, and generated `csrc/cuffpa/generated/*.{cu,h}` before rebuilding.
 - <span style="color:#c77dff;">FFPA_BUILD_IN_SHM</span>, default `0`, When `1`, symlinks `build/` into `/dev/shm/ffpa-build-$USER` (tmpfs) for IO-bound machines.
 - <span style="color:#c77dff;">CCACHE_MAXSIZE</span>, default `20G`, Cap of the ccache storage used by the nvcc shim.

@@ -42,7 +42,7 @@ struct SelectSmemAtom<16, Element> {
 template <int kHeadDim_, int kBr_ = 64, int kBc_ = 64, int kQKDChunk_ = 64,
           int kVDChunk_ = 64, int kStagesQK_ = 2, int kStagesPV_ = 2,
           typename Element_ = cutlass::half_t>
-struct FFPAAttnCuTeTraits {
+struct FFPAAttnCuTeSplitDTraits {
   static_assert(kHeadDim_ % kQKDChunk_ == 0);
   static_assert(kHeadDim_ % kVDChunk_ == 0);
   static_assert(kQKDChunk_ == 16 || kQKDChunk_ == 32 || kQKDChunk_ == 64);
@@ -154,8 +154,8 @@ struct FFPAAttnCuTePersistDTraits {
   using SmemCopyAtomTransposed = Copy_Atom<SM75_U16x8_LDSM_T, Element>;
 };
 
-// WS split-D reuses FFPAAttnCuTeTraits directly (FA-2 split-Q M8N1, same as
-// non-WS split-D): the WS layer is a pure producer/consumer split on top of
+// WS split-D reuses FFPAAttnCuTeSplitDTraits directly (FA-2 split-Q M8N1, same
+// as non-WS split-D): the WS layer is a pure producer/consumer split on top of
 // the unchanged consumer MMA layout.
 
 // Split-D + M4N2 traits: kBr=64, 8 warps (4M×2N), O regs = D/4 per thread.

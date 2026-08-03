@@ -1,8 +1,8 @@
 #pragma once
 
 // Project-wide numeric constants shared across cuffpa kernels. Centralized
-// here so the softmax / rescale helpers (prefill.cuh) and the CuTe TMA kernel
-// (cute/fwd_sm120.cuh) share a single source of truth. Add further
+// here so the softmax / rescale helpers (native/prefill.cuh) and the CuTe TMA
+// kernel (cute/sm_120/split_d.cuh) share a single source of truth. Add further
 // shared macros / constants here as needed.
 
 // exp2f softmax optimization: expf(x) == exp2f(x * FFPA_M_LOG2E).

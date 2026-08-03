@@ -1,8 +1,8 @@
 #pragma once
-#include "prefill.cuh"  // ffpa::prefill
+#include "../prefill.cuh"  // ffpa::prefill
 
 // ============================================================================
-// ffpa_attn_split_kv_decode_stage1_template, faster for Nq=1, pure GEMV dot.
+// split_kv_decode_s1_fwd_sm80, faster for Nq=1, pure GEMV dot.
 // ----------------------------------------------------------------------------
 // Decode-only stage1 kernel for the large-d CUDA path. Each block owns one
 // `(batch, q_head, kv_split)` tuple and processes all query rows for that head
@@ -23,12 +23,14 @@ template <typename kDataType, const int kHeadDim, const bool kUseGemv,
           const int kStage = 2>
 __global__ void __launch_bounds__(((kHeadDim / 8 + WARP_SIZE - 1) / WARP_SIZE) *
                                   WARP_SIZE)
-    ffpa_attn_split_kv_decode_stage1_template(
-        const kDataType* __restrict__ Q, const kDataType* __restrict__ K,
-        const kDataType* __restrict__ V, float* __restrict__ partial_out,
-        float* __restrict__ chunk_lse, const int Nq, const int Nkv,
-        const int Nh, const int Nh_kv, const float scale, const int num_splits,
-        const int split_size, const int causal) {
+    split_kv_decode_s1_fwd_sm80(const kDataType* __restrict__ Q,
+                                const kDataType* __restrict__ K,
+                                const kDataType* __restrict__ V,
+                                float* __restrict__ partial_out,
+                                float* __restrict__ chunk_lse, const int Nq,
+                                const int Nkv, const int Nh, const int Nh_kv,
+                                const float scale, const int num_splits,
+                                const int split_size, const int causal) {
   using Traits = ffpa::DtypeTraits<kDataType>;
   constexpr int kElemsPerThread = 8;
   static_assert(kHeadDim % kElemsPerThread == 0,
@@ -318,7 +320,7 @@ __global__ void __launch_bounds__(((kHeadDim / 8 + WARP_SIZE - 1) / WARP_SIZE) *
 }
 
 // ============================================================================
-// ffpa_attn_split_kv_decode_stage2_template
+// split_kv_decode_s2_fwd_sm80
 // ----------------------------------------------------------------------------
 // Combine per-split partial outputs from stage1 into the final output / LSE.
 // Each block handles one `(batch, q_head, row)` tuple and reduces over the
@@ -327,11 +329,11 @@ __global__ void __launch_bounds__(((kHeadDim / 8 + WARP_SIZE - 1) / WARP_SIZE) *
 template <typename kDataType, const int kHeadDim>
 __global__ void __launch_bounds__(((kHeadDim / 8 + WARP_SIZE - 1) / WARP_SIZE) *
                                   WARP_SIZE)
-    ffpa_attn_split_kv_decode_stage2_template(
-        const float* __restrict__ partial_out,
-        const float* __restrict__ chunk_lse, kDataType* __restrict__ O,
-        float* __restrict__ softmax_lse, const int Nq, const int Nh,
-        const int num_splits) {
+    split_kv_decode_s2_fwd_sm80(const float* __restrict__ partial_out,
+                                const float* __restrict__ chunk_lse,
+                                kDataType* __restrict__ O,
+                                float* __restrict__ softmax_lse, const int Nq,
+                                const int Nh, const int num_splits) {
   using Traits = ffpa::DtypeTraits<kDataType>;
   constexpr int kNumActiveThreads = kHeadDim / 8;
   constexpr int kNumThreads =
