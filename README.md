@@ -1,6 +1,6 @@
 <div align="center">
   <p align="center">
-    <h2>🤖FFPA: Fast and Memory-Efficient Exact Attention for Large Headdim</h2>
+    <h2>Fast and Memory-Efficient Exact Attention for Large Headdim</h2>
     <img src=https://img.shields.io/badge/language-CUDA/Python-brightgreen.svg >
     <a href="https://pepy.tech/projects/ffpa-attn"><img src=https://static.pepy.tech/personalized-badge/ffpa-attn?period=total&units=ABBREVIATION&left_color=GRAY&right_color=BLUE&left_text=downloads/pypi ></a>
     <a href="https://pypi.org/project/ffpa-attn/"><img src=https://img.shields.io/github/release/xlite-dev/ffpa-attn.svg?color=GREEN ></a>
@@ -9,7 +9,7 @@
     <img src="docs/assets/ffpa-api.png" width="700px">
 </div>
 
-**FFPA**: Fast and Memory-Efficient Exact Attention for Large Headdim, achieving **O(1)** SRAM complexity and **O(d/4)** register complexity, **1.5x~6x** 🎉 speedup over standard PyTorch SDPA. FFPA extends the headdim support beyond **D>256**, up to **1024** without any precision loss.
+**FFPA**: Fast and Memory-Efficient Exact Attention for **Large Headdim**, achieving **O(1)** SRAM complexity and **O(d/4)** register complexity, **1.5x~6x** 🎉 speedup over standard PyTorch SDPA. FFPA extends the headdim support beyond **D > 256** (up to **1024**) without any precision loss.
 
 <div align='center' markdown="1">
 
