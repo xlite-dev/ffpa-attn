@@ -1,6 +1,6 @@
 <div align="center">
   <p align="center">
-    <h2>🤖FFPA: Kernel Library for Large Headdim Attention</h2>
+    <h2>🤖FFPA: Fast and Memory-Efficient Exact Attention for Large Headdim</h2>
     <img src=https://img.shields.io/badge/language-CUDA/Python-brightgreen.svg >
     <a href="https://pepy.tech/projects/ffpa-attn"><img src=https://static.pepy.tech/personalized-badge/ffpa-attn?period=total&units=ABBREVIATION&left_color=GRAY&right_color=BLUE&left_text=downloads/pypi ></a>
     <a href="https://pypi.org/project/ffpa-attn/"><img src=https://img.shields.io/github/release/xlite-dev/ffpa-attn.svg?color=GREEN ></a>
@@ -9,7 +9,7 @@
     <img src="docs/assets/ffpa-api.png" width="700px">
 </div>
 
-**FFPA**: A production-ready **Kernel Library** with **Split-D** strategy for **Large Headdim Attention**, achieve **O(1)** SRAM complexity and **O(d/2)** register complexity, **1.5x~6x** 🎉 speedup over standard PyTorch SDPA.
+**FFPA**: Fast and Memory-Efficient Exact Attention for Large Headdim, achieving **O(1)** SRAM complexity and **O(d/4)** register complexity, **1.5x~6x** 🎉 speedup over standard PyTorch SDPA. FFPA extends the headdim support beyond **D>256**, up to **1024** without any precision loss.
 
 <div align='center' markdown="1">
 
@@ -21,7 +21,7 @@
 
 ## 🎉 Latest News
 
-- [2026-06-10] DefTruth, Butterfingrz (2026), [FFPA: Kernel Library for Large Headdim Attention](https://doi.org/10.5281/zenodo.20638547). 🎉🎉🎉
+- [2026-06-10] DefTruth, Butterfingrz (2026), [FFPA: Fast and Memory-Efficient Exact Attention for Large Headdim](https://doi.org/10.5281/zenodo.20638547). 🎉🎉🎉
 
 ## 📖 Quick Start
 
@@ -30,7 +30,7 @@
 First, install the prebuilt package from [PyPI](https://pypi.org/project/ffpa-attn/) or build [ffpa-attn](https://github.com/xlite-dev/ffpa-attn) from source:
 
 ```bash
-# Fisrt, install the prebuilt package from PyPI
+# First, install the prebuilt package from PyPI
 pip3 install -U ffpa-attn # CUDA 13.0+, PyTorch 2.11+
 # Or, build ffpa-attn from source, just follow the cmds
 git clone https://github.com/xlite-dev/ffpa-attn.git
@@ -87,11 +87,11 @@ FFPA supports multiple backends for the forward and backward pass, including: [`
 
 |Backend|Arch|Fwd|Bwd|Headdim|Autotune|Speedup|Recommend|
 |:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-|SDPA|sm>=75|✔|✔|All|❌|**1.0x**🤗|sm>=75|
-|CUDA|sm>=80|✔|❌|320~1024|❌|**1.5x~3x**🎉|sm_80~89,120a|
+|SDPA|sm>=75|✔|✔|All|✖️|**1.0x**🤗|sm>=75|
+|CUDA|sm>=80|✔|✖️|320~1024|✖️|**1.5x~3x**🎉|sm_80~89,120{a,f}|
 |Triton|sm>=80|✔|✔|320~1024|✔|**1.5x~5x**🎉|sm>=80|
-|CuTe-DSL|sm>=80|✔|✔|320~1024|❌|**1.5x~2x**🎉|sm_80~89,120a|
-|CuTe-DSL|sm_90a|✔|✔|320~512|❌|**3x~6x**🎉|sm_90a|
+|CuTe-DSL|sm>=80|✔|✔|320~1024|✖️|**1.5x~2x**🎉|sm_80~89,120{a,f}|
+|CuTe-DSL|sm_90a|✔|✔|320~512|✖️|**3x~6x**🎉|sm_90a|
 
 </div>
 
@@ -135,7 +135,7 @@ Apache License 2.0
 ```BibTeX
 @misc{deftruth2026ffpa,
   author       = {DefTruth and Butterfingrz},
-  title        = {FFPA: Kernel Library for Large Headdim Attention},
+  title        = {FFPA: Fast and Memory-Efficient Exact Attention for Large Headdim},
   year         = {2026},
   publisher    = {Zenodo},
   version      = {v1.0},

@@ -5,7 +5,7 @@ dynamic = ["version"]
 requires-python = ">=3.10"
 authors = [{name = "DefTruth, Butterfingrz"}]
 maintainers = [{name = "DefTruth, Butterfingrz"}]
-description = "🤖FFPA: Kernel Library for Large Headdim Attention."
+description = "🤖FFPA: Fast and Memory-Efficient Exact Attention for Large Headdim."
 readme = "README.md"
 license = {text = "Apache-2.0"}
 
