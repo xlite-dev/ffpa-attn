@@ -17,8 +17,8 @@
 #endif
 using namespace ffpa;
 
-static constexpr int kMaxDForOStoreFloat32 = 512;
-// for D up to 512; Use fp16/bf16 for D > 512 to save registers, since
+static constexpr int kMaxDForOStoreFloat32 = 1024;
+// Use fp16/bf16 for D > 1024 to save registers, since
 
 static inline int select_decode_num_splits(int batch_nheads_mblocks,
                                            int num_sms, int num_n_blocks,
@@ -892,8 +892,9 @@ void launch_ffpa_attn_split_d_fwd_cute_sm120(
   using CuteElement = std::conditional_t<std::is_same_v<kDataType, __half>,
                                          cutlass::half_t, cutlass::bfloat16_t>;
   using Traits =
-      ffpa_cute::FFPAAttnCuTeTraits<kHeadDim, kBr, kBc, kQKDChunk, kVDChunk,
-                                    kStagesQK, kStagesPV, CuteElement>;
+      ffpa_cute::FFPAAttnCuTeSplitDTraits<kHeadDim, kBr, kBc, kQKDChunk,
+                                          kVDChunk, kStagesQK, kStagesPV,
+                                          CuteElement>;
   using SmemLayoutQ = typename Traits::SmemLayoutQ;
   using SmemLayoutK = typename Traits::SmemLayoutK;
   using SmemLayoutV = typename Traits::SmemLayoutV;
@@ -1346,10 +1347,11 @@ void launch_ffpa_attn_split_d_ws_fwd_cute_sm120(
     int64_t philox_offset) {
   using namespace cute;
 
-  // WS split-D reuses FFPAAttnCuTeTraits (FA-2 split-Q M8N1: 8 warps along M,
-  // 1 along N), identical to the non-WS split-D consumer (kBr=128). The WS
-  // layer only adds a 128-thread TMA producer warpgroup; the consumer MMA
-  // layout is the same proven M8N1 used by ffpa_attn_split_d_fwd_cute_sm120.
+  // WS split-D reuses FFPAAttnCuTeSplitDTraits (FA-2 split-Q M8N1: 8 warps
+  // along M, 1 along N), identical to the non-WS split-D consumer (kBr=128).
+  // The WS layer only adds a 128-thread TMA producer warpgroup; the consumer
+  // MMA layout is the same proven M8N1 used by
+  // ffpa_attn_split_d_fwd_cute_sm120.
   constexpr int kBr = 128;
   constexpr int kBc = 64;
   constexpr int kQKDChunk = 32;
@@ -1369,8 +1371,9 @@ void launch_ffpa_attn_split_d_ws_fwd_cute_sm120(
   using CuteElement = std::conditional_t<std::is_same_v<kDataType, __half>,
                                          cutlass::half_t, cutlass::bfloat16_t>;
   using Traits =
-      ffpa_cute::FFPAAttnCuTeTraits<kHeadDim, kBr, kBc, kQKDChunk, kVDChunk,
-                                    kStagesQK, kStagesPV, CuteElement>;
+      ffpa_cute::FFPAAttnCuTeSplitDTraits<kHeadDim, kBr, kBc, kQKDChunk,
+                                          kVDChunk, kStagesQK, kStagesPV,
+                                          CuteElement>;
   using SmemLayoutQ = typename Traits::SmemLayoutQ;
   using SmemLayoutK = typename Traits::SmemLayoutK;
   using SmemLayoutV = typename Traits::SmemLayoutV;
@@ -1508,8 +1511,9 @@ void launch_ffpa_attn_split_d_fwd_cute(torch::Tensor Q, torch::Tensor K,
   constexpr int kStagesQK = kStage;
   constexpr int kStagesPV = kStagesQK;
   using Traits =
-      ffpa_cute::FFPAAttnCuTeTraits<kHeadDim, kBr, kBc, kQKDChunk, kVDChunk,
-                                    kStagesQK, kStagesPV, CuteElement>;
+      ffpa_cute::FFPAAttnCuTeSplitDTraits<kHeadDim, kBr, kBc, kQKDChunk,
+                                          kVDChunk, kStagesQK, kStagesPV,
+                                          CuteElement>;
 
   constexpr int kQTileBytes = kBr * kQKDChunk * sizeof(CuteElement);
   constexpr int kKTileBytes = kBc * kQKDChunk * sizeof(CuteElement);

@@ -1186,13 +1186,14 @@ __global__ void __launch_bounds__(384, 1) ffpa_attn_persist_d_ws_fwd_cute_sm120(
 
 // WS split-D: 128 producer (TMA-only) + 256 consumer (MMA-only), 384 threads.
 // Same D-chunked QK/PV algorithm and SAME consumer MMA layout (FA-2 split-Q
-// M8N1 via FFPAAttnCuTeTraits, kBr=128) as ffpa_attn_split_d_fwd_cute_sm120;
-// the only difference is a dedicated 128-thread TMA producer warpgroup.
-// Register strategy: consumer reuses the non-WS M8N1 layout (256 threads);
-// setmaxnreg (sm_120f) gated to kHeadDim >= 512.
-// Epilogue: batched R->S->TMA store (aligned) or R->G (tail); a __syncthreads
-// would deadlock since the producer warpgroup has already fallen through the
-// early-return below, so sync with a named barrier (consumer threads only).
+// M8N1 via FFPAAttnCuTeSplitDTraits, kBr=128) as
+// ffpa_attn_split_d_fwd_cute_sm120; the only difference is a dedicated
+// 128-thread TMA producer warpgroup. Register strategy: consumer reuses the
+// non-WS M8N1 layout (256 threads); setmaxnreg (sm_120f) gated to kHeadDim >=
+// 512. Epilogue: batched R->S->TMA store (aligned) or R->G (tail); a
+// __syncthreads would deadlock since the producer warpgroup has already fallen
+// through the early-return below, so sync with a named barrier (consumer
+// threads only).
 template <typename Traits, typename TmaQ, typename TmaK, typename TmaV,
           typename TmaO, int kHasAttnBias = 0, int kHasDropout = 0>
 __global__ void __launch_bounds__(384, 1) ffpa_attn_split_d_ws_fwd_cute_sm120(
