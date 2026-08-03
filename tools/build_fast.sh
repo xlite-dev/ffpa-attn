@@ -42,8 +42,9 @@ Flags (override same-named env vars; env reference: docs/env.md):
                          none   all off (Triton/CuTeDSL-python only build)
                          <csv>  subset of cuda,cute,tma (cute/tma imply cuda)
                        Default without --ext or env: ENABLE_FFPA_CUDA_IMPL=1.
-  --headdim <list|all> FFPA_DEV_HEADDIMS subset, e.g. 256,512; 'all' clears
-                       the subset and builds the full headdim set.
+                       TMA auto-disables when every target arch is sm<90.
+  --headdim <list|all> FFPA_DEV_HEADDIMS subset, e.g. 256,512; 'all' (or
+                       omitting the flag) builds the full headdim set.
   --editable           FFPA_EDITABLE=1: pip install -e instead of build_ext.
   -j, --jobs N         MAX_JOBS outer build parallelism (default min(nproc,32)).
   --clean              FFPA_CLEAN=1: rm build/, *.so, generated TUs first.
@@ -75,6 +76,7 @@ PASS_ARGS=()
 DRY_RUN=0
 ARCH_SET=0
 EXT_SET=0
+HEADDIM_SET=0
 EXT_CUDA=0
 EXT_CUTE=0
 EXT_TMA=0
@@ -110,6 +112,7 @@ while [[ $# -gt 0 ]]; do
       shift 2 ;;
     --headdim)
       require_value "$@"
+      HEADDIM_SET=1
       if [[ "${2,,}" == "all" ]]; then
         unset FFPA_DEV_HEADDIMS
       else
@@ -136,6 +139,11 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+# headdim omitted -> default to the full headdim set.
+if [[ "$HEADDIM_SET" == "0" ]]; then
+  unset FFPA_DEV_HEADDIMS
+fi
+
 # Resolve --ext into ENABLE_FFPA_* switches (cute/tma live inside the _C ext).
 if [[ "$EXT_SET" == "1" ]]; then
   if [[ "$EXT_CUTE" == "1" || "$EXT_TMA" == "1" ]]; then
@@ -156,6 +164,40 @@ elif [[ -z "${ENABLE_FFPA_CUDA_IMPL:-}" ]]; then
   elif [[ "${ENABLE_FFPA_TMA_EXT:-0}" == "1" || "${ENABLE_FFPA_CUTE_EXT:-0}" == "1" ]]; then
     echo "[build_fast] ENABLE_FFPA_CUTE_EXT/TMA_EXT set without ENABLE_FFPA_CUDA_IMPL; forcing ENABLE_FFPA_CUDA_IMPL=1"
     export ENABLE_FFPA_CUDA_IMPL=1
+  fi
+fi
+
+# TMA kernels need sm>=90 (native/tma.cuh is guarded by __CUDA_ARCH__>=900);
+# auto-disable ENABLE_FFPA_TMA_EXT when every target arch is below 90 so
+# `--ext all` stays valid on older GPUs.
+if [[ "${ENABLE_FFPA_TMA_EXT:-0}" == "1" ]]; then
+  _arch_raw="${FFPA_BUILD_ARCH:-}"
+  if [[ -z "$_arch_raw" ]] && command -v nvidia-smi >/dev/null 2>&1; then
+    _cc="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d ' .')"
+    [[ -n "${_cc:-}" ]] && _arch_raw="$_cc"
+  fi
+  _all_below_90=1
+  if [[ -n "$_arch_raw" ]]; then
+    IFS=',; ' read -r -a _arch_toks <<< "$_arch_raw"
+    for tok in "${_arch_toks[@]}"; do
+      tok="${tok,,}"
+      tok="${tok%+ptx}"
+      tok="${tok#sm_}"
+      tok="${tok#compute_}"
+      tok="${tok//./}"
+      case "$tok" in
+        maxwell) tok=50 ;; pascal) tok=60 ;; volta) tok=70 ;; turing) tok=75 ;;
+        ampere) tok=80 ;; ada) tok=89 ;; hopper) tok=90 ;;
+        blackwell) tok=100 ;; blackwell_geforce) tok=120 ;;
+      esac
+      num="${tok%%[!0-9]*}"
+      [[ -z "$num" ]] && continue
+      if (( 10#$num >= 90 )); then _all_below_90=0; break; fi
+    done
+  fi
+  if [[ -n "$_arch_raw" && "$_all_below_90" == "1" ]]; then
+    echo "[build_fast] all target archs are sm<90; disabling ENABLE_FFPA_TMA_EXT (TMA requires sm>=90)"
+    export ENABLE_FFPA_TMA_EXT=0
   fi
 fi
 
