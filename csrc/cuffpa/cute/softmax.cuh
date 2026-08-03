@@ -1,6 +1,7 @@
 #pragma once
 
-#include "prefill.cuh"
+#include "common.cuh"
+#include "../native/prefill.cuh"
 
 namespace ffpa_cute {
 

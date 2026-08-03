@@ -1,6 +1,6 @@
 #pragma once
-#include "prefill.cuh"  // ffpa::prefill
-#include "tma.cuh"      // ffpa::tma
+#include "native/prefill.cuh"  // ffpa::prefill
+#include "native/tma.cuh"      // ffpa::tma
 
 // ============================================================================
 // ffpa_attn_split_d_fwd_template_sm120

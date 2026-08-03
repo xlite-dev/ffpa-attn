@@ -1,17 +1,14 @@
 #pragma once
 
-#include "attn_traits.cuh"
-
 #include <cute/atom/copy_atom.hpp>
 #include <cute/tensor.hpp>
 #include <cutlass/cutlass.h>
 
-#include "common.cuh"
-#include "gemm.cuh"
-#include "attn_traits.cuh"
-#include "attn_bias.cuh"
-#include "dropout.cuh"
-#include "softmax.cuh"
+#include "../gemm.cuh"
+#include "../attn_traits.cuh"
+#include "../attn_bias.cuh"
+#include "../dropout.cuh"
+#include "../softmax.cuh"
 
 // Split-D Flash Attention forward (cp.async, sm_80+).
 // Same algorithm as the TMA version (fwd_sm120.cuh) but uses cooperative

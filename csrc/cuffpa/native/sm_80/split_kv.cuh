@@ -1,5 +1,5 @@
 #pragma once
-#include "prefill.cuh"  // ffpa::prefill
+#include "native/prefill.cuh"  // ffpa::prefill
 
 // ============================================================================
 // ffpa_attn_split_kv_decode_stage1_template, faster for Nq=1, pure GEMV dot.
