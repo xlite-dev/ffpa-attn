@@ -14,8 +14,6 @@
 #include "../softmax.cuh"
 
 // Split-D Flash Attention forward (cp.async, sm_80+).
-// Same algorithm as the TMA version (fwd_sm120.cuh) but uses cooperative
-// cp.async G2S (all 256 threads) instead of TMA (tid=0 only).
 template <typename Traits, int kStagesQK = 2, int kStagesPV = 2,
           int kHasAttnBias = 0, int kHasDropout = 0>
 __global__ void __launch_bounds__(Traits::kNumThreads, 1) split_d_fwd_cute_sm80(
