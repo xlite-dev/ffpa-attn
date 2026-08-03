@@ -623,17 +623,16 @@ void launch_cute_fwd_split_d_ws_sm120(torch::Tensor Q, torch::Tensor K,
 #endif  // ENABLE_FFPA_TMA_EXT
 
 template <typename kDataType, const int kHeadDim, const int kStage,
-          const int kQKDChunk, const int kVDChunk>
-void launch_cute_fwd_split_d_sm80(torch::Tensor Q, torch::Tensor K,
-                                  torch::Tensor V, torch::Tensor O,
-                                  torch::Tensor attn_bias,
-                                  torch::Tensor softmax_lse, int causal,
-                                  double softmax_scale, double dropout_p,
-                                  int64_t philox_seed, int64_t philox_offset) {
+          const int kBr, const int kBc, const int kQKDChunk, const int kVDChunk>
+void launch_cute_fwd_split_d_sm80_impl(torch::Tensor Q, torch::Tensor K,
+                                       torch::Tensor V, torch::Tensor O,
+                                       torch::Tensor attn_bias,
+                                       torch::Tensor softmax_lse, int causal,
+                                       double softmax_scale, double dropout_p,
+                                       int64_t philox_seed,
+                                       int64_t philox_offset) {
   using namespace cute;
 
-  constexpr int kBr = 128;
-  constexpr int kBc = 128;
   constexpr int kNumThreads = kBr / 16 * 32;
 
   using Element = std::conditional_t<std::is_same_v<kDataType, __half>,
@@ -744,6 +743,30 @@ void launch_cute_fwd_split_d_sm80(torch::Tensor Q, torch::Tensor K,
     launch_variant(split_d_fwd_cute_sm80<Traits, kStagesQK, kStagesPV, 0, 1>);
   } else {
     launch_variant(split_d_fwd_cute_sm80<Traits, kStagesQK, kStagesPV, 0, 0>);
+  }
+}
+
+template <typename kDataType, const int kHeadDim, const int kStage,
+          const int kQKDChunk, const int kVDChunk>
+void launch_cute_fwd_split_d_sm80(torch::Tensor Q, torch::Tensor K,
+                                  torch::Tensor V, torch::Tensor O,
+                                  torch::Tensor attn_bias,
+                                  torch::Tensor softmax_lse, int causal,
+                                  double softmax_scale, double dropout_p,
+                                  int64_t philox_seed, int64_t philox_offset) {
+  // __CUDA_ARCH__ is device-only; host launcher dispatches via runtime
+  // property.
+  const int dev_major = at::cuda::getCurrentDeviceProperties()->major;
+  if (dev_major >= 9) {
+    launch_cute_fwd_split_d_sm80_impl<kDataType, kHeadDim, kStage, 128, 128,
+                                      kQKDChunk, kVDChunk>(
+        Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale, dropout_p,
+        philox_seed, philox_offset);
+  } else {
+    launch_cute_fwd_split_d_sm80_impl<kDataType, kHeadDim, kStage, 64, 64,
+                                      kQKDChunk, kVDChunk>(
+        Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale, dropout_p,
+        philox_seed, philox_offset);
   }
 }
 #endif  // ENABLE_FFPA_CUTE_EXT
