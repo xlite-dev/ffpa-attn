@@ -25,17 +25,18 @@ void launch_cute_fwd_split_d_sm120(torch::Tensor Q, torch::Tensor K,
 
   constexpr int kBr = 128;
   constexpr int kBc = 128;
-  // stages=1 has a barrier-protocol race on sm_120a; clamp to >=2.
+  // stages=1: single-buffer makes producer TMA writes (async proxy) collide
+  // with consumer ldmatrix reads (generic proxy) on the same smem slot;
+  // CtaBarrier (async proxy) can't prove the generic-proxy read finished.
+  // Clamp >=2 so double-buffering keeps read/write addresses disjoint.
   constexpr int kStagesQK = (kStage < 2 ? 2 : (kStage > 3 ? 3 : kStage));
   constexpr int kStagesPV = kStagesQK;
   constexpr int kNumThreads = kBr / 16 * 32;
 
-  using CuteElement = std::conditional_t<std::is_same_v<kDataType, __half>,
-                                         cutlass::half_t, cutlass::bfloat16_t>;
-  using Traits =
-      ffpa_cute::FFPAAttnCuTeSplitDTraits<kHeadDim, kBr, kBc, kQKDChunk,
-                                          kVDChunk, kStagesQK, kStagesPV,
-                                          CuteElement>;
+  using Element = std::conditional_t<std::is_same_v<kDataType, __half>,
+                                     cutlass::half_t, cutlass::bfloat16_t>;
+  using Traits = ffpa_cute::FFPAAttnCuTeSplitDTraits<
+      kHeadDim, kBr, kBc, kQKDChunk, kVDChunk, kStagesQK, kStagesPV, Element>;
   using SmemLayoutQ = typename Traits::SmemLayoutQ;
   using SmemLayoutK = typename Traits::SmemLayoutK;
   using SmemLayoutV = typename Traits::SmemLayoutV;
@@ -105,18 +106,15 @@ void launch_cute_fwd_split_d_sm120(torch::Tensor Q, torch::Tensor K,
   const int total_q_rows = Nb * Nh * Nq;
   const int total_kv_rows = Nb * Nh_kv * Nkv;
 
-  auto gQ =
-      make_tensor(make_gmem_ptr(reinterpret_cast<CuteElement*>(Q.data_ptr())),
-                  make_shape(total_q_rows, Int<kHeadDim>{}),
-                  make_stride(Int<kHeadDim>{}, _1{}));
-  auto gK =
-      make_tensor(make_gmem_ptr(reinterpret_cast<CuteElement*>(K.data_ptr())),
-                  make_shape(total_kv_rows, Int<kHeadDim>{}),
-                  make_stride(Int<kHeadDim>{}, _1{}));
-  auto gV =
-      make_tensor(make_gmem_ptr(reinterpret_cast<CuteElement*>(V.data_ptr())),
-                  make_shape(total_kv_rows, Int<kHeadDim>{}),
-                  make_stride(Int<kHeadDim>{}, _1{}));
+  auto gQ = make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(Q.data_ptr())),
+                        make_shape(total_q_rows, Int<kHeadDim>{}),
+                        make_stride(Int<kHeadDim>{}, _1{}));
+  auto gK = make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(K.data_ptr())),
+                        make_shape(total_kv_rows, Int<kHeadDim>{}),
+                        make_stride(Int<kHeadDim>{}, _1{}));
+  auto gV = make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(V.data_ptr())),
+                        make_shape(total_kv_rows, Int<kHeadDim>{}),
+                        make_stride(Int<kHeadDim>{}, _1{}));
 
   auto tma_q = make_tma_copy(SM90_TMA_LOAD{}, gQ, SmemLayoutQ{},
                              Shape<Int<kBr>, Int<kQKDChunk>>{}, _1{});
@@ -129,22 +127,21 @@ void launch_cute_fwd_split_d_sm120(torch::Tensor Q, torch::Tensor K,
   // same shape/stride as gQ; per-head origin injected via domain_offset in
   // kernel. Direction = SM90_TMA_STORE (first arg); swizzle auto-inferred
   // from SmemLayoutO (matches the sO staging buffer's actual swizzle).
-  auto gO =
-      make_tensor(make_gmem_ptr(reinterpret_cast<CuteElement*>(O.data_ptr())),
-                  make_shape(total_q_rows, Int<kHeadDim>{}),
-                  make_stride(Int<kHeadDim>{}, _1{}));
+  auto gO = make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(O.data_ptr())),
+                        make_shape(total_q_rows, Int<kHeadDim>{}),
+                        make_stride(Int<kHeadDim>{}, _1{}));
   auto tma_o = make_tma_copy(SM90_TMA_STORE{}, gO, SmemLayoutO{},
                              Shape<Int<kBr>, Int<kVDChunk>>{}, _1{});
 
-  constexpr int kQTileBytes = kBr * kQKDChunk * sizeof(CuteElement);
-  constexpr int kKTileBytes = kBc * kQKDChunk * sizeof(CuteElement);
-  constexpr int kVTileBytes = kBc * kVDChunk * sizeof(CuteElement);
+  constexpr int kQTileBytes = kBr * kQKDChunk * sizeof(Element);
+  constexpr int kKTileBytes = kBc * kQKDChunk * sizeof(Element);
+  constexpr int kVTileBytes = kBc * kVDChunk * sizeof(Element);
   constexpr int kSmemBytes = kStagesQK * kQTileBytes + kStagesQK * kKTileBytes +
                              kStagesPV * kVTileBytes;
 
   float* softmax_lse_ptr =
       softmax_lse.numel() > 0 ? softmax_lse.data_ptr<float>() : nullptr;
-  auto O_ptr = reinterpret_cast<CuteElement*>(O.data_ptr());
+  auto O_ptr = reinterpret_cast<Element*>(O.data_ptr());
 
   auto launch_variant = [&](auto kernel_func) {
     cudaFuncSetAttribute(
@@ -197,12 +194,10 @@ void launch_cute_fwd_split_d_m4n2_sm120(torch::Tensor Q, torch::Tensor K,
   constexpr int kStagesPV = kStagesQK;
   constexpr int kNumThreads = 256;
 
-  using CuteElement = std::conditional_t<std::is_same_v<kDataType, __half>,
-                                         cutlass::half_t, cutlass::bfloat16_t>;
-  using Traits =
-      ffpa_cute::FFPAAttnCuTeSplitDM4N2Traits<kHeadDim, kBr, kBc, kQKDChunk,
-                                              kVDChunk, kStagesQK, kStagesPV,
-                                              CuteElement>;
+  using Element = std::conditional_t<std::is_same_v<kDataType, __half>,
+                                     cutlass::half_t, cutlass::bfloat16_t>;
+  using Traits = ffpa_cute::FFPAAttnCuTeSplitDM4N2Traits<
+      kHeadDim, kBr, kBc, kQKDChunk, kVDChunk, kStagesQK, kStagesPV, Element>;
   using SmemLayoutQ = typename Traits::SmemLayoutQ;
   using SmemLayoutK = typename Traits::SmemLayoutK;
   using SmemLayoutV = typename Traits::SmemLayoutV;
@@ -272,18 +267,15 @@ void launch_cute_fwd_split_d_m4n2_sm120(torch::Tensor Q, torch::Tensor K,
   const int total_q_rows = Nb * Nh * Nq;
   const int total_kv_rows = Nb * Nh_kv * Nkv;
 
-  auto gQ =
-      make_tensor(make_gmem_ptr(reinterpret_cast<CuteElement*>(Q.data_ptr())),
-                  make_shape(total_q_rows, Int<kHeadDim>{}),
-                  make_stride(Int<kHeadDim>{}, _1{}));
-  auto gK =
-      make_tensor(make_gmem_ptr(reinterpret_cast<CuteElement*>(K.data_ptr())),
-                  make_shape(total_kv_rows, Int<kHeadDim>{}),
-                  make_stride(Int<kHeadDim>{}, _1{}));
-  auto gV =
-      make_tensor(make_gmem_ptr(reinterpret_cast<CuteElement*>(V.data_ptr())),
-                  make_shape(total_kv_rows, Int<kHeadDim>{}),
-                  make_stride(Int<kHeadDim>{}, _1{}));
+  auto gQ = make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(Q.data_ptr())),
+                        make_shape(total_q_rows, Int<kHeadDim>{}),
+                        make_stride(Int<kHeadDim>{}, _1{}));
+  auto gK = make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(K.data_ptr())),
+                        make_shape(total_kv_rows, Int<kHeadDim>{}),
+                        make_stride(Int<kHeadDim>{}, _1{}));
+  auto gV = make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(V.data_ptr())),
+                        make_shape(total_kv_rows, Int<kHeadDim>{}),
+                        make_stride(Int<kHeadDim>{}, _1{}));
 
   auto tma_q = make_tma_copy(SM90_TMA_LOAD{}, gQ, SmemLayoutQ{},
                              Shape<Int<kBr>, Int<kQKDChunk>>{}, _1{});
@@ -292,18 +284,17 @@ void launch_cute_fwd_split_d_m4n2_sm120(torch::Tensor Q, torch::Tensor K,
   auto tma_v = make_tma_copy(SM90_TMA_LOAD{}, gV, SmemLayoutV{},
                              Shape<Int<kBc>, Int<kVDChunk>>{}, _1{});
 
-  auto gO =
-      make_tensor(make_gmem_ptr(reinterpret_cast<CuteElement*>(O.data_ptr())),
-                  make_shape(total_q_rows, Int<kHeadDim>{}),
-                  make_stride(Int<kHeadDim>{}, _1{}));
+  auto gO = make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(O.data_ptr())),
+                        make_shape(total_q_rows, Int<kHeadDim>{}),
+                        make_stride(Int<kHeadDim>{}, _1{}));
   auto tma_o = make_tma_copy(SM90_TMA_STORE{}, gO, SmemLayoutO{},
                              Shape<Int<kBr>, Int<kVDChunk>>{}, _1{});
 
-  constexpr int kSmemBytes = Traits::kSmemElems * sizeof(CuteElement);
+  constexpr int kSmemBytes = Traits::kSmemElems * sizeof(Element);
 
   float* softmax_lse_ptr =
       softmax_lse.numel() > 0 ? softmax_lse.data_ptr<float>() : nullptr;
-  auto O_ptr = reinterpret_cast<CuteElement*>(O.data_ptr());
+  auto O_ptr = reinterpret_cast<Element*>(O.data_ptr());
 
   auto launch_variant = [&](auto kernel_func) {
     cudaFuncSetAttribute(
@@ -364,11 +355,11 @@ void launch_cute_fwd_persist_d_sm120(torch::Tensor Q, torch::Tensor K,
   // WS: 128 producer + 256 consumer = 384 threads
   constexpr int kNumThreads = 384;
 
-  using CuteElement = std::conditional_t<std::is_same_v<kDataType, __half>,
-                                         cutlass::half_t, cutlass::bfloat16_t>;
+  using Element = std::conditional_t<std::is_same_v<kDataType, __half>,
+                                     cutlass::half_t, cutlass::bfloat16_t>;
   using Traits =
       ffpa_cute::FFPAAttnCuTePersistDTraits<kHeadDim, kBr, kBc, kStagesK,
-                                            kStagesV, CuteElement>;
+                                            kStagesV, Element>;
   using SmemLayoutQ = typename Traits::SmemLayoutQ;
   using SmemLayoutKV = typename Traits::SmemLayoutKV;
   using SmemLayoutO = typename Traits::SmemLayoutO;
@@ -422,22 +413,18 @@ void launch_cute_fwd_persist_d_sm120(torch::Tensor Q, torch::Tensor K,
   const int total_q_rows = Nb * Nh * Nq;
   const int total_kv_rows = Nb * Nh_kv * Nkv;
 
-  auto gQ =
-      make_tensor(make_gmem_ptr(reinterpret_cast<CuteElement*>(Q.data_ptr())),
-                  make_shape(total_q_rows, Int<kHeadDim>{}),
-                  make_stride(Int<kHeadDim>{}, _1{}));
-  auto gK =
-      make_tensor(make_gmem_ptr(reinterpret_cast<CuteElement*>(K.data_ptr())),
-                  make_shape(total_kv_rows, Int<kHeadDim>{}),
-                  make_stride(Int<kHeadDim>{}, _1{}));
-  auto gV =
-      make_tensor(make_gmem_ptr(reinterpret_cast<CuteElement*>(V.data_ptr())),
-                  make_shape(total_kv_rows, Int<kHeadDim>{}),
-                  make_stride(Int<kHeadDim>{}, _1{}));
-  auto gO =
-      make_tensor(make_gmem_ptr(reinterpret_cast<CuteElement*>(O.data_ptr())),
-                  make_shape(total_q_rows, Int<kHeadDim>{}),
-                  make_stride(Int<kHeadDim>{}, _1{}));
+  auto gQ = make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(Q.data_ptr())),
+                        make_shape(total_q_rows, Int<kHeadDim>{}),
+                        make_stride(Int<kHeadDim>{}, _1{}));
+  auto gK = make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(K.data_ptr())),
+                        make_shape(total_kv_rows, Int<kHeadDim>{}),
+                        make_stride(Int<kHeadDim>{}, _1{}));
+  auto gV = make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(V.data_ptr())),
+                        make_shape(total_kv_rows, Int<kHeadDim>{}),
+                        make_stride(Int<kHeadDim>{}, _1{}));
+  auto gO = make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(O.data_ptr())),
+                        make_shape(total_q_rows, Int<kHeadDim>{}),
+                        make_stride(Int<kHeadDim>{}, _1{}));
 
   auto tma_q = make_tma_copy(SM90_TMA_LOAD{}, gQ, SmemLayoutQ{},
                              Shape<Int<kBr>, Int<kHeadDim>>{}, _1{});
@@ -448,11 +435,11 @@ void launch_cute_fwd_persist_d_sm120(torch::Tensor Q, torch::Tensor K,
   auto tma_o = make_tma_copy(SM90_TMA_STORE{}, gO, SmemLayoutO{},
                              Shape<Int<kBr>, Int<kHeadDim>>{}, _1{});
 
-  constexpr int kSmemBytes = Traits::kSmemElems * sizeof(CuteElement);
+  constexpr int kSmemBytes = Traits::kSmemElems * sizeof(Element);
 
   float* softmax_lse_ptr =
       softmax_lse.numel() > 0 ? softmax_lse.data_ptr<float>() : nullptr;
-  auto O_ptr = reinterpret_cast<CuteElement*>(O.data_ptr());
+  auto O_ptr = reinterpret_cast<Element*>(O.data_ptr());
 
   auto launch_variant = [&](auto kernel_func) {
     cudaFuncSetAttribute(
@@ -508,19 +495,20 @@ void launch_cute_fwd_split_d_ws_sm120(torch::Tensor Q, torch::Tensor K,
   constexpr int kPerStageBytes =
       (kBr * kQKDChunk + kBc * kQKDChunk + kBc * kVDChunk) * kElemSize;
   constexpr int kMaxStages = kSmemBudgetBytes / kPerStageBytes;
-  // stages=1 has a barrier-protocol race on sm_120a; clamp to >=2.
+  // stages=1: single-buffer makes producer TMA writes (async proxy) collide
+  // with consumer ldmatrix reads (generic proxy) on the same smem slot;
+  // CtaBarrier (async proxy) can't prove the generic-proxy read finished.
+  // Clamp >=2 so double-buffering keeps read/write addresses disjoint.
   constexpr int kStagesQK =
       (kStage < 2) ? 2 : (kStage > kMaxStages ? kMaxStages : kStage);
   constexpr int kStagesPV = kStagesQK;
   // WS: 128 producer + 256 consumer (M8N1) = 384 threads
   constexpr int kNumThreads = 384;
 
-  using CuteElement = std::conditional_t<std::is_same_v<kDataType, __half>,
-                                         cutlass::half_t, cutlass::bfloat16_t>;
-  using Traits =
-      ffpa_cute::FFPAAttnCuTeSplitDTraits<kHeadDim, kBr, kBc, kQKDChunk,
-                                          kVDChunk, kStagesQK, kStagesPV,
-                                          CuteElement>;
+  using Element = std::conditional_t<std::is_same_v<kDataType, __half>,
+                                     cutlass::half_t, cutlass::bfloat16_t>;
+  using Traits = ffpa_cute::FFPAAttnCuTeSplitDTraits<
+      kHeadDim, kBr, kBc, kQKDChunk, kVDChunk, kStagesQK, kStagesPV, Element>;
   using SmemLayoutQ = typename Traits::SmemLayoutQ;
   using SmemLayoutK = typename Traits::SmemLayoutK;
   using SmemLayoutV = typename Traits::SmemLayoutV;
@@ -575,22 +563,18 @@ void launch_cute_fwd_split_d_ws_sm120(torch::Tensor Q, torch::Tensor K,
   const int total_q_rows = Nb * Nh * Nq;
   const int total_kv_rows = Nb * Nh_kv * Nkv;
 
-  auto gQ =
-      make_tensor(make_gmem_ptr(reinterpret_cast<CuteElement*>(Q.data_ptr())),
-                  make_shape(total_q_rows, Int<kHeadDim>{}),
-                  make_stride(Int<kHeadDim>{}, _1{}));
-  auto gK =
-      make_tensor(make_gmem_ptr(reinterpret_cast<CuteElement*>(K.data_ptr())),
-                  make_shape(total_kv_rows, Int<kHeadDim>{}),
-                  make_stride(Int<kHeadDim>{}, _1{}));
-  auto gV =
-      make_tensor(make_gmem_ptr(reinterpret_cast<CuteElement*>(V.data_ptr())),
-                  make_shape(total_kv_rows, Int<kHeadDim>{}),
-                  make_stride(Int<kHeadDim>{}, _1{}));
-  auto gO =
-      make_tensor(make_gmem_ptr(reinterpret_cast<CuteElement*>(O.data_ptr())),
-                  make_shape(total_q_rows, Int<kHeadDim>{}),
-                  make_stride(Int<kHeadDim>{}, _1{}));
+  auto gQ = make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(Q.data_ptr())),
+                        make_shape(total_q_rows, Int<kHeadDim>{}),
+                        make_stride(Int<kHeadDim>{}, _1{}));
+  auto gK = make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(K.data_ptr())),
+                        make_shape(total_kv_rows, Int<kHeadDim>{}),
+                        make_stride(Int<kHeadDim>{}, _1{}));
+  auto gV = make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(V.data_ptr())),
+                        make_shape(total_kv_rows, Int<kHeadDim>{}),
+                        make_stride(Int<kHeadDim>{}, _1{}));
+  auto gO = make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(O.data_ptr())),
+                        make_shape(total_q_rows, Int<kHeadDim>{}),
+                        make_stride(Int<kHeadDim>{}, _1{}));
 
   auto tma_q = make_tma_copy(SM90_TMA_LOAD{}, gQ, SmemLayoutQ{},
                              Shape<Int<kBr>, Int<kQKDChunk>>{}, _1{});
@@ -601,11 +585,11 @@ void launch_cute_fwd_split_d_ws_sm120(torch::Tensor Q, torch::Tensor K,
   auto tma_o = make_tma_copy(SM90_TMA_STORE{}, gO, SmemLayoutO{},
                              Shape<Int<kBr>, Int<kVDChunk>>{}, _1{});
 
-  constexpr int kSmemBytes = Traits::kSmemElems * sizeof(CuteElement);
+  constexpr int kSmemBytes = Traits::kSmemElems * sizeof(Element);
 
   float* softmax_lse_ptr =
       softmax_lse.numel() > 0 ? softmax_lse.data_ptr<float>() : nullptr;
-  auto O_ptr = reinterpret_cast<CuteElement*>(O.data_ptr());
+  auto O_ptr = reinterpret_cast<Element*>(O.data_ptr());
 
   auto launch_variant = [&](auto kernel_func) {
     cudaFuncSetAttribute(
@@ -652,18 +636,16 @@ void launch_cute_fwd_split_d_sm80(torch::Tensor Q, torch::Tensor K,
   constexpr int kBc = 128;
   constexpr int kNumThreads = kBr / 16 * 32;
 
-  using CuteElement = std::conditional_t<std::is_same_v<kDataType, __half>,
-                                         cutlass::half_t, cutlass::bfloat16_t>;
+  using Element = std::conditional_t<std::is_same_v<kDataType, __half>,
+                                     cutlass::half_t, cutlass::bfloat16_t>;
   constexpr int kStagesQK = kStage;
   constexpr int kStagesPV = kStagesQK;
-  using Traits =
-      ffpa_cute::FFPAAttnCuTeSplitDTraits<kHeadDim, kBr, kBc, kQKDChunk,
-                                          kVDChunk, kStagesQK, kStagesPV,
-                                          CuteElement>;
+  using Traits = ffpa_cute::FFPAAttnCuTeSplitDTraits<
+      kHeadDim, kBr, kBc, kQKDChunk, kVDChunk, kStagesQK, kStagesPV, Element>;
 
-  constexpr int kQTileBytes = kBr * kQKDChunk * sizeof(CuteElement);
-  constexpr int kKTileBytes = kBc * kQKDChunk * sizeof(CuteElement);
-  constexpr int kVTileBytes = kBc * kVDChunk * sizeof(CuteElement);
+  constexpr int kQTileBytes = kBr * kQKDChunk * sizeof(Element);
+  constexpr int kKTileBytes = kBc * kQKDChunk * sizeof(Element);
+  constexpr int kVTileBytes = kBc * kVDChunk * sizeof(Element);
   constexpr int kSmemPerStage = kQTileBytes + kKTileBytes + kVTileBytes;
   constexpr int kSmemBytes = kStagesQK * kSmemPerStage;
 
@@ -739,10 +721,10 @@ void launch_cute_fwd_split_d_sm80(torch::Tensor Q, torch::Tensor K,
 
   float* softmax_lse_ptr =
       softmax_lse.numel() > 0 ? softmax_lse.data_ptr<float>() : nullptr;
-  auto Q_ptr = reinterpret_cast<CuteElement*>(Q.data_ptr());
-  auto K_ptr = reinterpret_cast<CuteElement*>(K.data_ptr());
-  auto V_ptr = reinterpret_cast<CuteElement*>(V.data_ptr());
-  auto O_ptr = reinterpret_cast<CuteElement*>(O.data_ptr());
+  auto Q_ptr = reinterpret_cast<Element*>(Q.data_ptr());
+  auto K_ptr = reinterpret_cast<Element*>(K.data_ptr());
+  auto V_ptr = reinterpret_cast<Element*>(V.data_ptr());
+  auto O_ptr = reinterpret_cast<Element*>(O.data_ptr());
 
   auto launch_variant = [&](auto kernel_func) {
     cudaFuncSetAttribute(
