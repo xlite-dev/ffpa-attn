@@ -56,7 +56,7 @@ For more advanced features, please refer to our online docs at 📘[ffpa-attn.io
 
 <a id="ffpa-design"></a>
 
-We extend FlashAttention to support large headdim ($D>256$) via **fine-grained tiling** at the **MMA** level for $QK^\top$ and $PV$ matrix multiplication, referred to as [**Split-D**](./csrc/cuffpa/cute/sm_120/split_d.cuh). This design keeps SRAM usage fixed at $B_r \times 16$ (with $B_r=B_c$) for Q, K and V, yielding constant SRAM complexity $O(B_r \times 16) \approx O(1)$ and register complexity $O(d/4)$ (w/ [**TiledMMA<4,2,1>**](./csrc/cuffpa/cute/sm_120/split_d_m4n2.cuh)).
+We extend FlashAttention to support large headdim ($D>256$) via **fine-grained tiling** at the **MMA** level for $QK^\top$ and $PV$ matrix multiplication, referred to as [**Split-D**](./csrc/cuffpa/cute/sm_120/split_d.cuh). This design keeps SRAM usage fixed at $B_r \times 16$ (with $B_r=B_c$) for Q, K and V, yielding constant SRAM complexity $O(B_r \times 16) \approx O(1)$ & register complexity $O(d/4)$ (w/ [**TiledMMA<4,2,1>**](./csrc/cuffpa/cute/sm_120/split_d_m4n2.cuh)).
 
 <div align='center'>
   <img src="./docs/assets/split-d.png" width="700px">
