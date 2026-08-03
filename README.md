@@ -75,7 +75,7 @@ Runnable benchmark are provided under [`bench`](./bench). The performance benchm
 
 ## Backends
 
-FFPA supports multiple backends for the forward and backward pass, including: [`SDPA`](./bench/) (baseline), [`CUDA`](./bench/) (forward only), [`Triton`](./bench/), and [`CuTe-DSL`](./bench/). The `CuTe-DSL` backend is currently in early stage and has some constraints, but it can achieve up to `513~535🎉` TFLOPS on H200! Stay tuned for future updates. (The `Triton` backend (forward + backward) also runs on AMD GPUs)
+FFPA supports multiple backends for the forward and backward pass, including: [`SDPA`](./bench/) (baseline), [`CUDA`](./bench/) (forward only), [`Triton`](./bench/), and [`CuTe-DSL`](./bench/). The `CuTe-DSL` backend is currently in early stage, stay tuned for future updates. The `Triton` backend (forward + backward) also runs on AMD GPUs.
 
 <div align='center' markdown="1">
 
