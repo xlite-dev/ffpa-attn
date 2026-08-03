@@ -74,10 +74,14 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK +
         const long long attn_bias_stride_n, const float dropout_p,
         const unsigned long long philox_seed,
         const unsigned long long philox_offset) {
-  // Body guard: TMA instructions need sm>=90. In mixed -gencode builds the
-  // sm_89 device pass still compiles this TU; the guard makes the kernel a
-  // no-op stub there. Runtime safety: launch.cuh gates TMA dispatch on
-  // prop->major>=9, so pre-90 devices never enter this path.
+  // Body-level arch guard: TMA instructions require sm>=90, but in mixed
+  // -gencode builds the sm_89 device pass still compiles this TU; the guard
+  // compiles the body into a no-op stub there. Body-level (not file-level)
+  // is required because the host launcher references this kernel via <<<>>>
+  // and nvcc must see the declaration in every device pass; hiding it
+  // file-level fails with "identifier undefined". Runtime safety: launch.cuh
+  // dispatches TMA kernels only when prop->major >= 9, so pre-90 devices
+  // never execute the stub.
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
   static_assert(kMmaAtomM == 16 && kMmaAtomN == 8 && kMmaAtomK == 16);
   static_assert(kValTileSeqLenQ == 1 && kValTileSeqLenP == 1);
