@@ -74,6 +74,11 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK +
         const long long attn_bias_stride_n, const float dropout_p,
         const unsigned long long philox_seed,
         const unsigned long long philox_offset) {
+  // Body guard: TMA instructions need sm>=90. In mixed -gencode builds the
+  // sm_89 device pass still compiles this TU; the guard makes the kernel a
+  // no-op stub there. Runtime safety: launch.cuh gates TMA dispatch on
+  // prop->major>=9, so pre-90 devices never enter this path.
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
   static_assert(kMmaAtomM == 16 && kMmaAtomN == 8 && kMmaAtomK == 16);
   static_assert(kValTileSeqLenQ == 1 && kValTileSeqLenP == 1);
   constexpr int Br = kMmaAtomM * kMmaTileSeqLenQ * kValTileSeqLenQ;
@@ -637,4 +642,5 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK +
   ffpa::prefill::sync_store_lse_r2g<Br, kMmaAtomM, kValTileSeqLenQ>(
       softmax_lse, softmax_lse_offset, Q_tile_id, warp_QP,
       &lane_block_row_max_old[0][0], &lane_block_row_sum_old[0][0], Nq);
+#endif  // defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
 }

@@ -34,6 +34,8 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
         long long attn_bias_stride_m = 0, long long attn_bias_stride_n = 0,
         float dropout_p = 0.0f, unsigned long long philox_seed = 0,
         unsigned long long philox_offset = 0) {
+  // Body guard: TMA/stmatrix need sm>=90; empty stub in sm<90 device passes.
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
   // Split-D Flash Attention forward (non-WS, CuTe TMA).
   //
   // Algorithm per KV tile:
@@ -706,6 +708,7 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
     if (Br_base + kBr <= Nq)
       tma_store_wait<0>();
   }
+#endif  // defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
 }
 
 // WS split-D: 128 producer (TMA-only) + 256 consumer (MMA-only), 384 threads.
@@ -733,6 +736,8 @@ __global__ void __launch_bounds__(384, 1) split_d_ws_fwd_cute_sm120(
     long long attn_bias_stride_m = 0, long long attn_bias_stride_n = 0,
     float dropout_p = 0.0f, unsigned long long philox_seed = 0,
     unsigned long long philox_offset = 0) {
+  // Body guard: TMA/stmatrix need sm>=90; empty stub in sm<90 device passes.
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
   using namespace cute;
   using cute::tma_store_arrive;
   using cute::tma_store_wait;
@@ -1238,4 +1243,5 @@ __global__ void __launch_bounds__(384, 1) split_d_ws_fwd_cute_sm120(
     if (Br_base + kBr <= Nq)
       tma_store_wait<0>();
   }
+#endif  // defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
 }

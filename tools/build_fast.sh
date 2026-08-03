@@ -167,16 +167,16 @@ elif [[ -z "${ENABLE_FFPA_CUDA_IMPL:-}" ]]; then
   fi
 fi
 
-# TMA kernels need sm>=90 (native/tma.cuh is guarded by __CUDA_ARCH__>=900)
-# and the macro is global across all -gencode passes, so auto-disable
-# ENABLE_FFPA_TMA_EXT whenever any target arch is below 90.
+# TMA kernels need sm>=90; the TMA sources are guarded by
+# `!defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 900` so mixed builds compile,
+# and TMA is only auto-disabled when every target arch is below 90.
 if [[ "${ENABLE_FFPA_TMA_EXT:-0}" == "1" ]]; then
   _arch_raw="${FFPA_BUILD_ARCH:-}"
   if [[ -z "$_arch_raw" ]] && command -v nvidia-smi >/dev/null 2>&1; then
     _cc="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d ' .')"
     [[ -n "${_cc:-}" ]] && _arch_raw="$_cc"
   fi
-  _any_below_90=0
+  _all_below_90=1
   if [[ -n "$_arch_raw" ]]; then
     IFS=',; ' read -r -a _arch_toks <<< "$_arch_raw"
     for tok in "${_arch_toks[@]}"; do
@@ -192,11 +192,11 @@ if [[ "${ENABLE_FFPA_TMA_EXT:-0}" == "1" ]]; then
       esac
       num="${tok%%[!0-9]*}"
       [[ -z "$num" ]] && continue
-      if (( 10#$num < 90 )); then _any_below_90=1; break; fi
+      if (( 10#$num >= 90 )); then _all_below_90=0; break; fi
     done
   fi
-  if [[ "$_any_below_90" == "1" ]]; then
-    echo "[build_fast] target archs include sm<90; disabling ENABLE_FFPA_TMA_EXT" \
+  if [[ -n "$_arch_raw" && "$_all_below_90" == "1" ]]; then
+    echo "[build_fast] all target archs are sm<90; disabling ENABLE_FFPA_TMA_EXT" \
          "(TMA needs sm>=90; cute falls back to the SM80 cp.async path)"
     export ENABLE_FFPA_TMA_EXT=0
   fi

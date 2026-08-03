@@ -112,7 +112,7 @@ inline CUtensorMap make_2d_copy_desc(const Copy2DDescriptorParams<T>& params) {
 
 __host__ __device__ __forceinline__ void init_barrier(barrier_t* barrier,
                                                       int arrive_count) {
-#if __CUDA_ARCH__
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
   namespace cde = cuda::device::experimental;
   init(barrier, arrive_count);
 #if CUDART_VERSION >= 13020
@@ -124,7 +124,7 @@ __host__ __device__ __forceinline__ void init_barrier(barrier_t* barrier,
 }
 
 __host__ __device__ __forceinline__ void wait_barrier(barrier_t& barrier) {
-#if __CUDA_ARCH__
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
   namespace cde = cuda::device::experimental;
   barrier.wait(barrier.arrive());
 #if CUDART_VERSION >= 13020
@@ -137,7 +137,7 @@ __host__ __device__ __forceinline__ void wait_barrier(barrier_t& barrier) {
 
 __host__ __device__ __forceinline__ void wait_barrier_parity(barrier_t& barrier,
                                                              uint32_t phase) {
-#if __CUDA_ARCH__
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
   namespace cde = cuda::device::experimental;
   barrier.wait_parity(phase != 0);
 #if CUDART_VERSION >= 13020
@@ -149,7 +149,7 @@ __host__ __device__ __forceinline__ void wait_barrier_parity(barrier_t& barrier,
 }
 
 __host__ __device__ __forceinline__ void fence_async_shared() {
-#if __CUDA_ARCH__
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
   namespace cde = cuda::device::experimental;
 #if CUDART_VERSION >= 13020
   cuda::ptx::fence_proxy_async(cuda::ptx::space_shared);
@@ -160,14 +160,14 @@ __host__ __device__ __forceinline__ void fence_async_shared() {
 }
 
 __host__ __device__ __forceinline__ void bulk_commit_group() {
-#if __CUDA_ARCH__
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
   asm volatile("cp.async.bulk.commit_group;\n" ::);
 #endif
 }
 
 template <size_t n>
 __host__ __device__ __forceinline__ void bulk_wait_group() {
-#if __CUDA_ARCH__
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
   asm volatile("cp.async.bulk.wait_group %0;\n" ::"n"(n));
 #endif
 }
@@ -176,7 +176,7 @@ __host__ __device__ __forceinline__ void load_2d(
     void* smem_ptr, const CUtensorMap* tensor_map, int32_t minor_coord,
     int32_t major_coord, barrier_t& barrier, uint32_t bytes,
     int issuer_lane = 0) {
-#if __CUDA_ARCH__
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
   namespace cde = cuda::device::experimental;
   if (static_cast<int>(threadIdx.x) == issuer_lane) {
 #if CUDART_VERSION >= 13020
@@ -201,7 +201,7 @@ __host__ __device__ __forceinline__ void load_2d(
 __host__ __device__ __forceinline__ void load_2d_no_arrive(
     void* smem_ptr, const CUtensorMap* tensor_map, int32_t minor_coord,
     int32_t major_coord, barrier_t& barrier, int issuer_lane = 0) {
-#if __CUDA_ARCH__
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
   namespace cde = cuda::device::experimental;
   if (static_cast<int>(threadIdx.x) == issuer_lane) {
 #if CUDART_VERSION >= 13020
@@ -221,7 +221,7 @@ __host__ __device__ __forceinline__ void load_2d_no_arrive(
 __host__ __device__ __forceinline__ void arrive_expect_tx(barrier_t& barrier,
                                                           uint32_t bytes,
                                                           int issuer_lane = 0) {
-#if __CUDA_ARCH__
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
   namespace cde = cuda::device::experimental;
   if (static_cast<int>(threadIdx.x) == issuer_lane) {
 #if CUDART_VERSION >= 13020
@@ -243,7 +243,7 @@ __host__ __device__ __forceinline__ bool issue_load_2d_to_dst_swizzled(
     T* dst_smem_base_ptr, const CUtensorMap* tensor_map, const int major_coord,
     const int d_tile_id, const int dst_stage, barrier_t& barrier,
     int issuer_lane = 0) {
-#if __CUDA_ARCH__
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
   if (tensor_map == nullptr || d_tile_id >= (kHeadDim / kCols)) {
     return false;
   }
@@ -261,7 +261,7 @@ __host__ __device__ __forceinline__ bool issue_load_2d_to_tmp(
     T* tmp_smem_base_ptr, const CUtensorMap* tensor_map, const int major_coord,
     const int d_tile_id, const int tmp_stage, const int seqlen_bound,
     barrier_t& barrier) {
-#if __CUDA_ARCH__
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
   if (tensor_map == nullptr || d_tile_id >= (kHeadDim / kCols) ||
       ((major_coord + BrOrBc) > seqlen_bound)) {
     return false;
@@ -280,7 +280,7 @@ template <const int BrOrBc, const int kTileSize, const int kCols,
 __host__ __device__ __forceinline__ void wait_and_repack_tmp_to_dst(
     T* dst_smem_base_ptr, T* tmp_smem_base_ptr, const int dst_stage,
     const int tmp_stage, barrier_t& barrier) {
-#if __CUDA_ARCH__
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
   constexpr bool kSwizzle = (kPad == 0);
   constexpr int kElemsPerThread = kCols / (kNumThreads / BrOrBc);
   static_assert(kElemsPerThread * sizeof(T) == 16,
@@ -307,7 +307,7 @@ __host__ __device__ __forceinline__ bool load_2d_to_smem_repack(
     T* dst_smem_base_ptr, T* tmp_smem_base_ptr, const CUtensorMap* tensor_map,
     const int major_coord, const int d_tile_id, const int dst_stage,
     const int tmp_stage, const int seqlen_bound, barrier_t& barrier) {
-#if __CUDA_ARCH__
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
   if (!issue_load_2d_to_tmp<BrOrBc, kHeadDim, kCols, T>(
           tmp_smem_base_ptr, tensor_map, major_coord, d_tile_id, tmp_stage,
           seqlen_bound, barrier)) {
