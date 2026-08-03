@@ -190,7 +190,7 @@ class CUDABackend(Backend):
   stages: int = None
   enable_tma: bool = False
   enable_cute: bool = False
-  enable_ws: bool = False
+  enable_ws: bool = False  # For future use.
 
   def __post_init__(self) -> None:
     super().__post_init__()
