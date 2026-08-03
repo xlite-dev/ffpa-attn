@@ -9,7 +9,7 @@
     <img src="docs/assets/ffpa-api.png" width="700px">
 </div>
 
-**FFPA**: Fast and Memory-Efficient Exact Attention for **Large Headdim**, achieving **O(1)** SRAM complexity ([**Split-D**](#-split-d)) and **O(d/4)** register complexity (CUDA backend w/ [**TiledMMA<4,2,1>**](./csrc/cuffpa/cute/sm_120/split_d_m4n2.cuh)), **1.5x~6x** 🎉 speedup over standard PyTorch SDPA. FFPA extends the headdim support beyond **D > 256** (up to **1024**) without any precision loss.
+**FFPA**: Fast and Memory-Efficient Exact Attention for **Large Headdim**, achieving **O(1)** SRAM complexity (w/ [**Split-D**](#-split-d)) and **O(d/4)** register complexity (CUDA backend w/ [**TiledMMA<4,2,1>**](./csrc/cuffpa/cute/sm_120/split_d_m4n2.cuh)), **1.5x~6x** 🎉 speedup over standard PyTorch SDPA. FFPA extends the headdim support beyond **D > 256** (up to **1024**) without any precision loss.
 
 <div align='center' markdown="1">
 
