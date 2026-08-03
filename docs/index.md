@@ -1,6 +1,6 @@
 <div align="center">
   <p align="center">
-    <h2>🤖FFPA: Fast and Memory-Efficient Exact Attention for Large Headdim</h2>
+    <h2>Fast and Memory-Efficient Exact Attention for Large Headdim</h2>
   </p>
   <img src=https://img.shields.io/badge/language-CUDA/Python-brightgreen.svg >
   <a href="https://pepy.tech/projects/ffpa-attn"><img src=https://static.pepy.tech/personalized-badge/ffpa-attn?period=total&units=ABBREVIATION&left_color=GRAY&right_color=BLUE&left_text=downloads/pypi ></a>
