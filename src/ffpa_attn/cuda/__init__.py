@@ -8,11 +8,13 @@ try:
 
   _ffpa_attn_fwd_cuda = _cuda_ext.ffpa_attn_forward
   CUDA_FWD_AVAILABLE = bool(getattr(_cuda_ext, "CUDA_FWD_AVAILABLE", False))
+  F16_ACC_AVAILABLE = bool(getattr(_cuda_ext, "F16_ACC_AVAILABLE", False))
   CUDA_BWD_AVAILABLE = False
   _CUDA_IMPORT_ERROR = None
 except Exception as exc:
   _ffpa_attn_fwd_cuda = None
   CUDA_FWD_AVAILABLE = False
+  F16_ACC_AVAILABLE = False
   CUDA_BWD_AVAILABLE = False
   _CUDA_IMPORT_ERROR = exc
 

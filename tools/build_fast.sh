@@ -43,8 +43,10 @@ Flags (override same-named env vars; env reference: docs/env.md):
                          <csv>  subset of cuda,cute,tma (cute/tma imply cuda)
                        Default without --ext or env: ENABLE_FFPA_CUDA_IMPL=1.
                        TMA auto-disables when every target arch is sm<90.
-  --headdim <list|all> FFPA_DEV_HEADDIMS subset, e.g. 256,512; 'all' (or
-                       omitting the flag) builds the full headdim set.
+  --headdim <list|all> FFPA_DEV_HEADDIMS subset, e.g. 256,512; 'all' builds
+                       every headdim (multiples of 32). Omitting the flag
+                       builds the default set (multiples of 64), governed by
+                       ENABLE_FFPA_ALL_HEADDIM (default 0).
   --editable           FFPA_EDITABLE=1: pip install -e instead of build_ext.
   -j, --jobs N         MAX_JOBS outer build parallelism (default min(nproc,32)).
   --clean              FFPA_CLEAN=1: rm build/, *.so, generated TUs first.
@@ -115,6 +117,7 @@ while [[ $# -gt 0 ]]; do
       HEADDIM_SET=1
       if [[ "${2,,}" == "all" ]]; then
         unset FFPA_DEV_HEADDIMS
+        export ENABLE_FFPA_ALL_HEADDIM=1
       else
         export FFPA_DEV_HEADDIMS="$2"
       fi
@@ -139,7 +142,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-# headdim omitted -> default to the full headdim set.
+# headdim omitted -> default set (multiples of 64 via ENABLE_FFPA_ALL_HEADDIM=0).
 if [[ "$HEADDIM_SET" == "0" ]]; then
   unset FFPA_DEV_HEADDIMS
 fi
@@ -219,7 +222,7 @@ else
   BUILD_CMD="python setup.py build_ext --inplace"
 fi
 echo "[build_fast] ENABLE_FFPA_CUDA_IMPL=${ENABLE_FFPA_CUDA_IMPL:-0}  ENABLE_FFPA_CUTE_EXT=${ENABLE_FFPA_CUTE_EXT:-0}  ENABLE_FFPA_TMA_EXT=${ENABLE_FFPA_TMA_EXT:-0}"
-echo "[build_fast] FFPA_BUILD_ARCH=${FFPA_BUILD_ARCH:-<auto from current device>}  FFPA_DEV_HEADDIMS=${FFPA_DEV_HEADDIMS:-<full set>}  FFPA_EDITABLE=${FFPA_EDITABLE:-0}"
+echo "[build_fast] FFPA_BUILD_ARCH=${FFPA_BUILD_ARCH:-<auto from current device>}  FFPA_DEV_HEADDIMS=${FFPA_DEV_HEADDIMS:-<default: mults of 64>}  FFPA_EDITABLE=${FFPA_EDITABLE:-0}"
 echo "[build_fast] MAX_JOBS=$MAX_JOBS  FFPA_NVCC_THREADS=$FFPA_NVCC_THREADS"
 echo "[build_fast] command: $BUILD_CMD${PASS_ARGS[*]:+ ${PASS_ARGS[*]}}"
 if [[ "$DRY_RUN" == "1" ]]; then

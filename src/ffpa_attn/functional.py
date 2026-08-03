@@ -36,9 +36,10 @@ except Exception:
   _ffpa_attn_varlen_cute = None
 
 try:
-  from .cuda import _ffpa_attn_forward_cuda  # D > 256
+  from .cuda import _ffpa_attn_forward_cuda, F16_ACC_AVAILABLE  # D > 256
 except Exception:
   _ffpa_attn_forward_cuda = None
+  F16_ACC_AVAILABLE = False
 
 if TYPE_CHECKING:
   from typing import Tuple, Union, Optional  # noqa: F401
@@ -198,6 +199,11 @@ class CUDABackend(Backend):
     assert self.acc in (
       "f16", "f32"
     ), f"acc must be 'f16' or 'f32', got {self.acc!r}"
+    if self.acc == "f16" and not F16_ACC_AVAILABLE:
+      raise ValueError(
+        "CUDABackend(acc='f16') requires the fp16 MMA acc kernels, which were "
+        "not compiled. Rebuild with ENABLE_FFPA_F16_ACC=1 to enable them."
+      )
     self.stages = self._default_cuda_stages(
     ) if self.stages is None else self.stages
 
