@@ -1,5 +1,6 @@
 import os
 import re
+import shutil
 
 import torch
 
@@ -33,15 +34,25 @@ class ENV(object):
 
   # Maximum cp.async pipeline stages to generate at build time.
   # Controls the range dispatched in generated TUs and the static_assert
-  # bounds in prefill.cuh. Default 8 (stages 1-8).
-  FFPA_BUILD_MAX_STAGES = int(os.environ.get("FFPA_BUILD_MAX_STAGES", 8))
+  # bounds in prefill.cuh. Default 4 (stages 1-4); >4 rarely pays off.
+  FFPA_BUILD_MAX_STAGES = int(os.environ.get("FFPA_BUILD_MAX_STAGES", 4))
 
-  # Enable all headdims for FFPA kernels or not, default True.
+  # Enable all headdims for FFPA kernels or not, default False.
   # True, headdim will range from 32 to 1024 with step = 32, range(32, 1024, 32)
-  # False, headdim will range from 256 to 1024 with step = 64, range(256, 1024, 64)
+  # False, headdim will range from 64 to 1024 with step = 64, range(64, 1024, 64)
+  # (only multiples of 64). Pass other headdims via FFPA_DEV_HEADDIMS /
+  # `build_fast.sh --headdim`.
   ENABLE_FFPA_ALL_HEADDIM = bool(
-    int(os.environ.get("ENABLE_FFPA_ALL_HEADDIM", 1))
+    int(os.environ.get("ENABLE_FFPA_ALL_HEADDIM", 0))
   )
+
+  # Enable fp16 MMA acc (acc=0 / CUDABackend(acc="f16")) kernels. Default False:
+  # the fp16-acc path is rarely used and roughly doubles the fp16 TU count, so
+  # it is opt-in. When disabled env.py omits the ffpa_attn_fwd_fp16f16* TUs and
+  # the C++/Python dispatch raises a clear "rebuild with ENABLE_FFPA_F16_ACC=1"
+  # error. The kernel template code itself is unchanged (gating is at the
+  # generation/dispatch layer only).
+  ENABLE_FFPA_F16_ACC = bool(int(os.environ.get("ENABLE_FFPA_F16_ACC", 0)))
 
   # Enable force Q@K^T use fp16 as MMA Acc dtype for FFPA Acc F32 kernels, default False.
   # FFPA Acc F32 kernels MMA Acc = Mixed Q@K^T MMA Acc F16 + P@V MMA Acc F32.
@@ -281,6 +292,10 @@ class ENV(object):
     return cls.ENABLE_FFPA_CUTE_EXT
 
   @classmethod
+  def enable_f16_acc(cls):
+    return cls.ENABLE_FFPA_F16_ACC
+
+  @classmethod
   def env_cuda_cflags(cls):
     extra_env_cflags = []
     if cls.enable_all_mutistages():
@@ -314,6 +329,8 @@ class ENV(object):
       extra_env_cflags.append("-DENABLE_FFPA_LAUNCH_GRID_DNHB")
     if cls.enable_cuda_impl():
       extra_env_cflags.append("-DENABLE_FFPA_CUDA_IMPL")
+    if cls.enable_f16_acc():
+      extra_env_cflags.append("-DENABLE_FFPA_F16_ACC")
     if cls.enable_tma_ext():
       extra_env_cflags.append("-DENABLE_FFPA_TMA_EXT")
     if cls.enable_cute_ext():
@@ -330,6 +347,8 @@ class ENV(object):
     extra_gcc_flags = ["-O3", "-std=c++20"]
     if cls.enable_cuda_impl():
       extra_gcc_flags.append("-DENABLE_FFPA_CUDA_IMPL")
+    if cls.enable_f16_acc():
+      extra_gcc_flags.append("-DENABLE_FFPA_F16_ACC")
     return extra_gcc_flags
 
   @classmethod
@@ -352,12 +371,13 @@ class ENV(object):
     formatenv(
       "FFPA_DEV_HEADDIMS", cls.FFPA_DEV_HEADDIMS or (
         "range(32, 1024, 32)"
-        if cls.enable_all_headdim() else "range(320, 1024, 64)"
+        if cls.enable_all_headdim() else "range(64, 1024, 64)"
       )
     )
     formatenv("ENABLE_FFPA_ALL_STAGES", cls.enable_all_mutistages())
     formatenv("FFPA_BUILD_MAX_STAGES", cls.FFPA_BUILD_MAX_STAGES)
     formatenv("ENABLE_FFPA_ALL_HEADDIM", cls.enable_all_headdim())
+    formatenv("ENABLE_FFPA_F16_ACC", cls.enable_f16_acc())
     formatenv("ENABLE_FFPA_PREFETCH_QKV", cls.enable_prefetch_qkv())
     formatenv("ENABLE_FFPA_FORCE_QK_F16", cls.enable_force_qk_fp16())
     formatenv("ENABLE_FFPA_FORCE_PV_F16", cls.enable_force_pv_fp16())
@@ -413,73 +433,77 @@ class ENV(object):
       return sorted(subset)
     if cls.enable_all_headdim():
       return list(range(32, 1025, 32))
-    return list(range(256, 1025, 64))
+    return list(range(64, 1025, 64))
 
   @classmethod
   def generated_sources_dir(cls):
     return os.path.join(cls.project_dir(), "csrc", "cuffpa", "generated")
 
   @staticmethod
-  def _write_if_changed(path: str, content: str):
-    """Write ``content`` to ``path`` only if it differs from the current file.
-
-    Avoids touching mtime when unchanged so ``setuptools`` / ``ninja`` can
-    skip recompilation of TUs whose generated sources have not actually
-    changed.
-
-    :param path: Destination file path.
-    :param content: New file content to write when it differs from disk.
-    """
-    if os.path.exists(path):
-      with open(path, "r", encoding="utf-8") as f:
-        if f.read() == content:
-          return
+  def _write_file(path: str, content: str):
+    """Write ``content`` to ``path``, creating parent dirs as needed."""
     with open(path, "w", encoding="utf-8") as f:
       f.write(content)
 
   @classmethod
   def generate_split_headdim_sources(cls, build_pkg: bool = False):
-    """Generate per-headdim ``.cu`` translation units under ``csrc/cuffpa/generated/``.
+    """Generate per-(variant, headdim, stage) TUs under ``csrc/cuffpa/generated/``.
 
-    Splitting the big ``DISPATCH_HEADDIM`` switch into one TU per headdim
-    lets ``MAX_JOBS`` invoke nvcc on many files in parallel, dramatically
-    reducing the wall-clock build time of the heavy
-    ``launch_ffpa_attn_fwd_template`` instantiations. The generated files are
-    committed to the repository (not ignored); on every build the
-    generator refreshes their contents only when they would actually
-    change, so under steady state this is a no-op and incremental builds
-    stay fast.
+    Layout (variant ∈ {fp16f16 (only with ENABLE_FFPA_F16_ACC), fp16f32,
+    bf16f32}):
+
+    - ``fwd_<variant>_hdim{d}.cu``: lightweight wrapper TU. Includes only
+      ``fwd_decls.h`` (NOT ``launch.cuh``); dispatches on ``stages`` to the
+      per-stage symbols ``ffpa_attn_fwd_<variant>_d{d}_s{s}``. Keeps the
+      original dispatch symbol name so ``fwd_dispatch.cu`` / ``ffpa_api.cc``
+      are untouched.
+    - ``fwd_<variant>_hdim{d}_s{s}.cu``: heavy TU. Includes ``launch.cuh``
+      and contains a single ``launch_ffpa_attn_fwd_template`` instantiation
+      per stage, so ``MAX_JOBS`` parallelism is no longer bottlenecked by a
+      single TU serially compiling all stages.
+
+    The generated dir is wiped and rewritten on every call so stale files
+    from a previous config never leak into the build. It is gitignored.
 
     :param build_pkg: When ``True``, emit a per-call summary line via
         ``_logging_msg`` (suitable for the ``setup.py`` invocation).
-    :returns: List of generated file paths (declarations header first,
-        then per-headdim ``.cu`` sources, then the dispatch TU).
+    :returns: List of generated file paths (decls header, wrappers, stage
+        TUs, dispatch TU).
     """
     gen_dir = cls.generated_sources_dir()
-    os.makedirs(gen_dir, exist_ok=True)
-
     headdims = cls.get_enabled_headdims()
     generated = []
-
     fwd_generated_count = 0
+
     if cls.enable_fwd_cuda_impl():
-      # declarations header shared by per-D TUs + dispatch TU
+      # Wipe stale generated files from any prior config before regenerating.
+      shutil.rmtree(gen_dir, ignore_errors=True)
+      os.makedirs(gen_dir, exist_ok=True)
+
+      stages = cls._enabled_stages()
+      variants = cls._enabled_variants()
+
       decls_path = os.path.join(gen_dir, "fwd_decls.h")
-      cls._write_if_changed(decls_path, cls._render_decls_header(headdims))
+      cls._write_file(decls_path, cls._render_decls_header(headdims))
       generated.append(decls_path)
 
-      # two forward TUs per headdim, one per dtype
       for d in headdims:
-        fp16_path = os.path.join(gen_dir, f"fwd_fp16_hdim{d}.cu")
-        bf16_path = os.path.join(gen_dir, f"fwd_bf16_hdim{d}.cu")
-        cls._write_if_changed(fp16_path, cls._render_per_headdim_fp16_tu(d))
-        cls._write_if_changed(bf16_path, cls._render_per_headdim_bf16_tu(d))
-        generated.append(fp16_path)
-        generated.append(bf16_path)
+        for variant, t_in, prefix in variants:
+          wrapper_path = os.path.join(gen_dir, f"fwd_{variant}_hdim{d}.cu")
+          cls._write_file(wrapper_path, cls._render_wrapper_tu(variant, d))
+          generated.append(wrapper_path)
+          for s in stages:
+            stage_path = os.path.join(gen_dir, f"fwd_{variant}_hdim{d}_s{s}.cu")
+            cls._write_file(
+              stage_path, cls._render_stage_tu(variant, t_in, prefix, d, s)
+            )
+            generated.append(stage_path)
+          fwd_generated_count += 1 + len(stages)
+
       dispatch_path = os.path.join(gen_dir, "fwd_dispatch.cu")
-      cls._write_if_changed(dispatch_path, cls._render_dispatch_tu(headdims))
+      cls._write_file(dispatch_path, cls._render_dispatch_tu(headdims))
       generated.append(dispatch_path)
-      fwd_generated_count = len(headdims) * 2 + 1
+      fwd_generated_count += 1
 
     if build_pkg:
       _logging_msg(
@@ -490,218 +514,206 @@ class ENV(object):
 
     return generated
 
+  # constexpr prefix lines selecting kMmaAccFloat32QK / kMmaAccFloat32PV per
+  # variant. fp16f32 keeps the FORCE_{QK,PV}_F16 compile-time hooks for parity
+  # with the legacy single-TU behaviour.
+  _FP16F16_PREFIX = [
+    "  constexpr int kMmaAccFloat32QK = 0;",
+    "  constexpr int kMmaAccFloat32PV = 0;",
+  ]
+  _FP16F32_PREFIX = [
+    "#ifdef ENABLE_FFPA_FORCE_QK_F16",
+    "  constexpr int kMmaAccFloat32QK = 0;",
+    "#else",
+    "  constexpr int kMmaAccFloat32QK = 1;",
+    "#endif",
+    "#ifdef ENABLE_FFPA_FORCE_PV_F16",
+    "  constexpr int kMmaAccFloat32PV = 0;",
+    "#else",
+    "  constexpr int kMmaAccFloat32PV = 1;",
+    "#endif",
+  ]
+  _BF16F32_PREFIX = [
+    "  constexpr int kMmaAccFloat32QK = 1;",
+    "  constexpr int kMmaAccFloat32PV = 1;",
+  ]
+
+  @classmethod
+  def _enabled_stages(cls):
+    """Return the stage values to instantiate for the current build config.
+
+    ``ENABLE_FFPA_ALL_STAGES=1`` → ``1..FFPA_BUILD_MAX_STAGES``; ``=0`` →
+    ``[1, 2]``. Stage 1 is always present (runtime fallback).
+    """
+    if cls.enable_all_mutistages():
+      return list(range(1, cls.FFPA_BUILD_MAX_STAGES + 1))
+    return [1, 2]
+
+  @classmethod
+  def _enabled_variants(cls):
+    """Return ``(variant, t_in, constexpr_prefix)`` tuples to generate.
+
+    fp16f16 is prepended only when ``ENABLE_FFPA_F16_ACC`` is on; the fp16f32
+    / bf16f32 paths are always generated.
+    """
+    variants = [
+      ("fp16f32", "__half", cls._FP16F32_PREFIX),
+      ("bf16f32", "__nv_bfloat16", cls._BF16F32_PREFIX),
+    ]
+    if cls.enable_f16_acc():
+      variants.insert(0, ("fp16f16", "__half", cls._FP16F16_PREFIX))
+    return variants
+
   @staticmethod
-  def _render_decls_header(headdims):
+  def _arg_lines(with_stages: bool) -> list:
     lines = [
-      "// AUTO-GENERATED by env.py. DO NOT EDIT.",
-      "#pragma once",
-      "#include <torch/types.h>",
-      "",
-    ]
-    for d in headdims:
-      lines.append(
-        f"void ffpa_attn_fwd_fp16f16_d{d}(torch::Tensor Q, torch::Tensor K, "
-        f"torch::Tensor V, torch::Tensor O, torch::Tensor attn_bias, torch::Tensor softmax_lse, int stages, int causal, double softmax_scale, double dropout_p, int64_t philox_seed, int64_t philox_offset);"
-      )
-      lines.append(
-        f"void ffpa_attn_fwd_fp16f32_d{d}(torch::Tensor Q, torch::Tensor K, "
-        f"torch::Tensor V, torch::Tensor O, torch::Tensor attn_bias, torch::Tensor softmax_lse, int stages, int causal, double softmax_scale, double dropout_p, int64_t philox_seed, int64_t philox_offset);"
-      )
-      lines.append(
-        f"void ffpa_attn_fwd_bf16f32_d{d}(torch::Tensor Q, torch::Tensor K, "
-        f"torch::Tensor V, torch::Tensor O, torch::Tensor attn_bias, torch::Tensor softmax_lse, int stages, int causal, double softmax_scale, double dropout_p, int64_t philox_seed, int64_t philox_offset);"
-      )
-    lines.append("")
-    return "\n".join(lines)
-
-  @staticmethod
-  def _render_stage_body(d: int, t_in: str, qk: str, pv: str) -> str:
-    """Render the stage-dispatch body at body scope (2-space indent).
-
-    Stages dispatched: ``ENABLE_FFPA_ALL_STAGES=1`` → 2..max_stages plus
-    fallback to 1; ``=0`` → only 2 plus fallback to 1.
-
-    :param d: Headdim value to bake into the kernel template arguments.
-    :param t_in: C++ activation type name (e.g. ``__half`` or
-        ``__nv_bfloat16``).
-    :param qk: Identifier for the ``kMmaAccFloat32QK`` template constant
-        in scope at the call site.
-    :param pv: Identifier for the ``kMmaAccFloat32PV`` template constant
-        in scope at the call site.
-    :returns: Rendered C++ snippet wrapping the per-stage
-        ``launch_ffpa_attn_fwd_template`` calls.
-    """
-    call = (
-      f"launch_ffpa_attn_fwd_template<{t_in}, {d}, {qk}, {pv}, "
-      "{S}>(Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale, "
-      "dropout_p, philox_seed, philox_offset);"
-    )
-    max_stages = ENV.FFPA_BUILD_MAX_STAGES
-    full_lines = ["#ifdef ENABLE_FFPA_ALL_STAGES"]
-    full_lines.append("  if (stages == 2) {")
-    full_lines.append(f"    {call.replace('{S}', '2')}")
-    for s in range(3, max_stages + 1):
-      full_lines.append(f"  }} else if (stages == {s}) {{")
-      full_lines.append(f"    {call.replace('{S}', str(s))}")
-    full_lines.append("  } else {")
-    full_lines.append(f"    {call.replace('{S}', '1')}")
-    full_lines.append("  }")
-    full_lines.append("#else")
-    full_lines.append("  if (stages == 2) {")
-    full_lines.append(f"    {call.replace('{S}', '2')}")
-    full_lines.append("  } else {")
-    full_lines.append(f"    {call.replace('{S}', '1')}")
-    full_lines.append("  }")
-    full_lines.append("#endif")
-    return "\n".join(full_lines) + "\n"
-
-  @classmethod
-  def _render_per_headdim_fp16_tu(cls, d: int) -> str:
-    """Render the fp16-only TU for headdim ``d`` with two entry points.
-
-    The two emitted symbols are:
-
-    - ``ffpa_attn_fwd_fp16f16_d{d}``: fp16 activation, MMA acc=f16.
-    - ``ffpa_attn_fwd_fp16f32_d{d}``: fp16 activation, MMA acc=f32
-      (with ``ENABLE_FFPA_FORCE_{QK,PV}_F16`` fall-back hooks for parity).
-
-    :param d: Headdim value to bake into both entry symbols.
-    :returns: Rendered TU source string ready to write to a ``.cu`` file.
-    """
-    lines = [
-      "// AUTO-GENERATED by env.py. DO NOT EDIT.",
-      '#include "launch.cuh"',
-      "using namespace ffpa;",
-      "",
-    ]
-    f16_prefix = [
-      "  constexpr int kMmaAccFloat32QK = 0;",
-      "  constexpr int kMmaAccFloat32PV = 0;",
-    ]
-    f32_prefix = [
-      "#ifdef ENABLE_FFPA_FORCE_QK_F16",
-      "  constexpr int kMmaAccFloat32QK = 0;",
-      "#else",
-      "  constexpr int kMmaAccFloat32QK = 1;",
-      "#endif",
-      "#ifdef ENABLE_FFPA_FORCE_PV_F16",
-      "  constexpr int kMmaAccFloat32PV = 0;",
-      "#else",
-      "  constexpr int kMmaAccFloat32PV = 1;",
-      "#endif",
-    ]
-
-    body = "\n".join(lines) + "\n"
-    body += cls._render_entry(
-      d, f"ffpa_attn_fwd_fp16f16_d{d}", "__half", f16_prefix
-    ) + "\n"
-    body += cls._render_entry(
-      d, f"ffpa_attn_fwd_fp16f32_d{d}", "__half", f32_prefix
-    )
-    return body
-
-  @classmethod
-  def _render_per_headdim_bf16_tu(cls, d: int) -> str:
-    """Render the bf16-only TU for headdim ``d``.
-
-    Only one entry (``ffpa_attn_fwd_bf16f32_d{d}``) is emitted because
-    bf16 has no f16-acc mma PTX; acc is forced to f32.
-
-    :param d: Headdim value to bake into the entry symbol.
-    :returns: Rendered TU source string ready to write to a ``.cu`` file.
-    """
-    lines = [
-      "// AUTO-GENERATED by env.py. DO NOT EDIT.",
-      '#include "launch.cuh"',
-      "using namespace ffpa;",
-      "",
-    ]
-    bf16_prefix = [
-      "  constexpr int kMmaAccFloat32QK = 1;",
-      "  constexpr int kMmaAccFloat32PV = 1;",
-    ]
-    body = "\n".join(lines) + "\n"
-    body += cls._render_entry(
-      d, f"ffpa_attn_fwd_bf16f32_d{d}", "__nv_bfloat16", bf16_prefix
-    )
-    return body
-
-  @classmethod
-  def _render_entry(
-    cls, d: int, symbol: str, t_in: str, body_prefix: list
-  ) -> str:
-    head = [
-      f"void {symbol}(",
       "    torch::Tensor Q,",
       "    torch::Tensor K,",
       "    torch::Tensor V,",
       "    torch::Tensor O,",
       "    torch::Tensor attn_bias,",
       "    torch::Tensor softmax_lse,",
-      "    int stages,",
+    ]
+    if with_stages:
+      lines.append("    int stages,")
+    lines += [
       "    int causal,",
       "    double softmax_scale,",
       "    double dropout_p,",
       "    int64_t philox_seed,",
-      "    int64_t philox_offset) {",
+      "    int64_t philox_offset)",
     ]
-
-    stage_body = cls._render_stage_body(
-      d, t_in, "kMmaAccFloat32QK", "kMmaAccFloat32PV"
-    )
-    return (
-      "\n".join(head) + "\n" + "\n".join(body_prefix) + "\n" + stage_body +
-      "}\n"
-    )
+    return lines
 
   @staticmethod
-  def _render_dispatch_tu(headdims) -> str:
+  def _decl(symbol: str, with_stages: bool) -> str:
+    args = (
+      "torch::Tensor Q, torch::Tensor K, torch::Tensor V, "
+      "torch::Tensor O, torch::Tensor attn_bias, torch::Tensor softmax_lse"
+    )
+    if with_stages:
+      args += ", int stages"
+    args += (
+      ", int causal, double softmax_scale, double dropout_p, "
+      "int64_t philox_seed, int64_t philox_offset"
+    )
+    return f"void {symbol}({args});"
 
-    def _cases(symbol_prefix: str) -> str:
-      return "\n".join(
-        f"    case {d}: {symbol_prefix}_d{d}"
-        "(Q, K, V, O, attn_bias, softmax_lse, stages, causal, softmax_scale, "
-        "dropout_p, philox_seed, philox_offset); break;" for d in headdims
-      )
+  @classmethod
+  def _signature(cls, symbol: str, with_stages: bool) -> str:
+    head = [f"void {symbol}("] + cls._arg_lines(with_stages)
+    head[-1] = head[-1] + " {"
+    return "\n".join(head)
 
-    def _fn(name: str, symbol_prefix: str, torch_dtype: str) -> str:
-      return (
-        f"void {name}(\n"
-        "    torch::Tensor Q,\n"
-        "    torch::Tensor K,\n"
-        "    torch::Tensor V,\n"
-        "    torch::Tensor O,\n"
-        "    torch::Tensor attn_bias,\n"
-        "    torch::Tensor softmax_lse,\n"
-        "    int stages,\n"
-        "    int causal,\n"
-        "    double softmax_scale,\n"
-        "    double dropout_p,\n"
-        "    int64_t philox_seed,\n"
-        "    int64_t philox_offset) {\n"
-        f"  CHECK_TORCH_TENSOR_DTYPE(Q, {torch_dtype})\n"
-        f"  CHECK_TORCH_TENSOR_DTYPE(K, {torch_dtype})\n"
-        f"  CHECK_TORCH_TENSOR_DTYPE(V, {torch_dtype})\n"
-        f"  CHECK_TORCH_TENSOR_DTYPE(O, {torch_dtype})\n"
-        "  const int d = Q.size(3);\n"
-        "  switch (d) {\n"
-        f"{_cases(symbol_prefix)}\n"
-        '    default: throw std::runtime_error("headdim not support!");\n'
-        "  }\n"
-        "}\n"
-      )
+  @classmethod
+  def _render_decls_header(cls, headdims):
+    variants = cls._enabled_variants()
+    stages = cls._enabled_stages()
+    lines = [
+      "// AUTO-GENERATED by env.py. DO NOT EDIT.",
+      "#pragma once",
+      "#include <torch/types.h>",
+      "",
+    ]
+    for variant, _, _ in variants:
+      for d in headdims:
+        lines.append(cls._decl(f"ffpa_attn_fwd_{variant}_d{d}", True))
+        for s in stages:
+          lines.append(cls._decl(f"ffpa_attn_fwd_{variant}_d{d}_s{s}", False))
+    lines.append("")
+    return "\n".join(lines)
 
+  @classmethod
+  def _render_wrapper_dispatch(cls, variant: str, d: int) -> str:
+    """Render the ``if (stages == s) {...}`` chain calling per-stage symbols.
+
+    Stage 1 is the fallback (covers ``stages == 1`` and any out-of-range
+    value), mirroring the legacy dispatch semantics.
+    """
+    branches = [s for s in cls._enabled_stages() if s != 1]
+    call = (
+      "Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale, "
+      "dropout_p, philox_seed, philox_offset"
+    )
+    if not branches:
+      return f"  ffpa_attn_fwd_{variant}_d{d}_s1({call});\n"
+    lines = []
+    for i, s in enumerate(branches):
+      kw = "if" if i == 0 else "else if"
+      lines.append(f"  {kw} (stages == {s}) {{")
+      lines.append(f"    ffpa_attn_fwd_{variant}_d{d}_s{s}({call});")
+      lines.append("  }")
+    lines.append("  else {")
+    lines.append(f"    ffpa_attn_fwd_{variant}_d{d}_s1({call});")
+    lines.append("  }")
+    return "\n".join(lines) + "\n"
+
+  @classmethod
+  def _render_wrapper_tu(cls, variant: str, d: int) -> str:
+    """Lightweight wrapper TU: only ``fwd_decls.h``, stage if/else dispatch."""
     return (
       "// AUTO-GENERATED by env.py. DO NOT EDIT.\n"
-      '#include "logging.cuh"\n'
-      '#include "fwd_decls.h"\n'
-      "\n" +
-      _fn("ffpa_attn_fwd_fp16f16", "ffpa_attn_fwd_fp16f16", "torch::kHalf") +
-      "\n" +
-      _fn("ffpa_attn_fwd_fp16f32", "ffpa_attn_fwd_fp16f32", "torch::kHalf") +
-      "\n" +
-      _fn("ffpa_attn_fwd_bf16f32", "ffpa_attn_fwd_bf16f32", "torch::kBFloat16")
+      '#include "fwd_decls.h"\n\n' +
+      cls._signature(f"ffpa_attn_fwd_{variant}_d{d}", True) + "\n" +
+      cls._render_wrapper_dispatch(variant, d) + "}\n"
     )
+
+  @classmethod
+  def _render_stage_tu(
+    cls, variant: str, t_in: str, prefix: list, d: int, s: int
+  ) -> str:
+    """Heavy stage TU: one ``launch_ffpa_attn_fwd_template`` instantiation."""
+    body = list(prefix)
+    body.append(
+      f"  launch_ffpa_attn_fwd_template<{t_in}, {d}, kMmaAccFloat32QK, "
+      f"kMmaAccFloat32PV, {s}>(Q, K, V, O, attn_bias, softmax_lse, causal, "
+      "softmax_scale, dropout_p, philox_seed, philox_offset);"
+    )
+    return (
+      "// AUTO-GENERATED by env.py. DO NOT EDIT.\n"
+      '#include "launch.cuh"\n'
+      "using namespace ffpa;\n\n" +
+      cls._signature(f"ffpa_attn_fwd_{variant}_d{d}_s{s}", False) + "\n" +
+      "\n".join(body) + "\n}\n"
+    )
+
+  @classmethod
+  def _render_dispatch_tu(cls, headdims) -> str:
+    # fp16f16 (acc=0) dispatch is only emitted when ENABLE_FFPA_F16_ACC is on.
+    specs = [
+      ("ffpa_attn_fwd_fp16f32", "torch::kHalf"),
+      ("ffpa_attn_fwd_bf16f32", "torch::kBFloat16"),
+    ]
+    if cls.enable_f16_acc():
+      specs.insert(0, ("ffpa_attn_fwd_fp16f16", "torch::kHalf"))
+
+    out = [
+      "// AUTO-GENERATED by env.py. DO NOT EDIT.",
+      '#include "logging.cuh"',
+      '#include "fwd_decls.h"',
+      "",
+    ]
+    for name, dtype in specs:
+      out.append(cls._signature(name, True))
+      out.append(f"  CHECK_TORCH_TENSOR_DTYPE(Q, {dtype})")
+      out.append(f"  CHECK_TORCH_TENSOR_DTYPE(K, {dtype})")
+      out.append(f"  CHECK_TORCH_TENSOR_DTYPE(V, {dtype})")
+      out.append(f"  CHECK_TORCH_TENSOR_DTYPE(O, {dtype})")
+      out.append("  const int d = Q.size(3);")
+      out.append("  switch (d) {")
+      for d in headdims:
+        out.append(
+          f"    case {d}: {name}_d{d}(Q, K, V, O, attn_bias, softmax_lse, "
+          "stages, causal, softmax_scale, dropout_p, philox_seed, "
+          "philox_offset); break;"
+        )
+      out.append(
+        '    default: throw std::runtime_error("headdim not support!");'
+      )
+      out.append("  }")
+      out.append("}")
+      out.append("")
+    return "\n".join(out) + "\n"
 
   @staticmethod
   def get_build_sources(build_pkg: bool = False):
