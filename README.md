@@ -9,7 +9,7 @@
     <img src="docs/assets/ffpa-api.png" width="700px">
 </div>
 
-**FFPA**: Fast and Memory-Efficient Exact Attention for **Large Headdim**, achieving **O(1)** SRAM complexity (w/ [**Split-D**](#-split-d)) and **O(d/4)** register complexity, **1.5x~6x** speedup over standard PyTorch SDPA. FFPA extends the headdim support beyond **D > 256** (up to **1024**) without any precision loss.
+**FFPA**: Fast and Memory-Efficient Exact Attention for **Large Headdim**, achieving **O(1)** SRAM complexity (w/ [**Split-D**](#ffpa-design)) and **O(d/4)** register complexity, **1.5x~6x** speedup over standard PyTorch SDPA. FFPA extends the headdim support beyond **D > 256** (up to **1024**) without any precision loss.
 
 <div align='center' markdown="1">
 
@@ -37,7 +37,7 @@ git clone https://github.com/xlite-dev/ffpa-attn.git
 # Then, build the wheel package (Triton + CuTe-DSL backends)
 cd ffpa-attn && pip3 install -e . --no-build-isolation
 # Optional: install ffpa-attn w/ CUDA backend (forward only)
-tools/build_fast.sh --arch sm_120f --ext all --headdim all
+bash ./build.sh --arch sm_120f --ext all --headdim all
 ```
 
 Then, try to accelerate the attention for large headdim with just <i><b>one-line</b></i> of code:
@@ -52,15 +52,25 @@ Then, try to accelerate the attention for large headdim with just <i><b>one-line
 
 For more advanced features, please refer to our online docs at 📘[ffpa-attn.io](https://ffpa-attn.readthedocs.io/en/latest/).
 
-## Split-D
+## Split-D and TiledMMA
 
 <a id="ffpa-design"></a>
 
-We extend FlashAttention to support large headdim ($D>256$) via **fine-grained tiling** at the **MMA** level for $QK^\top$ and $PV$ matrix multiplication, referred to as [**Split-D**](./csrc/cuffpa/cute/sm_120/split_d.cuh). This design keeps SRAM usage fixed at $B_r \times 16$ (with $B_r=B_c$) for Q, K and V, yielding constant SRAM complexity $O(B_r \times 16) \approx O(1)$ & register complexity $O(d/4)$ (w/ [**TiledMMA<4,2,1>**](./csrc/cuffpa/cute/sm_120/split_d_m4n2.cuh)).
+We extend FlashAttention to support large headdim ($D>256$) via **fine-grained tiling** at the **MMA** level for $QK^\top$ and $PV$ matrix multiplication. Two orthogonal $O(D)$ bottlenecks — SRAM footprint and register pressure — are broken by **Split-D** and **TiledMMA<4,2,1>** respectively.
+
+[**Split-D**](./csrc/cuffpa/cute/sm_120/split_d.cuh): The tiling of the $D$ axis breaks the SRAM bottleneck. A persist-D layout keeps $Q$ resident in SRAM at $O(D)$ ($D{=}512 \Rightarrow 192\text{KB} > 99\text{KB}$ per-CTA limit on sm_8x/sm_120). Split-D chunks the $D$ axis, keeping SRAM fixed at $B_r \times 16$ (with $B_r=B_c$) for Q, K and V, yielding constant SRAM complexity $O(B_r \times 16) \approx O(1)$.
 
 <div align='center'>
-  <img src="./docs/assets/split-d.png" width="700px">
+  <img src="./docs/assets/split-d.png" width="750px">
 </div>
+
+[**TiledMMA**](./csrc/cuffpa/cute/sm_120/split_d_m4n2.cuh): The **M4N2** layout breaks the register bottleneck. The $QK^\top$ has $N{=}B_c$ (fixed, independent of $D$), so its acc is $O(1)$; the $PV$ GEMM instead has $N{=}D$, so the $O$ acc costs $D/(2{\cdot}N_w)$ regs/thread. **M8N1** (FA-2 style, $N_w{=}1$) $\Rightarrow O(D/2)$: at $D{=}512$ this already reaches 256 regs/thread, over the 255 architectural limit and spilling. Splitting $N$ to **M4N2** (FA-1 style, $N_w{=}2$) halves it to $O(D/4)$, keeping $D{=}1024$ just feasible (256 regs/thread).
+
+<div align='center'>
+  <img src="./docs/assets/mma.png" width="800px">
+</div>
+
+**Dispatch**: **M8N1** for $D \le 512$, **M4N2** for $D > 512$. On RTX 5090, **M4N2** delivers **1.55×** the throughput of **M8N1** at $D{=}1024$ (154T vs 100T, where **M8N1** collapses from register spilling).
 
 ## Benchmark
 
@@ -109,7 +119,7 @@ python -m ffpa_attn.autotune --mode max --full-tasks --num-gpus 8 --overwrite
 
 ## End-to-End (E2E) Training
 
-NVIDIA-NeMo Automodel PR [#2436](https://github.com/NVIDIA-NeMo/Automodel/pull/2436) shows that on Gemma4-31B training (L=8192, 8xH200, FSDP2 + Activation Checkpointing), accelerating the **10/60 (D=512)** full-attention layers with ffpa-attn delivers about [`1.4x-1.5x`](https://github.com/NVIDIA-NeMo/Automodel/pull/2436) higher throughput (**E2E**) than SDPA at similar memory footprint, with loss aligned within normal bf16 noise.
+NVIDIA-NeMo Automodel PR [#2436](https://github.com/NVIDIA-NeMo/Automodel/pull/2436) shows that on Gemma4-31B training (L=8192, 8xH200, FSDP2 + Activation Checkpointing), accelerating the **10/60 (D=512)** full-attention layers with FFPA delivers about [`1.4x~1.5x`](https://github.com/NVIDIA-NeMo/Automodel/pull/2436) higher throughput (**E2E**) than SDPA at similar memory footprint, with loss aligned within normal bf16 noise.
 
 <!--
 <div align='center'>
@@ -117,13 +127,13 @@ NVIDIA-NeMo Automodel PR [#2436](https://github.com/NVIDIA-NeMo/Automodel/pull/2
 </div>
 -->
 
-## ©️License
+## License
 
 <div id="License"></div>
 
 Apache License 2.0
 
-## ©️Citations
+## Citations
 
 ```BibTeX
 @misc{deftruth2026ffpa,
