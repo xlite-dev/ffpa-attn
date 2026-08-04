@@ -349,6 +349,12 @@ class ENV(object):
       extra_gcc_flags.append("-DENABLE_FFPA_CUDA_IMPL")
     if cls.enable_f16_acc():
       extra_gcc_flags.append("-DENABLE_FFPA_F16_ACC")
+    # Expose TMA/CUTE ext macros to the .cc pybind TU (ffpa_api.cc) so the
+    # CUDA_CUTE_TMA_AVAILABLE attr guard reflects the actual build config.
+    if cls.enable_tma_ext():
+      extra_gcc_flags.append("-DENABLE_FFPA_TMA_EXT")
+    if cls.enable_cute_ext():
+      extra_gcc_flags.append("-DENABLE_FFPA_CUTE_EXT")
     return extra_gcc_flags
 
   @classmethod
