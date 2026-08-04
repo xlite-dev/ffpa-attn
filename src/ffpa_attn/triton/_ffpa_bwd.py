@@ -524,6 +524,8 @@ def _ffpa_bwd_kernel_impl(
   autotune_seqlen_k_bucket: int,
   autotune_causal_key: int,
   autotune_dtype_key: int,
+  autotune_bias_key: int,
+  autotune_dropout_key: int,
   seqlen_q_rounded: int,
   headdim: int,
   dropout_p: float,
@@ -549,6 +551,8 @@ def _ffpa_bwd_kernel_impl(
   _ = autotune_seqlen_k_bucket
   _ = autotune_causal_key
   _ = autotune_dtype_key
+  _ = autotune_bias_key
+  _ = autotune_dropout_key
   if USE_DKDVDQ_FUSION:
     _ffpa_bwd_dkdvdq(
       Q, K, V, DO, DQ, DK, DV, LSE, D, AttnBias, GradAttnBias, softmax_scale,
@@ -1352,6 +1356,8 @@ def _ffpa_bwd_dkdv_kernel_impl(
   autotune_seqlen_k_bucket: int,
   autotune_causal_key: int,
   autotune_dtype_key: int,
+  autotune_bias_key: int,
+  autotune_dropout_key: int,
   seqlen_q_rounded: int,
   headdim: int,
   dropout_p: float,
@@ -1375,6 +1381,8 @@ def _ffpa_bwd_dkdv_kernel_impl(
   _ = autotune_seqlen_k_bucket
   _ = autotune_causal_key
   _ = autotune_dtype_key
+  _ = autotune_bias_key
+  _ = autotune_dropout_key
   _ffpa_bwd_dkdv(
     Q, K, V, DO, DK, DV, LSE, D, AttnBias, GradAttnBias, softmax_scale,
     stride_qb, stride_qh, stride_qm, stride_kb, stride_kh, stride_kn, stride_vb,
@@ -1427,6 +1435,8 @@ def _ffpa_bwd_dq_kernel_impl(
   autotune_seqlen_k_bucket: int,
   autotune_causal_key: int,
   autotune_dtype_key: int,
+  autotune_bias_key: int,
+  autotune_dropout_key: int,
   seqlen_q_rounded: int,
   headdim: int,
   dropout_p: float,
@@ -1445,6 +1455,8 @@ def _ffpa_bwd_dq_kernel_impl(
   _ = autotune_seqlen_k_bucket
   _ = autotune_causal_key
   _ = autotune_dtype_key
+  _ = autotune_bias_key
+  _ = autotune_dropout_key
   _ffpa_bwd_dq(
     Q, K, V, DO, DQ, LSE, D, AttnBias, softmax_scale, stride_qb, stride_qh,
     stride_qm, stride_kb, stride_kh, stride_kn, stride_vb, stride_vh, stride_vn,
@@ -1509,6 +1521,8 @@ def _get_bwd_autotune(
         "headdim",
         "autotune_causal_key",
         "autotune_dtype_key",
+        "autotune_bias_key",
+        "autotune_dropout_key",
       ],
       reset_to_zero=reset_args,
       cache_results=True,
@@ -1536,6 +1550,8 @@ def _get_bwd_dkdv_autotune(
         "headdim",
         "autotune_causal_key",
         "autotune_dtype_key",
+        "autotune_bias_key",
+        "autotune_dropout_key",
       ],
       reset_to_zero=reset_args,
       cache_results=True,
@@ -1558,6 +1574,8 @@ def _get_bwd_dq_autotune(headdim: int, autotune_mode: str):
         "headdim",
         "autotune_causal_key",
         "autotune_dtype_key",
+        "autotune_bias_key",
+        "autotune_dropout_key",
       ],
       reset_to_zero=["DQ"],
       cache_results=True,
@@ -1636,6 +1654,8 @@ def _get_decode_bwd_stage1_autotune(
         "headdim",
         "autotune_causal_key",
         "autotune_dtype_key",
+        "autotune_bias_key",
+        "autotune_dropout_key",
       ],
       reset_to_zero=reset_args,
       cache_results=True,
@@ -1722,6 +1742,8 @@ def _ffpa_bwd_decode_stage1_kernel(
   autotune_seqlen_k_bucket: int,
   autotune_causal_key: int,
   autotune_dtype_key: int,
+  autotune_bias_key: int,
+  autotune_dropout_key: int,
   seqlen_q_rounded: int,
   headdim: int,
   dropout_p: float,
@@ -1744,6 +1766,8 @@ def _ffpa_bwd_decode_stage1_kernel(
   _ = autotune_seqlen_k_bucket
   _ = autotune_causal_key
   _ = autotune_dtype_key
+  _ = autotune_bias_key
+  _ = autotune_dropout_key
 
   # Decode backward splits work by K block. DK/DV are independent per K block,
   # but dQ is a sum over all K blocks, so stage1 writes PartialDQ and the reduce
@@ -2143,6 +2167,8 @@ def _ffpa_attn_backward_triton_impl(
   autotune_seqlen_q_bucket = autotune_seqlen_key(seqlen_q, autotune_mode)
   autotune_seqlen_k_bucket = autotune_seqlen_key(seqlen_k, autotune_mode)
   autotune_causal_key = int(causal)
+  autotune_bias_key = int(attn_bias is not None)
+  autotune_dropout_key = int(dropout_p > 0.0)
   has_attn_bias = attn_bias is not None
   attn_bias_in = attn_bias if attn_bias is not None else q
   bias_strides = _attn_bias_broadcast_strides(
@@ -2403,6 +2429,8 @@ def _ffpa_attn_backward_triton_impl(
       autotune_seqlen_k_bucket,
       autotune_causal_key,
       autotune_dtype_key,
+      autotune_bias_key,
+      autotune_dropout_key,
       seqlen_q_rounded,
       headdim,
       dropout_p,
@@ -2530,6 +2558,8 @@ def _ffpa_attn_backward_triton_impl(
       autotune_seqlen_k_bucket,
       autotune_causal_key,
       autotune_dtype_key,
+      autotune_bias_key,
+      autotune_dropout_key,
       seqlen_q_rounded,
       headdim,
       dropout_p,
@@ -2582,6 +2612,8 @@ def _ffpa_attn_backward_triton_impl(
       autotune_seqlen_k_bucket,
       autotune_causal_key,
       autotune_dtype_key,
+      autotune_bias_key,
+      autotune_dropout_key,
       seqlen_q_rounded,
       headdim,
       dropout_p,
@@ -2696,6 +2728,8 @@ def _ffpa_attn_backward_triton_impl(
       autotune_seqlen_k_bucket,
       autotune_causal_key,
       autotune_dtype_key,
+      autotune_bias_key,
+      autotune_dropout_key,
       seqlen_q_rounded,
       headdim,
       dropout_p,
@@ -2768,6 +2802,8 @@ def _ffpa_attn_backward_triton_impl(
       autotune_seqlen_k_bucket,
       autotune_causal_key,
       autotune_dtype_key,
+      autotune_bias_key,
+      autotune_dropout_key,
       seqlen_q_rounded,
       headdim,
       dropout_p,

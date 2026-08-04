@@ -105,3 +105,76 @@ def exact_autotune_seqlen_keys() -> Iterator[None]:
     yield
   finally:
     _EXACT_AUTOTUNE_SEQLEN_KEYS.reset(token)
+
+
+_resilient_autotune_installed = False
+
+
+def install_resilient_autotuner() -> None:
+  """Monkey-patch Triton's Autotuner so final-launch OutOfResources falls back.
+
+  Triton's built-in autotuner already skips configs that fail during benchmark
+  with ``OutOfResources`` / ``CompileTimeAssertionFailure`` / ``PTXASError``.
+  However, once a best config is cached and replayed on a later call (e.g.
+  with different ``tl.constexpr`` flags that were not part of the key) the
+  same config may fail at final-launch time. This patch wraps
+  :meth:`triton.runtime.autotuner.Autotuner.run` so that if the cached best
+  config raises a resource error, the runner walks the remaining candidates
+  in benchmark order until one succeeds.
+
+  Safe to call multiple times; subsequent calls are no-ops.
+  """
+  global _resilient_autotune_installed
+  if _resilient_autotune_installed:
+    return
+
+  import triton.runtime.autotuner as _autotuner_mod
+  from triton.compiler.errors import CompileTimeAssertionFailure
+  from triton.runtime.errors import OutOfResources, PTXASError
+
+  _invalid_config_errors = (
+    OutOfResources,
+    CompileTimeAssertionFailure,
+    PTXASError,
+  )
+
+  _orig_run = _autotuner_mod.Autotuner.run
+
+  def _resilient_run(self, *args, **kwargs):
+    try:
+      return _orig_run(self, *args, **kwargs)
+    except _invalid_config_errors as first_exc:
+      timings = getattr(self, "configs_timings", None)
+      if timings is None:
+        raise
+      sorted_configs = sorted(
+        (c for c in self.configs if c in timings),
+        key=lambda c: timings[c][0],
+      )
+      best = getattr(self, "best_config", None)
+      last_exc: BaseException = first_exc
+      for config in sorted_configs:
+        if config is best:
+          continue
+        if config.pre_hook is not None:
+          full_nargs = {
+            **dict(zip(self.arg_names, args)),
+            **kwargs,
+            **config.all_kwargs(),
+          }
+          config.pre_hook(full_nargs)
+        try:
+          result = self.fn.run(*args, **kwargs, **config.all_kwargs())
+        except _invalid_config_errors as e:
+          last_exc = e
+          continue
+        self.best_config = config
+        return result
+      raise RuntimeError(
+        f"No valid autotune config for "
+        f"{getattr(self.base_fn, '__name__', repr(self.fn))} "
+        f"after trying {len(self.configs)} candidates."
+      ) from last_exc
+
+  _autotuner_mod.Autotuner.run = _resilient_run
+  _resilient_autotune_installed = True

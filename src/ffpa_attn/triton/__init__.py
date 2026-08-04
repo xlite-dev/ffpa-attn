@@ -169,8 +169,11 @@
 """
 import torch
 
+from ._autotune_utils import install_resilient_autotuner
 from ._ffpa_fwd import _ffpa_attn_forward_triton
 from ._ffpa_bwd import _ffpa_attn_backward_triton
+
+install_resilient_autotuner()
 
 _OP_NAMESPACE = "ffpa_attn"
 
