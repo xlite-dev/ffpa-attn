@@ -214,10 +214,14 @@ class CUDABackend(Backend):
   def _default_cuda_stages(self) -> int:
     from .cuda import CudaBackendImpl
     """Default pipeline depth for CUDA backend (non-TMA path)."""
-    if _is_hopper_or_later(
-    ) and self.impl_hint in (CudaBackendImpl.NATIVE, CudaBackendImpl.TMA):
-      return 4
-    return 3
+    if _is_hopper_or_later():
+      if self.impl_hint in (CudaBackendImpl.NATIVE, CudaBackendImpl.TMA):
+        return 4  # sm>=90, native or TMA path
+      elif self.impl_hint in (CudaBackendImpl.CUTE, CudaBackendImpl.CUTE_TMA):
+        return 2  # sm>=90, CuTe path
+    if self.impl_hint == CudaBackendImpl.CUTE:
+      return 2  # sm<90, cute path
+    return 3  # sm<90, native path
 
   @property
   def impl_hint(self) -> int:
