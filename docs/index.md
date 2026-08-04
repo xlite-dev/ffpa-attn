@@ -199,7 +199,7 @@ print(f"dK vs SDPA dK max_abs_err={(dk - k_ref.grad).abs().max().item():.4e}")
 print(f"dV vs SDPA dV max_abs_err={(dv - v_ref.grad).abs().max().item():.4e}")
 ```
 
-## Split-D
+## Split-D and M4N2
 
 <a id="ffpa-design"></a>
 
