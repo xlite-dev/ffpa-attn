@@ -9,7 +9,7 @@
     <img src="docs/assets/ffpa-api.png" width="700px">
 </div>
 
-**FFPA**: Fast and Memory-Efficient Exact Attention for **Large Headdim**, achieving **O(1)** SRAM complexity (w/ [**Split-D**](#-split-d)) and **O(d/4)** register complexity, **1.5x~6x** speedup over standard PyTorch SDPA. FFPA extends the headdim support beyond **D > 256** (up to **1024**) without any precision loss.
+**FFPA**: Fast and Memory-Efficient Exact Attention for **Large Headdim**, achieving **O(1)** SRAM complexity (w/ [**Split-D**](#ffpa-design)) and **O(d/4)** register complexity, **1.5x~6x** speedup over standard PyTorch SDPA. FFPA extends the headdim support beyond **D > 256** (up to **1024**) without any precision loss.
 
 <div align='center' markdown="1">
 
@@ -37,7 +37,7 @@ git clone https://github.com/xlite-dev/ffpa-attn.git
 # Then, build the wheel package (Triton + CuTe-DSL backends)
 cd ffpa-attn && pip3 install -e . --no-build-isolation
 # Optional: install ffpa-attn w/ CUDA backend (forward only)
-tools/build_fast.sh --arch sm_120f --ext all --headdim all
+bash ./build.sh --arch sm_120f --ext all --headdim all
 ```
 
 Then, try to accelerate the attention for large headdim with just <i><b>one-line</b></i> of code:
@@ -117,13 +117,13 @@ NVIDIA-NeMo Automodel PR [#2436](https://github.com/NVIDIA-NeMo/Automodel/pull/2
 </div>
 -->
 
-## ©️License
+## License
 
 <div id="License"></div>
 
 Apache License 2.0
 
-## ©️Citations
+## Citations
 
 ```BibTeX
 @misc{deftruth2026ffpa,
