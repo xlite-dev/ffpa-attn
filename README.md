@@ -60,11 +60,17 @@ We extend FlashAttention to support large headdim ($D>256$) via **fine-grained t
 
 [**Split-D**](./csrc/cuffpa/cute/sm_120/split_d.cuh): The tiling of the $D$ axis breaks the SRAM bottleneck. A persist-D layout keeps $Q$ resident in SRAM at $O(D)$ ($D{=}512 \Rightarrow 192\text{KB} > 99\text{KB}$ per-CTA limit on sm_8x/sm_120). Split-D chunks the $D$ axis, keeping SRAM fixed at $B_r \times 16$ (with $B_r=B_c$) for Q, K and V, yielding constant SRAM complexity $O(B_r \times 16) \approx O(1)$.
 
-[**TiledMMA**](./csrc/cuffpa/cute/sm_120/split_d_m4n2.cuh): The **M4N2** MMA layout breaks the register bottleneck, which lives in $PV$ rather than $QK^\top$: the $QK^\top$ GEMM has $N{=}B_c$ (fixed, independent of $D$), so its accumulator is $O(1)$; the $PV$ GEMM instead has $N{=}D$, so the $O$ accumulator costs $D/(2{\cdot}N_w)$ regs/thread. **M8N1** (FA-2 style, $N_w{=}1$) $\Rightarrow O(D/2)$: at $D{=}512$ this already reaches 256 regs/thread, over the 255 architectural limit and spilling. Splitting $N$ to **M4N2** (FA-1 style, $N_w{=}2$) halves it to $O(D/4)$, keeping $D{=}1024$ just feasible (256 regs/thread). Dispatch: **M8N1** for $D \le 512$, **M4N2** for $D > 512$. On RTX 5090, **M4N2** delivers **1.55×** the throughput of **M8N1** at $D{=}1024$ (154T vs 100T, where **M8N1** collapses from register spilling).
+<div align='center'>
+  <img src="./docs/assets/split-d.png" width="800px">
+</div>
+
+[**TiledMMA**](./csrc/cuffpa/cute/sm_120/split_d_m4n2.cuh): The **M4N2** MMA layout breaks the register bottleneck, which lives in $PV$ rather than $QK^\top$: the $QK^\top$ GEMM has $N{=}B_c$ (fixed, independent of $D$), so its accumulator is $O(1)$; the $PV$ GEMM instead has $N{=}D$, so the $O$ accumulator costs $D/(2{\cdot}N_w)$ regs/thread. **M8N1** (FA-2 style, $N_w{=}1$) $\Rightarrow O(D/2)$: at $D{=}512$ this already reaches 256 regs/thread, over the 255 architectural limit and spilling. Splitting $N$ to **M4N2** (FA-1 style, $N_w{=}2$) halves it to $O(D/4)$, keeping $D{=}1024$ just feasible (256 regs/thread).
 
 <div align='center'>
-  <img src="./docs/assets/split-d.png" width="700px">
+  <img src="./docs/assets/mma.png" width="800px">
 </div>
+
+**Dispatch**: **M8N1** for $D \le 512$, **M4N2** for $D > 512$. On RTX 5090, **M4N2** delivers **1.55×** the throughput of **M8N1** at $D{=}1024$ (154T vs 100T, where **M8N1** collapses from register spilling).
 
 ## Benchmark
 

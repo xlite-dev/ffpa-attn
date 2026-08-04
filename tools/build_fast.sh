@@ -46,8 +46,8 @@ Flags (override same-named env vars; env reference: docs/env.md):
                        every headdim (multiples of 32). Omitting the flag
                        builds the default set (multiples of 64), governed by
                        ENABLE_FFPA_ALL_HEADDIM (default 0).
-  --editable           FFPA_EDITABLE=1: build_ext + setup.py develop (default).
-  --no-editable        FFPA_EDITABLE=0: build_ext --inplace only, no package install.
+  --editable           FFPA_EDITABLE=1: build_ext + pip install -e (default).
+  --no-editable        FFPA_EDITABLE=0: build_ext only, no package install.
   -j, --jobs N         MAX_JOBS outer build parallelism (default min(nproc,32)).
   --clean              FFPA_CLEAN=1: rm build/, *.so, generated TUs first.
   --shm                FFPA_BUILD_IN_SHM=1: build dir on tmpfs.
@@ -221,7 +221,7 @@ export FFPA_NVCC_THREADS="${FFPA_NVCC_THREADS:-4}"
 
 # Resolved configuration; --dry-run exits here before any side effect.
 if [[ "${FFPA_EDITABLE}" == "1" ]]; then
-  BUILD_CMD="python setup.py build_ext --inplace && python setup.py develop"
+  BUILD_CMD="python setup.py build_ext --inplace && FFPA_SKIP_CUDA_EXT=1 python -m pip install -e . --no-build-isolation --no-deps"
 else
   BUILD_CMD="python setup.py build_ext --inplace"
 fi
@@ -297,9 +297,10 @@ fi
 
 T0=$(date +%s)
 if [[ "${FFPA_EDITABLE}" == "1" ]]; then
-  echo "[build_fast] editable mode: building extension, then setup.py develop"
+  echo "[build_fast] step 1/2: building extension (build_ext --inplace)"
   python setup.py build_ext --inplace ${PASS_ARGS[@]+"${PASS_ARGS[@]}"}
-  python setup.py develop
+  echo "[build_fast] step 2/2: registering editable install (pip install -e)"
+  FFPA_SKIP_CUDA_EXT=1 python -m pip install -e . --no-build-isolation --no-deps
 else
   python setup.py build_ext --inplace ${PASS_ARGS[@]+"${PASS_ARGS[@]}"}
 fi
