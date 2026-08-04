@@ -8,19 +8,18 @@
 #   5. Optional tmpfs build dir (--shm / FFPA_BUILD_IN_SHM=1).
 #   6. Pre-set FFPA_BUILD_ARCH to the current device SM when unset.
 #
-# Compatible with the PEP 621 pyproject.toml packaging: by default the script
-# bypasses pip's build isolation and invokes setup.py directly for the in-place
-# CUDA extension build. Pass --editable to register the package as an editable
-# install while reusing the same build environment. For an isolated PEP 517
-# wheel use ``pip wheel . --no-build-isolation`` instead.
+# Compatible with the PEP 621 pyproject.toml packaging: editable install is the
+# default (register the package + in-place CUDA extension build). Pass
+# --no-editable to only build the extension in-place without pip install. For
+# an isolated PEP 517 wheel use ``pip wheel . --no-build-isolation`` instead.
 #
 # Usage (run with --help for all flags; flags map onto the FFPA_* /
 # ENABLE_FFPA_* env vars and override same-named env vars):
-#   bash tools/build_fast.sh                                   # ext=cuda default
-#   bash tools/build_fast.sh --arch sm_120f --ext all --editable --headdim all --jobs 32
+#   bash tools/build_fast.sh                                   # editable + ext=cuda default
+#   bash tools/build_fast.sh --arch sm_120f --ext all --headdim all --jobs 32
 #   bash tools/build_fast.sh --arch sm_89,sm_120f              # multi-arch
 #   bash tools/build_fast.sh --clean --headdim 256,512         # fast iteration
-#   bash tools/build_fast.sh bdist_wheel                       # PEP 517-compatible wheel
+#   bash tools/build_fast.sh --no-editable bdist_wheel         # PEP 517-compatible wheel
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
@@ -47,7 +46,8 @@ Flags (override same-named env vars; env reference: docs/env.md):
                        every headdim (multiples of 32). Omitting the flag
                        builds the default set (multiples of 64), governed by
                        ENABLE_FFPA_ALL_HEADDIM (default 0).
-  --editable           FFPA_EDITABLE=1: pip install -e instead of build_ext.
+  --editable           FFPA_EDITABLE=1: pip install -e (default).
+  --no-editable        FFPA_EDITABLE=0: build_ext --inplace only, no pip install.
   -j, --jobs N         MAX_JOBS outer build parallelism (default min(nproc,32)).
   --clean              FFPA_CLEAN=1: rm build/, *.so, generated TUs first.
   --shm                FFPA_BUILD_IN_SHM=1: build dir on tmpfs.
@@ -133,6 +133,7 @@ while [[ $# -gt 0 ]]; do
       export FFPA_NVCC_THREADS="$2"
       shift 2 ;;
     --editable)      export FFPA_EDITABLE=1; shift ;;
+    --no-editable)   export FFPA_EDITABLE=0; shift ;;
     --clean)         export FFPA_CLEAN=1; shift ;;
     --shm)           export FFPA_BUILD_IN_SHM=1; shift ;;
     --ptxas-verbose) export FFPA_PTXAS_VERBOSE=1; shift ;;
@@ -215,14 +216,17 @@ fi
 # nvcc intra-TU threads (respect --nvcc-threads/env, else env.py default 4).
 export FFPA_NVCC_THREADS="${FFPA_NVCC_THREADS:-4}"
 
+# Default: editable install.
+: "${FFPA_EDITABLE:=1}"
+
 # Resolved configuration; --dry-run exits here before any side effect.
-if [[ "${FFPA_EDITABLE:-0}" == "1" ]]; then
-  BUILD_CMD="python -m pip install -e . --no-build-isolation --no-deps"
+if [[ "${FFPA_EDITABLE}" == "1" ]]; then
+  BUILD_CMD="python setup.py build_ext --inplace && python -m pip install -e . --no-build-isolation --no-deps"
 else
   BUILD_CMD="python setup.py build_ext --inplace"
 fi
 echo "[build_fast] ENABLE_FFPA_CUDA_IMPL=${ENABLE_FFPA_CUDA_IMPL:-0}  ENABLE_FFPA_CUTE_EXT=${ENABLE_FFPA_CUTE_EXT:-0}  ENABLE_FFPA_TMA_EXT=${ENABLE_FFPA_TMA_EXT:-0}"
-echo "[build_fast] FFPA_BUILD_ARCH=${FFPA_BUILD_ARCH:-<auto from current device>}  FFPA_DEV_HEADDIMS=${FFPA_DEV_HEADDIMS:-<default: mults of 64>}  FFPA_EDITABLE=${FFPA_EDITABLE:-0}"
+echo "[build_fast] FFPA_BUILD_ARCH=${FFPA_BUILD_ARCH:-<auto from current device>}  FFPA_DEV_HEADDIMS=${FFPA_DEV_HEADDIMS:-<default: mults of 64>}  FFPA_EDITABLE=${FFPA_EDITABLE}"
 echo "[build_fast] MAX_JOBS=$MAX_JOBS  FFPA_NVCC_THREADS=$FFPA_NVCC_THREADS"
 echo "[build_fast] command: $BUILD_CMD${PASS_ARGS[*]:+ ${PASS_ARGS[*]}}"
 if [[ "$DRY_RUN" == "1" ]]; then
@@ -292,9 +296,10 @@ if [[ "${FFPA_BUILD_IN_SHM:-0}" == "1" ]]; then
 fi
 
 T0=$(date +%s)
-if [[ "${FFPA_EDITABLE:-0}" == "1" ]]; then
-  echo "[build_fast] editable mode: $BUILD_CMD"
-  python -m pip install -e . --no-build-isolation --no-deps ${PASS_ARGS[@]+"${PASS_ARGS[@]}"}
+if [[ "${FFPA_EDITABLE}" == "1" ]]; then
+  echo "[build_fast] editable mode: building extension, then pip install -e"
+  python setup.py build_ext --inplace ${PASS_ARGS[@]+"${PASS_ARGS[@]}"}
+  python -m pip install -e . --no-build-isolation --no-deps
 else
   python setup.py build_ext --inplace ${PASS_ARGS[@]+"${PASS_ARGS[@]}"}
 fi
@@ -304,13 +309,13 @@ echo "[build_fast] total elapsed: $((T1-T0))s"
 # Usage guide
 #
 # CLI flags (override same-named env vars; see docs/env.md for the full table):
-#   bash tools/build_fast.sh --arch sm_120f --ext all --editable --headdim all --jobs 32
+#   bash tools/build_fast.sh --arch sm_120f --ext all --headdim all --jobs 32
 #     == FFPA_BUILD_ARCH=sm_120f ENABLE_FFPA_CUDA_IMPL=1 ENABLE_FFPA_CUTE_EXT=1 \
 #        ENABLE_FFPA_TMA_EXT=1 FFPA_EDITABLE=1 MAX_JOBS=32 bash tools/build_fast.sh
 #
-#   bash tools/build_fast.sh                      # incremental build; note the
-#                                                 # default now sets ENABLE_FFPA_CUDA_IMPL=1
+#   bash tools/build_fast.sh                      # incremental build (editable + cuda by default)
 #   bash tools/build_fast.sh --ext none           # Triton/CuTeDSL-python only
+#   bash tools/build_fast.sh --no-editable        # build_ext only, no pip install
 #   bash tools/build_fast.sh --clean              # rm build/ + rebuild
 #   bash tools/build_fast.sh --headdim 256,512    # headdim subset, fast iteration
 #   bash tools/build_fast.sh --shm                # tmpfs build dir
