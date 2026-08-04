@@ -52,7 +52,7 @@ Then, try to accelerate the attention for large headdim with just <i><b>one-line
 
 For more advanced features, please refer to our online docs at 📘[ffpa-attn.io](https://ffpa-attn.readthedocs.io/en/latest/).
 
-## Split-D & M4N2
+## Split-D & TiledMMA<4,2,1>
 
 <a id="ffpa-design"></a>
 
