@@ -95,6 +95,29 @@ def _is_hopper_or_later() -> bool:
   return (major, minor) >= (9, 0)
 
 
+def _is_sm120_or_later() -> bool:
+  if not torch.cuda.is_available():
+    return False
+  major, minor = torch.cuda.get_device_capability()
+  return (major, minor) >= (12, 0)
+
+
+def _cuda_cute_tma_available() -> bool:
+  """Whether the CuTe-TMA sm120 forward kernel was compiled and the current
+  device can run it. Drives the CUDABackend default impl hint auto-resolve.
+  """
+  from .cuda import CUDA_CUTE_TMA_AVAILABLE
+  return bool(CUDA_CUTE_TMA_AVAILABLE) and _is_sm120_or_later()
+
+
+def _cuda_tma_available() -> bool:
+  """Whether the TMA forward kernel was compiled and the current device can
+  run it. Sm120+ auto-resolve fallback below CUTE_TMA.
+  """
+  from .cuda import CUDA_TMA_AVAILABLE
+  return bool(CUDA_TMA_AVAILABLE) and _is_sm120_or_later()
+
+
 def _apply_cuda_backend_hint(backend: CUDABackend) -> None:
   """Set C++ backend impl hint from CUDABackend flags before kernel launch.
 
@@ -177,20 +200,25 @@ class CUDABackend(Backend):
   :ivar acc: MMA accumulator precision (``"f16"`` or ``"f32"``).
   :ivar stages: Pipeline stages for the CUDA kernel (default 4; C++ smem
       physics cap may reduce for large V chunks or TMA path).
-  :ivar enable_tma: Select the TMA-based kernel implementation. Combined with
-      ``enable_cute`` it picks the C++ backend hint: neither → NATIVE (legacy
-      cp.async), tma only → TMA, cute only → CUTE (CuTe cp.async), both →
-      CUTE_TMA (CuTe TMA). Ignored on architectures lacking the path.
-  :ivar enable_cute: Select the CuTe-based kernel implementation. See
-      ``enable_tma`` for the combined hint mapping. CUDA-backend only.
+  :ivar enable_tma: Select the TMA-based kernel implementation. ``None``
+      (default) auto-resolves with ``enable_cute``: when both are ``None`` the
+      backend picks ``CUTE_TMA`` if the CuTe-TMA sm120 kernel was compiled and
+      the device is sm120+, else ``TMA`` if the TMA kernel was compiled, else
+      ``NATIVE``. An explicit ``True``/``False`` opts out of auto. Combined
+      with ``enable_cute`` it picks the C++ backend hint: neither -> NATIVE
+      (legacy cp.async), tma only -> TMA, cute only -> CUTE (CuTe cp.async),
+      both -> CUTE_TMA (CuTe TMA). Ignored on architectures lacking the path.
+  :ivar enable_cute: Select the CuTe-based kernel implementation. ``None``
+      participates in auto-resolve (see ``enable_tma``); an explicit bool opts
+      out. CUDA-backend only.
   :ivar enable_ws: Accepted for API compatibility with the Triton backend;
       the CUDA sm120 path is always warp-specialised when ``enable_tma`` is on.
   """
   name: str = "cuda"
   acc: str = "f32"
   stages: int = None
-  enable_tma: bool = False
-  enable_cute: bool = False
+  enable_tma: bool | None = None
+  enable_cute: bool | None = None
   enable_ws: bool = False  # For future use.
 
   def __post_init__(self) -> None:
@@ -204,8 +232,33 @@ class CUDABackend(Backend):
         "CUDABackend(acc='f16') requires the fp16 MMA acc kernels, which were "
         "not compiled. Rebuild with ENABLE_FFPA_F16_ACC=1 to enable them."
       )
+    self._resolve_impl_defaults()
     self.stages = self._default_cuda_stages(
     ) if self.stages is None else self.stages
+
+  def _resolve_impl_defaults(self) -> None:
+    """Fill ``enable_tma``/``enable_cute`` defaults before kernel launch.
+
+    Both ``None`` -> auto. On sm120+ the priority is ``CUTE_TMA`` (TMA+CUTE
+    exts) -> ``TMA`` (TMA ext only) -> ``NATIVE``. A single ``None`` resolves
+    to ``False`` so an explicit ``--fwd-tma``/``--cute`` still selects
+    ``TMA``/``CUTE``.
+    """
+    if self.enable_tma is None and self.enable_cute is None:
+      if _cuda_cute_tma_available():
+        self.enable_tma = True
+        self.enable_cute = True
+      elif _cuda_tma_available():
+        self.enable_tma = True
+        self.enable_cute = False
+      else:
+        self.enable_tma = False
+        self.enable_cute = False
+    else:
+      if self.enable_tma is None:
+        self.enable_tma = False
+      if self.enable_cute is None:
+        self.enable_cute = False
 
   @property
   def acc_code(self) -> int:

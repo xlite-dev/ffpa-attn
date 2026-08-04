@@ -153,5 +153,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 #else
   m.attr("F16_ACC_AVAILABLE") = py::bool_(false);
 #endif
+#if defined(ENABLE_FFPA_TMA_EXT)
+  m.attr("CUDA_TMA_AVAILABLE") = py::bool_(true);
+#else
+  m.attr("CUDA_TMA_AVAILABLE") = py::bool_(false);
+#endif
+#if defined(ENABLE_FFPA_TMA_EXT) && defined(ENABLE_FFPA_CUTE_EXT)
+  m.attr("CUDA_CUTE_TMA_AVAILABLE") = py::bool_(true);
+#else
+  m.attr("CUDA_CUTE_TMA_AVAILABLE") = py::bool_(false);
+#endif
   m.attr("CUDA_BWD_AVAILABLE") = py::bool_(false);
 }

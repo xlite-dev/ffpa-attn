@@ -306,15 +306,27 @@ def _parse_args() -> argparse.Namespace:
     "--enable-fwd-tma",
     "--fwd-tma",
     action="store_true",
+    default=None,
     help=
-    "Enable experimental SM90+ TMA forward path (silently falls back on unsupported devices).",
+    "Enable experimental SM90+ TMA forward path (silently falls back on unsupported devices). "
+    "Under --fwd-backend cuda this is a compat alias for --cuda-impl tma.",
   )
   parser.add_argument(
     "--enable-fwd-cute",
     "--cute",
     action="store_true",
-    help=
-    "Enable the CuTe cp.async forward kernel (CUDA backend only; ignored by other backends).",
+    default=None,
+    help="Enable the CuTe cp.async forward kernel (CUDA backend only). Under "
+    "--fwd-backend cuda this is a compat alias for --cuda-impl cute.",
+  )
+  parser.add_argument(
+    "--cuda-impl",
+    choices=["auto", "native", "tma", "cute", "cute_tma"],
+    default="auto",
+    help="CUDA forward kernel implementation hint (--fwd-backend cuda only). "
+    "'auto' (default) picks CUTE_TMA when the CuTe-TMA sm120 kernel is "
+    "available, else NATIVE; --fwd-tma/--cute act as compat aliases under "
+    "auto. Mutually exclusive with --fwd-tma/--cute when not 'auto'.",
   )
   parser.add_argument(
     "--enable-bwd-tma",
@@ -409,6 +421,25 @@ def _resolve_directional_cli_flags(
     raise SystemExit(
       "--cute/--enable-fwd-cute is only valid with --forward-backend cuda"
     )
+  # CUDA forward impl: --cuda-impl is the canonical knob; --fwd-tma/--cute are
+  # compat aliases under auto. Non-cuda backends bool-ify tma for triton.
+  if args.forward_backend == "cuda":
+    if args.cuda_impl != "auto":
+      if args.enable_fwd_tma or args.enable_fwd_cute:
+        raise SystemExit(
+          "--cuda-impl is mutually exclusive with --enable-fwd-tma/--cute "
+          "under --fwd-backend cuda"
+        )
+      _CUDA_IMPL_MAP = {
+        "native": (False, False),
+        "tma": (True, False),
+        "cute": (False, True),
+        "cute_tma": (True, True),
+      }
+      args.enable_fwd_tma, args.enable_fwd_cute = _CUDA_IMPL_MAP[args.cuda_impl]
+    # auto: leave None/True as-is so CUDABackend auto-resolves / honors aliases.
+  else:
+    args.enable_fwd_tma = bool(args.enable_fwd_tma)
   if args.enable_persist_dkdv and not args.enable_bwd_tma:
     raise SystemExit("--enable-persist-dkdv requires --enable-bwd-tma")
   return args
