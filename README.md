@@ -64,7 +64,7 @@ We extend FlashAttention to support large headdim ($D>256$) via **fine-grained t
   <img src="./docs/assets/split-d.png" width="750px">
 </div>
 
-[**TiledMMA**](./csrc/cuffpa/cute/sm_120/split_d_m4n2.cuh): The **M4N2** layout breaks the register bottleneck. The $QK^\top$ has $N{=}B_c$ (fixed, independent of $D$); the $PV$ GEMM instead has $N{=}D$, so the $O$ accumulator costs $D/(2{\cdot}N_w)$ regs/thread. **M8N1** (FA-2 style, $N_w{=}1$) $\Rightarrow O(D/2)$: at $D{=}512$ this already reaches 256 regs/thread, over the 255 architectural limit and spilling. Splitting $N$ to **M4N2** (FA-1 style, $N_w{=}2$) halves it to $O(D/4)$, keeping $D{=}1024$ just feasible (256 regs/thread).
+[**TiledMMA**](./csrc/cuffpa/cute/sm_120/split_d_m4n2.cuh): The **M4N2** layout breaks the register bottleneck. The $QK^\top$ has $N{=}B_c$ (fixed, independent of $D$), so its accumulator is $O(1)$; the $PV$ GEMM instead has $N{=}D$, so the $O$ accumulator costs $D/(2{\cdot}N_w)$ regs/thread. **M8N1** (FA-2 style, $N_w{=}1$) $\Rightarrow O(D/2)$: at $D{=}512$ this already reaches 256 regs/thread, over the 255 architectural limit and spilling. Splitting $N$ to **M4N2** (FA-1 style, $N_w{=}2$) halves it to $O(D/4)$, keeping $D{=}1024$ just feasible (256 regs/thread).
 
 <div align='center'>
   <img src="./docs/assets/mma.png" width="800px">
