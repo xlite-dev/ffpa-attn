@@ -25,7 +25,8 @@ void launch_ffpa_attn_fwd_template(torch::Tensor Q, torch::Tensor K,
                                    torch::Tensor attn_bias,
                                    torch::Tensor softmax_lse, int causal,
                                    double softmax_scale, double dropout_p,
-                                   int64_t philox_seed, int64_t philox_offset) {
+                                   int64_t philox_seed, int64_t philox_offset,
+                                   bool smooth_k) {
   // Q,K,V,O with [B, H, N, D] layout, B=batch, H=head, N=seqlen, D=dim
   // TODO: support BNHD layout, Q,K,V,O with [B, N, H, D] layout.
   // Native block-tile config (MMA atoms, Br/Bc, stages, smem/pad flags) and
@@ -117,7 +118,7 @@ void launch_ffpa_attn_fwd_template(torch::Tensor Q, torch::Tensor K,
 #ifdef ENABLE_FFPA_CUTE_EXT
         launch_cute_fwd_persist_d_w8a8_sm120<kDataType, kHeadDim, kStage>(
             Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
-            dropout_p, philox_seed, philox_offset);
+            dropout_p, philox_seed, philox_offset, smooth_k);
 #else
         TORCH_CHECK(false, "ffpa_attn: cute ext not compiled");
 #endif

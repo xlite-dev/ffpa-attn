@@ -14,18 +14,21 @@ void ffpa_attn_fwd_fp16f16(torch::Tensor Q, torch::Tensor K, torch::Tensor V,
                            torch::Tensor O, torch::Tensor attn_bias,
                            torch::Tensor softmax_lse, int stages, int causal,
                            double softmax_scale, double dropout_p,
-                           int64_t philox_seed, int64_t philox_offset);
+                           int64_t philox_seed, int64_t philox_offset,
+                           bool smooth_k);
 #endif
 void ffpa_attn_fwd_fp16f32(torch::Tensor Q, torch::Tensor K, torch::Tensor V,
                            torch::Tensor O, torch::Tensor attn_bias,
                            torch::Tensor softmax_lse, int stages, int causal,
                            double softmax_scale, double dropout_p,
-                           int64_t philox_seed, int64_t philox_offset);
+                           int64_t philox_seed, int64_t philox_offset,
+                           bool smooth_k);
 void ffpa_attn_fwd_bf16f32(torch::Tensor Q, torch::Tensor K, torch::Tensor V,
                            torch::Tensor O, torch::Tensor attn_bias,
                            torch::Tensor softmax_lse, int stages, int causal,
                            double softmax_scale, double dropout_p,
-                           int64_t philox_seed, int64_t philox_offset);
+                           int64_t philox_seed, int64_t philox_offset,
+                           bool smooth_k);
 #endif
 
 // Public unified pybind entry.  acc encoding: 0=f16, 1=f32.
@@ -33,7 +36,8 @@ void ffpa_attn_forward(torch::Tensor Q, torch::Tensor K, torch::Tensor V,
                        torch::Tensor attn_bias, torch::Tensor O,
                        torch::Tensor softmax_lse, int64_t stages, int64_t acc,
                        int64_t causal, double softmax_scale, double dropout_p,
-                       int64_t philox_seed, int64_t philox_offset) {
+                       int64_t philox_seed, int64_t philox_offset,
+                       bool smooth_k) {
 #ifdef ENABLE_FFPA_CUDA_IMPL
   const auto dtype = Q.scalar_type();
   const int stages_i = static_cast<int>(stages);
@@ -53,7 +57,7 @@ void ffpa_attn_forward(torch::Tensor Q, torch::Tensor K, torch::Tensor V,
 #ifdef ENABLE_FFPA_F16_ACC
       ffpa_attn_fwd_fp16f16(Q, K, V, O, attn_bias, softmax_lse, stages_i,
                             causal_i, softmax_scale, dropout_p, philox_seed,
-                            philox_offset);
+                            philox_offset, smooth_k);
 #else
       throw std::invalid_argument(
           "ffpa_attn: fp16 MMA acc (acc=0) is disabled; rebuild with "
@@ -62,7 +66,7 @@ void ffpa_attn_forward(torch::Tensor Q, torch::Tensor K, torch::Tensor V,
     } else if (acc == 1) {
       ffpa_attn_fwd_fp16f32(Q, K, V, O, attn_bias, softmax_lse, stages_i,
                             causal_i, softmax_scale, dropout_p, philox_seed,
-                            philox_offset);
+                            philox_offset, smooth_k);
     } else {
       throw std::invalid_argument("ffpa_attn: acc must be 0 (f16) or 1 (f32)");
     }
@@ -74,7 +78,7 @@ void ffpa_attn_forward(torch::Tensor Q, torch::Tensor K, torch::Tensor V,
     }
     ffpa_attn_fwd_bf16f32(Q, K, V, O, attn_bias, softmax_lse, stages_i,
                           causal_i, softmax_scale, dropout_p, philox_seed,
-                          philox_offset);
+                          philox_offset, smooth_k);
   } else {
     throw std::invalid_argument(
         "ffpa_attn: Q.dtype must be torch.float16 or torch.bfloat16");
@@ -93,6 +97,7 @@ void ffpa_attn_forward(torch::Tensor Q, torch::Tensor K, torch::Tensor V,
   (void)dropout_p;
   (void)philox_seed;
   (void)philox_offset;
+  (void)smooth_k;
   throw std::runtime_error(
       "ffpa_attn_forward: native CUDA forward was not compiled. Rebuild with "
       "ENABLE_FFPA_CUDA_IMPL=1 to enable the CUDA forward backend.");

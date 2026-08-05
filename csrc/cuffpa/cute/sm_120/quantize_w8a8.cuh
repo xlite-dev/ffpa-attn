@@ -31,7 +31,9 @@ __global__ void quantize_w8a8_kernel(
     const Element* __restrict__ X,  // (B, H, N, D) row-major
     __nv_fp8_e4m3* __restrict__ Y,  // (B, H, N, D)
     float* __restrict__ scale,      // (B, H, N/kBlockRows)
-    int N, int H, int D, int ldy, int force1 = 0) {
+    int N, int H, int D, int ldy,
+    const Element* __restrict__ km = nullptr,  // (B*H, D) smooth-K col means
+    float inv_n = 0.0f) {
   constexpr int kVec = 8;  // elems per vector access (128-bit in, 64-bit out)
   constexpr int kThreads = 128;
   const int rb = blockIdx.x;
@@ -49,6 +51,14 @@ __global__ void quantize_w8a8_kernel(
   const Element* x_bh = X + static_cast<long>(bh) * N * D;
   __nv_fp8_e4m3* y_bh = Y + static_cast<long>(bh) * N * D;
 
+  // Smooth-K: cache this head's mean vector once (D floats, L1-hot reuse).
+  __shared__ float km_sh[128];
+  const bool smooth = km != nullptr;
+  if (smooth && tid < D)
+    km_sh[tid] =
+        static_cast<float>(km[static_cast<long>(bh) * D + tid]) * inv_n;
+  __syncthreads();
+
   using VecIn = Vec8<Element>;
   float amax = 0.0f;
   VecIn regs[8];  // kBlockRows*D/(kVec*kThreads) <= 8 for supported shapes
@@ -65,8 +75,12 @@ __global__ void quantize_w8a8_kernel(
       v = reinterpret_cast<const VecIn*>(x_bh + row * D)[c];
     regs[j] = v;
 #pragma unroll
-    for (int e = 0; e < kVec; ++e)
-      amax = fmaxf(amax, fabsf(static_cast<float>(v.elem[e])));
+    for (int e = 0; e < kVec; ++e) {
+      float x = static_cast<float>(v.elem[e]);
+      if (smooth)
+        x -= km_sh[c * kVec + e];
+      amax = fmaxf(amax, fabsf(x));
+    }
   }
 #pragma unroll
   for (int off = 16; off > 0; off >>= 1)
@@ -87,8 +101,6 @@ __global__ void quantize_w8a8_kernel(
   amax = warp_max[0];
 
   float s = amax / 448.0f;
-  if (force1)
-    s = 1.0f;
   const float inv_s = (s == 0.0f) ? 0.0f : 1.0f / s;
   const int n_rb = (N + kBlockRows - 1) / kBlockRows;
   if (tid == 0)
@@ -108,8 +120,12 @@ __global__ void quantize_w8a8_kernel(
     uint2 out;
     __nv_fp8_e4m3* ob = reinterpret_cast<__nv_fp8_e4m3*>(&out);
 #pragma unroll
-    for (int e = 0; e < kVec; ++e)
-      ob[e] = __nv_fp8_e4m3(static_cast<float>(v.elem[e]) * inv_s);
+    for (int e = 0; e < kVec; ++e) {
+      float x = static_cast<float>(v.elem[e]);
+      if (smooth)
+        x -= km_sh[c * kVec + e];
+      ob[e] = __nv_fp8_e4m3(x * inv_s);
+    }
     reinterpret_cast<uint2*>(y_bh + row * D)[c] = out;
   }
 }
@@ -124,7 +140,7 @@ __global__ void quantize_w8a8_vt_kernel(
     const Element* __restrict__ V,   // (B, H, N, D) row-major
     __nv_fp8_e4m3* __restrict__ VT,  // flat [B*Nh_kv*D, Nkv_pad]
     float* __restrict__ scale,       // (B*Nh_kv, Nkv/kBlockRows)
-    int N, int Nh_kv, int ldy, int force1 = 0) {
+    int N, int Nh_kv, int ldy) {
   constexpr int D = kD;
   constexpr int kPad = 16;
   constexpr int kVec = 8;
@@ -181,8 +197,6 @@ __global__ void quantize_w8a8_vt_kernel(
   amax = warp_max[0];
 
   float s = amax / 448.0f;
-  if (force1)
-    s = 1.0f;
   const float inv_s = (s == 0.0f) ? 0.0f : 1.0f / s;
   if (tid == 0)
     scale[static_cast<long>(bh) * ((N + kBlockRows - 1) / kBlockRows) + rb] = s;
@@ -240,7 +254,9 @@ __global__ void quantize_w8a8_qkv_fused_kernel(
     const Element* __restrict__ V, __nv_fp8_e4m3* __restrict__ Q8,
     __nv_fp8_e4m3* __restrict__ K8, __nv_fp8_e4m3* __restrict__ VT8,
     float* __restrict__ q_scale, float* __restrict__ k_scale,
-    float* __restrict__ v_scale, int N, int H, int ldy, int force1) {
+    float* __restrict__ v_scale, int N, int H, int ldy,
+    const Element* __restrict__ km = nullptr,  // (B*H, D) smooth-K col means
+    float inv_n = 0.0f) {
   constexpr int kVec = 8;
   constexpr int kPad = 16;
   constexpr int kWarps = kThreads / 32;
@@ -258,6 +274,12 @@ __global__ void quantize_w8a8_qkv_fused_kernel(
   const int n_rb = (N + kBlockRows - 1) / kBlockRows;
 
   __shared__ float warp_max[kWarps];
+  // Smooth-K applies to K only (role==1); cache the head's mean vector once.
+  __shared__ float km_sh[kD];
+  const bool smooth = (role == 1) && (km != nullptr);
+  if (smooth && tid < kD)
+    km_sh[tid] =
+        static_cast<float>(km[static_cast<long>(bh) * kD + tid]) * inv_n;
 
   if (role < 2) {
     const Element* X = (role == 0) ? Q : K;
@@ -265,6 +287,8 @@ __global__ void quantize_w8a8_qkv_fused_kernel(
     float* scale_out = (role == 0) ? q_scale : k_scale;
     const Element* x_bh = X + static_cast<long>(bh) * N * kD;
     __nv_fp8_e4m3* y_bh = Y + static_cast<long>(bh) * N * kD;
+    if (smooth)
+      __syncthreads();
 
     using VecIn = Vec8<Element>;
     float amax = 0.0f;
@@ -282,8 +306,12 @@ __global__ void quantize_w8a8_qkv_fused_kernel(
         v = reinterpret_cast<const VecIn*>(x_bh + row * kD)[c];
       regs[j] = v;
 #pragma unroll
-      for (int e = 0; e < kVec; ++e)
-        amax = fmaxf(amax, fabsf(static_cast<float>(v.elem[e])));
+      for (int e = 0; e < kVec; ++e) {
+        float x = static_cast<float>(v.elem[e]);
+        if (smooth)
+          x -= km_sh[c * kVec + e];
+        amax = fmaxf(amax, fabsf(x));
+      }
     }
 #pragma unroll
     for (int off = 16; off > 0; off >>= 1)
@@ -303,8 +331,6 @@ __global__ void quantize_w8a8_qkv_fused_kernel(
     amax = warp_max[0];
 
     float s = amax / 448.0f;
-    if (force1)
-      s = 1.0f;
     const float inv_s = (s == 0.0f) ? 0.0f : 1.0f / s;
     if (tid == 0)
       scale_out[static_cast<long>(bh) * n_rb + rb] = s;
@@ -323,8 +349,12 @@ __global__ void quantize_w8a8_qkv_fused_kernel(
       uint2 out;
       __nv_fp8_e4m3* ob = reinterpret_cast<__nv_fp8_e4m3*>(&out);
 #pragma unroll
-      for (int e = 0; e < kVec; ++e)
-        ob[e] = __nv_fp8_e4m3(static_cast<float>(v.elem[e]) * inv_s);
+      for (int e = 0; e < kVec; ++e) {
+        float x = static_cast<float>(v.elem[e]);
+        if (smooth)
+          x -= km_sh[c * kVec + e];
+        ob[e] = __nv_fp8_e4m3(x * inv_s);
+      }
       reinterpret_cast<uint2*>(y_bh + row * kD)[c] = out;
     }
   } else {
@@ -367,8 +397,6 @@ __global__ void quantize_w8a8_qkv_fused_kernel(
     amax = warp_max[0];
 
     float s = amax / 448.0f;
-    if (force1)
-      s = 1.0f;
     const float inv_s = (s == 0.0f) ? 0.0f : 1.0f / s;
     if (tid == 0)
       v_scale[static_cast<long>(bh) * n_rb + rb] = s;
@@ -416,6 +444,9 @@ __global__ void quantize_w8a8_qkv_fused_kernel(
 }
 
 // Quantize Q/K row-major and V transposed (D, N); scales per (bh, row-block).
+// smooth-K (km != nullptr): K is shifted by its per-(b,h) seq mean before
+// quantizing; km holds the per-head mean vector (B*Nh_kv, D). inv_n scales km
+// (pass 1.0 when km is already a mean).
 template <typename Element, int kBr, int kBc, int kHeadDim>
 void launch_quantize_w8a8_sm120(const Element* q_ptr, const Element* k_ptr,
                                 const Element* v_ptr, __nv_fp8_e4m3* q8,
@@ -423,7 +454,7 @@ void launch_quantize_w8a8_sm120(const Element* q_ptr, const Element* k_ptr,
                                 float* q_scale, float* k_scale, float* v_scale,
                                 int B, int Nh, int Nh_kv, int Nq, int Nkv,
                                 int Nkv_pad, int D, cudaStream_t stream,
-                                int force1 = 0) {
+                                const Element* km = nullptr) {
   constexpr int kThreads = 128;
   // Fused path: single launch for Q+K+VT when grids match (self-attention).
   if constexpr (kBr == kBc) {
@@ -432,19 +463,19 @@ void launch_quantize_w8a8_sm120(const Element* q_ptr, const Element* k_ptr,
       quantize_w8a8_qkv_fused_kernel<Element, kBr, kHeadDim, kThreads>
           <<<grid, kThreads, 0, stream>>>(q_ptr, k_ptr, v_ptr, q8, k8, vt8,
                                           q_scale, k_scale, v_scale, Nq, Nh,
-                                          Nkv_pad, force1);
+                                          Nkv_pad, km, 1.0f);
       return;
     }
   }
   dim3 grid_q((Nq + kBr - 1) / kBr, B * Nh);
   quantize_w8a8_kernel<Element, kBr><<<grid_q, kThreads, 0, stream>>>(
-      q_ptr, q8, q_scale, Nq, Nh, D, D, force1);
+      q_ptr, q8, q_scale, Nq, Nh, D, D, nullptr, 0.0f);
   dim3 grid_kv((Nkv + kBc - 1) / kBc, B * Nh_kv);
   quantize_w8a8_kernel<Element, kBc><<<grid_kv, kThreads, 0, stream>>>(
-      k_ptr, k8, k_scale, Nkv, Nh_kv, D, D, force1);
+      k_ptr, k8, k_scale, Nkv, Nh_kv, D, D, km, 1.0f);
   quantize_w8a8_vt_kernel<Element, kBc, kHeadDim>
       <<<grid_kv, kThreads, 0, stream>>>(v_ptr, vt8, v_scale, Nkv, Nh_kv,
-                                         Nkv_pad, force1);
+                                         Nkv_pad);
 }
 
 }  // namespace ffpa_cute

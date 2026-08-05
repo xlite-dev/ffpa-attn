@@ -480,13 +480,11 @@ void launch_cute_fwd_persist_d_sm120(torch::Tensor Q, torch::Tensor K,
 // W8A8 persist-D: fp16/bf16 in, internally blockwise-quantized to e4m3
 // (Q/K row-major, V transposed), then fp8 attention. D=64/128 only.
 template <typename kDataType, const int kHeadDim, const int kStage>
-void launch_cute_fwd_persist_d_w8a8_sm120(torch::Tensor Q, torch::Tensor K,
-                                          torch::Tensor V, torch::Tensor O,
-                                          torch::Tensor attn_bias,
-                                          torch::Tensor softmax_lse, int causal,
-                                          double softmax_scale,
-                                          double dropout_p, int64_t philox_seed,
-                                          int64_t philox_offset) {
+void launch_cute_fwd_persist_d_w8a8_sm120(
+    torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O,
+    torch::Tensor attn_bias, torch::Tensor softmax_lse, int causal,
+    double softmax_scale, double dropout_p, int64_t philox_seed,
+    int64_t philox_offset, bool smooth_k) {
   using namespace cute;
   TORCH_CHECK(attn_bias.numel() == 0 && dropout_p == 0.0,
               "w8a8 sm120 path does not support attn_bias/dropout");
@@ -540,7 +538,31 @@ void launch_cute_fwd_persist_d_w8a8_sm120(torch::Tensor Q, torch::Tensor K,
   const c10::cuda::OptionalCUDAGuard device_guard(Q.device());
   auto stream = at::cuda::getCurrentCUDAStream();
 
-  const int force1 = getenv("FFPA_W8A8_FORCE_SCALE1") ? 1 : 0;
+  // Smooth-K (K -= per-(b,h) seq mean before quantize) defaults on; it is
+  // mathematically lossless for O, only lse needs the correction done in the
+  // attention kernel epilogue. km = per-(b,h) seq mean of K, (B*Nh_kv, D).
+  // at::mean stays a separate launch, NOT fused into quantize, because:
+  //   - mean reduces ALONG seqlen (across all row blocks) while quantize
+  //     parallelizes ALONG seqlen (per row block); fusing creates a
+  //     cross-block global dependency (atomics + spin barrier) that costs
+  //     more than the mean kernel it replaces;
+  //   - no DRAM savings: K is cold-read once, mean fills L2 and quantize
+  //     re-reads it from L2;
+  //   - cost breakdown: only the mean reduction is real work (~33us warm from
+  //     L2 / ~82us cold, bandwidth-bound); reshape is a view, contiguous is a
+  //     no-op, and the fp32 cast below is lazy (lse-only, ~2us).
+  torch::Tensor km, km_f32;
+  const kDataType* km_ptr = nullptr;
+  const float* km_f32_ptr = nullptr;
+  if (smooth_k) {
+    km = at::mean(K, 2).reshape({Nb * Nh_kv, kHeadDim}).contiguous();
+    km_ptr = reinterpret_cast<const kDataType*>(km.data_ptr());
+    // fp32 copy only needed for the lse correction.
+    if (softmax_lse.numel() > 0) {
+      km_f32 = km.to(torch::kFloat32);
+      km_f32_ptr = km_f32.data_ptr<float>();
+    }
+  }
 
   ffpa_cute::launch_quantize_w8a8_sm120<kDataType, kBr, kBc, kHeadDim>(
       reinterpret_cast<const kDataType*>(Q.data_ptr()),
@@ -551,7 +573,7 @@ void launch_cute_fwd_persist_d_w8a8_sm120(torch::Tensor Q, torch::Tensor K,
       reinterpret_cast<__nv_fp8_e4m3*>(vt8.data_ptr()),
       q_scale.data_ptr<float>(), k_scale.data_ptr<float>(),
       v_scale.data_ptr<float>(), Nb, Nh, Nh_kv, Nq, Nkv, Nkv_pad, kHeadDim,
-      stream, force1);
+      stream, km_ptr);
 
   const int total_q_rows = Nb * Nh * Nq;
   const int total_kv_rows = Nb * Nh_kv * Nkv;
@@ -609,7 +631,7 @@ void launch_cute_fwd_persist_d_w8a8_sm120(torch::Tensor Q, torch::Tensor K,
         tma_q, tma_k, tma_v, tma_o, O_ptr, softmax_lse_ptr,
         q_scale.data_ptr<float>(), k_scale.data_ptr<float>(),
         v_scale.data_ptr<float>(), Nq, Nkv, Nh, Nh_kv, scale, Tc, causal,
-        total_q_rows, total_kv_rows, n_rb_q, n_rb_kv);
+        total_q_rows, total_kv_rows, n_rb_q, n_rb_kv, km_f32_ptr);
   };
   if (pquant_per_row) {
     launch_kernel(

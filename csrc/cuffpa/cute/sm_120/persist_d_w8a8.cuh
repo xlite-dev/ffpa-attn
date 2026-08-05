@@ -21,6 +21,42 @@ namespace ffpa_w8a8 {
 using TmaBarrier = cutlass::arch::ClusterTransactionBarrier;
 using CtaBarrier = cutlass::arch::ClusterBarrier;
 
+// Smooth-K lse correction, per-row partial: dot(Q8_row, km). Softmax is
+// shift-invariant, so smoothing K leaves O unchanged, but the returned lse
+// must add back scale*qs*dot(Q_row, km) (see the epilogue).
+// m16n8 C layout: the 4 peer lanes of a quad share the same rows; each lane
+// strides over kHeadDim/16 column chunks of 4, and xor-1/xor-2 complete the
+// quad-local reduce (a full-warp butterfly would mix the warp's 8 rows).
+// Perf note: scalar smem/gmem reads, correctness-first; the lse path is cold,
+// revisit only if it ever shows up in profiles.
+template <int kHeadDim, int kRows, typename SmemQTensor, typename CoordTensor>
+CUTE_DEVICE void smooth_k_qk_dot(const SmemQTensor& sQ,
+                                 const CoordTensor& tScS_rc,
+                                 const float* __restrict__ km_bh, float* qkm) {
+  constexpr int kVec = 4;
+  constexpr int kQuad = 4;
+  constexpr int kIters = kHeadDim / (kVec * kQuad);
+  const int qlane = cutlass::canonical_lane_idx() % kQuad;
+#pragma unroll
+  for (int row = 0; row < kRows; ++row) {
+    const int r_idx = cute::get<0>(tScS_rc(row, 0));
+    float acc = 0.0f;
+#pragma unroll
+    for (int it = 0; it < kIters; ++it) {
+      const int col = (qlane + it * kQuad) * kVec;
+#pragma unroll
+      for (int d = 0; d < kVec; ++d)
+        acc += static_cast<float>(sQ(r_idx, col + d)) * km_bh[col + d];
+    }
+    qkm[row] = acc;
+  }
+#pragma unroll
+  for (int row = 0; row < kRows; ++row) {
+    qkm[row] += __shfl_xor_sync(0xffffffff, qkm[row], 1);
+    qkm[row] += __shfl_xor_sync(0xffffffff, qkm[row], 2);
+  }
+}
+
 // WS persist-D W8A8 (fp8 e4m3 Q/K/V): same 128 producer + 256 consumer split
 // as persist_d.cuh. V is pre-transposed (D x N) by the quantize pre-kernel.
 // Blockwise scales: k_scale folded into the log2-domain softmax, v_scale
@@ -47,7 +83,8 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_w8a8_sm120(
     float* __restrict__ softmax_lse, const float* __restrict__ q_scale,
     const float* __restrict__ k_scale, const float* __restrict__ v_scale,
     int Nq, int Nkv, int Nh, int Nh_kv, float scale, int Tc, int causal,
-    int total_q_rows, int total_kv_rows, int n_rb_q, int n_rb_kv) {
+    int total_q_rows, int total_kv_rows, int n_rb_q, int n_rb_kv,
+    const float* __restrict__ km = nullptr) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
   using namespace cute;
   using Element = typename Traits::Element;  // float_e4m3_t
@@ -66,6 +103,8 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_w8a8_sm120(
   constexpr int kStagesV = Traits::kStagesV;
   constexpr int kProducerThreads = 128;
   constexpr int kConsumerThreads = 256;
+  static_assert(kHeadDim == 64 || kHeadDim == 128,
+                "w8a8 lse correction supports D in {64, 128}");
 
   constexpr int kQTileElements = cosize(SmemLayoutQ{});
   constexpr int kKTileElements = cosize(SmemLayoutK{});
@@ -261,7 +300,7 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_w8a8_sm120(
   constexpr int kSRows = decltype(size<0>(tScS_rc))::value;
   constexpr int kSCols = decltype(size<1>(tScS_rc))::value;
 
-  const float inv_scale = 1.0f / scale;
+  const float scale_orig = scale;
   scale *= FFPA_M_LOG2E;
 
   float row_max[kORows];
@@ -436,8 +475,18 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_w8a8_sm120(
 
   // Epilogue: O = O / row_sum (per-row mode already dequantized per tile) or
   // O = O * kFP8FixedPScale / row_sum (fixed mode keeps one global domain).
+  // Smooth-K lse correction: dot(Q8_row, km) must be read off sQ BEFORE the
+  // full-tile STSM aliases q_base as O staging; the lse gmem write itself is
+  // deferred to the end of the epilogue.
+  float qkm[kORows];
+  const bool smooth_lse = (softmax_lse != nullptr) && (km != nullptr);
   {
     cutlass::arch::NamedBarrier::sync(kConsumerThreads, 0);
+
+    if (smooth_lse)
+      smooth_k_qk_dot<kHeadDim, kORows>(
+          sQ, tScS_rc, km + static_cast<long>(kv_bh) * kHeadDim, qkm);
+
     auto tCrO = make_tensor(make_rmem_ptr(o_acc), OFragLayout{});
     auto tCrO_rc = make_tensor(
         tCrO.data(), ffpa_cute::convert_layout_acc_rowcol(tCrO.layout()));
@@ -504,7 +553,9 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_w8a8_sm120(
       const int lse_base = Nb_id * Nh * Nq + Nh_id * Nq;
 #pragma unroll
       for (int row = 0; row < kORows; ++row) {
-        const float lse = (row_max[row] + log2f(row_sum[row])) * FFPA_M_LN2;
+        float lse = (row_max[row] + log2f(row_sum[row])) * FFPA_M_LN2;
+        if (smooth_lse)
+          lse += scale_orig * qs * qkm[row];
         const int global_row = Br_base + get<0>(tScS_rc(row, 0));
         if (global_row < Nq)
           softmax_lse[lse_base + global_row] = lse;
