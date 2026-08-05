@@ -12,3 +12,7 @@
 // FA-4 conditional rescaling threshold (log2 domain). Skip O rescale when the
 // row-max growth stays below this. FP16/BF16: 8.0 = log2(256); FP8: 4.0.
 #define FFPA_RESCALE_THRESHOLD 8.0f
+// FP8 variant (FA-4 flash_fwd_sm100.py): deferred rescale lets emitted P grow
+// by 2^threshold; the e4m3 P operand (max 448) saturates far sooner than fp16,
+// so the fp8 path must use the smaller threshold.
+#define FFPA_RESCALE_THRESHOLD_FP8 4.0f

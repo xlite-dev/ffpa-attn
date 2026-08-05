@@ -321,7 +321,7 @@ def _parse_args() -> argparse.Namespace:
   )
   parser.add_argument(
     "--cuda-impl",
-    choices=["auto", "native", "tma", "cute", "cute_tma"],
+    choices=["auto", "native", "tma", "cute", "cute_tma", "cute_tma_w8a8"],
     default="auto",
     help="CUDA forward kernel implementation hint (--fwd-backend cuda only). "
     "'auto' (default) picks CUTE_TMA when the CuTe-TMA sm120 kernel is "
@@ -436,12 +436,20 @@ def _resolve_directional_cli_flags(
         "cute": (False, True),
         "cute_tma": (True, True),
       }
-      args.enable_fwd_tma, args.enable_fwd_cute = _CUDA_IMPL_MAP[args.cuda_impl]
+      if args.cuda_impl == "cute_tma_w8a8":
+        args.enable_fwd_tma, args.enable_fwd_cute = True, True
+        args.enable_w8a8 = True
+      else:
+        args.enable_fwd_tma, args.enable_fwd_cute = _CUDA_IMPL_MAP[
+          args.cuda_impl]
+        args.enable_w8a8 = False
     # auto: leave None/True as-is so CUDABackend auto-resolves / honors aliases.
   else:
     args.enable_fwd_tma = bool(args.enable_fwd_tma)
   if args.enable_persist_dkdv and not args.enable_bwd_tma:
     raise SystemExit("--enable-persist-dkdv requires --enable-bwd-tma")
+  if not hasattr(args, "enable_w8a8"):
+    args.enable_w8a8 = False
   return args
 
 
@@ -1517,6 +1525,7 @@ def _benchmark_rows(
         enable_tma=args.enable_fwd_tma,
         enable_ws=args.enable_fwd_ws,
         enable_cute=args.enable_fwd_cute,
+        enable_w8a8=args.enable_w8a8,
         tasks=tasks,
         dtypes=dtypes,
         verbose=args.verbose,

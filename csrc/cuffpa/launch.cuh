@@ -92,6 +92,7 @@ void launch_ffpa_attn_fwd_template(torch::Tensor Q, torch::Tensor K,
   const bool force_tma = (impl_hint == ffpa::CudaBackendImpl::TMA);
   const bool force_cute = (impl_hint == ffpa::CudaBackendImpl::CUTE);
   const bool force_cute_tma = (impl_hint == ffpa::CudaBackendImpl::CUTE_TMA);
+  const bool force_w8a8 = (impl_hint == ffpa::CudaBackendImpl::CUTE_TMA_W8A8);
 
   // SM120 TMA path: when ``tma`` is set and the device is TMA-capable
   // (sm_90+), delegate to the TMA launcher. Falls back to the legacy
@@ -106,10 +107,21 @@ void launch_ffpa_attn_fwd_template(torch::Tensor Q, torch::Tensor K,
   //   sm_90/100: WS (kNonWS=0). setmaxnreg effective, 228KB smem allows
   //     deep pipeline. Unverified on real hardware.
 #ifdef ENABLE_FFPA_TMA_EXT
-  if ((force_tma || force_cute_tma) && !force_native && !force_cute) {
+  if ((force_tma || force_cute_tma || force_w8a8) && !force_native &&
+      !force_cute) {
     auto prop = at::cuda::getCurrentDeviceProperties();
     if (prop->major >= 9) {
-      if (prop->major == 9 || prop->major == 10) {
+      if (force_w8a8) {
+        TORCH_CHECK(kHeadDim <= 128 && kHeadDim % 64 == 0,
+                    "ffpa_attn: cute_tma_w8a8 requires D=64/128");
+#ifdef ENABLE_FFPA_CUTE_EXT
+        launch_cute_fwd_persist_d_w8a8_sm120<kDataType, kHeadDim, kStage>(
+            Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
+            dropout_p, philox_seed, philox_offset);
+#else
+        TORCH_CHECK(false, "ffpa_attn: cute ext not compiled");
+#endif
+      } else if (prop->major == 9 || prop->major == 10) {
         // sm_90/100 (228 KB smem): WS path, setmaxnreg effective.
         if (!has_attn_bias && !has_dropout && kHeadDim <= 512) {
           // w/ kPersistQg2s = 1

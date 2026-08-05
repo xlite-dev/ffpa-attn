@@ -248,6 +248,7 @@ def _make_forward_backend(
   enable_tma: bool,
   enable_ws: bool,
   enable_cute: bool = False,
+  enable_w8a8: bool = False,
   cuda_stages: int | None = None,
 ):
   if name == "cuda":
@@ -257,6 +258,7 @@ def _make_forward_backend(
       "enable_tma": enable_tma,
       "enable_ws": enable_ws,
       "enable_cute": enable_cute,
+      "enable_w8a8": enable_w8a8,
     }
     if cuda_stages is not None:
       kwargs["stages"] = cuda_stages
@@ -298,6 +300,7 @@ def _run_case(
   enable_tma: bool = False,
   enable_ws: bool = False,
   enable_cute: bool = False,
+  enable_w8a8: bool = False,
   verbose: bool = False,
   stages: int | None = None,
 ) -> FORWARD_RESULT:
@@ -314,6 +317,7 @@ def _run_case(
     enable_tma=enable_tma,
     enable_ws=enable_ws,
     enable_cute=enable_cute,
+    enable_w8a8=enable_w8a8,
     cuda_stages=stages,
   )
   backward_backend = CuTeDSLBackend(
@@ -338,7 +342,7 @@ def _run_case(
     q, k_ref, v_ref, is_causal=causal, attn_mask=attn_mask, dropout_p=dropout_p
   )
 
-  tol = 5e-2 if dtype == torch.bfloat16 else 2e-2
+  tol = 5e-2 if (dtype == torch.bfloat16 or enable_w8a8) else 2e-2
   ok = _tensor_allclose(out_ffpa, out_sdpa, tol)
 
   ms_ffpa = _time_fn(
@@ -424,6 +428,7 @@ def run_forward_examples(
   enable_tma: bool = False,
   enable_ws: bool = False,
   enable_cute: bool = False,
+  enable_w8a8: bool = False,
   tasks: set[str] | None = None,
   dtypes: tuple[torch.dtype, ...] = (torch.float16, torch.bfloat16),
   verbose: bool = False,
@@ -468,6 +473,7 @@ def run_forward_examples(
     ("enable_fwd_tma", str(enable_tma)),
     ("enable_fwd_ws", str(enable_ws)),
     ("enable_fwd_cute", str(enable_cute)),
+    ("enable_fwd_w8a8", str(enable_w8a8)),
     ("cuda_stages", str(stages)),
     ("tasks", tasks_str),
     ("warmup", str(warmup)),
@@ -550,7 +556,7 @@ def run_forward_examples(
         "causal": True
       },
     ]
-    if forward_backend != "cutedsl":
+    if forward_backend != "cutedsl" and not enable_w8a8:
       mask_n = max(N, 512)
       case_specs.append({
         "name":
@@ -566,7 +572,7 @@ def run_forward_examples(
         "attn_mask":
         _make_broadcast_additive_attn_mask(mask_n, mask_n, dtype, seed),
       })
-    if forward_backend != "cutedsl":
+    if forward_backend != "cutedsl" and not enable_w8a8:
       case_specs.extend([
         {
           "name": "dropout",
@@ -612,6 +618,7 @@ def run_forward_examples(
           enable_tma=enable_tma,
           enable_ws=enable_ws,
           enable_cute=enable_cute,
+          enable_w8a8=enable_w8a8,
           verbose=verbose,
           stages=stages,
         )
