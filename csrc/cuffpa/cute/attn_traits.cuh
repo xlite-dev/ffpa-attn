@@ -249,8 +249,11 @@ struct FFPAAttnCuTeSplitDM4N2Traits {
 // V is pre-transposed by the quantize pre-kernel and stored (D x N), so the PV
 // B-operand loads with the same non-transposed LDSM_N atom as Q/K; there is no
 // SmemCopyAtomTransposed for fp8. TiledMma K-tile is 32 (atom K), not 16.
+// kQKInt8: Q/K become symmetric int8 and QK runs SM80 m16n8k32 s8xs8->s32
+// (A/B operand layouts identical to the fp8 atom; acc is s32, cast in-kernel);
+// V/PV stay fp8 e4m3.
 template <int kHeadDim_, typename ElementO_, int kBr_ = 128, int kBc_ = 64,
-          int kStagesK_ = 2, int kStagesV_ = 2>
+          int kStagesK_ = 2, int kStagesV_ = 2, bool kQKInt8_ = false>
 struct FFPAAttnCuTePersistDW8A8Traits {
   static constexpr int kHeadDim = kHeadDim_;
   static constexpr int kBr = kBr_;
@@ -259,42 +262,53 @@ struct FFPAAttnCuTePersistDW8A8Traits {
   static constexpr int kNumThreads = kNumWarps * 32;
   static constexpr int kStagesK = kStagesK_;
   static constexpr int kStagesV = kStagesV_;
+  static constexpr bool kQKInt8 = kQKInt8_;
   // fp8 P operand saturates at 448, so use the FA-4 fp8 rescale threshold.
   static constexpr float kRescaleThreshold = FFPA_RESCALE_THRESHOLD_FP8;
 
   static constexpr int kSmemElems =
       kBr * kHeadDim + kStagesK * kBc * kHeadDim + kStagesV * kBc * kHeadDim;
 
-  using Element = cutlass::float_e4m3_t;
+  using Element = cutlass::float_e4m3_t;  // V / P (PV side, always fp8)
+  using ElementQK = std::conditional_t<kQKInt8, int8_t, cutlass::float_e4m3_t>;
   using ElementO = ElementO_;
   // 1B elems: a 128B SW128 row needs 128 elems; D=64 only has 64 -> use SW64.
-  using SmemAtom =
-      std::conditional_t<(kHeadDim * static_cast<int>(sizeof(Element)) <= 64),
-                         GMMA::Layout_K_SW64_Atom<Element>,
-                         GMMA::Layout_K_SW128_Atom<Element>>;
+  template <typename Elem>
+  using SmemAtomT =
+      std::conditional_t<(kHeadDim * static_cast<int>(sizeof(Elem)) <= 64),
+                         GMMA::Layout_K_SW64_Atom<Elem>,
+                         GMMA::Layout_K_SW128_Atom<Elem>>;
+  using SmemAtomQK = SmemAtomT<ElementQK>;
+  using SmemAtomV = SmemAtomT<Element>;
   using SmemLayoutQ =
-      decltype(tile_to_shape(SmemAtom{}, Shape<Int<kBr>, Int<kHeadDim>>{}));
+      decltype(tile_to_shape(SmemAtomQK{}, Shape<Int<kBr>, Int<kHeadDim>>{}));
   using SmemLayoutK =
-      decltype(tile_to_shape(SmemAtom{}, Shape<Int<kBc>, Int<kHeadDim>>{}));
+      decltype(tile_to_shape(SmemAtomQK{}, Shape<Int<kBc>, Int<kHeadDim>>{}));
   // V^T view: (kHeadDim x kBc) row-major, loaded as PV B-operand.
   using SmemLayoutV =
-      decltype(tile_to_shape(SmemAtom{}, Shape<Int<kHeadDim>, Int<kBc>>{}));
+      decltype(tile_to_shape(SmemAtomV{}, Shape<Int<kHeadDim>, Int<kBc>>{}));
   // O staging in the epilogue (ElementO fp16/bf16, NOT the fp8 SmemAtom):
   // after the KV loop the freed Q/K/V smem is aliased to stage O via STSM
   // before the coalesced TMA store; swizzle must match the TMA descriptor.
   using SmemLayoutO = decltype(tile_to_shape(
       GMMA::Layout_K_SW128_Atom<ElementO>{}, Shape<Int<kBr>, Int<kHeadDim>>{}));
 
+  // s8 atom acc is s32; A/B layouts match the fp8 atom exactly (both
+  // 32dp32b m16n8k32), so smem/copy/TMA plumbing is shared.
+  using MmaAtomQK =
+      std::conditional_t<kQKInt8, MMA_Atom<SM80_16x8x32_S32S8S8S32_TN>,
+                         MMA_Atom<SM89_16x8x32_F32E4M3E4M3F32_TN>>;
   using MmaAtom = MMA_Atom<SM89_16x8x32_F32E4M3E4M3F32_TN>;
 
   using TiledMmaQK = decltype(make_tiled_mma(
-      MmaAtom{}, Layout<Shape<Int<kNumWarps>, _1, _1>>{},
+      MmaAtomQK{}, Layout<Shape<Int<kNumWarps>, _1, _1>>{},
       Tile<Int<kBr>, Int<kBc>, _32>{}));
 
   using TiledMmaPV = decltype(make_tiled_mma(
       MmaAtom{}, Layout<Shape<Int<kNumWarps>, _1, _1>>{},
       Tile<Int<kBr>, Int<kHeadDim>, _32>{}));
 
+  using SmemCopyAtomQK = Copy_Atom<SM75_U32x4_LDSM_N, ElementQK>;
   using SmemCopyAtom = Copy_Atom<SM75_U32x4_LDSM_N, Element>;
 };
 

@@ -477,10 +477,13 @@ void launch_cute_fwd_persist_d_sm120(torch::Tensor Q, torch::Tensor K,
   }
 }
 
-// W8A8 persist-D: fp16/bf16 in, internally blockwise-quantized to e4m3
-// (Q/K row-major, V transposed), then fp8 attention. D=64/128 only.
-template <typename kDataType, const int kHeadDim, const int kStage>
-void launch_cute_fwd_persist_d_w8a8_sm120(
+// W8A8 persist-D: fp16/bf16 in, internally blockwise-quantized (Q/K row-major
+// to e4m3 or symmetric int8, V transposed to e4m3), then low-precision
+// attention. kQKInt8: QK runs s8xs8->s32 MMA (cast to f32 before softmax).
+// D=64/128 only. Opt into int8 QK with FFPA_W8A8_QK_INT8.
+template <typename kDataType, const int kHeadDim, const int kStage,
+          bool kQKInt8>
+void launch_cute_fwd_persist_d_w8a8_sm120_impl(
     torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O,
     torch::Tensor attn_bias, torch::Tensor softmax_lse, int causal,
     double softmax_scale, double dropout_p, int64_t philox_seed,
@@ -505,8 +508,9 @@ void launch_cute_fwd_persist_d_w8a8_sm120(
                                       cutlass::half_t, cutlass::bfloat16_t>;
   using Traits =
       ffpa_cute::FFPAAttnCuTePersistDW8A8Traits<kHeadDim, ElementO, kBr, kBc,
-                                                kStagesK, kStagesV>;
+                                                kStagesK, kStagesV, kQKInt8>;
   using Element = typename Traits::Element;
+  using ElementQK = typename Traits::ElementQK;
   using SmemLayoutQ = typename Traits::SmemLayoutQ;
   using SmemLayoutK = typename Traits::SmemLayoutK;
   using SmemLayoutV = typename Traits::SmemLayoutV;
@@ -524,12 +528,15 @@ void launch_cute_fwd_persist_d_w8a8_sm120(
   // TMA needs a 16-byte-aligned leading stride; fp8 rows are Nkv bytes, so pad.
   const int Nkv_pad = (Nkv + 15) / 16 * 16;
 
+  auto opts_qk = torch::TensorOptions()
+                     .dtype(kQKInt8 ? torch::kChar : torch::kFloat8_e4m3fn)
+                     .device(Q.device());
   auto opts_u8 =
       torch::TensorOptions().dtype(torch::kFloat8_e4m3fn).device(Q.device());
   auto opts_f32 =
       torch::TensorOptions().dtype(torch::kFloat32).device(Q.device());
-  torch::Tensor q8 = torch::empty({Nb, Nh, Nq, kHeadDim}, opts_u8);
-  torch::Tensor k8 = torch::empty({Nb, Nh_kv, Nkv, kHeadDim}, opts_u8);
+  torch::Tensor q8 = torch::empty({Nb, Nh, Nq, kHeadDim}, opts_qk);
+  torch::Tensor k8 = torch::empty({Nb, Nh_kv, Nkv, kHeadDim}, opts_qk);
   torch::Tensor vt8 = torch::empty({Nb, Nh_kv, kHeadDim, Nkv_pad}, opts_u8);
   torch::Tensor q_scale = torch::empty({Nb * Nh, n_rb_q}, opts_f32);
   torch::Tensor k_scale = torch::empty({Nb * Nh_kv, n_rb_kv}, opts_f32);
@@ -564,13 +571,11 @@ void launch_cute_fwd_persist_d_w8a8_sm120(
     }
   }
 
-  ffpa_cute::launch_quantize_w8a8_sm120<kDataType, kBr, kBc, kHeadDim>(
+  ffpa_cute::launch_quantize_w8a8_sm120<kDataType, kBr, kBc, kHeadDim, kQKInt8>(
       reinterpret_cast<const kDataType*>(Q.data_ptr()),
       reinterpret_cast<const kDataType*>(K.data_ptr()),
-      reinterpret_cast<const kDataType*>(V.data_ptr()),
-      reinterpret_cast<__nv_fp8_e4m3*>(q8.data_ptr()),
-      reinterpret_cast<__nv_fp8_e4m3*>(k8.data_ptr()),
-      reinterpret_cast<__nv_fp8_e4m3*>(vt8.data_ptr()),
+      reinterpret_cast<const kDataType*>(V.data_ptr()), q8.data_ptr(),
+      k8.data_ptr(), reinterpret_cast<__nv_fp8_e4m3*>(vt8.data_ptr()),
       q_scale.data_ptr<float>(), k_scale.data_ptr<float>(),
       v_scale.data_ptr<float>(), Nb, Nh, Nh_kv, Nq, Nkv, Nkv_pad, kHeadDim,
       stream, km_ptr);
@@ -579,11 +584,11 @@ void launch_cute_fwd_persist_d_w8a8_sm120(
   const int total_kv_rows = Nb * Nh_kv * Nkv;
 
   auto gQ =
-      make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(q8.data_ptr())),
+      make_tensor(make_gmem_ptr(reinterpret_cast<ElementQK*>(q8.data_ptr())),
                   make_shape(total_q_rows, Int<kHeadDim>{}),
                   make_stride(Int<kHeadDim>{}, _1{}));
   auto gK =
-      make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(k8.data_ptr())),
+      make_tensor(make_gmem_ptr(reinterpret_cast<ElementQK*>(k8.data_ptr())),
                   make_shape(total_kv_rows, Int<kHeadDim>{}),
                   make_stride(Int<kHeadDim>{}, _1{}));
 
@@ -642,6 +647,24 @@ void launch_cute_fwd_persist_d_w8a8_sm120(
         ffpa_w8a8::persist_d_ws_fwd_cute_w8a8_sm120<Traits, ElementO, TmaQ,
                                                     TmaK, TmaV, TmaO, false>);
   }
+}
+
+template <typename kDataType, const int kHeadDim, const int kStage>
+void launch_cute_fwd_persist_d_w8a8_sm120(
+    torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O,
+    torch::Tensor attn_bias, torch::Tensor softmax_lse, int causal,
+    double softmax_scale, double dropout_p, int64_t philox_seed,
+    int64_t philox_offset, bool smooth_k) {
+  if (getenv("FFPA_W8A8_QK_INT8") != nullptr)
+    launch_cute_fwd_persist_d_w8a8_sm120_impl<kDataType, kHeadDim, kStage,
+                                              true>(
+        Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale, dropout_p,
+        philox_seed, philox_offset, smooth_k);
+  else
+    launch_cute_fwd_persist_d_w8a8_sm120_impl<kDataType, kHeadDim, kStage,
+                                              false>(
+        Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale, dropout_p,
+        philox_seed, philox_offset, smooth_k);
 }
 
 template <typename kDataType, const int kHeadDim, const int kStage>

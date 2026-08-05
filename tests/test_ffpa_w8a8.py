@@ -136,3 +136,126 @@ def test_w8a8_perf_vs_sage_sdpa(capsys):
     print("\n".join(lines))
 
   assert ms["FFPA FP8 (w8a8)"] < ms["SDPA fp16"]
+
+
+def _set_qk_int8(monkeypatch, enable: bool) -> None:
+  if enable:
+    monkeypatch.setenv("FFPA_W8A8_QK_INT8", "1")
+  else:
+    monkeypatch.delenv("FFPA_W8A8_QK_INT8", raising=False)
+
+
+def _w8a8_out_lse(q, k, v, causal: bool, smooth_k: bool = True):
+  from ffpa_attn.cuda import set_cuda_backend_impl, CudaBackendImpl
+  from ffpa_attn.cuda._ffpa_fwd import _ffpa_attn_forward_cuda
+
+  set_cuda_backend_impl(CudaBackendImpl.CUTE_TMA_W8A8)
+  return _ffpa_attn_forward_cuda(
+    q,
+    k,
+    v,
+    causal=int(causal),
+    softmax_scale=q.size(-1)**-0.5,
+    smooth_k=smooth_k,
+  )
+
+
+@pytest.mark.parametrize("D", [64, 128])
+@pytest.mark.parametrize(
+  "dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"]
+)
+@pytest.mark.parametrize("causal", [False, True], ids=["dense", "causal"])
+def test_w8a8_qk_int8_forward_parity(D, dtype, causal, monkeypatch):
+  _set_qk_int8(monkeypatch, True)
+  torch.manual_seed(0)
+  B, H, N = 1, 32, 4096
+  q = torch.randn(B, H, N, D, dtype=dtype, device="cuda") * 0.5
+  k = torch.randn(B, H, N, D, dtype=dtype, device="cuda") * 0.5
+  v = torch.randn(B, H, N, D, dtype=dtype, device="cuda") * 0.5
+
+  out = ffpa_attn_func(
+    q, k, v, is_causal=causal, forward_backend=_w8a8_backend()
+  )
+  ref = F.scaled_dot_product_attention(
+    q.float(), k.float(), v.float(), is_causal=causal
+  ).to(dtype)
+  # fp8 P-quant error is amplified on early causal rows (few attended keys).
+  tol = 1e-1 if causal else 4e-2
+  torch.testing.assert_close(out, ref, atol=tol, rtol=tol)
+
+
+def test_w8a8_qk_int8_beats_fp8_high_amp(monkeypatch):
+  torch.manual_seed(0)
+  B, H, N, D = 1, 32, 4096, 128
+  q = torch.randn(B, H, N, D, dtype=torch.float16, device="cuda") * 4.0
+  k = torch.randn(B, H, N, D, dtype=torch.float16, device="cuda") * 4.0
+  v = torch.randn(B, H, N, D, dtype=torch.float16, device="cuda") * 4.0
+  ref = F.scaled_dot_product_attention(q.float(), k.float(), v.float())
+
+  _set_qk_int8(monkeypatch, False)
+  out_fp8 = ffpa_attn_func(q, k, v, forward_backend=_w8a8_backend())
+  _set_qk_int8(monkeypatch, True)
+  out_int8 = ffpa_attn_func(q, k, v, forward_backend=_w8a8_backend())
+
+  rel_fp8 = ((out_fp8.float() - ref).norm() / ref.norm()).item()
+  rel_int8 = ((out_int8.float() - ref).norm() / ref.norm()).item()
+  assert rel_int8 < rel_fp8
+  assert rel_int8 < 0.10
+
+
+@pytest.mark.parametrize("qk_int8", [False, True], ids=["fp8-qk", "int8-qk"])
+@pytest.mark.parametrize(
+  "smooth_k", [False, True], ids=["smooth-off", "smooth-on"]
+)
+def test_w8a8_smooth_k_and_lse(qk_int8, smooth_k, monkeypatch):
+  _set_qk_int8(monkeypatch, qk_int8)
+  torch.manual_seed(0)
+  B, H, N, D = 1, 32, 4096, 128
+  q = torch.randn(B, H, N, D, dtype=torch.float16, device="cuda") * 0.5
+  k = torch.randn(B, H, N, D, dtype=torch.float16, device="cuda") * 0.5
+  v = torch.randn(B, H, N, D, dtype=torch.float16, device="cuda") * 0.5
+
+  out, lse = _w8a8_out_lse(q, k, v, causal=False, smooth_k=smooth_k)
+  p = (q.float() @ k.float().transpose(-1, -2)) * (D**-0.5)
+  ref = torch.softmax(p, dim=-1) @ v.float()
+  lse_ref = torch.logsumexp(p, dim=-1)
+  torch.testing.assert_close(out.float(), ref, atol=4e-2, rtol=4e-2)
+  torch.testing.assert_close(lse.float(), lse_ref, atol=5e-2, rtol=1e-3)
+
+
+@pytest.mark.parametrize("qk_int8", [False, True], ids=["fp8-qk", "int8-qk"])
+def test_w8a8_gqa_forward_parity(qk_int8, monkeypatch):
+  _set_qk_int8(monkeypatch, qk_int8)
+  torch.manual_seed(0)
+  B, H, H_kv, N, D = 1, 32, 8, 4096, 128
+  q = torch.randn(B, H, N, D, dtype=torch.float16, device="cuda") * 0.5
+  k = torch.randn(B, H_kv, N, D, dtype=torch.float16, device="cuda") * 0.5
+  v = torch.randn(B, H_kv, N, D, dtype=torch.float16, device="cuda") * 0.5
+
+  out = ffpa_attn_func(
+    q, k, v, is_causal=False, enable_gqa=True, forward_backend=_w8a8_backend()
+  )
+  k_rep = k.repeat_interleave(H // H_kv, dim=1)
+  v_rep = v.repeat_interleave(H // H_kv, dim=1)
+  ref = F.scaled_dot_product_attention(q.float(), k_rep.float(), v_rep.float())
+  torch.testing.assert_close(out.float(), ref, atol=4e-2, rtol=4e-2)
+
+
+@pytest.mark.parametrize("qk_int8", [False, True], ids=["fp8-qk", "int8-qk"])
+def test_w8a8_nkv_unaligned_parity(qk_int8, monkeypatch):
+  _set_qk_int8(monkeypatch, qk_int8)
+  torch.manual_seed(0)
+  B, H, N, D = 1, 32, 2120, 128  # N % 128 != 0: tail tile + partial quantize
+  q = torch.randn(B, H, N, D, dtype=torch.float16, device="cuda") * 0.5
+  k = torch.randn(B, H, N, D, dtype=torch.float16, device="cuda") * 0.5
+  v = torch.randn(B, H, N, D, dtype=torch.float16, device="cuda") * 0.5
+
+  out, lse = _w8a8_out_lse(q, k, v, causal=True)
+  ref = F.scaled_dot_product_attention(
+    q.float(), k.float(), v.float(), is_causal=True
+  )
+  torch.testing.assert_close(out.float(), ref, atol=1e-1, rtol=1e-1)
+  p = (q.float() @ k.float().transpose(-1, -2)) * (D**-0.5)
+  mask = torch.triu(torch.ones(N, N, device="cuda"), diagonal=1).bool()
+  lse_ref = torch.logsumexp(p.masked_fill(mask, float("-inf")), dim=-1)
+  torch.testing.assert_close(lse.float(), lse_ref, atol=5e-2, rtol=1e-3)

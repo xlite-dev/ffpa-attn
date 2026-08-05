@@ -57,7 +57,8 @@ CUTE_DEVICE void smooth_k_qk_dot(const SmemQTensor& sQ,
   }
 }
 
-// WS persist-D W8A8 (fp8 e4m3 Q/K/V): same 128 producer + 256 consumer split
+// WS persist-D W8A8 (fp8 e4m3 Q/K/V; kQKInt8: Q/K symmetric int8 with s32 QK
+// MMA cast to f32, PV stays fp8): same 128 producer + 256 consumer split
 // as persist_d.cuh. V is pre-transposed (D x N) by the quantize pre-kernel.
 // Blockwise scales: k_scale folded into the log2-domain softmax, v_scale
 // absorbed into P's fp8 quantization, q_scale * p_scale applied in epilogue.
@@ -87,13 +88,15 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_w8a8_sm120(
     const float* __restrict__ km = nullptr) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
   using namespace cute;
-  using Element = typename Traits::Element;  // float_e4m3_t
+  using Element = typename Traits::Element;      // float_e4m3_t (V/PV)
+  using ElementQK = typename Traits::ElementQK;  // int8 (kQKInt8) or e4m3
   using SmemLayoutQ = typename Traits::SmemLayoutQ;
   using SmemLayoutK = typename Traits::SmemLayoutK;
   using SmemLayoutV = typename Traits::SmemLayoutV;
   using TiledMmaQK = typename Traits::TiledMmaQK;
   using TiledMmaPV = typename Traits::TiledMmaPV;
   using SmemCopyAtom = typename Traits::SmemCopyAtom;
+  using SmemCopyAtomQK = typename Traits::SmemCopyAtomQK;
   using SmemLayoutO = typename Traits::SmemLayoutO;
 
   constexpr int kBr = Traits::kBr;
@@ -136,11 +139,12 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_w8a8_sm120(
   const int kv_bh = Nb_id * Nh_kv + kv_head_idx;
   const float qs = q_scale[static_cast<long>(q_bh) * n_rb_q + Q_tile_id];
 
-  // SMEM: [Q persist | K stages | V stages], all e4m3 (1B per elem).
-  extern __shared__ __align__(1024) Element shm[];
-  Element* q_base = shm;
-  Element* k_base = q_base + kQTileElements;
-  Element* v_base = k_base + kStagesK * kKTileElements;
+  // SMEM: [Q persist | K stages | V stages], 1B per elem (int8 or e4m3).
+  extern __shared__ __align__(1024) char shm[];
+  ElementQK* q_base = reinterpret_cast<ElementQK*>(shm);
+  ElementQK* k_base = q_base + kQTileElements;
+  Element* v_base =
+      reinterpret_cast<Element*>(k_base + kStagesK * kKTileElements);
 
   __shared__ uint64_t q_full;
   __shared__ uint64_t k_full[kStagesK];
@@ -188,7 +192,7 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_w8a8_sm120(
       auto sQ = make_tensor(make_smem_ptr(q_base), SmemLayoutQ{});
       auto gQ = local_tile(mQ, Shape<Int<kBr>, Int<kHeadDim>>{},
                            make_coord(Q_tile_id, _0{}));
-      TmaBarrier::arrive_and_expect_tx(&q_full, sizeof(Element) * size(sQ));
+      TmaBarrier::arrive_and_expect_tx(&q_full, sizeof(ElementQK) * size(sQ));
       copy(tma_q.with(q_full), q_slice.partition_S(gQ),
            q_slice.partition_D(sQ));
 
@@ -200,7 +204,7 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_w8a8_sm120(
           auto gK = local_tile(mK, Shape<Int<kBc>, Int<kHeadDim>>{},
                                make_coord(s, _0{}));
           TmaBarrier::arrive_and_expect_tx(&k_full[s],
-                                           sizeof(Element) * size(sK));
+                                           sizeof(ElementQK) * size(sK));
           copy(tma_k.with(k_full[s]), k_slice.partition_S(gK),
                k_slice.partition_D(sK));
         }
@@ -248,7 +252,7 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_w8a8_sm120(
             auto gK = local_tile(mK, Shape<Int<kBc>, Int<kHeadDim>>{},
                                  make_coord(k_tile, _0{}));
             TmaBarrier::arrive_and_expect_tx(&k_full[stage_k],
-                                             sizeof(Element) * size(sK));
+                                             sizeof(ElementQK) * size(sK));
             copy(tma_k.with(k_full[stage_k]), k_slice.partition_S(gK),
                  k_slice.partition_D(sK));
           }
@@ -275,8 +279,8 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_w8a8_sm120(
   auto thr_mma_qk = tiled_mma_qk.get_thread_slice(wg_tid);
   auto thr_mma_pv = tiled_mma_pv.get_thread_slice(wg_tid);
 
-  auto s2r_copy_q = make_tiled_copy_A(SmemCopyAtom{}, tiled_mma_qk);
-  auto s2r_copy_k = make_tiled_copy_B(SmemCopyAtom{}, tiled_mma_qk);
+  auto s2r_copy_q = make_tiled_copy_A(SmemCopyAtomQK{}, tiled_mma_qk);
+  auto s2r_copy_k = make_tiled_copy_B(SmemCopyAtomQK{}, tiled_mma_qk);
   auto s2r_copy_v = make_tiled_copy_B(SmemCopyAtom{}, tiled_mma_pv);
   auto s2r_thr_q = s2r_copy_q.get_thread_slice(wg_tid);
   auto s2r_thr_k = s2r_copy_k.get_thread_slice(wg_tid);
@@ -338,7 +342,7 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_w8a8_sm120(
     const float vs = v_scale[static_cast<long>(kv_bh) * n_rb_kv + kv_tile];
     const float s_dequant = qs * ks;  // linear dequant of S
 
-    // QK GEMM (fp8 x fp8 -> fp32).
+    // QK GEMM: fp8xfp8->fp32, or int8xint8->s32 when kQKInt8.
     TmaBarrier::wait(&k_full[k_stg], k_phase);
     cutlass::arch::fence_view_async_shared();
 
@@ -353,9 +357,19 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_w8a8_sm120(
                        s2r_copy_q, s2r_copy_k, s2r_thr_q, s2r_thr_k);
     CtaBarrier::arrive(&k_empty[k_stg]);
 
+    // int8 QK: cast the s32 acc to f32 in place over the same 4B regs (no
+    // extra registers); identity view on the fp8 path.
+    auto tCrSf =
+        make_tensor(reinterpret_cast<float*>(tCrS.data()), tCrS.layout());
+    if constexpr (Traits::kQKInt8) {
+#pragma unroll
+      for (int i = 0; i < size(tCrS); ++i)
+        tCrSf(i) = static_cast<float>(tCrS(i));
+    }
+
     // S -> log2 domain with k_scale folded in (blockwise dequant of S).
     auto scores = make_tensor(
-        tCrS.data(), ffpa_cute::convert_layout_acc_rowcol(tCrS.layout()));
+        tCrSf.data(), ffpa_cute::convert_layout_acc_rowcol(tCrS.layout()));
     const int kv_valid = Nkv - kv_tile * kBc;
     const bool tile_needs_mask =
         (kv_valid < kBc) || (kv_tile >= mask_start_tile);
@@ -430,9 +444,9 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_w8a8_sm120(
     // softmax and only converts (packed e4m3x2) + reorgs.
     if constexpr (kPQuantPerRow) {
       ffpa_cute::pscale_per_row(scores, p_scale);
-      ffpa_cute::quantize_p_frag<true>(scores, tCrS, vs, p_scale, reorg);
+      ffpa_cute::quantize_p_frag<true>(scores, tCrSf, vs, p_scale, reorg);
     } else {
-      ffpa_cute::quantize_p_frag_prescaled(tCrS, reorg);
+      ffpa_cute::quantize_p_frag_prescaled(tCrSf, reorg);
     }
 
     // PV GEMM: A = P in regs, B = V^T from smem. Per-row dequant factor
@@ -446,7 +460,7 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_w8a8_sm120(
     auto tVsV_s2r = s2r_thr_v.partition_S(sV);
 
     auto tCrP =
-        make_tensor(reinterpret_cast<Element*>(tCrS.data()),
+        make_tensor(reinterpret_cast<Element*>(tCrSf.data()),
                     Layout<Shape<Shape<_4, _2, _2>, _1, Int<kBc / 32>>>{});
     if constexpr (kPQuantPerRow) {
       auto tCrTile = make_tensor(make_rmem_ptr(o_tile), OFragLayout{});
