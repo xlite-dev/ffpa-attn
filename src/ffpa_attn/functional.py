@@ -224,6 +224,7 @@ class CUDABackend(Backend):
   enable_ws: bool = False  # For future use.
   enable_w8a8: bool = False  # fp8 W8A8 persist-D sm120 path (fp16/bf16 in).
   smooth_k: bool = True  # W8A8 only: subtract per-(b,h) K seq mean pre-quant.
+  qk_int8: bool | None = None  # W8A8 only: int8 QK MMA; None=auto (causal).
 
   def __post_init__(self) -> None:
     super().__post_init__()
@@ -911,6 +912,7 @@ class _FFPAAttnFunc(torch.autograd.Function):
         int(rng_state[0].item()) if rng_state.numel() else 0,
         int(rng_state[1].item()) if rng_state.numel() else 0,
         forward_meta.smooth_k,
+        forward_meta.qk_int8,
       )
     elif isinstance(meta.forward_meta, TritonBackend):
       forward_meta = meta.forward_meta

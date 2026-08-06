@@ -250,6 +250,7 @@ def _make_forward_backend(
   enable_cute: bool = False,
   enable_w8a8: bool = False,
   smooth_k: bool = True,
+  qk_int8: bool | None = None,
   cuda_stages: int | None = None,
 ):
   if name == "cuda":
@@ -261,6 +262,7 @@ def _make_forward_backend(
       "enable_cute": enable_cute,
       "enable_w8a8": enable_w8a8,
       "smooth_k": smooth_k,
+      "qk_int8": qk_int8,
     }
     if cuda_stages is not None:
       kwargs["stages"] = cuda_stages
@@ -304,6 +306,7 @@ def _run_case(
   enable_cute: bool = False,
   enable_w8a8: bool = False,
   smooth_k: bool = True,
+  qk_int8: bool | None = None,
   verbose: bool = False,
   stages: int | None = None,
 ) -> FORWARD_RESULT:
@@ -322,6 +325,7 @@ def _run_case(
     enable_cute=enable_cute,
     enable_w8a8=enable_w8a8,
     smooth_k=smooth_k,
+    qk_int8=qk_int8,
     cuda_stages=stages,
   )
   backward_backend = CuTeDSLBackend(
@@ -433,6 +437,7 @@ def run_forward_examples(
   enable_ws: bool = False,
   enable_cute: bool = False,
   enable_w8a8: bool = False,
+  qk_int8: bool | None = None,
   smooth_k: bool = True,
   tasks: set[str] | None = None,
   dtypes: tuple[torch.dtype, ...] = (torch.float16, torch.bfloat16),
@@ -624,6 +629,7 @@ def run_forward_examples(
           enable_ws=enable_ws,
           enable_cute=enable_cute,
           enable_w8a8=enable_w8a8,
+          qk_int8=qk_int8,
           smooth_k=smooth_k,
           verbose=verbose,
           stages=stages,

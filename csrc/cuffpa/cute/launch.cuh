@@ -4,15 +4,17 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <optional>
 #include "common.cuh"
 #ifdef ENABLE_FFPA_CUTE_EXT
 #include "cute/sm_80/split_d.cuh"
 #ifdef ENABLE_FFPA_TMA_EXT
 #include "cute/sm_120/split_d.cuh"
 #include "cute/sm_120/persist_d.cuh"
-#include "cute/sm_120/persist_d_w8a8.cuh"
-#include "cute/sm_120/quantize_w8a8.cuh"
 #include "cute/sm_120/split_d_m4n2.cuh"
+#include "cute/w8a8/quantize_w8a8.cuh"
+#include "cute/w8a8/smooth_k.cuh"
+#include "cute/w8a8/sm_120/persist_d_w8a8.cuh"
 #endif
 #endif
 
@@ -479,7 +481,7 @@ void launch_cute_fwd_persist_d_sm120(torch::Tensor Q, torch::Tensor K,
 // W8A8 persist-D: fp16/bf16 in, internally blockwise-quantized (Q/K row-major
 // to e4m3 or symmetric int8, V transposed to e4m3), then low-precision
 // attention. kQKInt8: QK runs s8xs8->s32 MMA (cast to f32 before softmax).
-// D=64/128 only. Opt into int8 QK with FFPA_W8A8_QK_INT8.
+// D=64/128 only.
 template <typename kDataType, const int kHeadDim, const int kStage,
           bool kQKInt8>
 void launch_cute_fwd_persist_d_w8a8_sm120_impl(
@@ -568,18 +570,18 @@ void launch_cute_fwd_persist_d_w8a8_sm120_impl(
     // Custom two-stage column mean (~50us) replacing at::mean + fp32 cast
     // (~85us); emits the in-dtype mean and its fp32 copy in one pass.
     const int mean_chunks =
-        (Nkv + ffpa_cute::kMeanRowsPerChunk - 1) / ffpa_cute::kMeanRowsPerChunk;
+        (Nkv + ffpa_w8a8::kMeanRowsPerChunk - 1) / ffpa_w8a8::kMeanRowsPerChunk;
     km = torch::empty({Nb * Nh_kv, kHeadDim}, K.options());
     km_f32 = torch::empty({Nb * Nh_kv, kHeadDim}, opts_f32);
     km_partials = torch::empty({Nb * Nh_kv, mean_chunks, kHeadDim}, opts_f32);
     km_ptr = reinterpret_cast<const kDataType*>(km.data_ptr());
     km_f32_ptr = km_f32.data_ptr<float>();
-    ffpa_cute::launch_kv_mean_sm120<kDataType, kHeadDim>(
+    ffpa_w8a8::launch_kv_mean_sm120<kDataType, kHeadDim>(
         k_ptr, reinterpret_cast<kDataType*>(km.data_ptr()),
         km_f32.data_ptr<float>(), km_partials.data_ptr<float>(), Nb, Nh_kv, Nkv,
         stream);
   }
-  ffpa_cute::launch_quantize_w8a8_sm120<kDataType, kBr, kBc, kHeadDim, kQKInt8>(
+  ffpa_w8a8::launch_quantize_w8a8_sm120<kDataType, kBr, kBc, kHeadDim, kQKInt8>(
       q_ptr, k_ptr, v_ptr, q8.data_ptr(), k8.data_ptr(),
       reinterpret_cast<__nv_fp8_e4m3*>(vt8.data_ptr()),
       q_scale.data_ptr<float>(), k_scale.data_ptr<float>(),
@@ -659,17 +661,22 @@ void launch_cute_fwd_persist_d_w8a8_sm120(
     torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O,
     torch::Tensor attn_bias, torch::Tensor softmax_lse, int causal,
     double softmax_scale, double dropout_p, int64_t philox_seed,
-    int64_t philox_offset, bool smooth_k) {
-  // QK dtype tri-state: FFPA_W8A8_QK_INT8=1 forces int8, =0 forces fp8;
-  // unset auto-selects int8 for causal (early-row accuracy limit, see the
-  // masking-pass comment in persist_d_w8a8.cuh; int8 QK fixes its dS part at
-  // ~zero causal cost) and fp8 otherwise (dense pays ~7.5% for no gain).
+    int64_t philox_offset, bool smooth_k, std::optional<bool> qk_int8_opt) {
+  // QK dtype tri-state: explicit qk_int8 wins; else FFPA_W8A8_QK_INT8
+  // (=1 forces int8, =0 forces fp8); else auto-selects int8 for causal
+  // (early-row accuracy limit, see the masking-pass comment in
+  // persist_d_w8a8.cuh; int8 QK fixes its dS part at ~zero causal cost)
+  // and fp8 otherwise (dense pays ~7.5% for no gain).
   // if constexpr keeps the impl (and its kernel) out of instantiation for
   // unsupported headdims; every headdim TU includes this launcher template.
   if constexpr (kHeadDim == 64 || kHeadDim == 128) {
-    const char* qk_int8_env = getenv("FFPA_W8A8_QK_INT8");
-    const bool qk_int8 =
-        qk_int8_env != nullptr ? qk_int8_env[0] != '0' : (causal != 0);
+    bool qk_int8;
+    if (qk_int8_opt.has_value()) {
+      qk_int8 = *qk_int8_opt;
+    } else {
+      const char* qk_int8_env = getenv("FFPA_W8A8_QK_INT8");
+      qk_int8 = qk_int8_env != nullptr ? qk_int8_env[0] != '0' : (causal != 0);
+    }
     if (qk_int8)
       launch_cute_fwd_persist_d_w8a8_sm120_impl<kDataType, kHeadDim, kStage,
                                                 true>(

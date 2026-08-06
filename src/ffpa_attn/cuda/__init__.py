@@ -57,7 +57,7 @@ torch.library.define(
   f"{_OP_NAMESPACE}::_fwd_cuda",
   "(Tensor q, Tensor k, Tensor v, Tensor attn_bias, int stages, int acc, int causal, "
   "float softmax_scale, float dropout_p, int philox_seed, int philox_offset, "
-  "bool smooth_k) -> (Tensor o, Tensor softmax_lse)",
+  "bool smooth_k, bool? qk_int8) -> (Tensor o, Tensor softmax_lse)",
 )
 
 
@@ -75,6 +75,7 @@ def _fwd_cuda_torch_op(
   philox_seed: int,
   philox_offset: int,
   smooth_k: bool,
+  qk_int8: bool | None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
   if _ffpa_attn_fwd_cuda is None:
     raise RuntimeError(
@@ -110,6 +111,7 @@ def _fwd_cuda_torch_op(
     philox_seed,
     philox_offset,
     smooth_k,
+    qk_int8,
   )
   return O, softmax_lse
 
@@ -128,6 +130,7 @@ def _fwd_cuda_fake(
   philox_seed: int,
   philox_offset: int,
   smooth_k: bool,
+  qk_int8: bool | None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
   O = torch.empty_like(Q)  # noqa: E741
   softmax_lse = Q.new_empty(

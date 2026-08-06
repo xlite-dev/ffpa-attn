@@ -17,6 +17,7 @@ def _ffpa_attn_forward_cuda(
   philox_seed: int = 0,
   philox_offset: int = 0,
   smooth_k: bool = True,
+  qk_int8: bool | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
   """Call FFPA CUDA forward via registered torch op, returning ``(O, softmax_lse)``.
 
@@ -38,5 +39,6 @@ def _ffpa_attn_forward_cuda(
     philox_seed,
     philox_offset,
     smooth_k,
+    qk_int8,
   )
   return O_storage, softmax_lse_storage[..., :Q.size(2)]

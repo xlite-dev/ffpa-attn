@@ -143,6 +143,37 @@ def _set_qk_int8(monkeypatch, enable: bool) -> None:
   monkeypatch.setenv("FFPA_W8A8_QK_INT8", "1" if enable else "0")
 
 
+def test_w8a8_qk_int8_param_priority(monkeypatch):
+  # CUDABackend.qk_int8 param beats the FFPA_W8A8_QK_INT8 env; None falls
+  # back to env, then to the causal-based auto default.
+  torch.manual_seed(0)
+  B, H, N, D = 1, 8, 2048, 128
+  q = torch.randn(B, H, N, D, dtype=torch.bfloat16, device="cuda") * 0.5
+  k = torch.randn(B, H, N, D, dtype=torch.bfloat16, device="cuda") * 0.5
+  v = torch.randn(B, H, N, D, dtype=torch.bfloat16, device="cuda") * 0.5
+
+  def run(qk_int8, env: str | None = None):
+    if env is None:
+      monkeypatch.delenv("FFPA_W8A8_QK_INT8", raising=False)
+    else:
+      monkeypatch.setenv("FFPA_W8A8_QK_INT8", env)
+    backend = CUDABackend(
+      backward=False,
+      enable_tma=True,
+      enable_cute=True,
+      enable_w8a8=True,
+      qk_int8=qk_int8,
+    )
+    return ffpa_attn_func(q, k, v, is_causal=False, forward_backend=backend)
+
+  fp8, int8 = run(False), run(True)
+  assert not torch.equal(fp8, int8)
+  assert torch.equal(run(None), fp8)  # dense auto -> fp8
+  assert torch.equal(run(None, env="1"), int8)  # env fallback
+  assert torch.equal(run(False, env="1"), fp8)  # param beats env
+  assert torch.equal(run(True, env="0"), int8)
+
+
 def _w8a8_out_lse(q, k, v, causal: bool, smooth_k: bool = True):
   from ffpa_attn.cuda import set_cuda_backend_impl, CudaBackendImpl
   from ffpa_attn.cuda._ffpa_fwd import _ffpa_attn_forward_cuda

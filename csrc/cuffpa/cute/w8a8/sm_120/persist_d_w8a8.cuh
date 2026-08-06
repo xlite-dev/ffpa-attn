@@ -11,12 +11,14 @@
 
 #include <algorithm>
 
-#include "../gemm.cuh"
-#include "../attn_traits.cuh"
+#include "../../gemm.cuh"
+#include "../../attn_traits.cuh"
+#include "../../softmax.cuh"
 #include "../fp8_pscale.cuh"
-#include "../reg2reg_fp8.cuh"
+#include "../reg2reg_8b.cuh"
 #include "../smooth_k.cuh"
-#include "../softmax.cuh"
+
+namespace ffpa_w8a8 {
 
 using TmaBarrier = cutlass::arch::ClusterTransactionBarrier;
 using CtaBarrier = cutlass::arch::ClusterBarrier;
@@ -104,10 +106,8 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_w8a8_sm120(
   const float qs = q_scale[static_cast<long>(q_bh) * n_rb_q + Q_tile_id];
 
   // SMEM: [Q persist | K stages | V stages], 1B per elem (int8 or e4m3).
-  // Unique name: extern __shared__ has global linkage across the kernels in
-  // this TU, so it must not collide with the sibling kernels' `shm`.
-  extern __shared__ __align__(1024) char shm_w8a8[];
-  ElementQK* q_base = reinterpret_cast<ElementQK*>(shm_w8a8);
+  extern __shared__ __align__(1024) char shm[];
+  ElementQK* q_base = reinterpret_cast<ElementQK*>(shm);
   ElementQK* k_base = q_base + kQTileElements;
   Element* v_base =
       reinterpret_cast<Element*>(k_base + kStagesK * kKTileElements);
@@ -300,7 +300,7 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_w8a8_sm120(
   auto tCrQ = thr_mma_qk.partition_fragment_A(sQ);
   auto tQsQ_s2r = s2r_thr_q.partition_S(sQ);
 
-  ffpa_cute::ReorgCFp8toAFp8 reorg;
+  ReorgC8bitToA8bit reorg;
 
 #pragma unroll 1
   for (int kv_tile = 0; kv_tile < Tc_eff; ++kv_tile) {
@@ -378,7 +378,7 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_w8a8_sm120(
     }
 
     float row_scale[kORows];
-    const float vs448 = vs * ffpa_cute::kE4m3Max;
+    const float vs448 = vs * kE4m3Max;
     if constexpr (kPQuantPerRow) {
       if (!tile_needs_mask) {
         const float sd = s_dequant * scale;
@@ -400,8 +400,8 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_w8a8_sm120(
       // of a separate scale pass over all 64 scores).
       const float softmax_scale_eff =
           tile_needs_mask ? 1.0f : s_dequant * scale;
-      ffpa_cute::online_softmax_fp8_fixed<true, decltype(scores),
-                                          decltype(tScS_rc), kORows>(
+      online_softmax_fp8_fixed<true, decltype(scores), decltype(tScS_rc),
+                               kORows>(
           scores, tScS_rc, softmax_scale_eff, row_max, row_sum, row_scale,
           log2f(vs448), 1.0f / vs448, Traits::kRescaleThreshold);
     }
@@ -428,10 +428,10 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_w8a8_sm120(
     // max first, then scales+converts; fixed mode was pre-scaled by the
     // softmax and only converts (packed e4m3x2) + reorgs.
     if constexpr (kPQuantPerRow) {
-      ffpa_cute::pscale_per_row(scores, p_scale);
-      ffpa_cute::quantize_p_frag<true>(scores, tCrSf, vs, p_scale, reorg);
+      pscale_per_row(scores, p_scale);
+      quantize_p_frag<true>(scores, tCrSf, vs, p_scale, reorg);
     } else {
-      ffpa_cute::quantize_p_frag_prescaled(tCrSf, reorg);
+      quantize_p_frag_prescaled(tCrSf, reorg);
     }
 
     // PV GEMM: A = P in regs, B = V^T from smem. Per-row dequant factor
@@ -460,11 +460,11 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_w8a8_sm120(
       auto tCrTile_rc =
           make_tensor(tCrTile.data(),
                       ffpa_cute::convert_layout_acc_rowcol(tCrTile.layout()));
-      ffpa_cute::accumulate_p_tile(tCrO_rc, tCrTile_rc, p_scale);
+      accumulate_p_tile(tCrO_rc, tCrTile_rc, p_scale);
     } else {
       // Tensor-core row sum over the quantized P regs (replaces the fp32
       // FADD/shfl reduction; softmax<true> only rescaled row_sum so far).
-      ffpa_cute::pscale_rowsum_mma(tCrP, row_sum, 1.0f / vs448);
+      pscale_rowsum_mma(tCrP, row_sum, 1.0f / vs448);
       auto tCrO = make_tensor(make_rmem_ptr(o_acc), OFragLayout{});
       ffpa_cute::gemm_rs(tCrO, tCrP, tCrV, tVsV_s2r, tiled_mma_pv, s2r_copy_v,
                          s2r_thr_v);
@@ -483,7 +483,7 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_w8a8_sm120(
     cutlass::arch::NamedBarrier::sync(kConsumerThreads, 0);
 
     if (smooth_lse)
-      ffpa_cute::smooth_k_qk_dot<kHeadDim, kORows>(
+      smooth_k_qk_dot<kHeadDim, kORows>(
           sQ, tScS_rc, km + static_cast<long>(kv_bh) * kHeadDim, qkm);
 
     auto tCrO = make_tensor(make_rmem_ptr(o_acc), OFragLayout{});
@@ -492,8 +492,7 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_w8a8_sm120(
 #pragma unroll
     for (int row = 0; row < kORows; ++row) {
       const float inv_sum = (row_sum[row] == 0.0f) ? 1.0f : 1.0f / row_sum[row];
-      const float mul =
-          kPQuantPerRow ? inv_sum : inv_sum * ffpa_cute::kFP8FixedPScale;
+      const float mul = kPQuantPerRow ? inv_sum : inv_sum * kFP8FixedPScale;
 #pragma unroll
       for (int col = 0; col < kOCols; ++col)
         tCrO_rc(row, col) *= mul;
@@ -563,3 +562,5 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_w8a8_sm120(
   }
 #endif  // defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
 }
+
+}  // namespace ffpa_w8a8

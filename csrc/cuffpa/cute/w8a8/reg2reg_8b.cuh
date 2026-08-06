@@ -3,16 +3,17 @@
 #include <cute/tensor.hpp>
 #include <cutlass/cutlass.h>
 
-namespace ffpa_cute {
+namespace ffpa_w8a8 {
 
-// FP8 m16n8k32: reorganize the (fp32->e4m3) C-fragment of the QK GEMM into the
-// A-operand register layout of the PV GEMM. Rule table derived numerically
+// 8-bit (fp8 e4m3 or symmetric int8; identical A/B operand layouts) m16n8k32:
+// reorganize the (fp32->8bit) C-fragment of the QK GEMM into the A-operand
+// register layout of the PV GEMM. Rule table derived numerically
 // with pycute from MMA_Traits<SM89_16x8x32_F32E4M3E4M3F32_TN>
 // (.tmp/fp8_persist_d/verify_layouts.py, V1b): per K=32 group (4 m16n8
 // C-tiles c0..c3), A reg r gathers tiles (r%2, r%2+2) from quad-partner lane
 // (t%4<2 -> self, else lane-2 within the quad), then __byte_perm picks bytes
 // (v0,v2)/(v1,v3): sel 0x6240 for even lanes, 0x7351 for odd lanes.
-struct ReorgCFp8toAFp8 {
+struct ReorgC8bitToA8bit {
   int selectorEx0;
   int selectorEx1;
   int selectorEx4;
@@ -22,7 +23,7 @@ struct ReorgCFp8toAFp8 {
   int upper_peer;
   int lower_peer;
 
-  CUTLASS_DEVICE ReorgCFp8toAFp8() {
+  CUTLASS_DEVICE ReorgC8bitToA8bit() {
     int laneId = cutlass::canonical_lane_idx();
     if (laneId % 4 == 0 || laneId % 4 == 3) {
       selectorEx0 = 0x3210;
@@ -64,4 +65,4 @@ struct ReorgCFp8toAFp8 {
   }
 };
 
-}  // namespace ffpa_cute
+}  // namespace ffpa_w8a8
