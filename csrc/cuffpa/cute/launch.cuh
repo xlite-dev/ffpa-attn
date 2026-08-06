@@ -664,19 +664,26 @@ void launch_cute_fwd_persist_d_w8a8_sm120(
   // unset auto-selects int8 for causal (early-row accuracy limit, see the
   // masking-pass comment in persist_d_w8a8.cuh; int8 QK fixes its dS part at
   // ~zero causal cost) and fp8 otherwise (dense pays ~7.5% for no gain).
-  const char* qk_int8_env = getenv("FFPA_W8A8_QK_INT8");
-  const bool qk_int8 =
-      qk_int8_env != nullptr ? qk_int8_env[0] != '0' : (causal != 0);
-  if (qk_int8)
-    launch_cute_fwd_persist_d_w8a8_sm120_impl<kDataType, kHeadDim, kStage,
-                                              true>(
-        Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale, dropout_p,
-        philox_seed, philox_offset, smooth_k);
-  else
-    launch_cute_fwd_persist_d_w8a8_sm120_impl<kDataType, kHeadDim, kStage,
-                                              false>(
-        Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale, dropout_p,
-        philox_seed, philox_offset, smooth_k);
+  // if constexpr keeps the impl (and its kernel) out of instantiation for
+  // unsupported headdims; every headdim TU includes this launcher template.
+  if constexpr (kHeadDim == 64 || kHeadDim == 128) {
+    const char* qk_int8_env = getenv("FFPA_W8A8_QK_INT8");
+    const bool qk_int8 =
+        qk_int8_env != nullptr ? qk_int8_env[0] != '0' : (causal != 0);
+    if (qk_int8)
+      launch_cute_fwd_persist_d_w8a8_sm120_impl<kDataType, kHeadDim, kStage,
+                                                true>(
+          Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale, dropout_p,
+          philox_seed, philox_offset, smooth_k);
+    else
+      launch_cute_fwd_persist_d_w8a8_sm120_impl<kDataType, kHeadDim, kStage,
+                                                false>(
+          Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale, dropout_p,
+          philox_seed, philox_offset, smooth_k);
+  } else {
+    TORCH_CHECK(false,
+                "ffpa_attn: cute_tma_w8a8 requires D=64/128, got D=", kHeadDim);
+  }
 }
 
 template <typename kDataType, const int kHeadDim, const int kStage>
