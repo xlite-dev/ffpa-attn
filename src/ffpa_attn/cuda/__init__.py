@@ -84,11 +84,14 @@ def _fwd_cuda_torch_op(
     )
   O = torch.empty_like(Q)  # noqa: E741
   seqlen_q = Q.size(2)
-  seqlen_q_aligned = ((seqlen_q + 7) // 8) * 8
+  # NOTE: allocate lse with the exact seqlen (no rounding). CUDA kernels index
+  # the lse buffer flat as [B, Nh, Nq] (stride Nq per head); passing a padded
+  # storage shifted head h's rows by h and leaves the last rows unwritten when
+  # seqlen_q % 8 != 0.
   softmax_lse = torch.empty(
     Q.size(0),
     Q.size(1),
-    seqlen_q_aligned,
+    seqlen_q,
     dtype=torch.float32,
     device=Q.device,
   )
@@ -98,7 +101,7 @@ def _fwd_cuda_torch_op(
     V,
     attn_bias,
     O,
-    softmax_lse[..., :seqlen_q],
+    softmax_lse,
     stages,
     acc,
     causal,
@@ -126,10 +129,9 @@ def _fwd_cuda_fake(
   philox_offset: int,
   smooth_k: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-  seqlen_q_aligned = ((Q.size(2) + 7) // 8) * 8
   O = torch.empty_like(Q)  # noqa: E741
   softmax_lse = Q.new_empty(
-    Q.size(0), Q.size(1), seqlen_q_aligned, dtype=torch.float32
+    Q.size(0), Q.size(1), Q.size(2), dtype=torch.float32
   )
   return O, softmax_lse
 

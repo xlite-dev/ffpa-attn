@@ -266,13 +266,18 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_w8a8_sm120(
   // Unconditional (not gated on kHeadDim != 128 like fp16 persist_d) because
   // the fp8 path carries P quant + row-sum + rescale state even at D=128.
   cutlass::arch::warpgroup_reg_alloc<232>();
-  TmaBarrier::wait(&q_full, 0);
-  cutlass::arch::fence_view_async_shared();
 
+  // Release the initial K/V stages *before* waiting on Q. The producer gates
+  // its first K/V TMA issues on these arrives; they carry no dependency on Q
+  // data, so arriving early lets K(0)/V(0) TMAs overlap the Q TMA in flight
+  // instead of serializing behind Q arrival + consumer wakeup.
   for (int s = 0; s < kStagesK; ++s)
     CtaBarrier::arrive(&k_empty[s]);
   for (int s = 0; s < kStagesV; ++s)
     CtaBarrier::arrive(&v_empty[s]);
+
+  TmaBarrier::wait(&q_full, 0);
+  cutlass::arch::fence_view_async_shared();
 
   TiledMmaQK tiled_mma_qk;
   TiledMmaPV tiled_mma_pv;
@@ -370,6 +375,20 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_w8a8_sm120(
     // S -> log2 domain with k_scale folded in (blockwise dequant of S).
     auto scores = make_tensor(
         tCrSf.data(), ffpa_cute::convert_layout_acc_rowcol(tCrS.layout()));
+    // Known causal accuracy limit (early-row error): masked upper-triangle
+    // columns contribute EXACTLY 0 (P=0 after -inf softmax), the error comes
+    // from the VALID terms -- early rows attend only i+1 keys, so per-element
+    // quant errors are not averaged out (~1/sqrt(n_valid) decay with row):
+    //   row 0 is the pure probe: O0 = V0 quant rounding itself (~0.08 @amp.5);
+    //   fp8-P weight error and QK dS->dP error hit the few dominant weights
+    //   undiluted. Late rows average hundreds of independent errors instead.
+    // Rejected fix: fp16 accurate-PV re-run on masked tiles (VT16 plane) made
+    // causal +38~61% slower (gmem-direct fp16 B + split quantize + VT16
+    // traffic) and was removed. Current mitigation: int8 QK (auto-default for
+    // causal) removes only the dS part. Future candidates: correct only the
+    // few attended KV columns of the diagonal tile in fp16 (the PV16 idea
+    // scoped down -- its cost was the implementation, not the concept), or
+    // finer V quant block granularity (currently 128 keys/block).
     const int kv_valid = Nkv - kv_tile * kBc;
     const bool tile_needs_mask =
         (kv_valid < kBc) || (kv_tile >= mask_start_tile);

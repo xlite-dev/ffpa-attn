@@ -754,6 +754,8 @@ class ENV(object):
   def get_build_cuda_cflags(build_pkg: bool = False):
     extra_cuda_cflags = []
     extra_cuda_cflags.append("-O3")
+    if os.environ.get("FFPA_LINEINFO", "0") == "1":
+      extra_cuda_cflags.append("-lineinfo")
     extra_cuda_cflags.append("-std=c++20")
     extra_cuda_cflags.append("-Xcompiler")
     extra_cuda_cflags.append("-fPIC")

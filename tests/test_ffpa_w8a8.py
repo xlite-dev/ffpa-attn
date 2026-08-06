@@ -139,10 +139,8 @@ def test_w8a8_perf_vs_sage_sdpa(capsys):
 
 
 def _set_qk_int8(monkeypatch, enable: bool) -> None:
-  if enable:
-    monkeypatch.setenv("FFPA_W8A8_QK_INT8", "1")
-  else:
-    monkeypatch.delenv("FFPA_W8A8_QK_INT8", raising=False)
+  # "0" forces fp8 QK (causal now auto-selects int8 when the env is unset).
+  monkeypatch.setenv("FFPA_W8A8_QK_INT8", "1" if enable else "0")
 
 
 def _w8a8_out_lse(q, k, v, causal: bool, smooth_k: bool = True):
@@ -179,7 +177,8 @@ def test_w8a8_qk_int8_forward_parity(D, dtype, causal, monkeypatch):
   ref = F.scaled_dot_product_attention(
     q.float(), k.float(), v.float(), is_causal=causal
   ).to(dtype)
-  # fp8 P-quant error is amplified on early causal rows (few attended keys).
+  # Causal early rows (few attended keys) carry fp8 P/V quant error that the
+  # fp8 PV path does not correct, so they get the looser 1e-1 bar.
   tol = 1e-1 if causal else 4e-2
   torch.testing.assert_close(out, ref, atol=tol, rtol=tol)
 
@@ -246,6 +245,30 @@ def test_w8a8_nkv_unaligned_parity(qk_int8, monkeypatch):
   _set_qk_int8(monkeypatch, qk_int8)
   torch.manual_seed(0)
   B, H, N, D = 1, 32, 2120, 128  # N % 128 != 0: tail tile + partial quantize
+  q = torch.randn(B, H, N, D, dtype=torch.float16, device="cuda") * 0.5
+  k = torch.randn(B, H, N, D, dtype=torch.float16, device="cuda") * 0.5
+  v = torch.randn(B, H, N, D, dtype=torch.float16, device="cuda") * 0.5
+
+  out, lse = _w8a8_out_lse(q, k, v, causal=True)
+  ref = F.scaled_dot_product_attention(
+    q.float(), k.float(), v.float(), is_causal=True
+  )
+  torch.testing.assert_close(out.float(), ref, atol=1e-1, rtol=1e-1)
+  p = (q.float() @ k.float().transpose(-1, -2)) * (D**-0.5)
+  mask = torch.triu(torch.ones(N, N, device="cuda"), diagonal=1).bool()
+  lse_ref = torch.logsumexp(p.masked_fill(mask, float("-inf")), dim=-1)
+  torch.testing.assert_close(lse.float(), lse_ref, atol=5e-2, rtol=1e-3)
+
+
+@pytest.mark.parametrize("qk_int8", [False, True], ids=["fp8-qk", "int8-qk"])
+def test_w8a8_nq_not_multiple_of_8_lse(qk_int8, monkeypatch):
+  # Regression: the torch op used to allocate lse with seqlen rounded up to 8
+  # and pass a sliced view, while kernels index lse flat with stride Nq per
+  # head; head h's rows shifted by h and the last head's trailing rows were
+  # left unwritten whenever Nq % 8 != 0.
+  _set_qk_int8(monkeypatch, qk_int8)
+  torch.manual_seed(0)
+  B, H, N, D = 1, 8, 2047, 128  # 2047 % 8 == 7
   q = torch.randn(B, H, N, D, dtype=torch.float16, device="cuda") * 0.5
   k = torch.randn(B, H, N, D, dtype=torch.float16, device="cuda") * 0.5
   v = torch.randn(B, H, N, D, dtype=torch.float16, device="cuda") * 0.5

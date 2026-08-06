@@ -24,8 +24,6 @@ struct ReorgCFp8toAFp8 {
 
   CUTLASS_DEVICE ReorgCFp8toAFp8() {
     int laneId = cutlass::canonical_lane_idx();
-    constexpr int kUpperMap[4] = {0, 3, 1, 2};
-    constexpr int kLowerMap[4] = {1, 2, 0, 3};
     if (laneId % 4 == 0 || laneId % 4 == 3) {
       selectorEx0 = 0x3210;
       selectorEx1 = 0x7654;
@@ -37,8 +35,13 @@ struct ReorgCFp8toAFp8 {
       selectorEx4 = 0x1054;
       selectorEx5 = 0x3276;
     }
-    upper_peer = kUpperMap[laneId % 4];
-    lower_peer = kLowerMap[laneId % 4];
+    // Peer maps as 2-bit fields (LSB-first) instead of constexpr arrays:
+    // runtime lane%4 indexing into local arrays emitted LDL/STL on the stack.
+    // kUpperMap = {0, 3, 1, 2} -> 0b10_01_11_00; kLowerMap = {1, 2, 0, 3}
+    // -> 0b11_00_10_01.
+    const int l4 = laneId & 3;
+    upper_peer = (0x9C >> (2 * l4)) & 3;
+    lower_peer = (0xC9 >> (2 * l4)) & 3;
   }
 
   // data: per-thread fp8 values ordered as contiguous m16n8 C-tiles along N

@@ -41,16 +41,21 @@ using QKOutT = std::conditional_t<kQKInt8, int8_t, __nv_fp8_e4m3>;
 // The amax pass keeps the 8-elem chunks in registers, so the quantize pass
 // converts straight from regs (no second global read).
 // kQKInt8: symmetric int8 output (scale = amax/127) instead of e4m3.
-template <typename Element, int kBlockRows, bool kQKInt8>
+template <typename Element, int kBlockRows, bool kQKInt8, int kD>
 __global__ void quantize_w8a8_kernel(
-    const Element* __restrict__ X,    // (B, H, N, D) row-major
-    QKOutT<kQKInt8>* __restrict__ Y,  // (B, H, N, D)
+    const Element* __restrict__ X,    // (B, H, N, kD) row-major
+    QKOutT<kQKInt8>* __restrict__ Y,  // (B, H, N, kD)
     float* __restrict__ scale,        // (B, H, N/kBlockRows)
-    int N, int H, int D, int ldy,
+    int N, int H,
     const Element* __restrict__ km = nullptr,  // (B*H, D) smooth-K col means
     float inv_n = 0.0f) {
   constexpr int kVec = 8;  // elems per vector access (128-bit in, 64-bit out)
   constexpr int kThreads = 128;
+  constexpr int D = kD;
+  constexpr int dv = kD / kVec;           // vector chunks per row
+  constexpr int total = kBlockRows * dv;  // vector chunks per block
+  constexpr int n_chunks_per_thread = total / kThreads;
+  static_assert(total % kThreads == 0, "tile must divide over threads");
   const int rb = blockIdx.x;
   const int bh = blockIdx.y;
   const int row0 = rb * kBlockRows;
@@ -58,10 +63,6 @@ __global__ void quantize_w8a8_kernel(
   const int warp = tid / 32;
   const int lane = tid % 32;
   constexpr int kWarps = kThreads / 32;
-
-  const int dv = D / kVec;            // vector chunks per row
-  const int total = kBlockRows * dv;  // vector chunks per block
-  const int n_chunks_per_thread = (total + kThreads - 1) / kThreads;
 
   const Element* x_bh = X + static_cast<long>(bh) * N * D;
   QKOutT<kQKInt8>* y_bh = Y + static_cast<long>(bh) * N * D;
@@ -76,12 +77,10 @@ __global__ void quantize_w8a8_kernel(
 
   using VecIn = Vec8<Element>;
   float amax = 0.0f;
-  VecIn regs[8];  // kBlockRows*D/(kVec*kThreads) <= 8 for supported shapes
-#pragma unroll 1
+  VecIn regs[n_chunks_per_thread];
+#pragma unroll
   for (int j = 0; j < n_chunks_per_thread; ++j) {
     const int i = tid + j * kThreads;
-    if (i >= total)
-      break;
     const int r = i / dv;
     const int c = i % dv;
     const long row = row0 + r;
@@ -121,11 +120,9 @@ __global__ void quantize_w8a8_kernel(
   if (tid == 0)
     scale[static_cast<long>(bh) * n_rb + rb] = s;
 
-#pragma unroll 1
+#pragma unroll
   for (int j = 0; j < n_chunks_per_thread; ++j) {
     const int i = tid + j * kThreads;
-    if (i >= total)
-      break;
     const int r = i / dv;
     const int c = i % dv;
     const long row = row0 + r;
@@ -163,7 +160,9 @@ __global__ void quantize_w8a8_vt_kernel(
   constexpr int kPad = 16;
   constexpr int kVec = 8;
   constexpr int kThreads = 128;
+  constexpr int dv = D / kVec;  // vector chunks per row
   static_assert(D % kVec == 0, "vt kernel requires D % 8 == 0");
+  static_assert(kBlockRows * dv % kThreads == 0);
   const int rb = blockIdx.x;
   const int bh = blockIdx.y;
   const int row0 = rb * kBlockRows;
@@ -175,16 +174,19 @@ __global__ void quantize_w8a8_vt_kernel(
   __shared__ __nv_fp8_e4m3 tile[kBlockRows][D + kPad];
   __shared__ float warp_max[kWarps];
 
-  const int dv = D / kVec;            // vector chunks per row
-  const int total = kBlockRows * dv;  // vector chunks per tile
-  const int n_chunks_per_thread = total / kThreads;
+  constexpr int total = kBlockRows * dv;  // vector chunks per tile
+  constexpr int n_chunks_per_thread = total / kThreads;
+  static_assert(total % kThreads == 0);
 
   const Element* v_bh = V + static_cast<long>(bh) * N * D;
   using VecIn = Vec8<Element>;
 
-  // Pass 1: vectorized coalesced read, track amax.
+  // Pass 1: vectorized coalesced read cached in regs (like the QK kernel),
+  // track amax. The quantize pass below converts straight from regs, so V is
+  // read from DRAM/L2 exactly once.
   float amax = 0.0f;
-#pragma unroll 1
+  VecIn regs[n_chunks_per_thread];
+#pragma unroll
   for (int j = 0; j < n_chunks_per_thread; ++j) {
     const int i = tid + j * kThreads;
     const int r = i / dv;
@@ -193,6 +195,7 @@ __global__ void quantize_w8a8_vt_kernel(
     if (row0 + r < N)
       v = reinterpret_cast<const VecIn*>(v_bh +
                                          static_cast<long>(row0 + r) * D)[c];
+    regs[j] = v;
 #pragma unroll
     for (int e = 0; e < kVec; ++e)
       amax = fmaxf(amax, fabsf(static_cast<float>(v.elem[e])));
@@ -219,16 +222,14 @@ __global__ void quantize_w8a8_vt_kernel(
   if (tid == 0)
     scale[static_cast<long>(bh) * ((N + kBlockRows - 1) / kBlockRows) + rb] = s;
 
-    // Pass 2: vectorized re-read (L2-hot), quantize into smem as 2x uint32.
-#pragma unroll 1
+  const long vt_base = static_cast<long>(bh) * D * ldy;
+  // Pass 2: quantize the cached regs into smem as 2x uint32.
+#pragma unroll
   for (int j = 0; j < n_chunks_per_thread; ++j) {
-    const int i = tid + j * kThreads;
-    const int r = i / dv;
-    const int c = i % dv;
-    VecIn v = Vec8<Element>::zero();
-    if (row0 + r < N)
-      v = reinterpret_cast<const VecIn*>(v_bh +
-                                         static_cast<long>(row0 + r) * D)[c];
+    const int i_local = tid + j * kThreads;
+    const int r = i_local / dv;
+    const int c = i_local % dv;
+    const VecIn v = regs[j];
     uint32_t pack[2];
 #pragma unroll
     for (int h = 0; h < 2; ++h) {
@@ -243,18 +244,18 @@ __global__ void quantize_w8a8_vt_kernel(
   }
   __syncthreads();
 
-  // Pass 3: coalesced transpose write. Each warp writes 4 consecutive output
-  // rows c..c+3; lanes sweep the contiguous kv index n. Per-element stores:
-  // a wider pack would straddle Nkv-length rows of a neighbouring head plane.
-  const long vt_base = static_cast<long>(bh) * D * ldy;
+  // Pass 3: coalesced transpose write. Each warp writes 4 consecutive
+  // output rows c..c+3; lanes sweep the contiguous kv index n.
+  // Per-element stores: a wider pack would straddle Nkv-length rows of a
+  // neighbouring head plane.
 #pragma unroll 1
   for (int it = warp * 4; it < D; it += kWarps * 4) {
 #pragma unroll
     for (int cc = 0; cc < 4; ++cc) {
       const int c = it + cc;
 #pragma unroll
-      for (int t = 0; t < 4; ++t) {
-        const int n = t * 32 + lane;  // local kv index within the block
+      for (int t = 0; t < kBlockRows / 32; ++t) {
+        const int n = t * 32 + lane;  // local kv index within the row block
         if (row0 + n < N)
           VT[vt_base + static_cast<long>(c) * ldy + row0 + n] = tile[n][c];
       }
@@ -287,9 +288,10 @@ __global__ void quantize_w8a8_qkv_fused_kernel(
   const int warp = tid / 32;
   const int lane = tid % 32;
 
-  const int dv = kD / kVec;
-  const int total = kBlockRows * dv;
-  const int n_chunks_per_thread = (total + kThreads - 1) / kThreads;
+  constexpr int dv = kD / kVec;
+  constexpr int total = kBlockRows * dv;
+  constexpr int n_chunks_per_thread = total / kThreads;
+  static_assert(total % kThreads == 0, "tile must divide over threads");
   const int n_rb = (N + kBlockRows - 1) / kBlockRows;
 
   __shared__ float warp_max[kWarps];
@@ -311,12 +313,10 @@ __global__ void quantize_w8a8_qkv_fused_kernel(
 
     using VecIn = Vec8<Element>;
     float amax = 0.0f;
-    VecIn regs[8];
-#pragma unroll 1
+    VecIn regs[n_chunks_per_thread];
+#pragma unroll
     for (int j = 0; j < n_chunks_per_thread; ++j) {
       const int i = tid + j * kThreads;
-      if (i >= total)
-        break;
       const int r = i / dv;
       const int c = i % dv;
       const long row = row0 + r;
@@ -389,8 +389,6 @@ __global__ void quantize_w8a8_qkv_fused_kernel(
 #pragma unroll 1
     for (int j = 0; j < n_chunks_per_thread; ++j) {
       const int i = tid + j * kThreads;
-      if (i >= total)
-        break;
       const int r = i / dv;
       const int c = i % dv;
       VecIn v = Vec8<Element>::zero();
@@ -423,11 +421,9 @@ __global__ void quantize_w8a8_qkv_fused_kernel(
     if (tid == 0)
       v_scale[static_cast<long>(bh) * n_rb + rb] = s;
 
-#pragma unroll 1
+#pragma unroll
     for (int j = 0; j < n_chunks_per_thread; ++j) {
       const int i = tid + j * kThreads;
-      if (i >= total)
-        break;
       const int r = i / dv;
       const int c = i % dv;
       VecIn v = Vec8<Element>::zero();
@@ -455,7 +451,7 @@ __global__ void quantize_w8a8_qkv_fused_kernel(
       for (int cc = 0; cc < 4; ++cc) {
         const int c = it + cc;
 #pragma unroll
-        for (int t = 0; t < 4; ++t) {
+        for (int t = 0; t < kBlockRows / 32; ++t) {
           const int n = t * 32 + lane;
           if (row0 + n < N)
             VT8[vt_base + static_cast<long>(c) * ldy + row0 + n] = tile[n][c];
@@ -493,16 +489,110 @@ void launch_quantize_w8a8_sm120(const Element* q_ptr, const Element* k_ptr,
       return;
     }
   }
-  dim3 grid_q((Nq + kBr - 1) / kBr, B * Nh);
-  quantize_w8a8_kernel<Element, kBr, kQKInt8>
-      <<<grid_q, kThreads, 0, stream>>>(q_ptr, reinterpret_cast<QKOut*>(q8),
-                                        q_scale, Nq, Nh, D, D, nullptr, 0.0f);
-  dim3 grid_kv((Nkv + kBc - 1) / kBc, B * Nh_kv);
-  quantize_w8a8_kernel<Element, kBc, kQKInt8><<<grid_kv, kThreads, 0, stream>>>(
-      k_ptr, reinterpret_cast<QKOut*>(k8), k_scale, Nkv, Nh_kv, D, D, km, 1.0f);
-  quantize_w8a8_vt_kernel<Element, kBc, kHeadDim>
-      <<<grid_kv, kThreads, 0, stream>>>(v_ptr, vt8, v_scale, Nkv, Nh_kv,
-                                         Nkv_pad);
+  {
+    dim3 grid_q((Nq + kBr - 1) / kBr, B * Nh);
+    quantize_w8a8_kernel<Element, kBr, kQKInt8, kHeadDim>
+        <<<grid_q, kThreads, 0, stream>>>(q_ptr, reinterpret_cast<QKOut*>(q8),
+                                          q_scale, Nq, Nh, nullptr, 0.0f);
+  }
+  {
+    dim3 grid_k((Nkv + kBc - 1) / kBc, B * Nh_kv);
+    quantize_w8a8_kernel<Element, kBc, kQKInt8, kHeadDim>
+        <<<grid_k, kThreads, 0, stream>>>(k_ptr, reinterpret_cast<QKOut*>(k8),
+                                          k_scale, Nkv, Nh_kv, km, 1.0f);
+  }
+  {
+    dim3 grid_kv((Nkv + kBc - 1) / kBc, B * Nh_kv);
+    quantize_w8a8_vt_kernel<Element, kBc, kHeadDim>
+        <<<grid_kv, kThreads, 0, stream>>>(v_ptr, vt8, v_scale, Nkv, Nh_kv,
+                                           Nkv_pad);
+  }
+}
+
+// Smooth-K column mean, two stages, deterministic (no atomics/zero-init):
+// stage 1 sums a (bh, row-chunk) slab of K into fp32 partials, stage 2
+// reduces the chunks and divides by Nkv, emitting both the in-dtype mean and
+// its fp32 copy (lse correction). Replaces at::mean + km.to(fp32) (~85us ->
+// ~50us at B1 H32 N8192 D128): one coalesced DRAM pass with fp32 accumulate.
+constexpr int kMeanRowsPerChunk = 512;
+
+template <typename Element, int kD>
+__global__ void kv_col_sum_kernel(const Element* __restrict__ k,
+                                  float* __restrict__ partials, int Nkv,
+                                  int rows_per_chunk) {
+  constexpr int kVec = 16 / sizeof(Element);  // 8 half/bf16 per 16B
+  constexpr int kColsPerRow = kD / kVec;      // uint4s per row
+  constexpr int kThreads = 256;
+  constexpr int kRowsPerIter = kThreads / kColsPerRow;
+  const int chunk = blockIdx.x;
+  const int bh = blockIdx.y;
+  const int row0 = chunk * rows_per_chunk;
+  const int row_end = min(row0 + rows_per_chunk, Nkv);
+  const Element* k_bh = k + static_cast<long>(bh) * Nkv * kD;
+  const int col0 = (threadIdx.x % kColsPerRow) * kVec;
+
+  float acc[kVec];
+#pragma unroll
+  for (int i = 0; i < kVec; ++i)
+    acc[i] = 0.0f;
+  for (int r = row0 + threadIdx.x / kColsPerRow; r < row_end;
+       r += kRowsPerIter) {
+    const uint4 packed = *reinterpret_cast<const uint4*>(
+        k_bh + static_cast<long>(r) * kD + col0);
+    const Element* vals = reinterpret_cast<const Element*>(&packed);
+#pragma unroll
+    for (int i = 0; i < kVec; ++i)
+      acc[i] += static_cast<float>(vals[i]);
+  }
+
+  // Block reduce: kRowsPerIter partial rows -> one per column.
+  __shared__ float red[kRowsPerIter][kD];
+  const int row_grp = threadIdx.x / kColsPerRow;
+#pragma unroll
+  for (int i = 0; i < kVec; ++i)
+    red[row_grp][col0 + i] = acc[i];
+  __syncthreads();
+  float* out = partials + (static_cast<long>(bh) * gridDim.x + chunk) * kD;
+  for (int d = threadIdx.x; d < kD; d += kThreads) {
+    float s = 0.0f;
+#pragma unroll
+    for (int g = 0; g < kRowsPerIter; ++g)
+      s += red[g][d];
+    out[d] = s;
+  }
+}
+
+template <typename Element>
+__global__ void kv_mean_finalize_kernel(const float* __restrict__ partials,
+                                        Element* __restrict__ km,
+                                        float* __restrict__ km_f32, int chunks,
+                                        int Nkv, int D) {
+  const int bh = blockIdx.x;
+  const float inv_n = 1.0f / static_cast<float>(Nkv);
+  for (int d = threadIdx.x; d < D; d += blockDim.x) {
+    float s = 0.0f;
+    for (int c = 0; c < chunks; ++c)
+      s += partials[(static_cast<long>(bh) * chunks + c) * D + d];
+    const float m = s * inv_n;
+    km[static_cast<long>(bh) * D + d] = static_cast<Element>(m);
+    km_f32[static_cast<long>(bh) * D + d] = m;
+  }
+}
+
+// Per-(b,h) seqlen mean of K [Nb, Nh_kv, Nkv, D]; D in {64, 128}. Writes km
+// (in-dtype) and km_f32; partials is fp32 scratch (Nb*Nh_kv, chunks, D) with
+// chunks = ceil(Nkv / 512), allocated by the caller.
+template <typename Element, int kHeadDim>
+void launch_kv_mean_sm120(const Element* k_ptr, Element* km, float* km_f32,
+                          float* partials, int Nb, int Nh_kv, int Nkv,
+                          cudaStream_t stream) {
+  const int bh = Nb * Nh_kv;
+  const int chunks = (Nkv + kMeanRowsPerChunk - 1) / kMeanRowsPerChunk;
+  dim3 grid(chunks, bh);
+  kv_col_sum_kernel<Element, kHeadDim>
+      <<<grid, 256, 0, stream>>>(k_ptr, partials, Nkv, kMeanRowsPerChunk);
+  kv_mean_finalize_kernel<Element>
+      <<<bh, 128, 0, stream>>>(partials, km, km_f32, chunks, Nkv, kHeadDim);
 }
 
 }  // namespace ffpa_cute
