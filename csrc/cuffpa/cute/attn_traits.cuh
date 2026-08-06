@@ -310,6 +310,10 @@ struct FFPAAttnCuTePersistDW8A8Traits {
 
   using SmemCopyAtomQK = Copy_Atom<SM75_U32x4_LDSM_N, ElementQK>;
   using SmemCopyAtom = Copy_Atom<SM75_U32x4_LDSM_N, Element>;
+
+  static constexpr int kQTileBytes = kBr * kHeadDim * sizeof(ElementQK);
+  static constexpr int kKTileBytes = kBc * kHeadDim * sizeof(ElementQK);
+  static constexpr int kVTileBytes = kBc * kHeadDim * sizeof(Element);
 };
 
 // Split-D W8A8 traits: non-WS M8N1 like FFPAAttnCuTeSplitDTraits but with
@@ -353,8 +357,7 @@ struct FFPAAttnCuTeSplitDW8A8Traits {
       kDChunksV, kHeadDim, kBr, kSmemElems / sizeof(ElementO_));
   static constexpr int kNBatches = kDChunksV / kVChunksPerBatch;
 
-  // Swizzle atom picked by ROW BYTES (1B elems: 32B row -> SW32, 128B ->
-  // SW128); the fp16 SelectSmemAtom keys on element count and would mis-size.
+  // Swizzle atom picked by ROW BYTES (1B elems): kBc=64 e4m3 = 64B -> SW64.
   template <typename Elem, int kRowBytes>
   using SmemAtomByBytes = std::conditional_t<
       kRowBytes <= 32, GMMA::Layout_K_SW32_Atom<Elem>,
@@ -372,8 +375,7 @@ struct FFPAAttnCuTeSplitDW8A8Traits {
   // V^T tile: (kVDChunk x kBc) row-major, loaded as PV B-operand.
   using SmemLayoutV =
       decltype(tile_to_shape(SmemAtomV{}, Shape<Int<kVDChunk>, Int<kBc>>{}));
-  // O staging (ElementO fp16/bf16, NOT the 1B fp8 atom): reuses the freed
-  // V/QK smem in the epilogue; swizzle must match the TMA store descriptor.
+  // O staging (ElementO fp16/bf16): reuses freed V/QK smem in the epilogue.
   using SmemLayoutO = decltype(tile_to_shape(
       GMMA::Layout_K_SW128_Atom<ElementO>{}, Shape<Int<kBr>, Int<kVDChunk>>{}));
 
@@ -387,10 +389,105 @@ struct FFPAAttnCuTeSplitDW8A8Traits {
   using TiledMmaQK = decltype(make_tiled_mma(
       MmaAtomQK{}, Layout<Shape<Int<kNumWarps>, _1, _1>>{},
       Tile<Int<kBr>, Int<kBc>, _32>{}));
-
   using TiledMmaPV = decltype(make_tiled_mma(
       MmaAtom{}, Layout<Shape<Int<kNumWarps>, _1, _1>>{},
       Tile<Int<kBr>, Int<kVDChunk>, _32>{}));
+
+  using SmemCopyAtomQK = Copy_Atom<SM75_U32x4_LDSM_N, ElementQK>;
+  using SmemCopyAtom = Copy_Atom<SM75_U32x4_LDSM_N, Element>;
+
+  static constexpr int kQTileBytes = kBr * kQKDChunk * sizeof(ElementQK);
+  static constexpr int kKTileBytes = kBc * kQKDChunk * sizeof(ElementQK);
+  static constexpr int kVTileBytes = kBc * kVDChunk * sizeof(Element);
+};
+
+// Split-D M4N2 W8A8 traits: m4n2 atom layout (4,2,1) + fp8 e4m3 Q/K/V via
+// SM89 m16n8k32 mma.sync. Combines FFPAAttnCuTeSplitDM4N2Traits (m4n2 geometry,
+// 8 warps, cross-N-warp softmax, P SMEM roundtrip) with FFPAAttnCuTeSplitDW8A8
+// (fp8 elements, V^T pre-transposed, kRescaleThreshold=4.0, K-tile=32).
+// kBr=64/kBc=64 fixed (m4n2); O regs = D/4 per thread (D=1024 -> 256 regs).
+// SmemLayoutP uses SW64 (kBc=64 e4m3 = 64B row), matching both stmatrix write
+// (QK C-fragment) and LDSM_N read (PV A-fragment).
+template <int kHeadDim_, typename ElementO_, int kBr_ = 64, int kBc_ = 64,
+          int kQKDChunk_ = 64, int kVDChunk_ = 64, int kStagesQK_ = 2,
+          int kStagesPV_ = 2, bool kQKInt8_ = false>
+struct FFPAAttnCuTeSplitDM4N2W8A8Traits {
+  static_assert(kHeadDim_ % kQKDChunk_ == 0);
+  static_assert(kHeadDim_ % kVDChunk_ == 0);
+  static_assert(kQKDChunk_ == 32 || kQKDChunk_ == 64);
+  static_assert(kVDChunk_ == 32 || kVDChunk_ == 64);
+  static_assert(kBr_ == 64, "M4N2 requires kBr=64 (4 warps x 16 rows)");
+  static_assert(kBc_ == 64,
+                "M4N2 requires kBc=64 (2 N-warps x 8 cols x 4 iters)");
+
+  static constexpr int kHeadDim = kHeadDim_;
+  static constexpr int kBr = kBr_;
+  static constexpr int kBc = kBc_;
+  static constexpr int kQKDChunk = kQKDChunk_;
+  static constexpr int kVDChunk = kVDChunk_;
+  static constexpr int kDChunksQK = kHeadDim / kQKDChunk;
+  static constexpr int kDChunksV = kHeadDim / kVDChunk;
+  static constexpr int kNumWarps = 8;
+  static constexpr int kNumThreads = 256;
+  static constexpr int kStagesQK = kStagesQK_;
+  static constexpr int kStagesPV = kStagesPV_;
+  static constexpr bool kQKInt8 = kQKInt8_;
+  static constexpr float kRescaleThreshold = FFPA_RESCALE_THRESHOLD_FP8;
+
+  using Element = cutlass::float_e4m3_t;  // V / P (PV side, always fp8)
+  using ElementQK = std::conditional_t<kQKInt8, int8_t, cutlass::float_e4m3_t>;
+  using ElementO = ElementO_;
+
+  // SMEM: Q stages + K stages + V stages + P staging + softmax exchange
+  static constexpr int kSmemQK =
+      kStagesQK * kBr * kQKDChunk + kStagesQK * kBc * kQKDChunk;
+  static constexpr int kSmemV = kStagesPV * kBc * kVDChunk;
+  static constexpr int kSmemP = kBr * kBc;
+  static constexpr int kSmemExchange =
+      2 * kNumWarps * 16 * sizeof(float) / sizeof(Element);
+  static constexpr int kSmemElems = kSmemQK + kSmemV + kSmemP + kSmemExchange;
+
+  static constexpr int kVChunksPerBatch = compute_vchunks_per_batch(
+      kDChunksV, kHeadDim, kBr, kSmemElems / sizeof(ElementO_));
+  static constexpr int kNBatches = kDChunksV / kVChunksPerBatch;
+
+  // Swizzle atom picked by ROW BYTES (1B elems): kBc=64 e4m3 = 64B -> SW64.
+  template <typename Elem, int kRowBytes>
+  using SmemAtomByBytes = std::conditional_t<
+      kRowBytes <= 32, GMMA::Layout_K_SW32_Atom<Elem>,
+      std::conditional_t<kRowBytes <= 64, GMMA::Layout_K_SW64_Atom<Elem>,
+                         GMMA::Layout_K_SW128_Atom<Elem>>>;
+  using SmemAtomQK =
+      SmemAtomByBytes<ElementQK,
+                      kQKDChunk* static_cast<int>(sizeof(ElementQK))>;
+  using SmemAtomV =
+      SmemAtomByBytes<Element, kBc* static_cast<int>(sizeof(Element))>;
+  using SmemLayoutQ =
+      decltype(tile_to_shape(SmemAtomQK{}, Shape<Int<kBr>, Int<kQKDChunk>>{}));
+  using SmemLayoutK =
+      decltype(tile_to_shape(SmemAtomQK{}, Shape<Int<kBc>, Int<kQKDChunk>>{}));
+  // V^T tile: (kVDChunk x kBc) row-major, loaded as PV B-operand.
+  using SmemLayoutV =
+      decltype(tile_to_shape(SmemAtomV{}, Shape<Int<kVDChunk>, Int<kBc>>{}));
+  // O staging (ElementO fp16/bf16): reuses freed V/QK smem in the epilogue.
+  using SmemLayoutO = decltype(tile_to_shape(
+      GMMA::Layout_K_SW128_Atom<ElementO>{}, Shape<Int<kBr>, Int<kVDChunk>>{}));
+  // P staging: [kBr, kBc], SW64 swizzle (kBc=64 e4m3 = 64B row) so stmatrix
+  // (QK C-fragment) and LDSM_N (PV A-fragment) hit the same SMEM layout.
+  using SmemLayoutP =
+      decltype(tile_to_shape(SmemAtomV{}, Shape<Int<kBr>, Int<kBc>>{}));
+
+  using MmaAtomQK =
+      std::conditional_t<kQKInt8, MMA_Atom<SM80_16x8x32_S32S8S8S32_TN>,
+                         MMA_Atom<SM89_16x8x32_F32E4M3E4M3F32_TN>>;
+  using MmaAtom = MMA_Atom<SM89_16x8x32_F32E4M3E4M3F32_TN>;
+
+  // M4N2: 4 warps along M (4x16=64=kBr), 2 warps along N (2x8=16 per K-step)
+  using AtomLayoutMN = Layout<Shape<_4, _2, _1>>;
+  using TiledMmaQK = decltype(make_tiled_mma(MmaAtomQK{}, AtomLayoutMN{},
+                                             Tile<Int<kBr>, Int<kBc>, _32>{}));
+  using TiledMmaPV = decltype(make_tiled_mma(
+      MmaAtom{}, AtomLayoutMN{}, Tile<Int<kBr>, Int<kVDChunk>, _32>{}));
 
   using SmemCopyAtomQK = Copy_Atom<SM75_U32x4_LDSM_N, ElementQK>;
   using SmemCopyAtom = Copy_Atom<SM75_U32x4_LDSM_N, Element>;

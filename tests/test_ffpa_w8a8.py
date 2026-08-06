@@ -414,3 +414,65 @@ def test_w8a8_split_d_smooth_k_and_lse(D, qk_int8, smooth_k, monkeypatch):
   lse_ref = torch.logsumexp(p, dim=-1)
   torch.testing.assert_close(out.float(), ref, atol=4e-2, rtol=4e-2)
   torch.testing.assert_close(lse.float(), lse_ref, atol=5e-2, rtol=1e-3)
+
+
+# Split-D M4N2 W8A8 path: D>=768 routes to split_d_m4n2_w8a8.cuh (M4N2 atom
+# layout (4,2,1), P SMEM roundtrip via DefaultCopy since stmatrix is b16-only).
+# O regs = D/4 per thread (vs M8N1's D/2 which spills for D>=768).
+# Causal early-row accuracy is worse than M8N1 (O_err ~0.17 vs ~0.08) due to
+# smaller kBc=64 tiles (more quant blocks, more error accumulation); the 2e-1
+# bar documents this known fp8 limitation.
+@pytest.mark.parametrize("D", [768, 896, 1024])
+@pytest.mark.parametrize(
+  "dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"]
+)
+def test_w8a8_split_d_m4n2_forward_parity(D, dtype):
+  torch.manual_seed(0)
+  B, H, N = 1, 32, 4096
+  q = torch.randn(B, H, N, D, dtype=dtype, device="cuda") * 0.5
+  k = torch.randn(B, H, N, D, dtype=dtype, device="cuda") * 0.5
+  v = torch.randn(B, H, N, D, dtype=dtype, device="cuda") * 0.5
+
+  out = ffpa_attn_func(
+    q, k, v, is_causal=False, forward_backend=_w8a8_backend()
+  )
+  ref = F.scaled_dot_product_attention(
+    q.float(), k.float(), v.float(), is_causal=False
+  ).to(dtype)
+  torch.testing.assert_close(out, ref, atol=5e-3, rtol=5e-3)
+
+
+@pytest.mark.parametrize("D", [768, 1024])
+def test_w8a8_split_d_m4n2_causal_parity(D):
+  torch.manual_seed(0)
+  B, H, N = 1, 32, 2048
+  q = torch.randn(B, H, N, D, dtype=torch.float16, device="cuda") * 0.5
+  k = torch.randn(B, H, N, D, dtype=torch.float16, device="cuda") * 0.5
+  v = torch.randn(B, H, N, D, dtype=torch.float16, device="cuda") * 0.5
+
+  out = ffpa_attn_func(q, k, v, is_causal=True, forward_backend=_w8a8_backend())
+  ref = F.scaled_dot_product_attention(
+    q.float(), k.float(), v.float(), is_causal=True
+  ).half()
+  # fp8 P-quant error on causal early rows is amplified by the smaller kBc=64
+  # tiles (vs M8N1's kBc=128); O_err ~0.17 < 2e-1 documents this known limit.
+  torch.testing.assert_close(out, ref, atol=2e-1, rtol=2e-1)
+
+
+@pytest.mark.parametrize("D", [768, 1024])
+@pytest.mark.parametrize("qk_int8", [False, True], ids=["fp8-qk", "int8-qk"])
+def test_w8a8_split_d_m4n2_gqa_parity(D, qk_int8, monkeypatch):
+  _set_qk_int8(monkeypatch, qk_int8)
+  torch.manual_seed(0)
+  B, H, H_kv, N = 1, 32, 8, 4096
+  q = torch.randn(B, H, N, D, dtype=torch.float16, device="cuda") * 0.5
+  k = torch.randn(B, H_kv, N, D, dtype=torch.float16, device="cuda") * 0.5
+  v = torch.randn(B, H_kv, N, D, dtype=torch.float16, device="cuda") * 0.5
+
+  out = ffpa_attn_func(
+    q, k, v, is_causal=False, enable_gqa=True, forward_backend=_w8a8_backend()
+  )
+  k_rep = k.repeat_interleave(H // H_kv, dim=1)
+  v_rep = v.repeat_interleave(H // H_kv, dim=1)
+  ref = F.scaled_dot_product_attention(q.float(), k_rep.float(), v_rep.float())
+  torch.testing.assert_close(out.float(), ref, atol=5e-3, rtol=5e-3)

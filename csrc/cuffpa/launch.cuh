@@ -115,16 +115,27 @@ void launch_ffpa_attn_fwd_template(torch::Tensor Q, torch::Tensor K,
     if (prop->major >= 9) {
       if (force_w8a8) {
 #ifdef ENABLE_FFPA_CUTE_EXT
-        // D<=128: persist-D w8a8 (Q persist fits smem); D>128: split-D w8a8.
-        // Both launchers carry their own if constexpr headdim guards.
+        // D<=128: persist-D w8a8; 128<D<=512: split-D M8N1 w8a8;
+        // D>=768: split-D M4N2 w8a8 (D/4 regs, avoids M8N1's D/2 spill);
+        // 512<D<768: fall back to fp16 M4N2 (M8N1 w8a8 spills, M4N2 w8a8
+        // not yet built for this range).
         if constexpr (kHeadDim <= 128) {
           launch_cute_fwd_persist_d_w8a8_sm120<kDataType, kHeadDim, kStage>(
               Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
               dropout_p, philox_seed, philox_offset, smooth_k, qk_int8);
-        } else {
+        } else if constexpr (kHeadDim <= 512) {
           launch_cute_fwd_split_d_w8a8_sm120<kDataType, kHeadDim, kStage>(
               Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
               dropout_p, philox_seed, philox_offset, smooth_k, qk_int8);
+        } else if constexpr (kHeadDim >= 768 && kHeadDim <= 1024) {
+          launch_cute_fwd_split_d_m4n2_w8a8_sm120<kDataType, kHeadDim, kStage>(
+              Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
+              dropout_p, philox_seed, philox_offset, smooth_k, qk_int8);
+        } else {
+          // 512 < D < 768: fall back to fp16 M4N2 (w8a8 not available).
+          launch_cute_fwd_split_d_m4n2_sm120<kDataType, kHeadDim, kStage>(
+              Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
+              dropout_p, philox_seed, philox_offset);
         }
 #else
         TORCH_CHECK(false, "ffpa_attn: cute ext not compiled");
