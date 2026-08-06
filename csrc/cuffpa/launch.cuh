@@ -114,12 +114,18 @@ void launch_ffpa_attn_fwd_template(torch::Tensor Q, torch::Tensor K,
     auto prop = at::cuda::getCurrentDeviceProperties();
     if (prop->major >= 9) {
       if (force_w8a8) {
-        TORCH_CHECK(kHeadDim <= 128 && kHeadDim % 64 == 0,
-                    "ffpa_attn: cute_tma_w8a8 requires D=64/128");
 #ifdef ENABLE_FFPA_CUTE_EXT
-        launch_cute_fwd_persist_d_w8a8_sm120<kDataType, kHeadDim, kStage>(
-            Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
-            dropout_p, philox_seed, philox_offset, smooth_k, qk_int8);
+        // D<=128: persist-D w8a8 (Q persist fits smem); D>128: split-D w8a8.
+        // Both launchers carry their own if constexpr headdim guards.
+        if constexpr (kHeadDim <= 128) {
+          launch_cute_fwd_persist_d_w8a8_sm120<kDataType, kHeadDim, kStage>(
+              Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
+              dropout_p, philox_seed, philox_offset, smooth_k, qk_int8);
+        } else {
+          launch_cute_fwd_split_d_w8a8_sm120<kDataType, kHeadDim, kStage>(
+              Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
+              dropout_p, philox_seed, philox_offset, smooth_k, qk_int8);
+        }
 #else
         TORCH_CHECK(false, "ffpa_attn: cute ext not compiled");
 #endif

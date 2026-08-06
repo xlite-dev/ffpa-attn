@@ -68,11 +68,11 @@ __global__ void quantize_w8a8_kernel(
   QKOutT<kQKInt8>* y_bh = Y + static_cast<long>(bh) * N * D;
 
   // Smooth-K: cache this head's mean vector once (D floats, L1-hot reuse).
-  __shared__ float km_sh[128];
+  __shared__ float km_sh[kD];
   const bool smooth = km != nullptr;
-  if (smooth && tid < D)
-    km_sh[tid] =
-        static_cast<float>(km[static_cast<long>(bh) * D + tid]) * inv_n;
+  if (smooth)
+    for (int d = tid; d < D; d += kThreads)
+      km_sh[d] = static_cast<float>(km[static_cast<long>(bh) * D + d]) * inv_n;
   __syncthreads();
 
   using VecIn = Vec8<Element>;
@@ -171,7 +171,11 @@ __global__ void quantize_w8a8_vt_kernel(
   const int lane = tid % 32;
   constexpr int kWarps = kThreads / 32;
 
-  __shared__ __nv_fp8_e4m3 tile[kBlockRows][D + kPad];
+  // VT staging tile lives in DYNAMIC smem (sized by the launcher): D=512
+  // needs ~67KB, beyond the 48KB static-smem default cap.
+  extern __shared__ __nv_fp8_e4m3 tile_sh[];
+  using TileRow = __nv_fp8_e4m3[D + kPad];
+  TileRow* tile = reinterpret_cast<TileRow*>(tile_sh);
   __shared__ float warp_max[kWarps];
 
   constexpr int total = kBlockRows * dv;  // vector chunks per tile
@@ -294,13 +298,17 @@ __global__ void quantize_w8a8_qkv_fused_kernel(
   static_assert(total % kThreads == 0, "tile must divide over threads");
   const int n_rb = (N + kBlockRows - 1) / kBlockRows;
 
-  __shared__ float warp_max[kWarps];
-  // Smooth-K applies to K only (role==1); cache the head's mean vector once.
+  __shared__ float warp_max[kWarps];  // VT staging tile (role==2) lives in
+                                      // DYNAMIC smem (sized by the launcher):
+  // D=512 needs ~67KB, beyond the 48KB static-smem default cap.
+  extern __shared__ __nv_fp8_e4m3
+      tile_sh[];  // Smooth-K applies to K only (role==1); cache the head's mean
+                  // vector once.
   __shared__ float km_sh[kD];
   const bool smooth = (role == 1) && (km != nullptr);
-  if (smooth && tid < kD)
-    km_sh[tid] =
-        static_cast<float>(km[static_cast<long>(bh) * kD + tid]) * inv_n;
+  if (smooth)
+    for (int d = tid; d < kD; d += kThreads)
+      km_sh[d] = static_cast<float>(km[static_cast<long>(bh) * kD + d]) * inv_n;
 
   if (role < 2) {
     const Element* X = (role == 0) ? Q : K;
@@ -381,7 +389,8 @@ __global__ void quantize_w8a8_qkv_fused_kernel(
     }
   } else {
     // V transpose quantize through smem.
-    __shared__ __nv_fp8_e4m3 tile[kBlockRows][kD + kPad];
+    using TileRow = __nv_fp8_e4m3[kD + kPad];
+    TileRow* tile = reinterpret_cast<TileRow*>(tile_sh);
     const Element* v_bh = V + static_cast<long>(bh) * N * kD;
     using VecIn = Vec8<Element>;
 
@@ -477,15 +486,21 @@ void launch_quantize_w8a8_sm120(const Element* q_ptr, const Element* k_ptr,
                                 const Element* km = nullptr) {
   using QKOut = QKOutT<kQKInt8>;
   constexpr int kThreads = 128;
+  // Dynamic smem for the VT staging tile (1B/elem); must match the kernels'
+  // kPad. Opt in via attribute since D=512 exceeds the 48KB default cap.
+  constexpr int kVtSmemBytes = kBc * (kHeadDim + 16);
   // Fused path: single launch for Q+K+VT when grids match (self-attention).
   if constexpr (kBr == kBc) {
     if (Nq == Nkv && Nh == Nh_kv) {
       dim3 grid((Nq + kBr - 1) / kBr, B * Nh, 3);
-      quantize_w8a8_qkv_fused_kernel<Element, kBr, kHeadDim, kThreads, kQKInt8>
-          <<<grid, kThreads, 0, stream>>>(
-              q_ptr, k_ptr, v_ptr, reinterpret_cast<QKOut*>(q8),
-              reinterpret_cast<QKOut*>(k8), vt8, q_scale, k_scale, v_scale, Nq,
-              Nh, Nkv_pad, km, 1.0f);
+      auto kernel = quantize_w8a8_qkv_fused_kernel<Element, kBr, kHeadDim,
+                                                   kThreads, kQKInt8>;
+      cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                           kVtSmemBytes);
+      kernel<<<grid, kThreads, kVtSmemBytes, stream>>>(
+          q_ptr, k_ptr, v_ptr, reinterpret_cast<QKOut*>(q8),
+          reinterpret_cast<QKOut*>(k8), vt8, q_scale, k_scale, v_scale, Nq, Nh,
+          Nkv_pad, km, 1.0f);
       return;
     }
   }
@@ -503,9 +518,11 @@ void launch_quantize_w8a8_sm120(const Element* q_ptr, const Element* k_ptr,
   }
   {
     dim3 grid_kv((Nkv + kBc - 1) / kBc, B * Nh_kv);
-    quantize_w8a8_vt_kernel<Element, kBc, kHeadDim>
-        <<<grid_kv, kThreads, 0, stream>>>(v_ptr, vt8, v_scale, Nkv, Nh_kv,
-                                           Nkv_pad);
+    auto kernel = quantize_w8a8_vt_kernel<Element, kBc, kHeadDim>;
+    cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                         kVtSmemBytes);
+    kernel<<<grid_kv, kThreads, kVtSmemBytes, stream>>>(v_ptr, vt8, v_scale,
+                                                        Nkv, Nh_kv, Nkv_pad);
   }
 }
 

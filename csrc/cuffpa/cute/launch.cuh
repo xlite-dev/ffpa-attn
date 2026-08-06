@@ -15,6 +15,7 @@
 #include "cute/w8a8/quantize_w8a8.cuh"
 #include "cute/w8a8/smooth_k.cuh"
 #include "cute/w8a8/sm_120/persist_d_w8a8.cuh"
+#include "cute/w8a8/sm_120/split_d_w8a8.cuh"
 #endif
 #endif
 
@@ -690,6 +691,190 @@ void launch_cute_fwd_persist_d_w8a8_sm120(
   } else {
     TORCH_CHECK(false,
                 "ffpa_attn: cute_tma_w8a8 requires D=64/128, got D=", kHeadDim);
+  }
+}
+
+// Split-D W8A8 launcher (headdim > 128): non-WS M8N1 kernel over quantized
+// q8/k8/vt8 buffers. Fixed-P-scale only (FFPA_W8A8_PQUANT_PER_ROW applies to
+// the persist_d path only and is ignored here).
+template <typename kDataType, const int kHeadDim, const int kStage,
+          bool kQKInt8>
+void launch_cute_fwd_split_d_w8a8_sm120_impl(
+    torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O,
+    torch::Tensor attn_bias, torch::Tensor softmax_lse, int causal,
+    double softmax_scale, double dropout_p, int64_t philox_seed,
+    int64_t philox_offset, bool smooth_k) {
+  using namespace cute;
+  TORCH_CHECK(attn_bias.numel() == 0 && dropout_p == 0.0,
+              "w8a8 sm120 path does not support attn_bias/dropout");
+
+  constexpr int kBr = 128;
+  constexpr int kBc = 128;
+  constexpr int kQKDChunk = 32;
+  constexpr int kVDChunk = 64;
+  constexpr int kSmemBudgetBytes = 99 * 1024;
+  constexpr int kPerStageBytes =
+      (kBr + kBc) * kQKDChunk + kBc * kVDChunk;  // 1B/elem QK + V
+  constexpr int kMaxStages = kSmemBudgetBytes / kPerStageBytes;
+  constexpr int kStagesQK =
+      (kStage < 2) ? 3 : (kStage > kMaxStages ? kMaxStages : kStage);
+  constexpr int kStagesPV = kStagesQK;
+
+  using ElementO = std::conditional_t<std::is_same_v<kDataType, __half>,
+                                      cutlass::half_t, cutlass::bfloat16_t>;
+  using Traits =
+      ffpa_cute::FFPAAttnCuTeSplitDW8A8Traits<kHeadDim, ElementO, kBr, kBc,
+                                              kQKDChunk, kVDChunk, kStagesQK,
+                                              kStagesPV, kQKInt8>;
+  using Element = typename Traits::Element;
+  using ElementQK = typename Traits::ElementQK;
+  using SmemLayoutQ = typename Traits::SmemLayoutQ;
+  using SmemLayoutK = typename Traits::SmemLayoutK;
+  using SmemLayoutV = typename Traits::SmemLayoutV;
+  using SmemLayoutO = typename Traits::SmemLayoutO;
+
+  const int Nb = Q.size(0);
+  const int Nh = Q.size(1);
+  const int Nh_kv = K.size(1);
+  const int Nq = Q.size(2);
+  const int Nkv = K.size(2);
+  const int Tc = utils::div_ceil(Nkv, kBc);
+  const float scale = static_cast<float>(softmax_scale);
+  const int n_rb_q = utils::div_ceil(Nq, kBr);
+  const int n_rb_kv = utils::div_ceil(Nkv, kBc);
+  // TMA needs a 16-byte-aligned leading stride; fp8 rows are Nkv bytes, so pad.
+  const int Nkv_pad = (Nkv + 15) / 16 * 16;
+
+  auto opts_qk = torch::TensorOptions()
+                     .dtype(kQKInt8 ? torch::kChar : torch::kFloat8_e4m3fn)
+                     .device(Q.device());
+  auto opts_u8 =
+      torch::TensorOptions().dtype(torch::kFloat8_e4m3fn).device(Q.device());
+  auto opts_f32 =
+      torch::TensorOptions().dtype(torch::kFloat32).device(Q.device());
+  torch::Tensor q8 = torch::empty({Nb, Nh, Nq, kHeadDim}, opts_qk);
+  torch::Tensor k8 = torch::empty({Nb, Nh_kv, Nkv, kHeadDim}, opts_qk);
+  torch::Tensor vt8 = torch::empty({Nb, Nh_kv, kHeadDim, Nkv_pad}, opts_u8);
+  torch::Tensor q_scale = torch::empty({Nb * Nh, n_rb_q}, opts_f32);
+  torch::Tensor k_scale = torch::empty({Nb * Nh_kv, n_rb_kv}, opts_f32);
+  torch::Tensor v_scale = torch::empty({Nb * Nh_kv, n_rb_kv}, opts_f32);
+
+  const c10::cuda::OptionalCUDAGuard device_guard(Q.device());
+  auto stream = at::cuda::getCurrentCUDAStream();
+
+  torch::Tensor km, km_f32, km_partials;
+  const kDataType* km_ptr = nullptr;
+  const float* km_f32_ptr = nullptr;
+  const kDataType* q_ptr = reinterpret_cast<const kDataType*>(Q.data_ptr());
+  const kDataType* k_ptr = reinterpret_cast<const kDataType*>(K.data_ptr());
+  const kDataType* v_ptr = reinterpret_cast<const kDataType*>(V.data_ptr());
+  if (smooth_k) {
+    const int mean_chunks =
+        (Nkv + ffpa_w8a8::kMeanRowsPerChunk - 1) / ffpa_w8a8::kMeanRowsPerChunk;
+    km = torch::empty({Nb * Nh_kv, kHeadDim}, K.options());
+    km_f32 = torch::empty({Nb * Nh_kv, kHeadDim}, opts_f32);
+    km_partials = torch::empty({Nb * Nh_kv, mean_chunks, kHeadDim}, opts_f32);
+    km_ptr = reinterpret_cast<const kDataType*>(km.data_ptr());
+    km_f32_ptr = km_f32.data_ptr<float>();
+    ffpa_w8a8::launch_kv_mean_sm120<kDataType, kHeadDim>(
+        k_ptr, reinterpret_cast<kDataType*>(km.data_ptr()),
+        km_f32.data_ptr<float>(), km_partials.data_ptr<float>(), Nb, Nh_kv, Nkv,
+        stream);
+  }
+  ffpa_w8a8::launch_quantize_w8a8_sm120<kDataType, kBr, kBc, kHeadDim, kQKInt8>(
+      q_ptr, k_ptr, v_ptr, q8.data_ptr(), k8.data_ptr(),
+      reinterpret_cast<__nv_fp8_e4m3*>(vt8.data_ptr()),
+      q_scale.data_ptr<float>(), k_scale.data_ptr<float>(),
+      v_scale.data_ptr<float>(), Nb, Nh, Nh_kv, Nq, Nkv, Nkv_pad, kHeadDim,
+      stream, km_ptr);
+
+  const int total_q_rows = Nb * Nh * Nq;
+  const int total_kv_rows = Nb * Nh_kv * Nkv;
+
+  auto gQ =
+      make_tensor(make_gmem_ptr(reinterpret_cast<ElementQK*>(q8.data_ptr())),
+                  make_shape(total_q_rows, Int<kHeadDim>{}),
+                  make_stride(Int<kHeadDim>{}, _1{}));
+  auto gK =
+      make_tensor(make_gmem_ptr(reinterpret_cast<ElementQK*>(k8.data_ptr())),
+                  make_shape(total_kv_rows, Int<kHeadDim>{}),
+                  make_stride(Int<kHeadDim>{}, _1{}));
+
+  auto tma_q = make_tma_copy(SM90_TMA_LOAD{}, gQ, SmemLayoutQ{},
+                             Shape<Int<kBr>, Int<kQKDChunk>>{}, _1{});
+  auto tma_k = make_tma_copy(SM90_TMA_LOAD{}, gK, SmemLayoutK{},
+                             Shape<Int<kBc>, Int<kQKDChunk>>{}, _1{});
+  // V^T: flat [B*Nh_kv*D, Nkv] with 16B-aligned row stride Nkv_pad; the
+  // kernel offsets rows by the KV head's D plane via domain_offset.
+  auto mV = make_tensor(
+      make_gmem_ptr(reinterpret_cast<Element*>(vt8.data_ptr())),
+      make_shape(Nb * Nh_kv * kHeadDim, Nkv), make_stride(Nkv_pad, Int<1>{}));
+  auto tma_v = make_tma_copy(SM90_TMA_LOAD{}, mV, SmemLayoutV{},
+                             Shape<Int<kVDChunk>, Int<kBc>>{}, _1{});
+
+  auto gO =
+      make_tensor(make_gmem_ptr(reinterpret_cast<ElementO*>(O.data_ptr())),
+                  make_shape(total_q_rows, Int<kHeadDim>{}),
+                  make_stride(Int<kHeadDim>{}, _1{}));
+  auto tma_o = make_tma_copy(SM90_TMA_STORE{}, gO, SmemLayoutO{},
+                             Shape<Int<kBr>, Int<kVDChunk>>{}, _1{});
+
+  constexpr int kSmemBytes = Traits::kSmemElems;
+  float* softmax_lse_ptr =
+      softmax_lse.numel() > 0 ? softmax_lse.data_ptr<float>() : nullptr;
+  auto O_ptr = reinterpret_cast<ElementO*>(O.data_ptr());
+
+  const dim3 block(Traits::kNumThreads, 1, 1);
+  const dim3 grid(utils::div_ceil(Nq, kBr), Nb * Nh, 1);
+  using TmaQ = decltype(tma_q);
+  using TmaK = decltype(tma_k);
+  using TmaV = decltype(tma_v);
+  using TmaO = decltype(tma_o);
+  auto kernel =
+      ffpa_w8a8::split_d_ws_fwd_cute_w8a8_sm120<Traits, ElementO, TmaQ, TmaK,
+                                                TmaV, TmaO>;
+  cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                       kSmemBytes);
+  kernel<<<grid, block, kSmemBytes, stream>>>(
+      tma_q, tma_k, tma_v, tma_o, O_ptr, softmax_lse_ptr,
+      q_scale.data_ptr<float>(), k_scale.data_ptr<float>(),
+      v_scale.data_ptr<float>(), Nq, Nkv, Nh, Nh_kv, scale, Tc, causal,
+      total_q_rows, total_kv_rows, n_rb_q, n_rb_kv, km_f32_ptr);
+}
+
+template <typename kDataType, const int kHeadDim, const int kStage>
+void launch_cute_fwd_split_d_w8a8_sm120(
+    torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O,
+    torch::Tensor attn_bias, torch::Tensor softmax_lse, int causal,
+    double softmax_scale, double dropout_p, int64_t philox_seed,
+    int64_t philox_offset, bool smooth_k, std::optional<bool> qk_int8_opt) {
+  // Same qk_int8 tri-state as persist_d: explicit param > FFPA_W8A8_QK_INT8
+  // env ("1"/"0") > auto (causal -> int8 for early-row accuracy, dense fp8).
+  // if constexpr keeps the impl (and its kernel) out of instantiation for
+  // unsupported headdims; every headdim TU includes this launcher template.
+  if constexpr (kHeadDim > 128 && kHeadDim <= 512 && kHeadDim % 64 == 0) {
+    bool qk_int8;
+    if (qk_int8_opt.has_value()) {
+      qk_int8 = *qk_int8_opt;
+    } else {
+      const char* qk_int8_env = getenv("FFPA_W8A8_QK_INT8");
+      qk_int8 = qk_int8_env != nullptr ? qk_int8_env[0] != '0' : (causal != 0);
+    }
+    if (qk_int8)
+      launch_cute_fwd_split_d_w8a8_sm120_impl<kDataType, kHeadDim, kStage,
+                                              true>(
+          Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale, dropout_p,
+          philox_seed, philox_offset, smooth_k);
+    else
+      launch_cute_fwd_split_d_w8a8_sm120_impl<kDataType, kHeadDim, kStage,
+                                              false>(
+          Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale, dropout_p,
+          philox_seed, philox_offset, smooth_k);
+  } else {
+    TORCH_CHECK(false,
+                "ffpa_attn: cute_tma_w8a8 split_d requires D in (128, 512] "
+                "with D % 64 == 0, got D=",
+                kHeadDim);
   }
 }
 

@@ -13,7 +13,10 @@ namespace ffpa_w8a8 {
 // quad-local reduce (a full-warp butterfly would mix the warp's 8 rows).
 // Perf note: scalar smem/gmem reads, correctness-first; the lse path is cold,
 // revisit only if it ever shows up in profiles.
-template <int kHeadDim, int kRows, typename SmemQTensor, typename CoordTensor>
+// kAccumulate: add into qkm instead of overwriting (split-D calls this once
+// per D chunk and accumulates the full dot).
+template <int kHeadDim, int kRows, bool kAccumulate = false,
+          typename SmemQTensor, typename CoordTensor>
 CUTE_DEVICE void smooth_k_qk_dot(const SmemQTensor& sQ,
                                  const CoordTensor& tScS_rc,
                                  const float* __restrict__ km_bh, float* qkm) {
@@ -21,8 +24,12 @@ CUTE_DEVICE void smooth_k_qk_dot(const SmemQTensor& sQ,
   constexpr int kQuad = 4;
   constexpr int kIters = kHeadDim / (kVec * kQuad);
   const int qlane = cutlass::canonical_lane_idx() % kQuad;
+  // Accumulate mode: the prior qkm is already quad-reduced, so it must stay
+  // out of the shfl reduction of this chunk's partial sum.
+  float base[kRows];
 #pragma unroll
   for (int row = 0; row < kRows; ++row) {
+    base[row] = kAccumulate ? qkm[row] : 0.0f;
     const int r_idx = cute::get<0>(tScS_rc(row, 0));
     float acc = 0.0f;
 #pragma unroll
@@ -38,6 +45,7 @@ CUTE_DEVICE void smooth_k_qk_dot(const SmemQTensor& sQ,
   for (int row = 0; row < kRows; ++row) {
     qkm[row] += __shfl_xor_sync(0xffffffff, qkm[row], 1);
     qkm[row] += __shfl_xor_sync(0xffffffff, qkm[row], 2);
+    qkm[row] += base[row];
   }
 }
 
@@ -55,7 +63,9 @@ __global__ void kv_col_sum_kernel(const Element* __restrict__ k,
   constexpr int kVec = 16 / sizeof(Element);  // 8 half/bf16 per 16B
   constexpr int kColsPerRow = kD / kVec;      // uint4s per row
   constexpr int kThreads = 256;
-  constexpr int kRowsPerIter = kThreads / kColsPerRow;
+  // Ceil'd so headdims where kColsPerRow does not divide kThreads (e.g.
+  // D=320/384/448) still map every thread to a valid row group.
+  constexpr int kRowsPerIter = (kThreads + kColsPerRow - 1) / kColsPerRow;
   const int chunk = blockIdx.x;
   const int bh = blockIdx.y;
   const int row0 = chunk * rows_per_chunk;
@@ -79,6 +89,13 @@ __global__ void kv_col_sum_kernel(const Element* __restrict__ k,
 
   // Block reduce: kRowsPerIter partial rows -> one per column.
   __shared__ float red[kRowsPerIter][kD];
+  // With a ceil'd row group some (row_grp, col) slots have no owning thread;
+  // zero them so they don't pollute the column sums.
+  if constexpr (kThreads % kColsPerRow != 0) {
+    for (int i = threadIdx.x; i < kRowsPerIter * kD; i += kThreads)
+      reinterpret_cast<float*>(red)[i] = 0.0f;
+    __syncthreads();
+  }
   const int row_grp = threadIdx.x / kColsPerRow;
 #pragma unroll
   for (int i = 0; i < kVec; ++i)
@@ -111,7 +128,7 @@ __global__ void kv_mean_finalize_kernel(const float* __restrict__ partials,
   }
 }
 
-// Per-(b,h) seqlen mean of K [Nb, Nh_kv, Nkv, D]; D in {64, 128}. Writes km
+// Per-(b,h) seqlen mean of K [Nb, Nh_kv, Nkv, D]; any D % 8 == 0. Writes km
 // (in-dtype) and km_f32; partials is fp32 scratch (Nb*Nh_kv, chunks, D) with
 // chunks = ceil(Nkv / 512), allocated by the caller.
 template <typename Element, int kHeadDim>
