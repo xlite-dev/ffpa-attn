@@ -38,7 +38,7 @@ using CtaBarrier = cutlass::arch::ClusterBarrier;
 template <typename Traits, typename ElementO, typename TmaQ, typename TmaK,
           typename TmaV, typename TmaO>
 __global__ void __launch_bounds__(Traits::kNumThreads, 1)
-    split_d_ws_fwd_cute_fp8_sm120(
+    split_d_fwd_cute_fp8_sm120(
         CUTLASS_GRID_CONSTANT TmaQ const tma_q,
         CUTLASS_GRID_CONSTANT TmaK const tma_k,
         CUTLASS_GRID_CONSTANT TmaV const tma_v,
