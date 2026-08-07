@@ -313,7 +313,7 @@ def test_fp8_nq_not_multiple_of_8_lse(qk_int8, monkeypatch):
   torch.testing.assert_close(lse.float(), lse_ref, atol=5e-2, rtol=1e-3)
 
 
-# Split-D path: D>128 routes to a separate kernel (split_d_fp8.cuh) that
+# Split-D path: D>128 routes to a separate kernel (split_d.cuh) that
 # shards the head dim across d-chunks for register pressure. Same parity
 # bars as the persist-D path; causal and lse checks use the looser 1e-1 bar
 # that documents the known fp8 early-row quant-error floor (split-D has the
@@ -412,7 +412,7 @@ def test_fp8_split_d_smooth_k_and_lse(D, qk_int8, smooth_k, monkeypatch):
   torch.testing.assert_close(lse.float(), lse_ref, atol=5e-2, rtol=1e-3)
 
 
-# Split-D M4N2 FP8 path: D>=768 routes to split_d_m4n2_fp8.cuh (M4N2 atom
+# Split-D M4N2 FP8 path: D>=768 routes to split_d_m4n2.cuh (M4N2 atom
 # layout (4,2,1), P SMEM roundtrip via DefaultCopy since stmatrix is b16-only).
 # O regs = D/4 per thread (vs M8N1's D/2 which spills for D>=768).
 # Causal early-row accuracy is worse than M8N1 (O_err ~0.17 vs ~0.08) due to

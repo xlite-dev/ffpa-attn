@@ -14,9 +14,9 @@
 #include "cute/sm_120/split_d_m4n2.cuh"
 #include "cute/fp8/quantize_fp8.cuh"
 #include "cute/fp8/smooth_k.cuh"
-#include "cute/fp8/sm_120/persist_d_fp8.cuh"
-#include "cute/fp8/sm_120/split_d_fp8.cuh"
-#include "cute/fp8/sm_120/split_d_m4n2_fp8.cuh"
+#include "cute/fp8/sm_120/persist_d.cuh"
+#include "cute/fp8/sm_120/split_d.cuh"
+#include "cute/fp8/sm_120/split_d_m4n2.cuh"
 #endif
 #endif
 
@@ -667,7 +667,7 @@ void launch_cute_fwd_persist_d_fp8_sm120(
   // QK dtype tri-state: explicit qk_int8 wins; else FFPA_FP8_QK_INT8
   // (=1 forces int8, =0 forces fp8); else auto-selects int8 for causal
   // (early-row accuracy limit, see the masking-pass comment in
-  // persist_d_fp8.cuh; int8 QK fixes its dS part at ~zero causal cost)
+  // persist_d.cuh; int8 QK fixes its dS part at ~zero causal cost)
   // and fp8 otherwise (dense pays ~7.5% for no gain).
   // if constexpr keeps the impl (and its kernel) out of instantiation for
   // unsupported headdims; every headdim TU includes this launcher template.
@@ -850,9 +850,11 @@ void launch_cute_fwd_split_d_fp8_sm120(
     int64_t philox_offset, bool smooth_k, std::optional<bool> qk_int8_opt) {
   // Same qk_int8 tri-state as persist_d: explicit param > FFPA_FP8_QK_INT8
   // env ("1"/"0") > auto (causal -> int8 for early-row accuracy, dense fp8).
-  // if constexpr keeps the impl (and its kernel) out of instantiation for
-  // unsupported headdims; every headdim TU includes this launcher template.
-  if constexpr (kHeadDim > 128 && kHeadDim < 768 && kHeadDim % 64 == 0) {
+  // EXPERIMENT: upper bound widened from <768 to <=1024 so M8N1 can be A/B'd
+  // against M4N2 across all large headdims via FFPA_FP8_FORCE_KERNEL. M8N1 at
+  // D>=768 is expected to heavy-spill (O=D/2 regs); production dispatch still
+  // selects it only for D<768 via the top-level launcher.
+  if constexpr (kHeadDim > 128 && kHeadDim <= 1024 && kHeadDim % 64 == 0) {
     bool qk_int8;
     if (qk_int8_opt.has_value()) {
       qk_int8 = *qk_int8_opt;
@@ -871,7 +873,7 @@ void launch_cute_fwd_split_d_fp8_sm120(
           philox_seed, philox_offset, smooth_k);
   } else {
     TORCH_CHECK(false,
-                "ffpa_attn: cute_tma_fp8 split_d requires D in (128, 768) "
+                "ffpa_attn: cute_tma_fp8 split_d requires D in (128, 1024] "
                 "with D % 64 == 0, got D=",
                 kHeadDim);
   }
@@ -1032,7 +1034,11 @@ void launch_cute_fwd_split_d_m4n2_fp8_sm120(
     torch::Tensor attn_bias, torch::Tensor softmax_lse, int causal,
     double softmax_scale, double dropout_p, int64_t philox_seed,
     int64_t philox_offset, bool smooth_k, std::optional<bool> qk_int8_opt) {
-  if constexpr (kHeadDim >= 768 && kHeadDim <= 1024 && kHeadDim % 64 == 0) {
+  // EXPERIMENT: lower bound lowered from >=768 to >=192 so M4N2 can be A/B'd
+  // against M8N1 across all large headdims via FFPA_FP8_FORCE_KERNEL.
+  // Production dispatch selects M4N2 only for D>=768 via the top-level
+  // launcher.
+  if constexpr (kHeadDim >= 192 && kHeadDim <= 1024 && kHeadDim % 64 == 0) {
     bool qk_int8;
     if (qk_int8_opt.has_value()) {
       qk_int8 = *qk_int8_opt;
@@ -1053,7 +1059,7 @@ void launch_cute_fwd_split_d_m4n2_fp8_sm120(
   } else {
     TORCH_CHECK(false,
                 "ffpa_attn: cute_tma_fp8 split_d_m4n2 requires D in "
-                "[768, 1024] with D % 64 == 0, got D=",
+                "[192, 1024] with D % 64 == 0, got D=",
                 kHeadDim);
   }
 }

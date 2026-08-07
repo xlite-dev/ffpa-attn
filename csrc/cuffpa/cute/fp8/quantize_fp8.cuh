@@ -1,7 +1,6 @@
 #pragma once
 
 #include <cuda_fp8.h>
-
 #include <cstdint>
 #include <type_traits>
 
@@ -171,10 +170,13 @@ __global__ void quantize_fp8_vt_kernel(
   const int lane = tid % 32;
   constexpr int kWarps = kThreads / 32;
 
-  // VT staging tile lives in DYNAMIC smem (sized by the launcher): D=512
-  // needs ~67KB, beyond the 48KB static-smem default cap.
+  // VT staging tile lives in DYNAMIC smem (sized by the launcher). D is
+  // tiled into kDChunk-wide columns so the staging tile fits the 48KB
+  // static-smem cap (kBlockRows*(kDChunk+kPad)) even for large D.
   extern __shared__ __nv_fp8_e4m3 tile_sh[];
-  using TileRow = __nv_fp8_e4m3[D + kPad];
+  constexpr int kDChunk = (D < 256) ? D : 256;
+  constexpr int kNDChunks = (D + kDChunk - 1) / kDChunk;
+  using TileRow = __nv_fp8_e4m3[kDChunk + kPad];
   TileRow* tile = reinterpret_cast<TileRow*>(tile_sh);
   __shared__ float warp_max[kWarps];
 
@@ -227,43 +229,52 @@ __global__ void quantize_fp8_vt_kernel(
     scale[static_cast<long>(bh) * ((N + kBlockRows - 1) / kBlockRows) + rb] = s;
 
   const long vt_base = static_cast<long>(bh) * D * ldy;
-  // Pass 2: quantize the cached regs into smem as 2x uint32.
-#pragma unroll
-  for (int j = 0; j < n_chunks_per_thread; ++j) {
-    const int i_local = tid + j * kThreads;
-    const int r = i_local / dv;
-    const int c = i_local % dv;
-    const VecIn v = regs[j];
-    uint32_t pack[2];
-#pragma unroll
-    for (int h = 0; h < 2; ++h) {
-      __nv_fp8_e4m3* ob = reinterpret_cast<__nv_fp8_e4m3*>(&pack[h]);
-#pragma unroll
-      for (int e = 0; e < 4; ++e)
-        ob[e] = __nv_fp8_e4m3(static_cast<float>(v.elem[h * 4 + e]) * inv_s);
-    }
-    uint32_t* dst = reinterpret_cast<uint32_t*>(&tile[r][c * kVec]);
-    dst[0] = pack[0];
-    dst[1] = pack[1];
-  }
-  __syncthreads();
-
-  // Pass 3: coalesced transpose write. Each warp writes 4 consecutive
-  // output rows c..c+3; lanes sweep the contiguous kv index n.
-  // Per-element stores: a wider pack would straddle Nkv-length rows of a
-  // neighbouring head plane.
+  // Pass 2+3: per D-chunk quantize regs -> smem -> transpose store. Tiling
+  // keeps the staging tile within the 48KB static-smem cap for large D.
+  for (int dci = 0; dci < kNDChunks; ++dci) {
+    const int dc = dci * kDChunk;
+    const int d_end = (dc + kDChunk < D) ? dc + kDChunk : D;
+    const int dc_vec = dc / kVec;
+    const int d_vec_end = d_end / kVec;
 #pragma unroll 1
-  for (int it = warp * 4; it < D; it += kWarps * 4) {
+    for (int j = 0; j < n_chunks_per_thread; ++j) {
+      const int i_local = tid + j * kThreads;
+      const int r = i_local / dv;
+      const int c_vec = i_local % dv;
+      if (c_vec < dc_vec || c_vec >= d_vec_end)
+        continue;
+      const int c_local = c_vec - dc_vec;
+      const VecIn v = regs[j];
+      uint32_t pack[2];
 #pragma unroll
-    for (int cc = 0; cc < 4; ++cc) {
-      const int c = it + cc;
+      for (int h = 0; h < 2; ++h) {
+        __nv_fp8_e4m3* ob = reinterpret_cast<__nv_fp8_e4m3*>(&pack[h]);
 #pragma unroll
-      for (int t = 0; t < kBlockRows / 32; ++t) {
-        const int n = t * 32 + lane;  // local kv index within the row block
-        if (row0 + n < N)
-          VT[vt_base + static_cast<long>(c) * ldy + row0 + n] = tile[n][c];
+        for (int e = 0; e < 4; ++e)
+          ob[e] = __nv_fp8_e4m3(static_cast<float>(v.elem[h * 4 + e]) * inv_s);
+      }
+      uint32_t* dst = reinterpret_cast<uint32_t*>(&tile[r][c_local * kVec]);
+      dst[0] = pack[0];
+      dst[1] = pack[1];
+    }
+    __syncthreads();
+
+    // Pass 3: coalesced transpose write for this chunk's D range [dc, d_end).
+#pragma unroll 1
+    for (int it = warp * 4; it < (d_end - dc); it += kWarps * 4) {
+#pragma unroll
+      for (int cc = 0; cc < 4; ++cc) {
+        const int c = dc + it + cc;
+#pragma unroll
+        for (int t = 0; t < kBlockRows / 32; ++t) {
+          const int n = t * 32 + lane;
+          if (row0 + n < N)
+            VT[vt_base + static_cast<long>(c) * ldy + row0 + n] =
+                tile[n][it + cc];
+        }
       }
     }
+    __syncthreads();  // tile safe to overwrite next chunk
   }
 }
 
@@ -388,8 +399,11 @@ __global__ void quantize_fp8_qkv_fused_kernel(
       reinterpret_cast<uint2*>(y_bh + row * kD)[c] = out;
     }
   } else {
-    // V transpose quantize through smem.
-    using TileRow = __nv_fp8_e4m3[kD + kPad];
+    // V transpose quantize through smem. D is tiled into kDChunk-wide
+    // columns so the staging tile fits the 48KB static-smem cap for large D.
+    constexpr int kDChunk = (kD < 256) ? kD : 256;
+    constexpr int kNDChunks = (kD + kDChunk - 1) / kDChunk;
+    using TileRow = __nv_fp8_e4m3[kDChunk + kPad];
     TileRow* tile = reinterpret_cast<TileRow*>(tile_sh);
     const Element* v_bh = V + static_cast<long>(bh) * N * kD;
     using VecIn = Vec8<Element>;
@@ -430,42 +444,55 @@ __global__ void quantize_fp8_qkv_fused_kernel(
     if (tid == 0)
       v_scale[static_cast<long>(bh) * n_rb + rb] = s;
 
-#pragma unroll
-    for (int j = 0; j < n_chunks_per_thread; ++j) {
-      const int i = tid + j * kThreads;
-      const int r = i / dv;
-      const int c = i % dv;
-      VecIn v = Vec8<Element>::zero();
-      if (row0 + r < N)
-        v = reinterpret_cast<const VecIn*>(v_bh +
-                                           static_cast<long>(row0 + r) * kD)[c];
-      uint32_t pack[2];
-#pragma unroll
-      for (int h = 0; h < 2; ++h) {
-        __nv_fp8_e4m3* ob = reinterpret_cast<__nv_fp8_e4m3*>(&pack[h]);
-#pragma unroll
-        for (int e = 0; e < 4; ++e)
-          ob[e] = __nv_fp8_e4m3(static_cast<float>(v.elem[h * 4 + e]) * inv_s);
-      }
-      uint32_t* dst = reinterpret_cast<uint32_t*>(&tile[r][c * kVec]);
-      dst[0] = pack[0];
-      dst[1] = pack[1];
-    }
-    __syncthreads();
-
     const long vt_base = static_cast<long>(bh) * kD * ldy;
+    // Pass 2+3: per D-chunk read -> quantize -> smem -> transpose store.
+    for (int dci = 0; dci < kNDChunks; ++dci) {
+      const int dc = dci * kDChunk;
+      const int d_end = (dc + kDChunk < kD) ? dc + kDChunk : kD;
+      const int dc_vec = dc / kVec;
+      const int d_vec_end = d_end / kVec;
 #pragma unroll 1
-    for (int it = warp * 4; it < kD; it += kWarps * 4) {
+      for (int j = 0; j < n_chunks_per_thread; ++j) {
+        const int i = tid + j * kThreads;
+        const int r = i / dv;
+        const int c_vec = i % dv;
+        if (c_vec < dc_vec || c_vec >= d_vec_end)
+          continue;
+        const int c_local = c_vec - dc_vec;
+        VecIn v = Vec8<Element>::zero();
+        if (row0 + r < N)
+          v = reinterpret_cast<const VecIn*>(
+              v_bh + static_cast<long>(row0 + r) * kD)[c_vec];
+        uint32_t pack[2];
 #pragma unroll
-      for (int cc = 0; cc < 4; ++cc) {
-        const int c = it + cc;
+        for (int h = 0; h < 2; ++h) {
+          __nv_fp8_e4m3* ob = reinterpret_cast<__nv_fp8_e4m3*>(&pack[h]);
 #pragma unroll
-        for (int t = 0; t < kBlockRows / 32; ++t) {
-          const int n = t * 32 + lane;
-          if (row0 + n < N)
-            VT8[vt_base + static_cast<long>(c) * ldy + row0 + n] = tile[n][c];
+          for (int e = 0; e < 4; ++e)
+            ob[e] =
+                __nv_fp8_e4m3(static_cast<float>(v.elem[h * 4 + e]) * inv_s);
+        }
+        uint32_t* dst = reinterpret_cast<uint32_t*>(&tile[r][c_local * kVec]);
+        dst[0] = pack[0];
+        dst[1] = pack[1];
+      }
+      __syncthreads();
+
+#pragma unroll 1
+      for (int it = warp * 4; it < (d_end - dc); it += kWarps * 4) {
+#pragma unroll
+        for (int cc = 0; cc < 4; ++cc) {
+          const int c = dc + it + cc;
+#pragma unroll
+          for (int t = 0; t < kBlockRows / 32; ++t) {
+            const int n = t * 32 + lane;
+            if (row0 + n < N)
+              VT8[vt_base + static_cast<long>(c) * ldy + row0 + n] =
+                  tile[n][it + cc];
+          }
         }
       }
+      __syncthreads();
     }
   }
 }
@@ -487,8 +514,10 @@ void launch_quantize_fp8_sm120(const Element* q_ptr, const Element* k_ptr,
   using QKOut = QKOutT<kQKInt8>;
   constexpr int kThreads = 128;
   // Dynamic smem for the VT staging tile (1B/elem); must match the kernels'
-  // kPad. Opt in via attribute since D=512 exceeds the 48KB default cap.
-  constexpr int kVtSmemBytes = kBc * (kHeadDim + 16);
+  // kPad. D is tiled into kDChunk-wide columns so the staging tile fits the
+  // 48KB static-smem cap even for large D (kBc*(kDChunk+16) <= ~34KB).
+  constexpr int kDChunk = (kHeadDim < 256) ? kHeadDim : 256;
+  constexpr int kVtSmemBytes = kBc * (kDChunk + 16);
   // Fused path: single launch for Q+K+VT when grids match (self-attention).
   if constexpr (kBr == kBc) {
     if (Nq == Nkv && Nh == Nh_kv) {

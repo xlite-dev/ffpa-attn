@@ -1,7 +1,6 @@
 #pragma once
 
 #include <cuda_fp8.h>
-
 #include <cute/tensor.hpp>
 
 #include "reg2reg_8b.cuh"

@@ -1,6 +1,7 @@
 #pragma once
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
+#include <cstring>
 #include <optional>
 #include "backend_hint.h"
 #include "native/launch.cuh"
@@ -115,6 +116,27 @@ void launch_ffpa_attn_fwd_template(torch::Tensor Q, torch::Tensor K,
     if (prop->major >= 9) {
       if (force_fp8) {
 #ifdef ENABLE_FFPA_CUTE_EXT
+        // EXPERIMENT: FFPA_FP8_FORCE_KERNEL=split_d|m4n2 forces a specific
+        // split-D kernel to A/B test the M8N1/M4N2 dispatch cross-point.
+        // Applies only to 128 < D <= 1024; persist-D (D<=128) is unaffected.
+        // Unset -> normal headdim-based dispatch below.
+        if constexpr (kHeadDim > 128 && kHeadDim <= 1024) {
+          const char* fk = getenv("FFPA_FP8_FORCE_KERNEL");
+          if (fk != nullptr) {
+            if (std::strcmp(fk, "split_d") == 0) {
+              launch_cute_fwd_split_d_fp8_sm120<kDataType, kHeadDim, kStage>(
+                  Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
+                  dropout_p, philox_seed, philox_offset, smooth_k, qk_int8);
+              return;
+            } else if (std::strcmp(fk, "m4n2") == 0) {
+              launch_cute_fwd_split_d_m4n2_fp8_sm120<kDataType, kHeadDim,
+                                                     kStage>(
+                  Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
+                  dropout_p, philox_seed, philox_offset, smooth_k, qk_int8);
+              return;
+            }
+          }
+        }
         // D<=128: persist-D fp8; 128<D<768: split-D M8N1 fp8;
         // D>=768: split-D M4N2 fp8. Same D<768/D>=768 cross-point as the
         // fp16 dispatch (M4N2 wins only for D>=768; below that M8N1 is
