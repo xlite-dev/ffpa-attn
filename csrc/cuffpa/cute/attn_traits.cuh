@@ -472,8 +472,10 @@ struct FFPAAttnCuTeSplitDM4N2W8A8Traits {
   // O staging (ElementO fp16/bf16): reuses freed V/QK smem in the epilogue.
   using SmemLayoutO = decltype(tile_to_shape(
       GMMA::Layout_K_SW128_Atom<ElementO>{}, Shape<Int<kBr>, Int<kVDChunk>>{}));
-  // P staging: [kBr, kBc], SW64 swizzle (kBc=64 e4m3 = 64B row) so stmatrix
-  // (QK C-fragment) and LDSM_N (PV A-fragment) hit the same SMEM layout.
+  // P staging: [kBr, kBc]. SW64 (kBc=64 e4m3 = 64B row). stmatrix cannot
+  // write 1B e4m3 (it's a b16 op needing SW128 for 16B vectorization, but
+  // SW128's 128-elem atom doesn't divide the 64-col P tile). DefaultCopy
+  // (vectorized stores) is used instead; see kernel comment.
   using SmemLayoutP =
       decltype(tile_to_shape(SmemAtomV{}, Shape<Int<kBr>, Int<kBc>>{}));
 

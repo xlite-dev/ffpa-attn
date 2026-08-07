@@ -385,10 +385,10 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
       local_need_rescale = local_need_rescale || (row_scale[r] < 1.0f);
     const bool need_rescale = __any_sync(0xffffffff, local_need_rescale);
 
-    // Phase 3: P -> e4m3 -> SMEM roundtrip. stmatrix is b16-only so it
-    // cannot write 1B e4m3 directly; use DefaultCopy (vectorized stores)
-    // for the write and LDSM_N for the read-back. Single barrier structure
-    // matches fp16 m4n2; softmax wrote fp32 tile_sum to smem_exchange.
+    // Phase 3: P -> e4m3 -> SMEM roundtrip. stmatrix is a b16 operation that
+    // needs SW128 for 16B vectorization, but SW128's 128-elem atom doesn't
+    // divide the 64-col P tile; DefaultCopy (vectorized stores) is used
+    // instead. Single barrier structure matches fp16 m4n2.
     auto tCrP = ffpa_cute::convert_type<Element>(tCrSf);
 
     auto sP = make_tensor(make_smem_ptr(p_base), SmemLayoutP{});
