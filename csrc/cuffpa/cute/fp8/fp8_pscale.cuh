@@ -6,11 +6,11 @@
 
 #include "reg2reg_8b.cuh"
 
-namespace ffpa_w8a8 {
+namespace ffpa_fp8 {
 
 // P quantization helpers for fp8 attention (softmax probabilities -> e4m3).
 // Shared by any kernel that feeds a register-resident softmax P into an fp8
-// PV MMA (persist-D w8a8 today; split-D fp8 in the future).
+// PV MMA (persist-D and split-D fp8 paths).
 //
 // Why P needs a runtime scale at all:
 // Q/K/V are quantized offline (blockwise scales q_scale/k_scale/v_scale).
@@ -103,7 +103,7 @@ CUTE_DEVICE void pscale_per_row(ScoresTensor const& scores, float* p_scale) {
 //   false: constant mul      = vs * 448            (== vs / kFP8FixedPScale)
 // The fragment storage is aliased: the fp32 C-fragment memory becomes the
 // packed e4m3 A-fragment (4x denser), so call BEFORE reinterpreting it as
-// the PV A operand. `reorg` must be ffpa_w8a8::ReorgC8bitToA8bit.
+// the PV A operand. `reorg` must be ffpa_fp8::ReorgC8bitToA8bit.
 template <bool kPQuantPerRow, typename ScoresTensor, typename Fragment,
           typename Reorg>
 CUTE_DEVICE void quantize_p_frag(ScoresTensor& scores, Fragment& tCrS, float vs,
@@ -286,4 +286,4 @@ CUTE_DEVICE void pscale_rowsum_mma(const P8Tensor& p8_frag, float* row_sum,
   row_sum[1] += d1 * inv_exp_factor;
 }
 
-}  // namespace ffpa_w8a8
+}  // namespace ffpa_fp8

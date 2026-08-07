@@ -245,7 +245,7 @@ struct FFPAAttnCuTeSplitDM4N2Traits {
   static constexpr int kVTileBytes = kBc * kVDChunk * sizeof(Element);
 };
 
-// Persist-D W8A8 traits: fp8 e4m3 Q/K/V via SM89 m16n8k32 mma.sync.
+// Persist-D FP8 traits: fp8 e4m3 Q/K/V via SM89 m16n8k32 mma.sync.
 // V is pre-transposed by the quantize pre-kernel and stored (D x N), so the PV
 // B-operand loads with the same non-transposed LDSM_N atom as Q/K; there is no
 // SmemCopyAtomTransposed for fp8. TiledMma K-tile is 32 (atom K), not 16.
@@ -254,7 +254,7 @@ struct FFPAAttnCuTeSplitDM4N2Traits {
 // V/PV stay fp8 e4m3.
 template <int kHeadDim_, typename ElementO_, int kBr_ = 128, int kBc_ = 64,
           int kStagesK_ = 2, int kStagesV_ = 2, bool kQKInt8_ = false>
-struct FFPAAttnCuTePersistDW8A8Traits {
+struct FFPAAttnCuTePersistDFP8Traits {
   static constexpr int kHeadDim = kHeadDim_;
   static constexpr int kBr = kBr_;
   static constexpr int kBc = kBc_;
@@ -316,7 +316,7 @@ struct FFPAAttnCuTePersistDW8A8Traits {
   static constexpr int kVTileBytes = kBc * kHeadDim * sizeof(Element);
 };
 
-// Split-D W8A8 traits: non-WS M8N1 like FFPAAttnCuTeSplitDTraits but with
+// Split-D FP8 traits: non-WS M8N1 like FFPAAttnCuTeSplitDTraits but with
 // fp8 e4m3 Q/K/V (SM89 m16n8k32 mma.sync; kQKInt8: SM80 s8 atom with s32 acc
 // cast to f32 in-kernel, PV always fp8). V is pre-transposed (D x N) by the
 // quantize pre-kernel, so PV B loads with the same non-transposed LDSM_N
@@ -325,7 +325,7 @@ struct FFPAAttnCuTePersistDW8A8Traits {
 template <int kHeadDim_, typename ElementO_, int kBr_ = 128, int kBc_ = 128,
           int kQKDChunk_ = 32, int kVDChunk_ = 64, int kStagesQK_ = 2,
           int kStagesPV_ = 2, bool kQKInt8_ = false>
-struct FFPAAttnCuTeSplitDW8A8Traits {
+struct FFPAAttnCuTeSplitDFP8Traits {
   static_assert(kHeadDim_ % kQKDChunk_ == 0);
   static_assert(kHeadDim_ % kVDChunk_ == 0);
   static_assert(kQKDChunk_ == 32 || kQKDChunk_ == 64);
@@ -401,9 +401,9 @@ struct FFPAAttnCuTeSplitDW8A8Traits {
   static constexpr int kVTileBytes = kBc * kVDChunk * sizeof(Element);
 };
 
-// Split-D M4N2 W8A8 traits: m4n2 atom layout (4,2,1) + fp8 e4m3 Q/K/V via
+// Split-D M4N2 FP8 traits: m4n2 atom layout (4,2,1) + fp8 e4m3 Q/K/V via
 // SM89 m16n8k32 mma.sync. Combines FFPAAttnCuTeSplitDM4N2Traits (m4n2 geometry,
-// 8 warps, cross-N-warp softmax, P SMEM roundtrip) with FFPAAttnCuTeSplitDW8A8
+// 8 warps, cross-N-warp softmax, P SMEM roundtrip) with FFPAAttnCuTeSplitDFP8
 // (fp8 elements, V^T pre-transposed, kRescaleThreshold=4.0, K-tile=32).
 // kBr=64/kBc=64 fixed (m4n2); O regs = D/4 per thread (D=1024 -> 256 regs).
 // SmemLayoutP uses SW64 (kBc=64 e4m3 = 64B row), matching both stmatrix write
@@ -411,7 +411,7 @@ struct FFPAAttnCuTeSplitDW8A8Traits {
 template <int kHeadDim_, typename ElementO_, int kBr_ = 64, int kBc_ = 64,
           int kQKDChunk_ = 64, int kVDChunk_ = 64, int kStagesQK_ = 2,
           int kStagesPV_ = 2, bool kQKInt8_ = false>
-struct FFPAAttnCuTeSplitDM4N2W8A8Traits {
+struct FFPAAttnCuTeSplitDM4N2FP8Traits {
   static_assert(kHeadDim_ % kQKDChunk_ == 0);
   static_assert(kHeadDim_ % kVDChunk_ == 0);
   static_assert(kQKDChunk_ == 32 || kQKDChunk_ == 64);

@@ -94,7 +94,7 @@ void launch_ffpa_attn_fwd_template(torch::Tensor Q, torch::Tensor K,
   const bool force_tma = (impl_hint == ffpa::CudaBackendImpl::TMA);
   const bool force_cute = (impl_hint == ffpa::CudaBackendImpl::CUTE);
   const bool force_cute_tma = (impl_hint == ffpa::CudaBackendImpl::CUTE_TMA);
-  const bool force_w8a8 = (impl_hint == ffpa::CudaBackendImpl::CUTE_TMA_W8A8);
+  const bool force_fp8 = (impl_hint == ffpa::CudaBackendImpl::CUTE_TMA_FP8);
 
   // SM120 TMA path: when ``tma`` is set and the device is TMA-capable
   // (sm_90+), delegate to the TMA launcher. Falls back to the legacy
@@ -109,26 +109,26 @@ void launch_ffpa_attn_fwd_template(torch::Tensor Q, torch::Tensor K,
   //   sm_90/100: WS (kNonWS=0). setmaxnreg effective, 228KB smem allows
   //     deep pipeline. Unverified on real hardware.
 #ifdef ENABLE_FFPA_TMA_EXT
-  if ((force_tma || force_cute_tma || force_w8a8) && !force_native &&
+  if ((force_tma || force_cute_tma || force_fp8) && !force_native &&
       !force_cute) {
     auto prop = at::cuda::getCurrentDeviceProperties();
     if (prop->major >= 9) {
-      if (force_w8a8) {
+      if (force_fp8) {
 #ifdef ENABLE_FFPA_CUTE_EXT
-        // D<=128: persist-D w8a8; 128<D<768: split-D M8N1 w8a8;
-        // D>=768: split-D M4N2 w8a8. Same D<768/D>=768 cross-point as the
+        // D<=128: persist-D fp8; 128<D<768: split-D M8N1 fp8;
+        // D>=768: split-D M4N2 fp8. Same D<768/D>=768 cross-point as the
         // fp16 dispatch (M4N2 wins only for D>=768; below that M8N1 is
         // faster even with D/2 reg spill, same as fp16).
         if constexpr (kHeadDim <= 128) {
-          launch_cute_fwd_persist_d_w8a8_sm120<kDataType, kHeadDim, kStage>(
+          launch_cute_fwd_persist_d_fp8_sm120<kDataType, kHeadDim, kStage>(
               Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
               dropout_p, philox_seed, philox_offset, smooth_k, qk_int8);
         } else if constexpr (kHeadDim < 768) {
-          launch_cute_fwd_split_d_w8a8_sm120<kDataType, kHeadDim, kStage>(
+          launch_cute_fwd_split_d_fp8_sm120<kDataType, kHeadDim, kStage>(
               Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
               dropout_p, philox_seed, philox_offset, smooth_k, qk_int8);
         } else {
-          launch_cute_fwd_split_d_m4n2_w8a8_sm120<kDataType, kHeadDim, kStage>(
+          launch_cute_fwd_split_d_m4n2_fp8_sm120<kDataType, kHeadDim, kStage>(
               Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
               dropout_p, philox_seed, philox_offset, smooth_k, qk_int8);
         }

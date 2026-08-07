@@ -124,8 +124,8 @@ def _apply_cuda_backend_hint(backend: CUDABackend) -> None:
   Mapping: (enable_tma, enable_cute) → hint. No flag set → NATIVE (Legacy).
   """
   from .cuda import set_cuda_backend_impl, CudaBackendImpl
-  if getattr(backend, "enable_w8a8", False):
-    set_cuda_backend_impl(CudaBackendImpl.CUTE_TMA_W8A8)
+  if getattr(backend, "enable_fp8", False):
+    set_cuda_backend_impl(CudaBackendImpl.CUTE_TMA_FP8)
   elif backend.enable_tma and backend.enable_cute:
     set_cuda_backend_impl(CudaBackendImpl.CUTE_TMA)
   elif backend.enable_tma:
@@ -222,9 +222,9 @@ class CUDABackend(Backend):
   enable_tma: bool | None = None
   enable_cute: bool | None = None
   enable_ws: bool = False  # For future use.
-  enable_w8a8: bool = False  # fp8 W8A8 persist-D sm120 path (fp16/bf16 in).
-  smooth_k: bool = True  # W8A8 only: subtract per-(b,h) K seq mean pre-quant.
-  qk_int8: bool | None = None  # W8A8 only: int8 QK MMA; None=auto (causal).
+  enable_fp8: bool = False  # FP8 persist-D sm120 path (fp16/bf16 in).
+  smooth_k: bool = True  # FP8 only: subtract per-(b,h) K seq mean pre-quant.
+  qk_int8: bool | None = None  # FP8 only: int8 QK MMA; None=auto (causal).
 
   def __post_init__(self) -> None:
     super().__post_init__()

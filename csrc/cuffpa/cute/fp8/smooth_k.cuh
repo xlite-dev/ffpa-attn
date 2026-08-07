@@ -3,7 +3,7 @@
 #include <cute/tensor.hpp>
 #include <cutlass/cutlass.h>
 
-namespace ffpa_w8a8 {
+namespace ffpa_fp8 {
 
 // Smooth-K lse correction, per-row partial: dot(Q8_row, km). Softmax is
 // shift-invariant, so smoothing K leaves O unchanged, but the returned lse
@@ -144,4 +144,4 @@ void launch_kv_mean_sm120(const Element* k_ptr, Element* km, float* km_f32,
       <<<bh, 128, 0, stream>>>(partials, km, km_f32, chunks, Nkv, kHeadDim);
 }
 
-}  // namespace ffpa_w8a8
+}  // namespace ffpa_fp8

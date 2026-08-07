@@ -5,7 +5,7 @@
 #include <cstdint>
 #include <type_traits>
 
-namespace ffpa_w8a8 {
+namespace ffpa_fp8 {
 
 // 8-elem (16-byte) vector for coalesced fp16/bf16 quantize I/O.
 template <typename Element>
@@ -31,7 +31,7 @@ __device__ __forceinline__ int8_t quant_sym_int8(float x) {
 template <bool kQKInt8>
 using QKOutT = std::conditional_t<kQKInt8, int8_t, __nv_fp8_e4m3>;
 
-// Row-major blockwise e4m3 quantization of fp16/bf16 Q/K for the W8A8
+// Row-major blockwise e4m3 quantization of fp16/bf16 Q/K for the FP8
 // persist-D kernel. Output keeps the (N, D) row-major layout; scales are
 // amax/448 per (b, h, row-block). One block per (head, row-block).
 //
@@ -42,7 +42,7 @@ using QKOutT = std::conditional_t<kQKInt8, int8_t, __nv_fp8_e4m3>;
 // converts straight from regs (no second global read).
 // kQKInt8: symmetric int8 output (scale = amax/127) instead of e4m3.
 template <typename Element, int kBlockRows, bool kQKInt8, int kD>
-__global__ void quantize_w8a8_kernel(
+__global__ void quantize_fp8_kernel(
     const Element* __restrict__ X,    // (B, H, N, kD) row-major
     QKOutT<kQKInt8>* __restrict__ Y,  // (B, H, N, kD)
     float* __restrict__ scale,        // (B, H, N/kBlockRows)
@@ -151,7 +151,7 @@ __global__ void quantize_w8a8_kernel(
 // 128-bit vectorized; 8-elem runs land in smem as 2x uint32 (pad keeps bank
 // conflicts low on the transposed read-out).
 template <typename Element, int kBlockRows, int kD>
-__global__ void quantize_w8a8_vt_kernel(
+__global__ void quantize_fp8_vt_kernel(
     const Element* __restrict__ V,   // (B, H, N, D) row-major
     __nv_fp8_e4m3* __restrict__ VT,  // flat [B*Nh_kv*D, Nkv_pad]
     float* __restrict__ scale,       // (B*Nh_kv, Nkv/kBlockRows)
@@ -273,7 +273,7 @@ __global__ void quantize_w8a8_vt_kernel(
 // dimensions. Falls back to separate launches otherwise.
 // kQKInt8: roles 0/1 emit symmetric int8 (amax/127); VT stays e4m3.
 template <typename Element, int kBlockRows, int kD, int kThreads, bool kQKInt8>
-__global__ void quantize_w8a8_qkv_fused_kernel(
+__global__ void quantize_fp8_qkv_fused_kernel(
     const Element* __restrict__ Q, const Element* __restrict__ K,
     const Element* __restrict__ V, QKOutT<kQKInt8>* __restrict__ Q8,
     QKOutT<kQKInt8>* __restrict__ K8, __nv_fp8_e4m3* __restrict__ VT8,
@@ -477,13 +477,13 @@ __global__ void quantize_w8a8_qkv_fused_kernel(
 // seq mean before quantizing; km holds the per-head mean vector (B*Nh_kv, D).
 // inv_n scales km (pass 1.0 when km is already a mean).
 template <typename Element, int kBr, int kBc, int kHeadDim, bool kQKInt8>
-void launch_quantize_w8a8_sm120(const Element* q_ptr, const Element* k_ptr,
-                                const Element* v_ptr, void* q8, void* k8,
-                                __nv_fp8_e4m3* vt8, float* q_scale,
-                                float* k_scale, float* v_scale, int B, int Nh,
-                                int Nh_kv, int Nq, int Nkv, int Nkv_pad, int D,
-                                cudaStream_t stream,
-                                const Element* km = nullptr) {
+void launch_quantize_fp8_sm120(const Element* q_ptr, const Element* k_ptr,
+                               const Element* v_ptr, void* q8, void* k8,
+                               __nv_fp8_e4m3* vt8, float* q_scale,
+                               float* k_scale, float* v_scale, int B, int Nh,
+                               int Nh_kv, int Nq, int Nkv, int Nkv_pad, int D,
+                               cudaStream_t stream,
+                               const Element* km = nullptr) {
   using QKOut = QKOutT<kQKInt8>;
   constexpr int kThreads = 128;
   // Dynamic smem for the VT staging tile (1B/elem); must match the kernels'
@@ -493,8 +493,8 @@ void launch_quantize_w8a8_sm120(const Element* q_ptr, const Element* k_ptr,
   if constexpr (kBr == kBc) {
     if (Nq == Nkv && Nh == Nh_kv) {
       dim3 grid((Nq + kBr - 1) / kBr, B * Nh, 3);
-      auto kernel = quantize_w8a8_qkv_fused_kernel<Element, kBr, kHeadDim,
-                                                   kThreads, kQKInt8>;
+      auto kernel = quantize_fp8_qkv_fused_kernel<Element, kBr, kHeadDim,
+                                                  kThreads, kQKInt8>;
       cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
                            kVtSmemBytes);
       kernel<<<grid, kThreads, kVtSmemBytes, stream>>>(
@@ -506,19 +506,19 @@ void launch_quantize_w8a8_sm120(const Element* q_ptr, const Element* k_ptr,
   }
   {
     dim3 grid_q((Nq + kBr - 1) / kBr, B * Nh);
-    quantize_w8a8_kernel<Element, kBr, kQKInt8, kHeadDim>
+    quantize_fp8_kernel<Element, kBr, kQKInt8, kHeadDim>
         <<<grid_q, kThreads, 0, stream>>>(q_ptr, reinterpret_cast<QKOut*>(q8),
                                           q_scale, Nq, Nh, nullptr, 0.0f);
   }
   {
     dim3 grid_k((Nkv + kBc - 1) / kBc, B * Nh_kv);
-    quantize_w8a8_kernel<Element, kBc, kQKInt8, kHeadDim>
+    quantize_fp8_kernel<Element, kBc, kQKInt8, kHeadDim>
         <<<grid_k, kThreads, 0, stream>>>(k_ptr, reinterpret_cast<QKOut*>(k8),
                                           k_scale, Nkv, Nh_kv, km, 1.0f);
   }
   {
     dim3 grid_kv((Nkv + kBc - 1) / kBc, B * Nh_kv);
-    auto kernel = quantize_w8a8_vt_kernel<Element, kBc, kHeadDim>;
+    auto kernel = quantize_fp8_vt_kernel<Element, kBc, kHeadDim>;
     cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
                          kVtSmemBytes);
     kernel<<<grid_kv, kThreads, kVtSmemBytes, stream>>>(v_ptr, vt8, v_scale,
@@ -526,4 +526,4 @@ void launch_quantize_w8a8_sm120(const Element* q_ptr, const Element* k_ptr,
   }
 }
 
-}  // namespace ffpa_w8a8
+}  // namespace ffpa_fp8

@@ -3,7 +3,7 @@
 #include <cute/tensor.hpp>
 #include <cutlass/cutlass.h>
 
-namespace ffpa_w8a8 {
+namespace ffpa_fp8 {
 
 // 8-bit (fp8 e4m3 or symmetric int8; identical A/B operand layouts) m16n8k32:
 // reorganize the (fp32->8bit) C-fragment of the QK GEMM into the A-operand
@@ -65,4 +65,4 @@ struct ReorgC8bitToA8bit {
   }
 };
 
-}  // namespace ffpa_w8a8
+}  // namespace ffpa_fp8

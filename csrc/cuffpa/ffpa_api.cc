@@ -142,7 +142,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         ffpa::set_backend_impl_hint(static_cast<ffpa::CudaBackendImpl>(impl));
       },
       "Set CUDA backend implementation hint (0=AUTO, 1=NATIVE, 2=TMA, 3=CUTE, "
-      "4=CUTE_TMA)");
+      "4=CUTE_TMA, 5=CUTE_TMA_FP8)");
   m.def(
       "get_cuda_backend_impl",
       []() { return static_cast<int>(ffpa::get_backend_impl_hint()); },

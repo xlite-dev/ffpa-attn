@@ -18,12 +18,12 @@
 #include "../reg2reg_8b.cuh"
 #include "../smooth_k.cuh"
 
-namespace ffpa_w8a8 {
+namespace ffpa_fp8 {
 
 using TmaBarrier = cutlass::arch::ClusterTransactionBarrier;
 using CtaBarrier = cutlass::arch::ClusterBarrier;
 
-// WS persist-D W8A8 (fp8 e4m3 Q/K/V; kQKInt8: Q/K symmetric int8 with s32 QK
+// WS persist-D FP8 (fp8 e4m3 Q/K/V; kQKInt8: Q/K symmetric int8 with s32 QK
 // MMA cast to f32, PV stays fp8): same 128 producer + 256 consumer split
 // as persist_d.cuh. V is pre-transposed (D x N) by the quantize pre-kernel.
 // Blockwise scales: k_scale folded into the log2-domain softmax, v_scale
@@ -42,7 +42,7 @@ using CtaBarrier = cutlass::arch::ClusterBarrier;
 //           Faster, slightly coarser for rows whose max(P) << 1. Default.
 template <typename Traits, typename ElementO, typename TmaQ, typename TmaK,
           typename TmaV, typename TmaO, bool kPQuantPerRow = false>
-__global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_w8a8_sm120(
+__global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp8_sm120(
     CUTLASS_GRID_CONSTANT TmaQ const tma_q,
     CUTLASS_GRID_CONSTANT TmaK const tma_k,
     CUTLASS_GRID_CONSTANT TmaV const tma_v,
@@ -73,7 +73,7 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_w8a8_sm120(
   constexpr int kProducerThreads = 128;
   constexpr int kConsumerThreads = 256;
   static_assert(kHeadDim == 64 || kHeadDim == 128,
-                "w8a8 lse correction supports D in {64, 128}");
+                "fp8 lse correction supports D in {64, 128}");
 
   constexpr int kQTileElements = cosize(SmemLayoutQ{});
   constexpr int kKTileElements = cosize(SmemLayoutK{});
@@ -563,4 +563,4 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_w8a8_sm120(
 #endif  // defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
 }
 
-}  // namespace ffpa_w8a8
+}  // namespace ffpa_fp8

@@ -2,6 +2,7 @@
 
 #include <cuda_fp8.h>
 
+// tensor.hpp MUST precede any cute/atom/* header (see sm_80/split_d.cuh).
 #include <cute/tensor.hpp>
 #include <cute/atom/copy_traits_sm90_tma.hpp>
 #include <cutlass/arch/barrier.h>
@@ -11,34 +12,31 @@
 #include "../../gemm.cuh"
 #include "../../attn_traits.cuh"
 #include "../fp8_pscale.cuh"
-#include "../reg2reg_8b.cuh"
 #include "../smooth_k.cuh"
 
-namespace ffpa_w8a8 {
+namespace ffpa_fp8 {
 
 using TmaBarrier = cutlass::arch::ClusterTransactionBarrier;
 using CtaBarrier = cutlass::arch::ClusterBarrier;
 
-// Split-D W8A8 forward (non-WS, CuTe TMA). Name keeps the persist_d "ws"
-// convention; the implementation is the non-WS M8N1 design of
-// split_d_fwd_cute_sm120 (all threads do MMA, tid=0 issues TMA inline).
+// Split-D M4N2 FP8 forward (non-WS, CuTe TMA). Atom layout (4,2,1): 2
+// N-warps split Bc/kVDChunk columns; P goes through SMEM roundtrip (stmatrix
+// -> syncthreads -> LDSM_N) because each N-warp holds only half the Bc
+// columns. Cross-N-warp softmax reduction via SMEM exchange.
 //
 // fp8 e4m3 Q/K/V (kQKInt8: Q/K symmetric int8 with s32 QK MMA cast to f32;
 // PV always fp8). V is pre-transposed (D x N) by the quantize pre-kernel.
-// Blockwise scales (per kBr/kBc row block): s_dequant = qs*ks folded into
-// the log2-domain softmax; fixed P scale 1/448 via exp_offset = log2(vs*448)
-// so the PV MMA domain cancels vs: (P*vs*448) @ (V/vs) = 448*(P@V), and the
-// epilogue dequants with (1/448)/row_sum. See fp8_pscale.cuh for the math.
-// attn_bias/dropout are not supported on this path.
+// Blockwise scales: s_dequant = qs*ks folded into log2-domain softmax; fixed
+// P scale 1/448 via exp_offset = log2(vs*448) so PV MMA cancels vs. Row sum
+// uses fp32 tile_sum (方案 C, single barrier, same structure as fp16 m4n2).
+// attn_bias/dropout are not supported.
 //
-// Known accuracy limit (shared with persist_d w8a8, unresolved): causal
-// early rows attend few keys, so per-element QK/P quant errors are not
-// averaged out -- O error stays < 1e-1 but lse error can reach ~6e-2
-// (e4m3 P rounding of near-1 probabilities), vs ~4e-3 for dense.
+// O regs = D/4 per thread (D=1024 -> 256 regs). See split_d_m4n2.cuh for the
+// M4N2 register-budget analysis and cross-point vs M8N1.
 template <typename Traits, typename ElementO, typename TmaQ, typename TmaK,
           typename TmaV, typename TmaO>
 __global__ void __launch_bounds__(Traits::kNumThreads, 1)
-    split_d_ws_fwd_cute_w8a8_sm120(
+    split_d_m4n2_fwd_cute_fp8_sm120(
         CUTLASS_GRID_CONSTANT TmaQ const tma_q,
         CUTLASS_GRID_CONSTANT TmaK const tma_k,
         CUTLASS_GRID_CONSTANT TmaV const tma_v,
@@ -48,19 +46,17 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
         int Nq, int Nkv, int Nh, int Nh_kv, float scale, int Tc, int causal,
         int total_q_rows, int total_kv_rows, int n_rb_q, int n_rb_kv,
         const float* __restrict__ km = nullptr) {
-  // Body-level arch guard (see sm_120/split_d.cuh): mixed -gencode builds
-  // compile the sm_89 device pass into a stub; launch.cuh only dispatches
-  // this kernel on sm>=90 devices.
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
   using namespace cute;
   using cute::tma_store_arrive;
   using cute::tma_store_wait;
-  using Element = typename Traits::Element;      // float_e4m3_t (V/PV)
-  using ElementQK = typename Traits::ElementQK;  // int8 (kQKInt8) or e4m3
+  using Element = typename Traits::Element;
+  using ElementQK = typename Traits::ElementQK;
   using SmemLayoutQ = typename Traits::SmemLayoutQ;
   using SmemLayoutK = typename Traits::SmemLayoutK;
   using SmemLayoutV = typename Traits::SmemLayoutV;
   using SmemLayoutO = typename Traits::SmemLayoutO;
+  using SmemLayoutP = typename Traits::SmemLayoutP;
   using TiledMmaQK = typename Traits::TiledMmaQK;
   using TiledMmaPV = typename Traits::TiledMmaPV;
   using SmemCopyAtom = typename Traits::SmemCopyAtom;
@@ -76,18 +72,14 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
   constexpr int kNumThreads = Traits::kNumThreads;
   constexpr int kStagesQK = Traits::kStagesQK;
   constexpr int kStagesPV = Traits::kStagesPV;
-  constexpr int kSmemBytes = Traits::kSmemElems;
 
   constexpr int kQChunkElements = cosize(SmemLayoutQ{});
   constexpr int kKChunkElements = cosize(SmemLayoutK{});
   constexpr int kVChunkElements = cosize(SmemLayoutV{});
+  constexpr int kPElements = cosize(SmemLayoutP{});
 
-  // O staging reuses the whole freed smem from its base; guard the batched
-  // staging budget in bytes (O is ElementO 2B, QK/V smem counts 1B elems).
-  static_assert(
-      Traits::kVChunksPerBatch * cosize(SmemLayoutO{}) * sizeof(ElementO) <=
-          kSmemBytes,
-      "TMA-O: batched O staging must fit the reused smem");
+  static_assert(cosize(SmemLayoutO{}) <= kStagesPV * cosize(SmemLayoutV{}),
+                "TMA-O: O staging buffer must fit in reused V-stage smem");
 
   const int Nb_id = blockIdx.y / Nh;
   const int Nh_id = blockIdx.y % Nh;
@@ -96,6 +88,9 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
   const int kv_head_idx = Nh_id / group_size;
   const int Br_base = Q_tile_id * kBr;
   const int tid = threadIdx.x;
+  const int warp_id = tid / 32;
+  const int lane_id = tid % 32;
+  const int n_warp = warp_id / 4;
 
   if (Br_base >= Nq)
     return;
@@ -113,12 +108,14 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
   const int kv_bh = Nb_id * Nh_kv + kv_head_idx;
   const float qs = q_scale[static_cast<long>(q_bh) * n_rb_q + Q_tile_id];
 
-  // SMEM: [Q stages | K stages | V stages], 1B per elem (int8 or e4m3).
+  // SMEM: [Q stages | K stages | V stages | P staging | exchange]
   extern __shared__ __align__(1024) char shm[];
   ElementQK* q_base = reinterpret_cast<ElementQK*>(shm);
   ElementQK* k_base = q_base + kStagesQK * kQChunkElements;
   Element* v_base =
       reinterpret_cast<Element*>(k_base + kStagesQK * kKChunkElements);
+  Element* p_base = v_base + kStagesPV * kVChunkElements;
+  float* smem_exchange = reinterpret_cast<float*>(p_base + kPElements);
 
   __shared__ uint64_t qk_full[kStagesQK];
   __shared__ uint64_t qk_empty[kStagesQK];
@@ -137,9 +134,8 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
   }
   __syncthreads();
 
-  // TMA views: Q/K over the flattened [total_rows, kHeadDim] quantized
-  // buffers; V^T is a flat [B*Nh_kv*D, Nkv] plane stack, offset by the KV
-  // head's D plane (persist_d_w8a8 pattern).
+  // TMA views: Q/K over flattened [total_rows, kHeadDim]; V^T is flat
+  // [B*Nh_kv*D, Nkv] plane stack, offset by the KV head's D plane.
   auto mQ = domain_offset(
       make_coord(q_row_offset, 0),
       tma_q.get_tma_tensor(make_shape(total_q_rows, Int<kHeadDim>{})));
@@ -161,10 +157,15 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
 
   auto s2r_copy_q = make_tiled_copy_A(SmemCopyAtomQK{}, tiled_mma_qk);
   auto s2r_copy_k = make_tiled_copy_B(SmemCopyAtomQK{}, tiled_mma_qk);
+  auto s2r_copy_p = make_tiled_copy_A(SmemCopyAtom{}, tiled_mma_pv);
   auto s2r_copy_v = make_tiled_copy_B(SmemCopyAtom{}, tiled_mma_pv);
   auto s2r_thr_q = s2r_copy_q.get_thread_slice(tid);
   auto s2r_thr_k = s2r_copy_k.get_thread_slice(tid);
+  auto s2r_thr_p = s2r_copy_p.get_thread_slice(tid);
   auto s2r_thr_v = s2r_copy_v.get_thread_slice(tid);
+
+  auto sV0 = make_tensor(make_smem_ptr(v_base), SmemLayoutV{});
+  auto tCrV_layout = thr_mma_pv.partition_fragment_B(sV0).layout();
 
   using OFragType = decltype(partition_fragment_C(
       tiled_mma_pv, Shape<Int<kBr>, Int<kVDChunk>>{}));
@@ -195,8 +196,7 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
     row_sum[r] = 0.0f;
   }
 
-  // Persistent O accumulators across the KV-tile loop (see split_d.cuh for
-  // the split-D register-budget analysis): D/2 fp32 regs per thread.
+  // O accumulators: D/4 fp32 regs per thread (m4n2 halves M8N1's D/2).
   float o_acc_storage[kDChunksV][kOElemsPerFrag];
 #pragma unroll
   for (int v = 0; v < kDChunksV; ++v)
@@ -204,16 +204,11 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
     for (int i = 0; i < kOElemsPerFrag; ++i)
       o_acc_storage[v][i] = 0.0f;
 
-  // Smooth-K lse correction partials: dot(Q8_row, km) accumulated per D
-  // chunk during kv_tile 0 (Q is re-loaded every kv_tile, so only the first
-  // pass needs to compute it).
   const bool smooth_lse = (softmax_lse != nullptr) && (km != nullptr);
   float qkm[kORows];
 #pragma unroll
   for (int r = 0; r < kORows; ++r)
     qkm[r] = 0.0f;
-
-  ReorgC8bitToA8bit reorg;
 
   for (int s = 0; s < kStagesQK; ++s)
     CtaBarrier::arrive(&qk_empty[s]);
@@ -261,7 +256,7 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
   }
   if (tid == 0) {
     for (int v = 0; v < kStagesPV && v < kDChunksV; ++v) {
-      const int chunk_index = v;  // kv_tile == 0
+      const int chunk_index = v;
       const int v_stage = chunk_index % kStagesPV;
       const int v_phase = (chunk_index / kStagesPV) & 1;
       CtaBarrier::wait(&v_empty[v_stage], v_phase);
@@ -271,6 +266,8 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
 
 #pragma unroll 1
   for (int kv_tile = 0; kv_tile < Tc_eff; ++kv_tile) {
+    if (kv_tile > 0)
+      __syncthreads();
     if (kv_tile > 0 && tid == 0) {
       for (int v = 0; v < kStagesPV && v < kDChunksV; ++v) {
         const int chunk_index = kv_tile * kDChunksV + v;
@@ -286,8 +283,7 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
     const float s_dequant = qs * ks;
     const float vs448 = vs * kE4m3Max;
 
-    // Phase 1: QK GEMM with split-D accumulation. fp8 accumulates in f32;
-    // int8 accumulates in s32 across chunks (exact, <<2^31) and casts once.
+    // Phase 1: QK GEMM with split-D accumulation.
     auto tCrS = partition_fragment_C(tiled_mma_qk, Shape<Int<kBr>, Int<kBc>>{});
     clear(tCrS);
 
@@ -341,8 +337,7 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
       }
     }
 
-    // int8 QK: cast the s32 acc to f32 in place over the same 4B regs;
-    // identity view on the fp8 path.
+    // int8 QK: cast s32 acc to f32; fp8 path: identity view.
     auto tCrSf =
         make_tensor(reinterpret_cast<float*>(tCrS.data()), tCrS.layout());
     if constexpr (Traits::kQKInt8) {
@@ -351,9 +346,7 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
         tCrSf(i) = static_cast<float>(tCrS(i));
     }
 
-    // Phase 2: fixed-P-scale softmax (fp8_pscale.cuh). Masked tiles pay an
-    // explicit scale pass so -inf clamps happen before exp2; unmasked tiles
-    // defer s_dequant*scale into the softmax (one multiply per exp).
+    // Phase 2: fixed-P-scale softmax with cross-N-warp reduction.
     auto scores = make_tensor(
         tCrSf.data(), ffpa_cute::convert_layout_acc_rowcol(tCrS.layout()));
     const int kv_valid = Nkv - kv_tile * kBc;
@@ -380,9 +373,11 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
 
     float row_scale[kORows];
     const float softmax_scale_eff = tile_needs_mask ? 1.0f : s_dequant * scale;
-    online_softmax_fp8_fixed<true, decltype(scores), decltype(tScS_rc), kORows>(
+    ffpa_cute::online_softmax_fp8_fixed_m4n2<decltype(scores),
+                                             decltype(tScS_rc), kORows>(
         scores, tScS_rc, softmax_scale_eff, row_max, row_sum, row_scale,
-        log2f(vs448), 1.0f / vs448, Traits::kRescaleThreshold);
+        smem_exchange, warp_id, lane_id, log2f(vs448), 1.0f / vs448,
+        Traits::kRescaleThreshold);
 
     bool local_need_rescale = false;
 #pragma unroll
@@ -390,16 +385,31 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
       local_need_rescale = local_need_rescale || (row_scale[r] < 1.0f);
     const bool need_rescale = __any_sync(0xffffffff, local_need_rescale);
 
-    // P -> e4m3 A operand (fixed mode: softmax already emitted P*vs*448).
-    quantize_p_frag_prescaled(tCrSf, reorg);
-    auto tCrP =
-        make_tensor(reinterpret_cast<Element*>(tCrSf.data()),
-                    Layout<Shape<Shape<_4, _2, _2>, _1, Int<kBc / 32>>>{});
-    // Tensor-core row sum over the quantized P regs (exact w.r.t. the P the
-    // PV MMA consumes); folds vs*448 back out of the probability domain.
-    pscale_rowsum_mma(tCrP, row_sum, 1.0f / vs448);
+    // Phase 3: P -> e4m3 -> SMEM roundtrip. stmatrix is a b16 operation that
+    // needs SW128 for 16B vectorization, but SW128's 128-elem atom doesn't
+    // divide the 64-col P tile; DefaultCopy (vectorized stores) is used
+    // instead. Single barrier structure matches fp16 m4n2.
+    auto tCrP = ffpa_cute::convert_type<Element>(tCrSf);
 
-    // Phase 3: PV GEMM over the split-D V chunks.
+    auto sP = make_tensor(make_smem_ptr(p_base), SmemLayoutP{});
+    auto r2s_copy_p =
+        make_tiled_copy_C(Copy_Atom<DefaultCopy, Element>{}, tiled_mma_qk);
+    auto r2s_thr_p = r2s_copy_p.get_thread_slice(tid);
+    auto tCrP_src = r2s_thr_p.retile_S(tCrP);
+    auto tCsP_dst = r2s_thr_p.partition_D(sP);
+    copy(r2s_copy_p, tCrP_src, tCsP_dst);
+    cutlass::arch::fence_view_async_shared();
+    __syncthreads();
+    // finalize_row_sum folds peer tile sums (written by the m4n2 softmax
+    // above) into row_sum, rescaled by row_scale.
+    ffpa_cute::finalize_row_sum_m4n2<kORows>(row_sum, row_scale, smem_exchange,
+                                             warp_id, lane_id);
+
+    auto tCrPv_storage = thr_mma_pv.partition_fragment_A(sP);
+    auto tPsP = s2r_thr_p.partition_S(sP);
+    copy(s2r_copy_p, tPsP, tCrPv_storage);
+
+    // Phase 4: PV GEMM with split-D accumulation over V^T chunks.
 #pragma unroll
     for (int v_chunk = 0; v_chunk < kDChunksV; ++v_chunk) {
       const int chunk_index = kv_tile * kDChunksV + v_chunk;
@@ -410,7 +420,8 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
 
       auto sV = make_tensor(make_smem_ptr(v_base + v_stage * kVChunkElements),
                             SmemLayoutV{});
-      auto tCrV = thr_mma_pv.partition_fragment_B(sV);
+      auto tCrVStorage = thr_mma_pv.partition_fragment_B(sV);
+      auto tCrV = make_tensor(tCrVStorage.data(), tCrV_layout);
       auto tVsV = s2r_thr_v.partition_S(sV);
 
       auto tCrO =
@@ -425,8 +436,8 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
             tCrO_rc(row, col) *= row_scale[row];
       }
 
-      ffpa_cute::gemm_rs(tCrO, tCrP, tCrV, tVsV, tiled_mma_pv, s2r_copy_v,
-                         s2r_thr_v);
+      ffpa_cute::gemm_rs(tCrO, tCrPv_storage, tCrV, tVsV, tiled_mma_pv,
+                         s2r_copy_v, s2r_thr_v);
 
       CtaBarrier::arrive(&v_empty[v_stage]);
 
@@ -443,14 +454,14 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
     }
   }
 
-  // Phase 4: epilogue. O = o_acc * (1/448) / row_sum (fixed-mode domain),
-  // batched R->S(STSM)->TMA store on aligned tiles, R->G on the tail.
+  // Phase 5: epilogue. O = o_acc * (1/448) / row_sum, batched R->S->TMA
+  // store. Only n_warp==0 writes LSE (both N-warps share same Q rows).
   {
     constexpr int kVChunksPerBatch = Traits::kVChunksPerBatch;
     constexpr int kNBatches = Traits::kNBatches;
     constexpr int kOTileElems = cosize(SmemLayoutO{});
 
-    __syncthreads();  // V smem reads done before R->S overwrites shm
+    __syncthreads();
 
     auto mO_tma = domain_offset(
         make_coord(q_row_offset, 0),
@@ -510,13 +521,12 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
                                    make_coord(Q_tile_id, v_chunk));
           auto tCgO_tma = o_slice.partition_D(gO_tma);
           auto tOsO = o_slice.partition_S(sO_v);
-          if (tid == 0) {
+          if (tid == 0)
             copy(tma_o, tOsO, tCgO_tma);
-          }
         }
         tma_store_arrive();
         if (batch < kNBatches - 1) {
-          tma_store_wait<0>();  // drain for shm reuse
+          tma_store_wait<0>();
           __syncthreads();
         }
       }
@@ -549,7 +559,8 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
       }
     }
 
-    if (softmax_lse != nullptr) {
+    // LSE: only n_warp==0 writes (both N-warps share same Q rows).
+    if (softmax_lse != nullptr && n_warp == 0) {
       const int lse_base = Nb_id * Nh * Nq + Nh_id * Nq;
 #pragma unroll
       for (int row = 0; row < kORows; ++row) {
@@ -568,4 +579,4 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
 #endif  // defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
 }
 
-}  // namespace ffpa_w8a8
+}  // namespace ffpa_fp8

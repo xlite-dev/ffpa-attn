@@ -322,16 +322,17 @@ def _parse_args() -> argparse.Namespace:
   parser.add_argument(
     "--cuda-impl",
     choices=[
-      "auto", "native", "tma", "cute", "cute_tma", "cute_tma_w8a8",
-      "cute_tma_w8a8_smk", "cute_tma_w8a8_smk_qk_int8"
+      "auto", "native", "tma", "cute", "cute_tma", "cute_tma_fp8", "fp8",
+      "cute_tma_fp8_smk", "fp8_smk", "cute_tma_fp8_smk_qk_int8", "fp8_smk_qk_i8"
     ],
     default="auto",
     help="CUDA forward kernel implementation hint (--fwd-backend cuda only). "
     "'auto' (default) picks CUTE_TMA when the CuTe-TMA sm120 kernel is "
     "available, else NATIVE; --fwd-tma/--cute act as compat aliases under "
-    "auto. 'cute_tma_w8a8_smk' is W8A8 with smooth-K enabled; "
-    "'cute_tma_w8a8_smk_qk_int8' additionally forces int8 QK MMA. Mutually "
-    "exclusive with --fwd-tma/--cute when not 'auto'.",
+    "auto. 'cute_tma_fp8' (alias 'fp8') selects the FP8 path; "
+    "'cute_tma_fp8_smk' (alias 'fp8_smk') enables smooth-K; "
+    "'cute_tma_fp8_smk_qk_int8' (alias 'fp8_smk_qk_i8') additionally forces "
+    "int8 QK MMA. Mutually exclusive with --fwd-tma/--cute when not 'auto'.",
   )
   parser.add_argument(
     "--enable-bwd-tma",
@@ -441,22 +442,31 @@ def _resolve_directional_cli_flags(
         "cute": (False, True),
         "cute_tma": (True, True),
       }
-      if args.cuda_impl.startswith("cute_tma_w8a8"):
+      _FP8_IMPLS = {
+        "cute_tma_fp8",
+        "fp8",
+        "cute_tma_fp8_smk",
+        "fp8_smk",
+        "cute_tma_fp8_smk_qk_int8",
+        "fp8_smk_qk_i8",
+      }
+      _FP8_QK_INT8_IMPLS = {"cute_tma_fp8_smk_qk_int8", "fp8_smk_qk_i8"}
+      if args.cuda_impl in _FP8_IMPLS:
         args.enable_fwd_tma, args.enable_fwd_cute = True, True
-        args.enable_w8a8 = True
+        args.enable_fp8 = True
         args.smooth_k = True
-        args.qk_int8 = True if args.cuda_impl.endswith("qk_int8") else None
+        args.qk_int8 = True if args.cuda_impl in _FP8_QK_INT8_IMPLS else None
       else:
         args.enable_fwd_tma, args.enable_fwd_cute = _CUDA_IMPL_MAP[
           args.cuda_impl]
-        args.enable_w8a8 = False
+        args.enable_fp8 = False
     # auto: leave None/True as-is so CUDABackend auto-resolves / honors aliases.
   else:
     args.enable_fwd_tma = bool(args.enable_fwd_tma)
   if args.enable_persist_dkdv and not args.enable_bwd_tma:
     raise SystemExit("--enable-persist-dkdv requires --enable-bwd-tma")
-  if not hasattr(args, "enable_w8a8"):
-    args.enable_w8a8 = False
+  if not hasattr(args, "enable_fp8"):
+    args.enable_fp8 = False
   if not hasattr(args, "smooth_k"):
     args.smooth_k = True
   if not hasattr(args, "qk_int8"):
@@ -1536,7 +1546,7 @@ def _benchmark_rows(
         enable_tma=args.enable_fwd_tma,
         enable_ws=args.enable_fwd_ws,
         enable_cute=args.enable_fwd_cute,
-        enable_w8a8=args.enable_w8a8,
+        enable_fp8=args.enable_fp8,
         smooth_k=args.smooth_k,
         qk_int8=args.qk_int8,
         tasks=tasks,
