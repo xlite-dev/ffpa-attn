@@ -853,7 +853,7 @@ void launch_cute_fwd_split_d_w8a8_sm120(
   // env ("1"/"0") > auto (causal -> int8 for early-row accuracy, dense fp8).
   // if constexpr keeps the impl (and its kernel) out of instantiation for
   // unsupported headdims; every headdim TU includes this launcher template.
-  if constexpr (kHeadDim > 128 && kHeadDim <= 512 && kHeadDim % 64 == 0) {
+  if constexpr (kHeadDim > 128 && kHeadDim < 768 && kHeadDim % 64 == 0) {
     bool qk_int8;
     if (qk_int8_opt.has_value()) {
       qk_int8 = *qk_int8_opt;
@@ -873,7 +873,7 @@ void launch_cute_fwd_split_d_w8a8_sm120(
           philox_seed, philox_offset, smooth_k);
   } else {
     TORCH_CHECK(false,
-                "ffpa_attn: cute_tma_w8a8 split_d requires D in (128, 512] "
+                "ffpa_attn: cute_tma_w8a8 split_d requires D in (128, 768) "
                 "with D % 64 == 0, got D=",
                 kHeadDim);
   }
