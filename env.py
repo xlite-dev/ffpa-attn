@@ -38,10 +38,10 @@ class ENV(object):
   FFPA_BUILD_MAX_STAGES = int(os.environ.get("FFPA_BUILD_MAX_STAGES", 4))
 
   # Enable all headdims for FFPA kernels or not, default False.
-  # Both True/False range from 64 to 1024 with step = 64, range(64, 1024, 64)
-  # (multiples of 64). True additionally sets -DENABLE_FFPA_ALL_HEADDIM.
-  # Pass non-64-multiple headdims (e.g. 32, 96) via FFPA_DEV_HEADDIMS /
-  # `build_fast.sh --headdim 32,96`.
+  # True, headdim will range from 64 to 1024 with step = 64, range(64, 1024, 64)
+  # False, headdim will range from 320 to 1024 with step = 64, range(320, 1024, 64)
+  # (multiples of 64, headdim >= 320). Pass other headdims via FFPA_DEV_HEADDIMS /
+  # `build_fast.sh --headdim`.
   ENABLE_FFPA_ALL_HEADDIM = bool(
     int(os.environ.get("ENABLE_FFPA_ALL_HEADDIM", 0))
   )
@@ -375,7 +375,10 @@ class ENV(object):
     formatenv("FFPA_NVCC_THREADS", cls.FFPA_NVCC_THREADS)
     formatenv("FFPA_PTXAS_VERBOSE", cls.FFPA_PTXAS_VERBOSE)
     formatenv(
-      "FFPA_DEV_HEADDIMS", cls.FFPA_DEV_HEADDIMS or "range(64, 1024, 64)"
+      "FFPA_DEV_HEADDIMS", cls.FFPA_DEV_HEADDIMS or (
+        "range(64, 1024, 64)"
+        if cls.enable_all_headdim() else "range(320, 1024, 64)"
+      )
     )
     formatenv("ENABLE_FFPA_ALL_STAGES", cls.enable_all_mutistages())
     formatenv("FFPA_BUILD_MAX_STAGES", cls.FFPA_BUILD_MAX_STAGES)
@@ -414,7 +417,8 @@ class ENV(object):
     """Return the list of headdims enabled for the current build configuration.
 
     Priority order: ``FFPA_DEV_HEADDIMS`` (explicit subset for fast
-    iteration) -> default (multiples of 64 in ``[64, 1024]``).
+    iteration) -> ``ENABLE_FFPA_ALL_HEADDIM`` (multiples of 64 in
+    ``[64, 1024]``) -> default (multiples of 64 in ``[320, 1024]``).
 
     :returns: Sorted list of ``int`` headdim values.
     :raises RuntimeError: if ``FFPA_DEV_HEADDIMS`` parses to an empty list.
@@ -433,7 +437,9 @@ class ENV(object):
           f"FFPA_DEV_HEADDIMS={raw!r} parsed to an empty list."
         )
       return sorted(subset)
-    return list(range(64, 1025, 64))
+    if cls.enable_all_headdim():
+      return list(range(64, 1025, 64))
+    return list(range(320, 1025, 64))
 
   @classmethod
   def generated_sources_dir(cls):
