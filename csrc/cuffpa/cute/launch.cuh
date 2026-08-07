@@ -1063,6 +1063,7 @@ void launch_cute_fwd_split_d_m4n2_fp8_sm120(
                 kHeadDim);
   }
 }
+#endif  // ENABLE_FFPA_TMA_EXT
 
 template <typename kDataType, const int kHeadDim, const int kStage,
           const int kQKDChunk, const int kVDChunk>
