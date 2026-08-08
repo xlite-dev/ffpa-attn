@@ -678,7 +678,10 @@ def _ffpa_bwd_dkdv(
     offs_m = tl.arange(0, BLOCK_M)
     offs_d = tl.arange(0, BLOCK_HEADDIM)
     num_block_m = tl.cdiv(seqlen_q, BLOCK_M)
-    begin_m = 0 if not IS_CAUSAL else start_n // BLOCK_M * BLOCK_M
+    kv_offset = seqlen_k - seqlen_q
+    begin_m = 0 if not IS_CAUSAL else tl.maximum(
+      0, start_n - kv_offset
+    ) // BLOCK_M * BLOCK_M
 
     for start_m in range(begin_m, num_block_m * BLOCK_M, BLOCK_M):
       offs_qm = start_m + offs_m
@@ -717,7 +720,11 @@ def _ffpa_bwd_dkdv(
       if not EVEN_M:
         S = tl.where(m_mask[:, None], S, float("-inf"))
       if IS_CAUSAL:
-        S = tl.where(offs_qm[:, None] >= (offs_n[None, :]), S, float("-inf"))
+        S = tl.where(
+          offs_qm[:, None] + kv_offset >= offs_n[None, :],
+          S,
+          float("-inf"),
+        )
       S = S * softmax_scale
       if HAS_ATTN_BIAS:
         bias = tl.load(
@@ -958,7 +965,10 @@ def _ffpa_bwd_dkdvdq(
     offs_m = tl.arange(0, BLOCK_M)
     offs_d = tl.arange(0, BLOCK_HEADDIM)
     num_block_m = tl.cdiv(seqlen_q, BLOCK_M)
-    begin_m = 0 if not IS_CAUSAL else start_n // BLOCK_M * BLOCK_M
+    kv_offset = seqlen_k - seqlen_q
+    begin_m = 0 if not IS_CAUSAL else tl.maximum(
+      0, start_n - kv_offset
+    ) // BLOCK_M * BLOCK_M
 
     for start_m in range(begin_m, num_block_m * BLOCK_M, BLOCK_M):
       offs_qm = start_m + offs_m
@@ -999,7 +1009,11 @@ def _ffpa_bwd_dkdvdq(
       if not EVEN_M:
         S = tl.where(m_mask[:, None], S, float("-inf"))
       if IS_CAUSAL:
-        S = tl.where(offs_qm[:, None] >= (offs_n[None, :]), S, float("-inf"))
+        S = tl.where(
+          offs_qm[:, None] + kv_offset >= offs_n[None, :],
+          S,
+          float("-inf"),
+        )
       S = S * softmax_scale
       if HAS_ATTN_BIAS:
         bias = tl.load(
@@ -1220,7 +1234,11 @@ def _ffpa_bwd_dq(
     offs_d = tl.arange(0, BLOCK_HEADDIM)
 
     num_block_n = tl.cdiv(seqlen_k, BLOCK_N)
-    end_n_k = start_m + BLOCK_M if IS_CAUSAL else num_block_n * BLOCK_N
+    kv_offset = seqlen_k - seqlen_q
+    end_n_k = (
+      start_m + BLOCK_M + kv_offset
+      if IS_CAUSAL else num_block_n * BLOCK_N
+    )
 
     for start_n_k in range(0, end_n_k, BLOCK_N):
       offs_nk = start_n_k + offs_n
@@ -1256,7 +1274,9 @@ def _ffpa_bwd_dq(
         S_qk = tl.where(offs_nk[None, :] < seqlen_k, S_qk, float("-inf"))
       if IS_CAUSAL:
         S_qk = tl.where(
-          offs_m[:, None] >= (offs_nk[None, :]), S_qk, float("-inf")
+          offs_m[:, None] + kv_offset >= offs_nk[None, :],
+          S_qk,
+          float("-inf"),
         )
       S_qk = S_qk * softmax_scale
       if HAS_ATTN_BIAS:
