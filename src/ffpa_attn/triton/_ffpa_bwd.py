@@ -544,6 +544,7 @@ def _ffpa_bwd_kernel_impl(
   EVEN_N: tl.constexpr,
   BLOCK_M: tl.constexpr,
   BLOCK_N: tl.constexpr,
+  GROUP_SIZE: tl.constexpr,
   USE_DKDVDQ_FUSION: tl.constexpr,
 ) -> None:
   # Keys for autotune and heuristics lookups.
@@ -577,7 +578,7 @@ def _ffpa_bwd_kernel_impl(
       headdim, dropout_p, philox_offset, IS_CAUSAL, HAS_ATTN_BIAS, HAS_DROPOUT,
       PHILOX_SEED, BIAS_REQUIRES_GRAD, GRAD_BIAS_NEEDS_REDUCTION,
       GRAD_BIAS_REDUCES_M, GRAD_BIAS_STORE_PARTIAL, BLOCK_HEADDIM, DTYPE,
-      EVEN_M, EVEN_N, BLOCK_M, BLOCK_N
+      EVEN_M, EVEN_N, BLOCK_M, BLOCK_N, GROUP_SIZE
     )
     _ffpa_bwd_dq(
       Q, K, V, DO, DQ, LSE, D, AttnBias, softmax_scale, stride_qb, stride_qh,
@@ -586,7 +587,7 @@ def _ffpa_bwd_kernel_impl(
       stride_dqm, stride_bb, stride_bh, stride_bm, stride_bn, nheads, seqlen_q,
       seqlen_k, seqlen_q_rounded, headdim, dropout_p, philox_offset, IS_CAUSAL,
       HAS_ATTN_BIAS, HAS_DROPOUT, PHILOX_SEED, BLOCK_HEADDIM, DTYPE, EVEN_N,
-      BLOCK_M, BLOCK_N
+      BLOCK_M, BLOCK_N, GROUP_SIZE
     )
 
 
@@ -652,18 +653,20 @@ def _ffpa_bwd_dkdv(
   EVEN_N: tl.constexpr,
   BLOCK_M: tl.constexpr,
   BLOCK_N: tl.constexpr,
+  GROUP_SIZE: tl.constexpr,
 ) -> None:
   pid = tl.program_id(0)
   off_hb = tl.program_id(2)
   off_b = off_hb // nheads
   off_h = off_hb % nheads
+  off_hkv = off_h // GROUP_SIZE
 
   Q += off_b * stride_qb + off_h * stride_qh
-  K += off_b * stride_kb + off_h * stride_kh
-  V += off_b * stride_vb + off_h * stride_vh
+  K += off_b * stride_kb + off_hkv * stride_kh
+  V += off_b * stride_vb + off_hkv * stride_vh
   DO += off_b * stride_dob + off_h * stride_doh
-  DK += off_b * stride_dkb + off_h * stride_dkh
-  DV += off_b * stride_dvb + off_h * stride_dvh
+  DK += off_b * stride_dkb + off_hkv * stride_dkh
+  DV += off_b * stride_dvb + off_hkv * stride_dvh
   D += off_hb * seqlen_q_rounded
   LSE += off_hb * seqlen_q_rounded
   if HAS_ATTN_BIAS:
@@ -678,7 +681,10 @@ def _ffpa_bwd_dkdv(
     offs_m = tl.arange(0, BLOCK_M)
     offs_d = tl.arange(0, BLOCK_HEADDIM)
     num_block_m = tl.cdiv(seqlen_q, BLOCK_M)
-    begin_m = 0 if not IS_CAUSAL else start_n // BLOCK_M * BLOCK_M
+    kv_offset = seqlen_k - seqlen_q
+    begin_m = 0 if not IS_CAUSAL else tl.maximum(
+      0, start_n - kv_offset
+    ) // BLOCK_M * BLOCK_M
 
     for start_m in range(begin_m, num_block_m * BLOCK_M, BLOCK_M):
       offs_qm = start_m + offs_m
@@ -717,7 +723,11 @@ def _ffpa_bwd_dkdv(
       if not EVEN_M:
         S = tl.where(m_mask[:, None], S, float("-inf"))
       if IS_CAUSAL:
-        S = tl.where(offs_qm[:, None] >= (offs_n[None, :]), S, float("-inf"))
+        S = tl.where(
+          offs_qm[:, None] + kv_offset >= offs_n[None, :],
+          S,
+          float("-inf"),
+        )
       S = S * softmax_scale
       if HAS_ATTN_BIAS:
         bias = tl.load(
@@ -803,7 +813,14 @@ def _ffpa_bwd_dkdv(
         # wrapper controls DK/DV storage by allocating these buffers as bf16,
         # fp16, or fp32; this repeated global accumulation then round-trips in
         # that storage dtype without needing a Triton-side dtype branch.
-        if start_m == begin_m:
+        if GROUP_SIZE > 1:
+          dk_d = tl.trans(tl.dot(tl.trans(q), dS, out_dtype=tl.float32))
+          tl.atomic_add(dk_ptrs, dk_d, sem="relaxed", mask=grad_mask)
+          dv_d = tl.trans(
+            tl.dot(tl.trans(do), P_drop.to(DTYPE), out_dtype=tl.float32)
+          )
+          tl.atomic_add(dv_ptrs, dv_d, sem="relaxed", mask=grad_mask)
+        elif start_m == begin_m:
           dk_d = tl.trans(tl.dot(tl.trans(q), dS, out_dtype=tl.float32))
           tl.store(dk_ptrs, dk_d, mask=grad_mask, eviction_policy="evict_last")
           dv_d = tl.trans(
@@ -958,7 +975,10 @@ def _ffpa_bwd_dkdvdq(
     offs_m = tl.arange(0, BLOCK_M)
     offs_d = tl.arange(0, BLOCK_HEADDIM)
     num_block_m = tl.cdiv(seqlen_q, BLOCK_M)
-    begin_m = 0 if not IS_CAUSAL else start_n // BLOCK_M * BLOCK_M
+    kv_offset = seqlen_k - seqlen_q
+    begin_m = 0 if not IS_CAUSAL else tl.maximum(
+      0, start_n - kv_offset
+    ) // BLOCK_M * BLOCK_M
 
     for start_m in range(begin_m, num_block_m * BLOCK_M, BLOCK_M):
       offs_qm = start_m + offs_m
@@ -999,7 +1019,11 @@ def _ffpa_bwd_dkdvdq(
       if not EVEN_M:
         S = tl.where(m_mask[:, None], S, float("-inf"))
       if IS_CAUSAL:
-        S = tl.where(offs_qm[:, None] >= (offs_n[None, :]), S, float("-inf"))
+        S = tl.where(
+          offs_qm[:, None] + kv_offset >= offs_n[None, :],
+          S,
+          float("-inf"),
+        )
       S = S * softmax_scale
       if HAS_ATTN_BIAS:
         bias = tl.load(
@@ -1196,15 +1220,17 @@ def _ffpa_bwd_dq(
   EVEN_N: tl.constexpr,
   BLOCK_M: tl.constexpr,
   BLOCK_N: tl.constexpr,
+  GROUP_SIZE: tl.constexpr,
 ) -> None:
   pid = tl.program_id(0)
   off_hb = tl.program_id(2)
   off_b = off_hb // nheads
   off_h = off_hb % nheads
+  off_hkv = off_h // GROUP_SIZE
 
   Q += off_b * stride_qb + off_h * stride_qh
-  K += off_b * stride_kb + off_h * stride_kh
-  V += off_b * stride_vb + off_h * stride_vh
+  K += off_b * stride_kb + off_hkv * stride_kh
+  V += off_b * stride_vb + off_hkv * stride_vh
   DO += off_b * stride_dob + off_h * stride_doh
   DQ += off_b * stride_dqb + off_h * stride_dqh
   D += off_hb * seqlen_q_rounded
@@ -1220,7 +1246,11 @@ def _ffpa_bwd_dq(
     offs_d = tl.arange(0, BLOCK_HEADDIM)
 
     num_block_n = tl.cdiv(seqlen_k, BLOCK_N)
-    end_n_k = start_m + BLOCK_M if IS_CAUSAL else num_block_n * BLOCK_N
+    kv_offset = seqlen_k - seqlen_q
+    end_n_k = (
+      start_m + BLOCK_M + kv_offset
+      if IS_CAUSAL else num_block_n * BLOCK_N
+    )
 
     for start_n_k in range(0, end_n_k, BLOCK_N):
       offs_nk = start_n_k + offs_n
@@ -1256,7 +1286,9 @@ def _ffpa_bwd_dq(
         S_qk = tl.where(offs_nk[None, :] < seqlen_k, S_qk, float("-inf"))
       if IS_CAUSAL:
         S_qk = tl.where(
-          offs_m[:, None] >= (offs_nk[None, :]), S_qk, float("-inf")
+          offs_m[:, None] + kv_offset >= offs_nk[None, :],
+          S_qk,
+          float("-inf"),
         )
       S_qk = S_qk * softmax_scale
       if HAS_ATTN_BIAS:
@@ -1376,6 +1408,7 @@ def _ffpa_bwd_dkdv_kernel_impl(
   EVEN_N: tl.constexpr,
   BLOCK_M: tl.constexpr,
   BLOCK_N: tl.constexpr,
+  GROUP_SIZE: tl.constexpr,
 ) -> None:
   _ = autotune_seqlen_q_bucket
   _ = autotune_seqlen_k_bucket
@@ -1393,7 +1426,7 @@ def _ffpa_bwd_dkdv_kernel_impl(
     dropout_p, philox_offset, IS_CAUSAL, HAS_ATTN_BIAS, HAS_DROPOUT,
     PHILOX_SEED, BIAS_REQUIRES_GRAD, GRAD_BIAS_NEEDS_REDUCTION,
     GRAD_BIAS_REDUCES_M, GRAD_BIAS_STORE_PARTIAL, BLOCK_HEADDIM, DTYPE, EVEN_M,
-    EVEN_N, BLOCK_M, BLOCK_N
+    EVEN_N, BLOCK_M, BLOCK_N, GROUP_SIZE
   )
 
 
@@ -1450,6 +1483,7 @@ def _ffpa_bwd_dq_kernel_impl(
   EVEN_N: tl.constexpr,
   BLOCK_M: tl.constexpr,
   BLOCK_N: tl.constexpr,
+  GROUP_SIZE: tl.constexpr,
 ) -> None:
   _ = autotune_seqlen_q_bucket
   _ = autotune_seqlen_k_bucket
@@ -1464,7 +1498,7 @@ def _ffpa_bwd_dq_kernel_impl(
     stride_bb, stride_bh, stride_bm, stride_bn, nheads, seqlen_q, seqlen_k,
     seqlen_q_rounded, headdim, dropout_p, philox_offset, IS_CAUSAL,
     HAS_ATTN_BIAS, HAS_DROPOUT, PHILOX_SEED, BLOCK_HEADDIM, DTYPE, EVEN_N,
-    BLOCK_M, BLOCK_N
+    BLOCK_M, BLOCK_N, GROUP_SIZE
   )
 
 
@@ -1523,6 +1557,7 @@ def _get_bwd_autotune(
         "autotune_dtype_key",
         "autotune_bias_key",
         "autotune_dropout_key",
+        "GROUP_SIZE",
       ],
       reset_to_zero=reset_args,
       cache_results=True,
@@ -1552,6 +1587,7 @@ def _get_bwd_dkdv_autotune(
         "autotune_dtype_key",
         "autotune_bias_key",
         "autotune_dropout_key",
+        "GROUP_SIZE",
       ],
       reset_to_zero=reset_args,
       cache_results=True,
@@ -1576,6 +1612,7 @@ def _get_bwd_dq_autotune(headdim: int, autotune_mode: str):
         "autotune_dtype_key",
         "autotune_bias_key",
         "autotune_dropout_key",
+        "GROUP_SIZE",
       ],
       reset_to_zero=["DQ"],
       cache_results=True,
@@ -2086,17 +2123,19 @@ def _ffpa_attn_backward_triton_impl(
 
   * ``lse`` must already expose the padded last-dimension storage required by
     masked Triton loads
-  * any GQA/MQA expansion of ``k`` and ``v`` must already be done
-  * ``dq``, ``dk``, and ``dv`` must already be allocated with the expanded
-    head layout expected by the selected kernel
+  * generic GQA/MQA uses compact ``k`` and ``v``; decode and TMA use expanded
+    heads
+  * ``dq``, ``dk``, and ``dv`` must already be allocated with the head layout
+    expected by the selected kernel
 
   The function only computes delta, dispatches the chosen Triton backward
   kernel, and writes gradients into the provided output buffers.
 
   :param do: Upstream output gradient with layout ``[B, Nh, Nq, D]``.
   :param q: Query tensor saved from forward, layout ``[B, Nh, Nq, D]``.
-  :param k: Key tensor saved from forward, layout ``[B, Nh, Nk, D]``.
-  :param v: Value tensor saved from forward, layout ``[B, Nh, Nk, D]``.
+  :param k: Key tensor saved from forward, layout ``[B, Nh_kv, Nk, D]`` for
+      generic GQA or ``[B, Nh_q, Nk, D]`` for expanded paths.
+  :param v: Value tensor with the same head layout as ``k``.
   :param o: Forward output tensor, layout ``[B, Nh, Nq, D]``.
   :param lse: Forward softmax log-sum-exp tensor with visible layout
     ``[B, Nh, Nq]`` and storage rounded on the last dimension.
@@ -2119,6 +2158,7 @@ def _ffpa_attn_backward_triton_impl(
   batch, nheads, seqlen_q, headdim = q.shape
   _, _, seqlen_k, _ = k.shape
   original_nheads_kv = original_nheads_kv or nheads
+  group_size = nheads // k.size(1)
   softmax_scale = softmax_scale or (1.0 / math.sqrt(headdim))
   # ``split_launch`` only changes whether the generic main path invokes dKdV
   # and dQ as separate launches. The duplicated S/dP/dS recompute exists in
@@ -2127,7 +2167,7 @@ def _ffpa_attn_backward_triton_impl(
   split_launch = enable_split_launch and seqlen_q >= 8
   use_dkdvdq_fusion = (
     bool(int(os.environ.get("FFPA_TRITON_BWD_FUSE_DKDVDQ", "0")))
-    and seqlen_q >= 8 and not split_launch
+    and seqlen_q >= 8 and not split_launch and group_size == 1
   )
 
   if enable_tma and seqlen_q >= 8:
@@ -2575,6 +2615,7 @@ def _ffpa_attn_backward_triton_impl(
       GRAD_BIAS_REDUCES_M=grad_bias_reduces_m,
       GRAD_BIAS_STORE_PARTIAL=grad_bias_store_partial,
       DTYPE=DTYPE,
+      GROUP_SIZE=group_size,
     )
     dq_args = (
       q,
@@ -2625,6 +2666,7 @@ def _ffpa_attn_backward_triton_impl(
       HAS_DROPOUT=has_dropout,
       PHILOX_SEED=philox_seed,
       DTYPE=DTYPE,
+      GROUP_SIZE=group_size,
     )
 
     def dkdv_grid(meta: dict) -> tuple[int, ...]:
@@ -2743,6 +2785,7 @@ def _ffpa_attn_backward_triton_impl(
       GRAD_BIAS_REDUCES_M=grad_bias_reduces_m,
       GRAD_BIAS_STORE_PARTIAL=grad_bias_store_partial,
       DTYPE=DTYPE,
+      GROUP_SIZE=group_size,
       USE_DKDVDQ_FUSION=use_dkdvdq_fusion,
     )
   else:
@@ -2819,6 +2862,7 @@ def _ffpa_attn_backward_triton_impl(
       GRAD_BIAS_REDUCES_M=grad_bias_reduces_m,
       GRAD_BIAS_STORE_PARTIAL=grad_bias_store_partial,
       DTYPE=DTYPE,
+      GROUP_SIZE=group_size,
       USE_DKDVDQ_FUSION=use_dkdvdq_fusion,
     )
     _ffpa_bwd[grid](*main_args, **main_meta, **main_config)
@@ -2871,8 +2915,7 @@ def _ffpa_attn_backward_triton(
   dispatch layer:
 
   * pad ``lse`` to the rounded sequence length required by the Triton kernels
-  * expand ``k`` / ``v`` for GQA or MQA when ``Nh_q > Nh_kv``
-  * allocate the expanded ``dq`` / ``dk`` / ``dv`` buffers
+  * prepare ``k`` / ``v`` for the selected GQA/MQA path
   * call :func:`_ffpa_attn_backward_triton_impl`
   * reduce expanded ``dk`` / ``dv`` back to the original KV head layout
   * cast the returned gradients back to the original input dtypes
@@ -2933,10 +2976,8 @@ def _ffpa_attn_backward_triton(
 
   original_nheads_kv = k.size(1)
   group_size = q.size(1) // original_nheads_kv
-  if group_size > 1:
-    # GQA/MQA contract: kernels operate on expanded query-head layout. Gradients
-    # for repeated KV heads are summed back into the original KV head dimension
-    # after the Triton op returns.
+  native_gqa = group_size > 1 and seqlen_q >= 8 and not enable_tma
+  if group_size > 1 and not native_gqa:
     k_in = k.repeat_interleave(group_size, dim=1).contiguous()
     v_in = v.repeat_interleave(group_size, dim=1).contiguous()
   else:
@@ -2956,8 +2997,10 @@ def _ffpa_attn_backward_triton(
     int(autotune_mode == "max"),
     int(preprocess_d_chunk),
     int(return_attn_bias_grad and attn_bias is not None),
-    2 if grad_kv_storage_dtype == torch.float16 else
-    int(grad_kv_storage_dtype == torch.float32),
+    1 if native_gqa else (
+      2 if grad_kv_storage_dtype == torch.float16 else
+      int(grad_kv_storage_dtype == torch.float32)
+    ),
     2 if grad_q_storage_dtype == torch.float16 else
     int(grad_q_storage_dtype == torch.float32),
     original_nheads_kv,
@@ -2970,7 +3013,7 @@ def _ffpa_attn_backward_triton(
     int(enable_split_launch),
   )
 
-  if group_size > 1:
+  if group_size > 1 and not native_gqa:
     dk = dk_expanded.reshape(
       k.size(0),
       k.size(1),
