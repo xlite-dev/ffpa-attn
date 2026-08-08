@@ -259,7 +259,10 @@ def _ffpa_bwd_pre_impl(
   _ = autotune_seqlen_q_bucket
 
   start_m = tl.program_id(0)
-  off_hb = tl.program_id(1)
+  # Keep dense tensor base offsets in i64.  Runtime strides can each fit in
+  # i32 while ``batch * head * sequence * headdim`` exceeds 2**31 elements;
+  # leaving the program id in i32 then wraps the base pointer multiplication.
+  off_hb = tl.program_id(1).to(tl.int64)
   off_b = off_hb // nheads
   off_h = off_hb % nheads
   offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
@@ -654,7 +657,7 @@ def _ffpa_bwd_dkdv(
   BLOCK_N: tl.constexpr,
 ) -> None:
   pid = tl.program_id(0)
-  off_hb = tl.program_id(2)
+  off_hb = tl.program_id(2).to(tl.int64)
   off_b = off_hb // nheads
   off_h = off_hb % nheads
 
@@ -933,7 +936,7 @@ def _ffpa_bwd_dkdvdq(
   BLOCK_N: tl.constexpr,
 ) -> None:
   pid = tl.program_id(0)
-  off_hb = tl.program_id(2)
+  off_hb = tl.program_id(2).to(tl.int64)
   off_b = off_hb // nheads
   off_h = off_hb % nheads
 
@@ -1198,7 +1201,7 @@ def _ffpa_bwd_dq(
   BLOCK_N: tl.constexpr,
 ) -> None:
   pid = tl.program_id(0)
-  off_hb = tl.program_id(2)
+  off_hb = tl.program_id(2).to(tl.int64)
   off_b = off_hb // nheads
   off_h = off_hb % nheads
 
@@ -1773,7 +1776,7 @@ def _ffpa_bwd_decode_stage1_kernel(
   # but dQ is a sum over all K blocks, so stage1 writes PartialDQ and the reduce
   # kernel below performs the cross-K accumulation.
   start_n_block = tl.program_id(0)
-  off_hb = tl.program_id(1)
+  off_hb = tl.program_id(1).to(tl.int64)
   off_b = off_hb // nheads
   off_h = off_hb % nheads
 
@@ -2023,7 +2026,7 @@ def _ffpa_bwd_decode_dq_reduce_kernel(
 ) -> None:
   d_block = tl.program_id(0)
   q_block = tl.program_id(1)
-  off_hb = tl.program_id(2)
+  off_hb = tl.program_id(2).to(tl.int64)
   off_b = off_hb // nheads
   off_h = off_hb % nheads
 
