@@ -1179,6 +1179,41 @@ def test_ffpa_bwd_cross_attention(dtype, Nq, Nkv, D):
 
 
 @pytest.mark.parametrize("dtype", DTYPES, ids=["fp16", "bf16"])
+def test_ffpa_bwd_triton_causal_cross_gqa_matches_sdpa(dtype):
+  """Triton backward uses the same tail-aligned causal mask as forward."""
+  B, Hq, Hkv, Nq, Nkv, D = 1, 8, 2, 512, 1024, 320
+  torch.manual_seed(11)
+  q = torch.randn(B, Hq, Nq, D, dtype=dtype, device="cuda", requires_grad=True)
+  k = torch.randn(
+    B, Hkv, Nkv, D, dtype=dtype, device="cuda", requires_grad=True
+  )
+  v = torch.randn(
+    B, Hkv, Nkv, D, dtype=dtype, device="cuda", requires_grad=True
+  )
+  grad_out = torch.randn_like(q)
+  scale = 1.0 / math.sqrt(D)
+
+  out = ffpa_attn_func(
+    q,
+    k,
+    v,
+    is_causal=True,
+    scale=scale,
+    backward_backend="triton",
+    enable_gqa=True,
+  )
+  out.backward(grad_out)
+
+  dq_ref, dk_ref, dv_ref = _sdpa_ref_grads(
+    q, k, v, True, scale, grad_out=grad_out
+  )
+  tol = _tolerance(dtype)
+  torch.testing.assert_close(q.grad, dq_ref, **tol)
+  torch.testing.assert_close(k.grad, dk_ref, **tol)
+  torch.testing.assert_close(v.grad, dv_ref, **tol)
+
+
+@pytest.mark.parametrize("dtype", DTYPES, ids=["fp16", "bf16"])
 @pytest.mark.parametrize("Nq,Nkv,D", [(512, 4096, 320), (512, 8192, 512)])
 def test_ffpa_bwd_sdpa_backend_causal_cross_attention(dtype, Nq, Nkv, D):
   """The SDPA backward backend must preserve causal cross-attention gradients."""
