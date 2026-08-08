@@ -1039,6 +1039,32 @@ def test_ffpa_bwd_gqa(dtype, Nh_q, Nh_kv, N, D):
   torch.testing.assert_close(v.grad, dv_ref, **tol)
 
 
+def test_ffpa_bwd_native_gqa_does_not_repeat_kv_heads(monkeypatch):
+  """Main Triton backward consumes compact GQA K/V tensors directly."""
+  B, Hq, Hkv, N, D = 1, 8, 2, 512, 320
+  dtype = torch.bfloat16
+  torch.manual_seed(19)
+  q = torch.randn(B, Hq, N, D, dtype=dtype, device="cuda", requires_grad=True)
+  k = torch.randn(B, Hkv, N, D, dtype=dtype, device="cuda", requires_grad=True)
+  v = torch.randn(B, Hkv, N, D, dtype=dtype, device="cuda", requires_grad=True)
+  grad_out = torch.randn_like(q)
+  scale = 1.0 / math.sqrt(D)
+  out = ffpa_attn_func(q, k, v, scale=scale, enable_gqa=True)
+  dq_ref, dk_ref, dv_ref = _sdpa_ref_grads(
+    q, k, v, False, scale, grad_out=grad_out
+  )
+
+  def fail_repeat_interleave(*args, **kwargs):
+    raise AssertionError("native GQA backward must not expand K/V heads")
+
+  monkeypatch.setattr(torch.Tensor, "repeat_interleave", fail_repeat_interleave)
+  out.backward(grad_out)
+  tol = _tolerance(dtype)
+  torch.testing.assert_close(q.grad, dq_ref, **tol)
+  torch.testing.assert_close(k.grad, dk_ref, **tol)
+  torch.testing.assert_close(v.grad, dv_ref, **tol)
+
+
 @pytest.mark.parametrize("dtype", DTYPES, ids=["fp16", "bf16"])
 @pytest.mark.parametrize(
   "Nh_q,Nh_kv,N,D", [(32, 4, 8192, 320), (8, 1, 8192, 320)]
