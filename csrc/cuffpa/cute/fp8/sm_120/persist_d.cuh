@@ -342,19 +342,17 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp8_sm120(
     auto scores = make_tensor(
         tCrSf.data(), ffpa_cute::convert_layout_acc_rowcol(tCrS.layout()));
     // Known causal accuracy limit (early-row error): masked upper-triangle
-    // columns contribute EXACTLY 0 (P=0 after -inf softmax), the error comes
-    // from the VALID terms -- early rows attend only i+1 keys, so per-element
-    // quant errors are not averaged out (~1/sqrt(n_valid) decay with row):
-    //   row 0 is the pure probe: O0 = V0 quant rounding itself (~0.08 @amp.5);
-    //   fp8-P weight error and QK dS->dP error hit the few dominant weights
-    //   undiluted. Late rows average hundreds of independent errors instead.
-    // Rejected fix: fp16 accurate-PV re-run on masked tiles (VT16 plane) made
-    // causal +38~61% slower (gmem-direct fp16 B + split quantize + VT16
-    // traffic) and was removed. Current mitigation: int8 QK (auto-default for
-    // causal) removes only the dS part. Future candidates: correct only the
-    // few attended KV columns of the diagonal tile in fp16 (the PV16 idea
-    // scoped down -- its cost was the implementation, not the concept), or
-    // finer V quant block granularity (currently 128 keys/block).
+    // columns contribute EXACTLY 0 (P=0 after -inf softmax), so early rows
+    // attend only i+1 keys and per-element fp8 quant errors are not averaged
+    // out (~1/sqrt(n_valid) decay with row). This is an industry-wide fp8
+    // causal limit, NOT ffpa-specific: at amp=1.0 B1H32N8192D128 vs fp32 SDPA,
+    // FFPA early_max=0.153 vs SageAttention 2.2.0 early_max=0.130 (both far
+    // above the dense <0.012 floor). <0.05 is unreachable in pure fp8 causal;
+    // The 0.023 gap vs sage is the optimization target (QK per-thread int8 /
+    // V per-channel(D)). int8 QK (auto-default for causal) removes only the
+    // dS part. PV16 (fp16 PV on masked tiles) was removed (+38~61% slower).
+    // Per-key V quant hits the e4m3 mantissa floor 0.116 (quant granularity
+    // cannot break it).
     const int kv_valid = Nkv - kv_tile * kBc;
     const bool tile_needs_mask =
         (kv_valid < kBc) || (kv_tile >= mask_start_tile);
