@@ -249,13 +249,15 @@ def _make_forward_backend(
   enable_ws: bool,
   enable_cute: bool = False,
   enable_fp8: bool = False,
-  smooth_k: bool = True,
-  smooth_v: bool = False,
-  q_quant_method: str = "per_block",
-  k_quant_method: str = "per_block",
-  v_quant_method: str = "per_block",
-  pv_acc_type: str = "f32",
-  qk_mm_type: str = "fp8",
+  fp8_smooth_k: bool = True,
+  fp8_smooth_v: bool = False,
+  fp8_q_quant_method: str = "per_block",
+  fp8_k_quant_method: str = "per_block",
+  fp8_v_quant_method: str = "per_block",
+  fp8_pv_acc_type: str = "f32",
+  fp8_qk_mm_type: str = "fp8",
+  fp8_hybrid: bool | None = None,
+  fp8_hybrid_n_early: int = 256,
   cuda_stages: int | None = None,
 ):
   if name == "cuda":
@@ -266,13 +268,15 @@ def _make_forward_backend(
       "enable_ws": enable_ws,
       "enable_cute": enable_cute,
       "enable_fp8": enable_fp8,
-      "smooth_k": smooth_k,
-      "smooth_v": smooth_v,
-      "q_quant_method": q_quant_method,
-      "k_quant_method": k_quant_method,
-      "v_quant_method": v_quant_method,
-      "pv_acc_type": pv_acc_type,
-      "qk_mm_type": qk_mm_type,
+      "fp8_smooth_k": fp8_smooth_k,
+      "fp8_smooth_v": fp8_smooth_v,
+      "fp8_q_quant_method": fp8_q_quant_method,
+      "fp8_k_quant_method": fp8_k_quant_method,
+      "fp8_v_quant_method": fp8_v_quant_method,
+      "fp8_pv_acc_type": fp8_pv_acc_type,
+      "fp8_qk_mm_type": fp8_qk_mm_type,
+      "fp8_hybrid": fp8_hybrid,
+      "fp8_hybrid_n_early": fp8_hybrid_n_early,
     }
     if cuda_stages is not None:
       kwargs["stages"] = cuda_stages
@@ -315,17 +319,17 @@ def _run_case(
   enable_ws: bool = False,
   enable_cute: bool = False,
   enable_fp8: bool = False,
-  smooth_k: bool = True,
-  smooth_v: bool = False,
-  q_quant_method: str = "per_block",
-  k_quant_method: str = "per_block",
-  v_quant_method: str = "per_block",
-  pv_acc_type: str = "f32",
-  qk_mm_type: str = "fp8",
+  fp8_smooth_k: bool = True,
+  fp8_smooth_v: bool = False,
+  fp8_q_quant_method: str = "per_block",
+  fp8_k_quant_method: str = "per_block",
+  fp8_v_quant_method: str = "per_block",
+  fp8_pv_acc_type: str = "f32",
+  fp8_qk_mm_type: str = "fp8",
   verbose: bool = False,
   stages: int | None = None,
-  causal_hybrid: bool = False,
-  causal_hybrid_n_early: int = 256,
+  fp8_hybrid: bool | None = None,
+  fp8_hybrid_n_early: int = 256,
 ) -> FORWARD_RESULT:
   torch.manual_seed(seed)
   q = torch.randn(B, Nh_q, Nq, D, dtype=dtype, device="cuda")
@@ -341,77 +345,33 @@ def _run_case(
     enable_ws=enable_ws,
     enable_cute=enable_cute,
     enable_fp8=enable_fp8,
-    smooth_k=smooth_k,
-    smooth_v=smooth_v,
-    q_quant_method=q_quant_method,
-    k_quant_method=k_quant_method,
-    v_quant_method=v_quant_method,
-    pv_acc_type=pv_acc_type,
-    qk_mm_type=qk_mm_type,
+    fp8_smooth_k=fp8_smooth_k,
+    fp8_smooth_v=fp8_smooth_v,
+    fp8_q_quant_method=fp8_q_quant_method,
+    fp8_k_quant_method=fp8_k_quant_method,
+    fp8_v_quant_method=fp8_v_quant_method,
+    fp8_pv_acc_type=fp8_pv_acc_type,
+    fp8_qk_mm_type=fp8_qk_mm_type,
+    fp8_hybrid=fp8_hybrid,
+    fp8_hybrid_n_early=fp8_hybrid_n_early,
     cuda_stages=stages,
   )
   backward_backend = CuTeDSLBackend(
     backward=True
   ) if forward_backend.name == "cutedsl" else None
 
-  # Causal hybrid precision: full fp8 + leading n_early query rows recomputed
-  # in fp16 (contiguous slice), overwriting the fp8 result. Fixes causal
-  # early-row precision loss (ESS root cause; see persist_d.cuh comment).
-  # Zero kernel change: two ffpa_attn_func calls + slice copy.
-  if causal and causal_hybrid and enable_fp8 and forward_backend.name == "cuda":
-    fp16_backend = _make_forward_backend(
-      "cuda",
-      acc=acc,
-      triton_autotune=triton_autotune,
-      triton_autotune_mode=triton_autotune_mode,
-      enable_tma=True,
-      enable_ws=enable_ws,
-      enable_cute=True,
-      enable_fp8=False,
-      cuda_stages=stages,
+  def _ffpa_call(q, k, v):
+    return ffpa_attn_func(
+      q,
+      k,
+      v,
+      attn_mask=attn_mask,
+      is_causal=causal,
+      dropout_p=dropout_p,
+      enable_gqa=Nh_q != Nh_kv,
+      forward_backend=forward_backend,
+      backward_backend=backward_backend,
     )
-    _n_early = causal_hybrid_n_early
-
-    def _ffpa_call(q, k, v):
-      o = ffpa_attn_func(
-        q,
-        k,
-        v,
-        attn_mask=attn_mask,
-        is_causal=True,
-        dropout_p=dropout_p,
-        enable_gqa=Nh_q != Nh_kv,
-        forward_backend=forward_backend,
-        backward_backend=backward_backend,
-      )
-      # causality: early query rows i<n_early attend key j<=i<n_early, so
-      # only k/v[:n_early] needed; slice must be contiguous (ffpa assumes it).
-      qe = q[:, :, :_n_early, :].contiguous()
-      ke = k[:, :, :_n_early, :].contiguous()
-      ve = v[:, :, :_n_early, :].contiguous()
-      o[:, :, :_n_early, :] = ffpa_attn_func(
-        qe,
-        ke,
-        ve,
-        is_causal=True,
-        enable_gqa=Nh_q != Nh_kv,
-        forward_backend=fp16_backend,
-      )
-      return o
-  else:
-
-    def _ffpa_call(q, k, v):
-      return ffpa_attn_func(
-        q,
-        k,
-        v,
-        attn_mask=attn_mask,
-        is_causal=causal,
-        dropout_p=dropout_p,
-        enable_gqa=Nh_q != Nh_kv,
-        forward_backend=forward_backend,
-        backward_backend=backward_backend,
-      )
 
   torch.manual_seed(seed + 17)
   out_ffpa = _ffpa_call(q, k, v)
@@ -498,19 +458,19 @@ def run_forward_examples(
   enable_ws: bool = False,
   enable_cute: bool = False,
   enable_fp8: bool = False,
-  qk_mm_type: str = "fp8",
-  smooth_k: bool = True,
-  smooth_v: bool = False,
-  q_quant_method: str = "per_block",
-  k_quant_method: str = "per_block",
-  v_quant_method: str = "per_block",
-  pv_acc_type: str = "f32",
+  fp8_qk_mm_type: str = "fp8",
+  fp8_smooth_k: bool = True,
+  fp8_smooth_v: bool = False,
+  fp8_q_quant_method: str = "per_block",
+  fp8_k_quant_method: str = "per_block",
+  fp8_v_quant_method: str = "per_block",
+  fp8_pv_acc_type: str = "f32",
   tasks: set[str] | None = None,
   dtypes: tuple[torch.dtype, ...] = (torch.float16, torch.bfloat16),
   verbose: bool = False,
   stages: int | None = None,
-  causal_hybrid: bool = False,
-  causal_hybrid_n_early: int = 256,
+  fp8_hybrid: bool | None = None,
+  fp8_hybrid_n_early: int = 256,
 ) -> list[FORWARD_RESULT]:
   """Run the canonical forward benchmark cases.
 
@@ -697,17 +657,17 @@ def run_forward_examples(
           enable_ws=enable_ws,
           enable_cute=enable_cute,
           enable_fp8=enable_fp8,
-          qk_mm_type=qk_mm_type,
-          smooth_k=smooth_k,
-          smooth_v=smooth_v,
-          q_quant_method=q_quant_method,
-          k_quant_method=k_quant_method,
-          v_quant_method=v_quant_method,
-          pv_acc_type=pv_acc_type,
+          fp8_qk_mm_type=fp8_qk_mm_type,
+          fp8_smooth_k=fp8_smooth_k,
+          fp8_smooth_v=fp8_smooth_v,
+          fp8_q_quant_method=fp8_q_quant_method,
+          fp8_k_quant_method=fp8_k_quant_method,
+          fp8_v_quant_method=fp8_v_quant_method,
+          fp8_pv_acc_type=fp8_pv_acc_type,
           verbose=verbose,
           stages=stages,
-          causal_hybrid=causal_hybrid,
-          causal_hybrid_n_early=causal_hybrid_n_early,
+          fp8_hybrid=fp8_hybrid,
+          fp8_hybrid_n_early=fp8_hybrid_n_early,
         )
       )
 

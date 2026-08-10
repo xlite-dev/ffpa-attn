@@ -26,9 +26,10 @@ void launch_ffpa_attn_fwd_template(
     torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O,
     torch::Tensor attn_bias, torch::Tensor softmax_lse, int causal,
     double softmax_scale, double dropout_p, int64_t philox_seed,
-    int64_t philox_offset, bool smooth_k, bool smooth_v, int64_t q_quant_method,
-    int64_t k_quant_method, int64_t v_quant_method, int64_t pv_acc_type,
-    int64_t qk_mm_type) {
+    int64_t philox_offset, bool fp8_smooth_k, bool fp8_smooth_v,
+    int64_t fp8_q_quant_method, int64_t fp8_k_quant_method,
+    int64_t fp8_v_quant_method, int64_t fp8_pv_acc_type, int64_t fp8_qk_mm_type,
+    bool fp8_hybrid = false, int64_t fp8_hybrid_n_early = 256) {
   // Q,K,V,O with [B, H, N, D] layout, B=batch, H=head, N=seqlen, D=dim
   // TODO: support BNHD layout, Q,K,V,O with [B, N, H, D] layout.
   // Native block-tile config (MMA atoms, Br/Bc, stages, smem/pad flags) and
@@ -117,8 +118,8 @@ void launch_ffpa_attn_fwd_template(
       if (force_fp8) {
         // q/k only support per-block quant today; per-channel is reserved
         // for future kernel work.
-        TORCH_CHECK(q_quant_method == 0 && k_quant_method == 0,
-                    "ffpa_attn: q/k_quant_method only supports per_block");
+        TORCH_CHECK(fp8_q_quant_method == 0 && fp8_k_quant_method == 0,
+                    "ffpa_attn: fp8_q/k_quant_method only supports per_block");
 #ifdef ENABLE_FFPA_CUTE_EXT
         // EXPERIMENT: FFPA_FP8_FORCE_KERNEL=split_d|m4n2 forces a specific
         // split-D kernel to A/B test the M8N1/M4N2 dispatch cross-point.
@@ -128,20 +129,23 @@ void launch_ffpa_attn_fwd_template(
         if constexpr (kHeadDim > 128 && kHeadDim <= 1024) {
           const char* fk = getenv("FFPA_FP8_FORCE_KERNEL");
           if (fk != nullptr) {
-            TORCH_CHECK(v_quant_method == 0 && !smooth_v && pv_acc_type != 0,
+            TORCH_CHECK(fp8_v_quant_method == 0 && !fp8_smooth_v &&
+                            fp8_pv_acc_type != 0,
                         "ffpa_attn: split_d/m4n2 fp8 (D>128) supports only "
                         "v_quant_method=per_block, pv_acc_type=f32, "
                         "smooth_v=False");
             if (std::strcmp(fk, "split_d") == 0) {
               launch_cute_fwd_split_d_fp8_sm120<kDataType, kHeadDim, kStage>(
                   Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
-                  dropout_p, philox_seed, philox_offset, smooth_k, qk_mm_type);
+                  dropout_p, philox_seed, philox_offset, fp8_smooth_k,
+                  fp8_qk_mm_type);
               return;
             } else if (std::strcmp(fk, "m4n2") == 0) {
               launch_cute_fwd_split_d_m4n2_fp8_sm120<kDataType, kHeadDim,
                                                      kStage>(
                   Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
-                  dropout_p, philox_seed, philox_offset, smooth_k, qk_mm_type);
+                  dropout_p, philox_seed, philox_offset, fp8_smooth_k,
+                  fp8_qk_mm_type);
               return;
             }
           }
@@ -151,27 +155,135 @@ void launch_ffpa_attn_fwd_template(
         // fp16 dispatch (M4N2 wins only for D>=768; below that M8N1 is
         // faster even with D/2 reg spill, same as fp16).
         if constexpr (kHeadDim <= 128) {
-          launch_cute_fwd_persist_d_fp8_sm120<kDataType, kHeadDim, kStage>(
-              Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
-              dropout_p, philox_seed, philox_offset, smooth_k, smooth_v,
-              q_quant_method, k_quant_method, v_quant_method, pv_acc_type,
-              qk_mm_type);
+          if (fp8_hybrid && Nq >= fp8_hybrid_n_early) {
+            const int n_early = static_cast<int>(fp8_hybrid_n_early);
+            TORCH_CHECK(
+                n_early % 128 == 0,
+                "ffpa_attn: fp8_hybrid_n_early must be multiple of 128");
+            auto Q_e = Q.slice(2, 0, n_early).contiguous();
+            torch::Tensor K_e, V_e;
+            if (causal != 0) {
+              // Causal: query[i] attends key[0:kv_offset+i+1]; early rows
+              // only need KV prefix [0:kv_offset+n_early].
+              const int kv_offset = Nkv - Nq;
+              K_e = K.slice(2, 0, kv_offset + n_early).contiguous();
+              V_e = V.slice(2, 0, kv_offset + n_early).contiguous();
+            } else {
+              // Non-causal: every query attends ALL keys.
+              K_e = K;
+              V_e = V;
+            }
+            auto O_e = torch::empty_like(Q_e);
+            auto lse_e =
+                torch::empty({Nb, Nh, n_early}, torch::TensorOptions()
+                                                    .dtype(torch::kFloat32)
+                                                    .device(Q.device()));
+            auto empty_bias = torch::empty({0}, attn_bias.options());
+            launch_cute_fwd_persist_d_sm120<kDataType, kHeadDim, kStage>(
+                Q_e, K_e, V_e, O_e, empty_bias, lse_e, causal, softmax_scale,
+                0.0, 0, 0);
+            O.slice(2, 0, n_early).copy_(O_e);
+            if (softmax_lse.numel() > 0)
+              softmax_lse.slice(2, 0, n_early).copy_(lse_e);
+            // Stage 2: fp8 late rows [n_early:N] via q_start_row offset.
+            launch_cute_fwd_persist_d_fp8_sm120<kDataType, kHeadDim, kStage>(
+                Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
+                dropout_p, philox_seed, philox_offset, fp8_smooth_k,
+                fp8_smooth_v, fp8_q_quant_method, fp8_k_quant_method,
+                fp8_v_quant_method, fp8_pv_acc_type, fp8_qk_mm_type,
+                /*q_start_row=*/n_early);
+          } else {
+            launch_cute_fwd_persist_d_fp8_sm120<kDataType, kHeadDim, kStage>(
+                Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
+                dropout_p, philox_seed, philox_offset, fp8_smooth_k,
+                fp8_smooth_v, fp8_q_quant_method, fp8_k_quant_method,
+                fp8_v_quant_method, fp8_pv_acc_type, fp8_qk_mm_type);
+          }
         } else if constexpr (kHeadDim < 768) {
-          TORCH_CHECK(v_quant_method == 0 && !smooth_v && pv_acc_type != 0,
-                      "ffpa_attn: split_d fp8 (D>128) supports only "
-                      "v_quant_method=per_block, pv_acc_type=f32, "
-                      "smooth_v=False");
-          launch_cute_fwd_split_d_fp8_sm120<kDataType, kHeadDim, kStage>(
-              Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
-              dropout_p, philox_seed, philox_offset, smooth_k, qk_mm_type);
+          TORCH_CHECK(
+              fp8_v_quant_method == 0 && !fp8_smooth_v && fp8_pv_acc_type != 0,
+              "ffpa_attn: split_d fp8 (D>128) supports only "
+              "v_quant_method=per_block, pv_acc_type=f32, "
+              "smooth_v=False");
+          if (fp8_hybrid && Nq >= fp8_hybrid_n_early) {
+            const int n_early = static_cast<int>(fp8_hybrid_n_early);
+            TORCH_CHECK(
+                n_early % 128 == 0,
+                "ffpa_attn: fp8_hybrid_n_early must be multiple of 128");
+            auto Q_e = Q.slice(2, 0, n_early).contiguous();
+            torch::Tensor K_e, V_e;
+            if (causal != 0) {
+              const int kv_offset = Nkv - Nq;
+              K_e = K.slice(2, 0, kv_offset + n_early).contiguous();
+              V_e = V.slice(2, 0, kv_offset + n_early).contiguous();
+            } else {
+              K_e = K;
+              V_e = V;
+            }
+            auto O_e = torch::empty_like(Q_e);
+            auto lse_e =
+                torch::empty({Nb, Nh, n_early}, torch::TensorOptions()
+                                                    .dtype(torch::kFloat32)
+                                                    .device(Q.device()));
+            auto empty_bias = torch::empty({0}, attn_bias.options());
+            launch_cute_fwd_split_d_sm120<kDataType, kHeadDim, kStage, 32, 64>(
+                Q_e, K_e, V_e, O_e, empty_bias, lse_e, causal, softmax_scale,
+                0.0, 0, 0);
+            O.slice(2, 0, n_early).copy_(O_e);
+            if (softmax_lse.numel() > 0)
+              softmax_lse.slice(2, 0, n_early).copy_(lse_e);
+            launch_cute_fwd_split_d_fp8_sm120<kDataType, kHeadDim, kStage>(
+                Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
+                dropout_p, philox_seed, philox_offset, fp8_smooth_k,
+                fp8_qk_mm_type, /*q_start_row=*/n_early);
+          } else {
+            launch_cute_fwd_split_d_fp8_sm120<kDataType, kHeadDim, kStage>(
+                Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
+                dropout_p, philox_seed, philox_offset, fp8_smooth_k,
+                fp8_qk_mm_type);
+          }
         } else {
-          TORCH_CHECK(v_quant_method == 0 && !smooth_v && pv_acc_type != 0,
-                      "ffpa_attn: split_d_m4n2 fp8 (D>=768) supports only "
-                      "v_quant_method=per_block, pv_acc_type=f32, "
-                      "smooth_v=False");
-          launch_cute_fwd_split_d_m4n2_fp8_sm120<kDataType, kHeadDim, kStage>(
-              Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
-              dropout_p, philox_seed, philox_offset, smooth_k, qk_mm_type);
+          TORCH_CHECK(
+              fp8_v_quant_method == 0 && !fp8_smooth_v && fp8_pv_acc_type != 0,
+              "ffpa_attn: split_d_m4n2 fp8 (D>=768) supports only "
+              "v_quant_method=per_block, pv_acc_type=f32, "
+              "smooth_v=False");
+          if (fp8_hybrid && Nq >= fp8_hybrid_n_early) {
+            const int n_early = static_cast<int>(fp8_hybrid_n_early);
+            TORCH_CHECK(n_early % 64 == 0,
+                        "ffpa_attn: fp8_hybrid_n_early must be multiple of 64");
+            auto Q_e = Q.slice(2, 0, n_early).contiguous();
+            torch::Tensor K_e, V_e;
+            if (causal != 0) {
+              const int kv_offset = Nkv - Nq;
+              K_e = K.slice(2, 0, kv_offset + n_early).contiguous();
+              V_e = V.slice(2, 0, kv_offset + n_early).contiguous();
+            } else {
+              K_e = K;
+              V_e = V;
+            }
+            auto O_e = torch::empty_like(Q_e);
+            auto lse_e =
+                torch::empty({Nb, Nh, n_early}, torch::TensorOptions()
+                                                    .dtype(torch::kFloat32)
+                                                    .device(Q.device()));
+            auto empty_bias = torch::empty({0}, attn_bias.options());
+            launch_cute_fwd_split_d_m4n2_sm120<kDataType, kHeadDim, kStage>(
+                Q_e, K_e, V_e, O_e, empty_bias, lse_e, causal, softmax_scale,
+                0.0, 0, 0);
+            O.slice(2, 0, n_early).copy_(O_e);
+            if (softmax_lse.numel() > 0)
+              softmax_lse.slice(2, 0, n_early).copy_(lse_e);
+            launch_cute_fwd_split_d_m4n2_fp8_sm120<kDataType, kHeadDim, kStage>(
+                Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
+                dropout_p, philox_seed, philox_offset, fp8_smooth_k,
+                fp8_qk_mm_type, /*q_start_row=*/n_early);
+          } else {
+            launch_cute_fwd_split_d_m4n2_fp8_sm120<kDataType, kHeadDim, kStage>(
+                Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
+                dropout_p, philox_seed, philox_offset, fp8_smooth_k,
+                fp8_qk_mm_type);
+          }
         }
 #else
         TORCH_CHECK(false, "ffpa_attn: cute ext not compiled");

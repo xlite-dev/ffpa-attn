@@ -490,23 +490,25 @@ void launch_cute_fwd_persist_d_fp8_sm120_impl(
     torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O,
     torch::Tensor attn_bias, torch::Tensor softmax_lse, int causal,
     double softmax_scale, double dropout_p, int64_t philox_seed,
-    int64_t philox_offset, bool smooth_k, bool smooth_v, int64_t q_quant_method,
-    int64_t k_quant_method, int64_t v_quant_method, int64_t pv_acc_type) {
+    int64_t philox_offset, bool fp8_smooth_k, bool fp8_smooth_v,
+    int64_t fp8_q_quant_method, int64_t fp8_k_quant_method,
+    int64_t fp8_v_quant_method, int64_t fp8_pv_acc_type, int q_start_row = 0) {
   using namespace cute;
   TORCH_CHECK(attn_bias.numel() == 0 && dropout_p == 0.0,
               "fp8 sm120 path does not support attn_bias/dropout");
   // q/k only support per-block quant today; per-channel is reserved for
   // future kernel work.
-  TORCH_CHECK(q_quant_method == 0 && k_quant_method == 0,
-              "ffpa_attn: q/k_quant_method only supports per_block");
+  TORCH_CHECK(fp8_q_quant_method == 0 && fp8_k_quant_method == 0,
+              "ffpa_attn: fp8_q/k_quant_method only supports per_block");
   // FP8 V quant / PV acc / smooth_v are API params (v_quant_method:
   // 0=per_block, 1=per_channel; pv_acc_type: 0=f16, 1=f32). Only persist_d
   // (D<=128) supports per-channel V / smooth_v / pv_acc_f16.
-  const bool v_perchannel = (v_quant_method == 1);
-  const bool v_smooth_mean = v_perchannel && smooth_v;
-  const bool pv_acc_f16 = (pv_acc_type == 0);
-  TORCH_CHECK(!smooth_v || v_perchannel,
-              "ffpa_attn: smooth_v requires v_quant_method='per_channel'");
+  const bool v_perchannel = (fp8_v_quant_method == 1);
+  const bool v_smooth_mean = v_perchannel && fp8_smooth_v;
+  const bool pv_acc_f16 = (fp8_pv_acc_type == 0);
+  TORCH_CHECK(
+      !fp8_smooth_v || v_perchannel,
+      "ffpa_attn: fp8_smooth_v requires fp8_v_quant_method='per_channel'");
   const bool pquant_per_row = getenv("FFPA_FP8_PQUANT_PER_ROW") != nullptr;
 
   constexpr int kBr = 128;
@@ -589,7 +591,7 @@ void launch_cute_fwd_persist_d_fp8_sm120_impl(
   const kDataType* q_ptr = reinterpret_cast<const kDataType*>(Q.data_ptr());
   const kDataType* k_ptr = reinterpret_cast<const kDataType*>(K.data_ptr());
   const kDataType* v_ptr = reinterpret_cast<const kDataType*>(V.data_ptr());
-  if (smooth_k) {
+  if (fp8_smooth_k) {
     // Custom two-stage column mean (~50us) replacing at::mean + fp32 cast
     // (~85us); emits the in-dtype mean and its fp32 copy in one pass.
     const int mean_chunks =
@@ -686,7 +688,11 @@ void launch_cute_fwd_persist_d_fp8_sm120_impl(
   auto O_ptr = reinterpret_cast<ElementO*>(O.data_ptr());
 
   const dim3 block(kNumThreads, 1, 1);
-  const dim3 grid(utils::div_ceil(Nq, kBr), Nb * Nh, 1);
+  TORCH_CHECK(q_start_row >= 0 && q_start_row < Nq,
+              "ffpa_attn: q_start_row must be in [0, Nq)");
+  TORCH_CHECK(q_start_row % 128 == 0,
+              "ffpa_attn: q_start_row must be a multiple of kBr=128");
+  const dim3 grid(utils::div_ceil(Nq - q_start_row, kBr), Nb * Nh, 1);
   // P quant granularity: fixed 1/448 scale (fast, default) vs per-row scale
   // (higher accuracy). Opt into per-row with FFPA_FP8_PQUANT_PER_ROW=1.
   using TmaQ = decltype(tma_q);
@@ -700,7 +706,8 @@ void launch_cute_fwd_persist_d_fp8_sm120_impl(
         tma_q, tma_k, tma_v, tma_o, O_ptr, softmax_lse_ptr,
         q_scale.data_ptr<float>(), k_scale.data_ptr<float>(),
         v_scale.data_ptr<float>(), Nq, Nkv, Nh, Nh_kv, scale, Tc, causal,
-        total_q_rows, total_kv_rows, n_rb_q, n_rb_kv, km_f32_ptr, vm_kernel);
+        total_q_rows, total_kv_rows, n_rb_q, n_rb_kv, q_start_row, km_f32_ptr,
+        vm_kernel);
   };
   if (pquant_per_row) {
     launch_kernel(
@@ -737,27 +744,30 @@ void launch_cute_fwd_persist_d_fp8_sm120(
     torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O,
     torch::Tensor attn_bias, torch::Tensor softmax_lse, int causal,
     double softmax_scale, double dropout_p, int64_t philox_seed,
-    int64_t philox_offset, bool smooth_k, bool smooth_v, int64_t q_quant_method,
-    int64_t k_quant_method, int64_t v_quant_method, int64_t pv_acc_type,
-    int64_t qk_mm_type) {
+    int64_t philox_offset, bool fp8_smooth_k, bool fp8_smooth_v,
+    int64_t fp8_q_quant_method, int64_t fp8_k_quant_method,
+    int64_t fp8_v_quant_method, int64_t fp8_pv_acc_type, int64_t fp8_qk_mm_type,
+    int q_start_row = 0) {
   // qk_mm_type: 0=fp8 (e4m3 QK MMA), 1=int8 (s8xs8->s32). Default fp8;
   // int8 fixes the causal early-row dS accuracy limit at ~zero cost.
   // if constexpr keeps the impl (and its kernel) out of instantiation for
   // unsupported headdims; every headdim TU includes this launcher template.
   if constexpr (kHeadDim == 64 || kHeadDim == 128) {
-    const bool qk_int8 = (qk_mm_type == 1);
+    const bool qk_int8 = (fp8_qk_mm_type == 1);
     if (qk_int8)
       launch_cute_fwd_persist_d_fp8_sm120_impl<kDataType, kHeadDim, kStage,
                                                true>(
           Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale, dropout_p,
-          philox_seed, philox_offset, smooth_k, smooth_v, q_quant_method,
-          k_quant_method, v_quant_method, pv_acc_type);
+          philox_seed, philox_offset, fp8_smooth_k, fp8_smooth_v,
+          fp8_q_quant_method, fp8_k_quant_method, fp8_v_quant_method,
+          fp8_pv_acc_type, q_start_row);
     else
       launch_cute_fwd_persist_d_fp8_sm120_impl<kDataType, kHeadDim, kStage,
                                                false>(
           Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale, dropout_p,
-          philox_seed, philox_offset, smooth_k, smooth_v, q_quant_method,
-          k_quant_method, v_quant_method, pv_acc_type);
+          philox_seed, philox_offset, fp8_smooth_k, fp8_smooth_v,
+          fp8_q_quant_method, fp8_k_quant_method, fp8_v_quant_method,
+          fp8_pv_acc_type, q_start_row);
   } else {
     TORCH_CHECK(false,
                 "ffpa_attn: cute_tma_fp8 requires D=64/128, got D=", kHeadDim);
@@ -773,7 +783,7 @@ void launch_cute_fwd_split_d_fp8_sm120_impl(
     torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O,
     torch::Tensor attn_bias, torch::Tensor softmax_lse, int causal,
     double softmax_scale, double dropout_p, int64_t philox_seed,
-    int64_t philox_offset, bool smooth_k) {
+    int64_t philox_offset, bool fp8_smooth_k, int q_start_row = 0) {
   using namespace cute;
   TORCH_CHECK(attn_bias.numel() == 0 && dropout_p == 0.0,
               "fp8 sm120 path does not support attn_bias/dropout");
@@ -838,7 +848,9 @@ void launch_cute_fwd_split_d_fp8_sm120_impl(
   const kDataType* q_ptr = reinterpret_cast<const kDataType*>(Q.data_ptr());
   const kDataType* k_ptr = reinterpret_cast<const kDataType*>(K.data_ptr());
   const kDataType* v_ptr = reinterpret_cast<const kDataType*>(V.data_ptr());
-  if (smooth_k) {
+  if (fp8_smooth_k) {
+    // Custom two-stage column mean (~50us) replacing at::mean + fp32 cast
+    // (~85us); emits the in-dtype mean and its fp32 copy in one pass.
     const int mean_chunks =
         (Nkv + ffpa_fp8::kMeanRowsPerChunk - 1) / ffpa_fp8::kMeanRowsPerChunk;
     km = torch::empty({Nb * Nh_kv, kHeadDim}, K.options());
@@ -895,7 +907,11 @@ void launch_cute_fwd_split_d_fp8_sm120_impl(
   auto O_ptr = reinterpret_cast<ElementO*>(O.data_ptr());
 
   const dim3 block(Traits::kNumThreads, 1, 1);
-  const dim3 grid(utils::div_ceil(Nq, kBr), Nb * Nh, 1);
+  TORCH_CHECK(q_start_row >= 0 && q_start_row < Nq,
+              "ffpa_attn: q_start_row must be in [0, Nq)");
+  TORCH_CHECK(q_start_row % 128 == 0,
+              "ffpa_attn: q_start_row must be a multiple of kBr=128");
+  const dim3 grid(utils::div_ceil(Nq - q_start_row, kBr), Nb * Nh, 1);
   using TmaQ = decltype(tma_q);
   using TmaK = decltype(tma_k);
   using TmaV = decltype(tma_v);
@@ -908,7 +924,7 @@ void launch_cute_fwd_split_d_fp8_sm120_impl(
       tma_q, tma_k, tma_v, tma_o, O_ptr, softmax_lse_ptr,
       q_scale.data_ptr<float>(), k_scale.data_ptr<float>(),
       v_scale.data_ptr<float>(), Nq, Nkv, Nh, Nh_kv, scale, Tc, causal,
-      total_q_rows, total_kv_rows, n_rb_q, n_rb_kv, km_f32_ptr);
+      total_q_rows, total_kv_rows, n_rb_q, n_rb_kv, q_start_row, km_f32_ptr);
 }
 
 template <typename kDataType, const int kHeadDim, const int kStage>
@@ -916,27 +932,27 @@ void launch_cute_fwd_split_d_fp8_sm120(
     torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O,
     torch::Tensor attn_bias, torch::Tensor softmax_lse, int causal,
     double softmax_scale, double dropout_p, int64_t philox_seed,
-    int64_t philox_offset, bool smooth_k, int64_t qk_mm_type) {
-  // qk_mm_type: 0=fp8, 1=int8. Same encoding as persist_d.
-  // EXPERIMENT: upper bound widened from <768 to <=1024 so M8N1 can be A/B'd
-  // against M4N2 across all large headdims via FFPA_FP8_FORCE_KERNEL. M8N1 at
-  // D>=768 is expected to heavy-spill (O=D/2 regs); production dispatch still
-  // selects it only for D<768 via the top-level launcher.
-  if constexpr (kHeadDim > 128 && kHeadDim <= 1024 && kHeadDim % 64 == 0) {
-    const bool qk_int8 = (qk_mm_type == 1);
+    int64_t philox_offset, bool fp8_smooth_k, int64_t fp8_qk_mm_type,
+    int q_start_row = 0) {
+  // EXPERIMENT: lower bound lowered from >=768 to >=192 so M4N2 can be A/B'd
+  // against M8N1 across all large headdims via FFPA_FP8_FORCE_KERNEL.
+  // Production dispatch selects M4N2 only for D>=768 via the top-level
+  // launcher.
+  if constexpr (kHeadDim >= 192 && kHeadDim <= 1024 && kHeadDim % 64 == 0) {
+    const bool qk_int8 = (fp8_qk_mm_type == 1);
     if (qk_int8)
       launch_cute_fwd_split_d_fp8_sm120_impl<kDataType, kHeadDim, kStage, true>(
           Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale, dropout_p,
-          philox_seed, philox_offset, smooth_k);
+          philox_seed, philox_offset, fp8_smooth_k, q_start_row);
     else
       launch_cute_fwd_split_d_fp8_sm120_impl<kDataType, kHeadDim, kStage,
                                              false>(
           Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale, dropout_p,
-          philox_seed, philox_offset, smooth_k);
+          philox_seed, philox_offset, fp8_smooth_k, q_start_row);
   } else {
     TORCH_CHECK(false,
-                "ffpa_attn: cute_tma_fp8 split_d requires D in (128, 1024] "
-                "with D % 64 == 0, got D=",
+                "ffpa_attn: cute_tma_fp8 split_d requires D in "
+                "[192, 1024] with D % 64 == 0, got D=",
                 kHeadDim);
   }
 }
@@ -951,7 +967,7 @@ void launch_cute_fwd_split_d_m4n2_fp8_sm120_impl(
     torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O,
     torch::Tensor attn_bias, torch::Tensor softmax_lse, int causal,
     double softmax_scale, double dropout_p, int64_t philox_seed,
-    int64_t philox_offset, bool smooth_k) {
+    int64_t philox_offset, bool fp8_smooth_k, int q_start_row = 0) {
   using namespace cute;
   TORCH_CHECK(attn_bias.numel() == 0 && dropout_p == 0.0,
               "fp8 sm120 path does not support attn_bias/dropout");
@@ -1018,7 +1034,9 @@ void launch_cute_fwd_split_d_m4n2_fp8_sm120_impl(
   const kDataType* q_ptr = reinterpret_cast<const kDataType*>(Q.data_ptr());
   const kDataType* k_ptr = reinterpret_cast<const kDataType*>(K.data_ptr());
   const kDataType* v_ptr = reinterpret_cast<const kDataType*>(V.data_ptr());
-  if (smooth_k) {
+  if (fp8_smooth_k) {
+    // Custom two-stage column mean (~50us) replacing at::mean + fp32 cast
+    // (~85us); emits the in-dtype mean and its fp32 copy in one pass.
     const int mean_chunks =
         (Nkv + ffpa_fp8::kMeanRowsPerChunk - 1) / ffpa_fp8::kMeanRowsPerChunk;
     km = torch::empty({Nb * Nh_kv, kHeadDim}, K.options());
@@ -1073,7 +1091,11 @@ void launch_cute_fwd_split_d_m4n2_fp8_sm120_impl(
   auto O_ptr = reinterpret_cast<ElementO*>(O.data_ptr());
 
   const dim3 block(Traits::kNumThreads, 1, 1);
-  const dim3 grid(utils::div_ceil(Nq, kBr), Nb * Nh, 1);
+  TORCH_CHECK(q_start_row >= 0 && q_start_row < Nq,
+              "ffpa_attn: q_start_row must be in [0, Nq)");
+  TORCH_CHECK(q_start_row % 64 == 0,
+              "ffpa_attn: q_start_row must be a multiple of kBr=64");
+  const dim3 grid(utils::div_ceil(Nq - q_start_row, kBr), Nb * Nh, 1);
   using TmaQ = decltype(tma_q);
   using TmaK = decltype(tma_k);
   using TmaV = decltype(tma_v);
@@ -1087,7 +1109,7 @@ void launch_cute_fwd_split_d_m4n2_fp8_sm120_impl(
       tma_q, tma_k, tma_v, tma_o, O_ptr, softmax_lse_ptr,
       q_scale.data_ptr<float>(), k_scale.data_ptr<float>(),
       v_scale.data_ptr<float>(), Nq, Nkv, Nh, Nh_kv, scale, Tc, causal,
-      total_q_rows, total_kv_rows, n_rb_q, n_rb_kv, km_f32_ptr);
+      total_q_rows, total_kv_rows, n_rb_q, n_rb_kv, q_start_row, km_f32_ptr);
 }
 
 template <typename kDataType, const int kHeadDim, const int kStage>
@@ -1095,23 +1117,24 @@ void launch_cute_fwd_split_d_m4n2_fp8_sm120(
     torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O,
     torch::Tensor attn_bias, torch::Tensor softmax_lse, int causal,
     double softmax_scale, double dropout_p, int64_t philox_seed,
-    int64_t philox_offset, bool smooth_k, int64_t qk_mm_type) {
+    int64_t philox_offset, bool fp8_smooth_k, int64_t fp8_qk_mm_type,
+    int q_start_row = 0) {
   // EXPERIMENT: lower bound lowered from >=768 to >=192 so M4N2 can be A/B'd
   // against M8N1 across all large headdims via FFPA_FP8_FORCE_KERNEL.
   // Production dispatch selects M4N2 only for D>=768 via the top-level
   // launcher.
   if constexpr (kHeadDim >= 192 && kHeadDim <= 1024 && kHeadDim % 64 == 0) {
-    const bool qk_int8 = (qk_mm_type == 1);
+    const bool qk_int8 = (fp8_qk_mm_type == 1);
     if (qk_int8)
       launch_cute_fwd_split_d_m4n2_fp8_sm120_impl<kDataType, kHeadDim, kStage,
                                                   true>(
           Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale, dropout_p,
-          philox_seed, philox_offset, smooth_k);
+          philox_seed, philox_offset, fp8_smooth_k, q_start_row);
     else
       launch_cute_fwd_split_d_m4n2_fp8_sm120_impl<kDataType, kHeadDim, kStage,
                                                   false>(
           Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale, dropout_p,
-          philox_seed, philox_offset, smooth_k);
+          philox_seed, philox_offset, fp8_smooth_k, q_start_row);
   } else {
     TORCH_CHECK(false,
                 "ffpa_attn: cute_tma_fp8 split_d_m4n2 requires D in "

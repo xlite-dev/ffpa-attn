@@ -57,8 +57,9 @@ torch.library.define(
   f"{_OP_NAMESPACE}::_fwd_cuda",
   "(Tensor q, Tensor k, Tensor v, Tensor attn_bias, int stages, int acc, int causal, "
   "float softmax_scale, float dropout_p, int philox_seed, int philox_offset, "
-  "bool smooth_k, bool smooth_v, int q_quant_method, int k_quant_method, "
-  "int v_quant_method, int pv_acc_type, int qk_mm_type) -> "
+  "bool fp8_smooth_k, bool fp8_smooth_v, int fp8_q_quant_method, int fp8_k_quant_method, "
+  "int fp8_v_quant_method, int fp8_pv_acc_type, int fp8_qk_mm_type, "
+  "bool fp8_hybrid, int fp8_hybrid_n_early) -> "
   "(Tensor o, Tensor softmax_lse)",
 )
 
@@ -76,13 +77,15 @@ def _fwd_cuda_torch_op(
   dropout_p: float,
   philox_seed: int,
   philox_offset: int,
-  smooth_k: bool,
-  smooth_v: bool,
-  q_quant_method: int,
-  k_quant_method: int,
-  v_quant_method: int,
-  pv_acc_type: int,
-  qk_mm_type: int,
+  fp8_smooth_k: bool,
+  fp8_smooth_v: bool,
+  fp8_q_quant_method: int,
+  fp8_k_quant_method: int,
+  fp8_v_quant_method: int,
+  fp8_pv_acc_type: int,
+  fp8_qk_mm_type: int,
+  fp8_hybrid: bool,
+  fp8_hybrid_n_early: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
   if _ffpa_attn_fwd_cuda is None:
     raise RuntimeError(
@@ -117,13 +120,15 @@ def _fwd_cuda_torch_op(
     dropout_p,
     philox_seed,
     philox_offset,
-    smooth_k,
-    smooth_v,
-    q_quant_method,
-    k_quant_method,
-    v_quant_method,
-    pv_acc_type,
-    qk_mm_type,
+    fp8_smooth_k,
+    fp8_smooth_v,
+    fp8_q_quant_method,
+    fp8_k_quant_method,
+    fp8_v_quant_method,
+    fp8_pv_acc_type,
+    fp8_qk_mm_type,
+    fp8_hybrid,
+    fp8_hybrid_n_early,
   )
   return O, softmax_lse
 
@@ -141,13 +146,15 @@ def _fwd_cuda_fake(
   dropout_p: float,
   philox_seed: int,
   philox_offset: int,
-  smooth_k: bool,
-  smooth_v: bool,
-  q_quant_method: int,
-  k_quant_method: int,
-  v_quant_method: int,
-  pv_acc_type: int,
-  qk_mm_type: int,
+  fp8_smooth_k: bool,
+  fp8_smooth_v: bool,
+  fp8_q_quant_method: int,
+  fp8_k_quant_method: int,
+  fp8_v_quant_method: int,
+  fp8_pv_acc_type: int,
+  fp8_qk_mm_type: int,
+  fp8_hybrid: bool,
+  fp8_hybrid_n_early: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
   O = torch.empty_like(Q)  # noqa: E741
   softmax_lse = Q.new_empty(

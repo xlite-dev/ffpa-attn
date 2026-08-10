@@ -402,19 +402,22 @@ def _parse_args() -> argparse.Namespace:
     "sage-style per-D scale.",
   )
   parser.add_argument(
-    "--fp8-causal-hybrid",
+    "--fp8-hybrid",
     action="store_true",
-    help="FP8 causal only: 2-stage hybrid precision. Recompute the leading "
-    "--fp8-causal-hybrid-n-early query rows in fp16 (full chain) and "
-    "overwrite the fp8 result, fixing causal early-row precision loss "
-    "(ESS root cause). Zero kernel change (two ffpa_attn_func calls).",
+    default=None,
+    help="FP8 hybrid: native C++ 2-stage hybrid via q_start_row offset. "
+    "fp16 computes [0:n_early] rows, fp8 computes [n_early:N] "
+    "(zero-redundancy). Works for causal (fixes early-row accuracy) "
+    "and non-causal (precision/perf trade-off). Default auto: enabled "
+    "when causal+fp8 to protect early-row precision. All headdims, "
+    "Nq>=n_early required.",
   )
   parser.add_argument(
-    "--fp8-causal-hybrid-n-early",
+    "--fp8-hybrid-n-early",
     type=int,
     default=256,
-    help="Number of leading query rows recomputed in fp16 under "
-    "--fp8-causal-hybrid (default 256).",
+    help="Number of leading query rows computed in fp16 under "
+    "--fp8-hybrid (default 256, must be multiple of 128).",
   )
   parser.add_argument(
     "--enable-bwd-tma",
@@ -616,10 +619,10 @@ def _resolve_directional_cli_flags(
     args.pv_acc_type = "f32"
   if not hasattr(args, "qk_mm_type"):
     args.qk_mm_type = "fp8"
-  if not hasattr(args, "fp8_causal_hybrid"):
-    args.fp8_causal_hybrid = False
-  if not hasattr(args, "fp8_causal_hybrid_n_early"):
-    args.fp8_causal_hybrid_n_early = 256
+  if not hasattr(args, "fp8_hybrid"):
+    args.fp8_hybrid = None
+  if not hasattr(args, "fp8_hybrid_n_early"):
+    args.fp8_hybrid_n_early = 256
   return args
 
 
@@ -1696,19 +1699,19 @@ def _benchmark_rows(
         enable_ws=args.enable_fwd_ws,
         enable_cute=args.enable_fwd_cute,
         enable_fp8=args.enable_fp8,
-        smooth_k=args.smooth_k,
-        smooth_v=args.smooth_v,
-        q_quant_method=args.q_quant_method,
-        k_quant_method=args.k_quant_method,
-        v_quant_method=args.v_quant_method,
-        pv_acc_type=args.pv_acc_type,
-        qk_mm_type=args.qk_mm_type,
+        fp8_smooth_k=args.smooth_k,
+        fp8_smooth_v=args.smooth_v,
+        fp8_q_quant_method=args.q_quant_method,
+        fp8_k_quant_method=args.k_quant_method,
+        fp8_v_quant_method=args.v_quant_method,
+        fp8_pv_acc_type=args.pv_acc_type,
+        fp8_qk_mm_type=args.qk_mm_type,
         tasks=tasks,
         dtypes=dtypes,
         verbose=args.verbose,
         stages=args.stages,
-        causal_hybrid=args.fp8_causal_hybrid,
-        causal_hybrid_n_early=args.fp8_causal_hybrid_n_early,
+        fp8_hybrid=args.fp8_hybrid,
+        fp8_hybrid_n_early=args.fp8_hybrid_n_early,
       ),
     )
   if args.backward:

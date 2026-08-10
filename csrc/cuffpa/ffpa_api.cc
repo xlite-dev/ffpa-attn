@@ -10,31 +10,31 @@
 // fp16-acc (acc=0) is opt-in via ENABLE_FFPA_F16_ACC; the symbol is absent
 // from the generated dispatch when the macro is off.
 #ifdef ENABLE_FFPA_F16_ACC
-void ffpa_attn_fwd_fp16f16(torch::Tensor Q, torch::Tensor K, torch::Tensor V,
-                           torch::Tensor O, torch::Tensor attn_bias,
-                           torch::Tensor softmax_lse, int stages, int causal,
-                           double softmax_scale, double dropout_p,
-                           int64_t philox_seed, int64_t philox_offset,
-                           bool smooth_k, bool smooth_v, int64_t q_quant_method,
-                           int64_t k_quant_method, int64_t v_quant_method,
-                           int64_t pv_acc_type, int64_t qk_mm_type);
+void ffpa_attn_fwd_fp16f16(
+    torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O,
+    torch::Tensor attn_bias, torch::Tensor softmax_lse, int stages, int causal,
+    double softmax_scale, double dropout_p, int64_t philox_seed,
+    int64_t philox_offset, bool fp8_smooth_k, bool fp8_smooth_v,
+    int64_t fp8_q_quant_method, int64_t fp8_k_quant_method,
+    int64_t fp8_v_quant_method, int64_t fp8_pv_acc_type, int64_t fp8_qk_mm_type,
+    bool fp8_hybrid, int64_t fp8_hybrid_n_early);
 #endif
-void ffpa_attn_fwd_fp16f32(torch::Tensor Q, torch::Tensor K, torch::Tensor V,
-                           torch::Tensor O, torch::Tensor attn_bias,
-                           torch::Tensor softmax_lse, int stages, int causal,
-                           double softmax_scale, double dropout_p,
-                           int64_t philox_seed, int64_t philox_offset,
-                           bool smooth_k, bool smooth_v, int64_t q_quant_method,
-                           int64_t k_quant_method, int64_t v_quant_method,
-                           int64_t pv_acc_type, int64_t qk_mm_type);
-void ffpa_attn_fwd_bf16f32(torch::Tensor Q, torch::Tensor K, torch::Tensor V,
-                           torch::Tensor O, torch::Tensor attn_bias,
-                           torch::Tensor softmax_lse, int stages, int causal,
-                           double softmax_scale, double dropout_p,
-                           int64_t philox_seed, int64_t philox_offset,
-                           bool smooth_k, bool smooth_v, int64_t q_quant_method,
-                           int64_t k_quant_method, int64_t v_quant_method,
-                           int64_t pv_acc_type, int64_t qk_mm_type);
+void ffpa_attn_fwd_fp16f32(
+    torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O,
+    torch::Tensor attn_bias, torch::Tensor softmax_lse, int stages, int causal,
+    double softmax_scale, double dropout_p, int64_t philox_seed,
+    int64_t philox_offset, bool fp8_smooth_k, bool fp8_smooth_v,
+    int64_t fp8_q_quant_method, int64_t fp8_k_quant_method,
+    int64_t fp8_v_quant_method, int64_t fp8_pv_acc_type, int64_t fp8_qk_mm_type,
+    bool fp8_hybrid, int64_t fp8_hybrid_n_early);
+void ffpa_attn_fwd_bf16f32(
+    torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O,
+    torch::Tensor attn_bias, torch::Tensor softmax_lse, int stages, int causal,
+    double softmax_scale, double dropout_p, int64_t philox_seed,
+    int64_t philox_offset, bool fp8_smooth_k, bool fp8_smooth_v,
+    int64_t fp8_q_quant_method, int64_t fp8_k_quant_method,
+    int64_t fp8_v_quant_method, int64_t fp8_pv_acc_type, int64_t fp8_qk_mm_type,
+    bool fp8_hybrid, int64_t fp8_hybrid_n_early);
 #endif
 
 // Public unified pybind entry for FFPA forward attention.
@@ -64,31 +64,24 @@ void ffpa_attn_fwd_bf16f32(torch::Tensor Q, torch::Tensor K, torch::Tensor V,
 //   dropout_p    Dropout probability on attention weights.  0 = disabled.
 //   philox_seed/offset  RNG seed/offset for the dropout mask.
 //
-// FP8-only args (ignored unless backend hint = CUTE_TMA_FP8; persist-D
-// D<=128 supports the full set, split-D D>128 supports per-block V / f32 PV /
-// fp8 QK only and will TORCH_CHECK-reject the rest):
-//   smooth_k     Subtract per-(b,h) K seq mean before quantize.  Lossless for
-//                O (only lse needs the in-kernel correction).  ~50us pre-pass.
-//   smooth_v     Subtract per-D V mean before quantize (shrinks per-channel
-//                outlier dynamic range).  Requires v_quant_method=per_channel.
-//   q/k_quant_method  0=per_block (only supported value today).
-//   v_quant_method    0=per_block (fast, fixed 1/448 P scale),
-//                     1=per_channel (sage-style per-D scale; better accuracy
-//                     on VLM/diffusion data with per-D outliers, ~5% slower
-//                     due to the v_stats pre-pass).
-//   pv_acc_type  PV accumulator: 0=f16 (absorbs to f32 o_acc each tile; avoids
-//                the 22-bit f8f8f32 accumulator loss on causal early rows),
-//                1=f32 (default).
-//   qk_mm_type   QK MMA dtype: 0=fp8 e4m3 (default), 1=int8 s8xs8->s32.
-//                int8 fixes causal early-row dS accuracy at ~zero perf cost.
+// FP8-only args (ignored unless backend hint = CUTE_TMA_FP8):
+//   fp8_smooth_k     Subtract per-(b,h) K seq mean before quantize.
+//   fp8_smooth_v     Subtract per-D V mean before quantize.
+//                    Requires fp8_v_quant_method=per_channel.
+//   fp8_q/k_quant_method  0=per_block (only supported value today).
+//   fp8_v_quant_method    0=per_block / 1=per_channel.
+//   fp8_pv_acc_type  PV accumulator: 0=f16 / 1=f32 (default).
+//   fp8_qk_mm_type   QK MMA dtype: 0=fp8 (default) / 1=int8.
 void ffpa_attn_forward(torch::Tensor Q, torch::Tensor K, torch::Tensor V,
                        torch::Tensor attn_bias, torch::Tensor O,
                        torch::Tensor softmax_lse, int64_t stages, int64_t acc,
                        int64_t causal, double softmax_scale, double dropout_p,
                        int64_t philox_seed, int64_t philox_offset,
-                       bool smooth_k, bool smooth_v, int64_t q_quant_method,
-                       int64_t k_quant_method, int64_t v_quant_method,
-                       int64_t pv_acc_type, int64_t qk_mm_type) {
+                       bool fp8_smooth_k, bool fp8_smooth_v,
+                       int64_t fp8_q_quant_method, int64_t fp8_k_quant_method,
+                       int64_t fp8_v_quant_method, int64_t fp8_pv_acc_type,
+                       int64_t fp8_qk_mm_type, bool fp8_hybrid,
+                       int64_t fp8_hybrid_n_early) {
 #ifdef ENABLE_FFPA_CUDA_IMPL
   const auto dtype = Q.scalar_type();
   const int stages_i = static_cast<int>(stages);
@@ -106,22 +99,22 @@ void ffpa_attn_forward(torch::Tensor Q, torch::Tensor K, torch::Tensor V,
   if (dtype == torch::kHalf) {
     if (acc == 0) {
 #ifdef ENABLE_FFPA_F16_ACC
-      ffpa_attn_fwd_fp16f16(Q, K, V, O, attn_bias, softmax_lse, stages_i,
-                            causal_i, softmax_scale, dropout_p, philox_seed,
-                            philox_offset, smooth_k, smooth_v, q_quant_method,
-                            k_quant_method, v_quant_method, pv_acc_type,
-                            qk_mm_type);
+      ffpa_attn_fwd_fp16f16(
+          Q, K, V, O, attn_bias, softmax_lse, stages_i, causal_i, softmax_scale,
+          dropout_p, philox_seed, philox_offset, fp8_smooth_k, fp8_smooth_v,
+          fp8_q_quant_method, fp8_k_quant_method, fp8_v_quant_method,
+          fp8_pv_acc_type, fp8_qk_mm_type, fp8_hybrid, fp8_hybrid_n_early);
 #else
       throw std::invalid_argument(
           "ffpa_attn: fp16 MMA acc (acc=0) is disabled; rebuild with "
           "ENABLE_FFPA_F16_ACC=1 to enable it.");
 #endif
     } else if (acc == 1) {
-      ffpa_attn_fwd_fp16f32(Q, K, V, O, attn_bias, softmax_lse, stages_i,
-                            causal_i, softmax_scale, dropout_p, philox_seed,
-                            philox_offset, smooth_k, smooth_v, q_quant_method,
-                            k_quant_method, v_quant_method, pv_acc_type,
-                            qk_mm_type);
+      ffpa_attn_fwd_fp16f32(
+          Q, K, V, O, attn_bias, softmax_lse, stages_i, causal_i, softmax_scale,
+          dropout_p, philox_seed, philox_offset, fp8_smooth_k, fp8_smooth_v,
+          fp8_q_quant_method, fp8_k_quant_method, fp8_v_quant_method,
+          fp8_pv_acc_type, fp8_qk_mm_type, fp8_hybrid, fp8_hybrid_n_early);
     } else {
       throw std::invalid_argument("ffpa_attn: acc must be 0 (f16) or 1 (f32)");
     }
@@ -131,11 +124,11 @@ void ffpa_attn_forward(torch::Tensor Q, torch::Tensor K, torch::Tensor V,
           "ffpa_attn: bf16 activations require acc=1 (f32); "
           "no bf16-acc mma PTX exists.");
     }
-    ffpa_attn_fwd_bf16f32(Q, K, V, O, attn_bias, softmax_lse, stages_i,
-                          causal_i, softmax_scale, dropout_p, philox_seed,
-                          philox_offset, smooth_k, smooth_v, q_quant_method,
-                          k_quant_method, v_quant_method, pv_acc_type,
-                          qk_mm_type);
+    ffpa_attn_fwd_bf16f32(
+        Q, K, V, O, attn_bias, softmax_lse, stages_i, causal_i, softmax_scale,
+        dropout_p, philox_seed, philox_offset, fp8_smooth_k, fp8_smooth_v,
+        fp8_q_quant_method, fp8_k_quant_method, fp8_v_quant_method,
+        fp8_pv_acc_type, fp8_qk_mm_type, fp8_hybrid, fp8_hybrid_n_early);
   } else {
     throw std::invalid_argument(
         "ffpa_attn: Q.dtype must be torch.float16 or torch.bfloat16");
@@ -154,13 +147,15 @@ void ffpa_attn_forward(torch::Tensor Q, torch::Tensor K, torch::Tensor V,
   (void)dropout_p;
   (void)philox_seed;
   (void)philox_offset;
-  (void)smooth_k;
-  (void)smooth_v;
-  (void)q_quant_method;
-  (void)k_quant_method;
-  (void)v_quant_method;
-  (void)pv_acc_type;
-  (void)qk_mm_type;
+  (void)fp8_smooth_k;
+  (void)fp8_smooth_v;
+  (void)fp8_q_quant_method;
+  (void)fp8_k_quant_method;
+  (void)fp8_v_quant_method;
+  (void)fp8_pv_acc_type;
+  (void)fp8_qk_mm_type;
+  (void)fp8_hybrid;
+  (void)fp8_hybrid_n_early;
   throw std::runtime_error(
       "ffpa_attn_forward: native CUDA forward was not compiled. Rebuild with "
       "ENABLE_FFPA_CUDA_IMPL=1 to enable the CUDA forward backend.");

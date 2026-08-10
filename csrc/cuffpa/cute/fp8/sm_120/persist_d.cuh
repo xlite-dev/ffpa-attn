@@ -82,7 +82,7 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp8_sm120(
     const float* __restrict__ k_scale, const float* __restrict__ v_scale,
     int Nq, int Nkv, int Nh, int Nh_kv, float scale, int Tc, int causal,
     int total_q_rows, int total_kv_rows, int n_rb_q, int n_rb_kv,
-    const float* __restrict__ km = nullptr,
+    int q_start_row = 0, const float* __restrict__ km = nullptr,
     const float* __restrict__ vm = nullptr) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
   using namespace cute;
@@ -122,21 +122,24 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp8_sm120(
   const bool is_producer = tid < kProducerThreads;
   const int wg_tid = is_producer ? tid : tid - kProducerThreads;
 
-  if (Br_base >= Nq)
+  if (Br_base >= Nq - q_start_row)
     return;
 
   const int kv_offset = Nkv - Nq;
-  const int causal_thresh_row0 = Br_base + kv_offset;
+  const int causal_thresh_row0 = q_start_row + Br_base + kv_offset;
   const int Tc_eff =
-      causal ? min(Tc, ((Br_base + kBr - 1 + kv_offset) / kBc) + 1) : Tc;
+      causal
+          ? min(Tc, ((q_start_row + Br_base + kBr - 1 + kv_offset) / kBc) + 1)
+          : Tc;
   const int mask_start_tile =
       causal ? max(0, (causal_thresh_row0 + 1) / kBc) : INT_MAX;
 
-  const int q_row_offset = (Nb_id * Nh + Nh_id) * Nq;
+  const int q_row_offset = (Nb_id * Nh + Nh_id) * Nq + q_start_row;
   const int kv_row_offset = (Nb_id * Nh_kv + kv_head_idx) * Nkv;
   const int q_bh = Nb_id * Nh + Nh_id;
   const int kv_bh = Nb_id * Nh_kv + kv_head_idx;
-  const float qs = q_scale[static_cast<long>(q_bh) * n_rb_q + Q_tile_id];
+  const float qs =
+      q_scale[static_cast<long>(q_bh) * n_rb_q + Q_tile_id + q_start_row / kBr];
 
   // SMEM: [Q persist | K stages | V stages], 1B per elem (int8 or e4m3).
   extern __shared__ __align__(1024) char shm[];
@@ -406,7 +409,8 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp8_sm120(
     if (tile_needs_mask) {
 #pragma unroll
       for (int row = 0; row < kSRows; ++row) {
-        const int q_pos = Br_base + get<0>(tScS_rc(row, 0)) + kv_offset;
+        const int q_pos =
+            q_start_row + Br_base + get<0>(tScS_rc(row, 0)) + kv_offset;
 #pragma unroll
         for (int col = 0; col < kSCols; ++col) {
           float s = scores(row, col) * s_dequant * scale;
@@ -609,7 +613,7 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp8_sm120(
     }
     auto tCrOHalf = ffpa_cute::convert_type<ElementO>(tCrO);
 
-    if (Br_base + kBr <= Nq) {
+    if (Br_base + kBr <= Nq - q_start_row) {
       // Full tile: STSM into the freed smem (Q/K/V all consumed), then one
       // coalesced TMA store. sO aliases q_base: kBr*kHeadDim ElementO elems
       // (32KB for D=128 fp16) fit the freed [Q|K|V] region.
@@ -639,10 +643,11 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp8_sm120(
     } else {
       // Tail tile: rows past Nq would alias the next head in the flattened
       // [total_q_rows, D] TMA space, so store R->G with a row guard.
-      const int O_gmem_offset =
-          (Nb_id * Nh * Nq * kHeadDim) + (Nh_id * Nq * kHeadDim);
+      const int O_gmem_offset = (Nb_id * Nh * Nq * kHeadDim) +
+                                (Nh_id * Nq * kHeadDim) +
+                                q_start_row * kHeadDim;
       auto mO = make_tensor(make_gmem_ptr(O + O_gmem_offset),
-                            make_shape(Nq, Int<kHeadDim>{}),
+                            make_shape(Nq - q_start_row, Int<kHeadDim>{}),
                             make_stride(Int<kHeadDim>{}, _1{}));
       auto gO = local_tile(mO, Shape<Int<kBr>, Int<kHeadDim>>{},
                            make_coord(Q_tile_id, _0{}));
@@ -652,7 +657,7 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp8_sm120(
 #pragma unroll
       for (int i = 0; i < size(tCrOHalf); ++i) {
         const int global_row = Br_base + get<0>(tOcO(i));
-        if (global_row < Nq)
+        if (global_row < Nq - q_start_row)
           tCgO(i) = tCrOHalf(i);
       }
     }
@@ -664,7 +669,7 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp8_sm120(
         float lse = (row_max[row] + log2f(row_sum[row])) * FFPA_M_LN2;
         if (smooth_lse)
           lse += scale_orig * qs * qkm[row];
-        const int global_row = Br_base + get<0>(tScS_rc(row, 0));
+        const int global_row = q_start_row + Br_base + get<0>(tScS_rc(row, 0));
         if (global_row < Nq)
           softmax_lse[lse_base + global_row] = lse;
       }

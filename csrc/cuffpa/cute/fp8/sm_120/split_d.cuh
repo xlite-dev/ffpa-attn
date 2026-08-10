@@ -52,7 +52,7 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
         const float* __restrict__ k_scale, const float* __restrict__ v_scale,
         int Nq, int Nkv, int Nh, int Nh_kv, float scale, int Tc, int causal,
         int total_q_rows, int total_kv_rows, int n_rb_q, int n_rb_kv,
-        const float* __restrict__ km = nullptr) {
+        int q_start_row = 0, const float* __restrict__ km = nullptr) {
   // Body-level arch guard (see sm_120/split_d.cuh): mixed -gencode builds
   // compile the sm_89 device pass into a stub; launch.cuh only dispatches
   // this kernel on sm>=90 devices.
@@ -102,21 +102,24 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
   const int Br_base = Q_tile_id * kBr;
   const int tid = threadIdx.x;
 
-  if (Br_base >= Nq)
+  if (Br_base >= Nq - q_start_row)
     return;
 
   const int kv_offset = Nkv - Nq;
-  const int causal_thresh_row0 = Br_base + kv_offset;
+  const int causal_thresh_row0 = q_start_row + Br_base + kv_offset;
   const int Tc_eff =
-      causal ? min(Tc, ((Br_base + kBr - 1 + kv_offset) / kBc) + 1) : Tc;
+      causal
+          ? min(Tc, ((q_start_row + Br_base + kBr - 1 + kv_offset) / kBc) + 1)
+          : Tc;
   const int mask_start_tile =
       causal ? max(0, (causal_thresh_row0 + 1) / kBc) : INT_MAX;
 
-  const int q_row_offset = (Nb_id * Nh + Nh_id) * Nq;
+  const int q_row_offset = (Nb_id * Nh + Nh_id) * Nq + q_start_row;
   const int kv_row_offset = (Nb_id * Nh_kv + kv_head_idx) * Nkv;
   const int q_bh = Nb_id * Nh + Nh_id;
   const int kv_bh = Nb_id * Nh_kv + kv_head_idx;
-  const float qs = q_scale[static_cast<long>(q_bh) * n_rb_q + Q_tile_id];
+  const float qs =
+      q_scale[static_cast<long>(q_bh) * n_rb_q + Q_tile_id + q_start_row / kBr];
 
   // SMEM: [Q stages | K stages | V stages], 1B per elem (int8 or e4m3).
   extern __shared__ __align__(1024) char shm[];
@@ -369,7 +372,8 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
     if (tile_needs_mask) {
 #pragma unroll
       for (int row = 0; row < kSRows; ++row) {
-        const int q_pos = Br_base + get<0>(tScS_rc(row, 0)) + kv_offset;
+        const int q_pos =
+            q_start_row + Br_base + get<0>(tScS_rc(row, 0)) + kv_offset;
 #pragma unroll
         for (int col = 0; col < kSCols; ++col) {
           float s = scores(row, col) * s_dequant * scale;
@@ -468,15 +472,15 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
                                       tiled_mma_pv);
     auto r2s_thr = r2s_copy.get_slice(tid);
 
-    const int O_gmem_offset =
-        (Nb_id * Nh * Nq * kHeadDim) + (Nh_id * Nq * kHeadDim);
+    const int O_gmem_offset = (Nb_id * Nh * Nq * kHeadDim) +
+                              (Nh_id * Nq * kHeadDim) + q_start_row * kHeadDim;
     auto mO = make_tensor(make_gmem_ptr(O + O_gmem_offset),
-                          make_shape(Nq, Int<kHeadDim>{}),
+                          make_shape(Nq - q_start_row, Int<kHeadDim>{}),
                           make_stride(Int<kHeadDim>{}, _1{}));
     auto cO = make_identity_tensor(Shape<Int<kBr>, Int<kVDChunk>>{});
     auto tOcO = thr_mma_pv.partition_C(cO);
 
-    if (Br_base + kBr <= Nq) {
+    if (Br_base + kBr <= Nq - q_start_row) {
 #pragma unroll
       for (int batch = 0; batch < kNBatches; ++batch) {
 #pragma unroll
@@ -550,7 +554,7 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
 #pragma unroll
         for (int i = 0; i < size(tCrOHalf); ++i) {
           const int global_row = Br_base + get<0>(tOcO(i));
-          if (global_row < Nq)
+          if (global_row < Nq - q_start_row)
             tCgO(i) = tCrOHalf(i);
         }
       }
@@ -563,13 +567,13 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
         float lse = (row_max[row] + log2f(row_sum[row])) * FFPA_M_LN2;
         if (smooth_lse)
           lse += scale_orig * qs * qkm[row];
-        const int global_row = Br_base + get<0>(tScS_rc(row, 0));
+        const int global_row = q_start_row + Br_base + get<0>(tScS_rc(row, 0));
         if (global_row < Nq)
           softmax_lse[lse_base + global_row] = lse;
       }
     }
 
-    if (Br_base + kBr <= Nq)
+    if (Br_base + kBr <= Nq - q_start_row)
       tma_store_wait<0>();
   }
 #endif  // defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900

@@ -238,13 +238,21 @@ class CUDABackend(Backend):
   enable_cute: bool | None = None
   enable_ws: bool = False  # For future use.
   enable_fp8: bool = False  # FP8 persist-D sm120 path (fp16/bf16 in).
-  smooth_k: bool = True  # FP8 only: subtract per-(b,h) K seq mean pre-quant.
-  smooth_v: bool = False  # FP8 only: subtract per-(b,h) V dim mean.
-  q_quant_method: str = "per_block"  # FP8 only; per_block only (placeholder).
-  k_quant_method: str = "per_block"  # FP8 only; per_block only (placeholder).
-  v_quant_method: str = "per_block"  # FP8 only; per_block/per_channel.
-  pv_acc_type: str = "f32"  # FP8 only; f32/f16 PV accumulator.
-  qk_mm_type: str = "fp8"  # FP8 only: QK MMA dtype; "fp8" or "int8".
+  fp8_smooth_k: bool = True  # FP8 only: subtract per-(b,h) K seq mean pre-quant.
+  fp8_smooth_v: bool = False  # FP8 only: subtract per-(b,h) V dim mean.
+  fp8_q_quant_method: str = "per_block"  # FP8 only; per_block only (placeholder).
+  fp8_k_quant_method: str = "per_block"  # FP8 only; per_block only (placeholder).
+  fp8_v_quant_method: str = "per_block"  # FP8 only; per_block/per_channel.
+  fp8_pv_acc_type: str = "f32"  # FP8 only; f32/f16 PV accumulator.
+  fp8_qk_mm_type: str = "fp8"  # FP8 only: QK MMA dtype; "fp8" or "int8".
+  # FP8 only: hybrid — fp16 computes [0:n_early] rows, fp8 computes
+  # [n_early:N] via q_start_row offset (zero-redundancy). Works for causal
+  # (fixes early-row accuracy loss) and non-causal (user-selected rows get
+  # full fp16 precision). None=auto: enabled when enable_fp8 + is_causal.
+  fp8_hybrid: bool | None = None
+  fp8_hybrid_n_early: int = 256
+  # Runtime: propagated from ffpa_attn_func(is_causal=...) by normalize_inputs.
+  is_causal: bool = False
 
   def __post_init__(self) -> None:
     super().__post_init__()
@@ -257,24 +265,24 @@ class CUDABackend(Backend):
         "CUDABackend(acc='f16') requires the fp16 MMA acc kernels, which were "
         "not compiled. Rebuild with ENABLE_FFPA_F16_ACC=1 to enable them."
       )
-    assert self.q_quant_method == "per_block", (
-      f"q_quant_method only supports 'per_block', got {self.q_quant_method!r}"
+    assert self.fp8_q_quant_method == "per_block", (
+      f"fp8_q_quant_method only supports 'per_block', got {self.fp8_q_quant_method!r}"
     )
-    assert self.k_quant_method == "per_block", (
-      f"k_quant_method only supports 'per_block', got {self.k_quant_method!r}"
+    assert self.fp8_k_quant_method == "per_block", (
+      f"fp8_k_quant_method only supports 'per_block', got {self.fp8_k_quant_method!r}"
     )
-    assert self.v_quant_method in _QUANT_METHOD_CODE, (
-      f"v_quant_method must be 'per_block' or 'per_channel', "
-      f"got {self.v_quant_method!r}"
+    assert self.fp8_v_quant_method in _QUANT_METHOD_CODE, (
+      f"fp8_v_quant_method must be 'per_block' or 'per_channel', "
+      f"got {self.fp8_v_quant_method!r}"
     )
-    assert self.pv_acc_type in _PV_ACC_CODE, (
-      f"pv_acc_type must be 'f32' or 'f16', got {self.pv_acc_type!r}"
+    assert self.fp8_pv_acc_type in _PV_ACC_CODE, (
+      f"fp8_pv_acc_type must be 'f32' or 'f16', got {self.fp8_pv_acc_type!r}"
     )
-    assert self.qk_mm_type in _QK_MM_TYPE_CODE, (
-      f"qk_mm_type must be 'fp8' or 'int8', got {self.qk_mm_type!r}"
+    assert self.fp8_qk_mm_type in _QK_MM_TYPE_CODE, (
+      f"fp8_qk_mm_type must be 'fp8' or 'int8', got {self.fp8_qk_mm_type!r}"
     )
-    assert not self.smooth_v or self.v_quant_method == "per_channel", (
-      "smooth_v requires v_quant_method='per_channel'"
+    assert not self.fp8_smooth_v or self.fp8_v_quant_method == "per_channel", (
+      "fp8_smooth_v requires fp8_v_quant_method='per_channel'"
     )
     self._resolve_impl_defaults()
     self.stages = self._default_cuda_stages(
@@ -309,24 +317,24 @@ class CUDABackend(Backend):
     return _ACC_F32 if self.acc == "f32" else _ACC_F16
 
   @property
-  def q_quant_method_code(self) -> int:
-    return _QUANT_METHOD_CODE[self.q_quant_method]
+  def fp8_q_quant_method_code(self) -> int:
+    return _QUANT_METHOD_CODE[self.fp8_q_quant_method]
 
   @property
-  def k_quant_method_code(self) -> int:
-    return _QUANT_METHOD_CODE[self.k_quant_method]
+  def fp8_k_quant_method_code(self) -> int:
+    return _QUANT_METHOD_CODE[self.fp8_k_quant_method]
 
   @property
-  def v_quant_method_code(self) -> int:
-    return _QUANT_METHOD_CODE[self.v_quant_method]
+  def fp8_v_quant_method_code(self) -> int:
+    return _QUANT_METHOD_CODE[self.fp8_v_quant_method]
 
   @property
-  def pv_acc_code(self) -> int:
-    return _PV_ACC_CODE[self.pv_acc_type]
+  def fp8_pv_acc_code(self) -> int:
+    return _PV_ACC_CODE[self.fp8_pv_acc_type]
 
   @property
-  def qk_mm_type_code(self) -> int:
-    return _QK_MM_TYPE_CODE[self.qk_mm_type]
+  def fp8_qk_mm_type_code(self) -> int:
+    return _QK_MM_TYPE_CODE[self.fp8_qk_mm_type]
 
   def _default_cuda_stages(self) -> int:
     from .cuda import CudaBackendImpl
@@ -757,6 +765,16 @@ class FFPAAttnMeta:
     self.attn_meta.dropout_p = float(dropout_p)
     self.attn_meta.is_grad_enabled = torch.is_grad_enabled()
 
+    # Propagate is_causal to the CUDA backend and auto-resolve fp8_hybrid.
+    # fp8_hybrid=None (default) means "auto": enable hybrid when causal + fp8
+    # to protect early-row precision; explicit True/False is honored as-is.
+    if isinstance(self.forward_meta, CUDABackend):
+      self.forward_meta.is_causal = is_causal
+      if self.forward_meta.fp8_hybrid is None:
+        self.forward_meta.fp8_hybrid = bool(
+          self.forward_meta.enable_fp8 and is_causal
+        )
+
     # Validate that acc-code is compatible with activation dtype.
     if isinstance(
       self.forward_meta, CUDABackend
@@ -970,13 +988,15 @@ class _FFPAAttnFunc(torch.autograd.Function):
         meta.attn_meta.dropout_p,
         int(rng_state[0].item()) if rng_state.numel() else 0,
         int(rng_state[1].item()) if rng_state.numel() else 0,
-        forward_meta.smooth_k,
-        forward_meta.smooth_v,
-        forward_meta.q_quant_method_code,
-        forward_meta.k_quant_method_code,
-        forward_meta.v_quant_method_code,
-        forward_meta.pv_acc_code,
-        forward_meta.qk_mm_type_code,
+        forward_meta.fp8_smooth_k,
+        forward_meta.fp8_smooth_v,
+        forward_meta.fp8_q_quant_method_code,
+        forward_meta.fp8_k_quant_method_code,
+        forward_meta.fp8_v_quant_method_code,
+        forward_meta.fp8_pv_acc_code,
+        forward_meta.fp8_qk_mm_type_code,
+        forward_meta.fp8_hybrid,
+        forward_meta.fp8_hybrid_n_early,
       )
     elif isinstance(meta.forward_meta, TritonBackend):
       forward_meta = meta.forward_meta
