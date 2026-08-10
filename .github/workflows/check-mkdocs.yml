@@ -16,19 +16,11 @@ on:
       - '.gitignore'
       - '.gitattributes'
       - 'LICENSE'
-  pull_request_target:
-    branches:
-      - main
-    types: [opened, synchronize, reopened]
-    paths-ignore:
-      - '.gitignore'
-      - '.gitattributes'
-      - 'LICENSE'
   workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' || github.event_name == 'pull_request_target' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -38,10 +30,7 @@ jobs:
     if: |
       github.event_name == 'push' ||
       github.event_name == 'workflow_dispatch' ||
-      (github.event_name == 'pull_request' &&
-       github.event.pull_request.head.repo.full_name == github.repository) ||
-      (github.event_name == 'pull_request_target' &&
-       github.event.pull_request.head.repo.full_name != github.repository)
+      github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     strategy:
       matrix:
