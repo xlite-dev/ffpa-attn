@@ -490,10 +490,24 @@ void launch_cute_fwd_persist_d_fp8_sm120_impl(
     torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O,
     torch::Tensor attn_bias, torch::Tensor softmax_lse, int causal,
     double softmax_scale, double dropout_p, int64_t philox_seed,
-    int64_t philox_offset, bool smooth_k) {
+    int64_t philox_offset, bool smooth_k, bool smooth_v, int64_t q_quant_method,
+    int64_t k_quant_method, int64_t v_quant_method, int64_t pv_acc_type) {
   using namespace cute;
   TORCH_CHECK(attn_bias.numel() == 0 && dropout_p == 0.0,
               "fp8 sm120 path does not support attn_bias/dropout");
+  // q/k only support per-block quant today; per-channel is reserved for
+  // future kernel work.
+  TORCH_CHECK(q_quant_method == 0 && k_quant_method == 0,
+              "ffpa_attn: q/k_quant_method only supports per_block");
+  // FP8 V quant / PV acc / smooth_v are API params (v_quant_method:
+  // 0=per_block, 1=per_channel; pv_acc_type: 0=f16, 1=f32). Only persist_d
+  // (D<=128) supports per-channel V / smooth_v / pv_acc_f16.
+  const bool v_perchannel = (v_quant_method == 1);
+  const bool v_smooth_mean = v_perchannel && smooth_v;
+  const bool pv_acc_f16 = (pv_acc_type == 0);
+  TORCH_CHECK(!smooth_v || v_perchannel,
+              "ffpa_attn: smooth_v requires v_quant_method='per_channel'");
+  const bool pquant_per_row = getenv("FFPA_FP8_PQUANT_PER_ROW") != nullptr;
 
   constexpr int kBr = 128;
   constexpr int kBc = 128;
@@ -543,8 +557,15 @@ void launch_cute_fwd_persist_d_fp8_sm120_impl(
   torch::Tensor vt8 = torch::empty({Nb, Nh_kv, kHeadDim, Nkv_pad}, opts_u8);
   torch::Tensor q_scale = torch::empty({Nb * Nh, n_rb_q}, opts_f32);
   torch::Tensor k_scale = torch::empty({Nb * Nh_kv, n_rb_kv}, opts_f32);
-  torch::Tensor v_scale = torch::empty({Nb * Nh_kv, n_rb_kv}, opts_f32);
-  const bool pquant_per_row = getenv("FFPA_FP8_PQUANT_PER_ROW") != nullptr;
+  // Per-channel V (along D, amax over N) -- sage style. Re-quantize V,
+  // overwriting the per-block vt8/v_scale produced above. Scale stays 448.
+  // v_perchannel / v_smooth_mean are resolved from API params at the top of
+  // this function.
+  torch::Tensor v_scale = v_perchannel
+                              ? torch::empty({Nb * Nh_kv, kHeadDim}, opts_f32)
+                              : torch::empty({Nb * Nh_kv, n_rb_kv}, opts_f32);
+  torch::Tensor v_scale_quant =
+      v_perchannel ? torch::empty({Nb * Nh_kv, n_rb_kv}, opts_f32) : v_scale;
 
   const c10::cuda::OptionalCUDAGuard device_guard(Q.device());
   auto stream = at::cuda::getCurrentCUDAStream();
@@ -587,8 +608,42 @@ void launch_cute_fwd_persist_d_fp8_sm120_impl(
       q_ptr, k_ptr, v_ptr, q8.data_ptr(), k8.data_ptr(),
       reinterpret_cast<__nv_fp8_e4m3*>(vt8.data_ptr()),
       q_scale.data_ptr<float>(), k_scale.data_ptr<float>(),
-      v_scale.data_ptr<float>(), Nb, Nh, Nh_kv, Nq, Nkv, Nkv_pad, kHeadDim,
-      stream, km_ptr);
+      v_scale_quant.data_ptr<float>(), Nb, Nh, Nh_kv, Nq, Nkv, Nkv_pad,
+      kHeadDim, stream, km_ptr);
+
+  // Per-channel V (sage-style): re-quantize V with per-D scale via coalesced
+  // stats (sum+max+min -> mean+amax) + quantize/transpose. smooth_v subtracts
+  // the per-D mean (residual amax); the per-block vt8/v_scale are overwritten.
+  torch::Tensor vm, v_partials_sum, v_partials_max, v_partials_min;
+  float* vm_ptr = nullptr;
+  if (v_perchannel) {
+    const int stats_chunks = (Nkv + ffpa_fp8::kVStatsRowsPerChunk - 1) /
+                             ffpa_fp8::kVStatsRowsPerChunk;
+    v_partials_sum =
+        torch::empty({Nb * Nh_kv, stats_chunks, kHeadDim}, opts_f32);
+    v_partials_max =
+        torch::empty({Nb * Nh_kv, stats_chunks, kHeadDim}, opts_f32);
+    v_partials_min =
+        torch::empty({Nb * Nh_kv, stats_chunks, kHeadDim}, opts_f32);
+    vm = torch::empty({Nb * Nh_kv, kHeadDim}, opts_f32);
+    vm_ptr = vm.data_ptr<float>();
+    if (v_smooth_mean) {
+      ffpa_fp8::launch_quantize_fp8_vt_perchannel_sm120<kDataType, kBr, kBc,
+                                                        kHeadDim, true>(
+          v_ptr, reinterpret_cast<__nv_fp8_e4m3*>(vt8.data_ptr()),
+          v_scale.data_ptr<float>(), vm_ptr, v_partials_sum.data_ptr<float>(),
+          v_partials_max.data_ptr<float>(), v_partials_min.data_ptr<float>(),
+          Nb, Nh_kv, Nkv, Nkv_pad, stream);
+    } else {
+      ffpa_fp8::launch_quantize_fp8_vt_perchannel_sm120<kDataType, kBr, kBc,
+                                                        kHeadDim, false>(
+          v_ptr, reinterpret_cast<__nv_fp8_e4m3*>(vt8.data_ptr()),
+          v_scale.data_ptr<float>(), vm_ptr, v_partials_sum.data_ptr<float>(),
+          v_partials_max.data_ptr<float>(), v_partials_min.data_ptr<float>(),
+          Nb, Nh_kv, Nkv, Nkv_pad, stream);
+    }
+  }
+  const float* vm_kernel = v_smooth_mean ? vm_ptr : nullptr;
 
   const int total_q_rows = Nb * Nh * Nq;
   const int total_kv_rows = Nb * Nh_kv * Nkv;
@@ -645,12 +700,31 @@ void launch_cute_fwd_persist_d_fp8_sm120_impl(
         tma_q, tma_k, tma_v, tma_o, O_ptr, softmax_lse_ptr,
         q_scale.data_ptr<float>(), k_scale.data_ptr<float>(),
         v_scale.data_ptr<float>(), Nq, Nkv, Nh, Nh_kv, scale, Tc, causal,
-        total_q_rows, total_kv_rows, n_rb_q, n_rb_kv, km_f32_ptr);
+        total_q_rows, total_kv_rows, n_rb_q, n_rb_kv, km_f32_ptr, vm_kernel);
   };
   if (pquant_per_row) {
     launch_kernel(
         ffpa_fp8::persist_d_ws_fwd_cute_fp8_sm120<Traits, ElementO, TmaQ, TmaK,
                                                   TmaV, TmaO, true>);
+  } else if (v_perchannel && pv_acc_f16) {
+    // Per-channel V + fp16 PV accumulator: sage-style per-D V scale plus the
+    // f8f8f16 PV path that avoids the 22-bit f8f8f32 accumulator loss.
+    launch_kernel(ffpa_fp8::persist_d_ws_fwd_cute_fp8_sm120<
+                  Traits, ElementO, TmaQ, TmaK, TmaV, TmaO, false, true, true>);
+  } else if (v_perchannel) {
+    // Per-channel V (sage-style): V per-D scale, P uses fixed 448; epilogue
+    // dequants per-D. Targets real VLM/diffusion data with per-D outliers
+    // (per-block V over-saturates them). See persist_d.cuh kVPerChannel.
+    launch_kernel(
+        ffpa_fp8::persist_d_ws_fwd_cute_fp8_sm120<
+            Traits, ElementO, TmaQ, TmaK, TmaV, TmaO, false, false, true>);
+  } else if (pv_acc_f16) {
+    // f8f8f16 PV (fp16 MMA accumulator, absorbs to float o_acc each
+    // kv_tile) avoids the 22-bit f8f8f32 accumulator loss on causal early
+    // rows. See persist_d.cuh kPVAccF16.
+    launch_kernel(
+        ffpa_fp8::persist_d_ws_fwd_cute_fp8_sm120<Traits, ElementO, TmaQ, TmaK,
+                                                  TmaV, TmaO, false, true>);
   } else {
     launch_kernel(
         ffpa_fp8::persist_d_ws_fwd_cute_fp8_sm120<Traits, ElementO, TmaQ, TmaK,
@@ -663,32 +737,27 @@ void launch_cute_fwd_persist_d_fp8_sm120(
     torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O,
     torch::Tensor attn_bias, torch::Tensor softmax_lse, int causal,
     double softmax_scale, double dropout_p, int64_t philox_seed,
-    int64_t philox_offset, bool smooth_k, std::optional<bool> qk_int8_opt) {
-  // QK dtype tri-state: explicit qk_int8 wins; else FFPA_FP8_QK_INT8
-  // (=1 forces int8, =0 forces fp8); else auto-selects int8 for causal
-  // (early-row accuracy limit, see the masking-pass comment in
-  // persist_d.cuh; int8 QK fixes its dS part at ~zero causal cost)
-  // and fp8 otherwise (dense pays ~7.5% for no gain).
+    int64_t philox_offset, bool smooth_k, bool smooth_v, int64_t q_quant_method,
+    int64_t k_quant_method, int64_t v_quant_method, int64_t pv_acc_type,
+    int64_t qk_mm_type) {
+  // qk_mm_type: 0=fp8 (e4m3 QK MMA), 1=int8 (s8xs8->s32). Default fp8;
+  // int8 fixes the causal early-row dS accuracy limit at ~zero cost.
   // if constexpr keeps the impl (and its kernel) out of instantiation for
   // unsupported headdims; every headdim TU includes this launcher template.
   if constexpr (kHeadDim == 64 || kHeadDim == 128) {
-    bool qk_int8;
-    if (qk_int8_opt.has_value()) {
-      qk_int8 = *qk_int8_opt;
-    } else {
-      const char* qk_int8_env = getenv("FFPA_FP8_QK_INT8");
-      qk_int8 = qk_int8_env != nullptr ? qk_int8_env[0] != '0' : (causal != 0);
-    }
+    const bool qk_int8 = (qk_mm_type == 1);
     if (qk_int8)
       launch_cute_fwd_persist_d_fp8_sm120_impl<kDataType, kHeadDim, kStage,
                                                true>(
           Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale, dropout_p,
-          philox_seed, philox_offset, smooth_k);
+          philox_seed, philox_offset, smooth_k, smooth_v, q_quant_method,
+          k_quant_method, v_quant_method, pv_acc_type);
     else
       launch_cute_fwd_persist_d_fp8_sm120_impl<kDataType, kHeadDim, kStage,
                                                false>(
           Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale, dropout_p,
-          philox_seed, philox_offset, smooth_k);
+          philox_seed, philox_offset, smooth_k, smooth_v, q_quant_method,
+          k_quant_method, v_quant_method, pv_acc_type);
   } else {
     TORCH_CHECK(false,
                 "ffpa_attn: cute_tma_fp8 requires D=64/128, got D=", kHeadDim);
@@ -847,21 +916,14 @@ void launch_cute_fwd_split_d_fp8_sm120(
     torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O,
     torch::Tensor attn_bias, torch::Tensor softmax_lse, int causal,
     double softmax_scale, double dropout_p, int64_t philox_seed,
-    int64_t philox_offset, bool smooth_k, std::optional<bool> qk_int8_opt) {
-  // Same qk_int8 tri-state as persist_d: explicit param > FFPA_FP8_QK_INT8
-  // env ("1"/"0") > auto (causal -> int8 for early-row accuracy, dense fp8).
+    int64_t philox_offset, bool smooth_k, int64_t qk_mm_type) {
+  // qk_mm_type: 0=fp8, 1=int8. Same encoding as persist_d.
   // EXPERIMENT: upper bound widened from <768 to <=1024 so M8N1 can be A/B'd
   // against M4N2 across all large headdims via FFPA_FP8_FORCE_KERNEL. M8N1 at
   // D>=768 is expected to heavy-spill (O=D/2 regs); production dispatch still
   // selects it only for D<768 via the top-level launcher.
   if constexpr (kHeadDim > 128 && kHeadDim <= 1024 && kHeadDim % 64 == 0) {
-    bool qk_int8;
-    if (qk_int8_opt.has_value()) {
-      qk_int8 = *qk_int8_opt;
-    } else {
-      const char* qk_int8_env = getenv("FFPA_FP8_QK_INT8");
-      qk_int8 = qk_int8_env != nullptr ? qk_int8_env[0] != '0' : (causal != 0);
-    }
+    const bool qk_int8 = (qk_mm_type == 1);
     if (qk_int8)
       launch_cute_fwd_split_d_fp8_sm120_impl<kDataType, kHeadDim, kStage, true>(
           Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale, dropout_p,
@@ -1033,19 +1095,13 @@ void launch_cute_fwd_split_d_m4n2_fp8_sm120(
     torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O,
     torch::Tensor attn_bias, torch::Tensor softmax_lse, int causal,
     double softmax_scale, double dropout_p, int64_t philox_seed,
-    int64_t philox_offset, bool smooth_k, std::optional<bool> qk_int8_opt) {
+    int64_t philox_offset, bool smooth_k, int64_t qk_mm_type) {
   // EXPERIMENT: lower bound lowered from >=768 to >=192 so M4N2 can be A/B'd
   // against M8N1 across all large headdims via FFPA_FP8_FORCE_KERNEL.
   // Production dispatch selects M4N2 only for D>=768 via the top-level
   // launcher.
   if constexpr (kHeadDim >= 192 && kHeadDim <= 1024 && kHeadDim % 64 == 0) {
-    bool qk_int8;
-    if (qk_int8_opt.has_value()) {
-      qk_int8 = *qk_int8_opt;
-    } else {
-      const char* qk_int8_env = getenv("FFPA_FP8_QK_INT8");
-      qk_int8 = qk_int8_env != nullptr ? qk_int8_env[0] != '0' : (causal != 0);
-    }
+    const bool qk_int8 = (qk_mm_type == 1);
     if (qk_int8)
       launch_cute_fwd_split_d_m4n2_fp8_sm120_impl<kDataType, kHeadDim, kStage,
                                                   true>(

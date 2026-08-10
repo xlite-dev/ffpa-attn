@@ -41,7 +41,8 @@ using CtaBarrier = cutlass::arch::ClusterBarrier;
 //           PV accumulates directly into o_acc, single dequant in epilogue.
 //           Faster, slightly coarser for rows whose max(P) << 1. Default.
 template <typename Traits, typename ElementO, typename TmaQ, typename TmaK,
-          typename TmaV, typename TmaO, bool kPQuantPerRow = false>
+          typename TmaV, typename TmaO, bool kPQuantPerRow = false,
+          bool kPVAccF16 = false, bool kVPerChannel = false>
 __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp8_sm120(
     CUTLASS_GRID_CONSTANT TmaQ const tma_q,
     CUTLASS_GRID_CONSTANT TmaK const tma_k,
@@ -51,7 +52,8 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp8_sm120(
     const float* __restrict__ k_scale, const float* __restrict__ v_scale,
     int Nq, int Nkv, int Nh, int Nh_kv, float scale, int Tc, int causal,
     int total_q_rows, int total_kv_rows, int n_rb_q, int n_rb_kv,
-    const float* __restrict__ km = nullptr) {
+    const float* __restrict__ km = nullptr,
+    const float* __restrict__ vm = nullptr) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
   using namespace cute;
   using Element = typename Traits::Element;      // float_e4m3_t (V/PV)
@@ -61,6 +63,7 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp8_sm120(
   using SmemLayoutV = typename Traits::SmemLayoutV;
   using TiledMmaQK = typename Traits::TiledMmaQK;
   using TiledMmaPV = typename Traits::TiledMmaPV;
+  using TiledMmaPVf16 = typename Traits::TiledMmaPVf16;
   using SmemCopyAtom = typename Traits::SmemCopyAtom;
   using SmemCopyAtomQK = typename Traits::SmemCopyAtomQK;
   using SmemLayoutO = typename Traits::SmemLayoutO;
@@ -247,6 +250,7 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp8_sm120(
 
   TiledMmaQK tiled_mma_qk;
   TiledMmaPV tiled_mma_pv;
+  [[maybe_unused]] TiledMmaPVf16 tiled_mma_pv_f16;
   auto thr_mma_qk = tiled_mma_qk.get_thread_slice(wg_tid);
   auto thr_mma_pv = tiled_mma_pv.get_thread_slice(wg_tid);
 
@@ -256,6 +260,14 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp8_sm120(
   auto s2r_thr_q = s2r_copy_q.get_thread_slice(wg_tid);
   auto s2r_thr_k = s2r_copy_k.get_thread_slice(wg_tid);
   auto s2r_thr_v = s2r_copy_v.get_thread_slice(wg_tid);
+  // f16 PV path: B-side (V fragment + smem copy) must derive from the f16
+  // TiledMma, else CuTe gemm silently no-ops (A/B layouts match the f32 atom
+  // logically, but the f16 mma needs its own thread-slice partition).
+  [[maybe_unused]] auto thr_mma_pv_f16 =
+      tiled_mma_pv_f16.get_thread_slice(wg_tid);
+  [[maybe_unused]] auto s2r_copy_v_f16 =
+      make_tiled_copy_B(SmemCopyAtom{}, tiled_mma_pv_f16);
+  [[maybe_unused]] auto s2r_thr_v_f16 = s2r_copy_v_f16.get_thread_slice(wg_tid);
 
   using OFragType = decltype(partition_fragment_C(
       tiled_mma_pv, Shape<Int<kBr>, Int<kHeadDim>>{}));
@@ -310,7 +322,12 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp8_sm120(
     const int v_phase = (kv_tile / kStagesV) & 1;
 
     const float ks = k_scale[static_cast<long>(kv_bh) * n_rb_kv + kv_tile];
-    const float vs = v_scale[static_cast<long>(kv_bh) * n_rb_kv + kv_tile];
+    // Per-channel V: v_scale is (bh, D) per-D; vs is unused (P uses fixed
+    // 448 scale, epilogue dequants per-D). Avoid reading the per-kv-tile
+    // slot (wrong buffer shape).
+    const float vs =
+        kVPerChannel ? 1.0f
+                     : v_scale[static_cast<long>(kv_bh) * n_rb_kv + kv_tile];
     const float s_dequant = qs * ks;  // linear dequant of S
 
     // QK GEMM: fp8xfp8->fp32, or int8xint8->s32 when kQKInt8.
@@ -376,7 +393,15 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp8_sm120(
     }
 
     float row_scale[kORows];
-    const float vs448 = vs * kE4m3Max;
+    // p_quant_scale is P's fp8 quantization multiplier (P8 = softmax *
+    // p_quant_scale). Per-block: vs * 448 = amax_block, chosen so vs cancels in
+    // PV MMA ->
+    //   o_acc lives in a single 448x domain (vs抵消是 fixed mode 统一域的前提).
+    // Per-channel: 1.0, so P8 = softmax lands in e4m3's precise [0,1] range.
+    //   Valid because amax_d is global (not per-tile), so o_acc's scale
+    //   (448/amax_d) is uniform across tiles -> single epilogue dequant.
+    //   (vs448=448 would push P8 into [224,448] where e4m3 ULP=32.)
+    const float p_quant_scale = kVPerChannel ? 1.0f : (vs * kE4m3Max);
     if constexpr (kPQuantPerRow) {
       if (!tile_needs_mask) {
         const float sd = s_dequant * scale;
@@ -391,17 +416,17 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp8_sm120(
                                              row_sum, row_scale,
                                              Traits::kRescaleThreshold);
     } else {
-      // Fixed mode: fold the P quant scale vs*448 into the exp2 offset so the
-      // softmax emits P*vs*448 directly; row_sum is folded back to the true
-      // probability domain inside (see fp8_pscale.cuh). Unmasked tiles defer
-      // the s_dequant multiply into the softmax (one multiply per exp instead
-      // of a separate scale pass over all 64 scores).
+      // Fixed mode: fold the P quant scale into the exp2 offset so the
+      // softmax emits P*p_quant_scale directly; row_sum is folded back to
+      // the true probability domain inside (see fp8_pscale.cuh). Unmasked
+      // tiles defer the s_dequant multiply into the softmax.
       const float softmax_scale_eff =
           tile_needs_mask ? 1.0f : s_dequant * scale;
       online_softmax_fp8_fixed<true, decltype(scores), decltype(tScS_rc),
                                kORows>(
           scores, tScS_rc, softmax_scale_eff, row_max, row_sum, row_scale,
-          log2f(vs448), 1.0f / vs448, Traits::kRescaleThreshold);
+          log2f(p_quant_scale), 1.0f / p_quant_scale,
+          Traits::kRescaleThreshold);
     }
 
     // Rescale o_acc (online softmax); deferred until p_scale is known.
@@ -462,10 +487,35 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp8_sm120(
     } else {
       // Tensor-core row sum over the quantized P regs (replaces the fp32
       // FADD/shfl reduction; softmax<true> only rescaled row_sum so far).
-      pscale_rowsum_mma(tCrP, row_sum, 1.0f / vs448);
-      auto tCrO = make_tensor(make_rmem_ptr(o_acc), OFragLayout{});
-      ffpa_cute::gemm_rs(tCrO, tCrP, tCrV, tVsV_s2r, tiled_mma_pv, s2r_copy_v,
-                         s2r_thr_v);
+      pscale_rowsum_mma(tCrP, row_sum, 1.0f / p_quant_scale);
+      if constexpr (kPVAccF16) {
+        // f8f8f16 PV: accumulate P@V into an fp16 MMA accumulator (cuts o_acc
+        // out of the tensor-core feedback chain, avoiding the 22-bit f8f8f32
+        // accumulator loss on causal early rows), then absorb to float o_acc
+        // via CUDA-core FADD. B-side derives from the f16 TiledMma.
+        auto tCrV_f16 = thr_mma_pv_f16.partition_fragment_B(sV);
+        auto tVsV_s2r_f16 = s2r_thr_v_f16.partition_S(sV);
+        auto tCrInst = partition_fragment_C(tiled_mma_pv_f16,
+                                            Shape<Int<kBr>, Int<kHeadDim>>{});
+        clear(tCrInst);
+        ffpa_cute::gemm_rs(tCrInst, tCrP, tCrV_f16, tVsV_s2r_f16,
+                           tiled_mma_pv_f16, s2r_copy_v_f16, s2r_thr_v_f16);
+        auto tCrO = make_tensor(make_rmem_ptr(o_acc), OFragLayout{});
+        auto tCrO_rc = make_tensor(
+            tCrO.data(), ffpa_cute::convert_layout_acc_rowcol(tCrO.layout()));
+        auto tCrInst_rc =
+            make_tensor(tCrInst.data(),
+                        ffpa_cute::convert_layout_acc_rowcol(tCrInst.layout()));
+#pragma unroll
+        for (int row = 0; row < kORows; ++row)
+#pragma unroll
+          for (int col = 0; col < kOCols; ++col)
+            tCrO_rc(row, col) += float(tCrInst_rc(row, col));
+      } else {
+        auto tCrO = make_tensor(make_rmem_ptr(o_acc), OFragLayout{});
+        ffpa_cute::gemm_rs(tCrO, tCrP, tCrV, tVsV_s2r, tiled_mma_pv, s2r_copy_v,
+                           s2r_thr_v);
+      }
     }
     CtaBarrier::arrive(&v_empty[v_stg]);
   }
@@ -487,13 +537,45 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp8_sm120(
     auto tCrO = make_tensor(make_rmem_ptr(o_acc), OFragLayout{});
     auto tCrO_rc = make_tensor(
         tCrO.data(), ffpa_cute::convert_layout_acc_rowcol(tCrO.layout()));
+    // Per-channel V: dequant per-D in the epilogue. Load this thread's vs_d
+    // cols via PV C-fragment D coords (cD/tScD), fold vs_d[col]/448 into mul.
+    // (Per-block path folds vs into P via vs448, needs no epilogue dequant.)
+    float vs_d_col[kVPerChannel ? kOCols : 1];
+    float vm_d_col[kVPerChannel ? kOCols : 1];
+    const float* vm_base = nullptr;
+    if constexpr (kVPerChannel) {
+      auto cD = make_identity_tensor(Shape<Int<kBr>, Int<kHeadDim>>{});
+      auto tScD = thr_mma_pv.partition_C(cD);
+      auto tScD_rc = make_tensor(
+          tScD.data(), ffpa_cute::convert_layout_acc_rowcol(tScD.layout()));
+      const float* vs_d_base = v_scale + static_cast<long>(kv_bh) * kHeadDim;
+      vm_base = vm ? (vm + static_cast<long>(kv_bh) * kHeadDim) : nullptr;
+#pragma unroll
+      for (int col = 0; col < kOCols; ++col) {
+        const int d_idx = get<1>(tScD_rc(0, col));
+        vs_d_col[col] = vs_d_base[d_idx];
+        if (vm_base)
+          vm_d_col[col] = vm_base[d_idx];
+      }
+    }
 #pragma unroll
     for (int row = 0; row < kORows; ++row) {
       const float inv_sum = (row_sum[row] == 0.0f) ? 1.0f : 1.0f / row_sum[row];
-      const float mul = kPQuantPerRow ? inv_sum : inv_sum * kFP8FixedPScale;
 #pragma unroll
-      for (int col = 0; col < kOCols; ++col)
+      for (int col = 0; col < kOCols; ++col) {
+        float mul;
+        if constexpr (kVPerChannel) {
+          // Per-channel V, p_quant_scale=1: P8=softmax (range [0,1]),
+          // V8=V/vs_d, MMA=(1/vs_d)*O_unnorm. Dequant mul=inv_sum*vs_d.
+          // smooth_v: V8=(V-mean)/vs_d so O += mean_d after normalize.
+          mul = inv_sum * vs_d_col[col];
+        } else {
+          mul = kPQuantPerRow ? inv_sum : inv_sum * kFP8FixedPScale;
+        }
         tCrO_rc(row, col) *= mul;
+        if (vm_base)
+          tCrO_rc(row, col) += vm_d_col[col];
+      }
     }
     auto tCrOHalf = ffpa_cute::convert_type<ElementO>(tCrO);
 

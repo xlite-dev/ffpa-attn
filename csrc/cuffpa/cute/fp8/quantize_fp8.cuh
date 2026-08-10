@@ -4,6 +4,8 @@
 #include <cstdint>
 #include <type_traits>
 
+#include "smooth_v.cuh"
+
 namespace ffpa_fp8 {
 
 // 8-elem (16-byte) vector for coalesced fp16/bf16 quantize I/O.
@@ -495,6 +497,130 @@ __global__ void quantize_fp8_qkv_fused_kernel(
       __syncthreads();
     }
   }
+}
+
+// Quantize + transpose V[N, D] -> VT[D, N_pad] with a per-D scale. Same smem
+// staging tile as quantize_fp8_vt_kernel, but the scale is read per-D from
+// v_scale[bh, D] instead of computed as a per-tile amax.
+template <typename Element, int kBlockRows, int kD>
+__global__ void quantize_fp8_vt_perchannel_kernel(
+    const Element* __restrict__ V,    // (B, H, N, D) row-major
+    __nv_fp8_e4m3* __restrict__ VT,   // flat [B*Nh_kv*D, Nkv_pad]
+    const float* __restrict__ scale,  // (B*Nh_kv, D)
+    const float* __restrict__ vm,     // (B*Nh_kv, D) per-D mean, or nullptr
+    int N, int Nh_kv, int ldy) {
+  constexpr int D = kD;
+  constexpr int kPad = 16;
+  constexpr int kVec = 8;
+  constexpr int kThreads = 128;
+  constexpr int dv = D / kVec;
+  const int rb = blockIdx.x;
+  const int bh = blockIdx.y;
+  const int row0 = rb * kBlockRows;
+  const int tid = threadIdx.x;
+  const int warp = tid / 32;
+  const int lane = tid % 32;
+  constexpr int kWarps = kThreads / 32;
+
+  extern __shared__ __nv_fp8_e4m3 tile_sh[];
+  constexpr int kDChunk = (D < 256) ? D : 256;
+  constexpr int kNDChunks = (D + kDChunk - 1) / kDChunk;
+  using TileRow = __nv_fp8_e4m3[kDChunk + kPad];
+  TileRow* tile = reinterpret_cast<TileRow*>(tile_sh);
+
+  constexpr int total = kBlockRows * dv;
+  constexpr int n_chunks_per_thread = total / kThreads;
+  static_assert(total % kThreads == 0);
+
+  const Element* v_bh = V + static_cast<long>(bh) * N * D;
+  const float* scale_bh = scale + static_cast<long>(bh) * D;
+  const float* vm_bh = vm ? (vm + static_cast<long>(bh) * D) : nullptr;
+  using VecIn = Vec8<Element>;
+
+  VecIn regs[n_chunks_per_thread];
+#pragma unroll
+  for (int j = 0; j < n_chunks_per_thread; ++j) {
+    const int i = tid + j * kThreads;
+    const int r = i / dv;
+    const int c = i % dv;
+    VecIn v = Vec8<Element>::zero();
+    if (row0 + r < N)
+      v = reinterpret_cast<const VecIn*>(v_bh +
+                                         static_cast<long>(row0 + r) * D)[c];
+    regs[j] = v;
+  }
+
+  const long vt_base = static_cast<long>(bh) * D * ldy;
+  for (int dci = 0; dci < kNDChunks; ++dci) {
+    const int dc = dci * kDChunk;
+    const int d_end = (dc + kDChunk < D) ? dc + kDChunk : D;
+    const int dc_vec = dc / kVec;
+    const int d_vec_end = d_end / kVec;
+#pragma unroll 1
+    for (int j = 0; j < n_chunks_per_thread; ++j) {
+      const int i_local = tid + j * kThreads;
+      const int r = i_local / dv;
+      const int c_vec = i_local % dv;
+      if (c_vec < dc_vec || c_vec >= d_vec_end)
+        continue;
+      const int c_local = c_vec - dc_vec;
+      const VecIn v = regs[j];
+      uint32_t pack[2];
+#pragma unroll
+      for (int h = 0; h < 2; ++h) {
+        __nv_fp8_e4m3* ob = reinterpret_cast<__nv_fp8_e4m3*>(&pack[h]);
+#pragma unroll
+        for (int e = 0; e < 4; ++e) {
+          const int d = dc + c_local * kVec + h * 4 + e;
+          float x = static_cast<float>(v.elem[h * 4 + e]);
+          if (vm_bh)
+            x -= vm_bh[d];
+          ob[e] = __nv_fp8_e4m3(x / scale_bh[d]);
+        }
+      }
+      uint32_t* dst = reinterpret_cast<uint32_t*>(&tile[r][c_local * kVec]);
+      dst[0] = pack[0];
+      dst[1] = pack[1];
+    }
+    __syncthreads();
+
+#pragma unroll 1
+    for (int it = warp * 4; it < (d_end - dc); it += kWarps * 4) {
+#pragma unroll
+      for (int cc = 0; cc < 4; ++cc) {
+        const int c = dc + it + cc;
+#pragma unroll
+        for (int t = 0; t < kBlockRows / 32; ++t) {
+          const int n = t * 32 + lane;
+          if (row0 + n < N)
+            VT[vt_base + static_cast<long>(c) * ldy + row0 + n] =
+                tile[n][it + cc];
+        }
+      }
+    }
+    __syncthreads();
+  }
+}
+
+// Per-channel V quantize: coalesced stats (sum+max+min -> mean+amax) then
+// quantize+transpose. kSmoothV: residual amax + mean subtract; else absolute
+// amax, no mean subtract (vm_quant=nullptr).
+template <typename Element, int kBr, int kBc, int kHeadDim, bool kSmoothV>
+void launch_quantize_fp8_vt_perchannel_sm120(
+    const Element* v_ptr, __nv_fp8_e4m3* vt8, float* v_scale, float* vm,
+    float* partials_sum, float* partials_max, float* partials_min, int B,
+    int Nh_kv, int Nkv, int Nkv_pad, cudaStream_t stream) {
+  launch_v_stats_sm120<Element, kHeadDim, kSmoothV>(
+      v_ptr, vm, v_scale, partials_sum, partials_max, partials_min, B, Nh_kv,
+      Nkv, stream);
+  constexpr int kDChunk = (kHeadDim < 256) ? kHeadDim : 256;
+  constexpr int kVtSmemBytes = kBc * (kDChunk + 16);
+  dim3 grid_q((Nkv + kBc - 1) / kBc, B * Nh_kv);
+  auto kernel = quantize_fp8_vt_perchannel_kernel<Element, kBc, kHeadDim>;
+  cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                       kVtSmemBytes);
+  kernel<<<grid_q, 128, kVtSmemBytes, stream>>>(
+      v_ptr, vt8, v_scale, kSmoothV ? vm : nullptr, Nkv, Nh_kv, Nkv_pad);
 }
 
 // Quantize Q/K row-major and V transposed (D, N); scales per (bh, row-block).

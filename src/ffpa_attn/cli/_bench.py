@@ -322,8 +322,23 @@ def _parse_args() -> argparse.Namespace:
   parser.add_argument(
     "--cuda-impl",
     choices=[
-      "auto", "native", "tma", "cute", "cute_tma", "cute_tma_fp8", "fp8",
-      "cute_tma_fp8_smk", "fp8_smk", "cute_tma_fp8_smk_qk_int8", "fp8_smk_qk_i8"
+      "auto",
+      "native",
+      "tma",
+      "cute",
+      "cute_tma",
+      "cute_tma_fp8",
+      "fp8",
+      "cute_tma_fp8_smk",
+      "fp8_smk",
+      "cute_tma_fp8_smk_qk_int8",
+      "fp8_smk_qk_i8",
+      "cute_tma_fp8_smv",
+      "fp8_smv",
+      "cute_tma_fp8_smkv",
+      "fp8_smkv",
+      "cute_tma_fp8_smkv_qk_int8",
+      "fp8_smkv_qk_i8",
     ],
     default="auto",
     help="CUDA forward kernel implementation hint (--fwd-backend cuda only). "
@@ -332,7 +347,59 @@ def _parse_args() -> argparse.Namespace:
     "auto. 'cute_tma_fp8' (alias 'fp8') selects the FP8 path; "
     "'cute_tma_fp8_smk' (alias 'fp8_smk') enables smooth-K; "
     "'cute_tma_fp8_smk_qk_int8' (alias 'fp8_smk_qk_i8') additionally forces "
-    "int8 QK MMA. Mutually exclusive with --fwd-tma/--cute when not 'auto'.",
+    "int8 QK MMA; 'cute_tma_fp8_smv' (alias 'fp8_smv') enables smooth-V "
+    "(per-channel V + dim-mean subtraction, smooth-K off); "
+    "'cute_tma_fp8_smkv' (alias 'fp8_smkv') enables smooth-K + smooth-V; "
+    "'cute_tma_fp8_smkv_qk_int8' (alias 'fp8_smkv_qk_i8') adds int8 QK MMA. "
+    "Mutually exclusive with --fwd-tma/--cute when not 'auto'.",
+  )
+  parser.add_argument(
+    "--fp8-smooth-k",
+    action="store_true",
+    help="FP8 only: force-enable smooth-K (K per-(b,h) seq mean subtraction). "
+    "Overrides the --cuda-impl smooth-K default.",
+  )
+  parser.add_argument(
+    "--fp8-smooth-v",
+    action="store_true",
+    help="FP8 only: force-enable smooth-V (V per-D mean subtraction; "
+    "requires --fp8-v-quant-method=per-channel).",
+  )
+  parser.add_argument(
+    "--fp8-qk-mm-type",
+    dest="qk_mm_type_arg",
+    choices=["fp8", "int8", "f8", "i8"],
+    default=None,
+    help="FP8 only: QK MMA dtype. 'int8'/'i8' forces s8xs8->s32; "
+    "'fp8'/'f8' uses e4m3. Default 'fp8'.",
+  )
+  parser.add_argument(
+    "--fp8-pv-acc-type",
+    dest="pv_acc_type_arg",
+    choices=["f32", "f16"],
+    default=None,
+    help="FP8 only: PV accumulation dtype. 'f16' uses fp16 PV acc "
+    "(faster, minor precision loss); 'f32' uses fp32 (default). "
+    "Only supported on persist_d path (D<=128).",
+  )
+  parser.add_argument(
+    "--fp8-q-quant-method",
+    choices=["per-block", "per-channel"],
+    default=None,
+    help="FP8 only: Q quantization granularity (per-block only for now).",
+  )
+  parser.add_argument(
+    "--fp8-k-quant-method",
+    choices=["per-block", "per-channel"],
+    default=None,
+    help="FP8 only: K quantization granularity (per-block only for now).",
+  )
+  parser.add_argument(
+    "--fp8-v-quant-method",
+    choices=["per-block", "per-channel"],
+    default=None,
+    help="FP8 only: V quantization granularity. 'per-channel' enables "
+    "sage-style per-D scale.",
   )
   parser.add_argument(
     "--enable-bwd-tma",
@@ -449,13 +516,48 @@ def _resolve_directional_cli_flags(
         "fp8_smk",
         "cute_tma_fp8_smk_qk_int8",
         "fp8_smk_qk_i8",
+        "cute_tma_fp8_smv",
+        "fp8_smv",
+        "cute_tma_fp8_smkv",
+        "fp8_smkv",
+        "cute_tma_fp8_smkv_qk_int8",
+        "fp8_smkv_qk_i8",
       }
-      _FP8_QK_INT8_IMPLS = {"cute_tma_fp8_smk_qk_int8", "fp8_smk_qk_i8"}
+      _FP8_QK_INT8_IMPLS = {
+        "cute_tma_fp8_smk_qk_int8",
+        "fp8_smk_qk_i8",
+        "cute_tma_fp8_smkv_qk_int8",
+        "fp8_smkv_qk_i8",
+      }
+      # smooth_v implies per-channel V quant; smooth_v-only (smv) keeps
+      # smooth_k off, smkv turns both on.
+      _FP8_SMOOTH_V_IMPLS = {
+        "cute_tma_fp8_smv",
+        "fp8_smv",
+        "cute_tma_fp8_smkv",
+        "fp8_smkv",
+        "cute_tma_fp8_smkv_qk_int8",
+        "fp8_smkv_qk_i8",
+      }
+      _FP8_SMOOTH_V_ONLY_IMPLS = {"cute_tma_fp8_smv", "fp8_smv"}
       if args.cuda_impl in _FP8_IMPLS:
         args.enable_fwd_tma, args.enable_fwd_cute = True, True
         args.enable_fp8 = True
-        args.smooth_k = True
-        args.qk_int8 = True if args.cuda_impl in _FP8_QK_INT8_IMPLS else None
+        if args.cuda_impl in _FP8_SMOOTH_V_ONLY_IMPLS:
+          args.smooth_k = False
+          args.smooth_v = True
+          args.v_quant_method = "per_channel"
+        elif args.cuda_impl in _FP8_SMOOTH_V_IMPLS:
+          args.smooth_k = True
+          args.smooth_v = True
+          args.v_quant_method = "per_channel"
+        else:
+          args.smooth_k = True
+          args.smooth_v = False
+          args.v_quant_method = "per_block"
+        args.qk_mm_type = (
+          "int8" if args.cuda_impl in _FP8_QK_INT8_IMPLS else "fp8"
+        )
       else:
         args.enable_fwd_tma, args.enable_fwd_cute = _CUDA_IMPL_MAP[
           args.cuda_impl]
@@ -465,12 +567,40 @@ def _resolve_directional_cli_flags(
     args.enable_fwd_tma = bool(args.enable_fwd_tma)
   if args.enable_persist_dkdv and not args.enable_bwd_tma:
     raise SystemExit("--enable-persist-dkdv requires --enable-bwd-tma")
+  # Explicit --fp8-* flags override the --cuda-impl / auto defaults.
+  if args.fp8_smooth_k:
+    args.smooth_k = True
+  if args.fp8_smooth_v:
+    args.smooth_v = True
+  _QK_MM_ALIAS = {"f8": "fp8", "i8": "int8"}
+  if getattr(args, "qk_mm_type_arg", None) is not None:
+    args.qk_mm_type = _QK_MM_ALIAS.get(args.qk_mm_type_arg, args.qk_mm_type_arg)
+  if getattr(args, "pv_acc_type_arg", None) is not None:
+    args.pv_acc_type = args.pv_acc_type_arg
+  for _cli_attr, _py_attr in (
+    ("fp8_q_quant_method", "q_quant_method"),
+    ("fp8_k_quant_method", "k_quant_method"),
+    ("fp8_v_quant_method", "v_quant_method"),
+  ):
+    _val = getattr(args, _cli_attr, None)
+    if _val is not None:
+      setattr(args, _py_attr, _val.replace("-", "_"))
   if not hasattr(args, "enable_fp8"):
     args.enable_fp8 = False
   if not hasattr(args, "smooth_k"):
     args.smooth_k = True
-  if not hasattr(args, "qk_int8"):
-    args.qk_int8 = None
+  if not hasattr(args, "smooth_v"):
+    args.smooth_v = False
+  if not hasattr(args, "q_quant_method"):
+    args.q_quant_method = "per_block"
+  if not hasattr(args, "k_quant_method"):
+    args.k_quant_method = "per_block"
+  if not hasattr(args, "v_quant_method"):
+    args.v_quant_method = "per_block"
+  if not hasattr(args, "pv_acc_type"):
+    args.pv_acc_type = "f32"
+  if not hasattr(args, "qk_mm_type"):
+    args.qk_mm_type = "fp8"
   return args
 
 
@@ -1548,7 +1678,12 @@ def _benchmark_rows(
         enable_cute=args.enable_fwd_cute,
         enable_fp8=args.enable_fp8,
         smooth_k=args.smooth_k,
-        qk_int8=args.qk_int8,
+        smooth_v=args.smooth_v,
+        q_quant_method=args.q_quant_method,
+        k_quant_method=args.k_quant_method,
+        v_quant_method=args.v_quant_method,
+        pv_acc_type=args.pv_acc_type,
+        qk_mm_type=args.qk_mm_type,
         tasks=tasks,
         dtypes=dtypes,
         verbose=args.verbose,

@@ -281,7 +281,8 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
     const float ks = k_scale[static_cast<long>(kv_bh) * n_rb_kv + kv_tile];
     const float vs = v_scale[static_cast<long>(kv_bh) * n_rb_kv + kv_tile];
     const float s_dequant = qs * ks;
-    const float vs448 = vs * kE4m3Max;
+    // P's fp8 quantization multiplier (vs*448 so vs cancels in PV MMA).
+    const float p_quant_scale = vs * kE4m3Max;
 
     // Phase 1: QK GEMM with split-D accumulation.
     auto tCrS = partition_fragment_C(tiled_mma_qk, Shape<Int<kBr>, Int<kBc>>{});
@@ -376,8 +377,8 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
     ffpa_cute::online_softmax_fp8_fixed_m4n2<decltype(scores),
                                              decltype(tScS_rc), kORows>(
         scores, tScS_rc, softmax_scale_eff, row_max, row_sum, row_scale,
-        smem_exchange, warp_id, lane_id, log2f(vs448), 1.0f / vs448,
-        Traits::kRescaleThreshold);
+        smem_exchange, warp_id, lane_id, log2f(p_quant_scale),
+        1.0f / p_quant_scale, Traits::kRescaleThreshold);
 
     bool local_need_rescale = false;
 #pragma unroll

@@ -5,6 +5,7 @@
 
 #include <cute/atom/copy_traits_sm90_tma.hpp>
 #include <cute/arch/cluster_sm90.hpp>
+#include <cute/arch/mma_sm120.hpp>
 #include <cutlass/arch/barrier.h>
 
 namespace ffpa_cute {
@@ -306,6 +307,15 @@ struct FFPAAttnCuTePersistDFP8Traits {
 
   using TiledMmaPV = decltype(make_tiled_mma(
       MmaAtom{}, Layout<Shape<Int<kNumWarps>, _1, _1>>{},
+      Tile<Int<kBr>, Int<kHeadDim>, _32>{}));
+  // f8f8f16 PV atom for the fp16-accumulator inst_buf path (persist_d.cuh):
+  // same m16n8k32 shape, A/B e4m3, but C/D half. Its CLayout matches the f32
+  // atom (both inherit SM80_16x8_Row), so the half inst_buf absorbs into the
+  // float o_acc element-wise via CUDA-core FADD each kv_tile.
+  using MmaAtomPVf16 =
+      MMA_Atom<SM120_16x8x32_TN<Element, Element, cutlass::half_t>>;
+  using TiledMmaPVf16 = decltype(make_tiled_mma(
+      MmaAtomPVf16{}, Layout<Shape<Int<kNumWarps>, _1, _1>>{},
       Tile<Int<kBr>, Int<kHeadDim>, _32>{}));
 
   using SmemCopyAtomQK = Copy_Atom<SM75_U32x4_LDSM_N, ElementQK>;

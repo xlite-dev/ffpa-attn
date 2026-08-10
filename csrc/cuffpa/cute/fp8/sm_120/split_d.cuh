@@ -284,7 +284,9 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
     const float ks = k_scale[static_cast<long>(kv_bh) * n_rb_kv + kv_tile];
     const float vs = v_scale[static_cast<long>(kv_bh) * n_rb_kv + kv_tile];
     const float s_dequant = qs * ks;
-    const float vs448 = vs * kE4m3Max;
+    // P's fp8 quantization multiplier (P8 = softmax * p_quant_scale). Per-block
+    // path: vs*448 = amax_block so vs cancels in PV MMA -> unified o_acc域.
+    const float p_quant_scale = vs * kE4m3Max;
 
     // Phase 1: QK GEMM with split-D accumulation. fp8 accumulates in f32;
     // int8 accumulates in s32 across chunks (exact, <<2^31) and casts once.
@@ -382,7 +384,7 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
     const float softmax_scale_eff = tile_needs_mask ? 1.0f : s_dequant * scale;
     online_softmax_fp8_fixed<true, decltype(scores), decltype(tScS_rc), kORows>(
         scores, tScS_rc, softmax_scale_eff, row_max, row_sum, row_scale,
-        log2f(vs448), 1.0f / vs448, Traits::kRescaleThreshold);
+        log2f(p_quant_scale), 1.0f / p_quant_scale, Traits::kRescaleThreshold);
 
     bool local_need_rescale = false;
 #pragma unroll
@@ -397,7 +399,7 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
                     Layout<Shape<Shape<_4, _2, _2>, _1, Int<kBc / 32>>>{});
     // Tensor-core row sum over the quantized P regs (exact w.r.t. the P the
     // PV MMA consumes); folds vs*448 back out of the probability domain.
-    pscale_rowsum_mma(tCrP, row_sum, 1.0f / vs448);
+    pscale_rowsum_mma(tCrP, row_sum, 1.0f / p_quant_scale);
 
     // Phase 3: PV GEMM over the split-D V chunks.
 #pragma unroll

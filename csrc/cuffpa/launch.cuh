@@ -22,13 +22,13 @@ using namespace ffpa;
 // forward launches always use the architecture-agnostic templates here.
 template <typename kDataType, const int kHeadDim, const int kMmaAccFloat32QK,
           const int kMmaAccFloat32PV, const int kStage>
-void launch_ffpa_attn_fwd_template(torch::Tensor Q, torch::Tensor K,
-                                   torch::Tensor V, torch::Tensor O,
-                                   torch::Tensor attn_bias,
-                                   torch::Tensor softmax_lse, int causal,
-                                   double softmax_scale, double dropout_p,
-                                   int64_t philox_seed, int64_t philox_offset,
-                                   bool smooth_k, std::optional<bool> qk_int8) {
+void launch_ffpa_attn_fwd_template(
+    torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O,
+    torch::Tensor attn_bias, torch::Tensor softmax_lse, int causal,
+    double softmax_scale, double dropout_p, int64_t philox_seed,
+    int64_t philox_offset, bool smooth_k, bool smooth_v, int64_t q_quant_method,
+    int64_t k_quant_method, int64_t v_quant_method, int64_t pv_acc_type,
+    int64_t qk_mm_type) {
   // Q,K,V,O with [B, H, N, D] layout, B=batch, H=head, N=seqlen, D=dim
   // TODO: support BNHD layout, Q,K,V,O with [B, N, H, D] layout.
   // Native block-tile config (MMA atoms, Br/Bc, stages, smem/pad flags) and
@@ -115,24 +115,33 @@ void launch_ffpa_attn_fwd_template(torch::Tensor Q, torch::Tensor K,
     auto prop = at::cuda::getCurrentDeviceProperties();
     if (prop->major >= 9) {
       if (force_fp8) {
+        // q/k only support per-block quant today; per-channel is reserved
+        // for future kernel work.
+        TORCH_CHECK(q_quant_method == 0 && k_quant_method == 0,
+                    "ffpa_attn: q/k_quant_method only supports per_block");
 #ifdef ENABLE_FFPA_CUTE_EXT
         // EXPERIMENT: FFPA_FP8_FORCE_KERNEL=split_d|m4n2 forces a specific
         // split-D kernel to A/B test the M8N1/M4N2 dispatch cross-point.
         // Applies only to 128 < D <= 1024; persist-D (D<=128) is unaffected.
         // Unset -> normal headdim-based dispatch below.
+        // split_d/m4n2 only support per-block V / f32 PV / no smooth_v.
         if constexpr (kHeadDim > 128 && kHeadDim <= 1024) {
           const char* fk = getenv("FFPA_FP8_FORCE_KERNEL");
           if (fk != nullptr) {
+            TORCH_CHECK(v_quant_method == 0 && !smooth_v && pv_acc_type != 0,
+                        "ffpa_attn: split_d/m4n2 fp8 (D>128) supports only "
+                        "v_quant_method=per_block, pv_acc_type=f32, "
+                        "smooth_v=False");
             if (std::strcmp(fk, "split_d") == 0) {
               launch_cute_fwd_split_d_fp8_sm120<kDataType, kHeadDim, kStage>(
                   Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
-                  dropout_p, philox_seed, philox_offset, smooth_k, qk_int8);
+                  dropout_p, philox_seed, philox_offset, smooth_k, qk_mm_type);
               return;
             } else if (std::strcmp(fk, "m4n2") == 0) {
               launch_cute_fwd_split_d_m4n2_fp8_sm120<kDataType, kHeadDim,
                                                      kStage>(
                   Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
-                  dropout_p, philox_seed, philox_offset, smooth_k, qk_int8);
+                  dropout_p, philox_seed, philox_offset, smooth_k, qk_mm_type);
               return;
             }
           }
@@ -144,15 +153,25 @@ void launch_ffpa_attn_fwd_template(torch::Tensor Q, torch::Tensor K,
         if constexpr (kHeadDim <= 128) {
           launch_cute_fwd_persist_d_fp8_sm120<kDataType, kHeadDim, kStage>(
               Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
-              dropout_p, philox_seed, philox_offset, smooth_k, qk_int8);
+              dropout_p, philox_seed, philox_offset, smooth_k, smooth_v,
+              q_quant_method, k_quant_method, v_quant_method, pv_acc_type,
+              qk_mm_type);
         } else if constexpr (kHeadDim < 768) {
+          TORCH_CHECK(v_quant_method == 0 && !smooth_v && pv_acc_type != 0,
+                      "ffpa_attn: split_d fp8 (D>128) supports only "
+                      "v_quant_method=per_block, pv_acc_type=f32, "
+                      "smooth_v=False");
           launch_cute_fwd_split_d_fp8_sm120<kDataType, kHeadDim, kStage>(
               Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
-              dropout_p, philox_seed, philox_offset, smooth_k, qk_int8);
+              dropout_p, philox_seed, philox_offset, smooth_k, qk_mm_type);
         } else {
+          TORCH_CHECK(v_quant_method == 0 && !smooth_v && pv_acc_type != 0,
+                      "ffpa_attn: split_d_m4n2 fp8 (D>=768) supports only "
+                      "v_quant_method=per_block, pv_acc_type=f32, "
+                      "smooth_v=False");
           launch_cute_fwd_split_d_m4n2_fp8_sm120<kDataType, kHeadDim, kStage>(
               Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
-              dropout_p, philox_seed, philox_offset, smooth_k, qk_int8);
+              dropout_p, philox_seed, philox_offset, smooth_k, qk_mm_type);
         }
 #else
         TORCH_CHECK(false, "ffpa_attn: cute ext not compiled");
