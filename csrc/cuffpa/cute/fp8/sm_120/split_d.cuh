@@ -14,6 +14,11 @@
 #include "../reg2reg_8b.cuh"
 #include "../smooth_k.cuh"
 
+// FP8 causal accuracy note: same ESS-rooted early-row amplitude effect as
+// persist_d.cuh (see the detailed math comment there). split_d only supports
+// per-block V / f32 PV acc, so the per-channel-V mitigation is unavailable
+// here; causal early-row abs error is intrinsic to fp8 + small ESS.
+
 namespace ffpa_fp8 {
 
 using TmaBarrier = cutlass::arch::ClusterTransactionBarrier;

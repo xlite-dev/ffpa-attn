@@ -324,6 +324,8 @@ def _run_case(
   qk_mm_type: str = "fp8",
   verbose: bool = False,
   stages: int | None = None,
+  causal_hybrid: bool = False,
+  causal_hybrid_n_early: int = 256,
 ) -> FORWARD_RESULT:
   torch.manual_seed(seed)
   q = torch.randn(B, Nh_q, Nq, D, dtype=dtype, device="cuda")
@@ -352,18 +354,67 @@ def _run_case(
     backward=True
   ) if forward_backend.name == "cutedsl" else None
 
+  # Causal hybrid precision: full fp8 + leading n_early query rows recomputed
+  # in fp16 (contiguous slice), overwriting the fp8 result. Fixes causal
+  # early-row precision loss (ESS root cause; see persist_d.cuh comment).
+  # Zero kernel change: two ffpa_attn_func calls + slice copy.
+  if causal and causal_hybrid and enable_fp8 and forward_backend.name == "cuda":
+    fp16_backend = _make_forward_backend(
+      "cuda",
+      acc=acc,
+      triton_autotune=triton_autotune,
+      triton_autotune_mode=triton_autotune_mode,
+      enable_tma=True,
+      enable_ws=enable_ws,
+      enable_cute=True,
+      enable_fp8=False,
+      cuda_stages=stages,
+    )
+    _n_early = causal_hybrid_n_early
+
+    def _ffpa_call(q, k, v):
+      o = ffpa_attn_func(
+        q,
+        k,
+        v,
+        attn_mask=attn_mask,
+        is_causal=True,
+        dropout_p=dropout_p,
+        enable_gqa=Nh_q != Nh_kv,
+        forward_backend=forward_backend,
+        backward_backend=backward_backend,
+      )
+      # causality: early query rows i<n_early attend key j<=i<n_early, so
+      # only k/v[:n_early] needed; slice must be contiguous (ffpa assumes it).
+      qe = q[:, :, :_n_early, :].contiguous()
+      ke = k[:, :, :_n_early, :].contiguous()
+      ve = v[:, :, :_n_early, :].contiguous()
+      o[:, :, :_n_early, :] = ffpa_attn_func(
+        qe,
+        ke,
+        ve,
+        is_causal=True,
+        enable_gqa=Nh_q != Nh_kv,
+        forward_backend=fp16_backend,
+      )
+      return o
+  else:
+
+    def _ffpa_call(q, k, v):
+      return ffpa_attn_func(
+        q,
+        k,
+        v,
+        attn_mask=attn_mask,
+        is_causal=causal,
+        dropout_p=dropout_p,
+        enable_gqa=Nh_q != Nh_kv,
+        forward_backend=forward_backend,
+        backward_backend=backward_backend,
+      )
+
   torch.manual_seed(seed + 17)
-  out_ffpa = ffpa_attn_func(
-    q,
-    k,
-    v,
-    attn_mask=attn_mask,
-    is_causal=causal,
-    dropout_p=dropout_p,
-    enable_gqa=Nh_q != Nh_kv,
-    forward_backend=forward_backend,
-    backward_backend=backward_backend,
-  )
+  out_ffpa = _ffpa_call(q, k, v)
   k_ref, v_ref = _expand_kv(k, v, Nh_q)
   torch.manual_seed(seed + 17)
   out_sdpa = _sdpa_ref(
@@ -374,17 +425,7 @@ def _run_case(
   ok = _tensor_allclose(out_ffpa, out_sdpa, tol)
 
   ms_ffpa = _time_fn(
-    lambda q, k, v: ffpa_attn_func(
-      q,
-      k,
-      v,
-      attn_mask=attn_mask,
-      is_causal=causal,
-      dropout_p=dropout_p,
-      enable_gqa=Nh_q != Nh_kv,
-      forward_backend=forward_backend,
-      backward_backend=backward_backend,
-    ),
+    _ffpa_call,
     q,
     k,
     v,
@@ -468,6 +509,8 @@ def run_forward_examples(
   dtypes: tuple[torch.dtype, ...] = (torch.float16, torch.bfloat16),
   verbose: bool = False,
   stages: int | None = None,
+  causal_hybrid: bool = False,
+  causal_hybrid_n_early: int = 256,
 ) -> list[FORWARD_RESULT]:
   """Run the canonical forward benchmark cases.
 
@@ -663,6 +706,8 @@ def run_forward_examples(
           pv_acc_type=pv_acc_type,
           verbose=verbose,
           stages=stages,
+          causal_hybrid=causal_hybrid,
+          causal_hybrid_n_early=causal_hybrid_n_early,
         )
       )
 

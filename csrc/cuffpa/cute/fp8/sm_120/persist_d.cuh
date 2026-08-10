@@ -18,6 +18,36 @@
 #include "../reg2reg_8b.cuh"
 #include "../smooth_k.cuh"
 
+// ============================================================================
+// FP8 causal accuracy: why early rows have large absolute error
+// ============================================================================
+// PyTorch sim (B1H32N8192D128 randn amp=1.0): causal max_abs=0.22 vs dense
+// 0.015 (15x worse), yet relative error is ~5% for BOTH (causal rel_max=5.5%
+// ~= dense 9.1%). The abs gap is entirely due to output amplitude, NOT a
+// per-stage error blow-up.
+//
+// Math: O[i] = sum_j P[i,j] * V[j], V[j] ~ N(0, I) i.i.d.
+//   per-dim Var(O[i]) = sum_j P[i,j]^2 = 1 / ESS_i,
+//   ESS_i = 1 / sum_j P[i,j]^2   (effective sample size)
+//   amplitude ~ sigma_V * sqrt(2 ln D) / sqrt(ESS) = 3.1 / sqrt(ESS)
+//
+//   dense row:     P ~ uniform over N=8192 -> ESS ~ 3000 -> amp ~ 0.05
+//   causal row[0]: P = [1]                 -> ESS = 1    -> amp ~ 3.1
+//   causal row[2]: P over 3 KV             -> ESS ~ 2    -> amp ~ 1.8
+//
+// FP8 quantization (QK / P / V / PV) adds a CONSTANT ~5% relative error per
+// stage regardless of row. Absolute error = rel_err * amp:
+//   dense:        5% * 0.05 = 0.003
+//   causal early: 5% * 2.6  = 0.13
+// Every fp8 stage independently contributes ~5% * amp. Keeping only QK in fp16
+// removes just the QK term; V quant (largest single source, 0.19 > QK 0.13 >
+// P 0.11) and PV remain. Hence early rows need FULL-chain fp16 (all stages) to
+// cut abs error, or per-channel V scale to lower V's relative error.
+// Takeaway: "early-row fp16 QK" does NOT fix causal accuracy -- V quant is the
+// dominant source and the whole chain matters. Sim scripts:
+// .tmp/causal-precision/{analyze,amplitude,ess}.py
+// ============================================================================
+
 namespace ffpa_fp8 {
 
 using TmaBarrier = cutlass::arch::ClusterTransactionBarrier;

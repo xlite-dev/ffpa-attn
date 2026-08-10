@@ -402,6 +402,21 @@ def _parse_args() -> argparse.Namespace:
     "sage-style per-D scale.",
   )
   parser.add_argument(
+    "--fp8-causal-hybrid",
+    action="store_true",
+    help="FP8 causal only: 2-stage hybrid precision. Recompute the leading "
+    "--fp8-causal-hybrid-n-early query rows in fp16 (full chain) and "
+    "overwrite the fp8 result, fixing causal early-row precision loss "
+    "(ESS root cause). Zero kernel change (two ffpa_attn_func calls).",
+  )
+  parser.add_argument(
+    "--fp8-causal-hybrid-n-early",
+    type=int,
+    default=256,
+    help="Number of leading query rows recomputed in fp16 under "
+    "--fp8-causal-hybrid (default 256).",
+  )
+  parser.add_argument(
     "--enable-bwd-tma",
     "--bwd-tma",
     action="store_true",
@@ -601,6 +616,10 @@ def _resolve_directional_cli_flags(
     args.pv_acc_type = "f32"
   if not hasattr(args, "qk_mm_type"):
     args.qk_mm_type = "fp8"
+  if not hasattr(args, "fp8_causal_hybrid"):
+    args.fp8_causal_hybrid = False
+  if not hasattr(args, "fp8_causal_hybrid_n_early"):
+    args.fp8_causal_hybrid_n_early = 256
   return args
 
 
@@ -1688,6 +1707,8 @@ def _benchmark_rows(
         dtypes=dtypes,
         verbose=args.verbose,
         stages=args.stages,
+        causal_hybrid=args.fp8_causal_hybrid,
+        causal_hybrid_n_early=args.fp8_causal_hybrid_n_early,
       ),
     )
   if args.backward:
