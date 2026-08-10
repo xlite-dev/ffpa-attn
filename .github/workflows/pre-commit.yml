@@ -3,13 +3,15 @@ name: pre-commit
 on:
   pull_request:
     branches: [main]
+  pull_request_target:
+    branches: [main]
   push:
     branches: [main]
   workflow_dispatch:
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -20,6 +22,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          # For pull_request events, check out the merged fork code (safe: restricted
+          # permissions). For pull_request_target events from forks, only check out
+          # the base branch to avoid executing untrusted code with elevated permissions.
           ref: ${{ github.event_name == 'pull_request' && format('refs/pull/{0}/merge', github.event.pull_request.number) || github.ref }}
           persist-credentials: false
       - uses: actions/setup-python@v5
