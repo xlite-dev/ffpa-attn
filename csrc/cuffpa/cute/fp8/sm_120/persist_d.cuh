@@ -142,13 +142,12 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp8_sm120(
   if (Br_base >= Nq - q_start_row)
     return;
 
-  // Causal mask is lower-triangular on [Nq, Nkv]: query row i attends to
-  // key col j <= i (PyTorch SDPA / Sage / FlashAttention convention). The
-  // previous "queries aligned to KV tail" (j <= i + Nkv - Nq) diverged from
-  // SDPA and produced wrong output whenever Nq < Nkv; the offset is dropped.
-  const int causal_thresh_row0 = q_start_row + Br_base;
+  const int kv_offset = Nkv - Nq;
+  const int causal_thresh_row0 = q_start_row + Br_base + kv_offset;
   const int Tc_eff =
-      causal ? min(Tc, ((q_start_row + Br_base + kBr - 1) / kBc) + 1) : Tc;
+      causal
+          ? min(Tc, ((q_start_row + Br_base + kBr - 1 + kv_offset) / kBc) + 1)
+          : Tc;
   const int mask_start_tile =
       causal ? max(0, (causal_thresh_row0 + 1) / kBc) : INT_MAX;
 
@@ -451,7 +450,8 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp8_sm120(
     if (tile_needs_mask) {
 #pragma unroll
       for (int row = 0; row < kSRows; ++row) {
-        const int q_pos = q_start_row + Br_base + get<0>(tScS_rc(row, 0));
+        const int q_pos =
+            q_start_row + Br_base + get<0>(tScS_rc(row, 0)) + kv_offset;
 #pragma unroll
         for (int col = 0; col < kSCols; ++col) {
           float s = scores(row, col) * qs_arr[row] * ks * scale;
