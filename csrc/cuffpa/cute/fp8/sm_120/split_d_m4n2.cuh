@@ -102,12 +102,11 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
   if (Br_base >= Nq - q_start_row)
     return;
 
-  const int kv_offset = Nkv - Nq;
-  const int causal_thresh_row0 = q_start_row + Br_base + kv_offset;
+  // Causal mask is lower-triangular (j <= i), matching PyTorch SDPA; see
+  // persist_d.cuh for the rationale behind dropping the Nkv-Nq offset.
+  const int causal_thresh_row0 = q_start_row + Br_base;
   const int Tc_eff =
-      causal
-          ? min(Tc, ((q_start_row + Br_base + kBr - 1 + kv_offset) / kBc) + 1)
-          : Tc;
+      causal ? min(Tc, ((q_start_row + Br_base + kBr - 1) / kBc) + 1) : Tc;
   const int mask_start_tile =
       causal ? max(0, (causal_thresh_row0 + 1) / kBc) : INT_MAX;
 
@@ -407,8 +406,7 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
     if (tile_needs_mask) {
 #pragma unroll
       for (int row = 0; row < kSRows; ++row) {
-        const int q_pos =
-            q_start_row + Br_base + get<0>(tScS_rc(row, 0)) + kv_offset;
+        const int q_pos = q_start_row + Br_base + get<0>(tScS_rc(row, 0));
 #pragma unroll
         for (int col = 0; col < kSCols; ++col) {
           float s = scores(row, col) * qs_arr[row] * ks * scale;

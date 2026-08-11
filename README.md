@@ -21,6 +21,7 @@
 
 ## Latest News
 
+- [2026/08] Support [FP8 Attention](./csrc/cuffpa/cute/fp8/) for headdim 64~1024 (currently, only sm_120 is supported), achieving **580 TOPS** (D=128) on NVIDIA RTX 5090, with almost the same accuracy as SageAttention.
 - [2026/06] DefTruth, Butterfingrz, [FFPA: Fast and Memory-Efficient Exact Attention for Large Headdim](https://doi.org/10.5281/zenodo.20638547).
 
 ## Quick Start
@@ -152,6 +153,7 @@ Apache License 2.0
 <div id="ref"></div>
 
 - [flash-attention](https://github.com/Dao-AILab/flash-attention)
+- [SageAttention](https://github.com/thu-ml/sageattention)
 - [LeetCUDA](https://github.com/xlite-dev/LeetCUDA)
 - [flashinfer](https://github.com/flashinfer-ai/flashinfer)
 - [quack](https://github.com/Dao-AILab/quack)
