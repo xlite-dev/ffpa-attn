@@ -116,10 +116,18 @@ void launch_ffpa_attn_fwd_template(
     auto prop = at::cuda::getCurrentDeviceProperties();
     if (prop->major >= 9) {
       if (force_fp8) {
-        // q/k only support per-block quant today; per-channel is reserved
-        // for future kernel work.
-        TORCH_CHECK(fp8_q_quant_method == 0 && fp8_k_quant_method == 0,
-                    "ffpa_attn: fp8_q/k_quant_method only supports per_block");
+        // q/k quant: per_block (0) for all headdims; per_thread (2) for
+        // D<=128 only (persist_d path). split_d/m4n2 (D>128) support
+        // per_block only.
+        if constexpr (kHeadDim <= 128) {
+          TORCH_CHECK((fp8_q_quant_method == 0 && fp8_k_quant_method == 0) ||
+                          (fp8_q_quant_method == 2 && fp8_k_quant_method == 2),
+                      "ffpa_attn: Q/K quant method must be both per_block or "
+                      "both per_thread");
+        } else {
+          TORCH_CHECK(fp8_q_quant_method == 0 && fp8_k_quant_method == 0,
+                      "ffpa_attn: per-thread Q/K quant requires D<=128");
+        }
 #ifdef ENABLE_FFPA_CUTE_EXT
         // EXPERIMENT: FFPA_FP8_FORCE_KERNEL=split_d|m4n2 forces a specific
         // split-D kernel to A/B test the M8N1/M4N2 dispatch cross-point.

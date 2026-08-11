@@ -72,7 +72,8 @@ using CtaBarrier = cutlass::arch::ClusterBarrier;
 //           Faster, slightly coarser for rows whose max(P) << 1. Default.
 template <typename Traits, typename ElementO, typename TmaQ, typename TmaK,
           typename TmaV, typename TmaO, bool kPQuantPerRow = false,
-          bool kPVAccF16 = false, bool kVPerChannel = false>
+          bool kPVAccF16 = false, bool kVPerChannel = false,
+          bool kQKPerThread = false>
 __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp8_sm120(
     CUTLASS_GRID_CONSTANT TmaQ const tma_q,
     CUTLASS_GRID_CONSTANT TmaK const tma_k,
@@ -138,8 +139,7 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp8_sm120(
   const int kv_row_offset = (Nb_id * Nh_kv + kv_head_idx) * Nkv;
   const int q_bh = Nb_id * Nh + Nh_id;
   const int kv_bh = Nb_id * Nh_kv + kv_head_idx;
-  const float qs =
-      q_scale[static_cast<long>(q_bh) * n_rb_q + Q_tile_id + q_start_row / kBr];
+  const int q_tile_abs = Q_tile_id + q_start_row / kBr;
 
   // SMEM: [Q persist | K stages | V stages], 1B per elem (int8 or e4m3).
   extern __shared__ __align__(1024) char shm[];
@@ -320,6 +320,24 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp8_sm120(
   constexpr int kSRows = decltype(size<0>(tScS_rc))::value;
   constexpr int kSCols = decltype(size<1>(tScS_rc))::value;
 
+  // Per-row Q dequant scales (one per scores-fragment row). Per-thread mode
+  // looks up the group for each row via tScS_rc coords: g=(q_row/16)*8+q_row%8.
+  float qs_arr[kSRows];
+  if constexpr (kQKPerThread) {
+#pragma unroll
+    for (int row = 0; row < kSRows; ++row) {
+      const int q_row = get<0>(tScS_rc(row, 0));
+      const int g = (q_row / 16) * 8 + q_row % 8;
+      qs_arr[row] = q_scale[static_cast<long>(q_bh) * (n_rb_q * 64) +
+                            q_tile_abs * 64 + g];
+    }
+  } else {
+    const float qs = q_scale[static_cast<long>(q_bh) * n_rb_q + q_tile_abs];
+#pragma unroll
+    for (int row = 0; row < kSRows; ++row)
+      qs_arr[row] = qs;
+  }
+
   const float scale_orig = scale;
   scale *= FFPA_M_LOG2E;
 
@@ -354,14 +372,21 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp8_sm120(
     const int v_stg = kv_tile % kStagesV;
     const int v_phase = (kv_tile / kStagesV) & 1;
 
-    const float ks = k_scale[static_cast<long>(kv_bh) * n_rb_kv + kv_tile];
+    // K scale: per-block (1 per 128-col block) or per-thread (4 per block,
+    // column-pair remainders matching SM80_16x8 C-fragment: group lane%4
+    // covers cols {2*(lane%4)+8n, +1} for n=0..15).
+    const float ks =
+        kQKPerThread ? k_scale[static_cast<long>(kv_bh) * (n_rb_kv * 4) +
+                               kv_tile * 4 + (wg_tid % 32) % 4]
+                     : k_scale[static_cast<long>(kv_bh) * n_rb_kv + kv_tile];
     // Per-channel V: v_scale is (bh, D) per-D; vs is unused (P uses fixed
     // 448 scale, epilogue dequants per-D). Avoid reading the per-kv-tile
     // slot (wrong buffer shape).
     const float vs =
         kVPerChannel ? 1.0f
                      : v_scale[static_cast<long>(kv_bh) * n_rb_kv + kv_tile];
-    const float s_dequant = qs * ks;  // linear dequant of S
+    // ks is uniform across thread's K cols (SM80_16x8: lane%4). qs_arr[row]
+    // varies per Q row in per-thread mode. Dequant is applied per-row below.
 
     // QK GEMM: fp8xfp8->fp32, or int8xint8->s32 when kQKInt8.
     TmaBarrier::wait(&k_full[k_stg], k_phase);
@@ -413,7 +438,7 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp8_sm120(
             q_start_row + Br_base + get<0>(tScS_rc(row, 0)) + kv_offset;
 #pragma unroll
         for (int col = 0; col < kSCols; ++col) {
-          float s = scores(row, col) * s_dequant * scale;
+          float s = scores(row, col) * qs_arr[row] * ks * scale;
           if (get<1>(tScS_rc(row, col)) >= kv_valid)
             s = -INFINITY;
           if (kv_tile >= mask_start_tile) {
@@ -438,12 +463,13 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp8_sm120(
     const float p_quant_scale = kVPerChannel ? 1.0f : (vs * kE4m3Max);
     if constexpr (kPQuantPerRow) {
       if (!tile_needs_mask) {
-        const float sd = s_dequant * scale;
 #pragma unroll
-        for (int row = 0; row < kSRows; ++row)
+        for (int row = 0; row < kSRows; ++row) {
+          const float sd = qs_arr[row] * ks * scale;
 #pragma unroll
           for (int col = 0; col < kSCols; ++col)
             scores(row, col) *= sd;
+        }
       }
       ffpa_cute::online_safe_softmax<decltype(scores), decltype(tScS_rc),
                                      kORows>(scores, tScS_rc, 1.0f, row_max,
@@ -452,15 +478,35 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp8_sm120(
     } else {
       // Fixed mode: fold the P quant scale into the exp2 offset so the
       // softmax emits P*p_quant_scale directly; row_sum is folded back to
-      // the true probability domain inside (see fp8_pscale.cuh). Unmasked
-      // tiles defer the s_dequant multiply into the softmax.
-      const float softmax_scale_eff =
-          tile_needs_mask ? 1.0f : s_dequant * scale;
-      online_softmax_fp8_fixed<true, decltype(scores), decltype(tScS_rc),
-                               kORows>(
-          scores, tScS_rc, softmax_scale_eff, row_max, row_sum, row_scale,
-          log2f(p_quant_scale), 1.0f / p_quant_scale,
-          Traits::kRescaleThreshold);
+      // the true probability domain inside (see fp8_pscale.cuh).
+      if constexpr (kQKPerThread) {
+        // Per-thread QK: pre-dequant scores per-row (different qs per row),
+        // then softmax with just 'scale' (no s_dequant folding).
+        if (!tile_needs_mask) {
+#pragma unroll
+          for (int row = 0; row < kSRows; ++row) {
+            const float sd = qs_arr[row] * ks;
+#pragma unroll
+            for (int col = 0; col < kSCols; ++col)
+              scores(row, col) *= sd;
+          }
+        }
+        const float softmax_scale_eff = tile_needs_mask ? 1.0f : scale;
+        online_softmax_fp8_fixed<true, decltype(scores), decltype(tScS_rc),
+                                 kORows>(
+            scores, tScS_rc, softmax_scale_eff, row_max, row_sum, row_scale,
+            log2f(p_quant_scale), 1.0f / p_quant_scale,
+            Traits::kRescaleThreshold);
+      } else {
+        const float s_dequant = qs_arr[0] * ks;
+        const float softmax_scale_eff =
+            tile_needs_mask ? 1.0f : s_dequant * scale;
+        online_softmax_fp8_fixed<true, decltype(scores), decltype(tScS_rc),
+                                 kORows>(
+            scores, tScS_rc, softmax_scale_eff, row_max, row_sum, row_scale,
+            log2f(p_quant_scale), 1.0f / p_quant_scale,
+            Traits::kRescaleThreshold);
+      }
     }
 
     // Rescale o_acc (online softmax); deferred until p_scale is known.
@@ -668,7 +714,7 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp8_sm120(
       for (int row = 0; row < kORows; ++row) {
         float lse = (row_max[row] + log2f(row_sum[row])) * FFPA_M_LN2;
         if (smooth_lse)
-          lse += scale_orig * qs * qkm[row];
+          lse += scale_orig * qs_arr[row] * qkm[row];
         const int global_row = q_start_row + Br_base + get<0>(tScS_rc(row, 0));
         if (global_row < Nq)
           softmax_lse[lse_base + global_row] = lse;

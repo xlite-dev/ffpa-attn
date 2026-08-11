@@ -50,9 +50,11 @@ _ACC_F32 = 1
 # FP8 quant granularity encoding (kept in sync with cute/launch.cuh).
 _QUANT_METHOD_PER_BLOCK = 0
 _QUANT_METHOD_PER_CHANNEL = 1
+_QUANT_METHOD_PER_THREAD = 2
 _QUANT_METHOD_CODE = {
   "per_block": _QUANT_METHOD_PER_BLOCK,
   "per_channel": _QUANT_METHOD_PER_CHANNEL,
+  "per_thread": _QUANT_METHOD_PER_THREAD,
 }
 # FP8 PV accumulator dtype encoding (kept in sync with cute/launch.cuh).
 _PV_ACC_F16 = 0
@@ -240,8 +242,8 @@ class CUDABackend(Backend):
   enable_fp8: bool = False  # FP8 persist-D sm120 path (fp16/bf16 in).
   fp8_smooth_k: bool = True  # FP8 only: subtract per-(b,h) K seq mean pre-quant.
   fp8_smooth_v: bool = False  # FP8 only: subtract per-(b,h) V dim mean.
-  fp8_q_quant_method: str = "per_block"  # FP8 only; per_block only (placeholder).
-  fp8_k_quant_method: str = "per_block"  # FP8 only; per_block only (placeholder).
+  fp8_q_quant_method: str = "per_block"  # FP8 only: per_block / per_thread.
+  fp8_k_quant_method: str = "per_block"  # FP8 only: per_block / per_thread.
   fp8_v_quant_method: str = "per_block"  # FP8 only; per_block/per_channel.
   fp8_pv_acc_type: str = "f32"  # FP8 only; f32/f16 PV accumulator.
   fp8_qk_mm_type: str = "fp8"  # FP8 only: QK MMA dtype; "fp8" or "int8".
@@ -265,13 +267,15 @@ class CUDABackend(Backend):
         "CUDABackend(acc='f16') requires the fp16 MMA acc kernels, which were "
         "not compiled. Rebuild with ENABLE_FFPA_F16_ACC=1 to enable them."
       )
-    assert self.fp8_q_quant_method == "per_block", (
-      f"fp8_q_quant_method only supports 'per_block', got {self.fp8_q_quant_method!r}"
+    assert self.fp8_q_quant_method in ("per_block", "per_thread"), (
+      f"fp8_q_quant_method must be 'per_block' or 'per_thread', "
+      f"got {self.fp8_q_quant_method!r}"
     )
-    assert self.fp8_k_quant_method == "per_block", (
-      f"fp8_k_quant_method only supports 'per_block', got {self.fp8_k_quant_method!r}"
+    assert self.fp8_k_quant_method in ("per_block", "per_thread"), (
+      f"fp8_k_quant_method must be 'per_block' or 'per_thread', "
+      f"got {self.fp8_k_quant_method!r}"
     )
-    assert self.fp8_v_quant_method in _QUANT_METHOD_CODE, (
+    assert self.fp8_v_quant_method in ("per_block", "per_channel"), (
       f"fp8_v_quant_method must be 'per_block' or 'per_channel', "
       f"got {self.fp8_v_quant_method!r}"
     )

@@ -384,15 +384,15 @@ def _parse_args() -> argparse.Namespace:
   )
   parser.add_argument(
     "--fp8-q-quant-method",
-    choices=["per-block", "per-channel"],
+    choices=["per-block", "per-channel", "per-thread"],
     default=None,
-    help="FP8 only: Q quantization granularity (per-block only for now).",
+    help="FP8 only: Q quantization granularity (per-thread requires D<=128).",
   )
   parser.add_argument(
     "--fp8-k-quant-method",
-    choices=["per-block", "per-channel"],
+    choices=["per-block", "per-channel", "per-thread"],
     default=None,
-    help="FP8 only: K quantization granularity (per-block only for now).",
+    help="FP8 only: K quantization granularity (per-thread requires D<=128).",
   )
   parser.add_argument(
     "--fp8-v-quant-method",

@@ -604,15 +604,17 @@ __global__ void quantize_fp8_vt_perchannel_kernel(
 
 // Per-channel V quantize: coalesced stats (sum+max+min -> mean+amax) then
 // quantize+transpose. kSmoothV: residual amax + mean subtract; else absolute
-// amax, no mean subtract (vm_quant=nullptr).
+// amax, no mean subtract (vm_quant=nullptr). v_scale_max controls V8 range
+// (default 448 = e4m3 full range); smaller compresses V8 for fp16 PV acc.
 template <typename Element, int kBr, int kBc, int kHeadDim, bool kSmoothV>
 void launch_quantize_fp8_vt_perchannel_sm120(
     const Element* v_ptr, __nv_fp8_e4m3* vt8, float* v_scale, float* vm,
     float* partials_sum, float* partials_max, float* partials_min, int B,
-    int Nh_kv, int Nkv, int Nkv_pad, cudaStream_t stream) {
+    int Nh_kv, int Nkv, int Nkv_pad, cudaStream_t stream,
+    float v_scale_max = 448.0f) {
   launch_v_stats_sm120<Element, kHeadDim, kSmoothV>(
       v_ptr, vm, v_scale, partials_sum, partials_max, partials_min, B, Nh_kv,
-      Nkv, stream);
+      Nkv, stream, v_scale_max);
   constexpr int kDChunk = (kHeadDim < 256) ? kHeadDim : 256;
   constexpr int kVtSmemBytes = kBc * (kDChunk + 16);
   dim3 grid_q((Nkv + kBc - 1) / kBc, B * Nh_kv);
@@ -621,6 +623,220 @@ void launch_quantize_fp8_vt_perchannel_sm120(
                        kVtSmemBytes);
   kernel<<<grid_q, 128, kVtSmemBytes, stream>>>(
       v_ptr, vt8, v_scale, kSmoothV ? vm : nullptr, Nkv, Nh_kv, Nkv_pad);
+}
+
+// Per-thread Q quantize: 64 scales per 128-row block, strided row-pairs
+// matching SM80_16x8 C-fragment (group g covers rows {16*(g/8)+g%8, +8}).
+// One thread per row (128 threads); shfl_xor(row, 8) pairs the two rows in
+// each group. kQKInt8: int8 output (amax/127); else e4m3 (amax/448).
+template <typename Element, int kD, bool kQKInt8>
+__global__ void quantize_fp8_perthread_q_kernel(
+    const Element* __restrict__ X,    // (B, H, N, kD)
+    QKOutT<kQKInt8>* __restrict__ Y,  // (B, H, N, kD)
+    float* __restrict__ scale,        // (B*H, ceil(N/128)*64)
+    int N, int H) {
+  constexpr int kVec = 8;
+  constexpr int D = kD;
+  constexpr int dv = D / kVec;
+  const int rb = blockIdx.x;
+  const int bh = blockIdx.y;
+  const int tid = threadIdx.x;
+  const int row = rb * 128 + tid;
+  const Element* x_bh = X + static_cast<long>(bh) * N * D;
+  QKOutT<kQKInt8>* y_bh = Y + static_cast<long>(bh) * N * D;
+
+  float amax = 0.0f;
+  Vec8<Element> regs[dv];
+  if (row < N) {
+#pragma unroll
+    for (int c = 0; c < dv; ++c) {
+      regs[c] = reinterpret_cast<const Vec8<Element>*>(x_bh + row * D)[c];
+#pragma unroll
+      for (int e = 0; e < kVec; ++e)
+        amax = fmaxf(amax, fabsf(static_cast<float>(regs[c].elem[e])));
+    }
+  }
+  // Pair rows tid and tid^8 (same C-fragment group).
+  amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, 8));
+  const float s = kQKInt8 ? amax / 127.0f : amax / 448.0f;
+  const float inv_s = (s == 0.0f) ? 0.0f : 1.0f / s;
+  const int n_rb = (N + 127) / 128;
+  const int g = (tid / 16) * 8 + tid % 8;
+  if ((tid & 8) == 0)
+    scale[static_cast<long>(bh) * (n_rb * 64) + rb * 64 + g] = s;
+
+  if (row < N) {
+#pragma unroll
+    for (int c = 0; c < dv; ++c) {
+      uint2 out;
+      QKOutT<kQKInt8>* ob = reinterpret_cast<QKOutT<kQKInt8>*>(&out);
+#pragma unroll
+      for (int e = 0; e < kVec; ++e) {
+        float v = static_cast<float>(regs[c].elem[e]) * inv_s;
+        if constexpr (kQKInt8)
+          ob[e] = quant_sym_int8(v);
+        else
+          ob[e] = __nv_fp8_e4m3(v);
+      }
+      reinterpret_cast<uint2*>(y_bh + row * D)[c] = out;
+    }
+  }
+}
+
+// Per-thread K quantize: 4 scales per 128-row block, grouped by N_kv row
+// ((row%8)/2) matching SM80_16x8 C-fragment N-column layout: thread lane
+// accesses N_kv cols {2*(lane%4)+8n, +1}, group=lane%4=(col%8)/2. amax is
+// across ALL D for each group of 32 N_kv rows. Smooth-K (km) subtracted.
+template <typename Element, int kBlockRows, int kD, bool kQKInt8>
+__global__ void quantize_fp8_perthread_k_kernel(
+    const Element* __restrict__ X,    // (B, H, N, kD)
+    QKOutT<kQKInt8>* __restrict__ Y,  // (B, H, N, kD)
+    float* __restrict__ scale,        // (B*H_kv, ceil(N/128)*4)
+    int N, int H,
+    const Element* __restrict__ km = nullptr,  // (B*H, D) smooth-K means
+    float inv_n = 0.0f) {
+  constexpr int kVec = 8;
+  constexpr int D = kD;
+  constexpr int dv = D / kVec;
+  constexpr int kThreads = 128;
+  constexpr int kWarps = kThreads / 32;
+  const int rb = blockIdx.x;
+  const int bh = blockIdx.y;
+  const int tid = threadIdx.x;
+  const int warp = tid / 32;
+  const int lane = tid % 32;
+  const int row0 = rb * kBlockRows;
+  const Element* x_bh = X + static_cast<long>(bh) * N * D;
+  QKOutT<kQKInt8>* y_bh = Y + static_cast<long>(bh) * N * D;
+
+  __shared__ float km_sh[kD];
+  const bool smooth = km != nullptr;
+  if (smooth)
+    for (int d = tid; d < D; d += kThreads)
+      km_sh[d] = static_cast<float>(km[static_cast<long>(bh) * D + d]) * inv_n;
+  __syncthreads();
+
+  // Group = (row % 8) / 2 (N_kv row dimension, NOT D element index).
+  float amax[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+  constexpr int total = kBlockRows * dv;
+  constexpr int n_chunks_per_thread = total / kThreads;
+  Vec8<Element> regs[n_chunks_per_thread];
+  int chunk_r[n_chunks_per_thread], chunk_c[n_chunks_per_thread];
+#pragma unroll
+  for (int j = 0; j < n_chunks_per_thread; ++j) {
+    const int i = tid + j * kThreads;
+    const int r = i / dv;
+    const int c = i % dv;
+    chunk_r[j] = r;
+    chunk_c[j] = c;
+    const long row = row0 + r;
+    Vec8<Element> v = Vec8<Element>::zero();
+    if (row < N)
+      v = reinterpret_cast<const Vec8<Element>*>(x_bh + row * D)[c];
+    regs[j] = v;
+    const int g = (r % 8) / 2;
+#pragma unroll
+    for (int e = 0; e < kVec; ++e) {
+      float x = static_cast<float>(v.elem[e]);
+      if (smooth)
+        x -= km_sh[c * kVec + e];
+      amax[g] = fmaxf(amax[g], fabsf(x));
+    }
+  }
+  // Warp-reduce 4 amaxes.
+#pragma unroll
+  for (int g = 0; g < 4; ++g) {
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+      amax[g] = fmaxf(amax[g], __shfl_xor_sync(0xffffffff, amax[g], off));
+  }
+  __shared__ float warp_max[kWarps * 4];
+  if (lane == 0)
+#pragma unroll
+    for (int g = 0; g < 4; ++g)
+      warp_max[warp * 4 + g] = amax[g];
+  __syncthreads();
+  float s[4];
+  if (warp == 0 && lane == 0) {
+#pragma unroll
+    for (int g = 0; g < 4; ++g) {
+      s[g] = warp_max[g];
+#pragma unroll
+      for (int w = 1; w < kWarps; ++w)
+        s[g] = fmaxf(s[g], warp_max[w * 4 + g]);
+      warp_max[g] = kQKInt8 ? s[g] / 127.0f : s[g] / 448.0f;
+    }
+  }
+  __syncthreads();
+  float sc[4] = {warp_max[0], warp_max[1], warp_max[2], warp_max[3]};
+  const int n_rb = (N + kBlockRows - 1) / kBlockRows;
+  if (tid == 0)
+#pragma unroll
+    for (int g = 0; g < 4; ++g)
+      scale[static_cast<long>(bh) * (n_rb * 4) + rb * 4 + g] = sc[g];
+
+  const float inv_s[4] = {
+      sc[0] == 0.0f ? 0.0f : 1.0f / sc[0], sc[1] == 0.0f ? 0.0f : 1.0f / sc[1],
+      sc[2] == 0.0f ? 0.0f : 1.0f / sc[2], sc[3] == 0.0f ? 0.0f : 1.0f / sc[3]};
+#pragma unroll
+  for (int j = 0; j < n_chunks_per_thread; ++j) {
+    const int r = chunk_r[j];
+    const int c = chunk_c[j];
+    const long row = row0 + r;
+    if (row >= N)
+      continue;
+    const int g = (r % 8) / 2;
+    uint2 out;
+    QKOutT<kQKInt8>* ob = reinterpret_cast<QKOutT<kQKInt8>*>(&out);
+#pragma unroll
+    for (int e = 0; e < kVec; ++e) {
+      float x = static_cast<float>(regs[j].elem[e]);
+      if (smooth)
+        x -= km_sh[c * kVec + e];
+      if constexpr (kQKInt8)
+        ob[e] = quant_sym_int8(x * inv_s[g]);
+      else
+        ob[e] = __nv_fp8_e4m3(x * inv_s[g]);
+    }
+    reinterpret_cast<uint2*>(y_bh + row * D)[c] = out;
+  }
+}
+
+// Per-thread QK quantize launcher: Q 64 scale/block, K 4 scale/block.
+// VT (V transposed) uses the regular per-block e4m3 quantize. Q/K quantize
+// kernels are launched separately (no fused path). smooth-K applied to K.
+template <typename Element, int kBr, int kBc, int kHeadDim, bool kQKInt8>
+void launch_quantize_fp8_perthread_qk_sm120(
+    const Element* q_ptr, const Element* k_ptr, const Element* v_ptr, void* q8,
+    void* k8, __nv_fp8_e4m3* vt8, float* q_scale, float* k_scale,
+    float* v_scale, int B, int Nh, int Nh_kv, int Nq, int Nkv, int Nkv_pad,
+    cudaStream_t stream, const Element* km = nullptr) {
+  using QKOut = QKOutT<kQKInt8>;
+  // Q: 128-row blocks, 64 scale per block.
+  {
+    dim3 grid((Nq + kBr - 1) / kBr, B * Nh);
+    auto qk = quantize_fp8_perthread_q_kernel<Element, kHeadDim, kQKInt8>;
+    qk<<<grid, 128, 0, stream>>>(q_ptr, reinterpret_cast<QKOut*>(q8), q_scale,
+                                 Nq, Nh);
+  }
+  // K: kBr-col blocks (kBc for persist_d = 128), 4 scale per block.
+  {
+    dim3 grid((Nkv + kBc - 1) / kBc, B * Nh_kv);
+    auto kk = quantize_fp8_perthread_k_kernel<Element, kBc, kHeadDim, kQKInt8>;
+    kk<<<grid, 128, 0, stream>>>(k_ptr, reinterpret_cast<QKOut*>(k8), k_scale,
+                                 Nkv, Nh_kv, km, 1.0f);
+  }
+  // VT: regular per-block e4m3 quantize (same as launch_quantize_fp8_sm120).
+  {
+    constexpr int kDChunk = (kHeadDim < 256) ? kHeadDim : 256;
+    constexpr int kVtSmemBytes = kBc * (kDChunk + 16);
+    dim3 grid((Nkv + kBc - 1) / kBc, B * Nh_kv);
+    auto vk = quantize_fp8_vt_kernel<Element, kBc, kHeadDim>;
+    cudaFuncSetAttribute(vk, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                         kVtSmemBytes);
+    vk<<<grid, 128, kVtSmemBytes, stream>>>(v_ptr, vt8, v_scale, Nkv, Nh_kv,
+                                            Nkv_pad);
+  }
 }
 
 // Quantize Q/K row-major and V transposed (D, N); scales per (bh, row-block).

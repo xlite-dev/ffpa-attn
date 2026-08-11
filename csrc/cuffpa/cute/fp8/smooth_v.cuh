@@ -97,7 +97,7 @@ __global__ void v_stats_finalize_kernel(const float* __restrict__ partials_sum,
                                         const float* __restrict__ partials_min,
                                         float* __restrict__ vm,
                                         float* __restrict__ v_scale, int chunks,
-                                        int Nkv) {
+                                        int Nkv, float v_scale_max) {
   const int bh = blockIdx.x;
   const int d = threadIdx.x;
   if (d >= kD)
@@ -114,26 +114,30 @@ __global__ void v_stats_finalize_kernel(const float* __restrict__ partials_sum,
   const float amax = kSmoothV ? fmaxf(fabsf(mx - mean), fabsf(mn - mean))
                               : fmaxf(fabsf(mx), fabsf(mn));
   vm[static_cast<long>(bh) * kD + d] = mean;
-  v_scale[static_cast<long>(bh) * kD + d] = fmaxf(amax, 1e-8f) / 448.0f;
+  v_scale[static_cast<long>(bh) * kD + d] = fmaxf(amax, 1e-8f) / v_scale_max;
 }
 
 // Per-(b,h) V stats [Nb, Nh_kv, Nkv, D] -> vm[bh, D] (mean) + v_scale[bh, D]
-// (amax/448). kSmoothV: residual amax max|V-mean| (symmetric, sage style);
-// else absolute amax max|V|. partials_sum/max/min are fp32 scratch
-// (Nb*Nh_kv, chunks, D) with chunks = ceil(Nkv / 512), allocated by caller.
+// (amax/v_scale_max). kSmoothV: residual amax max|V-mean| (symmetric, sage
+// style); else absolute amax max|V|. v_scale_max controls the V8 range
+// (V8 = (V-mean)/v_scale in [-v_scale_max, v_scale_max]); 448 keeps e4m3
+// full range, smaller (e.g. 2.25) compresses V8 for fp16 PV acc precision.
+// partials_sum/max/min are fp32 scratch (Nb*Nh_kv, chunks, D) with chunks =
+// ceil(Nkv / 512), allocated by caller.
 template <typename Element, int kHeadDim, bool kSmoothV>
 void launch_v_stats_sm120(const Element* v_ptr, float* vm, float* v_scale,
                           float* partials_sum, float* partials_max,
                           float* partials_min, int Nb, int Nh_kv, int Nkv,
-                          cudaStream_t stream) {
+                          cudaStream_t stream, float v_scale_max = 448.0f) {
   const int bh = Nb * Nh_kv;
   const int chunks = (Nkv + kVStatsRowsPerChunk - 1) / kVStatsRowsPerChunk;
   dim3 grid(chunks, bh);
   v_col_stats_kernel<Element, kHeadDim>
       <<<grid, 256, 0, stream>>>(v_ptr, partials_sum, partials_max,
                                  partials_min, Nkv, kVStatsRowsPerChunk);
-  v_stats_finalize_kernel<kHeadDim, kSmoothV><<<bh, kHeadDim, 0, stream>>>(
-      partials_sum, partials_max, partials_min, vm, v_scale, chunks, Nkv);
+  v_stats_finalize_kernel<kHeadDim, kSmoothV>
+      <<<bh, kHeadDim, 0, stream>>>(partials_sum, partials_max, partials_min,
+                                    vm, v_scale, chunks, Nkv, v_scale_max);
 }
 
 }  // namespace ffpa_fp8
