@@ -34,7 +34,8 @@ using CtaBarrier = cutlass::arch::ClusterBarrier;
 // O regs = D/4 per thread (D=1024 -> 256 regs). See split_d_m4n2.cuh for the
 // M4N2 register-budget analysis and cross-point vs M8N1.
 template <typename Traits, typename ElementO, typename TmaQ, typename TmaK,
-          typename TmaV, typename TmaO>
+          typename TmaV, typename TmaO, bool kPVAccF16 = false,
+          bool kVPerChannel = false>
 __global__ void __launch_bounds__(Traits::kNumThreads, 1)
     split_d_m4n2_fwd_cute_fp8_sm120(
         CUTLASS_GRID_CONSTANT TmaQ const tma_q,
@@ -45,7 +46,8 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
         const float* __restrict__ k_scale, const float* __restrict__ v_scale,
         int Nq, int Nkv, int Nh, int Nh_kv, float scale, int Tc, int causal,
         int total_q_rows, int total_kv_rows, int n_rb_q, int n_rb_kv,
-        int q_start_row = 0, const float* __restrict__ km = nullptr) {
+        int q_start_row = 0, const float* __restrict__ km = nullptr,
+        const float* __restrict__ vm = nullptr) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
   using namespace cute;
   using cute::tma_store_arrive;
@@ -59,6 +61,7 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
   using SmemLayoutP = typename Traits::SmemLayoutP;
   using TiledMmaQK = typename Traits::TiledMmaQK;
   using TiledMmaPV = typename Traits::TiledMmaPV;
+  using TiledMmaPVf16 = typename Traits::TiledMmaPVf16;
   using SmemCopyAtom = typename Traits::SmemCopyAtom;
   using SmemCopyAtomQK = typename Traits::SmemCopyAtomQK;
 
@@ -155,6 +158,7 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
 
   TiledMmaQK tiled_mma_qk;
   TiledMmaPV tiled_mma_pv;
+  [[maybe_unused]] TiledMmaPVf16 tiled_mma_pv_f16;
   auto thr_mma_qk = tiled_mma_qk.get_thread_slice(tid);
   auto thr_mma_pv = tiled_mma_pv.get_thread_slice(tid);
 
@@ -166,6 +170,12 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
   auto s2r_thr_k = s2r_copy_k.get_thread_slice(tid);
   auto s2r_thr_p = s2r_copy_p.get_thread_slice(tid);
   auto s2r_thr_v = s2r_copy_v.get_thread_slice(tid);
+  // f16 PV path: B-side (V) must derive from the f16 TiledMma, else CuTe
+  // gemm silently no-ops. A-side P reuses tCrPv_storage (layouts match).
+  [[maybe_unused]] auto thr_mma_pv_f16 = tiled_mma_pv_f16.get_thread_slice(tid);
+  [[maybe_unused]] auto s2r_copy_v_f16 =
+      make_tiled_copy_B(SmemCopyAtom{}, tiled_mma_pv_f16);
+  [[maybe_unused]] auto s2r_thr_v_f16 = s2r_copy_v_f16.get_thread_slice(tid);
 
   auto sV0 = make_tensor(make_smem_ptr(v_base), SmemLayoutV{});
   auto tCrV_layout = thr_mma_pv.partition_fragment_B(sV0).layout();
@@ -282,10 +292,16 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
     }
 
     const float ks = k_scale[static_cast<long>(kv_bh) * n_rb_kv + kv_tile];
-    const float vs = v_scale[static_cast<long>(kv_bh) * n_rb_kv + kv_tile];
+    // Per-channel V: v_scale is (bh, D); skip the per-kv-tile slot (wrong
+    // shape). vs=1 placeholder; epilogue dequants per-D instead.
+    const float vs =
+        kVPerChannel ? 1.0f
+                     : v_scale[static_cast<long>(kv_bh) * n_rb_kv + kv_tile];
     const float s_dequant = qs * ks;
-    // P's fp8 quantization multiplier (vs*448 so vs cancels in PV MMA).
-    const float p_quant_scale = vs * kE4m3Max;
+    // Per-block: vs*448, vs cancels in PV MMA -> unified 448 domain, single
+    //   epilogue dequant (1/448). Per-channel: 1.0 so P8=softmax lands in
+    //   e4m3's [0,1] range; amax_d global -> uniform per-D epilogue dequant.
+    const float p_quant_scale = kVPerChannel ? 1.0f : (vs * kE4m3Max);
 
     // Phase 1: QK GEMM with split-D accumulation.
     auto tCrS = partition_fragment_C(tiled_mma_qk, Shape<Int<kBr>, Int<kBc>>{});
@@ -425,9 +441,6 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
 
       auto sV = make_tensor(make_smem_ptr(v_base + v_stage * kVChunkElements),
                             SmemLayoutV{});
-      auto tCrVStorage = thr_mma_pv.partition_fragment_B(sV);
-      auto tCrV = make_tensor(tCrVStorage.data(), tCrV_layout);
-      auto tVsV = s2r_thr_v.partition_S(sV);
 
       auto tCrO =
           make_tensor(make_rmem_ptr(&o_acc_storage[v_chunk][0]), OFragLayout{});
@@ -441,8 +454,35 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
             tCrO_rc(row, col) *= row_scale[row];
       }
 
-      ffpa_cute::gemm_rs(tCrO, tCrPv_storage, tCrV, tVsV, tiled_mma_pv,
-                         s2r_copy_v, s2r_thr_v);
+      if constexpr (kPVAccF16) {
+        // f8f8f16 PV: fp16 accumulator avoids 22-bit f8f8f32 loss on causal
+        // early rows; absorb to float o_acc via CUDA-core FADD per kv_tile.
+        // A-side P stays tCrPv_storage (SMEM roundtrip); only B-side (V)
+        // derives from the f16 TiledMma.
+        auto tCrV_f16 = thr_mma_pv_f16.partition_fragment_B(sV);
+        auto tVsV_f16 = s2r_thr_v_f16.partition_S(sV);
+        auto tCrInst = partition_fragment_C(tiled_mma_pv_f16,
+                                            Shape<Int<kBr>, Int<kVDChunk>>{});
+        clear(tCrInst);
+        ffpa_cute::gemm_rs(tCrInst, tCrPv_storage, tCrV_f16, tVsV_f16,
+                           tiled_mma_pv_f16, s2r_copy_v_f16, s2r_thr_v_f16);
+        auto tCrO_rc = make_tensor(
+            tCrO.data(), ffpa_cute::convert_layout_acc_rowcol(tCrO.layout()));
+        auto tCrInst_rc =
+            make_tensor(tCrInst.data(),
+                        ffpa_cute::convert_layout_acc_rowcol(tCrInst.layout()));
+#pragma unroll
+        for (int row = 0; row < kORows; ++row)
+#pragma unroll
+          for (int col = 0; col < kOCols; ++col)
+            tCrO_rc(row, col) += float(tCrInst_rc(row, col));
+      } else {
+        auto tCrVStorage = thr_mma_pv.partition_fragment_B(sV);
+        auto tCrV = make_tensor(tCrVStorage.data(), tCrV_layout);
+        auto tVsV = s2r_thr_v.partition_S(sV);
+        ffpa_cute::gemm_rs(tCrO, tCrPv_storage, tCrV, tVsV, tiled_mma_pv,
+                           s2r_copy_v, s2r_thr_v);
+      }
 
       CtaBarrier::arrive(&v_empty[v_stage]);
 
@@ -484,6 +524,18 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
                           make_stride(Int<kHeadDim>{}, _1{}));
     auto cO = make_identity_tensor(Shape<Int<kBr>, Int<kVDChunk>>{});
     auto tOcO = thr_mma_pv.partition_C(cO);
+    // Per-channel V: D-column coords via PV C-fragment (chunk-local [0,
+    // kVDChunk)); the v_chunk base offset is added at load time below.
+    auto cD = make_identity_tensor(Shape<Int<kBr>, Int<kVDChunk>>{});
+    auto tScD = thr_mma_pv.partition_C(cD);
+    auto tScD_rc = make_tensor(
+        tScD.data(), ffpa_cute::convert_layout_acc_rowcol(tScD.layout()));
+    const float* vs_d_base =
+        kVPerChannel ? (v_scale + static_cast<long>(kv_bh) * kHeadDim)
+                     : nullptr;
+    const float* vm_base = (kVPerChannel && vm)
+                               ? (vm + static_cast<long>(kv_bh) * kHeadDim)
+                               : nullptr;
 
     if (Br_base + kBr <= Nq - q_start_row) {
 #pragma unroll
@@ -495,14 +547,32 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
                                   OFragLayout{});
           auto tCrO_rc = make_tensor(
               tCrO.data(), ffpa_cute::convert_layout_acc_rowcol(tCrO.layout()));
+          float vs_d_col[kVPerChannel ? kOCols : 1];
+          float vm_d_col[kVPerChannel ? kOCols : 1];
+          if constexpr (kVPerChannel) {
+            const float* vs_d_v = vs_d_base + v_chunk * kVDChunk;
+            const float* vm_d_v =
+                vm_base ? (vm_base + v_chunk * kVDChunk) : nullptr;
+#pragma unroll
+            for (int col = 0; col < kOCols; ++col) {
+              const int d_idx = get<1>(tScD_rc(0, col));
+              vs_d_col[col] = vs_d_v[d_idx];
+              if (vm_d_v)
+                vm_d_col[col] = vm_d_v[d_idx];
+            }
+          }
 #pragma unroll
           for (int row = 0; row < kORows; ++row) {
             const float inv_sum =
                 (row_sum[row] == 0.0f) ? 1.0f : 1.0f / row_sum[row];
-            const float mul = inv_sum * kFP8FixedPScale;
 #pragma unroll
-            for (int col = 0; col < kOCols; ++col)
+            for (int col = 0; col < kOCols; ++col) {
+              const float mul = kVPerChannel ? (inv_sum * vs_d_col[col])
+                                             : (inv_sum * kFP8FixedPScale);
               tCrO_rc(row, col) *= mul;
+              if (vm_base)
+                tCrO_rc(row, col) += vm_d_col[col];
+            }
           }
           auto tCrOHalf = ffpa_cute::convert_type<ElementO>(tCrO);
           auto sO_v =
@@ -542,14 +612,32 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
                                 OFragLayout{});
         auto tCrO_rc = make_tensor(
             tCrO.data(), ffpa_cute::convert_layout_acc_rowcol(tCrO.layout()));
+        float vs_d_col[kVPerChannel ? kOCols : 1];
+        float vm_d_col[kVPerChannel ? kOCols : 1];
+        if constexpr (kVPerChannel) {
+          const float* vs_d_v = vs_d_base + v_chunk * kVDChunk;
+          const float* vm_d_v =
+              vm_base ? (vm_base + v_chunk * kVDChunk) : nullptr;
+#pragma unroll
+          for (int col = 0; col < kOCols; ++col) {
+            const int d_idx = get<1>(tScD_rc(0, col));
+            vs_d_col[col] = vs_d_v[d_idx];
+            if (vm_d_v)
+              vm_d_col[col] = vm_d_v[d_idx];
+          }
+        }
 #pragma unroll
         for (int row = 0; row < kORows; ++row) {
           const float inv_sum =
               (row_sum[row] == 0.0f) ? 1.0f : 1.0f / row_sum[row];
-          const float mul = inv_sum * kFP8FixedPScale;
 #pragma unroll
-          for (int col = 0; col < kOCols; ++col)
+          for (int col = 0; col < kOCols; ++col) {
+            const float mul = kVPerChannel ? (inv_sum * vs_d_col[col])
+                                           : (inv_sum * kFP8FixedPScale);
             tCrO_rc(row, col) *= mul;
+            if (vm_base)
+              tCrO_rc(row, col) += vm_d_col[col];
+          }
         }
         auto tCrOHalf = ffpa_cute::convert_type<ElementO>(tCrO);
         auto gO = local_tile(mO, Shape<Int<kBr>, Int<kVDChunk>>{},

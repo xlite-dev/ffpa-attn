@@ -125,19 +125,14 @@ void launch_ffpa_attn_fwd_template(
         // split-D kernel to A/B test the M8N1/M4N2 dispatch cross-point.
         // Applies only to 128 < D <= 1024; persist-D (D<=128) is unaffected.
         // Unset -> normal headdim-based dispatch below.
-        // split_d/m4n2 only support per-block V / f32 PV / no smooth_v.
         if constexpr (kHeadDim > 128 && kHeadDim <= 1024) {
           const char* fk = getenv("FFPA_FP8_FORCE_KERNEL");
           if (fk != nullptr) {
-            TORCH_CHECK(fp8_v_quant_method == 0 && !fp8_smooth_v &&
-                            fp8_pv_acc_type != 0,
-                        "ffpa_attn: split_d/m4n2 fp8 (D>128) supports only "
-                        "v_quant_method=per_block, pv_acc_type=f32, "
-                        "smooth_v=False");
             if (std::strcmp(fk, "split_d") == 0) {
               launch_cute_fwd_split_d_fp8_sm120<kDataType, kHeadDim, kStage>(
                   Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
                   dropout_p, philox_seed, philox_offset, fp8_smooth_k,
+                  fp8_smooth_v, fp8_v_quant_method, fp8_pv_acc_type,
                   fp8_qk_mm_type);
               return;
             } else if (std::strcmp(fk, "m4n2") == 0) {
@@ -145,6 +140,7 @@ void launch_ffpa_attn_fwd_template(
                                                      kStage>(
                   Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
                   dropout_p, philox_seed, philox_offset, fp8_smooth_k,
+                  fp8_smooth_v, fp8_v_quant_method, fp8_pv_acc_type,
                   fp8_qk_mm_type);
               return;
             }
@@ -200,11 +196,6 @@ void launch_ffpa_attn_fwd_template(
                 fp8_v_quant_method, fp8_pv_acc_type, fp8_qk_mm_type);
           }
         } else if constexpr (kHeadDim < 768) {
-          TORCH_CHECK(
-              fp8_v_quant_method == 0 && !fp8_smooth_v && fp8_pv_acc_type != 0,
-              "ffpa_attn: split_d fp8 (D>128) supports only "
-              "v_quant_method=per_block, pv_acc_type=f32, "
-              "smooth_v=False");
           if (fp8_hybrid && Nq >= fp8_hybrid_n_early) {
             const int n_early = static_cast<int>(fp8_hybrid_n_early);
             TORCH_CHECK(
@@ -235,19 +226,16 @@ void launch_ffpa_attn_fwd_template(
             launch_cute_fwd_split_d_fp8_sm120<kDataType, kHeadDim, kStage>(
                 Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
                 dropout_p, philox_seed, philox_offset, fp8_smooth_k,
+                fp8_smooth_v, fp8_v_quant_method, fp8_pv_acc_type,
                 fp8_qk_mm_type, /*q_start_row=*/n_early);
           } else {
             launch_cute_fwd_split_d_fp8_sm120<kDataType, kHeadDim, kStage>(
                 Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
                 dropout_p, philox_seed, philox_offset, fp8_smooth_k,
+                fp8_smooth_v, fp8_v_quant_method, fp8_pv_acc_type,
                 fp8_qk_mm_type);
           }
         } else {
-          TORCH_CHECK(
-              fp8_v_quant_method == 0 && !fp8_smooth_v && fp8_pv_acc_type != 0,
-              "ffpa_attn: split_d_m4n2 fp8 (D>=768) supports only "
-              "v_quant_method=per_block, pv_acc_type=f32, "
-              "smooth_v=False");
           if (fp8_hybrid && Nq >= fp8_hybrid_n_early) {
             const int n_early = static_cast<int>(fp8_hybrid_n_early);
             TORCH_CHECK(n_early % 64 == 0,
@@ -277,11 +265,13 @@ void launch_ffpa_attn_fwd_template(
             launch_cute_fwd_split_d_m4n2_fp8_sm120<kDataType, kHeadDim, kStage>(
                 Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
                 dropout_p, philox_seed, philox_offset, fp8_smooth_k,
+                fp8_smooth_v, fp8_v_quant_method, fp8_pv_acc_type,
                 fp8_qk_mm_type, /*q_start_row=*/n_early);
           } else {
             launch_cute_fwd_split_d_m4n2_fp8_sm120<kDataType, kHeadDim, kStage>(
                 Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
                 dropout_p, philox_seed, philox_offset, fp8_smooth_k,
+                fp8_smooth_v, fp8_v_quant_method, fp8_pv_acc_type,
                 fp8_qk_mm_type);
           }
         }

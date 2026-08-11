@@ -402,6 +402,15 @@ struct FFPAAttnCuTeSplitDFP8Traits {
   using TiledMmaPV = decltype(make_tiled_mma(
       MmaAtom{}, Layout<Shape<Int<kNumWarps>, _1, _1>>{},
       Tile<Int<kBr>, Int<kVDChunk>, _32>{}));
+  // f8f8f16 PV atom for the fp16-accumulator inst_buf path (split_d.cuh):
+  // same m16n8k32 shape, A/B e4m3, C/D half. CLayout matches the f32 atom so
+  // the half inst_buf absorbs into float o_acc via CUDA-core FADD per
+  // kv_tile. N dim is kVDChunk (split-D chunk, not full kHeadDim).
+  using MmaAtomPVf16 =
+      MMA_Atom<SM120_16x8x32_TN<Element, Element, cutlass::half_t>>;
+  using TiledMmaPVf16 = decltype(make_tiled_mma(
+      MmaAtomPVf16{}, Layout<Shape<Int<kNumWarps>, _1, _1>>{},
+      Tile<Int<kBr>, Int<kVDChunk>, _32>{}));
 
   using SmemCopyAtomQK = Copy_Atom<SM75_U32x4_LDSM_N, ElementQK>;
   using SmemCopyAtom = Copy_Atom<SM75_U32x4_LDSM_N, Element>;
@@ -500,6 +509,13 @@ struct FFPAAttnCuTeSplitDM4N2FP8Traits {
                                              Tile<Int<kBr>, Int<kBc>, _32>{}));
   using TiledMmaPV = decltype(make_tiled_mma(
       MmaAtom{}, AtomLayoutMN{}, Tile<Int<kBr>, Int<kVDChunk>, _32>{}));
+  // f8f8f16 PV atom for the fp16-accumulator inst_buf path (m4n2.cuh):
+  // same m16n8k32 shape, A/B e4m3, C/D half; uses m4n2 AtomLayoutMN so the
+  // half inst_buf layout matches the f32 PV atom. N dim is kVDChunk.
+  using MmaAtomPVf16 =
+      MMA_Atom<SM120_16x8x32_TN<Element, Element, cutlass::half_t>>;
+  using TiledMmaPVf16 = decltype(make_tiled_mma(
+      MmaAtomPVf16{}, AtomLayoutMN{}, Tile<Int<kBr>, Int<kVDChunk>, _32>{}));
 
   using SmemCopyAtomQK = Copy_Atom<SM75_U32x4_LDSM_N, ElementQK>;
   using SmemCopyAtom = Copy_Atom<SM75_U32x4_LDSM_N, Element>;
