@@ -33,9 +33,13 @@ using CtaBarrier = cutlass::arch::ClusterBarrier;
 //
 // O regs = D/4 per thread (D=1024 -> 256 regs). See split_d_m4n2.cuh for the
 // M4N2 register-budget analysis and cross-point vs M8N1.
+// kQKPerThread: per-block (false, 1 scale/block) vs per-thread (true,
+//   Q=64/128-row block, K=4/kBc-col block, fragment-aligned). See
+//   persist_d.cuh for details. m4n2 note: Q attention tile (kBr=64) is
+//   smaller than the 128-row quant block; quant_offset handles the mapping.
 template <typename Traits, typename ElementO, typename TmaQ, typename TmaK,
           typename TmaV, typename TmaO, bool kPVAccF16 = false,
-          bool kVPerChannel = false>
+          bool kVPerChannel = false, bool kQKPerThread = false>
 __global__ void __launch_bounds__(Traits::kNumThreads, 1)
     split_d_m4n2_fwd_cute_fp8_sm120(
         CUTLASS_GRID_CONSTANT TmaQ const tma_q,
@@ -111,8 +115,9 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
   const int kv_row_offset = (Nb_id * Nh_kv + kv_head_idx) * Nkv;
   const int q_bh = Nb_id * Nh + Nh_id;
   const int kv_bh = Nb_id * Nh_kv + kv_head_idx;
-  const float qs =
-      q_scale[static_cast<long>(q_bh) * n_rb_q + Q_tile_id + q_start_row / kBr];
+  // Q quantize always uses 128-row blocks; m4n2 attention tiles are 64 rows,
+  // so 2 attention tiles map to 1 quantize block.
+  const int quant_rb = (q_start_row + Q_tile_id * kBr) / 128;
 
   // SMEM: [Q stages | K stages | V stages | P staging | exchange]
   extern __shared__ __align__(1024) char shm[];
@@ -197,6 +202,28 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
       tScS.data(), ffpa_cute::convert_layout_acc_rowcol(tScS.layout()));
   constexpr int kSRows = decltype(size<0>(tScS_rc))::value;
   constexpr int kSCols = decltype(size<1>(tScS_rc))::value;
+
+  // Per-row Q dequant scales. Per-thread mode: 64 groups per 128-row quantize
+  // block; group g=(q_row/16)*8+q_row%8 (SM89_16x8 C-fragment layout).
+  // m4n2 kBr=64 < 128-row quant block: odd tiles offset q_row by 64.
+  float qs_arr[kSRows];
+  if constexpr (kQKPerThread) {
+    const int n_rb_q_quant = (Nq + 127) / 128;
+    const int quant_offset = (q_start_row + Q_tile_id * kBr) % 128;
+#pragma unroll
+    for (int row = 0; row < kSRows; ++row) {
+      const int q_row = get<0>(tScS_rc(row, 0)) + quant_offset;
+      const int g = (q_row / 16) * 8 + q_row % 8;
+      qs_arr[row] = q_scale[static_cast<long>(q_bh) * (n_rb_q_quant * 64) +
+                            quant_rb * 64 + g];
+    }
+  } else {
+    const float qs = q_scale[static_cast<long>(q_bh) * n_rb_q + Q_tile_id +
+                             q_start_row / kBr];
+#pragma unroll
+    for (int row = 0; row < kSRows; ++row)
+      qs_arr[row] = qs;
+  }
 
   const float scale_orig = scale;
   scale *= FFPA_M_LOG2E;
@@ -291,13 +318,18 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
       }
     }
 
-    const float ks = k_scale[static_cast<long>(kv_bh) * n_rb_kv + kv_tile];
+    // K scale: per-block (1 per kBc-col block) or per-thread (4 per block,
+    // group lane%4 matches SM89_16x8x32 C-fragment cols {2*(lane%4)+8n, +1};
+    // valid for both N-warps since groups repeat every 8 N_kv rows).
+    const float ks =
+        kQKPerThread ? k_scale[static_cast<long>(kv_bh) * (n_rb_kv * 4) +
+                               kv_tile * 4 + (tid % 32) % 4]
+                     : k_scale[static_cast<long>(kv_bh) * n_rb_kv + kv_tile];
     // Per-channel V: v_scale is (bh, D); skip the per-kv-tile slot (wrong
     // shape). vs=1 placeholder; epilogue dequants per-D instead.
     const float vs =
         kVPerChannel ? 1.0f
                      : v_scale[static_cast<long>(kv_bh) * n_rb_kv + kv_tile];
-    const float s_dequant = qs * ks;
     // Per-block: vs*448, vs cancels in PV MMA -> unified 448 domain, single
     //   epilogue dequant (1/448). Per-channel: 1.0 so P8=softmax lands in
     //   e4m3's [0,1] range; amax_d global -> uniform per-D epilogue dequant.
@@ -379,7 +411,7 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
             q_start_row + Br_base + get<0>(tScS_rc(row, 0)) + kv_offset;
 #pragma unroll
         for (int col = 0; col < kSCols; ++col) {
-          float s = scores(row, col) * s_dequant * scale;
+          float s = scores(row, col) * qs_arr[row] * ks * scale;
           if (get<1>(tScS_rc(row, col)) >= kv_valid)
             s = -INFINITY;
           if (kv_tile >= mask_start_tile) {
@@ -393,12 +425,33 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
     }
 
     float row_scale[kORows];
-    const float softmax_scale_eff = tile_needs_mask ? 1.0f : s_dequant * scale;
-    ffpa_cute::online_softmax_fp8_fixed_m4n2<decltype(scores),
-                                             decltype(tScS_rc), kORows>(
-        scores, tScS_rc, softmax_scale_eff, row_max, row_sum, row_scale,
-        smem_exchange, warp_id, lane_id, log2f(p_quant_scale),
-        1.0f / p_quant_scale, Traits::kRescaleThreshold);
+    if constexpr (kQKPerThread) {
+      // Per-thread QK: pre-dequant scores per-row, then softmax with 'scale'.
+      if (!tile_needs_mask) {
+#pragma unroll
+        for (int row = 0; row < kSRows; ++row) {
+          const float sd = qs_arr[row] * ks;
+#pragma unroll
+          for (int col = 0; col < kSCols; ++col)
+            scores(row, col) *= sd;
+        }
+      }
+      const float softmax_scale_eff = tile_needs_mask ? 1.0f : scale;
+      ffpa_cute::online_softmax_fp8_fixed_m4n2<decltype(scores),
+                                               decltype(tScS_rc), kORows>(
+          scores, tScS_rc, softmax_scale_eff, row_max, row_sum, row_scale,
+          smem_exchange, warp_id, lane_id, log2f(p_quant_scale),
+          1.0f / p_quant_scale, Traits::kRescaleThreshold);
+    } else {
+      const float s_dequant = qs_arr[0] * ks;
+      const float softmax_scale_eff =
+          tile_needs_mask ? 1.0f : s_dequant * scale;
+      ffpa_cute::online_softmax_fp8_fixed_m4n2<decltype(scores),
+                                               decltype(tScS_rc), kORows>(
+          scores, tScS_rc, softmax_scale_eff, row_max, row_sum, row_scale,
+          smem_exchange, warp_id, lane_id, log2f(p_quant_scale),
+          1.0f / p_quant_scale, Traits::kRescaleThreshold);
+    }
 
     bool local_need_rescale = false;
 #pragma unroll
@@ -659,7 +712,7 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
       for (int row = 0; row < kORows; ++row) {
         float lse = (row_max[row] + log2f(row_sum[row])) * FFPA_M_LN2;
         if (smooth_lse)
-          lse += scale_orig * qs * qkm[row];
+          lse += scale_orig * qs_arr[row] * qkm[row];
         const int global_row = q_start_row + Br_base + get<0>(tScS_rc(row, 0));
         if (global_row < Nq)
           softmax_lse[lse_base + global_row] = lse;

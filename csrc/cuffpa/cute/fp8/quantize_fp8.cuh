@@ -625,10 +625,12 @@ void launch_quantize_fp8_vt_perchannel_sm120(
       v_ptr, vt8, v_scale, kSmoothV ? vm : nullptr, Nkv, Nh_kv, Nkv_pad);
 }
 
-// Per-thread Q quantize: 64 scales per 128-row block, strided row-pairs
-// matching SM80_16x8 C-fragment (group g covers rows {16*(g/8)+g%8, +8}).
-// One thread per row (128 threads); shfl_xor(row, 8) pairs the two rows in
-// each group. kQKInt8: int8 output (amax/127); else e4m3 (amax/448).
+// Per-thread Q quantize (fragment-aligned, NOT per-token): 64 scales per
+// 128-row block. Each group covers a C-fragment row pair {r, r+8} (2 rows),
+// paired via shfl_xor(amax, 8). Per-token would use 128 scales (1 row/scale);
+// per-block uses 1. This middle ground gives zero-shuffle dequant (each
+// thread's C-frag rows share one scale) at the cost of multi-row amax sharing.
+// kQKInt8: int8 output (amax/127); else e4m3 (amax/448).
 template <typename Element, int kD, bool kQKInt8>
 __global__ void quantize_fp8_perthread_q_kernel(
     const Element* __restrict__ X,    // (B, H, N, kD)
@@ -683,10 +685,13 @@ __global__ void quantize_fp8_perthread_q_kernel(
   }
 }
 
-// Per-thread K quantize: 4 scales per 128-row block, grouped by N_kv row
-// ((row%8)/2) matching SM80_16x8 C-fragment N-column layout: thread lane
-// accesses N_kv cols {2*(lane%4)+8n, +1}, group=lane%4=(col%8)/2. amax is
-// across ALL D for each group of 32 N_kv rows. Smooth-K (km) subtracted.
+// Per-thread K quantize (fragment-aligned, NOT per-token): 4 scales per
+// kBlockRows-row block, grouped by N_kv row (row%8)/2 matching SM89_16x8x32
+// C-fragment N-column layout: thread lane accesses N_kv cols
+// {2*(lane%4)+8n, +1}, group=lane%4=(col%8)/2. amax across ALL D per group.
+// Per-token would use kBlockRows scales (1 row/scale); per-block uses 1.
+// Groups repeat every 8 rows → valid for all warps (including m4n2's 2
+// N-warps). Smooth-K (km) subtracted.
 template <typename Element, int kBlockRows, int kD, bool kQKInt8>
 __global__ void quantize_fp8_perthread_k_kernel(
     const Element* __restrict__ X,    // (B, H, N, kD)
@@ -814,7 +819,7 @@ void launch_quantize_fp8_perthread_qk_sm120(
   using QKOut = QKOutT<kQKInt8>;
   // Q: 128-row blocks, 64 scale per block.
   {
-    dim3 grid((Nq + kBr - 1) / kBr, B * Nh);
+    dim3 grid((Nq + 127) / 128, B * Nh);
     auto qk = quantize_fp8_perthread_q_kernel<Element, kHeadDim, kQKInt8>;
     qk<<<grid, 128, 0, stream>>>(q_ptr, reinterpret_cast<QKOut*>(q8), q_scale,
                                  Nq, Nh);

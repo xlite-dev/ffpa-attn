@@ -117,17 +117,11 @@ void launch_ffpa_attn_fwd_template(
     if (prop->major >= 9) {
       if (force_fp8) {
         // q/k quant: per_block (0) for all headdims; per_thread (2) for
-        // D<=128 only (persist_d path). split_d/m4n2 (D>128) support
-        // per_block only.
-        if constexpr (kHeadDim <= 128) {
-          TORCH_CHECK((fp8_q_quant_method == 0 && fp8_k_quant_method == 0) ||
-                          (fp8_q_quant_method == 2 && fp8_k_quant_method == 2),
-                      "ffpa_attn: Q/K quant method must be both per_block or "
-                      "both per_thread");
-        } else {
-          TORCH_CHECK(fp8_q_quant_method == 0 && fp8_k_quant_method == 0,
-                      "ffpa_attn: per-thread Q/K quant requires D<=128");
-        }
+        // all headdims (persist_d + split_d + m4n2 paths).
+        TORCH_CHECK((fp8_q_quant_method == 0 && fp8_k_quant_method == 0) ||
+                        (fp8_q_quant_method == 2 && fp8_k_quant_method == 2),
+                    "ffpa_attn: Q/K quant method must be both per_block or "
+                    "both per_thread");
 #ifdef ENABLE_FFPA_CUTE_EXT
         // EXPERIMENT: FFPA_FP8_FORCE_KERNEL=split_d|m4n2 forces a specific
         // split-D kernel to A/B test the M8N1/M4N2 dispatch cross-point.
@@ -140,16 +134,16 @@ void launch_ffpa_attn_fwd_template(
               launch_cute_fwd_split_d_fp8_sm120<kDataType, kHeadDim, kStage>(
                   Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
                   dropout_p, philox_seed, philox_offset, fp8_smooth_k,
-                  fp8_smooth_v, fp8_v_quant_method, fp8_pv_acc_type,
-                  fp8_qk_mm_type);
+                  fp8_smooth_v, fp8_q_quant_method, fp8_k_quant_method,
+                  fp8_v_quant_method, fp8_pv_acc_type, fp8_qk_mm_type);
               return;
             } else if (std::strcmp(fk, "m4n2") == 0) {
               launch_cute_fwd_split_d_m4n2_fp8_sm120<kDataType, kHeadDim,
                                                      kStage>(
                   Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
                   dropout_p, philox_seed, philox_offset, fp8_smooth_k,
-                  fp8_smooth_v, fp8_v_quant_method, fp8_pv_acc_type,
-                  fp8_qk_mm_type);
+                  fp8_smooth_v, fp8_q_quant_method, fp8_k_quant_method,
+                  fp8_v_quant_method, fp8_pv_acc_type, fp8_qk_mm_type);
               return;
             }
           }
@@ -234,14 +228,15 @@ void launch_ffpa_attn_fwd_template(
             launch_cute_fwd_split_d_fp8_sm120<kDataType, kHeadDim, kStage>(
                 Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
                 dropout_p, philox_seed, philox_offset, fp8_smooth_k,
-                fp8_smooth_v, fp8_v_quant_method, fp8_pv_acc_type,
-                fp8_qk_mm_type, /*q_start_row=*/n_early);
+                fp8_smooth_v, fp8_q_quant_method, fp8_k_quant_method,
+                fp8_v_quant_method, fp8_pv_acc_type, fp8_qk_mm_type,
+                /*q_start_row=*/n_early);
           } else {
             launch_cute_fwd_split_d_fp8_sm120<kDataType, kHeadDim, kStage>(
                 Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
                 dropout_p, philox_seed, philox_offset, fp8_smooth_k,
-                fp8_smooth_v, fp8_v_quant_method, fp8_pv_acc_type,
-                fp8_qk_mm_type);
+                fp8_smooth_v, fp8_q_quant_method, fp8_k_quant_method,
+                fp8_v_quant_method, fp8_pv_acc_type, fp8_qk_mm_type);
           }
         } else {
           if (fp8_hybrid && Nq >= fp8_hybrid_n_early) {
@@ -273,14 +268,15 @@ void launch_ffpa_attn_fwd_template(
             launch_cute_fwd_split_d_m4n2_fp8_sm120<kDataType, kHeadDim, kStage>(
                 Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
                 dropout_p, philox_seed, philox_offset, fp8_smooth_k,
-                fp8_smooth_v, fp8_v_quant_method, fp8_pv_acc_type,
-                fp8_qk_mm_type, /*q_start_row=*/n_early);
+                fp8_smooth_v, fp8_q_quant_method, fp8_k_quant_method,
+                fp8_v_quant_method, fp8_pv_acc_type, fp8_qk_mm_type,
+                /*q_start_row=*/n_early);
           } else {
             launch_cute_fwd_split_d_m4n2_fp8_sm120<kDataType, kHeadDim, kStage>(
                 Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
                 dropout_p, philox_seed, philox_offset, fp8_smooth_k,
-                fp8_smooth_v, fp8_v_quant_method, fp8_pv_acc_type,
-                fp8_qk_mm_type);
+                fp8_smooth_v, fp8_q_quant_method, fp8_k_quant_method,
+                fp8_v_quant_method, fp8_pv_acc_type, fp8_qk_mm_type);
           }
         }
 #else

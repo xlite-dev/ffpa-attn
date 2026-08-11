@@ -244,7 +244,7 @@ class CUDABackend(Backend):
   fp8_smooth_v: bool = False  # FP8 only: subtract per-(b,h) V dim mean.
   fp8_q_quant_method: str = "per_block"  # FP8 only: per_block / per_thread.
   fp8_k_quant_method: str = "per_block"  # FP8 only: per_block / per_thread.
-  fp8_v_quant_method: str = "per_block"  # FP8 only; per_block/per_channel.
+  fp8_v_quant_method: str = "per_block"  # FP8 only; per_block / per_channel.
   fp8_pv_acc_type: str = "f32"  # FP8 only; f32/f16 PV accumulator.
   fp8_qk_mm_type: str = "fp8"  # FP8 only: QK MMA dtype; "fp8" or "int8".
   # FP8 only: hybrid — fp16 computes [0:n_early] rows, fp8 computes

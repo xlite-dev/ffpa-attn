@@ -70,6 +70,22 @@ using CtaBarrier = cutlass::arch::ClusterBarrier;
 //   false - fixed p_scale = 1/448 (valid since max(P) <= 1); no reduction,
 //           PV accumulates directly into o_acc, single dequant in epilogue.
 //           Faster, slightly coarser for rows whose max(P) << 1. Default.
+// kQKPerThread selects Q/K quantization granularity:
+//   false - per-block: 1 scale per kBr-row Q block, 1 per kBc-col K block.
+//           Dequant: single scalar qs*ks folded into softmax scale.
+//   true  - per-thread (fragment-aligned, NOT per-token): Q/K scales are
+//           grouped to match the SM89_16x8x32 MMA C-fragment thread mapping
+//           so dequant needs zero shuffles. This is coarser than per-token
+//           (where every row gets its own scale) but finer than per-block:
+//             Q: 64 scales/128-row block (2 rows/group — each group is a
+//                C-frag row pair {r, r+8}; shfl_xor(amax,8) pairs them).
+//                Per-token would be 128 scales (1 row/scale).
+//             K: 4 scales/block (block_size/4 rows/group — group=(row%8)/2,
+//                amax across all D). Per-token would be block_size scales.
+//           Dequant: per-row qs_arr[row]*ks pre-multiplied into scores before
+//           softmax; softmax_scale_eff = scale (not s_dequant*scale).
+//           Trade-off: less precise than per-token (multi-row groups share
+//           one amax) but avoids per-element scale lookup / shuffles.
 template <typename Traits, typename ElementO, typename TmaQ, typename TmaK,
           typename TmaV, typename TmaO, bool kPQuantPerRow = false,
           bool kPVAccF16 = false, bool kVPerChannel = false,
