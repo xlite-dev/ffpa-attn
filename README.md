@@ -21,7 +21,7 @@
 
 ## Latest News
 
-- [2026/08] Support [FP8 Attention](./csrc/cuffpa/cute/fp8/) for headdim 64~1024 ([sm_120](./csrc/cuffpa/cute/fp8/sm_120/)), achieving **580 TOPS** (D=128) on NVIDIA RTX 5090, with almost the same accuracy as SageAttention.
+- [2026/08] Support [FP8 Attention](./csrc/cuffpa/cute/fp8/) for headdim 64~1024 ([sm_120](./csrc/cuffpa/cute/fp8/sm_120/)), achieving **580 TOPS** (D=128) on NVIDIA RTX 5090, with almost the same accuracy as SageAttention. Support per-block(QKV)/per-thread(QK)/per-channel(V) FP8 quantization and hybrid FP8/FP16 attention.
 - [2026/06] DefTruth, Butterfingrz, 2026. [FFPA: Fast and Memory-Efficient Exact Attention for Large Headdim](https://doi.org/10.5281/zenodo.20638547).
 
 ## Quick Start
