@@ -197,14 +197,14 @@ def run_scenario(sc, dtype, scale, warmup, iters, use_sage):
     for name, fn in fns.items()
   }
 
-  print(f"### {sc.name}")
   print(
-    f"  shape: B{sc.B} Hq{sc.Hq} Hkv{sc.Hkv} "
+    f"{sc.name}, shape: B{sc.B} Hq{sc.Hq} Hkv{sc.Hkv} "
     f"Nq{sc.Nq} Nkv{sc.Nkv} D{sc.D} "
     f"causal={sc.causal} gqa={sc.gqa}"
   )
-  print("| backend | rel_err | min(ms) | TFLOPS | speedup vs SDPA-FA2 |")
-  print("|---|---|---|---|---|")
+  # Markdown table with dynamic column widths so the pipes align in terminal.
+  cols = ["backend", "rel_err", "min(ms)", "TFLOPS", "speedup vs SDPA-FA2"]
+  rows = []
   order = ["FFPA-FP8", "Sage", "SDPA-FA2"]
   for name in order:
     if name not in ms:
@@ -214,7 +214,21 @@ def run_scenario(sc, dtype, scale, warmup, iters, use_sage):
     err = errs.get(name, float("nan"))
     err_str = f"{err:.4f}" if err == err else "n/a"
     tf_str = f"{tf:.1f}" if tf is not None else "n/a"
-    print(f"| {name} | {err_str} | {ms[name]:.3f} | {tf_str} | {sp:.3f}x |")
+    sp_str = f"{sp:.3f}x"
+    rows.append([name, err_str, f"{ms[name]:.3f}", tf_str, sp_str])
+  widths = [
+    max(len(cols[i]), *(len(r[i]) for r in rows)) for i in range(len(cols))
+  ]
+
+  def fmt_row(cells):
+    return "| " + " | ".join(
+      f"{c:<{widths[i]}}" for i, c in enumerate(cells)
+    ) + " |"
+
+  print(fmt_row(cols))
+  print("|" + "|".join("-" * (w + 2) for w in widths) + "|")
+  for r in rows:
+    print(fmt_row(r))
   print()
 
 
@@ -264,9 +278,9 @@ def main():
   use_sage = (not args.no_sage) and SAGE_INSTALLED
   Ns = [int(x) for x in args.N.split(",")]
 
-  print(f"# dtype={dtype}, GPU={torch.cuda.get_device_name()}")
+  print(f"dtype={dtype}, GPU={torch.cuda.get_device_name()}")
   print(
-    f"# sage={'on' if use_sage else 'off'}, "
+    f"sage={'on' if use_sage else 'off'}, "
     f"SDPA=FLASH_ATTENTION(FA2), B={args.B} H={args.H} Hkv={args.Hkv} "
     f"D={args.D} warmup={args.warmup} iters={args.iters}\n"
   )
