@@ -3,7 +3,7 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <cstring>
 #include <optional>
-#include "backend_hint.h"
+#include "backend.h"
 #include "native/launch.cuh"
 #ifdef ENABLE_FFPA_CUTE_EXT
 #include "cute/launch.cuh"
