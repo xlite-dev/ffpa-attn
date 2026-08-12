@@ -91,7 +91,9 @@ TRITON_BACKEND = "triton"
 CUDA_BACKEND = "cuda"
 MIN_BENCHMARK_HEAD_DIM = 32
 MAX_FFPA_BENCHMARK_HEAD_DIM = 1024
-HEAD_DIM_ALIGNMENT = 32
+# 8 = quantize kernel Vec8 alignment (D % 8 == 0); non-32-multiples are padded
+# transparently by the C++ layer (ffpa_api.cc, e.g. 120 -> 128) for the fp8 path.
+HEAD_DIM_ALIGNMENT = 8
 TRITON_SMALL_D_ENV = "FFPA_TRITON_ALLOW_SMALL_D"
 CUDA_SMALL_D_ENV = "FFPA_CUDA_ALLOW_SMALL_D"
 CUTEDSL_SMALL_D_ENV = "FFPA_CUTE_ALLOW_SMALL_D"
