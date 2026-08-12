@@ -104,6 +104,8 @@ void ffpa_attn_forward(torch::Tensor Q, torch::Tensor K, torch::Tensor V,
   // resolves 1/sqrt(D_og)); Q/K/V are NOT padded — quantize kernels read
   // with stride=D_og and zero-fill output pad cols. Only O is padded (TMA
   // store needs compile-time kHeadDim stride); output is sliced back.
+  // Per-block and per-channel V quant both work: per-channel stats/quantize
+  // are D_og-aware (pad cols get v_scale=1, vm=0; VT pad rows are zero).
   // CUTE_TMA_FP8/CUTE_TMA/CUTE paths. Dispatch goes through the generated
   // ffpa_attn_fwd_*_d(..., head_dim_pad) helper, which throws a clean error
   // if head_dim_pad was not compiled.
@@ -122,11 +124,6 @@ void ffpa_attn_forward(torch::Tensor Q, torch::Tensor K, torch::Tensor V,
     TORCH_CHECK(head_dim_pad >= 32 && head_dim_pad <= 1024,
                 "ffpa_attn: padded head_dim must be in [32,1024], got ",
                 head_dim_pad);
-    if (pad_backend == ffpa::CudaBackendImpl::CUTE_TMA_FP8)
-      TORCH_CHECK(
-          fp8_v_quant_method != 1,
-          "ffpa_attn: per-channel V quant + non-32-multiple head_dim (D=",
-          head_dim_og, ") pad is not yet supported; use per-block V.");
     O_orig = O;
     O = torch::empty({Q.size(0), Q.size(1), Q.size(2), head_dim_pad},
                      O.options());

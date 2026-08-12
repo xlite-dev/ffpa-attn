@@ -18,7 +18,7 @@ __global__ void v_col_stats_kernel(const Element* __restrict__ v,
                                    float* __restrict__ partials_sum,
                                    float* __restrict__ partials_max,
                                    float* __restrict__ partials_min, int Nkv,
-                                   int rows_per_chunk) {
+                                   int rows_per_chunk, int D_og) {
   constexpr int kVec = 16 / sizeof(Element);  // 8 half/bf16 per 16B
   constexpr int kColsPerRow = kD / kVec;
   constexpr int kThreads = 256;
@@ -27,7 +27,7 @@ __global__ void v_col_stats_kernel(const Element* __restrict__ v,
   const int bh = blockIdx.y;
   const int row0 = chunk * rows_per_chunk;
   const int row_end = min(row0 + rows_per_chunk, Nkv);
-  const Element* v_bh = v + static_cast<long>(bh) * Nkv * kD;
+  const Element* v_bh = v + static_cast<long>(bh) * Nkv * D_og;
   const int col0 = (threadIdx.x % kColsPerRow) * kVec;
 
   float sum_acc[kVec], max_acc[kVec], min_acc[kVec];
@@ -37,17 +37,29 @@ __global__ void v_col_stats_kernel(const Element* __restrict__ v,
     max_acc[i] = -INFINITY;
     min_acc[i] = INFINITY;
   }
-  for (int r = row0 + threadIdx.x / kColsPerRow; r < row_end;
-       r += kRowsPerIter) {
-    const uint4 packed = *reinterpret_cast<const uint4*>(
-        v_bh + static_cast<long>(r) * kD + col0);
-    const Element* vals = reinterpret_cast<const Element*>(&packed);
+  // Pad cols (col0 >= D_og) have no V data; D_og%8==0 keeps each kVec
+  // entirely inside or outside the real dims, so the guard is exact.
+  if (col0 < D_og) {
+    for (int r = row0 + threadIdx.x / kColsPerRow; r < row_end;
+         r += kRowsPerIter) {
+      const uint4 packed = *reinterpret_cast<const uint4*>(
+          v_bh + static_cast<long>(r) * D_og + col0);
+      const Element* vals = reinterpret_cast<const Element*>(&packed);
+#pragma unroll
+      for (int i = 0; i < kVec; ++i) {
+        const float x = static_cast<float>(vals[i]);
+        sum_acc[i] += x;
+        max_acc[i] = fmaxf(max_acc[i], x);
+        min_acc[i] = fminf(min_acc[i], x);
+      }
+    }
+  } else {
+    // No data: collapse max/min to 0 so partials stay well-defined (the
+    // finalize kernel skips pad cols anyway).
 #pragma unroll
     for (int i = 0; i < kVec; ++i) {
-      const float x = static_cast<float>(vals[i]);
-      sum_acc[i] += x;
-      max_acc[i] = fmaxf(max_acc[i], x);
-      min_acc[i] = fminf(min_acc[i], x);
+      max_acc[i] = 0.0f;
+      min_acc[i] = 0.0f;
     }
   }
 
@@ -97,11 +109,19 @@ __global__ void v_stats_finalize_kernel(const float* __restrict__ partials_sum,
                                         const float* __restrict__ partials_min,
                                         float* __restrict__ vm,
                                         float* __restrict__ v_scale, int chunks,
-                                        int Nkv, float v_scale_max) {
+                                        int Nkv, float v_scale_max, int D_og) {
   const int bh = blockIdx.x;
   const int d = threadIdx.x;
   if (d >= kD)
     return;
+  if (d >= D_og) {
+    // Pad cols: no data, VT is zero-filled. v_scale=1 (identity) avoids
+    // 0/0 in the quantize divide; vm=0 keeps the epilogue dequant (O += mean)
+    // at 0. Deliberately NOT scaled by v_scale_max (decoupled on purpose).
+    vm[static_cast<long>(bh) * kD + d] = 0.0f;
+    v_scale[static_cast<long>(bh) * kD + d] = 1.0f;
+    return;
+  }
   const float inv_n = 1.0f / static_cast<float>(Nkv);
   float s = 0.0f, mx = -INFINITY, mn = INFINITY;
   for (int c = 0; c < chunks; ++c) {
@@ -128,16 +148,17 @@ template <typename Element, int kHeadDim, bool kSmoothV>
 void launch_v_stats_sm120(const Element* v_ptr, float* vm, float* v_scale,
                           float* partials_sum, float* partials_max,
                           float* partials_min, int Nb, int Nh_kv, int Nkv,
-                          cudaStream_t stream, float v_scale_max = 448.0f) {
+                          cudaStream_t stream, int D_og,
+                          float v_scale_max = 448.0f) {
   const int bh = Nb * Nh_kv;
   const int chunks = (Nkv + kVStatsRowsPerChunk - 1) / kVStatsRowsPerChunk;
   dim3 grid(chunks, bh);
   v_col_stats_kernel<Element, kHeadDim>
       <<<grid, 256, 0, stream>>>(v_ptr, partials_sum, partials_max,
-                                 partials_min, Nkv, kVStatsRowsPerChunk);
-  v_stats_finalize_kernel<kHeadDim, kSmoothV>
-      <<<bh, kHeadDim, 0, stream>>>(partials_sum, partials_max, partials_min,
-                                    vm, v_scale, chunks, Nkv, v_scale_max);
+                                 partials_min, Nkv, kVStatsRowsPerChunk, D_og);
+  v_stats_finalize_kernel<kHeadDim, kSmoothV><<<bh, kHeadDim, 0, stream>>>(
+      partials_sum, partials_max, partials_min, vm, v_scale, chunks, Nkv,
+      v_scale_max, D_og);
 }
 
 }  // namespace ffpa_fp8

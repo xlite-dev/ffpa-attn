@@ -507,11 +507,11 @@ __global__ void quantize_fp8_qkv_fused_kernel(
 // v_scale[bh, D] instead of computed as a per-tile amax.
 template <typename Element, int kBlockRows, int kD>
 __global__ void quantize_fp8_vt_perchannel_kernel(
-    const Element* __restrict__ V,    // (B, H, N, D) row-major
+    const Element* __restrict__ V,    // (B, H, N, D_og) row-major
     __nv_fp8_e4m3* __restrict__ VT,   // flat [B*Nh_kv*D, Nkv_pad]
     const float* __restrict__ scale,  // (B*Nh_kv, D)
     const float* __restrict__ vm,     // (B*Nh_kv, D) per-D mean, or nullptr
-    int N, int Nh_kv, int ldy) {
+    int N, int Nh_kv, int ldy, int D_og) {
   constexpr int D = kD;
   constexpr int kPad = 16;
   constexpr int kVec = 8;
@@ -535,7 +535,7 @@ __global__ void quantize_fp8_vt_perchannel_kernel(
   constexpr int n_chunks_per_thread = total / kThreads;
   static_assert(total % kThreads == 0);
 
-  const Element* v_bh = V + static_cast<long>(bh) * N * D;
+  const Element* v_bh = V + static_cast<long>(bh) * N * D_og;
   const float* scale_bh = scale + static_cast<long>(bh) * D;
   const float* vm_bh = vm ? (vm + static_cast<long>(bh) * D) : nullptr;
   using VecIn = Vec8<Element>;
@@ -547,9 +547,10 @@ __global__ void quantize_fp8_vt_perchannel_kernel(
     const int r = i / dv;
     const int c = i % dv;
     VecIn v = Vec8<Element>::zero();
-    if (row0 + r < N)
+    // D_og%8==0 keeps each kVec entirely inside/outside the real dims.
+    if (row0 + r < N && c * kVec < D_og)
       v = reinterpret_cast<const VecIn*>(v_bh +
-                                         static_cast<long>(row0 + r) * D)[c];
+                                         static_cast<long>(row0 + r) * D_og)[c];
     regs[j] = v;
   }
 
@@ -613,11 +614,11 @@ template <typename Element, int kBr, int kBc, int kHeadDim, bool kSmoothV>
 void launch_quantize_fp8_vt_perchannel_sm120(
     const Element* v_ptr, __nv_fp8_e4m3* vt8, float* v_scale, float* vm,
     float* partials_sum, float* partials_max, float* partials_min, int B,
-    int Nh_kv, int Nkv, int Nkv_pad, cudaStream_t stream,
+    int Nh_kv, int Nkv, int Nkv_pad, cudaStream_t stream, int D_og,
     float v_scale_max = 448.0f) {
   launch_v_stats_sm120<Element, kHeadDim, kSmoothV>(
       v_ptr, vm, v_scale, partials_sum, partials_max, partials_min, B, Nh_kv,
-      Nkv, stream, v_scale_max);
+      Nkv, stream, D_og, v_scale_max);
   constexpr int kDChunk = (kHeadDim < 256) ? kHeadDim : 256;
   constexpr int kVtSmemBytes = kBc * (kDChunk + 16);
   dim3 grid_q((Nkv + kBc - 1) / kBc, B * Nh_kv);
@@ -625,7 +626,7 @@ void launch_quantize_fp8_vt_perchannel_sm120(
   cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
                        kVtSmemBytes);
   kernel<<<grid_q, 128, kVtSmemBytes, stream>>>(
-      v_ptr, vt8, v_scale, kSmoothV ? vm : nullptr, Nkv, Nh_kv, Nkv_pad);
+      v_ptr, vt8, v_scale, kSmoothV ? vm : nullptr, Nkv, Nh_kv, Nkv_pad, D_og);
 }
 
 // Per-thread Q quantize (fragment-aligned, NOT per-token): 64 scales per
