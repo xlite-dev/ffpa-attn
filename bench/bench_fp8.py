@@ -41,12 +41,25 @@ if SAGE_INSTALLED:
 
 
 def fp8_backend() -> CUDABackend:
+  gpu_name = torch.cuda.get_device_name()
+  if "5090" in gpu_name:
+    return CUDABackend(
+      backward=False,
+      enable_tma=True,
+      enable_cute=True,
+      enable_fp8=True,
+      fp8_qk_mm_type="int8",
+      fp8_pv_acc_type="f16",
+    )
   return CUDABackend(
-    backward=False, enable_tma=True, enable_cute=True, enable_fp8=True
+    backward=False,
+    enable_tma=True,
+    enable_cute=True,
+    enable_fp8=True,
   )
 
 
-def bench_ms(fn, warmup=10, iters=30) -> float:
+def bench_ms(fn, warmup=3, iters=5) -> float:
   for _ in range(warmup):
     fn()
   torch.cuda.synchronize()
@@ -254,8 +267,8 @@ def parse_args():
     help="Activation dtype",
   )
   p.add_argument("--scale", type=float, default=0.5, help="Input randn scale")
-  p.add_argument("--warmup", type=int, default=10, help="Warmup iters")
-  p.add_argument("--iters", type=int, default=30, help="Bench iters")
+  p.add_argument("--warmup", type=int, default=3, help="Warmup iters")
+  p.add_argument("--iters", type=int, default=5, help="Bench iters")
   p.add_argument("--no-sage", action="store_true", help="Skip SageAttention")
   p.add_argument(
     "--no-cross-dense",
