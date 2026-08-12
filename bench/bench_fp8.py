@@ -139,9 +139,7 @@ def run_ffpa(q, k, v, causal, gqa):
 def run_sage(q, k, v, causal, gqa):
   if not SAGE_INSTALLED:
     return None
-  if gqa and q.size(1) != k.size(1):
-    k = k.repeat_interleave(q.size(1) // k.size(1), dim=1)
-    v = v.repeat_interleave(q.size(1) // v.size(1), dim=1)
+  # sageattn handles GQA natively (Hq % Hkv == 0); no KV repeat needed.
   return sageattn(q, k, v, tensor_layout="HND", is_causal=causal)
 
 
