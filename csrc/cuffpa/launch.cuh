@@ -153,7 +153,11 @@ void launch_ffpa_attn_fwd_template(
         // fp16 dispatch (M4N2 wins only for D>=768; below that M8N1 is
         // faster even with D/2 reg spill, same as fp16).
         if constexpr (kHeadDim <= 224) {
-          if (fp8_hybrid && Nq >= fp8_hybrid_n_early) {
+          // Skip hybrid when Q's real D != kHeadDim (non-32-multiple pad
+          // path): the fp16 early-rows sub-launch would pad-mismatch O_e
+          // (D_og) vs O (D_pad). Pure fp8 path handles D_og natively.
+          const bool d_is_padded = Q.size(3) != kHeadDim;
+          if (fp8_hybrid && Nq >= fp8_hybrid_n_early && !d_is_padded) {
             const int n_early = static_cast<int>(fp8_hybrid_n_early);
             TORCH_CHECK(
                 n_early % 128 == 0,

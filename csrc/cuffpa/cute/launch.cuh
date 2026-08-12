@@ -553,6 +553,8 @@ void launch_cute_fwd_persist_d_fp8_sm120_impl(
   const int n_rb_kv = utils::div_ceil(Nkv, kBc);
   // TMA needs a 16-byte-aligned leading stride; fp8 rows are Nkv bytes, so pad.
   const int Nkv_pad = (Nkv + 15) / 16 * 16;
+  // D_og: real input head_dim (may be < kHeadDim for non-32-mult pad path).
+  const int D_og = Q.size(3);
 
   auto opts_qk = torch::TensorOptions()
                      .dtype(kQKInt8 ? torch::kChar : torch::kFloat8_e4m3fn)
@@ -614,7 +616,7 @@ void launch_cute_fwd_persist_d_fp8_sm120_impl(
     ffpa_fp8::launch_kv_mean_sm120<kDataType, kHeadDim>(
         k_ptr, reinterpret_cast<kDataType*>(km.data_ptr()),
         km_f32.data_ptr<float>(), km_partials.data_ptr<float>(), Nb, Nh_kv, Nkv,
-        stream);
+        D_og, stream);
   }
   if (qk_per_thread) {
     ffpa_fp8::launch_quantize_fp8_perthread_qk_sm120<kDataType, kBr, kBc,
@@ -622,15 +624,15 @@ void launch_cute_fwd_persist_d_fp8_sm120_impl(
         q_ptr, k_ptr, v_ptr, q8.data_ptr(), k8.data_ptr(),
         reinterpret_cast<__nv_fp8_e4m3*>(vt8.data_ptr()),
         q_scale.data_ptr<float>(), k_scale.data_ptr<float>(),
-        v_scale_quant.data_ptr<float>(), Nb, Nh, Nh_kv, Nq, Nkv, Nkv_pad,
+        v_scale_quant.data_ptr<float>(), Nb, Nh, Nh_kv, Nq, Nkv, Nkv_pad, D_og,
         stream, km_ptr);
   } else {
     ffpa_fp8::launch_quantize_fp8_sm120<kDataType, kBr, kBc, kHeadDim, kQKInt8>(
         q_ptr, k_ptr, v_ptr, q8.data_ptr(), k8.data_ptr(),
         reinterpret_cast<__nv_fp8_e4m3*>(vt8.data_ptr()),
         q_scale.data_ptr<float>(), k_scale.data_ptr<float>(),
-        v_scale_quant.data_ptr<float>(), Nb, Nh, Nh_kv, Nq, Nkv, Nkv_pad,
-        kHeadDim, stream, km_ptr);
+        v_scale_quant.data_ptr<float>(), Nb, Nh, Nh_kv, Nq, Nkv, Nkv_pad, D_og,
+        stream, km_ptr);
   }
 
   // Per-channel V (sage-style): re-quantize V with per-D scale via coalesced
@@ -883,6 +885,8 @@ void launch_cute_fwd_split_d_fp8_sm120_impl(
   const int n_rb_kv = utils::div_ceil(Nkv, kBc);
   // TMA needs a 16-byte-aligned leading stride; fp8 rows are Nkv bytes, so pad.
   const int Nkv_pad = (Nkv + 15) / 16 * 16;
+  // D_og: real input head_dim (may be < kHeadDim for non-32-mult pad path).
+  const int D_og = Q.size(3);
 
   auto opts_qk = torch::TensorOptions()
                      .dtype(kQKInt8 ? torch::kChar : torch::kFloat8_e4m3fn)
@@ -930,7 +934,7 @@ void launch_cute_fwd_split_d_fp8_sm120_impl(
     ffpa_fp8::launch_kv_mean_sm120<kDataType, kHeadDim>(
         k_ptr, reinterpret_cast<kDataType*>(km.data_ptr()),
         km_f32.data_ptr<float>(), km_partials.data_ptr<float>(), Nb, Nh_kv, Nkv,
-        stream);
+        D_og, stream);
   }
   if (qk_per_thread) {
     ffpa_fp8::launch_quantize_fp8_perthread_qk_sm120<kDataType, kBr, kBc,
@@ -938,15 +942,15 @@ void launch_cute_fwd_split_d_fp8_sm120_impl(
         q_ptr, k_ptr, v_ptr, q8.data_ptr(), k8.data_ptr(),
         reinterpret_cast<__nv_fp8_e4m3*>(vt8.data_ptr()),
         q_scale.data_ptr<float>(), k_scale.data_ptr<float>(),
-        v_scale_quant.data_ptr<float>(), Nb, Nh, Nh_kv, Nq, Nkv, Nkv_pad,
+        v_scale_quant.data_ptr<float>(), Nb, Nh, Nh_kv, Nq, Nkv, Nkv_pad, D_og,
         stream, km_ptr);
   } else {
     ffpa_fp8::launch_quantize_fp8_sm120<kDataType, kBr, kBc, kHeadDim, kQKInt8>(
         q_ptr, k_ptr, v_ptr, q8.data_ptr(), k8.data_ptr(),
         reinterpret_cast<__nv_fp8_e4m3*>(vt8.data_ptr()),
         q_scale.data_ptr<float>(), k_scale.data_ptr<float>(),
-        v_scale_quant.data_ptr<float>(), Nb, Nh, Nh_kv, Nq, Nkv, Nkv_pad,
-        kHeadDim, stream, km_ptr);
+        v_scale_quant.data_ptr<float>(), Nb, Nh, Nh_kv, Nq, Nkv, Nkv_pad, D_og,
+        stream, km_ptr);
   }
 
   // Per-channel V (sage-style): re-quantize V with per-D scale via coalesced
@@ -1178,6 +1182,8 @@ void launch_cute_fwd_split_d_m4n2_fp8_sm120_impl(
   const int n_rb_q = utils::div_ceil(Nq, kBr);
   const int n_rb_kv = utils::div_ceil(Nkv, kBc);
   const int Nkv_pad = (Nkv + 15) / 16 * 16;
+  // D_og: real input head_dim (may be < kHeadDim for non-32-mult pad path).
+  const int D_og = Q.size(3);
 
   auto opts_qk = torch::TensorOptions()
                      .dtype(kQKInt8 ? torch::kChar : torch::kFloat8_e4m3fn)
@@ -1227,7 +1233,7 @@ void launch_cute_fwd_split_d_m4n2_fp8_sm120_impl(
     ffpa_fp8::launch_kv_mean_sm120<kDataType, kHeadDim>(
         k_ptr, reinterpret_cast<kDataType*>(km.data_ptr()),
         km_f32.data_ptr<float>(), km_partials.data_ptr<float>(), Nb, Nh_kv, Nkv,
-        stream);
+        D_og, stream);
   }
   if (qk_per_thread) {
     ffpa_fp8::launch_quantize_fp8_perthread_qk_sm120<kDataType, kBr, kBc,
@@ -1235,15 +1241,15 @@ void launch_cute_fwd_split_d_m4n2_fp8_sm120_impl(
         q_ptr, k_ptr, v_ptr, q8.data_ptr(), k8.data_ptr(),
         reinterpret_cast<__nv_fp8_e4m3*>(vt8.data_ptr()),
         q_scale.data_ptr<float>(), k_scale.data_ptr<float>(),
-        v_scale_quant.data_ptr<float>(), Nb, Nh, Nh_kv, Nq, Nkv, Nkv_pad,
+        v_scale_quant.data_ptr<float>(), Nb, Nh, Nh_kv, Nq, Nkv, Nkv_pad, D_og,
         stream, km_ptr);
   } else {
     ffpa_fp8::launch_quantize_fp8_sm120<kDataType, kBr, kBc, kHeadDim, kQKInt8>(
         q_ptr, k_ptr, v_ptr, q8.data_ptr(), k8.data_ptr(),
         reinterpret_cast<__nv_fp8_e4m3*>(vt8.data_ptr()),
         q_scale.data_ptr<float>(), k_scale.data_ptr<float>(),
-        v_scale_quant.data_ptr<float>(), Nb, Nh, Nh_kv, Nq, Nkv, Nkv_pad,
-        kHeadDim, stream, km_ptr);
+        v_scale_quant.data_ptr<float>(), Nb, Nh, Nh_kv, Nq, Nkv, Nkv_pad, D_og,
+        stream, km_ptr);
   }
   // Per-channel V (sage-style): re-quantize V with per-D scale via coalesced
   // stats (sum+max+min -> mean+amax) + quantize/transpose. smooth_v subtracts
