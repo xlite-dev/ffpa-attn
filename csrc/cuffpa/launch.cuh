@@ -125,9 +125,9 @@ void launch_ffpa_attn_fwd_template(
 #ifdef ENABLE_FFPA_CUTE_EXT
         // EXPERIMENT: FFPA_FP8_FORCE_KERNEL=split_d|m4n2 forces a specific
         // split-D kernel to A/B test the M8N1/M4N2 dispatch cross-point.
-        // Applies only to 128 < D <= 1024; persist-D (D<=128) is unaffected.
+        // Applies only to 224 < D <= 1024; persist-D (D<=224) is unaffected.
         // Unset -> normal headdim-based dispatch below.
-        if constexpr (kHeadDim > 128 && kHeadDim <= 1024) {
+        if constexpr (kHeadDim > 224 && kHeadDim <= 1024) {
           const char* fk = getenv("FFPA_FP8_FORCE_KERNEL");
           if (fk != nullptr) {
             if (std::strcmp(fk, "split_d") == 0) {
@@ -148,11 +148,11 @@ void launch_ffpa_attn_fwd_template(
             }
           }
         }
-        // D<=128: persist-D fp8; 128<D<768: split-D M8N1 fp8;
+        // D<=224: persist-D fp8; 224<D<768: split-D M8N1 fp8;
         // D>=768: split-D M4N2 fp8. Same D<768/D>=768 cross-point as the
         // fp16 dispatch (M4N2 wins only for D>=768; below that M8N1 is
         // faster even with D/2 reg spill, same as fp16).
-        if constexpr (kHeadDim <= 128) {
+        if constexpr (kHeadDim <= 224) {
           if (fp8_hybrid && Nq >= fp8_hybrid_n_early) {
             const int n_early = static_cast<int>(fp8_hybrid_n_early);
             TORCH_CHECK(

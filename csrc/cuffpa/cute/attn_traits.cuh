@@ -127,7 +127,15 @@ struct FFPAAttnCuTePersistDTraits {
       kBr * kHeadDim + kStagesK * kBc * kHeadDim + kStagesV * kBc * kHeadDim;
 
   using Element = Element_;
-  using SmemAtom = GMMA::Layout_K_SW128_Atom<Element>;
+  // Swizzle atom by D byte count so L divides the leading stride; SW128 only
+  // fits 64-multiple D (fp16), SW64/SW32 cover smaller 32-multiple D.
+  using SmemAtom = std::conditional_t<
+      (kHeadDim * static_cast<int>(sizeof(Element))) % 128 == 0,
+      GMMA::Layout_K_SW128_Atom<Element>,
+      std::conditional_t<(kHeadDim * static_cast<int>(sizeof(Element))) % 64 ==
+                             0,
+                         GMMA::Layout_K_SW64_Atom<Element>,
+                         GMMA::Layout_K_SW32_Atom<Element>>>;
   using SmemLayoutQ =
       decltype(tile_to_shape(SmemAtom{}, Shape<Int<kBr>, Int<kHeadDim>>{}));
   using SmemLayoutKV =
@@ -274,13 +282,19 @@ struct FFPAAttnCuTePersistDFP8Traits {
   using ElementQK = std::conditional_t<kQKInt8, int8_t, cutlass::float_e4m3_t>;
   using ElementO = ElementO_;
   // 1B elems: a 128B SW128 row needs 128 elems; D=64 only has 64 -> use SW64.
-  template <typename Elem>
-  using SmemAtomT =
-      std::conditional_t<(kHeadDim * static_cast<int>(sizeof(Elem)) <= 64),
-                         GMMA::Layout_K_SW64_Atom<Elem>,
-                         GMMA::Layout_K_SW128_Atom<Elem>>;
-  using SmemAtomQK = SmemAtomT<ElementQK>;
-  using SmemAtomV = SmemAtomT<Element>;
+  // Swizzle atom picked by the K-dim (contiguous, last) byte count so the
+  // swizzle-L divides the leading stride: Q/K/O have K=D, V^T has K=kBc.
+  // SW128/SW64/SW32 = 128/64/32-byte swizzle rows; L must divide K*sz and
+  // K*sz>=L. SW32 fallback covers all 32-multiple D (e.g. D=32/96/160/224).
+  template <typename Elem, int kKBytes>
+  using SmemAtomByK = std::conditional_t<
+      kKBytes % 128 == 0, GMMA::Layout_K_SW128_Atom<Elem>,
+      std::conditional_t<kKBytes % 64 == 0, GMMA::Layout_K_SW64_Atom<Elem>,
+                         GMMA::Layout_K_SW32_Atom<Elem>>>;
+  using SmemAtomQK =
+      SmemAtomByK<ElementQK, kHeadDim* static_cast<int>(sizeof(ElementQK))>;
+  using SmemAtomV =
+      SmemAtomByK<Element, kBc* static_cast<int>(sizeof(Element))>;
   using SmemLayoutQ =
       decltype(tile_to_shape(SmemAtomQK{}, Shape<Int<kBr>, Int<kHeadDim>>{}));
   using SmemLayoutK =
@@ -291,8 +305,11 @@ struct FFPAAttnCuTePersistDFP8Traits {
   // O staging in the epilogue (ElementO fp16/bf16, NOT the fp8 SmemAtom):
   // after the KV loop the freed Q/K/V smem is aliased to stage O via STSM
   // before the coalesced TMA store; swizzle must match the TMA descriptor.
-  using SmemLayoutO = decltype(tile_to_shape(
-      GMMA::Layout_K_SW128_Atom<ElementO>{}, Shape<Int<kBr>, Int<kHeadDim>>{}));
+  // D=32 fp16/bf16 O row is only 64B -> SW64; same rule as SmemAtomByK.
+  using SmemAtomO =
+      SmemAtomByK<ElementO, kHeadDim* static_cast<int>(sizeof(ElementO))>;
+  using SmemLayoutO =
+      decltype(tile_to_shape(SmemAtomO{}, Shape<Int<kBr>, Int<kHeadDim>>{}));
 
   // s8 atom acc is s32; A/B layouts match the fp8 atom exactly (both
   // 32dp32b m16n8k32), so smem/copy/TMA plumbing is shared.

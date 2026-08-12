@@ -96,6 +96,29 @@ void ffpa_attn_forward(torch::Tensor Q, torch::Tensor K, torch::Tensor V,
         torch::TensorOptions().dtype(torch::kFloat32).device(Q.device()));
   }
 
+  // FP8 persist_d head_dim pad: non-32-multiple D (e.g. 120) pads up to the
+  // next multiple of 32 (120->128) to hit a compiled kernel. softmax_scale
+  // already uses the real D (Python resolves 1/sqrt(D_og)); Q/K/V pad cols
+  // are 0 -> zero contribution to scores/output; output is sliced back.
+  // CUTE_TMA_FP8 path only; other cuda impls and triton/cutedsl untouched.
+  const int head_dim_og = Q.size(3);
+  const int head_dim_pad = (head_dim_og + 31) & ~31;
+  torch::Tensor O_orig;
+  if (ffpa::get_backend_impl_hint() == ffpa::CudaBackendImpl::CUTE_TMA_FP8 &&
+      head_dim_pad != head_dim_og) {
+    // Per-channel V quant on pad cols would hit 0 amax -> 0 scale -> 0/0=NaN.
+    TORCH_CHECK(fp8_v_quant_method != 1,
+                "ffpa_attn: per-channel V quant + non-32-multiple head_dim (D=",
+                head_dim_og, ") pad is not yet supported; use per-block V.");
+    const int pad = head_dim_pad - head_dim_og;
+    O_orig = O;
+    Q = at::constant_pad_nd(Q, {0, pad}, 0);
+    K = at::constant_pad_nd(K, {0, pad}, 0);
+    V = at::constant_pad_nd(V, {0, pad}, 0);
+    O = torch::empty({Q.size(0), Q.size(1), Q.size(2), head_dim_pad},
+                     O.options());
+  }
+
   if (dtype == torch::kHalf) {
     if (acc == 0) {
 #ifdef ENABLE_FFPA_F16_ACC
@@ -133,6 +156,9 @@ void ffpa_attn_forward(torch::Tensor Q, torch::Tensor K, torch::Tensor V,
     throw std::invalid_argument(
         "ffpa_attn: Q.dtype must be torch.float16 or torch.bfloat16");
   }
+  // Slice padded output back to the real head_dim.
+  if (O_orig.defined())
+    O_orig.copy_(O.narrow(3, 0, head_dim_og));
 #else
   (void)Q;
   (void)K;

@@ -516,7 +516,10 @@ void launch_cute_fwd_persist_d_fp8_sm120_impl(
   const bool pquant_per_row = getenv("FFPA_FP8_PQUANT_PER_ROW") != nullptr;
 
   constexpr int kBr = 128;
-  constexpr int kBc = 128;
+  // D>128 must shrink kBc to fit the 99KB smem budget (1B/elem fp8): D=224
+  // with kBc=64 -> Q(28KB)+2*stage(28KB)=84KB. Mirrors fp16 persist_d's
+  // D-scaled kBc (L354).
+  constexpr int kBc = (kHeadDim <= 128) ? 128 : 64;
   constexpr int kSmemBudgetBytes = 99 * 1024;
   constexpr int kQPersistBytes = kBr * kHeadDim;  // e4m3/int8 = 1B
   constexpr int kPerStageBytes = 2 * kBc * kHeadDim;
@@ -792,7 +795,7 @@ void launch_cute_fwd_persist_d_fp8_sm120(
   // int8 fixes the causal early-row dS accuracy limit at ~zero cost.
   // if constexpr keeps the impl (and its kernel) out of instantiation for
   // unsupported headdims; every headdim TU includes this launcher template.
-  if constexpr (kHeadDim == 64 || kHeadDim == 128) {
+  if constexpr (kHeadDim % 32 == 0 && kHeadDim >= 32 && kHeadDim <= 224) {
     const bool qk_int8 = (fp8_qk_mm_type == 1);
     if (qk_int8)
       launch_cute_fwd_persist_d_fp8_sm120_impl<kDataType, kHeadDim, kStage,
@@ -810,7 +813,9 @@ void launch_cute_fwd_persist_d_fp8_sm120(
           fp8_pv_acc_type, q_start_row);
   } else {
     TORCH_CHECK(false,
-                "ffpa_attn: cute_tma_fp8 requires D=64/128, got D=", kHeadDim);
+                "ffpa_attn: cute_tma_fp8 persist_d requires D in {32..224} "
+                "step 32, got D=",
+                kHeadDim);
   }
 }
 

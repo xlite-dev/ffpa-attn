@@ -122,8 +122,9 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp8_sm120(
   constexpr int kStagesV = Traits::kStagesV;
   constexpr int kProducerThreads = 128;
   constexpr int kConsumerThreads = 256;
-  static_assert(kHeadDim == 64 || kHeadDim == 128,
-                "fp8 lse correction supports D in {64, 128}");
+  static_assert(
+      kHeadDim % 32 == 0 && kHeadDim >= 32 && kHeadDim <= 224,
+      "fp8 persist_d supports D in {32,64,...,224} (multiples of 32)");
 
   constexpr int kQTileElements = cosize(SmemLayoutQ{});
   constexpr int kKTileElements = cosize(SmemLayoutK{});
