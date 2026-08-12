@@ -21,7 +21,7 @@
 
 ## Latest News
 
-- [2026/08] Support [FP8 Attention](./csrc/cuffpa/cute/fp8/) for headdim **[64,1024]** ([sm_120](./csrc/cuffpa/cute/fp8/sm_120/), forward only), achieving **3x~6x** speedup over standard PyTorch SDPA for large headdim, with almost the same accuracy as SageAttention. 🎉🎉
+- [2026/08] Support [FP8 Attention](./csrc/cuffpa/cute/fp8/) for headdim **[64,1024]** ([sm_120](./csrc/cuffpa/cute/fp8/sm_120/), forward only), achieving **3x~6x** speedup over standard PyTorch SDPA for large headdim (**D>256**), with almost the same accuracy as SageAttention. 🎉🎉
 - [2026/06] DefTruth, Butterfingrz. [FFPA: Fast and Memory-Efficient Exact Attention for Large Headdim](https://doi.org/10.5281/zenodo.20638547). 🎉🎉
 
 ## Quick Start

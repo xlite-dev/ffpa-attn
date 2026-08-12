@@ -42,13 +42,15 @@ using QKOutT = std::conditional_t<kQKInt8, int8_t, __nv_fp8_e4m3>;
 // The amax pass keeps the 8-elem chunks in registers, so the quantize pass
 // converts straight from regs (no second global read).
 // kQKInt8: symmetric int8 output (scale = amax/127) instead of e4m3.
+// D_og: input row stride (real head_dim, may be < kD for pad path); output
+// uses kD stride (compile-time, padded). c*kVec < D_og guards pad chunks.
 template <typename Element, int kBlockRows, bool kQKInt8, int kD>
 __global__ void quantize_fp8_kernel(
-    const Element* __restrict__ X,    // (B, H, N, kD) row-major
+    const Element* __restrict__ X,    // (B, H, N, D_og) row-major
     QKOutT<kQKInt8>* __restrict__ Y,  // (B, H, N, kD)
     float* __restrict__ scale,        // (B, H, N/kBlockRows)
-    int N, int H,
-    const Element* __restrict__ km = nullptr,  // (B*H, D) smooth-K col means
+    int N, int H, int D_og,
+    const Element* __restrict__ km = nullptr,  // (B*H, kD) smooth-K col means
     float inv_n = 0.0f) {
   constexpr int kVec = 8;  // elems per vector access (128-bit in, 64-bit out)
   constexpr int kThreads = 128;
@@ -65,10 +67,11 @@ __global__ void quantize_fp8_kernel(
   const int lane = tid % 32;
   constexpr int kWarps = kThreads / 32;
 
-  const Element* x_bh = X + static_cast<long>(bh) * N * D;
+  const Element* x_bh = X + static_cast<long>(bh) * N * D_og;
   QKOutT<kQKInt8>* y_bh = Y + static_cast<long>(bh) * N * D;
 
   // Smooth-K: cache this head's mean vector once (D floats, L1-hot reuse).
+  // Pad cols [D_og, kD) read 0 from km (mean kernel outputs 0 there).
   __shared__ float km_sh[kD];
   const bool smooth = km != nullptr;
   if (smooth)
@@ -86,8 +89,8 @@ __global__ void quantize_fp8_kernel(
     const int c = i % dv;
     const long row = row0 + r;
     VecIn v = Vec8<Element>::zero();
-    if (row < N)
-      v = reinterpret_cast<const VecIn*>(x_bh + row * D)[c];
+    if (row < N && c * kVec < D_og)
+      v = reinterpret_cast<const VecIn*>(x_bh + row * D_og)[c];
     regs[j] = v;
 #pragma unroll
     for (int e = 0; e < kVec; ++e) {
