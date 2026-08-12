@@ -73,12 +73,29 @@ def bench_ms(fn, warmup=3, iters=5) -> float:
   return min(ts) * 1e3
 
 
+# SDPA backend registry. "fa2" resolves the version-dependent symbol
+# (FLASH_ATTENTION on PyTorch 2.11, FLASH_ATTENTION_2 before).
+SDPA_BACKENDS = {
+  "fa2": getattr(SDPBackend, "FLASH_ATTENTION_2", SDPBackend.FLASH_ATTENTION),
+  "cudnn": SDPBackend.CUDNN_ATTENTION,
+  "math": SDPBackend.MATH,
+  "mem_eff": SDPBackend.EFFICIENT_ATTENTION,
+}
+
+
+def resolve_sdpa_backend(name: str, D: int) -> str:
+  # auto: FA2 covers D<=256, larger D falls to MATH. cuDNN (D<=128 only) is
+  # opt-in via an explicit --sdpa-backend cudnn.
+  if name == "auto":
+    if D <= 256:
+      return "fa2"
+    return "math"
+  return name
+
+
 @contextmanager
-def fa2():
-  # PyTorch 2.11 exposes FLASH_ATTENTION (= FA2); older versions use
-  # FLASH_ATTENTION_2. Pick whichever is available.
-  backend = getattr(SDPBackend, "FLASH_ATTENTION_2", SDPBackend.FLASH_ATTENTION)
-  with sdpa_kernel(backend):
+def sdpa_backend_ctx(name: str):
+  with sdpa_kernel(SDPA_BACKENDS[name]):
     yield
 
 
@@ -128,19 +145,18 @@ def run_sage(q, k, v, causal, gqa):
   return sageattn(q, k, v, tensor_layout="HND", is_causal=causal)
 
 
-def run_sdpa_fa2(q, k, v, causal, gqa):
-  with fa2():
+def run_sdpa(q, k, v, causal, gqa, backend):
+  with sdpa_backend_ctx(backend):
     return F.scaled_dot_product_attention(
       q, k, v, is_causal=causal, enable_gqa=gqa
     )
 
 
-def ref_bf16_fa2(q, k, v, causal, gqa):
-  # bf16 SDPA-FA2 as high-precision ref: FA internally fp32-accumulates, and
-  # bf16 has more exponent range than fp16. fp32 SDPA would OOM at large N
-  # (MATH backend materializes the full Nq*Nkv matrix) and fused kernels
-  # do not support fp32.
-  with fa2():
+def ref_bf16(q, k, v, causal, gqa, backend):
+  # bf16 SDPA as high-precision ref: fused kernels internally fp32-accumulate,
+  # and bf16 has more exponent range than fp16. fp32 SDPA would OOM at large N
+  # (MATH materializes the full Nq*Nkv matrix) and fused kernels don't do fp32.
+  with sdpa_backend_ctx(backend):
     return F.scaled_dot_product_attention(
       q.to(torch.bfloat16),
       k.to(torch.bfloat16),
@@ -185,13 +201,14 @@ def build_scenarios(N, B, H, Hkv, D, cross_dense=True, non_aligned_pad=15):
   return scs
 
 
-def run_scenario(sc, dtype, scale, warmup, iters, use_sage):
+def run_scenario(sc, dtype, scale, warmup, iters, use_sage, sdpa_name):
   q, k, v = _mk(sc.B, sc.Hq, sc.Hkv, sc.Nq, sc.Nkv, sc.D, dtype, scale)
-  ref = ref_bf16_fa2(q, k, v, sc.causal, sc.gqa).to(dtype)
+  ref = ref_bf16(q, k, v, sc.causal, sc.gqa, sdpa_name).to(dtype)
+  sdpa_label = f"SDPA-{sdpa_name.upper()}"
 
   outs = {
     "FFPA-FP8": run_ffpa(q, k, v, sc.causal, sc.gqa),
-    "SDPA-FA2": run_sdpa_fa2(q, k, v, sc.causal, sc.gqa),
+    sdpa_label: run_sdpa(q, k, v, sc.causal, sc.gqa, sdpa_name),
   }
   if use_sage:
     sage_out = run_sage(q, k, v, sc.causal, sc.gqa)
@@ -201,7 +218,7 @@ def run_scenario(sc, dtype, scale, warmup, iters, use_sage):
 
   fns = {
     "FFPA-FP8": lambda: run_ffpa(q, k, v, sc.causal, sc.gqa),
-    "SDPA-FA2": lambda: run_sdpa_fa2(q, k, v, sc.causal, sc.gqa),
+    sdpa_label: lambda: run_sdpa(q, k, v, sc.causal, sc.gqa, sdpa_name),
   }
   if use_sage and SAGE_INSTALLED:
     fns["Sage"] = lambda: run_sage(q, k, v, sc.causal, sc.gqa)
@@ -216,14 +233,14 @@ def run_scenario(sc, dtype, scale, warmup, iters, use_sage):
     f"causal={sc.causal} gqa={sc.gqa}"
   )
   # Markdown table with dynamic column widths so the pipes align in terminal.
-  cols = ["backend", "rel_err", "min(ms)", "TFLOPS", "speedup vs SDPA-FA2"]
+  cols = ["backend", "rel_err", "min(ms)", "TFLOPS", f"speedup vs {sdpa_label}"]
   rows = []
-  order = ["FFPA-FP8", "Sage", "SDPA-FA2"]
+  order = ["FFPA-FP8", "Sage", sdpa_label]
   for name in order:
     if name not in ms:
       continue
     tf = tflops_from_ms(sc.flops, ms[name])
-    sp = ms["SDPA-FA2"] / ms[name] if name != "SDPA-FA2" else 1.0
+    sp = ms[sdpa_label] / ms[name] if name != sdpa_label else 1.0
     err = errs.get(name, float("nan"))
     err_str = f"{err:.4f}" if err == err else "n/a"
     tf_str = f"{tf:.1f}" if tf is not None else "n/a"
@@ -271,6 +288,14 @@ def parse_args():
   p.add_argument("--iters", type=int, default=5, help="Bench iters")
   p.add_argument("--no-sage", action="store_true", help="Skip SageAttention")
   p.add_argument(
+    "--sdpa-backend",
+    type=str,
+    default="auto",
+    choices=["auto", "fa2", "cudnn", "math", "mem_eff"],
+    help="SDPA reference backend: auto picks FA2 (D<=256), MATH (D>256); "
+    "an explicit value (incl. cudnn, D<=128) forces that backend.",
+  )
+  p.add_argument(
     "--no-cross-dense",
     action="store_true",
     help="Skip cross-dense (Nkv=2Nq) scenario",
@@ -294,7 +319,7 @@ def main():
   print(f"dtype={dtype}, GPU={torch.cuda.get_device_name()}")
   print(
     f"sage={'on' if use_sage else 'off'}, "
-    f"SDPA=FLASH_ATTENTION(FA2), B={args.B} H={args.H} Hkv={args.Hkv} "
+    f"SDPA={args.sdpa_backend}, B={args.B} H={args.H} Hkv={args.Hkv} "
     f"D={args.D} warmup={args.warmup} iters={args.iters}\n"
   )
 
@@ -310,7 +335,10 @@ def main():
     )
     print(f"## Nq=Nkv={N}\n")
     for sc in scenarios:
-      run_scenario(sc, dtype, args.scale, args.warmup, args.iters, use_sage)
+      sdpa_name = resolve_sdpa_backend(args.sdpa_backend, sc.D)
+      run_scenario(
+        sc, dtype, args.scale, args.warmup, args.iters, use_sage, sdpa_name
+      )
 
 
 if __name__ == "__main__":

@@ -24,10 +24,9 @@ using CtaBarrier = cutlass::arch::ClusterBarrier;
 // Epilogue: R->S->TMA store (aligned) or R->G (tail); a __syncthreads would
 // deadlock since the producer warpgroup has already fallen through the
 // early-return below, so sync with a named barrier (consumer threads only).
-// NOTE: Only 64-multiple small D (D=64/128) is supported today. Non-64-multiple
-// small D (D=32/96, SW128 swizzle requires headdim % 64 == 0) is handled by the
-// split-D kernel; 32-multiple small D WS support is planned (dispatch already
-// splits on %64==0).
+// NOTE: 32-multiple small D (D=32/64/96/128) is supported. The smem swizzle
+// is auto-selected by Traits from D*2B (SW128 for 64-mult, SW64 for D=32/96);
+// TMA descriptors inherit the same swizzle from SmemLayoutO.
 template <typename Traits, typename TmaQ, typename TmaK, typename TmaV,
           typename TmaO, int kHasAttnBias = 0, int kHasDropout = 0>
 __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_sm120(
