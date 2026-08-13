@@ -478,6 +478,11 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp8_sm120(
     //   (448/amax_d) is uniform across tiles -> single epilogue dequant.
     //   (vs448=448 would push P8 into [224,448] where e4m3 ULP=32.)
     const float p_quant_scale = kVPerChannel ? 1.0f : (vs * kE4m3Max);
+    // Phase 2: compute the tile max on raw (unscaled) scores and apply the
+    // softmax scale once after the cross-lane reduction, removing one FMUL
+    // per element from the max-reduction critical path. Gated to the int8 QK
+    // + f16 PV-acc config so other variants stay bitwise identical.
+    constexpr bool kMaxScaleAfter = Traits::kQKInt8 && kPVAccF16;
     if constexpr (kPQuantPerRow) {
       if (!tile_needs_mask) {
 #pragma unroll
@@ -510,7 +515,7 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp8_sm120(
         }
         const float softmax_scale_eff = tile_needs_mask ? 1.0f : scale;
         online_softmax_fp8_fixed<true, decltype(scores), decltype(tScS_rc),
-                                 kORows>(
+                                 kORows, kMaxScaleAfter>(
             scores, tScS_rc, softmax_scale_eff, row_max, row_sum, row_scale,
             log2f(p_quant_scale), 1.0f / p_quant_scale,
             Traits::kRescaleThreshold);
@@ -519,7 +524,7 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp8_sm120(
         const float softmax_scale_eff =
             tile_needs_mask ? 1.0f : s_dequant * scale;
         online_softmax_fp8_fixed<true, decltype(scores), decltype(tScS_rc),
-                                 kORows>(
+                                 kORows, kMaxScaleAfter>(
             scores, tScS_rc, softmax_scale_eff, row_max, row_sum, row_scale,
             log2f(p_quant_scale), 1.0f / p_quant_scale,
             Traits::kRescaleThreshold);
@@ -588,6 +593,8 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp8_sm120(
     } else {
       // Tensor-core row sum over the quantized P regs (replaces the fp32
       // FADD/shfl reduction; softmax<true> only rescaled row_sum so far).
+      // NCU shows this overlaps the PV critical path (tensor pipe has ~27%
+      // headroom here), so CUDA-core row_sum was measured slower (see plan).
       pscale_rowsum_mma(tCrP, row_sum, 1.0f / p_quant_scale);
       if constexpr (kPVAccF16) {
         // f8f8f16 PV: accumulate P@V into an fp16 MMA accumulator (cuts o_acc
