@@ -41,21 +41,14 @@ if SAGE_INSTALLED:
 
 
 def fp8_backend() -> CUDABackend:
-  gpu_name = torch.cuda.get_device_name()
-  if "5090" in gpu_name:
-    return CUDABackend(
-      backward=False,
-      enable_tma=True,
-      enable_cute=True,
-      enable_fp8=True,
-      fp8_qk_mm_type="int8",
-      fp8_pv_acc_type="f16",
-    )
+  # TEMP: force int8+f16acc on all GPUs for D=128 WS-kernel optimization bench.
   return CUDABackend(
     backward=False,
     enable_tma=True,
     enable_cute=True,
     enable_fp8=True,
+    fp8_qk_mm_type="int8",
+    fp8_pv_acc_type="f16",
   )
 
 

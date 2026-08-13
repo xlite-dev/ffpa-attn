@@ -532,8 +532,12 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp8_sm120(
     for (int r = 0; r < kORows; ++r)
       local_need_rescale = local_need_rescale || (row_scale[r] < 1.0f);
     const bool need_rescale = __any_sync(0xffffffff, local_need_rescale);
+    const bool do_rescale = (kv_tile > 0) && need_rescale;
+    // f16acc fixed mode folds this rescale into the inst_buf absorption FFMA
+    // below (o_acc = o_acc*row_scale + inst), skipping the standalone pass.
+    constexpr bool kFuseRescaleAbsorb = (!kPQuantPerRow) && kPVAccF16;
 
-    if (kv_tile > 0 && need_rescale) {
+    if (do_rescale && !kFuseRescaleAbsorb) {
       auto tCrO = make_tensor(make_rmem_ptr(o_acc), OFragLayout{});
       auto tCrO_rc = make_tensor(
           tCrO.data(), ffpa_cute::convert_layout_acc_rowcol(tCrO.layout()));
@@ -604,10 +608,14 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp8_sm120(
             make_tensor(tCrInst.data(),
                         ffpa_cute::convert_layout_acc_rowcol(tCrInst.layout()));
 #pragma unroll
-        for (int row = 0; row < kORows; ++row)
+        for (int row = 0; row < kORows; ++row) {
+          // Fold the deferred online-softmax rescale into the absorption.
+          const float rs = do_rescale ? row_scale[row] : 1.0f;
 #pragma unroll
           for (int col = 0; col < kOCols; ++col)
-            tCrO_rc(row, col) += float(tCrInst_rc(row, col));
+            tCrO_rc(row, col) =
+                fmaf(tCrO_rc(row, col), rs, float(tCrInst_rc(row, col)));
+        }
       } else {
         auto tCrO = make_tensor(make_rmem_ptr(o_acc), OFragLayout{});
         ffpa_cute::gemm_rs(tCrO, tCrP, tCrV, tVsV_s2r, tiled_mma_pv, s2r_copy_v,
