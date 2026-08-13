@@ -163,6 +163,75 @@ __device__ __forceinline__ void finalize_row_sum_m4n2(float* row_sum,
   }
 }
 
+// FP8 fixed-P-scale variant of online_safe_softmax_m4n2 (Mode B companion).
+// Folds exp_offset = log2(vs*448) into exp2 so emitted P is already in the
+// P*vs*448 domain; tile_sum is scaled by inv_exp_factor = 1/(vs*448) before
+// writing to smem_exchange, so finalize_row_sum_m4n2 produces row_sum in the
+// true probability domain. Uses fp32 tile_sum (kRowSumViaMma=false path);
+// finalize_row_sum_m4n2 is called unchanged after the P STSM->LDSM_N barrier.
+template <typename ScoresTensor, typename CoordTensor, int kRows,
+          int kNumWarps = 8>
+__device__ __forceinline__ void online_softmax_fp8_fixed_m4n2(
+    ScoresTensor& scores, const CoordTensor& tScS_rc, float scale,
+    float* row_max, float* row_sum, float* row_scale, float* smem_exchange,
+    int warp_id, int lane_id, float exp_offset, float inv_exp_factor,
+    float rescale_threshold = 0.0f) {
+  const int peer_warp = warp_id ^ 4;
+  const bool is_writer = (lane_id % 4 == 0);
+  const int row_base = lane_id / 4;
+  constexpr int kMaxSlots = kNumWarps * 16;
+
+#pragma unroll
+  for (int row = 0; row < kRows; ++row) {
+    float tile_max = -INFINITY;
+#pragma unroll
+    for (int col = 0; col < cute::size<1>(scores); ++col)
+      tile_max = fmaxf(tile_max, scores(row, col) * scale);
+    tile_max = fmaxf(tile_max, __shfl_xor_sync(0xffffffff, tile_max, 1));
+    tile_max = fmaxf(tile_max, __shfl_xor_sync(0xffffffff, tile_max, 2));
+    const int row_local = row_base + row * 8;
+    if (is_writer)
+      smem_exchange[warp_id * 16 + row_local] = tile_max;
+  }
+  __syncthreads();
+
+#pragma unroll
+  for (int row = 0; row < kRows; ++row) {
+    const int row_local = row_base + row * 8;
+    float tile_max = smem_exchange[warp_id * 16 + row_local];
+    float peer_max = smem_exchange[peer_warp * 16 + row_local];
+    float global_tile_max = fmaxf(tile_max, peer_max);
+
+    const float next_max = fmaxf(row_max[row], global_tile_max);
+    const float log2_diff = row_max[row] - next_max;
+    float eff_max = next_max;
+    if (rescale_threshold > 0.0f && log2_diff >= -rescale_threshold) {
+      row_scale[row] = 1.0f;
+      eff_max = row_max[row];
+    } else {
+      row_scale[row] = exp2f(log2_diff);
+      row_max[row] = next_max;
+    }
+
+    // exp_offset folds vs*448 into the exp2 domain: P = exp2(s*scale - eff_max
+    // + exp_offset) = exp2(s*scale - (eff_max - exp_offset)).
+    const float max_minus_offset = eff_max - exp_offset;
+    float tile_sum = 0.0f;
+#pragma unroll
+    for (int col = 0; col < cute::size<1>(scores); ++col) {
+      const float p = exp2f(scores(row, col) * scale - max_minus_offset);
+      scores(row, col) = p;
+      tile_sum += p;
+    }
+    tile_sum += __shfl_xor_sync(0xffffffff, tile_sum, 1);
+    tile_sum += __shfl_xor_sync(0xffffffff, tile_sum, 2);
+    // inv_exp_factor converts P*vs*448 domain sum to true probability sum.
+    if (is_writer)
+      smem_exchange[kMaxSlots + warp_id * 16 + row_local] =
+          tile_sum * inv_exp_factor;
+  }
+}
+
 // Online softmax with additive bias fused into the row-max pass.
 template <typename ScoresTensor, typename CoordTensor, int kRows>
 __device__ __forceinline__ void online_softmax_bias(

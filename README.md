@@ -21,7 +21,12 @@
 
 ## Latest News
 
-- [2026/06] DefTruth, Butterfingrz, [FFPA: Fast and Memory-Efficient Exact Attention for Large Headdim](https://doi.org/10.5281/zenodo.20638547).
+<div align='center'>
+  <img src="./docs/assets/ffpa-fp8.png" width="850px">
+</div>
+
+- [2026/08] FFPA now supports [FP8 Attention](./csrc/cuffpa/cute/fp8/) for headdim **[64,1024]** ([sm_120](./csrc/cuffpa/cute/fp8/sm_120/), forward only), achieving **3x~6x**🎉 speedup over standard PyTorch SDPA for large headdim (**D>256**), with per-block(QKV)/per-thread(QK)/per-channel(V) FP8 quantization and hybrid FP8/FP16 attention. 🎉🎉
+- [2026/06] DefTruth, Butterfingrz, 2026. [FFPA: Fast and Memory-Efficient Exact Attention for Large Headdim](https://doi.org/10.5281/zenodo.20638547).
 
 ## Quick Start
 
@@ -37,6 +42,7 @@ git clone https://github.com/xlite-dev/ffpa-attn.git
 # Then, build the wheel package (Triton + CuTe-DSL backends)
 cd ffpa-attn && pip3 install -e . --no-build-isolation
 # Optional: install ffpa-attn w/ CUDA backend (forward only)
+# ext all: build all kernels, include fp8 quantzation kernels
 bash ./build.sh --arch sm_120f --ext all --headdim all
 ```
 
@@ -121,12 +127,6 @@ python -m ffpa_attn.autotune --mode max --full-tasks --num-gpus 8 --overwrite
 
 NVIDIA-NeMo Automodel PR [#2436](https://github.com/NVIDIA-NeMo/Automodel/pull/2436) shows that on Gemma4-31B training (L=8192, 8xH200, FSDP2 + Activation Checkpointing), accelerating the **10/60 (D=512)** full-attention layers with FFPA delivers about [`1.4x~1.5x`](https://github.com/NVIDIA-NeMo/Automodel/pull/2436) higher throughput (**E2E**) than SDPA at similar memory footprint, with loss aligned within normal bf16 noise.
 
-<!--
-<div align='center'>
-  <img src="./docs/assets/e2e/gemma4-31b-8k.png" width="800px">
-</div>
--->
-
 ## License
 
 <div id="License"></div>
@@ -152,6 +152,7 @@ Apache License 2.0
 <div id="ref"></div>
 
 - [flash-attention](https://github.com/Dao-AILab/flash-attention)
+- [SageAttention](https://github.com/thu-ml/sageattention)
 - [LeetCUDA](https://github.com/xlite-dev/LeetCUDA)
 - [flashinfer](https://github.com/flashinfer-ai/flashinfer)
 - [quack](https://github.com/Dao-AILab/quack)

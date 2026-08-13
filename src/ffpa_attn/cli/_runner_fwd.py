@@ -248,6 +248,16 @@ def _make_forward_backend(
   enable_tma: bool,
   enable_ws: bool,
   enable_cute: bool = False,
+  enable_fp8: bool = False,
+  fp8_smooth_k: bool = True,
+  fp8_smooth_v: bool = False,
+  fp8_q_quant_method: str = "per_block",
+  fp8_k_quant_method: str = "per_block",
+  fp8_v_quant_method: str = "per_block",
+  fp8_pv_acc_type: str = "f32",
+  fp8_qk_mm_type: str = "fp8",
+  fp8_hybrid: bool | None = None,
+  fp8_hybrid_n_early: int = 256,
   cuda_stages: int | None = None,
 ):
   if name == "cuda":
@@ -257,6 +267,16 @@ def _make_forward_backend(
       "enable_tma": enable_tma,
       "enable_ws": enable_ws,
       "enable_cute": enable_cute,
+      "enable_fp8": enable_fp8,
+      "fp8_smooth_k": fp8_smooth_k,
+      "fp8_smooth_v": fp8_smooth_v,
+      "fp8_q_quant_method": fp8_q_quant_method,
+      "fp8_k_quant_method": fp8_k_quant_method,
+      "fp8_v_quant_method": fp8_v_quant_method,
+      "fp8_pv_acc_type": fp8_pv_acc_type,
+      "fp8_qk_mm_type": fp8_qk_mm_type,
+      "fp8_hybrid": fp8_hybrid,
+      "fp8_hybrid_n_early": fp8_hybrid_n_early,
     }
     if cuda_stages is not None:
       kwargs["stages"] = cuda_stages
@@ -298,8 +318,18 @@ def _run_case(
   enable_tma: bool = False,
   enable_ws: bool = False,
   enable_cute: bool = False,
+  enable_fp8: bool = False,
+  fp8_smooth_k: bool = True,
+  fp8_smooth_v: bool = False,
+  fp8_q_quant_method: str = "per_block",
+  fp8_k_quant_method: str = "per_block",
+  fp8_v_quant_method: str = "per_block",
+  fp8_pv_acc_type: str = "f32",
+  fp8_qk_mm_type: str = "fp8",
   verbose: bool = False,
   stages: int | None = None,
+  fp8_hybrid: bool | None = None,
+  fp8_hybrid_n_early: int = 256,
 ) -> FORWARD_RESULT:
   torch.manual_seed(seed)
   q = torch.randn(B, Nh_q, Nq, D, dtype=dtype, device="cuda")
@@ -314,35 +344,24 @@ def _run_case(
     enable_tma=enable_tma,
     enable_ws=enable_ws,
     enable_cute=enable_cute,
+    enable_fp8=enable_fp8,
+    fp8_smooth_k=fp8_smooth_k,
+    fp8_smooth_v=fp8_smooth_v,
+    fp8_q_quant_method=fp8_q_quant_method,
+    fp8_k_quant_method=fp8_k_quant_method,
+    fp8_v_quant_method=fp8_v_quant_method,
+    fp8_pv_acc_type=fp8_pv_acc_type,
+    fp8_qk_mm_type=fp8_qk_mm_type,
+    fp8_hybrid=fp8_hybrid,
+    fp8_hybrid_n_early=fp8_hybrid_n_early,
     cuda_stages=stages,
   )
   backward_backend = CuTeDSLBackend(
     backward=True
   ) if forward_backend.name == "cutedsl" else None
 
-  torch.manual_seed(seed + 17)
-  out_ffpa = ffpa_attn_func(
-    q,
-    k,
-    v,
-    attn_mask=attn_mask,
-    is_causal=causal,
-    dropout_p=dropout_p,
-    enable_gqa=Nh_q != Nh_kv,
-    forward_backend=forward_backend,
-    backward_backend=backward_backend,
-  )
-  k_ref, v_ref = _expand_kv(k, v, Nh_q)
-  torch.manual_seed(seed + 17)
-  out_sdpa = _sdpa_ref(
-    q, k_ref, v_ref, is_causal=causal, attn_mask=attn_mask, dropout_p=dropout_p
-  )
-
-  tol = 5e-2 if dtype == torch.bfloat16 else 2e-2
-  ok = _tensor_allclose(out_ffpa, out_sdpa, tol)
-
-  ms_ffpa = _time_fn(
-    lambda q, k, v: ffpa_attn_func(
+  def _ffpa_call(q, k, v):
+    return ffpa_attn_func(
       q,
       k,
       v,
@@ -352,7 +371,21 @@ def _run_case(
       enable_gqa=Nh_q != Nh_kv,
       forward_backend=forward_backend,
       backward_backend=backward_backend,
-    ),
+    )
+
+  torch.manual_seed(seed + 17)
+  out_ffpa = _ffpa_call(q, k, v)
+  k_ref, v_ref = _expand_kv(k, v, Nh_q)
+  torch.manual_seed(seed + 17)
+  out_sdpa = _sdpa_ref(
+    q, k_ref, v_ref, is_causal=causal, attn_mask=attn_mask, dropout_p=dropout_p
+  )
+
+  tol = 5e-2 if (dtype == torch.bfloat16 or enable_fp8) else 2e-2
+  ok = _tensor_allclose(out_ffpa, out_sdpa, tol)
+
+  ms_ffpa = _time_fn(
+    _ffpa_call,
     q,
     k,
     v,
@@ -424,10 +457,20 @@ def run_forward_examples(
   enable_tma: bool = False,
   enable_ws: bool = False,
   enable_cute: bool = False,
+  enable_fp8: bool = False,
+  fp8_qk_mm_type: str = "fp8",
+  fp8_smooth_k: bool = True,
+  fp8_smooth_v: bool = False,
+  fp8_q_quant_method: str = "per_block",
+  fp8_k_quant_method: str = "per_block",
+  fp8_v_quant_method: str = "per_block",
+  fp8_pv_acc_type: str = "f32",
   tasks: set[str] | None = None,
   dtypes: tuple[torch.dtype, ...] = (torch.float16, torch.bfloat16),
   verbose: bool = False,
   stages: int | None = None,
+  fp8_hybrid: bool | None = None,
+  fp8_hybrid_n_early: int = 256,
 ) -> list[FORWARD_RESULT]:
   """Run the canonical forward benchmark cases.
 
@@ -468,6 +511,7 @@ def run_forward_examples(
     ("enable_fwd_tma", str(enable_tma)),
     ("enable_fwd_ws", str(enable_ws)),
     ("enable_fwd_cute", str(enable_cute)),
+    ("enable_fwd_fp8", str(enable_fp8)),
     ("cuda_stages", str(stages)),
     ("tasks", tasks_str),
     ("warmup", str(warmup)),
@@ -550,7 +594,7 @@ def run_forward_examples(
         "causal": True
       },
     ]
-    if forward_backend != "cutedsl":
+    if forward_backend != "cutedsl" and not enable_fp8:
       mask_n = max(N, 512)
       case_specs.append({
         "name":
@@ -566,7 +610,7 @@ def run_forward_examples(
         "attn_mask":
         _make_broadcast_additive_attn_mask(mask_n, mask_n, dtype, seed),
       })
-    if forward_backend != "cutedsl":
+    if forward_backend != "cutedsl" and not enable_fp8:
       case_specs.extend([
         {
           "name": "dropout",
@@ -612,8 +656,18 @@ def run_forward_examples(
           enable_tma=enable_tma,
           enable_ws=enable_ws,
           enable_cute=enable_cute,
+          enable_fp8=enable_fp8,
+          fp8_qk_mm_type=fp8_qk_mm_type,
+          fp8_smooth_k=fp8_smooth_k,
+          fp8_smooth_v=fp8_smooth_v,
+          fp8_q_quant_method=fp8_q_quant_method,
+          fp8_k_quant_method=fp8_k_quant_method,
+          fp8_v_quant_method=fp8_v_quant_method,
+          fp8_pv_acc_type=fp8_pv_acc_type,
           verbose=verbose,
           stages=stages,
+          fp8_hybrid=fp8_hybrid,
+          fp8_hybrid_n_early=fp8_hybrid_n_early,
         )
       )
 

@@ -1,7 +1,10 @@
 #pragma once
 #include <ATen/cuda/CUDAContext.h>
+#include <ATen/ops/constant_pad_nd.h>
 #include <c10/cuda/CUDAGuard.h>
-#include "backend_hint.h"
+#include <cstring>
+#include <optional>
+#include "backend.h"
 #include "native/launch.cuh"
 #ifdef ENABLE_FFPA_CUTE_EXT
 #include "cute/launch.cuh"
@@ -18,14 +21,53 @@ using namespace ffpa;
 // Runtime ``tma`` is accepted for API compatibility but ignored. The legacy
 // SM90 TMA CUDA branch is kept under csrc/cuffpa/deprecated; active native
 // forward launches always use the architecture-agnostic templates here.
+#ifdef ENABLE_FFPA_CUTE_EXT
+#ifdef ENABLE_FFPA_TMA_EXT
+// Hybrid Stage-1 prep: slice the early rows and, when head_dim is padded,
+// zero-pad them to kHeadDim so the fp16 launcher's TMA stride matches D_pad.
+// Returns new tensors; the original Q/K/V stay D_og-wide (fp8 quantize reads
+// D_og natively). Zero-fill keeps QK^T/PV dot products exact.
+static inline void prepare_hybrid_stage1(
+    torch::Tensor& Q_e, torch::Tensor& K_e, torch::Tensor& V_e,
+    const torch::Tensor& Q, const torch::Tensor& K, const torch::Tensor& V,
+    int64_t n_early, int64_t Nkv, int64_t Nq, int causal, int64_t D_og,
+    int64_t D_pad, bool d_padded) {
+  const int64_t kv_offset = Nkv - Nq;
+  if (d_padded) {
+    const int64_t pad_cols = D_pad - D_og;
+    Q_e = torch::constant_pad_nd(Q.slice(2, 0, n_early), {0, pad_cols}, 0.0);
+    if (causal != 0) {
+      K_e = torch::constant_pad_nd(K.slice(2, 0, kv_offset + n_early),
+                                   {0, pad_cols}, 0.0);
+      V_e = torch::constant_pad_nd(V.slice(2, 0, kv_offset + n_early),
+                                   {0, pad_cols}, 0.0);
+    } else {
+      K_e = torch::constant_pad_nd(K, {0, pad_cols}, 0.0);
+      V_e = torch::constant_pad_nd(V, {0, pad_cols}, 0.0);
+    }
+  } else {
+    Q_e = Q.slice(2, 0, n_early).contiguous();
+    if (causal != 0) {
+      K_e = K.slice(2, 0, kv_offset + n_early).contiguous();
+      V_e = V.slice(2, 0, kv_offset + n_early).contiguous();
+    } else {
+      K_e = K;
+      V_e = V;
+    }
+  }
+}
+#endif
+#endif
 template <typename kDataType, const int kHeadDim, const int kMmaAccFloat32QK,
           const int kMmaAccFloat32PV, const int kStage>
-void launch_ffpa_attn_fwd_template(torch::Tensor Q, torch::Tensor K,
-                                   torch::Tensor V, torch::Tensor O,
-                                   torch::Tensor attn_bias,
-                                   torch::Tensor softmax_lse, int causal,
-                                   double softmax_scale, double dropout_p,
-                                   int64_t philox_seed, int64_t philox_offset) {
+void launch_ffpa_attn_fwd_template(
+    torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O,
+    torch::Tensor attn_bias, torch::Tensor softmax_lse, int causal,
+    double softmax_scale, double dropout_p, int64_t philox_seed,
+    int64_t philox_offset, bool fp8_smooth_k, bool fp8_smooth_v,
+    int64_t fp8_q_quant_method, int64_t fp8_k_quant_method,
+    int64_t fp8_v_quant_method, int64_t fp8_pv_acc_type, int64_t fp8_qk_mm_type,
+    bool fp8_hybrid = false, int64_t fp8_hybrid_n_early = 256) {
   // Q,K,V,O with [B, H, N, D] layout, B=batch, H=head, N=seqlen, D=dim
   // TODO: support BNHD layout, Q,K,V,O with [B, N, H, D] layout.
   // Native block-tile config (MMA atoms, Br/Bc, stages, smem/pad flags) and
@@ -92,6 +134,21 @@ void launch_ffpa_attn_fwd_template(torch::Tensor Q, torch::Tensor K,
   const bool force_tma = (impl_hint == ffpa::CudaBackendImpl::TMA);
   const bool force_cute = (impl_hint == ffpa::CudaBackendImpl::CUTE);
   const bool force_cute_tma = (impl_hint == ffpa::CudaBackendImpl::CUTE_TMA);
+  const bool force_fp8 = (impl_hint == ffpa::CudaBackendImpl::CUTE_TMA_FP8);
+
+  // fp16/bf16 head_dim pad: non-32-multiple D_og (e.g. 120) zero-pads Q/K/V
+  // to the compiled kHeadDim. fp8 skips (quantize reads D_og natively); O is
+  // padded by ffpa_api.cc. Only reachable via the CUTE_TMA/CUTE pad paths
+  // (native/AUTO always have D_og == kHeadDim), so the TMA and cp.async
+  // dispatch below both see D_pad-wide Q/K/V.
+  const int D_og = Q.size(3);
+  const bool d_padded = D_og != kHeadDim;
+  if (d_padded && !force_fp8) {
+    const int64_t pad_cols = kHeadDim - D_og;
+    Q = torch::constant_pad_nd(Q, {0, pad_cols}, 0.0);
+    K = torch::constant_pad_nd(K, {0, pad_cols}, 0.0);
+    V = torch::constant_pad_nd(V, {0, pad_cols}, 0.0);
+  }
 
   // SM120 TMA path: when ``tma`` is set and the device is TMA-capable
   // (sm_90+), delegate to the TMA launcher. Falls back to the legacy
@@ -106,10 +163,154 @@ void launch_ffpa_attn_fwd_template(torch::Tensor Q, torch::Tensor K,
   //   sm_90/100: WS (kNonWS=0). setmaxnreg effective, 228KB smem allows
   //     deep pipeline. Unverified on real hardware.
 #ifdef ENABLE_FFPA_TMA_EXT
-  if ((force_tma || force_cute_tma) && !force_native && !force_cute) {
+  if ((force_tma || force_cute_tma || force_fp8) && !force_native &&
+      !force_cute) {
     auto prop = at::cuda::getCurrentDeviceProperties();
     if (prop->major >= 9) {
-      if (prop->major == 9 || prop->major == 10) {
+      if (force_fp8) {
+        // q/k quant: per_block (0) for all headdims; per_thread (2) for
+        // all headdims (persist_d + split_d + m4n2 paths).
+        TORCH_CHECK((fp8_q_quant_method == 0 && fp8_k_quant_method == 0) ||
+                        (fp8_q_quant_method == 2 && fp8_k_quant_method == 2),
+                    "ffpa_attn: Q/K quant method must be both per_block or "
+                    "both per_thread");
+#ifdef ENABLE_FFPA_CUTE_EXT
+        // EXPERIMENT: FFPA_FP8_FORCE_KERNEL=split_d|m4n2 forces a specific
+        // split-D kernel to A/B test the M8N1/M4N2 dispatch cross-point.
+        // Applies only to 224 < D <= 1024; persist-D (D<=224) is unaffected.
+        // Unset -> normal headdim-based dispatch below.
+        if constexpr (kHeadDim > 224 && kHeadDim <= 1024) {
+          const char* fk = getenv("FFPA_FP8_FORCE_KERNEL");
+          if (fk != nullptr) {
+            if (std::strcmp(fk, "split_d") == 0) {
+              launch_cute_fwd_split_d_fp8_sm120<kDataType, kHeadDim, kStage>(
+                  Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
+                  dropout_p, philox_seed, philox_offset, fp8_smooth_k,
+                  fp8_smooth_v, fp8_q_quant_method, fp8_k_quant_method,
+                  fp8_v_quant_method, fp8_pv_acc_type, fp8_qk_mm_type);
+              return;
+            } else if (std::strcmp(fk, "m4n2") == 0) {
+              launch_cute_fwd_split_d_m4n2_fp8_sm120<kDataType, kHeadDim,
+                                                     kStage>(
+                  Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
+                  dropout_p, philox_seed, philox_offset, fp8_smooth_k,
+                  fp8_smooth_v, fp8_q_quant_method, fp8_k_quant_method,
+                  fp8_v_quant_method, fp8_pv_acc_type, fp8_qk_mm_type);
+              return;
+            }
+          }
+        }
+        // D<=224: persist-D fp8; 224<D<768: split-D M8N1 fp8;
+        // D>=768: split-D M4N2 fp8. Same D<768/D>=768 cross-point as the
+        // fp16 dispatch (M4N2 wins only for D>=768; below that M8N1 is
+        // faster even with D/2 reg spill, same as fp16).
+        if constexpr (kHeadDim <= 224) {
+          if (fp8_hybrid && Nq >= fp8_hybrid_n_early) {
+            const int n_early = static_cast<int>(fp8_hybrid_n_early);
+            TORCH_CHECK(
+                n_early % 128 == 0,
+                "ffpa_attn: fp8_hybrid_n_early must be multiple of 128");
+            torch::Tensor Q_e, K_e, V_e;
+            prepare_hybrid_stage1(Q_e, K_e, V_e, Q, K, V, n_early, Nkv, Nq,
+                                  causal, D_og, kHeadDim, d_padded);
+            auto O_e = torch::empty_like(Q_e);
+            auto lse_e =
+                torch::empty({Nb, Nh, n_early}, torch::TensorOptions()
+                                                    .dtype(torch::kFloat32)
+                                                    .device(Q.device()));
+            auto empty_bias = torch::empty({0}, attn_bias.options());
+            launch_cute_fwd_persist_d_sm120<kDataType, kHeadDim, kStage>(
+                Q_e, K_e, V_e, O_e, empty_bias, lse_e, causal, softmax_scale,
+                0.0, 0, 0);
+            O.slice(2, 0, n_early).copy_(O_e);
+            if (softmax_lse.numel() > 0)
+              softmax_lse.slice(2, 0, n_early).copy_(lse_e);
+            // Stage 2: fp8 late rows [n_early:N] via q_start_row offset.
+            launch_cute_fwd_persist_d_fp8_sm120<kDataType, kHeadDim, kStage>(
+                Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
+                dropout_p, philox_seed, philox_offset, fp8_smooth_k,
+                fp8_smooth_v, fp8_q_quant_method, fp8_k_quant_method,
+                fp8_v_quant_method, fp8_pv_acc_type, fp8_qk_mm_type,
+                /*q_start_row=*/n_early);
+          } else {
+            launch_cute_fwd_persist_d_fp8_sm120<kDataType, kHeadDim, kStage>(
+                Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
+                dropout_p, philox_seed, philox_offset, fp8_smooth_k,
+                fp8_smooth_v, fp8_q_quant_method, fp8_k_quant_method,
+                fp8_v_quant_method, fp8_pv_acc_type, fp8_qk_mm_type);
+          }
+        } else if constexpr (kHeadDim < 768) {
+          if (fp8_hybrid && Nq >= fp8_hybrid_n_early) {
+            const int n_early = static_cast<int>(fp8_hybrid_n_early);
+            TORCH_CHECK(
+                n_early % 128 == 0,
+                "ffpa_attn: fp8_hybrid_n_early must be multiple of 128");
+            torch::Tensor Q_e, K_e, V_e;
+            prepare_hybrid_stage1(Q_e, K_e, V_e, Q, K, V, n_early, Nkv, Nq,
+                                  causal, D_og, kHeadDim, d_padded);
+            auto O_e = torch::empty_like(Q_e);
+            auto lse_e =
+                torch::empty({Nb, Nh, n_early}, torch::TensorOptions()
+                                                    .dtype(torch::kFloat32)
+                                                    .device(Q.device()));
+            auto empty_bias = torch::empty({0}, attn_bias.options());
+            launch_cute_fwd_split_d_sm120<kDataType, kHeadDim, kStage, 32, 64>(
+                Q_e, K_e, V_e, O_e, empty_bias, lse_e, causal, softmax_scale,
+                0.0, 0, 0);
+            O.slice(2, 0, n_early).copy_(O_e);
+            if (softmax_lse.numel() > 0)
+              softmax_lse.slice(2, 0, n_early).copy_(lse_e);
+            launch_cute_fwd_split_d_fp8_sm120<kDataType, kHeadDim, kStage>(
+                Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
+                dropout_p, philox_seed, philox_offset, fp8_smooth_k,
+                fp8_smooth_v, fp8_q_quant_method, fp8_k_quant_method,
+                fp8_v_quant_method, fp8_pv_acc_type, fp8_qk_mm_type,
+                /*q_start_row=*/n_early);
+          } else {
+            launch_cute_fwd_split_d_fp8_sm120<kDataType, kHeadDim, kStage>(
+                Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
+                dropout_p, philox_seed, philox_offset, fp8_smooth_k,
+                fp8_smooth_v, fp8_q_quant_method, fp8_k_quant_method,
+                fp8_v_quant_method, fp8_pv_acc_type, fp8_qk_mm_type);
+          }
+        } else {
+          if (fp8_hybrid && Nq >= fp8_hybrid_n_early) {
+            const int n_early = static_cast<int>(fp8_hybrid_n_early);
+            TORCH_CHECK(n_early % 64 == 0,
+                        "ffpa_attn: fp8_hybrid_n_early must be multiple of 64");
+            torch::Tensor Q_e, K_e, V_e;
+            prepare_hybrid_stage1(Q_e, K_e, V_e, Q, K, V, n_early, Nkv, Nq,
+                                  causal, D_og, kHeadDim, d_padded);
+            auto O_e = torch::empty_like(Q_e);
+            auto lse_e =
+                torch::empty({Nb, Nh, n_early}, torch::TensorOptions()
+                                                    .dtype(torch::kFloat32)
+                                                    .device(Q.device()));
+            auto empty_bias = torch::empty({0}, attn_bias.options());
+            launch_cute_fwd_split_d_m4n2_sm120<kDataType, kHeadDim, kStage>(
+                Q_e, K_e, V_e, O_e, empty_bias, lse_e, causal, softmax_scale,
+                0.0, 0, 0);
+            O.slice(2, 0, n_early).copy_(O_e);
+            if (softmax_lse.numel() > 0)
+              softmax_lse.slice(2, 0, n_early).copy_(lse_e);
+            launch_cute_fwd_split_d_m4n2_fp8_sm120<kDataType, kHeadDim, kStage>(
+                Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
+                dropout_p, philox_seed, philox_offset, fp8_smooth_k,
+                fp8_smooth_v, fp8_q_quant_method, fp8_k_quant_method,
+                fp8_v_quant_method, fp8_pv_acc_type, fp8_qk_mm_type,
+                /*q_start_row=*/n_early);
+          } else {
+            launch_cute_fwd_split_d_m4n2_fp8_sm120<kDataType, kHeadDim, kStage>(
+                Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
+                dropout_p, philox_seed, philox_offset, fp8_smooth_k,
+                fp8_smooth_v, fp8_q_quant_method, fp8_k_quant_method,
+                fp8_v_quant_method, fp8_pv_acc_type, fp8_qk_mm_type);
+          }
+        }
+#else
+        TORCH_CHECK(false, "ffpa_attn: cute ext not compiled");
+#endif
+      } else if (prop->major == 9 || prop->major == 10) {
         // sm_90/100 (228 KB smem): WS path, setmaxnreg effective.
         if (!has_attn_bias && !has_dropout && kHeadDim <= 512) {
           // w/ kPersistQg2s = 1
@@ -148,8 +349,10 @@ void launch_ffpa_attn_fwd_template(torch::Tensor Q, torch::Tensor K,
               Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
               dropout_p, philox_seed, philox_offset);
         } else if (force_cute_tma || (!has_attn_bias && !has_dropout)) {
-          if constexpr (kHeadDim <= 128 && kHeadDim % 64 == 0) {
-            // WS persist-D: D=64/128 (Q persist fits the smem budget).
+          if constexpr (kHeadDim <= 128 && kHeadDim % 32 == 0) {
+            // WS persist-D: D=32/64/96/128 (Q persist fits the smem budget).
+            // 32-mult small D (32/96) uses SW64 smem swizzle (D*2B=64/192B),
+            // auto-selected by Traits; TMA descriptors match via SmemLayoutO.
             launch_cute_fwd_persist_d_sm120<kDataType, kHeadDim, kStage>(
                 Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
                 dropout_p, philox_seed, philox_offset);

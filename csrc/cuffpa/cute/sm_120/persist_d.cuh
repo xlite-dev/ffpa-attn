@@ -24,10 +24,9 @@ using CtaBarrier = cutlass::arch::ClusterBarrier;
 // Epilogue: R->S->TMA store (aligned) or R->G (tail); a __syncthreads would
 // deadlock since the producer warpgroup has already fallen through the
 // early-return below, so sync with a named barrier (consumer threads only).
-// NOTE: Only 64-multiple small D (D=64/128) is supported today. Non-64-multiple
-// small D (D=32/96, SW128 swizzle requires headdim % 64 == 0) is handled by the
-// split-D kernel; 32-multiple small D WS support is planned (dispatch already
-// splits on %64==0).
+// NOTE: 32-multiple small D (D=32/64/96/128) is supported. The smem swizzle
+// is auto-selected by Traits from D*2B (SW128 for 64-mult, SW64 for D=32/96);
+// TMA descriptors inherit the same swizzle from SmemLayoutO.
 template <typename Traits, typename TmaQ, typename TmaK, typename TmaV,
           typename TmaO, int kHasAttnBias = 0, int kHasDropout = 0>
 __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_sm120(
@@ -125,12 +124,9 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_sm120(
   // P0 loads Q once; P1 prefetches K/V[0..S-2]; P2 prefetches ahead by S-1
   // tiles (V-first then K-after) so consumer's K/V waits never stall.
   if (is_producer) {
-    // Release 200 regs/thread to the CTA pool for the consumer warpgroups.
-    // D=128 keeps the static 168-reg budget: O acc is only 64 regs there and
-    // setmaxnreg costs a blocking TRY_ALLOC with no benefit.
-    if constexpr (kHeadDim != 128) {
-      cutlass::arch::warpgroup_reg_dealloc<32>();  // sm_120f
-    }
+    // Release registers to the CTA pool so the two consumer warpgroups can
+    // alloc up to 232 regs/thread.
+    cutlass::arch::warpgroup_reg_dealloc<32>();  // sm_120f
     if (wg_tid == 0) {
       auto mQ = domain_offset(
           make_coord(q_row_offset, 0),
@@ -238,12 +234,8 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_sm120(
 
   // Consumer path (wg_tid 0..255): wait Q, release K/V slots, then the full
   // QK->softmax->PV loop. No TMA issue here; no __syncthreads (single WG).
-  // Take the 200 regs/thread released by the producer warpgroup.
-  // D=128 keeps the static 168-reg budget: O acc is only 64 regs there and
-  // setmaxnreg costs a blocking TRY_ALLOC with no benefit.
-  if constexpr (kHeadDim != 128) {
-    cutlass::arch::warpgroup_reg_alloc<232>();  // sm_120f
-  }
+  cutlass::arch::warpgroup_reg_alloc<232>();  // sm_120f
+
   TmaBarrier::wait(&q_full, 0);
   cutlass::arch::fence_view_async_shared();
 

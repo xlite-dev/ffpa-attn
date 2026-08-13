@@ -31,6 +31,7 @@ class CudaBackendImpl(enum.IntEnum):
   TMA = 2
   CUTE = 3
   CUTE_TMA = 4
+  CUTE_TMA_FP8 = 5
 
 
 def set_cuda_backend_impl(impl: CudaBackendImpl) -> None:
@@ -55,8 +56,11 @@ _OP_NAMESPACE = "ffpa_attn"
 torch.library.define(
   f"{_OP_NAMESPACE}::_fwd_cuda",
   "(Tensor q, Tensor k, Tensor v, Tensor attn_bias, int stages, int acc, int causal, "
-  "float softmax_scale, float dropout_p, int philox_seed, int philox_offset) "
-  "-> (Tensor o, Tensor softmax_lse)",
+  "float softmax_scale, float dropout_p, int philox_seed, int philox_offset, "
+  "bool fp8_smooth_k, bool fp8_smooth_v, int fp8_q_quant_method, int fp8_k_quant_method, "
+  "int fp8_v_quant_method, int fp8_pv_acc_type, int fp8_qk_mm_type, "
+  "bool fp8_hybrid, int fp8_hybrid_n_early) -> "
+  "(Tensor o, Tensor softmax_lse)",
 )
 
 
@@ -73,6 +77,15 @@ def _fwd_cuda_torch_op(
   dropout_p: float,
   philox_seed: int,
   philox_offset: int,
+  fp8_smooth_k: bool,
+  fp8_smooth_v: bool,
+  fp8_q_quant_method: int,
+  fp8_k_quant_method: int,
+  fp8_v_quant_method: int,
+  fp8_pv_acc_type: int,
+  fp8_qk_mm_type: int,
+  fp8_hybrid: bool,
+  fp8_hybrid_n_early: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
   if _ffpa_attn_fwd_cuda is None:
     raise RuntimeError(
@@ -82,11 +95,14 @@ def _fwd_cuda_torch_op(
     )
   O = torch.empty_like(Q)  # noqa: E741
   seqlen_q = Q.size(2)
-  seqlen_q_aligned = ((seqlen_q + 7) // 8) * 8
+  # NOTE: allocate lse with the exact seqlen (no rounding). CUDA kernels index
+  # the lse buffer flat as [B, Nh, Nq] (stride Nq per head); passing a padded
+  # storage shifted head h's rows by h and leaves the last rows unwritten when
+  # seqlen_q % 8 != 0.
   softmax_lse = torch.empty(
     Q.size(0),
     Q.size(1),
-    seqlen_q_aligned,
+    seqlen_q,
     dtype=torch.float32,
     device=Q.device,
   )
@@ -96,7 +112,7 @@ def _fwd_cuda_torch_op(
     V,
     attn_bias,
     O,
-    softmax_lse[..., :seqlen_q],
+    softmax_lse,
     stages,
     acc,
     causal,
@@ -104,6 +120,15 @@ def _fwd_cuda_torch_op(
     dropout_p,
     philox_seed,
     philox_offset,
+    fp8_smooth_k,
+    fp8_smooth_v,
+    fp8_q_quant_method,
+    fp8_k_quant_method,
+    fp8_v_quant_method,
+    fp8_pv_acc_type,
+    fp8_qk_mm_type,
+    fp8_hybrid,
+    fp8_hybrid_n_early,
   )
   return O, softmax_lse
 
@@ -121,11 +146,19 @@ def _fwd_cuda_fake(
   dropout_p: float,
   philox_seed: int,
   philox_offset: int,
+  fp8_smooth_k: bool,
+  fp8_smooth_v: bool,
+  fp8_q_quant_method: int,
+  fp8_k_quant_method: int,
+  fp8_v_quant_method: int,
+  fp8_pv_acc_type: int,
+  fp8_qk_mm_type: int,
+  fp8_hybrid: bool,
+  fp8_hybrid_n_early: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-  seqlen_q_aligned = ((Q.size(2) + 7) // 8) * 8
   O = torch.empty_like(Q)  # noqa: E741
   softmax_lse = Q.new_empty(
-    Q.size(0), Q.size(1), seqlen_q_aligned, dtype=torch.float32
+    Q.size(0), Q.size(1), Q.size(2), dtype=torch.float32
   )
   return O, softmax_lse
 
