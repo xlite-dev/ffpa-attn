@@ -86,10 +86,17 @@ using CtaBarrier = cutlass::arch::ClusterBarrier;
 //           softmax; softmax_scale_eff = scale (not s_dequant*scale).
 //           Trade-off: less precise than per-token (multi-row groups share
 //           one amax) but avoids per-element scale lookup / shuffles.
+// kReorgFree: replaces the cross-lane ReorgC8bitToA8bit (16 SHFL + 32 PRMT
+// per thread-tile on the QK->PV critical path) with the shuffle-free
+// PackC8bitToA8bitPermVT (16 PRMT, zero SHFL). The pack leaves the PV A
+// operand with a permuted k-indexing; correctness requires V^T to be stored
+// with the matching column permutation (VTPermInv32 in quantize_fp8.cuh),
+// which the launcher pairs via the FFPA_FP8_PERM_VT env gate. Fixed-mode P
+// quant only (kPQuantPerRow false). See reg2reg_8b.cuh for the derivation.
 template <typename Traits, typename ElementO, typename TmaQ, typename TmaK,
           typename TmaV, typename TmaO, bool kPQuantPerRow = false,
           bool kPVAccF16 = false, bool kVPerChannel = false,
-          bool kQKPerThread = false>
+          bool kQKPerThread = false, bool kReorgFree = false>
 __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp8_sm120(
     CUTLASS_GRID_CONSTANT TmaQ const tma_q,
     CUTLASS_GRID_CONSTANT TmaK const tma_k,
@@ -125,6 +132,8 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp8_sm120(
   static_assert(
       kHeadDim % 32 == 0 && kHeadDim >= 32 && kHeadDim <= 224,
       "fp8 persist_d supports D in {32,64,...,224} (multiples of 32)");
+  static_assert(!(kReorgFree && kPQuantPerRow),
+                "kReorgFree supports fixed-mode P quant only");
 
   constexpr int kQTileElements = cosize(SmemLayoutQ{});
   constexpr int kKTileElements = cosize(SmemLayoutK{});
@@ -555,10 +564,15 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp8_sm120(
 
     // P -> e4m3 A operand (see fp8_pscale.cuh). Per-row mode needs the row
     // max first, then scales+converts; fixed mode was pre-scaled by the
-    // softmax and only converts (packed e4m3x2) + reorgs.
+    // softmax and only converts (packed e4m3x2) + reorgs. kReorgFree swaps
+    // the cross-lane reorg for the shuffle-free perm pack (paired with the
+    // permuted V^T written by the quantize pre-kernel).
     if constexpr (kPQuantPerRow) {
       pscale_per_row(scores, p_scale);
       quantize_p_frag<true>(scores, tCrSf, vs, p_scale, reorg);
+    } else if constexpr (kReorgFree) {
+      PackC8bitToA8bitPermVT perm_pack;
+      quantize_p_frag_prescaled(tCrSf, perm_pack);
     } else {
       quantize_p_frag_prescaled(tCrSf, reorg);
     }

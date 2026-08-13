@@ -514,6 +514,14 @@ void launch_cute_fwd_persist_d_fp8_sm120_impl(
       !fp8_smooth_v || v_per_channel,
       "ffpa_attn: fp8_smooth_v requires fp8_v_quant_method='per_channel'");
   const bool pquant_per_row = getenv("FFPA_FP8_PQUANT_PER_ROW") != nullptr;
+  // Reorg-free PV pack (Phase 3): the attention kernel packs P into the PV A
+  // operand without cross-lane shuffles, leaving a permuted k-indexing that
+  // the quantize pre-kernel must match by storing V^T columns permuted
+  // (VTPermInv32). Both sides key off this one env flag so the pairing can
+  // never diverge. Gated to the fixed-mode int8-QK + f16-PV-acc config.
+  const bool reorg_free = getenv("FFPA_FP8_PERM_VT") != nullptr && kQKInt8 &&
+                          pv_acc_f16 && !v_per_channel && !pquant_per_row &&
+                          !qk_per_thread;
 
   constexpr int kBr = 128;
   // D>128 must shrink kBc to fit the 99KB smem budget (1B/elem fp8): D=224
@@ -632,7 +640,7 @@ void launch_cute_fwd_persist_d_fp8_sm120_impl(
         reinterpret_cast<__nv_fp8_e4m3*>(vt8.data_ptr()),
         q_scale.data_ptr<float>(), k_scale.data_ptr<float>(),
         v_scale_quant.data_ptr<float>(), Nb, Nh, Nh_kv, Nq, Nkv, Nkv_pad, D_og,
-        stream, km_ptr);
+        stream, km_ptr, reorg_free);
   }
 
   // Per-channel V (sage-style): re-quantize V with per-D scale via coalesced
@@ -773,10 +781,23 @@ void launch_cute_fwd_persist_d_fp8_sm120_impl(
   } else if (pv_acc_f16) {
     // f8f8f16 PV (fp16 MMA accumulator, absorbs to float o_acc each
     // kv_tile) avoids the 22-bit f8f8f32 accumulator loss on causal early
-    // rows. See persist_d.cuh kPVAccF16.
-    launch_kernel(
-        ffpa_fp8::persist_d_ws_fwd_cute_fp8_sm120<Traits, ElementO, TmaQ, TmaK,
-                                                  TmaV, TmaO, false, true>);
+    // rows. See persist_d.cuh kPVAccF16. reorg_free additionally swaps the
+    // cross-lane P reorg for the shuffle-free perm pack (paired with the
+    // permuted V^T above); if constexpr keeps the extra instantiation out of
+    // the non-int8 TUs.
+    bool launched = false;
+    if constexpr (kQKInt8) {
+      if (reorg_free) {
+        launch_kernel(ffpa_fp8::persist_d_ws_fwd_cute_fp8_sm120<
+                      Traits, ElementO, TmaQ, TmaK, TmaV, TmaO, false, true,
+                      false, false, true>);
+        launched = true;
+      }
+    }
+    if (!launched) {
+      launch_kernel(ffpa_fp8::persist_d_ws_fwd_cute_fp8_sm120<
+                    Traits, ElementO, TmaQ, TmaK, TmaV, TmaO, false, true>);
+    }
   } else {
     launch_kernel(
         ffpa_fp8::persist_d_ws_fwd_cute_fp8_sm120<Traits, ElementO, TmaQ, TmaK,

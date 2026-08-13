@@ -28,6 +28,22 @@ __device__ __forceinline__ int8_t quant_sym_int8(float x) {
   return static_cast<int8_t>(static_cast<int>(q));
 }
 
+// V^T column permutation inverse for the reorg-free PV pack (Phase 3): the
+// attention kernel packs the softmax P bytes into the PV A operand WITHOUT
+// cross-lane shuffles, which leaves the A operand with a permuted k-indexing
+// pi (slot s holds true kv column pi(s)); the V^T operand must carry the
+// matching permutation so slot s of A and B meet the same kv position. See
+// PackC8bitToA8bitPermVT in reg2reg_8b.cuh for pi and the full derivation.
+// VTPermInv32 maps a TRUE kv column j (within any 32-column group, periodic)
+// to its STORAGE column: pi^-1(j) = 4*((j>>1)&3) + 2*((j>>3)&1) + (j&1).
+// The permutation stays inside each 32-column group, so the transposed V^T
+// warp stores remain within one 32B sector (coalescing unchanged).
+__device__ __forceinline__ int VTPermInv32(int n) {
+  const int half = n & 16;
+  const int x = n & 15;
+  return half | (4 * ((x >> 1) & 3) + 2 * ((x >> 3) & 1) + (x & 1));
+}
+
 // fp8/int8 QK quantize output element (int8 when kQKInt8).
 template <bool kQKInt8>
 using QKOutT = std::conditional_t<kQKInt8, int8_t, __nv_fp8_e4m3>;
@@ -154,7 +170,10 @@ __global__ void quantize_fp8_kernel(
 // covers one (bh, row-block) tile of (kBlockRows, D). Global reads are
 // 128-bit vectorized; 8-elem runs land in smem as 2x uint32 (pad keeps bank
 // conflicts low on the transposed read-out).
-template <typename Element, int kBlockRows, int kD>
+// kVTPerm: write V^T columns permuted for the reorg-free PV pack
+// (VTPermInv32); must pair with PackC8bitToA8bitPermVT in the attention
+// kernel (launcher-enforced, see FFPA_FP8_PERM_VT).
+template <typename Element, int kBlockRows, int kD, bool kVTPerm = false>
 __global__ void quantize_fp8_vt_kernel(
     const Element* __restrict__ V,   // (B, H, N, D_og) row-major
     __nv_fp8_e4m3* __restrict__ VT,  // flat [B*Nh_kv*kD, Nkv_pad]
@@ -265,6 +284,9 @@ __global__ void quantize_fp8_vt_kernel(
     __syncthreads();
 
     // Pass 3: coalesced transpose write for this chunk's D range [dc, d_end).
+    // kVTPerm: true kv row n lands in storage column VTPermInv32(n) (per
+    // 32-col group), pairing with PackC8bitToA8bitPermVT's slot->k map.
+    const int lane_slot = kVTPerm ? VTPermInv32(lane) : lane;
 #pragma unroll 1
     for (int it = warp * 4; it < (d_end - dc); it += kWarps * 4) {
 #pragma unroll
@@ -274,8 +296,8 @@ __global__ void quantize_fp8_vt_kernel(
         for (int t = 0; t < kBlockRows / 32; ++t) {
           const int n = t * 32 + lane;
           if (row0 + n < N)
-            VT[vt_base + static_cast<long>(c) * ldy + row0 + n] =
-                tile[n][it + cc];
+            VT[vt_base + static_cast<long>(c) * ldy + row0 + t * 32 +
+               lane_slot] = tile[n][it + cc];
         }
       }
     }
@@ -288,7 +310,11 @@ __global__ void quantize_fp8_vt_kernel(
 // self-attention (Nq == Nkv, Nh == Nh_kv) so all three share the same grid
 // dimensions. Falls back to separate launches otherwise.
 // kQKInt8: roles 0/1 emit symmetric int8 (amax/127); VT stays e4m3.
-template <typename Element, int kBlockRows, int kD, int kThreads, bool kQKInt8>
+// kVTPerm: role 2 writes V^T columns permuted for the reorg-free PV pack
+// (VTPermInv32); must pair with PackC8bitToA8bitPermVT in the attention
+// kernel (launcher-enforced, see FFPA_FP8_PERM_VT).
+template <typename Element, int kBlockRows, int kD, int kThreads, bool kQKInt8,
+          bool kVTPerm = false>
 __global__ void quantize_fp8_qkv_fused_kernel(
     const Element* __restrict__ Q, const Element* __restrict__ K,
     const Element* __restrict__ V, QKOutT<kQKInt8>* __restrict__ Q8,
@@ -450,6 +476,9 @@ __global__ void quantize_fp8_qkv_fused_kernel(
       v_scale[static_cast<long>(bh) * n_rb + rb] = s;
 
     const long vt_base = static_cast<long>(bh) * kD * ldy;
+    // kVTPerm: true kv row n lands in storage column VTPermInv32(n) (per
+    // 32-col group), pairing with PackC8bitToA8bitPermVT's slot->k map.
+    const int lane_slot = kVTPerm ? VTPermInv32(lane) : lane;
     // Pass 2+3: per D-chunk read -> quantize -> smem -> transpose store.
     for (int dci = 0; dci < kNDChunks; ++dci) {
       const int dc = dci * kDChunk;
@@ -492,8 +521,8 @@ __global__ void quantize_fp8_qkv_fused_kernel(
           for (int t = 0; t < kBlockRows / 32; ++t) {
             const int n = t * 32 + lane;
             if (row0 + n < N)
-              VT8[vt_base + static_cast<long>(c) * ldy + row0 + n] =
-                  tile[n][it + cc];
+              VT8[vt_base + static_cast<long>(c) * ldy + row0 + t * 32 +
+                  lane_slot] = tile[n][it + cc];
           }
         }
       }
@@ -856,6 +885,9 @@ void launch_quantize_fp8_perthread_qk_sm120(
 // mode-dependent); smooth-K (km != nullptr): K is shifted by its per-(b,h)
 // seq mean before quantizing; km holds the per-head mean vector (B*Nh_kv, D).
 // inv_n scales km (pass 1.0 when km is already a mean).
+// perm_vt: write V^T with the reorg-free column permutation (VTPermInv32);
+// the attention kernel consuming this VT must use PackC8bitToA8bitPermVT
+// (launcher pairing in launch.cuh, FFPA_FP8_PERM_VT).
 template <typename Element, int kBr, int kBc, int kHeadDim, bool kQKInt8>
 void launch_quantize_fp8_sm120(const Element* q_ptr, const Element* k_ptr,
                                const Element* v_ptr, void* q8, void* k8,
@@ -863,7 +895,8 @@ void launch_quantize_fp8_sm120(const Element* q_ptr, const Element* k_ptr,
                                float* k_scale, float* v_scale, int B, int Nh,
                                int Nh_kv, int Nq, int Nkv, int Nkv_pad,
                                int D_og, cudaStream_t stream,
-                               const Element* km = nullptr) {
+                               const Element* km = nullptr,
+                               bool perm_vt = false) {
   using QKOut = QKOutT<kQKInt8>;
   constexpr int kThreads = 128;
   // Dynamic smem for the VT staging tile (1B/elem); must match the kernels'
@@ -875,14 +908,20 @@ void launch_quantize_fp8_sm120(const Element* q_ptr, const Element* k_ptr,
   if constexpr (kBr == kBc) {
     if (Nq == Nkv && Nh == Nh_kv) {
       dim3 grid((Nq + kBr - 1) / kBr, B * Nh, 3);
-      auto kernel = quantize_fp8_qkv_fused_kernel<Element, kBr, kHeadDim,
-                                                  kThreads, kQKInt8>;
-      cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                           kVtSmemBytes);
-      kernel<<<grid, kThreads, kVtSmemBytes, stream>>>(
-          q_ptr, k_ptr, v_ptr, reinterpret_cast<QKOut*>(q8),
-          reinterpret_cast<QKOut*>(k8), vt8, q_scale, k_scale, v_scale, Nq, Nh,
-          Nkv_pad, D_og, km, 1.0f);
+      const auto launch_fused = [&](auto kernel) {
+        cudaFuncSetAttribute(
+            kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kVtSmemBytes);
+        kernel<<<grid, kThreads, kVtSmemBytes, stream>>>(
+            q_ptr, k_ptr, v_ptr, reinterpret_cast<QKOut*>(q8),
+            reinterpret_cast<QKOut*>(k8), vt8, q_scale, k_scale, v_scale, Nq,
+            Nh, Nkv_pad, D_og, km, 1.0f);
+      };
+      if (perm_vt)
+        launch_fused(quantize_fp8_qkv_fused_kernel<Element, kBr, kHeadDim,
+                                                   kThreads, kQKInt8, true>);
+      else
+        launch_fused(quantize_fp8_qkv_fused_kernel<Element, kBr, kHeadDim,
+                                                   kThreads, kQKInt8, false>);
       return;
     }
   }
@@ -900,11 +939,16 @@ void launch_quantize_fp8_sm120(const Element* q_ptr, const Element* k_ptr,
   }
   {
     dim3 grid_kv((Nkv + kBc - 1) / kBc, B * Nh_kv);
-    auto kernel = quantize_fp8_vt_kernel<Element, kBc, kHeadDim>;
-    cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                         kVtSmemBytes);
-    kernel<<<grid_kv, kThreads, kVtSmemBytes, stream>>>(
-        v_ptr, vt8, v_scale, Nkv, Nh_kv, Nkv_pad, D_og);
+    const auto launch_vt = [&](auto kernel) {
+      cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                           kVtSmemBytes);
+      kernel<<<grid_kv, kThreads, kVtSmemBytes, stream>>>(
+          v_ptr, vt8, v_scale, Nkv, Nh_kv, Nkv_pad, D_og);
+    };
+    if (perm_vt)
+      launch_vt(quantize_fp8_vt_kernel<Element, kBc, kHeadDim, true>);
+    else
+      launch_vt(quantize_fp8_vt_kernel<Element, kBc, kHeadDim, false>);
   }
 }
 
