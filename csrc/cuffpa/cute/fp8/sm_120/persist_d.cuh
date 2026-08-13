@@ -541,26 +541,29 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp8_sm120(
       }
     }
 
-    // Rescale o_acc (online softmax); deferred until p_scale is known.
-    bool local_need_rescale = false;
-#pragma unroll
-    for (int r = 0; r < kORows; ++r)
-      local_need_rescale = local_need_rescale || (row_scale[r] < 1.0f);
-    const bool need_rescale = __any_sync(0xffffffff, local_need_rescale);
-    const bool do_rescale = (kv_tile > 0) && need_rescale;
-    // f16acc fixed mode folds this rescale into the inst_buf absorption FFMA
+    // Rescale o_acc (online softmax). FA-4 lazy rescale: row_scale[r] is
+    // exactly 1.0f whenever the row needs no rescale (threshold skip keeps
+    // row_max stale), and each thread rescales only its own rows, so the
+    // decision is per-row. (The CUTLASS 77_blackwell_fmha warp-uniform
+    // __any_sync pattern guards a shared-TMEM collective rescale; here the
+    // target is thread-private registers, so the cross-lane vote is not
+    // required.) <1.0f also rejects NaN row_scale on all-masked rows.
+    // f16acc fixed mode folds the rescale into the inst_buf absorption FFMA
     // below (o_acc = o_acc*row_scale + inst), skipping the standalone pass.
     constexpr bool kFuseRescaleAbsorb = (!kPQuantPerRow) && kPVAccF16;
 
-    if (do_rescale && !kFuseRescaleAbsorb) {
+    if (kv_tile > 0 && !kFuseRescaleAbsorb) {
       auto tCrO = make_tensor(make_rmem_ptr(o_acc), OFragLayout{});
       auto tCrO_rc = make_tensor(
           tCrO.data(), ffpa_cute::convert_layout_acc_rowcol(tCrO.layout()));
 #pragma unroll
-      for (int row = 0; row < kORows; ++row)
+      for (int row = 0; row < kORows; ++row) {
+        if (row_scale[row] < 1.0f) {
 #pragma unroll
-        for (int col = 0; col < kOCols; ++col)
-          tCrO_rc(row, col) *= row_scale[row];
+          for (int col = 0; col < kOCols; ++col)
+            tCrO_rc(row, col) *= row_scale[row];
+        }
+      }
     }
 
     // P -> e4m3 A operand (see fp8_pscale.cuh). Per-row mode needs the row
@@ -636,8 +639,10 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp8_sm120(
                         ffpa_cute::convert_layout_acc_rowcol(tCrInst.layout()));
 #pragma unroll
         for (int row = 0; row < kORows; ++row) {
-          // Fold the deferred online-softmax rescale into the absorption.
-          const float rs = do_rescale ? row_scale[row] : 1.0f;
+          // Fold the online-softmax rescale into the absorption (per-row
+          // decision; row_scale is exactly 1.0f when no rescale is needed).
+          const float rs =
+              (kv_tile > 0 && row_scale[row] < 1.0f) ? row_scale[row] : 1.0f;
 #pragma unroll
           for (int col = 0; col < kOCols; ++col)
             tCrO_rc(row, col) =
