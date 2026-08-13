@@ -21,6 +21,7 @@ Examples:
 
 from __future__ import annotations
 
+import os
 import argparse
 import importlib.util
 import time
@@ -39,9 +40,17 @@ SAGE_INSTALLED = importlib.util.find_spec("sageattention") is not None
 if SAGE_INSTALLED:
   from sageattention import sageattn
 
+FFPA_BENCH_FP8_FORCE_QK_INT8 = os.environ.get(
+  "FFPA_BENCH_FP8_FORCE_QK_INT8", "0"
+) == "1"
+if FFPA_BENCH_FP8_FORCE_QK_INT8:
+  print(
+    "FFPA_BENCH_FP8_FORCE_QK_INT8=1: forcing FP8 Q/K matmul int8, P/V accumulate f16"
+  )
+
 
 def fp8_backend() -> CUDABackend:
-  if "5090" in torch.cuda.get_device_name():
+  if "5090" in torch.cuda.get_device_name() or FFPA_BENCH_FP8_FORCE_QK_INT8:
     # 5090: FP8 Q/K matmul int8, P/V accumulate f16 (default)
     return CUDABackend(
       backward=False,
