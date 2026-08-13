@@ -172,7 +172,8 @@ __global__ void quantize_fp8_kernel(
 // conflicts low on the transposed read-out).
 // kVTPerm: write V^T columns permuted for the reorg-free PV pack
 // (VTPermInv32); must pair with PackC8bitToA8bitPermVT in the attention
-// kernel (launcher-enforced, see FFPA_FP8_PERM_VT).
+// kernel (launcher-enforced pairing in launch.cuh, on by default for the
+// gated config).
 template <typename Element, int kBlockRows, int kD, bool kVTPerm = false>
 __global__ void quantize_fp8_vt_kernel(
     const Element* __restrict__ V,   // (B, H, N, D_og) row-major
@@ -312,7 +313,8 @@ __global__ void quantize_fp8_vt_kernel(
 // kQKInt8: roles 0/1 emit symmetric int8 (amax/127); VT stays e4m3.
 // kVTPerm: role 2 writes V^T columns permuted for the reorg-free PV pack
 // (VTPermInv32); must pair with PackC8bitToA8bitPermVT in the attention
-// kernel (launcher-enforced, see FFPA_FP8_PERM_VT).
+// kernel (launcher-enforced pairing in launch.cuh, on by default for the
+// gated config).
 template <typename Element, int kBlockRows, int kD, int kThreads, bool kQKInt8,
           bool kVTPerm = false>
 __global__ void quantize_fp8_qkv_fused_kernel(
@@ -534,7 +536,9 @@ __global__ void quantize_fp8_qkv_fused_kernel(
 // Quantize + transpose V[N, D] -> VT[D, N_pad] with a per-D scale. Same smem
 // staging tile as quantize_fp8_vt_kernel, but the scale is read per-D from
 // v_scale[bh, D] instead of computed as a per-tile amax.
-template <typename Element, int kBlockRows, int kD>
+// kVTPerm: permuted-column write pairing with PackC8bitToA8bitPermVT (see
+// quantize_fp8_vt_kernel).
+template <typename Element, int kBlockRows, int kD, bool kVTPerm = false>
 __global__ void quantize_fp8_vt_perchannel_kernel(
     const Element* __restrict__ V,    // (B, H, N, D_og) row-major
     __nv_fp8_e4m3* __restrict__ VT,   // flat [B*Nh_kv*D, Nkv_pad]
@@ -584,6 +588,8 @@ __global__ void quantize_fp8_vt_perchannel_kernel(
   }
 
   const long vt_base = static_cast<long>(bh) * D * ldy;
+  // kVTPerm: true kv row n lands in storage column VTPermInv32(n).
+  const int lane_slot = kVTPerm ? VTPermInv32(lane) : lane;
   for (int dci = 0; dci < kNDChunks; ++dci) {
     const int dc = dci * kDChunk;
     const int d_end = (dc + kDChunk < D) ? dc + kDChunk : D;
@@ -626,8 +632,8 @@ __global__ void quantize_fp8_vt_perchannel_kernel(
         for (int t = 0; t < kBlockRows / 32; ++t) {
           const int n = t * 32 + lane;
           if (row0 + n < N)
-            VT[vt_base + static_cast<long>(c) * ldy + row0 + n] =
-                tile[n][it + cc];
+            VT[vt_base + static_cast<long>(c) * ldy + row0 + t * 32 +
+               lane_slot] = tile[n][it + cc];
         }
       }
     }
@@ -644,18 +650,24 @@ void launch_quantize_fp8_vt_perchannel_sm120(
     const Element* v_ptr, __nv_fp8_e4m3* vt8, float* v_scale, float* vm,
     float* partials_sum, float* partials_max, float* partials_min, int B,
     int Nh_kv, int Nkv, int Nkv_pad, cudaStream_t stream, int D_og,
-    float v_scale_max = 448.0f) {
+    float v_scale_max = 448.0f, bool perm_vt = false) {
   launch_v_stats_sm120<Element, kHeadDim, kSmoothV>(
       v_ptr, vm, v_scale, partials_sum, partials_max, partials_min, B, Nh_kv,
       Nkv, stream, D_og, v_scale_max);
   constexpr int kDChunk = (kHeadDim < 256) ? kHeadDim : 256;
   constexpr int kVtSmemBytes = kBc * (kDChunk + 16);
   dim3 grid_q((Nkv + kBc - 1) / kBc, B * Nh_kv);
-  auto kernel = quantize_fp8_vt_perchannel_kernel<Element, kBc, kHeadDim>;
-  cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                       kVtSmemBytes);
-  kernel<<<grid_q, 128, kVtSmemBytes, stream>>>(
-      v_ptr, vt8, v_scale, kSmoothV ? vm : nullptr, Nkv, Nh_kv, Nkv_pad, D_og);
+  const auto launch_vt = [&](auto kernel) {
+    cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                         kVtSmemBytes);
+    kernel<<<grid_q, 128, kVtSmemBytes, stream>>>(v_ptr, vt8, v_scale,
+                                                  kSmoothV ? vm : nullptr, Nkv,
+                                                  Nh_kv, Nkv_pad, D_og);
+  };
+  if (perm_vt)
+    launch_vt(quantize_fp8_vt_perchannel_kernel<Element, kBc, kHeadDim, true>);
+  else
+    launch_vt(quantize_fp8_vt_perchannel_kernel<Element, kBc, kHeadDim, false>);
 }
 
 // Per-thread Q quantize (fragment-aligned, NOT per-token): 64 scales per
@@ -850,7 +862,8 @@ void launch_quantize_fp8_perthread_qk_sm120(
     const Element* q_ptr, const Element* k_ptr, const Element* v_ptr, void* q8,
     void* k8, __nv_fp8_e4m3* vt8, float* q_scale, float* k_scale,
     float* v_scale, int B, int Nh, int Nh_kv, int Nq, int Nkv, int Nkv_pad,
-    int D_og, cudaStream_t stream, const Element* km = nullptr) {
+    int D_og, cudaStream_t stream, const Element* km = nullptr,
+    bool perm_vt = false) {
   using QKOut = QKOutT<kQKInt8>;
   // Q: 128-row blocks, 64 scale per block.
   {
@@ -871,11 +884,16 @@ void launch_quantize_fp8_perthread_qk_sm120(
     constexpr int kDChunk = (kHeadDim < 256) ? kHeadDim : 256;
     constexpr int kVtSmemBytes = kBc * (kDChunk + 16);
     dim3 grid((Nkv + kBc - 1) / kBc, B * Nh_kv);
-    auto vk = quantize_fp8_vt_kernel<Element, kBc, kHeadDim>;
-    cudaFuncSetAttribute(vk, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                         kVtSmemBytes);
-    vk<<<grid, 128, kVtSmemBytes, stream>>>(v_ptr, vt8, v_scale, Nkv, Nh_kv,
-                                            Nkv_pad, D_og);
+    const auto launch_vt = [&](auto vk) {
+      cudaFuncSetAttribute(vk, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                           kVtSmemBytes);
+      vk<<<grid, 128, kVtSmemBytes, stream>>>(v_ptr, vt8, v_scale, Nkv, Nh_kv,
+                                              Nkv_pad, D_og);
+    };
+    if (perm_vt)
+      launch_vt(quantize_fp8_vt_kernel<Element, kBc, kHeadDim, true>);
+    else
+      launch_vt(quantize_fp8_vt_kernel<Element, kBc, kHeadDim, false>);
   }
 }
 
@@ -887,7 +905,7 @@ void launch_quantize_fp8_perthread_qk_sm120(
 // inv_n scales km (pass 1.0 when km is already a mean).
 // perm_vt: write V^T with the reorg-free column permutation (VTPermInv32);
 // the attention kernel consuming this VT must use PackC8bitToA8bitPermVT
-// (launcher pairing in launch.cuh, FFPA_FP8_PERM_VT).
+// (launcher pairing in launch.cuh; on by default for the gated config).
 template <typename Element, int kBr, int kBc, int kHeadDim, bool kQKInt8>
 void launch_quantize_fp8_sm120(const Element* q_ptr, const Element* k_ptr,
                                const Element* v_ptr, void* q8, void* k8,

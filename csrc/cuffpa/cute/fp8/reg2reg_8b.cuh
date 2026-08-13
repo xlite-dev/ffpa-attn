@@ -133,8 +133,10 @@ struct ReorgC8bitToA8bit {
 // (equivalently the quantize pre-kernel writes true kv row j into column
 // pi^-1(j) = 4*((j>>1)&3) + 2*((j>>3)&1) + (j&1), per 32-col group; see
 // VTPermInv32 in quantize_fp8.cuh). Pairing is enforced by the launcher
-// (FFPA_FP8_PERM_VT env gate in launch.cuh); this pack must NEVER run
-// against an unpermuted V^T.
+// (reorg_free gate in launch.cuh, on by default for every persist_d fp8
+// config); this pack must NEVER run against an unpermuted V^T.
+// ReorgC8bitToA8bit above stays compiled as the fallback/contrast path and
+// is still used by the split_d family.
 struct PackC8bitToA8bitPermVT {
   template <typename Fragment>
   CUTLASS_DEVICE void operator()(Fragment& accum) const {

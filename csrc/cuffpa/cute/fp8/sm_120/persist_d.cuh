@@ -91,8 +91,11 @@ using CtaBarrier = cutlass::arch::ClusterBarrier;
 // PackC8bitToA8bitPermVT (16 PRMT, zero SHFL). The pack leaves the PV A
 // operand with a permuted k-indexing; correctness requires V^T to be stored
 // with the matching column permutation (VTPermInv32 in quantize_fp8.cuh),
-// which the launcher pairs via the FFPA_FP8_PERM_VT env gate. Fixed-mode P
-// quant only (kPQuantPerRow false). See reg2reg_8b.cuh for the derivation.
+// which the launcher pairs via the reorg_free gate (on by default for every
+// persist_d fp8 config; the cross-lane reorg stays compiled as fallback and
+// is still used by the split_d family). Element/acc/granularity agnostic —
+// the pack only depends on the shared m16n8k32 fragment layouts. See
+// reg2reg_8b.cuh for the derivation.
 template <typename Traits, typename ElementO, typename TmaQ, typename TmaK,
           typename TmaV, typename TmaO, bool kPQuantPerRow = false,
           bool kPVAccF16 = false, bool kVPerChannel = false,
@@ -132,8 +135,6 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp8_sm120(
   static_assert(
       kHeadDim % 32 == 0 && kHeadDim >= 32 && kHeadDim <= 224,
       "fp8 persist_d supports D in {32,64,...,224} (multiples of 32)");
-  static_assert(!(kReorgFree && kPQuantPerRow),
-                "kReorgFree supports fixed-mode P quant only");
 
   constexpr int kQTileElements = cosize(SmemLayoutQ{});
   constexpr int kKTileElements = cosize(SmemLayoutK{});
@@ -567,12 +568,17 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp8_sm120(
     // softmax and only converts (packed e4m3x2) + reorgs. kReorgFree swaps
     // the cross-lane reorg for the shuffle-free perm pack (paired with the
     // permuted V^T written by the quantize pre-kernel).
-    if constexpr (kPQuantPerRow) {
+    if constexpr (kReorgFree) {
+      PackC8bitToA8bitPermVT perm_pack;
+      if constexpr (kPQuantPerRow) {
+        pscale_per_row(scores, p_scale);
+        quantize_p_frag<true>(scores, tCrSf, vs, p_scale, perm_pack);
+      } else {
+        quantize_p_frag_prescaled(tCrSf, perm_pack);
+      }
+    } else if constexpr (kPQuantPerRow) {
       pscale_per_row(scores, p_scale);
       quantize_p_frag<true>(scores, tCrSf, vs, p_scale, reorg);
-    } else if constexpr (kReorgFree) {
-      PackC8bitToA8bitPermVT perm_pack;
-      quantize_p_frag_prescaled(tCrSf, perm_pack);
     } else {
       quantize_p_frag_prescaled(tCrSf, reorg);
     }
