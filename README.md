@@ -38,6 +38,7 @@ git clone https://github.com/xlite-dev/ffpa-attn.git
 # Then, build the wheel package (Triton + CuTe-DSL backends)
 cd ffpa-attn && pip3 install -e . --no-build-isolation
 # Optional: install ffpa-attn w/ CUDA backend (forward only)
+# ext all: build all kernels, include fp8 quantzation kernels
 bash ./build.sh --arch sm_120f --ext all --headdim all
 ```
 
