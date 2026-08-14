@@ -425,6 +425,8 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
     }
 
     float row_scale[kORows];
+    constexpr bool kMaxScaleAfter = Traits::kQKInt8 && kPVAccF16;
+    constexpr bool kFuseRescaleAbsorb = kPVAccF16;
     if constexpr (kQKPerThread) {
       // Per-thread QK: pre-dequant scores per-row, then softmax with 'scale'.
       if (!tile_needs_mask) {
@@ -437,8 +439,8 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
         }
       }
       const float softmax_scale_eff = tile_needs_mask ? 1.0f : scale;
-      ffpa_cute::online_softmax_fp8_fixed_m4n2<decltype(scores),
-                                               decltype(tScS_rc), kORows>(
+      ffpa_cute::online_softmax_fp8_fixed_m4n2<
+          decltype(scores), decltype(tScS_rc), kORows, kMaxScaleAfter>(
           scores, tScS_rc, softmax_scale_eff, row_max, row_sum, row_scale,
           smem_exchange, warp_id, lane_id, log2f(p_quant_scale),
           1.0f / p_quant_scale, Traits::kRescaleThreshold);
@@ -446,18 +448,12 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
       const float s_dequant = qs_arr[0] * ks;
       const float softmax_scale_eff =
           tile_needs_mask ? 1.0f : s_dequant * scale;
-      ffpa_cute::online_softmax_fp8_fixed_m4n2<decltype(scores),
-                                               decltype(tScS_rc), kORows>(
+      ffpa_cute::online_softmax_fp8_fixed_m4n2<
+          decltype(scores), decltype(tScS_rc), kORows, kMaxScaleAfter>(
           scores, tScS_rc, softmax_scale_eff, row_max, row_sum, row_scale,
           smem_exchange, warp_id, lane_id, log2f(p_quant_scale),
           1.0f / p_quant_scale, Traits::kRescaleThreshold);
     }
-
-    bool local_need_rescale = false;
-#pragma unroll
-    for (int r = 0; r < kORows; ++r)
-      local_need_rescale = local_need_rescale || (row_scale[r] < 1.0f);
-    const bool need_rescale = __any_sync(0xffffffff, local_need_rescale);
 
     // Phase 3: P -> e4m3 -> SMEM roundtrip. stmatrix is a b16 operation that
     // needs SW128 for 16B vectorization, but SW128's 128-elem atom doesn't
@@ -497,21 +493,23 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
 
       auto tCrO =
           make_tensor(make_rmem_ptr(&o_acc_storage[v_chunk][0]), OFragLayout{});
-      if (kv_tile > 0 && need_rescale) {
+      if (kv_tile > 0 && !kFuseRescaleAbsorb) {
         auto tCrO_rc = make_tensor(
             tCrO.data(), ffpa_cute::convert_layout_acc_rowcol(tCrO.layout()));
 #pragma unroll
         for (int row = 0; row < kORows; ++row)
+          if (row_scale[row] < 1.0f) {
 #pragma unroll
-          for (int col = 0; col < kOCols; ++col)
-            tCrO_rc(row, col) *= row_scale[row];
+            for (int col = 0; col < kOCols; ++col)
+              tCrO_rc(row, col) *= row_scale[row];
+          }
       }
 
       if constexpr (kPVAccF16) {
         // f8f8f16 PV: fp16 accumulator avoids 22-bit f8f8f32 loss on causal
         // early rows; absorb to float o_acc via CUDA-core FADD per kv_tile.
         // A-side P stays tCrPv_storage (SMEM roundtrip); only B-side (V)
-        // derives from the f16 TiledMma.
+        // derives from the f16 TiledMma. Rescale folded into absorption FFMA.
         auto tCrV_f16 = thr_mma_pv_f16.partition_fragment_B(sV);
         auto tVsV_f16 = s2r_thr_v_f16.partition_S(sV);
         auto tCrInst = partition_fragment_C(tiled_mma_pv_f16,
@@ -525,10 +523,14 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
             make_tensor(tCrInst.data(),
                         ffpa_cute::convert_layout_acc_rowcol(tCrInst.layout()));
 #pragma unroll
-        for (int row = 0; row < kORows; ++row)
+        for (int row = 0; row < kORows; ++row) {
+          const float rs =
+              (kv_tile > 0 && row_scale[row] < 1.0f) ? row_scale[row] : 1.0f;
 #pragma unroll
           for (int col = 0; col < kOCols; ++col)
-            tCrO_rc(row, col) += float(tCrInst_rc(row, col));
+            tCrO_rc(row, col) =
+                fmaf(tCrO_rc(row, col), rs, float(tCrInst_rc(row, col)));
+        }
       } else {
         auto tCrVStorage = thr_mma_pv.partition_fragment_B(sV);
         auto tCrV = make_tensor(tCrVStorage.data(), tCrV_layout);

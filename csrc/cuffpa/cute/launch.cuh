@@ -504,8 +504,8 @@ void launch_cute_fwd_persist_d_fp8_sm120_impl(
       "ffpa_attn: Q/K quant method must be both per_block or both per_thread");
   const bool qk_per_thread = (fp8_q_quant_method == 2);
   // FP8 V quant / PV acc / smooth_v are API params (v_quant_method:
-  // 0=per_block, 1=per_channel; pv_acc_type: 0=f16, 1=f32). Only persist_d
-  // (D<=128) supports per-channel V / smooth_v / pv_acc_f16.
+  // 0=per_block, 1=per_channel; pv_acc_type: 0=f16, 1=f32). All fp8
+  // kernels (persist_d, split_d, m4n2) support every combination.
   const bool v_per_channel = (fp8_v_quant_method == 1);
   const bool v_smooth_mean = v_per_channel && fp8_smooth_v;
   const bool pv_acc_f16 = (fp8_pv_acc_type == 0);
@@ -522,8 +522,8 @@ void launch_cute_fwd_persist_d_fp8_sm120_impl(
   // depends on the shared m16n8k32 fragment layouts, so it is QK element
   // (fp8/int8), PV acc (f16/f32) and Q/K/V/P granularity agnostic; the
   // cross-lane ReorgC8bitToA8bit fallback stays compiled (flip this gate to
-  // restore) and the split_d family keeps using it.
-  const bool reorg_free = true;
+  // restore; split_d carries its own identical gate).
+  constexpr bool reorg_free = true;
 
   constexpr int kBr = 128;
   // D>128 must shrink kBc to fit the 99KB smem budget (1B/elem fp8): D=224
@@ -744,115 +744,55 @@ void launch_cute_fwd_persist_d_fp8_sm120_impl(
   if (qk_per_thread) {
     // Per-thread QK quant (sage style): fragment-aligned dequant scales.
     if (v_per_channel && pv_acc_f16) {
-      if (reorg_free) {
-        launch_kernel(
-            ffpa_fp8::persist_d_ws_fwd_cute_fp8_sm120<Traits, ElementO, TmaQ,
-                                                      TmaK, TmaV, TmaO, false,
-                                                      true, true, true, true>);
-      } else {
-        launch_kernel(
-            ffpa_fp8::persist_d_ws_fwd_cute_fp8_sm120<Traits, ElementO, TmaQ,
-                                                      TmaK, TmaV, TmaO, false,
-                                                      true, true, true>);
-      }
+      launch_kernel(ffpa_fp8::persist_d_ws_fwd_cute_fp8_sm120<
+                    Traits, ElementO, TmaQ, TmaK, TmaV, TmaO, false, true, true,
+                    true, reorg_free>);
     } else if (v_per_channel) {
-      if (reorg_free) {
-        launch_kernel(
-            ffpa_fp8::persist_d_ws_fwd_cute_fp8_sm120<Traits, ElementO, TmaQ,
-                                                      TmaK, TmaV, TmaO, false,
-                                                      false, true, true, true>);
-      } else {
-        launch_kernel(
-            ffpa_fp8::persist_d_ws_fwd_cute_fp8_sm120<Traits, ElementO, TmaQ,
-                                                      TmaK, TmaV, TmaO, false,
-                                                      false, true, true>);
-      }
+      launch_kernel(ffpa_fp8::persist_d_ws_fwd_cute_fp8_sm120<
+                    Traits, ElementO, TmaQ, TmaK, TmaV, TmaO, false, false,
+                    true, true, reorg_free>);
     } else if (pv_acc_f16) {
-      if (reorg_free) {
-        launch_kernel(
-            ffpa_fp8::persist_d_ws_fwd_cute_fp8_sm120<Traits, ElementO, TmaQ,
-                                                      TmaK, TmaV, TmaO, false,
-                                                      true, false, true, true>);
-      } else {
-        launch_kernel(
-            ffpa_fp8::persist_d_ws_fwd_cute_fp8_sm120<Traits, ElementO, TmaQ,
-                                                      TmaK, TmaV, TmaO, false,
-                                                      true, false, true>);
-      }
+      launch_kernel(ffpa_fp8::persist_d_ws_fwd_cute_fp8_sm120<
+                    Traits, ElementO, TmaQ, TmaK, TmaV, TmaO, false, true,
+                    false, true, reorg_free>);
     } else {
-      if (reorg_free) {
-        launch_kernel(ffpa_fp8::persist_d_ws_fwd_cute_fp8_sm120<
-                      Traits, ElementO, TmaQ, TmaK, TmaV, TmaO, false, false,
-                      false, true, true>);
-      } else {
-        launch_kernel(
-            ffpa_fp8::persist_d_ws_fwd_cute_fp8_sm120<Traits, ElementO, TmaQ,
-                                                      TmaK, TmaV, TmaO, false,
-                                                      false, false, true>);
-      }
+      launch_kernel(ffpa_fp8::persist_d_ws_fwd_cute_fp8_sm120<
+                    Traits, ElementO, TmaQ, TmaK, TmaV, TmaO, false, false,
+                    false, true, reorg_free>);
     }
   } else if (pquant_per_row) {
-    if (reorg_free) {
-      launch_kernel(
-          ffpa_fp8::persist_d_ws_fwd_cute_fp8_sm120<Traits, ElementO, TmaQ,
-                                                    TmaK, TmaV, TmaO, true,
-                                                    false, false, false, true>);
-    } else {
-      launch_kernel(
-          ffpa_fp8::persist_d_ws_fwd_cute_fp8_sm120<Traits, ElementO, TmaQ,
-                                                    TmaK, TmaV, TmaO, true>);
-    }
+    launch_kernel(
+        ffpa_fp8::persist_d_ws_fwd_cute_fp8_sm120<Traits, ElementO, TmaQ, TmaK,
+                                                  TmaV, TmaO, true, false,
+                                                  false, false, reorg_free>);
   } else if (v_per_channel && pv_acc_f16) {
     // Per-channel V + fp16 PV accumulator: sage-style per-D V scale plus the
     // f8f8f16 PV path that avoids the 22-bit f8f8f32 accumulator loss.
-    if (reorg_free) {
-      launch_kernel(
-          ffpa_fp8::persist_d_ws_fwd_cute_fp8_sm120<Traits, ElementO, TmaQ,
-                                                    TmaK, TmaV, TmaO, false,
-                                                    true, true, false, true>);
-    } else {
-      launch_kernel(
-          ffpa_fp8::persist_d_ws_fwd_cute_fp8_sm120<
-              Traits, ElementO, TmaQ, TmaK, TmaV, TmaO, false, true, true>);
-    }
+    launch_kernel(
+        ffpa_fp8::persist_d_ws_fwd_cute_fp8_sm120<Traits, ElementO, TmaQ, TmaK,
+                                                  TmaV, TmaO, false, true, true,
+                                                  false, reorg_free>);
   } else if (v_per_channel) {
     // Per-channel V (sage-style): V per-D scale, P uses fixed 448; epilogue
     // dequants per-D. Targets real VLM/diffusion data with per-D outliers
     // (per-block V over-saturates them). See persist_d.cuh kVPerChannel.
-    if (reorg_free) {
-      launch_kernel(
-          ffpa_fp8::persist_d_ws_fwd_cute_fp8_sm120<Traits, ElementO, TmaQ,
-                                                    TmaK, TmaV, TmaO, false,
-                                                    false, true, false, true>);
-    } else {
-      launch_kernel(
-          ffpa_fp8::persist_d_ws_fwd_cute_fp8_sm120<
-              Traits, ElementO, TmaQ, TmaK, TmaV, TmaO, false, false, true>);
-    }
+    launch_kernel(
+        ffpa_fp8::persist_d_ws_fwd_cute_fp8_sm120<Traits, ElementO, TmaQ, TmaK,
+                                                  TmaV, TmaO, false, false,
+                                                  true, false, reorg_free>);
   } else if (pv_acc_f16) {
     // f8f8f16 PV (fp16 MMA accumulator, absorbs to float o_acc each
     // kv_tile) avoids the 22-bit f8f8f32 accumulator loss on causal early
     // rows. See persist_d.cuh kPVAccF16.
-    if (reorg_free) {
-      launch_kernel(
-          ffpa_fp8::persist_d_ws_fwd_cute_fp8_sm120<Traits, ElementO, TmaQ,
-                                                    TmaK, TmaV, TmaO, false,
-                                                    true, false, false, true>);
-    } else {
-      launch_kernel(ffpa_fp8::persist_d_ws_fwd_cute_fp8_sm120<
-                    Traits, ElementO, TmaQ, TmaK, TmaV, TmaO, false, true>);
-    }
+    launch_kernel(
+        ffpa_fp8::persist_d_ws_fwd_cute_fp8_sm120<Traits, ElementO, TmaQ, TmaK,
+                                                  TmaV, TmaO, false, true,
+                                                  false, false, reorg_free>);
   } else {
-    if (reorg_free) {
-      launch_kernel(
-          ffpa_fp8::persist_d_ws_fwd_cute_fp8_sm120<Traits, ElementO, TmaQ,
-                                                    TmaK, TmaV, TmaO, false,
-                                                    false, false, false, true>);
-    } else {
-      launch_kernel(
-          ffpa_fp8::persist_d_ws_fwd_cute_fp8_sm120<Traits, ElementO, TmaQ,
-                                                    TmaK, TmaV, TmaO, false>);
-    }
+    launch_kernel(
+        ffpa_fp8::persist_d_ws_fwd_cute_fp8_sm120<Traits, ElementO, TmaQ, TmaK,
+                                                  TmaV, TmaO, false, false,
+                                                  false, false, reorg_free>);
   }
 }
 
@@ -920,6 +860,10 @@ void launch_cute_fwd_split_d_fp8_sm120_impl(
   TORCH_CHECK(
       !fp8_smooth_v || v_per_channel,
       "ffpa_attn: fp8_smooth_v requires fp8_v_quant_method='per_channel'");
+  // Split-D reorg-free: PackC8bitToA8bitPermVT in-kernel + permuted V^T from
+  // the quantize pre-kernel (same pairing as persist_d; M8N1 C/A layouts are
+  // identical between the two families).
+  constexpr bool reorg_free = true;
 
   constexpr int kBr = 128;
   constexpr int kBc = 128;
@@ -1015,14 +959,14 @@ void launch_cute_fwd_split_d_fp8_sm120_impl(
         reinterpret_cast<__nv_fp8_e4m3*>(vt8.data_ptr()),
         q_scale.data_ptr<float>(), k_scale.data_ptr<float>(),
         v_scale_quant.data_ptr<float>(), Nb, Nh, Nh_kv, Nq, Nkv, Nkv_pad, D_og,
-        stream, km_ptr);
+        stream, km_ptr, reorg_free);
   } else {
     ffpa_fp8::launch_quantize_fp8_sm120<kDataType, kBr, kBc, kHeadDim, kQKInt8>(
         q_ptr, k_ptr, v_ptr, q8.data_ptr(), k8.data_ptr(),
         reinterpret_cast<__nv_fp8_e4m3*>(vt8.data_ptr()),
         q_scale.data_ptr<float>(), k_scale.data_ptr<float>(),
         v_scale_quant.data_ptr<float>(), Nb, Nh, Nh_kv, Nq, Nkv, Nkv_pad, D_og,
-        stream, km_ptr);
+        stream, km_ptr, reorg_free);
   }
 
   // Per-channel V (sage-style): re-quantize V with per-D scale via coalesced
@@ -1120,34 +1064,44 @@ void launch_cute_fwd_split_d_fp8_sm120_impl(
     if (v_per_channel && pv_acc_f16) {
       launch_kernel(
           ffpa_fp8::split_d_fwd_cute_fp8_sm120<Traits, ElementO, TmaQ, TmaK,
-                                               TmaV, TmaO, true, true, true>);
+                                               TmaV, TmaO, true, true, true,
+                                               reorg_free>);
     } else if (v_per_channel) {
       launch_kernel(
           ffpa_fp8::split_d_fwd_cute_fp8_sm120<Traits, ElementO, TmaQ, TmaK,
-                                               TmaV, TmaO, false, true, true>);
+                                               TmaV, TmaO, false, true, true,
+                                               reorg_free>);
     } else if (pv_acc_f16) {
       launch_kernel(
           ffpa_fp8::split_d_fwd_cute_fp8_sm120<Traits, ElementO, TmaQ, TmaK,
-                                               TmaV, TmaO, true, false, true>);
+                                               TmaV, TmaO, true, false, true,
+                                               reorg_free>);
     } else {
       launch_kernel(
           ffpa_fp8::split_d_fwd_cute_fp8_sm120<Traits, ElementO, TmaQ, TmaK,
-                                               TmaV, TmaO, false, false, true>);
+                                               TmaV, TmaO, false, false, true,
+                                               reorg_free>);
     }
   } else if (v_per_channel && pv_acc_f16) {
     launch_kernel(
         ffpa_fp8::split_d_fwd_cute_fp8_sm120<Traits, ElementO, TmaQ, TmaK, TmaV,
-                                             TmaO, true, true>);
+                                             TmaO, true, true, false,
+                                             reorg_free>);
   } else if (v_per_channel) {
     launch_kernel(
         ffpa_fp8::split_d_fwd_cute_fp8_sm120<Traits, ElementO, TmaQ, TmaK, TmaV,
-                                             TmaO, false, true>);
+                                             TmaO, false, true, false,
+                                             reorg_free>);
   } else if (pv_acc_f16) {
-    launch_kernel(ffpa_fp8::split_d_fwd_cute_fp8_sm120<Traits, ElementO, TmaQ,
-                                                       TmaK, TmaV, TmaO, true>);
+    launch_kernel(
+        ffpa_fp8::split_d_fwd_cute_fp8_sm120<Traits, ElementO, TmaQ, TmaK, TmaV,
+                                             TmaO, true, false, false,
+                                             reorg_free>);
   } else {
-    launch_kernel(ffpa_fp8::split_d_fwd_cute_fp8_sm120<Traits, ElementO, TmaQ,
-                                                       TmaK, TmaV, TmaO>);
+    launch_kernel(
+        ffpa_fp8::split_d_fwd_cute_fp8_sm120<Traits, ElementO, TmaQ, TmaK, TmaV,
+                                             TmaO, false, false, false,
+                                             reorg_free>);
   }
 }
 

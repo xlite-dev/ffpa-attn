@@ -170,7 +170,7 @@ __device__ __forceinline__ void finalize_row_sum_m4n2(float* row_sum,
 // true probability domain. Uses fp32 tile_sum (kRowSumViaMma=false path);
 // finalize_row_sum_m4n2 is called unchanged after the P STSM->LDSM_N barrier.
 template <typename ScoresTensor, typename CoordTensor, int kRows,
-          int kNumWarps = 8>
+          bool kMaxScaleAfter = false, int kNumWarps = 8>
 __device__ __forceinline__ void online_softmax_fp8_fixed_m4n2(
     ScoresTensor& scores, const CoordTensor& tScS_rc, float scale,
     float* row_max, float* row_sum, float* row_scale, float* smem_exchange,
@@ -185,10 +185,16 @@ __device__ __forceinline__ void online_softmax_fp8_fixed_m4n2(
   for (int row = 0; row < kRows; ++row) {
     float tile_max = -INFINITY;
 #pragma unroll
-    for (int col = 0; col < cute::size<1>(scores); ++col)
-      tile_max = fmaxf(tile_max, scores(row, col) * scale);
+    for (int col = 0; col < cute::size<1>(scores); ++col) {
+      if constexpr (kMaxScaleAfter)
+        tile_max = fmaxf(tile_max, scores(row, col));
+      else
+        tile_max = fmaxf(tile_max, scores(row, col) * scale);
+    }
     tile_max = fmaxf(tile_max, __shfl_xor_sync(0xffffffff, tile_max, 1));
     tile_max = fmaxf(tile_max, __shfl_xor_sync(0xffffffff, tile_max, 2));
+    if constexpr (kMaxScaleAfter)
+      tile_max *= scale;
     const int row_local = row_base + row * 8;
     if (is_writer)
       smem_exchange[warp_id * 16 + row_local] = tile_max;
