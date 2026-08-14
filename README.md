@@ -98,7 +98,8 @@ FFPA supports multiple backends for the forward and backward pass, including: [`
 |Backend|Arch|Fwd|Bwd|Headdim|Autotune|Speedup|Recommend|
 |:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
 |SDPA|sm>=75|✔|✔|All|✖️|**1.0x**|sm>=75|
-|CUDA|sm>=80|✔|✖️|320~1024|✖️|**1.5x~3x**|sm_80~89,120{a,f}|
+|CUDA|sm>=80|✔|✖️|64~1024|✖️|**1.5x~3x**|sm_80~89,120{a,f}|
+|CUDA FP8|sm_120{a,f}|✔|✖️|64~1024|✖️|**3x~6x**|sm_120{a,f}|
 |Triton|sm>=80|✔|✔|320~1024|✔|**1.5x~5x**|sm>=80|
 |CuTe-DSL|sm>=80|✔|✔|320~1024|✖️|**1.5x~2x**|sm_80~89,120{a,f}|
 |CuTe-DSL|sm_90a|✔|✔|320~512|✖️|**3x~6x**|sm_90a|
