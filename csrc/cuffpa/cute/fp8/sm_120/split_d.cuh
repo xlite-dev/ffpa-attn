@@ -432,8 +432,17 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
     }
 
     float row_scale[kORows];
-    constexpr bool kMaxScaleAfter = Traits::kQKInt8 && kPVAccF16;
-    constexpr bool kFuseRescaleAbsorb = kPVAccF16;
+    // Split-d fused-rescale switches (migrated from persist-d fp8). All-on
+    // measured +8.4% vs the 81dbf75 baseline on RTX PRO 5000 (D=512,
+    // int8 QK + f16 PV acc): folding the rescale into the absorption FFMA
+    // (FADD->FFMA) raises math_pipe_throttle; split-d runs 1 CTA/SM (256
+    // threads) and cannot hide the extra tensor-pipe pressure, unlike
+    // persist-d (WS, 384 threads). Default off to match baseline; flip to
+    // true to re-evaluate on other GPUs (5090/H800).
+    constexpr bool kUseFusedRescale = false;
+    constexpr bool kMaxScaleAfter =
+        kUseFusedRescale && Traits::kQKInt8 && kPVAccF16;
+    constexpr bool kFuseRescaleAbsorb = kUseFusedRescale && kPVAccF16;
     if constexpr (kQKPerThread) {
       // Per-thread QK: pre-dequant scores per-row, then softmax with 'scale'.
       if (!tile_needs_mask) {
@@ -460,6 +469,17 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
           scores, tScS_rc, softmax_scale_eff, row_max, row_sum, row_scale,
           log2f(p_quant_scale), 1.0f / p_quant_scale,
           Traits::kRescaleThreshold);
+    }
+
+    // Batched rescale vote; only used when kFuseRescaleAbsorb is off (the
+    // fused path folds the rescale into the absorption FFMA instead).
+    bool need_rescale = false;
+    if constexpr (!kFuseRescaleAbsorb) {
+      bool local_need_rescale = false;
+#pragma unroll
+      for (int r = 0; r < kORows; ++r)
+        local_need_rescale = local_need_rescale || (row_scale[r] < 1.0f);
+      need_rescale = __any_sync(0xffffffff, local_need_rescale);
     }
 
     // P -> e4m3 A operand (fixed mode: softmax already emitted P*vs*448).
@@ -492,23 +512,20 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
 
       auto tCrO =
           make_tensor(make_rmem_ptr(&o_acc_storage[v_chunk][0]), OFragLayout{});
-      if (kv_tile > 0 && !kFuseRescaleAbsorb) {
+      if (kv_tile > 0 && !kFuseRescaleAbsorb && need_rescale) {
         auto tCrO_rc = make_tensor(
             tCrO.data(), ffpa_cute::convert_layout_acc_rowcol(tCrO.layout()));
 #pragma unroll
         for (int row = 0; row < kORows; ++row)
-          if (row_scale[row] < 1.0f) {
 #pragma unroll
-            for (int col = 0; col < kOCols; ++col)
-              tCrO_rc(row, col) *= row_scale[row];
-          }
+          for (int col = 0; col < kOCols; ++col)
+            tCrO_rc(row, col) *= row_scale[row];
       }
 
       if constexpr (kPVAccF16) {
         // f8f8f16 PV: fp16 accumulator avoids 22-bit f8f8f32 loss on causal
         // early rows; absorb to float o_acc via CUDA-core FADD per kv_tile.
-        // inst_buf reused across v_chunks (sequential PV). Rescale is folded
-        // into the absorption FFMA (per-row; row_scale==1.0f when no rescale).
+        // inst_buf reused across v_chunks (sequential PV).
         auto tCrV_f16 = thr_mma_pv_f16.partition_fragment_B(sV);
         auto tVsV_f16 = s2r_thr_v_f16.partition_S(sV);
         auto tCrInst = partition_fragment_C(tiled_mma_pv_f16,
@@ -521,14 +538,24 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
         auto tCrInst_rc =
             make_tensor(tCrInst.data(),
                         ffpa_cute::convert_layout_acc_rowcol(tCrInst.layout()));
+        if constexpr (kFuseRescaleAbsorb) {
+          // Fused: rescale folded into the absorption FFMA (per-row;
+          // row_scale==1.0f when no rescale).
 #pragma unroll
-        for (int row = 0; row < kORows; ++row) {
-          const float rs =
-              (kv_tile > 0 && row_scale[row] < 1.0f) ? row_scale[row] : 1.0f;
+          for (int row = 0; row < kORows; ++row) {
+            const float rs =
+                (kv_tile > 0 && row_scale[row] < 1.0f) ? row_scale[row] : 1.0f;
 #pragma unroll
-          for (int col = 0; col < kOCols; ++col)
-            tCrO_rc(row, col) =
-                fmaf(tCrO_rc(row, col), rs, float(tCrInst_rc(row, col)));
+            for (int col = 0; col < kOCols; ++col)
+              tCrO_rc(row, col) =
+                  fmaf(tCrO_rc(row, col), rs, float(tCrInst_rc(row, col)));
+          }
+        } else {
+#pragma unroll
+          for (int row = 0; row < kORows; ++row)
+#pragma unroll
+            for (int col = 0; col < kOCols; ++col)
+              tCrO_rc(row, col) += float(tCrInst_rc(row, col));
         }
       } else {
         auto tCrV = thr_mma_pv.partition_fragment_B(sV);

@@ -862,8 +862,13 @@ void launch_cute_fwd_split_d_fp8_sm120_impl(
       "ffpa_attn: fp8_smooth_v requires fp8_v_quant_method='per_channel'");
   // Split-D reorg-free: PackC8bitToA8bitPermVT in-kernel + permuted V^T from
   // the quantize pre-kernel (same pairing as persist_d; M8N1 C/A layouts are
-  // identical between the two families).
-  constexpr bool reorg_free = true;
+  // identical between the two families). Part of the split-d fused-rescale
+  // optimization set: all-on measured +8.4% vs the 81dbf75 baseline on RTX
+  // PRO 5000 (see the switches note in split_d.cuh); default off with the
+  // rest so the off-path stays instruction-identical to the baseline.
+  // persist_d keeps reorg_free=true (WS hides the extra pipe pressure).
+  constexpr bool kUseFusedRescale = false;
+  constexpr bool reorg_free = kUseFusedRescale;
 
   constexpr int kBr = 128;
   constexpr int kBc = 128;
