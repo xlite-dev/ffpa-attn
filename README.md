@@ -22,7 +22,7 @@
 ## Latest News
 
 <div align='center'>
-  <img src="./docs/assets/ffpa-fp8.png" width="850px">
+  <img src="./docs/assets/ffpa-fp8.png" width="800px">
 </div>
 
 - [2026/08] FFPA now supports [FP8 Attention](./csrc/cuffpa/cute/fp8/) for headdim **[64,1024]** ([sm_120](./csrc/cuffpa/cute/fp8/sm_120/), forward only), achieving **3x~6x**🎉 speedup over standard PyTorch SDPA for large headdim (**D>256**), with per-block(QKV)/per-thread(QK)/per-channel(V) FP8 quantization and hybrid FP8/FP16 attention. 🎉🎉
@@ -98,7 +98,8 @@ FFPA supports multiple backends for the forward and backward pass, including: [`
 |Backend|Arch|Fwd|Bwd|Headdim|Autotune|Speedup|Recommend|
 |:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
 |SDPA|sm>=75|✔|✔|All|✖️|**1.0x**|sm>=75|
-|CUDA|sm>=80|✔|✖️|320~1024|✖️|**1.5x~3x**|sm_80~89,120{a,f}|
+|CUDA|sm>=80|✔|✖️|64~1024|✖️|**1.5x~3x**|sm_80~89,120{a,f}|
+|CUDA FP8|sm_120{a,f}|✔|✖️|64~1024|✖️|**3x~6x**|sm_120{a,f}|
 |Triton|sm>=80|✔|✔|320~1024|✔|**1.5x~5x**|sm>=80|
 |CuTe-DSL|sm>=80|✔|✔|320~1024|✖️|**1.5x~2x**|sm_80~89,120{a,f}|
 |CuTe-DSL|sm_90a|✔|✔|320~512|✖️|**3x~6x**|sm_90a|

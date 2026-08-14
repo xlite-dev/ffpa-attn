@@ -208,8 +208,15 @@ CUTE_DEVICE void accumulate_p_tile(OrcTensor& o_acc_rc,
 // scores must already be in the log2 domain (caller pre-multiplied by
 // softmax_scale*log2e) with masking applied; `scale` multiplies scores again
 // inside the reductions (pass 1.0f when pre-scaled).
+//
+// kMaxScaleAfter: when true, the tile-max pass reduces raw (unscaled) scores
+// and applies `scale` once after the cross-lane reduction instead of
+// multiplying every element. max(scale*x) = scale*max(x) for scale > 0, so
+// the result is identical up to rounding; this removes one FMUL per element
+// from the softmax max-reduction critical path. Default false keeps existing
+// variants bitwise unchanged.
 template <bool kRowSumViaMma, typename ScoresTensor, typename CoordTensor,
-          int kRows>
+          int kRows, bool kMaxScaleAfter = false>
 CUTE_DEVICE void online_softmax_fp8_fixed(
     ScoresTensor& scores, const CoordTensor& tScS_rc, float scale,
     float* row_max, float* row_sum, float* row_scale, float exp_offset,
@@ -218,10 +225,16 @@ CUTE_DEVICE void online_softmax_fp8_fixed(
   for (int row = 0; row < kRows; ++row) {
     float tile_max = -INFINITY;
 #pragma unroll
-    for (int col = 0; col < cute::size<1>(scores); ++col)
-      tile_max = fmaxf(tile_max, scores(row, col) * scale);
+    for (int col = 0; col < cute::size<1>(scores); ++col) {
+      if constexpr (kMaxScaleAfter)
+        tile_max = fmaxf(tile_max, scores(row, col));
+      else
+        tile_max = fmaxf(tile_max, scores(row, col) * scale);
+    }
     tile_max = fmaxf(tile_max, __shfl_xor_sync(0xffffffff, tile_max, 1));
     tile_max = fmaxf(tile_max, __shfl_xor_sync(0xffffffff, tile_max, 2));
+    if constexpr (kMaxScaleAfter)
+      tile_max *= scale;  // scale commutes with max; one FMUL per row
     const float next_max = fmaxf(row_max[row], tile_max);
     const float log2_diff = row_max[row] - next_max;
     float eff_max = next_max;

@@ -86,10 +86,20 @@ using CtaBarrier = cutlass::arch::ClusterBarrier;
 //           softmax; softmax_scale_eff = scale (not s_dequant*scale).
 //           Trade-off: less precise than per-token (multi-row groups share
 //           one amax) but avoids per-element scale lookup / shuffles.
+// kReorgFree: replaces the cross-lane ReorgC8bitToA8bit (16 SHFL + 32 PRMT
+// per thread-tile on the QK->PV critical path) with the shuffle-free
+// PackC8bitToA8bitPermVT (16 PRMT, zero SHFL). The pack leaves the PV A
+// operand with a permuted k-indexing; correctness requires V^T to be stored
+// with the matching column permutation (VTPermInv32 in quantize_fp8.cuh),
+// which the launcher pairs via the reorg_free gate (on by default for every
+// persist_d fp8 config; the cross-lane reorg stays compiled as fallback and
+// is still used by the split_d family). Element/acc/granularity agnostic —
+// the pack only depends on the shared m16n8k32 fragment layouts. See
+// reg2reg_8b.cuh for the derivation.
 template <typename Traits, typename ElementO, typename TmaQ, typename TmaK,
           typename TmaV, typename TmaO, bool kPQuantPerRow = false,
           bool kPVAccF16 = false, bool kVPerChannel = false,
-          bool kQKPerThread = false>
+          bool kQKPerThread = false, bool kReorgFree = false>
 __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp8_sm120(
     CUTLASS_GRID_CONSTANT TmaQ const tma_q,
     CUTLASS_GRID_CONSTANT TmaK const tma_k,
@@ -478,6 +488,11 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp8_sm120(
     //   (448/amax_d) is uniform across tiles -> single epilogue dequant.
     //   (vs448=448 would push P8 into [224,448] where e4m3 ULP=32.)
     const float p_quant_scale = kVPerChannel ? 1.0f : (vs * kE4m3Max);
+    // Phase 2: compute the tile max on raw (unscaled) scores and apply the
+    // softmax scale once after the cross-lane reduction, removing one FMUL
+    // per element from the max-reduction critical path. Gated to the int8 QK
+    // + f16 PV-acc config so other variants stay bitwise identical.
+    constexpr bool kMaxScaleAfter = Traits::kQKInt8 && kPVAccF16;
     if constexpr (kPQuantPerRow) {
       if (!tile_needs_mask) {
 #pragma unroll
@@ -510,7 +525,7 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp8_sm120(
         }
         const float softmax_scale_eff = tile_needs_mask ? 1.0f : scale;
         online_softmax_fp8_fixed<true, decltype(scores), decltype(tScS_rc),
-                                 kORows>(
+                                 kORows, kMaxScaleAfter>(
             scores, tScS_rc, softmax_scale_eff, row_max, row_sum, row_scale,
             log2f(p_quant_scale), 1.0f / p_quant_scale,
             Traits::kRescaleThreshold);
@@ -519,39 +534,52 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp8_sm120(
         const float softmax_scale_eff =
             tile_needs_mask ? 1.0f : s_dequant * scale;
         online_softmax_fp8_fixed<true, decltype(scores), decltype(tScS_rc),
-                                 kORows>(
+                                 kORows, kMaxScaleAfter>(
             scores, tScS_rc, softmax_scale_eff, row_max, row_sum, row_scale,
             log2f(p_quant_scale), 1.0f / p_quant_scale,
             Traits::kRescaleThreshold);
       }
     }
 
-    // Rescale o_acc (online softmax); deferred until p_scale is known.
-    bool local_need_rescale = false;
-#pragma unroll
-    for (int r = 0; r < kORows; ++r)
-      local_need_rescale = local_need_rescale || (row_scale[r] < 1.0f);
-    const bool need_rescale = __any_sync(0xffffffff, local_need_rescale);
-    const bool do_rescale = (kv_tile > 0) && need_rescale;
-    // f16acc fixed mode folds this rescale into the inst_buf absorption FFMA
+    // Rescale o_acc (online softmax). FA-4 lazy rescale: row_scale[r] is
+    // exactly 1.0f whenever the row needs no rescale (threshold skip keeps
+    // row_max stale), and each thread rescales only its own rows, so the
+    // decision is per-row. (The CUTLASS 77_blackwell_fmha warp-uniform
+    // __any_sync pattern guards a shared-TMEM collective rescale; here the
+    // target is thread-private registers, so the cross-lane vote is not
+    // required.) <1.0f also rejects NaN row_scale on all-masked rows.
+    // f16acc fixed mode folds the rescale into the inst_buf absorption FFMA
     // below (o_acc = o_acc*row_scale + inst), skipping the standalone pass.
     constexpr bool kFuseRescaleAbsorb = (!kPQuantPerRow) && kPVAccF16;
 
-    if (do_rescale && !kFuseRescaleAbsorb) {
+    if (kv_tile > 0 && !kFuseRescaleAbsorb) {
       auto tCrO = make_tensor(make_rmem_ptr(o_acc), OFragLayout{});
       auto tCrO_rc = make_tensor(
           tCrO.data(), ffpa_cute::convert_layout_acc_rowcol(tCrO.layout()));
 #pragma unroll
-      for (int row = 0; row < kORows; ++row)
+      for (int row = 0; row < kORows; ++row) {
+        if (row_scale[row] < 1.0f) {
 #pragma unroll
-        for (int col = 0; col < kOCols; ++col)
-          tCrO_rc(row, col) *= row_scale[row];
+          for (int col = 0; col < kOCols; ++col)
+            tCrO_rc(row, col) *= row_scale[row];
+        }
+      }
     }
 
     // P -> e4m3 A operand (see fp8_pscale.cuh). Per-row mode needs the row
     // max first, then scales+converts; fixed mode was pre-scaled by the
-    // softmax and only converts (packed e4m3x2) + reorgs.
-    if constexpr (kPQuantPerRow) {
+    // softmax and only converts (packed e4m3x2) + reorgs. kReorgFree swaps
+    // the cross-lane reorg for the shuffle-free perm pack (paired with the
+    // permuted V^T written by the quantize pre-kernel).
+    if constexpr (kReorgFree) {
+      PackC8bitToA8bitPermVT perm_pack;
+      if constexpr (kPQuantPerRow) {
+        pscale_per_row(scores, p_scale);
+        quantize_p_frag<true>(scores, tCrSf, vs, p_scale, perm_pack);
+      } else {
+        quantize_p_frag_prescaled(tCrSf, perm_pack);
+      }
+    } else if constexpr (kPQuantPerRow) {
       pscale_per_row(scores, p_scale);
       quantize_p_frag<true>(scores, tCrSf, vs, p_scale, reorg);
     } else {
@@ -588,6 +616,8 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp8_sm120(
     } else {
       // Tensor-core row sum over the quantized P regs (replaces the fp32
       // FADD/shfl reduction; softmax<true> only rescaled row_sum so far).
+      // NCU shows this overlaps the PV critical path (tensor pipe has ~27%
+      // headroom here), so CUDA-core row_sum was measured slower (see plan).
       pscale_rowsum_mma(tCrP, row_sum, 1.0f / p_quant_scale);
       if constexpr (kPVAccF16) {
         // f8f8f16 PV: accumulate P@V into an fp16 MMA accumulator (cuts o_acc
@@ -609,8 +639,10 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp8_sm120(
                         ffpa_cute::convert_layout_acc_rowcol(tCrInst.layout()));
 #pragma unroll
         for (int row = 0; row < kORows; ++row) {
-          // Fold the deferred online-softmax rescale into the absorption.
-          const float rs = do_rescale ? row_scale[row] : 1.0f;
+          // Fold the online-softmax rescale into the absorption (per-row
+          // decision; row_scale is exactly 1.0f when no rescale is needed).
+          const float rs =
+              (kv_tile > 0 && row_scale[row] < 1.0f) ? row_scale[row] : 1.0f;
 #pragma unroll
           for (int col = 0; col < kOCols; ++col)
             tCrO_rc(row, col) =
