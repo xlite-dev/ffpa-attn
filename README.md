@@ -22,7 +22,7 @@
 ## Latest News
 
 <div align='center'>
-  <img src="./docs/assets/ffpa-fp8.png" width="850px">
+  <img src="./docs/assets/ffpa-fp8.png" width="800px">
 </div>
 
 - [2026/08] FFPA now supports [FP8 Attention](./csrc/cuffpa/cute/fp8/) for headdim **[64,1024]** ([sm_120](./csrc/cuffpa/cute/fp8/sm_120/), forward only), achieving **3x~6x**🎉 speedup over standard PyTorch SDPA for large headdim (**D>256**), with per-block(QKV)/per-thread(QK)/per-channel(V) FP8 quantization and hybrid FP8/FP16 attention. 🎉🎉
