@@ -272,6 +272,13 @@ def _parse_args() -> argparse.Namespace:
     "--warmup", type=int, default=2, help="Warmup iterations used for timing."
   )
   parser.add_argument(
+    "--pre-heat",
+    type=int,
+    default=0,
+    help="SDPA pre-heat iterations run before each timing block to stabilize "
+    "GPU clocks (0 disables)."
+  )
+  parser.add_argument(
     "--iters",
     type=int,
     default=10,
@@ -1694,6 +1701,7 @@ def _benchmark_rows(
         and tune_mode is not None,
         triton_autotune_mode=tune_mode or "fast",
         grad_kv_storage_dtype=grad_kv_dtype,
+        pre_heat=args.pre_heat,
         warmup=args.warmup,
         iters=args.iters,
         print_results=True,
@@ -1738,6 +1746,7 @@ def _benchmark_rows(
         enable_ws=args.enable_bwd_ws,
         enable_persist_dkdv=args.enable_persist_dkdv,
         enable_split_launch=args.enable_bwd_split_launch,
+        pre_heat=args.pre_heat,
         warmup=args.warmup,
         iters=args.iters,
         print_results=True,

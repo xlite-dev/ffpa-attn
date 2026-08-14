@@ -224,12 +224,17 @@ def run_scenario(sc, dtype, scale, warmup, iters, use_sage, sdpa_name):
       outs["Sage"] = sage_out
   errs = {name: rel_err(o, ref) for name, o in outs.items()}
 
+  # Bench order: SDPA pre-heat (unmeasured) stabilizes GPU clock/power first,
+  # then FFPA, then Sage, then SDPA (reference). Measured backends run hot.
+  for _ in range(5):
+    run_sdpa(q, k, v, sc.causal, sc.gqa, sdpa_name)
+  torch.cuda.synchronize()
   fns = {
     "FFPA-FP8": lambda: run_ffpa(q, k, v, sc.causal, sc.gqa),
-    sdpa_label: lambda: run_sdpa(q, k, v, sc.causal, sc.gqa, sdpa_name),
   }
   if use_sage and SAGE_INSTALLED:
     fns["Sage"] = lambda: run_sage(q, k, v, sc.causal, sc.gqa)
+  fns[sdpa_label] = lambda: run_sdpa(q, k, v, sc.causal, sc.gqa, sdpa_name)
   ms = {
     name: bench_ms(fn, warmup=warmup, iters=iters)
     for name, fn in fns.items()

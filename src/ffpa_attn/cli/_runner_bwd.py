@@ -637,6 +637,7 @@ def _run_case(
   enable_persist_dkdv: bool = False,
   enable_split_launch: bool = False,
   apply_norm: bool = False,
+  pre_heat: int = 0,
   warmup: int = DEFAULT_WARMUP,
   iters: int = DEFAULT_ITERS,
   print_result: bool = True,
@@ -731,6 +732,21 @@ def _run_case(
     dmask_ref = _key_position_bias_grad_ref(q, k, v, scale, active_attn_mask)
   if dmask_ffpa is not None and dmask_ref is not None and dmask_ref.dtype != dmask_ffpa.dtype:
     dmask_ref = dmask_ref.to(dmask_ffpa.dtype)
+
+  if pre_heat > 0:
+    # Low-power SDPA runs pull the GPU to full clocks before timing.
+    with torch.no_grad():
+      for _ in range(pre_heat):
+        _sdpa_forward(
+          q,
+          k,
+          v,
+          scale,
+          causal=causal,
+          attn_mask=active_attn_mask,
+          dropout_p=dropout_p,
+        )
+    torch.cuda.synchronize()
 
   if timing_mode == "backward-only":
     grad_out = torch.ones_like(q)
@@ -885,6 +901,7 @@ def run_backward_examples(
   enable_ws: bool = False,
   enable_persist_dkdv: bool = False,
   enable_split_launch: bool = False,
+  pre_heat: int = 0,
   warmup: int = DEFAULT_WARMUP,
   iters: int = DEFAULT_ITERS,
   print_results: bool = True,
@@ -917,6 +934,7 @@ def run_backward_examples(
     accumulation in the SM90+ TMA backward path. Requires ``enable_tma``.
   :param enable_split_launch: Whether to enable separate backward launches for
     dK/dV and dQ on generic Triton or SM90+ TMA paths.
+  :param pre_heat: SDPA pre-heat iterations before each timing block.
   :param warmup: Warmup iterations used for timing.
   :param iters: Measured iterations used for timing.
   :param print_results: Whether to print each case result.
@@ -944,6 +962,7 @@ def run_backward_examples(
     ("enable_persist_dkdv", str(enable_persist_dkdv)),
     ("enable_split_launch", str(enable_split_launch)),
     ("timing_mode", timing_mode),
+    ("pre_heat", str(pre_heat)),
     ("tasks", tasks_str),
     ("warmup", str(warmup)),
     ("iters", str(iters)),
@@ -1090,6 +1109,7 @@ def run_backward_examples(
           enable_persist_dkdv=enable_persist_dkdv,
           enable_split_launch=enable_split_launch,
           apply_norm=apply_norm,
+          pre_heat=pre_heat,
           warmup=warmup,
           iters=iters,
           print_result=print_results,
