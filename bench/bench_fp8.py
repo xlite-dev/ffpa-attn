@@ -49,7 +49,7 @@ if FFPA_BENCH_FP8_FORCE_QK_INT8:
   )
 
 
-def fp8_backend() -> CUDABackend:
+def fp8_backend(no_hybrid: bool = False) -> CUDABackend:
   if "5090" in torch.cuda.get_device_name() or FFPA_BENCH_FP8_FORCE_QK_INT8:
     # 5090: FP8 Q/K matmul int8, P/V accumulate f16 (default)
     return CUDABackend(
@@ -59,6 +59,7 @@ def fp8_backend() -> CUDABackend:
       enable_fp8=True,
       fp8_qk_mm_type="int8",
       fp8_pv_acc_type="f16",
+      fp8_hybrid=False if no_hybrid else None,
     )
   # default: FP8 Q/K matmul fp8, P/V accumulate f32
   return CUDABackend(
@@ -66,6 +67,7 @@ def fp8_backend() -> CUDABackend:
     enable_tma=True,
     enable_cute=True,
     enable_fp8=True,
+    fp8_hybrid=False if no_hybrid else None,
   )
 
 
@@ -140,9 +142,14 @@ def _mk(B, Hq, Hkv, Nq, Nkv, D, dtype, scale):
   return q, k, v
 
 
-def run_ffpa(q, k, v, causal, gqa):
+def run_ffpa(q, k, v, causal, gqa, no_hybrid=False):
   return ffpa_attn_func(
-    q, k, v, is_causal=causal, enable_gqa=gqa, forward_backend=fp8_backend()
+    q,
+    k,
+    v,
+    is_causal=causal,
+    enable_gqa=gqa,
+    forward_backend=fp8_backend(no_hybrid)
   )
 
 
@@ -209,13 +216,15 @@ def build_scenarios(N, B, H, Hkv, D, cross_dense=True, non_aligned_pad=15):
   return scs
 
 
-def run_scenario(sc, dtype, scale, warmup, iters, use_sage, sdpa_name):
+def run_scenario(
+  sc, dtype, scale, warmup, iters, use_sage, sdpa_name, no_hybrid=False
+):
   q, k, v = _mk(sc.B, sc.Hq, sc.Hkv, sc.Nq, sc.Nkv, sc.D, dtype, scale)
   ref = ref_bf16(q, k, v, sc.causal, sc.gqa, sdpa_name).to(dtype)
   sdpa_label = f"SDPA-{sdpa_name.upper()}"
 
   outs = {
-    "FFPA-FP8": run_ffpa(q, k, v, sc.causal, sc.gqa),
+    "FFPA-FP8": run_ffpa(q, k, v, sc.causal, sc.gqa, no_hybrid),
     sdpa_label: run_sdpa(q, k, v, sc.causal, sc.gqa, sdpa_name),
   }
   if use_sage:
@@ -224,12 +233,17 @@ def run_scenario(sc, dtype, scale, warmup, iters, use_sage, sdpa_name):
       outs["Sage"] = sage_out
   errs = {name: rel_err(o, ref) for name, o in outs.items()}
 
+  # Bench order: SDPA pre-heat (unmeasured) stabilizes GPU clock/power first,
+  # then FFPA, then Sage, then SDPA (reference). Measured backends run hot.
+  for _ in range(5):
+    run_sdpa(q, k, v, sc.causal, sc.gqa, sdpa_name)
+  torch.cuda.synchronize()
   fns = {
-    "FFPA-FP8": lambda: run_ffpa(q, k, v, sc.causal, sc.gqa),
-    sdpa_label: lambda: run_sdpa(q, k, v, sc.causal, sc.gqa, sdpa_name),
+    "FFPA-FP8": lambda: run_ffpa(q, k, v, sc.causal, sc.gqa, no_hybrid),
   }
   if use_sage and SAGE_INSTALLED:
     fns["Sage"] = lambda: run_sage(q, k, v, sc.causal, sc.gqa)
+  fns[sdpa_label] = lambda: run_sdpa(q, k, v, sc.causal, sc.gqa, sdpa_name)
   ms = {
     name: bench_ms(fn, warmup=warmup, iters=iters)
     for name, fn in fns.items()
@@ -296,6 +310,11 @@ def parse_args():
   p.add_argument("--iters", type=int, default=5, help="Bench iters")
   p.add_argument("--no-sage", action="store_true", help="Skip SageAttention")
   p.add_argument(
+    "--no-hybrid",
+    action="store_true",
+    help="Disable FFPA fp8 hybrid path (pure fp8 kernel comparison)",
+  )
+  p.add_argument(
     "--sdpa-backend",
     type=str,
     default="auto",
@@ -345,7 +364,14 @@ def main():
     for sc in scenarios:
       sdpa_name = resolve_sdpa_backend(args.sdpa_backend, sc.D)
       run_scenario(
-        sc, dtype, args.scale, args.warmup, args.iters, use_sage, sdpa_name
+        sc,
+        dtype,
+        args.scale,
+        args.warmup,
+        args.iters,
+        use_sage,
+        sdpa_name,
+        no_hybrid=args.no_hybrid,
       )
 
 

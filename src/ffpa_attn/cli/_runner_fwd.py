@@ -312,6 +312,7 @@ def _run_case(
   dropout_p: float = 0.0,
   acc: str = "f32",
   apply_norm: bool = False,
+  pre_heat: int = 0,
   warmup: int = DEFAULT_WARMUP,
   iters: int = DEFAULT_ITERS,
   print_result: bool = True,
@@ -384,6 +385,19 @@ def _run_case(
   tol = 5e-2 if (dtype == torch.bfloat16 or enable_fp8) else 2e-2
   ok = _tensor_allclose(out_ffpa, out_sdpa, tol)
 
+  if pre_heat > 0:
+    # Low-power SDPA runs pull the GPU to full clocks before timing.
+    for _ in range(pre_heat):
+      _sdpa_ref(
+        q,
+        k_ref,
+        v_ref,
+        is_causal=causal,
+        attn_mask=attn_mask,
+        dropout_p=dropout_p,
+      )
+    torch.cuda.synchronize()
+
   ms_ffpa = _time_fn(
     _ffpa_call,
     q,
@@ -451,6 +465,7 @@ def run_forward_examples(
   triton_autotune: bool = False,
   triton_autotune_mode: str = "fast",
   grad_kv_storage_dtype: torch.dtype | None = None,
+  pre_heat: int = 0,
   warmup: int = DEFAULT_WARMUP,
   iters: int = DEFAULT_ITERS,
   print_results: bool = True,
@@ -486,6 +501,7 @@ def run_forward_examples(
   :param triton_autotune_mode: Triton autotune mode.
   :param grad_kv_storage_dtype: Optional backward dK/dV (Triton or CuTeDSL)
     storage dtype forwarded to ``ffpa_attn_func``.
+  :param pre_heat: SDPA pre-heat iterations before each timing block.
   :param warmup: Warmup iterations used for timing.
   :param iters: Measured iterations used for timing.
   :param print_results: Whether to print each case result.
@@ -513,6 +529,7 @@ def run_forward_examples(
     ("enable_fwd_cute", str(enable_cute)),
     ("enable_fwd_fp8", str(enable_fp8)),
     ("cuda_stages", str(stages)),
+    ("pre_heat", str(pre_heat)),
     ("tasks", tasks_str),
     ("warmup", str(warmup)),
     ("iters", str(iters)),
@@ -650,6 +667,7 @@ def run_forward_examples(
           attn_mask=case.get("attn_mask"),
           dropout_p=case.get("dropout_p", 0.0),
           apply_norm=apply_norm,
+          pre_heat=pre_heat,
           warmup=warmup,
           iters=iters,
           print_result=print_results,
