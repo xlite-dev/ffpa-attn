@@ -389,19 +389,19 @@ def _parse_args() -> argparse.Namespace:
     default=None,
     help="FP8 only: PV accumulation dtype. 'f16' uses fp16 PV acc "
     "(faster, minor precision loss); 'f32' uses fp32 (default). "
-    "Only supported on persist_d path (D<=128).",
+    "Supported on all fp8 CUDA kernels (persist_d, split_d, m4n2).",
   )
   parser.add_argument(
     "--fp8-q-quant-method",
     choices=["per-block", "per-channel", "per-thread"],
     default=None,
-    help="FP8 only: Q quantization granularity (per-thread requires D<=128).",
+    help="FP8 only: Q quantization granularity.",
   )
   parser.add_argument(
     "--fp8-k-quant-method",
     choices=["per-block", "per-channel", "per-thread"],
     default=None,
-    help="FP8 only: K quantization granularity (per-thread requires D<=128).",
+    help="FP8 only: K quantization granularity.",
   )
   parser.add_argument(
     "--fp8-v-quant-method",

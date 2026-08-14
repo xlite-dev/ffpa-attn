@@ -425,6 +425,14 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
     }
 
     float row_scale[kORows];
+    // Split-d fused-rescale switches (migrated from persist-d fp8). All-on
+    // measured slower than the 81dbf75 baseline on RTX PRO 5000; see the
+    // matching note in split_d.cuh. Default off to match baseline; flip to
+    // true to re-evaluate on other GPUs (5090/H800).
+    constexpr bool kUseFusedRescale = false;
+    constexpr bool kMaxScaleAfter =
+        kUseFusedRescale && Traits::kQKInt8 && kPVAccF16;
+    constexpr bool kFuseRescaleAbsorb = kUseFusedRescale && kPVAccF16;
     if constexpr (kQKPerThread) {
       // Per-thread QK: pre-dequant scores per-row, then softmax with 'scale'.
       if (!tile_needs_mask) {
@@ -437,8 +445,8 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
         }
       }
       const float softmax_scale_eff = tile_needs_mask ? 1.0f : scale;
-      ffpa_cute::online_softmax_fp8_fixed_m4n2<decltype(scores),
-                                               decltype(tScS_rc), kORows>(
+      ffpa_cute::online_softmax_fp8_fixed_m4n2<
+          decltype(scores), decltype(tScS_rc), kORows, kMaxScaleAfter>(
           scores, tScS_rc, softmax_scale_eff, row_max, row_sum, row_scale,
           smem_exchange, warp_id, lane_id, log2f(p_quant_scale),
           1.0f / p_quant_scale, Traits::kRescaleThreshold);
@@ -446,18 +454,23 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
       const float s_dequant = qs_arr[0] * ks;
       const float softmax_scale_eff =
           tile_needs_mask ? 1.0f : s_dequant * scale;
-      ffpa_cute::online_softmax_fp8_fixed_m4n2<decltype(scores),
-                                               decltype(tScS_rc), kORows>(
+      ffpa_cute::online_softmax_fp8_fixed_m4n2<
+          decltype(scores), decltype(tScS_rc), kORows, kMaxScaleAfter>(
           scores, tScS_rc, softmax_scale_eff, row_max, row_sum, row_scale,
           smem_exchange, warp_id, lane_id, log2f(p_quant_scale),
           1.0f / p_quant_scale, Traits::kRescaleThreshold);
     }
 
-    bool local_need_rescale = false;
+    // Batched rescale vote; only used when kFuseRescaleAbsorb is off (the
+    // fused path folds the rescale into the absorption FFMA instead).
+    bool need_rescale = false;
+    if constexpr (!kFuseRescaleAbsorb) {
+      bool local_need_rescale = false;
 #pragma unroll
-    for (int r = 0; r < kORows; ++r)
-      local_need_rescale = local_need_rescale || (row_scale[r] < 1.0f);
-    const bool need_rescale = __any_sync(0xffffffff, local_need_rescale);
+      for (int r = 0; r < kORows; ++r)
+        local_need_rescale = local_need_rescale || (row_scale[r] < 1.0f);
+      need_rescale = __any_sync(0xffffffff, local_need_rescale);
+    }
 
     // Phase 3: P -> e4m3 -> SMEM roundtrip. stmatrix is a b16 operation that
     // needs SW128 for 16B vectorization, but SW128's 128-elem atom doesn't
@@ -497,7 +510,7 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
 
       auto tCrO =
           make_tensor(make_rmem_ptr(&o_acc_storage[v_chunk][0]), OFragLayout{});
-      if (kv_tile > 0 && need_rescale) {
+      if (kv_tile > 0 && !kFuseRescaleAbsorb && need_rescale) {
         auto tCrO_rc = make_tensor(
             tCrO.data(), ffpa_cute::convert_layout_acc_rowcol(tCrO.layout()));
 #pragma unroll
@@ -524,11 +537,25 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
         auto tCrInst_rc =
             make_tensor(tCrInst.data(),
                         ffpa_cute::convert_layout_acc_rowcol(tCrInst.layout()));
+        if constexpr (kFuseRescaleAbsorb) {
+          // Fused: rescale folded into the absorption FFMA (per-row;
+          // row_scale==1.0f when no rescale).
 #pragma unroll
-        for (int row = 0; row < kORows; ++row)
+          for (int row = 0; row < kORows; ++row) {
+            const float rs =
+                (kv_tile > 0 && row_scale[row] < 1.0f) ? row_scale[row] : 1.0f;
 #pragma unroll
-          for (int col = 0; col < kOCols; ++col)
-            tCrO_rc(row, col) += float(tCrInst_rc(row, col));
+            for (int col = 0; col < kOCols; ++col)
+              tCrO_rc(row, col) =
+                  fmaf(tCrO_rc(row, col), rs, float(tCrInst_rc(row, col)));
+          }
+        } else {
+#pragma unroll
+          for (int row = 0; row < kORows; ++row)
+#pragma unroll
+            for (int col = 0; col < kOCols; ++col)
+              tCrO_rc(row, col) += float(tCrInst_rc(row, col));
+        }
       } else {
         auto tCrVStorage = thr_mma_pv.partition_fragment_B(sV);
         auto tCrV = make_tensor(tCrVStorage.data(), tCrV_layout);

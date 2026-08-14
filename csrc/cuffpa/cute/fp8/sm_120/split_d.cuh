@@ -44,7 +44,8 @@ using CtaBarrier = cutlass::arch::ClusterBarrier;
 //   Q=64/block, K=4/block, fragment-aligned). See persist_d.cuh for details.
 template <typename Traits, typename ElementO, typename TmaQ, typename TmaK,
           typename TmaV, typename TmaO, bool kPVAccF16 = false,
-          bool kVPerChannel = false, bool kQKPerThread = false>
+          bool kVPerChannel = false, bool kQKPerThread = false,
+          bool kReorgFree = false>
 __global__ void __launch_bounds__(Traits::kNumThreads, 1)
     split_d_fwd_cute_fp8_sm120(
         CUTLASS_GRID_CONSTANT TmaQ const tma_q,
@@ -431,6 +432,17 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
     }
 
     float row_scale[kORows];
+    // Split-d fused-rescale switches (migrated from persist-d fp8). All-on
+    // measured +8.4% vs the 81dbf75 baseline on RTX PRO 5000 (D=512,
+    // int8 QK + f16 PV acc): folding the rescale into the absorption FFMA
+    // (FADD->FFMA) raises math_pipe_throttle; split-d runs 1 CTA/SM (256
+    // threads) and cannot hide the extra tensor-pipe pressure, unlike
+    // persist-d (WS, 384 threads). Default off to match baseline; flip to
+    // true to re-evaluate on other GPUs (5090/H800).
+    constexpr bool kUseFusedRescale = false;
+    constexpr bool kMaxScaleAfter =
+        kUseFusedRescale && Traits::kQKInt8 && kPVAccF16;
+    constexpr bool kFuseRescaleAbsorb = kUseFusedRescale && kPVAccF16;
     if constexpr (kQKPerThread) {
       // Per-thread QK: pre-dequant scores per-row, then softmax with 'scale'.
       if (!tile_needs_mask) {
@@ -444,7 +456,7 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
       }
       const float softmax_scale_eff = tile_needs_mask ? 1.0f : scale;
       online_softmax_fp8_fixed<true, decltype(scores), decltype(tScS_rc),
-                               kORows>(
+                               kORows, kMaxScaleAfter>(
           scores, tScS_rc, softmax_scale_eff, row_max, row_sum, row_scale,
           log2f(p_quant_scale), 1.0f / p_quant_scale,
           Traits::kRescaleThreshold);
@@ -453,20 +465,32 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
       const float softmax_scale_eff =
           tile_needs_mask ? 1.0f : s_dequant * scale;
       online_softmax_fp8_fixed<true, decltype(scores), decltype(tScS_rc),
-                               kORows>(
+                               kORows, kMaxScaleAfter>(
           scores, tScS_rc, softmax_scale_eff, row_max, row_sum, row_scale,
           log2f(p_quant_scale), 1.0f / p_quant_scale,
           Traits::kRescaleThreshold);
     }
 
-    bool local_need_rescale = false;
+    // Batched rescale vote; only used when kFuseRescaleAbsorb is off (the
+    // fused path folds the rescale into the absorption FFMA instead).
+    bool need_rescale = false;
+    if constexpr (!kFuseRescaleAbsorb) {
+      bool local_need_rescale = false;
 #pragma unroll
-    for (int r = 0; r < kORows; ++r)
-      local_need_rescale = local_need_rescale || (row_scale[r] < 1.0f);
-    const bool need_rescale = __any_sync(0xffffffff, local_need_rescale);
+      for (int r = 0; r < kORows; ++r)
+        local_need_rescale = local_need_rescale || (row_scale[r] < 1.0f);
+      need_rescale = __any_sync(0xffffffff, local_need_rescale);
+    }
 
     // P -> e4m3 A operand (fixed mode: softmax already emitted P*vs*448).
-    quantize_p_frag_prescaled(tCrSf, reorg);
+    // kReorgFree swaps the cross-lane reorg for the shuffle-free perm pack
+    // (paired with the permuted V^T written by the quantize pre-kernel).
+    if constexpr (kReorgFree) {
+      PackC8bitToA8bitPermVT perm_pack;
+      quantize_p_frag_prescaled(tCrSf, perm_pack);
+    } else {
+      quantize_p_frag_prescaled(tCrSf, reorg);
+    }
     auto tCrP =
         make_tensor(reinterpret_cast<Element*>(tCrSf.data()),
                     Layout<Shape<Shape<_4, _2, _2>, _1, Int<kBc / 32>>>{});
@@ -488,7 +512,7 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
 
       auto tCrO =
           make_tensor(make_rmem_ptr(&o_acc_storage[v_chunk][0]), OFragLayout{});
-      if (kv_tile > 0 && need_rescale) {
+      if (kv_tile > 0 && !kFuseRescaleAbsorb && need_rescale) {
         auto tCrO_rc = make_tensor(
             tCrO.data(), ffpa_cute::convert_layout_acc_rowcol(tCrO.layout()));
 #pragma unroll
@@ -514,11 +538,25 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
         auto tCrInst_rc =
             make_tensor(tCrInst.data(),
                         ffpa_cute::convert_layout_acc_rowcol(tCrInst.layout()));
+        if constexpr (kFuseRescaleAbsorb) {
+          // Fused: rescale folded into the absorption FFMA (per-row;
+          // row_scale==1.0f when no rescale).
 #pragma unroll
-        for (int row = 0; row < kORows; ++row)
+          for (int row = 0; row < kORows; ++row) {
+            const float rs =
+                (kv_tile > 0 && row_scale[row] < 1.0f) ? row_scale[row] : 1.0f;
 #pragma unroll
-          for (int col = 0; col < kOCols; ++col)
-            tCrO_rc(row, col) += float(tCrInst_rc(row, col));
+            for (int col = 0; col < kOCols; ++col)
+              tCrO_rc(row, col) =
+                  fmaf(tCrO_rc(row, col), rs, float(tCrInst_rc(row, col)));
+          }
+        } else {
+#pragma unroll
+          for (int row = 0; row < kORows; ++row)
+#pragma unroll
+            for (int col = 0; col < kOCols; ++col)
+              tCrO_rc(row, col) += float(tCrInst_rc(row, col));
+        }
       } else {
         auto tCrV = thr_mma_pv.partition_fragment_B(sV);
         auto tVsV = s2r_thr_v.partition_S(sV);
