@@ -1251,8 +1251,7 @@ def _ffpa_bwd_dq(
     num_block_n = tl.cdiv(seqlen_k, BLOCK_N)
     kv_offset = seqlen_k - seqlen_q
     end_n_k = (
-      start_m + BLOCK_M + kv_offset
-      if IS_CAUSAL else num_block_n * BLOCK_N
+      start_m + BLOCK_M + kv_offset if IS_CAUSAL else num_block_n * BLOCK_N
     )
 
     for start_n_k in range(0, end_n_k, BLOCK_N):
