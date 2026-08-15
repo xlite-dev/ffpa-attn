@@ -404,6 +404,10 @@ def _bwd_triton_torch_op(
   dq.zero_()  # atomic_add accumulates from the initial value; must be zero.
   dk = _triton_bwd_grad_tensor_like(k, grad_kv_storage_dtype)
   dv = _triton_bwd_grad_tensor_like(v, grad_kv_storage_dtype)
+  if k.size(1) < q.size(1):
+    # Native GQA accumulates query-head groups with atomic_add.
+    dk.zero_()
+    dv.zero_()
   if attn_bias is not None and return_attn_bias_grad:
     grad_dtype = _attn_bias_grad_dtype(attn_bias, q, k)
     grad_attn_bias = torch.empty_like(attn_bias, dtype=grad_dtype)
