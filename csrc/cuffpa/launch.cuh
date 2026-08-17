@@ -136,6 +136,11 @@ void launch_ffpa_attn_fwd_template(
   const bool force_cute_tma = (impl_hint == ffpa::CudaBackendImpl::CUTE_TMA);
   const bool force_fp8 = (impl_hint == ffpa::CudaBackendImpl::CUTE_TMA_FP8);
   const bool force_fp4 = (impl_hint == ffpa::CudaBackendImpl::CUTE_TMA_FP4);
+  // FFPA_FP4_PP=1: A/B switch for the ping-pong persist-D fp4 kernel.
+  static const bool use_fp4_pp = [] {
+    const char* e = getenv("FFPA_FP4_PP");
+    return e != nullptr && e[0] == '1';
+  }();
 
   // fp16/bf16 head_dim pad: non-32-multiple D_og (e.g. 120) zero-pads Q/K/V
   // to the compiled kHeadDim. fp8 skips (quantize reads D_og natively); O is
@@ -194,12 +199,23 @@ void launch_ffpa_attn_fwd_template(
           if (softmax_lse.numel() > 0)
             softmax_lse.slice(2, 0, n_early).copy_(lse_e);
           // Stage 2: fp4 late rows [n_early:N) via q_start_row offset.
-          launch_cute_fwd_persist_d_fp4_sm120<kDataType, kHeadDim, kStage>(
-              Q, K, V, O, softmax_lse, causal, softmax_scale,
-              /*q_start_row=*/n_early);
+          if (use_fp4_pp) {
+            launch_cute_fwd_persist_d_fp4_sm120_pp<kDataType, kHeadDim, kStage>(
+                Q, K, V, O, softmax_lse, causal, softmax_scale,
+                /*q_start_row=*/n_early);
+          } else {
+            launch_cute_fwd_persist_d_fp4_sm120<kDataType, kHeadDim, kStage>(
+                Q, K, V, O, softmax_lse, causal, softmax_scale,
+                /*q_start_row=*/n_early);
+          }
         } else {
-          launch_cute_fwd_persist_d_fp4_sm120<kDataType, kHeadDim, kStage>(
-              Q, K, V, O, softmax_lse, causal, softmax_scale);
+          if (use_fp4_pp) {
+            launch_cute_fwd_persist_d_fp4_sm120_pp<kDataType, kHeadDim, kStage>(
+                Q, K, V, O, softmax_lse, causal, softmax_scale);
+          } else {
+            launch_cute_fwd_persist_d_fp4_sm120<kDataType, kHeadDim, kStage>(
+                Q, K, V, O, softmax_lse, causal, softmax_scale);
+          }
         }
         return;
       }
