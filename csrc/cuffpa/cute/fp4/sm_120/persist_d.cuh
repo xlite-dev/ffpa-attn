@@ -42,6 +42,11 @@
 // reinterpret_cast<Element*> scales offsets by sizeof==1B (2x for 4-bit
 // elements) and walks off the smem window. fp8/fp16 paths never hit this
 // because their elements are >= 1 byte.
+//
+// Reference (NVFP4 data path):
+// https://github.com/thu-ml/SageAttention/tree/main/sageattention3_blackwell/sageattn3/blackwell
+//   (kernel_ws.h / mainloop_tma_ws.h / epilogue_tma_ws.h: the warp-specialized
+//    NVFP4 kernel whose fragment adapters this port copies verbatim)
 #pragma once
 
 #include <cuda_fp8.h>

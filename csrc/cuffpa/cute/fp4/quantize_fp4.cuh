@@ -1,5 +1,7 @@
 // NVFP4 quantize pre-kernels, ported from SageAttention3
 // fp4_quantization_4d.cu and adapted to the ffpa-attn pipeline:
+// Reference:
+// https://github.com/thu-ml/SageAttention/tree/main/sageattention3_blackwell/sageattn3/quantization/fp4_quantization_4d.cu
 //   - inputs keep their native (B,S,H,D) strides (no host transpose);
 //   - K-row permutation for the PV accumulator->A-operand layout is folded
 //     into the K quantize kernel (same [0,1,8,9,16,17,24,25,...] table);

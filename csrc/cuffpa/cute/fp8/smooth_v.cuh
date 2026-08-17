@@ -5,6 +5,8 @@
 
 namespace ffpa_fp8 {
 
+// Reference (V mean smoothing):
+// https://github.com/thu-ml/SageAttention/blob/main/csrc/qattn/sm89_qk_int8_sv_f8_accum_f32_fuse_v_scale_fuse_v_mean_attn.cu
 // Smooth-V per-channel stats (mean + symmetric residual amax), two stages,
 // deterministic (no atomics): stage 1 reduces a (bh, row-chunk) slab of V into
 // fp32 partials (sum + max + min), stage 2 reduces chunks and derives

@@ -3,6 +3,9 @@
 // The atom issues 4x mma.sync.m16n8k64 kind::mxf4nvf4 (scale_vec::4X, ue4m3
 // scale) and presents a fused 16x32x64 shape; SF fragments are 1x uint32 per
 // thread holding 4 packed ue4m3 scales.
+// Reference:
+// https://github.com/thu-ml/SageAttention/tree/main/sageattention3_blackwell/sageattn3/blackwell/cute_extension.h
+//            https://github.com/thu-ml/SageAttention/tree/main/sageattention3_blackwell/sageattn3/blackwell/blockscaled_layout.h
 #pragma once
 
 #include <cute/tensor.hpp>

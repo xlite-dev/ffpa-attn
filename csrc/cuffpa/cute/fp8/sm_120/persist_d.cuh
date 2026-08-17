@@ -61,6 +61,10 @@ using CtaBarrier = cutlass::arch::ClusterBarrier;
 // O epilogue: STSM into the freed smem, then TMA store (coalesced). Tail Q
 // tiles (partial rows) fall back to direct R->G stores. attn_bias/dropout are
 // not supported on this path.
+// Reference (Q/K int8 + V fp8 quantization recipe):
+//   https://github.com/thu-ml/SageAttention/tree/main/csrc/qattn
+//   (sm89_qk_int8_sv_f8_* kernels; P rowsum via MMA: csrc/mma.cuh
+//    rowsum_f8f8f32. The warp-specialized TMA structure is ffpa-native.)
 //
 // kPQuantPerRow selects the P (softmax probability) quantization granularity
 // (see fp8_pscale.cuh for the full math):
