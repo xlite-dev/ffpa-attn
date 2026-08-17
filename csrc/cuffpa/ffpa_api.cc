@@ -43,7 +43,9 @@ void ffpa_attn_fwd_bf16f32(
 // Computes O = softmax(scale * Q@K^T + attn_bias) @ V with optional causal
 // masking and dropout.  Supports fp16/bf16 activations; the FP8 path (backend
 // hint CUTE_TMA_FP8) internally quantizes Q/K/V to e4m3/int8 for low-precision
-// MMA.
+// MMA, and the NVFP4 path (backend hint CUTE_TMA_FP4, D=128 only) quantizes
+// Q/K/V to e2m1 with ue4m3 block scales (Q/K smoothed by qm/km means; the
+// delta_s correction restores the exact scores, see cute/fp4/sm_120).
 //
 // Tensor args (all CUDA, row-major [B, H, N, D]):
 //   Q            [B, Nh_q,  Nq,  D]  fp16/bf16 query.
@@ -112,6 +114,11 @@ void ffpa_attn_forward(torch::Tensor Q, torch::Tensor K, torch::Tensor V,
   const int head_dim_og = Q.size(3);
   const int head_dim_pad = (head_dim_og + 31) & ~31;
   const auto pad_backend = ffpa::get_backend_impl_hint();
+  TORCH_CHECK(
+      pad_backend != ffpa::CudaBackendImpl::CUTE_TMA_FP4 || head_dim_og == 128,
+      "ffpa_attn: the NVFP4 path (CUTE_TMA_FP4) requires head_dim=128, "
+      "got D=",
+      head_dim_og);
   torch::Tensor O_orig;
   const bool needs_pad = (pad_backend == ffpa::CudaBackendImpl::CUTE_TMA_FP8 ||
                           pad_backend == ffpa::CudaBackendImpl::CUTE_TMA ||

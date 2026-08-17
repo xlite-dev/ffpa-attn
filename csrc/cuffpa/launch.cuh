@@ -135,6 +135,7 @@ void launch_ffpa_attn_fwd_template(
   const bool force_cute = (impl_hint == ffpa::CudaBackendImpl::CUTE);
   const bool force_cute_tma = (impl_hint == ffpa::CudaBackendImpl::CUTE_TMA);
   const bool force_fp8 = (impl_hint == ffpa::CudaBackendImpl::CUTE_TMA_FP8);
+  const bool force_fp4 = (impl_hint == ffpa::CudaBackendImpl::CUTE_TMA_FP4);
 
   // fp16/bf16 head_dim pad: non-32-multiple D_og (e.g. 120) zero-pads Q/K/V
   // to the compiled kHeadDim. fp8 skips (quantize reads D_og natively); O is
@@ -163,10 +164,45 @@ void launch_ffpa_attn_fwd_template(
   //   sm_90/100: WS (kNonWS=0). setmaxnreg effective, 228KB smem allows
   //     deep pipeline. Unverified on real hardware.
 #ifdef ENABLE_FFPA_TMA_EXT
-  if ((force_tma || force_cute_tma || force_fp8) && !force_native &&
-      !force_cute) {
+  if ((force_tma || force_cute_tma || force_fp8 || force_fp4) &&
+      !force_native && !force_cute) {
     auto prop = at::cuda::getCurrentDeviceProperties();
     if (prop->major >= 9) {
+      if (force_fp4) {
+        // NVFP4 persist-D: quantize pre-kernels + blockscaled mma. No knobs
+        // (kStages fixed by traits); attn_bias/dropout unsupported. Causal
+        // early rows fall back to the fp16 persist_d kernel (hybrid), same
+        // as fp8: P-quantization noise on short-row softmax rows.
+        TORCH_CHECK(attn_bias.numel() == 0 && dropout_p == 0.0,
+                    "fp4 sm120 path does not support attn_bias/dropout");
+        if (fp8_hybrid && Nq >= fp8_hybrid_n_early) {
+          const int n_early = static_cast<int>(fp8_hybrid_n_early);
+          TORCH_CHECK(n_early % 128 == 0,
+                      "ffpa_attn: fp8_hybrid_n_early must be multiple of 128");
+          torch::Tensor Q_e, K_e, V_e;
+          prepare_hybrid_stage1(Q_e, K_e, V_e, Q, K, V, n_early, Nkv, Nq,
+                                causal, D_og, kHeadDim, d_padded);
+          auto O_e = torch::empty_like(Q_e);
+          auto lse_e = torch::empty(
+              {Nb, Nh, n_early},
+              torch::TensorOptions().dtype(torch::kFloat32).device(Q.device()));
+          auto empty_bias = torch::empty({0}, attn_bias.options());
+          launch_cute_fwd_persist_d_sm120<kDataType, kHeadDim, kStage>(
+              Q_e, K_e, V_e, O_e, empty_bias, lse_e, causal, softmax_scale, 0.0,
+              0, 0);
+          O.slice(2, 0, n_early).copy_(O_e);
+          if (softmax_lse.numel() > 0)
+            softmax_lse.slice(2, 0, n_early).copy_(lse_e);
+          // Stage 2: fp4 late rows [n_early:N) via q_start_row offset.
+          launch_cute_fwd_persist_d_fp4_sm120<kDataType, kHeadDim, kStage>(
+              Q, K, V, O, softmax_lse, causal, softmax_scale,
+              /*q_start_row=*/n_early);
+        } else {
+          launch_cute_fwd_persist_d_fp4_sm120<kDataType, kHeadDim, kStage>(
+              Q, K, V, O, softmax_lse, causal, softmax_scale);
+        }
+        return;
+      }
       if (force_fp8) {
         // q/k quant: per_block (0) for all headdims; per_thread (2) for
         // all headdims (persist_d + split_d + m4n2 paths).
