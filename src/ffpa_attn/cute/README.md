@@ -149,12 +149,12 @@ The forward routing rule, in order:
 - Every other supported architecture and every larger supported dense head-dim
   uses the SM80 generic Split-D path.
 
-Inside the SM100 entry a second gate decides dedicated-vs-fallback per call.
-Every delegation carries a named reason (`_sm100_d512_fallback_reason`), so the
-routing is auditable in the log rather than implicit: `varlen-one-sided`
-(exactly one of `cu_seqlens_q`/`cu_seqlens_k`), `local-window`, `softcap`,
-`score_mod`, `mask_mod`, `aux_tensors`, and any dtype that is not fp16/bf16
-all reach `_ffpa_attn_forward_sm80`.
+The SM100 entry never re-routes: it is an exact specialisation, so a call
+outside its contract raises `NotImplementedError` naming the rule that fired
+(`_sm100_d512_unsupported_reason`): `varlen-one-sided` (exactly one of
+`cu_seqlens_q`/`cu_seqlens_k`), `local-window`, `softcap`, `score_mod`,
+`mask_mod`, `aux_tensors`, or a `head_dim` other than 512. The backward
+rejects the same set, so the two entries cannot disagree.
 
 **Backward routing follows the same predicate.** `_backward_impl_for_device`
 reads the compute-capability minor and consults the same
@@ -179,7 +179,7 @@ and 512 of 512 TMEM columns for one tile, and an unsplit dK/dV would need
 |---|---|
 | `__init__.py` | Dense/varlen entry shims, SDPA↔FA layout adapters, torch custom ops, fake registrations, autograd registration, `_require_cute_supported()`, `cute_{forward,backward}_available()`, `cute_max_supported_head_dim()`. |
 | `_utils.py` | Shared constants, validation helpers, optional-int encoding, and fake-mode helpers. |
-| `_ffpa_fwd_sm100.py` | SM100 forward entry, dedicated-vs-fallback reasons, and compile cache. |
+| `_ffpa_fwd_sm100.py` | SM100 forward entry, named contract-rejection reasons, and compile cache. |
 | `_fwd_d512_sm100.py` | Blackwell 2-CTA `tcgen05` D512 forward kernel (TMEM accumulators, cluster-native). |
 | `_ffpa_bwd_sm100.py` | SM100 backward entry, preprocess wiring, and the four compile caches. |
 | `_dv_d512_sm100.py` | Blackwell D512 dV kernel. |

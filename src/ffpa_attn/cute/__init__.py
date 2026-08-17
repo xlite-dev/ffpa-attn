@@ -51,10 +51,7 @@ from ._utils import (
 )
 from ._ffpa_fwd_sm80 import _ffpa_attn_forward_sm80
 from ._ffpa_fwd_sm90 import _ffpa_attn_forward_sm90
-from ._ffpa_fwd_sm100 import (
-  _ffpa_attn_forward_sm100,
-  sm100_d512_allocates_bhnd_out,
-)
+from ._ffpa_fwd_sm100 import SM100_D512_KERNEL_LIVE, _ffpa_attn_forward_sm100
 from ._ffpa_bwd_sm80 import _ffpa_attn_backward_sm80
 from ._ffpa_bwd_sm90 import _ffpa_attn_backward_sm90
 from ._ffpa_bwd_sm100 import _ffpa_attn_backward_sm100
@@ -235,12 +232,14 @@ def _use_sm100_d512_specialized(
   with ``CtaGroup.TWO``, TMEM accumulators, and a cluster-scoped TMEM
   deallocation protocol built for a ``(2, 1, 1)`` cluster on ``sm100a``;
   none of that carries to another Blackwell minor without its own evidence.
-  So SM103/SM110/SM120, and every head_dim other than exactly 512, keep
-  using the SM80 Split-D fallback.
+  So SM103/SM110/SM120, every head_dim other than exactly 512, and a cleared
+  ``SM100_D512_KERNEL_LIVE`` all keep using the SM80 Split-D fallback. Being
+  the only such seam, the switch moves the forward and backward together.
   """
   return (
-    major == SM100_D512_MAJOR and minor == SM100_D512_MINOR
-    and head_dim == SM100_D512_HEAD_DIM and head_dim_v == SM100_D512_HEAD_DIM
+    SM100_D512_KERNEL_LIVE and major == SM100_D512_MAJOR
+    and minor == SM100_D512_MINOR and head_dim == SM100_D512_HEAD_DIM
+    and head_dim_v == SM100_D512_HEAD_DIM
   )
 
 
@@ -636,7 +635,7 @@ def _fwd_cute_fake(
   # this fake declared.
   if _forward_impl_for_device(
     q.device, q.size(-1), v.size(-1)
-  ) is _ffpa_attn_forward_sm100 and sm100_d512_allocates_bhnd_out(q, k, v):
+  ) is _ffpa_attn_forward_sm100:
     o = q.new_empty((batch, num_head, seqlen_q, head_dim_v)).transpose(1, 2)
   else:
     o = q.new_empty((batch, seqlen_q, num_head, head_dim_v))

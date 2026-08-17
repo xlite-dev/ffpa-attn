@@ -311,18 +311,17 @@ def test_config_rejects_out_of_contract_construction(kwargs, message):
 
 
 # ---------------------------------------------------------------------------
-# Routing and delegation — pure, so they can be checked for architectures we do
-# not have, and for features the wrapper would reject before a device saw them.
+# Routing and the frozen contract — the predicates are pure, so they answer for
+# architectures we do not have; carrying the reason to the caller needs one.
 # ---------------------------------------------------------------------------
 
 
 def test_both_kernels_are_live():
   """Nothing below is conditional on the migration flags, so they are pinned.
 
-  ``_sm100_d512_fallback_reason`` short-circuits to a single reason while the
-  forward is not live, and every backward test presumes the dedicated pair
-  exists.  Flipping either flag has to fail here rather than silently drain
-  the meaning out of the rest of the file.
+  ``SM100_D512_KERNEL_LIVE`` is read by ``_use_sm100_d512_specialized``, so
+  clearing it routes the whole pair to SM80 and every device test below would
+  quietly measure the fallback instead.  That has to fail here.
   """
   assert SM100_D512_KERNEL_LIVE and SM100_D512_BWD_KERNEL_LIVE
 
@@ -352,15 +351,12 @@ def test_sm100_routing_predicate(major, minor, head_dim, head_dim_v, expected):
   ) is expected
 
 
-#: Every frozen-contract exclusion the SM100 wrapper names, plus the two calls
-#: that are in contract. A shared boolean would make ``softcap`` and
-#: ``score_mod`` indistinguishable in a log; the migration standard requires
-#: the delegation to be auditable, so the reason string *is* the contract.
-_FALLBACK_REASONS = [
+#: Every frozen-contract exclusion the SM100 wrapper names, plus the call that
+#: is in contract. A shared boolean would make ``softcap`` and ``score_mod``
+#: indistinguishable in the error; the migration standard requires the
+#: rejection to be auditable, so the reason string *is* the contract.
+_UNSUPPORTED_REASONS = [
   pytest.param({}, None, id="in-contract"),
-  # ``requires_grad`` used to delegate. It no longer does: the dedicated
-  # backward exists, and one predicate selects the pair.
-  pytest.param({"requires_grad": True}, None, id="requires_grad"),
   # Packed varlen *is* in contract, but only with both prefixes: one alone
   # would leave the roles deriving trip counts from different lengths, which
   # is not a half-supported mode, it is a hang.
@@ -374,16 +370,49 @@ _FALLBACK_REASONS = [
 ]
 
 
-@pytest.mark.parametrize("kwargs,reason", _FALLBACK_REASONS)
+@pytest.mark.parametrize("kwargs,reason", _UNSUPPORTED_REASONS)
 def test_every_out_of_contract_feature_has_its_own_named_reason(kwargs, reason):
-  """Each delegation is attributable to exactly one rule, or to none.
+  """Each rejection is attributable to exactly one rule, or to none.
 
-  Runs without a GPU: the predicate is pure, so ``meta`` tensors reach it.
+  Runs without a GPU: the predicate is pure, and takes no tensors.
   """
-  q = torch.empty(1, 1, 1, SM100_D512, dtype=torch.bfloat16, device="meta")
-  base = dict(head_dim=SM100_D512, head_dim_v=SM100_D512, requires_grad=False)
-  base.update(kwargs)
-  assert _ffpa_fwd_sm100._sm100_d512_fallback_reason(q, q, q, **base) == reason
+  assert _ffpa_fwd_sm100._sm100_d512_unsupported_reason(**kwargs) == reason
+
+
+@requires_sm100a
+@pytest.mark.parametrize(
+  "kwargs,message",
+  [
+    pytest.param({"softcap": 30.0}, "softcap", id="softcap"),
+    pytest.param({"window_size_left": 8}, "local-window", id="window"),
+    pytest.param({"score_mod": lambda *a: a}, "score_mod", id="score_mod"),
+    pytest.param({"aux_tensors": [object()]}, "aux_tensors", id="aux_tensors"),
+  ],
+)
+def test_fwd_rejects_out_of_contract_features(kwargs, message):
+  """The reason reaches the caller: an exact specialisation never delegates."""
+  q, k, v, _ = _qkv(1, 64, 64, 2, 2, seed=0)
+  with pytest.raises(NotImplementedError, match=message):
+    _ffpa_attn_forward_sm100(q, k, v, **kwargs)
+
+
+@requires_sm100a
+def test_fwd_rejects_one_sided_varlen():
+  """Rejected before the shape validation, so the reason is the varlen rule."""
+  cu, q, k, v, _ = _packed_qkv([32, 32], 2, seed=0)
+  with pytest.raises(NotImplementedError, match="varlen-one-sided"):
+    _ffpa_attn_forward_sm100(q, k, v, cu_seqlens_q=cu, max_seqlen_q=32)
+
+
+@requires_sm100a
+def test_fwd_rejects_a_head_dim_outside_the_specialisation():
+  """Only the dispatcher may send another head dim to SM80; this entry raises."""
+  q, k, v = [
+    torch.randn(1, 64, 2, 320, device="cuda", dtype=torch.bfloat16)
+    for _ in range(3)
+  ]
+  with pytest.raises(NotImplementedError, match="exact specialisation"):
+    _ffpa_attn_forward_sm100(q, k, v)
 
 
 # ---------------------------------------------------------------------------
@@ -432,14 +461,19 @@ def test_dispatch_pairs_forward_and_backward_over_the_declared_domain(
 
 @requires_sm100a
 def test_sm80_fallback_is_not_reached_for_a_d512_forward(monkeypatch):
-  """The dedicated path must not silently ride on the fallback."""
+  """The dedicated path must not silently ride on the fallback.
+
+  Patched at the dispatcher, which is now the only seam that can route away
+  from the dedicated forward.
+  """
+  import ffpa_attn.cute as _cute
 
   def _fail(*args, **kwargs):
     raise AssertionError(
       "SM80 Split-D fallback was called for a D512 sm100a forward"
     )
 
-  monkeypatch.setattr(_ffpa_fwd_sm100, "_ffpa_attn_forward_sm80", _fail)
+  monkeypatch.setattr(_cute, "_ffpa_attn_forward_sm80", _fail)
   q, k, v = _qkv_bhnd(1, 2, 128, seed=0)
   out, _ = _ffpa_attn_forward_cute(
     q, k, v, 1.0 / math.sqrt(SM100_D512), False, return_lse=True
@@ -1094,16 +1128,9 @@ def test_varlen_matches_per_sequence_oracle(
     for _ in range(2)
   ]
 
-  # Routing first: correct numbers from the fallback are not evidence here.
-  assert _ffpa_fwd_sm100._sm100_d512_fallback_reason(
-    q,
-    k,
-    v,
-    head_dim=d,
-    head_dim_v=d,
-    requires_grad=False,
-    cu_seqlens_q=cu_q,
-    cu_seqlens_k=cu_k,
+  # Contract first: correct numbers from a rejected mode are not evidence here.
+  assert _ffpa_fwd_sm100._sm100_d512_unsupported_reason(
+    cu_seqlens_q=cu_q, cu_seqlens_k=cu_k
   ) is None
 
   out, lse = ffpa_attn_varlen_func(
