@@ -4,6 +4,9 @@
 // 1/(448*6) and is folded into the exp2 shift; sP2 (ue4m1-group absmax/6
 // stored as ue4m3) is what the MMA consumes, and the constant cancels
 // exactly between O and row_sum.
+// Reference:
+// https://github.com/thu-ml/SageAttention/tree/main/sageattention3_blackwell/sageattn3/blackwell/softmax_fused.h
+//            https://github.com/thu-ml/SageAttention/tree/main/sageattention3_blackwell/sageattn3/blackwell/utils.h
 #pragma once
 
 #include <cute/tensor.hpp>
@@ -172,20 +175,15 @@ struct SoftmaxFused {
                 : (row_max(mi) * softmax_scale_log2 + fp8_scalexfp4_scale_log2);
         CUTE_UNROLL
         for (int ni = 0; ni < size<1>(acc_reduction_view); ni++) {
-          acc_reduction_view(mi, ni) = ptx_exp2(
-              acc_reduction_view(mi, ni) * softmax_scale_log2 - max_scaled);
+          float p = ptx_exp2(acc_reduction_view(mi, ni) * softmax_scale_log2 -
+                             max_scaled);
+          acc_reduction_view(mi, ni) = p;
+          row_sum(mi) += p;
         }
         CUTE_UNROLL
         for (int sfi = 0; sfi < size<1>(AbsMaxP); sfi++) {
           AbsMaxP(mi, sfi) = ptx_exp2(AbsMaxP(mi, sfi) * softmax_scale_log2 -
                                       max_scaled + fp4_scale_log2);
-        }
-      }
-      CUTE_UNROLL
-      for (int mi = 0; mi < size<0>(acc_reduction_view); mi++) {
-        CUTE_UNROLL
-        for (int ni = 0; ni < size<1>(acc_reduction_view); ni++) {
-          row_sum(mi) += acc_reduction_view(mi, ni);
         }
       }
     } else {
@@ -235,12 +233,16 @@ struct SoftmaxFused {
         }
       }
     }
-    // normalize each group by its absmax so the e2m1 pack saturates at 6
+    // normalize each group by its absmax so the e2m1 pack saturates at 6.
+    // One reciprocal per group + FMUL per element (fp8 pscale style): a bare
+    // division expands to a MUFU.RCP + FFMA chain per element, which NCU
+    // showed flooding the XU pipe.
     CUTE_UNROLL
     for (int i = 0; i < size(AbsMaxP); ++i) {
+      const float inv_absmax = 1.0f / AbsMaxP(i);
       CUTE_UNROLL
       for (int j = 0; j < size<0>(acc_conversion_flatten); ++j)
-        acc_conversion_flatten(j, i) /= AbsMaxP(i);
+        acc_conversion_flatten(j, i) *= inv_absmax;
     }
   }
 
