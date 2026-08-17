@@ -1598,6 +1598,7 @@ void launch_cute_fwd_persist_d_fp4_sm120_impl(torch::Tensor Q, torch::Tensor K,
   using Traits = ffpa_fp4::Fp4PersistDTraits<ElementO>;
   using Element = typename Traits::Element;
   using ElementSF = typename Traits::ElementSF;
+  auto prop = at::cuda::getCurrentDeviceProperties();
   using SmemLayoutQ = typename Traits::SmemLayoutQ;
   using SmemLayoutK = typename Traits::SmemLayoutK;
   using SmemLayoutVt = typename Traits::SmemLayoutVt;
@@ -1749,7 +1750,16 @@ void launch_cute_fwd_persist_d_fp4_sm120_impl(torch::Tensor Q, torch::Tensor K,
       softmax_lse.numel() > 0 ? softmax_lse.data_ptr<float>() : nullptr;
   auto O_ptr = reinterpret_cast<ElementO*>(O.data_ptr());
   const dim3 block(kNumThreads, 1, 1);
-  const dim3 grid(utils::div_ceil(Nq - q_start_row, kBr), Nb * Nh, 1);
+  // Grid dispatch: dense works are long (Tc tiles each) and benefit from
+  // the persistent loop (pipeline overlap across works); causal works
+  // average half the tiles with many short ones, where the per-work
+  // epilogue_done -> Q TMA round trip dominates, so give each work its
+  // own CTA and let the HW scheduler load-balance instead.
+  const int mb = (Nq - q_start_row + kBr - 1) / kBr;
+  const int total_work = mb * Nb * Nh;
+  const int num_ctas =
+      causal ? total_work : std::min(total_work, prop->multiProcessorCount);
+  const dim3 grid(num_ctas, 1, 1);
   auto kernel = ffpa_fp4::persist_d_ws_fwd_cute_fp4_sm120<
       Traits, ElementO, decltype(tma_q), decltype(tma_k), decltype(tma_v),
       decltype(tma_o), decltype(tma_sfq), decltype(tma_sfk), decltype(tma_sfvt),
@@ -1759,7 +1769,8 @@ void launch_cute_fwd_persist_d_fp4_sm120_impl(torch::Tensor Q, torch::Tensor K,
   kernel<<<grid, block, kSmemBytes, stream>>>(
       tma_q, tma_k, tma_v, tma_o, tma_sfq, tma_sfk, tma_sfvt, tma_ds, O_ptr,
       softmax_lse_ptr, km_f32.data_ptr<float>(), qm.data_ptr<float>(), Nq, Nkv,
-      Nq_pad, Nkv_pad, Nh, Nh_kv, scale, Tc, causal, total_q_rows, q_start_row);
+      Nq_pad, Nkv_pad, Nh, Nh_kv, scale, Tc, causal, total_q_rows, Nb,
+      q_start_row);
 }
 
 template <typename kDataType, const int kHeadDim, const int kStage>
