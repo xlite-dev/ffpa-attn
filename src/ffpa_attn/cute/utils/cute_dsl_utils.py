@@ -44,7 +44,7 @@ def assume_tensor_aligned(t):
 
 
 # ---------------------------------------------------------------------------
-# torch → CuTE tensor conversion  (used at compile time in interface_sm90.py)
+# torch → CuTE tensor conversion  (compile-time use by every _ffpa_* wrapper)
 # ---------------------------------------------------------------------------
 def to_cute_tensor(
   t,
@@ -94,7 +94,7 @@ def to_cute_aux_tensor(t, enable_tvm_ffi=True):
 
 
 # ---------------------------------------------------------------------------
-# Compile-key metadata helpers  (used in interface_sm90.py)
+# Compile-key metadata helpers  (used in _ffpa_fwd_sm90.py)
 # ---------------------------------------------------------------------------
 def get_aux_tensor_metadata(aux_tensors):
   return tuple((

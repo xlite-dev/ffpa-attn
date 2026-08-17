@@ -9,12 +9,15 @@
 #   - _fa_clc_enabled / _fa_disable_2cta_enabled / _fa_disable_2cta_cuda12
 #   - _is_cuda_12() / _get_use_clc_scheduler_default() / _get_disable_2cta_default()
 #   - _compute_base_hash       (kept as internal impl of hash_callable, not removed)
-#   - convert_from_dlpack      (SM90 only uses convert_from_dlpack_leading_static)
+#   - convert_from_dlpack      (only convert_from_dlpack_leading_static is kept)
 #   - smid()                   (SM90 pipeline doesn't use it)
-#   - domain_offset_aligned()  (SM90 pipeline doesn't use it)
 #   - evaluate_polynomial / evaluate_polynomial_2
 #   - add_round_down / combine_int_frac_ex2
 #   - ex2_emulation / ex2_emulation_2 / e2e_asm2
+#
+# Restored at the end of this file for the SM100 D512 port (donor revision
+# b3012e4a539, verbatim); no SM90/SM80 path reaches any of them:
+#   - domain_offset_aligned / AuxData / as_bshkrd_tensor / as_shhb_tensor
 #
 # Simplified:
 #   - fmax: removed 3-input (c) parameter (SM100+ only)
@@ -25,7 +28,7 @@
 import math
 import hashlib
 import inspect
-from typing import Type, Callable, Optional, Tuple, overload
+from typing import Type, Callable, NamedTuple, Optional, Tuple, overload
 
 import cutlass
 import cutlass.cute as cute
@@ -37,7 +40,7 @@ from cutlass._mlir.dialects import nvvm, llvm
 from cutlass.cute.runtime import from_dlpack
 
 # ---------------------------------------------------------------------------
-# Callable hashing  (used by interface_sm90.py for compile keys)
+# Callable hashing  (used by _ffpa_fwd_sm90.py for compile keys)
 # ---------------------------------------------------------------------------
 _MIXER_ATTRS = ("__vec_size__", )
 
@@ -102,7 +105,7 @@ def hash_callable(
 
 
 # ---------------------------------------------------------------------------
-# Softcap score_mod helpers  (used by interface_sm90.py)
+# Softcap score_mod helpers  (used by _ffpa_fwd_sm90.py)
 # ---------------------------------------------------------------------------
 def create_softcap_scoremod(softcap_val):
 
@@ -167,7 +170,7 @@ def compute_fastdiv_mods(
 
 
 # ---------------------------------------------------------------------------
-# DLPack conversion  (used by interface_sm90.py for semaphore tensors)
+# DLPack conversion  (no in-tree caller today; kept with the donor API)
 # ---------------------------------------------------------------------------
 def convert_from_dlpack_leading_static(
   x,
@@ -641,3 +644,101 @@ def scalar_to_ssa(a: cute.Numeric, dtype) -> cute.TensorSSA:
 def ssa_to_scalar(val):
   """Could inline but nice for reflecting the above api"""
   return val[0]
+
+
+# SM100 D512 additions, used only by the SM100 D512 forward; nothing on the SM90/SM80 paths reaches them.
+class AuxData(NamedTuple):
+  tensors: tuple | list | None = None
+  scalars: tuple | None = None
+
+
+@dsl_user_op
+def domain_offset_aligned(
+  coord: cute.Coord, tensor: cute.Tensor, *, loc=None, ip=None
+) -> cute.Tensor:
+  assert isinstance(tensor.iterator, cute.Pointer)
+  # We assume that applying the offset does not change the pointer alignment
+  new_ptr = cute.make_ptr(
+    tensor.element_type,
+    elem_pointer(tensor, coord).toint(),
+    tensor.memspace,
+    assumed_align=tensor.iterator.alignment,
+  )
+  return cute.make_tensor(new_ptr, tensor.layout)
+
+
+def as_bshkrd_tensor(
+  tensor: cute.Tensor,
+  h_k: Int32,
+  h_r: Int32,
+  varlen: bool,
+) -> cute.Tensor:
+  """Normalize (B,S,H,D)/(S,H,D) tensors to (B,S,H_k,H_r,D) view."""
+  if cutlass.const_expr(cute.rank(tensor.layout) == 5):
+    return tensor
+  if cutlass.const_expr(cute.rank(tensor.layout) == 4):
+    return cute.make_tensor(
+      tensor.iterator,
+      cute.make_layout(
+        (tensor.shape[0], tensor.shape[1], h_k, h_r, tensor.shape[3]),
+        stride=(
+          tensor.stride[0],
+          tensor.stride[1],
+          tensor.stride[2] * h_r,
+          tensor.stride[2],
+          tensor.stride[3],
+        ),
+      ),
+    )
+  assert cutlass.const_expr(
+    cute.rank(tensor.layout) == 3
+  ), "Expected rank-3 varlen tensor"
+  assert cutlass.const_expr(varlen), "Rank-3 input is only valid for varlen"
+  return cute.make_tensor(
+    tensor.iterator,
+    cute.make_layout(
+      (1, tensor.shape[0], h_k, h_r, tensor.shape[2]),
+      stride=(
+        0,
+        tensor.stride[0],
+        tensor.stride[1] * h_r,
+        tensor.stride[1],
+        tensor.stride[2],
+      ),
+    ),
+  )
+
+
+def as_shhb_tensor(
+  tensor: cute.Tensor,
+  h_k: Int32,
+  h_r: Int32,
+  b: Int32,
+  varlen: bool,
+) -> cute.Tensor:
+  """Normalize (B,H,S)/(H,S) tensors to (S, ((H_r, H_k), B)) view."""
+  if cutlass.const_expr(cute.rank(tensor.layout) == 3):
+    return cute.make_tensor(
+      tensor.iterator,
+      cute.make_layout(
+        (tensor.shape[2], ((h_r, h_k), tensor.shape[0])),
+        stride=(
+          tensor.stride[2],
+          ((tensor.stride[1], tensor.stride[1] * h_r), tensor.stride[0]),
+        ),
+      ),
+    )
+  assert cutlass.const_expr(
+    cute.rank(tensor.layout) == 2
+  ), "Expected rank-2 varlen tensor"
+  assert cutlass.const_expr(varlen), "Rank-2 input is only valid for varlen"
+  return cute.make_tensor(
+    tensor.iterator,
+    cute.make_layout(
+      (tensor.shape[1], ((h_r, h_k), b)),
+      stride=(
+        tensor.stride[1],
+        ((tensor.stride[0], tensor.stride[0] * h_r), 0),
+      ),
+    ),
+  )
