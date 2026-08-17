@@ -136,8 +136,6 @@ struct SoftmaxFused {
         make_tensor(acc.data(), convert_to_reduction_layout(acc.layout()));
     Tensor acc_conversion_view =
         make_tensor(acc.data(), convert_to_conversion_layout(acc.layout()));
-    Tensor acc_conversion_flatten =
-        group_modes<1, 5>(group_modes<0, 2>(flatten(acc_conversion_view)));
 
     if constexpr (FirstTile) {
       fill(row_max, -INFINITY);
@@ -174,16 +172,26 @@ struct SoftmaxFused {
                           fp8_scalexfp4_scale_log2))
                 : (row_max(mi) * softmax_scale_log2 + fp8_scalexfp4_scale_log2);
         CUTE_UNROLL
-        for (int ni = 0; ni < size<1>(acc_reduction_view); ni++) {
-          float p = ptx_exp2(acc_reduction_view(mi, ni) * softmax_scale_log2 -
-                             max_scaled);
-          acc_reduction_view(mi, ni) = p;
-          row_sum(mi) += p;
-        }
-        CUTE_UNROLL
-        for (int sfi = 0; sfi < size<1>(AbsMaxP); sfi++) {
-          AbsMaxP(mi, sfi) = ptx_exp2(AbsMaxP(mi, sfi) * softmax_scale_log2 -
-                                      max_scaled + fp4_scale_log2);
+        for (int g = 0; g < size<1, 1>(acc_reduction_view); g++) {
+          const float a = AbsMaxP(mi, g);
+          const float sfp2 =
+              ptx_exp2(a * softmax_scale_log2 - max_scaled + fp4_scale_log2);
+          AbsMaxP(mi, g) = sfp2;
+          // Fold the 1/absmax normalize into the exp2 argument: q = p/sP2 =
+          // exp2((s-a)*L + log2 6) lands directly in the e2m1 (0,6] domain,
+          // so the rcp + per-element FMUL pass between softmax and the pack
+          // disappears; row_sum absorbs the sP2 factor via FMA. Clamp a for
+          // fully-masked groups so q and row_sum degenerate to 0, not NaN.
+          const float a_arg = (a == -INFINITY) ? 0.f : a;
+          const float c = fmaf(-a_arg, softmax_scale_log2, -fp4_scale_log2);
+          CUTE_UNROLL
+          for (int ei = 0; ei < size<1, 0>(acc_reduction_view); ei++) {
+            const float q =
+                ptx_exp2(fmaf(acc_reduction_view(mi, make_coord(ei, g)),
+                              softmax_scale_log2, c));
+            acc_reduction_view(mi, make_coord(ei, g)) = q;
+            row_sum(mi) = fmaf(q, sfp2, row_sum(mi));
+          }
         }
       }
     } else {
@@ -221,29 +229,26 @@ struct SoftmaxFused {
                 : (row_max(mi) * softmax_scale_log2 + fp8_scalexfp4_scale_log2);
         row_sum(mi) = row_sum(mi) * scores_scale(mi);
         CUTE_UNROLL
-        for (int ni = 0; ni < size<1>(acc_reduction_view); ni++) {
-          acc_reduction_view(mi, ni) = ptx_exp2(
-              acc_reduction_view(mi, ni) * softmax_scale_log2 - max_scaled);
-          row_sum(mi) += acc_reduction_view(mi, ni);
-        }
-        CUTE_UNROLL
-        for (int sfi = 0; sfi < size<1>(AbsMaxP); sfi++) {
-          AbsMaxP(mi, sfi) = ptx_exp2(AbsMaxP(mi, sfi) * softmax_scale_log2 -
-                                      max_scaled + fp4_scale_log2);
+        for (int g = 0; g < size<1, 1>(acc_reduction_view); g++) {
+          const float a = AbsMaxP(mi, g);
+          const float sfp2 =
+              ptx_exp2(a * softmax_scale_log2 - max_scaled + fp4_scale_log2);
+          AbsMaxP(mi, g) = sfp2;
+          const float a_arg = (a == -INFINITY) ? 0.f : a;
+          const float c = fmaf(-a_arg, softmax_scale_log2, -fp4_scale_log2);
+          CUTE_UNROLL
+          for (int ei = 0; ei < size<1, 0>(acc_reduction_view); ei++) {
+            const float q =
+                ptx_exp2(fmaf(acc_reduction_view(mi, make_coord(ei, g)),
+                              softmax_scale_log2, c));
+            acc_reduction_view(mi, make_coord(ei, g)) = q;
+            row_sum(mi) = fmaf(q, sfp2, row_sum(mi));
+          }
         }
       }
     }
-    // normalize each group by its absmax so the e2m1 pack saturates at 6.
-    // One reciprocal per group + FMUL per element (fp8 pscale style): a bare
-    // division expands to a MUFU.RCP + FFMA chain per element, which NCU
-    // showed flooding the XU pipe.
-    CUTE_UNROLL
-    for (int i = 0; i < size(AbsMaxP); ++i) {
-      const float inv_absmax = 1.0f / AbsMaxP(i);
-      CUTE_UNROLL
-      for (int j = 0; j < size<0>(acc_conversion_flatten); ++j)
-        acc_conversion_flatten(j, i) *= inv_absmax;
-    }
+    // The group normalize is folded into the exp2 argument above (q already
+    // in the e2m1 (0,6] domain); only the pack consumes acc now.
   }
 
   template <typename TensorAcc>
