@@ -569,7 +569,7 @@ def run_forward_examples(
       )
     else:
       print(
-        "[CuTeDSL] backend constraints in effect: SM8x/SM90 dense path, no attn_mask/dropout."
+        "[CuTeDSL] backend constraints in effect: SM8x/SM90/SM100 dense path, no attn_mask/dropout."
       )
 
   for dtype in dtypes:

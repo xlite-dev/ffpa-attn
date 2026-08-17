@@ -1,18 +1,12 @@
 # This file is adapted from https://github.com/Dao-AILab/flash-attention/blob/main/flash_attn/cute/block_info.py.
 # Copyright (c) 2025, Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar, Pradeep Ramani, Tri Dao.
-# SM90-only trimmed version of block_info.py for the Hopper training port.
+# Trimmed copy shared by SM80, SM90 and SM100 D512.  Dropped vs upstream:
+# get_n_block_k_new_min_max, the SeqlenInfoQKNewK import, is_split_kv.
 #
-# Removed vs upstream:
-#   - get_n_block_k_new_min_max (append-KV, not used in SM90 training)
-#   - SeqlenInfoQKNewK import (class removed upstream)
-#   - is_split_kv field and the split-KV branch in get_n_block_min_max (no SM90 split-KV in this repo)
-#
-# Methods (SM90 call sites in this repo, plus reserved helpers for future masked-iteration splits):
-#   - get_n_block_min_max:              _fwd_d512_sm90.py (lines 798, 1005, 1425),
-#                                       _dq_d512_sm90.py  (lines 759, 1015, 1317)
-#   - get_m_block_min_max:              _dkdv_d512_sm90.py (lines 702, 963, 1211)
-#   - get_n_block_min_causal_local_mask: reserved (no current call sites)
-#   - get_n_block_min_before_local_mask: reserved (no current call sites)
+# get_n_block_min_max serves the Q-outer kernels, get_m_block_min_max the
+# KV-outer ones; the two local-mask bounds are SM100 D512 only (forward and
+# dQ, under use_semantic_trip_range).  Owners by role, not line number --
+# pinned line numbers here went stale once already.
 
 from typing import Tuple, Optional
 from dataclasses import dataclass
@@ -83,7 +77,7 @@ class BlockInfo:
       m_block_max = min(m_block_max, cute.ceil_div(m_idx_left, self.tile_m))
     return m_block_min, m_block_max
 
-  # Reserved: for casual and sliding window case : lower bound of the n-block range that still needs causal / right-local masking.
+  # Lower bound of the n-blocks still needing causal / right-local masking.
   @cute.jit
   def get_n_block_min_causal_local_mask(
     self,
@@ -102,7 +96,7 @@ class BlockInfo:
     )
     return cutlass.max(n_block_min, n_idx_right // self.tile_n)
 
-  # Reserved: for sliding window case : lower bound of the no-mask fast path, i.e. the n-block at which left-local masking begins.
+  # Lower bound of the no-mask fast path, where left-local masking begins.
   @cute.jit
   def get_n_block_min_before_local_mask(
     self,

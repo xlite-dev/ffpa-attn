@@ -21,9 +21,11 @@ The package name is `ffpa_attn.cute`, but the public backend string remains
 | `ffpa_attn.ffpa_attn_varlen_func` | `src/ffpa_attn/ffpa_attn_interface.py` | Packed-THD varlen wrapper. CuTeDSL is the only backend. |
 
 Both APIs route into this package through architecture-aware wrappers defined in
-`__init__.py`. Dense and varlen paths share the same SM90 specialised kernels
-when `head_dim <= 512` on Hopper and otherwise fall back to the generic SM80
-Split-D implementation.
+`__init__.py`. Routing is three-way (see the architecture table below): the
+dedicated SM100 path at compute capability exactly 10.0 with
+`head_dim == head_dim_v == 512`; the SM90 specialised kernels when
+`320 <= head_dim <= 512` on Hopper; and otherwise the generic SM80 Split-D
+implementation.
 
 ---
 
@@ -44,9 +46,18 @@ out = ffpa_attn_func(q, k, v, is_causal=True, backend="cutedsl")
 out.sum().backward()
 ```
 
-Dense tensors use SDPA layout `[B, H, N, D]`. The wrapper converts to the
-CuTeDSL-native `[B, N, H, D]` layout internally, dispatches through
-`ffpa_attn::_fwd_cute` / `ffpa_attn::_bwd_cute`, then converts outputs back.
+Dense tensors use SDPA layout `[B, H, N, D]`. The wrapper re-views them as the
+CuTeDSL-native `[B, N, H, D]` layout, dispatches through
+`ffpa_attn::_fwd_cute` / `ffpa_attn::_bwd_cute`, then re-views results back.
+The re-view is a stride change, not a copy: each launcher materialises what it
+needs at its own entry, so the SM80 Split-D and SM90 Hopper paths and their
+backwards still see dense operands, while the SM100 D512 forward **and**
+backward — which read every stride at runtime — consume the views directly.
+Both normalise through the shared `_needs_dense_copy`, which tests only the
+three facts codegen bakes in (unit trailing stride, 128-bit aligned leading
+strides, 16-byte base), and both hand back `[B, H, N, D]`-backed storage so the
+caller's exit re-view costs nothing. Returned tensors are contiguous
+`[B, H, N, D]` either way.
 
 `meta.fallback()` only handles hardware and head-dim mismatches. Unsupported
 features such as `attn_mask`, `dropout_p > 0`, unsupported dtypes, or invalid
@@ -110,11 +121,13 @@ ffpa_attn_func(backend='cutedsl')
         forward  → _ffpa_attn_forward_cute  (__init__.py)
                     └── torch.ops.ffpa_attn._fwd_cute
                           └── _forward_impl_for_device(...)
+                                ├── _ffpa_attn_forward_sm100   (CC 10.0, D == Dv == 512)
                                 ├── _ffpa_attn_forward_sm90
                                 └── _ffpa_attn_forward_sm80
         backward → _ffpa_attn_backward_cute  (__init__.py)
                     └── torch.ops.ffpa_attn._bwd_cute
                           └── _backward_impl_for_device(...)
+                                ├── _ffpa_attn_backward_sm100  (CC 10.0, D == Dv == 512)
                                 ├── _ffpa_attn_backward_sm90
                                 └── _ffpa_attn_backward_sm80
 
@@ -124,11 +137,39 @@ ffpa_attn_varlen_func(...)
               └── torch.ops.ffpa_attn._varlen_fwd_cute / _varlen_bwd_cute
 ```
 
-The routing rule is simple:
+The forward routing rule, in order:
 
+- compute capability **exactly `10.0`** (`sm100a`) with `head_dim == head_dim_v
+  == 512` uses the dedicated Blackwell 2-CTA `tcgen05` path. The equality test
+  is deliberate: the kernel emits `CtaGroup.TWO` MMA, TMEM accumulators, and a
+  cluster-scoped TMEM deallocation protocol, none of which is compatible across
+  Blackwell minors, so `SM103`/`SM120` keep the documented fallback until they
+  have their own device evidence.
 - `major == 9` and symmetric `head_dim <= 512` uses the SM90 specialised path.
-- Every other supported architecture (`SM80/SM89/SM100/SM103/SM120/...`) and
-  every larger supported dense head-dim uses the SM80 generic Split-D path.
+- Every other supported architecture and every larger supported dense head-dim
+  uses the SM80 generic Split-D path.
+
+The SM100 entry never re-routes: it is an exact specialisation, so a call
+outside its contract raises `NotImplementedError` naming the rule that fired
+(`_sm100_d512_unsupported_reason`): `varlen-one-sided` (exactly one of
+`cu_seqlens_q`/`cu_seqlens_k`), `local-window`, `softcap`, `score_mod`,
+`mask_mod`, `aux_tensors`, or a `head_dim` other than 512. The backward
+rejects the same set, so the two entries cannot disagree.
+
+**Backward routing follows the same predicate.** `_backward_impl_for_device`
+reads the compute-capability minor and consults the same
+`_use_sm100_d512_specialized`, so a call that takes the dedicated forward
+always takes the dedicated backward. This matters rather than being tidy: the
+SM80 Split-D backward uses a different causal alignment for asymmetric
+sequence lengths, so a split pair would produce plausible, wrong gradients.
+
+The SM100 backward is **four launches and four compile caches** — preprocess,
+then dV, dK and dQ as separate resident single-output kernels — where SM90
+fuses dK/dV and needs three (preprocess, fused dKdV, dQ). That is a resource
+fact, not a style choice: at
+D512 the dQ kernel already occupies 232448 of the 232448 available SMEM bytes
+and 512 of 512 TMEM columns for one tile, and an unsplit dK/dV would need
+246272 bytes, which is more than the hardware has.
 
 ---
 
@@ -138,6 +179,12 @@ The routing rule is simple:
 |---|---|
 | `__init__.py` | Dense/varlen entry shims, SDPA↔FA layout adapters, torch custom ops, fake registrations, autograd registration, `_require_cute_supported()`, `cute_{forward,backward}_available()`, `cute_max_supported_head_dim()`. |
 | `_utils.py` | Shared constants, validation helpers, optional-int encoding, and fake-mode helpers. |
+| `_ffpa_fwd_sm100.py` | SM100 forward entry, named contract-rejection reasons, and compile cache. |
+| `_fwd_d512_sm100.py` | Blackwell 2-CTA `tcgen05` D512 forward kernel (TMEM accumulators, cluster-native). |
+| `_ffpa_bwd_sm100.py` | SM100 backward entry, preprocess wiring, and the four compile caches. |
+| `_dv_d512_sm100.py` | Blackwell D512 dV kernel. |
+| `_dk_d512_sm100.py` | Blackwell D512 dK kernel. |
+| `_dq_d512_sm100.py` | Blackwell D512 dQ kernel. |
 | `_ffpa_fwd_sm90.py` | SM90 forward entry and compile cache. |
 | `_ffpa_bwd_sm90.py` | SM90 backward entry, preprocess wiring, and compile caches. |
 | `_ffpa_fwd_sm80.py` | SM80/SM89 and generic fallback forward entry. |
@@ -166,7 +213,8 @@ functions are the stable internal contract for this package.
 
 | Constraint | Detail |
 |---|---|
-| **GPU** | Device-level gate is `sm >= 80`. SM90 gets specialised kernels; other supported archs use the SM80 fallback. |
+| **GPU** | Device-level gate is `sm >= 80`. CC 10.0 gets the dedicated D512 forward, SM90 gets specialised kernels, other supported archs use the SM80 fallback. |
+| **SM100 dedicated range** | Forward **and** backward, `head_dim == head_dim_v == 512`, dense `[B, N, H, 512]` or packed varlen `[T, H, 512]` with **both** `cu_seqlens`, fp16/bf16, causal (bottom-right aligned per sequence) or non-causal, MHA/GQA/MQA via zero-stride broadcast. Per-sequence `Lq` and `Lk` are independent, `Lq = 0` and `Lk = 0` are legal, and rows with no legal key produce `O = 0` / `LSE = -inf` forward and exactly zero gradient backward. |
 | **Dense head dim** | `320 <= D <= cute_max_supported_head_dim()`. Today that ceiling is `1024` via the SM80 fallback. |
 | **SM90 specialised range** | `320 <= D <= 512` with symmetric q/k/v head-dim. |
 | **SM80 fallback divisibility** | Dense fallback requires `D % 32 == 0` in forward and symmetric q/k/v head-dim. |
@@ -176,15 +224,26 @@ functions are the stable internal contract for this package.
 | **Dropout** | `dropout_p == 0.0` only. |
 | **Varlen extras** | `seqused_k`, `block_table`, `num_splits`, `window_size`, `alibi_slopes`, `softcap`, `score_mod`, `aux_tensors`, `sink`, `attention_mask`, and `block_mask` are rejected. |
 | **GQA / MQA** | Supported when head-count divisibility rules are satisfied. |
+| **`grad_kv_storage_dtype`** | Generic SM80 backward only. It widens the dK/dV *output buffer* because that path is the only one accumulating across tiles through HBM, where a bf16 round trip per partial loses bits. The SM90 and SM100 specialised backwards accumulate in registers and TMEM respectively and convert once in the epilogue, so their kernels only ever store the activation dtype — the SM100 dV kernel rejects an fp32 destination outright. At D512 it therefore raises `NotImplementedError` on `sm90` and, since the dedicated Blackwell backward landed, on `sm100a` too. Rejected rather than accepted-and-ignored. |
 
 Any ineligible call surfaces `NotImplementedError`, `TypeError`, or
 `ValueError`; there is no silent feature fallback inside this package.
 
 ---
 
-## Blackwell / SM120 investigation note
+## Blackwell status
 
-The current kernels are not made Blackwell-compatible by simply relaxing the
+**CC 10.0 (`sm100a`, B200) has a real dedicated D512 forward *and* backward** — see
+`_fwd_d512_sm100.py` and the routing rule above. It is a `tcgen05` 2-CTA kernel
+with TMEM accumulators and cluster-native barriers, not a relaxed Hopper path.
+Each kernel's own file header states its tile ownership, execution agents,
+storage budget, pipeline edges and constraints. Measured B200 numbers are in
+[`bench/README.md`](../../../bench/README.md).
+
+The note below still applies to **SM120 and other Blackwell minors**, which have
+no dedicated path and reach the SM80 fallback.
+
+The Hopper kernels are not made Blackwell-compatible by simply relaxing the
 Python-side `sm == 90` checks to `sm >= 90`. A May 2026 experiment on
 `NVIDIA RTX PRO 6000 Blackwell Server Edition`, (compute capability 12.0) showed that the D512 path reaches CuTeDSL JIT after the local gates are relaxed, but then fails inside CUTLASS DSL's Hopper
 warpgroup MMA implementation:
@@ -200,8 +259,8 @@ relaxing the installed CUTLASS DSL `warpgroup.MmaOp` arch check from
 serialization for `sm_120` / `sm_120a`. In other words, the blocker is not just
 an over-strict guard in this package.
 
-Future Blackwell work should add a real SM100+/SM120 CuTeDSL path instead of
-trying to reuse the Hopper `warpgroup` path. CUTLASS provides a separate
+Future SM120 work should add a real CuTeDSL path instead of trying to reuse the
+Hopper `warpgroup` path — the same conclusion the SM100 D512 port reached. CUTLASS provides a separate
 Blackwell stack based on `cutlass.cute.nvgpu.tcgen05` and
 `cutlass.utils.blackwell_helpers.make_trivial_tiled_mma`. That helper constructs
 `tcgen05.MmaF16BF16Op`, whose signature includes `CtaGroup` and uses Blackwell

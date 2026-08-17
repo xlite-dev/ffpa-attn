@@ -1001,7 +1001,7 @@ def run_backward_examples(
       )
     else:
       print(
-        "[CuTeDSL] backend constraints in effect: SM8x/SM90 dense path, no mask/dropout."
+        "[CuTeDSL] backend constraints in effect: SM8x/SM90/SM100 dense path, no mask/dropout."
       )
 
   mask_dropout_supported = backward_backend != "cutedsl"

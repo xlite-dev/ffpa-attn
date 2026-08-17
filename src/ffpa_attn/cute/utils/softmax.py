@@ -530,3 +530,84 @@ def apply_score_mod_bwd_inner(
     grad_vec.store(grad_out_ssa)
     for j in cutlass.range(vec_size, unroll_full=True):
       grad_tensor[i + j] = grad_vec[j]
+
+
+# exp2 polynomial emulation (SM100 D512 forward): part of the frozen precision contract, not a tuning knob.  The kernel's ex2_emu_* constants pin what fraction of exponentials takes this path instead of the MUFU-backed cute.math.exp2, and swapping in plain exp2 changes the numbers.
+
+from cutlass._mlir.dialects import llvm as _llvm  # noqa: E402
+from cutlass._mlir import ir as _ir  # noqa: E402,F401
+from cutlass._mlir.extras import types as _T  # noqa: E402
+from cutlass.cutlass_dsl import dsl_user_op as _dsl_user_op  # noqa: E402
+import quack.activation as _quack_activation  # noqa: E402
+
+#: Minimax coefficients for ``2**f`` on ``f in [0, 1)``, ascending degree.
+POLY_EX2_DEG3 = (
+  1.0,
+  0.695146143436431884765625,
+  0.227564394474029541015625,
+  0.077119089663028717041015625,
+)
+
+
+@_dsl_user_op
+@cute.jit
+def evaluate_polynomial_2(
+  x: Float32, y: Float32, poly: tuple, *, loc=None, ip=None
+) -> tuple:
+  """Horner evaluation of ``poly`` at two points, on the packed f32x2 path."""
+  deg = len(poly) - 1
+  out = (poly[deg], poly[deg])
+  for i in cutlass.range_constexpr(deg - 1, -1, -1):
+    out = cute.arch.fma_packed_f32x2(out, (x, y), (poly[i], poly[i]))
+  return out
+
+
+@_dsl_user_op
+def combine_int_frac_ex2(
+  x_rounded: Float32, frac_ex2: Float32, *, loc=None, ip=None
+) -> Float32:
+  """Assemble ``2**floor(x) * 2**frac`` by shifting ``x_rounded``'s low 8 bits into the exponent field."""
+  return cutlass.Float32(
+    _llvm.inline_asm(
+      _T.f32(),
+      [
+        Float32(x_rounded).ir_value(loc=loc, ip=ip),
+        Float32(frac_ex2).ir_value(loc=loc, ip=ip),
+      ],
+      "{\n\t"
+      ".reg .s32 x_rounded_i, frac_ex_i, x_rounded_e, out_i;\n\t"
+      "mov.b32 x_rounded_i, $1;\n\t"
+      "mov.b32 frac_ex_i, $2;\n\t"
+      "shl.b32 x_rounded_e, x_rounded_i, 23;\n\t"
+      "add.s32 out_i, x_rounded_e, frac_ex_i;\n\t"
+      "mov.b32 $0, out_i;\n\t"
+      "}",
+      "=f,f,f",
+      has_side_effects=False,
+      is_align_stack=False,
+      asm_dialect=_llvm.AsmDialect.AD_ATT,
+    )
+  )
+
+
+@_dsl_user_op
+def ex2_emulation_2(
+  x: Float32, y: Float32, *, poly_degree: int = 3, loc=None, ip=None
+) -> tuple:
+  """``(2**x, 2**y)`` without the SFU; assumes ``x, y <= 127.0``, and the round-down mode is what keeps the fraction in the fitted ``[0, 1)``."""
+  fp32_round_int = float(2**23 + 2**22)
+  xy_clamped = (cute.arch.fmax(x, -127.0), cute.arch.fmax(y, -127.0))
+  xy_rounded = cute.arch.add_packed_f32x2(
+    xy_clamped, (fp32_round_int, fp32_round_int), rnd="rm"
+  )
+  xy_rounded_back = _quack_activation.sub_packed_f32x2(
+    xy_rounded, (fp32_round_int, fp32_round_int)
+  )
+  xy_frac = _quack_activation.sub_packed_f32x2(xy_clamped, xy_rounded_back)
+  poly = POLY_EX2_DEG3 if poly_degree == 3 else POLY_EX2_DEG3
+  assert poly_degree == 3, "only the degree-3 fit is ported"
+  xy_frac_ex2 = evaluate_polynomial_2(*xy_frac, poly, loc=loc, ip=ip)
+  return (
+    combine_int_frac_ex2(xy_rounded[0], xy_frac_ex2[0], loc=loc, ip=ip),
+    combine_int_frac_ex2(xy_rounded[1], xy_frac_ex2[1], loc=loc, ip=ip),
+  )

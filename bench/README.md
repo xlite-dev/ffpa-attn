@@ -10,14 +10,14 @@ python3 -m ffpa_attn.bench --no-fwd # only backward pass
 python3 -m ffpa_attn.bench --fwd-backend triton --bwd-backend triton --tune fast
 python3 -m ffpa_attn.bench --fwd-backend triton --bwd-backend triton --tune max
 python3 -m ffpa_attn.bench --fwd-backend triton --bwd-backend triton --tune max --fwd-tma --bwd-tma # SM>=90
-python3 -m ffpa_attn.bench --fwd-backend cutedsl --bwd-backend cutedsl # SM==90 + dense 320<D<=512
+python3 -m ffpa_attn.bench --fwd-backend cutedsl --bwd-backend cutedsl # SM==90 dense 320<D<=512, SM==100 dense D==512
 ```
 
 The `ffpa-attn bench CLI (python -m ffpa_attn.bench)` migrated benchmark plotting entrypoint. It preserves the old plot style, can benchmark forward/backward cases on demand, and writes both `ffpa_{device}_speedup.png` and `ffpa_{device}_speedup.md`. The additive-mask example uses a compact `[1, 1, 1, Nkv]` key-position bias by default. Use `[1, 1, Nq, Nkv]` only when per-query bias is required, since it scales as `O(Nq * Nkv)` memory.
 
 ## Benchmark
 
-TFLOPS reports the theoretical dominant attention GEMM throughput only; forward and backward are computed separately from the measured latency. Env: NVIDIA L20 (Ada, 119.5 TFLOPS) and NVIDIA H200, PyTorch 2.11, CUDA 13.0, Headdim=512 (FA-2 not supported).
+TFLOPS reports the theoretical dominant attention GEMM throughput only; forward and backward are computed separately from the measured latency. Forward counts 2 GEMMs and backward the standard 5, so the backward figure stays comparable across implementations — on SM100 the backward is split into four launches (preprocess, dV, dK, dQ) that execute 8 GEMM passes, and the extra 1.6x is deliberately not counted. Env: NVIDIA L20 (Ada, 119.5 TFLOPS), NVIDIA H200 and NVIDIA B200, PyTorch 2.11, CUDA 13.0, Headdim=512 (FA-2 not supported).
 
 <div align='center' markdown="1">
 
@@ -124,6 +124,66 @@ TFLOPS reports the theoretical dominant attention GEMM throughput only; forward 
 | non-aligned | fp16 | 16383/16383 | 46.30 / 252.40 ms | 237T / 44T | 5.45x |
 | non-aligned | bf16 | 16383/16383 | 45.80 / 253.24 ms | 240T / 43T | 5.53x |
 
+### Forward Pass (CuTeDSL, NVIDIA B200, 8K, D=512)
+
+| Case | dtype | Nq/Nkv | FFPA / SDPA | TFLOPS | speedup |
+|:---:|:---:|:---:|:---:|:---:|:---:|
+| self-attn | fp16 | 8192/8192 | 3.19 / 23.89 ms | 1379T / 184T | 7.49x |
+| self-attn | bf16 | 8192/8192 | 3.02 / 23.93 ms | 1456T / 184T | 7.92x |
+| cross-attn | fp16 | 1024/8192 | 0.48 / 3.12 ms | 1136T / 176T | 6.45x |
+| cross-attn | bf16 | 1024/8192 | 0.47 / 3.12 ms | 1171T / 176T | 6.65x |
+| gqa | fp16 | 8192/8192 | 3.06 / 24.11 ms | 1435T / 182T | 7.87x |
+| gqa | bf16 | 8192/8192 | 2.94 / 23.94 ms | 1493T / 184T | 8.13x |
+| causal | fp16 | 8192/8192 | 1.74 / 13.05 ms | 1267T / 168T | 7.52x |
+| causal | bf16 | 8192/8192 | 1.65 / 12.82 ms | 1336T / 172T | 7.79x |
+| non-aligned | fp16 | 8191/8191 | 0.81 / 6.58 ms | 1365T / 167T | 8.17x |
+| non-aligned | bf16 | 8191/8191 | 0.77 / 6.16 ms | 1428T / 178T | 8.00x |
+
+### Backward Pass (CuTeDSL, NVIDIA B200, 8K, D=512)
+
+| Case | dtype | Nq/Nkv | FFPA / SDPA | TFLOPS | speedup |
+|:---:|:---:|:---:|:---:|:---:|:---:|
+| self-attn | fp16 | 8192/8192 | 15.13 / 202.29 ms | 727T / 54T | 13.37x |
+| self-attn | bf16 | 8192/8192 | 14.80 / 212.18 ms | 743T / 52T | 14.34x |
+| cross-attn | fp16 | 1024/8192 | 3.17 / 25.98 ms | 434T / 53T | 8.21x |
+| cross-attn | bf16 | 1024/8192 | 3.16 / 26.24 ms | 435T / 52T | 8.31x |
+| gqa | fp16 | 8192/8192 | 14.97 / 202.34 ms | 735T / 54T | 13.52x |
+| gqa | bf16 | 8192/8192 | 14.42 / 211.76 ms | 763T / 52T | 14.69x |
+| causal | fp16 | 8192/8192 | 8.88 / 104.29 ms | 619T / 53T | 11.75x |
+| causal | bf16 | 8192/8192 | 8.82 / 113.14 ms | 623T / 49T | 12.83x |
+| non-aligned | fp16 | 8191/8191 | 4.28 / 54.64 ms | 641T / 50T | 12.75x |
+| non-aligned | bf16 | 8191/8191 | 4.28 / 59.48 ms | 642T / 46T | 13.90x |
+
+### Forward Pass (CuTeDSL, NVIDIA B200, 16K, D=512)
+
+| Case | dtype | Nq/Nkv | FFPA / SDPA | TFLOPS | speedup |
+|:---:|:---:|:---:|:---:|:---:|:---:|
+| self-attn | fp16 | 16384/16384 | 12.83 / 98.01 ms | 1371T / 179T | 7.64x |
+| self-attn | bf16 | 16384/16384 | 12.63 / 96.73 ms | 1393T / 182T | 7.66x |
+| cross-attn | fp16 | 1024/16384 | 0.90 / 6.47 ms | 1219T / 170T | 7.17x |
+| cross-attn | bf16 | 1024/16384 | 0.87 / 6.47 ms | 1260T / 170T | 7.42x |
+| gqa | fp16 | 16384/16384 | 12.71 / 98.10 ms | 1384T / 179T | 7.72x |
+| gqa | bf16 | 16384/16384 | 12.17 / 96.62 ms | 1445T / 182T | 7.94x |
+| causal | fp16 | 16384/16384 | 6.47 / 50.82 ms | 1360T / 173T | 7.86x |
+| causal | bf16 | 16384/16384 | 6.27 / 49.94 ms | 1404T / 176T | 7.97x |
+| non-aligned | fp16 | 16383/16383 | 3.05 / 24.28 ms | 1443T / 181T | 7.97x |
+| non-aligned | bf16 | 16383/16383 | 2.90 / 24.37 ms | 1517T / 180T | 8.41x |
+
+### Backward Pass (CuTeDSL, NVIDIA B200, 16K, D=512)
+
+| Case | dtype | Nq/Nkv | FFPA / SDPA | TFLOPS | speedup |
+|:---:|:---:|:---:|:---:|:---:|:---:|
+| self-attn | fp16 | 16384/16384 | 62.93 / 785.17 ms | 699T / 56T | 12.48x |
+| self-attn | bf16 | 16384/16384 | 60.46 / 827.20 ms | 727T / 53T | 13.68x |
+| cross-attn | fp16 | 1024/16384 | 5.35 / 50.66 ms | 514T / 54T | 9.48x |
+| cross-attn | bf16 | 1024/16384 | 5.32 / 49.76 ms | 516T / 55T | 9.35x |
+| gqa | fp16 | 16384/16384 | 62.01 / 787.07 ms | 709T / 56T | 12.69x |
+| gqa | bf16 | 16384/16384 | 59.89 / 826.51 ms | 734T / 53T | 13.80x |
+| causal | fp16 | 16384/16384 | 34.42 / 401.00 ms | 639T / 55T | 11.65x |
+| causal | bf16 | 16384/16384 | 32.87 / 431.60 ms | 669T / 51T | 13.13x |
+| non-aligned | fp16 | 16383/16383 | 14.84 / 196.92 ms | 741T / 56T | 13.27x |
+| non-aligned | bf16 | 16383/16383 | 14.50 / 213.13 ms | 758T / 52T | 14.69x |
+
 ### Forward Pass (Triton w/ autotune (max), NVIDIA H20, 8K, D=512)
 
 | Case | dtype | Nq/Nkv | FFPA / SDPA | TFLOPS | speedup |
@@ -210,7 +270,7 @@ TFLOPS reports the theoretical dominant attention GEMM throughput only; forward 
 
 </div>
 
-The performance benchmarks for the NVIDIA L20 (**Ada**), NVIDIA Geforce RTX 5090 (**Blackwell**), NVIDIA H800 PCIE (**Hopper**), NVIDIA H200 SXM (**Hopper**, **CuTeDSL** backend, up to **427** TFLOPS!🎉) with large headdim are shown below:
+The performance benchmarks for the NVIDIA L20 (**Ada**), NVIDIA Geforce RTX 5090 (**Blackwell**), NVIDIA H800 PCIE (**Hopper**), NVIDIA H200 SXM (**Hopper**, **CuTeDSL** backend, up to **427** TFLOPS!🎉), NVIDIA B200 (**Blackwell**, **CuTeDSL** `tcgen05` 2-CTA D=512 path, up to **1517** TFLOPS forward and **763** TFLOPS backward!🎉) with large headdim are shown below:
 
 <div align='center'>
   <img src='../docs/assets/perf/ffpa_speedup_nvidia-l20_B1_H32_N8192_D320_T.png' width='400px'>
@@ -220,5 +280,7 @@ The performance benchmarks for the NVIDIA L20 (**Ada**), NVIDIA Geforce RTX 5090
   <img src='../docs/assets/perf/ffpa_speedup_nvidia-h800-pcie_B1_H32_N8192_D320_T.png' width='400px'>
   <img src='../docs/assets/perf/ffpa_speedup_nvidia-h800-pcie_B1_H32_N8192_D512_T.png' width='400px'><br>
   <img src='../docs/assets/perf/ffpa_speedup_cutedsl_nvidia-h20z_B1_H32_N8192_D512_T.png' width='400px'>
-  <img src='../docs/assets/perf/ffpa_speedup_cutedsl_nvidia-h20z_B1_H32_N16384_D512_T.png' width='400px'>
+  <img src='../docs/assets/perf/ffpa_speedup_cutedsl_nvidia-h20z_B1_H32_N16384_D512_T.png' width='400px'><br>
+  <img src='../docs/assets/perf/ffpa_speedup_cutedsl_nvidia-b200_B1_H32_N8192_D512_T.png' width='400px'>
+  <img src='../docs/assets/perf/ffpa_speedup_cutedsl_nvidia-b200_B1_H32_N16384_D512_T.png' width='400px'>
 </div>

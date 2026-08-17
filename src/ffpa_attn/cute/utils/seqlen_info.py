@@ -1,15 +1,13 @@
 # This file is copied from https://github.com/Dao-AILab/flash-attention/blob/main/flash_attn/cute/seqlen_info.py
 # Copyright (c) 2025, Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar, Pradeep Ramani, Tri Dao.
-# SM90-only simplified version of seqlen_info.py for Hopper training port.
+# Simplified copy shared across architectures.  SeqlenInfoQK is the seqlen
+# authority for the SM80 forward, the SM90 d512 forward and dQ/dKdV d512+d384,
+# and all four SM100 D512 kernels; SeqlenInfo serves _bwd_preprocess.py.
+# Dropped vs upstream: SeqlenInfoQKNewK, has_seqused_q/k, mSeqUsedQ/K, seqused.
 #
-# Removed vs upstream seqlen_info.py:
-#   - SeqlenInfoQKNewK class (append-KV, not used in SM90 training)
-#   - has_seqused_q / has_seqused_k fields from SeqlenInfoQK (seqused always None)
-#   - mSeqUsedQ / mSeqUsedK parameters from SeqlenInfoQK.create()
-#   - seqused parameter from SeqlenInfo.create()
-#
-# All offset_batch_Q / offset_batch_K methods retained including ragged and PackGQA branches,
-# as they are actively used by SM90 fwd (pack_gqa) and bwd (varlen ragged dK/dV/dQ_accum).
+# SM80/SM90/preprocess reach batches via offset_batch_Q/K/offset_batch; SM100
+# D512 calls none of them, reading offset_q/offset_k/padded_offset_* and
+# rebasing TMA coordinates itself.  The ragged=True arm has no call site here.
 
 from typing import Optional
 from dataclasses import dataclass
