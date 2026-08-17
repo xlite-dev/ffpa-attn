@@ -141,7 +141,9 @@ def _apply_cuda_backend_hint(backend: CUDABackend) -> None:
   Mapping: (enable_tma, enable_cute) → hint. No flag set → NATIVE (Legacy).
   """
   from .cuda import set_cuda_backend_impl, CudaBackendImpl
-  if getattr(backend, "enable_fp8", False):
+  if getattr(backend, "enable_fp4", False):
+    set_cuda_backend_impl(CudaBackendImpl.CUTE_TMA_FP4)
+  elif getattr(backend, "enable_fp8", False):
     set_cuda_backend_impl(CudaBackendImpl.CUTE_TMA_FP8)
   elif backend.enable_tma and backend.enable_cute:
     set_cuda_backend_impl(CudaBackendImpl.CUTE_TMA)
@@ -240,6 +242,7 @@ class CUDABackend(Backend):
   enable_cute: bool | None = None
   enable_ws: bool = False  # For future use.
   enable_fp8: bool = False  # FP8 persist-D sm120 path (fp16/bf16 in).
+  enable_fp4: bool = False  # NVFP4 persist-D sm120 path (D=128 only).
   fp8_smooth_k: bool = True  # FP8 only: subtract per-(b,h) K seq mean pre-quant.
   fp8_smooth_v: bool = False  # FP8 only: subtract per-(b,h) V dim mean.
   fp8_q_quant_method: str = "per_block"  # FP8 only: per_block / per_thread.
@@ -247,10 +250,11 @@ class CUDABackend(Backend):
   fp8_v_quant_method: str = "per_block"  # FP8 only; per_block / per_channel.
   fp8_pv_acc_type: str = "f32"  # FP8 only; f32/f16 PV accumulator.
   fp8_qk_mm_type: str = "fp8"  # FP8 only: QK MMA dtype; "fp8" or "int8".
-  # FP8 only: hybrid — fp16 computes [0:n_early] rows, fp8 computes
+  # Hybrid — fp16 computes [0:n_early] rows, fp8/fp4 computes
   # [n_early:N] via q_start_row offset (zero-redundancy). Works for causal
   # (fixes early-row accuracy loss) and non-causal (user-selected rows get
-  # full fp16 precision). None=auto: enabled when enable_fp8 + is_causal.
+  # full fp16 precision). None=auto: enabled when enable_fp8/enable_fp4 +
+  # is_causal.
   fp8_hybrid: bool | None = None
   fp8_hybrid_n_early: int = 256
   # Runtime: propagated from ffpa_attn_func(is_causal=...) by normalize_inputs.
@@ -262,6 +266,8 @@ class CUDABackend(Backend):
     assert self.acc in (
       "f16", "f32"
     ), f"acc must be 'f16' or 'f32', got {self.acc!r}"
+    assert not (self.enable_fp8 and self.enable_fp4
+                ), ("enable_fp8 and enable_fp4 are mutually exclusive")
     if self.acc == "f16" and not F16_ACC_AVAILABLE:
       raise ValueError(
         "CUDABackend(acc='f16') requires the fp16 MMA acc kernels, which were "
@@ -770,13 +776,15 @@ class FFPAAttnMeta:
     self.attn_meta.is_grad_enabled = torch.is_grad_enabled()
 
     # Propagate is_causal to the CUDA backend and auto-resolve fp8_hybrid.
-    # fp8_hybrid=None (default) means "auto": enable hybrid when causal + fp8
-    # to protect early-row precision; explicit True/False is honored as-is.
+    # fp8_hybrid=None (default) means "auto": enable hybrid when causal +
+    # fp8/fp4 to protect early-row precision; explicit True/False is honored
+    # as-is. fp4 shares the switch (fp16 stage-1 + fp4 stage-2).
     if isinstance(self.forward_meta, CUDABackend):
       self.forward_meta.is_causal = is_causal
       if self.forward_meta.fp8_hybrid is None:
         self.forward_meta.fp8_hybrid = bool(
-          self.forward_meta.enable_fp8 and is_causal
+          (self.forward_meta.enable_fp8 or self.forward_meta.enable_fp4)
+          and is_causal
         )
 
     # Validate that acc-code is compatible with activation dtype.

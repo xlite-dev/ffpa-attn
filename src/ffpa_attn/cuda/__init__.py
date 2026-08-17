@@ -32,6 +32,7 @@ class CudaBackendImpl(enum.IntEnum):
   CUTE = 3
   CUTE_TMA = 4
   CUTE_TMA_FP8 = 5
+  CUTE_TMA_FP4 = 6
 
 
 def set_cuda_backend_impl(impl: CudaBackendImpl) -> None:

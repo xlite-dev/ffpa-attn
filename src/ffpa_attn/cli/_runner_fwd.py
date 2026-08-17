@@ -249,6 +249,7 @@ def _make_forward_backend(
   enable_ws: bool,
   enable_cute: bool = False,
   enable_fp8: bool = False,
+  enable_fp4: bool = False,
   fp8_smooth_k: bool = True,
   fp8_smooth_v: bool = False,
   fp8_q_quant_method: str = "per_block",
@@ -268,6 +269,7 @@ def _make_forward_backend(
       "enable_ws": enable_ws,
       "enable_cute": enable_cute,
       "enable_fp8": enable_fp8,
+      "enable_fp4": enable_fp4,
       "fp8_smooth_k": fp8_smooth_k,
       "fp8_smooth_v": fp8_smooth_v,
       "fp8_q_quant_method": fp8_q_quant_method,
@@ -320,6 +322,7 @@ def _run_case(
   enable_ws: bool = False,
   enable_cute: bool = False,
   enable_fp8: bool = False,
+  enable_fp4: bool = False,
   fp8_smooth_k: bool = True,
   fp8_smooth_v: bool = False,
   fp8_q_quant_method: str = "per_block",
@@ -346,6 +349,7 @@ def _run_case(
     enable_ws=enable_ws,
     enable_cute=enable_cute,
     enable_fp8=enable_fp8,
+    enable_fp4=enable_fp4,
     fp8_smooth_k=fp8_smooth_k,
     fp8_smooth_v=fp8_smooth_v,
     fp8_q_quant_method=fp8_q_quant_method,
@@ -382,7 +386,13 @@ def _run_case(
     q, k_ref, v_ref, is_causal=causal, attn_mask=attn_mask, dropout_p=dropout_p
   )
 
-  tol = 5e-2 if (dtype == torch.bfloat16 or enable_fp8) else 2e-2
+  # NVFP4 P-quantization noise (e2m1 grid) needs a wider tolerance. Causal
+  # rows with peaked softmax amplify V/P e2m1 error (measured max ~0.62 at
+  # N=16384 randn); dense cases stay well below 0.15.
+  if enable_fp4:
+    tol = 0.7 if causal else 0.15
+  else:
+    tol = 5e-2 if (dtype == torch.bfloat16 or enable_fp8) else 2e-2
   ok = _tensor_allclose(out_ffpa, out_sdpa, tol)
 
   if pre_heat > 0:
@@ -473,6 +483,7 @@ def run_forward_examples(
   enable_ws: bool = False,
   enable_cute: bool = False,
   enable_fp8: bool = False,
+  enable_fp4: bool = False,
   fp8_qk_mm_type: str = "fp8",
   fp8_smooth_k: bool = True,
   fp8_smooth_v: bool = False,
@@ -528,6 +539,7 @@ def run_forward_examples(
     ("enable_fwd_ws", str(enable_ws)),
     ("enable_fwd_cute", str(enable_cute)),
     ("enable_fwd_fp8", str(enable_fp8)),
+    ("enable_fwd_fp4", str(enable_fp4)),
     ("cuda_stages", str(stages)),
     ("pre_heat", str(pre_heat)),
     ("tasks", tasks_str),
@@ -611,7 +623,7 @@ def run_forward_examples(
         "causal": True
       },
     ]
-    if forward_backend != "cutedsl" and not enable_fp8:
+    if forward_backend != "cutedsl" and not enable_fp8 and not enable_fp4:
       mask_n = max(N, 512)
       case_specs.append({
         "name":
@@ -627,7 +639,7 @@ def run_forward_examples(
         "attn_mask":
         _make_broadcast_additive_attn_mask(mask_n, mask_n, dtype, seed),
       })
-    if forward_backend != "cutedsl" and not enable_fp8:
+    if forward_backend != "cutedsl" and not enable_fp8 and not enable_fp4:
       case_specs.extend([
         {
           "name": "dropout",
@@ -675,6 +687,7 @@ def run_forward_examples(
           enable_ws=enable_ws,
           enable_cute=enable_cute,
           enable_fp8=enable_fp8,
+          enable_fp4=enable_fp4,
           fp8_qk_mm_type=fp8_qk_mm_type,
           fp8_smooth_k=fp8_smooth_k,
           fp8_smooth_v=fp8_smooth_v,
