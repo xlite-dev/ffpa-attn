@@ -1750,11 +1750,14 @@ void launch_cute_fwd_persist_d_fp4_sm120_impl(torch::Tensor Q, torch::Tensor K,
       softmax_lse.numel() > 0 ? softmax_lse.data_ptr<float>() : nullptr;
   auto O_ptr = reinterpret_cast<ElementO*>(O.data_ptr());
   const dim3 block(kNumThreads, 1, 1);
-  // Grid dispatch: dense works are long (Tc tiles each) and benefit from
-  // the persistent loop (pipeline overlap across works); causal works
-  // average half the tiles with many short ones, where the per-work
-  // epilogue_done -> Q TMA round trip dominates, so give each work its
-  // own CTA and let the HW scheduler load-balance instead.
+  // Grid dispatch - NOT two kernel variants: the kernel's strided work loop
+  // degenerates to one iteration per CTA when gridDim.x == total_work (see
+  // the scheduling contract comment in fp4/sm_120/persist_d.cuh). Dense
+  // works are long (Tc tiles each) and benefit from the persistent grid
+  // (pipeline overlap across works); causal works average half the tiles
+  // with many short ones, where the per-work epilogue_done -> Q TMA round
+  // trip dominates, so give each work its own CTA and let the HW scheduler
+  // load-balance instead.
   const int mb = (Nq - q_start_row + kBr - 1) / kBr;
   const int total_work = mb * Nb * Nh;
   const int num_ctas =

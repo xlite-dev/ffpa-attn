@@ -252,14 +252,38 @@ CUTE_DEVICE void lse_qkm_dot(const SmemQTensor& sQ, const SfQTensor& sSFQ,
     qkm[row] += c;
 }
 
-// NVFP4 persist-D forward, persistent grid: (min(total_work, num_SMs), 1),
-// strided work loop work_id = blockIdx.x + i * gridDim.x over
-// total_work = Mb * Nb *Nh (bh-outer / Q-tile-inner decomposition). Workspaces
-// are 128-padded along seqlen; TMA descriptors are built on the padded flat
-// row spaces (Q/K/V^T) and on the SF atom-layout tensors (SFQ/SFK/SFVt) and
-// the (B,H,Mb,Nkv_pad) delta_s tensor (DS). lse (natural log, with the
-// smooth-K correction) is written when softmax_lse != nullptr; km/qm may be
-// null to skip the correction.
+// NVFP4 persist-D forward. Grid-scheduling contract (ONE kernel, ONE code
+// path): the body is a strided work loop
+//     for (work_id = blockIdx.x; work_id < total_work; work_id += gridDim.x)
+// over total_work = Mb * Nb * Nh works (bh-outer / Q-tile-inner), so the
+// runtime grid alone selects the execution style - there is no separate
+// persistent vs non-persistent kernel variant:
+//   * persistent:   gridDim.x = min(total_work, num_SMs). Each CTA stays
+//     resident on its SM and iterates the loop ~total_work/gridDim.x times.
+//     The producer can prefetch the next work's K/V while the consumer runs
+//     the current epilogue, so pipeline fill/drain amortize once per CTA
+//     instead of once per work. Best for dense shapes (every work runs the
+//     full Tc KV tiles; the per-work epilogue_done -> Q TMA round trip is
+//     hidden behind a long KV loop).
+//   * non-persistent (classic block-per-work): gridDim.x = total_work. The
+//     loop runs exactly one iteration per CTA, which is the classic
+//     warp-specialized shape - HW scheduler load-balances, and short works
+//     finish early to free SMs. Chosen for causal shapes where most works
+//     have Tc_eff << Tc: the fixed per-work cost (Q TMA wait on
+//     epilogue_done + epilogue store drain) would dominate under a
+//     persistent grid.
+// The barrier protocol below is valid for ANY gridDim.x: a per-CTA global
+// kv-tile counter drives every mbarrier's stage/phase across works (never
+// re-initialized - re-init on a live mbarrier is UB, PTX ISA 9.7.13.15.9),
+// so the non-persistent launch is just the degenerate case where each
+// barrier flips only its first phases. The grid choice lives in
+// cute/launch.cuh (causal ? total_work : min(total_work, SMs)).
+//
+// Workspaces are 128-padded along seqlen; TMA descriptors are built on the
+// padded flat row spaces (Q/K/V^T) and on the SF atom-layout tensors
+// (SFQ/SFK/SFVt) and the (B,H,Mb,Nkv_pad) delta_s tensor (DS). lse (natural
+// log, with the smooth-K correction) is written when softmax_lse != nullptr;
+// km/qm may be null to skip the correction.
 template <typename Traits, typename ElementO, typename TmaQ, typename TmaK,
           typename TmaV, typename TmaO, typename TmaSFQ, typename TmaSFK,
           typename TmaSFVt, typename TmaDS>
