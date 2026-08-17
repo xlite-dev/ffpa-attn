@@ -145,6 +145,10 @@ struct SoftmaxFused {
       for (int mi = 0; mi < size<0>(acc_reduction_view); mi++) {
         CUTE_UNROLL
         for (int ni = 0; ni < size<1, 1>(acc_reduction_view); ni++) {
+          // AbsMaxP is a register fragment reused across kv tiles (and,
+          // in the persistent kernel, across works): start the reduction
+          // from -inf, not from its stale contents.
+          AbsMaxP(mi, ni) = -INFINITY;
           CUTE_UNROLL
           for (int ei = 0; ei < size<1, 0>(acc_reduction_view); ei++) {
             AbsMaxP(mi, ni) = fmaxf(AbsMaxP(mi, ni),
