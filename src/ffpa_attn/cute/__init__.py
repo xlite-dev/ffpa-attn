@@ -1,14 +1,20 @@
-"""CuTeDSL FFPA backend with SM8x Split-D and SM90 specialised paths.
+"""CuTeDSL FFPA backend with SM8x Split-D, SM90 and SM100 specialised paths.
 
 Exposes the dense and varlen CuTeDSL entry shims used by
 :mod:`ffpa_attn.ffpa_attn_interface` and :mod:`ffpa_attn.functional`.
 
+Routing is three-way (:func:`_forward_impl_for_device` /
+:func:`_backward_impl_for_device`): the dedicated SM100 D512 path at compute
+capability exactly 10.0, the SM90 specialised path on Hopper, and the SM80
+Split-D implementation as the cross-architecture fallback.
+
 The CuTeDSL kernels in :mod:`ffpa_attn.cute._ffpa_fwd_sm80`,
-:mod:`ffpa_attn.cute._ffpa_fwd_sm90`, and their backward launchers operate on the
-``[B, N, H, D]`` (or packed ``[T, H, D]``) layout. The SDPA-style
-``[B, H, N, D]`` wrappers (:func:`_ffpa_attn_forward_cute`,
-:func:`_ffpa_attn_backward_cute`, :func:`_ffpa_attn_varlen_cute`)
-handle layout conversion and dispatch through the registered torch ops below.
+:mod:`ffpa_attn.cute._ffpa_fwd_sm90`, :mod:`ffpa_attn.cute._ffpa_fwd_sm100`,
+and their backward launchers operate on the ``[B, N, H, D]`` (or packed
+``[T, H, D]``) layout. The SDPA-style ``[B, H, N, D]`` wrappers
+(:func:`_ffpa_attn_forward_cute`, :func:`_ffpa_attn_backward_cute`,
+:func:`_ffpa_attn_varlen_cute`) handle layout conversion and dispatch through
+the registered torch ops below.
 
 Dense-path ops ``ffpa_attn::_fwd_cute`` / ``ffpa_attn::_bwd_cute``
 and varlen-path ops ``ffpa_attn::_varlen_fwd_cute`` /
@@ -29,6 +35,9 @@ from ._utils import (
   SM80_FWD_SPLIT_D_CHUNK,
   SM80_SUPPORTED_HEAD_DIM,
   SM90_SUPPORTED_HEAD_DIM,
+  SM100_D512_HEAD_DIM,
+  SM100_D512_MAJOR,
+  SM100_D512_MINOR,
   _decode_custom_op_window,
   _encode_optional_int_for_custom_op,
   _validate_max_seqlen_for_cu_seqlens,
@@ -42,8 +51,13 @@ from ._utils import (
 )
 from ._ffpa_fwd_sm80 import _ffpa_attn_forward_sm80
 from ._ffpa_fwd_sm90 import _ffpa_attn_forward_sm90
+from ._ffpa_fwd_sm100 import (
+  _ffpa_attn_forward_sm100,
+  sm100_d512_allocates_bhnd_out,
+)
 from ._ffpa_bwd_sm80 import _ffpa_attn_backward_sm80
 from ._ffpa_bwd_sm90 import _ffpa_attn_backward_sm90
+from ._ffpa_bwd_sm100 import _ffpa_attn_backward_sm100
 
 __all__ = [
   "_ffpa_attn_forward_cute",
@@ -128,10 +142,11 @@ def _check_supported_options(
 def cute_forward_available(device: Optional[torch.device] = None) -> bool:
   """Return whether the CuTeDSL forward kernel can run on ``device``.
 
-  CuTeDSL forward supports SM90 through the existing Hopper specialised path
-  for ``head_dim <= 512`` and falls back to the SM80 Ampere Split-D path for
-  every other supported architecture (SM80/SM89, SM100/SM103/SM120, ...) and
-  for any ``head_dim > 512``. Other backend constraints (head_dim ceiling,
+  CuTeDSL forward takes the dedicated Blackwell path at compute capability
+  exactly 10.0 with ``head_dim == head_dim_v == 512``, the Hopper specialised
+  path on SM90 for ``head_dim <= 512``, and the SM80 Ampere Split-D path for
+  every other supported architecture (SM80/SM89, SM103/SM120, ...) and for any
+  ``head_dim > 512``. Other backend constraints (head_dim ceiling,
   dtype, no mask/dropout) are enforced per-call by
   :func:`_require_cute_supported`; this only checks the device-level
   prerequisite so callers can pre-select a backend before allocating tensors.
@@ -163,10 +178,12 @@ def cute_max_supported_head_dim(device: Optional[torch.device] = None) -> int:
 def cute_backward_available(device: Optional[torch.device] = None) -> bool:
   """Whether the CuTeDSL backward kernel can run on ``device``.
 
-  Mirrors :func:`cute_forward_available`: SM90 keeps the existing Hopper
-  specialised backward for ``head_dim <= 512``; every other supported
-  architecture (SM80/SM89, SM100/SM103/SM120, ...) and every
-  ``head_dim > 512`` uses the SM80 Ampere Split-D backward as a fallback.
+  Mirrors :func:`cute_forward_available`, and the routing it mirrors is the
+  same predicate the forward uses: compute capability exactly 10.0 with
+  ``head_dim == head_dim_v == 512`` takes the dedicated Blackwell backward,
+  SM90 keeps the existing Hopper specialised backward for ``head_dim <= 512``,
+  and every other supported architecture (SM80/SM89, SM103/SM120, ...) and
+  every ``head_dim > 512`` uses the SM80 Ampere Split-D backward as a fallback.
   """
   if not torch.cuda.is_available():
     return False
@@ -178,11 +195,20 @@ def cute_backward_available(device: Optional[torch.device] = None) -> bool:
   return major >= 8
 
 
-def _cute_device_major(device: torch.device) -> int:
+def _cute_device_capability(device: torch.device) -> tuple[int, int]:
+  """Return ``(major, minor)`` for ``device``, or the SM90 default.
+
+  Kept as one helper because the SM100 routing predicate needs the *minor*
+  as well: the dedicated D512 path claims compute capability 10.0 exactly,
+  not the whole Blackwell family.
+  """
   if device.type == "cuda" and torch.cuda.is_available():
-    major, _ = torch.cuda.get_device_capability(device)
-    return major
-  return 9
+    return torch.cuda.get_device_capability(device)
+  return 9, 0
+
+
+def _cute_device_major(device: torch.device) -> int:
+  return _cute_device_capability(device)[0]
 
 
 def _use_sm90_specialized(major: int, head_dim: int, head_dim_v: int) -> bool:
@@ -200,14 +226,34 @@ def _use_sm90_specialized(major: int, head_dim: int, head_dim_v: int) -> bool:
   )
 
 
+def _use_sm100_d512_specialized(
+  major: int, minor: int, head_dim: int, head_dim_v: int
+) -> bool:
+  """Return ``True`` when the SM100 dedicated D512 forward should be used.
+
+  An exact specialisation, not a range. The kernel emits ``tcgen05`` MMA
+  with ``CtaGroup.TWO``, TMEM accumulators, and a cluster-scoped TMEM
+  deallocation protocol built for a ``(2, 1, 1)`` cluster on ``sm100a``;
+  none of that carries to another Blackwell minor without its own evidence.
+  So SM103/SM110/SM120, and every head_dim other than exactly 512, keep
+  using the SM80 Split-D fallback.
+  """
+  return (
+    major == SM100_D512_MAJOR and minor == SM100_D512_MINOR
+    and head_dim == SM100_D512_HEAD_DIM and head_dim_v == SM100_D512_HEAD_DIM
+  )
+
+
 def _forward_impl_for_device(
   device: torch.device, head_dim: int, head_dim_v: int
 ):
-  major = _cute_device_major(device)
+  major, minor = _cute_device_capability(device)
   if major < 8:
     raise NotImplementedError(
       f"cutedsl forward requires compute capability >= 8.0; got {major}.x"
     )
+  if _use_sm100_d512_specialized(major, minor, head_dim, head_dim_v):
+    return _ffpa_attn_forward_sm100
   if _use_sm90_specialized(major, head_dim, head_dim_v):
     return _ffpa_attn_forward_sm90
   return _ffpa_attn_forward_sm80
@@ -216,11 +262,21 @@ def _forward_impl_for_device(
 def _backward_impl_for_device(
   device: torch.device, head_dim: int, head_dim_v: int
 ):
-  major = _cute_device_major(device)
+  # Reads the *minor* as well, like the forward, because the SM100 D512 path
+  # is an exact specialisation for compute capability 10.0. Selecting on the
+  # major alone would hand SM103/SM110 a kernel built for sm100a's cluster and
+  # TMEM protocol.
+  major, minor = _cute_device_capability(device)
   if major < 8:
     raise NotImplementedError(
       f"cutedsl backward requires compute capability >= 8.0; got {major}.x"
     )
+  # Forward and backward must agree: ``_use_sm100_d512_specialized`` is the one
+  # predicate both consult, so a device or head-dim that takes the dedicated
+  # forward cannot silently take the SM80 Split-D backward, which uses a
+  # different causal alignment for asymmetric sequence lengths.
+  if _use_sm100_d512_specialized(major, minor, head_dim, head_dim_v):
+    return _ffpa_attn_backward_sm100
   if _use_sm90_specialized(major, head_dim, head_dim_v):
     return _ffpa_attn_backward_sm90
   return _ffpa_attn_backward_sm80
@@ -290,8 +346,17 @@ def _require_cute_supported(
 
 
 def _bhnd_to_bnhd(t: torch.Tensor) -> torch.Tensor:
-  """Reshape ``[B, H, N, D]`` (SDPA) to the CuTeDSL-native ``[B, N, H, D]`` (FA)."""
-  return t.transpose(1, 2).contiguous()
+  """View ``[B, H, N, D]`` (SDPA) as the CuTeDSL-native ``[B, N, H, D]`` (FA).
+
+  A re-view, not a copy.  The two layouts name the same logical tensor and
+  differ only in stride, so materialising here would be an allocation policy
+  imposed on every launcher rather than part of the layout contract.  Each
+  launcher instead normalises at its own entry: the SM80 Split-D and SM90
+  Hopper forwards and every backward call ``maybe_contiguous`` and produce
+  exactly the copy this function used to make, while the SM100 D512
+  specialisation is stride-driven and consumes the view directly.
+  """
+  return t.transpose(1, 2)
 
 
 def _bnhd_to_bhnd(t: torch.Tensor) -> torch.Tensor:
@@ -531,24 +596,24 @@ def _fwd_cute_torch_op(
   causal: int,
   return_lse: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-  batch, seqlen_q, num_head, head_dim_v = q.shape
-  o = torch.empty(
-    batch, seqlen_q, num_head, head_dim_v, dtype=q.dtype, device=q.device
-  )
+  batch, seqlen_q, num_head, _ = q.shape
   need_lse = bool(return_lse)
   lse = (
     torch.empty(
       batch, num_head, seqlen_q, dtype=torch.float32, device=q.device
     ) if need_lse else torch.empty(0, device=q.device)
   )
-  _forward_impl_for_device(q.device, q.size(-1), v.size(-1))(
+  # ``out=None``: the selected launcher owns the O allocation, because only it
+  # knows which storage order its epilogue can write.  Pre-allocating here
+  # would force one order on all three architectures.
+  o, _ = _forward_impl_for_device(q.device, q.size(-1), v.size(-1))(
     q,
     k,
     v,
     softmax_scale=softmax_scale,
     causal=bool(causal),
     return_lse=need_lse,
-    out=o,
+    out=None,
     lse=lse if need_lse else None,
   )
   return o, lse
@@ -563,7 +628,18 @@ def _fwd_cute_fake(
   causal: int,
   return_lse: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-  o = torch.empty_like(q)
+  batch, seqlen_q, num_head, head_dim_v = q.shape
+  # Mirror the launcher's O storage order, not just its shape: the SM100 D512
+  # specialisation allocates ``[B, H, N, D]`` and returns its ``[B, N, H, D]``
+  # view, every other path allocates ``[B, N, H, D]`` directly, and a
+  # ``torch.compile`` consumer reads the real buffer with whatever strides
+  # this fake declared.
+  if _forward_impl_for_device(
+    q.device, q.size(-1), v.size(-1)
+  ) is _ffpa_attn_forward_sm100 and sm100_d512_allocates_bhnd_out(q, k, v):
+    o = q.new_empty((batch, num_head, seqlen_q, head_dim_v)).transpose(1, 2)
+  else:
+    o = q.new_empty((batch, seqlen_q, num_head, head_dim_v))
   lse = (
     q.new_empty(q.size(0), q.size(-2), q.size(-3), dtype=torch.float32)
     if return_lse else q.new_empty(0)
@@ -625,12 +701,21 @@ def _bwd_cute_torch_op(
   storage_dtype = _grad_kv_storage_dtype_from_code(grad_kv_storage_dtype_code)
   backward_impl = _backward_impl_for_device(q.device, q.size(-1), v.size(-1))
   if storage_dtype is not None and backward_impl is not _ffpa_attn_backward_sm80:
+    # The override widens the dK/dV *output buffer* so the generic SM80 dKdV
+    # path, which accumulates across tiles through HBM, does not lose bits to
+    # a bf16 round trip on every partial. Neither specialised path works that
+    # way -- SM90 accumulates in registers and SM100 in TMEM, converting once
+    # in the epilogue -- so their kernels only ever store the activation dtype,
+    # and the precision the override buys does not exist for them to give.
+    # Rejected rather than accepted-and-ignored: an option that reports success
+    # while doing nothing is worse than one that says it does not apply.
     raise NotImplementedError(
       "grad_kv_storage_dtype is only supported by the generic SM80 CuTeDSL "
-      "dKdV backward path; the SM90-specialised kernel does not accept a "
-      f"dK/dV storage-dtype override (head_dim={q.size(-1)}, "
-      f"head_dim_v={v.size(-1)}, device_major="
-      f"{torch.cuda.get_device_capability(q.device)[0]})."
+      "dKdV backward path. The specialised SM90 and SM100 D512 kernels store "
+      "dK/dV in the activation dtype and accumulate in registers/TMEM, so "
+      "they neither accept nor need a storage-dtype override "
+      f"(head_dim={q.size(-1)}, head_dim_v={v.size(-1)}, device_capability="
+      f"{torch.cuda.get_device_capability(q.device)})."
     )
   dq = torch.empty_like(q)
   if storage_dtype is None:
@@ -1016,10 +1101,14 @@ def _ffpa_attn_varlen_impl(
   aux_tensors: Optional[list] = None,
   return_lse: bool = False,
 ):
-  """Varlen SplitD FFPA attention for D=512 on SM90.
+  """Packed-varlen FFPA attention, routed by the same three-way dispatch.
 
-  q/k/v must be packed as (total_tokens, heads, 512). Training supports fp16
-  and bf16 q/k/v, valid CUDA int32 cu_seqlens, and explicit max_seqlen_q/k
+  Architecture selection is :func:`_forward_impl_for_device`, so a packed call
+  reaches the dedicated SM100 D512 path, the SM90 specialised path, or the
+  SM80 Split-D fallback on exactly the rules the dense path uses.
+
+  q/k/v must be packed as (total_tokens, heads, head_dim). Training supports
+  fp16 and bf16 q/k/v, valid CUDA int32 cu_seqlens, and explicit max_seqlen_q/k
   whenever the corresponding cu_seqlens tensor is provided. If return_lse=False,
   LSE is still computed internally when needed for backward.
   """

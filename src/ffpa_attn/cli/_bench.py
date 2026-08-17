@@ -8,8 +8,9 @@ Usage::
   CUDA_VISIBLE_DEVICES=0 python -m ffpa_attn.bench --fwd-backend triton --bwd-backend triton --tune fast
   CUDA_VISIBLE_DEVICES=0 python -m ffpa_attn.bench --fwd-backend cutedsl --bwd-backend cutedsl
 
-The cutedsl backend supports SM80/SM89 via the Split-D path and SM90 via the
-Hopper path. Selecting
+The cutedsl backend supports SM80/SM89 via the Split-D path, SM90 via the
+Hopper path, and SM100 at ``D == 512`` via the dedicated Blackwell 2-CTA
+``tcgen05`` path. Selecting
 ``cutedsl`` on either ``--fwd-backend`` or ``--bwd-backend`` auto-pairs the
 other side and restricts tasks to the cutedsl-compatible subset
 (self-attn, cross-attn, gqa, causal).
@@ -709,13 +710,13 @@ def _require_cute_device() -> int:
 
   if not torch.cuda.is_available():
     raise SystemExit(
-      "CUDA is required: the CuTeDSL backend only runs on SM80/SM89/SM90 GPUs."
+      "CUDA is required: the CuTeDSL backend only runs on SM80 and newer GPUs."
     )
   device = torch.device("cuda", torch.cuda.current_device())
   if not cute_forward_available(device):
     major, minor = torch.cuda.get_device_capability(device)
     raise SystemExit(
-      f"CuTeDSL backend requires SM80/SM89/SM90. Detected device "
+      f"CuTeDSL backend requires SM80 or newer. Detected device "
       f"'{torch.cuda.get_device_name(device)}' with compute capability {major}.{minor}."
     )
   return cute_max_supported_head_dim(device)

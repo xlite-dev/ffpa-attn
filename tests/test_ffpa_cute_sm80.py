@@ -135,9 +135,28 @@ def test_sm80_cutedsl_dense_autograd_matches_sdpa(D):
 def test_sm80_cutedsl_dkdv_fp32_buffer_matches_sdpa(causal):
   """CuTeDSL SM80 dKdV with grad_kv_storage_dtype=fp32 must keep public
   gradient dtype = bf16 and improve dK/dV cross-tile precision under
-  causal bf16 vs the default activation-dtype buffer."""
-  torch.manual_seed(7)
+  causal bf16 vs the default activation-dtype buffer.
+
+  The override is an SM80-path property -- it widens the output buffer so that
+  path's HBM cross-tile accumulation does not lose bits -- so this asserts the
+  dispatcher actually selects that path instead of assuming D=512 reaches it.
+  On a device with a specialised D512 backward (sm90, or sm100a since the SM100
+  D512 port) the option is rejected by design, and there is nothing here to
+  measure.
+  """
+  from ffpa_attn.cute import (
+    _backward_impl_for_device,
+    _ffpa_attn_backward_sm80,
+  )
   B, H, N, D = 1, 4, 256, 512
+  if _backward_impl_for_device(
+    torch.device("cuda", torch.cuda.current_device()), D, D
+  ) is not _ffpa_attn_backward_sm80:
+    pytest.skip(
+      "this device routes D=512 to a specialised backward, which does not "
+      "take a dK/dV storage-dtype override"
+    )
+  torch.manual_seed(7)
   dtype = torch.bfloat16
   scale = 1.0 / math.sqrt(D)
   q0 = torch.randn(B, H, N, D, dtype=dtype, device="cuda")

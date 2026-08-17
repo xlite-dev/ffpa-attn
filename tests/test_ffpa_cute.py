@@ -306,10 +306,17 @@ def test_cutedsl_autograd_nonaligned_matches_sdpa(is_causal, N):
   the oracle masks cutedsl's actual (correct) behavior. SDPA is the documented
   semantic target of ``ffpa_attn_func`` anyway.
 
-  For the causal bf16 case we explicitly configure ``grad_kv_storage_dtype`` to
-  ``fp32`` via ``CuTeDSLBackend``. This is a known dV precision workaround for
-  the SM80-style backward path and keeps the regression focused on semantic
-  correctness rather than bf16 HBM round-trip noise in dK/dV accumulation.
+  For the causal bf16 case we configure ``grad_kv_storage_dtype`` to ``fp32``
+  via ``CuTeDSLBackend`` *when the generic SM80 dKdV path is the one that will
+  run*. That is a known dV precision workaround for the SM80 path, which
+  accumulates across tiles through HBM; it keeps the regression focused on
+  semantic correctness rather than bf16 round-trip noise.
+
+  The specialised D512 kernels (SM90, and SM100 on ``sm100a``) accumulate in
+  registers/TMEM and convert once in the epilogue, so they neither accept nor
+  need the override -- and they meet the same tolerance without it. The
+  dispatcher is asked which one applies rather than inferred from the device,
+  so this test keeps working as the routing changes.
   """
   B, H, D = 1, 4, 512
 
@@ -333,9 +340,16 @@ def test_cutedsl_autograd_nonaligned_matches_sdpa(is_causal, N):
 
   torch.manual_seed(42)
   q_c, k_c, v_c = make()
+  from ffpa_attn.cute import (
+    _backward_impl_for_device,
+    _ffpa_attn_backward_sm80,
+  )
+  generic_sm80_bwd = _backward_impl_for_device(
+    torch.device("cuda", torch.cuda.current_device()), D, D
+  ) is _ffpa_attn_backward_sm80
   backward_backend = (
     CuTeDSLBackend(backward=True, grad_kv_storage_dtype="fp32")
-    if is_causal else None
+    if is_causal and generic_sm80_bwd else None
   )
   out_c = ffpa_attn_func(
     q_c,

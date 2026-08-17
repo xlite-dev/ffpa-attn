@@ -1,7 +1,7 @@
 """Shared utilities for FFPA cute SplitD forward and backward paths.
 
 Constants, validation helpers, tensor utilities, and optional-int encoding used
-by both SM90 and SM80/SM89 CuTeDSL paths (and also imported by
+by both SM90/SM100 and SM80/SM89 CuTeDSL paths (and also imported by
 :mod:`cute.__init__` for the torch custom op entry points).
 """
 
@@ -11,6 +11,7 @@ from typing import Optional, Tuple, Callable
 
 import torch
 from torch._guards import active_fake_mode
+from torch._subclasses.fake_tensor import FakeTensor
 import tvm_ffi
 
 import cutlass
@@ -27,6 +28,25 @@ SM90_FWD_TILE_M = 64
 SM90_FWD_TILE_N = 128
 SM90_BWD_TILE_M = 64
 SM90_BWD_TILE_N = 64
+
+# SM100 (Blackwell) ENVIRONMENT VARIABLES
+# The dedicated SM100 forward is an *exact* specialisation, not a range: it
+# only claims head_dim == head_dim_v == 512 on compute capability 10.0
+# (sm100a).  SM103/SM110/SM120 and every other head_dim stay on the
+# documented SM80 Split-D fallback until that combination has its own
+# target-device evidence.
+SM100_D512_HEAD_DIM = 512
+SM100_D512_MAJOR = 10
+SM100_D512_MINOR = 0
+SM100_D512_ARCH = SM100_D512_MAJOR * 10 + SM100_D512_MINOR
+# Q-direction tile shared by the three SM100 D512 backward kernels.  It also
+# sizes the padded statistics buffers, so the wrapper and the kernels must
+# agree on it (asserted by tests/test_ffpa_cute_sm100.py).
+SM100_BWD_TILE_M = 64
+# K-direction tile per CTA: dV and dK carry 64 (the 2-CTA pair covers 128);
+# dQ's QK tiler is 128 wide.
+SM100_BWD_TILE_N_DKDV = 64
+SM100_BWD_TILE_N_DQ = 128
 
 # SM80/SM89 ENVIRONMENT VARIABLES
 SM80_SUPPORTED_HEAD_DIM = 1024
@@ -156,6 +176,27 @@ def maybe_contiguous(x):
   return x.contiguous() if x is not None and not x.is_contiguous() else x
 
 
+def _needs_dense_copy(t: torch.Tensor) -> bool:
+  """Whether ``t`` must be copied dense before launching: exactly the three
+  facts baked into codegen are checked -- static unit trailing stride,
+  128-bit-aligned leading strides, 16-byte base pointer.  A violation is
+  silently wrong, not slow; the SDPA ``[B, H, N, D]`` layout passes all three
+  as a ``[B, N, H, D]`` view, so it reaches the kernel copy-free.
+
+  Shared by the SM100 D512 forward and backward wrappers so the three facts
+  have one definition.  Not a general replacement for ``maybe_contiguous``:
+  it answers "can codegen consume this?", and a ``True`` answer is only
+  repairable by ``.contiguous()`` when the tensor is not already contiguous.
+
+  A fake tensor's address is synthetic and says nothing about the real
+  allocation, so only the two stride facts are tested during tracing --
+  ``FakeTensor.data_ptr()`` is deprecated and warns."""
+  align = 128 // (t.element_size() * 8)
+  if t.stride(-1) != 1 or any(s % align for s in t.stride()[:-1]):
+    return True
+  return not isinstance(t, FakeTensor) and t.data_ptr() % 16 != 0
+
+
 def _call_with_tvm_ffi_current_stream(fn, *args, device: torch.device):
   """Run a TVM FFI launch on PyTorch's current CUDA stream for the tensor device."""
   if is_fake_mode() or device.type != "cuda":
@@ -218,6 +259,34 @@ def _validate_sm90_arch() -> tuple[int, str]:
     raise RuntimeError(
       "This SplitD D=512 path emits Hopper SM90a instructions such as WGMMA, TMA, "
       f"and setmaxnreg. CuTeDSL selected {cute_arch}, but Arch.sm_90a or newer is required."
+    )
+  return arch, _cute_arch_cache_key(cute_arch)
+
+
+def _validate_sm100_arch() -> tuple[int, str]:
+  """Validate that the active device and CuTeDSL target are ``sm100a``.
+
+  The D512 SM100 specialisation emits Blackwell-only ``tcgen05`` MMA with
+  ``CtaGroup.TWO``, TMEM accumulators, and a cluster-scoped TMEM
+  deallocation protocol.  None of that is forward- or backward-compatible
+  across Blackwell minors, so this gate is an equality test on compute
+  capability 10.0 rather than a ``>=`` range: SM103 and newer reach the
+  documented SM80 Split-D fallback until they have their own evidence.
+  """
+  arch = _get_device_arch()
+  if arch != SM100_D512_ARCH:
+    raise RuntimeError(
+      f"This SM100 D=512 interface requires compute capability "
+      f"{SM100_D512_MAJOR}.{SM100_D512_MINOR} (sm100a), got {arch}. "
+      "Falls back to the generic FFPA dispatcher for other architectures."
+    )
+  cute_arch = BaseDSL._get_dsl().get_arch_enum()
+  if cute_arch < Arch.sm_100a:
+    raise RuntimeError(
+      "This SM100 D=512 path emits Blackwell sm100a instructions such as "
+      "tcgen05 MMA with CtaGroup.TWO, TMEM allocation, and 2-CTA cluster "
+      f"barriers. CuTeDSL selected {cute_arch}, but Arch.sm_100a or newer "
+      "is required."
     )
   return arch, _cute_arch_cache_key(cute_arch)
 
