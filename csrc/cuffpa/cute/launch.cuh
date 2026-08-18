@@ -1595,7 +1595,7 @@ void launch_cute_fwd_persist_d_fp4_sm120_impl(torch::Tensor Q, torch::Tensor K,
 
   using ElementO = std::conditional_t<std::is_same_v<kDataType, __half>,
                                       cutlass::half_t, cutlass::bfloat16_t>;
-  using Traits = ffpa_fp4::Fp4PersistDTraits<ElementO>;
+  using Traits = ffpa_fp4::Fp4PersistDTraits<ElementO, kHeadDim>;
   using Element = typename Traits::Element;
   using ElementSF = typename Traits::ElementSF;
   auto prop = at::cuda::getCurrentDeviceProperties();
@@ -1661,13 +1661,13 @@ void launch_cute_fwd_persist_d_fp4_sm120_impl(torch::Tensor Q, torch::Tensor K,
   auto Q_t = Q.transpose(1, 2);
   auto K_t = K.transpose(1, 2);
   auto V_t = V.transpose(1, 2);
-  ffpa_fp4::launch_fp4_q_block_mean_sm120(Q_t, qm);
-  ffpa_fp4::launch_fp4_quant_q_sm120(Q_t, q4, sfq, qm, Nq_pad,
-                                     /*sub_qm=*/true);
-  ffpa_fp4::launch_fp4_quant_k_sm120(K_t, k4, sfk,
-                                     km_f32.view({Nb, Nh_kv, kHeadDim}),
-                                     Nkv_pad, /*sub_km=*/true);
-  ffpa_fp4::launch_fp4_quant_vt_sm120(V_t, vt4, sfvt, Nkv_pad);
+  ffpa_fp4::launch_fp4_q_block_mean_sm120<kHeadDim>(Q_t, qm);
+  ffpa_fp4::launch_fp4_quant_q_sm120<kHeadDim>(Q_t, q4, sfq, qm, Nq_pad,
+                                               /*sub_qm=*/true);
+  ffpa_fp4::launch_fp4_quant_k_sm120<kHeadDim>(
+      K_t, k4, sfk, km_f32.view({Nb, Nh_kv, kHeadDim}), Nkv_pad,
+      /*sub_km=*/true);
+  ffpa_fp4::launch_fp4_quant_vt_sm120<kHeadDim>(V_t, vt4, sfvt, Nkv_pad);
 
   // delta_s per 128-row Q block via the identity qm@(K-km)^T - qm.km^T ==
   // qm@K^T - 2*qm.km^T, fused in one wmma kernel (fp32 out, tail columns
@@ -1679,7 +1679,7 @@ void launch_cute_fwd_persist_d_fp4_sm120_impl(torch::Tensor Q, torch::Tensor K,
                    .reshape({Nb, Nh, Mb});
     delta_s = torch::empty({Nb, Nh, Mb, Nkv_pad}, opts_f32);
     TORCH_CHECK(K.is_contiguous(), "ffpa_attn: fp4 path requires contiguous K");
-    ffpa_fp4::launch_fp4_delta_s_sm120<kDataType>(
+    ffpa_fp4::launch_fp4_delta_s_sm120<kDataType, kHeadDim>(
         reinterpret_cast<const kDataType*>(qm_h.data_ptr()), k_ptr,
         reinterpret_cast<const kDataType*>(qkm.data_ptr()),
         delta_s.data_ptr<float>(), Nb, Nh, Nh_kv, Mb, Nkv, Nkv_pad, stream);
@@ -1746,6 +1746,14 @@ void launch_cute_fwd_persist_d_fp4_sm120_impl(torch::Tensor Q, torch::Tensor K,
               "ffpa_attn: q_start_row must be in [0, Nq)");
   TORCH_CHECK(q_start_row % kBr == 0,
               "ffpa_attn: q_start_row must be a multiple of kBr=128");
+  // Exceeding the smem opt-in limit fails SILENTLY in cudaFuncSetAttribute
+  // (score collapses to zero); check both up front (see sm120-smem-limit).
+  int max_smem_optin = 0;
+  cudaDeviceGetAttribute(
+      &max_smem_optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, Q.get_device());
+  TORCH_CHECK(kSmemBytes <= max_smem_optin,
+              "ffpa_attn: fp4 persist_d D=", kHeadDim, " needs ", kSmemBytes,
+              "B smem, device opt-in allows ", max_smem_optin);
   float* softmax_lse_ptr =
       softmax_lse.numel() > 0 ? softmax_lse.data_ptr<float>() : nullptr;
   auto O_ptr = reinterpret_cast<ElementO*>(O.data_ptr());
@@ -1767,8 +1775,10 @@ void launch_cute_fwd_persist_d_fp4_sm120_impl(torch::Tensor Q, torch::Tensor K,
       Traits, ElementO, decltype(tma_q), decltype(tma_k), decltype(tma_v),
       decltype(tma_o), decltype(tma_sfq), decltype(tma_sfk), decltype(tma_sfvt),
       decltype(tma_ds)>;
-  cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                       kSmemBytes);
+  TORCH_CHECK(
+      cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                           kSmemBytes) == cudaSuccess,
+      "ffpa_attn: fp4 persist_d smem opt-in failed for D=", kHeadDim);
   kernel<<<grid, block, kSmemBytes, stream>>>(
       tma_q, tma_k, tma_v, tma_o, tma_sfq, tma_sfk, tma_sfvt, tma_ds, O_ptr,
       softmax_lse_ptr, km_f32.data_ptr<float>(), qm.data_ptr<float>(), Nq, Nkv,
@@ -1782,18 +1792,19 @@ void launch_cute_fwd_persist_d_fp4_sm120(torch::Tensor Q, torch::Tensor K,
                                          torch::Tensor softmax_lse, int causal,
                                          double softmax_scale,
                                          int q_start_row = 0) {
-  (void)kStage;  // kStages=3 fixed by the fp4 traits
+  (void)kStage;  // kStages (3, or 2 at D=256) fixed by the fp4 traits
   auto prop = at::cuda::getCurrentDeviceProperties();
   TORCH_CHECK(prop->major == 12,
               "ffpa_attn: the NVFP4 path requires an sm_120 device, got sm_",
               prop->major, prop->minor);
-  if constexpr (kHeadDim == 128) {
+  if constexpr (kHeadDim % 64 == 0 && kHeadDim >= 64 && kHeadDim <= 256) {
     launch_cute_fwd_persist_d_fp4_sm120_impl<kDataType, kHeadDim>(
         Q, K, V, O, softmax_lse, causal, softmax_scale, q_start_row);
   } else {
-    TORCH_CHECK(
-        false,
-        "ffpa_attn: cute_tma_fp4 persist_d requires D=128, got D=", kHeadDim);
+    TORCH_CHECK(false,
+                "ffpa_attn: cute_tma_fp4 persist_d requires D in "
+                "{64,128,192,256} (64-multiples), got D=",
+                kHeadDim);
   }
 }
 #endif  // ENABLE_FFPA_TMA_EXT

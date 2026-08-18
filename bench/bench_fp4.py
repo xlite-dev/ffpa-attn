@@ -293,7 +293,12 @@ def parse_args():
   p.add_argument("--B", type=int, default=1, help="Batch size")
   p.add_argument("--H", type=int, default=32, help="Query heads")
   p.add_argument("--Hkv", type=int, default=8, help="KV heads (GQA)")
-  p.add_argument("--D", type=int, default=128, help="Head dim (fp4: 128)")
+  p.add_argument(
+    "--D",
+    type=int,
+    default=128,
+    help="Head dim (fp4: 64-multiples in {64,128,192,256})"
+  )
   p.add_argument(
     "--dtype",
     type=str,

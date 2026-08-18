@@ -73,6 +73,9 @@ struct Fp4PackedVec {
 // Q / K quantization: (B,S,H,D) strided fp16/bf16 -> packed e2m1 (B,H,N,D/2)
 // + SF (B,H,N,D/16) in the MMA atom layout. kPermute selects the K row
 // permutation; kSubQm / kSubKm select bias subtraction before quantization.
+// Mapping: 4 threads per token, each owning a 64-element slice (one SF
+// 4-col block) split into kHeadDim/64 16-element PackedVecs, so any
+// 64-multiple D maps onto 512 threads = 128 tokens per block.
 template <typename T, int kHeadDim, bool kPermute, bool kSubQm, bool kSubKm>
 __global__ void fp4_quant_kernel(
     const T* __restrict__ input, uint8_t* __restrict__ output,
@@ -84,18 +87,21 @@ __global__ void fp4_quant_kernel(
     const float* __restrict__ km, int km_stride_b, int km_stride_h) {
   using PackedVec = Fp4PackedVec<T>;
   constexpr int kBlock = 128;
-  constexpr int kThreadsPerToken = kHeadDim / kCVTFp4EltsPerThread;
+  constexpr int kThreadsPerToken = 4;
+  constexpr int kVecsPerThread = kHeadDim / 64;
+  static_assert(kHeadDim % 64 == 0, "fp4 quantize requires 64-multiple D");
 
   const int batch_id = blockIdx.y;
   const int head_id = blockIdx.z;
   const int token_block_id = blockIdx.x;
-  const int token_id = token_block_id * kBlock + threadIdx.x / kThreadsPerToken;
+  const int local_token_id = threadIdx.x / kThreadsPerToken;
+  const int token_id = token_block_id * kBlock + local_token_id;
+  const int slice = threadIdx.x % kThreadsPerToken;
 
   int load_token_id;
   if constexpr (!kPermute) {
     load_token_id = token_id;
   } else {
-    int local_token_id = threadIdx.x / kThreadsPerToken;
     int local_token_id_residue = local_token_id % 32;
     // [0,1,8,9,16,17,24,25,2,3,10,11,18,19,26,27,4,5,12,13,20,21,28,29,6,7,14,15,22,23,30,31]
     load_token_id = token_block_id * kBlock + (local_token_id / 32) * 32 +
@@ -103,102 +109,128 @@ __global__ void fp4_quant_kernel(
                     ((local_token_id_residue % 8) / 2) * 8 +
                     (local_token_id_residue % 8) % 2;
   }
+  const bool token_valid = load_token_id < num_tokens;
 
-  PackedVec in_vec;
+  PackedVec in_vec[kVecsPerThread];
 #pragma unroll
-  for (int i = 0; i < kCVTFp4EltsPerThread / 2; i++) {
-    reinterpret_cast<uint32_t&>(in_vec.elts[i]) = 0;
+  for (int v = 0; v < kVecsPerThread; v++) {
+#pragma unroll
+    for (int i = 0; i < kCVTFp4EltsPerThread / 2; i++) {
+      reinterpret_cast<uint32_t&>(in_vec[v].elts[i]) = 0;
+    }
   }
-  if (load_token_id < num_tokens) {
-    in_vec = reinterpret_cast<PackedVec const*>(
+  if (token_valid) {
+    const PackedVec* __restrict__ src = reinterpret_cast<const PackedVec*>(
         input + batch_id * stride_bz_input + head_id * stride_h_input +
         load_token_id * stride_seq_input +
-        (threadIdx.x % kThreadsPerToken) * kCVTFp4EltsPerThread)[0];
+        slice * kVecsPerThread * kCVTFp4EltsPerThread);
+#pragma unroll
+    for (int v = 0; v < kVecsPerThread; v++) {
+      in_vec[v] = src[v];
+    }
   }
 
-  float2 fp2Vals[kCVTFp4EltsPerThread / 2];
+  float2 fp2Vals[kVecsPerThread][kCVTFp4EltsPerThread / 2];
 #pragma unroll
-  for (int i = 0; i < kCVTFp4EltsPerThread / 2; i++) {
-    if constexpr (std::is_same<T, half>::value) {
-      fp2Vals[i] = __half22float2(in_vec.elts[i]);
-    } else {
-      fp2Vals[i] = __bfloat1622float2(in_vec.elts[i]);
+  for (int v = 0; v < kVecsPerThread; v++) {
+#pragma unroll
+    for (int i = 0; i < kCVTFp4EltsPerThread / 2; i++) {
+      if constexpr (std::is_same<T, half>::value) {
+        fp2Vals[v][i] = __half22float2(in_vec[v].elts[i]);
+      } else {
+        fp2Vals[v][i] = __bfloat1622float2(in_vec[v].elts[i]);
+      }
     }
   }
   // padded tail rows stay zero: skip the bias there (SF and data both)
   if constexpr (kSubQm) {
-    if (load_token_id < num_tokens) {
-      const float* qm_row =
-          qm +
-          (batch_id * qm_stride_b + head_id * qm_stride_h +
-           (token_id / 128) * kHeadDim) +
-          (threadIdx.x % kThreadsPerToken) * kCVTFp4EltsPerThread;
+    if (token_valid) {
+      const float* qm_row = qm +
+                            (batch_id * qm_stride_b + head_id * qm_stride_h +
+                             (token_id / 128) * kHeadDim) +
+                            slice * kVecsPerThread * kCVTFp4EltsPerThread;
 #pragma unroll
-      for (int i = 0; i < kCVTFp4EltsPerThread / 2; i++) {
-        float2 b = *reinterpret_cast<const float2*>(qm_row + 2 * i);
-        fp2Vals[i].x -= b.x;
-        fp2Vals[i].y -= b.y;
+      for (int v = 0; v < kVecsPerThread; v++) {
+#pragma unroll
+        for (int i = 0; i < kCVTFp4EltsPerThread / 2; i++) {
+          float2 b = *reinterpret_cast<const float2*>(
+              qm_row + v * kCVTFp4EltsPerThread + 2 * i);
+          fp2Vals[v][i].x -= b.x;
+          fp2Vals[v][i].y -= b.y;
+        }
       }
     }
   }
   if constexpr (kSubKm) {
-    if (load_token_id < num_tokens) {
-      const float* km_row =
-          km + batch_id * km_stride_b + head_id * km_stride_h +
-          (threadIdx.x % kThreadsPerToken) * kCVTFp4EltsPerThread;
+    if (token_valid) {
+      const float* km_row = km + batch_id * km_stride_b +
+                            head_id * km_stride_h +
+                            slice * kVecsPerThread * kCVTFp4EltsPerThread;
 #pragma unroll
-      for (int i = 0; i < kCVTFp4EltsPerThread / 2; i++) {
-        float2 b = *reinterpret_cast<const float2*>(km_row + 2 * i);
-        fp2Vals[i].x -= b.x;
-        fp2Vals[i].y -= b.y;
+      for (int v = 0; v < kVecsPerThread; v++) {
+#pragma unroll
+        for (int i = 0; i < kCVTFp4EltsPerThread / 2; i++) {
+          float2 b = *reinterpret_cast<const float2*>(
+              km_row + v * kCVTFp4EltsPerThread + 2 * i);
+          fp2Vals[v][i].x -= b.x;
+          fp2Vals[v][i].y -= b.y;
+        }
       }
     }
   }
-
-  float vecMax = 0.f;
-#pragma unroll
-  for (int i = 0; i < kCVTFp4EltsPerThread / 2; i++) {
-    vecMax = fmaxf(vecMax, fmaxf(fabsf(fp2Vals[i].x), fabsf(fp2Vals[i].y)));
-  }
-
-  float SFValue = vecMax / 6.0f;
-  uint8_t SFValueFP8;
-  reinterpret_cast<__nv_fp8_e4m3&>(SFValueFP8) = __nv_fp8_e4m3(SFValue);
-  SFValue = float(reinterpret_cast<__nv_fp8_e4m3&>(SFValueFP8));
-  float SFValueInv = (SFValue == 0.0f) ? 0.0f : 1.0f / SFValue;
-
-#pragma unroll
-  for (int i = 0; i < kCVTFp4EltsPerThread / 2; i++) {
-    fp2Vals[i].x = fp2Vals[i].x * SFValueInv;
-    fp2Vals[i].y = fp2Vals[i].y * SFValueInv;
-  }
-
-  uint32_t e2m1Vals[kCVTFp4EltsPerThread / 8];
-#pragma unroll
-  for (int i = 0; i < kCVTFp4EltsPerThread / 8; i++) {
-    e2m1Vals[i] = fp32_vec_to_e2m1(fp2Vals + i * 4);
-  }
-
-  reinterpret_cast<uint64_t*>(
-      output + batch_id * stride_bz_output + head_id * stride_h_output +
-      token_id * stride_seq_output +
-      (threadIdx.x % kThreadsPerToken) * kCVTFp4EltsPerThread / 2)[0] =
-      reinterpret_cast<uint64_t*>(e2m1Vals)[0];
 
   uint8_t* output_sf_save_base = output_sf + batch_id * stride_bz_output_sf +
                                  head_id * stride_h_output_sf +
                                  (token_id / 64) * 64 * stride_seq_output_sf;
   uint32_t token_id_local = token_id % 64;
-  uint32_t col_id_local = threadIdx.x % kThreadsPerToken;
-  uint32_t offset_local = (col_id_local / 4) * 256 + (col_id_local % 4) +
-                          (token_id_local / 16) * 4 +
-                          (token_id_local % 16) * 16;
-  reinterpret_cast<uint8_t*>(output_sf_save_base + offset_local)[0] =
-      SFValueFP8;
+#pragma unroll
+  for (int v = 0; v < kVecsPerThread; v++) {
+    float vecMax = 0.f;
+#pragma unroll
+    for (int i = 0; i < kCVTFp4EltsPerThread / 2; i++) {
+      vecMax =
+          fmaxf(vecMax, fmaxf(fabsf(fp2Vals[v][i].x), fabsf(fp2Vals[v][i].y)));
+    }
+
+    float SFValue = vecMax / 6.0f;
+    uint8_t SFValueFP8;
+    reinterpret_cast<__nv_fp8_e4m3&>(SFValueFP8) = __nv_fp8_e4m3(SFValue);
+    SFValue = float(reinterpret_cast<__nv_fp8_e4m3&>(SFValueFP8));
+    float SFValueInv = (SFValue == 0.0f) ? 0.0f : 1.0f / SFValue;
+
+#pragma unroll
+    for (int i = 0; i < kCVTFp4EltsPerThread / 2; i++) {
+      fp2Vals[v][i].x = fp2Vals[v][i].x * SFValueInv;
+      fp2Vals[v][i].y = fp2Vals[v][i].y * SFValueInv;
+    }
+
+    uint32_t e2m1Vals[kCVTFp4EltsPerThread / 8];
+#pragma unroll
+    for (int i = 0; i < kCVTFp4EltsPerThread / 8; i++) {
+      e2m1Vals[i] = fp32_vec_to_e2m1(fp2Vals[v] + i * 4);
+    }
+
+    reinterpret_cast<uint64_t*>(
+        output + batch_id * stride_bz_output + head_id * stride_h_output +
+        token_id * stride_seq_output +
+        (slice * kVecsPerThread + v) * kCVTFp4EltsPerThread / 2)[0] =
+        reinterpret_cast<uint64_t*>(e2m1Vals)[0];
+
+    uint32_t col_id_local = slice * kVecsPerThread + v;
+    uint32_t offset_local = (col_id_local / 4) * 256 + (col_id_local % 4) +
+                            (token_id_local / 16) * 4 +
+                            (token_id_local % 16) * 16;
+    reinterpret_cast<uint8_t*>(output_sf_save_base + offset_local)[0] =
+        SFValueFP8;
+  }
 }
 
 // V quantization with transpose: (B,S,H,D) -> packed e2m1 (B,H,D,N/2) + SF
 // (B,H,D,N/16) in the transposed SF atom layout. No bias (V not smoothed).
+// Mapping mirrors the Q/K kernel (4 threads per token, 64-element slices);
+// after the smem transpose each thread owns one (d, 16-token) SF group and
+// iterates d in kHeadDim/64 passes over 64 d-rows each. Tokens per block
+// shrink to 64 for D>=192 so the static smem staging stays under 48KB.
 template <typename T, int kHeadDim>
 __global__ void fp4_quant_trans_kernel(
     const T* __restrict__ input, uint8_t* __restrict__ output,
@@ -207,96 +239,113 @@ __global__ void fp4_quant_trans_kernel(
     int stride_h_output, int stride_d_output, int stride_bz_output_sf,
     int stride_h_output_sf, int stride_d_output_sf) {
   using PackedVec = Fp4PackedVec<T>;
-  constexpr int kBlock = 128;
-  constexpr int kThreadsPerToken = kHeadDim / kCVTFp4EltsPerThread;
-  constexpr int kThreadsPerSeq = kBlock / kCVTFp4EltsPerThread;
+  constexpr int kTokensPerBlock = (kHeadDim <= 128) ? 128 : 64;
+  constexpr int kThreadsPerToken = 4;
+  constexpr int kVecsPerThread = kHeadDim / 64;
+  constexpr int kSFGroupsPerToken = kHeadDim / 16;
+  constexpr int kThreadsPerSeq = kTokensPerBlock / kCVTFp4EltsPerThread;
+  constexpr int kDRowsPerPass =
+      kTokensPerBlock * kThreadsPerToken / kThreadsPerSeq;
+  static_assert(kHeadDim % 64 == 0 && kHeadDim % kDRowsPerPass == 0,
+                "fp4 quantize requires 64-multiple D");
 
   const int batch_id = blockIdx.y;
   const int head_id = blockIdx.z;
   const int token_block_id = blockIdx.x;
-  const int token_id = token_block_id * kBlock + threadIdx.x / kThreadsPerToken;
+  const int token_id =
+      token_block_id * kTokensPerBlock + threadIdx.x / kThreadsPerToken;
+  const int slice = threadIdx.x % kThreadsPerToken;
 
-  PackedVec in_vec;
+  PackedVec in_vec[kVecsPerThread];
 #pragma unroll
-  for (int i = 0; i < kCVTFp4EltsPerThread / 2; i++) {
-    reinterpret_cast<uint32_t&>(in_vec.elts[i]) = 0;
+  for (int v = 0; v < kVecsPerThread; v++) {
+#pragma unroll
+    for (int i = 0; i < kCVTFp4EltsPerThread / 2; i++) {
+      reinterpret_cast<uint32_t&>(in_vec[v].elts[i]) = 0;
+    }
   }
   if (token_id < num_tokens) {
-    in_vec = reinterpret_cast<PackedVec const*>(
+    const PackedVec* __restrict__ src = reinterpret_cast<const PackedVec*>(
         input + batch_id * stride_bz_input + head_id * stride_h_input +
         token_id * stride_seq_input +
-        (threadIdx.x % kThreadsPerToken) * kCVTFp4EltsPerThread)[0];
-  }
-
-  __shared__ T shared_input[kBlock * kHeadDim];
-  reinterpret_cast<PackedVec*>(shared_input)[threadIdx.x] = in_vec;
-  __syncthreads();
+        slice * kVecsPerThread * kCVTFp4EltsPerThread);
 #pragma unroll
-  for (int i = 0; i < kCVTFp4EltsPerThread / 2; i++) {
-    in_vec.elts[i].x =
-        shared_input[(threadIdx.x / kThreadsPerSeq) +
-                     ((threadIdx.x % kThreadsPerSeq) * kCVTFp4EltsPerThread +
-                      2 * i) *
-                         kHeadDim];
-    in_vec.elts[i].y =
-        shared_input[(threadIdx.x / kThreadsPerSeq) +
-                     ((threadIdx.x % kThreadsPerSeq) * kCVTFp4EltsPerThread +
-                      2 * i + 1) *
-                         kHeadDim];
-  }
-
-  float2 fp2Vals[kCVTFp4EltsPerThread / 2];
-#pragma unroll
-  for (int i = 0; i < kCVTFp4EltsPerThread / 2; i++) {
-    if constexpr (std::is_same<T, half>::value) {
-      fp2Vals[i] = __half22float2(in_vec.elts[i]);
-    } else {
-      fp2Vals[i] = __bfloat1622float2(in_vec.elts[i]);
+    for (int v = 0; v < kVecsPerThread; v++) {
+      in_vec[v] = src[v];
     }
   }
 
-  float vecMax = 0.f;
+  __shared__ T shared_input[kTokensPerBlock * kHeadDim];
+  PackedVec* shared_pv = reinterpret_cast<PackedVec*>(shared_input);
 #pragma unroll
-  for (int i = 0; i < kCVTFp4EltsPerThread / 2; i++) {
-    vecMax = fmaxf(vecMax, fmaxf(fabsf(fp2Vals[i].x), fabsf(fp2Vals[i].y)));
+  for (int v = 0; v < kVecsPerThread; v++) {
+    shared_pv[(threadIdx.x / kThreadsPerToken) * kSFGroupsPerToken +
+              slice * kVecsPerThread + v] = in_vec[v];
   }
+  __syncthreads();
 
-  float SFValue = vecMax / 6.0f;
-  uint8_t SFValueFP8;
-  reinterpret_cast<__nv_fp8_e4m3&>(SFValueFP8) = __nv_fp8_e4m3(SFValue);
-  SFValue = float(reinterpret_cast<__nv_fp8_e4m3&>(SFValueFP8));
-  float SFValueInv = (SFValue == 0.0f) ? 0.0f : 1.0f / SFValue;
+  uint8_t* output_sf_base =
+      output_sf + batch_id * stride_bz_output_sf + head_id * stride_h_output_sf;
+  uint32_t col_id_local =
+      token_block_id * kTokensPerBlock / kCVTFp4EltsPerThread +
+      threadIdx.x % kThreadsPerSeq;
+  uint32_t sf_col_offset = (col_id_local / 4) * 256 + (col_id_local % 4);
+#pragma unroll
+  for (int p = 0; p < kHeadDim / kDRowsPerPass; p++) {
+    const int d = p * kDRowsPerPass + threadIdx.x / kThreadsPerSeq;
+    float2 fp2Vals[kCVTFp4EltsPerThread / 2];
+#pragma unroll
+    for (int i = 0; i < kCVTFp4EltsPerThread / 2; i++) {
+      const int tok0 =
+          (threadIdx.x % kThreadsPerSeq) * kCVTFp4EltsPerThread + 2 * i;
+      if constexpr (std::is_same<T, half>::value) {
+        fp2Vals[i].x = __half2float(shared_input[tok0 * kHeadDim + d]);
+        fp2Vals[i].y = __half2float(shared_input[(tok0 + 1) * kHeadDim + d]);
+      } else {
+        fp2Vals[i].x = __bfloat162float(shared_input[tok0 * kHeadDim + d]);
+        fp2Vals[i].y =
+            __bfloat162float(shared_input[(tok0 + 1) * kHeadDim + d]);
+      }
+    }
+
+    float vecMax = 0.f;
+#pragma unroll
+    for (int i = 0; i < kCVTFp4EltsPerThread / 2; i++) {
+      vecMax = fmaxf(vecMax, fmaxf(fabsf(fp2Vals[i].x), fabsf(fp2Vals[i].y)));
+    }
+
+    float SFValue = vecMax / 6.0f;
+    uint8_t SFValueFP8;
+    reinterpret_cast<__nv_fp8_e4m3&>(SFValueFP8) = __nv_fp8_e4m3(SFValue);
+    SFValue = float(reinterpret_cast<__nv_fp8_e4m3&>(SFValueFP8));
+    float SFValueInv = (SFValue == 0.0f) ? 0.0f : 1.0f / SFValue;
 
 #pragma unroll
-  for (int i = 0; i < kCVTFp4EltsPerThread / 2; i++) {
-    fp2Vals[i].x = fp2Vals[i].x * SFValueInv;
-    fp2Vals[i].y = fp2Vals[i].y * SFValueInv;
-  }
+    for (int i = 0; i < kCVTFp4EltsPerThread / 2; i++) {
+      fp2Vals[i].x = fp2Vals[i].x * SFValueInv;
+      fp2Vals[i].y = fp2Vals[i].y * SFValueInv;
+    }
 
-  uint32_t e2m1Vals[kCVTFp4EltsPerThread / 8];
+    uint32_t e2m1Vals[kCVTFp4EltsPerThread / 8];
 #pragma unroll
-  for (int i = 0; i < kCVTFp4EltsPerThread / 8; i++) {
-    e2m1Vals[i] = fp32_vec_to_e2m1(fp2Vals + i * 4);
+    for (int i = 0; i < kCVTFp4EltsPerThread / 8; i++) {
+      e2m1Vals[i] = fp32_vec_to_e2m1(fp2Vals + i * 4);
+    }
+
+    reinterpret_cast<uint64_t*>(
+        output + batch_id * stride_bz_output + head_id * stride_h_output +
+        d * stride_d_output +
+        (token_block_id * kTokensPerBlock +
+         (threadIdx.x % kThreadsPerSeq) * kCVTFp4EltsPerThread) /
+            2)[0] = reinterpret_cast<uint64_t*>(e2m1Vals)[0];
+
+    uint32_t row_id_local = threadIdx.x / kThreadsPerSeq;
+    uint32_t offset_local =
+        sf_col_offset + (row_id_local / 16) * 4 + (row_id_local % 16) * 16;
+    reinterpret_cast<uint8_t*>(
+        output_sf_base + (d / 64) * 64 * stride_d_output_sf + offset_local)[0] =
+        SFValueFP8;
   }
-
-  reinterpret_cast<uint64_t*>(
-      output + batch_id * stride_bz_output + head_id * stride_h_output +
-      (threadIdx.x / kThreadsPerSeq) * stride_d_output +
-      (token_block_id * kBlock +
-       (threadIdx.x % kThreadsPerSeq) * kCVTFp4EltsPerThread) /
-          2)[0] = reinterpret_cast<uint64_t*>(e2m1Vals)[0];
-
-  uint8_t* output_sf_save_base =
-      output_sf + batch_id * stride_bz_output_sf +
-      head_id * stride_h_output_sf +
-      (threadIdx.x / kThreadsPerSeq / 64) * 64 * stride_d_output_sf;
-  uint32_t row_id_local = (threadIdx.x / kThreadsPerSeq) % 64;
-  uint32_t col_id_local = token_block_id * kBlock / kCVTFp4EltsPerThread +
-                          threadIdx.x % kThreadsPerSeq;
-  uint32_t offset_local = (col_id_local / 4) * 256 + (col_id_local % 4) +
-                          (row_id_local / 16) * 4 + (row_id_local % 16) * 16;
-  reinterpret_cast<uint8_t*>(output_sf_save_base + offset_local)[0] =
-      SFValueFP8;
 }
 
 // Per-(b,h) 128-row block means of Q: qm (B,H,ceil(Nq/128),D) fp32. Tail
@@ -330,151 +379,160 @@ __global__ void fp4_q_block_mean_kernel(const T* __restrict__ input,
   out[d] = count > 0 ? sum / count : 0.f;
 }
 
+namespace detail {
+
+template <typename T, int kHeadDim>
+void launch_fp4_quant_q_t(const torch::Tensor& input, torch::Tensor& output,
+                          torch::Tensor& output_sf, const torch::Tensor& qm,
+                          int64_t n_pad, bool sub_qm) {
+  const int num_tokens = input.size(1);
+  auto stream = at::cuda::getCurrentCUDAStream();
+  dim3 block(512, 1, 1);
+  dim3 grid((n_pad + 127) / 128, input.size(0), input.size(2));
+  if (sub_qm) {
+    fp4_quant_kernel<T, kHeadDim, false, true, false>
+        <<<grid, block, 0, stream>>>(
+            reinterpret_cast<const T*>(input.data_ptr()),
+            output.data_ptr<uint8_t>(), output_sf.data_ptr<uint8_t>(),
+            num_tokens, input.stride(0), input.stride(2), input.stride(1),
+            output.stride(0), output.stride(1), output.stride(2),
+            output_sf.stride(0), output_sf.stride(1), output_sf.stride(2),
+            qm.data_ptr<float>(), qm.stride(0), qm.stride(1), nullptr, 0, 0);
+  } else {
+    fp4_quant_kernel<T, kHeadDim, false, false, false>
+        <<<grid, block, 0, stream>>>(
+            reinterpret_cast<const T*>(input.data_ptr()),
+            output.data_ptr<uint8_t>(), output_sf.data_ptr<uint8_t>(),
+            num_tokens, input.stride(0), input.stride(2), input.stride(1),
+            output.stride(0), output.stride(1), output.stride(2),
+            output_sf.stride(0), output_sf.stride(1), output_sf.stride(2),
+            nullptr, 0, 0, nullptr, 0, 0);
+  }
+}
+
+template <typename T, int kHeadDim>
+void launch_fp4_quant_k_t(const torch::Tensor& input, torch::Tensor& output,
+                          torch::Tensor& output_sf, const torch::Tensor& km,
+                          int64_t n_pad, bool sub_km) {
+  const int num_tokens = input.size(1);
+  auto stream = at::cuda::getCurrentCUDAStream();
+  dim3 block(512, 1, 1);
+  dim3 grid((n_pad + 127) / 128, input.size(0), input.size(2));
+  if (sub_km) {
+    fp4_quant_kernel<T, kHeadDim, true, false, true>
+        <<<grid, block, 0, stream>>>(
+            reinterpret_cast<const T*>(input.data_ptr()),
+            output.data_ptr<uint8_t>(), output_sf.data_ptr<uint8_t>(),
+            num_tokens, input.stride(0), input.stride(2), input.stride(1),
+            output.stride(0), output.stride(1), output.stride(2),
+            output_sf.stride(0), output_sf.stride(1), output_sf.stride(2),
+            nullptr, 0, 0, km.data_ptr<float>(), input.size(2) * kHeadDim,
+            kHeadDim);
+  } else {
+    fp4_quant_kernel<T, kHeadDim, true, false, false>
+        <<<grid, block, 0, stream>>>(
+            reinterpret_cast<const T*>(input.data_ptr()),
+            output.data_ptr<uint8_t>(), output_sf.data_ptr<uint8_t>(),
+            num_tokens, input.stride(0), input.stride(2), input.stride(1),
+            output.stride(0), output.stride(1), output.stride(2),
+            output_sf.stride(0), output_sf.stride(1), output_sf.stride(2),
+            nullptr, 0, 0, nullptr, 0, 0);
+  }
+}
+
+template <typename T, int kHeadDim>
+void launch_fp4_quant_vt_t(const torch::Tensor& input, torch::Tensor& output,
+                           torch::Tensor& output_sf, int64_t n_pad) {
+  constexpr int kTokensPerBlock = (kHeadDim <= 128) ? 128 : 64;
+  const int num_tokens = input.size(1);
+  auto stream = at::cuda::getCurrentCUDAStream();
+  dim3 block(kTokensPerBlock * 4, 1, 1);
+  dim3 grid((n_pad + kTokensPerBlock - 1) / kTokensPerBlock, input.size(0),
+            input.size(2));
+  fp4_quant_trans_kernel<T, kHeadDim><<<grid, block, 0, stream>>>(
+      reinterpret_cast<const T*>(input.data_ptr()), output.data_ptr<uint8_t>(),
+      output_sf.data_ptr<uint8_t>(), num_tokens, input.stride(0),
+      input.stride(2), input.stride(1), output.stride(0), output.stride(1),
+      output.stride(2), output_sf.stride(0), output_sf.stride(1),
+      output_sf.stride(2));
+}
+
+}  // namespace detail
+
+template <int kHeadDim>
 inline void launch_fp4_quant_q_sm120(const torch::Tensor& input,
                                      torch::Tensor& output,
                                      torch::Tensor& output_sf,
                                      const torch::Tensor& qm, int64_t n_pad,
                                      bool sub_qm) {
-  TORCH_CHECK(input.size(3) == 128, "fp4 quantize requires head_dim 128");
-  const int num_tokens = input.size(1);
-  auto stream = at::cuda::getCurrentCUDAStream();
-  dim3 block(128 * 128 / kCVTFp4EltsPerThread, 1, 1);
-  dim3 grid((n_pad + 127) / 128, input.size(0), input.size(2));
+  TORCH_CHECK(input.size(3) == kHeadDim && kHeadDim % 64 == 0 &&
+                  kHeadDim >= 64 && kHeadDim <= 256,
+              "fp4 quantize requires head_dim in {64,128,192,256}");
   if (input.scalar_type() == at::ScalarType::Half) {
-    using T = half;
-    if (sub_qm) {
-      fp4_quant_kernel<T, 128, false, true, false><<<grid, block, 0, stream>>>(
-          reinterpret_cast<const T*>(input.data_ptr()),
-          output.data_ptr<uint8_t>(), output_sf.data_ptr<uint8_t>(), num_tokens,
-          input.stride(0), input.stride(2), input.stride(1), output.stride(0),
-          output.stride(1), output.stride(2), output_sf.stride(0),
-          output_sf.stride(1), output_sf.stride(2), qm.data_ptr<float>(),
-          qm.stride(0), qm.stride(1), nullptr, 0, 0);
-    } else {
-      fp4_quant_kernel<T, 128, false, false, false><<<grid, block, 0, stream>>>(
-          reinterpret_cast<const T*>(input.data_ptr()),
-          output.data_ptr<uint8_t>(), output_sf.data_ptr<uint8_t>(), num_tokens,
-          input.stride(0), input.stride(2), input.stride(1), output.stride(0),
-          output.stride(1), output.stride(2), output_sf.stride(0),
-          output_sf.stride(1), output_sf.stride(2), nullptr, 0, 0, nullptr, 0,
-          0);
-    }
+    detail::launch_fp4_quant_q_t<half, kHeadDim>(input, output, output_sf, qm,
+                                                 n_pad, sub_qm);
   } else {
-    using T = __nv_bfloat16;
-    if (sub_qm) {
-      fp4_quant_kernel<T, 128, false, true, false><<<grid, block, 0, stream>>>(
-          reinterpret_cast<const T*>(input.data_ptr()),
-          output.data_ptr<uint8_t>(), output_sf.data_ptr<uint8_t>(), num_tokens,
-          input.stride(0), input.stride(2), input.stride(1), output.stride(0),
-          output.stride(1), output.stride(2), output_sf.stride(0),
-          output_sf.stride(1), output_sf.stride(2), qm.data_ptr<float>(),
-          qm.stride(0), qm.stride(1), nullptr, 0, 0);
-    } else {
-      fp4_quant_kernel<T, 128, false, false, false><<<grid, block, 0, stream>>>(
-          reinterpret_cast<const T*>(input.data_ptr()),
-          output.data_ptr<uint8_t>(), output_sf.data_ptr<uint8_t>(), num_tokens,
-          input.stride(0), input.stride(2), input.stride(1), output.stride(0),
-          output.stride(1), output.stride(2), output_sf.stride(0),
-          output_sf.stride(1), output_sf.stride(2), nullptr, 0, 0, nullptr, 0,
-          0);
-    }
+    detail::launch_fp4_quant_q_t<__nv_bfloat16, kHeadDim>(
+        input, output, output_sf, qm, n_pad, sub_qm);
   }
 }
 
+template <int kHeadDim>
 inline void launch_fp4_quant_k_sm120(const torch::Tensor& input,
                                      torch::Tensor& output,
                                      torch::Tensor& output_sf,
                                      const torch::Tensor& km, int64_t n_pad,
                                      bool sub_km) {
-  TORCH_CHECK(input.size(3) == 128, "fp4 quantize requires head_dim 128");
-  const int num_tokens = input.size(1);
-  auto stream = at::cuda::getCurrentCUDAStream();
-  dim3 block(128 * 128 / kCVTFp4EltsPerThread, 1, 1);
-  dim3 grid((n_pad + 127) / 128, input.size(0), input.size(2));
+  TORCH_CHECK(input.size(3) == kHeadDim && kHeadDim % 64 == 0 &&
+                  kHeadDim >= 64 && kHeadDim <= 256,
+              "fp4 quantize requires head_dim in {64,128,192,256}");
   if (input.scalar_type() == at::ScalarType::Half) {
-    using T = half;
-    if (sub_km) {
-      fp4_quant_kernel<T, 128, true, false, true><<<grid, block, 0, stream>>>(
-          reinterpret_cast<const T*>(input.data_ptr()),
-          output.data_ptr<uint8_t>(), output_sf.data_ptr<uint8_t>(), num_tokens,
-          input.stride(0), input.stride(2), input.stride(1), output.stride(0),
-          output.stride(1), output.stride(2), output_sf.stride(0),
-          output_sf.stride(1), output_sf.stride(2), nullptr, 0, 0,
-          km.data_ptr<float>(), input.size(2) * 128, 128);
-    } else {
-      fp4_quant_kernel<T, 128, true, false, false><<<grid, block, 0, stream>>>(
-          reinterpret_cast<const T*>(input.data_ptr()),
-          output.data_ptr<uint8_t>(), output_sf.data_ptr<uint8_t>(), num_tokens,
-          input.stride(0), input.stride(2), input.stride(1), output.stride(0),
-          output.stride(1), output.stride(2), output_sf.stride(0),
-          output_sf.stride(1), output_sf.stride(2), nullptr, 0, 0, nullptr, 0,
-          0);
-    }
+    detail::launch_fp4_quant_k_t<half, kHeadDim>(input, output, output_sf, km,
+                                                 n_pad, sub_km);
   } else {
-    using T = __nv_bfloat16;
-    if (sub_km) {
-      fp4_quant_kernel<T, 128, true, false, true><<<grid, block, 0, stream>>>(
-          reinterpret_cast<const T*>(input.data_ptr()),
-          output.data_ptr<uint8_t>(), output_sf.data_ptr<uint8_t>(), num_tokens,
-          input.stride(0), input.stride(2), input.stride(1), output.stride(0),
-          output.stride(1), output.stride(2), output_sf.stride(0),
-          output_sf.stride(1), output_sf.stride(2), nullptr, 0, 0,
-          km.data_ptr<float>(), input.size(2) * 128, 128);
-    } else {
-      fp4_quant_kernel<T, 128, true, false, false><<<grid, block, 0, stream>>>(
-          reinterpret_cast<const T*>(input.data_ptr()),
-          output.data_ptr<uint8_t>(), output_sf.data_ptr<uint8_t>(), num_tokens,
-          input.stride(0), input.stride(2), input.stride(1), output.stride(0),
-          output.stride(1), output.stride(2), output_sf.stride(0),
-          output_sf.stride(1), output_sf.stride(2), nullptr, 0, 0, nullptr, 0,
-          0);
-    }
+    detail::launch_fp4_quant_k_t<__nv_bfloat16, kHeadDim>(
+        input, output, output_sf, km, n_pad, sub_km);
   }
 }
 
+template <int kHeadDim>
 inline void launch_fp4_quant_vt_sm120(const torch::Tensor& input,
                                       torch::Tensor& output,
                                       torch::Tensor& output_sf, int64_t n_pad) {
-  TORCH_CHECK(input.size(3) == 128, "fp4 quantize requires head_dim 128");
-  const int num_tokens = input.size(1);
-  auto stream = at::cuda::getCurrentCUDAStream();
-  dim3 block(128 * 128 / kCVTFp4EltsPerThread, 1, 1);
-  dim3 grid((n_pad + 127) / 128, input.size(0), input.size(2));
+  TORCH_CHECK(input.size(3) == kHeadDim && kHeadDim % 64 == 0 &&
+                  kHeadDim >= 64 && kHeadDim <= 256,
+              "fp4 quantize requires head_dim in {64,128,192,256}");
   if (input.scalar_type() == at::ScalarType::Half) {
-    fp4_quant_trans_kernel<half, 128><<<grid, block, 0, stream>>>(
-        reinterpret_cast<const half*>(input.data_ptr()),
-        output.data_ptr<uint8_t>(), output_sf.data_ptr<uint8_t>(), num_tokens,
-        input.stride(0), input.stride(2), input.stride(1), output.stride(0),
-        output.stride(1), output.stride(2), output_sf.stride(0),
-        output_sf.stride(1), output_sf.stride(2));
+    detail::launch_fp4_quant_vt_t<half, kHeadDim>(input, output, output_sf,
+                                                  n_pad);
   } else {
-    fp4_quant_trans_kernel<__nv_bfloat16, 128><<<grid, block, 0, stream>>>(
-        reinterpret_cast<const __nv_bfloat16*>(input.data_ptr()),
-        output.data_ptr<uint8_t>(), output_sf.data_ptr<uint8_t>(), num_tokens,
-        input.stride(0), input.stride(2), input.stride(1), output.stride(0),
-        output.stride(1), output.stride(2), output_sf.stride(0),
-        output_sf.stride(1), output_sf.stride(2));
+    detail::launch_fp4_quant_vt_t<__nv_bfloat16, kHeadDim>(input, output,
+                                                           output_sf, n_pad);
   }
 }
 
+template <int kHeadDim>
 inline void launch_fp4_q_block_mean_sm120(const torch::Tensor& input,
                                           torch::Tensor& qm) {
-  TORCH_CHECK(input.size(3) == 128, "fp4 quantize requires head_dim 128");
+  TORCH_CHECK(input.size(3) == kHeadDim && kHeadDim % 64 == 0 &&
+                  kHeadDim >= 64 && kHeadDim <= 256,
+              "fp4 quantize requires head_dim in {64,128,192,256}");
   const int num_tokens = input.size(1);
   const int n_blocks = qm.size(2);
   auto stream = at::cuda::getCurrentCUDAStream();
   dim3 grid(n_blocks, input.size(0), input.size(2));
-  dim3 block(128, 1, 1);
+  dim3 block(kHeadDim, 1, 1);
   if (input.scalar_type() == at::ScalarType::Half) {
-    fp4_q_block_mean_kernel<half, 128><<<grid, block, 0, stream>>>(
+    fp4_q_block_mean_kernel<half, kHeadDim><<<grid, block, 0, stream>>>(
         reinterpret_cast<const half*>(input.data_ptr()), qm.data_ptr<float>(),
         num_tokens, input.stride(0), input.stride(2), input.stride(1),
         qm.stride(0), qm.stride(1), qm.stride(2));
   } else {
-    fp4_q_block_mean_kernel<__nv_bfloat16, 128><<<grid, block, 0, stream>>>(
-        reinterpret_cast<const __nv_bfloat16*>(input.data_ptr()),
-        qm.data_ptr<float>(), num_tokens, input.stride(0), input.stride(2),
-        input.stride(1), qm.stride(0), qm.stride(1), qm.stride(2));
+    fp4_q_block_mean_kernel<__nv_bfloat16, kHeadDim>
+        <<<grid, block, 0, stream>>>(
+            reinterpret_cast<const __nv_bfloat16*>(input.data_ptr()),
+            qm.data_ptr<float>(), num_tokens, input.stride(0), input.stride(2),
+            input.stride(1), qm.stride(0), qm.stride(1), qm.stride(2));
   }
 }
 

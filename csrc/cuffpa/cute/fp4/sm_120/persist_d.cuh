@@ -73,40 +73,58 @@ namespace ffpa_fp4 {
 using TmaBarrier = cutlass::arch::ClusterTransactionBarrier;
 using CtaBarrier = cutlass::arch::ClusterBarrier;
 
-// NVFP4 persist-D traits, D=128 only: SM120 blockscaled 16x32x64 mma
+// NVFP4 persist-D traits, D in {64,128,192,256} (64-multiples only: the
+// blockscaled SF atom is 64-wide along both MN and K): SM120 blockscaled
+// 16x32x64 mma
 // (4x mma.sync m16n8k64 kind::mxf4nvf4 ue4m3 scale_vec::4X) tiled 8x1x1 over
-// a (128, 32, 128) tile for both QK and PV. Q/K/V^T smem share the
-// sm120_rr K-major swizzle atom; SF smem uses the BlockScaledConfig atom
+// a (128, 32, kHeadDim) tile for both QK and PV. Q/K smem use the
+// sm120_rr swizzle atom selected by kHeadDim and V^T a separate one
+// selected by kBc; SF smem uses the BlockScaledConfig atom
 // layouts; DS (delta_s) is a stride-(0,1) 128-float broadcast tile.
-template <typename ElementO_>
+template <typename ElementO_, int kHeadDim_>
 struct Fp4PersistDTraits {
   static constexpr int kBr = 128;
   static constexpr int kBc = 128;
-  static constexpr int kHeadDim = 128;
-  static constexpr int kStages = 3;
+  static constexpr int kHeadDim = kHeadDim_;
+  // D=256 at 3 stages needs 130,560B, past the 99KB sm_120 opt-in budget.
+  static constexpr int kStages = (kHeadDim <= 192) ? 3 : 2;
+  static_assert(kHeadDim % 64 == 0 && kHeadDim >= 64 && kHeadDim <= 256,
+                "fp4 persist_d supports D in {64,128,192,256}");
 
   using Element = cutlass::float_e2m1_t;
   using ElementSF = cutlass::float_ue4m3_t;
   using ElementO = ElementO_;
 
-  using TileShape_MNK = Shape<_128, _128, _128>;
+  using TileShape_MNK = Shape<_128, _128, Int<kHeadDim>>;
   using MMAAtom =
       MMA_Atom<cute::SM120::BLOCKSCALED::SM120_16x32x64_TN_VS_NVFP4>;
   using AtomLayoutMNK = Layout<Shape<_8, _1, _1>>;
+  // Tile-K must equal the GEMM's K extent: kHeadDim for QK, kBc (KV
+  // tokens) for PV. SA3 hardcodes PermTileK=kHeadDim for both, which only
+  // holds because all its configs have kBc==kHeadDim==128 (its D=64 branch
+  // never compiled). A mismatched Tile-K breaks partition_fragment_B's
+  // logical_divide (192 % 128 != 0 at D=192).
   using TiledMmaQK = decltype(make_tiled_mma(MMAAtom{}, AtomLayoutMNK{},
-                                             Tile<_128, _32, _128>{}));
-  using TiledMmaPV = TiledMmaQK;
+                                             Tile<_128, _32, Int<kHeadDim>>{}));
+  using TiledMmaPV = decltype(make_tiled_mma(MMAAtom{}, AtomLayoutMNK{},
+                                             Tile<_128, _32, Int<kBc>>{}));
 
-  using SmemLayoutAtomQKV =
+  // Q/K contiguous extent is kHeadDim elements, V^T's is kBc (SA3 splits
+  // the selector the same way); at D=128 both select SW64, so the D=128
+  // layout is bit-identical to the pre-templated version.
+  using SmemLayoutAtomQK =
       decltype(cutlass::gemm::collective::detail::sm120_rr_smem_selector<
                Element, Int<kHeadDim>>());
-  using SmemLayoutQ = decltype(tile_to_shape(SmemLayoutAtomQKV{},
+  using SmemLayoutAtomVt =
+      decltype(cutlass::gemm::collective::detail::sm120_rr_smem_selector<
+               Element, Int<kBc>>());
+  using SmemLayoutQ = decltype(tile_to_shape(SmemLayoutAtomQK{},
                                              Shape<Int<kBr>, Int<kHeadDim>>{}));
   using SmemLayoutK = decltype(tile_to_shape(
-      SmemLayoutAtomQKV{},
+      SmemLayoutAtomQK{},
       make_shape(Int<kBc>{}, Int<kHeadDim>{}, Int<kStages>{})));
   using SmemLayoutVt = decltype(tile_to_shape(
-      SmemLayoutAtomQKV{},
+      SmemLayoutAtomVt{},
       make_shape(Int<kHeadDim>{}, Int<kBc>{}, Int<kStages>{})));
 
   using BlkScaledConfig = BlockScaledConfig<16>;
@@ -170,10 +188,12 @@ struct Fp4PersistDTraits {
       static_cast<uint32_t>(
           cute::bits_to_bytes(size(take<0, 2>(SmemLayoutVt{})) * 4));
 
-  // SMEM plan: [Q | SFQ | K*s | SFK*s | DS*s | V^T*s | SFVt*s], regions
-  // padded to 1024B so the SW128 TMA destinations stay swizzle-span aligned.
-  // The O staging tile (kBr*kHeadDim*2B = 32KB) aliases q_base in the
-  // epilogue, after the KV loop has consumed everything below kSmemBytes.
+  // SMEM plan: [Q | SFQ | K*s | SFK*s | DS*s | V^T*s | SFVt*s], every region
+  // start padded to 1024B so all TMA destinations stay swizzle-span aligned
+  // at any D (kOffK is only naturally aligned at D in {128,256}). At D=128
+  // the padding is a no-op: offsets match the pre-templated layout exactly.
+  // The O staging tile (kBr*kHeadDim*2B) aliases q_base in the epilogue,
+  // after the KV loop has consumed everything below kSmemBytes.
   static constexpr int kQBytes =
       int(cute::bits_to_bytes(size(SmemLayoutQ{}) * 4));
   static constexpr int kSFQBytes =
@@ -189,12 +209,14 @@ struct Fp4PersistDTraits {
   static constexpr int kSFVtBytesStage =
       int(cute::bits_to_bytes(cosize(take<0, 2>(SmemLayoutSFVt{})) * 8));
   static constexpr int kOffQ = 0;
-  static constexpr int kOffSFQ = kOffQ + kQBytes;
-  static constexpr int kOffK = kOffSFQ + kSFQBytes;
-  static constexpr int kOffSFK = kOffK + kStages * kKBytesStage;
-  static constexpr int kOffDS = kOffSFK + kStages * kSFKBytesStage;
-  static constexpr int kOffV0 = kOffDS + kStages * kDSBytesStage;
-  static constexpr int kOffV = (kOffV0 + 1023) / 1024 * 1024;
+  static constexpr int kOffSFQ = (kQBytes + 1023) / 1024 * 1024;
+  static constexpr int kOffK = (kOffSFQ + kSFQBytes + 1023) / 1024 * 1024;
+  static constexpr int kOffSFK =
+      (kOffK + kStages * kKBytesStage + 1023) / 1024 * 1024;
+  static constexpr int kOffDS =
+      (kOffSFK + kStages * kSFKBytesStage + 1023) / 1024 * 1024;
+  static constexpr int kOffV =
+      (kOffDS + kStages * kDSBytesStage + 1023) / 1024 * 1024;
   static constexpr int kOffSFVt = kOffV + kStages * kVBytesStage;
   static constexpr int kSmemBytes = kOffSFVt + kStages * kSFVtBytesStage;
   static_assert(kOffK % 1024 == 0 && kOffV % 1024 == 0, "SW128 smem alignment");
@@ -631,9 +653,10 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp4_sm120(
       as_position_independent_swizzle_tensor(sSFK));
   Tensor tSrSFK_copy_view = smem_thr_copy_SFK.retile_D(tSrSFK);
 
-  auto smem_tiled_copy_SFV = make_tiled_copy_impl(
-      SmemCopyAtomSF{}, get_layoutSFB_TV(tiled_mma_pv),
-      make_shape(size<1>(tile_shape_mnk), size<2>(tile_shape_mnk)));
+  auto smem_tiled_copy_SFV =
+      make_tiled_copy_impl(SmemCopyAtomSF{}, get_layoutSFB_TV(tiled_mma_pv),
+                           make_shape(size<1>(tile_shape(tiled_mma_pv)),
+                                      size<2>(tile_shape(tiled_mma_pv))));
   auto smem_thr_copy_SFV = smem_tiled_copy_SFV.get_thread_slice(wg_tid);
   Tensor tOsSFVt = smem_thr_copy_SFV.partition_S(
       as_position_independent_swizzle_tensor(sSFVt));

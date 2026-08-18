@@ -115,9 +115,10 @@ void ffpa_attn_forward(torch::Tensor Q, torch::Tensor K, torch::Tensor V,
   const int head_dim_pad = (head_dim_og + 31) & ~31;
   const auto pad_backend = ffpa::get_backend_impl_hint();
   TORCH_CHECK(
-      pad_backend != ffpa::CudaBackendImpl::CUTE_TMA_FP4 || head_dim_og == 128,
-      "ffpa_attn: the NVFP4 path (CUTE_TMA_FP4) requires head_dim=128, "
-      "got D=",
+      pad_backend != ffpa::CudaBackendImpl::CUTE_TMA_FP4 ||
+          (head_dim_og % 64 == 0 && head_dim_og >= 64 && head_dim_og <= 256),
+      "ffpa_attn: the NVFP4 path (CUTE_TMA_FP4) requires head_dim in "
+      "{64,128,192,256} (64-multiples), got D=",
       head_dim_og);
   torch::Tensor O_orig;
   const bool needs_pad = (pad_backend == ffpa::CudaBackendImpl::CUTE_TMA_FP8 ||

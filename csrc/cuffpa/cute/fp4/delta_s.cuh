@@ -19,21 +19,25 @@ using namespace nvcuda;
 
 // CTA: one (m_tile 128, n_tile 128) output tile of one (b, h). 8 warps,
 // warp w owns rows [16w, 16w+16), full 128 cols via 8 wmma n-tiles.
-// A (qm) and B (K) are staged row-major in smem with a 136-half pad (wmma
-// ldm multiple of 8), then the same storage is reused as the f32
-// accumulator staging tile (128x136 floats) between barriers. Rows m >= Mb
-// and n >= Nkv are zero-filled on load: no OOB gmem reads and
-// garbage-free accumulators (out-of-range rows are skipped in the
+// The K reduction (kHeadDim) is staged in 64-element chunks: full A/B
+// staging would need 128*(D+8)*2*2 bytes and breaks the 99KB sm_120 budget
+// at D>=192, so A/B land in a 2*128*72*2 = 36KB window that is reused as
+// the f32 accumulator staging tile (128x136 floats = 68KB) for the
+// epilogue. Rows m >= Mb and n >= Nkv are zero-filled on load: no OOB gmem
+// reads and garbage-free accumulators (out-of-range rows are skipped in the
 // epilogue anyway).
-template <typename T>
+template <typename T, int kHeadDim>
 __global__ void delta_s_wmma_kernel(
-    const T* __restrict__ qm,   // [Nb, Nh, Mb, 128] row-major
-    const T* __restrict__ k,    // [Nb, Nhkv, Nkv, 128] row-major
+    const T* __restrict__ qm,   // [Nb, Nh, Mb, kHeadDim] row-major
+    const T* __restrict__ k,    // [Nb, Nhkv, Nkv, kHeadDim] row-major
     const T* __restrict__ qkm,  // [Nb, Nh, Mb] row-major
     float* __restrict__ ds,     // [Nb, Nh, Mb, Nkv_pad] row-major
     int Nh, int Nh_kv, int Mb, int Nkv, int Nkv_pad) {
   namespace w = nvcuda::wmma;
-  constexpr int kLd = 136;  // multiple of 8 halves / 4 floats, 16B rows
+  constexpr int kChunk = 64;   // K elements staged per pass
+  constexpr int kLdAB = 72;    // kChunk + 8 halves (ldm multiple of 8)
+  constexpr int kLdAcc = 136;  // multiple of 4 floats / 16B rows
+  static_assert(kHeadDim % kChunk == 0, "delta_s requires 64-multiple D");
   const int m_tiles = (Mb + 127) / 128;
   const int bh = blockIdx.y / m_tiles;
   const int tile_m = blockIdx.y % m_tiles;
@@ -47,58 +51,64 @@ __global__ void delta_s_wmma_kernel(
 
   extern __shared__ float tile[];
   T* sA = reinterpret_cast<T*>(tile);
-  T* sB = sA + 128 * kLd;
+  T* sB = sA + 128 * kLdAB;
 
-  // Cooperative A/B load: 128 rows x 128 halves (16 uint4) each, 8 uint4
-  // per thread.
-  const T* gA = qm + (long)(bh * Mb + tile_m * 128) * 128;
-  const T* gB = k + ((long)((b * Nh_kv + h / (Nh / Nh_kv)) * Nkv) + n0) * 128;
-#pragma unroll
-  for (int i = threadIdx.x; i < 128 * 16; i += 256) {
-    const int row = i >> 4;
-    const int col = (i & 15) << 3;
-    if (tile_m * 128 + row < Mb) {
-      *reinterpret_cast<uint4*>(sA + row * kLd + col) =
-          *reinterpret_cast<const uint4*>(gA + row * 128 + col);
-    } else {
-      *reinterpret_cast<uint4*>(sA + row * kLd + col) = uint4{0, 0, 0, 0};
-    }
-    if (n0 + row < Nkv) {
-      *reinterpret_cast<uint4*>(sB + row * kLd + col) =
-          *reinterpret_cast<const uint4*>(gB + row * 128 + col);
-    } else {
-      *reinterpret_cast<uint4*>(sB + row * kLd + col) = uint4{0, 0, 0, 0};
-    }
-  }
-  __syncthreads();
+  const T* gA = qm + (long)(bh * Mb + tile_m * 128) * kHeadDim;
+  const T* gB =
+      k + ((long)((b * Nh_kv + h / (Nh / Nh_kv)) * Nkv) + n0) * kHeadDim;
+  constexpr int kVec4PerRow = kChunk / 8;  // 16B loads per staged row
 
   w::fragment<w::accumulator, 16, 16, 16, float> acc[8];
 #pragma unroll
   for (int n = 0; n < 8; ++n)
     w::fill_fragment(acc[n], 0.0f);
-  if (m_ok) {
+
+  for (int kc = 0; kc < kHeadDim; kc += kChunk) {
+    // Cooperative A/B chunk load: 128 rows x 64 halves (8 uint4) each.
 #pragma unroll
-    for (int kk = 0; kk < 8; ++kk) {
-      w::fragment<w::matrix_a, 16, 16, 16, T, w::row_major> fa;
-      // sA holds one 128-row tile: index by the in-tile row (warp * 16),
-      // not the global m0 (tile_m * 128 + warp * 16).
-      w::load_matrix_sync(fa, sA + warp * 16 * kLd + kk * 16, kLd);
-#pragma unroll
-      for (int n = 0; n < 8; ++n) {
-        w::fragment<w::matrix_b, 16, 16, 16, T, w::col_major> fb;
-        w::load_matrix_sync(fb, sB + n * 16 * kLd + kk * 16, kLd);
-        w::mma_sync(acc[n], fa, fb, acc[n]);
+    for (int i = threadIdx.x; i < 128 * kVec4PerRow; i += 256) {
+      const int row = i / kVec4PerRow;
+      const int col = (i % kVec4PerRow) * 8;
+      if (tile_m * 128 + row < Mb) {
+        *reinterpret_cast<uint4*>(sA + row * kLdAB + col) =
+            *reinterpret_cast<const uint4*>(gA + row * kHeadDim + kc + col);
+      } else {
+        *reinterpret_cast<uint4*>(sA + row * kLdAB + col) = uint4{0, 0, 0, 0};
+      }
+      if (n0 + row < Nkv) {
+        *reinterpret_cast<uint4*>(sB + row * kLdAB + col) =
+            *reinterpret_cast<const uint4*>(gB + row * kHeadDim + kc + col);
+      } else {
+        *reinterpret_cast<uint4*>(sB + row * kLdAB + col) = uint4{0, 0, 0, 0};
       }
     }
+    __syncthreads();
+    if (m_ok) {
+#pragma unroll
+      for (int kk = 0; kk < kChunk / 16; ++kk) {
+        w::fragment<w::matrix_a, 16, 16, 16, T, w::row_major> fa;
+        // sA holds one 128-row tile: index by the in-tile row (warp * 16),
+        // not the global m0 (tile_m * 128 + warp * 16).
+        w::load_matrix_sync(fa, sA + warp * 16 * kLdAB + kk * 16, kLdAB);
+#pragma unroll
+        for (int n = 0; n < 8; ++n) {
+          w::fragment<w::matrix_b, 16, 16, 16, T, w::col_major> fb;
+          w::load_matrix_sync(fb, sB + n * 16 * kLdAB + kk * 16, kLdAB);
+          w::mma_sync(acc[n], fa, fb, acc[n]);
+        }
+      }
+    }
+    // A/B smem is dead for every warp only after all warps finish the mma
+    // loop (warps read B rows owned by other warps), so the next chunk load
+    // must wait.
+    __syncthreads();
   }
-  // A/B smem is dead for every warp only after all warps finish the mma
-  // loop (warps read B rows owned by other warps); then the accumulators
-  // may overwrite the same storage.
-  __syncthreads();
 
+  // The A/B staging is dead; the same storage now backs the f32 accumulator
+  // tile written below.
 #pragma unroll
   for (int n = 0; n < 8; ++n) {
-    w::store_matrix_sync(tile + warp * 16 * kLd + n * 16, acc[n], kLd,
+    w::store_matrix_sync(tile + warp * 16 * kLdAcc + n * 16, acc[n], kLdAcc,
                          w::mem_row_major);
   }
   __syncthreads();
@@ -109,7 +119,7 @@ __global__ void delta_s_wmma_kernel(
   if (m_global >= Mb)
     return;
   const float qk = static_cast<float>(qkm[(long)bh * Mb + m_global]);
-  const float* src = tile + row * kLd + c4;
+  const float* src = tile + row * kLdAcc + c4;
   float* out = ds + ((long)(bh * Mb) + m_global) * Nkv_pad + n0 + c4;
   const int n_valid = Nkv - n0 - c4;  // valid cols in this thread's span
 #pragma unroll
@@ -129,7 +139,7 @@ __global__ void delta_s_wmma_kernel(
   }
 }
 
-template <typename T>
+template <typename T, int kHeadDim>
 inline void launch_fp4_delta_s_sm120(const T* qm, const T* k, const T* qkm,
                                      float* ds, int Nb, int Nh, int Nh_kv,
                                      int Mb, int Nkv, int Nkv_pad,
@@ -137,11 +147,15 @@ inline void launch_fp4_delta_s_sm120(const T* qm, const T* k, const T* qkm,
   const int tc = Nkv_pad / 128;
   const int m_tiles = (Mb + 127) / 128;
   dim3 grid(tc, Nb * Nh * m_tiles);
-  const int smem = 128 * 136 * sizeof(T) * 2;  // A + B staging (acc reuses)
-  cudaFuncSetAttribute(delta_s_wmma_kernel<T>,
+  // Union of the A/B chunk staging (2*128*72*sizeof(T)) and the f32 acc
+  // tile (128*136*4); the acc side dominates for fp16/bf16.
+  constexpr int kSmemAB = 2 * 128 * 72 * (int)sizeof(T);
+  constexpr int kSmemAcc = 128 * 136 * 4;
+  constexpr int smem = kSmemAB > kSmemAcc ? kSmemAB : kSmemAcc;
+  cudaFuncSetAttribute(delta_s_wmma_kernel<T, kHeadDim>,
                        cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
-  delta_s_wmma_kernel<T><<<grid, 256, smem, stream>>>(qm, k, qkm, ds, Nh, Nh_kv,
-                                                      Mb, Nkv, Nkv_pad);
+  delta_s_wmma_kernel<T, kHeadDim><<<grid, 256, smem, stream>>>(
+      qm, k, qkm, ds, Nh, Nh_kv, Mb, Nkv, Nkv_pad);
 }
 
 }  // namespace ffpa_fp4
