@@ -18,7 +18,9 @@ using namespace cute;
 
 CUTE_DEVICE float ptx_exp2(float x) {
   float y;
-  asm volatile("ex2.approx.f32 %0, %1;" : "=f"(y) : "f"(x));
+  // .ftz keeps this a single MUFU.EX2: the non-ftz form makes ptxas wrap
+  // every call in range glue (FSETP -126/-INF, FSEL, FMUL 0.5 chain).
+  asm volatile("ex2.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
   return y;
 }
 
