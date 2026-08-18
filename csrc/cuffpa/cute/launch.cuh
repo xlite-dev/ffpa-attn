@@ -1,6 +1,8 @@
 #pragma once
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAEvent.h>
+#include <c10/cuda/CUDAStream.h>
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -1658,16 +1660,52 @@ void launch_cute_fwd_persist_d_fp4_sm120_impl(torch::Tensor Q, torch::Tensor K,
 
   // Quantize kernels take (B,S,H,D)-strided inputs; pass the (B,H,N,D)
   // tensors as (B,N,H,D) views (strides only, no copy).
+  // The Q chain (block mean -> quant), K chain (mean -> quant) and V chain
+  // (transposed quant) are data-independent: run them on side streams so
+  // their memory traffic overlaps instead of serializing (all are
+  // bandwidth-bound at ~1TB/s each on a 1.5TB/s part). The main stream
+  // keeps the K chain and later delta_s (needs qm + km_h) and joins via
+  // events before building TMA descriptors / launching the kernel.
   auto Q_t = Q.transpose(1, 2);
   auto K_t = K.transpose(1, 2);
   auto V_t = V.transpose(1, 2);
-  ffpa_fp4::launch_fp4_q_block_mean_sm120(Q_t, qm);
-  ffpa_fp4::launch_fp4_quant_q_sm120(Q_t, q4, sfq, qm, Nq_pad,
-                                     /*sub_qm=*/true);
-  ffpa_fp4::launch_fp4_quant_k_sm120(K_t, k4, sfk,
-                                     km_f32.view({Nb, Nh_kv, kHeadDim}),
-                                     Nkv_pad, /*sub_km=*/true);
-  ffpa_fp4::launch_fp4_quant_vt_sm120(V_t, vt4, sfvt, Nkv_pad);
+  c10::cuda::CUDAStream stream_q =
+      c10::cuda::getStreamFromPool(false, Q.device().index());
+  c10::cuda::CUDAStream stream_v =
+      c10::cuda::getStreamFromPool(false, Q.device().index());
+  c10::cuda::CUDAStream stream_k =
+      c10::cuda::getStreamFromPool(false, Q.device().index());
+  c10::cuda::CUDAEvent ev_km;  // km_h/km_f32 ready (km two-stage kernels done)
+  c10::cuda::CUDAEvent ev_qm;  // qm ready (qm_h cast + qkm may start)
+  c10::cuda::CUDAEvent ev_q;   // q4/sfq ready (TMA descriptor data)
+  c10::cuda::CUDAEvent ev_v;   // vt4/sfvt ready
+  c10::cuda::CUDAEvent ev_k;   // k4/sfk ready
+  {
+    c10::cuda::CUDAStreamGuard guard(stream_q);
+    ffpa_fp4::launch_fp4_q_block_mean_sm120(Q_t, qm);
+    ev_qm.record(stream_q);
+    ffpa_fp4::launch_fp4_quant_q_sm120(Q_t, q4, sfq, qm, Nq_pad,
+                                       /*sub_qm=*/true);
+    ev_q.record(stream_q);
+  }
+  {
+    // quant_k depends on the main-stream km kernels (same-stream ordering
+    // inside launch_kv_mean_sm120); join via a recorded event, then it runs
+    // concurrently with the Q/V chains AND with delta_s on the main stream.
+    ev_km.record(stream);
+    c10::cuda::CUDAStreamGuard guard(stream_k);
+    ev_km.block(stream_k);
+    ffpa_fp4::launch_fp4_quant_k_sm120(K_t, k4, sfk,
+                                       km_f32.view({Nb, Nh_kv, kHeadDim}),
+                                       Nkv_pad, /*sub_km=*/true);
+    ev_k.record(stream_k);
+  }
+  {
+    c10::cuda::CUDAStreamGuard guard(stream_v);
+    ffpa_fp4::launch_fp4_quant_vt_sm120(V_t, vt4, sfvt, Nkv_pad);
+    ev_v.record(stream_v);
+  }
+  ev_qm.block(stream);
 
   // delta_s per 128-row Q block via the identity qm@(K-km)^T - qm.km^T ==
   // qm@K^T - 2*qm.km^T, fused in one wmma kernel (fp32 out, tail columns
@@ -1750,6 +1788,11 @@ void launch_cute_fwd_persist_d_fp4_sm120_impl(torch::Tensor Q, torch::Tensor K,
       softmax_lse.numel() > 0 ? softmax_lse.data_ptr<float>() : nullptr;
   auto O_ptr = reinterpret_cast<ElementO*>(O.data_ptr());
   const dim3 block(kNumThreads, 1, 1);
+  // Join the side-stream quantizers: the TMA descriptors below read the
+  // quantized workspaces, and the kernel consumes them.
+  ev_q.block(stream);
+  ev_v.block(stream);
+  ev_k.block(stream);
   // Grid dispatch - NOT two kernel variants: the kernel's strided work loop
   // degenerates to one iteration per CTA when gridDim.x == total_work (see
   // the scheduling contract comment in fp4/sm_120/persist_d.cuh). Dense
