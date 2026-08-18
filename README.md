@@ -86,7 +86,9 @@ Runnable benchmark are provided under [`bench`](./bench). The performance benchm
   <img src='./docs/assets/perf/ffpa_speedup_nvidia-geforce-rtx-5090_B1_H32_N8192_D320_T.png' width='400px'>
   <img src='./docs/assets/perf/ffpa_speedup_nvidia-geforce-rtx-5090_B1_H32_N8192_D512_T.png' width='400px'><br>
   <img src='./docs/assets/perf/ffpa_speedup_cutedsl_nvidia-h20z_B1_H32_N8192_D512_T.png' width='400px'>
-  <img src='./docs/assets/perf/ffpa_speedup_cutedsl_nvidia-h20z_B1_H32_N16384_D512_T.png' width='400px'>
+  <img src='./docs/assets/perf/ffpa_speedup_cutedsl_nvidia-h20z_B1_H32_N16384_D512_T.png' width='400px'><br>
+  <img src='./docs/assets/perf/ffpa_speedup_cutedsl_nvidia-b200_B1_H32_N8192_D512_T.png' width='400px'>
+  <img src='./docs/assets/perf/ffpa_speedup_cutedsl_nvidia-b200_B1_H32_N16384_D512_T.png' width='400px'>
 </div>
 
 ## Backends
@@ -103,6 +105,7 @@ FFPA supports multiple backends for the forward and backward pass, including: [`
 |Triton|sm>=80|✔|✔|320~1024|✔|**1.5x~5x**|sm>=80|
 |CuTe-DSL|sm>=80|✔|✔|320~1024|✖️|**1.5x~2x**|sm_80~89,120{a,f}|
 |CuTe-DSL|sm_90a|✔|✔|320~512|✖️|**3x~6x**|sm_90a|
+|CuTe-DSL|sm_100a|✔|✔|512|✖️|**6x~15x**|sm_100a|
 
 </div>
 
