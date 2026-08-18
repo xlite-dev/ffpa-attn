@@ -148,6 +148,9 @@ struct Fp4PersistDTraits {
 
   using SmemCopyAtomQ = Copy_Atom<SM75_U32x4_LDSM_N, Element>;
   using SmemCopyAtomKV = Copy_Atom<SM75_U32x4_LDSM_N, Element>;
+  // NOTE: SF smem->reg copies stay byte-granular: the SFA/SFB TV layouts
+  // are not 4-value contiguous, so a 32-bit copy atom fails cute's
+  // vectorization static assert (tried, falsified).
   using SmemCopyAtomSF = Copy_Atom<UniversalCopy<ElementSF>, ElementSF>;
 
   // 1 TMA barrier arrival per stage; tx bytes include data + SF (+ DS).
