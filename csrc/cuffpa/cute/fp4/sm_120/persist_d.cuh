@@ -859,10 +859,19 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp4_sm120(
       if (kv_tile == 0) {
         pv_gemm(tOrO_store, v_stg);
       } else {
-        Tensor tOrO = make_fragment_like(tOrO_store);
-        clear(tOrO);
-        pv_gemm(tOrO, v_stg);
-        softmax_fused.rescale_o(tOrO_store, tOrO);
+        // scores_scale == 1.0f exactly when the row max did not move this
+        // tile (~96% of dense tiles): O = O*1 + O_new needs no rescale at
+        // all. Warp-vote keeps both fragments on one uniform path.
+        const bool need_rescale = softmax_fused.scores_scale[0] != 1.0f ||
+                                  softmax_fused.scores_scale[1] != 1.0f;
+        if (__any_sync(0xffffffff, need_rescale)) {
+          Tensor tOrO = make_fragment_like(tOrO_store);
+          clear(tOrO);
+          pv_gemm(tOrO, v_stg);
+          softmax_fused.rescale_o(tOrO_store, tOrO);
+        } else {
+          pv_gemm(tOrO_store, v_stg);
+        }
       }
     }
 
