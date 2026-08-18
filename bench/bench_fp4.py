@@ -297,7 +297,7 @@ def parse_args():
     "--D",
     type=int,
     default=128,
-    help="Head dim (fp4: 64-multiples in {64,128,192,256})"
+    help="Head dim (fp4: any D%8==0 in [8,256], padded up to {64,128,192,256})"
   )
   p.add_argument(
     "--dtype",

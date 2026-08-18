@@ -242,7 +242,7 @@ class CUDABackend(Backend):
   enable_cute: bool | None = None
   enable_ws: bool = False  # For future use.
   enable_fp8: bool = False  # FP8 persist-D sm120 path (fp16/bf16 in).
-  enable_fp4: bool = False  # NVFP4 persist-D sm120 path (D in {64,128,192,256}).
+  enable_fp4: bool = False  # NVFP4 persist-D sm120 path (any D%8==0 within [8,256], pads up to {64,128,192,256}).
   fp8_smooth_k: bool = True  # FP8 only: subtract per-(b,h) K seq mean pre-quant.
   fp8_smooth_v: bool = False  # FP8 only: subtract per-(b,h) V dim mean.
   fp8_q_quant_method: str = "per_block"  # FP8 only: per_block / per_thread.

@@ -180,8 +180,11 @@ void launch_ffpa_attn_fwd_template(
           TORCH_CHECK(n_early % 128 == 0,
                       "ffpa_attn: fp8_hybrid_n_early must be multiple of 128");
           torch::Tensor Q_e, K_e, V_e;
+          // Q/K/V were already zero-padded above (fp4 shares the
+          // !force_fp8 pad branch), so stage1 sees D_pad-wide inputs:
+          // pass d_padded=false to avoid padding twice.
           prepare_hybrid_stage1(Q_e, K_e, V_e, Q, K, V, n_early, Nkv, Nq,
-                                causal, D_og, kHeadDim, d_padded);
+                                causal, kHeadDim, kHeadDim, false);
           auto O_e = torch::empty_like(Q_e);
           auto lse_e = torch::empty(
               {Nb, Nh, n_early},

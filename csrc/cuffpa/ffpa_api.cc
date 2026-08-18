@@ -114,26 +114,39 @@ void ffpa_attn_forward(torch::Tensor Q, torch::Tensor K, torch::Tensor V,
   const int head_dim_og = Q.size(3);
   const int head_dim_pad = (head_dim_og + 31) & ~31;
   const auto pad_backend = ffpa::get_backend_impl_hint();
+  const bool is_fp4 = pad_backend == ffpa::CudaBackendImpl::CUTE_TMA_FP4;
+  // fp4 pads to its own 64-multiple support set {64,128,192,256}; Q/K/V are
+  // zero-padded by the cuffpa launcher, only O is padded here (fp8 style).
+  const int head_dim_pad_fp4 = (head_dim_og + 63) & ~63;
   TORCH_CHECK(
-      pad_backend != ffpa::CudaBackendImpl::CUTE_TMA_FP4 ||
-          (head_dim_og % 64 == 0 && head_dim_og >= 64 && head_dim_og <= 256),
-      "ffpa_attn: the NVFP4 path (CUTE_TMA_FP4) requires head_dim in "
-      "{64,128,192,256} (64-multiples), got D=",
+      !is_fp4 || (head_dim_og % 8 == 0 && head_dim_pad_fp4 >= 64 &&
+                  head_dim_pad_fp4 <= 256),
+      "ffpa_attn: the NVFP4 path (CUTE_TMA_FP4) requires head_dim %8==0 "
+      "within [8,256] (any such D pads up to the nearest of "
+      "{64,128,192,256}), got D=",
       head_dim_og);
   torch::Tensor O_orig;
+  const int head_dim_dispatch = is_fp4 ? head_dim_pad_fp4 : head_dim_pad;
   const bool needs_pad = (pad_backend == ffpa::CudaBackendImpl::CUTE_TMA_FP8 ||
                           pad_backend == ffpa::CudaBackendImpl::CUTE_TMA ||
-                          pad_backend == ffpa::CudaBackendImpl::CUTE) &&
-                         head_dim_pad != head_dim_og;
+                          pad_backend == ffpa::CudaBackendImpl::CUTE ||
+                          pad_backend == ffpa::CudaBackendImpl::CUTE_TMA_FP4) &&
+                         head_dim_dispatch != head_dim_og;
   if (needs_pad) {
     TORCH_CHECK(head_dim_og % 8 == 0,
                 "ffpa_attn: non-32-multiple head_dim must be D%8==0, got D=",
                 head_dim_og);
-    TORCH_CHECK(head_dim_pad >= 32 && head_dim_pad <= 1024,
-                "ffpa_attn: padded head_dim must be in [32,1024], got ",
-                head_dim_pad);
+    if (is_fp4) {
+      TORCH_CHECK(head_dim_dispatch >= 64 && head_dim_dispatch <= 256,
+                  "ffpa_attn: fp4 padded head_dim must be in [64,256], got ",
+                  head_dim_dispatch);
+    } else {
+      TORCH_CHECK(head_dim_dispatch >= 32 && head_dim_dispatch <= 1024,
+                  "ffpa_attn: padded head_dim must be in [32,1024], got ",
+                  head_dim_dispatch);
+    }
     O_orig = O;
-    O = torch::empty({Q.size(0), Q.size(1), Q.size(2), head_dim_pad},
+    O = torch::empty({Q.size(0), Q.size(1), Q.size(2), head_dim_dispatch},
                      O.options());
   }
 
@@ -159,7 +172,7 @@ void ffpa_attn_forward(torch::Tensor Q, torch::Tensor K, torch::Tensor V,
 #endif
     } else if (acc == 1) {
       if (needs_pad)
-        ffpa_attn_fwd_fp16f32_d(FFPA_FWD_ARGS, head_dim_pad);
+        ffpa_attn_fwd_fp16f32_d(FFPA_FWD_ARGS, head_dim_dispatch);
       else
         ffpa_attn_fwd_fp16f32(FFPA_FWD_ARGS);
     } else {
@@ -172,7 +185,7 @@ void ffpa_attn_forward(torch::Tensor Q, torch::Tensor K, torch::Tensor V,
           "no bf16-acc mma PTX exists.");
     }
     if (needs_pad)
-      ffpa_attn_fwd_bf16f32_d(FFPA_FWD_ARGS, head_dim_pad);
+      ffpa_attn_fwd_bf16f32_d(FFPA_FWD_ARGS, head_dim_dispatch);
     else
       ffpa_attn_fwd_bf16f32(FFPA_FWD_ARGS);
   } else {

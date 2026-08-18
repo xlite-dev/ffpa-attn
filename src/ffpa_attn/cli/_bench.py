@@ -362,8 +362,8 @@ def _parse_args() -> argparse.Namespace:
     "(per-channel V + dim-mean subtraction, smooth-K off); "
     "'cute_tma_fp8_smkv' (alias 'fp8_smkv') enables smooth-K + smooth-V; "
     "'cute_tma_fp8_smkv_qk_int8' (alias 'fp8_smkv_qk_i8') adds int8 QK MMA. "
-    "'cute_tma_fp4' (alias 'fp4') selects the NVFP4 path (D in "
-    "{64,128,192,256}, e2m1 + ue4m3 block scales). "
+    "'cute_tma_fp4' (alias 'fp4') selects the NVFP4 path (any D%8==0 in "
+    "[8,256], padded up to {64,128,192,256}; e2m1 + ue4m3 block scales). "
     "Mutually exclusive with --fwd-tma/--cute when not 'auto'.",
   )
   parser.add_argument(
