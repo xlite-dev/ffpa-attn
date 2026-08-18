@@ -809,6 +809,10 @@ class ENV(object):
     extra_cuda_cflags.append("177")
     extra_cuda_cflags.append("-diag-suppress")
     extra_cuda_cflags.append("1886")
+    # 2908: deprecated implicit by-copy capture of "this" in third_party
+    # CUTLASS headers; upstream code, not ours to patch.
+    extra_cuda_cflags.append("-diag-suppress")
+    extra_cuda_cflags.append("2908")
     if ENV.FFPA_PTXAS_VERBOSE:
       extra_cuda_cflags.append("--ptxas-options=-v")
       extra_cuda_cflags.append("-Xptxas")

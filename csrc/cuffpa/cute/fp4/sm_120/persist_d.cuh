@@ -725,7 +725,7 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp4_sm120(
                              tOrP_uint32_view(i, mma_m));
       }
       uint32_t local_sfp = SFP_uint32_view(_0{}, _0{}, mma_m);
-      uint32_t peer_sfp = __shfl_xor_sync(int32_t(-1), local_sfp, 2);
+      uint32_t peer_sfp = __shfl_xor_sync(0xFFFFFFFFu, local_sfp, 2);
       if ((quad_id & 1) == 0) {
         uint32_t sfp = (local_sfp & MASK) | ((peer_sfp & MASK) << 8);
         tOrSFP_uint32_view(_0{}, mma_m) = sfp;

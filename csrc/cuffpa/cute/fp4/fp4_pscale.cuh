@@ -158,12 +158,12 @@ struct SoftmaxFused {
                                     acc_reduction_view(mi, make_coord(ei, ni)));
           }
           // merge the neighbour thread's 8-element half-group into 16
-          float max_recv = __shfl_xor_sync(int32_t(-1), AbsMaxP(mi, ni), 1);
+          float max_recv = __shfl_xor_sync(0xFFFFFFFFu, AbsMaxP(mi, ni), 1);
           AbsMaxP(mi, ni) = fmaxf(AbsMaxP(mi, ni), max_recv);
           row_max(mi) = fmaxf(row_max(mi), AbsMaxP(mi, ni));
         }
         // finish the row max across the quad
-        float max_recv = __shfl_xor_sync(int32_t(-1), row_max(mi), 2);
+        float max_recv = __shfl_xor_sync(0xFFFFFFFFu, row_max(mi), 2);
         row_max(mi) = fmaxf(row_max(mi), max_recv);
 
         const float max_scaled =
@@ -209,11 +209,11 @@ struct SoftmaxFused {
             local_max =
                 fmaxf(local_max, acc_reduction_view(mi, make_coord(ei, ni)));
           }
-          float max_recv = __shfl_xor_sync(int32_t(-1), local_max, 1);
+          float max_recv = __shfl_xor_sync(0xFFFFFFFFu, local_max, 1);
           AbsMaxP(mi, ni) = fmaxf(local_max, max_recv);
           row_max(mi) = fmaxf(row_max(mi), AbsMaxP(mi, ni));
         }
-        float max_recv = __shfl_xor_sync(int32_t(-1), row_max(mi), 2);
+        float max_recv = __shfl_xor_sync(0xFFFFFFFFu, row_max(mi), 2);
         row_max(mi) = fmaxf(row_max(mi), max_recv);
 
         float scores_max_cur =
@@ -261,7 +261,7 @@ struct SoftmaxFused {
     for (int mi = 0; mi < size(row_max); ++mi) {
       CUTE_UNROLL
       for (int i = 1; i < RowReductionThr; i <<= 1) {
-        float sum_recv = __shfl_xor_sync(int32_t(-1), row_sum(mi), i);
+        float sum_recv = __shfl_xor_sync(0xFFFFFFFFu, row_sum(mi), i);
         row_sum(mi) += sum_recv;
       }
       float sum = row_sum(mi);
