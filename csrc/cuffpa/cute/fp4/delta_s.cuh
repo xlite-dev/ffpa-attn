@@ -29,10 +29,10 @@ using namespace nvcuda;
 template <typename T, int kHeadDim>
 __global__ void delta_s_wmma_kernel(
     const T* __restrict__ qm,   // [Nb, Nh, Mb, kHeadDim] row-major
-    const T* __restrict__ k,    // [Nb, Nhkv, Nkv, kHeadDim] row-major
+    const T* __restrict__ k,    // [Nb, Nhkv, Nkv, d_og] row-major
     const T* __restrict__ qkm,  // [Nb, Nh, Mb] row-major
     float* __restrict__ ds,     // [Nb, Nh, Mb, Nkv_pad] row-major
-    int Nh, int Nh_kv, int Mb, int Nkv, int Nkv_pad) {
+    int Nh, int Nh_kv, int Mb, int Nkv, int Nkv_pad, int d_og) {
   namespace w = nvcuda::wmma;
   constexpr int kChunk = 64;   // K elements staged per pass
   constexpr int kLdAB = 72;    // kChunk + 8 halves (ldm multiple of 8)
@@ -54,8 +54,7 @@ __global__ void delta_s_wmma_kernel(
   T* sB = sA + 128 * kLdAB;
 
   const T* gA = qm + (long)(bh * Mb + tile_m * 128) * kHeadDim;
-  const T* gB =
-      k + ((long)((b * Nh_kv + h / (Nh / Nh_kv)) * Nkv) + n0) * kHeadDim;
+  const T* gB = k + ((long)((b * Nh_kv + h / (Nh / Nh_kv)) * Nkv) + n0) * d_og;
   constexpr int kVec4PerRow = kChunk / 8;  // 16B loads per staged row
 
   w::fragment<w::accumulator, 16, 16, 16, float> acc[8];
@@ -75,9 +74,12 @@ __global__ void delta_s_wmma_kernel(
       } else {
         *reinterpret_cast<uint4*>(sA + row * kLdAB + col) = uint4{0, 0, 0, 0};
       }
-      if (n0 + row < Nkv) {
+      // K rows are only d_og wide (d_og%8==0: 8-elem uint4 loads stay
+      // whole); guarded loads keep pad cols zero. qm is a padded
+      // kHeadDim-wide buffer whose pad cols are already 0.
+      if (n0 + row < Nkv && kc + col < d_og) {
         *reinterpret_cast<uint4*>(sB + row * kLdAB + col) =
-            *reinterpret_cast<const uint4*>(gB + row * kHeadDim + kc + col);
+            *reinterpret_cast<const uint4*>(gB + row * d_og + kc + col);
       } else {
         *reinterpret_cast<uint4*>(sB + row * kLdAB + col) = uint4{0, 0, 0, 0};
       }
@@ -142,7 +144,7 @@ __global__ void delta_s_wmma_kernel(
 template <typename T, int kHeadDim>
 inline void launch_fp4_delta_s_sm120(const T* qm, const T* k, const T* qkm,
                                      float* ds, int Nb, int Nh, int Nh_kv,
-                                     int Mb, int Nkv, int Nkv_pad,
+                                     int Mb, int Nkv, int Nkv_pad, int d_og,
                                      cudaStream_t stream) {
   const int tc = Nkv_pad / 128;
   const int m_tiles = (Mb + 127) / 128;
@@ -155,7 +157,7 @@ inline void launch_fp4_delta_s_sm120(const T* qm, const T* k, const T* qkm,
   cudaFuncSetAttribute(delta_s_wmma_kernel<T, kHeadDim>,
                        cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
   delta_s_wmma_kernel<T, kHeadDim><<<grid, 256, smem, stream>>>(
-      qm, k, qkm, ds, Nh, Nh_kv, Mb, Nkv, Nkv_pad);
+      qm, k, qkm, ds, Nh, Nh_kv, Mb, Nkv, Nkv_pad, d_og);
 }
 
 }  // namespace ffpa_fp4

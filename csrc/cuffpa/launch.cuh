@@ -141,10 +141,16 @@ void launch_ffpa_attn_fwd_template(
   // to the compiled kHeadDim. fp8 skips (quantize reads D_og natively); O is
   // padded by ffpa_api.cc. Only reachable via the CUTE_TMA/CUTE pad paths
   // (native/AUTO always have D_og == kHeadDim), so the TMA and cp.async
-  // dispatch below both see D_pad-wide Q/K/V.
+  // dispatch below both see D_pad-wide Q/K/V. fp4 also skips when D_og%8==0
+  // (the api gate): its quantize/delta_s kernels read the original width and
+  // zero-fill pad cols (no pad copy); FFPA_FP4_PAD_TORCH=1 forces the torch
+  // pad path for A/B comparison and as a fallback.
   const int D_og = Q.size(3);
   const bool d_padded = D_og != kHeadDim;
-  if (d_padded && !force_fp8) {
+  const bool fp4_fused =
+      force_fp4 && D_og % 8 == 0 && getenv("FFPA_FP4_PAD_TORCH") == nullptr;
+  const bool qkv_padded = d_padded && !force_fp8 && !fp4_fused;
+  if (qkv_padded) {
     const int64_t pad_cols = kHeadDim - D_og;
     Q = torch::constant_pad_nd(Q, {0, pad_cols}, 0.0);
     K = torch::constant_pad_nd(K, {0, pad_cols}, 0.0);
@@ -180,11 +186,14 @@ void launch_ffpa_attn_fwd_template(
           TORCH_CHECK(n_early % 128 == 0,
                       "ffpa_attn: fp8_hybrid_n_early must be multiple of 128");
           torch::Tensor Q_e, K_e, V_e;
-          // Q/K/V were already zero-padded above (fp4 shares the
-          // !force_fp8 pad branch), so stage1 sees D_pad-wide inputs:
-          // pass d_padded=false to avoid padding twice.
+          // Stage-1 fp16 kernel needs D_pad-wide inputs: it must pad the
+          // early-row slices only on the fused path (Q/K/V still original
+          // width); the torch-padded path is already kHeadDim-wide.
+          const bool stage1_needs_pad = d_padded && !qkv_padded;
           prepare_hybrid_stage1(Q_e, K_e, V_e, Q, K, V, n_early, Nkv, Nq,
-                                causal, kHeadDim, kHeadDim, false);
+                                causal,
+                                stage1_needs_pad ? D_og : (int64_t)kHeadDim,
+                                kHeadDim, stage1_needs_pad);
           auto O_e = torch::empty_like(Q_e);
           auto lse_e = torch::empty(
               {Nb, Nh, n_early},

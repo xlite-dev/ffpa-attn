@@ -1653,7 +1653,7 @@ void launch_cute_fwd_persist_d_fp4_sm120_impl(torch::Tensor Q, torch::Tensor K,
     ffpa_fp8::launch_kv_mean_sm120<kDataType, kHeadDim>(
         k_ptr, reinterpret_cast<kDataType*>(km_h.data_ptr()),
         km_f32.data_ptr<float>(), km_partials.data_ptr<float>(), Nb, Nh_kv, Nkv,
-        kHeadDim, stream);
+        static_cast<int>(K.size(3)), stream);
   }
 
   // Quantize kernels take (B,S,H,D)-strided inputs; pass the (B,H,N,D)
@@ -1682,7 +1682,8 @@ void launch_cute_fwd_persist_d_fp4_sm120_impl(torch::Tensor Q, torch::Tensor K,
     ffpa_fp4::launch_fp4_delta_s_sm120<kDataType, kHeadDim>(
         reinterpret_cast<const kDataType*>(qm_h.data_ptr()), k_ptr,
         reinterpret_cast<const kDataType*>(qkm.data_ptr()),
-        delta_s.data_ptr<float>(), Nb, Nh, Nh_kv, Mb, Nkv, Nkv_pad, stream);
+        delta_s.data_ptr<float>(), Nb, Nh, Nh_kv, Mb, Nkv, Nkv_pad,
+        static_cast<int>(K.size(3)), stream);
   }
 
   const long total_q_pad = (long)Nb * Nh * Nq_pad;
