@@ -596,6 +596,12 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp4_sm120(
   Tensor tOrP = make_tensor_like<Element>(typename Traits::LayoutP{});
   Tensor tOrSFP = make_tensor<ElementSF>(typename Traits::LayoutSFP{});
 
+  auto smem_tiled_copy_Q = make_tiled_copy_A(SmemCopyAtomQ{}, tiled_mma_qk);
+  auto smem_thr_copy_Q = smem_tiled_copy_Q.get_thread_slice(wg_tid);
+  Tensor tSsQ =
+      smem_thr_copy_Q.partition_S(as_position_independent_swizzle_tensor(sQ));
+  Tensor tSrQ_copy_view = smem_thr_copy_Q.retile_D(tSrQ);
+
   auto smem_tiled_copy_K = make_tiled_copy_B(SmemCopyAtomKV{}, tiled_mma_qk);
   auto smem_thr_copy_K = smem_tiled_copy_K.get_thread_slice(wg_tid);
   Tensor tSsK =
@@ -775,6 +781,12 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp4_sm120(
       TmaBarrier::wait(&q_full, w & 1);
       cutlass::arch::fence_view_async_shared();
     }
+    // Q/SFQ are per-work constants: load the mma fragments once here, not
+    // inside the kv_tile loop. Without this the A/SFA asm operands are
+    // uninitialized and cicc folds them to 0: QK degenerates to delta_s
+    // (rank-1 mean attention), which the probe tolerances masked.
+    copy(smem_tiled_copy_Q, tSsQ, tSrQ_copy_view);
+    copy(smem_tiled_copy_SFQ, tSsSFQ, tSrSFQ_copy_view);
 
     clear(tOrO_store);
 
