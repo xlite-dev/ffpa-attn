@@ -1808,8 +1808,9 @@ void launch_cute_fwd_persist_d_fp4_sm120_pp_impl(
     torch::Tensor softmax_lse, int causal, double softmax_scale,
     int q_start_row = 0) {
   using namespace cute;
-  constexpr int kBr = 64;
-  constexpr int kBc = 64;
+  constexpr int kBr = 64;       // mma rows per consumer
+  constexpr int kWorkRows = 128;  // q tile rows per work
+  constexpr int kBc = 128;
   constexpr int kNumThreads = 384;
   constexpr int kPad = 128;  // qm/delta_s/SF gmem stay 128-row granular
 
@@ -1905,7 +1906,7 @@ void launch_cute_fwd_persist_d_fp4_sm120_pp_impl(
                   make_shape(total_q_pad, Int<kHeadDim>{}),
                   make_stride(Int<kHeadDim>{}, _1{}));
   auto tma_q = make_tma_copy(SM90_TMA_LOAD{}, gQ, SmemLayoutQ{},
-                             Shape<Int<kBr>, Int<kHeadDim>>{}, _1{});
+                             Shape<Int<kWorkRows>, Int<kHeadDim>>{}, _1{});
   auto gK =
       make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(k4.data_ptr())),
                   make_shape(total_kv_pad, Int<kHeadDim>{}),
@@ -1930,7 +1931,7 @@ void launch_cute_fwd_persist_d_fp4_sm120_pp_impl(
       make_gmem_ptr(reinterpret_cast<ElementSF*>(sfq.data_ptr())), layout_SFQ);
   auto tma_sfq =
       make_tma_copy<uint16_t>(SM90_TMA_LOAD{}, mSFQ, SmemLayoutSFQ{},
-                              Shape<Int<kBr>, Int<kHeadDim>>{}, _1{});
+                              Shape<Int<kWorkRows>, Int<kHeadDim>>{}, _1{});
   auto layout_SFK = BlkScaledConfig::tile_atom_to_shape_SFQKV(
       make_shape(Nkv_pad, Int<kHeadDim>{}, Nh_kv, Nb));
   auto mSFK = make_tensor(
@@ -1956,13 +1957,13 @@ void launch_cute_fwd_persist_d_fp4_sm120_pp_impl(
   constexpr int kSmemBytes = Traits::kSmemBytes;
   TORCH_CHECK(q_start_row >= 0 && q_start_row < Nq,
               "ffpa_attn: q_start_row must be in [0, Nq)");
-  TORCH_CHECK(q_start_row % kBr == 0,
-              "ffpa_attn: q_start_row must be a multiple of kBr=64");
+  TORCH_CHECK(q_start_row % kWorkRows == 0,
+              "ffpa_attn: q_start_row must be a multiple of 128");
   float* softmax_lse_ptr =
       softmax_lse.numel() > 0 ? softmax_lse.data_ptr<float>() : nullptr;
   auto O_ptr = reinterpret_cast<ElementO*>(O.data_ptr());
   const dim3 block(kNumThreads, 1, 1);
-  const int mb = (Nq - q_start_row + kBr - 1) / kBr;
+  const int mb = (Nq - q_start_row + kWorkRows - 1) / kWorkRows;
   const int total_work = mb * Nb * Nh;
   const int num_ctas =
       causal ? total_work : std::min(total_work, prop->multiProcessorCount);

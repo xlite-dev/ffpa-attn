@@ -54,21 +54,34 @@ namespace ffpa_fp4 {
 using TmaBarrier = cutlass::arch::ClusterTransactionBarrier;
 using CtaBarrier = cutlass::arch::ClusterBarrier;
 
-// Ping-pong traits: SM120 blockscaled 16x32x64 mma tiled 4x1x1 over a
-// (64, 32, 128) tile per consumer warpgroup (M4N1: 4 warps x 16 rows).
+// Split-M ping-pong traits: SM120 blockscaled 16x32x64 mma tiled 4x1x1
+// (M4N1: 4 warps x 16 rows = 64 rows per consumer warpgroup). Each work
+// covers a kWorkRows=128 Q tile; the two consumers each own one 64-row
+// half and stream the FULL kv range independently (kv is issued twice, once
+// per cid buffer — DRAM headroom is large). Works therefore stay at 128-row
+// granularity: the earlier 64-row-work split-KV variant doubled per-work
+// fixed cost (merge epilogue + q_full/epilogue_done round trips + lse/qkm
+// traffic) and lost to the single-consumer kernel; ncu pinned the excess
+// on LSU cycles (mbarrier spins + merge smem), not on tensor/XU.
 template <typename ElementO_>
 struct Fp4PersistDPPTraits {
-  static constexpr int kBr = 64;
-  static constexpr int kBc = 64;
+  static constexpr int kBr = 64;       // mma rows per consumer
+  static constexpr int kWorkRows = 128;  // q tile rows per work
+  static constexpr int kBc = 128;
   static constexpr int kHeadDim = 128;
   static constexpr int kStagesK = 2;  // per consumer
+  // V double buffer: the v_empty arrive follows the (async) tcgen05 smem
+  // reads, and with a single buffer the producer's next V TMA can land
+  // before those reads retire — intermittent NaN under many-work causal
+  // schedules. The second stage widens the window by a full tile, same
+  // margin the 3-stage single-consumer kernel enjoys.
   static constexpr int kStagesV = 1;  // per consumer
 
   using Element = cutlass::float_e2m1_t;
   using ElementSF = cutlass::float_ue4m3_t;
   using ElementO = ElementO_;
 
-  using TileShape_MNK = Shape<_64, _64, _128>;
+  using TileShape_MNK = Shape<_64, _128, _128>;
   using MMAAtom =
       MMA_Atom<cute::SM120::BLOCKSCALED::SM120_16x32x64_TN_VS_NVFP4>;
   using AtomLayoutMNK = Layout<Shape<_4, _1, _1>>;
@@ -79,11 +92,15 @@ struct Fp4PersistDPPTraits {
   using SmemLayoutAtomQK =
       decltype(cutlass::gemm::collective::detail::sm120_rr_smem_selector<
                Element, Int<kHeadDim>>());
-  using SmemLayoutAtomVt =
-      decltype(cutlass::gemm::collective::detail::sm120_rr_smem_selector<
-               Element, Int<kBc>>());
-  using SmemLayoutQ = decltype(tile_to_shape(SmemLayoutAtomQK{},
-                                             Shape<Int<kBr>, Int<kHeadDim>>{}));
+  using SmemLayoutAtomVt = SmemLayoutAtomQK;  // kBc == kHeadDim
+  using SmemLayoutQ = decltype(tile_to_shape(
+      SmemLayoutAtomQK{},
+      Shape<Int<kWorkRows>, Int<kHeadDim>>{}));
+  // 64-row half of the Q tile (same column-stacked atom layout; the two
+  // halves tile the full layout, so a half tensor at the cid byte offset
+  // aliases the full tensor's rows [cid*64, cid*64+64)).
+  using SmemLayoutQHalf = decltype(tile_to_shape(
+      SmemLayoutAtomQK{}, Shape<Int<kBr>, Int<kHeadDim>>{}));
   using SmemLayoutK = decltype(tile_to_shape(
       SmemLayoutAtomQK{},
       make_shape(Int<kBc>{}, Int<kHeadDim>{}, Int<kStagesK>{})));
@@ -98,8 +115,10 @@ struct Fp4PersistDPPTraits {
       TiledMmaQK{}, TileShape_MNK{}));
   using SmemLayoutAtomSFVt = decltype(BlkScaledConfig::deduce_smem_layoutSFVt(
       TiledMmaPV{}, Shape<Int<kBr>, Int<kHeadDim>, Int<kBc>>{}));
-  using SmemLayoutSFQ = decltype(make_layout(shape(SmemLayoutAtomSFQ{}),
-                                             stride(SmemLayoutAtomSFQ{})));
+  using SmemLayoutSFQ = decltype(tile_to_shape(
+      SmemLayoutAtomSFQ{}, Shape<Int<kWorkRows>, Int<kHeadDim>>{}));
+  using SmemLayoutSFQHalf = decltype(tile_to_shape(
+      SmemLayoutAtomSFQ{}, Shape<Int<kBr>, Int<kHeadDim>>{}));
   using SmemLayoutSFK =
       decltype(make_layout(append(shape(SmemLayoutAtomSFK{}), Int<kStagesK>{}),
                            append(stride(SmemLayoutAtomSFK{}),
@@ -163,8 +182,12 @@ struct Fp4PersistDPPTraits {
   // (16KB), both aliasing q_base after the KV loop consumed everything.
   static constexpr int kQBytes =
       int(cute::bits_to_bytes(size(SmemLayoutQ{}) * 4));
+  static constexpr int kQBytesHalf =
+      int(cute::bits_to_bytes(size(SmemLayoutQHalf{}) * 4));
   static constexpr int kSFQBytes =
       int(cute::bits_to_bytes(cosize(SmemLayoutSFQ{}) * 8));
+  static constexpr int kSFQBytesHalf =
+      int(cute::bits_to_bytes(cosize(SmemLayoutSFQHalf{}) * 8));
   static constexpr int kKBytesStage =
       int(cute::bits_to_bytes(size(take<0, 2>(SmemLayoutK{})) * 4));
   static constexpr int kSFKBytesStage =
@@ -182,17 +205,10 @@ struct Fp4PersistDPPTraits {
   static constexpr int kOffSFQ = kOffQ + kQBytes;
   static constexpr int kOffC0 = (kOffSFQ + kSFQBytes + 1023) / 1024 * 1024;
   static constexpr int kOffC1 = (kOffC0 + kCidBytes + 1023) / 1024 * 1024;
-  static constexpr int kSmemNatural = (kOffC1 + kCidBytes + 1023) / 1024 * 1024;
-  // Round the window up to the split-KV merge buffer need (fp32 O kBr x
-  // kHeadDim + 128 threads x 16B stats); smem is far from the 99KB budget.
-  static constexpr int kMergeBytes = kBr * kHeadDim * 4 + 128 * 16;
-  static constexpr int kSmemBytes = kSmemNatural >= kMergeBytes
-                                        ? kSmemNatural
-                                        : (kMergeBytes + 1023) / 1024 * 1024;
+  static constexpr int kSmemBytes = (kOffC1 + kCidBytes + 1023) / 1024 * 1024;
   static_assert(kOffC0 % 1024 == 0 && kOffC1 % 1024 == 0, "SW smem alignment");
-  static_assert(kSmemBytes >= kMergeBytes, "merge buffer must fit");
   static_assert(kSmemBytes <= 101376, "smem budget");
-  static_assert(kBr * kHeadDim * 2 <= kSmemBytes,
+  static_assert(kWorkRows * kHeadDim * 2 <= kSmemBytes,
                 "O staging must fit the freed smem");
 };
 
@@ -235,6 +251,7 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp4_sm120_pp(
   using BlkScaledConfig = typename Traits::BlkScaledConfig;
 
   constexpr int kBr = Traits::kBr;
+  constexpr int kWorkRows = Traits::kWorkRows;
   constexpr int kBc = Traits::kBc;
   constexpr int kHeadDim = Traits::kHeadDim;
   constexpr int kStagesK = Traits::kStagesK;
@@ -258,7 +275,7 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp4_sm120_pp(
       is_producer ? tid : (tid - kProducerThreads) % kConsumerThreads;
 
   // Work decomposition: 64-row Q tiles.
-  const int MB = (Nq - q_start_row + kBr - 1) / kBr;
+  const int MB = (Nq - q_start_row + kWorkRows - 1) / kWorkRows;
   const int total_work = MB * Nb * Nh;
 
   extern __shared__ __align__(1024) char shm[];
@@ -267,8 +284,8 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp4_sm120_pp(
   __shared__ uint64_t q_full;
   __shared__ uint64_t k_full[kNumConsumers][kStagesK];
   __shared__ uint64_t k_empty[kNumConsumers][kStagesK];
-  __shared__ uint64_t v_full[kNumConsumers];
-  __shared__ uint64_t v_empty[kNumConsumers];
+  __shared__ uint64_t v_full[kNumConsumers][kStagesV];
+  __shared__ uint64_t v_empty[kNumConsumers][kStagesV];
   __shared__ uint64_t epilogue_done;
 
   if (tid == 0) {
@@ -279,8 +296,10 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp4_sm120_pp(
         CtaBarrier::init(&k_empty[cid][s], kConsumerThreads);
       }
       for (int s = 0; s < kStagesV; ++s) {
-        TmaBarrier::init(&v_full[cid], 1);
-        CtaBarrier::init(&v_empty[cid], kConsumerThreads);
+        for (int sv = 0; sv < kStagesV; ++sv) {
+          TmaBarrier::init(&v_full[cid][sv], 1);
+          CtaBarrier::init(&v_empty[cid][sv], kConsumerThreads);
+        }
       }
     }
     CtaBarrier::init(&epilogue_done, 2 * kConsumerThreads);
@@ -370,7 +389,11 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp4_sm120_pp(
 
       // Per-cid own-tile counters drive stage/phase across works (never
       // re-initialized, PTX ISA 9.7.13.15.9).
-      int own_next[2] = {0, 0};  // next own-tile index to issue per cid
+      // Global issue counters per cid (never reset across works): every
+      // mbarrier phase below is derived from them, mirroring the single
+      // consumer kernel's global tile counter g.
+      int own_seq_k[2] = {0, 0};  // K loads issued per cid
+      int own_seq_v[2] = {0, 0};  // V loads issued per cid
       int w = 0;
       for (int work_id = blockIdx.x; work_id < total_work;
            work_id += gridDim.x, ++w) {
@@ -380,7 +403,7 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp4_sm120_pp(
         const int b = bh / Nh;
         const int Nh_id = bh % Nh;
         const int kv_head_idx = Nh_id / group_size;
-        const int q_tile_abs = Q_tile_id + q_start_row / kBr;
+        const int q_tile_abs = Q_tile_id + q_start_row / kWorkRows;
         const int q_bh = bh;
         const int kv_bh = b * Nh_kv + kv_head_idx;
         const int q_row_offset = q_bh * Nq_pad + q_start_row;
@@ -388,7 +411,7 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp4_sm120_pp(
         const int v_row_base = kv_bh * kHeadDim;
 
         auto gQ = local_tile(domain_offset(make_coord(q_row_offset, _0{}), mQ),
-                             Shape<Int<kBr>, Int<kHeadDim>>{},
+                             Shape<Int<kWorkRows>, Int<kHeadDim>>{},
                              make_coord(Q_tile_id, _0{}));
         auto gK =
             local_tile(domain_offset(make_coord(kv_row_offset, _0{}), mK),
@@ -396,19 +419,19 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp4_sm120_pp(
         auto gV =
             local_tile(domain_offset(make_coord(v_row_base, _0{}), mV),
                        Shape<Int<kHeadDim>, Int<kBc>>{}, make_coord(_0{}, _));
-        auto gSFQ =
-            local_tile(mSFQ(_, _, Nh_id, b), Shape<Int<kBr>, Int<kHeadDim>>{},
-                       make_coord(q_tile_abs, _0{}));
+        auto gSFQ = local_tile(mSFQ(_, _, Nh_id, b),
+                               Shape<Int<kWorkRows>, Int<kHeadDim>>{},
+                               make_coord(q_tile_abs, _0{}));
         auto gSFK =
             local_tile(mSFK(_, _, kv_head_idx, b),
                        Shape<Int<kBc>, Int<kHeadDim>>{}, make_coord(_, _0{}));
         auto gSFVt =
             local_tile(mSFVt(_, _, kv_head_idx, b),
                        Shape<Int<kHeadDim>, Int<kBc>>{}, make_coord(_0{}, _));
-        // DS rows follow the mb128 block (qm granularity); Q tile 2j/2j+1
-        // share one 128-row block.
+        // DS rows follow the mb128 block (qm granularity): one 128-row
+        // work tile == one qm block.
         auto gDS = local_tile(mDS(_, _, Nh_id, b), Shape<_128, Int<kBc>>{},
-                              make_coord(q_tile_abs / 2, _));
+                              make_coord(q_tile_abs, _));
 
         auto tQgQ = q_slice.partition_S(gQ);
         auto tQgSFQ = sfq_slice.partition_S(gSFQ);
@@ -418,12 +441,16 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp4_sm120_pp(
         auto tVgSFVt = group_modes<0, 3>(sfvt_slice.partition_S(gSFVt));
         auto tDSgDS = group_modes<0, 3>(ds_slice.partition_S(gDS));
 
-        const int Tc_eff = causal ? min(Tc, ((q_start_row + Q_tile_id * kBr +
-                                              kBr - 1 + kv_offset) /
-                                             kBc) +
-                                                1)
-                                  : Tc;
-        const int own_tiles[2] = {(Tc_eff + 1) / 2, Tc_eff / 2};
+        const int Tc_eff =
+            causal
+                ? min(Tc, ((q_start_row + Q_tile_id * kWorkRows + kWorkRows -
+                            1 + kv_offset) /
+                           kBc) +
+                              1)
+                : Tc;
+        // Both consumers stream the full tile range (split-M): kv tiles
+        // are issued twice, once per cid buffer.
+        const int own_tiles[2] = {Tc_eff, Tc_eff};
 
         // O staging/merge buffer aliases q_base: the previous work's
         // epilogue must be fully retired first.
@@ -433,71 +460,84 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp4_sm120_pp(
         copy(tma_q.with(q_full), tQgQ, tQsQ);
         copy(tma_sfq.with(q_full), tQgSFQ, tQsSFQ);
 
-        // Warmup: first K tile per cid into stage 0 (global tile = cid).
+        // Warmup: this work's first K tile per cid (kv tile 0) into the
+        // stage indexed by the global own sequence.
         for (int cid = 0; cid < kNumConsumers; ++cid) {
-          if (own_next[cid] < own_tiles[cid]) {
-            CtaBarrier::wait(&k_empty[cid][0], (own_next[cid] / kStagesK) & 1);
-            TmaBarrier::arrive_and_expect_tx(&k_full[cid][0],
+          if (own_tiles[cid] > 0) {
+            const int seq = own_seq_k[cid];
+            const int stage = seq % kStagesK;
+            const int phase = (seq / kStagesK) & 1;
+            CtaBarrier::wait(&k_empty[cid][stage], phase);
+            TmaBarrier::arrive_and_expect_tx(&k_full[cid][stage],
                                              Traits::kTxBytesK);
             if (cid == 0) {
-              copy(tma_k.with(k_full[0][0]), tKgK(_, cid), tKsK0(_, 0));
-              copy(tma_sfk.with(k_full[0][0]), tKgSFK(_, cid), tKsSFK0(_, 0));
-              copy(tma_ds.with(k_full[0][0]), tDSgDS(_, cid), tDSsDS0(_, 0));
+              copy(tma_k.with(k_full[0][stage]), tKgK(_, 0), tKsK0(_, stage));
+              copy(tma_sfk.with(k_full[0][stage]), tKgSFK(_, 0),
+                   tKsSFK0(_, stage));
+              copy(tma_ds.with(k_full[0][stage]), tDSgDS(_, 0),
+                   tDSsDS0(_, stage));
             } else {
-              copy(tma_k.with(k_full[1][0]), tKgK(_, cid), tKsK1(_, 0));
-              copy(tma_sfk.with(k_full[1][0]), tKgSFK(_, cid), tKsSFK1(_, 0));
-              copy(tma_ds.with(k_full[1][0]), tDSgDS(_, cid), tDSsDS1(_, 0));
+              copy(tma_k.with(k_full[1][stage]), tKgK(_, 0), tKsK1(_, stage));
+              copy(tma_sfk.with(k_full[1][stage]), tKgSFK(_, 0),
+                   tKsSFK1(_, stage));
+              copy(tma_ds.with(k_full[1][stage]), tDSgDS(_, 0),
+                   tDSsDS1(_, stage));
             }
-            ++own_next[cid];
+            ++own_seq_k[cid];
           }
         }
 
-        // Steady: per global tile, K-prefetch (own tile + 1) then V
-        // (current). K(cid, L) sits Sk own-tiles ahead; the V single
-        // buffer's issue->wait window spans QK+softmax+quant of the same
-        // tile.
+        // Steady: per kv tile, both cids get K(tile+1) prefetch then V
+        // (tile). All phases come from the global issue counters; the
+        // prefetch target stays inside this work (same as the baseline's
+        // tile + kStages - 1 bound).
         for (int tile = 0; tile < Tc_eff; ++tile) {
-          const int cid = tile & 1;
-          const int L = tile >> 1;
-          {
-            const int Lp = L + 1;
-            if (Lp < own_tiles[cid]) {
-              const int tile_p = 2 * Lp + cid;
-              const int stage = Lp % kStagesK;
-              const int phase = (Lp / kStagesK) & 1;
-              CtaBarrier::wait(&k_empty[cid][stage], phase);
-              TmaBarrier::arrive_and_expect_tx(&k_full[cid][stage],
-                                               Traits::kTxBytesK);
-              if (cid == 0) {
-                copy(tma_k.with(k_full[0][stage]), tKgK(_, tile_p),
-                     tKsK0(_, stage));
-                copy(tma_sfk.with(k_full[0][stage]), tKgSFK(_, tile_p),
-                     tKsSFK0(_, stage));
-                copy(tma_ds.with(k_full[0][stage]), tDSgDS(_, tile_p),
-                     tDSsDS0(_, stage));
-              } else {
-                copy(tma_k.with(k_full[1][stage]), tKgK(_, tile_p),
-                     tKsK1(_, stage));
-                copy(tma_sfk.with(k_full[1][stage]), tKgSFK(_, tile_p),
-                     tKsSFK1(_, stage));
-                copy(tma_ds.with(k_full[1][stage]), tDSgDS(_, tile_p),
-                     tDSsDS1(_, stage));
+          for (int cid = 0; cid < kNumConsumers; ++cid) {
+            {
+              const int tile_p = tile + 1;
+              if (tile_p < own_tiles[cid]) {
+                const int seq = own_seq_k[cid];
+                const int stage = seq % kStagesK;
+                const int phase = (seq / kStagesK) & 1;
+                CtaBarrier::wait(&k_empty[cid][stage], phase);
+                TmaBarrier::arrive_and_expect_tx(&k_full[cid][stage],
+                                                 Traits::kTxBytesK);
+                if (cid == 0) {
+                  copy(tma_k.with(k_full[0][stage]), tKgK(_, tile_p),
+                       tKsK0(_, stage));
+                  copy(tma_sfk.with(k_full[0][stage]), tKgSFK(_, tile_p),
+                       tKsSFK0(_, stage));
+                  copy(tma_ds.with(k_full[0][stage]), tDSgDS(_, tile_p),
+                       tDSsDS0(_, stage));
+                } else {
+                  copy(tma_k.with(k_full[1][stage]), tKgK(_, tile_p),
+                       tKsK1(_, stage));
+                  copy(tma_sfk.with(k_full[1][stage]), tKgSFK(_, tile_p),
+                       tKsSFK1(_, stage));
+                  copy(tma_ds.with(k_full[1][stage]), tDSgDS(_, tile_p),
+                       tDSsDS1(_, stage));
+                }
+                ++own_seq_k[cid];
               }
             }
-          }
-          {
-            const int stage = 0;  // single V buffer
-            const int phase = L & 1;
-            CtaBarrier::wait(&v_empty[cid], phase);
-            TmaBarrier::arrive_and_expect_tx(&v_full[cid], Traits::kTxBytesV);
-            if (cid == 0) {
-              copy(tma_v.with(v_full[0]), tVgV(_, tile), tVsV0(_, stage));
-              copy(tma_sfvt.with(v_full[0]), tVgSFVt(_, tile),
-                   tVsSFVt0(_, stage));
-            } else {
-              copy(tma_v.with(v_full[1]), tVgV(_, tile), tVsV1(_, stage));
-              copy(tma_sfvt.with(v_full[1]), tVgSFVt(_, tile),
-                   tVsSFVt1(_, stage));
+            {
+              const int vstage = own_seq_v[cid] % kStagesV;
+              const int phase = (own_seq_v[cid] / kStagesV) & 1;
+              CtaBarrier::wait(&v_empty[cid][vstage], phase);
+              TmaBarrier::arrive_and_expect_tx(&v_full[cid][vstage],
+                                               Traits::kTxBytesV);
+              if (cid == 0) {
+                copy(tma_v.with(v_full[0][vstage]), tVgV(_, tile),
+                     tVsV0(_, vstage));
+                copy(tma_sfvt.with(v_full[0][vstage]), tVgSFVt(_, tile),
+                     tVsSFVt0(_, vstage));
+              } else {
+                copy(tma_v.with(v_full[1][vstage]), tVgV(_, tile),
+                     tVsV1(_, vstage));
+                copy(tma_sfvt.with(v_full[1][vstage]), tVgSFVt(_, tile),
+                     tVsSFVt1(_, vstage));
+              }
+              ++own_seq_v[cid];
             }
           }
         }
@@ -512,16 +552,23 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp4_sm120_pp(
   for (int s = 0; s < kStagesK; ++s)
     CtaBarrier::arrive(&k_empty[cid][s]);
   for (int s = 0; s < kStagesV; ++s)
-    CtaBarrier::arrive(&v_empty[cid]);
+    CtaBarrier::arrive(&v_empty[cid][s]);
 
   TiledMmaQK tiled_mma_qk;
   TiledMmaPV tiled_mma_pv;
   auto thread_mma_qk = tiled_mma_qk.get_thread_slice(wg_tid);
   auto thread_mma_pv = tiled_mma_pv.get_thread_slice(wg_tid);
 
-  auto sQ = make_tensor(make_smem_ptr<Element>(shm + kOffQ), SmemLayoutQ{});
-  auto sSFQ =
-      make_tensor(make_smem_ptr<ElementSF>(shm + kOffSFQ), SmemLayoutSFQ{});
+  // Full-tile (128-row) Q/SFQ feed the TMA; each consumer works on its
+  // 64-row half — a half-layout tensor at the cid byte offset (the halves
+  // tile the full column-stacked layout).
+  auto sQ = make_tensor(
+      make_smem_ptr<Element>(q_base + cid * Traits::kQBytesHalf),
+      typename Traits::SmemLayoutQHalf{});
+  auto sSFQ = make_tensor(
+      make_smem_ptr<ElementSF>(
+          reinterpret_cast<ElementSF*>(shm + kOffSFQ) + cid * Traits::kSFQBytesHalf),
+      typename Traits::SmemLayoutSFQHalf{});
   auto sK = make_tensor(make_smem_ptr<Element>(shm + kCidOff(cid) + 0),
                         SmemLayoutK{});
   auto sSFK =
@@ -614,13 +661,13 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp4_sm120_pp(
   const float scale_orig = scale;
   const float softmax_scale_log2 = scale * FFPA_M_LOG2E;
 
-  // delta_s broadcast add: 64 kv columns = 16 float4 slots (vs 32 at
-  // kBc=128); quad pair addressing is the SA3 verbatim pattern.
+  // delta_s broadcast add: kBc=128 kv columns = 32 float4 slots; the SA3
+  // verbatim quad-pair addressing (identical to the single-consumer kernel).
   auto add_delta_s = [&](auto& acc, int stage) {
     auto tSsDS_stage = recast<float4>(sDS(_, _, stage));
     auto acc_float4 = recast<float4>(acc);
     int quad_id = (wg_tid % 4) * 2;
-    for (int i = 0; i < 2; i++) {
+    for (int i = 0; i < 4; i++) {
       auto num = quad_id + i * 8;
       float4 delta_s_0 =
           tSsDS_stage(make_coord(_0{}, _0{}), make_coord(num, _0{}));
@@ -710,7 +757,7 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp4_sm120_pp(
         copy_v_block(v_block + 1, stage);
         quantize(v_block + 1, tSrS_conversion_view);
       } else {
-        CtaBarrier::arrive(&v_empty[cid]);
+        CtaBarrier::arrive(&v_empty[cid][stage]);
       }
     }
   };
@@ -735,19 +782,23 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp4_sm120_pp(
     const int Nb_id = bh / Nh;
     const int Nh_id = bh % Nh;
     const int kv_head_idx = Nh_id / group_size;
-    const int Br_base = Q_tile_id * kBr;
+    // This WG's 64-row window inside the 128-row work tile.
+    const int Br_base = Q_tile_id * kWorkRows + cid * kBr;
     const int causal_thresh_row0 = q_start_row + Br_base + kv_offset;
     const int Tc_eff =
         causal
-            ? min(Tc, ((q_start_row + Br_base + kBr - 1 + kv_offset) / kBc) + 1)
+            ? min(Tc, ((q_start_row + Q_tile_id * kWorkRows + kWorkRows - 1 +
+                        kv_offset) /
+                       kBc) +
+                          1)
             : Tc;
     const int mask_start_tile =
         causal ? max(0, (causal_thresh_row0 + 1) / kBc) : INT_MAX;
     const int q_bh = bh;
     const int kv_bh = Nb_id * Nh_kv + kv_head_idx;
-    const int q_tile_abs = Q_tile_id + q_start_row / kBr;
+    const int q_tile_abs = Q_tile_id + q_start_row / kWorkRows;
     const int O_row_offset = q_bh * Nq + q_start_row;
-    const int own_tiles = (Tc_eff + (1 - cid)) / 2;
+    const int own_tiles = Tc_eff;  // split-M: full range per consumer
 
     if (w > 0) {
       TmaBarrier::wait(&q_full, w & 1);
@@ -755,22 +806,14 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp4_sm120_pp(
     }
 
     clear(tOrO_store);
-    // A cid with no own tiles (odd Tc_eff tail / causal cutoff) still
-    // enters the merge: neutral stats so its weight degenerates to 0.
-    if (own_tiles == 0) {
-      CUTLASS_PRAGMA_UNROLL
-      for (int mi = 0; mi < kSoftmaxRows; ++mi) {
-        softmax_fused.row_max[mi] = -INFINITY;
-        softmax_fused.row_sum[mi] = 0.f;
-      }
-    }
 
 #pragma unroll 1
     for (int L = 0; L < own_tiles; ++L, ++own) {
-      const int kv_tile = 2 * L + cid;
+      const int kv_tile = L;
       const int k_stg = own % kStagesK;
       const int k_phase = (own / kStagesK) & 1;
-      const int v_phase = own & 1;
+      const int v_stg = own % kStagesV;
+      const int v_phase = (own / kStagesV) & 1;
 
       TmaBarrier::wait(&k_full[cid][k_stg], k_phase);
       cutlass::arch::fence_view_async_shared();
@@ -828,164 +871,105 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp4_sm120_pp(
       if (L > 0)
         rescale_o_store();
 
-      TmaBarrier::wait(&v_full[cid], v_phase);
+      TmaBarrier::wait(&v_full[cid][v_stg], v_phase);
       cutlass::arch::fence_view_async_shared();
 
-      pv_gemm(tOrO_store, 0);
+      pv_gemm(tOrO_store, v_stg);
     }
 
-    // finalize() equivalent, split-KV variant: row_sum is a per-thread
-    // partial (16 of the row's 64 cols live in this lane); row_max is
-    // already quad-reduced inside online_softmax_with_quant. The merge
-    // below does its own normalization, so only the reduction is needed.
-    CUTLASS_PRAGMA_UNROLL
-    for (int mi = 0; mi < kSoftmaxRows; ++mi) {
-      CUTLASS_PRAGMA_UNROLL
-      for (int i = 1; i < 4; i <<= 1) {
-        float sum_recv =
-            __shfl_xor_sync(int32_t(-1), softmax_fused.row_sum[mi], i);
-        softmax_fused.row_sum[mi] += sum_recv;
-      }
-    }
+    // Split-M epilogue: rows are consumer-private over the full kv range,
+    // so no cross-WG merge — finalize() reduces the per-thread partial
+    // row_sum over the quad and normalizes o_store.
+    softmax_fused.finalize(tOrO_store);
 
-    // Split-KV merge epilogue. cid1 scatters O (P2 domain) + stats; cid0
-    // merges with max correction, normalizes, and runs the shared epilogue
-    // (r2s + O TMA + lse). The whole window from q_base is occupied by the
-    // merge buffer and then the O staging (producer TMA for the next work
-    // is gated on epilogue_done).
     float qkm[kSRows];
     const bool smooth_lse =
         (softmax_lse != nullptr) && (km != nullptr) && (qm != nullptr);
-    {
-      cutlass::arch::NamedBarrier::sync(2 * kConsumerThreads, 0);
-
-      if (cid == 0 && smooth_lse) {
-        const float* km_bh = km + static_cast<long>(kv_bh) * kHeadDim;
-        const long qm_mb = Nq_pad / 128;  // qm stays 128-row granular
-        const float* qm_blk =
-            qm + (static_cast<long>(q_bh) * qm_mb + q_tile_abs / 2) * kHeadDim;
-        lse_qkm_dot<kHeadDim, kSRows>(sQ, sSFQ, tScS_rc, km_bh, qm_blk, qkm);
-      }
-      // lse_qkm_dot read sQ/sSFQ; the merge buffer below overwrites them.
-      cutlass::arch::NamedBarrier::sync(2 * kConsumerThreads, 0);
-
-      float* merge_o = reinterpret_cast<float*>(q_base);
-      float4* merge_stats = reinterpret_cast<float4*>(merge_o + kBr * kHeadDim);
-      if (cid == 1) {
-        Tensor o_red =
-            make_tensor(tOrO_store.data(),
-                        convert_to_reduction_layout(tOrO_store.layout()));
-        CUTLASS_PRAGMA_UNROLL
-        for (int mi = 0; mi < kSoftmaxRows; ++mi)
-          CUTLASS_PRAGMA_UNROLL
-        for (int ni = 0; ni < size<1>(o_red); ++ni) {
-          const int idx = o_red.layout()(make_coord(mi, ni));
-          merge_o[idx * 128 + wg_tid] = o_red(mi, ni);
-        }
-        merge_stats[wg_tid] =
-            make_float4(softmax_fused.row_max[0], softmax_fused.row_max[1],
-                        softmax_fused.row_sum[0], softmax_fused.row_sum[1]);
-      }
-      cutlass::arch::NamedBarrier::sync(2 * kConsumerThreads, 0);
-
-      if (cid == 0) {
-        // merge: mg = max(mA, mB); O = (wA*O_A + wB*O_B) / (wA*l_A + wB*l_B)
-        Tensor o_red =
-            make_tensor(tOrO_store.data(),
-                        convert_to_reduction_layout(tOrO_store.layout()));
-        CUTLASS_PRAGMA_UNROLL
-        for (int mi = 0; mi < kSoftmaxRows; ++mi) {
-          const float mA = softmax_fused.row_max[mi];
-          const float lA = softmax_fused.row_sum[mi];
-          const float4 st = merge_stats[wg_tid];
-          const float mB = (mi == 0) ? st.x : st.y;
-          const float lB = (mi == 0) ? st.z : st.w;
-          const float mg = fmaxf(mA, mB);
-          // -inf guard: a fully-masked side must contribute weight 0, not
-          // exp2(NaN).
-          const float wA = (mA == -INFINITY)
-                               ? 0.f
-                               : ptx_exp2((mA - mg) * softmax_scale_log2);
-          const float wB = (mB == -INFINITY)
-                               ? 0.f
-                               : ptx_exp2((mB - mg) * softmax_scale_log2);
-          const float l_merge = wA * lA + wB * lB;
-          const float inv_l = 1.0f / l_merge;
-          CUTLASS_PRAGMA_UNROLL
-          for (int ni = 0; ni < size<1>(o_red); ++ni) {
-            const int idx = o_red.layout()(make_coord(mi, ni));
-            const float oB = merge_o[idx * 128 + wg_tid];
-            o_red(mi, ni) = (wA * o_red(mi, ni) + wB * oB) * inv_l;
-          }
-          if (softmax_lse != nullptr) {
-            const int lse_base = Nb_id * Nh * Nq + Nh_id * Nq;
-            float lse = (mg * softmax_scale_log2 + log2f(l_merge) +
-                         SoftmaxFused<kSoftmaxRows>::fp8_scalexfp4_scale_log2) *
-                        FFPA_M_LN2;
-            if (smooth_lse)
-              lse += scale_orig * qkm[mi];
-            const int global_row =
-                q_start_row + Br_base + cute::get<0>(tScS_rc(mi, 0));
-            if (global_row < Nq)
-              softmax_lse[lse_base + global_row] = lse;
-          }
-        }
-      }
-      // merge buffer consumed; O staging may reuse the window
-      cutlass::arch::NamedBarrier::sync(2 * kConsumerThreads, 0);
-
-      if (cid == 0) {
-        auto tCrOHalf = ffpa_cute::convert_type<ElementO>(tOrO_store);
-
-        if (Br_base + kBr <= Nq - q_start_row) {
-          auto sO = as_position_independent_swizzle_tensor(
-              make_tensor(make_smem_ptr(reinterpret_cast<ElementO*>(q_base)),
-                          SmemLayoutO{}));
-          auto r2s_copy = make_tiled_copy_C(
-              Copy_Atom<SM90_U32x2_STSM_N, ElementO>{}, tiled_mma_pv);
-          auto r2s_thr = r2s_copy.get_thread_slice(wg_tid);
-          auto tCrOHalf_src = r2s_thr.retile_S(tCrOHalf);
-          auto tCsO_dst = r2s_thr.partition_D(sO);
-          copy(r2s_copy, tCrOHalf_src, tCsO_dst);
-          cutlass::arch::fence_view_async_shared();
-          cutlass::arch::NamedBarrier::sync(kConsumerThreads, 1);
-
-          auto mO_tma =
-              domain_offset(make_coord(O_row_offset, 0),
-                            tma_o.get_tma_tensor(make_shape((long)total_q_rows,
-                                                            Int<kHeadDim>{})));
-          auto o_slice = tma_o.get_slice(_0{});
-          auto gO_tma = local_tile(mO_tma, Shape<Int<kBr>, Int<kHeadDim>>{},
-                                   make_coord(Q_tile_id, _0{}));
-          auto tCgO_tma = o_slice.partition_D(gO_tma);
-          auto tOsO = o_slice.partition_S(sO);
-          if (wg_tid == 0)
-            copy(tma_o, tOsO, tCgO_tma);
-          tma_store_arrive();
-          tma_store_wait<0>();
-        } else {
-          const int O_gmem_offset =
-              (q_bh)*Nq * kHeadDim + q_start_row * kHeadDim;
-          auto mO = make_tensor(make_gmem_ptr(O + O_gmem_offset),
-                                make_shape(Nq - q_start_row, Int<kHeadDim>{}),
-                                make_stride(Int<kHeadDim>{}, _1{}));
-          auto gO = local_tile(mO, Shape<Int<kBr>, Int<kHeadDim>>{},
-                               make_coord(Q_tile_id, _0{}));
-          auto tCgO = thread_mma_pv.partition_C(gO);
-          auto cO = make_identity_tensor(Shape<Int<kBr>, Int<kHeadDim>>{});
-          auto tOcO = thread_mma_pv.partition_C(cO);
-          CUTLASS_PRAGMA_UNROLL
-          for (int i = 0; i < size(tCrOHalf); ++i) {
-            const int global_row = Br_base + cute::get<0>(tOcO(i));
-            if (global_row < Nq - q_start_row)
-              tCgO(i) = tCrOHalf(i);
-          }
-        }
+    if (smooth_lse) {
+      const float* km_bh = km + static_cast<long>(kv_bh) * kHeadDim;
+      const long qm_mb = Nq_pad / 128;  // qm stays 128-row granular
+      const float* qm_blk =
+          qm + (static_cast<long>(q_bh) * qm_mb + q_tile_abs) * kHeadDim;
+      lse_qkm_dot<kHeadDim, kSRows>(sQ, sSFQ, tScS_rc, km_bh, qm_blk, qkm);
+    }
+    if (softmax_lse != nullptr) {
+      const int lse_base = Nb_id * Nh * Nq + Nh_id * Nq;
+      CUTLASS_PRAGMA_UNROLL
+      for (int row = 0; row < kSRows; ++row) {
+        float lse = (softmax_fused.row_max[row] * softmax_scale_log2 +
+                     log2f(softmax_fused.row_sum[row]) +
+                     SoftmaxFused<kSoftmaxRows>::fp8_scalexfp4_scale_log2) *
+                    FFPA_M_LN2;
+        if (smooth_lse)
+          lse += scale_orig * qkm[row];
+        const int global_row =
+            q_start_row + Br_base + cute::get<0>(tScS_rc(row, 0));
+        // one lane per quad writes; the 4 quad lanes hold identical sums
+        if (global_row < Nq && (wg_tid & 3) == 0)
+          softmax_lse[lse_base + global_row] = lse;
       }
     }
 
-    // Release q_base for the next work's Q TMA (merge buffer + O staging
-    // alias it). Both warpgroups arrive.
+    // Epilogue ordering: the two WGs run unordered, and any 16KB staging
+    // window overlaps SOME live K/V smem of the peer (its kv loop may
+    // still be draining). One 256-thread named barrier after qkm retires
+    // every K/V/SF read (mma.sync + LDSM are warp-synchronous, and qkm is
+    // the last sQ/sSFQ reader); from here on the whole window is dead
+    // until the producer's next TMA (epilogue_done).
+    cutlass::arch::NamedBarrier::sync(2 * kConsumerThreads, 0);
+
+    // O staging: cid-partitioned 16KB windows at q_base.
+    auto tCrOHalf = ffpa_cute::convert_type<ElementO>(tOrO_store);
+    if (Br_base + kBr <= Nq - q_start_row) {
+      auto sO = as_position_independent_swizzle_tensor(make_tensor(
+          make_smem_ptr(reinterpret_cast<ElementO*>(q_base) +
+                        cid * (kBr * kHeadDim)),
+          SmemLayoutO{}));
+      auto r2s_copy = make_tiled_copy_C(
+          Copy_Atom<SM90_U32x2_STSM_N, ElementO>{}, tiled_mma_pv);
+      auto r2s_thr = r2s_copy.get_thread_slice(wg_tid);
+      auto tCrOHalf_src = r2s_thr.retile_S(tCrOHalf);
+      auto tCsO_dst = r2s_thr.partition_D(sO);
+      copy(r2s_copy, tCrOHalf_src, tCsO_dst);
+      cutlass::arch::fence_view_async_shared();
+      cutlass::arch::NamedBarrier::sync(kConsumerThreads, 1);
+
+      auto mO_tma = domain_offset(
+          make_coord(O_row_offset, 0),
+          tma_o.get_tma_tensor(
+              make_shape((long)total_q_rows, Int<kHeadDim>{})));
+      auto o_slice = tma_o.get_slice(_0{});
+      auto gO_tma = local_tile(mO_tma, Shape<Int<kBr>, Int<kHeadDim>>{},
+                               make_coord(Q_tile_id * 2 + cid, _0{}));
+      auto tCgO_tma = o_slice.partition_D(gO_tma);
+      auto tOsO = o_slice.partition_S(sO);
+      if (wg_tid == 0)
+        copy(tma_o, tOsO, tCgO_tma);
+      tma_store_arrive();
+      tma_store_wait<0>();
+    } else {
+      // Tail tile: rows past Nq would alias the next head in the flattened
+      // [total_q_rows, D] TMA space, so store R->G with a row guard.
+      const int O_gmem_offset =
+          (q_bh)*Nq * kHeadDim + q_start_row * kHeadDim;
+      auto mO = make_tensor(make_gmem_ptr(O + O_gmem_offset),
+                            make_shape(Nq - q_start_row, Int<kHeadDim>{}),
+                            make_stride(Int<kHeadDim>{}, _1{}));
+      auto gO = local_tile(mO, Shape<Int<kBr>, Int<kHeadDim>>{},
+                           make_coord(Q_tile_id * 2 + cid, _0{}));
+      auto tCgO = thread_mma_pv.partition_C(gO);
+      auto cO = make_identity_tensor(Shape<Int<kBr>, Int<kHeadDim>>{});
+      auto tOcO = thread_mma_pv.partition_C(cO);
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < size(tCrOHalf); ++i) {
+        const int global_row = Br_base + cute::get<0>(tOcO(i));
+        if (global_row < Nq - q_start_row)
+          tCgO(i) = tCrOHalf(i);
+      }
+    }
+
+    // Release q_base for the next work's Q TMA (O staging aliases it).
+    // Both warpgroups arrive.
     CtaBarrier::arrive(&epilogue_done);
   }
 #endif  // defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
