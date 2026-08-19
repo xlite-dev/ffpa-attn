@@ -126,6 +126,14 @@ def ffpa_attn_func(
       (standard ``queries aligned to KV tail`` convention). Requires
       ``Nkv >= Nq``. Non-causal tiles pay only one compare-and-branch
       per KV tile; diagonal tiles apply a per-fragment -inf mask.
+      This aligns with FlashAttention's causal semantics (bottom-right
+      aligned when ``Nq != Nkv``), which differs from
+      ``torch.nn.functional.scaled_dot_product_attention(is_causal=True)``:
+      SDPA aligns the causal mask to the **top-left** when ``Nq != Nkv``
+      (row ``r`` attends to ``k <= r``), so the two only agree when
+      ``Nq == Nkv``. When cross-checking FFPA outputs against SDPA in the
+      cross-causal regime, build the reference with an explicit additive
+      mask (``col <= row + Nkv - Nq``) instead of ``is_causal=True``.
   :param scale: Pre-softmax scaling factor applied to ``QK^T``.
       Defaults to ``1 / sqrt(D)`` (standard attention scale) when ``None``.
   :param enable_gqa: Grouped-query attention mode. Defaults to ``False`` to
