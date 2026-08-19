@@ -426,13 +426,11 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp4_sm120(
   auto smem_thr_copy_K = smem_tiled_copy_K.get_thread_slice(wg_tid);
   Tensor tSsK =
       smem_thr_copy_K.partition_S(as_position_independent_swizzle_tensor(sK));
-  Tensor tSrK_copy_view = smem_thr_copy_K.retile_D(tSrK);
 
   auto smem_tiled_copy_V = make_tiled_copy_B(SmemCopyAtomKV{}, tiled_mma_pv);
   auto smem_thr_copy_V = smem_tiled_copy_V.get_thread_slice(wg_tid);
   Tensor tOsVt =
       smem_thr_copy_V.partition_S(as_position_independent_swizzle_tensor(sV));
-  Tensor tOrVt_copy_view = smem_thr_copy_V.retile_D(tOrVt);
 
   auto tile_shape_mnk = tile_shape(tiled_mma_qk);
   auto smem_tiled_copy_SFQ = make_tiled_copy_impl(
@@ -449,7 +447,6 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp4_sm120(
   auto smem_thr_copy_SFK = smem_tiled_copy_SFK.get_thread_slice(wg_tid);
   Tensor tSsSFK = smem_thr_copy_SFK.partition_S(
       as_position_independent_swizzle_tensor(sSFK));
-  Tensor tSrSFK_copy_view = smem_thr_copy_SFK.retile_D(tSrSFK);
 
   auto smem_tiled_copy_SFV =
       make_tiled_copy_impl(SmemCopyAtomSF{}, get_layoutSFB_TV(tiled_mma_pv),
@@ -458,7 +455,6 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp4_sm120(
   auto smem_thr_copy_SFV = smem_tiled_copy_SFV.get_thread_slice(wg_tid);
   Tensor tOsSFVt = smem_thr_copy_SFV.partition_S(
       as_position_independent_swizzle_tensor(sSFVt));
-  Tensor tOrSFVt_copy_view = smem_thr_copy_SFV.retile_D(tOrSFVt);
 
   Tensor tSrS = partition_fragment_C(tiled_mma_qk, Shape<Int<kBr>, Int<kBc>>{});
   Tensor tSrS_conversion_view =
@@ -498,82 +494,9 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp4_sm120(
     }
   };
 
-  auto copy_k_block = [&](auto block_id, int stage) {
-    auto tSsK_stage = tSsK(_, _, _, stage);
-    auto tSsSFK_stage = tSsSFK(_, _, _, stage);
-    copy(smem_tiled_copy_K, tSsK_stage(_, _, block_id),
-         tSrK_copy_view(_, _, block_id));
-    copy(smem_tiled_copy_SFK, tSsSFK_stage(_, _, block_id),
-         tSrSFK_copy_view(_, _, block_id));
-  };
-  auto copy_v_block = [&](auto block_id, int stage) {
-    auto tOsVt_stage = tOsVt(_, _, _, stage);
-    auto tOsSFVt_stage = tOsSFVt(_, _, _, stage);
-    copy(smem_tiled_copy_V, tOsVt_stage(_, _, block_id),
-         tOrVt_copy_view(_, _, block_id));
-    copy(smem_tiled_copy_SFV, tOsSFVt_stage(_, _, block_id),
-         tOrSFVt_copy_view(_, _, block_id));
-  };
-
-  auto quantize = [&](auto mma_k, auto& acc_conversion_view) {
-    Tensor AbsMaxP_stagek = AbsMaxP(_, make_coord(_, _, mma_k));
-    Tensor acc_conversion_stagek = acc_conversion_view(_, _, mma_k);
-    Tensor SFP =
-        make_tensor_like<cutlass::float_ue4m3_t>(AbsMaxP_stagek.layout());
-    Tensor SFP_uint32_view = recast<uint32_t>(SFP);
-    CUTLASS_PRAGMA_UNROLL
-    for (int i = 0; i < size(AbsMaxP_stagek); i += 4) {
-      uint32_t& tmp = SFP_uint32_view(i / 4);
-      packed_float_to_ue4m3(AbsMaxP_stagek(i), AbsMaxP_stagek(i + 1),
-                            AbsMaxP_stagek(i + 2), AbsMaxP_stagek(i + 3), tmp);
-    }
-    int const quad_id = threadIdx.x & 3;
-    uint32_t MASK = (0xFF00FF) << ((quad_id & 1) * 8);
-    Tensor tOrSFP_uint32_view = recast<uint32_t>(tOrSFP(_, _, mma_k));
-    Tensor tOrP_uint32_view = recast<uint32_t>(tOrP(_, _, mma_k));
-    CUTLASS_PRAGMA_UNROLL
-    for (int mma_m = 0; mma_m < size<1>(tOrP); ++mma_m) {
-      CUTLASS_PRAGMA_UNROLL
-      for (int i = 0; i < 4; ++i) {
-        packed_float_to_e2m1(acc_conversion_stagek(make_coord(_0{}, i), mma_m),
-                             acc_conversion_stagek(make_coord(_1{}, i), mma_m),
-                             acc_conversion_stagek(make_coord(_2{}, i), mma_m),
-                             acc_conversion_stagek(make_coord(_3{}, i), mma_m),
-                             acc_conversion_stagek(make_coord(_4{}, i), mma_m),
-                             acc_conversion_stagek(make_coord(_5{}, i), mma_m),
-                             acc_conversion_stagek(make_coord(_6{}, i), mma_m),
-                             acc_conversion_stagek(make_coord(_7{}, i), mma_m),
-                             tOrP_uint32_view(i, mma_m));
-      }
-      uint32_t local_sfp = SFP_uint32_view(_0{}, _0{}, mma_m);
-      uint32_t peer_sfp = __shfl_xor_sync(0xFFFFFFFFu, local_sfp, 2);
-      if ((quad_id & 1) == 0) {
-        uint32_t sfp = (local_sfp & MASK) | ((peer_sfp & MASK) << 8);
-        tOrSFP_uint32_view(_0{}, mma_m) = sfp;
-      } else {
-        uint32_t sfp = (peer_sfp & MASK) | ((local_sfp & MASK) >> 8);
-        tOrSFP_uint32_view(_0{}, mma_m) = sfp;
-      }
-    }
-  };
-
-  auto pv_gemm = [&](auto& tgt, int v_stg) {
-    copy_v_block(_0{}, v_stg);
-    quantize(_0{}, tSrS_conversion_view);
-    CUTLASS_PRAGMA_UNROLL
-    for (int v_block = 0; v_block < size<2>(tOrP); ++v_block) {
-      cute::gemm(tiled_mma_pv,
-                 make_zip_tensor(tOrP(_, _, v_block), tOrSFP(_, _, v_block)),
-                 make_zip_tensor(tOrVt(_, _, v_block), tOrSFVt(_, _, v_block)),
-                 tgt);
-      if (v_block < size<2>(tOrP) - 1) {
-        copy_v_block(v_block + 1, v_stg);
-        quantize(v_block + 1, tSrS_conversion_view);
-      } else {
-        CtaBarrier::arrive(&v_empty[v_stg]);
-      }
-    }
-  };
+  // QK/PV gemm loops live in ../fp4_gemm.cuh (gemm_ss_fp4 / gemm_rs_fp4,
+  // the fp4 counterpart of ffpa_cute::gemm_ss/gemm_rs); quantize_and_pack_p
+  // lives in ../fp4_pscale.cuh.
 
   int g = 0;
   int w = 0;
@@ -621,20 +544,13 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp4_sm120(
       TmaBarrier::wait(&k_full[k_stg], k_phase);
       cutlass::arch::fence_view_async_shared();
 
-      copy_k_block(_0{}, k_stg);
+      // delta_s preloads the rank-1 qm@K^T term into the C accumulator
+      // before the QK mma chain adds on top (writes tSrS regs only - no
+      // overlap with gemm_ss_fp4's tSrK/tSrSFK operand loads).
       add_delta_s(tSrS, k_stg);
-      CUTLASS_PRAGMA_UNROLL
-      for (int k_block = 0; k_block < size<2>(tSrQ); ++k_block) {
-        cute::gemm(tiled_mma_qk,
-                   make_zip_tensor(tSrQ(_, _, k_block), tSrSFQ(_, _, k_block)),
-                   make_zip_tensor(tSrK(_, _, k_block), tSrSFK(_, _, k_block)),
-                   tSrS);
-        if (k_block < size<2>(tSrQ) - 1) {
-          copy_k_block(k_block + 1, k_stg);
-        } else {
-          CtaBarrier::arrive(&k_empty[k_stg]);
-        }
-      }
+      gemm_ss_fp4(tSrS, tSrQ, tSrSFQ, tSrK, tSrSFK, tSsK, tSsSFK, tiled_mma_qk,
+                  smem_tiled_copy_K, smem_thr_copy_K, smem_tiled_copy_SFK,
+                  smem_thr_copy_SFK, k_empty, k_stg);
 
       // Masking: kv-tail (padded columns) + causal (bottom-right). The
       // logical column indexes the PERMUTED storage order, so the token
@@ -678,7 +594,10 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp4_sm120(
       cutlass::arch::fence_view_async_shared();
 
       if (kv_tile == 0) {
-        pv_gemm(tOrO_store, v_stg);
+        gemm_rs_fp4(tOrO_store, tOrP, tOrSFP, tOrVt, tOrSFVt, tOsVt, tOsSFVt,
+                    tiled_mma_pv, smem_tiled_copy_V, smem_thr_copy_V,
+                    smem_tiled_copy_SFV, smem_thr_copy_SFV, AbsMaxP,
+                    tSrS_conversion_view, v_empty, v_stg);
       } else {
         // scores_scale == 1.0f exactly when the row max did not move this
         // tile (~96% of dense tiles): O = O*1 + O_new needs no rescale at
@@ -688,10 +607,16 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp4_sm120(
         if (__any_sync(0xffffffff, need_rescale)) {
           Tensor tOrO = make_fragment_like(tOrO_store);
           clear(tOrO);
-          pv_gemm(tOrO, v_stg);
+          gemm_rs_fp4(tOrO, tOrP, tOrSFP, tOrVt, tOrSFVt, tOsVt, tOsSFVt,
+                      tiled_mma_pv, smem_tiled_copy_V, smem_thr_copy_V,
+                      smem_tiled_copy_SFV, smem_thr_copy_SFV, AbsMaxP,
+                      tSrS_conversion_view, v_empty, v_stg);
           softmax_fused.rescale_o(tOrO_store, tOrO);
         } else {
-          pv_gemm(tOrO_store, v_stg);
+          gemm_rs_fp4(tOrO_store, tOrP, tOrSFP, tOrVt, tOrSFVt, tOsVt, tOsSFVt,
+                      tiled_mma_pv, smem_tiled_copy_V, smem_thr_copy_V,
+                      smem_tiled_copy_SFV, smem_thr_copy_SFV, AbsMaxP,
+                      tSrS_conversion_view, v_empty, v_stg);
         }
       }
     }

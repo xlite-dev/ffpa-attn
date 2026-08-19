@@ -291,6 +291,57 @@ struct SoftmaxFused {
   }
 };
 
+// Quantize one mma_k slice of the online-softmax P fragment into the packed
+// (e2m1 data + ue4m3 SFP) register pair the blockscaled PV mma consumes as
+// its A operand (zip(tOrP, tOrSFP)). mma_k is either a compile-time Int<>
+// (_0{}) or a runtime int (v_block+1 prefetch), hence the class template
+// parameter. See the persist_d kernel for the fragment-layout details.
+template <class MmaK, typename AbsMaxTensor, typename AccConvTensor,
+          typename PFragment, typename SfpFragment>
+CUTE_DEVICE void quantize_and_pack_p(MmaK mma_k, AbsMaxTensor& AbsMaxP,
+                                     AccConvTensor& acc_conversion_view,
+                                     PFragment& tOrP, SfpFragment& tOrSFP) {
+  Tensor AbsMaxP_stagek = AbsMaxP(_, make_coord(_, _, mma_k));
+  Tensor acc_conversion_stagek = acc_conversion_view(_, _, mma_k);
+  Tensor SFP =
+      make_tensor_like<cutlass::float_ue4m3_t>(AbsMaxP_stagek.layout());
+  Tensor SFP_uint32_view = recast<uint32_t>(SFP);
+  CUTLASS_PRAGMA_UNROLL
+  for (int i = 0; i < size(AbsMaxP_stagek); i += 4) {
+    uint32_t& tmp = SFP_uint32_view(i / 4);
+    packed_float_to_ue4m3(AbsMaxP_stagek(i), AbsMaxP_stagek(i + 1),
+                          AbsMaxP_stagek(i + 2), AbsMaxP_stagek(i + 3), tmp);
+  }
+  int const quad_id = threadIdx.x & 3;
+  uint32_t MASK = (0xFF00FF) << ((quad_id & 1) * 8);
+  Tensor tOrSFP_uint32_view = recast<uint32_t>(tOrSFP(_, _, mma_k));
+  Tensor tOrP_uint32_view = recast<uint32_t>(tOrP(_, _, mma_k));
+  CUTLASS_PRAGMA_UNROLL
+  for (int mma_m = 0; mma_m < size<1>(tOrP); ++mma_m) {
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < 4; ++i) {
+      packed_float_to_e2m1(acc_conversion_stagek(make_coord(_0{}, i), mma_m),
+                           acc_conversion_stagek(make_coord(_1{}, i), mma_m),
+                           acc_conversion_stagek(make_coord(_2{}, i), mma_m),
+                           acc_conversion_stagek(make_coord(_3{}, i), mma_m),
+                           acc_conversion_stagek(make_coord(_4{}, i), mma_m),
+                           acc_conversion_stagek(make_coord(_5{}, i), mma_m),
+                           acc_conversion_stagek(make_coord(_6{}, i), mma_m),
+                           acc_conversion_stagek(make_coord(_7{}, i), mma_m),
+                           tOrP_uint32_view(i, mma_m));
+    }
+    uint32_t local_sfp = SFP_uint32_view(_0{}, _0{}, mma_m);
+    uint32_t peer_sfp = __shfl_xor_sync(0xFFFFFFFFu, local_sfp, 2);
+    if ((quad_id & 1) == 0) {
+      uint32_t sfp = (local_sfp & MASK) | ((peer_sfp & MASK) << 8);
+      tOrSFP_uint32_view(_0{}, mma_m) = sfp;
+    } else {
+      uint32_t sfp = (peer_sfp & MASK) | ((local_sfp & MASK) >> 8);
+      tOrSFP_uint32_view(_0{}, mma_m) = sfp;
+    }
+  }
+}
+
 // lse smooth-K correction: qkm[row] = dot(Qhat_row_dequant, km) +
 // dot(qm_block, km). Qhat is read back from smem (e2m1 x SF), quad-strided
 // like fp8's smooth_k_qk_dot; the qm term is CTA-constant per Q tile.
