@@ -1595,7 +1595,7 @@ void launch_cute_fwd_persist_d_fp4_sm120_impl(torch::Tensor Q, torch::Tensor K,
 
   using ElementO = std::conditional_t<std::is_same_v<kDataType, __half>,
                                       cutlass::half_t, cutlass::bfloat16_t>;
-  using Traits = ffpa_fp4::Fp4PersistDTraits<ElementO, kHeadDim>;
+  using Traits = ffpa_fp4::FFPAAttnCuTePersistDFP4Traits<ElementO, kHeadDim>;
   using Element = typename Traits::Element;
   using ElementSF = typename Traits::ElementSF;
   auto prop = at::cuda::getCurrentDeviceProperties();

@@ -21,6 +21,8 @@
 #include <cuda_bf16.h>
 #include <torch/all.h>
 
+#include "fp4_gemm.cuh"
+
 namespace ffpa_fp4 {
 
 constexpr int kCVTFp4EltsPerThread = 16;
@@ -105,12 +107,8 @@ __global__ void fp4_quant_kernel(
   if constexpr (!kPermute) {
     load_token_id = token_id;
   } else {
-    int local_token_id_residue = local_token_id % 32;
     // [0,1,8,9,16,17,24,25,2,3,10,11,18,19,26,27,4,5,12,13,20,21,28,29,6,7,14,15,22,23,30,31]
-    load_token_id = token_block_id * kBlock + (local_token_id / 32) * 32 +
-                    (local_token_id_residue / 8) * 2 +
-                    ((local_token_id_residue % 8) / 2) * 8 +
-                    (local_token_id_residue % 8) % 2;
+    load_token_id = token_block_id * kBlock + kv_perm32(local_token_id);
   }
   const bool token_valid = load_token_id < num_tokens;
 

@@ -291,4 +291,51 @@ struct SoftmaxFused {
   }
 };
 
+// lse smooth-K correction: qkm[row] = dot(Qhat_row_dequant, km) +
+// dot(qm_block, km). Qhat is read back from smem (e2m1 x SF), quad-strided
+// like fp8's smooth_k_qk_dot; the qm term is CTA-constant per Q tile.
+template <int kHeadDim, int kRows, typename SmemQTensor, typename SfQTensor,
+          typename CoordTensor>
+CUTE_DEVICE void lse_qkm_dot(const SmemQTensor& sQ, const SfQTensor& sSFQ,
+                             const CoordTensor& tScS_rc,
+                             const float* __restrict__ km_bh,
+                             const float* __restrict__ qm_blk, float* qkm) {
+  constexpr int kQuad = 4;
+  constexpr int kIters = kHeadDim / (kQuad * 4);
+  const int qlane = threadIdx.x & 3;
+#pragma unroll
+  for (int row = 0; row < kRows; ++row) {
+    const int r = cute::get<0>(tScS_rc(row, 0));
+    float acc = 0.0f;
+#pragma unroll
+    for (int it = 0; it < kIters; ++it) {
+      const int col = (qlane + it * kQuad) * 4;
+      const float sf = static_cast<float>(sSFQ(r, col));
+#pragma unroll
+      for (int d = 0; d < 4; ++d)
+        acc += static_cast<float>(sQ(r, col + d).get()) * sf * km_bh[col + d];
+    }
+    qkm[row] = acc;
+  }
+  float c = 0.0f;
+#pragma unroll
+  for (int it = 0; it < kIters; ++it) {
+    const int col = (qlane + it * kQuad) * 4;
+#pragma unroll
+    for (int d = 0; d < 4; ++d)
+      c += qm_blk[col + d] * km_bh[col + d];
+  }
+#pragma unroll
+  for (int row = 0; row < kRows; ++row) {
+    qkm[row] += __shfl_xor_sync(0xffffffff, qkm[row], 1);
+    qkm[row] += __shfl_xor_sync(0xffffffff, qkm[row], 2);
+    qkm[row] += c;
+  }
+  c += __shfl_xor_sync(0xffffffff, c, 1);
+  c += __shfl_xor_sync(0xffffffff, c, 2);
+#pragma unroll
+  for (int row = 0; row < kRows; ++row)
+    qkm[row] += c;
+}
+
 }  // namespace ffpa_fp4
