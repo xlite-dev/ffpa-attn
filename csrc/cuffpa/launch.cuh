@@ -67,7 +67,8 @@ void launch_ffpa_attn_fwd_template(
     int64_t philox_offset, bool fp8_smooth_k, bool fp8_smooth_v,
     int64_t fp8_q_quant_method, int64_t fp8_k_quant_method,
     int64_t fp8_v_quant_method, int64_t fp8_pv_acc_type, int64_t fp8_qk_mm_type,
-    bool fp8_hybrid = false, int64_t fp8_hybrid_n_early = 256) {
+    bool fp8_hybrid = false, int64_t fp8_hybrid_n_early = 256,
+    bool fp4_hybrid = false, int64_t fp4_hybrid_n_early = 256) {
   // Q,K,V,O with [B, H, N, D] layout, B=batch, H=head, N=seqlen, D=dim
   // TODO: support BNHD layout, Q,K,V,O with [B, N, H, D] layout.
   // Native block-tile config (MMA atoms, Br/Bc, stages, smem/pad flags) and
@@ -187,11 +188,11 @@ void launch_ffpa_attn_fwd_template(
         // yields 0 there (zero-sized array) and fp16's own dispatch never
         // instantiates it for those headdims.
         if constexpr (kHeadDim % 64 == 0 && kHeadDim >= 64 && kHeadDim <= 256) {
-          if (fp8_hybrid && Nq >= fp8_hybrid_n_early) {
-            const int n_early = static_cast<int>(fp8_hybrid_n_early);
+          if (fp4_hybrid && Nq >= fp4_hybrid_n_early) {
+            const int n_early = static_cast<int>(fp4_hybrid_n_early);
             TORCH_CHECK(
                 n_early % 128 == 0,
-                "ffpa_attn: fp8_hybrid_n_early must be multiple of 128");
+                "ffpa_attn: fp4_hybrid_n_early must be multiple of 128");
             torch::Tensor Q_e, K_e, V_e;
             // Stage-1 fp16 kernel needs D_pad-wide inputs: it must pad the
             // early-row slices only on the fused path (Q/K/V still original

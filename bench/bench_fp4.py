@@ -39,13 +39,14 @@ if SAGE3_INSTALLED:
   from sageattn3 import sageattn3_blackwell
 
 
-def fp4_backend(no_hybrid: bool = False) -> CUDABackend:
+def fp4_backend(no_hybrid: bool = False, hybrid_n_early: int = 256):
   return CUDABackend(
     backward=False,
     enable_tma=True,
     enable_cute=True,
     enable_fp4=True,
-    fp8_hybrid=False if no_hybrid else None,
+    fp4_hybrid=False if no_hybrid else None,
+    fp4_hybrid_n_early=hybrid_n_early,
   )
 
 
@@ -118,14 +119,14 @@ def _mk(B, Hq, Hkv, Nq, Nkv, D, dtype, scale):
   return q, k, v
 
 
-def run_ffpa(q, k, v, causal, gqa, no_hybrid=False):
+def run_ffpa(q, k, v, causal, gqa, no_hybrid=False, hybrid_n_early=256):
   return ffpa_attn_func(
     q,
     k,
     v,
     is_causal=causal,
     enable_gqa=gqa,
-    forward_backend=fp4_backend(no_hybrid),
+    forward_backend=fp4_backend(no_hybrid, hybrid_n_early),
   )
 
 
@@ -195,14 +196,22 @@ def build_scenarios(N, B, H, Hkv, D, cross_dense=True, non_aligned_pad=15):
 
 
 def run_scenario(
-  sc, dtype, scale, warmup, iters, use_sage3, sdpa_name, no_hybrid=False
+  sc,
+  dtype,
+  scale,
+  warmup,
+  iters,
+  use_sage3,
+  sdpa_name,
+  no_hybrid=False,
+  hybrid_n_early=256
 ):
   q, k, v = _mk(sc.B, sc.Hq, sc.Hkv, sc.Nq, sc.Nkv, sc.D, dtype, scale)
   ref = ref_bf16(q, k, v, sc.causal, sc.gqa, sdpa_name).to(dtype)
   sdpa_label = f"SDPA-{sdpa_name.upper()}"
 
   outs = {
-    "FFPA-FP4": run_ffpa(q, k, v, sc.causal, sc.gqa, no_hybrid),
+    "FFPA-FP4": run_ffpa(q, k, v, sc.causal, sc.gqa, no_hybrid, hybrid_n_early),
     "FFPA-FP8": run_ffpa8(q, k, v, sc.causal, sc.gqa),
     sdpa_label: run_sdpa(q, k, v, sc.causal, sc.gqa, sdpa_name),
   }
@@ -224,8 +233,10 @@ def run_scenario(
     run_sdpa(q, k, v, sc.causal, sc.gqa, sdpa_name)
   torch.cuda.synchronize()
   fns = {
-    "FFPA-FP4": lambda: run_ffpa(q, k, v, sc.causal, sc.gqa, no_hybrid),
-    "FFPA-FP8": lambda: run_ffpa8(q, k, v, sc.causal, sc.gqa),
+    "FFPA-FP4":
+    lambda: run_ffpa(q, k, v, sc.causal, sc.gqa, no_hybrid, hybrid_n_early),
+    "FFPA-FP8":
+    lambda: run_ffpa8(q, k, v, sc.causal, sc.gqa),
   }
   if use_sage3 and not sc.gqa:
     fns["Sage3"] = lambda: run_sage3(q, k, v, sc.causal, sc.gqa)
@@ -316,6 +327,13 @@ def parse_args():
     help="Disable FFPA causal fp16 hybrid (pure fp4 kernel)"
   )
   p.add_argument(
+    "--fp4-hybrid-n-early",
+    type=int,
+    default=256,
+    help="Leading query rows computed in fp16 under the fp4 hybrid "
+    "(default 256, must be multiple of 128)"
+  )
+  p.add_argument(
     "--sdpa-backend",
     type=str,
     default="fa2",
@@ -353,7 +371,8 @@ def main():
         args.iters,
         SAGE3_INSTALLED and not args.no_sage,
         args.sdpa_backend,
-        no_hybrid=args.no_hybrid
+        no_hybrid=args.no_hybrid,
+        hybrid_n_early=args.fp4_hybrid_n_early
       )
 
 

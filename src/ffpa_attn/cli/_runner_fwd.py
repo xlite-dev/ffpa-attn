@@ -259,6 +259,8 @@ def _make_forward_backend(
   fp8_qk_mm_type: str = "fp8",
   fp8_hybrid: bool | None = None,
   fp8_hybrid_n_early: int = 256,
+  fp4_hybrid: bool | None = None,
+  fp4_hybrid_n_early: int = 256,
   cuda_stages: int | None = None,
 ):
   if name == "cuda":
@@ -279,6 +281,8 @@ def _make_forward_backend(
       "fp8_qk_mm_type": fp8_qk_mm_type,
       "fp8_hybrid": fp8_hybrid,
       "fp8_hybrid_n_early": fp8_hybrid_n_early,
+      "fp4_hybrid": fp4_hybrid,
+      "fp4_hybrid_n_early": fp4_hybrid_n_early,
     }
     if cuda_stages is not None:
       kwargs["stages"] = cuda_stages
@@ -334,6 +338,8 @@ def _run_case(
   stages: int | None = None,
   fp8_hybrid: bool | None = None,
   fp8_hybrid_n_early: int = 256,
+  fp4_hybrid: bool | None = None,
+  fp4_hybrid_n_early: int = 256,
 ) -> FORWARD_RESULT:
   torch.manual_seed(seed)
   q = torch.randn(B, Nh_q, Nq, D, dtype=dtype, device="cuda")
@@ -359,6 +365,8 @@ def _run_case(
     fp8_qk_mm_type=fp8_qk_mm_type,
     fp8_hybrid=fp8_hybrid,
     fp8_hybrid_n_early=fp8_hybrid_n_early,
+    fp4_hybrid=fp4_hybrid,
+    fp4_hybrid_n_early=fp4_hybrid_n_early,
     cuda_stages=stages,
   )
   backward_backend = CuTeDSLBackend(
@@ -497,6 +505,8 @@ def run_forward_examples(
   stages: int | None = None,
   fp8_hybrid: bool | None = None,
   fp8_hybrid_n_early: int = 256,
+  fp4_hybrid: bool | None = None,
+  fp4_hybrid_n_early: int = 256,
 ) -> list[FORWARD_RESULT]:
   """Run the canonical forward benchmark cases.
 
@@ -699,6 +709,8 @@ def run_forward_examples(
           stages=stages,
           fp8_hybrid=fp8_hybrid,
           fp8_hybrid_n_early=fp8_hybrid_n_early,
+          fp4_hybrid=fp4_hybrid,
+          fp4_hybrid_n_early=fp4_hybrid_n_early,
         )
       )
 

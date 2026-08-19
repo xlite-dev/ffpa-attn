@@ -433,6 +433,21 @@ def _parse_args() -> argparse.Namespace:
     "--fp8-hybrid (default 256, must be multiple of 128).",
   )
   parser.add_argument(
+    "--fp4-hybrid",
+    action="store_true",
+    default=None,
+    help="FP4 hybrid: fp16 persist-D computes [0:n_early] rows, fp4 "
+    "computes [n_early:N] (zero-redundancy). Independent from "
+    "--fp8-hybrid. Default auto: enabled when causal+fp4.",
+  )
+  parser.add_argument(
+    "--fp4-hybrid-n-early",
+    type=int,
+    default=256,
+    help="Number of leading query rows computed in fp16 under "
+    "--fp4-hybrid (default 256, must be multiple of 128).",
+  )
+  parser.add_argument(
     "--enable-bwd-tma",
     "--bwd-tma",
     action="store_true",
@@ -646,6 +661,10 @@ def _resolve_directional_cli_flags(
     args.fp8_hybrid = None
   if not hasattr(args, "fp8_hybrid_n_early"):
     args.fp8_hybrid_n_early = 256
+  if not hasattr(args, "fp4_hybrid"):
+    args.fp4_hybrid = None
+  if not hasattr(args, "fp4_hybrid_n_early"):
+    args.fp4_hybrid_n_early = 256
   return args
 
 
@@ -1737,6 +1756,8 @@ def _benchmark_rows(
         stages=args.stages,
         fp8_hybrid=args.fp8_hybrid,
         fp8_hybrid_n_early=args.fp8_hybrid_n_early,
+        fp4_hybrid=args.fp4_hybrid,
+        fp4_hybrid_n_early=args.fp4_hybrid_n_early,
       ),
     )
   if args.backward:

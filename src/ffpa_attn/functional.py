@@ -250,13 +250,16 @@ class CUDABackend(Backend):
   fp8_v_quant_method: str = "per_block"  # FP8 only; per_block / per_channel.
   fp8_pv_acc_type: str = "f32"  # FP8 only; f32/f16 PV accumulator.
   fp8_qk_mm_type: str = "fp8"  # FP8 only: QK MMA dtype; "fp8" or "int8".
-  # Hybrid — fp16 computes [0:n_early] rows, fp8/fp4 computes
+  # Hybrid — fp16 computes [0:n_early] rows, the quantized path computes
   # [n_early:N] via q_start_row offset (zero-redundancy). Works for causal
   # (fixes early-row accuracy loss) and non-causal (user-selected rows get
-  # full fp16 precision). None=auto: enabled when enable_fp8/enable_fp4 +
-  # is_causal.
+  # full fp16 precision). None=auto: enabled when the matching quant path
+  # (enable_fp8 / enable_fp4) + is_causal. fp8_hybrid and fp4_hybrid are
+  # independent switches; each is honored only by its own quant path.
   fp8_hybrid: bool | None = None
   fp8_hybrid_n_early: int = 256
+  fp4_hybrid: bool | None = None
+  fp4_hybrid_n_early: int = 256
   # Runtime: propagated from ffpa_attn_func(is_causal=...) by normalize_inputs.
   is_causal: bool = False
 
@@ -775,16 +778,20 @@ class FFPAAttnMeta:
     self.attn_meta.dropout_p = float(dropout_p)
     self.attn_meta.is_grad_enabled = torch.is_grad_enabled()
 
-    # Propagate is_causal to the CUDA backend and auto-resolve fp8_hybrid.
-    # fp8_hybrid=None (default) means "auto": enable hybrid when causal +
-    # fp8/fp4 to protect early-row precision; explicit True/False is honored
-    # as-is. fp4 shares the switch (fp16 stage-1 + fp4 stage-2).
+    # Propagate is_causal to the CUDA backend and auto-resolve the hybrid
+    # switches. *_hybrid=None (default) means "auto": enable hybrid when
+    # causal + the matching quant path (fp8_hybrid<->enable_fp8,
+    # fp4_hybrid<->enable_fp4) to protect early-row precision; explicit
+    # True/False is honored as-is (fp16 stage-1 + quant stage-2).
     if isinstance(self.forward_meta, CUDABackend):
       self.forward_meta.is_causal = is_causal
       if self.forward_meta.fp8_hybrid is None:
         self.forward_meta.fp8_hybrid = bool(
-          (self.forward_meta.enable_fp8 or self.forward_meta.enable_fp4)
-          and is_causal
+          self.forward_meta.enable_fp8 and is_causal
+        )
+      if self.forward_meta.fp4_hybrid is None:
+        self.forward_meta.fp4_hybrid = bool(
+          self.forward_meta.enable_fp4 and is_causal
         )
 
     # Validate that acc-code is compatible with activation dtype.
@@ -1009,6 +1016,8 @@ class _FFPAAttnFunc(torch.autograd.Function):
         forward_meta.fp8_qk_mm_type_code,
         forward_meta.fp8_hybrid,
         forward_meta.fp8_hybrid_n_early,
+        forward_meta.fp4_hybrid,
+        forward_meta.fp4_hybrid_n_early,
       )
     elif isinstance(meta.forward_meta, TritonBackend):
       forward_meta = meta.forward_meta
