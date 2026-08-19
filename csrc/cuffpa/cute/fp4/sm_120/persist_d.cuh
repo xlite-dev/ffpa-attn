@@ -175,13 +175,22 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp4_sm120(
   extern __shared__ __align__(1024) char shm[];
   Element* q_base = reinterpret_cast<Element*>(shm + kOffQ);
 
+  // Barrier inventory (all initialized once, never re-init - see the
+  // grid-scheduling contract above):
+  //   q_full       TMA tx barrier, Q+SFQ of the current work (tx = kTxBytesQ)
+  //   k_full[s]    TMA tx barrier, K+SFK+DS of kv-tile stage s (kTxBytesK)
+  //   k_empty[s]   consumer->producer "stage s consumed", 256 arrivals
+  //   v_full[s]    TMA tx barrier, V^T+SFVt of kv-tile stage s (kTxBytesV)
+  //   v_empty[s]   consumer->producer, 256 arrivals (the gemm_rs_fp4 tail)
+  //   epilogue_done consumer->producer WAR fence: the O staging tile
+  //                aliases q_base, so the next work's Q TMA must wait for
+  //                the previous epilogue (r2s + TMA store + lse readback)
+  //                to retire fully.
   __shared__ uint64_t q_full;
   __shared__ uint64_t k_full[kStages];
   __shared__ uint64_t k_empty[kStages];
   __shared__ uint64_t v_full[kStages];
   __shared__ uint64_t v_empty[kStages];
-  // Consumers arrive after each epilogue; the producer waits before the
-  // next Q TMA (the O staging tile aliases q_base: WAR hazard).
   __shared__ uint64_t epilogue_done;
 
   if (tid == 0) {
@@ -258,6 +267,9 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp4_sm120(
       int w = 0;
       for (int work_id = blockIdx.x; work_id < total_work;
            work_id += gridDim.x, ++w) {
+        // work_id -> (b, h, Q_tile): bh-outer / Q-tile-inner, so consecutive
+        // work ids share one (b,h) and stream its Q tiles; a CTA's works are
+        // strided by gridDim.x (grid-stride loop, see header contract).
         const int kv_offset = Nkv - Nq;
         const int bh = work_id / MB;
         const int Q_tile_id = work_id % MB;
@@ -267,6 +279,9 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp4_sm120(
         const int q_tile_abs = Q_tile_id + q_start_row / kBr;
         const int q_bh = bh;
         const int kv_bh = b * Nh_kv + kv_head_idx;
+        // Flat row-space offsets into the padded descriptor planes: Q rows
+        // live at bh*Nq_pad (+q_start_row for hybrid fp16/fp4 split), K rows
+        // at kv_bh*Nkv_pad, V^T planes at kv_bh*kHeadDim (D x Nkv_pad).
         const int q_row_offset = q_bh * Nq_pad + q_start_row;
         const int kv_row_offset = kv_bh * Nkv_pad;
         const int v_row_base = kv_bh * kHeadDim;
@@ -383,6 +398,8 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp4_sm120(
 
   // Consumer
   cutlass::arch::warpgroup_reg_alloc<232>();
+  // Pre-drain: mark every stage empty so the producer's first kStages-1
+  // prefetches find their k_empty/v_empty barriers armed.
   for (int s = 0; s < kStages; ++s) {
     CtaBarrier::arrive(&k_empty[s]);
     CtaBarrier::arrive(&v_empty[s]);
@@ -407,6 +424,12 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp4_sm120(
   auto sSFVt =
       make_tensor(make_smem_ptr<ElementSF>(shm + kOffSFVt), SmemLayoutSFVt{});
 
+  // Register fragments for both mmas. partition_fragment_{A,B} mirror the
+  // blockscaled operand convention: each operand is a (data, SF) pair, so
+  // A comes as tSrQ/tSrSFQ (Q) or tOrP/tOrSFP (P, quantized in-flight), B as
+  // tSrK/tSrSFK and tOrVt/tOrSFVt. tOrP/tOrSFP are built on LayoutP/LayoutSFP
+  // (traits) rather than partition_fragment_A because they must ADAPT the QK
+  // C-fragment slots onto the PV A-operand slots - see quantize_and_pack_p.
   Tensor tSrQ = thread_mma_qk.partition_fragment_A(sQ);
   Tensor tSrK = thread_mma_qk.partition_fragment_B(sK(_, _, Int<0>{}));
   Tensor tOrVt = thread_mma_pv.partition_fragment_B(sV(_, _, Int<0>{}));
@@ -456,9 +479,18 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp4_sm120(
   Tensor tOsSFVt = smem_thr_copy_SFV.partition_S(
       as_position_independent_swizzle_tensor(sSFVt));
 
+  // The QK accumulator fragment is viewed through THREE layouts, each
+  // matching one consumer:
+  //   raw tSrS          - mma C-fragment order: what gemm_ss_fp4 accumulates
+  //                       into and what online_softmax_with_quant scans,
+  //   conversion_view   - order the e2m1 packer reads (8 floats -> uint32),
+  //                       consumed by quantize_and_pack_p,
+  //   reduction_view    - (row, col) addressing for masking, built per tile.
   Tensor tSrS = partition_fragment_C(tiled_mma_qk, Shape<Int<kBr>, Int<kBc>>{});
   Tensor tSrS_conversion_view =
       make_tensor(tSrS.data(), convert_to_conversion_layout(tSrS.layout()));
+  // Per-16-token-group absmax of the P2-domain scores; softmax fills it,
+  // quantize_and_pack_p turns it into the ue4m3 SFP operand.
   Tensor AbsMaxP = make_tensor_like<float>(make_layout(shape(group<1, 4>(
       flatten(tSrS_conversion_view.layout()(make_coord(_0{}, _), _, _))))));
 
@@ -477,6 +509,12 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp4_sm120(
   const float scale_orig = scale;
   const float softmax_scale_log2 = scale * FFPA_M_LOG2E;
 
+  // Preload the rank-1 delta_s term (qm @ K^T, kept in fp32 smem as a
+  // stride-(0,1) row broadcast) into the QK accumulator BEFORE the mma
+  // chain, so S = Qhat@Khat^T + qm@K^T falls out as one accumulate. The
+  // float4 slot arithmetic below maps each thread's C-fragment slots (quad
+  // pairs x 4 f32) onto the matching DS broadcast columns - SA3 verbatim,
+  // consistent with the permuted K storage (header "Column alignment").
   auto add_delta_s = [&](auto& acc, int stage) {
     auto tSsDS_stage = recast<float4>(sDS(_, _, stage));
     auto acc_float4 = recast<float4>(acc);
@@ -581,6 +619,13 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp4_sm120(
         }
       }
 
+      // Online softmax fused with the P quantization prep: updates the
+      // running row max/sum (rescaling O lazily via scores_scale below),
+      // shifts scores into the P2 = P*2688 domain inside exp2 (the 1/(448*6)
+      // global scale folded in, see fp4_pscale.cuh), and records the per-
+      // 16-token-group absmax into AbsMaxP for quantize_and_pack_p.
+      // InfCheck flushes rows whose valid columns all fall outside this
+      // tile (causal top-left / fully masked), keeping row_sum finite.
       if (kv_tile == 0)
         softmax_fused.template online_softmax_with_quant</*FirstTile=*/true,
                                                          /*InfCheck=*/true>(
@@ -590,6 +635,8 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp4_sm120(
                                                          /*InfCheck=*/true>(
             tSrS, AbsMaxP, softmax_scale_log2);
 
+      // V is loaded after the softmax so the QK math and the V TMA overlap;
+      // k_stg == v_stg by construction (same tile sequence drives both).
       TmaBarrier::wait(&v_full[v_stg], v_phase);
       cutlass::arch::fence_view_async_shared();
 
@@ -623,8 +670,17 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp4_sm120(
 
     softmax_fused.finalize(tOrO_store);
 
-    // Epilogue. qkm (lse correction) reads sQ back from smem, so it must run
-    // before the O staging aliases q_base.
+    // Epilogue, four ordered steps (the O staging tile aliases the Q smem,
+    // which drives the ordering):
+    //   1. lse correction (optional): lse_qkm_dot reads sQ/sSFQ back from
+    //      smem - must run BEFORE O staging overwrites q_base.
+    //   2. f32 -> ElementO convert of the PV accumulator.
+    //   3a. full Q tile: STSM r2s into the staged O tile + one TMA store
+    //       (coalesced, swizzle-matched descriptor).
+    //   3b. tail Q tile (Br_base+kBr > Nq): the flattened [total_q_rows, D]
+    //       TMA space would alias the next head's rows, so store R->G with a
+    //       row guard instead.
+    //   4. lse write (P2-domain formula + the smooth-K correction).
     float qkm[kSRows];
     const bool smooth_lse =
         (softmax_lse != nullptr) && (km != nullptr) && (qm != nullptr);

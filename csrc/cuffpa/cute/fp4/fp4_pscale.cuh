@@ -293,9 +293,35 @@ struct SoftmaxFused {
 
 // Quantize one mma_k slice of the online-softmax P fragment into the packed
 // (e2m1 data + ue4m3 SFP) register pair the blockscaled PV mma consumes as
-// its A operand (zip(tOrP, tOrSFP)). mma_k is either a compile-time Int<>
-// (_0{}) or a runtime int (v_block+1 prefetch), hence the class template
-// parameter. See the persist_d kernel for the fragment-layout details.
+// its A operand. Why the pack exists: the SM120 blockscaled mma
+// (SM120_16x32x64_TN_VS_NVFP4) takes each operand as zip(data, SF) REGISTER
+// pairs - there is no smem path for P - so the f32 scores produced by
+// softmax must be re-encoded in-register into the exact operand layout:
+//   * data: e2m1 has 16 encodings total (2 sign x 8 magnitudes: 0, .5, 1,
+//     1.5, 2, 3, 4, 6); P >= 0 so only the 8 non-negative values ever
+//     appear - i.e. 3 effective mantissa bits per element. packed_float_to_
+//     e2m1 packs 8 floats (8 x 4 bit) into one uint32; recast<uint32_t>
+//     exposes exactly that packing granularity.
+//   * SFP: one ue4m3 scale per 16-token group (AbsMaxP, produced by
+//     online_softmax_with_quant). Two-level math: exp2 already shifted P
+//     into the P2 = P*2688 domain (2688 = 448 ue4m3-max x 6 e2m1-max, folded
+//     into the exp2 shift by SoftmaxFused), so SFP = group_absmax/6 uses the
+//     full e2m1 range {0..6} x SFP <= 448 and the product reconstructs P*2688
+//     exactly in the mma's scale multiply; the 2688 cancels between O and
+//     row_sum (see the lse formula). packed_float_to_ue4m3 packs 4 scales
+//     into one uint32.
+//   * Fragment mapping: acc_conversion_view (the QK C-fragment re-laid-out
+//     by convert_to_conversion_layout) lists the scores in exactly the order
+//     packed_float_to_e2m1 wants; tOrP/tOrSFP carry Traits::LayoutP/LayoutSFP,
+//     the SA3 adapter that maps QK C-fragment slots onto the PV A-operand
+//     (k = token) register slots, so the quantized registers land where the
+//     mma reads them with no shuffles for the data half.
+//   * The SFP half DOES need a lane fixup: adjacent quads hold different
+//     16-token groups, and the SFA operand wants the pair of group scales
+//     interleaved in one register - hence the __shfl_xor(2) byte swap that
+//     merges local+peer scales into tOrSFP.
+// mma_k is either a compile-time Int<> (_0{}) or a runtime int (v_block+1
+// prefetch), hence the class template parameter.
 template <class MmaK, typename AbsMaxTensor, typename AccConvTensor,
           typename PFragment, typename SfpFragment>
 CUTE_DEVICE void quantize_and_pack_p(MmaK mma_k, AbsMaxTensor& AbsMaxP,
