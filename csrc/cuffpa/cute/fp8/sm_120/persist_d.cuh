@@ -12,7 +12,7 @@
 #include <algorithm>
 
 #include "../../gemm.cuh"
-#include "../../attn_traits.cuh"
+#include "../attn_traits.cuh"
 #include "../../softmax.cuh"
 #include "../fp8_pscale.cuh"
 #include "../reg2reg_8b.cuh"
