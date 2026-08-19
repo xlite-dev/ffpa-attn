@@ -21,6 +21,8 @@
 
 ## Latest News
 
+- [2026/08] FFPA now supports D=512 for NVIDIA B200 via [**CuTe-DSL**](#benchmark) `tcgen05` 2-CTA, [**1517**](#benchmark) TFLOPS forward and [**763**](#benchmark) TFLOPS backward, achieving **6x~15x**🎉 speedup over standard PyTorch SDPA. 🎉🎉
+
 <div align='center'>
   <img src="./docs/assets/ffpa-fp8.png" width="800px">
 </div>
