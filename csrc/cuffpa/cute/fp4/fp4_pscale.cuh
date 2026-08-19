@@ -289,6 +289,39 @@ struct SoftmaxFused {
       }
     }
   }
+
+  // split-d companion to finalize(): O lives in per-D-chunk fragments, so
+  // finalize() folds row_sum on the first chunk and this scales the rest
+  // with the already-folded row_sum.
+  template <typename TensorAcc>
+  CUTE_DEVICE void scale_o(TensorAcc& o_store) {
+    Tensor o_store_reduction_view = make_tensor(
+        o_store.data(), convert_to_reduction_layout(o_store.layout()));
+    CUTE_UNROLL
+    for (int mi = 0; mi < size(row_max); ++mi) {
+      const float sum = row_sum(mi);
+      const float inv_sum = (sum == 0.f || sum != sum) ? 0.f : 1 / sum;
+      CUTE_UNROLL
+      for (int ni = 0; ni < size<1>(o_store_reduction_view); ni++) {
+        o_store_reduction_view(mi, ni) *= inv_sum;
+      }
+    }
+  }
+
+  // split-d lazy rescale: multiply an O chunk in place by scores_scale
+  // (the gemm then accumulates the new tile on top).
+  template <typename TensorAcc>
+  CUTE_DEVICE void rescale_acc(TensorAcc& o_store) {
+    Tensor o_store_reduction_view = make_tensor(
+        o_store.data(), convert_to_reduction_layout(o_store.layout()));
+    CUTE_UNROLL
+    for (int mi = 0; mi < size(row_max); ++mi) {
+      CUTE_UNROLL
+      for (int ni = 0; ni < size<1>(o_store_reduction_view); ni++) {
+        o_store_reduction_view(mi, ni) *= scores_scale(mi);
+      }
+    }
+  }
 };
 
 // Quantize one mma_k slice of the online-softmax P fragment into the packed

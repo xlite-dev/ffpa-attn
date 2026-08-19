@@ -20,6 +20,7 @@
 #include "cute/fp4/quantize_fp4.cuh"
 #include "cute/fp4/delta_s.cuh"
 #include "cute/fp4/sm_120/persist_d.cuh"
+#include "cute/fp4/sm_120/split_d.cuh"
 #endif
 #endif
 
@@ -1805,6 +1806,223 @@ void launch_cute_fwd_persist_d_fp4_sm120(torch::Tensor Q, torch::Tensor K,
     TORCH_CHECK(false,
                 "ffpa_attn: cute_tma_fp4 persist_d requires D in "
                 "{64,128,192,256} (64-multiples), got D=",
+                kHeadDim);
+  }
+}
+
+// NVFP4 split-D launcher, headdims in (256, 768). Same pre-kernel pipeline
+// as the persist-D fp4 launcher (km -> q_block_mean -> quantize -> delta_s);
+// only the TMA descriptors change shape: K/SFK tiles become [kBc, 64] D
+// chunks, V^T/SFVt [64, kBc], and O stores per [kBr, kVDChunk] chunk. The
+// kernel itself stays persistent (same grid contract as persist_d fp4).
+template <typename kDataType, const int kHeadDim>
+void launch_cute_fwd_split_d_fp4_sm120_impl(torch::Tensor Q, torch::Tensor K,
+                                            torch::Tensor V, torch::Tensor O,
+                                            torch::Tensor softmax_lse,
+                                            int causal, double softmax_scale,
+                                            int q_start_row = 0) {
+  using namespace cute;
+  constexpr int kBr = 128;
+  constexpr int kBc = 128;
+  constexpr int kNumThreads = 256;
+  constexpr int kQKDChunk = 64;
+  constexpr int kVDChunk = 64;
+
+  using ElementO = std::conditional_t<std::is_same_v<kDataType, __half>,
+                                      cutlass::half_t, cutlass::bfloat16_t>;
+  using Traits = ffpa_fp4::FFPAAttnCuTeSplitDFP4Traits<ElementO, kHeadDim>;
+  using Element = typename Traits::Element;
+  using ElementSF = typename Traits::ElementSF;
+  auto prop = at::cuda::getCurrentDeviceProperties();
+  using SmemLayoutQ = typename Traits::SmemLayoutQ;
+  using SmemLayoutK = typename Traits::SmemLayoutK;
+  using SmemLayoutVt = typename Traits::SmemLayoutVt;
+  using SmemLayoutSFQ = typename Traits::SmemLayoutSFQ;
+  using SmemLayoutSFK = typename Traits::SmemLayoutSFK;
+  using SmemLayoutSFVt = typename Traits::SmemLayoutSFVt;
+  using SmemLayoutDS = typename Traits::SmemLayoutDS;
+  using SmemLayoutO = typename Traits::SmemLayoutO;
+  using SmemLayoutAtomDS = typename Traits::SmemLayoutAtomDS;
+  using BlkScaledConfig = typename Traits::BlkScaledConfig;
+
+  const int Nb = Q.size(0);
+  const int Nh = Q.size(1);
+  const int Nh_kv = K.size(1);
+  const int Nq = Q.size(2);
+  const int Nkv = K.size(2);
+  const int group = Nh / Nh_kv;
+  const int Nq_pad = utils::div_ceil(Nq, kBr) * kBr;
+  const int Nkv_pad = utils::div_ceil(Nkv, kBc) * kBc;
+  const int Mb = Nq_pad / kBr;
+  const int Tc = Nkv_pad / kBc;
+  const int total_q_rows = Nb * Nh * Nq;
+  const float scale = static_cast<float>(softmax_scale);
+
+  auto opts_u8 = torch::TensorOptions().dtype(torch::kUInt8).device(Q.device());
+  auto opts_f32 =
+      torch::TensorOptions().dtype(torch::kFloat32).device(Q.device());
+  torch::Tensor q4 = torch::empty({Nb, Nh, Nq_pad, kHeadDim / 2}, opts_u8);
+  torch::Tensor sfq = torch::empty({Nb, Nh, Nq_pad, kHeadDim / 16}, opts_u8);
+  torch::Tensor k4 = torch::empty({Nb, Nh_kv, Nkv_pad, kHeadDim / 2}, opts_u8);
+  torch::Tensor sfk =
+      torch::empty({Nb, Nh_kv, Nkv_pad, kHeadDim / 16}, opts_u8);
+  torch::Tensor vt4 = torch::empty({Nb, Nh_kv, kHeadDim, Nkv_pad / 2}, opts_u8);
+  torch::Tensor sfvt =
+      torch::empty({Nb, Nh_kv, kHeadDim, Nkv_pad / 16}, opts_u8);
+  torch::Tensor qm = torch::empty({Nb, Nh, Mb, kHeadDim}, opts_f32);
+  torch::Tensor delta_s;
+
+  const c10::cuda::OptionalCUDAGuard device_guard(Q.device());
+  auto stream = at::cuda::getCurrentCUDAStream();
+  const kDataType* k_ptr = reinterpret_cast<const kDataType*>(K.data_ptr());
+
+  torch::Tensor km_h = torch::empty({Nb * Nh_kv, kHeadDim}, K.options());
+  torch::Tensor km_f32 = torch::empty({Nb * Nh_kv, kHeadDim}, opts_f32);
+  {
+    const int mean_chunks =
+        (Nkv + ffpa_fp8::kMeanRowsPerChunk - 1) / ffpa_fp8::kMeanRowsPerChunk;
+    torch::Tensor km_partials =
+        torch::empty({Nb * Nh_kv, mean_chunks, kHeadDim}, opts_f32);
+    ffpa_fp8::launch_kv_mean_sm120<kDataType, kHeadDim>(
+        k_ptr, reinterpret_cast<kDataType*>(km_h.data_ptr()),
+        km_f32.data_ptr<float>(), km_partials.data_ptr<float>(), Nb, Nh_kv, Nkv,
+        static_cast<int>(K.size(3)), stream);
+  }
+
+  auto Q_t = Q.transpose(1, 2);
+  auto K_t = K.transpose(1, 2);
+  auto V_t = V.transpose(1, 2);
+  ffpa_fp4::launch_fp4_q_block_mean_sm120<kHeadDim>(Q_t, qm);
+  ffpa_fp4::launch_fp4_quant_q_sm120<kHeadDim>(Q_t, q4, sfq, qm, Nq_pad,
+                                               /*sub_qm=*/true);
+  ffpa_fp4::launch_fp4_quant_k_sm120<kHeadDim>(
+      K_t, k4, sfk, km_f32.view({Nb, Nh_kv, kHeadDim}), Nkv_pad,
+      /*sub_km=*/true);
+  ffpa_fp4::launch_fp4_quant_vt_sm120<kHeadDim>(V_t, vt4, sfvt, Nkv_pad);
+
+  {
+    auto qm_h = qm.to(Q.dtype());
+    auto qkm = torch::matmul(qm_h.view({Nb, Nh_kv, group, Mb, kHeadDim}),
+                             km_h.view({Nb, Nh_kv, 1, kHeadDim, 1}))
+                   .reshape({Nb, Nh, Mb});
+    delta_s = torch::empty({Nb, Nh, Mb, Nkv_pad}, opts_f32);
+    TORCH_CHECK(K.is_contiguous(), "ffpa_attn: fp4 path requires contiguous K");
+    ffpa_fp4::launch_fp4_delta_s_sm120<kDataType, kHeadDim>(
+        reinterpret_cast<const kDataType*>(qm_h.data_ptr()), k_ptr,
+        reinterpret_cast<const kDataType*>(qkm.data_ptr()),
+        delta_s.data_ptr<float>(), Nb, Nh, Nh_kv, Mb, Nkv, Nkv_pad,
+        static_cast<int>(K.size(3)), stream);
+  }
+
+  const long total_q_pad = (long)Nb * Nh * Nq_pad;
+  const long total_kv_pad = (long)Nb * Nh_kv * Nkv_pad;
+  const long d_total = (long)Nb * Nh_kv * kHeadDim;
+  auto gQ =
+      make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(q4.data_ptr())),
+                  make_shape(total_q_pad, Int<kHeadDim>{}),
+                  make_stride(Int<kHeadDim>{}, _1{}));
+  auto tma_q = make_tma_copy(SM90_TMA_LOAD{}, gQ, SmemLayoutQ{},
+                             Shape<Int<kBr>, Int<kHeadDim>>{}, _1{});
+  auto gK =
+      make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(k4.data_ptr())),
+                  make_shape(total_kv_pad, Int<kHeadDim>{}),
+                  make_stride(Int<kHeadDim>{}, _1{}));
+  auto tma_k = make_tma_copy(SM90_TMA_LOAD{}, gK, SmemLayoutK{}(_, _, _0{}),
+                             Shape<Int<kBc>, Int<kQKDChunk>>{}, _1{});
+  auto gV =
+      make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(vt4.data_ptr())),
+                  make_shape(d_total, Nkv_pad), make_stride(Nkv_pad, _1{}));
+  auto tma_v = make_tma_copy(SM90_TMA_LOAD{}, gV, SmemLayoutVt{}(_, _, _0{}),
+                             Shape<Int<kVDChunk>, Int<kBc>>{}, _1{});
+  auto gO =
+      make_tensor(make_gmem_ptr(reinterpret_cast<ElementO*>(O.data_ptr())),
+                  make_shape((long)total_q_rows, Int<kHeadDim>{}),
+                  make_stride(Int<kHeadDim>{}, _1{}));
+  auto tma_o = make_tma_copy(SM90_TMA_STORE{}, gO, SmemLayoutO{},
+                             Shape<Int<kBr>, Int<kVDChunk>>{}, _1{});
+
+  auto layout_SFQ = BlkScaledConfig::tile_atom_to_shape_SFQKV(
+      make_shape(Nq_pad, Int<kHeadDim>{}, Nh, Nb));
+  auto mSFQ = make_tensor(
+      make_gmem_ptr(reinterpret_cast<ElementSF*>(sfq.data_ptr())), layout_SFQ);
+  auto tma_sfq =
+      make_tma_copy<uint16_t>(SM90_TMA_LOAD{}, mSFQ, SmemLayoutSFQ{},
+                              Shape<Int<kBr>, Int<kHeadDim>>{}, _1{});
+  auto layout_SFK = BlkScaledConfig::tile_atom_to_shape_SFQKV(
+      make_shape(Nkv_pad, Int<kHeadDim>{}, Nh_kv, Nb));
+  auto mSFK = make_tensor(
+      make_gmem_ptr(reinterpret_cast<ElementSF*>(sfk.data_ptr())), layout_SFK);
+  auto tma_sfk = make_tma_copy<uint16_t>(
+      SM90_TMA_LOAD{}, mSFK, SmemLayoutSFK{}(_, _, _0{}),
+      Shape<Int<kBc>, Int<kQKDChunk>>{}, _1{});
+  auto layout_SFVt = BlkScaledConfig::tile_atom_to_shape_SFVt(
+      make_shape(Int<kHeadDim>{}, Nkv_pad, Nh_kv, Nb));
+  auto mSFVt =
+      make_tensor(make_gmem_ptr(reinterpret_cast<ElementSF*>(sfvt.data_ptr())),
+                  layout_SFVt);
+  auto tma_sfvt = make_tma_copy<uint16_t>(
+      SM90_TMA_LOAD{}, mSFVt, SmemLayoutSFVt{}(_, _, _0{}),
+      Shape<Int<kVDChunk>, Int<kBc>>{}, _1{});
+  auto layout_DS =
+      tile_to_shape(SmemLayoutAtomDS{}, make_shape(Nq_pad, Nkv_pad, Nh, Nb),
+                    Step<_2, _1, _3, _4>{});
+  auto mDS = make_tensor(make_gmem_ptr(delta_s.data_ptr<float>()), layout_DS);
+  auto tma_ds = make_tma_copy(SM90_TMA_LOAD{}, mDS, SmemLayoutDS{}(_, _, _0{}),
+                              Shape<Int<kBr>, Int<kBc>>{}, _1{});
+
+  constexpr int kSmemBytes = Traits::kSmemBytes;
+  TORCH_CHECK(q_start_row >= 0 && q_start_row < Nq,
+              "ffpa_attn: q_start_row must be in [0, Nq)");
+  TORCH_CHECK(q_start_row % kBr == 0,
+              "ffpa_attn: q_start_row must be a multiple of kBr=128");
+  int max_smem_optin = 0;
+  cudaDeviceGetAttribute(
+      &max_smem_optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, Q.get_device());
+  TORCH_CHECK(kSmemBytes <= max_smem_optin,
+              "ffpa_attn: fp4 split_d D=", kHeadDim, " needs ", kSmemBytes,
+              "B smem, device opt-in allows ", max_smem_optin);
+  float* softmax_lse_ptr =
+      softmax_lse.numel() > 0 ? softmax_lse.data_ptr<float>() : nullptr;
+  auto O_ptr = reinterpret_cast<ElementO*>(O.data_ptr());
+  const dim3 block(kNumThreads, 1, 1);
+  const int mb = (Nq - q_start_row + kBr - 1) / kBr;
+  const int total_work = mb * Nb * Nh;
+  const int num_ctas =
+      causal ? total_work : std::min(total_work, prop->multiProcessorCount);
+  const dim3 grid(num_ctas, 1, 1);
+  auto kernel = ffpa_fp4::split_d_fwd_cute_fp4_sm120<
+      Traits, ElementO, decltype(tma_q), decltype(tma_k), decltype(tma_v),
+      decltype(tma_o), decltype(tma_sfq), decltype(tma_sfk), decltype(tma_sfvt),
+      decltype(tma_ds)>;
+  TORCH_CHECK(
+      cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                           kSmemBytes) == cudaSuccess,
+      "ffpa_attn: fp4 split_d smem opt-in failed for D=", kHeadDim);
+  kernel<<<grid, block, kSmemBytes, stream>>>(
+      tma_q, tma_k, tma_v, tma_o, tma_sfq, tma_sfk, tma_sfvt, tma_ds, O_ptr,
+      softmax_lse_ptr, km_f32.data_ptr<float>(), qm.data_ptr<float>(), Nq, Nkv,
+      Nq_pad, Nkv_pad, Nh, Nh_kv, scale, Tc, causal, total_q_rows, Nb,
+      q_start_row);
+}
+
+template <typename kDataType, const int kHeadDim, const int kStage>
+void launch_cute_fwd_split_d_fp4_sm120(torch::Tensor Q, torch::Tensor K,
+                                       torch::Tensor V, torch::Tensor O,
+                                       torch::Tensor softmax_lse, int causal,
+                                       double softmax_scale,
+                                       int q_start_row = 0) {
+  (void)kStage;  // kStages (3/3) fixed by the fp4 split_d traits
+  auto prop = at::cuda::getCurrentDeviceProperties();
+  TORCH_CHECK(prop->major == 12,
+              "ffpa_attn: the NVFP4 path requires an sm_120 device, got sm_",
+              prop->major, prop->minor);
+  if constexpr (kHeadDim % 64 == 0 && kHeadDim > 256 && kHeadDim < 768) {
+    launch_cute_fwd_split_d_fp4_sm120_impl<kDataType, kHeadDim>(
+        Q, K, V, O, softmax_lse, causal, softmax_scale, q_start_row);
+  } else {
+    TORCH_CHECK(false,
+                "ffpa_attn: cute_tma_fp4 split_d requires 64-multiple D in "
+                "(256,768), got D=",
                 kHeadDim);
   }
 }

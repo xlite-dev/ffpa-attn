@@ -11,6 +11,7 @@
 #include <cutlass/numeric_types.h>
 #include <cutlass/gemm/collective/collective_builder.hpp>
 
+#include "../attn_traits.cuh"
 #include "cute_ext.h"
 
 namespace ffpa_fp4 {
@@ -168,6 +169,183 @@ struct FFPAAttnCuTePersistDFP4Traits {
   static_assert(kSmemBytes <= 101376, "smem budget");
   static_assert(kBr * kHeadDim * 2 <= kSmemBytes,
                 "O staging must fit the freed smem");
+};
+
+// NVFP4 split-D traits: headdims in (256, 768) (64-multiples), the regime
+// where the persist-D smem plan (full [kBc, D] K/V^T tiles) no longer fits
+// the 99KB opt-in budget. Same blockscaled 16x32x64 atom and kBr/kBc as
+// persist-D, but K and V^T stream through smem in 64-element D chunks
+// (kQKDChunk = the atom K extent; kVDChunk = 2 atom-N) while Q/SFQ stay
+// resident for the whole work. The kernel is non-WS 256T (tid==0 issues
+// TMA inline): the O accumulator alone is kBr*D/256 = D/2 f32 regs/thread,
+// already past the 255 wall at D=512, so a producer warp split (and its
+// setmaxnreg 232 cap) only adds spill - fp8's split_d made the same call.
+// O epilogue stages over the whole freed smem in kVChunksPerBatch batches.
+template <typename ElementO_, int kHeadDim_, int kBr_ = 128, int kBc_ = 128,
+          int kQKDChunk_ = 64, int kVDChunk_ = 64, int kStagesQK_ = 3,
+          int kStagesPV_ = 3>
+struct FFPAAttnCuTeSplitDFP4Traits {
+  static_assert(kHeadDim_ % 64 == 0 && kHeadDim_ > 256 && kHeadDim_ < 768,
+                "fp4 split_d supports 64-multiple D in (256,768)");
+  static_assert(kQKDChunk_ == 64, "kQKDChunk must equal the blockscale atom K");
+  static_assert(kVDChunk_ % 32 == 0, "kVDChunk must be a multiple of atom N");
+
+  static constexpr int kHeadDim = kHeadDim_;
+  static constexpr int kBr = kBr_;
+  static constexpr int kBc = kBc_;
+  static constexpr int kQKDChunk = kQKDChunk_;
+  static constexpr int kVDChunk = kVDChunk_;
+  static constexpr int kDChunksQK = kHeadDim / kQKDChunk;
+  static constexpr int kDChunksV = kHeadDim / kVDChunk;
+  static constexpr int kStagesQK = kStagesQK_;
+  static constexpr int kStagesPV = kStagesPV_;
+  static constexpr int kNumWarps = kBr / 16;
+  static constexpr int kNumThreads = kNumWarps * 32;
+
+  using Element = cutlass::float_e2m1_t;
+  using ElementSF = cutlass::float_ue4m3_t;
+  using ElementO = ElementO_;
+
+  // Tile-K per gemm call: 64 (one QK d_chunk) for QK, kBc (token extent,
+  // unchanged by D chunking) for PV - the SA3 Tile-K == K-extent discipline.
+  using MMAAtom =
+      MMA_Atom<cute::SM120::BLOCKSCALED::SM120_16x32x64_TN_VS_NVFP4>;
+  using AtomLayoutMNK = Layout<Shape<_8, _1, _1>>;
+  using TiledMmaQK = decltype(make_tiled_mma(
+      MMAAtom{}, AtomLayoutMNK{}, Tile<_128, _32, Int<kQKDChunk>>{}));
+  using TiledMmaPV = decltype(make_tiled_mma(MMAAtom{}, AtomLayoutMNK{},
+                                             Tile<_128, _32, Int<kBc>>{}));
+
+  // Q/K chunk rows are 64 e2m1 elements (32B) -> SW32; V^T rows are kBc=128
+  // elements (64B) -> SW64 (persist_d picks the same V^T atom). The 64-elem
+  // Q atom keeps every d_chunk a self-contained swizzle span.
+  using SmemLayoutAtomQK =
+      decltype(cutlass::gemm::collective::detail::sm120_rr_smem_selector<
+               Element, Int<kQKDChunk>>());
+  using SmemLayoutAtomVt =
+      decltype(cutlass::gemm::collective::detail::sm120_rr_smem_selector<
+               Element, Int<kBc>>());
+  using SmemLayoutQ = decltype(tile_to_shape(SmemLayoutAtomQK{},
+                                             Shape<Int<kBr>, Int<kHeadDim>>{}));
+  using SmemLayoutK = decltype(tile_to_shape(
+      SmemLayoutAtomQK{},
+      make_shape(Int<kBc>{}, Int<kQKDChunk>{}, Int<kStagesQK>{})));
+  using SmemLayoutVt = decltype(tile_to_shape(
+      SmemLayoutAtomVt{},
+      make_shape(Int<kVDChunk>{}, Int<kBc>{}, Int<kStagesPV>{})));
+  // Per-stage rank-2 views (byte-identical to the stage slices of the 3D
+  // layouts above; the TMA issue path addresses them by byte offset).
+  using SmemLayoutKStage = decltype(tile_to_shape(
+      SmemLayoutAtomQK{}, Shape<Int<kBc>, Int<kQKDChunk>>{}));
+  using SmemLayoutVtStage = decltype(tile_to_shape(
+      SmemLayoutAtomVt{}, Shape<Int<kVDChunk>, Int<kBc>>{}));
+
+  using BlkScaledConfig = BlockScaledConfig<16>;
+  // SFQ covers the full-D resident tile (deduce reads M and K modes);
+  // SFK/SFVt are per-chunk stage atoms.
+  using SmemLayoutAtomSFQ = decltype(BlkScaledConfig::deduce_smem_layoutSFQ(
+      TiledMmaQK{}, Shape<_128, _32, Int<kHeadDim>>{}));
+  using SmemLayoutAtomSFK = decltype(BlkScaledConfig::deduce_smem_layoutSFKV(
+      TiledMmaQK{}, Shape<_128, _128, Int<kQKDChunk>>{}));
+  using SmemLayoutAtomSFVt = decltype(BlkScaledConfig::deduce_smem_layoutSFVt(
+      TiledMmaPV{}, Shape<_128, Int<kVDChunk>, Int<kBc>>{}));
+  using SmemLayoutSFQ = decltype(make_layout(shape(SmemLayoutAtomSFQ{}),
+                                             stride(SmemLayoutAtomSFQ{})));
+  using SmemLayoutSFK =
+      decltype(make_layout(append(shape(SmemLayoutAtomSFK{}), Int<kStagesQK>{}),
+                           append(stride(SmemLayoutAtomSFK{}),
+                                  size(filter_zeros(SmemLayoutAtomSFK{})))));
+  using SmemLayoutSFVt = decltype(make_layout(
+      append(shape(SmemLayoutAtomSFVt{}), Int<kStagesPV>{}),
+      append(stride(SmemLayoutAtomSFVt{}),
+             size(filter_zeros(SmemLayoutAtomSFVt{})))));
+
+  using SmemLayoutAtomDS = Layout<Shape<_128, _128>, Stride<_0, _1>>;
+  using SmemLayoutDS = decltype(tile_to_shape(
+      SmemLayoutAtomDS{},
+      make_shape(Int<kBr>{}, Int<kBc>{}, Int<kStagesQK>{})));
+  using SmemLayoutSFKStage = decltype(make_layout(shape(SmemLayoutAtomSFK{}),
+                                                  stride(SmemLayoutAtomSFK{})));
+  using SmemLayoutSFVtStage = decltype(make_layout(
+      shape(SmemLayoutAtomSFVt{}), stride(SmemLayoutAtomSFVt{})));
+  using SmemLayoutDSStage =
+      decltype(tile_to_shape(SmemLayoutAtomDS{}, Shape<Int<kBr>, Int<kBc>>{}));
+
+  // P / SFP register adapters: identical to persist-D (kBc unchanged).
+  using LayoutP = decltype(make_layout(
+      make_shape(make_shape(_8{}, _2{}, _2{}), _1{}, Int<kBc / 64>{}),
+      make_stride(make_stride(_1{}, _8{}, _16{}), _0{}, _32{})));
+  using LayoutSFP = decltype(make_layout(
+      make_shape(make_shape(_16{}, _4{}), _1{}, Int<kBc / 64>{}),
+      make_stride(make_stride(_0{}, _1{}), _0{}, _4{})));
+
+  // O staging per v_chunk: [kBr, kVDChunk] ElementO, 128B rows -> SW128.
+  using SmemLayoutO = decltype(tile_to_shape(
+      GMMA::Layout_K_SW128_Atom<ElementO>{}, Shape<Int<kBr>, Int<kVDChunk>>{}));
+
+  using SmemCopyAtomQ = Copy_Atom<SM75_U32x4_LDSM_N, Element>;
+  using SmemCopyAtomKV = Copy_Atom<SM75_U32x4_LDSM_N, Element>;
+  using SmemCopyAtomSF = Copy_Atom<UniversalCopy<ElementSF>, ElementSF>;
+
+  // TMA tx bytes: Q/SFQ once per work (resident); K/SFK/DS and V/SFVt per
+  // chunk stage. DS rides with the kv_tile's first chunk's barrier.
+  static constexpr uint32_t kTxBytesQ =
+      static_cast<uint32_t>(cute::bits_to_bytes(cosize(SmemLayoutSFQ{}) * 8)) +
+      static_cast<uint32_t>(cute::bits_to_bytes(size(SmemLayoutQ{}) * 4));
+  static constexpr uint32_t kTxBytesK =
+      static_cast<uint32_t>(
+          cute::bits_to_bytes(cosize(take<0, 2>(SmemLayoutSFK{})) * 8)) +
+      static_cast<uint32_t>(
+          cute::bits_to_bytes(size(take<0, 2>(SmemLayoutK{})) * 4));
+  static constexpr uint32_t kTxBytesDS = static_cast<uint32_t>(
+      cute::bits_to_bytes(cosize(take<0, 2>(SmemLayoutDS{})) * 32));
+  static constexpr uint32_t kTxBytesV =
+      static_cast<uint32_t>(
+          cute::bits_to_bytes(cosize(take<0, 2>(SmemLayoutSFVt{})) * 8)) +
+      static_cast<uint32_t>(
+          cute::bits_to_bytes(size(take<0, 2>(SmemLayoutVt{})) * 4));
+
+  // SMEM plan: [Q | SFQ | K*s | SFK*s | DS*s | V^T*s | SFVt*s] - persist_d's
+  // ordering with Q/SFQ resident (no stage dim) and the rest chunk-staged;
+  // every region start 1024B-aligned.
+  static constexpr int kQBytes =
+      int(cute::bits_to_bytes(size(SmemLayoutQ{}) * 4));
+  static constexpr int kSFQBytes =
+      int(cute::bits_to_bytes(cosize(SmemLayoutSFQ{}) * 8));
+  static constexpr int kKBytesStage =
+      int(cute::bits_to_bytes(size(take<0, 2>(SmemLayoutK{})) * 4));
+  static constexpr int kSFKBytesStage =
+      int(cute::bits_to_bytes(cosize(take<0, 2>(SmemLayoutSFK{})) * 8));
+  static constexpr int kDSBytesStage =
+      int(cute::bits_to_bytes(cosize(take<0, 2>(SmemLayoutDS{})) * 32));
+  static constexpr int kVBytesStage =
+      int(cute::bits_to_bytes(size(take<0, 2>(SmemLayoutVt{})) * 4));
+  static constexpr int kSFVtBytesStage =
+      int(cute::bits_to_bytes(cosize(take<0, 2>(SmemLayoutSFVt{})) * 8));
+  static constexpr int kOffQ = 0;
+  static constexpr int kOffSFQ = (kQBytes + 1023) / 1024 * 1024;
+  static constexpr int kOffK = (kOffSFQ + kSFQBytes + 1023) / 1024 * 1024;
+  static constexpr int kOffSFK =
+      (kOffK + kStagesQK * kKBytesStage + 1023) / 1024 * 1024;
+  static constexpr int kOffDS =
+      (kOffSFK + kStagesQK * kSFKBytesStage + 1023) / 1024 * 1024;
+  static constexpr int kOffV =
+      (kOffDS + kStagesQK * kDSBytesStage + 1023) / 1024 * 1024;
+  static constexpr int kOffSFVt = kOffV + kStagesPV * kVBytesStage;
+  static constexpr int kSmemBytes = kOffSFVt + kStagesPV * kSFVtBytesStage;
+  static_assert(kOffK % 1024 == 0 && kOffV % 1024 == 0, "SW128 smem alignment");
+  // sm_120 opt-in budget (see persist_d traits; exceeding fails silently).
+  static_assert(kSmemBytes <= 101376, "smem budget");
+
+  // O epilogue batches over the whole freed smem (during the epilogue no
+  // K/V chunk TMA is in flight: the lookahead is work-bounded and the next
+  // work's fills wait on epilogue_done).
+  static constexpr int kVChunksPerBatch = ffpa_cute::compute_vchunks_per_batch(
+      kDChunksV, kHeadDim, kBr, kSmemBytes / int(sizeof(ElementO)));
+  static constexpr int kNBatches = kDChunksV / kVChunksPerBatch;
+  static_assert(kVChunksPerBatch * cosize(SmemLayoutO{}) * sizeof(ElementO) <=
+                    kSmemBytes,
+                "TMA-O: batched O staging must fit the reused smem");
 };
 
 }  // namespace ffpa_fp4
