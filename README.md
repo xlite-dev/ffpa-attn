@@ -86,11 +86,11 @@ Runnable benchmark are provided under [`bench`](./bench). The performance benchm
   <img src='./docs/assets/perf/ffpa_speedup_cutedsl_nvidia-h20z_B1_H32_N16384_D512_T.png' width='400px'><br>
   <img src='./docs/assets/perf/ffpa_speedup_cutedsl_nvidia-b200_B1_H32_N8192_D512_T.png' width='400px'>
   <img src='./docs/assets/perf/ffpa_speedup_cutedsl_nvidia-b200_B1_H32_N16384_D512_T.png' width='400px'><br>
-  <p><i>BF16 Attention for Large Headdim: FFPA vs SDPA across NVIDIA TRX 5090, H200 and B200. </i></p>
+  <p><i>BF16 Attention for Large Headdim: FFPA vs SDPA across NVIDIA RTX 5090, H200 and B200. </i></p>
 </div>
 <div align='center'>
   <img src="./docs/assets/ffpa-fp8.png" width="800px"><br>
-  <p><i>FP8 Attention for Large/Small Headdim: FFPA vs SDPA on NVIDIA TRX 5090. </i></p>
+  <p><i>FP8 Attention for Large/Small Headdim: FFPA vs SDPA on NVIDIA RTX 5090. </i></p>
 </div>
 
 ## Backends
