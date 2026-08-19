@@ -1,3 +1,7 @@
+// FP8/int8 quantize pre-kernels for the ffpa fp8 attention path (fp16/bf16
+// -> e4m3 or symmetric int8, plus blockwise scales).
+// Reference (int8 recipe: round-nearest-even, clamp [-127,127]):
+//   https://github.com/thu-ml/SageAttention/tree/main/csrc/qattn
 #pragma once
 
 #include <cuda_fp8.h>

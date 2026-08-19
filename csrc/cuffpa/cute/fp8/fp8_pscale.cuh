@@ -10,6 +10,9 @@ namespace ffpa_fp8 {
 // P quantization helpers for fp8 attention (softmax probabilities -> e4m3).
 // Shared by any kernel that feeds a register-resident softmax P into an fp8
 // PV MMA (persist-D and split-D fp8 paths).
+// Reference (P rowsum via MMA):
+// https://github.com/thu-ml/SageAttention/blob/main/csrc/mma.cuh
+// (rowsum_f8f8f32)
 //
 // Why P needs a runtime scale at all:
 // Q/K/V are quantized offline (blockwise scales q_scale/k_scale/v_scale).

@@ -10,6 +10,7 @@ enum class CudaBackendImpl : int {
   CUTE = 3,
   CUTE_TMA = 4,
   CUTE_TMA_FP8 = 5,
+  CUTE_TMA_FP4 = 6,
 };
 
 inline std::atomic<CudaBackendImpl>& backend_impl_hint() {

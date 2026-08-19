@@ -349,6 +349,8 @@ def _parse_args() -> argparse.Namespace:
       "fp8_smkv",
       "cute_tma_fp8_smkv_qk_int8",
       "fp8_smkv_qk_i8",
+      "cute_tma_fp4",
+      "fp4",
     ],
     default="auto",
     help="CUDA forward kernel implementation hint (--fwd-backend cuda only). "
@@ -361,6 +363,8 @@ def _parse_args() -> argparse.Namespace:
     "(per-channel V + dim-mean subtraction, smooth-K off); "
     "'cute_tma_fp8_smkv' (alias 'fp8_smkv') enables smooth-K + smooth-V; "
     "'cute_tma_fp8_smkv_qk_int8' (alias 'fp8_smkv_qk_i8') adds int8 QK MMA. "
+    "'cute_tma_fp4' (alias 'fp4') selects the NVFP4 path (any D%8==0 in "
+    "[8,256], padded up to {64,128,192,256}; e2m1 + ue4m3 block scales). "
     "Mutually exclusive with --fwd-tma/--cute when not 'auto'.",
   )
   parser.add_argument(
@@ -428,6 +432,21 @@ def _parse_args() -> argparse.Namespace:
     default=256,
     help="Number of leading query rows computed in fp16 under "
     "--fp8-hybrid (default 256, must be multiple of 128).",
+  )
+  parser.add_argument(
+    "--fp4-hybrid",
+    action="store_true",
+    default=None,
+    help="FP4 hybrid: fp16 persist-D computes [0:n_early] rows, fp4 "
+    "computes [n_early:N] (zero-redundancy). Independent from "
+    "--fp8-hybrid. Default auto: enabled when causal+fp4.",
+  )
+  parser.add_argument(
+    "--fp4-hybrid-n-early",
+    type=int,
+    default=256,
+    help="Number of leading query rows computed in fp16 under "
+    "--fp4-hybrid (default 256, must be multiple of 128).",
   )
   parser.add_argument(
     "--enable-bwd-tma",
@@ -550,6 +569,8 @@ def _resolve_directional_cli_flags(
         "fp8_smkv",
         "cute_tma_fp8_smkv_qk_int8",
         "fp8_smkv_qk_i8",
+        "cute_tma_fp4",
+        "fp4",
       }
       _FP8_QK_INT8_IMPLS = {
         "cute_tma_fp8_smk_qk_int8",
@@ -568,7 +589,12 @@ def _resolve_directional_cli_flags(
         "fp8_smkv_qk_i8",
       }
       _FP8_SMOOTH_V_ONLY_IMPLS = {"cute_tma_fp8_smv", "fp8_smv"}
-      if args.cuda_impl in _FP8_IMPLS:
+      _FP4_IMPLS = {"cute_tma_fp4", "fp4"}
+      if args.cuda_impl in _FP4_IMPLS:
+        args.enable_fwd_tma, args.enable_fwd_cute = True, True
+        args.enable_fp8 = False
+        args.enable_fp4 = True
+      elif args.cuda_impl in _FP8_IMPLS:
         args.enable_fwd_tma, args.enable_fwd_cute = True, True
         args.enable_fp8 = True
         if args.cuda_impl in _FP8_SMOOTH_V_ONLY_IMPLS:
@@ -590,6 +616,7 @@ def _resolve_directional_cli_flags(
         args.enable_fwd_tma, args.enable_fwd_cute = _CUDA_IMPL_MAP[
           args.cuda_impl]
         args.enable_fp8 = False
+        args.enable_fp4 = False
     # auto: leave None/True as-is so CUDABackend auto-resolves / honors aliases.
   else:
     args.enable_fwd_tma = bool(args.enable_fwd_tma)
@@ -615,6 +642,8 @@ def _resolve_directional_cli_flags(
       setattr(args, _py_attr, _val.replace("-", "_"))
   if not hasattr(args, "enable_fp8"):
     args.enable_fp8 = False
+  if not hasattr(args, "enable_fp4"):
+    args.enable_fp4 = False
   if not hasattr(args, "smooth_k"):
     args.smooth_k = True
   if not hasattr(args, "smooth_v"):
@@ -633,6 +662,10 @@ def _resolve_directional_cli_flags(
     args.fp8_hybrid = None
   if not hasattr(args, "fp8_hybrid_n_early"):
     args.fp8_hybrid_n_early = 256
+  if not hasattr(args, "fp4_hybrid"):
+    args.fp4_hybrid = None
+  if not hasattr(args, "fp4_hybrid_n_early"):
+    args.fp4_hybrid_n_early = 256
   return args
 
 
@@ -1710,6 +1743,7 @@ def _benchmark_rows(
         enable_ws=args.enable_fwd_ws,
         enable_cute=args.enable_fwd_cute,
         enable_fp8=args.enable_fp8,
+        enable_fp4=args.enable_fp4,
         fp8_smooth_k=args.smooth_k,
         fp8_smooth_v=args.smooth_v,
         fp8_q_quant_method=args.q_quant_method,
@@ -1723,6 +1757,8 @@ def _benchmark_rows(
         stages=args.stages,
         fp8_hybrid=args.fp8_hybrid,
         fp8_hybrid_n_early=args.fp8_hybrid_n_early,
+        fp4_hybrid=args.fp4_hybrid,
+        fp4_hybrid_n_early=args.fp4_hybrid_n_early,
       ),
     )
   if args.backward:

@@ -5,6 +5,8 @@
 
 namespace ffpa_fp8 {
 
+// Reference (smooth_k semantics + lse correction):
+// https://github.com/thu-ml/SageAttention/blob/main/sageattention/core.py
 // Smooth-K lse correction, per-row partial: dot(Q8_row, km). Softmax is
 // shift-invariant, so smoothing K leaves O unchanged, but the returned lse
 // must add back scale*qs*dot(Q_row, km) (see the attention epilogue).

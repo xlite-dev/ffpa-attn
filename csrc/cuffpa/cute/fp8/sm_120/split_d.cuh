@@ -9,7 +9,7 @@
 #include <cutlass/device_kernel.h>
 
 #include "../../gemm.cuh"
-#include "../../attn_traits.cuh"
+#include "../attn_traits.cuh"
 #include "../fp8_pscale.cuh"
 #include "../reg2reg_8b.cuh"
 #include "../smooth_k.cuh"

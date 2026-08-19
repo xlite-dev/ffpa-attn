@@ -18,7 +18,8 @@ void ffpa_attn_fwd_fp16f16(
     int64_t philox_offset, bool fp8_smooth_k, bool fp8_smooth_v,
     int64_t fp8_q_quant_method, int64_t fp8_k_quant_method,
     int64_t fp8_v_quant_method, int64_t fp8_pv_acc_type, int64_t fp8_qk_mm_type,
-    bool fp8_hybrid, int64_t fp8_hybrid_n_early);
+    bool fp8_hybrid, int64_t fp8_hybrid_n_early, bool fp4_hybrid,
+    int64_t fp4_hybrid_n_early);
 #endif
 void ffpa_attn_fwd_fp16f32(
     torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O,
@@ -27,7 +28,8 @@ void ffpa_attn_fwd_fp16f32(
     int64_t philox_offset, bool fp8_smooth_k, bool fp8_smooth_v,
     int64_t fp8_q_quant_method, int64_t fp8_k_quant_method,
     int64_t fp8_v_quant_method, int64_t fp8_pv_acc_type, int64_t fp8_qk_mm_type,
-    bool fp8_hybrid, int64_t fp8_hybrid_n_early);
+    bool fp8_hybrid, int64_t fp8_hybrid_n_early, bool fp4_hybrid,
+    int64_t fp4_hybrid_n_early);
 void ffpa_attn_fwd_bf16f32(
     torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O,
     torch::Tensor attn_bias, torch::Tensor softmax_lse, int stages, int causal,
@@ -35,7 +37,8 @@ void ffpa_attn_fwd_bf16f32(
     int64_t philox_offset, bool fp8_smooth_k, bool fp8_smooth_v,
     int64_t fp8_q_quant_method, int64_t fp8_k_quant_method,
     int64_t fp8_v_quant_method, int64_t fp8_pv_acc_type, int64_t fp8_qk_mm_type,
-    bool fp8_hybrid, int64_t fp8_hybrid_n_early);
+    bool fp8_hybrid, int64_t fp8_hybrid_n_early, bool fp4_hybrid,
+    int64_t fp4_hybrid_n_early);
 #endif
 
 // Public unified pybind entry for FFPA forward attention.
@@ -43,7 +46,9 @@ void ffpa_attn_fwd_bf16f32(
 // Computes O = softmax(scale * Q@K^T + attn_bias) @ V with optional causal
 // masking and dropout.  Supports fp16/bf16 activations; the FP8 path (backend
 // hint CUTE_TMA_FP8) internally quantizes Q/K/V to e4m3/int8 for low-precision
-// MMA.
+// MMA, and the NVFP4 path (backend hint CUTE_TMA_FP4, D=128 only) quantizes
+// Q/K/V to e2m1 with ue4m3 block scales (Q/K smoothed by qm/km means; the
+// delta_s correction restores the exact scores, see cute/fp4/sm_120).
 //
 // Tensor args (all CUDA, row-major [B, H, N, D]):
 //   Q            [B, Nh_q,  Nq,  D]  fp16/bf16 query.
@@ -73,6 +78,11 @@ void ffpa_attn_fwd_bf16f32(
 //   fp8_v_quant_method    0=per_block / 1=per_channel.
 //   fp8_pv_acc_type  PV accumulator: 0=f16 / 1=f32 (default).
 //   fp8_qk_mm_type   QK MMA dtype: 0=fp8 (default) / 1=int8.
+//
+// FP4-only args (ignored unless backend hint = CUTE_TMA_FP4):
+//   fp4_hybrid       2-stage hybrid: fp16 persist-D computes [0:n_early]
+//                   rows, fp4 computes [n_early:N) via q_start_row offset.
+//   fp4_hybrid_n_early  Leading fp16 row count (multiple of 128, default 256).
 void ffpa_attn_forward(torch::Tensor Q, torch::Tensor K, torch::Tensor V,
                        torch::Tensor attn_bias, torch::Tensor O,
                        torch::Tensor softmax_lse, int64_t stages, int64_t acc,
@@ -82,7 +92,8 @@ void ffpa_attn_forward(torch::Tensor Q, torch::Tensor K, torch::Tensor V,
                        int64_t fp8_q_quant_method, int64_t fp8_k_quant_method,
                        int64_t fp8_v_quant_method, int64_t fp8_pv_acc_type,
                        int64_t fp8_qk_mm_type, bool fp8_hybrid,
-                       int64_t fp8_hybrid_n_early) {
+                       int64_t fp8_hybrid_n_early, bool fp4_hybrid,
+                       int64_t fp4_hybrid_n_early) {
 #ifdef ENABLE_FFPA_CUDA_IMPL
   const auto dtype = Q.scalar_type();
   const int stages_i = static_cast<int>(stages);
@@ -112,20 +123,39 @@ void ffpa_attn_forward(torch::Tensor Q, torch::Tensor K, torch::Tensor V,
   const int head_dim_og = Q.size(3);
   const int head_dim_pad = (head_dim_og + 31) & ~31;
   const auto pad_backend = ffpa::get_backend_impl_hint();
+  const bool is_fp4 = pad_backend == ffpa::CudaBackendImpl::CUTE_TMA_FP4;
+  // fp4 pads to its own 64-multiple support set {64,128,192,256}; Q/K/V are
+  // zero-padded by the cuffpa launcher, only O is padded here (fp8 style).
+  const int head_dim_pad_fp4 = (head_dim_og + 63) & ~63;
+  TORCH_CHECK(
+      !is_fp4 || (head_dim_og % 8 == 0 && head_dim_pad_fp4 >= 64 &&
+                  head_dim_pad_fp4 <= 256),
+      "ffpa_attn: the NVFP4 path (CUTE_TMA_FP4) requires head_dim %8==0 "
+      "within [8,256] (any such D pads up to the nearest of "
+      "{64,128,192,256}), got D=",
+      head_dim_og);
   torch::Tensor O_orig;
+  const int head_dim_dispatch = is_fp4 ? head_dim_pad_fp4 : head_dim_pad;
   const bool needs_pad = (pad_backend == ffpa::CudaBackendImpl::CUTE_TMA_FP8 ||
                           pad_backend == ffpa::CudaBackendImpl::CUTE_TMA ||
-                          pad_backend == ffpa::CudaBackendImpl::CUTE) &&
-                         head_dim_pad != head_dim_og;
+                          pad_backend == ffpa::CudaBackendImpl::CUTE ||
+                          pad_backend == ffpa::CudaBackendImpl::CUTE_TMA_FP4) &&
+                         head_dim_dispatch != head_dim_og;
   if (needs_pad) {
     TORCH_CHECK(head_dim_og % 8 == 0,
                 "ffpa_attn: non-32-multiple head_dim must be D%8==0, got D=",
                 head_dim_og);
-    TORCH_CHECK(head_dim_pad >= 32 && head_dim_pad <= 1024,
-                "ffpa_attn: padded head_dim must be in [32,1024], got ",
-                head_dim_pad);
+    if (is_fp4) {
+      TORCH_CHECK(head_dim_dispatch >= 64 && head_dim_dispatch <= 256,
+                  "ffpa_attn: fp4 padded head_dim must be in [64,256], got ",
+                  head_dim_dispatch);
+    } else {
+      TORCH_CHECK(head_dim_dispatch >= 32 && head_dim_dispatch <= 1024,
+                  "ffpa_attn: padded head_dim must be in [32,1024], got ",
+                  head_dim_dispatch);
+    }
     O_orig = O;
-    O = torch::empty({Q.size(0), Q.size(1), Q.size(2), head_dim_pad},
+    O = torch::empty({Q.size(0), Q.size(1), Q.size(2), head_dim_dispatch},
                      O.options());
   }
 
@@ -136,7 +166,8 @@ void ffpa_attn_forward(torch::Tensor Q, torch::Tensor K, torch::Tensor V,
   Q, K, V, O, attn_bias, softmax_lse, stages_i, causal_i, softmax_scale, \
       dropout_p, philox_seed, philox_offset, fp8_smooth_k, fp8_smooth_v, \
       fp8_q_quant_method, fp8_k_quant_method, fp8_v_quant_method,        \
-      fp8_pv_acc_type, fp8_qk_mm_type, fp8_hybrid, fp8_hybrid_n_early
+      fp8_pv_acc_type, fp8_qk_mm_type, fp8_hybrid, fp8_hybrid_n_early,   \
+      fp4_hybrid, fp4_hybrid_n_early
 
   if (dtype == torch::kHalf) {
     if (acc == 0) {
@@ -151,7 +182,7 @@ void ffpa_attn_forward(torch::Tensor Q, torch::Tensor K, torch::Tensor V,
 #endif
     } else if (acc == 1) {
       if (needs_pad)
-        ffpa_attn_fwd_fp16f32_d(FFPA_FWD_ARGS, head_dim_pad);
+        ffpa_attn_fwd_fp16f32_d(FFPA_FWD_ARGS, head_dim_dispatch);
       else
         ffpa_attn_fwd_fp16f32(FFPA_FWD_ARGS);
     } else {
@@ -164,7 +195,7 @@ void ffpa_attn_forward(torch::Tensor Q, torch::Tensor K, torch::Tensor V,
           "no bf16-acc mma PTX exists.");
     }
     if (needs_pad)
-      ffpa_attn_fwd_bf16f32_d(FFPA_FWD_ARGS, head_dim_pad);
+      ffpa_attn_fwd_bf16f32_d(FFPA_FWD_ARGS, head_dim_dispatch);
     else
       ffpa_attn_fwd_bf16f32(FFPA_FWD_ARGS);
   } else {
@@ -198,6 +229,8 @@ void ffpa_attn_forward(torch::Tensor Q, torch::Tensor K, torch::Tensor V,
   (void)fp8_qk_mm_type;
   (void)fp8_hybrid;
   (void)fp8_hybrid_n_early;
+  (void)fp4_hybrid;
+  (void)fp4_hybrid_n_early;
   throw std::runtime_error(
       "ffpa_attn_forward: native CUDA forward was not compiled. Rebuild with "
       "ENABLE_FFPA_CUDA_IMPL=1 to enable the CUDA forward backend.");

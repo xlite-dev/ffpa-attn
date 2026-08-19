@@ -67,7 +67,8 @@ void launch_ffpa_attn_fwd_template(
     int64_t philox_offset, bool fp8_smooth_k, bool fp8_smooth_v,
     int64_t fp8_q_quant_method, int64_t fp8_k_quant_method,
     int64_t fp8_v_quant_method, int64_t fp8_pv_acc_type, int64_t fp8_qk_mm_type,
-    bool fp8_hybrid = false, int64_t fp8_hybrid_n_early = 256) {
+    bool fp8_hybrid = false, int64_t fp8_hybrid_n_early = 256,
+    bool fp4_hybrid = false, int64_t fp4_hybrid_n_early = 256) {
   // Q,K,V,O with [B, H, N, D] layout, B=batch, H=head, N=seqlen, D=dim
   // TODO: support BNHD layout, Q,K,V,O with [B, N, H, D] layout.
   // Native block-tile config (MMA atoms, Br/Bc, stages, smem/pad flags) and
@@ -135,15 +136,22 @@ void launch_ffpa_attn_fwd_template(
   const bool force_cute = (impl_hint == ffpa::CudaBackendImpl::CUTE);
   const bool force_cute_tma = (impl_hint == ffpa::CudaBackendImpl::CUTE_TMA);
   const bool force_fp8 = (impl_hint == ffpa::CudaBackendImpl::CUTE_TMA_FP8);
+  const bool force_fp4 = (impl_hint == ffpa::CudaBackendImpl::CUTE_TMA_FP4);
 
   // fp16/bf16 head_dim pad: non-32-multiple D_og (e.g. 120) zero-pads Q/K/V
   // to the compiled kHeadDim. fp8 skips (quantize reads D_og natively); O is
   // padded by ffpa_api.cc. Only reachable via the CUTE_TMA/CUTE pad paths
   // (native/AUTO always have D_og == kHeadDim), so the TMA and cp.async
-  // dispatch below both see D_pad-wide Q/K/V.
+  // dispatch below both see D_pad-wide Q/K/V. fp4 also skips when D_og%8==0
+  // (the api gate): its quantize/delta_s kernels read the original width and
+  // zero-fill pad cols (no pad copy); FFPA_FP4_PAD_TORCH=1 forces the torch
+  // pad path for A/B comparison and as a fallback.
   const int D_og = Q.size(3);
   const bool d_padded = D_og != kHeadDim;
-  if (d_padded && !force_fp8) {
+  const bool fp4_fused =
+      force_fp4 && D_og % 8 == 0 && getenv("FFPA_FP4_PAD_TORCH") == nullptr;
+  const bool qkv_padded = d_padded && !force_fp8 && !fp4_fused;
+  if (qkv_padded) {
     const int64_t pad_cols = kHeadDim - D_og;
     Q = torch::constant_pad_nd(Q, {0, pad_cols}, 0.0);
     K = torch::constant_pad_nd(K, {0, pad_cols}, 0.0);
@@ -163,10 +171,64 @@ void launch_ffpa_attn_fwd_template(
   //   sm_90/100: WS (kNonWS=0). setmaxnreg effective, 228KB smem allows
   //     deep pipeline. Unverified on real hardware.
 #ifdef ENABLE_FFPA_TMA_EXT
-  if ((force_tma || force_cute_tma || force_fp8) && !force_native &&
-      !force_cute) {
+  if ((force_tma || force_cute_tma || force_fp8 || force_fp4) &&
+      !force_native && !force_cute) {
     auto prop = at::cuda::getCurrentDeviceProperties();
     if (prop->major >= 9) {
+      if (force_fp4) {
+        // NVFP4 persist-D: quantize pre-kernels + blockscaled mma. No knobs
+        // (kStages fixed by traits); attn_bias/dropout unsupported. Causal
+        // early rows fall back to the fp16 persist_d kernel (hybrid), same
+        // as fp8: P-quantization noise on short-row softmax rows.
+        TORCH_CHECK(attn_bias.numel() == 0 && dropout_p == 0.0,
+                    "fp4 sm120 path does not support attn_bias/dropout");
+        // fp4 persist-D supports 64-multiple headdims in [64,256] (traits
+        // static_assert). The if constexpr also keeps the hybrid stage-1
+        // fp16 persist-D out of the D>=320 TUs: its smem stages formula
+        // yields 0 there (zero-sized array) and fp16's own dispatch never
+        // instantiates it for those headdims.
+        if constexpr (kHeadDim % 64 == 0 && kHeadDim >= 64 && kHeadDim <= 256) {
+          if (fp4_hybrid && Nq >= fp4_hybrid_n_early) {
+            const int n_early = static_cast<int>(fp4_hybrid_n_early);
+            TORCH_CHECK(
+                n_early % 128 == 0,
+                "ffpa_attn: fp4_hybrid_n_early must be multiple of 128");
+            torch::Tensor Q_e, K_e, V_e;
+            // Stage-1 fp16 kernel needs D_pad-wide inputs: it must pad the
+            // early-row slices only on the fused path (Q/K/V still original
+            // width); the torch-padded path is already kHeadDim-wide.
+            const bool stage1_needs_pad = d_padded && !qkv_padded;
+            prepare_hybrid_stage1(Q_e, K_e, V_e, Q, K, V, n_early, Nkv, Nq,
+                                  causal,
+                                  stage1_needs_pad ? D_og : (int64_t)kHeadDim,
+                                  kHeadDim, stage1_needs_pad);
+            auto O_e = torch::empty_like(Q_e);
+            auto lse_e =
+                torch::empty({Nb, Nh, n_early}, torch::TensorOptions()
+                                                    .dtype(torch::kFloat32)
+                                                    .device(Q.device()));
+            auto empty_bias = torch::empty({0}, attn_bias.options());
+            launch_cute_fwd_persist_d_sm120<kDataType, kHeadDim, kStage>(
+                Q_e, K_e, V_e, O_e, empty_bias, lse_e, causal, softmax_scale,
+                0.0, 0, 0);
+            O.slice(2, 0, n_early).copy_(O_e);
+            if (softmax_lse.numel() > 0)
+              softmax_lse.slice(2, 0, n_early).copy_(lse_e);
+            // Stage 2: fp4 late rows [n_early:N) via q_start_row offset.
+            launch_cute_fwd_persist_d_fp4_sm120<kDataType, kHeadDim, kStage>(
+                Q, K, V, O, softmax_lse, causal, softmax_scale,
+                /*q_start_row=*/n_early);
+          } else {
+            launch_cute_fwd_persist_d_fp4_sm120<kDataType, kHeadDim, kStage>(
+                Q, K, V, O, softmax_lse, causal, softmax_scale);
+          }
+        } else {
+          TORCH_CHECK(false,
+                      "ffpa_attn: fp4 requires 64-multiple head_dim in "
+                      "[64,256]");
+        }
+        return;
+      }
       if (force_fp8) {
         // q/k quant: per_block (0) for all headdims; per_thread (2) for
         // all headdims (persist_d + split_d + m4n2 paths).
