@@ -23,11 +23,6 @@
 
 - [2026/08] FFPA now supports D=512 for NVIDIA B200 via [**CuTe-DSL**](#benchmark) `tcgen05` 2-CTA, [**1517**](#benchmark) TFLOPS forward and [**763**](#benchmark) TFLOPS backward, achieving **6x~15x**🎉 speedup over standard PyTorch SDPA. 🎉🎉
 - [2026/08] FFPA now supports [FP8 Attention](./csrc/cuffpa/cute/fp8/) for headdim **[64,1024]** ([sm_120](./csrc/cuffpa/cute/fp8/sm_120/), forward only), achieving **3x~6x**🎉 speedup over standard PyTorch SDPA for large headdim (**D>256**), with per-block(QKV)/per-thread(QK)/per-channel(V) FP8 quantization and hybrid FP8/FP16 attention. 🎉🎉
-
-<div align='center'>
-  <img src="./docs/assets/ffpa-fp8.png" width="600px">
-</div>
-
 - [2026/06] DefTruth, Butterfingrz, 2026. [FFPA: Fast and Memory-Efficient Exact Attention for Large Headdim](https://doi.org/10.5281/zenodo.20638547).
 
 ## Quick Start
@@ -90,7 +85,12 @@ Runnable benchmark are provided under [`bench`](./bench). The performance benchm
   <img src='./docs/assets/perf/ffpa_speedup_cutedsl_nvidia-h20z_B1_H32_N8192_D512_T.png' width='400px'>
   <img src='./docs/assets/perf/ffpa_speedup_cutedsl_nvidia-h20z_B1_H32_N16384_D512_T.png' width='400px'><br>
   <img src='./docs/assets/perf/ffpa_speedup_cutedsl_nvidia-b200_B1_H32_N8192_D512_T.png' width='400px'>
-  <img src='./docs/assets/perf/ffpa_speedup_cutedsl_nvidia-b200_B1_H32_N16384_D512_T.png' width='400px'>
+  <img src='./docs/assets/perf/ffpa_speedup_cutedsl_nvidia-b200_B1_H32_N16384_D512_T.png' width='400px'><br>
+  <p><i>BF16 Attention for Large Headdim: FFPA vs SDPA across NVIDIA TRX 5090, H200 and B200. </i></p>
+</div>
+<div align='center'>
+  <img src="./docs/assets/ffpa-fp8.png" width="800px"><br>
+  <p><i>FP8 Attention for Large/Small Headdim: FFPA vs SDPA on NVIDIA TRX 5090. </i></p>
 </div>
 
 ## Backends
