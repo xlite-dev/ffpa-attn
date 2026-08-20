@@ -1671,8 +1671,8 @@ void launch_cute_fwd_persist_d_fp4_sm120_impl(torch::Tensor Q, torch::Tensor K,
       /*sub_km=*/true);
   ffpa_fp4::launch_fp4_quant_vt_sm120<kHeadDim>(V_t, vt4, sfvt, Nkv_pad);
 
-  // delta_s per 128-row Q block via the identity qm@(K-km)^T - qm.km^T ==
-  // qm@K^T - 2*qm.km^T, fused in one wmma kernel (fp32 out, tail columns
+  // delta_s per 128-row Q block via the identity qm@(K-km)^T ==
+  // qm@K^T - qm.km^T, fused in one wmma kernel (fp32 out, tail columns
   // zero-filled). GQA broadcasts the shared K heads.
   {
     auto qm_h = qm.to(Q.dtype());

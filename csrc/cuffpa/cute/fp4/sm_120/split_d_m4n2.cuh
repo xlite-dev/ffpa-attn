@@ -2,8 +2,9 @@
 // (64-multiples): the regime where even the chunked split-D O accumulator
 // (D/2 f32 regs/thread) passes the 255-register wall, so the atom layout
 // switches to (4,2,1) - 4 M-warps x 2 N-warps - halving the per-thread O
-// extent to D/4. Everything else is the split_d.cuh pipeline with the two
-// changes the N-warp split forces:
+// extent to D/4. Everything else is the split_d.cuh pipeline adapted to
+// the N-warp split (64x64 tiles, element-wise P-roundtrip STS, rc-view
+// delta_s preload):
 //   * P crosses N-warps (each holds half the kBc columns): softmax runs in
 //     the P domain writing f32 scores to a [kBr, kBc] smem
 //     staging tile; after the roundtrip barrier each N-warp reads its PV
@@ -15,7 +16,8 @@
 //     half published by the P roundtrip's __syncthreads and folded by
 //     ffpa_cute::finalize_row_sum_m4n2).
 // Kept from persist-D/split-D verbatim: persistent work loop with global
-// chunk counters (barriers never re-init), Q/SFQ resident per work,
+// chunk counters (barriers never re-init), SFQ resident per work (Q smem
+// resident, data half copied per chunk),
 // delta_s rank-1 preload, lazy rescale (row_scale warp vote), masking
 // through kv_perm32, the P-domain lse formula with the qkm dot read from
 // the resident Q smem before O staging overwrites it, batched R->S(STSM)
@@ -562,9 +564,8 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
             scores_p2, tScS_rc, softmax_scale_log2, row_max, row_sum, row_scale,
             smem_exchange, warp_id, lane_id);
       }
-
-      // Lazy rescale: row_scale == 1.0f when the row max did not move
-      // beyond the threshold; warp-vote the skip.
+      // Lazy rescale: row_scale == 1.0f when the running row max did not
+      // grow on this tile; warp-vote the skip.
       const bool need_rescale =
           kv_tile > 0 &&
           __any_sync(0xffffffff, row_scale[0] != 1.0f || row_scale[1] != 1.0f);
@@ -671,7 +672,8 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
       }
     }
 
-    // O = o_acc / row_sum (P domain cancels): chunk 0 folds row_sum.
+    // O = o_acc / row_sum (the P-domain 2688 cancels); every D chunk
+    // scales by the same 1/row_sum.
     {
       auto tCrO0 =
           make_tensor(make_rmem_ptr(&o_acc_storage[0][0]), OFragLayout{});

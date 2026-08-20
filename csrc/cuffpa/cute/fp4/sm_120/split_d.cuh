@@ -7,9 +7,11 @@
 // 64-element D chunks while everything persist-d validated is kept -
 //   * persistent work loop (grid-strided works, barriers never re-init,
 //     dense grid = min(total_work, SMs), causal = one CTA per work);
-//   * Q/SFQ loaded once per work into register fragments (the A operand is
-//     a per-work constant; only B streams, exactly like gemm_ss_fp4's
-//     contract), O staging then aliases q_base behind epilogue_done;
+//   * SFQ loaded once per work into a register fragment (extent-aware SFA
+//     partitioning covers all D chunks); Q is smem-resident with its
+//     64-wide data slice copied to registers per D chunk - only the B
+//     operands stream from gmem. O staging aliases q_base behind
+//     epilogue_done;
 //   * delta_s rank-1 preload into the QK accumulator (DS rides the kv
 //     tile's first K chunk barrier);
 //   * lazy rescale (warp-vote scores_scale!=1 skip) and register P
@@ -212,7 +214,8 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
   // call from the base tensors - cheap layout arithmetic, and it keeps the
   // work-loop state down to the two global chunk counters. Q+SFQ share the
   // q_full tx barrier; DS rides the K chunk-0 barrier (its expect_tx adds
-  // kTxBytesDS on top of kTxBytesK, so chunk 0 goes through issue_ds).
+  // kTxBytesDS on top of kTxBytesK and its TMA copy is issued together
+  // with the chunk-0 K load).
   auto issue_q = [&](int q_bh, int Q_tile_id, int Nh_id, int b,
                      int q_tile_abs) {
     const int q_row_offset = q_bh * Nq_pad + q_start_row;
@@ -381,7 +384,8 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
   const float scale_orig = scale;
   const float softmax_scale_log2 = scale * FFPA_M_LOG2E;
 
-  // delta_s rank-1 preload (persist_d verbatim, SA3 float4 slot math).
+  // delta_s rank-1 preload (SA3 float4 slot math); the assign doubles as
+  // the per-tile acc clear.
   auto add_delta_s = [&](auto& acc, int stage) {
     auto tSsDS_stage = recast<float4>(sDS(_, _, stage));
     auto acc_float4 = recast<float4>(acc);

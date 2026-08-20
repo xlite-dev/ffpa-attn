@@ -4,11 +4,11 @@
 // hand-rolled TMA barriers, consumer-side epilogue).
 //
 // Math chain (per (b,h), Q block of 128 rows):
-//   qm  = mean(q, 128-row group)          Qhat = q - qm   (quantized, sub_qm)
-//   km  = mean(k)                         Khat = k - km   (quantized, sub_km,
-//   rows permuted) S   = Qhat @ Khat^T + delta_s,  delta_s[b,h,mb,n] = qm @ (k
-//   - km)^T
-//       = (q - qm)(k - km)^T + qm(k - km)^T = q(k - km)^T
+//   qm  = mean(q, 128-row group)   Qhat = q - qm   (quantized, sub_qm)
+//   km  = mean(k)                  Khat = k - km   (quantized, sub_km,
+//                                    rows permuted)
+//   S   = Qhat @ Khat^T + delta_s,  delta_s[b,h,mb,n] = qm @ (k - km)^T:
+//       S = (q - qm)(k - km)^T + qm(k - km)^T = q(k - km)^T
 //   P   = softmax(S * scale)              O = P @ v
 // Smoothing K leaves O unchanged (softmax shift invariance); the lse must add
 // back scale * dot(q_row, km) = scale * (dot(Qhat_row, km) + dot(qm, km)).
@@ -29,8 +29,8 @@
 //
 // P quantization is two-level (fp4_pscale.cuh): the 1/(448*6) global constant
 // is folded into the exp2 shift, the per-16-column group scale SFP (ue4m3)
-// is consumed by the blockscaled PV mma. Fully-masked groups quantize to
-// P=NaN (0/0) with SFP=0, and the mma's scale multiply flushes them to zero.
+// is consumed by the blockscaled PV mma. Fully-masked groups degenerate to
+// P=0 with SFP=0 (the absmax clamp avoids a 0/0 NaN), contributing nothing.
 //
 // O epilogue: SM90_U32x2_STSM_N into SW128 smem staged over the freed Q/K
 // smem, then one TMA store (SA3 layout, not fp8's U32x4 - the blockscaled

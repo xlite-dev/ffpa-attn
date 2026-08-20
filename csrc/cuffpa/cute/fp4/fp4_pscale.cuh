@@ -1,9 +1,9 @@
 // NVFP4 P two-level quantization fused with online softmax, ported from
 // SageAttention3 softmax_fused.h/utils.h. Under online softmax rowmax(P)=1,
 // so the first-level per-row scale degenerates to the global constant
-// 1/(448*6) and is folded into the exp2 shift; sP2 (ue4m1-group absmax/6
-// stored as ue4m3) is what the MMA consumes, and the constant cancels
-// exactly between O and row_sum.
+// 1/(448*6) and is folded into the exp2 shift; sP2 (per-16-column-group
+// absmax/6, stored as ue4m3) is what the MMA consumes, and the constant
+// cancels exactly between O and row_sum.
 // Reference:
 // https://github.com/thu-ml/SageAttention/tree/main/sageattention3_blackwell/sageattn3/blackwell/softmax_fused.h
 //            https://github.com/thu-ml/SageAttention/tree/main/sageattention3_blackwell/sageattn3/blackwell/utils.h
@@ -403,7 +403,10 @@ CUTE_DEVICE void quantize_and_pack_p(MmaK mma_k, AbsMaxTensor& AbsMaxP,
 
 // lse smooth-K correction: qkm[row] = dot(Qhat_row_dequant, km) +
 // dot(qm_block, km). Qhat is read back from smem (e2m1 x SF), quad-strided
-// like fp8's smooth_k_qk_dot; the qm term is CTA-constant per Q tile.
+// like fp8's smooth_k_qk_dot: the 4 lanes sharing a row each own one
+// quarter of D. Both partial sums must be FULLY quad-reduced before being
+// combined - otherwise the 4 lanes of a row disagree and their lse gmem
+// stores race (and a lane-local quarter of the qm term leaks in).
 template <int kHeadDim, int kRows, typename SmemQTensor, typename SfQTensor,
           typename CoordTensor>
 CUTE_DEVICE void lse_qkm_dot(const SmemQTensor& sQ, const SfQTensor& sSFQ,
@@ -439,7 +442,6 @@ CUTE_DEVICE void lse_qkm_dot(const SmemQTensor& sQ, const SfQTensor& sSFQ,
   for (int row = 0; row < kRows; ++row) {
     qkm[row] += __shfl_xor_sync(0xffffffff, qkm[row], 1);
     qkm[row] += __shfl_xor_sync(0xffffffff, qkm[row], 2);
-    qkm[row] += c;
   }
   c += __shfl_xor_sync(0xffffffff, c, 1);
   c += __shfl_xor_sync(0xffffffff, c, 2);
