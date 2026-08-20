@@ -25,7 +25,7 @@
 - [2026-08] 🦅 FFPA now supports D=512 for NVIDIA B200 via [**CuTe-DSL**](#benchmark) **tcgen05** 2-CTA, [**1517**](#benchmark) TFLOPS forward and [**763**](#benchmark) TFLOPS backward, achieving **6x~15x**🎉 speedup over standard PyTorch SDPA. 🎉🎉
 - [2026-07] 🎯 FFPA now supports [**FP8 Attention**](./csrc/cuffpa/cute/fp8/) for headdims **[64,1024]** ([sm_120](./csrc/cuffpa/cute/fp8/sm_120/), forward only) and achieving **3x~6x**🎉 speedup over PyTorch SDPA for large headdim (**D>256**). 🎉🎉
 - [2026-06] 🐍 FFPA now supports [**TritonBackend**](./src/ffpa_attn/triton/) and [**CuTeDSLBacked**](./src/ffpa_attn/cute/) for both forward and backward pass, achieving **1.5x~5x**🎉 speedup over standard PyTorch SDPA across many devices. 🎉🎉
-- [2026-05] 🚪 FFPA now supports GQA, cross-attn, causal, attn-mask and dropout with [**CUDABackend**](./csrc/cuffpa/native/) for large headdims (**D>256**, forward only), achieving **1.3x~2x**🎉 speedup over standard PyTorch SDPA across many devices (NVIDIA 3080, 4080, L20, 5090, etc). 🎉🎉
+- [2026-05] 🚪 FFPA now supports GQA, MQA, cross-attn, causal, attn-mask and dropout with [**CUDABackend**](./csrc/cuffpa/native/) for large headdims (**D>256**, forward only), achieving **1.3x~2x**🎉 speedup over PyTorch SDPA. 🎉🎉
 
 ## Quick Start
 
