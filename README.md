@@ -21,8 +21,9 @@
 
 ## Latest News
 
-- [2026/08] FFPA now supports D=512 for NVIDIA B200 via [**CuTe-DSL**](#benchmark) **tcgen05** 2-CTA, [**1517**](#benchmark) TFLOPS forward and [**763**](#benchmark) TFLOPS backward, achieving **6x~15x**🎉 speedup over standard PyTorch SDPA. 🎉🎉
-- [2026/08] FFPA now supports [**FP8 Attention**](./csrc/cuffpa/cute/fp8/) for headdim **[64,1024]** ([sm_120](./csrc/cuffpa/cute/fp8/sm_120/), forward only), achieving **3x~6x**🎉 speedup over standard PyTorch SDPA for large headdim (**D>256**), with per-block(QKV)/per-thread(QK)/per-channel(V) FP8 quantization and hybrid FP8/FP16 attention. 🎉🎉
+- [2026/08/20] FFPA now experimental supports [**FP4 Attention**](./csrc/cuffpa/cute/fp4/) for headdim **[64,1024]** ([sm_120](./csrc/cuffpa/cute/fp4/sm_120/), forward only). The performance of large headdim is stay tuned for future updates. 🎉🎉
+- [2026/08/14] FFPA now supports D=512 for NVIDIA B200 via [**CuTe-DSL**](#benchmark) **tcgen05** 2-CTA, [**1517**](#benchmark) TFLOPS forward and [**763**](#benchmark) TFLOPS backward, achieving **6x~15x**🎉 speedup over standard PyTorch SDPA. 🎉🎉
+- [2026/07/31] FFPA now supports [**FP8 Attention**](./csrc/cuffpa/cute/fp8/) for headdim **[64,1024]** ([sm_120](./csrc/cuffpa/cute/fp8/sm_120/), forward only), achieving **3x~6x**🎉 speedup over standard PyTorch SDPA for large headdim (**D>256**), with per-block(QKV)/per-thread(QK)/per-channel(V) FP8 quantization and hybrid FP8/FP16 attention. 🎉🎉
 
 ## Quick Start
 
@@ -38,7 +39,7 @@ git clone https://github.com/xlite-dev/ffpa-attn.git
 # Then, build the wheel package (Triton + CuTe-DSL backends)
 cd ffpa-attn && pip3 install -e . --no-build-isolation
 # Optional: install ffpa-attn w/ CUDA backend (forward only)
-# ext all: build all kernels, include fp8 quantzation kernels
+# ext all: build all kernels, include fp8/fp4 attention kernels
 bash ./build.sh --arch sm_120f --ext all --headdim all
 ```
 
@@ -48,8 +49,62 @@ Then, try to accelerate the attention for large headdim with just <i><b>one-line
 >>> import torch.nn.functional as F
 >>> from ffpa_attn import ffpa_attn_func
 >>> # Monkey-patch SDPA to point to FFPA. Every thing that FFPA
->>> # does not support will auto fallback to SDPA: D <= 256, etc.
->>> F.scaled_dot_product_attention = ffpa_attn_func # one-line code
+>>> # does not support will auto fallback to SDPA: N < 512, etc.
+>>> F.scaled_dot_product_attention = ffpa_attn_func
+```
+
+<a id="example-self"></a>
+
+Or, try the minimal **BF16** usage example — **Self-Attention** (B=1, H=32, N=8192, D=512):
+
+```python
+import torch
+import torch.nn.functional as F
+from ffpa_attn import ffpa_attn_func
+
+# D: 64, 128, ..., 320, ..., 1024 (FA-2 <= 256, FFPA supports up to 1024).
+B, H, N, D = 1, 32, 8192, 512 # batch_size, num_heads, seq_len, head_dim
+q = torch.randn(B, H, N, D, dtype=torch.bfloat16, device="cuda")
+k = torch.randn(B, H, N, D, dtype=torch.bfloat16, device="cuda")
+v = torch.randn(B, H, N, D, dtype=torch.bfloat16, device="cuda")
+
+# FFPA self attention; layout follows SDPA: (B, H, N, D).
+out = ffpa_attn_func(q, k, v)  # -> torch.Tensor of shape (B, H, N, D)
+ref = F.scaled_dot_product_attention(q, k, v)
+
+print(f"FFPA vs SDPA max_abs_err={(out - ref).abs().max().item():.4e}")
+```
+
+Or, try the minimal **FP8/FP4** usage example with **CUDABackend** (sm_120, forward only):
+
+```python
+import torch
+import torch.nn.functional as F
+from ffpa_attn import CUDABackend, ffpa_attn_func
+from functools import partial
+
+# D: 64, 128, ..., 320, ..., 1024 (FA-2 <= 256, FFPA supports up to 1024).
+B, H, N, D = 1, 32, 8192, 128 # batch_size, num_heads, seq_len, head_dim
+q = torch.randn(B, H, N, D, dtype=torch.bfloat16, device="cuda")
+k = torch.randn(B, H, N, D, dtype=torch.bfloat16, device="cuda")
+v = torch.randn(B, H, N, D, dtype=torch.bfloat16, device="cuda")
+
+# Currenly, fp8/fp4 attention are only supported on sm_120, forward only.
+fp8_backend = CUDABackend(backward=False, forward=True, enable_fp8=True)
+fp4_backend = CUDABackend(backward=False, forward=True, enable_fp4=True)
+ffpa_attn_func_fp8 = partial(ffpa_attn_func, forward_backend=fp8_backend)
+ffpa_attn_func_fp4 = partial(ffpa_attn_func, forward_backend=fp4_backend)
+
+# FFPA self attention; layout follows SDPA: (B, H, N, D).
+out_fp8 = ffpa_attn_func_fp8(q, k, v)  # -> torch.Tensor of shape (B, H, N, D)
+out_fp4 = ffpa_attn_func_fp4(q, k, v)  # -> torch.Tensor of shape (B, H, N, D)
+ref = F.scaled_dot_product_attention(q, k, v)
+
+print(f"FFPA FP8 vs SDPA max_abs_err={(out_fp8 - ref).abs().max().item():.4e}")
+print(f"FFPA FP4 vs SDPA max_abs_err={(out_fp4 - ref).abs().max().item():.4e}")
+```
+```bash
+FFPA FP8 vs SDPA max_abs_err=1.6602e-02; FFPA FP4 vs SDPA max_abs_err=4.3213e-02
 ```
 
 For more advanced features, please refer to our online docs at 📘[ffpa-attn.io](https://ffpa-attn.readthedocs.io/en/latest/).
