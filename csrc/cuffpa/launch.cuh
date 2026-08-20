@@ -182,11 +182,12 @@ void launch_ffpa_attn_fwd_template(
         // as fp8: P-quantization noise on short-row softmax rows.
         TORCH_CHECK(attn_bias.numel() == 0 && dropout_p == 0.0,
                     "fp4 sm120 path does not support attn_bias/dropout");
-        // fp4 persist-D supports 64-multiple headdims in [64,256] (traits
-        // static_assert). The if constexpr also keeps the hybrid stage-1
-        // fp16 persist-D out of the D>=320 TUs: its smem stages formula
-        // yields 0 there (zero-sized array) and fp16's own dispatch never
-        // instantiates it for those headdims.
+        // fp4 persist-D covers 64-multiple headdims in [64,256], split-D
+        // fp4 covers (256,768); D>=768 lands in the m4n2 branch. The first
+        // if constexpr also keeps the hybrid stage-1 fp16 persist-D out of
+        // the D>=320 TUs: its smem stages formula yields 0 there (zero-
+        // sized array) and fp16's own dispatch never instantiates it for
+        // those headdims.
         if constexpr (kHeadDim % 64 == 0 && kHeadDim >= 64 && kHeadDim <= 256) {
           if (fp4_hybrid && Nq >= fp4_hybrid_n_early) {
             const int n_early = static_cast<int>(fp4_hybrid_n_early);
@@ -222,10 +223,80 @@ void launch_ffpa_attn_fwd_template(
             launch_cute_fwd_persist_d_fp4_sm120<kDataType, kHeadDim, kStage>(
                 Q, K, V, O, softmax_lse, causal, softmax_scale);
           }
+        } else if constexpr (kHeadDim % 64 == 0 && kHeadDim > 256 &&
+                             kHeadDim < 768) {
+          // Split-D fp4. Hybrid stage-1 runs the fp16 split_d kernel (the
+          // fp16 persist-D cannot be instantiated at D>=320: zero-sized
+          // stage array, see the comment above).
+          if (fp4_hybrid && Nq >= fp4_hybrid_n_early) {
+            const int n_early = static_cast<int>(fp4_hybrid_n_early);
+            TORCH_CHECK(
+                n_early % 128 == 0,
+                "ffpa_attn: fp4_hybrid_n_early must be multiple of 128");
+            torch::Tensor Q_e, K_e, V_e;
+            const bool stage1_needs_pad = d_padded && !qkv_padded;
+            prepare_hybrid_stage1(Q_e, K_e, V_e, Q, K, V, n_early, Nkv, Nq,
+                                  causal,
+                                  stage1_needs_pad ? D_og : (int64_t)kHeadDim,
+                                  kHeadDim, stage1_needs_pad);
+            auto O_e = torch::empty_like(Q_e);
+            auto lse_e =
+                torch::empty({Nb, Nh, n_early}, torch::TensorOptions()
+                                                    .dtype(torch::kFloat32)
+                                                    .device(Q.device()));
+            auto empty_bias = torch::empty({0}, attn_bias.options());
+            launch_cute_fwd_split_d_sm120<kDataType, kHeadDim, kStage, 32, 64>(
+                Q_e, K_e, V_e, O_e, empty_bias, lse_e, causal, softmax_scale,
+                0.0, 0, 0);
+            O.slice(2, 0, n_early).copy_(O_e);
+            if (softmax_lse.numel() > 0)
+              softmax_lse.slice(2, 0, n_early).copy_(lse_e);
+            // Stage 2: fp4 late rows [n_early:N) via q_start_row offset.
+            launch_cute_fwd_split_d_fp4_sm120<kDataType, kHeadDim, kStage>(
+                Q, K, V, O, softmax_lse, causal, softmax_scale,
+                /*q_start_row=*/n_early);
+          } else {
+            launch_cute_fwd_split_d_fp4_sm120<kDataType, kHeadDim, kStage>(
+                Q, K, V, O, softmax_lse, causal, softmax_scale);
+          }
+        } else if constexpr (kHeadDim % 64 == 0 && kHeadDim >= 768 &&
+                             kHeadDim <= 1024) {
+          // Split-D m4n2 fp4. Hybrid stage-1 runs the fp16 m4n2 kernel
+          // (same tile geometry); stage-2 takes the q_start_row offset.
+          if (fp4_hybrid && Nq >= fp4_hybrid_n_early) {
+            const int n_early = static_cast<int>(fp4_hybrid_n_early);
+            TORCH_CHECK(
+                n_early % 128 == 0,
+                "ffpa_attn: fp4_hybrid_n_early must be multiple of 128");
+            torch::Tensor Q_e, K_e, V_e;
+            const bool stage1_needs_pad = d_padded && !qkv_padded;
+            prepare_hybrid_stage1(Q_e, K_e, V_e, Q, K, V, n_early, Nkv, Nq,
+                                  causal,
+                                  stage1_needs_pad ? D_og : (int64_t)kHeadDim,
+                                  kHeadDim, stage1_needs_pad);
+            auto O_e = torch::empty_like(Q_e);
+            auto lse_e =
+                torch::empty({Nb, Nh, n_early}, torch::TensorOptions()
+                                                    .dtype(torch::kFloat32)
+                                                    .device(Q.device()));
+            auto empty_bias = torch::empty({0}, attn_bias.options());
+            launch_cute_fwd_split_d_m4n2_sm120<kDataType, kHeadDim, kStage>(
+                Q_e, K_e, V_e, O_e, empty_bias, lse_e, causal, softmax_scale,
+                0.0, 0, 0);
+            O.slice(2, 0, n_early).copy_(O_e);
+            if (softmax_lse.numel() > 0)
+              softmax_lse.slice(2, 0, n_early).copy_(lse_e);
+            launch_cute_fwd_split_d_m4n2_fp4_sm120<kDataType, kHeadDim, kStage>(
+                Q, K, V, O, softmax_lse, causal, softmax_scale,
+                /*q_start_row=*/n_early);
+          } else {
+            launch_cute_fwd_split_d_m4n2_fp4_sm120<kDataType, kHeadDim, kStage>(
+                Q, K, V, O, softmax_lse, causal, softmax_scale);
+          }
         } else {
           TORCH_CHECK(false,
                       "ffpa_attn: fp4 requires 64-multiple head_dim in "
-                      "[64,256]");
+                      "[64,1024]");
         }
         return;
       }

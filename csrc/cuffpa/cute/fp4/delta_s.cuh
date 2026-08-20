@@ -1,7 +1,11 @@
 // Fused delta_s preprocess for the NVFP4 persist_d path:
-//   delta_s[b,h,m,n] = qm[b,h,m,:] @ K[b,hkv,n,:] - 2 * qkm[b,h,m]
-// (identity of qm@(K-km)^T - qm.km^T). One wmma tile kernel replaces the
-// host-side bmm + transpose copy + epilogue cast (~1 ms at N=16384).
+//   delta_s[b,h,m,n] = qm[b,h,m,:] @ (K[b,hkv,n,:] - km)
+//                    = qm @ K^T - qkm   with qkm[b,h,m] = qm . km
+// (the kernel's S = Qhat@Khat^T + delta_s then equals q(k-km)^T, so the
+// lse correction needs exactly scale * dot(q_row, km); any extra row
+// constant here would shift the lse without changing O). One wmma tile
+// kernel replaces the host-side bmm + transpose copy + epilogue cast
+// (~1 ms at N=16384).
 // Tail columns n >= Nkv are zero-filled (masked -inf in the attn kernel).
 // Plain wmma on fp16 operands: the kernel is memory-bound (SM ~10%), so
 // the block-scaled NVFP4 CuTe atoms of the attention kernel buy nothing
@@ -127,8 +131,8 @@ __global__ void delta_s_wmma_kernel(
 #pragma unroll
   for (int i = 0; i < 16; ++i) {
     const float* s = src + i * 4;
-    float4 v = {s[0] - 2.f * qk, s[1] - 2.f * qk, s[2] - 2.f * qk,
-                s[3] - 2.f * qk};
+    // qm @ (k - km)^T = (qm @ k^T) - qm.km: subtract ONE qkm.
+    float4 v = {s[0] - qk, s[1] - qk, s[2] - qk, s[3] - qk};
     if (i * 4 + 3 < n_valid) {
       reinterpret_cast<float4*>(out)[i] = v;
     } else {  // tail tile: column-wise valid/zero mix

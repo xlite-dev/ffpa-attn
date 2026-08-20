@@ -73,6 +73,32 @@ CUTE_DEVICE void gemm_ss_fp4(TensorC& acc, TensorQA& tSrQ, TensorQSF& tSrSFQ,
   }
 }
 
+// Split-D QK step: one 64-wide D chunk per call, accumulating into the
+// shared [kBr, kBc] S tile (delta_s preloads the accumulator first). The
+// chunk TiledMmaQK (Tile-K=64) yields rank-2 per-chunk fragments, so there
+// is no k_block loop: A (Q chunk) is copied from the work-resident Q smem
+// by the caller - no stage barrier on the A side - and B (K/SFK chunk)
+// streams from the chunk stage exactly like gemm_ss_fp4. The trailing
+// k_empty arrive releases the stage when the single mma has consumed it.
+template <typename TensorC, typename TensorQA, typename TensorQSF,
+          typename TensorKB, typename TensorKSF, typename TensorSK,
+          typename TensorSKSF, typename TiledMma, typename TiledCopyK,
+          typename ThreadCopyK, typename TiledCopyKSF, typename ThreadCopyKSF>
+CUTE_DEVICE void gemm_ss_chunk_fp4(
+    TensorC& acc, TensorQA& tSrQ, TensorQSF& tSrSFQ, TensorKB& tSrK,
+    TensorKSF& tSrSFK, TensorSK const& tSsK, TensorSKSF const& tSsSFK,
+    TiledMma tiled_mma_qk, TiledCopyK tiled_copy_k, ThreadCopyK thread_copy_k,
+    TiledCopyKSF tiled_copy_ksf, ThreadCopyKSF thread_copy_ksf,
+    uint64_t* k_empty, int stage) {
+  auto copy_view_k = thread_copy_k.retile_D(tSrK);
+  auto copy_view_ksf = thread_copy_ksf.retile_D(tSrSFK);
+  copy(tiled_copy_k, tSsK, copy_view_k(_, _, _0{}));
+  copy(tiled_copy_ksf, tSsSFK, copy_view_ksf(_, _, _0{}));
+  cute::gemm(tiled_mma_qk, make_zip_tensor(tSrQ(_, _, _0{}), tSrSFQ),
+             make_zip_tensor(tSrK(_, _, _0{}), tSrSFK(_, _, _0{})), acc);
+  cutlass::arch::ClusterBarrier::arrive(k_empty + stage);
+}
+
 // PV step of the blockscaled pipeline: O += (P . SFP) @ (V^T . SFVt) over
 // one kv_tile's smem stage. Named gemm_rs_fp4 after the fp8/fp16
 // convention (PV step = gemm_rs family; the _fp4 suffix keeps it apart
@@ -120,5 +146,13 @@ CUTE_DEVICE void gemm_rs_fp4(
     }
   }
 }
+
+// PV step with a PRE-QUANTIZED register A (m4n2): P crosses N-warps
+// through the f32 smem roundtrip, so quantize+pack (quantize_pack_a_fp4)
+// happens before the PV call on the readback fragment. Inlined into
+// split_d_m4n2.cuh: B (V^T/SFVt chunk) loads element-wise from the mma's
+// own smem partition views (the tiled-copy path under-fills the fragments
+// under the m4n2 thr layout), single mma (Tile-K = kBc),
+// trailing v_empty arrive.
 
 }  // namespace ffpa_fp4

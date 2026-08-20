@@ -333,6 +333,8 @@ def _parse_args() -> argparse.Namespace:
     "--cuda-impl",
     choices=[
       "auto",
+      "fp16",  # alias for auto
+      "bf16",  # alias for auto
       "native",
       "tma",
       "cute",
@@ -544,7 +546,7 @@ def _resolve_directional_cli_flags(
   # CUDA forward impl: --cuda-impl is the canonical knob; --fwd-tma/--cute are
   # compat aliases under auto. Non-cuda backends bool-ify tma for triton.
   if args.forward_backend == "cuda":
-    if args.cuda_impl != "auto":
+    if args.cuda_impl not in {"auto", "fp16", "bf16"}:
       if args.enable_fwd_tma or args.enable_fwd_cute:
         raise SystemExit(
           "--cuda-impl is mutually exclusive with --enable-fwd-tma/--cute "

@@ -76,8 +76,9 @@ struct Fp4PackedVec {
 // + SF (B,H,N,D/16) in the MMA atom layout. kPermute selects the K row
 // permutation; kSubQm / kSubKm select bias subtraction before quantization.
 // Mapping: 4 threads per token, each owning a 64-element slice (one SF
-// 4-col block) split into kHeadDim/64 16-element PackedVecs, so any
-// 64-multiple D maps onto 512 threads = 128 tokens per block.
+// 4-col block) split into kHeadDim/64 16-element PackedVecs; tokens per
+// block shrink for large D (see the launchers) so regs*threads stays within
+// the SM register file.
 // d_og < kHeadDim (padded head_dim): input rows are only d_og wide
 // (d_og%8==0); guarded loads keep pad cols zero so data and SF pad cols
 // are 0.
@@ -91,8 +92,11 @@ __global__ void fp4_quant_kernel(
     const float* __restrict__ qm, int qm_stride_b, int qm_stride_h,
     const float* __restrict__ km, int km_stride_b, int km_stride_h, int d_og) {
   using PackedVec = Fp4PackedVec<T>;
-  constexpr int kBlock = 128;
   constexpr int kThreadsPerToken = 4;
+  // tokens/block is a launch-config choice (launcher shrinks it for large D
+  // to keep regs*threads within the SM register file); derive it from
+  // blockDim so the kernel stays agnostic.
+  const int kBlock = blockDim.x / kThreadsPerToken;
   constexpr int kVecsPerThread = kHeadDim / 64;
   static_assert(kHeadDim % 64 == 0, "fp4 quantize requires 64-multiple D");
 
@@ -247,7 +251,9 @@ __global__ void fp4_quant_kernel(
 // Mapping mirrors the Q/K kernel (4 threads per token, 64-element slices);
 // after the smem transpose each thread owns one (d, 16-token) SF group and
 // iterates d in kHeadDim/64 passes over 64 d-rows each. Tokens per block
-// shrink to 64 for D>=192 so the static smem staging stays under 48KB.
+// shrink to 64 for D>128 and to 32 for D>768 (96KB+ windows would not fit
+// the 101KB opt-in); the staging window goes dynamic (opt-in) once past
+// the 48KB static limit (D>=512 at 64 tokens).
 // d_og < kHeadDim (d_og%8==0): guarded loads keep pad d-rows zero in data
 // and SF.
 template <typename T, int kHeadDim>
@@ -258,13 +264,16 @@ __global__ void fp4_quant_trans_kernel(
     int stride_h_output, int stride_d_output, int stride_bz_output_sf,
     int stride_h_output_sf, int stride_d_output_sf, int d_og) {
   using PackedVec = Fp4PackedVec<T>;
-  constexpr int kTokensPerBlock = (kHeadDim <= 128) ? 128 : 64;
+  constexpr int kTokensPerBlock =
+      (kHeadDim <= 128) ? 128 : ((kHeadDim <= 768) ? 64 : 32);
   constexpr int kThreadsPerToken = 4;
   constexpr int kVecsPerThread = kHeadDim / 64;
   constexpr int kSFGroupsPerToken = kHeadDim / 16;
   constexpr int kThreadsPerSeq = kTokensPerBlock / kCVTFp4EltsPerThread;
   constexpr int kDRowsPerPass =
       kTokensPerBlock * kThreadsPerToken / kThreadsPerSeq;
+  constexpr bool kDynamicSmem =
+      kTokensPerBlock * kHeadDim * int(sizeof(T)) > 48 * 1024;
   static_assert(kHeadDim % 64 == 0 && kHeadDim % kDRowsPerPass == 0,
                 "fp4 quantize requires 64-multiple D");
 
@@ -308,7 +317,10 @@ __global__ void fp4_quant_trans_kernel(
     }
   }
 
-  __shared__ T shared_input[kTokensPerBlock * kHeadDim];
+  extern __shared__ __align__(16) char quant_dyn_shm[];
+  __shared__ T quant_static_shm[kDynamicSmem ? 1 : kTokensPerBlock * kHeadDim];
+  T* shared_input =
+      kDynamicSmem ? reinterpret_cast<T*>(quant_dyn_shm) : quant_static_shm;
   PackedVec* shared_pv = reinterpret_cast<PackedVec*>(shared_input);
 #pragma unroll
   for (int v = 0; v < kVecsPerThread; v++) {
@@ -423,11 +435,14 @@ template <typename T, int kHeadDim>
 void launch_fp4_quant_q_t(const torch::Tensor& input, torch::Tensor& output,
                           torch::Tensor& output_sf, const torch::Tensor& qm,
                           int64_t n_pad, bool sub_qm) {
+  constexpr int kTokensPerBlock =
+      (kHeadDim <= 128) ? 128 : ((kHeadDim <= 768) ? 64 : 32);
   const int num_tokens = input.size(1);
   const int d_og = static_cast<int>(input.size(3));
   auto stream = at::cuda::getCurrentCUDAStream();
-  dim3 block(512, 1, 1);
-  dim3 grid((n_pad + 127) / 128, input.size(0), input.size(2));
+  dim3 block(kTokensPerBlock * 4, 1, 1);
+  dim3 grid((n_pad + kTokensPerBlock - 1) / kTokensPerBlock, input.size(0),
+            input.size(2));
   if (sub_qm) {
     fp4_quant_kernel<T, kHeadDim, false, true, false>
         <<<grid, block, 0, stream>>>(
@@ -454,11 +469,14 @@ template <typename T, int kHeadDim>
 void launch_fp4_quant_k_t(const torch::Tensor& input, torch::Tensor& output,
                           torch::Tensor& output_sf, const torch::Tensor& km,
                           int64_t n_pad, bool sub_km) {
+  constexpr int kTokensPerBlock =
+      (kHeadDim <= 128) ? 128 : ((kHeadDim <= 768) ? 64 : 32);
   const int num_tokens = input.size(1);
   const int d_og = static_cast<int>(input.size(3));
   auto stream = at::cuda::getCurrentCUDAStream();
-  dim3 block(512, 1, 1);
-  dim3 grid((n_pad + 127) / 128, input.size(0), input.size(2));
+  dim3 block(kTokensPerBlock * 4, 1, 1);
+  dim3 grid((n_pad + kTokensPerBlock - 1) / kTokensPerBlock, input.size(0),
+            input.size(2));
   if (sub_km) {
     fp4_quant_kernel<T, kHeadDim, true, false, true>
         <<<grid, block, 0, stream>>>(
@@ -484,13 +502,25 @@ void launch_fp4_quant_k_t(const torch::Tensor& input, torch::Tensor& output,
 template <typename T, int kHeadDim>
 void launch_fp4_quant_vt_t(const torch::Tensor& input, torch::Tensor& output,
                            torch::Tensor& output_sf, int64_t n_pad) {
-  constexpr int kTokensPerBlock = (kHeadDim <= 128) ? 128 : 64;
+  constexpr int kTokensPerBlock =
+      (kHeadDim <= 128) ? 128 : ((kHeadDim <= 768) ? 64 : 32);
+  constexpr bool kDynamicSmem =
+      kTokensPerBlock * kHeadDim * int(sizeof(T)) > 48 * 1024;
+  constexpr int kSmemBytes =
+      kDynamicSmem ? kTokensPerBlock * kHeadDim * int(sizeof(T)) : 0;
   const int num_tokens = input.size(1);
   auto stream = at::cuda::getCurrentCUDAStream();
   dim3 block(kTokensPerBlock * 4, 1, 1);
   dim3 grid((n_pad + kTokensPerBlock - 1) / kTokensPerBlock, input.size(0),
             input.size(2));
-  fp4_quant_trans_kernel<T, kHeadDim><<<grid, block, 0, stream>>>(
+  auto kernel = fp4_quant_trans_kernel<T, kHeadDim>;
+  if constexpr (kDynamicSmem) {
+    TORCH_CHECK(cudaFuncSetAttribute(
+                    kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                    kSmemBytes) == cudaSuccess,
+                "fp4 V-transpose quantize smem opt-in failed for D=", kHeadDim);
+  }
+  kernel<<<grid, block, kSmemBytes, stream>>>(
       reinterpret_cast<const T*>(input.data_ptr()), output.data_ptr<uint8_t>(),
       output_sf.data_ptr<uint8_t>(), num_tokens, input.stride(0),
       input.stride(2), input.stride(1), output.stride(0), output.stride(1),
@@ -507,7 +537,7 @@ inline void launch_fp4_quant_q_sm120(const torch::Tensor& input,
                                      const torch::Tensor& qm, int64_t n_pad,
                                      bool sub_qm) {
   TORCH_CHECK(input.size(3) % 8 == 0 && input.size(3) <= kHeadDim &&
-                  kHeadDim % 64 == 0 && kHeadDim >= 64 && kHeadDim <= 256,
+                  kHeadDim % 64 == 0 && kHeadDim >= 64 && kHeadDim <= 1024,
               "fp4 quantize requires head_dim %8==0, D <= ", kHeadDim);
   if (input.scalar_type() == at::ScalarType::Half) {
     detail::launch_fp4_quant_q_t<half, kHeadDim>(input, output, output_sf, qm,
@@ -525,7 +555,7 @@ inline void launch_fp4_quant_k_sm120(const torch::Tensor& input,
                                      const torch::Tensor& km, int64_t n_pad,
                                      bool sub_km) {
   TORCH_CHECK(input.size(3) % 8 == 0 && input.size(3) <= kHeadDim &&
-                  kHeadDim % 64 == 0 && kHeadDim >= 64 && kHeadDim <= 256,
+                  kHeadDim % 64 == 0 && kHeadDim >= 64 && kHeadDim <= 1024,
               "fp4 quantize requires head_dim %8==0, D <= ", kHeadDim);
   if (input.scalar_type() == at::ScalarType::Half) {
     detail::launch_fp4_quant_k_t<half, kHeadDim>(input, output, output_sf, km,
@@ -541,7 +571,7 @@ inline void launch_fp4_quant_vt_sm120(const torch::Tensor& input,
                                       torch::Tensor& output,
                                       torch::Tensor& output_sf, int64_t n_pad) {
   TORCH_CHECK(input.size(3) % 8 == 0 && input.size(3) <= kHeadDim &&
-                  kHeadDim % 64 == 0 && kHeadDim >= 64 && kHeadDim <= 256,
+                  kHeadDim % 64 == 0 && kHeadDim >= 64 && kHeadDim <= 1024,
               "fp4 quantize requires head_dim %8==0, D <= ", kHeadDim);
   if (input.scalar_type() == at::ScalarType::Half) {
     detail::launch_fp4_quant_vt_t<half, kHeadDim>(input, output, output_sf,
@@ -556,7 +586,7 @@ template <int kHeadDim>
 inline void launch_fp4_q_block_mean_sm120(const torch::Tensor& input,
                                           torch::Tensor& qm) {
   TORCH_CHECK(input.size(3) % 8 == 0 && input.size(3) <= kHeadDim &&
-                  kHeadDim % 64 == 0 && kHeadDim >= 64 && kHeadDim <= 256,
+                  kHeadDim % 64 == 0 && kHeadDim >= 64 && kHeadDim <= 1024,
               "fp4 quantize requires head_dim %8==0, D <= ", kHeadDim);
   const int num_tokens = input.size(1);
   const int n_blocks = qm.size(2);
