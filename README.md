@@ -103,9 +103,6 @@ ref = F.scaled_dot_product_attention(q, k, v)
 print(f"FFPA FP8 vs SDPA max_abs_err={(out_fp8 - ref).abs().max().item():.4e}")
 print(f"FFPA FP4 vs SDPA max_abs_err={(out_fp4 - ref).abs().max().item():.4e}")
 ```
-```bash
-FFPA FP8 vs SDPA max_abs_err=1.6602e-02; FFPA FP4 vs SDPA max_abs_err=4.3213e-02
-```
 
 For more advanced features, please refer to our online docs at 📘[ffpa-attn.io](https://ffpa-attn.readthedocs.io/en/latest/).
 
