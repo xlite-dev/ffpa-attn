@@ -262,7 +262,12 @@ struct MMA_Traits<SM120::BLOCKSCALED::SM120_16x32x64_TN_VS_NVFP4> {
   // (T32,V64) -> (M16,K64)
   using SFALayout =
       Layout<Shape<Shape<_2, _2, _8>, _64>, Stride<Stride<_8, _0, _1>, _16>>;
-  // (T32,V64) -> (N32,K64)
+  // (T32,V64) -> (N32,K64). The fused n32 atom issues four m16n8k64
+  // sub-calls with thread-id-b = 0/1/2/3: sub-call i reads SF_B from the
+  // quad lane lane%4 == i and applies it to n-octant i (n = 8*i + gid).
+  // The t0 mode therefore needs stride 8 so lane tig provides the scale of
+  // n-octant tig - unlike the single-sub-call SM120_16x8x64_TN_VS n8 atom,
+  // whose 4:0 broadcast uses stride 0. (SageAttention3 reference layout.)
   using SFBLayout =
       Layout<Shape<Shape<_4, _8>, _64>, Stride<Stride<_8, _1>, _32>>;
   // (T32,V16) -> (M16,N32)

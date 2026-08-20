@@ -261,9 +261,38 @@ void launch_ffpa_attn_fwd_template(
           }
         } else if constexpr (kHeadDim % 64 == 0 && kHeadDim >= 768 &&
                              kHeadDim <= 1024) {
-          TORCH_CHECK(false,
-                      "ffpa_attn: fp4 split_d m4n2 (D>=768) not implemented "
-                      "yet");
+          // Split-D m4n2 fp4. Hybrid stage-1 runs the fp16 m4n2 kernel
+          // (same tile geometry); stage-2 takes the q_start_row offset.
+          if (fp4_hybrid && Nq >= fp4_hybrid_n_early) {
+            const int n_early = static_cast<int>(fp4_hybrid_n_early);
+            TORCH_CHECK(
+                n_early % 128 == 0,
+                "ffpa_attn: fp4_hybrid_n_early must be multiple of 128");
+            torch::Tensor Q_e, K_e, V_e;
+            const bool stage1_needs_pad = d_padded && !qkv_padded;
+            prepare_hybrid_stage1(Q_e, K_e, V_e, Q, K, V, n_early, Nkv, Nq,
+                                  causal,
+                                  stage1_needs_pad ? D_og : (int64_t)kHeadDim,
+                                  kHeadDim, stage1_needs_pad);
+            auto O_e = torch::empty_like(Q_e);
+            auto lse_e =
+                torch::empty({Nb, Nh, n_early}, torch::TensorOptions()
+                                                    .dtype(torch::kFloat32)
+                                                    .device(Q.device()));
+            auto empty_bias = torch::empty({0}, attn_bias.options());
+            launch_cute_fwd_split_d_m4n2_sm120<kDataType, kHeadDim, kStage>(
+                Q_e, K_e, V_e, O_e, empty_bias, lse_e, causal, softmax_scale,
+                0.0, 0, 0);
+            O.slice(2, 0, n_early).copy_(O_e);
+            if (softmax_lse.numel() > 0)
+              softmax_lse.slice(2, 0, n_early).copy_(lse_e);
+            launch_cute_fwd_split_d_m4n2_fp4_sm120<kDataType, kHeadDim, kStage>(
+                Q, K, V, O, softmax_lse, causal, softmax_scale,
+                /*q_start_row=*/n_early);
+          } else {
+            launch_cute_fwd_split_d_m4n2_fp4_sm120<kDataType, kHeadDim, kStage>(
+                Q, K, V, O, softmax_lse, causal, softmax_scale);
+          }
         } else {
           TORCH_CHECK(false,
                       "ffpa_attn: fp4 requires 64-multiple head_dim in "

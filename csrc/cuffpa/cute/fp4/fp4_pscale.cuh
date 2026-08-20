@@ -448,4 +448,165 @@ CUTE_DEVICE void lse_qkm_dot(const SmemQTensor& sQ, const SfQTensor& sSFQ,
     qkm[row] += c;
 }
 
+// ---------------------------------------------------------------------------
+// M4N2 variants (split_d_m4n2): each N-warp owns half the kBc columns, so
+// row max/sum cross N-warps via the smem exchange and P quantization moves
+// to the smem-roundtrip readback side.
+// ---------------------------------------------------------------------------
+
+// Cross-N-warp online softmax emitting P2-domain f32 scores (persist-D's
+// SoftmaxFused math): P2 = P*2688 via the +log2(2688) exp2 shift, so the
+// group SF = absmax/6 lands in ue4m3's full-precision range - without the
+// shift P-domain group scales flush to ue4m3 subnormals (or zero, which
+// drops whole 16-k groups via the inv=0 guard) and O degrades uniformly.
+// The 2688 cancels between O and row_sum and is folded back into the lse.
+// Protocol mirrors ffpa_cute's online_softmax_fp8_fixed_m4n2: one exchange
+// barrier for the max, the sum half is folded later by
+// ffpa_cute::finalize_row_sum_m4n2 which reuses the caller's P-roundtrip
+// __syncthreads() as its publication barrier.
+// row_max stays in the log2 domain (tile_max applies *scale before the
+// exchange); row_sum stays in the P2 domain.
+// Rescale is eager (threshold 0): the exp2 uses the CURRENT row max, so
+// P2 <= 2688 exactly and SF <= 448 never saturates; a lazy threshold would
+// let stale-max tiles push P2 to 2^thr * 2688 past ue4m3's 448 ceiling.
+template <typename ScoresTensor, typename CoordTensor, int kRows,
+          int kNumWarps = 8>
+CUTE_DEVICE void online_softmax_p2_m4n2(ScoresTensor& scores,
+                                        const CoordTensor& tScS_rc, float scale,
+                                        float* row_max, float* row_sum,
+                                        float* row_scale, float* smem_exchange,
+                                        int warp_id, int lane_id,
+                                        float rescale_threshold = 0.0f) {
+  const int peer_warp = warp_id ^ 4;
+  const bool is_writer = (lane_id % 4 == 0);
+  const int row_base = lane_id / 4;
+  constexpr int kMaxSlots = kNumWarps * 16;
+
+#pragma unroll
+  for (int row = 0; row < kRows; ++row) {
+    float tile_max = -INFINITY;
+#pragma unroll
+    for (int col = 0; col < cute::size<1>(scores); ++col)
+      tile_max = fmaxf(tile_max, scores(row, col) * scale);
+    tile_max = fmaxf(tile_max, __shfl_xor_sync(0xffffffff, tile_max, 1));
+    tile_max = fmaxf(tile_max, __shfl_xor_sync(0xffffffff, tile_max, 2));
+    const int row_local = row_base + row * 8;
+    if (is_writer)
+      smem_exchange[warp_id * 16 + row_local] = tile_max;
+  }
+  __syncthreads();
+
+#pragma unroll
+  for (int row = 0; row < kRows; ++row) {
+    const int row_local = row_base + row * 8;
+    const float tile_max = smem_exchange[warp_id * 16 + row_local];
+    const float peer_max = smem_exchange[peer_warp * 16 + row_local];
+    const float global_tile_max = fmaxf(tile_max, peer_max);
+
+    // row_max lives in the log2 domain throughout (tile_max above already
+    // applied *scale), so log2_diff exponentiates directly.
+    const float next_max = fmaxf(row_max[row], global_tile_max);
+    const float log2_diff = row_max[row] - next_max;
+    if (log2_diff >= -rescale_threshold) {
+      row_scale[row] = 1.0f;
+    } else {
+      row_scale[row] = exp2f(log2_diff);
+      row_max[row] = next_max;
+    }
+    // NOTE: row_sum rescale is NOT applied here - finalize_row_sum_m4n2
+    // folds it (row_sum*row_scale + local + peer) after the P barrier.
+
+    // exp2 shifted by the current row max plus the P2-domain factor
+    // 2688 = 448*6: P2 <= 2688 keeps the group SF = absmax/6 <= 448 (the
+    // ue4m3 ceiling) while small-probability groups stay well above the
+    // subnormal floor; fully-masked rows clamp the shift to avoid NaN.
+    constexpr float kP2ShiftLog2 = 11.392317422778762f;  // log2(448*6)
+    const float rm = (row_max[row] == -INFINITY) ? -kP2ShiftLog2 : row_max[row];
+    float tile_sum = 0.0f;
+#pragma unroll
+    for (int col = 0; col < cute::size<1>(scores); ++col) {
+      const float p = ptx_exp2(scores(row, col) * scale - rm + kP2ShiftLog2);
+      scores(row, col) = p;
+      tile_sum += p;
+    }
+    tile_sum += __shfl_xor_sync(0xffffffff, tile_sum, 1);
+    tile_sum += __shfl_xor_sync(0xffffffff, tile_sum, 2);
+    if (is_writer)
+      smem_exchange[kMaxSlots + warp_id * 16 + row_local] = tile_sum;
+  }
+}
+
+// Quantize the P2-domain f32 A-fragment (read back from the P smem staging
+// tile) into the packed (e2m1 data + ue4m3 SF) register pair the PV mma
+// consumes. One-level math here (the SoftmaxFused two-level fold needs the
+// full row max before the group SF, unavailable per-N-warp): per 16-k
+// group, SF = absmax/6 rounded to ue4m3, elements scaled by 1/SF land in
+// the e2m1 [0,6] domain, and the mma's scale multiply reconstructs P2
+// exactly (modulo ue4m3 rounding).
+//
+// Fragment contract (measured via an identity-tensor partition probe, see
+// .tmp/fp4-splitd/probe_layout.cu): the 32 readback slots are four 8-elem
+// packs laid out flat as [m0,k0-7][m8,k0-7][m0,k+32..39][m8,k+32..39] with
+// k-base 8*(lane%4); the quad k-peer lane (shfl_xor 1) holds the matching
+// other half of each 16-k group. The scale_vec::4X hardware consumes the SF
+// bytes in the same broadcast-interleaved form as quantize_and_pack_p: each
+// quad lane must carry all four 16-k group scales with the 0xFF00FF
+// shfl_xor(2) weave (see .tmp/fp4-splitd/probe_v3/v5/v12: a plain
+// contiguous byte pack leaves 1/8 of the P weights contributing to O).
+template <typename Pf32Tensor, typename PAFragment, typename PASFFragment>
+CUTE_DEVICE void quantize_pack_a_fp4(Pf32Tensor& tPf32, PAFragment& tPA,
+                                     PASFFragment& tPASF) {
+  Tensor tPf32_flat = flatten(tPf32);
+  Tensor tPA_flat = flatten(tPA);
+  Tensor tPA_u32 = recast<uint32_t>(tPA_flat);
+  static_assert(decltype(size(tPf32_flat))::value == 32,
+                "m4n2 A fragment is 32 elems (16x64/32)");
+  static_assert(decltype(size(tPA_flat))::value == 32,
+                "m4n2 A fragment is 32 elems (16x64/32)");
+
+  uint8_t sf_bytes[4];
+  CUTLASS_PRAGMA_UNROLL
+  for (int g = 0; g < 4; ++g) {
+    float amax = 0.0f;
+    CUTLASS_PRAGMA_UNROLL
+    for (int e = 0; e < 8; ++e)
+      amax = fmaxf(amax, fabsf(tPf32_flat(g * 8 + e)));
+    // The peer lane (quad k-neighbor) holds the group's other 8 elems.
+    amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFFu, amax, 1));
+    float sf = amax / 6.0f;
+    reinterpret_cast<__nv_fp8_e4m3&>(sf_bytes[g]) = __nv_fp8_e4m3(sf);
+    sf = float(reinterpret_cast<__nv_fp8_e4m3&>(sf_bytes[g]));
+    const float inv = (sf == 0.0f) ? 0.0f : 1.0f / sf;
+    uint32_t packed;
+    packed_float_to_e2m1(
+        tPf32_flat(g * 8 + 0) * inv, tPf32_flat(g * 8 + 1) * inv,
+        tPf32_flat(g * 8 + 2) * inv, tPf32_flat(g * 8 + 3) * inv,
+        tPf32_flat(g * 8 + 4) * inv, tPf32_flat(g * 8 + 5) * inv,
+        tPf32_flat(g * 8 + 6) * inv, tPf32_flat(g * 8 + 7) * inv, packed);
+    tPA_u32(g) = packed;
+  }
+  // SF weave. Hardware contract: SFA providers are quad lanes
+  // q=0 (row m=gid) and q=1 (row m=gid+8); lanes q=2/3 never provide.
+  // Every thread's local bytes {0,2} hold row-gid group scales (reg0/reg2
+  // of its k window) and bytes {1,3} row-gid+8 (reg1/reg3) - independent
+  // of q. A provider lane must hold its row's full [g0,g1,g2,g3] vector:
+  // group g0/g2 come from its own bytes (base, base+2) and g1/g3 from the
+  // q^2 lane (which covers the other 16-k half of the same rows), so
+  // byte pairs assemble as [F, S, F, S] at byte offsets base and base+2.
+  uint32_t local_sf = uint32_t(sf_bytes[0]) | (uint32_t(sf_bytes[1]) << 8) |
+                      (uint32_t(sf_bytes[2]) << 16) |
+                      (uint32_t(sf_bytes[3]) << 24);
+  uint32_t peer_sf = __shfl_xor_sync(0xFFFFFFFFu, local_sf, 2);
+  int const quad_id = threadIdx.x & 3;
+  int const base = quad_id & 1;  // 0: row-gid scales in bytes {0,2},
+                                 // 1: row-gid+8 scales in bytes {1,3}
+  uint32_t const& F = (quad_id & 2) == 0 ? local_sf : peer_sf;
+  uint32_t const& S = (quad_id & 2) == 0 ? peer_sf : local_sf;
+  uint32_t sfp = ((F >> (8 * base)) & 0xFFu) |
+                 (((S >> (8 * base)) & 0xFFu) << 8) |
+                 (((F >> (8 * (base + 2))) & 0xFFu) << 16) |
+                 (((S >> (8 * (base + 2))) & 0xFFu) << 24);
+  reinterpret_cast<uint32_t&>(*tPASF.data()) = sfp;
+}
+
 }  // namespace ffpa_fp4

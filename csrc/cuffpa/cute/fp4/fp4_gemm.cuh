@@ -147,4 +147,12 @@ CUTE_DEVICE void gemm_rs_fp4(
   }
 }
 
+// PV step with a PRE-QUANTIZED register A (m4n2): P crosses N-warps
+// through the f32 smem roundtrip, so quantize+pack (quantize_pack_a_fp4)
+// happens before the PV call on the readback fragment. Inlined into
+// split_d_m4n2.cuh: B (V^T/SFVt chunk) loads element-wise from the mma's
+// own smem partition views (the tiled-copy path under-fills the fragments
+// under the m4n2 thr layout), single mma (Tile-K = kBc),
+// trailing v_empty arrive.
+
 }  // namespace ffpa_fp4
