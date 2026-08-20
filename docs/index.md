@@ -38,6 +38,7 @@ git clone https://github.com/xlite-dev/ffpa-attn.git
 # Then, build the wheel package (Triton + CuTeDSL backends)
 cd ffpa-attn && pip3 install -e . --no-build-isolation
 # Optional: install ffpa-attn w/ CUDA backend (forward only)
+# ext all: build all kernels, include fp8/fp4 attention kernels
 bash ./build.sh --arch sm_120f --ext all --headdim all
 ```
 
@@ -47,7 +48,7 @@ Then, try to accelerate the attention for large headdim with just <i><b>one-line
 >>> import torch.nn.functional as F
 >>> from ffpa_attn import ffpa_attn_func
 >>> # Monkey-patch SDPA to point to FFPA. Every thing that FFPA
->>> # does not support will auto fallback to SDPA: D <= 256, etc.
+>>> # does not support will auto fallback to SDPA: N < 512, etc.
 >>> F.scaled_dot_product_attention = ffpa_attn_func # one-line code
 ```
 
