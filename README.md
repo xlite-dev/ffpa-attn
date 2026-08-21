@@ -136,15 +136,25 @@ We extend FlashAttention to support large headdim ($D>256$) via **fine-grained t
 Runnable benchmark are provided under [`bench`](./bench). The performance benchmarks for the NVIDIA L20 (**Ada**), NVIDIA Geforce RTX 5090 (**Blackwell**), NVIDIA H800 PCIE (**Hopper**), NVIDIA H200 SXM (**Hopper**, **CuTe-DSL** backend, up to **535** TFLOPS!), B200 (**Blackwell**, **CuTe-DSL** `tcgen05` 2-CTA D=512 backend, up to **1517** TFLOPS forward and **763** TFLOPS backward!) with large headdims can be found at [`bench`](./bench).
 
 <div align='center'>
-  <img src='./docs/assets/perf/ffpa_speedup_cutedsl_nvidia-h20z_B1_H32_N8192_D512_T.png' width='380px'>
-  <img src='./docs/assets/perf/ffpa_speedup_cutedsl_nvidia-h20z_B1_H32_N16384_D512_T.png' width='380px'><br>
-  <img src='./docs/assets/perf/ffpa_speedup_cutedsl_nvidia-b200_B1_H32_N8192_D512_T.png' width='380px'>
-  <img src='./docs/assets/perf/ffpa_speedup_cutedsl_nvidia-b200_B1_H32_N16384_D512_T.png' width='380px'><br>
-  <p><i><b>BF16 Attention</b> for Large Headdim: FFPA vs SDPA across NVIDIA RTX 5090, H200 and B200. </i></p>
+  <img src='./docs/assets/perf/ffpa_speedup_cutedsl_nvidia-h20z_B1_H32_N8192_D512_T.png' width='200px'>
+  <img src='./docs/assets/perf/ffpa_speedup_cutedsl_nvidia-h20z_B1_H32_N16384_D512_T.png' width='200px'>
+  <img src='./docs/assets/perf/ffpa_speedup_cutedsl_nvidia-b200_B1_H32_N8192_D512_T.png' width='200px'>
+  <img src='./docs/assets/perf/ffpa_speedup_cutedsl_nvidia-b200_B1_H32_N16384_D512_T.png' width='200px'><br>
+  <p><i><b>BF16 Attention</b> for Large Headdim: FFPA vs SDPA (FWD/BWD) across NVIDIA RTX H200 and B200, 6x-15x↑. </i></p>
 </div>
 <div align='center'>
-  <img src="./docs/assets/ffpa-fp8.png" width="800px"><br>
-  <p><i><b>FP8 Attention</b> for Large/Small Headdim: FFPA vs SDPA on NVIDIA RTX 5090. </i></p>
+  <img src='./docs/assets/perf/fp8/ffpa_speedup_nvidia-geforce-rtx-5090_B1_H64_N16384_D128_T.png' width='200px'>
+  <img src='./docs/assets/perf/fp8/ffpa_speedup_nvidia-geforce-rtx-5090_B1_H64_N16384_D256_T.png' width='200px'>
+  <img src='./docs/assets/perf/fp8/ffpa_speedup_nvidia-geforce-rtx-5090_B1_H64_N16384_D320_T.png' width='200px'>
+  <img src='./docs/assets/perf/fp8/ffpa_speedup_nvidia-geforce-rtx-5090_B1_H64_N16384_D512_T.png' width='200px'><br>
+  <p><i><b>FP8 Attention</b> for Large/Small Headdim: FFPA vs SDPA (FWD) on NVIDIA RTX 5090, 3x-6x↑. </i></p>
+</div>
+<div align='center'>
+  <img src='./docs/assets/perf/fp4/ffpa_speedup_nvidia-geforce-rtx-5090_B1_H64_N16384_D128_T.png' width='200px'>
+  <img src='./docs/assets/perf/fp4/ffpa_speedup_nvidia-geforce-rtx-5090_B1_H64_N16384_D192_T.png' width='200px'>
+  <img src='./docs/assets/perf/fp4/ffpa_speedup_nvidia-geforce-rtx-5090_B1_H64_N16384_D256_T.png' width='200px'>
+  <img src='./docs/assets/perf/fp4/ffpa_speedup_nvidia-geforce-rtx-5090_B1_H64_N16384_D320_T.png' width='200px'><br>
+  <p><i><b>FP4 Attention</b> for Large/Small Headdim: FFPA vs SDPA (FWD) on NVIDIA RTX 5090, 4x-7x↑. </i></p>
 </div>
 
 ## Backends
