@@ -190,7 +190,7 @@ NVIDIA-NeMo Automodel PR [#2436](https://github.com/NVIDIA-NeMo/Automodel/pull/2
 
 ## End-to-End Inference
 
-The FFPA (FP8/FP4) attention has fully integrated into [Cache-DiT](https://github.com/vipshop/cache-dit), feel free to take a try for your Diffusion models. For examples: (FLUX.1-dev, 1024x1024, seed=42, 28 steps)
+The FFPA (FP8/FP4) attention has fully integrated into [Cache-DiT](https://github.com/vipshop/cache-dit), feel free to take a try for your Diffusion models. For examples: (FLUX.1-dev, seed=42, 28 steps)
 
 ```bash
 python3 -m cache_dit.generate flux --attn native   --seed 42 --height 1024 --width 1024
@@ -200,13 +200,23 @@ python3 -m cache_dit.generate flux --attn ffpa_fp4 --seed 42 --height 1024 --wid
 
 <div align='center' markdown="1">
 
+<i> FLUX.1-dev, seed=42, 28 steps, 1024 x 1024, NVIDIA RTX PRO 5000 </i>
+
 |Native (SDPA-FA2)|SageAttention-3(FP4)|FFPA-FP4|
 |:---:|:---:|:---:|
-|<img src="./docs/assets/flux.1024.seed42.native.png" width="250px">|<img src="./docs/assets/flux.1024.seed42.sage3.png" width="250px">|<img src="./docs/assets/flux.1024.seed42.ffpa_fp4.png" width="250px">|
+|<img src="./docs/assets/flux.1024.seed42.native.png" width="240px">|<img src="./docs/assets/flux.1024.seed42.sage3.png" width="240px">|<img src="./docs/assets/flux.1024.seed42.ffpa_fp4.png" width="240px">|
+|17.18s|16.46s|16.52s|
+
+<i> FLUX.1-dev, seed=42, 28 steps, 2048 x 2048, NVIDIA RTX PRO 5000 </i>
+
+|Native (SDPA-FA2)|FFPA-FP8|SageAttention-3(FP4)|FFPA-FP4|
+|:---:|:---:|:---:|:---:|
+|<img src="./docs/assets/flux.2048x2048.C0_native.png" width="178px">|<img src="./docs/assets/flux.2048x2048.C0_ffpa_fp8.png" width="178px">|<img src="./docs/assets/flux.2048x2048.C0_sage3.png" width="178px">|<img src="./docs/assets/flux.2048x2048.C0_ffpa_fp4.png" width="178px">|
+|92.35s|83.50s|80.49s|78.40s|
 
 </div>
 
-The performance and precision of FFPA (FP8/FP4) is still under active development, stay tuned for future updates.
+The performance and precision of FFPA (FP8/FP4) is still under active development, stay tuned for future updates. Please note that the FP8/FP4 attention is **not suitable** for all scenarios (e.g., **small models** or **short sequences**), and we recommend users to evaluate the precision and performance of FFPA (FP8/FP4) for their own use cases.
 
 ## License
 
