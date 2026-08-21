@@ -190,9 +190,7 @@ NVIDIA-NeMo Automodel PR [#2436](https://github.com/NVIDIA-NeMo/Automodel/pull/2
 
 ## End-to-End Inference
 
-The FFPA (FP8/FP4) attention has fully integrated into [Cache-DiT](https://github.com/vipshop/cache-dit). Currently, the FP8/FP4 attention supports most of the attention headdims range from **64** to **1024** (forward only), including any headdims that can be divided by **8**, covering self-attention, cross-attention, causal attention and GQA/MQA attention.
-
-Feel free to take a try for your Diffusion models. For examples: (FLUX.1-dev, seed=42, 28 steps)
+The FFPA (FP8/FP4) attention has fully integrated into [Cache-DiT](https://github.com/vipshop/cache-dit). Currently, the FP8/FP4 attention supports most of the attention headdims range from **64** to **1024** (forward only), including any headdims that can be divided by **8**, covering self-attention, cross-attention, causal attention and GQA/MQA attention. Feel free to take a try for your Diffusion models. For examples: (FLUX.1-dev, seed=42, 28 steps)
 
 ```bash
 python3 -m cache_dit.generate flux --attn native   --seed 42 --height 1024 --width 1024
