@@ -15,16 +15,7 @@
 #include <cuda_fp16.h>
 #include <torch/all.h>
 
-#include <cstdlib>
-
 namespace ffpa_fp4 {
-
-// Per-call read (no static caching) so same-process A/B and monkeypatch
-// tests work, matching the FFPA_FP8_* env conventions.
-inline bool fp4_hadamard_enabled() {
-  const char* e = getenv("FFPA_FP4_HADAMARD");
-  return e != nullptr && e[0] != '0' && e[0] != '\0';
-}
 
 // One warp per (row, kWhtWidth-block); lane l owns cols {base + l + 32*j}.
 // Butterfly distances >= 32 swap register slots in-lane (bit lives in j),

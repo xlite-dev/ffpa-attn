@@ -260,6 +260,9 @@ class CUDABackend(Backend):
   fp8_hybrid_n_early: int = 256
   fp4_hybrid: bool | None = None
   fp4_hybrid_n_early: int = 256
+  # FP4 only: rotate Q/K by an orthogonal Walsh-Hadamard matrix before
+  # quantization (flattens per-16-group outliers; exact in fp32 math).
+  fp4_hadamard: bool = False
   # Runtime: propagated from ffpa_attn_func(is_causal=...) by normalize_inputs.
   is_causal: bool = False
 
@@ -296,6 +299,9 @@ class CUDABackend(Backend):
     )
     assert not self.fp8_smooth_v or self.fp8_v_quant_method == "per_channel", (
       "fp8_smooth_v requires fp8_v_quant_method='per_channel'"
+    )
+    assert not self.fp4_hadamard or self.enable_fp4, (
+      "fp4_hadamard requires enable_fp4"
     )
     self._resolve_impl_defaults()
     self.stages = self._default_cuda_stages(
@@ -1018,6 +1024,7 @@ class _FFPAAttnFunc(torch.autograd.Function):
         forward_meta.fp8_hybrid_n_early,
         forward_meta.fp4_hybrid,
         forward_meta.fp4_hybrid_n_early,
+        forward_meta.fp4_hadamard,
       )
     elif isinstance(meta.forward_meta, TritonBackend):
       forward_meta = meta.forward_meta

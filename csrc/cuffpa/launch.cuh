@@ -68,7 +68,8 @@ void launch_ffpa_attn_fwd_template(
     int64_t fp8_q_quant_method, int64_t fp8_k_quant_method,
     int64_t fp8_v_quant_method, int64_t fp8_pv_acc_type, int64_t fp8_qk_mm_type,
     bool fp8_hybrid = false, int64_t fp8_hybrid_n_early = 256,
-    bool fp4_hybrid = false, int64_t fp4_hybrid_n_early = 256) {
+    bool fp4_hybrid = false, int64_t fp4_hybrid_n_early = 256,
+    bool fp4_hadamard = false) {
   // Q,K,V,O with [B, H, N, D] layout, B=batch, H=head, N=seqlen, D=dim
   // TODO: support BNHD layout, Q,K,V,O with [B, N, H, D] layout.
   // Native block-tile config (MMA atoms, Br/Bc, stages, smem/pad flags) and
@@ -218,10 +219,11 @@ void launch_ffpa_attn_fwd_template(
             // Stage 2: fp4 late rows [n_early:N) via q_start_row offset.
             launch_cute_fwd_persist_d_fp4_sm120<kDataType, kHeadDim, kStage>(
                 Q, K, V, O, softmax_lse, causal, softmax_scale,
-                /*q_start_row=*/n_early);
+                /*q_start_row=*/n_early, fp4_hadamard);
           } else {
             launch_cute_fwd_persist_d_fp4_sm120<kDataType, kHeadDim, kStage>(
-                Q, K, V, O, softmax_lse, causal, softmax_scale);
+                Q, K, V, O, softmax_lse, causal, softmax_scale,
+                /*q_start_row=*/0, fp4_hadamard);
           }
         } else if constexpr (kHeadDim % 64 == 0 && kHeadDim > 256 &&
                              kHeadDim < 768) {
@@ -254,10 +256,11 @@ void launch_ffpa_attn_fwd_template(
             // Stage 2: fp4 late rows [n_early:N) via q_start_row offset.
             launch_cute_fwd_split_d_fp4_sm120<kDataType, kHeadDim, kStage>(
                 Q, K, V, O, softmax_lse, causal, softmax_scale,
-                /*q_start_row=*/n_early);
+                /*q_start_row=*/n_early, fp4_hadamard);
           } else {
             launch_cute_fwd_split_d_fp4_sm120<kDataType, kHeadDim, kStage>(
-                Q, K, V, O, softmax_lse, causal, softmax_scale);
+                Q, K, V, O, softmax_lse, causal, softmax_scale,
+                /*q_start_row=*/0, fp4_hadamard);
           }
         } else if constexpr (kHeadDim % 64 == 0 && kHeadDim >= 768 &&
                              kHeadDim <= 1024) {
@@ -288,10 +291,11 @@ void launch_ffpa_attn_fwd_template(
               softmax_lse.slice(2, 0, n_early).copy_(lse_e);
             launch_cute_fwd_split_d_m4n2_fp4_sm120<kDataType, kHeadDim, kStage>(
                 Q, K, V, O, softmax_lse, causal, softmax_scale,
-                /*q_start_row=*/n_early);
+                /*q_start_row=*/n_early, fp4_hadamard);
           } else {
             launch_cute_fwd_split_d_m4n2_fp4_sm120<kDataType, kHeadDim, kStage>(
-                Q, K, V, O, softmax_lse, causal, softmax_scale);
+                Q, K, V, O, softmax_lse, causal, softmax_scale,
+                /*q_start_row=*/0, fp4_hadamard);
           }
         } else {
           TORCH_CHECK(false,
