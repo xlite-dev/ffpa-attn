@@ -487,11 +487,17 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp8_sm120(
     // p_quant_scale). Per-block: vs * 448 = amax_block, chosen so vs cancels in
     // PV MMA ->
     //   o_acc lives in a single 448x domain (vs抵消是 fixed mode 统一域的前提).
-    // Per-channel: 1.0, so P8 = softmax lands in e4m3's precise [0,1] range.
-    //   Valid because amax_d is global (not per-tile), so o_acc's scale
-    //   (448/amax_d) is uniform across tiles -> single epilogue dequant.
-    //   (vs448=448 would push P8 into [224,448] where e4m3 ULP=32.)
-    const float p_quant_scale = kVPerChannel ? 1.0f : (vs * kE4m3Max);
+    // Per-channel: balanced narrowing. P must span the e4m3 range or small
+    //   probabilities fall into subnormals (p_quant_scale=1.0 => P in [0,1]
+    //   was 15x worse than Sage, which emits P*448 via S_FP8_OFFSET). P_r is
+    //   the largest range the f16 PV inst_buf can hold: kBc*P_r*V_r(2.25) <=
+    //   65504 (kBc=128 -> 224; kBc<=64 fits the full 448). f32 acc has no
+    //   fp16 overflow bound, so it always uses the full range.
+    constexpr float kPQuantScalePerCh =
+        (!kPVAccF16 || Traits::kBc * kE4m3Max * 2.25f <= 65504.0f) ? kE4m3Max
+                                                                   : 224.0f;
+    const float p_quant_scale =
+        kVPerChannel ? kPQuantScalePerCh : (vs * kE4m3Max);
     // Phase 2: compute the tile max on raw (unscaled) scores and apply the
     // softmax scale once after the cross-lane reduction, removing one FMUL
     // per element from the max-reduction critical path. Gated to the int8 QK
@@ -706,10 +712,14 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp8_sm120(
       for (int col = 0; col < kOCols; ++col) {
         float mul;
         if constexpr (kVPerChannel) {
-          // Per-channel V, p_quant_scale=1: P8=softmax (range [0,1]),
-          // V8=V/vs_d, MMA=(1/vs_d)*O_unnorm. Dequant mul=inv_sum*vs_d.
+          // Per-channel balanced narrowing: P8=softmax*p_quant_scale,
+          // V8=V/vs_d, MMA=(p_quant_scale/vs_d)*O_unnorm; divide it back out.
           // smooth_v: V8=(V-mean)/vs_d so O += mean_d after normalize.
-          mul = inv_sum * vs_d_col[col];
+          constexpr float kPQuantScale =
+              (!kPVAccF16 || Traits::kBc * kE4m3Max * 2.25f <= 65504.0f)
+                  ? kE4m3Max
+                  : 224.0f;
+          mul = inv_sum * vs_d_col[col] / kPQuantScale;
         } else {
           mul = kPQuantPerRow ? inv_sum : inv_sum * kFP8FixedPScale;
         }

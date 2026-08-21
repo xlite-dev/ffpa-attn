@@ -331,9 +331,15 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
         kVPerChannel ? 1.0f
                      : v_scale[static_cast<long>(kv_bh) * n_rb_kv + kv_tile];
     // Per-block: vs*448, vs cancels in PV MMA -> unified 448 domain, single
-    //   epilogue dequant (1/448). Per-channel: 1.0 so P8=softmax lands in
-    //   e4m3's [0,1] range; amax_d global -> uniform per-D epilogue dequant.
-    const float p_quant_scale = kVPerChannel ? 1.0f : (vs * kE4m3Max);
+    //   epilogue dequant (1/448). Per-channel: balanced narrowing (same as
+    //   persist-D) — P must span the e4m3 range or small probabilities fall
+    //   into e4m3 subnormals; P_r is the largest range the f16 inst_buf can
+    //   hold (kBc*P_r*V_r(2.25) <= 65504; kBc=64 here fits the full 448).
+    constexpr float kPQuantScalePerCh =
+        (!kPVAccF16 || Traits::kBc * kE4m3Max * 2.25f <= 65504.0f) ? kE4m3Max
+                                                                   : 224.0f;
+    const float p_quant_scale =
+        kVPerChannel ? kPQuantScalePerCh : (vs * kE4m3Max);
 
     // Phase 1: QK GEMM with split-D accumulation.
     auto tCrS = partition_fragment_C(tiled_mma_qk, Shape<Int<kBr>, Int<kBc>>{});
@@ -647,8 +653,14 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
                 (row_sum[row] == 0.0f) ? 1.0f : 1.0f / row_sum[row];
 #pragma unroll
             for (int col = 0; col < kOCols; ++col) {
-              const float mul = kVPerChannel ? (inv_sum * vs_d_col[col])
-                                             : (inv_sum * kFP8FixedPScale);
+              // Per-channel balanced narrowing dequant: divide p_quant_scale.
+              constexpr float kPQuantScale =
+                  (!kPVAccF16 || Traits::kBc * kE4m3Max * 2.25f <= 65504.0f)
+                      ? kE4m3Max
+                      : 224.0f;
+              const float mul = kVPerChannel
+                                    ? (inv_sum * vs_d_col[col] / kPQuantScale)
+                                    : (inv_sum * kFP8FixedPScale);
               tCrO_rc(row, col) *= mul;
               if (vm_base)
                 tCrO_rc(row, col) += vm_d_col[col];
@@ -712,8 +724,14 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
               (row_sum[row] == 0.0f) ? 1.0f : 1.0f / row_sum[row];
 #pragma unroll
           for (int col = 0; col < kOCols; ++col) {
-            const float mul = kVPerChannel ? (inv_sum * vs_d_col[col])
-                                           : (inv_sum * kFP8FixedPScale);
+            // Per-channel balanced narrowing dequant: divide p_quant_scale.
+            constexpr float kPQuantScale =
+                (!kPVAccF16 || Traits::kBc * kE4m3Max * 2.25f <= 65504.0f)
+                    ? kE4m3Max
+                    : 224.0f;
+            const float mul = kVPerChannel
+                                  ? (inv_sum * vs_d_col[col] / kPQuantScale)
+                                  : (inv_sum * kFP8FixedPScale);
             tCrO_rc(row, col) *= mul;
             if (vm_base)
               tCrO_rc(row, col) += vm_d_col[col];
