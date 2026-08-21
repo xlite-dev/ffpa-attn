@@ -28,8 +28,15 @@ struct FFPAAttnCuTePersistDFP8Traits {
   static constexpr int kStagesK = kStagesK_;
   static constexpr int kStagesV = kStagesV_;
   static constexpr bool kQKInt8 = kQKInt8_;
-  // fp8 P operand saturates at 448, so use the FA-4 fp8 rescale threshold.
-  static constexpr float kRescaleThreshold = FFPA_RESCALE_THRESHOLD_FP8;
+  // Lazy (FA-4 deferred) rescale is OFF for fp8 precision: skipping a rescale
+  // leaves the running max stale, so emitted P is inflated by up to
+  // 2^FFPA_RESCALE_THRESHOLD_FP8 against that stale max; with P spanning the
+  // e4m3 range (balanced narrowing) the inflation hits satfinite and corrupts
+  // the PV result. Sage rescales unconditionally. f16 inst_buf paths fuse the
+  // rescale into the absorption FFMA, so immediate rescale is nearly free.
+  static constexpr bool kLazyRescale = false;
+  static constexpr float kRescaleThreshold =
+      kLazyRescale ? FFPA_RESCALE_THRESHOLD_FP8 : 0.0f;
 
   static constexpr int kSmemElems =
       kBr * kHeadDim + kStagesK * kBc * kHeadDim + kStagesV * kBc * kHeadDim;
@@ -126,8 +133,10 @@ struct FFPAAttnCuTeSplitDFP8Traits {
   static constexpr int kStagesQK = kStagesQK_;
   static constexpr int kStagesPV = kStagesPV_;
   static constexpr bool kQKInt8 = kQKInt8_;
-  // fp8 P operand saturates at 448, so use the FA-4 fp8 rescale threshold.
-  static constexpr float kRescaleThreshold = FFPA_RESCALE_THRESHOLD_FP8;
+  // Lazy rescale OFF: same precision rationale as the persist-D traits above.
+  static constexpr bool kLazyRescale = false;
+  static constexpr float kRescaleThreshold =
+      kLazyRescale ? FFPA_RESCALE_THRESHOLD_FP8 : 0.0f;
 
   using Element = cutlass::float_e4m3_t;  // V / P (PV side, always fp8)
   using ElementQK = std::conditional_t<kQKInt8, int8_t, cutlass::float_e4m3_t>;
@@ -224,7 +233,10 @@ struct FFPAAttnCuTeSplitDM4N2FP8Traits {
   static constexpr int kStagesQK = kStagesQK_;
   static constexpr int kStagesPV = kStagesPV_;
   static constexpr bool kQKInt8 = kQKInt8_;
-  static constexpr float kRescaleThreshold = FFPA_RESCALE_THRESHOLD_FP8;
+  // Lazy rescale OFF: same precision rationale as the persist-D traits above.
+  static constexpr bool kLazyRescale = false;
+  static constexpr float kRescaleThreshold =
+      kLazyRescale ? FFPA_RESCALE_THRESHOLD_FP8 : 0.0f;
 
   using Element = cutlass::float_e4m3_t;  // V / P (PV side, always fp8)
   using ElementQK = std::conditional_t<kQKInt8, int8_t, cutlass::float_e4m3_t>;
