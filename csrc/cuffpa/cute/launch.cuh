@@ -18,6 +18,7 @@
 #include "cute/fp8/sm_120/split_d.cuh"
 #include "cute/fp8/sm_120/split_d_m4n2.cuh"
 #include "cute/fp4/quantize_fp4.cuh"
+#include "cute/fp4/hadamard.cuh"
 #include "cute/fp4/delta_s.cuh"
 #include "cute/fp4/sm_120/persist_d.cuh"
 #include "cute/fp4/sm_120/split_d.cuh"
@@ -1641,6 +1642,10 @@ void launch_cute_fwd_persist_d_fp4_sm120_impl(torch::Tensor Q, torch::Tensor K,
 
   const c10::cuda::OptionalCUDAGuard device_guard(Q.device());
   auto stream = at::cuda::getCurrentCUDAStream();
+  if (ffpa_fp4::fp4_hadamard_enabled()) {
+    Q = ffpa_fp4::apply_wht_qk_sm120<kDataType, kHeadDim>(Q);
+    K = ffpa_fp4::apply_wht_qk_sm120<kDataType, kHeadDim>(K);
+  }
   const kDataType* k_ptr = reinterpret_cast<const kDataType*>(K.data_ptr());
 
   // km: per-(b,hkv) K column mean, in-dtype + fp32 (lse correction +
@@ -1875,6 +1880,10 @@ void launch_cute_fwd_split_d_fp4_sm120_impl(torch::Tensor Q, torch::Tensor K,
 
   const c10::cuda::OptionalCUDAGuard device_guard(Q.device());
   auto stream = at::cuda::getCurrentCUDAStream();
+  if (ffpa_fp4::fp4_hadamard_enabled()) {
+    Q = ffpa_fp4::apply_wht_qk_sm120<kDataType, kHeadDim>(Q);
+    K = ffpa_fp4::apply_wht_qk_sm120<kDataType, kHeadDim>(K);
+  }
   const kDataType* k_ptr = reinterpret_cast<const kDataType*>(K.data_ptr());
 
   torch::Tensor km_h = torch::empty({Nb * Nh_kv, kHeadDim}, K.options());
@@ -2093,6 +2102,15 @@ void launch_cute_fwd_split_d_m4n2_fp4_sm120_impl(
 
   const c10::cuda::OptionalCUDAGuard device_guard(Q.device());
   auto stream = at::cuda::getCurrentCUDAStream();
+  // Optional Hadamard pre-rotation of Q/K (env FFPA_FP4_HADAMARD, per-call
+  // read): exact in fp32 math, only flattens fp4 quantization noise. The
+  // rotated copies are kHeadDim-wide (rotated zero pad cols stored), so
+  // every downstream consumer below stays in one rotated domain; V and the
+  // hybrid stage-1 (fp16, earlier in dispatch) are untouched.
+  if (ffpa_fp4::fp4_hadamard_enabled()) {
+    Q = ffpa_fp4::apply_wht_qk_sm120<kDataType, kHeadDim>(Q);
+    K = ffpa_fp4::apply_wht_qk_sm120<kDataType, kHeadDim>(K);
+  }
   const kDataType* k_ptr = reinterpret_cast<const kDataType*>(K.data_ptr());
 
   torch::Tensor km_h = torch::empty({Nb * Nh_kv, kHeadDim}, K.options());
