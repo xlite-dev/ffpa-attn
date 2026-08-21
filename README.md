@@ -21,9 +21,12 @@
 
 ## Latest News
 
-- [2026-08] 🚪 FFPA now experimental supports [**FP4 Attention**](./csrc/cuffpa/cute/fp4/) for headdims **[64,1024]** ([sm_120](./csrc/cuffpa/cute/fp4/sm_120/), forward only), achieving **910**🎉 TFLOPS (D=128) on 5090, the performance of large headdims is stay tuned for updates. 🎉🎉
+- [2026-08] 🐍 [**Cache-DiT x FFPA (FP8/FP4)**](#end-to-end-inference) is ready! Feel free to take a try for your Diffusion models. 🎉🎉
+- [2026-08] 🚪 FFPA now experimental supports [**FP4 Attention**](./csrc/cuffpa/cute/fp4/) for headdims **[64,1024]** ([sm_120](./csrc/cuffpa/cute/fp4/sm_120/), forward only), achieving **850-980**🎉 TFLOPS (D=128-256) on NVIDIA RTX 5090, **3.8x~4.4x**🎉 speedup over PyTorch SDPA (FlashAttention-2 backend) the performance of large headdims is stay tuned for updates. 🎉🎉
 - [2026-08] 🦅 FFPA now supports D=512 for NVIDIA B200 via [**CuTe-DSL**](#benchmark) **tcgen05** 2-CTA, [**1517**](#benchmark) TFLOPS forward and [**763**](#benchmark) TFLOPS backward, achieving **6x~15x**🎉 speedup over standard PyTorch SDPA. 🎉🎉
 - [2026-07] 🎯 FFPA now supports [**FP8 Attention**](./csrc/cuffpa/cute/fp8/) for headdims **[64,1024]** ([sm_120](./csrc/cuffpa/cute/fp8/sm_120/), forward only) and achieving **3x~6x**🎉 speedup over PyTorch SDPA for large headdim (**D>256**). 🎉🎉
+- [2026-06] FFPA now supports AMD ROCm/HIP GPUs via the Triton backend, check [#268](https://github.com/xlite-dev/ffpa-attn/pull/268) for more details. 🎉🎉
+- [2026-06] 🦅 [**NVIDIA-Nemo/AutoModel x FFPA**](https://github.com/NVIDIA-NeMo/Automodel/pull/2436) achieving [**1.4x~1.5x**🎉](https://github.com/NVIDIA-NeMo/Automodel/pull/2436) End2End training throughput speedup for Gemma4-31B (8xH200, FSDP2 + AC) with **FFPA** accelerating the **10/60 (D=512)** full-attention layers. 🎉🎉
 - [2026-06] 🐍 FFPA now supports [**TritonBackend**](./src/ffpa_attn/triton/) and [**CuTeDSLBacked**](./src/ffpa_attn/cute/) for both forward and backward pass, achieving **1.5x~5x**🎉 speedup over standard PyTorch SDPA across many devices. 🎉🎉
 - [2026-05] 🚪 FFPA now supports GQA, MQA, cross-attn, causal, attn-mask and dropout with [**CUDABackend**](./csrc/cuffpa/native/) for large headdims (**D>256**, forward only), achieving **1.3x~2x**🎉 speedup over PyTorch SDPA. 🎉🎉
 
@@ -133,17 +136,25 @@ We extend FlashAttention to support large headdim ($D>256$) via **fine-grained t
 Runnable benchmark are provided under [`bench`](./bench). The performance benchmarks for the NVIDIA L20 (**Ada**), NVIDIA Geforce RTX 5090 (**Blackwell**), NVIDIA H800 PCIE (**Hopper**), NVIDIA H200 SXM (**Hopper**, **CuTe-DSL** backend, up to **535** TFLOPS!), B200 (**Blackwell**, **CuTe-DSL** `tcgen05` 2-CTA D=512 backend, up to **1517** TFLOPS forward and **763** TFLOPS backward!) with large headdims can be found at [`bench`](./bench).
 
 <div align='center'>
-  <img src='./docs/assets/perf/ffpa_speedup_nvidia-geforce-rtx-5090_B1_H32_N8192_D320_T.png' width='400px'>
-  <img src='./docs/assets/perf/ffpa_speedup_nvidia-geforce-rtx-5090_B1_H32_N8192_D512_T.png' width='400px'><br>
-  <img src='./docs/assets/perf/ffpa_speedup_cutedsl_nvidia-h20z_B1_H32_N8192_D512_T.png' width='400px'>
-  <img src='./docs/assets/perf/ffpa_speedup_cutedsl_nvidia-h20z_B1_H32_N16384_D512_T.png' width='400px'><br>
-  <img src='./docs/assets/perf/ffpa_speedup_cutedsl_nvidia-b200_B1_H32_N8192_D512_T.png' width='400px'>
-  <img src='./docs/assets/perf/ffpa_speedup_cutedsl_nvidia-b200_B1_H32_N16384_D512_T.png' width='400px'><br>
-  <p><i><b>BF16 Attention</b> for Large Headdim: FFPA vs SDPA across NVIDIA RTX 5090, H200 and B200. </i></p>
+  <img src='./docs/assets/perf/ffpa_speedup_cutedsl_nvidia-h20z_B1_H32_N8192_D512_T.png' width='200px'>
+  <img src='./docs/assets/perf/ffpa_speedup_cutedsl_nvidia-h20z_B1_H32_N16384_D512_T.png' width='200px'>
+  <img src='./docs/assets/perf/ffpa_speedup_cutedsl_nvidia-b200_B1_H32_N8192_D512_T.png' width='200px'>
+  <img src='./docs/assets/perf/ffpa_speedup_cutedsl_nvidia-b200_B1_H32_N16384_D512_T.png' width='200px'><br>
+  <p><i><b>BF16 Attention</b> for Large Headdim: FFPA vs SDPA (FWD/BWD) across NVIDIA RTX H200 and B200, 6x-15x↑. </i></p>
 </div>
 <div align='center'>
-  <img src="./docs/assets/ffpa-fp8.png" width="800px"><br>
-  <p><i><b>FP8 Attention</b> for Large/Small Headdim: FFPA vs SDPA on NVIDIA RTX 5090. </i></p>
+  <img src='./docs/assets/perf/fp8/ffpa_speedup_nvidia-geforce-rtx-5090_B1_H64_N16384_D128_T.png' width='200px'>
+  <img src='./docs/assets/perf/fp8/ffpa_speedup_nvidia-geforce-rtx-5090_B1_H64_N16384_D256_T.png' width='200px'>
+  <img src='./docs/assets/perf/fp8/ffpa_speedup_nvidia-geforce-rtx-5090_B1_H64_N16384_D320_T.png' width='200px'>
+  <img src='./docs/assets/perf/fp8/ffpa_speedup_nvidia-geforce-rtx-5090_B1_H64_N16384_D512_T.png' width='200px'><br>
+  <p><i><b>FP8 Attention</b> for Large/Small Headdim: FFPA vs SDPA (FWD) on NVIDIA RTX 5090, 3x-6x↑. </i></p>
+</div>
+<div align='center'>
+  <img src='./docs/assets/perf/fp4/ffpa_speedup_nvidia-geforce-rtx-5090_B1_H64_N16384_D128_T.png' width='200px'>
+  <img src='./docs/assets/perf/fp4/ffpa_speedup_nvidia-geforce-rtx-5090_B1_H64_N16384_D192_T.png' width='200px'>
+  <img src='./docs/assets/perf/fp4/ffpa_speedup_nvidia-geforce-rtx-5090_B1_H64_N16384_D256_T.png' width='200px'>
+  <img src='./docs/assets/perf/fp4/ffpa_speedup_nvidia-geforce-rtx-5090_B1_H64_N16384_D320_T.png' width='200px'><br>
+  <p><i><b>FP4 Attention</b> for Large/Small Headdim: FFPA vs SDPA (FWD) on NVIDIA RTX 5090, 4x-7x↑. </i></p>
 </div>
 
 ## Backends
@@ -157,6 +168,7 @@ FFPA supports multiple backends for the forward and backward pass, including: [`
 |SDPA|sm>=75|✔|✔|All|✖️|**1.0x**|sm>=75|
 |CUDA|sm>=80|✔|✖️|64~1024|✖️|**1.5x~3x**|sm_80~89,120{a,f}|
 |CUDA FP8|sm_120{a,f}|✔|✖️|64~1024|✖️|**3x~6x**|sm_120{a,f}|
+|CUDA FP4|sm_120{a,f}|✔|✖️|64~512|✖️|**4x~7x**|sm_120{a,f}|
 |Triton|sm>=80|✔|✔|320~1024|✔|**1.5x~5x**|sm>=80|
 |CuTe-DSL|sm>=80|✔|✔|320~1024|✖️|**1.5x~2x**|sm_80~89,120{a,f}|
 |CuTe-DSL|sm_90a|✔|✔|320~512|✖️|**3x~6x**|sm_90a|
@@ -182,9 +194,37 @@ export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 # Multi-GPU (`pip install ray`)
 python -m ffpa_attn.autotune --mode max --full-tasks --num-gpus 8 --overwrite
 ```
 
-## End-to-End (E2E) Training
+## End-to-End Training
 
 NVIDIA-NeMo Automodel PR [#2436](https://github.com/NVIDIA-NeMo/Automodel/pull/2436) shows that on Gemma4-31B training (L=8192, 8xH200, FSDP2 + Activation Checkpointing), accelerating the **10/60 (D=512)** full-attention layers with FFPA delivers about [`1.4x~1.5x`](https://github.com/NVIDIA-NeMo/Automodel/pull/2436) higher throughput (**E2E**) than SDPA at similar memory footprint, with loss aligned within normal bf16 noise.
+
+## End-to-End Inference
+
+The FFPA (FP8/FP4) attention has fully integrated into [Cache-DiT](https://github.com/vipshop/cache-dit). Currently, the FP8/FP4 attention supports most of the attention headdims range from **64** to **1024** (forward only), including any headdims that can be divided by **8**, covering self-attention, cross-attention, causal attention and GQA/MQA attention. Feel free to take a try for your Diffusion models. For examples: (FLUX.1-dev, seed=42, 28 steps)
+
+```bash
+python3 -m cache_dit.generate flux --attn native   --seed 42 --height 1024 --width 1024
+python3 -m cache_dit.generate flux --attn ffpa_fp8 --seed 42 --height 1024 --width 1024
+python3 -m cache_dit.generate flux --attn ffpa_fp4 --seed 42 --height 1024 --width 1024
+```
+
+<div align='center' markdown="1">
+
+<i> FLUX.1-dev, seed=42, 28 steps, 1024 x 1024, NVIDIA RTX PRO 5000 </i>
+
+|Native (SDPA-FA2, 17.18s)|SageAttn-3 (FP4, 16.46s)|FFPA-FP4 (16.52s)|
+|:---:|:---:|:---:|
+|<img src="./docs/assets/flux.1024.seed42.native.png" width="250px">|<img src="./docs/assets/flux.1024.seed42.sage3.png" width="250px">|<img src="./docs/assets/flux.1024.seed42.ffpa_fp4.png" width="250px">|
+
+<i> FLUX.1-dev, seed=42, 28 steps, 2048 x 2048, NVIDIA RTX PRO 5000 </i>
+
+|Native (92.3s)|FFPA-FP8 (83.5s)|SageAttn-3 (FP4, 80.4s)|FFPA-FP4 (78.4s)|
+|:---:|:---:|:---:|:---:|
+|<img src="./docs/assets/flux.2048x2048.C0_native.png" width="178px">|<img src="./docs/assets/flux.2048x2048.C0_ffpa_fp8.png" width="178px">|<img src="./docs/assets/flux.2048x2048.C0_sage3.png" width="178px">|<img src="./docs/assets/flux.2048x2048.C0_ffpa_fp4.png" width="178px">|
+
+</div>
+
+The performance and precision of FFPA (FP8/FP4) is still under active development, stay tuned for future updates. Please note that the FP8/FP4 attention is **not suitable** for all scenarios (e.g., **small models** or **short seqlen**), and we recommend users to evaluate the precision and performance of FFPA (FP8/FP4) for their own use cases.
 
 ## License
 
