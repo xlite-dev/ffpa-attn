@@ -206,6 +206,8 @@ python3 -m cache_dit.generate flux --attn ffpa_fp4 --seed 42 --height 1024 --wid
 
 </div>
 
+The performance and precision of FFPA (FP8/FP4) is still under active development, stay tuned for future updates.
+
 ## License
 
 <div id="License"></div>
