@@ -214,7 +214,7 @@ python3 -m cache_dit.generate flux --attn ffpa_fp4 --seed 42 --height 1024 --wid
 
 </div>
 
-The performance and precision of FFPA (FP8/FP4) is still under active development, stay tuned for future updates. Please note that the FP8/FP4 attention is **not suitable** for all scenarios (e.g., **small models** or **short seqlen**), and we recommend users to evaluate the precision and performance of FFPA (FP8/FP4) for their own use cases.
+The performance and precision of FFPA (FP8/FP4) is still under active development, 😈 stay tuned for future updates. Please note that the FP8/FP4 attention is **not suitable** for all scenarios (e.g., **small models** or **short seqlen**), and we recommend users to evaluate the precision and performance of FFPA (FP8/FP4) for their own use cases.
 
 ## License
 
