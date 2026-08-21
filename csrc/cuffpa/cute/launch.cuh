@@ -18,7 +18,7 @@
 #include "cute/fp8/sm_120/split_d.cuh"
 #include "cute/fp8/sm_120/split_d_m4n2.cuh"
 #include "cute/fp4/quantize_fp4.cuh"
-#include "cute/fp4/hadamard.cuh"
+#include "cute/hadamard.cuh"
 #include "cute/fp4/delta_s.cuh"
 #include "cute/fp4/sm_120/persist_d.cuh"
 #include "cute/fp4/sm_120/split_d.cuh"
@@ -498,8 +498,18 @@ void launch_cute_fwd_persist_d_fp8_sm120_impl(
     double softmax_scale, double dropout_p, int64_t philox_seed,
     int64_t philox_offset, bool fp8_smooth_k, bool fp8_smooth_v,
     int64_t fp8_q_quant_method, int64_t fp8_k_quant_method,
-    int64_t fp8_v_quant_method, int64_t fp8_pv_acc_type, int q_start_row = 0) {
+    int64_t fp8_v_quant_method, int64_t fp8_pv_acc_type, int q_start_row = 0,
+    bool hadamard = false) {
   using namespace cute;
+  // Hadamard: rotate Q/K (and zero-pad V) BEFORE anything reads D_og — D_og
+  // is the row stride of every fp8 pre-kernel (kv-mean/quantize), so Q/K/V
+  // must all become kHeadDim-wide together.
+  if (hadamard) {
+    if (Q.size(3) < kHeadDim)
+      V = torch::constant_pad_nd(V, {0, kHeadDim - Q.size(3)}, 0.0);
+    Q = ffpa::apply_wht_qk_sm120<kDataType, kHeadDim>(Q);
+    K = ffpa::apply_wht_qk_sm120<kDataType, kHeadDim>(K);
+  }
   TORCH_CHECK(attn_bias.numel() == 0 && dropout_p == 0.0,
               "fp8 sm120 path does not support attn_bias/dropout");
   // q/k only support per-block quant today; per-channel is reserved for
@@ -810,7 +820,7 @@ void launch_cute_fwd_persist_d_fp8_sm120(
     int64_t philox_offset, bool fp8_smooth_k, bool fp8_smooth_v,
     int64_t fp8_q_quant_method, int64_t fp8_k_quant_method,
     int64_t fp8_v_quant_method, int64_t fp8_pv_acc_type, int64_t fp8_qk_mm_type,
-    int q_start_row = 0) {
+    int q_start_row = 0, bool hadamard = false) {
   // qk_mm_type: 0=fp8 (e4m3 QK MMA), 1=int8 (s8xs8->s32). Default fp8;
   // int8 fixes the causal early-row dS accuracy limit at ~zero cost.
   // if constexpr keeps the impl (and its kernel) out of instantiation for
@@ -823,14 +833,14 @@ void launch_cute_fwd_persist_d_fp8_sm120(
           Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale, dropout_p,
           philox_seed, philox_offset, fp8_smooth_k, fp8_smooth_v,
           fp8_q_quant_method, fp8_k_quant_method, fp8_v_quant_method,
-          fp8_pv_acc_type, q_start_row);
+          fp8_pv_acc_type, q_start_row, hadamard);
     else
       launch_cute_fwd_persist_d_fp8_sm120_impl<kDataType, kHeadDim, kStage,
                                                false>(
           Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale, dropout_p,
           philox_seed, philox_offset, fp8_smooth_k, fp8_smooth_v,
           fp8_q_quant_method, fp8_k_quant_method, fp8_v_quant_method,
-          fp8_pv_acc_type, q_start_row);
+          fp8_pv_acc_type, q_start_row, hadamard);
   } else {
     TORCH_CHECK(false,
                 "ffpa_attn: cute_tma_fp8 persist_d requires D in {32..224} "
@@ -850,8 +860,18 @@ void launch_cute_fwd_split_d_fp8_sm120_impl(
     double softmax_scale, double dropout_p, int64_t philox_seed,
     int64_t philox_offset, bool fp8_smooth_k, bool fp8_smooth_v,
     int64_t fp8_q_quant_method, int64_t fp8_k_quant_method,
-    int64_t fp8_v_quant_method, int64_t fp8_pv_acc_type, int q_start_row = 0) {
+    int64_t fp8_v_quant_method, int64_t fp8_pv_acc_type, int q_start_row = 0,
+    bool hadamard = false) {
   using namespace cute;
+  // Hadamard: rotate Q/K (and zero-pad V) BEFORE anything reads D_og — D_og
+  // is the row stride of every fp8 pre-kernel (kv-mean/quantize), so Q/K/V
+  // must all become kHeadDim-wide together.
+  if (hadamard) {
+    if (Q.size(3) < kHeadDim)
+      V = torch::constant_pad_nd(V, {0, kHeadDim - Q.size(3)}, 0.0);
+    Q = ffpa::apply_wht_qk_sm120<kDataType, kHeadDim>(Q);
+    K = ffpa::apply_wht_qk_sm120<kDataType, kHeadDim>(K);
+  }
   TORCH_CHECK(attn_bias.numel() == 0 && dropout_p == 0.0,
               "fp8 sm120 path does not support attn_bias/dropout");
   TORCH_CHECK(
@@ -1124,7 +1144,7 @@ void launch_cute_fwd_split_d_fp8_sm120(
     int64_t philox_offset, bool fp8_smooth_k, bool fp8_smooth_v,
     int64_t fp8_q_quant_method, int64_t fp8_k_quant_method,
     int64_t fp8_v_quant_method, int64_t fp8_pv_acc_type, int64_t fp8_qk_mm_type,
-    int q_start_row = 0) {
+    int q_start_row = 0, bool hadamard = false) {
   // EXPERIMENT: lower bound lowered from >=768 to >=192 so M4N2 can be A/B'd
   // against M8N1 across all large headdims via FFPA_FP8_FORCE_KERNEL.
   // Production dispatch selects M4N2 only for D>=768 via the top-level
@@ -1136,14 +1156,14 @@ void launch_cute_fwd_split_d_fp8_sm120(
           Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale, dropout_p,
           philox_seed, philox_offset, fp8_smooth_k, fp8_smooth_v,
           fp8_q_quant_method, fp8_k_quant_method, fp8_v_quant_method,
-          fp8_pv_acc_type, q_start_row);
+          fp8_pv_acc_type, q_start_row, hadamard);
     else
       launch_cute_fwd_split_d_fp8_sm120_impl<kDataType, kHeadDim, kStage,
                                              false>(
           Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale, dropout_p,
           philox_seed, philox_offset, fp8_smooth_k, fp8_smooth_v,
           fp8_q_quant_method, fp8_k_quant_method, fp8_v_quant_method,
-          fp8_pv_acc_type, q_start_row);
+          fp8_pv_acc_type, q_start_row, hadamard);
   } else {
     TORCH_CHECK(false,
                 "ffpa_attn: cute_tma_fp8 split_d requires D in "
@@ -1164,8 +1184,18 @@ void launch_cute_fwd_split_d_m4n2_fp8_sm120_impl(
     double softmax_scale, double dropout_p, int64_t philox_seed,
     int64_t philox_offset, bool fp8_smooth_k, bool fp8_smooth_v,
     int64_t fp8_q_quant_method, int64_t fp8_k_quant_method,
-    int64_t fp8_v_quant_method, int64_t fp8_pv_acc_type, int q_start_row = 0) {
+    int64_t fp8_v_quant_method, int64_t fp8_pv_acc_type, int q_start_row = 0,
+    bool hadamard = false) {
   using namespace cute;
+  // Hadamard: rotate Q/K (and zero-pad V) BEFORE anything reads D_og — D_og
+  // is the row stride of every fp8 pre-kernel (kv-mean/quantize), so Q/K/V
+  // must all become kHeadDim-wide together.
+  if (hadamard) {
+    if (Q.size(3) < kHeadDim)
+      V = torch::constant_pad_nd(V, {0, kHeadDim - Q.size(3)}, 0.0);
+    Q = ffpa::apply_wht_qk_sm120<kDataType, kHeadDim>(Q);
+    K = ffpa::apply_wht_qk_sm120<kDataType, kHeadDim>(K);
+  }
   TORCH_CHECK(attn_bias.numel() == 0 && dropout_p == 0.0,
               "fp8 sm120 path does not support attn_bias/dropout");
   TORCH_CHECK(
@@ -1422,7 +1452,7 @@ void launch_cute_fwd_split_d_m4n2_fp8_sm120(
     int64_t philox_offset, bool fp8_smooth_k, bool fp8_smooth_v,
     int64_t fp8_q_quant_method, int64_t fp8_k_quant_method,
     int64_t fp8_v_quant_method, int64_t fp8_pv_acc_type, int64_t fp8_qk_mm_type,
-    int q_start_row = 0) {
+    int q_start_row = 0, bool hadamard = false) {
   // EXPERIMENT: lower bound lowered from >=768 to >=192 so M4N2 can be A/B'd
   // against M8N1 across all large headdims via FFPA_FP8_FORCE_KERNEL.
   // Production dispatch selects M4N2 only for D>=768 via the top-level
@@ -1435,14 +1465,14 @@ void launch_cute_fwd_split_d_m4n2_fp8_sm120(
           Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale, dropout_p,
           philox_seed, philox_offset, fp8_smooth_k, fp8_smooth_v,
           fp8_q_quant_method, fp8_k_quant_method, fp8_v_quant_method,
-          fp8_pv_acc_type, q_start_row);
+          fp8_pv_acc_type, q_start_row, hadamard);
     else
       launch_cute_fwd_split_d_m4n2_fp8_sm120_impl<kDataType, kHeadDim, kStage,
                                                   false>(
           Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale, dropout_p,
           philox_seed, philox_offset, fp8_smooth_k, fp8_smooth_v,
           fp8_q_quant_method, fp8_k_quant_method, fp8_v_quant_method,
-          fp8_pv_acc_type, q_start_row);
+          fp8_pv_acc_type, q_start_row, hadamard);
   } else {
     TORCH_CHECK(false,
                 "ffpa_attn: cute_tma_fp8 split_d_m4n2 requires D in "
@@ -1591,7 +1621,7 @@ void launch_cute_fwd_persist_d_fp4_sm120_impl(torch::Tensor Q, torch::Tensor K,
                                               torch::Tensor softmax_lse,
                                               int causal, double softmax_scale,
                                               int q_start_row = 0,
-                                              bool fp4_hadamard = false) {
+                                              bool hadamard = false) {
   using namespace cute;
   constexpr int kBr = 128;
   constexpr int kBc = 128;
@@ -1643,14 +1673,14 @@ void launch_cute_fwd_persist_d_fp4_sm120_impl(torch::Tensor Q, torch::Tensor K,
 
   const c10::cuda::OptionalCUDAGuard device_guard(Q.device());
   auto stream = at::cuda::getCurrentCUDAStream();
-  // fp4_hadamard: rotate Q/K copies before the preprocessing chain. Exact
-  // in fp32 math (H orthogonal); only flattens fp4 quantization noise. The
-  // rotated copies are kHeadDim-wide (rotated zero pad cols stored), so all
-  // downstream consumers stay in one rotated domain; V and the hybrid
-  // stage-1 (fp16, earlier in dispatch) are untouched.
-  if (fp4_hadamard) {
-    Q = ffpa_fp4::apply_wht_qk_sm120<kDataType, kHeadDim>(Q);
-    K = ffpa_fp4::apply_wht_qk_sm120<kDataType, kHeadDim>(K);
+  // hadamard: rotate Q/K copies before the preprocessing chain. Exact in
+  // fp32 math (H orthogonal); only moves where quantization noise lands.
+  // The rotated copies are kHeadDim-wide (rotated zero pad cols stored),
+  // so all downstream consumers stay in one rotated domain; V and the
+  // hybrid stage-1 (fp16, earlier in dispatch) are untouched.
+  if (hadamard) {
+    Q = ffpa::apply_wht_qk_sm120<kDataType, kHeadDim>(Q);
+    K = ffpa::apply_wht_qk_sm120<kDataType, kHeadDim>(K);
   }
   const kDataType* k_ptr = reinterpret_cast<const kDataType*>(K.data_ptr());
 
@@ -1806,7 +1836,7 @@ void launch_cute_fwd_persist_d_fp4_sm120(torch::Tensor Q, torch::Tensor K,
                                          torch::Tensor softmax_lse, int causal,
                                          double softmax_scale,
                                          int q_start_row = 0,
-                                         bool fp4_hadamard = false) {
+                                         bool hadamard = false) {
   (void)kStage;  // kStages (3, or 2 at D=256) fixed by the fp4 traits
   auto prop = at::cuda::getCurrentDeviceProperties();
   TORCH_CHECK(prop->major == 12,
@@ -1814,8 +1844,7 @@ void launch_cute_fwd_persist_d_fp4_sm120(torch::Tensor Q, torch::Tensor K,
               prop->major, prop->minor);
   if constexpr (kHeadDim % 64 == 0 && kHeadDim >= 64 && kHeadDim <= 256) {
     launch_cute_fwd_persist_d_fp4_sm120_impl<kDataType, kHeadDim>(
-        Q, K, V, O, softmax_lse, causal, softmax_scale, q_start_row,
-        fp4_hadamard);
+        Q, K, V, O, softmax_lse, causal, softmax_scale, q_start_row, hadamard);
   } else {
     TORCH_CHECK(false,
                 "ffpa_attn: cute_tma_fp4 persist_d requires D in "
@@ -1835,7 +1864,7 @@ void launch_cute_fwd_split_d_fp4_sm120_impl(torch::Tensor Q, torch::Tensor K,
                                             torch::Tensor softmax_lse,
                                             int causal, double softmax_scale,
                                             int q_start_row = 0,
-                                            bool fp4_hadamard = false) {
+                                            bool hadamard = false) {
   using namespace cute;
   constexpr int kBr = 128;
   constexpr int kBc = 128;
@@ -1889,9 +1918,9 @@ void launch_cute_fwd_split_d_fp4_sm120_impl(torch::Tensor Q, torch::Tensor K,
 
   const c10::cuda::OptionalCUDAGuard device_guard(Q.device());
   auto stream = at::cuda::getCurrentCUDAStream();
-  if (fp4_hadamard) {
-    Q = ffpa_fp4::apply_wht_qk_sm120<kDataType, kHeadDim>(Q);
-    K = ffpa_fp4::apply_wht_qk_sm120<kDataType, kHeadDim>(K);
+  if (hadamard) {
+    Q = ffpa::apply_wht_qk_sm120<kDataType, kHeadDim>(Q);
+    K = ffpa::apply_wht_qk_sm120<kDataType, kHeadDim>(K);
   }
   const kDataType* k_ptr = reinterpret_cast<const kDataType*>(K.data_ptr());
 
@@ -2030,7 +2059,7 @@ void launch_cute_fwd_split_d_fp4_sm120(torch::Tensor Q, torch::Tensor K,
                                        torch::Tensor softmax_lse, int causal,
                                        double softmax_scale,
                                        int q_start_row = 0,
-                                       bool fp4_hadamard = false) {
+                                       bool hadamard = false) {
   (void)kStage;  // kStages (3/3) fixed by the fp4 split_d traits
   auto prop = at::cuda::getCurrentDeviceProperties();
   TORCH_CHECK(prop->major == 12,
@@ -2038,8 +2067,7 @@ void launch_cute_fwd_split_d_fp4_sm120(torch::Tensor Q, torch::Tensor K,
               prop->major, prop->minor);
   if constexpr (kHeadDim % 64 == 0 && kHeadDim > 256 && kHeadDim < 768) {
     launch_cute_fwd_split_d_fp4_sm120_impl<kDataType, kHeadDim>(
-        Q, K, V, O, softmax_lse, causal, softmax_scale, q_start_row,
-        fp4_hadamard);
+        Q, K, V, O, softmax_lse, causal, softmax_scale, q_start_row, hadamard);
   } else {
     TORCH_CHECK(false,
                 "ffpa_attn: cute_tma_fp4 split_d requires 64-multiple D in "
@@ -2056,7 +2084,7 @@ template <typename kDataType, const int kHeadDim>
 void launch_cute_fwd_split_d_m4n2_fp4_sm120_impl(
     torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O,
     torch::Tensor softmax_lse, int causal, double softmax_scale,
-    int q_start_row = 0, bool fp4_hadamard = false) {
+    int q_start_row = 0, bool hadamard = false) {
   using namespace cute;
   constexpr int kBr = 64;
   constexpr int kBc = 64;
@@ -2113,9 +2141,9 @@ void launch_cute_fwd_split_d_m4n2_fp4_sm120_impl(
 
   const c10::cuda::OptionalCUDAGuard device_guard(Q.device());
   auto stream = at::cuda::getCurrentCUDAStream();
-  if (fp4_hadamard) {
-    Q = ffpa_fp4::apply_wht_qk_sm120<kDataType, kHeadDim>(Q);
-    K = ffpa_fp4::apply_wht_qk_sm120<kDataType, kHeadDim>(K);
+  if (hadamard) {
+    Q = ffpa::apply_wht_qk_sm120<kDataType, kHeadDim>(Q);
+    K = ffpa::apply_wht_qk_sm120<kDataType, kHeadDim>(K);
   }
   const kDataType* k_ptr = reinterpret_cast<const kDataType*>(K.data_ptr());
 
@@ -2254,7 +2282,7 @@ void launch_cute_fwd_split_d_m4n2_fp4_sm120(torch::Tensor Q, torch::Tensor K,
                                             torch::Tensor softmax_lse,
                                             int causal, double softmax_scale,
                                             int q_start_row = 0,
-                                            bool fp4_hadamard = false) {
+                                            bool hadamard = false) {
   (void)kStage;  // kStages (2/2) fixed by the fp4 m4n2 traits
   auto prop = at::cuda::getCurrentDeviceProperties();
   TORCH_CHECK(prop->major == 12,
@@ -2262,8 +2290,7 @@ void launch_cute_fwd_split_d_m4n2_fp4_sm120(torch::Tensor Q, torch::Tensor K,
               prop->major, prop->minor);
   if constexpr (kHeadDim % 64 == 0 && kHeadDim >= 768 && kHeadDim <= 1024) {
     launch_cute_fwd_split_d_m4n2_fp4_sm120_impl<kDataType, kHeadDim>(
-        Q, K, V, O, softmax_lse, causal, softmax_scale, q_start_row,
-        fp4_hadamard);
+        Q, K, V, O, softmax_lse, causal, softmax_scale, q_start_row, hadamard);
   } else {
     TORCH_CHECK(false,
                 "ffpa_attn: cute_tma_fp4 split_d m4n2 requires 64-multiple D "

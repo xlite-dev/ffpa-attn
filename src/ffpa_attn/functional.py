@@ -260,8 +260,12 @@ class CUDABackend(Backend):
   fp8_hybrid_n_early: int = 256
   fp4_hybrid: bool | None = None
   fp4_hybrid_n_early: int = 256
-  # FP4 only: rotate Q/K by an orthogonal Walsh-Hadamard matrix before
-  # quantization (flattens per-16-group outliers; exact in fp32 math).
+  # Incoherent processing (FlashAttention-3, arXiv:2407.08608 Sec 3.3):
+  # rotate Q/K by an orthogonal Walsh-Hadamard matrix before quantization
+  # to spread per-dim outliers (exact in fp32 math; FA-3's 2.6x lower FP8
+  # RMSE is jointly with block quantization). Each switch is honored only
+  # by its own quant path.
+  fp8_hadamard: bool = False
   fp4_hadamard: bool = False
   # Runtime: propagated from ffpa_attn_func(is_causal=...) by normalize_inputs.
   is_causal: bool = False
@@ -302,6 +306,9 @@ class CUDABackend(Backend):
     )
     assert not self.fp4_hadamard or self.enable_fp4, (
       "fp4_hadamard requires enable_fp4"
+    )
+    assert not self.fp8_hadamard or self.enable_fp8, (
+      "fp8_hadamard requires enable_fp8"
     )
     self._resolve_impl_defaults()
     self.stages = self._default_cuda_stages(
@@ -1024,7 +1031,7 @@ class _FFPAAttnFunc(torch.autograd.Function):
         forward_meta.fp8_hybrid_n_early,
         forward_meta.fp4_hybrid,
         forward_meta.fp4_hybrid_n_early,
-        forward_meta.fp4_hadamard,
+        forward_meta.fp4_hadamard or forward_meta.fp8_hadamard,
       )
     elif isinstance(meta.forward_meta, TritonBackend):
       forward_meta = meta.forward_meta

@@ -1,9 +1,12 @@
-// Walsh-Hadamard pre-rotation for the NVFP4 QK path: rotated Q/K copies
-// are fed to the standard preprocessing chain (km/qm/quant/delta_s/lse).
-// H is orthogonal, so Q H H^T K^T == Q K^T exactly; the rotation only
-// moves where fp4 quantization noise lands (flattens per-16-group outlier
-// amplitudes). Width rule: full-width WHT for pow2 D <= 512, blockdiag
-// H_64 otherwise (fp4 D is always a 64-multiple). The rotated copy is
+// Walsh-Hadamard pre-rotation for the quantized QK paths (fp8 & fp4):
+// rotated Q/K copies are fed to the standard preprocessing chain. H is
+// orthogonal, so Q H H^T K^T == Q K^T exactly; the rotation only moves
+// where quantization noise lands (spreads per-dim outliers across D so
+// per-block/per-group amax drops). Same idea as FlashAttention-3's
+// incoherent processing (arXiv:2407.08608 Sec 3.3: randomized +/-1
+// diagonal x Hadamard fused into RoPE; up to 2.6x lower FP8 RMSE jointly
+// with block quantization). Width rule: full-width WHT for pow2 D <= 512,
+// blockdiag H_64 otherwise (needs kHeadDim % 64 == 0). The rotated copy is
 // kHeadDim-wide: cols >= d_og load as zeros and their rotated values are
 // STORED, so downstream full-width reads (d_og becomes kHeadDim) keep the
 // contraction exact instead of dropping energy into dead pad cols.
@@ -15,7 +18,7 @@
 #include <cuda_fp16.h>
 #include <torch/all.h>
 
-namespace ffpa_fp4 {
+namespace ffpa {
 
 // One warp per (row, kWhtWidth-block); lane l owns cols {base + l + 32*j}.
 // Butterfly distances >= 32 swap register slots in-lane (bit lives in j),
@@ -99,16 +102,17 @@ void launch_wht_qk_t(const torch::Tensor& input, torch::Tensor& output) {
 template <typename T, int kHeadDim>
 torch::Tensor apply_wht_qk_sm120(const torch::Tensor& input) {
   TORCH_CHECK(input.is_contiguous(),
-              "ffpa_attn: fp4 hadamard requires contiguous Q/K");
-  TORCH_CHECK(
-      input.size(3) % 8 == 0 && input.size(3) <= kHeadDim,
-      "ffpa_attn: fp4 hadamard requires head_dim%8==0 and <= ", kHeadDim);
+              "ffpa_attn: hadamard requires contiguous Q/K");
+  TORCH_CHECK(input.size(3) % 8 == 0 && input.size(3) <= kHeadDim,
+              "ffpa_attn: hadamard requires head_dim%8==0 and <= ", kHeadDim);
   constexpr bool kPow2 = (kHeadDim & (kHeadDim - 1)) == 0;
   constexpr int kWhtWidth = (kPow2 && kHeadDim <= 512) ? kHeadDim : 64;
+  static_assert(kHeadDim % kWhtWidth == 0,
+                "blockdiag H_64 needs kHeadDim % 64 == 0");
   torch::Tensor out = torch::empty(
       {input.size(0), input.size(1), input.size(2), kHeadDim}, input.options());
   detail::launch_wht_qk_t<T, kWhtWidth, kHeadDim>(input, out);
   return out;
 }
 
-}  // namespace ffpa_fp4
+}  // namespace ffpa
