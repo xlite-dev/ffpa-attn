@@ -1585,7 +1585,7 @@ void launch_cute_fwd_split_d_sm80(torch::Tensor Q, torch::Tensor K,
 // -> persist_d_ws_fwd_cute_fp4_sm120. Workspaces are 128-padded along
 // seqlen; delta_s tail columns zero-fill (masked -inf in-kernel).
 #ifdef ENABLE_FFPA_TMA_EXT
-template <typename kDataType, const int kHeadDim>
+template <typename kDataType, const int kHeadDim, bool kPvMxfp8 = false>
 void launch_cute_fwd_persist_d_fp4_sm120_impl(torch::Tensor Q, torch::Tensor K,
                                               torch::Tensor V, torch::Tensor O,
                                               torch::Tensor softmax_lse,
@@ -1599,9 +1599,12 @@ void launch_cute_fwd_persist_d_fp4_sm120_impl(torch::Tensor Q, torch::Tensor K,
 
   using ElementO = std::conditional_t<std::is_same_v<kDataType, __half>,
                                       cutlass::half_t, cutlass::bfloat16_t>;
-  using Traits = ffpa_fp4::FFPAAttnCuTePersistDFP4Traits<ElementO, kHeadDim>;
+  using Traits =
+      ffpa_fp4::FFPAAttnCuTePersistDFP4Traits<ElementO, kHeadDim, kPvMxfp8>;
   using Element = typename Traits::Element;
   using ElementSF = typename Traits::ElementSF;
+  using ElementPV = typename Traits::ElementPV;
+  using ElementSFV = typename Traits::ElementSFV;
   auto prop = at::cuda::getCurrentDeviceProperties();
   using SmemLayoutQ = typename Traits::SmemLayoutQ;
   using SmemLayoutK = typename Traits::SmemLayoutK;
@@ -1613,6 +1616,7 @@ void launch_cute_fwd_persist_d_fp4_sm120_impl(torch::Tensor Q, torch::Tensor K,
   using SmemLayoutO = typename Traits::SmemLayoutO;
   using SmemLayoutAtomDS = typename Traits::SmemLayoutAtomDS;
   using BlkScaledConfig = typename Traits::BlkScaledConfig;
+  using BlkScaledConfigV = typename Traits::BlkScaledConfigV;
 
   const int Nb = Q.size(0);
   const int Nh = Q.size(1);
@@ -1635,9 +1639,10 @@ void launch_cute_fwd_persist_d_fp4_sm120_impl(torch::Tensor Q, torch::Tensor K,
   torch::Tensor k4 = torch::empty({Nb, Nh_kv, Nkv_pad, kHeadDim / 2}, opts_u8);
   torch::Tensor sfk =
       torch::empty({Nb, Nh_kv, Nkv_pad, kHeadDim / 16}, opts_u8);
-  torch::Tensor vt4 = torch::empty({Nb, Nh_kv, kHeadDim, Nkv_pad / 2}, opts_u8);
-  torch::Tensor sfvt =
-      torch::empty({Nb, Nh_kv, kHeadDim, Nkv_pad / 16}, opts_u8);
+  torch::Tensor vt4 = torch::empty(
+      {Nb, Nh_kv, kHeadDim, Nkv_pad / (kPvMxfp8 ? 1 : 2)}, opts_u8);
+  torch::Tensor sfvt = torch::empty(
+      {Nb, Nh_kv, kHeadDim, Nkv_pad / (kPvMxfp8 ? 32 : 16)}, opts_u8);
   torch::Tensor qm = torch::empty({Nb, Nh, Mb, kHeadDim}, opts_f32);
   torch::Tensor delta_s;
 
@@ -1680,7 +1685,10 @@ void launch_cute_fwd_persist_d_fp4_sm120_impl(torch::Tensor Q, torch::Tensor K,
   ffpa_fp4::launch_fp4_quant_k_sm120<kHeadDim>(
       K_t, k4, sfk, km_f32.view({Nb, Nh_kv, kHeadDim}), Nkv_pad,
       /*sub_km=*/true);
-  ffpa_fp4::launch_fp4_quant_vt_sm120<kHeadDim>(V_t, vt4, sfvt, Nkv_pad);
+  if constexpr (kPvMxfp8)
+    ffpa_fp4::launch_mxfp8_quant_vt_sm120<kHeadDim>(V_t, vt4, sfvt, Nkv_pad);
+  else
+    ffpa_fp4::launch_fp4_quant_vt_sm120<kHeadDim>(V_t, vt4, sfvt, Nkv_pad);
 
   // delta_s per 128-row Q block via the identity qm@(K-km)^T ==
   // qm@K^T - qm.km^T, fused in one wmma kernel (fp32 out, tail columns
@@ -1715,7 +1723,7 @@ void launch_cute_fwd_persist_d_fp4_sm120_impl(torch::Tensor Q, torch::Tensor K,
   auto tma_k = make_tma_copy(SM90_TMA_LOAD{}, gK, SmemLayoutK{}(_, _, _0{}),
                              Shape<Int<kBc>, Int<kHeadDim>>{}, _1{});
   auto gV =
-      make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(vt4.data_ptr())),
+      make_tensor(make_gmem_ptr(reinterpret_cast<ElementPV*>(vt4.data_ptr())),
                   make_shape(d_total, Nkv_pad), make_stride(Nkv_pad, _1{}));
   auto tma_v = make_tma_copy(SM90_TMA_LOAD{}, gV, SmemLayoutVt{}(_, _, _0{}),
                              Shape<Int<kHeadDim>, Int<kBc>>{}, _1{});
@@ -1740,10 +1748,10 @@ void launch_cute_fwd_persist_d_fp4_sm120_impl(torch::Tensor Q, torch::Tensor K,
   auto tma_sfk = make_tma_copy<uint16_t>(
       SM90_TMA_LOAD{}, mSFK, SmemLayoutSFK{}(_, _, _0{}),
       Shape<Int<kBc>, Int<kHeadDim>>{}, _1{});
-  auto layout_SFVt = BlkScaledConfig::tile_atom_to_shape_SFVt(
+  auto layout_SFVt = BlkScaledConfigV::tile_atom_to_shape_SFVt(
       make_shape(Int<kHeadDim>{}, Nkv_pad, Nh_kv, Nb));
   auto mSFVt =
-      make_tensor(make_gmem_ptr(reinterpret_cast<ElementSF*>(sfvt.data_ptr())),
+      make_tensor(make_gmem_ptr(reinterpret_cast<ElementSFV*>(sfvt.data_ptr())),
                   layout_SFVt);
   auto tma_sfvt = make_tma_copy<uint16_t>(
       SM90_TMA_LOAD{}, mSFVt, SmemLayoutSFVt{}(_, _, _0{}),
@@ -1801,21 +1809,33 @@ void launch_cute_fwd_persist_d_fp4_sm120_impl(torch::Tensor Q, torch::Tensor K,
 }
 
 template <typename kDataType, const int kHeadDim, const int kStage>
-void launch_cute_fwd_persist_d_fp4_sm120(torch::Tensor Q, torch::Tensor K,
-                                         torch::Tensor V, torch::Tensor O,
-                                         torch::Tensor softmax_lse, int causal,
-                                         double softmax_scale,
-                                         int q_start_row = 0,
-                                         bool fp4_hadamard = false) {
+void launch_cute_fwd_persist_d_fp4_sm120(
+    torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O,
+    torch::Tensor softmax_lse, int causal, double softmax_scale,
+    int q_start_row = 0, bool fp4_hadamard = false, int fp4_pv_mm_type = 0) {
   (void)kStage;  // kStages (3, or 2 at D=256) fixed by the fp4 traits
   auto prop = at::cuda::getCurrentDeviceProperties();
   TORCH_CHECK(prop->major == 12,
               "ffpa_attn: the NVFP4 path requires an sm_120 device, got sm_",
               prop->major, prop->minor);
+  const bool pv_fp8 = fp4_pv_mm_type == 1;
+  TORCH_CHECK(fp4_pv_mm_type == 0 || fp4_pv_mm_type == 1,
+              "ffpa_attn: fp4_pv_mm_type must be 0 (fp4) or 1 (fp8)");
   if constexpr (kHeadDim % 64 == 0 && kHeadDim >= 64 && kHeadDim <= 256) {
-    launch_cute_fwd_persist_d_fp4_sm120_impl<kDataType, kHeadDim>(
-        Q, K, V, O, softmax_lse, causal, softmax_scale, q_start_row,
-        fp4_hadamard);
+    if (pv_fp8 && kHeadDim > 192)
+      TORCH_CHECK(false,
+                  "ffpa_attn: fp4_pv_mm_type=fp8 persist_d supports D in "
+                  "{64,128,192} (smem budget), got D=",
+                  kHeadDim);
+    if (pv_fp8) {
+      launch_cute_fwd_persist_d_fp4_sm120_impl<kDataType, kHeadDim, true>(
+          Q, K, V, O, softmax_lse, causal, softmax_scale, q_start_row,
+          fp4_hadamard);
+    } else {
+      launch_cute_fwd_persist_d_fp4_sm120_impl<kDataType, kHeadDim, false>(
+          Q, K, V, O, softmax_lse, causal, softmax_scale, q_start_row,
+          fp4_hadamard);
+    }
   } else {
     TORCH_CHECK(false,
                 "ffpa_attn: cute_tma_fp4 persist_d requires D in "

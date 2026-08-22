@@ -132,6 +132,8 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp4_sm120(
   using namespace cute;
   using Element = typename Traits::Element;
   using ElementSF = typename Traits::ElementSF;
+  using ElementPV = typename Traits::ElementPV;
+  using ElementSFV = typename Traits::ElementSFV;
   using SmemLayoutQ = typename Traits::SmemLayoutQ;
   using SmemLayoutK = typename Traits::SmemLayoutK;
   using SmemLayoutVt = typename Traits::SmemLayoutVt;
@@ -144,8 +146,12 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp4_sm120(
   using TiledMmaPV = typename Traits::TiledMmaPV;
   using SmemCopyAtomQ = typename Traits::SmemCopyAtomQ;
   using SmemCopyAtomKV = typename Traits::SmemCopyAtomKV;
+  using SmemCopyAtomV = typename Traits::SmemCopyAtomV;
   using SmemCopyAtomSF = typename Traits::SmemCopyAtomSF;
+  using SmemCopyAtomSFV = typename Traits::SmemCopyAtomSFV;
   using BlkScaledConfig = typename Traits::BlkScaledConfig;
+  using BlkScaledConfigV = typename Traits::BlkScaledConfigV;
+  constexpr bool kPvMxfp8 = Traits::kPvMxfp8;
 
   constexpr int kBr = Traits::kBr;
   constexpr int kBc = Traits::kBc;
@@ -221,7 +227,7 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp4_sm120(
           make_shape(Nq_pad, Int<kHeadDim>{}, Nh, Nb));
       auto layout_SFK = BlkScaledConfig::tile_atom_to_shape_SFQKV(
           make_shape(Nkv_pad, Int<kHeadDim>{}, Nh_kv, Nb));
-      auto layout_SFVt = BlkScaledConfig::tile_atom_to_shape_SFVt(
+      auto layout_SFVt = BlkScaledConfigV::tile_atom_to_shape_SFVt(
           make_shape(Int<kHeadDim>{}, Nkv_pad, Nh_kv, Nb));
       auto layout_DS = tile_to_shape(typename Traits::SmemLayoutAtomDS{},
                                      make_shape(Nq_pad, Nkv_pad, Nh, Nb),
@@ -248,8 +254,8 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp4_sm120(
       auto sDS =
           make_tensor(make_smem_ptr<float>(shm + kOffDS), SmemLayoutDS{});
       auto sV =
-          make_tensor(make_smem_ptr<Element>(shm + kOffV), SmemLayoutVt{});
-      auto sSFVt = make_tensor(make_smem_ptr<ElementSF>(shm + kOffSFVt),
+          make_tensor(make_smem_ptr<ElementPV>(shm + kOffV), SmemLayoutVt{});
+      auto sSFVt = make_tensor(make_smem_ptr<ElementSFV>(shm + kOffSFVt),
                                SmemLayoutSFVt{});
 
       auto tQsQ = q_slice.partition_D(sQ);
@@ -420,9 +426,9 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp4_sm120(
   auto sSFK =
       make_tensor(make_smem_ptr<ElementSF>(shm + kOffSFK), SmemLayoutSFK{});
   auto sDS = make_tensor(make_smem_ptr<float>(shm + kOffDS), SmemLayoutDS{});
-  auto sV = make_tensor(make_smem_ptr<Element>(shm + kOffV), SmemLayoutVt{});
+  auto sV = make_tensor(make_smem_ptr<ElementPV>(shm + kOffV), SmemLayoutVt{});
   auto sSFVt =
-      make_tensor(make_smem_ptr<ElementSF>(shm + kOffSFVt), SmemLayoutSFVt{});
+      make_tensor(make_smem_ptr<ElementSFV>(shm + kOffSFVt), SmemLayoutSFVt{});
 
   // Register fragments for both mmas. partition_fragment_{A,B} mirror the
   // blockscaled operand convention: each operand is a (data, SF) pair, so
@@ -436,8 +442,8 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp4_sm120(
   Tensor tSrSFQ = partition_fragment_SFA(sSFQ, thread_mma_qk);
   Tensor tSrSFK = partition_fragment_SFB(sSFK(_, _, Int<0>{}), thread_mma_qk);
   Tensor tOrSFVt = partition_fragment_SFB(sSFVt(_, _, Int<0>{}), thread_mma_pv);
-  Tensor tOrP = make_tensor_like<Element>(typename Traits::LayoutP{});
-  Tensor tOrSFP = make_tensor<ElementSF>(typename Traits::LayoutSFP{});
+  Tensor tOrP = make_tensor_like<ElementPV>(typename Traits::LayoutP{});
+  Tensor tOrSFP = make_tensor<ElementSFV>(typename Traits::LayoutSFP{});
 
   auto smem_tiled_copy_Q = make_tiled_copy_A(SmemCopyAtomQ{}, tiled_mma_qk);
   auto smem_thr_copy_Q = smem_tiled_copy_Q.get_thread_slice(wg_tid);
@@ -450,7 +456,7 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp4_sm120(
   Tensor tSsK =
       smem_thr_copy_K.partition_S(as_position_independent_swizzle_tensor(sK));
 
-  auto smem_tiled_copy_V = make_tiled_copy_B(SmemCopyAtomKV{}, tiled_mma_pv);
+  auto smem_tiled_copy_V = make_tiled_copy_B(SmemCopyAtomV{}, tiled_mma_pv);
   auto smem_thr_copy_V = smem_tiled_copy_V.get_thread_slice(wg_tid);
   Tensor tOsVt =
       smem_thr_copy_V.partition_S(as_position_independent_swizzle_tensor(sV));
@@ -472,7 +478,7 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp4_sm120(
       as_position_independent_swizzle_tensor(sSFK));
 
   auto smem_tiled_copy_SFV =
-      make_tiled_copy_impl(SmemCopyAtomSF{}, get_layoutSFB_TV(tiled_mma_pv),
+      make_tiled_copy_impl(SmemCopyAtomSFV{}, get_layoutSFB_TV(tiled_mma_pv),
                            make_shape(size<1>(tile_shape(tiled_mma_pv)),
                                       size<2>(tile_shape(tiled_mma_pv))));
   auto smem_thr_copy_SFV = smem_tiled_copy_SFV.get_thread_slice(wg_tid);
@@ -489,10 +495,20 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp4_sm120(
   Tensor tSrS = partition_fragment_C(tiled_mma_qk, Shape<Int<kBr>, Int<kBc>>{});
   Tensor tSrS_conversion_view =
       make_tensor(tSrS.data(), convert_to_conversion_layout(tSrS.layout()));
-  // Per-16-token-group absmax of the P2-domain scores; softmax fills it,
-  // quantize_and_pack_p turns it into the ue4m3 SFP operand.
-  Tensor AbsMaxP = make_tensor_like<float>(make_layout(shape(group<1, 4>(
-      flatten(tSrS_conversion_view.layout()(make_coord(_0{}, _), _, _))))));
+  Tensor tSrS_reduction_view =
+      make_tensor(tSrS.data(), convert_to_reduction_layout(tSrS.layout()));
+  // Per-token-group absmax of the P-domain scores; softmax fills it, the
+  // packer turns it into the SFP operand. NVFP4: 16-token groups derived
+  // from the conversion view; MXFP8: 32-token groups (= one mma-k32 block,
+  // the reduction view's MmaN extent).
+  auto AbsMaxP = [&]() {
+    if constexpr (kPvMxfp8)
+      return make_tensor_like<float>(make_layout(make_shape(
+          size<0>(tSrS_reduction_view), size<1, 1>(tSrS_reduction_view))));
+    else
+      return make_tensor_like<float>(make_layout(shape(group<1, 4>(
+          flatten(tSrS_conversion_view.layout()(make_coord(_0{}, _), _, _))))));
+  }();
 
   auto cS = make_identity_tensor(Shape<Int<kBr>, Int<kBc>>{});
   auto tScS = thread_mma_qk.partition_C(cS);
@@ -505,7 +521,9 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp4_sm120(
       partition_fragment_C(tiled_mma_pv, Shape<Int<kBr>, Int<kHeadDim>>{});
 
   constexpr int kSoftmaxRows = 2 * (2 * kBr / kConsumerThreads);
-  SoftmaxFused<kSoftmaxRows> softmax_fused;
+  std::conditional_t<kPvMxfp8, SoftmaxFusedMxfp8<kSoftmaxRows>,
+                     SoftmaxFused<kSoftmaxRows>>
+      softmax_fused;
   const float scale_orig = scale;
   const float softmax_scale_log2 = scale * FFPA_M_LOG2E;
 
@@ -640,11 +658,21 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp4_sm120(
       TmaBarrier::wait(&v_full[v_stg], v_phase);
       cutlass::arch::fence_view_async_shared();
 
+      auto gemm_rs_pv = [&](auto& tgt) {
+        if constexpr (kPvMxfp8)
+          gemm_rs_mxfp8(tgt, tOrP, tOrSFP, tOrVt, tOrSFVt, tOsVt, tOsSFVt,
+                        tiled_mma_pv, smem_tiled_copy_V, smem_thr_copy_V,
+                        smem_tiled_copy_SFV, smem_thr_copy_SFV, AbsMaxP,
+                        tSrS_reduction_view, v_empty, v_stg, wg_tid & 31);
+        else
+          gemm_rs_fp4(tgt, tOrP, tOrSFP, tOrVt, tOrSFVt, tOsVt, tOsSFVt,
+                      tiled_mma_pv, smem_tiled_copy_V, smem_thr_copy_V,
+                      smem_tiled_copy_SFV, smem_thr_copy_SFV, AbsMaxP,
+                      tSrS_conversion_view, v_empty, v_stg);
+      };
+
       if (kv_tile == 0) {
-        gemm_rs_fp4(tOrO_store, tOrP, tOrSFP, tOrVt, tOrSFVt, tOsVt, tOsSFVt,
-                    tiled_mma_pv, smem_tiled_copy_V, smem_thr_copy_V,
-                    smem_tiled_copy_SFV, smem_thr_copy_SFV, AbsMaxP,
-                    tSrS_conversion_view, v_empty, v_stg);
+        gemm_rs_pv(tOrO_store);
       } else {
         // scores_scale == 1.0f exactly when the row max did not move this
         // tile (~96% of dense tiles): O = O*1 + O_new needs no rescale at
@@ -654,16 +682,10 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp4_sm120(
         if (__any_sync(0xffffffff, need_rescale)) {
           Tensor tOrO = make_fragment_like(tOrO_store);
           clear(tOrO);
-          gemm_rs_fp4(tOrO, tOrP, tOrSFP, tOrVt, tOrSFVt, tOsVt, tOsSFVt,
-                      tiled_mma_pv, smem_tiled_copy_V, smem_thr_copy_V,
-                      smem_tiled_copy_SFV, smem_thr_copy_SFV, AbsMaxP,
-                      tSrS_conversion_view, v_empty, v_stg);
+          gemm_rs_pv(tOrO);
           softmax_fused.rescale_o(tOrO_store, tOrO);
         } else {
-          gemm_rs_fp4(tOrO_store, tOrP, tOrSFP, tOrVt, tOrSFVt, tOsVt, tOsSFVt,
-                      tiled_mma_pv, smem_tiled_copy_V, smem_thr_copy_V,
-                      smem_tiled_copy_SFV, smem_thr_copy_SFV, AbsMaxP,
-                      tSrS_conversion_view, v_empty, v_stg);
+          gemm_rs_pv(tOrO_store);
         }
       }
     }

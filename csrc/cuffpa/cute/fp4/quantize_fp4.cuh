@@ -54,6 +54,22 @@ inline __device__ uint32_t fp32_vec_to_e2m1(float2* array) {
 #endif
 }
 
+// 2 float2 (4 values) -> one uint32 of packed e4m3 (byte i = value i).
+inline __device__ uint32_t fp32_vec_to_e4m3(float2* array) {
+  uint32_t val;
+  asm volatile(
+      "{\n"
+      ".reg .b16 lo;\n"
+      ".reg .b16 hi;\n"
+      "cvt.rn.satfinite.e4m3x2.f32   lo, %2, %1;\n"
+      "cvt.rn.satfinite.e4m3x2.f32   hi, %4, %3;\n"
+      "mov.b32 %0, {lo, hi};\n"
+      "}"
+      : "=r"(val)
+      : "f"(array[0].x), "f"(array[0].y), "f"(array[1].x), "f"(array[1].y));
+  return val;
+}
+
 template <typename T>
 struct Fp4TypeConverter {
   using Type2 = void;
@@ -393,6 +409,160 @@ __global__ void fp4_quant_trans_kernel(
   }
 }
 
+// MXFP8 V^T quantize (fp4_pv_mm_type=fp8): V^T as e4m3 data + ue8m0 SF per
+// (d-row, 32-token group). Same staging window, thread mapping and guarded
+// loads as fp4_quant_trans_kernel; the only quantization change is the SF:
+// two adjacent pass threads (16 tokens each) merge their absmax via
+// shfl_xor(1) into the 32-token group scale, ceiled to a power of two
+// (2^ceil(log2(amax/448))), so the scaled data peaks within the e4m3
+// range. The even thread of each pair stores the single SF byte; the gmem
+// SF layout follows BlockScaledConfig<32> (same 64x4-block formula, group
+// index = token/32).
+template <typename T, int kHeadDim>
+__global__ void mxfp8_quant_trans_kernel(
+    const T* __restrict__ input, uint8_t* __restrict__ output,
+    uint8_t* __restrict__ output_sf, int num_tokens, int stride_bz_input,
+    int stride_h_input, int stride_seq_input, int stride_bz_output,
+    int stride_h_output, int stride_d_output, int stride_bz_output_sf,
+    int stride_h_output_sf, int stride_d_output_sf, int d_og) {
+  using PackedVec = Fp4PackedVec<T>;
+  constexpr int kTokensPerBlock =
+      (kHeadDim <= 128) ? 128 : ((kHeadDim <= 768) ? 64 : 32);
+  constexpr int kThreadsPerToken = 4;
+  constexpr int kVecsPerThread = kHeadDim / 64;
+  constexpr int kSFGroupsPerToken = kHeadDim / 16;
+  constexpr int kThreadsPerSeq = kTokensPerBlock / kCVTFp4EltsPerThread;
+  constexpr int kDRowsPerPass =
+      kTokensPerBlock * kThreadsPerToken / kThreadsPerSeq;
+  constexpr bool kDynamicSmem =
+      kTokensPerBlock * kHeadDim * int(sizeof(T)) > 48 * 1024;
+  static_assert(kHeadDim % 64 == 0 && kHeadDim % kDRowsPerPass == 0,
+                "mxfp8 quantize requires 64-multiple D");
+
+  const int batch_id = blockIdx.y;
+  const int head_id = blockIdx.z;
+  const int token_block_id = blockIdx.x;
+  const int token_id =
+      token_block_id * kTokensPerBlock + threadIdx.x / kThreadsPerToken;
+  const int slice = threadIdx.x % kThreadsPerToken;
+
+  PackedVec in_vec[kVecsPerThread];
+#pragma unroll
+  for (int v = 0; v < kVecsPerThread; v++) {
+#pragma unroll
+    for (int i = 0; i < kCVTFp4EltsPerThread / 2; i++) {
+      reinterpret_cast<uint32_t&>(in_vec[v].elts[i]) = 0;
+    }
+  }
+  if (token_id < num_tokens) {
+    const PackedVec* __restrict__ src = reinterpret_cast<const PackedVec*>(
+        input + batch_id * stride_bz_input + head_id * stride_h_input +
+        token_id * stride_seq_input +
+        slice * kVecsPerThread * kCVTFp4EltsPerThread);
+    const typename Fp4TypeConverter<T>::Type2* __restrict__ src2 =
+        reinterpret_cast<const typename Fp4TypeConverter<T>::Type2*>(src);
+#pragma unroll
+    for (int v = 0; v < kVecsPerThread; v++) {
+      const int off = (slice * kVecsPerThread + v) * kCVTFp4EltsPerThread;
+      if (off + kCVTFp4EltsPerThread <= d_og) {
+        in_vec[v] = src[v];
+      } else {
+#pragma unroll
+        for (int h = 0; h < 2; h++) {
+          if (off + h * 8 < d_og) {
+#pragma unroll
+            for (int i = 0; i < 4; i++)
+              in_vec[v].elts[h * 4 + i] = src2[v * 8 + h * 4 + i];
+          }
+        }
+      }
+    }
+  }
+
+  extern __shared__ __align__(16) char quant_dyn_shm[];
+  __shared__ T quant_static_shm[kDynamicSmem ? 1 : kTokensPerBlock * kHeadDim];
+  T* shared_input =
+      kDynamicSmem ? reinterpret_cast<T*>(quant_dyn_shm) : quant_static_shm;
+  PackedVec* shared_pv = reinterpret_cast<PackedVec*>(shared_input);
+#pragma unroll
+  for (int v = 0; v < kVecsPerThread; v++) {
+    shared_pv[(threadIdx.x / kThreadsPerToken) * kSFGroupsPerToken +
+              slice * kVecsPerThread + v] = in_vec[v];
+  }
+  __syncthreads();
+
+  uint8_t* output_sf_base =
+      output_sf + batch_id * stride_bz_output_sf + head_id * stride_h_output_sf;
+  const uint32_t seq_lane = threadIdx.x % kThreadsPerSeq;
+  const uint32_t row_id_local = threadIdx.x / kThreadsPerSeq;
+  const uint32_t group_col_local =
+      token_block_id * (kTokensPerBlock / 32) + seq_lane / 2;
+  const uint32_t sf_col_offset =
+      (group_col_local / 4) * 256 + (group_col_local % 4);
+  const uint32_t offset_local =
+      sf_col_offset + (row_id_local / 16) * 4 + (row_id_local % 16) * 16;
+#pragma unroll
+  for (int p = 0; p < kHeadDim / kDRowsPerPass; p++) {
+    const int d = p * kDRowsPerPass + threadIdx.x / kThreadsPerSeq;
+    float2 fp2Vals[kCVTFp4EltsPerThread / 2];
+#pragma unroll
+    for (int i = 0; i < kCVTFp4EltsPerThread / 2; i++) {
+      const int tok0 = seq_lane * kCVTFp4EltsPerThread + 2 * i;
+      if constexpr (std::is_same<T, half>::value) {
+        fp2Vals[i].x = __half2float(shared_input[tok0 * kHeadDim + d]);
+        fp2Vals[i].y = __half2float(shared_input[(tok0 + 1) * kHeadDim + d]);
+      } else {
+        fp2Vals[i].x = __bfloat162float(shared_input[tok0 * kHeadDim + d]);
+        fp2Vals[i].y =
+            __bfloat162float(shared_input[(tok0 + 1) * kHeadDim + d]);
+      }
+    }
+
+    float vecMax = 0.f;
+#pragma unroll
+    for (int i = 0; i < kCVTFp4EltsPerThread / 2; i++) {
+      vecMax = fmaxf(vecMax, fmaxf(fabsf(fp2Vals[i].x), fabsf(fp2Vals[i].y)));
+    }
+    // 32-token group absmax across the neighbouring pass thread.
+    const float groupMax =
+        fmaxf(vecMax, __shfl_xor_sync(0xFFFFFFFFu, vecMax, 1));
+
+    float sf = groupMax / 448.f;
+    int e = sf > 0.f ? int(ceilf(log2f(sf))) : -127;
+    if (e < -127)
+      e = -127;
+    if (e > 128)
+      e = 128;
+    if (e < 128 && ldexpf(1.f, e) < sf)
+      e += 1;
+    const float scale = ldexpf(1.f, -e);
+
+#pragma unroll
+    for (int i = 0; i < kCVTFp4EltsPerThread / 2; i++) {
+      fp2Vals[i].x = fp2Vals[i].x * scale;
+      fp2Vals[i].y = fp2Vals[i].y * scale;
+    }
+
+    uint32_t e4m3Vals[kCVTFp4EltsPerThread / 4];
+#pragma unroll
+    for (int i = 0; i < kCVTFp4EltsPerThread / 4; i++) {
+      e4m3Vals[i] = fp32_vec_to_e4m3(fp2Vals + i * 2);
+    }
+
+    reinterpret_cast<uint4*>(output + batch_id * stride_bz_output +
+                             head_id * stride_h_output + d * stride_d_output +
+                             (token_block_id * kTokensPerBlock +
+                              seq_lane * kCVTFp4EltsPerThread))[0] =
+        reinterpret_cast<uint4*>(e4m3Vals)[0];
+
+    if ((seq_lane & 1) == 0) {
+      reinterpret_cast<uint8_t*>(output_sf_base +
+                                 (d / 64) * 64 * stride_d_output_sf +
+                                 offset_local)[0] = uint8_t(e + 127);
+    }
+  }
+}
+
 // Per-(b,h) 128-row block means of Q: qm (B,H,ceil(Nq/128),D) fp32. Tail
 // blocks average only the valid rows. Pad cols [d_og, kHeadDim) stay 0.
 template <typename T, int kHeadDim>
@@ -528,6 +698,36 @@ void launch_fp4_quant_vt_t(const torch::Tensor& input, torch::Tensor& output,
       output_sf.stride(2), static_cast<int>(input.size(3)));
 }
 
+template <typename T, int kHeadDim>
+void launch_mxfp8_quant_vt_t(const torch::Tensor& input, torch::Tensor& output,
+                             torch::Tensor& output_sf, int64_t n_pad) {
+  constexpr int kTokensPerBlock =
+      (kHeadDim <= 128) ? 128 : ((kHeadDim <= 768) ? 64 : 32);
+  constexpr bool kDynamicSmem =
+      kTokensPerBlock * kHeadDim * int(sizeof(T)) > 48 * 1024;
+  constexpr int kSmemBytes =
+      kDynamicSmem ? kTokensPerBlock * kHeadDim * int(sizeof(T)) : 0;
+  const int num_tokens = input.size(1);
+  auto stream = at::cuda::getCurrentCUDAStream();
+  dim3 block(kTokensPerBlock * 4, 1, 1);
+  dim3 grid((n_pad + kTokensPerBlock - 1) / kTokensPerBlock, input.size(0),
+            input.size(2));
+  auto kernel = mxfp8_quant_trans_kernel<T, kHeadDim>;
+  if constexpr (kDynamicSmem) {
+    TORCH_CHECK(
+        cudaFuncSetAttribute(kernel,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize,
+                             kSmemBytes) == cudaSuccess,
+        "mxfp8 V-transpose quantize smem opt-in failed for D=", kHeadDim);
+  }
+  kernel<<<grid, block, kSmemBytes, stream>>>(
+      reinterpret_cast<const T*>(input.data_ptr()), output.data_ptr<uint8_t>(),
+      output_sf.data_ptr<uint8_t>(), num_tokens, input.stride(0),
+      input.stride(2), input.stride(1), output.stride(0), output.stride(1),
+      output.stride(2), output_sf.stride(0), output_sf.stride(1),
+      output_sf.stride(2), static_cast<int>(input.size(3)));
+}
+
 }  // namespace detail
 
 template <int kHeadDim>
@@ -579,6 +779,23 @@ inline void launch_fp4_quant_vt_sm120(const torch::Tensor& input,
   } else {
     detail::launch_fp4_quant_vt_t<__nv_bfloat16, kHeadDim>(input, output,
                                                            output_sf, n_pad);
+  }
+}
+
+template <int kHeadDim>
+inline void launch_mxfp8_quant_vt_sm120(const torch::Tensor& input,
+                                        torch::Tensor& output,
+                                        torch::Tensor& output_sf,
+                                        int64_t n_pad) {
+  TORCH_CHECK(input.size(3) % 8 == 0 && input.size(3) <= kHeadDim &&
+                  kHeadDim % 64 == 0 && kHeadDim >= 64 && kHeadDim <= 1024,
+              "fp4 quantize requires head_dim %8==0, D <= ", kHeadDim);
+  if (input.scalar_type() == at::ScalarType::Half) {
+    detail::launch_mxfp8_quant_vt_t<half, kHeadDim>(input, output, output_sf,
+                                                    n_pad);
+  } else {
+    detail::launch_mxfp8_quant_vt_t<__nv_bfloat16, kHeadDim>(input, output,
+                                                             output_sf, n_pad);
   }
 }
 

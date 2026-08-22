@@ -263,6 +263,9 @@ class CUDABackend(Backend):
   # FP4 only: rotate Q/K by an orthogonal Walsh-Hadamard matrix before
   # quantization (flattens per-16-group outliers; exact in fp32 math).
   fp4_hadamard: bool = False
+  # FP4 only: PV MMA dtype; "fp4" (NVFP4 e2m1+ue4m3/16) or "fp8" (MXFP8
+  # e4m3+ue8m0/32, QK stays NVFP4). smem budget limits fp8 to D<=192.
+  fp4_pv_mm_type: str = "fp4"
   # Runtime: propagated from ffpa_attn_func(is_causal=...) by normalize_inputs.
   is_causal: bool = False
 
@@ -302,6 +305,13 @@ class CUDABackend(Backend):
     )
     assert not self.fp4_hadamard or self.enable_fp4, (
       "fp4_hadamard requires enable_fp4"
+    )
+    assert self.fp4_pv_mm_type in ("fp4", "fp8"), (
+      f"fp4_pv_mm_type must be 'fp4' or 'fp8', "
+      f"got {self.fp4_pv_mm_type!r}"
+    )
+    assert self.fp4_pv_mm_type == "fp4" or self.enable_fp4, (
+      "fp4_pv_mm_type requires enable_fp4"
     )
     self._resolve_impl_defaults()
     self.stages = self._default_cuda_stages(
@@ -1025,6 +1035,7 @@ class _FFPAAttnFunc(torch.autograd.Function):
         forward_meta.fp4_hybrid,
         forward_meta.fp4_hybrid_n_early,
         forward_meta.fp4_hadamard,
+        1 if forward_meta.fp4_pv_mm_type == "fp8" else 0,
       )
     elif isinstance(meta.forward_meta, TritonBackend):
       forward_meta = meta.forward_meta

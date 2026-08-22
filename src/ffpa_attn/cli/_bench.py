@@ -444,6 +444,13 @@ def _parse_args() -> argparse.Namespace:
     "--fp8-hybrid. Default auto: enabled when causal+fp4.",
   )
   parser.add_argument(
+    "--fp4-pv-mm-type",
+    choices=["fp4", "fp8"],
+    default="fp4",
+    help="FP4 PV MMA dtype: 'fp4' (NVFP4 e2m1) or 'fp8' (MXFP8 e4m3 + "
+    "ue8m0/32, QK stays NVFP4; smem budget limits it to D<=192).",
+  )
+  parser.add_argument(
     "--fp4-hybrid-n-early",
     type=int,
     default=256,
@@ -668,6 +675,8 @@ def _resolve_directional_cli_flags(
     args.fp4_hybrid = None
   if not hasattr(args, "fp4_hybrid_n_early"):
     args.fp4_hybrid_n_early = 256
+  if not hasattr(args, "fp4_pv_mm_type"):
+    args.fp4_pv_mm_type = "fp4"
   return args
 
 
@@ -1761,6 +1770,7 @@ def _benchmark_rows(
         fp8_hybrid_n_early=args.fp8_hybrid_n_early,
         fp4_hybrid=args.fp4_hybrid,
         fp4_hybrid_n_early=args.fp4_hybrid_n_early,
+        fp4_pv_mm_type=args.fp4_pv_mm_type,
       ),
     )
   if args.backward:

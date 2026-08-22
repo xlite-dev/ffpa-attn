@@ -400,6 +400,213 @@ CUTE_DEVICE void quantize_and_pack_p(MmaK mma_k, AbsMaxTensor& AbsMaxP,
     }
   }
 }
+// ===== MXFP8 PV path (QK stays NVFP4; PV = e4m3 data + ue8m0 per-32 SF) ===
+// Numerical contract (the NVFP4 two-level scheme at 32 granularity):
+//   SF = 2^ceil((a32 - m) * L)                ue8m0 power, <= 1
+//   q  = exp2((s - m) * L + log2(448) - e)    in (0, 448], e4m3 domain
+// where a32 is the per-32-token group absmax and m the row max (both in the
+// raw score domain). The ceil at worst halves the q headroom (peak lands in
+// [224, 448]) and q never saturates; row_sum absorbs SF via FMA so the 448
+// factor cancels exactly between O and row_sum.
+
+// 4 floats -> 4 e4m3 packed into one uint32 (byte i = f_i).
+CUTE_DEVICE void packed_float_to_e4m3(float const& f0, float const& f1,
+                                      float const& f2, float const& f3,
+                                      uint32_t& out) {
+  asm volatile(
+      "{\n"
+      ".reg .b16 lo;\n"
+      ".reg .b16 hi;\n"
+      "cvt.rn.satfinite.e4m3x2.f32   lo, %2, %1;\n"
+      "cvt.rn.satfinite.e4m3x2.f32   hi, %4, %3;\n"
+      "mov.b32 %0, {lo, hi};\n"
+      "}"
+      : "=r"(out)
+      : "f"(f0), "f"(f1), "f"(f2), "f"(f3));
+}
+
+// Exact exponent of a positive power of two (SF values are powers of two
+// by construction), biased into the ue8m0 byte encoding.
+CUTE_DEVICE uint8_t pow2_to_ue8m0(float sf) {
+  int e = (__float_as_int(sf) >> 23) - 127;
+  return uint8_t(e + 127);
+}
+
+// Online softmax for the MXFP8 PV domain. Group granularity 32 = one
+// mma-k32 block (local 8 + shfl 1 + shfl 2), so AbsMaxP is indexed by the
+// same (row, group) pair the PV k loop walks. finalize/rescale_* come from
+// the base class (granularity-independent). AbsMaxP ends holding the group
+// SF as an f32 power of two for quantize_and_pack_p_mxfp8.
+template <int Rows>
+struct SoftmaxFusedMxfp8 : SoftmaxFused<Rows> {
+  using Base = SoftmaxFused<Rows>;
+  static constexpr float e4m3_full_log2 = 8.807354922057604f;  // log2(448)
+
+  template <bool FirstTile, bool InfCheck = false, typename TensorAcc,
+            typename TensorMax>
+  CUTE_DEVICE void online_softmax_with_quant(TensorAcc& acc, TensorMax& AbsMaxP,
+                                             const float L) {
+    Tensor rv =
+        make_tensor(acc.data(), convert_to_reduction_layout(acc.layout()));
+    Tensor prev_max = make_fragment_like(Base::row_max);
+    cute::copy(Base::row_max, prev_max);
+    if constexpr (FirstTile) {
+      fill(Base::row_max, -INFINITY);
+      clear(Base::row_sum);
+      fill(Base::scores_scale, 1.f);
+    }
+
+    // 32-group absmax in the raw score domain
+    CUTE_UNROLL
+    for (int mi = 0; mi < size<0>(rv); mi++) {
+      CUTE_UNROLL
+      for (int g = 0; g < size<1, 1>(rv); g++) {
+        float m = -INFINITY;
+        CUTE_UNROLL
+        for (int ei = 0; ei < size<1, 0>(rv); ei++)
+          m = fmaxf(m, rv(mi, make_coord(ei, g)));
+        float m16 = fmaxf(m, __shfl_xor_sync(0xFFFFFFFFu, m, 1));
+        AbsMaxP(mi, g) = fmaxf(m16, __shfl_xor_sync(0xFFFFFFFFu, m16, 2));
+      }
+      float rm = -INFINITY;
+      CUTE_UNROLL
+      for (int g = 0; g < size<1, 1>(rv); g++)
+        rm = fmaxf(rm, AbsMaxP(mi, g));
+      Base::row_max(mi) = fmaxf(prev_max(mi), rm);
+      const float cur = (InfCheck && Base::row_max(mi) == -INFINITY)
+                            ? 0.f
+                            : Base::row_max(mi);
+      if constexpr (!FirstTile) {
+        Base::scores_scale(mi) = ptx_exp2((prev_max(mi) - cur) * L);
+        Base::row_sum(mi) *= Base::scores_scale(mi);
+      }
+    }
+
+    // Emit q in the e4m3 domain and fold row_sum with the group SF.
+    CUTE_UNROLL
+    for (int mi = 0; mi < size<0>(rv); mi++) {
+      const float rm = Base::row_max(mi);
+      CUTE_UNROLL
+      for (int g = 0; g < size<1, 1>(rv); g++) {
+        const float a = AbsMaxP(mi, g);
+        const float a_arg = (a == -INFINITY) ? 0.f : a;
+        float shift = (a_arg - rm) * L;
+        int e = shift > -127.f ? int(ceilf(shift)) : -127;
+        if (e > 128)
+          e = 128;
+        const float sf = ldexpf(1.f, e);
+        AbsMaxP(mi, g) = sf;
+        const float c = fmaf(-rm, L, e4m3_full_log2 - float(e));
+        CUTE_UNROLL
+        for (int ei = 0; ei < size<1, 0>(rv); ei++) {
+          const float s = rv(mi, make_coord(ei, g));
+          const float q = (s == -INFINITY) ? 0.f : ptx_exp2(fmaf(s, L, c));
+          rv(mi, make_coord(ei, g)) = q;
+          Base::row_sum(mi) = fmaf(q, sf, Base::row_sum(mi));
+        }
+      }
+    }
+  }
+};
+
+// Quantize one mma-k32 slice of the softmax-emitted scores into the MXFP8
+// PV A operand (e4m3 data + ue8m0 SFA). Unlike the NVFP4 packer the A
+// fragment's (m,k) slot map differs from the QK C fragment's (m,n): within
+// a quad, value (vm, blk, j) at lane s is needed by lane 2*(blk&1)+(s>>1),
+// resolved with three uniform 8-wide shuffle rounds (one dead round per
+// lane keeps the warp path lockstep). SFA placement follows the T4 probe:
+// Pack the softmaxed scores of one kv tile into the K-fused MXFP8 A
+// fragment (64 e4m3 = 16 u32 per thread) plus its ue8m0 SFA bytes.
+//
+// Fragment contract (SM80-family 16x8 mma, cf. CUTLASS
+// SM80_16x8x32_S32S8S8S32_TN ALayout, which this atom extends 4x along K):
+// with lane t, quad position q = t&3, row group g = t>>4:
+//   A (u32 reg i, byte b): rows m = g + 8*(i&1),
+//                           k    = 4q + b + 16*((i>>1)&1) + 32*(i>>2)
+//   slot (= 4i + b) = b + 4*m1 + 8*m2 + 16*seg
+//     (m1 = i&1, m2 = (i>>1)&1, seg = i>>2): k bits {2,3} pick the lane's
+//     quad position, all other k bits pick the slot.
+//   SFA byte s of lane t scales row m = g + 8*(t&1), k segment s (the
+//     SFALayout thread modes ((2,2,8))/((8,0,1)): t&1 selects the row half,
+//     (t>>1)&1 is a redundant broadcast).
+//
+// The QK NVFP4 C fragment (CLayout ((4,8),((2,4),2))/((32,1),((16,128),8)))
+// holds rows m = g + 8*m1 and, at reduction-view index (m1,(n8,mn)), the
+// LOGICAL column N = 32*mn + 2q + (n8&1) + 8*(n8>>1). K rows are stored
+// under the kv_perm32 interleave, so logical column N carries the score of
+// TOKEN t = kv_perm32(N); V^T storage is natural, so the A slot for token
+// t is t. The permutation reorders the 5 low bits as (b, j0, j1, q0, q1)
+// (b = n8&1, j* = n8>>1 bits, q* = quad bits): the A slot of a value is
+// then quad = j1 + 2*q0, u32 i = m1 + 2*q1 + 4*mn, byte = b + 2*j0 - the
+// byte and the (m1, mn) pair never change, only the owning lane and the
+// u32 bit 1 do. So: pack locally into u32 grouped by j1 (i0 = m1 + 2*j1 +
+// 4*mn, one j1 per u32), then each lane PULLS its 16 final u32 with one
+// directed __shfl_sync each (source quad = l1 + 2*q1s, source idx = m1 +
+// 2*l0 + 4*seg). 16 shuffles and 16 u32 of scratch replace the earlier
+// 256-shuffle float-domain routing (which spilled and cost ~15x).
+template <typename AbsMaxTensor, typename AccRedTensor, typename PFragment,
+          typename SfaFragment>
+CUTE_DEVICE void quantize_and_pack_p_mxfp8(int mma_k, AbsMaxTensor& AbsMaxP,
+                                           AccRedTensor& acc_reduction_view,
+                                           PFragment& tOrP, SfaFragment& tOrSFA,
+                                           int lane) {
+  uint32_t packed[16];
+  CUTLASS_PRAGMA_UNROLL
+  for (int m1 = 0; m1 < 2; ++m1)
+    CUTLASS_PRAGMA_UNROLL
+  for (int mn = 0; mn < 4; ++mn)
+    CUTLASS_PRAGMA_UNROLL
+  for (int j1 = 0; j1 < 2; ++j1)
+    packed_float_to_e4m3(acc_reduction_view(m1, make_coord(4 * j1 + 0, mn)),
+                         acc_reduction_view(m1, make_coord(4 * j1 + 1, mn)),
+                         acc_reduction_view(m1, make_coord(4 * j1 + 2, mn)),
+                         acc_reduction_view(m1, make_coord(4 * j1 + 3, mn)),
+                         packed[m1 + 2 * j1 + 4 * mn]);
+
+  const int l0 = lane & 1;
+  const int l1 = (lane >> 1) & 1;
+  const int quad_base = lane & ~3;
+  Tensor tOrP_u32 = recast<uint32_t>(tOrP(_, _, mma_k));
+  CUTLASS_PRAGMA_UNROLL
+  for (int m1 = 0; m1 < 2; ++m1)
+    CUTLASS_PRAGMA_UNROLL
+  for (int q1s = 0; q1s < 2; ++q1s)
+    CUTLASS_PRAGMA_UNROLL
+  for (int seg = 0; seg < 4; ++seg)
+    tOrP_u32(m1 + 2 * q1s + 4 * seg) = __shfl_sync(
+        0xFFFFFFFFu, packed[m1 + 2 * l0 + 4 * seg], quad_base + l1 + 2 * q1s);
+
+  // SFA: each lane scales its SFALayout row g + 8*(lane&1); the lane's
+  // AbsMaxP half for that row is lane&1.
+  const int row_sel = lane & 1;
+  CUTLASS_PRAGMA_UNROLL
+  for (int seg = 0; seg < 4; ++seg)
+    tOrSFA(make_coord(_0{}, seg), _0{}, mma_k) =
+        cutlass::float_ue8m0_t::bitcast(pow2_to_ue8m0(AbsMaxP(row_sel, seg)));
+
+#ifdef FFPA_PACKER_DUMP
+  if (blockIdx.x == 0 && threadIdx.x / 32 == 11 && mma_k == 0) {
+    unsigned char sfb[4];
+    CUTLASS_PRAGMA_UNROLL
+    for (int seg = 0; seg < 4; ++seg) {
+      const auto sf = tOrSFA(make_coord(_0{}, seg), _0{}, mma_k);
+      memcpy(&sfb[seg], &sf, 1);
+    }
+    // One printf call = one atomic FIFO record: multi-call segments from
+    // different lanes interleave and shred the line.
+    printf(
+        "PD %d %d %d %d"
+        " %08x %08x %08x %08x %08x %08x %08x %08x"
+        " %08x %08x %08x %08x %08x %08x %08x %08x"
+        " %02x %02x %02x %02x\n",
+        (int)blockIdx.x, (int)(threadIdx.x / 32), mma_k, lane, tOrP_u32(0),
+        tOrP_u32(1), tOrP_u32(2), tOrP_u32(3), tOrP_u32(4), tOrP_u32(5),
+        tOrP_u32(6), tOrP_u32(7), tOrP_u32(8), tOrP_u32(9), tOrP_u32(10),
+        tOrP_u32(11), tOrP_u32(12), tOrP_u32(13), tOrP_u32(14), tOrP_u32(15),
+        (unsigned)sfb[0], (unsigned)sfb[1], (unsigned)sfb[2], (unsigned)sfb[3]);
+  }
+#endif
+}
 
 // lse smooth-K correction: qkm[row] = dot(Qhat_row_dequant, km) +
 // dot(qm_block, km). Qhat is read back from smem (e2m1 x SF), quad-strided
