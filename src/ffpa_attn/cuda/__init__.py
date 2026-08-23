@@ -61,7 +61,8 @@ torch.library.define(
   "bool fp8_smooth_k, bool fp8_smooth_v, int fp8_q_quant_method, int fp8_k_quant_method, "
   "int fp8_v_quant_method, int fp8_pv_acc_type, int fp8_qk_mm_type, "
   "bool fp8_hybrid, int fp8_hybrid_n_early, "
-  "bool fp4_hybrid, int fp4_hybrid_n_early) -> "
+  "bool fp4_hybrid, int fp4_hybrid_n_early, "
+  "bool fp4_hadamard, int fp4_pv_mm_type, bool fp4_smooth_v) -> "
   "(Tensor o, Tensor softmax_lse)",
 )
 
@@ -90,6 +91,9 @@ def _fwd_cuda_torch_op(
   fp8_hybrid_n_early: int,
   fp4_hybrid: bool,
   fp4_hybrid_n_early: int,
+  fp4_hadamard: bool,
+  fp4_pv_mm_type: int = 0,
+  fp4_smooth_v: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
   if _ffpa_attn_fwd_cuda is None:
     raise RuntimeError(
@@ -135,6 +139,9 @@ def _fwd_cuda_torch_op(
     fp8_hybrid_n_early,
     fp4_hybrid,
     fp4_hybrid_n_early,
+    fp4_hadamard,
+    fp4_pv_mm_type,
+    fp4_smooth_v,
   )
   return O, softmax_lse
 
@@ -163,6 +170,9 @@ def _fwd_cuda_fake(
   fp8_hybrid_n_early: int,
   fp4_hybrid: bool,
   fp4_hybrid_n_early: int,
+  fp4_hadamard: bool,
+  fp4_pv_mm_type: int = 0,
+  fp4_smooth_v: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
   O = torch.empty_like(Q)  # noqa: E741
   softmax_lse = Q.new_empty(

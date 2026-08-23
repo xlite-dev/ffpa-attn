@@ -68,7 +68,9 @@ void launch_ffpa_attn_fwd_template(
     int64_t fp8_q_quant_method, int64_t fp8_k_quant_method,
     int64_t fp8_v_quant_method, int64_t fp8_pv_acc_type, int64_t fp8_qk_mm_type,
     bool fp8_hybrid = false, int64_t fp8_hybrid_n_early = 256,
-    bool fp4_hybrid = false, int64_t fp4_hybrid_n_early = 256) {
+    bool fp4_hybrid = false, int64_t fp4_hybrid_n_early = 256,
+    bool fp4_hadamard = false, int64_t fp4_pv_mm_type = 0,
+    bool fp4_smooth_v = false) {
   // Q,K,V,O with [B, H, N, D] layout, B=batch, H=head, N=seqlen, D=dim
   // TODO: support BNHD layout, Q,K,V,O with [B, N, H, D] layout.
   // Native block-tile config (MMA atoms, Br/Bc, stages, smem/pad flags) and
@@ -218,16 +220,21 @@ void launch_ffpa_attn_fwd_template(
             // Stage 2: fp4 late rows [n_early:N) via q_start_row offset.
             launch_cute_fwd_persist_d_fp4_sm120<kDataType, kHeadDim, kStage>(
                 Q, K, V, O, softmax_lse, causal, softmax_scale,
-                /*q_start_row=*/n_early);
+                /*q_start_row=*/n_early, fp4_hadamard,
+                static_cast<int>(fp4_pv_mm_type), fp4_smooth_v);
           } else {
             launch_cute_fwd_persist_d_fp4_sm120<kDataType, kHeadDim, kStage>(
-                Q, K, V, O, softmax_lse, causal, softmax_scale);
+                Q, K, V, O, softmax_lse, causal, softmax_scale,
+                /*q_start_row=*/0, fp4_hadamard,
+                static_cast<int>(fp4_pv_mm_type), fp4_smooth_v);
           }
         } else if constexpr (kHeadDim % 64 == 0 && kHeadDim > 256 &&
                              kHeadDim < 768) {
           // Split-D fp4. Hybrid stage-1 runs the fp16 split_d kernel (the
           // fp16 persist-D cannot be instantiated at D>=320: zero-sized
           // stage array, see the comment above).
+          TORCH_CHECK(!fp4_smooth_v,
+                      "ffpa_attn: fp4_smooth_v supports persist_d (D<=256)");
           if (fp4_hybrid && Nq >= fp4_hybrid_n_early) {
             const int n_early = static_cast<int>(fp4_hybrid_n_early);
             TORCH_CHECK(
@@ -254,15 +261,20 @@ void launch_ffpa_attn_fwd_template(
             // Stage 2: fp4 late rows [n_early:N) via q_start_row offset.
             launch_cute_fwd_split_d_fp4_sm120<kDataType, kHeadDim, kStage>(
                 Q, K, V, O, softmax_lse, causal, softmax_scale,
-                /*q_start_row=*/n_early);
+                /*q_start_row=*/n_early, fp4_hadamard,
+                static_cast<int>(fp4_pv_mm_type));
           } else {
             launch_cute_fwd_split_d_fp4_sm120<kDataType, kHeadDim, kStage>(
-                Q, K, V, O, softmax_lse, causal, softmax_scale);
+                Q, K, V, O, softmax_lse, causal, softmax_scale,
+                /*q_start_row=*/0, fp4_hadamard,
+                static_cast<int>(fp4_pv_mm_type));
           }
         } else if constexpr (kHeadDim % 64 == 0 && kHeadDim >= 768 &&
                              kHeadDim <= 1024) {
           // Split-D m4n2 fp4. Hybrid stage-1 runs the fp16 m4n2 kernel
           // (same tile geometry); stage-2 takes the q_start_row offset.
+          TORCH_CHECK(!fp4_smooth_v,
+                      "ffpa_attn: fp4_smooth_v supports persist_d (D<=256)");
           if (fp4_hybrid && Nq >= fp4_hybrid_n_early) {
             const int n_early = static_cast<int>(fp4_hybrid_n_early);
             TORCH_CHECK(
@@ -288,10 +300,13 @@ void launch_ffpa_attn_fwd_template(
               softmax_lse.slice(2, 0, n_early).copy_(lse_e);
             launch_cute_fwd_split_d_m4n2_fp4_sm120<kDataType, kHeadDim, kStage>(
                 Q, K, V, O, softmax_lse, causal, softmax_scale,
-                /*q_start_row=*/n_early);
+                /*q_start_row=*/n_early, fp4_hadamard,
+                static_cast<int>(fp4_pv_mm_type));
           } else {
             launch_cute_fwd_split_d_m4n2_fp4_sm120<kDataType, kHeadDim, kStage>(
-                Q, K, V, O, softmax_lse, causal, softmax_scale);
+                Q, K, V, O, softmax_lse, causal, softmax_scale,
+                /*q_start_row=*/0, fp4_hadamard,
+                static_cast<int>(fp4_pv_mm_type));
           }
         } else {
           TORCH_CHECK(false,

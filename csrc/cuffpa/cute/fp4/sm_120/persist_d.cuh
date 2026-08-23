@@ -3,15 +3,24 @@
 // persist_d producer/consumer skeleton (128T producer + 256T consumer,
 // hand-rolled TMA barriers, consumer-side epilogue).
 //
-// Math chain (per (b,h), Q block of 128 rows):
-//   qm  = mean(q, 128-row group)   Qhat = q - qm   (quantized, sub_qm)
-//   km  = mean(k)                  Khat = k - km   (quantized, sub_km,
-//                                    rows permuted)
+// Math chain (per (b,h), Q block of 128 rows). All three operands are
+// mean-smoothed around their quantization - e2m1's +-6 dynamic range makes
+// this mandatory for accuracy, not an option:
+//   [smooth Q - always on]  qm  = mean(q, 128-row group)   Qhat = q - qm
+//                          (quantized with sub_qm; per-block mean, not
+//                          per-head: rows of one 128-tile share qm)
+//   [smooth K - always on]  km  = mean(k)                  Khat = k - km
+//                          (quantized with sub_km, rows permuted)
+//   [smooth V - optional]   vm  = mean(v)                  Vhat = v - vm
+//                          (fp4_smooth_v; subtracted in the V^T quantize
+//                          kernel, added back in the epilogue below)
 //   S   = Qhat @ Khat^T + delta_s,  delta_s[b,h,mb,n] = qm @ (k - km)^T:
 //       S = (q - qm)(k - km)^T + qm(k - km)^T = q(k - km)^T
-//   P   = softmax(S * scale)              O = P @ v
-// Smoothing K leaves O unchanged (softmax shift invariance); the lse must add
-// back scale * dot(q_row, km) = scale * (dot(Qhat_row, km) + dot(qm, km)).
+//   P   = softmax(S * scale)              O = P @ Vhat (+ vm in epilogue)
+// Smoothing K leaves O unchanged (softmax shift invariance); the lse must
+// add back scale * dot(q_row, km) = scale * (dot(Qhat_row, km) + dot(qm, km)).
+// Smoothing V leaves O unchanged as well (softmax rows sum to 1); see the
+// smooth_v epilogue comment for the full derivation.
 //
 // Column alignment (empirically locked against sageattn3 in
 // .tmp/fp4-persist-d/test_ds_align.py): K/V^T workspaces store tokens with
@@ -125,13 +134,15 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp4_sm120(
     CUTLASS_GRID_CONSTANT TmaSFVt const tma_sfvt,
     CUTLASS_GRID_CONSTANT TmaDS const tma_ds, ElementO* __restrict__ O,
     float* __restrict__ softmax_lse, const float* __restrict__ km,
-    const float* __restrict__ qm, int Nq, int Nkv, int Nq_pad, int Nkv_pad,
-    int Nh, int Nh_kv, float scale, int Tc, int causal, int total_q_rows,
-    int Nb, int q_start_row = 0) {
+    const float* __restrict__ qm, const float* __restrict__ vm, int Nq, int Nkv,
+    int Nq_pad, int Nkv_pad, int Nh, int Nh_kv, float scale, int Tc, int causal,
+    int total_q_rows, int Nb, int q_start_row = 0) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
   using namespace cute;
   using Element = typename Traits::Element;
   using ElementSF = typename Traits::ElementSF;
+  using ElementPV = typename Traits::ElementPV;
+  using ElementSFV = typename Traits::ElementSFV;
   using SmemLayoutQ = typename Traits::SmemLayoutQ;
   using SmemLayoutK = typename Traits::SmemLayoutK;
   using SmemLayoutVt = typename Traits::SmemLayoutVt;
@@ -144,8 +155,12 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp4_sm120(
   using TiledMmaPV = typename Traits::TiledMmaPV;
   using SmemCopyAtomQ = typename Traits::SmemCopyAtomQ;
   using SmemCopyAtomKV = typename Traits::SmemCopyAtomKV;
+  using SmemCopyAtomV = typename Traits::SmemCopyAtomV;
   using SmemCopyAtomSF = typename Traits::SmemCopyAtomSF;
+  using SmemCopyAtomSFV = typename Traits::SmemCopyAtomSFV;
   using BlkScaledConfig = typename Traits::BlkScaledConfig;
+  using BlkScaledConfigV = typename Traits::BlkScaledConfigV;
+  constexpr bool kPvMxfp8 = Traits::kPvMxfp8;
 
   constexpr int kBr = Traits::kBr;
   constexpr int kBc = Traits::kBc;
@@ -221,7 +236,7 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp4_sm120(
           make_shape(Nq_pad, Int<kHeadDim>{}, Nh, Nb));
       auto layout_SFK = BlkScaledConfig::tile_atom_to_shape_SFQKV(
           make_shape(Nkv_pad, Int<kHeadDim>{}, Nh_kv, Nb));
-      auto layout_SFVt = BlkScaledConfig::tile_atom_to_shape_SFVt(
+      auto layout_SFVt = BlkScaledConfigV::tile_atom_to_shape_SFVt(
           make_shape(Int<kHeadDim>{}, Nkv_pad, Nh_kv, Nb));
       auto layout_DS = tile_to_shape(typename Traits::SmemLayoutAtomDS{},
                                      make_shape(Nq_pad, Nkv_pad, Nh, Nb),
@@ -248,8 +263,8 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp4_sm120(
       auto sDS =
           make_tensor(make_smem_ptr<float>(shm + kOffDS), SmemLayoutDS{});
       auto sV =
-          make_tensor(make_smem_ptr<Element>(shm + kOffV), SmemLayoutVt{});
-      auto sSFVt = make_tensor(make_smem_ptr<ElementSF>(shm + kOffSFVt),
+          make_tensor(make_smem_ptr<ElementPV>(shm + kOffV), SmemLayoutVt{});
+      auto sSFVt = make_tensor(make_smem_ptr<ElementSFV>(shm + kOffSFVt),
                                SmemLayoutSFVt{});
 
       auto tQsQ = q_slice.partition_D(sQ);
@@ -420,9 +435,9 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp4_sm120(
   auto sSFK =
       make_tensor(make_smem_ptr<ElementSF>(shm + kOffSFK), SmemLayoutSFK{});
   auto sDS = make_tensor(make_smem_ptr<float>(shm + kOffDS), SmemLayoutDS{});
-  auto sV = make_tensor(make_smem_ptr<Element>(shm + kOffV), SmemLayoutVt{});
+  auto sV = make_tensor(make_smem_ptr<ElementPV>(shm + kOffV), SmemLayoutVt{});
   auto sSFVt =
-      make_tensor(make_smem_ptr<ElementSF>(shm + kOffSFVt), SmemLayoutSFVt{});
+      make_tensor(make_smem_ptr<ElementSFV>(shm + kOffSFVt), SmemLayoutSFVt{});
 
   // Register fragments for both mmas. partition_fragment_{A,B} mirror the
   // blockscaled operand convention: each operand is a (data, SF) pair, so
@@ -436,8 +451,8 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp4_sm120(
   Tensor tSrSFQ = partition_fragment_SFA(sSFQ, thread_mma_qk);
   Tensor tSrSFK = partition_fragment_SFB(sSFK(_, _, Int<0>{}), thread_mma_qk);
   Tensor tOrSFVt = partition_fragment_SFB(sSFVt(_, _, Int<0>{}), thread_mma_pv);
-  Tensor tOrP = make_tensor_like<Element>(typename Traits::LayoutP{});
-  Tensor tOrSFP = make_tensor<ElementSF>(typename Traits::LayoutSFP{});
+  Tensor tOrP = make_tensor_like<ElementPV>(typename Traits::LayoutP{});
+  Tensor tOrSFP = make_tensor<ElementSFV>(typename Traits::LayoutSFP{});
 
   auto smem_tiled_copy_Q = make_tiled_copy_A(SmemCopyAtomQ{}, tiled_mma_qk);
   auto smem_thr_copy_Q = smem_tiled_copy_Q.get_thread_slice(wg_tid);
@@ -450,7 +465,7 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp4_sm120(
   Tensor tSsK =
       smem_thr_copy_K.partition_S(as_position_independent_swizzle_tensor(sK));
 
-  auto smem_tiled_copy_V = make_tiled_copy_B(SmemCopyAtomKV{}, tiled_mma_pv);
+  auto smem_tiled_copy_V = make_tiled_copy_B(SmemCopyAtomV{}, tiled_mma_pv);
   auto smem_thr_copy_V = smem_tiled_copy_V.get_thread_slice(wg_tid);
   Tensor tOsVt =
       smem_thr_copy_V.partition_S(as_position_independent_swizzle_tensor(sV));
@@ -472,7 +487,7 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp4_sm120(
       as_position_independent_swizzle_tensor(sSFK));
 
   auto smem_tiled_copy_SFV =
-      make_tiled_copy_impl(SmemCopyAtomSF{}, get_layoutSFB_TV(tiled_mma_pv),
+      make_tiled_copy_impl(SmemCopyAtomSFV{}, get_layoutSFB_TV(tiled_mma_pv),
                            make_shape(size<1>(tile_shape(tiled_mma_pv)),
                                       size<2>(tile_shape(tiled_mma_pv))));
   auto smem_thr_copy_SFV = smem_tiled_copy_SFV.get_thread_slice(wg_tid);
@@ -489,10 +504,20 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp4_sm120(
   Tensor tSrS = partition_fragment_C(tiled_mma_qk, Shape<Int<kBr>, Int<kBc>>{});
   Tensor tSrS_conversion_view =
       make_tensor(tSrS.data(), convert_to_conversion_layout(tSrS.layout()));
-  // Per-16-token-group absmax of the P2-domain scores; softmax fills it,
-  // quantize_and_pack_p turns it into the ue4m3 SFP operand.
-  Tensor AbsMaxP = make_tensor_like<float>(make_layout(shape(group<1, 4>(
-      flatten(tSrS_conversion_view.layout()(make_coord(_0{}, _), _, _))))));
+  Tensor tSrS_reduction_view =
+      make_tensor(tSrS.data(), convert_to_reduction_layout(tSrS.layout()));
+  // Per-token-group absmax of the P-domain scores; softmax fills it, the
+  // packer turns it into the SFP operand. NVFP4: 16-token groups derived
+  // from the conversion view; MXFP8: 32-token groups (= one mma-k32 block,
+  // the reduction view's MmaN extent).
+  auto AbsMaxP = [&]() {
+    if constexpr (kPvMxfp8)
+      return make_tensor_like<float>(make_layout(make_shape(
+          size<0>(tSrS_reduction_view), size<1, 1>(tSrS_reduction_view))));
+    else
+      return make_tensor_like<float>(make_layout(shape(group<1, 4>(
+          flatten(tSrS_conversion_view.layout()(make_coord(_0{}, _), _, _))))));
+  }();
 
   auto cS = make_identity_tensor(Shape<Int<kBr>, Int<kBc>>{});
   auto tScS = thread_mma_qk.partition_C(cS);
@@ -505,7 +530,9 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp4_sm120(
       partition_fragment_C(tiled_mma_pv, Shape<Int<kBr>, Int<kHeadDim>>{});
 
   constexpr int kSoftmaxRows = 2 * (2 * kBr / kConsumerThreads);
-  SoftmaxFused<kSoftmaxRows> softmax_fused;
+  std::conditional_t<kPvMxfp8, SoftmaxFusedMxfp8<kSoftmaxRows>,
+                     SoftmaxFused<kSoftmaxRows>>
+      softmax_fused;
   const float scale_orig = scale;
   const float softmax_scale_log2 = scale * FFPA_M_LOG2E;
 
@@ -640,11 +667,21 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp4_sm120(
       TmaBarrier::wait(&v_full[v_stg], v_phase);
       cutlass::arch::fence_view_async_shared();
 
+      auto gemm_rs_pv = [&](auto& tgt) {
+        if constexpr (kPvMxfp8)
+          gemm_rs_mxfp8(tgt, tOrP, tOrSFP, tOrVt, tOrSFVt, tOsVt, tOsSFVt,
+                        tiled_mma_pv, smem_tiled_copy_V, smem_thr_copy_V,
+                        smem_tiled_copy_SFV, smem_thr_copy_SFV, AbsMaxP,
+                        tSrS_reduction_view, v_empty, v_stg, wg_tid & 31);
+        else
+          gemm_rs_fp4(tgt, tOrP, tOrSFP, tOrVt, tOrSFVt, tOsVt, tOsSFVt,
+                      tiled_mma_pv, smem_tiled_copy_V, smem_thr_copy_V,
+                      smem_tiled_copy_SFV, smem_thr_copy_SFV, AbsMaxP,
+                      tSrS_conversion_view, v_empty, v_stg);
+      };
+
       if (kv_tile == 0) {
-        gemm_rs_fp4(tOrO_store, tOrP, tOrSFP, tOrVt, tOrSFVt, tOsVt, tOsSFVt,
-                    tiled_mma_pv, smem_tiled_copy_V, smem_thr_copy_V,
-                    smem_tiled_copy_SFV, smem_thr_copy_SFV, AbsMaxP,
-                    tSrS_conversion_view, v_empty, v_stg);
+        gemm_rs_pv(tOrO_store);
       } else {
         // scores_scale == 1.0f exactly when the row max did not move this
         // tile (~96% of dense tiles): O = O*1 + O_new needs no rescale at
@@ -654,21 +691,52 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp4_sm120(
         if (__any_sync(0xffffffff, need_rescale)) {
           Tensor tOrO = make_fragment_like(tOrO_store);
           clear(tOrO);
-          gemm_rs_fp4(tOrO, tOrP, tOrSFP, tOrVt, tOrSFVt, tOsVt, tOsSFVt,
-                      tiled_mma_pv, smem_tiled_copy_V, smem_thr_copy_V,
-                      smem_tiled_copy_SFV, smem_thr_copy_SFV, AbsMaxP,
-                      tSrS_conversion_view, v_empty, v_stg);
+          gemm_rs_pv(tOrO);
           softmax_fused.rescale_o(tOrO_store, tOrO);
         } else {
-          gemm_rs_fp4(tOrO_store, tOrP, tOrSFP, tOrVt, tOrSFVt, tOsVt, tOsSFVt,
-                      tiled_mma_pv, smem_tiled_copy_V, smem_thr_copy_V,
-                      smem_tiled_copy_SFV, smem_thr_copy_SFV, AbsMaxP,
-                      tSrS_conversion_view, v_empty, v_stg);
+          gemm_rs_pv(tOrO_store);
         }
       }
     }
 
     softmax_fused.finalize(tOrO_store);
+
+    // smooth_v epilogue: add the per-(b, hkv) V column mean back.
+    //
+    // Math (exact equivalence). V was quantized as the residual
+    //   Vhat_j = V_j - vm,   vm[d] = (1/Nkv) * sum_j V[b,hkv,j,d],
+    // so the PV accumulator above computed Ohat_i = sum_j P_ij * Vhat_j
+    // with unnormalized softmax weights P_ij (>= 0). The exact output is
+    //
+    //   O_i = (sum_j P_ij * V_j) / (sum_j P_ij)
+    //       = (sum_j P_ij * (Vhat_j + vm)) / (sum_j P_ij)
+    //       = (sum_j P_ij * Vhat_j) / (sum_j P_ij) + vm * (sum_j P_ij) /
+    //         (sum_j P_ij)
+    //       = Ohat_i / row_sum_i + vm.
+    //
+    // vm is a per-(b, hkv, d) CONSTANT shared by every column j, so it
+    // factors out of the column sum and cancels against the row
+    // normalization (softmax weights sum to 1). Exactness does not depend
+    // on the V distribution; the ONLY numerical difference vs. unsmoothed
+    // quantization is that |Vhat| << |V|, so the fp4/fp8 block scales
+    // track the residual dynamic range -> smaller quantization noise.
+    //
+    // - finalize() above already divided by row_sum (with 0-row guard),
+    //   so this loop only adds vm[d] on the PV C-fragment's d columns.
+    // - Masked columns (causal future / kv pad) have P_ij = 0 (exp2 of
+    //   -inf), contribute to neither sum -> equivalence holds for causal.
+    // - lse is unchanged: the softmax scores themselves are untouched.
+    // - GQA: every q head of a group shares its kv head's vm (kv_bh
+    //   indexes vm exactly like it indexes km).
+    // - The vm row (kHeadDim floats) is L1-resident across the whole CTA.
+    if (vm != nullptr) {
+      const float* vm_bh = vm + static_cast<long>(kv_bh) * kHeadDim;
+      auto cO = make_identity_tensor(Shape<Int<kBr>, Int<kHeadDim>>{});
+      auto tOcO_vm = thread_mma_pv.partition_C(cO);
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < size(tOrO_store); ++i)
+        tOrO_store(i) += vm_bh[cute::get<1>(tOcO_vm(i))];
+    }
 
     // Epilogue, four ordered steps (the O staging tile aliases the Q smem,
     // which drives the ordering):

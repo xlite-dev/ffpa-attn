@@ -24,18 +24,34 @@ namespace ffpa_fp4 {
 // sm120_rr swizzle atom selected by kHeadDim and V^T a separate one
 // selected by kBc; SF smem uses the BlockScaledConfig atom
 // layouts; DS (delta_s) is a stride-(0,1) 128-float broadcast tile.
-template <typename ElementO_, int kHeadDim_>
+template <typename ElementO_, int kHeadDim_, bool kPvMxfp8_ = false>
 struct FFPAAttnCuTePersistDFP4Traits {
   static constexpr int kBr = 128;
   static constexpr int kBc = 128;
   static constexpr int kHeadDim = kHeadDim_;
+  static constexpr bool kPvMxfp8 = kPvMxfp8_;
   // D=256 at 3 stages needs 130,560B, past the 99KB sm_120 opt-in budget.
-  static constexpr int kStages = (kHeadDim <= 192) ? 3 : 2;
+  // MXFP8 doubles the V^T bytes (8-bit data): 3 stages fit D<=128 (D=128:
+  // 89,600B) but not D=192 (133,376B) or D=256. An early mxfp8 build
+  // pinned 2 stages for all D after a 3-stage D=128 run produced multi-
+  // tile NaN; that failure no longer reproduces on current code (16
+  // shape x causal x pv combos + 5 fresh-data stability trials, all
+  // NaN-free), so D=128 runs 3 stages (5090 N=8192: -1.2% kernel time).
+  // D=64 stays at 2 (3-stage untested there; only the D=128 TU was built).
+  static constexpr int kStages =
+      (kPvMxfp8 ? (kHeadDim == 128) : (kHeadDim <= 192)) ? 3 : 2;
   static_assert(kHeadDim % 64 == 0 && kHeadDim >= 64 && kHeadDim <= 256,
                 "fp4 persist_d supports D in {64,128,192,256}");
+  static_assert(!kPvMxfp8 || kHeadDim <= 192,
+                "MXFP8 PV persist_d supports D in {64,128,192} (smem budget)");
 
   using Element = cutlass::float_e2m1_t;
   using ElementSF = cutlass::float_ue4m3_t;
+  // PV-side operands: NVFP4 (e2m1 + ue4m3/16) or MXFP8 (e4m3 + ue8m0/32).
+  using ElementPV = std::conditional_t<kPvMxfp8, cutlass::float_e4m3_t,
+                                       cutlass::float_e2m1_t>;
+  using ElementSFV = std::conditional_t<kPvMxfp8, cutlass::float_ue8m0_t,
+                                        cutlass::float_ue4m3_t>;
   using ElementO = ElementO_;
 
   using TileShape_MNK = Shape<_128, _128, Int<kHeadDim>>;
@@ -49,7 +65,10 @@ struct FFPAAttnCuTePersistDFP4Traits {
   // logical_divide (192 % 128 != 0 at D=192).
   using TiledMmaQK = decltype(make_tiled_mma(MMAAtom{}, AtomLayoutMNK{},
                                              Tile<_128, _32, Int<kHeadDim>>{}));
-  using TiledMmaPV = decltype(make_tiled_mma(MMAAtom{}, AtomLayoutMNK{},
+  using MMAAtomPV = std::conditional_t<
+      kPvMxfp8, MMA_Atom<cute::SM120::BLOCKSCALED::SM120_16x8x128_TN_VS_MXFP8>,
+      MMAAtom>;
+  using TiledMmaPV = decltype(make_tiled_mma(MMAAtomPV{}, AtomLayoutMNK{},
                                              Tile<_128, _32, Int<kBc>>{}));
 
   // Q/K contiguous extent is kHeadDim elements, V^T's is kBc (SA3 splits
@@ -60,7 +79,7 @@ struct FFPAAttnCuTePersistDFP4Traits {
                Element, Int<kHeadDim>>());
   using SmemLayoutAtomVt =
       decltype(cutlass::gemm::collective::detail::sm120_rr_smem_selector<
-               Element, Int<kBc>>());
+               ElementPV, Int<kBc>>());
   using SmemLayoutQ = decltype(tile_to_shape(SmemLayoutAtomQK{},
                                              Shape<Int<kBr>, Int<kHeadDim>>{}));
   using SmemLayoutK = decltype(tile_to_shape(
@@ -71,11 +90,13 @@ struct FFPAAttnCuTePersistDFP4Traits {
       make_shape(Int<kHeadDim>{}, Int<kBc>{}, Int<kStages>{})));
 
   using BlkScaledConfig = BlockScaledConfig<16>;
+  using BlkScaledConfigV = std::conditional_t<kPvMxfp8, BlockScaledConfig<32>,
+                                              BlockScaledConfig<16>>;
   using SmemLayoutAtomSFQ = decltype(BlkScaledConfig::deduce_smem_layoutSFQ(
       TiledMmaQK{}, TileShape_MNK{}));
   using SmemLayoutAtomSFK = decltype(BlkScaledConfig::deduce_smem_layoutSFKV(
       TiledMmaQK{}, TileShape_MNK{}));
-  using SmemLayoutAtomSFVt = decltype(BlkScaledConfig::deduce_smem_layoutSFVt(
+  using SmemLayoutAtomSFVt = decltype(BlkScaledConfigV::deduce_smem_layoutSFVt(
       TiledMmaPV{}, Shape<Int<kBr>, Int<kHeadDim>, Int<kBc>>{}));
   using SmemLayoutSFQ = decltype(make_layout(shape(SmemLayoutAtomSFQ{}),
                                              stride(SmemLayoutAtomSFQ{})));
@@ -93,13 +114,33 @@ struct FFPAAttnCuTePersistDFP4Traits {
       SmemLayoutAtomDS{}, make_shape(Int<kBr>{}, Int<kBc>{}, Int<kStages>{})));
 
   // P / SFP rmem fragment layouts: adapter from the QK C-fragment slots to
-  // the PV A-operand (k = token) mapping. SA3 verbatim.
-  using LayoutP = decltype(make_layout(
-      make_shape(make_shape(_8{}, _2{}, _2{}), _1{}, Int<kBc / 64>{}),
-      make_stride(make_stride(_1{}, _8{}, _16{}), _0{}, _32{})));
-  using LayoutSFP = decltype(make_layout(
-      make_shape(make_shape(_16{}, _4{}), _1{}, Int<kBc / 64>{}),
-      make_stride(make_stride(_0{}, _1{}), _0{}, _4{})));
+  // the PV A-operand (k = token) mapping. SA3 verbatim for NVFP4; MXFP8
+  // mirrors the A layout at 8-bit (4 e4m3 per u32, k half = 32) with the
+  // SFA as one ue8m0 byte per k block.
+  using LayoutP = std::conditional_t<
+      kPvMxfp8,
+      // K-fused atom A fragment: 64 e4m3 = 16 u32. V mirrors the atom's
+      // ALayout V ((4,2,2),4): compact colex puts 4 k-bytes per u32, so the
+      // linear u32 order matches the asm register order a0..a15.
+      decltype(make_layout(
+          make_shape(make_shape(make_shape(_4{}, _2{}, _2{}), _4{}), _1{},
+                     Int<kBc / 128>{}),
+          make_stride(make_stride(make_stride(_1{}, _4{}, _8{}), _16{}), _0{},
+                      _64{}))),
+      decltype(make_layout(
+          make_shape(make_shape(_8{}, _2{}, _2{}), _1{}, Int<kBc / 64>{}),
+          make_stride(make_stride(_1{}, _8{}, _16{}), _0{}, _32{})))>;
+  using LayoutSFP = std::conditional_t<
+      kPvMxfp8,
+      // SFA fragment of the K-fused atom: (32 broadcast k-slots, 4 k-segment
+      // bytes) mirrors NVFP4's ((16,4),..) pattern; cosize 4 == K128/VS32 and
+      // filter_zeros leaves 4 uint8 slots == RegNumSFA.
+      decltype(make_layout(
+          make_shape(make_shape(_32{}, _4{}), _1{}, Int<kBc / 128>{}),
+          make_stride(make_stride(_0{}, _1{}), _0{}, _4{}))),
+      decltype(make_layout(
+          make_shape(make_shape(_16{}, _4{}), _1{}, Int<kBc / 64>{}),
+          make_stride(make_stride(_0{}, _1{}), _0{}, _4{})))>;
 
   using SmemLayoutAtomO =
       decltype(cutlass::gemm::collective::detail::ss_smem_selector<
@@ -109,10 +150,17 @@ struct FFPAAttnCuTePersistDFP4Traits {
 
   using SmemCopyAtomQ = Copy_Atom<SM75_U32x4_LDSM_N, Element>;
   using SmemCopyAtomKV = Copy_Atom<SM75_U32x4_LDSM_N, Element>;
+  // V streams e4m3 under MXFP8 (K stays e2m1): the LDSM atom is dtype-
+  // agnostic (4x32-bit per thread), only the copy's ValType changes.
+  using SmemCopyAtomV =
+      std::conditional_t<kPvMxfp8, Copy_Atom<SM75_U32x4_LDSM_N, ElementPV>,
+                         SmemCopyAtomKV>;
+
   // NOTE: SF smem->reg copies stay byte-granular: the SFA/SFB TV layouts
   // are not 4-value contiguous, so a 32-bit copy atom fails cute's
   // vectorization static assert (tried, falsified).
   using SmemCopyAtomSF = Copy_Atom<UniversalCopy<ElementSF>, ElementSF>;
+  using SmemCopyAtomSFV = Copy_Atom<UniversalCopy<ElementSFV>, ElementSFV>;
 
   // 1 TMA barrier arrival per stage; tx bytes include data + SF (+ DS).
   static constexpr uint32_t kTxBytesQ =
@@ -128,8 +176,8 @@ struct FFPAAttnCuTePersistDFP4Traits {
   static constexpr uint32_t kTxBytesV =
       static_cast<uint32_t>(
           cute::bits_to_bytes(cosize(take<0, 2>(SmemLayoutSFVt{})) * 8)) +
-      static_cast<uint32_t>(
-          cute::bits_to_bytes(size(take<0, 2>(SmemLayoutVt{})) * 4));
+      static_cast<uint32_t>(cute::bits_to_bytes(
+          size(take<0, 2>(SmemLayoutVt{})) * (kPvMxfp8 ? 8 : 4)));
 
   // SMEM plan: [Q | SFQ | K*s | SFK*s | DS*s | V^T*s | SFVt*s], every region
   // start padded to 1024B so all TMA destinations stay swizzle-span aligned
@@ -147,8 +195,8 @@ struct FFPAAttnCuTePersistDFP4Traits {
       int(cute::bits_to_bytes(cosize(take<0, 2>(SmemLayoutSFK{})) * 8));
   static constexpr int kDSBytesStage =
       int(cute::bits_to_bytes(cosize(take<0, 2>(SmemLayoutDS{})) * 32));
-  static constexpr int kVBytesStage =
-      int(cute::bits_to_bytes(size(take<0, 2>(SmemLayoutVt{})) * 4));
+  static constexpr int kVBytesStage = int(cute::bits_to_bytes(
+      size(take<0, 2>(SmemLayoutVt{})) * (kPvMxfp8 ? 8 : 4)));
   static constexpr int kSFVtBytesStage =
       int(cute::bits_to_bytes(cosize(take<0, 2>(SmemLayoutSFVt{})) * 8));
   static constexpr int kOffQ = 0;
