@@ -1665,6 +1665,29 @@ void launch_cute_fwd_persist_d_fp4_sm120_impl(
   }
   const kDataType* k_ptr = reinterpret_cast<const kDataType*>(K.data_ptr());
 
+  // Quantize kernels take (B,S,H,D)-strided inputs; pass the (B,H,N,D)
+  // tensors as (B,N,H,D) views (strides only, no copy).
+  auto Q_t = Q.transpose(1, 2);
+  auto K_t = K.transpose(1, 2);
+  auto V_t = V.transpose(1, 2);
+
+  // FFPA_FP4_FUSED_QKV (T7): single-launch Q/K/V quantize that also emits
+  // qm inside the Q-tile blocks (fp32 + in-dtype), replacing q_mean + the
+  // three quantize launches + the qm cast. Default off until measured
+  // faster; D <= 128 only (the fused 128-token tile mapping).
+  const bool fused_qkv =
+      kHeadDim <= 128 && getenv("FFPA_FP4_FUSED_QKV") != nullptr;
+  if (!fused_qkv) {
+    // [smooth Q - always on, mandatory for fp4 accuracy] per-128-row-block
+    // Q mean: quantize bias (sub_qm) + the rank-1 delta_s/qkm terms.
+    // Hoisted above the K chain so the qkm dot below only waits on the
+    // small km kernels; the launch order targets L2 reuse (see the
+    // quantize section).
+    ffpa_fp4::launch_fp4_q_block_mean_sm120<kHeadDim>(Q_t, qm);
+    if (fused_wht)
+      qm_rot = ffpa_fp4::apply_wht_f32_rows_sm120<kHeadDim>(qm);
+  }
+
   // [smooth K - always on, mandatory for fp4 accuracy] per-(b,hkv) K column
   // mean: km_h/km_f32. Consumed as the quantize bias (sub_km) and by the
   // lse correction; delta_s restores the exact scores (see the kernel
@@ -1684,77 +1707,103 @@ void launch_cute_fwd_persist_d_fp4_sm120_impl(
   if (fused_wht)
     km_rot_f32 = ffpa_fp4::apply_wht_f32_rows_sm120<kHeadDim>(km_f32);
 
-  // Quantize kernels take (B,S,H,D)-strided inputs; pass the (B,H,N,D)
-  // tensors as (B,N,H,D) views (strides only, no copy).
-  auto Q_t = Q.transpose(1, 2);
-  auto K_t = K.transpose(1, 2);
-  auto V_t = V.transpose(1, 2);
-  // smooth_v: per-(b,hkv) V column mean. The attention kernel computes, in
-  // exact math,
-  //   O_i = sum_j P_ij V_j / sum_j P_ij,
-  // and with V_j = Vhat_j + vm (vm constant per (b,hkv,d) column),
-  //   O_i = [sum_j P_ij Vhat_j / sum_j P_ij] + vm,
-  // so quantizing the residual Vhat and adding vm back in the epilogue is
-  // exactly equivalent while shrinking the quantized dynamic range. The
-  // chain: launch_kv_mean_sm120 (generic column-mean kernels shared with
-  // the fp8 smooth_k path; km=nullptr skips the in-dtype copy) -> subtract
-  // inside the V^T quantize kernel -> epilogue add-back after the softmax
-  // normalize. Contrast with K-smoothing: K-mean subtraction changes the
-  // scores, which stays exact only through softmax shift invariance plus
-  // the delta_s/lse corrections; V-mean subtraction never touches the
-  // scores at all.
   torch::Tensor vm_v;
-  if (fp4_smooth_v) {
-    TORCH_CHECK(V.is_contiguous(),
-                "ffpa_attn: fp4_smooth_v requires contiguous V");
-    vm_v = torch::empty({Nb, Nh_kv, kHeadDim}, opts_f32);
-    const int v_mean_chunks =
-        (Nkv + ffpa_fp8::kMeanRowsPerChunk - 1) / ffpa_fp8::kMeanRowsPerChunk;
-    torch::Tensor vm_partials =
-        torch::empty({Nb * Nh_kv, v_mean_chunks, kHeadDim}, opts_f32);
-    ffpa_fp8::launch_kv_mean_sm120<kDataType, kHeadDim>(
-        reinterpret_cast<const kDataType*>(V.data_ptr()), nullptr,
-        vm_v.data_ptr<float>(), vm_partials.data_ptr<float>(), Nb, Nh_kv, Nkv,
-        static_cast<int>(V.size(3)), stream);
-  }
-  // [smooth Q - always on, mandatory for fp4 accuracy] per-128-row-block Q
-  // mean: quantize bias (sub_qm) + the rank-1 delta_s/qkm terms.
-  ffpa_fp4::launch_fp4_q_block_mean_sm120<kHeadDim>(Q_t, qm);
-  if (fused_wht) {
-    qm_rot = ffpa_fp4::apply_wht_f32_rows_sm120<kHeadDim>(qm);
-    ffpa_fp4::launch_fp4_quant_q_wht_sm120<kHeadDim>(Q_t, q4, sfq, qm_rot,
-                                                     Nq_pad);
-    ffpa_fp4::launch_fp4_quant_k_wht_sm120<kHeadDim>(
-        K_t, k4, sfk, km_rot_f32.view({Nb, Nh_kv, kHeadDim}), Nkv_pad);
+  // Launch order targets L2 reuse (96MB L2 vs ~67MB per input tensor): the
+  // K chain km -> qkm -> K-quant -> delta_s keeps all four K touches back
+  // to back, vm -> V-quant pairs the V reads, and Q-quant (the 2nd Q read)
+  // runs last, where its L2 copy has aged out anyway. The fused path gets
+  // the same locality for free: vm/km run right before the single launch
+  // that re-reads all three tensors.
+  torch::Tensor qm_h;
+  if (fused_qkv) {
+    if (fp4_smooth_v) {
+      TORCH_CHECK(V.is_contiguous(),
+                  "ffpa_attn: fp4_smooth_v requires contiguous V");
+      vm_v = torch::empty({Nb, Nh_kv, kHeadDim}, opts_f32);
+      const int v_mean_chunks =
+          (Nkv + ffpa_fp8::kMeanRowsPerChunk - 1) / ffpa_fp8::kMeanRowsPerChunk;
+      torch::Tensor vm_partials =
+          torch::empty({Nb * Nh_kv, v_mean_chunks, kHeadDim}, opts_f32);
+      ffpa_fp8::launch_kv_mean_sm120<kDataType, kHeadDim>(
+          reinterpret_cast<const kDataType*>(V.data_ptr()), nullptr,
+          vm_v.data_ptr<float>(), vm_partials.data_ptr<float>(), Nb, Nh_kv, Nkv,
+          static_cast<int>(V.size(3)), stream);
+    }
+    qm_h = torch::empty({Nb, Nh, Mb, kHeadDim}, Q.options());
+    if (fused_wht)
+      qm_rot = torch::empty({Nb, Nh, Mb, kHeadDim}, opts_f32);
+    ffpa_fp4::launch_fp4_quant_qkv_fused_sm120<kHeadDim>(
+        Q_t, q4, sfq, qm, qm_h, qm_rot,
+        fused_wht ? km_rot_f32.view({Nb, Nh_kv, kHeadDim})
+                  : km_f32.view({Nb, Nh_kv, kHeadDim}),
+        K_t, k4, sfk, vm_v, V_t, vt4, sfvt, Nq_pad, Nkv_pad,
+        /*hadamard=*/fused_wht, /*pv_mxfp8=*/kPvMxfp8);
   } else {
-    ffpa_fp4::launch_fp4_quant_q_sm120<kHeadDim>(Q_t, q4, sfq, qm, Nq_pad,
-                                                 /*sub_qm=*/true);
-    ffpa_fp4::launch_fp4_quant_k_sm120<kHeadDim>(
-        K_t, k4, sfk, km_f32.view({Nb, Nh_kv, kHeadDim}), Nkv_pad,
-        /*sub_km=*/true);
+    qm_h = qm.to(Q.dtype());
+    if (fused_wht)
+      ffpa_fp4::launch_fp4_quant_k_wht_sm120<kHeadDim>(
+          K_t, k4, sfk, km_rot_f32.view({Nb, Nh_kv, kHeadDim}), Nkv_pad);
+    else
+      ffpa_fp4::launch_fp4_quant_k_sm120<kHeadDim>(
+          K_t, k4, sfk, km_f32.view({Nb, Nh_kv, kHeadDim}), Nkv_pad,
+          /*sub_km=*/true);
   }
-  if constexpr (kPvMxfp8)
-    ffpa_fp4::launch_mxfp8_quant_vt_sm120<kHeadDim>(V_t, vt4, sfvt, Nkv_pad,
-                                                    vm_v);
-  else
-    ffpa_fp4::launch_fp4_quant_vt_sm120<kHeadDim>(V_t, vt4, sfvt, Nkv_pad,
-                                                  vm_v);
+  auto qkm = torch::matmul(qm_h.view({Nb, Nh_kv, group, Mb, kHeadDim}),
+                           km_h.view({Nb, Nh_kv, 1, kHeadDim, 1}))
+                 .reshape({Nb, Nh, Mb});
 
   // delta_s per 128-row Q block via the identity qm@(K-km)^T ==
   // qm@K^T - qm.km^T, fused in one wmma kernel (fp32 out, tail columns
   // zero-filled). GQA broadcasts the shared K heads.
-  {
-    auto qm_h = qm.to(Q.dtype());
-    auto qkm = torch::matmul(qm_h.view({Nb, Nh_kv, group, Mb, kHeadDim}),
-                             km_h.view({Nb, Nh_kv, 1, kHeadDim, 1}))
-                   .reshape({Nb, Nh, Mb});
-    delta_s = torch::empty({Nb, Nh, Mb, Nkv_pad}, opts_f32);
-    TORCH_CHECK(K.is_contiguous(), "ffpa_attn: fp4 path requires contiguous K");
-    ffpa_fp4::launch_fp4_delta_s_sm120<kDataType, kHeadDim>(
-        reinterpret_cast<const kDataType*>(qm_h.data_ptr()), k_ptr,
-        reinterpret_cast<const kDataType*>(qkm.data_ptr()),
-        delta_s.data_ptr<float>(), Nb, Nh, Nh_kv, Mb, Nkv, Nkv_pad,
-        static_cast<int>(K.size(3)), stream);
+  delta_s = torch::empty({Nb, Nh, Mb, Nkv_pad}, opts_f32);
+  TORCH_CHECK(K.is_contiguous(), "ffpa_attn: fp4 path requires contiguous K");
+  ffpa_fp4::launch_fp4_delta_s_sm120<kDataType, kHeadDim>(
+      reinterpret_cast<const kDataType*>(qm_h.data_ptr()), k_ptr,
+      reinterpret_cast<const kDataType*>(qkm.data_ptr()),
+      delta_s.data_ptr<float>(), Nb, Nh, Nh_kv, Mb, Nkv, Nkv_pad,
+      static_cast<int>(K.size(3)), stream);
+
+  if (!fused_qkv) {
+    // smooth_v: per-(b,hkv) V column mean. The attention kernel computes,
+    // in exact math,
+    //   O_i = sum_j P_ij V_j / sum_j P_ij,
+    // and with V_j = Vhat_j + vm (vm constant per (b,hkv,d) column),
+    //   O_i = [sum_j P_ij Vhat_j / sum_j P_ij] + vm,
+    // so quantizing the residual Vhat and adding vm back in the epilogue is
+    // exactly equivalent while shrinking the quantized dynamic range. The
+    // chain: launch_kv_mean_sm120 (generic column-mean kernels shared with
+    // the fp8 smooth_k path; km=nullptr skips the in-dtype copy) -> subtract
+    // inside the V^T quantize kernel -> epilogue add-back after the softmax
+    // normalize. Contrast with K-smoothing: K-mean subtraction changes the
+    // scores, which stays exact only through softmax shift invariance plus
+    // the delta_s/lse corrections; V-mean subtraction never touches the
+    // scores at all.
+    if (fp4_smooth_v) {
+      TORCH_CHECK(V.is_contiguous(),
+                  "ffpa_attn: fp4_smooth_v requires contiguous V");
+      vm_v = torch::empty({Nb, Nh_kv, kHeadDim}, opts_f32);
+      const int v_mean_chunks =
+          (Nkv + ffpa_fp8::kMeanRowsPerChunk - 1) / ffpa_fp8::kMeanRowsPerChunk;
+      torch::Tensor vm_partials =
+          torch::empty({Nb * Nh_kv, v_mean_chunks, kHeadDim}, opts_f32);
+      ffpa_fp8::launch_kv_mean_sm120<kDataType, kHeadDim>(
+          reinterpret_cast<const kDataType*>(V.data_ptr()), nullptr,
+          vm_v.data_ptr<float>(), vm_partials.data_ptr<float>(), Nb, Nh_kv, Nkv,
+          static_cast<int>(V.size(3)), stream);
+    }
+    if constexpr (kPvMxfp8)
+      ffpa_fp4::launch_mxfp8_quant_vt_sm120<kHeadDim>(V_t, vt4, sfvt, Nkv_pad,
+                                                      vm_v);
+    else
+      ffpa_fp4::launch_fp4_quant_vt_sm120<kHeadDim>(V_t, vt4, sfvt, Nkv_pad,
+                                                    vm_v);
+
+    if (fused_wht)
+      ffpa_fp4::launch_fp4_quant_q_wht_sm120<kHeadDim>(Q_t, q4, sfq, qm_rot,
+                                                       Nq_pad);
+    else
+      ffpa_fp4::launch_fp4_quant_q_sm120<kHeadDim>(Q_t, q4, sfq, qm, Nq_pad,
+                                                   /*sub_qm=*/true);
   }
 
   const long total_q_pad = (long)Nb * Nh * Nq_pad;
