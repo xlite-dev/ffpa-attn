@@ -31,12 +31,15 @@ struct FFPAAttnCuTePersistDFP4Traits {
   static constexpr int kHeadDim = kHeadDim_;
   static constexpr bool kPvMxfp8 = kPvMxfp8_;
   // D=256 at 3 stages needs 130,560B, past the 99KB sm_120 opt-in budget.
-  // MXFP8 doubles the V^T bytes (8-bit data), so its budget is tighter:
-  // 2 stages from D=192 and no D=256 at all (2 stages already exceed it).
-  // MXFP8 stays at 2 stages for all D: V^T doubles to 1B/token and the
-  // 3-stage V rotation misbehaves at D=128 (multi-tile NaN, root cause
-  // TBD); 2 stages (the D=192-proven budget) is correct everywhere.
-  static constexpr int kStages = (kHeadDim <= (kPvMxfp8 ? 0 : 192)) ? 3 : 2;
+  // MXFP8 doubles the V^T bytes (8-bit data): 3 stages fit D<=128 (D=128:
+  // 89,600B) but not D=192 (133,376B) or D=256. An early mxfp8 build
+  // pinned 2 stages for all D after a 3-stage D=128 run produced multi-
+  // tile NaN; that failure no longer reproduces on current code (16
+  // shape x causal x pv combos + 5 fresh-data stability trials, all
+  // NaN-free), so D=128 runs 3 stages (5090 N=8192: -1.2% kernel time).
+  // D=64 stays at 2 (3-stage untested there; only the D=128 TU was built).
+  static constexpr int kStages =
+      (kPvMxfp8 ? (kHeadDim == 128) : (kHeadDim <= 192)) ? 3 : 2;
   static_assert(kHeadDim % 64 == 0 && kHeadDim >= 64 && kHeadDim <= 256,
                 "fp4 persist_d supports D in {64,128,192,256}");
   static_assert(!kPvMxfp8 || kHeadDim <= 192,
