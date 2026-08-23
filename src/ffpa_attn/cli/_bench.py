@@ -365,7 +365,7 @@ def _parse_args() -> argparse.Namespace:
     "(per-channel V + dim-mean subtraction, smooth-K off); "
     "'cute_tma_fp8_smkv' (alias 'fp8_smkv') enables smooth-K + smooth-V; "
     "'cute_tma_fp8_smkv_qk_int8' (alias 'fp8_smkv_qk_i8') adds int8 QK MMA. "
-    "'cute_tma_fp4' (alias 'fp4') selects the NVFP4 path (any D%8==0 in "
+    "'cute_tma_fp4' (alias 'fp4') selects the NVFP4 path (any D%%8==0 in "
     "[8,256], padded up to {64,128,192,256}; e2m1 + ue4m3 block scales). "
     "Mutually exclusive with --fwd-tma/--cute when not 'auto'.",
   )
@@ -449,6 +449,13 @@ def _parse_args() -> argparse.Namespace:
     default="fp4",
     help="FP4 PV MMA dtype: 'fp4' (NVFP4 e2m1) or 'fp8' (MXFP8 e4m3 + "
     "ue8m0/32, QK stays NVFP4; smem budget limits it to D<=192).",
+  )
+  parser.add_argument(
+    "--fp4-hadamard",
+    action="store_true",
+    default=False,
+    help="FP4 Hadamard transform on Q/K before QK quantization "
+    "(requires --enable-fp4).",
   )
   parser.add_argument(
     "--fp4-hybrid-n-early",
@@ -677,6 +684,8 @@ def _resolve_directional_cli_flags(
     args.fp4_hybrid_n_early = 256
   if not hasattr(args, "fp4_pv_mm_type"):
     args.fp4_pv_mm_type = "fp4"
+  if not hasattr(args, "fp4_hadamard"):
+    args.fp4_hadamard = False
   return args
 
 
@@ -1771,6 +1780,7 @@ def _benchmark_rows(
         fp4_hybrid=args.fp4_hybrid,
         fp4_hybrid_n_early=args.fp4_hybrid_n_early,
         fp4_pv_mm_type=args.fp4_pv_mm_type,
+        fp4_hadamard=args.fp4_hadamard,
       ),
     )
   if args.backward:
