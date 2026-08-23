@@ -1,12 +1,28 @@
-// Walsh-Hadamard pre-rotation for the NVFP4 QK path: rotated Q/K copies
-// are fed to the standard preprocessing chain (km/qm/quant/delta_s/lse).
-// H is orthogonal, so Q H H^T K^T == Q K^T exactly; the rotation only
-// moves where fp4 quantization noise lands (flattens per-16-group outlier
-// amplitudes). Width rule: full-width WHT for pow2 D <= 512, blockdiag
-// H_64 otherwise (fp4 D is always a 64-multiple). The rotated copy is
-// kHeadDim-wide: cols >= d_og load as zeros and their rotated values are
-// STORED, so downstream full-width reads (d_og becomes kHeadDim) keep the
-// contraction exact instead of dropping energy into dead pad cols.
+// Walsh-Hadamard pre-rotation for the NVFP4 QK path.
+//
+// Math: the (unnormalized) Walsh-Hadamard matrix is defined recursively,
+//   H_1 = [1],   H_{2n} = | H_n  H_n |
+//                         | H_n -H_n |
+// Entries are +-1; the normalized form Hhat = H_n / sqrt(n) is orthogonal
+// (Hhat Hhat^T = I). The kernels below apply Hhat to each row via the
+// radix-2 butterfly ((a,b) -> (a+b, a-b), one pass per bit, no
+// bit-reversal) with the 1/sqrt(n) scale folded into the store.
+//
+// Why rotate at all: (Q Hhat)(K Hhat)^T = Q K^T exactly (orthogonality),
+// so softmax logits are unchanged. The rotation whitens each row: every
+// output coordinate is the signed sum of ALL inputs, so energy spreads
+// uniformly across coords (Hadamard "Jackson" property). fp4 quantizes
+// per 16-element blocks with one shared scale; without rotation a single
+// outlier coordinate dominates its block scale and crushes the other 15
+// values, while rotated rows have near-uniform amplitudes -> block scales
+// concentrate -> quantization noise drops. Rotated Q/K copies feed the
+// standard preprocessing chain (km/qm/quant/delta_s/lse).
+//
+// Width rule: full-width WHT for pow2 D <= 512, blockdiag H_64 otherwise
+// (fp4 D is always a 64-multiple). The rotated copy is kHeadDim-wide:
+// cols >= d_og load as zeros and their rotated values are STORED, so
+// downstream full-width reads (d_og becomes kHeadDim) keep the contraction
+// exact instead of dropping energy into dead pad cols.
 #pragma once
 
 #include <ATen/cuda/CUDAContext.h>
