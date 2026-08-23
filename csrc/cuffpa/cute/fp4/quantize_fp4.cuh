@@ -1018,7 +1018,7 @@ inline void launch_fp4_q_block_mean_sm120(const torch::Tensor& input,
   }
 }
 
-// ===== T7: single-launch Q/K/V quantize with fused q_mean (D <= 128) =====
+// ===== single-launch Q/K/V quantize with fused q_mean (D <= 128) =====
 // Replaces the q_mean + Q-quant + K-quant + V-quant launches (and the
 // separate qm fp16 cast) with ONE kernel, following the fp8 path's
 // single-launch quantize precedent. blockIdx.x is split into three
@@ -1030,7 +1030,8 @@ inline void launch_fp4_q_block_mean_sm120(const torch::Tensor& input,
 // kHeadDim-point WHT over qm in smem (ping-pong butterfly) so the
 // pre-rotated bias qm_rot no longer needs its own launch; km_rot stays an
 // external small kernel (its input km is ready before this launch).
-// Guarded by FFPA_FP4_FUSED_QKV (default off until measured faster).
+// Used by the persist_d launcher as the default quantize path for D <=
+// 128 (larger head dims use the separate quant kernels below).
 // Staging row stride is kHeadDim+16 elements: 16-element vec aligned and
 // the +16 pad keeps the column-sum reads at 2-way bank conflicts.
 template <typename T, int kHeadDim, bool kHadamard, bool kPvMxfp8>
@@ -1593,7 +1594,7 @@ void launch_fp4_quant_qkv_fused_t(
 
 }  // namespace detail
 
-// Single-launch Q/K/V fp4 quantize with the fused q_mean (T7). km is the
+// Single-launch Q/K/V fp4 quantize with the fused q_mean. km is the
 // quantize bias for the K segment (km_f32, or km_rot under hadamard); vm
 // is optional (fp4_smooth_v). qm_h receives the in-dtype copy of qm so the
 // separate qm cast disappears. hadamard/pv_mxfp8 pick the kernel template.

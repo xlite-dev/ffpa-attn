@@ -1671,13 +1671,14 @@ void launch_cute_fwd_persist_d_fp4_sm120_impl(
   auto K_t = K.transpose(1, 2);
   auto V_t = V.transpose(1, 2);
 
-  // FFPA_FP4_FUSED_QKV (T7): single-launch Q/K/V quantize that also emits
-  // qm inside the Q-tile blocks (fp32 + in-dtype), replacing q_mean + the
-  // three quantize launches + the qm cast. Default off until measured
-  // faster; D <= 128 only (the fused 128-token tile mapping).
-  const bool fused_qkv =
-      kHeadDim <= 128 && getenv("FFPA_FP4_FUSED_QKV") != nullptr;
-  if (!fused_qkv) {
+  // D <= 128 quantizes Q/K/V in a single launch that also emits qm (fp32
+  // + in-dtype) inside the Q-tile blocks, replacing q_mean + the three
+  // quantize launches + the qm cast (and the qm_rot WHT under hadamard).
+  // Larger head dims keep the separate quantize chain below.
+  constexpr bool fused_qkv = kHeadDim <= 128;
+  // if constexpr: keeps the fused launcher (static_assert D <= 128, pow2
+  // WHT) from being instantiated for larger head dims.
+  if constexpr (!fused_qkv) {
     // [smooth Q - always on, mandatory for fp4 accuracy] per-128-row-block
     // Q mean: quantize bias (sub_qm) + the rank-1 delta_s/qkm terms.
     // Hoisted above the K chain so the qkm dot below only waits on the
@@ -1715,7 +1716,7 @@ void launch_cute_fwd_persist_d_fp4_sm120_impl(
   // the same locality for free: vm/km run right before the single launch
   // that re-reads all three tensors.
   torch::Tensor qm_h;
-  if (fused_qkv) {
+  if constexpr (fused_qkv) {
     if (fp4_smooth_v) {
       TORCH_CHECK(V.is_contiguous(),
                   "ffpa_attn: fp4_smooth_v requires contiguous V");
@@ -1740,13 +1741,17 @@ void launch_cute_fwd_persist_d_fp4_sm120_impl(
         /*hadamard=*/fused_wht, /*pv_mxfp8=*/kPvMxfp8);
   } else {
     qm_h = qm.to(Q.dtype());
-    if (fused_wht)
-      ffpa_fp4::launch_fp4_quant_k_wht_sm120<kHeadDim>(
-          K_t, k4, sfk, km_rot_f32.view({Nb, Nh_kv, kHeadDim}), Nkv_pad);
-    else
+    if (fused_wht) {
+      // pow2-only WHT-fused variant; fused_wht is false for non-pow2 D
+      // (standalone pre-rotated path), keep it uninstantiated there.
+      if constexpr (kFuseWht)
+        ffpa_fp4::launch_fp4_quant_k_wht_sm120<kHeadDim>(
+            K_t, k4, sfk, km_rot_f32.view({Nb, Nh_kv, kHeadDim}), Nkv_pad);
+    } else {
       ffpa_fp4::launch_fp4_quant_k_sm120<kHeadDim>(
           K_t, k4, sfk, km_f32.view({Nb, Nh_kv, kHeadDim}), Nkv_pad,
           /*sub_km=*/true);
+    }
   }
   auto qkm = torch::matmul(qm_h.view({Nb, Nh_kv, group, Mb, kHeadDim}),
                            km_h.view({Nb, Nh_kv, 1, kHeadDim, 1}))
@@ -1763,7 +1768,7 @@ void launch_cute_fwd_persist_d_fp4_sm120_impl(
       delta_s.data_ptr<float>(), Nb, Nh, Nh_kv, Mb, Nkv, Nkv_pad,
       static_cast<int>(K.size(3)), stream);
 
-  if (!fused_qkv) {
+  if constexpr (!fused_qkv) {
     // smooth_v: per-(b,hkv) V column mean. The attention kernel computes,
     // in exact math,
     //   O_i = sum_j P_ij V_j / sum_j P_ij,
@@ -1798,12 +1803,15 @@ void launch_cute_fwd_persist_d_fp4_sm120_impl(
       ffpa_fp4::launch_fp4_quant_vt_sm120<kHeadDim>(V_t, vt4, sfvt, Nkv_pad,
                                                     vm_v);
 
-    if (fused_wht)
-      ffpa_fp4::launch_fp4_quant_q_wht_sm120<kHeadDim>(Q_t, q4, sfq, qm_rot,
-                                                       Nq_pad);
-    else
+    if (fused_wht) {
+      // pow2-only WHT-fused variant (see the K quantize site above).
+      if constexpr (kFuseWht)
+        ffpa_fp4::launch_fp4_quant_q_wht_sm120<kHeadDim>(Q_t, q4, sfq, qm_rot,
+                                                         Nq_pad);
+    } else {
       ffpa_fp4::launch_fp4_quant_q_sm120<kHeadDim>(Q_t, q4, sfq, qm, Nq_pad,
                                                    /*sub_qm=*/true);
+    }
   }
 
   const long total_q_pad = (long)Nb * Nh * Nq_pad;
@@ -1930,9 +1938,12 @@ void launch_cute_fwd_persist_d_fp4_sm120(
                   "{64,128,192} (smem budget), got D=",
                   kHeadDim);
     if (pv_fp8) {
-      launch_cute_fwd_persist_d_fp4_sm120_impl<kDataType, kHeadDim, true>(
-          Q, K, V, O, softmax_lse, causal, softmax_scale, q_start_row,
-          fp4_hadamard, fp4_smooth_v);
+      // mxfp8-PV traits static_assert D <= 192; the TORCH_CHECK above
+      // already rejected the request, keep the variant uninstantiated.
+      if constexpr (kHeadDim <= 192)
+        launch_cute_fwd_persist_d_fp4_sm120_impl<kDataType, kHeadDim, true>(
+            Q, K, V, O, softmax_lse, causal, softmax_scale, q_start_row,
+            fp4_hadamard, fp4_smooth_v);
     } else {
       launch_cute_fwd_persist_d_fp4_sm120_impl<kDataType, kHeadDim, false>(
           Q, K, V, O, softmax_lse, causal, softmax_scale, q_start_row,
@@ -2045,11 +2056,15 @@ void launch_cute_fwd_split_d_fp4_sm120_impl(torch::Tensor Q, torch::Tensor K,
   auto V_t = V.transpose(1, 2);
   ffpa_fp4::launch_fp4_q_block_mean_sm120<kHeadDim>(Q_t, qm);
   if (fused_wht) {
-    qm_rot = ffpa_fp4::apply_wht_f32_rows_sm120<kHeadDim>(qm);
-    ffpa_fp4::launch_fp4_quant_q_wht_sm120<kHeadDim>(Q_t, q4, sfq, qm_rot,
-                                                     Nq_pad);
-    ffpa_fp4::launch_fp4_quant_k_wht_sm120<kHeadDim>(
-        K_t, k4, sfk, km_rot_f32.view({Nb, Nh_kv, kHeadDim}), Nkv_pad);
+    // pow2-only WHT-fused variants; fused_wht is false for non-pow2 D
+    // (standalone pre-rotated path), keep them uninstantiated there.
+    if constexpr (kFuseWht) {
+      qm_rot = ffpa_fp4::apply_wht_f32_rows_sm120<kHeadDim>(qm);
+      ffpa_fp4::launch_fp4_quant_q_wht_sm120<kHeadDim>(Q_t, q4, sfq, qm_rot,
+                                                       Nq_pad);
+      ffpa_fp4::launch_fp4_quant_k_wht_sm120<kHeadDim>(
+          K_t, k4, sfk, km_rot_f32.view({Nb, Nh_kv, kHeadDim}), Nkv_pad);
+    }
   } else {
     ffpa_fp4::launch_fp4_quant_q_sm120<kHeadDim>(Q_t, q4, sfq, qm, Nq_pad,
                                                  /*sub_qm=*/true);
