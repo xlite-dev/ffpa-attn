@@ -567,14 +567,22 @@ CUTE_DEVICE void quantize_and_pack_p_mxfp8(int mma_k, AbsMaxTensor& AbsMaxP,
   const int l1 = (lane >> 1) & 1;
   const int quad_base = lane & ~3;
   Tensor tOrP_u32 = recast<uint32_t>(tOrP(_, _, mma_k));
+  // nvcc miscompiles __shfl_sync whose var is an array element selected by a
+  // per-lane index (both direct packed[...l0...] and a pre-shuffle ternary
+  // select take the wrong half; verified by .tmp/mxfp8-pv/shfl_repro.cu).
+  // Shuffle BOTH j1 halves with compile-time-constant indices - which also
+  // keeps packed[] fully in registers - then select after the shuffles.
   CUTLASS_PRAGMA_UNROLL
   for (int m1 = 0; m1 < 2; ++m1)
     CUTLASS_PRAGMA_UNROLL
   for (int q1s = 0; q1s < 2; ++q1s)
     CUTLASS_PRAGMA_UNROLL
-  for (int seg = 0; seg < 4; ++seg)
-    tOrP_u32(m1 + 2 * q1s + 4 * seg) = __shfl_sync(
-        0xFFFFFFFFu, packed[m1 + 2 * l0 + 4 * seg], quad_base + l1 + 2 * q1s);
+  for (int seg = 0; seg < 4; ++seg) {
+    const int src = quad_base + l1 + 2 * q1s;
+    const uint32_t lo = __shfl_sync(0xFFFFFFFFu, packed[m1 + 4 * seg], src);
+    const uint32_t hi = __shfl_sync(0xFFFFFFFFu, packed[m1 + 2 + 4 * seg], src);
+    tOrP_u32(m1 + 2 * q1s + 4 * seg) = l0 ? hi : lo;
+  }
 
   // SFA: each lane scales its SFALayout row g + 8*(lane&1); the lane's
   // AbsMaxP half for that row is lane&1.
@@ -583,29 +591,6 @@ CUTE_DEVICE void quantize_and_pack_p_mxfp8(int mma_k, AbsMaxTensor& AbsMaxP,
   for (int seg = 0; seg < 4; ++seg)
     tOrSFA(make_coord(_0{}, seg), _0{}, mma_k) =
         cutlass::float_ue8m0_t::bitcast(pow2_to_ue8m0(AbsMaxP(row_sel, seg)));
-
-#ifdef FFPA_PACKER_DUMP
-  if (blockIdx.x == 0 && threadIdx.x / 32 == 11 && mma_k == 0) {
-    unsigned char sfb[4];
-    CUTLASS_PRAGMA_UNROLL
-    for (int seg = 0; seg < 4; ++seg) {
-      const auto sf = tOrSFA(make_coord(_0{}, seg), _0{}, mma_k);
-      memcpy(&sfb[seg], &sf, 1);
-    }
-    // One printf call = one atomic FIFO record: multi-call segments from
-    // different lanes interleave and shred the line.
-    printf(
-        "PD %d %d %d %d"
-        " %08x %08x %08x %08x %08x %08x %08x %08x"
-        " %08x %08x %08x %08x %08x %08x %08x %08x"
-        " %02x %02x %02x %02x\n",
-        (int)blockIdx.x, (int)(threadIdx.x / 32), mma_k, lane, tOrP_u32(0),
-        tOrP_u32(1), tOrP_u32(2), tOrP_u32(3), tOrP_u32(4), tOrP_u32(5),
-        tOrP_u32(6), tOrP_u32(7), tOrP_u32(8), tOrP_u32(9), tOrP_u32(10),
-        tOrP_u32(11), tOrP_u32(12), tOrP_u32(13), tOrP_u32(14), tOrP_u32(15),
-        (unsigned)sfb[0], (unsigned)sfb[1], (unsigned)sfb[2], (unsigned)sfb[3]);
-  }
-#endif
 }
 
 // lse smooth-K correction: qkm[row] = dot(Qhat_row_dequant, km) +

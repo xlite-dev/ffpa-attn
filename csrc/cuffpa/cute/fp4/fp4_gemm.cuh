@@ -176,26 +176,20 @@ CUTE_DEVICE void gemm_rs_mxfp8(
   auto copy_view_vsf = thread_copy_vsf.retile_D(tOrSFVt);
   auto tOsVt_stage = tOsVt(_, _, _, v_stg);
   auto tOsSFVt_stage = tOsSFVt(_, _, _, v_stg);
-#ifndef FFPA_MXFP8_NO_VCOPY
   copy(tiled_copy_v, tOsVt_stage(_, _, _0{}), copy_view_v(_, _, _0{}));
   copy(tiled_copy_vsf, tOsSFVt_stage(_, _, _0{}), copy_view_vsf(_, _, _0{}));
-#endif
   quantize_and_pack_p_mxfp8(0, AbsMaxP, acc_reduction_view, tOrP, tOrSFA, lane);
   CUTLASS_PRAGMA_UNROLL
   for (int v_block = 0; v_block < size<2>(tOrP); ++v_block) {
-#ifndef FFPA_MXFP8_NO_GEMM
     cute::gemm(tiled_mma_pv,
                make_zip_tensor(tOrP(_, _, v_block), tOrSFA(_, _, v_block)),
                make_zip_tensor(tOrVt(_, _, v_block), tOrSFVt(_, _, v_block)),
                tgt);
-#endif
     if (v_block < size<2>(tOrP) - 1) {
-#ifndef FFPA_MXFP8_NO_VCOPY
       copy(tiled_copy_v, tOsVt_stage(_, _, v_block + 1),
            copy_view_v(_, _, v_block + 1));
       copy(tiled_copy_vsf, tOsSFVt_stage(_, _, v_block + 1),
            copy_view_vsf(_, _, v_block + 1));
-#endif
       quantize_and_pack_p_mxfp8(v_block + 1, AbsMaxP, acc_reduction_view, tOrP,
                                 tOrSFA, lane);
     } else {
