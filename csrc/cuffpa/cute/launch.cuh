@@ -1653,7 +1653,15 @@ void launch_cute_fwd_persist_d_fp4_sm120_impl(torch::Tensor Q, torch::Tensor K,
   // rotated copies are kHeadDim-wide (rotated zero pad cols stored), so all
   // downstream consumers stay in one rotated domain; V and the hybrid
   // stage-1 (fp16, earlier in dispatch) are untouched.
-  if (fp4_hadamard) {
+  // Fused-hadamard path (pow2 D): rows are rotated inside the quantize
+  // kernel; Q/K stay unrotated, mean/delta_s run in the unrotated domain
+  // (WHT is linear, H H^T = I), and the attention kernel gets WHT-pre-
+  // rotated qm/km copies for its lse correction. Non-pow2 D keeps the
+  // standalone pre-rotation kernels.
+  constexpr bool kFuseWht = (kHeadDim & (kHeadDim - 1)) == 0 && kHeadDim <= 512;
+  const bool fused_wht = fp4_hadamard && kFuseWht;
+  torch::Tensor km_rot_f32, qm_rot;
+  if (fp4_hadamard && !fused_wht) {
     Q = ffpa_fp4::apply_wht_qk_sm120<kDataType, kHeadDim>(Q);
     K = ffpa_fp4::apply_wht_qk_sm120<kDataType, kHeadDim>(K);
   }
@@ -1673,6 +1681,8 @@ void launch_cute_fwd_persist_d_fp4_sm120_impl(torch::Tensor Q, torch::Tensor K,
         km_f32.data_ptr<float>(), km_partials.data_ptr<float>(), Nb, Nh_kv, Nkv,
         static_cast<int>(K.size(3)), stream);
   }
+  if (fused_wht)
+    km_rot_f32 = ffpa_fp4::apply_wht_f32_rows_sm120<kHeadDim>(km_f32);
 
   // Quantize kernels take (B,S,H,D)-strided inputs; pass the (B,H,N,D)
   // tensors as (B,N,H,D) views (strides only, no copy).
@@ -1680,11 +1690,19 @@ void launch_cute_fwd_persist_d_fp4_sm120_impl(torch::Tensor Q, torch::Tensor K,
   auto K_t = K.transpose(1, 2);
   auto V_t = V.transpose(1, 2);
   ffpa_fp4::launch_fp4_q_block_mean_sm120<kHeadDim>(Q_t, qm);
-  ffpa_fp4::launch_fp4_quant_q_sm120<kHeadDim>(Q_t, q4, sfq, qm, Nq_pad,
-                                               /*sub_qm=*/true);
-  ffpa_fp4::launch_fp4_quant_k_sm120<kHeadDim>(
-      K_t, k4, sfk, km_f32.view({Nb, Nh_kv, kHeadDim}), Nkv_pad,
-      /*sub_km=*/true);
+  if (fused_wht) {
+    qm_rot = ffpa_fp4::apply_wht_f32_rows_sm120<kHeadDim>(qm);
+    ffpa_fp4::launch_fp4_quant_q_wht_sm120<kHeadDim>(Q_t, q4, sfq, qm_rot,
+                                                     Nq_pad);
+    ffpa_fp4::launch_fp4_quant_k_wht_sm120<kHeadDim>(
+        K_t, k4, sfk, km_rot_f32.view({Nb, Nh_kv, kHeadDim}), Nkv_pad);
+  } else {
+    ffpa_fp4::launch_fp4_quant_q_sm120<kHeadDim>(Q_t, q4, sfq, qm, Nq_pad,
+                                                 /*sub_qm=*/true);
+    ffpa_fp4::launch_fp4_quant_k_sm120<kHeadDim>(
+        K_t, k4, sfk, km_f32.view({Nb, Nh_kv, kHeadDim}), Nkv_pad,
+        /*sub_km=*/true);
+  }
   if constexpr (kPvMxfp8)
     ffpa_fp4::launch_mxfp8_quant_vt_sm120<kHeadDim>(V_t, vt4, sfvt, Nkv_pad);
   else
@@ -1803,7 +1821,9 @@ void launch_cute_fwd_persist_d_fp4_sm120_impl(torch::Tensor Q, torch::Tensor K,
       "ffpa_attn: fp4 persist_d smem opt-in failed for D=", kHeadDim);
   kernel<<<grid, block, kSmemBytes, stream>>>(
       tma_q, tma_k, tma_v, tma_o, tma_sfq, tma_sfk, tma_sfvt, tma_ds, O_ptr,
-      softmax_lse_ptr, km_f32.data_ptr<float>(), qm.data_ptr<float>(), Nq, Nkv,
+      softmax_lse_ptr,
+      fused_wht ? km_rot_f32.data_ptr<float>() : km_f32.data_ptr<float>(),
+      fused_wht ? qm_rot.data_ptr<float>() : qm.data_ptr<float>(), Nq, Nkv,
       Nq_pad, Nkv_pad, Nh, Nh_kv, scale, Tc, causal, total_q_rows, Nb,
       q_start_row);
 }
@@ -1909,7 +1929,15 @@ void launch_cute_fwd_split_d_fp4_sm120_impl(torch::Tensor Q, torch::Tensor K,
 
   const c10::cuda::OptionalCUDAGuard device_guard(Q.device());
   auto stream = at::cuda::getCurrentCUDAStream();
-  if (fp4_hadamard) {
+  // Fused-hadamard path (pow2 D): rows are rotated inside the quantize
+  // kernel; Q/K stay unrotated, mean/delta_s run in the unrotated domain
+  // (WHT is linear, H H^T = I), and the attention kernel gets WHT-pre-
+  // rotated qm/km copies for its lse correction. Non-pow2 D keeps the
+  // standalone pre-rotation kernels below.
+  constexpr bool kFuseWht = (kHeadDim & (kHeadDim - 1)) == 0 && kHeadDim <= 512;
+  const bool fused_wht = fp4_hadamard && kFuseWht;
+  torch::Tensor km_rot_f32, qm_rot;
+  if (fp4_hadamard && !fused_wht) {
     Q = ffpa_fp4::apply_wht_qk_sm120<kDataType, kHeadDim>(Q);
     K = ffpa_fp4::apply_wht_qk_sm120<kDataType, kHeadDim>(K);
   }
@@ -1927,16 +1955,26 @@ void launch_cute_fwd_split_d_fp4_sm120_impl(torch::Tensor Q, torch::Tensor K,
         km_f32.data_ptr<float>(), km_partials.data_ptr<float>(), Nb, Nh_kv, Nkv,
         static_cast<int>(K.size(3)), stream);
   }
+  if (fused_wht)
+    km_rot_f32 = ffpa_fp4::apply_wht_f32_rows_sm120<kHeadDim>(km_f32);
 
   auto Q_t = Q.transpose(1, 2);
   auto K_t = K.transpose(1, 2);
   auto V_t = V.transpose(1, 2);
   ffpa_fp4::launch_fp4_q_block_mean_sm120<kHeadDim>(Q_t, qm);
-  ffpa_fp4::launch_fp4_quant_q_sm120<kHeadDim>(Q_t, q4, sfq, qm, Nq_pad,
-                                               /*sub_qm=*/true);
-  ffpa_fp4::launch_fp4_quant_k_sm120<kHeadDim>(
-      K_t, k4, sfk, km_f32.view({Nb, Nh_kv, kHeadDim}), Nkv_pad,
-      /*sub_km=*/true);
+  if (fused_wht) {
+    qm_rot = ffpa_fp4::apply_wht_f32_rows_sm120<kHeadDim>(qm);
+    ffpa_fp4::launch_fp4_quant_q_wht_sm120<kHeadDim>(Q_t, q4, sfq, qm_rot,
+                                                     Nq_pad);
+    ffpa_fp4::launch_fp4_quant_k_wht_sm120<kHeadDim>(
+        K_t, k4, sfk, km_rot_f32.view({Nb, Nh_kv, kHeadDim}), Nkv_pad);
+  } else {
+    ffpa_fp4::launch_fp4_quant_q_sm120<kHeadDim>(Q_t, q4, sfq, qm, Nq_pad,
+                                                 /*sub_qm=*/true);
+    ffpa_fp4::launch_fp4_quant_k_sm120<kHeadDim>(
+        K_t, k4, sfk, km_f32.view({Nb, Nh_kv, kHeadDim}), Nkv_pad,
+        /*sub_km=*/true);
+  }
   ffpa_fp4::launch_fp4_quant_vt_sm120<kHeadDim>(V_t, vt4, sfvt, Nkv_pad);
 
   {
@@ -2039,7 +2077,9 @@ void launch_cute_fwd_split_d_fp4_sm120_impl(torch::Tensor Q, torch::Tensor K,
       "ffpa_attn: fp4 split_d smem opt-in failed for D=", kHeadDim);
   kernel<<<grid, block, kSmemBytes, stream>>>(
       tma_q, tma_k, tma_v, tma_o, tma_sfq, tma_sfk, tma_sfvt, tma_ds, O_ptr,
-      softmax_lse_ptr, km_f32.data_ptr<float>(), qm.data_ptr<float>(), Nq, Nkv,
+      softmax_lse_ptr,
+      fused_wht ? km_rot_f32.data_ptr<float>() : km_f32.data_ptr<float>(),
+      fused_wht ? qm_rot.data_ptr<float>() : qm.data_ptr<float>(), Nq, Nkv,
       Nq_pad, Nkv_pad, Nh, Nh_kv, scale, Tc, causal, total_q_rows, Nb,
       q_start_row);
 }

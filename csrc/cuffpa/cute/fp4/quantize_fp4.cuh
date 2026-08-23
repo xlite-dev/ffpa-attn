@@ -98,7 +98,16 @@ struct Fp4PackedVec {
 // d_og < kHeadDim (padded head_dim): input rows are only d_og wide
 // (d_og%8==0); guarded loads keep pad cols zero so data and SF pad cols
 // are 0.
-template <typename T, int kHeadDim, bool kPermute, bool kSubQm, bool kSubKm>
+// kHadamard: fold the full-width Walsh-Hadamard row rotation into the load
+// (replaces the standalone wht_qk_kernel + its whole-tensor read/write).
+// The 4 threads of a token are contiguous, so with kE = kHeadDim/4 elems
+// per thread the butterfly splits into in-thread pairs (dist < kE), one
+// shfl_xor(1) pass (dist = kE) and one shfl_xor(2) pass (dist = 2*kE);
+// requires pow2 kHeadDim. qm/km biases must then be pre-rotated (qm_rot /
+// km_rot from wht_f32_rows_kernel): WHT is linear, so mean and rotation
+// commute and delta_s/qkm stay exact in the unrotated domain.
+template <typename T, int kHeadDim, bool kPermute, bool kSubQm, bool kSubKm,
+          bool kHadamard = false>
 __global__ void fp4_quant_kernel(
     const T* __restrict__ input, uint8_t* __restrict__ output,
     uint8_t* __restrict__ output_sf, int num_tokens, int stride_bz_input,
@@ -178,6 +187,54 @@ __global__ void fp4_quant_kernel(
         fp2Vals[v][i] = __bfloat1622float2(in_vec[v].elts[i]);
       }
     }
+  }
+  if constexpr (kHadamard) {
+    // Row WHT folded into the load: kE contiguous elems per thread, so
+    // distances < kE stay in-thread; dist kE / 2kE swap with the slice^1 /
+    // slice^2 neighbor via one shfl each (invalid tokens load zeros, so
+    // the whole warp stays convergent through the shuffles).
+    constexpr int kE = kHeadDim / 4;
+    static_assert((kHeadDim & (kHeadDim - 1)) == 0,
+                  "fused WHT requires pow2 kHeadDim");
+    static_assert(kVecsPerThread * kCVTFp4EltsPerThread == kE);
+    float x[kE];
+#pragma unroll
+    for (int v = 0; v < kVecsPerThread; v++)
+#pragma unroll
+      for (int i = 0; i < kCVTFp4EltsPerThread / 2; i++) {
+        x[v * kCVTFp4EltsPerThread + 2 * i] = fp2Vals[v][i].x;
+        x[v * kCVTFp4EltsPerThread + 2 * i + 1] = fp2Vals[v][i].y;
+      }
+#pragma unroll
+    for (int dist = kE / 2; dist >= 1; dist >>= 1) {
+#pragma unroll
+      for (int j = 0; j < kE; j++) {
+        const int jj = j ^ dist;
+        if (j < jj) {
+          const float a = x[j], b = x[jj];
+          x[j] = a + b;
+          x[jj] = a - b;
+        }
+      }
+    }
+#pragma unroll
+    for (int j = 0; j < kE; j++) {
+      const float p = __shfl_xor_sync(0xffffffffu, x[j], 1);
+      x[j] = (slice & 1) ? p - x[j] : x[j] + p;
+    }
+#pragma unroll
+    for (int j = 0; j < kE; j++) {
+      const float p = __shfl_xor_sync(0xffffffffu, x[j], 2);
+      x[j] = (slice & 2) ? p - x[j] : x[j] + p;
+    }
+    const float s = rsqrtf((float)kHeadDim);
+#pragma unroll
+    for (int v = 0; v < kVecsPerThread; v++)
+#pragma unroll
+      for (int i = 0; i < kCVTFp4EltsPerThread / 2; i++) {
+        fp2Vals[v][i].x = x[v * kCVTFp4EltsPerThread + 2 * i] * s;
+        fp2Vals[v][i].y = x[v * kCVTFp4EltsPerThread + 2 * i + 1] * s;
+      }
   }
   // padded tail rows stay zero: skip the bias there (SF and data both)
   if constexpr (kSubQm) {
@@ -728,6 +785,54 @@ void launch_mxfp8_quant_vt_t(const torch::Tensor& input, torch::Tensor& output,
       output_sf.stride(2), static_cast<int>(input.size(3)));
 }
 
+// Fused-WHT variants: same launch shape as the plain Q/K launchers but the
+// kernel rotates rows in-register; qm/km must be the PRE-ROTATED copies
+// (wht_f32_rows_kernel output), delta_s/qkm keep consuming the unrotated
+// ones.
+template <typename T, int kHeadDim>
+void launch_fp4_quant_q_wht_t(const torch::Tensor& input, torch::Tensor& output,
+                              torch::Tensor& output_sf, const torch::Tensor& qm,
+                              int64_t n_pad) {
+  constexpr int kTokensPerBlock =
+      (kHeadDim <= 128) ? 128 : ((kHeadDim <= 768) ? 64 : 32);
+  const int num_tokens = input.size(1);
+  const int d_og = static_cast<int>(input.size(3));
+  auto stream = at::cuda::getCurrentCUDAStream();
+  dim3 block(kTokensPerBlock * 4, 1, 1);
+  dim3 grid((n_pad + kTokensPerBlock - 1) / kTokensPerBlock, input.size(0),
+            input.size(2));
+  fp4_quant_kernel<T, kHeadDim, false, true, false, true>
+      <<<grid, block, 0, stream>>>(
+          reinterpret_cast<const T*>(input.data_ptr()),
+          output.data_ptr<uint8_t>(), output_sf.data_ptr<uint8_t>(), num_tokens,
+          input.stride(0), input.stride(2), input.stride(1), output.stride(0),
+          output.stride(1), output.stride(2), output_sf.stride(0),
+          output_sf.stride(1), output_sf.stride(2), qm.data_ptr<float>(),
+          qm.stride(0), qm.stride(1), nullptr, 0, 0, d_og);
+}
+
+template <typename T, int kHeadDim>
+void launch_fp4_quant_k_wht_t(const torch::Tensor& input, torch::Tensor& output,
+                              torch::Tensor& output_sf, const torch::Tensor& km,
+                              int64_t n_pad) {
+  constexpr int kTokensPerBlock =
+      (kHeadDim <= 128) ? 128 : ((kHeadDim <= 768) ? 64 : 32);
+  const int num_tokens = input.size(1);
+  const int d_og = static_cast<int>(input.size(3));
+  auto stream = at::cuda::getCurrentCUDAStream();
+  dim3 block(kTokensPerBlock * 4, 1, 1);
+  dim3 grid((n_pad + kTokensPerBlock - 1) / kTokensPerBlock, input.size(0),
+            input.size(2));
+  fp4_quant_kernel<T, kHeadDim, true, false, true, true>
+      <<<grid, block, 0, stream>>>(
+          reinterpret_cast<const T*>(input.data_ptr()),
+          output.data_ptr<uint8_t>(), output_sf.data_ptr<uint8_t>(), num_tokens,
+          input.stride(0), input.stride(2), input.stride(1), output.stride(0),
+          output.stride(1), output.stride(2), output_sf.stride(0),
+          output_sf.stride(1), output_sf.stride(2), nullptr, 0, 0,
+          km.data_ptr<float>(), km.stride(0), km.stride(1), d_og);
+}
+
 }  // namespace detail
 
 template <int kHeadDim>
@@ -796,6 +901,42 @@ inline void launch_mxfp8_quant_vt_sm120(const torch::Tensor& input,
   } else {
     detail::launch_mxfp8_quant_vt_t<__nv_bfloat16, kHeadDim>(input, output,
                                                              output_sf, n_pad);
+  }
+}
+
+// Fused-WHT Q/K quantize: rows are Walsh-Hadamard rotated in-register at
+// load time (pow2 kHeadDim only); qm/km args are the pre-rotated copies.
+template <int kHeadDim>
+inline void launch_fp4_quant_q_wht_sm120(const torch::Tensor& input,
+                                         torch::Tensor& output,
+                                         torch::Tensor& output_sf,
+                                         const torch::Tensor& qm,
+                                         int64_t n_pad) {
+  TORCH_CHECK((kHeadDim & (kHeadDim - 1)) == 0,
+              "fused-WHT fp4 quantize requires pow2 kHeadDim");
+  if (input.scalar_type() == at::ScalarType::Half) {
+    detail::launch_fp4_quant_q_wht_t<half, kHeadDim>(input, output, output_sf,
+                                                     qm, n_pad);
+  } else {
+    detail::launch_fp4_quant_q_wht_t<__nv_bfloat16, kHeadDim>(
+        input, output, output_sf, qm, n_pad);
+  }
+}
+
+template <int kHeadDim>
+inline void launch_fp4_quant_k_wht_sm120(const torch::Tensor& input,
+                                         torch::Tensor& output,
+                                         torch::Tensor& output_sf,
+                                         const torch::Tensor& km,
+                                         int64_t n_pad) {
+  TORCH_CHECK((kHeadDim & (kHeadDim - 1)) == 0,
+              "fused-WHT fp4 quantize requires pow2 kHeadDim");
+  if (input.scalar_type() == at::ScalarType::Half) {
+    detail::launch_fp4_quant_k_wht_t<half, kHeadDim>(input, output, output_sf,
+                                                     km, n_pad);
+  } else {
+    detail::launch_fp4_quant_k_wht_t<__nv_bfloat16, kHeadDim>(
+        input, output, output_sf, km, n_pad);
   }
 }
 
