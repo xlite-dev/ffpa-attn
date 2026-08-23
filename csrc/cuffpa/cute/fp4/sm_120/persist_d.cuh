@@ -3,15 +3,24 @@
 // persist_d producer/consumer skeleton (128T producer + 256T consumer,
 // hand-rolled TMA barriers, consumer-side epilogue).
 //
-// Math chain (per (b,h), Q block of 128 rows):
-//   qm  = mean(q, 128-row group)   Qhat = q - qm   (quantized, sub_qm)
-//   km  = mean(k)                  Khat = k - km   (quantized, sub_km,
-//                                    rows permuted)
+// Math chain (per (b,h), Q block of 128 rows). All three operands are
+// mean-smoothed around their quantization - e2m1's +-6 dynamic range makes
+// this mandatory for accuracy, not an option:
+//   [smooth Q - always on]  qm  = mean(q, 128-row group)   Qhat = q - qm
+//                          (quantized with sub_qm; per-block mean, not
+//                          per-head: rows of one 128-tile share qm)
+//   [smooth K - always on]  km  = mean(k)                  Khat = k - km
+//                          (quantized with sub_km, rows permuted)
+//   [smooth V - optional]   vm  = mean(v)                  Vhat = v - vm
+//                          (fp4_smooth_v; subtracted in the V^T quantize
+//                          kernel, added back in the epilogue below)
 //   S   = Qhat @ Khat^T + delta_s,  delta_s[b,h,mb,n] = qm @ (k - km)^T:
 //       S = (q - qm)(k - km)^T + qm(k - km)^T = q(k - km)^T
-//   P   = softmax(S * scale)              O = P @ v
-// Smoothing K leaves O unchanged (softmax shift invariance); the lse must add
-// back scale * dot(q_row, km) = scale * (dot(Qhat_row, km) + dot(qm, km)).
+//   P   = softmax(S * scale)              O = P @ Vhat (+ vm in epilogue)
+// Smoothing K leaves O unchanged (softmax shift invariance); the lse must
+// add back scale * dot(q_row, km) = scale * (dot(Qhat_row, km) + dot(qm, km)).
+// Smoothing V leaves O unchanged as well (softmax rows sum to 1); see the
+// smooth_v epilogue comment for the full derivation.
 //
 // Column alignment (empirically locked against sageattn3 in
 // .tmp/fp4-persist-d/test_ds_align.py): K/V^T workspaces store tokens with
@@ -125,9 +134,9 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp4_sm120(
     CUTLASS_GRID_CONSTANT TmaSFVt const tma_sfvt,
     CUTLASS_GRID_CONSTANT TmaDS const tma_ds, ElementO* __restrict__ O,
     float* __restrict__ softmax_lse, const float* __restrict__ km,
-    const float* __restrict__ qm, int Nq, int Nkv, int Nq_pad, int Nkv_pad,
-    int Nh, int Nh_kv, float scale, int Tc, int causal, int total_q_rows,
-    int Nb, int q_start_row = 0) {
+    const float* __restrict__ qm, const float* __restrict__ vm, int Nq, int Nkv,
+    int Nq_pad, int Nkv_pad, int Nh, int Nh_kv, float scale, int Tc, int causal,
+    int total_q_rows, int Nb, int q_start_row = 0) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
   using namespace cute;
   using Element = typename Traits::Element;
@@ -691,6 +700,43 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp4_sm120(
     }
 
     softmax_fused.finalize(tOrO_store);
+
+    // smooth_v epilogue: add the per-(b, hkv) V column mean back.
+    //
+    // Math (exact equivalence). V was quantized as the residual
+    //   Vhat_j = V_j - vm,   vm[d] = (1/Nkv) * sum_j V[b,hkv,j,d],
+    // so the PV accumulator above computed Ohat_i = sum_j P_ij * Vhat_j
+    // with unnormalized softmax weights P_ij (>= 0). The exact output is
+    //
+    //   O_i = (sum_j P_ij * V_j) / (sum_j P_ij)
+    //       = (sum_j P_ij * (Vhat_j + vm)) / (sum_j P_ij)
+    //       = (sum_j P_ij * Vhat_j) / (sum_j P_ij) + vm * (sum_j P_ij) /
+    //         (sum_j P_ij)
+    //       = Ohat_i / row_sum_i + vm.
+    //
+    // vm is a per-(b, hkv, d) CONSTANT shared by every column j, so it
+    // factors out of the column sum and cancels against the row
+    // normalization (softmax weights sum to 1). Exactness does not depend
+    // on the V distribution; the ONLY numerical difference vs. unsmoothed
+    // quantization is that |Vhat| << |V|, so the fp4/fp8 block scales
+    // track the residual dynamic range -> smaller quantization noise.
+    //
+    // - finalize() above already divided by row_sum (with 0-row guard),
+    //   so this loop only adds vm[d] on the PV C-fragment's d columns.
+    // - Masked columns (causal future / kv pad) have P_ij = 0 (exp2 of
+    //   -inf), contribute to neither sum -> equivalence holds for causal.
+    // - lse is unchanged: the softmax scores themselves are untouched.
+    // - GQA: every q head of a group shares its kv head's vm (kv_bh
+    //   indexes vm exactly like it indexes km).
+    // - The vm row (kHeadDim floats) is L1-resident across the whole CTA.
+    if (vm != nullptr) {
+      const float* vm_bh = vm + static_cast<long>(kv_bh) * kHeadDim;
+      auto cO = make_identity_tensor(Shape<Int<kBr>, Int<kHeadDim>>{});
+      auto tOcO_vm = thread_mma_pv.partition_C(cO);
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < size(tOrO_store); ++i)
+        tOrO_store(i) += vm_bh[cute::get<1>(tOcO_vm(i))];
+    }
 
     // Epilogue, four ordered steps (the O staging tile aliases the Q smem,
     // which drives the ordering):

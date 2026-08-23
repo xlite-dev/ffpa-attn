@@ -335,7 +335,9 @@ __global__ void fp4_quant_trans_kernel(
     uint8_t* __restrict__ output_sf, int num_tokens, int stride_bz_input,
     int stride_h_input, int stride_seq_input, int stride_bz_output,
     int stride_h_output, int stride_d_output, int stride_bz_output_sf,
-    int stride_h_output_sf, int stride_d_output_sf, int d_og) {
+    int stride_h_output_sf, int stride_d_output_sf, int d_og,
+    const float* __restrict__ vm = nullptr, int vm_stride_b = 0,
+    int vm_stride_h = 0) {
   using PackedVec = Fp4PackedVec<T>;
   constexpr int kTokensPerBlock =
       (kHeadDim <= 128) ? 128 : ((kHeadDim <= 768) ? 64 : 32);
@@ -404,6 +406,8 @@ __global__ void fp4_quant_trans_kernel(
 
   uint8_t* output_sf_base =
       output_sf + batch_id * stride_bz_output_sf + head_id * stride_h_output_sf;
+  const float* vm_head =
+      vm ? vm + batch_id * vm_stride_b + head_id * vm_stride_h : nullptr;
   uint32_t col_id_local =
       token_block_id * kTokensPerBlock / kCVTFp4EltsPerThread +
       threadIdx.x % kThreadsPerSeq;
@@ -423,6 +427,23 @@ __global__ void fp4_quant_trans_kernel(
         fp2Vals[i].x = __bfloat162float(shared_input[tok0 * kHeadDim + d]);
         fp2Vals[i].y =
             __bfloat162float(shared_input[(tok0 + 1) * kHeadDim + d]);
+      }
+    }
+    // smooth_v: quantize the residual Vhat = V - vm instead of V, where
+    //   vm[d] = (1/Nkv) * sum_n V[b, hkv, n, d]   (per-(b,hkv,d) constant)
+    // is subtracted per column d here and added back in the attention
+    // epilogue after the softmax normalize: because softmax weights sum to
+    // 1 and vm is shared by all columns,
+    //   O_i = (sum_j P_ij * (Vhat_j + vm)) / sum_j P_ij
+    //       = (sum_j P_ij * Vhat_j) / sum_j P_ij + vm,
+    // so the subtraction is mathematically exact; it only shrinks the
+    // residual dynamic range so the e2m1 blockscale quantizes finer.
+    if (vm_head) {
+      const float vm_d = vm_head[d];
+#pragma unroll
+      for (int i = 0; i < kCVTFp4EltsPerThread / 2; i++) {
+        fp2Vals[i].x -= vm_d;
+        fp2Vals[i].y -= vm_d;
       }
     }
 
@@ -481,7 +502,9 @@ __global__ void mxfp8_quant_trans_kernel(
     uint8_t* __restrict__ output_sf, int num_tokens, int stride_bz_input,
     int stride_h_input, int stride_seq_input, int stride_bz_output,
     int stride_h_output, int stride_d_output, int stride_bz_output_sf,
-    int stride_h_output_sf, int stride_d_output_sf, int d_og) {
+    int stride_h_output_sf, int stride_d_output_sf, int d_og,
+    const float* __restrict__ vm = nullptr, int vm_stride_b = 0,
+    int vm_stride_h = 0) {
   using PackedVec = Fp4PackedVec<T>;
   constexpr int kTokensPerBlock =
       (kHeadDim <= 128) ? 128 : ((kHeadDim <= 768) ? 64 : 32);
@@ -550,6 +573,8 @@ __global__ void mxfp8_quant_trans_kernel(
 
   uint8_t* output_sf_base =
       output_sf + batch_id * stride_bz_output_sf + head_id * stride_h_output_sf;
+  const float* vm_head =
+      vm ? vm + batch_id * vm_stride_b + head_id * vm_stride_h : nullptr;
   const uint32_t seq_lane = threadIdx.x % kThreadsPerSeq;
   const uint32_t row_id_local = threadIdx.x / kThreadsPerSeq;
   const uint32_t group_col_local =
@@ -572,6 +597,23 @@ __global__ void mxfp8_quant_trans_kernel(
         fp2Vals[i].x = __bfloat162float(shared_input[tok0 * kHeadDim + d]);
         fp2Vals[i].y =
             __bfloat162float(shared_input[(tok0 + 1) * kHeadDim + d]);
+      }
+    }
+    // smooth_v: quantize the residual Vhat = V - vm instead of V, where
+    //   vm[d] = (1/Nkv) * sum_n V[b, hkv, n, d]   (per-(b,hkv,d) constant)
+    // is subtracted per column d here and added back in the attention
+    // epilogue after the softmax normalize: because softmax weights sum to
+    // 1 and vm is shared by all columns,
+    //   O_i = (sum_j P_ij * (Vhat_j + vm)) / sum_j P_ij
+    //       = (sum_j P_ij * Vhat_j) / sum_j P_ij + vm,
+    // so the subtraction is mathematically exact; it only shrinks the
+    // residual dynamic range so the ue8m0 group scale quantizes finer.
+    if (vm_head) {
+      const float vm_d = vm_head[d];
+#pragma unroll
+      for (int i = 0; i < kCVTFp4EltsPerThread / 2; i++) {
+        fp2Vals[i].x -= vm_d;
+        fp2Vals[i].y -= vm_d;
       }
     }
 
@@ -728,7 +770,8 @@ void launch_fp4_quant_k_t(const torch::Tensor& input, torch::Tensor& output,
 
 template <typename T, int kHeadDim>
 void launch_fp4_quant_vt_t(const torch::Tensor& input, torch::Tensor& output,
-                           torch::Tensor& output_sf, int64_t n_pad) {
+                           torch::Tensor& output_sf, int64_t n_pad,
+                           const torch::Tensor& vm) {
   constexpr int kTokensPerBlock =
       (kHeadDim <= 128) ? 128 : ((kHeadDim <= 768) ? 64 : 32);
   constexpr bool kDynamicSmem =
@@ -752,12 +795,16 @@ void launch_fp4_quant_vt_t(const torch::Tensor& input, torch::Tensor& output,
       output_sf.data_ptr<uint8_t>(), num_tokens, input.stride(0),
       input.stride(2), input.stride(1), output.stride(0), output.stride(1),
       output.stride(2), output_sf.stride(0), output_sf.stride(1),
-      output_sf.stride(2), static_cast<int>(input.size(3)));
+      output_sf.stride(2), static_cast<int>(input.size(3)),
+      vm.defined() ? vm.data_ptr<float>() : nullptr,
+      vm.defined() ? vm.size(0) * vm.size(1) : 0,
+      vm.defined() ? vm.size(2) : 0);
 }
 
 template <typename T, int kHeadDim>
 void launch_mxfp8_quant_vt_t(const torch::Tensor& input, torch::Tensor& output,
-                             torch::Tensor& output_sf, int64_t n_pad) {
+                             torch::Tensor& output_sf, int64_t n_pad,
+                             const torch::Tensor& vm) {
   constexpr int kTokensPerBlock =
       (kHeadDim <= 128) ? 128 : ((kHeadDim <= 768) ? 64 : 32);
   constexpr bool kDynamicSmem =
@@ -782,7 +829,10 @@ void launch_mxfp8_quant_vt_t(const torch::Tensor& input, torch::Tensor& output,
       output_sf.data_ptr<uint8_t>(), num_tokens, input.stride(0),
       input.stride(2), input.stride(1), output.stride(0), output.stride(1),
       output.stride(2), output_sf.stride(0), output_sf.stride(1),
-      output_sf.stride(2), static_cast<int>(input.size(3)));
+      output_sf.stride(2), static_cast<int>(input.size(3)),
+      vm.defined() ? vm.data_ptr<float>() : nullptr,
+      vm.defined() ? vm.size(0) * vm.size(1) : 0,
+      vm.defined() ? vm.size(2) : 0);
 }
 
 // Fused-WHT variants: same launch shape as the plain Q/K launchers but the
@@ -874,33 +924,34 @@ inline void launch_fp4_quant_k_sm120(const torch::Tensor& input,
 template <int kHeadDim>
 inline void launch_fp4_quant_vt_sm120(const torch::Tensor& input,
                                       torch::Tensor& output,
-                                      torch::Tensor& output_sf, int64_t n_pad) {
+                                      torch::Tensor& output_sf, int64_t n_pad,
+                                      const torch::Tensor& vm = {}) {
   TORCH_CHECK(input.size(3) % 8 == 0 && input.size(3) <= kHeadDim &&
                   kHeadDim % 64 == 0 && kHeadDim >= 64 && kHeadDim <= 1024,
               "fp4 quantize requires head_dim %8==0, D <= ", kHeadDim);
   if (input.scalar_type() == at::ScalarType::Half) {
     detail::launch_fp4_quant_vt_t<half, kHeadDim>(input, output, output_sf,
-                                                  n_pad);
+                                                  n_pad, vm);
   } else {
-    detail::launch_fp4_quant_vt_t<__nv_bfloat16, kHeadDim>(input, output,
-                                                           output_sf, n_pad);
+    detail::launch_fp4_quant_vt_t<__nv_bfloat16, kHeadDim>(
+        input, output, output_sf, n_pad, vm);
   }
 }
 
 template <int kHeadDim>
 inline void launch_mxfp8_quant_vt_sm120(const torch::Tensor& input,
                                         torch::Tensor& output,
-                                        torch::Tensor& output_sf,
-                                        int64_t n_pad) {
+                                        torch::Tensor& output_sf, int64_t n_pad,
+                                        const torch::Tensor& vm = {}) {
   TORCH_CHECK(input.size(3) % 8 == 0 && input.size(3) <= kHeadDim &&
                   kHeadDim % 64 == 0 && kHeadDim >= 64 && kHeadDim <= 1024,
               "fp4 quantize requires head_dim %8==0, D <= ", kHeadDim);
   if (input.scalar_type() == at::ScalarType::Half) {
     detail::launch_mxfp8_quant_vt_t<half, kHeadDim>(input, output, output_sf,
-                                                    n_pad);
+                                                    n_pad, vm);
   } else {
-    detail::launch_mxfp8_quant_vt_t<__nv_bfloat16, kHeadDim>(input, output,
-                                                             output_sf, n_pad);
+    detail::launch_mxfp8_quant_vt_t<__nv_bfloat16, kHeadDim>(
+        input, output, output_sf, n_pad, vm);
   }
 }
 

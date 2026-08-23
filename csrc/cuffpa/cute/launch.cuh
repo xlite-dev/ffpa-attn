@@ -1586,12 +1586,10 @@ void launch_cute_fwd_split_d_sm80(torch::Tensor Q, torch::Tensor K,
 // seqlen; delta_s tail columns zero-fill (masked -inf in-kernel).
 #ifdef ENABLE_FFPA_TMA_EXT
 template <typename kDataType, const int kHeadDim, bool kPvMxfp8 = false>
-void launch_cute_fwd_persist_d_fp4_sm120_impl(torch::Tensor Q, torch::Tensor K,
-                                              torch::Tensor V, torch::Tensor O,
-                                              torch::Tensor softmax_lse,
-                                              int causal, double softmax_scale,
-                                              int q_start_row = 0,
-                                              bool fp4_hadamard = false) {
+void launch_cute_fwd_persist_d_fp4_sm120_impl(
+    torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O,
+    torch::Tensor softmax_lse, int causal, double softmax_scale,
+    int q_start_row = 0, bool fp4_hadamard = false, bool fp4_smooth_v = false) {
   using namespace cute;
   constexpr int kBr = 128;
   constexpr int kBc = 128;
@@ -1667,8 +1665,10 @@ void launch_cute_fwd_persist_d_fp4_sm120_impl(torch::Tensor Q, torch::Tensor K,
   }
   const kDataType* k_ptr = reinterpret_cast<const kDataType*>(K.data_ptr());
 
-  // km: per-(b,hkv) K column mean, in-dtype + fp32 (lse correction +
-  // quantize bias), shared two-stage kernel from the fp8 path.
+  // [smooth K - always on, mandatory for fp4 accuracy] per-(b,hkv) K column
+  // mean: km_h/km_f32. Consumed as the quantize bias (sub_km) and by the
+  // lse correction; delta_s restores the exact scores (see the kernel
+  // header). Shared two-stage kernel from the fp8 path.
   torch::Tensor km_h = torch::empty({Nb * Nh_kv, kHeadDim}, K.options());
   torch::Tensor km_f32 = torch::empty({Nb * Nh_kv, kHeadDim}, opts_f32);
   {
@@ -1689,6 +1689,36 @@ void launch_cute_fwd_persist_d_fp4_sm120_impl(torch::Tensor Q, torch::Tensor K,
   auto Q_t = Q.transpose(1, 2);
   auto K_t = K.transpose(1, 2);
   auto V_t = V.transpose(1, 2);
+  // smooth_v: per-(b,hkv) V column mean. The attention kernel computes, in
+  // exact math,
+  //   O_i = sum_j P_ij V_j / sum_j P_ij,
+  // and with V_j = Vhat_j + vm (vm constant per (b,hkv,d) column),
+  //   O_i = [sum_j P_ij Vhat_j / sum_j P_ij] + vm,
+  // so quantizing the residual Vhat and adding vm back in the epilogue is
+  // exactly equivalent while shrinking the quantized dynamic range. The
+  // chain: launch_kv_mean_sm120 (generic column-mean kernels shared with
+  // the fp8 smooth_k path; km=nullptr skips the in-dtype copy) -> subtract
+  // inside the V^T quantize kernel -> epilogue add-back after the softmax
+  // normalize. Contrast with K-smoothing: K-mean subtraction changes the
+  // scores, which stays exact only through softmax shift invariance plus
+  // the delta_s/lse corrections; V-mean subtraction never touches the
+  // scores at all.
+  torch::Tensor vm_v;
+  if (fp4_smooth_v) {
+    TORCH_CHECK(V.is_contiguous(),
+                "ffpa_attn: fp4_smooth_v requires contiguous V");
+    vm_v = torch::empty({Nb, Nh_kv, kHeadDim}, opts_f32);
+    const int v_mean_chunks =
+        (Nkv + ffpa_fp8::kMeanRowsPerChunk - 1) / ffpa_fp8::kMeanRowsPerChunk;
+    torch::Tensor vm_partials =
+        torch::empty({Nb * Nh_kv, v_mean_chunks, kHeadDim}, opts_f32);
+    ffpa_fp8::launch_kv_mean_sm120<kDataType, kHeadDim>(
+        reinterpret_cast<const kDataType*>(V.data_ptr()), nullptr,
+        vm_v.data_ptr<float>(), vm_partials.data_ptr<float>(), Nb, Nh_kv, Nkv,
+        static_cast<int>(V.size(3)), stream);
+  }
+  // [smooth Q - always on, mandatory for fp4 accuracy] per-128-row-block Q
+  // mean: quantize bias (sub_qm) + the rank-1 delta_s/qkm terms.
   ffpa_fp4::launch_fp4_q_block_mean_sm120<kHeadDim>(Q_t, qm);
   if (fused_wht) {
     qm_rot = ffpa_fp4::apply_wht_f32_rows_sm120<kHeadDim>(qm);
@@ -1704,9 +1734,11 @@ void launch_cute_fwd_persist_d_fp4_sm120_impl(torch::Tensor Q, torch::Tensor K,
         /*sub_km=*/true);
   }
   if constexpr (kPvMxfp8)
-    ffpa_fp4::launch_mxfp8_quant_vt_sm120<kHeadDim>(V_t, vt4, sfvt, Nkv_pad);
+    ffpa_fp4::launch_mxfp8_quant_vt_sm120<kHeadDim>(V_t, vt4, sfvt, Nkv_pad,
+                                                    vm_v);
   else
-    ffpa_fp4::launch_fp4_quant_vt_sm120<kHeadDim>(V_t, vt4, sfvt, Nkv_pad);
+    ffpa_fp4::launch_fp4_quant_vt_sm120<kHeadDim>(V_t, vt4, sfvt, Nkv_pad,
+                                                  vm_v);
 
   // delta_s per 128-row Q block via the identity qm@(K-km)^T ==
   // qm@K^T - qm.km^T, fused in one wmma kernel (fp32 out, tail columns
@@ -1823,16 +1855,17 @@ void launch_cute_fwd_persist_d_fp4_sm120_impl(torch::Tensor Q, torch::Tensor K,
       tma_q, tma_k, tma_v, tma_o, tma_sfq, tma_sfk, tma_sfvt, tma_ds, O_ptr,
       softmax_lse_ptr,
       fused_wht ? km_rot_f32.data_ptr<float>() : km_f32.data_ptr<float>(),
-      fused_wht ? qm_rot.data_ptr<float>() : qm.data_ptr<float>(), Nq, Nkv,
-      Nq_pad, Nkv_pad, Nh, Nh_kv, scale, Tc, causal, total_q_rows, Nb,
-      q_start_row);
+      fused_wht ? qm_rot.data_ptr<float>() : qm.data_ptr<float>(),
+      fp4_smooth_v ? vm_v.data_ptr<float>() : nullptr, Nq, Nkv, Nq_pad, Nkv_pad,
+      Nh, Nh_kv, scale, Tc, causal, total_q_rows, Nb, q_start_row);
 }
 
 template <typename kDataType, const int kHeadDim, const int kStage>
 void launch_cute_fwd_persist_d_fp4_sm120(
     torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O,
     torch::Tensor softmax_lse, int causal, double softmax_scale,
-    int q_start_row = 0, bool fp4_hadamard = false, int fp4_pv_mm_type = 0) {
+    int q_start_row = 0, bool fp4_hadamard = false, int fp4_pv_mm_type = 0,
+    bool fp4_smooth_v = false) {
   (void)kStage;  // kStages (3, or 2 at D=256) fixed by the fp4 traits
   auto prop = at::cuda::getCurrentDeviceProperties();
   TORCH_CHECK(prop->major == 12,
@@ -1850,11 +1883,11 @@ void launch_cute_fwd_persist_d_fp4_sm120(
     if (pv_fp8) {
       launch_cute_fwd_persist_d_fp4_sm120_impl<kDataType, kHeadDim, true>(
           Q, K, V, O, softmax_lse, causal, softmax_scale, q_start_row,
-          fp4_hadamard);
+          fp4_hadamard, fp4_smooth_v);
     } else {
       launch_cute_fwd_persist_d_fp4_sm120_impl<kDataType, kHeadDim, false>(
           Q, K, V, O, softmax_lse, causal, softmax_scale, q_start_row,
-          fp4_hadamard);
+          fp4_hadamard, fp4_smooth_v);
     }
   } else {
     TORCH_CHECK(false,

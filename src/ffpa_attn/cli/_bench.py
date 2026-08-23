@@ -458,6 +458,13 @@ def _parse_args() -> argparse.Namespace:
     "(requires --enable-fp4).",
   )
   parser.add_argument(
+    "--fp4-smooth-v",
+    action="store_true",
+    default=False,
+    help="FP4 V-mean smoothing: subtract the per-(b,hkv) V column mean "
+    "before V quantize (persist_d D<=256; requires --enable-fp4).",
+  )
+  parser.add_argument(
     "--fp4-hybrid-n-early",
     type=int,
     default=256,
@@ -686,6 +693,8 @@ def _resolve_directional_cli_flags(
     args.fp4_pv_mm_type = "fp4"
   if not hasattr(args, "fp4_hadamard"):
     args.fp4_hadamard = False
+  if not hasattr(args, "fp4_smooth_v"):
+    args.fp4_smooth_v = False
   return args
 
 
@@ -1781,6 +1790,7 @@ def _benchmark_rows(
         fp4_hybrid_n_early=args.fp4_hybrid_n_early,
         fp4_pv_mm_type=args.fp4_pv_mm_type,
         fp4_hadamard=args.fp4_hadamard,
+        fp4_smooth_v=args.fp4_smooth_v,
       ),
     )
   if args.backward:

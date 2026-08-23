@@ -128,14 +128,18 @@ __global__ void kv_mean_finalize_kernel(const float* __restrict__ partials,
     for (int c = 0; c < chunks; ++c)
       s += partials[(static_cast<long>(bh) * chunks + c) * D + d];
     const float m = s * inv_n;
-    km[static_cast<long>(bh) * D + d] = static_cast<Element>(m);
+    if (km)
+      km[static_cast<long>(bh) * D + d] = static_cast<Element>(m);
     km_f32[static_cast<long>(bh) * D + d] = m;
   }
 }
 
 // Per-(b,h) seqlen mean of K [Nb, Nh_kv, Nkv, D]; any D % 8 == 0. Writes km
-// (in-dtype) and km_f32; partials is fp32 scratch (Nb*Nh_kv, chunks, D) with
-// chunks = ceil(Nkv / 512), allocated by the caller.
+// (in-dtype, may be nullptr to skip - the fp4 smooth_v path only needs the
+// fp32 mean) and km_f32; partials is fp32 scratch (Nb*Nh_kv, chunks, D) with
+// chunks = ceil(Nkv / 512), allocated by the caller. The mean is exact over
+// the true Nkv rows (chunk-tail guard); used both for K smoothing (fp8) and
+// V smoothing (fp4) - it is a generic column-mean primitive.
 template <typename Element, int kHeadDim>
 void launch_kv_mean_sm120(const Element* k_ptr, Element* km, float* km_f32,
                           float* partials, int Nb, int Nh_kv, int Nkv, int D_og,
