@@ -42,8 +42,14 @@ using CtaBarrier = cutlass::arch::ClusterBarrier;
 // D<768 -> M8N1 (P regs stay under the 255-reg ceiling), D>=768 -> this
 // M4N2 kernel. At D=1024 M8N1's o_acc = D/2 = 512 regs/thread spills to
 // local mem and collapses to ~100T; M4N2's D/4 = 256 regs keeps 154T.
+// kNhdQ / kNhdKV: Q (resp. K/V) arrive as an NHD (diffusers BNHD) permute
+// view, read as flat (B*N, H*D) TMA rows with the head as a column tile
+// (the (head * kHeadDim + d_chunk) second coord) and the batch via
+// domain_offset. BHND keeps the per-head row-offset domain_offset + plain
+// d_chunk column tile. O stays BHND-packed (caller allocates it packed).
 template <typename Traits, typename TmaQ, typename TmaK, typename TmaV,
-          typename TmaO, int kHasAttnBias = 0, int kHasDropout = 0>
+          typename TmaO, int kHasAttnBias = 0, int kHasDropout = 0,
+          bool kNhdQ = false, bool kNhdKV = false>
 __global__ void __launch_bounds__(Traits::kNumThreads, 1)
     split_d_m4n2_fwd_cute_sm120(
         CUTLASS_GRID_CONSTANT TmaQ const tma_q,
@@ -150,15 +156,39 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
   }
   __syncthreads();
 
-  auto mQ = domain_offset(
-      make_coord(q_row_offset, 0),
-      tma_q.get_tma_tensor(make_shape(total_q_rows, Int<kHeadDim>{})));
-  auto mK = domain_offset(
-      make_coord(kv_row_offset, 0),
-      tma_k.get_tma_tensor(make_shape(total_kv_rows, Int<kHeadDim>{})));
-  auto mV = domain_offset(
-      make_coord(kv_row_offset, 0),
-      tma_v.get_tma_tensor(make_shape(total_kv_rows, Int<kHeadDim>{})));
+  auto mQ = [&] {
+    if constexpr (kNhdQ)
+      return domain_offset(make_coord(static_cast<long>(Nb_id) * Nq, 0),
+                           tma_q.get_tma_tensor(make_shape(
+                               static_cast<long>(gridDim.y / Nh) * Nq,
+                               static_cast<long>(Nh) * kHeadDim)));
+    else
+      return domain_offset(
+          make_coord(q_row_offset, 0),
+          tma_q.get_tma_tensor(make_shape(total_q_rows, Int<kHeadDim>{})));
+  }();
+  auto mK = [&] {
+    if constexpr (kNhdKV)
+      return domain_offset(make_coord(static_cast<long>(Nb_id) * Nkv, 0),
+                           tma_k.get_tma_tensor(make_shape(
+                               static_cast<long>(gridDim.y / Nh) * Nkv,
+                               static_cast<long>(Nh_kv) * kHeadDim)));
+    else
+      return domain_offset(
+          make_coord(kv_row_offset, 0),
+          tma_k.get_tma_tensor(make_shape(total_kv_rows, Int<kHeadDim>{})));
+  }();
+  auto mV = [&] {
+    if constexpr (kNhdKV)
+      return domain_offset(make_coord(static_cast<long>(Nb_id) * Nkv, 0),
+                           tma_v.get_tma_tensor(make_shape(
+                               static_cast<long>(gridDim.y / Nh) * Nkv,
+                               static_cast<long>(Nh_kv) * kHeadDim)));
+    else
+      return domain_offset(
+          make_coord(kv_row_offset, 0),
+          tma_v.get_tma_tensor(make_shape(total_kv_rows, Int<kHeadDim>{})));
+  }();
   auto q_slice = tma_q.get_slice(_0{});
   auto k_slice = tma_k.get_slice(_0{});
   auto v_slice = tma_v.get_slice(_0{});
@@ -231,10 +261,23 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
                           SmemLayoutQ{});
     auto sK = make_tensor(make_smem_ptr(k_base + stage * kKChunkElements),
                           SmemLayoutK{});
-    auto gQ = local_tile(mQ, Shape<Int<kBr>, Int<kQKDChunk>>{},
-                         make_coord(Q_tile_id, d_chunk));
-    auto gK = local_tile(mK, Shape<Int<kBc>, Int<kQKDChunk>>{},
-                         make_coord(kv_tile_idx, d_chunk));
+    auto gQ = [&] {
+      if constexpr (kNhdQ)
+        return local_tile(mQ, Shape<Int<kBr>, Int<kQKDChunk>>{},
+                          make_coord(Q_tile_id, Nh_id * kDChunksQK + d_chunk));
+      else
+        return local_tile(mQ, Shape<Int<kBr>, Int<kQKDChunk>>{},
+                          make_coord(Q_tile_id, d_chunk));
+    }();
+    auto gK = [&] {
+      if constexpr (kNhdKV)
+        return local_tile(
+            mK, Shape<Int<kBc>, Int<kQKDChunk>>{},
+            make_coord(kv_tile_idx, kv_head_idx * kDChunksQK + d_chunk));
+      else
+        return local_tile(mK, Shape<Int<kBc>, Int<kQKDChunk>>{},
+                          make_coord(kv_tile_idx, d_chunk));
+    }();
     auto tQgQ = q_slice.partition_S(gQ);
     auto tQsQ = q_slice.partition_D(sQ);
     auto tKgK = k_slice.partition_S(gK);
@@ -249,8 +292,15 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
     cutlass::arch::fence_view_async_shared();
     auto sV = make_tensor(make_smem_ptr(v_base + stage * kVChunkElements),
                           SmemLayoutV{});
-    auto gV = local_tile(mV, Shape<Int<kBc>, Int<kVDChunk>>{},
-                         make_coord(kv_tile_idx, v_chunk));
+    auto gV = [&] {
+      if constexpr (kNhdKV)
+        return local_tile(
+            mV, Shape<Int<kBc>, Int<kVDChunk>>{},
+            make_coord(kv_tile_idx, kv_head_idx * kDChunksV + v_chunk));
+      else
+        return local_tile(mV, Shape<Int<kBc>, Int<kVDChunk>>{},
+                          make_coord(kv_tile_idx, v_chunk));
+    }();
     auto tVgV = v_slice.partition_S(gV);
     auto tVsV = v_slice.partition_D(sV);
     TmaBarrier::arrive_and_expect_tx(&v_full[stage],

@@ -143,8 +143,8 @@ void launch_ffpa_attn_fwd_template(
 #ifdef ENABLE_FFPA_TMA_EXT
   // NHD (diffusers BNHD) permute-view inputs are consumed natively by the
   // fp8/fp4 cute paths (pre-kernels via Fp8InputLayout/strides + batched 4D
-  // TMA in the persist-D hybrid stage-1 fp16 kernel) and by the sm_120
-  // fp16/bf16 cute persist-D kernel (D<=128, clean path). Every other fp16
+  // TMA in the persist-D hybrid stage-1 fp16 kernel) and by the whole sm_120
+  // fp16/bf16 cute family (persist-D, split-D, M4N2). Every other fp16
   // backend materializes packed copies here (same cost as a caller-side
   // permute+contiguous) instead of silently corrupting.
   bool nhd_in =
@@ -152,9 +152,8 @@ void launch_ffpa_attn_fwd_template(
   if (nhd_in && !force_fp8 && !force_fp4) {
     auto prop_nhd = at::cuda::getCurrentDeviceProperties();
     const bool fp16_nhd_ok = !force_tma && !force_native && !force_cute &&
-                             prop_nhd->major >= 12 && kHeadDim <= 128 &&
-                             kHeadDim % 32 == 0 && attn_bias.numel() == 0 &&
-                             dropout_p == 0.0;
+                             prop_nhd->major >= 12 && kHeadDim % 32 == 0 &&
+                             attn_bias.numel() == 0 && dropout_p == 0.0;
     if (!fp16_nhd_ok) {
       if (ffpa_is_nhd_view(Q))
         Q = Q.contiguous();
@@ -268,11 +267,6 @@ void launch_ffpa_attn_fwd_template(
           // stage array, see the comment above).
           TORCH_CHECK(!fp4_smooth_v,
                       "ffpa_attn: fp4_smooth_v supports persist_d (D<=256)");
-          TORCH_CHECK(
-              !(nhd_in && fp4_hybrid && Nq >= fp4_hybrid_n_early),
-              "ffpa_attn: fp4 split-D hybrid stage-1 (fp16 split-D) does "
-              "not support NHD/BNHD K/V; pass BHND-contiguous tensors or "
-              "disable the fp4 hybrid");
           if (fp4_hybrid && Nq >= fp4_hybrid_n_early) {
             const int n_early = static_cast<int>(fp4_hybrid_n_early);
             TORCH_CHECK(
@@ -313,11 +307,6 @@ void launch_ffpa_attn_fwd_template(
           // (same tile geometry); stage-2 takes the q_start_row offset.
           TORCH_CHECK(!fp4_smooth_v,
                       "ffpa_attn: fp4_smooth_v supports persist_d (D<=256)");
-          TORCH_CHECK(
-              !(nhd_in && fp4_hybrid && Nq >= fp4_hybrid_n_early),
-              "ffpa_attn: fp4 split-D hybrid stage-1 (fp16 split-D) does "
-              "not support NHD/BNHD K/V; pass BHND-contiguous tensors or "
-              "disable the fp4 hybrid");
           if (fp4_hybrid && Nq >= fp4_hybrid_n_early) {
             const int n_early = static_cast<int>(fp4_hybrid_n_early);
             TORCH_CHECK(

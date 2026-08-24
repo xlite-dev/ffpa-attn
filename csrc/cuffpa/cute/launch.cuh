@@ -147,32 +147,87 @@ void launch_cute_fwd_split_d_sm120(torch::Tensor Q, torch::Tensor K,
   const int total_q_rows = Nb * Nh * Nq;
   const int total_kv_rows = Nb * Nh_kv * Nkv;
 
-  auto gQ = make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(Q.data_ptr())),
-                        make_shape(total_q_rows, Int<kHeadDim>{}),
-                        make_stride(Int<kHeadDim>{}, _1{}));
-  auto gK = make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(K.data_ptr())),
-                        make_shape(total_kv_rows, Int<kHeadDim>{}),
-                        make_stride(Int<kHeadDim>{}, _1{}));
-  auto gV = make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(V.data_ptr())),
-                        make_shape(total_kv_rows, Int<kHeadDim>{}),
-                        make_stride(Int<kHeadDim>{}, _1{}));
-
-  auto tma_q = make_tma_copy(SM90_TMA_LOAD{}, gQ, SmemLayoutQ{},
-                             Shape<Int<kBr>, Int<kQKDChunk>>{}, _1{});
-  auto tma_k = make_tma_copy(SM90_TMA_LOAD{}, gK, SmemLayoutK{},
-                             Shape<Int<kBc>, Int<kQKDChunk>>{}, _1{});
-  auto tma_v = make_tma_copy(SM90_TMA_LOAD{}, gV, SmemLayoutV{},
-                             Shape<Int<kBc>, Int<kVDChunk>>{}, _1{});
+  // NHD (diffusers BNHD) permute views are consumed natively via flat
+  // (B*N, H*D) TMA rows (head as a column tile); O stays BHND-packed (the
+  // caller allocates it packed and re-views).
+  const bool q_nhd = ffpa_is_nhd_view(Q);
+  const bool kv_nhd = ffpa_is_nhd_view(K);
+  if (kv_nhd) {
+    TORCH_CHECK(ffpa_is_nhd_view(V),
+                "ffpa_attn: K and V must share the same memory layout");
+  } else {
+    TORCH_CHECK(K.stride(3) == 1 && K.stride(2) == (long)kHeadDim &&
+                    K.stride(1) == (long)Nkv * kHeadDim &&
+                    K.stride(0) == (long)Nh_kv * Nkv * kHeadDim,
+                "ffpa_attn: K must be BHND-contiguous or an NHD (BNHD) view");
+  }
+  if (!q_nhd)
+    TORCH_CHECK(Q.stride(3) == 1 && Q.stride(2) == (long)kHeadDim &&
+                    Q.stride(1) == (long)Nq * kHeadDim &&
+                    Q.stride(0) == (long)Nh * Nq * kHeadDim,
+                "ffpa_attn: Q must be BHND-contiguous or an NHD (BNHD) view");
 
   // O output TMA store descriptor: full O tensor [total_q_rows,kHeadDim],
-  // same shape/stride as gQ; per-head origin injected via domain_offset in
-  // kernel. Direction = SM90_TMA_STORE (first arg); swizzle auto-inferred
-  // from SmemLayoutO (matches the sO staging buffer's actual swizzle).
+  // same shape/stride as the BHND Q; per-head origin injected via
+  // domain_offset in kernel. Direction = SM90_TMA_STORE (first arg);
+  // swizzle auto-inferred from SmemLayoutO.
   auto gO = make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(O.data_ptr())),
                         make_shape(total_q_rows, Int<kHeadDim>{}),
                         make_stride(Int<kHeadDim>{}, _1{}));
   auto tma_o = make_tma_copy(SM90_TMA_STORE{}, gO, SmemLayoutO{},
                              Shape<Int<kBr>, Int<kVDChunk>>{}, _1{});
+
+  auto make_tma_q = [&](auto q_c) {
+    if constexpr (decltype(q_c)::value) {
+      auto gQ =
+          make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(Q.data_ptr())),
+                      make_shape((long)Nb * Nq, (long)Nh * kHeadDim),
+                      make_stride((long)Nh * kHeadDim, _1{}));
+      return make_tma_copy(SM90_TMA_LOAD{}, gQ, SmemLayoutQ{},
+                           Shape<Int<kBr>, Int<kQKDChunk>>{}, _1{});
+    } else {
+      auto gQ =
+          make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(Q.data_ptr())),
+                      make_shape(total_q_rows, Int<kHeadDim>{}),
+                      make_stride(Int<kHeadDim>{}, _1{}));
+      return make_tma_copy(SM90_TMA_LOAD{}, gQ, SmemLayoutQ{},
+                           Shape<Int<kBr>, Int<kQKDChunk>>{}, _1{});
+    }
+  };
+  auto make_tma_k = [&](auto kv_c) {
+    if constexpr (decltype(kv_c)::value) {
+      auto gK =
+          make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(K.data_ptr())),
+                      make_shape((long)Nb * Nkv, (long)Nh_kv * kHeadDim),
+                      make_stride((long)Nh_kv * kHeadDim, _1{}));
+      return make_tma_copy(SM90_TMA_LOAD{}, gK, SmemLayoutK{},
+                           Shape<Int<kBc>, Int<kQKDChunk>>{}, _1{});
+    } else {
+      auto gK =
+          make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(K.data_ptr())),
+                      make_shape(total_kv_rows, Int<kHeadDim>{}),
+                      make_stride(Int<kHeadDim>{}, _1{}));
+      return make_tma_copy(SM90_TMA_LOAD{}, gK, SmemLayoutK{},
+                           Shape<Int<kBc>, Int<kQKDChunk>>{}, _1{});
+    }
+  };
+  auto make_tma_v = [&](auto kv_c) {
+    if constexpr (decltype(kv_c)::value) {
+      auto gV =
+          make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(V.data_ptr())),
+                      make_shape((long)Nb * Nkv, (long)Nh_kv * kHeadDim),
+                      make_stride((long)Nh_kv * kHeadDim, _1{}));
+      return make_tma_copy(SM90_TMA_LOAD{}, gV, SmemLayoutV{},
+                           Shape<Int<kBc>, Int<kVDChunk>>{}, _1{});
+    } else {
+      auto gV =
+          make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(V.data_ptr())),
+                      make_shape(total_kv_rows, Int<kHeadDim>{}),
+                      make_stride(Int<kHeadDim>{}, _1{}));
+      return make_tma_copy(SM90_TMA_LOAD{}, gV, SmemLayoutV{},
+                           Shape<Int<kBc>, Int<kVDChunk>>{}, _1{});
+    }
+  };
 
   constexpr int kQTileBytes = kBr * kQKDChunk * sizeof(Element);
   constexpr int kKTileBytes = kBc * kQKDChunk * sizeof(Element);
@@ -184,34 +239,47 @@ void launch_cute_fwd_split_d_sm120(torch::Tensor Q, torch::Tensor K,
       softmax_lse.numel() > 0 ? softmax_lse.data_ptr<float>() : nullptr;
   auto O_ptr = reinterpret_cast<Element*>(O.data_ptr());
 
-  auto launch_variant = [&](auto kernel_func) {
-    cudaFuncSetAttribute(
-        kernel_func, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes);
-    kernel_func<<<grid, block, kSmemBytes, stream>>>(
-        tma_q, tma_k, tma_v, tma_o, O_ptr, softmax_lse_ptr, Nq, Nkv, Nh, Nh_kv,
-        scale, Tc, causal, total_q_rows, total_kv_rows, attn_bias_ptr,
-        attn_bias_dtype, attn_bias_stride_b, attn_bias_stride_h,
-        attn_bias_stride_m, attn_bias_stride_n, dropout_p_f, philox_seed_u,
-        philox_offset_u);
+  const auto run = [&](auto tma_q, auto tma_k, auto tma_v, auto q_c,
+                       auto kv_c) {
+    constexpr bool kNhdQ = decltype(q_c)::value;
+    constexpr bool kNhdKV = decltype(kv_c)::value;
+
+    auto launch_variant = [&](auto kernel_func) {
+      cudaFuncSetAttribute(
+          kernel_func, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes);
+      kernel_func<<<grid, block, kSmemBytes, stream>>>(
+          tma_q, tma_k, tma_v, tma_o, O_ptr, softmax_lse_ptr, Nq, Nkv, Nh,
+          Nh_kv, scale, Tc, causal, total_q_rows, total_kv_rows, attn_bias_ptr,
+          attn_bias_dtype, attn_bias_stride_b, attn_bias_stride_h,
+          attn_bias_stride_m, attn_bias_stride_n, dropout_p_f, philox_seed_u,
+          philox_offset_u);
+    };
+
+    using TmaQ = decltype(tma_q);
+    using TmaK = decltype(tma_k);
+    using TmaV = decltype(tma_v);
+    using TmaO = decltype(tma_o);
+    if (has_attn_bias && has_dropout) {
+      launch_variant(split_d_fwd_cute_sm120<Traits, TmaQ, TmaK, TmaV, TmaO, 1,
+                                            1, kNhdQ, kNhdKV>);
+    } else if (has_attn_bias) {
+      launch_variant(split_d_fwd_cute_sm120<Traits, TmaQ, TmaK, TmaV, TmaO, 1,
+                                            0, kNhdQ, kNhdKV>);
+    } else if (has_dropout) {
+      launch_variant(split_d_fwd_cute_sm120<Traits, TmaQ, TmaK, TmaV, TmaO, 0,
+                                            1, kNhdQ, kNhdKV>);
+    } else {
+      launch_variant(split_d_fwd_cute_sm120<Traits, TmaQ, TmaK, TmaV, TmaO, 0,
+                                            0, kNhdQ, kNhdKV>);
+    }
   };
 
-  using TmaQ = decltype(tma_q);
-  using TmaK = decltype(tma_k);
-  using TmaV = decltype(tma_v);
-  using TmaO = decltype(tma_o);
-  if (has_attn_bias && has_dropout) {
-    launch_variant(
-        split_d_fwd_cute_sm120<Traits, TmaQ, TmaK, TmaV, TmaO, 1, 1>);
-  } else if (has_attn_bias) {
-    launch_variant(
-        split_d_fwd_cute_sm120<Traits, TmaQ, TmaK, TmaV, TmaO, 1, 0>);
-  } else if (has_dropout) {
-    launch_variant(
-        split_d_fwd_cute_sm120<Traits, TmaQ, TmaK, TmaV, TmaO, 0, 1>);
-  } else {
-    launch_variant(
-        split_d_fwd_cute_sm120<Traits, TmaQ, TmaK, TmaV, TmaO, 0, 0>);
-  }
+  if (kv_nhd)
+    run(make_tma_q(std::true_type{}), make_tma_k(std::true_type{}),
+        make_tma_v(std::true_type{}), std::true_type{}, std::true_type{});
+  else
+    run(make_tma_q(std::false_type{}), make_tma_k(std::false_type{}),
+        make_tma_v(std::false_type{}), std::false_type{}, std::false_type{});
 }
 
 // M4N2 launcher: kBr=64, kBc=64, atom_layout=(4,2,1). Uses
@@ -308,22 +376,25 @@ void launch_cute_fwd_split_d_m4n2_sm120(torch::Tensor Q, torch::Tensor K,
   const int total_q_rows = Nb * Nh * Nq;
   const int total_kv_rows = Nb * Nh_kv * Nkv;
 
-  auto gQ = make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(Q.data_ptr())),
-                        make_shape(total_q_rows, Int<kHeadDim>{}),
-                        make_stride(Int<kHeadDim>{}, _1{}));
-  auto gK = make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(K.data_ptr())),
-                        make_shape(total_kv_rows, Int<kHeadDim>{}),
-                        make_stride(Int<kHeadDim>{}, _1{}));
-  auto gV = make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(V.data_ptr())),
-                        make_shape(total_kv_rows, Int<kHeadDim>{}),
-                        make_stride(Int<kHeadDim>{}, _1{}));
-
-  auto tma_q = make_tma_copy(SM90_TMA_LOAD{}, gQ, SmemLayoutQ{},
-                             Shape<Int<kBr>, Int<kQKDChunk>>{}, _1{});
-  auto tma_k = make_tma_copy(SM90_TMA_LOAD{}, gK, SmemLayoutK{},
-                             Shape<Int<kBc>, Int<kQKDChunk>>{}, _1{});
-  auto tma_v = make_tma_copy(SM90_TMA_LOAD{}, gV, SmemLayoutV{},
-                             Shape<Int<kBc>, Int<kVDChunk>>{}, _1{});
+  // NHD (diffusers BNHD) permute views are consumed natively via flat
+  // (B*N, H*D) TMA rows (head as a column tile); O stays BHND-packed (the
+  // caller allocates it packed and re-views).
+  const bool q_nhd = ffpa_is_nhd_view(Q);
+  const bool kv_nhd = ffpa_is_nhd_view(K);
+  if (kv_nhd) {
+    TORCH_CHECK(ffpa_is_nhd_view(V),
+                "ffpa_attn: K and V must share the same memory layout");
+  } else {
+    TORCH_CHECK(K.stride(3) == 1 && K.stride(2) == (long)kHeadDim &&
+                    K.stride(1) == (long)Nkv * kHeadDim &&
+                    K.stride(0) == (long)Nh_kv * Nkv * kHeadDim,
+                "ffpa_attn: K must be BHND-contiguous or an NHD (BNHD) view");
+  }
+  if (!q_nhd)
+    TORCH_CHECK(Q.stride(3) == 1 && Q.stride(2) == (long)kHeadDim &&
+                    Q.stride(1) == (long)Nq * kHeadDim &&
+                    Q.stride(0) == (long)Nh * Nq * kHeadDim,
+                "ffpa_attn: Q must be BHND-contiguous or an NHD (BNHD) view");
 
   auto gO = make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(O.data_ptr())),
                         make_shape(total_q_rows, Int<kHeadDim>{}),
@@ -331,40 +402,105 @@ void launch_cute_fwd_split_d_m4n2_sm120(torch::Tensor Q, torch::Tensor K,
   auto tma_o = make_tma_copy(SM90_TMA_STORE{}, gO, SmemLayoutO{},
                              Shape<Int<kBr>, Int<kVDChunk>>{}, _1{});
 
+  auto make_tma_q = [&](auto q_c) {
+    if constexpr (decltype(q_c)::value) {
+      auto gQ =
+          make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(Q.data_ptr())),
+                      make_shape((long)Nb * Nq, (long)Nh * kHeadDim),
+                      make_stride((long)Nh * kHeadDim, _1{}));
+      return make_tma_copy(SM90_TMA_LOAD{}, gQ, SmemLayoutQ{},
+                           Shape<Int<kBr>, Int<kQKDChunk>>{}, _1{});
+    } else {
+      auto gQ =
+          make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(Q.data_ptr())),
+                      make_shape(total_q_rows, Int<kHeadDim>{}),
+                      make_stride(Int<kHeadDim>{}, _1{}));
+      return make_tma_copy(SM90_TMA_LOAD{}, gQ, SmemLayoutQ{},
+                           Shape<Int<kBr>, Int<kQKDChunk>>{}, _1{});
+    }
+  };
+  auto make_tma_k = [&](auto kv_c) {
+    if constexpr (decltype(kv_c)::value) {
+      auto gK =
+          make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(K.data_ptr())),
+                      make_shape((long)Nb * Nkv, (long)Nh_kv * kHeadDim),
+                      make_stride((long)Nh_kv * kHeadDim, _1{}));
+      return make_tma_copy(SM90_TMA_LOAD{}, gK, SmemLayoutK{},
+                           Shape<Int<kBc>, Int<kQKDChunk>>{}, _1{});
+    } else {
+      auto gK =
+          make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(K.data_ptr())),
+                      make_shape(total_kv_rows, Int<kHeadDim>{}),
+                      make_stride(Int<kHeadDim>{}, _1{}));
+      return make_tma_copy(SM90_TMA_LOAD{}, gK, SmemLayoutK{},
+                           Shape<Int<kBc>, Int<kQKDChunk>>{}, _1{});
+    }
+  };
+  auto make_tma_v = [&](auto kv_c) {
+    if constexpr (decltype(kv_c)::value) {
+      auto gV =
+          make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(V.data_ptr())),
+                      make_shape((long)Nb * Nkv, (long)Nh_kv * kHeadDim),
+                      make_stride((long)Nh_kv * kHeadDim, _1{}));
+      return make_tma_copy(SM90_TMA_LOAD{}, gV, SmemLayoutV{},
+                           Shape<Int<kBc>, Int<kVDChunk>>{}, _1{});
+    } else {
+      auto gV =
+          make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(V.data_ptr())),
+                      make_shape(total_kv_rows, Int<kHeadDim>{}),
+                      make_stride(Int<kHeadDim>{}, _1{}));
+      return make_tma_copy(SM90_TMA_LOAD{}, gV, SmemLayoutV{},
+                           Shape<Int<kBc>, Int<kVDChunk>>{}, _1{});
+    }
+  };
+
   constexpr int kSmemBytes = Traits::kSmemElems * sizeof(Element);
 
   float* softmax_lse_ptr =
       softmax_lse.numel() > 0 ? softmax_lse.data_ptr<float>() : nullptr;
   auto O_ptr = reinterpret_cast<Element*>(O.data_ptr());
 
-  auto launch_variant = [&](auto kernel_func) {
-    cudaFuncSetAttribute(
-        kernel_func, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes);
-    kernel_func<<<grid, block, kSmemBytes, stream>>>(
-        tma_q, tma_k, tma_v, tma_o, O_ptr, softmax_lse_ptr, Nq, Nkv, Nh, Nh_kv,
-        scale, Tc, causal, total_q_rows, total_kv_rows, attn_bias_ptr,
-        attn_bias_dtype, attn_bias_stride_b, attn_bias_stride_h,
-        attn_bias_stride_m, attn_bias_stride_n, dropout_p_f, philox_seed_u,
-        philox_offset_u);
+  const auto run = [&](auto tma_q, auto tma_k, auto tma_v, auto q_c,
+                       auto kv_c) {
+    constexpr bool kNhdQ = decltype(q_c)::value;
+    constexpr bool kNhdKV = decltype(kv_c)::value;
+
+    auto launch_variant = [&](auto kernel_func) {
+      cudaFuncSetAttribute(
+          kernel_func, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes);
+      kernel_func<<<grid, block, kSmemBytes, stream>>>(
+          tma_q, tma_k, tma_v, tma_o, O_ptr, softmax_lse_ptr, Nq, Nkv, Nh,
+          Nh_kv, scale, Tc, causal, total_q_rows, total_kv_rows, attn_bias_ptr,
+          attn_bias_dtype, attn_bias_stride_b, attn_bias_stride_h,
+          attn_bias_stride_m, attn_bias_stride_n, dropout_p_f, philox_seed_u,
+          philox_offset_u);
+    };
+
+    using TmaQ = decltype(tma_q);
+    using TmaK = decltype(tma_k);
+    using TmaV = decltype(tma_v);
+    using TmaO = decltype(tma_o);
+    if (has_attn_bias && has_dropout) {
+      launch_variant(split_d_m4n2_fwd_cute_sm120<Traits, TmaQ, TmaK, TmaV, TmaO,
+                                                 1, 1, kNhdQ, kNhdKV>);
+    } else if (has_attn_bias) {
+      launch_variant(split_d_m4n2_fwd_cute_sm120<Traits, TmaQ, TmaK, TmaV, TmaO,
+                                                 1, 0, kNhdQ, kNhdKV>);
+    } else if (has_dropout) {
+      launch_variant(split_d_m4n2_fwd_cute_sm120<Traits, TmaQ, TmaK, TmaV, TmaO,
+                                                 0, 1, kNhdQ, kNhdKV>);
+    } else {
+      launch_variant(split_d_m4n2_fwd_cute_sm120<Traits, TmaQ, TmaK, TmaV, TmaO,
+                                                 0, 0, kNhdQ, kNhdKV>);
+    }
   };
 
-  using TmaQ = decltype(tma_q);
-  using TmaK = decltype(tma_k);
-  using TmaV = decltype(tma_v);
-  using TmaO = decltype(tma_o);
-  if (has_attn_bias && has_dropout) {
-    launch_variant(
-        split_d_m4n2_fwd_cute_sm120<Traits, TmaQ, TmaK, TmaV, TmaO, 1, 1>);
-  } else if (has_attn_bias) {
-    launch_variant(
-        split_d_m4n2_fwd_cute_sm120<Traits, TmaQ, TmaK, TmaV, TmaO, 1, 0>);
-  } else if (has_dropout) {
-    launch_variant(
-        split_d_m4n2_fwd_cute_sm120<Traits, TmaQ, TmaK, TmaV, TmaO, 0, 1>);
-  } else {
-    launch_variant(
-        split_d_m4n2_fwd_cute_sm120<Traits, TmaQ, TmaK, TmaV, TmaO, 0, 0>);
-  }
+  if (kv_nhd)
+    run(make_tma_q(std::true_type{}), make_tma_k(std::true_type{}),
+        make_tma_v(std::true_type{}), std::true_type{}, std::true_type{});
+  else
+    run(make_tma_q(std::false_type{}), make_tma_k(std::false_type{}),
+        make_tma_v(std::false_type{}), std::false_type{}, std::false_type{});
 }
 
 template <typename kDataType, const int kHeadDim, const int kStage>

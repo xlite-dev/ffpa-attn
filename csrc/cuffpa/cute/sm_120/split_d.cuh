@@ -18,8 +18,14 @@
 using TmaBarrier = cutlass::arch::ClusterTransactionBarrier;
 using CtaBarrier = cutlass::arch::ClusterBarrier;
 
+// kNhdQ / kNhdKV: Q (resp. K/V) arrive as an NHD (diffusers BNHD) permute
+// view, read as flat (B*N, H*D) TMA rows with the head as a column tile
+// (the (head * kHeadDim + d_chunk) second coord) and the batch via
+// domain_offset. BHND keeps the per-head row-offset domain_offset + plain
+// d_chunk column tile. O stays BHND-packed (caller allocates it packed).
 template <typename Traits, typename TmaQ, typename TmaK, typename TmaV,
-          typename TmaO, int kHasAttnBias = 0, int kHasDropout = 0>
+          typename TmaO, int kHasAttnBias = 0, int kHasDropout = 0,
+          bool kNhdQ = false, bool kNhdKV = false>
 __global__ void __launch_bounds__(Traits::kNumThreads, 1)
     split_d_fwd_cute_sm120(
         CUTLASS_GRID_CONSTANT TmaQ const tma_q,
@@ -120,6 +126,13 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
   if (Br_base >= Nq)
     return;
 
+  // Per-head global row origins for the BHND path (NHD folds the head into
+  // the column tile, so it needs only the batch offset via domain_offset).
+  // Using the true per-head row count (Nq / Nkv) rather than ceil(N/kBr)*kBr
+  // keeps the TMA row coordinate correct when N % kBr != 0 (non-aligned).
+  const int q_row_offset = (Nb_id * Nh + Nh_id) * Nq;
+  const int kv_row_offset = (Nb_id * Nh_kv + kv_head_idx) * Nkv;
+
   const int kv_offset = Nkv - Nq;
   const int causal_thresh_row0 = Br_base + kv_offset;
   const int Tc_eff =
@@ -127,14 +140,43 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
   const int mask_start_tile =
       causal ? max(0, (causal_thresh_row0 + 1) / kBc) : INT_MAX;
 
-  // Per-head global row origins injected into the TMA views via domain_offset
-  // below. Using the true per-head row count (Nq / Nkv) rather than
-  // ceil(N/kBr)*kBr keeps the TMA row coordinate correct when N % kBr != 0
-  // (the non-aligned case); folding the head dim into the tile index would
-  // accumulate a (kBr - N%kBr) row misalignment per head.
-  const int q_row_offset = (Nb_id * Nh + Nh_id) * Nq;
-  const int kv_row_offset = (Nb_id * Nh_kv + kv_head_idx) * Nkv;
-
+  // NHD (diffusers BNHD): flat (B*N, H*D) TMA rows with the head as a
+  // kHeadDim-wide column tile; batch rides domain_offset. BHND: per-head row
+  // offset into a plain (B*H*N, D) row-major tensor.
+  const long nb = gridDim.y / Nh;
+  auto mQ = [&] {
+    if constexpr (kNhdQ)
+      return domain_offset(
+          make_coord(static_cast<long>(Nb_id) * Nq, 0),
+          tma_q.get_tma_tensor(make_shape(static_cast<long>(nb) * Nq,
+                                          static_cast<long>(Nh) * kHeadDim)));
+    else
+      return domain_offset(
+          make_coord(q_row_offset, 0),
+          tma_q.get_tma_tensor(make_shape(total_q_rows, Int<kHeadDim>{})));
+  }();
+  auto mK = [&] {
+    if constexpr (kNhdKV)
+      return domain_offset(make_coord(static_cast<long>(Nb_id) * Nkv, 0),
+                           tma_k.get_tma_tensor(make_shape(
+                               static_cast<long>(nb) * Nkv,
+                               static_cast<long>(Nh_kv) * kHeadDim)));
+    else
+      return domain_offset(
+          make_coord(kv_row_offset, 0),
+          tma_k.get_tma_tensor(make_shape(total_kv_rows, Int<kHeadDim>{})));
+  }();
+  auto mV = [&] {
+    if constexpr (kNhdKV)
+      return domain_offset(make_coord(static_cast<long>(Nb_id) * Nkv, 0),
+                           tma_v.get_tma_tensor(make_shape(
+                               static_cast<long>(nb) * Nkv,
+                               static_cast<long>(Nh_kv) * kHeadDim)));
+    else
+      return domain_offset(
+          make_coord(kv_row_offset, 0),
+          tma_v.get_tma_tensor(make_shape(total_kv_rows, Int<kHeadDim>{})));
+  }();
   // SMEM layout: [q_base | k_base | v_base], each with kStages copies.
   extern __shared__ __align__(1024) Element shm[];
   Element* q_base = shm;
@@ -171,27 +213,6 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
   }
   __syncthreads();
 
-  // TMA tensor views: 2D [total_rows, kHeadDim] with row-major stride. The
-  // per-head row origin (q_row_offset / kv_row_offset) is injected via
-  // domain_offset so the TMA row coordinate equals head*N + tile*kBr, which
-  // stays correct when N % kBr != 0 (non-aligned). The tile coordinate passed
-  // to local_tile below is then the per-head local tile id (Q_tile_id /
-  // kv_tile_idx), not a head-folded global tile index. Out-of-range rows on
-  // the last tile are zero-padded by the TMA descriptor (K tail is masked to
-  // -inf in softmax; Q/O tail rows are dropped by the store predicate).
-  // domain_offset(coord, layout) returns (same_layout, layout(coord)) -- i.e.
-  // the SAME tensor layout with its origin pointer advanced by coord, so the
-  // TMA row coordinate equals head*N + tile*kBr without re-wrapping the TMA
-  // tensor descriptor. local_tile below then uses per-head local tile ids.
-  auto mQ = domain_offset(
-      make_coord(q_row_offset, 0),
-      tma_q.get_tma_tensor(make_shape(total_q_rows, Int<kHeadDim>{})));
-  auto mK = domain_offset(
-      make_coord(kv_row_offset, 0),
-      tma_k.get_tma_tensor(make_shape(total_kv_rows, Int<kHeadDim>{})));
-  auto mV = domain_offset(
-      make_coord(kv_row_offset, 0),
-      tma_v.get_tma_tensor(make_shape(total_kv_rows, Int<kHeadDim>{})));
   auto q_slice = tma_q.get_slice(_0{});
   auto k_slice = tma_k.get_slice(_0{});
   auto v_slice = tma_v.get_slice(_0{});
@@ -309,10 +330,25 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
                           SmemLayoutQ{});
     auto sK = make_tensor(make_smem_ptr(k_base + stage * kKChunkElements),
                           SmemLayoutK{});
-    auto gQ = local_tile(mQ, Shape<Int<kBr>, Int<kQKDChunk>>{},
-                         make_coord(Q_tile_id, d_chunk));
-    auto gK = local_tile(mK, Shape<Int<kBc>, Int<kQKDChunk>>{},
-                         make_coord(kv_tile_idx, d_chunk));
+    // NHD: head rides the column tile (head * kHeadDim + d_chunk); BHND: the
+    // d_chunk column tile of a per-head row offset tensor.
+    auto gQ = [&] {
+      if constexpr (kNhdQ)
+        return local_tile(mQ, Shape<Int<kBr>, Int<kQKDChunk>>{},
+                          make_coord(Q_tile_id, Nh_id * kDChunksQK + d_chunk));
+      else
+        return local_tile(mQ, Shape<Int<kBr>, Int<kQKDChunk>>{},
+                          make_coord(Q_tile_id, d_chunk));
+    }();
+    auto gK = [&] {
+      if constexpr (kNhdKV)
+        return local_tile(
+            mK, Shape<Int<kBc>, Int<kQKDChunk>>{},
+            make_coord(kv_tile_idx, kv_head_idx * kDChunksQK + d_chunk));
+      else
+        return local_tile(mK, Shape<Int<kBc>, Int<kQKDChunk>>{},
+                          make_coord(kv_tile_idx, d_chunk));
+    }();
     auto tQgQ = q_slice.partition_S(gQ);
     auto tQsQ = q_slice.partition_D(sQ);
     auto tKgK = k_slice.partition_S(gK);
@@ -327,8 +363,15 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
     cutlass::arch::fence_view_async_shared();
     auto sV = make_tensor(make_smem_ptr(v_base + stage * kVChunkElements),
                           SmemLayoutV{});
-    auto gV = local_tile(mV, Shape<Int<kBc>, Int<kVDChunk>>{},
-                         make_coord(kv_tile_idx, v_chunk));
+    auto gV = [&] {
+      if constexpr (kNhdKV)
+        return local_tile(
+            mV, Shape<Int<kBc>, Int<kVDChunk>>{},
+            make_coord(kv_tile_idx, kv_head_idx * kDChunksV + v_chunk));
+      else
+        return local_tile(mV, Shape<Int<kBc>, Int<kVDChunk>>{},
+                          make_coord(kv_tile_idx, v_chunk));
+    }();
     auto tVgV = v_slice.partition_S(gV);
     auto tVsV = v_slice.partition_D(sV);
     TmaBarrier::arrive_and_expect_tx(&v_full[stage],
