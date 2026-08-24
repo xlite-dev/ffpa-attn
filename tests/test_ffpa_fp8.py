@@ -137,42 +137,43 @@ def test_fp8_perf_vs_sage_sdpa(capsys):
 
 
 def _set_qk_int8(monkeypatch, enable: bool) -> None:
-  # "0" forces fp8 QK (causal now auto-selects int8 when the env is unset).
-  monkeypatch.setenv("FFPA_FP8_QK_INT8", "1" if enable else "0")
-
-
-def test_fp8_qk_int8_param_priority(monkeypatch):
-  # CUDABackend.qk_int8 param beats the FFPA_FP8_QK_INT8 env; None falls
-  # back to env, then to the causal-based auto default.
-  torch.manual_seed(0)
-  B, H, N, D = 1, 8, 2048, 128
-  q = torch.randn(B, H, N, D, dtype=torch.bfloat16, device="cuda") * 0.5
-  k = torch.randn(B, H, N, D, dtype=torch.bfloat16, device="cuda") * 0.5
-  v = torch.randn(B, H, N, D, dtype=torch.bfloat16, device="cuda") * 0.5
-
-  def run(qk_int8, env: str | None = None):
-    if env is None:
-      monkeypatch.delenv("FFPA_FP8_QK_INT8", raising=False)
-    else:
-      monkeypatch.setenv("FFPA_FP8_QK_INT8", env)
-    backend = CUDABackend(
+  # The FFPA_FP8_QK_INT8 env was removed; swap the backend factory directly.
+  def backend():
+    return CUDABackend(
       backward=False,
       enable_tma=True,
       enable_cute=True,
       enable_fp8=True,
-      qk_int8=qk_int8,
+      fp8_qk_mm_type="int8" if enable else "fp8",
     )
-    return ffpa_attn_func(q, k, v, is_causal=False, forward_backend=backend)
 
-  fp8, int8 = run(False), run(True)
-  assert not torch.equal(fp8, int8)
-  assert torch.equal(run(None), fp8)  # dense auto -> fp8
-  assert torch.equal(run(None, env="1"), int8)  # env fallback
-  assert torch.equal(run(False, env="1"), fp8)  # param beats env
-  assert torch.equal(run(True, env="0"), int8)
+  monkeypatch.setitem(globals(), "_fp8_backend", backend)
 
 
-def _fp8_out_lse(q, k, v, causal: bool, smooth_k: bool = True):
+def test_fp8_qk_mm_type_validation():
+  # fp8_qk_mm_type replaces the removed qk_int8 param / FFPA_FP8_QK_INT8 env.
+  assert _fp8_backend().fp8_qk_mm_type == "fp8"
+  int8_backend = CUDABackend(
+    backward=False,
+    enable_tma=True,
+    enable_cute=True,
+    enable_fp8=True,
+    fp8_qk_mm_type="int8",
+  )
+  assert int8_backend.fp8_qk_mm_type_code == 1
+  with pytest.raises(AssertionError):
+    CUDABackend(
+      backward=False,
+      enable_tma=True,
+      enable_cute=True,
+      enable_fp8=True,
+      fp8_qk_mm_type="bogus",
+    )
+
+
+def _fp8_out_lse(
+  q, k, v, causal: bool, smooth_k: bool = True, qk_int8: bool = False
+):
   from ffpa_attn.cuda import set_cuda_backend_impl, CudaBackendImpl
   from ffpa_attn.cuda._ffpa_fwd import _ffpa_attn_forward_cuda
 
@@ -184,6 +185,7 @@ def _fp8_out_lse(q, k, v, causal: bool, smooth_k: bool = True):
     causal=int(causal),
     softmax_scale=q.size(-1)**-0.5,
     fp8_smooth_k=smooth_k,
+    fp8_qk_mm_type=int(qk_int8),
   )
 
 
@@ -243,7 +245,9 @@ def test_fp8_smooth_k_and_lse(qk_int8, smooth_k, monkeypatch):
   k = torch.randn(B, H, N, D, dtype=torch.float16, device="cuda") * 0.5
   v = torch.randn(B, H, N, D, dtype=torch.float16, device="cuda") * 0.5
 
-  out, lse = _fp8_out_lse(q, k, v, causal=False, smooth_k=smooth_k)
+  out, lse = _fp8_out_lse(
+    q, k, v, causal=False, smooth_k=smooth_k, qk_int8=qk_int8
+  )
   p = (q.float() @ k.float().transpose(-1, -2)) * (D**-0.5)
   ref = torch.softmax(p, dim=-1) @ v.float()
   lse_ref = torch.logsumexp(p, dim=-1)
@@ -278,7 +282,7 @@ def test_fp8_nkv_unaligned_parity(qk_int8, monkeypatch):
   k = torch.randn(B, H, N, D, dtype=torch.float16, device="cuda") * 0.5
   v = torch.randn(B, H, N, D, dtype=torch.float16, device="cuda") * 0.5
 
-  out, lse = _fp8_out_lse(q, k, v, causal=True)
+  out, lse = _fp8_out_lse(q, k, v, causal=True, qk_int8=qk_int8)
   ref = F.scaled_dot_product_attention(
     q.float(), k.float(), v.float(), is_causal=True
   )
@@ -302,7 +306,7 @@ def test_fp8_nq_not_multiple_of_8_lse(qk_int8, monkeypatch):
   k = torch.randn(B, H, N, D, dtype=torch.float16, device="cuda") * 0.5
   v = torch.randn(B, H, N, D, dtype=torch.float16, device="cuda") * 0.5
 
-  out, lse = _fp8_out_lse(q, k, v, causal=True)
+  out, lse = _fp8_out_lse(q, k, v, causal=True, qk_int8=qk_int8)
   ref = F.scaled_dot_product_attention(
     q.float(), k.float(), v.float(), is_causal=True
   )
@@ -326,7 +330,7 @@ def test_fp8_nkv_unaligned_dense_parity(qk_int8, monkeypatch):
   k = torch.randn(B, H, N, D, dtype=torch.float16, device="cuda") * 0.5
   v = torch.randn(B, H, N, D, dtype=torch.float16, device="cuda") * 0.5
 
-  out, lse = _fp8_out_lse(q, k, v, causal=False)
+  out, lse = _fp8_out_lse(q, k, v, causal=False, qk_int8=qk_int8)
   ref = F.scaled_dot_product_attention(q.float(), k.float(), v.float())
   torch.testing.assert_close(out.float(), ref, atol=4e-2, rtol=4e-2)
   p = (q.float() @ k.float().transpose(-1, -2)) * (D**-0.5)
@@ -432,7 +436,7 @@ def test_fp8_split_d_nkv_unaligned_lse(D, qk_int8, monkeypatch):
   k = torch.randn(B, H, N, D, dtype=torch.float16, device="cuda") * 0.5
   v = torch.randn(B, H, N, D, dtype=torch.float16, device="cuda") * 0.5
 
-  out, lse = _fp8_out_lse(q, k, v, causal=True)
+  out, lse = _fp8_out_lse(q, k, v, causal=True, qk_int8=qk_int8)
   ref = F.scaled_dot_product_attention(
     q.float(), k.float(), v.float(), is_causal=True
   )
@@ -456,7 +460,9 @@ def test_fp8_split_d_smooth_k_and_lse(D, qk_int8, smooth_k, monkeypatch):
   k = torch.randn(B, H, N, D, dtype=torch.float16, device="cuda") * 0.5
   v = torch.randn(B, H, N, D, dtype=torch.float16, device="cuda") * 0.5
 
-  out, lse = _fp8_out_lse(q, k, v, causal=False, smooth_k=smooth_k)
+  out, lse = _fp8_out_lse(
+    q, k, v, causal=False, smooth_k=smooth_k, qk_int8=qk_int8
+  )
   p = (q.float() @ k.float().transpose(-1, -2)) * (D**-0.5)
   ref = torch.softmax(p, dim=-1) @ v.float()
   lse_ref = torch.logsumexp(p, dim=-1)
