@@ -3,6 +3,8 @@
 #include <cute/tensor.hpp>
 #include <cutlass/cutlass.h>
 
+#include "input_layout.cuh"
+
 namespace ffpa_fp8 {
 
 // Reference (smooth_k semantics + lse correction):
@@ -61,7 +63,8 @@ constexpr int kMeanRowsPerChunk = 512;
 template <typename Element, int kD>
 __global__ void kv_col_sum_kernel(const Element* __restrict__ k,
                                   float* __restrict__ partials, int Nkv,
-                                  int rows_per_chunk, int D_og) {
+                                  int rows_per_chunk, int D_og,
+                                  ffpa_fp8::Fp8InputLayout L) {
   constexpr int kVec = 16 / sizeof(Element);  // 8 half/bf16 per 16B
   constexpr int kColsPerRow = kD / kVec;      // uint4s per row
   constexpr int kThreads = 256;
@@ -72,7 +75,7 @@ __global__ void kv_col_sum_kernel(const Element* __restrict__ k,
   const int bh = blockIdx.y;
   const int row0 = chunk * rows_per_chunk;
   const int row_end = min(row0 + rows_per_chunk, Nkv);
-  const Element* k_bh = k + static_cast<long>(bh) * Nkv * D_og;
+  const Element* k_bh = k + ffpa_fp8::fp8_plane_base(L, bh);
   const int col0 = (threadIdx.x % kColsPerRow) * kVec;
 
   float acc[kVec];
@@ -84,7 +87,7 @@ __global__ void kv_col_sum_kernel(const Element* __restrict__ k,
     for (int r = row0 + threadIdx.x / kColsPerRow; r < row_end;
          r += kRowsPerIter) {
       const uint4 packed = *reinterpret_cast<const uint4*>(
-          k_bh + static_cast<long>(r) * D_og + col0);
+          k_bh + static_cast<long>(r) * L.s_row + col0);
       const Element* vals = reinterpret_cast<const Element*>(&packed);
 #pragma unroll
       for (int i = 0; i < kVec; ++i)
@@ -143,12 +146,18 @@ __global__ void kv_mean_finalize_kernel(const float* __restrict__ partials,
 template <typename Element, int kHeadDim>
 void launch_kv_mean_sm120(const Element* k_ptr, Element* km, float* km_f32,
                           float* partials, int Nb, int Nh_kv, int Nkv, int D_og,
-                          cudaStream_t stream) {
+                          cudaStream_t stream,
+                          const Fp8InputLayout* L = nullptr) {
+  Fp8InputLayout bhnd;
+  if (!L) {
+    bhnd = {false, 0, 0, static_cast<long>(Nkv) * D_og, D_og};
+    L = &bhnd;
+  }
   const int bh = Nb * Nh_kv;
   const int chunks = (Nkv + kMeanRowsPerChunk - 1) / kMeanRowsPerChunk;
   dim3 grid(chunks, bh);
-  kv_col_sum_kernel<Element, kHeadDim>
-      <<<grid, 256, 0, stream>>>(k_ptr, partials, Nkv, kMeanRowsPerChunk, D_og);
+  kv_col_sum_kernel<Element, kHeadDim><<<grid, 256, 0, stream>>>(
+      k_ptr, partials, Nkv, kMeanRowsPerChunk, D_og, *L);
   kv_mean_finalize_kernel<Element>
       <<<bh, 128, 0, stream>>>(partials, km, km_f32, chunks, Nkv, kHeadDim);
 }

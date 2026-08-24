@@ -174,9 +174,11 @@ def run_ffpa(
   q, k, v, causal, gqa, preset="default", no_hybrid=False, with_permute=False
 ):
   if with_permute:
-    # Simulate the cache-dit E2E path: NHD [B,N,H,D] inputs permuted to BHND
-    # contiguous before ffpa_attn_func (layout overhead included in timing).
-    q, k, v = (x.permute(0, 2, 1, 3).contiguous() for x in (q, k, v))
+    # cache-dit E2E path: inputs arrive as diffusers NHD [B,N,H,D] storage;
+    # ffpa consumes them natively via a zero-copy permute view (Phase C, no
+    # transpose copy). The storage itself was materialized OUTSIDE the timed
+    # region in run_scenario.
+    q, k, v = (x.permute(0, 2, 1, 3) for x in (q, k, v))
   return ffpa_attn_func(
     q,
     k,
@@ -191,10 +193,11 @@ def run_sage(q, k, v, causal, gqa, with_permute=False):
   if not SAGE_INSTALLED:
     return None
   # sageattn handles GQA natively (Hq % Hkv == 0); no KV repeat needed.
-  # with_permute: feed NHD tensors like diffusers does (zero-copy for sage).
+  # with_permute: q/k/v are already NHD [B,N,H,D] storage (diffusers native);
+  # the NHD kernel returns [B,N,H,D], transpose back for BHND comparison.
   if with_permute:
-    q, k, v = (x.permute(0, 2, 1, 3) for x in (q, k, v))
-    return sageattn(q, k, v, tensor_layout="NHD", is_causal=causal)
+    return sageattn(q, k, v, tensor_layout="NHD",
+                    is_causal=causal).permute(0, 2, 1, 3)
   return sageattn(q, k, v, tensor_layout="HND", is_causal=causal)
 
 
@@ -269,12 +272,22 @@ def run_scenario(
   q, k, v = _mk(sc.B, sc.Hq, sc.Hkv, sc.Nq, sc.Nkv, sc.D, dtype, scale)
   ref = ref_bf16(q, k, v, sc.causal, sc.gqa, sdpa_name).to(dtype)
   sdpa_label = f"SDPA-{sdpa_name.upper()}"
+  if with_permute:
+    # Materialize diffusers-style NHD [B,N,H,D] storage ONCE, outside every
+    # timed region: ffpa consumes it via zero-copy permute views (Phase C),
+    # sage natively; this mirrors real pipelines where attention inputs are
+    # produced in NHD by upstream ops. SDPA still gets zero-copy BHND views
+    # (it has no NHD mode here).
+    q, k, v = (x.permute(0, 2, 1, 3).contiguous() for x in (q, k, v))
+    sq, sk, sv = (x.permute(0, 2, 1, 3) for x in (q, k, v))
+  else:
+    sq, sk, sv = q, k, v
 
   outs = {
     "FFPA-FP8":
     run_ffpa(q, k, v, sc.causal, sc.gqa, preset, no_hybrid, with_permute),
     sdpa_label:
-    run_sdpa(q, k, v, sc.causal, sc.gqa, sdpa_name),
+    run_sdpa(sq, sk, sv, sc.causal, sc.gqa, sdpa_name),
   }
   if use_sage:
     sage_out = run_sage(q, k, v, sc.causal, sc.gqa, with_permute)
@@ -285,7 +298,7 @@ def run_scenario(
   # Bench order: SDPA pre-heat (unmeasured) stabilizes GPU clock/power first,
   # then FFPA, then Sage, then SDPA (reference). Measured backends run hot.
   for _ in range(5):
-    run_sdpa(q, k, v, sc.causal, sc.gqa, sdpa_name)
+    run_sdpa(sq, sk, sv, sc.causal, sc.gqa, sdpa_name)
   torch.cuda.synchronize()
   fns = {
     "FFPA-FP8":
@@ -294,7 +307,7 @@ def run_scenario(
   }
   if use_sage and SAGE_INSTALLED:
     fns["Sage"] = lambda: run_sage(q, k, v, sc.causal, sc.gqa, with_permute)
-  fns[sdpa_label] = lambda: run_sdpa(q, k, v, sc.causal, sc.gqa, sdpa_name)
+  fns[sdpa_label] = lambda: run_sdpa(sq, sk, sv, sc.causal, sc.gqa, sdpa_name)
   ms = {
     name: bench_ms(fn, warmup=warmup, iters=iters)
     for name, fn in fns.items()

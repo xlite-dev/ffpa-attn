@@ -3,6 +3,8 @@
 #include <cute/tensor.hpp>
 #include <cutlass/cutlass.h>
 
+#include "input_layout.cuh"
+
 namespace ffpa_fp8 {
 
 // Reference (V mean smoothing):
@@ -20,7 +22,8 @@ __global__ void v_col_stats_kernel(const Element* __restrict__ v,
                                    float* __restrict__ partials_sum,
                                    float* __restrict__ partials_max,
                                    float* __restrict__ partials_min, int Nkv,
-                                   int rows_per_chunk, int D_og) {
+                                   int rows_per_chunk, int D_og,
+                                   Fp8InputLayout L) {
   constexpr int kVec = 16 / sizeof(Element);  // 8 half/bf16 per 16B
   constexpr int kColsPerRow = kD / kVec;
   constexpr int kThreads = 256;
@@ -29,7 +32,7 @@ __global__ void v_col_stats_kernel(const Element* __restrict__ v,
   const int bh = blockIdx.y;
   const int row0 = chunk * rows_per_chunk;
   const int row_end = min(row0 + rows_per_chunk, Nkv);
-  const Element* v_bh = v + static_cast<long>(bh) * Nkv * D_og;
+  const Element* v_bh = v + fp8_plane_base(L, bh);
   const int col0 = (threadIdx.x % kColsPerRow) * kVec;
 
   float sum_acc[kVec], max_acc[kVec], min_acc[kVec];
@@ -45,7 +48,7 @@ __global__ void v_col_stats_kernel(const Element* __restrict__ v,
     for (int r = row0 + threadIdx.x / kColsPerRow; r < row_end;
          r += kRowsPerIter) {
       const uint4 packed = *reinterpret_cast<const uint4*>(
-          v_bh + static_cast<long>(r) * D_og + col0);
+          v_bh + static_cast<long>(r) * L.s_row + col0);
       const Element* vals = reinterpret_cast<const Element*>(&packed);
 #pragma unroll
       for (int i = 0; i < kVec; ++i) {
@@ -151,13 +154,19 @@ void launch_v_stats_sm120(const Element* v_ptr, float* vm, float* v_scale,
                           float* partials_sum, float* partials_max,
                           float* partials_min, int Nb, int Nh_kv, int Nkv,
                           cudaStream_t stream, int D_og,
-                          float v_scale_max = 448.0f) {
+                          float v_scale_max = 448.0f,
+                          const Fp8InputLayout* L = nullptr) {
+  Fp8InputLayout bhnd;
+  if (!L) {
+    bhnd = {false, 0, 0, static_cast<long>(Nkv) * D_og, D_og};
+    L = &bhnd;
+  }
   const int bh = Nb * Nh_kv;
   const int chunks = (Nkv + kVStatsRowsPerChunk - 1) / kVStatsRowsPerChunk;
   dim3 grid(chunks, bh);
-  v_col_stats_kernel<Element, kHeadDim>
-      <<<grid, 256, 0, stream>>>(v_ptr, partials_sum, partials_max,
-                                 partials_min, Nkv, kVStatsRowsPerChunk, D_og);
+  v_col_stats_kernel<Element, kHeadDim><<<grid, 256, 0, stream>>>(
+      v_ptr, partials_sum, partials_max, partials_min, Nkv, kVStatsRowsPerChunk,
+      D_og, *L);
   v_stats_finalize_kernel<kHeadDim, kSmoothV><<<bh, kHeadDim, 0, stream>>>(
       partials_sum, partials_max, partials_min, vm, v_scale, chunks, Nkv,
       v_scale_max, D_og);
