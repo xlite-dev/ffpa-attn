@@ -183,7 +183,7 @@ def _fp8_out_lse(q, k, v, causal: bool, smooth_k: bool = True):
     v,
     causal=int(causal),
     softmax_scale=q.size(-1)**-0.5,
-    smooth_k=smooth_k,
+    fp8_smooth_k=smooth_k,
   )
 
 
@@ -311,6 +311,58 @@ def test_fp8_nq_not_multiple_of_8_lse(qk_int8, monkeypatch):
   mask = torch.triu(torch.ones(N, N, device="cuda"), diagonal=1).bool()
   lse_ref = torch.logsumexp(p.masked_fill(mask, float("-inf")), dim=-1)
   torch.testing.assert_close(lse.float(), lse_ref, atol=5e-2, rtol=1e-3)
+
+
+# Regression (Wan2.1-T2V self-attn, dense Nq=Nkv=14040, black-video bug): the
+# V^T quantize kernels left the [Nkv, Nkv_pad) pad columns uninitialized, TMA
+# loaded them into the tail tile, and 0 * NaN garbage poisoned O for every
+# fp8 config. Dense + Nkv%16!=0 is the trigger; causal tests missed it.
+@pytest.mark.parametrize("qk_int8", [False, True], ids=["fp8-qk", "int8-qk"])
+def test_fp8_nkv_unaligned_dense_parity(qk_int8, monkeypatch):
+  _set_qk_int8(monkeypatch, qk_int8)
+  torch.manual_seed(0)
+  B, H, N, D = 1, 8, 2120, 128  # N % 128 != 0 and N % 16 != 0, dense
+  q = torch.randn(B, H, N, D, dtype=torch.float16, device="cuda") * 0.5
+  k = torch.randn(B, H, N, D, dtype=torch.float16, device="cuda") * 0.5
+  v = torch.randn(B, H, N, D, dtype=torch.float16, device="cuda") * 0.5
+
+  out, lse = _fp8_out_lse(q, k, v, causal=False)
+  ref = F.scaled_dot_product_attention(q.float(), k.float(), v.float())
+  torch.testing.assert_close(out.float(), ref, atol=4e-2, rtol=4e-2)
+  p = (q.float() @ k.float().transpose(-1, -2)) * (D**-0.5)
+  lse_ref = torch.logsumexp(p, dim=-1)
+  torch.testing.assert_close(lse.float(), lse_ref, atol=5e-2, rtol=1e-3)
+
+
+def test_fp8_wan_self_attn_shape_parity():
+  # Wan2.1-T2V 480x832x33f self-attention shape (9*30*52 tokens, bf16, dense)
+  # with the cache-dit default ffpa_fp8 config (int8 QK + f16 PV acc +
+  # per_thread QK + per_channel V): NaN-free and within the dense parity bar.
+  torch.manual_seed(0)
+  B, H, N, D = 1, 40, 14040, 128
+  q = torch.randn(B, H, N, D, dtype=torch.bfloat16, device="cuda") * 0.5
+  k = torch.randn(B, H, N, D, dtype=torch.bfloat16, device="cuda") * 0.5
+  v = torch.randn(B, H, N, D, dtype=torch.bfloat16, device="cuda") * 0.5
+
+  backend = CUDABackend(
+    backward=False,
+    enable_tma=True,
+    enable_cute=True,
+    enable_fp8=True,
+    fp8_qk_mm_type="int8",
+    fp8_pv_acc_type="f16",
+    fp8_q_quant_method="per_thread",
+    fp8_k_quant_method="per_thread",
+    fp8_v_quant_method="per_channel",
+    fp8_smooth_k=True,
+    fp8_smooth_v=True,
+    fp8_hybrid=True,
+    fp8_hybrid_n_early=256,
+  )
+  out = ffpa_attn_func(q, k, v, is_causal=False, forward_backend=backend)
+  ref = F.scaled_dot_product_attention(q.float(), k.float(), v.float())
+  assert not torch.isnan(out.float()).any()
+  torch.testing.assert_close(out.float(), ref, atol=4e-2, rtol=4e-2)
 
 
 # Split-D path: D>128 routes to a separate kernel (split_d.cuh) that

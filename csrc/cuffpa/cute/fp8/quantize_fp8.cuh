@@ -300,9 +300,12 @@ __global__ void quantize_fp8_vt_kernel(
 #pragma unroll
         for (int t = 0; t < kBlockRows / 32; ++t) {
           const int n = t * 32 + lane;
-          if (row0 + n < N)
+          // Pad cols [N, ldy) must be zeroed: TMA loads them into the tail
+          // tile and 0 * NaN garbage poisons O.
+          if (row0 + n < ldy)
             VT[vt_base + static_cast<long>(c) * ldy + row0 + t * 32 +
-               lane_slot] = tile[n][it + cc];
+               lane_slot] =
+                (row0 + n < N) ? tile[n][it + cc] : __nv_fp8_e4m3(0.0f);
         }
       }
     }
@@ -526,9 +529,12 @@ __global__ void quantize_fp8_qkv_fused_kernel(
 #pragma unroll
           for (int t = 0; t < kBlockRows / 32; ++t) {
             const int n = t * 32 + lane;
-            if (row0 + n < N)
+            // Pad cols [N, ldy) must be zeroed: TMA loads them into the
+            // tail tile and 0 * NaN garbage poisons O.
+            if (row0 + n < ldy)
               VT8[vt_base + static_cast<long>(c) * ldy + row0 + t * 32 +
-                  lane_slot] = tile[n][it + cc];
+                  lane_slot] =
+                  (row0 + n < N) ? tile[n][it + cc] : __nv_fp8_e4m3(0.0f);
           }
         }
       }
@@ -635,9 +641,12 @@ __global__ void quantize_fp8_vt_perchannel_kernel(
 #pragma unroll
         for (int t = 0; t < kBlockRows / 32; ++t) {
           const int n = t * 32 + lane;
-          if (row0 + n < N)
+          // Pad cols [N, ldy) must be zeroed: TMA loads them into the tail
+          // tile and 0 * NaN garbage poisons O.
+          if (row0 + n < ldy)
             VT[vt_base + static_cast<long>(c) * ldy + row0 + t * 32 +
-               lane_slot] = tile[n][it + cc];
+               lane_slot] =
+                (row0 + n < N) ? tile[n][it + cc] : __nv_fp8_e4m3(0.0f);
         }
       }
     }
