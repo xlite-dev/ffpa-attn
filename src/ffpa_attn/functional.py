@@ -1052,7 +1052,8 @@ class _FFPAAttnFunc(torch.autograd.Function):
         forward_meta.fp8_hybrid_n_early,
         forward_meta.fp4_hybrid,
         forward_meta.fp4_hybrid_n_early,
-        forward_meta.fp4_hadamard or forward_meta.fp8_hadamard,
+        forward_meta.fp8_hadamard,
+        forward_meta.fp4_hadamard,
         1 if forward_meta.fp4_pv_mm_type == "fp8" else 0,
         forward_meta.fp4_smooth_v,
       )
