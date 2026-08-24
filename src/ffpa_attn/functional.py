@@ -247,7 +247,14 @@ class CUDABackend(Backend):
   :ivar fp8_k_quant_method: FP8 K quant granularity, ``"per_block"`` or
       ``"per_thread"`` (must match ``fp8_q_quant_method``).
   :ivar fp8_v_quant_method: FP8 V quant granularity, ``"per_block"`` or
-      ``"per_channel"``.
+      ``"per_channel"``. Defaults to ``"per_channel"``: SageAttention
+      (arXiv:2406.12943) shows V exhibits channel-wise outliers that a
+      per-block scale cannot contain (one block-wide amax lets a single
+      outlier crush the whole block), so it quantizes V per-channel
+      ("per-channel quantization can address the channel-wised outlier of
+      V"); SageAttention2 (arXiv:2410.21265) keeps V per-channel and adds
+      optional smooth-V. Per-block V is kept for exact regressions but is
+      not recommended for outlier-heavy activations.
   :ivar fp8_pv_acc_type: FP8 PV accumulator dtype, ``"f32"`` or ``"f16"``.
   :ivar fp8_qk_mm_type: FP8 QK MMA dtype, ``"fp8"`` (e4m3) or ``"int8"``.
   :ivar fp8_hybrid: 2-stage hybrid for the fp8 path — fp16 computes the
@@ -286,7 +293,10 @@ class CUDABackend(Backend):
   fp8_smooth_v: bool = False  # FP8 only: subtract per-(b,h) V dim mean.
   fp8_q_quant_method: str = "per_block"  # FP8 only: per_block / per_thread.
   fp8_k_quant_method: str = "per_block"  # FP8 only: per_block / per_thread.
-  fp8_v_quant_method: str = "per_block"  # FP8 only; per_block / per_channel.
+  # Default per_channel: V has channel-wise outliers; a per_block scale is
+  # shared by an entire 128-row tile and a single outlier drives the amax,
+  # crushing every other row (SageAttention, arXiv:2406.12943 Sec 4.3).
+  fp8_v_quant_method: str = "per_channel"  # FP8 only; per_block / per_channel.
   fp8_pv_acc_type: str = "f32"  # FP8 only; f32/f16 PV accumulator.
   fp8_qk_mm_type: str = "fp8"  # FP8 only: QK MMA dtype; "fp8" or "int8".
   # Hybrid — fp16 computes [0:n_early] rows, the quantized path computes
