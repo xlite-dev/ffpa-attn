@@ -234,6 +234,45 @@ class CUDABackend(Backend):
       out. CUDA-backend only.
   :ivar enable_ws: Accepted for API compatibility with the Triton backend;
       the CUDA sm120 path is always warp-specialised when ``enable_tma`` is on.
+  :ivar enable_fp8: FP8 persist-D sm120 path (fp16/bf16 inputs, Q/K/V
+      quantized inside the kernel).
+  :ivar enable_fp4: NVFP4 persist-D sm120 path (any D%8==0 within [8,256],
+      pads up to {64,128,192,256}). Mutually exclusive with ``enable_fp8``.
+  :ivar fp8_smooth_k: FP8 only: subtract the per-(b,h) K sequence mean
+      before quantization.
+  :ivar fp8_smooth_v: FP8 only: subtract the per-(b,h) V dim mean.
+      Requires ``fp8_v_quant_method='per_channel'``.
+  :ivar fp8_q_quant_method: FP8 Q quant granularity, ``"per_block"`` or
+      ``"per_thread"``.
+  :ivar fp8_k_quant_method: FP8 K quant granularity, ``"per_block"`` or
+      ``"per_thread"`` (must match ``fp8_q_quant_method``).
+  :ivar fp8_v_quant_method: FP8 V quant granularity, ``"per_block"`` or
+      ``"per_channel"``.
+  :ivar fp8_pv_acc_type: FP8 PV accumulator dtype, ``"f32"`` or ``"f16"``.
+  :ivar fp8_qk_mm_type: FP8 QK MMA dtype, ``"fp8"`` (e4m3) or ``"int8"``.
+  :ivar fp8_hybrid: 2-stage hybrid for the fp8 path — fp16 computes the
+      [0:n_early] rows and fp8 the [n_early:N) rows via a q_start_row offset.
+      ``None`` (default) is auto: enabled when causal + ``enable_fp8``.
+  :ivar fp8_hybrid_n_early: Leading fp16 row count for the fp8 hybrid mode
+      (multiple of 128, default 256).
+  :ivar fp4_hybrid: Same 2-stage hybrid for the fp4 path; ``None`` is auto
+      (causal + ``enable_fp4``).
+  :ivar fp4_hybrid_n_early: Leading fp16 row count for the fp4 hybrid mode
+      (multiple of 128, default 256).
+  :ivar fp8_hadamard: FP8 only: rotate Q/K by an orthogonal Walsh-Hadamard
+      matrix before quantization (incoherent processing as in
+      FlashAttention-3, arXiv:2407.08608 Sec 3.3; exact in fp32 math).
+  :ivar fp4_hadamard: FP4 only: same Walsh-Hadamard Q/K pre-rotation for
+      the NVFP4 path (pow2 D rotates inside the quantize kernel).
+  :ivar fp4_pv_mm_type: FP4 PV MMA dtype, ``"fp4"`` (NVFP4 e2m1+ue4m3/16)
+      or ``"fp8"`` (MXFP8 e4m3+ue8m0/32, QK stays NVFP4; smem budget
+      limits fp8 to D<=192).
+  :ivar fp4_smooth_v: FP4 only (persist_d, D<=256): subtract the
+      per-(b,hkv) V column mean before V quantize; the kernel epilogue adds
+      it back (softmax rows sum to 1).
+  :ivar is_causal: Runtime flag propagated from
+      ``ffpa_attn_func(is_causal=...)`` by ``normalize_inputs``; drives the
+      hybrid auto-resolve. Not a user constructor argument.
   """
   name: str = "cuda"
   acc: str = "f32"
