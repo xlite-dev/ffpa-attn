@@ -1050,9 +1050,12 @@ class _FFPAAttnFunc(torch.autograd.Function):
     use_aten_small_d_forward = _should_use_aten_small_d_forward(
       meta.forward_meta, head_dim
     )
-    O = torch.empty_like(q)  # noqa: E741
+    # O is allocated per path: the aten/Triton paths consume a caller-allocated
+    # buffer, while the CUDA/CuTeDSL wrappers ignore it (del O) and allocate
+    # their own storage.
 
     if use_aten_small_d_forward:
+      O = torch.empty_like(q)  # noqa: E741
       O, lse, rng_state, unused = _flash_attn_forward_aten(
         q,
         k,
@@ -1071,7 +1074,7 @@ class _FFPAAttnFunc(torch.autograd.Function):
         q,
         k,
         v,
-        O,
+        None,
         attn_bias,
         forward_meta.stages,
         forward_meta.acc_code,
@@ -1100,6 +1103,7 @@ class _FFPAAttnFunc(torch.autograd.Function):
       forward_meta = meta.forward_meta
       assert forward_meta.forward, "forward_meta must be configured with forward=True"
       rng_state = _reserve_large_d_dropout_rng(q, k, meta.attn_meta.dropout_p)
+      O = torch.empty_like(q)  # noqa: E741
       O, lse = _ffpa_attn_forward_triton(
         q,
         k,

@@ -870,13 +870,15 @@ __global__ void quantize_fp8_perthread_k_kernel(
 // Per-thread QK quantize launcher: Q 64 scale/block, K 4 scale/block.
 // VT (V transposed) uses the regular per-block e4m3 quantize. Q/K quantize
 // kernels are launched separately (no fused path). smooth-K applied to K.
+// skip_vt: per-channel V config re-quantizes vt8 in a separate kernel that
+// overwrites this pass, so the per-block VT launch is dead work — skip it.
 template <typename Element, int kBr, int kBc, int kHeadDim, bool kQKInt8>
 void launch_quantize_fp8_perthread_qk_sm120(
     const Element* q_ptr, const Element* k_ptr, const Element* v_ptr, void* q8,
     void* k8, __nv_fp8_e4m3* vt8, float* q_scale, float* k_scale,
     float* v_scale, int B, int Nh, int Nh_kv, int Nq, int Nkv, int Nkv_pad,
     int D_og, cudaStream_t stream, const Element* km = nullptr,
-    bool perm_vt = false) {
+    bool perm_vt = false, bool skip_vt = false) {
   using QKOut = QKOutT<kQKInt8>;
   // Q: 128-row blocks, 64 scale per block.
   {
@@ -893,7 +895,7 @@ void launch_quantize_fp8_perthread_qk_sm120(
                                  Nkv, Nh_kv, D_og, km, 1.0f);
   }
   // VT: regular per-block e4m3 quantize (same as launch_quantize_fp8_sm120).
-  {
+  if (!skip_vt) {
     constexpr int kDChunk = (kHeadDim < 256) ? kHeadDim : 256;
     constexpr int kVtSmemBytes = kBc * (kDChunk + 16);
     dim3 grid((Nkv + kBc - 1) / kBc, B * Nh_kv);
@@ -919,6 +921,9 @@ void launch_quantize_fp8_perthread_qk_sm120(
 // perm_vt: write V^T with the reorg-free column permutation (VTPermInv32);
 // the attention kernel consuming this VT must use PackC8bitToA8bitPermVT
 // (launcher pairing in launch.cuh; on by default for the gated config).
+// skip_vt: per-channel V config re-quantizes vt8 afterwards, so the per-block
+// VT work (fused role 2 / separate kernel) is dead — skip it (grid.z drops
+// to 2 in the fused path).
 template <typename Element, int kBr, int kBc, int kHeadDim, bool kQKInt8>
 void launch_quantize_fp8_sm120(const Element* q_ptr, const Element* k_ptr,
                                const Element* v_ptr, void* q8, void* k8,
@@ -927,7 +932,7 @@ void launch_quantize_fp8_sm120(const Element* q_ptr, const Element* k_ptr,
                                int Nh_kv, int Nq, int Nkv, int Nkv_pad,
                                int D_og, cudaStream_t stream,
                                const Element* km = nullptr,
-                               bool perm_vt = false) {
+                               bool perm_vt = false, bool skip_vt = false) {
   using QKOut = QKOutT<kQKInt8>;
   constexpr int kThreads = 128;
   // Dynamic smem for the VT staging tile (1B/elem); must match the kernels'
@@ -936,9 +941,10 @@ void launch_quantize_fp8_sm120(const Element* q_ptr, const Element* k_ptr,
   constexpr int kDChunk = (kHeadDim < 256) ? kHeadDim : 256;
   constexpr int kVtSmemBytes = kBc * (kDChunk + 16);
   // Fused path: single launch for Q+K+VT when grids match (self-attention).
+  // skip_vt drops the VT role (z=2); roles 0/1 are independent blocks.
   if constexpr (kBr == kBc) {
     if (Nq == Nkv && Nh == Nh_kv) {
-      dim3 grid((Nq + kBr - 1) / kBr, B * Nh, 3);
+      dim3 grid((Nq + kBr - 1) / kBr, B * Nh, skip_vt ? 2 : 3);
       const auto launch_fused = [&](auto kernel) {
         cudaFuncSetAttribute(
             kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kVtSmemBytes);
@@ -968,7 +974,7 @@ void launch_quantize_fp8_sm120(const Element* q_ptr, const Element* k_ptr,
         <<<grid_k, kThreads, 0, stream>>>(k_ptr, reinterpret_cast<QKOut*>(k8),
                                           k_scale, Nkv, Nh_kv, D_og, km, 1.0f);
   }
-  {
+  if (!skip_vt) {
     dim3 grid_kv((Nkv + kBc - 1) / kBc, B * Nh_kv);
     const auto launch_vt = [&](auto kernel) {
       cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,

@@ -651,14 +651,14 @@ void launch_cute_fwd_persist_d_fp8_sm120_impl(
         reinterpret_cast<__nv_fp8_e4m3*>(vt8.data_ptr()),
         q_scale.data_ptr<float>(), k_scale.data_ptr<float>(),
         v_scale_quant.data_ptr<float>(), Nb, Nh, Nh_kv, Nq, Nkv, Nkv_pad, D_og,
-        stream, km_ptr, reorg_free);
+        stream, km_ptr, reorg_free, v_per_channel);
   } else {
     ffpa_fp8::launch_quantize_fp8_sm120<kDataType, kBr, kBc, kHeadDim, kQKInt8>(
         q_ptr, k_ptr, v_ptr, q8.data_ptr(), k8.data_ptr(),
         reinterpret_cast<__nv_fp8_e4m3*>(vt8.data_ptr()),
         q_scale.data_ptr<float>(), k_scale.data_ptr<float>(),
         v_scale_quant.data_ptr<float>(), Nb, Nh, Nh_kv, Nq, Nkv, Nkv_pad, D_og,
-        stream, km_ptr, reorg_free);
+        stream, km_ptr, reorg_free, v_per_channel);
   }
 
   // Per-channel V (sage-style): re-quantize V with per-D scale via coalesced
@@ -990,14 +990,14 @@ void launch_cute_fwd_split_d_fp8_sm120_impl(
         reinterpret_cast<__nv_fp8_e4m3*>(vt8.data_ptr()),
         q_scale.data_ptr<float>(), k_scale.data_ptr<float>(),
         v_scale_quant.data_ptr<float>(), Nb, Nh, Nh_kv, Nq, Nkv, Nkv_pad, D_og,
-        stream, km_ptr, reorg_free);
+        stream, km_ptr, reorg_free, v_per_channel);
   } else {
     ffpa_fp8::launch_quantize_fp8_sm120<kDataType, kBr, kBc, kHeadDim, kQKInt8>(
         q_ptr, k_ptr, v_ptr, q8.data_ptr(), k8.data_ptr(),
         reinterpret_cast<__nv_fp8_e4m3*>(vt8.data_ptr()),
         q_scale.data_ptr<float>(), k_scale.data_ptr<float>(),
         v_scale_quant.data_ptr<float>(), Nb, Nh, Nh_kv, Nq, Nkv, Nkv_pad, D_og,
-        stream, km_ptr, reorg_free);
+        stream, km_ptr, reorg_free, v_per_channel);
   }
 
   // Per-channel V (sage-style): re-quantize V with per-D scale via coalesced
@@ -1309,14 +1309,14 @@ void launch_cute_fwd_split_d_m4n2_fp8_sm120_impl(
         reinterpret_cast<__nv_fp8_e4m3*>(vt8.data_ptr()),
         q_scale.data_ptr<float>(), k_scale.data_ptr<float>(),
         v_scale_quant.data_ptr<float>(), Nb, Nh, Nh_kv, Nq, Nkv, Nkv_pad, D_og,
-        stream, km_ptr);
+        stream, km_ptr, false, v_per_channel);
   } else {
     ffpa_fp8::launch_quantize_fp8_sm120<kDataType, kBr, kBc, kHeadDim, kQKInt8>(
         q_ptr, k_ptr, v_ptr, q8.data_ptr(), k8.data_ptr(),
         reinterpret_cast<__nv_fp8_e4m3*>(vt8.data_ptr()),
         q_scale.data_ptr<float>(), k_scale.data_ptr<float>(),
         v_scale_quant.data_ptr<float>(), Nb, Nh, Nh_kv, Nq, Nkv, Nkv_pad, D_og,
-        stream, km_ptr);
+        stream, km_ptr, false, v_per_channel);
   }
   // Per-channel V (sage-style): re-quantize V with per-D scale via coalesced
   // stats (sum+max+min -> mean+amax) + quantize/transpose. smooth_v subtracts
