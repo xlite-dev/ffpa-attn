@@ -218,7 +218,7 @@ python3 -m cache_dit.generate flux --attn ffpa_fp4 --seed 42 --height 1024 --wid
 
 <i> FLUX.1-dev, seed=42, 28 steps, 2048 x 2048, NVIDIA RTX PRO 5000 </i>
 
-|SDPA-FA2 (92.3s)|FFPA-FP8 (81.3s)|SageAttn-3 (FP4, 80.4s)|FFPA-FP4 (77.3s)|
+|SDPA-FA2 (92.3s)|FFPA-FP8 (81.7s)|SageAttn-3 (FP4, 80.4s)|FFPA-FP4 (77.3s)|
 |:---:|:---:|:---:|:---:|
 |<img src="./docs/assets/flux.2048x2048.C0_native.png" width="180px">|<img src="./docs/assets/flux.2048x2048.C0_ffpa_fp8.png" width="180px">|<img src="./docs/assets/flux.2048x2048.C0_sage3.png" width="180px">|<img src="./docs/assets/flux.2048x2048.C0_ffpa_fp4.png" width="180px">|
 
