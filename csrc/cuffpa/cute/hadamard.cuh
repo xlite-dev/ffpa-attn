@@ -1,15 +1,32 @@
 // Walsh-Hadamard pre-rotation for the quantized QK paths (fp8 & fp4):
-// rotated Q/K copies are fed to the standard preprocessing chain. H is
-// orthogonal, so Q H H^T K^T == Q K^T exactly; the rotation only moves
-// where quantization noise lands (spreads per-dim outliers across D so
-// per-block/per-group amax drops). Same idea as FlashAttention-3's
-// incoherent processing (arXiv:2407.08608 Sec 3.3: randomized +/-1
-// diagonal x Hadamard fused into RoPE; up to 2.6x lower FP8 RMSE jointly
-// with block quantization). Width rule: full-width WHT for pow2 D <= 512,
-// blockdiag H_64 otherwise (needs kHeadDim % 64 == 0). The rotated copy is
-// kHeadDim-wide: cols >= d_og load as zeros and their rotated values are
-// STORED, so downstream full-width reads (d_og becomes kHeadDim) keep the
-// contraction exact instead of dropping energy into dead pad cols.
+// rotated Q/K copies are fed to the standard preprocessing chain.
+//
+// Math: the (unnormalized) Walsh-Hadamard matrix is defined recursively,
+//   H_1 = [1],   H_{2n} = | H_n  H_n |
+//                         | H_n -H_n |
+// Entries are +-1; the normalized form Hhat = H_n / sqrt(n) is orthogonal
+// (Hhat Hhat^T = I), so (Q Hhat)(K Hhat)^T = Q K^T exactly - softmax
+// logits are unchanged. The kernels below apply Hhat to each row via the
+// radix-2 butterfly ((a,b) -> (a+b, a-b), one pass per bit, no
+// bit-reversal) with the 1/sqrt(n) scale folded into the store.
+//
+// Why rotate at all: the rotation whitens each row - every output
+// coordinate is the signed sum of ALL inputs, so energy spreads uniformly
+// across coords (Hadamard "Jackson" property). The quantizers share one
+// scale per element block (per 16 for fp4, per block/group for fp8);
+// without rotation a single outlier coordinate dominates its block scale
+// and crushes the other values, while rotated rows have near-uniform
+// amplitudes -> block scales concentrate -> quantization noise drops.
+// Same idea as FlashAttention-3's incoherent processing
+// (arXiv:2407.08608 Sec 3.3: randomized +/-1 diagonal x Hadamard fused
+// into RoPE; up to 2.6x lower FP8 RMSE jointly with block quantization).
+//
+// Width rule: full-width WHT for pow2 D <= 512, blockdiag H_64 otherwise
+// (fp4 D is always a 64-multiple; the blockdiag fallback needs
+// kHeadDim % 64 == 0). The rotated copy is kHeadDim-wide: cols >= d_og
+// load as zeros and their rotated values are STORED, so downstream
+// full-width reads (d_og becomes kHeadDim) keep the contraction exact
+// instead of dropping energy into dead pad cols.
 #pragma once
 
 #include <ATen/cuda/CUDAContext.h>
