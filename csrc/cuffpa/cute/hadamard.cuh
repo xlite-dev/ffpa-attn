@@ -1,28 +1,32 @@
-// Walsh-Hadamard pre-rotation for the NVFP4 QK path.
+// Walsh-Hadamard pre-rotation for the quantized QK paths (fp8 & fp4):
+// rotated Q/K copies are fed to the standard preprocessing chain.
 //
 // Math: the (unnormalized) Walsh-Hadamard matrix is defined recursively,
 //   H_1 = [1],   H_{2n} = | H_n  H_n |
 //                         | H_n -H_n |
 // Entries are +-1; the normalized form Hhat = H_n / sqrt(n) is orthogonal
-// (Hhat Hhat^T = I). The kernels below apply Hhat to each row via the
+// (Hhat Hhat^T = I), so (Q Hhat)(K Hhat)^T = Q K^T exactly - softmax
+// logits are unchanged. The kernels below apply Hhat to each row via the
 // radix-2 butterfly ((a,b) -> (a+b, a-b), one pass per bit, no
 // bit-reversal) with the 1/sqrt(n) scale folded into the store.
 //
-// Why rotate at all: (Q Hhat)(K Hhat)^T = Q K^T exactly (orthogonality),
-// so softmax logits are unchanged. The rotation whitens each row: every
-// output coordinate is the signed sum of ALL inputs, so energy spreads
-// uniformly across coords (Hadamard "Jackson" property). fp4 quantizes
-// per 16-element blocks with one shared scale; without rotation a single
-// outlier coordinate dominates its block scale and crushes the other 15
-// values, while rotated rows have near-uniform amplitudes -> block scales
-// concentrate -> quantization noise drops. Rotated Q/K copies feed the
-// standard preprocessing chain (km/qm/quant/delta_s/lse).
+// Why rotate at all: the rotation whitens each row - every output
+// coordinate is the signed sum of ALL inputs, so energy spreads uniformly
+// across coords (Hadamard "Jackson" property). The quantizers share one
+// scale per element block (per 16 for fp4, per block/group for fp8);
+// without rotation a single outlier coordinate dominates its block scale
+// and crushes the other values, while rotated rows have near-uniform
+// amplitudes -> block scales concentrate -> quantization noise drops.
+// Same idea as FlashAttention-3's incoherent processing
+// (arXiv:2407.08608 Sec 3.3: randomized +/-1 diagonal x Hadamard fused
+// into RoPE; up to 2.6x lower FP8 RMSE jointly with block quantization).
 //
 // Width rule: full-width WHT for pow2 D <= 512, blockdiag H_64 otherwise
-// (fp4 D is always a 64-multiple). The rotated copy is kHeadDim-wide:
-// cols >= d_og load as zeros and their rotated values are STORED, so
-// downstream full-width reads (d_og becomes kHeadDim) keep the contraction
-// exact instead of dropping energy into dead pad cols.
+// (fp4 D is always a 64-multiple; the blockdiag fallback needs
+// kHeadDim % 64 == 0). The rotated copy is kHeadDim-wide: cols >= d_og
+// load as zeros and their rotated values are STORED, so downstream
+// full-width reads (d_og becomes kHeadDim) keep the contraction exact
+// instead of dropping energy into dead pad cols.
 #pragma once
 
 #include <ATen/cuda/CUDAContext.h>
@@ -31,7 +35,7 @@
 #include <cuda_fp16.h>
 #include <torch/all.h>
 
-namespace ffpa_fp4 {
+namespace ffpa {
 
 // One warp per (row, kWhtWidth-block); lane l owns cols {base + l + 32*j}.
 // Butterfly distances >= 32 swap register slots in-lane (bit lives in j),
@@ -115,12 +119,13 @@ void launch_wht_qk_t(const torch::Tensor& input, torch::Tensor& output) {
 template <typename T, int kHeadDim>
 torch::Tensor apply_wht_qk_sm120(const torch::Tensor& input) {
   TORCH_CHECK(input.is_contiguous(),
-              "ffpa_attn: fp4 hadamard requires contiguous Q/K");
-  TORCH_CHECK(
-      input.size(3) % 8 == 0 && input.size(3) <= kHeadDim,
-      "ffpa_attn: fp4 hadamard requires head_dim%8==0 and <= ", kHeadDim);
+              "ffpa_attn: hadamard requires contiguous Q/K");
+  TORCH_CHECK(input.size(3) % 8 == 0 && input.size(3) <= kHeadDim,
+              "ffpa_attn: hadamard requires head_dim%8==0 and <= ", kHeadDim);
   constexpr bool kPow2 = (kHeadDim & (kHeadDim - 1)) == 0;
   constexpr int kWhtWidth = (kPow2 && kHeadDim <= 512) ? kHeadDim : 64;
+  static_assert(kHeadDim % kWhtWidth == 0,
+                "blockdiag H_64 needs kHeadDim % 64 == 0");
   torch::Tensor out = torch::empty(
       {input.size(0), input.size(1), input.size(2), kHeadDim}, input.options());
   detail::launch_wht_qk_t<T, kWhtWidth, kHeadDim>(input, out);
@@ -194,4 +199,4 @@ torch::Tensor apply_wht_f32_rows_sm120(const torch::Tensor& input) {
   return out;
 }
 
-}  // namespace ffpa_fp4
+}  // namespace ffpa

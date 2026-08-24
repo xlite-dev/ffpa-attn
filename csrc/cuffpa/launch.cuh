@@ -69,8 +69,8 @@ void launch_ffpa_attn_fwd_template(
     int64_t fp8_v_quant_method, int64_t fp8_pv_acc_type, int64_t fp8_qk_mm_type,
     bool fp8_hybrid = false, int64_t fp8_hybrid_n_early = 256,
     bool fp4_hybrid = false, int64_t fp4_hybrid_n_early = 256,
-    bool fp4_hadamard = false, int64_t fp4_pv_mm_type = 0,
-    bool fp4_smooth_v = false) {
+    bool fp8_hadamard = false, bool fp4_hadamard = false,
+    int64_t fp4_pv_mm_type = 0, bool fp4_smooth_v = false) {
   // Q,K,V,O with [B, H, N, D] layout, B=batch, H=head, N=seqlen, D=dim
   // TODO: support BNHD layout, Q,K,V,O with [B, N, H, D] layout.
   // Native block-tile config (MMA atoms, Br/Bc, stages, smem/pad flags) and
@@ -335,7 +335,8 @@ void launch_ffpa_attn_fwd_template(
                   Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
                   dropout_p, philox_seed, philox_offset, fp8_smooth_k,
                   fp8_smooth_v, fp8_q_quant_method, fp8_k_quant_method,
-                  fp8_v_quant_method, fp8_pv_acc_type, fp8_qk_mm_type);
+                  fp8_v_quant_method, fp8_pv_acc_type, fp8_qk_mm_type,
+                  /*q_start_row=*/0, fp8_hadamard);
               return;
             } else if (std::strcmp(fk, "m4n2") == 0) {
               launch_cute_fwd_split_d_m4n2_fp8_sm120<kDataType, kHeadDim,
@@ -343,7 +344,8 @@ void launch_ffpa_attn_fwd_template(
                   Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
                   dropout_p, philox_seed, philox_offset, fp8_smooth_k,
                   fp8_smooth_v, fp8_q_quant_method, fp8_k_quant_method,
-                  fp8_v_quant_method, fp8_pv_acc_type, fp8_qk_mm_type);
+                  fp8_v_quant_method, fp8_pv_acc_type, fp8_qk_mm_type,
+                  /*q_start_row=*/0, fp8_hadamard);
               return;
             }
           }
@@ -379,13 +381,14 @@ void launch_ffpa_attn_fwd_template(
                 dropout_p, philox_seed, philox_offset, fp8_smooth_k,
                 fp8_smooth_v, fp8_q_quant_method, fp8_k_quant_method,
                 fp8_v_quant_method, fp8_pv_acc_type, fp8_qk_mm_type,
-                /*q_start_row=*/n_early);
+                /*q_start_row=*/n_early, fp8_hadamard);
           } else {
             launch_cute_fwd_persist_d_fp8_sm120<kDataType, kHeadDim, kStage>(
                 Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
                 dropout_p, philox_seed, philox_offset, fp8_smooth_k,
                 fp8_smooth_v, fp8_q_quant_method, fp8_k_quant_method,
-                fp8_v_quant_method, fp8_pv_acc_type, fp8_qk_mm_type);
+                fp8_v_quant_method, fp8_pv_acc_type, fp8_qk_mm_type,
+                /*q_start_row=*/0, fp8_hadamard);
           }
         } else if constexpr (kHeadDim < 768) {
           if (fp8_hybrid && Nq >= fp8_hybrid_n_early) {
@@ -413,13 +416,14 @@ void launch_ffpa_attn_fwd_template(
                 dropout_p, philox_seed, philox_offset, fp8_smooth_k,
                 fp8_smooth_v, fp8_q_quant_method, fp8_k_quant_method,
                 fp8_v_quant_method, fp8_pv_acc_type, fp8_qk_mm_type,
-                /*q_start_row=*/n_early);
+                /*q_start_row=*/n_early, fp8_hadamard);
           } else {
             launch_cute_fwd_split_d_fp8_sm120<kDataType, kHeadDim, kStage>(
                 Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
                 dropout_p, philox_seed, philox_offset, fp8_smooth_k,
                 fp8_smooth_v, fp8_q_quant_method, fp8_k_quant_method,
-                fp8_v_quant_method, fp8_pv_acc_type, fp8_qk_mm_type);
+                fp8_v_quant_method, fp8_pv_acc_type, fp8_qk_mm_type,
+                /*q_start_row=*/0, fp8_hadamard);
           }
         } else {
           if (fp8_hybrid && Nq >= fp8_hybrid_n_early) {
@@ -446,13 +450,14 @@ void launch_ffpa_attn_fwd_template(
                 dropout_p, philox_seed, philox_offset, fp8_smooth_k,
                 fp8_smooth_v, fp8_q_quant_method, fp8_k_quant_method,
                 fp8_v_quant_method, fp8_pv_acc_type, fp8_qk_mm_type,
-                /*q_start_row=*/n_early);
+                /*q_start_row=*/n_early, fp8_hadamard);
           } else {
             launch_cute_fwd_split_d_m4n2_fp8_sm120<kDataType, kHeadDim, kStage>(
                 Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
                 dropout_p, philox_seed, philox_offset, fp8_smooth_k,
                 fp8_smooth_v, fp8_q_quant_method, fp8_k_quant_method,
-                fp8_v_quant_method, fp8_pv_acc_type, fp8_qk_mm_type);
+                fp8_v_quant_method, fp8_pv_acc_type, fp8_qk_mm_type,
+                /*q_start_row=*/0, fp8_hadamard);
           }
         }
 #else
