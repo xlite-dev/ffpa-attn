@@ -1293,14 +1293,14 @@ void launch_cute_fwd_split_d_fp8_sm120_impl(
           v_ptr, reinterpret_cast<__nv_fp8_e4m3*>(vt8.data_ptr()),
           v_scale.data_ptr<float>(), vm_ptr, v_partials_sum.data_ptr<float>(),
           v_partials_max.data_ptr<float>(), v_partials_min.data_ptr<float>(),
-          Nb, Nh_kv, Nkv, Nkv_pad, stream, D_og, v_r, &Lkv);
+          Nb, Nh_kv, Nkv, Nkv_pad, stream, D_og, v_r, reorg_free, &Lkv);
     } else {
       ffpa_fp8::launch_quantize_fp8_vt_perchannel_sm120<kDataType, kBr, kBc,
                                                         kHeadDim, false>(
           v_ptr, reinterpret_cast<__nv_fp8_e4m3*>(vt8.data_ptr()),
           v_scale.data_ptr<float>(), vm_ptr, v_partials_sum.data_ptr<float>(),
           v_partials_max.data_ptr<float>(), v_partials_min.data_ptr<float>(),
-          Nb, Nh_kv, Nkv, Nkv_pad, stream, D_og, v_r, &Lkv);
+          Nb, Nh_kv, Nkv, Nkv_pad, stream, D_og, v_r, reorg_free, &Lkv);
     }
   }
   const float* vm_kernel = v_smooth_mean ? vm_ptr : nullptr;
@@ -1622,14 +1622,14 @@ void launch_cute_fwd_split_d_m4n2_fp8_sm120_impl(
           v_ptr, reinterpret_cast<__nv_fp8_e4m3*>(vt8.data_ptr()),
           v_scale.data_ptr<float>(), vm_ptr, v_partials_sum.data_ptr<float>(),
           v_partials_max.data_ptr<float>(), v_partials_min.data_ptr<float>(),
-          Nb, Nh_kv, Nkv, Nkv_pad, stream, D_og, v_r, &Lkv);
+          Nb, Nh_kv, Nkv, Nkv_pad, stream, D_og, v_r, /*perm_vt=*/false, &Lkv);
     } else {
       ffpa_fp8::launch_quantize_fp8_vt_perchannel_sm120<kDataType, kBr, kBc,
                                                         kHeadDim, false>(
           v_ptr, reinterpret_cast<__nv_fp8_e4m3*>(vt8.data_ptr()),
           v_scale.data_ptr<float>(), vm_ptr, v_partials_sum.data_ptr<float>(),
           v_partials_max.data_ptr<float>(), v_partials_min.data_ptr<float>(),
-          Nb, Nh_kv, Nkv, Nkv_pad, stream, D_og, v_r, &Lkv);
+          Nb, Nh_kv, Nkv, Nkv_pad, stream, D_og, v_r, /*perm_vt=*/false, &Lkv);
     }
   }
   const float* vm_kernel = v_smooth_mean ? vm_ptr : nullptr;
