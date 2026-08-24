@@ -28,6 +28,8 @@ def _ffpa_attn_forward_cuda(
   fp4_hybrid: bool = False,
   fp4_hybrid_n_early: int = 256,
   hadamard: bool = False,
+  fp4_pv_mm_type: int = 0,
+  fp4_smooth_v: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
   """Call FFPA CUDA forward via registered torch op, returning ``(O, softmax_lse)``.
 
@@ -60,5 +62,7 @@ def _ffpa_attn_forward_cuda(
     fp4_hybrid,
     fp4_hybrid_n_early,
     hadamard,
+    fp4_pv_mm_type,
+    fp4_smooth_v,
   )
   return O_storage, softmax_lse_storage[..., :Q.size(2)]

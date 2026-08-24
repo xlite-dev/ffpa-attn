@@ -250,6 +250,7 @@ Apache License 2.0
 
 <div id="ref"></div>
 
+- [cache-dit](https://github.com/vipshop/cache-dit)
 - [flash-attention](https://github.com/Dao-AILab/flash-attention)
 - [SageAttention](https://github.com/thu-ml/sageattention)
 - [LeetCUDA](https://github.com/xlite-dev/LeetCUDA)

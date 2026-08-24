@@ -237,6 +237,84 @@ struct SM120_16x32x64_TN_VS_NVFP4 {
 
 }  // namespace cute::SM120::BLOCKSCALED
 
+namespace cute::SM120::BLOCKSCALED {
+
+using cutlass::float_e4m3_t;
+using cutlass::float_ue8m0_t;
+
+// MMA.SF 16x8x128 TN E4M3 x E4M3 with SF UE8M0 (MXFP8), the PV-side upgrade
+// of the NVFP4 atom: P and V^T as e4m3 with one ue8m0 scale per 32-element
+// group. K-fused: four m16n8k32 sub-calls accumulate along K=128; sub-call
+// i covers k in [32i, 32i+32) and selects its SFA/SFB byte via byte-id = i.
+// SFB stays the standard n8 4:0 quad broadcast, so all cute
+// partition/zip/gemm paths work unmodified.
+struct SM120_16x8x128_TN_VS_MXFP8 {
+  using DRegisters = float[4];
+  using ARegisters = uint32_t[16];
+  using BRegisters = uint32_t[8];
+  using CRegisters = float[4];
+
+  using SFARegisters = uint8_t[4];
+  using SFBRegisters = uint8_t[4];
+
+  CUTE_HOST_DEVICE static void fma(
+      float& d0, float& d1, float& d2, float& d3, uint32_t const& a0,
+      uint32_t const& a1, uint32_t const& a2, uint32_t const& a3,
+      uint32_t const& a4, uint32_t const& a5, uint32_t const& a6,
+      uint32_t const& a7, uint32_t const& a8, uint32_t const& a9,
+      uint32_t const& a10, uint32_t const& a11, uint32_t const& a12,
+      uint32_t const& a13, uint32_t const& a14, uint32_t const& a15,
+      uint32_t const& b0, uint32_t const& b1, uint32_t const& b2,
+      uint32_t const& b3, uint32_t const& b4, uint32_t const& b5,
+      uint32_t const& b6, uint32_t const& b7, float const& c0, float const& c1,
+      float const& c2, float const& c3, uint8_t const& sfa0,
+      uint8_t const& sfa1, uint8_t const& sfa2, uint8_t const& sfa3,
+      uint8_t const& sfb0, uint8_t const& sfb1, uint8_t const& sfb2,
+      uint8_t const& sfb3) {
+    static constexpr uint16_t tidA = 0;
+    static constexpr uint16_t tidB = 0;
+#if defined(CUTE_ARCH_MXF8F6F4_MMA_ENABLED)
+    // byte i of each packed SF word carries the k-segment [32i,32i+32)
+    // scale (the SF provider lane reads its sequence along k).
+    const uint32_t sfa = uint32_t(sfa0) | (uint32_t(sfa1) << 8) |
+                         (uint32_t(sfa2) << 16) | (uint32_t(sfa3) << 24);
+    const uint32_t sfb = uint32_t(sfb0) | (uint32_t(sfb1) << 8) |
+                         (uint32_t(sfb2) << 16) | (uint32_t(sfb3) << 24);
+#define FFPA_MXFP8_SUBCALL(D0, D1, D2, D3, A0, A1, A2, A3, B0, B1, C0, C1, C2, \
+                           C3, BI)                                             \
+  asm volatile(                                                                \
+      "mma.sync.aligned.m16n8k32.row.col.kind::mxf8f6f4.block_scale."          \
+      "scale_vec::1X.f32.e4m3.e4m3.f32.ue8m0 "                                 \
+      "{%0,  %1,  %2,  %3},"                                                   \
+      "{%4,  %5,  %6,  %7},"                                                   \
+      "{%8,  %9},"                                                             \
+      "{%10, %11, %12, %13},"                                                  \
+      "{%14},"                                                                 \
+      "{%15, %16},"                                                            \
+      "{%17},"                                                                 \
+      "{%18, %19};\n"                                                          \
+      : "=f"(D0), "=f"(D1), "=f"(D2), "=f"(D3)                                 \
+      : "r"(A0), "r"(A1), "r"(A2), "r"(A3), "r"(B0), "r"(B1), "f"(C0),         \
+        "f"(C1), "f"(C2), "f"(C3), "r"(sfa), "h"(BI), "h"(tidA), "r"(sfb),     \
+        "h"(BI), "h"(tidB));
+    FFPA_MXFP8_SUBCALL(d0, d1, d2, d3, a0, a1, a2, a3, b0, b1, c0, c1, c2, c3,
+                       (uint16_t)0)
+    FFPA_MXFP8_SUBCALL(d0, d1, d2, d3, a4, a5, a6, a7, b2, b3, d0, d1, d2, d3,
+                       (uint16_t)1)
+    FFPA_MXFP8_SUBCALL(d0, d1, d2, d3, a8, a9, a10, a11, b4, b5, d0, d1, d2, d3,
+                       (uint16_t)2)
+    FFPA_MXFP8_SUBCALL(d0, d1, d2, d3, a12, a13, a14, a15, b6, b7, d0, d1, d2,
+                       d3, (uint16_t)3)
+#undef FFPA_MXFP8_SUBCALL
+#else
+    CUTE_INVALID_CONTROL_PATH(
+        "SM120_16x8x128_TN_VS_MXFP8 requires "
+        "CUTE_ARCH_MXF8F6F4_MMA_ENABLED");
+#endif
+  }
+};
+}  // namespace cute::SM120::BLOCKSCALED
+
 namespace cute {
 
 // MMA NVFP4 16x32x64 TN: A = e2m1 (M,K) row, B = e2m1 (N,K) col, SF = ue4m3
@@ -274,6 +352,49 @@ struct MMA_Traits<SM120::BLOCKSCALED::SM120_16x32x64_TN_VS_NVFP4> {
   using CLayout =
       Layout<Shape<Shape<_4, _8>, Shape<Shape<_2, _4>, _2>>,
              Stride<Stride<_32, _1>, Stride<Stride<_16, _128>, _8>>>;
+};
+
+// MMA MXFP8 16x32x32 TN: A = P e4m3 (M,K=tokens) row, B = V^T e4m3 (N=head
+// dim, K=tokens) col, SF = ue8m0 with 32-element groups. A/B fragments are
+// 8-bit. Layout derivation (T4 probe + CUTLASS SM89 16x8x32 8-bit layouts):
+// A/B/C sub-block modes mirror the NVFP4 fused atom at half K; the SFB V
+// mode replaces NVFP4's t0-based n-octant stride with a per-byte n-octant
+// stride (sub-call i selects byte-id-b = i, so the fragment's v index maps
+// n += 8*v while t0 stays a 4:0 broadcast).
+// K-fused MXFP8 16x8x128 traits. A/B/C (T,V) layouts extend the SM89
+// 16x8x32 e4m3 atom fourfold along K (segment stride 512 in A, 256 in B);
+// SF layouts keep the standard n8 shapes with V=K=128. Per-thread SF
+// fragments hold 4 ue8m0 bytes (one per 32-k segment): cosize == K/VS == 4
+// satisfies mma_unpack's physical-size assert, unlike the n-fused variant
+// whose 4 n-octant bytes contradict K/VS == 1.
+template <>
+struct MMA_Traits<SM120::BLOCKSCALED::SM120_16x8x128_TN_VS_MXFP8> {
+  using ValTypeA = cutlass::float_e4m3_t;
+  using ValTypeB = cutlass::float_e4m3_t;
+  using ValTypeD = float;
+  using ValTypeC = float;
+  using ValTypeSF = cutlass::float_ue8m0_t;
+  constexpr static int SFVecSize = 32;
+
+  using Shape_MNK = Shape<_16, _8, _128>;
+  using ThrID = Layout<_32>;
+
+  // (T32,V64) -> (M16,K128)
+  using ALayout =
+      Layout<Shape<Shape<_4, _8>, Shape<Shape<_4, _2, _2>, _4>>,
+             Stride<Stride<_64, _1>, Stride<Stride<_16, _8, _256>, _512>>>;
+  // (T32,V32) -> (N8,K128)
+  using BLayout =
+      Layout<Shape<Shape<_4, _8>, Shape<Shape<_4, _2>, _4>>,
+             Stride<Stride<_32, _1>, Stride<Stride<_8, _128>, _256>>>;
+  // (T32,V128) -> (M16,K128)
+  using SFALayout = Layout<Shape<Shape<_2, _2, _8>, Shape<_32, _4>>,
+                           Stride<Stride<_8, _0, _1>, Stride<_16, _512>>>;
+  // (T32,V128) -> (N8,K128): standard n8 4:0 quad broadcast along V.
+  using SFBLayout = Layout<Shape<Shape<_4, _8>, Shape<_32, _4>>,
+                           Stride<Stride<_0, _1>, Stride<_8, _256>>>;
+  // (T32,V4) -> (M16,N8)
+  using CLayout = SM80_16x8_Row;
 };
 
 // Slice the SF tensor into a per-thread fragment, honoring the TiledMma's

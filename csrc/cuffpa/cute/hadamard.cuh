@@ -115,4 +115,71 @@ torch::Tensor apply_wht_qk_sm120(const torch::Tensor& input) {
   return out;
 }
 
+// fp32 row WHT for the pre-rotation of small mean vectors (qm / km) in the
+// fused-hadamard path: WHT is linear so mean(X H) == mean(X) H, which lets
+// the mean kernels keep running unrotated while the quantize bias needs
+// the rotated copy. One warp per row; rows are kWidth wide and fully
+// valid (pad cols already zeroed by the producers).
+template <int kWidth>
+__global__ void wht_f32_rows_kernel(const float* __restrict__ input,
+                                    float* __restrict__ output, long num_rows) {
+  constexpr int kVec = kWidth / 32;
+  const long row = (long)blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+  if (row >= num_rows)
+    return;
+  const int lane = threadIdx.x & 31;
+  const float* src = input + row * kWidth;
+  float x[kVec];
+#pragma unroll
+  for (int j = 0; j < kVec; ++j)
+    x[j] = src[lane + 32 * j];
+#pragma unroll
+  for (int dist = kWidth >> 1; dist >= 1; dist >>= 1) {
+    if (dist >= 32) {
+#pragma unroll
+      for (int j = 0; j < kVec; ++j) {
+        const int jj = j ^ (dist >> 5);
+        if (j < jj) {
+          const float a = x[j], b = x[jj];
+          x[j] = a + b;
+          x[jj] = a - b;
+        }
+      }
+    } else {
+#pragma unroll
+      for (int j = 0; j < kVec; ++j) {
+        const float other = __shfl_xor_sync(0xffffffffu, x[j], dist);
+        x[j] = (lane & dist) ? other - x[j] : x[j] + other;
+      }
+    }
+  }
+  const float s = rsqrtf((float)kWidth);
+  float* dst = output + row * kWidth;
+#pragma unroll
+  for (int j = 0; j < kVec; ++j)
+    dst[lane + 32 * j] = x[j] * s;
+}
+
+// Returns the WHT-rotated copy of a contiguous fp32 tensor whose last dim
+// is kWidth (qm blocks / km heads). Feed-forward only: tiny traffic.
+template <int kWidth>
+torch::Tensor apply_wht_f32_rows_sm120(const torch::Tensor& input) {
+  TORCH_CHECK(
+      input.is_contiguous() && input.scalar_type() == at::ScalarType::Float,
+      "ffpa_attn: wht_f32_rows requires contiguous fp32 input");
+  TORCH_CHECK(input.size(-1) == kWidth,
+              "ffpa_attn: wht_f32_rows last dim must be ", kWidth);
+  const long num_rows = input.numel() / kWidth;
+  torch::Tensor out = torch::empty_like(input);
+  if (num_rows == 0)
+    return out;
+  constexpr int kWarpsPerBlock = 8;
+  const long blocks = (num_rows + kWarpsPerBlock - 1) / kWarpsPerBlock;
+  auto stream = at::cuda::getCurrentCUDAStream();
+  wht_f32_rows_kernel<kWidth>
+      <<<(unsigned int)blocks, kWarpsPerBlock * 32, 0, stream>>>(
+          input.data_ptr<float>(), out.data_ptr<float>(), num_rows);
+  return out;
+}
+
 }  // namespace ffpa

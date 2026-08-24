@@ -155,4 +155,47 @@ CUTE_DEVICE void gemm_rs_fp4(
 // under the m4n2 thr layout), single mma (Tile-K = kBc),
 // trailing v_empty arrive.
 
+// PV step of the MXFP8 path (QK NVFP4 x PV MXFP8): O += (P . SFA) @
+// (V^T . SFVt) with P/V^T as e4m3 and SFs as ue8m0 (32-element groups).
+// Same copy/mma/arrive protocol as gemm_rs_fp4; two deviations: the pack
+// is quantize_and_pack_p_mxfp8 (quad-routed A slots + ue8m0 SFA) reading
+// the scores through a REDUCTION view, and the k loop walks kBc/32 blocks.
+template <typename TensorC, typename TensorPA, typename TensorPSF,
+          typename TensorVB, typename TensorVSF, typename TensorSV,
+          typename TensorSVSF, typename TiledMma, typename TiledCopyV,
+          typename ThreadCopyV, typename TiledCopyVSF, typename ThreadCopyVSF,
+          typename AbsMaxTensor, typename AccRedTensor>
+CUTE_DEVICE void gemm_rs_mxfp8(
+    TensorC& tgt, TensorPA& tOrP, TensorPSF& tOrSFA, TensorVB& tOrVt,
+    TensorVSF& tOrSFVt, TensorSV const& tOsVt, TensorSVSF const& tOsSFVt,
+    TiledMma tiled_mma_pv, TiledCopyV tiled_copy_v, ThreadCopyV thread_copy_v,
+    TiledCopyVSF tiled_copy_vsf, ThreadCopyVSF thread_copy_vsf,
+    AbsMaxTensor& AbsMaxP, AccRedTensor& acc_reduction_view, uint64_t* v_empty,
+    int v_stg, int lane) {
+  auto copy_view_v = thread_copy_v.retile_D(tOrVt);
+  auto copy_view_vsf = thread_copy_vsf.retile_D(tOrSFVt);
+  auto tOsVt_stage = tOsVt(_, _, _, v_stg);
+  auto tOsSFVt_stage = tOsSFVt(_, _, _, v_stg);
+  copy(tiled_copy_v, tOsVt_stage(_, _, _0{}), copy_view_v(_, _, _0{}));
+  copy(tiled_copy_vsf, tOsSFVt_stage(_, _, _0{}), copy_view_vsf(_, _, _0{}));
+  quantize_and_pack_p_mxfp8(0, AbsMaxP, acc_reduction_view, tOrP, tOrSFA, lane);
+  CUTLASS_PRAGMA_UNROLL
+  for (int v_block = 0; v_block < size<2>(tOrP); ++v_block) {
+    cute::gemm(tiled_mma_pv,
+               make_zip_tensor(tOrP(_, _, v_block), tOrSFA(_, _, v_block)),
+               make_zip_tensor(tOrVt(_, _, v_block), tOrSFVt(_, _, v_block)),
+               tgt);
+    if (v_block < size<2>(tOrP) - 1) {
+      copy(tiled_copy_v, tOsVt_stage(_, _, v_block + 1),
+           copy_view_v(_, _, v_block + 1));
+      copy(tiled_copy_vsf, tOsSFVt_stage(_, _, v_block + 1),
+           copy_view_vsf(_, _, v_block + 1));
+      quantize_and_pack_p_mxfp8(v_block + 1, AbsMaxP, acc_reduction_view, tOrP,
+                                tOrSFA, lane);
+    } else {
+      cutlass::arch::ClusterBarrier::arrive(v_empty + v_stg);
+    }
+  }
+}
+
 }  // namespace ffpa_fp4

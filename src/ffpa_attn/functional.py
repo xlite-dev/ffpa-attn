@@ -267,6 +267,17 @@ class CUDABackend(Backend):
   # by its own quant path.
   fp8_hadamard: bool = False
   fp4_hadamard: bool = False
+  # FP4 only: PV MMA dtype; "fp4" (NVFP4 e2m1+ue4m3/16) or "fp8" (MXFP8
+  # e4m3+ue8m0/32, QK stays NVFP4). smem budget limits fp8 to D<=192.
+  fp4_pv_mm_type: str = "fp4"
+  # FP4 only (persist_d, D<=256): subtract the per-(b,hkv) V column mean
+  # before V quantize; the epilogue adds it back (softmax rows sum to 1),
+  # concentrating the residual so the V blockscale tracks the dynamic range.
+  # NOTE: Q/K smoothing is NOT an option in the fp4 path - it is always on
+  # and required for accuracy (e2m1's +-6 dynamic range; qm/km means +
+  # sub_qm/sub_km quantize + delta_s/lse exact corrections are hardwired in
+  # the fp4 kernels). fp4_smooth_v only adds the missing V side.
+  fp4_smooth_v: bool = False
   # Runtime: propagated from ffpa_attn_func(is_causal=...) by normalize_inputs.
   is_causal: bool = False
 
@@ -309,6 +320,16 @@ class CUDABackend(Backend):
     )
     assert not self.fp8_hadamard or self.enable_fp8, (
       "fp8_hadamard requires enable_fp8"
+    )
+    assert self.fp4_pv_mm_type in ("fp4", "fp8"), (
+      f"fp4_pv_mm_type must be 'fp4' or 'fp8', "
+      f"got {self.fp4_pv_mm_type!r}"
+    )
+    assert self.fp4_pv_mm_type == "fp4" or self.enable_fp4, (
+      "fp4_pv_mm_type requires enable_fp4"
+    )
+    assert not self.fp4_smooth_v or self.enable_fp4, (
+      "fp4_smooth_v requires enable_fp4"
     )
     self._resolve_impl_defaults()
     self.stages = self._default_cuda_stages(
@@ -1032,6 +1053,8 @@ class _FFPAAttnFunc(torch.autograd.Function):
         forward_meta.fp4_hybrid,
         forward_meta.fp4_hybrid_n_early,
         forward_meta.fp4_hadamard or forward_meta.fp8_hadamard,
+        1 if forward_meta.fp4_pv_mm_type == "fp8" else 0,
+        forward_meta.fp4_smooth_v,
       )
     elif isinstance(meta.forward_meta, TritonBackend):
       forward_meta = meta.forward_meta
