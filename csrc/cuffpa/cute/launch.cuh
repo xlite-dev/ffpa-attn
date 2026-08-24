@@ -456,12 +456,15 @@ void launch_cute_fwd_persist_d_sm120(torch::Tensor Q, torch::Tensor K,
 
   // K/V gmem layout: BHND packed (flat 2D TMA rows) or an NHD (diffusers
   // BNHD) permute view consumed natively via a batched 4D TMA descriptor.
-  // Q/O always require BHND packing (their TMA rows are flat 2D).
-  TORCH_CHECK(Q.stride(3) == 1 && Q.stride(2) == (long)kHeadDim &&
-                  Q.stride(1) == (long)Nq * kHeadDim &&
-                  Q.stride(0) == (long)Nh * Nq * kHeadDim,
-              "ffpa_attn: Q must be BHND-contiguous for the fp16 persist-D "
-              "kernel (NHD input is only supported via the fp8 path)");
+  // Q likewise (flat (B*N, H*D) rows, head as a kHeadDim-wide column tile);
+  // O stays BHND-packed (the caller allocates it packed and re-views).
+  const bool q_nhd = ffpa_is_nhd_view(Q);
+  if (!q_nhd) {
+    TORCH_CHECK(Q.stride(3) == 1 && Q.stride(2) == (long)kHeadDim &&
+                    Q.stride(1) == (long)Nq * kHeadDim &&
+                    Q.stride(0) == (long)Nh * Nq * kHeadDim,
+                "ffpa_attn: Q must be BHND-contiguous or an NHD (BNHD) view");
+  }
   const bool kv_nhd = ffpa_is_nhd_view(K);
   if (!kv_nhd) {
     TORCH_CHECK(K.stride(3) == 1 && K.stride(2) == (long)kHeadDim &&
@@ -477,18 +480,16 @@ void launch_cute_fwd_persist_d_sm120(torch::Tensor Q, torch::Tensor K,
                 "ffpa_attn: K and V must share the same memory layout");
   }
 
-  auto gQ = make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(Q.data_ptr())),
-                        make_shape(total_q_rows, Int<kHeadDim>{}),
-                        make_stride(Int<kHeadDim>{}, _1{}));
   auto gO = make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(O.data_ptr())),
                         make_shape(total_q_rows, Int<kHeadDim>{}),
                         make_stride(Int<kHeadDim>{}, _1{}));
 
   // Everything from the TMA descriptor build through the kernel dispatch is
-  // generic over the K/V descriptor type (2D flat vs batched 4D).
-  const auto run = [&](auto tma_k, auto tma_v) {
-    auto tma_q = make_tma_copy(SM90_TMA_LOAD{}, gQ, SmemLayoutQ{},
-                               Shape<Int<kBr>, Int<kHeadDim>>{}, _1{});
+  // generic over the Q/K/V descriptor types (2D flat vs batched 4D).
+  const auto run = [&](auto tma_q, auto tma_k, auto tma_v, auto q_c,
+                       auto kv_c) {
+    constexpr bool kNhdQ = decltype(q_c)::value;
+    constexpr bool kNhdKV = decltype(kv_c)::value;
     auto tma_o = make_tma_copy(SM90_TMA_STORE{}, gO, SmemLayoutO{},
                                Shape<Int<kBr>, Int<kHeadDim>>{}, _1{});
 
@@ -513,35 +514,37 @@ void launch_cute_fwd_persist_d_sm120(torch::Tensor Q, torch::Tensor K,
     using TmaK = decltype(tma_k);
     using TmaV = decltype(tma_v);
     using TmaO = decltype(tma_o);
-    if (kv_nhd) {
-      // Batched 4D K/V: head/batch ride the tile coord in the kernel.
-      if (has_attn_bias && has_dropout) {
-        launch_variant(persist_d_ws_fwd_cute_sm120<Traits, TmaQ, TmaK, TmaV,
-                                                   TmaO, 1, 1, true>);
-      } else if (has_attn_bias) {
-        launch_variant(persist_d_ws_fwd_cute_sm120<Traits, TmaQ, TmaK, TmaV,
-                                                   TmaO, 1, 0, true>);
-      } else if (has_dropout) {
-        launch_variant(persist_d_ws_fwd_cute_sm120<Traits, TmaQ, TmaK, TmaV,
-                                                   TmaO, 0, 1, true>);
-      } else {
-        launch_variant(persist_d_ws_fwd_cute_sm120<Traits, TmaQ, TmaK, TmaV,
-                                                   TmaO, 0, 0, true>);
-      }
+    if (has_attn_bias && has_dropout) {
+      launch_variant(persist_d_ws_fwd_cute_sm120<Traits, TmaQ, TmaK, TmaV, TmaO,
+                                                 1, 1, kNhdKV, kNhdQ>);
+    } else if (has_attn_bias) {
+      launch_variant(persist_d_ws_fwd_cute_sm120<Traits, TmaQ, TmaK, TmaV, TmaO,
+                                                 1, 0, kNhdKV, kNhdQ>);
+    } else if (has_dropout) {
+      launch_variant(persist_d_ws_fwd_cute_sm120<Traits, TmaQ, TmaK, TmaV, TmaO,
+                                                 0, 1, kNhdKV, kNhdQ>);
     } else {
-      if (has_attn_bias && has_dropout) {
-        launch_variant(
-            persist_d_ws_fwd_cute_sm120<Traits, TmaQ, TmaK, TmaV, TmaO, 1, 1>);
-      } else if (has_attn_bias) {
-        launch_variant(
-            persist_d_ws_fwd_cute_sm120<Traits, TmaQ, TmaK, TmaV, TmaO, 1, 0>);
-      } else if (has_dropout) {
-        launch_variant(
-            persist_d_ws_fwd_cute_sm120<Traits, TmaQ, TmaK, TmaV, TmaO, 0, 1>);
-      } else {
-        launch_variant(
-            persist_d_ws_fwd_cute_sm120<Traits, TmaQ, TmaK, TmaV, TmaO, 0, 0>);
-      }
+      launch_variant(persist_d_ws_fwd_cute_sm120<Traits, TmaQ, TmaK, TmaV, TmaO,
+                                                 0, 0, kNhdKV, kNhdQ>);
+    }
+  };
+
+  // Q TMA: BHND flat (B*H*N, D) rows or NHD flat (B*N, H*D) rows.
+  const auto make_tma_q = [&](auto q_c) {
+    if constexpr (decltype(q_c)::value) {
+      auto gQ =
+          make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(Q.data_ptr())),
+                      make_shape((long)Nb * Nq, (long)Nh * kHeadDim),
+                      make_stride((long)Nh * kHeadDim, _1{}));
+      return make_tma_copy(SM90_TMA_LOAD{}, gQ, SmemLayoutQ{},
+                           Shape<Int<kBr>, Int<kHeadDim>>{}, _1{});
+    } else {
+      auto gQ =
+          make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(Q.data_ptr())),
+                      make_shape(total_q_rows, Int<kHeadDim>{}),
+                      make_stride(Int<kHeadDim>{}, _1{}));
+      return make_tma_copy(SM90_TMA_LOAD{}, gQ, SmemLayoutQ{},
+                           Shape<Int<kBr>, Int<kHeadDim>>{}, _1{});
     }
   };
 
@@ -563,7 +566,12 @@ void launch_cute_fwd_persist_d_sm120(torch::Tensor Q, torch::Tensor K,
                                Shape<Int<kBc>, Int<kHeadDim>>{}, _1{});
     auto tma_v = make_tma_copy(SM90_TMA_LOAD{}, gV, SmemLayoutKV{},
                                Shape<Int<kBc>, Int<kHeadDim>>{}, _1{});
-    run(tma_k, tma_v);
+    if (q_nhd)
+      run(make_tma_q(std::true_type{}), tma_k, tma_v, std::true_type{},
+          std::true_type{});
+    else
+      run(make_tma_q(std::false_type{}), tma_k, tma_v, std::false_type{},
+          std::true_type{});
   } else {
     auto gK =
         make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(K.data_ptr())),
@@ -577,7 +585,12 @@ void launch_cute_fwd_persist_d_sm120(torch::Tensor Q, torch::Tensor K,
                                Shape<Int<kBc>, Int<kHeadDim>>{}, _1{});
     auto tma_v = make_tma_copy(SM90_TMA_LOAD{}, gV, SmemLayoutKV{},
                                Shape<Int<kBc>, Int<kHeadDim>>{}, _1{});
-    run(tma_k, tma_v);
+    if (q_nhd)
+      run(make_tma_q(std::true_type{}), tma_k, tma_v, std::true_type{},
+          std::false_type{});
+    else
+      run(make_tma_q(std::false_type{}), tma_k, tma_v, std::false_type{},
+          std::false_type{});
   }
 }
 
@@ -1823,10 +1836,18 @@ void launch_cute_fwd_persist_d_fp4_sm120_impl(
   const bool fused_wht = fp4_hadamard && kFuseWht;
   torch::Tensor km_rot_f32, qm_rot;
   if (fp4_hadamard && !fused_wht) {
+    // WHT pre-rotation needs BHND-packed rows; materialize NHD views.
+    if (ffpa_is_nhd_view(Q))
+      Q = Q.contiguous();
+    if (ffpa_is_nhd_view(K))
+      K = K.contiguous();
     Q = ffpa::apply_wht_qk_sm120<kDataType, kHeadDim>(Q);
     K = ffpa::apply_wht_qk_sm120<kDataType, kHeadDim>(K);
   }
   const kDataType* k_ptr = reinterpret_cast<const kDataType*>(K.data_ptr());
+  // NHD (BNHD) permute views are consumed natively by the pre-kernels.
+  const ffpa_fp8::Fp8InputLayout Lkv = ffpa_layout_of(K, Nkv, K.size(3));
+  const ffpa_fp8::Fp8InputLayout Lv = ffpa_layout_of(V, Nkv, V.size(3));
 
   // Quantize kernels take (B,S,H,D)-strided inputs; pass the (B,H,N,D)
   // tensors as (B,N,H,D) views (strides only, no copy).
@@ -1866,7 +1887,7 @@ void launch_cute_fwd_persist_d_fp4_sm120_impl(
     ffpa_fp8::launch_kv_mean_sm120<kDataType, kHeadDim>(
         k_ptr, reinterpret_cast<kDataType*>(km_h.data_ptr()),
         km_f32.data_ptr<float>(), km_partials.data_ptr<float>(), Nb, Nh_kv, Nkv,
-        static_cast<int>(K.size(3)), stream);
+        static_cast<int>(K.size(3)), stream, &Lkv);
   }
   if (fused_wht)
     km_rot_f32 = ffpa::apply_wht_f32_rows_sm120<kHeadDim>(km_f32);
@@ -1881,8 +1902,6 @@ void launch_cute_fwd_persist_d_fp4_sm120_impl(
   torch::Tensor qm_h;
   if constexpr (fused_qkv) {
     if (fp4_smooth_v) {
-      TORCH_CHECK(V.is_contiguous(),
-                  "ffpa_attn: fp4_smooth_v requires contiguous V");
       vm_v = torch::empty({Nb, Nh_kv, kHeadDim}, opts_f32);
       const int v_mean_chunks =
           (Nkv + ffpa_fp8::kMeanRowsPerChunk - 1) / ffpa_fp8::kMeanRowsPerChunk;
@@ -1891,7 +1910,7 @@ void launch_cute_fwd_persist_d_fp4_sm120_impl(
       ffpa_fp8::launch_kv_mean_sm120<kDataType, kHeadDim>(
           reinterpret_cast<const kDataType*>(V.data_ptr()), nullptr,
           vm_v.data_ptr<float>(), vm_partials.data_ptr<float>(), Nb, Nh_kv, Nkv,
-          static_cast<int>(V.size(3)), stream);
+          static_cast<int>(V.size(3)), stream, &Lv);
     }
     qm_h = torch::empty({Nb, Nh, Mb, kHeadDim}, Q.options());
     if (fused_wht)
@@ -1924,12 +1943,11 @@ void launch_cute_fwd_persist_d_fp4_sm120_impl(
   // qm@K^T - qm.km^T, fused in one wmma kernel (fp32 out, tail columns
   // zero-filled). GQA broadcasts the shared K heads.
   delta_s = torch::empty({Nb, Nh, Mb, Nkv_pad}, opts_f32);
-  TORCH_CHECK(K.is_contiguous(), "ffpa_attn: fp4 path requires contiguous K");
   ffpa_fp4::launch_fp4_delta_s_sm120<kDataType, kHeadDim>(
       reinterpret_cast<const kDataType*>(qm_h.data_ptr()), k_ptr,
       reinterpret_cast<const kDataType*>(qkm.data_ptr()),
       delta_s.data_ptr<float>(), Nb, Nh, Nh_kv, Mb, Nkv, Nkv_pad,
-      static_cast<int>(K.size(3)), stream);
+      static_cast<int>(K.size(3)), stream, &Lkv);
 
   if constexpr (!fused_qkv) {
     // smooth_v: per-(b,hkv) V column mean. The attention kernel computes,
@@ -1947,8 +1965,6 @@ void launch_cute_fwd_persist_d_fp4_sm120_impl(
     // the delta_s/lse corrections; V-mean subtraction never touches the
     // scores at all.
     if (fp4_smooth_v) {
-      TORCH_CHECK(V.is_contiguous(),
-                  "ffpa_attn: fp4_smooth_v requires contiguous V");
       vm_v = torch::empty({Nb, Nh_kv, kHeadDim}, opts_f32);
       const int v_mean_chunks =
           (Nkv + ffpa_fp8::kMeanRowsPerChunk - 1) / ffpa_fp8::kMeanRowsPerChunk;
@@ -1957,7 +1973,7 @@ void launch_cute_fwd_persist_d_fp4_sm120_impl(
       ffpa_fp8::launch_kv_mean_sm120<kDataType, kHeadDim>(
           reinterpret_cast<const kDataType*>(V.data_ptr()), nullptr,
           vm_v.data_ptr<float>(), vm_partials.data_ptr<float>(), Nb, Nh_kv, Nkv,
-          static_cast<int>(V.size(3)), stream);
+          static_cast<int>(V.size(3)), stream, &Lv);
     }
     if constexpr (kPvMxfp8)
       ffpa_fp4::launch_mxfp8_quant_vt_sm120<kHeadDim>(V_t, vt4, sfvt, Nkv_pad,
@@ -2194,10 +2210,17 @@ void launch_cute_fwd_split_d_fp4_sm120_impl(torch::Tensor Q, torch::Tensor K,
   const bool fused_wht = fp4_hadamard && kFuseWht;
   torch::Tensor km_rot_f32, qm_rot;
   if (fp4_hadamard && !fused_wht) {
+    // WHT pre-rotation needs BHND-packed rows; materialize NHD views.
+    if (ffpa_is_nhd_view(Q))
+      Q = Q.contiguous();
+    if (ffpa_is_nhd_view(K))
+      K = K.contiguous();
     Q = ffpa::apply_wht_qk_sm120<kDataType, kHeadDim>(Q);
     K = ffpa::apply_wht_qk_sm120<kDataType, kHeadDim>(K);
   }
   const kDataType* k_ptr = reinterpret_cast<const kDataType*>(K.data_ptr());
+  // NHD (BNHD) permute views are consumed natively by the pre-kernels.
+  const ffpa_fp8::Fp8InputLayout Lkv = ffpa_layout_of(K, Nkv, K.size(3));
 
   torch::Tensor km_h = torch::empty({Nb * Nh_kv, kHeadDim}, K.options());
   torch::Tensor km_f32 = torch::empty({Nb * Nh_kv, kHeadDim}, opts_f32);
@@ -2209,7 +2232,7 @@ void launch_cute_fwd_split_d_fp4_sm120_impl(torch::Tensor Q, torch::Tensor K,
     ffpa_fp8::launch_kv_mean_sm120<kDataType, kHeadDim>(
         k_ptr, reinterpret_cast<kDataType*>(km_h.data_ptr()),
         km_f32.data_ptr<float>(), km_partials.data_ptr<float>(), Nb, Nh_kv, Nkv,
-        static_cast<int>(K.size(3)), stream);
+        static_cast<int>(K.size(3)), stream, &Lkv);
   }
   if (fused_wht)
     km_rot_f32 = ffpa::apply_wht_f32_rows_sm120<kHeadDim>(km_f32);
@@ -2243,12 +2266,11 @@ void launch_cute_fwd_split_d_fp4_sm120_impl(torch::Tensor Q, torch::Tensor K,
                              km_h.view({Nb, Nh_kv, 1, kHeadDim, 1}))
                    .reshape({Nb, Nh, Mb});
     delta_s = torch::empty({Nb, Nh, Mb, Nkv_pad}, opts_f32);
-    TORCH_CHECK(K.is_contiguous(), "ffpa_attn: fp4 path requires contiguous K");
     ffpa_fp4::launch_fp4_delta_s_sm120<kDataType, kHeadDim>(
         reinterpret_cast<const kDataType*>(qm_h.data_ptr()), k_ptr,
         reinterpret_cast<const kDataType*>(qkm.data_ptr()),
         delta_s.data_ptr<float>(), Nb, Nh, Nh_kv, Mb, Nkv, Nkv_pad,
-        static_cast<int>(K.size(3)), stream);
+        static_cast<int>(K.size(3)), stream, &Lkv);
   }
 
   const long total_q_pad = (long)Nb * Nh * Nq_pad;
@@ -2436,10 +2458,17 @@ void launch_cute_fwd_split_d_m4n2_fp4_sm120_impl(
   const c10::cuda::OptionalCUDAGuard device_guard(Q.device());
   auto stream = at::cuda::getCurrentCUDAStream();
   if (fp4_hadamard) {
+    // WHT pre-rotation needs BHND-packed rows; materialize NHD views.
+    if (ffpa_is_nhd_view(Q))
+      Q = Q.contiguous();
+    if (ffpa_is_nhd_view(K))
+      K = K.contiguous();
     Q = ffpa::apply_wht_qk_sm120<kDataType, kHeadDim>(Q);
     K = ffpa::apply_wht_qk_sm120<kDataType, kHeadDim>(K);
   }
   const kDataType* k_ptr = reinterpret_cast<const kDataType*>(K.data_ptr());
+  // NHD (BNHD) permute views are consumed natively by the pre-kernels.
+  const ffpa_fp8::Fp8InputLayout Lkv = ffpa_layout_of(K, Nkv, K.size(3));
 
   torch::Tensor km_h = torch::empty({Nb * Nh_kv, kHeadDim}, K.options());
   torch::Tensor km_f32 = torch::empty({Nb * Nh_kv, kHeadDim}, opts_f32);
@@ -2451,7 +2480,7 @@ void launch_cute_fwd_split_d_m4n2_fp4_sm120_impl(
     ffpa_fp8::launch_kv_mean_sm120<kDataType, kHeadDim>(
         k_ptr, reinterpret_cast<kDataType*>(km_h.data_ptr()),
         km_f32.data_ptr<float>(), km_partials.data_ptr<float>(), Nb, Nh_kv, Nkv,
-        static_cast<int>(K.size(3)), stream);
+        static_cast<int>(K.size(3)), stream, &Lkv);
   }
 
   auto Q_t = Q.transpose(1, 2);
@@ -2471,12 +2500,11 @@ void launch_cute_fwd_split_d_m4n2_fp4_sm120_impl(
                              km_h.view({Nb, Nh_kv, 1, kHeadDim, 1}))
                    .reshape({Nb, Nh, Mb_qm});
     delta_s = torch::empty({Nb, Nh, Mb_qm, Nkv_pad}, opts_f32);
-    TORCH_CHECK(K.is_contiguous(), "ffpa_attn: fp4 path requires contiguous K");
     ffpa_fp4::launch_fp4_delta_s_sm120<kDataType, kHeadDim>(
         reinterpret_cast<const kDataType*>(qm_h.data_ptr()), k_ptr,
         reinterpret_cast<const kDataType*>(qkm.data_ptr()),
         delta_s.data_ptr<float>(), Nb, Nh, Nh_kv, Mb_qm, Nkv, Nkv_pad,
-        static_cast<int>(K.size(3)), stream);
+        static_cast<int>(K.size(3)), stream, &Lkv);
   }
 
   const long total_q_pad = (long)Nb * Nh * Nq_pad;
