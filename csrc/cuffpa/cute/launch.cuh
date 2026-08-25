@@ -807,7 +807,10 @@ void launch_cute_fwd_persist_d_fp8_sm120_impl(
   // D-scaled kBc (L354).
   constexpr int kBc = (kHeadDim <= 128) ? 128 : 64;
   constexpr int kSmemBudgetBytes = 99 * 1024;
-  constexpr int kQPersistBytes = kBr * kHeadDim;  // e4m3/int8 = 1B
+  // kPersistQs2rDefault: K stage 0 reuses the Q area, so the Q bytes drop
+  // out of the smem budget (stages 3 -> 96KB fits the 99KB sm_120 limit).
+  constexpr int kQPersistBytes =
+      ffpa_fp8::kPersistQs2rDefault ? 0 : kBr * kHeadDim;  // e4m3/int8 = 1B
   constexpr int kPerStageBytes = 2 * kBc * kHeadDim;
   constexpr int kMaxStages =
       (kSmemBudgetBytes - kQPersistBytes) / kPerStageBytes;
@@ -990,7 +993,12 @@ void launch_cute_fwd_persist_d_fp8_sm120_impl(
   auto tma_o = make_tma_copy(SM90_TMA_STORE{}, gO, SmemLayoutO{},
                              Shape<Int<kBr>, Int<kHeadDim>>{}, _1{});
 
-  constexpr int kSmemBytes = Traits::kSmemElems * sizeof(Element);
+  // kPersistQs2rDefault: K stage 0 reuses the one-shot Q tile area in the
+  // kernel, so the Q bytes drop out of the smem allocation.
+  constexpr int kSmemBytes =
+      (Traits::kSmemElems -
+       (ffpa_fp8::kPersistQs2rDefault ? Traits::kBr * Traits::kHeadDim : 0)) *
+      sizeof(Element);
   float* softmax_lse_ptr =
       softmax_lse.numel() > 0 ? softmax_lse.data_ptr<float>() : nullptr;
   auto O_ptr = reinterpret_cast<ElementO*>(O.data_ptr());
