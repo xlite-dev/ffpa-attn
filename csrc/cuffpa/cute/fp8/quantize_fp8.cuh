@@ -698,6 +698,10 @@ void launch_quantize_fp8_vt_perchannel_sm120(
 // per-block uses 1. This middle ground gives zero-shuffle dequant (each
 // thread's C-frag rows share one scale) at the cost of multi-row amax sharing.
 // kQKInt8: int8 output (amax/127); else e4m3 (amax/448).
+// 2 threads per row (half a row each): doubles the grid so DRAM latency on
+// cold inputs is hidden by more in-flight warps. amax combines the row
+// halves (shfl_xor 1) then the {r, r+8} pair (shfl_xor 16); the group amax
+// and every quantized byte stay bitwise identical to the 1-thread/row form.
 template <typename Element, int kD, bool kQKInt8>
 __global__ void quantize_fp8_perthread_q_kernel(
     const Element* __restrict__ X,    // (B, H, N, D_og) or NHD layout L
@@ -707,39 +711,47 @@ __global__ void quantize_fp8_perthread_q_kernel(
   constexpr int kVec = 8;
   constexpr int D = kD;
   constexpr int dv = D / kVec;
-  const int rb = blockIdx.x;
+  constexpr int kHalf = dv / 2;  // Vec8 chunks per row half
+  const int rb = blockIdx.x;     // 64-row block
   const int bh = blockIdx.y;
   const int tid = threadIdx.x;
-  const int row = rb * 128 + tid;
+  const int row = rb * 64 + (tid >> 1);
+  const int half = tid & 1;
   const Element* x_bh = X + fp8_plane_base(L, bh);
   QKOutT<kQKInt8>* y_bh = Y + static_cast<long>(bh) * N * D;
 
   float amax = 0.0f;
-  Vec8<Element> regs[dv];
+  Vec8<Element> regs[kHalf];
   if (row < N) {
 #pragma unroll
-    for (int c = 0; c < dv; ++c) {
+    for (int c = 0; c < kHalf; ++c) {
+      const int cc = half * kHalf + c;
       regs[c] = Vec8<Element>::zero();
-      if (c * kVec < D_og)
+      if (cc * kVec < D_og)
         regs[c] =
-            reinterpret_cast<const Vec8<Element>*>(x_bh + row * L.s_row)[c];
+            reinterpret_cast<const Vec8<Element>*>(x_bh + row * L.s_row)[cc];
 #pragma unroll
       for (int e = 0; e < kVec; ++e)
         amax = fmaxf(amax, fabsf(static_cast<float>(regs[c].elem[e])));
     }
   }
-  // Pair rows tid and tid^8 (same C-fragment group).
-  amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, 8));
+  // Same row other half, then the pair row {r, r+8} (tid>>1 differs by 8).
+  amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, 1));
+  amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, 16));
   const float s = kQKInt8 ? amax / 127.0f : amax / 448.0f;
   const float inv_s = (s == 0.0f) ? 0.0f : 1.0f / s;
   const int n_rb = (N + 127) / 128;
-  const int g = (tid / 16) * 8 + tid % 8;
-  if ((tid & 8) == 0)
-    scale[static_cast<long>(bh) * (n_rb * 64) + rb * 64 + g] = s;
+  // Segment row = row within the 128-row scale segment: rows [0,64) come
+  // from even rb, [64,128) from odd rb (each launch block covers 64 rows).
+  const int seg_row = (rb & 1) * 64 + (tid >> 1);
+  const int g = (seg_row / 16) * 8 + seg_row % 8;
+  if ((tid & 1) == 0 && ((seg_row & 8) == 0))
+    scale[static_cast<long>(bh) * (n_rb * 64) + (rb >> 1) * 64 + g] = s;
 
   if (row < N) {
 #pragma unroll
-    for (int c = 0; c < dv; ++c) {
+    for (int c = 0; c < kHalf; ++c) {
+      const int cc = half * kHalf + c;
       uint2 out;
       QKOutT<kQKInt8>* ob = reinterpret_cast<QKOutT<kQKInt8>*>(&out);
 #pragma unroll
@@ -750,7 +762,7 @@ __global__ void quantize_fp8_perthread_q_kernel(
         else
           ob[e] = __nv_fp8_e4m3(v);
       }
-      reinterpret_cast<uint2*>(y_bh + row * D)[c] = out;
+      reinterpret_cast<uint2*>(y_bh + row * D)[cc] = out;
     }
   }
 }
@@ -890,9 +902,10 @@ void launch_quantize_fp8_perthread_qk_sm120(
     int D_og, Fp8InputLayout Lq, Fp8InputLayout Lkv, cudaStream_t stream,
     const Element* km = nullptr, bool perm_vt = false, bool skip_vt = false) {
   using QKOut = QKOutT<kQKInt8>;
-  // Q: 128-row blocks, 64 scale per block.
+  // Q: 128-row scale blocks, 64 scale per block; 2 threads/row (64-row
+  // launch blocks) for DRAM latency hiding.
   {
-    dim3 grid((Nq + 127) / 128, B * Nh);
+    dim3 grid((Nq + 63) / 64, B * Nh);
     auto qk = quantize_fp8_perthread_q_kernel<Element, kHeadDim, kQKInt8>;
     qk<<<grid, 128, 0, stream>>>(q_ptr, reinterpret_cast<QKOut*>(q8), q_scale,
                                  Nq, Nh, D_og, Lq);
