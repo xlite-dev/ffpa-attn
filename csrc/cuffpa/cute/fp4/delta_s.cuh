@@ -17,6 +17,8 @@
 #include <cuda_runtime.h>
 #include <mma.h>
 
+#include "../fp8/input_layout.cuh"
+
 namespace ffpa_fp4 {
 
 using namespace nvcuda;
@@ -33,10 +35,11 @@ using namespace nvcuda;
 template <typename T, int kHeadDim>
 __global__ void delta_s_wmma_kernel(
     const T* __restrict__ qm,   // [Nb, Nh, Mb, kHeadDim] row-major
-    const T* __restrict__ k,    // [Nb, Nhkv, Nkv, d_og] row-major
+    const T* __restrict__ k,    // (B,H,N,D) via Lkv (BHND- or NHD-packed)
     const T* __restrict__ qkm,  // [Nb, Nh, Mb] row-major
     float* __restrict__ ds,     // [Nb, Nh, Mb, Nkv_pad] row-major
-    int Nh, int Nh_kv, int Mb, int Nkv, int Nkv_pad, int d_og) {
+    int Nh, int Nh_kv, int Mb, int Nkv, int Nkv_pad, int d_og,
+    ffpa_fp8::Fp8InputLayout Lkv) {
   namespace w = nvcuda::wmma;
   constexpr int kChunk = 64;   // K elements staged per pass
   constexpr int kLdAB = 72;    // kChunk + 8 halves (ldm multiple of 8)
@@ -58,7 +61,8 @@ __global__ void delta_s_wmma_kernel(
   T* sB = sA + 128 * kLdAB;
 
   const T* gA = qm + (long)(bh * Mb + tile_m * 128) * kHeadDim;
-  const T* gB = k + ((long)((b * Nh_kv + h / (Nh / Nh_kv)) * Nkv) + n0) * d_og;
+  const int bh_kv = b * Nh_kv + h / (Nh / Nh_kv);
+  const T* gB = k + fp8_plane_base(Lkv, bh_kv) + (long)n0 * Lkv.s_row;
   constexpr int kVec4PerRow = kChunk / 8;  // 16B loads per staged row
 
   w::fragment<w::accumulator, 16, 16, 16, float> acc[8];
@@ -83,7 +87,7 @@ __global__ void delta_s_wmma_kernel(
       // kHeadDim-wide buffer whose pad cols are already 0.
       if (n0 + row < Nkv && kc + col < d_og) {
         *reinterpret_cast<uint4*>(sB + row * kLdAB + col) =
-            *reinterpret_cast<const uint4*>(gB + row * d_og + kc + col);
+            *reinterpret_cast<const uint4*>(gB + row * Lkv.s_row + kc + col);
       } else {
         *reinterpret_cast<uint4*>(sB + row * kLdAB + col) = uint4{0, 0, 0, 0};
       }
@@ -146,10 +150,14 @@ __global__ void delta_s_wmma_kernel(
 }
 
 template <typename T, int kHeadDim>
-inline void launch_fp4_delta_s_sm120(const T* qm, const T* k, const T* qkm,
-                                     float* ds, int Nb, int Nh, int Nh_kv,
-                                     int Mb, int Nkv, int Nkv_pad, int d_og,
-                                     cudaStream_t stream) {
+inline void launch_fp4_delta_s_sm120(
+    const T* qm, const T* k, const T* qkm, float* ds, int Nb, int Nh, int Nh_kv,
+    int Mb, int Nkv, int Nkv_pad, int d_og, cudaStream_t stream,
+    const ffpa_fp8::Fp8InputLayout* Lkv = nullptr) {
+  // nullptr keeps the historical BHND addressing (bh*Nkv*d_og plane base).
+  const ffpa_fp8::Fp8InputLayout L =
+      Lkv ? *Lkv
+          : ffpa_fp8::Fp8InputLayout{false, 0, 0, (long)Nkv * d_og, d_og};
   const int tc = Nkv_pad / 128;
   const int m_tiles = (Mb + 127) / 128;
   dim3 grid(tc, Nb * Nh * m_tiles);
@@ -161,7 +169,7 @@ inline void launch_fp4_delta_s_sm120(const T* qm, const T* k, const T* qkm,
   cudaFuncSetAttribute(delta_s_wmma_kernel<T, kHeadDim>,
                        cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
   delta_s_wmma_kernel<T, kHeadDim><<<grid, 256, smem, stream>>>(
-      qm, k, qkm, ds, Nh, Nh_kv, Mb, Nkv, Nkv_pad, d_og);
+      qm, k, qkm, ds, Nh, Nh_kv, Mb, Nkv, Nkv_pad, d_og, L);
 }
 
 }  // namespace ffpa_fp4

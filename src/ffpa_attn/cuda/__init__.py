@@ -102,7 +102,10 @@ def _fwd_cuda_torch_op(
       "Rebuild with ENABLE_FFPA_CUDA_IMPL=1 to enable it. "
       f"Original import error: {_CUDA_IMPORT_ERROR}"
     )
-  O = torch.empty_like(Q)  # noqa: E741
+  # O must be BHND-packed even when Q is an NHD (diffusers BNHD) permute
+  # view: empty_like would preserve the NHD strides, but the CUDA kernels
+  # write O through a flat packed-BHND TMA/store descriptor.
+  O = torch.empty_like(Q, memory_format=torch.contiguous_format)  # noqa: E741
   seqlen_q = Q.size(2)
   # NOTE: allocate lse with the exact seqlen (no rounding). CUDA kernels index
   # the lse buffer flat as [B, Nh, Nq] (stride Nq per head); passing a padded

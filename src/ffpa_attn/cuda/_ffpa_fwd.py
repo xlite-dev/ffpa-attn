@@ -20,7 +20,7 @@ def _ffpa_attn_forward_cuda(
   fp8_smooth_v: bool = False,
   fp8_q_quant_method: int = 0,
   fp8_k_quant_method: int = 0,
-  fp8_v_quant_method: int = 0,
+  fp8_v_quant_method: int = 1,
   fp8_pv_acc_type: int = 1,
   fp8_qk_mm_type: int = 0,
   fp8_hybrid: bool = False,

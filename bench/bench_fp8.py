@@ -48,10 +48,22 @@ if FFPA_BENCH_FP8_FORCE_QK_INT8:
     "FFPA_BENCH_FP8_FORCE_QK_INT8=1: forcing FP8 Q/K matmul int8, P/V accumulate f16"
   )
 
+# cachedit mirrors cache-dit's ffpa_fp8 backend: int8 QK + f16 PV acc +
+# per_thread Q/K + per_channel V + smooth {k,v} + hybrid (non-causal 256 /
+# causal 128 early rows). Same-basis comparison against Sage's native
+# per-thread/per-channel kernels.
+PRESETS = ("default", "int8", "cachedit")
 
-def fp8_backend(no_hybrid: bool = False) -> CUDABackend:
-  if "5090" in torch.cuda.get_device_name() or FFPA_BENCH_FP8_FORCE_QK_INT8:
-    # 5090: FP8 Q/K matmul int8, P/V accumulate f16 (default)
+
+def _is_5090_or_force_int8() -> bool:
+  return "5090" in torch.cuda.get_device_name() or FFPA_BENCH_FP8_FORCE_QK_INT8
+
+
+def fp8_backend(
+  preset: str = "default", no_hybrid: bool = False
+) -> CUDABackend:
+  if preset == "int8" or (preset == "default" and _is_5090_or_force_int8()):
+    # 5090 default / explicit int8 preset: int8 QK matmul, f16 PV acc.
     return CUDABackend(
       backward=False,
       enable_tma=True,
@@ -60,6 +72,22 @@ def fp8_backend(no_hybrid: bool = False) -> CUDABackend:
       fp8_qk_mm_type="int8",
       fp8_pv_acc_type="f16",
       fp8_hybrid=False if no_hybrid else None,
+    )
+  if preset == "cachedit":
+    return CUDABackend(
+      backward=False,
+      enable_tma=True,
+      enable_cute=True,
+      enable_fp8=True,
+      fp8_qk_mm_type="int8",
+      fp8_pv_acc_type="f16",
+      fp8_q_quant_method="per_thread",
+      fp8_k_quant_method="per_thread",
+      fp8_v_quant_method="per_channel",
+      fp8_smooth_k=True,
+      fp8_smooth_v=True,
+      fp8_hybrid=False if no_hybrid else True,
+      fp8_hybrid_n_early=256,
     )
   # default: FP8 Q/K matmul fp8, P/V accumulate f32
   return CUDABackend(
@@ -142,21 +170,34 @@ def _mk(B, Hq, Hkv, Nq, Nkv, D, dtype, scale):
   return q, k, v
 
 
-def run_ffpa(q, k, v, causal, gqa, no_hybrid=False):
+def run_ffpa(
+  q, k, v, causal, gqa, preset="default", no_hybrid=False, with_permute=False
+):
+  if with_permute:
+    # cache-dit E2E path: inputs arrive as diffusers NHD [B,N,H,D] storage;
+    # ffpa consumes them natively via a zero-copy permute view (Phase C, no
+    # transpose copy). The storage itself was materialized OUTSIDE the timed
+    # region in run_scenario.
+    q, k, v = (x.permute(0, 2, 1, 3) for x in (q, k, v))
   return ffpa_attn_func(
     q,
     k,
     v,
     is_causal=causal,
     enable_gqa=gqa,
-    forward_backend=fp8_backend(no_hybrid)
+    forward_backend=fp8_backend(preset, no_hybrid)
   )
 
 
-def run_sage(q, k, v, causal, gqa):
+def run_sage(q, k, v, causal, gqa, with_permute=False):
   if not SAGE_INSTALLED:
     return None
   # sageattn handles GQA natively (Hq % Hkv == 0); no KV repeat needed.
+  # with_permute: q/k/v are already NHD [B,N,H,D] storage (diffusers native);
+  # the NHD kernel returns [B,N,H,D], transpose back for BHND comparison.
+  if with_permute:
+    return sageattn(q, k, v, tensor_layout="NHD",
+                    is_causal=causal).permute(0, 2, 1, 3)
   return sageattn(q, k, v, tensor_layout="HND", is_causal=causal)
 
 
@@ -217,18 +258,39 @@ def build_scenarios(N, B, H, Hkv, D, cross_dense=True, non_aligned_pad=15):
 
 
 def run_scenario(
-  sc, dtype, scale, warmup, iters, use_sage, sdpa_name, no_hybrid=False
+  sc,
+  dtype,
+  scale,
+  warmup,
+  iters,
+  use_sage,
+  sdpa_name,
+  preset="default",
+  no_hybrid=False,
+  with_permute=False
 ):
   q, k, v = _mk(sc.B, sc.Hq, sc.Hkv, sc.Nq, sc.Nkv, sc.D, dtype, scale)
   ref = ref_bf16(q, k, v, sc.causal, sc.gqa, sdpa_name).to(dtype)
   sdpa_label = f"SDPA-{sdpa_name.upper()}"
+  if with_permute:
+    # Materialize diffusers-style NHD [B,N,H,D] storage ONCE, outside every
+    # timed region: ffpa consumes it via zero-copy permute views (Phase C),
+    # sage natively; this mirrors real pipelines where attention inputs are
+    # produced in NHD by upstream ops. SDPA still gets zero-copy BHND views
+    # (it has no NHD mode here).
+    q, k, v = (x.permute(0, 2, 1, 3).contiguous() for x in (q, k, v))
+    sq, sk, sv = (x.permute(0, 2, 1, 3) for x in (q, k, v))
+  else:
+    sq, sk, sv = q, k, v
 
   outs = {
-    "FFPA-FP8": run_ffpa(q, k, v, sc.causal, sc.gqa, no_hybrid),
-    sdpa_label: run_sdpa(q, k, v, sc.causal, sc.gqa, sdpa_name),
+    "FFPA-FP8":
+    run_ffpa(q, k, v, sc.causal, sc.gqa, preset, no_hybrid, with_permute),
+    sdpa_label:
+    run_sdpa(sq, sk, sv, sc.causal, sc.gqa, sdpa_name),
   }
   if use_sage:
-    sage_out = run_sage(q, k, v, sc.causal, sc.gqa)
+    sage_out = run_sage(q, k, v, sc.causal, sc.gqa, with_permute)
     if sage_out is not None:
       outs["Sage"] = sage_out
   errs = {name: rel_err(o, ref) for name, o in outs.items()}
@@ -236,14 +298,16 @@ def run_scenario(
   # Bench order: SDPA pre-heat (unmeasured) stabilizes GPU clock/power first,
   # then FFPA, then Sage, then SDPA (reference). Measured backends run hot.
   for _ in range(5):
-    run_sdpa(q, k, v, sc.causal, sc.gqa, sdpa_name)
+    run_sdpa(sq, sk, sv, sc.causal, sc.gqa, sdpa_name)
   torch.cuda.synchronize()
   fns = {
-    "FFPA-FP8": lambda: run_ffpa(q, k, v, sc.causal, sc.gqa, no_hybrid),
+    "FFPA-FP8":
+    lambda:
+    run_ffpa(q, k, v, sc.causal, sc.gqa, preset, no_hybrid, with_permute),
   }
   if use_sage and SAGE_INSTALLED:
-    fns["Sage"] = lambda: run_sage(q, k, v, sc.causal, sc.gqa)
-  fns[sdpa_label] = lambda: run_sdpa(q, k, v, sc.causal, sc.gqa, sdpa_name)
+    fns["Sage"] = lambda: run_sage(q, k, v, sc.causal, sc.gqa, with_permute)
+  fns[sdpa_label] = lambda: run_sdpa(sq, sk, sv, sc.causal, sc.gqa, sdpa_name)
   ms = {
     name: bench_ms(fn, warmup=warmup, iters=iters)
     for name, fn in fns.items()
@@ -315,6 +379,21 @@ def parse_args():
     help="Disable FFPA fp8 hybrid path (pure fp8 kernel comparison)",
   )
   p.add_argument(
+    "--preset",
+    type=str,
+    default="default",
+    choices=list(PRESETS),
+    help="FFPA fp8 config: default (fp8/f32 acc, per_block), int8 (int8/f16 "
+    "acc, per_block), cachedit (int8/f16 acc, per_thread+per_channel+smooth "
+    "{k,v}+hybrid 256 — same as cache-dit ffpa_fp8 backend)",
+  )
+  p.add_argument(
+    "--with-permute",
+    action="store_true",
+    help="Simulate cache-dit E2E layout: FFPA pays NHD->BHND permute+"
+    "contiguous per tensor, Sage consumes NHD natively",
+  )
+  p.add_argument(
     "--sdpa-backend",
     type=str,
     default="auto",
@@ -347,7 +426,8 @@ def main():
   print(
     f"sage={'on' if use_sage else 'off'}, "
     f"SDPA={args.sdpa_backend}, B={args.B} H={args.H} Hkv={args.Hkv} "
-    f"D={args.D} warmup={args.warmup} iters={args.iters}\n"
+    f"D={args.D} warmup={args.warmup} iters={args.iters} "
+    f"preset={args.preset} with_permute={args.with_permute}\n"
   )
 
   for N in Ns:
@@ -371,7 +451,9 @@ def main():
         args.iters,
         use_sage,
         sdpa_name,
+        preset=args.preset,
         no_hybrid=args.no_hybrid,
+        with_permute=args.with_permute,
       )
 
 

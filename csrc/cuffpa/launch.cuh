@@ -139,6 +139,33 @@ void launch_ffpa_attn_fwd_template(
   const bool force_cute_tma = (impl_hint == ffpa::CudaBackendImpl::CUTE_TMA);
   const bool force_fp8 = (impl_hint == ffpa::CudaBackendImpl::CUTE_TMA_FP8);
   const bool force_fp4 = (impl_hint == ffpa::CudaBackendImpl::CUTE_TMA_FP4);
+#ifdef ENABLE_FFPA_CUTE_EXT
+#ifdef ENABLE_FFPA_TMA_EXT
+  // NHD (diffusers BNHD) permute-view inputs are consumed natively by the
+  // fp8/fp4 cute paths (pre-kernels via Fp8InputLayout/strides + batched 4D
+  // TMA in the persist-D hybrid stage-1 fp16 kernel) and by the whole sm_120
+  // fp16/bf16 cute family (persist-D, split-D, M4N2). Every other fp16
+  // backend materializes packed copies here (same cost as a caller-side
+  // permute+contiguous) instead of silently corrupting.
+  bool nhd_in =
+      ffpa_is_nhd_view(Q) || ffpa_is_nhd_view(K) || ffpa_is_nhd_view(V);
+  if (nhd_in && !force_fp8 && !force_fp4) {
+    auto prop_nhd = at::cuda::getCurrentDeviceProperties();
+    const bool fp16_nhd_ok = !force_tma && !force_native && !force_cute &&
+                             prop_nhd->major >= 12 && kHeadDim % 32 == 0 &&
+                             attn_bias.numel() == 0 && dropout_p == 0.0;
+    if (!fp16_nhd_ok) {
+      if (ffpa_is_nhd_view(Q))
+        Q = Q.contiguous();
+      if (ffpa_is_nhd_view(K))
+        K = K.contiguous();
+      if (ffpa_is_nhd_view(V))
+        V = V.contiguous();
+      nhd_in = false;
+    }
+  }
+#endif
+#endif
 
   // fp16/bf16 head_dim pad: non-32-multiple D_og (e.g. 120) zero-pads Q/K/V
   // to the compiled kHeadDim. fp8 skips (quantize reads D_og natively); O is
@@ -184,6 +211,11 @@ void launch_ffpa_attn_fwd_template(
         // as fp8: P-quantization noise on short-row softmax rows.
         TORCH_CHECK(attn_bias.numel() == 0 && dropout_p == 0.0,
                     "fp4 sm120 path does not support attn_bias/dropout");
+        // NHD (BNHD) views are consumed natively by the fp4 pre-kernels and
+        // the persist-D attention kernel (quantized buffers are BHND). The
+        // persist-D hybrid stage-1 fp16 kernel also handles NHD K/V. Only
+        // the split-D/m4n2 hybrid stage-1 (fp16 split-D) needs BHND K/V -
+        // gated inside those branches below.
         // fp4 persist-D covers 64-multiple headdims in [64,256], split-D
         // fp4 covers (256,768); D>=768 lands in the m4n2 branch. The first
         // if constexpr also keeps the hybrid stage-1 fp16 persist-D out of
@@ -350,6 +382,19 @@ void launch_ffpa_attn_fwd_template(
             }
           }
         }
+        // NHD (diffusers BNHD) inputs: split-D fp8 quantize is
+        // layout-generic, but the hybrid stage-1 fp16 split-D kernel TMA
+        // needs BHND packing — reject that combination explicitly.
+#ifdef ENABLE_FFPA_CUTE_EXT
+#ifdef ENABLE_FFPA_TMA_EXT
+        if constexpr (kHeadDim > 224) {
+          TORCH_CHECK(!(nhd_in && fp8_hybrid && Nq >= fp8_hybrid_n_early),
+                      "ffpa_attn: NHD (BNHD) input with fp8 hybrid requires "
+                      "the persist-D path (head_dim <= 224); pass "
+                      "BHND-contiguous tensors or disable hybrid");
+        }
+#endif
+#endif
         // D<=224: persist-D fp8; 224<D<768: split-D M8N1 fp8;
         // D>=768: split-D M4N2 fp8. Same D<768/D>=768 cross-point as the
         // fp16 dispatch (M4N2 wins only for D>=768; below that M8N1 is

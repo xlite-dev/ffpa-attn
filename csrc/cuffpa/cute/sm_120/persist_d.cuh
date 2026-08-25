@@ -27,8 +27,14 @@ using CtaBarrier = cutlass::arch::ClusterBarrier;
 // NOTE: 32-multiple small D (D=32/64/96/128) is supported. The smem swizzle
 // is auto-selected by Traits from D*2B (SW128 for 64-mult, SW64 for D=32/96);
 // TMA descriptors inherit the same swizzle from SmemLayoutO.
+// kNhdKV: K/V arrive as a batched 4D (N, D, h, b) TMA over an NHD (diffusers
+// BNHD) permute view instead of flat BHND rows; the (kv_head, batch) origin
+// rides the local_tile coord (FA3 batched pattern) instead of domain_offset.
+// kNhdQ: same for Q - flat (B*N, H*D) rows with the q head as the column
+// tile. O stays BHND-packed (caller allocates it packed and re-views).
 template <typename Traits, typename TmaQ, typename TmaK, typename TmaV,
-          typename TmaO, int kHasAttnBias = 0, int kHasDropout = 0>
+          typename TmaO, int kHasAttnBias = 0, int kHasDropout = 0,
+          bool kNhdKV = false, bool kNhdQ = false>
 __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_sm120(
     CUTLASS_GRID_CONSTANT TmaQ const tma_q,
     CUTLASS_GRID_CONSTANT TmaK const tma_k,
@@ -128,23 +134,57 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_sm120(
     // alloc up to 232 regs/thread.
     cutlass::arch::warpgroup_reg_dealloc<32>();  // sm_120f
     if (wg_tid == 0) {
-      auto mQ = domain_offset(
-          make_coord(q_row_offset, 0),
-          tma_q.get_tma_tensor(make_shape(total_q_rows, Int<kHeadDim>{})));
-      auto mK = domain_offset(
-          make_coord(kv_row_offset, 0),
-          tma_k.get_tma_tensor(make_shape(total_kv_rows, Int<kHeadDim>{})));
-      auto mV = domain_offset(
-          make_coord(kv_row_offset, 0),
-          tma_v.get_tma_tensor(make_shape(total_kv_rows, Int<kHeadDim>{})));
+      auto mQ = [&] {
+        if constexpr (kNhdQ)
+          // NHD (diffusers BNHD) -> flat (B*N, H*D) rows, batch via
+          // domain_offset, head as a kHeadDim-wide column tile.
+          return domain_offset(make_coord(static_cast<long>(Nb_id) * Nq, 0),
+                               tma_q.get_tma_tensor(make_shape(
+                                   static_cast<long>(gridDim.y / Nh) * Nq,
+                                   static_cast<long>(Nh) * kHeadDim)));
+        else
+          return domain_offset(
+              make_coord(q_row_offset, 0),
+              tma_q.get_tma_tensor(make_shape(total_q_rows, Int<kHeadDim>{})));
+      }();
+      // K/V gmem view: BHND packed -> flat (B*H*N, D) rows, origin via
+      // domain_offset; NHD (diffusers BNHD) -> flat (B*N, H*D) rows (row
+      // stride H*D uniform across batch), head selected as a kHeadDim-wide
+      // column tile (tile coord 1) and batch via domain_offset. Both stay
+      // plain flat-2D TMA; only the tile coord gains the head index.
+      const auto make_mKV = [&](auto const& tma) {
+        if constexpr (kNhdKV)
+          return domain_offset(make_coord(static_cast<long>(Nb_id) * Nkv, 0),
+                               tma.get_tma_tensor(make_shape(
+                                   static_cast<long>(gridDim.y / Nh) * Nkv,
+                                   static_cast<long>(Nh_kv) * kHeadDim)));
+        else
+          return domain_offset(
+              make_coord(kv_row_offset, 0),
+              tma.get_tma_tensor(make_shape(total_kv_rows, Int<kHeadDim>{})));
+      };
+      auto mK = make_mKV(tma_k);
+      auto mV = make_mKV(tma_v);
+      const auto kv_tile_coord = [&](int tile) {
+        if constexpr (kNhdKV)
+          return make_coord(tile, kv_head_idx);
+        else
+          return make_coord(tile, _0{});
+      };
       auto q_slice = tma_q.get_slice(_0{});
       auto k_slice = tma_k.get_slice(_0{});
       auto v_slice = tma_v.get_slice(_0{});
 
       // P0: Q one-shot full-D TMA
       auto sQ = make_tensor(make_smem_ptr(q_base), SmemLayoutQ{});
-      auto gQ = local_tile(mQ, Shape<Int<kBr>, Int<kHeadDim>>{},
-                           make_coord(Q_tile_id, _0{}));
+      auto gQ = [&] {
+        if constexpr (kNhdQ)
+          return local_tile(mQ, Shape<Int<kBr>, Int<kHeadDim>>{},
+                            make_coord(Q_tile_id, Nh_id));
+        else
+          return local_tile(mQ, Shape<Int<kBr>, Int<kHeadDim>>{},
+                            make_coord(Q_tile_id, _0{}));
+      }();
       auto tQgQ = q_slice.partition_S(gQ);
       auto tQsQ = q_slice.partition_D(sQ);
       TmaBarrier::arrive_and_expect_tx(&q_full, sizeof(Element) * size(sQ));
@@ -157,7 +197,7 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_sm120(
           auto sK = make_tensor(make_smem_ptr(k_base + s * kKVTileElements),
                                 SmemLayoutKV{});
           auto gK = local_tile(mK, Shape<Int<kBc>, Int<kHeadDim>>{},
-                               make_coord(s, _0{}));
+                               kv_tile_coord(s));
           auto tKgK = k_slice.partition_S(gK);
           auto tKsK = k_slice.partition_D(sK);
           TmaBarrier::arrive_and_expect_tx(&k_full[s],
@@ -172,7 +212,7 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_sm120(
           auto sV = make_tensor(make_smem_ptr(v_base + s * kKVTileElements),
                                 SmemLayoutKV{});
           auto gV = local_tile(mV, Shape<Int<kBc>, Int<kHeadDim>>{},
-                               make_coord(s, _0{}));
+                               kv_tile_coord(s));
           auto tVgV = v_slice.partition_S(gV);
           auto tVsV = v_slice.partition_D(sV);
           TmaBarrier::arrive_and_expect_tx(&v_full[s],
@@ -200,7 +240,7 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_sm120(
                 make_tensor(make_smem_ptr(v_base + stage_v * kKVTileElements),
                             SmemLayoutKV{});
             auto gV = local_tile(mV, Shape<Int<kBc>, Int<kHeadDim>>{},
-                                 make_coord(v_tile, _0{}));
+                                 kv_tile_coord(v_tile));
             auto tVgV = v_slice.partition_S(gV);
             auto tVsV = v_slice.partition_D(sV);
             TmaBarrier::arrive_and_expect_tx(&v_full[stage_v],
@@ -219,7 +259,7 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_sm120(
                 make_tensor(make_smem_ptr(k_base + stage_k * kKVTileElements),
                             SmemLayoutKV{});
             auto gK = local_tile(mK, Shape<Int<kBc>, Int<kHeadDim>>{},
-                                 make_coord(k_tile, _0{}));
+                                 kv_tile_coord(k_tile));
             auto tKgK = k_slice.partition_S(gK);
             auto tKsK = k_slice.partition_D(sK);
             TmaBarrier::arrive_and_expect_tx(&k_full[stage_k],

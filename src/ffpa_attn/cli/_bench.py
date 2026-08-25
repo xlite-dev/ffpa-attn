@@ -676,7 +676,7 @@ def _resolve_directional_cli_flags(
   if not hasattr(args, "k_quant_method"):
     args.k_quant_method = "per_block"
   if not hasattr(args, "v_quant_method"):
-    args.v_quant_method = "per_block"
+    args.v_quant_method = "per_channel"
   if not hasattr(args, "pv_acc_type"):
     args.pv_acc_type = "f32"
   if not hasattr(args, "qk_mm_type"):
