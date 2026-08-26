@@ -15,37 +15,69 @@ internally; fp32 SDPA would OOM at large N).
 Examples:
   python bench/bench_fp4.py
   python bench/bench_fp4.py --N 16384 --dtype bf16
-  python bench/bench_fp4.py --no-sage --no-hybrid
+  python bench/bench_fp4.py --no-sage --hybrid
 """
 
 from __future__ import annotations
 
 import argparse
 import importlib.util
+import re
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
+from pathlib import Path
 
+import matplotlib.pyplot as plt
+import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from ffpa_attn import ffpa_attn_func
-from ffpa_attn.cli._flops import attention_fwd_flops, tflops_from_ms
+from ffpa_attn.cli._flops import (
+  attention_fwd_flops,
+  format_tflops_short,
+  tflops_from_ms,
+)
 from ffpa_attn.functional import CUDABackend
+
+# Match the bench_fp8.py / ffpa_attn.bench CLI plot style.
+plt.rcParams["figure.dpi"] = 300
+plt.rcParams["font.sans-serif"] = ["DejaVu Sans"]
+plt.rcParams["axes.unicode_minus"] = False
 
 SAGE3_INSTALLED = importlib.util.find_spec("sageattn3") is not None
 if SAGE3_INSTALLED:
   from sageattn3 import sageattn3_blackwell
 
+PLOT_OUTPUT_DIR = Path(__file__).resolve().parent / ".tmp"
+PLOT_CASE_ORDER = (
+  "self",
+  "causal",
+  "gqa",
+  "gqa-causal",
+  "cross-dense (Nkv=2Nq)",
+  "non-aligned-dense",
+  "non-aligned-causal",
+)
+PLOT_CASE_LABELS = {"cross-dense (Nkv=2Nq)": "cross-dense"}
+BACKEND_ORDER = ("FFPA-FP4", "FFPA-FP8", "Sage3", "SDPA")
+BACKEND_COLORS = {
+  "FFPA-FP4": "#f5a623",
+  "FFPA-FP8": "#fd493c",
+  "Sage3": "#2171b5",
+  "SDPA": "#b0b0b0",
+}
 
-def fp4_backend(no_hybrid: bool = False, hybrid_n_early: int = 256):
+
+def fp4_backend(hybrid: bool = False, hybrid_n_early: int = 256):
   return CUDABackend(
     backward=False,
     enable_tma=True,
     enable_cute=True,
     enable_fp4=True,
-    fp4_hybrid=False if no_hybrid else None,
+    fp4_hybrid=hybrid,
     fp4_hybrid_n_early=hybrid_n_early,
   )
 
@@ -119,14 +151,14 @@ def _mk(B, Hq, Hkv, Nq, Nkv, D, dtype, scale):
   return q, k, v
 
 
-def run_ffpa(q, k, v, causal, gqa, no_hybrid=False, hybrid_n_early=256):
+def run_ffpa(q, k, v, causal, gqa, hybrid=False, hybrid_n_early=256):
   return ffpa_attn_func(
     q,
     k,
     v,
     is_causal=causal,
     enable_gqa=gqa,
-    forward_backend=fp4_backend(no_hybrid, hybrid_n_early),
+    forward_backend=fp4_backend(hybrid, hybrid_n_early),
   )
 
 
@@ -203,7 +235,8 @@ def run_scenario(
   iters,
   use_sage3,
   sdpa_name,
-  no_hybrid=False,
+  base_n,
+  hybrid=False,
   hybrid_n_early=256
 ):
   q, k, v = _mk(sc.B, sc.Hq, sc.Hkv, sc.Nq, sc.Nkv, sc.D, dtype, scale)
@@ -211,7 +244,7 @@ def run_scenario(
   sdpa_label = f"SDPA-{sdpa_name.upper()}"
 
   outs = {
-    "FFPA-FP4": run_ffpa(q, k, v, sc.causal, sc.gqa, no_hybrid, hybrid_n_early),
+    "FFPA-FP4": run_ffpa(q, k, v, sc.causal, sc.gqa, hybrid, hybrid_n_early),
     "FFPA-FP8": run_ffpa8(q, k, v, sc.causal, sc.gqa),
     sdpa_label: run_sdpa(q, k, v, sc.causal, sc.gqa, sdpa_name),
   }
@@ -234,7 +267,7 @@ def run_scenario(
   torch.cuda.synchronize()
   fns = {
     "FFPA-FP4":
-    lambda: run_ffpa(q, k, v, sc.causal, sc.gqa, no_hybrid, hybrid_n_early),
+    lambda: run_ffpa(q, k, v, sc.causal, sc.gqa, hybrid, hybrid_n_early),
     "FFPA-FP8":
     lambda: run_ffpa8(q, k, v, sc.causal, sc.gqa),
   }
@@ -288,7 +321,174 @@ def run_scenario(
   for r in rows:
     print(fmt_row(r))
   print()
-  return ms
+  return {
+    "case_name": sc.name,
+    "base_n": base_n,
+    "tflops": {
+      name: tflops_from_ms(sc.flops, ms[name])
+      for name in ms
+    },
+  }
+
+
+def _fmt_n(n: int) -> str:
+  """Format a sequence length compactly for labels.
+
+  :param n: Base sequence length.
+  :return: ``8192 -> "8K"``; non-1024 multiples stay decimal.
+  """
+  if n % 1024 == 0:
+    return f"{n // 1024}K"
+  return str(n)
+
+
+def _slugify_device_name(device_name: str) -> str:
+  """Convert a device name into a filesystem-friendly slug.
+
+  :param device_name: Human-readable device name.
+  :return: Lowercase slug safe for filenames.
+  """
+  slug = re.sub(r"[^0-9A-Za-z]+", "-", device_name.strip().lower())
+  slug = re.sub(r"-+", "-", slug).strip("-")
+  return slug or "unknown-device"
+
+
+def _normalize_backend(name: str) -> str:
+  """Collapse dynamic SDPA labels (SDPA-FA2, ...) into one plot series.
+
+  :param name: Backend key from the ``ms`` dict.
+  :return: Canonical plot backend name.
+  """
+  return "SDPA" if name.startswith("SDPA") else name
+
+
+def plot_tflops(
+  rows,
+  *,
+  device_name,
+  output_path,
+  B,
+  H,
+  Hkv,
+  D,
+):
+  """Render the forward TFLOPS bar chart across scenarios and seqlens.
+
+  Draws at most the three largest base sequence lengths (tables stay complete
+  for every ``--N`` value), mirroring bench_fp8.py. Sage3 lacks GQA support,
+  so its slot in GQA scenarios is simply left empty (no bar).
+
+  :param rows: Result rows returned by :func:`run_scenario`.
+  :param device_name: Device name shown in the title.
+  :param output_path: Output PNG path.
+  :param B: Batch size shown in the title.
+  :param H: Base query-head count shown in the title.
+  :param Hkv: Base KV-head count (GQA) shown in the title.
+  :param D: Head dimension shown in the title.
+  :return: Saved PNG path.
+  """
+  plot_ns = sorted({row["base_n"] for row in rows})[-3:]
+  filtered = [row for row in rows if row["base_n"] in plot_ns]
+  present_cases = {row["case_name"] for row in filtered}
+  cases = [c for c in PLOT_CASE_ORDER if c in present_cases]
+  cases += [c for c in present_cases if c not in PLOT_CASE_ORDER]
+  values = {}
+  for row in filtered:
+    for name, tf in row["tflops"].items():
+      values[(row["case_name"], row["base_n"], _normalize_backend(name))] = tf
+  present_backends = {
+    _normalize_backend(name)
+    for row in filtered
+    for name in row["tflops"]
+  }
+  backends = [b for b in BACKEND_ORDER if b in present_backends]
+
+  n_ns = len(plot_ns)
+  n_backends = len(backends)
+  width = 0.24
+  per_case = n_ns * n_backends
+  step = (per_case + 1) * width
+
+  fig, ax = plt.subplots(figsize=(32, 12))
+  finite_values = [
+    tf for tf in values.values() if tf is not None and np.isfinite(tf)
+  ]
+  ymax = max(finite_values) if finite_values else 1.0
+
+  def _autolabel(x, h, text) -> None:
+    if not np.isfinite(h):
+      return
+    ax.annotate(
+      text,
+      # Bars are centered at x in data coordinates.
+      xy=(x, h),
+      xytext=(0, 5),
+      textcoords="offset points",
+      ha="center",
+      va="bottom",
+      fontsize=10,
+      fontweight="bold",
+    )
+
+  for n_idx, n in enumerate(plot_ns):
+    for b_idx, backend in enumerate(backends):
+      positions = []
+      heights = []
+      for case_idx, case in enumerate(cases):
+        base = case_idx * step
+        pos = base + n_idx * n_backends * width + b_idx * width
+        tf = values.get((case, n, backend))
+        # Sage3 GQA rows simply have no bar (sageattn3 lacks GQA support).
+        positions.append(pos)
+        heights.append(tf if tf is not None else float("nan"))
+      ax.bar(
+        positions,
+        heights,
+        width,
+        label=f"{backend} N={_fmt_n(n)}",
+        color=BACKEND_COLORS[backend],
+        edgecolor="white",
+        linewidth=1,
+      )
+      for x, h in zip(positions, heights):
+        _autolabel(x, h, format_tflops_short(h).removesuffix("T"))
+
+  fig.suptitle(
+    f"FFPA-FP4 TFLOPS (FWD) | {device_name} | "
+    f"B={B}, H={H}, Hkv={Hkv}, D={D}",
+    fontsize=18,
+    fontweight="bold",
+    y=0.958,
+  )
+  ax.set_xticks([i * step + per_case * width / 2 for i in range(len(cases))])
+  # One-bar-width left margin; right margin halved (bars crowd the right edge).
+  ax.set_xlim(-width, len(cases) * step - width / 2)
+  # Tag each case with the plotted seqlens (left-to-right N order in-cluster).
+  ns_tag = f"({'/'.join(_fmt_n(n) for n in plot_ns)})"
+  ax.set_xticklabels(
+    [PLOT_CASE_LABELS.get(c, c) + ns_tag for c in cases],
+    rotation=0,
+    ha="center",
+    fontsize=15,
+  )
+  ax.set_ylabel("Throughput (TFLOPS)", fontsize=18)
+  ax.tick_params(axis="y", labelsize=16)
+  ax.set_ylim(0, ymax * 1.10 if ymax > 0 else 1.0)
+  ax.legend(
+    fontsize=16,
+    loc="upper right",
+    ncol=n_backends,
+    columnspacing=1.5,
+    handletextpad=0.6,
+    frameon=True,
+  )
+  ax.grid(axis="y", alpha=0.3)
+
+  fig.tight_layout(rect=(0, 0, 1, 0.965))
+  output_path.parent.mkdir(parents=True, exist_ok=True)
+  fig.savefig(output_path)
+  plt.close(fig)
+  return output_path
 
 
 def parse_args():
@@ -322,9 +522,10 @@ def parse_args():
   p.add_argument("--iters", type=int, default=5, help="Bench iters")
   p.add_argument("--no-sage", action="store_true", help="Skip sageattn3")
   p.add_argument(
-    "--no-hybrid",
+    "--hybrid",
     action="store_true",
-    help="Disable FFPA causal fp16 hybrid (pure fp4 kernel)"
+    help="Enable FFPA causal fp16 hybrid (fp16 early rows). Off by default "
+    "(mirrors bench_fp8.py): Sage3 has no equivalent stage."
   )
   p.add_argument(
     "--fp4-hybrid-n-early",
@@ -357,23 +558,44 @@ def main():
     f"dtype={args.dtype} scale={args.scale} "
     f"warmup={args.warmup} iters={args.iters} "
     f"sage3={SAGE3_INSTALLED and not args.no_sage} "
-    f"hybrid={not args.no_hybrid}"
+    f"hybrid={args.hybrid}"
   )
+  rows = []
+  use_sage3 = SAGE3_INSTALLED and not args.no_sage
   for n in [int(x) for x in args.N.split(",")]:
     for sc in build_scenarios(
       n, args.B, args.H, args.Hkv, args.D, cross_dense=not args.no_cross_dense
     ):
-      run_scenario(
-        sc,
-        dtype,
-        args.scale,
-        args.warmup,
-        args.iters,
-        SAGE3_INSTALLED and not args.no_sage,
-        args.sdpa_backend,
-        no_hybrid=args.no_hybrid,
-        hybrid_n_early=args.fp4_hybrid_n_early
+      rows.append(
+        run_scenario(
+          sc,
+          dtype,
+          args.scale,
+          args.warmup,
+          args.iters,
+          use_sage3,
+          args.sdpa_backend,
+          base_n=n,
+          hybrid=args.hybrid,
+          hybrid_n_early=args.fp4_hybrid_n_early
+        )
       )
+
+  device_name = torch.cuda.get_device_name()
+  output_path = PLOT_OUTPUT_DIR / (
+    f"bench_fp4_tflops_{_slugify_device_name(device_name)}"
+    f"_B{args.B}_H{args.H}_Hkv{args.Hkv}_D{args.D}_{args.dtype}.png"
+  )
+  saved = plot_tflops(
+    rows,
+    device_name=device_name,
+    output_path=output_path,
+    B=args.B,
+    H=args.H,
+    Hkv=args.Hkv,
+    D=args.D,
+  )
+  print(f"Saved TFLOPS plot to {saved}")
 
 
 if __name__ == "__main__":

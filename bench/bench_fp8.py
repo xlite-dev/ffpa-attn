@@ -544,8 +544,8 @@ def plot_tflops(
     y=0.958,
   )
   ax.set_xticks([i * step + per_case * width / 2 for i in range(len(cases))])
-  # Symmetric one-bar-width x margins; matches the inter-cluster gap.
-  ax.set_xlim(-width, len(cases) * step)
+  # One-bar-width left margin; right margin halved (bars crowd the right edge).
+  ax.set_xlim(-width, len(cases) * step - width / 2)
   # Tag each case with the plotted seqlens (left-to-right N order in-cluster).
   ns_tag = f"({'/'.join(_fmt_n(n) for n in plot_ns)})"
   ax.set_xticklabels(
