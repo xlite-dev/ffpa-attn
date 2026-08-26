@@ -15,7 +15,51 @@ python3 -m ffpa_attn.bench --fwd-backend cutedsl --bwd-backend cutedsl # SM==90 
 
 The `ffpa-attn bench CLI (python -m ffpa_attn.bench)` migrated benchmark plotting entrypoint. It preserves the old plot style, can benchmark forward/backward cases on demand, and writes both `ffpa_{device}_speedup.png` and `ffpa_{device}_speedup.md`. The additive-mask example uses a compact `[1, 1, 1, Nkv]` key-position bias by default. Use `[1, 1, Nq, Nkv]` only when per-query bias is required, since it scales as `O(Nq * Nkv)` memory.
 
-## Benchmark
+## FP8 and FP4
+
+First, install [SageAttention-2/3](https://github.com/thu-ml/SageAttention.git) for benchmark comparison.
+
+```bash
+git clone https://github.com/thu-ml/SageAttention.git
+cd SageAttention
+# SageAttention-2 (FP8)
+export EXT_PARALLEL=4 NVCC_APPEND_FLAGS="--threads 8" MAX_JOBS=32 # Optional
+python setup.py install
+# SageAttention-3 (FP4)
+cd sageattention3_blackwell
+python setup.py install
+```
+Then, build FFPA Attention with FP8/FP4 support:
+
+```bash
+git clone https://github.com/xlite-dev/ffpa-attn.git
+cd ffpa-attn &&  git submodule update --init --recursive --force --progress --jobs 4
+# Optional: install ffpa-attn w/ CUDA backend (forward only)
+# ext all: build all kernels, include fp8/fp4 attention kernels
+bash ./build.sh --arch sm_120f --ext all --headdim 64,128,192,256
+```
+Now you can run the benchmark script to compare FFPA Attention with SageAttention-2/3 on NVIDIA RTX PRO 5000/6000/5090. The benchmark results will be saved in the `.tmp` directory.
+
+```bash
+python bench_fp8.py --N 16384,32768
+python bench_fp4.py --N 16384,32768
+```
+
+<div align='center'>
+  <p><i><b>FP8 Attention</b> for D=128: FFPA vs SageAttention-2 on NVIDIA RTX PRO 5000/6000/5090. </i></p>
+  <img src='../docs/assets/perf/bench/bench_fp8_tflops_nvidia-rtx-pro-5000-72gb-blackwell_B1_H32_Hkv8_D128_bf16_default.png'><br>
+  <img src='../docs/assets/perf/bench/bench_fp8_tflops_nvidia-rtx-pro-6000-blackwell-server-edition_B1_H32_Hkv8_D128_bf16_default.png'><br>
+  <img src='../docs/assets/perf/bench/bench_fp8_tflops_nvidia-geforce-rtx-5090_B1_H32_Hkv8_D128_bf16_default.png'><br>
+</div>
+
+<div align='center'>
+  <p><i><b>FP4 Attention</b> for D=128: FFPA vs SageAttention-3 on NVIDIA RTX PRO 5000/6000/5090. </i></p>
+  <img src='../docs/assets/perf/bench/bench_fp4_tflops_nvidia-rtx-pro-5000-72gb-blackwell_B1_H32_Hkv8_D128_bf16.png'><br>
+  <img src='../docs/assets/perf/bench/bench_fp4_tflops_nvidia-rtx-pro-6000-blackwell-server-edition_B1_H32_Hkv8_D128_bf16.png'><br>
+  <img src='../docs/assets/perf/bench/bench_fp4_tflops_nvidia-geforce-rtx-5090_B1_H32_Hkv8_D128_bf16.png'><br>
+</div>
+
+## More Benchmark
 
 TFLOPS reports the theoretical dominant attention GEMM throughput only; forward and backward are computed separately from the measured latency. Forward counts 2 GEMMs and backward the standard 5, so the backward figure stays comparable across implementations — on SM100 the backward is split into four launches (preprocess, dV, dK, dQ) that execute 8 GEMM passes, and the extra 1.6x is deliberately not counted. Env: NVIDIA L20 (Ada, 119.5 TFLOPS), NVIDIA H200 and NVIDIA B200, PyTorch 2.11, CUDA 13.0, Headdim=512 (FA-2 not supported).
 

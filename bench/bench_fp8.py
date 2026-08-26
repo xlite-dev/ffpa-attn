@@ -109,9 +109,15 @@ def fp8_backend(
       enable_fp8=True,
       fp8_qk_mm_type="int8",
       fp8_pv_acc_type="f16",
+      fp8_q_quant_method="per_thread",
+      fp8_k_quant_method="per_thread",
+      fp8_v_quant_method="per_channel",
+      fp8_smooth_k=True,
+      fp8_smooth_v=False,
       fp8_hybrid=hybrid,
       tensor_layout=layout,
     )
+  # Same as default, but with per-thread Q/K + per-channel V + smooth k on 5090.
   if preset in ("cachedit", "cache_dit", "cache-dit", "pre-thread"):
     return CUDABackend(
       backward=False,
