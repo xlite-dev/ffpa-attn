@@ -23,26 +23,26 @@ First, install [SageAttention-2/3](https://github.com/thu-ml/SageAttention.git) 
 git clone https://github.com/thu-ml/SageAttention.git
 cd SageAttention
 # SageAttention-2 (FP8)
-export EXT_PARALLEL=4 NVCC_APPEND_FLAGS="--threads 8" MAX_JOBS=32 # Optional
+export EXT_PARALLEL=4 NVCC_APPEND_FLAGS="--threads 8" MAX_JOBS=8 # Optional
 python setup.py install
 # SageAttention-3 (FP4)
 cd sageattention3_blackwell
 python setup.py install
 ```
-Then, build FFPA Attention with FP8/FP4 support:
+Then, build FFPA Attention with FP8/FP4 support from source:
 
 ```bash
 git clone https://github.com/xlite-dev/ffpa-attn.git
-cd ffpa-attn &&  git submodule update --init --recursive --force --progress --jobs 4
+cd ffpa-attn && git submodule update --init --recursive --force --progress --jobs 4
 # Optional: install ffpa-attn w/ CUDA backend (forward only)
 # ext all: build all kernels, include fp8/fp4 attention kernels
-bash ./build.sh --arch sm_120f --ext all --headdim 64,128,192,256
+bash ./build.sh --arch sm_120f --ext all --headdim 128,192,256
 ```
-Now you can run the benchmark script to compare FFPA Attention with SageAttention-2/3 on NVIDIA RTX PRO 5000/6000/5090. The benchmark results will be saved in the `.tmp` directory.
+Now you can run the benchmark script to compare FFPA Attention with SageAttention-2/3 on NVIDIA RTX PRO 5000/6000/5090. The benchmark results will be saved in the `bench/.tmp` directory.
 
 ```bash
-python bench_fp8.py --N 16384,32768
-python bench_fp4.py --N 16384,32768
+python bench/bench_fp8.py --N 16384,32768
+python bench/bench_fp4.py --N 16384,32768
 ```
 
 <div align='center'>
