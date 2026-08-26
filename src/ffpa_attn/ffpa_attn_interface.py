@@ -190,7 +190,7 @@ def ffpa_attn_func(
       raise TypeError(
         "tensor_layout='NHD' requires the inference fast path: forward-only "
         "no-grad call with an explicit CUDABackend whose persist-D kernel "
-        "applies (e.g. ffpa_attn_forward(q, k, v, forward_backend="
+        "applies (e.g. ffpa_attn_func(q, k, v, forward_backend="
         "CUDABackend(enable_fp8=True, tensor_layout='NHD')))"
       )
   meta = FFPAAttnMeta.from_kwargs(**kwargs)
@@ -219,74 +219,6 @@ def ffpa_attn_func(
   )
 
   return FFPAAttnFunc.apply(query, key, value, attn_bias, meta)
-
-
-@torch._dynamo.disable
-def ffpa_attn_forward(
-  query: torch.Tensor,
-  key: torch.Tensor,
-  value: torch.Tensor,
-  *,
-  is_causal: bool = False,
-  scale: float | None = None,
-  enable_gqa: bool = False,
-  forward_backend: CUDABackend | None = None,
-) -> torch.Tensor:
-  """Inference fast path: CUDA forward without meta validation.
-
-  When grad mode is off and ``forward_backend`` is an explicit
-  :class:`CUDABackend`, the CUDA forward op is called directly, skipping
-  ``FFPAAttnMeta`` construction, input validation, and the autograd
-  Function wrapper (~20us of python overhead per call, dominant at short
-  sequence lengths). The caller is responsible for passing pre-validated
-  packed BHND fp16/bf16 tensors (or NHD when the backend's
-  ``tensor_layout='NHD'``), as inference engines that build the
-  backend once and reuse it already do. :func:`ffpa_attn_func` applies the
-  same fast path automatically, so this explicit entry point is only needed
-  when the call site wants to make the inference intent explicit.
-
-  Any config outside that contract falls back to :func:`ffpa_attn_func`
-  unchanged: grad mode enabled, non-CUDA backend, CUDA op unavailable,
-  small-D SDPA routing, ``D > 1024``, ``Nq < 512``, ``Nkv < 512``, or
-  bf16 inputs with ``acc='f16'`` (no bf16-acc MMA exists).
-
-  :param query: Packed BHND fp16/bf16 tensor ``[B, Nh_q, Nq, D]``, or
-      NHD packed ``[B, Nq, Nh_q, D]`` when the backend sets
-      ``tensor_layout='NHD'``.
-  :param key: Packed BHND tensor ``[B, Nh_kv, Nkv, D]`` (or NHD).
-  :param value: Packed BHND tensor ``[B, Nh_kv, Nkv, D]`` (or NHD).
-  :param is_causal: Apply causal masking (requires ``Nkv >= Nq``).
-  :param scale: Softmax scale; defaults to ``D ** -0.5``.
-  :param enable_gqa: Only consumed by the fallback path; GQA head grouping
-      is native in the CUDA kernel.
-  :param forward_backend: Explicitly configured :class:`CUDABackend`; its
-      flags drive the kernel exactly as ``ffpa_attn_func(forward_backend=...)``.
-      Its ``tensor_layout`` field selects NHD (diffusers ``[B, N, H, D]``)
-      storage for inputs and output (persist-D CUDA kernels only).
-  :returns: Output tensor ``O`` with layout ``[B, Nh_q, Nq, D]`` (HND) or
-      ``[B, Nq, Nh_q, D]`` (NHD).
-  """
-  if isinstance(forward_backend, CUDABackend):
-    out = _ffpa_attn_forward(
-      query,
-      key,
-      value,
-      is_causal,
-      scale,
-      enable_gqa,
-      forward_backend,
-    )
-    if out is not None:
-      return out
-  return ffpa_attn_func(
-    query,
-    key,
-    value,
-    is_causal=is_causal,
-    scale=scale,
-    forward_backend=forward_backend,
-    enable_gqa=enable_gqa,
-  )
 
 
 def ffpa_attn_varlen_func(
@@ -379,4 +311,4 @@ def ffpa_attn_varlen_func(
   )
 
 
-__all__ = ["ffpa_attn_forward", "ffpa_attn_func", "ffpa_attn_varlen_func"]
+__all__ = ["ffpa_attn_func", "ffpa_attn_varlen_func"]

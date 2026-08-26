@@ -169,7 +169,7 @@ def _ffpa_attn_forward(
   is_causal: bool,
   scale: float | None,
   enable_gqa: bool,
-  fm: CUDABackend,
+  forward_backend: CUDABackend,
 ) -> torch.Tensor | None:
   """Inference-only forward: run the CUDA op directly, skipping meta
   validation and the autograd Function wrapper.
@@ -179,83 +179,66 @@ def _ffpa_attn_forward(
 
   Returns ``None`` when the config needs the full :func:`ffpa_attn_func`
   chain (grad mode on, small-D SDPA routing, ``D > 1024``, ``Nq < 512``,
-  ``Nkv < 512``, bf16 with ``acc='f16'``, or ``fm.tensor_layout='NHD'``
-  on a non-persist-D path). The caller is responsible for pre-validated
-  packed inputs (BHND fp16/bf16, or NHD when ``fm.tensor_layout='NHD'``).
+  ``Nkv < 512``, bf16 with ``acc='f16'``, or
+  ``forward_backend.tensor_layout='NHD'`` on a non-persist-D path). The
+  caller is responsible for pre-validated packed inputs (BHND fp16/bf16,
+  or NHD when ``forward_backend.tensor_layout='NHD'``).
 
   :param enable_gqa: Unused by the CUDA kernel (GQA head grouping is
       native); accepted for signature compatibility with future
       Triton / CuTeDSL fast paths.
   """
-  nhd = fm.tensor_layout == "NHD"
+  nhd = forward_backend.tensor_layout == "NHD"
   if nhd:
-    # NHD output packing is implemented by the persist-D CUDA kernels
-    # (fp8 / fp16 / fp4); every other combination must take the full chain.
-    # The hybrid stage-1 slice is BHND-only, so decline exactly the configs
-    # C++ would route into it (*_hybrid may still be None; the resolution
-    # below maps causal to True). fp16 has no family switches — its
-    # head_dim/arch checks live in the C++ TORCH_CHECK guards.
-    if _ffpa_attn_forward_cuda is None or torch.is_grad_enabled():
+    if not forward_backend.is_nhd_supported(
+      is_causal, query.size(1), query.size(-1)
+    ):
       return None
-    if fm.enable_fp4:
-      if (
-        fm.fp4_hadamard
-        or ((fm.fp4_hybrid or (fm.fp4_hybrid is None and is_causal))
-            and query.size(1) >= (fm.fp4_hybrid_n_early or 256))
-      ):
-        return None
-    elif fm.enable_fp8:
-      if (
-        fm.fp8_hadamard or fm.fp4_hybrid or fm.fp4_hadamard
-        or ((fm.fp8_hybrid or (fm.fp8_hybrid is None and is_causal))
-            and query.size(1) >= (fm.fp8_hybrid_n_early or 256))
-      ):
-        return None
     nq, nkv = query.size(1), key.size(1)
   else:
     nq, nkv = query.size(2), key.size(2)
   if (
     _ffpa_attn_forward_cuda is None or torch.is_grad_enabled()
-    or query.dtype is torch.bfloat16 and fm.acc == "f16"
-    or _should_use_aten_small_d_forward(fm, query.size(-1))
+    or query.dtype is torch.bfloat16 and forward_backend.acc == "f16"
+    or _should_use_aten_small_d_forward(forward_backend, query.size(-1))
     or query.size(-1) > 1024 or 8 <= nq < 512 or nkv < 512
   ):
     return None
   # Same in-place resolution normalize_inputs would perform (idempotent).
-  fm.is_causal = is_causal
-  if fm.fp8_hybrid is None:
-    fm.fp8_hybrid = bool(fm.enable_fp8 and is_causal)
-  if fm.fp4_hybrid is None:
-    fm.fp4_hybrid = bool(fm.enable_fp4 and is_causal)
-  _apply_cuda_backend_hint(fm)
+  forward_backend.is_causal = is_causal
+  if forward_backend.fp8_hybrid is None:
+    forward_backend.fp8_hybrid = bool(forward_backend.enable_fp8 and is_causal)
+  if forward_backend.fp4_hybrid is None:
+    forward_backend.fp4_hybrid = bool(forward_backend.enable_fp4 and is_causal)
+  _apply_cuda_backend_hint(forward_backend)
   O, _ = _ffpa_attn_forward_cuda(
     query,
     key,
     value,
     None,
     None,
-    fm.stages,
-    fm.acc_code,
+    forward_backend.stages,
+    forward_backend.acc_code,
     int(is_causal),
     1.0 / math.sqrt(query.size(-1)) if scale is None else float(scale),
     0.0,
     0,
     0,
-    fm.fp8_smooth_k,
-    fm.fp8_smooth_v,
-    fm.fp8_q_quant_method_code,
-    fm.fp8_k_quant_method_code,
-    fm.fp8_v_quant_method_code,
-    fm.fp8_pv_acc_code,
-    fm.fp8_qk_mm_type_code,
-    fm.fp8_hybrid,
-    fm.fp8_hybrid_n_early,
-    fm.fp4_hybrid,
-    fm.fp4_hybrid_n_early,
-    fm.fp8_hadamard,
-    fm.fp4_hadamard,
-    1 if fm.fp4_pv_mm_type == "fp8" else 0,
-    fm.fp4_smooth_v,
+    forward_backend.fp8_smooth_k,
+    forward_backend.fp8_smooth_v,
+    forward_backend.fp8_q_quant_method_code,
+    forward_backend.fp8_k_quant_method_code,
+    forward_backend.fp8_v_quant_method_code,
+    forward_backend.fp8_pv_acc_code,
+    forward_backend.fp8_qk_mm_type_code,
+    forward_backend.fp8_hybrid,
+    forward_backend.fp8_hybrid_n_early,
+    forward_backend.fp4_hybrid,
+    forward_backend.fp4_hybrid_n_early,
+    forward_backend.fp8_hadamard,
+    forward_backend.fp4_hadamard,
+    1 if forward_backend.fp4_pv_mm_type == "fp8" else 0,
+    forward_backend.fp4_smooth_v,
     0 if nhd else 1,
   )
   return O
@@ -574,6 +557,37 @@ class CUDABackend(Backend):
     if self.enable_cute:
       return CudaBackendImpl.CUTE
     return CudaBackendImpl.NATIVE
+
+  def is_nhd_supported(
+    self, is_causal: bool, seqlen_q: int, headdim: int
+  ) -> bool:
+    """Whether the persist-D NHD fast path applies for this config.
+
+    Family rules: fp8 needs no extra check; fp4 persist-D covers
+    ``headdim <= 256``; fp16 persist-D covers ``headdim <= 128``. Declines
+    the BHND-only hybrid stage-1 slice and hadamard rotation of the active
+    quantized family; a hybrid config only stages when ``seqlen_q >=
+    n_early`` (shorter sequences stay entirely on the NHD-capable fp16
+    persist-D kernel). ``*_hybrid=None`` means auto (enabled when causal).
+    The C++ TORCH_CHECK guards stay as the backstop.
+
+    :param is_causal: Runtime causal flag (drives the hybrid auto-resolve).
+    :param seqlen_q: Query sequence length (hybrid staging threshold).
+    :param headdim: Head dimension of Q/K/V.
+    :returns: Whether NHD inputs/outputs can take the fast path.
+    """
+    if self.enable_fp4:
+      if headdim > 256:
+        return False
+      hybrid, hadamard = self.fp4_hybrid, self.fp4_hadamard
+      n_early = self.fp4_hybrid_n_early
+    elif self.enable_fp8:
+      hybrid, hadamard = self.fp8_hybrid, self.fp8_hadamard
+      n_early = self.fp8_hybrid_n_early
+    else:
+      return headdim <= 128
+    hybrid = is_causal if hybrid is None else hybrid
+    return not (hadamard or (hybrid and seqlen_q >= (n_early or 256)))
 
 
 @dataclass

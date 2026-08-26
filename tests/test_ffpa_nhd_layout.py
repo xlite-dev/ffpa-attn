@@ -108,9 +108,10 @@ def test_nhd_layout_rejections(monkeypatch):
   torch.manual_seed(0)
   B, H, N = 1, 24, 4096
 
-  # fp16 D=256: outside the persist-D range -> the C++ dispatch guard
-  # raises RuntimeError naming the NHD requirement.
-  with pytest.raises(RuntimeError, match="NHD"):
+  # fp16 D=256: outside the persist-D D<=128 range -> declined by the
+  # python gate (CUDABackend.is_nhd_supported), which raises TypeError
+  # (NHD has no path outside the fast path).
+  with pytest.raises(TypeError, match="NHD"):
     with torch.no_grad():
       q, k, v = _mk(B, H, H, N, 256)
       ffpa_attn_func(
