@@ -983,13 +983,24 @@ void launch_cute_fwd_persist_d_fp8_sm120_impl(
   auto tma_v = make_tma_copy(SM90_TMA_LOAD{}, mV, SmemLayoutV{},
                              Shape<Int<kHeadDim>, Int<kBc>>{}, _1{});
 
-  // O store descriptor: full [total_q_rows, kHeadDim] ElementO tensor; the
-  // per-(batch,head) origin is injected via domain_offset in the kernel. The
-  // smem layout mirrors the kernel's SmemLayoutO staging (SW128, ElementO).
-  auto gO =
-      make_tensor(make_gmem_ptr(reinterpret_cast<ElementO*>(O.data_ptr())),
-                  make_shape(total_q_rows, Int<kHeadDim>{}),
-                  make_stride(Int<kHeadDim>{}, _1{}));
+  // O store descriptor: full [total_q_rows, kHeadDim] ElementO tensor for a
+  // BHND-packed O; the per-(batch,head) origin is injected via domain_offset
+  // in the kernel. NHD (diffusers BNHD packed) O, detected by storage: flat
+  // [Nb*Nq, Nh*kHeadDim] with the head selecting the column tile — mirrors
+  // the fp16 persist-D NHD Q load. Both branches use dynamic int64
+  // extents/strides so TmaO has a single type and the kernel takes a runtime
+  // nhd_out branch. The smem layout mirrors the kernel's SmemLayoutO staging
+  // (SW128, ElementO).
+  const bool nhd_out = ffpa_is_nhd_view(O);
+  auto gO = nhd_out
+                ? make_tensor(
+                      make_gmem_ptr(reinterpret_cast<ElementO*>(O.data_ptr())),
+                      make_shape((int64_t)Nb * Nq, (int64_t)Nh * kHeadDim),
+                      make_stride((int64_t)Nh * kHeadDim, _1{}))
+                : make_tensor(
+                      make_gmem_ptr(reinterpret_cast<ElementO*>(O.data_ptr())),
+                      make_shape((int64_t)total_q_rows, (int64_t)kHeadDim),
+                      make_stride((int64_t)kHeadDim, _1{}));
   auto tma_o = make_tma_copy(SM90_TMA_STORE{}, gO, SmemLayoutO{},
                              Shape<Int<kBr>, Int<kHeadDim>>{}, _1{});
 
@@ -1023,7 +1034,7 @@ void launch_cute_fwd_persist_d_fp8_sm120_impl(
         q_scale.data_ptr<float>(), k_scale.data_ptr<float>(),
         v_scale.data_ptr<float>(), Nq, Nkv, Nh, Nh_kv, scale, Tc, causal,
         total_q_rows, total_kv_rows, n_rb_q, n_rb_kv, q_start_row, km_f32_ptr,
-        vm_kernel);
+        vm_kernel, nhd_out);
   };
   if (qk_per_thread) {
     // Per-thread QK quant (sage style): fragment-aligned dequant scales.

@@ -125,7 +125,7 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp8_sm120(
     int Nq, int Nkv, int Nh, int Nh_kv, float scale, int Tc, int causal,
     int total_q_rows, int total_kv_rows, int n_rb_q, int n_rb_kv,
     int q_start_row = 0, const float* __restrict__ km = nullptr,
-    const float* __restrict__ vm = nullptr) {
+    const float* __restrict__ vm = nullptr, bool nhd_out = false) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
   using namespace cute;
   using Element = typename Traits::Element;      // float_e4m3_t (V/PV)
@@ -805,12 +805,23 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp8_sm120(
       cutlass::arch::fence_view_async_shared();
       cutlass::arch::NamedBarrier::sync(kConsumerThreads, 0);
 
-      auto mO_tma = domain_offset(
-          make_coord(q_row_offset, 0),
-          tma_o.get_tma_tensor(make_shape(total_q_rows, Int<kHeadDim>{})));
+      // BHND-packed O: flat [total_q_rows, D] TMA space, head folded into
+      // the row index. NHD (diffusers BNHD packed O): flat [Nb*Nq, Nh*D],
+      // batch in the row index, head selects the column tile — mirrors the
+      // fp16 persist-D NHD Q load. The runtime nhd_out branch only picks
+      // coordinates; the copy path is shared.
+      const int Nb = total_q_rows / (Nh * Nq);
+      const int o_row_base =
+          nhd_out ? (Nb_id * Nq + q_start_row) : q_row_offset;
+      const int o_col_tile = nhd_out ? Nh_id : 0;
+      const int o_rows = nhd_out ? (Nb * Nq) : total_q_rows;
+      const int o_cols = nhd_out ? (Nh * kHeadDim) : kHeadDim;
+      auto mO_tma =
+          domain_offset(make_coord(o_row_base, 0),
+                        tma_o.get_tma_tensor(make_shape(o_rows, o_cols)));
       auto o_slice = tma_o.get_slice(_0{});
       auto gO_tma = local_tile(mO_tma, Shape<Int<kBr>, Int<kHeadDim>>{},
-                               make_coord(Q_tile_id, _0{}));
+                               make_coord(Q_tile_id, o_col_tile));
       auto tCgO_tma = o_slice.partition_D(gO_tma);
       auto tOsO = o_slice.partition_S(sO);
       if (wg_tid == 0)
@@ -818,14 +829,15 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp8_sm120(
       tma_store_arrive();
       tma_store_wait<0>();
     } else {
-      // Tail tile: rows past Nq would alias the next head in the flattened
-      // [total_q_rows, D] TMA space, so store R->G with a row guard.
-      const int O_gmem_offset = (Nb_id * Nh * Nq * kHeadDim) +
-                                (Nh_id * Nq * kHeadDim) +
-                                q_start_row * kHeadDim;
+      // Tail tile: rows past Nq would alias the next head/batch in the
+      // flattened TMA space, so store R->G with a row guard.
+      const int O_gmem_offset =
+          nhd_out ? ((Nb_id * Nq + q_start_row) * Nh + Nh_id) * kHeadDim
+                  : ((Nb_id * Nh + Nh_id) * Nq + q_start_row) * kHeadDim;
+      const int o_row_stride = nhd_out ? Nh * kHeadDim : kHeadDim;
       auto mO = make_tensor(make_gmem_ptr(O + O_gmem_offset),
                             make_shape(Nq - q_start_row, Int<kHeadDim>{}),
-                            make_stride(Int<kHeadDim>{}, _1{}));
+                            make_stride(o_row_stride, _1{}));
       auto gO = local_tile(mO, Shape<Int<kBr>, Int<kHeadDim>>{},
                            make_coord(Q_tile_id, _0{}));
       auto tCgO = thr_mma_pv.partition_C(gO);
