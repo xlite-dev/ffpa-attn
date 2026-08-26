@@ -414,8 +414,14 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp4_sm120(
     return;
   }
 
-  // Consumer
-  cutlass::arch::warpgroup_reg_alloc<232>();
+  // Consumer. 224 regs gives ptxas more scheduling room at D<=128 (-0.9%
+  // kernel), but D>=192 needs the larger budget to keep spill down: at 224
+  // D=256 doubles its local ld/st and runs +16% (4.59 vs 3.94ms at N=8192).
+  if constexpr (kHeadDim <= 128) {
+    cutlass::arch::warpgroup_reg_alloc<224>();
+  } else {
+    cutlass::arch::warpgroup_reg_alloc<232>();
+  }
   // Pre-drain: mark every stage empty so the producer's first kStages-1
   // prefetches find their k_empty/v_empty barriers armed.
   for (int s = 0; s < kStages; ++s) {
