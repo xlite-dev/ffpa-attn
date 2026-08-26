@@ -185,16 +185,27 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp8_sm120(
 
   // SMEM: [Q | K stages | V stages], 1B per elem (int8 or e4m3). With
   // kPersistQs2r the Q tile is read into regs once before the kv loop, so
-  // K stage 0 reuses the Q area (q_consumed guards the handoff) and the Q
-  // bytes drop out of the allocation: smem = (kStagesK + kStagesV) K/V
-  // tiles, e.g. stages 2 -> 64KB (vs 80KB keeping a dead Q tile). The
-  // saving buys L1, not occupancy: smem/L1 share one pool per SM (~4-5us
-  // per 16KB), and residency stays register-limited (1 CTA/SM) either way.
+  // its 16KB area (slot 0 of the K region) is reused by the LAST K stage
+  // and the Q bytes drop out of the allocation: smem = (kStagesK +
+  // kStagesV) K/V tiles, e.g. stages 2 -> 64KB (vs 80KB keeping a dead Q
+  // tile). The saving buys L1, not occupancy: smem/L1 share one pool per SM
+  // (~4-5us per 16KB), and residency stays register-limited (1 CTA/SM)
+  // either way.
   extern __shared__ __align__(1024) char shm[];
   ElementQK* q_base = reinterpret_cast<ElementQK*>(shm);
   ElementQK* k_base = kPersistQs2r ? q_base : q_base + kQTileElements;
   Element* v_base =
       reinterpret_cast<Element*>(k_base + kStagesK * kKTileElements);
+
+  // kPersistQs2r slot rotation: logical stage s -> physical slot (s+1) %
+  // kStagesK, so the Q area (slot 0) hosts the LAST stage. That stage's
+  // first TMA issue happens in steady state (k_tile == kStagesK-1) and its
+  // first consume is tile kStagesK-1, hiding the q_consumed wait behind a
+  // full tile of compute; the prologue stages (slots 1..) never touch the
+  // Q area and issue with no Q dependency at all.
+  constexpr auto kKSlot = [](int s) {
+    return kPersistQs2r ? (s + 1) % kStagesK : s;
+  };
 
   __shared__ uint64_t q_full;
   __shared__ uint64_t q_consumed;  // kPersistQs2r: Q s2r done, Q area free
@@ -265,16 +276,12 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp8_sm120(
       }
       for (int s = 0; s < kStagesK - 1; ++s) {
         if (s < Tc_eff) {
-          // K stage 0 lands on the one-shot Q tile area (kPersistQs2r): the
-          // consumer's Q s2r must complete first. Steady-state rewrites of
-          // stage 0 are already behind k_empty, no extra guard needed.
-          if constexpr (kPersistQs2r) {
-            if (s == 0)
-              CtaBarrier::wait(&q_consumed, 0);
-          }
+          // Prologue stages map to slots 1.. (never the Q area), so no
+          // q_consumed guard: these TMAs issue with no Q dependency.
           CtaBarrier::wait(&k_empty[s], 0);
-          auto sK = make_tensor(make_smem_ptr(k_base + s * kKTileElements),
-                                SmemLayoutK{});
+          auto sK =
+              make_tensor(make_smem_ptr(k_base + kKSlot(s) * kKTileElements),
+                          SmemLayoutK{});
           auto gK = local_tile(mK, Shape<Int<kBc>, Int<kHeadDim>>{},
                                make_coord(s, _0{}));
           TmaBarrier::arrive_and_expect_tx(&k_full[s],
@@ -306,10 +313,17 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp8_sm120(
           if (k_tile < Tc_eff) {
             const int stage_k = k_tile % kStagesK;
             const int phase_k = (k_tile / kStagesK) & 1;
+            // First write of the Q-area slot (k_tile == kStagesK-1): the
+            // consumer's Q s2r must be done. The wait hides behind tile-0
+            // compute (this stage is not consumed until tile kStagesK-1).
+            if constexpr (kPersistQs2r) {
+              if (k_tile == kStagesK - 1)
+                CtaBarrier::wait(&q_consumed, 0);
+            }
             CtaBarrier::wait(&k_empty[stage_k], phase_k);
-            auto sK =
-                make_tensor(make_smem_ptr(k_base + stage_k * kKTileElements),
-                            SmemLayoutK{});
+            auto sK = make_tensor(
+                make_smem_ptr(k_base + kKSlot(stage_k) * kKTileElements),
+                SmemLayoutK{});
             auto gK = local_tile(mK, Shape<Int<kBc>, Int<kHeadDim>>{},
                                  make_coord(k_tile, _0{}));
             TmaBarrier::arrive_and_expect_tx(&k_full[stage_k],
@@ -472,8 +486,8 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp8_sm120(
     TmaBarrier::wait(&k_full[k_stg], k_phase);
     cutlass::arch::fence_view_async_shared();
 
-    auto sK = make_tensor(make_smem_ptr(k_base + k_stg * kKTileElements),
-                          SmemLayoutK{});
+    auto sK = make_tensor(
+        make_smem_ptr(k_base + kKSlot(k_stg) * kKTileElements), SmemLayoutK{});
     auto tCrK = thr_mma_qk.partition_fragment_B(sK);
     auto tKsK_s2r = s2r_thr_k.partition_S(sK);
 
