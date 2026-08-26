@@ -62,7 +62,13 @@ large-D shapes; other shapes / backends raise ``NotImplementedError``.
 from __future__ import annotations
 
 import torch
-from .functional import FFPAAttnMeta, FFPAAttnFunc, FFPAAttnVarlenFunc
+from .functional import (
+  CUDABackend,
+  FFPAAttnMeta,
+  FFPAAttnFunc,
+  FFPAAttnVarlenFunc,
+  _ffpa_attn_forward,
+)
 from .logger import init_logger
 
 logger = init_logger(__name__)
@@ -161,6 +167,22 @@ def ffpa_attn_func(
   :raises NotImplementedError: propagated from SDPA or FFPA backends for
       unsupported backend-specific combinations.
   """
+  fb = kwargs.get("forward_backend")
+  if fb is None:
+    fb = kwargs.get("backend")
+  if (
+    attn_mask is None and dropout_p == 0.0 and "backward_backend" not in kwargs
+    and isinstance(fb, CUDABackend)
+  ):
+    # Inference fast path: explicit forward-only CUDA backend under no-grad
+    # skips FFPAAttnMeta construction/validation and the autograd Function
+    # wrapper (~20us/call). Any config the fast path rejects returns None
+    # and falls through to the full chain below, so behavior is unchanged.
+    out = _ffpa_attn_forward(
+      query, key, value, is_causal, scale, enable_gqa, fb
+    )
+    if out is not None:
+      return out
   meta = FFPAAttnMeta.from_kwargs(**kwargs)
   if meta.fallback(query, key, attn_mask, dropout_p):
     # HACK: Avoid recursive for monkey-patch usage.
@@ -187,6 +209,62 @@ def ffpa_attn_func(
   )
 
   return FFPAAttnFunc.apply(query, key, value, attn_bias, meta)
+
+
+@torch._dynamo.disable
+def ffpa_attn_forward(
+  query: torch.Tensor,
+  key: torch.Tensor,
+  value: torch.Tensor,
+  *,
+  is_causal: bool = False,
+  scale: float | None = None,
+  enable_gqa: bool = False,
+  forward_backend: CUDABackend | None = None,
+) -> torch.Tensor:
+  """Inference fast path: CUDA forward without meta validation.
+
+  When grad mode is off and ``forward_backend`` is an explicit
+  :class:`CUDABackend`, the CUDA forward op is called directly, skipping
+  ``FFPAAttnMeta`` construction, input validation, and the autograd
+  Function wrapper (~20us of python overhead per call, dominant at short
+  sequence lengths). The caller is responsible for passing pre-validated
+  packed BHND fp16/bf16 tensors, as inference engines that build the
+  backend once and reuse it already do. :func:`ffpa_attn_func` applies the
+  same fast path automatically, so this explicit entry point is only needed
+  when the call site wants to make the inference intent explicit.
+
+  Any config outside that contract falls back to :func:`ffpa_attn_func`
+  unchanged: grad mode enabled, non-CUDA backend, CUDA op unavailable,
+  small-D SDPA routing, ``D > 1024``, ``Nq < 512``, ``Nkv < 512``, or
+  bf16 inputs with ``acc='f16'`` (no bf16-acc MMA exists).
+
+  :param query: Packed BHND fp16/bf16 tensor ``[B, Nh_q, Nq, D]``.
+  :param key: Packed BHND tensor ``[B, Nh_kv, Nkv, D]``.
+  :param value: Packed BHND tensor ``[B, Nh_kv, Nkv, D]``.
+  :param is_causal: Apply causal masking (requires ``Nkv >= Nq``).
+  :param scale: Softmax scale; defaults to ``D ** -0.5``.
+  :param enable_gqa: Only consumed by the fallback path; GQA head grouping
+      is native in the CUDA kernel.
+  :param forward_backend: Explicitly configured :class:`CUDABackend`; its
+      flags drive the kernel exactly as ``ffpa_attn_func(forward_backend=...)``.
+  :returns: Output tensor ``O`` with layout ``[B, Nh_q, Nq, D]``.
+  """
+  if isinstance(forward_backend, CUDABackend):
+    out = _ffpa_attn_forward(
+      query, key, value, is_causal, scale, enable_gqa, forward_backend
+    )
+    if out is not None:
+      return out
+  return ffpa_attn_func(
+    query,
+    key,
+    value,
+    is_causal=is_causal,
+    scale=scale,
+    forward_backend=forward_backend,
+    enable_gqa=enable_gqa,
+  )
 
 
 def ffpa_attn_varlen_func(
@@ -279,4 +357,4 @@ def ffpa_attn_varlen_func(
   )
 
 
-__all__ = ["ffpa_attn_func", "ffpa_attn_varlen_func"]
+__all__ = ["ffpa_attn_forward", "ffpa_attn_func", "ffpa_attn_varlen_func"]
