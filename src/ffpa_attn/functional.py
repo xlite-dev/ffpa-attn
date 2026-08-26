@@ -72,6 +72,14 @@ _PV_ACC_CODE = {"f16": _PV_ACC_F16, "f32": _PV_ACC_F32}
 _QK_MM_FP8 = 0
 _QK_MM_INT8 = 1
 _QK_MM_TYPE_CODE = {"fp8": _QK_MM_FP8, "int8": _QK_MM_INT8}
+# FP4 PV MMA dtype encoding (kept in sync with cute/launch.cuh).
+_FP4_PV_MM_NVFP4 = 0
+_FP4_PV_MM_MXFP8 = 1
+_FP4_PV_MM_CODE = {"fp4": _FP4_PV_MM_NVFP4, "fp8": _FP4_PV_MM_MXFP8}
+# Tensor layout encoding (kept in sync with cuda/__init__.py::_fwd_cuda).
+_LAYOUT_NHD = 0
+_LAYOUT_HND = 1
+_TENSOR_LAYOUT_CODE = {"NHD": _LAYOUT_NHD, "HND": _LAYOUT_HND}
 _ATEN_SMALL_HEAD_DIM_MAX = 256
 _FFPA_SMALL_HEAD_DIM_MIN = 64
 
@@ -235,9 +243,9 @@ def _ffpa_attn_forward(
     forward_backend.fp4_hybrid_n_early,
     forward_backend.fp8_hadamard,
     forward_backend.fp4_hadamard,
-    1 if forward_backend.fp4_pv_mm_type == "fp8" else 0,
+    forward_backend.fp4_pv_mm_type_code,
     forward_backend.fp4_smooth_v,
-    0 if nhd else 1,
+    forward_backend.tensor_layout_code,
   )
   return O
 
@@ -532,6 +540,14 @@ class CUDABackend(Backend):
   @property
   def fp8_qk_mm_type_code(self) -> int:
     return _QK_MM_TYPE_CODE[self.fp8_qk_mm_type]
+
+  @property
+  def fp4_pv_mm_type_code(self) -> int:
+    return _FP4_PV_MM_CODE[self.fp4_pv_mm_type]
+
+  @property
+  def tensor_layout_code(self) -> int:
+    return _TENSOR_LAYOUT_CODE[self.tensor_layout]
 
   def _default_cuda_stages(self) -> int:
     from .cuda import CudaBackendImpl
@@ -1233,7 +1249,7 @@ class _FFPAAttnFunc(torch.autograd.Function):
         forward_meta.fp4_hybrid_n_early,
         forward_meta.fp8_hadamard,
         forward_meta.fp4_hadamard,
-        1 if forward_meta.fp4_pv_mm_type == "fp8" else 0,
+        forward_meta.fp4_pv_mm_type_code,
         forward_meta.fp4_smooth_v,
       )
     elif isinstance(meta.forward_meta, TritonBackend):
