@@ -170,7 +170,6 @@ def _ffpa_attn_forward(
   scale: float | None,
   enable_gqa: bool,
   fm: CUDABackend,
-  tensor_layout: str = "HND",
 ) -> torch.Tensor | None:
   """Inference-only forward: run the CUDA op directly, skipping meta
   validation and the autograd Function wrapper.
@@ -180,15 +179,15 @@ def _ffpa_attn_forward(
 
   Returns ``None`` when the config needs the full :func:`ffpa_attn_func`
   chain (grad mode on, small-D SDPA routing, ``D > 1024``, ``Nq < 512``,
-  ``Nkv < 512``, bf16 with ``acc='f16'``, or ``tensor_layout='NHD'`` on a
-  non-fp8-persist-D path). The caller is responsible for pre-validated
-  packed inputs (BHND fp16/bf16, or NHD when ``tensor_layout='NHD'``).
+  ``Nkv < 512``, bf16 with ``acc='f16'``, or ``fm.tensor_layout='NHD'``
+  on a non-persist-D path). The caller is responsible for pre-validated
+  packed inputs (BHND fp16/bf16, or NHD when ``fm.tensor_layout='NHD'``).
 
   :param enable_gqa: Unused by the CUDA kernel (GQA head grouping is
       native); accepted for signature compatibility with future
       Triton / CuTeDSL fast paths.
   """
-  nhd = tensor_layout == "NHD"
+  nhd = fm.tensor_layout == "NHD"
   if nhd:
     # NHD output packing is implemented by the fp8 persist-D CUDA kernel
     # only (runtime store-layout branch); every other impl/hint combination
@@ -377,6 +376,11 @@ class CUDABackend(Backend):
   :ivar fp4_smooth_v: FP4 only (persist_d, D<=256): subtract the
       per-(b,hkv) V column mean before V quantize; the kernel epilogue adds
       it back (softmax rows sum to 1).
+  :ivar tensor_layout: Storage layout of Q/K/V inputs and the returned O:
+      ``"HND"`` (default) for BHND packed ``[B, H, N, D]`` tensors, or
+      ``"NHD"`` for diffusers-style ``[B, N, H, D]`` packed storage (output
+      follows the input layout). NHD is implemented by the persist-D sm120
+      CUDA kernels (fp8 / fp16 / fp4) on the inference fast path only.
   :ivar is_causal: Runtime flag propagated from
       ``ffpa_attn_func(is_causal=...)`` by ``normalize_inputs``; drives the
       hybrid auto-resolve. Not a user constructor argument.
@@ -427,6 +431,12 @@ class CUDABackend(Backend):
   # sub_qm/sub_km quantize + delta_s/lse exact corrections are hardwired in
   # the fp4 kernels). fp4_smooth_v only adds the missing V side.
   fp4_smooth_v: bool = False
+  # Storage layout of Q/K/V inputs and the returned O: "HND" (default) for
+  # BHND packed [B, H, N, D] tensors, or "NHD" for diffusers-style
+  # [B, N, H, D] packed storage (output follows the input layout). NHD is
+  # implemented by the persist-D sm120 CUDA kernels only (fp8 / fp16 / fp4)
+  # on the inference fast path.
+  tensor_layout: str = "HND"
   # Runtime: propagated from ffpa_attn_func(is_causal=...) by normalize_inputs.
   is_causal: bool = False
 
@@ -479,6 +489,9 @@ class CUDABackend(Backend):
     )
     assert not self.fp4_smooth_v or self.enable_fp4, (
       "fp4_smooth_v requires enable_fp4"
+    )
+    assert self.tensor_layout in ("HND", "NHD"), (
+      f"tensor_layout must be 'HND' or 'NHD', got {self.tensor_layout!r}"
     )
     self._resolve_impl_defaults()
     self.stages = self._default_cuda_stages(

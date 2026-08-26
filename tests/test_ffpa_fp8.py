@@ -33,9 +33,13 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def _fp8_backend() -> CUDABackend:
+def _fp8_backend(tensor_layout: str = "HND") -> CUDABackend:
   return CUDABackend(
-    backward=False, enable_tma=True, enable_cute=True, enable_fp8=True
+    backward=False,
+    enable_tma=True,
+    enable_cute=True,
+    enable_fp8=True,
+    tensor_layout=tensor_layout,
   )
 
 
@@ -536,12 +540,13 @@ def test_fp8_split_d_m4n2_gqa_parity(D, qk_int8, monkeypatch):
   [(1, 24, 24, 2048), (1, 24, 24, 16383), (2, 8, 8, 3000), (1, 24, 8, 4096)],
   ids=["full", "tail", "batch", "gqa"],
 )
-def test_fp8_nhd_layout_bit_exact(B, H, Hkv, N, causal):
+def test_fp8_nhd_layout_bit_exact(B, H, Hkv, N, causal, monkeypatch):
   # NHD (diffusers BNHD) storage in/out vs BHND in/out: same kernel run, so
   # the two layouts must agree bitwise. The NHD tensors are materialized
   # NHD-packed then permuted back to BHND shape (the documented construction
   # that avoids false NHD views). fp8_hybrid=False: the hybrid stage-1 is
   # BHND-only, so causal NHD takes the plain causal persist-D kernel.
+  monkeypatch.setenv("FFPA_CUDA_ALLOW_SMALL_D", "1")  # D=128 small-D routing
   torch.manual_seed(0)
   D = 128
   backend = CUDABackend(
@@ -550,6 +555,14 @@ def test_fp8_nhd_layout_bit_exact(B, H, Hkv, N, causal):
     enable_cute=True,
     enable_fp8=True,
     fp8_hybrid=False,
+  )
+  backend_nhd = CUDABackend(
+    backward=False,
+    enable_tma=True,
+    enable_cute=True,
+    enable_fp8=True,
+    fp8_hybrid=False,
+    tensor_layout="NHD",
   )
   q = torch.randn(B, H, N, D, dtype=torch.bfloat16, device="cuda") * 0.5
   k = torch.randn(B, Hkv, N, D, dtype=torch.bfloat16, device="cuda") * 0.5
@@ -566,41 +579,38 @@ def test_fp8_nhd_layout_bit_exact(B, H, Hkv, N, causal):
       k3,
       v3,
       is_causal=causal,
-      forward_backend=backend,
-      tensor_layout="NHD",
+      forward_backend=backend_nhd,
     )
   assert out_n.shape == (B, N, H, D) and out_n.is_contiguous()
   torch.testing.assert_close(out_n, out_b.permute(0, 2, 1, 3))
 
 
-def test_fp8_nhd_layout_parity_vs_sdpa():
+def test_fp8_nhd_layout_parity_vs_sdpa(monkeypatch):
+  monkeypatch.setenv("FFPA_CUDA_ALLOW_SMALL_D", "1")
   torch.manual_seed(0)
   B, H, N, D = 1, 24, 4096, 128
   q3 = torch.randn(B, N, H, D, dtype=torch.bfloat16, device="cuda") * 0.5
   k3 = torch.randn(B, N, H, D, dtype=torch.bfloat16, device="cuda") * 0.5
   v3 = torch.randn(B, N, H, D, dtype=torch.bfloat16, device="cuda") * 0.5
   with torch.no_grad():
-    out = ffpa_attn_func(
-      q3, k3, v3, forward_backend=_fp8_backend(), tensor_layout="NHD"
-    )
+    out = ffpa_attn_func(q3, k3, v3, forward_backend=_fp8_backend("NHD"))
   q, k, v = (t.permute(0, 2, 1, 3) for t in (q3, k3, v3))
   ref = F.scaled_dot_product_attention(q.float(), k.float(),
                                        v.float()).to(torch.bfloat16)
   torch.testing.assert_close(out, ref.permute(0, 2, 1, 3), atol=4e-2, rtol=4e-2)
 
 
-def test_fp8_nhd_layout_rejections():
+def test_fp8_nhd_layout_rejections(monkeypatch):
+  monkeypatch.setenv("FFPA_CUDA_ALLOW_SMALL_D", "1")
   torch.manual_seed(0)
   B, H, N, D = 1, 24, 4096, 128
   q3 = torch.randn(B, N, H, D, dtype=torch.bfloat16, device="cuda")
   k3 = torch.randn(B, N, H, D, dtype=torch.bfloat16, device="cuda")
   v3 = torch.randn(B, N, H, D, dtype=torch.bfloat16, device="cuda")
   with pytest.raises(TypeError):
-    # full chain (no explicit backend) does not accept NHD
+    # full chain (no explicit backend) does not accept a tensor_layout kwarg
     with torch.no_grad():
       ffpa_attn_func(q3, k3, v3, tensor_layout="NHD")
   with pytest.raises(TypeError):
     # grad-on declines the fast path, so NHD has no supported path
-    ffpa_attn_func(
-      q3, k3, v3, forward_backend=_fp8_backend(), tensor_layout="NHD"
-    )
+    ffpa_attn_func(q3, k3, v3, forward_backend=_fp8_backend("NHD"))

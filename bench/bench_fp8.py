@@ -61,7 +61,12 @@ def _is_5090_or_force_int8() -> bool:
 
 
 @lru_cache(maxsize=None)
-def fp8_backend(preset: str = "default", hybrid: bool = False) -> CUDABackend:
+def fp8_backend(
+  preset: str = "default",
+  hybrid: bool = False,
+  nhd: bool = False
+) -> CUDABackend:
+  layout = "NHD" if nhd else "HND"
   if preset == "int8" or (preset == "default" and _is_5090_or_force_int8()):
     # 5090 default / explicit int8 preset: int8 QK matmul, f16 PV acc.
     return CUDABackend(
@@ -72,6 +77,7 @@ def fp8_backend(preset: str = "default", hybrid: bool = False) -> CUDABackend:
       fp8_qk_mm_type="int8",
       fp8_pv_acc_type="f16",
       fp8_hybrid=hybrid,
+      tensor_layout=layout,
     )
   if preset in ("cachedit", "cache_dit", "cache-dit"):
     return CUDABackend(
@@ -88,6 +94,7 @@ def fp8_backend(preset: str = "default", hybrid: bool = False) -> CUDABackend:
       fp8_smooth_v=False,
       fp8_hybrid=hybrid,
       fp8_hybrid_n_early=256,
+      tensor_layout=layout,
     )
   # default: FP8 Q/K matmul fp8, P/V accumulate f32
   return CUDABackend(
@@ -96,6 +103,7 @@ def fp8_backend(preset: str = "default", hybrid: bool = False) -> CUDABackend:
     enable_cute=True,
     enable_fp8=True,
     fp8_hybrid=hybrid,
+    tensor_layout=layout,
   )
 
 
@@ -191,8 +199,7 @@ def run_ffpa(
         v,
         is_causal=causal,
         enable_gqa=gqa,
-        forward_backend=fp8_backend(preset, hybrid),
-        tensor_layout="NHD",
+        forward_backend=fp8_backend(preset, hybrid, nhd=True),
       ).permute(0, 2, 1, 3)
   return ffpa_attn_func(
     q,
