@@ -200,7 +200,20 @@ NVIDIA-NeMo Automodel PR [#2436](https://github.com/NVIDIA-NeMo/Automodel/pull/2
 
 ## End-to-End Inference
 
-The FFPA (FP8/FP4) attention has fully integrated into [Cache-DiT](https://github.com/vipshop/cache-dit). Currently, the FP8/FP4 attention supports most of the attention headdims range from **64** to **1024** (forward only), including any headdims that can be divided by **8**, covering self-attention, cross-attention, causal attention and GQA/MQA attention. Feel free to take a try for your Diffusion models. For examples: (FLUX.1-dev, seed=42, 28 steps)
+<div align='center'>
+  <p><i><b>FP8 Attention</b> for D=128: FFPA vs SageAttention-2 on NVIDIA RTX PRO 5000. </i></p>
+  <img src='./docs/assets/perf/bench/bench_fp8_tflops_nvidia-rtx-pro-5000-72gb-blackwell_B1_H32_Hkv8_D128_bf16_default.png' width='800px'>
+</div>
+
+The FFPA (FP8/FP4) attention has fully integrated into [Cache-DiT](https://github.com/vipshop/cache-dit). Currently, the FP8/FP4 attention supports most of the attention headdims range from **64** to **1024** (forward only), including any headdims that can be divided by **8**, covering self-attention, cross-attention, causal attention and GQA/MQA attention.
+
+<div align='center'>
+  <p><i><b>FP4 Attention</b> for D=128: FFPA vs SageAttention-3 on NVIDIA RTX PRO 5000. </i></p>
+  <img src='./docs/assets/perf/bench/bench_fp4_tflops_nvidia-rtx-pro-5000-72gb-blackwell_B1_H32_Hkv8_D128_bf16.png'
+  width='800px'>
+</div>
+
+The kernel benchmark results show that FFPA FP8 is comparable or slightly better than SageAttention-2 at D=128, and FFPA FP4 is significantly better than SageAttention-3 at D=128 on NVIDIA RTX PRO 5000. Feel free to take a try for your Diffusion models. For examples: (FLUX.1-dev, seed=42, 28 steps)
 
 ```bash
 python3 -m cache_dit.generate flux --attn native   --seed 42 --height 1024 --width 1024
