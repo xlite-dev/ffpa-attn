@@ -26,6 +26,7 @@ import re
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -71,6 +72,7 @@ BACKEND_COLORS = {
 }
 
 
+@lru_cache(maxsize=None)
 def fp4_backend(hybrid: bool = False, hybrid_n_early: int = 256):
   return CUDABackend(
     backward=False,
@@ -82,6 +84,7 @@ def fp4_backend(hybrid: bool = False, hybrid_n_early: int = 256):
   )
 
 
+@lru_cache(maxsize=None)
 def fp8_backend() -> CUDABackend:
   return CUDABackend(
     backward=False,
@@ -93,16 +96,17 @@ def fp8_backend() -> CUDABackend:
 
 
 def bench_ms(fn, warmup=3, iters=5) -> float:
-  for _ in range(warmup):
-    fn()
-  torch.cuda.synchronize()
-  ts = []
-  for _ in range(iters):
+  with torch.no_grad():
+    for _ in range(warmup):
+      fn()
     torch.cuda.synchronize()
-    t0 = time.perf_counter()
-    fn()
-    torch.cuda.synchronize()
-    ts.append(time.perf_counter() - t0)
+    ts = []
+    for _ in range(iters):
+      torch.cuda.synchronize()
+      t0 = time.perf_counter()
+      fn()
+      torch.cuda.synchronize()
+      ts.append(time.perf_counter() - t0)
   return min(ts) * 1e3
 
 
@@ -515,8 +519,8 @@ def parse_args():
   p.add_argument(
     "--N",
     type=str,
-    default="8192,16384",
-    help="Comma-separated seqlens (default: 8192,16384)"
+    default="16384,32768",
+    help="Comma-separated seqlens (default: 16384,32768)"
   )
   p.add_argument("--B", type=int, default=1, help="Batch size")
   p.add_argument("--H", type=int, default=32, help="Query heads")
