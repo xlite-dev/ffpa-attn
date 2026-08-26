@@ -208,7 +208,7 @@ NVIDIA-NeMo Automodel PR [#2436](https://github.com/NVIDIA-NeMo/Automodel/pull/2
   <img src='./docs/assets/perf/bench/bench_fp8_tflops_nvidia-geforce-rtx-5090_B1_H32_Hkv8_D128_bf16_default.png' width='800px'><br>
 </div>
 
-The FFPA (FP8/FP4) attention has fully integrated into [Cache-DiT](https://github.com/vipshop/cache-dit). Currently, the FP8/FP4 attention supports most of the attention headdims range from **64** to **1024** (SageAttention 2/3 only supports D<=128), including any headdims that can be divided by **8** (e.g, 120), covering **self-attention, cross-attention, causal attention and GQA/MQA** (SageAttention-3 does not support) attention.
+The FFPA (FP8/FP4) attention has fully integrated into [Cache-DiT](https://github.com/vipshop/cache-dit). Currently, the FP8/FP4 attention supports most of the attention headdims range from **64** to **1024** (SageAttention 2/3 only supports D<=128), including any headdims that can be divided by **8** (e.g, 120), covering **self-attention, cross-attention, causal attention, GQA and MQA** (SageAttention-3 does not support) attention.
 
 <div align='center'>
   <p><i><b>FP4 Attention</b> for D=128: FFPA vs SageAttention-3 on NVIDIA RTX PRO 5000/6000/5090. </i></p>
