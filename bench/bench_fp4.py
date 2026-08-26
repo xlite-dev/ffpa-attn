@@ -91,7 +91,12 @@ def fp8_backend() -> CUDABackend:
     enable_tma=True,
     enable_cute=True,
     enable_fp8=True,
-    fp8_hybrid=None,
+    fp8_qk_mm_type="int8",
+    fp8_pv_acc_type="f16",
+    fp8_q_quant_method="per_thread",
+    fp8_k_quant_method="per_thread",
+    fp8_v_quant_method="per_channel",
+    fp8_hybrid=False,
   )
 
 
