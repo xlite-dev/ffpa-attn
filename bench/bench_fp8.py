@@ -178,11 +178,22 @@ def run_ffpa(
   q, k, v, causal, gqa, preset="default", hybrid=False, with_permute=False
 ):
   if with_permute:
-    # cache-dit E2E path: inputs arrive as diffusers NHD [B,N,H,D] storage;
-    # ffpa consumes them natively via a zero-copy permute view (Phase C, no
-    # transpose copy). The storage itself was materialized OUTSIDE the timed
-    # region in run_scenario.
-    q, k, v = (x.permute(0, 2, 1, 3) for x in (q, k, v))
+    # cache-dit E2E path: inputs are diffusers NHD [B,N,H,D] storage; the
+    # fp8 persist-D kernel reads them and writes a contiguous NHD output
+    # directly (tensor_layout fast path — no permute views either side).
+    # Output is [B,N,H,D]; permuted back for the BHND comparison. no_grad:
+    # the NHD fast path is inference-only (the untimed correctness pass
+    # below otherwise runs grad-on).
+    with torch.no_grad():
+      return ffpa_attn_func(
+        q,
+        k,
+        v,
+        is_causal=causal,
+        enable_gqa=gqa,
+        forward_backend=fp8_backend(preset, hybrid),
+        tensor_layout="NHD",
+      ).permute(0, 2, 1, 3)
   return ffpa_attn_func(
     q,
     k,

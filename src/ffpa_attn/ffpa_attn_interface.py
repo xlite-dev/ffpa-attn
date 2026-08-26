@@ -83,6 +83,7 @@ def ffpa_attn_func(
   is_causal: bool = False,
   scale: float | None = None,
   enable_gqa: bool = False,
+  tensor_layout: str = "HND",
   **kwargs: object,
 ) -> torch.Tensor:
   """FFPA: Faster Flash Prefill Attention for large headdims (D > 256).
@@ -170,6 +171,10 @@ def ffpa_attn_func(
   fb = kwargs.get("forward_backend")
   if fb is None:
     fb = kwargs.get("backend")
+  if tensor_layout not in ("HND", "NHD"):
+    raise TypeError(
+      f"tensor_layout must be 'HND' or 'NHD', got {tensor_layout!r}"
+    )
   if (
     attn_mask is None and dropout_p == 0.0 and "backward_backend" not in kwargs
     and isinstance(fb, CUDABackend)
@@ -179,10 +184,19 @@ def ffpa_attn_func(
     # wrapper (~20us/call). Any config the fast path rejects returns None
     # and falls through to the full chain below, so behavior is unchanged.
     out = _ffpa_attn_forward(
-      query, key, value, is_causal, scale, enable_gqa, fb
+      query, key, value, is_causal, scale, enable_gqa, fb, tensor_layout
     )
     if out is not None:
       return out
+  if tensor_layout == "NHD":
+    # v1: NHD packing is a fast-path-only feature (fp8 persist-D CUDA
+    # kernel); the full meta/autograd chain still assumes BHND.
+    raise TypeError(
+      "tensor_layout='NHD' requires the inference fast path: forward-only "
+      "no-grad call with an explicit CUDABackend whose fp8 persist-D kernel "
+      "applies (e.g. ffpa_attn_forward(..., tensor_layout='NHD', "
+      "forward_backend=CUDABackend(enable_fp8=True, ...)))"
+    )
   meta = FFPAAttnMeta.from_kwargs(**kwargs)
   if meta.fallback(query, key, attn_mask, dropout_p):
     # HACK: Avoid recursive for monkey-patch usage.
@@ -221,6 +235,7 @@ def ffpa_attn_forward(
   scale: float | None = None,
   enable_gqa: bool = False,
   forward_backend: CUDABackend | None = None,
+  tensor_layout: str = "HND",
 ) -> torch.Tensor:
   """Inference fast path: CUDA forward without meta validation.
 
@@ -248,11 +263,22 @@ def ffpa_attn_forward(
       is native in the CUDA kernel.
   :param forward_backend: Explicitly configured :class:`CUDABackend`; its
       flags drive the kernel exactly as ``ffpa_attn_func(forward_backend=...)``.
-  :returns: Output tensor ``O`` with layout ``[B, Nh_q, Nq, D]``.
+  :param tensor_layout: ``"HND"`` (default) for BHND packed ``[B, H, N, D]``
+      tensors, or ``"NHD"`` for diffusers-style ``[B, N, H, D]`` storage
+      (output follows the input layout; fp8 persist-D CUDA kernel only).
+  :returns: Output tensor ``O`` with layout ``[B, Nh_q, Nq, D]`` (HND) or
+      ``[B, Nq, Nh_q, D]`` (NHD).
   """
   if isinstance(forward_backend, CUDABackend):
     out = _ffpa_attn_forward(
-      query, key, value, is_causal, scale, enable_gqa, forward_backend
+      query,
+      key,
+      value,
+      is_causal,
+      scale,
+      enable_gqa,
+      forward_backend,
+      tensor_layout,
     )
     if out is not None:
       return out
@@ -264,6 +290,7 @@ def ffpa_attn_forward(
     scale=scale,
     forward_backend=forward_backend,
     enable_gqa=enable_gqa,
+    tensor_layout=tensor_layout,
   )
 
 

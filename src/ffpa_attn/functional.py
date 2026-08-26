@@ -170,6 +170,7 @@ def _ffpa_attn_forward(
   scale: float | None,
   enable_gqa: bool,
   fm: CUDABackend,
+  tensor_layout: str = "HND",
 ) -> torch.Tensor | None:
   """Inference-only forward: run the CUDA op directly, skipping meta
   validation and the autograd Function wrapper.
@@ -179,18 +180,39 @@ def _ffpa_attn_forward(
 
   Returns ``None`` when the config needs the full :func:`ffpa_attn_func`
   chain (grad mode on, small-D SDPA routing, ``D > 1024``, ``Nq < 512``,
-  ``Nkv < 512``, or bf16 with ``acc='f16'``). The caller is responsible for
-  pre-validated packed BHND fp16/bf16 inputs.
+  ``Nkv < 512``, bf16 with ``acc='f16'``, or ``tensor_layout='NHD'`` on a
+  non-fp8-persist-D path). The caller is responsible for pre-validated
+  packed inputs (BHND fp16/bf16, or NHD when ``tensor_layout='NHD'``).
 
   :param enable_gqa: Unused by the CUDA kernel (GQA head grouping is
       native); accepted for signature compatibility with future
       Triton / CuTeDSL fast paths.
   """
+  nhd = tensor_layout == "NHD"
+  if nhd:
+    # NHD output packing is implemented by the fp8 persist-D CUDA kernel
+    # only (runtime store-layout branch); every other impl/hint combination
+    # must take the full chain. The hybrid stage-1 slice is BHND-only, so
+    # decline exactly the configs C++ would route into it (fp8_hybrid may
+    # still be None; the resolution below maps causal to True).
+    if (
+      _ffpa_attn_forward_cuda is None or torch.is_grad_enabled()
+      or fm.fp8_hadamard or fm.fp4_hybrid or fm.fp4_hadamard
+      or not fm.enable_fp8 or (
+        fm.enable_fp8 and
+        (fm.fp8_hybrid or (fm.fp8_hybrid is None and is_causal))
+        and query.size(1) >= (fm.fp8_hybrid_n_early or 256)
+      )
+    ):
+      return None
+    nq, nkv = query.size(1), key.size(1)
+  else:
+    nq, nkv = query.size(2), key.size(2)
   if (
     _ffpa_attn_forward_cuda is None or torch.is_grad_enabled()
     or query.dtype is torch.bfloat16 and fm.acc == "f16"
     or _should_use_aten_small_d_forward(fm, query.size(-1))
-    or query.size(-1) > 1024 or 8 <= query.size(2) < 512 or key.size(2) < 512
+    or query.size(-1) > 1024 or 8 <= nq < 512 or nkv < 512
   ):
     return None
   # Same in-place resolution normalize_inputs would perform (idempotent).
@@ -228,6 +250,7 @@ def _ffpa_attn_forward(
     fm.fp4_hadamard,
     1 if fm.fp4_pv_mm_type == "fp8" else 0,
     fm.fp4_smooth_v,
+    0 if nhd else 1,
   )
   return O
 
