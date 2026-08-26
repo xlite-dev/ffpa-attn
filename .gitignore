@@ -31,3 +31,4 @@ site
 .plans
 docs/paper
 csrc/cuffpa/generated/
+*.csv

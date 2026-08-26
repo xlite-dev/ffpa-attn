@@ -41,6 +41,14 @@ except Exception:
   _ffpa_attn_forward_cuda = None
   F16_ACC_AVAILABLE = False
 
+try:
+  # Hoisted to module level: the per-call `from .cuda import ...` inside
+  # _apply_cuda_backend_hint costs ~0.5us (sys.modules lookup + attr access).
+  from .cuda import set_cuda_backend_impl, CudaBackendImpl
+except Exception:
+  set_cuda_backend_impl = None
+  CudaBackendImpl = None
+
 if TYPE_CHECKING:
   from typing import Tuple, Union, Optional  # noqa: F401
 
@@ -140,7 +148,6 @@ def _apply_cuda_backend_hint(backend: CUDABackend) -> None:
 
   Mapping: (enable_tma, enable_cute) → hint. No flag set → NATIVE (Legacy).
   """
-  from .cuda import set_cuda_backend_impl, CudaBackendImpl
   if getattr(backend, "enable_fp4", False):
     set_cuda_backend_impl(CudaBackendImpl.CUTE_TMA_FP4)
   elif getattr(backend, "enable_fp8", False):
@@ -153,6 +160,76 @@ def _apply_cuda_backend_hint(backend: CUDABackend) -> None:
     set_cuda_backend_impl(CudaBackendImpl.CUTE)
   else:
     set_cuda_backend_impl(CudaBackendImpl.NATIVE)
+
+
+def _ffpa_attn_forward(
+  query: torch.Tensor,
+  key: torch.Tensor,
+  value: torch.Tensor,
+  is_causal: bool,
+  scale: float | None,
+  enable_gqa: bool,
+  fm: CUDABackend,
+) -> torch.Tensor | None:
+  """Inference-only forward: run the CUDA op directly, skipping meta
+  validation and the autograd Function wrapper.
+
+  Currently supports the CUDA backend only; Triton / CuTeDSL inference
+  fast paths may be added in the future.
+
+  Returns ``None`` when the config needs the full :func:`ffpa_attn_func`
+  chain (grad mode on, small-D SDPA routing, ``D > 1024``, ``Nq < 512``,
+  ``Nkv < 512``, or bf16 with ``acc='f16'``). The caller is responsible for
+  pre-validated packed BHND fp16/bf16 inputs.
+
+  :param enable_gqa: Unused by the CUDA kernel (GQA head grouping is
+      native); accepted for signature compatibility with future
+      Triton / CuTeDSL fast paths.
+  """
+  if (
+    _ffpa_attn_forward_cuda is None or torch.is_grad_enabled()
+    or query.dtype is torch.bfloat16 and fm.acc == "f16"
+    or _should_use_aten_small_d_forward(fm, query.size(-1))
+    or query.size(-1) > 1024 or 8 <= query.size(2) < 512 or key.size(2) < 512
+  ):
+    return None
+  # Same in-place resolution normalize_inputs would perform (idempotent).
+  fm.is_causal = is_causal
+  if fm.fp8_hybrid is None:
+    fm.fp8_hybrid = bool(fm.enable_fp8 and is_causal)
+  if fm.fp4_hybrid is None:
+    fm.fp4_hybrid = bool(fm.enable_fp4 and is_causal)
+  _apply_cuda_backend_hint(fm)
+  O, _ = _ffpa_attn_forward_cuda(
+    query,
+    key,
+    value,
+    None,
+    None,
+    fm.stages,
+    fm.acc_code,
+    int(is_causal),
+    1.0 / math.sqrt(query.size(-1)) if scale is None else float(scale),
+    0.0,
+    0,
+    0,
+    fm.fp8_smooth_k,
+    fm.fp8_smooth_v,
+    fm.fp8_q_quant_method_code,
+    fm.fp8_k_quant_method_code,
+    fm.fp8_v_quant_method_code,
+    fm.fp8_pv_acc_code,
+    fm.fp8_qk_mm_type_code,
+    fm.fp8_hybrid,
+    fm.fp8_hybrid_n_early,
+    fm.fp4_hybrid,
+    fm.fp4_hybrid_n_early,
+    fm.fp8_hadamard,
+    fm.fp4_hadamard,
+    1 if fm.fp4_pv_mm_type == "fp8" else 0,
+    fm.fp4_smooth_v,
+  )
+  return O
 
 
 def _normalize_grad_kv_storage_dtype(

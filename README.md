@@ -22,7 +22,7 @@
 ## Latest News
 
 - [2026-08] 🐍 [**Cache-DiT x FFPA (FP8/FP4)**](#end-to-end-inference) is ready! Feel free to take a try for your Diffusion models. 🎉🎉
-- [2026-08] 🚪 FFPA now experimental supports [**FP4 Attention**](./csrc/cuffpa/cute/fp4/) for headdims **[64,1024]** ([sm_120](./csrc/cuffpa/cute/fp4/sm_120/), forward only), achieving **850-980**🎉 TFLOPS (D=128-256) on NVIDIA RTX 5090, **3.8x~4.4x**🎉 speedup over PyTorch SDPA (FlashAttention-2 backend), the performance of large headdims is stay tuned for updates. 🎉🎉
+- [2026-08] 🚪 FFPA now experimental supports [**FP4 Attention**](./csrc/cuffpa/cute/fp4/) for headdims **[64,1024]** ([sm_120](./csrc/cuffpa/cute/fp4/sm_120/), forward only), achieving **850-980**🎉 TOPS (D=128-256) on NVIDIA RTX 5090, **3.8x~4.4x**🎉 speedup over PyTorch SDPA (FlashAttention-2 backend), the performance of large headdims is stay tuned for updates. 🎉🎉
 - [2026-08] 🦅 FFPA now supports D=512 for NVIDIA B200 via [**CuTe-DSL**](#benchmark) **tcgen05** 2-CTA, [**1517**](#benchmark) TFLOPS forward and [**763**](#benchmark) TFLOPS backward, achieving **6x~15x**🎉 speedup over standard PyTorch SDPA. 🎉🎉
 - [2026-07] 🎯 FFPA now supports [**FP8 Attention**](./csrc/cuffpa/cute/fp8/) for headdims **[64,1024]** ([sm_120](./csrc/cuffpa/cute/fp8/sm_120/), forward only) and achieving **3x~6x**🎉 speedup over PyTorch SDPA for large headdim (**D>256**). 🎉🎉
 - [2026-06] FFPA now supports **AMD ROCm/HIP GPUs** via the TritonBackend, check [#268](https://github.com/xlite-dev/ffpa-attn/pull/268) for more details. 🎉
@@ -212,13 +212,13 @@ python3 -m cache_dit.generate flux --attn ffpa_fp4 --seed 42 --height 1024 --wid
 
 <i> FLUX.1-dev, seed=42, 28 steps, 1024 x 1024, NVIDIA RTX PRO 5000 </i>
 
-|SDPA-FA2 (17.2s)|FFPA-FP8 (16.3s)|SageAttn-3 (FP4, 16.4s)|FFPA-FP4 (16.1s)|
+|SDPA-FA2 (17.2s)|FFPA-FP8 (16.2s)|SageAttn-2 (FP8, 16.2s)|FFPA-FP4 (16.1s)|
 |:---:|:---:|:---:|:---:|
-|<img src="./docs/assets/flux.1024.seed42.native.png" width="180px">|<img src="./docs/assets/flux.1024.seed42.ffpa_fp8.png" width="180px">|<img src="./docs/assets/flux.1024.seed42.sage3.png" width="180px">|<img src="./docs/assets/flux.1024.seed42.ffpa_fp4.png" width="180px">|
+|<img src="./docs/assets/flux.1024.seed42.native.png" width="180px">|<img src="./docs/assets/flux.1024.seed42.ffpa_fp8.png" width="180px">|<img src="./docs/assets/flux.1024.seed42.sage.png" width="180px">|<img src="./docs/assets/flux.1024.seed42.ffpa_fp4.png" width="180px">|
 
 <i> FLUX.1-dev, seed=42, 28 steps, 2048 x 2048, NVIDIA RTX PRO 5000 </i>
 
-|SDPA-FA2 (92.3s)|FFPA-FP8 (81.7s)|SageAttn-3 (FP4, 80.4s)|FFPA-FP4 (77.3s)|
+|SDPA-FA2 (92.3s)|FFPA-FP8 (80.3s)|SageAttn-3 (FP4, 80.4s)|FFPA-FP4 (77.3s)|
 |:---:|:---:|:---:|:---:|
 |<img src="./docs/assets/flux.2048x2048.C0_native.png" width="180px">|<img src="./docs/assets/flux.2048x2048.C0_ffpa_fp8.png" width="180px">|<img src="./docs/assets/flux.2048x2048.C0_sage3.png" width="180px">|<img src="./docs/assets/flux.2048x2048.C0_ffpa_fp4.png" width="180px">|
 
