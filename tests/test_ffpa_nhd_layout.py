@@ -136,6 +136,22 @@ def test_nhd_layout_rejections(monkeypatch):
           tensor_layout="NHD",
         ),
       )
+  # fp16 with the CUTE_TMA path opted out (enable_cute=False): NHD output
+  # packing only exists in the CUTE_TMA persist-D kernel.
+  with pytest.raises(TypeError, match="NHD"):
+    with torch.no_grad():
+      q, k, v = _mk(B, H, H, N, 128)
+      ffpa_attn_func(
+        _nhd(q),
+        _nhd(k),
+        _nhd(v),
+        forward_backend=CUDABackend(
+          backward=False,
+          enable_tma=True,
+          enable_cute=False,
+          tensor_layout="NHD",
+        ),
+      )
   # grad-on: the fast path declines, and the full chain assumes BHND.
   with pytest.raises(TypeError, match="NHD"):
     q, k, v = _mk(B, H, H, N, 128)

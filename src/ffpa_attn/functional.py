@@ -563,8 +563,11 @@ class CUDABackend(Backend):
   ) -> bool:
     """Whether the persist-D NHD fast path applies for this config.
 
-    Family rules: fp8 needs no extra check; fp4 persist-D covers
-    ``headdim <= 256``; fp16 persist-D covers ``headdim <= 128``. Declines
+    NHD requires the CUTE_TMA path (native / TMA / CUTE keep a static
+    BHND gO); fp8/fp4 always dispatch there, so only the fp16 family
+    checks the impl flags. Family rules: fp8 needs no extra check; fp4
+    persist-D covers ``headdim <= 256``; fp16 persist-D covers
+    ``headdim <= 128``. Declines
     the BHND-only hybrid stage-1 slice and hadamard rotation of the active
     quantized family; a hybrid config only stages when ``seqlen_q >=
     n_early`` (shorter sequences stay entirely on the NHD-capable fp16
@@ -585,7 +588,10 @@ class CUDABackend(Backend):
       hybrid, hadamard = self.fp8_hybrid, self.fp8_hadamard
       n_early = self.fp8_hybrid_n_early
     else:
-      return headdim <= 128
+      # NHD output packing only exists in the CUTE_TMA persist-D kernel; the
+      # native / TMA / CUTE paths keep a static BHND gO (fp8/fp4 always
+      # dispatch to CUTE_TMA, so only the fp16 family needs the check).
+      return headdim <= 128 and self.enable_tma and self.enable_cute
     hybrid = is_causal if hybrid is None else hybrid
     return not (hadamard or (hybrid and seqlen_q >= (n_early or 256)))
 

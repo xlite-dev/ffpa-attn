@@ -31,10 +31,12 @@
 // NHD (diffusers BNHD) input detection: a [B, H, N, D]-shaped tensor that is
 // a zero-copy permute view of a packed [B, N, H, D] tensor, i.e.
 // strides (N*H*D, D, H*D, 1). Returns false for BHND-packed tensors.
+// B == 1 makes stride(0) an ignored leftover (CP comm primitives leave the
+// pre-permute value), so it is exempt from the exact check.
 static inline bool ffpa_is_nhd_view(const torch::Tensor& X) {
   const long B = X.size(0), H = X.size(1), N = X.size(2), D = X.size(3);
   return X.dim() == 4 && X.stride(3) == 1 && X.stride(2) == H * D &&
-         X.stride(1) == D && X.stride(0) == N * H * D;
+         X.stride(1) == D && (B <= 1 || X.stride(0) == N * H * D);
 }
 
 // Fp8InputLayout from a [B, H, N, D] tensor's strides. Accepts BHND-packed
