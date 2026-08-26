@@ -552,6 +552,10 @@ class CUDABackend(Backend):
   def _default_cuda_stages(self) -> int:
     from .cuda import CudaBackendImpl
     """Default pipeline depth for CUDA backend (non-TMA path)."""
+    if self.impl_hint in (
+      CudaBackendImpl.CUTE_TMA_FP8, CudaBackendImpl.CUTE_TMA_FP4
+    ):
+      return 2  # fp8/fp4 persist-D sm120 path (smem budget caps stages)
     if _is_hopper_or_later():
       if self.impl_hint in (CudaBackendImpl.NATIVE, CudaBackendImpl.TMA):
         return 4  # sm>=90, native or TMA path
@@ -564,6 +568,10 @@ class CUDABackend(Backend):
   @property
   def impl_hint(self) -> int:
     from .cuda import CudaBackendImpl
+    if self.enable_fp4:
+      return CudaBackendImpl.CUTE_TMA_FP4
+    if self.enable_fp8:
+      return CudaBackendImpl.CUTE_TMA_FP8
     if self.enable_tma and self.enable_cute:
       return CudaBackendImpl.CUTE_TMA
     if self.enable_tma:
