@@ -189,21 +189,28 @@ def _ffpa_attn_forward(
   """
   nhd = fm.tensor_layout == "NHD"
   if nhd:
-    # NHD output packing is implemented by the fp8 persist-D CUDA kernel
-    # only (runtime store-layout branch); every other impl/hint combination
-    # must take the full chain. The hybrid stage-1 slice is BHND-only, so
-    # decline exactly the configs C++ would route into it (fp8_hybrid may
-    # still be None; the resolution below maps causal to True).
-    if (
-      _ffpa_attn_forward_cuda is None or torch.is_grad_enabled()
-      or fm.fp8_hadamard or fm.fp4_hybrid or fm.fp4_hadamard
-      or not fm.enable_fp8 or (
-        fm.enable_fp8 and
-        (fm.fp8_hybrid or (fm.fp8_hybrid is None and is_causal))
-        and query.size(1) >= (fm.fp8_hybrid_n_early or 256)
-      )
-    ):
+    # NHD output packing is implemented by the persist-D CUDA kernels
+    # (fp8 / fp16 / fp4); every other combination must take the full chain.
+    # The hybrid stage-1 slice is BHND-only, so decline exactly the configs
+    # C++ would route into it (*_hybrid may still be None; the resolution
+    # below maps causal to True). fp16 has no family switches — its
+    # head_dim/arch checks live in the C++ TORCH_CHECK guards.
+    if _ffpa_attn_forward_cuda is None or torch.is_grad_enabled():
       return None
+    if fm.enable_fp4:
+      if (
+        fm.fp4_hadamard
+        or ((fm.fp4_hybrid or (fm.fp4_hybrid is None and is_causal))
+            and query.size(1) >= (fm.fp4_hybrid_n_early or 256))
+      ):
+        return None
+    elif fm.enable_fp8:
+      if (
+        fm.fp8_hadamard or fm.fp4_hybrid or fm.fp4_hadamard
+        or ((fm.fp8_hybrid or (fm.fp8_hybrid is None and is_causal))
+            and query.size(1) >= (fm.fp8_hybrid_n_early or 256))
+      ):
+        return None
     nq, nkv = query.size(1), key.size(1)
   else:
     nq, nkv = query.size(2), key.size(2)
