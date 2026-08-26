@@ -27,6 +27,7 @@ import importlib.util
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
+from functools import lru_cache
 
 import torch
 import torch.nn.functional as F
@@ -59,6 +60,7 @@ def _is_5090_or_force_int8() -> bool:
   return "5090" in torch.cuda.get_device_name() or FFPA_BENCH_FP8_FORCE_QK_INT8
 
 
+@lru_cache(maxsize=None)
 def fp8_backend(preset: str = "default", hybrid: bool = False) -> CUDABackend:
   if preset == "int8" or (preset == "default" and _is_5090_or_force_int8()):
     # 5090 default / explicit int8 preset: int8 QK matmul, f16 PV acc.
@@ -98,16 +100,20 @@ def fp8_backend(preset: str = "default", hybrid: bool = False) -> CUDABackend:
 
 
 def bench_ms(fn, warmup=3, iters=5) -> float:
-  for _ in range(warmup):
-    fn()
-  torch.cuda.synchronize()
-  ts = []
-  for _ in range(iters):
+  # Inference benchmark: no_grad matches deployment and lets the ffpa_attn
+  # inference fast path engage (grad-on forces the full meta/autograd chain,
+  # ~30us of python per call that is not part of kernel performance).
+  with torch.no_grad():
+    for _ in range(warmup):
+      fn()
     torch.cuda.synchronize()
-    t0 = time.perf_counter()
-    fn()
-    torch.cuda.synchronize()
-    ts.append(time.perf_counter() - t0)
+    ts = []
+    for _ in range(iters):
+      torch.cuda.synchronize()
+      t0 = time.perf_counter()
+      fn()
+      torch.cuda.synchronize()
+      ts.append(time.perf_counter() - t0)
   return min(ts) * 1e3
 
 
