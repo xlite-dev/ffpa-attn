@@ -337,9 +337,6 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp8_sm120(
   for (int s = 0; s < kStagesV; ++s)
     CtaBarrier::arrive(&v_empty[s]);
 
-  TmaBarrier::wait(&q_full, 0);
-  cutlass::arch::fence_view_async_shared();
-
   TiledMmaQK tiled_mma_qk;
   TiledMmaPV tiled_mma_pv;
   [[maybe_unused]] TiledMmaPVf16 tiled_mma_pv_f16;
@@ -417,6 +414,12 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp8_sm120(
   // mode accumulates straight into o_acc and needs neither.
   float o_tile[kPQuantPerRow ? kOElemsPerFrag : 1];
   float p_scale[kPQuantPerRow ? kORows : 1];
+
+  // Deferred Q arrival: the setup above is register/scalar work (mma
+  // partitions, scale loads, accumulator zero-init) with no Q smem reads,
+  // so it now overlaps the in-flight Q TMA instead of stalling behind it.
+  TmaBarrier::wait(&q_full, 0);
+  cutlass::arch::fence_view_async_shared();
 
   auto sQ = make_tensor(make_smem_ptr(q_base), SmemLayoutQ{});
   auto tCrQ = thr_mma_qk.partition_fragment_A(sQ);
