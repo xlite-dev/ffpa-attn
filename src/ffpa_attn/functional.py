@@ -190,9 +190,7 @@ def _ffpa_attn_forward(
   """
   nhd = forward_backend.tensor_layout == "NHD"
   if nhd:
-    if not forward_backend.is_nhd_supported(
-      is_causal, query.size(1), query.size(-1)
-    ):
+    if not forward_backend.is_nhd_supported(query.size(-1)):
       return None
     nq, nkv = query.size(1), key.size(1)
   else:
@@ -558,42 +556,30 @@ class CUDABackend(Backend):
       return CudaBackendImpl.CUTE
     return CudaBackendImpl.NATIVE
 
-  def is_nhd_supported(
-    self, is_causal: bool, seqlen_q: int, headdim: int
-  ) -> bool:
+  def is_nhd_supported(self, headdim: int) -> bool:
     """Whether the persist-D NHD fast path applies for this config.
 
     NHD requires the CUTE_TMA path (native / TMA / CUTE keep a static
     BHND gO); fp8/fp4 always dispatch there, so only the fp16 family
-    checks the impl flags. Family rules: fp8 needs no extra check; fp4
-    persist-D covers ``headdim <= 256``; fp16 persist-D covers
-    ``headdim <= 128``. Declines
-    the BHND-only hybrid stage-1 slice and hadamard rotation of the active
-    quantized family; a hybrid config only stages when ``seqlen_q >=
-    n_early`` (shorter sequences stay entirely on the NHD-capable fp16
-    persist-D kernel). ``*_hybrid=None`` means auto (enabled when causal).
-    The C++ TORCH_CHECK guards stay as the backstop.
+    checks the impl flags. The head_dim caps follow the persist-D
+    coverage (fp8 <= 224, fp4 <= 256, fp16 <= 128): the split-D/M4N2
+    ranges beyond them have no NHD O store. Hybrid is fine — its
+    stage-1 writeback is a stride-generic ``O.slice(...).copy_`` and the
+    stage-2 kernel already offsets NHD rows by ``q_start_row``. Only the
+    hadamard Q/K rotation (BHND-packed) still declines. The C++
+    TORCH_CHECK guards stay as the backstop.
 
-    :param is_causal: Runtime causal flag (drives the hybrid auto-resolve).
-    :param seqlen_q: Query sequence length (hybrid staging threshold).
     :param headdim: Head dimension of Q/K/V.
     :returns: Whether NHD inputs/outputs can take the fast path.
     """
     if self.enable_fp4:
-      if headdim > 256:
-        return False
-      hybrid, hadamard = self.fp4_hybrid, self.fp4_hadamard
-      n_early = self.fp4_hybrid_n_early
-    elif self.enable_fp8:
-      hybrid, hadamard = self.fp8_hybrid, self.fp8_hadamard
-      n_early = self.fp8_hybrid_n_early
-    else:
-      # NHD output packing only exists in the CUTE_TMA persist-D kernel; the
-      # native / TMA / CUTE paths keep a static BHND gO (fp8/fp4 always
-      # dispatch to CUTE_TMA, so only the fp16 family needs the check).
-      return headdim <= 128 and self.enable_tma and self.enable_cute
-    hybrid = is_causal if hybrid is None else hybrid
-    return not (hadamard or (hybrid and seqlen_q >= (n_early or 256)))
+      return headdim <= 256 and not self.fp4_hadamard
+    if self.enable_fp8:
+      return headdim <= 224 and not self.fp8_hadamard
+    # NHD output packing only exists in the CUTE_TMA persist-D kernel; the
+    # native / TMA / CUTE paths keep a static BHND gO (fp8/fp4 always
+    # dispatch to CUTE_TMA, so only the fp16 family needs the check).
+    return headdim <= 128 and self.enable_tma and self.enable_cute
 
 
 @dataclass

@@ -103,6 +103,29 @@ def test_fp4_nhd_tail_batch_gqa(monkeypatch):
   torch.testing.assert_close(out_n, out_b.permute(0, 2, 1, 3))
 
 
+@pytest.mark.parametrize("family", ["fp8", "fp4"], ids=["fp8", "fp4"])
+@pytest.mark.parametrize("causal", [False, True], ids=["dense", "causal"])
+def test_hybrid_nhd_layout_bit_exact(family, causal, monkeypatch):
+  monkeypatch.setenv("FFPA_CUDA_ALLOW_SMALL_D", "1")
+  torch.manual_seed(0)
+  B, H, Hkv, N, D = 1, 24, 24, 2048, 128
+  q, k, v = _mk(B, H, Hkv, N, D)
+  kw = (
+    dict(enable_fp8=True, fp8_hybrid=True, fp8_hybrid_n_early=256)
+    if family == "fp8" else
+    dict(enable_fp4=True, fp4_hybrid=True, fp4_hybrid_n_early=256)
+  )
+  backend = _backend(**kw)
+  backend_nhd = _backend(tensor_layout="NHD", **kw)
+  with torch.no_grad():
+    out_b = ffpa_attn_func(q, k, v, is_causal=causal, forward_backend=backend)
+    out_n = ffpa_attn_func(
+      _nhd(q), _nhd(k), _nhd(v), is_causal=causal, forward_backend=backend_nhd
+    )
+  assert out_n.shape == (B, N, H, D) and out_n.is_contiguous()
+  torch.testing.assert_close(out_n, out_b.permute(0, 2, 1, 3))
+
+
 def test_nhd_layout_rejections(monkeypatch):
   monkeypatch.setenv("FFPA_CUDA_ALLOW_SMALL_D", "1")
   torch.manual_seed(0)
@@ -120,22 +143,15 @@ def test_nhd_layout_rejections(monkeypatch):
         _nhd(v),
         forward_backend=_backend(tensor_layout="NHD"),
       )
-  # explicit fp4_hybrid with Nq >= n_early: declined by the python gate,
-  # which raises TypeError (NHD has no path outside the fast path).
-  with pytest.raises(TypeError, match="NHD"):
-    with torch.no_grad():
-      q, k, v = _mk(B, H, H, N, 128)
-      ffpa_attn_func(
-        _nhd(q),
-        _nhd(k),
-        _nhd(v),
-        forward_backend=_backend(
-          enable_fp4=True,
-          fp4_hybrid=True,
-          fp4_hybrid_n_early=256,
-          tensor_layout="NHD",
-        ),
-      )
+  # Outside the persist-D range (fp8 D>224, fp4 D>256) and hadamard: the
+  # gate declines so NHD keeps the graceful BHND fallback; hybrid no
+  # longer blocks (its stage-1 writeback is a stride-generic slice copy).
+  assert not _backend(enable_fp8=True).is_nhd_supported(256)
+  assert not _backend(enable_fp4=True).is_nhd_supported(320)
+  assert not _backend(enable_fp8=True, fp8_hadamard=True).is_nhd_supported(128)
+  assert not _backend(enable_fp4=True, fp4_hadamard=True).is_nhd_supported(128)
+  assert _backend(enable_fp8=True, fp8_hybrid=True).is_nhd_supported(128)
+  assert _backend(enable_fp4=True, fp4_hybrid=True).is_nhd_supported(128)
   # fp16 with the CUTE_TMA path opted out (enable_cute=False): NHD output
   # packing only exists in the CUTE_TMA persist-D kernel.
   with pytest.raises(TypeError, match="NHD"):

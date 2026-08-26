@@ -226,15 +226,14 @@ void launch_ffpa_attn_fwd_template(
         TORCH_CHECK(attn_bias.numel() == 0 && dropout_p == 0.0,
                     "fp4 sm120 path does not support attn_bias/dropout");
         // NHD (BNHD) O is stored natively only by the persist-D fp4 kernel
-        // (64<=D<=256): split-D/M4N2 store BHND-packed only, and the hybrid
-        // stage-1 writes through a BHND slice.
+        // (64<=D<=256): split-D/M4N2 store BHND-packed only (the kHeadDim
+        // check below rejects them). The hybrid stage-1 writeback
+        // (O.slice(2,...).copy_) is stride-generic, so hybrid keeps
+        // working on an NHD O.
         TORCH_CHECK(
             !(ffpa_is_nhd_view(O) && kHeadDim > 256),
             "ffpa_attn: NHD (BNHD) output requires the persist-D fp4 path "
             "(64 <= head_dim <= 256)");
-        TORCH_CHECK(
-            !(ffpa_is_nhd_view(O) && fp4_hybrid && Nq >= fp4_hybrid_n_early),
-            "ffpa_attn: NHD (BNHD) output is not supported with fp4 hybrid");
         // NHD (BNHD) views are consumed natively by the fp4 pre-kernels and
         // the persist-D attention kernel (quantized buffers are BHND). The
         // persist-D hybrid stage-1 fp16 kernel also handles NHD K/V. Only
@@ -420,15 +419,13 @@ void launch_ffpa_attn_fwd_template(
 #endif
 #endif
         // NHD-packed O is only implemented for the persist-D fp8 path
-        // (D<=224): split-D/M4N2 store BHND-packed only, and the hybrid
-        // stage-1 slices O in BHND dims.
+        // (D<=224): split-D/M4N2 store BHND-packed only. The hybrid
+        // stage-1 writeback (O.slice(2,...).copy_) is stride-generic, so
+        // hybrid keeps working on an NHD O.
         TORCH_CHECK(
             !(ffpa_is_nhd_view(O) && kHeadDim > 224),
             "ffpa_attn: NHD (BNHD) output requires the persist-D fp8 path "
             "(head_dim <= 224)");
-        TORCH_CHECK(
-            !(ffpa_is_nhd_view(O) && fp8_hybrid && Nq >= fp8_hybrid_n_early),
-            "ffpa_attn: NHD (BNHD) output is not supported with fp8 hybrid");
         // D<=224: persist-D fp8; 224<D<768: split-D M8N1 fp8;
         // D>=768: split-D M4N2 fp8. Same D<768/D>=768 cross-point as the
         // fp16 dispatch (M4N2 wins only for D>=768; below that M8N1 is
