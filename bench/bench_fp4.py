@@ -64,7 +64,7 @@ PLOT_CASE_ORDER = (
 PLOT_CASE_LABELS = {"cross-dense (Nkv=2Nq)": "cross-dense"}
 BACKEND_ORDER = ("FFPA-FP4", "FFPA-FP8", "Sage3", "SDPA")
 BACKEND_COLORS = {
-  "FFPA-FP4": "#f5a623",
+  "FFPA-FP4": "#663399",
   "FFPA-FP8": "#fd493c",
   "Sage3": "#2171b5",
   "SDPA": "#b0b0b0",
@@ -376,7 +376,7 @@ def plot_tflops(
 
   Draws at most the three largest base sequence lengths (tables stay complete
   for every ``--N`` value), mirroring bench_fp8.py. Sage3 lacks GQA support,
-  so its slot in GQA scenarios is simply left empty (no bar).
+  so GQA clusters omit its bar entirely (no reserved gap; bars pack tight).
 
   :param rows: Result rows returned by :func:`run_scenario`.
   :param device_name: Device name shown in the title.
@@ -402,12 +402,24 @@ def plot_tflops(
     for name in row["tflops"]
   }
   backends = [b for b in BACKEND_ORDER if b in present_backends]
-
-  n_ns = len(plot_ns)
-  n_backends = len(backends)
   width = 0.24
-  per_case = n_ns * n_backends
-  step = (per_case + 1) * width
+
+  # Dense slot packing: clusters skip absent backends (Sage3 has no GQA), so
+  # no empty slot is reserved for unsupported case/backend combinations.
+  slot_of = {}
+  cluster_base = {}
+  cluster_slots = {}
+  cursor = 0.0
+  for case in cases:
+    slots = 0
+    for n in plot_ns:
+      for backend in backends:
+        if values.get((case, n, backend)) is not None:
+          slot_of[(case, n, backend)] = slots
+          slots += 1
+    cluster_base[case] = cursor
+    cluster_slots[case] = slots
+    cursor += slots * width + width  # one-bar-width gap between clusters
 
   fig, ax = plt.subplots(figsize=(32, 12))
   finite_values = [
@@ -430,17 +442,17 @@ def plot_tflops(
       fontweight="bold",
     )
 
-  for n_idx, n in enumerate(plot_ns):
-    for b_idx, backend in enumerate(backends):
+  for n in plot_ns:
+    for backend in backends:
       positions = []
       heights = []
-      for case_idx, case in enumerate(cases):
-        base = case_idx * step
-        pos = base + n_idx * n_backends * width + b_idx * width
+      for case in cases:
         tf = values.get((case, n, backend))
-        # Sage3 GQA rows simply have no bar (sageattn3 lacks GQA support).
+        if tf is None:
+          continue  # Sage3 GQA: no slot reserved, bars pack tight
+        pos = cluster_base[case] + slot_of[(case, n, backend)] * width
         positions.append(pos)
-        heights.append(tf if tf is not None else float("nan"))
+        heights.append(tf)
       ax.bar(
         positions,
         heights,
@@ -460,9 +472,14 @@ def plot_tflops(
     fontweight="bold",
     y=0.958,
   )
-  ax.set_xticks([i * step + per_case * width / 2 for i in range(len(cases))])
+  ax.set_xticks([
+    cluster_base[c] + (cluster_slots[c] - 1) * width / 2 for c in cases
+  ])
   # One-bar-width left margin; right margin halved (bars crowd the right edge).
-  ax.set_xlim(-width, len(cases) * step - width / 2)
+  last = cases[-1]
+  ax.set_xlim(
+    -width, cluster_base[last] + cluster_slots[last] * width - width / 2
+  )
   # Tag each case with the plotted seqlens (left-to-right N order in-cluster).
   ns_tag = f"({'/'.join(_fmt_n(n) for n in plot_ns)})"
   ax.set_xticklabels(
@@ -477,7 +494,7 @@ def plot_tflops(
   ax.legend(
     fontsize=16,
     loc="upper right",
-    ncol=n_backends,
+    ncol=len(backends),
     columnspacing=1.5,
     handletextpad=0.6,
     frameon=True,
@@ -513,7 +530,7 @@ def parse_args():
   p.add_argument(
     "--dtype",
     type=str,
-    default="fp16",
+    default="bf16",
     choices=["fp16", "bf16"],
     help="Activation dtype"
   )
