@@ -49,19 +49,17 @@ if FFPA_BENCH_FP8_FORCE_QK_INT8:
   )
 
 # cachedit mirrors cache-dit's ffpa_fp8 backend: int8 QK + f16 PV acc +
-# per_thread Q/K + per_channel V + smooth {k,v} + hybrid (non-causal 256 /
-# causal 128 early rows). Same-basis comparison against Sage's native
-# per-thread/per-channel kernels.
-PRESETS = ("default", "int8", "cachedit")
+# per_thread Q/K + per_channel V + smooth k (hybrid opt-in via --hybrid,
+# default off: Sage has no equivalent stage). Same-basis comparison against
+# Sage's native per-thread/per-channel kernels.
+PRESETS = ("default", "int8", "cachedit", "cache_dit", "cache-dit")
 
 
 def _is_5090_or_force_int8() -> bool:
   return "5090" in torch.cuda.get_device_name() or FFPA_BENCH_FP8_FORCE_QK_INT8
 
 
-def fp8_backend(
-  preset: str = "default", no_hybrid: bool = False
-) -> CUDABackend:
+def fp8_backend(preset: str = "default", hybrid: bool = False) -> CUDABackend:
   if preset == "int8" or (preset == "default" and _is_5090_or_force_int8()):
     # 5090 default / explicit int8 preset: int8 QK matmul, f16 PV acc.
     return CUDABackend(
@@ -71,9 +69,9 @@ def fp8_backend(
       enable_fp8=True,
       fp8_qk_mm_type="int8",
       fp8_pv_acc_type="f16",
-      fp8_hybrid=False if no_hybrid else None,
+      fp8_hybrid=hybrid,
     )
-  if preset == "cachedit":
+  if preset in ("cachedit", "cache_dit", "cache-dit"):
     return CUDABackend(
       backward=False,
       enable_tma=True,
@@ -85,8 +83,8 @@ def fp8_backend(
       fp8_k_quant_method="per_thread",
       fp8_v_quant_method="per_channel",
       fp8_smooth_k=True,
-      fp8_smooth_v=True,
-      fp8_hybrid=False if no_hybrid else True,
+      fp8_smooth_v=False,
+      fp8_hybrid=hybrid,
       fp8_hybrid_n_early=256,
     )
   # default: FP8 Q/K matmul fp8, P/V accumulate f32
@@ -95,7 +93,7 @@ def fp8_backend(
     enable_tma=True,
     enable_cute=True,
     enable_fp8=True,
-    fp8_hybrid=False if no_hybrid else None,
+    fp8_hybrid=hybrid,
   )
 
 
@@ -171,7 +169,7 @@ def _mk(B, Hq, Hkv, Nq, Nkv, D, dtype, scale):
 
 
 def run_ffpa(
-  q, k, v, causal, gqa, preset="default", no_hybrid=False, with_permute=False
+  q, k, v, causal, gqa, preset="default", hybrid=False, with_permute=False
 ):
   if with_permute:
     # cache-dit E2E path: inputs arrive as diffusers NHD [B,N,H,D] storage;
@@ -185,7 +183,7 @@ def run_ffpa(
     v,
     is_causal=causal,
     enable_gqa=gqa,
-    forward_backend=fp8_backend(preset, no_hybrid)
+    forward_backend=fp8_backend(preset, hybrid)
   )
 
 
@@ -266,7 +264,7 @@ def run_scenario(
   use_sage,
   sdpa_name,
   preset="default",
-  no_hybrid=False,
+  hybrid=False,
   with_permute=False
 ):
   q, k, v = _mk(sc.B, sc.Hq, sc.Hkv, sc.Nq, sc.Nkv, sc.D, dtype, scale)
@@ -285,9 +283,8 @@ def run_scenario(
 
   outs = {
     "FFPA-FP8":
-    run_ffpa(q, k, v, sc.causal, sc.gqa, preset, no_hybrid, with_permute),
-    sdpa_label:
-    run_sdpa(sq, sk, sv, sc.causal, sc.gqa, sdpa_name),
+    run_ffpa(q, k, v, sc.causal, sc.gqa, preset, hybrid, with_permute),
+    sdpa_label: run_sdpa(sq, sk, sv, sc.causal, sc.gqa, sdpa_name),
   }
   if use_sage:
     sage_out = run_sage(q, k, v, sc.causal, sc.gqa, with_permute)
@@ -302,8 +299,7 @@ def run_scenario(
   torch.cuda.synchronize()
   fns = {
     "FFPA-FP8":
-    lambda:
-    run_ffpa(q, k, v, sc.causal, sc.gqa, preset, no_hybrid, with_permute),
+    lambda: run_ffpa(q, k, v, sc.causal, sc.gqa, preset, hybrid, with_permute),
   }
   if use_sage and SAGE_INSTALLED:
     fns["Sage"] = lambda: run_sage(q, k, v, sc.causal, sc.gqa, with_permute)
@@ -374,9 +370,10 @@ def parse_args():
   p.add_argument("--iters", type=int, default=5, help="Bench iters")
   p.add_argument("--no-sage", action="store_true", help="Skip SageAttention")
   p.add_argument(
-    "--no-hybrid",
+    "--hybrid",
     action="store_true",
-    help="Disable FFPA fp8 hybrid path (pure fp8 kernel comparison)",
+    help="Enable FFPA fp8 hybrid path (fp16 early rows). Off by default: "
+    "Sage has no equivalent, so hybrid on would bias the comparison.",
   )
   p.add_argument(
     "--preset",
@@ -452,7 +449,7 @@ def main():
         use_sage,
         sdpa_name,
         preset=args.preset,
-        no_hybrid=args.no_hybrid,
+        hybrid=args.hybrid,
         with_permute=args.with_permute,
       )
 
