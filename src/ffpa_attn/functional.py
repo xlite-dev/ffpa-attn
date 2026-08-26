@@ -563,19 +563,20 @@ class CUDABackend(Backend):
     BHND gO); fp8/fp4 always dispatch there, so only the fp16 family
     checks the impl flags. The head_dim caps follow the persist-D
     coverage (fp8 <= 224, fp4 <= 256, fp16 <= 128): the split-D/M4N2
-    ranges beyond them have no NHD O store. Hybrid is fine — its
-    stage-1 writeback is a stride-generic ``O.slice(...).copy_`` and the
-    stage-2 kernel already offsets NHD rows by ``q_start_row``. Only the
-    hadamard Q/K rotation (BHND-packed) still declines. The C++
-    TORCH_CHECK guards stay as the backstop.
+    ranges beyond them have no NHD O store. Hybrid and hadamard are
+    both fine: the hybrid stage-1 writeback is a stride-generic
+    ``O.slice(...).copy_`` (stage-2 already offsets NHD rows by
+    ``q_start_row``), and the hadamard WHT materializes BHND copies of
+    NHD Q/K/V inside the launcher (the fp4 fused path stays zero-copy).
+    The C++ TORCH_CHECK guards stay as the backstop.
 
     :param headdim: Head dimension of Q/K/V.
     :returns: Whether NHD inputs/outputs can take the fast path.
     """
     if self.enable_fp4:
-      return headdim <= 256 and not self.fp4_hadamard
+      return headdim <= 256
     if self.enable_fp8:
-      return headdim <= 224 and not self.fp8_hadamard
+      return headdim <= 224
     # NHD output packing only exists in the CUTE_TMA persist-D kernel; the
     # native / TMA / CUTE paths keep a static BHND gO (fp8/fp4 always
     # dispatch to CUTE_TMA, so only the fp16 family needs the check).

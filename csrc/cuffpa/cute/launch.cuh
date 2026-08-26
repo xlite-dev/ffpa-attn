@@ -763,14 +763,17 @@ void launch_cute_fwd_persist_d_fp8_sm120_impl(
   if (fp8_hadamard) {
     // WHT requires BHND-contiguous inputs; materialize packed copies for
     // NHD views (rare combo — the quantize kernels below are NHD-native,
-    // only the WHT kernel is not). V may stay NHD when already kHeadDim
-    // wide (its readers are layout-generic).
+    // only the WHT kernel is not). V must join the same packing: its
+    // readers derive the layout from K (Lkv), so pad it to kHeadDim or
+    // materialize it BHND when already wide.
     if (ffpa_is_nhd_view(Q))
       Q = Q.contiguous();
     if (ffpa_is_nhd_view(K))
       K = K.contiguous();
     if (Q.size(3) < kHeadDim)
       V = torch::constant_pad_nd(V, {0, kHeadDim - Q.size(3)}, 0.0);
+    else if (ffpa_is_nhd_view(V))
+      V = V.contiguous();
     Q = ffpa::apply_wht_qk_sm120<kDataType, kHeadDim>(Q);
     K = ffpa::apply_wht_qk_sm120<kDataType, kHeadDim>(K);
   }
