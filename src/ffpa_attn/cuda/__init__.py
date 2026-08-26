@@ -108,6 +108,11 @@ def _fwd_cuda_torch_op(
   # NHD-storage views so every downstream size()/stride read keeps BHND
   # semantics; O is allocated over NHD-packed storage (empty_like preserves
   # the dense view strides) and returned in native [B, N, H, D].
+  # The layout stays a python-side permute (zero-copy) instead of a C++ flag:
+  # with tensor_layout=1 a BHND-output call still legally takes NHD-view
+  # inputs (zero-copy read path), a combination one flag cannot express, so
+  # C++ keeps detecting storage from strides — the only ground truth for
+  # which packed layout a [B, H, N, D]-shaped tensor actually is.
   if tensor_layout == 0:
     Q, K, V = (t.permute(0, 2, 1, 3) for t in (Q, K, V))
     O = torch.empty_like(Q)  # noqa: E741

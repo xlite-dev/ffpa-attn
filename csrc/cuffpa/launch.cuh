@@ -167,6 +167,20 @@ void launch_ffpa_attn_fwd_template(
 #endif
 #endif
 
+  // NHD (BNHD) O is stored natively only by the persist-D sm120 kernels.
+  // The fp8/fp4 families guard their own dispatch branches below; this
+  // check covers the fp16/bf16 family, where every other path (TMA/NATIVE/
+  // CUTE hints, split-D, M4N2, sm80/sm90) stores through a BHND-packed
+  // descriptor and would silently corrupt an NHD-packed O.
+  if (ffpa_is_nhd_view(O) && !force_fp8 && !force_fp4) {
+    auto prop_o = at::cuda::getCurrentDeviceProperties();
+    TORCH_CHECK(
+        prop_o->major >= 12 && force_cute_tma && kHeadDim <= 128 &&
+            kHeadDim % 32 == 0,
+        "ffpa_attn: NHD (BNHD) output requires the fp16 persist-D sm120 "
+        "CUTE_TMA path (head_dim <= 128, %32 == 0)");
+  }
+
   // fp16/bf16 head_dim pad: non-32-multiple D_og (e.g. 120) zero-pads Q/K/V
   // to the compiled kHeadDim. fp8 skips (quantize reads D_og natively); O is
   // padded by ffpa_api.cc. Only reachable via the CUTE_TMA/CUTE pad paths
@@ -211,6 +225,15 @@ void launch_ffpa_attn_fwd_template(
         // as fp8: P-quantization noise on short-row softmax rows.
         TORCH_CHECK(attn_bias.numel() == 0 && dropout_p == 0.0,
                     "fp4 sm120 path does not support attn_bias/dropout");
+        // NHD (BNHD) O is stored natively only by the persist-D fp4 kernel
+        // (64<=D<=256): split-D/M4N2 store BHND-packed only (the kHeadDim
+        // check below rejects them). The hybrid stage-1 writeback
+        // (O.slice(2,...).copy_) is stride-generic, so hybrid keeps
+        // working on an NHD O.
+        TORCH_CHECK(
+            !(ffpa_is_nhd_view(O) && kHeadDim > 256),
+            "ffpa_attn: NHD (BNHD) output requires the persist-D fp4 path "
+            "(64 <= head_dim <= 256)");
         // NHD (BNHD) views are consumed natively by the fp4 pre-kernels and
         // the persist-D attention kernel (quantized buffers are BHND). The
         // persist-D hybrid stage-1 fp16 kernel also handles NHD K/V. Only
@@ -396,15 +419,13 @@ void launch_ffpa_attn_fwd_template(
 #endif
 #endif
         // NHD-packed O is only implemented for the persist-D fp8 path
-        // (D<=224): split-D/M4N2 store BHND-packed only, and the hybrid
-        // stage-1 slices O in BHND dims.
+        // (D<=224): split-D/M4N2 store BHND-packed only. The hybrid
+        // stage-1 writeback (O.slice(2,...).copy_) is stride-generic, so
+        // hybrid keeps working on an NHD O.
         TORCH_CHECK(
             !(ffpa_is_nhd_view(O) && kHeadDim > 224),
             "ffpa_attn: NHD (BNHD) output requires the persist-D fp8 path "
             "(head_dim <= 224)");
-        TORCH_CHECK(
-            !(ffpa_is_nhd_view(O) && fp8_hybrid && Nq >= fp8_hybrid_n_early),
-            "ffpa_attn: NHD (BNHD) output is not supported with fp8 hybrid");
         // D<=224: persist-D fp8; 224<D<768: split-D M8N1 fp8;
         // D>=768: split-D M4N2 fp8. Same D<768/D>=768 cross-point as the
         // fp16 dispatch (M4N2 wins only for D>=768; below that M8N1 is

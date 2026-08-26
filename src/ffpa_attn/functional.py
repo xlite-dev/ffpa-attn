@@ -72,6 +72,14 @@ _PV_ACC_CODE = {"f16": _PV_ACC_F16, "f32": _PV_ACC_F32}
 _QK_MM_FP8 = 0
 _QK_MM_INT8 = 1
 _QK_MM_TYPE_CODE = {"fp8": _QK_MM_FP8, "int8": _QK_MM_INT8}
+# FP4 PV MMA dtype encoding (kept in sync with cute/launch.cuh).
+_FP4_PV_MM_NVFP4 = 0
+_FP4_PV_MM_MXFP8 = 1
+_FP4_PV_MM_CODE = {"fp4": _FP4_PV_MM_NVFP4, "fp8": _FP4_PV_MM_MXFP8}
+# Tensor layout encoding (kept in sync with cuda/__init__.py::_fwd_cuda).
+_LAYOUT_NHD = 0
+_LAYOUT_HND = 1
+_TENSOR_LAYOUT_CODE = {"NHD": _LAYOUT_NHD, "HND": _LAYOUT_HND}
 _ATEN_SMALL_HEAD_DIM_MAX = 256
 _FFPA_SMALL_HEAD_DIM_MIN = 64
 
@@ -169,8 +177,7 @@ def _ffpa_attn_forward(
   is_causal: bool,
   scale: float | None,
   enable_gqa: bool,
-  fm: CUDABackend,
-  tensor_layout: str = "HND",
+  forward_backend: CUDABackend,
 ) -> torch.Tensor | None:
   """Inference-only forward: run the CUDA op directly, skipping meta
   validation and the autograd Function wrapper.
@@ -180,77 +187,65 @@ def _ffpa_attn_forward(
 
   Returns ``None`` when the config needs the full :func:`ffpa_attn_func`
   chain (grad mode on, small-D SDPA routing, ``D > 1024``, ``Nq < 512``,
-  ``Nkv < 512``, bf16 with ``acc='f16'``, or ``tensor_layout='NHD'`` on a
-  non-fp8-persist-D path). The caller is responsible for pre-validated
-  packed inputs (BHND fp16/bf16, or NHD when ``tensor_layout='NHD'``).
+  ``Nkv < 512``, bf16 with ``acc='f16'``, or
+  ``forward_backend.tensor_layout='NHD'`` on a non-persist-D path). The
+  caller is responsible for pre-validated packed inputs (BHND fp16/bf16,
+  or NHD when ``forward_backend.tensor_layout='NHD'``).
 
   :param enable_gqa: Unused by the CUDA kernel (GQA head grouping is
       native); accepted for signature compatibility with future
       Triton / CuTeDSL fast paths.
   """
-  nhd = tensor_layout == "NHD"
+  nhd = forward_backend.tensor_layout == "NHD"
   if nhd:
-    # NHD output packing is implemented by the fp8 persist-D CUDA kernel
-    # only (runtime store-layout branch); every other impl/hint combination
-    # must take the full chain. The hybrid stage-1 slice is BHND-only, so
-    # decline exactly the configs C++ would route into it (fp8_hybrid may
-    # still be None; the resolution below maps causal to True).
-    if (
-      _ffpa_attn_forward_cuda is None or torch.is_grad_enabled()
-      or fm.fp8_hadamard or fm.fp4_hybrid or fm.fp4_hadamard
-      or not fm.enable_fp8 or (
-        fm.enable_fp8 and
-        (fm.fp8_hybrid or (fm.fp8_hybrid is None and is_causal))
-        and query.size(1) >= (fm.fp8_hybrid_n_early or 256)
-      )
-    ):
+    if not forward_backend.is_nhd_supported(query.size(-1)):
       return None
     nq, nkv = query.size(1), key.size(1)
   else:
     nq, nkv = query.size(2), key.size(2)
   if (
     _ffpa_attn_forward_cuda is None or torch.is_grad_enabled()
-    or query.dtype is torch.bfloat16 and fm.acc == "f16"
-    or _should_use_aten_small_d_forward(fm, query.size(-1))
+    or query.dtype is torch.bfloat16 and forward_backend.acc == "f16"
+    or _should_use_aten_small_d_forward(forward_backend, query.size(-1))
     or query.size(-1) > 1024 or 8 <= nq < 512 or nkv < 512
   ):
     return None
   # Same in-place resolution normalize_inputs would perform (idempotent).
-  fm.is_causal = is_causal
-  if fm.fp8_hybrid is None:
-    fm.fp8_hybrid = bool(fm.enable_fp8 and is_causal)
-  if fm.fp4_hybrid is None:
-    fm.fp4_hybrid = bool(fm.enable_fp4 and is_causal)
-  _apply_cuda_backend_hint(fm)
+  forward_backend.is_causal = is_causal
+  if forward_backend.fp8_hybrid is None:
+    forward_backend.fp8_hybrid = bool(forward_backend.enable_fp8 and is_causal)
+  if forward_backend.fp4_hybrid is None:
+    forward_backend.fp4_hybrid = bool(forward_backend.enable_fp4 and is_causal)
+  _apply_cuda_backend_hint(forward_backend)
   O, _ = _ffpa_attn_forward_cuda(
     query,
     key,
     value,
     None,
     None,
-    fm.stages,
-    fm.acc_code,
+    forward_backend.stages,
+    forward_backend.acc_code,
     int(is_causal),
     1.0 / math.sqrt(query.size(-1)) if scale is None else float(scale),
     0.0,
     0,
     0,
-    fm.fp8_smooth_k,
-    fm.fp8_smooth_v,
-    fm.fp8_q_quant_method_code,
-    fm.fp8_k_quant_method_code,
-    fm.fp8_v_quant_method_code,
-    fm.fp8_pv_acc_code,
-    fm.fp8_qk_mm_type_code,
-    fm.fp8_hybrid,
-    fm.fp8_hybrid_n_early,
-    fm.fp4_hybrid,
-    fm.fp4_hybrid_n_early,
-    fm.fp8_hadamard,
-    fm.fp4_hadamard,
-    1 if fm.fp4_pv_mm_type == "fp8" else 0,
-    fm.fp4_smooth_v,
-    0 if nhd else 1,
+    forward_backend.fp8_smooth_k,
+    forward_backend.fp8_smooth_v,
+    forward_backend.fp8_q_quant_method_code,
+    forward_backend.fp8_k_quant_method_code,
+    forward_backend.fp8_v_quant_method_code,
+    forward_backend.fp8_pv_acc_code,
+    forward_backend.fp8_qk_mm_type_code,
+    forward_backend.fp8_hybrid,
+    forward_backend.fp8_hybrid_n_early,
+    forward_backend.fp4_hybrid,
+    forward_backend.fp4_hybrid_n_early,
+    forward_backend.fp8_hadamard,
+    forward_backend.fp4_hadamard,
+    forward_backend.fp4_pv_mm_type_code,
+    forward_backend.fp4_smooth_v,
+    forward_backend.tensor_layout_code,
   )
   return O
 
@@ -377,6 +372,11 @@ class CUDABackend(Backend):
   :ivar fp4_smooth_v: FP4 only (persist_d, D<=256): subtract the
       per-(b,hkv) V column mean before V quantize; the kernel epilogue adds
       it back (softmax rows sum to 1).
+  :ivar tensor_layout: Storage layout of Q/K/V inputs and the returned O:
+      ``"HND"`` (default) for BHND packed ``[B, H, N, D]`` tensors, or
+      ``"NHD"`` for diffusers-style ``[B, N, H, D]`` packed storage (output
+      follows the input layout). NHD is implemented by the persist-D sm120
+      CUDA kernels (fp8 / fp16 / fp4) on the inference fast path only.
   :ivar is_causal: Runtime flag propagated from
       ``ffpa_attn_func(is_causal=...)`` by ``normalize_inputs``; drives the
       hybrid auto-resolve. Not a user constructor argument.
@@ -427,6 +427,12 @@ class CUDABackend(Backend):
   # sub_qm/sub_km quantize + delta_s/lse exact corrections are hardwired in
   # the fp4 kernels). fp4_smooth_v only adds the missing V side.
   fp4_smooth_v: bool = False
+  # Storage layout of Q/K/V inputs and the returned O: "HND" (default) for
+  # BHND packed [B, H, N, D] tensors, or "NHD" for diffusers-style
+  # [B, N, H, D] packed storage (output follows the input layout). NHD is
+  # implemented by the persist-D sm120 CUDA kernels only (fp8 / fp16 / fp4)
+  # on the inference fast path.
+  tensor_layout: str = "HND"
   # Runtime: propagated from ffpa_attn_func(is_causal=...) by normalize_inputs.
   is_causal: bool = False
 
@@ -480,6 +486,9 @@ class CUDABackend(Backend):
     assert not self.fp4_smooth_v or self.enable_fp4, (
       "fp4_smooth_v requires enable_fp4"
     )
+    assert self.tensor_layout in ("HND", "NHD"), (
+      f"tensor_layout must be 'HND' or 'NHD', got {self.tensor_layout!r}"
+    )
     self._resolve_impl_defaults()
     self.stages = self._default_cuda_stages(
     ) if self.stages is None else self.stages
@@ -532,9 +541,21 @@ class CUDABackend(Backend):
   def fp8_qk_mm_type_code(self) -> int:
     return _QK_MM_TYPE_CODE[self.fp8_qk_mm_type]
 
+  @property
+  def fp4_pv_mm_type_code(self) -> int:
+    return _FP4_PV_MM_CODE[self.fp4_pv_mm_type]
+
+  @property
+  def tensor_layout_code(self) -> int:
+    return _TENSOR_LAYOUT_CODE[self.tensor_layout]
+
   def _default_cuda_stages(self) -> int:
     from .cuda import CudaBackendImpl
     """Default pipeline depth for CUDA backend (non-TMA path)."""
+    if self.impl_hint in (
+      CudaBackendImpl.CUTE_TMA_FP8, CudaBackendImpl.CUTE_TMA_FP4
+    ):
+      return 2  # fp8/fp4 persist-D sm120 path (smem budget caps stages)
     if _is_hopper_or_later():
       if self.impl_hint in (CudaBackendImpl.NATIVE, CudaBackendImpl.TMA):
         return 4  # sm>=90, native or TMA path
@@ -547,6 +568,10 @@ class CUDABackend(Backend):
   @property
   def impl_hint(self) -> int:
     from .cuda import CudaBackendImpl
+    if self.enable_fp4:
+      return CudaBackendImpl.CUTE_TMA_FP4
+    if self.enable_fp8:
+      return CudaBackendImpl.CUTE_TMA_FP8
     if self.enable_tma and self.enable_cute:
       return CudaBackendImpl.CUTE_TMA
     if self.enable_tma:
@@ -554,6 +579,32 @@ class CUDABackend(Backend):
     if self.enable_cute:
       return CudaBackendImpl.CUTE
     return CudaBackendImpl.NATIVE
+
+  def is_nhd_supported(self, headdim: int) -> bool:
+    """Whether the persist-D NHD fast path applies for this config.
+
+    NHD requires the CUTE_TMA path (native / TMA / CUTE keep a static
+    BHND gO); fp8/fp4 always dispatch there, so only the fp16 family
+    checks the impl flags. The head_dim caps follow the persist-D
+    coverage (fp8 <= 224, fp4 <= 256, fp16 <= 128): the split-D/M4N2
+    ranges beyond them have no NHD O store. Hybrid and hadamard are
+    both fine: the hybrid stage-1 writeback is a stride-generic
+    ``O.slice(...).copy_`` (stage-2 already offsets NHD rows by
+    ``q_start_row``), and the hadamard WHT materializes BHND copies of
+    NHD Q/K/V inside the launcher (the fp4 fused path stays zero-copy).
+    The C++ TORCH_CHECK guards stay as the backstop.
+
+    :param headdim: Head dimension of Q/K/V.
+    :returns: Whether NHD inputs/outputs can take the fast path.
+    """
+    if self.enable_fp4:
+      return headdim <= 256
+    if self.enable_fp8:
+      return headdim <= 224
+    # NHD output packing only exists in the CUTE_TMA persist-D kernel; the
+    # native / TMA / CUTE paths keep a static BHND gO (fp8/fp4 always
+    # dispatch to CUTE_TMA, so only the fp16 family needs the check).
+    return headdim <= 128 and self.enable_tma and self.enable_cute
 
 
 @dataclass
@@ -1206,7 +1257,7 @@ class _FFPAAttnFunc(torch.autograd.Function):
         forward_meta.fp4_hybrid_n_early,
         forward_meta.fp8_hadamard,
         forward_meta.fp4_hadamard,
-        1 if forward_meta.fp4_pv_mm_type == "fp8" else 0,
+        forward_meta.fp4_pv_mm_type_code,
         forward_meta.fp4_smooth_v,
       )
     elif isinstance(meta.forward_meta, TritonBackend):
