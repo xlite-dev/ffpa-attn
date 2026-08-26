@@ -349,18 +349,9 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp4_sm120(
         // k_full/v_full of one stage per kv_tile), so the counters must
         // not interleave.
         const int g0 = g;
-        for (int s = 0; s < kStages - 1; ++s) {
-          if (s < Tc_eff) {
-            const int seq = g0 + s;
-            const int stage = seq % kStages;
-            const int phase = (seq / kStages) & 1;
-            CtaBarrier::wait(&k_empty[stage], phase);
-            TmaBarrier::arrive_and_expect_tx(&k_full[stage], Traits::kTxBytesK);
-            copy(tma_k.with(k_full[stage]), tKgK(_, s), tKsK(_, stage));
-            copy(tma_sfk.with(k_full[stage]), tKgSFK(_, s), tKsSFK(_, stage));
-            copy(tma_ds.with(k_full[stage]), tDSgDS(_, s), tDSsDS(_, stage));
-          }
-        }
+        // V prologue before K: V0 is only consumed after QK0 + softmax, so
+        // issuing it first is always safe (mirrors fp8 persist_d; the steady
+        // state below already issues V ahead of K).
         for (int s = 0; s < kStages - 1; ++s) {
           if (s < Tc_eff) {
             const int seq = g0 + s;
@@ -371,6 +362,18 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp4_sm120(
             copy(tma_v.with(v_full[stage]), tVgV(_, s), tVsV(_, stage));
             copy(tma_sfvt.with(v_full[stage]), tVgSFVt(_, s),
                  tVsSFVt(_, stage));
+          }
+        }
+        for (int s = 0; s < kStages - 1; ++s) {
+          if (s < Tc_eff) {
+            const int seq = g0 + s;
+            const int stage = seq % kStages;
+            const int phase = (seq / kStages) & 1;
+            CtaBarrier::wait(&k_empty[stage], phase);
+            TmaBarrier::arrive_and_expect_tx(&k_full[stage], Traits::kTxBytesK);
+            copy(tma_k.with(k_full[stage]), tKgK(_, s), tKsK(_, stage));
+            copy(tma_sfk.with(k_full[stage]), tKgSFK(_, s), tKsSFK(_, stage));
+            copy(tma_ds.with(k_full[stage]), tDSgDS(_, s), tDSsDS(_, stage));
           }
         }
         for (int tile = 0; tile < Tc_eff; ++tile) {
