@@ -67,7 +67,7 @@ if FFPA_BENCH_FP8_FORCE_QK_INT8:
 # default off: Sage has no equivalent stage). Same-basis comparison against
 # Sage's native per-thread/per-channel kernels.
 PRESETS = (
-  "default", "int8", "cachedit", "cache_dit", "cache-dit", "pre-thread"
+  "default", "int8", "cachedit", "cache_dit", "cache-dit", "per-thread"
 )
 
 PLOT_OUTPUT_DIR = Path(__file__).resolve().parent / ".tmp"
@@ -100,25 +100,8 @@ def fp8_backend(
   nhd: bool = False
 ) -> CUDABackend:
   layout = "NHD" if nhd else "HND"
-  if preset == "int8" or (preset == "default" and _is_5090_or_force_int8()):
-    # 5090 default / explicit int8 preset: int8 QK matmul, f16 PV acc.
-    return CUDABackend(
-      backward=False,
-      enable_tma=True,
-      enable_cute=True,
-      enable_fp8=True,
-      fp8_qk_mm_type="int8",
-      fp8_pv_acc_type="f16",
-      fp8_q_quant_method="per_thread",
-      fp8_k_quant_method="per_thread",
-      fp8_v_quant_method="per_channel",
-      fp8_smooth_k=True,
-      fp8_smooth_v=False,
-      fp8_hybrid=hybrid,
-      tensor_layout=layout,
-    )
   # Same as default, but with per-thread Q/K + per-channel V + smooth k on 5090.
-  if preset in ("cachedit", "cache_dit", "cache-dit", "pre-thread"):
+  if preset in ("cachedit", "cache_dit", "cache-dit", "per-thread"):
     return CUDABackend(
       backward=False,
       enable_tma=True,
@@ -135,12 +118,18 @@ def fp8_backend(
       fp8_hybrid_n_early=256,
       tensor_layout=layout,
     )
-  # default: FP8 Q/K matmul fp8, P/V accumulate f32
   return CUDABackend(
     backward=False,
     enable_tma=True,
     enable_cute=True,
     enable_fp8=True,
+    fp8_qk_mm_type="int8",
+    fp8_pv_acc_type="f16",
+    fp8_q_quant_method="per_thread",
+    fp8_k_quant_method="per_thread",
+    fp8_v_quant_method="per_channel",
+    fp8_smooth_k=True,
+    fp8_smooth_v=False,
     fp8_hybrid=hybrid,
     tensor_layout=layout,
   )
