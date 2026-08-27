@@ -177,6 +177,7 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp4_sm120(
   constexpr int kOffSFVt = Traits::kOffSFVt;
   constexpr int kSmemBytes = Traits::kSmemBytes;
   (void)kSmemBytes;
+  constexpr bool kQSmemReuse = Traits::kQSmemReuse;
 
   const int group_size = Nh / Nh_kv;
   const int tid = threadIdx.x;
@@ -197,6 +198,9 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp4_sm120(
   //   k_empty[s]   consumer->producer "stage s consumed", 256 arrivals
   //   v_full[s]    TMA tx barrier, V^T+SFVt of kv-tile stage s (kTxBytesV)
   //   v_empty[s]   consumer->producer, 256 arrivals (the gemm_rs_fp4 tail)
+  //   q_consumed   consumer->producer: Q/SFQ s2r and the lse dot are done,
+  //                so the V slot aliasing the Q region may be written; only
+  //                used on works with Tc_eff >= kStages (kQSmemReuse).
   //   epilogue_done consumer->producer WAR fence: the O staging tile
   //                aliases q_base, so the next work's Q TMA must wait for
   //                the previous epilogue (r2s + TMA store + lse readback)
@@ -207,6 +211,7 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp4_sm120(
   __shared__ uint64_t v_full[kStages];
   __shared__ uint64_t v_empty[kStages];
   __shared__ uint64_t epilogue_done;
+  __shared__ uint64_t q_consumed;
 
   if (tid == 0) {
     TmaBarrier::init(&q_full, 1);
@@ -217,6 +222,7 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp4_sm120(
       CtaBarrier::init(&v_empty[s], kConsumerThreads);
     }
     CtaBarrier::init(&epilogue_done, kConsumerThreads);
+    CtaBarrier::init(&q_consumed, kConsumerThreads);
   }
   __syncthreads();
 
@@ -266,6 +272,11 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp4_sm120(
           make_tensor(make_smem_ptr<ElementPV>(shm + kOffV), SmemLayoutVt{});
       auto sSFVt = make_tensor(make_smem_ptr<ElementSFV>(shm + kOffSFVt),
                                SmemLayoutSFVt{});
+      // V stage slot 0 aliases the Q+SFQ region under kQSmemReuse.
+      auto sV0 = make_tensor(make_smem_ptr<ElementPV>(shm + kOffQ),
+                             typename Traits::SmemLayoutVt0{});
+      auto sSFVt0 = make_tensor(make_smem_ptr<ElementSFV>(shm + kOffSFQ),
+                                typename Traits::SmemLayoutSFVt0{});
 
       auto tQsQ = q_slice.partition_D(sQ);
       auto tQsSFQ = sfq_slice.partition_D(sSFQ);
@@ -273,6 +284,8 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp4_sm120(
       auto tKsSFK = group_modes<0, 3>(sfk_slice.partition_D(sSFK));
       auto tVsV = group_modes<0, 3>(v_slice.partition_D(sV));
       auto tVsSFVt = group_modes<0, 3>(sfvt_slice.partition_D(sSFVt));
+      auto tVsV0 = group_modes<0, 3>(v_slice.partition_D(sV0));
+      auto tVsSFVt0 = group_modes<0, 3>(sfvt_slice.partition_D(sSFVt0));
       auto tDSsDS = group_modes<0, 3>(ds_slice.partition_D(sDS));
 
       // Global kv-tile counter: stage/phase across works come from it, so
@@ -280,6 +293,7 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp4_sm120(
       // live barrier is UB, PTX ISA 9.7.13.15.9).
       int g = 0;
       int w = 0;
+      int wl = 0;  // long-work (Tc_eff >= kStages) count for q_consumed phase
       for (int work_id = blockIdx.x; work_id < total_work;
            work_id += gridDim.x, ++w) {
         // work_id -> (b, h, Q_tile): bh-outer / Q-tile-inner, so consecutive
@@ -359,9 +373,17 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp4_sm120(
             const int phase = (seq / kStages) & 1;
             CtaBarrier::wait(&v_empty[stage], phase);
             TmaBarrier::arrive_and_expect_tx(&v_full[stage], Traits::kTxBytesV);
-            copy(tma_v.with(v_full[stage]), tVgV(_, s), tVsV(_, stage));
-            copy(tma_sfvt.with(v_full[stage]), tVgSFVt(_, s),
-                 tVsSFVt(_, stage));
+            const int vslot = kQSmemReuse ? (s + 1) % kStages : stage;
+            if (kQSmemReuse && vslot == 0) {
+              copy(tma_v.with(v_full[stage]), tVgV(_, s), tVsV0(_, _0{}));
+              copy(tma_sfvt.with(v_full[stage]), tVgSFVt(_, s),
+                   tVsSFVt0(_, _0{}));
+            } else {
+              copy(tma_v.with(v_full[stage]), tVgV(_, s),
+                   tVsV(_, kQSmemReuse ? vslot - 1 : stage));
+              copy(tma_sfvt.with(v_full[stage]), tVgSFVt(_, s),
+                   tVsSFVt(_, kQSmemReuse ? vslot - 1 : stage));
+            }
           }
         }
         for (int s = 0; s < kStages - 1; ++s) {
@@ -376,6 +398,10 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp4_sm120(
             copy(tma_ds.with(k_full[stage]), tDSgDS(_, s), tDSsDS(_, stage));
           }
         }
+        // The first slot-0 (Q-region alias) write lands at steady tile 0;
+        // wait for the consumer's Q/SFQ s2r + lse dot first.
+        if (kQSmemReuse && Tc_eff >= kStages)
+          CtaBarrier::wait(&q_consumed, wl & 1);
         for (int tile = 0; tile < Tc_eff; ++tile) {
           {
             const int v_tile = tile + kStages - 1;
@@ -383,12 +409,21 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp4_sm120(
               const int seq = g0 + v_tile;
               const int stage = seq % kStages;
               const int phase = (seq / kStages) & 1;
+              const int vslot = kQSmemReuse ? (v_tile + 1) % kStages : stage;
               CtaBarrier::wait(&v_empty[stage], phase);
               TmaBarrier::arrive_and_expect_tx(&v_full[stage],
                                                Traits::kTxBytesV);
-              copy(tma_v.with(v_full[stage]), tVgV(_, v_tile), tVsV(_, stage));
-              copy(tma_sfvt.with(v_full[stage]), tVgSFVt(_, v_tile),
-                   tVsSFVt(_, stage));
+              if (kQSmemReuse && vslot == 0) {
+                copy(tma_v.with(v_full[stage]), tVgV(_, v_tile),
+                     tVsV0(_, _0{}));
+                copy(tma_sfvt.with(v_full[stage]), tVgSFVt(_, v_tile),
+                     tVsSFVt0(_, _0{}));
+              } else {
+                copy(tma_v.with(v_full[stage]), tVgV(_, v_tile),
+                     tVsV(_, kQSmemReuse ? vslot - 1 : stage));
+                copy(tma_sfvt.with(v_full[stage]), tVgSFVt(_, v_tile),
+                     tVsSFVt(_, kQSmemReuse ? vslot - 1 : stage));
+              }
             }
           }
           {
@@ -409,6 +444,8 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp4_sm120(
           }
         }
         g += Tc_eff;
+        if (kQSmemReuse && Tc_eff >= kStages)
+          ++wl;
       }
     }
     return;
@@ -502,6 +539,15 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp4_sm120(
   auto smem_thr_copy_SFV = smem_tiled_copy_SFV.get_thread_slice(wg_tid);
   Tensor tOsSFVt = smem_thr_copy_SFV.partition_S(
       as_position_independent_swizzle_tensor(sSFVt));
+  // Alias views for the V stage slot resident in the Q+SFQ region.
+  auto sV0 = make_tensor(make_smem_ptr<ElementPV>(shm + kOffQ),
+                         typename Traits::SmemLayoutVt0{});
+  auto sSFVt0 = make_tensor(make_smem_ptr<ElementSFV>(shm + kOffSFQ),
+                            typename Traits::SmemLayoutSFVt0{});
+  auto tOsVt0 =
+      smem_thr_copy_V.partition_S(as_position_independent_swizzle_tensor(sV0));
+  auto tOsSFVt0 = smem_thr_copy_SFV.partition_S(
+      as_position_independent_swizzle_tensor(sSFVt0));
 
   // The QK accumulator fragment is viewed through THREE layouts, each
   // matching one consumer:
@@ -574,6 +620,7 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp4_sm120(
 
   int g = 0;
   int w = 0;
+  int wl = 0;  // mirrors the producer's long-work count (q_consumed phase)
   for (int work_id = blockIdx.x; work_id < total_work;
        work_id += gridDim.x, ++w) {
     const int kv_offset = Nkv - Nq;
@@ -599,12 +646,32 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp4_sm120(
       TmaBarrier::wait(&q_full, w & 1);
       cutlass::arch::fence_view_async_shared();
     }
-    // Q/SFQ are per-work constants: load the mma fragments once here, not
-    // inside the kv_tile loop. Without this the A/SFA asm operands are
-    // uninitialized and cicc folds them to 0: QK degenerates to delta_s
-    // (rank-1 mean attention), which the probe tolerances masked.
+    // Q register persistence (the fp8 kPersistQs2r equivalent, always on
+    // here): Q/SFQ are per-work constants, s2r'd once into tSrQ/tSrSFQ and
+    // kept in registers across the kv loop; gemm_ss_fp4 below consumes them
+    // as its A-side register operands and never re-reads Q smem per tile.
+    // Historical bug: without this the A/SFA asm operands are uninitialized
+    // and cicc folds them to 0, degenerating QK to delta_s (rank-1 mean
+    // attention), which the probe tolerances masked.
     copy(smem_tiled_copy_Q, tSsQ, tSrQ_copy_view);
     copy(smem_tiled_copy_SFQ, tSsSFQ, tSrSFQ_copy_view);
+
+    // lse dot lives ahead of the kv loop: with kQSmemReuse the V slot
+    // aliasing q_base would otherwise overwrite sQ mid-loop.
+    float qkm[kSRows];
+    const bool smooth_lse =
+        (softmax_lse != nullptr) && (km != nullptr) && (qm != nullptr);
+    if (smooth_lse) {
+      const float* km_bh = km + static_cast<long>(kv_bh) * kHeadDim;
+      const long qm_mb = Nq_pad / kBr;
+      const float* qm_blk =
+          qm + (static_cast<long>(q_bh) * qm_mb + q_tile_abs) * kHeadDim;
+      lse_qkm_dot<kHeadDim, kSRows>(sQ, sSFQ, tScS_rc, km_bh, qm_blk, qkm);
+    }
+    if (kQSmemReuse && Tc_eff >= kStages) {
+      CtaBarrier::arrive(&q_consumed);
+      ++wl;
+    }
 
     clear(tOrO_store);
 
@@ -614,6 +681,10 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp4_sm120(
       const int k_phase = (g / kStages) & 1;
       const int v_stg = k_stg;
       const int v_phase = k_phase;
+      // Slot rotation keyed on the work-local tile index; barriers stay on
+      // the global sequence (v_stg), smem index remapped via v_mem.
+      const int v_slot = kQSmemReuse ? (kv_tile + 1) % kStages : k_stg;
+      const int v_mem = kQSmemReuse ? (v_slot == 0 ? 0 : v_slot - 1) : k_stg;
 
       TmaBarrier::wait(&k_full[k_stg], k_phase);
       cutlass::arch::fence_view_async_shared();
@@ -677,16 +748,29 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp4_sm120(
       cutlass::arch::fence_view_async_shared();
 
       auto gemm_rs_pv = [&](auto& tgt) {
-        if constexpr (kPvMxfp8)
+        if (kQSmemReuse && v_slot == 0) {
+          if constexpr (kPvMxfp8)
+            gemm_rs_mxfp8(tgt, tOrP, tOrSFP, tOrVt, tOrSFVt, tOsVt0, tOsSFVt0,
+                          tiled_mma_pv, smem_tiled_copy_V, smem_thr_copy_V,
+                          smem_tiled_copy_SFV, smem_thr_copy_SFV, AbsMaxP,
+                          tSrS_reduction_view, v_empty, v_stg, wg_tid & 31, 0);
+          else
+            gemm_rs_fp4(tgt, tOrP, tOrSFP, tOrVt, tOrSFVt, tOsVt0, tOsSFVt0,
+                        tiled_mma_pv, smem_tiled_copy_V, smem_thr_copy_V,
+                        smem_tiled_copy_SFV, smem_thr_copy_SFV, AbsMaxP,
+                        tSrS_conversion_view, v_empty, v_stg, 0);
+        } else if constexpr (kPvMxfp8) {
           gemm_rs_mxfp8(tgt, tOrP, tOrSFP, tOrVt, tOrSFVt, tOsVt, tOsSFVt,
                         tiled_mma_pv, smem_tiled_copy_V, smem_thr_copy_V,
                         smem_tiled_copy_SFV, smem_thr_copy_SFV, AbsMaxP,
-                        tSrS_reduction_view, v_empty, v_stg, wg_tid & 31);
-        else
+                        tSrS_reduction_view, v_empty, v_stg, wg_tid & 31,
+                        v_mem);
+        } else {
           gemm_rs_fp4(tgt, tOrP, tOrSFP, tOrVt, tOrSFVt, tOsVt, tOsSFVt,
                       tiled_mma_pv, smem_tiled_copy_V, smem_thr_copy_V,
                       smem_tiled_copy_SFV, smem_thr_copy_SFV, AbsMaxP,
-                      tSrS_conversion_view, v_empty, v_stg);
+                      tSrS_conversion_view, v_empty, v_stg, v_mem);
+        }
       };
 
       if (kv_tile == 0) {
@@ -747,32 +831,10 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp4_sm120(
         tOrO_store(i) += vm_bh[cute::get<1>(tOcO_vm(i))];
     }
 
-    // Epilogue, four ordered steps (the O staging tile aliases the Q smem,
-    // which drives the ordering):
-    //   1. lse correction (optional): lse_qkm_dot reads sQ/sSFQ back from
-    //      smem - must run BEFORE O staging overwrites q_base.
-    //   2. f32 -> ElementO convert of the PV accumulator.
-    //   3a. full Q tile: STSM r2s into the staged O tile + one TMA store
-    //       (coalesced, swizzle-matched descriptor).
-    //   3b. tail Q tile (Br_base+kBr > Nq): the flattened [total_q_rows, D]
-    //       TMA space would alias the next head's rows, so store R->G with a
-    //       row guard instead.
-    //   4. lse write (P2-domain formula + the smooth-K correction).
-    float qkm[kSRows];
-    const bool smooth_lse =
-        (softmax_lse != nullptr) && (km != nullptr) && (qm != nullptr);
     {
+      // WAR fence: every PV read of sV (incl. the slot aliasing q_base) and
+      // the lse dot (now ahead of the loop) are done before O staging.
       cutlass::arch::NamedBarrier::sync(kConsumerThreads, 0);
-
-      if (smooth_lse) {
-        const float* km_bh = km + static_cast<long>(kv_bh) * kHeadDim;
-        const long qm_mb = Nq_pad / kBr;
-        const float* qm_blk =
-            qm + (static_cast<long>(q_bh) * qm_mb + q_tile_abs) * kHeadDim;
-        lse_qkm_dot<kHeadDim, kSRows>(sQ, sSFQ, tScS_rc, km_bh, qm_blk, qkm);
-        // lse_qkm_dot reads sQ/sSFQ; the O staging below overwrites that smem.
-        cutlass::arch::NamedBarrier::sync(kConsumerThreads, 0);
-      }
 
       auto tCrOHalf = ffpa_cute::convert_type<ElementO>(tOrO_store);
 
