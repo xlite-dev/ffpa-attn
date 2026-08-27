@@ -39,15 +39,59 @@ static inline bool ffpa_is_nhd_view(const torch::Tensor& X) {
          X.stride(1) == D && (B <= 1 || X.stride(0) == N * H * D);
 }
 
+// BHND-packed detection: contiguous [B, H, N, D] strides.
+static inline bool ffpa_is_bhnd_packed(const torch::Tensor& X) {
+  const long B = X.size(0), H = X.size(1), N = X.size(2), D = X.size(3);
+  return X.dim() == 4 && X.stride(3) == 1 && X.stride(2) == D &&
+         X.stride(1) == N * D && X.stride(0) == H * N * D;
+}
+
+// Strided-NHD predicate: an NHD-family [B, H, N, D] view whose row stride
+// exceeds H*D (fused-QKV interleaved chunk layouts) — neither BHND-packed
+// nor a packed-NHD permute view. stride(2) >= H*D excludes negative strides
+// and head-overlapping rows; stride(0) > 0 excludes reversed batches
+// (negative strides can still be %16-aligned).
+static inline bool ffpa_is_strided_nhd(const torch::Tensor& X) {
+  const long B = X.size(0), H = X.size(1), N = X.size(2), D = X.size(3);
+  return X.dim() == 4 && X.stride(3) == 1 && X.stride(1) == D &&
+         X.stride(2) >= H * D && !ffpa_is_nhd_view(X) &&
+         (B <= 1 || (X.stride(0) == X.stride(2) * N && X.stride(0) > 0));
+}
+
+// TMA consumers need 16B alignment on the base pointer and both row/batch
+// strides of a strided-NHD input.
+static inline void ffpa_check_strided_nhd_aligned(const torch::Tensor& X,
+                                                  const char* name) {
+  const long es = X.element_size();
+  TORCH_CHECK(reinterpret_cast<uintptr_t>(X.data_ptr()) % 16 == 0 &&
+                  (X.stride(2) * es) % 16 == 0 && (X.stride(0) * es) % 16 == 0,
+              "ffpa_attn: strided NHD ", name,
+              " requires a 16B-aligned data_ptr and 16B-aligned row/batch "
+              "strides (elemsize ",
+              es, ", strides ", X.stride(0), ",", X.stride(1), ",", X.stride(2),
+              ",1)");
+}
+
 // Fp8InputLayout from a [B, H, N, D] tensor's strides. Accepts BHND-packed
-// and NHD-view; anything else (arbitrary strides) is rejected.
-static inline ffpa_fp8::Fp8InputLayout ffpa_layout_of(const torch::Tensor& X,
-                                                      long N, long D) {
+// and NHD-view; anything else (arbitrary strides) is rejected unless
+// allow_strided_rows (persist-D opt-in): NHD-family views whose row stride
+// exceeds H*D (fused-QKV chunk layouts, e.g. FLUX.2 single-stream V) are
+// also accepted — the pre-kernels address rows through s_row, so any
+// 16B-aligned positive row/batch stride is legal. Split-D/M4N2 keep the
+// default strict gate.
+static inline ffpa_fp8::Fp8InputLayout ffpa_layout_of(
+    const torch::Tensor& X, long N, long D, bool allow_strided_rows = false) {
   const long B = X.size(0), H = X.size(1);
   TORCH_CHECK(X.dim() == 4 && X.stride(3) == 1,
               "ffpa_attn: Q/K/V must be 4-D with unit stride along D");
   if (ffpa_is_nhd_view(X))
     return {true, static_cast<int>(H), N * H * D, D, H * D};
+  if (allow_strided_rows && ffpa_is_strided_nhd(X)) {
+    ffpa_check_strided_nhd_aligned(X, "input");
+    const long s_row = X.stride(2);
+    const long s_batch = (B <= 1) ? N * s_row : X.stride(0);
+    return {true, static_cast<int>(H), s_batch, D, s_row};
+  }
   TORCH_CHECK(
       X.stride(2) == D && X.stride(1) == N * D && X.stride(0) == H * N * D,
       "ffpa_attn: Q/K/V must be BHND-contiguous or an NHD (BNHD) "
@@ -610,14 +654,30 @@ void launch_cute_fwd_persist_d_sm120(torch::Tensor Q, torch::Tensor K,
           : make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(O.data_ptr())),
                         make_shape((int64_t)total_q_rows, (int64_t)kHeadDim),
                         make_stride((int64_t)kHeadDim, _1{}));
-  const bool q_nhd = ffpa_is_nhd_view(Q);
+  // Per-tensor layout families: BHND-packed, packed-NHD view, or
+  // strided-NHD (fused-QKV interleaved chunk rows, e.g. FLUX.2
+  // single-stream V). K and V must belong to the same family (the
+  // kernel's NHD batch/row domain-offset logic is shared), but their row
+  // strides may differ.
+  const bool q_nhd = ffpa_is_nhd_view(Q) || ffpa_is_strided_nhd(Q);
+  if (ffpa_is_strided_nhd(Q))
+    ffpa_check_strided_nhd_aligned(Q, "Q");
   if (!q_nhd) {
     TORCH_CHECK(Q.stride(3) == 1 && Q.stride(2) == (long)kHeadDim &&
                     Q.stride(1) == (long)Nq * kHeadDim &&
                     Q.stride(0) == (long)Nh * Nq * kHeadDim,
                 "ffpa_attn: Q must be BHND-contiguous or an NHD (BNHD) view");
   }
-  const bool kv_nhd = ffpa_is_nhd_view(K);
+  const bool k_nhd = ffpa_is_nhd_view(K) || ffpa_is_strided_nhd(K);
+  const bool v_nhd = ffpa_is_nhd_view(V) || ffpa_is_strided_nhd(V);
+  TORCH_CHECK(k_nhd == v_nhd,
+              "ffpa_attn: K and V must share the same memory layout family "
+              "(BHND-packed or NHD)");
+  if (ffpa_is_strided_nhd(K))
+    ffpa_check_strided_nhd_aligned(K, "K");
+  if (ffpa_is_strided_nhd(V))
+    ffpa_check_strided_nhd_aligned(V, "V");
+  const bool kv_nhd = k_nhd;
   if (!kv_nhd) {
     TORCH_CHECK(K.stride(3) == 1 && K.stride(2) == (long)kHeadDim &&
                     K.stride(1) == (long)Nkv * kHeadDim &&
@@ -627,9 +687,6 @@ void launch_cute_fwd_persist_d_sm120(torch::Tensor Q, torch::Tensor K,
                     V.stride(1) == (long)Nkv * kHeadDim &&
                     V.stride(0) == (long)Nh_kv * Nkv * kHeadDim,
                 "ffpa_attn: V must be BHND-contiguous or an NHD (BNHD) view");
-  } else {
-    TORCH_CHECK(ffpa_is_nhd_view(V),
-                "ffpa_attn: K and V must share the same memory layout");
   }
 
   // Everything from the TMA descriptor build through the kernel dispatch is
@@ -677,13 +734,15 @@ void launch_cute_fwd_persist_d_sm120(torch::Tensor Q, torch::Tensor K,
     }
   };
 
-  // Q TMA: BHND flat (B*H*N, D) rows or NHD flat (B*N, H*D) rows.
+  // Q TMA: BHND flat (B*H*N, D) rows or NHD flat (B*N, H*D) rows. NHD rows
+  // carry the tensor's own row stride: H*D for packed views, wider for
+  // strided fused-QKV chunk views.
   const auto make_tma_q = [&](auto q_c) {
     if constexpr (decltype(q_c)::value) {
       auto gQ =
           make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(Q.data_ptr())),
                       make_shape((long)Nb * Nq, (long)Nh * kHeadDim),
-                      make_stride((long)Nh * kHeadDim, _1{}));
+                      make_stride(Q.stride(2), _1{}));
       return make_tma_copy(SM90_TMA_LOAD{}, gQ, SmemLayoutQ{},
                            Shape<Int<kBr>, Int<kHeadDim>>{}, _1{});
     } else {
@@ -699,17 +758,18 @@ void launch_cute_fwd_persist_d_sm120(torch::Tensor Q, torch::Tensor K,
   if (kv_nhd) {
     // NHD view [B, H, N, D] <- packed [B, N, H, D]: element offset is
     // ((b*N + n)*H + h)*D + d, i.e. a flat (B*N, H*D) row-major matrix with
-    // uniform row stride H*D. The kernel domain_offsets to the batch's rows
-    // and tiles the (H*D) columns by kHeadDim, so the head rides the second
-    // tile coord — same flat-2D TMA machinery as BHND.
+    // a uniform row stride (H*D packed; wider for strided fused-QKV chunk
+    // views). The kernel domain_offsets to the batch's rows and tiles the
+    // (H*D) columns by kHeadDim, so the head rides the second tile coord —
+    // same flat-2D TMA machinery as BHND.
     auto gK =
         make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(K.data_ptr())),
                     make_shape((long)Nb * Nkv, (long)Nh_kv * kHeadDim),
-                    make_stride((long)Nh_kv * kHeadDim, _1{}));
+                    make_stride(K.stride(2), _1{}));
     auto gV =
         make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(V.data_ptr())),
                     make_shape((long)Nb * Nkv, (long)Nh_kv * kHeadDim),
-                    make_stride((long)Nh_kv * kHeadDim, _1{}));
+                    make_stride(V.stride(2), _1{}));
     auto tma_k = make_tma_copy(SM90_TMA_LOAD{}, gK, SmemLayoutKV{},
                                Shape<Int<kBc>, Int<kHeadDim>>{}, _1{});
     auto tma_v = make_tma_copy(SM90_TMA_LOAD{}, gV, SmemLayoutKV{},
@@ -762,29 +822,32 @@ void launch_cute_fwd_persist_d_fp8_sm120_impl(
   // must all become kHeadDim-wide together.
   if (fp8_hadamard) {
     // WHT requires BHND-contiguous inputs; materialize packed copies for
-    // NHD views (rare combo — the quantize kernels below are NHD-native,
-    // only the WHT kernel is not). V must join the same packing: its
-    // readers derive the layout from K (Lkv), so pad it to kHeadDim or
-    // materialize it BHND when already wide.
-    if (ffpa_is_nhd_view(Q))
+    // any NHD-family view (rare combo — the quantize kernels below are
+    // NHD-native, only the WHT kernel is not). V must join the same
+    // packing: pad it to kHeadDim or materialize it BHND when already wide.
+    if (!Q.is_contiguous())
       Q = Q.contiguous();
-    if (ffpa_is_nhd_view(K))
+    if (!K.is_contiguous())
       K = K.contiguous();
     if (Q.size(3) < kHeadDim)
       V = torch::constant_pad_nd(V, {0, kHeadDim - Q.size(3)}, 0.0);
-    else if (ffpa_is_nhd_view(V))
+    else if (!V.is_contiguous())
       V = V.contiguous();
     Q = ffpa::apply_wht_qk_sm120<kDataType, kHeadDim>(Q);
     K = ffpa::apply_wht_qk_sm120<kDataType, kHeadDim>(K);
   }
   // NHD (diffusers BNHD) zero-copy views: the fp8 pre-kernels read the
   // original gmem through Fp8InputLayout strides, so no permute copy is
-  // needed. V must share K's layout (every V reader derives it from Lkv).
-  const ffpa_fp8::Fp8InputLayout Lq = ffpa_layout_of(Q, Q.size(2), Q.size(3));
-  const ffpa_fp8::Fp8InputLayout Lkv = ffpa_layout_of(K, K.size(2), K.size(3));
-  TORCH_CHECK(V.stride(0) == K.stride(0) && V.stride(1) == K.stride(1) &&
-                  V.stride(2) == K.stride(2) && V.stride(3) == K.stride(3),
-              "ffpa_attn: V must share K's memory layout");
+  // needed. Strided-NHD rows (fused-QKV chunk views, e.g. FLUX.2
+  // single-stream) are accepted via the relaxed gate; V keeps its own
+  // descriptor since interleaved chunks give it K's head layout but a
+  // wider row stride.
+  const ffpa_fp8::Fp8InputLayout Lq =
+      ffpa_layout_of(Q, Q.size(2), Q.size(3), /*allow_strided_rows=*/true);
+  const ffpa_fp8::Fp8InputLayout Lkv =
+      ffpa_layout_of(K, K.size(2), K.size(3), /*allow_strided_rows=*/true);
+  const ffpa_fp8::Fp8InputLayout Lv =
+      ffpa_layout_of(V, V.size(2), V.size(3), /*allow_strided_rows=*/true);
   TORCH_CHECK(attn_bias.numel() == 0 && dropout_p == 0.0,
               "fp8 sm120 path does not support attn_bias/dropout");
   // q/k only support per-block quant today; per-channel is reserved for
@@ -929,14 +992,14 @@ void launch_cute_fwd_persist_d_fp8_sm120_impl(
         reinterpret_cast<__nv_fp8_e4m3*>(vt8.data_ptr()),
         q_scale.data_ptr<float>(), k_scale.data_ptr<float>(),
         v_scale_quant.data_ptr<float>(), Nb, Nh, Nh_kv, Nq, Nkv, Nkv_pad, D_og,
-        Lq, Lkv, stream, km_ptr, reorg_free, v_per_channel);
+        Lq, Lkv, stream, km_ptr, reorg_free, v_per_channel, &Lv);
   } else {
     ffpa_fp8::launch_quantize_fp8_sm120<kDataType, kBr, kBc, kHeadDim, kQKInt8>(
         q_ptr, k_ptr, v_ptr, q8.data_ptr(), k8.data_ptr(),
         reinterpret_cast<__nv_fp8_e4m3*>(vt8.data_ptr()),
         q_scale.data_ptr<float>(), k_scale.data_ptr<float>(),
         v_scale_quant.data_ptr<float>(), Nb, Nh, Nh_kv, Nq, Nkv, Nkv_pad, D_og,
-        Lq, Lkv, stream, km_ptr, reorg_free, v_per_channel);
+        Lq, Lkv, stream, km_ptr, reorg_free, v_per_channel, &Lv);
   }
 
   // Per-channel V (sage-style): re-quantize V with per-D scale via coalesced
@@ -961,14 +1024,14 @@ void launch_cute_fwd_persist_d_fp8_sm120_impl(
           v_ptr, reinterpret_cast<__nv_fp8_e4m3*>(vt8.data_ptr()),
           v_scale.data_ptr<float>(), vm_ptr, v_partials_sum.data_ptr<float>(),
           v_partials_max.data_ptr<float>(), v_partials_min.data_ptr<float>(),
-          Nb, Nh_kv, Nkv, Nkv_pad, stream, D_og, v_r, reorg_free, &Lkv);
+          Nb, Nh_kv, Nkv, Nkv_pad, stream, D_og, v_r, reorg_free, &Lv);
     } else {
       ffpa_fp8::launch_quantize_fp8_vt_perchannel_sm120<kDataType, kBr, kBc,
                                                         kHeadDim, false>(
           v_ptr, reinterpret_cast<__nv_fp8_e4m3*>(vt8.data_ptr()),
           v_scale.data_ptr<float>(), vm_ptr, v_partials_sum.data_ptr<float>(),
           v_partials_max.data_ptr<float>(), v_partials_min.data_ptr<float>(),
-          Nb, Nh_kv, Nkv, Nkv_pad, stream, D_og, v_r, reorg_free, &Lkv);
+          Nb, Nh_kv, Nkv, Nkv_pad, stream, D_og, v_r, reorg_free, &Lv);
     }
   }
   const float* vm_kernel = v_smooth_mean ? vm_ptr : nullptr;
@@ -2006,18 +2069,21 @@ void launch_cute_fwd_persist_d_fp4_sm120_impl(
   const bool fused_wht = fp4_hadamard && kFuseWht;
   torch::Tensor km_rot_f32, qm_rot;
   if (fp4_hadamard && !fused_wht) {
-    // WHT pre-rotation needs BHND-packed rows; materialize NHD views.
-    if (ffpa_is_nhd_view(Q))
+    // WHT pre-rotation needs BHND-packed rows; materialize NHD-family views.
+    if (!Q.is_contiguous())
       Q = Q.contiguous();
-    if (ffpa_is_nhd_view(K))
+    if (!K.is_contiguous())
       K = K.contiguous();
     Q = ffpa::apply_wht_qk_sm120<kDataType, kHeadDim>(Q);
     K = ffpa::apply_wht_qk_sm120<kDataType, kHeadDim>(K);
   }
   const kDataType* k_ptr = reinterpret_cast<const kDataType*>(K.data_ptr());
-  // NHD (BNHD) permute views are consumed natively by the pre-kernels.
-  const ffpa_fp8::Fp8InputLayout Lkv = ffpa_layout_of(K, Nkv, K.size(3));
-  const ffpa_fp8::Fp8InputLayout Lv = ffpa_layout_of(V, Nkv, V.size(3));
+  // NHD (BNHD) permute views — including strided fused-QKV chunk rows —
+  // are consumed natively by the pre-kernels.
+  const ffpa_fp8::Fp8InputLayout Lkv =
+      ffpa_layout_of(K, Nkv, K.size(3), /*allow_strided_rows=*/true);
+  const ffpa_fp8::Fp8InputLayout Lv =
+      ffpa_layout_of(V, Nkv, V.size(3), /*allow_strided_rows=*/true);
 
   // Quantize kernels take (B,S,H,D)-strided inputs; pass the (B,H,N,D)
   // tensors as (B,N,H,D) views (strides only, no copy).

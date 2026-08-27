@@ -331,7 +331,7 @@ __global__ void quantize_fp8_qkv_fused_kernel(
     QKOutT<kQKInt8>* __restrict__ K8, __nv_fp8_e4m3* __restrict__ VT8,
     float* __restrict__ q_scale, float* __restrict__ k_scale,
     float* __restrict__ v_scale, int N, int H, int ldy, int D_og,
-    Fp8InputLayout Lq, Fp8InputLayout Lkv,
+    Fp8InputLayout Lq, Fp8InputLayout Lkv, Fp8InputLayout Lv,
     const Element* __restrict__ km = nullptr,  // (B*H, kD) col means
     float inv_n = 0.0f) {
   constexpr int kVec = 8;
@@ -344,7 +344,7 @@ __global__ void quantize_fp8_qkv_fused_kernel(
   const int tid = threadIdx.x;
   const int warp = tid / 32;
   const int lane = tid % 32;
-  const Fp8InputLayout L = (role == 0) ? Lq : Lkv;
+  const Fp8InputLayout L = (role == 0) ? Lq : (role == 1) ? Lkv : Lv;
 
   constexpr int dv = kD / kVec;
   constexpr int total = kBlockRows * dv;
@@ -900,8 +900,11 @@ void launch_quantize_fp8_perthread_qk_sm120(
     void* k8, __nv_fp8_e4m3* vt8, float* q_scale, float* k_scale,
     float* v_scale, int B, int Nh, int Nh_kv, int Nq, int Nkv, int Nkv_pad,
     int D_og, Fp8InputLayout Lq, Fp8InputLayout Lkv, cudaStream_t stream,
-    const Element* km = nullptr, bool perm_vt = false, bool skip_vt = false) {
+    const Element* km = nullptr, bool perm_vt = false, bool skip_vt = false,
+    const Fp8InputLayout* Lv = nullptr) {
   using QKOut = QKOutT<kQKInt8>;
+  // V may carry its own (strided-NHD) layout; default mirrors K's.
+  const Fp8InputLayout Lv_ = Lv ? *Lv : Lkv;
   // Q: 128-row scale blocks, 64 scale per block; 2 threads/row (64-row
   // launch blocks) for DRAM latency hiding.
   {
@@ -926,7 +929,7 @@ void launch_quantize_fp8_perthread_qk_sm120(
       cudaFuncSetAttribute(vk, cudaFuncAttributeMaxDynamicSharedMemorySize,
                            kVtSmemBytes);
       vk<<<grid, 128, kVtSmemBytes, stream>>>(v_ptr, vt8, v_scale, Nkv, Nh_kv,
-                                              Nkv_pad, D_og, Lkv);
+                                              Nkv_pad, D_og, Lv_);
     };
     if (perm_vt)
       launch_vt(quantize_fp8_vt_kernel<Element, kBc, kHeadDim, true>);
@@ -955,8 +958,11 @@ void launch_quantize_fp8_sm120(const Element* q_ptr, const Element* k_ptr,
                                int Nh_kv, int Nq, int Nkv, int Nkv_pad,
                                int D_og, Fp8InputLayout Lq, Fp8InputLayout Lkv,
                                cudaStream_t stream, const Element* km = nullptr,
-                               bool perm_vt = false, bool skip_vt = false) {
+                               bool perm_vt = false, bool skip_vt = false,
+                               const Fp8InputLayout* Lv = nullptr) {
   using QKOut = QKOutT<kQKInt8>;
+  // V may carry its own (strided-NHD) layout; default mirrors K's.
+  const Fp8InputLayout Lv_ = Lv ? *Lv : Lkv;
   constexpr int kThreads = 128;
   // Dynamic smem for the VT staging tile (1B/elem); must match the kernels'
   // kPad. D is tiled into kDChunk-wide columns so the staging tile fits the
@@ -974,7 +980,7 @@ void launch_quantize_fp8_sm120(const Element* q_ptr, const Element* k_ptr,
         kernel<<<grid, kThreads, kVtSmemBytes, stream>>>(
             q_ptr, k_ptr, v_ptr, reinterpret_cast<QKOut*>(q8),
             reinterpret_cast<QKOut*>(k8), vt8, q_scale, k_scale, v_scale, Nq,
-            Nh, Nkv_pad, D_og, Lq, Lkv, km, 1.0f);
+            Nh, Nkv_pad, D_og, Lq, Lkv, Lv_, km, 1.0f);
       };
       if (perm_vt)
         launch_fused(quantize_fp8_qkv_fused_kernel<Element, kBr, kHeadDim,
@@ -1005,7 +1011,7 @@ void launch_quantize_fp8_sm120(const Element* q_ptr, const Element* k_ptr,
       cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
                            kVtSmemBytes);
       kernel<<<grid_kv, kThreads, kVtSmemBytes, stream>>>(
-          v_ptr, vt8, v_scale, Nkv, Nh_kv, Nkv_pad, D_og, Lkv);
+          v_ptr, vt8, v_scale, Nkv, Nh_kv, Nkv_pad, D_og, Lv_);
     };
     if (perm_vt)
       launch_vt(quantize_fp8_vt_kernel<Element, kBc, kHeadDim, true>);
