@@ -35,6 +35,11 @@ CUTE_DEVICE int kv_perm32(int j) {
 // producer sees the stage freed exactly when the mma chain has consumed
 // it. Copy destinations are built in-function via retile_D (same as
 // gemm_ss); callers pass raw partition_fragment results.
+// Operand roles (the _ss name is a family convention, NOT smem-smem):
+//   tSrQ/tSrSFQ  A side, register fragments (caller's partition_fragment_A
+//                / partition_fragment_SFA results), resident for the work;
+//   tSrK/tSrSFK  B side register staging, filled by this function;
+//   tSsK/tSsSFK  B side smem sources, one kv_tile stage each.
 // NOTE for a future split-D variant: if A must also stream from smem,
 // extend this into a gemm_ss-style dual-operand pipeline instead of
 // preloading (Q-per-work is a persist_d specialization).
@@ -120,11 +125,15 @@ CUTE_DEVICE void gemm_rs_fp4(
     TiledMma tiled_mma_pv, TiledCopyV tiled_copy_v, ThreadCopyV thread_copy_v,
     TiledCopyVSF tiled_copy_vsf, ThreadCopyVSF thread_copy_vsf,
     AbsMaxTensor& AbsMaxP, AccConvTensor& acc_conversion_view,
-    uint64_t* v_empty, int v_stg) {
+    uint64_t* v_empty, int v_stg, int v_mem = -1) {
+  // v_mem optionally decouples the smem stage index from the v_stg barrier
+  // index (Q smem reuse remaps slots; barriers stay on the global sequence).
+  if (v_mem < 0)
+    v_mem = v_stg;
   auto copy_view_v = thread_copy_v.retile_D(tOrVt);
   auto copy_view_vsf = thread_copy_vsf.retile_D(tOrSFVt);
-  auto tOsVt_stage = tOsVt(_, _, _, v_stg);
-  auto tOsSFVt_stage = tOsSFVt(_, _, _, v_stg);
+  auto tOsVt_stage = tOsVt(_, _, _, v_mem);
+  auto tOsSFVt_stage = tOsSFVt(_, _, _, v_mem);
   copy(tiled_copy_v, tOsVt_stage(_, _, _0{}), copy_view_v(_, _, _0{}));
   copy(tiled_copy_vsf, tOsSFVt_stage(_, _, _0{}), copy_view_vsf(_, _, _0{}));
   quantize_and_pack_p(_0{}, AbsMaxP, acc_conversion_view, tOrP, tOrSFP);
@@ -171,11 +180,13 @@ CUTE_DEVICE void gemm_rs_mxfp8(
     TiledMma tiled_mma_pv, TiledCopyV tiled_copy_v, ThreadCopyV thread_copy_v,
     TiledCopyVSF tiled_copy_vsf, ThreadCopyVSF thread_copy_vsf,
     AbsMaxTensor& AbsMaxP, AccRedTensor& acc_reduction_view, uint64_t* v_empty,
-    int v_stg, int lane) {
+    int v_stg, int lane, int v_mem = -1) {
+  if (v_mem < 0)
+    v_mem = v_stg;
   auto copy_view_v = thread_copy_v.retile_D(tOrVt);
   auto copy_view_vsf = thread_copy_vsf.retile_D(tOrSFVt);
-  auto tOsVt_stage = tOsVt(_, _, _, v_stg);
-  auto tOsSFVt_stage = tOsSFVt(_, _, _, v_stg);
+  auto tOsVt_stage = tOsVt(_, _, _, v_mem);
+  auto tOsSFVt_stage = tOsSFVt(_, _, _, v_mem);
   copy(tiled_copy_v, tOsVt_stage(_, _, _0{}), copy_view_v(_, _, _0{}));
   copy(tiled_copy_vsf, tOsSFVt_stage(_, _, _0{}), copy_view_vsf(_, _, _0{}));
   quantize_and_pack_p_mxfp8(0, AbsMaxP, acc_reduction_view, tOrP, tOrSFA, lane);

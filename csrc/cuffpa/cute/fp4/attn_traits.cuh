@@ -16,6 +16,17 @@
 
 namespace ffpa_fp4 {
 
+// Default for the traits' kQSmemReuse knob: alias V stage slot 0 onto the
+// Q+SFQ region (byte-identical sizes at every D), shrinking smem by one V
+// stage to leave more L1 capacity (the fp8 Q-smem-reuse mechanism).
+// Default OFF after an implemented A/B (2026-08-27, outputs bitwise equal):
+// despite smem 68.6 -> 59.4KB at D=128, it measured SLOWER - ncu kernel
+// 7.58 -> 7.72ms (+1.8%), e2e self 8.48 -> 8.57ms, causal 5.09 -> 5.17ms.
+// fp4's L1 is already saturated (96.75% sector hit), so the freed smem buys
+// no L1 benefit (unlike fp8, whose L1 was pressured) and the q_consumed
+// handshake adds a producer wait. Kept for future smem-bound shapes.
+inline constexpr bool kQSmemReuseDefault = false;
+
 // NVFP4 persist-D traits, D in {64,128,192,256} (64-multiples only: the
 // blockscaled SF atom is 64-wide along both MN and K): SM120 blockscaled
 // 16x32x64 mma
@@ -24,12 +35,16 @@ namespace ffpa_fp4 {
 // sm120_rr swizzle atom selected by kHeadDim and V^T a separate one
 // selected by kBc; SF smem uses the BlockScaledConfig atom
 // layouts; DS (delta_s) is a stride-(0,1) 128-float broadcast tile.
-template <typename ElementO_, int kHeadDim_, bool kPvMxfp8_ = false>
+template <typename ElementO_, int kHeadDim_, bool kPvMxfp8_ = false,
+          bool kQSmemReuse_ = kQSmemReuseDefault>
 struct FFPAAttnCuTePersistDFP4Traits {
   static constexpr int kBr = 128;
   static constexpr int kBc = 128;
   static constexpr int kHeadDim = kHeadDim_;
   static constexpr bool kPvMxfp8 = kPvMxfp8_;
+  // MXFP8's 8-bit V stage does not fit the Q+SFQ region, so reuse self-
+  // disables there regardless of the knob.
+  static constexpr bool kQSmemReuse = kQSmemReuse_ && !kPvMxfp8;
   // D=256 at 3 stages needs 130,560B, past the 99KB sm_120 opt-in budget.
   // MXFP8 doubles the V^T bytes (8-bit data): 3 stages fit D<=128 (D=128:
   // 89,600B) but not D=192 (133,376B) or D=256. An early mxfp8 build
@@ -44,6 +59,10 @@ struct FFPAAttnCuTePersistDFP4Traits {
                 "fp4 persist_d supports D in {64,128,192,256}");
   static_assert(!kPvMxfp8 || kHeadDim <= 192,
                 "MXFP8 PV persist_d supports D in {64,128,192} (smem budget)");
+  // The aliased V stage lives in the Q+SFQ region, so the V area holds
+  // kStages-1 physical stages; slot(s) = (s+1)%kStages keeps the prologue
+  // off the alias (see persist_d.cuh).
+  static constexpr int kVStages = kQSmemReuse ? kStages - 1 : kStages;
 
   using Element = cutlass::float_e2m1_t;
   using ElementSF = cutlass::float_ue4m3_t;
@@ -87,7 +106,10 @@ struct FFPAAttnCuTePersistDFP4Traits {
       make_shape(Int<kBc>{}, Int<kHeadDim>{}, Int<kStages>{})));
   using SmemLayoutVt = decltype(tile_to_shape(
       SmemLayoutAtomVt{},
-      make_shape(Int<kHeadDim>{}, Int<kBc>{}, Int<kStages>{})));
+      make_shape(Int<kHeadDim>{}, Int<kBc>{}, Int<kVStages>{})));
+  // Single-stage view for the V stage aliased onto the Q+SFQ region.
+  using SmemLayoutVt0 = decltype(tile_to_shape(
+      SmemLayoutAtomVt{}, make_shape(Int<kHeadDim>{}, Int<kBc>{}, _1{})));
 
   using BlkScaledConfig = BlockScaledConfig<16>;
   using BlkScaledConfigV = std::conditional_t<kPvMxfp8, BlockScaledConfig<32>,
@@ -105,7 +127,11 @@ struct FFPAAttnCuTePersistDFP4Traits {
                            append(stride(SmemLayoutAtomSFK{}),
                                   size(filter_zeros(SmemLayoutAtomSFK{})))));
   using SmemLayoutSFVt =
-      decltype(make_layout(append(shape(SmemLayoutAtomSFVt{}), Int<kStages>{}),
+      decltype(make_layout(append(shape(SmemLayoutAtomSFVt{}), Int<kVStages>{}),
+                           append(stride(SmemLayoutAtomSFVt{}),
+                                  size(filter_zeros(SmemLayoutAtomSFVt{})))));
+  using SmemLayoutSFVt0 =
+      decltype(make_layout(append(shape(SmemLayoutAtomSFVt{}), _1{}),
                            append(stride(SmemLayoutAtomSFVt{}),
                                   size(filter_zeros(SmemLayoutAtomSFVt{})))));
 
@@ -208,8 +234,11 @@ struct FFPAAttnCuTePersistDFP4Traits {
       (kOffSFK + kStages * kSFKBytesStage + 1023) / 1024 * 1024;
   static constexpr int kOffV =
       (kOffDS + kStages * kDSBytesStage + 1023) / 1024 * 1024;
-  static constexpr int kOffSFVt = kOffV + kStages * kVBytesStage;
-  static constexpr int kSmemBytes = kOffSFVt + kStages * kSFVtBytesStage;
+  static constexpr int kOffSFVt = kOffV + kVStages * kVBytesStage;
+  static constexpr int kSmemBytes = kOffSFVt + kVStages * kSFVtBytesStage;
+  static_assert(!kQSmemReuse || (kVBytesStage <= kOffSFQ &&
+                                 kSFVtBytesStage <= kOffK - kOffSFQ),
+                "aliased V stage must fit the Q+SFQ region");
   static_assert(kOffK % 1024 == 0 && kOffV % 1024 == 0, "SW128 smem alignment");
   // sm_120 (GeForce/PRO Blackwell) opt-in smem per block is 101,376B —
   // NOT the 227KB of datacenter parts. kStages > 4 exceeds it and fails
