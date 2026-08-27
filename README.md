@@ -230,15 +230,15 @@ python3 -m cache_dit.generate flux --attn ffpa_fp4 --seed 42 --height 1024 --wid
 
 <i> FLUX.1-dev, seed=42, 28 steps, 1024 x 1024, NVIDIA RTX PRO 5000 </i>
 
-|SDPA-FA2 (17.2s)|FFPA-FP8 (16.2s)|SageAttn-2 (FP8, 16.2s)|FFPA-FP4 (16.1s)|
+|SDPA (17.19s)|FFPA-FP8 (16.08s)|Sage-2 (FP8, 16.21s)|FFPA-FP4 (15.99s)|
 |:---:|:---:|:---:|:---:|
-|<img src="./docs/assets/flux.1024.seed42.native.png" width="180px">|<img src="./docs/assets/flux.1024.seed42.ffpa_fp8.png" width="180px">|<img src="./docs/assets/flux.1024.seed42.sage.png" width="180px">|<img src="./docs/assets/flux.1024.seed42.ffpa_fp4.png" width="180px">|
+|<img src="./docs/assets/flux.1024.seed42.native.png" width="178px">|<img src="./docs/assets/flux.1024.seed42.ffpa_fp8.png" width="178px">|<img src="./docs/assets/flux.1024.seed42.sage.png" width="178px">|<img src="./docs/assets/flux.1024.seed42.ffpa_fp4.png" width="178px">|
 
 <i> FLUX.1-dev, seed=42, 28 steps, 2048 x 2048, NVIDIA RTX PRO 5000 </i>
 
-|SDPA-FA2 (92.3s)|FFPA-FP8 (80.0s)|SageAttn-3 (FP4, 80.4s)|FFPA-FP4 (76.1s)|
+|SDPA (91.25s)|FFPA-FP8 (79.91s)|Sage-3 (FP4, 80.39s)|FFPA-FP4 (75.73s)|
 |:---:|:---:|:---:|:---:|
-|<img src="./docs/assets/flux.2048x2048.C0_native.png" width="180px">|<img src="./docs/assets/flux.2048x2048.C0_ffpa_fp8.png" width="180px">|<img src="./docs/assets/flux.2048x2048.C0_sage3.png" width="180px">|<img src="./docs/assets/flux.2048x2048.C0_ffpa_fp4.png" width="180px">|
+|<img src="./docs/assets/flux.2048x2048.C0_native.png" width="178px">|<img src="./docs/assets/flux.2048x2048.C0_ffpa_fp8.png" width="178px">|<img src="./docs/assets/flux.2048x2048.C0_sage3.png" width="178px">|<img src="./docs/assets/flux.2048x2048.C0_ffpa_fp4.png" width="178px">|
 
 </div>
 

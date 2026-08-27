@@ -51,6 +51,9 @@ static inline void prepare_hybrid_stage1(
       K_e = K.slice(2, 0, kv_offset + n_early).contiguous();
       V_e = V.slice(2, 0, kv_offset + n_early).contiguous();
     } else {
+      // Stage-1 runs the fp16 persist-D kernel, which consumes packed and
+      // strided-NHD K/V natively (split-D/m4n2 stage-1 variants are gated
+      // against strided inputs at dispatch).
       K_e = K;
       V_e = V;
     }
@@ -149,20 +152,37 @@ void launch_ffpa_attn_fwd_template(
   // permute+contiguous) instead of silently corrupting.
   bool nhd_in =
       ffpa_is_nhd_view(Q) || ffpa_is_nhd_view(K) || ffpa_is_nhd_view(V);
-  if (nhd_in && !force_fp8 && !force_fp4) {
-    auto prop_nhd = at::cuda::getCurrentDeviceProperties();
-    const bool fp16_nhd_ok = !force_tma && !force_native && !force_cute &&
-                             prop_nhd->major >= 12 && kHeadDim % 32 == 0 &&
-                             attn_bias.numel() == 0 && dropout_p == 0.0;
-    if (!fp16_nhd_ok) {
-      if (ffpa_is_nhd_view(Q))
-        Q = Q.contiguous();
-      if (ffpa_is_nhd_view(K))
-        K = K.contiguous();
-      if (ffpa_is_nhd_view(V))
-        V = V.contiguous();
-      nhd_in = false;
-    }
+  // Strided-NHD inputs (fused-QKV interleaved chunk views): neither
+  // BHND-packed nor a packed-NHD permute view.
+  const bool strided_in = (!ffpa_is_bhnd_packed(Q) && !ffpa_is_nhd_view(Q)) ||
+                          (!ffpa_is_bhnd_packed(K) && !ffpa_is_nhd_view(K)) ||
+                          (!ffpa_is_bhnd_packed(V) && !ffpa_is_nhd_view(V));
+  auto prop_nhd = at::cuda::getCurrentDeviceProperties();
+  const bool fp16_nhd_ok = !force_tma && !force_native && !force_cute &&
+                           prop_nhd->major >= 12 && kHeadDim % 32 == 0 &&
+                           attn_bias.numel() == 0 && dropout_p == 0.0;
+  if (nhd_in && !force_fp8 && !force_fp4 && !fp16_nhd_ok) {
+    if (ffpa_is_nhd_view(Q))
+      Q = Q.contiguous();
+    if (ffpa_is_nhd_view(K))
+      K = K.contiguous();
+    if (ffpa_is_nhd_view(V))
+      V = V.contiguous();
+    nhd_in = false;
+  }
+  // Strided-NHD inputs are consumed natively by the fp8/fp4 persist-D
+  // families (relaxed ffpa_layout_of gate) and the fp16 persist-D CUTE_TMA
+  // path (D<=128; split-D/M4N2 keep the strict gate); every other backend
+  // indexes packed storage and would silently mis-index. Materialize them
+  // the same way unsupported NHD views are materialized above.
+  const bool fp16_strided_ok = fp16_nhd_ok && kHeadDim <= 128;
+  if (strided_in && !force_fp8 && !force_fp4 && !fp16_strided_ok) {
+    if (!ffpa_is_bhnd_packed(Q) && !ffpa_is_nhd_view(Q))
+      Q = Q.contiguous();
+    if (!ffpa_is_bhnd_packed(K) && !ffpa_is_nhd_view(K))
+      K = K.contiguous();
+    if (!ffpa_is_bhnd_packed(V) && !ffpa_is_nhd_view(V))
+      V = V.contiguous();
   }
 #endif
 #endif
@@ -234,6 +254,16 @@ void launch_ffpa_attn_fwd_template(
             !(ffpa_is_nhd_view(O) && kHeadDim > 256),
             "ffpa_attn: NHD (BNHD) output requires the persist-D fp4 path "
             "(64 <= head_dim <= 256)");
+        // Strided-NHD inputs are consumed by the persist-D relaxed gate
+        // only; the split-D/m4n2 hybrid stage-1 fp16 kernels keep the
+        // strict gate, so reject that combination (mirrors fp8 D>224).
+        if constexpr (kHeadDim > 256) {
+          TORCH_CHECK(
+              !(strided_in && fp4_hybrid && Nq >= fp4_hybrid_n_early),
+              "ffpa_attn: strided-NHD input with fp4 hybrid requires the "
+              "persist-D path (head_dim <= 256); pass BHND-contiguous "
+              "tensors or disable hybrid");
+        }
         // NHD (BNHD) views are consumed natively by the fp4 pre-kernels and
         // the persist-D attention kernel (quantized buffers are BHND). The
         // persist-D hybrid stage-1 fp16 kernel also handles NHD K/V. Only
@@ -411,10 +441,12 @@ void launch_ffpa_attn_fwd_template(
 #ifdef ENABLE_FFPA_CUTE_EXT
 #ifdef ENABLE_FFPA_TMA_EXT
         if constexpr (kHeadDim > 224) {
-          TORCH_CHECK(!(nhd_in && fp8_hybrid && Nq >= fp8_hybrid_n_early),
-                      "ffpa_attn: NHD (BNHD) input with fp8 hybrid requires "
-                      "the persist-D path (head_dim <= 224); pass "
-                      "BHND-contiguous tensors or disable hybrid");
+          TORCH_CHECK(
+              !((nhd_in || strided_in) && fp8_hybrid &&
+                Nq >= fp8_hybrid_n_early),
+              "ffpa_attn: NHD (BNHD) or strided-NHD input with fp8 hybrid "
+              "requires the persist-D path (head_dim <= 224); pass "
+              "BHND-contiguous tensors or disable hybrid");
         }
 #endif
 #endif

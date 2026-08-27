@@ -100,6 +100,35 @@ def _allow_cuda_small_d() -> bool:
   return _env_flag_enabled("FFPA_CUDA_ALLOW_SMALL_D")
 
 
+def is_nhd_zero_copy_input(t: torch.Tensor) -> bool:
+  """Whether a [B, N, H, D] tensor can feed the persist-D NHD path zero-copy.
+
+  Mirrors the relaxed ``ffpa_layout_of`` gate in ``csrc/cuffpa/cute/
+  launch.cuh``: packed-NHD tensors and fused-QKV interleaved chunk views
+  (row stride wider than ``H * D``) both qualify; BHND-packed and
+  arbitrary-stride tensors do not. Quant families whose C++ gate is not
+  relaxed yet must materialize tensors failing this predicate instead of
+  passing them through.
+
+  :param t: 4-D activation shaped ``[B, N, H, D]``.
+  :returns: True when the strides and 16B alignment satisfy the
+      strided-NHD layout contract.
+  """
+  if t.dim() != 4:
+    return False
+  B, N, H, D = t.shape
+  s_batch, s_row, s_head, s_d = t.stride()
+  if s_d != 1 or s_head != D or s_row < H * D:
+    return False
+  if B > 1 and s_batch != s_row * N:
+    return False
+  es = t.element_size()
+  return (
+    t.data_ptr() % 16 == 0 and (s_row * es) % 16 == 0
+    and (s_row * N * es) % 16 == 0
+  )
+
+
 def _backend_allows_small_d(backend: Backend, head_dim: int) -> bool:
   if not (_FFPA_SMALL_HEAD_DIM_MIN <= head_dim <= _ATEN_SMALL_HEAD_DIM_MAX):
     return False

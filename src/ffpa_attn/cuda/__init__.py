@@ -106,8 +106,9 @@ def _fwd_cuda_torch_op(
     )
   # NHD (diffusers BNHD, tensor_layout=0): normalize Q/K/V to BHND-shape
   # NHD-storage views so every downstream size()/stride read keeps BHND
-  # semantics; O is allocated over NHD-packed storage (empty_like preserves
-  # the dense view strides) and returned in native [B, N, H, D].
+  # semantics; O is allocated over packed NHD storage (explicit strides:
+  # empty_like would inherit a strided NHD input's strides and the kernels
+  # would store O as BHND-packed into it) and returned in [B, N, H, D].
   # The layout stays a python-side permute (zero-copy) instead of a C++ flag:
   # with tensor_layout=1 a BHND-output call still legally takes NHD-view
   # inputs (zero-copy read path), a combination one flag cannot express, so
@@ -115,7 +116,10 @@ def _fwd_cuda_torch_op(
   # which packed layout a [B, H, N, D]-shaped tensor actually is.
   if tensor_layout == 0:
     Q, K, V = (t.permute(0, 2, 1, 3) for t in (Q, K, V))
-    O = torch.empty_like(Q)  # noqa: E741
+    B, H, N, D = Q.shape
+    O = torch.empty_strided(  # noqa: E741
+      (B, H, N, D), (N * H * D, D, H * D, 1), dtype=Q.dtype, device=Q.device
+    )
   else:
     # O must be BHND-packed even when Q is an NHD (diffusers BNHD) permute
     # view: empty_like would preserve the NHD strides, but the CUDA kernels
@@ -199,7 +203,11 @@ def _fwd_cuda_fake(
   tensor_layout: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor]:
   if tensor_layout == 0:
-    O = torch.empty_like(Q.permute(0, 2, 1, 3))  # noqa: E741
+    # Mirror the real op: packed-NHD storage returned as [B, N, H, D].
+    B, N, H, D = Q.shape
+    O = torch.empty_strided(  # noqa: E741
+      (B, N, H, D), (N * H * D, H * D, D, 1), dtype=Q.dtype, device=Q.device
+    )
     softmax_lse = Q.new_empty(
       Q.size(0), Q.size(2), Q.size(1), dtype=torch.float32
     )
