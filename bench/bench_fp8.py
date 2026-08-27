@@ -21,7 +21,6 @@ Examples:
 
 from __future__ import annotations
 
-import os
 import argparse
 import importlib.util
 import re
@@ -54,21 +53,7 @@ SAGE_INSTALLED = importlib.util.find_spec("sageattention") is not None
 if SAGE_INSTALLED:
   from sageattention import sageattn
 
-FFPA_BENCH_FP8_FORCE_QK_INT8 = os.environ.get(
-  "FFPA_BENCH_FP8_FORCE_QK_INT8", "0"
-) == "1"
-if FFPA_BENCH_FP8_FORCE_QK_INT8:
-  print(
-    "FFPA_BENCH_FP8_FORCE_QK_INT8=1: forcing FP8 Q/K matmul int8, P/V accumulate f16"
-  )
-
-# cachedit mirrors cache-dit's ffpa_fp8 backend: int8 QK + f16 PV acc +
-# per_thread Q/K + per_channel V + smooth k (hybrid opt-in via --hybrid,
-# default off: Sage has no equivalent stage). Same-basis comparison against
-# Sage's native per-thread/per-channel kernels.
-PRESETS = (
-  "default", "int8", "cachedit", "cache_dit", "cache-dit", "pre-thread"
-)
+PRESETS = ("default", "cache-dit")
 
 PLOT_OUTPUT_DIR = Path(__file__).resolve().parent / ".tmp"
 PLOT_CASE_ORDER = (
@@ -89,10 +74,6 @@ BACKEND_COLORS = {
 }
 
 
-def _is_5090_or_force_int8() -> bool:
-  return "5090" in torch.cuda.get_device_name() or FFPA_BENCH_FP8_FORCE_QK_INT8
-
-
 @lru_cache(maxsize=None)
 def fp8_backend(
   preset: str = "default",
@@ -100,48 +81,20 @@ def fp8_backend(
   nhd: bool = False
 ) -> CUDABackend:
   layout = "NHD" if nhd else "HND"
-  if preset == "int8" or (preset == "default" and _is_5090_or_force_int8()):
-    # 5090 default / explicit int8 preset: int8 QK matmul, f16 PV acc.
-    return CUDABackend(
-      backward=False,
-      enable_tma=True,
-      enable_cute=True,
-      enable_fp8=True,
-      fp8_qk_mm_type="int8",
-      fp8_pv_acc_type="f16",
-      fp8_q_quant_method="per_thread",
-      fp8_k_quant_method="per_thread",
-      fp8_v_quant_method="per_channel",
-      fp8_smooth_k=True,
-      fp8_smooth_v=False,
-      fp8_hybrid=hybrid,
-      tensor_layout=layout,
-    )
-  # Same as default, but with per-thread Q/K + per-channel V + smooth k on 5090.
-  if preset in ("cachedit", "cache_dit", "cache-dit", "pre-thread"):
-    return CUDABackend(
-      backward=False,
-      enable_tma=True,
-      enable_cute=True,
-      enable_fp8=True,
-      fp8_qk_mm_type="int8",
-      fp8_pv_acc_type="f16",
-      fp8_q_quant_method="per_thread",
-      fp8_k_quant_method="per_thread",
-      fp8_v_quant_method="per_channel",
-      fp8_smooth_k=True,
-      fp8_smooth_v=False,
-      fp8_hybrid=hybrid,
-      fp8_hybrid_n_early=256,
-      tensor_layout=layout,
-    )
-  # default: FP8 Q/K matmul fp8, P/V accumulate f32
   return CUDABackend(
     backward=False,
     enable_tma=True,
     enable_cute=True,
     enable_fp8=True,
+    fp8_qk_mm_type="int8",
+    fp8_pv_acc_type="f16",
+    fp8_q_quant_method="per_thread",
+    fp8_k_quant_method="per_thread",
+    fp8_v_quant_method="per_channel",
+    fp8_smooth_k=True,
+    fp8_smooth_v=False,
     fp8_hybrid=hybrid,
+    fp8_hybrid_n_early=256 if preset == "cache-dit" else 128,
     tensor_layout=layout,
   )
 
