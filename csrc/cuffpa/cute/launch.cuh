@@ -74,11 +74,11 @@ static inline void ffpa_check_strided_nhd_aligned(const torch::Tensor& X,
 
 // Fp8InputLayout from a [B, H, N, D] tensor's strides. Accepts BHND-packed
 // and NHD-view; anything else (arbitrary strides) is rejected unless
-// allow_strided_rows (persist-D opt-in): NHD-family views whose row stride
-// exceeds H*D (fused-QKV chunk layouts, e.g. FLUX.2 single-stream V) are
-// also accepted — the pre-kernels address rows through s_row, so any
-// 16B-aligned positive row/batch stride is legal. Split-D/M4N2 keep the
-// default strict gate.
+// allow_strided_rows: NHD-family views whose row stride exceeds H*D
+// (fused-QKV chunk layouts, e.g. FLUX.2 single-stream V) are also accepted
+// — the pre-kernels address rows through s_row, so any 16B-aligned
+// positive row/batch stride is legal. Every fp8/fp4 family (persist-D,
+// split-D, m4n2) passes allow_strided_rows=true.
 static inline ffpa_fp8::Fp8InputLayout ffpa_layout_of(
     const torch::Tensor& X, long N, long D, bool allow_strided_rows = false) {
   const long B = X.size(0), H = X.size(1);

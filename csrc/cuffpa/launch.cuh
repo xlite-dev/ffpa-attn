@@ -51,11 +51,21 @@ static inline void prepare_hybrid_stage1(
       K_e = K.slice(2, 0, kv_offset + n_early).contiguous();
       V_e = V.slice(2, 0, kv_offset + n_early).contiguous();
     } else {
-      // Stage-1 runs the fp16 persist-D kernel, which consumes packed and
-      // strided-NHD K/V natively (split-D/m4n2 stage-1 variants are gated
-      // against strided inputs at dispatch).
-      K_e = K;
-      V_e = V;
+      // Stage-1 runs an fp16 cute kernel (persist-D or split-D/m4n2 by
+      // head_dim) that consumes packed and strided-NHD K/V natively, so
+      // pass the original layouts through zero-copy. Mixed K/V layout
+      // families (e.g. BHND K + strided-NHD V) are legal for the fp8/fp4
+      // stage-2 impls but not for the fp16 stage-1 kernel (k_nhd == v_nhd),
+      // so materialize both on a family mismatch.
+      const bool k_nhd_family = ffpa_is_nhd_view(K) || ffpa_is_strided_nhd(K);
+      const bool v_nhd_family = ffpa_is_nhd_view(V) || ffpa_is_strided_nhd(V);
+      if (k_nhd_family != v_nhd_family) {
+        K_e = K.contiguous();
+        V_e = V.contiguous();
+      } else {
+        K_e = K;
+        V_e = V;
+      }
     }
   }
 }
@@ -245,21 +255,11 @@ void launch_ffpa_attn_fwd_template(
         // as fp8: P-quantization noise on short-row softmax rows.
         TORCH_CHECK(attn_bias.numel() == 0 && dropout_p == 0.0,
                     "fp4 sm120 path does not support attn_bias/dropout");
-        // Strided-NHD inputs are consumed by the persist-D relaxed gate
-        // only; the split-D/m4n2 hybrid stage-1 fp16 kernels keep the
-        // strict gate, so reject that combination (mirrors fp8 D>224).
-        if constexpr (kHeadDim > 256) {
-          TORCH_CHECK(
-              !(strided_in && fp4_hybrid && Nq >= fp4_hybrid_n_early),
-              "ffpa_attn: strided-NHD input with fp4 hybrid requires the "
-              "persist-D path (head_dim <= 256); pass BHND-contiguous "
-              "tensors or disable hybrid");
-        }
-        // NHD (BNHD) views are consumed natively by the fp4 pre-kernels and
-        // the persist-D attention kernel (quantized buffers are BHND). The
-        // persist-D hybrid stage-1 fp16 kernel also handles NHD K/V. Only
-        // the split-D/m4n2 hybrid stage-1 (fp16 split-D) needs BHND K/V -
-        // gated inside those branches below.
+        // NHD (BNHD) views and strided fused-QKV rows are consumed natively
+        // by the fp4 pre-kernels (Fp8InputLayout strides) and every fp16
+        // stage-1 variant (persist-D, split-D, m4n2); the causal/padded
+        // slices inside prepare_hybrid_stage1 materialize BHND. Hybrid
+        // therefore composes with any layout family (RFC FC-3).
         // fp4 persist-D covers 64-multiple headdims in [64,256], split-D
         // fp4 covers (256,768); D>=768 lands in the m4n2 branch. The first
         // if constexpr also keeps the hybrid stage-1 fp16 persist-D out of
@@ -426,21 +426,12 @@ void launch_ffpa_attn_fwd_template(
             }
           }
         }
-        // NHD (diffusers BNHD) inputs: split-D fp8 quantize is
-        // layout-generic, but the hybrid stage-1 fp16 split-D kernel TMA
-        // needs BHND packing — reject that combination explicitly.
-#ifdef ENABLE_FFPA_CUTE_EXT
-#ifdef ENABLE_FFPA_TMA_EXT
-        if constexpr (kHeadDim > 224) {
-          TORCH_CHECK(
-              !((nhd_in || strided_in) && fp8_hybrid &&
-                Nq >= fp8_hybrid_n_early),
-              "ffpa_attn: NHD (BNHD) or strided-NHD input with fp8 hybrid "
-              "requires the persist-D path (head_dim <= 224); pass "
-              "BHND-contiguous tensors or disable hybrid");
-        }
-#endif
-#endif
+        // NHD (diffusers BNHD) views and strided fused-QKV rows compose
+        // with hybrid across persist-D/split-D/m4n2 (RFC FC-3): the fp16
+        // stage-1 kernels consume them natively, prepare_hybrid_stage1
+        // materializes BHND only for the causal/padded slices, and stage-2
+        // quantize is layout-generic with q_start_row offsetting just the
+        // attention grid.
         // D<=224: persist-D fp8; 224<D<768: split-D M8N1 fp8;
         // D>=768: split-D M4N2 fp8. Same D<768/D>=768 cross-point as the
         // fp16 dispatch (M4N2 wins only for D>=768; below that M8N1 is

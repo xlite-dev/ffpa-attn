@@ -677,34 +677,114 @@ def test_fp16_strided_nhd_mixed_q_bhnd():
   assert torch.equal(out_m, out_c)
 
 
-def test_strided_nhd_large_d_rejections():
-  """Large-D strided combos that stay closed until FC-3 must fail loudly:
-  hybrid on split-D/M4N2 ranges (its stage-1 slice path needs the FC-3
-  wiring). The NHD O store itself is open since FC-2 and covered
-  below."""
+# ---------------------------------------------------------------------------
+# Hybrid + strided/NHD on split-D/M4N2 (RFC FC-3): the stage-1 fp16 kernels
+# consume strided-NHD natively (FC-1) and stage-2 quantize is layout-generic
+# with q_start_row offsetting only the attention grid, so hybrid now composes
+# with any input family across the whole head_dim range.
+
+
+@pytest.mark.parametrize("causal", [False, True], ids=["dense", "causal"])
+@pytest.mark.parametrize(
+  "family,D",
+  [("fp8", 320), ("fp8", 768), ("fp4", 320), ("fp4", 768)],
+  ids=["fp8-d320-split", "fp8-d768-m4n2", "fp4-d320-split", "fp4-d768-m4n2"],
+)
+def test_hybrid_strided_nhd_large_d_bit_exact(family, D, causal):
+  """Hybrid + strided fused-QKV on the large-D kernels (RFC FC-3): the
+  strided run must match the BHND-packed hybrid run bitwise (same
+  kernels, only the stage-1/stage-2 input addressing differs)."""
+  torch.manual_seed(0)
+  B, H, Hkv, N = 1, 24, 6, 2048
+  q, k, v = _fused_qkv(B, H, Hkv, N, D)
+  kw = (
+    dict(enable_fp8=True, fp8_hybrid=True, fp8_hybrid_n_early=256)
+    if family == "fp8" else
+    dict(enable_fp4=True, fp4_hybrid=True, fp4_hybrid_n_early=256)
+  )
+  backend = _backend(**kw)
+  qs, ks, vs = _strided_hnd(q, k, v)
+  with torch.no_grad():
+    out_s = ffpa_attn_func(
+      qs, ks, vs, is_causal=causal, forward_backend=backend
+    )
+    out_c = ffpa_attn_func(
+      qs.contiguous(),
+      ks.contiguous(),
+      vs.contiguous(),
+      is_causal=causal,
+      forward_backend=backend,
+    )
+  assert out_s.shape == (B, H, N, D)
+  assert torch.equal(out_s, out_c)
+
+
+@pytest.mark.parametrize("causal", [False, True], ids=["dense", "causal"])
+def test_hybrid_nhd_view_large_d_bit_exact(causal):
+  """Packed-NHD permute views + hybrid at D>224 (the nhd_in half of the
+  pre-FC-3 gate): NHD in/out must match the BHND run bitwise."""
   torch.manual_seed(0)
   B, H, N, D = 1, 24, 2048, 320
-  q, k, v = _strided_hnd(*_fused_qkv(B, H, H, N, D))
-  with pytest.raises(RuntimeError, match="persist-D path"):
-    with torch.no_grad():
-      ffpa_attn_func(
-        q,
-        k,
-        v,
-        forward_backend=_backend(
-          enable_fp8=True, fp8_hybrid=True, fp8_hybrid_n_early=256
-        ),
-      )
-  with pytest.raises(RuntimeError, match="persist-D path"):
-    with torch.no_grad():
-      ffpa_attn_func(
-        q,
-        k,
-        v,
-        forward_backend=_backend(
-          enable_fp4=True, fp4_hybrid=True, fp4_hybrid_n_early=256
-        ),
-      )
+  q, k, v = _mk(B, H, H, N, D)
+  kw = dict(enable_fp8=True, fp8_hybrid=True, fp8_hybrid_n_early=256)
+  backend = _backend(**kw)
+  backend_nhd = _backend(tensor_layout="NHD", **kw)
+  with torch.no_grad():
+    out_b = ffpa_attn_func(q, k, v, is_causal=causal, forward_backend=backend)
+    out_n = ffpa_attn_func(
+      _nhd(q), _nhd(k), _nhd(v), is_causal=causal, forward_backend=backend_nhd
+    )
+  assert out_n.shape == (B, N, H, D) and out_n.is_contiguous()
+  torch.testing.assert_close(out_n, out_b.permute(0, 2, 1, 3))
+
+
+def test_fp8_hybrid_mixed_kv_family_split_d():
+  """Mixed K/V layout families (BHND K + strided-NHD V) + hybrid:
+  prepare_hybrid_stage1 materializes both for the fp16 stage-1 kernel
+  (k_nhd == v_nhd), so the result matches the all-strided hybrid run."""
+  torch.manual_seed(0)
+  B, H, Hkv, N, D = 1, 24, 6, 2048, 320
+  q, k, v = _fused_qkv(B, H, Hkv, N, D)
+  kw = dict(enable_fp8=True, fp8_hybrid=True, fp8_hybrid_n_early=256)
+  backend = _backend(**kw)
+  qs, ks, vs = _strided_hnd(q, k, v)
+  with torch.no_grad():
+    out_m = ffpa_attn_func(qs, ks.contiguous(), vs, forward_backend=backend)
+    out_s = ffpa_attn_func(qs, ks, vs, forward_backend=backend)
+  assert torch.equal(out_m, out_s)
+
+
+def test_fp8_hybrid_strided_semantic_decomposition():
+  """Semantic wiring of hybrid at D=320 (dense + causal): late rows equal
+  the no-hybrid quantized run bitwise (stage-2 is deterministic on
+  identical workspaces), early rows equal the plain fp16 run (stage-1 is
+  that kernel on the same values)."""
+  torch.manual_seed(0)
+  B, H, Hkv, N, D, n_early = 1, 24, 6, 2048, 320, 256
+  q, k, v = _fused_qkv(B, H, Hkv, N, D)
+  qs, ks, vs = _strided_hnd(q, k, v)
+  with torch.no_grad():
+    out_h = ffpa_attn_func(
+      qs,
+      ks,
+      vs,
+      is_causal=True,
+      forward_backend=_backend(
+        enable_fp8=True, fp8_hybrid=True, fp8_hybrid_n_early=n_early
+      ),
+    )
+    out_q = ffpa_attn_func(
+      qs,
+      ks,
+      vs,
+      is_causal=True,
+      forward_backend=_backend(enable_fp8=True, fp8_hybrid=False),
+    )
+    out_fp16 = ffpa_attn_func(
+      qs, ks, vs, is_causal=True, forward_backend=_backend()
+    )
+  assert torch.equal(out_h[:, :, n_early:, :], out_q[:, :, n_early:, :])
+  assert torch.equal(out_h[:, :, :n_early, :], out_fp16[:, :, :n_early, :])
 
 
 # ---------------------------------------------------------------------------
