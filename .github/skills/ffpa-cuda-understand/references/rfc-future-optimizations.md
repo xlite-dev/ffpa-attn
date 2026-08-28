@@ -24,7 +24,7 @@
 | `attn_bias` | ✓ | ✓ | ✗ | ✗ | FC-4 |
 | `dropout` | ✓ | ✓ | ✗ | ✗ | FC-5 |
 | `tensor_layout='NHD'` O 写 | ✗ | persist-D | persist-D | persist-D | FC-2 |
-| strided-NHD 读（fused-QKV） | ✗ | persist-D | persist-D | persist-D | FC-1 |
+| strided-NHD 读（fused-QKV） | ✗ | persist-D | 全族（FC-1） | 全族（FC-1） | 全族（FC-1） | FC-1 ✅ |
 | strided/NHD + hybrid 组合 | — | — | ✗ | ✗ | FC-3 |
 | smooth_v / MXFP8-PV knob | — | — | ✓ | persist-D only | FC-6 |
 | head_dim pad | ✗ | ✓ | ✓ | ✓ | FC-8 |
@@ -38,7 +38,7 @@
 
 | 编号 | 标题 | 轨道 | 状态 | 依赖 |
 |---|---|---|---|---|
-| FC-1 | split-D/M4N2 独立 Lv（strided-NHD 读） | F1 | ⬜ 待开始 | — |
+| FC-1 | split-D/M4N2 独立 Lv（strided-NHD 读） | F1 | ✅ 已完成（ffpa-attn cc8e8dc/4a49d38/882ee07） | — |
 | FC-2 | split-D/M4N2 NHD O 写 | F1 | ⬜ 待开始 | FC-1 热身 |
 | FC-3 | split-D/M4N2 + hybrid strided 组合 | F1 | ⬜ 待开始 | FC-1 |
 | FC-4 | 量化路径 `attn_bias` | F2 | ⬜ 待开始 | — |
@@ -63,7 +63,7 @@
 
 **轨道 F（功能完备性，最高优先级）**
 
-- [ ] FC-1：split-D/M4N2 独立 Lv（strided-NHD 读）—— F1 基建第一步
+- [x] FC-1：split-D/M4N2 独立 Lv（strided-NHD 读）—— F1 基建第一步（2026-08-28 完成）
 - [ ] FC-2：split-D/M4N2 NHD O 写 —— F1 基建第二步
 - [ ] FC-3：split-D/M4N2 + hybrid strided 组合
 - [ ] FC-4：量化路径 `attn_bias`（S/P 域注入基建）
@@ -130,7 +130,11 @@
 
 ### FC-1：split-D/M4N2 独立 Lv（strided-NHD 读）
 
-- **Status**: Draft ｜ **Priority**: F1 ｜ **Track**: 功能（布局）
+- **Status**: Done（2026-08-28，ffpa-attn cc8e8dc/4a49d38/882ee07） ｜ **Priority**: F1 ｜ **Track**: 功能（布局）
+  实施偏离设计稿两点：fp4 不引入 `Lv`（其 V 消费全走 tensor-stride 参数化
+  quantize kernel，无需描述符）；fp8 的 `Lq` 一并放宽（fused-QKV 的 Q 同为
+  strided chunk）。顺带修复 fp16 split-D/M4N2 的 q_c 绑死 kv_c latent bug
+  （BHND Q + NHD K/V 混合布局静默错读，现独立分派）。
 
 #### Motivation
 
