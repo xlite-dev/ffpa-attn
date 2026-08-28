@@ -519,7 +519,7 @@ softmax_scale 恒按真实 D（Python 解析 `1/sqrt(D_og)`）。
 5. ~~**split-D/M4N2 接独立 Lv**（§8 #2）~~：✅ 已完成（FC-1）。
 6. **量化路径的 attn_bias**（§8 #6，大工程）：bias 在 S 累加器 fp32 域注入 → P 量化前；需要每 tile bias TMA/cp.async 加载通道（fp16 家族已有可抄的 bias 加载协议）。
 7. **配置自适应**：历史测量 `fp8_qk_mm_type/pv_acc_type` 存在 N-crossover（小 N 偏 fp8 QK、大 N 偏 int8 QK，crossover ∈ (4608,8192)）；默认配置已统一为 QK int8 + PV f16 acc，可按 Nkv 在反转区自适应切换（切前须跑 FLUX PSNR 验证精度）。
-8. **decode/短 Nq 的量化路径**：fp4 固定前处理 ~1.1ms 使小 Nq 不划算；方向是前处理链的 lazy/条件化（Nq 小时跳过 qm/delta_s 或整体回退 fp16）。
+8. ~~**decode/短 Nq 的量化路径**~~（⏸ RFC FC-7 暂不实施，仅保留设计稿，2026-08-28）：短 Nq/decode 量化基本没有收益——fp4 固定前处理 ~1.1ms 结构性占优、小 Nq 下量化吞吐优势摊不开，decode 已由 native split-KV fp16 覆盖。
 9. **P online 量化的精度优化**（§5.4）：P 是量化注意力中唯一 online 量化、无法离线校准的对象，其精度丢失是量化 attn 误差的最主要根源之一。候选形态：更好的满量程利用率、行感知 scale、causal 早行 P 高精度补偿；须避开已证伪的 per-row P quant + 重开 lazy rescale（§5.8 #12）。
 
 ### 9.2 框架/工程级

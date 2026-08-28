@@ -44,7 +44,7 @@
 | FC-4 | 量化路径 `attn_bias` | F2 | ⬜ 待开始 | — |
 | FC-5 | 量化路径 `dropout` (**暂不实施，仅保留设计稿**) | F2 | ⬜ 待开始 | FC-4 注入点 |
 | FC-6 | fp4 smooth_v/MXFP8-PV 扩展至三族 | F2 | ⬜ 待开始 | FC-1/FC-2 |
-| FC-7 | 短 Nq/decode 量化路径 | F3 | ⬜ 待开始 | — |
+| FC-7 | 短 Nq/decode 量化路径 (**暂不实施，仅保留设计稿**) | F3 | ⬜ 待开始 | — |
 | FC-8 | native head_dim pad | F3 | ⬜ 待开始 | — |
 | FC-9 | CUDA backward (**暂不实施，仅保留设计稿**) | F3 | ⬜ 待开始 | — |
 | FC-10 | sm90/sm100 量化覆盖 (**暂不实施，仅保留设计稿**) | F3 | ⬜ 待开始 | — |
@@ -73,7 +73,7 @@
 - [ ] FC-4：量化路径 `attn_bias`（S/P 域注入基建）
 - [ ] FC-5：量化路径 `dropout`
 - [ ] FC-6：fp4 smooth_v/MXFP8-PV 扩展至三族
-- [ ] FC-7：短 Nq/decode 量化路径
+- [ ] FC-7：短 Nq/decode 量化路径 ⏸（暂不实施，仅保留设计稿）
 - [ ] FC-8：native head_dim pad
 - [ ] FC-9：CUDA backward（定位评估）
 - [ ] FC-10：sm90/sm100 量化覆盖
@@ -106,8 +106,8 @@
 阶段 2（F2 特性对齐）
   FC-4 attn_bias（S/P 域注入基建）──► FC-5 dropout ⏸（暂不实施，复用注入点）
 阶段 3（F3 覆盖，按需推进，互相独立）
-  FC-7 短 Nq/decode ｜ FC-8 native pad ｜ FC-9 backward 评估 ⏸ ｜
-  FC-10 sm90/sm100 ⏸（FC-9/FC-10 均暂不实施）
+  FC-7 短 Nq/decode ⏸ ｜ FC-8 native pad ｜ FC-9 backward 评估 ⏸ ｜
+  FC-10 sm90/sm100 ⏸（FC-7/FC-9/FC-10 均暂不实施）
 阶段 4（轨道 P）
   PC-1 Mega Quantize Kernel（先做 cooperative 两阶段原型）
         ├─► 收编 PC-2（增量融合是其落地台阶）
@@ -119,7 +119,10 @@
 ```
 
 > ⏸ = **暂不实施，仅保留设计稿**：不入执行序列、不排期；未来大概率不做，
-> 仅当出现真实需求时重新评估。当前共 5 项：FC-5 / FC-9 / FC-10 / PC-5 / PC-6。
+> 仅当出现真实需求时重新评估。当前共 6 项：FC-5 / FC-7 / FC-9 / FC-10 /
+> PC-5 / PC-6。（FC-7 搁置理由：短 Nq/decode 量化基本没有收益——固定前处理
+> 链开销结构性占优，小 Nq 下量化 kernel 的吞吐优势摊不开，且 decode 已由
+> native split-KV fp16 路径覆盖。）
 
 承上启下要点：
 
@@ -134,7 +137,7 @@
    PC-2 的相邻对融合是其增量台阶（PC-1 落地即收编），PC-5 的 graph 兼容性必须等
    PC-1 的 cooperative launch 形态定型后才有确定方案（PC-5 ⏸ 暂不实施，届时再评估）。
 4. **阶段 3 各项与阶段 1/2 无依赖**，可在基建间隙穿插推进，但不得抢占基建资源
-   （实际排期仅 FC-7/FC-8；FC-9/FC-10 ⏸ 暂不实施，不占档期）。
+   （实际排期仅 FC-8；FC-7/FC-9/FC-10 ⏸ 暂不实施，不占档期）。
 
 ---
 
@@ -498,7 +501,11 @@ FC-1 / FC-2（同族布局基建先行，减少一次改动面）。
 
 ### FC-7：短 Nq / decode 量化路径
 
-- **Status**: Draft ｜ **Priority**: F3 ｜ **Track**: 功能
+- **Status**: Draft（⏸ **暂不实施，仅保留设计稿**）｜ **Priority**: F3 ｜ **Track**: 功能
+  搁置理由（2026-08-28）：短 Nq/decode 量化**基本没有收益**——量化链固定前处理
+  开销（fp4 ~1.1ms）结构性占优，小 Nq 下 attn kernel 本身占比小、量化吞吐优势
+  摊不开；decode 场景已由 native split-KV fp16 路径覆盖。短期无必要，仅当出现
+  真实短序列量化需求时重新评估。
 
 #### Motivation
 
