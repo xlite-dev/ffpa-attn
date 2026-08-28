@@ -42,18 +42,18 @@
 | FC-2 | split-D/M4N2 NHD O 写 | F1 | ⬜ 待开始 | FC-1 热身 |
 | FC-3 | split-D/M4N2 + hybrid strided 组合 | F1 | ⬜ 待开始 | FC-1 |
 | FC-4 | 量化路径 `attn_bias` | F2 | ⬜ 待开始 | — |
-| FC-5 | 量化路径 `dropout` | F2 | ⬜ 待开始 | FC-4 注入点 |
+| FC-5 | 量化路径 `dropout` (**暂不实施，仅保留设计稿**) | F2 | ⬜ 待开始 | FC-4 注入点 |
 | FC-6 | fp4 smooth_v/MXFP8-PV 扩展至三族 | F2 | ⬜ 待开始 | FC-1/FC-2 |
 | FC-7 | 短 Nq/decode 量化路径 | F3 | ⬜ 待开始 | — |
 | FC-8 | native head_dim pad | F3 | ⬜ 待开始 | — |
-| FC-9 | CUDA backward（定位评估） | F3 | ⬜ 待开始 | — |
-| FC-10 | sm90/sm100 量化覆盖 | F3 | ⬜ 待开始 | — |
+| FC-9 | CUDA backward (**暂不实施，仅保留设计稿**) | F3 | ⬜ 待开始 | — |
+| FC-10 | sm90/sm100 量化覆盖 (**暂不实施，仅保留设计稿**) | F3 | ⬜ 待开始 | — |
 | PC-1 | Mega Quantize Kernel（aux 链大融合） | P | ⬜ 待开始 | — |
 | PC-2 | 增量融合（Mega Kernel 步进） | P | ⬜ 待开始 | 被 PC-1 收编 |
 | PC-3 | N-crossover 量化配置自适应 | P | ⬜ 待开始 | — |
 | PC-4 | fp4 attn kernel 内部优化 | P | ⬜ 待开始 | — |
 | PC-5 | CUDA graph 友好化 | P | ⬜ 待开始 | PC-1 评估 |
-| PC-6 | sm_89 fp8 int4 QK | P | ⬜ 低优搁置 | sm_89 fp8 路线复活 |
+| PC-6 | sm_89 fp8 int4 QK (**暂不实施，仅保留设计稿**) | P | ⬜ 低优搁置 | sm_89 fp8 路线复活 |
 
 > 未收录项：cache-dit `_keep_or_pack` 物化兜底移除（依赖 FC-2 完成后作为其收尾步骤）；分卡基准标注（文档规范，随下次 bench 执行）。
 
@@ -373,14 +373,14 @@ fp8/fp4 全体（含 persist-D）拒绝 `attn_bias`（报告 §8#6）。数学�
 
 ---
 
-### FC-5：量化路径 `dropout`
+### FC-5：量化路径 `dropout` (暂不实施，仅保留设计稿)
 
 - **Status**: Draft ｜ **Priority**: F2（低于 FC-4） ｜ **Track**: 功能
 
 #### Motivation
 
 与 `attn_bias` 同源（报告 §7.2，`dropout_p == 0.0` 拒绝）。但 **dropout 是训练特性，
-推理几乎恒为 0**（本库定位 prefill/推理），故优先级低于 `attn_bias`；若未来有
+推理几乎恒为 0**（ffpa cuda backend定位 prefill/推理），故优先级低于 `attn_bias`；若未来有
 训练/蒸馏场景再启用。数学上 `O = dropout(softmax(S)) V` 只需在 P 上叠乘性掩码
 （Philox RNG），同样须在 P 量化前施加。
 
@@ -563,7 +563,7 @@ native 家族覆盖非整 D（补齐与 CuTe 家族的对齐）。
 
 ---
 
-### FC-9：CUDA backward（定位评估）
+### FC-9：CUDA backward (暂不实施，仅保留设计稿)
 
 - **Status**: Draft ｜ **Priority**: F3（长期/评估） ｜ **Track**: 功能
 
@@ -605,7 +605,7 @@ CUDA backend 完全无 backward（`CUDA_BWD_AVAILABLE=False`，报告 §6.4）�
 
 ---
 
-### FC-10：sm90 / sm100 量化覆盖
+### FC-10：sm90 / sm100 量化覆盖 (暂不实施，仅保留设计稿)
 
 - **Status**: Draft ｜ **Priority**: F3（长期） ｜ **Track**: 功能
 
@@ -910,7 +910,7 @@ PC-1 的 launch 形态先定（cooperative launch 的 graph 兼容性联动）�
 
 ---
 
-### PC-6：sm_89 fp8 int4 QK（低优先级，搁置）
+### PC-6：sm_89 fp8 int4 QK（低优先级，搁置）(暂不实施，仅保留设计稿)
 
 - **Status**: Draft ｜ **Priority**: P4（低，搁置） ｜ **Track**: 性能（sm_89 专属）
 
