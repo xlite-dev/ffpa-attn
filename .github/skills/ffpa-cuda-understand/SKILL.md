@@ -376,10 +376,10 @@ E2E（含前处理）GQA 小 N 场景仍落后：根因是辅助链 kernel 数�
 1. **smooth Q / smooth K 强制开启**（不是选项）：e2m1 ±6 动态范围使均值平滑是精度必需。`qm = mean(q, 128-row group)`、`km = mean(k)`。
 2. `delta_s`（rank-1 修正预计算）：`delta_s[b,h,mb,n] = qm @ (k-km)^T`，恒等式 `qm@K^T - 2·qm·km` 免物化 K-km；单 wmma kernel（128×128 tile，dynamic smem 64KB），大 N 从 torch 链 1.4ms 降到 ~0.3ms。
 3. `D≤128` 时 Q/K/V 单 launch fused 量化（同时产 qm）；更大 D 保持分离链。
-4. smooth V（可选 `fp4_smooth_v`，仅 persist-D D≤256）：V 列均值减除 + epilogue 加回（softmax 行和为 1 ⇒ O 不变）。
+4. smooth V（可选 `fp4_smooth_v`，三族全支持）：V 列均值减除 + epilogue 加回（softmax 行和为 1 ⇒ O 不变；split-D/m4n2 的 add-back 按 v_chunk 走 per-chunk identity partition）。
 5. hadamard（`fp4_hadamard`）：pow2 D（≤512）**fused 进 quantize kernel**（行内旋转，mean/delta_s 走未旋转域——WHT 线性，`H H^T=I`；lse 修正用旋转副本 qm_rot/km_rot）；非 pow2 D 回退独立 WHT kernel（需 BHND，NHD 物化）。
 
-lse 公式：`lse = (m*L + log2(row_sum) + log2(1/2688))*ln2 + scale*qkm`（P2=2688=448×6 两级量化域）。
+lse 公式（NVFP4 PV）：`lse = (m*L + log2(row_sum) + log2(1/2688))*ln2 + scale*qkm`（P2=2688=448×6 两级量化域）。MXFP8 PV 的 row_sum 处于 P·448 域（`SoftmaxFusedMxfp8`），域常量换为 `log2(1/448)`——两 kernel 按 `kPvMxfp8` 选择（曾是无条件 2688 的 latent bug，差 ln 6）。
 
 ### 6.3 数学链与列对齐
 
@@ -397,12 +397,12 @@ lse 公式：`lse = (m*L + log2(row_sum) + log2(1/2688))*ln2 + scale*qkm`（P2=2
 | GQA | ✓ | ✓ | ✓ |
 | **attn_bias** | **✗**（dispatch 层统一拒） | ✗ | ✗ |
 | **dropout** | **✗** | ✗ | ✗ |
-| NHD 读 | ✓（Lkv/Lv relaxed gate） | ✓（严格 gate，packed view） | ✓（严格 gate） |
-| **strided-NHD 读** | ✓ | ✗ | ✗ |
-| NHD O 写 | ✓（D≤256） | ✗ | ✗ |
+| NHD 读 | ✓（Lkv/Lv relaxed gate） | ✓（FC-1 起独立 Lv relaxed gate） | ✓（FC-1 起独立 Lv relaxed gate） |
+| **strided-NHD 读** | ✓ | ✓（FC-1） | ✓（FC-1） |
+| NHD O 写 | ✓（D≤256） | ✓（FC-2，nhd_out 分支） | ✓（FC-2） |
 | hybrid | ✓ | ✓ | ✓ |
-| `fp4_pv_mm_type='fp8'`（MXFP8 PV） | ✓ 仅 `D≤192`（smem 预算） | **✗**（TORCH_CHECK） | **✗** |
-| `fp4_smooth_v` | ✓ | **✗**（persist-D 专属） | **✗** |
+| `fp4_pv_mm_type='fp8'`（MXFP8 PV） | ✓ 仅 `D≤192`（smem 预算） | ✓（FC-6；PV Tile-K=kBc=128=MXFP8 atom K） | **✗ 架构排除**（atom K=128 > kBc=64） |
+| `fp4_smooth_v` | ✓ | ✓（FC-6） | ✓（FC-6） |
 | hadamard | ✓（pow2 fused / 非 pow2 物化） | ✓（非 pow2 物化） | ✓（同左） |
 | head_dim pad | ✓（fused，任意 %8） | ✓ | ✓ |
 
@@ -494,7 +494,7 @@ softmax_scale 恒按真实 D（Python 解析 `1/sqrt(D_og)`）。
 | 1 | **NHD O 写**（`nhd_out` 运行时分支 + 双分支动态 int64 gO） | ✅ 已补齐（FC-2，df7d572/c4ca38b/2382ca4）：split-D/M4N2 运行时 `nhd_out` 动态描述符，`tensor_layout='NHD'` 全 D 可用 | fp8/fp4/fp16 全部 split-D/M4N2 | （已解决）原 O store 是静态 BHND TMA descriptor |
 | 2 | **strided-NHD 读**（relaxed `ffpa_layout_of`） | ✅ 已补齐（FC-1，cc8e8dc/4a49d38/882ee07）：split-D/M4N2 独立 `Lq/Lkv/Lv`，fused-QKV chunk 零物化 | fp8/fp4/fp16 split-D/M4N2 | （已解决）原 quantize 侧描述符共享 Lkv |
 | 3 | **strided/NHD + hybrid 组合** | ✅ 已补齐（FC-3，9b9dcae）：dispatch gate 删除，hybrid 与任意布局族组合可用（dense 零拷贝 / causal 物化前缀） | fp8 D>224 / fp4 D>256 | （已解决）原 stage-1 gate 误拒 |
-| 4 | **fp4 smooth_v / MXFP8-PV** | fp4 大 D 精度/速度 knob 缺失 | fp4 split-D/M4N2 | `TORCH_CHECK(fp4_smooth_v ... persist_d)`；mxfp8 traits `static_assert D≤192` |
+| 4 | **fp4 smooth_v / MXFP8-PV** | ✅ 已补齐（FC-6，76a8bd8）：smooth_v 三族全放开；MXFP8-PV 扩至 split-D（PV Tile-K=kBc=128=atom K），m4n2 架构排除（atom K=128 > kBc=64）；顺带修 mxfp8 lse 域常量 latent bug（P·448 域误用 log2(1/2688)） | fp4 split-D/M4N2 | （已解决）原 `TORCH_CHECK(fp4_smooth_v ... persist_d)`；mxfp8 仅 persist-D traits |
 | 5 | fp16 persist-D 专属的 WS 结构 | （非缺口，差异说明）split-D/M4N2 是 non-WS | fp16 split 家族 | setmaxnreg 232 装不下大 D o_acc；FA-1 M4N2 是替代方案 |
 | 6 | **attn_bias / dropout（量化路径全体）** | 低精度 + mask/dropout 无解 | fp8/fp4 全部（含 persist-D） | 量化 kernel 链无 bias 注入点；P 量化与 bias 叠加需要 bias 在 S 域 fp32 化后再量化，工程量大 |
 

@@ -26,7 +26,7 @@
 | `tensor_layout='NHD'` O 写 | ✗ | persist-D | 全族（FC-2） | 全族（FC-2） | 全族（FC-2） | FC-2 ✅ |
 | strided-NHD 读（fused-QKV） | ✗ | persist-D | 全族（FC-1） | 全族（FC-1） | 全族（FC-1） | FC-1 ✅ |
 | strided/NHD + hybrid 组合 | — | — | ✓ | ✓ | FC-3 ✅ |
-| smooth_v / MXFP8-PV knob | — | — | ✓ | persist-D only | FC-6 |
+| smooth_v / MXFP8-PV knob | — | — | ✓ | smooth_v 全族；MXFP8-PV persist-D+split-D（m4n2 架构排除） | FC-6 ✅ |
 | head_dim pad | ✗ | ✓ | ✓ | ✓ | FC-8 |
 | decode / 短 Nq 量化 | ✗（无量化） | ✗ | ✗ | ✗ | FC-7 |
 | backward | ✗ | ✗ | ✗ | ✗ | FC-9 |
@@ -43,7 +43,7 @@
 | FC-3 | split-D/M4N2 + hybrid strided 组合 | F1 | ✅ 已完成（ffpa-attn 9b9dcae） | FC-1 |
 | FC-4 | 量化路径 `attn_bias` | F2 | ⬜ 待开始 | — |
 | FC-5 | 量化路径 `dropout` (**暂不实施，仅保留设计稿**) | F2 | ⬜ 待开始 | FC-4 注入点 |
-| FC-6 | fp4 smooth_v/MXFP8-PV 扩展至三族 | F2 | ⬜ 待开始 | FC-1/FC-2 |
+| FC-6 | fp4 smooth_v/MXFP8-PV 扩展至三族 | F2 | ✅ 已完成（ffpa-attn 76a8bd8） | FC-1/FC-2 |
 | FC-7 | 短 Nq/decode 量化路径 (**暂不实施，仅保留设计稿**) | F3 | ⬜ 待开始 | — |
 | FC-8 | native head_dim pad | F3 | ⬜ 待开始 | — |
 | FC-9 | CUDA backward (**暂不实施，仅保留设计稿**) | F3 | ⬜ 待开始 | — |
@@ -72,7 +72,7 @@
 - [x] FC-3：split-D/M4N2 + hybrid strided 组合 —— F1 布局闭环收尾（2026-08-28 完成）
 - [ ] FC-4：量化路径 `attn_bias`（S/P 域注入基建）
 - [ ] FC-5：量化路径 `dropout`
-- [ ] FC-6：fp4 smooth_v/MXFP8-PV 扩展至三族
+- [x] FC-6：fp4 smooth_v/MXFP8-PV 扩展至三族 —— smooth_v 全族；MXFP8-PV 至 split-D（2026-08-28 完成）
 - [ ] FC-7：短 Nq/decode 量化路径 ⏸（暂不实施，仅保留设计稿）
 - [ ] FC-8：native head_dim pad
 - [ ] FC-9：CUDA backward（定位评估）
@@ -101,7 +101,7 @@
   FC-1 独立 Lv 尾参 ──► FC-2 nhd_out 动态 O 描述符
         │（描述符/尾参基建，受益方 ↓）
         ├─► FC-3 strided+hybrid 组合放开（收尾）
-        ├─► FC-6 smooth_v/MXFP8-PV 三族扩展（同一批 quantize 调用点）
+        ├─► FC-6 smooth_v/MXFP8-PV 三族扩展 ✓（2026-08-28，76a8bd8）
         └─► cache-dit _keep_or_pack 物化兜底移除 ✓（2026-08-28，cache-dit@4b5c977）
 阶段 2（F2 特性对齐）
   FC-4 attn_bias（S/P 域注入基建）──► FC-5 dropout ⏸（暂不实施，复用注入点）
@@ -443,7 +443,18 @@ FC-4（共用 S/P 注入点）。
 
 ### FC-6：fp4 smooth_v / MXFP8-PV 扩展至三族
 
-- **Status**: Draft ｜ **Priority**: F2 ｜ **Track**: 功能
+- **Status**: Done（2026-08-28，ffpa-attn 76a8bd8）｜ **Priority**: F2 ｜ **Track**: 功能
+
+> 完成范围与设计稿的差异：**smooth_v** 按设计扩展至三族（split-D/m4n2 补 launcher
+> 接线 + per-v_chunk epilogue add-back，量化入口本就带 vm 尾参）；**MXFP8-PV** 实际
+> 只扩展到 split-D——split-D 的 PV Tile-K = kBc = 128 恰好等于 MXFP8 atom
+> （SM120_16x8x128）的 K extent，persist-D 的全套 mxfp8 机制直接复用（smem 最坏
+> D=704 约 95KB < 99KB opt-in）；**m4n2 架构性排除**（atom K=128 > kBc=64，除非
+> 把两个 kv tile 融进一次 PV 调用，改动面不成比例），wrapper 保留拒绝并注明理由。
+> 顺带修复 latent bug：MXFP8 路径 row_sum 处于 P·448 域，但 lse 修正无条件用了
+> NVFP4 的 log2(1/2688)（差 ln 6）；两 kernel 均改为按 kPvMxfp8 选域常量。
+> Bench（PRO 5000，D=320 N=16384 split-D）：NVFP4-PV 29.5ms/372T（5.39x SDPA），
+> MXFP8-PV 44.8ms/245T（3.56x）——精度 knob 代价约 50%，与 persist-D 行为一致。
 
 #### Motivation
 
