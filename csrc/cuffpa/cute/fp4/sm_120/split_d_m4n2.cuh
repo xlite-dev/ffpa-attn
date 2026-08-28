@@ -69,7 +69,7 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
         float* __restrict__ softmax_lse, const float* __restrict__ km,
         const float* __restrict__ qm, int Nq, int Nkv, int Nq_pad, int Nkv_pad,
         int Nh, int Nh_kv, float scale, int Tc, int causal, int total_q_rows,
-        int Nb, int q_start_row = 0) {
+        int Nb, int q_start_row = 0, bool nhd_out = false) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
   using namespace cute;
   using cute::tma_store_arrive;
@@ -733,9 +733,18 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
           Copy_Atom<SM90_U32x2_STSM_N, ElementO>{}, tiled_mma_pv);
       auto r2s_thr = r2s_copy.get_thread_slice(tid);
 
-      auto mO_tma = domain_offset(make_coord(O_row_offset, 0),
-                                  tma_o.get_tma_tensor(make_shape(
-                                      (long)total_q_rows, Int<kHeadDim>{})));
+      // NHD (diffusers BNHD packed) O: rows interleave heads (row stride
+      // Nh*kHeadDim); the nhd_out branch only picks coordinates, the
+      // batched R->S->TMA copy path is shared (per-work, like fp4
+      // persist-D). Column tiles fold the head in (v_chunk stays local).
+      const int o_row_base =
+          nhd_out ? (Nb_id * Nq + q_start_row) : O_row_offset;
+      const int o_rows = nhd_out ? (Nb * Nq) : total_q_rows;
+      const int o_cols = nhd_out ? (Nh * kHeadDim) : kHeadDim;
+      const int o_col_tile = nhd_out ? (Nh_id * kDChunksV) : 0;
+      auto mO_tma =
+          domain_offset(make_coord(o_row_base, 0),
+                        tma_o.get_tma_tensor(make_shape(o_rows, o_cols)));
       auto o_slice = tma_o.get_slice(_0{});
 
       if (Br_base + kBr <= Nq - q_start_row) {
@@ -764,8 +773,9 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
                 make_tensor(make_smem_ptr(reinterpret_cast<ElementO*>(shm) +
                                           v_in * kOTileElems),
                             SmemLayoutO{});
-            auto gO_tma = local_tile(mO_tma, Shape<Int<kBr>, Int<kVDChunk>>{},
-                                     make_coord(Q_tile_id, v_chunk));
+            auto gO_tma =
+                local_tile(mO_tma, Shape<Int<kBr>, Int<kVDChunk>>{},
+                           make_coord(Q_tile_id, o_col_tile + v_chunk));
             auto tCgO_tma = o_slice.partition_D(gO_tma);
             auto tOsO = o_slice.partition_S(sO_v);
             if (tid == 0)
@@ -778,10 +788,13 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
           }
         }
       } else {
-        const int O_gmem_offset = (q_bh)*Nq * kHeadDim + q_start_row * kHeadDim;
+        const int O_gmem_offset =
+            nhd_out ? ((Nb_id * Nq + q_start_row) * Nh + Nh_id) * kHeadDim
+                    : (q_bh)*Nq * kHeadDim + q_start_row * kHeadDim;
+        const int o_row_stride = nhd_out ? Nh * kHeadDim : kHeadDim;
         auto mO = make_tensor(make_gmem_ptr(O + O_gmem_offset),
                               make_shape(Nq - q_start_row, Int<kHeadDim>{}),
-                              make_stride(Int<kHeadDim>{}, _1{}));
+                              make_stride(o_row_stride, _1{}));
         auto cO = make_identity_tensor(Shape<Int<kBr>, Int<kVDChunk>>{});
         auto tOcO = thread_mma_pv.partition_C(cO);
 #pragma unroll

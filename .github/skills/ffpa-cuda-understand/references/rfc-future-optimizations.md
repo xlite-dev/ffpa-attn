@@ -23,9 +23,9 @@
 |---|---|---|---|---|---|
 | `attn_bias` | ✓ | ✓ | ✗ | ✗ | FC-4 |
 | `dropout` | ✓ | ✓ | ✗ | ✗ | FC-5 |
-| `tensor_layout='NHD'` O 写 | ✗ | persist-D | persist-D | persist-D | FC-2 |
-| strided-NHD 读（fused-QKV） | ✗ | persist-D | persist-D | persist-D | FC-1 |
-| strided/NHD + hybrid 组合 | — | — | ✗ | ✗ | FC-3 |
+| `tensor_layout='NHD'` O 写 | ✗ | persist-D | 全族（FC-2） | 全族（FC-2） | 全族（FC-2） | FC-2 ✅ |
+| strided-NHD 读（fused-QKV） | ✗ | persist-D | 全族（FC-1） | 全族（FC-1） | 全族（FC-1） | FC-1 ✅ |
+| strided/NHD + hybrid 组合 | — | — | ✓ | ✓ | FC-3 ✅ |
 | smooth_v / MXFP8-PV knob | — | — | ✓ | persist-D only | FC-6 |
 | head_dim pad | ✗ | ✓ | ✓ | ✓ | FC-8 |
 | decode / 短 Nq 量化 | ✗（无量化） | ✗ | ✗ | ✗ | FC-7 |
@@ -38,22 +38,26 @@
 
 | 编号 | 标题 | 轨道 | 状态 | 依赖 |
 |---|---|---|---|---|
-| FC-1 | split-D/M4N2 独立 Lv（strided-NHD 读） | F1 | ⬜ 待开始 | — |
-| FC-2 | split-D/M4N2 NHD O 写 | F1 | ⬜ 待开始 | FC-1 热身 |
-| FC-3 | split-D/M4N2 + hybrid strided 组合 | F1 | ⬜ 待开始 | FC-1 |
+| FC-1 | split-D/M4N2 独立 Lv（strided-NHD 读） | F1 | ✅ 已完成（ffpa-attn cc8e8dc/4a49d38/882ee07） | — |
+| FC-2 | split-D/M4N2 NHD O 写 | F1 | ✅ 已完成（ffpa-attn df7d572/c4ca38b/2382ca4） | FC-1 热身 |
+| FC-3 | split-D/M4N2 + hybrid strided 组合 | F1 | ✅ 已完成（ffpa-attn 9b9dcae） | FC-1 |
 | FC-4 | 量化路径 `attn_bias` | F2 | ⬜ 待开始 | — |
-| FC-5 | 量化路径 `dropout` | F2 | ⬜ 待开始 | FC-4 注入点 |
+| FC-5 | 量化路径 `dropout` (**暂不实施，仅保留设计稿**) | F2 | ⬜ 待开始 | FC-4 注入点 |
 | FC-6 | fp4 smooth_v/MXFP8-PV 扩展至三族 | F2 | ⬜ 待开始 | FC-1/FC-2 |
-| FC-7 | 短 Nq/decode 量化路径 | F3 | ⬜ 待开始 | — |
+| FC-7 | 短 Nq/decode 量化路径 (**暂不实施，仅保留设计稿**) | F3 | ⬜ 待开始 | — |
 | FC-8 | native head_dim pad | F3 | ⬜ 待开始 | — |
-| FC-9 | CUDA backward（定位评估） | F3 | ⬜ 待开始 | — |
-| FC-10 | sm90/sm100 量化覆盖 | F3 | ⬜ 待开始 | — |
+| FC-9 | CUDA backward (**暂不实施，仅保留设计稿**) | F3 | ⬜ 待开始 | — |
+| FC-10 | sm90/sm100 量化覆盖 (**暂不实施，仅保留设计稿**) | F3 | ⬜ 待开始 | — |
 | PC-1 | Mega Quantize Kernel（aux 链大融合） | P | ⬜ 待开始 | — |
 | PC-2 | 增量融合（Mega Kernel 步进） | P | ⬜ 待开始 | 被 PC-1 收编 |
 | PC-3 | N-crossover 量化配置自适应 | P | ⬜ 待开始 | — |
-| PC-4 | fp4 attn kernel 内部优化 | P | ⬜ 待开始 | — |
-| PC-5 | CUDA graph 友好化 | P | ⬜ 待开始 | PC-1 评估 |
-| PC-6 | sm_89 fp8 int4 QK | P | ⬜ 低优搁置 | sm_89 fp8 路线复活 |
+| PC-4 | fp4 persist-D attn kernel 内部优化 | P | ⬜ 待开始 | — |
+| PC-5 | CUDA graph 友好化 (**暂不实施，仅保留设计稿**) | P | ⬜ 待开始 | PC-1 评估 |
+| PC-6 | sm_89 fp8 int4 QK (**暂不实施，仅保留设计稿**) | P | ⬜ 低优搁置 | sm_89 fp8 路线复活 |
+| PC-7 | fp8 split-D (M8N1) 量化大 D kernel 性能优化 | P | ⬜ 待开始 | — |
+| PC-8 | fp8 split-D M4N2 量化大 D kernel 性能优化 | P | ⬜ 待开始 | PC-7（顺序） |
+| PC-9 | fp4 split-D (M8N1) 量化大 D kernel 性能优化 | P | ⬜ 待开始 | PC-8（顺序） |
+| PC-10 | fp4 split-D M4N2 量化大 D kernel 性能优化 | P | ⬜ 待开始 | PC-9（顺序） |
 
 > 未收录项：cache-dit `_keep_or_pack` 物化兜底移除（依赖 FC-2 完成后作为其收尾步骤）；分卡基准标注（文档规范，随下次 bench 执行）。
 
@@ -63,13 +67,13 @@
 
 **轨道 F（功能完备性，最高优先级）**
 
-- [ ] FC-1：split-D/M4N2 独立 Lv（strided-NHD 读）—— F1 基建第一步
-- [ ] FC-2：split-D/M4N2 NHD O 写 —— F1 基建第二步
-- [ ] FC-3：split-D/M4N2 + hybrid strided 组合
+- [x] FC-1：split-D/M4N2 独立 Lv（strided-NHD 读）—— F1 基建第一步（2026-08-28 完成）
+- [x] FC-2：split-D/M4N2 NHD O 写 —— F1 基建第二步（2026-08-28 完成）
+- [x] FC-3：split-D/M4N2 + hybrid strided 组合 —— F1 布局闭环收尾（2026-08-28 完成）
 - [ ] FC-4：量化路径 `attn_bias`（S/P 域注入基建）
 - [ ] FC-5：量化路径 `dropout`
 - [ ] FC-6：fp4 smooth_v/MXFP8-PV 扩展至三族
-- [ ] FC-7：短 Nq/decode 量化路径
+- [ ] FC-7：短 Nq/decode 量化路径 ⏸（暂不实施，仅保留设计稿）
 - [ ] FC-8：native head_dim pad
 - [ ] FC-9：CUDA backward（定位评估）
 - [ ] FC-10：sm90/sm100 量化覆盖
@@ -79,9 +83,13 @@
 - [ ] PC-1：Mega Quantize Kernel —— P 轨基建
 - [ ] PC-2：增量融合（Mega Kernel 步进，被 PC-1 收编）
 - [ ] PC-3：N-crossover 量化配置自适应
-- [ ] PC-4：fp4 attn kernel 内部优化
+- [ ] PC-4：fp4 persist-D attn kernel 内部优化
 - [ ] PC-5：CUDA graph 友好化
 - [ ] PC-6：sm_89 fp8 int4 QK（低优搁置：sm_120 无原生 int4 MMA，SA2 int4 kernel 未开源）
+- [ ] PC-7：fp8 split-D (M8N1) 量化大 D kernel 性能优化
+- [ ] PC-8：fp8 split-D M4N2 量化大 D kernel 性能优化
+- [ ] PC-9：fp4 split-D (M8N1) 量化大 D kernel 性能优化
+- [ ] PC-10：fp4 split-D M4N2 量化大 D kernel 性能优化
 
 ## 实施路线图（基建优先，承上启下）
 
@@ -96,16 +104,25 @@
         ├─► FC-6 smooth_v/MXFP8-PV 三族扩展（同一批 quantize 调用点）
         └─► cache-dit _keep_or_pack 物化兜底移除
 阶段 2（F2 特性对齐）
-  FC-4 attn_bias（S/P 域注入基建）──► FC-5 dropout（复用注入点）
+  FC-4 attn_bias（S/P 域注入基建）──► FC-5 dropout ⏸（暂不实施，复用注入点）
 阶段 3（F3 覆盖，按需推进，互相独立）
-  FC-7 短 Nq/decode ｜ FC-8 native pad ｜ FC-9 backward 评估 ｜ FC-10 sm90/sm100
+  FC-7 短 Nq/decode ⏸ ｜ FC-8 native pad ｜ FC-9 backward 评估 ⏸ ｜
+  FC-10 sm90/sm100 ⏸（FC-7/FC-9/FC-10 均暂不实施）
 阶段 4（轨道 P）
   PC-1 Mega Quantize Kernel（先做 cooperative 两阶段原型）
         ├─► 收编 PC-2（增量融合是其落地台阶）
-        └─► 联动 PC-5（launch 形态定型后才能定 graph 兼容方案）
-  PC-3 配置自适应 ｜ PC-4 fp4 kernel 内部（与上并行，互不依赖）
-  PC-6 sm_89 int4 QK（低优搁置，不入路线图；前置 = sm_89 fp8 路线复活）
+        └─► 联动 PC-5 ⏸（暂不实施；launch 形态定型后才能定 graph 兼容方案）
+  PC-3 配置自适应 ｜ PC-4 fp4 persist-D kernel 内部（与上并行，互不依赖）
+  PC-7 → PC-8 → PC-9 → PC-10 量化大 D kernel（优化复杂，严格逐个推进：
+        fp8 split-D → fp8 M4N2 → fp4 split-D → fp4 M4N2，上一项验收后再启动下一项）
+  PC-6 sm_89 int4 QK ⏸（暂不实施，低优搁置，不入执行序列；前置 = sm_89 fp8 路线复活）
 ```
+
+> ⏸ = **暂不实施，仅保留设计稿**：不入执行序列、不排期；未来大概率不做，
+> 仅当出现真实需求时重新评估。当前共 6 项：FC-5 / FC-7 / FC-9 / FC-10 /
+> PC-5 / PC-6。（FC-7 搁置理由：短 Nq/decode 量化基本没有收益——固定前处理
+> 链开销结构性占优，小 Nq 下量化 kernel 的吞吐优势摊不开，且 decode 已由
+> native split-KV fp16 路径覆盖。）
 
 承上启下要点：
 
@@ -114,11 +131,13 @@
    照抄 persist-D 已验证的动态 descriptor 模式（改动面大但有范本）；FC-3 在两者就位
    后放开组合，只改判定逻辑。三步各自独立验收、独立回退。
 2. **FC-4 → FC-5**：`attn_bias` 建立的 S 域注入基建（per-block bias 载入、P 量化前
-   修正、`-inf` 掩码叠加顺序）正是 dropout 乘性掩码所需的注入点，FC-5 复用即可。
+   修正、`-inf` 掩码叠加顺序）正是 dropout 乘性掩码所需的注入点，FC-5 复用即可
+   （FC-5 ⏸ 暂不实施：FC-4 落地后注入点自然可用，届时再评估）。
 3. **PC-1 → PC-2/PC-5**：Mega Kernel 的两阶段 + grid 屏障是 aux 链融合的终局形态；
    PC-2 的相邻对融合是其增量台阶（PC-1 落地即收编），PC-5 的 graph 兼容性必须等
-   PC-1 的 cooperative launch 形态定型后才有确定方案。
-4. **阶段 3 各项与阶段 1/2 无依赖**，可在基建间隙穿插推进，但不得抢占基建资源。
+   PC-1 的 cooperative launch 形态定型后才有确定方案（PC-5 ⏸ 暂不实施，届时再评估）。
+4. **阶段 3 各项与阶段 1/2 无依赖**，可在基建间隙穿插推进，但不得抢占基建资源
+   （实际排期仅 FC-8；FC-7/FC-9/FC-10 ⏸ 暂不实施，不占档期）。
 
 ---
 
@@ -130,7 +149,11 @@
 
 ### FC-1：split-D/M4N2 独立 Lv（strided-NHD 读）
 
-- **Status**: Draft ｜ **Priority**: F1 ｜ **Track**: 功能（布局）
+- **Status**: Done（2026-08-28，ffpa-attn cc8e8dc/4a49d38/882ee07） ｜ **Priority**: F1 ｜ **Track**: 功能（布局）
+  实施偏离设计稿两点：fp4 不引入 `Lv`（其 V 消费全走 tensor-stride 参数化
+  quantize kernel，无需描述符）；fp8 的 `Lq` 一并放宽（fused-QKV 的 Q 同为
+  strided chunk）。顺带修复 fp16 split-D/M4N2 的 q_c 绑死 kv_c latent bug
+  （BHND Q + NHD K/V 混合布局静默错读，现独立分派）。
 
 #### Motivation
 
@@ -195,7 +218,7 @@ FC-2/FC-3 的热身（先打通 split-D 上的新描述符路径）。
 
 ### FC-2：split-D/M4N2 NHD O 写
 
-- **Status**: Draft ｜ **Priority**: F1 ｜ **Track**: 功能（布局）
+- **Status**: Done（2026-08-28，ffpa-attn df7d572/c4ca38b/2382ca4，fp8/fp4/fp16 三族） ｜ **Priority**: F1 ｜ **Track**: 功能（布局）
 
 #### Motivation
 
@@ -255,7 +278,16 @@ FC-1 先行（同文件调用点，先打通描述符尾参路径，降低一次
 
 ### FC-3：split-D/M4N2 + hybrid strided 组合
 
-- **Status**: Draft ｜ **Priority**: F1 ｜ **Track**: 功能（布局）
+- **Status**: Done（2026-08-28，ffpa-attn 9b9dcae） ｜ **Priority**: F1 ｜ **Track**: 功能（布局）
+  实施远小于设计稿：fp16 split-D/M4N2 launcher 与 fp8/fp4 stage-2 impl 经
+  FC-1/FC-2 已 layout 原生（从 tensor stride 自检，无需显式传 `Lv`/`nhd_out`）；
+  kernel 内 `nhd_out + q_start_row` 组合偏移已在 FC-2 实现；量化链恒做
+  full-Q 量化，故 `q_start_row` 与输入布局正交。本项实际改动 = 删两组
+  dispatch `TORCH_CHECK`（fp8 D>224 拒 `nhd_in||strided_in`、fp4 D>256 拒
+  `strided_in`）+ `prepare_hybrid_stage1` 非 causal 分支的 K/V 族不匹配
+  物化兜底（BHND K + strided V 等 mixed 输入对 stage-2 合法但 fp16 stage-1
+  要求 `k_nhd==v_nhd`），保证 hybrid 能力 ⊇ 非 hybrid。nsys 确认 dense
+  模式 K/V 零物化（每次调用仅 Q_e slice copy + O/lse 写回 3 个 copy kernel）。
 
 #### Motivation
 
@@ -369,14 +401,14 @@ fp8/fp4 全体（含 persist-D）拒绝 `attn_bias`（报告 §8#6）。数学�
 
 ---
 
-### FC-5：量化路径 `dropout`
+### FC-5：量化路径 `dropout` (暂不实施，仅保留设计稿)
 
 - **Status**: Draft ｜ **Priority**: F2（低于 FC-4） ｜ **Track**: 功能
 
 #### Motivation
 
 与 `attn_bias` 同源（报告 §7.2，`dropout_p == 0.0` 拒绝）。但 **dropout 是训练特性，
-推理几乎恒为 0**（本库定位 prefill/推理），故优先级低于 `attn_bias`；若未来有
+推理几乎恒为 0**（ffpa cuda backend定位 prefill/推理），故优先级低于 `attn_bias`；若未来有
 训练/蒸馏场景再启用。数学上 `O = dropout(softmax(S)) V` 只需在 P 上叠乘性掩码
 （Philox RNG），同样须在 P 量化前施加。
 
@@ -469,7 +501,11 @@ FC-1 / FC-2（同族布局基建先行，减少一次改动面）。
 
 ### FC-7：短 Nq / decode 量化路径
 
-- **Status**: Draft ｜ **Priority**: F3 ｜ **Track**: 功能
+- **Status**: Draft（⏸ **暂不实施，仅保留设计稿**）｜ **Priority**: F3 ｜ **Track**: 功能
+  搁置理由（2026-08-28）：短 Nq/decode 量化**基本没有收益**——量化链固定前处理
+  开销（fp4 ~1.1ms）结构性占优，小 Nq 下 attn kernel 本身占比小、量化吞吐优势
+  摊不开；decode 场景已由 native split-KV fp16 路径覆盖。短期无必要，仅当出现
+  真实短序列量化需求时重新评估。
 
 #### Motivation
 
@@ -559,7 +595,7 @@ native 家族覆盖非整 D（补齐与 CuTe 家族的对齐）。
 
 ---
 
-### FC-9：CUDA backward（定位评估）
+### FC-9：CUDA backward (暂不实施，仅保留设计稿)
 
 - **Status**: Draft ｜ **Priority**: F3（长期/评估） ｜ **Track**: 功能
 
@@ -601,7 +637,7 @@ CUDA backend 完全无 backward（`CUDA_BWD_AVAILABLE=False`，报告 §6.4）�
 
 ---
 
-### FC-10：sm90 / sm100 量化覆盖
+### FC-10：sm90 / sm100 量化覆盖 (暂不实施，仅保留设计稿)
 
 - **Status**: Draft ｜ **Priority**: F3（长期） ｜ **Track**: 功能
 
@@ -806,13 +842,13 @@ M8N1 / D≥768 M4N2，`csrc/cuffpa/launch.cuh`），无 N 维分支。历史上�
 
 ---
 
-### PC-4：fp4 attn kernel 内部优化
+### PC-4：fp4 persist-D attn kernel 内部优化
 
 - **Status**: Draft ｜ **Priority**: P3 ｜ **Track**: 性能
 
 #### Motivation
 
-fp4 attn kernel 当前 `wait` stall 31.1% 为主（报告 §6.5），
+fp4 persist-D attn kernel 当前 `wait` stall 31.1% 为主（报告 §6.5），
 tensor pipe 未饱和（`math_pipe_throttle` 仅 7.4%），说明数据供给（Q/K/V smem→reg、
 P pack、rescale）是瓶颈而非 MMA 吞吐。潜在方向：减少 P pack 的寄存器往返、
 优化 rescale 的 FFMA 依赖链、提升 TMA→smem→reg 的供给速率。**但必须先证明热点**
@@ -856,7 +892,190 @@ fp4 attn kernel -3~5%（若热点可攻克）。
 
 ---
 
-### PC-5：CUDA graph 友好化
+### PC-7：fp8 split-D (M8N1) 量化大 D kernel 性能优化
+
+- **Status**: Draft ｜ **Priority**: P2 ｜ **Track**: 性能
+
+#### Motivation
+
+fp8 split-D (M8N1, 224<D<768，代表 D=320/512) 是量化大 D attention 的薄弱点
+之一：non-WS 结构，大 D 下 `o_acc=D/2` per-thread 寄存器（D=512 → 256 regs，
+逼近 255 硬上限，spill 到 local mem），QK→softmax→P 量化→PV 串行依赖链长。
+同族 persist-D（D≤224）已被深度打磨（WS / non-WS 双版本 + 多轮局部优化），
+其中验证有效的局部优化方案与 split-D 主循环结构无关，可移植。
+
+#### Design
+
+1. **先决（硬）**：`ncu --page source` 拿到 D=320/512 的 stall / roofline /
+   occupancy 画像，确认热点结构；**无画像不动手**（同 PC-4 纪律）。
+2. 逐项移植 fp8 persist-D 的局部优化菜单：reg reconfig 参数、NamedBarrier
+   数量/位置、producer TMA issue 顺序（K/V 先后与 prefetch 深度）、softmax
+   MUFU、int8 s32→f32 cast 向量化——每项 ≤ 几十行、不动主循环骨架。
+3. persistent work loop **不假设可移植**：fp8 persist-D 已证伪零收益
+   （附录 A #3），split-D 上须独立实测后才能定论。
+4. 编译期路径隔离，默认配置行为零变化。
+
+#### Files & Symbols
+
+- `csrc/cuffpa/cute/fp8/sm_120/split_d.cuh`；
+- 参照范本：`csrc/cuffpa/cute/fp8/sm_120/persist_d.cuh`（WS / non-WS 双版本，
+  已落地各优化项）。
+
+#### Validation
+
+1. NCU stall / roofline 画像前后对比（附录 B）。
+2. 冷数据轮转（附录 B）：fp8 × D∈{320,512} × N∈{1024,4608,16384}，
+   **必须报告卡型 + 冷热条件**。
+3. bitwise probe 数值一致（优化只改执行方式、不改结果，硬约束）。
+4. 动手前查附录 A 证伪边界（#3 persistent、#4 stages 加深等）。
+
+#### Risks & Rollback
+
+- fp8 可能同为 latency-bound、可挖空间有限（参照
+  `ffpa-fp4-125x-ceiling-analysis` 的收益上限定量方法）；
+- 结构优化收益不能跨结构外推（附录 A 元教训）——每方案独立 A/B；
+- 回退 = 逐项恢复（每方案独立 flag / 分支）。
+
+#### Expected Benefit
+
+按方案实测（参考量级：局部优化单项 0.5~2%）。
+
+#### Dependencies
+
+—（PC-7/8/9/10 四部曲首项，严格逐个推进；强依赖 NCU 先决分析）。
+
+---
+
+### PC-8：fp8 split-D M4N2 量化大 D kernel 性能优化
+
+- **Status**: Draft ｜ **Priority**: P2 ｜ **Track**: 性能
+
+#### Motivation
+
+fp8 split-D M4N2（D≥768，代表 D=768/1024）：kBr=64、atom_layout=(4,2,1)、
+`o_acc=D/4`（寄存器压力为 M8N1 的一半，正是 D≥768 的 spill 解法），但 MMA 形状
+与 kv 循环结构与 M8N1 不同，热点结构须独立画像，收益不能从 PC-7 直接外推。
+
+#### Design
+
+同 PC-7 方法论（NCU 先决 + 局部优化菜单 + 附录 A 证伪边界核对）。fp8 两 kernel
+共享量化链与 softmax 结构，PC-7 验证有效的方案优先复测移植。
+
+#### Files & Symbols
+
+- `csrc/cuffpa/cute/fp8/sm_120/split_d_m4n2.cuh`；
+- 参照范本：同 PC-7。
+
+#### Validation
+
+同 PC-7 套件，bench 代表点改 D∈{768,1024}；每方案独立 A/B、独立回退。
+
+#### Risks & Rollback
+
+同 PC-7（M4N2 寄存器压力更低，latency-bound 特征可能更显著，收益上限先定量）。
+
+#### Expected Benefit
+
+按方案实测。
+
+#### Dependencies
+
+PC-7（顺序：复杂优化逐个推进，同族经验复用）。
+
+---
+
+### PC-9：fp4 split-D (M8N1) 量化大 D kernel 性能优化
+
+- **Status**: Draft ｜ **Priority**: P2 ｜ **Track**: 性能
+
+#### Motivation
+
+fp4 split-D (M8N1, 256<D<768，代表 D=320/512)：NVFP4 OMMA.SF MMA，两级 P 量化
+（`quantize_and_pack_p` 2688 域），non-WS，大 D 寄存器压力同族同构。fp4
+persist-D 沉淀的**两项已验证有效方案**与主循环结构无关，是首选移植对象：
+
+1. **softmax 尾部逐元素除法 → 每 group 一次倒数 + FMUL（fp8 pscale 风格）+
+   FirstTile row_sum 融合进 exp2 pass**——fp4 persist-D 实测 self@16k
+   9.40→9.34；
+2. **persistent work loop**——fp4 persist-D 验证有效（**注意这是家族相关的：
+   fp8 同款已证伪零收益，附录 A #3**）；fp4 split-D 已有 per-work 批式
+   epilogue（FC-2），主循环对齐成本低。
+
+#### Design
+
+1. **先决（硬）**：`ncu --page source` 拿到 D=320/512 的 stall / roofline /
+   occupancy 画像；**无画像不动手**。
+2. 按 Motivation 顺序移植两项有效方案，再叠加局部优化菜单（reg reconfig /
+   NamedBarrier / TMA issue / MUFU）；每项 ≤ 几十行、不动主循环骨架。
+3. 编译期路径隔离，默认配置行为零变化。
+
+#### Files & Symbols
+
+- `csrc/cuffpa/cute/fp4/sm_120/split_d.cuh`、P pack
+  `csrc/cuffpa/cute/fp4/fp4_pscale.cuh`；
+- 参照范本：`csrc/cuffpa/cute/fp4/sm_120/persist_d.cuh`（两项有效方案的
+  落地形态）。
+
+#### Validation
+
+同 PC-7 套件（fp4 × D∈{320,512} × N∈{1024,4608,16384}）；动手前查附录 A
+（#14 fp4 Q smem 复用、#15 rescale merge 等 fp4 专属证伪项）。
+
+#### Risks & Rollback
+
+同 PC-7；fp4 专属风险：P pack 与 rescale 的微改动易触碰已证伪方向
+（#15/#16/#17），逐项先查边界。
+
+#### Expected Benefit
+
+按方案实测（参考量级：softmax 尾部单项 ~0.6%）。
+
+#### Dependencies
+
+PC-8（顺序：复杂优化逐个推进）。
+
+---
+
+### PC-10：fp4 split-D M4N2 量化大 D kernel 性能优化
+
+- **Status**: Draft ｜ **Priority**: P2 ｜ **Track**: 性能
+
+#### Motivation
+
+fp4 split-D M4N2（D≥768，代表 D=768/1024）：kBr=64、atom_layout=(4,2,1)、
+`o_acc=D/4`；与 fp8 M4N2 同为"低寄存器压力 + 长依赖链"形态。fp4 家族两项
+已验证有效方案（同 PC-9 Motivation）继续适用，M4N2 结构下须独立画像验证。
+
+#### Design
+
+同 PC-9 方法论（NCU 先决 + 两项有效方案 + 局部菜单 + 证伪边界核对）；
+PC-9 验证有效的方案优先复测移植。
+
+#### Files & Symbols
+
+- `csrc/cuffpa/cute/fp4/sm_120/split_d_m4n2.cuh`、P pack
+  `csrc/cuffpa/cute/fp4/fp4_pscale.cuh`；
+- 参照范本：同 PC-9。
+
+#### Validation
+
+同 PC-7 套件，bench 代表点改 D∈{768,1024}；每方案独立 A/B、独立回退。
+
+#### Risks & Rollback
+
+同 PC-9。
+
+#### Expected Benefit
+
+按方案实测。
+
+#### Dependencies
+
+PC-9（顺序：复杂优化逐个推进，同族经验复用）。
+
+---
+
+### PC-5：CUDA graph 友好化 (暂不实施，仅保留设计稿)
 
 - **Status**: Draft ｜ **Priority**: P3 ｜ **Track**: 性能（部署能力）
 
@@ -906,7 +1125,7 @@ PC-1 的 launch 形态先定（cooperative launch 的 graph 兼容性联动）�
 
 ---
 
-### PC-6：sm_89 fp8 int4 QK（低优先级，搁置）
+### PC-6：sm_89 fp8 int4 QK（低优先级，搁置）(暂不实施，仅保留设计稿)
 
 - **Status**: Draft ｜ **Priority**: P4（低，搁置） ｜ **Track**: 性能（sm_89 专属）
 

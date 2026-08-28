@@ -162,29 +162,36 @@ def test_nhd_layout_rejections(monkeypatch):
   torch.manual_seed(0)
   B, H, N = 1, 24, 4096
 
-  # fp16 D=256: outside the persist-D D<=128 range -> declined by the
-  # python gate (CUDABackend.is_nhd_supported), which raises TypeError
-  # (NHD has no path outside the fast path).
+  # fp16: %32 multiples stay on the CUTE_TMA fast path across the range
+  # (persist-D <=128, split-D (32,64) %64 / (32,32) %32, M4N2 %64>=768);
+  # 288 hits the (32,32) variant. Non-multiples beyond the persist-D pad
+  # range (e.g. 280) have no kernel: the gate declines with TypeError.
+  assert _backend().is_nhd_supported(256)
+  assert _backend().is_nhd_supported(288)
+  assert not _backend().is_nhd_supported(280)
   with pytest.raises(TypeError, match="NHD"):
     with torch.no_grad():
-      q, k, v = _mk(B, H, H, N, 256)
+      q, k, v = _mk(B, H, H, N, 280)
       ffpa_attn_func(
         _nhd(q),
         _nhd(k),
         _nhd(v),
         forward_backend=_backend(tensor_layout="NHD"),
       )
-  # Outside the persist-D range (fp8 D>224, fp4 D>256): the gate declines
-  # so NHD keeps the graceful BHND fallback. Hybrid and hadamard no
-  # longer block (stride-generic writeback / launcher-side BHND copies).
-  assert not _backend(enable_fp8=True).is_nhd_supported(256)
-  assert not _backend(enable_fp4=True).is_nhd_supported(320)
+  # Outside the persist-D range fp8/fp4 are now covered by
+  # split-D/M4N2 (%64 chunk granularity); 288/280 (not %64) have no
+  # kernel. Hybrid and hadamard no longer block (stride-generic
+  # writeback / launcher-side BHND copies).
+  assert _backend(enable_fp8=True).is_nhd_supported(256)
+  assert not _backend(enable_fp8=True).is_nhd_supported(288)
+  assert _backend(enable_fp4=True).is_nhd_supported(320)
+  assert not _backend(enable_fp4=True).is_nhd_supported(280)
   assert _backend(enable_fp8=True, fp8_hybrid=True).is_nhd_supported(128)
   assert _backend(enable_fp4=True, fp4_hybrid=True).is_nhd_supported(128)
   assert _backend(enable_fp8=True, fp8_hadamard=True).is_nhd_supported(128)
   assert _backend(enable_fp4=True, fp4_hadamard=True).is_nhd_supported(128)
-  # fp16 with the CUTE_TMA path opted out (enable_cute=False): NHD output
-  # packing only exists in the CUTE_TMA persist-D kernel.
+  # fp16 with the CUTE_TMA path opted out (enable_cute=False): every
+  # remaining fp16 path stores through a static BHND descriptor.
   with pytest.raises(TypeError, match="NHD"):
     with torch.no_grad():
       q, k, v = _mk(B, H, H, N, 128)
@@ -196,6 +203,23 @@ def test_nhd_layout_rejections(monkeypatch):
           backward=False,
           enable_tma=True,
           enable_cute=False,
+          tensor_layout="NHD",
+        ),
+      )
+  # force_cute (enable_tma=False + enable_cute=True): the python gate
+  # declines NHD (needs CUTE_TMA); the C++ backstop keeps rejecting it
+  # too, so the sm80 cp.async path never silently writes a packed O.
+  with pytest.raises(TypeError, match="NHD"):
+    with torch.no_grad():
+      q, k, v = _mk(B, H, H, N, 320)
+      ffpa_attn_func(
+        _nhd(q),
+        _nhd(k),
+        _nhd(v),
+        forward_backend=CUDABackend(
+          backward=False,
+          enable_tma=False,
+          enable_cute=True,
           tensor_layout="NHD",
         ),
       )
@@ -445,3 +469,499 @@ def test_fp8_strided_nhd_rejections(monkeypatch):
     torch.as_strided(narrow, (B, N, H, D), ov),
     "permute view",
   )
+
+
+# ---------------------------------------------------------------------------
+# split-D / M4N2 (RFC FC-1): strided-NHD reads on the large-D kernels.
+# Inputs are [B, H, N, D]-shaped strided fused-QKV chunk views consumed
+# zero-copy; O stays BHND-packed (the NHD O store is persist-D only until
+# FC-2), so the packed contiguous run is the reference.
+
+
+def _strided_hnd(q, k, v):
+  """[B, N, H, D] fused-QKV chunk views as [B, H, N, D]-shaped strided
+  views — what the HND-default call path sees (C++ stride detection is
+  the layout ground truth)."""
+  return q.permute(0, 2, 1, 3), k.permute(0, 2, 1, 3), v.permute(0, 2, 1, 3)
+
+
+@pytest.mark.parametrize("causal", [False, True], ids=["dense", "causal"])
+@pytest.mark.parametrize(
+  "B,H,Hkv,N",
+  [(1, 24, 24, 2048), (1, 24, 24, 3000), (2, 8, 8, 2048), (1, 24, 6, 2048)],
+  ids=["full", "tail", "batch", "gqa"],
+)
+@pytest.mark.parametrize(
+  "vq", ["per_channel", "per_block"], ids=["vchan", "vblk"]
+)
+def test_fp8_strided_nhd_split_d_bit_exact(B, H, Hkv, N, vq, causal):
+  """D=320 lands on the split-D fp8 kernel: strided fused-QKV inputs are
+  read zero-copy through the relaxed gate and the independent Lv
+  descriptor; only the pre-kernel addressing differs, so the packed run
+  must agree bitwise."""
+  torch.manual_seed(0)
+  D = 320
+  q, k, v = _fused_qkv(B, H, Hkv, N, D)
+  backend = _backend(enable_fp8=True, fp8_v_quant_method=vq, fp8_hybrid=False)
+  qs, ks, vs = _strided_hnd(q, k, v)
+  with torch.no_grad():
+    out_s = ffpa_attn_func(
+      qs, ks, vs, is_causal=causal, forward_backend=backend
+    )
+    out_c = ffpa_attn_func(
+      qs.contiguous(),
+      ks.contiguous(),
+      vs.contiguous(),
+      is_causal=causal,
+      forward_backend=backend,
+    )
+  assert out_s.shape == (B, H, N, D)
+  assert torch.equal(out_s, out_c)
+
+
+@pytest.mark.parametrize("causal", [False, True], ids=["dense", "causal"])
+@pytest.mark.parametrize(
+  "B,H,Hkv,N", [(1, 24, 24, 2048), (1, 24, 6, 2048)], ids=["full", "gqa"]
+)
+@pytest.mark.parametrize(
+  "vq", ["per_channel", "per_block"], ids=["vchan", "vblk"]
+)
+def test_fp8_strided_nhd_m4n2_bit_exact(B, H, Hkv, N, vq, causal):
+  """D=768 lands on the split-D M4N2 fp8 kernel (same FC-1 wiring)."""
+  torch.manual_seed(0)
+  D = 768
+  q, k, v = _fused_qkv(B, H, Hkv, N, D)
+  backend = _backend(enable_fp8=True, fp8_v_quant_method=vq, fp8_hybrid=False)
+  qs, ks, vs = _strided_hnd(q, k, v)
+  with torch.no_grad():
+    out_s = ffpa_attn_func(
+      qs, ks, vs, is_causal=causal, forward_backend=backend
+    )
+    out_c = ffpa_attn_func(
+      qs.contiguous(),
+      ks.contiguous(),
+      vs.contiguous(),
+      is_causal=causal,
+      forward_backend=backend,
+    )
+  assert out_s.shape == (B, H, N, D)
+  assert torch.equal(out_s, out_c)
+
+
+@pytest.mark.parametrize("causal", [False, True], ids=["dense", "causal"])
+@pytest.mark.parametrize(
+  "B,H,Hkv,N",
+  [(1, 24, 24, 2048), (2, 8, 8, 2048), (1, 24, 6, 2048)],
+  ids=["full", "batch", "gqa"],
+)
+def test_fp4_strided_nhd_split_d_bit_exact(B, H, Hkv, N, causal):
+  """D=320 lands on the split-D fp4 kernel: the quantize chain is
+  tensor-stride native, kv-mean/delta_s read through the relaxed Lkv."""
+  torch.manual_seed(0)
+  D = 320
+  q, k, v = _fused_qkv(B, H, Hkv, N, D)
+  backend = _backend(enable_fp4=True, fp4_hybrid=False)
+  qs, ks, vs = _strided_hnd(q, k, v)
+  with torch.no_grad():
+    out_s = ffpa_attn_func(
+      qs, ks, vs, is_causal=causal, forward_backend=backend
+    )
+    out_c = ffpa_attn_func(
+      qs.contiguous(),
+      ks.contiguous(),
+      vs.contiguous(),
+      is_causal=causal,
+      forward_backend=backend,
+    )
+  assert out_s.shape == (B, H, N, D)
+  assert torch.equal(out_s, out_c)
+
+
+@pytest.mark.parametrize("causal", [False, True], ids=["dense", "causal"])
+def test_fp4_strided_nhd_m4n2_bit_exact(causal):
+  """D=768 lands on the split-D M4N2 fp4 kernel (same FC-1 wiring)."""
+  torch.manual_seed(0)
+  B, H, Hkv, N, D = 1, 24, 6, 2048, 768
+  q, k, v = _fused_qkv(B, H, Hkv, N, D)
+  backend = _backend(enable_fp4=True, fp4_hybrid=False)
+  qs, ks, vs = _strided_hnd(q, k, v)
+  with torch.no_grad():
+    out_s = ffpa_attn_func(
+      qs, ks, vs, is_causal=causal, forward_backend=backend
+    )
+    out_c = ffpa_attn_func(
+      qs.contiguous(),
+      ks.contiguous(),
+      vs.contiguous(),
+      is_causal=causal,
+      forward_backend=backend,
+    )
+  assert out_s.shape == (B, H, N, D)
+  assert torch.equal(out_s, out_c)
+
+
+@pytest.mark.parametrize("causal", [False, True], ids=["dense", "causal"])
+@pytest.mark.parametrize(
+  "B,H,Hkv,N",
+  [(1, 24, 24, 2048), (2, 8, 8, 2048), (1, 24, 6, 2048)],
+  ids=["full", "batch", "gqa"],
+)
+def test_fp16_strided_nhd_split_d_bit_exact(B, H, Hkv, N, causal):
+  """fp16 split-D (D=320): stride-parameterized TMA descriptors read the
+  strided views zero-copy, mirroring the persist-D pattern."""
+  torch.manual_seed(0)
+  D = 320
+  q, k, v = _fused_qkv(B, H, Hkv, N, D)
+  backend = _backend()
+  qs, ks, vs = _strided_hnd(q, k, v)
+  with torch.no_grad():
+    out_s = ffpa_attn_func(
+      qs, ks, vs, is_causal=causal, forward_backend=backend
+    )
+    out_c = ffpa_attn_func(
+      qs.contiguous(),
+      ks.contiguous(),
+      vs.contiguous(),
+      is_causal=causal,
+      forward_backend=backend,
+    )
+  assert out_s.shape == (B, H, N, D)
+  assert torch.equal(out_s, out_c)
+
+
+@pytest.mark.parametrize("causal", [False, True], ids=["dense", "causal"])
+def test_fp16_strided_nhd_m4n2_bit_exact(causal):
+  """fp16 split-D M4N2 (D=768): same stride-parameterized descriptors."""
+  torch.manual_seed(0)
+  B, H, Hkv, N, D = 1, 24, 6, 2048, 768
+  q, k, v = _fused_qkv(B, H, Hkv, N, D)
+  backend = _backend()
+  qs, ks, vs = _strided_hnd(q, k, v)
+  with torch.no_grad():
+    out_s = ffpa_attn_func(
+      qs, ks, vs, is_causal=causal, forward_backend=backend
+    )
+    out_c = ffpa_attn_func(
+      qs.contiguous(),
+      ks.contiguous(),
+      vs.contiguous(),
+      is_causal=causal,
+      forward_backend=backend,
+    )
+  assert out_s.shape == (B, H, N, D)
+  assert torch.equal(out_s, out_c)
+
+
+def test_fp16_strided_nhd_mixed_q_bhnd():
+  """Mixed families are legal per tensor: a BHND-packed Q with strided-NHD
+  K/V must match the all-packed run (the launcher dispatches the Q
+  descriptor family independently from K/V)."""
+  torch.manual_seed(0)
+  B, H, Hkv, N, D = 1, 24, 6, 2048, 320
+  q, k, v = _fused_qkv(B, H, Hkv, N, D)
+  backend = _backend()
+  _, ks, vs = _strided_hnd(q, k, v)
+  with torch.no_grad():
+    out_m = ffpa_attn_func(
+      _strided_hnd(q, k, v)[0].contiguous(),
+      ks,
+      vs,
+      forward_backend=backend,
+    )
+    out_c = ffpa_attn_func(
+      _strided_hnd(q, k, v)[0].contiguous(),
+      ks.contiguous(),
+      vs.contiguous(),
+      forward_backend=backend,
+    )
+  assert torch.equal(out_m, out_c)
+
+
+# ---------------------------------------------------------------------------
+# Hybrid + strided/NHD on split-D/M4N2 (RFC FC-3): the stage-1 fp16 kernels
+# consume strided-NHD natively (FC-1) and stage-2 quantize is layout-generic
+# with q_start_row offsetting only the attention grid, so hybrid now composes
+# with any input family across the whole head_dim range.
+
+
+@pytest.mark.parametrize("causal", [False, True], ids=["dense", "causal"])
+@pytest.mark.parametrize(
+  "family,D",
+  [("fp8", 320), ("fp8", 768), ("fp4", 320), ("fp4", 768)],
+  ids=["fp8-d320-split", "fp8-d768-m4n2", "fp4-d320-split", "fp4-d768-m4n2"],
+)
+def test_hybrid_strided_nhd_large_d_bit_exact(family, D, causal):
+  """Hybrid + strided fused-QKV on the large-D kernels (RFC FC-3): the
+  strided run must match the BHND-packed hybrid run bitwise (same
+  kernels, only the stage-1/stage-2 input addressing differs)."""
+  torch.manual_seed(0)
+  B, H, Hkv, N = 1, 24, 6, 2048
+  q, k, v = _fused_qkv(B, H, Hkv, N, D)
+  kw = (
+    dict(enable_fp8=True, fp8_hybrid=True, fp8_hybrid_n_early=256)
+    if family == "fp8" else
+    dict(enable_fp4=True, fp4_hybrid=True, fp4_hybrid_n_early=256)
+  )
+  backend = _backend(**kw)
+  qs, ks, vs = _strided_hnd(q, k, v)
+  with torch.no_grad():
+    out_s = ffpa_attn_func(
+      qs, ks, vs, is_causal=causal, forward_backend=backend
+    )
+    out_c = ffpa_attn_func(
+      qs.contiguous(),
+      ks.contiguous(),
+      vs.contiguous(),
+      is_causal=causal,
+      forward_backend=backend,
+    )
+  assert out_s.shape == (B, H, N, D)
+  assert torch.equal(out_s, out_c)
+
+
+@pytest.mark.parametrize("causal", [False, True], ids=["dense", "causal"])
+def test_hybrid_nhd_view_large_d_bit_exact(causal):
+  """Packed-NHD permute views + hybrid at D>224 (the nhd_in half of the
+  pre-FC-3 gate): NHD in/out must match the BHND run bitwise."""
+  torch.manual_seed(0)
+  B, H, N, D = 1, 24, 2048, 320
+  q, k, v = _mk(B, H, H, N, D)
+  kw = dict(enable_fp8=True, fp8_hybrid=True, fp8_hybrid_n_early=256)
+  backend = _backend(**kw)
+  backend_nhd = _backend(tensor_layout="NHD", **kw)
+  with torch.no_grad():
+    out_b = ffpa_attn_func(q, k, v, is_causal=causal, forward_backend=backend)
+    out_n = ffpa_attn_func(
+      _nhd(q), _nhd(k), _nhd(v), is_causal=causal, forward_backend=backend_nhd
+    )
+  assert out_n.shape == (B, N, H, D) and out_n.is_contiguous()
+  torch.testing.assert_close(out_n, out_b.permute(0, 2, 1, 3))
+
+
+def test_fp8_hybrid_mixed_kv_family_split_d():
+  """Mixed K/V layout families (BHND K + strided-NHD V) + hybrid:
+  prepare_hybrid_stage1 materializes both for the fp16 stage-1 kernel
+  (k_nhd == v_nhd), so the result matches the all-strided hybrid run."""
+  torch.manual_seed(0)
+  B, H, Hkv, N, D = 1, 24, 6, 2048, 320
+  q, k, v = _fused_qkv(B, H, Hkv, N, D)
+  kw = dict(enable_fp8=True, fp8_hybrid=True, fp8_hybrid_n_early=256)
+  backend = _backend(**kw)
+  qs, ks, vs = _strided_hnd(q, k, v)
+  with torch.no_grad():
+    out_m = ffpa_attn_func(qs, ks.contiguous(), vs, forward_backend=backend)
+    out_s = ffpa_attn_func(qs, ks, vs, forward_backend=backend)
+  assert torch.equal(out_m, out_s)
+
+
+def test_fp8_hybrid_strided_semantic_decomposition():
+  """Semantic wiring of hybrid at D=320 (dense + causal): late rows equal
+  the no-hybrid quantized run bitwise (stage-2 is deterministic on
+  identical workspaces), early rows equal the plain fp16 run (stage-1 is
+  that kernel on the same values)."""
+  torch.manual_seed(0)
+  B, H, Hkv, N, D, n_early = 1, 24, 6, 2048, 320, 256
+  q, k, v = _fused_qkv(B, H, Hkv, N, D)
+  qs, ks, vs = _strided_hnd(q, k, v)
+  with torch.no_grad():
+    out_h = ffpa_attn_func(
+      qs,
+      ks,
+      vs,
+      is_causal=True,
+      forward_backend=_backend(
+        enable_fp8=True, fp8_hybrid=True, fp8_hybrid_n_early=n_early
+      ),
+    )
+    out_q = ffpa_attn_func(
+      qs,
+      ks,
+      vs,
+      is_causal=True,
+      forward_backend=_backend(enable_fp8=True, fp8_hybrid=False),
+    )
+    out_fp16 = ffpa_attn_func(
+      qs, ks, vs, is_causal=True, forward_backend=_backend()
+    )
+  assert torch.equal(out_h[:, :, n_early:, :], out_q[:, :, n_early:, :])
+  assert torch.equal(out_h[:, :, :n_early, :], out_fp16[:, :, :n_early, :])
+
+
+# ---------------------------------------------------------------------------
+# NHD O store (RFC FC-2): the split-D/M4N2 kernels take a runtime
+# nhd_out branch (dynamic TMA descriptor + head-folded column tiles).
+# Same-kernel NHD vs BHND outputs must agree bitwise. B>=2 and H>=2 are
+# mandatory shapes here: with B==1 or H==1 the two packings coincide and
+# a wrong head fold would pass silently.
+
+
+@pytest.mark.parametrize("causal", [False, True], ids=["dense", "causal"])
+@pytest.mark.parametrize(
+  "B,H,Hkv,N",
+  [(2, 8, 8, 2048), (2, 8, 8, 3000), (2, 24, 6, 4096)],
+  ids=["batch", "tail", "gqa"],
+)
+@pytest.mark.parametrize(
+  "vq", ["per_channel", "per_block"], ids=["vchan", "vblk"]
+)
+def test_fp8_nhd_out_split_d_bit_exact(B, H, Hkv, N, vq, causal):
+  """D=320 lands on the split-D M8N1 fp8 kernel; the tail case pins the
+  R->G store's NHD row stride (Nh*kHeadDim) and offset."""
+  torch.manual_seed(0)
+  D = 320
+  q, k, v = _mk(B, H, Hkv, N, D)
+  backend = _backend(enable_fp8=True, fp8_v_quant_method=vq, fp8_hybrid=False)
+  backend_nhd = _backend(
+    enable_fp8=True,
+    fp8_v_quant_method=vq,
+    fp8_hybrid=False,
+    tensor_layout="NHD",
+  )
+  with torch.no_grad():
+    out_b = ffpa_attn_func(q, k, v, is_causal=causal, forward_backend=backend)
+    out_n = ffpa_attn_func(
+      _nhd(q), _nhd(k), _nhd(v), is_causal=causal, forward_backend=backend_nhd
+    )
+  assert out_n.shape == (B, N, H, D) and out_n.is_contiguous()
+  assert torch.equal(out_n, out_b.permute(0, 2, 1, 3))
+
+
+@pytest.mark.parametrize("causal", [False, True], ids=["dense", "causal"])
+@pytest.mark.parametrize(
+  "B,H,Hkv,N",
+  [(2, 8, 8, 2048), (2, 8, 8, 3000), (2, 24, 6, 4096)],
+  ids=["batch", "tail", "gqa"],
+)
+@pytest.mark.parametrize(
+  "vq", ["per_channel", "per_block"], ids=["vchan", "vblk"]
+)
+def test_fp8_nhd_out_m4n2_bit_exact(B, H, Hkv, N, vq, causal):
+  """D=768 lands on the split-D M4N2 fp8 kernel; the tail case pins the
+  partial-Nq semantics (kBr=64, N-warp half columns absorbed by the
+  shared epilogue path)."""
+  torch.manual_seed(0)
+  D = 768
+  q, k, v = _mk(B, H, Hkv, N, D)
+  backend = _backend(enable_fp8=True, fp8_v_quant_method=vq, fp8_hybrid=False)
+  backend_nhd = _backend(
+    enable_fp8=True,
+    fp8_v_quant_method=vq,
+    fp8_hybrid=False,
+    tensor_layout="NHD",
+  )
+  with torch.no_grad():
+    out_b = ffpa_attn_func(q, k, v, is_causal=causal, forward_backend=backend)
+    out_n = ffpa_attn_func(
+      _nhd(q), _nhd(k), _nhd(v), is_causal=causal, forward_backend=backend_nhd
+    )
+  assert out_n.shape == (B, N, H, D) and out_n.is_contiguous()
+  assert torch.equal(out_n, out_b.permute(0, 2, 1, 3))
+
+
+@pytest.mark.parametrize("causal", [False, True], ids=["dense", "causal"])
+@pytest.mark.parametrize(
+  "B,H,Hkv,N",
+  [(1, 24, 24, 2048), (2, 8, 8, 2048), (1, 24, 6, 2048)],
+  ids=["full", "batch", "gqa"],
+)
+def test_fp8_strided_nhd_out_bit_exact(B, H, Hkv, N, causal):
+  """Strided fused-QKV inputs (FC-1 reads) combined with the NHD O store
+  (FC-2 writes). ``_fused_qkv`` already yields [B, N, H, D]-shaped
+  strided views — the NHD-call convention; the packed-NHD run is the
+  reference, BHND the anchor."""
+  torch.manual_seed(0)
+  D = 320
+  q, k, v = _fused_qkv(B, H, Hkv, N, D)
+  backend_nhd = _backend(enable_fp8=True, fp8_hybrid=False, tensor_layout="NHD")
+  with torch.no_grad():
+    out_s = ffpa_attn_func(
+      q, k, v, is_causal=causal, forward_backend=backend_nhd
+    )
+    out_n = ffpa_attn_func(
+      q.contiguous(),
+      k.contiguous(),
+      v.contiguous(),
+      is_causal=causal,
+      forward_backend=backend_nhd,
+    )
+    out_b = ffpa_attn_func(
+      q.permute(0, 2, 1, 3).contiguous(),
+      k.permute(0, 2, 1, 3).contiguous(),
+      v.permute(0, 2, 1, 3).contiguous(),
+      is_causal=causal,
+      forward_backend=_backend(enable_fp8=True, fp8_hybrid=False),
+    )
+  assert out_s.shape == (B, N, H, D) and out_s.is_contiguous()
+  assert torch.equal(out_s, out_n)
+  assert torch.equal(out_s, out_b.permute(0, 2, 1, 3))
+
+
+@pytest.mark.parametrize("causal", [False, True], ids=["dense", "causal"])
+@pytest.mark.parametrize(
+  "B,H,Hkv,N",
+  [(2, 8, 8, 2048), (2, 8, 8, 3000), (2, 24, 6, 4096)],
+  ids=["batch", "tail", "gqa"],
+)
+def test_fp4_nhd_out_split_d_bit_exact(B, H, Hkv, N, causal):
+  """D=320 lands on the split-D fp4 kernel (persistent work loop); the
+  per-work coordinates carry the NHD fold, the staging protocol is
+  untouched."""
+  torch.manual_seed(0)
+  D = 320
+  q, k, v = _mk(B, H, Hkv, N, D)
+  backend = _backend(enable_fp4=True, fp4_hybrid=False)
+  backend_nhd = _backend(enable_fp4=True, fp4_hybrid=False, tensor_layout="NHD")
+  with torch.no_grad():
+    out_b = ffpa_attn_func(q, k, v, is_causal=causal, forward_backend=backend)
+    out_n = ffpa_attn_func(
+      _nhd(q), _nhd(k), _nhd(v), is_causal=causal, forward_backend=backend_nhd
+    )
+  assert out_n.shape == (B, N, H, D) and out_n.is_contiguous()
+  assert torch.equal(out_n, out_b.permute(0, 2, 1, 3))
+
+
+@pytest.mark.parametrize("causal", [False, True], ids=["dense", "causal"])
+@pytest.mark.parametrize(
+  "B,H,Hkv,N",
+  [(2, 8, 8, 2048), (2, 8, 8, 3000), (2, 24, 6, 4096)],
+  ids=["batch", "tail", "gqa"],
+)
+def test_fp4_nhd_out_m4n2_bit_exact(B, H, Hkv, N, causal):
+  """D=768 lands on the split-D M4N2 fp4 kernel; the tail case pins the
+  partial-Nq R->G store (kBr=64) on the packed layout."""
+  torch.manual_seed(0)
+  D = 768
+  q, k, v = _mk(B, H, Hkv, N, D)
+  backend = _backend(enable_fp4=True, fp4_hybrid=False)
+  backend_nhd = _backend(enable_fp4=True, fp4_hybrid=False, tensor_layout="NHD")
+  with torch.no_grad():
+    out_b = ffpa_attn_func(q, k, v, is_causal=causal, forward_backend=backend)
+    out_n = ffpa_attn_func(
+      _nhd(q), _nhd(k), _nhd(v), is_causal=causal, forward_backend=backend_nhd
+    )
+  assert out_n.shape == (B, N, H, D) and out_n.is_contiguous()
+  assert torch.equal(out_n, out_b.permute(0, 2, 1, 3))
+
+
+@pytest.mark.parametrize("causal", [False, True], ids=["dense", "causal"])
+@pytest.mark.parametrize(
+  "B,H,Hkv,N",
+  [(2, 8, 8, 2048), (2, 8, 8, 3000), (2, 24, 6, 4096)],
+  ids=["batch", "tail", "gqa"],
+)
+@pytest.mark.parametrize("D", [320, 768], ids=["d320", "d768"])
+def test_fp16_nhd_out_bit_exact(B, H, Hkv, N, D, causal):
+  """fp16 split-D (D=320; the epilogue is shared across the 4x4 template
+  grid) and M4N2 (D=768): the runtime nhd_out branch covers every
+  variant."""
+  torch.manual_seed(0)
+  q, k, v = _mk(B, H, Hkv, N, D)
+  backend = _backend()
+  backend_nhd = _backend(tensor_layout="NHD")
+  with torch.no_grad():
+    out_b = ffpa_attn_func(q, k, v, is_causal=causal, forward_backend=backend)
+    out_n = ffpa_attn_func(
+      _nhd(q), _nhd(k), _nhd(v), is_causal=causal, forward_backend=backend_nhd
+    )
+  assert out_n.shape == (B, N, H, D) and out_n.is_contiguous()
+  assert torch.equal(out_n, out_b.permute(0, 2, 1, 3))

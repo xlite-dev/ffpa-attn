@@ -300,7 +300,7 @@ D 交叉点与 fp16 家族一致（<768 M8N1 / ≥768 M4N2）。`FFPA_FP8_FORCE_
 
 - 结构：stage-1 用 **fp16 kernel**（按 D 选 persist-D/split-D/M4N2）算 `[0:n_early)` 行；stage-2 fp8 kernel 以 `q_start_row=n_early` 偏移算其余行。stage-1 输出经 stride-generic `O.slice(...).copy_` 回写（NHD O 兼容）。
 - 动机：保护 causal early rows 精度（§5.4）。
-- 约束：`n_early %128`（M4N2 段 %64）；`D>224`（fp8 split-D/M4N2 范围）+ `nhd_in || strided_in` + hybrid → **显式拒绝**（stage-1 fp16 split-D TMA 烧死 BHND）；D≤224 的 persist-D 范围 hybrid 与 NHD/strided 兼容（stage-1 persist-D 原生吃 strided，非 causal 分支 K/V 直传零拷贝）。
+- 约束：`n_early %128`（fp8 M4N2 段 %64）。hybrid 与 NHD/strided 输入**全 D 兼容**（FC-3，9b9dcae）：stage-1 fp16 kernel（persist-D/split-D/M4N2）均原生消费 strided/NHD——dense 分支 K/V 直传零拷贝，causal/pad 分支在 `prepare_hybrid_stage1` 内物化 BHND 前缀（Q_e 恒物化）；stage-2 量化链 layout-generic 且恒做 full-Q 量化，`q_start_row` 只偏移 attn kernel grid；K/V 布局族不匹配（如 BHND K + strided V）时 prep 自动物化兜底。
 - `prepare_hybrid_stage1`：d_padded 时 pad 早行切片到 D_pad；causal 时 K/V 切 `[0, kv_offset+n_early)`。
 
 ### 5.6 特性支持矩阵（fp8 三族对比）
@@ -314,7 +314,7 @@ D 交叉点与 fp16 家族一致（<768 M8N1 / ≥768 M4N2）。`FFPA_FP8_FORCE_
 | NHD 读（packed view） | ✓ | ✓（quantize NHD-native） | ✓ |
 | **strided-NHD 读** | ✓（relaxed gate + Lv） | ✗（严格 gate） | ✗ |
 | NHD O 写 | ✓（D≤224） | ✗ | ✗ |
-| hybrid | ✓ | ✓（但 strided/NHD 输入被拒） | ✓（同左，n_early%64） |
+| hybrid | ✓ | ✓ | ✓（n_early%64） |
 | smooth_v (per-channel V) | ✓ | ✓（v_per_channel 可用但 smooth_v？—— split-D 头注释明确 *只支持 per-block V / f32 PV acc* 的旧说明已被覆盖：dispatch 传参支持，但注意头注释 "split_d only supports per-block V / f32 PV acc" 的历史限制） | ✓（kVPerChannel/kPVAccF16 模板参数） |
 | per_thread Q/K | ✓（kQKPerThread） | ✓ | ✓（quant_offset 处理 kBr=64 与 128-row quant block 映射） |
 | head_dim pad | ✓（quantize 读 D_og stride + 零填 pad 列，**Q/K/V 不物化 pad**，仅 O pad） | ✓ 同左 | ✓ 同左 |
@@ -400,7 +400,7 @@ lse 公式：`lse = (m*L + log2(row_sum) + log2(1/2688))*ln2 + scale*qkm`（P2=2
 | NHD 读 | ✓（Lkv/Lv relaxed gate） | ✓（严格 gate，packed view） | ✓（严格 gate） |
 | **strided-NHD 读** | ✓ | ✗ | ✗ |
 | NHD O 写 | ✓（D≤256） | ✗ | ✗ |
-| hybrid | ✓ | ✓（strided+hybrid 拒） | ✓（同左） |
+| hybrid | ✓ | ✓ | ✓ |
 | `fp4_pv_mm_type='fp8'`（MXFP8 PV） | ✓ 仅 `D≤192`（smem 预算） | **✗**（TORCH_CHECK） | **✗** |
 | `fp4_smooth_v` | ✓ | **✗**（persist-D 专属） | **✗** |
 | hadamard | ✓（pow2 fused / 非 pow2 物化） | ✓（非 pow2 物化） | ✓（同左） |
@@ -452,9 +452,9 @@ lse 公式：`lse = (m*L + log2(row_sum) + log2(1/2688))*ln2 + scale*qkm`（P2=2
 |---|---|---|---|---|---|---|---|
 | BHND-packed `[B,H,N,D]` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | packed-NHD view（diffusers BNHD permute，stride=(NHD,D,HD,1)） | ✓ 零拷贝 | ✓ 零拷贝（TMA flat 行） | ✓ 零拷贝（Fp8InputLayout） | ✓ | ✓ | ✓ | ✗ 物化 BHND 副本 |
-| strided-NHD（fused-QKV chunk，row stride > H·D） | ✓（D≤128） | ✗ | ✓（Lv 独立描述符） | ✗ | ✓ | ✗ | ✗ |
-| K/V 布局族约束 | 同族（k_nhd==v_nhd），row stride 可不同 | 同族且 stride 一致（"V must share K's layout"） | persist：Lkv/Lv 独立 | Lkv 共享（严格 gate） | Lv 独立 | Lkv 共享 | BHND-only |
-| **O 写侧 NHD** | ✓（`nhd_out` 运行时分支） | ✗ 静态 BHND gO | ✓（D≤224） | ✗ | ✓（D≤256） | ✗ | ✗ |
+| strided-NHD（fused-QKV chunk，row stride > H·D） | ✓（D≤128） | ✓ 零拷贝（FC-1） | ✓（Lv 独立描述符） | ✓（FC-1） | ✓ | ✓（FC-1） | ✗ |
+| K/V 布局族约束 | 同族（k_nhd==v_nhd），row stride 可不同 | 同族（k_nhd==v_nhd），row stride 可不同（FC-1） | Lkv/Lv 独立（mixed 族 OK） | Lkv/Lv 独立（FC-1） | Lkv/Lv 独立 | Lkv/Lv 独立（FC-1） | BHND-only |
+| **O 写侧 NHD** | ✓（`nhd_out` 运行时分支） | ✓（FC-2 运行时 `nhd_out` 分支） | ✓ | ✓（FC-2） | ✓ | ✓（FC-2） | ✗ |
 
 strided-NHD 门禁细节（`ffpa_is_strided_nhd`）：`stride(3)==1 && stride(1)==D && stride(2)≥H·D`（排除负/头重叠）且 `B>1 时 stride(0)==stride(2)·N >0`；TMA 消费需 data_ptr/row/batch stride ×elemsize 均 16B 对齐。Python 镜像谓词 `ffpa_attn.is_nhd_zero_copy_input(t)`（[B,N,H,D] 语义）。`tensor_layout='NHD'` 时 Python 侧 permute 归一化（零拷贝）+ O 用 `empty_strided` 显式 packed NHD 分配（**不能用 empty_like**——会继承 strided storage 导致 kernel 按 packed 写静默坏）。
 
@@ -463,7 +463,7 @@ strided-NHD 门禁细节（`ffpa_is_strided_nhd`）：`stride(3)==1 && stride(1)
 - **packed-NHD view**（`ffpa_is_nhd_view`）：strides 严格 = `(N·H·D, D, H·D, 1)`——底层 storage 是完全 packed 的 `[B,N,H,D]`（行步长恰为 $H\cdot D$，行与行无缝密铺）。本质是 BHND-packed tensor 的**视图别名**：同一 batch 内全部 $N\cdot H$ 行构成一段连续 flat 行序列，kernel 按 flat $(B\cdot N,\ H\cdot D)$ 行主序矩阵寻址（列 tile = head，"TMA flat 行"），无需任何拷贝。
 - **strided-NHD**（`ffpa_is_strided_nhd`）：shape 同为 `[B,H,N,D]`，但行步长 `stride(2)` 大于 $H\cdot D$——单行内（$H\cdot D$ 连续）仍 packed，**行与行之间夹有外来数据**。典型形态是 fused-QKV(+MLP) 投影的 chunk view：FLUX.2 single-stream block 把 QKV 投影融合为 `[B, N, H_total·D]`，切出 V 后其行步长 = 融合缓冲总头维（大于 $H_v\cdot D$），相邻 V 行之间交错着同一 token 的 Q/K。
 
-**为何只有 strided-NHD 才算真零拷贝**：真实下游流水线（diffusers / cache-dit）的 QKV 是 Linear 投影输出，天然 NHD 布局；fused-QKV 形态下切出的 Q/K/V 全是 strided chunk——这类输入**无法表达成 packed-NHD view**（行步长 $>H\cdot D$，不能 flat 化）。只支持 packed-NHD view 时，"NHD 零拷贝"仅对人造输入（BHND→permute）成立，真实下游输入仍需 `contiguous()` 物化后才能进 kernel。只有 kernel 能直接消费任意行步长（正、16B 对齐）的 NHD 行——fp8/fp4 经 `Fp8InputLayout` 的 `s_row`/`s_batch` 寻址 + V 独立 `Lv` 描述符，fp16 persist-D 经独立 Lq/Lk/Lv——才做到"下游实际产生的 NHD 输入零物化进 kernel"（#343，对齐 SageAttention 的零拷贝行为）。即：packed-NHD view 只是 strided 机制在行步长等于 $H\cdot D$ 时的退化特例，strided-NHD 是通用形态；split-D / M4N2 的缺口（RFC FC-1）正是尚未接通这个通用机制。
+**为何只有 strided-NHD 才算真零拷贝**：真实下游流水线（diffusers / cache-dit）的 QKV 是 Linear 投影输出，天然 NHD 布局；fused-QKV 形态下切出的 Q/K/V 全是 strided chunk——这类输入**无法表达成 packed-NHD view**（行步长 $>H\cdot D$，不能 flat 化）。只支持 packed-NHD view 时，"NHD 零拷贝"仅对人造输入（BHND→permute）成立，真实下游输入仍需 `contiguous()` 物化后才能进 kernel。只有 kernel 能直接消费任意行步长（正、16B 对齐）的 NHD 行——fp8/fp4 经 `Fp8InputLayout` 的 `s_row`/`s_batch` 寻址 + V 独立 `Lv` 描述符，fp16 persist-D 经独立 Lq/Lk/Lv——才做到"下游实际产生的 NHD 输入零物化进 kernel"（#343，对齐 SageAttention 的零拷贝行为）。即：packed-NHD view 只是 strided 机制在行步长等于 $H\cdot D$ 时的退化特例，strided-NHD 是通用形态；该通用机制已由 FC-1（split-D/M4N2 strided 读）→ FC-2（NHD O 写）→ FC-3（hybrid 组合）在全家族接通，大 D 布局闭环完成。
 
 ### 7.5 head_dim 覆盖与 pad
 
@@ -487,13 +487,13 @@ softmax_scale 恒按真实 D（Python 解析 `1/sqrt(D_og)`）。
 
 ## 8. split-D / M4N2 相对 persist-D 的功能缺口
 
-按路径族的持久化差距清单（persist-D 拥有、split-D/M4N2 缺失）：
+按路径族的持久化差距清单（persist-D 拥有、split-D/M4N2 缺失）。**#1-#3 已随 F1 布局轨道（FC-1/FC-2/FC-3，2026-08-28）全部关闭**，保留行仅作历史根因记录：
 
 | # | 缺口 | 影响 | 涉及路径 | 根因 |
 |---|---|---|---|---|
-| 1 | **NHD O 写**（`nhd_out` 运行时分支 + 双分支动态 int64 gO） | `tensor_layout='NHD'` 在 D>224(fp8)/D>256(fp4)/D>128(fp16) 直接不可用（python gate decline → TypeError） | fp8/fp4/fp16 全部 split-D/M4N2 | O store 是静态 BHND TMA descriptor；补齐需要 full-tile 4 运行时值 + `get_tma_tensor` 动态 shape（persist-D 模板可照抄，memory 记录了完整模式） |
-| 2 | **strided-NHD 读**（relaxed `ffpa_layout_of`） | fused-QKV chunk 输入（FLUX.2 single-stream V）须物化或拒绝 | fp8/fp4 split-D/M4N2 | quantize 侧描述符共享 Lkv；独立 Lv 已在 persist-D 验证（尾参 `&Lv`），split-D 调用点未接 |
-| 3 | **strided/NHD + hybrid 组合** | `TORCH_CHECK` 显式拒（"requires the persist-D path"） | fp8 D>224 / fp4 D>256 | hybrid stage-1 的 fp16 split-D TMA 输入烧死 BHND（`prepare_hybrid_stage1` 只在非 causal 分支直传） |
+| 1 | **NHD O 写**（`nhd_out` 运行时分支 + 双分支动态 int64 gO） | ✅ 已补齐（FC-2，df7d572/c4ca38b/2382ca4）：split-D/M4N2 运行时 `nhd_out` 动态描述符，`tensor_layout='NHD'` 全 D 可用 | fp8/fp4/fp16 全部 split-D/M4N2 | （已解决）原 O store 是静态 BHND TMA descriptor |
+| 2 | **strided-NHD 读**（relaxed `ffpa_layout_of`） | ✅ 已补齐（FC-1，cc8e8dc/4a49d38/882ee07）：split-D/M4N2 独立 `Lq/Lkv/Lv`，fused-QKV chunk 零物化 | fp8/fp4/fp16 split-D/M4N2 | （已解决）原 quantize 侧描述符共享 Lkv |
+| 3 | **strided/NHD + hybrid 组合** | ✅ 已补齐（FC-3，9b9dcae）：dispatch gate 删除，hybrid 与任意布局族组合可用（dense 零拷贝 / causal 物化前缀） | fp8 D>224 / fp4 D>256 | （已解决）原 stage-1 gate 误拒 |
 | 4 | **fp4 smooth_v / MXFP8-PV** | fp4 大 D 精度/速度 knob 缺失 | fp4 split-D/M4N2 | `TORCH_CHECK(fp4_smooth_v ... persist_d)`；mxfp8 traits `static_assert D≤192` |
 | 5 | fp16 persist-D 专属的 WS 结构 | （非缺口，差异说明）split-D/M4N2 是 non-WS | fp16 split 家族 | setmaxnreg 232 装不下大 D o_acc；FA-1 M4N2 是替代方案 |
 | 6 | **attn_bias / dropout（量化路径全体）** | 低精度 + mask/dropout 无解 | fp8/fp4 全部（含 persist-D） | 量化 kernel 链无 bias 注入点；P 量化与 bias 叠加需要 bias 在 S 域 fp32 化后再量化，工程量大 |
@@ -515,11 +515,11 @@ softmax_scale 恒按真实 D（Python 解析 `1/sqrt(D_og)`）。
 1. **Mega Quantize Kernel（aux 链大融合）**：fp8/fp4 前处理链 pad/smooth/hadamard/vstats/vt/quantize/permute（≈13 kernel/call vs sage 7；CPU dispatch wall-GPU 129µs vs sage 50µs，§5.3）融合进单个大 kernel，中间结果留 smem/寄存器，消灭 gmem round-trip 与逐 kernel launch/dispatch 开销。关键难点是 vstats per-channel scale 的跨行全局依赖（必须先于 quantize 完成），用 kernel 内两阶段 + grid 级屏障（cooperative groups）解决。**multi-stream 并行 aux 链不可行**：依赖图跨分支并行窗口小、小 kernel 间无法互饱 SM，反增 event 同步与 launch 开销——并行化 launch 省不掉 gmem 往返，融合才是正方向。
 2. **增量融合（Mega Kernel 的步进）**：先融无全局依赖的相邻对，每步独立验收：kv_mean 融进 quantize（跨块全局依赖，需重新评估原子/屏障成本）；fused qkv 量化扩展到 D>128；pad+quantize 合并。最终收敛到方向 1 的巨型 kernel。
 3. **fp4 attn kernel 内部**：quantize CVT 链、NCU 驱动的指令 mix 优化（Phase 3 后仍有空间）；causal 三段化（全 -inf 行 tile 跳过，预期 1-2%，低优先）。
-4. **split-D/M4N2 补 NHD O 写**（§8 #1）：模式已模板化（persist-D 的 full-tile 动态 gO），主要是照抄 + 各 traits 的 O 分支；完成后 `tensor_layout='NHD'` 全 D 可用。
-5. **split-D/M4N2 接独立 Lv**（§8 #2）：尾参已在 persist-D 验证，接线点明确（split-D quantize launcher 尾参 + fused kernel role==2）。
+4. ~~**split-D/M4N2 补 NHD O 写**（§8 #1）~~：✅ 已完成（FC-2）。
+5. ~~**split-D/M4N2 接独立 Lv**（§8 #2）~~：✅ 已完成（FC-1）。
 6. **量化路径的 attn_bias**（§8 #6，大工程）：bias 在 S 累加器 fp32 域注入 → P 量化前；需要每 tile bias TMA/cp.async 加载通道（fp16 家族已有可抄的 bias 加载协议）。
 7. **配置自适应**：历史测量 `fp8_qk_mm_type/pv_acc_type` 存在 N-crossover（小 N 偏 fp8 QK、大 N 偏 int8 QK，crossover ∈ (4608,8192)）；默认配置已统一为 QK int8 + PV f16 acc，可按 Nkv 在反转区自适应切换（切前须跑 FLUX PSNR 验证精度）。
-8. **decode/短 Nq 的量化路径**：fp4 固定前处理 ~1.1ms 使小 Nq 不划算；方向是前处理链的 lazy/条件化（Nq 小时跳过 qm/delta_s 或整体回退 fp16）。
+8. ~~**decode/短 Nq 的量化路径**~~（⏸ RFC FC-7 暂不实施，仅保留设计稿，2026-08-28）：短 Nq/decode 量化基本没有收益——fp4 固定前处理 ~1.1ms 结构性占优、小 Nq 下量化吞吐优势摊不开，decode 已由 native split-KV fp16 覆盖。
 9. **P online 量化的精度优化**（§5.4）：P 是量化注意力中唯一 online 量化、无法离线校准的对象，其精度丢失是量化 attn 误差的最主要根源之一。候选形态：更好的满量程利用率、行感知 scale、causal 早行 P 高精度补偿；须避开已证伪的 per-row P quant + 重开 lazy rescale（§5.8 #12）。
 
 ### 9.2 框架/工程级
