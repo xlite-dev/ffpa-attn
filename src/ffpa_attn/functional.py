@@ -614,20 +614,25 @@ class CUDABackend(Backend):
 
     NHD requires the CUTE_TMA path (native / TMA / CUTE keep a static
     BHND gO); fp8/fp4 always dispatch there, so only the fp16 family
-    checks the impl flags. fp8 covers the full headdim range: persist-D
-    (%32, D<=224) and split-D/M4N2 (%64, D>224), each with a runtime
-    ``nhd_out`` O-store branch. fp4/fp16 keep the persist-D caps for now
-    (fp4 <= 256, fp16 <= 128). Hybrid and hadamard are both fine: the
-    hybrid stage-1 writeback is a stride-generic ``O.slice(...).copy_``
-    and stage-2 kernels offset NHD rows by ``q_start_row``; the hadamard
-    WHT materializes BHND copies of NHD Q/K/V inside the launcher (the
-    fp4 fused path stays zero-copy). The C++ TORCH_CHECK guards stay as
-    the backstop.
+    checks the impl flags. fp8 and fp4 cover the full headdim range:
+    persist-D for the small-D segment and split-D/M4N2 for the rest,
+    each with a runtime ``nhd_out`` O-store branch (fp4 keeps the
+    persist-D cap for non-%64 multiples, which pad inside the
+    launcher). fp16 keeps the persist-D cap (D <= 128). Hybrid and
+    hadamard are both fine: the hybrid stage-1 writeback is a
+    stride-generic ``O.slice(...).copy_`` and stage-2 kernels offset
+    NHD rows by ``q_start_row``; the hadamard WHT materializes BHND
+    copies of NHD Q/K/V inside the launcher (the fp4 fused path stays
+    zero-copy). The C++ TORCH_CHECK guards stay as the backstop.
 
     :param headdim: Head dimension of Q/K/V.
     :returns: Whether NHD inputs/outputs can take the fast path.
     """
     if self.enable_fp4:
+      # Exact %64 multiples hit the compiled kernels directly; others
+      # (e.g. 120 -> 128) pad inside the launcher and stay on persist-D.
+      if headdim % 64 == 0:
+        return True
       return headdim <= 256
     if self.enable_fp8:
       # Exact %32 multiples dispatch straight to the compiled kernels

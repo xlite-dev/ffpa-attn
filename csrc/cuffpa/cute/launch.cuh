@@ -2621,10 +2621,21 @@ void launch_cute_fwd_split_d_fp4_sm120_impl(torch::Tensor Q, torch::Tensor K,
                   make_shape(d_total, Nkv_pad), make_stride(Nkv_pad, _1{}));
   auto tma_v = make_tma_copy(SM90_TMA_LOAD{}, gV, SmemLayoutVt{}(_, _, _0{}),
                              Shape<Int<kVDChunk>, Int<kBc>>{}, _1{});
-  auto gO =
-      make_tensor(make_gmem_ptr(reinterpret_cast<ElementO*>(O.data_ptr())),
-                  make_shape((long)total_q_rows, Int<kHeadDim>{}),
-                  make_stride(Int<kHeadDim>{}, _1{}));
+  // NHD (diffusers BNHD packed) O, detected by storage: flat [Nb*Nq,
+  // Nh*kHeadDim] with the head selecting the column-tile group (kernel folds
+  // Nh_id*kDChunksV into the v_chunk walk). Both branches use dynamic int64
+  // extents/strides so TmaO has a single type and the kernel takes a runtime
+  // nhd_out branch (same pattern as the persist-D impls).
+  const bool nhd_out = ffpa_is_nhd_view(O);
+  auto gO = nhd_out
+                ? make_tensor(
+                      make_gmem_ptr(reinterpret_cast<ElementO*>(O.data_ptr())),
+                      make_shape((int64_t)Nb * Nq, (int64_t)Nh * kHeadDim),
+                      make_stride((int64_t)Nh * kHeadDim, _1{}))
+                : make_tensor(
+                      make_gmem_ptr(reinterpret_cast<ElementO*>(O.data_ptr())),
+                      make_shape((int64_t)total_q_rows, (int64_t)kHeadDim),
+                      make_stride((int64_t)kHeadDim, _1{}));
   auto tma_o = make_tma_copy(SM90_TMA_STORE{}, gO, SmemLayoutO{},
                              Shape<Int<kBr>, Int<kVDChunk>>{}, _1{});
 
@@ -2691,7 +2702,7 @@ void launch_cute_fwd_split_d_fp4_sm120_impl(torch::Tensor Q, torch::Tensor K,
       fused_wht ? km_rot_f32.data_ptr<float>() : km_f32.data_ptr<float>(),
       fused_wht ? qm_rot.data_ptr<float>() : qm.data_ptr<float>(), Nq, Nkv,
       Nq_pad, Nkv_pad, Nh, Nh_kv, scale, Tc, causal, total_q_rows, Nb,
-      q_start_row);
+      q_start_row, nhd_out);
 }
 
 template <typename kDataType, const int kHeadDim, const int kStage>
@@ -2859,10 +2870,21 @@ void launch_cute_fwd_split_d_m4n2_fp4_sm120_impl(
                   make_shape(d_total, Nkv_pad), make_stride(Nkv_pad, _1{}));
   auto tma_v = make_tma_copy(SM90_TMA_LOAD{}, gV, SmemLayoutVt{}(_, _, _0{}),
                              Shape<Int<kVDChunk>, Int<kBc>>{}, _1{});
-  auto gO =
-      make_tensor(make_gmem_ptr(reinterpret_cast<ElementO*>(O.data_ptr())),
-                  make_shape((long)total_q_rows, Int<kHeadDim>{}),
-                  make_stride(Int<kHeadDim>{}, _1{}));
+  // NHD (diffusers BNHD packed) O, detected by storage: flat [Nb*Nq,
+  // Nh*kHeadDim] with the head selecting the column-tile group (kernel folds
+  // Nh_id*kDChunksV into the v_chunk walk). Both branches use dynamic int64
+  // extents/strides so TmaO has a single type and the kernel takes a runtime
+  // nhd_out branch (same pattern as the persist-D impls).
+  const bool nhd_out = ffpa_is_nhd_view(O);
+  auto gO = nhd_out
+                ? make_tensor(
+                      make_gmem_ptr(reinterpret_cast<ElementO*>(O.data_ptr())),
+                      make_shape((int64_t)Nb * Nq, (int64_t)Nh * kHeadDim),
+                      make_stride((int64_t)Nh * kHeadDim, _1{}))
+                : make_tensor(
+                      make_gmem_ptr(reinterpret_cast<ElementO*>(O.data_ptr())),
+                      make_shape((int64_t)total_q_rows, (int64_t)kHeadDim),
+                      make_stride((int64_t)kHeadDim, _1{}));
   auto tma_o = make_tma_copy(SM90_TMA_STORE{}, gO, SmemLayoutO{},
                              Shape<Int<kBr>, Int<kVDChunk>>{}, _1{});
 
@@ -2927,7 +2949,7 @@ void launch_cute_fwd_split_d_m4n2_fp4_sm120_impl(
       tma_q, tma_k, tma_v, tma_o, tma_sfq, tma_sfk, tma_sfvt, tma_ds, O_ptr,
       softmax_lse_ptr, km_f32.data_ptr<float>(), qm.data_ptr<float>(), Nq, Nkv,
       Nq_pad, Nkv_pad, Nh, Nh_kv, scale, Tc, causal, total_q_rows, Nb,
-      q_start_row);
+      q_start_row, nhd_out);
 }
 
 template <typename kDataType, const int kHeadDim, const int kStage>

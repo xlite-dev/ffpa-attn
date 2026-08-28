@@ -246,15 +246,6 @@ void launch_ffpa_attn_fwd_template(
         // as fp8: P-quantization noise on short-row softmax rows.
         TORCH_CHECK(attn_bias.numel() == 0 && dropout_p == 0.0,
                     "fp4 sm120 path does not support attn_bias/dropout");
-        // NHD (BNHD) O is stored natively only by the persist-D fp4 kernel
-        // (64<=D<=256): split-D/M4N2 store BHND-packed only (the kHeadDim
-        // check below rejects them). The hybrid stage-1 writeback
-        // (O.slice(2,...).copy_) is stride-generic, so hybrid keeps
-        // working on an NHD O.
-        TORCH_CHECK(
-            !(ffpa_is_nhd_view(O) && kHeadDim > 256),
-            "ffpa_attn: NHD (BNHD) output requires the persist-D fp4 path "
-            "(64 <= head_dim <= 256)");
         // Strided-NHD inputs are consumed by the persist-D relaxed gate
         // only; the split-D/m4n2 hybrid stage-1 fp16 kernels keep the
         // strict gate, so reject that combination (mirrors fp8 D>224).
