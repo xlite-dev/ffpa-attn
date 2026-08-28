@@ -1224,22 +1224,27 @@ void launch_cute_fwd_split_d_fp8_sm120_impl(
   // is the row stride of every fp8 pre-kernel (kv-mean/quantize), so Q/K/V
   // must all become kHeadDim-wide together.
   if (fp8_hadamard) {
-    if (ffpa_is_nhd_view(Q))
+    if (!Q.is_contiguous())
       Q = Q.contiguous();
-    if (ffpa_is_nhd_view(K))
+    if (!K.is_contiguous())
       K = K.contiguous();
     if (Q.size(3) < kHeadDim)
       V = torch::constant_pad_nd(V, {0, kHeadDim - Q.size(3)}, 0.0);
+    else if (!V.is_contiguous())
+      V = V.contiguous();
     Q = ffpa::apply_wht_qk_sm120<kDataType, kHeadDim>(Q);
     K = ffpa::apply_wht_qk_sm120<kDataType, kHeadDim>(K);
   }
   // NHD (diffusers BNHD) zero-copy views: the fp8 pre-kernels read the
-  // original gmem through Fp8InputLayout strides. V must share K's layout.
-  const ffpa_fp8::Fp8InputLayout Lq = ffpa_layout_of(Q, Q.size(2), Q.size(3));
-  const ffpa_fp8::Fp8InputLayout Lkv = ffpa_layout_of(K, K.size(2), K.size(3));
-  TORCH_CHECK(V.stride(0) == K.stride(0) && V.stride(1) == K.stride(1) &&
-                  V.stride(2) == K.stride(2) && V.stride(3) == K.stride(3),
-              "ffpa_attn: V must share K's memory layout");
+  // original gmem through Fp8InputLayout strides, including strided
+  // fused-QKV chunk rows. V keeps its own descriptor since interleaved
+  // chunks give it K's head layout but a wider row stride.
+  const ffpa_fp8::Fp8InputLayout Lq =
+      ffpa_layout_of(Q, Q.size(2), Q.size(3), /*allow_strided_rows=*/true);
+  const ffpa_fp8::Fp8InputLayout Lkv =
+      ffpa_layout_of(K, K.size(2), K.size(3), /*allow_strided_rows=*/true);
+  const ffpa_fp8::Fp8InputLayout Lv =
+      ffpa_layout_of(V, V.size(2), V.size(3), /*allow_strided_rows=*/true);
   TORCH_CHECK(attn_bias.numel() == 0 && dropout_p == 0.0,
               "fp8 sm120 path does not support attn_bias/dropout");
   TORCH_CHECK(
@@ -1358,14 +1363,14 @@ void launch_cute_fwd_split_d_fp8_sm120_impl(
         reinterpret_cast<__nv_fp8_e4m3*>(vt8.data_ptr()),
         q_scale.data_ptr<float>(), k_scale.data_ptr<float>(),
         v_scale_quant.data_ptr<float>(), Nb, Nh, Nh_kv, Nq, Nkv, Nkv_pad, D_og,
-        Lq, Lkv, stream, km_ptr, reorg_free, v_per_channel);
+        Lq, Lkv, stream, km_ptr, reorg_free, v_per_channel, &Lv);
   } else {
     ffpa_fp8::launch_quantize_fp8_sm120<kDataType, kBr, kBc, kHeadDim, kQKInt8>(
         q_ptr, k_ptr, v_ptr, q8.data_ptr(), k8.data_ptr(),
         reinterpret_cast<__nv_fp8_e4m3*>(vt8.data_ptr()),
         q_scale.data_ptr<float>(), k_scale.data_ptr<float>(),
         v_scale_quant.data_ptr<float>(), Nb, Nh, Nh_kv, Nq, Nkv, Nkv_pad, D_og,
-        Lq, Lkv, stream, km_ptr, reorg_free, v_per_channel);
+        Lq, Lkv, stream, km_ptr, reorg_free, v_per_channel, &Lv);
   }
 
   // Per-channel V (sage-style): re-quantize V with per-D scale via coalesced
@@ -1390,14 +1395,14 @@ void launch_cute_fwd_split_d_fp8_sm120_impl(
           v_ptr, reinterpret_cast<__nv_fp8_e4m3*>(vt8.data_ptr()),
           v_scale.data_ptr<float>(), vm_ptr, v_partials_sum.data_ptr<float>(),
           v_partials_max.data_ptr<float>(), v_partials_min.data_ptr<float>(),
-          Nb, Nh_kv, Nkv, Nkv_pad, stream, D_og, v_r, reorg_free, &Lkv);
+          Nb, Nh_kv, Nkv, Nkv_pad, stream, D_og, v_r, reorg_free, &Lv);
     } else {
       ffpa_fp8::launch_quantize_fp8_vt_perchannel_sm120<kDataType, kBr, kBc,
                                                         kHeadDim, false>(
           v_ptr, reinterpret_cast<__nv_fp8_e4m3*>(vt8.data_ptr()),
           v_scale.data_ptr<float>(), vm_ptr, v_partials_sum.data_ptr<float>(),
           v_partials_max.data_ptr<float>(), v_partials_min.data_ptr<float>(),
-          Nb, Nh_kv, Nkv, Nkv_pad, stream, D_og, v_r, reorg_free, &Lkv);
+          Nb, Nh_kv, Nkv, Nkv_pad, stream, D_og, v_r, reorg_free, &Lv);
     }
   }
   const float* vm_kernel = v_smooth_mean ? vm_ptr : nullptr;
@@ -1559,22 +1564,27 @@ void launch_cute_fwd_split_d_m4n2_fp8_sm120_impl(
   // is the row stride of every fp8 pre-kernel (kv-mean/quantize), so Q/K/V
   // must all become kHeadDim-wide together.
   if (fp8_hadamard) {
-    if (ffpa_is_nhd_view(Q))
+    if (!Q.is_contiguous())
       Q = Q.contiguous();
-    if (ffpa_is_nhd_view(K))
+    if (!K.is_contiguous())
       K = K.contiguous();
     if (Q.size(3) < kHeadDim)
       V = torch::constant_pad_nd(V, {0, kHeadDim - Q.size(3)}, 0.0);
+    else if (!V.is_contiguous())
+      V = V.contiguous();
     Q = ffpa::apply_wht_qk_sm120<kDataType, kHeadDim>(Q);
     K = ffpa::apply_wht_qk_sm120<kDataType, kHeadDim>(K);
   }
   // NHD (diffusers BNHD) zero-copy views: the fp8 pre-kernels read the
-  // original gmem through Fp8InputLayout strides. V must share K's layout.
-  const ffpa_fp8::Fp8InputLayout Lq = ffpa_layout_of(Q, Q.size(2), Q.size(3));
-  const ffpa_fp8::Fp8InputLayout Lkv = ffpa_layout_of(K, K.size(2), K.size(3));
-  TORCH_CHECK(V.stride(0) == K.stride(0) && V.stride(1) == K.stride(1) &&
-                  V.stride(2) == K.stride(2) && V.stride(3) == K.stride(3),
-              "ffpa_attn: V must share K's memory layout");
+  // original gmem through Fp8InputLayout strides, including strided
+  // fused-QKV chunk rows. V keeps its own descriptor since interleaved
+  // chunks give it K's head layout but a wider row stride.
+  const ffpa_fp8::Fp8InputLayout Lq =
+      ffpa_layout_of(Q, Q.size(2), Q.size(3), /*allow_strided_rows=*/true);
+  const ffpa_fp8::Fp8InputLayout Lkv =
+      ffpa_layout_of(K, K.size(2), K.size(3), /*allow_strided_rows=*/true);
+  const ffpa_fp8::Fp8InputLayout Lv =
+      ffpa_layout_of(V, V.size(2), V.size(3), /*allow_strided_rows=*/true);
   TORCH_CHECK(attn_bias.numel() == 0 && dropout_p == 0.0,
               "fp8 sm120 path does not support attn_bias/dropout");
   TORCH_CHECK(
@@ -1688,14 +1698,14 @@ void launch_cute_fwd_split_d_m4n2_fp8_sm120_impl(
         reinterpret_cast<__nv_fp8_e4m3*>(vt8.data_ptr()),
         q_scale.data_ptr<float>(), k_scale.data_ptr<float>(),
         v_scale_quant.data_ptr<float>(), Nb, Nh, Nh_kv, Nq, Nkv, Nkv_pad, D_og,
-        Lq, Lkv, stream, km_ptr, false, v_per_channel);
+        Lq, Lkv, stream, km_ptr, false, v_per_channel, &Lv);
   } else {
     ffpa_fp8::launch_quantize_fp8_sm120<kDataType, kBr, kBc, kHeadDim, kQKInt8>(
         q_ptr, k_ptr, v_ptr, q8.data_ptr(), k8.data_ptr(),
         reinterpret_cast<__nv_fp8_e4m3*>(vt8.data_ptr()),
         q_scale.data_ptr<float>(), k_scale.data_ptr<float>(),
         v_scale_quant.data_ptr<float>(), Nb, Nh, Nh_kv, Nq, Nkv, Nkv_pad, D_og,
-        Lq, Lkv, stream, km_ptr, false, v_per_channel);
+        Lq, Lkv, stream, km_ptr, false, v_per_channel, &Lv);
   }
   // Per-channel V (sage-style): re-quantize V with per-D scale via coalesced
   // stats (sum+max+min -> mean+amax) + quantize/transpose. smooth_v subtracts
@@ -1719,14 +1729,14 @@ void launch_cute_fwd_split_d_m4n2_fp8_sm120_impl(
           v_ptr, reinterpret_cast<__nv_fp8_e4m3*>(vt8.data_ptr()),
           v_scale.data_ptr<float>(), vm_ptr, v_partials_sum.data_ptr<float>(),
           v_partials_max.data_ptr<float>(), v_partials_min.data_ptr<float>(),
-          Nb, Nh_kv, Nkv, Nkv_pad, stream, D_og, v_r, /*perm_vt=*/false, &Lkv);
+          Nb, Nh_kv, Nkv, Nkv_pad, stream, D_og, v_r, /*perm_vt=*/false, &Lv);
     } else {
       ffpa_fp8::launch_quantize_fp8_vt_perchannel_sm120<kDataType, kBr, kBc,
                                                         kHeadDim, false>(
           v_ptr, reinterpret_cast<__nv_fp8_e4m3*>(vt8.data_ptr()),
           v_scale.data_ptr<float>(), vm_ptr, v_partials_sum.data_ptr<float>(),
           v_partials_max.data_ptr<float>(), v_partials_min.data_ptr<float>(),
-          Nb, Nh_kv, Nkv, Nkv_pad, stream, D_og, v_r, /*perm_vt=*/false, &Lkv);
+          Nb, Nh_kv, Nkv, Nkv_pad, stream, D_og, v_r, /*perm_vt=*/false, &Lv);
     }
   }
   const float* vm_kernel = v_smooth_mean ? vm_ptr : nullptr;
