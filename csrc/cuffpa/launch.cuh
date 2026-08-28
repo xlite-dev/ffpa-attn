@@ -170,12 +170,13 @@ void launch_ffpa_attn_fwd_template(
       V = V.contiguous();
     nhd_in = false;
   }
-  // Strided-NHD inputs are consumed natively by the fp8/fp4 persist-D
-  // families (relaxed ffpa_layout_of gate) and the fp16 persist-D CUTE_TMA
-  // path (D<=128; split-D/M4N2 keep the strict gate); every other backend
-  // indexes packed storage and would silently mis-index. Materialize them
-  // the same way unsupported NHD views are materialized above.
-  const bool fp16_strided_ok = fp16_nhd_ok && kHeadDim <= 128;
+  // Strided-NHD inputs are consumed natively by the fp8/fp4 families
+  // (relaxed ffpa_layout_of gate across persist-D/split-D/M4N2) and the
+  // whole fp16/bf16 CUTE_TMA family (stride-parameterized TMA rows);
+  // every other backend indexes packed storage and would silently
+  // mis-index. Materialize them the same way unsupported NHD views are
+  // materialized above.
+  const bool fp16_strided_ok = fp16_nhd_ok;
   if (strided_in && !force_fp8 && !force_fp4 && !fp16_strided_ok) {
     if (!ffpa_is_bhnd_packed(Q) && !ffpa_is_nhd_view(Q))
       Q = Q.contiguous();

@@ -193,25 +193,38 @@ void launch_cute_fwd_split_d_sm120(torch::Tensor Q, torch::Tensor K,
   const int total_q_rows = Nb * Nh * Nq;
   const int total_kv_rows = Nb * Nh_kv * Nkv;
 
-  // NHD (diffusers BNHD) permute views are consumed natively via flat
-  // (B*N, H*D) TMA rows (head as a column tile); O stays BHND-packed (the
-  // caller allocates it packed and re-views).
-  const bool q_nhd = ffpa_is_nhd_view(Q);
-  const bool kv_nhd = ffpa_is_nhd_view(K);
-  if (kv_nhd) {
-    TORCH_CHECK(ffpa_is_nhd_view(V),
-                "ffpa_attn: K and V must share the same memory layout");
-  } else {
-    TORCH_CHECK(K.stride(3) == 1 && K.stride(2) == (long)kHeadDim &&
-                    K.stride(1) == (long)Nkv * kHeadDim &&
-                    K.stride(0) == (long)Nh_kv * Nkv * kHeadDim,
-                "ffpa_attn: K must be BHND-contiguous or an NHD (BNHD) view");
-  }
+  // NHD (diffusers BNHD) permute views — including strided fused-QKV chunk
+  // rows — are consumed natively via flat (B*N, H*D) TMA rows carrying the
+  // tensor's own row stride (H*D packed; wider for strided views); O stays
+  // BHND-packed (the caller allocates it packed and re-views).
+  const bool q_nhd = ffpa_is_nhd_view(Q) || ffpa_is_strided_nhd(Q);
+  if (ffpa_is_strided_nhd(Q))
+    ffpa_check_strided_nhd_aligned(Q, "Q");
   if (!q_nhd)
     TORCH_CHECK(Q.stride(3) == 1 && Q.stride(2) == (long)kHeadDim &&
                     Q.stride(1) == (long)Nq * kHeadDim &&
                     Q.stride(0) == (long)Nh * Nq * kHeadDim,
                 "ffpa_attn: Q must be BHND-contiguous or an NHD (BNHD) view");
+  const bool k_nhd = ffpa_is_nhd_view(K) || ffpa_is_strided_nhd(K);
+  const bool v_nhd = ffpa_is_nhd_view(V) || ffpa_is_strided_nhd(V);
+  TORCH_CHECK(k_nhd == v_nhd,
+              "ffpa_attn: K and V must share the same memory layout family "
+              "(BHND-packed or NHD)");
+  if (ffpa_is_strided_nhd(K))
+    ffpa_check_strided_nhd_aligned(K, "K");
+  if (ffpa_is_strided_nhd(V))
+    ffpa_check_strided_nhd_aligned(V, "V");
+  const bool kv_nhd = k_nhd;
+  if (!kv_nhd) {
+    TORCH_CHECK(K.stride(3) == 1 && K.stride(2) == (long)kHeadDim &&
+                    K.stride(1) == (long)Nkv * kHeadDim &&
+                    K.stride(0) == (long)Nh_kv * Nkv * kHeadDim,
+                "ffpa_attn: K must be BHND-contiguous or an NHD (BNHD) view");
+    TORCH_CHECK(V.stride(3) == 1 && V.stride(2) == (long)kHeadDim &&
+                    V.stride(1) == (long)Nkv * kHeadDim &&
+                    V.stride(0) == (long)Nh_kv * Nkv * kHeadDim,
+                "ffpa_attn: V must be BHND-contiguous or an NHD (BNHD) view");
+  }
 
   // O output TMA store descriptor: full O tensor [total_q_rows,kHeadDim],
   // same shape/stride as the BHND Q; per-head origin injected via
@@ -228,7 +241,7 @@ void launch_cute_fwd_split_d_sm120(torch::Tensor Q, torch::Tensor K,
       auto gQ =
           make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(Q.data_ptr())),
                       make_shape((long)Nb * Nq, (long)Nh * kHeadDim),
-                      make_stride((long)Nh * kHeadDim, _1{}));
+                      make_stride(Q.stride(2), _1{}));
       return make_tma_copy(SM90_TMA_LOAD{}, gQ, SmemLayoutQ{},
                            Shape<Int<kBr>, Int<kQKDChunk>>{}, _1{});
     } else {
@@ -245,7 +258,7 @@ void launch_cute_fwd_split_d_sm120(torch::Tensor Q, torch::Tensor K,
       auto gK =
           make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(K.data_ptr())),
                       make_shape((long)Nb * Nkv, (long)Nh_kv * kHeadDim),
-                      make_stride((long)Nh_kv * kHeadDim, _1{}));
+                      make_stride(K.stride(2), _1{}));
       return make_tma_copy(SM90_TMA_LOAD{}, gK, SmemLayoutK{},
                            Shape<Int<kBc>, Int<kQKDChunk>>{}, _1{});
     } else {
@@ -262,7 +275,7 @@ void launch_cute_fwd_split_d_sm120(torch::Tensor Q, torch::Tensor K,
       auto gV =
           make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(V.data_ptr())),
                       make_shape((long)Nb * Nkv, (long)Nh_kv * kHeadDim),
-                      make_stride((long)Nh_kv * kHeadDim, _1{}));
+                      make_stride(V.stride(2), _1{}));
       return make_tma_copy(SM90_TMA_LOAD{}, gV, SmemLayoutV{},
                            Shape<Int<kBc>, Int<kVDChunk>>{}, _1{});
     } else {
@@ -320,12 +333,21 @@ void launch_cute_fwd_split_d_sm120(torch::Tensor Q, torch::Tensor K,
     }
   };
 
-  if (kv_nhd)
-    run(make_tma_q(std::true_type{}), make_tma_k(std::true_type{}),
-        make_tma_v(std::true_type{}), std::true_type{}, std::true_type{});
-  else
-    run(make_tma_q(std::false_type{}), make_tma_k(std::false_type{}),
-        make_tma_v(std::false_type{}), std::false_type{}, std::false_type{});
+  if (kv_nhd) {
+    if (q_nhd)
+      run(make_tma_q(std::true_type{}), make_tma_k(std::true_type{}),
+          make_tma_v(std::true_type{}), std::true_type{}, std::true_type{});
+    else
+      run(make_tma_q(std::false_type{}), make_tma_k(std::true_type{}),
+          make_tma_v(std::true_type{}), std::false_type{}, std::true_type{});
+  } else {
+    if (q_nhd)
+      run(make_tma_q(std::true_type{}), make_tma_k(std::false_type{}),
+          make_tma_v(std::false_type{}), std::true_type{}, std::false_type{});
+    else
+      run(make_tma_q(std::false_type{}), make_tma_k(std::false_type{}),
+          make_tma_v(std::false_type{}), std::false_type{}, std::false_type{});
+  }
 }
 
 // M4N2 launcher: kBr=64, kBc=64, atom_layout=(4,2,1). Uses
@@ -422,25 +444,38 @@ void launch_cute_fwd_split_d_m4n2_sm120(torch::Tensor Q, torch::Tensor K,
   const int total_q_rows = Nb * Nh * Nq;
   const int total_kv_rows = Nb * Nh_kv * Nkv;
 
-  // NHD (diffusers BNHD) permute views are consumed natively via flat
-  // (B*N, H*D) TMA rows (head as a column tile); O stays BHND-packed (the
-  // caller allocates it packed and re-views).
-  const bool q_nhd = ffpa_is_nhd_view(Q);
-  const bool kv_nhd = ffpa_is_nhd_view(K);
-  if (kv_nhd) {
-    TORCH_CHECK(ffpa_is_nhd_view(V),
-                "ffpa_attn: K and V must share the same memory layout");
-  } else {
-    TORCH_CHECK(K.stride(3) == 1 && K.stride(2) == (long)kHeadDim &&
-                    K.stride(1) == (long)Nkv * kHeadDim &&
-                    K.stride(0) == (long)Nh_kv * Nkv * kHeadDim,
-                "ffpa_attn: K must be BHND-contiguous or an NHD (BNHD) view");
-  }
+  // NHD (diffusers BNHD) permute views — including strided fused-QKV chunk
+  // rows — are consumed natively via flat (B*N, H*D) TMA rows carrying the
+  // tensor's own row stride (H*D packed; wider for strided views); O stays
+  // BHND-packed (the caller allocates it packed and re-views).
+  const bool q_nhd = ffpa_is_nhd_view(Q) || ffpa_is_strided_nhd(Q);
+  if (ffpa_is_strided_nhd(Q))
+    ffpa_check_strided_nhd_aligned(Q, "Q");
   if (!q_nhd)
     TORCH_CHECK(Q.stride(3) == 1 && Q.stride(2) == (long)kHeadDim &&
                     Q.stride(1) == (long)Nq * kHeadDim &&
                     Q.stride(0) == (long)Nh * Nq * kHeadDim,
                 "ffpa_attn: Q must be BHND-contiguous or an NHD (BNHD) view");
+  const bool k_nhd = ffpa_is_nhd_view(K) || ffpa_is_strided_nhd(K);
+  const bool v_nhd = ffpa_is_nhd_view(V) || ffpa_is_strided_nhd(V);
+  TORCH_CHECK(k_nhd == v_nhd,
+              "ffpa_attn: K and V must share the same memory layout family "
+              "(BHND-packed or NHD)");
+  if (ffpa_is_strided_nhd(K))
+    ffpa_check_strided_nhd_aligned(K, "K");
+  if (ffpa_is_strided_nhd(V))
+    ffpa_check_strided_nhd_aligned(V, "V");
+  const bool kv_nhd = k_nhd;
+  if (!kv_nhd) {
+    TORCH_CHECK(K.stride(3) == 1 && K.stride(2) == (long)kHeadDim &&
+                    K.stride(1) == (long)Nkv * kHeadDim &&
+                    K.stride(0) == (long)Nh_kv * Nkv * kHeadDim,
+                "ffpa_attn: K must be BHND-contiguous or an NHD (BNHD) view");
+    TORCH_CHECK(V.stride(3) == 1 && V.stride(2) == (long)kHeadDim &&
+                    V.stride(1) == (long)Nkv * kHeadDim &&
+                    V.stride(0) == (long)Nh_kv * Nkv * kHeadDim,
+                "ffpa_attn: V must be BHND-contiguous or an NHD (BNHD) view");
+  }
 
   auto gO = make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(O.data_ptr())),
                         make_shape(total_q_rows, Int<kHeadDim>{}),
@@ -453,7 +488,7 @@ void launch_cute_fwd_split_d_m4n2_sm120(torch::Tensor Q, torch::Tensor K,
       auto gQ =
           make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(Q.data_ptr())),
                       make_shape((long)Nb * Nq, (long)Nh * kHeadDim),
-                      make_stride((long)Nh * kHeadDim, _1{}));
+                      make_stride(Q.stride(2), _1{}));
       return make_tma_copy(SM90_TMA_LOAD{}, gQ, SmemLayoutQ{},
                            Shape<Int<kBr>, Int<kQKDChunk>>{}, _1{});
     } else {
@@ -470,7 +505,7 @@ void launch_cute_fwd_split_d_m4n2_sm120(torch::Tensor Q, torch::Tensor K,
       auto gK =
           make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(K.data_ptr())),
                       make_shape((long)Nb * Nkv, (long)Nh_kv * kHeadDim),
-                      make_stride((long)Nh_kv * kHeadDim, _1{}));
+                      make_stride(K.stride(2), _1{}));
       return make_tma_copy(SM90_TMA_LOAD{}, gK, SmemLayoutK{},
                            Shape<Int<kBc>, Int<kQKDChunk>>{}, _1{});
     } else {
@@ -487,7 +522,7 @@ void launch_cute_fwd_split_d_m4n2_sm120(torch::Tensor Q, torch::Tensor K,
       auto gV =
           make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(V.data_ptr())),
                       make_shape((long)Nb * Nkv, (long)Nh_kv * kHeadDim),
-                      make_stride((long)Nh_kv * kHeadDim, _1{}));
+                      make_stride(V.stride(2), _1{}));
       return make_tma_copy(SM90_TMA_LOAD{}, gV, SmemLayoutV{},
                            Shape<Int<kBc>, Int<kVDChunk>>{}, _1{});
     } else {
@@ -541,12 +576,21 @@ void launch_cute_fwd_split_d_m4n2_sm120(torch::Tensor Q, torch::Tensor K,
     }
   };
 
-  if (kv_nhd)
-    run(make_tma_q(std::true_type{}), make_tma_k(std::true_type{}),
-        make_tma_v(std::true_type{}), std::true_type{}, std::true_type{});
-  else
-    run(make_tma_q(std::false_type{}), make_tma_k(std::false_type{}),
-        make_tma_v(std::false_type{}), std::false_type{}, std::false_type{});
+  if (kv_nhd) {
+    if (q_nhd)
+      run(make_tma_q(std::true_type{}), make_tma_k(std::true_type{}),
+          make_tma_v(std::true_type{}), std::true_type{}, std::true_type{});
+    else
+      run(make_tma_q(std::false_type{}), make_tma_k(std::true_type{}),
+          make_tma_v(std::true_type{}), std::false_type{}, std::true_type{});
+  } else {
+    if (q_nhd)
+      run(make_tma_q(std::true_type{}), make_tma_k(std::false_type{}),
+          make_tma_v(std::false_type{}), std::true_type{}, std::false_type{});
+    else
+      run(make_tma_q(std::false_type{}), make_tma_k(std::false_type{}),
+          make_tma_v(std::false_type{}), std::false_type{}, std::false_type{});
+  }
 }
 
 template <typename kDataType, const int kHeadDim, const int kStage>
