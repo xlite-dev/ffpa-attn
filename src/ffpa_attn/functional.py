@@ -610,18 +610,19 @@ class CUDABackend(Backend):
     return CudaBackendImpl.NATIVE
 
   def is_nhd_supported(self, headdim: int) -> bool:
-    """Whether the persist-D NHD fast path applies for this config.
+    """Whether the NHD O fast path applies for this config.
 
     NHD requires the CUTE_TMA path (native / TMA / CUTE keep a static
     BHND gO); fp8/fp4 always dispatch there, so only the fp16 family
-    checks the impl flags. The head_dim caps follow the persist-D
-    coverage (fp8 <= 224, fp4 <= 256, fp16 <= 128): the split-D/M4N2
-    ranges beyond them have no NHD O store. Hybrid and hadamard are
-    both fine: the hybrid stage-1 writeback is a stride-generic
-    ``O.slice(...).copy_`` (stage-2 already offsets NHD rows by
-    ``q_start_row``), and the hadamard WHT materializes BHND copies of
-    NHD Q/K/V inside the launcher (the fp4 fused path stays zero-copy).
-    The C++ TORCH_CHECK guards stay as the backstop.
+    checks the impl flags. fp8 covers the full headdim range: persist-D
+    (%32, D<=224) and split-D/M4N2 (%64, D>224), each with a runtime
+    ``nhd_out`` O-store branch. fp4/fp16 keep the persist-D caps for now
+    (fp4 <= 256, fp16 <= 128). Hybrid and hadamard are both fine: the
+    hybrid stage-1 writeback is a stride-generic ``O.slice(...).copy_``
+    and stage-2 kernels offset NHD rows by ``q_start_row``; the hadamard
+    WHT materializes BHND copies of NHD Q/K/V inside the launcher (the
+    fp4 fused path stays zero-copy). The C++ TORCH_CHECK guards stay as
+    the backstop.
 
     :param headdim: Head dimension of Q/K/V.
     :returns: Whether NHD inputs/outputs can take the fast path.
@@ -629,6 +630,11 @@ class CUDABackend(Backend):
     if self.enable_fp4:
       return headdim <= 256
     if self.enable_fp8:
+      # Exact %32 multiples dispatch straight to the compiled kernels
+      # (persist-D <=224, split-D/M4N2 %64 beyond). Non-multiples pad up
+      # inside the launcher (e.g. 120 -> 128) and stay on persist-D.
+      if headdim % 32 == 0:
+        return headdim <= 224 or headdim % 64 == 0
       return headdim <= 224
     # NHD output packing only exists in the CUTE_TMA persist-D kernel; the
     # native / TMA / CUTE paths keep a static BHND gO (fp8/fp4 always
