@@ -25,7 +25,7 @@
 | `dropout` | ✓ | ✓ | ✗ | ✗ | FC-5 |
 | `tensor_layout='NHD'` O 写 | ✗ | persist-D | 全族（FC-2） | 全族（FC-2） | 全族（FC-2） | FC-2 ✅ |
 | strided-NHD 读（fused-QKV） | ✗ | persist-D | 全族（FC-1） | 全族（FC-1） | 全族（FC-1） | FC-1 ✅ |
-| strided/NHD + hybrid 组合 | — | — | ✗ | ✗ | FC-3 |
+| strided/NHD + hybrid 组合 | — | — | ✓ | ✓ | FC-3 ✅ |
 | smooth_v / MXFP8-PV knob | — | — | ✓ | persist-D only | FC-6 |
 | head_dim pad | ✗ | ✓ | ✓ | ✓ | FC-8 |
 | decode / 短 Nq 量化 | ✗（无量化） | ✗ | ✗ | ✗ | FC-7 |
@@ -40,7 +40,7 @@
 |---|---|---|---|---|
 | FC-1 | split-D/M4N2 独立 Lv（strided-NHD 读） | F1 | ✅ 已完成（ffpa-attn cc8e8dc/4a49d38/882ee07） | — |
 | FC-2 | split-D/M4N2 NHD O 写 | F1 | ✅ 已完成（ffpa-attn df7d572/c4ca38b/2382ca4） | FC-1 热身 |
-| FC-3 | split-D/M4N2 + hybrid strided 组合 | F1 | ⬜ 待开始 | FC-1 |
+| FC-3 | split-D/M4N2 + hybrid strided 组合 | F1 | ✅ 已完成（ffpa-attn 9b9dcae） | FC-1 |
 | FC-4 | 量化路径 `attn_bias` | F2 | ⬜ 待开始 | — |
 | FC-5 | 量化路径 `dropout` (**暂不实施，仅保留设计稿**) | F2 | ⬜ 待开始 | FC-4 注入点 |
 | FC-6 | fp4 smooth_v/MXFP8-PV 扩展至三族 | F2 | ⬜ 待开始 | FC-1/FC-2 |
@@ -69,7 +69,7 @@
 
 - [x] FC-1：split-D/M4N2 独立 Lv（strided-NHD 读）—— F1 基建第一步（2026-08-28 完成）
 - [x] FC-2：split-D/M4N2 NHD O 写 —— F1 基建第二步（2026-08-28 完成）
-- [ ] FC-3：split-D/M4N2 + hybrid strided 组合
+- [x] FC-3：split-D/M4N2 + hybrid strided 组合 —— F1 布局闭环收尾（2026-08-28 完成）
 - [ ] FC-4：量化路径 `attn_bias`（S/P 域注入基建）
 - [ ] FC-5：量化路径 `dropout`
 - [ ] FC-6：fp4 smooth_v/MXFP8-PV 扩展至三族
@@ -275,7 +275,16 @@ FC-1 先行（同文件调用点，先打通描述符尾参路径，降低一次
 
 ### FC-3：split-D/M4N2 + hybrid strided 组合
 
-- **Status**: Draft ｜ **Priority**: F1 ｜ **Track**: 功能（布局）
+- **Status**: Done（2026-08-28，ffpa-attn 9b9dcae） ｜ **Priority**: F1 ｜ **Track**: 功能（布局）
+  实施远小于设计稿：fp16 split-D/M4N2 launcher 与 fp8/fp4 stage-2 impl 经
+  FC-1/FC-2 已 layout 原生（从 tensor stride 自检，无需显式传 `Lv`/`nhd_out`）；
+  kernel 内 `nhd_out + q_start_row` 组合偏移已在 FC-2 实现；量化链恒做
+  full-Q 量化，故 `q_start_row` 与输入布局正交。本项实际改动 = 删两组
+  dispatch `TORCH_CHECK`（fp8 D>224 拒 `nhd_in||strided_in`、fp4 D>256 拒
+  `strided_in`）+ `prepare_hybrid_stage1` 非 causal 分支的 K/V 族不匹配
+  物化兜底（BHND K + strided V 等 mixed 输入对 stage-2 合法但 fp16 stage-1
+  要求 `k_nhd==v_nhd`），保证 hybrid 能力 ⊇ 非 hybrid。nsys 确认 dense
+  模式 K/V 零物化（每次调用仅 Q_e slice copy + O/lse 写回 3 个 copy kernel）。
 
 #### Motivation
 
