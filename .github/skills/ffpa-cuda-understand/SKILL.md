@@ -309,7 +309,7 @@ D 交叉点与 fp16 家族一致（<768 M8N1 / ≥768 M4N2）。`FFPA_FP8_FORCE_
 |---|---|---|---|
 | causal | ✓ | ✓ | ✓ |
 | GQA | ✓ | ✓ | ✓ |
-| **attn_bias** | **✗**（TORCH_CHECK 拒绝） | ✗ | ✗ |
+| **attn_bias** | ✓（FC-4：raw-S 域注入 + `kHasAttnBias` 双实例） | ✓（FC-4） | ✓（FC-4） |
 | **dropout** | **✗** | ✗ | ✗ |
 | NHD 读（packed view） | ✓ | ✓（quantize NHD-native） | ✓ |
 | **strided-NHD 读** | ✓（relaxed gate + Lv） | ✗（严格 gate） | ✗ |
@@ -395,7 +395,7 @@ lse 公式（NVFP4 PV）：`lse = (m*L + log2(row_sum) + log2(1/2688))*ln2 + sca
 |---|---|---|---|
 | causal | ✓（perm-aware mask） | ✓ | ✓ |
 | GQA | ✓ | ✓ | ✓ |
-| **attn_bias** | **✗**（dispatch 层统一拒） | ✗ | ✗ |
+| **attn_bias** | ✓（FC-4：dequant 域注入，列 kv_perm32） | ✓（FC-4） | ✓（FC-4） |
 | **dropout** | **✗** | ✗ | ✗ |
 | NHD 读 | ✓（Lkv/Lv relaxed gate） | ✓（FC-1 起独立 Lv relaxed gate） | ✓（FC-1 起独立 Lv relaxed gate） |
 | **strided-NHD 读** | ✓ | ✓（FC-1） | ✓（FC-1） |
@@ -431,12 +431,12 @@ lse 公式（NVFP4 PV）：`lse = (m*L + log2(row_sum) + log2(1/2688))*ln2 + sca
 | 全局互斥 | — | `attn_mask` + `is_causal` 任何 backend 均拒绝 |
 | Native sm80 / sm120 TMA | ✓ | 4D 广播 `[B\|1, H\|1, Nq\|1, Nkv\|1]`；fp16/bf16/fp32；广播维 stride 置 0；dtype code 1/2/3 |
 | CUTE fp16（persist/split/M4N2/sm80） | ✓（编译期 4 变体） | 但 dispatch 自动回退 native TMA（除非 force_cute_tma），因 CUTE bias 路径寄存器压力慢 ~2x |
-| **CUTE FP8（全部三族）** | **✗** | `TORCH_CHECK(attn_bias.numel()==0 && dropout_p==0.0)` |
-| **CUTE FP4（全部三族）** | **✗** | 同上（dispatch 层统一拒） |
+| **CUTE FP8（全部三族）** | ✓（FC-4） | raw-S 域注入 `bias/(qs*ks*scale_orig)`；`kHasAttnBias` 双实例 tag dispatch；仅拒 dropout |
+| **CUTE FP4（全部三族）** | ✓（FC-4） | dequant 域注入 `bias/scale_orig`，列 `kv_perm32(j)`；仅拒 dropout |
 | cutedsl backend | ✗ | `NotImplementedError`（无静默 fallback） |
 | Triton backend | ✓ | （非本报告范围，支持 additive mask 梯度） |
 
-**结论：需要 attn_mask 的低精度场景目前没有 CUDA 路径**——fp8/fp4 全拒，只能 fp16 家族（实际跑 native TMA）或 Triton。
+**结论：attn_mask 的低精度路径已由 FC-4 解锁**（fp8/fp4 六族均支持，2026-08-28）；dropout 仍为 fp16 家族专属。
 
 ### 7.2 dropout
 
@@ -496,7 +496,7 @@ softmax_scale 恒按真实 D（Python 解析 `1/sqrt(D_og)`）。
 | 3 | **strided/NHD + hybrid 组合** | ✅ 已补齐（FC-3，9b9dcae）：dispatch gate 删除，hybrid 与任意布局族组合可用（dense 零拷贝 / causal 物化前缀） | fp8 D>224 / fp4 D>256 | （已解决）原 stage-1 gate 误拒 |
 | 4 | **fp4 smooth_v / MXFP8-PV** | ✅ 已补齐（FC-6，76a8bd8）：smooth_v 三族全放开；MXFP8-PV 扩至 split-D（PV Tile-K=kBc=128=atom K），m4n2 架构排除（atom K=128 > kBc=64）；顺带修 mxfp8 lse 域常量 latent bug（P·448 域误用 log2(1/2688)） | fp4 split-D/M4N2 | （已解决）原 `TORCH_CHECK(fp4_smooth_v ... persist_d)`；mxfp8 仅 persist-D traits |
 | 5 | fp16 persist-D 专属的 WS 结构 | （非缺口，差异说明）split-D/M4N2 是 non-WS | fp16 split 家族 | setmaxnreg 232 装不下大 D o_acc；FA-1 M4N2 是替代方案 |
-| 6 | **attn_bias / dropout（量化路径全体）** | 低精度 + mask/dropout 无解 | fp8/fp4 全部（含 persist-D） | 量化 kernel 链无 bias 注入点；P 量化与 bias 叠加需要 bias 在 S 域 fp32 化后再量化，工程量大 |
+| 6 | **attn_bias（量化路径全体）** | ✅ 已补齐（FC-4，2026-08-28）：fp8 raw-S 域注入 `bias/(qs*ks*scale_orig)` / fp4 dequant 域注入（列 kv_perm32），六族 kernel + `kHasAttnBias` 双实例 tag dispatch；dropout 仍拒（FC-5 ⏸） | fp8/fp4 全部（含 persist-D） | （已解决）原 dispatch 层统一拒绝 |
 
 另注意 native 家族相对 cute 家族的缺口：NHD/strided 零拷贝（物化）、head_dim pad（不支持）。
 
@@ -517,7 +517,7 @@ softmax_scale 恒按真实 D（Python 解析 `1/sqrt(D_og)`）。
 3. **fp4 attn kernel 内部**：quantize CVT 链、NCU 驱动的指令 mix 优化（Phase 3 后仍有空间）；causal 三段化（全 -inf 行 tile 跳过，预期 1-2%，低优先）。
 4. ~~**split-D/M4N2 补 NHD O 写**（§8 #1）~~：✅ 已完成（FC-2）。
 5. ~~**split-D/M4N2 接独立 Lv**（§8 #2）~~：✅ 已完成（FC-1）。
-6. **量化路径的 attn_bias**（§8 #6，大工程）：bias 在 S 累加器 fp32 域注入 → P 量化前；需要每 tile bias TMA/cp.async 加载通道（fp16 家族已有可抄的 bias 加载协议）。
+6. ~~**量化路径的 attn_bias**（§8 #6，大工程）~~：✅ 已完成（FC-4，2026-08-28）——raw-S/dequant 域注入 + `kHasAttnBias` 模板双实例，详见 RFC FC-4 完成记录。
 7. **配置自适应**：历史测量 `fp8_qk_mm_type/pv_acc_type` 存在 N-crossover（小 N 偏 fp8 QK、大 N 偏 int8 QK，crossover ∈ (4608,8192)）；默认配置已统一为 QK int8 + PV f16 acc，可按 Nkv 在反转区自适应切换（切前须跑 FLUX PSNR 验证精度）。
 8. ~~**decode/短 Nq 的量化路径**~~（⏸ RFC FC-7 暂不实施，仅保留设计稿，2026-08-28）：短 Nq/decode 量化基本没有收益——fp4 固定前处理 ~1.1ms 结构性占优、小 Nq 下量化吞吐优势摊不开，decode 已由 native split-KV fp16 覆盖。
 9. **P online 量化的精度优化**（§5.4）：P 是量化注意力中唯一 online 量化、无法离线校准的对象，其精度丢失是量化 attn 误差的最主要根源之一。候选形态：更好的满量程利用率、行感知 scale、causal 早行 P 高精度补偿；须避开已证伪的 per-row P quant + 重开 lazy rescale（§5.8 #12）。

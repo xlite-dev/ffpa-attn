@@ -21,7 +21,7 @@
 
 | 能力 | native | fp16 cute | fp8 cute | fp4 cute | 缺口 |
 |---|---|---|---|---|---|
-| `attn_bias` | ✓ | ✓ | ✗ | ✗ | FC-4 |
+| `attn_bias` | ✓ | ✓ | 全族（FC-4） | 全族（FC-4） | FC-4 ✅ |
 | `dropout` | ✓ | ✓ | ✗ | ✗ | FC-5 |
 | `tensor_layout='NHD'` O 写 | ✗ | persist-D | 全族（FC-2） | 全族（FC-2） | 全族（FC-2） | FC-2 ✅ |
 | strided-NHD 读（fused-QKV） | ✗ | persist-D | 全族（FC-1） | 全族（FC-1） | 全族（FC-1） | FC-1 ✅ |
@@ -41,7 +41,7 @@
 | FC-1 | split-D/M4N2 独立 Lv（strided-NHD 读） | F1 | ✅ 已完成（ffpa-attn cc8e8dc/4a49d38/882ee07） | — |
 | FC-2 | split-D/M4N2 NHD O 写 | F1 | ✅ 已完成（ffpa-attn df7d572/c4ca38b/2382ca4） | FC-1 热身 |
 | FC-3 | split-D/M4N2 + hybrid strided 组合 | F1 | ✅ 已完成（ffpa-attn 9b9dcae） | FC-1 |
-| FC-4 | 量化路径 `attn_bias` | F2 | ⬜ 待开始 | — |
+| FC-4 | 量化路径 `attn_bias` | F2 | ✅ 已完成 | — |
 | FC-5 | 量化路径 `dropout` (**暂不实施，仅保留设计稿**) | F2 | ⬜ 待开始 | FC-4 注入点 |
 | FC-6 | fp4 smooth_v/MXFP8-PV 扩展至三族 | F2 | ✅ 已完成（ffpa-attn 76a8bd8） | FC-1/FC-2 |
 | FC-7 | 短 Nq/decode 量化路径 (**暂不实施，仅保留设计稿**) | F3 | ⬜ 待开始 | — |
@@ -61,9 +61,9 @@
 
 > 未收录项：分卡基准标注（文档规范，随下次 bench 执行）。（原列于此的 cache-dit `_keep_or_pack` 物化兜底移除已于 2026-08-28 完成，cache-dit@4b5c977：三 tensor 直传零拷贝，契约外布局由 C++ layout gate 显式报错。）
 
-## 完成状态清单
+## 完成状态清单（备忘录）
 
-> 每项动手前：先在 plan 模式完成实施规划（改动面 / 注入点 / 验证矩阵），审查通过后再实施——FC-4 起执行此流程（PC 轨道同）。
+> 每项动手前：先在 plan 模式（Copilot下要切换到plan agent）完成实施规划（改动面 / 注入点 / 验证矩阵），规划好再动手 (自动模式下可以按照规划继续实施操作。)。
 > 每做完一项：勾选对应条目（`- [ ]` → `- [x]`），并同步更新上方总览表状态列。
 
 **轨道 F（功能完备性，最高优先级）**
@@ -71,7 +71,7 @@
 - [x] FC-1：split-D/M4N2 独立 Lv（strided-NHD 读）—— F1 基建第一步（2026-08-28 完成）
 - [x] FC-2：split-D/M4N2 NHD O 写 —— F1 基建第二步（2026-08-28 完成）
 - [x] FC-3：split-D/M4N2 + hybrid strided 组合 —— F1 布局闭环收尾（2026-08-28 完成）
-- [ ] FC-4：量化路径 `attn_bias`（S/P 域注入基建）
+- [x] FC-4：量化路径 `attn_bias`（S/P 域注入基建）—— fp8/fp4 六族 kernel raw-S 域注入 + FfpaBiasParams helper（2026-08-28 完成）
 - [ ] FC-5：量化路径 `dropout`
 - [x] FC-6：fp4 smooth_v/MXFP8-PV 扩展至三族 —— smooth_v 全族；MXFP8-PV 至 split-D（2026-08-28 完成）
 - [ ] FC-7：短 Nq/decode 量化路径 ⏸（暂不实施，仅保留设计稿）
@@ -343,7 +343,23 @@ FC-1、FC-2（共用描述符/写路径基建）。
 
 ### FC-4：量化路径 `attn_bias`
 
-- **Status**: Draft ｜ **Priority**: F2（功能轨内最高频需求） ｜ **Track**: 功能
+- **Status**: ✅ Done（2026-08-28） ｜ **Priority**: F2（功能轨内最高频需求） ｜ **Track**: 功能
+
+> **完成记录（2026-08-28）**：fp8/fp4 六族 sm_120 kernel 全部落地。实现要点与设计稿
+> 的差异：fp8 注入在 **raw-S 域**（QK GEMM 后、任何 dequant 预乘前），注入
+> `bias/(qs_arr[row]*ks*scale_orig)`，四条 softmax 路径的 `qs*ks*scale(LOG2E)` 缩放
+> 使其落地为 exp 域 `+bias`；fp4 注入在 dequant 域（blockscale MMA 已折 SF），列须
+> `kv_perm32(j)`（K/V^T 置换存储）。注入点位于 masking `-INFINITY` 赋值之前，
+> `-inf` 掩码覆盖 bias（无 NaN）。共享 `FfpaBiasParams` helper（cute/launch.cuh）：
+> 4-D 校验 + size==1 维 stride-0 broadcast + dtype code（1=half/2=bf16/3=float）。
+> launcher 以 `std::integral_constant` tag dispatch 双实例化 `kHasAttnBias`，bias=None
+> 编译路径零变化。hybrid 两段各自带 bias（stage-1 fp16 取 bias 前 n_early 行，
+> stage-2 fp4/fp8 全量传参）。测试：fp8/fp4 各 5 组（dense/causal_fused/mask 形态/
+> GQA/hybrid + dropout 拒绝），fp8 85/85、fp4 61/61、cute 49/49 回归全绿。
+> **踩坑**：两处模板实参错位（fp8 persist_d 的 kBiasOn 落入 kPersistQs2r 槽位；
+> fp8 split_d_m4n2 非 per-thread 4 变体漏传 kQKPerThread 显式 false）——
+> 均为"kBiasOn 挤掉中部带默认值参数、kHasAttnBias 吃默认 0"的静默错位，
+> 详见 repo memory `ffpa-fc4-attn-bias.md`。
 
 #### Motivation
 
