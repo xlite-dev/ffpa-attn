@@ -52,6 +52,7 @@
 | PC-2 | 增量融合（Mega Kernel 步进） | P | ⬜ 待开始 | 被 PC-1 收编 |
 | PC-3 | N-crossover 量化配置自适应 | P | ⬜ 待开始 | — |
 | PC-4 | fp4 attn kernel 内部优化 | P | ⬜ 待开始 | — |
+| PC-7 | {fp8,fp4} split-D/M4N2 量化大 D kernel 性能优化 | P | ⬜ 待开始 | — |
 | PC-5 | CUDA graph 友好化 | P | ⬜ 待开始 | PC-1 评估 |
 | PC-6 | sm_89 fp8 int4 QK (**暂不实施，仅保留设计稿**) | P | ⬜ 低优搁置 | sm_89 fp8 路线复活 |
 
@@ -80,6 +81,7 @@
 - [ ] PC-2：增量融合（Mega Kernel 步进，被 PC-1 收编）
 - [ ] PC-3：N-crossover 量化配置自适应
 - [ ] PC-4：fp4 attn kernel 内部优化
+- [ ] PC-7：{fp8,fp4} split-D/M4N2 量化大 D kernel 性能优化
 - [ ] PC-5：CUDA graph 友好化
 - [ ] PC-6：sm_89 fp8 int4 QK（低优搁置：sm_120 无原生 int4 MMA，SA2 int4 kernel 未开源）
 
@@ -103,7 +105,7 @@
   PC-1 Mega Quantize Kernel（先做 cooperative 两阶段原型）
         ├─► 收编 PC-2（增量融合是其落地台阶）
         └─► 联动 PC-5（launch 形态定型后才能定 graph 兼容方案）
-  PC-3 配置自适应 ｜ PC-4 fp4 kernel 内部（与上并行，互不依赖）
+  PC-3 配置自适应 ｜ PC-4 fp4 kernel 内部 ｜ PC-7 量化大 D kernel（与上并行，互不依赖）
   PC-6 sm_89 int4 QK（低优搁置，不入路线图；前置 = sm_89 fp8 路线复活）
 ```
 
@@ -857,6 +859,78 @@ fp4 attn kernel -3~5%（若热点可攻克）。
 #### Dependencies
 
 无（但强依赖 NCU 先决分析）。
+
+---
+
+### PC-7：{fp8,fp4} split-D/M4N2 量化大 D kernel 性能优化
+
+- **Status**: Draft ｜ **Priority**: P2 ｜ **Track**: 性能
+
+#### Motivation
+
+{fp8, fp4} × {split-D (M8N1), split-D M4N2} 四个量化大 D kernel 是当前量化
+attention 的薄弱点：均为 non-WS 结构，大 D 下 `o_acc` 寄存器压力高（M8N1 的
+`o_acc=D/2` 在 D≥512 spill 到 local mem——正是引入 M4N2 的动因），且
+QK→softmax→quant→PV 串行依赖链长。相对同族被深度打磨过的 persist-D 小 D
+kernel，以及经过多轮寄存器压力 / dispatch 优化的 fp16 大 D 家族，量化大 D 的
+性能仍有明显差距，需要深入优化。
+
+persist-D 上沉淀了一批**同族已验证有效、与 persist/split 结构无关的通用方案**，
+本项核心思路是**逐项移植到 split-D/M4N2**，每项独立 A/B 验证收益：
+
+1. **softmax 尾部逐元素除法 → 每 group 一次倒数 + FMUL（fp8 pscale 风格）+
+   FirstTile row_sum 融合进 exp2 pass**——fp4 persist-D 实测有效
+   （self@16k 9.40→9.34），纯 softmax 链尾部结构改动，与主循环结构无关；
+2. **persistent work loop**——fp4 persist-D 验证有效（fp4 split-D/M4N2 已有
+   per-work 批式 epilogue，主循环可进一步对齐）。**注意：fp8 persist-D 已证伪
+   零收益（附录 A #3），fp8 split-D/M4N2 须独立实测、不可假设可移植**；
+3. **局部优化菜单**（PC-4 同款纪律）：reg reconfig、NamedBarrier 数量/位置、
+   producer TMA issue 顺序、softmax MUFU、int8 s32→f32 cast 向量化——每项
+   ≤ 几十行、不动主循环骨架、NCU + timing 双验证。
+
+#### Design
+
+1. **先决（硬）**：`ncu --page source` 拿到四个 kernel 的 stall / roofline /
+   occupancy 画像，确认热点与 persist-D 经验一致（`wait` / `short_scoreboard`
+   主导 vs `math_pipe_throttle`）；**无画像不动手**（同 PC-4 纪律）。
+2. 逐项移植 Motivation 中的方案；编译期路径隔离，默认配置行为零变化。
+3. fp8 / fp4 × split-D / M4N2 构成四个独立子轨，各自验收、各自收益、各自回退，
+   互不阻塞。
+
+#### Files & Symbols
+
+- fp8：`csrc/cuffpa/cute/fp8/sm_120/{split_d,split_d_m4n2}.cuh`；
+- fp4：`csrc/cuffpa/cute/fp4/sm_120/{split_d,split_d_m4n2}.cuh`、P pack
+  `csrc/cuffpa/cute/fp4/fp4_pscale.cuh`；
+- 参照范本：已落地上述有效方案的
+  `csrc/cuffpa/cute/fp4/sm_120/persist_d.cuh` 与
+  `csrc/cuffpa/cute/fp8/sm_120/persist_d.cuh`。
+
+#### Validation
+
+1. NCU stall / roofline 画像前后对比（附录 B）。
+2. 冷数据轮转（附录 B）：fp8/fp4 × D∈{320,768} × N∈{1024,4608,16384}，
+   **必须报告卡型 + 冷热条件**。
+3. bitwise probe 数值一致（融合只改执行方式、不改结果，硬约束）。
+4. 每项移植前先查附录 A 证伪边界（#3 fp8 persistent、#14 fp4 Q smem 复用等），
+   避免在 split-D/M4N2 上重复已证伪方向。
+
+#### Risks & Rollback
+
+- 结构优化收益是 kernel-结构相关的，不能跨格式 / 跨家族外推（附录 A 元教训：
+  fp4 persistent 有效、fp8 零收益）——每个方案独立 A/B；
+- fp8 split-D/M4N2 可能同为 latency-bound、可挖空间有限（参照
+  `ffpa-fp4-125x-ceiling-analysis` 的潜在收益上限定量方法）；
+- 回退 = 逐项恢复（每方案独立 flag / 分支）。
+
+#### Expected Benefit
+
+量化大 D attention 向 persist-D 小 D 与 fp16 大 D 家族收敛；收益按方案实测
+（参考量级：fp4 softmax 尾部单项 ~0.6%）。
+
+#### Dependencies
+
+无（但强依赖 NCU 先决分析，与 PC-4 共用方法论）。
 
 ---
 
