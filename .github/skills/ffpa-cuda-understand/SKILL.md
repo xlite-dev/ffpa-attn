@@ -525,7 +525,7 @@ softmax_scale 恒按真实 D（Python 解析 `1/sqrt(D_og)`）。
 ### 9.2 框架/工程级
 
 - **CPU dispatch 开销**：fast path 已省 ~20µs；剩余是 CUDABackend 构建 / tensor slice/copy op / 多 launch。CUDA graph 捕获友好化（native TMA 的每调用 cudaMalloc/Memcpy descriptor 改常驻池）在 graph 场景有价值。
-- **cache-dit 集成侧**：`is_nhd_zero_copy_input` 逐 tensor 直传已家族无关；后续 split-D 补齐后可移除 `_keep_or_pack` 物化兜底。
+- **cache-dit 集成侧**：✅ 三族 NHD/strided 全量直传后，`_keep_or_pack` 物化兜底已移除（2026-08-28，cache-dit@4b5c977），契约外布局由 C++ layout gate 显式报错。
 - **5090/PRO 5000 差异**：fp8 bench 默认配置已统一为 QK int8（int8 MMA + int32 acc）+ PV f16 acc（fp8 MMA + f16 acc），两卡同配置；剩余差异是硬件吞吐/带宽（消费卡 vs 专业卡），发布基准仍须分卡标注绝对数字。
 
 ---

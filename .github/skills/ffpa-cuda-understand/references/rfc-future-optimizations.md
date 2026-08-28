@@ -59,7 +59,7 @@
 | PC-9 | fp4 split-D (M8N1) 量化大 D kernel 性能优化 | P | ⬜ 待开始 | PC-8（顺序） |
 | PC-10 | fp4 split-D M4N2 量化大 D kernel 性能优化 | P | ⬜ 待开始 | PC-9（顺序） |
 
-> 未收录项：cache-dit `_keep_or_pack` 物化兜底移除（依赖 FC-2 完成后作为其收尾步骤）；分卡基准标注（文档规范，随下次 bench 执行）。
+> 未收录项：分卡基准标注（文档规范，随下次 bench 执行）。（原列于此的 cache-dit `_keep_or_pack` 物化兜底移除已于 2026-08-28 完成，cache-dit@4b5c977：三 tensor 直传零拷贝，契约外布局由 C++ layout gate 显式报错。）
 
 ## 完成状态清单
 
@@ -102,7 +102,7 @@
         │（描述符/尾参基建，受益方 ↓）
         ├─► FC-3 strided+hybrid 组合放开（收尾）
         ├─► FC-6 smooth_v/MXFP8-PV 三族扩展（同一批 quantize 调用点）
-        └─► cache-dit _keep_or_pack 物化兜底移除
+        └─► cache-dit _keep_or_pack 物化兜底移除 ✓（2026-08-28，cache-dit@4b5c977）
 阶段 2（F2 特性对齐）
   FC-4 attn_bias（S/P 域注入基建）──► FC-5 dropout ⏸（暂不实施，复用注入点）
 阶段 3（F3 覆盖，按需推进，互相独立）
