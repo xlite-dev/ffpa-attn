@@ -23,7 +23,7 @@
 |---|---|---|---|---|---|
 | `attn_bias` | ✓ | ✓ | ✗ | ✗ | FC-4 |
 | `dropout` | ✓ | ✓ | ✗ | ✗ | FC-5 |
-| `tensor_layout='NHD'` O 写 | ✗ | persist-D | persist-D | persist-D | FC-2 |
+| `tensor_layout='NHD'` O 写 | ✗ | persist-D | 全族（FC-2） | 全族（FC-2） | 全族（FC-2） | FC-2 ✅ |
 | strided-NHD 读（fused-QKV） | ✗ | persist-D | 全族（FC-1） | 全族（FC-1） | 全族（FC-1） | FC-1 ✅ |
 | strided/NHD + hybrid 组合 | — | — | ✗ | ✗ | FC-3 |
 | smooth_v / MXFP8-PV knob | — | — | ✓ | persist-D only | FC-6 |
@@ -39,7 +39,7 @@
 | 编号 | 标题 | 轨道 | 状态 | 依赖 |
 |---|---|---|---|---|
 | FC-1 | split-D/M4N2 独立 Lv（strided-NHD 读） | F1 | ✅ 已完成（ffpa-attn cc8e8dc/4a49d38/882ee07） | — |
-| FC-2 | split-D/M4N2 NHD O 写 | F1 | ⬜ 待开始 | FC-1 热身 |
+| FC-2 | split-D/M4N2 NHD O 写 | F1 | ✅ 已完成（ffpa-attn df7d572/c4ca38b/2382ca4） | FC-1 热身 |
 | FC-3 | split-D/M4N2 + hybrid strided 组合 | F1 | ⬜ 待开始 | FC-1 |
 | FC-4 | 量化路径 `attn_bias` | F2 | ⬜ 待开始 | — |
 | FC-5 | 量化路径 `dropout` (**暂不实施，仅保留设计稿**) | F2 | ⬜ 待开始 | FC-4 注入点 |
@@ -64,7 +64,7 @@
 **轨道 F（功能完备性，最高优先级）**
 
 - [x] FC-1：split-D/M4N2 独立 Lv（strided-NHD 读）—— F1 基建第一步（2026-08-28 完成）
-- [ ] FC-2：split-D/M4N2 NHD O 写 —— F1 基建第二步
+- [x] FC-2：split-D/M4N2 NHD O 写 —— F1 基建第二步（2026-08-28 完成）
 - [ ] FC-3：split-D/M4N2 + hybrid strided 组合
 - [ ] FC-4：量化路径 `attn_bias`（S/P 域注入基建）
 - [ ] FC-5：量化路径 `dropout`
@@ -199,7 +199,7 @@ FC-2/FC-3 的热身（先打通 split-D 上的新描述符路径）。
 
 ### FC-2：split-D/M4N2 NHD O 写
 
-- **Status**: Draft ｜ **Priority**: F1 ｜ **Track**: 功能（布局）
+- **Status**: Done（2026-08-28，ffpa-attn df7d572/c4ca38b/2382ca4，fp8/fp4/fp16 三族） ｜ **Priority**: F1 ｜ **Track**: 功能（布局）
 
 #### Motivation
 
