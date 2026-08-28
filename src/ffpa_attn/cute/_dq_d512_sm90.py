@@ -1089,9 +1089,9 @@ class FFPAAttnBwdDQSm90SplitD:
       m_block, head_idx, batch_idx, _ = work_tile.tile_idx
       seqlen = SeqlenInfoCls(batch_idx)
       n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block)
-      process_tile = const_expr(
-        not self.is_varlen_k
-      ) or n_block_min < n_block_max
+      # A keyless tile has no MMA producer for the dQ accumulators.  Keep the
+      # wrapper-prezeroed dQ instead of epiloguing undefined RMEM fragments.
+      process_tile = n_block_min < n_block_max
 
       mask = AttentionMask(self.tile_m, self.tile_n, seqlen)
 
@@ -1421,9 +1421,8 @@ class FFPAAttnBwdDQSm90SplitD:
       seqlen = SeqlenInfoCls(batch_idx)
       n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block)
 
-      process_tile = const_expr(
-        not self.is_varlen_k
-      ) or n_block_min < n_block_max
+      # Mirror WG1: both halves must agree whether a defined accumulator exists.
+      process_tile = n_block_min < n_block_max
 
       mask = AttentionMask(self.tile_m, self.tile_n, seqlen)
 
