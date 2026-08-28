@@ -978,6 +978,12 @@ class FFPAAttnMeta:
     if self.forward_meta.name == "sdpa":
       return True
 
+    # Test/dev escape hatch (FFPA_FORCE_NO_SDPA_FALLBACK=1): run the
+    # selected backend's real kernel path instead of rerouting small
+    # shapes to SDPA, so tests assert the kernel rather than the fallback.
+    if os.environ.get("FFPA_FORCE_NO_SDPA_FALLBACK", "0") not in ("", "0"):
+      return False
+
     if self.forward_meta.name == "cutedsl":
       from .cute import (
         cute_forward_available,

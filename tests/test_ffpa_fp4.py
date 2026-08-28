@@ -566,3 +566,134 @@ def test_fp4_perf_vs_sdpa(capsys):
     print("\n".join(lines))
 
   assert ms["FFPA FP4"] < ms["SDPA fp16"]
+
+
+# ---------------------------------------------------------------------------
+# attn_bias (FC-4): additive bias / bool mask across the three fp4 families.
+# The fp4 kernels store KV permuted (kv_perm32), so the causal+bias cases
+# double as the column-mapping check (a wrong map flips masked columns and
+# fails parity immediately).
+
+
+def _mk_attn_bias(q, k, kind):
+  Nq, Nkv = q.size(2), k.size(2)
+  torch.manual_seed(1)
+  if kind == "additive":
+    return torch.randn(1, 1, Nq, Nkv, dtype=q.dtype, device=q.device) * 0.25
+  if kind == "broadcast":
+    return torch.randn(1, 1, 1, Nkv, dtype=q.dtype, device=q.device) * 0.25
+  mask = torch.ones(Nq, Nkv, dtype=torch.bool, device=q.device)
+  mask[:, 3::7] = False
+  mask[:, 0] = True
+  return mask
+
+
+def _sdpa_bias_ref(q, k, v, bias, causal):
+  # SDPA takes is_causal XOR attn_mask, so causal+bias composes into one
+  # additive mask (this mirrors the kernel: -inf masking overrides bias).
+  if bias.dtype == torch.bool:
+    score_bias = torch.zeros_like(bias, dtype=torch.float32
+                                  ).masked_fill(~bias, float("-inf"))
+  else:
+    score_bias = bias.float()
+  if causal:
+    tri = torch.ones(q.size(2), k.size(2), dtype=torch.bool,
+                     device=q.device).tril()
+    score_bias = score_bias.masked_fill(~tri, float("-inf"))
+  return F.scaled_dot_product_attention(
+    q.float(), k.float(), v.float(), attn_mask=score_bias
+  )
+
+
+@pytest.mark.parametrize(
+  "kind", ["dense", "causal_fused"], ids=["dense", "causal-fused"]
+)
+@pytest.mark.parametrize(
+  "D", [128, 320, 768], ids=["persist_d", "split_d", "split_d_m4n2"]
+)
+def test_fp4_attn_bias_parity(D, kind, monkeypatch):
+  # The public API rejects explicit attn_mask + is_causal (SDPA semantics),
+  # so the causal composition runs as one additive mask. This still checks
+  # the kv_perm32 column mapping: a wrong map flips masked/bias columns and
+  # fails parity immediately.
+  monkeypatch.setenv("FFPA_CUDA_ALLOW_SMALL_D", "1")
+  torch.manual_seed(0)
+  B, H, N = 1, 8, 2048
+  q, k, v = _mk(B, H, H, N, D)
+  bias = _mk_attn_bias(q, k, "additive")
+  if kind == "causal_fused":
+    tri = torch.ones(N, N, dtype=torch.bool, device=q.device).tril()
+    bias = bias.masked_fill(~tri, float("-inf"))
+
+  out = ffpa_attn_func(q, k, v, attn_mask=bias, forward_backend=_fp4_backend())
+  ref = _sdpa_bias_ref(q, k, v, bias, causal=False).half()
+  tol = _TOL_CAUSAL if kind == "causal_fused" else _TOL_DENSE
+  torch.testing.assert_close(out.float(), ref.float(), **tol)
+
+
+@pytest.mark.parametrize("kind", ["additive", "broadcast", "bool"])
+def test_fp4_attn_mask_forms_match_sdpa(kind, monkeypatch):
+  monkeypatch.setenv("FFPA_CUDA_ALLOW_SMALL_D", "1")
+  torch.manual_seed(0)
+  B, H, N, D = 1, 8, 2048, 128
+  q, k, v = _mk(B, H, H, N, D)
+  bias = _mk_attn_bias(q, k, kind)
+
+  out = ffpa_attn_func(q, k, v, attn_mask=bias, forward_backend=_fp4_backend())
+  ref = _sdpa_bias_ref(q, k, v, bias, causal=False).half()
+  torch.testing.assert_close(out.float(), ref.float(), **_TOL_DENSE)
+
+
+def test_fp4_attn_bias_gqa_parity(monkeypatch):
+  monkeypatch.setenv("FFPA_CUDA_ALLOW_SMALL_D", "1")
+  torch.manual_seed(0)
+  B, H, Hkv, Nq, Nkv, D = 1, 4, 2, 1024, 1536, 128
+  q = torch.randn(B, H, Nq, D, dtype=torch.float16, device="cuda") * 0.5
+  k = torch.randn(B, Hkv, Nkv, D, dtype=torch.float16, device="cuda") * 0.5
+  v = torch.randn(B, Hkv, Nkv, D, dtype=torch.float16, device="cuda") * 0.5
+  bias = _mk_attn_bias(q, k, "additive")
+
+  out = ffpa_attn_func(
+    q, k, v, attn_mask=bias, enable_gqa=True, forward_backend=_fp4_backend()
+  )
+  ref = F.scaled_dot_product_attention(
+    q.float(),
+    k.float(),
+    v.float(),
+    attn_mask=bias.float(),
+    enable_gqa=True,
+  ).half()
+  torch.testing.assert_close(out.float(), ref.float(), **_TOL_DENSE)
+
+
+def test_fp4_hybrid_attn_bias_parity(monkeypatch):
+  # Hybrid stage-1 (fp16 kernel) takes the [0, n_early) bias rows; stage-2
+  # offsets rows via q_start_row against the full bias.
+  monkeypatch.setenv("FFPA_CUDA_ALLOW_SMALL_D", "1")
+  torch.manual_seed(0)
+  B, H, N, D, n_early = 1, 8, 2048, 128, 256
+  q, k, v = _mk(B, H, H, N, D)
+  bias = _mk_attn_bias(q, k, "additive")
+
+  out = ffpa_attn_func(
+    q,
+    k,
+    v,
+    attn_mask=bias,
+    forward_backend=_fp4_backend(fp4_hybrid=True, fp4_hybrid_n_early=n_early),
+  )
+  ref = _sdpa_bias_ref(q, k, v, bias, causal=False).half()
+  torch.testing.assert_close(out.float(), ref.float(), **_TOL_DENSE)
+
+
+def test_fp4_rejects_dropout(monkeypatch):
+  monkeypatch.setenv("FFPA_CUDA_ALLOW_SMALL_D", "1")
+  torch.manual_seed(0)
+  B, H, N, D = 1, 4, 512, 128
+  q, k, v = _mk(B, H, H, N, D)
+  bias = _mk_attn_bias(q, k, "additive")
+
+  with pytest.raises(RuntimeError, match="does not support dropout"):
+    ffpa_attn_func(
+      q, k, v, attn_mask=bias, dropout_p=0.1, forward_backend=_fp4_backend()
+    )

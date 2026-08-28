@@ -250,11 +250,11 @@ void launch_ffpa_attn_fwd_template(
     if (prop->major >= 9) {
       if (force_fp4) {
         // NVFP4 persist-D: quantize pre-kernels + blockscaled mma. No knobs
-        // (kStages fixed by traits); attn_bias/dropout unsupported. Causal
-        // early rows fall back to the fp16 persist_d kernel (hybrid), same
+        // (kStages fixed by traits); dropout unsupported. Causal early
+        // rows fall back to the fp16 persist_d kernel (hybrid), same
         // as fp8: P-quantization noise on short-row softmax rows.
-        TORCH_CHECK(attn_bias.numel() == 0 && dropout_p == 0.0,
-                    "fp4 sm120 path does not support attn_bias/dropout");
+        TORCH_CHECK(dropout_p == 0.0,
+                    "fp4 sm120 path does not support dropout");
         // NHD (BNHD) views and strided fused-QKV rows are consumed natively
         // by the fp4 pre-kernels (Fp8InputLayout strides) and every fp16
         // stage-1 variant (persist-D, split-D, m4n2); the causal/padded
@@ -286,21 +286,26 @@ void launch_ffpa_attn_fwd_template(
                 torch::empty({Nb, Nh, n_early}, torch::TensorOptions()
                                                     .dtype(torch::kFloat32)
                                                     .device(Q.device()));
-            auto empty_bias = torch::empty({0}, attn_bias.options());
+            // Stage-1 sees only the [0, n_early) query rows; slice the bias
+            // to match (the fp16 family has no q_start_row, rows are
+            // addressed from 0). Stage-2 passes the full bias and offsets
+            // rows via q_start_row.
+            auto bias_e = attn_bias.numel() > 0 ? attn_bias.slice(2, 0, n_early)
+                                                : attn_bias;
             launch_cute_fwd_persist_d_sm120<kDataType, kHeadDim, kStage>(
-                Q_e, K_e, V_e, O_e, empty_bias, lse_e, causal, softmax_scale,
-                0.0, 0, 0);
+                Q_e, K_e, V_e, O_e, bias_e, lse_e, causal, softmax_scale, 0.0,
+                0, 0);
             O.slice(2, 0, n_early).copy_(O_e);
             if (softmax_lse.numel() > 0)
               softmax_lse.slice(2, 0, n_early).copy_(lse_e);
             // Stage 2: fp4 late rows [n_early:N) via q_start_row offset.
             launch_cute_fwd_persist_d_fp4_sm120<kDataType, kHeadDim, kStage>(
-                Q, K, V, O, softmax_lse, causal, softmax_scale,
+                Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
                 /*q_start_row=*/n_early, fp4_hadamard,
                 static_cast<int>(fp4_pv_mm_type), fp4_smooth_v);
           } else {
             launch_cute_fwd_persist_d_fp4_sm120<kDataType, kHeadDim, kStage>(
-                Q, K, V, O, softmax_lse, causal, softmax_scale,
+                Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
                 /*q_start_row=*/0, fp4_hadamard,
                 static_cast<int>(fp4_pv_mm_type), fp4_smooth_v);
           }
@@ -326,21 +331,23 @@ void launch_ffpa_attn_fwd_template(
                 torch::empty({Nb, Nh, n_early}, torch::TensorOptions()
                                                     .dtype(torch::kFloat32)
                                                     .device(Q.device()));
-            auto empty_bias = torch::empty({0}, attn_bias.options());
+            // Stage-1 bias slice: see the persist_d hybrid block above.
+            auto bias_e = attn_bias.numel() > 0 ? attn_bias.slice(2, 0, n_early)
+                                                : attn_bias;
             launch_cute_fwd_split_d_sm120<kDataType, kHeadDim, kStage, 32, 64>(
-                Q_e, K_e, V_e, O_e, empty_bias, lse_e, causal, softmax_scale,
-                0.0, 0, 0);
+                Q_e, K_e, V_e, O_e, bias_e, lse_e, causal, softmax_scale, 0.0,
+                0, 0);
             O.slice(2, 0, n_early).copy_(O_e);
             if (softmax_lse.numel() > 0)
               softmax_lse.slice(2, 0, n_early).copy_(lse_e);
             // Stage 2: fp4 late rows [n_early:N) via q_start_row offset.
             launch_cute_fwd_split_d_fp4_sm120<kDataType, kHeadDim, kStage>(
-                Q, K, V, O, softmax_lse, causal, softmax_scale,
+                Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
                 /*q_start_row=*/n_early, fp4_hadamard,
                 static_cast<int>(fp4_pv_mm_type), fp4_smooth_v);
           } else {
             launch_cute_fwd_split_d_fp4_sm120<kDataType, kHeadDim, kStage>(
-                Q, K, V, O, softmax_lse, causal, softmax_scale,
+                Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
                 /*q_start_row=*/0, fp4_hadamard,
                 static_cast<int>(fp4_pv_mm_type), fp4_smooth_v);
           }
@@ -366,20 +373,22 @@ void launch_ffpa_attn_fwd_template(
                 torch::empty({Nb, Nh, n_early}, torch::TensorOptions()
                                                     .dtype(torch::kFloat32)
                                                     .device(Q.device()));
-            auto empty_bias = torch::empty({0}, attn_bias.options());
+            // Stage-1 bias slice: see the persist_d hybrid block above.
+            auto bias_e = attn_bias.numel() > 0 ? attn_bias.slice(2, 0, n_early)
+                                                : attn_bias;
             launch_cute_fwd_split_d_m4n2_sm120<kDataType, kHeadDim, kStage>(
-                Q_e, K_e, V_e, O_e, empty_bias, lse_e, causal, softmax_scale,
-                0.0, 0, 0);
+                Q_e, K_e, V_e, O_e, bias_e, lse_e, causal, softmax_scale, 0.0,
+                0, 0);
             O.slice(2, 0, n_early).copy_(O_e);
             if (softmax_lse.numel() > 0)
               softmax_lse.slice(2, 0, n_early).copy_(lse_e);
             launch_cute_fwd_split_d_m4n2_fp4_sm120<kDataType, kHeadDim, kStage>(
-                Q, K, V, O, softmax_lse, causal, softmax_scale,
+                Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
                 /*q_start_row=*/n_early, fp4_hadamard,
                 static_cast<int>(fp4_pv_mm_type), fp4_smooth_v);
           } else {
             launch_cute_fwd_split_d_m4n2_fp4_sm120<kDataType, kHeadDim, kStage>(
-                Q, K, V, O, softmax_lse, causal, softmax_scale,
+                Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
                 /*q_start_row=*/0, fp4_hadamard,
                 static_cast<int>(fp4_pv_mm_type), fp4_smooth_v);
           }
@@ -449,10 +458,13 @@ void launch_ffpa_attn_fwd_template(
                 torch::empty({Nb, Nh, n_early}, torch::TensorOptions()
                                                     .dtype(torch::kFloat32)
                                                     .device(Q.device()));
-            auto empty_bias = torch::empty({0}, attn_bias.options());
+            // Stage-1 bias slice: the fp16 family has no q_start_row (rows
+            // addressed from 0), so hand it only the [0, n_early) rows.
+            auto bias_e = attn_bias.numel() > 0 ? attn_bias.slice(2, 0, n_early)
+                                                : attn_bias;
             launch_cute_fwd_persist_d_sm120<kDataType, kHeadDim, kStage>(
-                Q_e, K_e, V_e, O_e, empty_bias, lse_e, causal, softmax_scale,
-                0.0, 0, 0);
+                Q_e, K_e, V_e, O_e, bias_e, lse_e, causal, softmax_scale, 0.0,
+                0, 0);
             O.slice(2, 0, n_early).copy_(O_e);
             if (softmax_lse.numel() > 0)
               softmax_lse.slice(2, 0, n_early).copy_(lse_e);
@@ -485,10 +497,11 @@ void launch_ffpa_attn_fwd_template(
                 torch::empty({Nb, Nh, n_early}, torch::TensorOptions()
                                                     .dtype(torch::kFloat32)
                                                     .device(Q.device()));
-            auto empty_bias = torch::empty({0}, attn_bias.options());
+            auto bias_e = attn_bias.numel() > 0 ? attn_bias.slice(2, 0, n_early)
+                                                : attn_bias;
             launch_cute_fwd_split_d_sm120<kDataType, kHeadDim, kStage, 32, 64>(
-                Q_e, K_e, V_e, O_e, empty_bias, lse_e, causal, softmax_scale,
-                0.0, 0, 0);
+                Q_e, K_e, V_e, O_e, bias_e, lse_e, causal, softmax_scale, 0.0,
+                0, 0);
             O.slice(2, 0, n_early).copy_(O_e);
             if (softmax_lse.numel() > 0)
               softmax_lse.slice(2, 0, n_early).copy_(lse_e);
@@ -519,10 +532,11 @@ void launch_ffpa_attn_fwd_template(
                 torch::empty({Nb, Nh, n_early}, torch::TensorOptions()
                                                     .dtype(torch::kFloat32)
                                                     .device(Q.device()));
-            auto empty_bias = torch::empty({0}, attn_bias.options());
+            auto bias_e = attn_bias.numel() > 0 ? attn_bias.slice(2, 0, n_early)
+                                                : attn_bias;
             launch_cute_fwd_split_d_m4n2_sm120<kDataType, kHeadDim, kStage>(
-                Q_e, K_e, V_e, O_e, empty_bias, lse_e, causal, softmax_scale,
-                0.0, 0, 0);
+                Q_e, K_e, V_e, O_e, bias_e, lse_e, causal, softmax_scale, 0.0,
+                0, 0);
             O.slice(2, 0, n_early).copy_(O_e);
             if (softmax_lse.numel() > 0)
               softmax_lse.slice(2, 0, n_early).copy_(lse_e);

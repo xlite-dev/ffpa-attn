@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstdio>
 #include <optional>
+#include <type_traits>
 #include "common.cuh"
 #ifdef ENABLE_FFPA_CUTE_EXT
 #include "cute/sm_80/split_d.cuh"
@@ -98,6 +99,54 @@ static inline ffpa_fp8::Fp8InputLayout ffpa_layout_of(
       "permute view, got strides (",
       X.stride(0), ",", X.stride(1), ",", X.stride(2), ",", X.stride(3), ")");
   return {false, 0, 0, N * D, D};
+}
+
+// Kernel-side attn_bias view: nullptr means no bias. dtype codes match
+// ffpa::prefill::load_attn_bias_value (1=half, 2=bf16, 3=other).
+struct FfpaBiasParams {
+  const void* ptr = nullptr;
+  int dtype = 0;
+  long long stride_b = 0;
+  long long stride_h = 0;
+  long long stride_m = 0;
+  long long stride_n = 0;
+};
+
+// Validate/flatten a python-side additive attn_bias (already normalized to
+// 4-D [B, Nh_q, Nq, Nkv]; size-1 dims broadcast via stride 0) into kernel
+// launch parameters. Shared by the fp8/fp4 quant launchers; mirrors the
+// fp16 launcher checks.
+static inline FfpaBiasParams ffpa_bias_params_of(const torch::Tensor& attn_bias,
+                                                 const torch::Tensor& Q,
+                                                 const torch::Tensor& K) {
+  FfpaBiasParams p;
+  if (attn_bias.numel() == 0)
+    return p;
+  const long Nb = Q.size(0), Nh = Q.size(1), Nq = Q.size(2);
+  const long Nkv = K.size(2);
+  TORCH_CHECK(attn_bias.is_cuda(),
+              "ffpa_attn: attn_mask must be a CUDA tensor");
+  TORCH_CHECK(attn_bias.device() == Q.device(),
+              "ffpa_attn: attn_mask must be on the same device as Q/K/V");
+  TORCH_CHECK(attn_bias.dim() == 4,
+              "ffpa_attn: normalized attn_mask must be 4-D [B, Nh_q, Nq, Nkv]");
+  TORCH_CHECK(attn_bias.size(0) == 1 || attn_bias.size(0) == Nb,
+              "ffpa_attn: attn_mask batch dimension must be 1 or B");
+  TORCH_CHECK(attn_bias.size(1) == 1 || attn_bias.size(1) == Nh,
+              "ffpa_attn: attn_mask head dimension must be 1 or Nh_q");
+  TORCH_CHECK(attn_bias.size(2) == 1 || attn_bias.size(2) == Nq,
+              "ffpa_attn: attn_mask query dimension must be 1 or Nq");
+  TORCH_CHECK(attn_bias.size(3) == 1 || attn_bias.size(3) == Nkv,
+              "ffpa_attn: attn_mask kv dimension must be 1 or Nkv");
+  p.ptr = attn_bias.data_ptr();
+  p.dtype = attn_bias.scalar_type() == at::ScalarType::Half       ? 1
+            : attn_bias.scalar_type() == at::ScalarType::BFloat16 ? 2
+                                                                  : 3;
+  p.stride_b = (attn_bias.size(0) == 1 && Nb > 1) ? 0 : attn_bias.stride(0);
+  p.stride_h = (attn_bias.size(1) == 1 && Nh > 1) ? 0 : attn_bias.stride(1);
+  p.stride_m = (attn_bias.size(2) == 1 && Nq > 1) ? 0 : attn_bias.stride(2);
+  p.stride_n = (attn_bias.size(3) == 1 && Nkv > 1) ? 0 : attn_bias.stride(3);
+  return p;
 }
 
 template <typename kDataType, const int kHeadDim, const int kStage,
@@ -912,8 +961,9 @@ void launch_cute_fwd_persist_d_fp8_sm120_impl(
       ffpa_layout_of(K, K.size(2), K.size(3), /*allow_strided_rows=*/true);
   const ffpa_fp8::Fp8InputLayout Lv =
       ffpa_layout_of(V, V.size(2), V.size(3), /*allow_strided_rows=*/true);
-  TORCH_CHECK(attn_bias.numel() == 0 && dropout_p == 0.0,
-              "fp8 sm120 path does not support attn_bias/dropout");
+  TORCH_CHECK(dropout_p == 0.0, "fp8 sm120 path does not support dropout");
+  const FfpaBiasParams bias = ffpa_bias_params_of(attn_bias, Q, K);
+  const int bias_on = bias.ptr != nullptr ? 1 : 0;
   // q/k only support per-block quant today; per-channel is reserved for
   // future kernel work.
   TORCH_CHECK(
@@ -1176,61 +1226,74 @@ void launch_cute_fwd_persist_d_fp8_sm120_impl(
         q_scale.data_ptr<float>(), k_scale.data_ptr<float>(),
         v_scale.data_ptr<float>(), Nq, Nkv, Nh, Nh_kv, scale, Tc, causal,
         total_q_rows, total_kv_rows, n_rb_q, n_rb_kv, q_start_row, km_f32_ptr,
-        vm_kernel, nhd_out);
+        vm_kernel, nhd_out, bias.ptr, bias.dtype, bias.stride_b, bias.stride_h,
+        bias.stride_m, bias.stride_n);
   };
-  if (qk_per_thread) {
-    // Per-thread QK quant (sage style): fragment-aligned dequant scales.
-    if (v_per_channel && pv_acc_f16) {
+  // kHasAttnBias is a template parameter, so the variant table below is
+  // instantiated once per compile-time bias tag (runtime numel -> tag).
+  const auto dispatch = [&](auto bias_tag) {
+    constexpr int kBiasOn = decltype(bias_tag)::value;
+    if (qk_per_thread) {
+      // Per-thread QK quant (sage style): fragment-aligned dequant scales.
+      if (v_per_channel && pv_acc_f16) {
+        launch_kernel(
+            ffpa_fp8::persist_d_ws_fwd_cute_fp8_sm120<
+                Traits, ElementO, TmaQ, TmaK, TmaV, TmaO, false, true, true,
+                true, reorg_free, ffpa_fp8::kPersistQs2rDefault, kBiasOn>);
+      } else if (v_per_channel) {
+        launch_kernel(
+            ffpa_fp8::persist_d_ws_fwd_cute_fp8_sm120<
+                Traits, ElementO, TmaQ, TmaK, TmaV, TmaO, false, false, true,
+                true, reorg_free, ffpa_fp8::kPersistQs2rDefault, kBiasOn>);
+      } else if (pv_acc_f16) {
+        launch_kernel(
+            ffpa_fp8::persist_d_ws_fwd_cute_fp8_sm120<
+                Traits, ElementO, TmaQ, TmaK, TmaV, TmaO, false, true, false,
+                true, reorg_free, ffpa_fp8::kPersistQs2rDefault, kBiasOn>);
+      } else {
+        launch_kernel(
+            ffpa_fp8::persist_d_ws_fwd_cute_fp8_sm120<
+                Traits, ElementO, TmaQ, TmaK, TmaV, TmaO, false, false, false,
+                true, reorg_free, ffpa_fp8::kPersistQs2rDefault, kBiasOn>);
+      }
+    } else if (pquant_per_row) {
+      launch_kernel(
+          ffpa_fp8::persist_d_ws_fwd_cute_fp8_sm120<
+              Traits, ElementO, TmaQ, TmaK, TmaV, TmaO, true, false, false,
+              false, reorg_free, ffpa_fp8::kPersistQs2rDefault, kBiasOn>);
+    } else if (v_per_channel && pv_acc_f16) {
+      // Per-channel V + fp16 PV accumulator: sage-style per-D V scale plus
+      // the f8f8f16 PV path that avoids the 22-bit f8f8f32 loss.
       launch_kernel(ffpa_fp8::persist_d_ws_fwd_cute_fp8_sm120<
                     Traits, ElementO, TmaQ, TmaK, TmaV, TmaO, false, true, true,
-                    true, reorg_free>);
+                    false, reorg_free, ffpa_fp8::kPersistQs2rDefault, kBiasOn>);
     } else if (v_per_channel) {
-      launch_kernel(ffpa_fp8::persist_d_ws_fwd_cute_fp8_sm120<
-                    Traits, ElementO, TmaQ, TmaK, TmaV, TmaO, false, false,
-                    true, true, reorg_free>);
+      // Per-channel V (sage-style): V per-D scale, P uses fixed 448;
+      // epilogue dequants per-D. Targets real VLM/diffusion data with
+      // per-D outliers (per-block V over-saturates them).
+      launch_kernel(
+          ffpa_fp8::persist_d_ws_fwd_cute_fp8_sm120<
+              Traits, ElementO, TmaQ, TmaK, TmaV, TmaO, false, false, true,
+              false, reorg_free, ffpa_fp8::kPersistQs2rDefault, kBiasOn>);
     } else if (pv_acc_f16) {
-      launch_kernel(ffpa_fp8::persist_d_ws_fwd_cute_fp8_sm120<
-                    Traits, ElementO, TmaQ, TmaK, TmaV, TmaO, false, true,
-                    false, true, reorg_free>);
+      // f8f8f16 PV (fp16 MMA accumulator, absorbs to float o_acc each
+      // kv_tile) avoids the 22-bit f8f8f32 accumulator loss on causal
+      // early rows. See persist_d.cuh kPVAccF16.
+      launch_kernel(
+          ffpa_fp8::persist_d_ws_fwd_cute_fp8_sm120<
+              Traits, ElementO, TmaQ, TmaK, TmaV, TmaO, false, true, false,
+              false, reorg_free, ffpa_fp8::kPersistQs2rDefault, kBiasOn>);
     } else {
-      launch_kernel(ffpa_fp8::persist_d_ws_fwd_cute_fp8_sm120<
-                    Traits, ElementO, TmaQ, TmaK, TmaV, TmaO, false, false,
-                    false, true, reorg_free>);
+      launch_kernel(
+          ffpa_fp8::persist_d_ws_fwd_cute_fp8_sm120<
+              Traits, ElementO, TmaQ, TmaK, TmaV, TmaO, false, false, false,
+              false, reorg_free, ffpa_fp8::kPersistQs2rDefault, kBiasOn>);
     }
-  } else if (pquant_per_row) {
-    launch_kernel(
-        ffpa_fp8::persist_d_ws_fwd_cute_fp8_sm120<Traits, ElementO, TmaQ, TmaK,
-                                                  TmaV, TmaO, true, false,
-                                                  false, false, reorg_free>);
-  } else if (v_per_channel && pv_acc_f16) {
-    // Per-channel V + fp16 PV accumulator: sage-style per-D V scale plus the
-    // f8f8f16 PV path that avoids the 22-bit f8f8f32 accumulator loss.
-    launch_kernel(
-        ffpa_fp8::persist_d_ws_fwd_cute_fp8_sm120<Traits, ElementO, TmaQ, TmaK,
-                                                  TmaV, TmaO, false, true, true,
-                                                  false, reorg_free>);
-  } else if (v_per_channel) {
-    // Per-channel V (sage-style): V per-D scale, P uses fixed 448; epilogue
-    // dequants per-D. Targets real VLM/diffusion data with per-D outliers
-    // (per-block V over-saturates them). See persist_d.cuh kVPerChannel.
-    launch_kernel(
-        ffpa_fp8::persist_d_ws_fwd_cute_fp8_sm120<Traits, ElementO, TmaQ, TmaK,
-                                                  TmaV, TmaO, false, false,
-                                                  true, false, reorg_free>);
-  } else if (pv_acc_f16) {
-    // f8f8f16 PV (fp16 MMA accumulator, absorbs to float o_acc each
-    // kv_tile) avoids the 22-bit f8f8f32 accumulator loss on causal early
-    // rows. See persist_d.cuh kPVAccF16.
-    launch_kernel(
-        ffpa_fp8::persist_d_ws_fwd_cute_fp8_sm120<Traits, ElementO, TmaQ, TmaK,
-                                                  TmaV, TmaO, false, true,
-                                                  false, false, reorg_free>);
-  } else {
-    launch_kernel(
-        ffpa_fp8::persist_d_ws_fwd_cute_fp8_sm120<Traits, ElementO, TmaQ, TmaK,
-                                                  TmaV, TmaO, false, false,
-                                                  false, false, reorg_free>);
-  }
+  };
+  if (bias.ptr != nullptr)
+    dispatch(std::integral_constant<int, 1>{});
+  else
+    dispatch(std::integral_constant<int, 0>{});
 }
 
 template <typename kDataType, const int kHeadDim, const int kStage>
@@ -1309,8 +1372,9 @@ void launch_cute_fwd_split_d_fp8_sm120_impl(
       ffpa_layout_of(K, K.size(2), K.size(3), /*allow_strided_rows=*/true);
   const ffpa_fp8::Fp8InputLayout Lv =
       ffpa_layout_of(V, V.size(2), V.size(3), /*allow_strided_rows=*/true);
-  TORCH_CHECK(attn_bias.numel() == 0 && dropout_p == 0.0,
-              "fp8 sm120 path does not support attn_bias/dropout");
+  TORCH_CHECK(dropout_p == 0.0, "fp8 sm120 path does not support dropout");
+  const FfpaBiasParams bias = ffpa_bias_params_of(attn_bias, Q, K);
+  const int bias_on = bias.ptr != nullptr ? 1 : 0;
   TORCH_CHECK(
       (fp8_q_quant_method == 0 && fp8_k_quant_method == 0) ||
           (fp8_q_quant_method == 2 && fp8_k_quant_method == 2),
@@ -1536,52 +1600,62 @@ void launch_cute_fwd_split_d_fp8_sm120_impl(
         q_scale.data_ptr<float>(), k_scale.data_ptr<float>(),
         v_scale.data_ptr<float>(), Nq, Nkv, Nh, Nh_kv, scale, Tc, causal,
         total_q_rows, total_kv_rows, n_rb_q, n_rb_kv, q_start_row, km_f32_ptr,
-        vm_kernel, nhd_out);
+        vm_kernel, nhd_out, bias.ptr, bias.dtype, bias.stride_b, bias.stride_h,
+        bias.stride_m, bias.stride_n);
   };
-  if (qk_per_thread) {
-    // Per-thread QK quant (sage style): fragment-aligned dequant scales.
-    if (v_per_channel && pv_acc_f16) {
+  // kHasAttnBias is a template parameter, so the variant table below is
+  // instantiated once per compile-time bias tag (runtime numel -> tag).
+  const auto dispatch = [&](auto bias_tag) {
+    constexpr int kBiasOn = decltype(bias_tag)::value;
+    if (qk_per_thread) {
+      // Per-thread QK quant (sage style): fragment-aligned dequant scales.
+      if (v_per_channel && pv_acc_f16) {
+        launch_kernel(
+            ffpa_fp8::split_d_fwd_cute_fp8_sm120<Traits, ElementO, TmaQ, TmaK,
+                                                 TmaV, TmaO, true, true, true,
+                                                 reorg_free, kBiasOn>);
+      } else if (v_per_channel) {
+        launch_kernel(
+            ffpa_fp8::split_d_fwd_cute_fp8_sm120<Traits, ElementO, TmaQ, TmaK,
+                                                 TmaV, TmaO, false, true, true,
+                                                 reorg_free, kBiasOn>);
+      } else if (pv_acc_f16) {
+        launch_kernel(
+            ffpa_fp8::split_d_fwd_cute_fp8_sm120<Traits, ElementO, TmaQ, TmaK,
+                                                 TmaV, TmaO, true, false, true,
+                                                 reorg_free, kBiasOn>);
+      } else {
+        launch_kernel(
+            ffpa_fp8::split_d_fwd_cute_fp8_sm120<Traits, ElementO, TmaQ, TmaK,
+                                                 TmaV, TmaO, false, false, true,
+                                                 reorg_free, kBiasOn>);
+      }
+    } else if (v_per_channel && pv_acc_f16) {
       launch_kernel(
           ffpa_fp8::split_d_fwd_cute_fp8_sm120<Traits, ElementO, TmaQ, TmaK,
-                                               TmaV, TmaO, true, true, true,
-                                               reorg_free>);
+                                               TmaV, TmaO, true, true, false,
+                                               reorg_free, kBiasOn>);
     } else if (v_per_channel) {
       launch_kernel(
           ffpa_fp8::split_d_fwd_cute_fp8_sm120<Traits, ElementO, TmaQ, TmaK,
-                                               TmaV, TmaO, false, true, true,
-                                               reorg_free>);
+                                               TmaV, TmaO, false, true, false,
+                                               reorg_free, kBiasOn>);
     } else if (pv_acc_f16) {
       launch_kernel(
           ffpa_fp8::split_d_fwd_cute_fp8_sm120<Traits, ElementO, TmaQ, TmaK,
-                                               TmaV, TmaO, true, false, true,
-                                               reorg_free>);
+                                               TmaV, TmaO, true, false, false,
+                                               reorg_free, kBiasOn>);
     } else {
       launch_kernel(
           ffpa_fp8::split_d_fwd_cute_fp8_sm120<Traits, ElementO, TmaQ, TmaK,
-                                               TmaV, TmaO, false, false, true,
-                                               reorg_free>);
+                                               TmaV, TmaO, false, false, false,
+                                               reorg_free, kBiasOn>);
     }
-  } else if (v_per_channel && pv_acc_f16) {
-    launch_kernel(
-        ffpa_fp8::split_d_fwd_cute_fp8_sm120<Traits, ElementO, TmaQ, TmaK, TmaV,
-                                             TmaO, true, true, false,
-                                             reorg_free>);
-  } else if (v_per_channel) {
-    launch_kernel(
-        ffpa_fp8::split_d_fwd_cute_fp8_sm120<Traits, ElementO, TmaQ, TmaK, TmaV,
-                                             TmaO, false, true, false,
-                                             reorg_free>);
-  } else if (pv_acc_f16) {
-    launch_kernel(
-        ffpa_fp8::split_d_fwd_cute_fp8_sm120<Traits, ElementO, TmaQ, TmaK, TmaV,
-                                             TmaO, true, false, false,
-                                             reorg_free>);
-  } else {
-    launch_kernel(
-        ffpa_fp8::split_d_fwd_cute_fp8_sm120<Traits, ElementO, TmaQ, TmaK, TmaV,
-                                             TmaO, false, false, false,
-                                             reorg_free>);
-  }
+  };
+  if (bias.ptr != nullptr)
+    dispatch(std::integral_constant<int, 1>{});
+  else
+    dispatch(std::integral_constant<int, 0>{});
 }
 
 template <typename kDataType, const int kHeadDim, const int kStage>
@@ -1660,8 +1734,9 @@ void launch_cute_fwd_split_d_m4n2_fp8_sm120_impl(
       ffpa_layout_of(K, K.size(2), K.size(3), /*allow_strided_rows=*/true);
   const ffpa_fp8::Fp8InputLayout Lv =
       ffpa_layout_of(V, V.size(2), V.size(3), /*allow_strided_rows=*/true);
-  TORCH_CHECK(attn_bias.numel() == 0 && dropout_p == 0.0,
-              "fp8 sm120 path does not support attn_bias/dropout");
+  TORCH_CHECK(dropout_p == 0.0, "fp8 sm120 path does not support dropout");
+  const FfpaBiasParams bias = ffpa_bias_params_of(attn_bias, Q, K);
+  const int bias_on = bias.ptr != nullptr ? 1 : 0;
   TORCH_CHECK(
       (fp8_q_quant_method == 0 && fp8_k_quant_method == 0) ||
           (fp8_q_quant_method == 2 && fp8_k_quant_method == 2),
@@ -1879,44 +1954,62 @@ void launch_cute_fwd_split_d_m4n2_fp8_sm120_impl(
         q_scale.data_ptr<float>(), k_scale.data_ptr<float>(),
         v_scale.data_ptr<float>(), Nq, Nkv, Nh, Nh_kv, scale, Tc, causal,
         total_q_rows, total_kv_rows, n_rb_q, n_rb_kv, q_start_row, km_f32_ptr,
-        vm_kernel, nhd_out);
+        vm_kernel, nhd_out, bias.ptr, bias.dtype, bias.stride_b, bias.stride_h,
+        bias.stride_m, bias.stride_n);
   };
-  if (qk_per_thread) {
-    // Per-thread QK quant (sage style): fragment-aligned dequant scales.
-    if (v_per_channel && pv_acc_f16) {
+  // kHasAttnBias is a template parameter, so the variant table below is
+  // instantiated once per compile-time bias tag (runtime numel -> tag).
+  const auto dispatch = [&](auto bias_tag) {
+    constexpr int kBiasOn = decltype(bias_tag)::value;
+    if (qk_per_thread) {
+      // Per-thread QK quant (sage style): fragment-aligned dequant scales.
+      if (v_per_channel && pv_acc_f16) {
+        launch_kernel(
+            ffpa_fp8::split_d_m4n2_fwd_cute_fp8_sm120<Traits, ElementO, TmaQ,
+                                                      TmaK, TmaV, TmaO, true,
+                                                      true, true, kBiasOn>);
+      } else if (v_per_channel) {
+        launch_kernel(
+            ffpa_fp8::split_d_m4n2_fwd_cute_fp8_sm120<Traits, ElementO, TmaQ,
+                                                      TmaK, TmaV, TmaO, false,
+                                                      true, true, kBiasOn>);
+      } else if (pv_acc_f16) {
+        launch_kernel(
+            ffpa_fp8::split_d_m4n2_fwd_cute_fp8_sm120<Traits, ElementO, TmaQ,
+                                                      TmaK, TmaV, TmaO, true,
+                                                      false, true, kBiasOn>);
+      } else {
+        launch_kernel(
+            ffpa_fp8::split_d_m4n2_fwd_cute_fp8_sm120<Traits, ElementO, TmaQ,
+                                                      TmaK, TmaV, TmaO, false,
+                                                      false, true, kBiasOn>);
+      }
+    } else if (v_per_channel && pv_acc_f16) {
       launch_kernel(
-          ffpa_fp8::split_d_m4n2_fwd_cute_fp8_sm120<
-              Traits, ElementO, TmaQ, TmaK, TmaV, TmaO, true, true, true>);
+          ffpa_fp8::split_d_m4n2_fwd_cute_fp8_sm120<Traits, ElementO, TmaQ,
+                                                    TmaK, TmaV, TmaO, true,
+                                                    true, false, kBiasOn>);
     } else if (v_per_channel) {
       launch_kernel(
-          ffpa_fp8::split_d_m4n2_fwd_cute_fp8_sm120<
-              Traits, ElementO, TmaQ, TmaK, TmaV, TmaO, false, true, true>);
+          ffpa_fp8::split_d_m4n2_fwd_cute_fp8_sm120<Traits, ElementO, TmaQ,
+                                                    TmaK, TmaV, TmaO, false,
+                                                    true, false, kBiasOn>);
     } else if (pv_acc_f16) {
       launch_kernel(
-          ffpa_fp8::split_d_m4n2_fwd_cute_fp8_sm120<
-              Traits, ElementO, TmaQ, TmaK, TmaV, TmaO, true, false, true>);
+          ffpa_fp8::split_d_m4n2_fwd_cute_fp8_sm120<Traits, ElementO, TmaQ,
+                                                    TmaK, TmaV, TmaO, true,
+                                                    false, false, kBiasOn>);
     } else {
       launch_kernel(
-          ffpa_fp8::split_d_m4n2_fwd_cute_fp8_sm120<
-              Traits, ElementO, TmaQ, TmaK, TmaV, TmaO, false, false, true>);
+          ffpa_fp8::split_d_m4n2_fwd_cute_fp8_sm120<Traits, ElementO, TmaQ,
+                                                    TmaK, TmaV, TmaO, false,
+                                                    false, false, kBiasOn>);
     }
-  } else if (v_per_channel && pv_acc_f16) {
-    launch_kernel(
-        ffpa_fp8::split_d_m4n2_fwd_cute_fp8_sm120<Traits, ElementO, TmaQ, TmaK,
-                                                  TmaV, TmaO, true, true>);
-  } else if (v_per_channel) {
-    launch_kernel(
-        ffpa_fp8::split_d_m4n2_fwd_cute_fp8_sm120<Traits, ElementO, TmaQ, TmaK,
-                                                  TmaV, TmaO, false, true>);
-  } else if (pv_acc_f16) {
-    launch_kernel(
-        ffpa_fp8::split_d_m4n2_fwd_cute_fp8_sm120<Traits, ElementO, TmaQ, TmaK,
-                                                  TmaV, TmaO, true>);
-  } else {
-    launch_kernel(
-        ffpa_fp8::split_d_m4n2_fwd_cute_fp8_sm120<Traits, ElementO, TmaQ, TmaK,
-                                                  TmaV, TmaO>);
-  }
+  };
+  if (bias.ptr != nullptr)
+    dispatch(std::integral_constant<int, 1>{});
+  else
+    dispatch(std::integral_constant<int, 0>{});
 }
 
 template <typename kDataType, const int kHeadDim, const int kStage>
@@ -2093,8 +2186,9 @@ void launch_cute_fwd_split_d_sm80(torch::Tensor Q, torch::Tensor K,
 template <typename kDataType, const int kHeadDim, bool kPvMxfp8 = false>
 void launch_cute_fwd_persist_d_fp4_sm120_impl(
     torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O,
-    torch::Tensor softmax_lse, int causal, double softmax_scale,
-    int q_start_row = 0, bool fp4_hadamard = false, bool fp4_smooth_v = false) {
+    torch::Tensor attn_bias, torch::Tensor softmax_lse, int causal,
+    double softmax_scale, int q_start_row = 0, bool fp4_hadamard = false,
+    bool fp4_smooth_v = false) {
   using namespace cute;
   constexpr int kBr = 128;
   constexpr int kBc = 128;
@@ -2104,6 +2198,8 @@ void launch_cute_fwd_persist_d_fp4_sm120_impl(
                                       cutlass::half_t, cutlass::bfloat16_t>;
   using Traits =
       ffpa_fp4::FFPAAttnCuTePersistDFP4Traits<ElementO, kHeadDim, kPvMxfp8>;
+  const FfpaBiasParams bias = ffpa_bias_params_of(attn_bias, Q, K);
+  const int bias_on = bias.ptr != nullptr ? 1 : 0;
   using Element = typename Traits::Element;
   using ElementSF = typename Traits::ElementSF;
   using ElementPV = typename Traits::ElementPV;
@@ -2423,29 +2519,38 @@ void launch_cute_fwd_persist_d_fp4_sm120_impl(
   const int num_ctas =
       causal ? total_work : std::min(total_work, prop->multiProcessorCount);
   const dim3 grid(num_ctas, 1, 1);
-  auto kernel = ffpa_fp4::persist_d_ws_fwd_cute_fp4_sm120<
-      Traits, ElementO, decltype(tma_q), decltype(tma_k), decltype(tma_v),
-      decltype(tma_o), decltype(tma_sfq), decltype(tma_sfk), decltype(tma_sfvt),
-      decltype(tma_ds)>;
-  TORCH_CHECK(
-      cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                           kSmemBytes) == cudaSuccess,
-      "ffpa_attn: fp4 persist_d smem opt-in failed for D=", kHeadDim);
-  kernel<<<grid, block, kSmemBytes, stream>>>(
-      tma_q, tma_k, tma_v, tma_o, tma_sfq, tma_sfk, tma_sfvt, tma_ds, O_ptr,
-      softmax_lse_ptr,
-      fused_wht ? km_rot_f32.data_ptr<float>() : km_f32.data_ptr<float>(),
-      fused_wht ? qm_rot.data_ptr<float>() : qm.data_ptr<float>(),
-      fp4_smooth_v ? vm_v.data_ptr<float>() : nullptr, Nq, Nkv, Nq_pad, Nkv_pad,
-      Nh, Nh_kv, scale, Tc, causal, total_q_rows, Nb, q_start_row, nhd_out);
+  const auto launch_with = [&](auto bias_tag) {
+    constexpr int kBiasOn = decltype(bias_tag)::value;
+    auto kernel = ffpa_fp4::persist_d_ws_fwd_cute_fp4_sm120<
+        Traits, ElementO, decltype(tma_q), decltype(tma_k), decltype(tma_v),
+        decltype(tma_o), decltype(tma_sfq), decltype(tma_sfk),
+        decltype(tma_sfvt), decltype(tma_ds), kBiasOn>;
+    TORCH_CHECK(cudaFuncSetAttribute(
+                    kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                    kSmemBytes) == cudaSuccess,
+                "ffpa_attn: fp4 persist_d smem opt-in failed for D=", kHeadDim);
+    kernel<<<grid, block, kSmemBytes, stream>>>(
+        tma_q, tma_k, tma_v, tma_o, tma_sfq, tma_sfk, tma_sfvt, tma_ds, O_ptr,
+        softmax_lse_ptr,
+        fused_wht ? km_rot_f32.data_ptr<float>() : km_f32.data_ptr<float>(),
+        fused_wht ? qm_rot.data_ptr<float>() : qm.data_ptr<float>(),
+        fp4_smooth_v ? vm_v.data_ptr<float>() : nullptr, Nq, Nkv, Nq_pad,
+        Nkv_pad, Nh, Nh_kv, scale, Tc, causal, total_q_rows, Nb, q_start_row,
+        nhd_out, bias.ptr, bias.dtype, bias.stride_b, bias.stride_h,
+        bias.stride_m, bias.stride_n);
+  };
+  if (bias.ptr != nullptr)
+    launch_with(std::integral_constant<int, 1>{});
+  else
+    launch_with(std::integral_constant<int, 0>{});
 }
 
 template <typename kDataType, const int kHeadDim, const int kStage>
 void launch_cute_fwd_persist_d_fp4_sm120(
     torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O,
-    torch::Tensor softmax_lse, int causal, double softmax_scale,
-    int q_start_row = 0, bool fp4_hadamard = false, int fp4_pv_mm_type = 0,
-    bool fp4_smooth_v = false) {
+    torch::Tensor attn_bias, torch::Tensor softmax_lse, int causal,
+    double softmax_scale, int q_start_row = 0, bool fp4_hadamard = false,
+    int fp4_pv_mm_type = 0, bool fp4_smooth_v = false) {
   (void)kStage;  // kStages (3, or 2 at D=256) fixed by the fp4 traits
   auto prop = at::cuda::getCurrentDeviceProperties();
   TORCH_CHECK(prop->major == 12,
@@ -2465,12 +2570,12 @@ void launch_cute_fwd_persist_d_fp4_sm120(
       // already rejected the request, keep the variant uninstantiated.
       if constexpr (kHeadDim <= 192)
         launch_cute_fwd_persist_d_fp4_sm120_impl<kDataType, kHeadDim, true>(
-            Q, K, V, O, softmax_lse, causal, softmax_scale, q_start_row,
-            fp4_hadamard, fp4_smooth_v);
+            Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
+            q_start_row, fp4_hadamard, fp4_smooth_v);
     } else {
       launch_cute_fwd_persist_d_fp4_sm120_impl<kDataType, kHeadDim, false>(
-          Q, K, V, O, softmax_lse, causal, softmax_scale, q_start_row,
-          fp4_hadamard, fp4_smooth_v);
+          Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
+          q_start_row, fp4_hadamard, fp4_smooth_v);
     }
   } else {
     TORCH_CHECK(false,
@@ -2493,8 +2598,9 @@ void launch_cute_fwd_persist_d_fp4_sm120(
 template <typename kDataType, const int kHeadDim, bool kPvMxfp8 = false>
 void launch_cute_fwd_split_d_fp4_sm120_impl(
     torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O,
-    torch::Tensor softmax_lse, int causal, double softmax_scale,
-    int q_start_row = 0, bool fp4_hadamard = false, bool fp4_smooth_v = false) {
+    torch::Tensor attn_bias, torch::Tensor softmax_lse, int causal,
+    double softmax_scale, int q_start_row = 0, bool fp4_hadamard = false,
+    bool fp4_smooth_v = false) {
   using namespace cute;
   constexpr int kBr = 128;
   constexpr int kBc = 128;
@@ -2506,6 +2612,8 @@ void launch_cute_fwd_split_d_fp4_sm120_impl(
                                       cutlass::half_t, cutlass::bfloat16_t>;
   using Traits = ffpa_fp4::FFPAAttnCuTeSplitDFP4Traits<
       ElementO, kHeadDim, kBr, kBc, kQKDChunk, kVDChunk, 3, 3, kPvMxfp8>;
+  const FfpaBiasParams bias = ffpa_bias_params_of(attn_bias, Q, K);
+  const int bias_on = bias.ptr != nullptr ? 1 : 0;
   using Element = typename Traits::Element;
   using ElementSF = typename Traits::ElementSF;
   using ElementPV = typename Traits::ElementPV;
@@ -2739,29 +2847,38 @@ void launch_cute_fwd_split_d_fp4_sm120_impl(
   const int num_ctas =
       causal ? total_work : std::min(total_work, prop->multiProcessorCount);
   const dim3 grid(num_ctas, 1, 1);
-  auto kernel = ffpa_fp4::split_d_fwd_cute_fp4_sm120<
-      Traits, ElementO, decltype(tma_q), decltype(tma_k), decltype(tma_v),
-      decltype(tma_o), decltype(tma_sfq), decltype(tma_sfk), decltype(tma_sfvt),
-      decltype(tma_ds)>;
-  TORCH_CHECK(
-      cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                           kSmemBytes) == cudaSuccess,
-      "ffpa_attn: fp4 split_d smem opt-in failed for D=", kHeadDim);
-  kernel<<<grid, block, kSmemBytes, stream>>>(
-      tma_q, tma_k, tma_v, tma_o, tma_sfq, tma_sfk, tma_sfvt, tma_ds, O_ptr,
-      softmax_lse_ptr,
-      fused_wht ? km_rot_f32.data_ptr<float>() : km_f32.data_ptr<float>(),
-      fused_wht ? qm_rot.data_ptr<float>() : qm.data_ptr<float>(),
-      fp4_smooth_v ? vm_v.data_ptr<float>() : nullptr, Nq, Nkv, Nq_pad, Nkv_pad,
-      Nh, Nh_kv, scale, Tc, causal, total_q_rows, Nb, q_start_row, nhd_out);
+  const auto launch_with = [&](auto bias_tag) {
+    constexpr int kBiasOn = decltype(bias_tag)::value;
+    auto kernel = ffpa_fp4::split_d_fwd_cute_fp4_sm120<
+        Traits, ElementO, decltype(tma_q), decltype(tma_k), decltype(tma_v),
+        decltype(tma_o), decltype(tma_sfq), decltype(tma_sfk),
+        decltype(tma_sfvt), decltype(tma_ds), kBiasOn>;
+    TORCH_CHECK(cudaFuncSetAttribute(
+                    kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                    kSmemBytes) == cudaSuccess,
+                "ffpa_attn: fp4 split_d smem opt-in failed for D=", kHeadDim);
+    kernel<<<grid, block, kSmemBytes, stream>>>(
+        tma_q, tma_k, tma_v, tma_o, tma_sfq, tma_sfk, tma_sfvt, tma_ds, O_ptr,
+        softmax_lse_ptr,
+        fused_wht ? km_rot_f32.data_ptr<float>() : km_f32.data_ptr<float>(),
+        fused_wht ? qm_rot.data_ptr<float>() : qm.data_ptr<float>(),
+        fp4_smooth_v ? vm_v.data_ptr<float>() : nullptr, Nq, Nkv, Nq_pad,
+        Nkv_pad, Nh, Nh_kv, scale, Tc, causal, total_q_rows, Nb, q_start_row,
+        nhd_out, bias.ptr, bias.dtype, bias.stride_b, bias.stride_h,
+        bias.stride_m, bias.stride_n);
+  };
+  if (bias.ptr != nullptr)
+    launch_with(std::integral_constant<int, 1>{});
+  else
+    launch_with(std::integral_constant<int, 0>{});
 }
 
 template <typename kDataType, const int kHeadDim, const int kStage>
 void launch_cute_fwd_split_d_fp4_sm120(
     torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O,
-    torch::Tensor softmax_lse, int causal, double softmax_scale,
-    int q_start_row = 0, bool fp4_hadamard = false, int fp4_pv_mm_type = 0,
-    bool fp4_smooth_v = false) {
+    torch::Tensor attn_bias, torch::Tensor softmax_lse, int causal,
+    double softmax_scale, int q_start_row = 0, bool fp4_hadamard = false,
+    int fp4_pv_mm_type = 0, bool fp4_smooth_v = false) {
   (void)kStage;  // kStages (3/3) fixed by the fp4 split_d traits
   TORCH_CHECK(fp4_pv_mm_type == 0 || fp4_pv_mm_type == 1,
               "ffpa_attn: fp4_pv_mm_type must be 0 (fp4) or 1 (fp8)");
@@ -2772,12 +2889,12 @@ void launch_cute_fwd_split_d_fp4_sm120(
   if constexpr (kHeadDim % 64 == 0 && kHeadDim > 256 && kHeadDim < 768) {
     if (fp4_pv_mm_type == 1) {
       launch_cute_fwd_split_d_fp4_sm120_impl<kDataType, kHeadDim, true>(
-          Q, K, V, O, softmax_lse, causal, softmax_scale, q_start_row,
-          fp4_hadamard, fp4_smooth_v);
+          Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
+          q_start_row, fp4_hadamard, fp4_smooth_v);
     } else {
       launch_cute_fwd_split_d_fp4_sm120_impl<kDataType, kHeadDim, false>(
-          Q, K, V, O, softmax_lse, causal, softmax_scale, q_start_row,
-          fp4_hadamard, fp4_smooth_v);
+          Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
+          q_start_row, fp4_hadamard, fp4_smooth_v);
     }
   } else {
     TORCH_CHECK(false,
@@ -2797,8 +2914,9 @@ void launch_cute_fwd_split_d_fp4_sm120(
 template <typename kDataType, const int kHeadDim>
 void launch_cute_fwd_split_d_m4n2_fp4_sm120_impl(
     torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O,
-    torch::Tensor softmax_lse, int causal, double softmax_scale,
-    int q_start_row = 0, bool fp4_hadamard = false, bool fp4_smooth_v = false) {
+    torch::Tensor attn_bias, torch::Tensor softmax_lse, int causal,
+    double softmax_scale, int q_start_row = 0, bool fp4_hadamard = false,
+    bool fp4_smooth_v = false) {
   using namespace cute;
   constexpr int kBr = 64;
   constexpr int kBc = 64;
@@ -2809,6 +2927,8 @@ void launch_cute_fwd_split_d_m4n2_fp4_sm120_impl(
   using ElementO = std::conditional_t<std::is_same_v<kDataType, __half>,
                                       cutlass::half_t, cutlass::bfloat16_t>;
   using Traits = ffpa_fp4::FFPAAttnCuTeSplitDM4N2FP4Traits<ElementO, kHeadDim>;
+  const FfpaBiasParams bias = ffpa_bias_params_of(attn_bias, Q, K);
+  const int bias_on = bias.ptr != nullptr ? 1 : 0;
   using Element = typename Traits::Element;
   using ElementSF = typename Traits::ElementSF;
   auto prop = at::cuda::getCurrentDeviceProperties();
@@ -3011,27 +3131,37 @@ void launch_cute_fwd_split_d_m4n2_fp4_sm120_impl(
   const int num_ctas =
       causal ? total_work : std::min(total_work, prop->multiProcessorCount);
   const dim3 grid(num_ctas, 1, 1);
-  auto kernel = ffpa_fp4::split_d_m4n2_fwd_cute_fp4_sm120<
-      Traits, ElementO, decltype(tma_q), decltype(tma_k), decltype(tma_v),
-      decltype(tma_o), decltype(tma_sfq), decltype(tma_sfk), decltype(tma_sfvt),
-      decltype(tma_ds)>;
-  TORCH_CHECK(
-      cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                           kSmemBytes) == cudaSuccess,
-      "ffpa_attn: fp4 split_d m4n2 smem opt-in failed for D=", kHeadDim);
-  kernel<<<grid, block, kSmemBytes, stream>>>(
-      tma_q, tma_k, tma_v, tma_o, tma_sfq, tma_sfk, tma_sfvt, tma_ds, O_ptr,
-      softmax_lse_ptr, km_f32.data_ptr<float>(), qm.data_ptr<float>(),
-      fp4_smooth_v ? vm_v.data_ptr<float>() : nullptr, Nq, Nkv, Nq_pad, Nkv_pad,
-      Nh, Nh_kv, scale, Tc, causal, total_q_rows, Nb, q_start_row, nhd_out);
+  const auto launch_with = [&](auto bias_tag) {
+    constexpr int kBiasOn = decltype(bias_tag)::value;
+    auto kernel = ffpa_fp4::split_d_m4n2_fwd_cute_fp4_sm120<
+        Traits, ElementO, decltype(tma_q), decltype(tma_k), decltype(tma_v),
+        decltype(tma_o), decltype(tma_sfq), decltype(tma_sfk),
+        decltype(tma_sfvt), decltype(tma_ds), kBiasOn>;
+    TORCH_CHECK(
+        cudaFuncSetAttribute(kernel,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize,
+                             kSmemBytes) == cudaSuccess,
+        "ffpa_attn: fp4 split_d m4n2 smem opt-in failed for D=", kHeadDim);
+    kernel<<<grid, block, kSmemBytes, stream>>>(
+        tma_q, tma_k, tma_v, tma_o, tma_sfq, tma_sfk, tma_sfvt, tma_ds, O_ptr,
+        softmax_lse_ptr, km_f32.data_ptr<float>(), qm.data_ptr<float>(),
+        fp4_smooth_v ? vm_v.data_ptr<float>() : nullptr, Nq, Nkv, Nq_pad,
+        Nkv_pad, Nh, Nh_kv, scale, Tc, causal, total_q_rows, Nb, q_start_row,
+        nhd_out, bias.ptr, bias.dtype, bias.stride_b, bias.stride_h,
+        bias.stride_m, bias.stride_n);
+  };
+  if (bias.ptr != nullptr)
+    launch_with(std::integral_constant<int, 1>{});
+  else
+    launch_with(std::integral_constant<int, 0>{});
 }
 
 template <typename kDataType, const int kHeadDim, const int kStage>
 void launch_cute_fwd_split_d_m4n2_fp4_sm120(
     torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O,
-    torch::Tensor softmax_lse, int causal, double softmax_scale,
-    int q_start_row = 0, bool fp4_hadamard = false, int fp4_pv_mm_type = 0,
-    bool fp4_smooth_v = false) {
+    torch::Tensor attn_bias, torch::Tensor softmax_lse, int causal,
+    double softmax_scale, int q_start_row = 0, bool fp4_hadamard = false,
+    int fp4_pv_mm_type = 0, bool fp4_smooth_v = false) {
   (void)kStage;  // kStages (2/2) fixed by the fp4 m4n2 traits
   // NVFP4-only PV: the MXFP8 PV atom (SM120_16x8x128) consumes Tile-K=128
   // tokens per mma, but the m4n2 tiles are kBc=64 - the operand pair
@@ -3046,7 +3176,7 @@ void launch_cute_fwd_split_d_m4n2_fp4_sm120(
               prop->major, prop->minor);
   if constexpr (kHeadDim % 64 == 0 && kHeadDim >= 768 && kHeadDim <= 1024) {
     launch_cute_fwd_split_d_m4n2_fp4_sm120_impl<kDataType, kHeadDim>(
-        Q, K, V, O, softmax_lse, causal, softmax_scale, q_start_row,
+        Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale, q_start_row,
         fp4_hadamard, fp4_smooth_v);
   } else {
     TORCH_CHECK(false,

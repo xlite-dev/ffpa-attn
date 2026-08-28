@@ -11,6 +11,7 @@
 
 #include "../../gemm.cuh"
 #include "../attn_traits.cuh"
+#include "../../attn_bias.cuh"
 #include "../fp8_pscale.cuh"
 #include "../smooth_k.cuh"
 
@@ -39,7 +40,8 @@ using CtaBarrier = cutlass::arch::ClusterBarrier;
 //   smaller than the 128-row quant block; quant_offset handles the mapping.
 template <typename Traits, typename ElementO, typename TmaQ, typename TmaK,
           typename TmaV, typename TmaO, bool kPVAccF16 = false,
-          bool kVPerChannel = false, bool kQKPerThread = false>
+          bool kVPerChannel = false, bool kQKPerThread = false,
+          int kHasAttnBias = 0>
 __global__ void __launch_bounds__(Traits::kNumThreads, 1)
     split_d_m4n2_fwd_cute_fp8_sm120(
         CUTLASS_GRID_CONSTANT TmaQ const tma_q,
@@ -51,7 +53,10 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
         int Nq, int Nkv, int Nh, int Nh_kv, float scale, int Tc, int causal,
         int total_q_rows, int total_kv_rows, int n_rb_q, int n_rb_kv,
         int q_start_row = 0, const float* __restrict__ km = nullptr,
-        const float* __restrict__ vm = nullptr, bool nhd_out = false) {
+        const float* __restrict__ vm = nullptr, bool nhd_out = false,
+        const void* __restrict__ attn_bias = nullptr, int attn_bias_dtype = 0,
+        long long attn_bias_stride_b = 0, long long attn_bias_stride_h = 0,
+        long long attn_bias_stride_m = 0, long long attn_bias_stride_n = 0) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
   using namespace cute;
   using cute::tma_store_arrive;
@@ -407,6 +412,23 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
     // Phase 2: fixed-P-scale softmax with cross-N-warp reduction.
     auto scores = make_tensor(
         tCrSf.data(), ffpa_cute::convert_layout_acc_rowcol(tCrS.layout()));
+    // Additive attn bias in the RAW score domain (before any dequant-scale
+    // path): every path below scales raw scores by qs_arr[row]*ks*scale, so
+    // bias/(qs_arr[row]*ks*scale_orig) lands as +bias in softmax-input
+    // units on masked and unmasked tiles alike; the -INFINITY assignments
+    // in the masking block below simply override it.
+    if constexpr (kHasAttnBias) {
+      float bias_inv[kSRows];
+#pragma unroll
+      for (int row = 0; row < kSRows; ++row)
+        bias_inv[row] = 1.0f / (qs_arr[row] * ks * scale_orig);
+      ffpa_cute::apply_attn_bias_quant_rowcol<
+          decltype(scores), decltype(tScS_rc), kSRows, kSCols>(
+          scores, tScS_rc, attn_bias, attn_bias_dtype, attn_bias_stride_b,
+          attn_bias_stride_h, attn_bias_stride_m, attn_bias_stride_n, Nb_id,
+          Nh_id, q_start_row + Br_base, kv_tile, kBc, bias_inv);
+    }
+
     const int kv_valid = Nkv - kv_tile * kBc;
     const bool tile_needs_mask =
         (kv_valid < kBc) || (kv_tile >= mask_start_tile);

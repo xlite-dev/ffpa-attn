@@ -68,7 +68,7 @@ using CtaBarrier = cutlass::arch::ClusterBarrier;
 
 template <typename Traits, typename ElementO, typename TmaQ, typename TmaK,
           typename TmaV, typename TmaO, typename TmaSFQ, typename TmaSFK,
-          typename TmaSFVt, typename TmaDS>
+          typename TmaSFVt, typename TmaDS, int kHasAttnBias = 0>
 __global__ void __launch_bounds__(Traits::kNumThreads, 1)
     split_d_fwd_cute_fp4_sm120(
         CUTLASS_GRID_CONSTANT TmaQ const tma_q,
@@ -83,7 +83,10 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
         const float* __restrict__ qm, const float* __restrict__ vm, int Nq,
         int Nkv, int Nq_pad, int Nkv_pad, int Nh, int Nh_kv, float scale,
         int Tc, int causal, int total_q_rows, int Nb, int q_start_row = 0,
-        bool nhd_out = false) {
+        bool nhd_out = false, const void* __restrict__ attn_bias = nullptr,
+        int attn_bias_dtype = 0, long long attn_bias_stride_b = 0,
+        long long attn_bias_stride_h = 0, long long attn_bias_stride_m = 0,
+        long long attn_bias_stride_n = 0) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
   using namespace cute;
   using cute::tma_store_arrive;
@@ -584,6 +587,17 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
       {
         auto scores = make_tensor(tSrS.data(),
                                   convert_to_reduction_layout(tSrS.layout()));
+        // Additive attn bias in the dequantized score domain; the fused
+        // softmax below applies softmax_scale_log2, so bias/scale_orig
+        // lands as +bias in softmax-input units. The -INFINITY assignments
+        // in the masking below simply override it.
+        if constexpr (kHasAttnBias) {
+          ffpa_fp4::apply_attn_bias_fp4_rowcol<
+              decltype(scores), decltype(tScS_rc), kSRows, kSCols>(
+              scores, tScS_rc, attn_bias, attn_bias_dtype, attn_bias_stride_b,
+              attn_bias_stride_h, attn_bias_stride_m, attn_bias_stride_n, Nb_id,
+              Nh_id, q_start_row + Br_base, kv_tile, kBc, 1.0f / scale_orig);
+        }
         const int kv_valid = Nkv - kv_tile * kBc;
         const bool tail_tile = kv_valid < kBc;
         const bool causal_tile = kv_tile >= mask_start_tile;
