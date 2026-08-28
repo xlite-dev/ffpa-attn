@@ -188,18 +188,17 @@ void launch_ffpa_attn_fwd_template(
 #endif
 #endif
 
-  // NHD (BNHD) O is stored natively only by the persist-D sm120 kernels.
+  // NHD (BNHD) O is stored natively by the sm120 CUTE_TMA kernels
+  // (persist-D and split-D/M4N2, each with a runtime nhd_out branch).
   // The fp8/fp4 families guard their own dispatch branches below; this
   // check covers the fp16/bf16 family, where every other path (TMA/NATIVE/
-  // CUTE hints, split-D, M4N2, sm80/sm90) stores through a BHND-packed
-  // descriptor and would silently corrupt an NHD-packed O.
+  // CUTE hints, sm80/sm90) stores through a BHND-packed descriptor and
+  // would silently corrupt an NHD-packed O.
   if (ffpa_is_nhd_view(O) && !force_fp8 && !force_fp4) {
     auto prop_o = at::cuda::getCurrentDeviceProperties();
-    TORCH_CHECK(
-        prop_o->major >= 12 && force_cute_tma && kHeadDim <= 128 &&
-            kHeadDim % 32 == 0,
-        "ffpa_attn: NHD (BNHD) output requires the fp16 persist-D sm120 "
-        "CUTE_TMA path (head_dim <= 128, %32 == 0)");
+    TORCH_CHECK(prop_o->major >= 12 && force_cute_tma && kHeadDim % 32 == 0,
+                "ffpa_attn: NHD (BNHD) output requires the fp16 sm120 CUTE_TMA "
+                "path (%32 == 0)");
   }
 
   // fp16/bf16 head_dim pad: non-32-multiple D_og (e.g. 120) zero-pads Q/K/V

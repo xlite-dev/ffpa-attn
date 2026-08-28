@@ -614,11 +614,10 @@ class CUDABackend(Backend):
 
     NHD requires the CUTE_TMA path (native / TMA / CUTE keep a static
     BHND gO); fp8/fp4 always dispatch there, so only the fp16 family
-    checks the impl flags. fp8 and fp4 cover the full headdim range:
-    persist-D for the small-D segment and split-D/M4N2 for the rest,
-    each with a runtime ``nhd_out`` O-store branch (fp4 keeps the
-    persist-D cap for non-%64 multiples, which pad inside the
-    launcher). fp16 keeps the persist-D cap (D <= 128). Hybrid and
+    checks the impl flags. All three families cover the full headdim
+    range: persist-D for the small-D segment and split-D/M4N2 for the
+    rest, each with a runtime ``nhd_out`` O-store branch (non-multiple
+    headdims pad inside the launcher and stay on persist-D). Hybrid and
     hadamard are both fine: the hybrid stage-1 writeback is a
     stride-generic ``O.slice(...).copy_`` and stage-2 kernels offset
     NHD rows by ``q_start_row``; the hadamard WHT materializes BHND
@@ -641,9 +640,11 @@ class CUDABackend(Backend):
       if headdim % 32 == 0:
         return headdim <= 224 or headdim % 64 == 0
       return headdim <= 224
-    # NHD output packing only exists in the CUTE_TMA persist-D kernel; the
-    # native / TMA / CUTE paths keep a static BHND gO (fp8/fp4 always
-    # dispatch to CUTE_TMA, so only the fp16 family needs the check).
+    # fp16: %32 multiples hit the CUTE_TMA kernels across the whole
+    # range (persist-D <=128, split-D/M4N2 beyond); smaller non-multiples
+    # pad to the nearest %32 and stay on persist-D.
+    if headdim % 32 == 0:
+      return self.enable_tma and self.enable_cute
     return headdim <= 128 and self.enable_tma and self.enable_cute
 
 

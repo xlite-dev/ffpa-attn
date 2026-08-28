@@ -226,13 +226,22 @@ void launch_cute_fwd_split_d_sm120(torch::Tensor Q, torch::Tensor K,
                 "ffpa_attn: V must be BHND-contiguous or an NHD (BNHD) view");
   }
 
-  // O output TMA store descriptor: full O tensor [total_q_rows,kHeadDim],
-  // same shape/stride as the BHND Q; per-head origin injected via
-  // domain_offset in kernel. Direction = SM90_TMA_STORE (first arg);
-  // swizzle auto-inferred from SmemLayoutO.
-  auto gO = make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(O.data_ptr())),
-                        make_shape(total_q_rows, Int<kHeadDim>{}),
-                        make_stride(Int<kHeadDim>{}, _1{}));
+  // O output TMA store descriptor: BHND flat [total_q_rows,kHeadDim] or
+  // NHD (diffusers BNHD packed) [Nb*Nq, Nh*kHeadDim] with the head
+  // selecting the column-tile group (kernel folds Nh_id*kDChunksV into
+  // the v_chunk walk). Both branches use dynamic int64 extents/strides so
+  // TmaO has a single type and the kernel takes a runtime nhd_out branch.
+  // Per-head origin injected via domain_offset in kernel; direction =
+  // SM90_TMA_STORE (first arg); swizzle auto-inferred from SmemLayoutO.
+  const bool nhd_out = ffpa_is_nhd_view(O);
+  auto gO =
+      nhd_out
+          ? make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(O.data_ptr())),
+                        make_shape((int64_t)Nb * Nq, (int64_t)Nh * kHeadDim),
+                        make_stride((int64_t)Nh * kHeadDim, _1{}))
+          : make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(O.data_ptr())),
+                        make_shape((int64_t)total_q_rows, (int64_t)kHeadDim),
+                        make_stride((int64_t)kHeadDim, _1{}));
   auto tma_o = make_tma_copy(SM90_TMA_STORE{}, gO, SmemLayoutO{},
                              Shape<Int<kBr>, Int<kVDChunk>>{}, _1{});
 
@@ -311,7 +320,7 @@ void launch_cute_fwd_split_d_sm120(torch::Tensor Q, torch::Tensor K,
           Nh_kv, scale, Tc, causal, total_q_rows, total_kv_rows, attn_bias_ptr,
           attn_bias_dtype, attn_bias_stride_b, attn_bias_stride_h,
           attn_bias_stride_m, attn_bias_stride_n, dropout_p_f, philox_seed_u,
-          philox_offset_u);
+          philox_offset_u, nhd_out);
     };
 
     using TmaQ = decltype(tma_q);
@@ -477,9 +486,20 @@ void launch_cute_fwd_split_d_m4n2_sm120(torch::Tensor Q, torch::Tensor K,
                 "ffpa_attn: V must be BHND-contiguous or an NHD (BNHD) view");
   }
 
-  auto gO = make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(O.data_ptr())),
-                        make_shape(total_q_rows, Int<kHeadDim>{}),
-                        make_stride(Int<kHeadDim>{}, _1{}));
+  // O output TMA store descriptor: BHND flat [total_q_rows,kHeadDim] or
+  // NHD (diffusers BNHD packed) [Nb*Nq, Nh*kHeadDim] with the head
+  // selecting the column-tile group (kernel folds Nh_id*kDChunksV into
+  // the v_chunk walk). Both branches use dynamic int64 extents/strides so
+  // TmaO has a single type and the kernel takes a runtime nhd_out branch.
+  const bool nhd_out = ffpa_is_nhd_view(O);
+  auto gO =
+      nhd_out
+          ? make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(O.data_ptr())),
+                        make_shape((int64_t)Nb * Nq, (int64_t)Nh * kHeadDim),
+                        make_stride((int64_t)Nh * kHeadDim, _1{}))
+          : make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(O.data_ptr())),
+                        make_shape((int64_t)total_q_rows, (int64_t)kHeadDim),
+                        make_stride((int64_t)kHeadDim, _1{}));
   auto tma_o = make_tma_copy(SM90_TMA_STORE{}, gO, SmemLayoutO{},
                              Shape<Int<kBr>, Int<kVDChunk>>{}, _1{});
 
@@ -554,7 +574,7 @@ void launch_cute_fwd_split_d_m4n2_sm120(torch::Tensor Q, torch::Tensor K,
           Nh_kv, scale, Tc, causal, total_q_rows, total_kv_rows, attn_bias_ptr,
           attn_bias_dtype, attn_bias_stride_b, attn_bias_stride_h,
           attn_bias_stride_m, attn_bias_stride_n, dropout_p_f, philox_seed_u,
-          philox_offset_u);
+          philox_offset_u, nhd_out);
     };
 
     using TmaQ = decltype(tma_q);

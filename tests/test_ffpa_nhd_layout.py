@@ -162,12 +162,16 @@ def test_nhd_layout_rejections(monkeypatch):
   torch.manual_seed(0)
   B, H, N = 1, 24, 4096
 
-  # fp16 D=256: outside the persist-D D<=128 range -> declined by the
-  # python gate (CUDABackend.is_nhd_supported), which raises TypeError
-  # (NHD has no path outside the fast path).
+  # fp16: %32 multiples stay on the CUTE_TMA fast path across the range
+  # (persist-D <=128, split-D (32,64) %64 / (32,32) %32, M4N2 %64>=768);
+  # 288 hits the (32,32) variant. Non-multiples beyond the persist-D pad
+  # range (e.g. 280) have no kernel: the gate declines with TypeError.
+  assert _backend().is_nhd_supported(256)
+  assert _backend().is_nhd_supported(288)
+  assert not _backend().is_nhd_supported(280)
   with pytest.raises(TypeError, match="NHD"):
     with torch.no_grad():
-      q, k, v = _mk(B, H, H, N, 256)
+      q, k, v = _mk(B, H, H, N, 280)
       ffpa_attn_func(
         _nhd(q),
         _nhd(k),
@@ -186,8 +190,8 @@ def test_nhd_layout_rejections(monkeypatch):
   assert _backend(enable_fp4=True, fp4_hybrid=True).is_nhd_supported(128)
   assert _backend(enable_fp8=True, fp8_hadamard=True).is_nhd_supported(128)
   assert _backend(enable_fp4=True, fp4_hadamard=True).is_nhd_supported(128)
-  # fp16 with the CUTE_TMA path opted out (enable_cute=False): NHD output
-  # packing only exists in the CUTE_TMA persist-D kernel.
+  # fp16 with the CUTE_TMA path opted out (enable_cute=False): every
+  # remaining fp16 path stores through a static BHND descriptor.
   with pytest.raises(TypeError, match="NHD"):
     with torch.no_grad():
       q, k, v = _mk(B, H, H, N, 128)
@@ -199,6 +203,23 @@ def test_nhd_layout_rejections(monkeypatch):
           backward=False,
           enable_tma=True,
           enable_cute=False,
+          tensor_layout="NHD",
+        ),
+      )
+  # force_cute (enable_tma=False + enable_cute=True): the python gate
+  # declines NHD (needs CUTE_TMA); the C++ backstop keeps rejecting it
+  # too, so the sm80 cp.async path never silently writes a packed O.
+  with pytest.raises(TypeError, match="NHD"):
+    with torch.no_grad():
+      q, k, v = _mk(B, H, H, N, 320)
+      ffpa_attn_func(
+        _nhd(q),
+        _nhd(k),
+        _nhd(v),
+        forward_backend=CUDABackend(
+          backward=False,
+          enable_tma=False,
+          enable_cute=True,
           tensor_layout="NHD",
         ),
       )
@@ -833,6 +854,30 @@ def test_fp4_nhd_out_m4n2_bit_exact(B, H, Hkv, N, causal):
   q, k, v = _mk(B, H, Hkv, N, D)
   backend = _backend(enable_fp4=True, fp4_hybrid=False)
   backend_nhd = _backend(enable_fp4=True, fp4_hybrid=False, tensor_layout="NHD")
+  with torch.no_grad():
+    out_b = ffpa_attn_func(q, k, v, is_causal=causal, forward_backend=backend)
+    out_n = ffpa_attn_func(
+      _nhd(q), _nhd(k), _nhd(v), is_causal=causal, forward_backend=backend_nhd
+    )
+  assert out_n.shape == (B, N, H, D) and out_n.is_contiguous()
+  assert torch.equal(out_n, out_b.permute(0, 2, 1, 3))
+
+
+@pytest.mark.parametrize("causal", [False, True], ids=["dense", "causal"])
+@pytest.mark.parametrize(
+  "B,H,Hkv,N",
+  [(2, 8, 8, 2048), (2, 8, 8, 3000), (2, 24, 6, 4096)],
+  ids=["batch", "tail", "gqa"],
+)
+@pytest.mark.parametrize("D", [320, 768], ids=["d320", "d768"])
+def test_fp16_nhd_out_bit_exact(B, H, Hkv, N, D, causal):
+  """fp16 split-D (D=320; the epilogue is shared across the 4x4 template
+  grid) and M4N2 (D=768): the runtime nhd_out branch covers every
+  variant."""
+  torch.manual_seed(0)
+  q, k, v = _mk(B, H, Hkv, N, D)
+  backend = _backend()
+  backend_nhd = _backend(tensor_layout="NHD")
   with torch.no_grad():
     out_b = ffpa_attn_func(q, k, v, is_causal=causal, forward_backend=backend)
     out_n = ffpa_attn_func(
