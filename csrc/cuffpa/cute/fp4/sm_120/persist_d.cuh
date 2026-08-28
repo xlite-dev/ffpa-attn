@@ -898,12 +898,18 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp4_sm120(
         const int lse_base = Nb_id * Nh * Nq + Nh_id * Nq;
         CUTLASS_PRAGMA_UNROLL
         for (int row = 0; row < kSRows; ++row) {
-          // row_sum lives in the P2 = P*2688 domain: lse = scale*m +
-          // ln(row_sum / 2688); fp8_scalexfp4_scale_log2 is log2(1/2688) < 0.
-          float lse = (softmax_fused.row_max[row] * softmax_scale_log2 +
-                       log2f(softmax_fused.row_sum[row]) +
-                       SoftmaxFused<kSoftmaxRows>::fp8_scalexfp4_scale_log2) *
-                      FFPA_M_LN2;
+          // row_sum lives in a scaled P domain: lse = scale*m +
+          // ln(row_sum / domain_scale). NVFP4: P*2688 (fp8_scalexfp4_
+          // scale_log2 = log2(1/2688)); MXFP8: P*448 (row_sum = sum of
+          // q*SF with q in the e4m3 domain, see SoftmaxFusedMxfp8), so
+          // the correction is log2(1/448) = -e4m3_full_log2.
+          float lse =
+              (softmax_fused.row_max[row] * softmax_scale_log2 +
+               log2f(softmax_fused.row_sum[row]) +
+               (kPvMxfp8
+                    ? -SoftmaxFusedMxfp8<kSoftmaxRows>::e4m3_full_log2
+                    : SoftmaxFused<kSoftmaxRows>::fp8_scalexfp4_scale_log2)) *
+              FFPA_M_LN2;
           if (smooth_lse)
             lse += scale_orig * qkm[row];
           const int global_row =

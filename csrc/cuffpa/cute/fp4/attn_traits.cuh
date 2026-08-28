@@ -260,7 +260,7 @@ struct FFPAAttnCuTePersistDFP4Traits {
 // O epilogue stages over the whole freed smem in kVChunksPerBatch batches.
 template <typename ElementO_, int kHeadDim_, int kBr_ = 128, int kBc_ = 128,
           int kQKDChunk_ = 64, int kVDChunk_ = 64, int kStagesQK_ = 3,
-          int kStagesPV_ = 3>
+          int kStagesPV_ = 3, bool kPvMxfp8_ = false>
 struct FFPAAttnCuTeSplitDFP4Traits {
   static_assert(kHeadDim_ % 64 == 0 && kHeadDim_ > 256 && kHeadDim_ < 768,
                 "fp4 split_d supports 64-multiple D in (256,768)");
@@ -278,9 +278,18 @@ struct FFPAAttnCuTeSplitDFP4Traits {
   static constexpr int kStagesPV = kStagesPV_;
   static constexpr int kNumWarps = kBr / 16;
   static constexpr int kNumThreads = kNumWarps * 32;
+  // PV-side operand family: NVFP4 (e2m1 + ue4m3/16) or MXFP8 (e4m3 +
+  // ue8m0/32), same switch as the persist-D traits. MXFP8 works here
+  // because the split-D PV Tile-K is the full kBc=128 = the MXFP8 atom's
+  // K extent (the m4n2 traits cannot take it: their kBc=64 < 128).
+  static constexpr bool kPvMxfp8 = kPvMxfp8_;
 
   using Element = cutlass::float_e2m1_t;
   using ElementSF = cutlass::float_ue4m3_t;
+  using ElementPV = std::conditional_t<kPvMxfp8, cutlass::float_e4m3_t,
+                                       cutlass::float_e2m1_t>;
+  using ElementSFV = std::conditional_t<kPvMxfp8, cutlass::float_ue8m0_t,
+                                        cutlass::float_ue4m3_t>;
   using ElementO = ElementO_;
 
   // Tile-K per gemm call: 64 (one QK d_chunk) for QK, kBc (token extent,
@@ -290,18 +299,22 @@ struct FFPAAttnCuTeSplitDFP4Traits {
   using AtomLayoutMNK = Layout<Shape<_8, _1, _1>>;
   using TiledMmaQK = decltype(make_tiled_mma(
       MMAAtom{}, AtomLayoutMNK{}, Tile<_128, _32, Int<kQKDChunk>>{}));
-  using TiledMmaPV = decltype(make_tiled_mma(MMAAtom{}, AtomLayoutMNK{},
+  using MMAAtomPV = std::conditional_t<
+      kPvMxfp8, MMA_Atom<cute::SM120::BLOCKSCALED::SM120_16x8x128_TN_VS_MXFP8>,
+      MMAAtom>;
+  using TiledMmaPV = decltype(make_tiled_mma(MMAAtomPV{}, AtomLayoutMNK{},
                                              Tile<_128, _32, Int<kBc>>{}));
 
   // Q/K chunk rows are 64 e2m1 elements (32B) -> SW32; V^T rows are kBc=128
-  // elements (64B) -> SW64 (persist_d picks the same V^T atom). The 64-elem
-  // Q atom keeps every d_chunk a self-contained swizzle span.
+  // elements (64B at 4-bit, 128B at 8-bit) -> SW64 (persist_d picks the same
+  // V^T atom). The 64-elem Q atom keeps every d_chunk a self-contained
+  // swizzle span.
   using SmemLayoutAtomQK =
       decltype(cutlass::gemm::collective::detail::sm120_rr_smem_selector<
                Element, Int<kQKDChunk>>());
   using SmemLayoutAtomVt =
       decltype(cutlass::gemm::collective::detail::sm120_rr_smem_selector<
-               Element, Int<kBc>>());
+               ElementPV, Int<kBc>>());
   using SmemLayoutQ = decltype(tile_to_shape(SmemLayoutAtomQK{},
                                              Shape<Int<kBr>, Int<kHeadDim>>{}));
   using SmemLayoutK = decltype(tile_to_shape(
@@ -318,13 +331,15 @@ struct FFPAAttnCuTeSplitDFP4Traits {
       SmemLayoutAtomVt{}, Shape<Int<kVDChunk>, Int<kBc>>{}));
 
   using BlkScaledConfig = BlockScaledConfig<16>;
+  using BlkScaledConfigV = std::conditional_t<kPvMxfp8, BlockScaledConfig<32>,
+                                              BlockScaledConfig<16>>;
   // SFQ covers the full-D resident tile (deduce reads M and K modes);
   // SFK/SFVt are per-chunk stage atoms.
   using SmemLayoutAtomSFQ = decltype(BlkScaledConfig::deduce_smem_layoutSFQ(
       TiledMmaQK{}, Shape<_128, _32, Int<kHeadDim>>{}));
   using SmemLayoutAtomSFK = decltype(BlkScaledConfig::deduce_smem_layoutSFKV(
       TiledMmaQK{}, Shape<_128, _128, Int<kQKDChunk>>{}));
-  using SmemLayoutAtomSFVt = decltype(BlkScaledConfig::deduce_smem_layoutSFVt(
+  using SmemLayoutAtomSFVt = decltype(BlkScaledConfigV::deduce_smem_layoutSFVt(
       TiledMmaPV{}, Shape<_128, Int<kVDChunk>, Int<kBc>>{}));
   using SmemLayoutSFQ = decltype(make_layout(shape(SmemLayoutAtomSFQ{}),
                                              stride(SmemLayoutAtomSFQ{})));
@@ -348,13 +363,27 @@ struct FFPAAttnCuTeSplitDFP4Traits {
   using SmemLayoutDSStage =
       decltype(tile_to_shape(SmemLayoutAtomDS{}, Shape<Int<kBr>, Int<kBc>>{}));
 
-  // P / SFP register adapters: identical to persist-D (kBc unchanged).
-  using LayoutP = decltype(make_layout(
-      make_shape(make_shape(_8{}, _2{}, _2{}), _1{}, Int<kBc / 64>{}),
-      make_stride(make_stride(_1{}, _8{}, _16{}), _0{}, _32{})));
-  using LayoutSFP = decltype(make_layout(
-      make_shape(make_shape(_16{}, _4{}), _1{}, Int<kBc / 64>{}),
-      make_stride(make_stride(_0{}, _1{}), _0{}, _4{})));
+  // P / SFP register adapters: NVFP4 identical to persist-D (kBc
+  // unchanged); MXFP8 mirrors the persist-D mxfp8 adapters (kBc=128 ->
+  // single k-iter of the K-fused atom).
+  using LayoutP = std::conditional_t<
+      kPvMxfp8,
+      decltype(make_layout(
+          make_shape(make_shape(make_shape(_4{}, _2{}, _2{}), _4{}), _1{},
+                     Int<kBc / 128>{}),
+          make_stride(make_stride(make_stride(_1{}, _4{}, _8{}), _16{}), _0{},
+                      _64{}))),
+      decltype(make_layout(
+          make_shape(make_shape(_8{}, _2{}, _2{}), _1{}, Int<kBc / 64>{}),
+          make_stride(make_stride(_1{}, _8{}, _16{}), _0{}, _32{})))>;
+  using LayoutSFP = std::conditional_t<
+      kPvMxfp8,
+      decltype(make_layout(
+          make_shape(make_shape(_32{}, _4{}), _1{}, Int<kBc / 128>{}),
+          make_stride(make_stride(_0{}, _1{}), _0{}, _4{}))),
+      decltype(make_layout(
+          make_shape(make_shape(_16{}, _4{}), _1{}, Int<kBc / 64>{}),
+          make_stride(make_stride(_0{}, _1{}), _0{}, _4{})))>;
 
   // O staging per v_chunk: [kBr, kVDChunk] ElementO, 128B rows -> SW128.
   using SmemLayoutO = decltype(tile_to_shape(
@@ -362,7 +391,13 @@ struct FFPAAttnCuTeSplitDFP4Traits {
 
   using SmemCopyAtomQ = Copy_Atom<SM75_U32x4_LDSM_N, Element>;
   using SmemCopyAtomKV = Copy_Atom<SM75_U32x4_LDSM_N, Element>;
+  // V streams e4m3 under MXFP8 (K stays e2m1): the LDSM atom is dtype-
+  // agnostic (4x32-bit per thread), only the copy's ValType changes.
+  using SmemCopyAtomV =
+      std::conditional_t<kPvMxfp8, Copy_Atom<SM75_U32x4_LDSM_N, ElementPV>,
+                         SmemCopyAtomKV>;
   using SmemCopyAtomSF = Copy_Atom<UniversalCopy<ElementSF>, ElementSF>;
+  using SmemCopyAtomSFV = Copy_Atom<UniversalCopy<ElementSFV>, ElementSFV>;
 
   // TMA tx bytes: Q/SFQ once per work (resident); K/SFK/DS and V/SFVt per
   // chunk stage. DS rides with the kv_tile's first chunk's barrier.
@@ -379,8 +414,8 @@ struct FFPAAttnCuTeSplitDFP4Traits {
   static constexpr uint32_t kTxBytesV =
       static_cast<uint32_t>(
           cute::bits_to_bytes(cosize(take<0, 2>(SmemLayoutSFVt{})) * 8)) +
-      static_cast<uint32_t>(
-          cute::bits_to_bytes(size(take<0, 2>(SmemLayoutVt{})) * 4));
+      static_cast<uint32_t>(cute::bits_to_bytes(
+          size(take<0, 2>(SmemLayoutVt{})) * (kPvMxfp8 ? 8 : 4)));
 
   // SMEM plan: [Q | SFQ | K*s | SFK*s | DS*s | V^T*s | SFVt*s] - persist_d's
   // ordering with Q/SFQ resident (no stage dim) and the rest chunk-staged;
@@ -395,8 +430,8 @@ struct FFPAAttnCuTeSplitDFP4Traits {
       int(cute::bits_to_bytes(cosize(take<0, 2>(SmemLayoutSFK{})) * 8));
   static constexpr int kDSBytesStage =
       int(cute::bits_to_bytes(cosize(take<0, 2>(SmemLayoutDS{})) * 32));
-  static constexpr int kVBytesStage =
-      int(cute::bits_to_bytes(size(take<0, 2>(SmemLayoutVt{})) * 4));
+  static constexpr int kVBytesStage = int(cute::bits_to_bytes(
+      size(take<0, 2>(SmemLayoutVt{})) * (kPvMxfp8 ? 8 : 4)));
   static constexpr int kSFVtBytesStage =
       int(cute::bits_to_bytes(cosize(take<0, 2>(SmemLayoutSFVt{})) * 8));
   static constexpr int kOffQ = 0;

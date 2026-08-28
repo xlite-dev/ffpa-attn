@@ -67,9 +67,10 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
         CUTLASS_GRID_CONSTANT TmaSFVt const tma_sfvt,
         CUTLASS_GRID_CONSTANT TmaDS const tma_ds, ElementO* __restrict__ O,
         float* __restrict__ softmax_lse, const float* __restrict__ km,
-        const float* __restrict__ qm, int Nq, int Nkv, int Nq_pad, int Nkv_pad,
-        int Nh, int Nh_kv, float scale, int Tc, int causal, int total_q_rows,
-        int Nb, int q_start_row = 0, bool nhd_out = false) {
+        const float* __restrict__ qm, const float* __restrict__ vm, int Nq,
+        int Nkv, int Nq_pad, int Nkv_pad, int Nh, int Nh_kv, float scale,
+        int Tc, int causal, int total_q_rows, int Nb, int q_start_row = 0,
+        bool nhd_out = false) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
   using namespace cute;
   using cute::tma_store_arrive;
@@ -701,6 +702,27 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
           for (int col = 0; col < decltype(size<1>(tCrO_rc))::value; ++col)
             tCrO_rc(row, col) *= inv_sum;
         }
+      }
+    }
+
+    // smooth_v epilogue: add the per-(b, hkv) V column mean back (the
+    // persist_d derivation; vm factors out of the column sum and cancels
+    // against the row normalization above). Per v_chunk the [kBr,
+    // kVDChunk] identity partition maps each C-fragment slot onto its d
+    // column within the chunk; the m4n2 N-warp split is handled by the
+    // partition itself (each N-warp holds its own d half).
+    if (vm != nullptr) {
+      const float* vm_bh = vm + static_cast<long>(kv_bh) * kHeadDim;
+      auto cO_vm = make_identity_tensor(Shape<Int<kBr>, Int<kVDChunk>>{});
+      auto tOcO_vm = thread_mma_pv.partition_C(cO_vm);
+#pragma unroll
+      for (int v_chunk = 0; v_chunk < kDChunksV; ++v_chunk) {
+        auto tCrO = make_tensor(make_rmem_ptr(&o_acc_storage[v_chunk][0]),
+                                OFragLayout{});
+        const float* vm_c = vm_bh + v_chunk * kVDChunk;
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < size(tCrO); ++i)
+          tCrO(i) += vm_c[cute::get<1>(tOcO_vm(i))];
       }
     }
 
