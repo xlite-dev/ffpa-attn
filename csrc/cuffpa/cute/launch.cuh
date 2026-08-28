@@ -2468,17 +2468,21 @@ void launch_cute_fwd_split_d_fp4_sm120_impl(torch::Tensor Q, torch::Tensor K,
   const bool fused_wht = fp4_hadamard && kFuseWht;
   torch::Tensor km_rot_f32, qm_rot;
   if (fp4_hadamard && !fused_wht) {
-    // WHT pre-rotation needs BHND-packed rows; materialize NHD views.
-    if (ffpa_is_nhd_view(Q))
+    // WHT pre-rotation needs BHND-packed rows; materialize non-packed.
+    if (!Q.is_contiguous())
       Q = Q.contiguous();
-    if (ffpa_is_nhd_view(K))
+    if (!K.is_contiguous())
       K = K.contiguous();
     Q = ffpa::apply_wht_qk_sm120<kDataType, kHeadDim>(Q);
     K = ffpa::apply_wht_qk_sm120<kDataType, kHeadDim>(K);
   }
   const kDataType* k_ptr = reinterpret_cast<const kDataType*>(K.data_ptr());
-  // NHD (BNHD) permute views are consumed natively by the pre-kernels.
-  const ffpa_fp8::Fp8InputLayout Lkv = ffpa_layout_of(K, Nkv, K.size(3));
+  // NHD (BNHD) permute views — including strided fused-QKV chunk rows —
+  // are consumed natively by the pre-kernels: kv-mean/delta_s address rows
+  // through the relaxed Lkv, the tensor-based quantize kernels take the
+  // tensors' native strides.
+  const ffpa_fp8::Fp8InputLayout Lkv =
+      ffpa_layout_of(K, Nkv, K.size(3), /*allow_strided_rows=*/true);
 
   torch::Tensor km_h = torch::empty({Nb * Nh_kv, kHeadDim}, K.options());
   torch::Tensor km_f32 = torch::empty({Nb * Nh_kv, kHeadDim}, opts_f32);
@@ -2716,17 +2720,21 @@ void launch_cute_fwd_split_d_m4n2_fp4_sm120_impl(
   const c10::cuda::OptionalCUDAGuard device_guard(Q.device());
   auto stream = at::cuda::getCurrentCUDAStream();
   if (fp4_hadamard) {
-    // WHT pre-rotation needs BHND-packed rows; materialize NHD views.
-    if (ffpa_is_nhd_view(Q))
+    // WHT pre-rotation needs BHND-packed rows; materialize non-packed.
+    if (!Q.is_contiguous())
       Q = Q.contiguous();
-    if (ffpa_is_nhd_view(K))
+    if (!K.is_contiguous())
       K = K.contiguous();
     Q = ffpa::apply_wht_qk_sm120<kDataType, kHeadDim>(Q);
     K = ffpa::apply_wht_qk_sm120<kDataType, kHeadDim>(K);
   }
   const kDataType* k_ptr = reinterpret_cast<const kDataType*>(K.data_ptr());
-  // NHD (BNHD) permute views are consumed natively by the pre-kernels.
-  const ffpa_fp8::Fp8InputLayout Lkv = ffpa_layout_of(K, Nkv, K.size(3));
+  // NHD (BNHD) permute views — including strided fused-QKV chunk rows —
+  // are consumed natively by the pre-kernels: kv-mean/delta_s address rows
+  // through the relaxed Lkv, the tensor-based quantize kernels take the
+  // tensors' native strides.
+  const ffpa_fp8::Fp8InputLayout Lkv =
+      ffpa_layout_of(K, Nkv, K.size(3), /*allow_strided_rows=*/true);
 
   torch::Tensor km_h = torch::empty({Nb * Nh_kv, kHeadDim}, K.options());
   torch::Tensor km_f32 = torch::empty({Nb * Nh_kv, kHeadDim}, opts_f32);
