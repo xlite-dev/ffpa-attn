@@ -54,6 +54,7 @@
 | FC-8 | native head_dim pad | F3 | ✅ 已完成 | — |
 | FC-9 | CUDA backward (**暂不实施，仅保留设计稿**) | F3 | ⬜ 待开始 | — |
 | FC-10 | sm90/sm100 量化覆盖 (**暂不实施，仅保留设计稿**) | F3 | ⬜ 待开始 | — |
+| PC-0 | attn_mask 量化路径 bias tile IO 重构（fp8/fp4） | P | ⬜ 待开始（**P 轨最高优先**） | FC-4 注入点 |
 | PC-1 | Mega Quantize Kernel（aux 链大融合） | P | ⬜ 待开始 | — |
 | PC-2 | 增量融合（Mega Kernel 步进） | P | ⬜ 待开始 | 被 PC-1 收编 |
 | PC-3 | N-crossover 量化配置自适应 | P | ⬜ 待开始 | — |
@@ -87,6 +88,7 @@
 
 **轨道 P（性能优化）**
 
+- [ ] PC-0：attn_mask 量化路径 bias tile IO 重构（fp8/fp4）—— P 轨最高优先（2026-08-31 立项）
 - [ ] PC-1：Mega Quantize Kernel —— P 轨基建
 - [ ] PC-2：增量融合（Mega Kernel 步进，被 PC-1 收编）
 - [ ] PC-3：N-crossover 量化配置自适应
@@ -116,6 +118,7 @@
   FC-7 短 Nq/decode ⏸ ｜ FC-8 native pad ｜ FC-9 backward 评估 ⏸ ｜
   FC-10 sm90/sm100 ⏸（FC-7/FC-9/FC-10 均暂不实施）
 阶段 4（轨道 P）
+  PC-0 attn_mask 量化路径 bias tile IO 重构（P0：attn-mask 是当前量化路径最大退化点）
   PC-1 Mega Quantize Kernel（先做 cooperative 两阶段原型）
         ├─► 收编 PC-2（增量融合是其落地台阶）
         └─► 联动 PC-5 ⏸（暂不实施；launch 形态定型后才能定 graph 兼容方案）
@@ -765,9 +768,114 @@ Blackwell 消费/专业卡；若目标硬件扩到 H100/B200，量化路径不�
 
 > 轨道 F 解决"能不能用"，轨道 P 解决"快不快"。以下各项在功能完备的前提下推进。
 
+### PC-0：attn_mask 量化路径 bias tile IO 重构（fp8/fp4）
+
+- **Status**: Draft ｜ **Priority**: P0（性能轨最高优先） ｜ **Track**: 性能
+
+#### Motivation
+
+FC-4 打开了量化路径的 `attn_bias`，但注入实现（`apply_attn_bias_quant_rowcol` /
+`apply_attn_bias_fp4_rowcol`，均调 native 的标量 loader `load_attn_bias_value`）
+使 attn-mask 成为量化路径**最大的性能退化点**（RTX PRO 5000，B=1 H=32 N=16384）：
+
+| 场景 | self-attn | attn-mask | 退化 |
+|---|---|---|---|
+| fp4 D=128 fp16 | 8.16 ms / 539T | 30.55 ms / 144T | **3.74x** |
+| fp4 D=128 bf16 | 8.17 ms / 538T | 26.23 ms / 168T | 3.21x |
+| fp8 D=320 fp16 | 38.36 ms / 287T | 68.16 ms / 161T | 1.78x |
+
+fp4 D=128 的纯 bias 开销 ≈ 22.4 ms；16384² fp32 mask ≈ 1 GB → 有效带宽仅
+~45 GB/s（<3% DRAM 峰值）。fp4 越快（NVFP4 MMA 主循环 539T）标量 bias 注入
+占比越大，退化越狠。
+
+#### Root Cause（初步分析，动手前 NCU 复核）
+
+1. **cache line 级重复 IO（主因）**：cute rowcol score fragment 坐标散布，
+   同一 128B line 的 bias 元素被不同 thread、不同循环迭代的**独立标量 load**
+   分别取出；1 GB mask 远超 L2（96MB）→ line 反复从 DRAM 拉取。
+   fp4 的 `kv_perm32` 列置换（j → 0,1,8,9,16,17,...）进一步打散跨迭代局部性。
+2. **低效 IO**：逐元素 32-bit 标量 load，warp 内地址不连续 → 无合并，
+   32B sector 只取 4B（sector 效率 ~12.5%）；广播 mask（stride_n==0 等）也
+   逐元素重复读同一地址。
+3. 计算顺带浪费：每元素运行时 dtype 三分支 + `long long` 地址算术 +
+   fp8 的 `inv_sd[row]` 逐元素乘（可 tile 级预乘）。
+
+#### Design（重点：消除重复 IO + 高效 IO；仅向量化不够）
+
+**方案 A（主案，数学不变）——cute 专属 bias tile smem 预载**：
+
+- 为 cute 家族**单独实现** bias tile 加载（TMA 2D box / cp.async 向量化），
+  **不复用 native/prefill.cuh 的标量函数**（cute 有自己的 TMA/Tensor 基建；
+  native 的 R_S fragment + broadcast-stride 语义留在 native 侧）。
+- per (Q-tile, KV-tile) 把 `[Br, Bc]` bias 块一次性载入 smem（行连续 →
+  sector 满载），与 K/V tile 同流水异步预取（latency 隐藏）；注入函数改为
+  按 `tScS_rc` 坐标读 smem Tensor。**每 bias 元素、每 cache line 从 DRAM
+  只取一次**：DRAM 流量降到理论最小 `Nq·Nkv·sizeof(dtype)`，line 一次取满。
+- 广播特化在 loader 侧：`stride_n==0` 载 `[Br,1]` 单列、`stride_m==0` 载
+  `[1,Bc]` 单行、h/b 广播由 grid 索引天然处理——广播 mask 的重复读归零。
+- fp4 适配：smem 存原序列，读时按 `kv_perm32(j)` 索引（与既有 masking
+  同构）；是否载入侧预置换由实现时 A/B 定。
+- fp8 raw-S 域：`inv_sd[row]` 折叠加法不变，仅换 load 来源；可选把
+  `bias·inv_sd` 预乘后以 fp16 存 smem（流量减半，精度需验证）。
+
+**方案 B（进阶，可选）——乘子域预折叠（数学等价变换）**：
+`softmax 输入 = S_dequant + bias`，则 `exp(S' − m) = exp2((S_dequant − m̃)·c) ·
+exp2(bias·c)`。预处理 kernel 一次性产出 `bias_exp` 乘子表（半精度）+ per-row
+`max(bias)` 作 online-max 初值上界（防溢出，softmax 平移不变保证等价）；
+fp8 的 `qs·ks` 在 softmax 输入域恰好消去 → 乘子与 row 无关，per-(q,k) 常量表。
+attn kernel 内 add 变 mul、读表流量减半。风险：online-max 初始化语义变化 +
+半精度乘子表精度，A 落地后再评估。乘子表预处理可并入 PC-1 的 aux 融合。
+
+**方案 C（仅根因对照，非交付路径）**：stride_n==1 时 128-bit 向量化 direct
+load——按用户判断"仅向量化不够"（line 级重复仍在），只用于 A/B 对照验证
+sector 效率诊断，不作为交付方案。
+
+**验证顺序**：NCU 先行（attn-mask kernel 看
+`l1tex` sector/request 比与 DRAM 带宽利用率，预测 <15% / <10%）→ A 落地 →
+复核指标归位。
+
+#### Files & Symbols
+
+- `csrc/cuffpa/cute/attn_bias.cuh`（新增 cute 原生 bias tile loader；
+  `apply_attn_bias_quant_rowcol` 的 gmem 直读路径退役为 fallback）
+- `csrc/cuffpa/cute/fp4/fp4_gemm.cuh`（`apply_attn_bias_fp4_rowcol` 改 smem 读 + perm32）
+- `csrc/cuffpa/cute/fp8/sm_120/{persist_d,split_d,split_d_m4n2}.cuh`、
+  `cute/fp4/sm_120/{persist_d,split_d,split_d_m4n2}.cuh`（注入点接线；
+  fp16 cute 家族 `apply_attn_bias_rowcol` 同模式受益，可随做）
+- `csrc/cuffpa/cute/launch.cuh`（bias 描述符 / smem 布局 / 流水接线）
+
+#### Validation
+
+- parity：`ffpa_attn.bench --cuda-impl fp8/fp4 --tasks attn-mask` 前后 O_err
+  不变（容差同 FC-4：fp8 5e-2 / fp4 0.15）；六族 kernel 全过；
+- 性能：attn-mask 与 self-attn 差距 3.74x(fp4 D128) / 1.78x(fp8 D320) 收敛至
+  ≤1.2x；attn-mask TFLOPS 回到同 D self-attn 的 80%+；
+- NCU：标量 global load 消失，sector/request 与 DRAM 带宽利用率归位；
+- 广播 mask 专项（stride 0 各维）与尾 tile（Nq/Nkv 非 tile 倍数）正确性。
+
+#### Risks & Rollback
+
+- smem 预算：+bias tile `[Br,Bc]`（fp32 最坏 ~64KB）——按档位裁剪（fp16 存 /
+  从 stage 数腾 / 大 D 档 fallback 直读路径保留）；
+- TMA box 形状：Nq/Nkv 非 box 整数倍的边界（OOB bias 读 0 与 kv_mask -inf
+  屏蔽交互需验证）；broadcast stride 无法直接 TMA → 单行/单列特化；
+- 回退 = `kHasAttnBias` 双实例保留直读路径，逐 kernel 切换可独立回退。
+
+#### Expected Benefit
+
+attn-mask 量化路径从 144T（fp4 D128）回到 ~400T+ 量级；对齐 SageAttention
+等竞品在 mask 场景的竞争力（当前 attn-mask 是量化路径唯一 >1.8x 退化点）。
+
+#### Dependencies
+
+FC-4 注入点基建（`kHasAttnBias` 编译期双实例，bias=None 零开销不变）；
+与 PC-1 正交（方案 B 的乘子表可并入其 aux 融合）。
+
+---
+
 ### PC-1：Mega Quantize Kernel（aux 链大融合）
 
-- **Status**: Draft ｜ **Priority**: P1（性能轨最高） ｜ **Track**: 性能
+- **Status**: Draft ｜ **Priority**: P1（aux 链基建） ｜ **Track**: 性能
 
 #### Motivation
 
