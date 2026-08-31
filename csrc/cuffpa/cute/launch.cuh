@@ -3053,7 +3053,18 @@ void launch_cute_fwd_persist_d_fp4_sm120_impl(
   auto tma_ds = make_tma_copy(SM90_TMA_LOAD{}, mDS, SmemLayoutDS{}(_, _, _0{}),
                               Shape<Int<kBr>, Int<kBc>>{}, _1{});
 
-  constexpr int kSmemBytes = Traits::kSmemBytes;
+  // PC-0-1 bias tile plan (tail slack past SFVt, mirroring the fp8 m4n2
+  // launcher): dense tiles get a single buffer; row-broadcast double
+  // buffers and upgrades to the resident vector (mode 3) when the whole
+  // [1,Nkv] row fits AND the smem-driven blocks/SM of the base layout stay
+  // intact (this family is 1 CTA/SM, so the guard only rejects the tight
+  // D=256 corners).
+  FfpaBiasTilePlan bias_plan;
+  if (bias.ptr != nullptr) {
+    FfpaBiasParams bias_p{bias.ptr,      bias.dtype,    bias.stride_b,
+                          bias.stride_h, bias.stride_m, bias.stride_n};
+    bias_plan = ffpa_bias_tile_plan_of(bias_p, Nb, Nh, Nq, Nkv);
+  }
   TORCH_CHECK(q_start_row >= 0 && q_start_row < Nq,
               "ffpa_attn: q_start_row must be in [0, Nq)");
   TORCH_CHECK(q_start_row % kBr == 0,
@@ -3063,9 +3074,74 @@ void launch_cute_fwd_persist_d_fp4_sm120_impl(
   int max_smem_optin = 0;
   cudaDeviceGetAttribute(
       &max_smem_optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, Q.get_device());
-  TORCH_CHECK(kSmemBytes <= max_smem_optin,
-              "ffpa_attn: fp4 persist_d D=", kHeadDim, " needs ", kSmemBytes,
-              "B smem, device opt-in allows ", max_smem_optin);
+  // The kernel's STATIC smem (the barrier arrays, <= 144B incl. the bias
+  // pair) is invisible to the dynamic budget: D=256's base sits ~200B under
+  // the opt-in ceiling and the aligned bias tail pushed the ATTRIBUTE over
+  // (the dynamic pre-check still passed). Reserve 256B for it.
+  const int dyn_limit = max_smem_optin - 256;
+  const int bias_stages = (bias_plan.mode == 2) ? 2 : 1;
+  if ((long long)Traits::kSmemBytes +
+          bias_plan.tile_bytes(kBr, kBc, bias_stages) >
+      dyn_limit)
+    bias_plan.mode = 0;
+  if (bias_plan.mode == 2) {
+    const long long base_align = ((long long)Traits::kSmemBytes + 15) & ~15;
+    const long long resident =
+        base_align + (long long)Nkv * bias_plan.elem_size;
+    if (resident <= dyn_limit && dyn_limit / resident >= dyn_limit / base_align)
+      bias_plan.mode = 3;
+  }
+  const auto make_tma_bias = [&](auto mode_c, auto b4_c) {
+    constexpr int kBiasModeT = decltype(mode_c)::value;
+    constexpr int kBias4B = decltype(b4_c)::value;
+    constexpr int bias_cols = kBc * (kBias4B ? 2 : 1);
+    // The descriptor is live only when the template mode matches the plan
+    // (mode 2 then spans the real [m_total, Nkv] plane); every other
+    // combination is a never-issued dummy, where bias_cols keeps the TMA
+    // descriptor's 16B outer-stride assert satisfied.
+    const bool bias_desc_live = bias_plan.mode == kBiasModeT;
+    const int64_t plane_rows =
+        bias_desc_live ? (int64_t)bias_plan.m_total : (int64_t)1;
+    const int64_t plane_cols =
+        (int64_t)std::max<long long>(Nkv, 1) * (kBias4B ? 2 : 1);
+    const int64_t plane_row_stride =
+        bias_desc_live
+            ? (kBiasModeT == 1 ? (int64_t)bias.stride_m * (kBias4B ? 2 : 1)
+                               : plane_cols)
+            : (int64_t)bias_cols;
+    // mode 0 (any demote reason, incl. an unaligned mask ptr) never issues:
+    // point every descriptor at the anchor so the 16B address assert holds.
+    const uint16_t* bias_desc_base =
+        bias_plan.mode != 0 ? reinterpret_cast<const uint16_t*>(bias.ptr)
+                            : &kBiasDummyAnchor;
+    auto gB = make_tensor(make_gmem_ptr(bias_desc_base),
+                          make_shape(plane_rows, plane_cols),
+                          make_stride(plane_row_stride, _1{}));
+    auto sB = [&] {
+      if constexpr (kBiasModeT == 1)
+        return Layout<Shape<Int<kBr>, Int<bias_cols>>,
+                      Stride<Int<bias_cols>, _1>>{};
+      else
+        return Layout<Shape<_1, Int<bias_cols>>, Stride<Int<bias_cols>, _1>>{};
+    }();
+    return make_tma_copy(SM90_TMA_LOAD{}, gB, sB, shape(sB), _1{});
+  };
+  auto tma_bias_d16 = make_tma_bias(std::integral_constant<int, 1>{},
+                                    std::integral_constant<int, 0>{});
+  auto tma_bias_d32 = make_tma_bias(std::integral_constant<int, 1>{},
+                                    std::integral_constant<int, 1>{});
+  auto tma_bias_r16 = make_tma_bias(std::integral_constant<int, 2>{},
+                                    std::integral_constant<int, 0>{});
+  auto tma_bias_r32 = make_tma_bias(std::integral_constant<int, 2>{},
+                                    std::integral_constant<int, 1>{});
+  const int kSmemBytes =
+      (int)(((long long)Traits::kSmemBytes + 15) & ~15) +
+      (int)((bias_plan.mode == 3)
+                ? (long long)Nkv * bias_plan.elem_size
+                : bias_plan.tile_bytes(kBr, kBc, bias_stages));
+  TORCH_CHECK(kSmemBytes <= dyn_limit, "ffpa_attn: fp4 persist_d D=", kHeadDim,
+              " needs ", kSmemBytes, "B smem, device opt-in allows ", dyn_limit,
+              " (static reserved 256B)");
   float* softmax_lse_ptr =
       softmax_lse.numel() > 0 ? softmax_lse.data_ptr<float>() : nullptr;
   auto O_ptr = reinterpret_cast<ElementO*>(O.data_ptr());
@@ -3083,30 +3159,61 @@ void launch_cute_fwd_persist_d_fp4_sm120_impl(
   const int num_ctas =
       causal ? total_work : std::min(total_work, prop->multiProcessorCount);
   const dim3 grid(num_ctas, 1, 1);
-  const auto launch_with = [&](auto bias_tag) {
+  const auto launch_with = [&](auto bias_tag, auto tma_bias_sel, auto mode_c,
+                               auto b4_c) {
     constexpr int kBiasOn = decltype(bias_tag)::value;
+    constexpr int kModeL = decltype(mode_c)::value;
+    constexpr int kB4 = decltype(b4_c)::value;
+    using TmaBiasSel = decltype(tma_bias_sel);
     auto kernel = ffpa_fp4::persist_d_ws_fwd_cute_fp4_sm120<
         Traits, ElementO, decltype(tma_q), decltype(tma_k), decltype(tma_v),
         decltype(tma_o), decltype(tma_sfq), decltype(tma_sfk),
-        decltype(tma_sfvt), decltype(tma_ds), kBiasOn>;
+        decltype(tma_sfvt), decltype(tma_ds), TmaBiasSel, kModeL, kB4, kBiasOn>;
     TORCH_CHECK(cudaFuncSetAttribute(
                     kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
                     kSmemBytes) == cudaSuccess,
                 "ffpa_attn: fp4 persist_d smem opt-in failed for D=", kHeadDim);
     kernel<<<grid, block, kSmemBytes, stream>>>(
-        tma_q, tma_k, tma_v, tma_o, tma_sfq, tma_sfk, tma_sfvt, tma_ds, O_ptr,
-        softmax_lse_ptr,
+        tma_q, tma_k, tma_v, tma_o, tma_sfq, tma_sfk, tma_sfvt, tma_ds,
+        tma_bias_sel, O_ptr, softmax_lse_ptr,
         fused_wht ? km_rot_f32.data_ptr<float>() : km_f32.data_ptr<float>(),
         fused_wht ? qm_rot.data_ptr<float>() : qm.data_ptr<float>(),
         fp4_smooth_v ? vm_v.data_ptr<float>() : nullptr, Nq, Nkv, Nq_pad,
         Nkv_pad, Nh, Nh_kv, scale, Tc, causal, total_q_rows, Nb, q_start_row,
         nhd_out, bias.ptr, bias.dtype, bias.stride_b, bias.stride_h,
-        bias.stride_m, bias.stride_n);
+        bias.stride_m, bias.stride_n,
+        bias_plan.mode != 0 ? bias_plan.m_total : (long long)1);
   };
-  if (bias.ptr != nullptr)
-    launch_with(std::integral_constant<int, 1>{});
-  else
-    launch_with(std::integral_constant<int, 0>{});
+  if (bias.ptr == nullptr) {
+    launch_with(std::integral_constant<int, 0>{}, tma_bias_r16,
+                std::integral_constant<int, 0>{},
+                std::integral_constant<int, 0>{});
+  } else {
+    const auto bias_on = std::integral_constant<int, 1>{};
+    const auto m0 = std::integral_constant<int, 0>{};
+    const auto m1 = std::integral_constant<int, 1>{};
+    const auto m2 = std::integral_constant<int, 2>{};
+    const auto m3 = std::integral_constant<int, 3>{};
+    if (bias_plan.mode == 1) {
+      if (bias.dtype == 3)
+        launch_with(bias_on, tma_bias_d32, m1, m1);
+      else
+        launch_with(bias_on, tma_bias_d16, m1, m0);
+    } else if (bias_plan.mode == 2) {
+      if (bias.dtype == 3)
+        launch_with(bias_on, tma_bias_r32, m2, m1);
+      else
+        launch_with(bias_on, tma_bias_r16, m2, m0);
+    } else if (bias_plan.mode == 3) {
+      // resident row-vector: no TMA issue in-kernel, descriptor unused.
+      if (bias.dtype == 3)
+        launch_with(bias_on, tma_bias_r32, m3, m1);
+      else
+        launch_with(bias_on, tma_bias_r16, m3, m0);
+    } else {
+      launch_with(bias_on, tma_bias_r16, m0, m0);
+    }
+  }
 }
 
 template <typename kDataType, const int kHeadDim, const int kStage>
