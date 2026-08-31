@@ -446,11 +446,14 @@ class CUDABackend(Backend):
   fp8_hadamard: bool = False
   fp4_hadamard: bool = False
   # FP4 only: PV MMA dtype; "fp4" (NVFP4 e2m1+ue4m3/16) or "fp8" (MXFP8
-  # e4m3+ue8m0/32, QK stays NVFP4). smem budget limits fp8 to D<=192.
+  # e4m3+ue8m0/32, QK stays NVFP4). MXFP8 covers persist_d D<=192 and
+  # split_d D<768; persist_d D=256 (smem) and the m4n2 family D>=768
+  # (MXFP8 PV atom needs Tile-K=128 > m4n2's kBc=64) are rejected.
   fp4_pv_mm_type: str = "fp4"
-  # FP4 only (persist_d, D<=256): subtract the per-(b,hkv) V column mean
-  # before V quantize; the epilogue adds it back (softmax rows sum to 1),
-  # concentrating the residual so the V blockscale tracks the dynamic range.
+  # FP4 only: subtract the per-(b,hkv) V column mean before V quantize;
+  # the epilogue adds it back (softmax rows sum to 1), concentrating the
+  # residual so the V blockscale tracks the dynamic range. Available on
+  # every fp4 family (persist_d / split_d / m4n2).
   # NOTE: Q/K smoothing is NOT an option in the fp4 path - it is always on
   # and required for accuracy (e2m1's +-6 dynamic range; qm/km means +
   # sub_qm/sub_km quantize + delta_s/lse exact corrections are hardwired in
@@ -974,6 +977,12 @@ class FFPAAttnMeta:
     # incomplete Function dispatch below.
     if self.forward_meta.name == "sdpa":
       return True
+
+    # Test/dev escape hatch (FFPA_FORCE_NO_SDPA_FALLBACK=1): run the
+    # selected backend's real kernel path instead of rerouting small
+    # shapes to SDPA, so tests assert the kernel rather than the fallback.
+    if os.environ.get("FFPA_FORCE_NO_SDPA_FALLBACK", "0") not in ("", "0"):
+      return False
 
     if self.forward_meta.name == "cutedsl":
       from .cute import (

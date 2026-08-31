@@ -614,3 +614,137 @@ def test_fp8_nhd_layout_rejections(monkeypatch):
   with pytest.raises(TypeError):
     # grad-on declines the fast path, so NHD has no supported path
     ffpa_attn_func(q3, k3, v3, forward_backend=_fp8_backend("NHD"))
+
+
+# ---------------------------------------------------------------------------
+# attn_bias (FC-4): additive bias / bool mask across the three fp8 families.
+
+
+def _mk_attn_bias(q, k, kind):
+  Nq, Nkv = q.size(2), k.size(2)
+  torch.manual_seed(1)
+  if kind == "additive":
+    return torch.randn(1, 1, Nq, Nkv, dtype=q.dtype, device=q.device) * 0.25
+  if kind == "broadcast":
+    return torch.randn(1, 1, 1, Nkv, dtype=q.dtype, device=q.device) * 0.25
+  mask = torch.ones(Nq, Nkv, dtype=torch.bool, device=q.device)
+  mask[:, 3::7] = False
+  mask[:, 0] = True
+  return mask
+
+
+def _sdpa_bias_ref(q, k, v, bias, causal):
+  # SDPA takes is_causal XOR attn_mask, so causal+bias composes into one
+  # additive mask (this mirrors the kernel: -inf masking overrides bias).
+  if bias.dtype == torch.bool:
+    score_bias = torch.zeros_like(bias, dtype=torch.float32
+                                  ).masked_fill(~bias, float("-inf"))
+  else:
+    score_bias = bias.float()
+  if causal:
+    tri = torch.ones(q.size(2), k.size(2), dtype=torch.bool,
+                     device=q.device).tril()
+    score_bias = score_bias.masked_fill(~tri, float("-inf"))
+  return F.scaled_dot_product_attention(
+    q.float(), k.float(), v.float(), attn_mask=score_bias
+  )
+
+
+@pytest.mark.parametrize(
+  "kind", ["dense", "causal_fused"], ids=["dense", "causal-fused"]
+)
+@pytest.mark.parametrize(
+  "D", [128, 320, 768], ids=["persist_d", "split_d", "split_d_m4n2"]
+)
+def test_fp8_attn_bias_parity(D, kind):
+  # The public API rejects explicit attn_mask + is_causal (SDPA semantics),
+  # so the causal composition runs as one additive mask: bias + the causal
+  # -inf triangle (this still exercises the kernel bias load on every tile
+  # including -inf values).
+  torch.manual_seed(0)
+  B, H, N = 1, 8, 2048
+  q = torch.randn(B, H, N, D, dtype=torch.float16, device="cuda") * 0.5
+  k = torch.randn(B, H, N, D, dtype=torch.float16, device="cuda") * 0.5
+  v = torch.randn(B, H, N, D, dtype=torch.float16, device="cuda") * 0.5
+  bias = _mk_attn_bias(q, k, "additive")
+  if kind == "causal_fused":
+    tri = torch.ones(N, N, dtype=torch.bool, device=q.device).tril()
+    bias = bias.masked_fill(~tri, float("-inf"))
+
+  out = ffpa_attn_func(q, k, v, attn_mask=bias, forward_backend=_fp8_backend())
+  ref = _sdpa_bias_ref(q, k, v, bias, causal=False).half()
+  if kind == "causal_fused":
+    # Same early-row quant floor as the causal tests.
+    torch.testing.assert_close(out, ref, atol=1e-1, rtol=1e-1)
+  else:
+    torch.testing.assert_close(out, ref, atol=4e-2, rtol=4e-2)
+
+
+@pytest.mark.parametrize("kind", ["additive", "broadcast", "bool"])
+def test_fp8_attn_mask_forms_match_sdpa(kind):
+  torch.manual_seed(0)
+  B, H, N, D = 1, 8, 2048, 128
+  q = torch.randn(B, H, N, D, dtype=torch.float16, device="cuda") * 0.5
+  k = torch.randn(B, H, N, D, dtype=torch.float16, device="cuda") * 0.5
+  v = torch.randn(B, H, N, D, dtype=torch.float16, device="cuda") * 0.5
+  bias = _mk_attn_bias(q, k, kind)
+
+  out = ffpa_attn_func(q, k, v, attn_mask=bias, forward_backend=_fp8_backend())
+  ref = _sdpa_bias_ref(q, k, v, bias, causal=False).half()
+  torch.testing.assert_close(out, ref, atol=4e-2, rtol=4e-2)
+
+
+def test_fp8_attn_bias_gqa_parity():
+  torch.manual_seed(0)
+  B, H, Hkv, Nq, Nkv, D = 1, 4, 2, 1024, 1536, 128
+  q = torch.randn(B, H, Nq, D, dtype=torch.float16, device="cuda") * 0.5
+  k = torch.randn(B, Hkv, Nkv, D, dtype=torch.float16, device="cuda") * 0.5
+  v = torch.randn(B, Hkv, Nkv, D, dtype=torch.float16, device="cuda") * 0.5
+  bias = _mk_attn_bias(q, k, "additive")
+
+  out = ffpa_attn_func(
+    q, k, v, attn_mask=bias, enable_gqa=True, forward_backend=_fp8_backend()
+  )
+  ref = F.scaled_dot_product_attention(
+    q.float(),
+    k.float(),
+    v.float(),
+    attn_mask=bias.float(),
+    enable_gqa=True,
+  ).half()
+  torch.testing.assert_close(out, ref, atol=4e-2, rtol=4e-2)
+
+
+def test_fp8_hybrid_attn_bias_parity():
+  torch.manual_seed(0)
+  B, H, N, D, n_early = 1, 8, 2048, 128, 256
+  q = torch.randn(B, H, N, D, dtype=torch.float16, device="cuda") * 0.5
+  k = torch.randn(B, H, N, D, dtype=torch.float16, device="cuda") * 0.5
+  v = torch.randn(B, H, N, D, dtype=torch.float16, device="cuda") * 0.5
+  bias = _mk_attn_bias(q, k, "additive")
+  backend = CUDABackend(
+    backward=False,
+    enable_tma=True,
+    enable_cute=True,
+    enable_fp8=True,
+    fp8_hybrid=True,
+    fp8_hybrid_n_early=n_early,
+  )
+
+  out = ffpa_attn_func(q, k, v, attn_mask=bias, forward_backend=backend)
+  ref = _sdpa_bias_ref(q, k, v, bias, causal=False).half()
+  torch.testing.assert_close(out, ref, atol=4e-2, rtol=4e-2)
+
+
+def test_fp8_rejects_dropout():
+  torch.manual_seed(0)
+  B, H, N, D = 1, 4, 512, 128
+  q = torch.randn(B, H, N, D, dtype=torch.float16, device="cuda") * 0.5
+  k = torch.randn(B, H, N, D, dtype=torch.float16, device="cuda") * 0.5
+  v = torch.randn(B, H, N, D, dtype=torch.float16, device="cuda") * 0.5
+  bias = _mk_attn_bias(q, k, "additive")
+
+  with pytest.raises(RuntimeError, match="does not support dropout"):
+    ffpa_attn_func(
+      q, k, v, attn_mask=bias, dropout_p=0.1, forward_backend=_fp8_backend()
+    )

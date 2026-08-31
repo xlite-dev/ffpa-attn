@@ -309,7 +309,7 @@ D 交叉点与 fp16 家族一致（<768 M8N1 / ≥768 M4N2）。`FFPA_FP8_FORCE_
 |---|---|---|---|
 | causal | ✓ | ✓ | ✓ |
 | GQA | ✓ | ✓ | ✓ |
-| **attn_bias** | **✗**（TORCH_CHECK 拒绝） | ✗ | ✗ |
+| **attn_bias** | ✓（FC-4：raw-S 域注入 + `kHasAttnBias` 双实例） | ✓（FC-4） | ✓（FC-4） |
 | **dropout** | **✗** | ✗ | ✗ |
 | NHD 读（packed view） | ✓ | ✓（quantize NHD-native） | ✓ |
 | **strided-NHD 读** | ✓（relaxed gate + Lv） | ✗（严格 gate） | ✗ |
@@ -376,10 +376,10 @@ E2E（含前处理）GQA 小 N 场景仍落后：根因是辅助链 kernel 数�
 1. **smooth Q / smooth K 强制开启**（不是选项）：e2m1 ±6 动态范围使均值平滑是精度必需。`qm = mean(q, 128-row group)`、`km = mean(k)`。
 2. `delta_s`（rank-1 修正预计算）：`delta_s[b,h,mb,n] = qm @ (k-km)^T`，恒等式 `qm@K^T - 2·qm·km` 免物化 K-km；单 wmma kernel（128×128 tile，dynamic smem 64KB），大 N 从 torch 链 1.4ms 降到 ~0.3ms。
 3. `D≤128` 时 Q/K/V 单 launch fused 量化（同时产 qm）；更大 D 保持分离链。
-4. smooth V（可选 `fp4_smooth_v`，仅 persist-D D≤256）：V 列均值减除 + epilogue 加回（softmax 行和为 1 ⇒ O 不变）。
+4. smooth V（可选 `fp4_smooth_v`，三族全支持）：V 列均值减除 + epilogue 加回（softmax 行和为 1 ⇒ O 不变；split-D/m4n2 的 add-back 按 v_chunk 走 per-chunk identity partition）。
 5. hadamard（`fp4_hadamard`）：pow2 D（≤512）**fused 进 quantize kernel**（行内旋转，mean/delta_s 走未旋转域——WHT 线性，`H H^T=I`；lse 修正用旋转副本 qm_rot/km_rot）；非 pow2 D 回退独立 WHT kernel（需 BHND，NHD 物化）。
 
-lse 公式：`lse = (m*L + log2(row_sum) + log2(1/2688))*ln2 + scale*qkm`（P2=2688=448×6 两级量化域）。
+lse 公式（NVFP4 PV）：`lse = (m*L + log2(row_sum) + log2(1/2688))*ln2 + scale*qkm`（P2=2688=448×6 两级量化域）。MXFP8 PV 的 row_sum 处于 P·448 域（`SoftmaxFusedMxfp8`），域常量换为 `log2(1/448)`——两 kernel 按 `kPvMxfp8` 选择（曾是无条件 2688 的 latent bug，差 ln 6）。
 
 ### 6.3 数学链与列对齐
 
@@ -395,14 +395,14 @@ lse 公式：`lse = (m*L + log2(row_sum) + log2(1/2688))*ln2 + scale*qkm`（P2=2
 |---|---|---|---|
 | causal | ✓（perm-aware mask） | ✓ | ✓ |
 | GQA | ✓ | ✓ | ✓ |
-| **attn_bias** | **✗**（dispatch 层统一拒） | ✗ | ✗ |
+| **attn_bias** | ✓（FC-4：dequant 域注入，列 kv_perm32） | ✓（FC-4） | ✓（FC-4） |
 | **dropout** | **✗** | ✗ | ✗ |
-| NHD 读 | ✓（Lkv/Lv relaxed gate） | ✓（严格 gate，packed view） | ✓（严格 gate） |
-| **strided-NHD 读** | ✓ | ✗ | ✗ |
-| NHD O 写 | ✓（D≤256） | ✗ | ✗ |
+| NHD 读 | ✓（Lkv/Lv relaxed gate） | ✓（FC-1 起独立 Lv relaxed gate） | ✓（FC-1 起独立 Lv relaxed gate） |
+| **strided-NHD 读** | ✓ | ✓（FC-1） | ✓（FC-1） |
+| NHD O 写 | ✓（D≤256） | ✓（FC-2，nhd_out 分支） | ✓（FC-2） |
 | hybrid | ✓ | ✓ | ✓ |
-| `fp4_pv_mm_type='fp8'`（MXFP8 PV） | ✓ 仅 `D≤192`（smem 预算） | **✗**（TORCH_CHECK） | **✗** |
-| `fp4_smooth_v` | ✓ | **✗**（persist-D 专属） | **✗** |
+| `fp4_pv_mm_type='fp8'`（MXFP8 PV） | ✓ 仅 `D≤192`（smem 预算） | ✓（FC-6；PV Tile-K=kBc=128=MXFP8 atom K） | **✗ 架构排除**（atom K=128 > kBc=64） |
+| `fp4_smooth_v` | ✓ | ✓（FC-6） | ✓（FC-6） |
 | hadamard | ✓（pow2 fused / 非 pow2 物化） | ✓（非 pow2 物化） | ✓（同左） |
 | head_dim pad | ✓（fused，任意 %8） | ✓ | ✓ |
 
@@ -431,12 +431,12 @@ lse 公式：`lse = (m*L + log2(row_sum) + log2(1/2688))*ln2 + scale*qkm`（P2=2
 | 全局互斥 | — | `attn_mask` + `is_causal` 任何 backend 均拒绝 |
 | Native sm80 / sm120 TMA | ✓ | 4D 广播 `[B\|1, H\|1, Nq\|1, Nkv\|1]`；fp16/bf16/fp32；广播维 stride 置 0；dtype code 1/2/3 |
 | CUTE fp16（persist/split/M4N2/sm80） | ✓（编译期 4 变体） | 但 dispatch 自动回退 native TMA（除非 force_cute_tma），因 CUTE bias 路径寄存器压力慢 ~2x |
-| **CUTE FP8（全部三族）** | **✗** | `TORCH_CHECK(attn_bias.numel()==0 && dropout_p==0.0)` |
-| **CUTE FP4（全部三族）** | **✗** | 同上（dispatch 层统一拒） |
+| **CUTE FP8（全部三族）** | ✓（FC-4） | raw-S 域注入 `bias/(qs*ks*scale_orig)`；`kHasAttnBias` 双实例 tag dispatch；仅拒 dropout |
+| **CUTE FP4（全部三族）** | ✓（FC-4） | dequant 域注入 `bias/scale_orig`，列 `kv_perm32(j)`；仅拒 dropout |
 | cutedsl backend | ✗ | `NotImplementedError`（无静默 fallback） |
 | Triton backend | ✓ | （非本报告范围，支持 additive mask 梯度） |
 
-**结论：需要 attn_mask 的低精度场景目前没有 CUDA 路径**——fp8/fp4 全拒，只能 fp16 家族（实际跑 native TMA）或 Triton。
+**结论：attn_mask 的低精度路径已由 FC-4 解锁**（fp8/fp4 六族均支持，2026-08-28）；dropout 仍为 fp16 家族专属。
 
 ### 7.2 dropout
 
@@ -494,9 +494,9 @@ softmax_scale 恒按真实 D（Python 解析 `1/sqrt(D_og)`）。
 | 1 | **NHD O 写**（`nhd_out` 运行时分支 + 双分支动态 int64 gO） | ✅ 已补齐（FC-2，df7d572/c4ca38b/2382ca4）：split-D/M4N2 运行时 `nhd_out` 动态描述符，`tensor_layout='NHD'` 全 D 可用 | fp8/fp4/fp16 全部 split-D/M4N2 | （已解决）原 O store 是静态 BHND TMA descriptor |
 | 2 | **strided-NHD 读**（relaxed `ffpa_layout_of`） | ✅ 已补齐（FC-1，cc8e8dc/4a49d38/882ee07）：split-D/M4N2 独立 `Lq/Lkv/Lv`，fused-QKV chunk 零物化 | fp8/fp4/fp16 split-D/M4N2 | （已解决）原 quantize 侧描述符共享 Lkv |
 | 3 | **strided/NHD + hybrid 组合** | ✅ 已补齐（FC-3，9b9dcae）：dispatch gate 删除，hybrid 与任意布局族组合可用（dense 零拷贝 / causal 物化前缀） | fp8 D>224 / fp4 D>256 | （已解决）原 stage-1 gate 误拒 |
-| 4 | **fp4 smooth_v / MXFP8-PV** | fp4 大 D 精度/速度 knob 缺失 | fp4 split-D/M4N2 | `TORCH_CHECK(fp4_smooth_v ... persist_d)`；mxfp8 traits `static_assert D≤192` |
+| 4 | **fp4 smooth_v / MXFP8-PV** | ✅ 已补齐（FC-6，76a8bd8）：smooth_v 三族全放开；MXFP8-PV 扩至 split-D（PV Tile-K=kBc=128=atom K），m4n2 架构排除（atom K=128 > kBc=64）；顺带修 mxfp8 lse 域常量 latent bug（P·448 域误用 log2(1/2688)） | fp4 split-D/M4N2 | （已解决）原 `TORCH_CHECK(fp4_smooth_v ... persist_d)`；mxfp8 仅 persist-D traits |
 | 5 | fp16 persist-D 专属的 WS 结构 | （非缺口，差异说明）split-D/M4N2 是 non-WS | fp16 split 家族 | setmaxnreg 232 装不下大 D o_acc；FA-1 M4N2 是替代方案 |
-| 6 | **attn_bias / dropout（量化路径全体）** | 低精度 + mask/dropout 无解 | fp8/fp4 全部（含 persist-D） | 量化 kernel 链无 bias 注入点；P 量化与 bias 叠加需要 bias 在 S 域 fp32 化后再量化，工程量大 |
+| 6 | **attn_bias（量化路径全体）** | ✅ 已补齐（FC-4，2026-08-28）：fp8 raw-S 域注入 `bias/(qs*ks*scale_orig)` / fp4 dequant 域注入（列 kv_perm32），六族 kernel + `kHasAttnBias` 双实例 tag dispatch；dropout 仍拒（FC-5 ⏸） | fp8/fp4 全部（含 persist-D） | （已解决）原 dispatch 层统一拒绝 |
 
 另注意 native 家族相对 cute 家族的缺口：NHD/strided 零拷贝（物化）、head_dim pad（不支持）。
 
@@ -517,7 +517,7 @@ softmax_scale 恒按真实 D（Python 解析 `1/sqrt(D_og)`）。
 3. **fp4 attn kernel 内部**：quantize CVT 链、NCU 驱动的指令 mix 优化（Phase 3 后仍有空间）；causal 三段化（全 -inf 行 tile 跳过，预期 1-2%，低优先）。
 4. ~~**split-D/M4N2 补 NHD O 写**（§8 #1）~~：✅ 已完成（FC-2）。
 5. ~~**split-D/M4N2 接独立 Lv**（§8 #2）~~：✅ 已完成（FC-1）。
-6. **量化路径的 attn_bias**（§8 #6，大工程）：bias 在 S 累加器 fp32 域注入 → P 量化前；需要每 tile bias TMA/cp.async 加载通道（fp16 家族已有可抄的 bias 加载协议）。
+6. ~~**量化路径的 attn_bias**（§8 #6，大工程）~~：✅ 已完成（FC-4，2026-08-28）——raw-S/dequant 域注入 + `kHasAttnBias` 模板双实例，详见 RFC FC-4 完成记录。
 7. **配置自适应**：历史测量 `fp8_qk_mm_type/pv_acc_type` 存在 N-crossover（小 N 偏 fp8 QK、大 N 偏 int8 QK，crossover ∈ (4608,8192)）；默认配置已统一为 QK int8 + PV f16 acc，可按 Nkv 在反转区自适应切换（切前须跑 FLUX PSNR 验证精度）。
 8. ~~**decode/短 Nq 的量化路径**~~（⏸ RFC FC-7 暂不实施，仅保留设计稿，2026-08-28）：短 Nq/decode 量化基本没有收益——fp4 固定前处理 ~1.1ms 结构性占优、小 Nq 下量化吞吐优势摊不开，decode 已由 native split-KV fp16 覆盖。
 9. **P online 量化的精度优化**（§5.4）：P 是量化注意力中唯一 online 量化、无法离线校准的对象，其精度丢失是量化 attn 误差的最主要根源之一。候选形态：更好的满量程利用率、行感知 scale、causal 早行 P 高精度补偿；须避开已证伪的 per-row P quant + 重开 lazy rescale（§5.8 #12）。
@@ -525,7 +525,7 @@ softmax_scale 恒按真实 D（Python 解析 `1/sqrt(D_og)`）。
 ### 9.2 框架/工程级
 
 - **CPU dispatch 开销**：fast path 已省 ~20µs；剩余是 CUDABackend 构建 / tensor slice/copy op / 多 launch。CUDA graph 捕获友好化（native TMA 的每调用 cudaMalloc/Memcpy descriptor 改常驻池）在 graph 场景有价值。
-- **cache-dit 集成侧**：`is_nhd_zero_copy_input` 逐 tensor 直传已家族无关；后续 split-D 补齐后可移除 `_keep_or_pack` 物化兜底。
+- **cache-dit 集成侧**：✅ 三族 NHD/strided 全量直传后，`_keep_or_pack` 物化兜底已移除（2026-08-28，cache-dit@4b5c977），契约外布局由 C++ layout gate 显式报错。
 - **5090/PRO 5000 差异**：fp8 bench 默认配置已统一为 QK int8（int8 MMA + int32 acc）+ PV f16 acc（fp8 MMA + f16 acc），两卡同配置；剩余差异是硬件吞吐/带宽（消费卡 vs 专业卡），发布基准仍须分卡标注绝对数字。
 
 ---

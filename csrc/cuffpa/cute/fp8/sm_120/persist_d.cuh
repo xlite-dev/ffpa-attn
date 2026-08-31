@@ -13,6 +13,7 @@
 
 #include "../../gemm.cuh"
 #include "../attn_traits.cuh"
+#include "../../attn_bias.cuh"
 #include "../../softmax.cuh"
 #include "../fp8_pscale.cuh"
 #include "../reg2reg_8b.cuh"
@@ -114,7 +115,7 @@ template <typename Traits, typename ElementO, typename TmaQ, typename TmaK,
           typename TmaV, typename TmaO, bool kPQuantPerRow = false,
           bool kPVAccF16 = false, bool kVPerChannel = false,
           bool kQKPerThread = false, bool kReorgFree = false,
-          bool kPersistQs2r = kPersistQs2rDefault>
+          bool kPersistQs2r = kPersistQs2rDefault, int kHasAttnBias = 0>
 __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp8_sm120(
     CUTLASS_GRID_CONSTANT TmaQ const tma_q,
     CUTLASS_GRID_CONSTANT TmaK const tma_k,
@@ -125,7 +126,10 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp8_sm120(
     int Nq, int Nkv, int Nh, int Nh_kv, float scale, int Tc, int causal,
     int total_q_rows, int total_kv_rows, int n_rb_q, int n_rb_kv,
     int q_start_row = 0, const float* __restrict__ km = nullptr,
-    const float* __restrict__ vm = nullptr, bool nhd_out = false) {
+    const float* __restrict__ vm = nullptr, bool nhd_out = false,
+    const void* __restrict__ attn_bias = nullptr, int attn_bias_dtype = 0,
+    long long attn_bias_stride_b = 0, long long attn_bias_stride_h = 0,
+    long long attn_bias_stride_m = 0, long long attn_bias_stride_n = 0) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
   using namespace cute;
   using Element = typename Traits::Element;      // float_e4m3_t (V/PV)
@@ -527,6 +531,23 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp8_sm120(
     // dS part. PV16 (fp16 PV on masked tiles) was removed (+38~61% slower).
     // Per-key V quant hits the e4m3 mantissa floor 0.116 (quant granularity
     // cannot break it).
+    // Additive attn bias in the RAW score domain (before any dequant-scale
+    // path): every path below scales raw scores by qs_arr[row]*ks*scale, so
+    // bias/(qs_arr[row]*ks*scale_orig) lands as +bias in softmax-input
+    // units on masked and unmasked tiles alike; the -INFINITY assignments
+    // in the masking block below simply override it.
+    if constexpr (kHasAttnBias) {
+      float bias_inv[kSRows];
+#pragma unroll
+      for (int row = 0; row < kSRows; ++row)
+        bias_inv[row] = 1.0f / (qs_arr[row] * ks * scale_orig);
+      ffpa_cute::apply_attn_bias_quant_rowcol<
+          decltype(scores), decltype(tScS_rc), kSRows, kSCols>(
+          scores, tScS_rc, attn_bias, attn_bias_dtype, attn_bias_stride_b,
+          attn_bias_stride_h, attn_bias_stride_m, attn_bias_stride_n, Nb_id,
+          Nh_id, q_start_row + Br_base, kv_tile, kBc, bias_inv);
+    }
+
     const int kv_valid = Nkv - kv_tile * kBc;
     const bool tile_needs_mask =
         (kv_valid < kBc) || (kv_tile >= mask_start_tile);

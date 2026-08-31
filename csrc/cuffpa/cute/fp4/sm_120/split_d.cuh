@@ -68,7 +68,7 @@ using CtaBarrier = cutlass::arch::ClusterBarrier;
 
 template <typename Traits, typename ElementO, typename TmaQ, typename TmaK,
           typename TmaV, typename TmaO, typename TmaSFQ, typename TmaSFK,
-          typename TmaSFVt, typename TmaDS>
+          typename TmaSFVt, typename TmaDS, int kHasAttnBias = 0>
 __global__ void __launch_bounds__(Traits::kNumThreads, 1)
     split_d_fwd_cute_fp4_sm120(
         CUTLASS_GRID_CONSTANT TmaQ const tma_q,
@@ -80,15 +80,21 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
         CUTLASS_GRID_CONSTANT TmaSFVt const tma_sfvt,
         CUTLASS_GRID_CONSTANT TmaDS const tma_ds, ElementO* __restrict__ O,
         float* __restrict__ softmax_lse, const float* __restrict__ km,
-        const float* __restrict__ qm, int Nq, int Nkv, int Nq_pad, int Nkv_pad,
-        int Nh, int Nh_kv, float scale, int Tc, int causal, int total_q_rows,
-        int Nb, int q_start_row = 0, bool nhd_out = false) {
+        const float* __restrict__ qm, const float* __restrict__ vm, int Nq,
+        int Nkv, int Nq_pad, int Nkv_pad, int Nh, int Nh_kv, float scale,
+        int Tc, int causal, int total_q_rows, int Nb, int q_start_row = 0,
+        bool nhd_out = false, const void* __restrict__ attn_bias = nullptr,
+        int attn_bias_dtype = 0, long long attn_bias_stride_b = 0,
+        long long attn_bias_stride_h = 0, long long attn_bias_stride_m = 0,
+        long long attn_bias_stride_n = 0) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
   using namespace cute;
   using cute::tma_store_arrive;
   using cute::tma_store_wait;
   using Element = typename Traits::Element;
   using ElementSF = typename Traits::ElementSF;
+  using ElementPV = typename Traits::ElementPV;
+  using ElementSFV = typename Traits::ElementSFV;
   using SmemLayoutQ = typename Traits::SmemLayoutQ;
   using SmemLayoutK = typename Traits::SmemLayoutK;
   using SmemLayoutVt = typename Traits::SmemLayoutVt;
@@ -101,8 +107,12 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
   using TiledMmaPV = typename Traits::TiledMmaPV;
   using SmemCopyAtomQ = typename Traits::SmemCopyAtomQ;
   using SmemCopyAtomKV = typename Traits::SmemCopyAtomKV;
+  using SmemCopyAtomV = typename Traits::SmemCopyAtomV;
   using SmemCopyAtomSF = typename Traits::SmemCopyAtomSF;
+  using SmemCopyAtomSFV = typename Traits::SmemCopyAtomSFV;
   using BlkScaledConfig = typename Traits::BlkScaledConfig;
+  using BlkScaledConfigV = typename Traits::BlkScaledConfigV;
+  constexpr bool kPvMxfp8 = Traits::kPvMxfp8;
 
   constexpr int kBr = Traits::kBr;
   constexpr int kBc = Traits::kBc;
@@ -176,7 +186,7 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
       make_shape(Nq_pad, Int<kHeadDim>{}, Nh, Nb));
   auto layout_SFK = BlkScaledConfig::tile_atom_to_shape_SFQKV(
       make_shape(Nkv_pad, Int<kHeadDim>{}, Nh_kv, Nb));
-  auto layout_SFVt = BlkScaledConfig::tile_atom_to_shape_SFVt(
+  auto layout_SFVt = BlkScaledConfigV::tile_atom_to_shape_SFVt(
       make_shape(Int<kHeadDim>{}, Nkv_pad, Nh_kv, Nb));
   auto layout_DS = tile_to_shape(typename Traits::SmemLayoutAtomDS{},
                                  make_shape(Nq_pad, Nkv_pad, Nh, Nb),
@@ -201,9 +211,9 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
   auto sSFK =
       make_tensor(make_smem_ptr<ElementSF>(shm + kOffSFK), SmemLayoutSFK{});
   auto sDS = make_tensor(make_smem_ptr<float>(shm + kOffDS), SmemLayoutDS{});
-  auto sV = make_tensor(make_smem_ptr<Element>(shm + kOffV), SmemLayoutVt{});
+  auto sV = make_tensor(make_smem_ptr<ElementPV>(shm + kOffV), SmemLayoutVt{});
   auto sSFVt =
-      make_tensor(make_smem_ptr<ElementSF>(shm + kOffSFVt), SmemLayoutSFVt{});
+      make_tensor(make_smem_ptr<ElementSFV>(shm + kOffSFVt), SmemLayoutSFVt{});
 
   auto tQsQ = q_slice.partition_D(sQ);
   auto tQsSFQ = sfq_slice.partition_D(sSFQ);
@@ -275,11 +285,11 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
                             Shape<Int<kVDChunk>, Int<kBc>>{},
                             make_coord(v_chunk, kv_tile));
     auto sV_st = make_tensor(
-        make_smem_ptr<Element>(shm + kOffV + stage * Traits::kVBytesStage),
+        make_smem_ptr<ElementPV>(shm + kOffV + stage * Traits::kVBytesStage),
         typename Traits::SmemLayoutVtStage{});
     auto sSFVt_st =
-        make_tensor(make_smem_ptr<ElementSF>(shm + kOffSFVt +
-                                             stage * Traits::kSFVtBytesStage),
+        make_tensor(make_smem_ptr<ElementSFV>(shm + kOffSFVt +
+                                              stage * Traits::kSFVtBytesStage),
                     typename Traits::SmemLayoutSFVtStage{});
     cutlass::arch::fence_view_async_shared();
     TmaBarrier::arrive_and_expect_tx(&v_full[stage], Traits::kTxBytesV);
@@ -311,8 +321,8 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
   Tensor tSrSFQ = partition_fragment_SFA(sSFQ, thread_mma_qk);
   Tensor tSrSFK = partition_fragment_SFB(sSFK(_, _, Int<0>{}), thread_mma_qk);
   Tensor tOrSFVt = partition_fragment_SFB(sSFVt(_, _, Int<0>{}), thread_mma_pv);
-  Tensor tOrP = make_tensor_like<Element>(typename Traits::LayoutP{});
-  Tensor tOrSFP = make_tensor<ElementSF>(typename Traits::LayoutSFP{});
+  Tensor tOrP = make_tensor_like<ElementPV>(typename Traits::LayoutP{});
+  Tensor tOrSFP = make_tensor<ElementSFV>(typename Traits::LayoutSFP{});
 
   auto smem_tiled_copy_Q = make_tiled_copy_A(SmemCopyAtomQ{}, tiled_mma_qk);
   auto smem_thr_copy_Q = smem_tiled_copy_Q.get_thread_slice(tid);
@@ -324,7 +334,7 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
   Tensor tSsK =
       smem_thr_copy_K.partition_S(as_position_independent_swizzle_tensor(sK));
 
-  auto smem_tiled_copy_V = make_tiled_copy_B(SmemCopyAtomKV{}, tiled_mma_pv);
+  auto smem_tiled_copy_V = make_tiled_copy_B(SmemCopyAtomV{}, tiled_mma_pv);
   auto smem_thr_copy_V = smem_tiled_copy_V.get_thread_slice(tid);
   Tensor tOsVt =
       smem_thr_copy_V.partition_S(as_position_independent_swizzle_tensor(sV));
@@ -346,7 +356,7 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
       as_position_independent_swizzle_tensor(sSFK));
 
   auto smem_tiled_copy_SFV =
-      make_tiled_copy_impl(SmemCopyAtomSF{}, get_layoutSFB_TV(tiled_mma_pv),
+      make_tiled_copy_impl(SmemCopyAtomSFV{}, get_layoutSFB_TV(tiled_mma_pv),
                            make_shape(size<1>(tile_shape(tiled_mma_pv)),
                                       size<2>(tile_shape(tiled_mma_pv))));
   auto smem_thr_copy_SFV = smem_tiled_copy_SFV.get_thread_slice(tid);
@@ -359,8 +369,20 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
   Tensor tSrS = partition_fragment_C(tiled_mma_qk, Shape<Int<kBr>, Int<kBc>>{});
   Tensor tSrS_conversion_view =
       make_tensor(tSrS.data(), convert_to_conversion_layout(tSrS.layout()));
-  Tensor AbsMaxP = make_tensor_like<float>(make_layout(shape(group<1, 4>(
-      flatten(tSrS_conversion_view.layout()(make_coord(_0{}, _), _, _))))));
+  Tensor tSrS_reduction_view =
+      make_tensor(tSrS.data(), convert_to_reduction_layout(tSrS.layout()));
+  // Per-token-group absmax of the P-domain scores; softmax fills it, the
+  // packer turns it into the SFP operand (persist_d verbatim): 16-token
+  // groups from the conversion view (NVFP4) or 32-token groups = one
+  // mma-k32 block from the reduction view (MXFP8).
+  auto AbsMaxP = [&]() {
+    if constexpr (kPvMxfp8)
+      return make_tensor_like<float>(make_layout(make_shape(
+          size<0>(tSrS_reduction_view), size<1, 1>(tSrS_reduction_view))));
+    else
+      return make_tensor_like<float>(make_layout(shape(group<1, 4>(
+          flatten(tSrS_conversion_view.layout()(make_coord(_0{}, _), _, _))))));
+  }();
 
   auto cS = make_identity_tensor(Shape<Int<kBr>, Int<kBc>>{});
   auto tScS = thread_mma_qk.partition_C(cS);
@@ -378,7 +400,9 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
 
   constexpr int kSoftmaxRows = 2 * (2 * kBr / kNumThreads);
   static_assert(kSoftmaxRows == kSRows, "softmax/O row mismatch");
-  SoftmaxFused<kSoftmaxRows> softmax_fused;
+  std::conditional_t<kPvMxfp8, SoftmaxFusedMxfp8<kSoftmaxRows>,
+                     SoftmaxFused<kSoftmaxRows>>
+      softmax_fused;
   const float scale_orig = scale;
   const float softmax_scale_log2 = scale * FFPA_M_LOG2E;
 
@@ -563,6 +587,17 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
       {
         auto scores = make_tensor(tSrS.data(),
                                   convert_to_reduction_layout(tSrS.layout()));
+        // Additive attn bias in the dequantized score domain; the fused
+        // softmax below applies softmax_scale_log2, so bias/scale_orig
+        // lands as +bias in softmax-input units. The -INFINITY assignments
+        // in the masking below simply override it.
+        if constexpr (kHasAttnBias) {
+          ffpa_fp4::apply_attn_bias_fp4_rowcol<
+              decltype(scores), decltype(tScS_rc), kSRows, kSCols>(
+              scores, tScS_rc, attn_bias, attn_bias_dtype, attn_bias_stride_b,
+              attn_bias_stride_h, attn_bias_stride_m, attn_bias_stride_n, Nb_id,
+              Nh_id, q_start_row + Br_base, kv_tile, kBc, 1.0f / scale_orig);
+        }
         const int kv_valid = Nkv - kv_tile * kBc;
         const bool tail_tile = kv_valid < kBc;
         const bool causal_tile = kv_tile >= mask_start_tile;
@@ -622,10 +657,16 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
 
         auto tCrO = make_tensor(make_rmem_ptr(&o_acc_storage[v_chunk][0]),
                                 OFragLayout{});
-        gemm_rs_fp4(tCrO, tOrP, tOrSFP, tOrVt, tOrSFVt, tOsVt, tOsSFVt,
-                    tiled_mma_pv, smem_tiled_copy_V, smem_thr_copy_V,
-                    smem_tiled_copy_SFV, smem_thr_copy_SFV, AbsMaxP,
-                    tSrS_conversion_view, v_empty, v_stg);
+        if constexpr (kPvMxfp8)
+          gemm_rs_mxfp8(tCrO, tOrP, tOrSFP, tOrVt, tOrSFVt, tOsVt, tOsSFVt,
+                        tiled_mma_pv, smem_tiled_copy_V, smem_thr_copy_V,
+                        smem_tiled_copy_SFV, smem_thr_copy_SFV, AbsMaxP,
+                        tSrS_reduction_view, v_empty, v_stg, tid & 31);
+        else
+          gemm_rs_fp4(tCrO, tOrP, tOrSFP, tOrVt, tOrSFVt, tOsVt, tOsSFVt,
+                      tiled_mma_pv, smem_tiled_copy_V, smem_thr_copy_V,
+                      smem_tiled_copy_SFV, smem_thr_copy_SFV, AbsMaxP,
+                      tSrS_conversion_view, v_empty, v_stg);
 
         if (tid == 0) {
           const int next = kv_tile * kDChunksV + v_chunk + kStagesPV;
@@ -650,6 +691,26 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
         auto tCrO =
             make_tensor(make_rmem_ptr(&o_acc_storage[v][0]), OFragLayout{});
         softmax_fused.scale_o(tCrO);
+      }
+    }
+
+    // smooth_v epilogue: add the per-(b, hkv) V column mean back (the
+    // persist_d derivation; vm factors out of the column sum and cancels
+    // against the row normalization above). Per v_chunk the [kBr,
+    // kVDChunk] identity partition maps each C-fragment slot onto its d
+    // column within the chunk.
+    if (vm != nullptr) {
+      const float* vm_bh = vm + static_cast<long>(kv_bh) * kHeadDim;
+      auto cO_vm = make_identity_tensor(Shape<Int<kBr>, Int<kVDChunk>>{});
+      auto tOcO_vm = thread_mma_pv.partition_C(cO_vm);
+#pragma unroll
+      for (int v_chunk = 0; v_chunk < kDChunksV; ++v_chunk) {
+        auto tCrO = make_tensor(make_rmem_ptr(&o_acc_storage[v_chunk][0]),
+                                OFragLayout{});
+        const float* vm_c = vm_bh + v_chunk * kVDChunk;
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < size(tCrO); ++i)
+          tCrO(i) += vm_c[cute::get<1>(tOcO_vm(i))];
       }
     }
 
@@ -767,10 +828,18 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
         const int lse_base = Nb_id * Nh * Nq + Nh_id * Nq;
         CUTLASS_PRAGMA_UNROLL
         for (int row = 0; row < kSRows; ++row) {
-          float lse = (softmax_fused.row_max[row] * softmax_scale_log2 +
-                       log2f(softmax_fused.row_sum[row]) +
-                       SoftmaxFused<kSoftmaxRows>::fp8_scalexfp4_scale_log2) *
-                      FFPA_M_LN2;
+          // row_sum lives in a scaled P domain: lse = scale*m +
+          // ln(row_sum / domain_scale). NVFP4: P*2688 (fp8_scalexfp4_
+          // scale_log2 = log2(1/2688)); MXFP8: P*448 (row_sum = sum of
+          // q*SF with q in the e4m3 domain, see SoftmaxFusedMxfp8), so
+          // the correction is log2(1/448) = -e4m3_full_log2.
+          float lse =
+              (softmax_fused.row_max[row] * softmax_scale_log2 +
+               log2f(softmax_fused.row_sum[row]) +
+               (kPvMxfp8
+                    ? -SoftmaxFusedMxfp8<kSoftmaxRows>::e4m3_full_log2
+                    : SoftmaxFused<kSoftmaxRows>::fp8_scalexfp4_scale_log2)) *
+              FFPA_M_LN2;
           if (smooth_lse)
             lse += scale_orig * qkm[row];
           const int global_row =
