@@ -56,8 +56,8 @@
 | FC-9 | CUDA backward (**暂不实施，仅保留设计稿**) | F3 | ⬜ 待开始 | — |
 | FC-10 | sm90/sm100 量化覆盖 (**暂不实施，仅保留设计稿**) | F3 | ⬜ 待开始 | — |
 | FC-11 | native 路径 dropout 精度修复（bug，高优） | F3 | ✅ 已完成（ffpa-attn 542f774/e1fe363，根因=torch ref uint32 bug） | — |
-| PC-0 | attn mask 场景性能优化（bias tile IO 重构） | P | ⬜ 待开始 0/3（**P 轨最高优先**） | FC-4 注入点 |
-| PC-0-0 | ↳ cute/cute_tma 场景（fp16 cute 家族） | P | ⬜ 待开始 | — |
+| PC-0 | attn mask 场景性能优化（bias tile IO 重构） | P | 🚧 1/3（**P 轨最高优先**） | FC-4 注入点 |
+| PC-0-0 | ↳ cute/cute_tma 场景（fp16 cute 家族） | P | ✅ 完成（b4a811e：bench CLI D=128 gap 1.12/89%、D=768 0.99/101% 双达标；D=320 1.52x 未达，NCU 跟进） | — |
 | PC-0-1 | ↳ fp8/fp4 场景（量化六族，原 PC-0 主体） | P | ⬜ 待开始 | FC-4 注入点；PC-0-0 热身 |
 | PC-0-2 | ↳ native/native_tma 场景 | P | ⬜ 待开始 | — |
 | PC-1 | Mega Quantize Kernel（aux 链大融合） | P | ⬜ 待开始 | — |
@@ -95,7 +95,7 @@
 **轨道 P（性能优化）**
 
 - [ ] PC-0：attn mask 场景性能优化 —— bias tile IO 重构（P 轨最高优先，2026-08-31 立项）
-  - [ ] PC-0-0：cute/cute_tma 场景（fp16 cute 家族 `apply_attn_bias_rowcol` smem tile 化）
+  - [x] PC-0-0：cute/cute_tma 场景（fp16 cute 家族 `apply_attn_bias_rowcol` smem tile 化）—— 2026-08-31 完成（b4a811e）：TMA tile 预取 + persist_d Q-s2r 寄存器持久化腾出 Q smem 给 bias tile（fp8 kPersistQs2r 模式移植）+ split_d/m4n2 单缓冲防自锁 + dense 平面行坐标修复（元素 stride 误作行单位，h≥1 bias 被 TMA OOB zero-fill）；99 parity 用例 + bench CLI 验收：D=128 gap 1.12x（TFLOPS 89%）、D=768 gap 0.99x（101%）、D=320 1.52x（66%，NCU 跟进）；dense 全量 mask 下 D=128 增量已达 HBM 带宽极限（~2.2TB/s 等效）
   - [ ] PC-0-1：fp8/fp4 场景（量化六族 kernel，原 PC-0 主体设计）
   - [ ] PC-0-2：native/native_tma 场景（标量 loader 路径，设计稿待补）
 - [ ] PC-1：Mega Quantize Kernel —— P 轨基建
