@@ -56,10 +56,11 @@
 | FC-9 | CUDA backward (**暂不实施，仅保留设计稿**) | F3 | ⬜ 待开始 | — |
 | FC-10 | sm90/sm100 量化覆盖 (**暂不实施，仅保留设计稿**) | F3 | ⬜ 待开始 | — |
 | FC-11 | native 路径 dropout 精度修复（bug，高优） | F3 | ✅ 已完成（ffpa-attn 542f774/e1fe363，根因=torch ref uint32 bug） | — |
-| PC-0 | attn mask 场景性能优化（bias tile IO 重构） | P | 🚧 1/3（**P 轨最高优先**） | FC-4 注入点 |
-| PC-0-0 | ↳ cute/cute_tma 场景（fp16 cute 家族） | P | ✅ 完成（b4a811e：bench CLI D=128 gap 1.12/89%、D=768 0.99/101% 双达标；D=320 1.52x 未达，NCU 跟进） | — |
+| PC-0 | attn mask 场景性能优化（bias tile IO 重构） | P | 🚧 1/4（**P 轨最高优先**） | FC-4 注入点 |
+| PC-0-0 | ↳ cute/cute_tma 场景（fp16 cute 家族） | P | ✅ 完成（b4a811e + 7ffe765/1e4d9b6 迭代：bench CLI D=128 gap 1.12/89%、D=768 0.99/101% 双达标；D=320 1.44/70% 结构极限未达 → **PC-0-3 专项**） | — |
 | PC-0-1 | ↳ fp8/fp4 场景（量化六族，原 PC-0 主体） | P | ⬜ 待开始 | FC-4 注入点；PC-0-0 热身 |
 | PC-0-2 | ↳ native/native_tma 场景 | P | ⬜ 待开始 | — |
+| PC-0-3 | ↳ D=320 split_d 注入开销专项（PC-0-0 遗留） | P | ⬜ 待开始（NCU 分析已备，见完成清单） | PC-0-0 |
 | PC-1 | Mega Quantize Kernel（aux 链大融合） | P | ⬜ 待开始 | — |
 | PC-2 | 增量融合（Mega Kernel 步进） | P | ⬜ 待开始 | 被 PC-1 收编 |
 | PC-3 | N-crossover 量化配置自适应 | P | ⬜ 待开始 | — |
@@ -95,9 +96,14 @@
 **轨道 P（性能优化）**
 
 - [ ] PC-0：attn mask 场景性能优化 —— bias tile IO 重构（P 轨最高优先，2026-08-31 立项）
-  - [x] PC-0-0：cute/cute_tma 场景（fp16 cute 家族 `apply_attn_bias_rowcol` smem tile 化）—— 2026-08-31 完成（b4a811e）：TMA tile 预取 + persist_d Q-s2r 寄存器持久化腾出 Q smem 给 bias tile（fp8 kPersistQs2r 模式移植）+ split_d/m4n2 单缓冲防自锁 + dense 平面行坐标修复（元素 stride 误作行单位，h≥1 bias 被 TMA OOB zero-fill）；99 parity 用例 + bench CLI 验收：D=128 gap 1.12x（TFLOPS 89%）、D=768 gap 0.99x（101%）、D=320 1.52x（66%，NCU 跟进）；dense 全量 mask 下 D=128 增量已达 HBM 带宽极限（~2.2TB/s 等效）
+  - [x] PC-0-0：cute/cute_tma 场景（fp16 cute 家族 `apply_attn_bias_rowcol` smem tile 化）—— 2026-08-31 完成（b4a811e）：TMA tile 预取 + persist_d Q-s2r 寄存器持久化腾出 Q smem 给 bias tile（fp8 kPersistQs2r 模式移植）+ split_d/m4n2 单缓冲防自锁 + dense 平面行坐标修复（元素 stride 误作行单位，h≥1 bias 被 TMA OOB zero-fill）；99 parity 用例 + bench CLI 验收：D=128 gap 1.12x（TFLOPS 89%）、D=768 gap 0.99x（101%）双达标；dense 全量 mask 下 D=128 增量已达 HBM 带宽极限（~2.2TB/s 等效）。后续迭代 7ffe765（rowvec 双缓冲）+ 1e4d9b6（mode 3 全驻留）：D=320 gap 2.21→1.44（TFLOPS 66%→70%）仍未达 1.2x，属 split_d 结构极限 → 移交 PC-0-3 专项
   - [ ] PC-0-1：fp8/fp4 场景（量化六族 kernel，原 PC-0 主体设计）
   - [ ] PC-0-2：native/native_tma 场景（标量 loader 路径，设计稿待补）
+  - [ ] PC-0-3：D=320 split_d attn-mask 注入开销专项（PC-0-0 遗留，目标 gap 1.44→≤1.2x）
+    - 现状（2026-08-31，N=16384 B1 H32，self 57.4ms/191T）：attn-mask 83.5ms/132T，gap 1.44、TFLOPS 70%；迭代路径 mode0 gmem 2.21 → 单缓冲 tile 1.51 → rowvec 双缓冲 1.48 → mode 3 全驻留 1.44；dense 全量 1.59
+    - NCU 定性（三轮）：SM 吞吐 71.4%→47.6%（memory 42.8%/occupancy 16.67% 不变）；bias 同步开销已消除（mode 3 后 short_scoreboard 1.47→1.21、bias barrier 全无）；sleeping 1.7 = tid==0 producer 在 qk/v empty-wait 空转（注入拉长 consumer 每 tile → K/V 流水变浅）。**剩余 gap 本质 = 注入计算本身进入 critical path**（1 CTA/SM × 8 warps，无并行 warp 掩盖）
+    - 剩余杠杆（按预估收益排序）：① 注入 smem 读向量化——m16n8k16 acc 的 col 对 (c,c+1) 连续（rowcol 转换 `(2,MMA_N)` 内层），`apply_attn_bias_rowcol_smem` 可成对 4B/8B 读替代逐 u16 标量读，c0 恒偶 4B 对齐成立（预估 5-10%）；② 注入与 online_softmax 行扫描融合（省一轮 scores 寄存器往返）；③ 提高 occupancy 不可行（smem 96KB 已 1 CTA/SM 上限）
+    - 相关文件：`csrc/cuffpa/cute/attn_bias.cuh`（注入函数）、`sm_120/split_d.cuh`（主循环）、`.tmp/pc0-bias-tile/`（ab2_bench/ncu_probe 脚本与三轮 ncu-rep）
 - [ ] PC-1：Mega Quantize Kernel —— P 轨基建
 - [ ] PC-2：增量融合（Mega Kernel 步进，被 PC-1 收编）
 - [ ] PC-3：N-crossover 量化配置自适应
