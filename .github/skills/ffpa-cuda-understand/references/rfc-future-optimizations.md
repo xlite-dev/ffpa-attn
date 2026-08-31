@@ -671,7 +671,9 @@ native 家族覆盖非整 D（补齐与 CuTe 家族的对齐）。
   - `--cuda-impl tma --D 120/328` 通过（TMA OOB 零填充路径，D=328 self-attn 2.14x）；
   - 回归：`test_ffpa_fwd.py` 503 passed（新增 `test_native_head_dim_pad_*`
     40 项全过；`test_ffpa_fp8.py` 85 / `test_ffpa_fp4.py` 61 全过）。
-    `triton_small_d_default_falls_back_to_sdpa` 1 项为 HEAD 基线存量失败（stash 验证），与本项无关。
+    当时的 `triton_small_d_default_falls_back_to_sdpa` 1 项失败后经查为
+    shell env 污染（残留 `FFPA_TRITON_ALLOW_SMALL_D=1`）+ 测试未自封闭，
+    非代码缺陷；已加 `monkeypatch.delenv` 修复（06e23fe），全量 504 passed 0 failed。
 
 ---
 
