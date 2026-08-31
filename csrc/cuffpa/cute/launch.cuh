@@ -424,6 +424,15 @@ void launch_cute_fwd_split_d_sm120(torch::Tensor Q, torch::Tensor K,
   if (kBaseSmemBytes + bias_plan.tile_bytes(kBr, kBc, bias_stages) >
       kSmemBudgetBytes)
     bias_plan.mode = 0;
+  // Row-broadcast resident: the whole [1,Nkv] vector fits past the QK/V
+  // buffers (16B-aligned) — one plain load before the kv loop removes every
+  // per-tile bias TMA/barrier from the hot path (mode 3).
+  if (bias_plan.mode == 2) {
+    const long long resident =
+        ((kBaseSmemBytes + 15) & ~15) + (long long)Nkv * bias_plan.elem_size;
+    if (resident <= kSmemBudgetBytes)
+      bias_plan.mode = 3;
+  }
   const auto make_tma_bias = [&](auto mode_c, auto b4_c) {
     constexpr int kBiasModeT = decltype(mode_c)::value;
     constexpr int kBias4B = decltype(b4_c)::value;
@@ -467,7 +476,10 @@ void launch_cute_fwd_split_d_sm120(torch::Tensor Q, torch::Tensor K,
   auto tma_bias_r32 = make_tma_bias(std::integral_constant<int, 2>{},
                                     std::integral_constant<int, 1>{});
   const int kSmemBytes =
-      kBaseSmemBytes + (int)bias_plan.tile_bytes(kBr, kBc, bias_stages);
+      ((kBaseSmemBytes + 15) & ~15) +
+      (int)((bias_plan.mode == 3)
+                ? (long long)Nkv * bias_plan.elem_size
+                : bias_plan.tile_bytes(kBr, kBc, bias_stages));
 
   float* softmax_lse_ptr =
       softmax_lse.numel() > 0 ? softmax_lse.data_ptr<float>() : nullptr;
@@ -539,6 +551,14 @@ void launch_cute_fwd_split_d_sm120(torch::Tensor Q, torch::Tensor K,
                   std::integral_constant<int, 1>{});
       else
         launch_bd(tma_bias_r16, std::integral_constant<int, 2>{},
+                  std::integral_constant<int, 0>{});
+    } else if (bias_plan.mode == 3) {
+      // resident row-vector: no TMA issue in-kernel, descriptor unused.
+      if (bias_f32)
+        launch_bd(tma_bias_r32, std::integral_constant<int, 3>{},
+                  std::integral_constant<int, 1>{});
+      else
+        launch_bd(tma_bias_r16, std::integral_constant<int, 3>{},
                   std::integral_constant<int, 0>{});
     } else {
       launch_bd(tma_bias_r16, std::integral_constant<int, 0>{},
@@ -780,6 +800,15 @@ void launch_cute_fwd_split_d_m4n2_sm120(torch::Tensor Q, torch::Tensor K,
   if (kBaseSmemBytes + bias_plan.tile_bytes(kBr, kBc, bias_stages) >
       kSmemBudgetBytes)
     bias_plan.mode = 0;
+  // Row-broadcast resident: the whole [1,Nkv] vector fits past the QK/V
+  // buffers (16B-aligned) — one plain load before the kv loop removes every
+  // per-tile bias TMA/barrier from the hot path (mode 3).
+  if (bias_plan.mode == 2) {
+    const long long resident =
+        ((kBaseSmemBytes + 15) & ~15) + (long long)Nkv * bias_plan.elem_size;
+    if (resident <= kSmemBudgetBytes)
+      bias_plan.mode = 3;
+  }
   const auto make_tma_bias = [&](auto mode_c, auto b4_c) {
     constexpr int kBiasModeT = decltype(mode_c)::value;
     constexpr int kBias4B = decltype(b4_c)::value;
@@ -823,7 +852,10 @@ void launch_cute_fwd_split_d_m4n2_sm120(torch::Tensor Q, torch::Tensor K,
   auto tma_bias_r32 = make_tma_bias(std::integral_constant<int, 2>{},
                                     std::integral_constant<int, 1>{});
   const int kSmemBytes =
-      kBaseSmemBytes + (int)bias_plan.tile_bytes(kBr, kBc, bias_stages);
+      ((kBaseSmemBytes + 15) & ~15) +
+      (int)((bias_plan.mode == 3)
+                ? (long long)Nkv * bias_plan.elem_size
+                : bias_plan.tile_bytes(kBr, kBc, bias_stages));
 
   float* softmax_lse_ptr =
       softmax_lse.numel() > 0 ? softmax_lse.data_ptr<float>() : nullptr;
@@ -897,6 +929,14 @@ void launch_cute_fwd_split_d_m4n2_sm120(torch::Tensor Q, torch::Tensor K,
                   std::integral_constant<int, 1>{});
       else
         launch_bd(tma_bias_r16, std::integral_constant<int, 2>{},
+                  std::integral_constant<int, 0>{});
+    } else if (bias_plan.mode == 3) {
+      // resident row-vector: no TMA issue in-kernel, descriptor unused.
+      if (bias_f32)
+        launch_bd(tma_bias_r32, std::integral_constant<int, 3>{},
+                  std::integral_constant<int, 1>{});
+      else
+        launch_bd(tma_bias_r16, std::integral_constant<int, 3>{},
                   std::integral_constant<int, 0>{});
     } else {
       launch_bd(tma_bias_r16, std::integral_constant<int, 0>{},

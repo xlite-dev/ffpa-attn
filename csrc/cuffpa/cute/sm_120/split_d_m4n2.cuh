@@ -156,8 +156,11 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
   constexpr int kBiasStages = (kBiasMode == 2) ? 2 : 1;
   __shared__ uint64_t bias_full[kBiasStages];
   __shared__ uint64_t bias_empty[kBiasStages];
+  // 16B-aligned past the QK/V buffers (mode 3's plain vector stores); the
+  // launcher sizes the dynamic smem with the same rounding.
   uint16_t* bias_base = reinterpret_cast<uint16_t*>(
-      reinterpret_cast<char*>(shm) + Traits::kSmemElems * sizeof(Element));
+      reinterpret_cast<char*>(shm) +
+      ((Traits::kSmemElems * sizeof(Element) + 15) & ~15));
 
   if (tid == 0) {
     for (int s = 0; s < kStagesQK; ++s) {
@@ -404,8 +407,21 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
     }
   }
 
-  // Bias tile(0) prefetch (depth-1 ahead, like the QK pipeline).
-  if constexpr (kHasAttnBias && kBiasMode != 0) {
+  // Bias tile(0) prefetch (depth-1 ahead, like the QK pipeline). Mode 3
+  // instead loads the resident [1,Nkv] row-broadcast vector once (plain
+  // vector loads, host-guaranteed 16B alignment): no TMA and no per-tile
+  // bias barrier anywhere in the kv loop.
+  if constexpr (kHasAttnBias && kBiasMode == 3) {
+    const uint16_t* src = reinterpret_cast<const uint16_t*>(attn_bias);
+    const int n_u16 = (int)Nkv * ((attn_bias_dtype == 3) ? 2 : 1);
+    const int vec_end = n_u16 & ~7;
+    for (int i = tid * 8; i < vec_end; i += kNumThreads * 8)
+      *reinterpret_cast<uint4*>(bias_base + i) =
+          *reinterpret_cast<const uint4*>(src + i);
+    for (int i = vec_end + tid; i < n_u16; i += kNumThreads)
+      bias_base[i] = src[i];
+    __syncthreads();
+  } else if constexpr (kHasAttnBias && kBiasMode != 0) {
     if (tid == 0 && Tc_eff > 0)
       issue_bias_tma(0);
   }
@@ -515,11 +531,17 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
       if constexpr (kHasAttnBias && kBiasMode != 0) {
         const int b_stg = kv_tile % kBiasStages;
         const int b_phase = (kv_tile / kBiasStages) & 1;
-        TmaBarrier::wait(&bias_full[b_stg], b_phase);
-        cutlass::arch::fence_view_async_shared();
+        if constexpr (kBiasMode != 3) {
+          TmaBarrier::wait(&bias_full[b_stg], b_phase);
+          cutlass::arch::fence_view_async_shared();
+        }
         const int b_slot_u16 = ((kBiasMode == 1) ? kBr * kBc : kBc) *
                                ((attn_bias_dtype == 3) ? 2 : 1);
-        const uint16_t* b_slot = bias_base + b_stg * b_slot_u16;
+        // mode 3: the resident vector's tile-t segment sits at t*kBc.
+        const uint16_t* b_slot =
+            bias_base + (kBiasMode == 3 ? (long long)kv_tile * kBc *
+                                              ((attn_bias_dtype == 3) ? 2 : 1)
+                                        : (long long)b_stg * b_slot_u16);
         constexpr int s_row = (kBiasMode == 1) ? kBc : 0;
         if (attn_bias_dtype == 3)
           ffpa_cute::apply_attn_bias_rowcol_smem<
@@ -538,13 +560,15 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
               kSCols>(scores, tScS_rc,
                       reinterpret_cast<const cutlass::half_t*>(b_slot), s_row,
                       1, inv_scale);
-        CtaBarrier::arrive(&bias_empty[b_stg]);
-        // 1-stage slot: reissue (t+1) only after the injection of t has
-        // released the buffer (tid 0 joins the injection; waiting in the
-        // prefetch block would self-deadlock). The TMA overlaps this tile's
-        // softmax + PV.
-        if (kBiasStages == 1 && kv_tile + 1 < Tc_eff && tid == 0)
-          issue_bias_tma(kv_tile + 1);
+        if constexpr (kBiasMode != 3) {
+          CtaBarrier::arrive(&bias_empty[b_stg]);
+          // 1-stage slot: reissue (t+1) only after the injection of t has
+          // released the buffer (tid 0 joins the injection; waiting in the
+          // prefetch block would self-deadlock). The TMA overlaps this tile's
+          // softmax + PV.
+          if (kBiasStages == 1 && kv_tile + 1 < Tc_eff && tid == 0)
+            issue_bias_tma(kv_tile + 1);
+        }
       } else if constexpr (kHasAttnBias) {
         ffpa_cute::apply_attn_bias_rowcol<decltype(scores), decltype(tScS_rc),
                                           kSRows, kSCols>(
