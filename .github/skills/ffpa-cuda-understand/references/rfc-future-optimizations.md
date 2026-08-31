@@ -60,7 +60,7 @@
 | PC-0-0 | ↳ cute/cute_tma 场景（fp16 cute 家族） | P | ✅ 完成（b4a811e + 7ffe765/1e4d9b6 迭代：bench CLI D=128 gap 1.12/89%、D=768 0.99/101% 双达标；D=320 1.44/70% 结构极限未达 → **PC-0-3 专项**） | — |
 | PC-0-1 | ↳ fp8/fp4 场景（量化六族，原 PC-0 主体） | P | ⬜ 待开始 | FC-4 注入点；PC-0-0 热身 |
 | PC-0-2 | ↳ native/native_tma 场景 | P | ⬜ 待开始 | — |
-| PC-0-3 | ↳ D=320 split_d 注入开销专项（PC-0-0 遗留） | P | ⬜ 待开始（NCU 分析已备，见完成清单） | PC-0-0 |
+| PC-0-3 | ↳ D=320 split_d 注入开销专项（PC-0-0 遗留） | P | ⬜ 待开始（杠杆①向量化已证伪 +2.7%，见完成清单） | PC-0-0 |
 | PC-1 | Mega Quantize Kernel（aux 链大融合） | P | ⬜ 待开始 | — |
 | PC-2 | 增量融合（Mega Kernel 步进） | P | ⬜ 待开始 | 被 PC-1 收编 |
 | PC-3 | N-crossover 量化配置自适应 | P | ⬜ 待开始 | — |
@@ -102,7 +102,7 @@
   - [ ] PC-0-3：D=320 split_d attn-mask 注入开销专项（PC-0-0 遗留，目标 gap 1.44→≤1.2x）
     - 现状（2026-08-31，N=16384 B1 H32，self 57.4ms/191T）：attn-mask 83.5ms/132T，gap 1.44、TFLOPS 70%；迭代路径 mode0 gmem 2.21 → 单缓冲 tile 1.51 → rowvec 双缓冲 1.48 → mode 3 全驻留 1.44；dense 全量 1.59
     - NCU 定性（三轮）：SM 吞吐 71.4%→47.6%（memory 42.8%/occupancy 16.67% 不变）；bias 同步开销已消除（mode 3 后 short_scoreboard 1.47→1.21、bias barrier 全无）；sleeping 1.7 = tid==0 producer 在 qk/v empty-wait 空转（注入拉长 consumer 每 tile → K/V 流水变浅）。**剩余 gap 本质 = 注入计算本身进入 critical path**（1 CTA/SM × 8 warps，无并行 warp 掩盖）
-    - 剩余杠杆（按预估收益排序）：① 注入 smem 读向量化——m16n8k16 acc 的 col 对 (c,c+1) 连续（rowcol 转换 `(2,MMA_N)` 内层），`apply_attn_bias_rowcol_smem` 可成对 4B/8B 读替代逐 u16 标量读，c0 恒偶 4B 对齐成立（预估 5-10%）；② 注入与 online_softmax 行扫描融合（省一轮 scores 寄存器往返）；③ 提高 occupancy 不可行（smem 96KB 已 1 CTA/SM 上限）
+    - 剩余杠杆（按预估收益排序）：~~① 注入 smem 读向量化~~ **已证伪（2026-08-31 实测 + NCU）**：m16n8k16 col 对 (c,c+1) 成对 4B/8B 读（对齐前提全部成立，路径确认编译生效：LSU 指令 −1.8% ≈ bias LDS 减半预期）反而使 kernel **慢 2.7%**（NCU 85.28 vs 83.05ms，bench 86.5 vs 83.5，gap 1.44→1.48）。机制：注入开销是 latency 放大（critical path 拉长→producer 空转）而非指令数瓶颈，省指令无感；f16 pair 读的 unpack（LDS.32→SHF→F2F→FADD）比标量双并行链（LDS.U16→F2F→FADD）更深，16.7% occupancy 无掩盖 → long_scoreboard +0.42。fp32 mask 子场景无 unpack（LDS.64 直喂 FADD）理论纯赢但场景罕见，不值得保留。已回退；② 注入与 online_softmax 行扫描融合（省一轮 scores 寄存器往返，且可缩短注入依赖链——向量化的教训指向链深而非带宽）；③ 提高 occupancy 不可行（smem 96KB 已 1 CTA/SM 上限）
     - 相关文件：`csrc/cuffpa/cute/attn_bias.cuh`（注入函数）、`sm_120/split_d.cuh`（主循环）、`.tmp/pc0-bias-tile/`（ab2_bench/ncu_probe 脚本与三轮 ncu-rep）
 - [ ] PC-1：Mega Quantize Kernel —— P 轨基建
 - [ ] PC-2：增量融合（Mega Kernel 步进，被 PC-1 收编）
