@@ -9,6 +9,7 @@
 
 - 1. 每项动手前：先在 plan 模式（Copilot下要切换到plan agent）完成实施规划（改动面 / 注入点 / 验证矩阵），规划好再动手 (自动模式下可以按照规划继续实施操作)。
 - 2. 每做完一项：勾选对应条目（`- [ ]` → `- [x]`），并同步更新上方总览表状态列。注意，要同时更新[SKILL.md](../SKILL.md) 中的技术报告和本文档的总览表状态列，确保两处状态一致。
+- 3. **验收必须落实到 `ffpa_attn.bench` CLI**：`python -m ffpa_attn.bench` 全链路（`--fwd-backend cuda --cuda-impl <impl> --tasks <相关task>`）跑通并通过 parity。`tests/` 与临时脚本仅是开发阶段验证，**不能替代 CLI 验收**；若该项能力影响 bench task 集合（新增/排除 task），须同步放开/过滤 bench CLI 的 task 并在 CLI 输出中可见。
 
 ## 优先级框架
 
@@ -32,7 +33,7 @@
 | strided-NHD 读（fused-QKV） | ✗ | persist-D | 全族（FC-1） | 全族（FC-1） | 全族（FC-1） | FC-1 ✅ |
 | strided/NHD + hybrid 组合 | — | — | ✓ | ✓ | FC-3 ✅ |
 | smooth_v / MXFP8-PV knob | — | — | ✓ | smooth_v 全族；MXFP8-PV persist-D+split-D（m4n2 架构排除） | FC-6 ✅ |
-| head_dim pad | ✗ | ✓ | ✓ | ✓ | FC-8 |
+| head_dim pad | ✓（FC-8） | ✓ | ✓ | ✓ | FC-8 ✅ |
 | decode / 短 Nq 量化 | ✗（无量化） | ✗ | ✗ | ✗ | FC-7 |
 | backward | ✗ | ✗ | ✗ | ✗ | FC-9 |
 | sm90 / sm100 | 部分（fp16 TMA） | ✗ | ✗（fp8 限 sm_120） | ✗（fp4 限 sm_120） | FC-10 |
@@ -50,7 +51,7 @@
 | FC-5 | 量化路径 `dropout` (**暂不实施，仅保留设计稿**) | F2 | ⬜ 待开始 | FC-4 注入点 |
 | FC-6 | fp4 smooth_v/MXFP8-PV 扩展至三族 | F2 | ✅ 已完成（ffpa-attn 76a8bd8） | FC-1/FC-2 |
 | FC-7 | 短 Nq/decode 量化路径 (**暂不实施，仅保留设计稿**) | F3 | ⬜ 待开始 | — |
-| FC-8 | native head_dim pad | F3 | ⬜ 待开始 | — |
+| FC-8 | native head_dim pad | F3 | ✅ 已完成 | — |
 | FC-9 | CUDA backward (**暂不实施，仅保留设计稿**) | F3 | ⬜ 待开始 | — |
 | FC-10 | sm90/sm100 量化覆盖 (**暂不实施，仅保留设计稿**) | F3 | ⬜ 待开始 | — |
 | PC-1 | Mega Quantize Kernel（aux 链大融合） | P | ⬜ 待开始 | — |
@@ -80,7 +81,7 @@
 - [ ] FC-5：量化路径 `dropout`
 - [x] FC-6：fp4 smooth_v/MXFP8-PV 扩展至三族 —— smooth_v 全族；MXFP8-PV 至 split-D（2026-08-28 完成）
 - [ ] FC-7：短 Nq/decode 量化路径 ⏸（暂不实施，仅保留设计稿）
-- [ ] FC-8：native head_dim pad
+- [x] FC-8：native head_dim pad —— kernel 侧 d_og 零物化 pad（cp.async src-size 列守卫 / TMA OOB 零填充），AUTO/NATIVE/TMA 三 hint 64 对齐（2026-08-31 完成）
 - [ ] FC-9：CUDA backward（定位评估）
 - [ ] FC-10：sm90/sm100 量化覆盖
 
@@ -407,6 +408,15 @@ fp8/fp4 全体（含 persist-D）拒绝 `attn_bias`（报告 §8#6）。数学�
 3. bitwiseprobe 确认 bias=None 路径零变化；并核对无 bias 实例与现 kernel 的
    寄存器数/指令数一致（模板隔离生效的硬指标，ptxas -v 或 NCU 对比）。
 
+#### Post-completion Fix (2026-08-31)
+
+FC-4 完成时漏改 bench CLI：`_runner_fwd.py` 的 attn-mask case 仍带
+`not enable_fp8 and not enable_fp4` gate，`ffpa_attn.bench --cuda-impl
+fp8/fp4` 输出中没有 attn-mask 行。已放开（fp8/fp4 attn-mask task 现随
+全量跑，D=128 parity 通过 2.2x/2.2x）；同时按规范 3 把 fp8/fp4 不支持
+的 decode-attn/dropout 在 `_bench.py` task-set 级过滤
+（`CUDA_QUANT_EXCLUDED_TASKS`），避免 NaN 空档进入 tflops/speedup plots。
+
 #### Risks & Rollback
 
 - 每 block 多一次 gmem bias 载入（带宽 +1 tile）——对长序列占比小；
@@ -589,7 +599,7 @@ FC-1 / FC-2（同族布局基建先行，减少一次改动面）。
 
 ### FC-8：native 路径 head_dim pad
 
-- **Status**: Draft ｜ **Priority**: F3 ｜ **Track**: 功能
+- **Status**: ✅ Completed（2026-08-31） ｜ **Priority**: F3 ｜ **Track**: 功能
 
 #### Motivation
 
@@ -625,6 +635,43 @@ native 家族覆盖非整 D（补齐与 CuTe 家族的对齐）。
 #### Dependencies
 
 无。
+
+#### Completion Record (2026-08-31)
+
+实现与设计稿的差异（零物化方向）：
+
+- **api 层**（`csrc/cuffpa/ffpa_api.cc`）：AUTO/NATIVE/TMA 三 hint 纳入
+  `needs_pad`，pad 目标为下一个 **64 倍数**（native 家族编译集
+  `range(64,1025,64)`），范围校验 [64,1024]；`head_dim_dispatch` 三路
+  （fp4 64 对齐 / native 64 对齐 / 其余 32 对齐）；O 仍由 api 层 pad +
+  narrow 回切。TMA hint 仅在 `ENABLE_FFPA_TMA_EXT` 且 sm90+ 时计入
+  native 家族（镜像 launcher 分派：pre-sm90 / 无 TMA ext 时回落 CUTE
+  sm80 kernel，仍走 32 对齐 torch pad）。
+- **launcher**（`csrc/cuffpa/launch.cuh`）：`native_kernel_pad =
+  force_native || tma_kernel_active`（后者 `#ifdef ENABLE_FFPA_TMA_EXT` +
+  `major>=9` 双重限定，防 TMA-ext 未编译时未物化 QKV 泄漏进 cute sm80
+  kernel 的静默数据错乱）；`qkv_padded` 排除 native 家族——Q/K/V 保持
+  D_og 宽，不再做 `constant_pad_nd` 物化拷贝。
+- **kernel 侧零物化**：
+  - sm80 cp.async（`native/prefill.cuh` + `sm_80/split_d.cuh`）：
+    `cp_async_qkv_g2s` 增加 `d_og` 行 stride + 16B chunk 列守卫
+    （`cp_async_zfill` src-size=0），17 个调用点全部显式传参
+    （移除默认参数，编译器强制覆盖）；`split_d_fwd_sm80` O 偏移与
+    QKV 偏移解耦（O 恒为 kHeadDim 宽）。
+  - sm80 decode split-KV（`sm_80/split_kv.cuh`）：s1 全部 5 处 gmem
+    载入改 zfill + `d_og` stride；kStage==1 直读分支加越界零向量守卫。
+  - sm90+ TMA（`native/launch.cuh`）：`make_desc` 的
+    `minor_dim`/`major_stride_bytes` 改用运行时 `d_og = Q.size(3)`，
+    TMA OOB 自动零填充 pad 列（无需 kernel 改动）。
+- **约束**：D_og%8==0（16B stride 对齐 + 16B chunk 列守卫粒度）；
+  `--headdim all` 全量编译集 {64..1024 step 64} 16 档无空洞。
+- **验收**（规范 3，`ffpa_attn.bench` CLI 全链路）：
+  - `--cuda-impl native --D 328 --tasks self-attn,cross-attn,decode-attn,gqa,causal,non-aligned` 通过（328→384）；
+  - `--cuda-impl native --D 120`（`FFPA_CUDA_ALLOW_SMALL_D=1`，120→128）全 task 通过；
+  - `--cuda-impl tma --D 120/328` 通过（TMA OOB 零填充路径，D=328 self-attn 2.14x）；
+  - 回归：`test_ffpa_fwd.py` 503 passed（新增 `test_native_head_dim_pad_*`
+    40 项全过；`test_ffpa_fp8.py` 85 / `test_ffpa_fp4.py` 61 全过）。
+    `triton_small_d_default_falls_back_to_sdpa` 1 项为 HEAD 基线存量失败（stash 验证），与本项无关。
 
 ---
 
