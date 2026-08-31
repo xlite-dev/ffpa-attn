@@ -370,6 +370,59 @@ def test_ffpa_attn_func_cuda_dropout_matches_sdpa():
   torch.testing.assert_close(out, ref, atol=4e-2, rtol=4e-2)
 
 
+@pytest.mark.skipif(
+  IS_ROCM,
+  reason="Dropout mask RNG differs between Triton-AMD and PyTorch SDPA"
+)
+def test_ffpa_attn_func_triton_dropout_large_n_matches_sdpa(monkeypatch):
+  # B1 H16 N16384 reaches exactly 2**32 score elements: Triton's dropout RNG
+  # offset math used to wrap in int32 from head 8 onward, while the SDPA
+  # mem-efficient reference stays valid up to index 2**32-1.
+  monkeypatch.setenv("FFPA_TRITON_ALLOW_SMALL_D", "1")
+  q, k, v = _alloc_qkv(1, 16, 16384, 128, torch.float16)
+
+  torch.manual_seed(0)
+  out = ffpa_attn_func(q, k, v, dropout_p=0.25, forward_backend="triton")
+  torch.manual_seed(0)
+  with sdpa_kernel(SDPBackend.EFFICIENT_ATTENTION):
+    ref = F.scaled_dot_product_attention(
+      q, k, v, dropout_p=0.25, scale=1.0 / math.sqrt(q.size(-1))
+    )
+  torch.testing.assert_close(out, ref, atol=4e-2, rtol=4e-2)
+
+
+def test_ffpa_attn_func_cuda_dropout_large_n_matches_sdpa(monkeypatch):
+  _require_cuda_forward_impl()
+  monkeypatch.setenv("FFPA_CUDA_ALLOW_SMALL_D", "1")
+  q, k, v = _alloc_qkv(1, 16, 16384, 128, torch.float16)
+
+  torch.manual_seed(0)
+  out = ffpa_attn_func(q, k, v, dropout_p=0.25, forward_backend="cuda")
+  torch.manual_seed(0)
+  with sdpa_kernel(SDPBackend.EFFICIENT_ATTENTION):
+    ref = F.scaled_dot_product_attention(
+      q, k, v, dropout_p=0.25, scale=1.0 / math.sqrt(q.size(-1))
+    )
+  torch.testing.assert_close(out, ref, atol=4e-2, rtol=4e-2)
+
+
+def test_ffpa_fwd_cuda_triton_dropout_2p33_cross_consistent(monkeypatch):
+  # B1 H32 N16384 totals 2**33 score elements, where torch's mem-efficient
+  # SDPA reference wraps its own dropout RNG offset in 32-bit arithmetic
+  # (fixed on PyTorch main). Parity is asserted across FFPA implementations,
+  # which both use the correct int64 element layout.
+  _require_cuda_forward_impl()
+  monkeypatch.setenv("FFPA_TRITON_ALLOW_SMALL_D", "1")
+  monkeypatch.setenv("FFPA_CUDA_ALLOW_SMALL_D", "1")
+  q, k, v = _alloc_qkv(1, 32, 16384, 128, torch.float16)
+
+  torch.manual_seed(0)
+  cuda_out = ffpa_attn_func(q, k, v, dropout_p=0.25, forward_backend="cuda")
+  torch.manual_seed(0)
+  triton_out = ffpa_attn_func(q, k, v, dropout_p=0.25, forward_backend="triton")
+  torch.testing.assert_close(cuda_out, triton_out, atol=2e-2, rtol=2e-2)
+
+
 def test_ffpa_attn_func_cuda_dropout_with_attn_mask_matches_sdpa():
   _require_cuda_forward_impl()
   q, k, v = _alloc_qkv(1, 2, 512, 320, torch.float16)
