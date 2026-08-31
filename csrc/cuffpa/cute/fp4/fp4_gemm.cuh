@@ -57,6 +57,30 @@ __device__ __forceinline__ void apply_attn_bias_fp4_rowcol(
   }
 }
 
+// smem-tile variant of the injector above (PC-0-1): the tile holds the
+// mask's original dtype in ORIGINAL token order (the host prefetches
+// linear KV ranges), so the fragment's permuted column j still indexes
+// through kv_perm32 exactly like the gmem variant. s_row/s_col follow
+// ffpa_cute::apply_attn_bias_rowcol_smem: dense=(kBc,1), row-broadcast
+// (0,1); scalar reads only (pair vectorization falsified, PC-0-3).
+template <typename BiasElem, typename ScoresTensor, typename CoordTensor,
+          int kRows, int kCols>
+__device__ __forceinline__ void apply_attn_bias_fp4_rowcol_smem(
+    ScoresTensor& scores, const CoordTensor& tScS_rc,
+    const BiasElem* __restrict__ bias_smem, int s_row, int s_col,
+    float inv_scale) {
+#pragma unroll
+  for (int row = 0; row < kRows; ++row) {
+    const int smem_row = cute::get<0>(tScS_rc(row, 0)) * s_row;
+#pragma unroll
+    for (int col = 0; col < kCols; ++col) {
+      const int j = cute::get<1>(tScS_rc(row, col));
+      const int idx = smem_row + kv_perm32(j) * s_col;
+      scores(row, col) += float(bias_smem[idx]) * inv_scale;
+    }
+  }
+}
+
 // QK step of the blockscaled pipeline: S += (Qhat . SFQ) @ (Khat . SFK)^T
 // over one kv_tile's smem stage. Named gemm_ss_fp4 after the fp8/fp16
 // convention (QK = gemm_ss family, PV = gemm_rs family; the _fp4 suffix

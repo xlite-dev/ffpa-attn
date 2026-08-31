@@ -178,6 +178,9 @@ static inline FfpaBiasTilePlan ffpa_bias_tile_plan_of(
   FfpaBiasTilePlan plan;
   if (bias.ptr == nullptr)
     return plan;
+  // Debug/A-B switch: force every tile mode to the gmem-direct fallback.
+  if (getenv("FFPA_BIAS_TILE_DISABLE") != nullptr)
+    return plan;
   plan.elem_size = bias.dtype == 3 ? 4 : 2;
   const auto aligned16 = [](long long bytes) { return bytes % 16 == 0; };
   if (!aligned16(reinterpret_cast<long long>(bias.ptr)))
@@ -439,11 +442,16 @@ void launch_cute_fwd_split_d_sm120(torch::Tensor Q, torch::Tensor K,
     bias_plan.mode = 0;
   // Row-broadcast resident: the whole [1,Nkv] vector fits past the QK/V
   // buffers (16B-aligned) — one plain load before the kv loop removes every
-  // per-tile bias TMA/barrier from the hot path (mode 3).
+  // per-tile bias TMA/barrier from the hot path (mode 3). The upgrade must
+  // not trade blocks/SM for the removed barrier: keep the smem-driven
+  // occupancy of the base layout (101376B opt-in per block; measured on
+  // fp8 m4n2 where mode 3 dropped 3 CTA/SM to 1 and ran 4.9% slower).
   if (bias_plan.mode == 2) {
+    const long long base_align = (kBaseSmemBytes + 15) & ~15;
     const long long resident =
-        ((kBaseSmemBytes + 15) & ~15) + (long long)Nkv * bias_plan.elem_size;
-    if (resident <= kSmemBudgetBytes)
+        base_align + (long long)Nkv * bias_plan.elem_size;
+    if (resident <= kSmemBudgetBytes &&
+        101376 / resident >= 101376 / base_align)
       bias_plan.mode = 3;
   }
   const auto make_tma_bias = [&](auto mode_c, auto b4_c) {
@@ -815,13 +823,16 @@ void launch_cute_fwd_split_d_m4n2_sm120(torch::Tensor Q, torch::Tensor K,
   if (kBaseSmemBytes + bias_plan.tile_bytes(kBr, kBc, bias_stages) >
       kSmemBudgetBytes)
     bias_plan.mode = 0;
-  // Row-broadcast resident: the whole [1,Nkv] vector fits past the QK/V
-  // buffers (16B-aligned) — one plain load before the kv loop removes every
-  // per-tile bias TMA/barrier from the hot path (mode 3).
+  // Row-broadcast resident (mode 3): the upgrade must not trade blocks/SM
+  // for the removed barrier -- keep the smem-driven occupancy of the base
+  // layout (measured on fp8 m4n2: mode 3 dropped 3 CTA/SM to 1, 4.9%
+  // slower than the gmem fallback).
   if (bias_plan.mode == 2) {
+    const long long base_align = (kBaseSmemBytes + 15) & ~15;
     const long long resident =
-        ((kBaseSmemBytes + 15) & ~15) + (long long)Nkv * bias_plan.elem_size;
-    if (resident <= kSmemBudgetBytes)
+        base_align + (long long)Nkv * bias_plan.elem_size;
+    if (resident <= kSmemBudgetBytes &&
+        101376 / resident >= 101376 / base_align)
       bias_plan.mode = 3;
   }
   const auto make_tma_bias = [&](auto mode_c, auto b4_c) {
@@ -2361,7 +2372,81 @@ void launch_cute_fwd_split_d_m4n2_fp8_sm120_impl(
   auto tma_o = make_tma_copy(SM90_TMA_STORE{}, gO, SmemLayoutO{},
                              Shape<Int<kBr>, Int<kVDChunk>>{}, _1{});
 
-  constexpr int kSmemBytes = Traits::kSmemElems;
+  // PC-0-1 bias tile plan (mirrors the fp16 split_d launcher): classify the
+  // mask shape, demote to gmem-direct when the tile misses the smem budget,
+  // and upgrade row-broadcast to the resident vector (mode 3) when the whole
+  // [1,Nkv] row fits past the buffers. kSmemElems counts bytes here (1B
+  // elements + exchange), same as the kernel's bias_base rounding.
+  FfpaBiasTilePlan bias_plan;
+  if (bias.ptr != nullptr) {
+    FfpaBiasParams bias_p{bias.ptr,      bias.dtype,    bias.stride_b,
+                          bias.stride_h, bias.stride_m, bias.stride_n};
+    bias_plan = ffpa_bias_tile_plan_of(bias_p, Nb, Nh, Nq, Nkv);
+  }
+  constexpr int kBiasSmemBudgetBytes = 99 * 1024;
+  const int bias_stages = (bias_plan.mode == 2) ? 2 : 1;
+  if (Traits::kSmemElems + bias_plan.tile_bytes(kBr, kBc, bias_stages) >
+      kBiasSmemBudgetBytes)
+    bias_plan.mode = 0;
+  // Mode 3 upgrade must keep the smem-driven blocks/SM of the base layout:
+  // this family runs 3 CTA/SM (29.7KB base) and the resident vector's 32KB
+  // would drop it to 1 -- measured 4.9% slower than the gmem fallback.
+  if (bias_plan.mode == 2) {
+    const long long base_align = (Traits::kSmemElems + 15) & ~15;
+    const long long resident =
+        base_align + (long long)Nkv * bias_plan.elem_size;
+    if (resident <= kBiasSmemBudgetBytes &&
+        101376 / resident >= 101376 / base_align)
+      bias_plan.mode = 3;
+  }
+  const auto make_tma_bias = [&](auto mode_c, auto b4_c) {
+    constexpr int kBiasModeT = decltype(mode_c)::value;
+    constexpr int kBias4B = decltype(b4_c)::value;
+    constexpr int bias_cols = kBc * (kBias4B ? 2 : 1);
+    // The descriptor is live only when the template mode matches the plan
+    // (mode 2 then spans the real [m_total, Nkv] plane); every other
+    // combination is a never-issued dummy, where bias_cols keeps the TMA
+    // descriptor's 16B outer-stride assert satisfied.
+    const bool bias_desc_live = bias_plan.mode == kBiasModeT;
+    const int64_t plane_rows =
+        bias_desc_live ? (int64_t)bias_plan.m_total : (int64_t)1;
+    const int64_t plane_cols =
+        (int64_t)std::max<long long>(Nkv, 1) * (kBias4B ? 2 : 1);
+    const int64_t plane_row_stride =
+        bias_desc_live
+            ? (kBiasModeT == 1 ? (int64_t)bias.stride_m * (kBias4B ? 2 : 1)
+                               : plane_cols)
+            : (int64_t)bias_cols;
+    // mode 0 (any demote reason, incl. an unaligned mask ptr) never issues:
+    // point every descriptor at the anchor so the 16B address assert holds.
+    const uint16_t* bias_desc_base =
+        bias_plan.mode != 0 ? reinterpret_cast<const uint16_t*>(bias.ptr)
+                            : &kBiasDummyAnchor;
+    auto gB = make_tensor(make_gmem_ptr(bias_desc_base),
+                          make_shape(plane_rows, plane_cols),
+                          make_stride(plane_row_stride, _1{}));
+    auto sB = [&] {
+      if constexpr (kBiasModeT == 1)
+        return Layout<Shape<Int<kBr>, Int<bias_cols>>,
+                      Stride<Int<bias_cols>, _1>>{};
+      else
+        return Layout<Shape<_1, Int<bias_cols>>, Stride<Int<bias_cols>, _1>>{};
+    }();
+    return make_tma_copy(SM90_TMA_LOAD{}, gB, sB, shape(sB), _1{});
+  };
+  auto tma_bias_d16 = make_tma_bias(std::integral_constant<int, 1>{},
+                                    std::integral_constant<int, 0>{});
+  auto tma_bias_d32 = make_tma_bias(std::integral_constant<int, 1>{},
+                                    std::integral_constant<int, 1>{});
+  auto tma_bias_r16 = make_tma_bias(std::integral_constant<int, 2>{},
+                                    std::integral_constant<int, 0>{});
+  auto tma_bias_r32 = make_tma_bias(std::integral_constant<int, 2>{},
+                                    std::integral_constant<int, 1>{});
+  const int kSmemBytes =
+      ((Traits::kSmemElems + 15) & ~15) +
+      (int)((bias_plan.mode == 3)
+                ? (long long)Nkv * bias_plan.elem_size
+                : bias_plan.tile_bytes(kBr, kBc, bias_stages));
   float* softmax_lse_ptr =
       softmax_lse.numel() > 0 ? softmax_lse.data_ptr<float>() : nullptr;
   auto O_ptr = reinterpret_cast<ElementO*>(O.data_ptr());
@@ -2376,70 +2461,102 @@ void launch_cute_fwd_split_d_m4n2_fp8_sm120_impl(
   using TmaK = decltype(tma_k);
   using TmaV = decltype(tma_v);
   using TmaO = decltype(tma_o);
-  auto launch_kernel = [&](auto kernel) {
+  auto launch_kernel = [&](auto kernel, auto tma_bias_sel) {
     cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
                          kSmemBytes);
     kernel<<<grid, block, kSmemBytes, stream>>>(
-        tma_q, tma_k, tma_v, tma_o, O_ptr, softmax_lse_ptr,
+        tma_q, tma_k, tma_v, tma_o, tma_bias_sel, O_ptr, softmax_lse_ptr,
         q_scale.data_ptr<float>(), k_scale.data_ptr<float>(),
         v_scale.data_ptr<float>(), Nq, Nkv, Nh, Nh_kv, scale, Tc, causal,
         total_q_rows, total_kv_rows, n_rb_q, n_rb_kv, q_start_row, km_f32_ptr,
         vm_kernel, nhd_out, bias.ptr, bias.dtype, bias.stride_b, bias.stride_h,
-        bias.stride_m, bias.stride_n);
+        bias.stride_m, bias.stride_n,
+        bias_plan.mode != 0 ? bias_plan.m_total : (long long)1);
   };
-  // kHasAttnBias is a template parameter, so the variant table below is
-  // instantiated once per compile-time bias tag (runtime numel -> tag).
-  const auto dispatch = [&](auto bias_tag) {
+  // kHasAttnBias/kBiasMode/kBias4B are template parameters (TMA box type),
+  // so the variant table below is instantiated once per compile-time bias
+  // tag combination; the runtime mode/dtype select the branch.
+  const auto dispatch = [&](auto bias_tag, auto tma_bias_sel, auto mode_c,
+                            auto b4_c) {
     constexpr int kBiasOn = decltype(bias_tag)::value;
+    constexpr int kModeL = decltype(mode_c)::value;
+    constexpr int kB4 = decltype(b4_c)::value;
+    using TmaBiasSel = decltype(tma_bias_sel);
     if (qk_per_thread) {
       // Per-thread QK quant (sage style): fragment-aligned dequant scales.
       if (v_per_channel && pv_acc_f16) {
-        launch_kernel(
-            ffpa_fp8::split_d_m4n2_fwd_cute_fp8_sm120<Traits, ElementO, TmaQ,
-                                                      TmaK, TmaV, TmaO, true,
-                                                      true, true, kBiasOn>);
+        launch_kernel(ffpa_fp8::split_d_m4n2_fwd_cute_fp8_sm120<
+                          Traits, ElementO, TmaQ, TmaK, TmaV, TmaO, TmaBiasSel,
+                          true, true, true, kModeL, kB4, kBiasOn>,
+                      tma_bias_sel);
       } else if (v_per_channel) {
-        launch_kernel(
-            ffpa_fp8::split_d_m4n2_fwd_cute_fp8_sm120<Traits, ElementO, TmaQ,
-                                                      TmaK, TmaV, TmaO, false,
-                                                      true, true, kBiasOn>);
+        launch_kernel(ffpa_fp8::split_d_m4n2_fwd_cute_fp8_sm120<
+                          Traits, ElementO, TmaQ, TmaK, TmaV, TmaO, TmaBiasSel,
+                          false, true, true, kModeL, kB4, kBiasOn>,
+                      tma_bias_sel);
       } else if (pv_acc_f16) {
-        launch_kernel(
-            ffpa_fp8::split_d_m4n2_fwd_cute_fp8_sm120<Traits, ElementO, TmaQ,
-                                                      TmaK, TmaV, TmaO, true,
-                                                      false, true, kBiasOn>);
+        launch_kernel(ffpa_fp8::split_d_m4n2_fwd_cute_fp8_sm120<
+                          Traits, ElementO, TmaQ, TmaK, TmaV, TmaO, TmaBiasSel,
+                          true, false, true, kModeL, kB4, kBiasOn>,
+                      tma_bias_sel);
       } else {
-        launch_kernel(
-            ffpa_fp8::split_d_m4n2_fwd_cute_fp8_sm120<Traits, ElementO, TmaQ,
-                                                      TmaK, TmaV, TmaO, false,
-                                                      false, true, kBiasOn>);
+        launch_kernel(ffpa_fp8::split_d_m4n2_fwd_cute_fp8_sm120<
+                          Traits, ElementO, TmaQ, TmaK, TmaV, TmaO, TmaBiasSel,
+                          false, false, true, kModeL, kB4, kBiasOn>,
+                      tma_bias_sel);
       }
     } else if (v_per_channel && pv_acc_f16) {
-      launch_kernel(
-          ffpa_fp8::split_d_m4n2_fwd_cute_fp8_sm120<Traits, ElementO, TmaQ,
-                                                    TmaK, TmaV, TmaO, true,
-                                                    true, false, kBiasOn>);
+      launch_kernel(ffpa_fp8::split_d_m4n2_fwd_cute_fp8_sm120<
+                        Traits, ElementO, TmaQ, TmaK, TmaV, TmaO, TmaBiasSel,
+                        true, true, false, kModeL, kB4, kBiasOn>,
+                    tma_bias_sel);
     } else if (v_per_channel) {
-      launch_kernel(
-          ffpa_fp8::split_d_m4n2_fwd_cute_fp8_sm120<Traits, ElementO, TmaQ,
-                                                    TmaK, TmaV, TmaO, false,
-                                                    true, false, kBiasOn>);
+      launch_kernel(ffpa_fp8::split_d_m4n2_fwd_cute_fp8_sm120<
+                        Traits, ElementO, TmaQ, TmaK, TmaV, TmaO, TmaBiasSel,
+                        false, true, false, kModeL, kB4, kBiasOn>,
+                    tma_bias_sel);
     } else if (pv_acc_f16) {
-      launch_kernel(
-          ffpa_fp8::split_d_m4n2_fwd_cute_fp8_sm120<Traits, ElementO, TmaQ,
-                                                    TmaK, TmaV, TmaO, true,
-                                                    false, false, kBiasOn>);
+      launch_kernel(ffpa_fp8::split_d_m4n2_fwd_cute_fp8_sm120<
+                        Traits, ElementO, TmaQ, TmaK, TmaV, TmaO, TmaBiasSel,
+                        true, false, false, kModeL, kB4, kBiasOn>,
+                    tma_bias_sel);
     } else {
-      launch_kernel(
-          ffpa_fp8::split_d_m4n2_fwd_cute_fp8_sm120<Traits, ElementO, TmaQ,
-                                                    TmaK, TmaV, TmaO, false,
-                                                    false, false, kBiasOn>);
+      launch_kernel(ffpa_fp8::split_d_m4n2_fwd_cute_fp8_sm120<
+                        Traits, ElementO, TmaQ, TmaK, TmaV, TmaO, TmaBiasSel,
+                        false, false, false, kModeL, kB4, kBiasOn>,
+                    tma_bias_sel);
     }
   };
-  if (bias.ptr != nullptr)
-    dispatch(std::integral_constant<int, 1>{});
-  else
-    dispatch(std::integral_constant<int, 0>{});
+  if (bias.ptr == nullptr) {
+    dispatch(std::integral_constant<int, 0>{}, tma_bias_r16,
+             std::integral_constant<int, 0>{},
+             std::integral_constant<int, 0>{});
+  } else {
+    const auto bias_on = std::integral_constant<int, 1>{};
+    const auto m0 = std::integral_constant<int, 0>{};
+    const auto m1 = std::integral_constant<int, 1>{};
+    const auto m2 = std::integral_constant<int, 2>{};
+    const auto m3 = std::integral_constant<int, 3>{};
+    if (bias_plan.mode == 1) {
+      if (bias.dtype == 3)
+        dispatch(bias_on, tma_bias_d32, m1, m1);
+      else
+        dispatch(bias_on, tma_bias_d16, m1, m0);
+    } else if (bias_plan.mode == 2) {
+      if (bias.dtype == 3)
+        dispatch(bias_on, tma_bias_r32, m2, m1);
+      else
+        dispatch(bias_on, tma_bias_r16, m2, m0);
+    } else if (bias_plan.mode == 3) {
+      // resident row-vector: no TMA issue in-kernel, descriptor unused.
+      if (bias.dtype == 3)
+        dispatch(bias_on, tma_bias_r32, m3, m1);
+      else
+        dispatch(bias_on, tma_bias_r16, m3, m0);
+    } else {
+      dispatch(bias_on, tma_bias_r16, m0, m0);
+    }
+  }
 }
 
 template <typename kDataType, const int kHeadDim, const int kStage>
