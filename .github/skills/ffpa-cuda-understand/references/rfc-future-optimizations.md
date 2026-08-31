@@ -54,6 +54,7 @@
 | FC-8 | native head_dim pad | F3 | ✅ 已完成 | — |
 | FC-9 | CUDA backward (**暂不实施，仅保留设计稿**) | F3 | ⬜ 待开始 | — |
 | FC-10 | sm90/sm100 量化覆盖 (**暂不实施，仅保留设计稿**) | F3 | ⬜ 待开始 | — |
+| FC-11 | native 路径 dropout 精度修复（bug，高优） | F3 | ⬜ 待开始 | — |
 | PC-0 | attn_mask 量化路径 bias tile IO 重构（fp8/fp4） | P | ⬜ 待开始（**P 轨最高优先**） | FC-4 注入点 |
 | PC-1 | Mega Quantize Kernel（aux 链大融合） | P | ⬜ 待开始 | — |
 | PC-2 | 增量融合（Mega Kernel 步进） | P | ⬜ 待开始 | 被 PC-1 收编 |
@@ -85,6 +86,7 @@
 - [x] FC-8：native head_dim pad —— kernel 侧 d_og 零物化 pad（cp.async src-size 列守卫 / TMA OOB 零填充），AUTO/NATIVE/TMA 三 hint 64 对齐（2026-08-31 完成）
 - [ ] FC-9：CUDA backward（定位评估）
 - [ ] FC-10：sm90/sm100 量化覆盖
+- [ ] FC-11：native 路径 dropout 精度修复 —— 存量 bug（2026-08-31 记录）
 
 **轨道 P（性能优化）**
 
@@ -761,6 +763,88 @@ Blackwell 消费/专业卡；若目标硬件扩到 H100/B200，量化路径不�
 #### Dependencies
 
 目标硬件可得性确认。
+
+---
+
+### FC-11：native 路径 dropout 精度修复
+
+- **Status**: Draft ｜ **Priority**: F3（**bug 修复，高优**） ｜ **Track**: 功能/正确性
+
+#### Motivation
+
+native 家族（AUTO/NATIVE cp.async 与 sm90+ TMA）的 dropout task 在 bench CLI
+上 parity 失败（RTX PRO 5000，B=1 H=32 N=16384，dropout_p=0.1）：
+
+| 配置 | O_err | allclose |
+|---|---|---|
+| `--cuda-impl fp16` D=120 fp16/bf16（atol 0.02/0.05） | 0.0629 / 0.0630 | **False / False** |
+| `--cuda-impl fp16` D=128 fp16/bf16 | 0.0779 / 0.0775 | **False / False** |
+| `--cuda-impl tma`  D=120 fp16/bf16 | 0.0629 / 0.0630 | **False / False** |
+| `--cuda-impl tma`  D=128 fp16/bf16 | 0.0779 / 0.0776 | **False / False** |
+
+同批 run 的 self-attn / causal / attn-mask / non-aligned / decode / gqa /
+cross 全部通过（O_err ≤ 0.005）→ 问题**仅限 dropout**。
+
+#### 归属判定（已做，2026-08-31）
+
+- D=128（无 head_dim pad）同样失败 → **与 FC-8 native pad 无关**；
+- AUTO（sm80 cp.async）与 TMA（sm120 native TMA）两 hint 都失败，且同 D 下
+  O_err 数值一致 → 两 kernel 共享的 `prefill.cuh` philox dropout 路径是
+  唯一公共环节 → **存量 bug**（kernel 侧 RNG mask 与 SDPA 不完全对齐）。
+
+#### 附带发现（性能）
+
+`--cuda-impl tma` + dropout：112-114 ms（0.65x vs SDPA），比同形状
+`--cuda-impl fp16` 的 40 ms 慢 2.8x。TMA hint 带 dropout 回退的 native TMA
+sm120 kernel 疑似走了低效配置（与本 bug 一并排查）。
+
+#### Root Cause（初步假设，待验证）
+
+dropout 作用于 softmax 后的 P，RNG 按
+`linear = ((b*Hq+h)*Nq+q)*Nkv+k` 消费 philox4x32-10（`sync_apply_dropout_to_p`
+→ `philox4x32_10` / `apply_dropout_pair`）。O_err 量级（~0.06-0.08，
+dropout_p=0.1）呈"大部分 mask 对齐、局部错位"特征，疑似：
+- SDPA（efficient/flash backend）的 RNG 消费布局与该线性布局在**行/组边界**
+  不一致（philox 按 4 元素组消费，行尾或 (b,h) 边界对齐方式不同）；或
+- Python 侧预留的 philox seed/offset 与 kernel 侧 offset base 错位。
+
+#### Design
+
+1. **对齐诊断**：小形状（如 4×8）dump FFPA 与 SDPA 的 dropout mask 逐元素
+   diff，定位错位模式（行边界 / 4 元素组边界 / (b,h) 边界）；
+2. 按 SDPA 实际消费布局修正 `sync_apply_dropout_to_p` 的 offset 计算
+   （两 kernel 共享一份修正）；若 SDPA backend 在 sm120 上本身无稳定 mask
+   契约，则以 Triton forward（已与 SDPA 对齐）的实现为参照；
+3. 排查 tma+dropout 回退 kernel 的 2.8x 性能异常。
+
+#### Files & Symbols
+
+- `csrc/cuffpa/native/prefill.cuh`（`philox4x32_10` / `apply_dropout_pair` /
+  `sync_apply_dropout_to_p`）
+- `csrc/cuffpa/native/sm_80/split_d.cuh`、`csrc/cuffpa/native/sm_120/split_d.cuh`
+  （调用点 offset 传参）
+- `src/ffpa_attn/functional.py`（philox seed/offset 预留侧）
+
+#### Validation
+
+- `ffpa_attn.bench --cuda-impl fp16/tma --tasks dropout`：fp16/bf16
+  allclose=True（atol 0.02/0.05），跨 D（128/120/320/328）与 hint；
+- 新增 mask 逐元素一致性单测（FFPA vs SDPA/Triton dropout mask diff == 0）；
+- tma+dropout 延时回到与 fp16 impl 同量级。
+
+#### Risks & Rollback
+
+- dropout mask 改动会影响依赖同一 RNG 路径的既有 parity 基线（Triton 已对齐
+  路径不动）；回退 = 单 commit revert。
+
+#### Expected Benefit
+
+native 家族 dropout 恢复 parity（当前 bench 唯一 False 项）；tma+dropout
+性能异常排除。
+
+#### Dependencies
+
+无（与 FC-5 量化 dropout 设计稿独立）。
 
 ---
 
