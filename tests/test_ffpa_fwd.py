@@ -250,6 +250,9 @@ def test_ffpa_attn_func_triton_additive_attn_mask_matches_sdpa():
 def test_ffpa_attn_func_triton_small_d_default_falls_back_to_sdpa(monkeypatch):
   import ffpa_attn.ffpa_attn_interface as iface
 
+  # Assert the default (env unset) semantics even when the surrounding
+  # shell leaked FFPA_TRITON_ALLOW_SMALL_D=1.
+  monkeypatch.delenv("FFPA_TRITON_ALLOW_SMALL_D", raising=False)
   q, k, v = _alloc_qkv(1, 4, 1024, 256, torch.float16)
 
   def _unexpected_apply(*args, **kwargs):
