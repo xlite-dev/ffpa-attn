@@ -857,7 +857,7 @@ def _run_case(
   # (fixed on PyTorch main). A dropout mismatch at that scale indicts the
   # reference, not the kernel.
   sdpa_dropout_ref_wrapped = dropout_p > 0.0 and B * Nh_q * Nq * Nkv > 2**32
-  if sdpa_dropout_ref_wrapped and not allclose:
+  if sdpa_dropout_ref_wrapped and not allclose and verbose:
     print(
       f"[warn] {name}: torch mem-efficient SDPA dropout RNG offset wraps"
       " above 2^32 score elements (reference bug, fixed on PyTorch"
