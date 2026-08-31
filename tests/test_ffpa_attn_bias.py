@@ -226,6 +226,58 @@ def test_bias_int32_overflow_scale(D):
   )
 
 
+def _make_unaligned_view(mask):
+  """Same values, storage offset +1 element: the base ptr loses its 16B
+  alignment, so the classifier keeps the gmem-direct fallback (mode 0).
+  A last-dim slice cannot do this -- it moves neither ptr nor stride."""
+  n = mask.numel()
+  flat = torch.empty(n + 1, device="cuda", dtype=mask.dtype)
+  out = flat[1:1 + n].view_as(mask)
+  out.copy_(mask)
+  assert out.data_ptr() % 16 == mask.element_size()
+  return out
+
+
+@pytest.mark.parametrize(
+  "mask_kind", ["key", "batch-key", "head-key", "dense", "batch-dense"]
+)
+@pytest.mark.parametrize(
+  "B,H,Nq,Nkv,D", [(2, 4, 512, 4096, 128), (2, 4, 512, 4096, 320),
+                   (1, 4, 1024, 1024, 768)]
+)
+def test_bias_tile_vs_gmem_paths(B, H, Nq, Nkv, D, mask_kind):
+  """Tile path (mode 2/3) vs gmem-direct (mode 0) on identical values.
+
+  The two runs differ ONLY in the bias storage address, so outputs must be
+  bitwise equal; this pins the (b,h) row fold of the row-broadcast plane
+  (head-key/batch-key) that the 3e-2 SDPA tolerance cannot catch."""
+  if D >= 256 and D != 320 and D != 768:
+    pytest.skip("headdim not in build set")
+  torch.manual_seed(11)
+  mask = _make_mask(mask_kind, B, H, Nq, Nkv, torch.float32)
+  mask_gmem = _make_unaligned_view(mask)
+  Q = torch.randn(B, H, Nq, D, device="cuda", dtype=torch.float16) * 0.5
+  K = torch.randn(B, H, Nkv, D, device="cuda", dtype=torch.float16) * 0.5
+  V = torch.randn(B, H, Nkv, D, device="cuda", dtype=torch.float16) * 0.5
+
+  backend = CUDABackend(
+    forward=True,
+    enable_fp8=False,
+    enable_fp4=False,
+    enable_tma=True,
+    enable_cute=True,
+    backward=False
+  )
+  out_tile = ffpa_attn_func(Q, K, V, attn_mask=mask, forward_backend=backend)
+  out_gmem = ffpa_attn_func(
+    Q, K, V, attn_mask=mask_gmem, forward_backend=backend
+  )
+  assert torch.equal(out_tile, out_gmem), (
+    f"tile-vs-gmem paths diverged: kind={mask_kind} D={D} "
+    f"max={(out_tile.float() - out_gmem.float()).abs().max().item():.4f}"
+  )
+
+
 @pytest.mark.parametrize("D", [128, 320])
 def test_causal_plus_bias_parity(D):
   """Bias must compose with -inf masked positions.

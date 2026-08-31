@@ -203,8 +203,9 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_sm120(
       auto b_slice = tma_bias.get_slice(_0{});
       // Bias plane in u16 units (see launcher): dense folds (b,h) into the
       // linear row domain (validated host-side); the plane's dim0 is an
-      // element row, dim1 is a u16 column. Row-broadcast reads the single
-      // [1,Nkv] plane with a static 1-row box. The TMA box must be fully
+      // element row, dim1 is a u16 column. Row-broadcast reads the
+      // [m_total,Nkv] plane ((b,h) folds to one row, host-validated) with
+      // a static 1-row box. The TMA box must be fully
       // static (vectorization inference rejects dynamic modes) and must
       // match the host descriptor, so the mode is a template parameter.
       constexpr int bias_cols = kBc * (kBias4B ? 2 : 1);
@@ -222,9 +223,16 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_sm120(
               tma_bias.get_tma_tensor(make_shape(
                   attn_bias_plane_m_total, (long long)Nkv * bias_cols / kBc)));
         else
-          return domain_offset(make_coord(0LL, 0LL),
-                               tma_bias.get_tma_tensor(make_shape(
-                                   1LL, (long long)Nkv * bias_cols / kBc)));
+          // Row-broadcast rows are Nkv elements wide, so the folded (b,h)
+          // element offset divides exactly (stride_h==Nkv, stride_b==
+          // h_eff*Nkv, host-validated).
+          return domain_offset(
+              make_coord(((long long)Nb_id * attn_bias_stride_b +
+                          (long long)Nh_id * attn_bias_stride_h) /
+                             (long long)Nkv,
+                         0LL),
+              tma_bias.get_tma_tensor(make_shape(
+                  attn_bias_plane_m_total, (long long)Nkv * bias_cols / kBc)));
       }();
       const auto issue_bias_tma = [&](int tile) {
         const int stage = tile % kBiasStages;

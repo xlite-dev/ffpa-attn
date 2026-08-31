@@ -57,7 +57,7 @@
 | FC-10 | sm90/sm100 量化覆盖 (**暂不实施，仅保留设计稿**) | F3 | ⬜ 待开始 | — |
 | FC-11 | native 路径 dropout 精度修复（bug，高优） | F3 | ✅ 已完成（ffpa-attn 542f774/e1fe363，根因=torch ref uint32 bug） | — |
 | PC-0 | attn mask 场景性能优化（bias tile IO 重构） | P | 🚧 1/4（**P 轨最高优先**） | FC-4 注入点 |
-| PC-0-0 | ↳ cute/cute_tma 场景（fp16 cute 家族） | P | ✅ 完成（b4a811e + 7ffe765/1e4d9b6 迭代：bench CLI D=128 gap 1.12/89%、D=768 0.99/101% 双达标；D=320 1.44/70% 结构极限未达 → **PC-0-3 专项**） | — |
+| PC-0-0 | ↳ cute/cute_tma 场景（fp16 cute 家族） | P | ✅ 完成（b4a811e + 7ffe765/1e4d9b6 迭代：bench CLI D=128 gap 1.12/89%、D=768 1.07/93% 双达标，原记录 0.99 系测量异常已修正；D=320 1.44/70% 结构极限未达 → **PC-0-3 专项**；2026-08-31 A0 补丁修复 mode 2/3 (b,h) 折叠缺陷 + sm_80 dense 平方 bug） | — |
 | PC-0-1 | ↳ fp8/fp4 场景（量化六族，原 PC-0 主体） | P | ⬜ 待开始 | FC-4 注入点；PC-0-0 热身 |
 | PC-0-2 | ↳ native/native_tma 场景 | P | ⬜ 待开始 | — |
 | PC-0-3 | ↳ D=320 split_d 注入开销专项（PC-0-0 遗留） | P | ⬜ 待开始（杠杆①向量化已证伪 +2.7%，见完成清单） | PC-0-0 |
@@ -96,7 +96,7 @@
 **轨道 P（性能优化）**
 
 - [ ] PC-0：attn mask 场景性能优化 —— bias tile IO 重构（P 轨最高优先，2026-08-31 立项）
-  - [x] PC-0-0：cute/cute_tma 场景（fp16 cute 家族 `apply_attn_bias_rowcol` smem tile 化）—— 2026-08-31 完成（b4a811e）：TMA tile 预取 + persist_d Q-s2r 寄存器持久化腾出 Q smem 给 bias tile（fp8 kPersistQs2r 模式移植）+ split_d/m4n2 单缓冲防自锁 + dense 平面行坐标修复（元素 stride 误作行单位，h≥1 bias 被 TMA OOB zero-fill）；99 parity 用例 + bench CLI 验收：D=128 gap 1.12x（TFLOPS 89%）、D=768 gap 0.99x（101%）双达标；dense 全量 mask 下 D=128 增量已达 HBM 带宽极限（~2.2TB/s 等效）。后续迭代 7ffe765（rowvec 双缓冲）+ 1e4d9b6（mode 3 全驻留）：D=320 gap 2.21→1.44（TFLOPS 66%→70%）仍未达 1.2x，属 split_d 结构极限 → 移交 PC-0-3 专项
+  - [x] PC-0-0：cute/cute_tma 场景（fp16 cute 家族 `apply_attn_bias_rowcol` smem tile 化）—— 2026-08-31 完成（b4a811e）：TMA tile 预取 + persist_d Q-s2r 寄存器持久化腾出 Q smem 给 bias tile（fp8 kPersistQs2r 模式移植）+ split_d/m4n2 单缓冲防自锁 + dense 平面行坐标修复（元素 stride 误作行单位，h≥1 bias 被 TMA OOB zero-fill）；99 parity 用例 + bench CLI 验收：D=128 gap 1.12x（TFLOPS 89%）、D=768 gap 1.07x（93%）双达标（原记录 0.99x/101% 系测量异常：2026-08-31 A0 前后同口径复测均为 ~1.07-1.08，gap<1 本身反常）；dense 全量 mask 下 D=128 增量已达 HBM 带宽极限（~2.2TB/s 等效）。后续迭代 7ffe765（rowvec 双缓冲）+ 1e4d9b6（mode 3 全驻留）：D=320 gap 2.21→1.44（TFLOPS 66%→70%）仍未达 1.2x，属 split_d 结构极限 → 移交 PC-0-3 专项。A0 补丁（2026-08-31，PC-0-1 规划审查发现）：mode 2/3 的 (b,h) 未折叠——head-key/batch-key rowvec mask（stride_m 被 size-1 归零而 stride_b/h≠0）全部 CTA 读 (0,0) 行，h≥1 输出错但 3e-2 断言假阴性掩盖（repro 差 0.0097）；修复 = 分类器补 rowvec 平面校验（stride_h∈{0,Nkv}、stride_b∈{0,h_eff·Nkv}、Nkv·elem 16B 对齐）+ TMA 坐标/mode 3 装载 fold + sm_80 loader 统一行坐标公式（顺带修 dense 元素偏移×stride_m 平方 bug，sm_120 GPU 上从未暴露）；新增 15 例 tile-vs-gmem bitwise 对照（storage-offset 视图强制 mode 0，`buf[...,:N]` 左切片不改变 ptr/stride 无效）
   - [ ] PC-0-1：fp8/fp4 场景（量化六族 kernel，原 PC-0 主体设计）
   - [ ] PC-0-2：native/native_tma 场景（标量 loader 路径，设计稿待补）
   - [ ] PC-0-3：D=320 split_d attn-mask 注入开销专项（PC-0-0 遗留，目标 gap 1.44→≤1.2x）

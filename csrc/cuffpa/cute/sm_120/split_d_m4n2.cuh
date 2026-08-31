@@ -284,7 +284,8 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
   }
 
   // Bias tile TMA (PC-0): u16 plane. Dense folds (b,h) into the linear row
-  // domain; row-broadcast reads the [1,Nkv] plane with a static 1-row box.
+  // domain; row-broadcast reads the [m_total,Nkv] plane ((b,h) folds to one
+  // row, host-validated) with a static 1-row box.
   // tScS_rc covers half rows per N-warp; tile-local coords index the same
   // [kBr,kBc] smem tile from both warps. The TMA box must be fully static
   // (vectorization inference rejects dynamic modes) and must match the host
@@ -305,9 +306,16 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
           tma_bias.get_tma_tensor(make_shape(
               attn_bias_plane_m_total, (long long)Nkv * bias_cols / kBc)));
     else
-      return domain_offset(make_coord(0LL, 0LL),
-                           tma_bias.get_tma_tensor(make_shape(
-                               1LL, (long long)Nkv * bias_cols / kBc)));
+      // Row-broadcast rows are Nkv elements wide, so the folded (b,h)
+      // element offset divides exactly (stride_h==Nkv, stride_b==
+      // h_eff*Nkv, host-validated).
+      return domain_offset(
+          make_coord(((long long)Nb_id * attn_bias_stride_b +
+                      (long long)Nh_id * attn_bias_stride_h) /
+                         (long long)Nkv,
+                     0LL),
+          tma_bias.get_tma_tensor(make_shape(
+              attn_bias_plane_m_total, (long long)Nkv * bias_cols / kBc)));
   }();
   auto issue_bias_tma = [&](int tile) {
     cutlass::arch::fence_view_async_shared();
@@ -412,7 +420,12 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
   // vector loads, host-guaranteed 16B alignment): no TMA and no per-tile
   // bias barrier anywhere in the kv loop.
   if constexpr (kHasAttnBias && kBiasMode == 3) {
-    const uint16_t* src = reinterpret_cast<const uint16_t*>(attn_bias);
+    // The resident vector is this (b,h)'s row: rows are Nkv elements wide
+    // (stride_h==Nkv, stride_b==h_eff*Nkv, host-validated).
+    const uint16_t* src = reinterpret_cast<const uint16_t*>(attn_bias) +
+                          ((long long)Nb_id * attn_bias_stride_b +
+                           (long long)Nh_id * attn_bias_stride_h) *
+                              ((attn_bias_dtype == 3) ? 2 : 1);
     const int n_u16 = (int)Nkv * ((attn_bias_dtype == 3) ? 2 : 1);
     const int vec_end = n_u16 & ~7;
     for (int i = tid * 8; i < vec_end; i += kNumThreads * 8)

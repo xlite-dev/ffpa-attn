@@ -183,7 +183,20 @@ static inline FfpaBiasTilePlan ffpa_bias_tile_plan_of(
   if (!aligned16(reinterpret_cast<long long>(bias.ptr)))
     return plan;
   if (bias.stride_n == 1 && bias.stride_m == 0) {
+    // Row-broadcast plane is [b_eff*h_eff, Nkv]: (b,h) must fold to an
+    // exact row (stride_h in {0, Nkv}, stride_b in {0, h_eff*Nkv}) and
+    // the row stride must keep the 16B outer-stride guarantee (TMA
+    // descriptor / cp.async vector), else stay on the gmem fallback.
+    const long long h_eff = bias.stride_h != 0 ? Nh : 1;
+    const long long b_eff = bias.stride_b != 0 ? Nb : 1;
+    if (bias.stride_h != 0 && bias.stride_h != Nkv)
+      return plan;
+    if (bias.stride_b != 0 && bias.stride_b != h_eff * Nkv)
+      return plan;
+    if (!aligned16(Nkv * plan.elem_size))
+      return plan;
     plan.mode = 2;
+    plan.m_total = b_eff * h_eff;
     return plan;
   }
   if (bias.stride_n != 1 || !aligned16(bias.stride_m * plan.elem_size))
@@ -437,17 +450,19 @@ void launch_cute_fwd_split_d_sm120(torch::Tensor Q, torch::Tensor K,
     constexpr int kBiasModeT = decltype(mode_c)::value;
     constexpr int kBias4B = decltype(b4_c)::value;
     constexpr int bias_cols = kBc * (kBias4B ? 2 : 1);
-    const int64_t plane_rows = (kBiasModeT == 1 && bias_plan.mode == 1)
-                                   ? (int64_t)bias_plan.m_total
-                                   : (int64_t)1;
+    // The descriptor is live only when the template mode matches the plan
+    // (mode 2 then spans the real [m_total, Nkv] plane); every other
+    // combination is a never-issued dummy, where bias_cols keeps the TMA
+    // descriptor's 16B outer-stride assert satisfied.
+    const bool bias_desc_live = bias_plan.mode == kBiasModeT;
+    const int64_t plane_rows =
+        bias_desc_live ? (int64_t)bias_plan.m_total : (int64_t)1;
     const int64_t plane_cols =
         (int64_t)std::max<long long>(Nkv, 1) * (kBias4B ? 2 : 1);
-    // dim0 has extent 1 outside the dense plan: bias_cols is semantically
-    // inert there but keeps the TMA descriptor's 16B outer-stride assert
-    // satisfied for the row-vec and never-issued dummy descriptors.
     const int64_t plane_row_stride =
-        (kBiasModeT == 1 && bias_plan.mode == 1)
-            ? (int64_t)attn_bias_stride_m * (kBias4B ? 2 : 1)
+        bias_desc_live
+            ? (kBiasModeT == 1 ? (int64_t)attn_bias_stride_m * (kBias4B ? 2 : 1)
+                               : plane_cols)
             : (int64_t)bias_cols;
     // mode 0 (any demote reason, incl. an unaligned mask ptr) never issues:
     // point every descriptor at the anchor so the 16B address assert holds.
@@ -499,7 +514,7 @@ void launch_cute_fwd_split_d_sm120(torch::Tensor Q, torch::Tensor K,
           attn_bias_ptr, attn_bias_dtype, attn_bias_stride_b,
           attn_bias_stride_h, attn_bias_stride_m, attn_bias_stride_n,
           dropout_p_f, philox_seed_u, philox_offset_u, nhd_out,
-          bias_plan.mode == 1 ? bias_plan.m_total : (long long)1);
+          bias_plan.mode != 0 ? bias_plan.m_total : (long long)1);
     };
 
     using TmaQ = decltype(tma_q);
@@ -813,17 +828,19 @@ void launch_cute_fwd_split_d_m4n2_sm120(torch::Tensor Q, torch::Tensor K,
     constexpr int kBiasModeT = decltype(mode_c)::value;
     constexpr int kBias4B = decltype(b4_c)::value;
     constexpr int bias_cols = kBc * (kBias4B ? 2 : 1);
-    const int64_t plane_rows = (kBiasModeT == 1 && bias_plan.mode == 1)
-                                   ? (int64_t)bias_plan.m_total
-                                   : (int64_t)1;
+    // The descriptor is live only when the template mode matches the plan
+    // (mode 2 then spans the real [m_total, Nkv] plane); every other
+    // combination is a never-issued dummy, where bias_cols keeps the TMA
+    // descriptor's 16B outer-stride assert satisfied.
+    const bool bias_desc_live = bias_plan.mode == kBiasModeT;
+    const int64_t plane_rows =
+        bias_desc_live ? (int64_t)bias_plan.m_total : (int64_t)1;
     const int64_t plane_cols =
         (int64_t)std::max<long long>(Nkv, 1) * (kBias4B ? 2 : 1);
-    // dim0 has extent 1 outside the dense plan: bias_cols is semantically
-    // inert there but keeps the TMA descriptor's 16B outer-stride assert
-    // satisfied for the row-vec and never-issued dummy descriptors.
     const int64_t plane_row_stride =
-        (kBiasModeT == 1 && bias_plan.mode == 1)
-            ? (int64_t)attn_bias_stride_m * (kBias4B ? 2 : 1)
+        bias_desc_live
+            ? (kBiasModeT == 1 ? (int64_t)attn_bias_stride_m * (kBias4B ? 2 : 1)
+                               : plane_cols)
             : (int64_t)bias_cols;
     // mode 0 (any demote reason, incl. an unaligned mask ptr) never issues:
     // point every descriptor at the anchor so the 16B address assert holds.
@@ -875,7 +892,7 @@ void launch_cute_fwd_split_d_m4n2_sm120(torch::Tensor Q, torch::Tensor K,
           attn_bias_ptr, attn_bias_dtype, attn_bias_stride_b,
           attn_bias_stride_h, attn_bias_stride_m, attn_bias_stride_n,
           dropout_p_f, philox_seed_u, philox_offset_u, nhd_out,
-          bias_plan.mode == 1 ? bias_plan.m_total : (long long)1);
+          bias_plan.mode != 0 ? bias_plan.m_total : (long long)1);
     };
 
     using TmaQ = decltype(tma_q);
@@ -1071,17 +1088,19 @@ void launch_cute_fwd_persist_d_sm120(torch::Tensor Q, torch::Tensor K,
     constexpr int kBiasModeT = decltype(mode_c)::value;
     constexpr int kBias4B = decltype(b4_c)::value;
     constexpr int bias_cols = kBc * (kBias4B ? 2 : 1);
-    const int64_t plane_rows = (kBiasModeT == 1 && bias_plan.mode == 1)
-                                   ? (int64_t)bias_plan.m_total
-                                   : (int64_t)1;
+    // The descriptor is live only when the template mode matches the plan
+    // (mode 2 then spans the real [m_total, Nkv] plane); every other
+    // combination is a never-issued dummy, where bias_cols keeps the TMA
+    // descriptor's 16B outer-stride assert satisfied.
+    const bool bias_desc_live = bias_plan.mode == kBiasModeT;
+    const int64_t plane_rows =
+        bias_desc_live ? (int64_t)bias_plan.m_total : (int64_t)1;
     const int64_t plane_cols =
         (int64_t)std::max<long long>(Nkv, 1) * (kBias4B ? 2 : 1);
-    // dim0 has extent 1 outside the dense plan: bias_cols is semantically
-    // inert there but keeps the TMA descriptor's 16B outer-stride assert
-    // satisfied for the row-vec and never-issued dummy descriptors.
     const int64_t plane_row_stride =
-        (kBiasModeT == 1 && bias_plan.mode == 1)
-            ? (int64_t)attn_bias_stride_m * (kBias4B ? 2 : 1)
+        bias_desc_live
+            ? (kBiasModeT == 1 ? (int64_t)attn_bias_stride_m * (kBias4B ? 2 : 1)
+                               : plane_cols)
             : (int64_t)bias_cols;
     // mode 0 (any demote reason, incl. an unaligned mask ptr) never issues:
     // point every descriptor at the anchor so the 16B address assert holds.
@@ -1197,7 +1216,7 @@ void launch_cute_fwd_persist_d_sm120(torch::Tensor Q, torch::Tensor K,
           attn_bias_ptr, attn_bias_dtype, attn_bias_stride_b,
           attn_bias_stride_h, attn_bias_stride_m, attn_bias_stride_n,
           dropout_p_f, philox_seed_u, philox_offset_u, nhd_out,
-          bias_plan.mode == 1 ? bias_plan.m_total : (long long)1);
+          bias_plan.mode != 0 ? bias_plan.m_total : (long long)1);
     };
 
     using TmaQ = decltype(tma_q);
@@ -2590,7 +2609,7 @@ void launch_cute_fwd_split_d_sm80(torch::Tensor Q, torch::Tensor K,
         Tc, causal, attn_bias_ptr, attn_bias_dtype, attn_bias_stride_b,
         attn_bias_stride_h, attn_bias_stride_m, attn_bias_stride_n, dropout_p_f,
         philox_seed_u, philox_offset_u, bias_plan.mode,
-        bias_plan.mode == 1 ? bias_plan.m_total : (long long)1);
+        bias_plan.mode != 0 ? bias_plan.m_total : (long long)1);
   };
 
   if (has_attn_bias && has_dropout) {

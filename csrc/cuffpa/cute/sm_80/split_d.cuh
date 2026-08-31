@@ -203,17 +203,21 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1) split_d_fwd_cute_sm80(
     copy(g2s_copy_v, g2s_thr_v.partition_S(gV), g2s_thr_v.partition_D(sV));
   };
 
-  // Bias tile loader (PC-0): 16B vectorized with OOB zero guard. Row guard
-  // uses the folded plane extent (dense); row-broadcast reads row 0 with
-  // stride_m==0, so the offset formula stays uniform. Tail tiles fall back
-  // to per-element loads only for partially-OOB groups.
+  // Bias tile loader (PC-0): 16B vectorized with OOB zero guard. Plane
+  // rows are stride_m wide (dense) or Nkv wide (row-broadcast); (b,h)
+  // folds to a plane row exactly in both shapes (host-validated), so the
+  // element offset divides without remainder and every (b,h) row start
+  // stays 16B aligned (plan requires Nkv*elem % 16 == 0). Tail tiles fall
+  // back to per-element loads only for partially-OOB groups.
   const int bias_esize = (attn_bias_dtype == 3) ? 4 : 2;
   const int bias_rows_l = (attn_bias_tile_mode == 1) ? kBr : 1;
-  const long long bias_m_off = (attn_bias_tile_mode == 1)
-                                   ? (long long)Nb_id * attn_bias_stride_b +
-                                         (long long)Nh_id * attn_bias_stride_h +
-                                         (long long)Q_tile_id * kBr
-                                   : 0;
+  const long long bias_row_span =
+      (attn_bias_tile_mode == 1) ? attn_bias_stride_m : (long long)Nkv;
+  const long long bias_m_off =
+      ((long long)Nb_id * attn_bias_stride_b +
+       (long long)Nh_id * attn_bias_stride_h) /
+          bias_row_span +
+      ((attn_bias_tile_mode == 1) ? (long long)Q_tile_id * kBr : 0);
   const int bias_slot_u16 = bias_rows_l * kBc * (bias_esize / 2);
   auto g2s_load_bias = [&](int tile) {
     if (attn_bias_tile_mode == 0)
@@ -231,12 +235,12 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1) split_d_fwd_cute_sm80(
         *reinterpret_cast<uint4*>(dst + flat * (bias_esize / 2)) =
             *reinterpret_cast<const uint4*>(
                 reinterpret_cast<const char*>(attn_bias) +
-                ((long long)(bias_m_off + r) * attn_bias_stride_m + gc) *
+                ((long long)(bias_m_off + r) * bias_row_span + gc) *
                     bias_esize);
       } else {
         const char* src_row =
             reinterpret_cast<const char*>(attn_bias) +
-            (long long)(bias_m_off + r) * attn_bias_stride_m * bias_esize;
+            (long long)(bias_m_off + r) * bias_row_span * bias_esize;
 #pragma unroll
         for (int e = 0; e < epv; ++e) {
           const int gc_e = gc + e;
