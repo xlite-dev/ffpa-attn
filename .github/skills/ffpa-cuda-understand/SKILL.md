@@ -447,6 +447,15 @@ lse 公式（NVFP4 PV）：`lse = (m*L + log2(row_sum) + log2(1/2688))*ln2 + sca
 
 同 7.1：native ✓（philox）；cute fp16 ✓（但回退 native）；**fp8/fp4 ✗**；cutedsl 拒绝。
 
+RNG 语义（FC-11 结案，2026-08-31）：element offset
+`((b·Hq+h)·Nq+q)·Nkv+k` 全后端 int64 计算（native 源码本就 u64；Triton
+三处 2026-08-31 修复 int32 回绕）。**本地 torch 2.11.0 mem-eff SDPA 参照系
+在 B·H·Nq·Nkv > 2³² 时自身 uint32 回绕**（PyTorch main 已修，
+`gemm_kernel_utils::dropout_rng_offset`）→ bench 该条件下 dropout parity
+失配输出 `[torch-ref-2^32-bug]` 标注（⚠️ 而非 ❌）。大 N 回归防线：
+B1 H16 N16384（=2³²）对 SDPA parity、B1 H32 N16384（=2³³）cuda vs triton
+交叉一致性（`tests/test_ffpa_fwd.py`）。
+
 ### 7.3 causal 语义
 
 全部路径统一 **tail-aligned**（query 行 r attend `k ≤ r + (Nkv - Nq)`，与 FlashAttention 一致）；要求 `Nkv ≥ Nq`。**与 SDPA `is_causal=True` 的 top-left 对齐在 `Nq != Nkv` 时数学上不同**——对照验证必须 `Nq==Nkv` 或手工构造 tail-aligned mask。
