@@ -146,12 +146,14 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
   __shared__ uint64_t qk_empty[kStagesQK];
   __shared__ uint64_t v_full[kStagesPV];
   __shared__ uint64_t v_empty[kStagesPV];
-  // Bias tile (PC-0): single-buffered [kBr,kBc] (dense) or [1,kBc]
-  // (row-broadcast). A single stage halves the dense footprint so the tile
-  // fits the smem budget next to the QK/V buffers; the reissue happens right
-  // after the consumer's injection (see below). Tile mode 0 keeps the
-  // gmem-direct FC-4 path.
-  constexpr int kBiasStages = 1;
+  // Bias tile (PC-0): [kBr,kBc] (dense) or [1,kBc] (row-broadcast). Dense
+  // runs single-buffered (halves the footprint so the tile fits the smem
+  // budget next to the QK/V buffers; the reissue happens right after the
+  // consumer's injection, see below). Row-broadcast keeps a 512B
+  // double-buffer: the tiny tile would otherwise expose the full TMA latency
+  // on every kv tile (NCU: long_scoreboard/sleeping dominate the bias gap).
+  // Tile mode 0 keeps the gmem-direct FC-4 path.
+  constexpr int kBiasStages = (kBiasMode == 2) ? 2 : 1;
   __shared__ uint64_t bias_full[kBiasStages];
   __shared__ uint64_t bias_empty[kBiasStages];
   uint16_t* bias_base = reinterpret_cast<uint16_t*>(
@@ -422,6 +424,14 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
       }
     }
 
+    // 2-stage bias prefetch: issue (t+1) before this tile's QK/softmax so the
+    // TMA hides behind them; empty-wait(t+1) needs only the previous tile's
+    // injection arrive, which finished last iteration (no self-deadlock).
+    if constexpr (kHasAttnBias && kBiasMode != 0) {
+      if (kBiasStages == 2 && kv_tile + 1 < Tc_eff && tid == 0)
+        issue_bias_tma(kv_tile + 1);
+    }
+
     // Phase 1: QK GEMM with split-D accumulation
     auto tCrS = partition_fragment_C(tiled_mma_qk, Shape<Int<kBr>, Int<kBc>>{});
     clear(tCrS);
@@ -533,7 +543,7 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
         // released the buffer (tid 0 joins the injection; waiting in the
         // prefetch block would self-deadlock). The TMA overlaps this tile's
         // softmax + PV.
-        if (kv_tile + 1 < Tc_eff && tid == 0)
+        if (kBiasStages == 1 && kv_tile + 1 < Tc_eff && tid == 0)
           issue_bias_tma(kv_tile + 1);
       } else if constexpr (kHasAttnBias) {
         ffpa_cute::apply_attn_bias_rowcol<decltype(scores), decltype(tScS_rc),

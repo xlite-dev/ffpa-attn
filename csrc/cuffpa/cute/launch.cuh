@@ -415,9 +415,14 @@ void launch_cute_fwd_split_d_sm120(torch::Tensor Q, torch::Tensor K,
     bias_plan = ffpa_bias_tile_plan_of(bias_p, Nb, Nh, Nq, Nkv);
   }
   // sm_120 max opt-in dynamic smem per block is 99KB (101376B), which also
-  // caps the dense bias tile next to the QK/V buffers.
+  // caps the dense bias tile next to the QK/V buffers. Row-broadcast keeps
+  // a double buffer (tiny tile; hides the TMA latency, see split_d.cuh) —
+  // the stages must mirror the kernel's kBiasStages so the dynamic smem
+  // covers every slot.
   constexpr int kSmemBudgetBytes = 99 * 1024;
-  if (kBaseSmemBytes + bias_plan.tile_bytes(kBr, kBc) > kSmemBudgetBytes)
+  const int bias_stages = (bias_plan.mode == 2) ? 2 : 1;
+  if (kBaseSmemBytes + bias_plan.tile_bytes(kBr, kBc, bias_stages) >
+      kSmemBudgetBytes)
     bias_plan.mode = 0;
   const auto make_tma_bias = [&](auto mode_c, auto b4_c) {
     constexpr int kBiasModeT = decltype(mode_c)::value;
@@ -461,7 +466,8 @@ void launch_cute_fwd_split_d_sm120(torch::Tensor Q, torch::Tensor K,
                                     std::integral_constant<int, 0>{});
   auto tma_bias_r32 = make_tma_bias(std::integral_constant<int, 2>{},
                                     std::integral_constant<int, 1>{});
-  const int kSmemBytes = kBaseSmemBytes + (int)bias_plan.tile_bytes(kBr, kBc);
+  const int kSmemBytes =
+      kBaseSmemBytes + (int)bias_plan.tile_bytes(kBr, kBc, bias_stages);
 
   float* softmax_lse_ptr =
       softmax_lse.numel() > 0 ? softmax_lse.data_ptr<float>() : nullptr;
@@ -766,8 +772,13 @@ void launch_cute_fwd_split_d_m4n2_sm120(torch::Tensor Q, torch::Tensor K,
     bias_plan = ffpa_bias_tile_plan_of(bias_p, Nb, Nh, Nq, Nkv);
   }
   const int kBaseSmemBytes = Traits::kSmemElems * sizeof(Element);
+  // Row-broadcast keeps a double buffer (tiny tile; hides the TMA latency,
+  // see split_d_m4n2.cuh); the stages must mirror the kernel's kBiasStages
+  // so the dynamic smem covers every slot.
   constexpr int kSmemBudgetBytes = 99 * 1024;
-  if (kBaseSmemBytes + bias_plan.tile_bytes(kBr, kBc) > kSmemBudgetBytes)
+  const int bias_stages = (bias_plan.mode == 2) ? 2 : 1;
+  if (kBaseSmemBytes + bias_plan.tile_bytes(kBr, kBc, bias_stages) >
+      kSmemBudgetBytes)
     bias_plan.mode = 0;
   const auto make_tma_bias = [&](auto mode_c, auto b4_c) {
     constexpr int kBiasModeT = decltype(mode_c)::value;
@@ -811,7 +822,8 @@ void launch_cute_fwd_split_d_m4n2_sm120(torch::Tensor Q, torch::Tensor K,
                                     std::integral_constant<int, 0>{});
   auto tma_bias_r32 = make_tma_bias(std::integral_constant<int, 2>{},
                                     std::integral_constant<int, 1>{});
-  const int kSmemBytes = kBaseSmemBytes + (int)bias_plan.tile_bytes(kBr, kBc);
+  const int kSmemBytes =
+      kBaseSmemBytes + (int)bias_plan.tile_bytes(kBr, kBc, bias_stages);
 
   float* softmax_lse_ptr =
       softmax_lse.numel() > 0 ? softmax_lse.data_ptr<float>() : nullptr;
