@@ -221,12 +221,16 @@ def _format_backward_result(
     dmask_msg = "dMask_err=(SKIPPED FFPA fwd fallback)"
   else:
     dmask_msg = "dMask_err=(NO Grad)"
+  parity_note = ""
+  if result.get("ref_wrapped") and result["allclose"] is False:
+    parity_note = "[torch-ref-2^32-bug] "
   return (
     f"[{result['case_name']:<12} {result['dtype']:>4}] "
     f"B={result['B']:<1} Hq={result['Hq']:<2} Hkv={result['Hkv']:<2} "
     f"Nq={result['Nq']:<5} Nkv={result['Nkv']:<5} D={result['D']:<3} "
     f"dQ_err={result['dq_err']:.4e} dK_err={result['dk_err']:.4e} "
     f"dV_err={result['dv_err']:.4e} {dmask_msg:<20}  "
+    f"{parity_note}"
     f"FFPA={result['ffpa_ms']:<6.2f}ms SDPA={result['sdpa_ms']:<6.2f}ms  "
     f"TFLOPS={tflops_str:<9} "
     f"🎉{result['speedup']:<4.2f}x"
@@ -847,6 +851,18 @@ def _run_case(
   )
   if dmask_ffpa is not None and dmask_ref is not None:
     allclose = allclose and _tensor_allclose(dmask_ffpa, dmask_ref, tol)
+  # Same reference defect as the forward runner: torch's mem-efficient SDPA
+  # derives the per-(b,h) dropout Philox offset in 32-bit arithmetic and the
+  # reference mask wraps once B*Hq*Nq*Nkv exceeds 2**32 score elements
+  # (fixed on PyTorch main). A dropout mismatch at that scale indicts the
+  # reference, not the kernel.
+  sdpa_dropout_ref_wrapped = dropout_p > 0.0 and B * Nh_q * Nq * Nkv > 2**32
+  if sdpa_dropout_ref_wrapped and not allclose:
+    print(
+      f"[warn] {name}: torch mem-efficient SDPA dropout RNG offset wraps"
+      " above 2^32 score elements (reference bug, fixed on PyTorch"
+      " main); parity mismatch attributed to the reference"
+    )
 
   result: BACKWARD_RESULT = {
     "case_name": name,
@@ -868,6 +884,7 @@ def _run_case(
     "dmask_status": dmask_status,
     "compare_mask_grad": compare_mask_grad,
     "allclose": allclose,
+    "ref_wrapped": sdpa_dropout_ref_wrapped,
     "tolerance": tol,
     "warmup": warmup,
     "iters": iters,

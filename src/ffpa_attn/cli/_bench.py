@@ -1552,11 +1552,16 @@ def _allclose_marker(row: RESULT_ROW) -> str:
   """Convert the allclose field into the Markdown marker.
 
   :param row: Structured result row.
-  :return: ``✅``, ``❌``, or ``-``.
+  :return: ``✅``, ``❌``, ``⚠️`` (torch reference bug), or ``-``.
   """
   if row.get("allclose") is True:
     return "✅"
   if row.get("allclose") is False:
+    # torch's mem-efficient SDPA wraps its dropout RNG offset above 2**32
+    # score elements (fixed on PyTorch main); the mismatch is the
+    # reference's, not the kernel's.
+    if row.get("ref_wrapped"):
+      return "⚠️"
     return "❌"
   return "-"
 
