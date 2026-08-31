@@ -1,6 +1,7 @@
 #include <torch/extension.h>
 #include <torch/types.h>
 
+#include <ATen/cuda/CUDAContext.h>
 #include <stdexcept>
 
 #include "backend.h"
@@ -126,16 +127,17 @@ void ffpa_attn_forward(
         torch::TensorOptions().dtype(torch::kFloat32).device(Q.device()));
   }
 
-  // FP8 head_dim pad: non-32-multiple D (e.g. 120) pads up to the next
-  // compiled head_dim (120->128, 280->320, 504->512) to hit a compiled
-  // kernel. Works for persist_d (D_pad<=224), split_d M8N1 (224<D_pad<768)
-  // and split_d M4N2 (D_pad>=768). softmax_scale uses the real D (Python
-  // resolves 1/sqrt(D_og)); Q/K/V are NOT padded — quantize kernels read
-  // with stride=D_og and zero-fill output pad cols. Only O is padded (TMA
-  // store needs compile-time kHeadDim stride); output is sliced back.
-  // Per-block and per-channel V quant both work: per-channel stats/quantize
-  // are D_og-aware (pad cols get v_scale=1, vm=0; VT pad rows are zero).
-  // CUTE_TMA_FP8/CUTE_TMA/CUTE paths. Dispatch goes through the generated
+  // head_dim pad: non-32-multiple D (e.g. 120) pads up to the next compiled
+  // head_dim to hit a compiled kernel. Works for persist_d (D_pad<=224),
+  // split_d M8N1 (224<D_pad<768) and split_d M4N2 (D_pad>=768).
+  // softmax_scale uses the real D (Python resolves 1/sqrt(D_og)); Q/K/V are
+  // NOT padded for fp8/native (quantize / cp.async / TMA kernels read with
+  // stride=D_og and zero-fill output pad cols), and for CUTE/CUTE_TMA/fp4
+  // torch-padded inside the cuffpa launcher. Only O is padded here (TMA
+  // store / gmem stores need compile-time kHeadDim stride); output is
+  // sliced back. Per-block and per-channel V quant both work: per-channel
+  // stats/quantize are D_og-aware (pad cols get v_scale=1, vm=0; VT pad rows
+  // are zero). Dispatch goes through the generated
   // ffpa_attn_fwd_*_d(..., head_dim_pad) helper, which throws a clean error
   // if head_dim_pad was not compiled.
   const int head_dim_og = Q.size(3);
@@ -153,13 +155,28 @@ void ffpa_attn_forward(
       "within [8,1024] (any such D pads up to the nearest 64-multiple), "
       "got D=",
       head_dim_og);
+  // FC-8: the native family (AUTO/NATIVE cp.async, sm90+ TMA) pads to the
+  // next 64-multiple — its compiled support set — and consumes D_og-wide
+  // Q/K/V directly (kernels zero-fill pad cols), so only O is padded here.
+  const bool is_native = pad_backend == ffpa::CudaBackendImpl::AUTO ||
+                         pad_backend == ffpa::CudaBackendImpl::NATIVE;
+#ifdef ENABLE_FFPA_TMA_EXT
+  // Mirror the cuffpa launcher's dispatch: a tma hint only runs the native
+  // TMA kernel on sm90+; below that (or without the TMA ext) it falls back
+  // to the CUTE sm80 path, which uses the 32-align pad instead.
+  auto prop_pad = at::cuda::getCurrentDeviceProperties();
+  const bool is_native_tma =
+      pad_backend == ffpa::CudaBackendImpl::TMA && prop_pad->major >= 9;
+#else
+  const bool is_native_tma = false;
+#endif
+  const bool native_pad_family = is_native || is_native_tma;
+  const int head_dim_pad_native = (head_dim_og + 63) & ~63;
   torch::Tensor O_orig;
-  const int head_dim_dispatch = is_fp4 ? head_dim_pad_fp4 : head_dim_pad;
-  const bool needs_pad = (pad_backend == ffpa::CudaBackendImpl::CUTE_TMA_FP8 ||
-                          pad_backend == ffpa::CudaBackendImpl::CUTE_TMA ||
-                          pad_backend == ffpa::CudaBackendImpl::CUTE ||
-                          pad_backend == ffpa::CudaBackendImpl::CUTE_TMA_FP4) &&
-                         head_dim_dispatch != head_dim_og;
+  const int head_dim_dispatch = is_fp4              ? head_dim_pad_fp4
+                                : native_pad_family ? head_dim_pad_native
+                                                    : head_dim_pad;
+  const bool needs_pad = head_dim_dispatch != head_dim_og;
   if (needs_pad) {
     TORCH_CHECK(head_dim_og % 8 == 0,
                 "ffpa_attn: non-32-multiple head_dim must be D%8==0, got D=",
@@ -167,6 +184,11 @@ void ffpa_attn_forward(
     if (is_fp4) {
       TORCH_CHECK(head_dim_dispatch >= 64 && head_dim_dispatch <= 1024,
                   "ffpa_attn: fp4 padded head_dim must be in [64,1024], got ",
+                  head_dim_dispatch);
+    } else if (native_pad_family) {
+      TORCH_CHECK(head_dim_dispatch >= 64 && head_dim_dispatch <= 1024,
+                  "ffpa_attn: native padded head_dim must be in [64,1024], "
+                  "got ",
                   head_dim_dispatch);
     } else {
       TORCH_CHECK(head_dim_dispatch >= 32 && head_dim_dispatch <= 1024,
@@ -193,7 +215,7 @@ void ffpa_attn_forward(
     if (acc == 0) {
 #ifdef ENABLE_FFPA_F16_ACC
       TORCH_CHECK(!needs_pad,
-                  "ffpa_attn: fp16-acc + non-32 head_dim pad is not supported");
+                  "ffpa_attn: fp16-acc + head_dim pad is not supported");
       ffpa_attn_fwd_fp16f16(FFPA_FWD_ARGS);
 #else
       throw std::invalid_argument(

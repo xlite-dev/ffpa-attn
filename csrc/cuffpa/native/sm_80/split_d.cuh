@@ -104,7 +104,7 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
         const long long attn_bias_stride_h, const long long attn_bias_stride_m,
         const long long attn_bias_stride_n, const float dropout_p,
         const unsigned long long philox_seed,
-        const unsigned long long philox_offset) {
+        const unsigned long long philox_offset, const int d_og) {
   ffpa::prefill::check_large_d_compiling_states<
       kHeadDim, kMmaAtomM, kMmaAtomN, kMmaAtomK, kMmaTileSeqLenQ,
       kMmaTileSeqLenK, kMmaTileSeqLenP, kMmaTileHeadDimV, kValTileSeqLenQ,
@@ -134,12 +134,15 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
   // kv_head_idx).
   const int group_size = Nh / Nh_kv;
   const int kv_head_idx = Nh_id / group_size;
+  // d_og: real gmem row width of Q/K/V (== kHeadDim unless the head_dim pad
+  // path shrunk the rows); O is always kHeadDim-wide (api-layer padded O).
   const int Q_gmem_offset =
-      ((Nb_id * Nh * Nq * kHeadDim) + (Nh_id * Nq * kHeadDim));  // Q [seqlen,d]
-  const int K_gmem_offset = ((Nb_id * Nh_kv * Nkv * kHeadDim) +
-                             (kv_head_idx * Nkv * kHeadDim));  // K [seqlen,d]
-  const int V_gmem_offset = K_gmem_offset;                     // V [seqlen,d]
-  const int O_gmem_offset = Q_gmem_offset;                     // O [seqlen,d]
+      ((Nb_id * Nh * Nq * d_og) + (Nh_id * Nq * d_og));  // Q [seqlen,d]
+  const int K_gmem_offset =
+      ((Nb_id * Nh_kv * Nkv * d_og) + (kv_head_idx * Nkv * d_og));  // K
+  const int V_gmem_offset = K_gmem_offset;                          // V
+  const int O_gmem_offset =
+      ((Nb_id * Nh * Nq * kHeadDim) + (Nh_id * Nq * kHeadDim));  // O [seqlen,d]
 
   // int load_gmem_Q_Br = Q_tile_id * Br + load_smem_Q_Br;
   // if ((Q_tile_id * Br + (threadIdx.x / (kNumThreads / Br))) >= Nq) return;
@@ -174,7 +177,8 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
     for (int tile_K_d = 0; tile_K_d < (kHeadDim / kMmaAtomK); ++tile_K_d) {
       ffpa::prefill::cp_async_qkv_g2s<Br, Q_tile_size, kHeadDim, kMmaAtomK,
                                       kNumThreads, kPadQ>(
-          smem_Q_base_ptr, Q, Q_gmem_offset, Q_tile_id, tile_K_d, tile_K_d, Nq);
+          smem_Q_base_ptr, Q, Q_gmem_offset, Q_tile_id, tile_K_d, tile_K_d, Nq,
+          d_og);
       ffpa::cp_async::commit_group();
     }
   }
@@ -242,13 +246,13 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
               ffpa::prefill::cp_async_qkv_g2s<Br, Q_tile_size, kHeadDim,
                                               kMmaAtomK, kNumThreads, kPadQ>(
                   smem_Q_base_ptr, Q, Q_gmem_offset, Q_tile_id, stage, stage,
-                  Nq);
+                  Nq, d_og);
             }
 
             ffpa::prefill::cp_async_qkv_g2s<Bc, K_tile_size, kHeadDim,
                                             kMmaAtomK, kNumThreads, kPadK>(
                 smem_K_base_ptr, K, K_gmem_offset, tile_K_seqlen, stage, stage,
-                Nkv);
+                Nkv, d_og);
             ffpa::cp_async::commit_group();  // pack QK as 1 group.
           }  // end for stage
           ffpa::cp_async::wait_group<(kStageQK - 2)>();
@@ -268,21 +272,21 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
               ffpa::prefill::cp_async_qkv_g2s<Br, Q_tile_size, kHeadDim,
                                               kMmaAtomK, kNumThreads, kPadQ>(
                   smem_Q_base_ptr, Q, Q_gmem_offset, Q_tile_id, stage, stage,
-                  Nq);
+                  Nq, d_og);
             }
           } else {
             if constexpr (!kPersistQg2s) {
               ffpa::prefill::cp_async_qkv_g2s<Br, Q_tile_size, kHeadDim,
                                               kMmaAtomK, kNumThreads, kPadQ>(
                   smem_Q_base_ptr, Q, Q_gmem_offset, Q_tile_id, stage, stage,
-                  Nq);
+                  Nq, d_og);
             }
           }
 
           ffpa::prefill::cp_async_qkv_g2s<Bc, K_tile_size, kHeadDim, kMmaAtomK,
                                           kNumThreads, kPadK>(
               smem_K_base_ptr, K, K_gmem_offset, tile_K_seqlen, stage, stage,
-              Nkv);
+              Nkv, d_og);
           ffpa::cp_async::commit_group();  // pack QK as 1 group.
         }  // end for stage
         ffpa::cp_async::wait_group<(kStageQK - 2)>();
@@ -299,7 +303,7 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
           ffpa::prefill::cp_async_qkv_g2s<Bc, V_tile_size, kHeadDim,
                                           kMmaAtomN * 2, kNumThreads, kPadV>(
               smem_V_base_ptr, V, V_gmem_offset, tile_K_seqlen, stage, stage,
-              Nkv);
+              Nkv, d_og);
           ffpa::cp_async::commit_group();
         }
       }
@@ -320,7 +324,7 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
                                           kNumThreads, kPadQ>(
               smem_Q_base_ptr, Q, Q_gmem_offset, Q_tile_id,
               (kStageQK > 1) ? (tile_K_d + (kStageQK - 1)) : tile_K_d,
-              (kStageQK > 1) ? smem_sel_next : smem_sel, Nq);
+              (kStageQK > 1) ? smem_sel_next : smem_sel, Nq, d_og);
         }
       } else {
         if constexpr (!kPersistQg2s) {
@@ -328,7 +332,7 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
                                           kNumThreads, kPadQ>(
               smem_Q_base_ptr, Q, Q_gmem_offset, Q_tile_id,
               (kStageQK > 1) ? (tile_K_d + (kStageQK - 1)) : tile_K_d,
-              (kStageQK > 1) ? smem_sel_next : smem_sel, Nq);
+              (kStageQK > 1) ? smem_sel_next : smem_sel, Nq, d_og);
         }
       }
 
@@ -336,7 +340,7 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
                                       kNumThreads, kPadK>(
           smem_K_base_ptr, K, K_gmem_offset, tile_K_seqlen,
           (kStageQK > 1) ? (tile_K_d + (kStageQK - 1)) : tile_K_d,
-          (kStageQK > 1) ? smem_sel_next : smem_sel, Nkv);
+          (kStageQK > 1) ? smem_sel_next : smem_sel, Nkv, d_og);
       ffpa::cp_async::commit_group();  // pack QK as 1 group.
 
       if constexpr (kStageQK <= 1) {
@@ -400,7 +404,7 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
               ffpa::prefill::cp_async_qkv_g2s<
                   Bc, V_tile_size, kHeadDim, kMmaAtomN * 2, kNumThreads, kPadV>(
                   smem_V_base_ptr, V, V_gmem_offset, tile_K_seqlen, stage,
-                  stage, Nkv);
+                  stage, Nkv, d_og);
               ffpa::cp_async::commit_group();
             }
           }
@@ -464,7 +468,7 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
           ffpa::prefill::cp_async_qkv_g2s<Bc, V_tile_size, kHeadDim,
                                           kMmaAtomN * 2, kNumThreads, kPadV>(
               smem_V_base_ptr, V, V_gmem_offset, tile_K_seqlen, stage, stage,
-              Nkv);
+              Nkv, d_og);
           ffpa::cp_async::commit_group();
         }
       }
@@ -554,13 +558,14 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
           if constexpr (!kPersistQs2r) {
             ffpa::prefill::cp_async_qkv_g2s<Br, Q_tile_size, kHeadDim,
                                             kMmaAtomK, kNumThreads, kPadQ>(
-                smem_Q_base_ptr, Q, Q_gmem_offset, Q_tile_id, stage, stage, Nq);
+                smem_Q_base_ptr, Q, Q_gmem_offset, Q_tile_id, stage, stage, Nq,
+                d_og);
           }
 
           ffpa::prefill::cp_async_qkv_g2s<Bc, K_tile_size, kHeadDim, kMmaAtomK,
                                           kNumThreads, kPadK>(
               smem_K_base_ptr, K, K_gmem_offset, tile_K_seqlen + 1, stage,
-              stage, Nkv);
+              stage, Nkv, d_og);
           ffpa::cp_async::commit_group();  // pack QK as 1 group.
         }  // end for stage
       }
@@ -593,7 +598,7 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
                                           kMmaAtomN * 2, kNumThreads, kPadV>(
               smem_V_base_ptr, V, V_gmem_offset, tile_K_seqlen,
               (kStagePV > 1) ? (tile_V_d + (kStagePV - 1)) : tile_V_d,
-              (kStagePV > 1) ? smem_sel_v_next : smem_sel_v, Nkv);
+              (kStagePV > 1) ? smem_sel_v_next : smem_sel_v, Nkv, d_og);
           ffpa::cp_async::commit_group();
           if constexpr (kStagePV <= 1) {
             ffpa::cp_async::wait_group<0>();
@@ -634,13 +639,13 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
                                                     kMmaAtomK, kNumThreads,
                                                     kPadQ>(
                         smem_Q_base_ptr, Q, Q_gmem_offset, Q_tile_id, stage,
-                        stage, Nq);
+                        stage, Nq, d_og);
                   }
 
                   ffpa::prefill::cp_async_qkv_g2s<
                       Bc, K_tile_size, kHeadDim, kMmaAtomK, kNumThreads, kPadK>(
                       smem_K_base_ptr, K, K_gmem_offset, tile_K_seqlen + 1,
-                      stage, stage, Nkv);
+                      stage, stage, Nkv, d_og);
                   ffpa::cp_async::commit_group();  // pack QK as 1 group.
                 }  // end for stage
               }

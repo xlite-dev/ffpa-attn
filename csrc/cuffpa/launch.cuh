@@ -211,19 +211,33 @@ void launch_ffpa_attn_fwd_template(
                 "path (%32 == 0)");
   }
 
-  // fp16/bf16 head_dim pad: non-32-multiple D_og (e.g. 120) zero-pads Q/K/V
-  // to the compiled kHeadDim. fp8 skips (quantize reads D_og natively); O is
-  // padded by ffpa_api.cc. Only reachable via the CUTE_TMA/CUTE pad paths
-  // (native/AUTO always have D_og == kHeadDim), so the TMA and cp.async
-  // dispatch below both see D_pad-wide Q/K/V. fp4 also skips when D_og%8==0
-  // (the api gate): its quantize/delta_s kernels read the original width and
-  // zero-fill pad cols (no pad copy); FFPA_FP4_PAD_TORCH=1 forces the torch
-  // pad path for A/B comparison and as a fallback.
+  // fp16/bf16 head_dim pad: non-32-multiple D_og (e.g. 120) needs Q/K/V rows
+  // widened to the compiled kHeadDim. Which mechanism applies depends on the
+  // backend (FC-8):
+  //   - AUTO/NATIVE (cp.async) and the sm90+ TMA native path consume D_og-wide
+  //     rows directly: kernels zero-fill pad cols (cp.async src-size guard /
+  //     TMA OOB zero fill), so no pad copy here.
+  //   - TMA hint on pre-sm90 hardware (or without the TMA ext) falls back to
+  //     the CUTE sm80 kernel, which still needs the torch pad copy — hence
+  //     tma_kernel_active requires both the ext and major >= 9.
+  //   - CUTE/CUTE_TMA fp16 paths keep the torch pad copy below.
+  //   - fp8 skips (quantize reads D_og natively); O is padded by ffpa_api.cc.
+  //   - fp4 skips when D_og%8==0 (the api gate): its quantize/delta_s kernels
+  //     read the original width and zero-fill pad cols; FFPA_FP4_PAD_TORCH=1
+  //     forces the torch pad path for A/B comparison and as a fallback.
   const int D_og = Q.size(3);
   const bool d_padded = D_og != kHeadDim;
+#ifdef ENABLE_FFPA_TMA_EXT
+  auto prop_pad = at::cuda::getCurrentDeviceProperties();
+  const bool tma_kernel_active = force_tma && prop_pad->major >= 9;
+#else
+  const bool tma_kernel_active = false;
+#endif
+  const bool native_kernel_pad = force_native || tma_kernel_active;
   const bool fp4_fused =
       force_fp4 && D_og % 8 == 0 && getenv("FFPA_FP4_PAD_TORCH") == nullptr;
-  const bool qkv_padded = d_padded && !force_fp8 && !fp4_fused;
+  const bool qkv_padded =
+      d_padded && !force_fp8 && !fp4_fused && !native_kernel_pad;
   if (qkv_padded) {
     const int64_t pad_cols = kHeadDim - D_og;
     Q = torch::constant_pad_nd(Q, {0, pad_cols}, 0.0);

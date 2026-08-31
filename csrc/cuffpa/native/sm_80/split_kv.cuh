@@ -23,14 +23,12 @@ template <typename kDataType, const int kHeadDim, const bool kUseGemv,
           const int kStage = 2>
 __global__ void __launch_bounds__(((kHeadDim / 8 + WARP_SIZE - 1) / WARP_SIZE) *
                                   WARP_SIZE)
-    split_kv_decode_s1_fwd_sm80(const kDataType* __restrict__ Q,
-                                const kDataType* __restrict__ K,
-                                const kDataType* __restrict__ V,
-                                float* __restrict__ partial_out,
-                                float* __restrict__ chunk_lse, const int Nq,
-                                const int Nkv, const int Nh, const int Nh_kv,
-                                const float scale, const int num_splits,
-                                const int split_size, const int causal) {
+    split_kv_decode_s1_fwd_sm80(
+        const kDataType* __restrict__ Q, const kDataType* __restrict__ K,
+        const kDataType* __restrict__ V, float* __restrict__ partial_out,
+        float* __restrict__ chunk_lse, const int Nq, const int Nkv,
+        const int Nh, const int Nh_kv, const float scale, const int num_splits,
+        const int split_size, const int causal, const int d_og) {
   using Traits = ffpa::DtypeTraits<kDataType>;
   constexpr int kElemsPerThread = 8;
   static_assert(kHeadDim % kElemsPerThread == 0,
@@ -76,8 +74,10 @@ __global__ void __launch_bounds__(((kHeadDim / 8 + WARP_SIZE - 1) / WARP_SIZE) *
   __shared__ float row_p[kMaxRows];
   __shared__ float row_rescale[kMaxRows];
 
-  const int q_base = ((Nb_id * Nh + Nh_id) * Nq) * kHeadDim;
-  const int kv_base = ((Nb_id * Nh_kv + kv_head_idx) * Nkv) * kHeadDim;
+  // d_og: real gmem row width of Q/K/V (== kHeadDim unless head_dim padded);
+  // partial_out / O stay kHeadDim-wide.
+  const int q_base = ((Nb_id * Nh + Nh_id) * Nq) * d_og;
+  const int kv_base = ((Nb_id * Nh_kv + kv_head_idx) * Nkv) * d_og;
 
   // Vector constants for cp.async row loads (8×half/bf16 = 128-bit).
   constexpr int kVecRow =
@@ -96,8 +96,9 @@ __global__ void __launch_bounds__(((kHeadDim / 8 + WARP_SIZE - 1) / WARP_SIZE) *
       for (int i = tid; i < kNumVecRow; i += kNumThreads) {
         uint32_t smem_ptr =
             __cvta_generic_to_shared(&K_tile[slot][i * kVecRow]);
-        ffpa::cp_async::cp_async<16>(smem_ptr,
-                                     &K[kv_base + gk * kHeadDim + i * kVecRow]);
+        ffpa::cp_async::cp_async_zfill<16>(
+            smem_ptr, &K[kv_base + gk * d_og + i * kVecRow],
+            i * kVecRow < d_og);
       }
     }
   }
@@ -105,16 +106,17 @@ __global__ void __launch_bounds__(((kHeadDim / 8 + WARP_SIZE - 1) / WARP_SIZE) *
   {
     for (int i = tid; i < kNumVecRow; i += kNumThreads) {
       uint32_t v_smem = __cvta_generic_to_shared(&V_tile[i * kVecRow]);
-      ffpa::cp_async::cp_async<16>(
-          v_smem, &V[kv_base + split_start * kHeadDim + i * kVecRow]);
+      ffpa::cp_async::cp_async_zfill<16>(
+          v_smem, &V[kv_base + split_start * d_og + i * kVecRow],
+          i * kVecRow < d_og);
     }
   }
   // Q load (async cp.async, overlaps with K+V).
   for (int row = 0; row < active_rows; ++row) {
     for (int i = tid; i < kNumVecRow; i += kNumThreads) {
       uint32_t q_smem = __cvta_generic_to_shared(&q_tile[row][i * kVecRow]);
-      ffpa::cp_async::cp_async<16>(q_smem,
-                                   &Q[q_base + row * kHeadDim + i * kVecRow]);
+      ffpa::cp_async::cp_async_zfill<16>(
+          q_smem, &Q[q_base + row * d_og + i * kVecRow], i * kVecRow < d_og);
     }
   }
   // Single commit: K + V + Q all in one group.
@@ -145,8 +147,9 @@ __global__ void __launch_bounds__(((kHeadDim / 8 + WARP_SIZE - 1) / WARP_SIZE) *
     if (global_k > split_start) {
       for (int i = tid; i < kNumVecRow; i += kNumThreads) {
         uint32_t v_smem = __cvta_generic_to_shared(&V_tile[i * kVecRow]);
-        ffpa::cp_async::cp_async<16>(
-            v_smem, &V[kv_base + global_k * kHeadDim + i * kVecRow]);
+        ffpa::cp_async::cp_async_zfill<16>(
+            v_smem, &V[kv_base + global_k * d_og + i * kVecRow],
+            i * kVecRow < d_og);
       }
       ffpa::cp_async::commit_group();  // → group 0 = V
     }
@@ -166,8 +169,14 @@ __global__ void __launch_bounds__(((kHeadDim / 8 + WARP_SIZE - 1) / WARP_SIZE) *
           const int d = tid * kElemsPerThread;
           uint4 qv, kv_g;
           ffpa::cp_async::ldg_sync_128b(&qv, &q_tile[row][d]);
-          ffpa::cp_async::ldg_sync_128b(&kv_g,
-                                        &K[kv_base + global_k * kHeadDim + d]);
+          // Pad cols (d >= d_og) have no gmem backing; zero the vector so the
+          // dot product stays exact without an out-of-bounds read.
+          if (d < d_og) {
+            ffpa::cp_async::ldg_sync_128b(&kv_g,
+                                          &K[kv_base + global_k * d_og + d]);
+          } else {
+            kv_g = make_uint4(0, 0, 0, 0);
+          }
           const kDataType* qh = reinterpret_cast<const kDataType*>(&qv);
           const kDataType* kh = reinterpret_cast<const kDataType*>(&kv_g);
           // TODO: Warp reduction here instead of register reduction for better
@@ -200,8 +209,9 @@ __global__ void __launch_bounds__(((kHeadDim / 8 + WARP_SIZE - 1) / WARP_SIZE) *
           for (int i = tid; i < kNumVecRow; i += kNumThreads) {
             uint32_t smem_ptr =
                 __cvta_generic_to_shared(&K_tile[slot][i * kVecRow]);
-            ffpa::cp_async::cp_async<16>(
-                smem_ptr, &K[kv_base + prefetch_k * kHeadDim + i * kVecRow]);
+            ffpa::cp_async::cp_async_zfill<16>(
+                smem_ptr, &K[kv_base + prefetch_k * d_og + i * kVecRow],
+                i * kVecRow < d_og);
           }
           ffpa::cp_async::commit_group();  // → group 0 = K, group 1 = V
         }

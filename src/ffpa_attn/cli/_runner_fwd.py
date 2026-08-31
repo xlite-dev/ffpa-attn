@@ -625,13 +625,18 @@ def run_forward_examples(
         "Nq": 1024,
         "Nkv": N
       },
-      {
+    ]
+    # decode (Nq==1) runs the fp16 native split-KV fast path; the fp8/fp4
+    # families have no decode kernel, so skip the case there.
+    if not enable_fp8 and not enable_fp4:
+      case_specs.append({
         "name": "decode-attn",
         "Nh_q": H,
         "Nh_kv": H,
         "Nq": 1,
         "Nkv": N
-      },
+      })
+    case_specs.extend([
       {
         "name": "gqa",
         "Nh_q": H,
@@ -647,8 +652,8 @@ def run_forward_examples(
         "Nkv": N,
         "causal": True
       },
-    ]
-    if forward_backend != "cutedsl" and not enable_fp8 and not enable_fp4:
+    ])
+    if forward_backend != "cutedsl":
       mask_n = max(N, 512)
       case_specs.append({
         "name":
