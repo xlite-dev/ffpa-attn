@@ -163,7 +163,7 @@ Dispatch 细节（`launch.cuh`）：
 | 特性 | 支持情况 |
 |---|---|
 | dtype | fp16 / bf16（bf16 强制 f32 acc） |
-| head_dim | 编译集内 %32（generated dispatcher：64..1024）；**不支持运行时 pad**（`AUTO/NATIVE` 恒 `D_og==kHeadDim`，未编译的 D 报 "headdim not support"） |
+| head_dim | 编译集内（`--headdim all` 时 %64 ∈ [64,1024]）；**FC-8 起支持运行时 pad**：`D_og%8==0` → 64 对齐 ∈[64,1024]，AUTO/NATIVE/TMA 三 hint 均可，Q/K/V **零物化**（sm80 cp.async 16B chunk 列守卫 src-size=0 / sm90+ TMA `minor_dim=d_og` OOB 零填充），仅 O 由 api 层 pad+切回；未编译档仍报 "headdim not support" |
 | acc | f16 / f32（`kMmaAccFloat32QK/PV` 模板参数） |
 | causal | ✓（tail-aligned，要求 `Nkv ≥ Nq`） |
 | GQA/MQA | ✓（`Nh_q % Nh_kv == 0`，kernel 原生分组） |
@@ -474,7 +474,7 @@ strided-NHD 门禁细节（`ffpa_is_strided_nhd`）：`stride(3)==1 && stride(1)
 
 | 路径 | 原生 D 集合 | pad 规则 | pad 实现方式 |
 |---|---|---|---|
-| native（AUTO/TMA） | 编译集（默认 %64 ∈ [320,1024]；`--headdim all` %64 ∈ [64,1024]；32/96/128/192/224 需显式） | **无 pad**（未编译 D 报错） | — |
+| native（AUTO/NATIVE/TMA） | 编译集（默认 %64 ∈ [320,1024]；`--headdim all` %64 ∈ [64,1024]） | `D_og%8==0` → **64 对齐** ∈[64,1024]（FC-8） | **Q/K/V 不物化**：sm80 cp.async 16B chunk 列守卫（`cp_async_zfill` src-size=0，含 decode split-KV）/ sm90+ TMA descriptor `minor_dim=d_og` OOB 零填充；仅 O pad 切回。TMA hint 仅在 TMA ext 已编译且 sm90+ 计入（pre-sm90 回落 CUTE sm80 走 32 对齐物化 pad） |
 | cute fp16 | persist: %32 ≤128；split: %64（<768）/ %32（(32,32) chunk）；M4N2: %64 [768,1024] | `D_og%8==0` → 32 对齐 | **Q/K/V `constant_pad_nd` 物化 + O pad 切回**（TMA stride 需 D_pad） |
 | fp8 | persist %32 ≤224；split (224,768)；M4N2 ≥768 | `D_og%8==0` → 32 对齐 ≤1024 | **quantize kernel 读 D_og stride + 零填 pad 列（不物化）**；仅 O pad |
 | fp4 | persist {64,128,192,256}；split (256,768)；M4N2 [768,1024] | `D_og%8==0` → **64 对齐** ∈[64,1024] | 同 fp8 fused（`FFPA_FP4_PAD_TORCH=1` 可切 torch pad） |
@@ -503,7 +503,7 @@ softmax_scale 恒按真实 D（Python 解析 `1/sqrt(D_og)`）。
 | 5 | fp16 persist-D 专属的 WS 结构 | （非缺口，差异说明）split-D/M4N2 是 non-WS | fp16 split 家族 | setmaxnreg 232 装不下大 D o_acc；FA-1 M4N2 是替代方案 |
 | 6 | **attn_bias（量化路径全体）** | ✅ 已补齐（FC-4，2026-08-28）：fp8 raw-S 域注入 `bias/(qs*ks*scale_orig)` / fp4 dequant 域注入（列 kv_perm32），六族 kernel + `kHasAttnBias` 双实例 tag dispatch；dropout 仍拒（FC-5 ⏸） | fp8/fp4 全部（含 persist-D） | （已解决）原 dispatch 层统一拒绝 |
 
-另注意 native 家族相对 cute 家族的缺口：NHD/strided 零拷贝（物化）、head_dim pad（不支持）。
+另注意 native 家族相对 cute 家族的缺口：NHD/strided 零拷贝（物化）。head_dim pad 缺口已由 FC-8（2026-08-31）关闭（§7.5）。
 
 ---
 
@@ -730,7 +730,7 @@ QK 与 PV 的 fragment 生命周期不重叠（Q/K frags 在 softmax 前已死�
 | per-row | softmax 行 | P 的 `kPQuantPerRow`（fp8） | ffpa |
 | per-16 组 | NVFP4 microscaling block $1\times16$ | Q/K/V/P 的 SF | SA3 |
 
-**head_dim pad 的零贡献语义**：pad 列写入 data = $0$ 且 SF = $0$（ue4m3 的 bits0 是合法最小值），MMA 中 $\hat{x}\cdot s=0\cdot0=0$，对 $S$/ $O$ 贡献严格为 0——任意 $D\bmod 8$ pad 到 64/32 倍数是**精确**的（fp4 kernel 另有 `SFValue==0→SFValueInv=0` 防护，规避 fp8 amax=0 的 0/0 NaN 坑）。
+**head_dim pad 的零贡献语义**：pad 列写入 data = $0$ 且 SF = $0$（ue4m3 的 bits0 是合法最小值），MMA 中 $\hat{x}\cdot s=0\cdot0=0$，对 $S$/ $O$ 贡献严格为 0——任意 $D\bmod 8$ pad 到 64/32 倍数是**精确**的（fp4 kernel 另有 `SFValue==0→SFValueInv=0` 防护，规避 fp8 amax=0 的 0/0 NaN 坑）。native 家族（FC-8）遵循同一零贡献语义，实现手段是**load 侧**而非量化侧：sm80 cp.async 对 cols ≥ d_og 的 16B chunk 用 src-size=0 零填充（`cp_async_zfill`，`D_og%8==0` 保证 chunk 整体在/出界），sm90+ TMA 用 descriptor `minor_dim=d_og` 触发硬件 OOB 零填充——pad 列在 smem/寄存器中即为精确 0，QK^T/PV 贡献严格为 0。
 
 **ffpa 代码**：`cute/fp8/quantize_fp8.cuh`（fused QKV/per-thread/vt_perchannel 三 launcher）、`cute/fp4/quantize_fp4.cuh`、`cute/fp4/fp4_pscale.cuh`。
 

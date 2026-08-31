@@ -93,7 +93,8 @@ CUDA_BACKEND = "cuda"
 MIN_BENCHMARK_HEAD_DIM = 32
 MAX_FFPA_BENCHMARK_HEAD_DIM = 1024
 # 8 = quantize kernel Vec8 alignment (D % 8 == 0); non-32-multiples are padded
-# transparently by the C++ layer (ffpa_api.cc, e.g. 120 -> 128) for the fp8 path.
+# transparently by the C++ layer (ffpa_api.cc, e.g. 120 -> 128) for the fp8 and
+# native (AUTO/NATIVE/TMA, 64-align) paths.
 HEAD_DIM_ALIGNMENT = 8
 TRITON_SMALL_D_ENV = "FFPA_TRITON_ALLOW_SMALL_D"
 CUDA_SMALL_D_ENV = "FFPA_CUDA_ALLOW_SMALL_D"
@@ -101,8 +102,16 @@ CUTEDSL_SMALL_D_ENV = "FFPA_CUTE_ALLOW_SMALL_D"
 CUTEDSL_COMPAT_TASKS = frozenset({
   "self-attn", "cross-attn", "gqa", "causal", "non-aligned"
 })
+# CUDA fp8/fp4 forward paths have no decode (Nq==1) or dropout kernel; drop
+# the tasks at the task-set level so they neither run nor appear as NaN bars
+# in the tflops/speedup plots (runner-side skipping alone leaves the gaps).
+CUDA_QUANT_EXCLUDED_TASKS = frozenset({"decode-attn", "dropout"})
 CUTEDSL_DTYPES: tuple[torch.dtype, ...] = (torch.float16, torch.bfloat16)
 CUTEDSL_OUTPUT_STEM = "ffpa_speedup_cutedsl"
+# Quant-impl stems keep fp8/fp4 artifacts from clobbering the fp16/bf16 ones
+# when the same shape is benchmarked across precisions.
+FP8_OUTPUT_STEM = "ffpa_speedup_fp8"
+FP4_OUTPUT_STEM = "ffpa_speedup_fp4"
 CUTEDSL_SECTION_LABEL = "CuTeDSL"
 TFLOPS_FWD_SDPA_COLOR = "#b0b0b0"
 TFLOPS_FWD_FFPA_COLOR = "#2171b5"
@@ -902,7 +911,9 @@ def _output_stem(
   N: int,
   D: int,
   *,
-  cutedsl: bool = False
+  cutedsl: bool = False,
+  fp8: bool = False,
+  fp4: bool = False
 ) -> Path:
   """Build the output stem shared by the PNG and Markdown files.
 
@@ -913,9 +924,18 @@ def _output_stem(
   :param D: Head dimension.
   :param cutedsl: When ``True``, switch the prefix to keep cutedsl artifacts
       from clobbering the standard ones.
+  :param fp8: When ``True``, use the fp8 stem (quant impl runs).
+  :param fp4: When ``True``, use the fp4 stem (quant impl runs).
   :return: Output stem without extension.
   """
-  prefix = CUTEDSL_OUTPUT_STEM if cutedsl else DEFAULT_OUTPUT_STEM
+  if cutedsl:
+    prefix = CUTEDSL_OUTPUT_STEM
+  elif fp8:
+    prefix = FP8_OUTPUT_STEM
+  elif fp4:
+    prefix = FP4_OUTPUT_STEM
+  else:
+    prefix = DEFAULT_OUTPUT_STEM  # fp16/bf16 activations (triton / cuda fp16)
   device_slug = _slugify_device_name(device_name)
   return Path(f"{prefix}_{device_slug}_B{B}_H{H}_N{N}_D{D}")
 
@@ -929,6 +949,8 @@ def _resolve_output_stem(
   D: int,
   *,
   cutedsl: bool = False,
+  fp8: bool = False,
+  fp4: bool = False,
 ) -> Path:
   """Resolve the final output stem, optionally rooted at ``save_path``.
 
@@ -939,9 +961,13 @@ def _resolve_output_stem(
   :param N: Sequence length.
   :param D: Head dimension.
   :param cutedsl: Forwarded to :func:`_output_stem` for prefix selection.
+  :param fp8: Forwarded to :func:`_output_stem` for prefix selection.
+  :param fp4: Forwarded to :func:`_output_stem` for prefix selection.
   :return: Output stem without extension.
   """
-  default_stem = _output_stem(device_name, B, H, N, D, cutedsl=cutedsl)
+  default_stem = _output_stem(
+    device_name, B, H, N, D, cutedsl=cutedsl, fp8=fp8, fp4=fp4
+  )
   output_dir = DEFAULT_OUTPUT_DIR if save_path is None else save_path
   output_dir.mkdir(parents=True, exist_ok=True)
   return output_dir / default_stem.name
@@ -1726,6 +1752,29 @@ def _filter_cutedsl_tasks(tasks: set[str] | None) -> set[str]:
   return kept
 
 
+def _filter_cuda_quant_tasks(tasks: set[str] | None) -> set[str]:
+  """Drop the fp8/fp4-incompatible cases from a CUDA benchmark task set.
+
+  ``None`` (no ``--tasks``) becomes the full suite minus the excluded cases.
+  Explicitly requested excluded tasks are dropped with a stderr note; an empty
+  remainder raises ``SystemExit``.
+  """
+  supported = set(VALID_TASKS) - CUDA_QUANT_EXCLUDED_TASKS
+  if tasks is None:
+    return supported
+  rejected = sorted(tasks & CUDA_QUANT_EXCLUDED_TASKS)
+  if rejected:
+    print(
+      f"[cuda-quant] Skipping tasks unsupported by the fp8/fp4 forward paths: "
+      f"{rejected}. Excluded: {sorted(CUDA_QUANT_EXCLUDED_TASKS)}.",
+      file=sys.stderr,
+    )
+  kept = tasks - CUDA_QUANT_EXCLUDED_TASKS
+  if not kept:
+    raise SystemExit("No requested tasks are supported by the fp8/fp4 paths.")
+  return kept
+
+
 def _benchmark_rows(
   args: argparse.Namespace,
   *,
@@ -1846,6 +1895,8 @@ def main() -> None:
   tasks = _parse_tasks_arg(args.tasks)
   if is_cutedsl:
     tasks = _filter_cutedsl_tasks(tasks)
+  elif args.forward_backend == "cuda" and (args.enable_fp8 or args.enable_fp4):
+    tasks = _filter_cuda_quant_tasks(tasks)
   dtypes = CUTEDSL_DTYPES if is_cutedsl else (torch.float16, torch.bfloat16)
   if args.dtype == "fp16":
     dtypes = tuple(d for d in dtypes if d == torch.float16)
@@ -1877,6 +1928,8 @@ def main() -> None:
     args.N,
     args.D,
     cutedsl=is_cutedsl,
+    fp8=args.forward_backend == "cuda" and args.enable_fp8,
+    fp4=args.forward_backend == "cuda" and args.enable_fp4,
   )
   speedup_png_path = plot_speedup(
     forward_rows,

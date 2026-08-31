@@ -250,6 +250,9 @@ def test_ffpa_attn_func_triton_additive_attn_mask_matches_sdpa():
 def test_ffpa_attn_func_triton_small_d_default_falls_back_to_sdpa(monkeypatch):
   import ffpa_attn.ffpa_attn_interface as iface
 
+  # Assert the default (env unset) semantics even when the surrounding
+  # shell leaked FFPA_TRITON_ALLOW_SMALL_D=1.
+  monkeypatch.delenv("FFPA_TRITON_ALLOW_SMALL_D", raising=False)
   q, k, v = _alloc_qkv(1, 4, 1024, 256, torch.float16)
 
   def _unexpected_apply(*args, **kwargs):
@@ -1380,3 +1383,159 @@ def test_ffpa_attn_func_requires_explicit_gqa_opt_in_for_large_d():
   v = torch.randn(1, 4, 512, 512, dtype=torch.float16, device="cuda")
   with pytest.raises(ValueError, match="enable_gqa=False"):
     ffpa_attn_func(q, k, v)
+
+
+# ---------------------------------------------------------------------------
+# Native family head_dim pad (RFC FC-8): D_og % 8 == 0, D_og not 64-aligned.
+# The api layer pads O to the next 64-multiple and dispatches through the
+# per-headdim entry; Q/K/V stay D_og-wide and the kernels zero-fill pad cols
+# (cp.async src-size guard on sm80, TMA OOB zero fill on sm90+).
+# ---------------------------------------------------------------------------
+NATIVE_PAD_DS = [72, 120, 328, 800]  # pads: 128, 128, 384, 832
+
+
+def _native_pad_backend(tma: bool):
+  # enable_tma=False/True opts out of the CUTE_TMA auto-resolve so the
+  # hint maps to NATIVE / TMA exactly.
+  return ffpa_attn_functional.CUDABackend(backward=False, enable_tma=tma)
+
+
+def _native_pad_tol(dtype):
+  return {
+    "atol": 3e-2,
+    "rtol": 3e-2
+  } if dtype == torch.bfloat16 else {
+    "atol": 2e-2,
+    "rtol": 2e-2
+  }
+
+
+@pytest.mark.parametrize("dtype", DTYPES, ids=["fp16", "bf16"])
+@pytest.mark.parametrize("causal", [False, True], ids=["dense", "causal"])
+@pytest.mark.parametrize("tma", [False, True], ids=["native", "tma"])
+@pytest.mark.parametrize("D", NATIVE_PAD_DS)
+def test_native_head_dim_pad_matches_sdpa(monkeypatch, D, tma, causal, dtype):
+  monkeypatch.setenv("FFPA_CUDA_ALLOW_SMALL_D", "1")
+  torch.manual_seed(0)
+  B, H, N = 1, 8, 1024
+  q, k, v = _alloc_qkv(B, H, N, D, dtype)
+  out = ffpa_attn_func(
+    q, k, v, is_causal=causal, forward_backend=_native_pad_backend(tma)
+  )
+  assert out.shape == q.shape
+  assert out.dtype == dtype
+  assert torch.isfinite(out).all()
+  ref = F.scaled_dot_product_attention(
+    q.float(), k.float(), v.float(), is_causal=causal
+  ).to(dtype)
+  torch.testing.assert_close(out, ref, **_native_pad_tol(dtype))
+
+
+@pytest.mark.parametrize("causal", [False, True], ids=["dense", "causal"])
+def test_native_head_dim_pad_tail_tiles(monkeypatch, causal):
+  # Non-tile-multiple Nq/Nkv exercise the seqlen-bound + tail guards.
+  monkeypatch.setenv("FFPA_CUDA_ALLOW_SMALL_D", "1")
+  torch.manual_seed(0)
+  B, H, Nq, Nkv, D = 1, 4, 520, 2120, 120
+  q, k, v = _alloc_qkv(B, H, Nq, D, torch.float16)
+  k = torch.randn(B, H, Nkv, D, dtype=torch.float16, device="cuda")
+  v = torch.randn(B, H, Nkv, D, dtype=torch.float16, device="cuda")
+  out = ffpa_attn_func(
+    q, k, v, is_causal=causal, forward_backend=_native_pad_backend(False)
+  )
+  # FFPA causal is bottom-right aligned; SDPA is_causal aligns top-left when
+  # Nq != Nkv, so the reference uses the explicit tail-aligned mask.
+  if causal:
+    ref = F.scaled_dot_product_attention(
+      q.float(),
+      k.float(),
+      v.float(),
+      attn_mask=_tail_aligned_causal_mask(Nq, Nkv)
+    ).half()
+  else:
+    ref = F.scaled_dot_product_attention(q.float(), k.float(), v.float()).half()
+  torch.testing.assert_close(out, ref, **_native_pad_tol(torch.float16))
+
+
+def test_native_head_dim_pad_gqa(monkeypatch):
+  monkeypatch.setenv("FFPA_CUDA_ALLOW_SMALL_D", "1")
+  torch.manual_seed(0)
+  B, Nh_q, Nh_kv, N, D = 1, 8, 2, 1024, 328
+  q = torch.randn(B, Nh_q, N, D, dtype=torch.float16, device="cuda")
+  k = torch.randn(B, Nh_kv, N, D, dtype=torch.float16, device="cuda")
+  v = torch.randn(B, Nh_kv, N, D, dtype=torch.float16, device="cuda")
+  out = ffpa_attn_func(
+    q, k, v, enable_gqa=True, forward_backend=_native_pad_backend(False)
+  )
+  ref = F.scaled_dot_product_attention(
+    q.float(), k.float(), v.float(), enable_gqa=True
+  ).half()
+  assert torch.isfinite(out).all()
+  torch.testing.assert_close(out, ref, **_native_pad_tol(torch.float16))
+
+
+def test_native_head_dim_pad_attn_mask(monkeypatch):
+  # Additive mask routes through the full _FFPAAttnFunc chain (the inference
+  # fast path only takes attn_mask=None).
+  monkeypatch.setenv("FFPA_CUDA_ALLOW_SMALL_D", "1")
+  torch.manual_seed(0)
+  B, H, N, D = 1, 8, 1024, 120
+  q, k, v = _alloc_qkv(B, H, N, D, torch.float16)
+  attn_mask = (
+    torch.randn(1, 1, N, N, device="cuda", dtype=torch.float16) * 0.25
+  )
+  out = ffpa_attn_func(
+    q, k, v, attn_mask=attn_mask, forward_backend=_native_pad_backend(False)
+  )
+  ref = F.scaled_dot_product_attention(
+    q.float(), k.float(), v.float(), attn_mask=attn_mask.float()
+  ).half()
+  assert torch.isfinite(out).all()
+  torch.testing.assert_close(out, ref, **_native_pad_tol(torch.float16))
+
+
+def test_native_head_dim_pad_dropout_deterministic(monkeypatch):
+  # SDPA-dropout parity is a bench concern; here verify the native pad +
+  # dropout path is deterministic per philox state (seeded before each call)
+  # and actually drops.
+  monkeypatch.setenv("FFPA_CUDA_ALLOW_SMALL_D", "1")
+  B, H, N, D = 1, 8, 1024, 120
+  q, k, v = _alloc_qkv(B, H, N, D, torch.float16)
+  backend = _native_pad_backend(False)
+  torch.manual_seed(17)
+  out1 = ffpa_attn_func(q, k, v, dropout_p=0.1, forward_backend=backend)
+  torch.manual_seed(17)
+  out2 = ffpa_attn_func(q, k, v, dropout_p=0.1, forward_backend=backend)
+  out_nodrop = ffpa_attn_func(
+    q, k, v, forward_backend=_native_pad_backend(False)
+  )
+  assert torch.isfinite(out1).all()
+  assert torch.equal(out1, out2)
+  assert not torch.equal(out1, out_nodrop)
+
+
+@pytest.mark.parametrize("tma", [False, True], ids=["native", "tma"])
+def test_native_head_dim_pad_decode(monkeypatch, tma):
+  monkeypatch.setenv("FFPA_CUDA_ALLOW_SMALL_D", "1")
+  torch.manual_seed(0)
+  B, H, Nq, Nkv, D = 1, 2, 1, 2048, 120
+  q = torch.randn(B, H, Nq, D, dtype=torch.float16, device="cuda")
+  k = torch.randn(B, H, Nkv, D, dtype=torch.float16, device="cuda")
+  v = torch.randn(B, H, Nkv, D, dtype=torch.float16, device="cuda")
+  out = ffpa_attn_func(q, k, v, forward_backend=_native_pad_backend(tma))
+  ref = F.scaled_dot_product_attention(q.float(), k.float(), v.float()).half()
+  assert torch.isfinite(out).all()
+  torch.testing.assert_close(out, ref, **_native_pad_tol(torch.float16))
+
+
+def test_native_head_dim_pad_stage_variant(monkeypatch):
+  monkeypatch.setenv("FFPA_CUDA_ALLOW_SMALL_D", "1")
+  torch.manual_seed(0)
+  B, H, N, D = 1, 8, 1024, 328
+  q, k, v = _alloc_qkv(B, H, N, D, torch.float16)
+  backend = _native_pad_backend(False)
+  backend.stages = 2
+  out = ffpa_attn_func(q, k, v, forward_backend=backend)
+  ref = F.scaled_dot_product_attention(q.float(), k.float(), v.float()).half()
+  assert torch.isfinite(out).all()
+  torch.testing.assert_close(out, ref, **_native_pad_tol(torch.float16))

@@ -268,6 +268,9 @@ void launch_native_fwd_split_d_sm80(torch::Tensor Q, torch::Tensor K,
   const int Nh_kv = K.size(1);
   const int Nq = Q.size(2);
   const int Nkv = K.size(2);
+  // Real gmem row width of Q/K/V; == kHeadDim unless the api-layer head_dim
+  // pad shrank the rows (kernels zero-fill cols >= d_og, FC-8).
+  const int d_og = static_cast<int>(Q.size(3));
   const bool has_attn_bias = attn_bias.numel() != 0;
   const bool has_dropout = dropout_p > 0.0;
   const void* attn_bias_ptr = nullptr;
@@ -328,7 +331,7 @@ void launch_native_fwd_split_d_sm80(torch::Tensor Q, torch::Tensor K,
         reinterpret_cast<kDataType*>(K.data_ptr()),
         reinterpret_cast<kDataType*>(V.data_ptr()),
         partial_out.data_ptr<float>(), chunk_lse.data_ptr<float>(), Nq, Nkv, Nh,
-        Nh_kv, scale, num_splits, split_size, causal);
+        Nh_kv, scale, num_splits, split_size, causal, d_og);
 
     auto decode_stage2_kernel =
         (split_kv_decode_s2_fwd_sm80<kDataType, kHeadDim>);
@@ -363,7 +366,7 @@ void launch_native_fwd_split_d_sm80(torch::Tensor Q, torch::Tensor K,
       reinterpret_cast<kDataType*>(O.data_ptr()), softmax_lse_ptr, Nq, Nkv, Nh,
       Nh_kv, scale, Tc, causal, attn_bias_ptr, attn_bias_dtype,
       attn_bias_stride_b, attn_bias_stride_h, attn_bias_stride_m,
-      attn_bias_stride_n, dropout_p_f, philox_seed_u, philox_offset_u);
+      attn_bias_stride_n, dropout_p_f, philox_seed_u, philox_offset_u, d_og);
 }
 
 // Host-side launcher that picks compile-time configuration (block tile,
@@ -434,6 +437,11 @@ void launch_native_fwd_split_d_sm120(torch::Tensor Q, torch::Tensor K,
   const int Nh_kv = K.size(1);
   const int Nq = Q.size(2);
   const int Nkv = K.size(2);
+  // Real gmem row width of Q/K/V; == kHeadDim unless the api-layer head_dim
+  // pad shrank the rows (TMA OOB fill zero-pads the descriptor minor axis,
+  // FC-8). Q.size(3)==kHeadDim when a caller (e.g. the CUTE_TMA bias/dropout
+  // fallback) already materialized padded tensors.
+  const int d_og = static_cast<int>(Q.size(3));
   const bool has_attn_bias = attn_bias.numel() != 0;
   const bool has_dropout = dropout_p > 0.0;
   const void* attn_bias_ptr = nullptr;
@@ -484,9 +492,11 @@ void launch_native_fwd_split_d_sm120(torch::Tensor Q, torch::Tensor K,
                        CUtensorMapSwizzle sw) -> CUtensorMap {
     ffpa::tma::Copy2DDescriptorParams<kDataType> params;
     params.global_address = reinterpret_cast<kDataType*>(gmem_ptr);
-    params.minor_dim = kHeadDim;
+    // minor_dim/stride follow the real row width; boxes reaching past it are
+    // zero-filled by TMA (OOB_FILL_NONE = zeros), so pad cols contribute 0.
+    params.minor_dim = d_og;
     params.major_dim = rows;
-    params.major_stride_bytes = kHeadDim * sizeof(kDataType);
+    params.major_stride_bytes = static_cast<uint64_t>(d_og) * sizeof(kDataType);
     params.box_minor_dim = box_minor;
     params.box_major_dim = Bc;
     params.swizzle = sw;

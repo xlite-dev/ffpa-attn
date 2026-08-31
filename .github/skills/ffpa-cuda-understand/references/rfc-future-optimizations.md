@@ -9,6 +9,7 @@
 
 - 1. 每项动手前：先在 plan 模式（Copilot下要切换到plan agent）完成实施规划（改动面 / 注入点 / 验证矩阵），规划好再动手 (自动模式下可以按照规划继续实施操作)。
 - 2. 每做完一项：勾选对应条目（`- [ ]` → `- [x]`），并同步更新上方总览表状态列。注意，要同时更新[SKILL.md](../SKILL.md) 中的技术报告和本文档的总览表状态列，确保两处状态一致。
+- 3. **验收必须落实到 `ffpa_attn.bench` CLI**：`python -m ffpa_attn.bench` 全链路（`--fwd-backend cuda --cuda-impl <impl> --tasks <相关task>`）跑通并通过 parity。`tests/` 与临时脚本仅是开发阶段验证，**不能替代 CLI 验收**；若该项能力影响 bench task 集合（新增/排除 task），须同步放开/过滤 bench CLI 的 task 并在 CLI 输出中可见。
 
 ## 优先级框架
 
@@ -32,7 +33,7 @@
 | strided-NHD 读（fused-QKV） | ✗ | persist-D | 全族（FC-1） | 全族（FC-1） | 全族（FC-1） | FC-1 ✅ |
 | strided/NHD + hybrid 组合 | — | — | ✓ | ✓ | FC-3 ✅ |
 | smooth_v / MXFP8-PV knob | — | — | ✓ | smooth_v 全族；MXFP8-PV persist-D+split-D（m4n2 架构排除） | FC-6 ✅ |
-| head_dim pad | ✗ | ✓ | ✓ | ✓ | FC-8 |
+| head_dim pad | ✓（FC-8） | ✓ | ✓ | ✓ | FC-8 ✅ |
 | decode / 短 Nq 量化 | ✗（无量化） | ✗ | ✗ | ✗ | FC-7 |
 | backward | ✗ | ✗ | ✗ | ✗ | FC-9 |
 | sm90 / sm100 | 部分（fp16 TMA） | ✗ | ✗（fp8 限 sm_120） | ✗（fp4 限 sm_120） | FC-10 |
@@ -50,9 +51,11 @@
 | FC-5 | 量化路径 `dropout` (**暂不实施，仅保留设计稿**) | F2 | ⬜ 待开始 | FC-4 注入点 |
 | FC-6 | fp4 smooth_v/MXFP8-PV 扩展至三族 | F2 | ✅ 已完成（ffpa-attn 76a8bd8） | FC-1/FC-2 |
 | FC-7 | 短 Nq/decode 量化路径 (**暂不实施，仅保留设计稿**) | F3 | ⬜ 待开始 | — |
-| FC-8 | native head_dim pad | F3 | ⬜ 待开始 | — |
+| FC-8 | native head_dim pad | F3 | ✅ 已完成 | — |
 | FC-9 | CUDA backward (**暂不实施，仅保留设计稿**) | F3 | ⬜ 待开始 | — |
 | FC-10 | sm90/sm100 量化覆盖 (**暂不实施，仅保留设计稿**) | F3 | ⬜ 待开始 | — |
+| FC-11 | native 路径 dropout 精度修复（bug，高优） | F3 | ⬜ 待开始 | — |
+| PC-0 | attn_mask 量化路径 bias tile IO 重构（fp8/fp4） | P | ⬜ 待开始（**P 轨最高优先**） | FC-4 注入点 |
 | PC-1 | Mega Quantize Kernel（aux 链大融合） | P | ⬜ 待开始 | — |
 | PC-2 | 增量融合（Mega Kernel 步进） | P | ⬜ 待开始 | 被 PC-1 收编 |
 | PC-3 | N-crossover 量化配置自适应 | P | ⬜ 待开始 | — |
@@ -80,12 +83,14 @@
 - [ ] FC-5：量化路径 `dropout`
 - [x] FC-6：fp4 smooth_v/MXFP8-PV 扩展至三族 —— smooth_v 全族；MXFP8-PV 至 split-D（2026-08-28 完成）
 - [ ] FC-7：短 Nq/decode 量化路径 ⏸（暂不实施，仅保留设计稿）
-- [ ] FC-8：native head_dim pad
+- [x] FC-8：native head_dim pad —— kernel 侧 d_og 零物化 pad（cp.async src-size 列守卫 / TMA OOB 零填充），AUTO/NATIVE/TMA 三 hint 64 对齐（2026-08-31 完成）
 - [ ] FC-9：CUDA backward（定位评估）
 - [ ] FC-10：sm90/sm100 量化覆盖
+- [ ] FC-11：native 路径 dropout 精度修复 —— 存量 bug（2026-08-31 记录）
 
 **轨道 P（性能优化）**
 
+- [ ] PC-0：attn_mask 量化路径 bias tile IO 重构（fp8/fp4）—— P 轨最高优先（2026-08-31 立项）
 - [ ] PC-1：Mega Quantize Kernel —— P 轨基建
 - [ ] PC-2：增量融合（Mega Kernel 步进，被 PC-1 收编）
 - [ ] PC-3：N-crossover 量化配置自适应
@@ -115,6 +120,7 @@
   FC-7 短 Nq/decode ⏸ ｜ FC-8 native pad ｜ FC-9 backward 评估 ⏸ ｜
   FC-10 sm90/sm100 ⏸（FC-7/FC-9/FC-10 均暂不实施）
 阶段 4（轨道 P）
+  PC-0 attn_mask 量化路径 bias tile IO 重构（P0：attn-mask 是当前量化路径最大退化点）
   PC-1 Mega Quantize Kernel（先做 cooperative 两阶段原型）
         ├─► 收编 PC-2（增量融合是其落地台阶）
         └─► 联动 PC-5 ⏸（暂不实施；launch 形态定型后才能定 graph 兼容方案）
@@ -407,6 +413,15 @@ fp8/fp4 全体（含 persist-D）拒绝 `attn_bias`（报告 §8#6）。数学�
 3. bitwiseprobe 确认 bias=None 路径零变化；并核对无 bias 实例与现 kernel 的
    寄存器数/指令数一致（模板隔离生效的硬指标，ptxas -v 或 NCU 对比）。
 
+#### Post-completion Fix (2026-08-31)
+
+FC-4 完成时漏改 bench CLI：`_runner_fwd.py` 的 attn-mask case 仍带
+`not enable_fp8 and not enable_fp4` gate，`ffpa_attn.bench --cuda-impl
+fp8/fp4` 输出中没有 attn-mask 行。已放开（fp8/fp4 attn-mask task 现随
+全量跑，D=128 parity 通过 2.2x/2.2x）；同时按规范 3 把 fp8/fp4 不支持
+的 decode-attn/dropout 在 `_bench.py` task-set 级过滤
+（`CUDA_QUANT_EXCLUDED_TASKS`），避免 NaN 空档进入 tflops/speedup plots。
+
 #### Risks & Rollback
 
 - 每 block 多一次 gmem bias 载入（带宽 +1 tile）——对长序列占比小；
@@ -589,7 +604,7 @@ FC-1 / FC-2（同族布局基建先行，减少一次改动面）。
 
 ### FC-8：native 路径 head_dim pad
 
-- **Status**: Draft ｜ **Priority**: F3 ｜ **Track**: 功能
+- **Status**: ✅ Completed（2026-08-31） ｜ **Priority**: F3 ｜ **Track**: 功能
 
 #### Motivation
 
@@ -625,6 +640,45 @@ native 家族覆盖非整 D（补齐与 CuTe 家族的对齐）。
 #### Dependencies
 
 无。
+
+#### Completion Record (2026-08-31)
+
+实现与设计稿的差异（零物化方向）：
+
+- **api 层**（`csrc/cuffpa/ffpa_api.cc`）：AUTO/NATIVE/TMA 三 hint 纳入
+  `needs_pad`，pad 目标为下一个 **64 倍数**（native 家族编译集
+  `range(64,1025,64)`），范围校验 [64,1024]；`head_dim_dispatch` 三路
+  （fp4 64 对齐 / native 64 对齐 / 其余 32 对齐）；O 仍由 api 层 pad +
+  narrow 回切。TMA hint 仅在 `ENABLE_FFPA_TMA_EXT` 且 sm90+ 时计入
+  native 家族（镜像 launcher 分派：pre-sm90 / 无 TMA ext 时回落 CUTE
+  sm80 kernel，仍走 32 对齐 torch pad）。
+- **launcher**（`csrc/cuffpa/launch.cuh`）：`native_kernel_pad =
+  force_native || tma_kernel_active`（后者 `#ifdef ENABLE_FFPA_TMA_EXT` +
+  `major>=9` 双重限定，防 TMA-ext 未编译时未物化 QKV 泄漏进 cute sm80
+  kernel 的静默数据错乱）；`qkv_padded` 排除 native 家族——Q/K/V 保持
+  D_og 宽，不再做 `constant_pad_nd` 物化拷贝。
+- **kernel 侧零物化**：
+  - sm80 cp.async（`native/prefill.cuh` + `sm_80/split_d.cuh`）：
+    `cp_async_qkv_g2s` 增加 `d_og` 行 stride + 16B chunk 列守卫
+    （`cp_async_zfill` src-size=0），17 个调用点全部显式传参
+    （移除默认参数，编译器强制覆盖）；`split_d_fwd_sm80` O 偏移与
+    QKV 偏移解耦（O 恒为 kHeadDim 宽）。
+  - sm80 decode split-KV（`sm_80/split_kv.cuh`）：s1 全部 5 处 gmem
+    载入改 zfill + `d_og` stride；kStage==1 直读分支加越界零向量守卫。
+  - sm90+ TMA（`native/launch.cuh`）：`make_desc` 的
+    `minor_dim`/`major_stride_bytes` 改用运行时 `d_og = Q.size(3)`，
+    TMA OOB 自动零填充 pad 列（无需 kernel 改动）。
+- **约束**：D_og%8==0（16B stride 对齐 + 16B chunk 列守卫粒度）；
+  `--headdim all` 全量编译集 {64..1024 step 64} 16 档无空洞。
+- **验收**（规范 3，`ffpa_attn.bench` CLI 全链路）：
+  - `--cuda-impl native --D 328 --tasks self-attn,cross-attn,decode-attn,gqa,causal,non-aligned` 通过（328→384）；
+  - `--cuda-impl native --D 120`（`FFPA_CUDA_ALLOW_SMALL_D=1`，120→128）全 task 通过；
+  - `--cuda-impl tma --D 120/328` 通过（TMA OOB 零填充路径，D=328 self-attn 2.14x）；
+  - 回归：`test_ffpa_fwd.py` 503 passed（新增 `test_native_head_dim_pad_*`
+    40 项全过；`test_ffpa_fp8.py` 85 / `test_ffpa_fp4.py` 61 全过）。
+    当时的 `triton_small_d_default_falls_back_to_sdpa` 1 项失败后经查为
+    shell env 污染（残留 `FFPA_TRITON_ALLOW_SMALL_D=1`）+ 测试未自封闭，
+    非代码缺陷；已加 `monkeypatch.delenv` 修复（06e23fe），全量 504 passed 0 failed。
 
 ---
 
@@ -712,13 +766,200 @@ Blackwell 消费/专业卡；若目标硬件扩到 H100/B200，量化路径不�
 
 ---
 
+### FC-11：native 路径 dropout 精度修复
+
+- **Status**: Draft ｜ **Priority**: F3（**bug 修复，高优**） ｜ **Track**: 功能/正确性
+
+#### Motivation
+
+native 家族（AUTO/NATIVE cp.async 与 sm90+ TMA）的 dropout task 在 bench CLI
+上 parity 失败（RTX PRO 5000，B=1 H=32 N=16384，dropout_p=0.1）：
+
+| 配置 | O_err | allclose |
+|---|---|---|
+| `--cuda-impl fp16` D=120 fp16/bf16（atol 0.02/0.05） | 0.0629 / 0.0630 | **False / False** |
+| `--cuda-impl fp16` D=128 fp16/bf16 | 0.0779 / 0.0775 | **False / False** |
+| `--cuda-impl tma`  D=120 fp16/bf16 | 0.0629 / 0.0630 | **False / False** |
+| `--cuda-impl tma`  D=128 fp16/bf16 | 0.0779 / 0.0776 | **False / False** |
+
+同批 run 的 self-attn / causal / attn-mask / non-aligned / decode / gqa /
+cross 全部通过（O_err ≤ 0.005）→ 问题**仅限 dropout**。
+
+#### 归属判定（已做，2026-08-31）
+
+- D=128（无 head_dim pad）同样失败 → **与 FC-8 native pad 无关**；
+- AUTO（sm80 cp.async）与 TMA（sm120 native TMA）两 hint 都失败，且同 D 下
+  O_err 数值一致 → 两 kernel 共享的 `prefill.cuh` philox dropout 路径是
+  唯一公共环节 → **存量 bug**（kernel 侧 RNG mask 与 SDPA 不完全对齐）。
+
+#### 附带发现（性能）
+
+`--cuda-impl tma` + dropout：112-114 ms（0.65x vs SDPA），比同形状
+`--cuda-impl fp16` 的 40 ms 慢 2.8x。TMA hint 带 dropout 回退的 native TMA
+sm120 kernel 疑似走了低效配置（与本 bug 一并排查）。
+
+#### Root Cause（初步假设，待验证）
+
+dropout 作用于 softmax 后的 P，RNG 按
+`linear = ((b*Hq+h)*Nq+q)*Nkv+k` 消费 philox4x32-10（`sync_apply_dropout_to_p`
+→ `philox4x32_10` / `apply_dropout_pair`）。O_err 量级（~0.06-0.08，
+dropout_p=0.1）呈"大部分 mask 对齐、局部错位"特征，疑似：
+- SDPA（efficient/flash backend）的 RNG 消费布局与该线性布局在**行/组边界**
+  不一致（philox 按 4 元素组消费，行尾或 (b,h) 边界对齐方式不同）；或
+- Python 侧预留的 philox seed/offset 与 kernel 侧 offset base 错位。
+
+#### Design
+
+1. **对齐诊断**：小形状（如 4×8）dump FFPA 与 SDPA 的 dropout mask 逐元素
+   diff，定位错位模式（行边界 / 4 元素组边界 / (b,h) 边界）；
+2. 按 SDPA 实际消费布局修正 `sync_apply_dropout_to_p` 的 offset 计算
+   （两 kernel 共享一份修正）；若 SDPA backend 在 sm120 上本身无稳定 mask
+   契约，则以 Triton forward（已与 SDPA 对齐）的实现为参照；
+3. 排查 tma+dropout 回退 kernel 的 2.8x 性能异常。
+
+#### Files & Symbols
+
+- `csrc/cuffpa/native/prefill.cuh`（`philox4x32_10` / `apply_dropout_pair` /
+  `sync_apply_dropout_to_p`）
+- `csrc/cuffpa/native/sm_80/split_d.cuh`、`csrc/cuffpa/native/sm_120/split_d.cuh`
+  （调用点 offset 传参）
+- `src/ffpa_attn/functional.py`（philox seed/offset 预留侧）
+
+#### Validation
+
+- `ffpa_attn.bench --cuda-impl fp16/tma --tasks dropout`：fp16/bf16
+  allclose=True（atol 0.02/0.05），跨 D（128/120/320/328）与 hint；
+- 新增 mask 逐元素一致性单测（FFPA vs SDPA/Triton dropout mask diff == 0）；
+- tma+dropout 延时回到与 fp16 impl 同量级。
+
+#### Risks & Rollback
+
+- dropout mask 改动会影响依赖同一 RNG 路径的既有 parity 基线（Triton 已对齐
+  路径不动）；回退 = 单 commit revert。
+
+#### Expected Benefit
+
+native 家族 dropout 恢复 parity（当前 bench 唯一 False 项）；tma+dropout
+性能异常排除。
+
+#### Dependencies
+
+无（与 FC-5 量化 dropout 设计稿独立）。
+
+---
+
 ## 轨道 P：性能优化（功能不变下提速）
 
 > 轨道 F 解决"能不能用"，轨道 P 解决"快不快"。以下各项在功能完备的前提下推进。
 
+### PC-0：attn_mask 量化路径 bias tile IO 重构（fp8/fp4）
+
+- **Status**: Draft ｜ **Priority**: P0（性能轨最高优先） ｜ **Track**: 性能
+
+#### Motivation
+
+FC-4 打开了量化路径的 `attn_bias`，但注入实现（`apply_attn_bias_quant_rowcol` /
+`apply_attn_bias_fp4_rowcol`，均调 native 的标量 loader `load_attn_bias_value`）
+使 attn-mask 成为量化路径**最大的性能退化点**（RTX PRO 5000，B=1 H=32 N=16384）：
+
+| 场景 | self-attn | attn-mask | 退化 |
+|---|---|---|---|
+| fp4 D=128 fp16 | 8.16 ms / 539T | 30.55 ms / 144T | **3.74x** |
+| fp4 D=128 bf16 | 8.17 ms / 538T | 26.23 ms / 168T | 3.21x |
+| fp8 D=320 fp16 | 38.36 ms / 287T | 68.16 ms / 161T | 1.78x |
+
+fp4 D=128 的纯 bias 开销 ≈ 22.4 ms；16384² fp32 mask ≈ 1 GB → 有效带宽仅
+~45 GB/s（<3% DRAM 峰值）。fp4 越快（NVFP4 MMA 主循环 539T）标量 bias 注入
+占比越大，退化越狠。
+
+#### Root Cause（初步分析，动手前 NCU 复核）
+
+1. **cache line 级重复 IO（主因）**：cute rowcol score fragment 坐标散布，
+   同一 128B line 的 bias 元素被不同 thread、不同循环迭代的**独立标量 load**
+   分别取出；1 GB mask 远超 L2（96MB）→ line 反复从 DRAM 拉取。
+   fp4 的 `kv_perm32` 列置换（j → 0,1,8,9,16,17,...）进一步打散跨迭代局部性。
+2. **低效 IO**：逐元素 32-bit 标量 load，warp 内地址不连续 → 无合并，
+   32B sector 只取 4B（sector 效率 ~12.5%）；广播 mask（stride_n==0 等）也
+   逐元素重复读同一地址。
+3. 计算顺带浪费：每元素运行时 dtype 三分支 + `long long` 地址算术 +
+   fp8 的 `inv_sd[row]` 逐元素乘（可 tile 级预乘）。
+
+#### Design（重点：消除重复 IO + 高效 IO；仅向量化不够）
+
+**方案 A（主案，数学不变）——cute 专属 bias tile smem 预载**：
+
+- 为 cute 家族**单独实现** bias tile 加载（TMA 2D box / cp.async 向量化），
+  **不复用 native/prefill.cuh 的标量函数**（cute 有自己的 TMA/Tensor 基建；
+  native 的 R_S fragment + broadcast-stride 语义留在 native 侧）。
+- per (Q-tile, KV-tile) 把 `[Br, Bc]` bias 块一次性载入 smem（行连续 →
+  sector 满载），与 K/V tile 同流水异步预取（latency 隐藏）；注入函数改为
+  按 `tScS_rc` 坐标读 smem Tensor。**每 bias 元素、每 cache line 从 DRAM
+  只取一次**：DRAM 流量降到理论最小 `Nq·Nkv·sizeof(dtype)`，line 一次取满。
+- 广播特化在 loader 侧：`stride_n==0` 载 `[Br,1]` 单列、`stride_m==0` 载
+  `[1,Bc]` 单行、h/b 广播由 grid 索引天然处理——广播 mask 的重复读归零。
+- fp4 适配：smem 存原序列，读时按 `kv_perm32(j)` 索引（与既有 masking
+  同构）；是否载入侧预置换由实现时 A/B 定。
+- fp8 raw-S 域：`inv_sd[row]` 折叠加法不变，仅换 load 来源；可选把
+  `bias·inv_sd` 预乘后以 fp16 存 smem（流量减半，精度需验证）。
+
+**方案 B（进阶，可选）——乘子域预折叠（数学等价变换）**：
+`softmax 输入 = S_dequant + bias`，则 `exp(S' − m) = exp2((S_dequant − m̃)·c) ·
+exp2(bias·c)`。预处理 kernel 一次性产出 `bias_exp` 乘子表（半精度）+ per-row
+`max(bias)` 作 online-max 初值上界（防溢出，softmax 平移不变保证等价）；
+fp8 的 `qs·ks` 在 softmax 输入域恰好消去 → 乘子与 row 无关，per-(q,k) 常量表。
+attn kernel 内 add 变 mul、读表流量减半。风险：online-max 初始化语义变化 +
+半精度乘子表精度，A 落地后再评估。乘子表预处理可并入 PC-1 的 aux 融合。
+
+**方案 C（仅根因对照，非交付路径）**：stride_n==1 时 128-bit 向量化 direct
+load——按用户判断"仅向量化不够"（line 级重复仍在），只用于 A/B 对照验证
+sector 效率诊断，不作为交付方案。
+
+**验证顺序**：NCU 先行（attn-mask kernel 看
+`l1tex` sector/request 比与 DRAM 带宽利用率，预测 <15% / <10%）→ A 落地 →
+复核指标归位。
+
+#### Files & Symbols
+
+- `csrc/cuffpa/cute/attn_bias.cuh`（新增 cute 原生 bias tile loader；
+  `apply_attn_bias_quant_rowcol` 的 gmem 直读路径退役为 fallback）
+- `csrc/cuffpa/cute/fp4/fp4_gemm.cuh`（`apply_attn_bias_fp4_rowcol` 改 smem 读 + perm32）
+- `csrc/cuffpa/cute/fp8/sm_120/{persist_d,split_d,split_d_m4n2}.cuh`、
+  `cute/fp4/sm_120/{persist_d,split_d,split_d_m4n2}.cuh`（注入点接线；
+  fp16 cute 家族 `apply_attn_bias_rowcol` 同模式受益，可随做）
+- `csrc/cuffpa/cute/launch.cuh`（bias 描述符 / smem 布局 / 流水接线）
+
+#### Validation
+
+- parity：`ffpa_attn.bench --cuda-impl fp8/fp4 --tasks attn-mask` 前后 O_err
+  不变（容差同 FC-4：fp8 5e-2 / fp4 0.15）；六族 kernel 全过；
+- 性能：attn-mask 与 self-attn 差距 3.74x(fp4 D128) / 1.78x(fp8 D320) 收敛至
+  ≤1.2x；attn-mask TFLOPS 回到同 D self-attn 的 80%+；
+- NCU：标量 global load 消失，sector/request 与 DRAM 带宽利用率归位；
+- 广播 mask 专项（stride 0 各维）与尾 tile（Nq/Nkv 非 tile 倍数）正确性。
+
+#### Risks & Rollback
+
+- smem 预算：+bias tile `[Br,Bc]`（fp32 最坏 ~64KB）——按档位裁剪（fp16 存 /
+  从 stage 数腾 / 大 D 档 fallback 直读路径保留）；
+- TMA box 形状：Nq/Nkv 非 box 整数倍的边界（OOB bias 读 0 与 kv_mask -inf
+  屏蔽交互需验证）；broadcast stride 无法直接 TMA → 单行/单列特化；
+- 回退 = `kHasAttnBias` 双实例保留直读路径，逐 kernel 切换可独立回退。
+
+#### Expected Benefit
+
+attn-mask 量化路径从 144T（fp4 D128）回到 ~400T+ 量级；对齐 SageAttention
+等竞品在 mask 场景的竞争力（当前 attn-mask 是量化路径唯一 >1.8x 退化点）。
+
+#### Dependencies
+
+FC-4 注入点基建（`kHasAttnBias` 编译期双实例，bias=None 零开销不变）；
+与 PC-1 正交（方案 B 的乘子表可并入其 aux 融合）。
+
+---
+
 ### PC-1：Mega Quantize Kernel（aux 链大融合）
 
-- **Status**: Draft ｜ **Priority**: P1（性能轨最高） ｜ **Track**: 性能
+- **Status**: Draft ｜ **Priority**: P1（aux 链基建） ｜ **Track**: 性能
 
 #### Motivation
 

@@ -96,9 +96,11 @@ __device__ __forceinline__ void cp_async_qkv_g2s(
     const int d_tile_id,  // headdim offset, tile_K_d * kMmaAtomK, tile_V_d *
                           // kMmaAtomN * 2
     const int stage,      // stage * QKV tile_size
-    const int seqlen_bound = INT_MAX  // bound on the seqlen axis; rows with
-                                      // global idx >= seqlen_bound are
-                                      // zero-filled via cp.async src-size=0
+    const int seqlen_bound,  // seqlen bound; rows with global idx >= bound are
+                             // zero-filled via cp.async src-size=0
+    const int d_og  // gmem row stride / real head width (== kHeadDim when the
+                    // head_dim is not padded); 16B chunks at cols >= d_og are
+                    // zero-filled the same way
 ) {
   // QK: tile_K_d < (kHeadDim / kMmaAtomK)
   //  V: tile_V_d < (kHeadDim / kMmaAtomN * 2)
@@ -119,7 +121,7 @@ __device__ __forceinline__ void cp_async_qkv_g2s(
   const int load_gmem_d = (d_tile_id * kMmaAtomK) + load_smem_d;  // 0,8
   // Offset by QKV global gmem_offset.
   const int load_gmem_addr =
-      (gmem_offset + load_gmem_BrOrBc * kHeadDim + load_gmem_d);
+      (gmem_offset + load_gmem_BrOrBc * d_og + load_gmem_d);
   // Seqlen boundary predicate: rows beyond QKV_seqlen must be zero-filled.
   const bool row_valid = (load_gmem_BrOrBc < seqlen_bound);
 
@@ -133,8 +135,10 @@ __device__ __forceinline__ void cp_async_qkv_g2s(
                ? swizzle::permuted<kMmaAtomK>(load_smem_BrOrBc, load_smem_d + i)
                : load_smem_d + i)) *
              sizeof(kDataType));
+    // d_og % 8 == 0 keeps each 16B chunk fully inside/outside the real cols.
+    const bool col_valid = (load_gmem_d + i) < d_og;
     cp_async::cp_async_zfill<16>(load_smem_ptr, &(gmem_ptr[load_gmem_addr + i]),
-                                 row_valid);
+                                 row_valid && col_valid);
   }
   // cp_async::commit_group();
 }
