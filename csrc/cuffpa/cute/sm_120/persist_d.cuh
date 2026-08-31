@@ -35,13 +35,15 @@ using CtaBarrier = cutlass::arch::ClusterBarrier;
 // rows, or NHD (diffusers BNHD) flat [B*N, H*D] rows with the head as the
 // column tile - mirrors the kNhdQ Q load.
 template <typename Traits, typename TmaQ, typename TmaK, typename TmaV,
-          typename TmaO, int kHasAttnBias = 0, int kHasDropout = 0,
-          bool kNhdKV = false, bool kNhdQ = false>
+          typename TmaO, typename TmaBias, int kBiasMode = 0, int kBias4B = 0,
+          int kHasAttnBias = 0, int kHasDropout = 0, bool kNhdKV = false,
+          bool kNhdQ = false>
 __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_sm120(
     CUTLASS_GRID_CONSTANT TmaQ const tma_q,
     CUTLASS_GRID_CONSTANT TmaK const tma_k,
     CUTLASS_GRID_CONSTANT TmaV const tma_v,
     CUTLASS_GRID_CONSTANT TmaO const tma_o,
+    CUTLASS_GRID_CONSTANT TmaBias const tma_bias,
     typename Traits::Element* __restrict__ O, float* __restrict__ softmax_lse,
     int Nq, int Nkv, int Nh, int Nh_kv, float scale, int Tc, int causal,
     int total_q_rows, int total_kv_rows,
@@ -49,7 +51,8 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_sm120(
     long long attn_bias_stride_b = 0, long long attn_bias_stride_h = 0,
     long long attn_bias_stride_m = 0, long long attn_bias_stride_n = 0,
     float dropout_p = 0.0f, unsigned long long philox_seed = 0,
-    unsigned long long philox_offset = 0, bool nhd_out = false) {
+    unsigned long long philox_offset = 0, bool nhd_out = false,
+    long long attn_bias_plane_m_total = 0) {
   // Body-level arch guard: TMA/stmatrix need sm>=90, but in mixed -gencode
   // builds the sm_89 device pass still compiles this TU; the guard compiles
   // the body into a no-op stub there. Body-level (not file-level) is required
@@ -114,9 +117,24 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_sm120(
   __shared__ uint64_t k_empty[kStagesK];
   __shared__ uint64_t v_full[kStagesV];
   __shared__ uint64_t v_empty[kStagesV];
+  // Bias tile (PC-0): [kBr,kBc] (dense) or [1,kBc] (row-broadcast), issued by
+  // the dedicated producer warp one tile behind the consumer's injection (the
+  // empty-wait in the P2 loop needs exactly the previous tile's injection,
+  // which the producer does not join, so no self-deadlock). Tile mode 0 keeps
+  // the gmem-direct FC-4 path. The tile lives in the Q area: Q is s2r'd into
+  // regs before the kv loop (gemm_rs), and the O epilogue only reuses this
+  // area after the loop, so the bias window [first issue, last injection]
+  // fits between them. Double-buffer when the Q area holds two tiles.
+  constexpr int kBiasTileU16 = kBr * (kBc * (kBias4B ? 2 : 1));
+  constexpr int kBiasStages = (kQTileElements >= 2 * kBiasTileU16) ? 2 : 1;
+  __shared__ uint64_t bias_full[kBiasStages];
+  __shared__ uint64_t bias_empty[kBiasStages];
+  uint16_t* bias_base = reinterpret_cast<uint16_t*>(q_base);
+  __shared__ uint64_t q_consumed;  // Q s2r done: bias may reuse the Q area
 
   if (tid == 0) {
     TmaBarrier::init(&q_full, 1);
+    CtaBarrier::init(&q_consumed, kConsumerThreads);
     for (int s = 0; s < kStagesK; ++s) {
       TmaBarrier::init(&k_full[s], 1);
       CtaBarrier::init(&k_empty[s], kConsumerThreads);
@@ -124,6 +142,12 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_sm120(
     for (int s = 0; s < kStagesV; ++s) {
       TmaBarrier::init(&v_full[s], 1);
       CtaBarrier::init(&v_empty[s], kConsumerThreads);
+    }
+    if constexpr (kHasAttnBias) {
+      for (int s = 0; s < kBiasStages; ++s) {
+        TmaBarrier::init(&bias_full[s], 1);
+        CtaBarrier::init(&bias_empty[s], kConsumerThreads);
+      }
     }
   }
   __syncthreads();
@@ -176,6 +200,60 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_sm120(
       auto q_slice = tma_q.get_slice(_0{});
       auto k_slice = tma_k.get_slice(_0{});
       auto v_slice = tma_v.get_slice(_0{});
+      auto b_slice = tma_bias.get_slice(_0{});
+      // Bias plane in u16 units (see launcher): dense folds (b,h) into the
+      // linear row domain (validated host-side); the plane's dim0 is an
+      // element row, dim1 is a u16 column. Row-broadcast reads the single
+      // [1,Nkv] plane with a static 1-row box. The TMA box must be fully
+      // static (vectorization inference rejects dynamic modes) and must
+      // match the host descriptor, so the mode is a template parameter.
+      constexpr int bias_cols = kBc * (kBias4B ? 2 : 1);
+      auto mBias = [&] {
+        if constexpr (kBiasMode == 1)
+          // TMA-tensor coords are in rows; the (b,h) strides are element
+          // counts, so divide by stride_m (exact: plan validated stride_h
+          // == Nq*stride_m, stride_b == h_eff*Nq*stride_m).
+          return domain_offset(
+              make_coord(((long long)Nb_id * attn_bias_stride_b +
+                          (long long)Nh_id * attn_bias_stride_h) /
+                                 attn_bias_stride_m +
+                             (long long)Q_tile_id * kBr,
+                         0LL),
+              tma_bias.get_tma_tensor(make_shape(
+                  attn_bias_plane_m_total, (long long)Nkv * bias_cols / kBc)));
+        else
+          return domain_offset(make_coord(0LL, 0LL),
+                               tma_bias.get_tma_tensor(make_shape(
+                                   1LL, (long long)Nkv * bias_cols / kBc)));
+      }();
+      const auto issue_bias_tma = [&](int tile) {
+        const int stage = tile % kBiasStages;
+        const int phase = (tile / kBiasStages) & 1;
+        CtaBarrier::wait(&bias_empty[stage], phase);
+        if constexpr (kBiasMode == 1) {
+          auto sB =
+              make_tensor(make_smem_ptr(bias_base + stage * kBr * bias_cols),
+                          Layout<Shape<Int<kBr>, Int<bias_cols>>,
+                                 Stride<Int<bias_cols>, _1>>{});
+          auto gB = local_tile(mBias, Shape<Int<kBr>, Int<bias_cols>>{},
+                               make_coord(_0{}, tile));
+          TmaBarrier::arrive_and_expect_tx(&bias_full[stage],
+                                           sizeof(uint16_t) * kBr * bias_cols);
+          copy(tma_bias.with(bias_full[stage]), b_slice.partition_S(gB),
+               b_slice.partition_D(sB));
+        } else {
+          auto sB = make_tensor(
+              make_smem_ptr(bias_base + stage * bias_cols),
+              Layout<Shape<_1, Int<bias_cols>>, Stride<Int<bias_cols>, _1>>{});
+          auto gB = local_tile(mBias, Shape<_1, Int<bias_cols>>{},
+                               make_coord(_0{}, tile));
+          TmaBarrier::arrive_and_expect_tx(&bias_full[stage],
+                                           sizeof(uint16_t) * bias_cols);
+          copy(tma_bias.with(bias_full[stage]), b_slice.partition_S(gB),
+               b_slice.partition_D(sB));
+        }
+      };
+      const auto issue_bias = [&](int tile) { issue_bias_tma(tile); };
 
       // P0: Q one-shot full-D TMA
       auto sQ = make_tensor(make_smem_ptr(q_base), SmemLayoutQ{});
@@ -220,6 +298,14 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_sm120(
           TmaBarrier::arrive_and_expect_tx(&v_full[s],
                                            sizeof(Element) * size(sV));
           copy(tma_v.with(v_full[s]), tVgV, tVsV);
+        }
+      }
+      // P1c: bias tile(0) prefetch (depth-1 ahead, like the K pipeline).
+      // Wait for the Q s2r first: the tile overwrites the Q area.
+      if constexpr (kHasAttnBias && kBiasMode != 0) {
+        if (Tc_eff > 0) {
+          CtaBarrier::wait(&q_consumed, 0);
+          issue_bias(0);
         }
       }
       // P2: prefetch-ahead loop. s_next == k_stg since
@@ -269,6 +355,13 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_sm120(
             copy(tma_k.with(k_full[stage_k]), tKgK, tKsK);
           }
         }
+        // Bias: prefetch bias[tile+1]. Issued last so its empty-wait (needs
+        // the consumer's injection of tile-1) can never stall the V/K path.
+        if constexpr (kHasAttnBias && kBiasMode != 0) {
+          const int b_tile = tile + 1;
+          if (b_tile < Tc_eff)
+            issue_bias(b_tile);
+        }
       }
     }
     return;
@@ -286,6 +379,10 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_sm120(
     CtaBarrier::arrive(&k_empty[s]);
   for (int s = 0; s < kStagesV; ++s)
     CtaBarrier::arrive(&v_empty[s]);
+  if constexpr (kHasAttnBias) {
+    for (int s = 0; s < kBiasStages; ++s)
+      CtaBarrier::arrive(&bias_empty[s]);
+  }
 
   TiledMmaQK tiled_mma_qk;
   TiledMmaPV tiled_mma_pv;
@@ -342,6 +439,16 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_sm120(
   auto sQ = make_tensor(make_smem_ptr(q_base), SmemLayoutQ{});
   auto tCrQ = thr_mma_qk.partition_fragment_A(sQ);
   auto tQsQ_s2r = s2r_thr_q.partition_S(sQ);
+  // Q s2r once: the A fragment is loop-invariant (persist-D), so the QK step
+  // runs as gemm_rs (K-only smem loads) and the Q area hosts the bias tile
+  // for the whole kv loop (O epilogue reuses it only after the loop).
+  {
+    auto tXrQ = s2r_thr_q.retile_D(tCrQ);
+#pragma unroll
+    for (int tile_k = 0; tile_k < size<2>(tCrQ); ++tile_k)
+      copy(s2r_copy_q, tQsQ_s2r(_, _, tile_k), tXrQ(_, _, tile_k));
+    CtaBarrier::arrive(&q_consumed);
+  }
 
 #pragma unroll 1
   for (int kv_tile = 0; kv_tile < Tc_eff; ++kv_tile) {
@@ -350,7 +457,8 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_sm120(
     const int v_stg = kv_tile % kStagesV;
     const int v_phase = (kv_tile / kStagesV) & 1;
 
-    // QK GEMM: single gemm_ss, full-D Q × full-D K
+    // QK GEMM: gemm_rs with the loop-invariant Q A-fragment in regs,
+    // full-D Q × full-D K (K-only smem loads).
     TmaBarrier::wait(&k_full[k_stg], k_phase);
     cutlass::arch::fence_view_async_shared();
 
@@ -361,8 +469,8 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_sm120(
 
     auto tCrS = partition_fragment_C(tiled_mma_qk, Shape<Int<kBr>, Int<kBc>>{});
     clear(tCrS);
-    ffpa_cute::gemm_ss(tCrS, tCrQ, tCrK, tQsQ_s2r, tKsK_s2r, tiled_mma_qk,
-                       s2r_copy_q, s2r_copy_k, s2r_thr_q, s2r_thr_k);
+    ffpa_cute::gemm_rs(tCrS, tCrQ, tCrK, tKsK_s2r, tiled_mma_qk, s2r_copy_k,
+                       s2r_thr_k);
     // Release K slot to producer; no inline prefetch here (producer owns it).
     CtaBarrier::arrive(&k_empty[k_stg]);
 
@@ -397,7 +505,34 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_sm120(
       }
     }
 
-    if constexpr (kHasAttnBias) {
+    if constexpr (kHasAttnBias && kBiasMode != 0) {
+      const int b_stg = kv_tile % kBiasStages;
+      const int b_phase = (kv_tile / kBiasStages) & 1;
+      TmaBarrier::wait(&bias_full[b_stg], b_phase);
+      cutlass::arch::fence_view_async_shared();
+      const int b_slot_u16 = ((kBiasMode == 1) ? kBr * kBc : kBc) *
+                             ((attn_bias_dtype == 3) ? 2 : 1);
+      const uint16_t* b_slot = bias_base + b_stg * b_slot_u16;
+      constexpr int s_row = (kBiasMode == 1) ? kBc : 0;
+      if (attn_bias_dtype == 3)
+        ffpa_cute::apply_attn_bias_rowcol_smem<
+            float, decltype(scores), decltype(tScS_rc), kSRows, kSCols>(
+            scores, tScS_rc, reinterpret_cast<const float*>(b_slot), s_row, 1,
+            inv_scale);
+      else if (attn_bias_dtype == 2)
+        ffpa_cute::apply_attn_bias_rowcol_smem<
+            cutlass::bfloat16_t, decltype(scores), decltype(tScS_rc), kSRows,
+            kSCols>(scores, tScS_rc,
+                    reinterpret_cast<const cutlass::bfloat16_t*>(b_slot), s_row,
+                    1, inv_scale);
+      else
+        ffpa_cute::apply_attn_bias_rowcol_smem<
+            cutlass::half_t, decltype(scores), decltype(tScS_rc), kSRows,
+            kSCols>(scores, tScS_rc,
+                    reinterpret_cast<const cutlass::half_t*>(b_slot), s_row, 1,
+                    inv_scale);
+      CtaBarrier::arrive(&bias_empty[b_stg]);
+    } else if constexpr (kHasAttnBias) {
       ffpa_cute::apply_attn_bias_rowcol<decltype(scores), decltype(tScS_rc),
                                         kSRows, kSCols>(
           scores, tScS_rc, attn_bias, attn_bias_dtype, attn_bias_stride_b,

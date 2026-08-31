@@ -112,6 +112,10 @@ struct FfpaBiasParams {
   long long stride_n = 0;
 };
 
+// Anchor object for bias-less dummy TMA descriptors (never dereferenced:
+// the kernel skips the bias TMA when tile mode is 0).
+static constexpr uint16_t kBiasDummyAnchor __attribute__((aligned(16))) = 0;
+
 // Validate/flatten a python-side additive attn_bias (already normalized to
 // 4-D [B, Nh_q, Nq, Nkv]; size-1 dims broadcast via stride 0) into kernel
 // launch parameters. Shared by the fp8/fp4 quant launchers; mirrors the
@@ -147,6 +151,52 @@ static inline FfpaBiasParams ffpa_bias_params_of(const torch::Tensor& attn_bias,
   p.stride_m = (attn_bias.size(2) == 1 && Nq > 1) ? 0 : attn_bias.stride(2);
   p.stride_n = (attn_bias.size(3) == 1 && Nkv > 1) ? 0 : attn_bias.stride(3);
   return p;
+}
+
+// PC-0 bias tile plan: classify the broadcast shape and check TMA
+// expressibility (contiguous inner dim, 16B-aligned rows) for the smem
+// tile prefetch. mode: 0 = gmem-direct fallback (FC-4 path), 1 = dense
+// [kBr,kBc] tile, 2 = row-broadcast [1,kBc] tile. For mode 1 the (b,h)
+// strides fold into the linear row domain of the (m_total, Nkv) plane
+// (validated here), so the kernel offsets rows with its existing
+// attn_bias_stride_b/h. Column-broadcast masks (stride_n==0) stay on the
+// fallback: a 1-wide TMA box violates the 16B inner-dim requirement.
+struct FfpaBiasTilePlan {
+  int mode = 0;
+  int elem_size = 4;
+  long long m_total = 0;
+  // stages: 1 for the sm_120 single-buffer TMA tile, 2 for the sm_80
+  // double-buffered cp.async loader.
+  long long tile_bytes(int kBr, int kBc, int stages = 1) const {
+    const long long rows = (mode == 1) ? kBr : 1;
+    return (long long)stages * rows * kBc * elem_size;
+  }
+};
+
+static inline FfpaBiasTilePlan ffpa_bias_tile_plan_of(
+    const FfpaBiasParams& bias, long Nb, long Nh, long Nq, long Nkv) {
+  FfpaBiasTilePlan plan;
+  if (bias.ptr == nullptr)
+    return plan;
+  plan.elem_size = bias.dtype == 3 ? 4 : 2;
+  const auto aligned16 = [](long long bytes) { return bytes % 16 == 0; };
+  if (!aligned16(reinterpret_cast<long long>(bias.ptr)))
+    return plan;
+  if (bias.stride_n == 1 && bias.stride_m == 0) {
+    plan.mode = 2;
+    return plan;
+  }
+  if (bias.stride_n != 1 || !aligned16(bias.stride_m * plan.elem_size))
+    return plan;
+  const long long h_eff = bias.stride_h != 0 ? Nh : 1;
+  const long long b_eff = bias.stride_b != 0 ? Nb : 1;
+  if (bias.stride_h != 0 && bias.stride_h != Nq * bias.stride_m)
+    return plan;
+  if (bias.stride_b != 0 && bias.stride_b != h_eff * Nq * bias.stride_m)
+    return plan;
+  plan.mode = 1;
+  plan.m_total = b_eff * h_eff * Nq;
+  return plan;
 }
 
 template <typename kDataType, const int kHeadDim, const int kStage,
@@ -349,8 +399,69 @@ void launch_cute_fwd_split_d_sm120(torch::Tensor Q, torch::Tensor K,
   constexpr int kQTileBytes = kBr * kQKDChunk * sizeof(Element);
   constexpr int kKTileBytes = kBc * kQKDChunk * sizeof(Element);
   constexpr int kVTileBytes = kBc * kVDChunk * sizeof(Element);
-  constexpr int kSmemBytes = kStagesQK * kQTileBytes + kStagesQK * kKTileBytes +
+  const int kBaseSmemBytes = kStagesQK * kQTileBytes + kStagesQK * kKTileBytes +
                              kStagesPV * kVTileBytes;
+
+  // PC-0 bias tile: classify the mask shape; fall back to the gmem-direct
+  // path when the tile exceeds the smem budget. The TMA box must be fully
+  // static (cute's vectorization inference rejects dynamic modes), so mode
+  // and dtype become template splits; the direct fallback reuses the
+  // row-vec 2B descriptor shape as a never-issued dummy.
+  FfpaBiasTilePlan bias_plan;
+  if (has_attn_bias) {
+    FfpaBiasParams bias_p{attn_bias_ptr,      attn_bias_dtype,
+                          attn_bias_stride_b, attn_bias_stride_h,
+                          attn_bias_stride_m, attn_bias_stride_n};
+    bias_plan = ffpa_bias_tile_plan_of(bias_p, Nb, Nh, Nq, Nkv);
+  }
+  // sm_120 max opt-in dynamic smem per block is 99KB (101376B), which also
+  // caps the dense bias tile next to the QK/V buffers.
+  constexpr int kSmemBudgetBytes = 99 * 1024;
+  if (kBaseSmemBytes + bias_plan.tile_bytes(kBr, kBc) > kSmemBudgetBytes)
+    bias_plan.mode = 0;
+  const auto make_tma_bias = [&](auto mode_c, auto b4_c) {
+    constexpr int kBiasModeT = decltype(mode_c)::value;
+    constexpr int kBias4B = decltype(b4_c)::value;
+    constexpr int bias_cols = kBc * (kBias4B ? 2 : 1);
+    const int64_t plane_rows = (kBiasModeT == 1 && bias_plan.mode == 1)
+                                   ? (int64_t)bias_plan.m_total
+                                   : (int64_t)1;
+    const int64_t plane_cols =
+        (int64_t)std::max<long long>(Nkv, 1) * (kBias4B ? 2 : 1);
+    // dim0 has extent 1 outside the dense plan: bias_cols is semantically
+    // inert there but keeps the TMA descriptor's 16B outer-stride assert
+    // satisfied for the row-vec and never-issued dummy descriptors.
+    const int64_t plane_row_stride =
+        (kBiasModeT == 1 && bias_plan.mode == 1)
+            ? (int64_t)attn_bias_stride_m * (kBias4B ? 2 : 1)
+            : (int64_t)bias_cols;
+    // mode 0 (any demote reason, incl. an unaligned mask ptr) never issues:
+    // point every descriptor at the anchor so the 16B address assert holds.
+    const uint16_t* bias_desc_base =
+        bias_plan.mode != 0 ? reinterpret_cast<const uint16_t*>(attn_bias_ptr)
+                            : &kBiasDummyAnchor;
+    auto gB = make_tensor(make_gmem_ptr(bias_desc_base),
+                          make_shape(plane_rows, plane_cols),
+                          make_stride(plane_row_stride, _1{}));
+    auto sB = [&] {
+      if constexpr (kBiasModeT == 1)
+        return make_layout(Shape<Int<kBr>, Int<bias_cols>>{},
+                           Stride<Int<bias_cols>, _1>{});
+      else
+        return make_layout(Shape<_1, Int<bias_cols>>{},
+                           Stride<Int<bias_cols>, _1>{});
+    }();
+    return make_tma_copy(SM90_TMA_LOAD{}, gB, sB, shape(sB), _1{});
+  };
+  auto tma_bias_d16 = make_tma_bias(std::integral_constant<int, 1>{},
+                                    std::integral_constant<int, 0>{});
+  auto tma_bias_d32 = make_tma_bias(std::integral_constant<int, 1>{},
+                                    std::integral_constant<int, 1>{});
+  auto tma_bias_r16 = make_tma_bias(std::integral_constant<int, 2>{},
+                                    std::integral_constant<int, 0>{});
+  auto tma_bias_r32 = make_tma_bias(std::integral_constant<int, 2>{},
+                                    std::integral_constant<int, 1>{});
+  const int kSmemBytes = kBaseSmemBytes + (int)bias_plan.tile_bytes(kBr, kBc);
 
   float* softmax_lse_ptr =
       softmax_lse.numel() > 0 ? softmax_lse.data_ptr<float>() : nullptr;
@@ -361,33 +472,71 @@ void launch_cute_fwd_split_d_sm120(torch::Tensor Q, torch::Tensor K,
     constexpr bool kNhdQ = decltype(q_c)::value;
     constexpr bool kNhdKV = decltype(kv_c)::value;
 
-    auto launch_variant = [&](auto kernel_func) {
+    auto launch_variant = [&](auto kernel_func, auto tma_bias_sel) {
       cudaFuncSetAttribute(
           kernel_func, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes);
       kernel_func<<<grid, block, kSmemBytes, stream>>>(
-          tma_q, tma_k, tma_v, tma_o, O_ptr, softmax_lse_ptr, Nq, Nkv, Nh,
-          Nh_kv, scale, Tc, causal, total_q_rows, total_kv_rows, attn_bias_ptr,
-          attn_bias_dtype, attn_bias_stride_b, attn_bias_stride_h,
-          attn_bias_stride_m, attn_bias_stride_n, dropout_p_f, philox_seed_u,
-          philox_offset_u, nhd_out);
+          tma_q, tma_k, tma_v, tma_o, tma_bias_sel, O_ptr, softmax_lse_ptr, Nq,
+          Nkv, Nh, Nh_kv, scale, Tc, causal, total_q_rows, total_kv_rows,
+          attn_bias_ptr, attn_bias_dtype, attn_bias_stride_b,
+          attn_bias_stride_h, attn_bias_stride_m, attn_bias_stride_n,
+          dropout_p_f, philox_seed_u, philox_offset_u, nhd_out,
+          bias_plan.mode == 1 ? bias_plan.m_total : (long long)1);
     };
 
     using TmaQ = decltype(tma_q);
     using TmaK = decltype(tma_k);
     using TmaV = decltype(tma_v);
     using TmaO = decltype(tma_o);
-    if (has_attn_bias && has_dropout) {
-      launch_variant(split_d_fwd_cute_sm120<Traits, TmaQ, TmaK, TmaV, TmaO, 1,
-                                            1, kNhdQ, kNhdKV>);
-    } else if (has_attn_bias) {
-      launch_variant(split_d_fwd_cute_sm120<Traits, TmaQ, TmaK, TmaV, TmaO, 1,
-                                            0, kNhdQ, kNhdKV>);
-    } else if (has_dropout) {
-      launch_variant(split_d_fwd_cute_sm120<Traits, TmaQ, TmaK, TmaV, TmaO, 0,
-                                            1, kNhdQ, kNhdKV>);
+    using TmaBiasD16 = decltype(tma_bias_d16);
+    using TmaBiasD32 = decltype(tma_bias_d32);
+    using TmaBiasR16 = decltype(tma_bias_r16);
+    using TmaBiasR32 = decltype(tma_bias_r32);
+    const bool bias_f32 = (attn_bias_dtype == 3);
+    // bias-bearing helper: mode/dtype are compile-time (TMA box type), the
+    // dropout flag stays a runtime split inside.
+    const auto launch_bd = [&](auto tma_bias_sel, auto mode_c, auto b4_c) {
+      constexpr int kModeL = decltype(mode_c)::value;
+      constexpr int kB4 = decltype(b4_c)::value;
+      if (has_dropout)
+        launch_variant(split_d_fwd_cute_sm120<Traits, TmaQ, TmaK, TmaV, TmaO,
+                                              decltype(tma_bias_sel), kModeL,
+                                              kB4, 1, 1, kNhdQ, kNhdKV>,
+                       tma_bias_sel);
+      else
+        launch_variant(split_d_fwd_cute_sm120<Traits, TmaQ, TmaK, TmaV, TmaO,
+                                              decltype(tma_bias_sel), kModeL,
+                                              kB4, 1, 0, kNhdQ, kNhdKV>,
+                       tma_bias_sel);
+    };
+    if (!has_attn_bias) {
+      if (has_dropout)
+        launch_variant(
+            split_d_fwd_cute_sm120<Traits, TmaQ, TmaK, TmaV, TmaO, TmaBiasR16,
+                                   0, 0, 0, 1, kNhdQ, kNhdKV>,
+            tma_bias_r16);
+      else
+        launch_variant(
+            split_d_fwd_cute_sm120<Traits, TmaQ, TmaK, TmaV, TmaO, TmaBiasR16,
+                                   0, 0, 0, 0, kNhdQ, kNhdKV>,
+            tma_bias_r16);
+    } else if (bias_plan.mode == 1) {
+      if (bias_f32)
+        launch_bd(tma_bias_d32, std::integral_constant<int, 1>{},
+                  std::integral_constant<int, 1>{});
+      else
+        launch_bd(tma_bias_d16, std::integral_constant<int, 1>{},
+                  std::integral_constant<int, 0>{});
+    } else if (bias_plan.mode == 2) {
+      if (bias_f32)
+        launch_bd(tma_bias_r32, std::integral_constant<int, 2>{},
+                  std::integral_constant<int, 1>{});
+      else
+        launch_bd(tma_bias_r16, std::integral_constant<int, 2>{},
+                  std::integral_constant<int, 0>{});
     } else {
-      launch_variant(split_d_fwd_cute_sm120<Traits, TmaQ, TmaK, TmaV, TmaO, 0,
-                                            0, kNhdQ, kNhdKV>);
+      launch_bd(tma_bias_r16, std::integral_constant<int, 0>{},
+                std::integral_constant<int, 0>{});
     }
   };
 
@@ -604,7 +753,65 @@ void launch_cute_fwd_split_d_m4n2_sm120(torch::Tensor Q, torch::Tensor K,
     }
   };
 
-  constexpr int kSmemBytes = Traits::kSmemElems * sizeof(Element);
+  // PC-0 bias tile: classify the mask shape; fall back to the gmem-direct
+  // path when the tile exceeds the smem budget. The TMA box must be fully
+  // static (cute's vectorization inference rejects dynamic modes), so mode
+  // and dtype become template splits; the direct fallback reuses the
+  // row-vec 2B descriptor shape as a never-issued dummy.
+  FfpaBiasTilePlan bias_plan;
+  if (has_attn_bias) {
+    FfpaBiasParams bias_p{attn_bias_ptr,      attn_bias_dtype,
+                          attn_bias_stride_b, attn_bias_stride_h,
+                          attn_bias_stride_m, attn_bias_stride_n};
+    bias_plan = ffpa_bias_tile_plan_of(bias_p, Nb, Nh, Nq, Nkv);
+  }
+  const int kBaseSmemBytes = Traits::kSmemElems * sizeof(Element);
+  constexpr int kSmemBudgetBytes = 99 * 1024;
+  if (kBaseSmemBytes + bias_plan.tile_bytes(kBr, kBc) > kSmemBudgetBytes)
+    bias_plan.mode = 0;
+  const auto make_tma_bias = [&](auto mode_c, auto b4_c) {
+    constexpr int kBiasModeT = decltype(mode_c)::value;
+    constexpr int kBias4B = decltype(b4_c)::value;
+    constexpr int bias_cols = kBc * (kBias4B ? 2 : 1);
+    const int64_t plane_rows = (kBiasModeT == 1 && bias_plan.mode == 1)
+                                   ? (int64_t)bias_plan.m_total
+                                   : (int64_t)1;
+    const int64_t plane_cols =
+        (int64_t)std::max<long long>(Nkv, 1) * (kBias4B ? 2 : 1);
+    // dim0 has extent 1 outside the dense plan: bias_cols is semantically
+    // inert there but keeps the TMA descriptor's 16B outer-stride assert
+    // satisfied for the row-vec and never-issued dummy descriptors.
+    const int64_t plane_row_stride =
+        (kBiasModeT == 1 && bias_plan.mode == 1)
+            ? (int64_t)attn_bias_stride_m * (kBias4B ? 2 : 1)
+            : (int64_t)bias_cols;
+    // mode 0 (any demote reason, incl. an unaligned mask ptr) never issues:
+    // point every descriptor at the anchor so the 16B address assert holds.
+    const uint16_t* bias_desc_base =
+        bias_plan.mode != 0 ? reinterpret_cast<const uint16_t*>(attn_bias_ptr)
+                            : &kBiasDummyAnchor;
+    auto gB = make_tensor(make_gmem_ptr(bias_desc_base),
+                          make_shape(plane_rows, plane_cols),
+                          make_stride(plane_row_stride, _1{}));
+    auto sB = [&] {
+      if constexpr (kBiasModeT == 1)
+        return make_layout(Shape<Int<kBr>, Int<bias_cols>>{},
+                           Stride<Int<bias_cols>, _1>{});
+      else
+        return make_layout(Shape<_1, Int<bias_cols>>{},
+                           Stride<Int<bias_cols>, _1>{});
+    }();
+    return make_tma_copy(SM90_TMA_LOAD{}, gB, sB, shape(sB), _1{});
+  };
+  auto tma_bias_d16 = make_tma_bias(std::integral_constant<int, 1>{},
+                                    std::integral_constant<int, 0>{});
+  auto tma_bias_d32 = make_tma_bias(std::integral_constant<int, 1>{},
+                                    std::integral_constant<int, 1>{});
+  auto tma_bias_r16 = make_tma_bias(std::integral_constant<int, 2>{},
+                                    std::integral_constant<int, 0>{});
+  auto tma_bias_r32 = make_tma_bias(std::integral_constant<int, 2>{},
+                                    std::integral_constant<int, 1>{});
+  const int kSmemBytes = kBaseSmemBytes + (int)bias_plan.tile_bytes(kBr, kBc);
 
   float* softmax_lse_ptr =
       softmax_lse.numel() > 0 ? softmax_lse.data_ptr<float>() : nullptr;
@@ -615,33 +822,73 @@ void launch_cute_fwd_split_d_m4n2_sm120(torch::Tensor Q, torch::Tensor K,
     constexpr bool kNhdQ = decltype(q_c)::value;
     constexpr bool kNhdKV = decltype(kv_c)::value;
 
-    auto launch_variant = [&](auto kernel_func) {
+    auto launch_variant = [&](auto kernel_func, auto tma_bias_sel) {
       cudaFuncSetAttribute(
           kernel_func, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes);
       kernel_func<<<grid, block, kSmemBytes, stream>>>(
-          tma_q, tma_k, tma_v, tma_o, O_ptr, softmax_lse_ptr, Nq, Nkv, Nh,
-          Nh_kv, scale, Tc, causal, total_q_rows, total_kv_rows, attn_bias_ptr,
-          attn_bias_dtype, attn_bias_stride_b, attn_bias_stride_h,
-          attn_bias_stride_m, attn_bias_stride_n, dropout_p_f, philox_seed_u,
-          philox_offset_u, nhd_out);
+          tma_q, tma_k, tma_v, tma_o, tma_bias_sel, O_ptr, softmax_lse_ptr, Nq,
+          Nkv, Nh, Nh_kv, scale, Tc, causal, total_q_rows, total_kv_rows,
+          attn_bias_ptr, attn_bias_dtype, attn_bias_stride_b,
+          attn_bias_stride_h, attn_bias_stride_m, attn_bias_stride_n,
+          dropout_p_f, philox_seed_u, philox_offset_u, nhd_out,
+          bias_plan.mode == 1 ? bias_plan.m_total : (long long)1);
     };
 
     using TmaQ = decltype(tma_q);
     using TmaK = decltype(tma_k);
     using TmaV = decltype(tma_v);
     using TmaO = decltype(tma_o);
-    if (has_attn_bias && has_dropout) {
-      launch_variant(split_d_m4n2_fwd_cute_sm120<Traits, TmaQ, TmaK, TmaV, TmaO,
-                                                 1, 1, kNhdQ, kNhdKV>);
-    } else if (has_attn_bias) {
-      launch_variant(split_d_m4n2_fwd_cute_sm120<Traits, TmaQ, TmaK, TmaV, TmaO,
-                                                 1, 0, kNhdQ, kNhdKV>);
-    } else if (has_dropout) {
-      launch_variant(split_d_m4n2_fwd_cute_sm120<Traits, TmaQ, TmaK, TmaV, TmaO,
-                                                 0, 1, kNhdQ, kNhdKV>);
+    using TmaBiasD16 = decltype(tma_bias_d16);
+    using TmaBiasD32 = decltype(tma_bias_d32);
+    using TmaBiasR16 = decltype(tma_bias_r16);
+    using TmaBiasR32 = decltype(tma_bias_r32);
+    const bool bias_f32 = (attn_bias_dtype == 3);
+    // bias-bearing helper: mode/dtype are compile-time (TMA box type), the
+    // dropout flag stays a runtime split inside.
+    const auto launch_bd = [&](auto tma_bias_sel, auto mode_c, auto b4_c) {
+      constexpr int kModeL = decltype(mode_c)::value;
+      constexpr int kB4 = decltype(b4_c)::value;
+      if (has_dropout)
+        launch_variant(
+            split_d_m4n2_fwd_cute_sm120<Traits, TmaQ, TmaK, TmaV, TmaO,
+                                        decltype(tma_bias_sel), kModeL, kB4, 1,
+                                        1, kNhdQ, kNhdKV>,
+            tma_bias_sel);
+      else
+        launch_variant(
+            split_d_m4n2_fwd_cute_sm120<Traits, TmaQ, TmaK, TmaV, TmaO,
+                                        decltype(tma_bias_sel), kModeL, kB4, 1,
+                                        0, kNhdQ, kNhdKV>,
+            tma_bias_sel);
+    };
+    if (!has_attn_bias) {
+      if (has_dropout)
+        launch_variant(
+            split_d_m4n2_fwd_cute_sm120<Traits, TmaQ, TmaK, TmaV, TmaO,
+                                        TmaBiasR16, 0, 0, 0, 1, kNhdQ, kNhdKV>,
+            tma_bias_r16);
+      else
+        launch_variant(
+            split_d_m4n2_fwd_cute_sm120<Traits, TmaQ, TmaK, TmaV, TmaO,
+                                        TmaBiasR16, 0, 0, 0, 0, kNhdQ, kNhdKV>,
+            tma_bias_r16);
+    } else if (bias_plan.mode == 1) {
+      if (bias_f32)
+        launch_bd(tma_bias_d32, std::integral_constant<int, 1>{},
+                  std::integral_constant<int, 1>{});
+      else
+        launch_bd(tma_bias_d16, std::integral_constant<int, 1>{},
+                  std::integral_constant<int, 0>{});
+    } else if (bias_plan.mode == 2) {
+      if (bias_f32)
+        launch_bd(tma_bias_r32, std::integral_constant<int, 2>{},
+                  std::integral_constant<int, 1>{});
+      else
+        launch_bd(tma_bias_r16, std::integral_constant<int, 2>{},
+                  std::integral_constant<int, 0>{});
     } else {
-      launch_variant(split_d_m4n2_fwd_cute_sm120<Traits, TmaQ, TmaK, TmaV, TmaO,
-                                                 0, 0, kNhdQ, kNhdKV>);
+      launch_bd(tma_bias_r16, std::integral_constant<int, 0>{},
+                std::integral_constant<int, 0>{});
     }
   };
 
@@ -740,6 +987,78 @@ void launch_cute_fwd_persist_d_sm120(torch::Tensor Q, torch::Tensor K,
   const unsigned long long philox_offset_u =
       static_cast<unsigned long long>(philox_offset);
 
+  // PC-0 bias tile: classify the mask shape; fall back to the gmem-direct
+  // path when the tile exceeds the smem budget. The TMA box must be fully
+  // static (cute's vectorization inference rejects dynamic modes), so mode
+  // and dtype become template splits; the direct fallback reuses the
+  // row-vec 2B descriptor shape as a never-issued dummy.
+  FfpaBiasTilePlan bias_plan;
+  if (has_attn_bias) {
+    FfpaBiasParams bias_p{attn_bias_ptr,      attn_bias_dtype,
+                          attn_bias_stride_b, attn_bias_stride_h,
+                          attn_bias_stride_m, attn_bias_stride_n};
+    bias_plan = ffpa_bias_tile_plan_of(bias_p, Nb, Nh, Nq, Nkv);
+  }
+  const int kBaseSmemBytes = Traits::kSmemElems * sizeof(Element);
+  // Independent of the K/V stage budget above (kSmemBudgetBytes drives
+  // kMaxStages): the bias tile shares the same 99KB per-block opt-in cap.
+  // The tile reuses the Q-persist area (Q is s2r'd into regs before the kv
+  // loop, see persist_d.cuh), so only the part beyond kQPersistBytes adds
+  // smem. bias_stages mirrors the kernel's kBiasStages (double-buffer when
+  // the Q area holds two tiles).
+  constexpr int kBiasSmemBudgetBytes = 99 * 1024;
+  const long long tile_u16_1 = (long long)kBr * kBc * (bias_plan.elem_size / 2);
+  const int bias_stages =
+      ((long long)kQPersistBytes / 2 >= 2 * tile_u16_1) ? 2 : 1;
+  const long long bias_extra =
+      std::max(0LL, bias_plan.tile_bytes(kBr, kBc, bias_stages) -
+                        (long long)kQPersistBytes);
+  if (kBaseSmemBytes + bias_extra > kBiasSmemBudgetBytes)
+    bias_plan.mode = 0;
+  const auto make_tma_bias = [&](auto mode_c, auto b4_c) {
+    constexpr int kBiasModeT = decltype(mode_c)::value;
+    constexpr int kBias4B = decltype(b4_c)::value;
+    constexpr int bias_cols = kBc * (kBias4B ? 2 : 1);
+    const int64_t plane_rows = (kBiasModeT == 1 && bias_plan.mode == 1)
+                                   ? (int64_t)bias_plan.m_total
+                                   : (int64_t)1;
+    const int64_t plane_cols =
+        (int64_t)std::max<long long>(Nkv, 1) * (kBias4B ? 2 : 1);
+    // dim0 has extent 1 outside the dense plan: bias_cols is semantically
+    // inert there but keeps the TMA descriptor's 16B outer-stride assert
+    // satisfied for the row-vec and never-issued dummy descriptors.
+    const int64_t plane_row_stride =
+        (kBiasModeT == 1 && bias_plan.mode == 1)
+            ? (int64_t)attn_bias_stride_m * (kBias4B ? 2 : 1)
+            : (int64_t)bias_cols;
+    // mode 0 (any demote reason, incl. an unaligned mask ptr) never issues:
+    // point every descriptor at the anchor so the 16B address assert holds.
+    const uint16_t* bias_desc_base =
+        bias_plan.mode != 0 ? reinterpret_cast<const uint16_t*>(attn_bias_ptr)
+                            : &kBiasDummyAnchor;
+    auto gB = make_tensor(make_gmem_ptr(bias_desc_base),
+                          make_shape(plane_rows, plane_cols),
+                          make_stride(plane_row_stride, _1{}));
+    auto sB = [&] {
+      if constexpr (kBiasModeT == 1)
+        return make_layout(Shape<Int<kBr>, Int<bias_cols>>{},
+                           Stride<Int<bias_cols>, _1>{});
+      else
+        return make_layout(Shape<_1, Int<bias_cols>>{},
+                           Stride<Int<bias_cols>, _1>{});
+    }();
+    return make_tma_copy(SM90_TMA_LOAD{}, gB, sB, shape(sB), _1{});
+  };
+  auto tma_bias_d16 = make_tma_bias(std::integral_constant<int, 1>{},
+                                    std::integral_constant<int, 0>{});
+  auto tma_bias_d32 = make_tma_bias(std::integral_constant<int, 1>{},
+                                    std::integral_constant<int, 1>{});
+  auto tma_bias_r16 = make_tma_bias(std::integral_constant<int, 2>{},
+                                    std::integral_constant<int, 0>{});
+  auto tma_bias_r32 = make_tma_bias(std::integral_constant<int, 2>{},
+                                    std::integral_constant<int, 1>{});
+  const int kTotalSmemBytes = kBaseSmemBytes + (int)bias_extra;
+
   const dim3 block(kNumThreads, 1, 1);
   const dim3 grid(utils::div_ceil(Nq, kBr), Nb * Nh, 1);
 
@@ -811,39 +1130,79 @@ void launch_cute_fwd_persist_d_sm120(torch::Tensor Q, torch::Tensor K,
     auto tma_o = make_tma_copy(SM90_TMA_STORE{}, gO, SmemLayoutO{},
                                Shape<Int<kBr>, Int<kHeadDim>>{}, _1{});
 
-    constexpr int kSmemBytes = Traits::kSmemElems * sizeof(Element);
+    const int kSmemBytes = kTotalSmemBytes;
 
     float* softmax_lse_ptr =
         softmax_lse.numel() > 0 ? softmax_lse.data_ptr<float>() : nullptr;
     auto O_ptr = reinterpret_cast<Element*>(O.data_ptr());
 
-    auto launch_variant = [&](auto kernel_func) {
+    auto launch_variant = [&](auto kernel_func, auto tma_bias_sel) {
       cudaFuncSetAttribute(
           kernel_func, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes);
       kernel_func<<<grid, block, kSmemBytes, stream>>>(
-          tma_q, tma_k, tma_v, tma_o, O_ptr, softmax_lse_ptr, Nq, Nkv, Nh,
-          Nh_kv, scale, Tc, causal, total_q_rows, total_kv_rows, attn_bias_ptr,
-          attn_bias_dtype, attn_bias_stride_b, attn_bias_stride_h,
-          attn_bias_stride_m, attn_bias_stride_n, dropout_p_f, philox_seed_u,
-          philox_offset_u, nhd_out);
+          tma_q, tma_k, tma_v, tma_o, tma_bias_sel, O_ptr, softmax_lse_ptr, Nq,
+          Nkv, Nh, Nh_kv, scale, Tc, causal, total_q_rows, total_kv_rows,
+          attn_bias_ptr, attn_bias_dtype, attn_bias_stride_b,
+          attn_bias_stride_h, attn_bias_stride_m, attn_bias_stride_n,
+          dropout_p_f, philox_seed_u, philox_offset_u, nhd_out,
+          bias_plan.mode == 1 ? bias_plan.m_total : (long long)1);
     };
 
     using TmaQ = decltype(tma_q);
     using TmaK = decltype(tma_k);
     using TmaV = decltype(tma_v);
     using TmaO = decltype(tma_o);
-    if (has_attn_bias && has_dropout) {
-      launch_variant(persist_d_ws_fwd_cute_sm120<Traits, TmaQ, TmaK, TmaV, TmaO,
-                                                 1, 1, kNhdKV, kNhdQ>);
-    } else if (has_attn_bias) {
-      launch_variant(persist_d_ws_fwd_cute_sm120<Traits, TmaQ, TmaK, TmaV, TmaO,
-                                                 1, 0, kNhdKV, kNhdQ>);
-    } else if (has_dropout) {
-      launch_variant(persist_d_ws_fwd_cute_sm120<Traits, TmaQ, TmaK, TmaV, TmaO,
-                                                 0, 1, kNhdKV, kNhdQ>);
+    using TmaBiasD16 = decltype(tma_bias_d16);
+    using TmaBiasD32 = decltype(tma_bias_d32);
+    using TmaBiasR16 = decltype(tma_bias_r16);
+    using TmaBiasR32 = decltype(tma_bias_r32);
+    const bool bias_f32 = (attn_bias_dtype == 3);
+    // bias-bearing helper: mode/dtype are compile-time (TMA box type), the
+    // dropout flag stays a runtime split inside.
+    const auto launch_bd = [&](auto tma_bias_sel, auto mode_c, auto b4_c) {
+      constexpr int kModeL = decltype(mode_c)::value;
+      constexpr int kB4 = decltype(b4_c)::value;
+      if (has_dropout)
+        launch_variant(
+            persist_d_ws_fwd_cute_sm120<Traits, TmaQ, TmaK, TmaV, TmaO,
+                                        decltype(tma_bias_sel), kModeL, kB4, 1,
+                                        1, kNhdKV, kNhdQ>,
+            tma_bias_sel);
+      else
+        launch_variant(
+            persist_d_ws_fwd_cute_sm120<Traits, TmaQ, TmaK, TmaV, TmaO,
+                                        decltype(tma_bias_sel), kModeL, kB4, 1,
+                                        0, kNhdKV, kNhdQ>,
+            tma_bias_sel);
+    };
+    if (!has_attn_bias) {
+      if (has_dropout)
+        launch_variant(
+            persist_d_ws_fwd_cute_sm120<Traits, TmaQ, TmaK, TmaV, TmaO,
+                                        TmaBiasR16, 0, 0, 0, 1, kNhdKV, kNhdQ>,
+            tma_bias_r16);
+      else
+        launch_variant(
+            persist_d_ws_fwd_cute_sm120<Traits, TmaQ, TmaK, TmaV, TmaO,
+                                        TmaBiasR16, 0, 0, 0, 0, kNhdKV, kNhdQ>,
+            tma_bias_r16);
+    } else if (bias_plan.mode == 1) {
+      if (bias_f32)
+        launch_bd(tma_bias_d32, std::integral_constant<int, 1>{},
+                  std::integral_constant<int, 1>{});
+      else
+        launch_bd(tma_bias_d16, std::integral_constant<int, 1>{},
+                  std::integral_constant<int, 0>{});
+    } else if (bias_plan.mode == 2) {
+      if (bias_f32)
+        launch_bd(tma_bias_r32, std::integral_constant<int, 2>{},
+                  std::integral_constant<int, 1>{});
+      else
+        launch_bd(tma_bias_r16, std::integral_constant<int, 2>{},
+                  std::integral_constant<int, 0>{});
     } else {
-      launch_variant(persist_d_ws_fwd_cute_sm120<Traits, TmaQ, TmaK, TmaV, TmaO,
-                                                 0, 0, kNhdKV, kNhdQ>);
+      launch_bd(tma_bias_r16, std::integral_constant<int, 0>{},
+                std::integral_constant<int, 0>{});
     }
   };
 
@@ -2076,16 +2435,16 @@ void launch_cute_fwd_split_d_sm80(torch::Tensor Q, torch::Tensor K,
   constexpr int kKTileBytes = kBc * kQKDChunk * sizeof(Element);
   constexpr int kVTileBytes = kBc * kVDChunk * sizeof(Element);
   constexpr int kSmemPerStage = kQTileBytes + kKTileBytes + kVTileBytes;
-  constexpr int kSmemBytes = kStagesQK * kSmemPerStage;
 
   int max_smem_optin = 0;
   cudaDeviceGetAttribute(&max_smem_optin,
                          cudaDevAttrMaxSharedMemoryPerBlockOptin,
                          Q.device().index());
-  TORCH_CHECK(kSmemBytes <= max_smem_optin, "ffpa_attn: CuTe kernel requires ",
-              kSmemBytes, " bytes smem (stages=", kStagesQK,
-              ", chunk=", kQKDChunk, "/", kVDChunk, ") but device supports ",
-              max_smem_optin, " bytes opt-in smem");
+  TORCH_CHECK(kStagesQK * kSmemPerStage <= max_smem_optin,
+              "ffpa_attn: CuTe kernel requires ", kStagesQK * kSmemPerStage,
+              " bytes smem (stages=", kStagesQK, ", chunk=", kQKDChunk, "/",
+              kVDChunk, ") but device supports ", max_smem_optin,
+              " bytes opt-in smem");
 
   const int Nb = Q.size(0);
   const int Nh = Q.size(1);
@@ -2142,6 +2501,22 @@ void launch_cute_fwd_split_d_sm80(torch::Tensor Q, torch::Tensor K,
   const unsigned long long philox_offset_u =
       static_cast<unsigned long long>(philox_offset);
 
+  // PC-0 bias tile (cp.async sm80 path): shape classification only — no TMA
+  // descriptor here; the loader is in-kernel vectorized global loads, so the
+  // plan only gates on the smem budget.
+  FfpaBiasTilePlan bias_plan;
+  if (has_attn_bias) {
+    FfpaBiasParams bias_p{attn_bias_ptr,      attn_bias_dtype,
+                          attn_bias_stride_b, attn_bias_stride_h,
+                          attn_bias_stride_m, attn_bias_stride_n};
+    bias_plan = ffpa_bias_tile_plan_of(bias_p, Nb, Nh, Nq, Nkv);
+  }
+  const int kBaseSmemBytes = kStagesQK * kSmemPerStage;
+  if (kBaseSmemBytes + bias_plan.tile_bytes(kBr, kBc, 2) > max_smem_optin)
+    bias_plan.mode = 0;
+  const int kSmemBytes =
+      kBaseSmemBytes + (int)bias_plan.tile_bytes(kBr, kBc, 2);
+
   const dim3 block(kNumThreads, 1, 1);
   const dim3 grid(utils::div_ceil(Nq, kBr), Nb * Nh, 1);
 
@@ -2162,7 +2537,8 @@ void launch_cute_fwd_split_d_sm80(torch::Tensor Q, torch::Tensor K,
         Q_ptr, K_ptr, V_ptr, O_ptr, softmax_lse_ptr, Nq, Nkv, Nh, Nh_kv, scale,
         Tc, causal, attn_bias_ptr, attn_bias_dtype, attn_bias_stride_b,
         attn_bias_stride_h, attn_bias_stride_m, attn_bias_stride_n, dropout_p_f,
-        philox_seed_u, philox_offset_u);
+        philox_seed_u, philox_offset_u, bias_plan.mode,
+        bias_plan.mode == 1 ? bias_plan.m_total : (long long)1);
   };
 
   if (has_attn_bias && has_dropout) {

@@ -26,7 +26,8 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1) split_d_fwd_cute_sm80(
     long long attn_bias_stride_b = 0, long long attn_bias_stride_h = 0,
     long long attn_bias_stride_m = 0, long long attn_bias_stride_n = 0,
     float dropout_p = 0.0f, unsigned long long philox_seed = 0,
-    unsigned long long philox_offset = 0) {
+    unsigned long long philox_offset = 0, int attn_bias_tile_mode = 0,
+    long long attn_bias_plane_m_total = 0) {
   using namespace cute;
   using Element = typename Traits::Element;
   using SmemLayoutQ = typename Traits::SmemLayoutQ;
@@ -78,6 +79,12 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1) split_d_fwd_cute_sm80(
   Element* q_base = shm;
   Element* k_base = q_base + kStagesQK * kQChunkElements;
   Element* v_base = k_base + kStagesQK * kKChunkElements;
+  // Bias tile (PC-0): double-buffered [kBr,kBc] (dense) or [1,kBc]
+  // (row-broadcast), raw dtype bytes, loaded via 16B vectorized global
+  // loads with an OOB zero guard. Tile mode 0 keeps the gmem-direct path.
+  uint16_t* bias_base = reinterpret_cast<uint16_t*>(
+      reinterpret_cast<char*>(v_base) +
+      kStagesPV * kVChunkElements * sizeof(Element));
 
   // G2S TiledCopy: 256 threads, 128-bit cp.async.
   // Separate copies for QK (kQKDChunk-wide) and V (kVDChunk-wide) tiles.
@@ -196,6 +203,60 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1) split_d_fwd_cute_sm80(
     copy(g2s_copy_v, g2s_thr_v.partition_S(gV), g2s_thr_v.partition_D(sV));
   };
 
+  // Bias tile loader (PC-0): 16B vectorized with OOB zero guard. Row guard
+  // uses the folded plane extent (dense); row-broadcast reads row 0 with
+  // stride_m==0, so the offset formula stays uniform. Tail tiles fall back
+  // to per-element loads only for partially-OOB groups.
+  const int bias_esize = (attn_bias_dtype == 3) ? 4 : 2;
+  const int bias_rows_l = (attn_bias_tile_mode == 1) ? kBr : 1;
+  const long long bias_m_off = (attn_bias_tile_mode == 1)
+                                   ? (long long)Nb_id * attn_bias_stride_b +
+                                         (long long)Nh_id * attn_bias_stride_h +
+                                         (long long)Q_tile_id * kBr
+                                   : 0;
+  const int bias_slot_u16 = bias_rows_l * kBc * (bias_esize / 2);
+  auto g2s_load_bias = [&](int tile) {
+    if (attn_bias_tile_mode == 0)
+      return;
+    uint16_t* dst = bias_base + (tile % 2) * bias_slot_u16;
+    const int epv = 16 / bias_esize;
+    const int vecs_total = bias_rows_l * kBc / epv;
+    for (int g = tid; g < vecs_total; g += kNumThreads) {
+      const int flat = g * epv;
+      const int r = flat / kBc, c = flat % kBc;
+      const int gc = tile * kBc + c;
+      const bool row_ok = (attn_bias_tile_mode != 1) ||
+                          (bias_m_off + r < attn_bias_plane_m_total);
+      if (row_ok && gc + epv <= Nkv) {
+        *reinterpret_cast<uint4*>(dst + flat * (bias_esize / 2)) =
+            *reinterpret_cast<const uint4*>(
+                reinterpret_cast<const char*>(attn_bias) +
+                ((long long)(bias_m_off + r) * attn_bias_stride_m + gc) *
+                    bias_esize);
+      } else {
+        const char* src_row =
+            reinterpret_cast<const char*>(attn_bias) +
+            (long long)(bias_m_off + r) * attn_bias_stride_m * bias_esize;
+#pragma unroll
+        for (int e = 0; e < epv; ++e) {
+          const int gc_e = gc + e;
+          const bool ok = row_ok && gc_e < Nkv;
+          if (bias_esize == 4) {
+            uint32_t u = 0;
+            if (ok)
+              memcpy(&u, src_row + (long long)gc_e * 4, 4);
+            reinterpret_cast<uint32_t*>(dst)[flat + e] = u;
+          } else {
+            uint16_t u = 0;
+            if (ok)
+              memcpy(&u, src_row + (long long)gc_e * 2, 2);
+            dst[flat + e] = u;
+          }
+        }
+      }
+    }
+  };
+
   // Initial V prefetch for kv_tile 0.
   {
     int v_write = 0;
@@ -221,8 +282,14 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1) split_d_fwd_cute_sm80(
       cp_async_fence();
       qk_write = (qk_write + 1) % kStagesQK;
     }
+    if constexpr (kHasAttnBias) {
+      if (attn_bias_tile_mode != 0 && Tc_eff > 0)
+        g2s_load_bias(0);
+    }
     if constexpr (kStagesQK > 1) {
       cp_async_wait<kStagesQK - 2>();
+      __syncthreads();
+    } else {
       __syncthreads();
     }
   }
@@ -311,6 +378,14 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1) split_d_fwd_cute_sm80(
         cp_async_fence();
         qk_write_next = (qk_write_next + 1) % kStagesQK;
       }
+      if constexpr (kHasAttnBias) {
+        if (attn_bias_tile_mode != 0)
+          g2s_load_bias(kv_tile + 1);
+        // bias smem store must be visible before the next tile's injection;
+        // stages>=2 already syncs below, stages==1 needs it explicitly.
+        if (attn_bias_tile_mode != 0 && kStagesQK == 1)
+          __syncthreads();
+      }
       if constexpr (kStagesQK > 1) {
         cp_async_wait<kStagesQK - 2>();
         __syncthreads();
@@ -353,11 +428,37 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1) split_d_fwd_cute_sm80(
 
       // Additive attention bias (pre-softmax).
       if constexpr (kHasAttnBias) {
-        ffpa_cute::apply_attn_bias_rowcol<decltype(scores), decltype(tScS_rc),
-                                          kSRows, kSCols>(
-            scores, tScS_rc, attn_bias, attn_bias_dtype, attn_bias_stride_b,
-            attn_bias_stride_h, attn_bias_stride_m, attn_bias_stride_n, Nb_id,
-            Nh_id, Br_base, kv_tile, kBc, inv_scale);
+        if (attn_bias_tile_mode != 0) {
+          const int b_slot_u16 =
+              ((attn_bias_tile_mode == 1) ? kBr * kBc : kBc) *
+              ((attn_bias_dtype == 3) ? 2 : 1);
+          const uint16_t* b_slot = bias_base + (kv_tile % 2) * b_slot_u16;
+          const int s_row = (attn_bias_tile_mode == 1) ? kBc : 0;
+          if (attn_bias_dtype == 3)
+            ffpa_cute::apply_attn_bias_rowcol_smem<
+                float, decltype(scores), decltype(tScS_rc), kSRows, kSCols>(
+                scores, tScS_rc, reinterpret_cast<const float*>(b_slot), s_row,
+                1, inv_scale);
+          else if (attn_bias_dtype == 2)
+            ffpa_cute::apply_attn_bias_rowcol_smem<
+                cutlass::bfloat16_t, decltype(scores), decltype(tScS_rc),
+                kSRows, kSCols>(
+                scores, tScS_rc,
+                reinterpret_cast<const cutlass::bfloat16_t*>(b_slot), s_row, 1,
+                inv_scale);
+          else
+            ffpa_cute::apply_attn_bias_rowcol_smem<
+                cutlass::half_t, decltype(scores), decltype(tScS_rc), kSRows,
+                kSCols>(scores, tScS_rc,
+                        reinterpret_cast<const cutlass::half_t*>(b_slot), s_row,
+                        1, inv_scale);
+        } else {
+          ffpa_cute::apply_attn_bias_rowcol<decltype(scores), decltype(tScS_rc),
+                                            kSRows, kSCols>(
+              scores, tScS_rc, attn_bias, attn_bias_dtype, attn_bias_stride_b,
+              attn_bias_stride_h, attn_bias_stride_m, attn_bias_stride_n, Nb_id,
+              Nh_id, Br_base, kv_tile, kBc, inv_scale);
+        }
       }
 
       // Row-max + exp2 + row-sum.
