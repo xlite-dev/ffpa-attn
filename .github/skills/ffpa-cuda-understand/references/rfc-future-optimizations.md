@@ -4,6 +4,7 @@
 > 本稿按"**功能完备性 > 性能优化**"两条轨道组织。功能完备性轨道解锁"现在做不了/被物化降级/直接报错"的能力；性能轨道在功能不变前提下提速。
 > 动手前**必读附录 A（已证伪清单）**；所有性能类收益数字按报告 §2.2 纪律标注卡型/冷热条件。
 > **约定**：本文所有代码路径均相对于 **ffpa-attn 仓库根目录**（如 `csrc/cuffpa/cute/launch.cuh`）。实施完成状态统一记录在两处：**完成状态清单**（下方，GitHub 上可直接勾选）与**总览表状态列**；各条目 `Status: Draft` 仅表示设计稿状态。每做完一项，同步勾选清单 + 更新总览表状态列（⬜ 待开始 → 🚧 进行中 → ✅ 已完成）。
+> **子项编号**：任一大 FC/PC 可按场景拆挂子项，编号为 `父-子`（如 `PC-0-0`），子项在总览表与完成状态清单中缩进列于父项之下，可独立推进/验收/勾选；父项状态 = 全部子项完成后方可置 ✅（部分完成时父项标 🚧 并括注进度，如 `🚧 1/3`）。
 
 ## RFC实现规范（⚠️ 强制约束）
 
@@ -55,7 +56,10 @@
 | FC-9 | CUDA backward (**暂不实施，仅保留设计稿**) | F3 | ⬜ 待开始 | — |
 | FC-10 | sm90/sm100 量化覆盖 (**暂不实施，仅保留设计稿**) | F3 | ⬜ 待开始 | — |
 | FC-11 | native 路径 dropout 精度修复（bug，高优） | F3 | ✅ 已完成（ffpa-attn 542f774/e1fe363，根因=torch ref uint32 bug） | — |
-| PC-0 | attn_mask 量化路径 bias tile IO 重构（fp8/fp4） | P | ⬜ 待开始（**P 轨最高优先**） | FC-4 注入点 |
+| PC-0 | attn mask 场景性能优化（bias tile IO 重构） | P | ⬜ 待开始 0/3（**P 轨最高优先**） | FC-4 注入点 |
+| PC-0-0 | ↳ cute/cute_tma 场景（fp16 cute 家族） | P | ⬜ 待开始 | — |
+| PC-0-1 | ↳ fp8/fp4 场景（量化六族，原 PC-0 主体） | P | ⬜ 待开始 | FC-4 注入点；PC-0-0 热身 |
+| PC-0-2 | ↳ native/native_tma 场景 | P | ⬜ 待开始 | — |
 | PC-1 | Mega Quantize Kernel（aux 链大融合） | P | ⬜ 待开始 | — |
 | PC-2 | 增量融合（Mega Kernel 步进） | P | ⬜ 待开始 | 被 PC-1 收编 |
 | PC-3 | N-crossover 量化配置自适应 | P | ⬜ 待开始 | — |
@@ -90,7 +94,10 @@
 
 **轨道 P（性能优化）**
 
-- [ ] PC-0：attn_mask 量化路径 bias tile IO 重构（fp8/fp4）—— P 轨最高优先（2026-08-31 立项）
+- [ ] PC-0：attn mask 场景性能优化 —— bias tile IO 重构（P 轨最高优先，2026-08-31 立项）
+  - [ ] PC-0-0：cute/cute_tma 场景（fp16 cute 家族 `apply_attn_bias_rowcol` smem tile 化）
+  - [ ] PC-0-1：fp8/fp4 场景（量化六族 kernel，原 PC-0 主体设计）
+  - [ ] PC-0-2：native/native_tma 场景（标量 loader 路径，设计稿待补）
 - [ ] PC-1：Mega Quantize Kernel —— P 轨基建
 - [ ] PC-2：增量融合（Mega Kernel 步进，被 PC-1 收编）
 - [ ] PC-3：N-crossover 量化配置自适应
@@ -120,7 +127,10 @@
   FC-7 短 Nq/decode ⏸ ｜ FC-8 native pad ｜ FC-9 backward 评估 ⏸ ｜
   FC-10 sm90/sm100 ⏸（FC-7/FC-9/FC-10 均暂不实施）
 阶段 4（轨道 P）
-  PC-0 attn_mask 量化路径 bias tile IO 重构（P0：attn-mask 是当前量化路径最大退化点）
+  PC-0 attn mask 场景性能优化（P0：attn-mask 是当前量化路径最大退化点）
+        ├─► PC-0-0 cute/cute_tma（fp16 家族，方案 A 热身台阶）
+        ├─► PC-0-1 fp8/fp4（量化六族，主体）
+        └─► PC-0-2 native/native_tma（设计稿待补，NCU 复核后再排期）
   PC-1 Mega Quantize Kernel（先做 cooperative 两阶段原型）
         ├─► 收编 PC-2（增量融合是其落地台阶）
         └─► 联动 PC-5 ⏸（暂不实施；launch 形态定型后才能定 graph 兼容方案）
@@ -864,9 +874,27 @@ tma+dropout 112ms 性能异常（见上"附带发现"，归属后续性能 RFC�
 
 > 轨道 F 解决"能不能用"，轨道 P 解决"快不快"。以下各项在功能完备的前提下推进。
 
-### PC-0：attn_mask 量化路径 bias tile IO 重构（fp8/fp4）
+### PC-0：attn mask 场景性能优化（bias tile IO 重构）
 
 - **Status**: Draft ｜ **Priority**: P0（性能轨最高优先） ｜ **Track**: 性能
+
+#### 子项分解（场景拆分，可独立推进/验收/回退）
+
+父项按 kernel 家族拆三个子项，共享同一根因诊断（bias 标量 IO 的 cache line
+级重复 + 低效 sector 利用），但注入点/基建不同，故分别设计与验收：
+
+- **PC-0-0：cute/cute_tma 场景**（fp16 cute 家族，`apply_attn_bias_rowcol`）——
+  方案 A（bias tile smem 预载）的最小验证场：无 raw-S 域反量化、无 fp4
+  `kv_perm32` 置换、无 fp8 `inv_sd` 乘法，先在此跑通 smem tile + `tScS_rc`
+  坐标读 + 流水预取，作为 PC-0-1 的热身台阶。
+- **PC-0-1：fp8/fp4 场景**（量化六族：fp8/fp4 × persist-D/split-D/M4N2）——
+  原 PC-0 主体设计（下方 Motivation/Design/Files/Validation 均归属此子项），
+  在 PC-0-0 基建上叠加 raw-S 域注入、perm32 列置换、inv_sd 折叠三个量化特化。
+- **PC-0-2：native/native_tma 场景**（`prefill.cuh` 标量 loader
+  `load_attn_bias_value`，R_S fragment + broadcast-stride 语义）——native 侧
+  与 cute 的 TMA/smem 基建不同，且 bias 坐标来自 R_S fragment 语义，不能直接
+  搬方案 A；候选方向（向量化 direct load / cp.async 预载 / smem tile 化）
+  设计稿待补，动手前先 NCU 复核退化量级再定投入。
 
 #### Motivation
 
