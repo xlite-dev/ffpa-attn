@@ -113,8 +113,11 @@ def _apply_dropout_to_p(
   if HAS_DROPOUT:
     # Keep this in SDPA's logical score order.  In split-kv decode, offs_n is
     # passed as the global KV index, so no extra chunk offset should be added.
-    linear = off_hb * seqlen_q * seqlen_k + offs_m[:, None] * seqlen_k + offs_n[
-      None, :]
+    # int64: B*H*Nq*Nkv exceeds 2**31 for realistic prefill shapes.
+    linear = (
+      off_hb.to(tl.int64) * seqlen_q * seqlen_k +
+      offs_m[:, None].to(tl.int64) * seqlen_k + offs_n[None, :]
+    )
     rand = _curand_uniform_from_element_offset(
       philox_seed, philox_offset + linear
     )
@@ -636,10 +639,11 @@ def _ffpa_decode_fwd_stage1_kernel(
       l_new = l_i_single * alpha + tl.sum(p, axis=0)
       if HAS_DROPOUT:
         # offs_kv already includes chunk_start, matching the global Nkv axis in
-        # SDPA's [B, H, Nq, Nkv] dropout RNG layout.
-        linear = off_hb * seqlen_q * seqlen_k + (
+        # SDPA's [B, H, Nq, Nkv] dropout RNG layout. int64: same overflow guard
+        # as _apply_dropout_to_p.
+        linear = off_hb.to(tl.int64) * seqlen_q * seqlen_k + (
           q_block * BLOCK_M
-        ) * seqlen_k + offs_kv
+        ).to(tl.int64) * seqlen_k + offs_kv
         rand = _curand_uniform_from_element_offset(
           PHILOX_SEED, philox_offset + linear
         )

@@ -211,8 +211,11 @@ def _dropout_multiplier(
   mult = tl.full([offs_m.shape[0], offs_n.shape[0]], 1.0, dtype=tl.float32)
   if HAS_DROPOUT:
     # Replay the exact forward dropout mask using SDPA's logical score layout.
-    linear = off_hb * seqlen_q * seqlen_k + offs_m[:, None] * seqlen_k + offs_n[
-      None, :]
+    # int64: B*H*Nq*Nkv exceeds 2**31 for realistic prefill shapes.
+    linear = (
+      off_hb.to(tl.int64) * seqlen_q * seqlen_k +
+      offs_m[:, None].to(tl.int64) * seqlen_k + offs_n[None, :]
+    )
     rand = _curand_uniform_from_element_offset(
       philox_seed, philox_offset + linear
     )

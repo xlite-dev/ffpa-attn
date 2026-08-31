@@ -4,6 +4,7 @@
 > 本稿按"**功能完备性 > 性能优化**"两条轨道组织。功能完备性轨道解锁"现在做不了/被物化降级/直接报错"的能力；性能轨道在功能不变前提下提速。
 > 动手前**必读附录 A（已证伪清单）**；所有性能类收益数字按报告 §2.2 纪律标注卡型/冷热条件。
 > **约定**：本文所有代码路径均相对于 **ffpa-attn 仓库根目录**（如 `csrc/cuffpa/cute/launch.cuh`）。实施完成状态统一记录在两处：**完成状态清单**（下方，GitHub 上可直接勾选）与**总览表状态列**；各条目 `Status: Draft` 仅表示设计稿状态。每做完一项，同步勾选清单 + 更新总览表状态列（⬜ 待开始 → 🚧 进行中 → ✅ 已完成）。
+> **子项编号**：任一大 FC/PC 可按场景拆挂子项，编号为 `父-子`（如 `PC-0-0`），子项在总览表与完成状态清单中缩进列于父项之下，可独立推进/验收/勾选；父项状态 = 全部子项完成后方可置 ✅（部分完成时父项标 🚧 并括注进度，如 `🚧 1/3`）。
 
 ## RFC实现规范（⚠️ 强制约束）
 
@@ -54,8 +55,11 @@
 | FC-8 | native head_dim pad | F3 | ✅ 已完成 | — |
 | FC-9 | CUDA backward (**暂不实施，仅保留设计稿**) | F3 | ⬜ 待开始 | — |
 | FC-10 | sm90/sm100 量化覆盖 (**暂不实施，仅保留设计稿**) | F3 | ⬜ 待开始 | — |
-| FC-11 | native 路径 dropout 精度修复（bug，高优） | F3 | ⬜ 待开始 | — |
-| PC-0 | attn_mask 量化路径 bias tile IO 重构（fp8/fp4） | P | ⬜ 待开始（**P 轨最高优先**） | FC-4 注入点 |
+| FC-11 | native 路径 dropout 精度修复（bug，高优） | F3 | ✅ 已完成（ffpa-attn 542f774/e1fe363，根因=torch ref uint32 bug） | — |
+| PC-0 | attn mask 场景性能优化（bias tile IO 重构） | P | ⬜ 待开始 0/3（**P 轨最高优先**） | FC-4 注入点 |
+| PC-0-0 | ↳ cute/cute_tma 场景（fp16 cute 家族） | P | ⬜ 待开始 | — |
+| PC-0-1 | ↳ fp8/fp4 场景（量化六族，原 PC-0 主体） | P | ⬜ 待开始 | FC-4 注入点；PC-0-0 热身 |
+| PC-0-2 | ↳ native/native_tma 场景 | P | ⬜ 待开始 | — |
 | PC-1 | Mega Quantize Kernel（aux 链大融合） | P | ⬜ 待开始 | — |
 | PC-2 | 增量融合（Mega Kernel 步进） | P | ⬜ 待开始 | 被 PC-1 收编 |
 | PC-3 | N-crossover 量化配置自适应 | P | ⬜ 待开始 | — |
@@ -86,11 +90,14 @@
 - [x] FC-8：native head_dim pad —— kernel 侧 d_og 零物化 pad（cp.async src-size 列守卫 / TMA OOB 零填充），AUTO/NATIVE/TMA 三 hint 64 对齐（2026-08-31 完成）
 - [ ] FC-9：CUDA backward（定位评估）
 - [ ] FC-10：sm90/sm100 量化覆盖
-- [ ] FC-11：native 路径 dropout 精度修复 —— 存量 bug（2026-08-31 记录）
+- [x] FC-11：native 路径 dropout 精度修复 —— 存量 bug（2026-08-31 记录）；已结案（同日）：实为 stale `.so` + Triton int32 回绕 + torch 2.11 mem-eff ref 自身 uint32 回绕（PyTorch main 已修），FFPA 源码本身正确
 
 **轨道 P（性能优化）**
 
-- [ ] PC-0：attn_mask 量化路径 bias tile IO 重构（fp8/fp4）—— P 轨最高优先（2026-08-31 立项）
+- [ ] PC-0：attn mask 场景性能优化 —— bias tile IO 重构（P 轨最高优先，2026-08-31 立项）
+  - [ ] PC-0-0：cute/cute_tma 场景（fp16 cute 家族 `apply_attn_bias_rowcol` smem tile 化）
+  - [ ] PC-0-1：fp8/fp4 场景（量化六族 kernel，原 PC-0 主体设计）
+  - [ ] PC-0-2：native/native_tma 场景（标量 loader 路径，设计稿待补）
 - [ ] PC-1：Mega Quantize Kernel —— P 轨基建
 - [ ] PC-2：增量融合（Mega Kernel 步进，被 PC-1 收编）
 - [ ] PC-3：N-crossover 量化配置自适应
@@ -120,7 +127,10 @@
   FC-7 短 Nq/decode ⏸ ｜ FC-8 native pad ｜ FC-9 backward 评估 ⏸ ｜
   FC-10 sm90/sm100 ⏸（FC-7/FC-9/FC-10 均暂不实施）
 阶段 4（轨道 P）
-  PC-0 attn_mask 量化路径 bias tile IO 重构（P0：attn-mask 是当前量化路径最大退化点）
+  PC-0 attn mask 场景性能优化（P0：attn-mask 是当前量化路径最大退化点）
+        ├─► PC-0-0 cute/cute_tma（fp16 家族，方案 A 热身台阶）
+        ├─► PC-0-1 fp8/fp4（量化六族，主体）
+        └─► PC-0-2 native/native_tma（设计稿待补，NCU 复核后再排期）
   PC-1 Mega Quantize Kernel（先做 cooperative 两阶段原型）
         ├─► 收编 PC-2（增量融合是其落地台阶）
         └─► 联动 PC-5 ⏸（暂不实施；launch 形态定型后才能定 graph 兼容方案）
@@ -768,7 +778,7 @@ Blackwell 消费/专业卡；若目标硬件扩到 H100/B200，量化路径不�
 
 ### FC-11：native 路径 dropout 精度修复
 
-- **Status**: Draft ｜ **Priority**: F3（**bug 修复，高优**） ｜ **Track**: 功能/正确性
+- **Status**: ✅ Done（2026-08-31，ffpa-attn 542f774/e1fe363） ｜ **Priority**: F3（bug 修复，高优） ｜ **Track**: 功能/正确性
 
 #### Motivation
 
@@ -785,66 +795,78 @@ native 家族（AUTO/NATIVE cp.async 与 sm90+ TMA）的 dropout task 在 bench 
 同批 run 的 self-attn / causal / attn-mask / non-aligned / decode / gqa /
 cross 全部通过（O_err ≤ 0.005）→ 问题**仅限 dropout**。
 
-#### 归属判定（已做，2026-08-31）
+#### Root Cause（已验证，根因反转）
 
-- D=128（无 head_dim pad）同样失败 → **与 FC-8 native pad 无关**；
-- AUTO（sm80 cp.async）与 TMA（sm120 native TMA）两 hint 都失败，且同 D 下
-  O_err 数值一致 → 两 kernel 共享的 `prefill.cuh` philox dropout 路径是
-  唯一公共环节 → **存量 bug**（kernel 侧 RNG mask 与 SDPA 不完全对齐）。
+三个相互独立的因素叠加，最终结论是 **FFPA 源码正确，参照系（本地 torch
+2.11.0 mem-efficient SDPA）在 >2^32 score elements 时自身 uint32 回绕**：
 
-#### 附带发现（性能）
+1. **bench 实测的 native FAIL 主体是 stale `.so`**：`_C*.so`（03:07 编译）
+   落后于 `prefill.cuh`（04:53 `git pull` 拉入 #351 更新），
+   `rm -rf build src/ffpa_attn/_C*.so` 全量重编后 native 恢复正确
+   （源码 `sync_apply_dropout_to_p` 全链路 u64，#199 起即正确）；
+2. **Triton 侧确有真 bug（已修）**：`_apply_dropout_to_p` /
+   `_ffpa_decode_fwd_stage1_kernel` / `_dropout_multiplier` 三处的
+   `linear = off_hb * seqlen_q * seqlen_k + ...` 在 int32 域计算
+   （`program_id`/`offs_*` 均 32 位），B\*H\*Nq\*Nkv > 2^31 即回绕；
+   统一 `.to(tl.int64)` 提升后修复（< 2^31 数值逐位不变，
+   stash 基线对比证实）；
+3. **torch 2.11.0 mem-eff 参照系 bug**：`kernel_forward.h`
+   `advance_to_block()` 中 `batch_id * num_heads * num_queries * num_keys`
+   的 `num_*` 全是 `int32_t`、`blockIdx` 分量为 32 位 unsigned → 乘法在
+   **uint32 域**完成后才赋给 u64。边界矩阵实证：max linear index =
+   2^32−1 的三个 shape（B1 H16 N16384、B2 H32 N8192 等）全部 PASS，
+   仅 2^33−1（B1 H32 N16384）FAIL，per-head 图显示 sdpa 恰从 head 16
+   （base = 2^32）起分歧。PyTorch main 已修（`gemm_kernel_utils::
+   dropout_rng_offset` 全 int64_t helper，注释明确 "keeps num_queries *
+   num_keys from wrapping at 2^32"）。
 
-`--cuda-impl tma` + dropout：112-114 ms（0.65x vs SDPA），比同形状
-`--cuda-impl fp16` 的 40 ms 慢 2.8x。TMA hint 带 dropout 回退的 native TMA
-sm120 kernel 疑似走了低效配置（与本 bug 一并排查）。
+修复后五路交叉验证（native / tma / cute / cute_tma / triton，
+B1 H32 N16384）：互相 max_err ≤ 1e-4，与 sdpa 一致地 0.0452（仅
+head 16+ 分歧，即 ref bug）。bwd 组合（cuda-fwd + triton-bwd）与全
+triton 的 dQ/dK/dV 互差 ≤ 1.2e-4 → **fwd/bwd mask replay 自洽**。
 
-#### Root Cause（初步假设，待验证）
+#### Design（实际落地）
 
-dropout 作用于 softmax 后的 P，RNG 按
-`linear = ((b*Hq+h)*Nq+q)*Nkv+k` 消费 philox4x32-10（`sync_apply_dropout_to_p`
-→ `philox4x32_10` / `apply_dropout_pair`）。O_err 量级（~0.06-0.08，
-dropout_p=0.1）呈"大部分 mask 对齐、局部错位"特征，疑似：
-- SDPA（efficient/flash backend）的 RNG 消费布局与该线性布局在**行/组边界**
-  不一致（philox 按 4 元素组消费，行尾或 (b,h) 边界对齐方式不同）；或
-- Python 侧预留的 philox seed/offset 与 kernel 侧 offset base 错位。
-
-#### Design
-
-1. **对齐诊断**：小形状（如 4×8）dump FFPA 与 SDPA 的 dropout mask 逐元素
-   diff，定位错位模式（行边界 / 4 元素组边界 / (b,h) 边界）；
-2. 按 SDPA 实际消费布局修正 `sync_apply_dropout_to_p` 的 offset 计算
-   （两 kernel 共享一份修正）；若 SDPA backend 在 sm120 上本身无稳定 mask
-   契约，则以 Triton forward（已与 SDPA 对齐）的实现为参照；
-3. 排查 tma+dropout 回退 kernel 的 2.8x 性能异常。
+1. Triton 三处 RNG offset 计算 int64 化（helper 内统一 cast，
+   覆盖 sm80/sm90 所有调用点）；
+2. bench 侧：runner 检测 `dropout_p > 0 且 B*Hq*Nq*Nkv > 2^32` 时打印
+   `[warn]`、行内标注 `[torch-ref-2^32-bug]`、Markdown marker 渲染 ⚠️
+   而非 ❌（torch 修复版落地后自动恢复正常判定）；
+3. native 侧无需改动（u64 源码正确，stale 二进制问题）。
 
 #### Files & Symbols
 
-- `csrc/cuffpa/native/prefill.cuh`（`philox4x32_10` / `apply_dropout_pair` /
-  `sync_apply_dropout_to_p`）
-- `csrc/cuffpa/native/sm_80/split_d.cuh`、`csrc/cuffpa/native/sm_120/split_d.cuh`
-  （调用点 offset 传参）
-- `src/ffpa_attn/functional.py`（philox seed/offset 预留侧）
+- `src/ffpa_attn/triton/_ffpa_fwd.py`（`_apply_dropout_to_p`、decode
+  stage1 内联 dropout）
+- `src/ffpa_attn/triton/_ffpa_bwd.py`（`_dropout_multiplier`）
+- `src/ffpa_attn/cli/_runner_fwd.py`、`_runner_bwd.py`、`_bench.py`
+  （ref-bug 检测与标注）
+- `tests/test_ffpa_fwd.py`（三个大 N 回归测试）
 
-#### Validation
+#### Validation（已通过）
 
-- `ffpa_attn.bench --cuda-impl fp16/tma --tasks dropout`：fp16/bf16
-  allclose=True（atol 0.02/0.05），跨 D（128/120/320/328）与 hint；
-- 新增 mask 逐元素一致性单测（FFPA vs SDPA/Triton dropout mask diff == 0）；
-- tma+dropout 延时回到与 fp16 impl 同量级。
+- `pytest -k 'dropout_large_n or cross_consistent'`：3 passed；
+  stash 修复后 triton 大 N 测试按预期 FAIL（证明可捕获回归）；
+- `ffpa_attn.bench --backend cuda/triton --D 128 --N 8192` 全任务
+  allclose=True（triton bwd dropout dQ_err 与修复前基线逐位一致 →
+  无回归）；
+- `--N 16384 --tasks dropout`（fwd/bwd）：输出 `[torch-ref-2^32-bug]`
+  标注；`--N 8192` 无误标。
 
 #### Risks & Rollback
 
-- dropout mask 改动会影响依赖同一 RNG 路径的既有 parity 基线（Triton 已对齐
-  路径不动）；回退 = 单 commit revert。
+- bench 的 ⚠️ 标注条件精确限定于 dropout + >2^32（该条件下 ref 数学上
+  必坏），不会掩盖 FFPA 其它缺陷；回退 = revert 两个 commit。
 
 #### Expected Benefit
 
-native 家族 dropout 恢复 parity（当前 bench 唯一 False 项）；tma+dropout
-性能异常排除。
+dropout RNG 语义与 PyTorch main 对齐；N=16384 dropout 不再误报回归；
+大 N 回归防线建立（2^32 边界 SDPA-parity + 2^33 交叉一致性）。
 
 #### Dependencies
 
-无（与 FC-5 量化 dropout 设计稿独立）。
+无（与 FC-5 量化 dropout 设计稿独立）。附带发现未处理项：
+tma+dropout 112ms 性能异常（见上"附带发现"，归属后续性能 RFC）。
 
 ---
 
@@ -852,9 +874,27 @@ native 家族 dropout 恢复 parity（当前 bench 唯一 False 项）；tma+dro
 
 > 轨道 F 解决"能不能用"，轨道 P 解决"快不快"。以下各项在功能完备的前提下推进。
 
-### PC-0：attn_mask 量化路径 bias tile IO 重构（fp8/fp4）
+### PC-0：attn mask 场景性能优化（bias tile IO 重构）
 
 - **Status**: Draft ｜ **Priority**: P0（性能轨最高优先） ｜ **Track**: 性能
+
+#### 子项分解（场景拆分，可独立推进/验收/回退）
+
+父项按 kernel 家族拆三个子项，共享同一根因诊断（bias 标量 IO 的 cache line
+级重复 + 低效 sector 利用），但注入点/基建不同，故分别设计与验收：
+
+- **PC-0-0：cute/cute_tma 场景**（fp16 cute 家族，`apply_attn_bias_rowcol`）——
+  方案 A（bias tile smem 预载）的最小验证场：无 raw-S 域反量化、无 fp4
+  `kv_perm32` 置换、无 fp8 `inv_sd` 乘法，先在此跑通 smem tile + `tScS_rc`
+  坐标读 + 流水预取，作为 PC-0-1 的热身台阶。
+- **PC-0-1：fp8/fp4 场景**（量化六族：fp8/fp4 × persist-D/split-D/M4N2）——
+  原 PC-0 主体设计（下方 Motivation/Design/Files/Validation 均归属此子项），
+  在 PC-0-0 基建上叠加 raw-S 域注入、perm32 列置换、inv_sd 折叠三个量化特化。
+- **PC-0-2：native/native_tma 场景**（`prefill.cuh` 标量 loader
+  `load_attn_bias_value`，R_S fragment + broadcast-stride 语义）——native 侧
+  与 cute 的 TMA/smem 基建不同，且 bias 坐标来自 R_S fragment 语义，不能直接
+  搬方案 A；候选方向（向量化 direct load / cp.async 预载 / smem tile 化）
+  设计稿待补，动手前先 NCU 复核退化量级再定投入。
 
 #### Motivation
 

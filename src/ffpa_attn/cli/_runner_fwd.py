@@ -227,12 +227,16 @@ def _format_forward_result(
       f"TFLOPS={tflops_str:<9} "
       f"🎉{result['speedup']:<4.2f}x"
     )
+  parity_note = ""
+  if result.get("ref_wrapped") and result["allclose"] is False:
+    parity_note = "[torch-ref-2^32-bug] "
   return (
     f"[{result['case_name']:<12} {result['dtype']:>4}] "
     f"B={result['B']:<1} Hq={result['Hq']:<2} Hkv={result['Hkv']:<2} "
     f"Nq={result['Nq']:<5} Nkv={result['Nkv']:<5} D={result['D']:<3} "
     f"O_err={result['max_diff']:<9.4f} "
     f"allclose(atol={result['tolerance']:.2f})={str(result['allclose']):<5} "
+    f"{parity_note}"
     f"FFPA={result['ffpa_ms']:<6.2f}ms SDPA={result['sdpa_ms']:<6.2f}ms "
     f"TFLOPS={tflops_str:<9} "
     f"🎉{result['speedup']:<4.2f}x"
@@ -413,7 +417,19 @@ def _run_case(
     tol = 0.7 if causal else 0.15
   else:
     tol = 5e-2 if (dtype == torch.bfloat16 or enable_fp8) else 2e-2
+  # torch's mem-efficient SDPA derives the per-(b,h) dropout Philox offset in
+  # 32-bit arithmetic, so the reference dropout mask itself wraps once
+  # B*Hq*Nq*Nkv exceeds 2**32 total score elements (fixed on PyTorch main by
+  # gemm_kernel_utils::dropout_rng_offset). FFPA keeps the int64 layout, so a
+  # dropout mismatch at that scale indicts the reference, not the kernel.
+  sdpa_dropout_ref_wrapped = dropout_p > 0.0 and B * Nh_q * Nq * Nkv > 2**32
   ok = _tensor_allclose(out_ffpa, out_sdpa, tol)
+  if sdpa_dropout_ref_wrapped and not ok and verbose:
+    print(
+      f"[warn] {name}: torch mem-efficient SDPA dropout RNG offset wraps"
+      " above 2^32 score elements (reference bug, fixed on PyTorch"
+      " main); parity mismatch attributed to the reference"
+    )
 
   if pre_heat > 0:
     # Low-power SDPA runs pull the GPU to full clocks before timing.
@@ -466,6 +482,7 @@ def _run_case(
     "max_diff": _max_abs_diff(out_ffpa, out_sdpa),
     "mean_diff": _mean_abs_diff(out_ffpa, out_sdpa),
     "allclose": ok,
+    "ref_wrapped": sdpa_dropout_ref_wrapped,
     "tolerance": tol,
     "warmup": warmup,
     "iters": iters,
