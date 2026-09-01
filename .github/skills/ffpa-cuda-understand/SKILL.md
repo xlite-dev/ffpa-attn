@@ -435,13 +435,13 @@ lse 公式（NVFP4 PV）：`lse = (m*L + log2(row_sum) + log2(1/2688))*ln2 + sca
 | Python 层归一化（`normalize_attn_mask`） | — | bool mask → additive（True 参与注意 / False→-inf，SDPA 语义）；2D→`[1,1,Nq,Nkv]`、3D→`[B,1,Nq,Nkv]` view；要求最内维连续（否则 contiguous）；dtype ∈ {bool, fp32, Q.dtype} |
 | 全局互斥 | — | `attn_mask` + `is_causal` 任何 backend 均拒绝 |
 | Native sm80 / sm120 TMA | ✓ | 4D 广播 `[B\|1, H\|1, Nq\|1, Nkv\|1]`；fp16/bf16/fp32；广播维 stride 置 0；dtype code 1/2/3 |
-| CUTE fp16（persist/split/M4N2/sm80） | ✓（编译期 4 变体） | 但 dispatch 自动回退 native TMA（除非 force_cute_tma），因 CUTE bias 路径寄存器压力慢 ~2x |
-| **CUTE FP8（全部三族）** | ✓（FC-4） | raw-S 域注入 `bias/(qs*ks*scale_orig)`；`kHasAttnBias` 双实例 tag dispatch；仅拒 dropout |
-| **CUTE FP4（全部三族）** | ✓（FC-4） | dequant 域注入 `bias/scale_orig`，列 `kv_perm32(j)`；仅拒 dropout |
+| CUTE fp16（persist/split/M4N2/sm80） | ✓（编译期 4 变体） | bias IO 已 smem tile 化（PC-0-0：TMA 预取 + mode 2 rowvec 双缓冲 / mode 3 全驻留；D=128 gap 1.12、D=768 1.07 达标，D=320 结构极限 1.44 → PC-0-3）；dispatch 默认仍回退 native TMA（除非 force_cute_tma） |
+| **CUTE FP8（全部三族）** | ✓（FC-4 + PC-0-1 tile） | raw-S 域注入 `bias/(qs*ks*scale_orig)`；`kHasAttnBias` 双实例 tag dispatch；仅拒 dropout；bias IO 已 smem tile 化（PC-0-1：persist_d mode 3 **1.84x**、split_d D=320 mode 2 1.20x / D≥512 demote mode 0（PC-0-4）、m4n2 occupancy 守卫 mode 2 1.03x） |
+| **CUTE FP4（全部三族）** | ✓（FC-4 + PC-0-1 tile） | dequant 域注入 `bias/scale_orig`，列 `kv_perm32(j)`；仅拒 dropout；bias IO 已 smem tile 化（PC-0-1：split_d mode 3 **1.67x**、m4n2 mode 3 1.04x）；⚠️ **persist_d / m4n2 带 bias 存在先在时序竞争**（偶发单 head 16 行条纹 ~1e-2，PC-0-5 排查中；fp8 全族、fp16 全族、fp4 split_d 实证干净） |
 | cutedsl backend | ✗ | `NotImplementedError`（无静默 fallback） |
 | Triton backend | ✓ | （非本报告范围，支持 additive mask 梯度） |
 
-**结论：attn_mask 的低精度路径已由 FC-4 解锁**（fp8/fp4 六族均支持，2026-08-28）；dropout 仍为 fp16 家族专属。
+**结论：attn_mask 的低精度路径已由 FC-4 解锁**（fp8/fp4 六族均支持，2026-08-28）；bias 注入 IO 已全家族 smem tile 化（PC-0-0 fp16 2026-08-31 / PC-0-1 fp8+fp4 2026-09-01，主力 mode 3 全驻留 + occupancy 守卫）；fp4 persist_d/m4n2 的 bias 场景存在先在时序竞争（正确性，PC-0-5 排查中）；dropout 仍为 fp16 家族专属。
 
 ### 7.2 dropout
 
