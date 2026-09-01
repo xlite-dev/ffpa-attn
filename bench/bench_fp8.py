@@ -664,6 +664,7 @@ def main():
           preset=args.preset,
           hybrid=args.hybrid,
           with_permute=args.with_permute,
+          stages=args.stages
         )
       )
 
