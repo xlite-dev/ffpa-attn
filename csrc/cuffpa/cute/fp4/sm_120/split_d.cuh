@@ -68,7 +68,8 @@ using CtaBarrier = cutlass::arch::ClusterBarrier;
 
 template <typename Traits, typename ElementO, typename TmaQ, typename TmaK,
           typename TmaV, typename TmaO, typename TmaSFQ, typename TmaSFK,
-          typename TmaSFVt, typename TmaDS, int kHasAttnBias = 0>
+          typename TmaSFVt, typename TmaDS, typename TmaBias, int kBiasMode = 0,
+          int kBias4B = 0, int kHasAttnBias = 0>
 __global__ void __launch_bounds__(Traits::kNumThreads, 1)
     split_d_fwd_cute_fp4_sm120(
         CUTLASS_GRID_CONSTANT TmaQ const tma_q,
@@ -78,7 +79,8 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
         CUTLASS_GRID_CONSTANT TmaSFQ const tma_sfq,
         CUTLASS_GRID_CONSTANT TmaSFK const tma_sfk,
         CUTLASS_GRID_CONSTANT TmaSFVt const tma_sfvt,
-        CUTLASS_GRID_CONSTANT TmaDS const tma_ds, ElementO* __restrict__ O,
+        CUTLASS_GRID_CONSTANT TmaDS const tma_ds,
+        CUTLASS_GRID_CONSTANT TmaBias const tma_bias, ElementO* __restrict__ O,
         float* __restrict__ softmax_lse, const float* __restrict__ km,
         const float* __restrict__ qm, const float* __restrict__ vm, int Nq,
         int Nkv, int Nq_pad, int Nkv_pad, int Nh, int Nh_kv, float scale,
@@ -86,7 +88,8 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
         bool nhd_out = false, const void* __restrict__ attn_bias = nullptr,
         int attn_bias_dtype = 0, long long attn_bias_stride_b = 0,
         long long attn_bias_stride_h = 0, long long attn_bias_stride_m = 0,
-        long long attn_bias_stride_n = 0) {
+        long long attn_bias_stride_n = 0,
+        long long attn_bias_plane_m_total = 0) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
   using namespace cute;
   using cute::tma_store_arrive;
@@ -158,6 +161,18 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
   __shared__ uint64_t v_full[kStagesPV];
   __shared__ uint64_t v_empty[kStagesPV];
   __shared__ uint64_t epilogue_done;
+  // PC-0-1 bias tile: row-broadcast [1,kBc] double buffered (mode 2) or the
+  // resident [1,Nkv] vector (mode 3), 16B-aligned past the SFVt block --
+  // outside kSmemBytes so the O epilogue's batched staging (which reuses
+  // the freed K/V area) never aliases it. Like the K/V stages the bias
+  // barriers are never re-init: issuer and consumer advance one global
+  // bias-tile counter each so phases stay aligned across the grid-strided
+  // works.
+  constexpr int kBiasStages = (kBiasMode == 2) ? 2 : 1;
+  __shared__ uint64_t bias_full[kBiasStages];
+  __shared__ uint64_t bias_empty[kBiasStages];
+  uint16_t* bias_base =
+      reinterpret_cast<uint16_t*>(shm + ((Traits::kSmemBytes + 15) & ~15));
 
   if (tid == 0) {
     TmaBarrier::init(&q_full, 1);
@@ -170,6 +185,12 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
       CtaBarrier::init(&v_empty[s], kNumThreads);
     }
     CtaBarrier::init(&epilogue_done, kNumThreads);
+    if constexpr (kHasAttnBias) {
+      for (int s = 0; s < kBiasStages; ++s) {
+        TmaBarrier::init(&bias_full[s], 1);
+        CtaBarrier::init(&bias_empty[s], kNumThreads);
+      }
+    }
   }
   __syncthreads();
 
@@ -299,11 +320,46 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
          sfvt_slice.partition_D(sSFVt_st));
   };
 
+  // PC-0-1 bias tile (fp4 persist_d pattern, adapted to the in-loop
+  // producer): the stage/phase come from the global bias_g counter
+  // (barriers never re-init), and mBias folds this work's (b,h) row --
+  // row-broadcast rows are Nkv elements wide (host-validated strides).
+  int bias_g = 0;  // global bias-tile count; bias_full/empty never re-init
+  auto b_slice = tma_bias.get_slice(_0{});
+  constexpr int bias_cols = kBc * (kBias4B ? 2 : 1);
+  auto issue_bias_tma = [&](int b, int h, int tile) {
+    cutlass::arch::fence_view_async_shared();
+    const int stage = bias_g % kBiasStages;
+    const int phase = (bias_g / kBiasStages) & 1;
+    CtaBarrier::wait(&bias_empty[stage], phase);
+    auto mBias = domain_offset(
+        make_coord(((long long)b * attn_bias_stride_b +
+                    (long long)h * attn_bias_stride_h) /
+                       (long long)Nkv,
+                   0LL),
+        tma_bias.get_tma_tensor(make_shape(attn_bias_plane_m_total,
+                                           (long long)Nkv * bias_cols / kBc)));
+    auto sB = make_tensor(
+        make_smem_ptr(bias_base + stage * bias_cols),
+        Layout<Shape<_1, Int<bias_cols>>, Stride<Int<bias_cols>, _1>>{});
+    auto gB =
+        local_tile(mBias, Shape<_1, Int<bias_cols>>{}, make_coord(_0{}, tile));
+    TmaBarrier::arrive_and_expect_tx(&bias_full[stage],
+                                     sizeof(uint16_t) * bias_cols);
+    copy(tma_bias.with(bias_full[stage]), b_slice.partition_S(gB),
+         b_slice.partition_D(sB));
+    ++bias_g;
+  };
+
   // Consumer-side setup (all threads).
   for (int s = 0; s < kStagesQK; ++s)
     CtaBarrier::arrive(&k_empty[s]);
   for (int s = 0; s < kStagesPV; ++s)
     CtaBarrier::arrive(&v_empty[s]);
+  if constexpr (kHasAttnBias) {
+    for (int s = 0; s < kBiasStages; ++s)
+      CtaBarrier::arrive(&bias_empty[s]);
+  }
 
   TiledMmaQK tiled_mma_qk;
   TiledMmaPV tiled_mma_pv;
@@ -464,6 +520,10 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
       CtaBarrier::wait(&v_empty[stage], phase);
       issue_v_chunk(first_kv_bh, i / kDChunksV, i % kDChunksV, stage);
     }
+    if constexpr (kHasAttnBias && kBiasMode == 2) {
+      if (first_Tc_eff > 0)
+        issue_bias_tma(first_b, first_Nh_id, 0);
+    }
   }
   TmaBarrier::wait(&q_full, 0);
   cutlass::arch::fence_view_async_shared();
@@ -471,6 +531,7 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
   int gK = 0;
   int gV = 0;
   int w = 0;
+  int bias_gc = 0;  // consumer-side mirror of bias_g (never re-init)
   for (int work_id = blockIdx.x; work_id < total_work;
        work_id += gridDim.x, ++w) {
     const int kv_offset = Nkv - Nq;
@@ -516,9 +577,33 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
           CtaBarrier::wait(&v_empty[stage], phase);
           issue_v_chunk(kv_bh, i / kDChunksV, i % kDChunksV, stage);
         }
+        if constexpr (kHasAttnBias && kBiasMode == 2) {
+          if (Tc_eff > 0)
+            issue_bias_tma(Nb_id, Nh_id, 0);
+        }
       }
       TmaBarrier::wait(&q_full, w & 1);
       cutlass::arch::fence_view_async_shared();
+    }
+
+    // Mode 3: load this work's (b,h) resident [1,Nkv] row-broadcast vector
+    // once per work (plain vector loads, host-guaranteed 16B alignment) --
+    // no bias TMA and no per-tile bias barrier in the kv loop. The bias
+    // area sits past kSmemBytes so the O epilogue's batched staging never
+    // aliases it; a plain CTA sync orders the loads against the injection.
+    if constexpr (kHasAttnBias && kBiasMode == 3) {
+      const uint16_t* src = reinterpret_cast<const uint16_t*>(attn_bias) +
+                            ((long long)Nb_id * attn_bias_stride_b +
+                             (long long)Nh_id * attn_bias_stride_h) *
+                                ((attn_bias_dtype == 3) ? 2 : 1);
+      const int n_u16 = (int)Nkv * ((attn_bias_dtype == 3) ? 2 : 1);
+      const int vec_end = n_u16 & ~7;
+      for (int i = tid * 8; i < vec_end; i += kNumThreads * 8)
+        *reinterpret_cast<uint4*>(bias_base + i) =
+            *reinterpret_cast<const uint4*>(src + i);
+      for (int i = vec_end + tid; i < n_u16; i += kNumThreads)
+        bias_base[i] = src[i];
+      __syncthreads();
     }
 
     // SFQ is a per-work register constant (tensor-extent-aware SFA
@@ -538,6 +623,15 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
 
 #pragma unroll 1
     for (int kv_tile = 0; kv_tile < Tc_eff; ++kv_tile) {
+      // 2-stage bias prefetch: issue (t+1) before this tile's QK/softmax so
+      // the TMA hides behind them; empty-wait(t+1) needs only the previous
+      // tile's injection arrive, which finished last iteration. Mode 3 has
+      // no per-tile bias traffic at all.
+      if constexpr (kHasAttnBias && kBiasMode == 2) {
+        if (kv_tile + 1 < Tc_eff && tid == 0)
+          issue_bias_tma(Nb_id, Nh_id, kv_tile + 1);
+      }
+
       // Phase 1: QK over D chunks, accumulating one [kBr, kBc] S tile.
       // Unrolled: kDChunksQK is compile-time and the register fragments
       // (tSrQ chunk slices) need static indexing to stay out of local.
@@ -590,8 +684,44 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
         // Additive attn bias in the dequantized score domain; the fused
         // softmax below applies softmax_scale_log2, so bias/scale_orig
         // lands as +bias in softmax-input units. The -INFINITY assignments
-        // in the masking below simply override it.
-        if constexpr (kHasAttnBias) {
+        // in the masking below simply override it. Tile path (PC-0-1): the
+        // smem tile holds ORIGINAL token order, the injection indexes it
+        // through kv_perm32 just like the gmem variant.
+        if constexpr (kHasAttnBias && kBiasMode != 0) {
+          const int b_stg = bias_gc % kBiasStages;
+          if constexpr (kBiasMode != 3) {
+            const int b_phase = (bias_gc / kBiasStages) & 1;
+            TmaBarrier::wait(&bias_full[b_stg], b_phase);
+            cutlass::arch::fence_view_async_shared();
+          }
+          const int b_slot_u16 = kBc * ((attn_bias_dtype == 3) ? 2 : 1);
+          // mode 3: the resident vector's tile-t segment sits at t*kBc.
+          const uint16_t* b_slot =
+              bias_base + (kBiasMode == 3 ? (long long)kv_tile * kBc *
+                                                ((attn_bias_dtype == 3) ? 2 : 1)
+                                          : (long long)b_stg * b_slot_u16);
+          if (attn_bias_dtype == 3)
+            ffpa_fp4::apply_attn_bias_fp4_rowcol_smem<
+                float, decltype(scores), decltype(tScS_rc), kSRows, kSCols>(
+                scores, tScS_rc, reinterpret_cast<const float*>(b_slot), 0, 1,
+                1.0f / scale_orig);
+          else if (attn_bias_dtype == 2)
+            ffpa_fp4::apply_attn_bias_fp4_rowcol_smem<
+                cutlass::bfloat16_t, decltype(scores), decltype(tScS_rc),
+                kSRows, kSCols>(
+                scores, tScS_rc,
+                reinterpret_cast<const cutlass::bfloat16_t*>(b_slot), 0, 1,
+                1.0f / scale_orig);
+          else
+            ffpa_fp4::apply_attn_bias_fp4_rowcol_smem<
+                cutlass::half_t, decltype(scores), decltype(tScS_rc), kSRows,
+                kSCols>(scores, tScS_rc,
+                        reinterpret_cast<const cutlass::half_t*>(b_slot), 0, 1,
+                        1.0f / scale_orig);
+          if constexpr (kBiasMode != 3)
+            CtaBarrier::arrive(&bias_empty[b_stg]);
+          ++bias_gc;
+        } else if constexpr (kHasAttnBias) {
           ffpa_fp4::apply_attn_bias_fp4_rowcol<
               decltype(scores), decltype(tScS_rc), kSRows, kSCols>(
               scores, tScS_rc, attn_bias, attn_bias_dtype, attn_bias_stride_b,
