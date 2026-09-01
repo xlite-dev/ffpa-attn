@@ -542,17 +542,6 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
       for (int i = vec_end + tid; i < n_u16; i += kNumThreads)
         bias_base[i] = src[i];
       __syncthreads();
-      // PC5-E1 (diagnostic): sentinel-fill the P staging each work. If the
-      // manual readback ever reads an unwritten slot the error explodes to
-      // ~1e37; if the error stays ~1e-2 the readback values are fine and
-      // the corruption sits further downstream (PV / quant / epilogue).
-      {
-        float* sP_raw = reinterpret_cast<float*>(shm + kOffP);
-        const int nP = (int)kBr * kBc;
-        for (int i = tid; i < nP; i += kNumThreads)
-          sP_raw[i] = __int_as_float(0x7e7e7e7e);
-        __syncthreads();
-      }
     }
 
     copy(smem_tiled_copy_SFQ, tSsSFQ, tSrSFQ_copy_view);
@@ -1012,8 +1001,11 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
       }
     }
 
-    if (Br_base + kBr <= Nq - q_start_row)
-      tma_store_wait<0>();
+    // PC-0-5: wait for the O TMA reads of the reused staging unconditionally
+    // (tail works used to skip this) so they retire before any later work
+    // (or the next kernel launch) rewrites the P staging region.
+    tma_store_wait<0>();
+    __threadfence();
 
     gK += work_chunks_qk;
     gV += work_chunks_v;

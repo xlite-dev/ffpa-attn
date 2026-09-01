@@ -62,7 +62,7 @@
 | PC-0-2 | ↳ native/native_tma 场景 | P | ⬜ 待开始 | — |
 | PC-0-3 | ↳ D=320 split_d 注入开销专项（PC-0-0 遗留） | P | ⬜ 待开始（杠杆①向量化已证伪 +2.7%，见完成清单） | PC-0-0 |
 | PC-0-4 | ↳ fp8 split_d D≥512 attn-mask tile 化专项（PC-0-1 B-3 遗留） | P3 | ⬜ 待开始（当前 D≥512 已 demote mode 0 保底，gap 停留 gmem 基线 1.48x，见完成清单） | PC-0-1 |
-| PC-0-5 | ↳ 量化家族先在时序竞争排查（PC-0-1 B-4/B-6 实证，bitwise 断言 flaky 根因） | P3 | ⬜ 待开始（fp4 persist_d FC-4 epilogue race + fp4 m4n2 interleaved race，复现条件与证据链见完成清单 PC-0-1 段） | PC-0-1 |
+| PC-0-5 | ↳ 量化家族先在时序竞争排查（PC-0-1 B-4/B-6 实证，bitwise 断言 flaky 根因） | P3 | 🚧 深度排查完成、根因定性（fp4 m4n2：**双必要条件实锤** = 同进程 no-bias 模板（Li0E，56576B）前置 + kernel 内 mode-3 装载段 fill 写（4096B STS）；纯 bias 序列稳定（C9a）；racecheck 0 hazard 且 race 在 hook 下复现；staging/TMA（C1 强制 R2G）排除；bias 数据无关（C2a 常数填充仍触发）；barrier 语义修复无效（A2/A3/B）→ 定性为**跨模板时序敏感竞争**，疑似 sm_120 TMA/L2 与调度交互的硬件/driver 层问题。无条件 barrier（A）可修但致 ptxas spill 翻倍、mode 3 慢 57%（SASS 实证）→ 不可用。**已落地**：tail work 的 `tma_store_wait` 协议补全（B，无条件 wait + `__threadfence`，性能无回退）+ E1 诊断代码误入 HEAD 清理 + race 用例沉淀 tests（xfail）。现实风险受控：触发需同进程 no-bias→bias m4n2 fp4 背靠背。后续：NVIDIA 上报（最小复现器 `.tmp/pc5-race/m4n2_e5d.py`）或新思路；fp4 persist_d 3/30 触发待排查；fp8 六族实证干净） | PC-0-1；PC-11 解耦可独立推进 |
 | PC-1 | Mega Quantize Kernel（aux 链大融合） | P | ⬜ 待开始 | — |
 | PC-2 | 增量融合（Mega Kernel 步进） | P | ⬜ 待开始 | 被 PC-1 收编 |
 | PC-3 | N-crossover 量化配置自适应 | P | ⬜ 待开始 | — |
@@ -73,6 +73,7 @@
 | PC-8 | fp8 split-D M4N2 量化大 D kernel 性能优化 | P | ⬜ 待开始 | PC-7（顺序） |
 | PC-9 | fp4 split-D (M8N1) 量化大 D kernel 性能优化 | P | ⬜ 待开始 | PC-8（顺序） |
 | PC-10 | fp4 split-D M4N2 量化大 D kernel 性能优化 | P | ⬜ 待开始 | PC-9（顺序） |
+| PC-11 | warp 级 `__any_sync` lazy-rescale 统一治理（精度治理专项） | P | ⬜ 待开始 | PC-0-5（fp4 m4n2 已实证 vote 交互 race；根因修复落地时启动） |
 
 > 未收录项：分卡基准标注（文档规范，随下次 bench 执行）。（原列于此的 cache-dit `_keep_or_pack` 物化兜底移除已于 2026-08-28 完成，cache-dit@4b5c977：三 tensor 直传零拷贝，契约外布局由 C++ layout gate 显式报错。）
 
@@ -105,6 +106,12 @@
     - 关键设计：fp4 注入 `apply_attn_bias_fp4_rowcol_smem`（original-token-ordered tile，kv_perm32 索引，标量读——PC-0-3 向量化证伪结论复用）；persist_d 的 bias barrier 跨 grid-strided work 全局计数（bias_g/bias_gc 分离 producer/consumer）；m4n2 issue_bias_tma rowvec 双缓冲 + kv loop 顶 t+1 预取；fp8 split_d 与 fp16 族 barrier 协议同构。
     - C 阶段修复（7d5ca4c）：bench non-aligned task（Nkv=16383）在 make_tma_bias **dummy** descriptor 构建期 SIGABRT——dummy 行 stride 误用运行时 plane_cols（Nkv%8≠0 违 16B 断言），修为编译期 bias_cols（bias_desc_live ? plane_cols : bias_cols，4 launcher 统一）；parity 扩至 6 broadcast kinds × fp8/fp4 + fp4 D=768 + fp4 tile-vs-gmem 严格对照（storage-offset mode 0），159 用例全绿。
     - 遗留：量化家族两处**先在时序竞争**（fp4 persist_d FC-4 epilogue race + fp4 m4n2 interleaved race，均先于 PC-0-1 存在、stash 复现实证；fp8 六族实证干净）→ **PC-0-5** 专项；验证策略避开 interleaved bitwise 断言。复验脚本 `.tmp/pc1-bias-tile/`。
+  - [ ] PC-0-5：量化家族先在时序竞争排查（2026-09-01 深度排查完成，根因定性、无零成本修复、风险受控）
+    - 复现与判定（fp4 m4n2 D=768 bias mode 3，e5d p0 判定器 `.tmp/pc5-race/m4n2_e5d.py`）：同进程 no-bias 模板（Li0E，smem 56576B）前置 ×9 → bias 模板（Li3E，60416B）连续调用 **6/6 bitwise 非确定**（O body 真实错误，64 行对齐条纹，幅度 ~5e-3..3e-2，lse 稳定）；纯 bias 序列无 prelude **稳定**（C9a）。
+    - **双必要条件（消元链 C1-C9 实锤）**：①同进程 no-bias 模板前置（毒源遗留：L2/时序状态）②kernel 内 mode-3 装载段 fill 写（4096B STS；只留 barrier=稳 C6，单写 2B=稳 C7，全量 fill=触发 C4/C2a）——bias 数值本身无关（常数填充仍触发 C2a），staging/TMA 复用无关（强制 R2G 仍触发 C1），注入调用非必要（禁用后 3/6 C4）。
+    - 排除项（全部实证）：smem barrier 语义缺失（racecheck 0 hazard 且 race 在 hook 下复现；tile-0 barrier 语义等价注入 A2/A3 均无效）、插桩伪影链（checksum 槽三重污染塌方后止损）、共享量化链（E5c split_d 同进程稳定）、越界写（launcher printf 实证分配全对：56320+4096=60416B 合法）、未初始化读（initcheck 0）。
+    - 修复探索：**候选 A（kv loop 顶无条件 barrier）修复 race 但 mode 3 慢 57%**（SASS diff 实证：无条件 barrier 增大 live-range 约束 → ptxas 热循环 spill 822 vs 440 次/tile）；且其"修复"是 spill 时序副产物（A3 语义等价却不修）→ 拒绝。**已落地 B**：tail work 的 `tma_store_wait` 无条件化 + `__threadfence`（协议补全，性能无回退 414.8 vs 398.9ms 噪声带内）+ E1 诊断代码清理（6155cd9 误入 HEAD）+ race 用例沉淀 `tests/test_ffpa_fp4_m4n2_bias_race.py`（xfail）。
+    - 定性与后续：**跨模板时序敏感竞争**（语言级协议完备、sanitizer 不可见、kernel 内时序扰动可调制触发率）——疑似 sm_120 TMA×调度×L2 交互的硬件/driver 层问题。现实风险受控（需同进程 no-bias→bias m4n2 fp4 背靠背，推理场景罕见）；最小复现器可上报 NVIDIA；fp4 persist_d 3/30 低概率触发待排查（可能同族）。
   - [ ] PC-0-2：native/native_tma 场景（标量 loader 路径，设计稿待补）
   - [ ] PC-0-3：D=320 split_d attn-mask 注入开销专项（PC-0-0 遗留，目标 gap 1.44→≤1.2x）
     - 现状（2026-08-31，N=16384 B1 H32，self 57.4ms/191T）：attn-mask 83.5ms/132T，gap 1.44、TFLOPS 70%；迭代路径 mode0 gmem 2.21 → 单缓冲 tile 1.51 → rowvec 双缓冲 1.48 → mode 3 全驻留 1.44；dense 全量 1.59
@@ -125,6 +132,15 @@
 - [ ] PC-4：fp4 persist-D attn kernel 内部优化
 - [ ] PC-5：CUDA graph 友好化
 - [ ] PC-6：sm_89 fp8 int4 QK（低优搁置：sm_120 无原生 int4 MMA，SA2 int4 kernel 未开源）
+- [ ] PC-11：warp 级 `__any_sync` lazy-rescale 统一治理（精度治理专项，2026-09-01 立项）
+  - 背景：PC-0-5 实证 fp4 split_d_m4n2 的 warp-uniform lazy-rescale（`__any_sync(0xffffffff, row_scale != 1.0f ...)`）与 attn_bias smem 注入路径交互产生**同输入 bitwise 非确定**（触发：同进程 no-bias 模板前置 ×N 后 bias 模板 8/8 必现；lse 全程稳定 + o_acc checksum 不稳 → 竞争在 kv loop PV 段；E5 消元排除共享量化链）。`__any_sync` 投票模式源自 CUTLASS 77_blackwell_fmha 的 **shared-TMEM collective rescale** 场景——那里 warp-uniform 是必须的；本仓库所有 kernel 的 rescale 目标均为 **thread-private 寄存器**，投票既非必需，又把 per-row 决策强行提升为 warp-uniform 分支，与 bias 注入的调度交互埋下时序竞争。
+  - 参考实现（治理目标形态）：`csrc/cuffpa/cute/fp8/sm_120/persist_d.cuh` 已改为 thread-level per-row——`const float rs = (kv_tile > 0 && row_scale[row] < 1.0f) ? row_scale[row] : 1.0f;` 逐行独立判断（`< 1.0f` 顺带拒绝全 masked 行的 NaN scale），无跨 lane 通信；其注释含完整论证。
+  - 治理清单（`grep -r "__any_sync" csrc/cuffpa/cute/` 全量 9 处实际使用 + 1 处已治理注释）：
+    - `sm_120/split_d_m4n2.cuh`、`sm_120/split_d.cuh`、`sm_120/persist_d.cuh`（fp16 cute 三族）
+    - `fp8/sm_120/split_d_m4n2.cuh`、`fp8/sm_120/split_d.cuh`（fp8 persist_d 已治理）
+    - `fp4/sm_120/split_d_m4n2.cuh`（PC-0-5 实证 race，随 PC-0-5 修复先行落地）、`fp4/sm_120/split_d.cuh`、`fp4/sm_120/persist_d.cuh`（fp4 persist_d 3/30 低概率触发待排查）
+    - `sm_80/split_d.cuh`
+  - 动作与验收：①逐 kernel 转 per-row lazy-rescale（语义等价，多数 tile 无 max 增长时按行跳过乘法，性能预期持平或略优）；②每处 `ffpa_attn.bench` A/B 无回归；③每家族补"no-bias 前置 ×N → bias self-loop bitwise 断言"用例（PC-0-5 复现脚本 `.tmp/pc5-race/` 沉淀为 tests 后纳入）；④PC-0-5 的 fp4 m4n2 修复是本专项第一块拼图，其余 8 处排期跟进。
 - [ ] PC-7：fp8 split-D (M8N1) 量化大 D kernel 性能优化
 - [ ] PC-8：fp8 split-D M4N2 量化大 D kernel 性能优化
 - [ ] PC-9：fp4 split-D (M8N1) 量化大 D kernel 性能优化
