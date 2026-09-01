@@ -78,7 +78,8 @@ BACKEND_COLORS = {
 def fp8_backend(
   preset: str = "default",
   hybrid: bool = False,
-  nhd: bool = False
+  nhd: bool = False,
+  stages: int = None,
 ) -> CUDABackend:
   layout = "NHD" if nhd else "HND"
   return CUDABackend(
@@ -96,6 +97,7 @@ def fp8_backend(
     fp8_hybrid=hybrid,
     fp8_hybrid_n_early=256 if preset == "cache-dit" else 128,
     tensor_layout=layout,
+    stages=stages,
   )
 
 
@@ -175,7 +177,15 @@ def _mk(B, Hq, Hkv, Nq, Nkv, D, dtype, scale):
 
 
 def run_ffpa(
-  q, k, v, causal, gqa, preset="default", hybrid=False, with_permute=False
+  q,
+  k,
+  v,
+  causal,
+  gqa,
+  preset="default",
+  hybrid=False,
+  with_permute=False,
+  stages=None
 ):
   if with_permute:
     # cache-dit E2E path: inputs are diffusers NHD [B,N,H,D] storage; the
@@ -191,7 +201,7 @@ def run_ffpa(
         v,
         is_causal=causal,
         enable_gqa=gqa,
-        forward_backend=fp8_backend(preset, hybrid, nhd=True),
+        forward_backend=fp8_backend(preset, hybrid, nhd=True, stages=stages),
       ).permute(0, 2, 1, 3)
   return ffpa_attn_func(
     q,
@@ -199,7 +209,7 @@ def run_ffpa(
     v,
     is_causal=causal,
     enable_gqa=gqa,
-    forward_backend=fp8_backend(preset, hybrid)
+    forward_backend=fp8_backend(preset, hybrid, stages=stages)
   )
 
 
@@ -282,7 +292,8 @@ def run_scenario(
   base_n,
   preset="default",
   hybrid=False,
-  with_permute=False
+  with_permute=False,
+  stages=None
 ):
   q, k, v = _mk(sc.B, sc.Hq, sc.Hkv, sc.Nq, sc.Nkv, sc.D, dtype, scale)
   ref = ref_bf16(q, k, v, sc.causal, sc.gqa, sdpa_name).to(dtype)
@@ -316,7 +327,9 @@ def run_scenario(
   torch.cuda.synchronize()
   fns = {
     "FFPA-FP8":
-    lambda: run_ffpa(q, k, v, sc.causal, sc.gqa, preset, hybrid, with_permute),
+    lambda: run_ffpa(
+      q, k, v, sc.causal, sc.gqa, preset, hybrid, with_permute, stages=stages
+    ),
   }
   if use_sage and SAGE_INSTALLED:
     fns["Sage"] = lambda: run_sage(q, k, v, sc.causal, sc.gqa, with_permute)
@@ -599,11 +612,18 @@ def parse_args():
     default=15,
     help="Non-aligned scenario uses N-pad (0 disables)",
   )
+  p.add_argument(
+    "--stages",
+    type=int,
+    default=None,
+    help="Number of stages for FFPA pipeline",
+  )
   return p.parse_args()
 
 
 def main():
   args = parse_args()
+  print(f"Running {Path(__file__).name} with args: {args}\n")
   torch.manual_seed(0)
   dtype = torch.float16 if args.dtype == "fp16" else torch.bfloat16
   use_sage = (not args.no_sage) and SAGE_INSTALLED

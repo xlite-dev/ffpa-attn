@@ -542,6 +542,17 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
       for (int i = vec_end + tid; i < n_u16; i += kNumThreads)
         bias_base[i] = src[i];
       __syncthreads();
+      // PC5-E1 (diagnostic): sentinel-fill the P staging each work. If the
+      // manual readback ever reads an unwritten slot the error explodes to
+      // ~1e37; if the error stays ~1e-2 the readback values are fine and
+      // the corruption sits further downstream (PV / quant / epilogue).
+      {
+        float* sP_raw = reinterpret_cast<float*>(shm + kOffP);
+        const int nP = (int)kBr * kBc;
+        for (int i = tid; i < nP; i += kNumThreads)
+          sP_raw[i] = __int_as_float(0x7e7e7e7e);
+        __syncthreads();
+      }
     }
 
     copy(smem_tiled_copy_SFQ, tSsSFQ, tSrSFQ_copy_view);
