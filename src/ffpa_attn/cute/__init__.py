@@ -47,7 +47,6 @@ from ._utils import (
   _validate_training_dtype,
   _validate_varlen_custom_bwd_features,
   _validate_varlen_custom_fwd_features,
-  is_fake_mode,
 )
 from ._ffpa_fwd_sm80 import _ffpa_attn_forward_sm80
 from ._ffpa_fwd_sm90 import _ffpa_attn_forward_sm90
@@ -761,32 +760,11 @@ def _bwd_cute_fake(
 # Varlen torch custom ops — ``@custom_op`` + ``@register_fake`` +
 # ``register_autograd`` pattern.  The varlen path owns its own autograd
 # boundary (unlike dense, which delegates to ``_FFPAAttnFunc``).
+#
+# Zero-length ``cu_seqlens`` segments (leading/interior/trailing) are part
+# of the op contract and run as zero-work tiles in the kernels; the host
+# never inspects prefix values, so no per-call device→host sync.
 # ---------------------------------------------------------------------------
-
-
-def _trim_trailing_empty_varlen_segments(
-  cu_seqlens_q: torch.Tensor,
-  cu_seqlens_k: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-  """Drop trailing segments where both q and k have zero length."""
-  if cu_seqlens_q.numel() != cu_seqlens_k.numel():
-    return cu_seqlens_q, cu_seqlens_k
-  if cu_seqlens_q.numel() <= 1 or is_fake_mode():
-    return cu_seqlens_q, cu_seqlens_k
-
-  q_lengths = cu_seqlens_q[1:] - cu_seqlens_q[:-1]
-  k_lengths = cu_seqlens_k[1:] - cu_seqlens_k[:-1]
-  active = (q_lengths != 0) | (k_lengths != 0)
-  if bool(active.all().item()):
-    return cu_seqlens_q, cu_seqlens_k
-  if not bool(active.any().item()):
-    return cu_seqlens_q[:1], cu_seqlens_k[:1]
-
-  last_active_segment = int(active.nonzero()[-1].item())
-  keep_numel = last_active_segment + 2
-  if keep_numel == cu_seqlens_q.numel():
-    return cu_seqlens_q, cu_seqlens_k
-  return cu_seqlens_q[:keep_numel], cu_seqlens_k[:keep_numel]
 
 
 @torch.library.custom_op("ffpa_attn::_varlen_fwd_cute", mutates_args=())
@@ -805,9 +783,6 @@ def _varlen_fwd_custom(
   softcap: float,
   pack_gqa: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-  cu_seqlens_q, cu_seqlens_k = _trim_trailing_empty_varlen_segments(
-    cu_seqlens_q, cu_seqlens_k
-  )
   window_size_left_opt, window_size_right_opt = _decode_custom_op_window(
     window_size_left, window_size_right
   )
@@ -903,9 +878,6 @@ def _varlen_bwd_custom(
   softcap: float,
   dlse: Optional[torch.Tensor],
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-  cu_seqlens_q, cu_seqlens_k = _trim_trailing_empty_varlen_segments(
-    cu_seqlens_q, cu_seqlens_k
-  )
   window_size_left_opt, window_size_right_opt = _decode_custom_op_window(
     window_size_left, window_size_right
   )
