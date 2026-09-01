@@ -372,7 +372,7 @@ class FFPAAttnFwdSm100D512(IketTraceChannel):
     learnable_sink: Optional[cute.Tensor] = None,
     descale_tensors: Optional[DescaleTensors] = None,
     blocksparse_tensors: Optional[cute.Tensor] = None,
-    aux_data: AuxData = AuxData(),
+    aux_data: Optional[AuxData] = None,
     stream: cuda.CUstream = None,
   ):
     """Trace entry; mirrors FlashAttentionForwardSm100.__call__'s interface."""
@@ -385,10 +385,10 @@ class FFPAAttnFwdSm100D512(IketTraceChannel):
     assert blocksparse_tensors is None, (
       "SM100 forward with head_dim=512 does not support block sparse tensors"
     )
-    assert aux_data.tensors is None, (
+    assert aux_data is None or aux_data.tensors is None, (
       "SM100 forward with head_dim=512 does not support aux_tensors"
     )
-    assert aux_data.scalars is None, (
+    assert aux_data is None or aux_data.scalars is None, (
       "SM100 forward with head_dim=512 does not support aux_scalars"
     )
     assert not self.is_local, (

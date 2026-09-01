@@ -20,7 +20,7 @@ from ._utils import (
   _validate_training_dtype,
 )
 from ._fwd_d512_sm100 import FFPAAttnFwdSm100D512, compile_key_fields
-from .utils import AuxData, fa_logging
+from .utils import fa_logging
 from .utils.cache_utils import get_jit_cache
 from .utils.cute_dsl_utils import to_cute_tensor
 from .utils.fa_logging import fa_log
@@ -247,7 +247,7 @@ def _ffpa_attn_forward_sm100(
       None,  # learnable_sink
       None,  # descale_tensors
       None,  # blocksparse_tensors
-      AuxData(),
+      None,  # aux_data
       current_stream,
       options=_PTXAS,
     )

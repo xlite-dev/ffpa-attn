@@ -55,7 +55,6 @@ from ffpa_attn.cute._fwd_d512_sm100 import (
   FFPAAttnFwdSm100D512,
   compile_key_fields,
 )
-from ffpa_attn.cute.utils import AuxData
 from ffpa_attn.cute.utils.cute_dsl_utils import to_cute_tensor
 from ffpa_attn.cute.utils.hd512_helpers import check_tmem_intervals
 from ffpa_attn.cute.utils.named_barrier import NamedBarrierFwdSm100Hd512
@@ -654,7 +653,7 @@ _FORWARD_UNSUPPORTED_ARGS = (
   None,  # learnable_sink
   None,  # descale_tensors
   None,  # blocksparse_tensors
-  AuxData(),
+  None,  # aux_data
 )
 
 
