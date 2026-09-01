@@ -44,15 +44,17 @@ using CtaBarrier = cutlass::arch::ClusterBarrier;
 // kQKPerThread: per-block (false, 1 scale/block) vs per-thread (true,
 //   Q=64/block, K=4/block, fragment-aligned). See persist_d.cuh for details.
 template <typename Traits, typename ElementO, typename TmaQ, typename TmaK,
-          typename TmaV, typename TmaO, bool kPVAccF16 = false,
-          bool kVPerChannel = false, bool kQKPerThread = false,
-          bool kReorgFree = false, int kHasAttnBias = 0>
+          typename TmaV, typename TmaO, typename TmaBias,
+          bool kPVAccF16 = false, bool kVPerChannel = false,
+          bool kQKPerThread = false, bool kReorgFree = false, int kBiasMode = 0,
+          int kBias4B = 0, int kHasAttnBias = 0>
 __global__ void __launch_bounds__(Traits::kNumThreads, 1)
     split_d_fwd_cute_fp8_sm120(
         CUTLASS_GRID_CONSTANT TmaQ const tma_q,
         CUTLASS_GRID_CONSTANT TmaK const tma_k,
         CUTLASS_GRID_CONSTANT TmaV const tma_v,
-        CUTLASS_GRID_CONSTANT TmaO const tma_o, ElementO* __restrict__ O,
+        CUTLASS_GRID_CONSTANT TmaO const tma_o,
+        CUTLASS_GRID_CONSTANT TmaBias const tma_bias, ElementO* __restrict__ O,
         float* __restrict__ softmax_lse, const float* __restrict__ q_scale,
         const float* __restrict__ k_scale, const float* __restrict__ v_scale,
         int Nq, int Nkv, int Nh, int Nh_kv, float scale, int Tc, int causal,
@@ -61,7 +63,8 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
         const float* __restrict__ vm = nullptr, bool nhd_out = false,
         const void* __restrict__ attn_bias = nullptr, int attn_bias_dtype = 0,
         long long attn_bias_stride_b = 0, long long attn_bias_stride_h = 0,
-        long long attn_bias_stride_m = 0, long long attn_bias_stride_n = 0) {
+        long long attn_bias_stride_m = 0, long long attn_bias_stride_n = 0,
+        long long attn_bias_plane_m_total = 0) {
   // Body-level arch guard (see sm_120/split_d.cuh): mixed -gencode builds
   // compile the sm_89 device pass into a stub; launch.cuh only dispatches
   // this kernel on sm>=90 devices.
@@ -141,6 +144,15 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
   __shared__ uint64_t qk_empty[kStagesQK];
   __shared__ uint64_t v_full[kStagesPV];
   __shared__ uint64_t v_empty[kStagesPV];
+  // PC-0-1 bias tile: row-broadcast [1,kBc] double buffered (mode 2) or the
+  // resident [1,Nkv] vector (mode 3), 16B-aligned past the QK/V stages --
+  // the tail slack (dense mode 1 is m4n2-only per the PC-0-1 plan). The
+  // kernel's kSmemElems counts 1B elements so it IS the byte size here.
+  constexpr int kBiasStages = (kBiasMode == 2) ? 2 : 1;
+  __shared__ uint64_t bias_full[kBiasStages];
+  __shared__ uint64_t bias_empty[kBiasStages];
+  uint16_t* bias_base =
+      reinterpret_cast<uint16_t*>(shm + ((Traits::kSmemElems + 15) & ~15));
 
   if (tid == 0) {
     for (int s = 0; s < kStagesQK; ++s) {
@@ -150,6 +162,12 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
     for (int s = 0; s < kStagesPV; ++s) {
       TmaBarrier::init(&v_full[s], 1);
       CtaBarrier::init(&v_empty[s], kNumThreads);
+    }
+    if constexpr (kHasAttnBias) {
+      for (int s = 0; s < kBiasStages; ++s) {
+        TmaBarrier::init(&bias_full[s], 1);
+        CtaBarrier::init(&bias_empty[s], kNumThreads);
+      }
     }
   }
   __syncthreads();
@@ -261,6 +279,10 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
     CtaBarrier::arrive(&qk_empty[s]);
   for (int s = 0; s < kStagesPV; ++s)
     CtaBarrier::arrive(&v_empty[s]);
+  if constexpr (kHasAttnBias) {
+    for (int s = 0; s < kBiasStages; ++s)
+      CtaBarrier::arrive(&bias_empty[s]);
+  }
 
   auto issue_qk_tma = [&](int d_chunk, int stage, int kv_tile_idx) {
     cutlass::arch::fence_view_async_shared();
@@ -295,6 +317,36 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
     copy(tma_v.with(v_full[stage]), tVgV, tVsV);
   };
 
+  // PC-0-1 bias tile (fp16 split_d pattern): this CTA owns one (b,h,q-tile)
+  // work, so mBias folds the (b,h) row once -- row-broadcast rows are Nkv
+  // elements wide (stride_h==Nkv, stride_b==h_eff*Nkv, host-validated).
+  auto b_slice = tma_bias.get_slice(_0{});
+  constexpr int bias_cols = kBc * (kBias4B ? 2 : 1);
+  auto mBias = [&] {
+    return domain_offset(
+        make_coord(((long long)Nb_id * attn_bias_stride_b +
+                    (long long)Nh_id * attn_bias_stride_h) /
+                       (long long)Nkv,
+                   0LL),
+        tma_bias.get_tma_tensor(make_shape(attn_bias_plane_m_total,
+                                           (long long)Nkv * bias_cols / kBc)));
+  }();
+  auto issue_bias_tma = [&](int tile) {
+    cutlass::arch::fence_view_async_shared();
+    const int stage = tile % kBiasStages;
+    const int phase = (tile / kBiasStages) & 1;
+    CtaBarrier::wait(&bias_empty[stage], phase);
+    auto sB = make_tensor(
+        make_smem_ptr(bias_base + stage * bias_cols),
+        Layout<Shape<_1, Int<bias_cols>>, Stride<Int<bias_cols>, _1>>{});
+    auto gB =
+        local_tile(mBias, Shape<_1, Int<bias_cols>>{}, make_coord(_0{}, tile));
+    TmaBarrier::arrive_and_expect_tx(&bias_full[stage],
+                                     sizeof(uint16_t) * bias_cols);
+    copy(tma_bias.with(bias_full[stage]), b_slice.partition_S(gB),
+         b_slice.partition_D(sB));
+  };
+
   if (tid == 0) {
     for (int d = 0; d < kStagesQK && d < kDChunksQK; ++d) {
       CtaBarrier::wait(&qk_empty[d], 0);
@@ -311,6 +363,28 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
     }
   }
 
+  // Bias tile(0) prefetch (depth-1 ahead, like the QK pipeline). Mode 3
+  // instead loads the resident [1,Nkv] row-broadcast vector once (plain
+  // vector loads, host-guaranteed 16B alignment): no TMA and no per-tile
+  // bias barrier anywhere in the kv loop. The resident row is this (b,h)'s.
+  if constexpr (kHasAttnBias && kBiasMode == 3) {
+    const uint16_t* src = reinterpret_cast<const uint16_t*>(attn_bias) +
+                          ((long long)Nb_id * attn_bias_stride_b +
+                           (long long)Nh_id * attn_bias_stride_h) *
+                              ((attn_bias_dtype == 3) ? 2 : 1);
+    const int n_u16 = (int)Nkv * ((attn_bias_dtype == 3) ? 2 : 1);
+    const int vec_end = n_u16 & ~7;
+    for (int i = tid * 8; i < vec_end; i += kNumThreads * 8)
+      *reinterpret_cast<uint4*>(bias_base + i) =
+          *reinterpret_cast<const uint4*>(src + i);
+    for (int i = vec_end + tid; i < n_u16; i += kNumThreads)
+      bias_base[i] = src[i];
+    __syncthreads();
+  } else if constexpr (kHasAttnBias && kBiasMode != 0) {
+    if (tid == 0 && Tc_eff > 0)
+      issue_bias_tma(0);
+  }
+
 #pragma unroll 1
   for (int kv_tile = 0; kv_tile < Tc_eff; ++kv_tile) {
     if (kv_tile > 0 && tid == 0) {
@@ -321,6 +395,15 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
         CtaBarrier::wait(&v_empty[v_stage], v_phase);
         issue_v_tma(v, v_stage, kv_tile);
       }
+    }
+
+    // 2-stage bias prefetch: issue (t+1) before this tile's QK/softmax so
+    // the TMA hides behind them; empty-wait(t+1) needs only the previous
+    // tile's injection arrive, which finished last iteration (no
+    // self-deadlock). Mode 3 has no per-tile bias traffic at all.
+    if constexpr (kHasAttnBias && kBiasMode != 0) {
+      if (kBiasStages == 2 && kv_tile + 1 < Tc_eff && tid == 0)
+        issue_bias_tma(kv_tile + 1);
     }
 
     // K scale: per-block (1 per kBc-col block) or per-thread (4 per block,
@@ -422,7 +505,50 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
     // bias/(qs_arr[row]*ks*scale_orig) lands as +bias in softmax-input
     // units on masked and unmasked tiles alike; the -INFINITY assignments
     // in the masking block below simply override it.
-    if constexpr (kHasAttnBias) {
+    if constexpr (kHasAttnBias && kBiasMode != 0) {
+      float bias_inv[kSRows];
+#pragma unroll
+      for (int row = 0; row < kSRows; ++row)
+        bias_inv[row] = 1.0f / (qs_arr[row] * ks * scale_orig);
+      const int b_stg = kv_tile % kBiasStages;
+      const int b_phase = (kv_tile / kBiasStages) & 1;
+      if constexpr (kBiasMode != 3) {
+        TmaBarrier::wait(&bias_full[b_stg], b_phase);
+        cutlass::arch::fence_view_async_shared();
+      }
+      const int b_slot_u16 = kBc * ((attn_bias_dtype == 3) ? 2 : 1);
+      // mode 3: the resident vector's tile-t segment sits at t*kBc.
+      const uint16_t* b_slot =
+          bias_base + (kBiasMode == 3 ? (long long)kv_tile * kBc *
+                                            ((attn_bias_dtype == 3) ? 2 : 1)
+                                      : (long long)b_stg * b_slot_u16);
+      if (attn_bias_dtype == 3)
+        ffpa_cute::apply_attn_bias_quant_rowcol_smem<
+            float, decltype(scores), decltype(tScS_rc), kSRows, kSCols>(
+            scores, tScS_rc, reinterpret_cast<const float*>(b_slot), 0, 1,
+            bias_inv);
+      else if (attn_bias_dtype == 2)
+        ffpa_cute::apply_attn_bias_quant_rowcol_smem<
+            cutlass::bfloat16_t, decltype(scores), decltype(tScS_rc), kSRows,
+            kSCols>(scores, tScS_rc,
+                    reinterpret_cast<const cutlass::bfloat16_t*>(b_slot), 0, 1,
+                    bias_inv);
+      else
+        ffpa_cute::apply_attn_bias_quant_rowcol_smem<
+            cutlass::half_t, decltype(scores), decltype(tScS_rc), kSRows,
+            kSCols>(scores, tScS_rc,
+                    reinterpret_cast<const cutlass::half_t*>(b_slot), 0, 1,
+                    bias_inv);
+      if constexpr (kBiasMode != 3) {
+        CtaBarrier::arrive(&bias_empty[b_stg]);
+        // 1-stage slot: reissue (t+1) only after the injection of t has
+        // released the buffer. tid 0 joins the injection, so waiting here
+        // (instead of in the prefetch block) is required to avoid a
+        // self-deadlock; the TMA then overlaps this tile's softmax + PV.
+        if (kBiasStages == 1 && kv_tile + 1 < Tc_eff && tid == 0)
+          issue_bias_tma(kv_tile + 1);
+      }
+    } else if constexpr (kHasAttnBias) {
       float bias_inv[kSRows];
 #pragma unroll
       for (int row = 0; row < kSRows; ++row)
