@@ -412,17 +412,17 @@ def _validate_cu_seqlens(
   if not tensor.is_cuda:
     raise RuntimeError(f"{name} must be on a CUDA device, got {tensor.device}")
 
-  first = int(tensor[0].item())
-  if first != 0:
-    raise ValueError(f"{name}[0] must be 0, got {first}")
+  # Exact device-value guards, asynchronous (``.item()`` would sync per
+  # call); violations trap as a device-side assert, not a ValueError.
+  ok = tensor[0] == 0
+  message = f"{name} must satisfy: [0] == 0"
   if total_tokens is not None:
-    last = int(tensor[-1].item())
-    if last != total_tokens:
-      raise ValueError(
-        f"{name}[-1] must equal total tokens ({total_tokens}), got {last}"
-      )
-  if tensor.numel() > 1 and bool(torch.any(tensor[1:] < tensor[:-1]).item()):
-    raise ValueError(f"{name} must be monotonically non-decreasing")
+    ok = ok & (tensor[-1] == total_tokens)
+    message += f", [-1] == total tokens ({total_tokens})"
+  if tensor.numel() > 1:
+    ok = ok & torch.all(tensor[1:] >= tensor[:-1])
+    message += ", monotonically non-decreasing"
+  torch._assert_async(ok, message)
 
 
 def _validate_max_seqlen_for_cu_seqlens(
@@ -442,11 +442,14 @@ def _validate_max_seqlen_for_cu_seqlens(
     return
 
   lengths = tensor[1:] - tensor[:-1]
-  actual_max = int(lengths.max().item()) if lengths.numel() > 0 else 0
-  if max_seqlen < actual_max:
-    raise ValueError(
-      f"{max_name} ({max_seqlen}) must be >= max sequence length from {name} ({actual_max})"
-    )
+  if lengths.numel() == 0:
+    return
+  # Async device-side guard (``.item()`` would sync per call): an undersized
+  # max_seqlen would shrink the launch grid and silently yield garbage rows.
+  torch._assert_async(
+    (lengths.max() <= max_seqlen),
+    f"{max_name} ({max_seqlen}) must be >= the max sequence length in {name}",
+  )
 
 
 def _ensure_cuda_tensors(*named_tensors) -> None:

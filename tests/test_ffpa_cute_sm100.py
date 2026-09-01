@@ -1112,6 +1112,15 @@ def _varlen_oracle(q, k, v, cu_q, cu_k, causal, num_head):
                  2,
                  2,
                  id="batch70_with_zeros"),
+    # Trailing zero-length segments must reach the kernel unchanged as
+    # zero-work tiles (no host trim; a trim would cost a device→host sync).
+    pytest.param([129, 0], None, 2, 2, id="trailing_zero"),
+    pytest.param([40, 0, 0], [64, 0, 0], 2, 2, id="trailing_zeros_cross"),
+    pytest.param([512, 512, 512, 0, 0, 0, 0, 0],
+                 None,
+                 4,
+                 2,
+                 id="ring_cp_zero_tail"),
   ],
 )
 def test_varlen_matches_per_sequence_oracle(
@@ -1190,8 +1199,10 @@ def test_varlen_zero_legal_key_reads_no_kv(dtype):
   [
     [1024, 320, 2048],  # one long, one non-tile-multiple, one long
     [512, 64, 1536, 200, 1024],  # five sequences, two of them short
+    [1024, 320, 0],  # trailing zero-length sequence reaches the kernel as-is
+    [512, 0, 0, 200, 0, 0],  # zero-work tiles interior and trailing
   ],
-  ids=["v3", "v5"],
+  ids=["v3", "v5", "tail_zero", "zeros_mixed"],
 )
 def test_bwd_varlen_matches_per_sequence_oracle(lens, causal):
   """Packed varlen gradients, per sequence, against an fp32 oracle.
@@ -1208,6 +1219,8 @@ def test_bwd_varlen_matches_per_sequence_oracle(lens, causal):
   scale = 1.0 / math.sqrt(SM100_D512)
 
   for i, ln in enumerate(lens):
+    if ln == 0:
+      continue  # a zero-length sequence owns no rows; nothing to compare
     lo, hi = int(cu[i]), int(cu[i + 1])
     refs = _ref_bwd(
       q[lo:hi].detach().unsqueeze(0),
