@@ -827,6 +827,10 @@ class ENV(object):
     # CUTLASS headers; upstream code, not ours to patch.
     extra_cuda_cflags.append("-diag-suppress")
     extra_cuda_cflags.append("2908")
+    # 3189-D: torch/python.h names a lambda parameter "module"; cudafe
+    # parses it as an identifier under C++20 (harmless, upstream torch).
+    extra_cuda_cflags.append("-Xcudafe")
+    extra_cuda_cflags.append("--diag_suppress=3189")
     if ENV.FFPA_PTXAS_VERBOSE:
       extra_cuda_cflags.append("--ptxas-options=-v")
       extra_cuda_cflags.append("-Xptxas")

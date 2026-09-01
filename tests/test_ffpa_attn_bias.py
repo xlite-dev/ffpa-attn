@@ -116,7 +116,10 @@ def test_cute_tma_bias_parity(B, H, Nq, Nkv, D, mask_kind, mask_dtype):
 
 
 @pytest.mark.parametrize("mask_dtype", [torch.float16, torch.float32])
-@pytest.mark.parametrize("mask_kind", ["key", "batch-key", "dense"])
+@pytest.mark.parametrize(
+  "mask_kind",
+  ["key", "query", "batch-key", "head-key", "batch-dense", "dense"]
+)
 @pytest.mark.parametrize("D", [128, 320, 768])
 def test_fp8_bias_parity(D, mask_kind, mask_dtype):
   B, H, Nq, Nkv = 1, 4, 1024, 1024
@@ -169,8 +172,11 @@ def test_cute_tma_bias_bf16_parity(D, mask_kind):
 
 
 @pytest.mark.parametrize("mask_dtype", [torch.float16, torch.float32])
-@pytest.mark.parametrize("mask_kind", ["key", "batch-key", "dense"])
-@pytest.mark.parametrize("D", [128, 320])
+@pytest.mark.parametrize(
+  "mask_kind",
+  ["key", "query", "batch-key", "head-key", "batch-dense", "dense"]
+)
+@pytest.mark.parametrize("D", [128, 320, 768])
 def test_fp4_bias_parity(D, mask_kind, mask_dtype):
   B, H, Nq, Nkv = 1, 4, 1024, 1024
   torch.manual_seed(0)
@@ -188,6 +194,36 @@ def test_fp4_bias_parity(D, mask_kind, mask_dtype):
   assert err.max().item() < 0.15, (
     f"fp4 bias parity failed: kind={mask_kind} dtype={mask_dtype} D={D} "
     f"max={err.max().item():.4f}"
+  )
+
+
+@pytest.mark.parametrize("mask_kind", ["key", "batch-key", "head-key"])
+@pytest.mark.parametrize("D", [320])
+def test_fp4_bias_tile_vs_gmem_paths(D, mask_kind):
+  """fp4 tile path (mode 2/3) vs gmem-direct (mode 0) on identical values.
+
+  Same values, storage offset +1 element -> the classifier keeps mode 0.
+  Row-broadcast kinds, split_d family only (D=320, verified bitwise-stable);
+  the fp4 persist_d family carries the FC-4 epilogue race and the fp4 m4n2
+  family (D>=768) an interleaved-launch race (see repo memory) -- both make
+  strict cross-path assertions flaky there, so they stay under the wide
+  parity tolerance above."""
+  B, H, Nq, Nkv = 2, 4, 512, 4096
+  torch.manual_seed(11)
+  mask = _make_mask(mask_kind, B, H, Nq, Nkv, torch.float32)
+  mask_gmem = _make_unaligned_view(mask)
+  Q = torch.randn(B, H, Nq, D, device="cuda", dtype=torch.float16) * 0.5
+  K = torch.randn(B, H, Nkv, D, device="cuda", dtype=torch.float16) * 0.5
+  V = torch.randn(B, H, Nkv, D, device="cuda", dtype=torch.float16) * 0.5
+
+  backend = CUDABackend(forward=True, enable_fp4=True, backward=False)
+  out_tile = ffpa_attn_func(Q, K, V, attn_mask=mask, forward_backend=backend)
+  out_gmem = ffpa_attn_func(
+    Q, K, V, attn_mask=mask_gmem, forward_backend=backend
+  )
+  assert torch.equal(out_tile, out_gmem), (
+    f"fp4 tile-vs-gmem paths diverged: kind={mask_kind} D={D} "
+    f"max={(out_tile.float() - out_gmem.float()).abs().max().item():.4f}"
   )
 
 

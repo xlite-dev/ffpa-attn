@@ -1687,8 +1687,10 @@ void launch_cute_fwd_persist_d_fp8_sm120_impl(
     constexpr int bias_cols = kBc * (kBias4B ? 2 : 1);
     // Row-broadcast plane is the real [m_total, Nkv]; demoted/dummy cases
     // (mode 0, or mode 3 which never issues) keep a 1-row plane where
-    // bias_cols satisfies the 16B outer-stride assert. mode 0 points at the
-    // anchor so the 16B address assert holds without touching user memory.
+    // bias_cols satisfies the 16B outer-stride assert (a live plane needs
+    // Nkv % 8; the dummy must NOT inherit plane_cols or non-16-multiple
+    // Nkv values trip the assert). mode 0 points at the anchor so the 16B
+    // address assert holds without touching user memory.
     const bool bias_desc_live = bias_plan.mode == 2;
     const int64_t plane_rows =
         bias_desc_live ? (int64_t)bias_plan.m_total : (int64_t)1;
@@ -1697,9 +1699,9 @@ void launch_cute_fwd_persist_d_fp8_sm120_impl(
     const uint16_t* bias_desc_base =
         bias_plan.mode != 0 ? reinterpret_cast<const uint16_t*>(bias.ptr)
                             : &kBiasDummyAnchor;
-    auto gB = make_tensor(make_gmem_ptr(bias_desc_base),
-                          make_shape(plane_rows, plane_cols),
-                          make_stride(plane_cols, _1{}));
+    auto gB = make_tensor(
+        make_gmem_ptr(bias_desc_base), make_shape(plane_rows, plane_cols),
+        make_stride(bias_desc_live ? plane_cols : (int64_t)bias_cols, _1{}));
     auto sB = Layout<Shape<_1, Int<bias_cols>>, Stride<Int<bias_cols>, _1>>{};
     return make_tma_copy(SM90_TMA_LOAD{}, gB, sB, shape(sB), _1{});
   };
@@ -2127,8 +2129,9 @@ void launch_cute_fwd_split_d_fp8_sm120_impl(
     constexpr int bias_cols = kBc * (kBias4B ? 2 : 1);
     // Row-broadcast plane is the real [m_total, Nkv]; every demoted/dummy
     // case (mode 0, or mode 3 which never issues) keeps a 1-row plane where
-    // bias_cols satisfies the 16B outer-stride assert. mode 0 points at the
-    // anchor so the 16B address assert holds without touching user memory.
+    // bias_cols satisfies the 16B outer-stride assert (NOT plane_cols --
+    // non-16-multiple Nkv would trip it). mode 0 points at the anchor so
+    // the 16B address assert holds without touching user memory.
     const bool bias_desc_live = bias_plan.mode == 2;
     const int64_t plane_rows =
         bias_desc_live ? (int64_t)bias_plan.m_total : (int64_t)1;
@@ -2137,9 +2140,9 @@ void launch_cute_fwd_split_d_fp8_sm120_impl(
     const uint16_t* bias_desc_base =
         bias_plan.mode != 0 ? reinterpret_cast<const uint16_t*>(bias.ptr)
                             : &kBiasDummyAnchor;
-    auto gB = make_tensor(make_gmem_ptr(bias_desc_base),
-                          make_shape(plane_rows, plane_cols),
-                          make_stride(plane_cols, _1{}));
+    auto gB = make_tensor(
+        make_gmem_ptr(bias_desc_base), make_shape(plane_rows, plane_cols),
+        make_stride(bias_desc_live ? plane_cols : (int64_t)bias_cols, _1{}));
     auto sB = Layout<Shape<_1, Int<bias_cols>>, Stride<Int<bias_cols>, _1>>{};
     return make_tma_copy(SM90_TMA_LOAD{}, gB, sB, shape(sB), _1{});
   };
@@ -3684,8 +3687,9 @@ void launch_cute_fwd_split_d_fp4_sm120_impl(
     constexpr int bias_cols = kBc * (kBias4B ? 2 : 1);
     // Row-broadcast plane is the real [m_total, Nkv]; demoted/dummy cases
     // (mode 0, or mode 3 which never issues) keep a 1-row plane where
-    // bias_cols satisfies the 16B outer-stride assert. mode 0 points at the
-    // anchor so the 16B address assert holds without touching user memory.
+    // bias_cols satisfies the 16B outer-stride assert (NOT plane_cols --
+    // non-16-multiple Nkv would trip it). mode 0 points at the anchor so
+    // the 16B address assert holds without touching user memory.
     const bool bias_desc_live = bias_plan.mode == 2;
     const int64_t plane_rows =
         bias_desc_live ? (int64_t)bias_plan.m_total : (int64_t)1;
@@ -3694,9 +3698,9 @@ void launch_cute_fwd_split_d_fp4_sm120_impl(
     const uint16_t* bias_desc_base =
         bias_plan.mode != 0 ? reinterpret_cast<const uint16_t*>(bias.ptr)
                             : &kBiasDummyAnchor;
-    auto gB = make_tensor(make_gmem_ptr(bias_desc_base),
-                          make_shape(plane_rows, plane_cols),
-                          make_stride(plane_cols, _1{}));
+    auto gB = make_tensor(
+        make_gmem_ptr(bias_desc_base), make_shape(plane_rows, plane_cols),
+        make_stride(bias_desc_live ? plane_cols : (int64_t)bias_cols, _1{}));
     auto sB = Layout<Shape<_1, Int<bias_cols>>, Stride<Int<bias_cols>, _1>>{};
     return make_tma_copy(SM90_TMA_LOAD{}, gB, sB, shape(sB), _1{});
   };
@@ -4048,8 +4052,9 @@ void launch_cute_fwd_split_d_m4n2_fp4_sm120_impl(
     constexpr int bias_cols = kBc * (kBias4B ? 2 : 1);
     // Row-broadcast plane is the real [m_total, Nkv]; demoted/dummy cases
     // (mode 0, or mode 3 which never issues) keep a 1-row plane where
-    // bias_cols satisfies the 16B outer-stride assert. mode 0 points at the
-    // anchor so the 16B address assert holds without touching user memory.
+    // bias_cols satisfies the 16B outer-stride assert (NOT plane_cols --
+    // non-16-multiple Nkv would trip it). mode 0 points at the anchor so
+    // the 16B address assert holds without touching user memory.
     const bool bias_desc_live = bias_plan.mode == 2;
     const int64_t plane_rows =
         bias_desc_live ? (int64_t)bias_plan.m_total : (int64_t)1;
@@ -4058,9 +4063,9 @@ void launch_cute_fwd_split_d_m4n2_fp4_sm120_impl(
     const uint16_t* bias_desc_base =
         bias_plan.mode != 0 ? reinterpret_cast<const uint16_t*>(bias.ptr)
                             : &kBiasDummyAnchor;
-    auto gB = make_tensor(make_gmem_ptr(bias_desc_base),
-                          make_shape(plane_rows, plane_cols),
-                          make_stride(plane_cols, _1{}));
+    auto gB = make_tensor(
+        make_gmem_ptr(bias_desc_base), make_shape(plane_rows, plane_cols),
+        make_stride(bias_desc_live ? plane_cols : (int64_t)bias_cols, _1{}));
     auto sB = Layout<Shape<_1, Int<bias_cols>>, Stride<Int<bias_cols>, _1>>{};
     return make_tma_copy(SM90_TMA_LOAD{}, gB, sB, shape(sB), _1{});
   };
