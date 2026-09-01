@@ -61,6 +61,7 @@
 | PC-0-1 | ↳ fp8/fp4 场景（量化六族，原 PC-0 主体） | P | ⬜ 待开始 | FC-4 注入点；PC-0-0 热身 |
 | PC-0-2 | ↳ native/native_tma 场景 | P | ⬜ 待开始 | — |
 | PC-0-3 | ↳ D=320 split_d 注入开销专项（PC-0-0 遗留） | P | ⬜ 待开始（杠杆①向量化已证伪 +2.7%，见完成清单） | PC-0-0 |
+| PC-0-4 | ↳ fp8 split_d D≥512 attn-mask tile 化专项（PC-0-1 B-3 遗留） | P3 | ⬜ 待开始（当前 D≥512 已 demote mode 0 保底，gap 停留 gmem 基线 1.48x，见完成清单） | PC-0-1 |
 | PC-1 | Mega Quantize Kernel（aux 链大融合） | P | ⬜ 待开始 | — |
 | PC-2 | 增量融合（Mega Kernel 步进） | P | ⬜ 待开始 | 被 PC-1 收编 |
 | PC-3 | N-crossover 量化配置自适应 | P | ⬜ 待开始 | — |
@@ -104,6 +105,14 @@
     - NCU 定性（三轮）：SM 吞吐 71.4%→47.6%（memory 42.8%/occupancy 16.67% 不变）；bias 同步开销已消除（mode 3 后 short_scoreboard 1.47→1.21、bias barrier 全无）；sleeping 1.7 = tid==0 producer 在 qk/v empty-wait 空转（注入拉长 consumer 每 tile → K/V 流水变浅）。**剩余 gap 本质 = 注入计算本身进入 critical path**（1 CTA/SM × 8 warps，无并行 warp 掩盖）
     - 剩余杠杆（按预估收益排序）：~~① 注入 smem 读向量化~~ **已证伪（2026-08-31 实测 + NCU）**：m16n8k16 col 对 (c,c+1) 成对 4B/8B 读（对齐前提全部成立，路径确认编译生效：LSU 指令 −1.8% ≈ bias LDS 减半预期）反而使 kernel **慢 2.7%**（NCU 85.28 vs 83.05ms，bench 86.5 vs 83.5，gap 1.44→1.48）。机制：注入开销是 latency 放大（critical path 拉长→producer 空转）而非指令数瓶颈，省指令无感；f16 pair 读的 unpack（LDS.32→SHF→F2F→FADD）比标量双并行链（LDS.U16→F2F→FADD）更深，16.7% occupancy 无掩盖 → long_scoreboard +0.42。fp32 mask 子场景无 unpack（LDS.64 直喂 FADD）理论纯赢但场景罕见，不值得保留。已回退；② 注入与 online_softmax 行扫描融合（省一轮 scores 寄存器往返，且可缩短注入依赖链——向量化的教训指向链深而非带宽）；③ 提高 occupancy 不可行（smem 96KB 已 1 CTA/SM 上限）
     - 相关文件：`csrc/cuffpa/cute/attn_bias.cuh`（注入函数）、`sm_120/split_d.cuh`（主循环）、`.tmp/pc0-bias-tile/`（ab2_bench/ncu_probe 脚本与三轮 ncu-rep）
+  - [ ] PC-0-4：fp8 split_d D≥512 attn-mask tile 化专项（PC-0-1 B-3 遗留，目标 gap 1.48→≤1.2x）—— 2026-09-01 现状定案（全部实测，PRO 5000，B=1 H=32 N=16384 rowvec fp16 mask，s2 配置）：
+    - 现象：D=320（10 QK chunks）tile mode 2 正常达标（50.9 vs gmem 69.6ms，gap 1.203）；**D=512（16 QK chunks）tile 反慢 2.4x**（mode 2 275ms / mode 3 267ms vs gmem 115.5ms），bitwise parity 全对（非正确性问题）。
+    - NCU 证据链（`--page source --csv` pcsamp + cuobjdump）：排除 spill（LOCAL:0）、排除 occupancy（两版均 16.67%，**Block Limit Registers=1**——REG:255，smem 守卫在该家族恒空转）、排除协议错（模板尾参与 D=320 逐字同构）。定位：tile 版 **SYNCS.PHASECHK（mbarrier phase 自旋）占 18% 采样（top8 全是 qk_full wait 点）+ sleeping 22.3%**（gmem 版仅 3.5%）——**smem 注入（LDS）进入 consumer critical path 拉长每 tile 时间 → s2 两级 QK 流水断供 → 全线程自旋等 K**。gmem 版的 LDG 注入走 L1 load path 不抢 smem/MIO，QK s2r 不受拖累反而快。
+    - 根因定性：**结构性**——1 CTA/SM（REG 限制）无 warp 掩盖 × s2 浅流水 × D=512 的 16-chunk 高 s2r MIO 压力三者叠加；与 PC-0-3 的"注入进入 critical path"同构，但 fp8 split_d 流水更浅所以直接崩。
+    - 附带结论：**mode 排序是家族属性不可跨族继承**——mode 3 在 fp16 家族最优（PC-0-0），在 fp8 split_d 全败（D=320：mode3 59.2 vs mode2 50.9；D=512：267 ≈ mode2 275 都烂），B-3 dispatch 已移除 mode 3 分支。
+    - 当前处置（commit f42b12a）：launcher 数据驱动 `kHeadDim >= 512 → mode 0`（实测 115.8ms 与 gmem 持平零劣化），D=320 保持 mode 2 达标。
+    - 候选方向（动手前先 A/B）：①bias 激活时升 s3/s4 加深 QK 流水（48KB base + 512B tile 仍放得下，直击断供根因）；②`bias·inv_sd` tile 级预乘减半注入 LDS 压力（PC-0-1 设计的可选项）；③注入移出 softmax critical path（与 PV 重叠的分块注入）；④注入向量化**不要做**（PC-0-3 杠杆①已证伪 +2.7%，低 occupancy 依赖链加深）。
+    - 复验脚本：`.tmp/pc1-bias-tile/fp8_splitd_check.py`（parity+A/B）、`fp8_mode_of.py`（模板尾参）、`fp8_ncu_run.py`（NCU 采集）。
 - [ ] PC-1：Mega Quantize Kernel —— P 轨基建
 - [ ] PC-2：增量融合（Mega Kernel 步进，被 PC-1 收编）
 - [ ] PC-3：N-crossover 量化配置自适应
