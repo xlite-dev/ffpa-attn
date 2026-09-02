@@ -4036,7 +4036,10 @@ void launch_cute_fwd_split_d_m4n2_fp4_sm120_impl(
                ? (long long)std::max<long long>(Nkv, 1) * bias_plan.elem_size
                : bias_plan.tile_bytes(kBr, kBc, (m == 2) ? 2 : 1);
   };
-  if (bias_plan.mode == 2 &&
+  // PC-0-5 debug switch: keep mode 2 (TMA row-broadcast double buffer) and
+  // skip the resident-vector upgrade (mode 3 fill-write loader).
+  const bool resident_off = getenv("FFPA_BIAS_RESIDENT_DISABLE") != nullptr;
+  if (bias_plan.mode == 2 && !resident_off &&
       (long long)kSmemBytes + bias_bytes_of(3) <= dyn_limit)
     bias_plan.mode = 3;
   if ((long long)kSmemBytes + bias_bytes_of(bias_plan.mode) > dyn_limit)
