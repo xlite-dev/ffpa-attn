@@ -78,14 +78,24 @@ template <typename BiasElem, typename ScoresTensor, typename CoordTensor,
 __device__ __forceinline__ void apply_attn_bias_rowcol_smem(
     ScoresTensor& scores, const CoordTensor& tScS_rc,
     const BiasElem* __restrict__ bias_smem, int s_row, int s_col,
-    float inv_scale) {
+    float inv_scale, const BiasElem* __restrict__ bias_smem2 = nullptr,
+    int split_elems = 0) {
 #pragma unroll
   for (int row = 0; row < kRows; ++row) {
     const int smem_row = cute::get<0>(tScS_rc(row, 0)) * s_row;
+    // Split dense tiles: rows past the Q-area capacity live in the tail
+    // extra segment (persist_d.cuh); whole tiles keep bias_smem2 null.
+    const BiasElem* base = bias_smem;
+    int off = smem_row;
+    if (split_elems > 0 && smem_row >= split_elems) {
+      base = bias_smem2;
+      off = smem_row - split_elems;
+    }
 #pragma unroll
     for (int col = 0; col < kCols; ++col) {
-      const int idx = smem_row + cute::get<1>(tScS_rc(row, col)) * s_col;
-      scores(row, col) += float(bias_smem[idx]) * inv_scale;
+      scores(row, col) +=
+          float(base[off + cute::get<1>(tScS_rc(row, col)) * s_col]) *
+          inv_scale;
     }
   }
 }

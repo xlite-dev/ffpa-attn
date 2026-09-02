@@ -1088,18 +1088,18 @@ void launch_cute_fwd_persist_d_sm120(torch::Tensor Q, torch::Tensor K,
   // the Q area holds two tiles).
   constexpr int kBiasSmemBudgetBytes = 99 * 1024;
   const long long tile_u16_1 = (long long)kBr * kBc * (bias_plan.elem_size / 2);
-  // The dense tile is written at q_base (persist_d.cuh); a single-stage tile
-  // larger than the Q-persist area would spill into the K stages no matter
-  // what the tail pad below accounts for. Demote to the gmem-direct path.
-  if (bias_plan.mode == 1 && tile_u16_1 * 2 > (long long)kQPersistBytes)
-    bias_plan.mode = 0;
   const int bias_stages =
       ((long long)kQPersistBytes / 2 >= 2 * tile_u16_1) ? 2 : 1;
-  const long long bias_extra =
+  long long bias_extra =
       std::max(0LL, bias_plan.tile_bytes(kBr, kBc, bias_stages) -
                         (long long)kQPersistBytes);
-  if (kBaseSmemBytes + bias_extra > kBiasSmemBudgetBytes)
+  if (kBaseSmemBytes + bias_extra > kBiasSmemBudgetBytes) {
+    // Demoted to gmem-direct: no smem tile at all (the dummy descriptor
+    // never issues), so the tail pad must drop out of the allocation or
+    // the opt-in size itself would exceed the cap.
     bias_plan.mode = 0;
+    bias_extra = 0;
+  }
   const auto make_tma_bias = [&](auto mode_c, auto b4_c) {
     constexpr int kBiasModeT = decltype(mode_c)::value;
     constexpr int kBias4B = decltype(b4_c)::value;
@@ -1127,10 +1127,16 @@ void launch_cute_fwd_persist_d_sm120(torch::Tensor Q, torch::Tensor K,
                           make_shape(plane_rows, plane_cols),
                           make_stride(plane_row_stride, _1{}));
     auto sB = [&] {
-      if constexpr (kBiasModeT == 1)
-        return make_layout(Shape<Int<kBr>, Int<bias_cols>>{},
+      if constexpr (kBiasModeT == 1) {
+        // Dense tiles larger than the Q-persist area arrive as multiple
+        // box-tall segments (Q area + tail extra, see persist_d.cuh); the
+        // box height must match the kernel's kBiasBoxRows.
+        constexpr int kQPersistU16 = kQPersistBytes / 2;
+        constexpr int box_rows =
+            kBr * bias_cols > kQPersistU16 ? kQPersistU16 / bias_cols : kBr;
+        return make_layout(Shape<Int<box_rows>, Int<bias_cols>>{},
                            Stride<Int<bias_cols>, _1>{});
-      else
+      } else
         return make_layout(Shape<_1, Int<bias_cols>>{},
                            Stride<Int<bias_cols>, _1>{});
     }();

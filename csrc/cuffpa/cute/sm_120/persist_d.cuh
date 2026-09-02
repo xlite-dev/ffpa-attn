@@ -131,6 +131,21 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_sm120(
   __shared__ uint64_t bias_empty[kBiasStages];
   uint16_t* bias_base = reinterpret_cast<uint16_t*>(q_base);
   __shared__ uint64_t q_consumed;  // Q s2r done: bias may reuse the Q area
+  // Dense tiles larger than the Q-persist area split at the Q-area
+  // capacity: leading segments land in the (dead) Q area, the rest in a
+  // tail extra area past the K/V stages (the launcher budgets it as
+  // bias_extra). One TMA box height (kBiasBoxRows) serves every segment;
+  // the host descriptor matches. Split tiles are always single-buffered.
+  constexpr int kBiasColsU16 = kBc * (kBias4B ? 2 : 1);
+  constexpr int kQPersistU16 = kBr * kHeadDim;  // Element is 2B
+  constexpr int kBiasBoxRows =
+      (kBr * kBiasColsU16 > kQPersistU16) ? kQPersistU16 / kBiasColsU16 : kBr;
+  constexpr int kBiasSegs = (kBr + kBiasBoxRows - 1) / kBiasBoxRows;
+  constexpr int kBiasQSegs = kQPersistU16 / (kBiasBoxRows * kBiasColsU16);
+  static_assert(kBiasSegs == 1 || kBiasStages == 1);
+  static_assert(kBiasQSegs >= 1 && kBiasBoxRows >= 1);
+  uint16_t* bias_extra =
+      reinterpret_cast<uint16_t*>(v_base + kStagesV * kKVTileElements);
 
   if (tid == 0) {
     TmaBarrier::init(&q_full, 1);
@@ -239,16 +254,38 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_sm120(
         const int phase = (tile / kBiasStages) & 1;
         CtaBarrier::wait(&bias_empty[stage], phase);
         if constexpr (kBiasMode == 1) {
-          auto sB =
-              make_tensor(make_smem_ptr(bias_base + stage * kBr * bias_cols),
-                          Layout<Shape<Int<kBr>, Int<bias_cols>>,
-                                 Stride<Int<bias_cols>, _1>>{});
-          auto gB = local_tile(mBias, Shape<Int<kBr>, Int<bias_cols>>{},
-                               make_coord(_0{}, tile));
           TmaBarrier::arrive_and_expect_tx(&bias_full[stage],
                                            sizeof(uint16_t) * kBr * bias_cols);
-          copy(tma_bias.with(bias_full[stage]), b_slice.partition_S(gB),
-               b_slice.partition_D(sB));
+          if constexpr (kBiasSegs == 1) {
+            auto sB =
+                make_tensor(make_smem_ptr(bias_base + stage * kBr * bias_cols),
+                            Layout<Shape<Int<kBr>, Int<bias_cols>>,
+                                   Stride<Int<bias_cols>, _1>>{});
+            auto gB = local_tile(mBias, Shape<Int<kBr>, Int<bias_cols>>{},
+                                 make_coord(_0{}, tile));
+            copy(tma_bias.with(bias_full[stage]), b_slice.partition_S(gB),
+                 b_slice.partition_D(sB));
+          } else {
+            // Split tile: segments [0, kBiasQSegs) fill the Q area, the
+            // rest the tail extra area; all copies share this barrier's
+            // transaction byte count above.
+#pragma unroll
+            for (int seg = 0; seg < kBiasSegs; ++seg) {
+              uint16_t* dst = seg < kBiasQSegs
+                                  ? bias_base + seg * kBiasBoxRows * bias_cols
+                                  : bias_extra + (seg - kBiasQSegs) *
+                                                     kBiasBoxRows * bias_cols;
+              auto sB =
+                  make_tensor(make_smem_ptr(dst),
+                              Layout<Shape<Int<kBiasBoxRows>, Int<bias_cols>>,
+                                     Stride<Int<bias_cols>, _1>>{});
+              auto gB =
+                  local_tile(mBias, Shape<Int<kBiasBoxRows>, Int<bias_cols>>{},
+                             make_coord(seg, tile));
+              copy(tma_bias.with(bias_full[stage]), b_slice.partition_S(gB),
+                   b_slice.partition_D(sB));
+            }
+          }
         } else {
           auto sB = make_tensor(
               make_smem_ptr(bias_base + stage * bias_cols),
@@ -521,24 +558,32 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_sm120(
       const int b_slot_u16 = ((kBiasMode == 1) ? kBr * kBc : kBc) *
                              ((attn_bias_dtype == 3) ? 2 : 1);
       const uint16_t* b_slot = bias_base + b_stg * b_slot_u16;
+      const uint16_t* b_slot2 =
+          (kBiasMode == 1 && kBiasSegs > 1) ? bias_extra : nullptr;
+      const int split_elems = (kBiasMode == 1 && kBiasSegs > 1)
+                                  ? kQPersistU16 / (kBias4B ? 2 : 1)
+                                  : 0;
       constexpr int s_row = (kBiasMode == 1) ? kBc : 0;
       if (attn_bias_dtype == 3)
         ffpa_cute::apply_attn_bias_rowcol_smem<
             float, decltype(scores), decltype(tScS_rc), kSRows, kSCols>(
             scores, tScS_rc, reinterpret_cast<const float*>(b_slot), s_row, 1,
-            inv_scale);
+            inv_scale, reinterpret_cast<const float*>(b_slot2), split_elems);
       else if (attn_bias_dtype == 2)
         ffpa_cute::apply_attn_bias_rowcol_smem<
             cutlass::bfloat16_t, decltype(scores), decltype(tScS_rc), kSRows,
             kSCols>(scores, tScS_rc,
                     reinterpret_cast<const cutlass::bfloat16_t*>(b_slot), s_row,
-                    1, inv_scale);
+                    1, inv_scale,
+                    reinterpret_cast<const cutlass::bfloat16_t*>(b_slot2),
+                    split_elems);
       else
         ffpa_cute::apply_attn_bias_rowcol_smem<
             cutlass::half_t, decltype(scores), decltype(tScS_rc), kSRows,
-            kSCols>(scores, tScS_rc,
-                    reinterpret_cast<const cutlass::half_t*>(b_slot), s_row, 1,
-                    inv_scale);
+            kSCols>(
+            scores, tScS_rc, reinterpret_cast<const cutlass::half_t*>(b_slot),
+            s_row, 1, inv_scale,
+            reinterpret_cast<const cutlass::half_t*>(b_slot2), split_elems);
       CtaBarrier::arrive(&bias_empty[b_stg]);
     } else if constexpr (kHasAttnBias) {
       ffpa_cute::apply_attn_bias_rowcol<decltype(scores), decltype(tScS_rc),
