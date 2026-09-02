@@ -61,6 +61,7 @@
 | PC-0 | attn mask 场景性能优化（bias tile IO 重构） | P | 🚧 2/4（**P 轨最高优先**） | FC-4 注入点 |
 | PC-0-0 | ↳ cute/cute_tma 场景（fp16 cute 家族） | P | ✅ 完成（b4a811e + 7ffe765/1e4d9b6 迭代：bench CLI D=128 gap 1.12/89%、D=768 1.07/93% 双达标，原记录 0.99 系测量异常已修正；D=320 1.44/70% 结构极限未达 → **PC-0-3 专项**；2026-08-31 A0 补丁修复 mode 2/3 (b,h) 折叠缺陷 + sm_80 dense 平方 bug） | — |
 | PC-0-1 | ↳ fp8/fp4 场景（量化六族，原 PC-0 主体） | P | ✅ 完成（17ac22f A0 → 16eaea7/39c63ea/f42b12a/f12406f/b194bec/c2fc67d B1-B6 → 7d5ca4c C 阶段：mode 3 全驻留为主力，fp8 D=128 1.85x、fp4 D=320 1.67x、D=768 1.04x；fp8 split_d D≥512 demote mode 0 → **PC-0-4 专项**；先在 race → **PC-0-5**，见完成清单） | FC-4 注入点；PC-0-0 热身 |
+| PC-0-6 | ↳ D=768 split-d vs m4n2 A/B + 寄存器模型分析 | P | ✅ 完成（2026-09-02：fp4 split_d D=768 因 O staging 196608B>101376B smem 预算**物理不可行**，m4n2 是唯一可行 kernel；fp8 A/B 实证 m4n2 五场景全胜，attn-mask split_d 崩溃 3.15x 差距；寄存器实证量化路径 O regs/线程 split_d=D/2=384 重 spill vs m4n2=D/4=192 近零 spill，fp4 m4n2 有量化状态中等 spill 528-920B → 量化寄存器模型不等同 fp16，m4n2 在大 D 必需非可选） | — |
 | PC-0-2 | ↳ native/native_tma 场景 | P | ⬜ 待开始 | — |
 | PC-0-3 | ↳ D=320 split_d 注入开销专项（PC-0-0 遗留） | P | ⬜ 待开始（杠杆①向量化已证伪 +2.7%，见完成清单） | PC-0-0 |
 | PC-0-4 | ↳ fp8 split_d D≥512 attn-mask tile 化专项（PC-0-1 B-3 遗留） | P3 | ⬜ 待开始（当前 D≥512 已 demote mode 0 保底，gap 停留 gmem 基线 1.48x，见完成清单） | PC-0-1 |
@@ -115,6 +116,18 @@
     - 排除项（全部实证）：smem barrier 语义缺失（racecheck 0 hazard 且 race 在 hook 下复现；A2/A3 语义等价注入无效）、插桩伪影链、共享量化链（E5c split_d 稳定）、越界写（launcher printf 56320+4096=60416B 合法）、未初始化读（initcheck 0）。
     - 修复探索：候选 A（kv loop 顶无条件 barrier）修 race 但 mode 3 慢 57%（SASS：spill 822 vs 440/tile），且修复为 spill 时序副产物（A3 等价却不修）→ 拒绝。**已落地**：tail work `tma_store_wait` 无条件化 + `__threadfence`（协议补全，无回退）+ E1 清理 + race 用例沉淀 `tests/test_ffpa_fp4_m4n2_bias_race.py`（xfail）+ `FFPA_BIAS_TILE_DISABLE`/`FFPA_BIAS_RESIDENT_DISABLE` A-B 开关。
     - 定性与搁置决定：**m4n2 P smem 通信 × bias smem 写 × 大占用** 的时序敏感竞争（语言级协议完备、sanitizer 不可见、布局/内容/协议/allocator 全部排除）——疑似 sm_120 TMA/L2 与调度交互的硬件/driver 层问题。**影响面窄（仅 fp4 m4n2 bias，使用人少）→ 专题搁置**。缓解：`FFPA_BIAS_TILE_DISABLE=1` 退 mode 0 完全免疫（牺牲 PC-0-1 attn-mask 收益）。根治待 NVIDIA 上报（最小复现器 + mode 矩阵 + D/结构依赖证据链完整）；fp4 persist_d 3/30 待独立排查（persist_d bias 已实测干净：D=256/D=128 各 0/30，无 P 跨 N-warp staging 不满足 PC-0-5 组合；该 3/30 为独立 epilogue race、非 PC-0-5、persist_d 无 mode 0 等价路径需另解）；fp16/fp8/fp4 split_d 全路径实证干净。
+  - [x] PC-0-6：D=768 split-d vs m4n2 A/B + 寄存器模型分析（2026-09-02 完成）
+    - **fp4 split_d D=768 物理不可行**：split_d fp4 的 O epilogue 用整块释放 smem 做 staging，`static_assert(kBr*kHeadDim*2 <= kSmemBytes)` → kBr=128×768×2B=**196608B ≫ 101376B opt-in**（2 倍超预算，编译期即失败）。m4n2 用 kBr=64 把 O staging 降到 98304B 才可行——**m4n2 是 D≥768 fp4 的唯一可行 kernel**。
+    - **fp8 A/B 实证**（`FFPA_FP8_FORCE_KERNEL=split_d|m4n2`，D=768 N=8192 B1 H32，PRO 5000，TFLOPS）：
+      | 场景 | split_d | m4n2 | m4n2 优势 |
+      |---|---|---|---|
+      | self-attn | 139T / 47.59ms | 158T / 41.88ms | 1.14x |
+      | cross-attn | 85T / 9.70ms | 102T / 8.11ms | 1.20x |
+      | gqa | 141T / 46.69ms | 169T / 39.14ms | 1.20x |
+      | causal | 126T / 26.13ms | 149T / 22.20ms | 1.18x |
+      | **attn-mask** | **50T / 130.96ms** | **159T / 41.52ms** | **3.15x（split_d 崩溃至 0.81x<SDPA）** |
+    - **寄存器压力（cuobjdump -res-usage，D=768 sm_120f）**：fp8 split_d REG:255 + **STACK 1104-1944B**（重 spill）；fp8 m4n2 REG:255 + STACK 0-264B（几乎无 spill）；fp4 m4n2 REG:255 + STACK 528-920B（中等 spill）；fp16 split_d REG:196-254 + STACK ~1536B。
+    - **结论（验证用户假设）**：m4n2 的 O regs/线程 = D/4（192），split_d = D/2（384）——**量化路径沿用 fp16 m4n2 的 kBr/kBc 几何收缩思路方向正确，但量化 kernel 的寄存器模型不等同 fp16**：①fp4 多了 SFQ/SFK/SFVt/DS 量化状态寄存器（fp4 m4n2 STACK 528-920B > fp16 m4n2 0-312B）；②attn-mask 场景 split_d 的 spill 与 bias smem 写叠加后**性能崩溃**（3.15x 差距），而 m4n2 把 spill 压到近零保持稳定。→ m4n2 在量化大 D 路径是**必需而非可选**，fp4 m4n2 的中等 spill 是后续 PC-10 的优化面。
   - [ ] PC-0-2：native/native_tma 场景（标量 loader 路径，设计稿待补）
   - [ ] PC-0-3：D=320 split_d attn-mask 注入开销专项（PC-0-0 遗留，目标 gap 1.44→≤1.2x）
     - 现状（2026-08-31，N=16384 B1 H32，self 57.4ms/191T）：attn-mask 83.5ms/132T，gap 1.44、TFLOPS 70%；迭代路径 mode0 gmem 2.21 → 单缓冲 tile 1.51 → rowvec 双缓冲 1.48 → mode 3 全驻留 1.44；dense 全量 1.59
