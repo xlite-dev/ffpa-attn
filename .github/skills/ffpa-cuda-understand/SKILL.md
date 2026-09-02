@@ -441,7 +441,7 @@ lse 公式（NVFP4 PV）：`lse = (m*L + log2(row_sum) + log2(1/2688))*ln2 + sca
 | cutedsl backend | ✗ | `NotImplementedError`（无静默 fallback） |
 | Triton backend | ✓ | （非本报告范围，支持 additive mask 梯度） |
 
-**结论：attn_mask 的低精度路径已由 FC-4 解锁**（fp8/fp4 六族均支持，2026-08-28）；bias 注入 IO 已全家族 smem tile 化（PC-0-0 fp16 2026-08-31 / PC-0-1 fp8+fp4 2026-09-01，主力 mode 3 全驻留 + occupancy 守卫）；**正确性现状（PC-0-5 收敛）**：native / fp16 全族 / fp8 六族 / fp4 split_d bias 路径全部干净，**唯一已知问题 = fp4 split_d_m4n2 + attn_bias**（bias 数据经 smem 的 mode 2/3，且仅 D=768 大 smem 占用复现、D=320 免疫；触发为 O body bitwise 非确定 ~5e-3..3e-2，非错误值；纯 bias 序列稳定、mode 0 gmem 直读完全免疫、`FFPA_BIAS_TILE_DISABLE=1` 可作 escape hatch）——使用面窄，已收敛定性并搁置，根治待 NVIDIA 上报；dropout 仍为 fp16 家族专属。
+**结论：attn_mask 的低精度路径已由 FC-4 解锁**（fp8/fp4 六族均支持，2026-08-28）；bias 注入 IO 已全家族 smem tile 化（PC-0-0 fp16 2026-08-31 / PC-0-1 fp8+fp4 2026-09-01，主力 mode 3 全驻留 + occupancy 守卫）；**正确性现状（PC-0-5 收敛）**：native / fp16 全族 / fp8 六族 / fp4 split_d / **fp4 persist_d（D=256/D=128 各 0/30 实测）** bias 路径全部干净，**唯一 PC-0-5 问题 = fp4 split_d_m4n2 + attn_bias**（bias 数据经 smem 的 mode 2/3，且 m4n2 独有的 P 跨 N-warp smem 通信 + 大 D 复现、split_d 免疫；触发为 O body bitwise 非确定 ~5e-3..3e-2，非错误值；纯 bias 序列稳定、mode 0 gmem 直读完全免疫、`FFPA_BIAS_TILE_DISABLE=1` 可作 escape hatch）——使用面窄，已收敛定性并搁置，根治待 NVIDIA 上报。**区分**：fp4 persist_d 另有一处独立低概率（3/30）epilogue race（非 PC-0-5，persist_d 无 mode 0 等价路径，需独立排查）；dropout 仍为 fp16 家族专属。
 
 ### 7.2 dropout
 
