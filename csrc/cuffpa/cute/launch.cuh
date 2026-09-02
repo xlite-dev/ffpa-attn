@@ -1093,6 +1093,23 @@ void launch_cute_fwd_persist_d_sm120(torch::Tensor Q, torch::Tensor K,
   long long bias_extra =
       std::max(0LL, bias_plan.tile_bytes(kBr, kBc, bias_stages) -
                         (long long)kQPersistBytes);
+  if (bias_plan.mode == 1) {
+    // Mirror persist_d.cuh's ceil-split segment layout: the tail TMA
+    // segment still writes a full box, so the extra area must use the
+    // same ceil arithmetic. Exact sizing under-reserves (D=96 dense f32
+    // by 16KB) and the tail writes past the allocation into whatever
+    // follows — now the dropout bitmap. Exact equality with the old
+    // formula holds because cols_u16 divides q_u16 (kBc is a power of
+    // two and D a multiple of 32).
+    const long long cols_u16 = (long long)kBc * (bias_plan.elem_size / 2);
+    const long long q_u16 = (long long)kQPersistBytes / 2;
+    const long long box_rows =
+        ((long long)kBr * cols_u16 > q_u16) ? q_u16 / cols_u16 : (long long)kBr;
+    const long long segs = ((long long)kBr + box_rows - 1) / box_rows;
+    bias_extra =
+        std::max(0LL, (long long)bias_stages * segs * box_rows * cols_u16 * 2 -
+                          (long long)kQPersistBytes);
+  }
   if (kBaseSmemBytes + bias_extra > kBiasSmemBudgetBytes) {
     // Demoted to gmem-direct: no smem tile at all (the dummy descriptor
     // never issues), so the tail pad must drop out of the allocation or
