@@ -441,7 +441,7 @@ lse 公式（NVFP4 PV）：`lse = (m*L + log2(row_sum) + log2(1/2688))*ln2 + sca
 | cutedsl backend | ✗ | `NotImplementedError`（无静默 fallback） |
 | Triton backend | ✓ | （非本报告范围，支持 additive mask 梯度） |
 
-**结论：attn_mask 的低精度路径已由 FC-4 解锁**（fp8/fp4 六族均支持，2026-08-28）；bias 注入 IO 已全家族 smem tile 化（PC-0-0 fp16 2026-08-31 / PC-0-1 fp8+fp4 2026-09-01，主力 mode 3 全驻留 + occupancy 守卫）；fp4 m4n2 的 bias 场景存在先在时序竞争（正确性，PC-0-5 定性收尾：触发面 = bias 数据经 smem（mode 0 免疫/mode 2、3 触发）、协议补全落地、无零成本修复、`FFPA_BIAS_TILE_DISABLE` escape hatch 可完全免疫但牺牲 attn-mask 收益）；dropout 仍为 fp16 家族专属。
+**结论：attn_mask 的低精度路径已由 FC-4 解锁**（fp8/fp4 六族均支持，2026-08-28）；bias 注入 IO 已全家族 smem tile 化（PC-0-0 fp16 2026-08-31 / PC-0-1 fp8+fp4 2026-09-01，主力 mode 3 全驻留 + occupancy 守卫）；**正确性现状（PC-0-5 收敛）**：native / fp16 全族 / fp8 六族 / fp4 split_d bias 路径全部干净，**唯一已知问题 = fp4 split_d_m4n2 + attn_bias**（bias 数据经 smem 的 mode 2/3，且仅 D=768 大 smem 占用复现、D=320 免疫；触发为 O body bitwise 非确定 ~5e-3..3e-2，非错误值；纯 bias 序列稳定、mode 0 gmem 直读完全免疫、`FFPA_BIAS_TILE_DISABLE=1` 可作 escape hatch）——使用面窄，已收敛定性并搁置，根治待 NVIDIA 上报；dropout 仍为 fp16 家族专属。
 
 ### 7.2 dropout
 
