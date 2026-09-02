@@ -1088,6 +1088,11 @@ void launch_cute_fwd_persist_d_sm120(torch::Tensor Q, torch::Tensor K,
   // the Q area holds two tiles).
   constexpr int kBiasSmemBudgetBytes = 99 * 1024;
   const long long tile_u16_1 = (long long)kBr * kBc * (bias_plan.elem_size / 2);
+  // The dense tile is written at q_base (persist_d.cuh); a single-stage tile
+  // larger than the Q-persist area would spill into the K stages no matter
+  // what the tail pad below accounts for. Demote to the gmem-direct path.
+  if (bias_plan.mode == 1 && tile_u16_1 * 2 > (long long)kQPersistBytes)
+    bias_plan.mode = 0;
   const int bias_stages =
       ((long long)kQPersistBytes / 2 >= 2 * tile_u16_1) ? 2 : 1;
   const long long bias_extra =

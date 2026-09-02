@@ -6,7 +6,8 @@ unaligned inner strides), for the fp16 CuTe family (``cute_tma``) across
 persist-D / split-D / M4N2 head dims. Reference is fp32 SDPA with the same
 mask.
 
-Run: CUDA_VISIBLE_DEVICES=7 pytest tests/test_ffpa_attn_bias.py -x -q
+Run: CUDA_VISIBLE_DEVICES=7 FFPA_CUDA_ALLOW_SMALL_D=1 \
+  pytest tests/test_ffpa_attn_bias.py -x -q
 """
 
 import math
@@ -30,7 +31,11 @@ pytestmark = [
 ]
 
 # Nq/Nkv >= 512 keeps the CUDA fast path (short-seq declines below 512).
+# D=64 exercises the small-D persist-D launcher guard (dense bias tile
+# larger than the Q-persist area must demote to the gmem-direct path);
+# needs FFPA_CUDA_ALLOW_SMALL_D=1 (see the Run line above).
 SHAPES = [
+  (1, 4, 1024, 1024, 64),  # persist-D small D (bias-tile demote guard)
   (1, 4, 1024, 1024, 128),  # persist-D (D<=128)
   (1, 4, 1024, 1024, 320),  # split-D M8N1
   (1, 4, 1024, 1024, 768),  # split-D M4N2
