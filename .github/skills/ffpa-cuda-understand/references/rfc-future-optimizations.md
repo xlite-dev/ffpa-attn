@@ -103,6 +103,7 @@
 | PC-10 | fp4 split-D M4N2 量化大 D kernel 性能优化 | P | ⬜ 待开始 | PC-9（顺序） |
 | PC-11 | warp 级 `__any_sync` lazy-rescale 统一治理（精度治理专项） | P | ⬜ 待开始 | 已与 PC-0-5 解耦可独立推进（vote 非本次 race 根因——force-rescale 实证；治理价值在消除 warp-uniform 分支的调度脆弱性） |
 | PC-12 | cute sm_80 fp16 性能优化（cp.async + 多级流水线，fp8/sm_89 路线前置） | P | ⬜ 待开始 | —；被 PC-6 依赖 |
+| PC-13 | fp8/fp4 hybrid 路径性能优化（双 attn kernel → 融合 kernel） | P | ⬜ 待开始 | —（与 PC-7~10 协同） |
 
 > 未收录项：分卡基准标注（文档规范，随下次 bench 执行）。（原列于此的 cache-dit `_keep_or_pack` 物化兜底移除已于 2026-08-28 完成，cache-dit@4b5c977：三 tensor 直传零拷贝，契约外布局由 C++ layout gate 显式报错。）
 
@@ -195,6 +196,11 @@
   - 背景：cute sm_80 路径（`cute/sm_80/split_d.cuh`，cp.async loader）此前从未做专项性能优化——2026-09-02 补验 attn-mask 时实测 vs CUTE_TMA 慢 7%（D=768）~28%（D=128），cp.async loader 开销与小 D 流水深度是主因。
   - 战略意义（fp8/sm_89 路线的训练场）：**sm_89 不支持 TMA 与 async proxy，只有 cp.async general proxy**——fp8 sm_89 量化路径无法复用 sm_120 的 TMA + WS/non-WS 模式，只能走 **cp.async + 多级流水线**。该技术路线的全部经验（stage 深度/同步开销/barrier 协议/寄存器规划 under cp.async）必须先在 cute sm_80 fp16 上打磨成熟，性能达标后才迁移到 cute/fp8/sm_89 实现 fp8 量化（即 sm_89 fp8 路线复活，解锁 PC-6）。
   - 动作与验收：①NCU 基线（loader 停顿/s2r MIO/occupancy）；②stage 深度与 stage 组合扫描（现状 sm_120 上 cap 2/3，物理 smem 上限内探索）；③cp.async commit-group 分组与多级流水线重构；④`ffpa_attn.bench`（CUTE hint）vs CUTE_TMA gap 收敛到 ≤1.1x 作为"达标"准出（经验才值得迁移）；⑤达标后开 cute/fp8/sm_89 专项（量化链 + kernel 移植，届时与 FC-12 一并评估）。
+- [ ] PC-13：fp8/fp4 hybrid 路径性能优化（双 attn kernel → 融合 kernel，2026-09-02 立项）
+  - 背景：hybrid（causal 前缀 `n_early` 行走 fp16 保精度、其余行走量化）当前是 **stage-1 fp16 attn kernel + stage-2 量化 attn kernel 两条主 kernel 路径背靠背**（`launch.cuh` 6 处 hybrid 分支：fp8/fp4 × persist_d/split_d/m4n2 全同构）：`prepare_hybrid_stage1` 物化切片 + `O_e`/`lse_e` 临时分配 + `O.slice(2,0,n_early).copy_(O_e)` 拼接拷贝 + K/V 双份加载（fp16 原值给 stage-1、量化值给 stage-2）+ 两条 pre-kernel 链与两次 launch——固定开销显著（n_early 占比越大越亏），且 stage-1 走 fp16 kernel 本身吞吐低于量化 kernel。
+  - 融合方向（设计要点）：单 kernel 内按 work 的 Q 行域选精度——前缀 tile 走 fp16 MMA、其余 tile 走 fp8/fp4 MMA，同 grid/同流水/同 epilogue 直写 O（`q_start_row` 行域判定已具备），消除拼接拷贝与双份 K/V IO；难点 = 同一 kernel 内两套 smem 布局/量化状态的条件编译分支对寄存器压力的影响（PC-0-6 教训：量化寄存器模型不等同 fp16）。
+  - 动作与验收：①hybrid 现状开销量化（nsys：双 kernel + copy + pre-kernel 链时间占比，`n_early` 扫描）；②融合 kernel 原型（先 persist_d 家族，行域分支最简单）；③hybrid bench A/B + 精度对照（hybrid 本身是精度特性，融合版必须保持 stage-1 fp16 数值语义不变）。
+  - 关联：与 PC-7~PC-10（量化大 D kernel 内部优化）协同——融合 kernel 的量化段直接继承其优化成果。
 
 ## 实施路线图（基建优先，承上启下）
 
@@ -226,6 +232,8 @@
         fp8 split-D → fp8 M4N2 → fp4 split-D → fp4 M4N2，上一项验收后再启动下一项）
   PC-12 cute sm_80 fp16（cp.async + 多级流水线）──达标──► cute/fp8/sm_89 量化实现
         （sm_89 无 TMA/async proxy，fp8 只能走 cp.async 路线；复活后解锁 PC-6）
+  PC-13 fp8/fp4 hybrid 融合 kernel（现状 = fp16 + 量化两条主 attn kernel 背靠背，
+        拼接拷贝/双份 K/V IO/双 launch 固定开销显著 → 单 kernel 内按 Q 行域选精度）
   PC-6 sm_89 int4 QK ⏸（暂不实施，低优搁置，不入执行序列；前置 = PC-12 达标）
 ```
 
