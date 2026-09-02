@@ -73,7 +73,7 @@
 | PC-8 | fp8 split-D M4N2 量化大 D kernel 性能优化 | P | ⬜ 待开始 | PC-7（顺序） |
 | PC-9 | fp4 split-D (M8N1) 量化大 D kernel 性能优化 | P | ⬜ 待开始 | PC-8（顺序） |
 | PC-10 | fp4 split-D M4N2 量化大 D kernel 性能优化 | P | ⬜ 待开始 | PC-9（顺序） |
-| PC-11 | warp 级 `__any_sync` lazy-rescale 统一治理（精度治理专项） | P | ⬜ 待开始 | PC-0-5（fp4 m4n2 已实证 vote 交互 race；根因修复落地时启动） |
+| PC-11 | warp 级 `__any_sync` lazy-rescale 统一治理（精度治理专项） | P | ⬜ 待开始 | 已与 PC-0-5 解耦可独立推进（vote 非本次 race 根因——force-rescale 实证；治理价值在消除 warp-uniform 分支的调度脆弱性） |
 
 > 未收录项：分卡基准标注（文档规范，随下次 bench 执行）。（原列于此的 cache-dit `_keep_or_pack` 物化兜底移除已于 2026-08-28 完成，cache-dit@4b5c977：三 tensor 直传零拷贝，契约外布局由 C++ layout gate 显式报错。）
 
@@ -133,7 +133,7 @@
 - [ ] PC-5：CUDA graph 友好化
 - [ ] PC-6：sm_89 fp8 int4 QK（低优搁置：sm_120 无原生 int4 MMA，SA2 int4 kernel 未开源）
 - [ ] PC-11：warp 级 `__any_sync` lazy-rescale 统一治理（精度治理专项，2026-09-01 立项）
-  - 背景：PC-0-5 实证 fp4 split_d_m4n2 的 warp-uniform lazy-rescale（`__any_sync(0xffffffff, row_scale != 1.0f ...)`）与 attn_bias smem 注入路径交互产生**同输入 bitwise 非确定**（触发：同进程 no-bias 模板前置 ×N 后 bias 模板 8/8 必现；lse 全程稳定 + o_acc checksum 不稳 → 竞争在 kv loop PV 段；E5 消元排除共享量化链）。`__any_sync` 投票模式源自 CUTLASS 77_blackwell_fmha 的 **shared-TMEM collective rescale** 场景——那里 warp-uniform 是必须的；本仓库所有 kernel 的 rescale 目标均为 **thread-private 寄存器**，投票既非必需，又把 per-row 决策强行提升为 warp-uniform 分支，与 bias 注入的调度交互埋下时序竞争。
+  - 背景：PC-0-5 调查早期曾怀疑 fp4 split_d_m4n2 的 warp-uniform lazy-rescale（`__any_sync(0xffffffff, row_scale != 1.0f ...)`）参与 bias 场景的 bitwise 非确定，**后续消元已证伪 vote 因果**（force-rescale 后仍触发；race 真身为跨模板时序敏感竞争，见 PC-0-5 完成清单）。本专项保留的治理价值：`__any_sync` 投票模式源自 CUTLASS 77_blackwell_fmha 的 **shared-TMEM collective rescale** 场景——那里 warp-uniform 是必须的；本仓库所有 kernel 的 rescale 目标均为 **thread-private 寄存器**，投票既非必需，又把 per-row 决策强行提升为 warp-uniform 分支，徒增调度脆弱性与 warp divergence 面。
   - 参考实现（治理目标形态）：`csrc/cuffpa/cute/fp8/sm_120/persist_d.cuh` 已改为 thread-level per-row——`const float rs = (kv_tile > 0 && row_scale[row] < 1.0f) ? row_scale[row] : 1.0f;` 逐行独立判断（`< 1.0f` 顺带拒绝全 masked 行的 NaN scale），无跨 lane 通信；其注释含完整论证。
   - 治理清单（`grep -r "__any_sync" csrc/cuffpa/cute/` 全量 9 处实际使用 + 1 处已治理注释）：
     - `sm_120/split_d_m4n2.cuh`、`sm_120/split_d.cuh`、`sm_120/persist_d.cuh`（fp16 cute 三族）
