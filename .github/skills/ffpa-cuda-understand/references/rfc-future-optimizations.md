@@ -84,7 +84,7 @@
 | FC-11 | native 路径 dropout 精度修复（bug，高优） | F3 | ✅ 已完成（ffpa-attn 542f774/e1fe363，根因=torch ref uint32 bug） | — |
 | FC-12 | cute sm_80 家族补齐 persist-D / split-D M4N2 (**暂不实施，仅保留设计稿**) | F3 | ⬜ 待开始 | 与 PC-12 同路线（sm_80 cp.async） |
 | PC-0 | attn mask 场景性能优化（bias tile IO 重构） | P | 🚧 2/4（**P 轨最高优先**） | FC-4 注入点 |
-| PC-0-0 | ↳ cute/cute_tma 场景（fp16 cute 家族） | P | ✅ 完成（b4a811e + 7ffe765/1e4d9b6 迭代：bench CLI D=128 gap 1.12/89%、D=768 1.07/93% 双达标，原记录 0.99 系测量异常已修正；D=320 1.44/70% 结构极限未达 → **PC-0-3 专项**；2026-08-31 A0 补丁修复 mode 2/3 (b,h) 折叠缺陷 + sm_80 dense 平方 bug） | — |
+| PC-0-0 | ↳ cute/cute_tma 场景（fp16 cute 家族） | P | ✅ 完成（b4a811e + 7ffe765/1e4d9b6 迭代：bench CLI D=128 gap 1.12/89%、D=768 1.07/93% 双达标，原记录 0.99 系测量异常已修正；D=320 1.44/70% 结构极限未达 → **PC-0-3 专项**；2026-08-31 A0 补丁修复 mode 2/3 (b,h) 折叠缺陷 + sm_80 dense 平方 bug；2026-09-02 D=64 dense 拆段 TMA 补强：tile 超出 Q 复用区时按 Q 容量拆多段 TMA（前段 Q 区 + 尾段 extra 区，单 mbarrier expect_tx 总账），fp16 mask 1.34x vs gmem、fp32 超预算自动降级，见完成清单） | — |
 | PC-0-1 | ↳ fp8/fp4 场景（量化六族，原 PC-0 主体） | P | ✅ 完成（17ac22f A0 → 16eaea7/39c63ea/f42b12a/f12406f/b194bec/c2fc67d B1-B6 → 7d5ca4c C 阶段：mode 3 全驻留为主力，fp8 D=128 1.85x、fp4 D=320 1.67x、D=768 1.04x；fp8 split_d D≥512 demote mode 0 → **PC-0-4 专项**；先在 race → **PC-0-5**，见完成清单） | FC-4 注入点；PC-0-0 热身 |
 | PC-0-6 | ↳ D=768 split-d vs m4n2 A/B + 寄存器模型分析 | P | ✅ 完成（2026-09-02：fp4 split_d D=768 因 O staging 196608B>101376B smem 预算**物理不可行**，m4n2 是唯一可行 kernel；fp8 A/B 实证 m4n2 五场景全胜，attn-mask split_d 崩溃 3.15x 差距；寄存器实证量化路径 O regs/线程 split_d=D/2=384 重 spill vs m4n2=D/4=192 近零 spill，fp4 m4n2 有量化状态中等 spill 528-920B → 量化寄存器模型不等同 fp16，m4n2 在大 D 必需非可选） | — |
 | PC-0-2 | ↳ native/native_tma 场景 | P | ⬜ 待开始 | — |
@@ -104,6 +104,7 @@
 | PC-11 | warp 级 `__any_sync` lazy-rescale 统一治理（精度治理专项） | P | ⬜ 待开始 | 已与 PC-0-5 解耦可独立推进（vote 非本次 race 根因——force-rescale 实证；治理价值在消除 warp-uniform 分支的调度脆弱性） |
 | PC-12 | cute sm_80 fp16 性能优化（cp.async + 多级流水线，fp8/sm_89 路线前置） | P | ⬜ 待开始 | —；被 PC-6 依赖 |
 | PC-13 | fp8/fp4 hybrid 路径性能优化（双 attn kernel → 融合 kernel） | P | ⬜ 待开始 | —（与 PC-7~10 协同） |
+| PC-14 | fp16 dropout 路径性能优化（RNG bitmap 预计算 + producer/consumer 重排） | P | ⬜ 待开始 | PC-0 同构（bias tile 协议复用）；FC-5 是量化路径功能项（⏸），与本项无重叠 |
 
 > 未收录项：分卡基准标注（文档规范，随下次 bench 执行）。（原列于此的 cache-dit `_keep_or_pack` 物化兜底移除已于 2026-08-28 完成，cache-dit@4b5c977：三 tensor 直传零拷贝，契约外布局由 C++ layout gate 显式报错。）
 
@@ -133,7 +134,7 @@
 **轨道 P（性能优化）**
 
 - [ ] PC-0：attn mask 场景性能优化 —— bias tile IO 重构（P 轨最高优先，2026-08-31 立项）
-  - [x] PC-0-0：cute/cute_tma 场景（fp16 cute 家族 `apply_attn_bias_rowcol` smem tile 化）—— 2026-08-31 完成（b4a811e）：TMA tile 预取 + persist_d Q-s2r 寄存器持久化腾出 Q smem 给 bias tile（fp8 kPersistQs2r 模式移植）+ split_d/m4n2 单缓冲防自锁 + dense 平面行坐标修复（元素 stride 误作行单位，h≥1 bias 被 TMA OOB zero-fill）；99 parity 用例 + bench CLI 验收：D=128 gap 1.12x（TFLOPS 89%）、D=768 gap 1.07x（93%）双达标（原记录 0.99x/101% 系测量异常：2026-08-31 A0 前后同口径复测均为 ~1.07-1.08，gap<1 本身反常）；dense 全量 mask 下 D=128 增量已达 HBM 带宽极限（~2.2TB/s 等效）。后续迭代 7ffe765（rowvec 双缓冲）+ 1e4d9b6（mode 3 全驻留）：D=320 gap 2.21→1.44（TFLOPS 66%→70%）仍未达 1.2x，属 split_d 结构极限 → 移交 PC-0-3 专项。A0 补丁（2026-08-31，PC-0-1 规划审查发现）：mode 2/3 的 (b,h) 未折叠——head-key/batch-key rowvec mask（stride_m 被 size-1 归零而 stride_b/h≠0）全部 CTA 读 (0,0) 行，h≥1 输出错但 3e-2 断言假阴性掩盖（repro 差 0.0097）；修复 = 分类器补 rowvec 平面校验（stride_h∈{0,Nkv}、stride_b∈{0,h_eff·Nkv}、Nkv·elem 16B 对齐）+ TMA 坐标/mode 3 装载 fold + sm_80 loader 统一行坐标公式（顺带修 dense 元素偏移×stride_m 平方 bug，sm_120 GPU 上从未暴露）；新增 15 例 tile-vs-gmem bitwise 对照（storage-offset 视图强制 mode 0，`buf[...,:N]` 左切片不改变 ptr/stride 无效）。**2026-09-02 补验**：CUTE hint（非 TMA，`launch_cute_fwd_split_d_sm80` cp.async loader，CUTE=3）attn-mask 路径此前从未被 bench/parity 覆盖（全部验收走 CUTE_TMA），补测通过——D=128/768 parity abs≤1.3e-5（含 head-key `[1,H,1,N]`/batch-head `[B,H,1,N]` 折叠变体，A0 的 sm_80 loader 行坐标修复实证正确）、bitwise 稳定 0/8、vs SDPA 1.94-2.12x（比 CUTE_TMA 慢 7%@D=768 / 28%@D=128，小 D cp.async loader 开销占比大；复现脚本 `.tmp/pc5-race/fp16_cute_nontma_mask.py`）
+  - [x] PC-0-0：cute/cute_tma 场景（fp16 cute 家族 `apply_attn_bias_rowcol` smem tile 化）—— 2026-08-31 完成（b4a811e）：TMA tile 预取 + persist_d Q-s2r 寄存器持久化腾出 Q smem 给 bias tile（fp8 kPersistQs2r 模式移植）+ split_d/m4n2 单缓冲防自锁 + dense 平面行坐标修复（元素 stride 误作行单位，h≥1 bias 被 TMA OOB zero-fill）；99 parity 用例 + bench CLI 验收：D=128 gap 1.12x（TFLOPS 89%）、D=768 gap 1.07x（93%）双达标（原记录 0.99x/101% 系测量异常：2026-08-31 A0 前后同口径复测均为 ~1.07-1.08，gap<1 本身反常）；dense 全量 mask 下 D=128 增量已达 HBM 带宽极限（~2.2TB/s 等效）。后续迭代 7ffe765（rowvec 双缓冲）+ 1e4d9b6（mode 3 全驻留）：D=320 gap 2.21→1.44（TFLOPS 66%→70%）仍未达 1.2x，属 split_d 结构极限 → 移交 PC-0-3 专项。A0 补丁（2026-08-31，PC-0-1 规划审查发现）：mode 2/3 的 (b,h) 未折叠——head-key/batch-key rowvec mask（stride_m 被 size-1 归零而 stride_b/h≠0）全部 CTA 读 (0,0) 行，h≥1 输出错但 3e-2 断言假阴性掩盖（repro 差 0.0097）；修复 = 分类器补 rowvec 平面校验（stride_h∈{0,Nkv}、stride_b∈{0,h_eff·Nkv}、Nkv·elem 16B 对齐）+ TMA 坐标/mode 3 装载 fold + sm_80 loader 统一行坐标公式（顺带修 dense 元素偏移×stride_m 平方 bug，sm_120 GPU 上从未暴露）；新增 15 例 tile-vs-gmem bitwise 对照（storage-offset 视图强制 mode 0，`buf[...,:N]` 左切片不改变 ptr/stride 无效）。**2026-09-02 补验**：CUTE hint（非 TMA，`launch_cute_fwd_split_d_sm80` cp.async loader，CUTE=3）attn-mask 路径此前从未被 bench/parity 覆盖（全部验收走 CUTE_TMA），补测通过——D=128/768 parity abs≤1.3e-5（含 head-key `[1,H,1,N]`/batch-head `[B,H,1,N]` 折叠变体，A0 的 sm_80 loader 行坐标修复实证正确）、bitwise 稳定 0/8、vs SDPA 1.94-2.12x（比 CUTE_TMA 慢 7%@D=768 / 28%@D=128，小 D cp.async loader 开销占比大；复现脚本 `.tmp/pc5-race/fp16_cute_nontma_mask.py`）。**2026-09-02 拆段 TMA 补强（F1 后续）**：D=64 dense tile（fp16 32KB/fp32 64KB）超 Q 复用区（16KB）时不再整体降级 gmem——kernel 按 Q 容量拆多段 TMA（box 高度 `kQPersistU16/bias_cols`，前段落 Q 区、尾段落 K/V 后 extra 区，共享单 mbarrier expect_tx 总账；消费函数加默认尾参 `bias_smem2/split_elems` 分段读，其余 5 调用点零改动）；fp16 mask 1.34x vs gmem（0.229 vs 0.306ms，B1H4N4096）、fp32 超总预算（80+48>99KB）自动降级 gmem；**账目修复**：budget 降级必须同步清零 `bias_extra`（否则 setAttribute 超限 → launch 报 invalid argument，F1 守卫版纯靠先行降级的巧合掩盖此坑）。验收：171 parity + f1 复现器 D=64/128 + A/B 路径生效实证 + bench CLI D=64 无回归（attn-mask 2.13x）
   - [x] PC-0-1：fp8/fp4 场景（量化六族 kernel，原 PC-0 主体设计）—— 2026-09-01 完成（A0 17ac22f 分类器量化族扩展 + 平面校验 → B1-B6 六 kernel 垂直切片 16eaea7/39c63ea/f42b12a/f12406f/b194bec/c2fc67d → C 7d5ca4c parity 扩展 159 用例 + bench 全 D 矩阵验收 + TMA dummy descriptor stride 修复）。
     - 模式总览：**mode 3 全驻留为主力**（fp8 persist_d 1.84x / fp4 split_d D=320 1.67x / fp4 m4n2 1.04x），**occupancy 守卫**（resident 驻留不得降 CTA/SM：fp8 m4n2 3 CTA/SM，32KB 驻留降 1 CTA/SM 反慢 4.9% → 守卫后 mode 2 150.7ms gap 1.029）、**fp8 split_d D≥512 demote mode 0**（B-3 结构性劣化 2.4x → PC-0-4 专项）、fp4 persist_d rowvec-only（dense fp32 超预算全 demote）。
     - 逐 kernel（B=1 H=32 N=16384 rowvec，PRO 5000）：fp8 m4n2 mode 2 1.03x（守卫）；fp8 persist_d mode 3 **1.84x**（14.46 vs 26.61ms）；fp8 split_d D=320 mode 2 **1.20x** 达标 / D≥512 demote 0（1.0x 持平）；fp4 persist_d mode 3（parity 达标，gap 小——fp4 persist_d 本身 attn 占比低）；fp4 split_d D=320 mode 2/3 **1.67x**、D=512 **1.29x**；fp4 m4n2 mode 3 **1.04x**（401.5 vs 419.4ms，D=768）。
@@ -201,6 +202,11 @@
   - 融合方向（设计要点）：单 kernel 内按 work 的 Q 行域选精度——前缀 tile 走 fp16 MMA、其余 tile 走 fp8/fp4 MMA，同 grid/同流水/同 epilogue 直写 O（`q_start_row` 行域判定已具备），消除拼接拷贝与双份 K/V IO；难点 = 同一 kernel 内两套 smem 布局/量化状态的条件编译分支对寄存器压力的影响（PC-0-6 教训：量化寄存器模型不等同 fp16）。
   - 动作与验收：①hybrid 现状开销量化（nsys：双 kernel + copy + pre-kernel 链时间占比，`n_early` 扫描）；②融合 kernel 原型（先 persist_d 家族，行域分支最简单）；③hybrid bench A/B + 精度对照（hybrid 本身是精度特性，融合版必须保持 stage-1 fp16 数值语义不变）。
   - 关联：与 PC-7~PC-10（量化大 D kernel 内部优化）协同——融合 kernel 的量化段直接继承其优化成果。
+- [ ] PC-14：fp16 dropout 路径性能优化（RNG bitmap 预计算 + producer/consumer 重排，2026-09-02 立项）
+  - 背景：D=64 bench 实测 dropout task **0.83x**（FFPA 37.69ms vs SDPA 31.31ms；无 mask self-attn 9.97ms → dropout 3.8 倍耗时，当前量化路径外唯一劣化点）。根因：`apply_dropout_rowcol`（cute/dropout.cuh）在 consumer 的 QK-MMA→softmax 串行链上**逐 element 计算 Philox**（philox4x32_10 = 4×10 round 整数乘加/异或链，每 2 个 score 一次完整调用），算术密度远超 score 本身的 add/mul。
+  - 思路（与 PC-0 attn bias tile 同构）：producer warp（128T，目前仅发 TMA 基本空闲）预计算下一 KV tile 的 `[kBr,kBc]` dropout keep bitmap（1 bit/elem）写入 smem 预取窗口——复用 bias tile 已验证的 Q 区/extra 段布局与 `bias_full/empty` mbarrier 协议；consumer 只查 bitmap + 乘 keep_scale。Philox 生成侧按 4 连续列块对齐（一次 philox4x32_10 出 4 个决策），消除 lane0==3 的重算分支。
+  - 进阶（评估项）：drop 的 keep_scale 因子后置到 P 域/row_scale 折叠（online softmax 已有 rescale 乘法链，drop=置 0 可与 rescale 合并乘法）。
+  - 动作与验收：①NCU 基线（dropout 段指令占比/串行链停顿）；②producer bitmap 原型（先 persist_d 家族）；③`ffpa_attn.bench` dropout task ≥1.0x SDPA（D=64/128 全 dtype）；④**bitwise RNG 语义不变**（philox offset = `philox_offset + row*Nkv + col` 的决策序列与现状一致，保证与 torch 训练对齐；parity 注意 torch 参考 2^32 offset wrap bug 标注）。
 
 ## 实施路线图（基建优先，承上启下）
 
@@ -234,6 +240,8 @@
         （sm_89 无 TMA/async proxy，fp8 只能走 cp.async 路线；复活后解锁 PC-6）
   PC-13 fp8/fp4 hybrid 融合 kernel（现状 = fp16 + 量化两条主 attn kernel 背靠背，
         拼接拷贝/双份 K/V IO/双 launch 固定开销显著 → 单 kernel 内按 Q 行域选精度）
+  PC-14 fp16 dropout 性能（producer 预计算 RNG bitmap，复用 bias tile 协议；
+        现状逐 element Philox 在 consumer 串行链上 → dropout 0.83x 唯一劣化点）
   PC-6 sm_89 int4 QK ⏸（暂不实施，低优搁置，不入执行序列；前置 = PC-12 达标）
 ```
 
