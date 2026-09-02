@@ -106,6 +106,9 @@ CUTEDSL_COMPAT_TASKS = frozenset({
 # the tasks at the task-set level so they neither run nor appear as NaN bars
 # in the tflops/speedup plots (runner-side skipping alone leaves the gaps).
 CUDA_QUANT_EXCLUDED_TASKS = frozenset({"decode-attn", "dropout"})
+# Decode (Nq==1) is not an ffpa focus: every backend drops it from the
+# default (and "full") run; explicit --tasks decode-attn still runs it.
+DEFAULT_EXCLUDED_TASKS = frozenset({"decode-attn"})
 CUTEDSL_DTYPES: tuple[torch.dtype, ...] = (torch.float16, torch.bfloat16)
 CUTEDSL_OUTPUT_STEM = "ffpa_speedup_cutedsl"
 # Quant-impl stems keep fp8/fp4 artifacts from clobbering the fp16/bf16 ones
@@ -711,14 +714,15 @@ def _parse_tasks_arg(tasks_arg: list[str] | None) -> set[str] | None:
   """Parse the optional benchmark task filter.
 
   :param tasks_arg: Raw ``--tasks`` values.
-  :return: Selected case names, or ``None`` for the full benchmark suite.
+  :return: Selected case names; the default (no ``--tasks``) and ``full``
+      resolve to the suite minus ``DEFAULT_EXCLUDED_TASKS``.
   :raises SystemExit: If an unknown case name is requested.
   """
   if tasks_arg is None:
-    return None
+    return set(VALID_TASKS) - DEFAULT_EXCLUDED_TASKS
   normalized = " ".join(tasks_arg).strip()
   if normalized == "" or normalized.lower() in {"full", "all", "none"}:
-    return None
+    return set(VALID_TASKS) - DEFAULT_EXCLUDED_TASKS
   tasks = {task for task in re.split(r"[\s,]+", normalized) if task}
   if not tasks:
     return None
