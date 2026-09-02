@@ -58,6 +58,7 @@
 | FC-9 | CUDA backward (**暂不实施，仅保留设计稿**) | F3 | ⬜ 待开始 | — |
 | FC-10 | sm90/sm100 量化覆盖 (**暂不实施，仅保留设计稿**) | F3 | ⬜ 待开始 | — |
 | FC-11 | native 路径 dropout 精度修复（bug，高优） | F3 | ✅ 已完成（ffpa-attn 542f774/e1fe363，根因=torch ref uint32 bug） | — |
+| FC-12 | cute sm_80 家族补齐 persist-D / split-D M4N2 (**暂不实施，仅保留设计稿**) | F3 | ⬜ 待开始 | 与 PC-12 同路线（sm_80 cp.async） |
 | PC-0 | attn mask 场景性能优化（bias tile IO 重构） | P | 🚧 2/4（**P 轨最高优先**） | FC-4 注入点 |
 | PC-0-0 | ↳ cute/cute_tma 场景（fp16 cute 家族） | P | ✅ 完成（b4a811e + 7ffe765/1e4d9b6 迭代：bench CLI D=128 gap 1.12/89%、D=768 1.07/93% 双达标，原记录 0.99 系测量异常已修正；D=320 1.44/70% 结构极限未达 → **PC-0-3 专项**；2026-08-31 A0 补丁修复 mode 2/3 (b,h) 折叠缺陷 + sm_80 dense 平方 bug） | — |
 | PC-0-1 | ↳ fp8/fp4 场景（量化六族，原 PC-0 主体） | P | ✅ 完成（17ac22f A0 → 16eaea7/39c63ea/f42b12a/f12406f/b194bec/c2fc67d B1-B6 → 7d5ca4c C 阶段：mode 3 全驻留为主力，fp8 D=128 1.85x、fp4 D=320 1.67x、D=768 1.04x；fp8 split_d D≥512 demote mode 0 → **PC-0-4 专项**；先在 race → **PC-0-5**，见完成清单） | FC-4 注入点；PC-0-0 热身 |
@@ -71,12 +72,13 @@
 | PC-3 | N-crossover 量化配置自适应 | P | ⬜ 待开始 | — |
 | PC-4 | fp4 persist-D attn kernel 内部优化 | P | ⬜ 待开始 | — |
 | PC-5 | CUDA graph 友好化 (**暂不实施，仅保留设计稿**) | P | ⬜ 待开始 | PC-1 评估 |
-| PC-6 | sm_89 fp8 int4 QK (**暂不实施，仅保留设计稿**) | P | ⬜ 低优搁置 | sm_89 fp8 路线复活 |
+| PC-6 | sm_89 fp8 int4 QK (**暂不实施，仅保留设计稿**) | P | ⬜ 低优搁置 | PC-12（cute sm_80 fp16 性能达标 → 迁移 cute/fp8/sm_89 即 fp8 路线复活） |
 | PC-7 | fp8 split-D (M8N1) 量化大 D kernel 性能优化 | P | ⬜ 待开始 | — |
 | PC-8 | fp8 split-D M4N2 量化大 D kernel 性能优化 | P | ⬜ 待开始 | PC-7（顺序） |
 | PC-9 | fp4 split-D (M8N1) 量化大 D kernel 性能优化 | P | ⬜ 待开始 | PC-8（顺序） |
 | PC-10 | fp4 split-D M4N2 量化大 D kernel 性能优化 | P | ⬜ 待开始 | PC-9（顺序） |
 | PC-11 | warp 级 `__any_sync` lazy-rescale 统一治理（精度治理专项） | P | ⬜ 待开始 | 已与 PC-0-5 解耦可独立推进（vote 非本次 race 根因——force-rescale 实证；治理价值在消除 warp-uniform 分支的调度脆弱性） |
+| PC-12 | cute sm_80 fp16 性能优化（cp.async + 多级流水线，fp8/sm_89 路线前置） | P | ⬜ 待开始 | —；被 PC-6 依赖 |
 
 > 未收录项：分卡基准标注（文档规范，随下次 bench 执行）。（原列于此的 cache-dit `_keep_or_pack` 物化兜底移除已于 2026-08-28 完成，cache-dit@4b5c977：三 tensor 直传零拷贝，契约外布局由 C++ layout gate 显式报错。）
 
@@ -98,6 +100,10 @@
 - [ ] FC-9：CUDA backward（定位评估）
 - [ ] FC-10：sm90/sm100 量化覆盖
 - [x] FC-11：native 路径 dropout 精度修复 —— 存量 bug（2026-08-31 记录）；已结案（同日）：实为 stale `.so` + Triton int32 回绕 + torch 2.11 mem-eff ref 自身 uint32 回绕（PyTorch main 已修），FFPA 源码本身正确
+- [ ] FC-12：cute sm_80 家族补齐 persist-D / split-D M4N2 ⏸（暂不实施，仅保留设计稿）
+  - 现状：sm_80 cute 只有 split_d M8N1（`cute/sm_80/split_d.cuh`，cp.async loader，CUTE hint 分发）；对照 sm_120 家族缺两个成员——persist-D（D≤128 小 D，Q 驻留，寄存器/带宽模型最优）与 split-D M4N2（D≥768，kBr=64 + (4,2,1) atom 解 O regs=D/2 撞 255 墙，sm_80 版可复用 sm_120 m4n2 的几何但 loader 全换 cp.async，无 TMA/async proxy）。
+  - 价值：无 TMA 硬件（sm_80/89）的 cute 家族 D 维全覆盖（小 D persist-D / 中 D split-D M8N1 / 大 D M4N2）；与 PC-12 同路线，PC-12 的 cp.async 多级流水线经验直接复用。
+  - 触发条件：出现真实 sm_80/89 fp16 部署需求，或 PC-12 达标后随 fp8/sm_89 路线一并补齐。
 
 **轨道 P（性能优化）**
 
@@ -161,6 +167,10 @@
 - [ ] PC-8：fp8 split-D M4N2 量化大 D kernel 性能优化
 - [ ] PC-9：fp4 split-D (M8N1) 量化大 D kernel 性能优化
 - [ ] PC-10：fp4 split-D M4N2 量化大 D kernel 性能优化
+- [ ] PC-12：cute sm_80 fp16 性能优化（cp.async + 多级流水线，fp8/sm_89 路线前置，2026-09-02 立项）
+  - 背景：cute sm_80 路径（`cute/sm_80/split_d.cuh`，cp.async loader）此前从未做专项性能优化——2026-09-02 补验 attn-mask 时实测 vs CUTE_TMA 慢 7%（D=768）~28%（D=128），cp.async loader 开销与小 D 流水深度是主因。
+  - 战略意义（fp8/sm_89 路线的训练场）：**sm_89 不支持 TMA 与 async proxy，只有 cp.async general proxy**——fp8 sm_89 量化路径无法复用 sm_120 的 TMA + WS/non-WS 模式，只能走 **cp.async + 多级流水线**。该技术路线的全部经验（stage 深度/同步开销/barrier 协议/寄存器规划 under cp.async）必须先在 cute sm_80 fp16 上打磨成熟，性能达标后才迁移到 cute/fp8/sm_89 实现 fp8 量化（即 sm_89 fp8 路线复活，解锁 PC-6）。
+  - 动作与验收：①NCU 基线（loader 停顿/s2r MIO/occupancy）；②stage 深度与 stage 组合扫描（现状 sm_120 上 cap 2/3，物理 smem 上限内探索）；③cp.async commit-group 分组与多级流水线重构；④`ffpa_attn.bench`（CUTE hint）vs CUTE_TMA gap 收敛到 ≤1.1x 作为"达标"准出（经验才值得迁移）；⑤达标后开 cute/fp8/sm_89 专项（量化链 + kernel 移植，届时与 FC-12 一并评估）。
 
 ## 实施路线图（基建优先，承上启下）
 
@@ -178,7 +188,7 @@
   FC-4 attn_bias（S/P 域注入基建）──► FC-5 dropout ⏸（暂不实施，复用注入点）
 阶段 3（F3 覆盖，按需推进，互相独立）
   FC-7 短 Nq/decode ⏸ ｜ FC-8 native pad ｜ FC-9 backward 评估 ⏸ ｜
-  FC-10 sm90/sm100 ⏸（FC-7/FC-9/FC-10 均暂不实施）
+  FC-10 sm90/sm100 ⏸ ｜ FC-12 cute sm_80 persist-D/M4N2 ⏸（FC-7/FC-9/FC-10/FC-12 均暂不实施）
 阶段 4（轨道 P）
   PC-0 attn mask 场景性能优化（P0：attn-mask 是当前量化路径最大退化点）
         ├─► PC-0-0 cute/cute_tma（fp16 家族，方案 A 热身台阶）
@@ -190,12 +200,14 @@
   PC-3 配置自适应 ｜ PC-4 fp4 persist-D kernel 内部（与上并行，互不依赖）
   PC-7 → PC-8 → PC-9 → PC-10 量化大 D kernel（优化复杂，严格逐个推进：
         fp8 split-D → fp8 M4N2 → fp4 split-D → fp4 M4N2，上一项验收后再启动下一项）
-  PC-6 sm_89 int4 QK ⏸（暂不实施，低优搁置，不入执行序列；前置 = sm_89 fp8 路线复活）
+  PC-12 cute sm_80 fp16（cp.async + 多级流水线）──达标──► cute/fp8/sm_89 量化实现
+        （sm_89 无 TMA/async proxy，fp8 只能走 cp.async 路线；复活后解锁 PC-6）
+  PC-6 sm_89 int4 QK ⏸（暂不实施，低优搁置，不入执行序列；前置 = PC-12 达标）
 ```
 
 > ⏸ = **暂不实施，仅保留设计稿**：不入执行序列、不排期；未来大概率不做，
-> 仅当出现真实需求时重新评估。当前共 6 项：FC-5 / FC-7 / FC-9 / FC-10 /
-> PC-5 / PC-6。（FC-7 搁置理由：短 Nq/decode 量化基本没有收益——固定前处理
+> 仅当出现真实需求时重新评估。当前共 7 项：FC-5 / FC-7 / FC-9 / FC-10 /
+> FC-12 / PC-5 / PC-6。（FC-7 搁置理由：短 Nq/decode 量化基本没有收益——固定前处理
 > 链开销结构性占优，小 Nq 下量化 kernel 的吞吐优势摊不开，且 decode 已由
 > native split-KV fp16 路径覆盖。）
 
