@@ -52,7 +52,7 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_sm120(
     long long attn_bias_stride_m = 0, long long attn_bias_stride_n = 0,
     float dropout_p = 0.0f, unsigned long long philox_seed = 0,
     unsigned long long philox_offset = 0, bool nhd_out = false,
-    long long attn_bias_plane_m_total = 0) {
+    long long attn_bias_plane_m_total = 0, int dropout_bitmap_on = 0) {
   // Body-level arch guard: TMA/stmatrix need sm>=90, but in mixed -gencode
   // builds the sm_89 device pass still compiles this TU; the guard compiles
   // the body into a no-op stub there. Body-level (not file-level) is required
@@ -146,6 +146,21 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_sm120(
   static_assert(kBiasQSegs >= 1 && kBiasBoxRows >= 1);
   uint16_t* bias_extra =
       reinterpret_cast<uint16_t*>(v_base + kStagesV * kKVTileElements);
+  // PC-14 dropout keep-bitmap: [kBr, kBc] bits per stage, two stages past
+  // the bias extra area. The 256 consumer threads generate it one tile
+  // ahead (half-row per thread) at the top of each kv iteration — inside
+  // the K/V TMA wait window, off the softmax->PV critical path — and apply
+  // it right after softmax as register bit-tests. Cross-warp visibility
+  // and the apply-vs-regen ordering ride one NamedBarrier per tile.
+  constexpr int kBiasExtraU16 =
+      (kBiasMode == 1 && kBiasSegs > kBiasQSegs)
+          ? (kBiasSegs - kBiasQSegs) * kBiasBoxRows * kBiasColsU16
+          : 0;
+  constexpr int kBitmapU32PerStage = kBr * kBc / 32;
+  static_assert(!kHasDropout || kBc % 64 == 0,
+                "half-row bitmap generation needs kBc >= 64");
+  uint32_t* bitmap_base =
+      reinterpret_cast<uint32_t*>(bias_extra + kBiasExtraU16);
 
   if (tid == 0) {
     TmaBarrier::init(&q_full, 1);
@@ -171,8 +186,10 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_sm120(
   // P0 loads Q once; P1 prefetches K/V[0..S-2]; P2 prefetches ahead by S-1
   // tiles (V-first then K-after) so consumer's K/V waits never stall.
   if (is_producer) {
-    // Release registers to the CTA pool so the two consumer warpgroups can
-    // alloc up to 232 regs/thread.
+    // Release registers to the CTA pool so the consumer warpgroups can
+    // alloc up to 232 regs/thread. The producer stays a thin TMA-only
+    // issuer (PC-14: bitmap Philox generation lives on the consumer side —
+    // concentrating it on 4 of 12 warps made it the machine bottleneck).
     cutlass::arch::warpgroup_reg_dealloc<32>();  // sm_120f
     if (wg_tid == 0) {
       auto mQ = [&] {
@@ -414,6 +431,10 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_sm120(
 
   // Consumer path (wg_tid 0..255): wait Q, release K/V slots, then the full
   // QK->softmax->PV loop. No TMA issue here; no __syncthreads (single WG).
+  // Historical FA-3/4-style split (dec 32 / inc 232), measured best; the
+  // inc ceiling never binds codegen under launch_bounds(384,1) — it is CTA
+  // pool bookkeeping only (deadlock needs the static allocation to drop
+  // below 166; all instantiations compile at the 168 cap).
   cutlass::arch::warpgroup_reg_alloc<232>();  // sm_120f
 
   TmaBarrier::wait(&q_full, 0);
@@ -495,12 +516,32 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_sm120(
     CtaBarrier::arrive(&q_consumed);
   }
 
+  // PC-14 dropout bitmap: stage(0) into buffer 0, then the per-tile
+  // generate-ahead protocol (see the kv loop).
+  const bool bitmap_on = kHasDropout && dropout_bitmap_on != 0;
+  const unsigned long long dropout_head_base =
+      (static_cast<unsigned long long>(Nb_id) * Nh + Nh_id) * Nq;
+  if (bitmap_on && Tc_eff > 0) {
+    ffpa_cute::generate_dropout_bitmap_halfrow<kBc>(
+        bitmap_base, wg_tid >> 1, wg_tid & 1, Br_base + (wg_tid >> 1), 0,
+        dropout_p, philox_seed, philox_offset, dropout_head_base, Nkv);
+    cutlass::arch::NamedBarrier::sync(kConsumerThreads, 0);
+  }
+
 #pragma unroll 1
   for (int kv_tile = 0; kv_tile < Tc_eff; ++kv_tile) {
     const int k_stg = kv_tile % kStagesK;
     const int k_phase = (kv_tile / kStagesK) & 1;
     const int v_stg = kv_tile % kStagesV;
     const int v_phase = (kv_tile / kStagesV) & 1;
+
+    // Bitmap for the next tile: issued before the K wait so it fills the
+    // TMA-latency window instead of the softmax->PV critical path.
+    if (bitmap_on && kv_tile + 1 < Tc_eff)
+      ffpa_cute::generate_dropout_bitmap_halfrow<kBc>(
+          bitmap_base + ((kv_tile + 1) & 1) * kBitmapU32PerStage, wg_tid >> 1,
+          wg_tid & 1, Br_base + (wg_tid >> 1), kv_tile + 1, dropout_p,
+          philox_seed, philox_offset, dropout_head_base, Nkv);
 
     // QK GEMM: gemm_rs with the loop-invariant Q A-fragment in regs,
     // full-D Q × full-D K (K-only smem loads).
@@ -604,10 +645,20 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_sm120(
     const bool need_rescale = __any_sync(0xffffffff, local_need_rescale);
 
     if constexpr (kHasDropout) {
-      ffpa_cute::apply_dropout_rowcol<decltype(scores), decltype(tScS_rc),
-                                      kORows, kSCols>(
-          scores, tScS_rc, dropout_p, philox_seed, philox_offset, Nb_id, Nh,
-          Nh_id, Nq, Nkv, Br_base, kv_tile, kBc);
+      if (dropout_bitmap_on) {
+        ffpa_cute::apply_dropout_bitmap_rowcol<
+            decltype(scores), decltype(tScS_rc), kSRows, kSCols, kBc>(
+            scores, tScS_rc, bitmap_base + (kv_tile & 1) * kBitmapU32PerStage,
+            1.0f / (1.0f - dropout_p));
+        // Orders this tile's bitmap reads against the next iteration's
+        // regen of the same (ping-pong) buffer by any other warp.
+        cutlass::arch::NamedBarrier::sync(kConsumerThreads, 0);
+      } else {
+        ffpa_cute::apply_dropout_rowcol<decltype(scores), decltype(tScS_rc),
+                                        kORows, kSCols>(
+            scores, tScS_rc, dropout_p, philox_seed, philox_offset, Nb_id, Nh,
+            Nh_id, Nq, Nkv, Br_base, kv_tile, kBc);
+      }
     }
 
     // Rescale O accumulator
