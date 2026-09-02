@@ -104,7 +104,7 @@
 | PC-11 | warp 级 `__any_sync` lazy-rescale 统一治理（精度治理专项） | P | ⬜ 待开始 | 已与 PC-0-5 解耦可独立推进（vote 非本次 race 根因——force-rescale 实证；治理价值在消除 warp-uniform 分支的调度脆弱性） |
 | PC-12 | cute sm_80 fp16 性能优化（cp.async + 多级流水线，fp8/sm_89 路线前置） | P | ⬜ 待开始 | —；被 PC-6 依赖 |
 | PC-13 | fp8/fp4 hybrid 路径性能优化（双 attn kernel → 融合 kernel） | P | ⬜ 待开始 | —（与 PC-7~10 协同） |
-| PC-14 | fp16 dropout 路径性能优化（RNG bitmap 预计算 + producer/consumer 重排） | P | ⬜ 待开始 | PC-0 同构（bias tile 协议复用）；FC-5 是量化路径功能项（⏸），与本项无重叠 |
+| PC-14 | fp16 dropout 路径性能优化（RNG bitmap 预计算 + producer/consumer 重排） | P | 🚧 persist_d 完成（consumer 侧双缓冲 bitmap：D=64 1.02x / D=128 2.25x，bitwise 15/15 + 全 task 无回归；producer 方案证伪；RNG 指令地板结论见 SKILL §11.16——契约下上限约 1.2x）；split_d/m4n2/sm_80 待做 | PC-0 同构（bias tile 协议复用）；FC-5 是量化路径功能项（⏸），与本项无重叠 |
 
 > 未收录项：分卡基准标注（文档规范，随下次 bench 执行）。（原列于此的 cache-dit `_keep_or_pack` 物化兜底移除已于 2026-08-28 完成，cache-dit@4b5c977：三 tensor 直传零拷贝，契约外布局由 C++ layout gate 显式报错。）
 
@@ -207,6 +207,8 @@
   - 思路（与 PC-0 attn bias tile 同构）：producer warp（128T，目前仅发 TMA 基本空闲）预计算下一 KV tile 的 `[kBr,kBc]` dropout keep bitmap（1 bit/elem）写入 smem 预取窗口——复用 bias tile 已验证的 Q 区/extra 段布局与 `bias_full/empty` mbarrier 协议；consumer 只查 bitmap + 乘 keep_scale。Philox 生成侧按 4 连续列块对齐（一次 philox4x32_10 出 4 个决策），消除 lane0==3 的重算分支。
   - 进阶（评估项）：drop 的 keep_scale 因子后置到 P 域/row_scale 折叠（online softmax 已有 rescale 乘法链，drop=置 0 可与 rescale 合并乘法）。
   - 动作与验收：①NCU 基线（dropout 段指令占比/串行链停顿）；②producer bitmap 原型（先 persist_d 家族）；③`ffpa_attn.bench` dropout task ≥1.0x SDPA（D=64/128 全 dtype）；④**bitwise RNG 语义不变**（philox offset = `philox_offset + row*Nkv + col` 的决策序列与现状一致，保证与 torch 训练对齐；parity 注意 torch 参考 2^32 offset wrap bug 标注）。
+  - 进展（2026-09-02，persist_d 家族完成）：producer 预计算方案**已证伪**（philox 集中在 4/12 warps = 3× 指令浓缩成机器瓶颈，15.6ms；且 producer 提寄存器预算在 32/64/96 全档 spill）。落地形态为 **consumer 侧双缓冲 smem bitmap**：256 consumer threads 在 kv 迭代顶部（TMA wait 窗口，脱离 softmax→PV 关键路径）按 offset-quad 预生成下一 tile 的 keep bitmap（1 philox/4 元素，旧 inline 为 1/2，philox 总量减半），softmax 后以寄存器 bit-test 应用，每 tile 一次 NamedBarrier(256)；producer 回归薄 TMA issuer（setmaxnreg 维持 32/232 不动）。验收：D=64 0.82x→**1.02x**、D=128 **2.25x**，15/15 bitwise A/B + 全 task 矩阵无回归。
+  - **理论结论（详见 SKILL §11.16）**：bit-exact Philox 契约存在指令地板（每 4 决策约 150 条线程指令 → PRO 5000 上 N=16384 约 20ms / N=8192 约 5.1ms，实测已贴地板）；加速比上限 $= (T_{\text{self}} + \Delta_{\text{SDPA}}) / (T_{\text{self}} + \text{floor})$，契约不变时结构上到不了 2x（完美实现约 1.2x），与 attn_bias 的 2.1x+ 量级差源于 bias 是 memory-bound 数据问题而 dropout 是 ALU-bound 计算问题。要突破上限只能换非 bit-exact 的便宜 RNG（产品决策）。
 
 ## 实施路线图（基建优先，承上启下）
 

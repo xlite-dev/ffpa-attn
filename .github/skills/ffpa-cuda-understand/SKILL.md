@@ -982,3 +982,26 @@ $$O=\big[\,O_{[0:n)}^{(\text{fp16 kernel})};\ \ O_{[n:N)}^{(\text{fp8/fp4 kernel
 | lse | f32 $\ln$ 域 | f32 | f32（+ $\text{scale}\cdot q\bar k$ 修正当 smooth_k） | f32 复合式（§11.10） |
 
 通用注记：softmax 的 $m/L$ 与 rescale 恒 fp32（全路径）；所有 scale 折叠点（§11.6/§11.10）都是精确代数，表内低精度域只引入 §11.5 的量化噪声。
+
+### 11.16 dropout 的 RNG 指令地板与加速比上限（PC-14）
+
+为什么 dropout 的加速比（~1.0-1.1x）永远到不了 attn_bias 的量级（2.1x+）——把两 task 相对 self-attn 的增量拆开（PRO 5000，N=16384，D=64，fp16）：
+
+| task | FFPA 增量 | SDPA 增量 | 增量比 |
+|---|---|---|---|
+| attn-mask | 1.76 ms | 14.84 ms | 8.4x |
+| dropout | 18.95 ms | 21.20 ms | 1.12x |
+
+加速比 $= (T_{\text{self}} + \Delta_{\text{SDPA}}) / (T_{\text{self}} + \Delta_{\text{FFPA}})$，attn-mask 赢在增量比；dropout 两边被同一地板托底。根本区别：**attn_bias 是数据问题（memory-bound），dropout 是计算问题（ALU-bound）**——bias 每元素 = 1 条 FMA（FP32 管道空闲期）+ 可去重的 HBM 流量（broadcast mask 只读一次），TFLOPS 保持 85%；dropout 没有输入数据， $N^2 \cdot H$ 个决策必须现场合成，与 MMA 争同一份发射带宽，TFLOPS 掉到 34%。
+
+**RNG 契约锁死指令下限**。bit-exact 契约为 $\text{keep}(e) = [\,u(\text{philox}(\text{seed}, e \gg 2)[e \bmod 4]) > p\,]$ ，每次 philox4x32-10 约 120 条整数指令产 4 个决策。以 N=16384、H=32 计：
+
+$$\text{warp 指令总量} \approx 8.6\text{G 决策} \times \frac{120 + 30}{4 \times 32} \approx 10\text{G}$$
+
+PRO 5000 发射带宽约 $74 \times 4 \times 1.7\text{GHz} \approx 503\text{G}$ warp-instr/s，故 RNG 地板约 20 ms（N=8192 时约 5.1 ms）。实测 PC-14 优化后增量 5.15 ms @N8192 / 18.95 ms @N16384——**已贴合地板**（bitmap 化把 philox 调用从每 2 元素一次降到每 4 元素一次后，恰好落在 quad 摊销的理论下限）。
+
+**加速比上限**（ $T_{\text{self}} = 10$ ms， $\Delta_{\text{SDPA}} = 21$ ms）：
+
+$$\text{speedup}_{\max} = \frac{10 + 21}{10 + \text{floor}} \approx 1.08x\ (\text{floor}=20) \ ;\ 1.2x\ (\text{floor}=16)\ ;\ 3.1x\ (\text{floor}=0)$$
+
+即 bit-exact 契约下无论怎么优化都到不了 2x；要 2x 只能放弃 bit-exact 换便宜 RNG（xorwow/PCG 约 30-40 instr/4 决策，地板降到约 5 ms，可达 1.5-1.9x），代价是与 PyTorch dropout 的 RNG 序列不再一致（产品决策）。缓存预生成 RNG 不可行： philox offset 每次 forward 递增，决策序列不复用。
