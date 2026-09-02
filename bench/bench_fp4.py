@@ -73,7 +73,9 @@ BACKEND_COLORS = {
 
 
 @lru_cache(maxsize=None)
-def fp4_backend(hybrid: bool = False, hybrid_n_early: int = 256):
+def fp4_backend(
+  hybrid: bool = False, hybrid_n_early: int = 256, stages: int = None
+):
   return CUDABackend(
     backward=False,
     enable_tma=True,
@@ -81,11 +83,12 @@ def fp4_backend(hybrid: bool = False, hybrid_n_early: int = 256):
     enable_fp4=True,
     fp4_hybrid=hybrid,
     fp4_hybrid_n_early=hybrid_n_early,
+    stages=stages,
   )
 
 
 @lru_cache(maxsize=None)
-def fp8_backend() -> CUDABackend:
+def fp8_backend(stages: int = None) -> CUDABackend:
   return CUDABackend(
     backward=False,
     enable_tma=True,
@@ -97,6 +100,7 @@ def fp8_backend() -> CUDABackend:
     fp8_k_quant_method="per_thread",
     fp8_v_quant_method="per_channel",
     fp8_hybrid=False,
+    stages=stages,
   )
 
 
@@ -160,25 +164,27 @@ def _mk(B, Hq, Hkv, Nq, Nkv, D, dtype, scale):
   return q, k, v
 
 
-def run_ffpa(q, k, v, causal, gqa, hybrid=False, hybrid_n_early=256):
+def run_ffpa(
+  q, k, v, causal, gqa, hybrid=False, hybrid_n_early=256, stages=None
+):
   return ffpa_attn_func(
     q,
     k,
     v,
     is_causal=causal,
     enable_gqa=gqa,
-    forward_backend=fp4_backend(hybrid, hybrid_n_early),
+    forward_backend=fp4_backend(hybrid, hybrid_n_early, stages),
   )
 
 
-def run_ffpa8(q, k, v, causal, gqa):
+def run_ffpa8(q, k, v, causal, gqa, stages=None):
   return ffpa_attn_func(
     q,
     k,
     v,
     is_causal=causal,
     enable_gqa=gqa,
-    forward_backend=fp8_backend(),
+    forward_backend=fp8_backend(stages),
   )
 
 
@@ -246,16 +252,20 @@ def run_scenario(
   sdpa_name,
   base_n,
   hybrid=False,
-  hybrid_n_early=256
+  hybrid_n_early=256,
+  stages=None
 ):
   q, k, v = _mk(sc.B, sc.Hq, sc.Hkv, sc.Nq, sc.Nkv, sc.D, dtype, scale)
   ref = ref_bf16(q, k, v, sc.causal, sc.gqa, sdpa_name).to(dtype)
   sdpa_label = f"SDPA-{sdpa_name.upper()}"
 
   outs = {
-    "FFPA-FP4": run_ffpa(q, k, v, sc.causal, sc.gqa, hybrid, hybrid_n_early),
-    "FFPA-FP8": run_ffpa8(q, k, v, sc.causal, sc.gqa),
-    sdpa_label: run_sdpa(q, k, v, sc.causal, sc.gqa, sdpa_name),
+    "FFPA-FP4":
+    run_ffpa(q, k, v, sc.causal, sc.gqa, hybrid, hybrid_n_early, stages),
+    "FFPA-FP8":
+    run_ffpa8(q, k, v, sc.causal, sc.gqa, stages),
+    sdpa_label:
+    run_sdpa(q, k, v, sc.causal, sc.gqa, sdpa_name),
   }
   if use_sage3:
     outs["Sage3"] = run_sage3(q, k, v, sc.causal, sc.gqa)
@@ -276,9 +286,10 @@ def run_scenario(
   torch.cuda.synchronize()
   fns = {
     "FFPA-FP4":
-    lambda: run_ffpa(q, k, v, sc.causal, sc.gqa, hybrid, hybrid_n_early),
+    lambda:
+    run_ffpa(q, k, v, sc.causal, sc.gqa, hybrid, hybrid_n_early, stages),
     "FFPA-FP8":
-    lambda: run_ffpa8(q, k, v, sc.causal, sc.gqa),
+    lambda: run_ffpa8(q, k, v, sc.causal, sc.gqa, stages),
   }
   if use_sage3 and not sc.gqa:
     fns["Sage3"] = lambda: run_sage3(q, k, v, sc.causal, sc.gqa)
@@ -572,6 +583,12 @@ def parse_args():
     action="store_true",
     help="Skip cross-dense (Nkv=2Nq) scenario"
   )
+  p.add_argument(
+    "--stages",
+    type=int,
+    default=None,
+    help="Number of stages for FFPA pipeline",
+  )
   return p.parse_args()
 
 
@@ -603,7 +620,8 @@ def main():
           args.sdpa_backend,
           base_n=n,
           hybrid=args.hybrid,
-          hybrid_n_early=args.fp4_hybrid_n_early
+          hybrid_n_early=args.fp4_hybrid_n_early,
+          stages=args.stages
         )
       )
 
