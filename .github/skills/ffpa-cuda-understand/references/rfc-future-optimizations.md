@@ -12,6 +12,30 @@
 - 2. 每做完一项：勾选对应条目（`- [ ]` → `- [x]`），并同步更新上方总览表状态列。注意，要同时更新[SKILL.md](../SKILL.md) 中的技术报告和本文档的总览表状态列，确保两处状态一致。
 - 3. **验收必须落实到 `ffpa_attn.bench` CLI**：`python -m ffpa_attn.bench` 全链路（`--fwd-backend cuda --cuda-impl <impl> --tasks <相关task>`）跑通并通过 parity。`tests/` 与临时脚本仅是开发阶段验证，**不能替代 CLI 验收**；若该项能力影响 bench task 集合（新增/排除 task），须同步放开/过滤 bench CLI 的 task 并在 CLI 输出中可见。
 
+## 0. 功能全景对比：ffpa fp8/fp4 vs SageAttention-2/3（sm_120）
+
+> 2026-09-02 依据本地源码核对（SageAttention `sageattention/core.py`、`sageattention3_blackwell/sageattn3/api.py` + `blackwell/static_switch.h`；ffpa `ffpa_api.cc`）。sage3 在 sm_120 可用（warp 级 `mma.sync kind::mxf4nvf4`，无 TMEM/tcgen05 依赖）。
+> 总括：**ffpa 接口对齐 SDPA（除 dropout），场景/维度覆盖为 sage-2/3 的超集**；sage 系列以场景收窄换 kernel 极简与峰值吞吐。
+
+| 能力 | ffpa fp8 | ffpa fp4 | SageAttention-2 | SageAttention-3 |
+|---|---|---|---|---|
+| self / cross-attn | ✓ | ✓ | ✓ | ✓ |
+| causal | ✓ | ✓ | ✓ | ✓ |
+| GQA | ✓ | ✓ | ✓（Hq 需被 Hkv 整除） | **✗**（无任何 Hq≠Hkv 处理） |
+| attn_mask（bias 注入） | ✓ 全族（FC-4 + PC-0 tile 化；rowvec/dense/折叠 6 形态） | ✓（同左；m4n2 已知 race 见 PC-0-5，影响受控） | **✗**（cuda kernel 无注入） | **✗**（签名有 `attn_mask` 但函数体完全忽略——伪参数，传入即静默丢 mask） |
+| dropout | ✗（量化族不支持；fp16/native ✓） | ✗ | ✗ | ✗ |
+| return_lse | ✓ | ✓ | ✓ | ✗ |
+| head_dim | **64-1024 任意 D%8==0**（kernel 内零物化 pad 到 64 倍数实例） | 同左（pad 后 ∈[64,1024]） | **≤128**（<64 pad 64；(64,128) pad 128；>128 raise） | **仅 64/128**（`HEADDIM_SWITCH` 有 64/128/256 实例，但入口 `D≥256` fallback SDPA、非 64/128 倍数无处理） |
+| 输入布局 | BHND packed / strided fused-QKV / NHD O 写**全零拷贝**（FC-1/2/3） | 同左 | HND/NHD 双布局（要求 `stride(-1)==1`） | 仅 HND 4D |
+| QK 精度 | **FP8 或 INT8**（`fp8_qk_mm_type`）+ per-block/per-thread 量化粒度 | NVFP4（1×16 + E4M3 SF） | INT8 per_warp/per_thread（**sm_120 仅 per_warp**——per_thread 是 triton 路径，sm120 不可用；论文 int4 QK 未开源） | NVFP4 固定 |
+| PV 精度 | FP8 E4M3，累加器 FP16/FP32 可选 | NVFP4（或 MXFP8 PV） | FP8 E4M3（acc `fp32+fp16`/`fp32+fp32`）或 FP16 PV | NVFP4 固定 |
+| smoothing / 数值 knobs | smooth_k / smooth_v / hadamard 独立开关 | smooth_v / hadamard | smooth_k 内置 + smooth_v 可选 | K 减均值 + Q per-block 均值（`per_block_mean`），无其它 knob |
+| hybrid（前缀 fp16 + 量化主体，causal 短行精度） | ✓（fp8/fp4_hybrid） | ✓ | ✗ | ✗ |
+| backward | ✗（FC-9 设计稿） | ✗ | ✗（SageBwd 论文有、未开源） | ✗ |
+| seq len 约束 | 任意（non-aligned task 覆盖 Nkv 非对齐） | 同左 | 任意 | N pad 至 128 倍数（preprocess 内） |
+
+> 读法：sage-2/3 用"场景子集 + 固定量化配方"换 kernel 简洁与峰值 TOPS（sage3 论文 1038 TOPS @RTX5090）；ffpa 走 SDPA 全接口兼容路线——attn_mask/GQA/任意 %8 headdim/布局零拷贝/hybrid 均为量化路径保留，代价是 kernel 家族多（persist_d/split_d/m4n2 × fp8/fp4）与 knobs 维护面。下游（diffusers/cache-dit）替换 SDPA 时 ffpa 可直接物化，sage 需要接口降级或 fallback 混跑。
+
 ## 优先级框架
 
 两大轨道，**轨道 F 整体优先于轨道 P**；轨道内按依赖与投入产出排序：
