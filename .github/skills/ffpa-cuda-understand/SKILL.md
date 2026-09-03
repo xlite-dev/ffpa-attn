@@ -434,14 +434,14 @@ lse 公式（NVFP4 PV）：`lse = (m*L + log2(row_sum) + log2(1/2688))*ln2 + sca
 |---|---|---|
 | Python 层归一化（`normalize_attn_mask`） | — | bool mask → additive（True 参与注意 / False→-inf，SDPA 语义）；2D→`[1,1,Nq,Nkv]`、3D→`[B,1,Nq,Nkv]` view；要求最内维连续（否则 contiguous）；dtype ∈ {bool, fp32, Q.dtype} |
 | 全局互斥 | — | `attn_mask` + `is_causal` 任何 backend 均拒绝 |
-| Native sm80 / sm120 TMA | ✓ | 4D 广播 `[B\|1, H\|1, Nq\|1, Nkv\|1]`；fp16/bf16/fp32；广播维 stride 置 0；dtype code 1/2/3 |
+| Native sm80 / sm120 TMA | ✓ | 4D 广播 `[B\|1, H\|1, Nq\|1, Nkv\|1]`；fp16/bf16/fp32；广播维 stride 置 0；dtype code 1/2/3；bias IO 已 rowvec 内联向量化（PC-0-2：门控 `(stride_m==0 \|\| Nq==1) && stride_n==1 && 对齐` 时 `half2`/`float2` 对加载服务 4 个 fragment 槽，消 16x load 冗余，验收 tma D512 2.00x / native 1.89x；不满足门控自动回落标量路径；`FFPA_BIAS_ROWVEC_DISABLE=1` 强制回落做 A/B） |
 | CUTE fp16（persist/split/M4N2/sm80） | ✓（编译期 4 变体） | bias IO 已 smem tile 化（PC-0-0：TMA 预取 + mode 2 rowvec 双缓冲 / mode 3 全驻留；D=128 gap 1.12、D=768 1.07 达标，D=320 结构极限 1.44 → PC-0-3）；dispatch 默认仍回退 native TMA（除非 force_cute_tma） |
 | **CUTE FP8（全部三族）** | ✓（FC-4 + PC-0-1 tile） | raw-S 域注入 `bias/(qs*ks*scale_orig)`；`kHasAttnBias` 双实例 tag dispatch；仅拒 dropout；bias IO 已 smem tile 化（PC-0-1：persist_d mode 3 **1.84x**、split_d D=320 mode 2 1.20x / D≥512 demote mode 0（PC-0-4）、m4n2 occupancy 守卫 mode 2 1.03x） |
 | **CUTE FP4（全部三族）** | ✓（FC-4 + PC-0-1 tile） | dequant 域注入 `bias/scale_orig`，列 `kv_perm32(j)`；仅拒 dropout；bias IO 已 smem tile 化（PC-0-1：split_d mode 3 **1.67x**、m4n2 mode 3 1.04x）；⚠️ **m4n2 带 bias 存在先在时序竞争**（触发面 = bias 数据经 smem：mode 0 gmem 直读完全免疫，mode 2/3 smem 写均触发；跨模板切换非必要——同模板不同 bias 值也触发，PC-0-5 定性收尾 db76a1f + 2026-09-02 mode 矩阵收窄——协议补全 + xfail 用例 + `FFPA_BIAS_TILE_DISABLE` escape hatch；纯 bias 序列稳定，风险受控；fp8 全族、fp16 全族、fp4 split_d 实证干净） |
 | cutedsl backend | ✗ | `NotImplementedError`（无静默 fallback） |
 | Triton backend | ✓ | （非本报告范围，支持 additive mask 梯度） |
 
-**结论：attn_mask 的低精度路径已由 FC-4 解锁**（fp8/fp4 六族均支持，2026-08-28）；bias 注入 IO 已全家族 smem tile 化（PC-0-0 fp16 2026-08-31 / PC-0-1 fp8+fp4 2026-09-01，主力 mode 3 全驻留 + occupancy 守卫）；**正确性现状（PC-0-5 收敛）**：native / fp16 全族 / fp8 六族 / fp4 split_d / **fp4 persist_d（D=256/D=128 各 0/30 实测）** bias 路径全部干净，**唯一 PC-0-5 问题 = fp4 split_d_m4n2 + attn_bias**（bias 数据经 smem 的 mode 2/3，且 m4n2 独有的 P 跨 N-warp smem 通信 + 大 D 复现、split_d 免疫；触发为 O body bitwise 非确定 ~5e-3..3e-2，非错误值；纯 bias 序列稳定、mode 0 gmem 直读完全免疫、`FFPA_BIAS_TILE_DISABLE=1` 可作 escape hatch）——使用面窄，已收敛定性并搁置，根治待 NVIDIA 上报。**区分**：fp4 persist_d 另有一处独立低概率（3/30）epilogue race（非 PC-0-5，persist_d 无 mode 0 等价路径，需独立排查）；dropout 仍为 fp16 家族专属。
+**结论：attn_mask 的低精度路径已由 FC-4 解锁**（fp8/fp4 六族均支持，2026-08-28）；bias 注入 IO 已全家族优化（PC-0-0 fp16 cute smem tile 化 2026-08-31 / PC-0-1 fp8+fp4 smem tile 化 2026-09-01，主力 mode 3 全驻留 + occupancy 守卫 / PC-0-2 native rowvec 内联向量化 2026-09-03，残余为 load-latency 主导、预取受寄存器预算约束搁置）；**正确性现状（PC-0-5 收敛）**：native / fp16 全族 / fp8 六族 / fp4 split_d / **fp4 persist_d（D=256/D=128 各 0/30 实测）** bias 路径全部干净，**唯一 PC-0-5 问题 = fp4 split_d_m4n2 + attn_bias**（bias 数据经 smem 的 mode 2/3，且 m4n2 独有的 P 跨 N-warp smem 通信 + 大 D 复现、split_d 免疫；触发为 O body bitwise 非确定 ~5e-3..3e-2，非错误值；纯 bias 序列稳定、mode 0 gmem 直读完全免疫、`FFPA_BIAS_TILE_DISABLE=1` 可作 escape hatch）——使用面窄，已收敛定性并搁置，根治待 NVIDIA 上报。**区分**：fp4 persist_d 另有一处独立低概率（3/30）epilogue race（非 PC-0-5，persist_d 无 mode 0 等价路径，需独立排查）；dropout 仍为 fp16 家族专属。
 
 ### 7.2 dropout
 

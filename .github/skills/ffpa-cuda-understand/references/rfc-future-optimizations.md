@@ -83,11 +83,11 @@
 | FC-10 | sm90/sm100 量化覆盖 (**暂不实施，仅保留设计稿**) | F3 | ⬜ 待开始 | — |
 | FC-11 | native 路径 dropout 精度修复（bug，高优） | F3 | ✅ 已完成（ffpa-attn 542f774/e1fe363，根因=torch ref uint32 bug） | — |
 | FC-12 | cute sm_80 家族补齐 persist-D / split-D M4N2 (**暂不实施，仅保留设计稿**) | F3 | ⬜ 待开始 | 与 PC-12 同路线（sm_80 cp.async） |
-| PC-0 | attn mask 场景性能优化（bias tile IO 重构） | P | 🚧 2/4（**P 轨最高优先**） | FC-4 注入点 |
+| PC-0 | attn mask 场景性能优化（bias tile IO 重构） | P | 🚧 3/4（**P 轨最高优先**） | FC-4 注入点 |
 | PC-0-0 | ↳ cute/cute_tma 场景（fp16 cute 家族） | P | ✅ 完成（b4a811e + 7ffe765/1e4d9b6 迭代：bench CLI D=128 gap 1.12/89%、D=768 1.07/93% 双达标，原记录 0.99 系测量异常已修正；D=320 1.44/70% 结构极限未达 → **PC-0-3 专项**；2026-08-31 A0 补丁修复 mode 2/3 (b,h) 折叠缺陷 + sm_80 dense 平方 bug；2026-09-02 D=64 dense 拆段 TMA 补强：tile 超出 Q 复用区时按 Q 容量拆多段 TMA（前段 Q 区 + 尾段 extra 区，单 mbarrier expect_tx 总账），fp16 mask 1.34x vs gmem、fp32 超预算自动降级，见完成清单） | — |
 | PC-0-1 | ↳ fp8/fp4 场景（量化六族，原 PC-0 主体） | P | ✅ 完成（17ac22f A0 → 16eaea7/39c63ea/f42b12a/f12406f/b194bec/c2fc67d B1-B6 → 7d5ca4c C 阶段：mode 3 全驻留为主力，fp8 D=128 1.85x、fp4 D=320 1.67x、D=768 1.04x；fp8 split_d D≥512 demote mode 0 → **PC-0-4 专项**；先在 race → **PC-0-5**，见完成清单） | FC-4 注入点；PC-0-0 热身 |
 | PC-0-6 | ↳ D=768 split-d vs m4n2 A/B + 寄存器模型分析 | P | ✅ 完成（2026-09-02：fp4 split_d D=768 因 O staging 196608B>101376B smem 预算**物理不可行**，m4n2 是唯一可行 kernel；fp8 A/B 实证 m4n2 五场景全胜，attn-mask split_d 崩溃 3.15x 差距；寄存器实证量化路径 O regs/线程 split_d=D/2=384 重 spill vs m4n2=D/4=192 近零 spill，fp4 m4n2 有量化状态中等 spill 528-920B → 量化寄存器模型不等同 fp16，m4n2 在大 D 必需非可选） | — |
-| PC-0-2 | ↳ native/native_tma 场景 | P | ⬜ 待开始 | — |
+| PC-0-2 | ↳ native/native_tma 场景 | P | ✅ 完成（c645ac1：launcher 门控 rowvec 快路径——stride_m==0/Nq==1 + stride_n==1 + pair 对齐时半精度 `half2`/fp32 `float2` 对加载，1 次对加载服务 4 个 fragment 槽（原 2048 loads/warp/tile 冗余 16x）；NCU 定性指令数瓶颈（非带宽）；11/11 bitwise；验收 tma D512 2.00x / native D512 1.89x / native D128 1.67x（vs SDPA），N=16384 无退化；残余为 load-latency 主导，地址提升无增益，预取方案受 255 寄存器预算约束搁置，见完成清单） | — |
 | PC-0-3 | ↳ D=320 split_d 注入开销专项（PC-0-0 遗留） | P | ⬜ 待开始（杠杆①向量化已证伪 +2.7%，见完成清单） | PC-0-0 |
 | PC-0-4 | ↳ fp8 split_d D≥512 attn-mask tile 化专项（PC-0-1 B-3 遗留） | P3 | ⬜ 待开始（当前 D≥512 已 demote mode 0 保底，gap 停留 gmem 基线 1.48x，见完成清单） | PC-0-1 |
 | PC-0-5 | ↳ 量化家族先在时序竞争排查（PC-0-1 B-4/B-6 实证，bitwise 断言 flaky 根因） | P3 | 🚧 已收敛定性、专题搁置（fp4 split_d_m4n2 bias：触发面 = **bias 数据经 smem + P smem 通信（m4n2 独有）**——mode 矩阵：mode 0（gmem 直读，无 smem bias）**完全免疫** 0/6×3，mode 2/3（smem 写）均 6/6；C9b/C10 同模板 prelude 仍 6/6 → 跨模板切换非必要；**D 依赖实为 kernel 结构依赖**：D=768→m4n2、D=320→split_d（headdim 分发），m4n2 独有的 P 跨 N-warp smem staging（[kBr,kBc] 写回 + 各 N-warp 读回量化 + row max/sum 跨 N-warp 经 softmax exchange buffer 归约，split_d 无此路径）——D=320（split_d，无 P smem 通信）免疫、D=768（m4n2，有 P smem 通信）复现 → 触发与 **P smem 通信存在**强相关（叠加 m4n2 大 smem 60416B）；H1 布局同位叠加经 pad 扫描（256/1024/4096B 错开字节带仍 6/6）**证伪**；racecheck 0 hazard；bias 数值/写方式（TMA vs STS）/allocator 均排除 → 定性为 **m4n2 P smem 通信 × bias smem 写** 的时序敏感竞争，疑似 sm_120 TMA/L2/调度硬件/driver 层。无条件 barrier（A）修但慢 57%（spill 副产物）→ 拒绝。**已落地**：tail work `tma_store_wait` 协议补全（B，无回退）+ E1 清理 + xfail 用例 + `FFPA_BIAS_TILE_DISABLE`（mode 0 免疫，牺牲 attn-mask 收益）/`FFPA_BIAS_RESIDENT_DISABLE` A-B 开关。**影响面窄：仅 fp4 m4n2 bias 场景，使用人少 → 专题搁置**，根治待 NVIDIA 上报（最小复现器 `.tmp/pc5-race/m4n2_e5d.py`）或新思路；fp4 persist_d 3/30 独立排查（无 mode 0 等价路径）；**fp16/fp8/fp4 split_d 全路径干净**；**fp4 persist_d bias 实测干净**（D=256/D=128 各 0/30，`m4n2_persistd.py`，与结构分析一致：persist_d 无 m4n2 的 P 跨 N-warp smem staging，不满足 PC-0-5 触发组合）——persist_d 另有独立的 3/30 低概率 epilogue race（非 PC-0-5，先于 PC-0-1 存在，无 mode 0 等价路径，需独立排查） | PC-0-1；PC-11 解耦可独立推进 |
@@ -160,7 +160,11 @@
       | **attn-mask** | **50T / 130.96ms** | **159T / 41.52ms** | **3.15x（split_d 崩溃至 0.81x<SDPA）** |
     - **寄存器压力（cuobjdump -res-usage，D=768 sm_120f）**：fp8 split_d REG:255 + **STACK 1104-1944B**（重 spill）；fp8 m4n2 REG:255 + STACK 0-264B（几乎无 spill）；fp4 m4n2 REG:255 + STACK 528-920B（中等 spill）；fp16 split_d REG:196-254 + STACK ~1536B。
     - **结论（验证用户假设）**：m4n2 的 O regs/线程 = D/4（192），split_d = D/2（384）——**量化路径沿用 fp16 m4n2 的 kBr/kBc 几何收缩思路方向正确，但量化 kernel 的寄存器模型不等同 fp16**：①fp4 多了 SFQ/SFK/SFVt/DS 量化状态寄存器（fp4 m4n2 STACK 528-920B > fp16 m4n2 0-312B）；②attn-mask 场景 split_d 的 spill 与 bias smem 写叠加后**性能崩溃**（3.15x 差距），而 m4n2 把 spill 压到近零保持稳定。→ m4n2 在量化大 D 路径是**必需而非可选**，fp4 m4n2 的中等 spill 是后续 PC-10 的优化面。
-  - [ ] PC-0-2：native/native_tma 场景（标量 loader 路径，设计稿待补）
+  - [x] PC-0-2：native/native_tma 场景（标量 loader 路径）—— 2026-09-03 完成（c645ac1，四文件 +208/−21）：
+    - Phase 0 定性（NCU，PRO 5000，B=1 H32 N=4096 D=512/128，tma+native 各两配置）：bias 注入开销**指令数瓶颈而非带宽瓶颈**——bias 路径指令 +1.39G（+22%）、L1 hit 98.4%、sectors/request 1.0、long_scoreboard 仅 +0.64、mio_throttle 不变。标量路径每 warp 每 tile 2048 次 load 只覆盖 128 个独立值（per-lane 2x + 跨 lane 8x = 16x 冗余）。**决策树落分支①（指令开销主导）→ 内联向量化**，不引入独立预取协议（non-WS kernel 无 producer，问题在 load 条数不在单次延迟）。
+    - 实现（`prefill.cuh` + `launch.cuh` + 两个 `split_d.cuh`）：`load_attn_bias_pair`（half2/__nv_bfloat162/float2 三分支）+ `sync_apply_attn_bias_rowvec`（pair-base 提升、`k1 < Nkv` 尾部安全、消行界检查、单语句形式保 f32 FFMA 收缩与 f16-acc 表达式形态——禁止预乘 `inv_scale`，舍入不同）。门控：`(stride_m==0 || Nq==1) && stride_n==1 && ptr 对齐 && (b,h) plane stride 偶数`，`FFPA_BIAS_ROWVEC_DISABLE=1` 强制标量路径做 A/B；Nq==1 时行索引恒 0，padding 行读 row-0 值但被 O/LSE 写守卫丢弃。不满足门控（misaligned / dense 4D mask）自动回落原标量路径。
+    - 验收（全部 `python -m ffpa_attn.bench` CLI）：11/11 bitwise parity（tma+native，fp16/bf16 query × fp16/bf16/fp32 bias，odd-Nkv 尾 tile、misaligned 自动回落、Nq=1、tail Q rows、GQA、dense fallback）；四形状加速比（vs SDPA）tma D512 1.42→2.00x、native D512 1.89x、native D128 1.67x、tma D128 1.44x；N=16384 抽查无 L2 退化（tma mask 2.02x/self 2.30x，native 1.84x/2.00x）；全 task 套件两 impl 零回归。
+    - 残余与搁置：优化后 NCU 显示残余为 **load-latency 主导**（long_scoreboard 2.40 / wait stall），地址提升 v2 实测无增益（编译器已优化寻址）；预取/双缓冲是唯一剩余杠杆但与 255 寄存器预算冲突（spill 墙），内联约束下判为实际上限，搁置。f16-acc 分支（kMmaAccFloat32=0）已实例化但当前构建矩阵不可达（默认 QK/PV f32 acc），保留镜像标量路径表达式形态。复验：`.tmp/pc02-native-mask/`（parity.py + 5 ncu-rep + bench 输出）。
   - [ ] PC-0-3：D=320 split_d attn-mask 注入开销专项（PC-0-0 遗留，目标 gap 1.44→≤1.2x）
     - 现状（2026-08-31，N=16384 B1 H32，self 57.4ms/191T）：attn-mask 83.5ms/132T，gap 1.44、TFLOPS 70%；迭代路径 mode0 gmem 2.21 → 单缓冲 tile 1.51 → rowvec 双缓冲 1.48 → mode 3 全驻留 1.44；dense 全量 1.59
     - NCU 定性（三轮）：SM 吞吐 71.4%→47.6%（memory 42.8%/occupancy 16.67% 不变）；bias 同步开销已消除（mode 3 后 short_scoreboard 1.47→1.21、bias barrier 全无）；sleeping 1.7 = tid==0 producer 在 qk/v empty-wait 空转（注入拉长 consumer 每 tile → K/V 流水变浅）。**剩余 gap 本质 = 注入计算本身进入 critical path**（1 CTA/SM × 8 warps，无并行 warp 掩盖）
@@ -233,7 +237,7 @@
   PC-0 attn mask 场景性能优化（P0：attn-mask 是当前量化路径最大退化点）
         ├─► PC-0-0 cute/cute_tma（fp16 家族，方案 A 热身台阶）
         ├─► PC-0-1 fp8/fp4（量化六族，主体）
-        └─► PC-0-2 native/native_tma（设计稿待补，NCU 复核后再排期）
+        └─► PC-0-2 native/native_tma（✅ c645ac1，rowvec 内联向量化）
   PC-1 Mega Quantize Kernel（先做 cooperative 两阶段原型）
         ├─► 收编 PC-2（增量融合是其落地台阶）
         └─► 联动 PC-5 ⏸（暂不实施；launch 形态定型后才能定 graph 兼容方案）
@@ -1000,10 +1004,11 @@ tma+dropout 112ms 性能异常（见上"附带发现"，归属后续性能 RFC�
   原 PC-0 主体设计（下方 Motivation/Design/Files/Validation 均归属此子项），
   在 PC-0-0 基建上叠加 raw-S 域注入、perm32 列置换、inv_sd 折叠三个量化特化。
 - **PC-0-2：native/native_tma 场景**（`prefill.cuh` 标量 loader
-  `load_attn_bias_value`，R_S fragment + broadcast-stride 语义）——native 侧
-  与 cute 的 TMA/smem 基建不同，且 bias 坐标来自 R_S fragment 语义，不能直接
-  搬方案 A；候选方向（向量化 direct load / cp.async 预载 / smem tile 化）
-  设计稿待补，动手前先 NCU 复核退化量级再定投入。
+  `load_attn_bias_value`，R_S fragment + broadcast-stride 语义）——已完成
+  （c645ac1）：NCU 复核确认退化是**指令数瓶颈**（非带宽），故选内联向量化
+  而非 tile 化——rowvec 门控（stride_m==0/Nq==1 + stride_n==1 + 对齐）下
+  `half2`/`float2` 对加载服务全部 4 个 fragment 槽，消除 16x load 冗余；
+  残余为 load-latency 主导（预取受寄存器预算约束搁置），见完成清单。
 
 #### Motivation
 
