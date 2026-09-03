@@ -27,7 +27,7 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1) split_d_fwd_cute_sm80(
     long long attn_bias_stride_m = 0, long long attn_bias_stride_n = 0,
     float dropout_p = 0.0f, unsigned long long philox_seed = 0,
     unsigned long long philox_offset = 0, int attn_bias_tile_mode = 0,
-    long long attn_bias_plane_m_total = 0) {
+    long long attn_bias_plane_m_total = 0, int dropout_bitmap_on = 0) {
   using namespace cute;
   using Element = typename Traits::Element;
   using SmemLayoutQ = typename Traits::SmemLayoutQ;
@@ -85,6 +85,21 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1) split_d_fwd_cute_sm80(
   uint16_t* bias_base = reinterpret_cast<uint16_t*>(
       reinterpret_cast<char*>(v_base) +
       kStagesPV * kVChunkElements * sizeof(Element));
+  // PC-14 dropout keep-bitmap: [kBr,kBc] bits x2 stages past the bias
+  // area (launcher budgets both). Same half-row scheme as the sm120
+  // split_d (kBr=128/kBc=128/256 threads); the fully-synchronous cp.async
+  // loop already barriers around each phase, and the explicit sync after
+  // apply (below) plus the per-tile phase barriers order the ping-pong
+  // buffers' read and regen across iterations.
+  constexpr int kBitmapU32PerStage = kBr * kBc / 32;
+  static_assert(!kHasDropout || (kBc % 64 == 0 && kNumThreads == 2 * kBr),
+                "bitmap generation needs kBc%64==0 and 2 threads/row");
+  const int bias_area_u16 = (kHasAttnBias && attn_bias_tile_mode != 0)
+                                ? 2 * ((attn_bias_tile_mode == 1) ? kBr : 1) *
+                                      kBc * ((attn_bias_dtype == 3) ? 2 : 1)
+                                : 0;
+  uint32_t* bitmap_base =
+      reinterpret_cast<uint32_t*>(bias_base + bias_area_u16);
 
   // G2S TiledCopy: 256 threads, 128-bit cp.async.
   // Separate copies for QK (kQKDChunk-wide) and V (kVDChunk-wide) tiles.
@@ -298,6 +313,17 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1) split_d_fwd_cute_sm80(
     }
   }
 
+  // PC-14 dropout bitmap: stage(0) into buffer 0 before the kv loop.
+  const bool bitmap_on = kHasDropout && dropout_bitmap_on != 0;
+  const unsigned long long dropout_head_base =
+      (static_cast<unsigned long long>(Nb_id) * Nh + Nh_id) * Nq;
+  if (bitmap_on && Tc_eff > 0) {
+    ffpa_cute::generate_dropout_bitmap_halfrow<kBc>(
+        bitmap_base, tid >> 1, tid & 1, Br_base + (tid >> 1), 0, dropout_p,
+        philox_seed, philox_offset, dropout_head_base, Nkv);
+    __syncthreads();
+  }
+
 #pragma unroll 1
   for (int kv_tile = 0; kv_tile < Tc_eff; ++kv_tile) {
     // V prefetch for kv_tile > 0.
@@ -314,6 +340,14 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1) split_d_fwd_cute_sm80(
         __syncthreads();
       }
     }
+
+    // Bitmap for the next tile: before this tile's QK/softmax — the
+    // cp.async prefetches above are non-blocking, so the gen overlaps them.
+    if (bitmap_on && kv_tile + 1 < Tc_eff)
+      ffpa_cute::generate_dropout_bitmap_halfrow<kBc>(
+          bitmap_base + ((kv_tile + 1) & 1) * kBitmapU32PerStage, tid >> 1,
+          tid & 1, Br_base + (tid >> 1), kv_tile + 1, dropout_p, philox_seed,
+          philox_offset, dropout_head_base, Nkv);
 
     // Phase 1: QK GEMM with split-D accumulation.
     auto tCrS = partition_fragment_C(tiled_mma_qk, Shape<Int<kBr>, Int<kBc>>{});
@@ -480,10 +514,20 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1) split_d_fwd_cute_sm80(
 
       // Dropout on P (post-softmax, pre-PV).
       if constexpr (kHasDropout) {
-        ffpa_cute::apply_dropout_rowcol<decltype(scores), decltype(tScS_rc),
-                                        kORows, kSCols>(
-            scores, tScS_rc, dropout_p, philox_seed, philox_offset, Nb_id, Nh,
-            Nh_id, Nq, Nkv, Br_base, kv_tile, kBc);
+        if (dropout_bitmap_on) {
+          ffpa_cute::apply_dropout_bitmap_rowcol<
+              decltype(scores), decltype(tScS_rc), kSRows, kSCols, kBc>(
+              scores, tScS_rc, bitmap_base + (kv_tile & 1) * kBitmapU32PerStage,
+              1.0f / (1.0f - dropout_p));
+          // Orders this tile's bitmap reads against the next iteration's
+          // regen of the same (ping-pong) buffer by any other thread.
+          __syncthreads();
+        } else {
+          ffpa_cute::apply_dropout_rowcol<decltype(scores), decltype(tScS_rc),
+                                          kORows, kSCols>(
+              scores, tScS_rc, dropout_p, philox_seed, philox_offset, Nb_id, Nh,
+              Nh_id, Nq, Nkv, Br_base, kv_tile, kBc);
+        }
       }
 
       // P fragment: convert fp32 → Element, reinterpret as A-operand for PV.

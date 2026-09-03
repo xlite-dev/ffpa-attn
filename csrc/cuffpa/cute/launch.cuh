@@ -2903,8 +2903,20 @@ void launch_cute_fwd_split_d_sm80(torch::Tensor Q, torch::Tensor K,
   const int kBaseSmemBytes = kStagesQK * kSmemPerStage;
   if (kBaseSmemBytes + bias_plan.tile_bytes(kBr, kBc, 2) > max_smem_optin)
     bias_plan.mode = 0;
-  const int kSmemBytes =
-      kBaseSmemBytes + (int)bias_plan.tile_bytes(kBr, kBc, 2);
+  int kSmemBytes = kBaseSmemBytes + (int)bias_plan.tile_bytes(kBr, kBc, 2);
+  // PC-14 dropout bitmap: [kBr,kBc] keep-bits x2 stages past the bias area
+  // (same layout/gating as the sm120 split_d launcher; env escape per call).
+  bool dropout_bitmap_on =
+      has_dropout && getenv("FFPA_DROPOUT_BITMAP_DISABLE") == nullptr;
+  constexpr int kBitmapBytes = kBr * kBc / 8 * 2;
+  if (dropout_bitmap_on) {
+    const long long total = (((long long)kSmemBytes + 15) & ~15) + kBitmapBytes;
+    const long long base16 = ((long long)kSmemBytes + 15) & ~15;
+    if (total > max_smem_optin || 101376 / total < 101376 / base16)
+      dropout_bitmap_on = false;
+    else
+      kSmemBytes = (int)total;
+  }
 
   const dim3 block(kNumThreads, 1, 1);
   const dim3 grid(utils::div_ceil(Nq, kBr), Nb * Nh, 1);
@@ -2927,7 +2939,8 @@ void launch_cute_fwd_split_d_sm80(torch::Tensor Q, torch::Tensor K,
         Tc, causal, attn_bias_ptr, attn_bias_dtype, attn_bias_stride_b,
         attn_bias_stride_h, attn_bias_stride_m, attn_bias_stride_n, dropout_p_f,
         philox_seed_u, philox_offset_u, bias_plan.mode,
-        bias_plan.mode != 0 ? bias_plan.m_total : (long long)1);
+        bias_plan.mode != 0 ? bias_plan.m_total : (long long)1,
+        dropout_bitmap_on ? 1 : 0);
   };
 
   if (has_attn_bias && has_dropout) {
