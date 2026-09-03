@@ -157,8 +157,10 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_sm120(
           ? (kBiasSegs - kBiasQSegs) * kBiasBoxRows * kBiasColsU16
           : 0;
   constexpr int kBitmapU32PerStage = kBr * kBc / 32;
-  static_assert(!kHasDropout || kBc % 64 == 0,
-                "half-row bitmap generation needs kBc >= 64");
+  // The half-row generation scheme needs a row to span an even number of
+  // 32-bit words (kBc % 64 == 0); D=192/256 persist-D runs kBc=32 and
+  // stays on inline Philox instead.
+  constexpr bool kBitmapCapable = kHasDropout && (kBc % 64 == 0);
   uint32_t* bitmap_base =
       reinterpret_cast<uint32_t*>(bias_extra + kBiasExtraU16);
 
@@ -518,14 +520,16 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_sm120(
 
   // PC-14 dropout bitmap: stage(0) into buffer 0, then the per-tile
   // generate-ahead protocol (see the kv loop).
-  const bool bitmap_on = kHasDropout && dropout_bitmap_on != 0;
+  const bool bitmap_on = kBitmapCapable && dropout_bitmap_on != 0;
   const unsigned long long dropout_head_base =
       (static_cast<unsigned long long>(Nb_id) * Nh + Nh_id) * Nq;
-  if (bitmap_on && Tc_eff > 0) {
-    ffpa_cute::generate_dropout_bitmap_halfrow<kBc>(
-        bitmap_base, wg_tid >> 1, wg_tid & 1, Br_base + (wg_tid >> 1), 0,
-        dropout_p, philox_seed, philox_offset, dropout_head_base, Nkv);
-    cutlass::arch::NamedBarrier::sync(kConsumerThreads, 0);
+  if constexpr (kBitmapCapable) {
+    if (bitmap_on && Tc_eff > 0) {
+      ffpa_cute::generate_dropout_bitmap_halfrow<kBc>(
+          bitmap_base, wg_tid >> 1, wg_tid & 1, Br_base + (wg_tid >> 1), 0,
+          dropout_p, philox_seed, philox_offset, dropout_head_base, Nkv);
+      cutlass::arch::NamedBarrier::sync(kConsumerThreads, 0);
+    }
   }
 
 #pragma unroll 1
@@ -537,11 +541,13 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_sm120(
 
     // Bitmap for the next tile: issued before the K wait so it fills the
     // TMA-latency window instead of the softmax->PV critical path.
-    if (bitmap_on && kv_tile + 1 < Tc_eff)
-      ffpa_cute::generate_dropout_bitmap_halfrow<kBc>(
-          bitmap_base + ((kv_tile + 1) & 1) * kBitmapU32PerStage, wg_tid >> 1,
-          wg_tid & 1, Br_base + (wg_tid >> 1), kv_tile + 1, dropout_p,
-          philox_seed, philox_offset, dropout_head_base, Nkv);
+    if constexpr (kBitmapCapable) {
+      if (bitmap_on && kv_tile + 1 < Tc_eff)
+        ffpa_cute::generate_dropout_bitmap_halfrow<kBc>(
+            bitmap_base + ((kv_tile + 1) & 1) * kBitmapU32PerStage, wg_tid >> 1,
+            wg_tid & 1, Br_base + (wg_tid >> 1), kv_tile + 1, dropout_p,
+            philox_seed, philox_offset, dropout_head_base, Nkv);
+    }
 
     // QK GEMM: gemm_rs with the loop-invariant Q A-fragment in regs,
     // full-D Q × full-D K (K-only smem loads).
@@ -645,7 +651,7 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_sm120(
     const bool need_rescale = __any_sync(0xffffffff, local_need_rescale);
 
     if constexpr (kHasDropout) {
-      if (dropout_bitmap_on) {
+      if (bitmap_on) {
         ffpa_cute::apply_dropout_bitmap_rowcol<
             decltype(scores), decltype(tScS_rc), kSRows, kSCols, kBc>(
             scores, tScS_rc, bitmap_base + (kv_tile & 1) * kBitmapU32PerStage,
