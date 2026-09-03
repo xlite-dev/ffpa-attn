@@ -106,9 +106,10 @@ CUTEDSL_COMPAT_TASKS = frozenset({
 # the tasks at the task-set level so they neither run nor appear as NaN bars
 # in the tflops/speedup plots (runner-side skipping alone leaves the gaps).
 CUDA_QUANT_EXCLUDED_TASKS = frozenset({"decode-attn", "dropout"})
-# Decode (Nq==1) is not an ffpa focus: every backend drops it from the
-# default (and "full") run; explicit --tasks decode-attn still runs it.
-DEFAULT_EXCLUDED_TASKS = frozenset({"decode-attn"})
+# Decode (Nq==1) is not an ffpa focus and dropout is no longer a CUDA-backend
+# focus: both are dropped from the default (and "full") run; explicit
+# --tasks still runs them.
+DEFAULT_EXCLUDED_TASKS = frozenset({"decode-attn", "dropout"})
 CUTEDSL_DTYPES: tuple[torch.dtype, ...] = (torch.float16, torch.bfloat16)
 CUTEDSL_OUTPUT_STEM = "ffpa_speedup_cutedsl"
 # Quant-impl stems keep fp8/fp4 artifacts from clobbering the fp16/bf16 ones
@@ -263,7 +264,8 @@ def _parse_args() -> argparse.Namespace:
     default=None,
     help=(
       "Benchmark cases to run, separated by commas or whitespace, for example self-attn,cross-attn. "
-      "Defaults to full; valid cases: " + ",".join(VALID_TASKS)
+      "Defaults to the full suite minus decode-attn/dropout; valid cases: " +
+      ",".join(VALID_TASKS)
     ),
   )
   parser.add_argument(
