@@ -104,7 +104,7 @@
 | PC-11 | warp 级 `__any_sync` lazy-rescale 统一治理（精度治理专项） | P | ⬜ 待开始 | 已与 PC-0-5 解耦可独立推进（vote 非本次 race 根因——force-rescale 实证；治理价值在消除 warp-uniform 分支的调度脆弱性） |
 | PC-12 | cute sm_80 fp16 性能优化（cp.async + 多级流水线，fp8/sm_89 路线前置） | P | ⬜ 待开始 | —；被 PC-6 依赖 |
 | PC-13 | fp8/fp4 hybrid 路径性能优化（双 attn kernel → 融合 kernel） | P | ⬜ 待开始 | —（与 PC-7~10 协同） |
-| PC-14 | fp16 dropout 路径性能优化（RNG bitmap 预计算 + producer/consumer 重排） | P | 🚧 persist_d + split_d 完成（consumer 侧双缓冲 bitmap：persist_d D=64 1.02x / D=128 2.25x，split_d D=320 2.05x，bitwise 全过 + 全 task 无回归；producer 方案证伪；**m4n2 证伪不实现**（D=768 bitmap 212.82ms 反慢于 inline 202.31ms，tile 小 + PV/exchange 主导，RNG 非瓶颈；未来有需求再评估）；RNG 指令地板结论见 SKILL §11.16——契约下上限约 1.2x）；sm_80 进行中 | PC-0 同构（bias tile 协议复用）；FC-5 是量化路径功能项（⏸），与本项无重叠 |
+| PC-14 | fp16 dropout 路径性能优化（RNG bitmap 预计算 + producer/consumer 重排） | P | ✅ 完成（consumer 侧双缓冲 bitmap：persist_d D=64 1.02x / D=128 2.25x，split_d D=320 2.05x，sm_80 split_d 完成（f158eb1），bitwise 全过 + 全 task 套件零回归（fp16 7 tasks×2 dtypes + fp8/fp4 smoke）；producer 方案证伪；**m4n2 证伪不实现**（D=768 bitmap 212.82ms 反慢于 inline 202.31ms，tile 小 + PV/exchange 主导，RNG 非瓶颈；未来有需求再评估）；**persist-D half-row 方案要求 kBc≥64**——D=192/256 的 kBc=32 实例化编译期 `kBitmapCapable` 门控回落 inline Philox（d6a4a1d）；RNG 指令地板结论见 SKILL §11.16——契约下上限约 1.2x） | PC-0 同构（bias tile 协议复用）；FC-5 是量化路径功能项（⏸），与本项无重叠 |
 
 > 未收录项：分卡基准标注（文档规范，随下次 bench 执行）。（原列于此的 cache-dit `_keep_or_pack` 物化兜底移除已于 2026-08-28 完成，cache-dit@4b5c977：三 tensor 直传零拷贝，契约外布局由 C++ layout gate 显式报错。）
 
@@ -202,7 +202,7 @@
   - 融合方向（设计要点）：单 kernel 内按 work 的 Q 行域选精度——前缀 tile 走 fp16 MMA、其余 tile 走 fp8/fp4 MMA，同 grid/同流水/同 epilogue 直写 O（`q_start_row` 行域判定已具备），消除拼接拷贝与双份 K/V IO；难点 = 同一 kernel 内两套 smem 布局/量化状态的条件编译分支对寄存器压力的影响（PC-0-6 教训：量化寄存器模型不等同 fp16）。
   - 动作与验收：①hybrid 现状开销量化（nsys：双 kernel + copy + pre-kernel 链时间占比，`n_early` 扫描）；②融合 kernel 原型（先 persist_d 家族，行域分支最简单）；③hybrid bench A/B + 精度对照（hybrid 本身是精度特性，融合版必须保持 stage-1 fp16 数值语义不变）。
   - 关联：与 PC-7~PC-10（量化大 D kernel 内部优化）协同——融合 kernel 的量化段直接继承其优化成果。
-- [ ] PC-14：fp16 dropout 路径性能优化（RNG bitmap 预计算 + producer/consumer 重排，2026-09-02 立项）
+- [x] PC-14：fp16 dropout 路径性能优化（RNG bitmap 预计算 + producer/consumer 重排，2026-09-02 立项，2026-09-03 完成）
   - 背景：D=64 bench 实测 dropout task **0.83x**（FFPA 37.69ms vs SDPA 31.31ms；无 mask self-attn 9.97ms → dropout 3.8 倍耗时，当前量化路径外唯一劣化点）。根因：`apply_dropout_rowcol`（cute/dropout.cuh）在 consumer 的 QK-MMA→softmax 串行链上**逐 element 计算 Philox**（philox4x32_10 = 4×10 round 整数乘加/异或链，每 2 个 score 一次完整调用），算术密度远超 score 本身的 add/mul。
   - 思路（与 PC-0 attn bias tile 同构）：producer warp（128T，目前仅发 TMA 基本空闲）预计算下一 KV tile 的 `[kBr,kBc]` dropout keep bitmap（1 bit/elem）写入 smem 预取窗口——复用 bias tile 已验证的 Q 区/extra 段布局与 `bias_full/empty` mbarrier 协议；consumer 只查 bitmap + 乘 keep_scale。Philox 生成侧按 4 连续列块对齐（一次 philox4x32_10 出 4 个决策），消除 lane0==3 的重算分支。
   - 进阶（评估项）：drop 的 keep_scale 因子后置到 P 域/row_scale 折叠（online softmax 已有 rescale 乘法链，drop=置 0 可与 rescale 合并乘法）。
@@ -210,6 +210,7 @@
   - 进展（2026-09-02，persist_d 家族完成）：producer 预计算方案**已证伪**（philox 集中在 4/12 warps = 3× 指令浓缩成机器瓶颈，15.6ms；且 producer 提寄存器预算在 32/64/96 全档 spill）。落地形态为 **consumer 侧双缓冲 smem bitmap**：256 consumer threads 在 kv 迭代顶部（TMA wait 窗口，脱离 softmax→PV 关键路径）按 offset-quad 预生成下一 tile 的 keep bitmap（1 philox/4 元素，旧 inline 为 1/2，philox 总量减半），softmax 后以寄存器 bit-test 应用，每 tile 一次 NamedBarrier(256)；producer 回归薄 TMA issuer（setmaxnreg 维持 32/232 不动）。验收：D=64 0.82x→**1.02x**、D=128 **2.25x**，15/15 bitwise A/B + 全 task 矩阵无回归。
   - 进展（2026-09-03，split_d 家族完成 / m4n2 证伪）：**split_d 同构移植成功**（half-row 生成，kBr=128/kBc=128，`__syncthreads` 替代 NamedBarrier）：D=320 dropout forward **2.05x** SDPA（inline 1.52x），A/B 22/22 bit-exact（dense/causal/odd-Nkv/row-bias fp16+fp32/GQA/bf16），全 task 矩阵零回归（8842cff）。**m4n2 证伪、该路径不实现 bitmap**：bit-exact 成立（word-per-thread 生成，27/27），但性能**反向**——D=768 N=16384 bitmap 212.82ms(2.16x) 慢于禁用态 inline 202.31ms(2.25x)，-5.2%。根因：m4n2 tile 仅 64×64（4KB bitmap），inline philox 量本小且 kernel 时间由 PV split-D + cross-N-warp softmax exchange 主导，RNG 不在关键路径上；bitmap 的生成 + smem 写读往返是固定净增开销，无 RNG 节省可抵。已回滚全部 m4n2 改动；未来若 m4n2 结构变化（如 PC-8/PC-10 优化后 RNG 占比上升）再重新评估。
   - **理论结论（详见 SKILL §11.16）**：bit-exact Philox 契约存在指令地板（每 4 决策约 150 条线程指令 → PRO 5000 上 N=16384 约 20ms / N=8192 约 5.1ms，实测已贴地板）；加速比上限 $= (T_{\text{self}} + \Delta_{\text{SDPA}}) / (T_{\text{self}} + \text{floor})$，契约不变时结构上到不了 2x（完美实现约 1.2x），与 attn_bias 的 2.1x+ 量级差源于 bias 是 memory-bound 数据问题而 dropout 是 ALU-bound 计算问题。要突破上限只能换非 bit-exact 的便宜 RNG（产品决策）。
+  - 进展（2026-09-03，sm_80 完成 / persist-D kBc 门控 / 收尾验收）：**sm_80 split_d 同构移植完成**（half-row 生成 + `__syncthreads`，f158eb1）；**persist-D 增加 kBc≥64 编译期门控**（d6a4a1d）：half-row 方案要求 row 跨偶数个 32-bit word，D=192/256 的 kBc=32 实例化（fp4-hybrid stage-1 调用点触发）经 `kBitmapCapable` 回落 inline Philox，launcher 同步加 `kBc >= 64` 运行期门控跳过 bitmap smem 预算。收尾验收：全 headdim 构建 162/162，fp16 7-task 套件零回归（dropout 1.90x@D512，persist-D parity D64 1.03x / D128 2.13x），fp8/fp4 smoke 通过。PC-14 关闭。
 
 ## 实施路线图（基建优先，承上启下）
 
@@ -243,8 +244,8 @@
         （sm_89 无 TMA/async proxy，fp8 只能走 cp.async 路线；复活后解锁 PC-6）
   PC-13 fp8/fp4 hybrid 融合 kernel（现状 = fp16 + 量化两条主 attn kernel 背靠背，
         拼接拷贝/双份 K/V IO/双 launch 固定开销显著 → 单 kernel 内按 Q 行域选精度）
-  PC-14 fp16 dropout 性能（producer 预计算 RNG bitmap，复用 bias tile 协议；
-        现状逐 element Philox 在 consumer 串行链上 → dropout 0.83x 唯一劣化点）
+  PC-14 fp16 dropout 性能 ✅（consumer 侧双缓冲 bitmap，producer 方案证伪；
+        persist_d/split_d/sm_80 完成、m4n2 证伪；D=64 0.83x→1.02x，D=128 2.25x）
   PC-6 sm_89 int4 QK ⏸（暂不实施，低优搁置，不入执行序列；前置 = PC-12 达标）
 ```
 
