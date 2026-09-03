@@ -393,6 +393,110 @@ __device__ __forceinline__ float load_attn_bias_value(const void* attn_bias,
   return reinterpret_cast<const float*>(attn_bias)[offset];
 }
 
+// Vectorized two-element load for the rowvec bias fast path. The caller
+// guarantees stride_n == 1, an even element offset (``pair_offset`` is the
+// element offset >> 1), and a host-checked aligned base pointer (4B for
+// half/bf16, 8B for fp32).
+template <const int kBiasDtype>
+__device__ __forceinline__ float2
+load_attn_bias_pair(const void* attn_bias, const long long pair_offset) {
+  if constexpr (kBiasDtype == 1) {
+    const __half2 v = reinterpret_cast<const __half2*>(attn_bias)[pair_offset];
+    return make_float2(__low2float(v), __high2float(v));
+  } else if constexpr (kBiasDtype == 2) {
+    const __nv_bfloat162 v =
+        reinterpret_cast<const __nv_bfloat162*>(attn_bias)[pair_offset];
+    return make_float2(__low2float(v), __high2float(v));
+  } else {
+    return reinterpret_cast<const float2*>(attn_bias)[pair_offset];
+  }
+}
+
+// Rowvec fast path for additive attention bias: stride_m == 0 (the value
+// depends only on the KV column) with stride_n == 1 and host-proven
+// alignment. Each lane's two columns k0/k1 are adjacent, so one vectorized
+// pair load serves both; the m16n8k16 C-fragment rows q0/q8 share the same
+// value because the row stride is zero, so a single pair serves all four
+// accumulator slots. Row bounds checks are dropped: with stride_m == 0 every
+// row index addresses valid bias memory, and padded Q rows never reach O/LSE.
+// The tail KV tile (odd remainder) falls back to scalar loads. The load is
+// hoisted but ``* inv_scale`` stays per element so the f32 path keeps the
+// scalar version's FFMA contraction (bitwise identical results).
+template <const int kValTileSeqLenK, const int kMmaAccFloat32,
+          const int kBiasDtype, typename kDataType = __half>
+__device__ __forceinline__ void sync_apply_attn_bias_rowvec(
+    uint32_t* R_S, const void* attn_bias, const long long attn_bias_stride_b,
+    const long long attn_bias_stride_h, const int Nb_id, const int Nh_id,
+    const int Bc_base, const int Nkv, const float inv_scale) {
+  using Traits = DtypeTraits<kDataType>;
+  const int lane_id = threadIdx.x % WARP_SIZE;
+  const int col_base = (lane_id % 4) * 2;
+  const long long base = static_cast<long long>(Nb_id) * attn_bias_stride_b +
+                         static_cast<long long>(Nh_id) * attn_bias_stride_h;
+  // Column-pair addressing hoisted out of the j loop: base/Bc_base/col_base
+  // are all even (launcher alignment gate + tile geometry), so the pair
+  // index is exact and each fragment advances it by a constant 4 pairs
+  // (8 KV columns). This replaces the per-fragment 64-bit offset chain.
+  const long long pair_base = (base + Bc_base + col_base) >> 1;
+
+  if constexpr (kMmaAccFloat32) {
+#pragma unroll
+    for (int j = 0; j < kValTileSeqLenK; ++j) {
+      float* t_fptr = reinterpret_cast<float*>(R_S + j * 4);
+      const int k0 = Bc_base + j * 8 + col_base;
+      const int k1 = k0 + 1;
+      if (k1 < Nkv) {
+        const float2 bv =
+            load_attn_bias_pair<kBiasDtype>(attn_bias, pair_base + j * 4);
+        t_fptr[0] += bv.x * inv_scale;
+        t_fptr[1] += bv.y * inv_scale;
+        t_fptr[2] += bv.x * inv_scale;
+        t_fptr[3] += bv.y * inv_scale;
+      } else if (k0 < Nkv) {
+        // Scalar tail: keep the single-statement form so nvcc applies the
+        // same FFMA contraction as the scalar path (bitwise identical).
+        t_fptr[0] +=
+            load_attn_bias_value(attn_bias, kBiasDtype, base + k0) * inv_scale;
+        t_fptr[2] +=
+            load_attn_bias_value(attn_bias, kBiasDtype, base + k0) * inv_scale;
+      }
+    }
+  } else {
+    static_assert(std::is_same_v<kDataType, __half>,
+                  "MMA Acc F16 attention bias path is only valid for __half "
+                  "activation dtype.");
+#pragma unroll
+    for (int j = 0; j < kValTileSeqLenK; ++j) {
+      kDataType* t_hptr = reinterpret_cast<kDataType*>(R_S + j * 2);
+      const int k0 = Bc_base + j * 8 + col_base;
+      const int k1 = k0 + 1;
+      if (k1 < Nkv) {
+        const float2 bv =
+            load_attn_bias_pair<kBiasDtype>(attn_bias, pair_base + j * 4);
+        const float v0 = Traits::to_float(t_hptr[0]) + bv.x * inv_scale;
+        t_hptr[0] = Traits::from_float(v0);
+        const float v1 = Traits::to_float(t_hptr[1]) + bv.y * inv_scale;
+        t_hptr[1] = Traits::from_float(v1);
+        const float v2 = Traits::to_float(t_hptr[2]) + bv.x * inv_scale;
+        t_hptr[2] = Traits::from_float(v2);
+        const float v3 = Traits::to_float(t_hptr[3]) + bv.y * inv_scale;
+        t_hptr[3] = Traits::from_float(v3);
+      } else if (k0 < Nkv) {
+        // Scalar tail: keep the single-statement ``cvt + load * inv_scale``
+        // form so contraction matches the scalar path (bitwise identical).
+        const float v0 =
+            Traits::to_float(t_hptr[0]) +
+            load_attn_bias_value(attn_bias, kBiasDtype, base + k0) * inv_scale;
+        t_hptr[0] = Traits::from_float(v0);
+        const float v2 =
+            Traits::to_float(t_hptr[2]) +
+            load_attn_bias_value(attn_bias, kBiasDtype, base + k0) * inv_scale;
+        t_hptr[2] = Traits::from_float(v2);
+      }
+    }
+  }
+}
+
 // Reproduce Triton's ``tl.randint4x`` Philox-4x32-10 counter transform.
 // The CUDA forward dropout path uses this exact round function so a logical
 // attention score consumes the same random uint32 as the Triton forward kernel

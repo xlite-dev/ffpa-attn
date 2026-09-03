@@ -275,6 +275,7 @@ void launch_native_fwd_split_d_sm80(torch::Tensor Q, torch::Tensor K,
   const bool has_dropout = dropout_p > 0.0;
   const void* attn_bias_ptr = nullptr;
   int attn_bias_dtype = 0;
+  int attn_bias_rowvec = 0;
   long long attn_bias_stride_b = 0, attn_bias_stride_h = 0,
             attn_bias_stride_m = 0, attn_bias_stride_n = 0;
   if (has_attn_bias) {
@@ -290,6 +291,19 @@ void launch_native_fwd_split_d_sm80(torch::Tensor Q, torch::Tensor K,
         (attn_bias.size(2) == 1 && Nq > 1) ? 0 : attn_bias.stride(2);
     attn_bias_stride_n =
         (attn_bias.size(3) == 1 && Nkv > 1) ? 0 : attn_bias.stride(3);
+    // PC-0-2 rowvec fast path: stride_m == 0 (bias depends only on the KV
+    // column) + stride_n == 1 (columns contiguous) + alignment for pair
+    // loads (4B fp16/bf16, 8B fp32) + even (b,h) plane strides so every
+    // block's base offset stays pair-aligned. Nq == 1 admits non-zero
+    // stride_m too: every row index is a padding row except row 0, and the
+    // fast path addresses columns only. The env is read per call so
+    // toggling mid-process works.
+    const int bias_vec_bytes = attn_bias_dtype == 3 ? 8 : 4;
+    attn_bias_rowvec =
+        (attn_bias_stride_m == 0 || Nq == 1) && attn_bias_stride_n == 1 &&
+        (reinterpret_cast<uintptr_t>(attn_bias_ptr) % bias_vec_bytes == 0) &&
+        (attn_bias_stride_b % 2 == 0) && (attn_bias_stride_h % 2 == 0) &&
+        getenv("FFPA_BIAS_ROWVEC_DISABLE") == nullptr;
   }
 
   const dim3 block = getConfigBlock<kNumThreads>();
@@ -365,8 +379,9 @@ void launch_native_fwd_split_d_sm80(torch::Tensor Q, torch::Tensor K,
       reinterpret_cast<kDataType*>(V.data_ptr()),
       reinterpret_cast<kDataType*>(O.data_ptr()), softmax_lse_ptr, Nq, Nkv, Nh,
       Nh_kv, scale, Tc, causal, attn_bias_ptr, attn_bias_dtype,
-      attn_bias_stride_b, attn_bias_stride_h, attn_bias_stride_m,
-      attn_bias_stride_n, dropout_p_f, philox_seed_u, philox_offset_u, d_og);
+      attn_bias_rowvec, attn_bias_stride_b, attn_bias_stride_h,
+      attn_bias_stride_m, attn_bias_stride_n, dropout_p_f, philox_seed_u,
+      philox_offset_u, d_og);
 }
 
 // Host-side launcher that picks compile-time configuration (block tile,
@@ -446,6 +461,7 @@ void launch_native_fwd_split_d_sm120(torch::Tensor Q, torch::Tensor K,
   const bool has_dropout = dropout_p > 0.0;
   const void* attn_bias_ptr = nullptr;
   int attn_bias_dtype = 0;
+  int attn_bias_rowvec = 0;
   long long attn_bias_stride_b = 0, attn_bias_stride_h = 0,
             attn_bias_stride_m = 0, attn_bias_stride_n = 0;
   if (has_attn_bias) {
@@ -461,6 +477,15 @@ void launch_native_fwd_split_d_sm120(torch::Tensor Q, torch::Tensor K,
         (attn_bias.size(2) == 1 && Nq > 1) ? 0 : attn_bias.stride(2);
     attn_bias_stride_n =
         (attn_bias.size(3) == 1 && Nkv > 1) ? 0 : attn_bias.stride(3);
+    // PC-0-2 rowvec fast path (see the sm80 launcher for the gate rules;
+    // Nq == 1 admits non-zero stride_m since only row 0 is a real row and
+    // the fast path addresses columns only).
+    const int bias_vec_bytes = attn_bias_dtype == 3 ? 8 : 4;
+    attn_bias_rowvec =
+        (attn_bias_stride_m == 0 || Nq == 1) && attn_bias_stride_n == 1 &&
+        (reinterpret_cast<uintptr_t>(attn_bias_ptr) % bias_vec_bytes == 0) &&
+        (attn_bias_stride_b % 2 == 0) && (attn_bias_stride_h % 2 == 0) &&
+        getenv("FFPA_BIAS_ROWVEC_DISABLE") == nullptr;
   }
 
   const dim3 block(kTotalThreads, 1, 1);
@@ -550,7 +575,7 @@ void launch_native_fwd_split_d_sm120(torch::Tensor Q, torch::Tensor K,
   kernel_func<<<grid, block, kSmemBytes, stream>>>(
       tma_q_d, tma_k_d, tma_v_d, reinterpret_cast<kDataType*>(O.data_ptr()),
       softmax_lse_ptr, Nq, Nkv, Nh, Nh_kv, scale, Tc, causal, attn_bias_ptr,
-      attn_bias_dtype, attn_bias_stride_b, attn_bias_stride_h,
+      attn_bias_dtype, attn_bias_rowvec, attn_bias_stride_b, attn_bias_stride_h,
       attn_bias_stride_m, attn_bias_stride_n, dropout_p_f, philox_seed_u,
       philox_offset_u);
   cudaFree(tma_q_d);

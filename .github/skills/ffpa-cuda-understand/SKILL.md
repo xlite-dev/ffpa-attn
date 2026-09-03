@@ -434,14 +434,14 @@ lse 公式（NVFP4 PV）：`lse = (m*L + log2(row_sum) + log2(1/2688))*ln2 + sca
 |---|---|---|
 | Python 层归一化（`normalize_attn_mask`） | — | bool mask → additive（True 参与注意 / False→-inf，SDPA 语义）；2D→`[1,1,Nq,Nkv]`、3D→`[B,1,Nq,Nkv]` view；要求最内维连续（否则 contiguous）；dtype ∈ {bool, fp32, Q.dtype} |
 | 全局互斥 | — | `attn_mask` + `is_causal` 任何 backend 均拒绝 |
-| Native sm80 / sm120 TMA | ✓ | 4D 广播 `[B\|1, H\|1, Nq\|1, Nkv\|1]`；fp16/bf16/fp32；广播维 stride 置 0；dtype code 1/2/3 |
+| Native sm80 / sm120 TMA | ✓ | 4D 广播 `[B\|1, H\|1, Nq\|1, Nkv\|1]`；fp16/bf16/fp32；广播维 stride 置 0；dtype code 1/2/3；bias IO 已 rowvec 内联向量化（PC-0-2：门控 `(stride_m==0 \|\| Nq==1) && stride_n==1 && 对齐` 时 `half2`/`float2` 对加载服务 4 个 fragment 槽，消 16x load 冗余，验收 tma D512 2.00x / native 1.89x；不满足门控自动回落标量路径；`FFPA_BIAS_ROWVEC_DISABLE=1` 强制回落做 A/B） |
 | CUTE fp16（persist/split/M4N2/sm80） | ✓（编译期 4 变体） | bias IO 已 smem tile 化（PC-0-0：TMA 预取 + mode 2 rowvec 双缓冲 / mode 3 全驻留；D=128 gap 1.12、D=768 1.07 达标，D=320 结构极限 1.44 → PC-0-3）；dispatch 默认仍回退 native TMA（除非 force_cute_tma） |
 | **CUTE FP8（全部三族）** | ✓（FC-4 + PC-0-1 tile） | raw-S 域注入 `bias/(qs*ks*scale_orig)`；`kHasAttnBias` 双实例 tag dispatch；仅拒 dropout；bias IO 已 smem tile 化（PC-0-1：persist_d mode 3 **1.84x**、split_d D=320 mode 2 1.20x / D≥512 demote mode 0（PC-0-4）、m4n2 occupancy 守卫 mode 2 1.03x） |
 | **CUTE FP4（全部三族）** | ✓（FC-4 + PC-0-1 tile） | dequant 域注入 `bias/scale_orig`，列 `kv_perm32(j)`；仅拒 dropout；bias IO 已 smem tile 化（PC-0-1：split_d mode 3 **1.67x**、m4n2 mode 3 1.04x）；⚠️ **m4n2 带 bias 存在先在时序竞争**（触发面 = bias 数据经 smem：mode 0 gmem 直读完全免疫，mode 2/3 smem 写均触发；跨模板切换非必要——同模板不同 bias 值也触发，PC-0-5 定性收尾 db76a1f + 2026-09-02 mode 矩阵收窄——协议补全 + xfail 用例 + `FFPA_BIAS_TILE_DISABLE` escape hatch；纯 bias 序列稳定，风险受控；fp8 全族、fp16 全族、fp4 split_d 实证干净） |
 | cutedsl backend | ✗ | `NotImplementedError`（无静默 fallback） |
 | Triton backend | ✓ | （非本报告范围，支持 additive mask 梯度） |
 
-**结论：attn_mask 的低精度路径已由 FC-4 解锁**（fp8/fp4 六族均支持，2026-08-28）；bias 注入 IO 已全家族 smem tile 化（PC-0-0 fp16 2026-08-31 / PC-0-1 fp8+fp4 2026-09-01，主力 mode 3 全驻留 + occupancy 守卫）；**正确性现状（PC-0-5 收敛）**：native / fp16 全族 / fp8 六族 / fp4 split_d / **fp4 persist_d（D=256/D=128 各 0/30 实测）** bias 路径全部干净，**唯一 PC-0-5 问题 = fp4 split_d_m4n2 + attn_bias**（bias 数据经 smem 的 mode 2/3，且 m4n2 独有的 P 跨 N-warp smem 通信 + 大 D 复现、split_d 免疫；触发为 O body bitwise 非确定 ~5e-3..3e-2，非错误值；纯 bias 序列稳定、mode 0 gmem 直读完全免疫、`FFPA_BIAS_TILE_DISABLE=1` 可作 escape hatch）——使用面窄，已收敛定性并搁置，根治待 NVIDIA 上报。**区分**：fp4 persist_d 另有一处独立低概率（3/30）epilogue race（非 PC-0-5，persist_d 无 mode 0 等价路径，需独立排查）；dropout 仍为 fp16 家族专属。
+**结论：attn_mask 的低精度路径已由 FC-4 解锁**（fp8/fp4 六族均支持，2026-08-28）；bias 注入 IO 已全家族优化（PC-0-0 fp16 cute smem tile 化 2026-08-31 / PC-0-1 fp8+fp4 smem tile 化 2026-09-01，主力 mode 3 全驻留 + occupancy 守卫 / PC-0-2 native rowvec 内联向量化 2026-09-03，残余为 load-latency 主导、预取受寄存器预算约束搁置）；**正确性现状（PC-0-5 收敛）**：native / fp16 全族 / fp8 六族 / fp4 split_d / **fp4 persist_d（D=256/D=128 各 0/30 实测）** bias 路径全部干净，**唯一 PC-0-5 问题 = fp4 split_d_m4n2 + attn_bias**（bias 数据经 smem 的 mode 2/3，且 m4n2 独有的 P 跨 N-warp smem 通信 + 大 D 复现、split_d 免疫；触发为 O body bitwise 非确定 ~5e-3..3e-2，非错误值；纯 bias 序列稳定、mode 0 gmem 直读完全免疫、`FFPA_BIAS_TILE_DISABLE=1` 可作 escape hatch）——使用面窄，已收敛定性并搁置，根治待 NVIDIA 上报。**区分**：fp4 persist_d 另有一处独立低概率（3/30）epilogue race（非 PC-0-5，persist_d 无 mode 0 等价路径，需独立排查）；dropout 仍为 fp16 家族专属。
 
 ### 7.2 dropout
 
@@ -982,3 +982,26 @@ $$O=\big[\,O_{[0:n)}^{(\text{fp16 kernel})};\ \ O_{[n:N)}^{(\text{fp8/fp4 kernel
 | lse | f32 $\ln$ 域 | f32 | f32（+ $\text{scale}\cdot q\bar k$ 修正当 smooth_k） | f32 复合式（§11.10） |
 
 通用注记：softmax 的 $m/L$ 与 rescale 恒 fp32（全路径）；所有 scale 折叠点（§11.6/§11.10）都是精确代数，表内低精度域只引入 §11.5 的量化噪声。
+
+### 11.16 dropout 的 RNG 指令地板与加速比上限（PC-14）
+
+为什么 dropout 的加速比（~1.0-1.1x）永远到不了 attn_bias 的量级（2.1x+）——把两 task 相对 self-attn 的增量拆开（PRO 5000，N=16384，D=64，fp16）：
+
+| task | FFPA 增量 | SDPA 增量 | 增量比 |
+|---|---|---|---|
+| attn-mask | 1.76 ms | 14.84 ms | 8.4x |
+| dropout | 18.95 ms | 21.20 ms | 1.12x |
+
+加速比 $= (T_{\text{self}} + \Delta_{\text{SDPA}}) / (T_{\text{self}} + \Delta_{\text{FFPA}})$，attn-mask 赢在增量比；dropout 两边被同一地板托底。根本区别：**attn_bias 是数据问题（memory-bound），dropout 是计算问题（ALU-bound）**——bias 每元素 = 1 条 FMA（FP32 管道空闲期）+ 可去重的 HBM 流量（broadcast mask 只读一次），TFLOPS 保持 85%；dropout 没有输入数据， $N^2 \cdot H$ 个决策必须现场合成，与 MMA 争同一份发射带宽，TFLOPS 掉到 34%。
+
+**RNG 契约锁死指令下限**。bit-exact 契约为 $\text{keep}(e) = [\,u(\text{philox}(\text{seed}, e \gg 2)[e \bmod 4]) > p\,]$ ，每次 philox4x32-10 约 120 条整数指令产 4 个决策。以 N=16384、H=32 计：
+
+$$\text{warp 指令总量} \approx 8.6\text{G 决策} \times \frac{120 + 30}{4 \times 32} \approx 10\text{G}$$
+
+PRO 5000 发射带宽约 $74 \times 4 \times 1.7\text{GHz} \approx 503\text{G}$ warp-instr/s，故 RNG 地板约 20 ms（N=8192 时约 5.1 ms）。实测 PC-14 优化后增量 5.15 ms @N8192 / 18.95 ms @N16384——**已贴合地板**（bitmap 化把 philox 调用从每 2 元素一次降到每 4 元素一次后，恰好落在 quad 摊销的理论下限）。
+
+**加速比上限**（ $T_{\text{self}} = 10$ ms， $\Delta_{\text{SDPA}} = 21$ ms）：
+
+$$\text{speedup}_{\max} = \frac{10 + 21}{10 + \text{floor}} \approx 1.08x\ (\text{floor}=20) \ ;\ 1.2x\ (\text{floor}=16)\ ;\ 3.1x\ (\text{floor}=0)$$
+
+即 bit-exact 契约下无论怎么优化都到不了 2x；要 2x 只能放弃 bit-exact 换便宜 RNG（xorwow/PCG 约 30-40 instr/4 决策，地板降到约 5 ms，可达 1.5-1.9x），代价是与 PyTorch dropout 的 RNG 序列不再一致（产品决策）。缓存预生成 RNG 不可行： philox offset 每次 forward 递增，决策序列不复用。

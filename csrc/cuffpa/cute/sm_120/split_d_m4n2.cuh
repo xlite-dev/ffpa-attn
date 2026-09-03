@@ -601,6 +601,11 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
         local_need_rescale = local_need_rescale || (row_scale[r] < 1.0f);
       const bool need_rescale = __any_sync(0xffffffff, local_need_rescale);
 
+      // Inline philox only, no smem keep-bitmap: PC-14 measured the bitmap
+      // variant 5.2% SLOWER on this kernel (D=768 N=16384: 212.82 vs inline
+      // 202.31ms) — the 64x64 tile is too small and PV split-D + cross-N-warp
+      // exchange dominate, leaving RNG off the critical path. Re-evaluate only
+      // if this structure changes (PC-8/PC-10).
       if constexpr (kHasDropout) {
         ffpa_cute::apply_dropout_rowcol<decltype(scores), decltype(tScS_rc),
                                         kORows, kSCols>(

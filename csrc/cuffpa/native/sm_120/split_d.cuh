@@ -69,10 +69,10 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK +
         float* __restrict__ softmax_lse, const int Nq, const int Nkv,
         const int Nh, const int Nh_kv, const float scale, const int Tc,
         const int causal, const void* __restrict__ attn_bias,
-        const int attn_bias_dtype, const long long attn_bias_stride_b,
-        const long long attn_bias_stride_h, const long long attn_bias_stride_m,
-        const long long attn_bias_stride_n, const float dropout_p,
-        const unsigned long long philox_seed,
+        const int attn_bias_dtype, const int attn_bias_rowvec,
+        const long long attn_bias_stride_b, const long long attn_bias_stride_h,
+        const long long attn_bias_stride_m, const long long attn_bias_stride_n,
+        const float dropout_p, const unsigned long long philox_seed,
         const unsigned long long philox_offset) {
   // Body-level arch guard: TMA instructions require sm>=90, but in mixed
   // -gencode builds the sm_89 device pass still compiles this TU; the guard
@@ -510,11 +510,40 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK +
           &R_S[0][0][0], warp_QP, Br_base, tile_K_seqlen * Bc, kv_offset);
     }
     if (attn_bias != nullptr) {
-      ffpa::prefill::sync_apply_attn_bias<kValTileSeqLenK, kMmaAccFloat32QK,
-                                          kDataType>(
-          &R_S[0][0][0], attn_bias, attn_bias_dtype, attn_bias_stride_b,
-          attn_bias_stride_h, attn_bias_stride_m, attn_bias_stride_n, Nb_id,
-          Nh_id, warp_QP, Br_base, tile_K_seqlen * Bc, Nq, Nkv, inv_scale);
+      if (attn_bias_rowvec) {
+        // Rowvec fast path (stride_m == 0, stride_n == 1, aligned): one
+        // vectorized pair load serves all four C-fragment slots. The dtype
+        // switch instantiates the per-dtype specialization once per tile.
+        switch (attn_bias_dtype) {
+          case 1:
+            ffpa::prefill::sync_apply_attn_bias_rowvec<
+                kValTileSeqLenK, kMmaAccFloat32QK, 1, kDataType>(
+                &R_S[0][0][0], attn_bias, attn_bias_stride_b,
+                attn_bias_stride_h, Nb_id, Nh_id, tile_K_seqlen * Bc, Nkv,
+                inv_scale);
+            break;
+          case 2:
+            ffpa::prefill::sync_apply_attn_bias_rowvec<
+                kValTileSeqLenK, kMmaAccFloat32QK, 2, kDataType>(
+                &R_S[0][0][0], attn_bias, attn_bias_stride_b,
+                attn_bias_stride_h, Nb_id, Nh_id, tile_K_seqlen * Bc, Nkv,
+                inv_scale);
+            break;
+          default:
+            ffpa::prefill::sync_apply_attn_bias_rowvec<
+                kValTileSeqLenK, kMmaAccFloat32QK, 3, kDataType>(
+                &R_S[0][0][0], attn_bias, attn_bias_stride_b,
+                attn_bias_stride_h, Nb_id, Nh_id, tile_K_seqlen * Bc, Nkv,
+                inv_scale);
+            break;
+        }
+      } else {
+        ffpa::prefill::sync_apply_attn_bias<kValTileSeqLenK, kMmaAccFloat32QK,
+                                            kDataType>(
+            &R_S[0][0][0], attn_bias, attn_bias_dtype, attn_bias_stride_b,
+            attn_bias_stride_h, attn_bias_stride_m, attn_bias_stride_n, Nb_id,
+            Nh_id, warp_QP, Br_base, tile_K_seqlen * Bc, Nq, Nkv, inv_scale);
+      }
     }
     ffpa::prefill::sync_online_safe_softmax<kValTileSeqLenK, kMmaAccFloat32QK,
                                             kDataType>(
