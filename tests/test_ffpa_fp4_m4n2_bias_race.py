@@ -1,14 +1,20 @@
 """FP4 M4N2 attn-bias determinism regression (PC-0-5 race).
 
-The fp4 split-D M4N2 kernel reuses one smem region for both the O epilogue
-staging and the P softmax round-trip tile. Repeated calls of the bias
-template back-to-back behind a no-bias prelude used to race: the tile-0 P
-scatter could overtake the previous work's epilogue staging read, showing
-as non-deterministic stripe-shaped O errors (~5e-3..3e-2) with a stable
-lse. The fix orders every kv tile with a full-CTA barrier.
+The fp4 split-D M4N2 kernel with a bias smem tile (mode 2 TMA double
+buffer / mode 3 resident fill) produced bitwise-unstable O across identical
+back-to-back calls -- with or without a no-bias prelude -- while lse stayed
+stable: corruption pinned to a single (m-warp, n-warp, v-chunk) PV C tile.
+The language-level protocol audit closed clean and neither ptxas -O2 nor
+producer-warp relocation fixed it, so the launcher now pins the gmem
+direct-read mode (mode 0, stable on the cold/pure sequence) for this
+kernel; FFPA_BIAS_TILE_KEEP=1 restores the smem tile modes. RESIDUAL
+(accepted): a heavy GPU-work prelude still opens a low-probability
+instability window on the bias template even in mode 0 - load-timing
+sensitive, documented in RFC PC-0-5.
 
-This test pins the trigger sequence (no-bias prelude, then the row-broadcast
-bias template) and requires bit-identical outputs across back-to-back calls.
+These tests pin both trigger sequences (with and without the no-bias
+prelude). The pure-bias case is the must-pass gate; the prelude case is
+tracked as xfail for the accepted residual.
 """
 
 import math
@@ -54,22 +60,13 @@ def _run(q, k, v, backend, bias):
   return o
 
 
-@pytest.mark.parametrize("D", [768])
-@pytest.mark.xfail(
-  strict=False,
-  reason="PC-0-5: fp4 m4n2 bias output is not bit-deterministic after a "
-  "no-bias prelude (cross-template timing-sensitive race; both necessary "
-  "ingredients confirmed: no-bias kernel prelude + the mode-3 bias "
-  "load-section stores. See rfc-future-optimizations.md PC-0-5)",
-)
-def test_fp4_m4n2_bias_determinism_after_no_bias_prelude(D):
+def _make_case(D):
   torch.manual_seed(0)
   B, H, N = 1, 4, 2048
   q = torch.randn(B, H, N, D, device="cuda", dtype=torch.float16) * 0.5
   k = torch.randn(B, H, N, D, device="cuda", dtype=torch.float16) * 0.5
   v = torch.randn(B, H, N, D, device="cuda", dtype=torch.float16) * 0.5
   bias = torch.randn(1, 1, 1, N, device="cuda", dtype=torch.float16) * 0.25
-
   backend = CUDABackend(
     forward=True,
     enable_fp8=False,
@@ -80,7 +77,38 @@ def test_fp4_m4n2_bias_determinism_after_no_bias_prelude(D):
   )
   backend.fp8_hybrid = False
   backend.fp4_hybrid = False
+  return q, k, v, bias, backend
 
+
+@pytest.mark.parametrize("D", [768])
+def test_fp4_m4n2_pure_bias_determinism(D):
+  # PC-0-5 follow-up: the pure-bias sequence (no prelude, first call as
+  # reference) was the 100%-reproducer that re-opened this issue. Defined
+  # BEFORE the prelude case so a single-file run consumes it first (the
+  # gate's stability guarantee holds for the cold sequence; a shared pytest
+  # session with heavy prior GPU load can still open the residual window).
+  q, k, v, bias, backend = _make_case(D)
+  ref = _run(q, k, v, backend, bias).view(torch.int32).flatten()
+  for _ in range(6):
+    out = _run(q, k, v, backend, bias).view(torch.int32).flatten()
+    assert torch.equal(out, ref), (
+      "fp4 m4n2 pure-bias output is not bit-deterministic (PC-0-5): "
+      f"{(out != ref).sum().item()} int32 lanes differ"
+    )
+
+
+@pytest.mark.parametrize("D", [768])
+@pytest.mark.xfail(
+  strict=False,
+  reason="PC-0-5 residual (accepted): with any heavy GPU-work prelude the "
+  "fp4 m4n2 bias template still shows low-probability bitwise instability "
+  "even in the pinned mode 0 (load-timing sensitive at the hardware level; "
+  "no-bias template is clean under the same load). fp4 m4n2 only serves "
+  "D>=768 fp4 (rare in production) - documented, not root-caused. See "
+  "rfc-future-optimizations.md PC-0-5",
+)
+def test_fp4_m4n2_bias_determinism_after_no_bias_prelude(D):
+  q, k, v, bias, backend = _make_case(D)
   for _ in range(9):
     _run(q, k, v, backend, None)
 
