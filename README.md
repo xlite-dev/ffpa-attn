@@ -1,6 +1,6 @@
 <div align="center">
   <p align="center">
-    <h2>Fast and Memory-Efficient Exact Attention for Large Headdim</h2>
+    <h2>Kernel Library for Large Headdim Attention</h2>
     <img src=https://img.shields.io/badge/language-CUDA/Python-brightgreen.svg >
     <a href="https://pepy.tech/projects/ffpa-attn"><img src=https://static.pepy.tech/personalized-badge/ffpa-attn?period=total&units=ABBREVIATION&left_color=GRAY&right_color=BLUE&left_text=downloads/pypi ></a>
     <a href="https://pypi.org/project/ffpa-attn/"><img src=https://img.shields.io/github/release/xlite-dev/ffpa-attn.svg?color=GREEN ></a>
@@ -260,7 +260,7 @@ Apache License 2.0
 ```BibTeX
 @misc{deftruth2026ffpa,
   author       = {DefTruth and Butterfingrz},
-  title        = {FFPA: Fast and Memory-Efficient Exact Attention for Large Headdim},
+  title        = {FFPA: Kernel Library for Large Headdim Attention},
   year         = {2026},
   publisher    = {Zenodo},
   version      = {v1.0},
