@@ -203,7 +203,7 @@ NVIDIA-NeMo Automodel PR [#2436](https://github.com/NVIDIA-NeMo/Automodel/pull/2
 ## End-to-End Inference
 
 <div align='center'>
-  <img src='./docs/assets/perf/bench/bench_fp8_tflops_nvidia-rtx-pro-5000-72gb-blackwell_B1_H32_Hkv8_D128_bf16_default.png' width='800px'><br>
+  <img src='./docs/assets/perf/bench/bench_fp8_tflops_nvidia-rtx-pro-5000-72gb-blackwell_B1_H32_Hkv8_D128_bf16_default.png' width='820px'><br>
   <!--
   <img src='./docs/assets/perf/bench/bench_fp8_tflops_nvidia-rtx-pro-6000-blackwell-server-edition_B1_H32_Hkv8_D128_bf16_default.png' width='800px'><br>
   <img src='./docs/assets/perf/bench/bench_fp8_tflops_nvidia-geforce-rtx-5090_B1_H32_Hkv8_D128_bf16_default.png' width='800px'><br>
@@ -215,7 +215,7 @@ The FFPA (FP8/FP4) attention has fully integrated into [Cache-DiT](https://githu
 
 <div align='center'>
   <img src='./docs/assets/perf/bench/bench_fp4_tflops_nvidia-rtx-pro-5000-72gb-blackwell_B1_H32_Hkv8_D128_bf16.png'
-  width='800px'><br>
+  width='820px'><br>
   <!--
   <img src='./docs/assets/perf/bench/bench_fp4_tflops_nvidia-rtx-pro-6000-blackwell-server-edition_B1_H32_Hkv8_D128_bf16.png' width='800px'><br>
   <img src='./docs/assets/perf/bench/bench_fp4_tflops_nvidia-geforce-rtx-5090_B1_H32_Hkv8_D128_bf16.png' width='800px'><br>
