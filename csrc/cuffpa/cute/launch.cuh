@@ -4097,6 +4097,23 @@ void launch_cute_fwd_split_d_m4n2_fp4_sm120_impl(
     bias_plan = ffpa_bias_tile_plan_of(bias_p, Nb, Nh, Nq, Nkv);
     if (bias_plan.mode == 1)
       bias_plan.mode = 0;
+    // PC-0-5: the fp4 m4n2 bias-smem paths (mode 2 TMA double buffer, mode 3
+    // resident fill) hit a 100%-reproducible O corruption on cold bias
+    // calls (bitwise-unstable across identical launches, lse stable,
+    // corruption pinned to one (m-warp, n-warp, v-chunk) PV C tile;
+    // protocol audit closed at the language level and ptxas -O2 /
+    // producer-warp relocation both reproduce it - see RFC PC-0-5). Pin
+    // the gmem direct-read mode (mode 0), which is stable on that
+    // sequence, at ~5% attn-mask cost. RESIDUAL (known, accepted): with a
+    // heavy GPU-work prelude (any matmul burst) the bias template still
+    // shows the same low-probability corruption even in mode 0 - the race
+    // is load-timing sensitive at the hardware level, not bias-smem
+    // specific; the no-bias template is clean under the same load. fp4
+    // m4n2 only serves D>=768 fp4 (rare in production), so this is
+    // documented rather than root-caused (NVIDIA report pending).
+    // FFPA_BIAS_TILE_KEEP=1 restores the smem tile modes.
+    if (bias_plan.mode != 0 && getenv("FFPA_BIAS_TILE_KEEP") == nullptr)
+      bias_plan.mode = 0;
   }
   // Static smem (barrier arrays, ~160B incl. the bias pair) is invisible to
   // the dynamic budget: reserve 256B so the attribute set cannot land past
