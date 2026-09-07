@@ -597,6 +597,11 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_sm120(
       }
     }
 
+    // Bias tail guards: rows/cols of this tile inside the real (Nq, Nkv)
+    // domain; the injector clamps pad rows/cols to these bounds (their scores
+    // are already -INFINITY or dropped by the O-write guards).
+    const int bias_q_valid = min(kBr, Nq - Br_base);
+    const int bias_kv_valid = min(kBc, Nkv - kv_tile * kBc);
     if constexpr (kHasAttnBias && kBiasMode != 0) {
       const int b_stg = kv_tile % kBiasStages;
       const int b_phase = (kv_tile / kBiasStages) & 1;
@@ -633,11 +638,21 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_sm120(
             reinterpret_cast<const cutlass::half_t*>(b_slot2), split_elems);
       CtaBarrier::arrive(&bias_empty[b_stg]);
     } else if constexpr (kHasAttnBias) {
-      ffpa_cute::apply_attn_bias_rowcol<decltype(scores), decltype(tScS_rc),
-                                        kSRows, kSCols>(
-          scores, tScS_rc, attn_bias, attn_bias_dtype, attn_bias_stride_b,
-          attn_bias_stride_h, attn_bias_stride_m, attn_bias_stride_n, Nb_id,
-          Nh_id, Br_base, kv_tile, kBc, inv_scale);
+      const bool full_tile = bias_q_valid >= kBr && bias_kv_valid >= kBc;
+      if (__builtin_expect(full_tile, 1))
+        ffpa_cute::apply_attn_bias_rowcol<decltype(scores), decltype(tScS_rc),
+                                          kSRows, kSCols, false>(
+            scores, tScS_rc, attn_bias, attn_bias_dtype, attn_bias_stride_b,
+            attn_bias_stride_h, attn_bias_stride_m, attn_bias_stride_n, Nb_id,
+            Nh_id, Br_base, kv_tile, kBc, inv_scale, bias_q_valid,
+            bias_kv_valid);
+      else
+        ffpa_cute::apply_attn_bias_rowcol<decltype(scores), decltype(tScS_rc),
+                                          kSRows, kSCols, true>(
+            scores, tScS_rc, attn_bias, attn_bias_dtype, attn_bias_stride_b,
+            attn_bias_stride_h, attn_bias_stride_m, attn_bias_stride_n, Nb_id,
+            Nh_id, Br_base, kv_tile, kBc, inv_scale, bias_q_valid,
+            bias_kv_valid);
     }
 
     ffpa_cute::online_safe_softmax<decltype(scores), decltype(tScS_rc), kORows>(
