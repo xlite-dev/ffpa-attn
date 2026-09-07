@@ -8,6 +8,11 @@
 #include <type_traits>
 #include "common.cuh"
 #include "layout.cuh"
+// Unqualified ffpa names below (utils::div_ceil, ffpa_fp8::...) relied on
+// native/launch.cuh's global `using namespace ffpa;` arriving first in the
+// old launch.cuh include chain; family TUs include this header directly.
+#include "native/utils.cuh"
+using namespace ffpa;
 #ifdef ENABLE_FFPA_CUTE_EXT
 #include "cute/sm_80/split_d.cuh"
 #ifdef ENABLE_FFPA_TMA_EXT

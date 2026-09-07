@@ -37,6 +37,14 @@ class ENV(object):
   # bounds in prefill.cuh. Default 4 (stages 1-4); >4 rarely pays off.
   FFPA_BUILD_MAX_STAGES = int(os.environ.get("FFPA_BUILD_MAX_STAGES", 4))
 
+  # Pipeline stages subset to compile: csv (e.g. "2,3") or "all"
+  # (= 1..FFPA_BUILD_MAX_STAGES). Highest priority, overrides
+  # ENABLE_FFPA_ALL_STAGES. When unset but ENABLE_FFPA_ALL_STAGES is
+  # explicitly set, the legacy semantics apply ("1" -> 1..max, "0" ->
+  # [1, 2]); when both are unset the default is "2,3" (out-of-set runtime
+  # requests are clamped by the generated wrapper, so s1 needs no TU).
+  FFPA_BUILD_STAGES = os.environ.get("FFPA_BUILD_STAGES", "")
+
   # Enable all headdims for FFPA kernels or not, default False.
   # True, headdim will range from 64 to 1024 with step = 64, range(64, 1024, 64)
   # False, headdim will range from 320 to 1024 with step = 64, range(320, 1024, 64)
@@ -383,6 +391,10 @@ class ENV(object):
     )
     formatenv("ENABLE_FFPA_ALL_STAGES", cls.enable_all_mutistages())
     formatenv("FFPA_BUILD_MAX_STAGES", cls.FFPA_BUILD_MAX_STAGES)
+    formatenv(
+      "FFPA_BUILD_STAGES",
+      ",".join(str(s) for s in cls._enabled_stages()),
+    )
     formatenv("ENABLE_FFPA_ALL_HEADDIM", cls.enable_all_headdim())
     formatenv("ENABLE_FFPA_F16_ACC", cls.enable_f16_acc())
     formatenv("ENABLE_FFPA_PREFETCH_QKV", cls.enable_prefetch_qkv())
@@ -457,17 +469,35 @@ class ENV(object):
     """Generate per-(variant, headdim, stage) TUs under ``csrc/cuffpa/generated/``.
 
     Layout (variant ∈ {fp16f16 (only with ENABLE_FFPA_F16_ACC), fp16f32,
-    bf16f32}):
+    bf16f32}; dtype token ∈ {fp16, bf16}):
 
     - ``fwd_<variant>_hdim{d}.cu``: lightweight wrapper TU. Includes only
       ``fwd_decls.h`` (NOT ``launch.cuh``); dispatches on ``stages`` to the
-      per-stage symbols ``ffpa_attn_fwd_<variant>_d{d}_s{s}``. Keeps the
-      original dispatch symbol name so ``fwd_dispatch.cu`` / ``ffpa_api.cc``
-      are untouched.
-    - ``fwd_<variant>_hdim{d}_s{s}.cu``: heavy TU. Includes ``launch.cuh``
-      and contains a single ``launch_ffpa_attn_fwd_template`` instantiation
-      per stage, so ``MAX_JOBS`` parallelism is no longer bottlenecked by a
-      single TU serially compiling all stages.
+      per-stage symbols ``ffpa_attn_fwd_<variant>_d{d}_s{s}``, clamping
+      out-of-set requests to the nearest compiled stage (s > max -> max,
+      s < min -> min). Keeps the original dispatch symbol name so
+      ``fwd_dispatch.cu`` / ``ffpa_api.cc`` are untouched.
+    - ``fwd_<variant>_hdim{d}_s{s}.cu``: dispatcher TU. Includes
+      ``launch.cuh`` and contains a single ``launch_ffpa_attn_fwd_template``
+      instantiation; the family entries resolve at link time (explicit
+      instantiation in the family TUs below provides the strong symbols).
+    - ``fwd_<variant>_native_hdim{d}_s{s}.cu``: native family TU
+      (``dispatch/native.cuh``): explicit instantiation of
+      ``ffpa_fwd_native_sm80`` / ``ffpa_fwd_native_tma`` with the
+      variant-dependent QK/PV constexprs.
+    - ``fwd_<dtype>_cute16_hdim{d}_s{s}.cu`` (ENABLE_FFPA_CUTE_EXT):
+      cute16 family TU (``dispatch/cute16.cuh``): explicit instantiation
+      of ``ffpa_fwd_cute16``, ``ffpa_fwd_cute16_sm80`` and the hybrid
+      stage-1 entries (kPersistMaxD 224/256); keyed by dtype so fp16f16
+      and fp16f32 share one __half TU (duplicate explicit instantiation
+      would be a compile error).
+    - ``fwd_<dtype>_fp8_hdim{d}_s{s}.cu`` (ENABLE_FFPA_TMA_EXT): fp8
+      family TU (``dispatch/fp8.cuh``): explicit instantiation of
+      ``ffpa_fwd_fp8``.
+    - ``fwd_<dtype>_fp4_hdim{d}.cu`` (ENABLE_FFPA_TMA_EXT): fp4 family
+      TU (``dispatch/fp4.cuh``): a single TU per (dtype, d) instantiating
+      ``ffpa_fwd_fp4`` for every compiled stage (the fp4 entry ignores
+      kStage, so the kernel templates codegen once inside the TU).
 
     The generated dir is wiped and rewritten on every call so stale files
     from a previous config never leak into the build. It is gitignored.
@@ -487,30 +517,19 @@ class ENV(object):
       shutil.rmtree(gen_dir, ignore_errors=True)
       os.makedirs(gen_dir, exist_ok=True)
 
-      stages = cls._enabled_stages()
-      variants = cls._enabled_variants()
-
       decls_path = os.path.join(gen_dir, "fwd_decls.h")
       cls._write_file(decls_path, cls._render_decls_header(headdims))
       generated.append(decls_path)
 
-      for d in headdims:
-        for variant, t_in, prefix in variants:
-          wrapper_path = os.path.join(gen_dir, f"fwd_{variant}_hdim{d}.cu")
-          cls._write_file(wrapper_path, cls._render_wrapper_tu(variant, d))
-          generated.append(wrapper_path)
-          for s in stages:
-            stage_path = os.path.join(gen_dir, f"fwd_{variant}_hdim{d}_s{s}.cu")
-            cls._write_file(
-              stage_path, cls._render_stage_tu(variant, t_in, prefix, d, s)
-            )
-            generated.append(stage_path)
-          fwd_generated_count += 1 + len(stages)
+      for name, content in cls._iter_generated_tus(headdims):
+        path = os.path.join(gen_dir, name)
+        cls._write_file(path, content)
+        generated.append(path)
 
       dispatch_path = os.path.join(gen_dir, "fwd_dispatch.cu")
       cls._write_file(dispatch_path, cls._render_dispatch_tu(headdims))
       generated.append(dispatch_path)
-      fwd_generated_count += 1
+      fwd_generated_count = sum(1 for p in generated if p.endswith(".cu"))
 
     if build_pkg:
       _logging_msg(
@@ -549,12 +568,43 @@ class ENV(object):
   def _enabled_stages(cls):
     """Return the stage values to instantiate for the current build config.
 
-    ``ENABLE_FFPA_ALL_STAGES=1`` → ``1..FFPA_BUILD_MAX_STAGES``; ``=0`` →
-    ``[1, 2]``. Stage 1 is always present (runtime fallback).
+    Priority: explicit ``FFPA_BUILD_STAGES`` (csv subset or ``all`` =
+    ``1..FFPA_BUILD_MAX_STAGES``) first; else an explicitly set
+    ``ENABLE_FFPA_ALL_STAGES`` keeps the legacy semantics (``1`` ->
+    ``1..max``, ``0`` -> ``[1, 2]``); both unset -> the ``[2, 3]``
+    default. Out-of-set runtime requests are clamped by the generated
+    wrapper (nearest compiled stage), so s1 no longer needs a TU.
+
+    :returns: Sorted list of ``int`` stage values.
+    :raises RuntimeError: if ``FFPA_BUILD_STAGES`` parses to an empty list
+      or contains a stage outside ``[1, FFPA_BUILD_MAX_STAGES]``.
     """
-    if cls.enable_all_mutistages():
-      return list(range(1, cls.FFPA_BUILD_MAX_STAGES + 1))
-    return [1, 2]
+    raw = cls.FFPA_BUILD_STAGES.strip()
+    if raw:
+      if raw.lower() == "all":
+        return list(range(1, cls.FFPA_BUILD_MAX_STAGES + 1))
+      stages = []
+      for tok in re.split(r"[;,\s]+", raw):
+        if not tok:
+          continue
+        s = int(tok)
+        if not 1 <= s <= cls.FFPA_BUILD_MAX_STAGES:
+          raise RuntimeError(
+            f"FFPA_BUILD_STAGES={raw!r}: stage {s} out of range "
+            f"[1, {cls.FFPA_BUILD_MAX_STAGES}]."
+          )
+        if s not in stages:
+          stages.append(s)
+      if not stages:
+        raise RuntimeError(
+          f"FFPA_BUILD_STAGES={raw!r} parsed to an empty stage list."
+        )
+      return sorted(stages)
+    if "ENABLE_FFPA_ALL_STAGES" in os.environ:
+      if cls.enable_all_mutistages():
+        return list(range(1, cls.FFPA_BUILD_MAX_STAGES + 1))
+      return [1, 2]
+    return [2, 3]
 
   @classmethod
   def _enabled_variants(cls):
@@ -562,7 +612,22 @@ class ENV(object):
 
     fp16f16 is prepended only when ``ENABLE_FFPA_F16_ACC`` is on; the fp16f32
     / bf16f32 paths are always generated.
+
+    :raises RuntimeError: if ``ENABLE_FFPA_F16_ACC`` is combined with both
+      ``ENABLE_FFPA_FORCE_QK_F16`` and ``ENABLE_FFPA_FORCE_PV_F16`` (the
+      docs mark them mutually exclusive; with both forced, fp16f32 and
+      fp16f16 collapse to the same QK=0/PV=0 template ids and the native
+      family TUs would emit duplicate explicit instantiations).
     """
+    if (
+      cls.enable_f16_acc() and cls.ENABLE_FFPA_FORCE_QK_F16
+      and cls.ENABLE_FFPA_FORCE_PV_F16
+    ):
+      raise RuntimeError(
+        "ENABLE_FFPA_F16_ACC cannot be combined with both "
+        "ENABLE_FFPA_FORCE_QK_F16 and ENABLE_FFPA_FORCE_PV_F16: fp16f16 and "
+        "fp16f32 would resolve to identical template ids (QK=0, PV=0)."
+      )
     variants = [
       ("fp16f32", "__half", cls._FP16F32_PREFIX),
       ("bf16f32", "__nv_bfloat16", cls._BF16F32_PREFIX),
@@ -660,10 +725,13 @@ class ENV(object):
   def _render_wrapper_dispatch(cls, variant: str, d: int) -> str:
     """Render the ``if (stages == s) {...}`` chain calling per-stage symbols.
 
-    Stage 1 is the fallback (covers ``stages == 1`` and any out-of-range
-    value), mirroring the legacy dispatch semantics.
+    Out-of-set requests clamp to the nearest compiled stage: ``stages >
+    max(S)`` -> ``max(S)`` (the last exact branch renders as ``>=``), and
+    anything below ``min(S)`` falls through to ``min(S)``. This replaces
+    the legacy "always fall back to s1" chain, so s1 needs no dedicated
+    TU unless it is in the compiled set.
     """
-    branches = [s for s in cls._enabled_stages() if s != 1]
+    stages = sorted(cls._enabled_stages())
     call = (
       "Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale, "
       "dropout_p, philox_seed, philox_offset, fp8_smooth_k, fp8_smooth_v, "
@@ -672,16 +740,17 @@ class ENV(object):
       "fp4_hybrid, fp4_hybrid_n_early, fp8_hadamard, fp4_hadamard, "
       "fp4_pv_mm_type, fp4_smooth_v"
     )
-    if not branches:
-      return f"  ffpa_attn_fwd_{variant}_d{d}_s1({call});\n"
+    if len(stages) == 1:
+      return f"  ffpa_attn_fwd_{variant}_d{d}_s{stages[0]}({call});\n"
     lines = []
-    for i, s in enumerate(branches):
+    for i, s in enumerate(stages):
       kw = "if" if i == 0 else "else if"
-      lines.append(f"  {kw} (stages == {s}) {{")
+      op = ">=" if s == stages[-1] else "=="
+      lines.append(f"  {kw} (stages {op} {s}) {{")
       lines.append(f"    ffpa_attn_fwd_{variant}_d{d}_s{s}({call});")
       lines.append("  }")
     lines.append("  else {")
-    lines.append(f"    ffpa_attn_fwd_{variant}_d{d}_s1({call});")
+    lines.append(f"    ffpa_attn_fwd_{variant}_d{d}_s{stages[0]}({call});")
     lines.append("  }")
     return "\n".join(lines) + "\n"
 
@@ -699,7 +768,12 @@ class ENV(object):
   def _render_stage_tu(
     cls, variant: str, t_in: str, prefix: list, d: int, s: int
   ) -> str:
-    """Heavy stage TU: one ``launch_ffpa_attn_fwd_template`` instantiation."""
+    """Dispatcher TU: one ``launch_ffpa_attn_fwd_template`` instantiation.
+
+    Only includes ``launch.cuh`` (routing); the family entry symbols
+    resolve at link time against the strong explicit instantiations in
+    the per-family TUs below.
+    """
     body = list(prefix)
     body.append(
       f"  launch_ffpa_attn_fwd_template<{t_in}, {d}, kMmaAccFloat32QK, "
@@ -717,6 +791,142 @@ class ENV(object):
       cls._signature(f"ffpa_attn_fwd_{variant}_d{d}_s{s}", False) + "\n" +
       "\n".join(body) + "\n}\n"
     )
+
+  # Filename token per input dtype for the dtype-keyed family TUs
+  # (cute16/fp8/fp4). fp16f16 and fp16f32 share the __half TU.
+  _DTYPE_TOKENS = {
+    "__half": "fp16",
+    "__nv_bfloat16": "bf16",
+  }
+
+  @classmethod
+  def _iter_generated_tus(cls, headdims):
+    """Yield ``(filename, content)`` for every generated forward TU.
+
+    Wrappers / dispatcher TUs / native family TUs are keyed by
+    (variant, d, s) - the native entries take the variant-dependent
+    QK/PV constexprs. cute16/fp8/fp4 family TUs are keyed by dtype only
+    (a duplicate explicit instantiation across TUs is a compile error)
+    and are macro-gated: CUTE ext for cute16, TMA ext for fp8/fp4. The
+    fp4 entry ignores kStage, so one TU per (dtype, d) covers all
+    compiled stages.
+    """
+    stages = cls._enabled_stages()
+    variants = cls._enabled_variants()
+    for d in headdims:
+      for variant, t_in, prefix in variants:
+        yield (
+          f"fwd_{variant}_hdim{d}.cu",
+          cls._render_wrapper_tu(variant, d),
+        )
+        for s in stages:
+          yield (
+            f"fwd_{variant}_hdim{d}_s{s}.cu",
+            cls._render_stage_tu(variant, t_in, prefix, d, s),
+          )
+          yield (
+            f"fwd_{variant}_native_hdim{d}_s{s}.cu",
+            cls._render_native_family_tu(t_in, prefix, d, s),
+          )
+      seen_dtypes = set()
+      for _, t_in, _ in variants:
+        if t_in in seen_dtypes:
+          continue
+        seen_dtypes.add(t_in)
+        token = cls._DTYPE_TOKENS[t_in]
+        if cls.enable_cute_ext():
+          for s in stages:
+            yield (
+              f"fwd_{token}_cute16_hdim{d}_s{s}.cu",
+              cls._render_cute16_family_tu(t_in, d, s),
+            )
+        if cls.enable_tma_ext():
+          for s in stages:
+            yield (
+              f"fwd_{token}_fp8_hdim{d}_s{s}.cu",
+              cls._render_fp8_family_tu(t_in, d, s),
+            )
+          yield (
+            f"fwd_{token}_fp4_hdim{d}.cu",
+            cls._render_fp4_family_tu(t_in, d, stages),
+          )
+
+  @classmethod
+  def _render_native_family_tu(
+    cls, t_in: str, prefix: list, d: int, s: int
+  ) -> str:
+    """Native family TU: explicit instantiation of the sm80 + TMA entries.
+
+    The variant prefix lines (namespace-scope constexpr QK/PV) match the
+    dispatcher TU's, so these strong symbols bind to the same template
+    ids the routing layer references under any FORCE_{QK,PV}_F16 config.
+    """
+    lines = [
+      "// AUTO-GENERATED by env.py. DO NOT EDIT.",
+      '#include "dispatch/native.cuh"',
+      "",
+    ]
+    lines += [ln.lstrip() for ln in prefix]
+    lines.append(
+      f"template void ffpa::ffpa_fwd_native_sm80<{t_in}, {d}, "
+      f"kMmaAccFloat32QK, kMmaAccFloat32PV, {s}>"
+      "(const ffpa::FfpaFwdParams&);"
+    )
+    lines.append(
+      f"template void ffpa::ffpa_fwd_native_tma<{t_in}, {d}, "
+      f"kMmaAccFloat32QK, kMmaAccFloat32PV, {s}>"
+      "(const ffpa::FfpaFwdParams&);"
+    )
+    return "\n".join(lines) + "\n"
+
+  @classmethod
+  def _render_cute16_family_tu(cls, t_in: str, d: int, s: int) -> str:
+    """CuTe fp16 family TU: cute16 sm120/sm80 entries + hybrid stage-1."""
+    lines = [
+      "// AUTO-GENERATED by env.py. DO NOT EDIT.",
+      '#include "dispatch/cute16.cuh"',
+      "",
+      f"template void ffpa::ffpa_fwd_cute16<{t_in}, {d}, {s}>"
+      "(const ffpa::FfpaFwdParams&);",
+      f"template void ffpa::ffpa_fwd_cute16_sm80<{t_in}, {d}, {s}>"
+      "(const ffpa::FfpaFwdParams&);",
+      f"template void ffpa::ffpa_fwd_fp16_stage1<{t_in}, {d}, {s}, 224>"
+      "(const ffpa::FfpaFwdParams&);",
+      f"template void ffpa::ffpa_fwd_fp16_stage1<{t_in}, {d}, {s}, 256>"
+      "(const ffpa::FfpaFwdParams&);",
+    ]
+    return "\n".join(lines) + "\n"
+
+  @classmethod
+  def _render_fp8_family_tu(cls, t_in: str, d: int, s: int) -> str:
+    """FP8 family TU: explicit instantiation of the CUTE_TMA_FP8 entry."""
+    return (
+      "// AUTO-GENERATED by env.py. DO NOT EDIT.\n"
+      '#include "dispatch/fp8.cuh"\n\n'
+      f"template void ffpa::ffpa_fwd_fp8<{t_in}, {d}, {s}>"
+      "(const ffpa::FfpaFwdParams&);\n"
+    )
+
+  @classmethod
+  def _render_fp4_family_tu(cls, t_in: str, d: int, stages: list) -> str:
+    """FP4 family TU: one TU per (dtype, d) covering every compiled stage.
+
+    The fp4 launcher ignores kStage (fixed by traits), so all explicit
+    instantiations live in a single TU and the kernel templates codegen
+    once inside it. Exception: the hybrid path forwards kStage to the
+    fp16 stage-1 entry, which the cute16 family TU instantiates per stage.
+    """
+    lines = [
+      "// AUTO-GENERATED by env.py. DO NOT EDIT.",
+      '#include "dispatch/fp4.cuh"',
+      "",
+    ]
+    for s in stages:
+      lines.append(
+        f"template void ffpa::ffpa_fwd_fp4<{t_in}, {d}, {s}>"
+        "(const ffpa::FfpaFwdParams&);"
+      )
+    return "\n".join(lines) + "\n"
 
   @classmethod
   def _render_dispatch_tu(cls, headdims) -> str:

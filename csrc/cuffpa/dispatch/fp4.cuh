@@ -16,6 +16,7 @@ void ffpa_fwd_fp4(const FfpaFwdParams& p) {
   // rows fall back to the fp16 persist_d kernel (hybrid), same
   // as fp8: P-quantization noise on short-row softmax rows.
   TORCH_CHECK(p.dropout_p == 0.0, "fp4 sm120 path does not support dropout");
+#ifdef ENABLE_FFPA_CUTE_EXT
   // NHD (BNHD) views and strided fused-QKV rows are consumed natively
   // by the fp4 pre-kernels (Fp8InputLayout strides) and every fp16
   // stage-1 variant (persist-D, split-D, m4n2); the causal/padded
@@ -178,6 +179,9 @@ void ffpa_fwd_fp4(const FfpaFwdParams& p) {
                 "ffpa_attn: fp4 requires 64-multiple head_dim in "
                 "[64,1024]");
   }
+#else
+  TORCH_CHECK(false, "ffpa_attn: cute ext not compiled");
+#endif
 }
 #else
 template <typename kDataType, const int kHeadDim, const int kStage>

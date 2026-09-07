@@ -2,22 +2,14 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <ATen/ops/constant_pad_nd.h>
 #include <c10/cuda/CUDAGuard.h>
-#include <cstring>
+#include <cstdlib>
 #include <optional>
 #include "backend.h"
 #include "layout.cuh"
+// Routing-only: the family entry definitions live in dispatch/*.cuh and are
+// explicitly instantiated by the generated per-family TUs (env.py); this TU
+// must never include the impl headers or the heavy codegen creeps back in.
 #include "dispatch.cuh"
-#include "native/launch.cuh"
-// Green-checkpoint stage: the family entry definitions stay visible in this
-// TU (implicit instantiation == pre-split behavior). The C' flip drops these
-// includes; the generated per-family TUs then provide the instantiations.
-#include "dispatch/native.cuh"
-#include "dispatch/cute16.cuh"
-#include "dispatch/fp8.cuh"
-#include "dispatch/fp4.cuh"
-#ifdef ENABLE_FFPA_CUTE_EXT
-#include "cute/launch.cuh"
-#endif
 using namespace ffpa;
 
 // Runtime arguments:
