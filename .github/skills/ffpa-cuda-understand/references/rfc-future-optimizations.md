@@ -65,7 +65,7 @@
 
 > 读法：列方向看某个量化家族缺什么；行方向看某能力在哪些家族缺口。persist-D 三族功能最全，**所有大 D（超出 persist-D 上限）场景目前被上述 ✗ 卡住**。
 >
-> **正确性现状（PC-0-5 止血，2026-09-04）**：**native / fp16 全族 / fp8 六族 / fp4 split_d / fp4 persist_d 的 bias 路径全部 bitwise 稳定**（persist_d D=256/D=128 各 0/30 实测，`.tmp/pc5-race/m4n2_persistd.py`）；**唯一 PC-0-5 问题 = fp4 split_d_m4n2 + attn_bias**——2026-09-04 重启深挖证实 pure bias（无 prelude）在 mode 2/3 下 **100% 触发**（推翻 09-02"纯 bias 稳定"定性），指纹恒定为单个 (m-warp, n-warp, v-chunk) PV C tile；**修复 = launcher pin mode 0（gmem 直读）**，pure 序列 10/10 稳定（代价 attn-mask ~5%）；**残留（已接受）**：重负载前置（任意 GPU 工作）下 bias 模板仍低概率不稳（mode 0 亦然，硬件负载时序层，no-bias 模板同负载干净），fp4 m4n2 仅服务 D≥768 fp4、场景少，待 NVIDIA 上报。`FFPA_BIAS_TILE_KEEP=1` 可恢复 mode 2/3。详见完成清单 PC-0-5。**注意区分**：fp4 persist_d 另有一处独立的低概率（3/30）epilogue race（先于 PC-0-1 存在、非 PC-0-5），persist_d 无 mode 0 等价路径，需独立排查；另发现 m4n2 **Nq=64（MB=1）illegal access 独立 bug 待修**。
+> **正确性现状（PC-0-5 止血，2026-09-04）**：**native / fp16 全族 / fp8 六族 / fp4 split_d / fp4 persist_d 的 bias 路径全部 bitwise 稳定**（persist_d D=256/D=128 各 0/30 实测，`.tmp/pc5-race/m4n2_persistd.py`）；**唯一 PC-0-5 问题 = fp4 split_d_m4n2 + attn_bias**——2026-09-04 重启深挖证实 pure bias（无 prelude）在 mode 2/3 下 **100% 触发**（推翻 09-02"纯 bias 稳定"定性），指纹恒定为单个 (m-warp, n-warp, v-chunk) PV C tile；**修复 = launcher pin mode 0（gmem 直读）**，pure 序列 10/10 稳定（代价 attn-mask ~5%）；**残留（已接受）**：重负载前置（任意 GPU 工作）下 bias 模板仍低概率不稳（mode 0 亦然，硬件负载时序层，no-bias 模板同负载干净），fp4 m4n2 仅服务 D≥768 fp4、场景少，待 NVIDIA 上报。`FFPA_BIAS_TILE_KEEP=1` 可恢复 mode 2/3。详见完成清单 PC-0-5。**注意区分**：fp4 persist_d 另有一处独立的低概率（3/30）epilogue race（先于 PC-0-1 存在、非 PC-0-5），persist_d 无 mode 0 等价路径，需独立排查；m4n2 的 **Nq=64 illegal access 已修复（546786a，2026-09-07）**：bias 尾 tile OOB 三缺陷清扫（mode 3 resident 分配 pad + gmem kTailTile 双实例，热路径指令级零开销；m4n2 mode 3 升级永久禁用——deterministic 8B LDS.64 越界读）。
 
 ## RFC 总览（按优先级）
 
