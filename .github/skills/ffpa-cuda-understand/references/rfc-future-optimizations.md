@@ -809,7 +809,8 @@ native 家族覆盖非整 D（补齐与 CuTe 家族的对齐）。
     `minor_dim`/`major_stride_bytes` 改用运行时 `d_og = Q.size(3)`，
     TMA OOB 自动零填充 pad 列（无需 kernel 改动）。
 - **约束**：D_og%8==0（16B stride 对齐 + 16B chunk 列守卫粒度）；
-  `--headdim all` 全量编译集 {64..1024 step 64} 16 档无空洞。
+  `ENABLE_FFPA_ALL_HEADDIM=1` 全量编译集 {64..1024 step 64} 16 档无空洞
+  （现 `--headdim all` 已改为 {64,128,192,256,320,512,768}，验收当时为旧全量集）。
 - **验收**（规范 3，`ffpa_attn.bench` CLI 全链路）：
   - `--cuda-impl native --D 328 --tasks self-attn,cross-attn,decode-attn,gqa,causal,non-aligned` 通过（328→384）；
   - `--cuda-impl native --D 120`（`FFPA_CUDA_ALLOW_SMALL_D=1`，120→128）全 task 通过；

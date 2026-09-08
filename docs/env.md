@@ -24,8 +24,8 @@ These only affect the ccache-based fast-build wrapper.
 The wrapper also accepts CLI flags that map onto the variables below (flags override same-named env vars; unknown args pass through to `setup.py build_ext` / `pip install -e`):
 
 ```bash
-# cuda impl + cute + tma, editable install, all headdims, 32 jobs
-bash tools/build_fast.sh --arch sm_120f --ext all --editable --headdim all --jobs 32
+# cuda impl + cute + tma, editable install, default headdim set, 32 jobs
+bash tools/build_fast.sh --arch sm_120f --ext all --editable --headdim default --jobs 32
 # equivalent env-var form:
 FFPA_BUILD_ARCH=sm_120f ENABLE_FFPA_CUDA_IMPL=1 ENABLE_FFPA_CUTE_EXT=1 \
 ENABLE_FFPA_TMA_EXT=1 FFPA_EDITABLE=1 MAX_JOBS=32 bash tools/build_fast.sh

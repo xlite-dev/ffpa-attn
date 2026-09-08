@@ -16,7 +16,7 @@
 # Usage (run with --help for all flags; flags map onto the FFPA_* /
 # ENABLE_FFPA_* env vars and override same-named env vars):
 #   bash tools/build_fast.sh                                   # editable + ext=cuda default
-#   bash tools/build_fast.sh --arch sm_120f --ext all --headdim all --jobs 32
+#   bash tools/build_fast.sh --arch sm_120f --ext all --headdim default --jobs 32
 #   bash tools/build_fast.sh --arch sm_89,sm_120f              # multi-arch
 #   bash tools/build_fast.sh --clean --headdim 256,512         # fast iteration
 #   bash tools/build_fast.sh --no-editable bdist_wheel         # PEP 517-compatible wheel
@@ -45,11 +45,13 @@ Flags (override same-named env vars; env reference: docs/env.md):
   --headdim <list|all|default>
                        FFPA_DEV_HEADDIMS subset, e.g. 256,512; 'all' builds
                        64,128,192,256,320,512,768; 'default' builds the same
-                       set minus 768 (fast full-feature iteration). Omitting
-                       the flag builds the legacy default set (multiples of 64
-                       in [320, 1024]), governed by ENABLE_FFPA_ALL_HEADDIM
-                       (default 0). Pass other headdims (e.g. 32, 96, 1024)
-                       explicitly via --headdim 32,96,1024.
+                       set minus 768 (fast full-feature iteration). Any other
+                       headdim (e.g. 32, 96, 832..1024) is NOT covered by
+                       'all'/'default' and must be requested manually via an
+                       explicit list: --headdim 32,96,1024. Omitting the flag
+                       builds the legacy default set (multiples of 64 in
+                       [320, 1024]), governed by ENABLE_FFPA_ALL_HEADDIM
+                       (default 0).
   --stages <csv|all>   FFPA_BUILD_STAGES: build stage subset, e.g. '2,3' or
                        'all' (= 1..max). Overrides the legacy
                        ENABLE_FFPA_ALL_STAGES; default without both: '2,3'.
@@ -122,6 +124,7 @@ while [[ $# -gt 0 ]]; do
     --headdim)
       require_value "$@"
       HEADDIM_SET=1
+      # all/default are fixed sets; any other headdim needs an explicit list.
       if [[ "${2,,}" == "all" ]]; then
         unset ENABLE_FFPA_ALL_HEADDIM
         export FFPA_DEV_HEADDIMS="64,128,192,256,320,512,768"
