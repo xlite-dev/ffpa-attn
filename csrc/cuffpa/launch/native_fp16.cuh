@@ -2,7 +2,7 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 #include "backend.h"
-#include "common.cuh"
+#include "../common.cuh"
 #include "native/sm_80/split_d.cuh"
 #include "native/sm_80/split_kv.cuh"
 #ifdef ENABLE_FFPA_TMA_EXT

@@ -3,8 +3,8 @@
 // ffpa_fwd_fp16_stage1<...,256> instead of direct fp16 launcher calls.
 #pragma once
 #include "dispatch.cuh"
-#include "dispatch/hybrid.cuh"
-#include "cute/launch.cuh"
+#include "dispatch/cute_hybrid.cuh"
+#include "launch/cute_fp4.cuh"
 
 namespace ffpa {
 

@@ -71,7 +71,7 @@ flowchart TD
     E -- D≤256 未开 small-D env / D>1024 /<br/>8≤Nq<512 / Nkv<512 / grad 等 --> F["SDPA fallback<br/>(torch._C._nn.sdpa)"]
     E -- 通过 --> G["_fwd_cuda torch op<br/>(cuda/__init__.py)"]
     G --> H["ffpa_api.cc<br/>dtype/acc/pad 分发 → generated per-headdim 入口"]
-    H --> I["launch_ffpa_attn_fwd_template<br/>(csrc/cuffpa/launch.cuh)"]
+    H --> I["launch_ffpa_attn_fwd_template<br/>(csrc/cuffpa/launch/router.cuh)"]
     I --> J1["Native cp.async (sm80+)<br/>+ split-KV decode"]
     I --> J2["Native TMA (sm90/100 WS,<br/>sm120 non-WS)"]
     I --> J3["CUTE_TMA fp16 家族 (sm120)<br/>persist-D / split-D / M4N2"]
@@ -88,9 +88,10 @@ flowchart TD
 | `src/ffpa_attn/ffpa_attn_interface.py` | SDPA 对齐签名入口、meta 校验、SDPA fallback 路由 |
 | `src/ffpa_attn/cuda/__init__.py` | `_fwd_cuda` torch op 注册、O/lse 分配、NHD permute 归一化 |
 | `csrc/cuffpa/ffpa_api.cc` | dtype×acc 分发、head_dim pad（O-only）、generated dispatcher |
-| `csrc/cuffpa/launch.cuh` | **顶层 dispatcher**：impl hint → 路径；hybrid stage-1 编排；NHD/strided 物化决策 |
-| `csrc/cuffpa/cute/launch.cuh` | CUTE 家族 launcher：TMA descriptor 构建、布局 gate（`ffpa_is_nhd_view` / `ffpa_is_strided_nhd` / `ffpa_layout_of`）、fp8/fp4 前处理链编排 |
-| `csrc/cuffpa/native/launch.cuh` | Native kernel 编译期 config（MMA atom、stage、smem 复用、decode split 数选择） |
+| `csrc/cuffpa/launch/router.cuh` | **顶层 dispatcher**：impl hint → 路径；hybrid stage-1 编排；NHD/strided 物化决策 |
+| `csrc/cuffpa/launch/{cute_fp16,cute_fp8,cute_fp4}.cuh` | CUTE 家族 launcher（按精度拆分）：TMA descriptor 构建、fp8/fp4 前处理链编排 |
+| `csrc/cuffpa/launch/common.cuh` | CUTE 家族共享 helper：布局 gate（`ffpa_is_nhd_view` / `ffpa_is_strided_nhd` / `ffpa_layout_of`）、bias tile plan |
+| `csrc/cuffpa/launch/native_fp16.cuh` | Native kernel 编译期 config（MMA atom、stage、smem 复用、decode split 数选择） |
 | `csrc/cuffpa/cute/{fp8,fp4}/` | 量化前处理 kernel（quantize / kv_mean / delta_s / smooth）与主 kernel |
 
 ---
@@ -152,7 +153,7 @@ Native 是 `AUTO`/`NATIVE` hint 的默认路径，也是 TMA super-path 中 sm90
 | split-KV decode 两阶段 | sm80+ | `native/sm_80/split_kv.cuh` | `Nq==1 && num_splits>1 && 无 bias/dropout` |
 | TMA split-D | sm90/100/120 | `native/sm_120/split_d.cuh` | `TMA` hint；或 sm120 上 fp16 家族带 bias/dropout 的回退；或 `D%32!=0` 的非 cute 回退 |
 
-Dispatch 细节（`launch.cuh`）：
+Dispatch 细节（`launch/native_fp16.cuh`）：
 
 - **sm90/100（228KB smem）**：WS（warp-specialized）路径，`setmaxnreg` 生效。clean path（无 bias/dropout 且 `D≤512`）用 `kPersistQg2s=1`（Q 常驻 smem），否则 `kPersistQg2s=0`。
 - **sm120（99KB smem）**：non-WS（`kNonWS=1`），全部 256 线程做 MMA、thread 0 inline 发 TMA。注释明确：**sm_120a 上没有 WGMMA**，且 `setmaxnreg` 在 sm_120a 上会触发 ptxas C7506 被静默忽略（所以构建用 `sm_120f`）。non-WS 相对 cp.async legacy +2~7%。
@@ -552,9 +553,9 @@ softmax_scale 恒按真实 D（Python 解析 `1/sqrt(D_og)`）。
 |---|---|
 | `FFPA_CUDA_ALLOW_SMALL_D=1` | 允许 CUDA backend 跑 D≤256（否则 SDPA fallback） |
 | `FFPA_CUTE_ALLOW_SMALL_D` / `FFPA_TRITON_ALLOW_SMALL_D` | 同上，cutedsl/triton |
-| `FFPA_FP8_FORCE_KERNEL=split_d\|m4n2` | 强制 fp8 split-D kernel A/B（224<D≤1024） |
-| `FFPA_FP8_PQUANT_PER_ROW=1` | per-row P 量化（满量程，禁 lazy rescale） |
-| `FFPA_FP4_PAD_TORCH=1` | fp4 pad 走 torch 物化路径（A/B 对照） |
+| `FFPA_FP8_FORCE_KERNEL=split_d\|m4n2` | 强制 fp8 split-D kernel A/B（224<D≤1024）（debug build only） |
+| `FFPA_FP8_PQUANT_PER_ROW=1` | per-row P 量化（满量程，禁 lazy rescale）（debug build only） |
+| `FFPA_FP4_PAD_TORCH=1` | fp4 pad 走 torch 物化路径（A/B 对照）（debug build only） |
 | `FFPA_FP8_KV_STAGES="K,V"` | fp8 persist-D stages 组合实验 dispatch |
 | `FFPA_PTXAS_VERBOSE=1` | 注入 `-Xptxas -v`（须配 `FFPA_NVCC_THREADS=1`，ccache shim 坑） |
 
@@ -575,6 +576,9 @@ bash ./build.sh --arch sm_120f --headdim <list> --ext all --jobs 64
 # sm_120f（非 sm_120a）才能让 setmaxnreg 生效（120a 上 ptxas C7506 静默忽略）
 # 开发测试期间避免全量编译headdim，减少编译时间；只编译需要测试的headdim，比如 128/512等
 # 开发收敛后再全量编译 headdim，避免 bench 时遇到未编译 headdim 报错
+# debug 构建开关 --debug-ext <fp16|fp8|fp4 csv|all>（默认 none）按需使用：只开正在调试的家族；
+# 盲目 --debug-ext all 编译大幅变慢（全家族 debug getenv 分支 + fp8 FORCE_KERNEL 双 split-D
+# 实例化，实测 ~3.6x：1320s vs 默认 367s）；上述 debug env 开关仅在对应家族 debug 构建中存在
 # 另外注意：AutoDL上的测试机器最多 --jobs 6，避免CPU 过载被Kill
 ```
 
@@ -649,7 +653,7 @@ ffpa 的 stage-2 实现直接对 `chunk_lse` = $m_i+\ln l_i$ 做 log-sum-exp： 
 
 **split 数选择**（`select_decode_num_splits`，波效率贪心）：parallelism 充足（`batch_nheads_mblocks ≥ 0.8·SMs`）时 splits=1；否则枚举 `num_splits ∈ [1, min(max_splits, SMs, n_blocks)]`，效率 $\eta(n)=\frac{n_w}{\lceil n_w\rceil}$（ $n_w$ = waves = 并行块数/SM 数）取最大；`active_rows==1`（真 decode）取 $\arg\max\eta$，其余场景在 $\eta\ge0.85\eta_{\max}$ 的较小 split 数中取（少合并开销）。`is_split_eligible` 排除不减少 tile/块的冗余 split。
 
-**ffpa 代码**：`native/sm_80/split_kv.cuh`（s1: per-split partial + chunk_lse；s2: merge），入口在 `native/launch.cuh` 的 `Nq==1 && num_splits>1 && !bias && !dropout` 分支。
+**ffpa 代码**：`native/sm_80/split_kv.cuh`（s1: per-split partial + chunk_lse；s2: merge），入口在 `launch/native_fp16.cuh` 的 `Nq==1 && num_splits>1 && !bias && !dropout` 分支。
 
 **含义**：decode fast-path 仅存在于 native 路径；量化路径（fp8/fp4）小 $N_q$ 的不划算来自固定前处理链（§6.4），不是 merge 数学。
 
@@ -713,7 +717,7 @@ QK 与 PV 的 fragment 生命周期不重叠（Q/K frags 在 softmax 前已死�
 
 **代价与交叉点**。M4N2 的代价：kBr 减半（CTA 数翻倍、单 CTA 工作量减半）；P 必须 SMEM roundtrip（每 N-warp 只持半列，warp 内 reshuffle 无法重建完整 P：stmatrix→SMEM→LDSM_N，8KB/KV-tile）；cross-N-warp softmax（§11.12）。实测（5090，N=8192，fp16）：D≤640 M8N1 快 +2~16%，D≥768 M4N2 快（+7%@768、+11%@896、**+55%@1024**），dispatch 交叉点 D=768。**M4N2 的意义不是"让 D=512 可行"，而是把崩塌点从 ~D=768 推迟到 D≥2048**；SMEM 侧 57KB 与 D 完全无关（Q/K/V 各 16KB + P 8KB + 交换区 1KB）。
 
-**ffpa 代码**：`cute/sm_120/split_d_m4n2.cuh`、`attn_traits.cuh` 的 `FFPAAttnCuTeSplitDM4N2Traits`、`launch.cuh` dispatch `D≥768→M4N2`。设计推导见 [references/ffpa_split_d_m4n2_design.md](references/ffpa_split_d_m4n2_design.md) 与 [references/ffpa_split_d_m4n4_analysis.md](references/ffpa_split_d_m4n4_analysis.md)。
+**ffpa 代码**：`cute/sm_120/split_d_m4n2.cuh`、`attn_traits.cuh` 的 `FFPAAttnCuTeSplitDM4N2Traits`、`launch/cute_fp16.cuh` dispatch `D≥768→M4N2`。设计推导见 [references/ffpa_split_d_m4n2_design.md](references/ffpa_split_d_m4n2_design.md) 与 [references/ffpa_split_d_m4n4_analysis.md](references/ffpa_split_d_m4n4_analysis.md)。
 
 ### 11.5 量化基础与数值格式
 
@@ -952,7 +956,7 @@ $$O=\big[\,O_{[0:n)}^{(\text{fp16 kernel})};\ \ O_{[n:N)}^{(\text{fp8/fp4 kernel
 
 **lse 边界**：两个 stage 各写自己行集的 lse 段（`softmax_lse.slice(2,0,n).copy_`），无重叠无缝隙。
 
-**ffpa 代码**：`csrc/cuffpa/launch.cuh` 的 fp8/fp4 hybrid 分支（stage-1 `launch_cute_fwd_persist_d_sm120`/`split_d`/`split_d_m4n2` 按 D 选，stage-2 带 `q_start_row`）。
+**ffpa 代码**：`csrc/cuffpa/launch/router.cuh` 的 fp8/fp4 hybrid 分支（stage-1 `launch_cute_fwd_persist_d_sm120`/`split_d`/`split_d_m4n2` 按 D 选，stage-2 带 `q_start_row`）。
 
 ### 11.14 causal tail-aligned 形式化
 

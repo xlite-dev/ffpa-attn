@@ -39,9 +39,9 @@ void launch_ffpa_attn_fwd_template(
   // TODO: support BNHD layout, Q,K,V,O with [B, N, H, D] layout.
   // Native block-tile config (MMA atoms, Br/Bc, stages, smem/pad flags) and
   // the Nq==1 decode fast-path live in
-  // native/launch.cuh::launch_native_fwd_split_d_sm80. CuTe uses its own
-  // traits. This top-level entry only validates shapes and dispatches to a
-  // backend.
+  // launch/native_fp16.cuh::launch_native_fwd_split_d_sm80. CuTe uses its
+  // own traits. This top-level entry only validates shapes and dispatches
+  // to a backend.
   TORCH_CHECK(K.size(0) == Q.size(0) && V.size(0) == Q.size(0),
               "ffpa_attn: Q/K/V must share the same batch size");
   TORCH_CHECK(K.size(1) == V.size(1),

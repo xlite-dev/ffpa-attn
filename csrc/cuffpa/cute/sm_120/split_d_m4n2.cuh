@@ -25,7 +25,7 @@ using CtaBarrier = cutlass::arch::ClusterBarrier;
 //   3. P→PV: SMEM roundtrip (stmatrix→LDSM_N) instead of register reinterpret
 //   4. Epilogue: only n_warp==0 writes LSE (both N-warps share same rows)
 //
-// A/B benchmark vs M8N1 (constexpr dispatch in launch.cuh),
+// A/B benchmark vs M8N1 (constexpr dispatch in launch/cute_fp16.cuh),
 // RTX 5090 (SM120), torch 2.13.0+cu132, self-attn N=8192, stages=2.
 // Table: FFPA time (ms) / TFLOPS, fp16 (bf16 within ±2%); O_err≈1e-4 both.
 //   D     M8N1 (ms/TFLOPS)      M4N2 (ms/TFLOPS)       winner
@@ -38,7 +38,7 @@ using CtaBarrier = cutlass::arch::ClusterBarrier;
 //   768   40.55/39.79  163T     37.78/37.31  175T      M4N2  +7%
 //   896   54.03/57.97  142T     49.16/48.72  157T      M4N2 +11%
 //   1024  88.37/87.75  100T     57.11/56.60  154T      M4N2 +55%
-// Cross point lies between 640 and 768. Final dispatch (launch.cuh):
+// Cross point lies between 640 and 768. Final dispatch (launch/cute_fp16.cuh):
 // D<768 -> M8N1 (P regs stay under the 255-reg ceiling), D>=768 -> this
 // M4N2 kernel. At D=1024 M8N1's o_acc = D/2 = 512 regs/thread spills to
 // local mem and collapses to ~100T; M4N2's D/4 = 256 regs keeps 154T.
@@ -72,8 +72,9 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
   // the body into a no-op stub there. Body-level (not file-level) is required
   // because the host launcher references this kernel via <<<>>> and nvcc must
   // see its declaration in every device pass; hiding it file-level fails with
-  // "identifier undefined". Runtime safety: launch.cuh dispatches TMA kernels
-  // only when prop->major >= 9, so pre-90 devices never execute the stub.
+  // "identifier undefined". Runtime safety: launch/cute_fp16.cuh dispatches
+  // TMA kernels only when prop->major >= 9, so pre-90 devices never execute
+  // the stub.
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
   using namespace cute;
   using cute::tma_store_arrive;

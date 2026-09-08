@@ -5,7 +5,7 @@
 #pragma once
 #include <ATen/cuda/CUDAContext.h>
 #include "dispatch.cuh"
-#include "native/launch.cuh"
+#include "launch/native_fp16.cuh"
 
 namespace ffpa {
 
@@ -20,11 +20,11 @@ void ffpa_fwd_native_sm80(const FfpaFwdParams& p) {
       p.dropout_p, p.philox_seed, p.philox_offset);
 }
 
-// TMA path dispatch (moved from launch.cuh): sm_90/100 run the WS kernel
-// (setmaxnreg effective, 228KB smem allows a deep pipeline); sm_120a runs
-// non-WS (all 256 threads do MMA, thread 0 issues TMA inline, which removes
-// the WS register-allocation penalty; NOTE: no WGMMA on sm_120a). See
-// fwd_sm120.cuh for the register pressure analysis.
+// TMA path dispatch (moved from the old top-level launch.cuh): sm_90/100 run
+// the WS kernel (setmaxnreg effective, 228KB smem allows a deep pipeline);
+// sm_120a runs non-WS (all 256 threads do MMA, thread 0 issues TMA inline,
+// which removes the WS register-allocation penalty; NOTE: no WGMMA on sm_120a).
+// See fwd_sm120.cuh for the register pressure analysis.
 template <typename kDataType, const int kHeadDim, const int kMmaAccFloat32QK,
           const int kMmaAccFloat32PV, const int kStage>
 void ffpa_fwd_native_tma(const FfpaFwdParams& p) {

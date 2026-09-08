@@ -177,8 +177,8 @@ __global__ void quantize_fp8_kernel(
 // conflicts low on the transposed read-out).
 // kVTPerm: write V^T columns permuted for the reorg-free PV pack
 // (VTPermInv32); must pair with PackC8bitToA8bitPermVT in the attention
-// kernel (launcher-enforced pairing in launch.cuh, on by default for the
-// gated config).
+// kernel (launcher-enforced pairing in launch/cute_fp8.cuh, on by default
+// for the gated config).
 template <typename Element, int kBlockRows, int kD, bool kVTPerm = false>
 __global__ void quantize_fp8_vt_kernel(
     const Element* __restrict__ V,   // (B, H, N, D_og) or NHD layout L
@@ -321,8 +321,8 @@ __global__ void quantize_fp8_vt_kernel(
 // kQKInt8: roles 0/1 emit symmetric int8 (amax/127); VT stays e4m3.
 // kVTPerm: role 2 writes V^T columns permuted for the reorg-free PV pack
 // (VTPermInv32); must pair with PackC8bitToA8bitPermVT in the attention
-// kernel (launcher-enforced pairing in launch.cuh, on by default for the
-// gated config).
+// kernel (launcher-enforced pairing in launch/cute_fp8.cuh, on by default
+// for the gated config).
 template <typename Element, int kBlockRows, int kD, int kThreads, bool kQKInt8,
           bool kVTPerm = false>
 __global__ void quantize_fp8_qkv_fused_kernel(
@@ -946,7 +946,8 @@ void launch_quantize_fp8_perthread_qk_sm120(
 // inv_n scales km (pass 1.0 when km is already a mean).
 // perm_vt: write V^T with the reorg-free column permutation (VTPermInv32);
 // the attention kernel consuming this VT must use PackC8bitToA8bitPermVT
-// (launcher pairing in launch.cuh; on by default for the gated config).
+// (launcher pairing in launch/cute_fp8.cuh; on by default for the gated
+// config).
 // skip_vt: per-channel V config re-quantizes vt8 afterwards, so the per-block
 // VT work (fused role 2 / separate kernel) is dead — skip it (grid.z drops
 // to 2 in the fused path).

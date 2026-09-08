@@ -1,5 +1,5 @@
 // Hybrid stage-1 prep shared by the fp8/fp4 dispatch families (moved
-// verbatim from launch.cuh).
+// verbatim from the old cute/launch.cuh).
 #pragma once
 #include <torch/types.h>
 #include <ATen/ops/constant_pad_nd.h>

@@ -58,8 +58,9 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_sm120(
   // the body into a no-op stub there. Body-level (not file-level) is required
   // because the host launcher references this kernel via <<<>>> and nvcc must
   // see its declaration in every device pass; hiding it file-level fails with
-  // "identifier undefined". Runtime safety: launch.cuh dispatches TMA kernels
-  // only when prop->major >= 9, so pre-90 devices never execute the stub.
+  // "identifier undefined". Runtime safety: launch/cute_fp16.cuh dispatches
+  // TMA kernels only when prop->major >= 9, so pre-90 devices never execute
+  // the stub.
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
   using namespace cute;
   using Element = typename Traits::Element;

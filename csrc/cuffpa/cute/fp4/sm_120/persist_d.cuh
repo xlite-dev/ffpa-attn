@@ -114,7 +114,7 @@ using CtaBarrier = cutlass::arch::ClusterBarrier;
 // re-initialized - re-init on a live mbarrier is UB, PTX ISA 9.7.13.15.9),
 // so the non-persistent launch is just the degenerate case where each
 // barrier flips only its first phases. The grid choice lives in
-// cute/launch.cuh (causal ? total_work : min(total_work, SMs)).
+// launch/cute_fp4.cuh (causal ? total_work : min(total_work, SMs)).
 //
 // Workspaces are 128-padded along seqlen; TMA descriptors are built on the
 // padded flat row spaces (Q/K/V^T) and on the SF atom-layout tensors

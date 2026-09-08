@@ -80,7 +80,7 @@ __device__ __forceinline__ void apply_attn_bias_quant_rowcol(
 
 // Additive attention bias read from a per-KV-tile prefetched smem tile
 // (PC-0). The host side classifies the broadcast shape (see FfpaBiasTilePlan
-// in launch.cuh) and only enables this path when the tile fits the smem
+// in launch/common.cuh) and only enables this path when the tile fits the smem
 // budget; otherwise the gmem-direct variants above stay as fallback. The
 // tile holds the mask's original dtype; s_row/s_col are runtime smem strides
 // selected by shape: dense=(kBc,1), row-broadcast=(0,1), col-broadcast=(1,0).

@@ -5,7 +5,7 @@
 #pragma once
 #include "dispatch.cuh"
 #ifdef ENABLE_FFPA_CUTE_EXT
-#include "cute/launch.cuh"
+#include "launch/cute_fp16.cuh"
 #endif
 
 namespace ffpa {

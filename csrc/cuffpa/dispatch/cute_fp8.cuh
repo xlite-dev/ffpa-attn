@@ -1,12 +1,12 @@
 // CUTE_TMA_FP8 family entry (moved verbatim from the force_fp8 branch of
-// launch.cuh's TMA super-path). Hybrid stage-1 goes through
+// the old cute/launch.cuh TMA super-path). Hybrid stage-1 goes through
 // ffpa_fwd_fp16_stage1<...,224> instead of direct fp16 launcher calls.
 #pragma once
 #include <cstdlib>
 #include <cstring>
 #include "dispatch.cuh"
-#include "dispatch/hybrid.cuh"
-#include "cute/launch.cuh"
+#include "dispatch/cute_hybrid.cuh"
+#include "launch/cute_fp8.cuh"
 
 namespace ffpa {
 

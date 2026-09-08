@@ -1,11 +1,11 @@
 // Dispatch interface layer for the family-split CUDA forward build.
 //
-// The routing logic itself lives in launch.cuh
+// The routing logic itself lives in launch/router.cuh
 // (launch_ffpa_attn_fwd_template); this header only carries the shared
 // parameter struct and the family entry template declarations so that
 // dispatcher TUs stay free of CUTLASS/kernel headers. Definitions live in
-// dispatch/{native,cute16,fp8,fp4,hybrid}.cuh and are explicitly
-// instantiated by the generated per-family TUs (see env.py).
+// dispatch/{native_fp16,cute_fp16,cute_fp8,cute_fp4,cute_hybrid}.cuh and
+// are explicitly instantiated by the generated per-family TUs (see env.py).
 #pragma once
 #include <torch/types.h>
 
@@ -68,7 +68,7 @@ void ffpa_fwd_native_tma(const FfpaFwdParams& p);
 
 // CuTe TMA fp16/bf16 sm120 family (persist-D / split-D / M4N2 by the
 // headdim gates). Routing-level fallbacks (bias/dropout -> native, D%32
-// != 0 -> native) stay in launch.cuh and are NOT part of this entry.
+// != 0 -> native) stay in launch/router.cuh and are NOT part of this entry.
 template <typename kDataType, const int kHeadDim, const int kStage>
 void ffpa_fwd_cute16(const FfpaFwdParams& p);
 

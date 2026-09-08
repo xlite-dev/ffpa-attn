@@ -1,9 +1,9 @@
-// Layout-family predicates shared by the routing layer (launch.cuh), the
-// cute launchers (cute/launch.cuh) and the hybrid stage-1 prep
-// (dispatch/hybrid.cuh). Moved verbatim out of cute/launch.cuh so the
-// dispatcher TU never needs the CUTLASS/kernel headers. Unguarded on
-// purpose: launch.cuh's NHD output check uses these outside the
-// CUTE/TMA extension guards.
+// Layout-family predicates shared by the routing layer (launch/router.cuh),
+// the cute launchers (launch/cute_*.cuh) and the hybrid stage-1 prep
+// (dispatch/cute_hybrid.cuh). Moved verbatim out of the old monolithic
+// cute/launch.cuh so the dispatcher TU never needs the CUTLASS/kernel
+// headers. Unguarded on purpose: the router's NHD output check uses these
+// outside the CUTE/TMA extension guards.
 #pragma once
 #include <torch/types.h>
 

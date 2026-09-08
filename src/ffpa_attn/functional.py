@@ -55,7 +55,7 @@ if TYPE_CHECKING:
 # MMA Acc encoding kept in sync with csrc/pybind/ffpa_attn_api.cc::ffpa_attn.
 _ACC_F16 = 0
 _ACC_F32 = 1
-# FP8 quant granularity encoding (kept in sync with cute/launch.cuh).
+# FP8 quant granularity encoding (kept in sync with launch/cute_fp8.cuh).
 _QUANT_METHOD_PER_BLOCK = 0
 _QUANT_METHOD_PER_CHANNEL = 1
 _QUANT_METHOD_PER_THREAD = 2
@@ -64,15 +64,15 @@ _QUANT_METHOD_CODE = {
   "per_channel": _QUANT_METHOD_PER_CHANNEL,
   "per_thread": _QUANT_METHOD_PER_THREAD,
 }
-# FP8 PV accumulator dtype encoding (kept in sync with cute/launch.cuh).
+# FP8 PV accumulator dtype encoding (kept in sync with launch/cute_fp8.cuh).
 _PV_ACC_F16 = 0
 _PV_ACC_F32 = 1
 _PV_ACC_CODE = {"f16": _PV_ACC_F16, "f32": _PV_ACC_F32}
-# FP8 QK MMA dtype encoding (kept in sync with cute/launch.cuh).
+# FP8 QK MMA dtype encoding (kept in sync with launch/cute_fp8.cuh).
 _QK_MM_FP8 = 0
 _QK_MM_INT8 = 1
 _QK_MM_TYPE_CODE = {"fp8": _QK_MM_FP8, "int8": _QK_MM_INT8}
-# FP4 PV MMA dtype encoding (kept in sync with cute/launch.cuh).
+# FP4 PV MMA dtype encoding (kept in sync with launch/cute_fp4.cuh).
 _FP4_PV_MM_NVFP4 = 0
 _FP4_PV_MM_MXFP8 = 1
 _FP4_PV_MM_CODE = {"fp4": _FP4_PV_MM_NVFP4, "fp8": _FP4_PV_MM_MXFP8}
@@ -103,8 +103,8 @@ def _allow_cuda_small_d() -> bool:
 def is_nhd_zero_copy_input(t: torch.Tensor) -> bool:
   """Whether a [B, N, H, D] tensor can feed the persist-D NHD path zero-copy.
 
-  Mirrors the relaxed ``ffpa_layout_of`` gate in ``csrc/cuffpa/cute/
-  launch.cuh``: packed-NHD tensors and fused-QKV interleaved chunk views
+  Mirrors the relaxed ``ffpa_layout_of`` gate in
+  ``csrc/cuffpa/launch/common.cuh``: packed-NHD tensors and fused-QKV interleaved chunk views
   (row stride wider than ``H * D``) both qualify; BHND-packed and
   arbitrary-stride tensors do not. Quant families whose C++ gate is not
   relaxed yet must materialize tensors failing this predicate instead of

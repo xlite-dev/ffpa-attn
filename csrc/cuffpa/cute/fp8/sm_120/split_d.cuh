@@ -66,8 +66,8 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
         long long attn_bias_stride_m = 0, long long attn_bias_stride_n = 0,
         long long attn_bias_plane_m_total = 0) {
   // Body-level arch guard (see sm_120/split_d.cuh): mixed -gencode builds
-  // compile the sm_89 device pass into a stub; launch.cuh only dispatches
-  // this kernel on sm>=90 devices.
+  // compile the sm_89 device pass into a stub; launch/cute_fp8.cuh only
+  // dispatches this kernel on sm>=90 devices.
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
   using namespace cute;
   using cute::tma_store_arrive;
