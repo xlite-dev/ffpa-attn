@@ -94,6 +94,54 @@ flowchart TD
 | `csrc/cuffpa/launch/native_fp16.cuh` | Native kernel 编译期 config（MMA atom、stage、smem 复用、decode split 数选择） |
 | `csrc/cuffpa/cute/{fp8,fp4}/` | 量化前处理 kernel（quantize / kv_mean / delta_s / smooth）与主 kernel |
 
+### 1.3 C++ dispatch/launch 详细调用链（router 之后）
+
+```mermaid
+flowchart TD
+    API["ffpa_api.cc::ffpa_attn_fwd_*<br/>dtype×acc 分发 + head_dim pad"] --> GEN["generated dispatcher<br/>(per-headdim case 表, env.py 生成)"]
+    GEN --> TU["generated family TU<br/>fwd_{fp16,bf16}_{cute_fp16,fp8,fp4,native}_hdim{D}[_s{stage}].cu<br/>显式实例化 family 入口模板"]
+    TU --> DISP["dispatch/{native_fp16,cute_fp16,cute_fp8,cute_fp4}.cuh<br/>family 入口: 参数校验 + D 路由 + hybrid 编排"]
+    DISP --> LAUNCH["launch/{family}.cuh<br/>launcher _impl: hadamard → 布局探测 → bias<br/>→ quant knob 派生 → kBr/kBc/smem/stages clamp → traits"]
+    LAUNCH --> PRE["前处理编排"]
+    LAUNCH --> TMA["TMA descriptor 构建<br/>(make_tma_copy Q/K/V/O)"]
+    TMA --> KERN["attention 主 kernel launch<br/>(<<<>>> 或 cute cooperative)"]
+
+    subgraph PRE["前处理（stage 无关）"]
+        P1["fp8: cute/fp8/prepare_inputs.cuh<br/>prepare_fp8_inputs&lt;dtype,kBr,kBc,D,kQKInt8&gt;<br/>分配 + smooth-K mean + Q/K quantize + V per-channel<br/>⚠ extern-template: 仅 fwd_fp8_preprocess.cu 实例化"]
+        P2["fp4: launch_fp4_quant_*&lt;D&gt; 量化链<br/>(launcher 模板不带 dtype)"]
+        P3["fp8/fp4 共享: launch_kv_mean_sm120&lt;dtype,D&gt;<br/>(cute/fp8/smooth_k.cuh)"]
+    end
+```
+
+**family 入口的 D 路由决策**（dispatch/cute_fp8.cuh、cute_fp4.cuh、cute_fp16.cuh 同构交叉点）：
+
+| 家族 | D≤224 | 224<D<768 | D≥768 | 备注 |
+|---|---|---|---|---|
+| fp16 (cute_fp16) | persist-D | split-D M8N1 | split-D M4N2 | M4N2 交叉点 768 两端一致；D%32≠0 或 bias/dropout 路由级回退 native |
+| fp8 | persist-D (kBc=128/D≤128, else 64) | split-D M8N1 (128/128) | M4N2 (64/64) | kBr/kBc 被 env.py::_fp8_variant_blocks 镜像（extern 表） |
+| fp4 | persist-D | split-D | M4N2 | 量化 launcher 模板仅 &lt;kHeadDim&gt;（dtype 无关） |
+| native | sm80 split-D + split-KV decode (Nq==1) | TMA: sm90/100 WS / sm120 non-WS | 同左 | decode split 数 = select_decode_num_splits 波效率贪心 |
+
+**hybrid 双阶段**（dispatch/cute_hybrid.cuh::prepare_hybrid_stage1）：`fp8_hybrid/fp4_hybrid && Nq ≥ n_early` 时，前 `n_early` 行走 fp16 stage-1（`ffpa_fwd_fp16_stage1<dtype,D,stage,224>`，cute_fp16 TU 实例化），其余行 stage-2 以 `q_start_row` 偏移交回量化家族 launcher——两阶段各写自己行集的 O/lse 切片。
+
+**编译期 TU 结构**（谁实例化什么）：
+
+```mermaid
+flowchart LR
+    subgraph FamilyTU["family TU ×(dtype,D,stage)"]
+        A["dispatch/cute_fp8.cuh"] --> B["launch/cute_fp8.cuh<br/>(extern: 前处理不实例化)"]
+        B --> C["cute/fp8/sm_120/*.cuh 主 kernel<br/>(stage 相关, 每 TU 独有)"]
+    end
+    subgraph SharedTU["fwd_fp8_preprocess.cu (×1)"]
+        D["generated/fp8_preprocess_instances.cuh<br/>define 模式: prepare_fp8_inputs 全组合"]
+    end
+    B -. "extern template 声明<br/>(instances.cuh extern 模式)" .- D
+```
+
+**单条完整链路示例**（fp8、D=512、bf16、stage=2、无 hybrid）：
+
+`CUDABackend(enable_fp8=True)` → `_fwd_cuda` → `ffpa_api.cc` pad→512 → `fwd_bf16_fp8_hdim512_s2.cu`（实例化 `ffpa_fwd_fp8<bf16,512,2>`）→ `dispatch/cute_fp8.cuh`：D=512∈(224,768) → `launch_cute_fwd_split_d_fp8_sm120<bf16,512,2>` → `_impl`：hadamard off → `ffpa_layout_of`×3 → kBr/kBc=128/128 → `prepare_fp8_inputs<bf16,128,128,512,kQKInt8>`（**extern→preprocess TU**）→ TMA Q/K/V/O → `split_d_fwd_cute_fp8_sm120<...Traits<512,...,kStagesQK=2,...>>`。
+
 ---
 
 ## 2. 后端实现枚举与 Python 入口门禁

@@ -70,12 +70,12 @@ void ffpa_fwd_native_tma(const FfpaFwdParams& p);
 // headdim gates). Routing-level fallbacks (bias/dropout -> native, D%32
 // != 0 -> native) stay in launch/router.cuh and are NOT part of this entry.
 template <typename kDataType, const int kHeadDim, const int kStage>
-void ffpa_fwd_cute16(const FfpaFwdParams& p);
+void ffpa_fwd_cute_fp16(const FfpaFwdParams& p);
 
 // CuTe cp.async sm80 path (CUTE hint, no TMA; internal stage clamps for
 // sm>=120 preserved verbatim).
 template <typename kDataType, const int kHeadDim, const int kStage>
-void ffpa_fwd_cute16_sm80(const FfpaFwdParams& p);
+void ffpa_fwd_cute_fp16_sm80(const FfpaFwdParams& p);
 
 // Hybrid stage-1 fp16 kernel selection for the fp8/fp4 paths: the caller
 // (ffpa_fwd_fp8 / ffpa_fwd_fp4) prepares the early-row sub-problem

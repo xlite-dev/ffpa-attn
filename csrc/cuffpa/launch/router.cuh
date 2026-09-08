@@ -264,7 +264,7 @@ void launch_ffpa_attn_fwd_template(
                                     kMmaAccFloat32PV, kStage>(p);
         } else if (force_cute_tma || (!has_attn_bias && !has_dropout)) {
           if constexpr (kHeadDim % 32 == 0) {
-            ffpa::ffpa_fwd_cute16<kDataType, kHeadDim, kStage>(p);
+            ffpa::ffpa_fwd_cute_fp16<kDataType, kHeadDim, kStage>(p);
           } else {
             // D%32!=0: native non-WS fallback, as before the family split.
             ffpa::ffpa_fwd_native_tma<kDataType, kHeadDim, kMmaAccFloat32QK,
@@ -288,7 +288,7 @@ void launch_ffpa_attn_fwd_template(
   // CuTe cp.async path: sm_80+ without TMA (tma=0 or sm<90).
   // Architecture-aware stage clamps live inside the entry.
   if (!force_native) {
-    ffpa::ffpa_fwd_cute16_sm80<kDataType, kHeadDim, kStage>(p);
+    ffpa::ffpa_fwd_cute_fp16_sm80<kDataType, kHeadDim, kStage>(p);
     return;
   }
 #endif  // ENABLE_FFPA_CUTE_EXT

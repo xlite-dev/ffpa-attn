@@ -17,7 +17,7 @@ namespace ffpa {
 //   sm < 120 (Ada/Ampere, lower compute): prefer (32,64) for D%64==0,
 //     deeper pipeline (Python-controlled, smem physics cap applies).
 template <typename kDataType, const int kHeadDim, const int kStage>
-void ffpa_fwd_cute16_sm80(const FfpaFwdParams& p) {
+void ffpa_fwd_cute_fp16_sm80(const FfpaFwdParams& p) {
 #ifdef ENABLE_FFPA_CUTE_EXT
   auto cute_prop = at::cuda::getCurrentDeviceProperties();
   const int sm_arch = cute_prop->major * 10 + cute_prop->minor;
@@ -61,7 +61,7 @@ void ffpa_fwd_cute16_sm80(const FfpaFwdParams& p) {
 // only the clean path here (bias/dropout falls back to native); the
 // kernels still accept bias/dropout for the hybrid stage-1 slices.
 template <typename kDataType, const int kHeadDim, const int kStage>
-void ffpa_fwd_cute16(const FfpaFwdParams& p) {
+void ffpa_fwd_cute_fp16(const FfpaFwdParams& p) {
 #if defined(ENABLE_FFPA_CUTE_EXT) && defined(ENABLE_FFPA_TMA_EXT)
   if constexpr (kHeadDim <= 128 && kHeadDim % 32 == 0) {
     // WS persist-D: D=32/64/96/128 (Q persist fits the smem budget).
