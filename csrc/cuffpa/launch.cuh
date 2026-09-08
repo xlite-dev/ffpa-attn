@@ -185,8 +185,12 @@ void launch_ffpa_attn_fwd_template(
   const bool tma_kernel_active = false;
 #endif
   const bool native_kernel_pad = force_native || tma_kernel_active;
+#ifdef ENABLE_FFPA_FP4_BUILD_DEBUG
   const bool fp4_fused =
       force_fp4 && D_og % 8 == 0 && getenv("FFPA_FP4_PAD_TORCH") == nullptr;
+#else
+  const bool fp4_fused = force_fp4 && D_og % 8 == 0;
+#endif
   const bool qkv_padded =
       d_padded && !force_fp8 && !fp4_fused && !native_kernel_pad;
   if (qkv_padded) {

@@ -55,6 +55,12 @@ Flags (override same-named env vars; env reference: docs/env.md):
   --stages <csv|all>   FFPA_BUILD_STAGES: build stage subset, e.g. '2,3' or
                        'all' (= 1..max). Overrides the legacy
                        ENABLE_FFPA_ALL_STAGES; default without both: '2,3'.
+  --debug-ext <csv|all|none>
+                       ENABLE_FFPA_BUILD_DEBUG: compile debug dispatch knobs
+                       (e.g. FFPA_FP8_FORCE_KERNEL, FFPA_DROPOUT_BITMAP_DISABLE)
+                       for the selected families only: subset of fp16,fp8,fp4
+                       or 'all'. Default 'none' strips every debug getenv
+                       branch (and the FORCE_KERNEL dual instantiation).
   --editable           FFPA_EDITABLE=1: build_ext + pip install -e (default).
   --no-editable        FFPA_EDITABLE=0: build_ext only, no package install.
   -j, --jobs N         MAX_JOBS outer build parallelism (default min(nproc,32)).
@@ -137,6 +143,14 @@ while [[ $# -gt 0 ]]; do
     --stages)
       require_value "$@"
       export FFPA_BUILD_STAGES="$2"
+      shift 2 ;;
+    --debug-ext)
+      require_value "$@"
+      if [[ "${2,,}" == "none" ]]; then
+        export ENABLE_FFPA_BUILD_DEBUG=""
+      else
+        export ENABLE_FFPA_BUILD_DEBUG="$2"
+      fi
       shift 2 ;;
     -j|--jobs)
       require_value "$@"
@@ -242,7 +256,7 @@ else
   BUILD_CMD="python setup.py build_ext --inplace"
 fi
 echo "[build_fast] ENABLE_FFPA_CUDA_IMPL=${ENABLE_FFPA_CUDA_IMPL:-0}  ENABLE_FFPA_CUTE_EXT=${ENABLE_FFPA_CUTE_EXT:-0}  ENABLE_FFPA_TMA_EXT=${ENABLE_FFPA_TMA_EXT:-0}"
-echo "[build_fast] FFPA_BUILD_ARCH=${FFPA_BUILD_ARCH:-<auto from current device>}  FFPA_DEV_HEADDIMS=${FFPA_DEV_HEADDIMS:-<default: mults of 64 in [320,1024]>}  FFPA_BUILD_STAGES=${FFPA_BUILD_STAGES:-<default: '2,3'>}  FFPA_EDITABLE=${FFPA_EDITABLE}"
+echo "[build_fast] FFPA_BUILD_ARCH=${FFPA_BUILD_ARCH:-<auto from current device>}  FFPA_DEV_HEADDIMS=${FFPA_DEV_HEADDIMS:-<default: mults of 64 in [320,1024]>}  FFPA_BUILD_STAGES=${FFPA_BUILD_STAGES:-<default: '2,3'>}  FFPA_EDITABLE=${FFPA_EDITABLE}  ENABLE_FFPA_BUILD_DEBUG=${ENABLE_FFPA_BUILD_DEBUG:-<none>}"
 echo "[build_fast] MAX_JOBS=$MAX_JOBS  FFPA_NVCC_THREADS=$FFPA_NVCC_THREADS"
 echo "[build_fast] command: $BUILD_CMD${PASS_ARGS[*]:+ ${PASS_ARGS[*]}}"
 if [[ "$DRY_RUN" == "1" ]]; then

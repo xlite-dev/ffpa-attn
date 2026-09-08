@@ -296,14 +296,18 @@ void launch_native_fwd_split_d_sm80(torch::Tensor Q, torch::Tensor K,
     // loads (4B fp16/bf16, 8B fp32) + even (b,h) plane strides so every
     // block's base offset stays pair-aligned. Nq == 1 admits non-zero
     // stride_m too: every row index is a padding row except row 0, and the
-    // fast path addresses columns only. The env is read per call so
-    // toggling mid-process works.
+    // fast path addresses columns only. The env escape needs a debug build
+    // (ENABLE_FFPA_FP16_BUILD_DEBUG); it is read per call so toggling
+    // mid-process works.
     const int bias_vec_bytes = attn_bias_dtype == 3 ? 8 : 4;
     attn_bias_rowvec =
         (attn_bias_stride_m == 0 || Nq == 1) && attn_bias_stride_n == 1 &&
         (reinterpret_cast<uintptr_t>(attn_bias_ptr) % bias_vec_bytes == 0) &&
-        (attn_bias_stride_b % 2 == 0) && (attn_bias_stride_h % 2 == 0) &&
-        getenv("FFPA_BIAS_ROWVEC_DISABLE") == nullptr;
+        (attn_bias_stride_b % 2 == 0) && (attn_bias_stride_h % 2 == 0);
+#ifdef ENABLE_FFPA_FP16_BUILD_DEBUG
+    if (getenv("FFPA_BIAS_ROWVEC_DISABLE") != nullptr)
+      attn_bias_rowvec = 0;
+#endif
   }
 
   const dim3 block = getConfigBlock<kNumThreads>();
@@ -484,8 +488,11 @@ void launch_native_fwd_split_d_sm120(torch::Tensor Q, torch::Tensor K,
     attn_bias_rowvec =
         (attn_bias_stride_m == 0 || Nq == 1) && attn_bias_stride_n == 1 &&
         (reinterpret_cast<uintptr_t>(attn_bias_ptr) % bias_vec_bytes == 0) &&
-        (attn_bias_stride_b % 2 == 0) && (attn_bias_stride_h % 2 == 0) &&
-        getenv("FFPA_BIAS_ROWVEC_DISABLE") == nullptr;
+        (attn_bias_stride_b % 2 == 0) && (attn_bias_stride_h % 2 == 0);
+#ifdef ENABLE_FFPA_FP16_BUILD_DEBUG
+    if (getenv("FFPA_BIAS_ROWVEC_DISABLE") != nullptr)
+      attn_bias_rowvec = 0;
+#endif
   }
 
   const dim3 block(kTotalThreads, 1, 1);

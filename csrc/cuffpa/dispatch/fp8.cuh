@@ -20,10 +20,12 @@ void ffpa_fwd_fp8(const FfpaFwdParams& p) {
               "ffpa_attn: Q/K quant method must be both per_block or "
               "both per_thread");
 #ifdef ENABLE_FFPA_CUTE_EXT
+#ifdef ENABLE_FFPA_FP8_BUILD_DEBUG
   // EXPERIMENT: FFPA_FP8_FORCE_KERNEL=split_d|m4n2 forces a specific
   // split-D kernel to A/B test the M8N1/M4N2 dispatch cross-point.
   // Applies only to 224 < D <= 1024; persist-D (D<=224) is unaffected.
-  // Unset -> normal headdim-based dispatch below.
+  // Unset -> normal headdim-based dispatch below. Debug-build only: both
+  // forced entries instantiate, doubling the fp8 attention codegen per TU.
   if constexpr (kHeadDim > 224 && kHeadDim <= 1024) {
     const char* fk = getenv("FFPA_FP8_FORCE_KERNEL");
     if (fk != nullptr) {
@@ -48,6 +50,7 @@ void ffpa_fwd_fp8(const FfpaFwdParams& p) {
       }
     }
   }
+#endif  // ENABLE_FFPA_FP8_BUILD_DEBUG
   // NHD (diffusers BNHD) views and strided fused-QKV rows compose
   // with hybrid across persist-D/split-D/m4n2 (RFC FC-3): the fp16
   // stage-1 kernels consume them natively, prepare_hybrid_stage1

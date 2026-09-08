@@ -177,6 +177,13 @@ class ENV(object):
   # ``ENABLE_FFPA_ALL_HEADDIM``.
   FFPA_DEV_HEADDIMS = os.environ.get("FFPA_DEV_HEADDIMS", "")
 
+  # Compile per-family debug dispatch knobs (e.g. FFPA_FP8_FORCE_KERNEL,
+  # FFPA_DROPOUT_BITMAP_DISABLE). Comma separated subset of {fp16,fp8,fp4}
+  # or "all"; each enabled family expands to -DENABLE_FFPA_<FAM>_BUILD_DEBUG.
+  # Empty (default) strips every debug getenv branch from the production
+  # build, which also removes the FORCE_KERNEL dual template instantiation.
+  ENABLE_FFPA_BUILD_DEBUG = os.environ.get("ENABLE_FFPA_BUILD_DEBUG", "")
+
   @classmethod
   def project_dir(cls):
     return cls.PROJECT_DIR
@@ -304,6 +311,37 @@ class ENV(object):
     return cls.ENABLE_FFPA_F16_ACC
 
   @classmethod
+  def build_debug_families(cls):
+    """Parse ``ENABLE_FFPA_BUILD_DEBUG`` into a set of family tokens.
+
+    :returns: Subset of ``{'fp16', 'fp8', 'fp4'}``; ``all`` expands to the
+        full set, empty (default) to the empty set.
+    :raises RuntimeError: if the value contains an unknown family token.
+    """
+    toks = {
+      t.strip().lower()
+      for t in re.split(r"[;,\s]+", cls.ENABLE_FFPA_BUILD_DEBUG) if t.strip()
+    }
+    unknown = toks - {"fp16", "fp8", "fp4", "all"}
+    if unknown:
+      raise RuntimeError(
+        f"ENABLE_FFPA_BUILD_DEBUG={cls.ENABLE_FFPA_BUILD_DEBUG!r} contains "
+        f"unknown families {sorted(unknown)}, expected fp16/fp8/fp4/all."
+      )
+    if "all" in toks:
+      return {"fp16", "fp8", "fp4"}
+    return toks
+
+  @classmethod
+  def enable_build_debug(cls, family: str) -> bool:
+    """Whether debug dispatch knobs are compiled for one kernel family.
+
+    :param family: One of ``'fp16'``, ``'fp8'``, ``'fp4'``.
+    :returns: True when ``ENABLE_FFPA_BUILD_DEBUG`` selects this family.
+    """
+    return family in cls.build_debug_families()
+
+  @classmethod
   def env_cuda_cflags(cls):
     extra_env_cflags = []
     if cls.enable_all_mutistages():
@@ -343,6 +381,9 @@ class ENV(object):
       extra_env_cflags.append("-DENABLE_FFPA_TMA_EXT")
     if cls.enable_cute_ext():
       extra_env_cflags.append("-DENABLE_FFPA_CUTE_EXT")
+    for family in ("fp16", "fp8", "fp4"):
+      if cls.enable_build_debug(family):
+        extra_env_cflags.append(f"-DENABLE_FFPA_{family.upper()}_BUILD_DEBUG")
 
     # Debug/profiling pass-through: extra -D defines for nvcc.
     for d in os.environ.get("FFPA_NVCC_DEFINES", "").split(","):
@@ -411,6 +452,10 @@ class ENV(object):
     formatenv("ENABLE_FFPA_CUDA_IMPL", cls.enable_cuda_impl())
     formatenv("ENABLE_FFPA_TMA_EXT", cls.enable_tma_ext())
     formatenv("ENABLE_FFPA_CUTE_EXT", cls.enable_cute_ext())
+    formatenv(
+      "ENABLE_FFPA_BUILD_DEBUG",
+      ",".join(sorted(cls.build_debug_families())) or "none",
+    )
     _logging_msg()
 
   @staticmethod
