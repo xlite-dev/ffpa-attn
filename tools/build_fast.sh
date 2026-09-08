@@ -42,12 +42,15 @@ Flags (override same-named env vars; env reference: docs/env.md):
                          <csv>  subset of cuda,cute,tma (cute/tma imply cuda)
                        Default without --ext or env: ENABLE_FFPA_CUDA_IMPL=1.
                        TMA auto-disables when every target arch is sm<90.
-  --headdim <list|all> FFPA_DEV_HEADDIMS subset, e.g. 256,512; 'all' builds
-                       every headdim (multiples of 64 in [64, 1024]). Omitting
-                       the flag builds the default set (multiples of 64 in
-                       [320, 1024]), governed by ENABLE_FFPA_ALL_HEADDIM
-                       (default 0). Pass other headdims (e.g. 32, 96, 128)
-                       explicitly via --headdim 32,96,128.
+  --headdim <list|all|default>
+                       FFPA_DEV_HEADDIMS subset, e.g. 256,512; 'all' builds
+                       every headdim (multiples of 64 in [64, 1024]);
+                       'default' builds the common set 64,128,192,256,320,512
+                       (fast full-feature iteration). Omitting the flag builds
+                       the legacy default set (multiples of 64 in [320, 1024]),
+                       governed by ENABLE_FFPA_ALL_HEADDIM (default 0). Pass
+                       other headdims (e.g. 32, 96, 128) explicitly via
+                       --headdim 32,96,128.
   --stages <csv|all>   FFPA_BUILD_STAGES: build stage subset, e.g. '2,3' or
                        'all' (= 1..max). Overrides the legacy
                        ENABLE_FFPA_ALL_STAGES; default without both: '2,3'.
@@ -123,6 +126,8 @@ while [[ $# -gt 0 ]]; do
       if [[ "${2,,}" == "all" ]]; then
         unset FFPA_DEV_HEADDIMS
         export ENABLE_FFPA_ALL_HEADDIM=1
+      elif [[ "${2,,}" == "default" ]]; then
+        export FFPA_DEV_HEADDIMS="64,128,192,256,320,512"
       else
         export FFPA_DEV_HEADDIMS="$2"
       fi
