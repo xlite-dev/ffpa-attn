@@ -12,6 +12,7 @@
 #include "../../gemm.cuh"
 #include "../attn_traits.cuh"
 #include "../../attn_bias.cuh"
+#include "../../softmax.cuh"
 #include "../fp8_pscale.cuh"
 #include "../smooth_k.cuh"
 
