@@ -119,6 +119,10 @@ inline FfpaBiasTilePlan fp4_m4n2_bias_plan(const FfpaBiasParams& bias_p, int Nb,
 // - qm.km (GQA broadcast bmm, fp16 domain like sageattn3) -> TMA descriptors
 // -> persist_d_ws_fwd_cute_fp4_sm120. Workspaces are 128-padded along
 // seqlen; delta_s tail columns zero-fill (masked -inf in-kernel).
+// The `_v` suffix = variant body of the variant-TU split: a tag-pinned
+// template whose explicit instantiations live in the env.py-generated
+// per-tag TUs (fwd_*_cute_fp4_*_p*_b*m*f*.cu); the suffix-less wrapper
+// below does the runtime plan -> tag dispatch into these.
 // Variant tags: (kPvMxfp8, kBiasOn, kModeL, kB4) pin the PV dtype and the
 // bias tile mode so each kernel table compiles in its own TU (env.py).
 template <typename kDataType, const int kHeadDim, bool kPvMxfp8, int kBiasOn,

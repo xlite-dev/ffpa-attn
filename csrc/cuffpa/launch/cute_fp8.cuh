@@ -125,6 +125,10 @@ inline FfpaBiasTilePlan fp8_m4n2_bias_plan(const FfpaBiasParams& bias_p, int Nb,
 // FP8 persist-D: fp16/bf16 in, internally blockwise-quantized (Q/K row-major
 // to e4m3 or symmetric int8, V transposed to e4m3), then low-precision
 // attention. kQKInt8: QK runs s8xs8->s32 MMA (cast to f32 before softmax).
+// The `_v` suffix = variant body of the variant-TU split: a tag-pinned
+// template whose explicit instantiations live in the env.py-generated
+// per-tag TUs; the suffix-less wrapper does the runtime plan -> tag
+// dispatch into these (same contract as the fp4 launchers).
 // Variant tags (kBiasOn, kModeL, kB4) pin the kernel set compiled into this
 // instantiation; explicit instantiations live in the generated variant TUs
 // (fwd_cute_fp8_variants.cuh), so family TUs only carry extern declarations.
