@@ -5,6 +5,8 @@
 #include "launch/common.cuh"
 #if defined(ENABLE_FFPA_CUTE_EXT) && defined(ENABLE_FFPA_TMA_EXT)
 #include "cute/fp8/quantize_fp8.cuh"
+#include "cute/fp8/prepare_inputs.cuh"
+#include "generated/fp8_preprocess_instances.cuh"  // extern templates
 #include "cute/fp8/smooth_k.cuh"
 #include "cute/fp8/sm_120/persist_d.cuh"
 #include "cute/fp8/sm_120/split_d.cuh"
@@ -93,6 +95,8 @@ void launch_cute_fwd_persist_d_fp8_sm120_impl(
   // restore; split_d carries its own identical gate).
   constexpr bool reorg_free = true;
 
+  // kBr/kBc choice mirrored by env.py::_fp8_variant_blocks (the extern-
+  // template table); keep the two in sync.
   constexpr int kBr = 128;
   // D>128 must shrink kBc to fit the 99KB smem budget (1B/elem fp8): D=224
   // with kBc=64 -> Q(28KB)+2*stage(28KB)=84KB. Mirrors fp16 persist_d's
@@ -137,118 +141,25 @@ void launch_cute_fwd_persist_d_fp8_sm120_impl(
   // D_og: real input head_dim (may be < kHeadDim for non-32-mult pad path).
   const int D_og = Q.size(3);
 
-  auto opts_qk = torch::TensorOptions()
-                     .dtype(kQKInt8 ? torch::kChar : torch::kFloat8_e4m3fn)
-                     .device(Q.device());
-  auto opts_u8 =
-      torch::TensorOptions().dtype(torch::kFloat8_e4m3fn).device(Q.device());
-  auto opts_f32 =
-      torch::TensorOptions().dtype(torch::kFloat32).device(Q.device());
-  torch::Tensor q8 = torch::empty({Nb, Nh, Nq, kHeadDim}, opts_qk);
-  torch::Tensor k8 = torch::empty({Nb, Nh_kv, Nkv, kHeadDim}, opts_qk);
-  torch::Tensor vt8 = torch::empty({Nb, Nh_kv, kHeadDim, Nkv_pad}, opts_u8);
-  // Per-thread QK: 64 scale/Q-block, 4 scale/K-block (fragment-aligned).
-  torch::Tensor q_scale =
-      torch::empty({Nb * Nh, qk_per_thread ? n_rb_q * 64 : n_rb_q}, opts_f32);
-  torch::Tensor k_scale = torch::empty(
-      {Nb * Nh_kv, qk_per_thread ? n_rb_kv * 4 : n_rb_kv}, opts_f32);
-  // Per-channel V (along D, amax over N) -- sage style. Re-quantize V,
-  // overwriting the per-block vt8/v_scale produced above. Scale stays 448.
-  // v_per_channel / v_smooth_mean are resolved from API params at the top of
-  // this function.
-  torch::Tensor v_scale = v_per_channel
-                              ? torch::empty({Nb * Nh_kv, kHeadDim}, opts_f32)
-                              : torch::empty({Nb * Nh_kv, n_rb_kv}, opts_f32);
-  torch::Tensor v_scale_quant =
-      v_per_channel ? torch::empty({Nb * Nh_kv, n_rb_kv}, opts_f32) : v_scale;
-
   const c10::cuda::OptionalCUDAGuard device_guard(Q.device());
   auto stream = at::cuda::getCurrentCUDAStream();
-
-  // Smooth-K (K -= per-(b,h) seq mean before quantize) defaults on; it is
-  // mathematically lossless for O, only lse needs the correction done in the
-  // attention kernel epilogue. km = per-(b,h) seq mean of K, (B*Nh_kv, D).
-  // The mean stays a separate launch, NOT fused into quantize, because:
-  //   - mean reduces ALONG seqlen (across all row blocks) while quantize
-  //     parallelizes ALONG seqlen (per row block); fusing creates a
-  //     cross-block global dependency (atomics + spin barrier) that costs
-  //     more than the mean kernel it replaces;
-  //   - no DRAM savings: K is cold-read once, mean fills L2 and quantize
-  //     re-reads it from L2.
-  // Implemented as a custom two-stage kernel (launch_kv_mean_sm120, ~50us at
-  // B1 H32 N8192 D128) instead of at::mean + fp32 cast (~85us): it reads K
-  // once coalesced with fp32 accumulate and emits both dtypes in one pass.
-  torch::Tensor km, km_f32, km_partials;
-  const kDataType* km_ptr = nullptr;
-  const float* km_f32_ptr = nullptr;
-  const kDataType* q_ptr = reinterpret_cast<const kDataType*>(Q.data_ptr());
-  const kDataType* k_ptr = reinterpret_cast<const kDataType*>(K.data_ptr());
-  const kDataType* v_ptr = reinterpret_cast<const kDataType*>(V.data_ptr());
-  if (fp8_smooth_k) {
-    // Custom two-stage column mean (~50us) replacing at::mean + fp32 cast
-    // (~85us); emits the in-dtype mean and its fp32 copy in one pass.
-    const int mean_chunks =
-        (Nkv + ffpa_fp8::kMeanRowsPerChunk - 1) / ffpa_fp8::kMeanRowsPerChunk;
-    km = torch::empty({Nb * Nh_kv, kHeadDim}, K.options());
-    km_f32 = torch::empty({Nb * Nh_kv, kHeadDim}, opts_f32);
-    km_partials = torch::empty({Nb * Nh_kv, mean_chunks, kHeadDim}, opts_f32);
-    km_ptr = reinterpret_cast<const kDataType*>(km.data_ptr());
-    km_f32_ptr = km_f32.data_ptr<float>();
-    ffpa_fp8::launch_kv_mean_sm120<kDataType, kHeadDim>(
-        k_ptr, reinterpret_cast<kDataType*>(km.data_ptr()),
-        km_f32.data_ptr<float>(), km_partials.data_ptr<float>(), Nb, Nh_kv, Nkv,
-        D_og, stream, &Lkv);
-  }
-  if (qk_per_thread) {
-    ffpa_fp8::launch_quantize_fp8_perthread_qk_sm120<kDataType, kBr, kBc,
-                                                     kHeadDim, kQKInt8>(
-        q_ptr, k_ptr, v_ptr, q8.data_ptr(), k8.data_ptr(),
-        reinterpret_cast<__nv_fp8_e4m3*>(vt8.data_ptr()),
-        q_scale.data_ptr<float>(), k_scale.data_ptr<float>(),
-        v_scale_quant.data_ptr<float>(), Nb, Nh, Nh_kv, Nq, Nkv, Nkv_pad, D_og,
-        Lq, Lkv, stream, km_ptr, reorg_free, v_per_channel, &Lv);
-  } else {
-    ffpa_fp8::launch_quantize_fp8_sm120<kDataType, kBr, kBc, kHeadDim, kQKInt8>(
-        q_ptr, k_ptr, v_ptr, q8.data_ptr(), k8.data_ptr(),
-        reinterpret_cast<__nv_fp8_e4m3*>(vt8.data_ptr()),
-        q_scale.data_ptr<float>(), k_scale.data_ptr<float>(),
-        v_scale_quant.data_ptr<float>(), Nb, Nh, Nh_kv, Nq, Nkv, Nkv_pad, D_og,
-        Lq, Lkv, stream, km_ptr, reorg_free, v_per_channel, &Lv);
-  }
-
-  // Per-channel V (sage-style): re-quantize V with per-D scale via coalesced
-  // stats (sum+max+min -> mean+amax) + quantize/transpose. smooth_v subtracts
-  // the per-D mean (residual amax); the per-block vt8/v_scale are overwritten.
-  torch::Tensor vm, v_partials_sum, v_partials_max, v_partials_min;
-  float* vm_ptr = nullptr;
-  if (v_per_channel) {
-    const int stats_chunks = (Nkv + ffpa_fp8::kVStatsRowsPerChunk - 1) /
-                             ffpa_fp8::kVStatsRowsPerChunk;
-    v_partials_sum =
-        torch::empty({Nb * Nh_kv, stats_chunks, kHeadDim}, opts_f32);
-    v_partials_max =
-        torch::empty({Nb * Nh_kv, stats_chunks, kHeadDim}, opts_f32);
-    v_partials_min =
-        torch::empty({Nb * Nh_kv, stats_chunks, kHeadDim}, opts_f32);
-    vm = torch::empty({Nb * Nh_kv, kHeadDim}, opts_f32);
-    vm_ptr = vm.data_ptr<float>();
-    if (v_smooth_mean) {
-      ffpa_fp8::launch_quantize_fp8_vt_perchannel_sm120<kDataType, kBr, kBc,
-                                                        kHeadDim, true>(
-          v_ptr, reinterpret_cast<__nv_fp8_e4m3*>(vt8.data_ptr()),
-          v_scale.data_ptr<float>(), vm_ptr, v_partials_sum.data_ptr<float>(),
-          v_partials_max.data_ptr<float>(), v_partials_min.data_ptr<float>(),
-          Nb, Nh_kv, Nkv, Nkv_pad, stream, D_og, v_r, reorg_free, &Lv);
-    } else {
-      ffpa_fp8::launch_quantize_fp8_vt_perchannel_sm120<kDataType, kBr, kBc,
-                                                        kHeadDim, false>(
-          v_ptr, reinterpret_cast<__nv_fp8_e4m3*>(vt8.data_ptr()),
-          v_scale.data_ptr<float>(), vm_ptr, v_partials_sum.data_ptr<float>(),
-          v_partials_max.data_ptr<float>(), v_partials_min.data_ptr<float>(),
-          Nb, Nh_kv, Nkv, Nkv_pad, stream, D_og, v_r, reorg_free, &Lv);
-    }
-  }
-  const float* vm_kernel = v_smooth_mean ? vm_ptr : nullptr;
+  // Stage-independent preprocessing (allocation + smooth-K mean + Q/K/V
+  // quantize) lives in cute/fp8/prepare_inputs.cuh, instantiated once per
+  // (dtype, D, kQKInt8) in the generated preprocess TU; the extern
+  // template declarations come from generated/fp8_preprocess_instances.cuh.
+  const ffpa_fp8::Fp8QuantizedInputs qi =
+      ffpa_fp8::prepare_fp8_inputs<kDataType, kBr, kBc, kHeadDim, kQKInt8>(
+          Q, K, V, Lq, Lkv, Lv, Nb, Nh, Nh_kv, Nq, Nkv, n_rb_q, n_rb_kv,
+          Nkv_pad, D_og, fp8_smooth_k, qk_per_thread, v_per_channel,
+          v_smooth_mean, v_r, reorg_free, stream);
+  const torch::Tensor& q8 = qi.q8;
+  const torch::Tensor& k8 = qi.k8;
+  const torch::Tensor& vt8 = qi.vt8;
+  const torch::Tensor& q_scale = qi.q_scale;
+  const torch::Tensor& k_scale = qi.k_scale;
+  const torch::Tensor& v_scale = qi.v_scale;
+  const float* km_f32_ptr = qi.km_f32_ptr;
+  const float* vm_kernel = qi.vm_kernel;
 
   const int total_q_rows = Nb * Nh * Nq;
   const int total_kv_rows = Nb * Nh_kv * Nkv;
@@ -570,6 +481,7 @@ void launch_cute_fwd_split_d_fp8_sm120_impl(
   constexpr bool kUseFusedRescale = false;
   constexpr bool reorg_free = kUseFusedRescale;
 
+  // kBr/kBc mirrored by env.py::_fp8_variant_blocks; keep in sync.
   constexpr int kBr = 128;
   constexpr int kBc = 128;
   constexpr int kQKDChunk = 32;
@@ -609,104 +521,25 @@ void launch_cute_fwd_split_d_fp8_sm120_impl(
   // D_og: real input head_dim (may be < kHeadDim for non-32-mult pad path).
   const int D_og = Q.size(3);
 
-  auto opts_qk = torch::TensorOptions()
-                     .dtype(kQKInt8 ? torch::kChar : torch::kFloat8_e4m3fn)
-                     .device(Q.device());
-  auto opts_u8 =
-      torch::TensorOptions().dtype(torch::kFloat8_e4m3fn).device(Q.device());
-  auto opts_f32 =
-      torch::TensorOptions().dtype(torch::kFloat32).device(Q.device());
-  torch::Tensor q8 = torch::empty({Nb, Nh, Nq, kHeadDim}, opts_qk);
-  torch::Tensor k8 = torch::empty({Nb, Nh_kv, Nkv, kHeadDim}, opts_qk);
-  torch::Tensor vt8 = torch::empty({Nb, Nh_kv, kHeadDim, Nkv_pad}, opts_u8);
-  // Per-thread QK: 64 scale/Q-block, 4 scale/K-block (fragment-aligned).
-  torch::Tensor q_scale =
-      torch::empty({Nb * Nh, qk_per_thread ? n_rb_q * 64 : n_rb_q}, opts_f32);
-  torch::Tensor k_scale = torch::empty(
-      {Nb * Nh_kv, qk_per_thread ? n_rb_kv * 4 : n_rb_kv}, opts_f32);
-  // Per-channel V (along D): v_scale is (bh, D) for per-channel, (bh,
-  // n_rb_kv) for per-block. v_scale_quant feeds the first per-block quantize
-  // pass; per-channel overwrites vt8/v_scale afterwards.
-  torch::Tensor v_scale = v_per_channel
-                              ? torch::empty({Nb * Nh_kv, kHeadDim}, opts_f32)
-                              : torch::empty({Nb * Nh_kv, n_rb_kv}, opts_f32);
-  torch::Tensor v_scale_quant =
-      v_per_channel ? torch::empty({Nb * Nh_kv, n_rb_kv}, opts_f32) : v_scale;
-
   const c10::cuda::OptionalCUDAGuard device_guard(Q.device());
   auto stream = at::cuda::getCurrentCUDAStream();
-
-  torch::Tensor km, km_f32, km_partials;
-  const kDataType* km_ptr = nullptr;
-  const float* km_f32_ptr = nullptr;
-  const kDataType* q_ptr = reinterpret_cast<const kDataType*>(Q.data_ptr());
-  const kDataType* k_ptr = reinterpret_cast<const kDataType*>(K.data_ptr());
-  const kDataType* v_ptr = reinterpret_cast<const kDataType*>(V.data_ptr());
-  if (fp8_smooth_k) {
-    // Custom two-stage column mean (~50us) replacing at::mean + fp32 cast
-    // (~85us); emits the in-dtype mean and its fp32 copy in one pass.
-    const int mean_chunks =
-        (Nkv + ffpa_fp8::kMeanRowsPerChunk - 1) / ffpa_fp8::kMeanRowsPerChunk;
-    km = torch::empty({Nb * Nh_kv, kHeadDim}, K.options());
-    km_f32 = torch::empty({Nb * Nh_kv, kHeadDim}, opts_f32);
-    km_partials = torch::empty({Nb * Nh_kv, mean_chunks, kHeadDim}, opts_f32);
-    km_ptr = reinterpret_cast<const kDataType*>(km.data_ptr());
-    km_f32_ptr = km_f32.data_ptr<float>();
-    ffpa_fp8::launch_kv_mean_sm120<kDataType, kHeadDim>(
-        k_ptr, reinterpret_cast<kDataType*>(km.data_ptr()),
-        km_f32.data_ptr<float>(), km_partials.data_ptr<float>(), Nb, Nh_kv, Nkv,
-        D_og, stream, &Lkv);
-  }
-  if (qk_per_thread) {
-    ffpa_fp8::launch_quantize_fp8_perthread_qk_sm120<kDataType, kBr, kBc,
-                                                     kHeadDim, kQKInt8>(
-        q_ptr, k_ptr, v_ptr, q8.data_ptr(), k8.data_ptr(),
-        reinterpret_cast<__nv_fp8_e4m3*>(vt8.data_ptr()),
-        q_scale.data_ptr<float>(), k_scale.data_ptr<float>(),
-        v_scale_quant.data_ptr<float>(), Nb, Nh, Nh_kv, Nq, Nkv, Nkv_pad, D_og,
-        Lq, Lkv, stream, km_ptr, reorg_free, v_per_channel, &Lv);
-  } else {
-    ffpa_fp8::launch_quantize_fp8_sm120<kDataType, kBr, kBc, kHeadDim, kQKInt8>(
-        q_ptr, k_ptr, v_ptr, q8.data_ptr(), k8.data_ptr(),
-        reinterpret_cast<__nv_fp8_e4m3*>(vt8.data_ptr()),
-        q_scale.data_ptr<float>(), k_scale.data_ptr<float>(),
-        v_scale_quant.data_ptr<float>(), Nb, Nh, Nh_kv, Nq, Nkv, Nkv_pad, D_og,
-        Lq, Lkv, stream, km_ptr, reorg_free, v_per_channel, &Lv);
-  }
-
-  // Per-channel V (sage-style): re-quantize V with per-D scale via coalesced
-  // stats (sum+max+min -> mean+amax) + quantize/transpose. smooth_v subtracts
-  // the per-D mean (residual amax); overwrites the per-block vt8/v_scale.
-  torch::Tensor vm, v_partials_sum, v_partials_max, v_partials_min;
-  float* vm_ptr = nullptr;
-  if (v_per_channel) {
-    const int stats_chunks = (Nkv + ffpa_fp8::kVStatsRowsPerChunk - 1) /
-                             ffpa_fp8::kVStatsRowsPerChunk;
-    v_partials_sum =
-        torch::empty({Nb * Nh_kv, stats_chunks, kHeadDim}, opts_f32);
-    v_partials_max =
-        torch::empty({Nb * Nh_kv, stats_chunks, kHeadDim}, opts_f32);
-    v_partials_min =
-        torch::empty({Nb * Nh_kv, stats_chunks, kHeadDim}, opts_f32);
-    vm = torch::empty({Nb * Nh_kv, kHeadDim}, opts_f32);
-    vm_ptr = vm.data_ptr<float>();
-    if (v_smooth_mean) {
-      ffpa_fp8::launch_quantize_fp8_vt_perchannel_sm120<kDataType, kBr, kBc,
-                                                        kHeadDim, true>(
-          v_ptr, reinterpret_cast<__nv_fp8_e4m3*>(vt8.data_ptr()),
-          v_scale.data_ptr<float>(), vm_ptr, v_partials_sum.data_ptr<float>(),
-          v_partials_max.data_ptr<float>(), v_partials_min.data_ptr<float>(),
-          Nb, Nh_kv, Nkv, Nkv_pad, stream, D_og, v_r, reorg_free, &Lv);
-    } else {
-      ffpa_fp8::launch_quantize_fp8_vt_perchannel_sm120<kDataType, kBr, kBc,
-                                                        kHeadDim, false>(
-          v_ptr, reinterpret_cast<__nv_fp8_e4m3*>(vt8.data_ptr()),
-          v_scale.data_ptr<float>(), vm_ptr, v_partials_sum.data_ptr<float>(),
-          v_partials_max.data_ptr<float>(), v_partials_min.data_ptr<float>(),
-          Nb, Nh_kv, Nkv, Nkv_pad, stream, D_og, v_r, reorg_free, &Lv);
-    }
-  }
-  const float* vm_kernel = v_smooth_mean ? vm_ptr : nullptr;
+  // Stage-independent preprocessing (allocation + smooth-K mean + Q/K/V
+  // quantize) lives in cute/fp8/prepare_inputs.cuh, instantiated once per
+  // (dtype, D, kQKInt8) in the generated preprocess TU; the extern
+  // template declarations come from generated/fp8_preprocess_instances.cuh.
+  const ffpa_fp8::Fp8QuantizedInputs qi =
+      ffpa_fp8::prepare_fp8_inputs<kDataType, kBr, kBc, kHeadDim, kQKInt8>(
+          Q, K, V, Lq, Lkv, Lv, Nb, Nh, Nh_kv, Nq, Nkv, n_rb_q, n_rb_kv,
+          Nkv_pad, D_og, fp8_smooth_k, qk_per_thread, v_per_channel,
+          v_smooth_mean, v_r, reorg_free, stream);
+  const torch::Tensor& q8 = qi.q8;
+  const torch::Tensor& k8 = qi.k8;
+  const torch::Tensor& vt8 = qi.vt8;
+  const torch::Tensor& q_scale = qi.q_scale;
+  const torch::Tensor& k_scale = qi.k_scale;
+  const torch::Tensor& v_scale = qi.v_scale;
+  const float* km_f32_ptr = qi.km_f32_ptr;
+  const float* vm_kernel = qi.vm_kernel;
 
   const int total_q_rows = Nb * Nh * Nq;
   const int total_kv_rows = Nb * Nh_kv * Nkv;
@@ -1000,6 +833,7 @@ void launch_cute_fwd_split_d_m4n2_fp8_sm120_impl(
       !fp8_smooth_v || v_per_channel,
       "ffpa_attn: fp8_smooth_v requires fp8_v_quant_method='per_channel'");
 
+  // kBr/kBc mirrored by env.py::_fp8_variant_blocks; keep in sync.
   constexpr int kBr = 64;
   constexpr int kBc = 64;
   constexpr int kQKDChunk = 64;
@@ -1041,105 +875,25 @@ void launch_cute_fwd_split_d_m4n2_fp8_sm120_impl(
   // D_og: real input head_dim (may be < kHeadDim for non-32-mult pad path).
   const int D_og = Q.size(3);
 
-  auto opts_qk = torch::TensorOptions()
-                     .dtype(kQKInt8 ? torch::kChar : torch::kFloat8_e4m3fn)
-                     .device(Q.device());
-  auto opts_u8 =
-      torch::TensorOptions().dtype(torch::kFloat8_e4m3fn).device(Q.device());
-  auto opts_f32 =
-      torch::TensorOptions().dtype(torch::kFloat32).device(Q.device());
-  torch::Tensor q8 = torch::empty({Nb, Nh, Nq, kHeadDim}, opts_qk);
-  torch::Tensor k8 = torch::empty({Nb, Nh_kv, Nkv, kHeadDim}, opts_qk);
-  torch::Tensor vt8 = torch::empty({Nb, Nh_kv, kHeadDim, Nkv_pad}, opts_u8);
-  // Per-thread QK: Q uses 128-row quantize blocks (64 scale/block), K uses
-  // kBc=64-col blocks (4 scale/block).
-  const int n_rb_q_quant = utils::div_ceil(Nq, 128);
-  torch::Tensor q_scale = torch::empty(
-      {Nb * Nh, qk_per_thread ? n_rb_q_quant * 64 : n_rb_q}, opts_f32);
-  torch::Tensor k_scale = torch::empty(
-      {Nb * Nh_kv, qk_per_thread ? n_rb_kv * 4 : n_rb_kv}, opts_f32);
-  // Per-channel V (along D): v_scale is (bh, D) for per-channel, (bh,
-  // n_rb_kv) for per-block. v_scale_quant feeds the first per-block quantize
-  // pass; per-channel overwrites vt8/v_scale afterwards.
-  torch::Tensor v_scale = v_per_channel
-                              ? torch::empty({Nb * Nh_kv, kHeadDim}, opts_f32)
-                              : torch::empty({Nb * Nh_kv, n_rb_kv}, opts_f32);
-  torch::Tensor v_scale_quant =
-      v_per_channel ? torch::empty({Nb * Nh_kv, n_rb_kv}, opts_f32) : v_scale;
-
   const c10::cuda::OptionalCUDAGuard device_guard(Q.device());
   auto stream = at::cuda::getCurrentCUDAStream();
-
-  torch::Tensor km, km_f32, km_partials;
-  const kDataType* km_ptr = nullptr;
-  const float* km_f32_ptr = nullptr;
-  const kDataType* q_ptr = reinterpret_cast<const kDataType*>(Q.data_ptr());
-  const kDataType* k_ptr = reinterpret_cast<const kDataType*>(K.data_ptr());
-  const kDataType* v_ptr = reinterpret_cast<const kDataType*>(V.data_ptr());
-  if (fp8_smooth_k) {
-    // Custom two-stage column mean (~50us) replacing at::mean + fp32 cast
-    // (~85us); emits the in-dtype mean and its fp32 copy in one pass.
-    const int mean_chunks =
-        (Nkv + ffpa_fp8::kMeanRowsPerChunk - 1) / ffpa_fp8::kMeanRowsPerChunk;
-    km = torch::empty({Nb * Nh_kv, kHeadDim}, K.options());
-    km_f32 = torch::empty({Nb * Nh_kv, kHeadDim}, opts_f32);
-    km_partials = torch::empty({Nb * Nh_kv, mean_chunks, kHeadDim}, opts_f32);
-    km_ptr = reinterpret_cast<const kDataType*>(km.data_ptr());
-    km_f32_ptr = km_f32.data_ptr<float>();
-    ffpa_fp8::launch_kv_mean_sm120<kDataType, kHeadDim>(
-        k_ptr, reinterpret_cast<kDataType*>(km.data_ptr()),
-        km_f32.data_ptr<float>(), km_partials.data_ptr<float>(), Nb, Nh_kv, Nkv,
-        D_og, stream, &Lkv);
-  }
-  if (qk_per_thread) {
-    ffpa_fp8::launch_quantize_fp8_perthread_qk_sm120<kDataType, kBr, kBc,
-                                                     kHeadDim, kQKInt8>(
-        q_ptr, k_ptr, v_ptr, q8.data_ptr(), k8.data_ptr(),
-        reinterpret_cast<__nv_fp8_e4m3*>(vt8.data_ptr()),
-        q_scale.data_ptr<float>(), k_scale.data_ptr<float>(),
-        v_scale_quant.data_ptr<float>(), Nb, Nh, Nh_kv, Nq, Nkv, Nkv_pad, D_og,
-        Lq, Lkv, stream, km_ptr, false, v_per_channel, &Lv);
-  } else {
-    ffpa_fp8::launch_quantize_fp8_sm120<kDataType, kBr, kBc, kHeadDim, kQKInt8>(
-        q_ptr, k_ptr, v_ptr, q8.data_ptr(), k8.data_ptr(),
-        reinterpret_cast<__nv_fp8_e4m3*>(vt8.data_ptr()),
-        q_scale.data_ptr<float>(), k_scale.data_ptr<float>(),
-        v_scale_quant.data_ptr<float>(), Nb, Nh, Nh_kv, Nq, Nkv, Nkv_pad, D_og,
-        Lq, Lkv, stream, km_ptr, false, v_per_channel, &Lv);
-  }
-  // Per-channel V (sage-style): re-quantize V with per-D scale via coalesced
-  // stats (sum+max+min -> mean+amax) + quantize/transpose. smooth_v subtracts
-  // the per-D mean (residual amax); overwrites the per-block vt8/v_scale.
-  torch::Tensor vm, v_partials_sum, v_partials_max, v_partials_min;
-  float* vm_ptr = nullptr;
-  if (v_per_channel) {
-    const int stats_chunks = (Nkv + ffpa_fp8::kVStatsRowsPerChunk - 1) /
-                             ffpa_fp8::kVStatsRowsPerChunk;
-    v_partials_sum =
-        torch::empty({Nb * Nh_kv, stats_chunks, kHeadDim}, opts_f32);
-    v_partials_max =
-        torch::empty({Nb * Nh_kv, stats_chunks, kHeadDim}, opts_f32);
-    v_partials_min =
-        torch::empty({Nb * Nh_kv, stats_chunks, kHeadDim}, opts_f32);
-    vm = torch::empty({Nb * Nh_kv, kHeadDim}, opts_f32);
-    vm_ptr = vm.data_ptr<float>();
-    if (v_smooth_mean) {
-      ffpa_fp8::launch_quantize_fp8_vt_perchannel_sm120<kDataType, kBr, kBc,
-                                                        kHeadDim, true>(
-          v_ptr, reinterpret_cast<__nv_fp8_e4m3*>(vt8.data_ptr()),
-          v_scale.data_ptr<float>(), vm_ptr, v_partials_sum.data_ptr<float>(),
-          v_partials_max.data_ptr<float>(), v_partials_min.data_ptr<float>(),
-          Nb, Nh_kv, Nkv, Nkv_pad, stream, D_og, v_r, /*perm_vt=*/false, &Lv);
-    } else {
-      ffpa_fp8::launch_quantize_fp8_vt_perchannel_sm120<kDataType, kBr, kBc,
-                                                        kHeadDim, false>(
-          v_ptr, reinterpret_cast<__nv_fp8_e4m3*>(vt8.data_ptr()),
-          v_scale.data_ptr<float>(), vm_ptr, v_partials_sum.data_ptr<float>(),
-          v_partials_max.data_ptr<float>(), v_partials_min.data_ptr<float>(),
-          Nb, Nh_kv, Nkv, Nkv_pad, stream, D_og, v_r, /*perm_vt=*/false, &Lv);
-    }
-  }
-  const float* vm_kernel = v_smooth_mean ? vm_ptr : nullptr;
+  // Stage-independent preprocessing (allocation + smooth-K mean + Q/K/V
+  // quantize) lives in cute/fp8/prepare_inputs.cuh, instantiated once per
+  // (dtype, D, kQKInt8) in the generated preprocess TU; the extern
+  // template declarations come from generated/fp8_preprocess_instances.cuh.
+  const ffpa_fp8::Fp8QuantizedInputs qi =
+      ffpa_fp8::prepare_fp8_inputs<kDataType, kBr, kBc, kHeadDim, kQKInt8>(
+          Q, K, V, Lq, Lkv, Lv, Nb, Nh, Nh_kv, Nq, Nkv, n_rb_q, n_rb_kv,
+          Nkv_pad, D_og, fp8_smooth_k, qk_per_thread, v_per_channel,
+          v_smooth_mean, v_r, /*reorg_free=*/false, stream);
+  const torch::Tensor& q8 = qi.q8;
+  const torch::Tensor& k8 = qi.k8;
+  const torch::Tensor& vt8 = qi.vt8;
+  const torch::Tensor& q_scale = qi.q_scale;
+  const torch::Tensor& k_scale = qi.k_scale;
+  const torch::Tensor& v_scale = qi.v_scale;
+  const float* km_f32_ptr = qi.km_f32_ptr;
+  const float* vm_kernel = qi.vm_kernel;
 
   const int total_q_rows = Nb * Nh * Nq;
   const int total_kv_rows = Nb * Nh_kv * Nkv;
