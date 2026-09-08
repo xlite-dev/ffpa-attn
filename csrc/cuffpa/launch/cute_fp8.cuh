@@ -617,6 +617,8 @@ void launch_cute_fwd_split_d_fp8_sm120_impl(
     // the FC-4 gmem path whose LDG injection leaves the smem/MIO pipe
     // alone. Mode 3 does not help either (267ms): the resident load and
     // the injection LDS share the same critical path.
+    // The mode-2 launch variants are compile-time excluded for D>=512
+    // (see the launch table below); keep both in sync.
     bias_plan.mode = 0;
   }
   const auto make_tma_bias = [&](auto b4_c) {
@@ -642,7 +644,8 @@ void launch_cute_fwd_split_d_fp8_sm120_impl(
     return make_tma_copy(SM90_TMA_LOAD{}, gB, sB, shape(sB), _1{});
   };
   auto tma_bias_r16 = make_tma_bias(std::integral_constant<int, 0>{});
-  auto tma_bias_r32 = make_tma_bias(std::integral_constant<int, 1>{});
+  [[maybe_unused]] auto tma_bias_r32 =
+      make_tma_bias(std::integral_constant<int, 1>{});
   // Mode 3 pads the resident bytes to a whole kBc tile: tail tiles'
   // unclamped injection reads stay in-allocation (pad zero-filled by the
   // resident load).
@@ -721,19 +724,27 @@ void launch_cute_fwd_split_d_fp8_sm120_impl(
       launch_kernel(kernel_of(Ic0{}, Ic0{}, Ic0{}), tma_bias_sel);
     }
   };
+  // D>=512 demotes mode 2 to 0 above, so the mode-2 tile variants are
+  // unreachable there; keep them out of codegen entirely.
   if (bias.ptr == nullptr) {
     launch_with(std::integral_constant<int, 0>{}, tma_bias_r16,
                 std::integral_constant<int, 0>{},
                 std::integral_constant<int, 0>{});
-  } else if (bias_plan.mode == 2) {
-    if (bias.dtype == 3)
-      launch_with(std::integral_constant<int, 1>{}, tma_bias_r32,
-                  std::integral_constant<int, 2>{},
-                  std::integral_constant<int, 1>{});
-    else
+  } else if constexpr (kHeadDim < 512) {
+    if (bias_plan.mode == 2) {
+      if (bias.dtype == 3)
+        launch_with(std::integral_constant<int, 1>{}, tma_bias_r32,
+                    std::integral_constant<int, 2>{},
+                    std::integral_constant<int, 1>{});
+      else
+        launch_with(std::integral_constant<int, 1>{}, tma_bias_r16,
+                    std::integral_constant<int, 2>{},
+                    std::integral_constant<int, 0>{});
+    } else {
       launch_with(std::integral_constant<int, 1>{}, tma_bias_r16,
-                  std::integral_constant<int, 2>{},
+                  std::integral_constant<int, 0>{},
                   std::integral_constant<int, 0>{});
+    }
   } else {
     launch_with(std::integral_constant<int, 1>{}, tma_bias_r16,
                 std::integral_constant<int, 0>{},
