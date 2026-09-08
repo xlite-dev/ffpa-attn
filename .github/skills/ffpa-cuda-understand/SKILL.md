@@ -533,7 +533,7 @@ strided-NHD 门禁细节（`ffpa_is_strided_nhd`）：`stride(3)==1 && stride(1)
 
 | 路径 | 原生 D 集合 | pad 规则 | pad 实现方式 |
 |---|---|---|---|
-| native（AUTO/NATIVE/TMA） | 编译集（默认 %64 ∈ [320,1024]；`--headdim all` {64,128,192,256,320,512,768}） | `D_og%8==0` → **64 对齐** ∈[64,1024]（FC-8） | **Q/K/V 不物化**：sm80 cp.async 16B chunk 列守卫（`cp_async_zfill` src-size=0，含 decode split-KV）/ sm90+ TMA descriptor `minor_dim=d_og` OOB 零填充；仅 O pad 切回。TMA hint 仅在 TMA ext 已编译且 sm90+ 计入（pre-sm90 回落 CUTE sm80 走 32 对齐物化 pad） |
+| native（AUTO/NATIVE/TMA） | 编译集（默认 = default 集 {64,128,192,256,320,512}；`--headdim all` {64,128,192,256,320,512,768}） | `D_og%8==0` → **64 对齐** ∈[64,1024]（FC-8） | **Q/K/V 不物化**：sm80 cp.async 16B chunk 列守卫（`cp_async_zfill` src-size=0，含 decode split-KV）/ sm90+ TMA descriptor `minor_dim=d_og` OOB 零填充；仅 O pad 切回。TMA hint 仅在 TMA ext 已编译且 sm90+ 计入（pre-sm90 回落 CUTE sm80 走 32 对齐物化 pad） |
 | cute fp16 | persist: %32 ≤128；split: %64（<768）/ %32（(32,32) chunk）；M4N2: %64 [768,1024] | `D_og%8==0` → 32 对齐 | **Q/K/V `constant_pad_nd` 物化 + O pad 切回**（TMA stride 需 D_pad） |
 | fp8 | persist %32 ≤224；split (224,768)；M4N2 ≥768 | `D_og%8==0` → 32 对齐 ≤1024 | **quantize kernel 读 D_og stride + 零填 pad 列（不物化）**；仅 O pad |
 | fp4 | persist {64,128,192,256}；split (256,768)；M4N2 [768,1024] | `D_og%8==0` → **64 对齐** ∈[64,1024] | 同 fp8 fused（`FFPA_FP4_PAD_TORCH=1` 可切 torch pad） |
@@ -619,9 +619,9 @@ softmax_scale 恒按真实 D（Python 解析 `1/sqrt(D_og)`）。
 
 ```bash
 bash ./build.sh --arch sm_120f --headdim <list> --ext all --jobs 64
-# 不传 flag（legacy 默认）：64 倍数 ∈ [320,1024]
+# 不传 flag = 'default'（64,128,192,256,320,512）
 # 'default' → 64,128,192,256,320,512；'all' → default + 768（832-1024 编译极慢，已移出 all）
-# 其它 headdim（32/96/120/224/832..1024 等）必须显式列表传；ENABLE_FFPA_ALL_HEADDIM=1 env 可编满 [64,1024] %64
+# 其它 headdim（32/96/120/224/832..1024 等）必须显式列表传；ENABLE_FFPA_ALL_HEADDIM=1 env（仅裸 setup.py/pip 路径）可编满 [64,1024] %64
 # sm_120f（非 sm_120a）才能让 setmaxnreg 生效（120a 上 ptxas C7506 静默忽略）
 # 开发测试期间避免全量编译headdim，减少编译时间；只编译需要测试的headdim，比如 128/512等
 # 开发收敛后再全量编译 headdim，避免 bench 时遇到未编译 headdim 报错

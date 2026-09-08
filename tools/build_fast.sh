@@ -49,9 +49,7 @@ Flags (override same-named env vars; env reference: docs/env.md):
                        headdim (e.g. 32, 96, 832..1024) is NOT covered by
                        'all'/'default' and must be requested manually via an
                        explicit list: --headdim 32,96,1024. Omitting the flag
-                       builds the legacy default set (multiples of 64 in
-                       [320, 1024]), governed by ENABLE_FFPA_ALL_HEADDIM
-                       (default 0).
+                       is equivalent to 'default'.
   --stages <csv|all>   FFPA_BUILD_STAGES: build stage subset, e.g. '2,3' or
                        'all' (= 1..max). Overrides the legacy
                        ENABLE_FFPA_ALL_STAGES; default without both: '2,3'.
@@ -173,9 +171,10 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-# headdim omitted -> default set (multiples of 64 in [320, 1024]).
+# headdim omitted -> same fixed set as --headdim default.
 if [[ "$HEADDIM_SET" == "0" ]]; then
-  unset FFPA_DEV_HEADDIMS
+  unset ENABLE_FFPA_ALL_HEADDIM
+  export FFPA_DEV_HEADDIMS="64,128,192,256,320,512"
 fi
 
 # Resolve --ext into ENABLE_FFPA_* switches (cute/tma live inside the _C ext).
@@ -256,7 +255,7 @@ else
   BUILD_CMD="python setup.py build_ext --inplace"
 fi
 echo "[build_fast] ENABLE_FFPA_CUDA_IMPL=${ENABLE_FFPA_CUDA_IMPL:-0}  ENABLE_FFPA_CUTE_EXT=${ENABLE_FFPA_CUTE_EXT:-0}  ENABLE_FFPA_TMA_EXT=${ENABLE_FFPA_TMA_EXT:-0}"
-echo "[build_fast] FFPA_BUILD_ARCH=${FFPA_BUILD_ARCH:-<auto from current device>}  FFPA_DEV_HEADDIMS=${FFPA_DEV_HEADDIMS:-<default: mults of 64 in [320,1024]>}  FFPA_BUILD_STAGES=${FFPA_BUILD_STAGES:-<default: '2,3'>}  FFPA_EDITABLE=${FFPA_EDITABLE}  ENABLE_FFPA_BUILD_DEBUG=${ENABLE_FFPA_BUILD_DEBUG:-<none>}"
+echo "[build_fast] FFPA_BUILD_ARCH=${FFPA_BUILD_ARCH:-<auto from current device>}  FFPA_DEV_HEADDIMS=${FFPA_DEV_HEADDIMS:-<default: 64,128,192,256,320,512>}  FFPA_BUILD_STAGES=${FFPA_BUILD_STAGES:-<default: '2,3'>}  FFPA_EDITABLE=${FFPA_EDITABLE}  ENABLE_FFPA_BUILD_DEBUG=${ENABLE_FFPA_BUILD_DEBUG:-<none>}"
 echo "[build_fast] MAX_JOBS=$MAX_JOBS  FFPA_NVCC_THREADS=$FFPA_NVCC_THREADS"
 echo "[build_fast] command: $BUILD_CMD${PASS_ARGS[*]:+ ${PASS_ARGS[*]}}"
 if [[ "$DRY_RUN" == "1" ]]; then
