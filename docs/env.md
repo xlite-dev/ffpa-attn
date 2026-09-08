@@ -35,7 +35,7 @@ ENABLE_FFPA_TMA_EXT=1 FFPA_EDITABLE=1 MAX_JOBS=32 bash tools/build_fast.sh
 |---|---|
 | `--arch <spec>` | `FFPA_BUILD_ARCH`; full names (`sm_120f`, `sm_89`), short forms (`120f`) or aliases; comma-separate or repeat the flag for multiple archs |
 | `--ext all\|none\|<csv of cuda,cute,tma>` | `ENABLE_FFPA_CUDA_IMPL` / `ENABLE_FFPA_CUTE_EXT` / `ENABLE_FFPA_TMA_EXT`; `all` sets all three; default when omitted: `ENABLE_FFPA_CUDA_IMPL=1`. TMA auto-disables when every target arch is sm<90 |
-| `--headdim all\|default\|<list>` | `FFPA_DEV_HEADDIMS`; `all` builds every headdim (multiples of 64 in [64, 1024]); `default` builds the common set `64,128,192,256,320,512`; omitting the flag builds the legacy set (multiples of 64 in [320, 1024], governed by `ENABLE_FFPA_ALL_HEADDIM`) |
+| `--headdim all\|default\|<list>` | `FFPA_DEV_HEADDIMS`; `all` builds `64,128,192,256,320,512,768`; `default` builds the same set minus 768; omitting the flag builds the legacy set (multiples of 64 in [320, 1024], governed by `ENABLE_FFPA_ALL_HEADDIM`) |
 | `--stages <csv>\|all` | `FFPA_BUILD_STAGES`; stage subset, e.g. `2,3` or `all` (stages `1..max`); takes priority over `ENABLE_FFPA_ALL_STAGES`; default without both: `"2,3"` |
 | `--editable` / `--clean` / `--shm` | `FFPA_EDITABLE` / `FFPA_CLEAN` / `FFPA_BUILD_IN_SHM` |
 | `-j, --jobs N` / `--nvcc-threads N` / `--ptxas-verbose` | `MAX_JOBS` / `FFPA_NVCC_THREADS` / `FFPA_PTXAS_VERBOSE` |

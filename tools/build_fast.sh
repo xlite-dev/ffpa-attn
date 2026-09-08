@@ -44,13 +44,12 @@ Flags (override same-named env vars; env reference: docs/env.md):
                        TMA auto-disables when every target arch is sm<90.
   --headdim <list|all|default>
                        FFPA_DEV_HEADDIMS subset, e.g. 256,512; 'all' builds
-                       every headdim (multiples of 64 in [64, 1024]);
-                       'default' builds the common set 64,128,192,256,320,512
-                       (fast full-feature iteration). Omitting the flag builds
-                       the legacy default set (multiples of 64 in [320, 1024]),
-                       governed by ENABLE_FFPA_ALL_HEADDIM (default 0). Pass
-                       other headdims (e.g. 32, 96, 128) explicitly via
-                       --headdim 32,96,128.
+                       64,128,192,256,320,512,768; 'default' builds the same
+                       set minus 768 (fast full-feature iteration). Omitting
+                       the flag builds the legacy default set (multiples of 64
+                       in [320, 1024]), governed by ENABLE_FFPA_ALL_HEADDIM
+                       (default 0). Pass other headdims (e.g. 32, 96, 1024)
+                       explicitly via --headdim 32,96,1024.
   --stages <csv|all>   FFPA_BUILD_STAGES: build stage subset, e.g. '2,3' or
                        'all' (= 1..max). Overrides the legacy
                        ENABLE_FFPA_ALL_STAGES; default without both: '2,3'.
@@ -124,8 +123,8 @@ while [[ $# -gt 0 ]]; do
       require_value "$@"
       HEADDIM_SET=1
       if [[ "${2,,}" == "all" ]]; then
-        unset FFPA_DEV_HEADDIMS
-        export ENABLE_FFPA_ALL_HEADDIM=1
+        unset ENABLE_FFPA_ALL_HEADDIM
+        export FFPA_DEV_HEADDIMS="64,128,192,256,320,512,768"
       elif [[ "${2,,}" == "default" ]]; then
         export FFPA_DEV_HEADDIMS="64,128,192,256,320,512"
       else
