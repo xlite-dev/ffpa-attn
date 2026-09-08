@@ -13,18 +13,123 @@
 #include "cute/fp4/sm_120/split_d.cuh"
 #include "cute/fp4/sm_120/split_d_m4n2.cuh"
 
+namespace ffpa {
+
+// Single-source final bias-mode decision per fp4 impl: the wrapper
+// dispatch and the variant body both call these, so a demote-rule drift
+// fails the variant tag TORCH_CHECK instead of silently mismatching.
+// All three read the device smem opt-in (dyn_limit = optin - 256, the
+// static barrier-array reserve) at the call site and pass it in.
+
+// persist_d: dense tiles single-buffered; row-broadcast double buffered
+// and upgraded to the resident vector (mode 3) when the whole [1,Nkv]
+// row fits AND the smem-driven blocks/SM of the base layout stay intact
+// (this family is 1 CTA/SM, so the guard only rejects tight D corners).
+template <typename kDataType, const int kHeadDim, bool kPvMxfp8>
+inline FfpaBiasTilePlan fp4_persist_d_bias_plan(const FfpaBiasParams& bias_p,
+                                                int Nb, int Nh, int Nq, int Nkv,
+                                                int dyn_limit) {
+  using ElementO = std::conditional_t<std::is_same_v<kDataType, __half>,
+                                      cutlass::half_t, cutlass::bfloat16_t>;
+  using Traits =
+      ffpa_fp4::FFPAAttnCuTePersistDFP4Traits<ElementO, kHeadDim, kPvMxfp8>;
+  constexpr int kBr = 128;
+  constexpr int kBc = 128;
+  FfpaBiasTilePlan plan = ffpa_bias_tile_plan_of(bias_p, Nb, Nh, Nq, Nkv);
+  const int bias_stages = (plan.mode == 2) ? 2 : 1;
+  if ((long long)Traits::kSmemBytes + plan.tile_bytes(kBr, kBc, bias_stages) >
+      dyn_limit)
+    plan.mode = 0;
+  if (plan.mode == 2) {
+    const long long kv_pad = (Nkv + kBc - 1) / kBc * kBc;
+    const long long base_align = ((long long)Traits::kSmemBytes + 15) & ~15;
+    const long long resident = base_align + kv_pad * plan.elem_size;
+    if (resident <= dyn_limit && dyn_limit / resident >= dyn_limit / base_align)
+      plan.mode = 3;
+  }
+  return plan;
+}
+
+// split_d: dense (mode 1) is m4n2-native, demote to gmem-direct; try the
+// resident vector (mode 3) upgrade first, then demote by the smem budget.
+template <typename kDataType, const int kHeadDim, bool kPvMxfp8>
+inline FfpaBiasTilePlan fp4_split_d_bias_plan(const FfpaBiasParams& bias_p,
+                                              int Nb, int Nh, int Nq, int Nkv,
+                                              int dyn_limit) {
+  using ElementO = std::conditional_t<std::is_same_v<kDataType, __half>,
+                                      cutlass::half_t, cutlass::bfloat16_t>;
+  using Traits =
+      ffpa_fp4::FFPAAttnCuTeSplitDFP4Traits<ElementO, kHeadDim, 128, 128, 64,
+                                            64, 3, 3, kPvMxfp8>;
+  constexpr int kBr = 128;
+  constexpr int kBc = 128;
+  FfpaBiasTilePlan plan = ffpa_bias_tile_plan_of(bias_p, Nb, Nh, Nq, Nkv);
+  if (plan.mode == 1)
+    plan.mode = 0;
+  const auto bias_bytes_of = [&](int m) {
+    // Mode 3 pads the resident bytes to a whole kBc tile (the kernel's
+    // resident fill zero-fills the pad segment).
+    return (m == 3) ? (long long)(Nkv + kBc - 1) / kBc * kBc * plan.elem_size
+                    : plan.tile_bytes(kBr, kBc, (m == 2) ? 2 : 1);
+  };
+  if (plan.mode == 2 &&
+      (long long)Traits::kSmemBytes + bias_bytes_of(3) <= dyn_limit)
+    plan.mode = 3;
+  if ((long long)Traits::kSmemBytes + bias_bytes_of(plan.mode) > dyn_limit)
+    plan.mode = 0;
+  return plan;
+}
+
+// split_d m4n2: dense is m4n2-native but unwired (demote to 0); PC-0-5
+// pins gmem-direct (mode 0) on regular builds - FFPA_BIAS_TILE_KEEP
+// (debug build only) keeps the smem tile modes for investigation. No
+// mode-3 upgrade on this family (deterministic 8B resident overread).
+template <typename kDataType, const int kHeadDim>
+inline FfpaBiasTilePlan fp4_m4n2_bias_plan(const FfpaBiasParams& bias_p, int Nb,
+                                           int Nh, int Nq, int Nkv,
+                                           int dyn_limit) {
+  using ElementO = std::conditional_t<std::is_same_v<kDataType, __half>,
+                                      cutlass::half_t, cutlass::bfloat16_t>;
+  using Traits = ffpa_fp4::FFPAAttnCuTeSplitDM4N2FP4Traits<ElementO, kHeadDim>;
+  constexpr int kBr = 64;
+  constexpr int kBc = 64;
+  FfpaBiasTilePlan plan = ffpa_bias_tile_plan_of(bias_p, Nb, Nh, Nq, Nkv);
+  if (plan.mode == 1)
+    plan.mode = 0;
+#ifdef ENABLE_FFPA_FP4_BUILD_DEBUG
+  if (plan.mode != 0 && getenv("FFPA_BIAS_TILE_KEEP") == nullptr)
+    plan.mode = 0;
+#else
+  plan.mode = 0;
+#endif
+  const auto bias_bytes_of = [&](int m) {
+    return (m == 3) ? (long long)(Nkv + kBc - 1) / kBc * kBc * plan.elem_size
+                    : plan.tile_bytes(kBr, kBc, (m == 2) ? 2 : 1);
+  };
+  if ((long long)Traits::kSmemBytes + bias_bytes_of(plan.mode) > dyn_limit)
+    plan.mode = 0;
+  return plan;
+}
+
+}  // namespace ffpa
+
 // NVFP4 persist-D launcher (D=128). Pipeline: km (two-stage K column mean,
 // shared with fp8) -> q_block_mean -> 3 quantize kernels (Q centered by qm,
 // K smoothed by km + row-permuted, V transposed) -> delta_s = qm @ (K-km)^T
 // - qm.km (GQA broadcast bmm, fp16 domain like sageattn3) -> TMA descriptors
 // -> persist_d_ws_fwd_cute_fp4_sm120. Workspaces are 128-padded along
 // seqlen; delta_s tail columns zero-fill (masked -inf in-kernel).
-template <typename kDataType, const int kHeadDim, bool kPvMxfp8 = false>
-void launch_cute_fwd_persist_d_fp4_sm120_impl(
-    torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O,
-    torch::Tensor attn_bias, torch::Tensor softmax_lse, int causal,
-    double softmax_scale, int q_start_row = 0, bool fp4_hadamard = false,
-    bool fp4_smooth_v = false) {
+// Variant tags: (kPvMxfp8, kBiasOn, kModeL, kB4) pin the PV dtype and the
+// bias tile mode so each kernel table compiles in its own TU (env.py).
+template <typename kDataType, const int kHeadDim, bool kPvMxfp8, int kBiasOn,
+          int kModeL, int kB4>
+void launch_cute_fwd_persist_d_fp4_sm120_v(torch::Tensor Q, torch::Tensor K,
+                                           torch::Tensor V, torch::Tensor O,
+                                           torch::Tensor attn_bias,
+                                           torch::Tensor softmax_lse,
+                                           int causal, double softmax_scale,
+                                           int q_start_row, bool fp4_hadamard,
+                                           bool fp4_smooth_v) {
   using namespace cute;
   constexpr int kBr = 128;
   constexpr int kBc = 128;
@@ -325,44 +430,28 @@ void launch_cute_fwd_persist_d_fp4_sm120_impl(
   auto tma_ds = make_tma_copy(SM90_TMA_LOAD{}, mDS, SmemLayoutDS{}(_, _, _0{}),
                               Shape<Int<kBr>, Int<kBc>>{}, _1{});
 
-  // PC-0-1 bias tile plan (tail slack past SFVt, mirroring the fp8 m4n2
-  // launcher): dense tiles get a single buffer; row-broadcast double
-  // buffers and upgrades to the resident vector (mode 3) when the whole
-  // [1,Nkv] row fits AND the smem-driven blocks/SM of the base layout stay
-  // intact (this family is 1 CTA/SM, so the guard only rejects the tight
-  // D=256 corners).
-  FfpaBiasTilePlan bias_plan;
-  if (bias.ptr != nullptr) {
-    FfpaBiasParams bias_p{bias.ptr,      bias.dtype,    bias.stride_b,
-                          bias.stride_h, bias.stride_m, bias.stride_n};
-    bias_plan = ffpa_bias_tile_plan_of(bias_p, Nb, Nh, Nq, Nkv);
-  }
+  // PC-0-1 bias tile plan: single-source helper (the wrapper dispatch
+  // calls it too); the tags below must match or the CHECK fires.
   TORCH_CHECK(q_start_row >= 0 && q_start_row < Nq,
               "ffpa_attn: q_start_row must be in [0, Nq)");
   TORCH_CHECK(q_start_row % kBr == 0,
               "ffpa_attn: q_start_row must be a multiple of kBr=128");
-  // Exceeding the smem opt-in limit fails SILENTLY in cudaFuncSetAttribute
-  // (score collapses to zero); check both up front (see sm120-smem-limit).
   int max_smem_optin = 0;
   cudaDeviceGetAttribute(
       &max_smem_optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, Q.get_device());
-  // The kernel's STATIC smem (the barrier arrays, <= 144B incl. the bias
-  // pair) is invisible to the dynamic budget: D=256's base sits ~200B under
-  // the opt-in ceiling and the aligned bias tail pushed the ATTRIBUTE over
-  // (the dynamic pre-check still passed). Reserve 256B for it.
   const int dyn_limit = max_smem_optin - 256;
-  const int bias_stages = (bias_plan.mode == 2) ? 2 : 1;
-  if ((long long)Traits::kSmemBytes +
-          bias_plan.tile_bytes(kBr, kBc, bias_stages) >
-      dyn_limit)
-    bias_plan.mode = 0;
-  if (bias_plan.mode == 2) {
-    const long long kv_pad = (Nkv + kBc - 1) / kBc * kBc;
-    const long long base_align = ((long long)Traits::kSmemBytes + 15) & ~15;
-    const long long resident = base_align + kv_pad * bias_plan.elem_size;
-    if (resident <= dyn_limit && dyn_limit / resident >= dyn_limit / base_align)
-      bias_plan.mode = 3;
+  FfpaBiasTilePlan bias_plan;
+  if (bias.ptr != nullptr) {
+    FfpaBiasParams bias_p{bias.ptr,      bias.dtype,    bias.stride_b,
+                          bias.stride_h, bias.stride_m, bias.stride_n};
+    bias_plan = ffpa::fp4_persist_d_bias_plan<kDataType, kHeadDim, kPvMxfp8>(
+        bias_p, Nb, Nh, Nq, Nkv, dyn_limit);
   }
+  TORCH_CHECK(kBiasOn == bias_on && kModeL == (bias_on ? bias_plan.mode : 0) &&
+                  kB4 == ((kModeL != 0 && bias.dtype == 3) ? 1 : 0),
+              "ffpa_attn: fp4 persist_d D=", kHeadDim,
+              " variant tag mismatch (wrapper dispatch vs plan)");
+  const int bias_stages = (bias_plan.mode == 2) ? 2 : 1;
   const auto make_tma_bias = [&](auto mode_c, auto b4_c) {
     constexpr int kBiasModeT = decltype(mode_c)::value;
     constexpr int kBias4B = decltype(b4_c)::value;
@@ -398,14 +487,14 @@ void launch_cute_fwd_persist_d_fp4_sm120_impl(
     }();
     return make_tma_copy(SM90_TMA_LOAD{}, gB, sB, shape(sB), _1{});
   };
-  auto tma_bias_d16 = make_tma_bias(std::integral_constant<int, 1>{},
-                                    std::integral_constant<int, 0>{});
-  auto tma_bias_d32 = make_tma_bias(std::integral_constant<int, 1>{},
-                                    std::integral_constant<int, 1>{});
-  auto tma_bias_r16 = make_tma_bias(std::integral_constant<int, 2>{},
-                                    std::integral_constant<int, 0>{});
-  auto tma_bias_r32 = make_tma_bias(std::integral_constant<int, 2>{},
-                                    std::integral_constant<int, 1>{});
+  [[maybe_unused]] auto tma_bias_d16 = make_tma_bias(
+      std::integral_constant<int, 1>{}, std::integral_constant<int, 0>{});
+  [[maybe_unused]] auto tma_bias_d32 = make_tma_bias(
+      std::integral_constant<int, 1>{}, std::integral_constant<int, 1>{});
+  [[maybe_unused]] auto tma_bias_r16 = make_tma_bias(
+      std::integral_constant<int, 2>{}, std::integral_constant<int, 0>{});
+  [[maybe_unused]] auto tma_bias_r32 = make_tma_bias(
+      std::integral_constant<int, 2>{}, std::integral_constant<int, 1>{});
   const int kSmemBytes =
       (int)(((long long)Traits::kSmemBytes + 15) & ~15) +
       (int)((bias_plan.mode == 3)
@@ -433,9 +522,6 @@ void launch_cute_fwd_persist_d_fp4_sm120_impl(
   const dim3 grid(num_ctas, 1, 1);
   const auto launch_with = [&](auto bias_tag, auto tma_bias_sel, auto mode_c,
                                auto b4_c) {
-    constexpr int kBiasOn = decltype(bias_tag)::value;
-    constexpr int kModeL = decltype(mode_c)::value;
-    constexpr int kB4 = decltype(b4_c)::value;
     using TmaBiasSel = decltype(tma_bias_sel);
     auto kernel = ffpa_fp4::persist_d_ws_fwd_cute_fp4_sm120<
         Traits, ElementO, decltype(tma_q), decltype(tma_k), decltype(tma_v),
@@ -456,35 +542,43 @@ void launch_cute_fwd_persist_d_fp4_sm120_impl(
         bias.stride_m, bias.stride_n,
         bias_plan.mode != 0 ? bias_plan.m_total : (long long)1);
   };
-  if (bias.ptr == nullptr) {
+  // Compile-time pinned variant: only this tag's kernel table instantiates.
+  if constexpr (kBiasOn == 0) {
     launch_with(std::integral_constant<int, 0>{}, tma_bias_r16,
                 std::integral_constant<int, 0>{},
                 std::integral_constant<int, 0>{});
+  } else if constexpr (kModeL == 1) {
+    if constexpr (kB4 == 1)
+      launch_with(std::integral_constant<int, 1>{}, tma_bias_d32,
+                  std::integral_constant<int, 1>{},
+                  std::integral_constant<int, 1>{});
+    else
+      launch_with(std::integral_constant<int, 1>{}, tma_bias_d16,
+                  std::integral_constant<int, 1>{},
+                  std::integral_constant<int, 0>{});
+  } else if constexpr (kModeL == 2) {
+    if constexpr (kB4 == 1)
+      launch_with(std::integral_constant<int, 1>{}, tma_bias_r32,
+                  std::integral_constant<int, 2>{},
+                  std::integral_constant<int, 1>{});
+    else
+      launch_with(std::integral_constant<int, 1>{}, tma_bias_r16,
+                  std::integral_constant<int, 2>{},
+                  std::integral_constant<int, 0>{});
+  } else if constexpr (kModeL == 3) {
+    // resident row-vector: no TMA issue in-kernel, descriptor unused.
+    if constexpr (kB4 == 1)
+      launch_with(std::integral_constant<int, 1>{}, tma_bias_r32,
+                  std::integral_constant<int, 3>{},
+                  std::integral_constant<int, 1>{});
+    else
+      launch_with(std::integral_constant<int, 1>{}, tma_bias_r16,
+                  std::integral_constant<int, 3>{},
+                  std::integral_constant<int, 0>{});
   } else {
-    const auto bias_on = std::integral_constant<int, 1>{};
-    const auto m0 = std::integral_constant<int, 0>{};
-    const auto m1 = std::integral_constant<int, 1>{};
-    const auto m2 = std::integral_constant<int, 2>{};
-    const auto m3 = std::integral_constant<int, 3>{};
-    if (bias_plan.mode == 1) {
-      if (bias.dtype == 3)
-        launch_with(bias_on, tma_bias_d32, m1, m1);
-      else
-        launch_with(bias_on, tma_bias_d16, m1, m0);
-    } else if (bias_plan.mode == 2) {
-      if (bias.dtype == 3)
-        launch_with(bias_on, tma_bias_r32, m2, m1);
-      else
-        launch_with(bias_on, tma_bias_r16, m2, m0);
-    } else if (bias_plan.mode == 3) {
-      // resident row-vector: no TMA issue in-kernel, descriptor unused.
-      if (bias.dtype == 3)
-        launch_with(bias_on, tma_bias_r32, m3, m1);
-      else
-        launch_with(bias_on, tma_bias_r16, m3, m0);
-    } else {
-      launch_with(bias_on, tma_bias_r16, m0, m0);
-    }
+    launch_with(std::integral_constant<int, 1>{}, tma_bias_r16,
+                std::integral_constant<int, 0>{},
+                std::integral_constant<int, 0>{});
   }
 }
 
@@ -508,18 +602,70 @@ void launch_cute_fwd_persist_d_fp4_sm120(
                   "ffpa_attn: fp4_pv_mm_type=fp8 persist_d supports D in "
                   "{64,128,192} (smem budget), got D=",
                   kHeadDim);
-    if (pv_fp8) {
-      // mxfp8-PV traits static_assert D <= 192; the TORCH_CHECK above
-      // already rejected the request, keep the variant uninstantiated.
-      if constexpr (kHeadDim <= 192)
-        launch_cute_fwd_persist_d_fp4_sm120_impl<kDataType, kHeadDim, true>(
-            Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
-            q_start_row, fp4_hadamard, fp4_smooth_v);
-    } else {
-      launch_cute_fwd_persist_d_fp4_sm120_impl<kDataType, kHeadDim, false>(
-          Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
-          q_start_row, fp4_hadamard, fp4_smooth_v);
-    }
+    const FfpaBiasParams bias = ffpa_bias_params_of(attn_bias, Q, K);
+    // Runtime dispatch over the variant tags (single-source plan, see
+    // fp4_persist_d_bias_plan); the variant body re-checks the tags.
+    const auto dispatch_p = [&](auto pv_c) {
+      constexpr bool kPv = decltype(pv_c)::value;
+      if constexpr (!kPv || kHeadDim <= 192) {
+        int max_smem_optin = 0;
+        cudaDeviceGetAttribute(&max_smem_optin,
+                               cudaDevAttrMaxSharedMemoryPerBlockOptin,
+                               Q.get_device());
+        const int dyn_limit = max_smem_optin - 256;
+        FfpaBiasTilePlan plan;
+        if (bias.ptr != nullptr)
+          plan = ffpa::fp4_persist_d_bias_plan<kDataType, kHeadDim, kPv>(
+              bias, Q.size(0), Q.size(1), Q.size(2), K.size(2), dyn_limit);
+        const int bias_on = bias.ptr != nullptr ? 1 : 0;
+        const int mode = bias_on ? plan.mode : 0;
+        const int b4 = (mode != 0 && bias.dtype == 3) ? 1 : 0;
+        if (!bias_on)
+          launch_cute_fwd_persist_d_fp4_sm120_v<kDataType, kHeadDim, kPv, 0, 0,
+                                                0>(
+              Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
+              q_start_row, fp4_hadamard, fp4_smooth_v);
+        else if (mode == 1 && b4)
+          launch_cute_fwd_persist_d_fp4_sm120_v<kDataType, kHeadDim, kPv, 1, 1,
+                                                1>(
+              Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
+              q_start_row, fp4_hadamard, fp4_smooth_v);
+        else if (mode == 1)
+          launch_cute_fwd_persist_d_fp4_sm120_v<kDataType, kHeadDim, kPv, 1, 1,
+                                                0>(
+              Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
+              q_start_row, fp4_hadamard, fp4_smooth_v);
+        else if (mode == 2 && b4)
+          launch_cute_fwd_persist_d_fp4_sm120_v<kDataType, kHeadDim, kPv, 1, 2,
+                                                1>(
+              Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
+              q_start_row, fp4_hadamard, fp4_smooth_v);
+        else if (mode == 2)
+          launch_cute_fwd_persist_d_fp4_sm120_v<kDataType, kHeadDim, kPv, 1, 2,
+                                                0>(
+              Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
+              q_start_row, fp4_hadamard, fp4_smooth_v);
+        else if (mode == 3 && b4)
+          launch_cute_fwd_persist_d_fp4_sm120_v<kDataType, kHeadDim, kPv, 1, 3,
+                                                1>(
+              Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
+              q_start_row, fp4_hadamard, fp4_smooth_v);
+        else if (mode == 3)
+          launch_cute_fwd_persist_d_fp4_sm120_v<kDataType, kHeadDim, kPv, 1, 3,
+                                                0>(
+              Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
+              q_start_row, fp4_hadamard, fp4_smooth_v);
+        else
+          launch_cute_fwd_persist_d_fp4_sm120_v<kDataType, kHeadDim, kPv, 1, 0,
+                                                0>(
+              Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
+              q_start_row, fp4_hadamard, fp4_smooth_v);
+      }
+    };
+    if (pv_fp8)
+      dispatch_p(std::integral_constant<bool, true>{});
+    else
+      dispatch_p(std::integral_constant<bool, false>{});
   } else {
     TORCH_CHECK(false,
                 "ffpa_attn: cute_tma_fp4 persist_d requires D in "
@@ -538,12 +684,15 @@ void launch_cute_fwd_persist_d_fp4_sm120(
 // full kBc=128; the m4n2 family cannot take it, kBc=64 < 128). smooth_v
 // quantizes the residual V - vm (kv-mean kernels shared with the fp8 path)
 // and the kernel adds vm back in the epilogue (persist_d derivation).
-template <typename kDataType, const int kHeadDim, bool kPvMxfp8 = false>
-void launch_cute_fwd_split_d_fp4_sm120_impl(
-    torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O,
-    torch::Tensor attn_bias, torch::Tensor softmax_lse, int causal,
-    double softmax_scale, int q_start_row = 0, bool fp4_hadamard = false,
-    bool fp4_smooth_v = false) {
+// Variant tags: (kPvMxfp8, kBiasOn, kModeL, kB4), see the persist_d notes.
+template <typename kDataType, const int kHeadDim, bool kPvMxfp8, int kBiasOn,
+          int kModeL, int kB4>
+void launch_cute_fwd_split_d_fp4_sm120_v(torch::Tensor Q, torch::Tensor K,
+                                         torch::Tensor V, torch::Tensor O,
+                                         torch::Tensor attn_bias,
+                                         torch::Tensor softmax_lse, int causal,
+                                         double softmax_scale, int q_start_row,
+                                         bool fp4_hadamard, bool fp4_smooth_v) {
   using namespace cute;
   constexpr int kBr = 128;
   constexpr int kBc = 128;
@@ -778,35 +927,29 @@ void launch_cute_fwd_split_d_fp4_sm120_impl(
   int max_smem_optin = 0;
   cudaDeviceGetAttribute(
       &max_smem_optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, Q.get_device());
-  // PC-0-1 bias tile plan (tail slack past the SFVt block): row-broadcast
-  // double buffered (mode 2); dense (mode 1) is m4n2-only per the PC-0-1
-  // plan. Try the resident vector (mode 3) first -- the fp4 persist_d
-  // family measured it fastest -- and demote 3->2->0 by the smem budget.
+  // PC-0-1 bias tile plan: single-source helper (the wrapper dispatch
+  // calls it too); the tags below must match or the CHECK fires.
+  const int dyn_limit = max_smem_optin - 256;
   FfpaBiasTilePlan bias_plan;
   if (bias.ptr != nullptr) {
     FfpaBiasParams bias_p{bias.ptr,      bias.dtype,    bias.stride_b,
                           bias.stride_h, bias.stride_m, bias.stride_n};
-    bias_plan = ffpa_bias_tile_plan_of(bias_p, Nb, Nh, Nq, Nkv);
-    if (bias_plan.mode == 1)
-      bias_plan.mode = 0;
+    bias_plan = ffpa::fp4_split_d_bias_plan<kDataType, kHeadDim, kPvMxfp8>(
+        bias_p, Nb, Nh, Nq, Nkv, dyn_limit);
   }
-  // Static smem (barrier arrays, ~160B incl. the bias pair) is invisible to
-  // the dynamic budget: reserve 256B so the attribute set cannot land past
-  // the true ceiling (fp4 persist_d D=256 lesson).
-  const int dyn_limit = max_smem_optin - 256;
+  TORCH_CHECK(kBiasOn == bias_on && kModeL == (bias_on ? bias_plan.mode : 0) &&
+                  // b4 only picks the mode-2 TMA smem width; the mode-3
+                  // resident fill reads the runtime attn_bias_dtype in-kernel.
+                  kB4 == ((kModeL == 2 && bias.dtype == 3) ? 1 : 0),
+              "ffpa_attn: fp4 split_d D=", kHeadDim,
+              " variant tag mismatch (wrapper dispatch vs plan)");
   const auto bias_bytes_of = [&](int m) {
     // Mode 3 pads the resident bytes to a whole kBc tile (the kernel's
-    // resident fill zero-fills the pad segment; tail tiles' unclamped
-    // injection reads stay in-allocation).
+    // resident fill zero-fills the pad segment).
     return (m == 3)
                ? (long long)(Nkv + kBc - 1) / kBc * kBc * bias_plan.elem_size
                : bias_plan.tile_bytes(kBr, kBc, (m == 2) ? 2 : 1);
   };
-  if (bias_plan.mode == 2 &&
-      (long long)kSmemBytes + bias_bytes_of(3) <= dyn_limit)
-    bias_plan.mode = 3;
-  if ((long long)kSmemBytes + bias_bytes_of(bias_plan.mode) > dyn_limit)
-    bias_plan.mode = 0;
   const int kSmemBytesBias = (int)(((long long)kSmemBytes + 15) & ~15) +
                              (int)bias_bytes_of(bias_plan.mode);
   TORCH_CHECK(kSmemBytesBias <= dyn_limit,
@@ -835,8 +978,10 @@ void launch_cute_fwd_split_d_fp4_sm120_impl(
     auto sB = Layout<Shape<_1, Int<bias_cols>>, Stride<Int<bias_cols>, _1>>{};
     return make_tma_copy(SM90_TMA_LOAD{}, gB, sB, shape(sB), _1{});
   };
-  auto tma_bias_r16 = make_tma_bias(std::integral_constant<int, 0>{});
-  auto tma_bias_r32 = make_tma_bias(std::integral_constant<int, 1>{});
+  [[maybe_unused]] auto tma_bias_r16 =
+      make_tma_bias(std::integral_constant<int, 0>{});
+  [[maybe_unused]] auto tma_bias_r32 =
+      make_tma_bias(std::integral_constant<int, 1>{});
   TORCH_CHECK(kSmemBytes <= max_smem_optin,
               "ffpa_attn: fp4 split_d D=", kHeadDim, " needs ", kSmemBytes,
               "B smem, device opt-in allows ", max_smem_optin);
@@ -851,9 +996,6 @@ void launch_cute_fwd_split_d_fp4_sm120_impl(
   const dim3 grid(num_ctas, 1, 1);
   const auto launch_with = [&](auto bias_tag, auto tma_bias_sel, auto mode_c,
                                auto b4_c) {
-    constexpr int kBiasOn = decltype(bias_tag)::value;
-    constexpr int kModeL = decltype(mode_c)::value;
-    constexpr int kB4 = decltype(b4_c)::value;
     auto kernel = ffpa_fp4::split_d_fwd_cute_fp4_sm120<
         Traits, ElementO, decltype(tma_q), decltype(tma_k), decltype(tma_v),
         decltype(tma_o), decltype(tma_sfq), decltype(tma_sfk),
@@ -874,12 +1016,13 @@ void launch_cute_fwd_split_d_fp4_sm120_impl(
         bias.stride_m, bias.stride_n,
         bias_plan.mode != 0 ? bias_plan.m_total : (long long)1);
   };
-  if (bias.ptr == nullptr) {
+  // Compile-time pinned variant: only this tag's kernel table instantiates.
+  if constexpr (kBiasOn == 0) {
     launch_with(std::integral_constant<int, 0>{}, tma_bias_r16,
                 std::integral_constant<int, 0>{},
                 std::integral_constant<int, 0>{});
-  } else if (bias_plan.mode == 2) {
-    if (bias.dtype == 3)
+  } else if constexpr (kModeL == 2) {
+    if constexpr (kB4 == 1)
       launch_with(std::integral_constant<int, 1>{}, tma_bias_r32,
                   std::integral_constant<int, 2>{},
                   std::integral_constant<int, 1>{});
@@ -887,7 +1030,7 @@ void launch_cute_fwd_split_d_fp4_sm120_impl(
       launch_with(std::integral_constant<int, 1>{}, tma_bias_r16,
                   std::integral_constant<int, 2>{},
                   std::integral_constant<int, 0>{});
-  } else if (bias_plan.mode == 3) {
+  } else if constexpr (kModeL == 3) {
     // Resident-vector path: no bias TMA (dummy desc), runtime dtype only.
     launch_with(std::integral_constant<int, 1>{}, tma_bias_r16,
                 std::integral_constant<int, 3>{},
@@ -913,15 +1056,48 @@ void launch_cute_fwd_split_d_fp4_sm120(
               "ffpa_attn: the NVFP4 path requires an sm_120 device, got sm_",
               prop->major, prop->minor);
   if constexpr (kHeadDim % 64 == 0 && kHeadDim > 256 && kHeadDim < 768) {
-    if (fp4_pv_mm_type == 1) {
-      launch_cute_fwd_split_d_fp4_sm120_impl<kDataType, kHeadDim, true>(
-          Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
-          q_start_row, fp4_hadamard, fp4_smooth_v);
-    } else {
-      launch_cute_fwd_split_d_fp4_sm120_impl<kDataType, kHeadDim, false>(
-          Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
-          q_start_row, fp4_hadamard, fp4_smooth_v);
-    }
+    const FfpaBiasParams bias = ffpa_bias_params_of(attn_bias, Q, K);
+    // Runtime dispatch over the variant tags (single-source plan, see
+    // fp4_split_d_bias_plan); the variant body re-checks the tags.
+    const auto dispatch_p = [&](auto pv_c) {
+      constexpr bool kPv = decltype(pv_c)::value;
+      int max_smem_optin = 0;
+      cudaDeviceGetAttribute(&max_smem_optin,
+                             cudaDevAttrMaxSharedMemoryPerBlockOptin,
+                             Q.get_device());
+      const int dyn_limit = max_smem_optin - 256;
+      FfpaBiasTilePlan plan;
+      if (bias.ptr != nullptr)
+        plan = ffpa::fp4_split_d_bias_plan<kDataType, kHeadDim, kPv>(
+            bias, Q.size(0), Q.size(1), Q.size(2), K.size(2), dyn_limit);
+      const int bias_on = bias.ptr != nullptr ? 1 : 0;
+      const int mode = bias_on ? plan.mode : 0;
+      const int b4 = (mode == 2 && bias.dtype == 3) ? 1 : 0;
+      if (!bias_on)
+        launch_cute_fwd_split_d_fp4_sm120_v<kDataType, kHeadDim, kPv, 0, 0, 0>(
+            Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
+            q_start_row, fp4_hadamard, fp4_smooth_v);
+      else if (mode == 2 && b4)
+        launch_cute_fwd_split_d_fp4_sm120_v<kDataType, kHeadDim, kPv, 1, 2, 1>(
+            Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
+            q_start_row, fp4_hadamard, fp4_smooth_v);
+      else if (mode == 2)
+        launch_cute_fwd_split_d_fp4_sm120_v<kDataType, kHeadDim, kPv, 1, 2, 0>(
+            Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
+            q_start_row, fp4_hadamard, fp4_smooth_v);
+      else if (mode == 3)
+        launch_cute_fwd_split_d_fp4_sm120_v<kDataType, kHeadDim, kPv, 1, 3, 0>(
+            Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
+            q_start_row, fp4_hadamard, fp4_smooth_v);
+      else
+        launch_cute_fwd_split_d_fp4_sm120_v<kDataType, kHeadDim, kPv, 1, 0, 0>(
+            Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
+            q_start_row, fp4_hadamard, fp4_smooth_v);
+    };
+    if (fp4_pv_mm_type == 1)
+      dispatch_p(std::integral_constant<bool, true>{});
+    else
+      dispatch_p(std::integral_constant<bool, false>{});
   } else {
     TORCH_CHECK(false,
                 "ffpa_attn: cute_tma_fp4 split_d requires 64-multiple D in "
@@ -937,12 +1113,15 @@ void launch_cute_fwd_split_d_fp4_sm120(
 // as split-D/persist-D (V^T quantize residual + epilogue add-back);
 // fp4_pv_mm_type stays NVFP4-only here (see the wrapper: the MXFP8 PV
 // atom needs Tile-K=128 but m4n2 tiles are kBc=64).
-template <typename kDataType, const int kHeadDim>
-void launch_cute_fwd_split_d_m4n2_fp4_sm120_impl(
+// Variant tags: (kPvMxfp8=false always, kBiasOn, kModeL, kB4) - regular
+// builds pin mode 0 (PC-0-5); FFPA_BIAS_TILE_KEEP (debug) keeps mode 2.
+template <typename kDataType, const int kHeadDim, bool kPvMxfp8, int kBiasOn,
+          int kModeL, int kB4>
+void launch_cute_fwd_split_d_m4n2_fp4_sm120_v(
     torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O,
     torch::Tensor attn_bias, torch::Tensor softmax_lse, int causal,
-    double softmax_scale, int q_start_row = 0, bool fp4_hadamard = false,
-    bool fp4_smooth_v = false) {
+    double softmax_scale, int q_start_row, bool fp4_hadamard,
+    bool fp4_smooth_v) {
   using namespace cute;
   constexpr int kBr = 64;
   constexpr int kBc = 64;
@@ -1145,61 +1324,28 @@ void launch_cute_fwd_split_d_m4n2_fp4_sm120_impl(
   int max_smem_optin = 0;
   cudaDeviceGetAttribute(
       &max_smem_optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, Q.get_device());
-  // PC-0-1 bias tile plan (tail slack past the P/exchange block):
-  // row-broadcast double buffered (mode 2); dense (mode 1) tile support is
-  // m4n2-native but wired in a follow-up (B-1 wired the fp8 m4n2 dense
-  // tile). Try the resident vector (mode 3) first -- measured fastest on
-  // both fp4 families so far -- and demote 3->2->0 by the smem budget.
+  // PC-0-5 bias tile plan: single-source helper (the wrapper dispatch
+  // calls it too; it owns the PC-0-5 mode-0 pin and the FFPA_BIAS_TILE_KEEP
+  // debug switch); the tags below must match or the CHECK fires.
+  const int dyn_limit = max_smem_optin - 256;
   FfpaBiasTilePlan bias_plan;
   if (bias.ptr != nullptr) {
     FfpaBiasParams bias_p{bias.ptr,      bias.dtype,    bias.stride_b,
                           bias.stride_h, bias.stride_m, bias.stride_n};
-    bias_plan = ffpa_bias_tile_plan_of(bias_p, Nb, Nh, Nq, Nkv);
-    if (bias_plan.mode == 1)
-      bias_plan.mode = 0;
-      // PC-0-5: the fp4 m4n2 bias-smem paths (mode 2 TMA double buffer, mode 3
-      // resident fill) hit a 100%-reproducible O corruption on cold bias
-      // calls (bitwise-unstable across identical launches, lse stable,
-      // corruption pinned to one (m-warp, n-warp, v-chunk) PV C tile;
-      // protocol audit closed at the language level and ptxas -O2 /
-      // producer-warp relocation both reproduce it - see RFC PC-0-5). Pin
-      // the gmem direct-read mode (mode 0), which is stable on that
-      // sequence, at ~5% attn-mask cost. RESIDUAL (known, accepted): with a
-      // heavy GPU-work prelude (any matmul burst) the bias template still
-      // shows the same low-probability corruption even in mode 0 - the race
-      // is load-timing sensitive at the hardware level, not bias-smem
-      // specific; the no-bias template is clean under the same load. fp4
-      // m4n2 only serves D>=768 fp4 (rare in production), so this is
-      // documented rather than root-caused (NVIDIA report pending).
-      // FFPA_BIAS_TILE_KEEP=1 restores the smem tile modes (debug build only).
-#ifdef ENABLE_FFPA_FP4_BUILD_DEBUG
-    if (bias_plan.mode != 0 && getenv("FFPA_BIAS_TILE_KEEP") == nullptr)
-      bias_plan.mode = 0;
-#else
-    bias_plan.mode = 0;
-#endif
+    bias_plan = ffpa::fp4_m4n2_bias_plan<kDataType, kHeadDim>(
+        bias_p, Nb, Nh, Nq, Nkv, dyn_limit);
   }
-  // Static smem (barrier arrays, ~160B incl. the bias pair) is invisible to
-  // the dynamic budget: reserve 256B so the attribute set cannot land past
-  // the true ceiling (fp4 persist_d D=256 lesson).
-  const int dyn_limit = max_smem_optin - 256;
+  TORCH_CHECK(kBiasOn == bias_on && kModeL == (bias_on ? bias_plan.mode : 0) &&
+                  // b4 only picks the mode-2 TMA smem width; the mode-3
+                  // resident fill reads the runtime attn_bias_dtype in-kernel.
+                  kB4 == ((kModeL == 2 && bias.dtype == 3) ? 1 : 0),
+              "ffpa_attn: fp4 split_d m4n2 D=", kHeadDim,
+              " variant tag mismatch (wrapper dispatch vs plan)");
   const auto bias_bytes_of = [&](int m) {
-    // Mode 3 pads the resident bytes to a whole kBc tile: tail tiles'
-    // unclamped injection reads stay in-allocation (the kernel's resident
-    // fill zero-fills the pad segment).
     return (m == 3)
                ? (long long)(Nkv + kBc - 1) / kBc * kBc * bias_plan.elem_size
                : bias_plan.tile_bytes(kBr, kBc, (m == 2) ? 2 : 1);
   };
-  // PC-0-5 debug switch: keep mode 2 (TMA row-broadcast double buffer).
-  // The mode 3 resident-vector upgrade stays OFF on this family: the
-  // fill+inject pair has a deterministic 8B shared overread at whole-tail
-  // shapes (Nkv=kBc, repro'd 4/4 on pre-fix builds; ptxas merges the
-  // per-column scalar LDS into LDS.64 past the resident segment) on top
-  // of the PC-0-5 corruption, so mode 2 is the only KEEP debug path that
-  // can run clean. Production pins mode 0 anyway (PC-0-5).
-  if ((long long)kSmemBytes + bias_bytes_of(bias_plan.mode) > dyn_limit)
-    bias_plan.mode = 0;
   const int kSmemBytesBias = (int)(((long long)kSmemBytes + 15) & ~15) +
                              (int)bias_bytes_of(bias_plan.mode);
   TORCH_CHECK(kSmemBytesBias <= dyn_limit,
@@ -1228,8 +1374,10 @@ void launch_cute_fwd_split_d_m4n2_fp4_sm120_impl(
     auto sB = Layout<Shape<_1, Int<bias_cols>>, Stride<Int<bias_cols>, _1>>{};
     return make_tma_copy(SM90_TMA_LOAD{}, gB, sB, shape(sB), _1{});
   };
-  auto tma_bias_r16 = make_tma_bias(std::integral_constant<int, 0>{});
-  auto tma_bias_r32 = make_tma_bias(std::integral_constant<int, 1>{});
+  [[maybe_unused]] auto tma_bias_r16 =
+      make_tma_bias(std::integral_constant<int, 0>{});
+  [[maybe_unused]] auto tma_bias_r32 =
+      make_tma_bias(std::integral_constant<int, 1>{});
   TORCH_CHECK(kSmemBytes <= max_smem_optin,
               "ffpa_attn: fp4 split_d m4n2 D=", kHeadDim, " needs ", kSmemBytes,
               "B smem, device opt-in allows ", max_smem_optin);
@@ -1244,9 +1392,6 @@ void launch_cute_fwd_split_d_m4n2_fp4_sm120_impl(
   const dim3 grid(num_ctas, 1, 1);
   const auto launch_with = [&](auto bias_tag, auto tma_bias_sel, auto mode_c,
                                auto b4_c) {
-    constexpr int kBiasOn = decltype(bias_tag)::value;
-    constexpr int kModeL = decltype(mode_c)::value;
-    constexpr int kB4 = decltype(b4_c)::value;
     auto kernel = ffpa_fp4::split_d_m4n2_fwd_cute_fp4_sm120<
         Traits, ElementO, decltype(tma_q), decltype(tma_k), decltype(tma_v),
         decltype(tma_o), decltype(tma_sfq), decltype(tma_sfk),
@@ -1266,28 +1411,29 @@ void launch_cute_fwd_split_d_m4n2_fp4_sm120_impl(
         bias.stride_h, bias.stride_m, bias.stride_n,
         bias_plan.mode != 0 ? bias_plan.m_total : (long long)1);
   };
-  if (bias.ptr == nullptr) {
+  // Compile-time pinned variant: regular builds pin mode 0 (PC-0-5, see
+  // fp4_m4n2_bias_plan); only the debug KEEP switch reaches mode 2, so the
+  // m2 tags compile solely under ENABLE_FFPA_FP4_BUILD_DEBUG.
+  if constexpr (kBiasOn == 0) {
     launch_with(std::integral_constant<int, 0>{}, tma_bias_r16,
                 std::integral_constant<int, 0>{},
                 std::integral_constant<int, 0>{});
-  } else if (bias_plan.mode == 2) {
-    if (bias.dtype == 3)
-      launch_with(std::integral_constant<int, 1>{}, tma_bias_r32,
-                  std::integral_constant<int, 2>{},
-                  std::integral_constant<int, 1>{});
-    else
-      launch_with(std::integral_constant<int, 1>{}, tma_bias_r16,
-                  std::integral_constant<int, 2>{},
-                  std::integral_constant<int, 0>{});
-  } else if (bias_plan.mode == 3) {
-    // Resident-vector path: no bias TMA (dummy desc), runtime dtype only.
-    launch_with(std::integral_constant<int, 1>{}, tma_bias_r16,
-                std::integral_constant<int, 3>{},
-                std::integral_constant<int, 0>{});
   } else {
-    launch_with(std::integral_constant<int, 1>{}, tma_bias_r16,
-                std::integral_constant<int, 0>{},
-                std::integral_constant<int, 0>{});
+#ifdef ENABLE_FFPA_FP4_BUILD_DEBUG
+    if constexpr (kModeL == 2) {
+      if constexpr (kB4 == 1)
+        launch_with(std::integral_constant<int, 1>{}, tma_bias_r32,
+                    std::integral_constant<int, 2>{},
+                    std::integral_constant<int, 1>{});
+      else
+        launch_with(std::integral_constant<int, 1>{}, tma_bias_r16,
+                    std::integral_constant<int, 2>{},
+                    std::integral_constant<int, 0>{});
+    } else
+#endif
+      launch_with(std::integral_constant<int, 1>{}, tma_bias_r16,
+                  std::integral_constant<int, 0>{},
+                  std::integral_constant<int, 0>{});
   }
 }
 
@@ -1310,9 +1456,47 @@ void launch_cute_fwd_split_d_m4n2_fp4_sm120(
               "ffpa_attn: the NVFP4 path requires an sm_120 device, got sm_",
               prop->major, prop->minor);
   if constexpr (kHeadDim % 64 == 0 && kHeadDim >= 768 && kHeadDim <= 1024) {
-    launch_cute_fwd_split_d_m4n2_fp4_sm120_impl<kDataType, kHeadDim>(
-        Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale, q_start_row,
-        fp4_hadamard, fp4_smooth_v);
+    // Runtime dispatch over the variant tags (single-source plan, see
+    // fp4_m4n2_bias_plan); regular builds always land on mode 0 (PC-0-5)
+    // or no-bias, mode 2 exists only in debug builds.
+    const FfpaBiasParams bias = ffpa_bias_params_of(attn_bias, Q, K);
+    const int bias_on = bias.ptr != nullptr ? 1 : 0;
+    if (!bias_on) {
+      launch_cute_fwd_split_d_m4n2_fp4_sm120_v<kDataType, kHeadDim, false, 0, 0,
+                                               0>(
+          Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
+          q_start_row, fp4_hadamard, fp4_smooth_v);
+      return;
+    }
+    int max_smem_optin = 0;
+    cudaDeviceGetAttribute(&max_smem_optin,
+                           cudaDevAttrMaxSharedMemoryPerBlockOptin,
+                           Q.get_device());
+    FfpaBiasTilePlan plan = ffpa::fp4_m4n2_bias_plan<kDataType, kHeadDim>(
+        bias, Q.size(0), Q.size(1), Q.size(2), K.size(2), max_smem_optin - 256);
+    if (plan.mode == 2) {
+#ifdef ENABLE_FFPA_FP4_BUILD_DEBUG
+      if (bias.dtype == 3)
+        launch_cute_fwd_split_d_m4n2_fp4_sm120_v<kDataType, kHeadDim, false, 1,
+                                                 2, 1>(
+            Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
+            q_start_row, fp4_hadamard, fp4_smooth_v);
+      else
+        launch_cute_fwd_split_d_m4n2_fp4_sm120_v<kDataType, kHeadDim, false, 1,
+                                                 2, 0>(
+            Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
+            q_start_row, fp4_hadamard, fp4_smooth_v);
+#else
+      TORCH_CHECK(false,
+                  "ffpa_attn: fp4 m4n2 mode-2 requires a debug build "
+                  "(ENABLE_FFPA_FP4_BUILD_DEBUG)");
+#endif
+    } else {
+      launch_cute_fwd_split_d_m4n2_fp4_sm120_v<kDataType, kHeadDim, false, 1, 0,
+                                               0>(
+          Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
+          q_start_row, fp4_hadamard, fp4_smooth_v);
+    }
   } else {
     TORCH_CHECK(false,
                 "ffpa_attn: cute_tma_fp4 split_d m4n2 requires 64-multiple D "
@@ -1320,5 +1504,10 @@ void launch_cute_fwd_split_d_m4n2_fp4_sm120(
                 kHeadDim);
   }
 }
+
+// Variant TUs define FFPA_FP4_VARIANTS_TU before including the header and
+// compile exactly one kernel table via this file; every other TU gets
+// extern-template declarations only (see generated/fwd_cute_fp4_variants.cuh).
+#include "generated/fwd_cute_fp4_variants.cuh"  // extern templates
 
 #endif  // ENABLE_FFPA_CUTE_EXT && ENABLE_FFPA_TMA_EXT
