@@ -4,7 +4,7 @@
 // launchers (launch/cute_fp8.cuh). Explicitly instantiated once per
 // (dtype, kBr, kBc, kHeadDim, kQKInt8) in the generated preprocess TU;
 // every other TU sees extern-template declarations from
-// generated/fp8_preprocess_instances.cuh and stops recompiling the
+// generated/fwd_cute_fp8_preprocess.cuh and stops recompiling the
 // quantize kernel family per stage variant.
 #pragma once
 #include <ATen/cuda/CUDAContext.h>

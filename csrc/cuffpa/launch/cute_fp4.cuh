@@ -8,6 +8,7 @@
 #include "cute/fp4/quantize_fp4.cuh"
 #include "cute/hadamard.cuh"
 #include "cute/fp4/delta_s.cuh"
+#include "generated/fwd_cute_fp4_preprocess.cuh"  // extern templates
 #include "cute/fp4/sm_120/persist_d.cuh"
 #include "cute/fp4/sm_120/split_d.cuh"
 #include "cute/fp4/sm_120/split_d_m4n2.cuh"

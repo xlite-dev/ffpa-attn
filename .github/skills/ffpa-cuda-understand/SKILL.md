@@ -99,7 +99,7 @@ flowchart TD
 ```mermaid
 flowchart TD
     API["ffpa_api.cc::ffpa_attn_fwd_*<br/>dtype×acc 分发 + head_dim pad"] --> GEN["generated dispatcher<br/>(per-headdim case 表, env.py 生成)"]
-    GEN --> TU["generated family TU<br/>fwd_{fp16,bf16}_{cute_fp16,fp8,fp4,native}_hdim{D}[_s{stage}].cu<br/>显式实例化 family 入口模板"]
+    GEN --> TU["generated family TU<br/>fwd_{fp16,bf16}_{cute_fp16,cute_fp8,cute_fp4}_hdim{D}[_s{stage}].cu / fwd_{fp16f32,bf16f32}_native_hdim{D}[_s{stage}].cu<br/>显式实例化 family 入口模板"]
     TU --> DISP["dispatch/{native_fp16,cute_fp16,cute_fp8,cute_fp4}.cuh<br/>family 入口: 参数校验 + D 路由 + hybrid 编排"]
     DISP --> LAUNCH["launch/{family}.cuh<br/>launcher _impl: hadamard → 布局探测 → bias<br/>→ quant knob 派生 → kBr/kBc/smem/stages clamp → traits"]
     LAUNCH --> PRE["前处理编排"]
@@ -107,8 +107,8 @@ flowchart TD
     TMA --> KERN["attention 主 kernel launch<br/>(<<<>>> 或 cute cooperative)"]
 
     subgraph PRE["前处理（stage 无关）"]
-        P1["fp8: cute/fp8/prepare_inputs.cuh<br/>prepare_fp8_inputs&lt;dtype,kBr,kBc,D,kQKInt8&gt;<br/>分配 + smooth-K mean + Q/K quantize + V per-channel<br/>⚠ extern-template: 仅 fwd_fp8_preprocess.cu 实例化"]
-        P2["fp4: launch_fp4_quant_*&lt;D&gt; 量化链<br/>(launcher 模板不带 dtype)"]
+        P1["fp8: cute/fp8/prepare_inputs.cuh<br/>prepare_fp8_inputs&lt;dtype,kBr,kBc,D,kQKInt8&gt;<br/>分配 + smooth-K mean + Q/K quantize + V per-channel<br/>⚠ extern-template: 仅 fwd_cute_fp8_preprocess.cu 实例化"]
+        P2["fp4: launch_fp4_quant_*&lt;D&gt; 量化链<br/>(launcher 模板不带 dtype)<br/>⚠ extern-template: 仅 fwd_cute_fp4_preprocess.cu 实例化"]
         P3["fp8/fp4 共享: launch_kv_mean_sm120&lt;dtype,D&gt;<br/>(cute/fp8/smooth_k.cuh)"]
     end
 ```
@@ -132,15 +132,16 @@ flowchart LR
         A["dispatch/cute_fp8.cuh"] --> B["launch/cute_fp8.cuh<br/>(extern: 前处理不实例化)"]
         B --> C["cute/fp8/sm_120/*.cuh 主 kernel<br/>(stage 相关, 每 TU 独有)"]
     end
-    subgraph SharedTU["fwd_fp8_preprocess.cu (×1)"]
-        D["generated/fp8_preprocess_instances.cuh<br/>define 模式: prepare_fp8_inputs 全组合"]
+    subgraph SharedTU["fwd_cute_fp8/fp4_preprocess.cu (×2)"]
+        D["generated/fwd_cute_fp8_preprocess.cuh<br/>define 模式: prepare_fp8_inputs 全组合"]
+        E["generated/fwd_cute_fp4_preprocess.cuh<br/>define 模式: launch_fp4_quant_* 全组合"]
     end
-    B -. "extern template 声明<br/>(instances.cuh extern 模式)" .- D
+    B -. "extern template 声明<br/>(preprocess.cuh extern 模式)" .- D
 ```
 
 **单条完整链路示例**（fp8、D=512、bf16、stage=2、无 hybrid）：
 
-`CUDABackend(enable_fp8=True)` → `_fwd_cuda` → `ffpa_api.cc` pad→512 → `fwd_bf16_fp8_hdim512_s2.cu`（实例化 `ffpa_fwd_fp8<bf16,512,2>`）→ `dispatch/cute_fp8.cuh`：D=512∈(224,768) → `launch_cute_fwd_split_d_fp8_sm120<bf16,512,2>` → `_impl`：hadamard off → `ffpa_layout_of`×3 → kBr/kBc=128/128 → `prepare_fp8_inputs<bf16,128,128,512,kQKInt8>`（**extern→preprocess TU**）→ TMA Q/K/V/O → `split_d_fwd_cute_fp8_sm120<...Traits<512,...,kStagesQK=2,...>>`。
+`CUDABackend(enable_fp8=True)` → `_fwd_cuda` → `ffpa_api.cc` pad→512 → `fwd_bf16_cute_fp8_hdim512_s2.cu`（实例化 `ffpa_fwd_fp8<bf16,512,2>`）→ `dispatch/cute_fp8.cuh`：D=512∈(224,768) → `launch_cute_fwd_split_d_fp8_sm120<bf16,512,2>` → `_impl`：hadamard off → `ffpa_layout_of`×3 → kBr/kBc=128/128 → `prepare_fp8_inputs<bf16,128,128,512,kQKInt8>`（**extern→preprocess TU**）→ TMA Q/K/V/O → `split_d_fwd_cute_fp8_sm120<...Traits<512,...,kStagesQK=2,...>>`。
 
 ---
 

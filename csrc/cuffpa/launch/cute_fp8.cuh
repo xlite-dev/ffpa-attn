@@ -6,7 +6,7 @@
 #if defined(ENABLE_FFPA_CUTE_EXT) && defined(ENABLE_FFPA_TMA_EXT)
 #include "cute/fp8/quantize_fp8.cuh"
 #include "cute/fp8/prepare_inputs.cuh"
-#include "generated/fp8_preprocess_instances.cuh"  // extern templates
+#include "generated/fwd_cute_fp8_preprocess.cuh"  // extern templates
 #include "cute/fp8/smooth_k.cuh"
 #include "cute/fp8/sm_120/persist_d.cuh"
 #include "cute/fp8/sm_120/split_d.cuh"
@@ -146,7 +146,7 @@ void launch_cute_fwd_persist_d_fp8_sm120_impl(
   // Stage-independent preprocessing (allocation + smooth-K mean + Q/K/V
   // quantize) lives in cute/fp8/prepare_inputs.cuh, instantiated once per
   // (dtype, D, kQKInt8) in the generated preprocess TU; the extern
-  // template declarations come from generated/fp8_preprocess_instances.cuh.
+  // template declarations come from generated/fwd_cute_fp8_preprocess.cuh.
   const ffpa_fp8::Fp8QuantizedInputs qi =
       ffpa_fp8::prepare_fp8_inputs<kDataType, kBr, kBc, kHeadDim, kQKInt8>(
           Q, K, V, Lq, Lkv, Lv, Nb, Nh, Nh_kv, Nq, Nkv, n_rb_q, n_rb_kv,
@@ -526,7 +526,7 @@ void launch_cute_fwd_split_d_fp8_sm120_impl(
   // Stage-independent preprocessing (allocation + smooth-K mean + Q/K/V
   // quantize) lives in cute/fp8/prepare_inputs.cuh, instantiated once per
   // (dtype, D, kQKInt8) in the generated preprocess TU; the extern
-  // template declarations come from generated/fp8_preprocess_instances.cuh.
+  // template declarations come from generated/fwd_cute_fp8_preprocess.cuh.
   const ffpa_fp8::Fp8QuantizedInputs qi =
       ffpa_fp8::prepare_fp8_inputs<kDataType, kBr, kBc, kHeadDim, kQKInt8>(
           Q, K, V, Lq, Lkv, Lv, Nb, Nh, Nh_kv, Nq, Nkv, n_rb_q, n_rb_kv,
@@ -880,7 +880,7 @@ void launch_cute_fwd_split_d_m4n2_fp8_sm120_impl(
   // Stage-independent preprocessing (allocation + smooth-K mean + Q/K/V
   // quantize) lives in cute/fp8/prepare_inputs.cuh, instantiated once per
   // (dtype, D, kQKInt8) in the generated preprocess TU; the extern
-  // template declarations come from generated/fp8_preprocess_instances.cuh.
+  // template declarations come from generated/fwd_cute_fp8_preprocess.cuh.
   const ffpa_fp8::Fp8QuantizedInputs qi =
       ffpa_fp8::prepare_fp8_inputs<kDataType, kBr, kBc, kHeadDim, kQKInt8>(
           Q, K, V, Lq, Lkv, Lv, Nb, Nh, Nh_kv, Nq, Nkv, n_rb_q, n_rb_kv,
