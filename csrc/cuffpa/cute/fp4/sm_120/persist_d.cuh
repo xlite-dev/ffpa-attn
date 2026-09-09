@@ -965,23 +965,15 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp4_sm120(
         }
       };
 
-      if (kv_tile == 0) {
-        gemm_rs_pv(tOrO_store);
-      } else {
-        // scores_scale == 1.0f exactly when the row max did not move this
-        // tile (~96% of dense tiles): O = O*1 + O_new needs no rescale at
-        // all. Warp-vote keeps both fragments on one uniform path.
-        const bool need_rescale = softmax_fused.scores_scale[0] != 1.0f ||
-                                  softmax_fused.scores_scale[1] != 1.0f;
-        if (__any_sync(0xffffffff, need_rescale)) {
-          Tensor tOrO = make_fragment_like(tOrO_store);
-          clear(tOrO);
-          gemm_rs_pv(tOrO);
-          softmax_fused.rescale_o(tOrO_store, tOrO);
-        } else {
-          gemm_rs_pv(tOrO_store);
-        }
-      }
+      // Lazy rescale (PC-11, per-row): pre-scale the resident O in place
+      // (rows whose scale stayed 1.0 skip the multiply inside rescale_acc)
+      // and let the gemm accumulate directly -- same shape as the fp8
+      // persist-D kernel. This replaces the old temp-fragment +
+      // rescale_o merge; per-row guarding keeps the dense-tile fast path
+      // (zero FMUL) so the FMUL never enters the MMA chain unguarded.
+      if (kv_tile > 0)
+        softmax_fused.rescale_acc(tOrO_store);
+      gemm_rs_pv(tOrO_store);
     }
 
     softmax_fused.finalize(tOrO_store);

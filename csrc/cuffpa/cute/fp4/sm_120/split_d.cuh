@@ -783,12 +783,9 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
 
       // Lazy rescale: scores_scale == 1.0f exactly when the row max did
       // not move this tile (~96% of dense tiles). Pre-scale the resident O
-      // chunks in place; the gemm then accumulates on top.
-      const bool need_rescale =
-          kv_tile > 0 &&
-          __any_sync(0xffffffff, softmax_fused.scores_scale[0] != 1.0f ||
-                                     softmax_fused.scores_scale[1] != 1.0f);
-      if (need_rescale) {
+      // chunks in place; the gemm then accumulates on top. Per-row (PC-11):
+      // rescale_acc guards each row by scores_scale < 1.0f.
+      if (kv_tile > 0) {
 #pragma unroll
         for (int v = 0; v < kDChunksV; ++v) {
           auto tCrO =

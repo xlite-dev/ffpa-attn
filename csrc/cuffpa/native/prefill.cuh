@@ -1022,14 +1022,16 @@ __device__ __forceinline__ void sync_rescaling_tiling_o(
     const float* rescale_o_factor_0,  // rescale factor
     const float* rescale_o_factor_1,  // rescale factor
     const int n_tile_id,              // tile_K_seqlen
-    const int d_tile_id,              // j
-    const bool need_rescale = true  // FA-4: false -> factor=1, accumulate only
+    const int d_tile_id               // j
 ) {
   using Traits = DtypeTraits<kDataType>;
-  // need_rescale is warp-uniform (from __any_sync). When false, force
-  // factor=1.0 so fmaf collapses to D += O (skip O rescale).
-  const float f0 = need_rescale ? rescale_o_factor_0[0] : 1.0f;
-  const float f1 = need_rescale ? rescale_o_factor_1[0] : 1.0f;
+  // Per-factor clamp (PC-11): factors are <= 1 and hit 1.0 exactly when the
+  // row max did not move, so fmaf collapses to D += O on those rows;
+  // < 1.0f also rejects NaN factors on all-masked rows.
+  const float f0 =
+      (rescale_o_factor_0[0] < 1.0f) ? rescale_o_factor_0[0] : 1.0f;
+  const float f1 =
+      (rescale_o_factor_1[0] < 1.0f) ? rescale_o_factor_1[0] : 1.0f;
   // Now, we get [Br,8] slice of [Br,d], each warp(MMA) contains m16n8.
   // 0. Rescale O: Online rescaling O each tile_K_seqlen step, need m_new,
   // m_old. m = max(m_old, m_new), O_new[Br,d] = exp(m_old - m) * O_old + P@V m

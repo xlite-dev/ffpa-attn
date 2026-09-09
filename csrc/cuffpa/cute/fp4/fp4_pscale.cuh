@@ -273,23 +273,6 @@ struct SoftmaxFused {
     }
   }
 
-  template <typename TensorAcc>
-  CUTE_DEVICE void rescale_o(TensorAcc& o_store, TensorAcc const& o_tmp) {
-    Tensor o_store_reduction_view = make_tensor(
-        o_store.data(), convert_to_reduction_layout(o_store.layout()));
-    Tensor o_tmp_reduction_view =
-        make_tensor(o_tmp.data(), convert_to_reduction_layout(o_tmp.layout()));
-    CUTE_UNROLL
-    for (int mi = 0; mi < size(row_max); ++mi) {
-      CUTE_UNROLL
-      for (int ni = 0; ni < size<1>(o_store_reduction_view); ni++) {
-        o_store_reduction_view(mi, ni) =
-            o_store_reduction_view(mi, ni) * scores_scale(mi) +
-            o_tmp_reduction_view(mi, ni);
-      }
-    }
-  }
-
   // split-d companion to finalize(): O lives in per-D-chunk fragments, so
   // finalize() folds row_sum on the first chunk and this scales the rest
   // with the already-folded row_sum.
@@ -309,16 +292,20 @@ struct SoftmaxFused {
   }
 
   // split-d lazy rescale: multiply an O chunk in place by scores_scale
-  // (the gemm then accumulates the new tile on top).
+  // (the gemm then accumulates the new tile on top). Per-row guard (PC-11):
+  // rows whose scale stayed 1.0 skip the multiply; < 1.0f also rejects NaN
+  // on all-masked rows.
   template <typename TensorAcc>
   CUTE_DEVICE void rescale_acc(TensorAcc& o_store) {
     Tensor o_store_reduction_view = make_tensor(
         o_store.data(), convert_to_reduction_layout(o_store.layout()));
     CUTE_UNROLL
     for (int mi = 0; mi < size(row_max); ++mi) {
-      CUTE_UNROLL
-      for (int ni = 0; ni < size<1>(o_store_reduction_view); ni++) {
-        o_store_reduction_view(mi, ni) *= scores_scale(mi);
+      if (scores_scale(mi) < 1.0f) {
+        CUTE_UNROLL
+        for (int ni = 0; ni < size<1>(o_store_reduction_view); ni++) {
+          o_store_reduction_view(mi, ni) *= scores_scale(mi);
+        }
       }
     }
   }

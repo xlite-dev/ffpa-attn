@@ -736,6 +736,14 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
       }
       // Lazy rescale: row_scale == 1.0f when the running row max did not
       // grow on this tile; warp-vote the skip.
+      // PC-11 EXEMPTION: do not replace this vote with the per-row guard
+      // used everywhere else. The vote's compiled form is load-bearing for
+      // the PC-0-5 stability (validated on fp16 inputs); re-shaping the
+      // lazy-rescale code shifts the bias-template timing window. Follow-up
+      // control experiment (2026-09-09): bf16 inputs open the window even
+      // at HEAD (10/10, d=[192,224) PV C tile fingerprint, lse stable,
+      // no-bias clean) -- the equilibrium is dtype dependent, keep the
+      // validated form here.
       const bool need_rescale =
           kv_tile > 0 &&
           __any_sync(0xffffffff, row_scale[0] != 1.0f || row_scale[1] != 1.0f);
