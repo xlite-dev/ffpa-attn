@@ -53,10 +53,14 @@ inline FfpaBiasTilePlan fp8_split_d_bias_plan(const FfpaBiasParams& bias_p,
 // Split-D FP8 launcher (headdim > 128): non-WS M8N1 kernel over quantized
 // q8/k8/vt8 buffers. Fixed-P-scale only (FFPA_FP8_PQUANT_PER_ROW applies to
 // the persist_d path only and is ignored here).
-// Variant tags (kBiasOn, kModeL, kB4): see launch_cute_fwd_persist_d_fp8_
-// sm120_v above; explicit instantiations live in the generated variant TUs.
+// Variant tags: kBiasOn (attn_bias tensor present), kBiasPlanMode (bias
+// tile mode: 0 = gmem-direct fallback, 1 = dense [kBr,kBc] TMA tile,
+// 2 = row-broadcast TMA, 3 = resident row vector), kBias4BytesPerElem
+// (1 = 4-byte fp32 mask, 0 = 2-byte fp16/bf16 mask); see
+// launch_cute_fwd_persist_d_fp8_sm120_v above; explicit instantiations
+// live in the generated variant TUs.
 template <typename kDataType, const int kHeadDim, const int kStage,
-          bool kQKInt8, int kBiasOn, int kModeL, int kB4>
+          bool kQKInt8, int kBiasOn, int kBiasPlanMode, int kBias4BytesPerElem>
 void launch_cute_fwd_split_d_fp8_sm120_v(
     torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O,
     torch::Tensor attn_bias, torch::Tensor softmax_lse, int causal,
@@ -239,8 +243,10 @@ void launch_cute_fwd_split_d_fp8_sm120_v(
         ffpa::fp8_split_d_bias_plan<kDataType, kHeadDim, kStage, kQKInt8>(
             bias_p, Nb, Nh, Nq, Nkv, dyn_limit);
   }
-  TORCH_CHECK(kBiasOn == bias_on && kModeL == (bias_on ? bias_plan.mode : 0) &&
-                  kB4 == ((kModeL == 2 && bias.dtype == 3) ? 1 : 0),
+  TORCH_CHECK(kBiasOn == bias_on &&
+                  kBiasPlanMode == (bias_on ? bias_plan.mode : 0) &&
+                  kBias4BytesPerElem ==
+                      ((kBiasPlanMode == 2 && bias.dtype == 3) ? 1 : 0),
               "ffpa_attn: fp8 split_d D=", kHeadDim,
               " variant tag mismatch (wrapper dispatch vs plan)");
   const int bias_stages = (bias_plan.mode == 2) ? 2 : 1;
@@ -318,7 +324,8 @@ void launch_cute_fwd_split_d_fp8_sm120_v(
       return ffpa_fp8::split_d_fwd_cute_fp8_sm120<
           Traits, ElementO, TmaQ, TmaK, TmaV, TmaO, TmaBiasSel,
           decltype(pv_f16)::value, decltype(v_pc)::value,
-          decltype(qk_pt)::value, reorg_free, kModeL, kB4, kBiasOn>;
+          decltype(qk_pt)::value, reorg_free, kBiasPlanMode, kBias4BytesPerElem,
+          kBiasOn>;
     };
     using Ic = std::integral_constant<int, 1>;
     using Ic0 = std::integral_constant<int, 0>;
@@ -351,8 +358,8 @@ void launch_cute_fwd_split_d_fp8_sm120_v(
     launch_with(std::integral_constant<int, 0>{}, tma_bias_r16,
                 std::integral_constant<int, 0>{},
                 std::integral_constant<int, 0>{});
-  } else if constexpr (kModeL == 2) {
-    if constexpr (kB4 == 1)
+  } else if constexpr (kBiasPlanMode == 2) {
+    if constexpr (kBias4BytesPerElem == 1)
       launch_with(std::integral_constant<int, 1>{}, tma_bias_r32,
                   std::integral_constant<int, 2>{},
                   std::integral_constant<int, 1>{});

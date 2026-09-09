@@ -61,11 +61,15 @@ inline FfpaBiasTilePlan fp8_persist_d_bias_plan(const FfpaBiasParams& bias_p,
 // template whose explicit instantiations live in the env.py-generated
 // per-tag TUs; the suffix-less wrapper does the runtime plan -> tag
 // dispatch into these (same contract as the fp4 launchers).
-// Variant tags (kBiasOn, kModeL, kB4) pin the kernel set compiled into this
-// instantiation; explicit instantiations live in the generated variant TUs
-// (fwd_cute_fp8_variants.cuh), so family TUs only carry extern declarations.
+// Variant tags: kBiasOn (attn_bias tensor present), kBiasPlanMode (bias
+// tile mode: 0 = gmem-direct fallback, 1 = dense [kBr,kBc] TMA tile,
+// 2 = row-broadcast TMA, 3 = resident row vector), kBias4BytesPerElem
+// (1 = 4-byte fp32 mask, 0 = 2-byte fp16/bf16 mask). They pin the kernel
+// set compiled into this instantiation; explicit instantiations live in
+// the generated variant TUs (fwd_cute_fp8_variants.cuh), so family TUs
+// only carry extern declarations.
 template <typename kDataType, const int kHeadDim, const int kStage,
-          bool kQKInt8, int kBiasOn, int kModeL, int kB4>
+          bool kQKInt8, int kBiasOn, int kBiasPlanMode, int kBias4BytesPerElem>
 void launch_cute_fwd_persist_d_fp8_sm120_v(
     torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O,
     torch::Tensor attn_bias, torch::Tensor softmax_lse, int causal,
@@ -279,8 +283,10 @@ void launch_cute_fwd_persist_d_fp8_sm120_v(
         ffpa::fp8_persist_d_bias_plan<kDataType, kHeadDim, kStage, kQKInt8>(
             bias_p, Nb, Nh, Nq, Nkv, dyn_limit);
   }
-  TORCH_CHECK(kBiasOn == bias_on && kModeL == (bias_on ? bias_plan.mode : 0) &&
-                  kB4 == ((kModeL == 2 && bias.dtype == 3) ? 1 : 0),
+  TORCH_CHECK(kBiasOn == bias_on &&
+                  kBiasPlanMode == (bias_on ? bias_plan.mode : 0) &&
+                  kBias4BytesPerElem ==
+                      ((kBiasPlanMode == 2 && bias.dtype == 3) ? 1 : 0),
               "ffpa_attn: fp8 persist_d D=", kHeadDim,
               " variant tag mismatch (wrapper dispatch vs plan)");
   const auto bias_bytes_of = [&](int m) {
@@ -362,7 +368,8 @@ void launch_cute_fwd_persist_d_fp8_sm120_v(
           Traits, ElementO, TmaQ, TmaK, TmaV, TmaO, TmaBiasSel,
           decltype(pq_pr)::value, decltype(pv_f16)::value,
           decltype(v_pc)::value, decltype(qk_pt)::value, reorg_free,
-          ffpa_fp8::kPersistQs2rDefault, kModeL, kB4, kBiasOn>;
+          ffpa_fp8::kPersistQs2rDefault, kBiasPlanMode, kBias4BytesPerElem,
+          kBiasOn>;
     };
     using Ic = std::integral_constant<int, 1>;
     using Ic0 = std::integral_constant<int, 0>;
@@ -400,8 +407,8 @@ void launch_cute_fwd_persist_d_fp8_sm120_v(
     launch_with(std::integral_constant<int, 0>{}, tma_bias_r16,
                 std::integral_constant<int, 0>{},
                 std::integral_constant<int, 0>{});
-  } else if constexpr (kModeL == 2) {
-    if constexpr (kB4 == 1)
+  } else if constexpr (kBiasPlanMode == 2) {
+    if constexpr (kBias4BytesPerElem == 1)
       launch_with(std::integral_constant<int, 1>{}, tma_bias_r32,
                   std::integral_constant<int, 2>{},
                   std::integral_constant<int, 1>{});
@@ -409,7 +416,7 @@ void launch_cute_fwd_persist_d_fp8_sm120_v(
       launch_with(std::integral_constant<int, 1>{}, tma_bias_r16,
                   std::integral_constant<int, 2>{},
                   std::integral_constant<int, 0>{});
-  } else if constexpr (kModeL == 3) {
+  } else if constexpr (kBiasPlanMode == 3) {
     // Resident-vector path: no bias TMA (dummy desc), runtime dtype only.
     launch_with(std::integral_constant<int, 1>{}, tma_bias_r16,
                 std::integral_constant<int, 3>{},

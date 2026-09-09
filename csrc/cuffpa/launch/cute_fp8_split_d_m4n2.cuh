@@ -54,10 +54,13 @@ inline FfpaBiasTilePlan fp8_m4n2_bias_plan(const FfpaBiasParams& bias_p, int Nb,
 // Dispatched for D>=768 to avoid M8N1's D/2 register spill (O=D/2>255).
 // M4N2 uses D/4 regs per thread; P goes through SMEM roundtrip (stmatrix->
 // LDSM_N) since each N-warp holds only half the Bc columns.
-// Variant tags (kBiasOn, kModeL, kB4): mode 1 (dense tile) is m4n2-only;
+// Variant tags: kBiasOn (attn_bias tensor present), kBiasPlanMode (bias
+// tile mode: 0 = gmem-direct fallback, 1 = dense [kBr,kBc] TMA tile,
+// 2 = row-broadcast TMA, 3 = resident row vector; mode 1 is m4n2-only),
+// kBias4BytesPerElem (1 = 4-byte fp32 mask, 0 = 2-byte fp16/bf16 mask);
 // explicit instantiations live in the generated variant TUs.
 template <typename kDataType, const int kHeadDim, const int kStage,
-          bool kQKInt8, int kBiasOn, int kModeL, int kB4>
+          bool kQKInt8, int kBiasOn, int kBiasPlanMode, int kBias4BytesPerElem>
 void launch_cute_fwd_split_d_m4n2_fp8_sm120_v(
     torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O,
     torch::Tensor attn_bias, torch::Tensor softmax_lse, int causal,
@@ -220,8 +223,10 @@ void launch_cute_fwd_split_d_m4n2_fp8_sm120_v(
     bias_plan = ffpa::fp8_m4n2_bias_plan<kDataType, kHeadDim, kStage, kQKInt8>(
         bias_p, Nb, Nh, Nq, Nkv);
   }
-  TORCH_CHECK(kBiasOn == bias_on && kModeL == (bias_on ? bias_plan.mode : 0) &&
-                  kB4 == ((kModeL != 0 && bias.dtype == 3) ? 1 : 0),
+  TORCH_CHECK(kBiasOn == bias_on &&
+                  kBiasPlanMode == (bias_on ? bias_plan.mode : 0) &&
+                  kBias4BytesPerElem ==
+                      ((kBiasPlanMode != 0 && bias.dtype == 3) ? 1 : 0),
               "ffpa_attn: fp8 split_d m4n2 D=", kHeadDim,
               " variant tag mismatch (wrapper dispatch vs plan)");
   constexpr int kBiasSmemBudgetBytes = 99 * 1024;
@@ -309,46 +314,54 @@ void launch_cute_fwd_split_d_m4n2_fp8_sm120_v(
     if (qk_per_thread) {
       // Per-thread QK quant (sage style): fragment-aligned dequant scales.
       if (v_per_channel && pv_acc_f16) {
-        launch_kernel(ffpa_fp8::split_d_m4n2_fwd_cute_fp8_sm120<
-                          Traits, ElementO, TmaQ, TmaK, TmaV, TmaO, TmaBiasSel,
-                          true, true, true, kModeL, kB4, kBiasOn>,
-                      tma_bias_sel);
+        launch_kernel(
+            ffpa_fp8::split_d_m4n2_fwd_cute_fp8_sm120<
+                Traits, ElementO, TmaQ, TmaK, TmaV, TmaO, TmaBiasSel, true,
+                true, true, kBiasPlanMode, kBias4BytesPerElem, kBiasOn>,
+            tma_bias_sel);
       } else if (v_per_channel) {
-        launch_kernel(ffpa_fp8::split_d_m4n2_fwd_cute_fp8_sm120<
-                          Traits, ElementO, TmaQ, TmaK, TmaV, TmaO, TmaBiasSel,
-                          false, true, true, kModeL, kB4, kBiasOn>,
-                      tma_bias_sel);
+        launch_kernel(
+            ffpa_fp8::split_d_m4n2_fwd_cute_fp8_sm120<
+                Traits, ElementO, TmaQ, TmaK, TmaV, TmaO, TmaBiasSel, false,
+                true, true, kBiasPlanMode, kBias4BytesPerElem, kBiasOn>,
+            tma_bias_sel);
       } else if (pv_acc_f16) {
-        launch_kernel(ffpa_fp8::split_d_m4n2_fwd_cute_fp8_sm120<
-                          Traits, ElementO, TmaQ, TmaK, TmaV, TmaO, TmaBiasSel,
-                          true, false, true, kModeL, kB4, kBiasOn>,
-                      tma_bias_sel);
+        launch_kernel(
+            ffpa_fp8::split_d_m4n2_fwd_cute_fp8_sm120<
+                Traits, ElementO, TmaQ, TmaK, TmaV, TmaO, TmaBiasSel, true,
+                false, true, kBiasPlanMode, kBias4BytesPerElem, kBiasOn>,
+            tma_bias_sel);
       } else {
-        launch_kernel(ffpa_fp8::split_d_m4n2_fwd_cute_fp8_sm120<
-                          Traits, ElementO, TmaQ, TmaK, TmaV, TmaO, TmaBiasSel,
-                          false, false, true, kModeL, kB4, kBiasOn>,
-                      tma_bias_sel);
+        launch_kernel(
+            ffpa_fp8::split_d_m4n2_fwd_cute_fp8_sm120<
+                Traits, ElementO, TmaQ, TmaK, TmaV, TmaO, TmaBiasSel, false,
+                false, true, kBiasPlanMode, kBias4BytesPerElem, kBiasOn>,
+            tma_bias_sel);
       }
     } else if (v_per_channel && pv_acc_f16) {
-      launch_kernel(ffpa_fp8::split_d_m4n2_fwd_cute_fp8_sm120<
-                        Traits, ElementO, TmaQ, TmaK, TmaV, TmaO, TmaBiasSel,
-                        true, true, false, kModeL, kB4, kBiasOn>,
-                    tma_bias_sel);
+      launch_kernel(
+          ffpa_fp8::split_d_m4n2_fwd_cute_fp8_sm120<
+              Traits, ElementO, TmaQ, TmaK, TmaV, TmaO, TmaBiasSel, true, true,
+              false, kBiasPlanMode, kBias4BytesPerElem, kBiasOn>,
+          tma_bias_sel);
     } else if (v_per_channel) {
-      launch_kernel(ffpa_fp8::split_d_m4n2_fwd_cute_fp8_sm120<
-                        Traits, ElementO, TmaQ, TmaK, TmaV, TmaO, TmaBiasSel,
-                        false, true, false, kModeL, kB4, kBiasOn>,
-                    tma_bias_sel);
+      launch_kernel(
+          ffpa_fp8::split_d_m4n2_fwd_cute_fp8_sm120<
+              Traits, ElementO, TmaQ, TmaK, TmaV, TmaO, TmaBiasSel, false, true,
+              false, kBiasPlanMode, kBias4BytesPerElem, kBiasOn>,
+          tma_bias_sel);
     } else if (pv_acc_f16) {
-      launch_kernel(ffpa_fp8::split_d_m4n2_fwd_cute_fp8_sm120<
-                        Traits, ElementO, TmaQ, TmaK, TmaV, TmaO, TmaBiasSel,
-                        true, false, false, kModeL, kB4, kBiasOn>,
-                    tma_bias_sel);
+      launch_kernel(
+          ffpa_fp8::split_d_m4n2_fwd_cute_fp8_sm120<
+              Traits, ElementO, TmaQ, TmaK, TmaV, TmaO, TmaBiasSel, true, false,
+              false, kBiasPlanMode, kBias4BytesPerElem, kBiasOn>,
+          tma_bias_sel);
     } else {
-      launch_kernel(ffpa_fp8::split_d_m4n2_fwd_cute_fp8_sm120<
-                        Traits, ElementO, TmaQ, TmaK, TmaV, TmaO, TmaBiasSel,
-                        false, false, false, kModeL, kB4, kBiasOn>,
-                    tma_bias_sel);
+      launch_kernel(
+          ffpa_fp8::split_d_m4n2_fwd_cute_fp8_sm120<
+              Traits, ElementO, TmaQ, TmaK, TmaV, TmaO, TmaBiasSel, false,
+              false, false, kBiasPlanMode, kBias4BytesPerElem, kBiasOn>,
+          tma_bias_sel);
     }
   };
   // Compile-time pinned variant: only this tag's kernel table instantiates.
@@ -356,8 +369,8 @@ void launch_cute_fwd_split_d_m4n2_fp8_sm120_v(
     dispatch(std::integral_constant<int, 0>{}, tma_bias_r16,
              std::integral_constant<int, 0>{},
              std::integral_constant<int, 0>{});
-  } else if constexpr (kModeL == 1) {
-    if constexpr (kB4 == 1)
+  } else if constexpr (kBiasPlanMode == 1) {
+    if constexpr (kBias4BytesPerElem == 1)
       dispatch(std::integral_constant<int, 1>{}, tma_bias_d32,
                std::integral_constant<int, 1>{},
                std::integral_constant<int, 1>{});
@@ -365,8 +378,8 @@ void launch_cute_fwd_split_d_m4n2_fp8_sm120_v(
       dispatch(std::integral_constant<int, 1>{}, tma_bias_d16,
                std::integral_constant<int, 1>{},
                std::integral_constant<int, 0>{});
-  } else if constexpr (kModeL == 2) {
-    if constexpr (kB4 == 1)
+  } else if constexpr (kBiasPlanMode == 2) {
+    if constexpr (kBias4BytesPerElem == 1)
       dispatch(std::integral_constant<int, 1>{}, tma_bias_r32,
                std::integral_constant<int, 2>{},
                std::integral_constant<int, 1>{});
@@ -374,8 +387,8 @@ void launch_cute_fwd_split_d_m4n2_fp8_sm120_v(
       dispatch(std::integral_constant<int, 1>{}, tma_bias_r16,
                std::integral_constant<int, 2>{},
                std::integral_constant<int, 0>{});
-  } else if constexpr (kModeL == 3) {
-    if constexpr (kB4 == 1)
+  } else if constexpr (kBiasPlanMode == 3) {
+    if constexpr (kBias4BytesPerElem == 1)
       dispatch(std::integral_constant<int, 1>{}, tma_bias_r32,
                std::integral_constant<int, 3>{},
                std::integral_constant<int, 1>{});

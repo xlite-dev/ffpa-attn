@@ -57,10 +57,13 @@ inline FfpaBiasTilePlan fp4_m4n2_bias_plan(const FfpaBiasParams& bias_p, int Nb,
 // as split-D/persist-D (V^T quantize residual + epilogue add-back);
 // fp4_pv_mm_type stays NVFP4-only here (see the wrapper: the MXFP8 PV
 // atom needs Tile-K=128 but m4n2 tiles are kBc=64).
-// Variant tags: (kPvMxfp8=false always, kBiasOn, kModeL, kB4) - regular
-// builds pin mode 0 (PC-0-5); FFPA_BIAS_TILE_KEEP (debug) keeps mode 2.
+// Variant tags: kPvMxfp8 (always false here - m4n2 is NVFP4-only),
+// kBiasOn (attn_bias tensor present), kBiasPlanMode (bias tile mode,
+// see the persist_d notes; regular builds pin mode 0 per PC-0-5,
+// FFPA_BIAS_TILE_KEEP (debug) keeps mode 2), kBias4BytesPerElem (1 =
+// 4-byte fp32 mask, 0 = 2-byte fp16/bf16 mask).
 template <typename kDataType, const int kHeadDim, bool kPvMxfp8, int kBiasOn,
-          int kModeL, int kB4>
+          int kBiasPlanMode, int kBias4BytesPerElem>
 void launch_cute_fwd_split_d_m4n2_fp4_sm120_v(
     torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O,
     torch::Tensor attn_bias, torch::Tensor softmax_lse, int causal,
@@ -279,10 +282,12 @@ void launch_cute_fwd_split_d_m4n2_fp4_sm120_v(
     bias_plan = ffpa::fp4_m4n2_bias_plan<kDataType, kHeadDim>(
         bias_p, Nb, Nh, Nq, Nkv, dyn_limit);
   }
-  TORCH_CHECK(kBiasOn == bias_on && kModeL == (bias_on ? bias_plan.mode : 0) &&
+  TORCH_CHECK(kBiasOn == bias_on &&
+                  kBiasPlanMode == (bias_on ? bias_plan.mode : 0) &&
                   // b4 only picks the mode-2 TMA smem width; the mode-3
                   // resident fill reads the runtime attn_bias_dtype in-kernel.
-                  kB4 == ((kModeL == 2 && bias.dtype == 3) ? 1 : 0),
+                  kBias4BytesPerElem ==
+                      ((kBiasPlanMode == 2 && bias.dtype == 3) ? 1 : 0),
               "ffpa_attn: fp4 split_d m4n2 D=", kHeadDim,
               " variant tag mismatch (wrapper dispatch vs plan)");
   const auto bias_bytes_of = [&](int m) {
@@ -339,8 +344,8 @@ void launch_cute_fwd_split_d_m4n2_fp4_sm120_v(
     auto kernel = ffpa_fp4::split_d_m4n2_fwd_cute_fp4_sm120<
         Traits, ElementO, decltype(tma_q), decltype(tma_k), decltype(tma_v),
         decltype(tma_o), decltype(tma_sfq), decltype(tma_sfk),
-        decltype(tma_sfvt), decltype(tma_ds), decltype(tma_bias_sel), kModeL,
-        kB4, kBiasOn>;
+        decltype(tma_sfvt), decltype(tma_ds), decltype(tma_bias_sel),
+        kBiasPlanMode, kBias4BytesPerElem, kBiasOn>;
     TORCH_CHECK(
         cudaFuncSetAttribute(kernel,
                              cudaFuncAttributeMaxDynamicSharedMemorySize,
@@ -364,8 +369,8 @@ void launch_cute_fwd_split_d_m4n2_fp4_sm120_v(
                 std::integral_constant<int, 0>{});
   } else {
 #ifdef ENABLE_FFPA_FP4_BUILD_DEBUG
-    if constexpr (kModeL == 2) {
-      if constexpr (kB4 == 1)
+    if constexpr (kBiasPlanMode == 2) {
+      if constexpr (kBias4BytesPerElem == 1)
         launch_with(std::integral_constant<int, 1>{}, tma_bias_r32,
                     std::integral_constant<int, 2>{},
                     std::integral_constant<int, 1>{});

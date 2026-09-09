@@ -58,10 +58,14 @@ inline FfpaBiasTilePlan fp4_persist_d_bias_plan(const FfpaBiasParams& bias_p,
 // template whose explicit instantiations live in the env.py-generated
 // per-tag TUs (fwd_*_cute_fp4_*_p*_b*m*f*.cu); the suffix-less wrapper
 // below does the runtime plan -> tag dispatch into these.
-// Variant tags: (kPvMxfp8, kBiasOn, kModeL, kB4) pin the PV dtype and the
-// bias tile mode so each kernel table compiles in its own TU (env.py).
+// Variant tags: kPvMxfp8 (PV MMA dtype: MXFP8 vs NVFP4), kBiasOn
+// (attn_bias tensor present), kBiasPlanMode (bias tile mode: 0 =
+// gmem-direct fallback, 1 = dense [kBr,kBc] TMA tile, 2 = row-broadcast
+// TMA, 3 = resident row vector), kBias4BytesPerElem (1 = 4-byte fp32
+// mask, 0 = 2-byte fp16/bf16 mask). They pin the PV dtype and the bias
+// tile mode so each kernel table compiles in its own TU (env.py).
 template <typename kDataType, const int kHeadDim, bool kPvMxfp8, int kBiasOn,
-          int kModeL, int kB4>
+          int kBiasPlanMode, int kBias4BytesPerElem>
 void launch_cute_fwd_persist_d_fp4_sm120_v(torch::Tensor Q, torch::Tensor K,
                                            torch::Tensor V, torch::Tensor O,
                                            torch::Tensor attn_bias,
@@ -386,8 +390,10 @@ void launch_cute_fwd_persist_d_fp4_sm120_v(torch::Tensor Q, torch::Tensor K,
     bias_plan = ffpa::fp4_persist_d_bias_plan<kDataType, kHeadDim, kPvMxfp8>(
         bias_p, Nb, Nh, Nq, Nkv, dyn_limit);
   }
-  TORCH_CHECK(kBiasOn == bias_on && kModeL == (bias_on ? bias_plan.mode : 0) &&
-                  kB4 == ((kModeL != 0 && bias.dtype == 3) ? 1 : 0),
+  TORCH_CHECK(kBiasOn == bias_on &&
+                  kBiasPlanMode == (bias_on ? bias_plan.mode : 0) &&
+                  kBias4BytesPerElem ==
+                      ((kBiasPlanMode != 0 && bias.dtype == 3) ? 1 : 0),
               "ffpa_attn: fp4 persist_d D=", kHeadDim,
               " variant tag mismatch (wrapper dispatch vs plan)");
   const int bias_stages = (bias_plan.mode == 2) ? 2 : 1;
@@ -465,7 +471,8 @@ void launch_cute_fwd_persist_d_fp4_sm120_v(torch::Tensor Q, torch::Tensor K,
     auto kernel = ffpa_fp4::persist_d_ws_fwd_cute_fp4_sm120<
         Traits, ElementO, decltype(tma_q), decltype(tma_k), decltype(tma_v),
         decltype(tma_o), decltype(tma_sfq), decltype(tma_sfk),
-        decltype(tma_sfvt), decltype(tma_ds), TmaBiasSel, kModeL, kB4, kBiasOn>;
+        decltype(tma_sfvt), decltype(tma_ds), TmaBiasSel, kBiasPlanMode,
+        kBias4BytesPerElem, kBiasOn>;
     TORCH_CHECK(cudaFuncSetAttribute(
                     kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
                     kSmemBytes) == cudaSuccess,
@@ -486,8 +493,8 @@ void launch_cute_fwd_persist_d_fp4_sm120_v(torch::Tensor Q, torch::Tensor K,
     launch_with(std::integral_constant<int, 0>{}, tma_bias_r16,
                 std::integral_constant<int, 0>{},
                 std::integral_constant<int, 0>{});
-  } else if constexpr (kModeL == 1) {
-    if constexpr (kB4 == 1)
+  } else if constexpr (kBiasPlanMode == 1) {
+    if constexpr (kBias4BytesPerElem == 1)
       launch_with(std::integral_constant<int, 1>{}, tma_bias_d32,
                   std::integral_constant<int, 1>{},
                   std::integral_constant<int, 1>{});
@@ -495,8 +502,8 @@ void launch_cute_fwd_persist_d_fp4_sm120_v(torch::Tensor Q, torch::Tensor K,
       launch_with(std::integral_constant<int, 1>{}, tma_bias_d16,
                   std::integral_constant<int, 1>{},
                   std::integral_constant<int, 0>{});
-  } else if constexpr (kModeL == 2) {
-    if constexpr (kB4 == 1)
+  } else if constexpr (kBiasPlanMode == 2) {
+    if constexpr (kBias4BytesPerElem == 1)
       launch_with(std::integral_constant<int, 1>{}, tma_bias_r32,
                   std::integral_constant<int, 2>{},
                   std::integral_constant<int, 1>{});
@@ -504,9 +511,9 @@ void launch_cute_fwd_persist_d_fp4_sm120_v(torch::Tensor Q, torch::Tensor K,
       launch_with(std::integral_constant<int, 1>{}, tma_bias_r16,
                   std::integral_constant<int, 2>{},
                   std::integral_constant<int, 0>{});
-  } else if constexpr (kModeL == 3) {
+  } else if constexpr (kBiasPlanMode == 3) {
     // resident row-vector: no TMA issue in-kernel, descriptor unused.
-    if constexpr (kB4 == 1)
+    if constexpr (kBias4BytesPerElem == 1)
       launch_with(std::integral_constant<int, 1>{}, tma_bias_r32,
                   std::integral_constant<int, 3>{},
                   std::integral_constant<int, 1>{});
