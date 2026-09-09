@@ -539,12 +539,19 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp8_sm120(
                            (long long)Nh_id * attn_bias_stride_h) *
                               ((attn_bias_dtype == 3) ? 2 : 1);
     const int n_u16 = (int)Nkv * ((attn_bias_dtype == 3) ? 2 : 1);
+    // Zero-fill the tail pad up to a whole kBc tile (tail tiles' bias
+    // injection reads tile-local offsets < kBc unclamped; the masking
+    // overrides the pad scores).
+    const int pad_u16 = (int)(((Nkv + kBc - 1) / kBc * kBc) - Nkv) *
+                        ((attn_bias_dtype == 3) ? 2 : 1);
     const int vec_end = n_u16 & ~7;
     for (int i = wg_tid * 8; i < vec_end; i += kConsumerThreads * 8)
       *reinterpret_cast<uint4*>(bias_base + i) =
           *reinterpret_cast<const uint4*>(src + i);
     for (int i = vec_end + wg_tid; i < n_u16; i += kConsumerThreads)
       bias_base[i] = src[i];
+    for (int i = n_u16 + wg_tid; i < n_u16 + pad_u16; i += kConsumerThreads)
+      bias_base[i] = 0;
     cutlass::arch::NamedBarrier::sync(kConsumerThreads, 0);
   }
 
@@ -623,6 +630,11 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp8_sm120(
     // bias/(qs_arr[row]*ks*scale_orig) lands as +bias in softmax-input
     // units on masked and unmasked tiles alike; the -INFINITY assignments
     // in the masking block below simply override it.
+    // Bias tail guards: rows/cols of this tile inside the real row window
+    // [q_start_row, Nq) x [0, Nkv); the injector clamps pad rows/cols to these
+    // bounds (the masking block below overrides their scores anyway).
+    const int bias_q_valid = min(kBr, Nq - q_start_row - Br_base);
+    const int bias_kv_valid = min(kBc, Nkv - kv_tile * kBc);
     if constexpr (kHasAttnBias && kBiasMode != 0) {
       float bias_inv[kSRows];
 #pragma unroll
@@ -664,11 +676,21 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_fp8_sm120(
 #pragma unroll
       for (int row = 0; row < kSRows; ++row)
         bias_inv[row] = 1.0f / (qs_arr[row] * ks * scale_orig);
-      ffpa_cute::apply_attn_bias_quant_rowcol<
-          decltype(scores), decltype(tScS_rc), kSRows, kSCols>(
-          scores, tScS_rc, attn_bias, attn_bias_dtype, attn_bias_stride_b,
-          attn_bias_stride_h, attn_bias_stride_m, attn_bias_stride_n, Nb_id,
-          Nh_id, q_start_row + Br_base, kv_tile, kBc, bias_inv);
+      const bool full_tile = bias_q_valid >= kBr && bias_kv_valid >= kBc;
+      if (__builtin_expect(full_tile, 1))
+        ffpa_cute::apply_attn_bias_quant_rowcol<
+            decltype(scores), decltype(tScS_rc), kSRows, kSCols, false>(
+            scores, tScS_rc, attn_bias, attn_bias_dtype, attn_bias_stride_b,
+            attn_bias_stride_h, attn_bias_stride_m, attn_bias_stride_n, Nb_id,
+            Nh_id, q_start_row + Br_base, kv_tile, kBc, bias_inv, bias_q_valid,
+            bias_kv_valid);
+      else
+        ffpa_cute::apply_attn_bias_quant_rowcol<
+            decltype(scores), decltype(tScS_rc), kSRows, kSCols, true>(
+            scores, tScS_rc, attn_bias, attn_bias_dtype, attn_bias_stride_b,
+            attn_bias_stride_h, attn_bias_stride_m, attn_bias_stride_n, Nb_id,
+            Nh_id, q_start_row + Br_base, kv_tile, kBc, bias_inv, bias_q_valid,
+            bias_kv_valid);
     }
 
     const int kv_valid = Nkv - kv_tile * kBc;

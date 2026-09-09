@@ -36,10 +36,17 @@ except Exception:
   _ffpa_attn_varlen_cute = None
 
 try:
-  from .cuda import _ffpa_attn_forward_cuda, F16_ACC_AVAILABLE  # D > 256
+  from .cuda import (  # D > 256
+    _ffpa_attn_forward_cuda,
+    F16_ACC_AVAILABLE,
+    CUDA_INPUT_FP16_AVAILABLE,
+    CUDA_MASK_FP32_AVAILABLE,
+  )
 except Exception:
   _ffpa_attn_forward_cuda = None
   F16_ACC_AVAILABLE = False
+  CUDA_INPUT_FP16_AVAILABLE = True
+  CUDA_MASK_FP32_AVAILABLE = True
 
 try:
   # Hoisted to module level: the per-call `from .cuda import ...` inside
@@ -55,7 +62,7 @@ if TYPE_CHECKING:
 # MMA Acc encoding kept in sync with csrc/pybind/ffpa_attn_api.cc::ffpa_attn.
 _ACC_F16 = 0
 _ACC_F32 = 1
-# FP8 quant granularity encoding (kept in sync with cute/launch.cuh).
+# FP8 quant granularity encoding (kept in sync with launch/cute_fp8.cuh).
 _QUANT_METHOD_PER_BLOCK = 0
 _QUANT_METHOD_PER_CHANNEL = 1
 _QUANT_METHOD_PER_THREAD = 2
@@ -64,15 +71,15 @@ _QUANT_METHOD_CODE = {
   "per_channel": _QUANT_METHOD_PER_CHANNEL,
   "per_thread": _QUANT_METHOD_PER_THREAD,
 }
-# FP8 PV accumulator dtype encoding (kept in sync with cute/launch.cuh).
+# FP8 PV accumulator dtype encoding (kept in sync with launch/cute_fp8.cuh).
 _PV_ACC_F16 = 0
 _PV_ACC_F32 = 1
 _PV_ACC_CODE = {"f16": _PV_ACC_F16, "f32": _PV_ACC_F32}
-# FP8 QK MMA dtype encoding (kept in sync with cute/launch.cuh).
+# FP8 QK MMA dtype encoding (kept in sync with launch/cute_fp8.cuh).
 _QK_MM_FP8 = 0
 _QK_MM_INT8 = 1
 _QK_MM_TYPE_CODE = {"fp8": _QK_MM_FP8, "int8": _QK_MM_INT8}
-# FP4 PV MMA dtype encoding (kept in sync with cute/launch.cuh).
+# FP4 PV MMA dtype encoding (kept in sync with launch/cute_fp4.cuh).
 _FP4_PV_MM_NVFP4 = 0
 _FP4_PV_MM_MXFP8 = 1
 _FP4_PV_MM_CODE = {"fp4": _FP4_PV_MM_NVFP4, "fp8": _FP4_PV_MM_MXFP8}
@@ -103,8 +110,8 @@ def _allow_cuda_small_d() -> bool:
 def is_nhd_zero_copy_input(t: torch.Tensor) -> bool:
   """Whether a [B, N, H, D] tensor can feed the persist-D NHD path zero-copy.
 
-  Mirrors the relaxed ``ffpa_layout_of`` gate in ``csrc/cuffpa/cute/
-  launch.cuh``: packed-NHD tensors and fused-QKV interleaved chunk views
+  Mirrors the relaxed ``ffpa_layout_of`` gate in
+  ``csrc/cuffpa/launch/common.cuh``: packed-NHD tensors and fused-QKV interleaved chunk views
   (row stride wider than ``H * D``) both qualify; BHND-packed and
   arbitrary-stride tensors do not. Quant families whose C++ gate is not
   relaxed yet must materialize tensors failing this predicate instead of
@@ -199,6 +206,30 @@ def _apply_cuda_backend_hint(backend: CUDABackend) -> None:
     set_cuda_backend_impl(CudaBackendImpl.NATIVE)
 
 
+def _cuda_input_guard_and_mask_downcast(
+  q: torch.Tensor, attn_bias: torch.Tensor | None
+) -> torch.Tensor | None:
+  """Guard the compile-time input/mask dtype sets before the CUDA entry.
+
+  fp16 inputs need ENABLE_FFPA_CUDA_INPUT_FP16 (default builds are
+  bf16-only). fp32 attn_masks are downcast to q.dtype unless
+  ENABLE_FFPA_CUDA_MASK_FP32 compiled the f=1 variants (mode-0 gmem-direct
+  paths read fp32 natively, but the TMA tile modes do not, so the downcast
+  keeps every plan mode reachable).
+  """
+  if q.dtype is torch.float16 and not CUDA_INPUT_FP16_AVAILABLE:
+    raise RuntimeError(
+      "ffpa_attn: fp16 inputs are disabled in this build; rebuild with "
+      "ENABLE_FFPA_CUDA_INPUT_FP16=1 to enable them."
+    )
+  if (
+    attn_bias is not None and attn_bias.dtype == torch.float32
+    and not CUDA_MASK_FP32_AVAILABLE
+  ):
+    attn_bias = attn_bias.to(q.dtype)
+  return attn_bias
+
+
 def _ffpa_attn_forward(
   query: torch.Tensor,
   key: torch.Tensor,
@@ -246,6 +277,7 @@ def _ffpa_attn_forward(
   if forward_backend.fp4_hybrid is None:
     forward_backend.fp4_hybrid = bool(forward_backend.enable_fp4 and is_causal)
   _apply_cuda_backend_hint(forward_backend)
+  _cuda_input_guard_and_mask_downcast(query, None)  # fp16 guard only here
   O, _ = _ffpa_attn_forward_cuda(
     query,
     key,
@@ -1280,6 +1312,7 @@ class _FFPAAttnFunc(torch.autograd.Function):
       forward_meta = meta.forward_meta
       assert _ffpa_attn_forward_cuda is not None, "CUDA backend is not available."
       _apply_cuda_backend_hint(forward_meta)
+      attn_bias = _cuda_input_guard_and_mask_downcast(q, attn_bias)
       rng_state = _reserve_large_d_dropout_rng(q, k, meta.attn_meta.dropout_p)
       O, lse = _ffpa_attn_forward_cuda(
         q,

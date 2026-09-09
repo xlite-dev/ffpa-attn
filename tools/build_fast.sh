@@ -16,7 +16,7 @@
 # Usage (run with --help for all flags; flags map onto the FFPA_* /
 # ENABLE_FFPA_* env vars and override same-named env vars):
 #   bash tools/build_fast.sh                                   # editable + ext=cuda default
-#   bash tools/build_fast.sh --arch sm_120f --ext all --headdim all --jobs 32
+#   bash tools/build_fast.sh --arch sm_120f --ext all --headdim default --jobs 32
 #   bash tools/build_fast.sh --arch sm_89,sm_120f              # multi-arch
 #   bash tools/build_fast.sh --clean --headdim 256,512         # fast iteration
 #   bash tools/build_fast.sh --no-editable bdist_wheel         # PEP 517-compatible wheel
@@ -42,12 +42,36 @@ Flags (override same-named env vars; env reference: docs/env.md):
                          <csv>  subset of cuda,cute,tma (cute/tma imply cuda)
                        Default without --ext or env: ENABLE_FFPA_CUDA_IMPL=1.
                        TMA auto-disables when every target arch is sm<90.
-  --headdim <list|all> FFPA_DEV_HEADDIMS subset, e.g. 256,512; 'all' builds
-                       every headdim (multiples of 64 in [64, 1024]). Omitting
-                       the flag builds the default set (multiples of 64 in
-                       [320, 1024]), governed by ENABLE_FFPA_ALL_HEADDIM
-                       (default 0). Pass other headdims (e.g. 32, 96, 128)
-                       explicitly via --headdim 32,96,128.
+  --headdim <list|all|default>
+                       FFPA_DEV_HEADDIMS subset, e.g. 256,512; 'all' builds
+                       64,128,192,256,320,512,768; 'default' builds the same
+                       set minus 768 (fast full-feature iteration). Any other
+                       headdim (e.g. 32, 96, 832..1024) is NOT covered by
+                       'all'/'default' and must be requested manually via an
+                       explicit list: --headdim 32,96,1024. Omitting the flag
+                       is equivalent to 'default'.
+  --stages <csv|all>   FFPA_BUILD_STAGES: build stage subset, e.g. '2,3' or
+                       'all' (= 1..max). Overrides the legacy
+                       ENABLE_FFPA_ALL_STAGES; default without both: '2,3'.
+  --debug-ext <csv|all|none>
+                       ENABLE_FFPA_BUILD_DEBUG: compile debug dispatch knobs
+                       (e.g. FFPA_FP8_FORCE_KERNEL, FFPA_DROPOUT_BITMAP_DISABLE)
+                       for the selected families only: subset of fp16,fp8,fp4
+                       or 'all'. Default 'none' strips every debug getenv
+                       branch (and the FORCE_KERNEL dual instantiation).
+  --input-dtypes <csv> ENABLE_FFPA_CUDA_INPUT_FP16: qkv input dtypes compiled
+                       into the kernels. Subset of fp16,bf16. bf16 is always
+                       built (baseline); adding fp16 compiles the fp16-input
+                       TUs. e.g. --input-dtypes fp16,bf16 (full set)
+                       Default: bf16 only.
+  --mask-dtypes <csv>  ENABLE_FFPA_CUDA_MASK_FP32: attn_mask (bias) dtypes
+                       compiled into the variant TUs. Subset of
+                       fp16,bf16,fp32. 2-byte masks (fp16/bf16) are always
+                       built (baseline); adding fp32 compiles the 4-byte
+                       f=1 variants and disables the runtime downcast.
+                         e.g. --mask-dtypes fp16,bf16,fp32 (full set)
+                       Default: fp16,bf16 (fp32 masks are downcast to
+                       q.dtype at runtime).
   --editable           FFPA_EDITABLE=1: build_ext + pip install -e (default).
   --no-editable        FFPA_EDITABLE=0: build_ext only, no package install.
   -j, --jobs N         MAX_JOBS outer build parallelism (default min(nproc,32)).
@@ -117,12 +141,57 @@ while [[ $# -gt 0 ]]; do
     --headdim)
       require_value "$@"
       HEADDIM_SET=1
+      # all/default are fixed sets; any other headdim needs an explicit list.
       if [[ "${2,,}" == "all" ]]; then
-        unset FFPA_DEV_HEADDIMS
-        export ENABLE_FFPA_ALL_HEADDIM=1
+        unset ENABLE_FFPA_ALL_HEADDIM
+        export FFPA_DEV_HEADDIMS="64,128,192,256,320,512,768"
+      elif [[ "${2,,}" == "default" ]]; then
+        export FFPA_DEV_HEADDIMS="64,128,192,256,320,512"
       else
         export FFPA_DEV_HEADDIMS="$2"
       fi
+      shift 2 ;;
+    --stages)
+      require_value "$@"
+      export FFPA_BUILD_STAGES="$2"
+      shift 2 ;;
+    --debug-ext)
+      require_value "$@"
+      if [[ "${2,,}" == "none" ]]; then
+        export ENABLE_FFPA_BUILD_DEBUG=""
+      else
+        export ENABLE_FFPA_BUILD_DEBUG="$2"
+      fi
+      shift 2 ;;
+    --input-dtypes)
+      require_value "$@"
+      _input_fp16=0
+      IFS=', ' read -r -a _idt_toks <<< "$2"
+      for tok in "${_idt_toks[@]}"; do
+        tok="${tok,,}"
+        [[ -z "$tok" ]] && continue
+        case "$tok" in
+          fp16) _input_fp16=1 ;;
+          bf16) ;;  # always compiled; nothing to toggle
+          *) fail_usage "invalid --input-dtypes token '$tok' (allowed: fp16, bf16)" ;;
+        esac
+      done
+      export ENABLE_FFPA_CUDA_INPUT_FP16="$_input_fp16"
+      shift 2 ;;
+    --mask-dtypes)
+      require_value "$@"
+      _mask_fp32=0
+      IFS=', ' read -r -a _mdt_toks <<< "$2"
+      for tok in "${_mdt_toks[@]}"; do
+        tok="${tok,,}"
+        [[ -z "$tok" ]] && continue
+        case "$tok" in
+          fp32) _mask_fp32=1 ;;
+          fp16|bf16) ;;  # always compiled; nothing to toggle
+          *) fail_usage "invalid --mask-dtypes token '$tok' (allowed: fp16, bf16, fp32)" ;;
+        esac
+      done
+      export ENABLE_FFPA_CUDA_MASK_FP32="$_mask_fp32"
       shift 2 ;;
     -j|--jobs)
       require_value "$@"
@@ -145,9 +214,10 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-# headdim omitted -> default set (multiples of 64 in [320, 1024]).
+# headdim omitted -> same fixed set as --headdim default.
 if [[ "$HEADDIM_SET" == "0" ]]; then
-  unset FFPA_DEV_HEADDIMS
+  unset ENABLE_FFPA_ALL_HEADDIM
+  export FFPA_DEV_HEADDIMS="64,128,192,256,320,512"
 fi
 
 # Resolve --ext into ENABLE_FFPA_* switches (cute/tma live inside the _C ext).
@@ -228,8 +298,9 @@ else
   BUILD_CMD="python setup.py build_ext --inplace"
 fi
 echo "[build_fast] ENABLE_FFPA_CUDA_IMPL=${ENABLE_FFPA_CUDA_IMPL:-0}  ENABLE_FFPA_CUTE_EXT=${ENABLE_FFPA_CUTE_EXT:-0}  ENABLE_FFPA_TMA_EXT=${ENABLE_FFPA_TMA_EXT:-0}"
-echo "[build_fast] FFPA_BUILD_ARCH=${FFPA_BUILD_ARCH:-<auto from current device>}  FFPA_DEV_HEADDIMS=${FFPA_DEV_HEADDIMS:-<default: mults of 64 in [320,1024]>}  FFPA_EDITABLE=${FFPA_EDITABLE}"
+echo "[build_fast] FFPA_BUILD_ARCH=${FFPA_BUILD_ARCH:-<auto from current device>}  FFPA_DEV_HEADDIMS=${FFPA_DEV_HEADDIMS:-<default: 64,128,192,256,320,512>}  FFPA_BUILD_STAGES=${FFPA_BUILD_STAGES:-<default: '2,3'>}  FFPA_EDITABLE=${FFPA_EDITABLE}  ENABLE_FFPA_BUILD_DEBUG=${ENABLE_FFPA_BUILD_DEBUG:-<none>}"
 echo "[build_fast] MAX_JOBS=$MAX_JOBS  FFPA_NVCC_THREADS=$FFPA_NVCC_THREADS"
+echo "[build_fast] input-dtypes: bf16(+fp16 iff ENABLE_FFPA_CUDA_INPUT_FP16=${ENABLE_FFPA_CUDA_INPUT_FP16:-0})  mask-dtypes: fp16/bf16(+fp32 iff ENABLE_FFPA_CUDA_MASK_FP32=${ENABLE_FFPA_CUDA_MASK_FP32:-0})"
 echo "[build_fast] command: $BUILD_CMD${PASS_ARGS[*]:+ ${PASS_ARGS[*]}}"
 if [[ "$DRY_RUN" == "1" ]]; then
   echo "[build_fast] dry-run: exiting before any clean/build side effects."

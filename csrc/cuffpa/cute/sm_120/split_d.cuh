@@ -48,8 +48,9 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
   // the body into a no-op stub there. Body-level (not file-level) is required
   // because the host launcher references this kernel via <<<>>> and nvcc must
   // see its declaration in every device pass; hiding it file-level fails with
-  // "identifier undefined". Runtime safety: launch.cuh dispatches TMA kernels
-  // only when prop->major >= 9, so pre-90 devices never execute the stub.
+  // "identifier undefined". Runtime safety: launch/cute_fp16.cuh dispatches
+  // TMA kernels only when prop->major >= 9, so pre-90 devices never execute
+  // the stub.
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
   // Split-D Flash Attention forward (non-WS, CuTe TMA).
   //
@@ -524,12 +525,19 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
                            (long long)Nh_id * attn_bias_stride_h) *
                               ((attn_bias_dtype == 3) ? 2 : 1);
     const int n_u16 = (int)Nkv * ((attn_bias_dtype == 3) ? 2 : 1);
+    // Zero-fill the tail pad up to a whole kBc tile (tail tiles' bias
+    // injection reads tile-local offsets < kBc unclamped; the masking
+    // overrides the pad scores).
+    const int pad_u16 = (int)(((Nkv + kBc - 1) / kBc * kBc) - Nkv) *
+                        ((attn_bias_dtype == 3) ? 2 : 1);
     const int vec_end = n_u16 & ~7;
     for (int i = tid * 8; i < vec_end; i += kNumThreads * 8)
       *reinterpret_cast<uint4*>(bias_base + i) =
           *reinterpret_cast<const uint4*>(src + i);
     for (int i = vec_end + tid; i < n_u16; i += kNumThreads)
       bias_base[i] = src[i];
+    for (int i = n_u16 + tid; i < n_u16 + pad_u16; i += kNumThreads)
+      bias_base[i] = 0;
     __syncthreads();
   } else if constexpr (kHasAttnBias && kBiasMode != 0) {
     if (tid == 0 && Tc_eff > 0)
@@ -687,6 +695,11 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
       // should prefer the non-WS TMA fallback when bias/dropout is active;
       // these constexpr paths exist for correctness and future optimization
       // (e.g. vectorized bias load via TMA).
+      // Bias tail guards: rows/cols of this tile inside the real (Nq, Nkv)
+      // domain; the injector clamps pad rows/cols to these bounds (their scores
+      // are already -INFINITY or dropped by the O-write guards).
+      const int bias_q_valid = min(kBr, Nq - Br_base);
+      const int bias_kv_valid = min(kBc, Nkv - kv_tile * kBc);
       if constexpr (kHasAttnBias && kBiasMode != 0) {
         const int b_stg = kv_tile % kBiasStages;
         const int b_phase = (kv_tile / kBiasStages) & 1;
@@ -729,11 +742,21 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
             issue_bias_tma(kv_tile + 1);
         }
       } else if constexpr (kHasAttnBias) {
-        ffpa_cute::apply_attn_bias_rowcol<decltype(scores), decltype(tScS_rc),
-                                          kSRows, kSCols>(
-            scores, tScS_rc, attn_bias, attn_bias_dtype, attn_bias_stride_b,
-            attn_bias_stride_h, attn_bias_stride_m, attn_bias_stride_n, Nb_id,
-            Nh_id, Br_base, kv_tile, kBc, inv_scale);
+        const bool full_tile = bias_q_valid >= kBr && bias_kv_valid >= kBc;
+        if (__builtin_expect(full_tile, 1))
+          ffpa_cute::apply_attn_bias_rowcol<decltype(scores), decltype(tScS_rc),
+                                            kSRows, kSCols, false>(
+              scores, tScS_rc, attn_bias, attn_bias_dtype, attn_bias_stride_b,
+              attn_bias_stride_h, attn_bias_stride_m, attn_bias_stride_n, Nb_id,
+              Nh_id, Br_base, kv_tile, kBc, inv_scale, bias_q_valid,
+              bias_kv_valid);
+        else
+          ffpa_cute::apply_attn_bias_rowcol<decltype(scores), decltype(tScS_rc),
+                                            kSRows, kSCols, true>(
+              scores, tScS_rc, attn_bias, attn_bias_dtype, attn_bias_stride_b,
+              attn_bias_stride_h, attn_bias_stride_m, attn_bias_stride_n, Nb_id,
+              Nh_id, Br_base, kv_tile, kBc, inv_scale, bias_q_valid,
+              bias_kv_valid);
       }
 
       // Row-max + exp2 + row-sum (warp-level reduction via shfl_xor).

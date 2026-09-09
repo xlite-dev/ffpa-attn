@@ -7,7 +7,8 @@ stable: corruption pinned to a single (m-warp, n-warp, v-chunk) PV C tile.
 The language-level protocol audit closed clean and neither ptxas -O2 nor
 producer-warp relocation fixed it, so the launcher now pins the gmem
 direct-read mode (mode 0, stable on the cold/pure sequence) for this
-kernel; FFPA_BIAS_TILE_KEEP=1 restores the smem tile modes. RESIDUAL
+kernel; FFPA_BIAS_TILE_KEEP=1 restores the smem tile modes (debug builds
+only, ENABLE_FFPA_FP4_BUILD_DEBUG). RESIDUAL
 (accepted): a heavy GPU-work prelude still opens a low-probability
 instability window on the bias template even in mode 0 - load-timing
 sensitive, documented in RFC PC-0-5.

@@ -37,11 +37,19 @@ class ENV(object):
   # bounds in prefill.cuh. Default 4 (stages 1-4); >4 rarely pays off.
   FFPA_BUILD_MAX_STAGES = int(os.environ.get("FFPA_BUILD_MAX_STAGES", 4))
 
+  # Pipeline stages subset to compile: csv (e.g. "2,3") or "all"
+  # (= 1..FFPA_BUILD_MAX_STAGES). Highest priority, overrides
+  # ENABLE_FFPA_ALL_STAGES. When unset but ENABLE_FFPA_ALL_STAGES is
+  # explicitly set, the legacy semantics apply ("1" -> 1..max, "0" ->
+  # [1, 2]); when both are unset the default is "2,3" (out-of-set runtime
+  # requests are clamped by the generated wrapper, so s1 needs no TU).
+  FFPA_BUILD_STAGES = os.environ.get("FFPA_BUILD_STAGES", "")
+
   # Enable all headdims for FFPA kernels or not, default False.
   # True, headdim will range from 64 to 1024 with step = 64, range(64, 1024, 64)
-  # False, headdim will range from 320 to 1024 with step = 64, range(320, 1024, 64)
-  # (multiples of 64, headdim >= 320). Pass other headdims via FFPA_DEV_HEADDIMS /
-  # `build_fast.sh --headdim`.
+  # False, headdim defaults to the fixed set 64,128,192,256,320,512 (same as
+  # `build_fast.sh --headdim default`). Pass other headdims via FFPA_DEV_HEADDIMS
+  # / `build_fast.sh --headdim`.
   ENABLE_FFPA_ALL_HEADDIM = bool(
     int(os.environ.get("ENABLE_FFPA_ALL_HEADDIM", 0))
   )
@@ -53,6 +61,23 @@ class ENV(object):
   # error. The kernel template code itself is unchanged (gating is at the
   # generation/dispatch layer only).
   ENABLE_FFPA_F16_ACC = bool(int(os.environ.get("ENABLE_FFPA_F16_ACC", 0)))
+
+  # Compile fp16-input kernels (fp16f32 / fp16f16 native + every cute
+  # family's fp16 token TUs). Default 0: bf16-input-only halves the forward
+  # TU count. The C++/Python dispatch raises a clear "rebuild with
+  # ENABLE_FFPA_CUDA_INPUT_FP16=1" error for fp16 queries when disabled.
+  ENABLE_FFPA_CUDA_INPUT_FP16 = bool(
+    int(os.environ.get("ENABLE_FFPA_CUDA_INPUT_FP16", 0))
+  )
+
+  # Compile fp32 attn_mask variants (f=1 tag axis) for the cute fp16/fp8/fp4
+  # families. Default 0: only fp16/bf16 masks are compiled; the Python layer
+  # downcasts fp32 masks to query.dtype before the CUDA entry, and the C++
+  # wrappers raise a clear "rebuild with ENABLE_FFPA_CUDA_MASK_FP32=1" error
+  # if an fp32 mask still reaches them.
+  ENABLE_FFPA_CUDA_MASK_FP32 = bool(
+    int(os.environ.get("ENABLE_FFPA_CUDA_MASK_FP32", 0))
+  )
 
   # Enable force Q@K^T use fp16 as MMA Acc dtype for FFPA Acc F32 kernels, default False.
   # FFPA Acc F32 kernels MMA Acc = Mixed Q@K^T MMA Acc F16 + P@V MMA Acc F32.
@@ -168,6 +193,13 @@ class ENV(object):
   # fast iteration. Empty (default) means use the full set from
   # ``ENABLE_FFPA_ALL_HEADDIM``.
   FFPA_DEV_HEADDIMS = os.environ.get("FFPA_DEV_HEADDIMS", "")
+
+  # Compile per-family debug dispatch knobs (e.g. FFPA_FP8_FORCE_KERNEL,
+  # FFPA_DROPOUT_BITMAP_DISABLE). Comma separated subset of {fp16,fp8,fp4}
+  # or "all"; each enabled family expands to -DENABLE_FFPA_<FAM>_BUILD_DEBUG.
+  # Empty (default) strips every debug getenv branch from the production
+  # build, which also removes the FORCE_KERNEL dual template instantiation.
+  ENABLE_FFPA_BUILD_DEBUG = os.environ.get("ENABLE_FFPA_BUILD_DEBUG", "")
 
   @classmethod
   def project_dir(cls):
@@ -296,6 +328,45 @@ class ENV(object):
     return cls.ENABLE_FFPA_F16_ACC
 
   @classmethod
+  def enable_cuda_input_fp16(cls):
+    return cls.ENABLE_FFPA_CUDA_INPUT_FP16
+
+  @classmethod
+  def enable_cuda_mask_fp32(cls):
+    return cls.ENABLE_FFPA_CUDA_MASK_FP32
+
+  @classmethod
+  def build_debug_families(cls):
+    """Parse ``ENABLE_FFPA_BUILD_DEBUG`` into a set of family tokens.
+
+    :returns: Subset of ``{'fp16', 'fp8', 'fp4'}``; ``all`` expands to the
+        full set, empty (default) to the empty set.
+    :raises RuntimeError: if the value contains an unknown family token.
+    """
+    toks = {
+      t.strip().lower()
+      for t in re.split(r"[;,\s]+", cls.ENABLE_FFPA_BUILD_DEBUG) if t.strip()
+    }
+    unknown = toks - {"fp16", "fp8", "fp4", "all"}
+    if unknown:
+      raise RuntimeError(
+        f"ENABLE_FFPA_BUILD_DEBUG={cls.ENABLE_FFPA_BUILD_DEBUG!r} contains "
+        f"unknown families {sorted(unknown)}, expected fp16/fp8/fp4/all."
+      )
+    if "all" in toks:
+      return {"fp16", "fp8", "fp4"}
+    return toks
+
+  @classmethod
+  def enable_build_debug(cls, family: str) -> bool:
+    """Whether debug dispatch knobs are compiled for one kernel family.
+
+    :param family: One of ``'fp16'``, ``'fp8'``, ``'fp4'``.
+    :returns: True when ``ENABLE_FFPA_BUILD_DEBUG`` selects this family.
+    """
+    return family in cls.build_debug_families()
+
+  @classmethod
   def env_cuda_cflags(cls):
     extra_env_cflags = []
     if cls.enable_all_mutistages():
@@ -331,10 +402,17 @@ class ENV(object):
       extra_env_cflags.append("-DENABLE_FFPA_CUDA_IMPL")
     if cls.enable_f16_acc():
       extra_env_cflags.append("-DENABLE_FFPA_F16_ACC")
+    if cls.enable_cuda_input_fp16():
+      extra_env_cflags.append("-DENABLE_FFPA_CUDA_INPUT_FP16")
+    if cls.enable_cuda_mask_fp32():
+      extra_env_cflags.append("-DENABLE_FFPA_CUDA_MASK_FP32")
     if cls.enable_tma_ext():
       extra_env_cflags.append("-DENABLE_FFPA_TMA_EXT")
     if cls.enable_cute_ext():
       extra_env_cflags.append("-DENABLE_FFPA_CUTE_EXT")
+    for family in ("fp16", "fp8", "fp4"):
+      if cls.enable_build_debug(family):
+        extra_env_cflags.append(f"-DENABLE_FFPA_{family.upper()}_BUILD_DEBUG")
 
     # Debug/profiling pass-through: extra -D defines for nvcc.
     for d in os.environ.get("FFPA_NVCC_DEFINES", "").split(","):
@@ -350,6 +428,12 @@ class ENV(object):
       extra_gcc_flags.append("-DENABLE_FFPA_CUDA_IMPL")
     if cls.enable_f16_acc():
       extra_gcc_flags.append("-DENABLE_FFPA_F16_ACC")
+    # Expose the input-dtype / mask-dtype compile sets to the pybind TU
+    # (ffpa_api.cc): dispatch guards and the *_AVAILABLE attrs reflect them.
+    if cls.enable_cuda_input_fp16():
+      extra_gcc_flags.append("-DENABLE_FFPA_CUDA_INPUT_FP16")
+    if cls.enable_cuda_mask_fp32():
+      extra_gcc_flags.append("-DENABLE_FFPA_CUDA_MASK_FP32")
     # Expose TMA/CUTE ext macros to the .cc pybind TU (ffpa_api.cc) so the
     # CUDA_CUTE_TMA_AVAILABLE attr guard reflects the actual build config.
     if cls.enable_tma_ext():
@@ -378,13 +462,19 @@ class ENV(object):
     formatenv(
       "FFPA_DEV_HEADDIMS", cls.FFPA_DEV_HEADDIMS or (
         "range(64, 1024, 64)"
-        if cls.enable_all_headdim() else "range(320, 1024, 64)"
+        if cls.enable_all_headdim() else "64,128,192,256,320,512"
       )
     )
     formatenv("ENABLE_FFPA_ALL_STAGES", cls.enable_all_mutistages())
     formatenv("FFPA_BUILD_MAX_STAGES", cls.FFPA_BUILD_MAX_STAGES)
+    formatenv(
+      "FFPA_BUILD_STAGES",
+      ",".join(str(s) for s in cls._enabled_stages()),
+    )
     formatenv("ENABLE_FFPA_ALL_HEADDIM", cls.enable_all_headdim())
     formatenv("ENABLE_FFPA_F16_ACC", cls.enable_f16_acc())
+    formatenv("ENABLE_FFPA_CUDA_INPUT_FP16", cls.enable_cuda_input_fp16())
+    formatenv("ENABLE_FFPA_CUDA_MASK_FP32", cls.enable_cuda_mask_fp32())
     formatenv("ENABLE_FFPA_PREFETCH_QKV", cls.enable_prefetch_qkv())
     formatenv("ENABLE_FFPA_FORCE_QK_F16", cls.enable_force_qk_fp16())
     formatenv("ENABLE_FFPA_FORCE_PV_F16", cls.enable_force_pv_fp16())
@@ -399,6 +489,10 @@ class ENV(object):
     formatenv("ENABLE_FFPA_CUDA_IMPL", cls.enable_cuda_impl())
     formatenv("ENABLE_FFPA_TMA_EXT", cls.enable_tma_ext())
     formatenv("ENABLE_FFPA_CUTE_EXT", cls.enable_cute_ext())
+    formatenv(
+      "ENABLE_FFPA_BUILD_DEBUG",
+      ",".join(sorted(cls.build_debug_families())) or "none",
+    )
     _logging_msg()
 
   @staticmethod
@@ -419,7 +513,8 @@ class ENV(object):
 
     Priority order: ``FFPA_DEV_HEADDIMS`` (explicit subset for fast
     iteration) -> ``ENABLE_FFPA_ALL_HEADDIM`` (multiples of 64 in
-    ``[64, 1024]``) -> default (multiples of 64 in ``[320, 1024]``).
+    ``[64, 1024]``) -> default (the fixed set 64,128,192,256,320,512,
+    same as ``build_fast.sh --headdim default``).
 
     :returns: Sorted list of ``int`` headdim values.
     :raises RuntimeError: if ``FFPA_DEV_HEADDIMS`` parses to an empty list.
@@ -440,7 +535,7 @@ class ENV(object):
       return sorted(subset)
     if cls.enable_all_headdim():
       return list(range(64, 1025, 64))
-    return list(range(320, 1025, 64))
+    return [64, 128, 192, 256, 320, 512]
 
   @classmethod
   def generated_sources_dir(cls):
@@ -453,21 +548,149 @@ class ENV(object):
       f.write(content)
 
   @classmethod
+  def _render_tu_naming_doc(cls) -> str:
+    """Markdown reference for every generated TU filename under generated/."""
+    return """\
+# Generated TU naming reference
+
+Every file under `csrc/cuffpa/generated/` is auto-generated by `env.py`
+(wiped and rewritten per build config). This note decodes the fields.
+
+## Wrapper / family TUs
+
+| Pattern | Meaning |
+|---|---|
+| `fwd_decls.h` | stage-entry declarations shared by the wrapper TUs |
+| `fwd_dispatch.cu` | top-level headdim/stage dispatch (the only public symbol table) |
+| `fwd_{fp16\\|bf16}_native_hdim{d}.cu` | lightweight wrapper: runtime `stages` -> stage entry `ffpa_attn_fwd_{variant}_d{d}_s{s}` (clamped to the compiled set); the filename token drops the `f32` acc suffix (`fp16f16` keeps its full name), the symbols keep the full variant name (ABI) |
+| `fwd_{fp16\\|bf16}_native_hdim{d}_s{s}.cu` | native family TU: stage entry + `ffpa_fwd_native_sm80` / `ffpa_fwd_native_tma` instantiations |
+| `fwd_{token}_cute_fp16_hdim{d}_s{s}.cu` | CuTe fp16 family TU (`ffpa_fwd_cute_fp16` / `_sm80` + hybrid stage-1 entries) |
+| `fwd_{token}_cute_fp8_hdim{d}_s{s}.cu` | fp8 family TU: `ffpa_fwd_fp8` entry (wrapper shell only; kernel tables live in the variant TUs below) |
+| `fwd_{token}_cute_fp4_hdim{d}.cu` | fp4 family TU: `ffpa_fwd_fp4` for every compiled stage (fp4 ignores kStage, one TU per (dtype, d)) |
+| `fwd_cute_fp8_preprocess.cu/.cuh` | single definition site of `prepare_fp8_inputs`; the .cuh carries extern declarations for the family TUs |
+| `fwd_cute_fp4_preprocess.cu/.cuh` | single definition site of the dtype-agnostic `launch_fp4_quant_*` helpers |
+| `fwd_cute_fp8_variants.cuh` | extern-template table of every fp8 variant entry (included from the tail of `launch/cute_fp8.cuh`) |
+| `fwd_cute_fp4_variants.cuh` | extern-template table of every fp4 variant entry (included from the tail of `launch/cute_fp4.cuh`) |
+| `fwd_cute_fp16_variants.cuh` | extern-template table of every fp16 variant entry (included from the tail of `launch/cute_fp16.cuh`) |
+
+`{variant}` (dispatch symbols) is the input/accumulator combo: `fp16f16`,
+`fp16f32`, `bf16f32`. `{token}` is the input dtype token: `fp16` or `bf16`
+(fp16f16/fp16f32 share the `fp16` TUs; the native TUs likewise use the
+token filenames). `{d}` = head dim, `{s}` = pipeline stages (kStage, 2/3).
+
+Default builds compile the bf16-input set only (`fp16f32` / `fp16f16`
+need `ENABLE_FFPA_CUDA_INPUT_FP16=1`) and drop every `f{f}=1` variant TU
+(fp32 attn_mask needs `ENABLE_FFPA_CUDA_MASK_FP32=1`; the Python layer
+downcasts fp32 masks to query.dtype otherwise).
+
+## fp8 variant TUs (one kernel table per TU)
+
+Pattern: `fwd_{token}_cute_fp8_{impl}_hdim{d}_s{s}_q{q}_b{b}m{m}f{f}.cu`
+
+Example: `fwd_fp16_cute_fp8_persist_hdim128_s3_q1_b1m3f0.cu` = fp16 input,
+persist-D kernel, D=128, 3 stages, int8 QK MMA, with attn_bias, resident
+row-vector bias mode, 2-byte bias elements.
+
+| Field | Values | Meaning |
+|---|---|---|
+| `{impl}` | `persist` / `split` / `m4n2` | kernel family: persist-D, split-D M8N1, split-D M4N2 TiledMMA |
+| `q{q}` | `0` / `1` | `kQKInt8`: QK^T MMA type - 1 = int8 MMA + int32 acc, 0 = fp8 MMA |
+| `b{b}` | `0` / `1` | `kBiasOn`: 1 = an attn_bias tensor is present (kernel compiled with bias plumbing) |
+| `m{m}` | `0..3` | `kBiasPlanMode`: bias tile mode - 0 = gmem-direct fallback (no TMA), 1 = dense [kBr,kBc] TMA tile, 2 = row-broadcast TMA ([1,Nkv]), 3 = resident row vector in smem |
+| `f{f}` | `0` / `1` | `kBias4BytesPerElem`: bias element width - 1 = 4 bytes (fp32), 0 = 2 bytes (fp16/bf16) |
+
+The runtime wrapper computes the final plan once (single-source
+`ffpa::fp8_{impl}_bias_plan`) and dispatches to the matching compile-time
+tag, so each TU instantiates exactly one kernel table. Not every
+(impl, m) combination exists: the plan demotes per impl/D (e.g. split_d
+never yields mode 1; D>=512 never yields mode 2) - see `_fp8_impl_variants`
+in `env.py` for the exact production windows.
+
+## fp4 variant TUs (one kernel table per TU)
+
+Pattern: `fwd_{token}_cute_fp4_{impl}_hdim{d}_p{p}_b{b}m{m}f{f}.cu`
+
+Example: `fwd_fp16_cute_fp4_persist_hdim128_p1_b1m3f0.cu` = fp16 input,
+persist-D NVFP4 kernel, D=128, MXFP8 PV MMA, with attn_bias, resident
+row-vector bias mode, 2-byte bias elements. (No `{s}` field: fp4
+launchers fix their stage count, so one TU per (dtype, d, tag).)
+
+| Field | Values | Meaning |
+|---|---|---|
+| `{impl}` | `persist` / `split` / `m4n2` | kernel family: persist-D (D<=256), split-D M8N1 (256<D<768), split-D M4N2 (768<=D<=1024) |
+| `p{p}` | `0` / `1` | `kPvMxfp8`: PV MMA dtype - 1 = MXFP8 PV (persist D<=192 and split only; m4n2 is NVFP4-only), 0 = NVFP4 PV |
+| `b{b}` | `0` / `1` | `kBiasOn`: 1 = an attn_bias tensor is present (kernel compiled with bias plumbing) |
+| `m{m}` | `0..3` | `kBiasPlanMode`: bias tile mode - 0 = gmem-direct fallback (no TMA), 1 = dense [kBr,kBc] TMA tile, 2 = row-broadcast TMA ([1,Nkv]), 3 = resident row vector in smem |
+| `f{f}` | `0` / `1` | `kBias4BytesPerElem`: bias element width - 1 = 4 bytes (fp32), 0 = 2 bytes (fp16/bf16) |
+
+Same single-source dispatch contract as fp8 (`ffpa::fp4_{impl}_bias_plan`),
+with two fp4 specifics: the m4n2 plan pins mode 0 in regular builds
+(PC-0-5; mode 2 survives only in ENABLE_FFPA_BUILD_DEBUG=fp4 builds behind
+FFPA_BIAS_TILE_KEEP), and the persist plan keeps the mode-1 dense tile
+(m4n2 demotes it). See `_fp4_impl_variants` in `env.py`.
+
+## fp16 variant TUs (one kernel table per TU)
+
+Pattern: `fwd_{token}_cute_fp16_{impl}_hdim{d}_s{s}_b{b}m{m}f{f}r{r}.cu`
+
+Example: `fwd_fp16_cute_fp16_split_hdim512_s3_b1m3f1r1.cu` = fp16 input,
+split-D kernel, D=512, 3 stages, with attn_bias, resident row-vector bias
+mode, 4-byte (fp32) bias elements, compiled with dropout plumbing.
+
+| Field | Values | Meaning |
+|---|---|---|
+| `{impl}` | `persist` / `split` / `m4n2` | kernel family: persist-D (D%32==0, 32<=D<=256, no mode 3), split-D (D%32==0, 128<D<768), split-D M4N2 (D%64==0, 768<=D<=1024) |
+| `b{b}` | `0` / `1` | `kBiasOn`: 1 = an attn_bias tensor is present (kernel compiled with bias plumbing) |
+| `m{m}` | `0..3` | `kBiasPlanMode`: bias tile mode - 0 = gmem-direct fallback (no TMA), 1 = dense [kBr,kBc] TMA tile, 2 = row-broadcast TMA ([1,Nkv]), 3 = resident row vector in smem |
+| `f{f}` | `0` / `1` | `kBias4BytesPerElem`: bias element width - 1 = 4 bytes (fp32), 0 = 2 bytes (fp16/bf16) |
+| `r{r}` | `0` / `1` | `kHasDropout`: 1 = compiled with dropout plumbing (Philox keep-mask, optionally the smem bitmap path), dispatched when dropout_p > 0 |
+
+Same single-source dispatch contract as fp8/fp4
+(`ffpa::fp16_{impl}_bias_plan`). Unlike fp8/fp4, dropout is a template
+axis here (the bitmap path is compile-time), so every (b, m, f) tag pairs
+with r in {0, 1}. See `_fp16_impl_variants` in `env.py`.
+"""
+
+  @classmethod
   def generate_split_headdim_sources(cls, build_pkg: bool = False):
     """Generate per-(variant, headdim, stage) TUs under ``csrc/cuffpa/generated/``.
 
     Layout (variant ∈ {fp16f16 (only with ENABLE_FFPA_F16_ACC), fp16f32,
-    bf16f32}):
+    bf16f32}; dtype token ∈ {fp16, bf16}; fp16-input variants need
+    ENABLE_FFPA_CUDA_INPUT_FP16, default builds are bf16-only):
 
-    - ``fwd_<variant>_hdim{d}.cu``: lightweight wrapper TU. Includes only
-      ``fwd_decls.h`` (NOT ``launch.cuh``); dispatches on ``stages`` to the
-      per-stage symbols ``ffpa_attn_fwd_<variant>_d{d}_s{s}``. Keeps the
-      original dispatch symbol name so ``fwd_dispatch.cu`` / ``ffpa_api.cc``
-      are untouched.
-    - ``fwd_<variant>_hdim{d}_s{s}.cu``: heavy TU. Includes ``launch.cuh``
-      and contains a single ``launch_ffpa_attn_fwd_template`` instantiation
-      per stage, so ``MAX_JOBS`` parallelism is no longer bottlenecked by a
-      single TU serially compiling all stages.
+    - ``fwd_<variant>_native_hdim{d}.cu``: lightweight wrapper TU. Includes
+      only ``fwd_decls.h`` (NOT ``launch/router.cuh``); dispatches on ``stages``
+      to the per-stage symbols ``ffpa_attn_fwd_<variant>_d{d}_s{s}``,
+      clamping out-of-set requests to the nearest compiled stage
+      (s > max -> max, s < min -> min). Keeps the original dispatch symbol
+      name so ``fwd_dispatch.cu`` / ``ffpa_api.cc`` are untouched.
+    - ``fwd_<variant>_native_hdim{d}_s{s}.cu``: native family TU
+      (``dispatch/native_fp16.cuh`` + ``launch/router.cuh``): the variant's
+      stage entry (a single ``launch_ffpa_attn_fwd_template``
+      instantiation routing to the family entries) plus the explicit
+      instantiation of ``ffpa_fwd_native_sm80`` / ``ffpa_fwd_native_tma``
+      with the variant-dependent QK/PV constexprs.
+    - ``fwd_<dtype>_cute_fp16_hdim{d}_s{s}.cu`` (ENABLE_FFPA_CUTE_EXT):
+      cute_fp16 family TU (``dispatch/cute_fp16.cuh``): explicit instantiation
+      of ``ffpa_fwd_cute_fp16``, ``ffpa_fwd_cute_fp16_sm80`` and the hybrid
+      stage-1 entries (kPersistMaxD 224/256); keyed by dtype so fp16f16
+      and fp16f32 share one __half TU (duplicate explicit instantiation
+      would be a compile error).
+    - ``fwd_<dtype>_cute_fp8_hdim{d}_s{s}.cu`` (ENABLE_FFPA_TMA_EXT):
+      cute_fp8 family TU (``dispatch/cute_fp8.cuh``): explicit
+      instantiation of ``ffpa_fwd_fp8``.
+    - ``fwd_<dtype>_cute_fp4_hdim{d}.cu`` (ENABLE_FFPA_TMA_EXT): cute_fp4
+      family TU (``dispatch/cute_fp4.cuh``): a single TU per (dtype, d)
+      instantiating
+      ``ffpa_fwd_fp4`` for every compiled stage (the fp4 entry ignores
+      kStage, so the kernel templates codegen once inside the TU).
+    - ``fwd_cute_fp8_preprocess.cu`` / ``fwd_cute_fp4_preprocess.cu``
+      (+ same-name ``.cuh`` declaration tables, ENABLE_FFPA_TMA_EXT):
+      the single definition sites for the stage/dtype-independent
+      preprocessing chains (``prepare_fp8_inputs`` and the dtype-agnostic
+      ``launch_fp4_quant_*`` helpers); family TUs see extern-template
+      declarations from the ``.cuh`` and skip re-instantiation.
 
     The generated dir is wiped and rewritten on every call so stale files
     from a previous config never leak into the build. It is gitignored.
@@ -487,30 +710,24 @@ class ENV(object):
       shutil.rmtree(gen_dir, ignore_errors=True)
       os.makedirs(gen_dir, exist_ok=True)
 
-      stages = cls._enabled_stages()
-      variants = cls._enabled_variants()
-
       decls_path = os.path.join(gen_dir, "fwd_decls.h")
       cls._write_file(decls_path, cls._render_decls_header(headdims))
       generated.append(decls_path)
 
-      for d in headdims:
-        for variant, t_in, prefix in variants:
-          wrapper_path = os.path.join(gen_dir, f"fwd_{variant}_hdim{d}.cu")
-          cls._write_file(wrapper_path, cls._render_wrapper_tu(variant, d))
-          generated.append(wrapper_path)
-          for s in stages:
-            stage_path = os.path.join(gen_dir, f"fwd_{variant}_hdim{d}_s{s}.cu")
-            cls._write_file(
-              stage_path, cls._render_stage_tu(variant, t_in, prefix, d, s)
-            )
-            generated.append(stage_path)
-          fwd_generated_count += 1 + len(stages)
+      for name, content in cls._iter_generated_tus(headdims):
+        path = os.path.join(gen_dir, name)
+        cls._write_file(path, content)
+        generated.append(path)
 
       dispatch_path = os.path.join(gen_dir, "fwd_dispatch.cu")
       cls._write_file(dispatch_path, cls._render_dispatch_tu(headdims))
       generated.append(dispatch_path)
-      fwd_generated_count += 1
+      fwd_generated_count = sum(1 for p in generated if p.endswith(".cu"))
+
+      # Not a build input: a naming reference for the generated TUs.
+      cls._write_file(
+        os.path.join(gen_dir, "tu_naming.md"), cls._render_tu_naming_doc()
+      )
 
     if build_pkg:
       _logging_msg(
@@ -549,20 +766,71 @@ class ENV(object):
   def _enabled_stages(cls):
     """Return the stage values to instantiate for the current build config.
 
-    ``ENABLE_FFPA_ALL_STAGES=1`` → ``1..FFPA_BUILD_MAX_STAGES``; ``=0`` →
-    ``[1, 2]``. Stage 1 is always present (runtime fallback).
+    Priority: explicit ``FFPA_BUILD_STAGES`` (csv subset or ``all`` =
+    ``1..FFPA_BUILD_MAX_STAGES``) first; else an explicitly set
+    ``ENABLE_FFPA_ALL_STAGES`` keeps the legacy semantics (``1`` ->
+    ``1..max``, ``0`` -> ``[1, 2]``); both unset -> the ``[2, 3]``
+    default. Out-of-set runtime requests are clamped by the generated
+    wrapper (nearest compiled stage), so s1 no longer needs a TU.
+
+    :returns: Sorted list of ``int`` stage values.
+    :raises RuntimeError: if ``FFPA_BUILD_STAGES`` parses to an empty list
+      or contains a stage outside ``[1, FFPA_BUILD_MAX_STAGES]``.
     """
-    if cls.enable_all_mutistages():
-      return list(range(1, cls.FFPA_BUILD_MAX_STAGES + 1))
-    return [1, 2]
+    raw = cls.FFPA_BUILD_STAGES.strip()
+    if raw:
+      if raw.lower() == "all":
+        return list(range(1, cls.FFPA_BUILD_MAX_STAGES + 1))
+      stages = []
+      for tok in re.split(r"[;,\s]+", raw):
+        if not tok:
+          continue
+        s = int(tok)
+        if not 1 <= s <= cls.FFPA_BUILD_MAX_STAGES:
+          raise RuntimeError(
+            f"FFPA_BUILD_STAGES={raw!r}: stage {s} out of range "
+            f"[1, {cls.FFPA_BUILD_MAX_STAGES}]."
+          )
+        if s not in stages:
+          stages.append(s)
+      if not stages:
+        raise RuntimeError(
+          f"FFPA_BUILD_STAGES={raw!r} parsed to an empty stage list."
+        )
+      return sorted(stages)
+    if "ENABLE_FFPA_ALL_STAGES" in os.environ:
+      if cls.enable_all_mutistages():
+        return list(range(1, cls.FFPA_BUILD_MAX_STAGES + 1))
+      return [1, 2]
+    return [2, 3]
 
   @classmethod
   def _enabled_variants(cls):
     """Return ``(variant, t_in, constexpr_prefix)`` tuples to generate.
 
-    fp16f16 is prepended only when ``ENABLE_FFPA_F16_ACC`` is on; the fp16f32
-    / bf16f32 paths are always generated.
+    fp16f16 is prepended only when ``ENABLE_FFPA_F16_ACC`` is on. fp16-input
+    variants (fp16f32, fp16f16) are generated only when
+    ``ENABLE_FFPA_CUDA_INPUT_FP16`` is on; default builds compile bf16-input
+    kernels only (halves the forward TU count) and the dispatch layer raises
+    a clear rebuild error for fp16 queries.
+
+    :raises RuntimeError: if ``ENABLE_FFPA_F16_ACC`` is combined with both
+      ``ENABLE_FFPA_FORCE_QK_F16`` and ``ENABLE_FFPA_FORCE_PV_F16`` (the
+      docs mark them mutually exclusive; with both forced, fp16f32 and
+      fp16f16 collapse to the same QK=0/PV=0 template ids and the native
+      family TUs would emit duplicate explicit instantiations).
     """
+    if (
+      cls.enable_f16_acc() and cls.ENABLE_FFPA_FORCE_QK_F16
+      and cls.ENABLE_FFPA_FORCE_PV_F16
+    ):
+      raise RuntimeError(
+        "ENABLE_FFPA_F16_ACC cannot be combined with both "
+        "ENABLE_FFPA_FORCE_QK_F16 and ENABLE_FFPA_FORCE_PV_F16: fp16f16 and "
+        "fp16f32 would resolve to identical template ids (QK=0, PV=0)."
+      )
+    if not cls.enable_cuda_input_fp16():
+      return [("bf16f32", "__nv_bfloat16", cls._BF16F32_PREFIX)]
     variants = [
       ("fp16f32", "__half", cls._FP16F32_PREFIX),
       ("bf16f32", "__nv_bfloat16", cls._BF16F32_PREFIX),
@@ -660,10 +928,13 @@ class ENV(object):
   def _render_wrapper_dispatch(cls, variant: str, d: int) -> str:
     """Render the ``if (stages == s) {...}`` chain calling per-stage symbols.
 
-    Stage 1 is the fallback (covers ``stages == 1`` and any out-of-range
-    value), mirroring the legacy dispatch semantics.
+    Out-of-set requests clamp to the nearest compiled stage: ``stages >
+    max(S)`` -> ``max(S)`` (the last exact branch renders as ``>=``), and
+    anything below ``min(S)`` falls through to ``min(S)``. This replaces
+    the legacy "always fall back to s1" chain, so s1 needs no dedicated
+    TU unless it is in the compiled set.
     """
-    branches = [s for s in cls._enabled_stages() if s != 1]
+    stages = sorted(cls._enabled_stages())
     call = (
       "Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale, "
       "dropout_p, philox_seed, philox_offset, fp8_smooth_k, fp8_smooth_v, "
@@ -672,16 +943,17 @@ class ENV(object):
       "fp4_hybrid, fp4_hybrid_n_early, fp8_hadamard, fp4_hadamard, "
       "fp4_pv_mm_type, fp4_smooth_v"
     )
-    if not branches:
-      return f"  ffpa_attn_fwd_{variant}_d{d}_s1({call});\n"
+    if len(stages) == 1:
+      return f"  ffpa_attn_fwd_{variant}_d{d}_s{stages[0]}({call});\n"
     lines = []
-    for i, s in enumerate(branches):
+    for i, s in enumerate(stages):
       kw = "if" if i == 0 else "else if"
-      lines.append(f"  {kw} (stages == {s}) {{")
+      op = ">=" if s == stages[-1] else "=="
+      lines.append(f"  {kw} (stages {op} {s}) {{")
       lines.append(f"    ffpa_attn_fwd_{variant}_d{d}_s{s}({call});")
       lines.append("  }")
     lines.append("  else {")
-    lines.append(f"    ffpa_attn_fwd_{variant}_d{d}_s1({call});")
+    lines.append(f"    ffpa_attn_fwd_{variant}_d{d}_s{stages[0]}({call});")
     lines.append("  }")
     return "\n".join(lines) + "\n"
 
@@ -695,13 +967,165 @@ class ENV(object):
       cls._render_wrapper_dispatch(variant, d) + "}\n"
     )
 
+  # Filename token per input dtype for the dtype-keyed family TUs
+  # (cute_fp16/cute_fp8/cute_fp4). fp16f16 and fp16f32 share the __half TU.
+  _DTYPE_TOKENS = {
+    "__half": "fp16",
+    "__nv_bfloat16": "bf16",
+  }
+
   @classmethod
-  def _render_stage_tu(
+  def _iter_generated_tus(cls, headdims):
+    """Yield ``(filename, content)`` for every generated forward TU.
+
+    Wrappers / native family TUs (stage entry + native sm80/tma) are
+    keyed by (variant, d, s) - the native entries take the
+    variant-dependent QK/PV constexprs. cute_fp16/cute_fp8/cute_fp4
+    family TUs are keyed by dtype only (a duplicate explicit
+    instantiation across TUs is a compile error) and are macro-gated:
+    CUTE ext for cute_fp16, TMA ext for cute_fp8/cute_fp4. The
+    fp4 entry ignores kStage, so one TU per (dtype, d) covers all
+    compiled stages.
+    """
+    stages = cls._enabled_stages()
+    variants = cls._enabled_variants()
+    if cls.enable_tma_ext():
+      # Shared fp8 preprocessing TU: defines the prepare_fp8_inputs
+      # instances once; the same header carries extern-template
+      # declarations for every family TU (see launch/cute_fp8.cuh).
+      yield (
+        "fwd_cute_fp8_preprocess.cuh",
+        cls._render_fp8_preprocess_instances(
+          headdims, [t_in for _, t_in, _ in variants]
+        ),
+      )
+      yield ("fwd_cute_fp8_preprocess.cu", cls._render_fp8_preprocess_tu())
+      # Shared fp8 variant header + one TU per (dtype, d, s, tag) kernel
+      # table: the family TUs' s2/s3 single-TU time collapses into small
+      # parallel variants (see launch/cute_fp8.cuh wrapper dispatch).
+      # fp16f16/fp16f32 share the __half variant TUs (same dedup as the
+      # family TUs; a duplicate explicit instantiation is a compile error).
+      dtypes = list(dict.fromkeys(t_in for _, t_in, _ in variants))
+      yield (
+        "fwd_cute_fp8_variants.cuh",
+        cls._render_fp8_variants_header(headdims, dtypes),
+      )
+      for t_in, impl, func, d, s, tag in cls._iter_fp8_variant_combos(
+        headdims, dtypes
+      ):
+        q, b, m, f = tag
+        yield (
+          f"fwd_{cls._DTYPE_TOKENS[t_in]}_cute_fp8_{impl}_hdim{d}_s{s}"
+          f"_q{q}_b{b}m{m}f{f}.cu",
+          cls._render_fp8_variant_tu(t_in, impl, func, d, s, tag),
+        )
+      # Shared fp4 quantize TU: the dtype-agnostic launch_ helpers are
+      # identical across the fp16/bf16 family TUs; defined once here and
+      # extern-declared for the family TUs (see launch/cute_fp4.cuh).
+      yield (
+        "fwd_cute_fp4_preprocess.cuh",
+        cls._render_fp4_preprocess_instances(headdims),
+      )
+      yield ("fwd_cute_fp4_preprocess.cu", cls._render_fp4_preprocess_tu())
+      # Shared fp4 variant header + one TU per (dtype, d, tag) kernel
+      # table (no stage axis: the fp4 launchers fix their stage count);
+      # the family TUs' single-TU time collapses into small parallel
+      # variants (see launch/cute_fp4.cuh wrapper dispatch).
+      yield (
+        "fwd_cute_fp4_variants.cuh",
+        cls._render_fp4_variants_header(headdims, dtypes),
+      )
+      for t_in, impl, func, d, tag in cls._iter_fp4_variant_combos(
+        headdims, dtypes
+      ):
+        p, b, m, f = tag
+        yield (
+          f"fwd_{cls._DTYPE_TOKENS[t_in]}_cute_fp4_{impl}_hdim{d}"
+          f"_p{p}_b{b}m{m}f{f}.cu",
+          cls._render_fp4_variant_tu(t_in, impl, func, d, tag),
+        )
+      # Shared fp16 variant header + one TU per (dtype, d, s, tag): the
+      # cute_fp16 family TUs' single-TU kernel table (every impl, every
+      # tag, incl. the sm80 entry) collapses into small parallel variants
+      # (see launch/cute_fp16.cuh wrapper dispatch). Needs both exts (the
+      # per-impl headers are double-gated); the family TUs alone are
+      # CUTE_EXT-only.
+      if cls.enable_cute_ext():
+        yield (
+          "fwd_cute_fp16_variants.cuh",
+          cls._render_fp16_variants_header(headdims, dtypes),
+        )
+        for t_in, impl, func, d, s, tag in cls._iter_fp16_variant_combos(
+          headdims, dtypes
+        ):
+          b, m, f, r = tag
+          yield (
+            f"fwd_{cls._DTYPE_TOKENS[t_in]}_cute_fp16_{impl}_hdim{d}_s{s}"
+            f"_b{b}m{m}f{f}r{r}.cu",
+            cls._render_fp16_variant_tu(t_in, impl, func, d, s, tag),
+          )
+    for d in headdims:
+      for variant, t_in, prefix in variants:
+        # Native TU filenames carry the dtype token (fp16/bf16, matching
+        # the cute family TUs); fp16f16 keeps its full name to stay
+        # distinct from fp16f32 (same __half input). The dispatch symbols
+        # (ffpa_attn_fwd_{variant}_*) keep the full variant name (ABI).
+        token = variant.removesuffix("f32")
+        yield (
+          f"fwd_{token}_native_hdim{d}.cu", cls._render_wrapper_tu(variant, d)
+        )
+        for s in stages:
+          yield (
+            f"fwd_{token}_native_hdim{d}_s{s}.cu",
+            cls._render_native_family_tu(variant, t_in, prefix, d, s)
+          )
+      seen_dtypes = set()
+      for _, t_in, _ in variants:
+        if t_in in seen_dtypes:
+          continue
+        seen_dtypes.add(t_in)
+        token = cls._DTYPE_TOKENS[t_in]
+        if cls.enable_cute_ext():
+          for s in stages:
+            yield (
+              f"fwd_{token}_cute_fp16_hdim{d}_s{s}.cu",
+              cls._render_cute_fp16_family_tu(t_in, d, s),
+            )
+        if cls.enable_tma_ext():
+          for s in stages:
+            yield (
+              f"fwd_{token}_cute_fp8_hdim{d}_s{s}.cu",
+              cls._render_fp8_family_tu(t_in, d, s),
+            )
+          yield (
+            f"fwd_{token}_cute_fp4_hdim{d}.cu",
+            cls._render_fp4_family_tu(t_in, d, stages),
+          )
+
+  @classmethod
+  def _render_native_family_tu(
     cls, variant: str, t_in: str, prefix: list, d: int, s: int
   ) -> str:
-    """Heavy stage TU: one ``launch_ffpa_attn_fwd_template`` instantiation."""
-    body = list(prefix)
-    body.append(
+    """Native family TU: the variant's stage entry + native sm80/tma.
+
+    The stage entry (ffpa_attn_fwd_{variant}_d{d}_s{s}, a
+    launch_ffpa_attn_fwd_template instantiation routing to the family
+    entries) and the native sm80/tma explicit instantiations share the
+    variant prefix lines (namespace-scope constexpr QK/PV), so they live
+    in one TU; these strong symbols bind to the same template ids the
+    routing layer references under any FORCE_{QK,PV}_F16 config.
+    """
+    lines = [
+      "// AUTO-GENERATED by env.py. DO NOT EDIT.",
+      '#include "launch/router.cuh"',
+      '#include "dispatch/native_fp16.cuh"',
+      "using namespace ffpa;",
+      "",
+    ]
+    lines += [ln.lstrip() for ln in prefix]
+    lines.append("")
+    lines.append(cls._signature(f"ffpa_attn_fwd_{variant}_d{d}_s{s}", False))
+    lines.append(
       f"  launch_ffpa_attn_fwd_template<{t_in}, {d}, kMmaAccFloat32QK, "
       f"kMmaAccFloat32PV, {s}>(Q, K, V, O, attn_bias, softmax_lse, causal, "
       "softmax_scale, dropout_p, philox_seed, philox_offset, fp8_smooth_k, "
@@ -710,23 +1134,663 @@ class ENV(object):
       "fp8_hybrid_n_early, fp4_hybrid, fp4_hybrid_n_early, fp8_hadamard, "
       "fp4_hadamard, fp4_pv_mm_type, fp4_smooth_v);"
     )
+    lines.append("}")
+    lines.append("")
+    lines.append(
+      f"template void ffpa::ffpa_fwd_native_sm80<{t_in}, {d}, "
+      f"kMmaAccFloat32QK, kMmaAccFloat32PV, {s}>"
+      "(const ffpa::FfpaFwdParams&);"
+    )
+    lines.append(
+      f"template void ffpa::ffpa_fwd_native_tma<{t_in}, {d}, "
+      f"kMmaAccFloat32QK, kMmaAccFloat32PV, {s}>"
+      "(const ffpa::FfpaFwdParams&);"
+    )
+    return "\n".join(lines) + "\n"
+
+  @classmethod
+  def _render_cute_fp16_family_tu(cls, t_in: str, d: int, s: int) -> str:
+    """CuTe fp16 family TU: cute_fp16 sm120/sm80 entries + hybrid stage-1."""
+    lines = [
+      "// AUTO-GENERATED by env.py. DO NOT EDIT.",
+      '#include "dispatch/cute_fp16.cuh"',
+      "",
+      f"template void ffpa::ffpa_fwd_cute_fp16<{t_in}, {d}, {s}>"
+      "(const ffpa::FfpaFwdParams&);",
+      f"template void ffpa::ffpa_fwd_cute_fp16_sm80<{t_in}, {d}, {s}>"
+      "(const ffpa::FfpaFwdParams&);",
+      f"template void ffpa::ffpa_fwd_fp16_stage1<{t_in}, {d}, {s}, 224>"
+      "(const ffpa::FfpaFwdParams&);",
+      f"template void ffpa::ffpa_fwd_fp16_stage1<{t_in}, {d}, {s}, 256>"
+      "(const ffpa::FfpaFwdParams&);",
+    ]
+    return "\n".join(lines) + "\n"
+
+  @classmethod
+  def _render_fp8_family_tu(cls, t_in: str, d: int, s: int) -> str:
+    """FP8 family TU: explicit instantiation of the CUTE_TMA_FP8 entry."""
     return (
       "// AUTO-GENERATED by env.py. DO NOT EDIT.\n"
-      '#include "launch.cuh"\n'
-      "using namespace ffpa;\n\n" +
-      cls._signature(f"ffpa_attn_fwd_{variant}_d{d}_s{s}", False) + "\n" +
-      "\n".join(body) + "\n}\n"
+      '#include "dispatch/cute_fp8.cuh"\n\n'
+      f"template void ffpa::ffpa_fwd_fp8<{t_in}, {d}, {s}>"
+      "(const ffpa::FfpaFwdParams&);\n"
     )
 
   @classmethod
-  def _render_dispatch_tu(cls, headdims) -> str:
-    # fp16f16 (acc=0) dispatch is only emitted when ENABLE_FFPA_F16_ACC is on.
-    specs = [
-      ("ffpa_attn_fwd_fp16f32", "torch::kHalf"),
-      ("ffpa_attn_fwd_bf16f32", "torch::kBFloat16"),
+  def _fp8_variant_blocks(cls, d: int):
+    """(kBr, kBc) of the fp8 launcher owning head_dim d.
+
+    Mirrors the constexpr choices at the top of each launcher in
+    launch/cute_fp8.cuh: persist_d (D<=224) shrinks kBc above D=128,
+    split_d (D<768) keeps 128/128, m4n2 (D>=768) drops to 64/64.
+    """
+    if d <= 224:
+      return 128, (128 if d <= 128 else 64)
+    if d < 768:
+      return 128, 128
+    return 64, 64
+
+  @classmethod
+  def _mask_f32_tags(cls, tags):
+    """Drop fp32-mask tags (f=1, last tuple slot) unless MASK_FP32 is on.
+
+    Applies to every *_impl_variants tag list (fp8 (b,m,f), fp4
+    (p,b,m,f), fp16 (b,m,f) - f is always last).
+    """
+    if cls.enable_cuda_mask_fp32():
+      return tags
+    return [t for t in tags if t[-1] != 1]
+
+  @classmethod
+  def _fp8_impl_variants(cls, d: int):
+    """(impl key, variant entry func, tag tuples) owning head_dim d.
+
+    Mirrors the routing windows in dispatch/cute_fp8.cuh (keep in sync):
+    regular builds route by constexpr D (persist_d D%32==0 and 32<=D<=224;
+    split_d D%64==0 and 224<D<768; m4n2 D%64==0 and 768<=D<=1024), so only
+    the routed impl's tags get variant TUs. Debug builds additionally
+    instantiate both split wrappers across the FFPA_FP8_FORCE_KERNEL A/B
+    window (224<D<=1024), so both families get TUs there. Tag tuple =
+    (kQKInt8, kBiasOn, kBiasPlanMode, kBias4BytesPerElem).
+    """
+    debug_fp8 = cls.enable_build_debug("fp8")
+    out = []
+    if d % 32 == 0 and 32 <= d <= 224:
+      tags = [
+        (0, 0, 0),
+        (1, 2, 1),
+        (1, 2, 0),
+        (1, 3, 0),
+        (1, 0, 0),
+      ]
+      out.append((
+        "persist",
+        "launch_cute_fwd_persist_d_fp8_sm120_v",
+        cls._mask_f32_tags(tags),
+      ))
+    if d % 64 == 0 and 224 < d <= 1024:
+      routed_split = 224 < d < 768
+      routed_m4n2 = d >= 768
+      if routed_split or debug_fp8:
+        tags = [(0, 0, 0), (1, 0, 0)]
+        if d < 512:
+          tags += [(1, 2, 1), (1, 2, 0)]
+        out.append((
+          "split",
+          "launch_cute_fwd_split_d_fp8_sm120_v",
+          cls._mask_f32_tags(tags),
+        ))
+      if routed_m4n2 or debug_fp8:
+        tags = [
+          (0, 0, 0),
+          (1, 1, 1),
+          (1, 1, 0),
+          (1, 2, 1),
+          (1, 2, 0),
+          (1, 3, 1),
+          (1, 3, 0),
+          (1, 0, 0),
+        ]
+        out.append((
+          "m4n2",
+          "launch_cute_fwd_split_d_m4n2_fp8_sm120_v",
+          cls._mask_f32_tags(tags),
+        ))
+    return out
+
+  @classmethod
+  def _iter_fp8_variant_combos(cls, headdims, dtypes):
+    """Yield (t_in, impl, func, d, s, (q, b, m, f)) for every fp8 variant."""
+    for t_in in dtypes:
+      for d in headdims:
+        for impl, func, tags in cls._fp8_impl_variants(d):
+          for s in cls._enabled_stages():
+            for q in (0, 1):
+              for b, m, f in tags:
+                yield t_in, impl, func, d, s, (q, b, m, f)
+
+  # 19-arg signature shared by every fp8 variant entry (Q, K, V, O,
+  # attn_bias, softmax_lse, causal, softmax_scale, dropout_p, philox_seed,
+  # philox_offset, fp8_smooth_k, fp8_smooth_v, q/k/v quant, pv_acc,
+  # q_start_row, fp8_hadamard). Keep in sync with launch/cute_fp8.cuh.
+  _FP8_VARIANT_SIG = (
+    "(torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, "
+    "torch::Tensor, torch::Tensor, int, double, double, int64_t, int64_t, "
+    "bool, bool, int64_t, int64_t, int64_t, int64_t, int, bool)"
+  )
+
+  @classmethod
+  def _render_fp8_variants_header(cls, headdims, dtypes) -> str:
+    """Shared fp8 variant header: extern declarations only.
+
+    The variant TUs include the per-impl headers
+    (launch/cute_fp8_{persist_d,split_d,split_d_m4n2}.cuh) directly and
+    compile exactly one kernel table. Every family TU includes this
+    header from the tail of launch/cute_fp8.cuh and gets extern-template
+    declarations for the whole table, which suppresses re-instantiation
+    the whole table, which suppresses re-instantiation of the variant
+    entries (and keeps FFPA_FP8_FORCE_KERNEL A/B combos - absent from
+    the table - on the implicit-instantization path).
+    """
+    decls = []
+    for t_in, _, func, d, s, (q, b, m, f) in cls._iter_fp8_variant_combos(
+      headdims, dtypes
+    ):
+      decls.append(
+        f"extern template void {func}<{t_in}, {d}, {s}, "
+        f"{'true' if q else 'false'}, {b}, {m}, {f}>"
+        f"{cls._FP8_VARIANT_SIG};"
+      )
+    lines = [
+      "// AUTO-GENERATED by env.py. DO NOT EDIT.",
+      "#ifndef FFPA_GENERATED_FWD_CUTE_FP8_VARIANTS_CUH_",
+      "#define FFPA_GENERATED_FWD_CUTE_FP8_VARIANTS_CUH_",
+      "// Declarations only: included from the tail of",
+      "// launch/cute_fp8.cuh, after the variant templates are defined.",
     ]
-    if cls.enable_f16_acc():
-      specs.insert(0, ("ffpa_attn_fwd_fp16f16", "torch::kHalf"))
+    lines += decls
+    lines += ["#endif", ""]
+    return "\n".join(lines)
+
+  # impl token (TU naming / _fp8_impl_variants) -> per-impl header stem
+  _FP8_IMPL_HEADER = {
+    "persist": "persist_d",
+    "split": "split_d",
+    "m4n2": "split_d_m4n2",
+  }
+
+  @classmethod
+  def _render_fp8_variant_tu(
+    cls, t_in: str, impl: str, func: str, d: int, s: int, tag: tuple
+  ) -> str:
+    """Single-variant TU: one kernel table per translation unit."""
+    q, b, m, f = tag
+    return (
+      "// AUTO-GENERATED by env.py. DO NOT EDIT.\n"
+      f'#include "launch/cute_fp8_{cls._FP8_IMPL_HEADER[impl]}.cuh"\n\n'
+      f"template void {func}<{t_in}, {d}, {s}, "
+      f"{'true' if q else 'false'}, {b}, {m}, {f}>"
+      f"{cls._FP8_VARIANT_SIG};\n"
+    )
+
+  @classmethod
+  def _fp4_impl_variants(cls, d: int):
+    """(impl key, variant entry func, tag tuples) owning head_dim d.
+
+    Mirrors the routing windows in dispatch/cute_fp4.cuh (keep in sync):
+    persist_d owns D%64==0 and 64<=D<=256 (MXFP8 PV only D<=192),
+    split_d owns D%64==0 and 256<D<768 (PV dual-open), m4n2 owns
+    D%64==0 and 768<=D<=1024 (NVFP4-only PV, so pv stays 0). Regular
+    builds pin m4n2 to mode 0 (PC-0-5); debug builds
+    (ENABLE_FFPA_BUILD_DEBUG=fp4) add the mode-2 KEEP tags behind
+    FFPA_BIAS_TILE_KEEP. Tag tuple = (kPvMxfp8, kBiasOn, kBiasPlanMode,
+    kBias4BytesPerElem).
+    """
+    debug_fp4 = cls.enable_build_debug("fp4")
+    out = []
+    if d % 64 == 0 and 64 <= d <= 256:
+      for pv in ((0, 1) if d <= 192 else (0, )):
+        out.append((
+          "persist",
+          "launch_cute_fwd_persist_d_fp4_sm120_v",
+          cls._mask_f32_tags([
+            (pv, 0, 0, 0),
+            (pv, 1, 1, 1),
+            (pv, 1, 1, 0),
+            (pv, 1, 2, 1),
+            (pv, 1, 2, 0),
+            (pv, 1, 3, 1),
+            (pv, 1, 3, 0),
+            (pv, 1, 0, 0),
+          ]),
+        ))
+    if d % 64 == 0 and 256 < d < 768:
+      for pv in (0, 1):
+        out.append((
+          "split",
+          "launch_cute_fwd_split_d_fp4_sm120_v",
+          cls._mask_f32_tags([
+            (pv, 0, 0, 0),
+            (pv, 1, 2, 1),
+            (pv, 1, 2, 0),
+            (pv, 1, 3, 0),
+            (pv, 1, 0, 0),
+          ]),
+        ))
+    if d % 64 == 0 and 768 <= d <= 1024:
+      tags = [(0, 0, 0, 0), (0, 1, 0, 0)]
+      if debug_fp4:
+        tags += [(0, 1, 2, 1), (0, 1, 2, 0)]
+      out.append((
+        "m4n2",
+        "launch_cute_fwd_split_d_m4n2_fp4_sm120_v",
+        cls._mask_f32_tags(tags),
+      ))
+    return out
+
+  @classmethod
+  def _iter_fp4_variant_combos(cls, headdims, dtypes):
+    """Yield (t_in, impl, func, d, (p, b, m, f)) for every fp4 variant."""
+    for t_in in dtypes:
+      for d in headdims:
+        for impl, func, tags in cls._fp4_impl_variants(d):
+          for tag in tags:
+            yield t_in, impl, func, d, tag
+
+  # 11-arg signature shared by every fp4 variant entry (Q, K, V, O,
+  # attn_bias, softmax_lse, causal, softmax_scale, q_start_row,
+  # fp4_hadamard, fp4_smooth_v). Keep in sync with launch/cute_fp4.cuh.
+  _FP4_VARIANT_SIG = (
+    "(torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, "
+    "torch::Tensor, torch::Tensor, int, double, int, bool, bool)"
+  )
+
+  @classmethod
+  def _render_fp4_variants_header(cls, headdims, dtypes) -> str:
+    """Shared fp4 variant header: extern declarations only.
+
+    Variant TUs include the per-impl headers
+    (launch/cute_fp4_{persist_d,split_d,split_d_m4n2}.cuh) directly and
+    compile exactly one kernel table; every family TU includes this
+    header from the tail of launch/cute_fp4.cuh and gets extern-template
+    declarations that suppress variant re-instantiation.
+    """
+    decls = []
+    for t_in, _, func, d, (p, b, m, f
+                           ) in cls._iter_fp4_variant_combos(headdims, dtypes):
+      decls.append(
+        f"extern template void {func}<{t_in}, {d}, "
+        f"{'true' if p else 'false'}, {b}, {m}, {f}>"
+        f"{cls._FP4_VARIANT_SIG};"
+      )
+    lines = [
+      "// AUTO-GENERATED by env.py. DO NOT EDIT.",
+      "#ifndef FFPA_GENERATED_FWD_CUTE_FP4_VARIANTS_CUH_",
+      "#define FFPA_GENERATED_FWD_CUTE_FP4_VARIANTS_CUH_",
+      "// Declarations only: included from the tail of",
+      "// launch/cute_fp4.cuh, after the variant templates are defined.",
+    ]
+    lines += decls
+    lines += ["#endif", ""]
+    return "\n".join(lines)
+
+  # impl token (TU naming / _fp4_impl_variants) -> per-impl header stem
+  _FP4_IMPL_HEADER = {
+    "persist": "persist_d",
+    "split": "split_d",
+    "m4n2": "split_d_m4n2",
+  }
+
+  @classmethod
+  def _render_fp4_variant_tu(
+    cls, t_in: str, impl: str, func: str, d: int, tag: tuple
+  ) -> str:
+    """Single-variant TU: one kernel table per translation unit."""
+    p, b, m, f = tag
+    return (
+      "// AUTO-GENERATED by env.py. DO NOT EDIT.\n"
+      f'#include "launch/cute_fp4_{cls._FP4_IMPL_HEADER[impl]}.cuh"\n\n'
+      f"template void {func}<{t_in}, {d}, "
+      f"{'true' if p else 'false'}, {b}, {m}, {f}>"
+      f"{cls._FP4_VARIANT_SIG};\n"
+    )
+
+  @classmethod
+  def _fp16_impl_variants(cls, d: int):
+    """(impl key, variant entry func, tag tuples) owning head_dim d.
+
+    Mirrors the routing windows in dispatch/cute_fp16.cuh (keep in sync):
+    persist_d owns D%32==0 and 32<=D<=256 (the direct dispatch route caps
+    at 128; the fp8/fp4 hybrid stage-1 entries extend it to 224/256) and
+    has no mode 3; split_d owns D%32==0 above 128 ((32,64) chunks for
+    D%64==0 below 768, (32,32) otherwise — derived in
+    _fp16_split_chunks); m4n2 owns D%64==0 and 768<=D<=1024. Tag tuple =
+    (kBiasOn, kBiasPlanMode, kBias4BytesPerElem); the kHasDropout axis
+    expands in _iter_fp16_variant_combos.
+    """
+    out = []
+    if d % 32 == 0 and 32 <= d <= 256:
+      out.append((
+        "persist",
+        "launch_cute_fwd_persist_d_sm120_v",
+        cls._mask_f32_tags([
+          (0, 0, 0),
+          (1, 1, 1),
+          (1, 1, 0),
+          (1, 2, 1),
+          (1, 2, 0),
+          (1, 0, 0),
+        ]),
+      ))
+    if d > 128 and d < 768 and d % 32 == 0:
+      out.append((
+        "split",
+        "launch_cute_fwd_split_d_sm120_v",
+        cls._mask_f32_tags([
+          (0, 0, 0),
+          (1, 1, 1),
+          (1, 1, 0),
+          (1, 2, 1),
+          (1, 2, 0),
+          (1, 3, 1),
+          (1, 3, 0),
+          (1, 0, 0),
+        ]),
+      ))
+    if d % 64 == 0 and 768 <= d <= 1024:
+      out.append((
+        "m4n2",
+        "launch_cute_fwd_split_d_m4n2_sm120_v",
+        cls._mask_f32_tags([
+          (0, 0, 0),
+          (1, 1, 1),
+          (1, 1, 0),
+          (1, 2, 1),
+          (1, 2, 0),
+          (1, 3, 1),
+          (1, 3, 0),
+          (1, 0, 0),
+        ]),
+      ))
+    return out
+
+  @classmethod
+  def _fp16_split_chunks(cls, d: int):
+    """(kQKDChunk, kVDChunk) of the split_d launcher owning head_dim d."""
+    return (32, 64) if d % 64 == 0 else (32, 32)
+
+  @classmethod
+  def _iter_fp16_variant_combos(cls, headdims, dtypes):
+    """Yield (t_in, impl, func, d, s, (b, m, f, r)) for every fp16 variant."""
+    for t_in in dtypes:
+      for d in headdims:
+        for impl, func, tags in cls._fp16_impl_variants(d):
+          for s in cls._enabled_stages():
+            for b, m, f in tags:
+              for r in (0, 1):
+                yield t_in, impl, func, d, s, (b, m, f, r)
+
+  # 11-arg signature shared by every fp16 variant entry (Q, K, V, O,
+  # attn_bias, softmax_lse, causal, softmax_scale, dropout_p, philox_seed,
+  # philox_offset). Keep in sync with launch/cute_fp16.cuh.
+  _FP16_VARIANT_SIG = (
+    "(torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, "
+    "torch::Tensor, torch::Tensor, int, double, double, int64_t, int64_t)"
+  )
+
+  @classmethod
+  def _render_fp16_variants_header(cls, headdims, dtypes) -> str:
+    """Shared fp16 variant header: extern declarations only.
+
+    Variant TUs include the per-impl headers
+    (launch/cute_fp16_{persist_d,split_d,split_d_m4n2}.cuh) directly and
+    compile exactly one kernel table; every family TU includes this
+    header from the tail of launch/cute_fp16.cuh and gets extern-template
+    declarations that suppress variant re-instantiation.
+    """
+    decls = []
+    for t_in, impl, func, d, s, (
+      b,
+      m,
+      f,
+      r,
+    ) in cls._iter_fp16_variant_combos(headdims, dtypes):
+      if impl == "split":
+        qc, vc = cls._fp16_split_chunks(d)
+        args = f"<{t_in}, {d}, {s}, {qc}, {vc}, {b}, {m}, {f}, {r}>"
+      else:
+        args = f"<{t_in}, {d}, {s}, {b}, {m}, {f}, {r}>"
+      decls.append(f"extern template void {func}{args}{cls._FP16_VARIANT_SIG};")
+    lines = [
+      "// AUTO-GENERATED by env.py. DO NOT EDIT.",
+      "#ifndef FFPA_GENERATED_FWD_CUTE_FP16_VARIANTS_CUH_",
+      "#define FFPA_GENERATED_FWD_CUTE_FP16_VARIANTS_CUH_",
+      "// Declarations only: included from the tail of",
+      "// launch/cute_fp16.cuh, after the variant templates are defined.",
+    ]
+    lines += decls
+    lines += ["#endif", ""]
+    return "\n".join(lines)
+
+  # impl token (TU naming / _fp16_impl_variants) -> per-impl header stem
+  _FP16_IMPL_HEADER = {
+    "persist": "persist_d",
+    "split": "split_d",
+    "m4n2": "split_d_m4n2",
+  }
+
+  @classmethod
+  def _render_fp16_variant_tu(
+    cls, t_in: str, impl: str, func: str, d: int, s: int, tag: tuple
+  ) -> str:
+    """Single-variant TU: one kernel table per translation unit."""
+    b, m, f, r = tag
+    if impl == "split":
+      qc, vc = cls._fp16_split_chunks(d)
+      args = f"<{t_in}, {d}, {s}, {qc}, {vc}, {b}, {m}, {f}, {r}>"
+    else:
+      args = f"<{t_in}, {d}, {s}, {b}, {m}, {f}, {r}>"
+    return (
+      "// AUTO-GENERATED by env.py. DO NOT EDIT.\n"
+      f'#include "launch/cute_fp16_{cls._FP16_IMPL_HEADER[impl]}.cuh"\n\n'
+      f"template void {func}{args}{cls._FP16_VARIANT_SIG};\n"
+    )
+
+  @classmethod
+  def _render_fp8_preprocess_instances(cls, headdims, dtypes) -> str:
+    """Explicit-instantiation table for ffpa_fp8::prepare_fp8_inputs.
+
+    The preprocess TU (fwd_cute_fp8_preprocess.cu) defines FFPA_FP8_
+    PREPROCESS_TU and emits the definitions; every other TU including
+    this header gets the matching extern-template declarations, so the
+    s2/s3 family TUs stop re-instantiating the quantize kernel family.
+    """
+    sig = (
+      "(const torch::Tensor&, const torch::Tensor&, const torch::Tensor&,"
+      " const ffpa_fp8::Fp8InputLayout&, const ffpa_fp8::Fp8InputLayout&,"
+      " const ffpa_fp8::Fp8InputLayout&, int, int, int, int, int, int,"
+      " int, int, int, bool, bool, bool, bool, float, bool, cudaStream_t)"
+    )
+    combos = []
+    seen = set()
+    debug_fp8 = cls.enable_build_debug("fp8")
+    for t_in in dtypes:
+      for d in headdims:
+        br, bc = cls._fp8_variant_blocks(d)
+        blocks = [(br, bc)]
+        if debug_fp8 and 224 < d <= 1024:
+          # FFPA_FP8_FORCE_KERNEL A/B instantiates both split_d and m4n2
+          # in one TU; the forced variant's blocks are absent from the
+          # dispatch route, so emit both or the TU silently falls back to
+          # implicit instantiation (compile-time only, no correctness
+          # impact).
+          blocks.append((64, 64) if (br, bc) == (128, 128) else (128, 128))
+        for b in blocks:
+          for qk in ("false", "true"):
+            key = (t_in, b[0], b[1], d, qk)
+            if key not in seen:
+              seen.add(key)
+              combos.append(
+                f"ffpa_fp8::prepare_fp8_inputs"
+                f"<{t_in}, {b[0]}, {b[1]}, {d}, {qk}>"
+              )
+    lines = [
+      "// AUTO-GENERATED by env.py. DO NOT EDIT.",
+      "#include \"cute/fp8/prepare_inputs.cuh\"",
+      "",
+      "#ifdef FFPA_FP8_PREPROCESS_TU",
+    ]
+    lines += [
+      f"template ffpa_fp8::Fp8QuantizedInputs {c}{sig};" for c in combos
+    ]
+    lines += ["#else"]
+    lines += [
+      f"extern template ffpa_fp8::Fp8QuantizedInputs {c}{sig};" for c in combos
+    ]
+    lines += ["#endif", ""]
+    return "\n".join(lines)
+
+  @classmethod
+  def _render_fp8_preprocess_tu(cls) -> str:
+    """Preprocess TU: the single definition site for the table above."""
+    return (
+      "// AUTO-GENERATED by env.py. DO NOT EDIT.\n"
+      "#define FFPA_FP8_PREPROCESS_TU\n"
+      '#include "generated/fwd_cute_fp8_preprocess.cuh"\n'
+    )
+
+  # dtype-agnostic fp4 quantize launchers (template <int kHeadDim>, the
+  # half/bf16 kernels are picked at runtime inside), mirrored from
+  # cute/fp4/quantize_fp4.cuh. The fp4 family TUs are keyed by dtype, so
+  # these identical instantiations would otherwise be codegen'd twice.
+  # (signature, max head_dim or None); keep in sync with the headers.
+  _FP4_PREPROCESS_LAUNCHERS = [
+    (
+      "launch_fp4_quant_q_sm120",
+      "(const torch::Tensor&, torch::Tensor&, torch::Tensor&, "
+      "const torch::Tensor&, long, bool)",
+      None,
+    ),
+    (
+      "launch_fp4_quant_k_sm120",
+      "(const torch::Tensor&, torch::Tensor&, torch::Tensor&, "
+      "const torch::Tensor&, long, bool)",
+      None,
+    ),
+    (
+      "launch_fp4_quant_vt_sm120",
+      "(const torch::Tensor&, torch::Tensor&, torch::Tensor&, "
+      "long, const torch::Tensor&)",
+      None,
+    ),
+    (
+      "launch_mxfp8_quant_vt_sm120",
+      "(const torch::Tensor&, torch::Tensor&, torch::Tensor&, "
+      "long, const torch::Tensor&)",
+      None,
+    ),
+    (
+      "launch_fp4_quant_q_wht_sm120",
+      "(const torch::Tensor&, torch::Tensor&, torch::Tensor&, "
+      "const torch::Tensor&, long)",
+      "pow2",
+    ),
+    (
+      "launch_fp4_quant_k_wht_sm120",
+      "(const torch::Tensor&, torch::Tensor&, torch::Tensor&, "
+      "const torch::Tensor&, long)",
+      "pow2",
+    ),
+    (
+      "launch_fp4_q_block_mean_sm120",
+      "(const torch::Tensor&, torch::Tensor&)",
+      None,
+    ),
+    (
+      "launch_fp4_quant_qkv_fused_sm120",
+      "(const torch::Tensor&, torch::Tensor&, torch::Tensor&, "
+      "torch::Tensor&, torch::Tensor&, torch::Tensor&, "
+      "const torch::Tensor&, const torch::Tensor&, torch::Tensor&, "
+      "torch::Tensor&, const torch::Tensor&, const torch::Tensor&, "
+      "torch::Tensor&, torch::Tensor&, long, long, bool, bool)",
+      128,
+    ),
+  ]
+
+  @classmethod
+  def _render_fp4_preprocess_instances(cls, headdims) -> str:
+    """Explicit-instantiation table for the dtype-agnostic fp4 launchers.
+
+    Same dual-mode pattern as the fp8 table: the preprocess TU
+    (fwd_cute_fp4_preprocess.cu) defines FFPA_FP4_PREPROCESS_TU and emits the
+    definitions; the fp4 family TUs get extern-template declarations, so
+    the half and bf16 family TUs stop codegen'ing the same quantize
+    kernels twice.
+    """
+    lines = [
+      "// AUTO-GENERATED by env.py. DO NOT EDIT.",
+      '#include "cute/fp4/quantize_fp4.cuh"',
+      "",
+      "#ifdef FFPA_FP4_PREPROCESS_TU",
+    ]
+    for name, sig, d_filter in cls._FP4_PREPROCESS_LAUNCHERS:
+      for d in headdims:
+        if d_filter == "pow2" and d & (d - 1):
+          continue
+        if isinstance(d_filter, int) and d > d_filter:
+          continue
+        lines.append(f"template void ffpa_fp4::{name}<{d}>{sig};")
+    lines += ["#else"]
+    for name, sig, d_filter in cls._FP4_PREPROCESS_LAUNCHERS:
+      for d in headdims:
+        if d_filter == "pow2" and d & (d - 1):
+          continue
+        if isinstance(d_filter, int) and d > d_filter:
+          continue
+        lines.append(f"extern template void ffpa_fp4::{name}<{d}>{sig};")
+    lines += ["#endif", ""]
+    return "\n".join(lines)
+
+  @classmethod
+  def _render_fp4_preprocess_tu(cls) -> str:
+    """Preprocess TU: the single definition site for the table above."""
+    return (
+      "// AUTO-GENERATED by env.py. DO NOT EDIT.\n"
+      "#define FFPA_FP4_PREPROCESS_TU\n"
+      '#include "generated/fwd_cute_fp4_preprocess.cuh"\n'
+    )
+
+  @classmethod
+  def _render_fp4_family_tu(cls, t_in: str, d: int, stages: list) -> str:
+    """FP4 family TU: one TU per (dtype, d) covering every compiled stage.
+
+    The fp4 launcher ignores kStage (fixed by traits), so all explicit
+    instantiations live in a single TU and the kernel templates codegen
+    once inside it. Exception: the hybrid path forwards kStage to the
+    fp16 stage-1 entry, which the cute_fp16 family TU instantiates per stage.
+    """
+    lines = [
+      "// AUTO-GENERATED by env.py. DO NOT EDIT.",
+      '#include "dispatch/cute_fp4.cuh"',
+      "",
+    ]
+    for s in stages:
+      lines.append(
+        f"template void ffpa::ffpa_fwd_fp4<{t_in}, {d}, {s}>"
+        "(const ffpa::FfpaFwdParams&);"
+      )
+    return "\n".join(lines) + "\n"
+
+  @classmethod
+  def _render_dispatch_tu(cls, headdims) -> str:
+    # fp16f16 (acc=0) dispatch is only emitted when ENABLE_FFPA_F16_ACC is
+    # on; fp16-input dispatch (fp16f16/fp16f32) only when
+    # ENABLE_FFPA_CUDA_INPUT_FP16 is on (default builds are bf16-only).
+    specs = [("ffpa_attn_fwd_bf16f32", "torch::kBFloat16")]
+    if cls.enable_cuda_input_fp16():
+      specs.insert(0, ("ffpa_attn_fwd_fp16f32", "torch::kHalf"))
+      if cls.enable_f16_acc():
+        specs.insert(0, ("ffpa_attn_fwd_fp16f16", "torch::kHalf"))
 
     call_args = (
       "Q, K, V, O, attn_bias, softmax_lse, stages, causal, softmax_scale, "
@@ -781,7 +1845,7 @@ class ENV(object):
     if build_pkg:
       _logging_msg()
     # Generate per-headdim TUs under csrc/cuffpa/generated/ and use them as
-    # the actual build sources. The generated TUs include launch.cuh,
+    # the actual build sources. The generated TUs include launch/router.cuh,
     # which in turn includes ffpa_attn_fwd.cuh. Splitting by headdim enables
     # MAX_JOBS to drive nvcc on many small files in parallel and cuts the build
     # time of the heavy launch_ffpa_attn_fwd_template instantiations.

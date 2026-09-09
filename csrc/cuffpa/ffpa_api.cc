@@ -23,6 +23,10 @@ void ffpa_attn_fwd_fp16f16(
     int64_t fp4_hybrid_n_early, bool fp8_hadamard, bool fp4_hadamard,
     int64_t fp4_pv_mm_type, bool fp4_smooth_v);
 #endif
+// fp16-input entries (fp16f32, and fp16f16 above) are opt-in via
+// ENABLE_FFPA_CUDA_INPUT_FP16; the symbols are absent from the generated
+// dispatch when the macro is off.
+#ifdef ENABLE_FFPA_CUDA_INPUT_FP16
 void ffpa_attn_fwd_fp16f32(
     torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O,
     torch::Tensor attn_bias, torch::Tensor softmax_lse, int stages, int causal,
@@ -33,6 +37,7 @@ void ffpa_attn_fwd_fp16f32(
     bool fp8_hybrid, int64_t fp8_hybrid_n_early, bool fp4_hybrid,
     int64_t fp4_hybrid_n_early, bool fp8_hadamard, bool fp4_hadamard,
     int64_t fp4_pv_mm_type, bool fp4_smooth_v);
+#endif
 void ffpa_attn_fwd_bf16f32(
     torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O,
     torch::Tensor attn_bias, torch::Tensor softmax_lse, int stages, int causal,
@@ -212,6 +217,7 @@ void ffpa_attn_forward(
       fp4_pv_mm_type, fp4_smooth_v
 
   if (dtype == torch::kHalf) {
+#ifdef ENABLE_FFPA_CUDA_INPUT_FP16
     if (acc == 0) {
 #ifdef ENABLE_FFPA_F16_ACC
       TORCH_CHECK(!needs_pad,
@@ -230,6 +236,12 @@ void ffpa_attn_forward(
     } else {
       throw std::invalid_argument("ffpa_attn: acc must be 0 (f16) or 1 (f32)");
     }
+#else
+    (void)needs_pad;
+    throw std::invalid_argument(
+        "ffpa_attn: fp16 inputs are disabled in this build; rebuild with "
+        "ENABLE_FFPA_CUDA_INPUT_FP16=1 to enable them.");
+#endif
   } else if (dtype == torch::kBFloat16) {
     if (acc != 1) {
       throw std::invalid_argument(
@@ -337,6 +349,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.attr("F16_ACC_AVAILABLE") = py::bool_(true);
 #else
   m.attr("F16_ACC_AVAILABLE") = py::bool_(false);
+#endif
+#ifdef ENABLE_FFPA_CUDA_INPUT_FP16
+  m.attr("CUDA_INPUT_FP16_AVAILABLE") = py::bool_(true);
+#else
+  m.attr("CUDA_INPUT_FP16_AVAILABLE") = py::bool_(false);
+#endif
+#ifdef ENABLE_FFPA_CUDA_MASK_FP32
+  m.attr("CUDA_MASK_FP32_AVAILABLE") = py::bool_(true);
+#else
+  m.attr("CUDA_MASK_FP32_AVAILABLE") = py::bool_(false);
 #endif
 #if defined(ENABLE_FFPA_TMA_EXT)
   m.attr("CUDA_TMA_AVAILABLE") = py::bool_(true);

@@ -19,7 +19,7 @@
 #include <cuda_fp8.h>
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
-#include <torch/all.h>
+#include <torch/types.h>
 
 #include "fp4_gemm.cuh"
 

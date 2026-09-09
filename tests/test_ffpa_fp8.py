@@ -15,6 +15,7 @@ import torch.nn.functional as F
 
 from ffpa_attn import ffpa_attn_func
 from ffpa_attn.cli._flops import attention_fwd_flops, tflops_from_ms
+from ffpa_attn.cuda import CUDA_INPUT_FP16_AVAILABLE
 from ffpa_attn.functional import CUDABackend
 
 SAGE_INSTALLED = importlib.util.find_spec("sageattention") is not None
@@ -27,10 +28,18 @@ def _fp8_available() -> bool:
   return major == 12
 
 
-pytestmark = pytest.mark.skipif(
-  not _fp8_available(),
-  reason="fp8 path requires an sm_120 GPU",
-)
+pytestmark = [
+  pytest.mark.skipif(
+    not _fp8_available(),
+    reason="fp8 path requires an sm_120 GPU",
+  ),
+  pytest.mark.skipif(
+    not CUDA_INPUT_FP16_AVAILABLE,
+    reason="fp16 fixtures in the parity paths; rebuild with "
+    "ENABLE_FFPA_CUDA_INPUT_FP16=1 (bf16 coverage: ffpa_attn.bench "
+    "--backend cuda --dtype bf16)",
+  ),
+]
 
 
 def _fp8_backend(tensor_layout: str = "HND") -> CUDABackend:

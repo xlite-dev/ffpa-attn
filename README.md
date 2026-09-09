@@ -47,7 +47,9 @@ git clone https://github.com/xlite-dev/ffpa-attn.git
 cd ffpa-attn && pip3 install -e . --no-build-isolation
 # Optional: install ffpa-attn w/ CUDA backend (forward only)
 # ext all: build all kernels, include fp8/fp4 attention kernels
-bash ./build.sh --arch sm_120f --ext all --headdim all
+# headdim default: build 64,128,192,256,320,512; other headdims
+# (e.g. 832,1024 or 120) must be requested via --headdim <list>
+bash ./build.sh --arch sm_120f --ext all --headdim default
 ```
 
 Then, try to accelerate the attention for large headdim with just <i><b>one-line</b></i> of code:

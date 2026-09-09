@@ -35,7 +35,8 @@ user-invocable: true
 
 # ffpa-attn CUDA Backend 特性支持现状技术报告
 
-> 基准代码：ffpa-attn `dev` 分支（strided-NHD 零拷贝已合入，对应 commit `02d49ab` 附近）。
+> 基准代码：ffpa-attn `dev` 分支（strided-NHD 零拷贝已合入，对应 commit `02d49ab` 附近；
+> fp16 家族 per-tag variant TU 拆分 + 默认编译集裁剪已合入，对应 `0b90ddf` 附近）。
 > 本报告梳理 CUDA backend 的全部 kernel 路径、特性矩阵、限制、核心技术与未来优化方向。
 > 所有行号/行为以当前工作树为准。
 
@@ -71,7 +72,7 @@ flowchart TD
     E -- D≤256 未开 small-D env / D>1024 /<br/>8≤Nq<512 / Nkv<512 / grad 等 --> F["SDPA fallback<br/>(torch._C._nn.sdpa)"]
     E -- 通过 --> G["_fwd_cuda torch op<br/>(cuda/__init__.py)"]
     G --> H["ffpa_api.cc<br/>dtype/acc/pad 分发 → generated per-headdim 入口"]
-    H --> I["launch_ffpa_attn_fwd_template<br/>(csrc/cuffpa/launch.cuh)"]
+    H --> I["launch_ffpa_attn_fwd_template<br/>(csrc/cuffpa/launch/router.cuh)"]
     I --> J1["Native cp.async (sm80+)<br/>+ split-KV decode"]
     I --> J2["Native TMA (sm90/100 WS,<br/>sm120 non-WS)"]
     I --> J3["CUTE_TMA fp16 家族 (sm120)<br/>persist-D / split-D / M4N2"]
@@ -88,10 +89,70 @@ flowchart TD
 | `src/ffpa_attn/ffpa_attn_interface.py` | SDPA 对齐签名入口、meta 校验、SDPA fallback 路由 |
 | `src/ffpa_attn/cuda/__init__.py` | `_fwd_cuda` torch op 注册、O/lse 分配、NHD permute 归一化 |
 | `csrc/cuffpa/ffpa_api.cc` | dtype×acc 分发、head_dim pad（O-only）、generated dispatcher |
-| `csrc/cuffpa/launch.cuh` | **顶层 dispatcher**：impl hint → 路径；hybrid stage-1 编排；NHD/strided 物化决策 |
-| `csrc/cuffpa/cute/launch.cuh` | CUTE 家族 launcher：TMA descriptor 构建、布局 gate（`ffpa_is_nhd_view` / `ffpa_is_strided_nhd` / `ffpa_layout_of`）、fp8/fp4 前处理链编排 |
-| `csrc/cuffpa/native/launch.cuh` | Native kernel 编译期 config（MMA atom、stage、smem 复用、decode split 数选择） |
+| `csrc/cuffpa/launch/router.cuh` | **顶层 dispatcher**：impl hint → 路径；hybrid stage-1 编排；NHD/strided 物化决策 |
+| `csrc/cuffpa/launch/{cute_fp16,cute_fp8,cute_fp4}.cuh` | CUTE 家族 launcher **伞形头**（per-impl 头 + 尾部 extern 表）：以 `cute_fp16.cuh` 为例 = common include + `cute_fp16_{persist_d,split_d,split_d_m4n2}.cuh`（单源 `ffpa::fp16_{impl}_bias_plan` + `_v` 变体体）+ 3 个 tag-dispatch wrapper（签名不变，lambda `launch_variant[_with_dropout]` 按 runtime bias/dropout 选 `(kBiasOn,kBiasPlanMode,kBias4BytesPerElem,kHasDropout)` tag 发 `_v`）+ 尾部 include `generated/fwd_cute_fp16_variants.cuh`（extern 表，variant TU 负责实例化） |
+| `csrc/cuffpa/launch/common.cuh` | CUTE 家族共享 helper：布局 gate（`ffpa_is_nhd_view` / `ffpa_is_strided_nhd` / `ffpa_layout_of`）、bias tile plan |
+| `csrc/cuffpa/launch/native_fp16.cuh` | Native kernel 编译期 config（MMA atom、stage、smem 复用、decode split 数选择） |
 | `csrc/cuffpa/cute/{fp8,fp4}/` | 量化前处理 kernel（quantize / kv_mean / delta_s / smooth）与主 kernel |
+
+### 1.3 C++ dispatch/launch 详细调用链（router 之后）
+
+```mermaid
+flowchart TD
+    API["ffpa_api.cc::ffpa_attn_fwd_*<br/>dtype×acc 分发 + head_dim pad"] --> GEN["generated dispatcher<br/>(per-headdim case 表, env.py 生成)"]
+    GEN --> TU["generated family TU<br/>fwd_{fp16,bf16}_{cute_fp16,cute_fp8,cute_fp4}_hdim{D}[_s{stage}].cu / fwd_{fp16,bf16}_native_hdim{D}[_s{stage}].cu<br/>显式实例化 family 入口模板（native 文件名 drop f32 后缀，符号保留全 variant 名）"]
+    TU --> VT["generated variant TU（量化族 + fp16 族）<br/>fwd_{token}_cute_{f}_{impl}_hdim{D}_s{S}_b{b}m{m}f{f}[r{r}].cu<br/>每 (bias_on, plan_mode, bias_4B, dropout) tag 一个 TU，实例化 `_v` kernel 表"]
+    VT --> DISP["dispatch/{native_fp16,cute_fp16,cute_fp8,cute_fp4}.cuh<br/>family 入口: 参数校验 + D 路由 + hybrid 编排"]
+    DISP --> LAUNCH["launch/{family}.cuh<br/>launcher _impl: hadamard → 布局探测 → bias<br/>→ quant knob 派生 → kBr/kBc/smem/stages clamp → traits"]
+    LAUNCH --> PRE["前处理编排"]
+    LAUNCH --> TMA["TMA descriptor 构建<br/>(make_tma_copy Q/K/V/O)"]
+    TMA --> KERN["attention 主 kernel launch<br/>(<<<>>> 或 cute cooperative)"]
+
+    subgraph PRE["前处理（stage 无关）"]
+        P1["fp8: cute/fp8/prepare_inputs.cuh<br/>prepare_fp8_inputs&lt;dtype,kBr,kBc,D,kQKInt8&gt;<br/>分配 + smooth-K mean + Q/K quantize + V per-channel<br/>⚠ extern-template: 仅 fwd_cute_fp8_preprocess.cu 实例化"]
+        P2["fp4: launch_fp4_quant_*&lt;D&gt; 量化链<br/>(launcher 模板不带 dtype)<br/>⚠ extern-template: 仅 fwd_cute_fp4_preprocess.cu 实例化"]
+        P3["fp8/fp4 共享: launch_kv_mean_sm120&lt;dtype,D&gt;<br/>(cute/fp8/smooth_k.cuh)"]
+    end
+```
+
+**family 入口的 D 路由决策**（dispatch/cute_fp8.cuh、cute_fp4.cuh、cute_fp16.cuh 同构交叉点）：
+
+| 家族 | D≤224 | 224<D<768 | D≥768 | 备注 |
+|---|---|---|---|---|
+| fp16 (cute_fp16) | persist-D | split-D M8N1 | split-D M4N2 | M4N2 交叉点 768 两端一致；D%32≠0 或 bias/dropout 路由级回退 native |
+| fp8 | persist-D (kBc=128/D≤128, else 64) | split-D M8N1 (128/128) | M4N2 (64/64) | kBr/kBc 被 env.py::_fp8_variant_blocks 镜像（extern 表） |
+| fp4 | persist-D | split-D | M4N2 | 量化 launcher 模板仅 &lt;kHeadDim&gt;（dtype 无关） |
+| native | sm80 split-D + split-KV decode (Nq==1) | TMA: sm90/100 WS / sm120 non-WS | 同左 | decode split 数 = select_decode_num_splits 波效率贪心 |
+
+**hybrid 双阶段**（dispatch/cute_hybrid.cuh::prepare_hybrid_stage1）：`fp8_hybrid/fp4_hybrid && Nq ≥ n_early` 时，前 `n_early` 行走 fp16 stage-1（`ffpa_fwd_fp16_stage1<dtype,D,stage,224>`，cute_fp16 TU 实例化），其余行 stage-2 以 `q_start_row` 偏移交回量化家族 launcher——两阶段各写自己行集的 O/lse 切片。
+
+**编译期 TU 结构**（谁实例化什么）：
+
+```mermaid
+flowchart LR
+    subgraph FamilyTU["family TU ×(dtype,D,stage)"]
+        A["dispatch/cute_fp8.cuh"] --> B["launch/cute_fp8.cuh<br/>(extern: 前处理不实例化)"]
+        B --> C["cute/fp8/sm_120/*.cuh 主 kernel<br/>(stage 相关, 每 TU 独有)"]
+    end
+    subgraph SharedTU["fwd_cute_fp8/fp4_preprocess.cu (×2)"]
+        D["generated/fwd_cute_fp8_preprocess.cuh<br/>define 模式: prepare_fp8_inputs 全组合"]
+        E["generated/fwd_cute_fp4_preprocess.cuh<br/>define 模式: launch_fp4_quant_* 全组合"]
+    end
+    B -. "extern template 声明<br/>(preprocess.cuh extern 模式)" .- D
+```
+
+**默认编译集裁剪（构建期 flags，env.py `_enabled_variants()`）**：冷构建 770s/451 TU → **525s/326 TU（-32%）**。两条轴：
+
+| flag | 默认 | 效果 |
+|---|---|---|
+| `ENABLE_FFPA_CUDA_INPUT_FP16` | 0 | 只编 bf16 输入 TU（fp16 输入 kernel 不编译，`fwd_{fp16,bf16}_native_*` 文件名 drop f32 后缀、fp16f16 保留全名） |
+| `ENABLE_FFPA_CUDA_MASK_FP32` | 0 | 剔除所有 `f=1`（bias 4B/fp32 mask）variant TU；量化族与 fp16 族统一 |
+
+运行时配套（`functional._cuda_input_guard_and_mask_downcast`）：fp16 输入 raise（提示 rebuild flag）；fp32 mask downcast 到 `q.dtype` 再调（数值等价，PC-0-5-pd 缓解选项 B 的默认形态）。headdim 128+512 子集下默认 97 TU / 全开 255 TU。
+
+**单条完整链路示例**（fp8、D=512、bf16、stage=2、无 hybrid）：
+
+`CUDABackend(enable_fp8=True)` → `_fwd_cuda` → `ffpa_api.cc` pad→512 → `fwd_bf16_cute_fp8_hdim512_s2.cu`（实例化 `ffpa_fwd_fp8<bf16,512,2>`）→ `dispatch/cute_fp8.cuh`：D=512∈(224,768) → `launch_cute_fwd_split_d_fp8_sm120<bf16,512,2>` → `_impl`：hadamard off → `ffpa_layout_of`×3 → kBr/kBc=128/128 → `prepare_fp8_inputs<bf16,128,128,512,kQKInt8>`（**extern→preprocess TU**）→ TMA Q/K/V/O → `split_d_fwd_cute_fp8_sm120<...Traits<512,...,kStagesQK=2,...>>`。
 
 ---
 
@@ -138,6 +199,14 @@ flowchart TD
 - CUDA backend **无 backward**：`CUDA_BWD_AVAILABLE=False`，`_ffpa_attn_backward_cuda` 直接 raise（历史实现已删除）。
 - 训练场景路由 `backward_backend='triton'` 或 `'sdpa'`；活跃 backward 开发在 Triton backend。
 
+### 2.5 构建裁剪 flags 的运行时门禁（`_cuda_input_guard_and_mask_downcast`）
+
+默认构建（见 §1.3 裁剪表）下，进入 CUDA fast path 前由 Python 层做输入适配（覆盖 `_ffpa_attn_forward` 与 `_FFPAAttnFunc.forward` 两个调用点）：
+
+- **fp16 输入**：capability probe（pybind attrs `CUDA_INPUT_FP16_AVAILABLE`，Python 侧 getattr 默认 True 兼容旧 so）探测到未编译 → raise，报错文案提示 `ENABLE_FFPA_CUDA_INPUT_FP16=1` 重建。
+- **fp32 attn_mask**：downcast 到 `q.dtype`（fp16/bf16）再进 kernel——mode-0 gmem-direct 路径 fp32 天然合法，但 downcast 使全部 plan mode 在默认构建下可达；additive mask 在 S 域加性注入，fp16 表示与量化路径注入域一致，精度语义不变。
+- bench CLI 的 `--dtype fp16` 默认构建下显式报错（`_dtype_or_error`），不静默回退。
+
 ---
 
 ## 3. Native 路径
@@ -152,7 +221,7 @@ Native 是 `AUTO`/`NATIVE` hint 的默认路径，也是 TMA super-path 中 sm90
 | split-KV decode 两阶段 | sm80+ | `native/sm_80/split_kv.cuh` | `Nq==1 && num_splits>1 && 无 bias/dropout` |
 | TMA split-D | sm90/100/120 | `native/sm_120/split_d.cuh` | `TMA` hint；或 sm120 上 fp16 家族带 bias/dropout 的回退；或 `D%32!=0` 的非 cute 回退 |
 
-Dispatch 细节（`launch.cuh`）：
+Dispatch 细节（`launch/native_fp16.cuh`）：
 
 - **sm90/100（228KB smem）**：WS（warp-specialized）路径，`setmaxnreg` 生效。clean path（无 bias/dropout 且 `D≤512`）用 `kPersistQg2s=1`（Q 常驻 smem），否则 `kPersistQg2s=0`。
 - **sm120（99KB smem）**：non-WS（`kNonWS=1`），全部 256 线程做 MMA、thread 0 inline 发 TMA。注释明确：**sm_120a 上没有 WGMMA**，且 `setmaxnreg` 在 sm_120a 上会触发 ptxas C7506 被静默忽略（所以构建用 `sm_120f`）。non-WS 相对 cp.async legacy +2~7%。
@@ -163,7 +232,7 @@ Dispatch 细节（`launch.cuh`）：
 | 特性 | 支持情况 |
 |---|---|
 | dtype | fp16 / bf16（bf16 强制 f32 acc） |
-| head_dim | 编译集内（`--headdim all` 时 %64 ∈ [64,1024]）；**FC-8 起支持运行时 pad**：`D_og%8==0` → 64 对齐 ∈[64,1024]，AUTO/NATIVE/TMA 三 hint 均可，Q/K/V **零物化**（sm80 cp.async 16B chunk 列守卫 src-size=0 / sm90+ TMA `minor_dim=d_og` OOB 零填充），仅 O 由 api 层 pad+切回；未编译档仍报 "headdim not support" |
+| head_dim | 编译集内（`--headdim all` 时 {64,128,192,256,320,512,768}）；**FC-8 起支持运行时 pad**：`D_og%8==0` → 64 对齐 ∈[64,1024]，AUTO/NATIVE/TMA 三 hint 均可，Q/K/V **零物化**（sm80 cp.async 16B chunk 列守卫 src-size=0 / sm90+ TMA `minor_dim=d_og` OOB 零填充），仅 O 由 api 层 pad+切回；未编译档仍报 "headdim not support" |
 | acc | f16 / f32（`kMmaAccFloat32QK/PV` 模板参数） |
 | causal | ✓（tail-aligned，要求 `Nkv ≥ Nq`） |
 | GQA/MQA | ✓（`Nh_q % Nh_kv == 0`，kernel 原生分组） |
@@ -216,7 +285,7 @@ WS split-D 变体（`launch_cute_fwd_split_d_ws_sm120`）已被禁用：`setmaxn
 |---|---|---|---|---|
 | causal（tail-aligned） | ✓ | ✓ | ✓ | ✓ |
 | GQA | ✓ | ✓ | ✓ | ✓ |
-| attn_bias | ✓（编译期 4 变体 `kHasAttnBias×kHasDropout`） | ✓ | ✓ | ✓ |
+| attn_bias | ✓（variant TU 化：`(kBiasOn,kBiasPlanMode,kBias4BytesPerElem,kHasDropout)` tag 每 TU 一表，launcher lambda 按 plan 分发 `_v`；默认构建无 f=1 变体 → fp32 mask 由 Python 层 downcast，见 §2.5） | ✓ | ✓ | ✓ |
 | dropout（philox） | ✓ | ✓ | ✓ | ✓ |
 | NHD 读（packed view） | ✓（Q/K/V 独立判定，`kNhdQ`/`kNhdKV`） | ✓ | ✓ | ✗（BHND-only，物化） |
 | **strided-NHD 读**（fused-QKV chunk） | ✓（仅 `D≤128` 本路径） | ✗ | ✗ | ✗ |
@@ -435,13 +504,13 @@ lse 公式（NVFP4 PV）：`lse = (m*L + log2(row_sum) + log2(1/2688))*ln2 + sca
 | Python 层归一化（`normalize_attn_mask`） | — | bool mask → additive（True 参与注意 / False→-inf，SDPA 语义）；2D→`[1,1,Nq,Nkv]`、3D→`[B,1,Nq,Nkv]` view；要求最内维连续（否则 contiguous）；dtype ∈ {bool, fp32, Q.dtype} |
 | 全局互斥 | — | `attn_mask` + `is_causal` 任何 backend 均拒绝 |
 | Native sm80 / sm120 TMA | ✓ | 4D 广播 `[B\|1, H\|1, Nq\|1, Nkv\|1]`；fp16/bf16/fp32；广播维 stride 置 0；dtype code 1/2/3；bias IO 已 rowvec 内联向量化（PC-0-2：门控 `(stride_m==0 \|\| Nq==1) && stride_n==1 && 对齐` 时 `half2`/`float2` 对加载服务 4 个 fragment 槽，消 16x load 冗余，验收 tma D512 2.00x / native 1.89x；不满足门控自动回落标量路径；`FFPA_BIAS_ROWVEC_DISABLE=1` 强制回落做 A/B） |
-| CUTE fp16（persist/split/M4N2/sm80） | ✓（编译期 4 变体） | bias IO 已 smem tile 化（PC-0-0：TMA 预取 + mode 2 rowvec 双缓冲 / mode 3 全驻留；D=128 gap 1.12、D=768 1.07 达标，D=320 结构极限 1.44，PC-0-3 两杠杆证伪关闭）；dispatch 默认仍回退 native TMA（除非 force_cute_tma） |
+| CUTE fp16（persist/split/M4N2/sm80） | ✓（variant TU 化：`(b,m,f,r)` tag，默认构建无 f=1） | bias IO 已 smem tile 化（PC-0-0：TMA 预取 + mode 2 rowvec 双缓冲 / mode 3 全驻留；D=128 gap 1.12、D=768 1.07 达标，D=320 结构极限 1.44，PC-0-3 两杠杆证伪关闭）；dispatch 默认仍回退 native TMA（除非 force_cute_tma）；fp32 mask 由 Python 层 downcast（§2.5） |
 | **CUTE FP8（全部三族）** | ✓（FC-4 + PC-0-1 tile） | raw-S 域注入 `bias/(qs*ks*scale_orig)`；`kHasAttnBias` 双实例 tag dispatch；仅拒 dropout；bias IO 已 smem tile 化（PC-0-1：persist_d mode 3 **1.84x**、split_d D=320 mode 2 1.20x / D≥512 demote mode 0（PC-0-4）、m4n2 occupancy 守卫 mode 2 1.03x） |
 | **CUTE FP4（全部三族）** | ✓（FC-4 + PC-0-1 tile） | dequant 域注入 `bias/scale_orig`，列 `kv_perm32(j)`；仅拒 dropout；bias IO 已 smem tile 化（PC-0-1：split_d mode 3 **1.67x**；**m4n2 已 pin mode 0 gmem 直读**，PC-0-5 止血 2026-09-04：mode 2/3 在纯 bias 序列 100% 触发 bitwise 非确定 → launcher 强制 mode 0（pure 序列 10/10 稳定，attn-mask ~5% 代价），`FFPA_BIAS_TILE_KEEP=1` 可恢复 tile 模式；**残留（接受）**：重负载前置下 bias 模板仍低概率不稳（mode 0 亦然，硬件负载时序层；no-bias 模板同负载干净；m4n2 仅 D≥768 fp4 场景少）；fp8 全族、fp16 全族、fp4 split_d 实证干净） |
 | cutedsl backend | ✗ | `NotImplementedError`（无静默 fallback） |
 | Triton backend | ✓ | （非本报告范围，支持 additive mask 梯度） |
 
-**结论：attn_mask 的低精度路径已由 FC-4 解锁**（fp8/fp4 六族均支持，2026-08-28）；bias 注入 IO 已全家族优化（PC-0-0 fp16 cute smem tile 化 2026-08-31 / PC-0-1 fp8+fp4 smem tile 化 2026-09-01，主力 mode 3 全驻留 + occupancy 守卫 / PC-0-2 native rowvec 内联向量化 2026-09-03，残余为 load-latency 主导、预取受寄存器预算约束搁置）；**正确性现状（PC-0-5 止血，2026-09-04）**：native / fp16 全族 / fp8 六族 / fp4 split_d / **fp4 persist_d（D=256/D=128 各 0/30 实测）** bias 路径全部干净，**唯一 PC-0-5 问题 = fp4 split_d_m4n2 + attn_bias**（纯 bias 序列 mode 2/3 100% 触发 → **已 pin mode 0**，pure 序列稳定、`FFPA_BIAS_TILE_KEEP=1` 逃生口；**残留（接受）**：重负载前置下 bias 模板仍低概率不稳（mode 0 亦然——硬件负载时序层，no-bias 模板同负载干净；触发需 bias+重负载+m4n2（仅 D≥768 fp4）三重条件，现实场景少；指纹恒定单个 (m-warp,n-warp,v-chunk) PV C tile、lse 稳定、diff ~0.8% 元素 max ~0.039，根治待 NVIDIA 上报）。**区分**：fp4 persist_d 另有一处独立低概率（3/30）epilogue race（非 PC-0-5，persist_d 无 mode 0 等价路径，需独立排查）；m4n2 另有 **Nq=64 单 q-tile illegal access 独立 bug 待修**；dropout 仍为 fp16 家族专属。
+**结论：attn_mask 的低精度路径已由 FC-4 解锁**（fp8/fp4 六族均支持，2026-08-28）；bias 注入 IO 已全家族优化（PC-0-0 fp16 cute smem tile 化 2026-08-31 / PC-0-1 fp8+fp4 smem tile 化 2026-09-01，主力 mode 3 全驻留 + occupancy 守卫 / PC-0-2 native rowvec 内联向量化 2026-09-03，残余为 load-latency 主导、预取受寄存器预算约束搁置）；**正确性现状（PC-0-5 止血，2026-09-04）**：native / fp16 全族 / fp8 六族 / fp4 split_d / **fp4 persist_d rowvec（D=256/D=128 各 0/30，重负载复验 0/60×3）** bias 路径全部干净，**PC-0-5 问题① = fp4 split_d_m4n2 + attn_bias**（纯 bias 序列 mode 2/3 100% 触发 → **已 pin mode 0**，pure 序列稳定、`FFPA_BIAS_TILE_KEEP=1` 逃生口；**残留（接受）**：重负载前置下 bias 模板仍低概率不稳（mode 0 亦然——硬件负载时序层，no-bias 模板同负载干净；触发需 bias+重负载+m4n2（仅 D≥768 fp4）三重条件，现实场景少；指纹恒定单个 (m-warp,n-warp,v-chunk) PV C tile、lse 稳定、diff ~0.8% 元素 max ~0.039，根治待 NVIDIA 上报）。**区分**：fp4 persist_d + **dense fp32 mask**（mode 0 gmem 注入）的独立 race **已定性（2026-09-07，PC-0-5-pd）**：fp4 特有 × dense × mode 0 × 负载状态四重条件，重负载下 100% 触发（lse 稳定、PV/O 侧 16 行 warp 段、racecheck 0 + sanitizer 串行化免疫——硬件时序层，与 m4n2 同队列待 NVIDIA 上报）；rowvec（mode 3）与 fp16/bf16 dense（mode 1）免疫、fp8 同形干净，缓解选项待决策；m4n2 的 **Nq=64 illegal access 已修复（2026-09-07，bias 尾 tile OOB 三缺陷清扫）**：根因是 bias 注入在尾 tile 读 pad 行/列越界（smem mode 3 resident 按需截断分配 + gmem mode 0 直读两族），修复采用**分配侧 padding + gmem 模板双实例**（热路径指令级零开销——注入循环内 min 钳制/双分支会被 ptxas if-conversion 或向量化打爆 issue 受限 kernel 的指令数，fp4 persist_d 实测 +21~26% 指令 = +24% 耗时）；fp4 m4n2 的 mode 3 升级永久禁用（deterministic 8B LDS.64 越界读 + PC-0-5，KEEP 调试路径最高 mode 2）；dropout 仍为 fp16 家族专属。
 
 ### 7.2 dropout
 
@@ -483,7 +552,7 @@ strided-NHD 门禁细节（`ffpa_is_strided_nhd`）：`stride(3)==1 && stride(1)
 
 | 路径 | 原生 D 集合 | pad 规则 | pad 实现方式 |
 |---|---|---|---|
-| native（AUTO/NATIVE/TMA） | 编译集（默认 %64 ∈ [320,1024]；`--headdim all` %64 ∈ [64,1024]） | `D_og%8==0` → **64 对齐** ∈[64,1024]（FC-8） | **Q/K/V 不物化**：sm80 cp.async 16B chunk 列守卫（`cp_async_zfill` src-size=0，含 decode split-KV）/ sm90+ TMA descriptor `minor_dim=d_og` OOB 零填充；仅 O pad 切回。TMA hint 仅在 TMA ext 已编译且 sm90+ 计入（pre-sm90 回落 CUTE sm80 走 32 对齐物化 pad） |
+| native（AUTO/NATIVE/TMA） | 编译集（默认 = default 集 {64,128,192,256,320,512}；`--headdim all` {64,128,192,256,320,512,768}） | `D_og%8==0` → **64 对齐** ∈[64,1024]（FC-8） | **Q/K/V 不物化**：sm80 cp.async 16B chunk 列守卫（`cp_async_zfill` src-size=0，含 decode split-KV）/ sm90+ TMA descriptor `minor_dim=d_og` OOB 零填充；仅 O pad 切回。TMA hint 仅在 TMA ext 已编译且 sm90+ 计入（pre-sm90 回落 CUTE sm80 走 32 对齐物化 pad） |
 | cute fp16 | persist: %32 ≤128；split: %64（<768）/ %32（(32,32) chunk）；M4N2: %64 [768,1024] | `D_og%8==0` → 32 对齐 | **Q/K/V `constant_pad_nd` 物化 + O pad 切回**（TMA stride 需 D_pad） |
 | fp8 | persist %32 ≤224；split (224,768)；M4N2 ≥768 | `D_og%8==0` → 32 对齐 ≤1024 | **quantize kernel 读 D_og stride + 零填 pad 列（不物化）**；仅 O pad |
 | fp4 | persist {64,128,192,256}；split (256,768)；M4N2 [768,1024] | `D_og%8==0` → **64 对齐** ∈[64,1024] | 同 fp8 fused（`FFPA_FP4_PAD_TORCH=1` 可切 torch pad） |
@@ -518,7 +587,7 @@ softmax_scale 恒按真实 D（Python 解析 `1/sqrt(D_og)`）。
 
 ## 9. 未来优化方向
 
-> 本节为方向概览；**工程级实施方案见 [references/rfc-future-optimizations.md](references/rfc-future-optimizations.md)**（按"功能完备性 > 性能优化"两轨组织：轨道 F=FC-1..10 功能 / 轨道 P=PC-1..5 性能 + 已证伪附录）。已证伪且不应重复投入的实验在 §5.8/§6.6 与 RFC 附录 A。
+> 本节为方向概览；**工程级实施方案见 [references/rfc-future-optimizations.md](references/rfc-future-optimizations.md)**（按"功能完备性 > 性能优化"两轨组织：轨道 F=FC-1..12 功能 / 轨道 P=PC-0..15 性能 + 已证伪附录）。已证伪且不应重复投入的实验在 §5.8/§6.6 与 RFC 附录 A。
 
 ### 9.1 kernel 级（区分"已证伪"与"待做"）
 
@@ -552,11 +621,18 @@ softmax_scale 恒按真实 D（Python 解析 `1/sqrt(D_og)`）。
 |---|---|
 | `FFPA_CUDA_ALLOW_SMALL_D=1` | 允许 CUDA backend 跑 D≤256（否则 SDPA fallback） |
 | `FFPA_CUTE_ALLOW_SMALL_D` / `FFPA_TRITON_ALLOW_SMALL_D` | 同上，cutedsl/triton |
-| `FFPA_FP8_FORCE_KERNEL=split_d\|m4n2` | 强制 fp8 split-D kernel A/B（224<D≤1024） |
-| `FFPA_FP8_PQUANT_PER_ROW=1` | per-row P 量化（满量程，禁 lazy rescale） |
-| `FFPA_FP4_PAD_TORCH=1` | fp4 pad 走 torch 物化路径（A/B 对照） |
+| `FFPA_FP8_FORCE_KERNEL=split_d\|m4n2` | 强制 fp8 split-D kernel A/B（224<D≤1024）（debug build only） |
+| `FFPA_FP8_PQUANT_PER_ROW=1` | per-row P 量化（满量程，禁 lazy rescale）（debug build only） |
+| `FFPA_FP4_PAD_TORCH=1` | fp4 pad 走 torch 物化路径（A/B 对照）（debug build only） |
 | `FFPA_FP8_KV_STAGES="K,V"` | fp8 persist-D stages 组合实验 dispatch |
 | `FFPA_PTXAS_VERBOSE=1` | 注入 `-Xptxas -v`（须配 `FFPA_NVCC_THREADS=1`，ccache shim 坑） |
+
+**构建期 flags（传给 build.sh / pip，非运行时 env）**：
+
+| flag | 默认 | 作用 |
+|---|---|---|
+| `ENABLE_FFPA_CUDA_INPUT_FP16=1` | 0 | 编入 fp16 输入 TU（默认只编 bf16：native TU 名 drop f32 后缀、cute 家族 fp16f32/fp16f16 specs 不渲染）；不开时 fp16 输入在 Python 层 raise（§2.5） |
+| `ENABLE_FFPA_CUDA_MASK_FP32=1` | 0 | 编入 `f=1`（4B/fp32 mask）variant TU；不开时 fp32 mask 由 Python 层 downcast 到 q.dtype（§2.5） |
 
 ### 10.2 bench CLI（`python -m ffpa_attn.bench`）
 
@@ -569,11 +645,18 @@ softmax_scale 恒按真实 D（Python 解析 `1/sqrt(D_og)`）。
 
 ```bash
 bash ./build.sh --arch sm_120f --headdim <list> --ext all --jobs 64
-# 默认 headdim：64 倍数 ∈ [320,1024]；'all' → [64,1024]
-# 32/96/128/192/224 等必须显式传
+# 不传 flag = 'default'（64,128,192,256,320,512）
+# 'default' → 64,128,192,256,320,512；'all' → default + 768（832-1024 编译极慢，已移出 all）
+# 其它 headdim（32/96/120/224/832..1024 等）必须显式列表传；ENABLE_FFPA_ALL_HEADDIM=1 env（仅裸 setup.py/pip 路径）可编满 [64,1024] %64
 # sm_120f（非 sm_120a）才能让 setmaxnreg 生效（120a 上 ptxas C7506 静默忽略）
 # 开发测试期间避免全量编译headdim，减少编译时间；只编译需要测试的headdim，比如 128/512等
 # 开发收敛后再全量编译 headdim，避免 bench 时遇到未编译 headdim 报错
+# debug 构建开关 --debug-ext <fp16|fp8|fp4 csv|all>（默认 none）按需使用：只开正在调试的家族；
+# 盲目 --debug-ext all 编译大幅变慢（全家族 debug getenv 分支 + fp8 FORCE_KERNEL 双 split-D
+# 实例化，实测 ~3.6x：1320s vs 默认 367s）；上述 debug env 开关仅在对应家族 debug 构建中存在
+# 默认编译集裁剪（2026-09-08 起生效）：bf16-only 输入 + 无 f=1（fp32 mask）variant TU，
+#   冷构建 770s/451 TU → 525s/326 TU（-32%）；需 fp16 输入/fp32 mask 变体时加
+#   ENABLE_FFPA_CUDA_INPUT_FP16=1 / ENABLE_FFPA_CUDA_MASK_FP32=1（见 §10.1）
 # 另外注意：AutoDL上的测试机器最多 --jobs 6，避免CPU 过载被Kill
 ```
 
@@ -648,7 +731,7 @@ ffpa 的 stage-2 实现直接对 `chunk_lse` = $m_i+\ln l_i$ 做 log-sum-exp： 
 
 **split 数选择**（`select_decode_num_splits`，波效率贪心）：parallelism 充足（`batch_nheads_mblocks ≥ 0.8·SMs`）时 splits=1；否则枚举 `num_splits ∈ [1, min(max_splits, SMs, n_blocks)]`，效率 $\eta(n)=\frac{n_w}{\lceil n_w\rceil}$（ $n_w$ = waves = 并行块数/SM 数）取最大；`active_rows==1`（真 decode）取 $\arg\max\eta$，其余场景在 $\eta\ge0.85\eta_{\max}$ 的较小 split 数中取（少合并开销）。`is_split_eligible` 排除不减少 tile/块的冗余 split。
 
-**ffpa 代码**：`native/sm_80/split_kv.cuh`（s1: per-split partial + chunk_lse；s2: merge），入口在 `native/launch.cuh` 的 `Nq==1 && num_splits>1 && !bias && !dropout` 分支。
+**ffpa 代码**：`native/sm_80/split_kv.cuh`（s1: per-split partial + chunk_lse；s2: merge），入口在 `launch/native_fp16.cuh` 的 `Nq==1 && num_splits>1 && !bias && !dropout` 分支。
 
 **含义**：decode fast-path 仅存在于 native 路径；量化路径（fp8/fp4）小 $N_q$ 的不划算来自固定前处理链（§6.4），不是 merge 数学。
 
@@ -712,7 +795,7 @@ QK 与 PV 的 fragment 生命周期不重叠（Q/K frags 在 softmax 前已死�
 
 **代价与交叉点**。M4N2 的代价：kBr 减半（CTA 数翻倍、单 CTA 工作量减半）；P 必须 SMEM roundtrip（每 N-warp 只持半列，warp 内 reshuffle 无法重建完整 P：stmatrix→SMEM→LDSM_N，8KB/KV-tile）；cross-N-warp softmax（§11.12）。实测（5090，N=8192，fp16）：D≤640 M8N1 快 +2~16%，D≥768 M4N2 快（+7%@768、+11%@896、**+55%@1024**），dispatch 交叉点 D=768。**M4N2 的意义不是"让 D=512 可行"，而是把崩塌点从 ~D=768 推迟到 D≥2048**；SMEM 侧 57KB 与 D 完全无关（Q/K/V 各 16KB + P 8KB + 交换区 1KB）。
 
-**ffpa 代码**：`cute/sm_120/split_d_m4n2.cuh`、`attn_traits.cuh` 的 `FFPAAttnCuTeSplitDM4N2Traits`、`launch.cuh` dispatch `D≥768→M4N2`。设计推导见 [references/ffpa_split_d_m4n2_design.md](references/ffpa_split_d_m4n2_design.md) 与 [references/ffpa_split_d_m4n4_analysis.md](references/ffpa_split_d_m4n4_analysis.md)。
+**ffpa 代码**：`cute/sm_120/split_d_m4n2.cuh`、`attn_traits.cuh` 的 `FFPAAttnCuTeSplitDM4N2Traits`、`launch/cute_fp16.cuh` dispatch `D≥768→M4N2`。设计推导见 [references/ffpa_split_d_m4n2_design.md](references/ffpa_split_d_m4n2_design.md) 与 [references/ffpa_split_d_m4n4_analysis.md](references/ffpa_split_d_m4n4_analysis.md)。
 
 ### 11.5 量化基础与数值格式
 
@@ -951,7 +1034,7 @@ $$O=\big[\,O_{[0:n)}^{(\text{fp16 kernel})};\ \ O_{[n:N)}^{(\text{fp8/fp4 kernel
 
 **lse 边界**：两个 stage 各写自己行集的 lse 段（`softmax_lse.slice(2,0,n).copy_`），无重叠无缝隙。
 
-**ffpa 代码**：`csrc/cuffpa/launch.cuh` 的 fp8/fp4 hybrid 分支（stage-1 `launch_cute_fwd_persist_d_sm120`/`split_d`/`split_d_m4n2` 按 D 选，stage-2 带 `q_start_row`）。
+**ffpa 代码**：`csrc/cuffpa/launch/router.cuh` 的 fp8/fp4 hybrid 分支（stage-1 `launch_cute_fwd_persist_d_sm120`/`split_d`/`split_d_m4n2` 按 D 选，stage-2 带 `q_start_row`）。
 
 ### 11.14 causal tail-aligned 形式化
 

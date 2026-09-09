@@ -6,22 +6,32 @@ namespace ffpa_cute {
 
 // Additive attention bias on rowcol scores (pre-softmax).
 // Partial unroll to avoid icache pressure from 256 scalar loads.
-template <typename ScoresTensor, typename CoordTensor, int kRows, int kCols>
+// kTailTile=true (tail tiles only) clamps pad rows/cols to the last valid
+// element: their scores are -INFINITY-masked or dropped by the O-write
+// guards, so any in-bounds value is output-identical while every load
+// stays inside the tensor. kTailTile=false keeps the original hot path
+// instruction-for-instruction (separate template instances force a real
+// branch at the call site instead of if-conversion into one loop body).
+template <typename ScoresTensor, typename CoordTensor, int kRows, int kCols,
+          bool kTailTile>
 __device__ __forceinline__ void apply_attn_bias_rowcol(
     ScoresTensor& scores, const CoordTensor& tScS_rc,
     const void* __restrict__ attn_bias, int attn_bias_dtype, long long stride_b,
     long long stride_h, long long stride_m, long long stride_n, int Nb_id,
-    int Nh_id, int Br_base, int kv_tile, int kBc, float inv_scale) {
+    int Nh_id, int Br_base, int kv_tile, int kBc, float inv_scale, int q_valid,
+    int kv_valid) {
   const long long bias_base =
       (long long)Nb_id * stride_b + (long long)Nh_id * stride_h;
   const int bc_base = kv_tile * kBc;
 #pragma unroll
   for (int row = 0; row < kRows; ++row) {
-    const int q_row = Br_base + cute::get<0>(tScS_rc(row, 0));
+    const int r = cute::get<0>(tScS_rc(row, 0));
+    const int q_row = Br_base + (kTailTile ? min(r, q_valid - 1) : r);
     const long long row_off = bias_base + (long long)q_row * stride_m;
 #pragma unroll
     for (int col = 0; col < kCols; ++col) {
-      const int k_col = bc_base + cute::get<1>(tScS_rc(row, col));
+      const int c = cute::get<1>(tScS_rc(row, col));
+      const int k_col = bc_base + (kTailTile ? min(c, kv_valid - 1) : c);
       scores(row, col) += ffpa::prefill::load_attn_bias_value(
                               attn_bias, attn_bias_dtype,
                               row_off + (long long)k_col * stride_n) *
@@ -37,25 +47,29 @@ __device__ __forceinline__ void apply_attn_bias_rowcol(
 // 1/(qs_arr[row]*ks*scale_orig) lands as +bias in softmax-input units on
 // masked and unmasked tiles alike. q_row_base = q_start_row + Br_base is
 // the absolute query row (split/hybrid launches offset rows); kv columns
-// are in natural order on the fp8 kernels.
-template <typename ScoresTensor, typename CoordTensor, int kRows, int kCols>
+// are in natural order on the fp8 kernels. kTailTile mirrors
+// apply_attn_bias_rowcol: true = clamped tail-tile loads, false = hot path.
+template <typename ScoresTensor, typename CoordTensor, int kRows, int kCols,
+          bool kTailTile>
 __device__ __forceinline__ void apply_attn_bias_quant_rowcol(
     ScoresTensor& scores, const CoordTensor& tScS_rc,
     const void* __restrict__ attn_bias, int attn_bias_dtype, long long stride_b,
     long long stride_h, long long stride_m, long long stride_n, int Nb_id,
     int Nh_id, int q_row_base, int kv_tile, int kBc,
-    const float (&inv_sd)[kRows]) {
+    const float (&inv_sd)[kRows], int q_valid, int kv_valid) {
   const long long bias_base =
       (long long)Nb_id * stride_b + (long long)Nh_id * stride_h;
   const int bc_base = kv_tile * kBc;
 #pragma unroll
   for (int row = 0; row < kRows; ++row) {
-    const int q_row = q_row_base + cute::get<0>(tScS_rc(row, 0));
+    const int r = cute::get<0>(tScS_rc(row, 0));
+    const int q_row = q_row_base + (kTailTile ? min(r, q_valid - 1) : r);
     const long long row_off = bias_base + (long long)q_row * stride_m;
     const float inv = inv_sd[row];
 #pragma unroll
     for (int col = 0; col < kCols; ++col) {
-      const int k_col = bc_base + cute::get<1>(tScS_rc(row, col));
+      const int c = cute::get<1>(tScS_rc(row, col));
+      const int k_col = bc_base + (kTailTile ? min(c, kv_valid - 1) : c);
       scores(row, col) += ffpa::prefill::load_attn_bias_value(
                               attn_bias, attn_bias_dtype,
                               row_off + (long long)k_col * stride_n) *
@@ -66,7 +80,7 @@ __device__ __forceinline__ void apply_attn_bias_quant_rowcol(
 
 // Additive attention bias read from a per-KV-tile prefetched smem tile
 // (PC-0). The host side classifies the broadcast shape (see FfpaBiasTilePlan
-// in launch.cuh) and only enables this path when the tile fits the smem
+// in launch/common.cuh) and only enables this path when the tile fits the smem
 // budget; otherwise the gmem-direct variants above stay as fallback. The
 // tile holds the mask's original dtype; s_row/s_col are runtime smem strides
 // selected by shape: dense=(kBc,1), row-broadcast=(0,1), col-broadcast=(1,0).

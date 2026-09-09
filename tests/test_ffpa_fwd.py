@@ -18,6 +18,16 @@ import ffpa_attn.functional as ffpa_attn_functional  # noqa: E402
 from ffpa_attn.functional import TritonBackend  # noqa: E402
 from ffpa_attn.triton._ffpa_fwd import _ffpa_attn_forward_decode_impl  # noqa: E402
 
+try:
+  from ffpa_attn.cuda import CUDA_INPUT_FP16_AVAILABLE  # noqa: E402
+except Exception:  # pragma: no cover
+  CUDA_INPUT_FP16_AVAILABLE = True
+
+requires_cuda_fp16 = pytest.mark.skipif(
+  not CUDA_INPUT_FP16_AVAILABLE,
+  reason="fp16 CUDA inputs trimmed; rebuild with ENABLE_FFPA_CUDA_INPUT_FP16=1",
+)
+
 # ROCm/AMD detection: dropout mask RNG differs between Triton-AMD and PyTorch SDPA
 IS_ROCM = hasattr(torch.version, 'hip') and torch.version.hip is not None
 
@@ -296,6 +306,8 @@ def test_ffpa_attn_func_triton_small_d_env_uses_triton(monkeypatch):
 @pytest.mark.parametrize("mask_kind", ["bool_2d", "additive_broadcast"])
 def test_ffpa_attn_func_cuda_attn_mask_matches_sdpa(dtype, D, mask_kind):
   _require_cuda_forward_impl()
+  if dtype is torch.float16 and not CUDA_INPUT_FP16_AVAILABLE:
+    pytest.skip("fp16 CUDA inputs trimmed (ENABLE_FFPA_CUDA_INPUT_FP16=0)")
   q, k, v = _alloc_qkv(1, 4, 512, D, dtype)
   if mask_kind == "bool_2d":
     attn_mask = torch.ones(
@@ -314,6 +326,24 @@ def test_ffpa_attn_func_cuda_attn_mask_matches_sdpa(dtype, D, mask_kind):
   torch.testing.assert_close(out, ref, **_tolerance(dtype))
 
 
+def test_ffpa_attn_func_cuda_fp32_mask_matches_sdpa():
+  """fp32 masks work in every build: natively with ENABLE_FFPA_CUDA_MASK_FP32,
+  downcast to q.dtype otherwise (bf16 inputs stay valid in trimmed builds)."""
+  _require_cuda_forward_impl()
+  # D=320 keeps this on the real CUDA kernel path (D<=256 without
+  # FFPA_CUDA_ALLOW_SMALL_D would silently SDPA-fallback).
+  q, k, v = _alloc_qkv(1, 4, 512, 320, torch.bfloat16)
+  torch.manual_seed(1)
+  attn_mask = torch.randn(
+    1, 1, 1, k.size(2), device=q.device, dtype=torch.float32
+  ) * 0.25
+  out = ffpa_attn_func(q, k, v, attn_mask=attn_mask, forward_backend="cuda")
+  ref = _sdpa_ref(q.float(), k.float(), v.float(),
+                  attn_mask=attn_mask).to(torch.bfloat16)
+  torch.testing.assert_close(out, ref, **_tolerance(torch.bfloat16))
+
+
+@requires_cuda_fp16
 def test_ffpa_attn_func_cuda_attn_mask_cross_gqa_matches_sdpa():
   _require_cuda_forward_impl()
   dtype = torch.float16
@@ -356,6 +386,7 @@ def test_ffpa_attn_func_triton_dropout_matches_sdpa():
   torch.testing.assert_close(out, ref, **_tolerance(torch.float16))
 
 
+@requires_cuda_fp16
 def test_ffpa_attn_func_cuda_dropout_matches_sdpa():
   _require_cuda_forward_impl()
   q, k, v = _alloc_qkv(1, 2, 512, 512, torch.float16)
@@ -391,6 +422,7 @@ def test_ffpa_attn_func_triton_dropout_large_n_matches_sdpa(monkeypatch):
   torch.testing.assert_close(out, ref, atol=4e-2, rtol=4e-2)
 
 
+@requires_cuda_fp16
 def test_ffpa_attn_func_cuda_dropout_large_n_matches_sdpa(monkeypatch):
   _require_cuda_forward_impl()
   monkeypatch.setenv("FFPA_CUDA_ALLOW_SMALL_D", "1")
@@ -406,6 +438,7 @@ def test_ffpa_attn_func_cuda_dropout_large_n_matches_sdpa(monkeypatch):
   torch.testing.assert_close(out, ref, atol=4e-2, rtol=4e-2)
 
 
+@requires_cuda_fp16
 def test_ffpa_fwd_cuda_triton_dropout_2p33_cross_consistent(monkeypatch):
   # B1 H32 N16384 totals 2**33 score elements, where torch's mem-efficient
   # SDPA reference wraps its own dropout RNG offset in 32-bit arithmetic
@@ -423,6 +456,7 @@ def test_ffpa_fwd_cuda_triton_dropout_2p33_cross_consistent(monkeypatch):
   torch.testing.assert_close(cuda_out, triton_out, atol=2e-2, rtol=2e-2)
 
 
+@requires_cuda_fp16
 def test_ffpa_attn_func_cuda_dropout_with_attn_mask_matches_sdpa():
   _require_cuda_forward_impl()
   q, k, v = _alloc_qkv(1, 2, 512, 320, torch.float16)
@@ -452,6 +486,7 @@ def test_ffpa_attn_func_cuda_dropout_with_attn_mask_matches_sdpa():
   torch.testing.assert_close(out, ref, atol=4e-2, rtol=4e-2)
 
 
+@requires_cuda_fp16
 def test_ffpa_attn_func_cuda_decode_dropout_matches_sdpa():
   _require_cuda_forward_impl()
   q, k, v = _alloc_cross_qkv(1, 2, 1, 4096, 512, torch.float16)
@@ -993,6 +1028,8 @@ def test_ffpa_attn_func_triton_decode_matches_sdpa(dtype, Nq, Nkv, D, causal):
 )
 def test_ffpa_attn_func_cuda_decode_matches_sdpa(dtype, Nq, Nkv, D, causal):
   _require_cuda_forward_impl()
+  if dtype is torch.float16 and not CUDA_INPUT_FP16_AVAILABLE:
+    pytest.skip("fp16 CUDA inputs trimmed (ENABLE_FFPA_CUDA_INPUT_FP16=0)")
   B, H = 1, 4
   q, k, v = _alloc_cross_qkv(B, H, Nq, Nkv, D, dtype)
   out = ffpa_attn_func(q, k, v, is_causal=causal, forward_backend="cuda")
@@ -1057,6 +1094,8 @@ def test_ffpa_attn_func_triton_decode_gqa_matches_sdpa(dtype, Nq, D):
 @pytest.mark.parametrize("Nq,D", [(1, 512), (7, 320)])
 def test_ffpa_attn_func_cuda_decode_gqa_matches_sdpa(dtype, Nq, D):
   _require_cuda_forward_impl()
+  if dtype is torch.float16 and not CUDA_INPUT_FP16_AVAILABLE:
+    pytest.skip("fp16 CUDA inputs trimmed (ENABLE_FFPA_CUDA_INPUT_FP16=0)")
   B, Nh_q, Nh_kv, Nkv = 1, 8, 2, 8192
   torch.manual_seed(0)
   q = torch.randn(B, Nh_q, Nq, D, dtype=dtype, device="cuda")
@@ -1469,12 +1508,21 @@ def _native_pad_tol(dtype):
 @pytest.mark.parametrize("D", NATIVE_PAD_DS)
 def test_native_head_dim_pad_matches_sdpa(monkeypatch, D, tma, causal, dtype):
   monkeypatch.setenv("FFPA_CUDA_ALLOW_SMALL_D", "1")
+  if dtype is torch.float16 and not CUDA_INPUT_FP16_AVAILABLE:
+    pytest.skip("fp16 CUDA inputs trimmed (ENABLE_FFPA_CUDA_INPUT_FP16=0)")
   torch.manual_seed(0)
   B, H, N = 1, 8, 1024
   q, k, v = _alloc_qkv(B, H, N, D, dtype)
-  out = ffpa_attn_func(
-    q, k, v, is_causal=causal, forward_backend=_native_pad_backend(tma)
-  )
+  try:
+    out = ffpa_attn_func(
+      q, k, v, is_causal=causal, forward_backend=_native_pad_backend(tma)
+    )
+  except RuntimeError as exc:
+    # Pad targets (e.g. D=328 -> 384, D=800 -> 832) only run when that
+    # headdim is in the build set.
+    if "headdim not support" in str(exc):
+      pytest.skip(f"D={D} pad target not in the compiled headdim set")
+    raise
   assert out.shape == q.shape
   assert out.dtype == dtype
   assert torch.isfinite(out).all()
@@ -1484,6 +1532,7 @@ def test_native_head_dim_pad_matches_sdpa(monkeypatch, D, tma, causal, dtype):
   torch.testing.assert_close(out, ref, **_native_pad_tol(dtype))
 
 
+@requires_cuda_fp16
 @pytest.mark.parametrize("causal", [False, True], ids=["dense", "causal"])
 def test_native_head_dim_pad_tail_tiles(monkeypatch, causal):
   # Non-tile-multiple Nq/Nkv exercise the seqlen-bound + tail guards.
@@ -1510,6 +1559,7 @@ def test_native_head_dim_pad_tail_tiles(monkeypatch, causal):
   torch.testing.assert_close(out, ref, **_native_pad_tol(torch.float16))
 
 
+@requires_cuda_fp16
 def test_native_head_dim_pad_gqa(monkeypatch):
   monkeypatch.setenv("FFPA_CUDA_ALLOW_SMALL_D", "1")
   torch.manual_seed(0)
@@ -1527,6 +1577,7 @@ def test_native_head_dim_pad_gqa(monkeypatch):
   torch.testing.assert_close(out, ref, **_native_pad_tol(torch.float16))
 
 
+@requires_cuda_fp16
 def test_native_head_dim_pad_attn_mask(monkeypatch):
   # Additive mask routes through the full _FFPAAttnFunc chain (the inference
   # fast path only takes attn_mask=None).
@@ -1547,6 +1598,7 @@ def test_native_head_dim_pad_attn_mask(monkeypatch):
   torch.testing.assert_close(out, ref, **_native_pad_tol(torch.float16))
 
 
+@requires_cuda_fp16
 def test_native_head_dim_pad_dropout_deterministic(monkeypatch):
   # SDPA-dropout parity is a bench concern; here verify the native pad +
   # dropout path is deterministic per philox state (seeded before each call)
@@ -1567,6 +1619,7 @@ def test_native_head_dim_pad_dropout_deterministic(monkeypatch):
   assert not torch.equal(out1, out_nodrop)
 
 
+@requires_cuda_fp16
 @pytest.mark.parametrize("tma", [False, True], ids=["native", "tma"])
 def test_native_head_dim_pad_decode(monkeypatch, tma):
   monkeypatch.setenv("FFPA_CUDA_ALLOW_SMALL_D", "1")
@@ -1581,6 +1634,7 @@ def test_native_head_dim_pad_decode(monkeypatch, tma):
   torch.testing.assert_close(out, ref, **_native_pad_tol(torch.float16))
 
 
+@requires_cuda_fp16
 def test_native_head_dim_pad_stage_variant(monkeypatch):
   monkeypatch.setenv("FFPA_CUDA_ALLOW_SMALL_D", "1")
   torch.manual_seed(0)
