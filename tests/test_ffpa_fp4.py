@@ -640,6 +640,32 @@ def test_fp4_attn_bias_parity(D, kind, monkeypatch):
   torch.testing.assert_close(out.float(), ref.float(), **tol)
 
 
+@pytest.mark.parametrize("D", [64, 128, 192, 256])
+def test_fp4_persist_d_fp32_dense_downcast_bitwise(D, monkeypatch):
+  # PC-0-5-pd option B: a dense fp32 mask is downcast to the q.dtype twin
+  # inside the launcher at every persist-D — escaping to the immune mode-1
+  # TMA tile at D<=128 (the D=64 native fp32 tile hard-fails its smem
+  # opt-in), or halving the mode-0 gmem load at D>=192 where even the 2B
+  # tile misses the budget — so mask32 and mask16 == mask32.to(q.dtype)
+  # must be bitwise identical at every D.
+  monkeypatch.setenv("FFPA_CUDA_ALLOW_SMALL_D", "1")
+  torch.manual_seed(0)
+  B, H, N = 1, 8, 2048
+  q, k, v = _mk(B, H, H, N, D)
+  # Values not exactly representable in fp16 (unlike a 0/1 mask): if the
+  # downcast were ever removed, out32 would inject raw fp32 values and
+  # diverge from out16 immediately.
+  mask32 = torch.rand(B, H, N, N, device="cuda") * 0.25
+
+  out32 = ffpa_attn_func(
+    q, k, v, attn_mask=mask32, forward_backend=_fp4_backend()
+  )
+  out16 = ffpa_attn_func(
+    q, k, v, attn_mask=mask32.to(q.dtype), forward_backend=_fp4_backend()
+  )
+  assert torch.equal(out32, out16)
+
+
 @pytest.mark.parametrize("kind", ["additive", "broadcast", "bool"])
 def test_fp4_attn_mask_forms_match_sdpa(kind, monkeypatch):
   monkeypatch.setenv("FFPA_CUDA_ALLOW_SMALL_D", "1")
