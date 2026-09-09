@@ -41,43 +41,46 @@ void launch_cute_fwd_persist_d_sm120(torch::Tensor Q, torch::Tensor K,
                 "ffpa_attn: fp32 attn_mask requires a build with "
                 "ENABLE_FFPA_CUDA_MASK_FP32=1");
 #endif
-    using Ic = std::integral_constant<int, 1>;
+    using Ic1 = std::integral_constant<int, 1>;
     using Ic0 = std::integral_constant<int, 0>;
     using Ic2 = std::integral_constant<int, 2>;
     using Ic3 = std::integral_constant<int, 3>;
-    const auto call = [&](auto b, auto m, auto f, auto r) {
-      launch_cute_fwd_persist_d_sm120_v<kDataType, kHeadDim, kStage,
-                                        decltype(b)::value, decltype(m)::value,
-                                        decltype(f)::value, decltype(r)::value>(
-          Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale, dropout_p,
-          philox_seed, philox_offset);
+    const auto launch_variant = [&](auto has_bias, auto plan_mode, auto bias_4b,
+                                    auto has_dropout) {
+      launch_cute_fwd_persist_d_sm120_v<
+          kDataType, kHeadDim, kStage, decltype(has_bias)::value,
+          decltype(plan_mode)::value, decltype(bias_4b)::value,
+          decltype(has_dropout)::value>(Q, K, V, O, attn_bias, softmax_lse,
+                                        causal, softmax_scale, dropout_p,
+                                        philox_seed, philox_offset);
     };
-    const auto call_mr = [&](auto b, auto m, auto f) {
+    const auto launch_variant_with_dropout = [&](auto has_bias, auto plan_mode,
+                                                 auto bias_4b) {
       if (dropout_p > 0.0)
-        call(b, m, f, Ic{});
+        launch_variant(has_bias, plan_mode, bias_4b, Ic1{});
       else
-        call(b, m, f, Ic0{});
+        launch_variant(has_bias, plan_mode, bias_4b, Ic0{});
     };
     if (!bias_on)
-      call_mr(Ic0{}, Ic0{}, Ic0{});
+      launch_variant_with_dropout(Ic0{}, Ic0{}, Ic0{});
     else if (mode == 1) {
 #ifdef ENABLE_FFPA_CUDA_MASK_FP32
       if (b4)
-        call_mr(Ic{}, Ic{}, Ic{});
+        launch_variant_with_dropout(Ic1{}, Ic1{}, Ic1{});
       else
 #endif
-        call_mr(Ic{}, Ic{}, Ic0{});
+        launch_variant_with_dropout(Ic1{}, Ic1{}, Ic0{});
     } else if (mode == 2) {
 #ifdef ENABLE_FFPA_CUDA_MASK_FP32
       if (b4)
-        call_mr(Ic{}, Ic2{}, Ic{});
+        launch_variant_with_dropout(Ic1{}, Ic2{}, Ic1{});
       else
 #endif
-        call_mr(Ic{}, Ic2{}, Ic0{});
+        launch_variant_with_dropout(Ic1{}, Ic2{}, Ic0{});
     } else {
       // persist has no mode 3 (the resident upgrade is a split/m4n2-only
       // plan step); mode 0 keeps the gmem-direct tag.
-      call_mr(Ic{}, Ic0{}, Ic0{});
+      launch_variant_with_dropout(Ic1{}, Ic0{}, Ic0{});
     }
   } else {
     TORCH_CHECK(false,
@@ -112,48 +115,51 @@ void launch_cute_fwd_split_d_sm120(torch::Tensor Q, torch::Tensor K,
                 "ffpa_attn: fp32 attn_mask requires a build with "
                 "ENABLE_FFPA_CUDA_MASK_FP32=1");
 #endif
-    using Ic = std::integral_constant<int, 1>;
+    using Ic1 = std::integral_constant<int, 1>;
     using Ic0 = std::integral_constant<int, 0>;
     using Ic2 = std::integral_constant<int, 2>;
     using Ic3 = std::integral_constant<int, 3>;
-    const auto call = [&](auto b, auto m, auto f, auto r) {
+    const auto launch_variant = [&](auto has_bias, auto plan_mode, auto bias_4b,
+                                    auto has_dropout) {
       launch_cute_fwd_split_d_sm120_v<
-          kDataType, kHeadDim, kStage, kQKDChunk, kVDChunk, decltype(b)::value,
-          decltype(m)::value, decltype(f)::value, decltype(r)::value>(
+          kDataType, kHeadDim, kStage, kQKDChunk, kVDChunk,
+          decltype(has_bias)::value, decltype(plan_mode)::value,
+          decltype(bias_4b)::value, decltype(has_dropout)::value>(
           Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale, dropout_p,
           philox_seed, philox_offset);
     };
-    const auto call_mr = [&](auto b, auto m, auto f) {
+    const auto launch_variant_with_dropout = [&](auto has_bias, auto plan_mode,
+                                                 auto bias_4b) {
       if (dropout_p > 0.0)
-        call(b, m, f, Ic{});
+        launch_variant(has_bias, plan_mode, bias_4b, Ic1{});
       else
-        call(b, m, f, Ic0{});
+        launch_variant(has_bias, plan_mode, bias_4b, Ic0{});
     };
     if (!bias_on)
-      call_mr(Ic0{}, Ic0{}, Ic0{});
+      launch_variant_with_dropout(Ic0{}, Ic0{}, Ic0{});
     else if (mode == 1) {
 #ifdef ENABLE_FFPA_CUDA_MASK_FP32
       if (b4)
-        call_mr(Ic{}, Ic{}, Ic{});
+        launch_variant_with_dropout(Ic1{}, Ic1{}, Ic1{});
       else
 #endif
-        call_mr(Ic{}, Ic{}, Ic0{});
+        launch_variant_with_dropout(Ic1{}, Ic1{}, Ic0{});
     } else if (mode == 2) {
 #ifdef ENABLE_FFPA_CUDA_MASK_FP32
       if (b4)
-        call_mr(Ic{}, Ic2{}, Ic{});
+        launch_variant_with_dropout(Ic1{}, Ic2{}, Ic1{});
       else
 #endif
-        call_mr(Ic{}, Ic2{}, Ic0{});
+        launch_variant_with_dropout(Ic1{}, Ic2{}, Ic0{});
     } else if (mode == 3) {
 #ifdef ENABLE_FFPA_CUDA_MASK_FP32
       if (b4)
-        call_mr(Ic{}, Ic3{}, Ic{});
+        launch_variant_with_dropout(Ic1{}, Ic3{}, Ic1{});
       else
 #endif
-        call_mr(Ic{}, Ic3{}, Ic0{});
+        launch_variant_with_dropout(Ic1{}, Ic3{}, Ic0{});
     } else {
-      call_mr(Ic{}, Ic0{}, Ic0{});
+      launch_variant_with_dropout(Ic1{}, Ic0{}, Ic0{});
     }
   } else {
     TORCH_CHECK(
@@ -186,48 +192,51 @@ void launch_cute_fwd_split_d_m4n2_sm120(torch::Tensor Q, torch::Tensor K,
                 "ffpa_attn: fp32 attn_mask requires a build with "
                 "ENABLE_FFPA_CUDA_MASK_FP32=1");
 #endif
-    using Ic = std::integral_constant<int, 1>;
+    using Ic1 = std::integral_constant<int, 1>;
     using Ic0 = std::integral_constant<int, 0>;
     using Ic2 = std::integral_constant<int, 2>;
     using Ic3 = std::integral_constant<int, 3>;
-    const auto call = [&](auto b, auto m, auto f, auto r) {
+    const auto launch_variant = [&](auto has_bias, auto plan_mode, auto bias_4b,
+                                    auto has_dropout) {
       launch_cute_fwd_split_d_m4n2_sm120_v<
-          kDataType, kHeadDim, kStage, decltype(b)::value, decltype(m)::value,
-          decltype(f)::value, decltype(r)::value>(
-          Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale, dropout_p,
-          philox_seed, philox_offset);
+          kDataType, kHeadDim, kStage, decltype(has_bias)::value,
+          decltype(plan_mode)::value, decltype(bias_4b)::value,
+          decltype(has_dropout)::value>(Q, K, V, O, attn_bias, softmax_lse,
+                                        causal, softmax_scale, dropout_p,
+                                        philox_seed, philox_offset);
     };
-    const auto call_mr = [&](auto b, auto m, auto f) {
+    const auto launch_variant_with_dropout = [&](auto has_bias, auto plan_mode,
+                                                 auto bias_4b) {
       if (dropout_p > 0.0)
-        call(b, m, f, Ic{});
+        launch_variant(has_bias, plan_mode, bias_4b, Ic1{});
       else
-        call(b, m, f, Ic0{});
+        launch_variant(has_bias, plan_mode, bias_4b, Ic0{});
     };
     if (!bias_on)
-      call_mr(Ic0{}, Ic0{}, Ic0{});
+      launch_variant_with_dropout(Ic0{}, Ic0{}, Ic0{});
     else if (mode == 1) {
 #ifdef ENABLE_FFPA_CUDA_MASK_FP32
       if (b4)
-        call_mr(Ic{}, Ic{}, Ic{});
+        launch_variant_with_dropout(Ic1{}, Ic1{}, Ic1{});
       else
 #endif
-        call_mr(Ic{}, Ic{}, Ic0{});
+        launch_variant_with_dropout(Ic1{}, Ic1{}, Ic0{});
     } else if (mode == 2) {
 #ifdef ENABLE_FFPA_CUDA_MASK_FP32
       if (b4)
-        call_mr(Ic{}, Ic2{}, Ic{});
+        launch_variant_with_dropout(Ic1{}, Ic2{}, Ic1{});
       else
 #endif
-        call_mr(Ic{}, Ic2{}, Ic0{});
+        launch_variant_with_dropout(Ic1{}, Ic2{}, Ic0{});
     } else if (mode == 3) {
 #ifdef ENABLE_FFPA_CUDA_MASK_FP32
       if (b4)
-        call_mr(Ic{}, Ic3{}, Ic{});
+        launch_variant_with_dropout(Ic1{}, Ic3{}, Ic1{});
       else
 #endif
-        call_mr(Ic{}, Ic3{}, Ic0{});
+        launch_variant_with_dropout(Ic1{}, Ic3{}, Ic0{});
     } else {
-      call_mr(Ic{}, Ic0{}, Ic0{});
+      launch_variant_with_dropout(Ic1{}, Ic0{}, Ic0{});
     }
   } else {
     TORCH_CHECK(false,
