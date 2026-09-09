@@ -101,7 +101,7 @@
 | PC-8 | fp8 split-D M4N2 量化大 D kernel 性能优化 | P | ⬜ 待开始 | PC-7（顺序） |
 | PC-9 | fp4 split-D (M8N1) 量化大 D kernel 性能优化 | P | ⬜ 待开始 | PC-8（顺序） |
 | PC-10 | fp4 split-D M4N2 量化大 D kernel 性能优化 | P | ⬜ 待开始 | PC-9（顺序） |
-| PC-11 | warp 级 `__any_sync` lazy-rescale 统一治理（精度治理专项） | P | ⬜ 待开始 | 已与 PC-0-5 解耦可独立推进（vote 非本次 race 根因——force-rescale 实证；治理价值在消除 warp-uniform 分支的调度脆弱性） |
+| PC-11 | warp 级 `__any_sync` lazy-rescale 统一治理（精度治理专项） | P | ✅ **完成（2026-09-09，范围收敛）** | **fp4 + native 两族落地 per-row**（fp4 attn-mask -3.7%/-4.7%，其余 ~0%；native branchless clamp 中性）；**fp8 ×2 + cute fp16 ×4 回退 vote 形态**（per-row 守卫进 rescale 循环引入跨 lane 分歧，attn-mask 实测 fp8_D512 **+23.9%**）；**fp4 m4n2 豁免**（vote 编译形态是 PC-0-5 稳定性载荷）；m4n2 bf16 失败定责 HEAD 既有（控制实验），race gate 恢复 fp16 语义 |
 | PC-12 | cute sm_80 fp16 性能优化（cp.async + 多级流水线，fp8/sm_89 路线前置） | P | ⬜ 待开始 | —；被 PC-6 依赖 |
 | PC-13 | fp8/fp4 hybrid 路径性能优化（双 attn kernel → 融合 kernel） | P | ⬜ 待开始 | —（与 PC-7~10 协同） |
 | PC-14 | fp16 dropout 路径性能优化（RNG bitmap 预计算 + producer/consumer 重排） | P | ✅ 完成（consumer 侧双缓冲 bitmap：persist_d D=64 1.02x / D=128 2.25x，split_d D=320 2.05x，sm_80 split_d 完成（f158eb1），bitwise 全过 + 全 task 套件零回归（fp16 7 tasks×2 dtypes + fp8/fp4 smoke）；producer 方案证伪；**m4n2 证伪不实现**（D=768 bitmap 212.82ms 反慢于 inline 202.31ms，tile 小 + PV/exchange 主导，RNG 非瓶颈；未来有需求再评估）；**persist-D half-row 方案要求 kBc≥64**——D=192/256 的 kBc=32 实例化编译期 `kBitmapCapable` 门控回落 inline Philox（d6a4a1d）；RNG 指令地板结论见 SKILL §11.16——契约下上限约 1.2x） | PC-0 同构（bias tile 协议复用）；FC-5 是量化路径功能项（⏸），与本项无重叠 |
@@ -207,7 +207,7 @@
 - [ ] PC-4：fp4 persist-D attn kernel 内部优化
 - [ ] PC-5：CUDA graph 友好化
 - [ ] PC-6：sm_89 fp8 int4 QK（低优搁置：sm_120 无原生 int4 MMA，SA2 int4 kernel 未开源）
-- [ ] PC-11：warp 级 `__any_sync` lazy-rescale 统一治理（精度治理专项，2026-09-01 立项）
+- [x] PC-11：warp 级 `__any_sync` lazy-rescale 统一治理（精度治理专项，2026-09-01 立项，2026-09-09 完成）
   - 背景：PC-0-5 调查早期曾怀疑 fp4 split_d_m4n2 的 warp-uniform lazy-rescale（`__any_sync(0xffffffff, row_scale != 1.0f ...)`）参与 bias 场景的 bitwise 非确定，**后续消元已证伪 vote 因果**（force-rescale 后仍触发；race 真身为跨模板时序敏感竞争，见 PC-0-5 完成清单）。本专项保留的治理价值：`__any_sync` 投票模式源自 CUTLASS 77_blackwell_fmha 的 **shared-TMEM collective rescale** 场景——那里 warp-uniform 是必须的；本仓库所有 kernel 的 rescale 目标均为 **thread-private 寄存器**，投票既非必需，又把 per-row 决策强行提升为 warp-uniform 分支，徒增调度脆弱性与 warp divergence 面。
   - 参考实现（治理目标形态）：`csrc/cuffpa/cute/fp8/sm_120/persist_d.cuh` 已改为 thread-level per-row——`const float rs = (kv_tile > 0 && row_scale[row] < 1.0f) ? row_scale[row] : 1.0f;` 逐行独立判断（`< 1.0f` 顺带拒绝全 masked 行的 NaN scale），无跨 lane 通信；其注释含完整论证。
   - 治理清单（`grep -r "__any_sync" csrc/cuffpa/cute/` 全量 9 处实际使用 + 1 处已治理注释）：
@@ -216,6 +216,13 @@
     - `fp4/sm_120/split_d_m4n2.cuh`（PC-0-5 实证 race，随 PC-0-5 修复先行落地）、`fp4/sm_120/split_d.cuh`、`fp4/sm_120/persist_d.cuh`（fp4 persist_d 3/30 低概率触发待排查）
     - `sm_80/split_d.cuh`
   - 动作与验收：①逐 kernel 转 per-row lazy-rescale（语义等价，多数 tile 无 max 增长时按行跳过乘法，性能预期持平或略优）；②每处 `ffpa_attn.bench` A/B 无回归；③每家族补"no-bias 前置 ×N → bias self-loop bitwise 断言"用例（PC-0-5 复现脚本 `.tmp/pc5-race/` 沉淀为 tests 后纳入）；④PC-0-5 的 fp4 m4n2 修复是本专项第一块拼图，其余 8 处排期跟进。
+  - **完成记录（2026-09-09，范围收敛为 fp4 + native 两族）**：
+    - **fp4 三处落地**：`fp4_pscale.cuh` `rescale_acc` 加 `scores_scale(mi) < 1.0f` fragment 级守卫（persist_d/split_d 共用，`SoftmaxFusedMxfp8` 同享）；fp4 `persist_d` 三分支收敛为 `if (kv_tile > 0) rescale_acc(tOrO_store)` in-place；fp4 `split_d` 消费点 per-row。**收益**：fp4 attn-mask **-3.7%**（D64 2.73→2.63ms）/ **-4.7%**（D320 15.82→15.07ms），其余 task ~0%；独立强 gate（fp4 D64/D128 self+causal，+1% 阈值）通过。
+    - **native 两处落地**：`prefill.cuh` `sync_rescaling_tiling_o` 删 `need_rescale` 尾参、factor 改 `< 1.0f` branchless clamp（顺带拒绝全 masked 行 NaN）；sm_80/sm_120 `split_d` 删 vote。A/B：sm_80 全 task ±0.3%；sm_120（tma impl）min-of-5 ≤+1.3% 混号（该 impl run 间波动大，单轮 spike 可至 +20%，需 min 口径）。
+    - **fp8 ×2 + cute fp16 ×4 六处回退 HEAD vote 形态**：per-row 守卫位于 rescale 乘法展开循环内且 `row_scale` 为 thread-local → 跨 lane 分歧 + 谓词化 FFMA，attn-mask（低 skip 率、D 大、乘法链长）下实测回归——**fp8_D512 attn-mask +23.9%**（33.99→42.1ms，3 复跑 42.08/42.15/42.10 ±0.2%）、fp8_D768 +6.8%、cute_D128 +2.9%。结论：**vote（warp-uniform 分支 + 无谓词 FFMA）是 split-D 展开循环的 perf 最优形态；per-row 仅当守卫在 fragment 级（fp4 `scores_scale(mi)`，无展开循环开销）时获益**。
+    - **fp4 m4n2 豁免**（kernel 内 EXEMPTION 注释在档）：per-row（含/不含 `__syncwarp`）都重开 PC-0-5 窗口，vote 编译形态是稳定性的载荷。
+    - **m4n2 bf16 新证据（HEAD 对照控制实验）**：bf16 输入下 **HEAD 原始代码** pure-bias 也 10/10 失败（stash 全部 csrc 改动 → 重建 → 同 probe，指纹同 d=[192,224)、lse 稳定、no-bias 干净）——09-04 的"mode 0 纯序列稳定"是 fp16 输入下的 dtype 相关平衡；race gate 测试恢复 fp16 语义 + 裁剪构建（PC-15）skipif（顺带修复默认构建下直接报错的缺口）。
+    - 验收：新增 `tests/test_ffpa_lazy_rescale_determinism.py`（5 形状 no-bias 前置×3 → bias 自环×3 int16 bitwise + 全 masked 行分族断言：fp16 NaN 行 / fp4 恒 0 行）；16 配置 bench A/B + SDPA 参照一致性校验——**首轮基线 8 配置被 GPU 级污染（SDPA 参照同膨胀 ~2x，FFPA 假 -50%）**，教训：A/B 必须校验 SDPA 参照；污染配置以 HEAD 干净重采对照替代；pytest 468 passed / 292 skipped（fp16-trimmed 与未编译 headdim 的预期 skip）。
 - [ ] PC-7：fp8 split-D (M8N1) 量化大 D kernel 性能优化
 - [ ] PC-8：fp8 split-D M4N2 量化大 D kernel 性能优化
 - [ ] PC-9：fp4 split-D (M8N1) 量化大 D kernel 性能优化

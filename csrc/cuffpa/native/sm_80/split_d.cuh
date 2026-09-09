@@ -609,11 +609,6 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
           &lane_row_max_new[0][0], &lane_block_row_max_old[0][0],
           tile_K_seqlen);
 
-      // FA-4 warp-uniform vote: skip O rescale when all factors are 1.0.
-      const bool local_need_rescale =
-          (rescale_o_factor_0[0] < 1.0f) || (rescale_o_factor_1[0] < 1.0f);
-      const bool need_rescale = __any_sync(0xffffffff, local_need_rescale);
-
       // <HGEMM in registers>
 #pragma unroll
       for (int j = 0; j < kValTileHeadDimV; ++j) {  // 8, 16, 32, ...
@@ -764,7 +759,7 @@ __global__ void __launch_bounds__(WARP_SIZE* kMmaTileSeqLenQ* kMmaTileSeqLenK)
         ffpa::prefill::sync_rescaling_tiling_o<kOStorageAccFloat32,
                                                kMmaAccFloat32PV, kDataType>(
             &R_D[0][0][0], &R_O[0], &rescale_o_factor_0[0],
-            &rescale_o_factor_1[0], tile_K_seqlen, j, need_rescale);
+            &rescale_o_factor_1[0], tile_K_seqlen, j);
 
         if constexpr (kStagePV > 1) {
           // Wait next V tile g2s ready.

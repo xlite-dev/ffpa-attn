@@ -16,6 +16,12 @@ sensitive, documented in RFC PC-0-5.
 These tests pin both trigger sequences (with and without the no-bias
 prelude). The pure-bias case is the must-pass gate; the prelude case is
 tracked as xfail for the accepted residual.
+
+Note (2026-09-09, PC-11 control experiment): the mode-0 equilibrium is
+dtype dependent. With bf16 inputs the pure-bias sequence fails 10/10 at
+HEAD (bitwise-unstable O, same d=[192,224) PV C tile fingerprint, stable
+lse, no-bias clean) -- fp16 inputs are the validated-stable dtype, so the
+gate runs fp16 only.
 """
 
 import math
@@ -32,6 +38,11 @@ try:
 except Exception:  # pragma: no cover
   FFPA_CUDA_EXT_BUILT = False
 
+try:
+  from ffpa_attn.cuda import CUDA_INPUT_FP16_AVAILABLE
+except Exception:  # pragma: no cover
+  CUDA_INPUT_FP16_AVAILABLE = True
+
 
 def _fp4_available() -> bool:
   if not torch.cuda.is_available():
@@ -43,6 +54,12 @@ def _fp4_available() -> bool:
 pytestmark = [
   pytest.mark.skipif(not _fp4_available(), reason="fp4 path requires sm_120"),
   pytest.mark.skipif(not FFPA_CUDA_EXT_BUILT, reason="ffpa CUDA ext required"),
+  pytest.mark.skipif(
+    not CUDA_INPUT_FP16_AVAILABLE,
+    reason="fp16 CUDA inputs trimmed; this gate is validated on fp16 inputs"
+    " (bf16 opens the pure-sequence window even at HEAD, 2026-09-09"
+    " control experiment); rebuild with ENABLE_FFPA_CUDA_INPUT_FP16=1",
+  ),
 ]
 
 
@@ -62,12 +79,17 @@ def _run(q, k, v, backend, bias):
 
 
 def _make_case(D):
+  # fp16 inputs: the validated-stable dtype for this gate. bf16 inputs
+  # open the pure-sequence timing window even at HEAD (2026-09-09 control
+  # experiment, 10/10 nondeterministic with the same d=[192,224) PV tile
+  # fingerprint), so bf16 cannot serve as the clean baseline here.
   torch.manual_seed(0)
   B, H, N = 1, 4, 2048
-  q = torch.randn(B, H, N, D, device="cuda", dtype=torch.float16) * 0.5
-  k = torch.randn(B, H, N, D, device="cuda", dtype=torch.float16) * 0.5
-  v = torch.randn(B, H, N, D, device="cuda", dtype=torch.float16) * 0.5
-  bias = torch.randn(1, 1, 1, N, device="cuda", dtype=torch.float16) * 0.25
+  dt = torch.float16
+  q = torch.randn(B, H, N, D, device="cuda", dtype=dt) * 0.5
+  k = torch.randn(B, H, N, D, device="cuda", dtype=dt) * 0.5
+  v = torch.randn(B, H, N, D, device="cuda", dtype=dt) * 0.5
+  bias = torch.randn(1, 1, 1, N, device="cuda", dtype=dt) * 0.25
   backend = CUDABackend(
     forward=True,
     enable_fp8=False,

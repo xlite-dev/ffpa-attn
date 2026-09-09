@@ -488,7 +488,7 @@ lse 公式（NVFP4 PV）：`lse = (m*L + log2(row_sum) + log2(1/2688))*ln2 + sca
 ### 6.6 性能与优化记录
 
 - 相对 fp8（D=192）：self 1.47x / causal 1.29x / gqa 1.50x / cross-dense 1.57x。fp4 attn kernel 本身比 fp8 快 ~23%；blockscale mxf4nvf4 MMA 吞吐 ≈ fp8 dense（收益主要来自带宽）。
-- 已落地：条件 rescale（warp-vote 跳过，dense 96.5% 命中，-4.9%）、`ex2.approx.ftz.f32`（消 ptxas range 胶水，-5.9%）、regalloc 按 D 门控（D≤128 用 alloc<224>，D≥192 必须 232）。
+- 已落地：条件 rescale（dense 96.5% 命中，-4.9%；PC-11 后 fp4 为 fragment 级 per-row 守卫（`scores_scale(mi)<1.0f`，attn-mask 再 -3.7%/-4.7%），m4n2 保留 vote（其编译形态是 PC-0-5 稳定性载荷））、`ex2.approx.ftz.f32`（消 ptxas range 胶水，-5.9%）、regalloc 按 D 门控（D≤128 用 alloc<224>，D≥192 必须 232）。
 - 证伪：Q smem 复用（fp4 L1TEX hit 已 96.75% 饱和，fp8 的前提不成立，+1.8% 回退，默认 OFF 代码保留）、rescale merge in-place（+1.7%，把 FMUL 拉进 MMA 依赖链）、q_full wait 延迟（中性偏负）、exp2 多项式替换、三段化 causal middle 段（投入产出低留后续）。
 - **小 Nq（cross/decode）结构性不划算**：固定前处理链 ~1.1ms 占比过大。
 - fp4 相关 falsified 记录另见 memory：`ffpa-fp4-125x-sprint` / `ffpa-fp4-64x64` / `ffpa-fp4-pingpong`。
@@ -703,7 +703,7 @@ $$
 
 终值 $O=O^{(T)}/L^{(T)}$；log-sum-exp = $m^{(T)}+\ln L^{(T)}$。ffpa 的 fp8/fp4 kernel 在 **log2 域**实现（`exp2` 由 MUFU 单指令完成，`.approx.ftz.f32` 变体消除了 ptxas 对非 ftz 版插入的 range 胶水链，fp4 路径 -5.9%），递推结构不变。
 
-**lazy rescale**（FA-4 条件 rescale）： $\alpha$ 接近 1 时跳过 $O$ 的 rescale，把膨胀因子滚入下一 tile 的 $\tilde{P}$。判定用 per-row `row_scale[row]<1.0f`（fp8 persist-D，commit `f2ee001`）或 warp-vote `scores_scale!=1`（fp4，dense 命中率 96.5%）。数学代价： $\tilde{P}$ 相对 stale max 膨胀至多 $2^T$（ $T$ 为 log2 域阈值；FA-4 原文对 BF16 取 $\tau=8$，fp8 取 4、由发射域天花板反推），见 §11.6 溢出约束。
+**lazy rescale**（FA-4 条件 rescale）： $\alpha$ 接近 1 时跳过 $O$ 的 rescale，把膨胀因子滚入下一 tile 的 $\tilde{P}$。判定形态分族（PC-11 实测收敛，2026-09-09）：**fp4 = fragment 级 per-row 守卫** `scores_scale(mi)<1.0f`（attn-mask 再 -3.7%/-4.7%）；**native = branchless clamp** `(f<1.0f)?f:1`（中性，顺带拒 NaN）；**fp8 split-D ×2 / cute fp16 ×4 / fp4 m4n2 = warp-vote** `__any_sync`（fp8 persist-D 早已 per-row，f2ee001；vote 是 warp-uniform 分支 + 无谓词 FFMA 链——thread-local 守卫放进 split-D 展开的 rescale 乘法循环会引入跨 lane 分歧，attn-mask 实测 fp8 D512 +23.9%；fp4 m4n2 另有 PC-0-5 时序载荷）；threshold 恒 1.0 时 `x*1.0f` bitwise no-op，skip 是纯性能优化。数学代价： $\tilde{P}$ 相对 stale max 膨胀至多 $2^T$（ $T$ 为 log2 域阈值；FA-4 原文对 BF16 取 $\tau=8$，fp8 取 4、由发射域天花板反推），见 §11.6 溢出约束。
 
 **ffpa 代码**：`cute/softmax.cuh`（`online_softmax_fp8_fixed` 及 `kMaxScaleAfter`——tile-max 用未 scale 的 scores 归约、cross-lane 后再乘 scale，省 max-pass 每 element 一次 FMUL 且无跨 pass 依赖，kernel -1.56%）；fp4 lse 公式 `(m*L + log2(row_sum) + log2(1/2688))*ln2 + scale*qkm`（`cute/fp4/sm_120/persist_d.cuh`）。
 
