@@ -40,6 +40,13 @@ void launch_cute_fwd_persist_d_fp8_sm120(
       const int bias_on = bias.ptr != nullptr ? 1 : 0;
       const int mode = bias_on ? plan.mode : 0;
       const int b4 = (mode == 2 && bias.dtype == 3) ? 1 : 0;
+#ifndef ENABLE_FFPA_CUDA_MASK_FP32
+      // Only the mode-2 TMA tile needs the f=1 variant (b4); mode 0/3
+      // read the mask dtype at runtime.
+      TORCH_CHECK(b4 == 0,
+                  "ffpa_attn: fp32 attn_mask requires a build with "
+                  "ENABLE_FFPA_CUDA_MASK_FP32=1");
+#endif
       if (!bias_on)
         launch_cute_fwd_persist_d_fp8_sm120_v<kDataType, kHeadDim, kStage, kQ,
                                               0, 0, 0>(
@@ -47,6 +54,7 @@ void launch_cute_fwd_persist_d_fp8_sm120(
             dropout_p, philox_seed, philox_offset, fp8_smooth_k, fp8_smooth_v,
             fp8_q_quant_method, fp8_k_quant_method, fp8_v_quant_method,
             fp8_pv_acc_type, q_start_row, fp8_hadamard);
+#ifdef ENABLE_FFPA_CUDA_MASK_FP32
       else if (mode == 2 && b4)
         launch_cute_fwd_persist_d_fp8_sm120_v<kDataType, kHeadDim, kStage, kQ,
                                               1, 2, 1>(
@@ -54,6 +62,7 @@ void launch_cute_fwd_persist_d_fp8_sm120(
             dropout_p, philox_seed, philox_offset, fp8_smooth_k, fp8_smooth_v,
             fp8_q_quant_method, fp8_k_quant_method, fp8_v_quant_method,
             fp8_pv_acc_type, q_start_row, fp8_hadamard);
+#endif
       else if (mode == 2)
         launch_cute_fwd_persist_d_fp8_sm120_v<kDataType, kHeadDim, kStage, kQ,
                                               1, 2, 0>(
@@ -120,6 +129,13 @@ void launch_cute_fwd_split_d_fp8_sm120(
       const int bias_on = bias.ptr != nullptr ? 1 : 0;
       const int mode = bias_on ? plan.mode : 0;
       const int b4 = (mode == 2 && bias.dtype == 3) ? 1 : 0;
+#ifndef ENABLE_FFPA_CUDA_MASK_FP32
+      // Only the mode-2 TMA tile needs the f=1 variant (b4); mode 0
+      // reads the mask dtype at runtime.
+      TORCH_CHECK(b4 == 0,
+                  "ffpa_attn: fp32 attn_mask requires a build with "
+                  "ENABLE_FFPA_CUDA_MASK_FP32=1");
+#endif
       if (!bias_on)
         launch_cute_fwd_split_d_fp8_sm120_v<kDataType, kHeadDim, kStage, kQ, 0,
                                             0, 0>(
@@ -131,6 +147,7 @@ void launch_cute_fwd_split_d_fp8_sm120(
         // mode 2 is demoted away by the plan for D>=512 (see
         // fp8_split_d_bias_plan), so those tags stay out of the extern
         // table and must not be instantiated here either.
+#ifdef ENABLE_FFPA_CUDA_MASK_FP32
         if (mode == 2 && b4)
           launch_cute_fwd_split_d_fp8_sm120_v<kDataType, kHeadDim, kStage, kQ,
                                               1, 2, 1>(
@@ -139,6 +156,9 @@ void launch_cute_fwd_split_d_fp8_sm120(
               fp8_q_quant_method, fp8_k_quant_method, fp8_v_quant_method,
               fp8_pv_acc_type, q_start_row, fp8_hadamard);
         else if (mode == 2)
+#else
+        if (mode == 2)
+#endif
           launch_cute_fwd_split_d_fp8_sm120_v<kDataType, kHeadDim, kStage, kQ,
                                               1, 2, 0>(
               Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
@@ -199,6 +219,13 @@ void launch_cute_fwd_split_d_m4n2_fp8_sm120(
       const int bias_on = bias.ptr != nullptr ? 1 : 0;
       const int mode = bias_on ? plan.mode : 0;
       const int b4 = (mode != 0 && bias.dtype == 3) ? 1 : 0;
+#ifndef ENABLE_FFPA_CUDA_MASK_FP32
+      // mode 0 (gmem-direct) reads the mask dtype at runtime; only the
+      // TMA tile modes need the f=1 variants.
+      TORCH_CHECK(bias_on == 0 || mode == 0 || bias.dtype != 3,
+                  "ffpa_attn: fp32 attn_mask requires a build with "
+                  "ENABLE_FFPA_CUDA_MASK_FP32=1");
+#endif
       if (!bias_on)
         launch_cute_fwd_split_d_m4n2_fp8_sm120_v<kDataType, kHeadDim, kStage,
                                                  kQ, 0, 0, 0>(
@@ -206,6 +233,7 @@ void launch_cute_fwd_split_d_m4n2_fp8_sm120(
             dropout_p, philox_seed, philox_offset, fp8_smooth_k, fp8_smooth_v,
             fp8_q_quant_method, fp8_k_quant_method, fp8_v_quant_method,
             fp8_pv_acc_type, q_start_row, fp8_hadamard);
+#ifdef ENABLE_FFPA_CUDA_MASK_FP32
       else if (mode == 1 && b4)
         launch_cute_fwd_split_d_m4n2_fp8_sm120_v<kDataType, kHeadDim, kStage,
                                                  kQ, 1, 1, 1>(
@@ -213,6 +241,7 @@ void launch_cute_fwd_split_d_m4n2_fp8_sm120(
             dropout_p, philox_seed, philox_offset, fp8_smooth_k, fp8_smooth_v,
             fp8_q_quant_method, fp8_k_quant_method, fp8_v_quant_method,
             fp8_pv_acc_type, q_start_row, fp8_hadamard);
+#endif
       else if (mode == 1)
         launch_cute_fwd_split_d_m4n2_fp8_sm120_v<kDataType, kHeadDim, kStage,
                                                  kQ, 1, 1, 0>(
@@ -220,6 +249,7 @@ void launch_cute_fwd_split_d_m4n2_fp8_sm120(
             dropout_p, philox_seed, philox_offset, fp8_smooth_k, fp8_smooth_v,
             fp8_q_quant_method, fp8_k_quant_method, fp8_v_quant_method,
             fp8_pv_acc_type, q_start_row, fp8_hadamard);
+#ifdef ENABLE_FFPA_CUDA_MASK_FP32
       else if (mode == 2 && b4)
         launch_cute_fwd_split_d_m4n2_fp8_sm120_v<kDataType, kHeadDim, kStage,
                                                  kQ, 1, 2, 1>(
@@ -227,6 +257,7 @@ void launch_cute_fwd_split_d_m4n2_fp8_sm120(
             dropout_p, philox_seed, philox_offset, fp8_smooth_k, fp8_smooth_v,
             fp8_q_quant_method, fp8_k_quant_method, fp8_v_quant_method,
             fp8_pv_acc_type, q_start_row, fp8_hadamard);
+#endif
       else if (mode == 2)
         launch_cute_fwd_split_d_m4n2_fp8_sm120_v<kDataType, kHeadDim, kStage,
                                                  kQ, 1, 2, 0>(
@@ -234,6 +265,7 @@ void launch_cute_fwd_split_d_m4n2_fp8_sm120(
             dropout_p, philox_seed, philox_offset, fp8_smooth_k, fp8_smooth_v,
             fp8_q_quant_method, fp8_k_quant_method, fp8_v_quant_method,
             fp8_pv_acc_type, q_start_row, fp8_hadamard);
+#ifdef ENABLE_FFPA_CUDA_MASK_FP32
       else if (mode == 3 && b4)
         launch_cute_fwd_split_d_m4n2_fp8_sm120_v<kDataType, kHeadDim, kStage,
                                                  kQ, 1, 3, 1>(
@@ -241,6 +273,7 @@ void launch_cute_fwd_split_d_m4n2_fp8_sm120(
             dropout_p, philox_seed, philox_offset, fp8_smooth_k, fp8_smooth_v,
             fp8_q_quant_method, fp8_k_quant_method, fp8_v_quant_method,
             fp8_pv_acc_type, q_start_row, fp8_hadamard);
+#endif
       else if (mode == 3)
         launch_cute_fwd_split_d_m4n2_fp8_sm120_v<kDataType, kHeadDim, kStage,
                                                  kQ, 1, 3, 0>(

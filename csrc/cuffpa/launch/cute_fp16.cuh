@@ -34,6 +34,13 @@ void launch_cute_fwd_persist_d_sm120(torch::Tensor Q, torch::Tensor K,
           bias, Q.size(0), Q.size(1), Q.size(2), K.size(2));
     const int mode = bias_on ? plan.mode : 0;
     const int b4 = (mode != 0 && bias.dtype == 3) ? 1 : 0;
+#ifndef ENABLE_FFPA_CUDA_MASK_FP32
+    // mode 0 (gmem-direct) reads the mask dtype at runtime, so fp32 stays
+    // legal there; only the TMA tile modes need the f=1 variants.
+    TORCH_CHECK(bias_on == 0 || mode == 0 || bias.dtype != 3,
+                "ffpa_attn: fp32 attn_mask requires a build with "
+                "ENABLE_FFPA_CUDA_MASK_FP32=1");
+#endif
     using Ic = std::integral_constant<int, 1>;
     using Ic0 = std::integral_constant<int, 0>;
     using Ic2 = std::integral_constant<int, 2>;
@@ -54,14 +61,18 @@ void launch_cute_fwd_persist_d_sm120(torch::Tensor Q, torch::Tensor K,
     if (!bias_on)
       call_mr(Ic0{}, Ic0{}, Ic0{});
     else if (mode == 1) {
+#ifdef ENABLE_FFPA_CUDA_MASK_FP32
       if (b4)
         call_mr(Ic{}, Ic{}, Ic{});
       else
+#endif
         call_mr(Ic{}, Ic{}, Ic0{});
     } else if (mode == 2) {
+#ifdef ENABLE_FFPA_CUDA_MASK_FP32
       if (b4)
         call_mr(Ic{}, Ic2{}, Ic{});
       else
+#endif
         call_mr(Ic{}, Ic2{}, Ic0{});
     } else {
       // persist has no mode 3 (the resident upgrade is a split/m4n2-only
@@ -94,6 +105,13 @@ void launch_cute_fwd_split_d_sm120(torch::Tensor Q, torch::Tensor K,
           bias, Q.size(0), Q.size(1), Q.size(2), K.size(2));
     const int mode = bias_on ? plan.mode : 0;
     const int b4 = (mode != 0 && bias.dtype == 3) ? 1 : 0;
+#ifndef ENABLE_FFPA_CUDA_MASK_FP32
+    // mode 0 (gmem-direct) reads the mask dtype at runtime, so fp32 stays
+    // legal there; only the TMA tile modes need the f=1 variants.
+    TORCH_CHECK(bias_on == 0 || mode == 0 || bias.dtype != 3,
+                "ffpa_attn: fp32 attn_mask requires a build with "
+                "ENABLE_FFPA_CUDA_MASK_FP32=1");
+#endif
     using Ic = std::integral_constant<int, 1>;
     using Ic0 = std::integral_constant<int, 0>;
     using Ic2 = std::integral_constant<int, 2>;
@@ -114,19 +132,25 @@ void launch_cute_fwd_split_d_sm120(torch::Tensor Q, torch::Tensor K,
     if (!bias_on)
       call_mr(Ic0{}, Ic0{}, Ic0{});
     else if (mode == 1) {
+#ifdef ENABLE_FFPA_CUDA_MASK_FP32
       if (b4)
         call_mr(Ic{}, Ic{}, Ic{});
       else
+#endif
         call_mr(Ic{}, Ic{}, Ic0{});
     } else if (mode == 2) {
+#ifdef ENABLE_FFPA_CUDA_MASK_FP32
       if (b4)
         call_mr(Ic{}, Ic2{}, Ic{});
       else
+#endif
         call_mr(Ic{}, Ic2{}, Ic0{});
     } else if (mode == 3) {
+#ifdef ENABLE_FFPA_CUDA_MASK_FP32
       if (b4)
         call_mr(Ic{}, Ic3{}, Ic{});
       else
+#endif
         call_mr(Ic{}, Ic3{}, Ic0{});
     } else {
       call_mr(Ic{}, Ic0{}, Ic0{});
@@ -155,6 +179,13 @@ void launch_cute_fwd_split_d_m4n2_sm120(torch::Tensor Q, torch::Tensor K,
           bias, Q.size(0), Q.size(1), Q.size(2), K.size(2));
     const int mode = bias_on ? plan.mode : 0;
     const int b4 = (mode != 0 && bias.dtype == 3) ? 1 : 0;
+#ifndef ENABLE_FFPA_CUDA_MASK_FP32
+    // mode 0 (gmem-direct) reads the mask dtype at runtime, so fp32 stays
+    // legal there; only the TMA tile modes need the f=1 variants.
+    TORCH_CHECK(bias_on == 0 || mode == 0 || bias.dtype != 3,
+                "ffpa_attn: fp32 attn_mask requires a build with "
+                "ENABLE_FFPA_CUDA_MASK_FP32=1");
+#endif
     using Ic = std::integral_constant<int, 1>;
     using Ic0 = std::integral_constant<int, 0>;
     using Ic2 = std::integral_constant<int, 2>;
@@ -175,19 +206,25 @@ void launch_cute_fwd_split_d_m4n2_sm120(torch::Tensor Q, torch::Tensor K,
     if (!bias_on)
       call_mr(Ic0{}, Ic0{}, Ic0{});
     else if (mode == 1) {
+#ifdef ENABLE_FFPA_CUDA_MASK_FP32
       if (b4)
         call_mr(Ic{}, Ic{}, Ic{});
       else
+#endif
         call_mr(Ic{}, Ic{}, Ic0{});
     } else if (mode == 2) {
+#ifdef ENABLE_FFPA_CUDA_MASK_FP32
       if (b4)
         call_mr(Ic{}, Ic2{}, Ic{});
       else
+#endif
         call_mr(Ic{}, Ic2{}, Ic0{});
     } else if (mode == 3) {
+#ifdef ENABLE_FFPA_CUDA_MASK_FP32
       if (b4)
         call_mr(Ic{}, Ic3{}, Ic{});
       else
+#endif
         call_mr(Ic{}, Ic3{}, Ic0{});
     } else {
       call_mr(Ic{}, Ic0{}, Ic0{});

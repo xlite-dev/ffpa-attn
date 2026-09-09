@@ -45,36 +45,49 @@ void launch_cute_fwd_persist_d_fp4_sm120(
         const int bias_on = bias.ptr != nullptr ? 1 : 0;
         const int mode = bias_on ? plan.mode : 0;
         const int b4 = (mode != 0 && bias.dtype == 3) ? 1 : 0;
+#ifndef ENABLE_FFPA_CUDA_MASK_FP32
+        // mode 0 (gmem-direct) reads the mask dtype at runtime; only the
+        // TMA tile modes need the f=1 variants.
+        TORCH_CHECK(bias_on == 0 || mode == 0 || bias.dtype != 3,
+                    "ffpa_attn: fp32 attn_mask requires a build with "
+                    "ENABLE_FFPA_CUDA_MASK_FP32=1");
+#endif
         if (!bias_on)
           launch_cute_fwd_persist_d_fp4_sm120_v<kDataType, kHeadDim, kPv, 0, 0,
                                                 0>(
               Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
               q_start_row, fp4_hadamard, fp4_smooth_v);
+#ifdef ENABLE_FFPA_CUDA_MASK_FP32
         else if (mode == 1 && b4)
           launch_cute_fwd_persist_d_fp4_sm120_v<kDataType, kHeadDim, kPv, 1, 1,
                                                 1>(
               Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
               q_start_row, fp4_hadamard, fp4_smooth_v);
+#endif
         else if (mode == 1)
           launch_cute_fwd_persist_d_fp4_sm120_v<kDataType, kHeadDim, kPv, 1, 1,
                                                 0>(
               Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
               q_start_row, fp4_hadamard, fp4_smooth_v);
+#ifdef ENABLE_FFPA_CUDA_MASK_FP32
         else if (mode == 2 && b4)
           launch_cute_fwd_persist_d_fp4_sm120_v<kDataType, kHeadDim, kPv, 1, 2,
                                                 1>(
               Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
               q_start_row, fp4_hadamard, fp4_smooth_v);
+#endif
         else if (mode == 2)
           launch_cute_fwd_persist_d_fp4_sm120_v<kDataType, kHeadDim, kPv, 1, 2,
                                                 0>(
               Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
               q_start_row, fp4_hadamard, fp4_smooth_v);
+#ifdef ENABLE_FFPA_CUDA_MASK_FP32
         else if (mode == 3 && b4)
           launch_cute_fwd_persist_d_fp4_sm120_v<kDataType, kHeadDim, kPv, 1, 3,
                                                 1>(
               Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
               q_start_row, fp4_hadamard, fp4_smooth_v);
+#endif
         else if (mode == 3)
           launch_cute_fwd_persist_d_fp4_sm120_v<kDataType, kHeadDim, kPv, 1, 3,
                                                 0>(
@@ -130,14 +143,23 @@ void launch_cute_fwd_split_d_fp4_sm120(
       const int bias_on = bias.ptr != nullptr ? 1 : 0;
       const int mode = bias_on ? plan.mode : 0;
       const int b4 = (mode == 2 && bias.dtype == 3) ? 1 : 0;
+#ifndef ENABLE_FFPA_CUDA_MASK_FP32
+      // Only the mode-2 TMA tile needs the f=1 variant (b4); mode 0/3
+      // read the mask dtype at runtime.
+      TORCH_CHECK(b4 == 0,
+                  "ffpa_attn: fp32 attn_mask requires a build with "
+                  "ENABLE_FFPA_CUDA_MASK_FP32=1");
+#endif
       if (!bias_on)
         launch_cute_fwd_split_d_fp4_sm120_v<kDataType, kHeadDim, kPv, 0, 0, 0>(
             Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
             q_start_row, fp4_hadamard, fp4_smooth_v);
+#ifdef ENABLE_FFPA_CUDA_MASK_FP32
       else if (mode == 2 && b4)
         launch_cute_fwd_split_d_fp4_sm120_v<kDataType, kHeadDim, kPv, 1, 2, 1>(
             Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
             q_start_row, fp4_hadamard, fp4_smooth_v);
+#endif
       else if (mode == 2)
         launch_cute_fwd_split_d_fp4_sm120_v<kDataType, kHeadDim, kPv, 1, 2, 0>(
             Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
@@ -202,12 +224,21 @@ void launch_cute_fwd_split_d_m4n2_fp4_sm120(
         bias, Q.size(0), Q.size(1), Q.size(2), K.size(2), max_smem_optin - 256);
     if (plan.mode == 2) {
 #ifdef ENABLE_FFPA_FP4_BUILD_DEBUG
+      // mode 2 is a debug-only tag (PC-0-5); the f=1 variant additionally
+      // needs ENABLE_FFPA_CUDA_MASK_FP32 (env.py drops it otherwise).
+#ifndef ENABLE_FFPA_CUDA_MASK_FP32
+      TORCH_CHECK(bias.dtype != 3,
+                  "ffpa_attn: fp32 attn_mask requires a build with "
+                  "ENABLE_FFPA_CUDA_MASK_FP32=1");
+#endif
+#ifdef ENABLE_FFPA_CUDA_MASK_FP32
       if (bias.dtype == 3)
         launch_cute_fwd_split_d_m4n2_fp4_sm120_v<kDataType, kHeadDim, false, 1,
                                                  2, 1>(
             Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,
             q_start_row, fp4_hadamard, fp4_smooth_v);
       else
+#endif
         launch_cute_fwd_split_d_m4n2_fp4_sm120_v<kDataType, kHeadDim, false, 1,
                                                  2, 0>(
             Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale,

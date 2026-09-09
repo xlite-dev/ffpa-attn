@@ -36,10 +36,17 @@ except Exception:
   _ffpa_attn_varlen_cute = None
 
 try:
-  from .cuda import _ffpa_attn_forward_cuda, F16_ACC_AVAILABLE  # D > 256
+  from .cuda import (  # D > 256
+    _ffpa_attn_forward_cuda,
+    F16_ACC_AVAILABLE,
+    CUDA_INPUT_FP16_AVAILABLE,
+    CUDA_MASK_FP32_AVAILABLE,
+  )
 except Exception:
   _ffpa_attn_forward_cuda = None
   F16_ACC_AVAILABLE = False
+  CUDA_INPUT_FP16_AVAILABLE = True
+  CUDA_MASK_FP32_AVAILABLE = True
 
 try:
   # Hoisted to module level: the per-call `from .cuda import ...` inside
@@ -199,6 +206,30 @@ def _apply_cuda_backend_hint(backend: CUDABackend) -> None:
     set_cuda_backend_impl(CudaBackendImpl.NATIVE)
 
 
+def _cuda_input_guard_and_mask_downcast(
+  q: torch.Tensor, attn_bias: torch.Tensor | None
+) -> torch.Tensor | None:
+  """Guard the compile-time input/mask dtype sets before the CUDA entry.
+
+  fp16 inputs need ENABLE_FFPA_CUDA_INPUT_FP16 (default builds are
+  bf16-only). fp32 attn_masks are downcast to q.dtype unless
+  ENABLE_FFPA_CUDA_MASK_FP32 compiled the f=1 variants (mode-0 gmem-direct
+  paths read fp32 natively, but the TMA tile modes do not, so the downcast
+  keeps every plan mode reachable).
+  """
+  if q.dtype is torch.float16 and not CUDA_INPUT_FP16_AVAILABLE:
+    raise RuntimeError(
+      "ffpa_attn: fp16 inputs are disabled in this build; rebuild with "
+      "ENABLE_FFPA_CUDA_INPUT_FP16=1 to enable them."
+    )
+  if (
+    attn_bias is not None and attn_bias.dtype == torch.float32
+    and not CUDA_MASK_FP32_AVAILABLE
+  ):
+    attn_bias = attn_bias.to(q.dtype)
+  return attn_bias
+
+
 def _ffpa_attn_forward(
   query: torch.Tensor,
   key: torch.Tensor,
@@ -246,6 +277,7 @@ def _ffpa_attn_forward(
   if forward_backend.fp4_hybrid is None:
     forward_backend.fp4_hybrid = bool(forward_backend.enable_fp4 and is_causal)
   _apply_cuda_backend_hint(forward_backend)
+  _cuda_input_guard_and_mask_downcast(query, None)  # fp16 guard only here
   O, _ = _ffpa_attn_forward_cuda(
     query,
     key,
@@ -1280,6 +1312,7 @@ class _FFPAAttnFunc(torch.autograd.Function):
       forward_meta = meta.forward_meta
       assert _ffpa_attn_forward_cuda is not None, "CUDA backend is not available."
       _apply_cuda_backend_hint(forward_meta)
+      attn_bias = _cuda_input_guard_and_mask_downcast(q, attn_bias)
       rng_state = _reserve_large_d_dropout_rng(q, k, meta.attn_meta.dropout_p)
       O, lse = _ffpa_attn_forward_cuda(
         q,

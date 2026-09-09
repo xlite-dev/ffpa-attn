@@ -9,6 +9,12 @@ try:
   _ffpa_attn_fwd_cuda = _cuda_ext.ffpa_attn_forward
   CUDA_FWD_AVAILABLE = bool(getattr(_cuda_ext, "CUDA_FWD_AVAILABLE", False))
   F16_ACC_AVAILABLE = bool(getattr(_cuda_ext, "F16_ACC_AVAILABLE", False))
+  CUDA_INPUT_FP16_AVAILABLE = bool(
+    getattr(_cuda_ext, "CUDA_INPUT_FP16_AVAILABLE", True)
+  )
+  CUDA_MASK_FP32_AVAILABLE = bool(
+    getattr(_cuda_ext, "CUDA_MASK_FP32_AVAILABLE", True)
+  )
   CUDA_TMA_AVAILABLE = bool(getattr(_cuda_ext, "CUDA_TMA_AVAILABLE", False))
   CUDA_CUTE_TMA_AVAILABLE = bool(
     getattr(_cuda_ext, "CUDA_CUTE_TMA_AVAILABLE", False)
@@ -19,6 +25,8 @@ except Exception as exc:
   _ffpa_attn_fwd_cuda = None
   CUDA_FWD_AVAILABLE = False
   F16_ACC_AVAILABLE = False
+  CUDA_INPUT_FP16_AVAILABLE = False
+  CUDA_MASK_FP32_AVAILABLE = False
   CUDA_TMA_AVAILABLE = False
   CUDA_CUTE_TMA_AVAILABLE = False
   CUDA_BWD_AVAILABLE = False
