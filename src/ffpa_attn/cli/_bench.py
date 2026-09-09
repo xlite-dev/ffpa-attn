@@ -32,6 +32,7 @@ import torch
 from ._runner_fwd import run_forward_examples
 from ._runner_bwd import run_backward_examples
 from ._flops import format_tflops_short
+from ..cuda import CUDA_INPUT_FP16_AVAILABLE
 
 
 def _parse_grad_kv_dtype(arg: str) -> torch.dtype | None:
@@ -1913,6 +1914,19 @@ def main() -> None:
     dtypes = tuple(d for d in dtypes if d == torch.float16)
   elif args.dtype == "bf16":
     dtypes = tuple(d for d in dtypes if d == torch.bfloat16)
+  # Trimmed CUDA builds compile bf16-input kernels only (env.py
+  # ENABLE_FFPA_CUDA_INPUT_FP16); Triton/CuTeDSL dtypes are unaffected.
+  if args.forward_backend == CUDA_BACKEND and not CUDA_INPUT_FP16_AVAILABLE:
+    if dtypes == (torch.float16, ):
+      raise SystemExit(
+        "fp16 inputs are disabled in this build; rebuild with "
+        "ENABLE_FFPA_CUDA_INPUT_FP16=1 or use --dtype bf16."
+      )
+    print(
+      "[cuda] fp16 inputs disabled in this build "
+      "(ENABLE_FFPA_CUDA_INPUT_FP16=0); benchmarking bf16 only."
+    )
+    dtypes = tuple(d for d in dtypes if d != torch.float16)
 
   if not fallback and not args.forward and not args.backward:
     raise SystemExit(

@@ -17,6 +17,7 @@ import torch
 import torch.nn.functional as F
 
 from ffpa_attn import ffpa_attn_func
+from ffpa_attn.cuda import CUDA_INPUT_FP16_AVAILABLE
 from ffpa_attn.functional import CUDABackend
 
 FFPA_CUDA_EXT_BUILT = True
@@ -28,6 +29,11 @@ except Exception:  # pragma: no cover
 pytestmark = [
   pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"),
   pytest.mark.skipif(not FFPA_CUDA_EXT_BUILT, reason="ffpa CUDA ext required"),
+  pytest.mark.skipif(
+    not CUDA_INPUT_FP16_AVAILABLE,
+    reason="fp16 QKV in every case; rebuild with "
+    "ENABLE_FFPA_CUDA_INPUT_FP16=1",
+  ),
 ]
 
 # Nq/Nkv >= 512 keeps the CUDA fast path (short-seq declines below 512).

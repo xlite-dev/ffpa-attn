@@ -37,6 +37,7 @@ import torch.nn.functional as F
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from ffpa_attn import ffpa_attn_func
+from ffpa_attn.cuda import CUDA_INPUT_FP16_AVAILABLE
 from ffpa_attn.cli._flops import (
   attention_fwd_flops,
   format_tflops_short,
@@ -625,6 +626,11 @@ def main():
   args = parse_args()
   print(f"Running {Path(__file__).name} with args: {args}\n")
   torch.manual_seed(0)
+  if args.dtype == "fp16" and not CUDA_INPUT_FP16_AVAILABLE:
+    raise SystemExit(
+      "fp16 inputs are disabled in this build; rebuild with "
+      "ENABLE_FFPA_CUDA_INPUT_FP16=1 or use --dtype bf16."
+    )
   dtype = torch.float16 if args.dtype == "fp16" else torch.bfloat16
   use_sage = (not args.no_sage) and SAGE_INSTALLED
   Ns = [int(x) for x in args.N.split(",")]
