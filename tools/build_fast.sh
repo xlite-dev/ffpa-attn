@@ -59,6 +59,19 @@ Flags (override same-named env vars; env reference: docs/env.md):
                        for the selected families only: subset of fp16,fp8,fp4
                        or 'all'. Default 'none' strips every debug getenv
                        branch (and the FORCE_KERNEL dual instantiation).
+  --input-dtypes <csv> ENABLE_FFPA_CUDA_INPUT_FP16: qkv input dtypes compiled
+                       into the kernels. Subset of fp16,bf16. bf16 is always
+                       built (baseline); adding fp16 compiles the fp16-input
+                       TUs. e.g. --input-dtypes fp16,bf16 (full set)
+                       Default: bf16 only.
+  --mask-dtypes <csv>  ENABLE_FFPA_CUDA_MASK_FP32: attn_mask (bias) dtypes
+                       compiled into the variant TUs. Subset of
+                       fp16,bf16,fp32. 2-byte masks (fp16/bf16) are always
+                       built (baseline); adding fp32 compiles the 4-byte
+                       f=1 variants and disables the runtime downcast.
+                         e.g. --mask-dtypes fp16,bf16,fp32 (full set)
+                       Default: fp16,bf16 (fp32 masks are downcast to
+                       q.dtype at runtime).
   --editable           FFPA_EDITABLE=1: build_ext + pip install -e (default).
   --no-editable        FFPA_EDITABLE=0: build_ext only, no package install.
   -j, --jobs N         MAX_JOBS outer build parallelism (default min(nproc,32)).
@@ -149,6 +162,36 @@ while [[ $# -gt 0 ]]; do
       else
         export ENABLE_FFPA_BUILD_DEBUG="$2"
       fi
+      shift 2 ;;
+    --input-dtypes)
+      require_value "$@"
+      _input_fp16=0
+      IFS=', ' read -r -a _idt_toks <<< "$2"
+      for tok in "${_idt_toks[@]}"; do
+        tok="${tok,,}"
+        [[ -z "$tok" ]] && continue
+        case "$tok" in
+          fp16) _input_fp16=1 ;;
+          bf16) ;;  # always compiled; nothing to toggle
+          *) fail_usage "invalid --input-dtypes token '$tok' (allowed: fp16, bf16)" ;;
+        esac
+      done
+      export ENABLE_FFPA_CUDA_INPUT_FP16="$_input_fp16"
+      shift 2 ;;
+    --mask-dtypes)
+      require_value "$@"
+      _mask_fp32=0
+      IFS=', ' read -r -a _mdt_toks <<< "$2"
+      for tok in "${_mdt_toks[@]}"; do
+        tok="${tok,,}"
+        [[ -z "$tok" ]] && continue
+        case "$tok" in
+          fp32) _mask_fp32=1 ;;
+          fp16|bf16) ;;  # always compiled; nothing to toggle
+          *) fail_usage "invalid --mask-dtypes token '$tok' (allowed: fp16, bf16, fp32)" ;;
+        esac
+      done
+      export ENABLE_FFPA_CUDA_MASK_FP32="$_mask_fp32"
       shift 2 ;;
     -j|--jobs)
       require_value "$@"
@@ -257,6 +300,7 @@ fi
 echo "[build_fast] ENABLE_FFPA_CUDA_IMPL=${ENABLE_FFPA_CUDA_IMPL:-0}  ENABLE_FFPA_CUTE_EXT=${ENABLE_FFPA_CUTE_EXT:-0}  ENABLE_FFPA_TMA_EXT=${ENABLE_FFPA_TMA_EXT:-0}"
 echo "[build_fast] FFPA_BUILD_ARCH=${FFPA_BUILD_ARCH:-<auto from current device>}  FFPA_DEV_HEADDIMS=${FFPA_DEV_HEADDIMS:-<default: 64,128,192,256,320,512>}  FFPA_BUILD_STAGES=${FFPA_BUILD_STAGES:-<default: '2,3'>}  FFPA_EDITABLE=${FFPA_EDITABLE}  ENABLE_FFPA_BUILD_DEBUG=${ENABLE_FFPA_BUILD_DEBUG:-<none>}"
 echo "[build_fast] MAX_JOBS=$MAX_JOBS  FFPA_NVCC_THREADS=$FFPA_NVCC_THREADS"
+echo "[build_fast] input-dtypes: bf16(+fp16 iff ENABLE_FFPA_CUDA_INPUT_FP16=${ENABLE_FFPA_CUDA_INPUT_FP16:-0})  mask-dtypes: fp16/bf16(+fp32 iff ENABLE_FFPA_CUDA_MASK_FP32=${ENABLE_FFPA_CUDA_MASK_FP32:-0})"
 echo "[build_fast] command: $BUILD_CMD${PASS_ARGS[*]:+ ${PASS_ARGS[*]}}"
 if [[ "$DRY_RUN" == "1" ]]; then
   echo "[build_fast] dry-run: exiting before any clean/build side effects."
