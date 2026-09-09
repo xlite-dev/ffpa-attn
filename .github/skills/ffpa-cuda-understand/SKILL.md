@@ -148,7 +148,7 @@ flowchart LR
 | `ENABLE_FFPA_CUDA_INPUT_FP16` | 0 | 只编 bf16 输入 TU（fp16 输入 kernel 不编译，`fwd_{fp16,bf16}_native_*` 文件名 drop f32 后缀、fp16f16 保留全名） |
 | `ENABLE_FFPA_CUDA_MASK_FP32` | 0 | 剔除所有 `f=1`（bias 4B/fp32 mask）variant TU；量化族与 fp16 族统一 |
 
-运行时配套（`functional._cuda_input_guard_and_mask_downcast`）：fp16 输入 raise（提示 rebuild flag）；fp32 mask downcast 到 `q.dtype` 再调（数值等价，PC-0-5-pd 缓解选项 B 的默认形态）。headdim 128+512 子集下默认 97 TU / 全开 255 TU。
+运行时配套（`functional._cuda_input_guard_and_mask_downcast`）：fp16 输入 raise（提示 rebuild flag）；fp32 mask downcast 到 `q.dtype` 再调（数值等价，PC-0-5-pd 缓解选项 B 的默认形态；全开构建的 fp4 persist_d C++ launcher 侧已镜像同语义 downcast——PC-0-5-pd-B，覆盖直调绕过面）。headdim 128+512 子集下默认 97 TU / 全开 255 TU。
 
 **单条完整链路示例**（fp8、D=512、bf16、stage=2、无 hybrid）：
 
@@ -204,7 +204,7 @@ flowchart LR
 默认构建（见 §1.3 裁剪表）下，进入 CUDA fast path 前由 Python 层做输入适配（覆盖 `_ffpa_attn_forward` 与 `_FFPAAttnFunc.forward` 两个调用点）：
 
 - **fp16 输入**：capability probe（pybind attrs `CUDA_INPUT_FP16_AVAILABLE`，Python 侧 getattr 默认 True 兼容旧 so）探测到未编译 → raise，报错文案提示 `ENABLE_FFPA_CUDA_INPUT_FP16=1` 重建。
-- **fp32 attn_mask**：downcast 到 `q.dtype`（fp16/bf16）再进 kernel——mode-0 gmem-direct 路径 fp32 天然合法，但 downcast 使全部 plan mode 在默认构建下可达；additive mask 在 S 域加性注入，fp16 表示与量化路径注入域一致，精度语义不变。
+- **fp32 attn_mask**：downcast 到 `q.dtype`（fp16/bf16）再进 kernel——mode-0 gmem-direct 路径 fp32 天然合法，但 downcast 使全部 plan mode 在默认构建下可达；additive mask 在 S 域加性注入，fp16 表示与量化路径注入域一致，精度语义不变。fp4 persist_d 的 C++ launcher 侧另有同语义 downcast（PC-0-5-pd-B：plan 落 mode 0/1 且 fp32 时物化副本重跑，堵 mode 0 race 的直调入口，见 §7.1）。
 - bench CLI 的 `--dtype fp16` 默认构建下显式报错（`_dtype_or_error`），不静默回退。
 
 ---
@@ -510,7 +510,7 @@ lse 公式（NVFP4 PV）：`lse = (m*L + log2(row_sum) + log2(1/2688))*ln2 + sca
 | cutedsl backend | ✗ | `NotImplementedError`（无静默 fallback） |
 | Triton backend | ✓ | （非本报告范围，支持 additive mask 梯度） |
 
-**结论：attn_mask 的低精度路径已由 FC-4 解锁**（fp8/fp4 六族均支持，2026-08-28）；bias 注入 IO 已全家族优化（PC-0-0 fp16 cute smem tile 化 2026-08-31 / PC-0-1 fp8+fp4 smem tile 化 2026-09-01，主力 mode 3 全驻留 + occupancy 守卫 / PC-0-2 native rowvec 内联向量化 2026-09-03，残余为 load-latency 主导、预取受寄存器预算约束搁置）；**正确性现状（PC-0-5 止血，2026-09-04）**：native / fp16 全族 / fp8 六族 / fp4 split_d / **fp4 persist_d rowvec（D=256/D=128 各 0/30，重负载复验 0/60×3）** bias 路径全部干净，**PC-0-5 问题① = fp4 split_d_m4n2 + attn_bias**（纯 bias 序列 mode 2/3 100% 触发 → **已 pin mode 0**，pure 序列稳定、`FFPA_BIAS_TILE_KEEP=1` 逃生口；**残留（接受）**：重负载前置下 bias 模板仍低概率不稳（mode 0 亦然——硬件负载时序层，no-bias 模板同负载干净；触发需 bias+重负载+m4n2（仅 D≥768 fp4）三重条件，现实场景少；指纹恒定单个 (m-warp,n-warp,v-chunk) PV C tile、lse 稳定、diff ~0.8% 元素 max ~0.039，根治待 NVIDIA 上报）。**区分**：fp4 persist_d + **dense fp32 mask**（mode 0 gmem 注入）的独立 race **已定性（2026-09-07，PC-0-5-pd）**：fp4 特有 × dense × mode 0 × 负载状态四重条件，重负载下 100% 触发（lse 稳定、PV/O 侧 16 行 warp 段、racecheck 0 + sanitizer 串行化免疫——硬件时序层，与 m4n2 同队列待 NVIDIA 上报）；rowvec（mode 3）与 fp16/bf16 dense（mode 1）免疫、fp8 同形干净，缓解选项待决策；m4n2 的 **Nq=64 illegal access 已修复（2026-09-07，bias 尾 tile OOB 三缺陷清扫）**：根因是 bias 注入在尾 tile 读 pad 行/列越界（smem mode 3 resident 按需截断分配 + gmem mode 0 直读两族），修复采用**分配侧 padding + gmem 模板双实例**（热路径指令级零开销——注入循环内 min 钳制/双分支会被 ptxas if-conversion 或向量化打爆 issue 受限 kernel 的指令数，fp4 persist_d 实测 +21~26% 指令 = +24% 耗时）；fp4 m4n2 的 mode 3 升级永久禁用（deterministic 8B LDS.64 越界读 + PC-0-5，KEEP 调试路径最高 mode 2）；dropout 仍为 fp16 家族专属。
+**结论：attn_mask 的低精度路径已由 FC-4 解锁**（fp8/fp4 六族均支持，2026-08-28）；bias 注入 IO 已全家族优化（PC-0-0 fp16 cute smem tile 化 2026-08-31 / PC-0-1 fp8+fp4 smem tile 化 2026-09-01，主力 mode 3 全驻留 + occupancy 守卫 / PC-0-2 native rowvec 内联向量化 2026-09-03，残余为 load-latency 主导、预取受寄存器预算约束搁置）；**正确性现状（PC-0-5 止血，2026-09-04）**：native / fp16 全族 / fp8 六族 / fp4 split_d / **fp4 persist_d rowvec（D=256/D=128 各 0/30，重负载复验 0/60×3）** bias 路径全部干净，**PC-0-5 问题① = fp4 split_d_m4n2 + attn_bias**（纯 bias 序列 mode 2/3 100% 触发 → **已 pin mode 0**，pure 序列稳定、`FFPA_BIAS_TILE_KEEP=1` 逃生口；**残留（接受）**：重负载前置下 bias 模板仍低概率不稳（mode 0 亦然——硬件负载时序层，no-bias 模板同负载干净；触发需 bias+重负载+m4n2（仅 D≥768 fp4）三重条件，现实场景少；指纹恒定单个 (m-warp,n-warp,v-chunk) PV C tile、lse 稳定、diff ~0.8% 元素 max ~0.039，根治待 NVIDIA 上报）。**区分**：fp4 persist_d + **dense fp32 mask**（mode 0 gmem 注入）的独立 race **已定性（2026-09-07，PC-0-5-pd）**：fp4 特有 × dense × mode 0 × 负载状态四重条件，重负载下 100% 触发（lse 稳定、PV/O 侧 16 行 warp 段、racecheck 0 + sanitizer 串行化免疫——硬件时序层，与 m4n2 同队列待 NVIDIA 上报）；rowvec（mode 3）免疫、fp16/bf16 dense D≤128 走 mode 1 免疫（D≥192 dense 原生亦 mode 0——"dense 免疫仅 D≤128 成立"，但 fp16 实测 0/40 不触发）、fp8 同形干净；**缓解选项 B 已落地（2026-09-09，PC-0-5-pd-B）**：persist_d launcher 在 plan 落 mode 0/1 且 fp32 时物化 q.dtype 副本重跑 plan 并采纳——D≤128 逃逸 mode 1 TMA tile（免疫路径）、D≥192 留 mode 0 但 load 减半（4B→2B），race 触发面归零（workbench 0/60×3 + 全矩阵 0/40，含 D=64 原生 mode1-f1 smem 硬崩的顺带修复）；m4n2 的 **Nq=64 illegal access 已修复（2026-09-07，bias 尾 tile OOB 三缺陷清扫）**：根因是 bias 注入在尾 tile 读 pad 行/列越界（smem mode 3 resident 按需截断分配 + gmem mode 0 直读两族），修复采用**分配侧 padding + gmem 模板双实例**（热路径指令级零开销——注入循环内 min 钳制/双分支会被 ptxas if-conversion 或向量化打爆 issue 受限 kernel 的指令数，fp4 persist_d 实测 +21~26% 指令 = +24% 耗时）；fp4 m4n2 的 mode 3 升级永久禁用（deterministic 8B LDS.64 越界读 + PC-0-5，KEEP 调试路径最高 mode 2）；dropout 仍为 fp16 家族专属。
 
 ### 7.2 dropout
 

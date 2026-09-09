@@ -27,7 +27,6 @@ void launch_cute_fwd_persist_d_fp4_sm120(
                   "ffpa_attn: fp4_pv_mm_type=fp8 persist_d supports D in "
                   "{64,128,192} (smem budget), got D=",
                   kHeadDim);
-    const FfpaBiasParams bias = ffpa_bias_params_of(attn_bias, Q, K);
     // Runtime dispatch over the variant tags (single-source plan, see
     // fp4_persist_d_bias_plan); the variant body re-checks the tags.
     const auto dispatch_p = [&](auto pv_c) {
@@ -38,10 +37,34 @@ void launch_cute_fwd_persist_d_fp4_sm120(
                                cudaDevAttrMaxSharedMemoryPerBlockOptin,
                                Q.get_device());
         const int dyn_limit = max_smem_optin - 256;
+        // PC-0-5-pd: a mode-0 demote (fp32 dense tile over budget / an
+        // unaligned mask ptr) puts the in-loop per-element gmem loads on a
+        // load-sensitive race window (fp4-specific; TMA tile modes immune).
+        // Materialize a q.dtype copy and retry the plan: at D<=128 the 2B
+        // tile fits the budget and a fresh allocation is 16B-aligned, so
+        // the retry escapes to the immune mode-1 TMA tile. A native mode-1
+        // fp32 tile (only reachable at D=64) is downcast too: its smem
+        // opt-in collides with the kernel's static smem reserve and
+        // hard-fails. At D>=192 even the 2B tile misses the budget and the
+        // retry stays in mode 0 — the copy is still adopted, halving the
+        // per-element load (2B vs 4B) the race window is sensitive to
+        // (measured: fp32 5-8/40 hits vs fp16 0/40 at load=400, D=192).
+        // Note: under FFPA_BIAS_TILE_DISABLE (debug) the retry stays in
+        // mode 0 and the copy is still adopted — the 4B fp32 gmem-direct
+        // injection is no longer reachable for repro; use a pre-fix build.
+        FfpaBiasParams bias = ffpa_bias_params_of(attn_bias, Q, K);
         FfpaBiasTilePlan plan;
-        if (bias.ptr != nullptr)
+        if (bias.ptr != nullptr) {
           plan = ffpa::fp4_persist_d_bias_plan<kDataType, kHeadDim, kPv>(
               bias, Q.size(0), Q.size(1), Q.size(2), K.size(2), dyn_limit);
+          if ((plan.mode == 0 || plan.mode == 1) && bias.dtype == 3) {
+            torch::Tensor bias_q = attn_bias.to(Q.scalar_type());
+            attn_bias = bias_q;
+            bias = ffpa_bias_params_of(bias_q, Q, K);
+            plan = ffpa::fp4_persist_d_bias_plan<kDataType, kHeadDim, kPv>(
+                bias, Q.size(0), Q.size(1), Q.size(2), K.size(2), dyn_limit);
+          }
+        }
         const int bias_on = bias.ptr != nullptr ? 1 : 0;
         const int mode = bias_on ? plan.mode : 0;
         const int b4 = (mode != 0 && bias.dtype == 3) ? 1 : 0;
