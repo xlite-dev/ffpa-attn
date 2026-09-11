@@ -95,7 +95,7 @@
 | PC-1 | Mega Quantize Kernel（aux 链大融合） | P | ❌ 证伪关闭（2026-09-11 实测：aux 链是**流量问题非 launch 问题**——PRO 5000 实测 DRAM 峰值 1.04TB/s，aux 各项均带宽饱和（fp4 fused_qkv 240MB/237µs=1.01TB/s、delta_s 131MB/110µs=1.19TB/s），融合不减流量；大 N wall 差 <0.2%（fp8 N8192→32768 aux 占比 14%→3.9%，fp4 17.3%→8.1%）；L2 排序（K 贴 col_sum -27µs/vt 贴 col_stats -30µs）作用域 ≤L2 100.7MB（N≈9000@D128），更大 N 反向恶化；已实现 4-launch stats 融合 bitwise 9/9 PASS 后**回退**——仅小 N/GQA 有 launch 数收益（+5.7% wall），大 N（核心场景）为零净负。详见完成清单） | — |
 | PC-2 | 增量融合（Mega Kernel 步进） | P | ❌ 证伪关闭（随 PC-1，同一实测裁决：融合不减 DRAM 流量） | PC-1 |
 | PC-3 | N-crossover 量化配置自适应 | P | ⬜ 待开始 | — |
-| PC-4 | fp4 persist-D attn kernel 内部优化 | P | ⬜ 待开始 | — |
+| PC-4 | fp4 persist-D attn kernel 内部优化 | P | ❌ 证伪关闭（2026-09-11 NCU 全量画像 + 严格 A/B：`wait` stall 31% 集中在 OMMA **等 A 操作数**（softmax→pack→PV 串行链）与 tile 级 S 复用串行，非 B 供给（LDS 类 wait 仅 7.7%）；tensor pipe 54% 的缺口被低 occupancy（25%，smem 99KB 硬限制）+ 数值链依赖链锁死；唯一候选改动（V/SFV 首块 s2r 提前藏进 softmax）严格 A/B **+1.3~1.7% 净负**（寄存器 live-range 拉长抵消延迟掩盖，同 #15 机制）已回退——微优化到顶确认，详见完成清单与附录 A #21） | — |
 | PC-5 | CUDA graph 友好化 (**暂不实施，仅保留设计稿**) | P | ⬜ 待开始 | PC-1 已证伪关闭（其 launch 形态前置消失；graph 化价值独立评估） |
 | PC-6 | sm_89 fp8 int4 QK (**暂不实施，仅保留设计稿**) | P | ⬜ 低优搁置 | PC-12（cute sm_80 fp16 性能达标 → 迁移 cute/fp8/sm_89 即 fp8 路线复活） |
 | PC-7 | fp8 split-D (M8N1) 量化大 D kernel 性能优化 | P | ⬜ 待开始 | — |
@@ -229,7 +229,26 @@
 - [x] PC-2：增量融合（Mega Kernel 步进）—— ❌ **证伪关闭**（随 PC-1 同一实测裁决：
   融合不减 DRAM 流量；4-launch stats 融合的 bitwise 验证与回退记录见 PC-1 条目）
 - [ ] PC-3：N-crossover 量化配置自适应
-- [ ] PC-4：fp4 persist-D attn kernel 内部优化
+- [x] PC-4：fp4 persist-D attn kernel 内部优化 —— ❌ **证伪关闭（2026-09-11，微优化到顶确认）**
+  - **NCU 全量画像（`--set full`，N16384 D128 B1H32，`.tmp/pc4/`，已删大文件仅存 verdict）**：
+    SOL SM 54.8%/MEM 46.5%/DRAM 5.1%，tensor pipe 54.0%（近半空转——fp4 主 kernel vs fp8 仅
+    1.26x 的根因）；occupancy 25%（1 CTA/SM，regs 168 + smem 99KB 双限制，WS 结构不可提）；
+    stall 主导 `wait` 31%：OMMA 发射处占 38.3%（等操作数就绪，非 MMA 吞吐），LDS 仅 7.7%、
+    MOV 6.9%、FMNMX 6.2%、FFMA 6.0%；数值链指令量是 MMA 的 ~4 倍（FFMA 615M/FMNMX 344M/
+    F2FP 152M vs OMMA 268M warp-inst）；SF 窄 load 不存在（LDS.U8 仅 0.5M，SF 32-bit copy
+    atom 早已证伪——traits 注释：TV 布局不连续）。
+  - **裁决**：wait 的主体 = PV 的 A 操作数链（softmax→pack→PV mma）+ tile 级 S 复用串行
+    （QK(t+1) 等 pack(t) 读走 tSrS）；数值链已高度优化（SA3 exp2 折叠 / PC-11 lazy rescale
+    per-row guard / ex2.approx.ftz / regalloc 门控），剩余结构项（S 双缓冲需翻倍寄存器、
+    softmax 半块流水需跨半块 row_max 合并）均非微调可攻克；occupancy 由 smem 硬限制锁死。
+  - **候选改动实测证伪**：V/SFV 首块 s2r 从 softmax 后提前到前（`gemm_rs_fp4/mxfp8` 加
+    `k_preloaded` 尾参，LDSM 延迟藏进 softmax 数值链的假设）——严格 A/B（同构建配方，stash
+    重建基线，各 3 遍，boost 时钟，锁 1800 排除时钟混杂）：N8192 D128 2.51→2.55ms（+1.6%）、
+    N16384 D128 8.32→8.46ms（+1.7%）、N32768 D128 15.39→15.59ms（+1.3%），**稳定净负已回退**。
+    机制同附录 A #15：LDSM 目的寄存器（tOrVt/tOrSFVt k0）跨 softmax 链存活拉长 live-range，
+    寄存器调度损失反超延迟掩盖收益。K 跨 tile 预取（候选 2）同机制风险 + B 供给非瓶颈
+    （LDS wait 7.7%），不再投。
+  - 证据：`.tmp/pc4/verdict.md`（完整数据 + 机制）；NCU harness `.tmp/pc4/ncu_harness_fp4.py`。
 - [ ] PC-5：CUDA graph 友好化
 - [ ] PC-6：sm_89 fp8 int4 QK（低优搁置：sm_120 无原生 int4 MMA，SA2 int4 kernel 未开源）
 - [x] PC-11：warp 级 `__any_sync` lazy-rescale 统一治理（精度治理专项，2026-09-01 立项，2026-09-09 完成）
@@ -303,7 +322,8 @@
         └─► PC-0-2 native/native_tma（✅ c645ac1，rowvec 内联向量化）
   ~~PC-1 Mega Quantize Kernel（先做 cooperative 两阶段原型）~~ ❌ 证伪关闭（2026-09-11，
         aux 链流量饱和，融合不减量；联动 PC-2/PC-5 一并关闭或失去前置）
-  PC-3 配置自适应 ｜ PC-4 fp4 persist-D kernel 内部（与上并行，互不依赖）
+  PC-3 配置自适应 ｜ ~~PC-4 fp4 persist-D kernel 内部~~ ❌ 证伪关闭（2026-09-11，
+        NCU 证实 wait 集中在 A 操作数串行链 + occupancy 硬限制，候选改动 +1.3~1.7% 净负）
   PC-7 → PC-8 → PC-9 → PC-10 量化大 D kernel（优化复杂，严格逐个推进：
         fp8 split-D → fp8 M4N2 → fp4 split-D → fp4 M4N2，上一项验收后再启动下一项）
   PC-12 cute sm_80 fp16（cp.async + 多级流水线）──达标──► cute/fp8/sm_89 量化实现
@@ -1347,9 +1367,9 @@ M8N1 / D≥768 M4N2，`csrc/cuffpa/launch.cuh`），无 N 维分支。历史上�
 
 ### PC-4：fp4 persist-D attn kernel 内部优化
 
-- **Status**: Draft ｜ **Priority**: P3 ｜ **Track**: 性能
+- **Status**: ❌ 证伪关闭（2026-09-11，微优化到顶确认） ｜ **Priority**: P3 ｜ **Track**: 性能
 
-#### Motivation
+#### Motivation（原立项）
 
 fp4 persist-D attn kernel 当前 `wait` stall 31.1% 为主（报告 §6.5），
 tensor pipe 未饱和（`math_pipe_throttle` 仅 7.4%），说明数据供给（Q/K/V smem→reg、
@@ -1357,41 +1377,48 @@ P pack、rescale）是瓶颈而非 MMA 吞吐。潜在方向：减少 P pack 的
 优化 rescale 的 FFMA 依赖链、提升 TMA→smem→reg 的供给速率。**但必须先证明热点**
 （附录 B 的 NCU stall 采样），避免在已饱和处做无用功。
 
-#### Design
+#### 最终裁决（2026-09-11，NCU `--set full` + `--page source` SASS 级归因）
 
-1. **先决**：`ncu --page source` 定位 fp4 attn kernel 的 stall 热点行
-   （`wait` 31.1% 集中在哪条指令链）。
-2. 按热点选方向（候选）：
-   - P pack（`quantize_and_pack_p`）的寄存器压力优化；
-   - rescale 与 MMA 的依赖解耦；
-   - smem→reg 的 load 合并。
-3. 每次改动用 NCU A/B 验证（附录 B）。
+1. **画像事实**（N16384 D128 B1H32，PRO 5000）：
+   - tensor pipe 54.0% / SM 54.8% / DRAM 5.1%；occupancy 25%（regs 168 +
+     smem 99KB 双限制，WS 单 CTA 设计锁死）；
+   - `wait` 31% 中 **OMMA 发射处占 38.3%**（等操作数就绪，非 MMA 吞吐）；
+     LDS 类仅 7.7%；数值链指令量是 MMA 的 ~4 倍（FFMA 615M / FMNMX 344M /
+     F2FP 152M vs OMMA 268M warp-inst）；
+   - SF 窄 load 不存在（LDS.U8 仅 0.5M）；SF 32-bit copy atom 早已证伪
+     （traits 注释：SFA/SFB TV 布局不连续）。
+2. **热点定性**：wait 主体 = **PV 的 A 操作数链**（softmax→pack→PV mma 串行）
+   + **tile 级 S 复用串行**（QK(t+1) 必须等 pack(t) 读走 tSrS）——B 操作数
+   供给（LDS）非瓶颈。数值链已是已优化形态（SA3 exp2 折叠、PC-11 per-row
+   guard、ex2.approx.ftz、regalloc 门控）；剩余结构项（S 双缓冲 = 寄存器翻倍
+   不可行；softmax 半块流水 = 跨半块 row_max 合并大改）均非微调可攻克。
+3. **候选改动严格 A/B 证伪**：V/SFV 首块 s2r 提前到 softmax 前（`k_preloaded`
+   尾参形态）——stash 重建基线各 3 遍：N8192 **+1.6%** / N16384 **+1.7%** /
+   N32768 **+1.3%** 净负（寄存器 live-range 拉长，同附录 A #15 机制），已回退。
+   K 跨 tile 预取同机制风险且 B 供给非瓶颈，不再投。
+4. **结论**：fp4 persist-D kernel 内部微优化到顶（与附录 A 元教训一致），
+   `wait` 31% 是低 occupancy + 串行链的结构性代价，无可攻克热点。
 
-#### Files & Symbols
+#### Files & Symbols（改动已全部回退，无保留）
 
-- `csrc/cuffpa/cute/fp4/sm_120/{persist_d,split_d,split_d_m4n2}.cuh` fp4 主循环；
-  `csrc/cuffpa/cute/fp4/fp4_pscale.cuh`（`quantize_and_pack_p` /
-  `quantize_and_pack_p_mxfp8` 的 P pack）。
+- 曾涉及 `csrc/cuffpa/cute/fp4/fp4_gemm.cuh`（`gemm_rs_fp4`/`gemm_rs_mxfp8`
+  `k_preloaded` 尾参）、`csrc/cuffpa/cute/fp4/sm_120/persist_d.cuh`（v_full
+  wait + 首块 s2r 提前）——bitwise 语义等价但性能净负，回退。
 
-#### Validation
+#### Validation Record
 
-1. NCU stall 画像前后对比（`wait` 占比下降）。
-2. 冷数据轮转性能。
-3. bitwise probe 数值一致。
+1. NCU 画像前后对比（改动后未复测——wall A/B 已净负，无需 NCU 复核）。
+2. wall A/B（同构建配方 stash 重建，各 3 遍，boost 时钟 + 锁 1800 排除混杂）。
+3. determinism + sdpa parity probe 通过（数值路径未变，纯调度移动）。
 
-#### Risks & Rollback
+#### Expected Benefit（原预期 vs 实际）
 
-- fp4 kernel 微优化空间可能已接近上限（参照附录 A 元教训：微优化到顶）；
-  **先 NCU 证明有可攻克的热点再投入**。
-- 回退 = 逐项保留原路径。
-
-#### Expected Benefit
-
-fp4 attn kernel -3~5%（若热点可攻克）。
+原预期 -3~5%；实际 **+1.3~1.7%（净负）**——RFC Risks 预判的"微优化空间可能
+已接近上限"成立，方向整体关闭。
 
 #### Dependencies
 
-无（但强依赖 NCU 先决分析）。
+无。
 
 ---
 
@@ -1743,10 +1770,14 @@ SA2 证明了 int4 QK 的精度可行性（per-thread int4 量化 + smooth-Q ran
 | 18 | vstats+vt 融合 | 算法不可行 | per-channel scale 必须先完成 |
 | 19 | flat workspace + reorder（dispatch 侧） | 无收益 | TensorImpl 开销 ≈ 省掉的 empty |
 | 20 | aux 链融合（PC-1 Mega Quantize Kernel / PC-2 增量融合） | 证伪关闭（2026-09-11） | **流量问题非 launch 问题**：aux 各项贴 1.04TB/s 设备峰值（fp4 fused_qkv 240MB/237µs=1.01TB/s、delta_s 1.19TB/s、col_sum 0.9TB/s），融合不减流量；大 N 三模式 wall 差 <0.2%；L2 排序作用域 ≤L2 100.7MB（N≤~9000@D128）；4-launch 融合 bitwise 9/9 PASS 后回退（仅小 N/GQA launch 收益 +5.7%） |
+| 21 | fp4 persist-D V/SFV 首块 s2r 提前（PC-4，LDSM 延迟藏进 softmax 链） | 负已回退（2026-09-11） | N8192 +1.6% / N16384 +1.7% / N32768 +1.3%（stash 重建基线各 3 遍）；机制同 #15——LDSM 目的寄存器跨 softmax 链存活拉长 live-range，寄存器调度损失反超延迟掩盖；NCU 佐证：B 供给非瓶颈（LDS 类 wait 仅 7.7%，wait 31% 主体在 OMMA 等 A 操作数链），PC-4 方向整体关闭 |
 
 **跨实验元教训**：fp8 attn kernel 微优化已到顶（kernel 级稳定优于 SageAttention +1.1~2.3%）；
+**fp4 persist-D 微优化同样到顶（2026-09-11 PC-4 关闭：wait 31% = 低 occupancy + softmax→pack→PV 串行链的结构性代价，tensor pipe 54% 的缺口无可攻克热点）**；
 结构优化收益是 kernel-结构相关的，不能跨量化格式外推（fp4 persistent 有效、fp8 零收益）；
-优化前先查目标 kernel 的 L1 hit / stall 画像（fp4 教训）。
+优化前先查目标 kernel 的 L1 hit / stall 画像（fp4 教训）；**把额外指令/更长寄存器存活拉进
+softmax-MMA 依赖链的调度类改动（#5/#7/#15/#21）在本设计下一致净负——WS 低 occupancy 结构
+对 live-range 极端敏感，调度收益上限远低于直觉**。
 
 > 注意：#18（vstats+vt 融合）的证伪对象是**无同步的单遍融合**；#20 进一步把整个
 > aux 链融合方向（含两阶段 + grid 屏障形态）也证伪关闭——根因不是同步成本，而是
