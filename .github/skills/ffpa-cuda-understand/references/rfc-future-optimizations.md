@@ -44,7 +44,8 @@
   - **F1 布局零拷贝闭环**（最高）——直接服务下游（diffusers / cache-dit）最高频形态；
   - **F2 量化路径特性对齐**——让低精度家族获得与 fp16 家族同等的输入特性（`attn_bias` 是最大高频需求）；
   - **F3 场景与硬件覆盖**——decode / pad / 多架构，按需。
-- **轨道 P（性能优化）**：功能不变下提速——前处理融合（Mega Quantize Kernel）、kernel 内部、配置自适应、graph 友好。
+- **轨道 P（性能优化）**：功能不变下提速——kernel 内部、配置自适应、graph 友好。
+  （~~前处理融合（Mega Quantize Kernel）~~ ❌ 2026-09-11 证伪关闭，见完成清单）
 
 ## 功能完备性现状矩阵
 
@@ -329,9 +330,9 @@
 2. **FC-4 → FC-5**：`attn_bias` 建立的 S 域注入基建（per-block bias 载入、P 量化前
    修正、`-inf` 掩码叠加顺序）正是 dropout 乘性掩码所需的注入点，FC-5 复用即可
    （FC-5 ⏸ 暂不实施：FC-4 落地后注入点自然可用，届时再评估）。
-3. **PC-1 → PC-2/PC-5**：Mega Kernel 的两阶段 + grid 屏障是 aux 链融合的终局形态；
-   PC-2 的相邻对融合是其增量台阶（PC-1 落地即收编），PC-5 的 graph 兼容性必须等
-   PC-1 的 cooperative launch 形态定型后才有确定方案（PC-5 ⏸ 暂不实施，届时再评估）。
+3. ~~**PC-1 → PC-2/PC-5**~~ **关系解体（2026-09-11）**：PC-1（Mega Kernel 融合）已
+   实测证伪关闭（aux 链流量饱和，见完成清单），PC-2 随之关闭；PC-5（CUDA graph
+   友好化）的 launch 形态前置消失，价值需独立评估（⏸ 暂不实施不变）。
 4. **阶段 3 各项与阶段 1/2 无依赖**，可在基建间隙穿插推进，但不得抢占基建资源
    （实际排期仅 FC-8；FC-7/FC-9/FC-10 ⏸ 暂不实施，不占档期）。
 
@@ -1124,7 +1125,8 @@ exp2(bias·c)`。预处理 kernel 一次性产出 `bias_exp` 乘子表（半精�
 `max(bias)` 作 online-max 初值上界（防溢出，softmax 平移不变保证等价）；
 fp8 的 `qs·ks` 在 softmax 输入域恰好消去 → 乘子与 row 无关，per-(q,k) 常量表。
 attn kernel 内 add 变 mul、读表流量减半。风险：online-max 初始化语义变化 +
-半精度乘子表精度，A 落地后再评估。乘子表预处理可并入 PC-1 的 aux 融合。
+半精度乘子表精度，A 落地后再评估。~~乘子表预处理可并入 PC-1 的 aux 融合~~（PC-1
+已证伪关闭，乘子表需独立预处理 kernel 或并入既有量化 kernel）。
 
 **方案 C（仅根因对照，非交付路径）**：stride_n==1 时 128-bit 向量化 direct
 load——按用户判断"仅向量化不够"（line 级重复仍在），只用于 A/B 对照验证
@@ -1169,7 +1171,8 @@ attn-mask 量化路径从 144T（fp4 D128）回到 ~400T+ 量级；对齐 SageAt
 #### Dependencies
 
 FC-4 注入点基建（`kHasAttnBias` 编译期双实例，bias=None 零开销不变）；
-与 PC-1 正交（方案 B 的乘子表可并入其 aux 融合）。
+~~与 PC-1 正交（方案 B 的乘子表可并入其 aux 融合）~~（PC-1 已证伪关闭，方案 B
+乘子表需独立评估前置 kernel）。
 
 ---
 
@@ -1240,6 +1243,11 @@ CPU dispatch gap 向 sage 水平收敛。
 ---
 
 ### PC-2：增量融合（Mega Kernel 步进）
+
+> ❌ **证伪关闭（2026-09-11，随 PC-1）**：同一实测裁决——aux 链为纯 DRAM 流式
+> 负载，相邻对融合（pad+quantize / smooth 后置 / kv_mean 融进 quantize）同样不
+> 减流量。已实现的 4-launch stats 融合 bitwise 9/9 PASS 后也已回退，详见
+> 「完成清单」PC-1 条目。下方内容保留为历史设计记录。
 
 - **Status**: Draft ｜ **Priority**: P2 ｜ **Track**: 性能
 
@@ -1572,13 +1580,17 @@ PC-9（顺序：复杂优化逐个推进，同族经验复用）。
 
 ### PC-5：CUDA graph 友好化 (暂不实施，仅保留设计稿)
 
+> ⚠️ **2026-09-11 依赖更新**：PC-1 已证伪关闭，其 cooperative 两阶段 launch 前置
+> 消失；本项的 graph-safe 目标（capture 期免分配 / launch 结构固定）价值需独立
+> 评估（⏸ 暂不实施不变），不再以 PC-1 形态为设计输入。
+
 - **Status**: Draft ｜ **Priority**: P3 ｜ **Track**: 性能（部署能力）
 
 #### Motivation
 
 CUDA graph capture 要求 kernel 参数、stream、内存分配在 capture
 期间确定。当前量化路径的前处理链有多次 `cudaMalloc`/`cudaFree`（descriptor 构建）、
-cooperative 两阶段 launch（PC-1 引入后）、以及依赖运行时形状的动态 launch，可能破坏 graph 捕获。
+以及依赖运行时形状的动态 launch，可能破坏 graph 捕获。
 cache-dit 若启用图模式部署，需要 ffpa 路径 graph-safe。
 
 #### Design
@@ -1705,7 +1717,8 @@ SA2 证明了 int4 QK 的精度可行性（per-thread int4 量化 + smooth-Q ran
 ## 附录 A：已证伪优化清单（动手前必读）
 
 以下实验已完成且**负收益或零收益**，数据与结论详见报告 §5.8/§6.6 及 memory
-（`ffpa-fp8-d128-ws-opt` / `ffpa-fp8-persistent-falsified` / `ffpa-fp4-persist-d`）。
+（`ffpa-fp8-d128-ws-opt` / `ffpa-fp8-persistent-falsified` / `ffpa-fp4-persist-d` /
+`ffpa-pc1-mega-verdict`）。
 重复投入前先查本表。
 
 | # | 实验 | 结果 | 关键数字 |
@@ -1729,15 +1742,16 @@ SA2 证明了 int4 QK 的精度可行性（per-thread int4 量化 + smooth-Q ran
 | 17 | fp4 exp2 多项式替换 | 否决 | XU 28% 利用率非瓶颈，串行 FFMA 更糟 |
 | 18 | vstats+vt 融合 | 算法不可行 | per-channel scale 必须先完成 |
 | 19 | flat workspace + reorder（dispatch 侧） | 无收益 | TensorImpl 开销 ≈ 省掉的 empty |
+| 20 | aux 链融合（PC-1 Mega Quantize Kernel / PC-2 增量融合） | 证伪关闭（2026-09-11） | **流量问题非 launch 问题**：aux 各项贴 1.04TB/s 设备峰值（fp4 fused_qkv 240MB/237µs=1.01TB/s、delta_s 1.19TB/s、col_sum 0.9TB/s），融合不减流量；大 N 三模式 wall 差 <0.2%；L2 排序作用域 ≤L2 100.7MB（N≤~9000@D128）；4-launch 融合 bitwise 9/9 PASS 后回退（仅小 N/GQA launch 收益 +5.7%） |
 
 **跨实验元教训**：fp8 attn kernel 微优化已到顶（kernel 级稳定优于 SageAttention +1.1~2.3%）；
 结构优化收益是 kernel-结构相关的，不能跨量化格式外推（fp4 persistent 有效、fp8 零收益）；
 优化前先查目标 kernel 的 L1 hit / stall 画像（fp4 教训）。
 
-> 注意：#18（vstats+vt 融合）的证伪对象是**无同步的单遍融合**（per-channel scale
-> 必须先完成）。PC-1 的 Mega Kernel 用两阶段 + grid 级屏障绕过该约束；PC-2 的增量
-> 融合不含 vstats+vt。实施时先原型验证屏障成本，若 grid_sync 开销抵消 round-trip
-> 削减，则退回 PC-2 的相邻对融合。
+> 注意：#18（vstats+vt 融合）的证伪对象是**无同步的单遍融合**；#20 进一步把整个
+> aux 链融合方向（含两阶段 + grid 屏障形态）也证伪关闭——根因不是同步成本，而是
+> **融合不减 DRAM 流量**（各项 kernel 本已带宽饱和），即便屏障免费也无收益。aux
+> 链的残余空间只剩 engine 层 overlap，不要再投 kernel 内融合。
 
 ## 附录 B：验证基础设施
 

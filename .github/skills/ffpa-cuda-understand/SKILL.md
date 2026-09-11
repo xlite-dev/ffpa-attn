@@ -420,12 +420,15 @@ sm120 fp8 persist-D 的结构优化路线**已全部实测证伪**（memory 记�
 | CUDA-core row_sum 替代 tensor rowsum MMA | -4%（rowsum MMA 在 tensor 气泡里免费） |
 | O2 预计算 log2/RCP、O3 bank conflict | 否决（MUFU 被 MMA 等待掩盖；ld conflict 0.39%） |
 | aux vstats 扩容 | 带宽受限，零收益 |
+| **aux 链融合（PC-1/PC-2 Mega Quantize Kernel）** | **证伪关闭（2026-09-11）**：aux 各项贴设备峰值带宽（1.04TB/s），融合只省 launch 不减流量；大 N wall 差 <0.2%；L2 排序仅 N≤~9000@D128 有效；4-launch 融合 bitwise 验证后回退（详见 RFC 完成清单 PC-1） |
 
 **结论：attn kernel 本身已稳定略优于 SageAttention（kernel 级 +1.1~2.3%），kernel 微优化到顶。**
 
 ### 5.9 E2E 差距根因与方向
 
-E2E（含前处理）GQA 小 N 场景仍落后：根因是辅助链 kernel 数量（quantize×2 + vt + kv_mean 链 ≈13 kernel/call vs sage 7）+ CPU dispatch（wall-GPU 129µs vs sage 50µs）。方向是**aux 链融合成单个大 kernel（Mega Quantize Kernel）削减 kernel 数量**，而非 kernel 微调；multi-stream 并行 aux 链不可行（见 §9）。
+E2E（含前处理）GQA 小 N 场景一度落后：根因是辅助链 kernel 数量（quantize×2 + vt + kv_mean 链 ≈13 kernel/call vs sage 7）+ CPU dispatch（wall-GPU 129µs vs sage 50µs）。
+
+> ⚠️ **2026-09-11 更新（PC-1 证伪关闭）**：当时推断的"aux 链融合成单个大 kernel（Mega Quantize Kernel）削减 kernel 数量"方向**已被实测证伪**——aux 链是纯 DRAM 流式负载，各项 kernel 均已贴设备峰值带宽（PRO 5000 实测 1.04TB/s），融合只省 launch 不减流量；大 N（核心场景）三模式（串行/4-launch 融合/L2 顺序）wall 差 <0.2%。小 N/GQA 的 launch 数收益（+5.7% wall）不足以抵消全量融合在大 N 的净负。**不要再投 aux 链融合**；multi-stream 并行同样不可行（见 §9）。aux 残余方向只有 engine 层 overlap（大 N 主 kernel 占 86-92%，aux 属可掩蔽侧）。完整数据见 RFC 完成清单 PC-1 条目。
 
 ---
 
