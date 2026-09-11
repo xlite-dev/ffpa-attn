@@ -364,17 +364,11 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
   // zeroing 3/4 of the k-groups in every mxf4nvf4 mma).
 
   // P roundtrip plumbing: each N-warp reads its PV A-fragment slice back
-  // from sP as f32 (UniversalCopy over the mma's A thread partition - the
-  // dst fragment layout matches the e2m1 A operand's, so the register
-  // quantizer packs straight into the operand slots) and quantizes in
-  // registers. The write side is the permuted element-wise STS in the kv
-  // loop (see the P roundtrip block). The e2m1/SF fragment shapes come
-  // from shadow (nullptr) tensors of the operand layouts - shape only, no
-  // access.
-  auto s2r_copy_p =
-      make_tiled_copy_A(Copy_Atom<UniversalCopy<float>, float>{}, tiled_mma_pv);
-  auto s2r_thr_p = s2r_copy_p.get_thread_slice(tid);
-  Tensor tPsP = s2r_thr_p.partition_S(sP);
+  // from sP as f32 (float4 loads in the operand's (m,k) order - see the
+  // P roundtrip block) and quantizes in registers. The write side is the
+  // permuted element-wise STS in the kv loop. The e2m1/SF fragment shapes
+  // come from shadow (nullptr) tensors of the operand layouts - shape
+  // only, no access.
   // Register fragments carry the persist-D rank-3 LayoutP/LayoutSFP
   // adapters (k-iter = 1): make_zip_tensor(tPA, tPASF) requires equal
   // ranks, and the raw partition_fragment_A layout is rank-2 here.
@@ -606,9 +600,14 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
         copy(smem_tiled_copy_Q, tSsQ_chunk, tSrQ_c_view);
         auto tSrSFQ_c = tSrSFQ(_, _, d_chunk);
         {
-          auto b_smem = recast<uint4_t>(
+          // 32-bit block copy (8 e2m1 per access): the fragment and the
+          // smem partition share the same 4-bit element order, so this is
+          // bitwise-identical to the former per-nibble loop while cutting
+          // the byte-load/shift instruction sea ~8x. SF stays byte-wise
+          // (1 B per 16 elems).
+          auto b_smem = recast<uint32_t>(
               flatten(thread_mma_qk.partition_B(sK(_, _, k_stg))));
-          auto b_frag = flatten(tSrK);
+          auto b_frag = recast<uint32_t>(flatten(tSrK));
           CUTLASS_PRAGMA_UNROLL
           for (int i = 0; i < (int)size(b_frag); ++i)
             b_frag(i) = b_smem(i);
@@ -786,13 +785,10 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
         __syncthreads();
         ffpa_cute::finalize_row_sum_m4n2<kSoftmaxRows>(
             row_sum, row_scale, smem_exchange, warp_id, lane_id);
-        copy(s2r_copy_p, tPsP, s2r_thr_p.retile_D(tPf32));
-        // retile_D writes the copy's k-major (v1 = k+8) slot order into
-        // tPf32, but the PV A operand needs the PTX fragment order
-        // (slot v1 = m+8): reg0/2 = row gid at k = 8*tig (+32), reg1/3 =
-        // row gid+8, same k windows (mma_traits_sm120 ALayout). Reload the
-        // fragment element-wise straight from sP in the operand's (m,k)
-        // order.
+        // Load the PV A operand straight from sP in the PTX fragment
+        // order (the tiled-copy retile writes the copy's k-major slot
+        // order, which the operand cannot use). sP is swizzle-free
+        // row-major, so each 8-float (v0) run loads as 2 x float4.
         {
           Tensor pf = flatten(tPf32);
           int const tig = lane_id & 3;
@@ -800,9 +796,15 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
           // warp M base: atoms are (warp_id % 4) along M (see AtomLayoutMNK)
           int const wrow = (warp_id % 4) * 16 + gid;
           CUTLASS_PRAGMA_UNROLL
-          for (int v = 0; v < 32; ++v) {
-            int const v0 = v & 7, v1 = (v >> 3) & 1, v2 = (v >> 4) & 1;
-            pf(v) = sP(wrow + 8 * v1, 8 * tig + v0 + 32 * v2);
+          for (int v1 = 0; v1 < 2; ++v1) {
+            CUTLASS_PRAGMA_UNROLL
+            for (int v2 = 0; v2 < 2; ++v2) {
+              float4 const* src = reinterpret_cast<float4 const*>(
+                  &sP(wrow + 8 * v1, 8 * tig + 32 * v2));
+              float4* dst = reinterpret_cast<float4*>(&pf(8 * v1 + 16 * v2));
+              dst[0] = src[0];
+              dst[1] = src[1];
+            }
           }
         }
         quantize_pack_a_fp4(tPf32, tPA, tPASF);
@@ -819,9 +821,10 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
         auto tCrO = make_tensor(make_rmem_ptr(&o_acc_storage[v_chunk][0]),
                                 OFragLayout{});
         {
-          auto b_smem = recast<uint4_t>(
+          // 32-bit block copy, same rationale as the QK-side K load.
+          auto b_smem = recast<uint32_t>(
               flatten(thread_mma_pv.partition_B(sV(_, _, v_stg))));
-          auto b_frag = flatten(tOrVt);
+          auto b_frag = recast<uint32_t>(flatten(tOrVt));
           CUTLASS_PRAGMA_UNROLL
           for (int i = 0; i < (int)size(b_frag); ++i)
             b_frag(i) = b_smem(i);

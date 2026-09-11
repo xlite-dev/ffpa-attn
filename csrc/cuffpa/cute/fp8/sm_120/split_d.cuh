@@ -607,12 +607,15 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
 
     float row_scale[kORows];
     // Split-d fused-rescale switches (migrated from persist-d fp8). All-on
-    // measured +8.4% vs the 81dbf75 baseline on RTX PRO 5000 (D=512,
+    // measured +8.2% vs the 81dbf75 baseline on RTX PRO 5000 (D=512,
     // int8 QK + f16 PV acc): folding the rescale into the absorption FFMA
     // (FADD->FFMA) raises math_pipe_throttle; split-d runs 1 CTA/SM (256
     // threads) and cannot hide the extra tensor-pipe pressure, unlike
     // persist-d (WS, 384 threads). Default off to match baseline; flip to
-    // true to re-evaluate on other GPUs (5090/H800).
+    // true to re-evaluate on other GPUs (5090/H800). NOTE (PC-7 2026-09-11):
+    // that verdict bundled reorg_free; reorg_free measured SOLO is faster
+    // (D=320 -3.4~-3.9%, D=512 -0.3~-0.4%, bitwise identical) and is now
+    // default-ON via the launcher -- only the fused-rescale pair stays off.
     constexpr bool kUseFusedRescale = false;
     constexpr bool kMaxScaleAfter =
         kUseFusedRescale && Traits::kQKInt8 && kPVAccF16;
