@@ -359,7 +359,7 @@ D 交叉点与 fp16 家族一致（<768 M8N1 / ≥768 M4N2）。`FFPA_FP8_FORCE_
 | `fp8_hadamard` | bool | WHT Q/K 预旋转 |
 | `fp8_hybrid` / `fp8_hybrid_n_early`(默认256) | None(auto: causal+fp8)/bool/int | 见 §5.5 |
 | per-row P 量化 | env `FFPA_FP8_PQUANT_PER_ROW=1` | P scale = row_max/448 满量程（balanced narrowing；与 lazy rescale 互斥） |
-| reorg-free PV pack | 编译期常量 `reorg_free=true`（persist-D 全配置默认） | P 进 PV A 操作数免 cross-lane shuffle，V^T 列按 `VTPermInv32` 置置写 |
+| reorg-free PV pack | 编译期常量 `reorg_free=true`（persist-D 全配置 + **split-D（PC-7 2026-09-11 拆分实测：D=320 -3.4~-3.9%/D=512 -0.3~-0.4%，bitwise 一致；61d02c4 的 all-on +8.2% 慢是 fused-rescale FADD→FFMA 吸收链非本开关）** 默认；m4n2 仍 off） | P 进 PV A 操作数免 cross-lane shuffle，V^T 列按 `VTPermInv32` 置置写 |
 
 配置性能经验：**fp8 bench 默认配置已统一为 QK int8（int8 MMA + int32 acc）+ PV f16 acc（fp8 MMA + f16 acc）**（5090 与 PRO 5000 同配置；历史上"PRO 5000 纯 fp8(f32acc) / 5090 int8+f16acc"的分卡默认已废弃）。历史测量：FLUX 分辨率（N≤4608）fp8+f16acc 曾更快，qk_mm_type crossover N∈(4608,8192)。**优化/对照实验仍必须显式声明所用配置**，避免与默认配置错位比较。
 

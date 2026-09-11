@@ -112,13 +112,13 @@ void launch_cute_fwd_split_d_fp8_sm120_v(
       "ffpa_attn: fp8_smooth_v requires fp8_v_quant_method='per_channel'");
   // Split-D reorg-free: PackC8bitToA8bitPermVT in-kernel + permuted V^T from
   // the quantize pre-kernel (same pairing as persist_d; M8N1 C/A layouts are
-  // identical between the two families). Part of the split-d fused-rescale
-  // optimization set: all-on measured +8.4% vs the 81dbf75 baseline on RTX
-  // PRO 5000 (see the switches note in split_d.cuh); default off with the
-  // rest so the off-path stays instruction-identical to the baseline.
-  // persist_d keeps reorg_free=true (WS hides the extra pipe pressure).
-  constexpr bool kUseFusedRescale = false;
-  constexpr bool reorg_free = kUseFusedRescale;
+  // identical between the two families). 61d02c4's all-on +8.2% slowdown was
+  // the fused-rescale FADD->FFMA absorb swap, not this switch: measured SOLO
+  // (PC-7, 2026-09-11, RTX PRO 5000, int8 QK + f16 PV acc, three-leg
+  // on/off/on): D=320 -3.4~-3.9%, D=512 -0.3~-0.4%, outputs bitwise
+  // identical to the cross-lane reorg path. persist_d also keeps it on.
+  [[maybe_unused]] constexpr bool kUseFusedRescale = false;
+  constexpr bool reorg_free = true;
 
   // kBr/kBc mirrored by env.py::_fp8_variant_blocks; keep in sync.
   constexpr int kBr = 128;

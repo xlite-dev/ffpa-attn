@@ -98,8 +98,8 @@
 | PC-4 | fp4 persist-D attn kernel 内部优化 | P | ❌ 证伪关闭（2026-09-11 NCU 全量画像 + 严格 A/B：`wait` stall 31% 集中在 OMMA **等 A 操作数**（softmax→pack→PV 串行链）与 tile 级 S 复用串行，非 B 供给（LDS 类 wait 仅 7.7%）；tensor pipe 54% 的缺口被低 occupancy（25%，smem 99KB 硬限制）+ 数值链依赖链锁死；唯一候选改动（V/SFV 首块 s2r 提前藏进 softmax）严格 A/B **+1.3~1.7% 净负**（寄存器 live-range 拉长抵消延迟掩盖，同 #15 机制）已回退——微优化到顶确认，详见完成清单与附录 A #21） | — |
 | PC-5 | CUDA graph 友好化 (**暂不实施，仅保留设计稿**) | P | ⬜ 待开始 | PC-1 已证伪关闭（其 launch 形态前置消失；graph 化价值独立评估） |
 | PC-6 | sm_89 fp8 int4 QK (**暂不实施，仅保留设计稿**) | P | ⬜ 低优搁置 | PC-12（cute sm_80 fp16 性能达标 → 迁移 cute/fp8/sm_89 即 fp8 路线复活） |
-| PC-7 | fp8 split-D (M8N1) 量化大 D kernel 性能优化 | P | ⬜ 待开始 | — |
-| PC-8 | fp8 split-D M4N2 量化大 D kernel 性能优化 | P | ⬜ 待开始 | PC-7（顺序） |
+| PC-7 | fp8 split-D (M8N1) 量化大 D kernel 性能优化 | P | ✅ **完成（2026-09-11，范围收敛）**：reorg-free solo 拆分实测落地（D=320 **-3.4~-3.9%**、D=512 -0.3~-0.4%，bitwise 一致，SHFL 归零）——61d02c4 的 all-on +8.2% 慢是 fused-rescale FADD→FFMA 吸收链而非 reorg-free，历史捆绑证伪澄清；其余菜单项盘点穷尽（producer TMA 预取/int8 cast 已做，reg reconfig 无 WS 不适用，fused-rescale 对已证伪）；NCU 画像固化结构性上限认知（255 regs + 660~704MB spill + occupancy 16.67% = o_acc f32 数学必需 × 256 thr 单 CTA，超出局部优化边界），见完成清单 | PC-8 顺序前置已解除 |
+| PC-8 | fp8 split-D M4N2 量化大 D kernel 性能优化 | P | ⬜ 待开始（PC-7 完成，前置已解除；先验：同族单 CTA occupancy/spill 结构矛盾 + m4n2 自身 race 约束见 PC-0-5） | PC-7 结构结论参考 |
 | PC-9 | fp4 split-D (M8N1) 量化大 D kernel 性能优化 | P | ⬜ 待开始 | PC-8（顺序） |
 | PC-10 | fp4 split-D M4N2 量化大 D kernel 性能优化 | P | ⬜ 待开始 | PC-9（顺序） |
 | PC-11 | warp 级 `__any_sync` lazy-rescale 统一治理（精度治理专项） | P | ✅ **完成（2026-09-09，范围收敛）** | **fp4 + native 两族落地 per-row**（fp4 attn-mask -3.7%/-4.7%，其余 ~0%；native branchless clamp 中性）；**fp8 ×2 + cute fp16 ×4 回退 vote 形态**（per-row 守卫进 rescale 循环引入跨 lane 分歧，attn-mask 实测 fp8_D512 **+23.9%**）；**fp4 m4n2 豁免**（vote 编译形态是 PC-0-5 稳定性载荷）；m4n2 bf16 失败定责 HEAD 既有（控制实验），race gate 恢复 fp16 语义 |
@@ -267,7 +267,33 @@
     - **fp4 m4n2 豁免**（kernel 内 EXEMPTION 注释在档）：per-row（含/不含 `__syncwarp`）都重开 PC-0-5 窗口，vote 编译形态是稳定性的载荷。
     - **m4n2 bf16 新证据（HEAD 对照控制实验）**：bf16 输入下 **HEAD 原始代码** pure-bias 也 10/10 失败（stash 全部 csrc 改动 → 重建 → 同 probe，指纹同 d=[192,224)、lse 稳定、no-bias 干净）——09-04 的"mode 0 纯序列稳定"是 fp16 输入下的 dtype 相关平衡；race gate 测试恢复 fp16 语义 + 裁剪构建（PC-15）skipif（顺带修复默认构建下直接报错的缺口）。
     - 验收：新增 `tests/test_ffpa_lazy_rescale_determinism.py`（5 形状 no-bias 前置×3 → bias 自环×3 int16 bitwise + 全 masked 行分族断言：fp16 NaN 行 / fp4 恒 0 行）；16 配置 bench A/B + SDPA 参照一致性校验——**首轮基线 8 配置被 GPU 级污染（SDPA 参照同膨胀 ~2x，FFPA 假 -50%）**，教训：A/B 必须校验 SDPA 参照；污染配置以 HEAD 干净重采对照替代；pytest 468 passed / 292 skipped（fp16-trimmed 与未编译 headdim 的预期 skip）。
-- [ ] PC-7：fp8 split-D (M8N1) 量化大 D kernel 性能优化
+- [x] PC-7：fp8 split-D (M8N1) 量化大 D kernel 性能优化 —— ✅ **完成（2026-09-11，范围收敛：移植菜单全项评估完毕）**
+  - **NCU 画像（先决，`--set full` N16384 B1H32，`.tmp/pc7/`，大文件已删仅存 verdict/harness）**：
+    D=512：255 regs + local spill 661MB（198M ld sectors）；QMMA stall wait 41.1%；
+    occupancy **16.67%**（256 thr × 255 regs = 1 CTA/SM，每 scheduler 仅 2 warps）；
+    SM 46.2%/MEM 56.1%/DRAM 1.75%。D=320：同样 255 regs + spill 704MB（`o_acc` 仅
+    160 regs——spill 是总需求 ~250+ 的全局压力非 o_acc 独有）；SM 49.8%/MEM 54.7%。
+    spill 伴随巨量 64-bit 寻址（MOV 2G/LOP3 1.7G/IADD.64 1.3G/SHF.R.U64 1.15G warp-inst）。
+  - **落地项：reorg-free solo**（launcher `cute_fp8_split_d.cuh` `reorg_free=true`
+    默认开，fused-rescale 对保持 off）。历史 61d02c4 的三开关 all-on +8.2% 慢的
+    真因是 FADD→FFMA 吸收链抬 math_pipe_throttle（1 CTA/SM 无 WS 掩盖），reorg_free
+    被捆绑从未单独测过。本次拆分三段式 on/off/on（同构建配方，boost 时钟，直调
+    `_ffpa_attn_forward_cuda`）：**N8192 D320 -3.4%、N16384 D320 -3.9%、D512 -0.3~0.4%**；
+    on/off 输出 **bitwise 一致**（置换双射 + 相同 e4m3 编码）；NCU 复测 SHFL 归零
+    （reorg 16 SHFL/thread-tile 消除）。bench CLI 验收：D320 self 4.11x/causal
+    3.85x，D512 3.33x/3.03x（N16384，PRO 5000）。
+  - **其余菜单项盘点（穷尽）**：producer TMA issue 顺序（跨 chunk/tile 预取）已在
+    （split_d.cuh tid0 预取）；int8 s32→f32 cast in place 已做；softmax MUFU 已用
+    exp2.approx；reg reconfig 参数——split-D non-WS 无 warpgroup 区分，不适用；
+    persistent work loop——附录 A #3 已证伪不移植。fused-rescale 对（kMaxScaleAfter
+    +kFuseRescaleAbsorb）——61d02c4 已证伪维持 off。
+  - **结构性上限认知（后续任何 split-D 大 D 优化的出发点）**：`o_acc` f32 跨 kv tile
+    累加是数学必需（D/2 regs/thread，D=512 即 256 regs 单项超限）；__launch_bounds__
+    (256,1) + 255 regs = 1 CTA/SM、occupancy 16.67%、2 warps/scheduler 的 latency
+    掩盖天花板是 SM~50% 的根因；spill 的 LDL/STL + 64-bit 寻址开销是第二矛盾。
+    根治需结构变更（WS 化/线程布局/两轮 KV），超出 PC-7 局部优化边界——按 RFC
+    预期单项 0.5~2%，本次 +3.4~3.9% 已超预期，方向收敛关闭。
+  - 证据：`.tmp/pc7/{verdict_step1.md, ncu_harness_fp8.py, bench_ab.py}`。
 - [ ] PC-8：fp8 split-D M4N2 量化大 D kernel 性能优化
 - [ ] PC-9：fp4 split-D (M8N1) 量化大 D kernel 性能优化
 - [ ] PC-10：fp4 split-D M4N2 量化大 D kernel 性能优化
@@ -324,8 +350,10 @@
         aux 链流量饱和，融合不减量；联动 PC-2/PC-5 一并关闭或失去前置）
   PC-3 配置自适应 ｜ ~~PC-4 fp4 persist-D kernel 内部~~ ❌ 证伪关闭（2026-09-11，
         NCU 证实 wait 集中在 A 操作数串行链 + occupancy 硬限制，候选改动 +1.3~1.7% 净负）
-  PC-7 → PC-8 → PC-9 → PC-10 量化大 D kernel（优化复杂，严格逐个推进：
-        fp8 split-D → fp8 M4N2 → fp4 split-D → fp4 M4N2，上一项验收后再启动下一项）
+  ~~PC-7~~ fp8 split-D ✅ 完成（2026-09-11，reorg-free solo 落地 D320 -3.4~-3.9%，
+        菜单穷尽 + 结构上限认知固化）→ PC-8 → PC-9 → PC-10 量化大 D kernel（严格逐个
+        推进：fp8 M4N2 → fp4 split-D → fp4 M4N2，上一项验收后再启动下一项；PC-7 的
+        结构性结论——单 CTA occupancy/spill 矛盾——是同族后续项的先验参考）
   PC-12 cute sm_80 fp16（cp.async + 多级流水线）──达标──► cute/fp8/sm_89 量化实现
         （sm_89 无 TMA/async proxy，fp8 只能走 cp.async 路线；复活后解锁 PC-6）
   PC-13 fp8/fp4 hybrid 融合 kernel（现状 = fp16 + 量化两条主 attn kernel 背靠背，
@@ -1424,9 +1452,18 @@ P pack、rescale）是瓶颈而非 MMA 吞吐。潜在方向：减少 P pack 的
 
 ### PC-7：fp8 split-D (M8N1) 量化大 D kernel 性能优化
 
-- **Status**: Draft ｜ **Priority**: P2 ｜ **Track**: 性能
+- **Status**: ✅ 完成（2026-09-11，范围收敛：移植菜单全项评估，reorg-free solo 落地） ｜ **Priority**: P2 ｜ **Track**: 性能
 
-#### Motivation
+#### 结果摘要（详见完成清单 PC-7 条目）
+
+- 落地：reorg-free solo 默认开（D=320 -3.4~-3.9% / D=512 -0.3~-0.4%，
+  bitwise 一致，SHFL 归零）；61d02c4 捆绑证伪澄清。
+- 证伪/不适用：fused-rescale 对（历史）、reg reconfig（non-WS）、
+  persistent loop（#3）；TMA 预取/int8 cast 已在。
+- 结构上限：o_acc f32 数学必需 × 256 thr 单 CTA → 255 regs + 660~704MB
+  spill + occupancy 16.67%，SM~50% 天花板；根治需结构变更，超出本项边界。
+
+#### Motivation（原立项）
 
 fp8 split-D (M8N1, 224<D<768，代表 D=320/512) 是量化大 D attention 的薄弱点
 之一：non-WS 结构，大 D 下 `o_acc=D/2` per-thread 寄存器（D=512 → 256 regs，
