@@ -91,11 +91,11 @@
 | PC-0-3 | ↳ D=320 split_d 注入开销专项（PC-0-0 遗留） | P | ❌ 证伪关闭（gap 1.44=结构极限：杠杆①向量化 +2.7%、杠杆②softmax 融合 87.7 vs 83.6ms 双证伪；加载侧 smem prefetch 本体收益 45ms/35% 已在 PC-0-0 落地，见完成清单） | PC-0-0 |
 | PC-0-4 | ↳ fp8 split_d D≥512 attn-mask tile 化专项（PC-0-1 B-3 遗留） | P3 | ⬜ 待开始（当前 D≥512 已 demote mode 0 保底，gap 停留 gmem 基线 1.48x，见完成清单） | PC-0-1 |
 | PC-0-5 | ↳ 量化家族先在时序竞争排查（PC-0-1 B-4/B-6 实证，bitwise 断言 flaky 根因） | P3 | 🚧 **止血落地、残留接受**（2026-09-04 重启深挖：**pure bias（无 prelude）100% 触发**（10/10 全 6/6，推翻 C9a"稳定"；918ae3c squash 终态即存在，build41 重建实证）；指纹恒定 = **单个 (m-warp0, n-warp0, v-chunk3) PV C tile**（d 恒 [192,224) 32 列 = 一个 SM120_16x32x64_TN_VS_NVFP4 atom 的 C 宽 = 一个 uint4 B 寄存器载荷），坏行限定每 64 行 tile 的 rows 0-15（warp_id%4==0 行组），lse 稳定、diff ~0.8% 元素 med 0.002/max ~0.039（漏/多一个 tile 贡献项）；维度窗口 = **works×tiles 乘积**（2×32 或 32×2 稳定、32×32 轻触发、128×32 全触发）；协议全文复审 + `mma.sync`（SM120 f8f6f4 为同步 warp mma）语义级闭环，**ptxas -O2 证伪编译调度**、**producer 挪位（tid0→255）证伪 producer×consumer 交织**（race 存活且条纹相位漂移 +12 → 坏块跟随 warp×chunk 相对时序而非绝对 warp id）；**决定性反转：重负载 prelude（任意 matmul×9）下 mode 0 gmem 直读也触发**（6-12/24）且指纹同源 → **历史"mode 0 完全免疫"结论修正**，race = **bias 模板 × 负载时序窗口**的硬件层问题（no-bias 模板同负载 0/24 干净）；**修复**：launcher pin mode 0（堵住 pure 冷启动 100% 入口，10/10 0/6；代价 attn-mask ~5%：397.9→419.1ms，其余 task 零回归）+ `FFPA_BIAS_TILE_KEEP=1` 逃生口 + 测试分类（pure 序列转正必过 gate / prelude 序列 xfail 残留）+ **残留接受**（重负载下 bias 模板低概率不稳，m4n2 仅服务 D≥768 fp4 现实场景少，待 NVIDIA 上报，复现器 `.tmp/pc5-race/m4n2_stat.py` 等 8 脚本）；顺带发现的 **Nq=64（MB=1）illegal access 已修复（546786a，2026-09-07：bias 尾 tile OOB 三缺陷清扫——mode 3 resident 分配 pad 到整 kBc tile + fill 清零 / gmem 注入 kTailTile 双实例（热路径指令级零开销）/ fp4 m4n2 mode 3 升级永久禁用（deterministic 8B LDS.64 越界读））**；**persist_d 独立 race 已定性（2026-09-07，PC-0-5-pd）**：fp4 persist_d + dense fp32（mode 0）× 负载状态重负载下 100%（lse 稳定、PV/O 侧 16 行 warp 段），rowvec/fp16 dense/fp8 免疫，硬件时序层与 m4n2 同队列；fp16/fp8/fp4 split_d 全路径及 persist_d rowvec 保持干净；**persist_d dense fp32 race 已修复（2026-09-09，PC-0-5-pd-B 选项 B 落地：launcher downcast → D≤128 mode 1 / D≥192 2B mode 0，0/60×3 + 全矩阵 0/40，见完成清单）** | PC-0-1；PC-11 解耦可独立推进 |
-| PC-1 | Mega Quantize Kernel（aux 链大融合） | P | ⬜ 待开始 | — |
-| PC-2 | 增量融合（Mega Kernel 步进） | P | ⬜ 待开始 | 被 PC-1 收编 |
+| PC-1 | Mega Quantize Kernel（aux 链大融合） | P | ❌ 证伪关闭（2026-09-11 实测：aux 链是**流量问题非 launch 问题**——PRO 5000 实测 DRAM 峰值 1.04TB/s，aux 各项均带宽饱和（fp4 fused_qkv 240MB/237µs=1.01TB/s、delta_s 131MB/110µs=1.19TB/s），融合不减流量；大 N wall 差 <0.2%（fp8 N8192→32768 aux 占比 14%→3.9%，fp4 17.3%→8.1%）；L2 排序（K 贴 col_sum -27µs/vt 贴 col_stats -30µs）作用域 ≤L2 100.7MB（N≈9000@D128），更大 N 反向恶化；已实现 4-launch stats 融合 bitwise 9/9 PASS 后**回退**——仅小 N/GQA 有 launch 数收益（+5.7% wall），大 N（核心场景）为零净负。详见完成清单） | — |
+| PC-2 | 增量融合（Mega Kernel 步进） | P | ❌ 证伪关闭（随 PC-1，同一实测裁决：融合不减 DRAM 流量） | PC-1 |
 | PC-3 | N-crossover 量化配置自适应 | P | ⬜ 待开始 | — |
 | PC-4 | fp4 persist-D attn kernel 内部优化 | P | ⬜ 待开始 | — |
-| PC-5 | CUDA graph 友好化 (**暂不实施，仅保留设计稿**) | P | ⬜ 待开始 | PC-1 评估 |
+| PC-5 | CUDA graph 友好化 (**暂不实施，仅保留设计稿**) | P | ⬜ 待开始 | PC-1 已证伪关闭（其 launch 形态前置消失；graph 化价值独立评估） |
 | PC-6 | sm_89 fp8 int4 QK (**暂不实施，仅保留设计稿**) | P | ⬜ 低优搁置 | PC-12（cute sm_80 fp16 性能达标 → 迁移 cute/fp8/sm_89 即 fp8 路线复活） |
 | PC-7 | fp8 split-D (M8N1) 量化大 D kernel 性能优化 | P | ⬜ 待开始 | — |
 | PC-8 | fp8 split-D M4N2 量化大 D kernel 性能优化 | P | ⬜ 待开始 | PC-7（顺序） |
@@ -201,8 +201,32 @@
     - 当前处置（commit f42b12a）：launcher 数据驱动 `kHeadDim >= 512 → mode 0`（实测 115.8ms 与 gmem 持平零劣化），D=320 保持 mode 2 达标。
     - 候选方向（动手前先 A/B）：①bias 激活时升 s3/s4 加深 QK 流水（48KB base + 512B tile 仍放得下，直击断供根因）；②`bias·inv_sd` tile 级预乘减半注入 LDS 压力（PC-0-1 设计的可选项）；③注入移出 softmax critical path（与 PV 重叠的分块注入）；④注入向量化**不要做**（PC-0-3 杠杆①已证伪 +2.7%，低 occupancy 依赖链加深）。
     - 复验脚本：`.tmp/pc1-bias-tile/fp8_splitd_check.py`（parity+A/B）、`fp8_mode_of.py`（模板尾参）、`fp8_ncu_run.py`（NCU 采集）。
-- [ ] PC-1：Mega Quantize Kernel —— P 轨基建
-- [ ] PC-2：增量融合（Mega Kernel 步进，被 PC-1 收编）
+- [x] PC-1：Mega Quantize Kernel —— ❌ **证伪关闭**（2026-09-11）
+  - **实测数据（PRO 5000，aux 链实测带宽 1.04TB/s 已饱和）**：
+    fp8 D128 B1H32：N8192 aux 421µs（14%）/ N12288 650µs（10%）/ N16384 861µs
+    （7.4%）/ N32768 861µs（3.9%）；三模式（legacy / 4-launch 融合 / L2 顺序）
+    wall 差全部 <0.2%。
+    fp4：N8192 aux 430µs（17.3%，fused_qkv 238 + delta_s 110 + col_sum 71）/
+    N16384 975µs（11.7%）/ D256N16384 1.14ms（14.2%，quant_trans 236 + delta_s 233
+    + quant_kernel×2 362 + q_block_mean 148）/ N32768 1.25ms（8.1%）。
+  - **饱和证据**：fp4 fused_qkv 读 Q+K+V 192MB + 写 fp4 48MB ≈ 240MB / 237µs =
+    1.01TB/s；delta_s 读 K 64MB + 写 67MB / 110µs = 1.19TB/s（含 L2 命中）；
+    col_sum 64MB / 71µs = 0.9TB/s。aux 每一项都贴着 DRAM 上限，融合只省 launch
+    不减流量。
+  - **L2 策略作用域边界**：恩惠 = L2 命中（100.7MB），条件 = 消费 kernel 紧贴
+    生产 kernel（窗口 ≤1 plane）。实测 K 贴 col_sum -27µs、vt 贴 col_stats
+    -30µs，但仅 N≤~9000@D128 有效（plane ≤ L2）；N≥12288 反向恶化 +18%。
+  - **已实现的融合（4-launch：stats 两段 256T + 合并 finalize + qkv_fused(skip_vt)
+    + vt，bitwise 9/9 PASS）**在小 N/GQA 兑现 +5.7% wall（launch gap 占比高），
+    但大 N（核心场景：大 N + D≤256）净收益为零，**已回退**（无收益不保留维护
+    负担）。全融合版（含 Q 量化进 stage1）另证：256T Q 段 +45µs、K/V 量化拆出
+    qkv_fused 交织 +45µs、vt 链序破坏 +31µs——量化 kernel 的交织/邻序本身就是
+    已优化形态。
+  - **残余结论**：aux 链的下一步只在 engine 层——aux 与主 kernel/其它 stage 的
+    overlap（大 N 主 kernel 占 86-92%，aux 属可掩蔽侧），kernel 内融合无空间。
+    证据脚本：`.tmp/pc1/{bw_baseline,three_mode,large_n_matrix,fp4_large_n}.py`。
+- [x] PC-2：增量融合（Mega Kernel 步进）—— ❌ **证伪关闭**（随 PC-1 同一实测裁决：
+  融合不减 DRAM 流量；4-launch stats 融合的 bitwise 验证与回退记录见 PC-1 条目）
 - [ ] PC-3：N-crossover 量化配置自适应
 - [ ] PC-4：fp4 persist-D attn kernel 内部优化
 - [ ] PC-5：CUDA graph 友好化
@@ -276,9 +300,8 @@
         ├─► PC-0-0 cute/cute_tma（fp16 家族，方案 A 热身台阶）
         ├─► PC-0-1 fp8/fp4（量化六族，主体）
         └─► PC-0-2 native/native_tma（✅ c645ac1，rowvec 内联向量化）
-  PC-1 Mega Quantize Kernel（先做 cooperative 两阶段原型）
-        ├─► 收编 PC-2（增量融合是其落地台阶）
-        └─► 联动 PC-5 ⏸（暂不实施；launch 形态定型后才能定 graph 兼容方案）
+  ~~PC-1 Mega Quantize Kernel（先做 cooperative 两阶段原型）~~ ❌ 证伪关闭（2026-09-11，
+        aux 链流量饱和，融合不减量；联动 PC-2/PC-5 一并关闭或失去前置）
   PC-3 配置自适应 ｜ PC-4 fp4 persist-D kernel 内部（与上并行，互不依赖）
   PC-7 → PC-8 → PC-9 → PC-10 量化大 D kernel（优化复杂，严格逐个推进：
         fp8 split-D → fp8 M4N2 → fp4 split-D → fp4 M4N2，上一项验收后再启动下一项）
@@ -1151,6 +1174,11 @@ FC-4 注入点基建（`kHasAttnBias` 编译期双实例，bias=None 零开销�
 ---
 
 ### PC-1：Mega Quantize Kernel（aux 链大融合）
+
+> ❌ **证伪关闭（2026-09-11）**：实测 aux 链为纯 DRAM 流式负载（各项均贴 1.04TB/s
+> 峰值带宽），融合只省 launch 不减流量——大 N（核心场景）wall 差 <0.2%，仅小
+> N/GQA 有 launch 数收益。完整实测数据见「完成清单」PC-1 条目；证据脚本
+> `.tmp/pc1/`。下方 Design 保留为历史设计记录。
 
 - **Status**: Draft ｜ **Priority**: P1（aux 链基建） ｜ **Track**: 性能
 
