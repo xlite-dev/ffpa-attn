@@ -78,7 +78,7 @@ flowchart TD
     I --> J3["CUTE_TMA fp16 家族 (sm120)<br/>persist-D / split-D / M4N2"]
     I --> J4["CUTE_TMA_FP8<br/>persist-D / split-D / M4N2"]
     I --> J5["CUTE_TMA_FP4<br/>persist-D / split-D / M4N2"]
-    I --> J6["CUTE hint cp.async<br/>(sm80+, 非 TMA)"]
+    I --> J6["CUTE hint cp.async<br/>(sm80+, 非 TMA)<br/>persist-D / split-D / M4N2"]
 ```
 
 ### 1.2 关键文件
@@ -119,7 +119,7 @@ flowchart TD
 
 | 家族 | D≤224 | 224<D<768 | D≥768 | 备注 |
 |---|---|---|---|---|
-| fp16 (cute_fp16) | persist-D | split-D M8N1 | split-D M4N2 | M4N2 交叉点 768 两端一致；D%32≠0 或 bias/dropout 路由级回退 native |
+| fp16 (cute_fp16) | persist-D | split-D M8N1 | split-D M4N2 | M4N2 交叉点 768（sm120 dense 全家 M4N2 / sm80 仅 causal）；D%32≠0 或 bias/dropout 路由级回退 native；sm80 路由见 §4.5 |
 | fp8 | persist-D (kBc=128/D≤128, else 64) | split-D M8N1 (128/128) | M4N2 (64/64) | kBr/kBc 被 env.py::_fp8_variant_blocks 镜像（extern 表） |
 | fp4 | persist-D | split-D | M4N2 | 量化 launcher 模板仅 &lt;kHeadDim&gt;（dtype 无关） |
 | native | sm80 split-D + split-KV decode (Nq==1) | TMA: sm90/100 WS / sm120 non-WS | 同左 | decode split 数 = select_decode_num_splits 波效率贪心 |
@@ -314,7 +314,15 @@ WS split-D 变体（`launch_cute_fwd_split_d_ws_sm120`）已被禁用：`setmaxn
 
 ### 4.5 CUTE hint（sm80 cp.async）
 
-`CUTE` hint（`enable_cute` 单开、无 TMA）：`launch_cute_fwd_split_d_sm80`，sm80+ 通用。sm_arch≥120 时 stages 上限压到 2（(32,32)）/ 3（(32,64)）——快速 MMA 下同步开销主导；sm<120 用深流水。`D≥320` 固定 (32,32)。支持 bias/dropout。属兼容/实验路径。
+`CUTE` hint（`enable_cute` 单开、无 TMA）：sm80+ 通用 cp.async 家族，**D 维全覆盖**（PC-12，2026-09-11，76e6d99）：
+
+- `D≤128 且 %64==0` → **persist-D sm80**（`cute/sm_80/persist_d.cuh`）：Q 寄存器持久化（A-fragment s2r 一次 + 全程 `gemm_rs`）+ K/V 独立 stage 池 cp.async 组 FIFO（per-thread 提交序 Q,K0,V0,K1,V1...；不变式 QK[t] 用组 1+2t → `wait_group<2S-1>`，PV[t] 用组 2+2t → `wait_group<2S-2>`，越界不提交时 wait 立即通过）+ 64 列段装载（=1 swizzle atom 宽，D%64==0 全整除）+ dropout half-row bitmap（smem 预算 gate，kBc≥64 门控否则 inline Philox）+ 256T non-WS。D=128 **持平 SDPA**（self 1.02x/causal 0.98x，原 split_d 0.74x）；D=64 0.85-0.89x（带宽受限区接受；kBc=64/S=5 几何实验证伪）。与 sm120 CUTE_TMA persist-D bitwise（D=64/128 全 feature）。
+- `D≥320 dense` → split-D M8N1 (32,32)；`[192,320)` %64 → (32,64)、%32 → (32,32)。sm_arch≥120 时 stages 上限压到 2（(32,32)）/ 3（(32,64)）——快速 MMA 下同步开销主导；sm<120 用深流水。
+- `D=768 causal 或 D≥1024` → **split-D M4N2 sm80**（`cute/sm_80/split_d_m4n2.cuh`）：kBr=64/kBc=64、atom (4,2,1)、o_acc=D/4；P roundtrip 写侧必须用 `make_tiled_copy_C` 数学坐标（手写 A-operand 映射与 LDSM 读侧坐标系不对称 → 数值爆炸，关键教训）。D=768 causal 27.16ms/1.86x，与 sm120 bitwise。
+- **路由依据（PRO 5000 N=8192 全 task A/B，`.tmp/pc12/bench_m4n2_ab.txt`）**：D≥320 dense 一律 M8N1（D=320 +80%/D=512 +53%/D=768 +19% vs M4N2——kBr=64 翻倍 K/V cp.async 总量，dense 必付）；仅 D=768 causal 切 M4N2（早停 + 无 spill 回补 +8%）；D≥1024 无条件 M4N2（M8N1 o_acc=D/2=512 regs spill 崩溃）。
+- 全 task 矩阵 vs SDPA：D=320 2.06-2.55x、D=512 1.96-2.40x、D=768 1.77-1.90x；vs CUTE_TMA gap：D=128 1.07-1.08x（达标线 ≤1.1x 内）、D=320 1.14x、D=768 1.09-1.21x（结构性差距 = cp.async 无 TMA 引擎卸载）。
+- review 修复：split_d/m4n2 下一 tile prefetch 前置 `__syncthreads()`（最后 d_chunk 跳过 post-wait 时 stage 0 重发与滞后读竞态，(kDChunksQK-1)%S≠S-1 触发如 D=832/1024；零性能回退）。
+- 已知债务：G2S copy 无谓词——非 tile 对齐 Nq/Nkv 物理越界读（数值被 mask 掩盖，non-aligned task 通过），待 ZFILL/谓词化重构。属兼容路径（生产 sm120 走 TMA 家族）。
 
 ---
 
