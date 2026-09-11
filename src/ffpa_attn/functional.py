@@ -619,7 +619,9 @@ class CUDABackend(Backend):
     if self.impl_hint in (
       CudaBackendImpl.CUTE_TMA_FP8, CudaBackendImpl.CUTE_TMA_FP4
     ):
-      return 2  # fp8/fp4 persist-D sm120 path (smem budget caps stages)
+      # fp8/fp4 persist-D sm120 path (smem budget caps stages). The fp8
+      # split-D m4n2 launcher floors this to 3 stages in C++ (PC-8).
+      return 2
     if _is_hopper_or_later():
       if self.impl_hint in (CudaBackendImpl.NATIVE, CudaBackendImpl.TMA):
         return 4  # sm>=90, native or TMA path

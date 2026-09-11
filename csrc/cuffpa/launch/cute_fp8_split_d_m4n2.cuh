@@ -28,10 +28,11 @@ inline FfpaBiasTilePlan fp8_m4n2_bias_plan(const FfpaBiasParams& bias_p, int Nb,
   constexpr int kMaxStages = (99 * 1024 - kFixedSmemBytes) / kPerStageBytes;
   using ElementO = std::conditional_t<std::is_same_v<kDataType, __half>,
                                       cutlass::half_t, cutlass::bfloat16_t>;
+  // Stage floor 3 (PC-8): keep in sync with the launcher clamp below.
   using Traits = ffpa_cute::FFPAAttnCuTeSplitDM4N2FP8Traits<
       kHeadDim, ElementO, kBr, kBc, 64, 64,
-      (kStage < 2) ? 2 : (kStage > kMaxStages ? kMaxStages : kStage),
-      (kStage < 2) ? 2 : (kStage > kMaxStages ? kMaxStages : kStage), kQKInt8>;
+      (kStage < 3) ? 3 : (kStage > kMaxStages ? kMaxStages : kStage),
+      (kStage < 3) ? 3 : (kStage > kMaxStages ? kMaxStages : kStage), kQKInt8>;
   constexpr int kBiasSmemBudgetBytes = 99 * 1024;
   FfpaBiasTilePlan plan = ffpa_bias_tile_plan_of(bias_p, Nb, Nh, Nq, Nkv);
   const int bias_stages = (plan.mode == 2) ? 2 : 1;
@@ -123,8 +124,13 @@ void launch_cute_fwd_split_d_m4n2_fp8_sm120_v(
   constexpr int kFixedSmemBytes = kBr * kBc + 2 * 8 * 16 * 4;
   constexpr int kMaxStages =
       (kSmemBudgetBytes - kFixedSmemBytes) / kPerStageBytes;
+  // Stage floor 3 (PC-8): at 2 stages the K/V TMA pipe starves (barrier
+  // NANOSLEEP/@BRA waits dominate long_scoreboard). s2->s3 = -9~-13% e2e at
+  // D=768 (N=4096..16384, self+causal); s4..s7 non-monotonic and slower.
+  // Floor applies inside the traits, so no extra sN TU is needed; M8N1 /
+  // persist-D / fp16 m4n2 keep their own clamps.
   constexpr int kStagesQK =
-      (kStage < 2) ? 2 : (kStage > kMaxStages ? kMaxStages : kStage);
+      (kStage < 3) ? 3 : (kStage > kMaxStages ? kMaxStages : kStage);
   constexpr int kStagesPV = kStagesQK;
 
   using ElementO = std::conditional_t<std::is_same_v<kDataType, __half>,
