@@ -8,6 +8,8 @@
 #include "launch/common.cuh"
 #ifdef ENABLE_FFPA_CUTE_EXT
 #include "launch/cute_fp16_split_d_sm80.cuh"
+#include "launch/cute_fp16_persist_d_sm80.cuh"
+#include "launch/cute_fp16_split_d_m4n2_sm80.cuh"
 #ifdef ENABLE_FFPA_TMA_EXT
 #include "launch/cute_fp16_split_d.cuh"
 #include "launch/cute_fp16_persist_d.cuh"

@@ -408,6 +408,9 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1) split_d_fwd_cute_sm80(
 
     // Prefetch next kv_tile's initial QK chunks (overlaps softmax + PV).
     if (kv_tile < Tc_eff - 1) {
+      // The last d_chunk skips the post-wait above; sync so lagging
+      // threads finish reading its stage before this reissues stage 0.
+      __syncthreads();
       int qk_write_next = 0;
 #pragma unroll
       for (int d = 0; d < kStagesQK - 1 && d < kDChunksQK; ++d) {
