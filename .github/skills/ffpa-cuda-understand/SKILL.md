@@ -420,12 +420,15 @@ sm120 fp8 persist-D 的结构优化路线**已全部实测证伪**（memory 记�
 | CUDA-core row_sum 替代 tensor rowsum MMA | -4%（rowsum MMA 在 tensor 气泡里免费） |
 | O2 预计算 log2/RCP、O3 bank conflict | 否决（MUFU 被 MMA 等待掩盖；ld conflict 0.39%） |
 | aux vstats 扩容 | 带宽受限，零收益 |
+| **aux 链融合（PC-1/PC-2 Mega Quantize Kernel）** | **证伪关闭（2026-09-11）**：aux 各项贴设备峰值带宽（1.04TB/s），融合只省 launch 不减流量；大 N wall 差 <0.2%；L2 排序仅 N≤~9000@D128 有效；4-launch 融合 bitwise 验证后回退（详见 RFC 完成清单 PC-1） |
 
 **结论：attn kernel 本身已稳定略优于 SageAttention（kernel 级 +1.1~2.3%），kernel 微优化到顶。**
 
 ### 5.9 E2E 差距根因与方向
 
-E2E（含前处理）GQA 小 N 场景仍落后：根因是辅助链 kernel 数量（quantize×2 + vt + kv_mean 链 ≈13 kernel/call vs sage 7）+ CPU dispatch（wall-GPU 129µs vs sage 50µs）。方向是**aux 链融合成单个大 kernel（Mega Quantize Kernel）削减 kernel 数量**，而非 kernel 微调；multi-stream 并行 aux 链不可行（见 §9）。
+E2E（含前处理）GQA 小 N 场景一度落后：根因是辅助链 kernel 数量（quantize×2 + vt + kv_mean 链 ≈13 kernel/call vs sage 7）+ CPU dispatch（wall-GPU 129µs vs sage 50µs）。
+
+> ⚠️ **2026-09-11 更新（PC-1 证伪关闭）**：当时推断的"aux 链融合成单个大 kernel（Mega Quantize Kernel）削减 kernel 数量"方向**已被实测证伪**——aux 链是纯 DRAM 流式负载，各项 kernel 均已贴设备峰值带宽（PRO 5000 实测 1.04TB/s），融合只省 launch 不减流量；大 N（核心场景）三模式（串行/4-launch 融合/L2 顺序）wall 差 <0.2%。小 N/GQA 的 launch 数收益（+5.7% wall）不足以抵消全量融合在大 N 的净负。**不要再投 aux 链融合**；multi-stream 并行同样不可行（见 §9）。aux 残余方向只有 engine 层 overlap（大 N 主 kernel 占 86-92%，aux 属可掩蔽侧）。完整数据见 RFC 完成清单 PC-1 条目。
 
 ---
 
@@ -591,12 +594,12 @@ softmax_scale 恒按真实 D（Python 解析 `1/sqrt(D_og)`）。
 
 ### 9.1 kernel 级（区分"已证伪"与"待做"）
 
-**已证伪、不要再投**（详见 §5.8/§6.6）：WS 双 consumer、persistent work loop（fp8）、stages 加深/不对称（K3V2/K2V1）、cluster 化、v2/v3/v5 结构变体、MUFU 预计算、bank conflict、CUDA-core row_sum、fp4 Q-smem 复用、rescale in-place。fp8/fp4 attn kernel 微调已到顶（kernel 级已稳定略优于 SageAttention）。
+**已证伪、不要再投**（详见 §5.8/§6.6）：WS 双 consumer、persistent work loop（fp8）、stages 加深/不对称（K3V2/K2V1）、cluster 化、v2/v3/v5 结构变体、MUFU 预计算、bank conflict、CUDA-core row_sum、fp4 Q-smem 复用、rescale in-place、**aux 链融合（PC-1/PC-2，2026-09-11：aux 为纯 DRAM 流式负载，各项贴 1.04TB/s 峰值带宽，融合只省 launch 不减流量——大 N wall 差 <0.2%，L2 排序作用域 ≤L2 100.7MB 即 N≤~9000@D128，见 RFC 完成清单）**。fp8/fp4 attn kernel 微调已到顶（kernel 级已稳定略优于 SageAttention）。
 
 **待做 / 有明确预期收益**：
 
-1. **Mega Quantize Kernel（aux 链大融合）**：fp8/fp4 前处理链 pad/smooth/hadamard/vstats/vt/quantize/permute（≈13 kernel/call vs sage 7；CPU dispatch wall-GPU 129µs vs sage 50µs，§5.3）融合进单个大 kernel，中间结果留 smem/寄存器，消灭 gmem round-trip 与逐 kernel launch/dispatch 开销。关键难点是 vstats per-channel scale 的跨行全局依赖（必须先于 quantize 完成），用 kernel 内两阶段 + grid 级屏障（cooperative groups）解决。**multi-stream 并行 aux 链不可行**：依赖图跨分支并行窗口小、小 kernel 间无法互饱 SM，反增 event 同步与 launch 开销——并行化 launch 省不掉 gmem 往返，融合才是正方向。
-2. **增量融合（Mega Kernel 的步进）**：先融无全局依赖的相邻对，每步独立验收：kv_mean 融进 quantize（跨块全局依赖，需重新评估原子/屏障成本）；fused qkv 量化扩展到 D>128；pad+quantize 合并。最终收敛到方向 1 的巨型 kernel。
+1. ~~**Mega Quantize Kernel（aux 链大融合）**~~ ❌ 证伪关闭（2026-09-11，见上）。aux 链的残余方向只有 engine 层 overlap（aux 与主 kernel/其它 stage 流水，大 N 主 kernel 占 86-92%）。
+2. ~~**增量融合（Mega Kernel 的步进）**~~ ❌ 随 PC-1 证伪关闭。
 3. **fp4 attn kernel 内部**：quantize CVT 链、NCU 驱动的指令 mix 优化（Phase 3 后仍有空间）；causal 三段化（全 -inf 行 tile 跳过，预期 1-2%，低优先）。
 4. ~~**split-D/M4N2 补 NHD O 写**（§8 #1）~~：✅ 已完成（FC-2）。
 5. ~~**split-D/M4N2 接独立 Lv**（§8 #2）~~：✅ 已完成（FC-1）。
