@@ -16,36 +16,68 @@ namespace ffpa {
 //     3 for (32,64) — sync overhead dominates on fast MMA.
 //   sm < 120 (Ada/Ampere, lower compute): prefer (32,64) for D%64==0,
 //     deeper pipeline (Python-controlled, smem physics cap applies).
+// PC-12: D<=128 routes to the persist-D sm80 kernel (Q persisted, full-D
+// GEMMs, sm120 persist-D geometry); the split_d D-chunk pipeline stays
+// for D>=192 where the Q persist area crowds out the K/V stages.
 template <typename kDataType, const int kHeadDim, const int kStage>
 void ffpa_fwd_cute_fp16_sm80(const FfpaFwdParams& p) {
 #ifdef ENABLE_FFPA_CUTE_EXT
-  auto cute_prop = at::cuda::getCurrentDeviceProperties();
-  const int sm_arch = cute_prop->major * 10 + cute_prop->minor;
-  if (sm_arch >= 120) {
-    constexpr int kCuteStage32 = (kStage > 2) ? 2 : kStage;
-    constexpr int kCuteStage64 = (kStage > 3) ? 3 : kStage;
-    if constexpr (kHeadDim >= 320) {
-      launch_cute_fwd_split_d_sm80<kDataType, kHeadDim, kCuteStage32, 32, 32>(
-          p.Q, p.K, p.V, p.O, p.attn_bias, p.softmax_lse, p.causal,
-          p.softmax_scale, p.dropout_p, p.philox_seed, p.philox_offset);
-    } else if constexpr (kHeadDim % 64 == 0) {
-      launch_cute_fwd_split_d_sm80<kDataType, kHeadDim, kCuteStage64, 32, 64>(
-          p.Q, p.K, p.V, p.O, p.attn_bias, p.softmax_lse, p.causal,
-          p.softmax_scale, p.dropout_p, p.philox_seed, p.philox_offset);
-    } else if constexpr (kHeadDim % 32 == 0) {
-      launch_cute_fwd_split_d_sm80<kDataType, kHeadDim, kCuteStage32, 32, 32>(
-          p.Q, p.K, p.V, p.O, p.attn_bias, p.softmax_lse, p.causal,
-          p.softmax_scale, p.dropout_p, p.philox_seed, p.philox_offset);
-    }
+  if constexpr (kHeadDim <= 128 && kHeadDim % 64 == 0) {
+    launch_cute_fwd_persist_d_sm80<kDataType, kHeadDim, kStage>(
+        p.Q, p.K, p.V, p.O, p.attn_bias, p.softmax_lse, p.causal,
+        p.softmax_scale, p.dropout_p, p.philox_seed, p.philox_offset);
   } else {
-    if constexpr (kHeadDim % 64 == 0) {
-      launch_cute_fwd_split_d_sm80<kDataType, kHeadDim, kStage, 32, 64>(
-          p.Q, p.K, p.V, p.O, p.attn_bias, p.softmax_lse, p.causal,
-          p.softmax_scale, p.dropout_p, p.philox_seed, p.philox_offset);
-    } else if constexpr (kHeadDim % 32 == 0) {
-      launch_cute_fwd_split_d_sm80<kDataType, kHeadDim, kStage, 32, 32>(
-          p.Q, p.K, p.V, p.O, p.attn_bias, p.softmax_lse, p.causal,
-          p.softmax_scale, p.dropout_p, p.philox_seed, p.philox_offset);
+    auto cute_prop = at::cuda::getCurrentDeviceProperties();
+    const int sm_arch = cute_prop->major * 10 + cute_prop->minor;
+    if (sm_arch >= 120) {
+      constexpr int kCuteStage32 = (kStage > 2) ? 2 : kStage;
+      constexpr int kCuteStage64 = (kStage > 3) ? 3 : kStage;
+      // PC-12 M4N2 sm80 routing (O regs = D/4), measured on PRO 5000
+      // (N=8192, bench_m4n2_ab): the kBr=64 tiling doubles the total K/V
+      // cp.async traffic — dense pays it everywhere (D=320 self -80%,
+      // D=512 -53%, D=768 -19% vs M8N1), only the D=768 causal path repays
+      // via early stopping and spill-free accumulators (+8%); D>=1024 is
+      // unconditional because the M8N1 o_acc = D/2 regs spill to collapse.
+      if constexpr (kHeadDim >= 320) {
+        if (kHeadDim >= 1024 || (kHeadDim >= 768 && p.causal)) {
+          launch_cute_fwd_split_d_m4n2_sm80<kDataType, kHeadDim, kCuteStage32>(
+              p.Q, p.K, p.V, p.O, p.attn_bias, p.softmax_lse, p.causal,
+              p.softmax_scale, p.dropout_p, p.philox_seed, p.philox_offset);
+        } else {
+          launch_cute_fwd_split_d_sm80<kDataType, kHeadDim, kCuteStage32, 32,
+                                       32>(
+              p.Q, p.K, p.V, p.O, p.attn_bias, p.softmax_lse, p.causal,
+              p.softmax_scale, p.dropout_p, p.philox_seed, p.philox_offset);
+        }
+      } else if constexpr (kHeadDim % 64 == 0) {
+        launch_cute_fwd_split_d_sm80<kDataType, kHeadDim, kCuteStage64, 32, 64>(
+            p.Q, p.K, p.V, p.O, p.attn_bias, p.softmax_lse, p.causal,
+            p.softmax_scale, p.dropout_p, p.philox_seed, p.philox_offset);
+      } else if constexpr (kHeadDim % 32 == 0) {
+        launch_cute_fwd_split_d_sm80<kDataType, kHeadDim, kCuteStage32, 32, 32>(
+            p.Q, p.K, p.V, p.O, p.attn_bias, p.softmax_lse, p.causal,
+            p.softmax_scale, p.dropout_p, p.philox_seed, p.philox_offset);
+      }
+    } else {
+      if constexpr (kHeadDim >= 320) {
+        if (kHeadDim >= 1024 || (kHeadDim >= 768 && p.causal)) {
+          launch_cute_fwd_split_d_m4n2_sm80<kDataType, kHeadDim, kStage>(
+              p.Q, p.K, p.V, p.O, p.attn_bias, p.softmax_lse, p.causal,
+              p.softmax_scale, p.dropout_p, p.philox_seed, p.philox_offset);
+        } else {
+          launch_cute_fwd_split_d_sm80<kDataType, kHeadDim, kStage, 32, 32>(
+              p.Q, p.K, p.V, p.O, p.attn_bias, p.softmax_lse, p.causal,
+              p.softmax_scale, p.dropout_p, p.philox_seed, p.philox_offset);
+        }
+      } else if constexpr (kHeadDim % 64 == 0) {
+        launch_cute_fwd_split_d_sm80<kDataType, kHeadDim, kStage, 32, 64>(
+            p.Q, p.K, p.V, p.O, p.attn_bias, p.softmax_lse, p.causal,
+            p.softmax_scale, p.dropout_p, p.philox_seed, p.philox_offset);
+      } else if constexpr (kHeadDim % 32 == 0) {
+        launch_cute_fwd_split_d_sm80<kDataType, kHeadDim, kStage, 32, 32>(
+            p.Q, p.K, p.V, p.O, p.attn_bias, p.softmax_lse, p.causal,
+            p.softmax_scale, p.dropout_p, p.philox_seed, p.philox_offset);
+      }
     }
   }
 #else
