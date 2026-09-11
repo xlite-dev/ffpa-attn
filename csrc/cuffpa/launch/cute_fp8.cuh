@@ -7,6 +7,7 @@
 #include "launch/cute_fp8_persist_d.cuh"
 #include "launch/cute_fp8_split_d.cuh"
 #include "launch/cute_fp8_split_d_m4n2.cuh"
+#include "launch/cute_fp8_persist_d_sm89.cuh"
 template <typename kDataType, const int kHeadDim, const int kStage>
 void launch_cute_fwd_persist_d_fp8_sm120(
     torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O,

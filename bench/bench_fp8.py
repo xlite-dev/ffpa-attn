@@ -54,7 +54,7 @@ SAGE_INSTALLED = importlib.util.find_spec("sageattention") is not None
 if SAGE_INSTALLED:
   from sageattention import sageattn
 
-PRESETS = ("default", "cache-dit")
+PRESETS = ("default", "cache-dit", "perblock")
 
 PLOT_OUTPUT_DIR = Path(__file__).resolve().parent / ".tmp"
 PLOT_CASE_ORDER = (
@@ -83,6 +83,26 @@ def fp8_backend(
   stages: int = None,
 ) -> CUDABackend:
   layout = "NHD" if nhd else "HND"
+  if preset == "perblock":
+    # sm89 cp.async path scope (v1): per_block Q/K/V quant, no per_thread /
+    # per_channel / smooth_v / hybrid. Bench under FFPA_FP8_SM89_FORCE=1 to
+    # steer the fp8 dispatch onto the sm89 persist-D kernel.
+    return CUDABackend(
+      backward=False,
+      enable_tma=True,
+      enable_cute=True,
+      enable_fp8=True,
+      fp8_qk_mm_type="int8",
+      fp8_pv_acc_type="f16",
+      fp8_q_quant_method="per_block",
+      fp8_k_quant_method="per_block",
+      fp8_v_quant_method="per_block",
+      fp8_smooth_k=True,
+      fp8_smooth_v=False,
+      fp8_hybrid=hybrid,
+      tensor_layout=layout,
+      stages=stages,
+    )
   return CUDABackend(
     backward=False,
     enable_tma=True,
@@ -586,7 +606,8 @@ def parse_args():
     choices=list(PRESETS),
     help="FFPA fp8 config: default (fp8/f32 acc, per_block), int8 (int8/f16 "
     "acc, per_block), cachedit (int8/f16 acc, per_thread+per_channel+smooth "
-    "{k,v}+hybrid 256 — same as cache-dit ffpa_fp8 backend)",
+    "{k,v}+hybrid 256 — same as cache-dit ffpa_fp8 backend), perblock "
+    "(int8/f16 acc, per_block Q/K/V + smooth_k — the sm89 cp.async v1 scope)",
   )
   p.add_argument(
     "--with-permute",
