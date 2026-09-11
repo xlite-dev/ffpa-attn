@@ -424,6 +424,7 @@ sm120 fp8 persist-D 的结构优化路线**已全部实测证伪**（memory 记�
 | aux vstats 扩容 | 带宽受限，零收益 |
 | **aux 链融合（PC-1/PC-2 Mega Quantize Kernel）** | **证伪关闭（2026-09-11）**：aux 各项贴设备峰值带宽（1.04TB/s），融合只省 launch 不减流量；大 N wall 差 <0.2%；L2 排序仅 N≤~9000@D128 有效；4-launch 融合 bitwise 验证后回退（详见 RFC 完成清单 PC-1） |
 | **fp4 persist-D V/SFV 首块 s2r 提前（PC-4）** | **证伪关闭（2026-09-11）**：NCU 全量画像（N16384 D128）证实 wait 31% 主体在 OMMA 等 **A 操作数链**（softmax→pack→PV 串行 + tile 级 S 复用），B 供给非瓶颈（LDS 类 wait 仅 7.7%）；V 首块 LDSM 提前藏进 softmax 的假设严格 A/B **+1.3~1.7% 净负**（寄存器 live-range 拉长，同 fp4 rescale in-place 机制）已回退；tensor pipe 54% 缺口被 occupancy 25%（smem 99KB 硬限制）+ 数值链依赖锁死，**fp4 persist-D 微优化到顶确认**（详见 RFC 完成清单 PC-4 / 附录 A #21） |
+| **fp4 split-D (M8N1) kernel 内部（PC-9）** | **证伪关闭（2026-09-11，零改动）**：立项预设的两项 persist-D 方案**均已内化**（`online_softmax_with_quant` FirstTile 融合共享 / split-D 本就是 persistent kernel，grid=110=SM 数）；stages 3/3→4/4 实测 ±0.5% 抵消（D512 微益/D320 微损 + 挤 O epilogue batching）；kVDChunk 64→128 smem 物理不可行（+12.75KB 超预算 static_assert 拦截——现状 3/3 已用 ~90KB/99KB）；kQKDChunk 锁 64（blockscale atom K）；D=512 spill 234MB = o_acc D/2 结构性（同 PC-7，流量仅 12.8GB/s、代价在 2 warps/scheduler 延迟暴露）；D=320 已健康（319T，wait 依赖链主导同 PC-4 模板）。**fp4 split-D 微优化到顶确认**（详见 RFC 完成清单 PC-9） |
 
 **结论：attn kernel 本身已稳定略优于 SageAttention（kernel 级 +1.1~2.3%），kernel 微优化到顶（fp8/fp4 persist-D 双双确认）。**
 

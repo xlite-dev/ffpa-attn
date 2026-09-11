@@ -100,7 +100,7 @@
 | PC-6 | sm_89 fp8 int4 QK (**暂不实施，仅保留设计稿**) | P | ⬜ 低优搁置 | PC-12（cute sm_80 fp16 性能达标 → 迁移 cute/fp8/sm_89 即 fp8 路线复活） |
 | PC-7 | fp8 split-D (M8N1) 量化大 D kernel 性能优化 | P | ✅ **完成（2026-09-11，范围收敛）**：reorg-free solo 拆分实测落地（D=320 **-3.4~-3.9%**、D=512 -0.3~-0.4%，bitwise 一致，SHFL 归零）——61d02c4 的 all-on +8.2% 慢是 fused-rescale FADD→FFMA 吸收链而非 reorg-free，历史捆绑证伪澄清；其余菜单项盘点穷尽（producer TMA 预取/int8 cast 已做，reg reconfig 无 WS 不适用，fused-rescale 对已证伪）；NCU 画像固化结构性上限认知（255 regs + 660~704MB spill + occupancy 16.67% = o_acc f32 数学必需 × 256 thr 单 CTA，超出局部优化边界），见完成清单 | PC-8 顺序前置已解除 |
 | PC-8 | fp8 split-D M4N2 量化大 D kernel 性能优化 | P | ✅ **完成（2026-09-11）**：stage floor 3 落地——默认 stages=2 下 K/V TMA 流水饿死（NCU source：barrier NANOSLEEP/@BRA 等待循环占 long_scoreboard 主导），launcher + bias plan 两处 clamp 下限 2→3（traits 层生效，无需新 sN TU；M8N1/persist-D/fp16 m4n2 独立 clamp 不受影响）。实测 D=768：self **-11.7%/-13.1%/-13.0%**（N=4k/8k/16k）、causal -7.2%/-9.4%/-10.8%；s2~s7 扫描 s3 全局最优（s4~s7 非单调更慢）；三段式 A/B 36.29/41.75/36.29ms；s2 vs s3 与 ON vs OFF **bitwise 一致**；邻域（D=128/320/512）零回归（1209a3f）。其余方向盘点：lazy rescale 不可开（fixed 448·vs P 域膨胀 saturate，persist-D 精度理由继承）、f16 acc 反慢 1.7%（m4n2 实现保留 f32 o_acc 只加吸收链）、kBr/kBc traits 硬锁 64/64、P SMEM roundtrip 跨 warp SHFL/PRMT 不适用（reorg-free 不可移植）、QMMA wait/spill 非首瓶颈 | PC-9 顺序前置已解除 |
-| PC-9 | fp4 split-D (M8N1) 量化大 D kernel 性能优化 | P | ⬜ 待开始 | PC-8（顺序） |
+| PC-9 | fp4 split-D (M8N1) 量化大 D kernel 性能优化 | P | ❌ **证伪关闭（2026-09-11，零改动）**：立项时预设的两项 persist-D 已验证方案**均已内化**（`online_softmax_with_quant` FirstTile 融合共享自 fp4_pscale.cuh；persistent work loop 即 kernel 本体——fp4 split-D 本就是 persistent grid）；画像后候选全空——①stages 3/3→4/4 实测 ±0.5% 抵消（D512 -0.5%/D320 +0.8%，且挤 O epilogue batching）；②kVDChunk 64→128 **smem 物理不可行**（V stage +12.75KB 超预算，static_assert 编译期拦截；现状 3/3 已用 ~90KB/99KB）；③kQKDChunk 被 blockscale atom K=64 锁死；④D=512 spill 234MB = o_acc D/2=256 regs 结构性（同 fp8 M8N1 PC-7 定论，local Memory 流量本身仅 12.8GB/s 微不足道，代价在延迟+指令暴露：8 warps/SM=2 warps/scheduler 遮蔽不足）；⑤D=320 已健康（319T、wait 2.23 依赖链主导，同 PC-4 定论模板）。画像固化：sleeping 2.11 = barrier 退避+round-robin 尾部（grid=110=SM 数 persistent 语义完好，尾部 imbalance ≤5% 上限，work-stealing 先验不偿） | PC-10 顺序前置已解除 |
 | PC-10 | fp4 split-D M4N2 量化大 D kernel 性能优化 | P | ⬜ 待开始 | PC-9（顺序） |
 | PC-11 | warp 级 `__any_sync` lazy-rescale 统一治理（精度治理专项） | P | ✅ **完成（2026-09-09，范围收敛）** | **fp4 + native 两族落地 per-row**（fp4 attn-mask -3.7%/-4.7%，其余 ~0%；native branchless clamp 中性）；**fp8 ×2 + cute fp16 ×4 回退 vote 形态**（per-row 守卫进 rescale 循环引入跨 lane 分歧，attn-mask 实测 fp8_D512 **+23.9%**）；**fp4 m4n2 豁免**（vote 编译形态是 PC-0-5 稳定性载荷）；m4n2 bf16 失败定责 HEAD 既有（控制实验），race gate 恢复 fp16 语义 |
 | PC-12 | cute sm_80 fp16 性能优化（cp.async + 多级流水线，fp8/sm_89 路线前置） | P | ⬜ 待开始 | —；被 PC-6 依赖 |
@@ -295,7 +295,7 @@
     预期单项 0.5~2%，本次 +3.4~3.9% 已超预期，方向收敛关闭。
   - 证据：`.tmp/pc7/{verdict_step1.md, ncu_harness_fp8.py, bench_ab.py}`。
 - [x] PC-8：fp8 split-D M4N2 量化大 D kernel 性能优化
-- [ ] PC-9：fp4 split-D (M8N1) 量化大 D kernel 性能优化
+- [x] PC-9：fp4 split-D (M8N1) 量化大 D kernel 性能优化 —— ❌ **证伪关闭（2026-09-11，零改动：候选全空 + 结构边界固化）**
 - [ ] PC-10：fp4 split-D M4N2 量化大 D kernel 性能优化
 - [ ] PC-12：cute sm_80 fp16 性能优化（cp.async + 多级流水线，fp8/sm_89 路线前置，2026-09-02 立项）
   - 背景：cute sm_80 路径（`cute/sm_80/split_d.cuh`，cp.async loader）此前从未做专项性能优化——2026-09-02 补验 attn-mask 时实测 vs CUTE_TMA 慢 7%（D=768）~28%（D=128），cp.async loader 开销与小 D 流水深度是主因。
@@ -353,7 +353,9 @@
   ~~PC-7~~ fp8 split-D ✅ 完成（2026-09-11，reorg-free solo 落地 D320 -3.4~-3.9%，
         菜单穷尽 + 结构上限认知固化）→ ~~PC-8~~ fp8 split-D M4N2 ✅ 完成（2026-09-11，
         stage floor 3：TMA 流水饿死修复，D=768 self -11.7~-13.1%/causal -7.2~-10.8%，
-        其余方向证伪盘点见详情节）→ PC-9 → PC-10 量化大 D kernel（严格逐个
+        其余方向证伪盘点见详情节）→ ~~PC-9~~ fp4 split-D ❌ 证伪关闭（2026-09-11，
+        立项预设方案均已内化 + stages/kVDChunk 实验证伪 + D512 spill 结构性，
+        详见详情节）→ PC-10 量化大 D kernel（严格逐个
         推进：fp4 split-D → fp4 M4N2，上一项验收后再启动下一项；PC-7 的
         结构性结论——单 CTA occupancy/spill 矛盾——是同族后续项的先验参考）
   PC-12 cute sm_80 fp16（cp.async + 多级流水线）──达标──► cute/fp8/sm_89 量化实现
@@ -1592,7 +1594,7 @@ PC-7（顺序：复杂优化逐个推进，同族经验复用）。
 
 ### PC-9：fp4 split-D (M8N1) 量化大 D kernel 性能优化
 
-- **Status**: Draft ｜ **Priority**: P2 ｜ **Track**: 性能
+- **Status**: ❌ Closed (2026-09-11, 证伪关闭零改动) ｜ **Priority**: P2 ｜ **Track**: 性能
 
 #### Motivation
 
@@ -1607,13 +1609,44 @@ persist-D 沉淀的**两项已验证有效方案**与主循环结构无关，是
    fp8 同款已证伪零收益，附录 A #3**）；fp4 split-D 已有 per-work 批式
    epilogue（FC-2），主循环对齐成本低。
 
+#### Outcome（证伪关闭，2026-09-11）
+
+- **立项预设方案已内化**：①`online_softmax_with_quant</*FirstTile=*/true/false>`
+  softmax+倒数+row_sum 融合早已共享（`fp4_pscale.cuh`，kernel L20 注释明示）；
+  ②fp4 split-D 本就是 **persistent kernel**（grid-stride work loop，barriers
+  never re-init，grid=110=PRO 5000 SM 数，persistent 语义完好）——两项候补
+  无剩余空间。
+- **NCU 画像**（N=8192，PRO 5000）：
+  - D=320（健康态）：SM 33.6%/MEM 31.5%，spill 仅 42MB（o_acc=160 regs），
+    wait 2.23 依赖链主导——PC-4 同款"softmax→pack→PV 串行链 + occupancy
+    锁死"模板，319T 已接近该结构上限。
+  - D=512（spill 态）：SM 23.2%/MEM 45.3%，**spill 234MB**（o_acc=D/2=256
+    regs 超 255 上限，结构性，同 fp8 M8N1 PC-7 定论）；lsb 4.14 第一（OMMA
+    行 38%/FMUL 14%——LDL 依赖链归因）；sleeping 2.11（barrier 退避）。
+    注意 spill 流量本身仅 234MB/18.26ms≈12.8GB/s（DRAM 3.57% 含其内），
+    代价在**延迟+指令数暴露**：255 regs 锁 8 warps/SM=2 warps/scheduler，
+    延迟遮蔽不足。
+- **实验证伪**：
+  - stages 3/3→4/4（Traits 两处）：D512 self -0.5%/causal -0.8%，
+    D320 self **+0.8%**/causal +0.5%——方向相反抵消，且加深挤 O epilogue
+    batching（kVChunksPerBatch 变小）。已回退。
+  - kVDChunk 64→128：V^T stage 8KB/级（+12.75KB×3 级）**超 smem 预算**，
+    `static_assert(kSmemBytes <= 101376)` 编译期拦截——现状 3/3 已用
+    ~90KB/99KB（该 assert 也解释了 4/4 贴线通过：每级 K+DS+V ≈9.3KB）。
+  - kQKDChunk：static_assert 锁 64（= blockscale atom K extent）。
+  - work-stealing：round-robin 尾部 imbalance 上限 ~5%（2048 works/110 CTA
+    = 18.6，末位差 1 work），atomic 领取开销先验不偿。
+- **结论**：候选菜单全空 + 结构边界固化，零改动关闭。fp4 split-D 在
+  D=320/512 的性能特征与 fp8 M8N1（PC-7）/fp4 persist-D（PC-4）完全同构：
+  大 D spill 是 o_acc f32 数学必需的结构代价，超出 kernel 内部优化边界；
+  PC-8 式 stage 调优不适用（fp4 split-D stages 已是 3/3 且 smem 近满）。
+
 #### Design
 
 1. **先决（硬）**：`ncu --page source` 拿到 D=320/512 的 stall / roofline /
-   occupancy 画像；**无画像不动手**。
+   occupancy 画像；**无画像不动手**。（已执行，见 Outcome）
 2. 按 Motivation 顺序移植两项有效方案，再叠加局部优化菜单（reg reconfig /
    NamedBarrier / TMA issue / MUFU）；每项 ≤ 几十行、不动主循环骨架。
-3. 编译期路径隔离，默认配置行为零变化。
 
 #### Files & Symbols
 
