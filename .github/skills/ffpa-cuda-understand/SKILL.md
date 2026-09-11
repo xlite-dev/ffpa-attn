@@ -332,6 +332,8 @@ WS split-D 变体（`launch_cute_fwd_split_d_ws_sm120`）已被禁用：`setmaxn
 
 D 交叉点与 fp16 家族一致（<768 M8N1 / ≥768 M4N2）。`FFPA_FP8_FORCE_KERNEL=split_d|m4n2` env 可强制 A/B（仅 224<D≤1024）。
 
+> **PC-8 stage floor（2026-09-11，1209a3f）**：fp8 m4n2 launcher + bias plan 的 stages clamp 下限 2→3（traits 层生效，无需额外 sN TU）。fp8 CUTE_TMA Python 默认 stages=2（persist-D smem 预算的历史选择），m4n2 每级仅 12KB（99KB 预算容 7 级），s2 下 K/V TMA 流水饿死（NCU source：`@BRA`+`@NANOSLEEP` barrier 等待循环主导 long_scoreboard）。实测 D=768：self -11.7~-13.1% / causal -7.2~-10.8%（N=4k~16k，bitwise 一致）；s2~s7 扫描 **s3 全局最优、s4~s7 非单调更慢**（与 §5.8 persist-D "stages 加深证伪"前提不同：m4n2 occupancy 已被 255 regs 锁死 1 CTA，加深无 occupancy 代价，瓶颈只在 TMA 遮蔽深度）。M8N1/persist-D/fp16 m4n2 独立 clamp 不受影响；lazy rescale 不可开（fixed 448·vs P 域膨胀 saturate）。
+
 ### 5.2 前处理链（每调用）
 
 1. `launch_kv_mean_sm120`（smooth_k，默认开）：K 的 per-(b,h) 序列均值，两阶段自定义 kernel（~50µs @ B1H32N8192D128，替代 `at::mean`+cast 的 ~85µs）；输出 in-dtype 均值 + fp32 副本。
