@@ -496,6 +496,7 @@ lse 公式（NVFP4 PV）：`lse = (m*L + log2(row_sum) + log2(1/2688))*ln2 + sca
 
 - 相对 fp8（D=192）：self 1.47x / causal 1.29x / gqa 1.50x / cross-dense 1.57x。fp4 attn kernel 本身比 fp8 快 ~23%；blockscale mxf4nvf4 MMA 吞吐 ≈ fp8 dense（收益主要来自带宽）。
 - 已落地：条件 rescale（dense 96.5% 命中，-4.9%；PC-11 后 fp4 为 fragment 级 per-row 守卫（`scores_scale(mi)<1.0f`，attn-mask 再 -3.7%/-4.7%），m4n2 保留 vote（其编译形态是 PC-0-5 稳定性载荷））、`ex2.approx.ftz.f32`（消 ptxas range 胶水，-5.9%）、regalloc 按 D 门控（D≤128 用 alloc<224>，D≥192 必须 232）。
+- **PC-10 m4n2 装载向量化（2026-09-11，fade694）**：K/V fragment 装载 per-nibble 循环 → `recast<uint32_t>` 32bit 块拷贝（fragment 与 smem partition 共享同一 4bit 元素序，SW32 swizzle 以 8B 块置换不拆 4B word → bitwise 等价；SF 保持 byte-wise）+ P roundtrip 死 tiled-copy 删除 + 读侧 float4 化（sP 无 swizzle 行主序，kOffP 1024 对齐）。D=768 N=8192：self 94.06→53.04ms（**-43.6%**，70T→124T，1.09x→1.92x SDPA）、causal -38.6%（1.58x）；总指令 2.4B→1.21B（基线 OMMA 仅 1.7%——element-wise 装载指令海是历史遗留，LDSM 失败后退回形态）。收敛边界：255 regs = 2 warps/scheduler 延迟暴露（SM/MEM 双 28.9%、math throttle 0.38），regs 重构属结构变更留未来。
 - 证伪：Q smem 复用（fp4 L1TEX hit 已 96.75% 饱和，fp8 的前提不成立，+1.8% 回退，默认 OFF 代码保留）、rescale merge in-place（+1.7%，把 FMUL 拉进 MMA 依赖链）、q_full wait 延迟（中性偏负）、exp2 多项式替换、三段化 causal middle 段（投入产出低留后续）、**V/SFV 首块 s2r 提前藏进 softmax（PC-4，2026-09-11：+1.3~1.7% 净负，LDSM 目的寄存器跨 softmax 链拉长 live-range；NCU 证实 B 供给非瓶颈（LDS wait 仅 7.7%），wait 31% 主体在 A 操作数串行链——persist-D 微优化到顶确认，详见 §5.8 / RFC 附录 A #21）**。
 - **小 Nq（cross/decode）结构性不划算**：固定前处理链 ~1.1ms 占比过大。
 - fp4 相关 falsified 记录另见 memory：`ffpa-fp4-125x-sprint` / `ffpa-fp4-64x64` / `ffpa-fp4-pingpong`。
