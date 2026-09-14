@@ -267,7 +267,15 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
         cp_async_fence();
       }
     }
-    cp_async_wait<0>();
+    // Prologue wait: settle only Q + K[0] (the t=0 QK operands); the newer
+    // K[1..S-1]/V[0..S-1] groups stay in flight and land under the t=0
+    // compute. Short-Tc grids submit fewer than 2S+1 groups, which would
+    // make the depth-limited wait pass immediately, so they settle
+    // everything (the in-loop FIFO waits then pass trivially).
+    if (Tc_eff >= kStages)
+      cp_async_wait<kStages * 2 - 1>();
+    else
+      cp_async_wait<0>();
     __syncthreads();
   }
 

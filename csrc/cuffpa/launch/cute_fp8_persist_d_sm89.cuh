@@ -68,6 +68,11 @@ void launch_cute_fwd_persist_d_fp8_sm89(
   TORCH_CHECK(kHasAttnBias == (bias.ptr != nullptr ? 1 : 0),
               "ffpa_attn: fp8 sm89 persist_d bias tag mismatch");
 
+  // kBr=128 / 256T is the register ceiling: o_acc (D/1 f32) + scores
+  // (kBc s32) already fill ~128 regs/thread, and 64K regs/SM caps a single
+  // CTA at 256 threads x 255 regs (kBr=256/512T measured 65% slower --
+  // forced 128-reg limit spills everything; the sm120 kernel only fits
+  // 384T because WS splits a 128T producer from the 256T compute pool).
   constexpr int kBr = 128;
   constexpr int kBc = (kHeadDim <= 128) ? 128 : 64;
   constexpr int kQPersistBytes = kBr * kHeadDim;  // 1B/elem, Q stays in smem
@@ -93,7 +98,7 @@ void launch_cute_fwd_persist_d_fp8_sm89(
   const int Nkv = K.size(2);
   const int Tc = utils::div_ceil(Nkv, kBc);
   const float scale = static_cast<float>(softmax_scale);
-  const int n_rb_q = utils::div_ceil(Nq, kBr);
+  const int n_rb_q = utils::div_ceil(Nq, kBr);  // quant blocks are 128-row
   const int n_rb_kv = utils::div_ceil(Nkv, kBc);
   const int Nkv_pad = (Nkv + 15) / 16 * 16;
   const int D_og = Q.size(3);
