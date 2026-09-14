@@ -328,7 +328,9 @@ WS split-D 变体（`launch_cute_fwd_split_d_ws_sm120`）已被禁用：`setmaxn
 
 ## 5. CUTE FP8 路径
 
-`enable_fp8=True`（hint `CUTE_TMA_FP8`）。**fp16/bf16 输入 → 前处理链量化 → 低精度 attention**。仅 sm120（`prop->major >= 9` gate 内的 fp4/fp8 分支实际要求 sm120 traits；fp4 显式 check major==12，fp8 的 traits 是 sm120 家族）。
+`enable_fp8=True`（hint `CUTE_TMA_FP8`）。**fp16/bf16 输入 → 前处理链量化 → 低精度 attention**。主路径 sm120（`prop->major >= 9` gate 内的 fp4/fp8 分支实际要求 sm120 traits；fp4 显式 check major==12，fp8 的 traits 是 sm120 家族）。
+
+**sm89（Ada）fp8 支持**（2026-09-11 落地）：sm_89 无 TMA/async proxy，只能 cp.async general proxy。fp8 家族在 sm89 GPU（arch major < 12）或 `FFPA_FP8_SM89_FORCE=1` 下分流到 `cute/fp8/sm_89/persist_d.cuh`（见 §5.1）。v1 scope：**persist-D**（D≤224）、per_block Q/K/V、int8 QK + f16 PV acc（与 sm120 默认配置一致的量化配方）；split-D/M4N2 sm89 待 Phase 2/3（功能正确即可，低优先）。
 
 ### 5.1 kernel 家族与 D 覆盖
 
@@ -337,6 +339,11 @@ WS split-D 变体（`launch_cute_fwd_split_d_ws_sm120`）已被禁用：`setmaxn
 | **persist-D WS** | `D ≤ 224`（%32：32..224；kBc=128 for D≤128，64 for D>128） | 128 producer + 256 consumer，384T；`kPersistQs2rDefault`（Q s2r 常驻寄存器，K stage0 复用 Q smem） |
 | **split-D M8N1** | `224 < D < 768` | non-WS，M8N1 设计（同 fp16 split-D） |
 | **split-D M4N2** | `D ≥ 768` | atom (4,2,1)，O regs=D/4 |
+| **persist-D sm89** | `D ≤ 224` 且 %64==0（sm89 专属，`cute/fp8/sm_89/persist_d.cuh`） | 256T non-WS cp.async（sm80 装载协议）+ sm120 fp8 计算层（int8 QK MMA / fixed p_scale softmax / f8f8f16 PV inst_buf）；Q s2r 常驻 + K/V 独立 stage 池组 FIFO（wait<2S-1>/<2S-2>）；smem 预算 1B/elem Q persist + K/V stages |
+
+> **sm89 vs sm120 关键差异**：sm89 无 TMA/mbarrier/WS，PV 用 SM89 专用 f16-acc atom（traits 的 SM120 atom 是 Blackwell 专属）；V^T 装载沿用 sm80 64 列段（D%64==0 gate）。v1 scope 严格：per_block Q/K/V、f16 PV acc、`q_start_row==0`、`!smooth_v`、`!dropout`、NHD-O 拒（`TORCH_CHECK` 响亮报错）。已验证：PRO5000 force-sm89 下 N=512/2048 dense+causal 与 sm120 同配置 **bitwise 一致**；per_block preset self 1.137ms vs Sage 0.968ms（85%）。
+>
+> **sm89 fp8 性能现状与未来方向（2026-09-14 收敛，详见 RFC PC-16 + memory `ffpa-fp8-sm89-persistd`）**：主 kernel 定稿 **909.4µs vs SageAttention-2 710µs = 86.6%**（PRO 5000，B1 H32 N4096 D128，int8 QK + f16 PV acc；前处理已优于 Sage，差距全在主 kernel）。NCU 定型 = **依赖链/发射受限**（`math_pipe_throttle` 1.32 ≫ `wait` 0.82、`long_scoreboard` 0.04），故**深流水（S=3/slot-0 Q 复用）、指令瘦身、kBc=64 缩 tile 三类微优化全部零收益或负收益**（附录 A #22-#23）；**唯一实测有效方向 = 2 CTA/SM 拆链**（kBr=64+kBc=64+128T 实测 864µs -5%，ncu 确认 2 blocks/SM、tensor pipe 49%→59.5%），但其前提 f16 持久 O 有溢出域（`Σ_j exp2(s_j−m)·|V_j[d]| > 146.4` → ±inf，长平坦注意力），未落地。**几何红线**：P→A 的 `PackC8bitToA8bitPermVT` 要求 16 字节组同属一个 m-tile，故 **MMA_M≥2 的几何一律不可行**（kBr=128/128T 实测 parity 1.2524e+00；判据 = fragment `MMA_M_stride`，<16 即组跨 m-tile）。未来路线：2×64 行 sub-tile 共用 K/V smem（每 sub-tile 保持 MMA_M=1）/ 治理 f16 O 溢出域 / 换 m16n16k32 atom。
 
 D 交叉点与 fp16 家族一致（<768 M8N1 / ≥768 M4N2）。`FFPA_FP8_FORCE_KERNEL=split_d|m4n2` env 可强制 A/B（仅 224<D≤1024）。
 

@@ -62,6 +62,45 @@ void ffpa_fwd_fp8(const FfpaFwdParams& p) {
   // fp16 dispatch (M4N2 wins only for D>=768; below that M8N1 is
   // faster even with D/2 reg spill, same as fp16).
   if constexpr (kHeadDim <= 224) {
+    // sm89 cp.async path: FFPA_FP8_SM89_FORCE=1 or arch < 120. v1 scope:
+    // no hybrid / q_start_row, per-block Q/K/V quant, no dropout
+    // (checked inside the launcher). kQKInt8 is a template tag here; the
+    // e4m3 QK atom is picked by Traits from the same flag.
+    static const bool force_sm89 =
+        (std::getenv("FFPA_FP8_SM89_FORCE") != nullptr);
+    const bool on_sm89 =
+        force_sm89 || (at::cuda::getCurrentDeviceProperties()->major < 12);
+    if (on_sm89) {
+      TORCH_CHECK(!p.fp8_hybrid, "ffpa_attn: fp8 sm89 v1 has no hybrid");
+      TORCH_CHECK(p.fp8_qk_mm_type == 0 || p.fp8_qk_mm_type == 1,
+                  "ffpa_attn: fp8 sm89 v1 supports fp8/int8 QK only");
+      const bool qk_int8 = (p.fp8_qk_mm_type == 1);
+      const int bias_on = p.attn_bias.numel() > 0 ? 1 : 0;
+      const auto dispatch_sm89 = [&](auto qk_c) {
+        constexpr bool kQ = decltype(qk_c)::value;
+        if (!bias_on)
+          launch_cute_fwd_persist_d_fp8_sm89<kDataType, kHeadDim, kStage, kQ,
+                                             0>(
+              p.Q, p.K, p.V, p.O, p.attn_bias, p.softmax_lse, p.causal,
+              p.softmax_scale, p.dropout_p, p.philox_seed, p.philox_offset,
+              p.fp8_smooth_k, p.fp8_smooth_v, p.fp8_q_quant_method,
+              p.fp8_k_quant_method, p.fp8_v_quant_method, p.fp8_pv_acc_type,
+              /*q_start_row=*/0, p.fp8_hadamard);
+        else
+          launch_cute_fwd_persist_d_fp8_sm89<kDataType, kHeadDim, kStage, kQ,
+                                             1>(
+              p.Q, p.K, p.V, p.O, p.attn_bias, p.softmax_lse, p.causal,
+              p.softmax_scale, p.dropout_p, p.philox_seed, p.philox_offset,
+              p.fp8_smooth_k, p.fp8_smooth_v, p.fp8_q_quant_method,
+              p.fp8_k_quant_method, p.fp8_v_quant_method, p.fp8_pv_acc_type,
+              /*q_start_row=*/0, p.fp8_hadamard);
+      };
+      if (qk_int8)
+        dispatch_sm89(std::true_type{});
+      else
+        dispatch_sm89(std::false_type{});
+      return;
+    }
     if (p.fp8_hybrid && p.Nq >= p.fp8_hybrid_n_early) {
       const int n_early = static_cast<int>(p.fp8_hybrid_n_early);
       TORCH_CHECK(n_early % 128 == 0,

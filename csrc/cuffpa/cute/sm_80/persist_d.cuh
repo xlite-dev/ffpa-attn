@@ -405,6 +405,11 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
 
     // All threads finished reading K[t]/V[t] stages: safe to reissue the
     // stage slots for tile t+S (the loop-tail commits of the group FIFO).
+    // Drain tiles commit two EMPTY groups so C(t)=1+2S+2t holds through
+    // the last tile and the depth-limited in-loop waits (2S-1/2S-2) keep
+    // settling exactly K[t]/V[t] (empty groups complete instantly). The
+    // prologue wait_all implicitly commits one extra empty group, so the
+    // waits over-settle by one group here (harmless).
     __syncthreads();
     {
       const int kv_next = kv_tile + kStages;
@@ -412,6 +417,9 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
         g2s_load_k(kv_next, k_stg);
         cp_async_fence();
         g2s_load_v(kv_next, v_stg);
+        cp_async_fence();
+      } else {
+        cp_async_fence();
         cp_async_fence();
       }
     }
