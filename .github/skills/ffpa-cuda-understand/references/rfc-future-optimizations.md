@@ -108,6 +108,7 @@
 | PC-13 | fp8/fp4 hybrid 路径性能优化（双 attn kernel → 融合 kernel） | P | ⬜ 待开始 | —（与 PC-7~10 协同） |
 | PC-14 | fp16 dropout 路径性能优化（RNG bitmap 预计算 + producer/consumer 重排） | P | ✅ 完成（consumer 侧双缓冲 bitmap：persist_d D=64 1.02x / D=128 2.25x，split_d D=320 2.05x，sm_80 split_d 完成（f158eb1），bitwise 全过 + 全 task 套件零回归（fp16 7 tasks×2 dtypes + fp8/fp4 smoke）；producer 方案证伪；**m4n2 证伪不实现**（D=768 bitmap 212.82ms 反慢于 inline 202.31ms，tile 小 + PV/exchange 主导，RNG 非瓶颈；未来有需求再评估）；**persist-D half-row 方案要求 kBc≥64**——D=192/256 的 kBc=32 实例化编译期 `kBitmapCapable` 门控回落 inline Philox（d6a4a1d）；RNG 指令地板结论见 SKILL §11.16——契约下上限约 1.2x） | PC-0 同构（bias tile 协议复用）；FC-5 是量化路径功能项（⏸），与本项无重叠 |
 | PC-15 | 构建时间优化：fp16 家族 variant TU 拆分 + 默认编译集裁剪（构建工程） | P | ✅ 完成（2026-09-08：P1 fp16 TU 拆分 642e9d0 镜像 fp8/fp4 模式（8515ce7）→ P2 裁剪 flags e5133ee → P3 bench/tests 适配 d813fca → P5 wrapper 命名语义化 0b90ddf；**冷构建 770s/451 TU → 525s/326 TU（-32%）**；headdim 128+512 子集默认 97 TU / 全开 255 TU；见完成清单） | — |
+| PC-16 | sm_89 fp8 persist-D 性能深挖（追平 SageAttention-2）(**暂不实施，仅保留设计稿 + 实验记录**) | P3 | ⏸ **收敛搁置（2026-09-14）**：基线 **909.4µs vs Sage 710µs = 86.6%**（PRO 5000，B1 H32 Hkv32 N4096 D128，int8 QK + f16 PV acc）；NCU 定型 = **依赖链/发射受限**（math_pipe_throttle 1.32 主导，wait 0.82 / long_scoreboard 0.04 → 装载非瓶颈），Sage 结构优势 = 128T×2CTA/SM（32.8KB smem）+ m16n16k32 atom；已证伪 6 项（深流水/指令瘦身/kBc=64 单 CTA/kBr=128-128T 等，见附录 A #22-#25）；**唯一实测有效方向 = 2 CTA/SM 拆链**（kBr=64+kBc=64+128T 实测 **864µs -5%**，ncu 确认 2 blocks/SM），落地受 f16 持久 O 溢出域阻塞；详见完成清单 | FC-13 ✅ |
 
 > 未收录项：分卡基准标注（文档规范，随下次 bench 执行）。（原列于此的 cache-dit `_keep_or_pack` 物化兜底移除已于 2026-08-28 完成，cache-dit@4b5c977：三 tensor 直传零拷贝，契约外布局由 C++ layout gate 显式报错。）
 
@@ -334,6 +335,19 @@
   - P5 wrapper 命名语义化（0b90ddf）：wrapper 内 lambda `launch_variant`/`launch_variant_with_dropout`（按 runtime dropout_p 选 kHasDropout tag）、tag 别名 `Ic1/Ic0` 系列、lambda 参数名 (has_bias, plan_mode, bias_4b, has_dropout) 对应 `_v` 模板参。
   - P4 验收（冷计时，ccache -C 后）：默认裁剪 **525s/326 TU vs 基线 770s/451 TU（-32%）**；headdim 128+512 子集默认 97 TU / 全开 255 TU（f=1 贡献 24 TU）。bf16 parity / 全开 fp16 parity + f=1 真路径 / fp32 mask downcast / fp16 报错文案全矩阵绿。全量恢复方式：两 flags =1 重建。
   - 教训（已入 memory `ffpa-cuda-trim-flags`）：setuptools 不跟踪 `.cuh` 依赖（改头后必须 find 删 `*cute_fp16*.o` + `_C*.so`）；pytest 前须 unset `FFPA_FORCE_NO_SDPA_FALLBACK`（否则 meta.fallback 短路假失败）。
+
+- [ ] PC-16：sm_89 fp8 persist-D 性能深挖（追平 SageAttention-2，2026-09-14 收敛搁置）
+  - 现状基线（PRO 5000，`FFPA_FP8_SM89_FORCE=1`，B1 H32 Hkv32 N4096 D128，int8 QK + f16 PV acc + per_block Q/K/V）：主 kernel **909.4µs vs SageAttention-2 `qk_int_sv_f8_attn_kernel` 710µs = 86.6%**（Sage canary 跨轮稳定 709-710µs，可做环境漂移对照）；e2e ~1100µs（前处理 190µs 已优于 Sage 242µs，差距全在主 kernel）。
+  - NCU 定型（1 CTA/256T 基线）：**依赖链/发射受限而非装载受限**——`math_pipe_throttle` 1.32 主导、`wait` 0.82、`long_scoreboard` 0.04、tensor pipe 49%；对照 Sage 结构 = CTA_Q=128 + CTA_K=64 + **128T/CTA × 2 CTA/SM**（32.8KB smem，255 regs 卡线）。推论：任何"加深流水/削指令/缩 tile"都不解决问题，只有拆依赖链（2 CTA/SM）有效。
+  - 已证伪项（数据见附录 A #22-#25）：S=3 + slot-0 Q 复用（929.5/925.5µs 慢于基线）；指令瘦身（HFMA2 merge 中性 914.1 vs 913.5µs）；kBc=64 单 CTA（987.1µs，-8.5%）；kBr=128/128T（MMA_M=2，perm-pack 结构性不可行，parity 1.2524e+00）；warp-split（用户否决：sm_89 无 TMA，S=1 单缓冲交错无意义）。
+  - **已实测达成但未落地：2 CTA/SM（kBr=64 + kBc=64 + 128T 经 `kNumWarpsHint=4`）→ 864µs（-5%）**，ncu 确认 2 blocks/SM（`launch__registers_per_thread=250`、grid (64,32)）；stall 剖面对照：math_pipe_throttle 1.32→**0.72**、tensor pipe 49%→**59.5%**、inst_executed 495.7M；多形状 parity 5.86e-2（优于基线 7.65e-2，量化块变细）。**阻塞点**：该几何必须用 **f16 持久 O 累加器**（f32 版本 + scores 已顶满 255 regs，256T 无法配对），而 f16 O 有溢出域——`o16 = 448·Σ_j P_run_j·V_j`，当 `Σ_j exp2(s_j−m)·|V_j[d]| > 65504/448 ≈ 146.4` 时输出 ±inf（长平坦注意力，如 Nkv≥1.5k 且 avg|V|≈0.1），HEAD 的 f32 o_acc 跨 tile 免疫。改动已 stash 保存（`stash@{0}`，含 f16 O + 原地 PV 累加 + gemm_ss + `kNumWarpsHint`），因风险评估未决未提交。
+  - 未来方向（按收益/可行性排序）：
+    - **① 2×64 行 sub-tile 共用 K/V smem（复刻 Sage CTA_Q=128 结构）**：每个 sub-tile 保持 MMA_M=1（perm pack 可复用），K/V 的 B-fragment 跨两个 sub-tile 共享（否则 LDSM 翻倍 ≈ +23% cycles）；收益 = 每 tile 固定开销（wait/syncthreads/装载）摊半、8 warps/SM 覆盖 256 Q 行（对齐 Sage 的行覆盖）。改动面 = persist_d.cuh 的 Q/O/scores/row 状态 ×2 + K/V B-fragment 手写 2-acc k-loop。
+    - **② 治理 f16 持久 O 的溢出域后落地 2 CTA/SM**：per-chunk rescale（周期把 O 折算回小域）、或大 Nkv 回退 f32 acc（按 Nkv 运行时选核）、或 O 存 f32 但把 scores 降到 f16。任一方案落地即可解锁 ①/③ 的寄存器前提。
+    - **③ 换 m16n16k32 atom（Sage 同构）**：Sage 用 n16（每线程同行 4 列）→ P 的寄存器 repack 无 m-tile 约束、WARP_Q=32 天然可行、tile 数减半；代价 = QK B/K 布局 + softmax rowcol 视图 + perm-pack 契约全部重写（本设计 perm pack 的 16 字节组"必须同属一个 m-tile"正是 n8 atom 的产物）。
+    - ④ sm_89 int4 QK（PC-6，QK 段理论 2x）——需先验证净收益。
+  - 设计稿注意（本次实测发现的既有代码缺陷，当前 MMA_M 恒为 1 故潜伏）：`fp8_pscale.cuh::pscale_rowsum_mma` 只 issue 一个 m16n8k32 且只写 `row_sum[0]/[1]`，任何 MMA_M>1 形态会静默丢失后半行和；`tCrP` 的手搓 A 布局（`Shape<Shape<_4,_2,_2>, MMA_M, kBc/32>`）亦需按 M-tile 独占 `16×(kBc/32)` 字节连续区才与 perm pack 自洽。改 P fragment/atom 前先跑 host 端探针 `.tmp/sm89_opt/layout_probe.cu`（打印 fragment layout，秒级、不占 GPU）。
+  - 验收工具链：`python -m ffpa_attn.bench --fwd-backend cuda --cuda-impl fp8 --fp8-qk-mm-type int8 --fp8-pv-acc-type f16 --tasks self-attn,cross-attn,gqa,non-aligned`（sm89 v1 无 hybrid，causal/attn-mask task 会因 bench 默认开 hybrid 崩，属既有功能边界）+ `.tmp/sm89_opt/{prof_sm89.py,check_parity.py,prof_sage.py}` + ncu `--kernel-name regex:persist_d_fwd_cute_fp8_sm89`。
 
 ## 实施路线图（基建优先，承上启下）
 
@@ -1905,6 +1919,66 @@ SA2 证明了 int4 QK 的精度可行性（per-thread int4 量化 + smooth-Q ran
 
 先复活 sm_89 fp8 路线（memory `ffpa-fp8-sm89-cpasync` 的回退原因需重评估）。
 
+  - 阅读顺序：先读 memory `ffpa-fp8-sm89-persistd`（FC-13 落地与全部实验数据），再读本文完成清单 PC-16 条目，最后读本设计稿。
+
+### PC-16：sm_89 fp8 persist-D 性能深挖（追平 SageAttention-2）(暂不实施，仅保留设计稿 + 实验记录)
+
+- **Status**: Draft（收敛搁置） ｜ **Priority**: P3（结构变更，收益上限 ~28%） ｜ **Track**: 性能（sm_89 专属）
+
+#### Motivation
+
+FC-13 让 sm_89 fp8 persist-D 功能落地（256T non-WS cp.async，计算层照搬 sm120），但性能停在 **909.4µs vs SageAttention-2 710µs = 86.6%**（PRO 5000 sm_120f 构建，B1 H32 Hkv32 N4096 D128，int8 QK + f16 PV acc + per_block Q/K/V）。前处理链已优于 Sage（190µs vs 242µs），**差距 100% 在主 kernel**。sm_89（Ada/PRO 5000/4090）是消费级量化推理的主力卡型，86.6% 对下游 e2e 有实质影响。
+
+#### Root Cause（NCU 定型，2026-09-14）
+
+- 基线画像（kBr=128/256T/1 CTA/SM，80KB smem）：`math_pipe_throttle` **1.32** 主导、`wait` 0.82、`long_scoreboard` **0.04**、tensor pipe 49%、255 regs。
+- 结论：**kernel 是依赖链/发射受限，不是装载受限**——装载 stall 远低于计算 stall，所以"加深流水"（S=3）"削指令"（HFMA2 merge）都兑现不了收益（证伪数据见附录 A）。
+- Sage 结构优势（源码核对 `SageAttention/csrc/qattn/{sm89_qk_int8_sv_f8_accum_f32_attn.cu, qk_int_sv_f8_cuda_sm89.cuh, attn_utils.cuh}`）：CTA_Q=128 / CTA_K=64 / **128T per CTA × 2 CTA/SM**（smem 32KB，255 regs 卡线），且 QK/PV 用 **m16n16k32** atom + WARP_Q=32 —— 每线程手里是**同一行的 4 列**，所以 softmax 后的 P→A 转换是纯寄存器 repack（`RS_32_to_8` 的 `floatx4_to_e4m3x4`），天然支持每 warp 2 个 M16 tile。
+- FFPA 用 m16n8k32（每线程 2 行 × 2 列），P→A 靠 `PackC8bitToA8bitPermVT` 在原地把"同一 M16 内 2 个 n8 tile"合成单行 4 列——**该契约要求 16 字节组同属一个 m-tile**，这直接排除了 MMA_M≥2 的几何（见 Risks）。
+
+#### Design（三个方向，按收益/可行性排序）
+
+1. **2×64 行 sub-tile 共用 K/V smem**（复刻 Sage CTA_Q=128 结构；最高可行）
+   - 结构：CTA 持 2 个 64 行 sub-tile（各 4 warp 中的 2 warp，或 warp 分半），两者**共用同一份 K/V smem stage**；每个 sub-tile 内部仍 MMA_M=1 → perm pack、Q s2r、softmax rowcol 视图全部照旧。
+   - 关键约束：K/V 的 B-fragment **必须跨 sub-tile 共享**（手写 2-acc k-loop：一次 LDSM 喂两次 MMA），否则 LDSM 流量翻倍 ≈ +23% cycles，收益被吃光。
+   - 收益：每 tile 固定开销（wait + syncthreads + 装载发射）摊半；8 warps/SM 覆盖 256 Q 行（对齐 Sage）；CTA 数减半 → 网格更小、尾部更齐。
+2. **治理 f16 持久 O 的溢出域后落地 2 CTA/SM**（已实测 -5% 的路径）
+   - 已实测：kBr=64 + kBc=64 + 128T（`kNumWarpsHint=4`）= **864µs（-5%）**，ncu 确认 2 blocks/SM，`math_pipe_throttle` 1.32→0.72、tensor pipe 49%→59.5%，parity 5.86e-2（优于基线）。
+   - 阻塞：该几何要求 f16 持久 O（f32 版 + scores 已顶满 255 regs，256T 无法配对），而 `o16 = 448·Σ_j P_run_j·V_j` 在 `Σ_j exp2(s_j−m)·|V_j[d]| > 65504/448 ≈ 146.4` 时溢出到 ±inf（长平坦注意力，如 Nkv≥1.5k 且 avg|V|≈0.1）；HEAD 的 f32 o_acc 跨 tile 免疫。候选治理：per-chunk rescale 折回小域 / 大 Nkv 回退 f32 acc（按 Nkv 运行时选核）/ scores 降 f16 换 O 回 f32。
+3. **换 m16n16k32 atom（Sage 同构）**（改动面最大）
+   - 前提：n16 让每线程持有同行 4 列 → P repack 无 m-tile 约束、WARP_Q=32 可行、每 tile 的 M16 tile 数减半。
+   - 代价：QK 的 B/K 布局、softmax rowcol 视图、`perm_pack` 契约、V^T 的 perm 索引全部要按 n16 重写。
+
+#### Files & Symbols
+
+- `csrc/cuffpa/cute/fp8/sm_89/persist_d.cuh`（kernel 主体；实验改动已 stash）
+- `csrc/cuffpa/cute/fp8/attn_traits.cuh`（`FFPAAttnCuTePersistDFP8Traits`，实验期加了 `kNumWarpsHint`）
+- `csrc/cuffpa/launch/cute_fp8_persist_d_sm89.cuh`（几何/预算常量：kBr、kBc、kNumWarps、kMaxStages，stages 上限须按 50KB 半卡 smem 算而非 99KB opt-in）
+- `csrc/cuffpa/cute/fp8/fp8_pscale.cuh`（`pscale_rowsum_mma`、`quantize_p_frag_prescaled`）
+- `csrc/cuffpa/cute/fp8/reg2reg_8b.cuh`（`PackC8bitToA8bitPermVT` 契约：16 字节组 = 同一 m-tile 的 2 个 n8 tile）
+
+#### Validation
+
+- CLI：`python -m ffpa_attn.bench --fwd-backend cuda --cuda-impl fp8 --fp8-qk-mm-type int8 --fp8-pv-acc-type f16 --tasks self-attn,cross-attn,gqa,non-aligned`（v1 无 hybrid → causal/attn-mask task 会崩，属既有边界）
+- parity：`.tmp/sm89_opt/check_parity.py`（基线 7.6503e-2；2 CTA 版 5.8604e-2）+ 多形状 sweep（含 N=16383/16384 长平坦行，f16 O 溢出的高危域）
+- 性能：`nsys` 主 kernel avg（Sage canary `prof_sage.py` 做环境漂移对照）
+- 画像：ncu `--kernel-name regex:persist_d_fwd_cute_fp8_sm89`；布局类改动**先跑 host 端探针** `.tmp/sm89_opt/layout_probe.cu`（打印 fragment layout，秒级且不占 GPU）
+
+#### Risks & Rollback
+
+- **perm pack 契约锁死几何**：`((2,2),1,8):((1,2),0,4)`（MMA_M=1）→ 16 寄存器 = 4 个 n-tile 同属一个 m-tile ✓；`((2,2),2,8):((1,2),4,8)`（MMA_M=2）→ 组内跨 m-tile ✗（parity 1.2524e+00）。**任何 MMA_M≥2 的几何（如 kBr=128/128T）在此契约下不可行**，除非同时换 atom（方向 ③）。
+- f16 持久 O 溢出域（方向 ② 的前置）：治理不彻底会在长序列上静默产生 ±inf。
+- 特性负担：Sage 无 attn_bias/GQA/hybrid/任意 headdim/布局零拷贝——100µs 差距里含"特性对齐即结构性慢"的不可追回部分，追平目标应以同等特性子集（self-attn dense 无 mask）口径衡量。
+- 回退成本低：改动集中在 1-2 个文件，stash/checkout 即可复原到 913e711（909.4µs 基线）。
+
+#### Expected Benefit
+
+- 上限 = 追平 Sage（710µs，即 +28%）；其中 2 CTA/SM 单项已实测 **-5%（864µs）**，方向 ① 的"每 tile 开销摊半"是剩余差距的主要候选。收敛判断：若方向 ① 落地后仍 >1.2x Sage，则视为 sm_89 结构下限（cp.async 无 TMA + p_scale 域 + 特性负担），停止投入。
+
+#### Dependencies
+
+- FC-13 ✅（sm_89 fp8 persist-D 已落地）；memory `ffpa-fp8-sm89-persistd`（全部实验数据与教训）；PC-6（int4 QK，方向 ④）。
+
 ---
 
 ## 附录 A：已证伪优化清单（动手前必读）
@@ -1937,13 +2011,25 @@ SA2 证明了 int4 QK 的精度可行性（per-thread int4 量化 + smooth-Q ran
 | 19 | flat workspace + reorder（dispatch 侧） | 无收益 | TensorImpl 开销 ≈ 省掉的 empty |
 | 20 | aux 链融合（PC-1 Mega Quantize Kernel / PC-2 增量融合） | 证伪关闭（2026-09-11） | **流量问题非 launch 问题**：aux 各项贴 1.04TB/s 设备峰值（fp4 fused_qkv 240MB/237µs=1.01TB/s、delta_s 1.19TB/s、col_sum 0.9TB/s），融合不减流量；大 N 三模式 wall 差 <0.2%；L2 排序作用域 ≤L2 100.7MB（N≤~9000@D128）；4-launch 融合 bitwise 9/9 PASS 后回退（仅小 N/GQA launch 收益 +5.7%） |
 | 21 | fp4 persist-D V/SFV 首块 s2r 提前（PC-4，LDSM 延迟藏进 softmax 链） | 负已回退（2026-09-11） | N8192 +1.6% / N16384 +1.7% / N32768 +1.3%（stash 重建基线各 3 遍）；机制同 #15——LDSM 目的寄存器跨 softmax 链存活拉长 live-range，寄存器调度损失反超延迟掩盖；NCU 佐证：B 供给非瓶颈（LDS 类 wait 仅 7.7%，wait 31% 主体在 OMMA 等 A 操作数链），PC-4 方向整体关闭 |
+| 22 | sm_89 fp8 S=3 + K 槽0 兼 Q smem 复用（PC-16） | 负已回退（2026-09-14） | S=2@64KB **929.5µs** / S=3@96KB **925.5µs**，均慢于基线 910.3µs；ncu inst +1%（每 tile ~55 条地址选择/延迟提交指令）；**装载深度不是瓶颈**（wait 0.82 < math_pipe_throttle 1.32），该省 smem 收益在 .cg 装载路径上不存在 |
+| 23 | sm_89 fp8 kBc=64 单 CTA（对齐 Sage CTA_K=64） | 负已回退（2026-09-14） | **987.1µs（-8.5%）**；tile 数翻倍（32→64）放大每 tile 固定开销（2×wait + 2×syncthreads + 依赖链排队）；数值反略好（6.31e-2 vs 7.65e-2）。**结论：Sage 的收益来自 2 CTA/SM 拆链，不是 kBc=64 本身** |
+| 24 | sm_89 fp8 kBr=128 / 128T（MMA_M=2，意图复刻 Sage CTA_Q=128） | 结构性不可行（2026-09-14 实测证伪） | perm pack 的 16 字节组跨 m-tile：fragment layout MMA_M=1 `((2,2),1,8):((1,2),0,4)`（组 = 4 n-tile 同 m-tile ✓）vs MMA_M=2 `((2,2),2,8):((1,2),4,8)`（组跨 m-tile ✗）；实测 parity rel err **1.2524e+00**（随机级）。要 MMA_M≥2 必须换 m16n16 atom（PC-16 方向③） |
+| 25 | sm_89 fp8 「运行时分支 wait」修 drain race 语义 | 负已回退（2026-09-14） | **+18%（910→1076µs）**——延迟/依赖链受限 kernel 对循环内分支结构极敏感（每 tile ~+500 cycles，非指令数问题）。正解 = drain 段提交**空组**（零回退，913e711） |
 
 **跨实验元教训**：fp8 attn kernel 微优化已到顶（kernel 级稳定优于 SageAttention +1.1~2.3%）；
 **fp4 persist-D 微优化同样到顶（2026-09-11 PC-4 关闭：wait 31% = 低 occupancy + softmax→pack→PV 串行链的结构性代价，tensor pipe 54% 的缺口无可攻克热点）**；
+**sm_89 fp8 persist-D 亦然（2026-09-14 PC-16 收敛：#22-#23 证明装载/指令/tile 尺寸三类微优化全负或零，
+唯一有效方向是 2 CTA/SM 拆链 -5%；#24 说明该方向的 MMA_M=2 变体被 perm-pack 契约锁死，须走 sub-tile 或换 atom）**；
 结构优化收益是 kernel-结构相关的，不能跨量化格式外推（fp4 persistent 有效、fp8 零收益）；
 优化前先查目标 kernel 的 L1 hit / stall 画像（fp4 教训）；**把额外指令/更长寄存器存活拉进
 softmax-MMA 依赖链的调度类改动（#5/#7/#15/#21）在本设计下一致净负——WS 低 occupancy 结构
 对 live-range 极端敏感，调度收益上限远低于直觉**。
+
+**跨家族方法论教训（2026-09-14，PC-16）**：多家族通用的**布局类假设**（fragment 寄存器顺序、
+atom 契约、perm 合法性）先用 **host 端 cute layout 探针**（`nvcc` 直接编译 + `print(layout)`，
+秒级、不占 GPU、不动 so）定论，再决定是否值得改 kernel——比"改 kernel → 全量重构建（~8 分钟）
+→ parity 崩 → 猜测原因"快两个数量级。#24 正是靠探针把"16 字节组跨 m-tile"从推演升级为实测
+（判据：fragment 的 `MMA_M_stride`，0/≥16 = 组内同 m-tile，<16 = 组跨 m-tile）。
 
 > 注意：#18（vstats+vt 融合）的证伪对象是**无同步的单遍融合**；#20 进一步把整个
 > aux 链融合方向（含两阶段 + grid 屏障形态）也证伪关闭——根因不是同步成本，而是
