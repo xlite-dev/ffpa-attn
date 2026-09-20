@@ -9,14 +9,15 @@
 //   - per-thread gmem/smem chunk addressing derived once before the loop;
 //     issuing tile t only adds constant strides (K: kBc*kHeadDim bytes,
 //     V^T: kBc bytes) that preserve the SW128 swizzle pattern,
-//   - single-buffer K/V stages with no alternation: K[t+1] issues right
-//     after QK (overlaps softmax + PV), V[t+1] after PV (overlaps the
-//     next tile's QK + softmax), and the LDSM address chains become
-//     loop-invariant,
-//   - the Q tile shares the K stage storage whenever the two tiles have
-//     the same shape (D <= 128: both SW128 (128,128) 1B tiles -> 32KB
-//     smem total, more L1 left on the SM; D > 128 keeps a separate Q
-//     buffer),
+//   - kS-deep K/V cp.async pipeline (kStagesK/kStagesV traits; 1 = the
+//     Sage2 single-buffer schedule where K[t+1] issues right after QK and
+//     V[t+1] after PV). Deeper stages refill stage t%kS with tile t+kS
+//     once its LDSM readers have drained CTA-wide; every iteration
+//     commits exactly two groups (possibly empty at the pipeline tail)
+//     so the steady-state waits are the constants wait<2*kS-1> (K[t])
+//     and wait<2*kS-2> (V[t]),
+//   - the Q tile shares the K stage0 storage whenever the two tiles have
+//     the same shape (kBr == kBc, both SW atoms equal),
 //   - a mask-free main loop with the masked variant in the tail.
 //
 // Two-level PV accumulator (the Sage2 structure): the PV MMA lands in a
@@ -56,7 +57,7 @@
 namespace ffpa_fp8 {
 
 template <typename Traits, typename ElementO, int kHasAttnBias = 0>
-__global__ void __launch_bounds__(Traits::kNumThreads, 1)
+__global__ void __launch_bounds__(Traits::kNumThreads, 2)
     persist_d_fwd_cute_fp8_sm89(
         typename Traits::ElementQK* __restrict__ Q,
         typename Traits::ElementQK* __restrict__ K,
@@ -79,18 +80,19 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
   using SmemLayoutV = typename Traits::SmemLayoutV;
   using TiledMmaQK = typename Traits::TiledMmaQK;
 
-  constexpr int kBr = Traits::kBr;  // 128
-  constexpr int kBc = Traits::kBc;  // D <= 128 ? 128 : 64
+  constexpr int kBr = Traits::kBr;  // 64 (128T: 2 CTAs interleave per SM)
+  constexpr int kBc = Traits::kBc;
   constexpr int kHeadDim = Traits::kHeadDim;
-  constexpr int kNumThreads = Traits::kNumThreads;  // 256
-  static_assert(Traits::kStagesK == 1 && Traits::kStagesV == 1,
-                "single-stage Sage2 pipeline");
-  // Same-shape Q/K tiles (D <= 128) share one SW128 buffer: Q's g2s and
-  // both smem readers drain before K[0] overwrites it. D > 128 keeps a
-  // separate (larger) Q buffer next to the K/V stages.
+  constexpr int kNumThreads = Traits::kNumThreads;  // 128
+  static_assert(Traits::kStagesK == Traits::kStagesV,
+                "K and V pipeline depths must match");
+  constexpr int kS = Traits::kStagesK;  // K/V cp.async pipeline depth
+  // Same-shape Q/K tiles (kBr == kBc) share one swizzle buffer: Q drains
+  // before K[0] overwrites it. Different shapes keep a separate Q buffer
+  // next to the K/V stages.
   constexpr bool kQSharesK = cosize(SmemLayoutQ{}) == cosize(SmemLayoutK{});
 
-  // f16 PV atom (Ada-only m16n8k32 f16-acc), 8 warps over the 128 rows.
+  // f16 PV atom (Ada-only m16n8k32 f16-acc), warps over the kBr rows.
   using MmaAtomPVf16 = MMA_Atom<SM89_16x8x32_F16E4M3E4M3F16_TN>;
   using TiledMmaPVf16 = decltype(make_tiled_mma(
       MmaAtomPVf16{}, Layout<Shape<Int<kNumThreads / 32>, _1, _1>>{},
@@ -122,12 +124,18 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
   const int q_bh = Nb_id * Nh + Nh_id;
   const int kv_bh = Nb_id * Nh_kv + kv_head_idx;
 
-  // SMEM carve. kQSharesK: [K stage (Q transient) | V stage] = 32KB for
-  // D=128. Otherwise [Q | K stage | V stage].
+  // SMEM carve. kQSharesK: [K stage0 (Q transient) | K 1..S-1 | V stages].
+  // Otherwise [Q | K stages | V stages]. Stage s of K/V sits at its base
+  // plus s * cosize(2D tile) -- the stage-major 3D layouts below.
   extern __shared__ __align__(1024) char shm[];
   ElementQK* q_base = reinterpret_cast<ElementQK*>(shm);
   ElementQK* k_base = kQSharesK ? q_base : q_base + kQTileElements;
-  Element* v_base = reinterpret_cast<Element*>(k_base + kKTileElements);
+  Element* v_base = reinterpret_cast<Element*>(k_base + kS * kKTileElements);
+  using SmemLayoutKSt =
+      decltype(tile_to_shape(typename Traits::SmemAtomQK{},
+                             Shape<Int<kBc>, Int<kHeadDim>, Int<kS>>{}));
+  using SmemLayoutVSt = decltype(tile_to_shape(
+      typename Traits::SmemAtomV{}, Shape<Int<kHeadDim>, Int<kBc>, Int<kS>>{}));
 
   // G2S TiledCopy: 16B cp.async over [rows, 64] segments (one swizzle
   // atom wide, keeps the thread tiling integral for every D%64==0).
@@ -170,23 +178,21 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
     }
   };
 
-  // G2S destination tensors for the K/V stages (single stage each).
-  auto sK_g2s = make_tensor(make_smem_ptr(k_base), SmemLayoutK{});
-  auto sV_g2s = make_tensor(make_smem_ptr(v_base), SmemLayoutV{});
+  // G2S destination tensors for all K/V stages (stage-major 3D).
+  auto sK_g2s = make_tensor(make_smem_ptr(k_base), SmemLayoutKSt{});
+  auto sV_g2s = make_tensor(make_smem_ptr(v_base), SmemLayoutVSt{});
   // G2S issue for one K/V tile, pure cute: the gmem slice is an affine
-  // function of t (K: +kBc*kHeadDim elements, V^T: +kBc elements), the
-  // smem stage tensor is loop-invariant in the single-stage schedule, so
-  // nvcc folds the copy addressing into a constant-stride pointer walk --
-  // the same algebra v1 recomputed as fresh 64-bit layout slices every
-  // tile.
+  // function of t (K: +kBc*kHeadDim elements, V^T: +kBc elements); the
+  // smem stage tensor is the (t % kS) slice of the 3D stages.
   auto issue_k = [&](int t) {
     auto gK =
         local_tile(mK, Shape<Int<kBc>, Int<kHeadDim>>{}, make_coord(t, _0{}));
+    auto sK_t = sK_g2s(_, _, t % kS);
     CUTLASS_PRAGMA_UNROLL
     for (int seg = 0; seg < kHeadDim / kSegCols; ++seg) {
       auto gSeg = local_tile(gK, Shape<Int<kBc>, Int<kSegCols>>{},
                              make_coord(_0{}, seg));
-      auto sSeg = local_tile(sK_g2s, Shape<Int<kBc>, Int<kSegCols>>{},
+      auto sSeg = local_tile(sK_t, Shape<Int<kBc>, Int<kSegCols>>{},
                              make_coord(_0{}, seg));
       copy(g2s_copy, g2s_thr.partition_S(gSeg), g2s_thr.partition_D(sSeg));
     }
@@ -194,11 +200,12 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
   auto issue_v = [&](int t) {
     auto gV =
         local_tile(mV, Shape<Int<kHeadDim>, Int<kBc>>{}, make_coord(_0{}, t));
+    auto sV_t = sV_g2s(_, _, t % kS);
     CUTLASS_PRAGMA_UNROLL
     for (int seg = 0; seg < kBc / kSegCols; ++seg) {
       auto gSeg = local_tile(gV, Shape<Int<kHeadDim>, Int<kSegCols>>{},
                              make_coord(_0{}, seg));
-      auto sSeg = local_tile(sV_g2s, Shape<Int<kHeadDim>, Int<kSegCols>>{},
+      auto sSeg = local_tile(sV_t, Shape<Int<kHeadDim>, Int<kSegCols>>{},
                              make_coord(_0{}, seg));
       copy(g2s_copy, g2s_thr.partition_S(gSeg), g2s_thr.partition_D(sSeg));
     }
@@ -244,13 +251,10 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
   static_assert(kORows == 2, "");
 
   auto sQ = make_tensor(make_smem_ptr(q_base), SmemLayoutQ{});
-  // Single-stage K/V smem tensors and s2r partitions, built once. With no
-  // stage alternation the LDSM address chains are loop-invariant, so nvcc
-  // hoists them out of the KV loop.
-  auto sK_s0 = make_tensor(make_smem_ptr(k_base), SmemLayoutK{});
-  auto sV_s0 = make_tensor(make_smem_ptr(v_base), SmemLayoutV{});
-  auto tKsK0 = s2r_thr_k.partition_S(sK_s0);
-  auto tVsV0 = s2r_thr_v.partition_S(sV_s0);
+  // K/V smem tensors carry the stage mode; the per-tile s2r partitions
+  // are rebuilt from the (kv_tile % kS) slice inside the KV loop.
+  auto sK_st = make_tensor(make_smem_ptr(k_base), SmemLayoutKSt{});
+  auto sV_st = make_tensor(make_smem_ptr(v_base), SmemLayoutVSt{});
 
   // Coordinate tensor for softmax indexing.
   auto cS = make_identity_tensor(Shape<Int<kBr>, Int<kBc>>{});
@@ -283,11 +287,10 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
 
   const bool smooth_lse = (softmax_lse != nullptr) && (km != nullptr);
 
-  // Prologue, Sage2 style. Commit order Q(1), K[0](2), V[0](3), then per
-  // tile K[t] = group 2+2t, V[t] = group 3+2t, so the steady-state waits
-  // are constant: wait<1> settles K[t], wait<0> settles V[t]. When Q
-  // shares the K storage, both of Q's smem readers (smooth-K dot, Q s2r)
-  // drain CTA-wide before K[0] issues.
+  // Prologue, Sage2 style. Q settles first (one group, fully drained),
+  // then the pipeline fill commits K/V[0..kS-1] in order -- 2*kS groups
+  // in flight. When Q shares the K stage0 storage, both of Q's smem
+  // readers (smooth-K dot, Q s2r) drain CTA-wide before K[0] issues.
   auto tCrQ = thr_mma_qk.partition_fragment_A(sQ);
   auto tQsQ_s2r = s2r_thr_q.partition_S(sQ);
   {
@@ -310,10 +313,14 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
       copy(s2r_copy_q, tQsQ_s2r(_, _, tile_k), tXrQ(_, _, tile_k));
 
     __syncthreads();  // Q storage drained CTA-wide -> K[0] may overwrite
-    if (Tc_eff > 0) {
-      issue_k(0);
+    // Fill the pipeline: K/V[0..kS-1] commit in order. Past-Tc_eff slots
+    // commit empty groups so the steady-state wait depth stays exact.
+    for (int s = 0; s < kS; ++s) {
+      if (s < Tc_eff)
+        issue_k(s);
       cp_async_fence();
-      issue_v(0);
+      if (s < Tc_eff)
+        issue_v(s);
       cp_async_fence();
     }
   }
@@ -330,13 +337,18 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
     const float p_quant_scale = vs * kE4m3Max;
 
     // ---- QK: K-only smem loads feed the resident Q A-fragment ----
-    cp_async_wait<1>();  // settles K[t] = group 2+2t
+    // Steady state holds 2*kS groups in flight at the iteration head;
+    // waiting for <= 2*kS-1 settles the oldest, K[t] (V[t-1] landed at
+    // the previous iteration's wait).
+    cp_async_wait<2 * kS - 1>();
     __syncthreads();
 
-    auto tCrK = thr_mma_qk.partition_fragment_B(sK_s0);
+    auto sK_t = sK_st(_, _, kv_tile % kS);
+    auto tKsK_t = s2r_thr_k.partition_S(sK_t);
+    auto tCrK = thr_mma_qk.partition_fragment_B(sK_t);
     ScoreFrag tCrS;
     clear(tCrS);
-    ffpa_cute::gemm_rs(tCrS, tCrQ, tCrK, tKsK0, tiled_mma_qk, s2r_copy_k,
+    ffpa_cute::gemm_rs(tCrS, tCrQ, tCrK, tKsK_t, tiled_mma_qk, s2r_copy_k,
                        s2r_thr_k);
 
     // int8 QK: cast the s32 acc to f32 in place (identity view on the
@@ -415,24 +427,26 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
     auto tCrP = make_tensor(reinterpret_cast<Element*>(tCrSf.data()), PLayer{});
     quantize_p_frag_prescaled(tCrSf, perm_pack);
 
-    // ---- V settle, then PV: per-tile f16 inst_buf -> RO absorb ----
-    cp_async_wait<0>();  // settles V[t] = group 3+2t
+    // ---- V settle + K drain, one sync for both: the wait settles V[t]
+    // (second-oldest in-flight group after K[t]); the barrier certifies
+    // QK's LDSM readers drained K stage t%kS CTA-wide, so it can be
+    // refilled with K[t+kS] to overlap PV. Empty commits past the
+    // pipeline tail keep the in-flight group count exact.
+    cp_async_wait<2 * kS - 2>();  // settles V[t]
     __syncthreads();
+    if (kv_tile + kS < Tc_eff)
+      issue_k(kv_tile + kS);
+    cp_async_fence();
 
-    // K storage drained (QK read it before this sync): release it now so
-    // the K[t+1] load overlaps softmax + PV (Sage2 single-buffer schedule).
-    const int kv_next = kv_tile + 1;
-    if (kv_next < Tc_eff)
-      issue_k(kv_next);
-    cp_async_fence();  // empty group on drain keeps the depths exact
-
-    auto tCrV = thr_mma_pv_f16.partition_fragment_B(sV_s0);
+    auto sV_t = sV_st(_, _, kv_tile % kS);
+    auto tVsV_t = s2r_thr_v.partition_S(sV_t);
+    auto tCrV = thr_mma_pv_f16.partition_fragment_B(sV_t);
 
     pscale_rowsum_mma(tCrP, row_sum, 1.0f / p_quant_scale);
 
     OFrag16 inst;
     clear(inst);
-    ffpa_cute::gemm_rs(inst, tCrP, tCrV, tVsV0, tiled_mma_pv_f16, s2r_copy_v,
+    ffpa_cute::gemm_rs(inst, tCrP, tCrV, tVsV_t, tiled_mma_pv_f16, s2r_copy_v,
                        s2r_thr_v);
 
     // RO = RO*rs + inst, one fused fmaf per element; rs is skipped on
@@ -450,12 +464,11 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
       }
     }
 
-    // ---- release V and issue V[t+1] ----
-    // V[t+1] then overlaps the next tile's K wait + QK + softmax. Drain
-    // tiles commit an empty group so the depth-limited waits stay exact.
+    // ---- V[t] drained: refill its stage with V[t+kS] ----
+    // V[t+kS] then overlaps the next tile's K wait + QK + softmax.
     __syncthreads();
-    if (kv_next < Tc_eff)
-      issue_v(kv_next);
+    if (kv_tile + kS < Tc_eff)
+      issue_v(kv_tile + kS);
     cp_async_fence();
   };
 

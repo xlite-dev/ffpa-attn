@@ -5,6 +5,9 @@
 // the sm120 launcher; diverges in the kernel launch (no TMA descriptors)
 // and the v1 scope (bias mode 0 gmem-direct, per_block Q/K/V quant,
 // q_start_row=0, no dropout/smooth_v).
+#include <cstdio>
+#include <cstdlib>
+
 #include "launch/common.cuh"
 #if defined(ENABLE_FFPA_CUTE_EXT) && defined(ENABLE_FFPA_TMA_EXT)
 #include "cute/fp8/quantize_fp8.cuh"
@@ -16,9 +19,16 @@
 
 namespace ffpa {
 
-template <typename kDataType, const int kHeadDim, const int kStage,
-          bool kQKInt8, int kHasAttnBias>
-void launch_cute_fwd_persist_d_fp8_sm89(
+// One (kBc, kStages) schedule of the unified kBr=64 persist-D kernel.
+// kBr=64 / 128T keeps the per-thread tile share (and REG:255 ceiling) of
+// the old kBr=128/256T schedule while two CTAs per SM interleave two
+// independent QK->softmax->PV chains -- the Sage2 structure. kStages is
+// the K/V cp.async pipeline depth; every extra stage spends the smem
+// that funds the 2nd resident CTA (D=128: kBc=128 S=1 -> 40KB/2 CTAs,
+// S=2 -> 72KB/1 CTA; kBc=64 S=1/2/3 -> 16/32/48KB, all 2 CTAs).
+template <typename kDataType, const int kHeadDim, bool kQKInt8,
+          int kHasAttnBias, const int kBc, const int kStages>
+void persist_d_fp8_sm89_variant(
     torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O,
     torch::Tensor attn_bias, torch::Tensor softmax_lse, int causal,
     double softmax_scale, double dropout_p, int64_t philox_seed,
@@ -68,26 +78,20 @@ void launch_cute_fwd_persist_d_fp8_sm89(
   TORCH_CHECK(kHasAttnBias == (bias.ptr != nullptr ? 1 : 0),
               "ffpa_attn: fp8 sm89 persist_d bias tag mismatch");
 
-  // kBr=128 / 256T is the register ceiling: the f32 running accumulator
-  // (D/2 f32) + scores (kBc/4 s32) already fill most of the budget, and
-  // 64K regs/SM caps a single CTA at 256 threads x 255 regs.
-  constexpr int kBr = 128;
-  constexpr int kBc = (kHeadDim <= 128) ? 128 : 64;
-  // Single-stage Sage2 pipeline (K[t+1] issues after QK, V[t+1] after PV).
-  // Same-shape Q/K tiles (D <= 128) share one SW128 buffer (Q drains
-  // before K[0] overwrites it); D > 128 keeps a separate Q buffer next to
-  // the K/V stages. kStage is ignored by this schedule.
-  constexpr int kQTileBytes = kBr * kHeadDim;  // 1B/elem
-  constexpr int kKVTilesBytes = 2 * kBc * kHeadDim;
-  constexpr bool kQSharesK = kHeadDim <= 128;
+  constexpr int kBr = 64;
+  constexpr int kKTileBytes = kBc * kHeadDim;  // 1B/elem
+  constexpr int kVTileBytes = kBc * kHeadDim;
+  // Same-shape Q/K tiles (kBc == kBr) share one swizzle buffer: Q drains
+  // before K[0] overwrites it; K stages 1..S-1 and the V stages follow.
+  constexpr bool kQSharesK = kBr == kBc;
   constexpr int kSmemBytes =
-      kQSharesK ? kKVTilesBytes : kQTileBytes + kKVTilesBytes;
+      (kQSharesK ? 0 : kBr * kHeadDim) + kStages * (kKTileBytes + kVTileBytes);
 
   using ElementO = std::conditional_t<std::is_same_v<kDataType, __half>,
                                       cutlass::half_t, cutlass::bfloat16_t>;
   using Traits =
-      ffpa_cute::FFPAAttnCuTePersistDFP8Traits<kHeadDim, ElementO, kBr, kBc, 1,
-                                               1, kQKInt8>;
+      ffpa_cute::FFPAAttnCuTePersistDFP8Traits<kHeadDim, ElementO, kBr, kBc,
+                                               kStages, kStages, kQKInt8>;
   using Element = typename Traits::Element;
   using ElementQK = typename Traits::ElementQK;
   constexpr int kNumThreads = Traits::kNumThreads;
@@ -99,7 +103,7 @@ void launch_cute_fwd_persist_d_fp8_sm89(
   const int Nkv = K.size(2);
   const int Tc = utils::div_ceil(Nkv, kBc);
   const float scale = static_cast<float>(softmax_scale);
-  const int n_rb_q = utils::div_ceil(Nq, kBr);  // quant blocks are 128-row
+  const int n_rb_q = utils::div_ceil(Nq, kBr);
   const int n_rb_kv = utils::div_ceil(Nkv, kBc);
   const int Nkv_pad = (Nkv + 15) / 16 * 16;
   const int D_og = Q.size(3);
@@ -143,6 +147,55 @@ void launch_cute_fwd_persist_d_fp8_sm89(
       qi.v_scale.data_ptr<float>(), Nq, Nkv, Nh, Nh_kv, n_rb_q, n_rb_kv, scale,
       Tc, causal, Nkv_pad, qi.km_f32_ptr, qi.vm_kernel, bias.ptr, bias.dtype,
       bias.stride_b, bias.stride_h, bias.stride_m, bias.stride_n);
+}
+
+template <typename kDataType, const int kHeadDim, const int kStage,
+          bool kQKInt8, int kHasAttnBias>
+void launch_cute_fwd_persist_d_fp8_sm89(
+    torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O,
+    torch::Tensor attn_bias, torch::Tensor softmax_lse, int causal,
+    double softmax_scale, double dropout_p, int64_t philox_seed,
+    int64_t philox_offset, bool fp8_smooth_k, bool fp8_smooth_v,
+    int64_t fp8_q_quant_method, int64_t fp8_k_quant_method,
+    int64_t fp8_v_quant_method, int64_t fp8_pv_acc_type, int q_start_row,
+    bool fp8_hadamard) {
+  // Unified kBr=64 / 128T: two resident CTAs per SM interleave two
+  // independent QK->softmax->PV dependency chains (the Sage2 structure)
+  // while keeping the old kBr=128/256T per-thread register share.
+  // kBc=64 minimizes the smem footprint (16KB: Q shares K stage0) which
+  // keeps both CTAs resident AND shrinks the smem carve so the L1 cache
+  // left behind is bigger; single-stage K/V (S=1) wins because deeper
+  // pipelines spend the smem that funds the 2nd CTA -- S=2 @ kBc=128
+  // drops to 1 CTA/SM (+37% @ Nkv=16384), and even with both CTAs held
+  // (kBc=64 S=2/3) the extra depth only costs. Bench vs Sage2 (B1 H32
+  // D128 dense): -3.8% @ 4096, -1.1% @ 8192, +3.3% @ 16384 (med; min
+  // ties). FFPA_SM89_PERSIST_KVCFG="kBc,stages" retunes for experiments.
+  int kBc_cfg = 64, kStages_cfg = 1;
+  if (const char* cfg = std::getenv("FFPA_SM89_PERSIST_KVCFG"))
+    std::sscanf(cfg, "%d,%d", &kBc_cfg, &kStages_cfg);
+#define FFPA_PERSIST_D_CFG(BC, ST)                                           \
+  persist_d_fp8_sm89_variant<kDataType, kHeadDim, kQKInt8, kHasAttnBias, BC, \
+                             ST>(                                            \
+      Q, K, V, O, attn_bias, softmax_lse, causal, softmax_scale, dropout_p,  \
+      philox_seed, philox_offset, fp8_smooth_k, fp8_smooth_v,                \
+      fp8_q_quant_method, fp8_k_quant_method, fp8_v_quant_method,            \
+      fp8_pv_acc_type, q_start_row, fp8_hadamard)
+  const bool valid =
+      (kBc_cfg == 128 && (kStages_cfg == 1 || kStages_cfg == 2)) ||
+      (kBc_cfg == 64 && kStages_cfg >= 1 && kStages_cfg <= 3);
+  TORCH_CHECK(valid, "ffpa_attn: unsupported FFPA_SM89_PERSIST_KVCFG=", kBc_cfg,
+              ",", kStages_cfg);
+  if (kBc_cfg == 128 && kStages_cfg == 1)
+    FFPA_PERSIST_D_CFG(128, 1);
+  else if (kBc_cfg == 128 && kStages_cfg == 2)
+    FFPA_PERSIST_D_CFG(128, 2);
+  else if (kBc_cfg == 64 && kStages_cfg == 1)
+    FFPA_PERSIST_D_CFG(64, 1);
+  else if (kBc_cfg == 64 && kStages_cfg == 2)
+    FFPA_PERSIST_D_CFG(64, 2);
+  else
+    FFPA_PERSIST_D_CFG(64, 3);
+#undef FFPA_PERSIST_D_CFG
 }
 
 }  // namespace ffpa

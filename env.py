@@ -1618,6 +1618,10 @@ with r in {0, 1}. See `_fp16_impl_variants` in `env.py`.
       for d in headdims:
         br, bc = cls._fp8_variant_blocks(d)
         blocks = [(br, bc)]
+        # sm89 persist-D unified kBr=64: kBc=128 and kBc=64 tuning cfgs
+        # both need their preprocess instances for every D <= 224.
+        blocks.append((64, 128))
+        blocks.append((64, 64))
         if debug_fp8 and 224 < d <= 1024:
           # FFPA_FP8_FORCE_KERNEL A/B instantiates both split_d and m4n2
           # in one TU; the forced variant's blocks are absent from the
