@@ -72,9 +72,10 @@ void ffpa_fwd_fp8(const FfpaFwdParams& p) {
   TORCH_CHECK(!on_sm89 || kHeadDim <= 224,
               "ffpa_attn: fp8 sm89 path supports D<=224 only");
   if constexpr (kHeadDim <= 224) {
-    // v1 scope: no hybrid / q_start_row, per-block Q/K/V quant, no
-    // dropout (checked inside the launcher). kQKInt8 is a template tag
-    // here; the e4m3 QK atom is picked by Traits from the same flag.
+    // scope: no hybrid / q_start_row, per_block/per_thread QK + per_block/
+    // per_channel V (+smooth_v), no dropout (checked inside the launcher).
+    // kQKInt8 is a template tag here; the e4m3 QK atom is picked by Traits
+    // from the same flag.
     if (on_sm89) {
       TORCH_CHECK(!p.fp8_hybrid, "ffpa_attn: fp8 sm89 v1 has no hybrid");
       TORCH_CHECK(p.fp8_qk_mm_type == 0 || p.fp8_qk_mm_type == 1,

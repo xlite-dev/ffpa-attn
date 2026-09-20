@@ -3,8 +3,8 @@
 // sm_89 persist_d kernel. Reuses the TMA-free fp8 preprocess chain
 // (prepare_fp8_inputs / smooth_k) and the shared quantization plumbing of
 // the sm120 launcher; diverges in the kernel launch (no TMA descriptors)
-// and the v1 scope (bias mode 0 gmem-direct, per_block Q/K/V quant,
-// q_start_row=0, no dropout/smooth_v).
+// and the scope (bias mode 0 gmem-direct, per_block/per_thread QK (matched)
+// + per_block/per_channel V with smooth_v, q_start_row=0, no dropout).
 #include <cstdio>
 #include <cstdlib>
 
@@ -40,11 +40,11 @@ void persist_d_fp8_sm89_variant(
   // v1 scope checks (sm89 cp.async path).
   TORCH_CHECK(dropout_p == 0.0, "fp8 sm89 path does not support dropout");
   TORCH_CHECK(q_start_row == 0, "fp8 sm89 v1 does not support q_start_row");
-  TORCH_CHECK(fp8_q_quant_method == 0 && fp8_k_quant_method == 0,
-              "fp8 sm89 v1 supports per_block Q/K quant only");
-  TORCH_CHECK(fp8_v_quant_method == 0,
-              "fp8 sm89 v1 supports per_block V quant only");
-  TORCH_CHECK(!fp8_smooth_v, "fp8 sm89 v1 requires per_channel V for smooth_v");
+  TORCH_CHECK((fp8_q_quant_method == 0 && fp8_k_quant_method == 0) ||
+                  (fp8_q_quant_method == 2 && fp8_k_quant_method == 2),
+              "fp8 sm89 supports per_block or per_thread Q/K quant (matched)");
+  TORCH_CHECK(fp8_v_quant_method == 0 || fp8_v_quant_method == 1,
+              "fp8 sm89 supports per_block or per_channel V quant");
   TORCH_CHECK(fp8_pv_acc_type == 0,
               "fp8 sm89 v1 supports f16 PV accumulator only");
   // The cp.async G2S loader cuts 64-column segments (1B elems, 16B copies):
@@ -110,10 +110,15 @@ void persist_d_fp8_sm89_variant(
 
   const c10::cuda::OptionalCUDAGuard device_guard(Q.device());
   auto stream = at::cuda::getCurrentCUDAStream();
-  const bool qk_per_thread = false;
-  const bool v_per_channel = false;
-  const bool v_smooth_mean = false;
-  const float v_r = 448.0f;
+  const bool qk_per_thread = (fp8_q_quant_method == 2);
+  const bool v_per_channel = (fp8_v_quant_method == 1);
+  const bool v_smooth_mean = v_per_channel && fp8_smooth_v;
+  TORCH_CHECK(!fp8_smooth_v || v_per_channel,
+              "ffpa_attn: fp8_smooth_v requires fp8_v_quant_method="
+              "'per_channel'");
+  // Per-channel V + f16 PV acc compresses V8 to v_r=2.25 so one tile's
+  // f16 inst_buf stays in range (kBc*448*2.25 <= 65504 for kBc=64).
+  const float v_r = v_per_channel ? 2.25f : 448.0f;
   const bool reorg_free = true;
   const ffpa_fp8::Fp8QuantizedInputs qi =
       ffpa_fp8::prepare_fp8_inputs<kDataType, kBr, kBc, kHeadDim, kQKInt8>(
@@ -135,18 +140,35 @@ void persist_d_fp8_sm89_variant(
   const dim3 block(kNumThreads, 1, 1);
   const dim3 grid(utils::div_ceil(Nq, kBr), Nb * Nh, 1);
 
-  const auto kernel =
-      ffpa_fp8::persist_d_fwd_cute_fp8_sm89<Traits, ElementO, kHasAttnBias>;
-  cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                       kSmemBytes);
-  kernel<<<grid, block, kSmemBytes, stream>>>(
-      reinterpret_cast<ElementQK*>(qi.q8.data_ptr()),
-      reinterpret_cast<ElementQK*>(qi.k8.data_ptr()),
-      reinterpret_cast<Element*>(qi.vt8.data_ptr()), O_ptr, softmax_lse_ptr,
-      qi.q_scale.data_ptr<float>(), qi.k_scale.data_ptr<float>(),
-      qi.v_scale.data_ptr<float>(), Nq, Nkv, Nh, Nh_kv, n_rb_q, n_rb_kv, scale,
-      Tc, causal, Nkv_pad, qi.km_f32_ptr, qi.vm_kernel, bias.ptr, bias.dtype,
-      bias.stride_b, bias.stride_h, bias.stride_m, bias.stride_n);
+  // The quant granularity only changes register-time constants and the
+  // epilogue dequant; instantiate the four combinations over one launch site.
+  const auto launch = [&](auto qk_pt_c, auto v_pc_c) {
+    const auto k =
+        ffpa_fp8::persist_d_fwd_cute_fp8_sm89<Traits, ElementO, kHasAttnBias,
+                                              decltype(qk_pt_c)::value,
+                                              decltype(v_pc_c)::value>;
+    cudaFuncSetAttribute(k, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                         kSmemBytes);
+    k<<<grid, block, kSmemBytes, stream>>>(
+        reinterpret_cast<ElementQK*>(qi.q8.data_ptr()),
+        reinterpret_cast<ElementQK*>(qi.k8.data_ptr()),
+        reinterpret_cast<Element*>(qi.vt8.data_ptr()), O_ptr, softmax_lse_ptr,
+        qi.q_scale.data_ptr<float>(), qi.k_scale.data_ptr<float>(),
+        qi.v_scale.data_ptr<float>(), Nq, Nkv, Nh, Nh_kv, n_rb_q, n_rb_kv,
+        scale, Tc, causal, Nkv_pad, qi.km_f32_ptr, qi.vm_kernel, bias.ptr,
+        bias.dtype, bias.stride_b, bias.stride_h, bias.stride_m, bias.stride_n);
+  };
+  if (qk_per_thread) {
+    if (v_per_channel)
+      launch(std::true_type{}, std::true_type{});
+    else
+      launch(std::true_type{}, std::false_type{});
+  } else {
+    if (v_per_channel)
+      launch(std::false_type{}, std::true_type{});
+    else
+      launch(std::false_type{}, std::false_type{});
+  }
 }
 
 template <typename kDataType, const int kHeadDim, const int kStage,

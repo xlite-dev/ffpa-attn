@@ -204,17 +204,13 @@ def _fp8_sm89_active(backend: CUDABackend, device: torch.device) -> bool:
 def _adapt_backend_for_fp8_sm89(backend: CUDABackend) -> None:
   """Clamp fp8 knobs to what the sm89 persist-D kernel supports.
 
-  The sm89 path has no 2-stage hybrid, only supports the f16 PV
-  accumulator, per-block Q/K/V quant, and no smooth-V (all pure
-  accuracy/perf knobs with sm120 counterparts), so they are forced
-  regardless of auto/explicit settings.
+  The sm89 path has no 2-stage hybrid and only supports the f16 PV
+  accumulator, so those are forced regardless of auto/explicit settings.
+  Quant methods (per_block/per_thread QK, per_block/per_channel V with
+  smooth_v) pass through since FC-14.
   """
   backend.fp8_hybrid = False
   backend.fp8_pv_acc_type = "f16"
-  backend.fp8_q_quant_method = "per_block"
-  backend.fp8_k_quant_method = "per_block"
-  backend.fp8_v_quant_method = "per_block"
-  backend.fp8_smooth_v = False
 
 
 def _apply_cuda_backend_hint(backend: CUDABackend) -> None:

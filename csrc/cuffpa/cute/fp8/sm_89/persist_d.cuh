@@ -32,10 +32,18 @@
 // concentrated scores with larger amax can still inf -- the documented
 // FA2-unnormalized-P contract, matching randn-domain safety).
 //
-// v1 scope: per-block Q/K/V quant, additive attn bias in the raw score
-// domain (gmem-direct, mode 0), q_start_row=0, no dropout/smooth_v/hybrid.
-// D % 64 == 0; kBc=128 for D <= 128 (matches the 128-col quant blocks, so
-// ks/vs index kv_tile directly) and 64 above.
+// Quant scope: per-block Q/K/V plus the Sage2-style per-thread QK (Q 64
+// scales/128-row block, K 4 scales/kBc-col block, fragment-aligned so the
+// dequant needs zero shuffles) and per-channel V (v_scale is (bh, D); P uses
+// a fixed compile-time quant scale and the epilogue dequants per D column).
+// Per-channel V with the f16 PV accumulator compresses V8 to v_r=2.25
+// (launcher) and caps P's scale so one tile's inst_buf stays in fp16 range:
+// kBc*448*2.25 <= 65504 holds for kBc=64, kBc=128 uses 224.
+//
+// v1 scope: additive attn bias in the raw score domain (gmem-direct,
+// mode 0), q_start_row=0, no dropout/hybrid. D % 64 == 0; kBc=128 for
+// D <= 128 (matches the 128-col quant blocks, so ks/vs index kv_tile
+// directly) and 64 above.
 
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
@@ -56,7 +64,8 @@
 
 namespace ffpa_fp8 {
 
-template <typename Traits, typename ElementO, int kHasAttnBias = 0>
+template <typename Traits, typename ElementO, int kHasAttnBias = 0,
+          bool kQKPerThread = false, bool kVPerChannel = false>
 __global__ void __launch_bounds__(Traits::kNumThreads, 2)
     persist_d_fwd_cute_fp8_sm89(
         typename Traits::ElementQK* __restrict__ Q,
@@ -87,6 +96,11 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 2)
   static_assert(Traits::kStagesK == Traits::kStagesV,
                 "K and V pipeline depths must match");
   constexpr int kS = Traits::kStagesK;  // K/V cp.async pipeline depth
+  // Per-channel-V P quant scale (compile-time: the epilogue dequant divides
+  // it back out). One tile's inst_buf worst case is kBc*448*v_r(2.25), so
+  // kBc=128 must narrow P to 224 to stay inside the f16 range.
+  constexpr float kPQuantScalePerCh =
+      (kBc * kE4m3Max * 2.25f <= 65504.0f) ? kE4m3Max : 224.0f;
   // Same-shape Q/K tiles (kBr == kBc) share one swizzle buffer: Q drains
   // before K[0] overwrites it. Different shapes keep a separate Q buffer
   // next to the K/V stages.
@@ -265,7 +279,28 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 2)
   const float scale_orig = scale;
   scale *= FFPA_M_LOG2E;
 
-  const float qs = q_scale[static_cast<long>(q_bh) * n_rb_q + Q_tile_id];
+  // Per-row Q dequant scales (kSRows == kORows == 2: the QK C-frag row pair
+  // and the PV C-frag rows index the same Q rows). Per-thread mode maps each
+  // row into the 128-row quant block: kBr=64 tiles straddle block halves by
+  // tile parity, group g covers the C-frag row pair {r, r+8}.
+  float qs_arr[kORows];
+  if constexpr (kQKPerThread) {
+    const int n_q128 = (Nq + 127) / 128;
+    const long q_sc_base =
+        static_cast<long>(q_bh) * (n_q128 * 64) + (Q_tile_id >> 1) * 64;
+    // Both C-frag rows of a thread share one group ({r, r+8} pair).
+    const int seg_row = (Q_tile_id & 1) * 64 + get<0>(tScS_rc(0, 0));
+    const int g = (seg_row / 16) * 8 + seg_row % 8;
+    const float qs_g = q_scale[q_sc_base + g];
+#pragma unroll
+    for (int row = 0; row < kORows; ++row)
+      qs_arr[row] = qs_g;
+  } else {
+    const float qs = q_scale[static_cast<long>(q_bh) * n_rb_q + Q_tile_id];
+#pragma unroll
+    for (int row = 0; row < kORows; ++row)
+      qs_arr[row] = qs;
+  }
 
   float row_max[kORows];
   float row_sum[kORows];
@@ -331,10 +366,19 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 2)
   // One KV tile. `masked == false` is a compile-time constant at the
   // main-loop call site, so the mask code only exists in the tail copy.
   auto process_tile = [&](int kv_tile, bool masked) {
-    // kBc == the quant block width for D <= 128; one scale per tile.
-    const float ks = k_scale[static_cast<long>(kv_bh) * n_rb_kv + kv_tile];
-    const float vs = v_scale[static_cast<long>(kv_bh) * n_rb_kv + kv_tile];
-    const float p_quant_scale = vs * kE4m3Max;
+    // K scale: per-block (1 per tile) or per-thread (4 per tile, the lane's
+    // C-frag column group lane%4 covers cols {2*(lane%4)+8n, +1}).
+    const float ks =
+        kQKPerThread ? k_scale[static_cast<long>(kv_bh) * (n_rb_kv * 4) +
+                               kv_tile * 4 + (tid % 32) % 4]
+                     : k_scale[static_cast<long>(kv_bh) * n_rb_kv + kv_tile];
+    // Per-channel V: v_scale is (bh, D); vs is unused in-tile (P uses the
+    // fixed compile-time scale, the epilogue dequants per D column).
+    const float vs =
+        kVPerChannel ? 1.0f
+                     : v_scale[static_cast<long>(kv_bh) * n_rb_kv + kv_tile];
+    const float p_quant_scale =
+        kVPerChannel ? kPQuantScalePerCh : vs * kE4m3Max;
 
     // ---- QK: K-only smem loads feed the resident Q A-fragment ----
     // Steady state holds 2*kS groups in flight at the iteration head;
@@ -368,7 +412,7 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 2)
       float bias_inv[kSRows];
 #pragma unroll
       for (int row = 0; row < kSRows; ++row)
-        bias_inv[row] = 1.0f / (qs * ks * scale_orig);
+        bias_inv[row] = 1.0f / (qs_arr[row] * ks * scale_orig);
       const int bias_q_valid = min(kBr, Nq - Br_base);
       const int bias_kv_valid = min(kBc, Nkv - kv_tile * kBc);
       const bool full_tile = bias_q_valid >= kBr && bias_kv_valid >= kBc;
@@ -399,7 +443,7 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 2)
           const int q_pos = Br_base + get<0>(tScS_rc(row, 0)) + kv_offset;
 #pragma unroll
           for (int col = 0; col < kSCols; ++col) {
-            float s = scores(row, col) * qs * ks * scale;
+            float s = scores(row, col) * qs_arr[row] * ks * scale;
             if (get<1>(tScS_rc(row, col)) >= kv_valid)
               s = -INFINITY;
             if (kv_tile >= mask_start_tile) {
@@ -414,13 +458,33 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 2)
     }
 
     // Fixed P quant scale: per-block V folds vs into P (P8 = P*vs*448),
-    // so vs cancels in the PV MMA and RO lives in one fixed domain.
-    // kMaxScaleAfter holds only for the int8-QK + f16-inst combo.
-    online_softmax_fp8_fixed<true, decltype(scores), decltype(tScS_rc), kORows,
-                             Traits::kQKInt8>(
-        scores, tScS_rc, tile_needs_mask ? 1.0f : qs * ks * scale, row_max,
-        row_sum, row_scale, log2f(p_quant_scale), 1.0f / p_quant_scale,
-        Traits::kRescaleThreshold);
+    // so vs cancels in the PV MMA and RO lives in one fixed domain; the
+    // per-channel path keeps the compile-time kPQuantScalePerCh domain and
+    // dequants per D column in the epilogue. kMaxScaleAfter holds only for
+    // the int8-QK + f16-inst combo. Per-thread QK pre-dequants the scores
+    // per row (each row's qs differs), so softmax sees plain 'scale'.
+    if constexpr (kQKPerThread) {
+      if (!tile_needs_mask) {
+#pragma unroll
+        for (int row = 0; row < kSRows; ++row) {
+          const float sd = qs_arr[row] * ks;
+#pragma unroll
+          for (int col = 0; col < kSCols; ++col)
+            scores(row, col) *= sd;
+        }
+      }
+      online_softmax_fp8_fixed<true, decltype(scores), decltype(tScS_rc),
+                               kORows, Traits::kQKInt8>(
+          scores, tScS_rc, tile_needs_mask ? 1.0f : scale, row_max, row_sum,
+          row_scale, log2f(p_quant_scale), 1.0f / p_quant_scale,
+          Traits::kRescaleThreshold);
+    } else {
+      online_softmax_fp8_fixed<true, decltype(scores), decltype(tScS_rc),
+                               kORows, Traits::kQKInt8>(
+          scores, tScS_rc, tile_needs_mask ? 1.0f : qs_arr[0] * ks * scale,
+          row_max, row_sum, row_scale, log2f(p_quant_scale),
+          1.0f / p_quant_scale, Traits::kRescaleThreshold);
+    }
 
     // f32 score storage -> packed e4m3 PV A operand (perm pack binds the
     // kVTPerm V^T from the quantize pre-kernel).
@@ -500,13 +564,37 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 2)
     auto tOHalf = ffpa_cute::convert_type<ElementO>(OFrag16{});
     auto tOH_rc = make_tensor(
         tOHalf.data(), ffpa_cute::convert_layout_acc_rowcol(tOHalf.layout()));
+    // Per-channel V: dequant per D column in the epilogue (P8 domain is the
+    // compile-time kPQuantScalePerCh; MMA emits (pqs/vs_d)*O_unnorm).
+    // smooth_v: V8 = (V - mean_d)/vs_d, so the mean adds back per column.
+    float vs_d_col[kVPerChannel ? kOCols : 1];
+    float vm_d_col[kVPerChannel ? kOCols : 1];
+    const float* vm_base = nullptr;
+    if constexpr (kVPerChannel) {
+      auto tOcO_rc = make_tensor(
+          tOcO.data(), ffpa_cute::convert_layout_acc_rowcol(tOcO.layout()));
+      const float* vs_d_base = v_scale + static_cast<long>(kv_bh) * kHeadDim;
+      vm_base = vm ? (vm + static_cast<long>(kv_bh) * kHeadDim) : nullptr;
+#pragma unroll
+      for (int col = 0; col < kOCols; ++col) {
+        const int d_idx = get<1>(tOcO_rc(0, col));
+        vs_d_col[col] = vs_d_base[d_idx];
+        if (vm_base)
+          vm_d_col[col] = vm_base[d_idx];
+      }
+    }
 #pragma unroll
     for (int row = 0; row < kORows; ++row) {
       const float inv_sum = (row_sum[row] == 0.0f) ? 1.0f : 1.0f / row_sum[row];
-      const float mul = inv_sum * kFP8FixedPScale;
 #pragma unroll
-      for (int col = 0; col < kOCols; ++col)
-        tOH_rc(row, col) = ElementO(ro_rc(row, col) * mul);
+      for (int col = 0; col < kOCols; ++col) {
+        const float mul = kVPerChannel
+                              ? inv_sum * vs_d_col[col] / kPQuantScalePerCh
+                              : inv_sum * kFP8FixedPScale;
+        const float o = vm_base ? fmaf(ro_rc(row, col), mul, vm_d_col[col])
+                                : ro_rc(row, col) * mul;
+        tOH_rc(row, col) = ElementO(o);
+      }
     }
 
     if (Br_base + kBr <= Nq) {
@@ -526,7 +614,7 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 2)
       for (int row = 0; row < kORows; ++row) {
         float lse = (row_max[row] + log2f(row_sum[row])) * FFPA_M_LN2;
         if (smooth_lse)
-          lse += scale_orig * qs * qkm[row];
+          lse += scale_orig * qs_arr[row] * qkm[row];
         const int global_row = Br_base + get<0>(tScS_rc(row, 0));
         if (global_row < Nq)
           softmax_lse[lse_base + global_row] = lse;

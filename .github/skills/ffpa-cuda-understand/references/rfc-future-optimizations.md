@@ -85,7 +85,7 @@
 | FC-11 | native 路径 dropout 精度修复（bug，高优） | F3 | ✅ 已完成（ffpa-attn 542f774/e1fe363，根因=torch ref uint32 bug） | — |
 | FC-12 | cute sm_80 家族补齐 persist-D / split-D M4N2 | F3 | ✅ fp16 已完成（2026-09-11，76e6d99，随 PC-12 落地）；fp8 版随 PC-6 路线再评估 | 与 PC-12 同路线（sm_80 cp.async） |
 | FC-13 | sm_89 fp8 persist-D（cp.async 非-WS，Ada 量化路线复活） | F3 | ✅ 已完成（2026-09-11，v1 scope：per_block Q/K/V + int8 QK + f16 PV acc；PRO5000 force-sm89 与 sm120 同配置 bitwise）；几何/性能后续由 PC-17 迭代（已统一 kBr=64/128T/2CTA，见 PC-17）；split-D/M4N2 sm89 待 Phase 2/3（功能正确即可） | PC-12 装载协议 + sm120 fp8 计算层；PC-6 前置 |
-| FC-14 | sm_89 fp8 per-thread QK + per-channel V（量化 knob 对齐 sm120/Sage2） | F2 | ⬜ 待开始（2026-09-20 登记，设计稿就绪） | FC-13 ✅；与 PC-17 结构正交 |
+| FC-14 | sm_89 fp8 per-thread QK + per-channel V（量化 knob 对齐 sm120/Sage2） | F2 | ✅ 已完成（2026-09-20 同日落地：kernel `kQKPerThread/kVPerChannel` 模板 + launcher 4 组合 + Python adapt 放开；18/18 parity、零 spill、max_abs -36%、CLI 全 task；**bitwise 契约修正**见完成清单） | FC-13 ✅；与 PC-17 结构正交 |
 | PC-0 | attn mask 场景性能优化（bias tile IO 重构） | P | ✅ 主体完成（P 轨三子项 PC-0-0/0-1/0-2 落地；PC-0-3 证伪关闭=结构极限定论；PC-0-4/0-5 P3 搁置） | FC-4 注入点 |
 | PC-0-0 | ↳ cute/cute_tma 场景（fp16 cute 家族） | P | ✅ 完成（b4a811e + 7ffe765/1e4d9b6 迭代：bench CLI D=128 gap 1.12/89%、D=768 1.07/93% 双达标，原记录 0.99 系测量异常已修正；D=320 1.44/70% 结构极限未达 → **PC-0-3 专项**；2026-08-31 A0 补丁修复 mode 2/3 (b,h) 折叠缺陷 + sm_80 dense 平方 bug；2026-09-02 D=64 dense 拆段 TMA 补强：tile 超出 Q 复用区时按 Q 容量拆多段 TMA（前段 Q 区 + 尾段 extra 区，单 mbarrier expect_tx 总账），fp16 mask 1.34x vs gmem、fp32 超预算自动降级，见完成清单） | — |
 | PC-0-1 | ↳ fp8/fp4 场景（量化六族，原 PC-0 主体） | P | ✅ 完成（17ac22f A0 → 16eaea7/39c63ea/f42b12a/f12406f/b194bec/c2fc67d B1-B6 → 7d5ca4c C 阶段：mode 3 全驻留为主力，fp8 D=128 1.85x、fp4 D=320 1.67x、D=768 1.04x；fp8 split_d D≥512 demote mode 0 → **PC-0-4 专项**；先在 race → **PC-0-5**，见完成清单） | FC-4 注入点；PC-0-0 热身 |
@@ -145,7 +145,11 @@
   - 验证：PRO5000 force-sm89 N=512/2048 dense+causal 与 sm120 同配置 **bitwise 一致**（max_abs=0.0）；vs SDPA rel_err ~4%（fp8 固有，与 sm120 一致）；bench per_block preset self 1.137ms vs Sage 0.968ms = **85%**（sm120 同配置 0.964ms）。
   - 关键 bug（调试二分定位）：V^T 装载 gmem 偏移曾误写 `kv_bh*kHeadDim`（漏 `*Nkv_pad`），h=0 偏移 0 恰好对、h≥1 错读——VT 布局 `[B*Nh_kv*kHeadDim, Nkv_pad]` 行主序，偏移应为 `kv_bh*kHeadDim*Nkv_pad`。
   - 待办：Phase 2 split-D M8N1 sm89、Phase 3 m4n2 sm89（功能正确即可，低优先）；sm89 前处理链（smooth_k/quantize）仍用 sm120 kernel 的 stride-generic 路径（已可用）；per-thread QK / per-channel V（+smooth_v）见 **FC-14**。
-- [ ] FC-14：sm_89 fp8 persist-D per-thread QK + per-channel V —— 对齐 Sage2 默认量化配方（精度主杠杆 = V per-channel，V 是最大单项误差源 0.19）；前处理链零改动（sm120 quantize kernel 复用，qk_per_thread/v_per_channel 是 prepare_fp8_inputs 运行时参数非模板参数），工作全在 kernel 侧 fixed p_scale 数学推广（qs/ks per-row/colblk 化 + vs 向量化 epilogue 反量化）；核心风险 = REG:255 下 qs/ks 数组形态 spill 教训（必须 fragment 坐标即时标量读）
+- [x] FC-14：sm_89 fp8 persist-D per-thread QK + per-channel V —— 对齐 Sage2 默认量化配方（精度主杠杆 = V per-channel，V 是最大单项误差源 0.19）；前处理链零改动（sm120 quantize kernel 复用，qk_per_thread/v_per_channel 是 prepare_fp8_inputs 运行时参数非模板参数），工作全在 kernel 侧 fixed p_scale 数学推广（qs/ks per-row/colblk 化 + vs 向量化 epilogue 反量化）；核心风险 = REG:255 下 qs/ks 数组形态 spill 教训（必须 fragment 坐标即时标量读）
+  - 落地（2026-09-20 同日）：`persist_d.cuh` 模板尾参 `kQKPerThread/kVPerChannel`（4 组合单 launch 点实例化）——per-thread QK 复刻 sm120 数学：`qs_arr[kORows]` 循环前一次读（kBr=64 tile 按 `(Q_tile_id&1)*64+row` 映射进 128 行 quant block，g=(seg_row/16)*8+seg_row%8，两 C-frag 行同组单 load 广播）+ `ks = k_scale[kv_bh*(n_rb_kv*4)+kv_tile*4+(tid%32)%4]`（lane%4 列组零 shuffle）+ pre-dequant（scores*=qs_arr[row]*ks 后 softmax scale 不带 s_dequant）；per-channel V：`kPQuantScalePerCh` 编译期 448/224（kBc·448·2.25≤65504 域界）+ epilogue `vs_d_col/vm_d_col[kOCols]` 按 PV C-frag D 坐标读 + `mul=inv_sum*vs_d/pqs` + smooth_v fmaf 加回；launcher TORCH_CHECK 放开 + `v_r=2.25` 派生；`_adapt_backend_for_fp8_sm89` 只剩 hybrid/pv_acc clamp。code review APPROVE WITH COMMENTS（6 focus 全过；🟡 注释同步 + bias×per_thread 补测已做）。
+  - 验证：**parity 19/19**（4 quant × dense/causal/cross/gqa/unaligned @8192 + bias+per_thread @4096，dump/cmp 跨进程）；**零 spill**（全实例 REG:255 STACK:0 LOCAL:0——RFC 风险项排除，kSRows=2 的 qs_arr 远小于历史事故形态）；KVCFG 5 配置下默认 (64,1) 仍最优；精度 vs fp32 手写参照（B1H32N8192D128 dense）：max_abs **block 0.00895 → thread 0.00729 → channel 0.00617 → both 0.00569（-36%）**；性能 @8192 kernel 级：thread +3.1~3.6% / channel +1.0~1.2% / both +2.8~2.9%（与 sm120 同配置逐 µs 一致 = 量化配方固有成本，pre 链 353→429µs 占大头）；bench CLI `--cuda-impl fp8_sm_89` + 显式 per-thread/per-channel/smooth-v 全 5 task（含 causal）通过。
+  - **bitwise 契约修正（重要教训）**：sm89↔sm120 的 bitwise 一致是**同批编译产物属性**——dispatch TU 重编（仅注释改动）触发 sm120 persist-D TU 重链后，sm120 输出出现 1-ulp 级 f32 融合序差异并在 e4m3 舍入边界翻转（sm89 输出跨 build 逐位不变，vs fp32 精度梯度跨 build 逐位复现；差异量级 = 单个 e4m3 步：dense 8e-3、causal 早行 0.22，两 arch 各自 vs fp32 精度对齐）。**跨实现验收标准改为：各自跨进程 bitwise 确定 + 相互 allclose@fp8 噪声量级 + vs fp32 精度对齐**；"与 sm120 bitwise"只在同批 .so 内成立。
+  - 遗留：D=192/224 实例的 epilogue vs_d_col 寄存器增量 spill 核验（headdim-128 构建未覆盖，随全量构建验收）；sm89 设备（major<12）默认 V quant 从 per_block 翻为 per_channel（adapt 不再 clamp + CUDABackend 默认），存量用户数值非 bitwise 不变——release note 记录。
 
 **轨道 P（性能优化）**
 
@@ -828,7 +832,7 @@ FC-1 / FC-2（同族布局基建先行，减少一次改动面）。
 
 ### FC-14：sm_89 fp8 persist-D per-thread QK + per-channel V 量化支持
 
-> 状态：⬜ 待开始（2026-09-20 登记）。设计稿级，动手前须按规范先 plan。
+> 状态：✅ 已完成（2026-09-20 登记，同日落地；详见完成清单 FC-14 条目）。
 
 #### Motivation
 
