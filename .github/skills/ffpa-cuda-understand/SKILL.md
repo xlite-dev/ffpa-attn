@@ -330,9 +330,9 @@ WS split-D 变体（`launch_cute_fwd_split_d_ws_sm120`）已被禁用：`setmaxn
 
 `enable_fp8=True`（hint `CUTE_TMA_FP8`）。**fp16/bf16 输入 → 前处理链量化 → 低精度 attention**。主路径 sm120（`prop->major >= 9` gate 内的 fp4/fp8 分支实际要求 sm120 traits；fp4 显式 check major==12，fp8 的 traits 是 sm120 家族）。
 
-**sm89（Ada）fp8 支持**（2026-09-11 落地）：sm_89 无 TMA/async proxy，只能 cp.async general proxy。fp8 家族在 sm89 GPU（arch major < 12）或 `FFPA_FP8_SM89_FORCE=1` 下分流到 `cute/fp8/sm_89/persist_d.cuh`（见 §5.1）。v1 scope：**persist-D**（D≤224）、per_block Q/K/V、int8 QK + f16 PV acc（与 sm120 默认配置一致的量化配方）；split-D/M4N2 sm89 待 Phase 2/3（功能正确即可，低优先）。
+**sm89（Ada）fp8 支持**（2026-09-11 落地）：sm_89 无 TMA/async proxy，只能 cp.async general proxy。fp8 家族在 sm89 GPU（arch major < 12）或 `FFPA_FP8_SM89_FORCE=1` 下分流到 `cute/fp8/sm_89/persist_d.cuh`（见 §5.1）。v1 scope：**persist-D**（D≤224）、per_block Q/K/V、int8 QK + f16 PV acc（与 sm120 默认配置一致的量化配方）；**per-thread QK / per-channel V（+smooth_v）规划为 FC-14**（RFC 登记 2026-09-20，设计稿就绪）；split-D/M4N2 sm89 待 Phase 2/3（功能正确即可，低优先）。
 
-**sm89 fp8 Sage2 复刻线**（2026-09-20，`FFPA_FP8_SM89_SAGE=1`，PC-17）：`cute/fp8/sm_89/persist_d_sage.cuh`——Sage2 两级累加器（f32 RO + per-tile f16 inst_buf absorb，f16 永不跨 tile 累计，o16 溢出域结构性消失）+ v1 几何（256T/kBc=128；literal 128T 形状 255 regs spill 304B 实测 4x 慢）+ v2 瘦身三件套（g2s 寻址外提常量步进 / per-stage s2r partition 预计算 / mask-free 主循环）。实测 e2e **-9~11% vs v1、93.7-94.6% of Sage2**；kernel 级剩 12.6% 差距全部来自 LDSM 地址的 cute 布局代数残余（SASS 直方图 MOV/IADD/LOP3/SHF +1750/128cols），下一步 s2r 寻址常量化。开关是**进程级 static**（同进程切换无效，bench 每变体一进程）。
+**sm89 fp8 性能终态**（2026-09-20，PC-17，`1119c4c`）：Sage2 复刻线的两级累加器结构（f32 RO + per-tile f16 inst_buf absorb，o16 溢出域结构性消失）已**合入主 `persist_d.cuh`**（首版独立 `persist_d_sage.cuh` + `FFPA_FP8_SM89_SAGE` 开关退役）。几何定稿 **kBr=64 + 128T + 2 CTA/SM 驻留** + KV stage 参数化（`FFPA_SM89_PERSIST_KVCFG="kBc,stages"`，默认 **(64,1)**，16KB smem——Q 共享 K stage0；stage 矩阵定论：深流水全线负，smem 应花在多 CTA 驻留而非流水深度，(128,2) 挤掉第 2 CTA 崩 +37%）。e2e med **937/3155/12179µs @ N=4096/8192/16384 = -3.3%/-0.6%/+4.0% vs Sage2**（16384 min 反超 -1.7%，残差 = kBr=64 双倍 K/V 装载流量的 L2 服务吞吐结构性上限）；与 sm120 同配置（936/3154/12173）**性能几乎一致**。多 stage 实现：3D stage 布局 + 稳态 wait<2kS-1> settle K[t]、wait<2kS-2> settle V[t]（两次 wait 间无 fence 时第二个同深度 wait 恒 no-op——曾致 V 未 settle 即被读的 race）。
 
 ### 5.1 kernel 家族与 D 覆盖
 
@@ -341,11 +341,11 @@ WS split-D 变体（`launch_cute_fwd_split_d_ws_sm120`）已被禁用：`setmaxn
 | **persist-D WS** | `D ≤ 224`（%32：32..224；kBc=128 for D≤128，64 for D>128） | 128 producer + 256 consumer，384T；`kPersistQs2rDefault`（Q s2r 常驻寄存器，K stage0 复用 Q smem） |
 | **split-D M8N1** | `224 < D < 768` | non-WS，M8N1 设计（同 fp16 split-D） |
 | **split-D M4N2** | `D ≥ 768` | atom (4,2,1)，O regs=D/4 |
-| **persist-D sm89** | `D ≤ 224` 且 %64==0（sm89 专属，`cute/fp8/sm_89/persist_d.cuh`） | 256T non-WS cp.async（sm80 装载协议）+ sm120 fp8 计算层（int8 QK MMA / fixed p_scale softmax / f8f8f16 PV inst_buf）；Q s2r 常驻 + K/V 独立 stage 池组 FIFO（wait<2S-1>/<2S-2>）；smem 预算 1B/elem Q persist + K/V stages |
+| **persist-D sm89** | `D ≤ 224` 且 %64==0（sm89 专属，`cute/fp8/sm_89/persist_d.cuh`） | 128T non-WS cp.async（sm80 装载协议）+ sm120 fp8 计算层（int8 QK MMA / fixed p_scale softmax / f8f8f16 PV inst_buf 两级累加：per-tile f16 inst_buf + f32 RO absorb）；**2 CTA/SM 驻留**（kBr=64，`__launch_bounds__(128, 2)`）+ K/V stage 参数化（kBc∈{64,128} × S∈{1,2,3}，默认 64/1）；Q s2r 常驻 + K/V 独立 stage 池组 FIFO（wait<2S-1>/<2S-2>） |
 
-> **sm89 vs sm120 关键差异**：sm89 无 TMA/mbarrier/WS，PV 用 SM89 专用 f16-acc atom（traits 的 SM120 atom 是 Blackwell 专属）；V^T 装载沿用 sm80 64 列段（D%64==0 gate）。v1 scope 严格：per_block Q/K/V、f16 PV acc、`q_start_row==0`、`!smooth_v`、`!dropout`、NHD-O 拒（`TORCH_CHECK` 响亮报错）。已验证：PRO5000 force-sm89 下 N=512/2048 dense+causal 与 sm120 同配置 **bitwise 一致**；per_block preset self 1.137ms vs Sage 0.968ms（85%）。
+> **sm89 vs sm120 关键差异**：sm89 无 TMA/mbarrier/WS，PV 用 SM89 专用 f16-acc atom（traits 的 SM120 atom 是 Blackwell 专属）；V^T 装载沿用 sm80 64 列段（D%64==0 gate）。v1 scope 严格：per_block Q/K/V、f16 PV acc、`q_start_row==0`、`!smooth_v`、`!dropout`、NHD-O 拒（`TORCH_CHECK` 响亮报错）——**per_thread QK / per_channel V / smooth_v 见 FC-14（RFC 登记，待实施）**。已验证：PRO5000 force-sm89 下 N=512/2048 dense+causal 与 sm120 同配置 **bitwise 一致**；性能见上方 PC-17 终态段（vs Sage2 -3.3%/-0.6%/+4.0% med，与 sm120 同配置持平）。
 >
-> **sm89 fp8 性能现状与未来方向（2026-09-14 收敛，详见 RFC PC-16 + memory `ffpa-fp8-sm89-persistd`）**：主 kernel 定稿 **909.4µs vs SageAttention-2 710µs = 86.6%**（PRO 5000，B1 H32 N4096 D128，int8 QK + f16 PV acc；前处理已优于 Sage，差距全在主 kernel）。NCU 定型 = **依赖链/发射受限**（`math_pipe_throttle` 1.32 ≫ `wait` 0.82、`long_scoreboard` 0.04），故**深流水（S=3/slot-0 Q 复用）、指令瘦身、kBc=64 缩 tile 三类微优化全部零收益或负收益**（附录 A #22-#23）；**唯一实测有效方向 = 2 CTA/SM 拆链**（kBr=64+kBc=64+128T 实测 864µs -5%，ncu 确认 2 blocks/SM、tensor pipe 49%→59.5%），但其前提 f16 持久 O 有溢出域（`Σ_j exp2(s_j−m)·|V_j[d]| > 146.4` → ±inf，长平坦注意力），未落地。**几何红线**：P→A 的 `PackC8bitToA8bitPermVT` 要求 16 字节组同属一个 m-tile，故 **MMA_M≥2 的几何一律不可行**（kBr=128/128T 实测 parity 1.2524e+00；判据 = fragment `MMA_M_stride`，<16 即组跨 m-tile）。未来路线：2×64 行 sub-tile 共用 K/V smem（每 sub-tile 保持 MMA_M=1）/ 治理 f16 O 溢出域 / 换 m16n16k32 atom。
+> **sm89 fp8 性能路线（2026-09-20 闭环，详见 RFC PC-16/PC-17 + memory `ffpa-fp8-sm89-persistd`）**：2026-09-14 定型为依赖链/发射受限（`math_pipe_throttle` 1.32 主导），微优化（深流水/指令瘦身/缩 tile）全证伪；**唯一有效方向 = 2 CTA/SM 拆链**（PC-16 预言）已由 PC-17 承接落地——f16 持久 O 溢出域被两级累加器结构性消解，kBr=64/128T/2CTA + kBc=64/S=1 默认（16KB smem）。16384 残差 = kBr=64 装载流量 (Nq/64)×Nkv×D×2B 的 L2 服务吞吐上限（hit 99.3%），cluster/DSMEM 可破但会破坏 sm89 定位，不做。**几何红线**（仍有效）：P→A 的 `PackC8bitToA8bitPermVT` 要求 16 字节组同属一个 m-tile，故 MMA_M≥2 的几何一律不可行（kBr=128/128T 实测 parity 1.2524e+00；判据 = fragment `MMA_M_stride`，<16 即组跨 m-tile）。
 
 D 交叉点与 fp16 家族一致（<768 M8N1 / ≥768 M4N2）。`FFPA_FP8_FORCE_KERNEL=split_d|m4n2` env 可强制 A/B（仅 224<D≤1024）。
 
@@ -369,8 +369,8 @@ D 交叉点与 fp16 家族一致（<768 M8N1 / ≥768 M4N2）。`FFPA_FP8_FORCE_
 
 | knob | 取值 | 支持范围 |
 |---|---|---|
-| `fp8_q/k_quant_method` | `per_block` / `per_thread`（Q/K 必须同配置） | 全部三族 ✓ |
-| `fp8_v_quant_method` | `per_block` / `per_channel` | 全部三族 ✓（per-channel stats/quantize 均 D_og 感知） |
+| `fp8_q/k_quant_method` | `per_block` / `per_thread`（Q/K 必须同配置） | sm120 三族 ✓；sm89 persist-D 现仅 `per_block`，`per_thread` 见 FC-14 |
+| `fp8_v_quant_method` | `per_block` / `per_channel` | sm120 三族 ✓（per-channel stats/quantize 均 D_og 感知）；sm89 persist-D 现仅 `per_block`，`per_channel`（含 smooth_v）见 FC-14 |
 | `fp8_pv_acc_type` | `f32` / `f16` | 全部三族 ✓ |
 | `fp8_qk_mm_type` | `fp8`(e4m3) / `int8` | 全部三族 ✓ |
 | `fp8_smooth_k` | bool（默认 True） | K 减 per-(b,h) 序列均值，对 O 数学无损（softmax 平移不变），仅 lse 需 kernel 内修正 |
