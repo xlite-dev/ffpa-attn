@@ -13,6 +13,8 @@
 #include "cute/fp8/smooth_k.cuh"
 #include "cute/hadamard.cuh"
 #include "cute/fp8/sm_89/persist_d.cuh"
+#include "cute/fp8/sm_89/persist_d_dual.cuh"
+#include "cute/fp8/sm_89/persist_d_sage.cuh"
 
 namespace ffpa {
 
@@ -115,6 +117,77 @@ void launch_cute_fwd_persist_d_fp8_sm89(
           Q, K, V, Lq, Lkv, Lv, Nb, Nh, Nh_kv, Nq, Nkv, n_rb_q, n_rb_kv,
           Nkv_pad, D_og, fp8_smooth_k, qk_per_thread, v_per_channel,
           v_smooth_mean, v_r, reorg_free, stream);
+
+  // Dual sub-tile geometry: 128T/CTA processing 128 Q rows as two shared-K/V
+  // 64-row sub-tiles (2 CTAs/SM, fills the dependency stalls measured on the
+  // single-tile kernel). Quantization still uses the 128-row blocks above,
+  // so ks/vs index kv_tile/2 inside the kernel. int8 QK + D=128 + no bias
+  // only; FFPA_FP8_SM89_DUAL=0 forces the single-tile kernel.
+  constexpr bool kDualEligible =
+      (kHeadDim == 128 && kHasAttnBias == 0 && kQKInt8);
+  if constexpr (kDualEligible) {
+    static const bool sage_on = [] {
+      const char* e = std::getenv("FFPA_FP8_SM89_SAGE");
+      return e != nullptr && e[0] == '1';
+    }();
+    if (sage_on) {
+      // Sage2-replica accumulator: v1 geometry (256T, kBc=128) with the
+      // f32-RO + per-tile f16 inst_buf two-level accumulator and the
+      // dual-kernel loop-body discipline (hoisted chunk addressing,
+      // per-stage partitions, mask-free main loop).
+      using SageTraits =
+          ffpa_cute::FFPAAttnCuTePersistDFP8Traits<128, ElementO, 128, 128, 2,
+                                                   2, true>;
+      constexpr int kSageSmem = 128 * 128 + 2 * (128 * 128) + 2 * (128 * 128);
+      auto sage_kernel =
+          ffpa_fp8::persist_d_fwd_cute_fp8_sm89_sage<SageTraits, ElementO>;
+      cudaFuncSetAttribute(
+          sage_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSageSmem);
+      const dim3 sage_grid(utils::div_ceil(Nq, 128), Nb * Nh, 1);
+      sage_kernel<<<sage_grid, dim3(256), kSageSmem, stream>>>(
+          reinterpret_cast<typename SageTraits::ElementQK*>(qi.q8.data_ptr()),
+          reinterpret_cast<typename SageTraits::ElementQK*>(qi.k8.data_ptr()),
+          reinterpret_cast<typename SageTraits::Element*>(qi.vt8.data_ptr()),
+          reinterpret_cast<ElementO*>(O.data_ptr()),
+          softmax_lse.numel() > 0 ? softmax_lse.data_ptr<float>() : nullptr,
+          qi.q_scale.data_ptr<float>(), qi.k_scale.data_ptr<float>(),
+          qi.v_scale.data_ptr<float>(), Nq, Nkv, Nh, Nh_kv, n_rb_q, n_rb_kv,
+          scale, Tc, causal, Nkv_pad, qi.km_f32_ptr, qi.vm_kernel);
+      return;
+    }
+    static const bool dual_off = [] {
+      const char* e = std::getenv("FFPA_FP8_SM89_DUAL");
+      return e != nullptr && e[0] == '0';
+    }();
+    static const bool obound_on = [] {
+      const char* e = std::getenv("FFPA_FP8_SM89_OBOUND");
+      return e == nullptr || e[0] != '0';
+    }();
+    if (!dual_off) {
+      using DualTraits =
+          ffpa_cute::FFPAAttnCuTePersistDFP8Traits<128, ElementO, 64, 64, 2, 2,
+                                                   true>;
+      constexpr int kDualSmem =
+          128 * 128 + 2 * (64 * 128) + 2 * (128 * 64) + 64;  // +8-float reduce
+      const int Tc64 = utils::div_ceil(Nkv, 64);
+      auto dual_kernel =
+          ffpa_fp8::persist_d_fwd_cute_fp8_sm89_dual<DualTraits, ElementO>;
+      cudaFuncSetAttribute(
+          dual_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kDualSmem);
+      const dim3 dual_grid(utils::div_ceil(Nq, 128), Nb * Nh, 1);
+      dual_kernel<<<dual_grid, dim3(128), kDualSmem, stream>>>(
+          reinterpret_cast<typename DualTraits::ElementQK*>(qi.q8.data_ptr()),
+          reinterpret_cast<typename DualTraits::ElementQK*>(qi.k8.data_ptr()),
+          reinterpret_cast<typename DualTraits::Element*>(qi.vt8.data_ptr()),
+          reinterpret_cast<ElementO*>(O.data_ptr()),
+          softmax_lse.numel() > 0 ? softmax_lse.data_ptr<float>() : nullptr,
+          qi.q_scale.data_ptr<float>(), qi.k_scale.data_ptr<float>(),
+          qi.v_scale.data_ptr<float>(), Nq, Nkv, Nh, Nh_kv, n_rb_q, n_rb_kv,
+          scale, Tc64, causal, Nkv_pad, obound_on ? 1 : 0, qi.km_f32_ptr,
+          qi.vm_kernel);
+      return;
+    }
+  }
 
   int max_smem_optin = 0;
   cudaDeviceGetAttribute(

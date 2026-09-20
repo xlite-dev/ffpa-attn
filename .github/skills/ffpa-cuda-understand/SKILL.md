@@ -332,6 +332,8 @@ WS split-D 变体（`launch_cute_fwd_split_d_ws_sm120`）已被禁用：`setmaxn
 
 **sm89（Ada）fp8 支持**（2026-09-11 落地）：sm_89 无 TMA/async proxy，只能 cp.async general proxy。fp8 家族在 sm89 GPU（arch major < 12）或 `FFPA_FP8_SM89_FORCE=1` 下分流到 `cute/fp8/sm_89/persist_d.cuh`（见 §5.1）。v1 scope：**persist-D**（D≤224）、per_block Q/K/V、int8 QK + f16 PV acc（与 sm120 默认配置一致的量化配方）；split-D/M4N2 sm89 待 Phase 2/3（功能正确即可，低优先）。
 
+**sm89 fp8 Sage2 复刻线**（2026-09-20，`FFPA_FP8_SM89_SAGE=1`，PC-17）：`cute/fp8/sm_89/persist_d_sage.cuh`——Sage2 两级累加器（f32 RO + per-tile f16 inst_buf absorb，f16 永不跨 tile 累计，o16 溢出域结构性消失）+ v1 几何（256T/kBc=128；literal 128T 形状 255 regs spill 304B 实测 4x 慢）+ v2 瘦身三件套（g2s 寻址外提常量步进 / per-stage s2r partition 预计算 / mask-free 主循环）。实测 e2e **-9~11% vs v1、93.7-94.6% of Sage2**；kernel 级剩 12.6% 差距全部来自 LDSM 地址的 cute 布局代数残余（SASS 直方图 MOV/IADD/LOP3/SHF +1750/128cols），下一步 s2r 寻址常量化。开关是**进程级 static**（同进程切换无效，bench 每变体一进程）。
+
 ### 5.1 kernel 家族与 D 覆盖
 
 | kernel | D 范围（kHeadDim） | 结构 |
