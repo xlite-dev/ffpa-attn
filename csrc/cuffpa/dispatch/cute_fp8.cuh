@@ -61,15 +61,20 @@ void ffpa_fwd_fp8(const FfpaFwdParams& p) {
   // D>=768: split-D M4N2 fp8. Same D<768/D>=768 cross-point as the
   // fp16 dispatch (M4N2 wins only for D>=768; below that M8N1 is
   // faster even with D/2 reg spill, same as fp16).
+  // sm89 selection (fp8_sm89 op arg / FFPA_FP8_SM89_FORCE / arch < 12)
+  // is computed family-agnostically here: reject D>224 loudly instead of
+  // silently running the sm120 split-D/M4N2 families (on real sm89
+  // hardware that path dies on a cubin load with a misleading error).
+  static const bool force_sm89 =
+      (std::getenv("FFPA_FP8_SM89_FORCE") != nullptr);
+  const bool on_sm89 = p.fp8_sm89 || force_sm89 ||
+                       (at::cuda::getCurrentDeviceProperties()->major < 12);
+  TORCH_CHECK(!on_sm89 || kHeadDim <= 224,
+              "ffpa_attn: fp8 sm89 path supports D<=224 only");
   if constexpr (kHeadDim <= 224) {
-    // sm89 cp.async path: FFPA_FP8_SM89_FORCE=1 or arch < 120. v1 scope:
-    // no hybrid / q_start_row, per-block Q/K/V quant, no dropout
-    // (checked inside the launcher). kQKInt8 is a template tag here; the
-    // e4m3 QK atom is picked by Traits from the same flag.
-    static const bool force_sm89 =
-        (std::getenv("FFPA_FP8_SM89_FORCE") != nullptr);
-    const bool on_sm89 =
-        force_sm89 || (at::cuda::getCurrentDeviceProperties()->major < 12);
+    // v1 scope: no hybrid / q_start_row, per-block Q/K/V quant, no
+    // dropout (checked inside the launcher). kQKInt8 is a template tag
+    // here; the e4m3 QK atom is picked by Traits from the same flag.
     if (on_sm89) {
       TORCH_CHECK(!p.fp8_hybrid, "ffpa_attn: fp8 sm89 v1 has no hybrid");
       TORCH_CHECK(p.fp8_qk_mm_type == 0 || p.fp8_qk_mm_type == 1,

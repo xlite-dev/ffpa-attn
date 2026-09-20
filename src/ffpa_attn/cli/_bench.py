@@ -366,6 +366,7 @@ def _parse_args() -> argparse.Namespace:
       "fp8_smkv",
       "cute_tma_fp8_smkv_qk_int8",
       "fp8_smkv_qk_i8",
+      "fp8_sm_89",
       "cute_tma_fp4",
       "fp4",
     ],
@@ -379,7 +380,10 @@ def _parse_args() -> argparse.Namespace:
     "int8 QK MMA; 'cute_tma_fp8_smv' (alias 'fp8_smv') enables smooth-V "
     "(per-channel V + dim-mean subtraction, smooth-K off); "
     "'cute_tma_fp8_smkv' (alias 'fp8_smkv') enables smooth-K + smooth-V; "
-    "'cute_tma_fp8_smkv_qk_int8' (alias 'fp8_smkv_qk_i8') adds int8 QK MMA. "
+    "'cute_tma_fp8_smkv_qk_int8' (alias 'fp8_smkv_qk_i8') adds int8 QK MMA; "
+    "'fp8_sm_89' forces the sm_89 cp.async persist-D FP8 kernel (int8 QK + "
+    "f16 PV acc + smooth-K defaults; per-call backend flag, also "
+    "auto-selected on any major<12 device). "
     "'cute_tma_fp4' (alias 'fp4') selects the NVFP4 path (any D%%8==0 in "
     "[8,256], padded up to {64,128,192,256}; e2m1 + ue4m3 block scales). "
     "Mutually exclusive with --fwd-tma/--cute when not 'auto'.",
@@ -607,6 +611,7 @@ def _resolve_directional_cli_flags(
         "fp8_smkv",
         "cute_tma_fp8_smkv_qk_int8",
         "fp8_smkv_qk_i8",
+        "fp8_sm_89",
         "cute_tma_fp4",
         "fp4",
       }
@@ -615,6 +620,7 @@ def _resolve_directional_cli_flags(
         "fp8_smk_qk_i8",
         "cute_tma_fp8_smkv_qk_int8",
         "fp8_smkv_qk_i8",
+        "fp8_sm_89",
       }
       # smooth_v implies per-channel V quant; smooth_v-only (smv) keeps
       # smooth_k off, smkv turns both on.
@@ -650,6 +656,14 @@ def _resolve_directional_cli_flags(
         args.qk_mm_type = (
           "int8" if args.cuda_impl in _FP8_QK_INT8_IMPLS else "fp8"
         )
+        if args.cuda_impl == "fp8_sm_89":
+          # Force the sm_89 cp.async persist-D kernel via the backend flag
+          # (per-call, no process-wide env latch). The backend adapter
+          # additionally disables hybrid (unsupported on sm_89) and defaults
+          # the f16-only PV accumulator; an explicit --fp8-pv-acc-type
+          # still overrides below (and is then re-clamped to f16).
+          args.force_fp8_sm89 = True
+          args.pv_acc_type = "f16"
       else:
         args.enable_fwd_tma, args.enable_fwd_cute = _CUDA_IMPL_MAP[
           args.cuda_impl]
@@ -1852,6 +1866,7 @@ def _benchmark_rows(
         fp4_pv_mm_type=args.fp4_pv_mm_type,
         fp4_hadamard=args.fp4_hadamard,
         fp4_smooth_v=args.fp4_smooth_v,
+        force_fp8_sm89=getattr(args, "force_fp8_sm89", False),
       ),
     )
   if args.backward:

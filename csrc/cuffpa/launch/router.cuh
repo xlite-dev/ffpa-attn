@@ -34,7 +34,8 @@ void launch_ffpa_attn_fwd_template(
     bool fp8_hybrid = false, int64_t fp8_hybrid_n_early = 256,
     bool fp4_hybrid = false, int64_t fp4_hybrid_n_early = 256,
     bool fp8_hadamard = false, bool fp4_hadamard = false,
-    int64_t fp4_pv_mm_type = 0, bool fp4_smooth_v = false) {
+    int64_t fp4_pv_mm_type = 0, bool fp4_smooth_v = false,
+    bool fp8_sm89 = false) {
   // Q,K,V,O with [B, H, N, D] layout, B=batch, H=head, N=seqlen, D=dim
   // TODO: support BNHD layout, Q,K,V,O with [B, N, H, D] layout.
   // Native block-tile config (MMA atoms, Br/Bc, stages, smem/pad flags) and
@@ -232,6 +233,7 @@ void launch_ffpa_attn_fwd_template(
   p.fp4_hadamard = fp4_hadamard;
   p.fp4_pv_mm_type = fp4_pv_mm_type;
   p.fp4_smooth_v = fp4_smooth_v;
+  p.fp8_sm89 = fp8_sm89;
   p.Nb = Nb;
   p.Nh = Nh;
   p.Nh_kv = Nh_kv;

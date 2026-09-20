@@ -43,6 +43,8 @@ struct FfpaFwdParams {
   bool fp4_hadamard = false;
   int64_t fp4_pv_mm_type = 0;
   bool fp4_smooth_v = false;
+  bool fp8_sm89 = false;  // Force the fp8 sm89 persist-D kernel (also auto
+                          // on any major < 12 device; see cute_fp8.cuh).
   int64_t Nb = 0;
   int64_t Nh = 0;
   int64_t Nh_kv = 0;

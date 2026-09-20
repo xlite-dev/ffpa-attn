@@ -81,17 +81,19 @@ def fp8_backend(
   hybrid: bool = False,
   nhd: bool = False,
   stages: int = None,
+  sm89: bool = False,
 ) -> CUDABackend:
   layout = "NHD" if nhd else "HND"
   if preset == "perblock":
     # sm89 cp.async path scope (v1): per_block Q/K/V quant, no per_thread /
-    # per_channel / smooth_v / hybrid. Bench under FFPA_FP8_SM89_FORCE=1 to
-    # steer the fp8 dispatch onto the sm89 persist-D kernel.
+    # per_channel / smooth_v / hybrid. Select via --ffpa-fp8-impl
+    # cute_sm_89 (per-call backend force; also auto on major<12 devices).
     return CUDABackend(
       backward=False,
       enable_tma=True,
       enable_cute=True,
       enable_fp8=True,
+      force_fp8_sm89=sm89,
       fp8_qk_mm_type="int8",
       fp8_pv_acc_type="f16",
       fp8_q_quant_method="per_block",
@@ -108,6 +110,7 @@ def fp8_backend(
     enable_tma=True,
     enable_cute=True,
     enable_fp8=True,
+    force_fp8_sm89=sm89,
     fp8_qk_mm_type="int8",
     fp8_pv_acc_type="f16",
     fp8_q_quant_method="per_thread",
@@ -206,7 +209,8 @@ def run_ffpa(
   preset="default",
   hybrid=False,
   with_permute=False,
-  stages=None
+  stages=None,
+  sm89=False
 ):
   if with_permute:
     # cache-dit E2E path: inputs are diffusers NHD [B,N,H,D] storage; the
@@ -222,7 +226,9 @@ def run_ffpa(
         v,
         is_causal=causal,
         enable_gqa=gqa,
-        forward_backend=fp8_backend(preset, hybrid, nhd=True, stages=stages),
+        forward_backend=fp8_backend(
+          preset, hybrid, nhd=True, stages=stages, sm89=sm89
+        ),
       ).permute(0, 2, 1, 3)
   return ffpa_attn_func(
     q,
@@ -230,7 +236,7 @@ def run_ffpa(
     v,
     is_causal=causal,
     enable_gqa=gqa,
-    forward_backend=fp8_backend(preset, hybrid, stages=stages)
+    forward_backend=fp8_backend(preset, hybrid, stages=stages, sm89=sm89)
   )
 
 
@@ -314,7 +320,8 @@ def run_scenario(
   preset="default",
   hybrid=False,
   with_permute=False,
-  stages=None
+  stages=None,
+  sm89=False
 ):
   q, k, v = _mk(sc.B, sc.Hq, sc.Hkv, sc.Nq, sc.Nkv, sc.D, dtype, scale)
   ref = ref_bf16(q, k, v, sc.causal, sc.gqa, sdpa_name).to(dtype)
@@ -332,8 +339,11 @@ def run_scenario(
 
   outs = {
     "FFPA-FP8":
-    run_ffpa(q, k, v, sc.causal, sc.gqa, preset, hybrid, with_permute),
-    sdpa_label: run_sdpa(sq, sk, sv, sc.causal, sc.gqa, sdpa_name),
+    run_ffpa(
+      q, k, v, sc.causal, sc.gqa, preset, hybrid, with_permute, sm89=sm89
+    ),
+    sdpa_label:
+    run_sdpa(sq, sk, sv, sc.causal, sc.gqa, sdpa_name),
   }
   if use_sage:
     sage_out = run_sage(q, k, v, sc.causal, sc.gqa, with_permute)
@@ -349,7 +359,16 @@ def run_scenario(
   fns = {
     "FFPA-FP8":
     lambda: run_ffpa(
-      q, k, v, sc.causal, sc.gqa, preset, hybrid, with_permute, stages=stages
+      q,
+      k,
+      v,
+      sc.causal,
+      sc.gqa,
+      preset,
+      hybrid,
+      with_permute,
+      stages=stages,
+      sm89=sm89,
     ),
   }
   if use_sage and SAGE_INSTALLED:
@@ -600,6 +619,16 @@ def parse_args():
     "Sage has no equivalent, so hybrid on would bias the comparison.",
   )
   p.add_argument(
+    "--ffpa-fp8-impl",
+    type=str,
+    default="cute_tma",
+    choices=["cute_tma", "cute_sm_89"],
+    help="FFPA fp8 kernel: cute_tma (default, sm120 TMA persist-D) or "
+    "cute_sm_89 (force the sm89 cp.async persist-D kernel via the per-call "
+    "backend flag; also auto-selected on major<12 devices. The sm89 scope "
+    "auto-clamps per_thread/per_channel quant, hybrid and smooth_v).",
+  )
+  p.add_argument(
     "--preset",
     type=str,
     default="default",
@@ -655,13 +684,20 @@ def main():
   dtype = torch.float16 if args.dtype == "fp16" else torch.bfloat16
   use_sage = (not args.no_sage) and SAGE_INSTALLED
   Ns = [int(x) for x in args.N.split(",")]
+  sm89 = args.ffpa_fp8_impl == "cute_sm_89"
+  if sm89 and args.with_permute:
+    raise SystemExit(
+      "--ffpa-fp8-impl cute_sm_89 has no NHD output fast path "
+      "(BHND O only); incompatible with --with-permute."
+    )
 
   print(f"dtype={dtype}, GPU={torch.cuda.get_device_name()}")
   print(
     f"sage={'on' if use_sage else 'off'}, "
     f"SDPA={args.sdpa_backend}, B={args.B} H={args.H} Hkv={args.Hkv} "
     f"D={args.D} warmup={args.warmup} iters={args.iters} "
-    f"preset={args.preset} with_permute={args.with_permute}\n"
+    f"preset={args.preset} impl={args.ffpa_fp8_impl} "
+    f"with_permute={args.with_permute}\n"
   )
 
   rows = []
@@ -691,16 +727,18 @@ def main():
           preset=args.preset,
           hybrid=args.hybrid,
           with_permute=args.with_permute,
-          stages=args.stages
+          stages=args.stages,
+          sm89=sm89,
         )
       )
 
   device_name = torch.cuda.get_device_name()
   permute_tag = "_permute" if args.with_permute else ""
+  impl_tag = "_sm89" if sm89 else ""
   output_path = PLOT_OUTPUT_DIR / (
     f"bench_fp8_tflops_{_slugify_device_name(device_name)}"
     f"_B{args.B}_H{args.H}_Hkv{args.Hkv}_D{args.D}"
-    f"_{args.dtype}_{args.preset}{permute_tag}.png"
+    f"_{args.dtype}_{args.preset}{impl_tag}{permute_tag}.png"
   )
   saved = plot_tflops(
     rows,

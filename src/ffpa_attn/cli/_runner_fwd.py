@@ -268,6 +268,7 @@ def _make_forward_backend(
   fp4_pv_mm_type: str = "fp4",
   fp4_hadamard: bool = False,
   fp4_smooth_v: bool = False,
+  force_fp8_sm89: bool = False,
   cuda_stages: int | None = None,
 ):
   if name == "cuda":
@@ -293,6 +294,7 @@ def _make_forward_backend(
       "fp4_pv_mm_type": fp4_pv_mm_type,
       "fp4_hadamard": fp4_hadamard,
       "fp4_smooth_v": fp4_smooth_v,
+      "force_fp8_sm89": force_fp8_sm89,
     }
     if cuda_stages is not None:
       kwargs["stages"] = cuda_stages
@@ -353,6 +355,7 @@ def _run_case(
   fp4_pv_mm_type: str = "fp4",
   fp4_hadamard: bool = False,
   fp4_smooth_v: bool = False,
+  force_fp8_sm89: bool = False,
 ) -> FORWARD_RESULT:
   torch.manual_seed(seed)
   q = torch.randn(B, Nh_q, Nq, D, dtype=dtype, device="cuda")
@@ -383,6 +386,7 @@ def _run_case(
     fp4_pv_mm_type=fp4_pv_mm_type,
     fp4_hadamard=fp4_hadamard,
     fp4_smooth_v=fp4_smooth_v,
+    force_fp8_sm89=force_fp8_sm89,
     cuda_stages=stages,
   )
   backward_backend = CuTeDSLBackend(
@@ -539,6 +543,7 @@ def run_forward_examples(
   fp4_pv_mm_type: str = "fp4",
   fp4_hadamard: bool = False,
   fp4_smooth_v: bool = False,
+  force_fp8_sm89: bool = False,
 ) -> list[FORWARD_RESULT]:
   """Run the canonical forward benchmark cases.
 
@@ -751,6 +756,7 @@ def run_forward_examples(
           fp4_pv_mm_type=fp4_pv_mm_type,
           fp4_hadamard=fp4_hadamard,
           fp4_smooth_v=fp4_smooth_v,
+          force_fp8_sm89=force_fp8_sm89,
         )
       )
 
