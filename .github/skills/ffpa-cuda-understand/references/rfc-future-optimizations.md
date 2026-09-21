@@ -30,7 +30,7 @@
 | QK 精度 | **FP8 或 INT8**（`fp8_qk_mm_type`）+ per-block/per-thread 量化粒度 | NVFP4（1×16 + E4M3 SF） | INT8 per_warp/per_thread（**sm_120 仅 per_warp**——per_thread 是 triton 路径，sm120 不可用；论文 int4 QK 未开源） | NVFP4 固定 |
 | PV 精度 | FP8 E4M3，累加器 FP16/FP32 可选 | NVFP4（或 MXFP8 PV） | FP8 E4M3（acc `fp32+fp16`/`fp32+fp32`）或 FP16 PV | NVFP4 固定 |
 | smoothing / 数值 knobs | smooth_k / smooth_v / hadamard 独立开关 | smooth_v / hadamard | smooth_k 内置 + smooth_v 可选 | K 减均值 + Q per-block 均值（`per_block_mean`），无其它 knob |
-| hybrid（前缀 fp16 + 量化主体，causal 短行精度） | ✓（fp8/fp4_hybrid） | ✓ | ✗ | ✗ |
+| hybrid（前缀 fp16 + 量化主体，causal 短行精度） | ✓（fp8/fp4_hybrid；sm_89 fp8 自 FC-15，stage-1 走 sm_80 cp.async fp16 家族） | ✓ | ✗ | ✗ |
 | backward | ✗（FC-9 设计稿） | ✗ | ✗（SageBwd 论文有、未开源） | ✗ |
 | seq len 约束 | 任意（non-aligned task 覆盖 Nkv 非对齐） | 同左 | 任意 | N pad 至 128 倍数（preprocess 内） |
 
@@ -86,6 +86,7 @@
 | FC-12 | cute sm_80 家族补齐 persist-D / split-D M4N2 | F3 | ✅ fp16 已完成（2026-09-11，76e6d99，随 PC-12 落地）；fp8 版随 PC-6 路线再评估 | 与 PC-12 同路线（sm_80 cp.async） |
 | FC-13 | sm_89 fp8 persist-D（cp.async 非-WS，Ada 量化路线复活） | F3 | ✅ 已完成（2026-09-11，v1 scope：per_block Q/K/V + int8 QK + f16 PV acc；PRO5000 force-sm89 与 sm120 同配置 bitwise）；几何/性能后续由 PC-17 迭代（已统一 kBr=64/128T/2CTA，见 PC-17）；split-D/M4N2 sm89 待 Phase 2/3（功能正确即可） | PC-12 装载协议 + sm120 fp8 计算层；PC-6 前置 |
 | FC-14 | sm_89 fp8 per-thread QK + per-channel V（量化 knob 对齐 sm120/Sage2） | F2 | ✅ 已完成（2026-09-20 同日落地：kernel `kQKPerThread/kVPerChannel` 模板 + launcher 4 组合 + Python adapt 放开；18/18 parity、零 spill、max_abs -36%、CLI 全 task；**bitwise 契约修正**见完成清单） | FC-13 ✅；与 PC-17 结构正交 |
+| FC-15 | sm_89 fp8 hybrid（fp16 早行 + fp8 晚行，causal 短行精度） | F2 | ✅ 已完成（2026-09-21 落地：kernel `q_start_row` 全行坐标 re-base + launcher grid/guard + dispatch 镜像 sm120 分支；early 行精度=fp16 noise floor、CLI causal/attn-mask 复活、e2e 8k 零开销/16k +1.3%） | FC-13/14 ✅；PC-13 融合 kernel 的 sm89 侧前置 |
 | PC-0 | attn mask 场景性能优化（bias tile IO 重构） | P | ✅ 主体完成（P 轨三子项 PC-0-0/0-1/0-2 落地；PC-0-3 证伪关闭=结构极限定论；PC-0-4/0-5 P3 搁置） | FC-4 注入点 |
 | PC-0-0 | ↳ cute/cute_tma 场景（fp16 cute 家族） | P | ✅ 完成（b4a811e + 7ffe765/1e4d9b6 迭代：bench CLI D=128 gap 1.12/89%、D=768 1.07/93% 双达标，原记录 0.99 系测量异常已修正；D=320 1.44/70% 结构极限未达 → **PC-0-3 专项**；2026-08-31 A0 补丁修复 mode 2/3 (b,h) 折叠缺陷 + sm_80 dense 平方 bug；2026-09-02 D=64 dense 拆段 TMA 补强：tile 超出 Q 复用区时按 Q 容量拆多段 TMA（前段 Q 区 + 尾段 extra 区，单 mbarrier expect_tx 总账），fp16 mask 1.34x vs gmem、fp32 超预算自动降级，见完成清单） | — |
 | PC-0-1 | ↳ fp8/fp4 场景（量化六族，原 PC-0 主体） | P | ✅ 完成（17ac22f A0 → 16eaea7/39c63ea/f42b12a/f12406f/b194bec/c2fc67d B1-B6 → 7d5ca4c C 阶段：mode 3 全驻留为主力，fp8 D=128 1.85x、fp4 D=320 1.67x、D=768 1.04x；fp8 split_d D≥512 demote mode 0 → **PC-0-4 专项**；先在 race → **PC-0-5**，见完成清单） | FC-4 注入点；PC-0-0 热身 |
@@ -146,6 +147,7 @@
   - 关键 bug（调试二分定位）：V^T 装载 gmem 偏移曾误写 `kv_bh*kHeadDim`（漏 `*Nkv_pad`），h=0 偏移 0 恰好对、h≥1 错读——VT 布局 `[B*Nh_kv*kHeadDim, Nkv_pad]` 行主序，偏移应为 `kv_bh*kHeadDim*Nkv_pad`。
   - 待办：Phase 2 split-D M8N1 sm89、Phase 3 m4n2 sm89（功能正确即可，低优先）；sm89 前处理链（smooth_k/quantize）仍用 sm120 kernel 的 stride-generic 路径（已可用）；per-thread QK / per-channel V（+smooth_v）见 **FC-14**。
 - [x] FC-14：sm_89 fp8 persist-D per-thread QK + per-channel V —— 对齐 Sage2 默认量化配方（精度主杠杆 = V per-channel，V 是最大单项误差源 0.19）；前处理链零改动（sm120 quantize kernel 复用，qk_per_thread/v_per_channel 是 prepare_fp8_inputs 运行时参数非模板参数），工作全在 kernel 侧 fixed p_scale 数学推广（qs/ks per-row/colblk 化 + vs 向量化 epilogue 反量化）；核心风险 = REG:255 下 qs/ks 数组形态 spill 教训（必须 fragment 坐标即时标量读）
+- [x] FC-15：sm_89 fp8 hybrid —— 复刻 sm120 的 q_start_row 模式到 sm89 persist-D（早行 fp16 + 晚行 fp8，causal 短行精度；这是 sm89 上 attn 精度的最后一块短板）。三个关键决策：① stage-1 必须调 `ffpa_fwd_cute_fp16_sm80`（cp.async 家族）而非 sm120 硬绑 TMA 的 `ffpa_fwd_fp16_stage1`——sm89 目标硬件无 TMA；跨 TU 模板弱符号链接成立（fp16 TU 显式实例化，dispatch.cuh 前置声明）。② kernel 9 处行坐标 re-base 全部镜像 sm120（early-exit/causal_thresh/Tc_eff/q_row_offset/q_tile_abs 量化索引重基准/bias 坐标/mask q_pos/epilogue O 基址/lse），n_early%128==0 保证 q_start_row/kBr 整除。③ launcher 补 `q_start_row < Nq` guard（Nq==n_early 时 loud error 而非 grid.x=0 静默失败——与 sm120 launcher 对齐）。验证：parity（FFPA_FP8_SM89_FORCE 强制路径）early 区精度=fp16 noise floor 0.0077、late 区随 n_early 单调改善、非 128 倍数 raise、4 量化组合全过、纯 fp8 回归；CLI causal 1.43x / attn-mask 3.63x（两 task 自此复活）；e2e causal 8192 零开销 / 16384 +1.3%；spill 无新增（q_start_row 是标量参数）。
   - 落地（2026-09-20 同日）：`persist_d.cuh` 模板尾参 `kQKPerThread/kVPerChannel`（4 组合单 launch 点实例化）——per-thread QK 复刻 sm120 数学：`qs_arr[kORows]` 循环前一次读（kBr=64 tile 按 `(Q_tile_id&1)*64+row` 映射进 128 行 quant block，g=(seg_row/16)*8+seg_row%8，两 C-frag 行同组单 load 广播）+ `ks = k_scale[kv_bh*(n_rb_kv*4)+kv_tile*4+(tid%32)%4]`（lane%4 列组零 shuffle）+ pre-dequant（scores*=qs_arr[row]*ks 后 softmax scale 不带 s_dequant）；per-channel V：`kPQuantScalePerCh` 编译期 448/224（kBc·448·2.25≤65504 域界）+ epilogue `vs_d_col/vm_d_col[kOCols]` 按 PV C-frag D 坐标读 + `mul=inv_sum*vs_d/pqs` + smooth_v fmaf 加回；launcher TORCH_CHECK 放开 + `v_r=2.25` 派生；`_adapt_backend_for_fp8_sm89` 只剩 hybrid/pv_acc clamp。code review APPROVE WITH COMMENTS（6 focus 全过；🟡 注释同步 + bias×per_thread 补测已做）。
   - 验证：**parity 19/19**（4 quant × dense/causal/cross/gqa/unaligned @8192 + bias+per_thread @4096，dump/cmp 跨进程）；**零 spill**（全实例 REG:255 STACK:0 LOCAL:0——RFC 风险项排除，kSRows=2 的 qs_arr 远小于历史事故形态）；KVCFG 5 配置下默认 (64,1) 仍最优；精度 vs fp32 手写参照（B1H32N8192D128 dense）：max_abs **block 0.00895 → thread 0.00729 → channel 0.00617 → both 0.00569（-36%）**；性能 @8192 kernel 级：thread +3.1~3.6% / channel +1.0~1.2% / both +2.8~2.9%（与 sm120 同配置逐 µs 一致 = 量化配方固有成本，pre 链 353→429µs 占大头）；bench CLI `--cuda-impl fp8_sm_89` + 显式 per-thread/per-channel/smooth-v 全 5 task（含 causal）通过。
   - **bitwise 契约修正（重要教训）**：sm89↔sm120 的 bitwise 一致是**同批编译产物属性**——dispatch TU 重编（仅注释改动）触发 sm120 persist-D TU 重链后，sm120 输出出现 1-ulp 级 f32 融合序差异并在 e4m3 舍入边界翻转（sm89 输出跨 build 逐位不变，vs fp32 精度梯度跨 build 逐位复现；差异量级 = 单个 e4m3 步：dense 8e-3、causal 早行 0.22，两 arch 各自 vs fp32 精度对齐）。**跨实现验收标准改为：各自跨进程 bitwise 确定 + 相互 allclose@fp8 噪声量级 + vs fp32 精度对齐**；"与 sm120 bitwise"只在同批 .so 内成立。
@@ -354,7 +356,7 @@
     - **③ 换 m16n16k32 atom（Sage 同构）**：Sage 用 n16（每线程同行 4 列）→ P 的寄存器 repack 无 m-tile 约束、WARP_Q=32 天然可行、tile 数减半；代价 = QK B/K 布局 + softmax rowcol 视图 + perm-pack 契约全部重写（本设计 perm pack 的 16 字节组"必须同属一个 m-tile"正是 n8 atom 的产物）。
     - ④ sm_89 int4 QK（PC-6，QK 段理论 2x）——需先验证净收益。
   - 设计稿注意（本次实测发现的既有代码缺陷，当前 MMA_M 恒为 1 故潜伏）：`fp8_pscale.cuh::pscale_rowsum_mma` 只 issue 一个 m16n8k32 且只写 `row_sum[0]/[1]`，任何 MMA_M>1 形态会静默丢失后半行和；`tCrP` 的手搓 A 布局（`Shape<Shape<_4,_2,_2>, MMA_M, kBc/32>`）亦需按 M-tile 独占 `16×(kBc/32)` 字节连续区才与 perm pack 自洽。改 P fragment/atom 前先跑 host 端探针 `.tmp/sm89_opt/layout_probe.cu`（打印 fragment layout，秒级、不占 GPU）。
-  - 验收工具链：`python -m ffpa_attn.bench --fwd-backend cuda --cuda-impl fp8 --fp8-qk-mm-type int8 --fp8-pv-acc-type f16 --tasks self-attn,cross-attn,gqa,non-aligned`（sm89 v1 无 hybrid，causal/attn-mask task 会因 bench 默认开 hybrid 崩，属既有功能边界）+ `.tmp/sm89_opt/{prof_sm89.py,check_parity.py,prof_sage.py}` + ncu `--kernel-name regex:persist_d_fwd_cute_fp8_sm89`。
+  - 验收工具链：`python -m ffpa_attn.bench --fwd-backend cuda --cuda-impl fp8_sm_89 --fp8-qk-mm-type int8 --fp8-pv-acc-type f16 --D <128|192> --tasks <...>`（FC-15 后 causal/attn-mask task 可跑——hybrid 已支持；D>224 仍 raise 属功能边界）+ `.tmp/sm89_opt/{prof_sm89.py,check_parity.py,prof_sage.py}` + ncu `--kernel-name regex:persist_d_fwd_cute_fp8_sm89`。
 
 - [x] PC-17：sm_89 fp8 persist-D **Sage2 复刻线**（2026-09-20 首版落地；同日终态合入主 `persist_d.cuh`，1119c4c，**主体达成**）
   - 结构（用户指定"用 cute 复刻 Sage2"）：**Sage2 两级累加器**——PV mma 落 per-tile f16 inst_buf，唯一消费者是 f32 RO（`RO = RO*rs + inst` 一条 fmaf/element，rescale-absorb 融合）；**f16 寄存器永不跨 tile 累计，PC-16 的 o16 溢出域结构性消失**。几何 = v1（256T/CTA、kBr=128、kBc=128、1 CTA/SM）：**literal Sage2 形状（128T、128 f32 RO/thread）在本计算层 REG:255 STACK:304 spill、实测 4x 慢**——256T 每线程 64 f32 RO + 32 f16 inst 恰好 255 regs 零 spill（Sage2 自身组件更少能挤进 128T/255，我们带 perm-pack/rowsum-MMA/exp2 折叠组件挤不进，这是组件丰富度的代价）。继承 v2 瘦身三件套：寻址外提（裸 cp.async + 常量步进）、per-stage K/V s2r partition 预计算、mask-free 主循环 + masked tail。
@@ -2121,3 +2123,27 @@ atom 契约、perm 合法性）先用 **host 端 cute layout 探针**（`nvcc` �
 **构建提醒**：`bash build.sh --arch sm_120f --headdim <list> --ext all --jobs 64`；
 默认 headdim 集 = 64 倍数 ∈ [320,1024]，**覆盖 64-256 与 split-D 端点必须显式传**；
 sm_120f（非 120a）才有 setmaxnreg；small-D 测试需 `FFPA_CUDA_ALLOW_SMALL_D=1`。
+
+### FC-15：sm_89 fp8 hybrid（fp16 早行 + fp8 晚行）
+
+> 状态：✅ 已完成（2026-09-21 登记，同日落地；详见完成清单 FC-15 条目）。
+
+#### Motivation
+
+- FC-13/14 后 sm89 fp8 路径仍有最后一个功能缺口：**hybrid**（causal 场景下前 `n_early` 行走 fp16 保短行精度、其余行走 fp8）。sm120 家族早已支持（`q_start_row` 模式），sm89 被dispatch `TORCH_CHECK(!p.fp8_hybrid)` 拒绝，导致 bench CLI 的 causal/attn-mask task 在 sm89 下不可跑（bench 默认 causal+fp8 自动开 hybrid）。
+- causal 短行（KV 长度极小）是 fp8 误差最大暴露区（V 量化误差直接显形，pure fp8 causal N=2048 max_abs 0.125-0.152 vs hybrid late 区 0.04）；hybrid 是 sm89 上 attn 精度的最后一块短板。
+
+#### Design（改动面）
+
+- **kernel**（`cute/fp8/sm_89/persist_d.cuh`）：签名插 `q_start_row`（Nkv_pad 后），9 处行坐标 re-base 全部镜像 sm120 参照——early-exit `Br_base >= Nq - q_start_row`、causal_thresh_row0/Tc_eff、`q_row_offset`、新增 `q_tile_abs = Q_tile_id + q_start_row/kBr`（per_thread `(q_tile_abs>>1)*64`/`(q_tile_abs&1)*64` 与 per_block 量化索引重基准）、bias 坐标 `q_start_row + Br_base` + `bias_q_valid`、mask `q_pos`、epilogue O 基址 `+(long)q_start_row*kHeadDim`、full-tile 判定、tail/lse global_row。`n_early%128==0`（既有 TORCH_CHECK）保证 `q_start_row/kBr` 整除。
+- **dispatch**（`dispatch/cute_fp8.cuh` on_sm89 分支）：镜像 sm120 hybrid 分支（prepare_hybrid_stage1 切片 + O_e/lse_e/bias_e + FfpaFwdParams p1 + copy-back + `dispatch_sm89(tag, n_early)`）。**关键差异**：stage-1 调 `ffpa_fwd_cute_fp16_sm80<kDataType,kHeadDim,kStage>`（3 参模板，cp.async 家族）而非 sm120 硬绑 TMA launcher 的 `ffpa_fwd_fp16_stage1<...,224>`（4 参）——sm89 目标硬件 sm≤89 无 TMA；跨 TU 模板弱符号链接成立（fp16 TU 按 env.py 显式实例化 + dispatch.cuh 前置声明）。
+- **launcher**：删 `q_start_row==0` TORCH_CHECK；grid.x = `div_ceil(Nq - q_start_row, kBr)`；补 `q_start_row ∈ [0, Nq)` guard（Nq==n_early loud error，而非 grid.x=0 静默 invalid-configuration——与 sm120 launcher 对齐）。
+- **Python**：`_adapt_backend_for_fp8_sm89` 删 `backend.fp8_hybrid = False`（auto causal 自动开 hybrid 生效）；pv_acc f16 clamp 保留。
+
+#### 验证与教训
+
+- **parity 必须强制 sm89 路径**：dev box 是 sm120，`FFPA_FP8_SM89_FORCE=1`（或 CLI force_fp8_sm89）不设时跑的是 sm120 hybrid——数值结论张冠李戴（code review 抓出，sm120 与 sm89 强制路径数值有可测差异：late 区 0.042 vs 0.046）。FC-14 的 einsum 参照 + GQA repeat 教训沿用。
+- D=128（stage-1 persist_d_sm80）与 D=192（stage-1 split_d_sm80，`ffpa_fwd_cute_fp16_sm80` 内部分流）两分支都过：early 区 max_abs == fp16 noise floor（0.0077/0.0081）、late 区随 n_early 单调改善（0.046→0.009 / 0.055→0.010）、非 128 倍数 raise、4 量化组合 × hybrid 全过、纯 fp8 回归不变。
+- CLI：causal 1.43x / attn-mask 3.63x vs SDPA（N=8192 D=128），两 task 自此在 sm89 复活。
+- e2e（bench5，强制 sm89）：causal N=8192 hybrid 与纯 fp8 零开销差（1892 vs 1893µs）、N=16384 +1.3%（stage-1 物化/copy 固定开销）；cross/gqa/unaligned/dense hybrid smoke 全过。
+- spill：无新增（q_start_row 是标量 int 参数 + 头部整数偏移；STACK>0 实例 = FC-14 基线即有的 per_thread/per_channel 组合，量级一致）。
