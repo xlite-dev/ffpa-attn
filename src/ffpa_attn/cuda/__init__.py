@@ -22,6 +22,7 @@ try:
   CUDA_BWD_AVAILABLE = False
   _CUDA_IMPORT_ERROR = None
 except Exception as exc:
+  _cuda_ext = None
   _ffpa_attn_fwd_cuda = None
   CUDA_FWD_AVAILABLE = False
   F16_ACC_AVAILABLE = False
