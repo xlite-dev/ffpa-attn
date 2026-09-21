@@ -158,8 +158,8 @@ void persist_d_fp8_sm89_variant(
         qi.q_scale.data_ptr<float>(), qi.k_scale.data_ptr<float>(),
         qi.v_scale.data_ptr<float>(), Nq, Nkv, Nh, Nh_kv, n_rb_q, n_rb_kv,
         scale, Tc, causal, Nkv_pad, q_start_row, qi.km_f32_ptr, qi.vm_kernel,
-        bias.ptr,
-        bias.dtype, bias.stride_b, bias.stride_h, bias.stride_m, bias.stride_n);
+        bias.ptr, bias.dtype, bias.stride_b, bias.stride_h, bias.stride_m,
+        bias.stride_n);
   };
   if (qk_per_thread) {
     if (v_per_channel)

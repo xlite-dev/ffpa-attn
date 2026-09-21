@@ -112,9 +112,8 @@ void ffpa_fwd_fp8(const FfpaFwdParams& p) {
         auto lse_e = torch::empty(
             {p.Nb, p.Nh, n_early},
             torch::TensorOptions().dtype(torch::kFloat32).device(p.Q.device()));
-        auto bias_e = p.attn_bias.numel() > 0
-                          ? p.attn_bias.slice(2, 0, n_early)
-                          : p.attn_bias;
+        auto bias_e = p.attn_bias.numel() > 0 ? p.attn_bias.slice(2, 0, n_early)
+                                              : p.attn_bias;
         FfpaFwdParams p1;
         p1.Q = Q_e;
         p1.K = K_e;
