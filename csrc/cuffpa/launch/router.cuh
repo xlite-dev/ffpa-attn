@@ -256,11 +256,32 @@ void launch_ffpa_attn_fwd_template(
     if (prop->major >= 9 ||
         (force_fp8 && !force_fp4 && prop->major == 8 && prop->minor >= 9)) {
       if (force_fp4) {
+#ifdef ENABLE_FFPA_TMA_EXT
         ffpa::ffpa_fwd_fp4<kDataType, kHeadDim, kStage>(p);
+#else
+        // fp4 is the sm_120 family and only compiles under the TMA ext;
+        // instantiating the call in sm_89-only builds leaves undefined
+        // symbols that only surface at .so load time (RTLD_NOW).
+        TORCH_CHECK(false,
+                    "ffpa_attn: fp4 requires ENABLE_FFPA_TMA_EXT (sm_120 "
+                    "family)");
+#endif
         return;
       }
       if (force_fp8) {
+#ifdef ENABLE_FFPA_TMA_EXT
         ffpa::ffpa_fwd_fp8<kDataType, kHeadDim, kStage>(p);
+#else
+        // sm_89-only builds instantiate fp8 family TUs for D<=224 only;
+        // guard the call so D>224 entry TUs emit no undefined refs.
+        if constexpr (kHeadDim <= 224) {
+          ffpa::ffpa_fwd_fp8<kDataType, kHeadDim, kStage>(p);
+        } else {
+          TORCH_CHECK(false,
+                      "ffpa_attn: fp8 beyond the sm89 persist-D family "
+                      "(D<=224) requires ENABLE_FFPA_TMA_EXT");
+        }
+#endif
       } else if (prop->major == 9 || prop->major == 10) {
         // sm_90/100 (228 KB smem): WS path, setmaxnreg effective.
         ffpa::ffpa_fwd_native_tma<kDataType, kHeadDim, kMmaAccFloat32QK,
