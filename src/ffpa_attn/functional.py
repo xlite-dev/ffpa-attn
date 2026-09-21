@@ -187,6 +187,31 @@ def _cuda_tma_available() -> bool:
   return bool(CUDA_TMA_AVAILABLE) and _is_sm120_or_later()
 
 
+def _fp8_sm89_active(backend: CUDABackend, device: torch.device) -> bool:
+  """Whether the fp8 forward will take the sm89 persist-D kernel.
+
+  True when forced (backend ``force_fp8_sm89`` or the
+  ``FFPA_FP8_SM89_FORCE`` env), or automatically on any pre-sm120
+  (``major < 12``) device such as L20 / 4090 where TMA is unavailable.
+  """
+  if backend.force_fp8_sm89 or os.environ.get("FFPA_FP8_SM89_FORCE"):
+    return True
+  if device.type != "cuda":
+    return False
+  return torch.cuda.get_device_capability(device)[0] < 12
+
+
+def _adapt_backend_for_fp8_sm89(backend: CUDABackend) -> None:
+  """Clamp fp8 knobs to what the sm89 persist-D kernel supports.
+
+  The sm89 path only supports the f16 PV accumulator, so that is forced
+  regardless of auto/explicit settings. Hybrid (fp16 early rows via the
+  sm_80 cp.async family + fp8 late rows), quant methods (per_block/
+  per_thread QK, per_block/per_channel V with smooth_v) pass through.
+  """
+  backend.fp8_pv_acc_type = "f16"
+
+
 def _apply_cuda_backend_hint(backend: CUDABackend) -> None:
   """Set C++ backend impl hint from CUDABackend flags before kernel launch.
 
@@ -272,6 +297,10 @@ def _ffpa_attn_forward(
     return None
   # Same in-place resolution normalize_inputs would perform (idempotent).
   forward_backend.is_causal = is_causal
+  if forward_backend.enable_fp8 and _fp8_sm89_active(
+    forward_backend, query.device
+  ):
+    _adapt_backend_for_fp8_sm89(forward_backend)
   if forward_backend.fp8_hybrid is None:
     forward_backend.fp8_hybrid = bool(forward_backend.enable_fp8 and is_causal)
   if forward_backend.fp4_hybrid is None:
@@ -306,6 +335,7 @@ def _ffpa_attn_forward(
     forward_backend.fp4_hadamard,
     forward_backend.fp4_pv_mm_type_code,
     forward_backend.fp4_smooth_v,
+    forward_backend.force_fp8_sm89,
     forward_backend.tensor_layout_code,
   )
   return O
@@ -449,6 +479,11 @@ class CUDABackend(Backend):
   enable_cute: bool | None = None
   enable_ws: bool = False  # For future use.
   enable_fp8: bool = False  # FP8 persist-D sm120 path (fp16/bf16 in).
+  # Force the fp8 sm89 persist-D kernel (cp.async, no TMA) even on sm120+.
+  # Also auto-selected on any major < 12 device (L20 / 4090); the sm89
+  # path only supports the f16 PV accumulator (hybrid runs the sm_80
+  # cp.async fp16 family for the early rows).
+  force_fp8_sm89: bool = False
   enable_fp4: bool = False  # NVFP4 persist-D sm120 path (any D%8==0 within [8,256], pads up to {64,128,192,256}).
   fp8_smooth_k: bool = True  # FP8 only: subtract per-(b,h) K seq mean pre-quant.
   fp8_smooth_v: bool = False  # FP8 only: subtract per-(b,h) V dim mean.
@@ -1103,6 +1138,10 @@ class FFPAAttnMeta:
     # True/False is honored as-is (fp16 stage-1 + quant stage-2).
     if isinstance(self.forward_meta, CUDABackend):
       self.forward_meta.is_causal = is_causal
+      if self.forward_meta.enable_fp8 and _fp8_sm89_active(
+        self.forward_meta, query.device
+      ):
+        _adapt_backend_for_fp8_sm89(self.forward_meta)
       if self.forward_meta.fp8_hybrid is None:
         self.forward_meta.fp8_hybrid = bool(
           self.forward_meta.enable_fp8 and is_causal
@@ -1344,6 +1383,7 @@ class _FFPAAttnFunc(torch.autograd.Function):
         forward_meta.fp4_hadamard,
         forward_meta.fp4_pv_mm_type_code,
         forward_meta.fp4_smooth_v,
+        forward_meta.force_fp8_sm89,
       )
     elif isinstance(meta.forward_meta, TritonBackend):
       forward_meta = meta.forward_meta

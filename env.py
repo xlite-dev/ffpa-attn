@@ -871,7 +871,7 @@ with r in {0, 1}. See `_fp16_impl_variants` in `env.py`.
       "    bool fp8_hadamard,",
       "    bool fp4_hadamard,",
       "    int64_t fp4_pv_mm_type,",
-      "    bool fp4_smooth_v)",
+      "    bool fp4_smooth_v, bool fp8_sm89)",
     ]
     return lines
 
@@ -891,7 +891,7 @@ with r in {0, 1}. See `_fp16_impl_variants` in `env.py`.
       "int64_t fp8_pv_acc_type, int64_t fp8_qk_mm_type, bool fp8_hybrid, "
       "int64_t fp8_hybrid_n_early, bool fp4_hybrid, "
       "int64_t fp4_hybrid_n_early, bool fp8_hadamard, bool fp4_hadamard, "
-      "int64_t fp4_pv_mm_type, bool fp4_smooth_v"
+      "int64_t fp4_pv_mm_type, bool fp4_smooth_v, bool fp8_sm89"
     )
     return f"void {symbol}({args});"
 
@@ -941,7 +941,7 @@ with r in {0, 1}. See `_fp16_impl_variants` in `env.py`.
       "fp8_q_quant_method, fp8_k_quant_method, fp8_v_quant_method, "
       "fp8_pv_acc_type, fp8_qk_mm_type, fp8_hybrid, fp8_hybrid_n_early, "
       "fp4_hybrid, fp4_hybrid_n_early, fp8_hadamard, fp4_hadamard, "
-      "fp4_pv_mm_type, fp4_smooth_v"
+      "fp4_pv_mm_type, fp4_smooth_v, fp8_sm89"
     )
     if len(stages) == 1:
       return f"  ffpa_attn_fwd_{variant}_d{d}_s{stages[0]}({call});\n"
@@ -1132,7 +1132,7 @@ with r in {0, 1}. See `_fp16_impl_variants` in `env.py`.
       "fp8_smooth_v, fp8_q_quant_method, fp8_k_quant_method, "
       "fp8_v_quant_method, fp8_pv_acc_type, fp8_qk_mm_type, fp8_hybrid, "
       "fp8_hybrid_n_early, fp4_hybrid, fp4_hybrid_n_early, fp8_hadamard, "
-      "fp4_hadamard, fp4_pv_mm_type, fp4_smooth_v);"
+      "fp4_hadamard, fp4_pv_mm_type, fp4_smooth_v, fp8_sm89);"
     )
     lines.append("}")
     lines.append("")
@@ -1618,6 +1618,10 @@ with r in {0, 1}. See `_fp16_impl_variants` in `env.py`.
       for d in headdims:
         br, bc = cls._fp8_variant_blocks(d)
         blocks = [(br, bc)]
+        # sm89 persist-D unified kBr=64: kBc=128 and kBc=64 tuning cfgs
+        # both need their preprocess instances for every D <= 224.
+        blocks.append((64, 128))
+        blocks.append((64, 64))
         if debug_fp8 and 224 < d <= 1024:
           # FFPA_FP8_FORCE_KERNEL A/B instantiates both split_d and m4n2
           # in one TU; the forced variant's blocks are absent from the
@@ -1798,7 +1802,7 @@ with r in {0, 1}. See `_fp16_impl_variants` in `env.py`.
       "fp8_q_quant_method, fp8_k_quant_method, fp8_v_quant_method, "
       "fp8_pv_acc_type, fp8_qk_mm_type, fp8_hybrid, fp8_hybrid_n_early, "
       "fp4_hybrid, fp4_hybrid_n_early, fp8_hadamard, fp4_hadamard, "
-      "fp4_pv_mm_type, fp4_smooth_v"
+      "fp4_pv_mm_type, fp4_smooth_v, fp8_sm89"
     )
 
     out = [

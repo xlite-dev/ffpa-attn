@@ -1,20 +1,52 @@
 #pragma once
 
 // FP8 persist-D Flash Attention forward (cp.async, sm_89+).
-// Ada port of the fp8 persist-D geometry: no TMA / mbarrier / WS on sm_89,
-// so the sm120 fp8 persist-D compute layer (int8 QK MMA, fixed p_scale
-// softmax, fp8 f16-acc PV) rides the sm80 non-WS cp.async loader: 256T
-// fully synchronous, K/V tiles committed as per-tile cp.async group pairs
-// and waited by FIFO group counting (QK needs group 1+2t, PV group 2+2t of
-// the per-thread sequence Q,K0,V0,K1,V1,...).
-// Q is s2r'd once and every QK step runs gemm_rs (K-only smem loads). V is
-// pre-transposed (D x Nkv, kVTPerm column permutation) by the quantize
-// pre-kernel, so the PV B operand loads with the non-transposed LDSM atom
-// and the P pack is the reorg-free perm variant.
-// Divergences from the sm120 kernel: bias is gmem-direct only (mode 0; the
-// TMA tile modes 1-3 need mbarrier handoff); dropout is unsupported (same
-// contract as the sm120 fp8 path); q_start_row/hybrid is out of scope (v1).
+//
+// Single-kernel merge of the Sage2-replica experiments: the validated v1
+// compute layer (int8/fp8 QK MMA with Q resident in registers via gemm_rs,
+// fixed p_scale softmax, two-level PV accumulator) on the Sage2
+// single-stage pipeline:
+//   - per-thread gmem/smem chunk addressing derived once before the loop;
+//     issuing tile t only adds constant strides (K: kBc*kHeadDim bytes,
+//     V^T: kBc bytes) that preserve the SW128 swizzle pattern,
+//   - kS-deep K/V cp.async pipeline (kStagesK/kStagesV traits; 1 = the
+//     Sage2 single-buffer schedule where K[t+1] issues right after QK and
+//     V[t+1] after PV). Deeper stages refill stage t%kS with tile t+kS
+//     once its LDSM readers have drained CTA-wide; every iteration
+//     commits exactly two groups (possibly empty at the pipeline tail)
+//     so the steady-state waits are the constants wait<2*kS-1> (K[t])
+//     and wait<2*kS-2> (V[t]),
+//   - the Q tile shares the K stage0 storage whenever the two tiles have
+//     the same shape (kBr == kBc, both SW atoms equal),
+//   - a mask-free main loop with the masked variant in the tail.
+//
+// Two-level PV accumulator (the Sage2 structure): the PV MMA lands in a
+// per-tile f16 inst_buf whose only consumer is the float running
+// accumulator,
+//     RO = RO * row_scale + inst      (one fused fmaf per element)
+// so no f16 register ever accumulates across KV tiles -- the f16 overflow
+// domain that plagued the persistent-o16 kernels is structurally gone
+// (same trade Sage2 makes; adversarial inputs can still saturate a single
+// tile's inst_buf: worst case |inst| ~ 448 * sum(P_tile) * amax(V), so a
+// fully flat 64-row tile with amax(V) > ~2.3 (448*64*2.3 > f16 max) or
+// concentrated scores with larger amax can still inf -- the documented
+// FA2-unnormalized-P contract, matching randn-domain safety).
+//
+// Quant scope: per-block Q/K/V plus the Sage2-style per-thread QK (Q 64
+// scales/128-row block, K 4 scales/kBc-col block, fragment-aligned so the
+// dequant needs zero shuffles) and per-channel V (v_scale is (bh, D); P uses
+// a fixed compile-time quant scale and the epilogue dequants per D column).
+// Per-channel V with the f16 PV accumulator compresses V8 to v_r=2.25
+// (launcher) and caps P's scale so one tile's inst_buf stays in fp16 range:
+// kBc*448*2.25 <= 65504 holds for kBc=64, kBc=128 uses 224.
+//
+// v1 scope: additive attn bias in the raw score domain (gmem-direct,
+// mode 0), no dropout. q_start_row serves the fp8-hybrid stage-2 (early
+// rows run the sm_80 cp.async fp16 family). D % 64 == 0; kBc=128 for
+// D <= 128 (matches the 128-col quant blocks, so ks/vs index kv_tile
+// directly) and 64 above.
 
+#include <cuda_fp16.h>
 #include <cuda_fp8.h>
 
 #include <algorithm>
@@ -34,9 +66,8 @@
 namespace ffpa_fp8 {
 
 template <typename Traits, typename ElementO, int kHasAttnBias = 0,
-          bool kPVAccF16 = true, bool kVPerChannel = false,
-          bool kQKPerThread = false, bool kReorgFree = true>
-__global__ void __launch_bounds__(Traits::kNumThreads, 1)
+          bool kQKPerThread = false, bool kVPerChannel = false>
+__global__ void __launch_bounds__(Traits::kNumThreads, 2)
     persist_d_fwd_cute_fp8_sm89(
         typename Traits::ElementQK* __restrict__ Q,
         typename Traits::ElementQK* __restrict__ K,
@@ -45,7 +76,7 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
         const float* __restrict__ q_scale, const float* __restrict__ k_scale,
         const float* __restrict__ v_scale, int Nq, int Nkv, int Nh, int Nh_kv,
         int n_rb_q, int n_rb_kv, float scale, int Tc, int causal, int Nkv_pad,
-        const float* __restrict__ km = nullptr,
+        int q_start_row = 0, const float* __restrict__ km = nullptr,
         const float* __restrict__ vm = nullptr,
         const void* __restrict__ attn_bias = nullptr, int attn_bias_dtype = 0,
         long long attn_bias_stride_b = 0, long long attn_bias_stride_h = 0,
@@ -58,30 +89,32 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
   using SmemLayoutK = typename Traits::SmemLayoutK;
   using SmemLayoutV = typename Traits::SmemLayoutV;
   using TiledMmaQK = typename Traits::TiledMmaQK;
-  using TiledMmaPV = typename Traits::TiledMmaPV;
-  using SmemCopyAtomQK = typename Traits::SmemCopyAtomQK;
-  using SmemCopyAtom = typename Traits::SmemCopyAtom;
 
-  constexpr int kBr = Traits::kBr;
+  constexpr int kBr = Traits::kBr;  // 64 (128T: 2 CTAs interleave per SM)
   constexpr int kBc = Traits::kBc;
   constexpr int kHeadDim = Traits::kHeadDim;
-  constexpr int kStages = Traits::kStagesK;
+  constexpr int kNumThreads = Traits::kNumThreads;  // 128
   static_assert(Traits::kStagesK == Traits::kStagesV,
-                "the single kStages pool partition assumes K/V stage parity");
-  constexpr int kNumThreads = Traits::kNumThreads;
-  constexpr int kNumWarps = Traits::kNumWarps;
+                "K and V pipeline depths must match");
+  constexpr int kS = Traits::kStagesK;  // K/V cp.async pipeline depth
+  // Per-channel-V P quant scale (compile-time: the epilogue dequant divides
+  // it back out). One tile's inst_buf worst case is kBc*448*v_r(2.25), so
+  // kBc=128 must narrow P to 224 to stay inside the f16 range.
+  constexpr float kPQuantScalePerCh =
+      (kBc * kE4m3Max * 2.25f <= 65504.0f) ? kE4m3Max : 224.0f;
+  // Same-shape Q/K tiles (kBr == kBc) share one swizzle buffer: Q drains
+  // before K[0] overwrites it. Different shapes keep a separate Q buffer
+  // next to the K/V stages.
+  constexpr bool kQSharesK = cosize(SmemLayoutQ{}) == cosize(SmemLayoutK{});
 
-  // Traits::TiledMmaPVf16 uses the Blackwell SM120 atom; sm89 needs its own
-  // f16-acc atom. Same m16n8k32 shape and A/B layouts as the f32 atom, so
-  // the B-operand smem plumbing and the P A-operand packing are shared.
+  // f16 PV atom (Ada-only m16n8k32 f16-acc), warps over the kBr rows.
   using MmaAtomPVf16 = MMA_Atom<SM89_16x8x32_F16E4M3E4M3F16_TN>;
   using TiledMmaPVf16 = decltype(make_tiled_mma(
-      MmaAtomPVf16{}, Layout<Shape<Int<kNumWarps>, _1, _1>>{},
+      MmaAtomPVf16{}, Layout<Shape<Int<kNumThreads / 32>, _1, _1>>{},
       Tile<Int<kBr>, Int<kHeadDim>, _32>{}));
 
   constexpr int kQTileElements = cosize(SmemLayoutQ{});
   constexpr int kKTileElements = cosize(SmemLayoutK{});
-  constexpr int kVTileElements = cosize(SmemLayoutV{});
 
   const int Nb_id = blockIdx.y / Nh;
   const int Nh_id = blockIdx.y % Nh;
@@ -91,32 +124,41 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
   const int Br_base = Q_tile_id * kBr;
   const int tid = threadIdx.x;
 
-  if (Br_base >= Nq)
+  // Hybrid stage-2: rows [q_start_row, Nq); grid.x covers the remainder
+  // and q_tile_abs re-bases the quant-scale indexing on absolute tiles.
+  if (Br_base >= Nq - q_start_row)
     return;
 
   const int kv_offset = Nkv - Nq;
-  const int causal_thresh_row0 = Br_base + kv_offset;
+  const int causal_thresh_row0 = q_start_row + Br_base + kv_offset;
   const int Tc_eff =
-      causal ? min(Tc, ((Br_base + kBr - 1 + kv_offset) / kBc) + 1) : Tc;
+      causal
+          ? min(Tc, ((q_start_row + Br_base + kBr - 1 + kv_offset) / kBc) + 1)
+          : Tc;
   const int mask_start_tile =
       causal ? max(0, (causal_thresh_row0 + 1) / kBc) : INT_MAX;
 
-  const int q_row_offset = (Nb_id * Nh + Nh_id) * Nq;
+  const int q_row_offset = (Nb_id * Nh + Nh_id) * Nq + q_start_row;
   const int kv_row_offset = (Nb_id * Nh_kv + kv_head_idx) * Nkv;
   const int q_bh = Nb_id * Nh + Nh_id;
   const int kv_bh = Nb_id * Nh_kv + kv_head_idx;
-  const int q_tile_abs = Q_tile_id;
+  const int q_tile_abs = Q_tile_id + q_start_row / kBr;
 
-  // SMEM: [Q persist | K stages | V stages], 1B per elem (int8 or e4m3).
+  // SMEM carve. kQSharesK: [K stage0 (Q transient) | K 1..S-1 | V stages].
+  // Otherwise [Q | K stages | V stages]. Stage s of K/V sits at its base
+  // plus s * cosize(2D tile) -- the stage-major 3D layouts below.
   extern __shared__ __align__(1024) char shm[];
   ElementQK* q_base = reinterpret_cast<ElementQK*>(shm);
-  ElementQK* k_base = q_base + kQTileElements;
-  Element* v_base =
-      reinterpret_cast<Element*>(k_base + kStages * kKTileElements);
+  ElementQK* k_base = kQSharesK ? q_base : q_base + kQTileElements;
+  Element* v_base = reinterpret_cast<Element*>(k_base + kS * kKTileElements);
+  using SmemLayoutKSt =
+      decltype(tile_to_shape(typename Traits::SmemAtomQK{},
+                             Shape<Int<kBc>, Int<kHeadDim>, Int<kS>>{}));
+  using SmemLayoutVSt = decltype(tile_to_shape(
+      typename Traits::SmemAtomV{}, Shape<Int<kHeadDim>, Int<kBc>, Int<kS>>{}));
 
   // G2S TiledCopy: 16B cp.async over [rows, 64] segments (one swizzle
   // atom wide, keeps the thread tiling integral for every D%64==0).
-  // 1B elems: 16 elements per 16B copy; kSegCols=64 -> 4 copies/row.
   using G2SCopyOp = SM80_CP_ASYNC_CACHEGLOBAL<cute::uint128_t>;
   using G2SCopyAtom = Copy_Atom<Copy_Traits<G2SCopyOp>, Element>;
   constexpr int kSegCols = 64;
@@ -130,8 +172,6 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
   G2SCopy g2s_copy;
   auto g2s_thr = g2s_copy.get_slice(tid);
 
-  // Gmem tensors. Q/K stay (rows, D) row-major int8/fp8; V is the
-  // pre-transposed VT (D, Nkv_pad) e4m3 output of the quantize kernel.
   auto mQ = make_tensor(make_gmem_ptr(Q + q_row_offset * kHeadDim),
                         make_shape(Nq, Int<kHeadDim>{}),
                         make_stride(Int<kHeadDim>{}, _1{}));
@@ -144,7 +184,6 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
       make_gmem_ptr(V + static_cast<long>(kv_bh) * kHeadDim * Nkv_pad),
       make_shape(kHeadDim, Nkv), make_stride(Nkv_pad, _1{}));
 
-  // G2S helpers: Q once (persist), K/V per kv tile into their stage.
   auto g2s_load_q = [&]() {
     auto gQ = local_tile(mQ, Shape<Int<kBr>, Int<kHeadDim>>{},
                          make_coord(Q_tile_id, _0{}));
@@ -158,177 +197,212 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
       copy(g2s_copy, g2s_thr.partition_S(gSeg), g2s_thr.partition_D(sSeg));
     }
   };
-  auto g2s_load_k = [&](int kv_tile_idx, int stage) {
-    auto gK = local_tile(mK, Shape<Int<kBc>, Int<kHeadDim>>{},
-                         make_coord(kv_tile_idx, _0{}));
-    auto sK = make_tensor(make_smem_ptr(k_base + stage * kKTileElements),
-                          SmemLayoutK{});
+
+  // G2S destination tensors for all K/V stages (stage-major 3D).
+  auto sK_g2s = make_tensor(make_smem_ptr(k_base), SmemLayoutKSt{});
+  auto sV_g2s = make_tensor(make_smem_ptr(v_base), SmemLayoutVSt{});
+  // G2S issue for one K/V tile, pure cute: the gmem slice is an affine
+  // function of t (K: +kBc*kHeadDim elements, V^T: +kBc elements); the
+  // smem stage tensor is the (t % kS) slice of the 3D stages.
+  auto issue_k = [&](int t) {
+    auto gK =
+        local_tile(mK, Shape<Int<kBc>, Int<kHeadDim>>{}, make_coord(t, _0{}));
+    auto sK_t = sK_g2s(_, _, t % kS);
     CUTLASS_PRAGMA_UNROLL
     for (int seg = 0; seg < kHeadDim / kSegCols; ++seg) {
       auto gSeg = local_tile(gK, Shape<Int<kBc>, Int<kSegCols>>{},
                              make_coord(_0{}, seg));
-      auto sSeg = local_tile(sK, Shape<Int<kBc>, Int<kSegCols>>{},
+      auto sSeg = local_tile(sK_t, Shape<Int<kBc>, Int<kSegCols>>{},
                              make_coord(_0{}, seg));
       copy(g2s_copy, g2s_thr.partition_S(gSeg), g2s_thr.partition_D(sSeg));
     }
   };
-  auto g2s_load_v = [&](int kv_tile_idx, int stage) {
-    // VT is [D, Nkv] row-major (kv contiguous), so the tile [kHeadDim, kBc]
-    // loads as 64-column segments along the kv direction, same G2S shape as
-    // Q/K (rows x 64).
-    auto gV = local_tile(mV, Shape<Int<kHeadDim>, Int<kBc>>{},
-                         make_coord(_0{}, kv_tile_idx));
-    auto sV = make_tensor(make_smem_ptr(v_base + stage * kVTileElements),
-                          SmemLayoutV{});
+  auto issue_v = [&](int t) {
+    auto gV =
+        local_tile(mV, Shape<Int<kHeadDim>, Int<kBc>>{}, make_coord(_0{}, t));
+    auto sV_t = sV_g2s(_, _, t % kS);
     CUTLASS_PRAGMA_UNROLL
     for (int seg = 0; seg < kBc / kSegCols; ++seg) {
       auto gSeg = local_tile(gV, Shape<Int<kHeadDim>, Int<kSegCols>>{},
                              make_coord(_0{}, seg));
-      auto sSeg = local_tile(sV, Shape<Int<kHeadDim>, Int<kSegCols>>{},
+      auto sSeg = local_tile(sV_t, Shape<Int<kHeadDim>, Int<kSegCols>>{},
                              make_coord(_0{}, seg));
       copy(g2s_copy, g2s_thr.partition_S(gSeg), g2s_thr.partition_D(sSeg));
     }
   };
 
-  // Dual TiledMma (fp8/int8 QK + fp8 PV; the f16-acc PV shares the f32
-  // B-operand layout, so one partition set serves both).
   TiledMmaQK tiled_mma_qk;
-  TiledMmaPV tiled_mma_pv;
   TiledMmaPVf16 tiled_mma_pv_f16;
   auto thr_mma_qk = tiled_mma_qk.get_thread_slice(tid);
-  auto thr_mma_pv = tiled_mma_pv.get_thread_slice(tid);
   auto thr_mma_pv_f16 = tiled_mma_pv_f16.get_thread_slice(tid);
 
-  // S2R copy atoms.
-  auto s2r_copy_q = make_tiled_copy_A(SmemCopyAtomQK{}, tiled_mma_qk);
-  auto s2r_copy_k = make_tiled_copy_B(SmemCopyAtomQK{}, tiled_mma_qk);
-  auto s2r_copy_v = make_tiled_copy_B(SmemCopyAtom{}, tiled_mma_pv);
-  auto s2r_copy_v_f16 = make_tiled_copy_B(SmemCopyAtom{}, tiled_mma_pv_f16);
+  auto s2r_copy_q =
+      make_tiled_copy_A(typename Traits::SmemCopyAtomQK{}, tiled_mma_qk);
+  auto s2r_copy_k =
+      make_tiled_copy_B(typename Traits::SmemCopyAtomQK{}, tiled_mma_qk);
+  auto s2r_copy_v =
+      make_tiled_copy_B(typename Traits::SmemCopyAtom{}, tiled_mma_pv_f16);
   auto s2r_thr_q = s2r_copy_q.get_thread_slice(tid);
   auto s2r_thr_k = s2r_copy_k.get_thread_slice(tid);
   auto s2r_thr_v = s2r_copy_v.get_thread_slice(tid);
-  auto s2r_thr_v_f16 = s2r_copy_v_f16.get_thread_slice(tid);
 
-  // O fragment layout (full-D persist accumulator).
-  using OFragType = decltype(partition_fragment_C(
-      tiled_mma_pv, Shape<Int<kBr>, Int<kHeadDim>>{}));
-  using OFragLayout = typename OFragType::layout_type;
-  constexpr int kOElemsPerFrag = decltype(size(OFragType{}))::value;
-  constexpr int kORows = decltype(size<0>(
-      make_tensor((float*)nullptr,
-                  ffpa_cute::convert_layout_acc_rowcol(OFragLayout{}))))::value;
-  constexpr int kOCols = decltype(size<1>(
-      make_tensor((float*)nullptr,
-                  ffpa_cute::convert_layout_acc_rowcol(OFragLayout{}))))::value;
+  // s32 QK score fragment: 2 rows x (kBc/4) cols per thread.
+  using ScoreFrag =
+      decltype(partition_fragment_C(tiled_mma_qk, Shape<Int<kBr>, Int<kBc>>{}));
+  using ScoreRCLayout =
+      decltype(ffpa_cute::convert_layout_acc_rowcol(ScoreFrag{}.layout()));
+  constexpr int kSCols = decltype(cute::size<1>(
+      make_tensor((float*)nullptr, ScoreRCLayout{})))::value;
+  constexpr int kSRows = decltype(cute::size<0>(
+      make_tensor((float*)nullptr, ScoreRCLayout{})))::value;
+  static_assert(kSRows == 2, "");
+
+  // f16 PV inst_buf fragment over the full (kBr, D) tile; the float
+  // running accumulator keeps the same layout.
+  using OFrag16 = decltype(partition_fragment_C(
+      tiled_mma_pv_f16, Shape<Int<kBr>, Int<kHeadDim>>{}));
+  using ORC16Layout =
+      decltype(ffpa_cute::convert_layout_acc_rowcol(OFrag16{}.layout()));
+  constexpr int kORows = decltype(cute::size<0>(
+      make_tensor((float*)nullptr, ORC16Layout{})))::value;
+  constexpr int kOCols = decltype(cute::size<1>(
+      make_tensor((float*)nullptr, ORC16Layout{})))::value;
+  constexpr int kOElems = decltype(cute::size(OFrag16{}))::value;
+  static_assert(kORows == 2, "");
+
+  auto sQ = make_tensor(make_smem_ptr(q_base), SmemLayoutQ{});
+  // K/V smem tensors carry the stage mode; the per-tile s2r partitions
+  // are rebuilt from the (kv_tile % kS) slice inside the KV loop.
+  auto sK_st = make_tensor(make_smem_ptr(k_base), SmemLayoutKSt{});
+  auto sV_st = make_tensor(make_smem_ptr(v_base), SmemLayoutVSt{});
 
   // Coordinate tensor for softmax indexing.
   auto cS = make_identity_tensor(Shape<Int<kBr>, Int<kBc>>{});
   auto tScS = thr_mma_qk.partition_C(cS);
   auto tScS_rc = make_tensor(
       tScS.data(), ffpa_cute::convert_layout_acc_rowcol(tScS.layout()));
-  constexpr int kSRows = decltype(size<0>(tScS_rc))::value;
-  constexpr int kSCols = decltype(size<1>(tScS_rc))::value;
 
   const float scale_orig = scale;
   scale *= FFPA_M_LOG2E;
 
-  // Per-block Q/K dequant scales (kQKPerThread=false: one scalar per
-  // kBr-row Q block / kBc-col K block). Per-thread mode keeps qs_arr
-  // fragment-aligned; v1 pins per-block (fp8_q_quant_method=0).
-  const float qs = q_scale[static_cast<long>(q_bh) * n_rb_q + q_tile_abs];
+  // Per-row Q dequant scales (kSRows == kORows == 2: the QK C-frag row pair
+  // and the PV C-frag rows index the same Q rows). Per-thread mode maps each
+  // row into the 128-row quant block: kBr=64 tiles straddle block halves by
+  // tile parity, group g covers the C-frag row pair {r, r+8}.
+  float qs_arr[kORows];
+  if constexpr (kQKPerThread) {
+    const int n_q128 = (Nq + 127) / 128;
+    const long q_sc_base =
+        static_cast<long>(q_bh) * (n_q128 * 64) + (q_tile_abs >> 1) * 64;
+    // Both C-frag rows of a thread share one group ({r, r+8} pair).
+    const int seg_row = (q_tile_abs & 1) * 64 + get<0>(tScS_rc(0, 0));
+    const int g = (seg_row / 16) * 8 + seg_row % 8;
+    const float qs_g = q_scale[q_sc_base + g];
+#pragma unroll
+    for (int row = 0; row < kORows; ++row)
+      qs_arr[row] = qs_g;
+  } else {
+    const float qs = q_scale[static_cast<long>(q_bh) * n_rb_q + q_tile_abs];
+#pragma unroll
+    for (int row = 0; row < kORows; ++row)
+      qs_arr[row] = qs;
+  }
 
   float row_max[kORows];
   float row_sum[kORows];
   float qkm[kORows];
+  float row_scale[kORows];
 #pragma unroll
   for (int r = 0; r < kORows; ++r) {
     row_max[r] = -INFINITY;
     row_sum[r] = 0.0f;
     qkm[r] = 0.0f;
+    row_scale[r] = 1.0f;
   }
 
-  float o_acc[kOElemsPerFrag];
+  // Float running accumulator (the upper level of the two-level RO).
+  float ro[kOElems];
 #pragma unroll
-  for (int i = 0; i < kOElemsPerFrag; ++i)
-    o_acc[i] = 0.0f;
+  for (int i = 0; i < kOElems; ++i)
+    ro[i] = 0.0f;
 
-  // Initial loads: Q group, then K/V[0..S-1] as per-tile pairs (same FIFO
-  // invariant as the sm80 fp16 persist-D: at kv tile t K[t] is group 1+2t,
-  // V[t] group 2+2t -> wait<2S-1> settles K[t], wait<2S-2> settles V[t]).
-  {
-    g2s_load_q();
-    cp_async_fence();
-#pragma unroll
-    for (int s = 0; s < kStages; ++s) {
-      if (s < Tc_eff) {
-        g2s_load_k(s, s);
-        cp_async_fence();
-        g2s_load_v(s, s);
-        cp_async_fence();
-      }
-    }
-    // Prologue wait: settle only Q + K[0] (the t=0 QK operands); the newer
-    // K[1..S-1]/V[0..S-1] groups stay in flight and land under the t=0
-    // compute. Short-Tc grids submit fewer than 2S+1 groups, which would
-    // make the depth-limited wait pass immediately, so they settle
-    // everything (the in-loop FIFO waits then pass trivially).
-    if (Tc_eff >= kStages)
-      cp_async_wait<kStages * 2 - 1>();
-    else
-      cp_async_wait<0>();
-    __syncthreads();
-  }
-
-  // Smooth-K dot correction (lse += scale_orig * qs * qkm[row]); reads the
-  // smem Q tile before the A-fragment is moved to regs.
   const bool smooth_lse = (softmax_lse != nullptr) && (km != nullptr);
-  if (smooth_lse) {
-    auto sQ = make_tensor(make_smem_ptr(q_base), SmemLayoutQ{});
-    smooth_k_qk_dot<kHeadDim, kORows>(
-        sQ, tScS_rc, km + static_cast<long>(kv_bh) * kHeadDim, qkm);
-  }
 
-  // Q s2r once: the A fragment is loop-invariant (persist-D), so every QK
-  // step below runs as gemm_rs (K-only smem loads).
-  auto sQ = make_tensor(make_smem_ptr(q_base), SmemLayoutQ{});
+  // Prologue, Sage2 style. Q settles first (one group, fully drained),
+  // then the pipeline fill commits K/V[0..kS-1] in order -- 2*kS groups
+  // in flight. When Q shares the K stage0 storage, both of Q's smem
+  // readers (smooth-K dot, Q s2r) drain CTA-wide before K[0] issues.
   auto tCrQ = thr_mma_qk.partition_fragment_A(sQ);
   auto tQsQ_s2r = s2r_thr_q.partition_S(sQ);
   {
+    g2s_load_q();
+    cp_async_fence();
+    cp_async_wait<0>();
+    __syncthreads();  // Q settle, CTA-visible
+
+    // Smooth-K dot correction (lse += scale_orig * qs * qkm[row]); reads
+    // the smem Q tile before the A-fragment is moved to regs.
+    if (smooth_lse)
+      smooth_k_qk_dot<kHeadDim, kORows>(
+          sQ, tScS_rc, km + static_cast<long>(kv_bh) * kHeadDim, qkm);
+
+    // Q s2r once: the A fragment is loop-invariant (persist-D), so every
+    // QK step below runs as gemm_rs (K-only smem loads).
     auto tXrQ = s2r_thr_q.retile_D(tCrQ);
 #pragma unroll
     for (int tile_k = 0; tile_k < size<2>(tCrQ); ++tile_k)
       copy(s2r_copy_q, tQsQ_s2r(_, _, tile_k), tXrQ(_, _, tile_k));
+
+    __syncthreads();  // Q storage drained CTA-wide -> K[0] may overwrite
+    // Fill the pipeline: K/V[0..kS-1] commit in order. Past-Tc_eff slots
+    // commit empty groups so the steady-state wait depth stays exact.
+    for (int s = 0; s < kS; ++s) {
+      if (s < Tc_eff)
+        issue_k(s);
+      cp_async_fence();
+      if (s < Tc_eff)
+        issue_v(s);
+      cp_async_fence();
+    }
   }
 
-  ReorgC8bitToA8bit reorg;
   PackC8bitToA8bitPermVT perm_pack;
+  using PLayer = Layout<Shape<Shape<_4, _2, _2>, _1, Int<kBc / 32>>>;
 
-#pragma unroll 1
-  for (int kv_tile = 0; kv_tile < Tc_eff; ++kv_tile) {
-    const int k_stg = kv_tile % kStages;
-    const int v_stg = kv_tile % kStages;
+  // One KV tile. `masked == false` is a compile-time constant at the
+  // main-loop call site, so the mask code only exists in the tail copy.
+  auto process_tile = [&](int kv_tile, bool masked) {
+    // K scale: per-block (1 per tile) or per-thread (4 per tile, the lane's
+    // C-frag column group lane%4 covers cols {2*(lane%4)+8n, +1}).
+    const float ks =
+        kQKPerThread ? k_scale[static_cast<long>(kv_bh) * (n_rb_kv * 4) +
+                               kv_tile * 4 + (tid % 32) % 4]
+                     : k_scale[static_cast<long>(kv_bh) * n_rb_kv + kv_tile];
+    // Per-channel V: v_scale is (bh, D); vs is unused in-tile (P uses the
+    // fixed compile-time scale, the epilogue dequants per D column).
+    const float vs =
+        kVPerChannel ? 1.0f
+                     : v_scale[static_cast<long>(kv_bh) * n_rb_kv + kv_tile];
+    const float p_quant_scale =
+        kVPerChannel ? kPQuantScalePerCh : vs * kE4m3Max;
 
-    // K scale: per-block (1 per kBc-col block).
-    const float ks = k_scale[static_cast<long>(kv_bh) * n_rb_kv + kv_tile];
-    // V scale: per-block (P uses fixed 448 scale; epilogue dequants).
-    const float vs = v_scale[static_cast<long>(kv_bh) * n_rb_kv + kv_tile];
-
-    // QK GEMM: gemm_rs with the loop-invariant Q A-fragment in regs.
-    cp_async_wait<kStages * 2 - 1>();
+    // ---- QK: K-only smem loads feed the resident Q A-fragment ----
+    // Steady state holds 2*kS groups in flight at the iteration head;
+    // waiting for <= 2*kS-1 settles the oldest, K[t] (V[t-1] landed at
+    // the previous iteration's wait).
+    cp_async_wait<2 * kS - 1>();
     __syncthreads();
 
-    auto sK = make_tensor(make_smem_ptr(k_base + k_stg * kKTileElements),
-                          SmemLayoutK{});
-    auto tCrK = thr_mma_qk.partition_fragment_B(sK);
-    auto tKsK_s2r = s2r_thr_k.partition_S(sK);
-
-    auto tCrS = partition_fragment_C(tiled_mma_qk, Shape<Int<kBr>, Int<kBc>>{});
+    auto sK_t = sK_st(_, _, kv_tile % kS);
+    auto tKsK_t = s2r_thr_k.partition_S(sK_t);
+    auto tCrK = thr_mma_qk.partition_fragment_B(sK_t);
+    ScoreFrag tCrS;
     clear(tCrS);
-    ffpa_cute::gemm_rs(tCrS, tCrQ, tCrK, tKsK_s2r, tiled_mma_qk, s2r_copy_k,
+    ffpa_cute::gemm_rs(tCrS, tCrQ, tCrK, tKsK_t, tiled_mma_qk, s2r_copy_k,
                        s2r_thr_k);
 
-    // int8 QK: cast the s32 acc to f32 in place (identity on the e4m3
-    // path); S enters the log2 domain with qs*ks folded in below.
+    // int8 QK: cast the s32 acc to f32 in place (identity view on the
+    // e4m3 path, whose accumulator is already f32).
     auto tCrSf =
         make_tensor(reinterpret_cast<float*>(tCrS.data()), tCrS.layout());
     if constexpr (Traits::kQKInt8) {
@@ -336,7 +410,6 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
       for (int i = 0; i < size(tCrS); ++i)
         tCrSf(i) = static_cast<float>(tCrS(i));
     }
-
     auto scores = make_tensor(
         tCrSf.data(), ffpa_cute::convert_layout_acc_rowcol(tCrS.layout()));
 
@@ -345,8 +418,8 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
       float bias_inv[kSRows];
 #pragma unroll
       for (int row = 0; row < kSRows; ++row)
-        bias_inv[row] = 1.0f / (qs * ks * scale_orig);
-      const int bias_q_valid = min(kBr, Nq - Br_base);
+        bias_inv[row] = 1.0f / (qs_arr[row] * ks * scale_orig);
+      const int bias_q_valid = min(kBr, Nq - q_start_row - Br_base);
       const int bias_kv_valid = min(kBc, Nkv - kv_tile * kBc);
       const bool full_tile = bias_q_valid >= kBr && bias_kv_valid >= kBc;
       if (__builtin_expect(full_tile, 1))
@@ -354,180 +427,193 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
             decltype(scores), decltype(tScS_rc), kSRows, kSCols, false>(
             scores, tScS_rc, attn_bias, attn_bias_dtype, attn_bias_stride_b,
             attn_bias_stride_h, attn_bias_stride_m, attn_bias_stride_n, Nb_id,
-            Nh_id, Br_base, kv_tile, kBc, bias_inv, bias_q_valid,
+            Nh_id, q_start_row + Br_base, kv_tile, kBc, bias_inv, bias_q_valid,
             bias_kv_valid);
       else
         ffpa_cute::apply_attn_bias_quant_rowcol<
             decltype(scores), decltype(tScS_rc), kSRows, kSCols, true>(
             scores, tScS_rc, attn_bias, attn_bias_dtype, attn_bias_stride_b,
             attn_bias_stride_h, attn_bias_stride_m, attn_bias_stride_n, Nb_id,
-            Nh_id, Br_base, kv_tile, kBc, bias_inv, bias_q_valid,
+            Nh_id, q_start_row + Br_base, kv_tile, kBc, bias_inv, bias_q_valid,
             bias_kv_valid);
     }
 
     // Boundary masking (kv_valid / causal) in the raw score domain.
     const int kv_valid = Nkv - kv_tile * kBc;
-    const bool tile_needs_mask =
-        (kv_valid < kBc) || (kv_tile >= mask_start_tile);
-    if (tile_needs_mask) {
+    bool tile_needs_mask = false;
+    if (masked) {
+      tile_needs_mask = (kv_valid < kBc) || (kv_tile >= mask_start_tile);
+      if (tile_needs_mask) {
 #pragma unroll
-      for (int row = 0; row < kSRows; ++row) {
-        const int q_pos = Br_base + get<0>(tScS_rc(row, 0)) + kv_offset;
+        for (int row = 0; row < kSRows; ++row) {
+          const int q_pos =
+              q_start_row + Br_base + get<0>(tScS_rc(row, 0)) + kv_offset;
 #pragma unroll
-        for (int col = 0; col < kSCols; ++col) {
-          float s = scores(row, col) * qs * ks * scale;
-          if (get<1>(tScS_rc(row, col)) >= kv_valid)
-            s = -INFINITY;
-          if (kv_tile >= mask_start_tile) {
-            const int k_pos = kv_tile * kBc + get<1>(tScS_rc(row, col));
-            if (k_pos > q_pos)
+          for (int col = 0; col < kSCols; ++col) {
+            float s = scores(row, col) * qs_arr[row] * ks * scale;
+            if (get<1>(tScS_rc(row, col)) >= kv_valid)
               s = -INFINITY;
+            if (kv_tile >= mask_start_tile) {
+              const int k_pos = kv_tile * kBc + get<1>(tScS_rc(row, col));
+              if (k_pos > q_pos)
+                s = -INFINITY;
+            }
+            scores(row, col) = s;
           }
-          scores(row, col) = s;
         }
       }
     }
 
-    float row_scale[kORows];
-    // Fixed P quant scale: per-block V folds vs into P (P8 = P*vs*448), so
-    // vs cancels in the PV MMA and o_acc lives in one fixed domain.
-    const float p_quant_scale = vs * kE4m3Max;
-    // Fixed mode (kPQuantPerRow=false): fold the P quant scale into the
-    // exp2 offset; row_sum is recovered from a tensor-core row-sum over the
-    // quantized P (pscale_rowsum_mma), so kRowSumViaMma=true. kMaxScaleAfter
-    // mirrors the sm120 gate (only the int8 QK + f16-acc PV combo defers the
-    // max pass scaling).
-    constexpr bool kMaxScaleAfter = Traits::kQKInt8 && kPVAccF16;
-    const float s_dequant = qs * ks;
-    const float softmax_scale_eff = tile_needs_mask ? 1.0f : s_dequant * scale;
-    online_softmax_fp8_fixed<true, decltype(scores), decltype(tScS_rc), kORows,
-                             kMaxScaleAfter>(
-        scores, tScS_rc, softmax_scale_eff, row_max, row_sum, row_scale,
-        log2f(p_quant_scale), 1.0f / p_quant_scale, Traits::kRescaleThreshold);
-
-    // Rescale o_acc (online softmax, thread-private per-row decision).
-    constexpr bool kFuseRescaleAbsorb = kPVAccF16;
-    if (kv_tile > 0 && !kFuseRescaleAbsorb) {
-      auto tCrO = make_tensor(make_rmem_ptr(o_acc), OFragLayout{});
-      auto tCrO_rc = make_tensor(
-          tCrO.data(), ffpa_cute::convert_layout_acc_rowcol(tCrO.layout()));
+    // Fixed P quant scale: per-block V folds vs into P (P8 = P*vs*448),
+    // so vs cancels in the PV MMA and RO lives in one fixed domain; the
+    // per-channel path keeps the compile-time kPQuantScalePerCh domain and
+    // dequants per D column in the epilogue. kMaxScaleAfter holds only for
+    // the int8-QK + f16-inst combo. Per-thread QK pre-dequants the scores
+    // per row (each row's qs differs), so softmax sees plain 'scale'.
+    if constexpr (kQKPerThread) {
+      if (!tile_needs_mask) {
 #pragma unroll
-      for (int row = 0; row < kORows; ++row) {
-        if (row_scale[row] < 1.0f) {
+        for (int row = 0; row < kSRows; ++row) {
+          const float sd = qs_arr[row] * ks;
 #pragma unroll
-          for (int col = 0; col < kOCols; ++col)
-            tCrO_rc(row, col) *= row_scale[row];
+          for (int col = 0; col < kSCols; ++col)
+            scores(row, col) *= sd;
         }
       }
-    }
-
-    // P -> e4m3 A operand (pre-scaled by the fixed-mode softmax; the
-    // reorg-free perm pack pairs with the kVTPerm V^T from pre-kernel).
-    auto tCrP =
-        make_tensor(reinterpret_cast<Element*>(tCrSf.data()),
-                    Layout<Shape<Shape<_4, _2, _2>, _1, Int<kBc / 32>>>{});
-    if constexpr (kReorgFree) {
-      quantize_p_frag_prescaled(tCrSf, perm_pack);
+      online_softmax_fp8_fixed<true, decltype(scores), decltype(tScS_rc),
+                               kORows, Traits::kQKInt8>(
+          scores, tScS_rc, tile_needs_mask ? 1.0f : scale, row_max, row_sum,
+          row_scale, log2f(p_quant_scale), 1.0f / p_quant_scale,
+          Traits::kRescaleThreshold);
     } else {
-      quantize_p_frag_prescaled(tCrSf, reorg);
+      online_softmax_fp8_fixed<true, decltype(scores), decltype(tScS_rc),
+                               kORows, Traits::kQKInt8>(
+          scores, tScS_rc, tile_needs_mask ? 1.0f : qs_arr[0] * ks * scale,
+          row_max, row_sum, row_scale, log2f(p_quant_scale),
+          1.0f / p_quant_scale, Traits::kRescaleThreshold);
     }
 
-    // PV GEMM. Tensor-core row sum over the quantized P regs, then the fp8
-    // PV MMA accumulates into o_acc (f16-acc inst_buf absorbs the rescale).
-    cp_async_wait<kStages * 2 - 2>();
-    __syncthreads();
+    // f32 score storage -> packed e4m3 PV A operand (perm pack binds the
+    // kVTPerm V^T from the quantize pre-kernel).
+    auto tCrP = make_tensor(reinterpret_cast<Element*>(tCrSf.data()), PLayer{});
+    quantize_p_frag_prescaled(tCrSf, perm_pack);
 
-    auto sV = make_tensor(make_smem_ptr(v_base + v_stg * kVTileElements),
-                          SmemLayoutV{});
-    auto tCrV = thr_mma_pv.partition_fragment_B(sV);
-    auto tVsV_s2r = s2r_thr_v.partition_S(sV);
+    // ---- V settle + K drain, one sync for both: the wait settles V[t]
+    // (second-oldest in-flight group after K[t]); the barrier certifies
+    // QK's LDSM readers drained K stage t%kS CTA-wide, so it can be
+    // refilled with K[t+kS] to overlap PV. Empty commits past the
+    // pipeline tail keep the in-flight group count exact.
+    cp_async_wait<2 * kS - 2>();  // settles V[t]
+    __syncthreads();
+    if (kv_tile + kS < Tc_eff)
+      issue_k(kv_tile + kS);
+    cp_async_fence();
+
+    auto sV_t = sV_st(_, _, kv_tile % kS);
+    auto tVsV_t = s2r_thr_v.partition_S(sV_t);
+    auto tCrV = thr_mma_pv_f16.partition_fragment_B(sV_t);
 
     pscale_rowsum_mma(tCrP, row_sum, 1.0f / p_quant_scale);
-    if constexpr (kPVAccF16) {
-      auto s2r_thr_pv_f16 = s2r_thr_v_f16;
-      auto tCrV_f16 = thr_mma_pv_f16.partition_fragment_B(sV);
-      auto tVsV_s2r_f16 = s2r_thr_pv_f16.partition_S(sV);
-      auto tCrInst = partition_fragment_C(tiled_mma_pv_f16,
-                                          Shape<Int<kBr>, Int<kHeadDim>>{});
-      clear(tCrInst);
-      ffpa_cute::gemm_rs(tCrInst, tCrP, tCrV_f16, tVsV_s2r_f16,
-                         tiled_mma_pv_f16, s2r_copy_v_f16, s2r_thr_v_f16);
-      auto tCrO = make_tensor(make_rmem_ptr(o_acc), OFragLayout{});
-      auto tCrO_rc = make_tensor(
-          tCrO.data(), ffpa_cute::convert_layout_acc_rowcol(tCrO.layout()));
-      auto tCrInst_rc =
-          make_tensor(tCrInst.data(),
-                      ffpa_cute::convert_layout_acc_rowcol(tCrInst.layout()));
+
+    OFrag16 inst;
+    clear(inst);
+    ffpa_cute::gemm_rs(inst, tCrP, tCrV, tVsV_t, tiled_mma_pv_f16, s2r_copy_v,
+                       s2r_thr_v);
+
+    // RO = RO*rs + inst, one fused fmaf per element; rs is skipped on
+    // the first tile (RO is zero anyway).
+    {
+      auto ro_rc = make_tensor(make_rmem_ptr(ro), ORC16Layout{});
+      auto inst_rc = make_tensor(inst.data(), ORC16Layout{});
 #pragma unroll
       for (int row = 0; row < kORows; ++row) {
         const float rs =
             (kv_tile > 0 && row_scale[row] < 1.0f) ? row_scale[row] : 1.0f;
 #pragma unroll
         for (int col = 0; col < kOCols; ++col)
-          tCrO_rc(row, col) =
-              fmaf(tCrO_rc(row, col), rs, float(tCrInst_rc(row, col)));
+          ro_rc(row, col) = fmaf(ro_rc(row, col), rs, float(inst_rc(row, col)));
       }
-    } else {
-      auto tCrO = make_tensor(make_rmem_ptr(o_acc), OFragLayout{});
-      ffpa_cute::gemm_rs(tCrO, tCrP, tCrV, tVsV_s2r, tiled_mma_pv, s2r_copy_v,
-                         s2r_thr_v);
     }
 
-    // All threads finished reading K[t]/V[t] stages: safe to reissue the
-    // stage slots for tile t+S (the loop-tail commits of the group FIFO).
-    // Drain tiles commit two EMPTY groups so C(t)=1+2S+2t holds through
-    // the last tile and the depth-limited in-loop waits (2S-1/2S-2) keep
-    // settling exactly K[t]/V[t] (empty groups complete instantly).
+    // ---- V[t] drained: refill its stage with V[t+kS] ----
+    // V[t+kS] then overlaps the next tile's K wait + QK + softmax.
     __syncthreads();
-    {
-      const int kv_next = kv_tile + kStages;
-      if (kv_next < Tc_eff) {
-        g2s_load_k(kv_next, k_stg);
-        cp_async_fence();
-        g2s_load_v(kv_next, v_stg);
-        cp_async_fence();
-      } else {
-        cp_async_fence();
-        cp_async_fence();
-      }
-    }
-  }
+    if (kv_tile + kS < Tc_eff)
+      issue_v(kv_tile + kS);
+    cp_async_fence();
+  };
+
+  // tail_start: first tile needing any per-element mask (causal diagonal
+  // or the out-of-bounds tail); tiles before it run a mask-free body.
+  const int oob_start = (Nkv % kBc == 0) ? Tc : (Nkv - 1) / kBc;
+  const int tail_start = min(mask_start_tile, oob_start);
+
+#pragma unroll 1
+  for (int kv_tile = 0; kv_tile < tail_start && kv_tile < Tc_eff; ++kv_tile)
+    process_tile(kv_tile, false);
+#pragma unroll 1
+  for (int kv_tile = tail_start; kv_tile < Tc_eff; ++kv_tile)
+    process_tile(kv_tile, true);
   cp_async_wait<0>();
 
-  // Phase 4: Epilogue. Dequant o_acc (fixed mode keeps the single
-  // 1/p_quant_scale domain), normalize, convert, store R->G.
+  // ---- Epilogue: dequant, normalize, store ----
   {
-    const int O_gmem_offset =
-        (Nb_id * Nh * Nq * kHeadDim) + (Nh_id * Nq * kHeadDim);
-    auto mO = make_tensor(make_gmem_ptr(O + O_gmem_offset),
-                          make_shape(Nq, Int<kHeadDim>{}),
-                          make_stride(Int<kHeadDim>{}, _1{}));
+    auto mO = make_tensor(
+        make_gmem_ptr(O + (Nb_id * Nh * Nq * kHeadDim) +
+                      Nh_id * Nq * kHeadDim +
+                      static_cast<long>(q_start_row) * kHeadDim),
+        make_shape(Nq, Int<kHeadDim>{}), make_stride(Int<kHeadDim>{}, _1{}));
     auto gO = local_tile(mO, Shape<Int<kBr>, Int<kHeadDim>>{},
                          make_coord(Q_tile_id, _0{}));
-    auto tCgO = thr_mma_pv.partition_C(gO);
+    auto tCgO = thr_mma_pv_f16.partition_C(gO);
     auto cO = make_identity_tensor(Shape<Int<kBr>, Int<kHeadDim>>{});
-    auto tOcO = thr_mma_pv.partition_C(cO);
+    auto tOcO = thr_mma_pv_f16.partition_C(cO);
 
-    auto tCrO = make_tensor(make_rmem_ptr(o_acc), OFragLayout{});
-    auto tCrO_rc = make_tensor(
-        tCrO.data(), ffpa_cute::convert_layout_acc_rowcol(tCrO.layout()));
+    auto ro_rc = make_tensor(make_rmem_ptr(ro), ORC16Layout{});
+    auto tOHalf = ffpa_cute::convert_type<ElementO>(OFrag16{});
+    auto tOH_rc = make_tensor(
+        tOHalf.data(), ffpa_cute::convert_layout_acc_rowcol(tOHalf.layout()));
+    // Per-channel V: dequant per D column in the epilogue (P8 domain is the
+    // compile-time kPQuantScalePerCh; MMA emits (pqs/vs_d)*O_unnorm).
+    // smooth_v: V8 = (V - mean_d)/vs_d, so the mean adds back per column.
+    float vs_d_col[kVPerChannel ? kOCols : 1];
+    float vm_d_col[kVPerChannel ? kOCols : 1];
+    const float* vm_base = nullptr;
+    if constexpr (kVPerChannel) {
+      auto tOcO_rc = make_tensor(
+          tOcO.data(), ffpa_cute::convert_layout_acc_rowcol(tOcO.layout()));
+      const float* vs_d_base = v_scale + static_cast<long>(kv_bh) * kHeadDim;
+      vm_base = vm ? (vm + static_cast<long>(kv_bh) * kHeadDim) : nullptr;
+#pragma unroll
+      for (int col = 0; col < kOCols; ++col) {
+        const int d_idx = get<1>(tOcO_rc(0, col));
+        vs_d_col[col] = vs_d_base[d_idx];
+        if (vm_base)
+          vm_d_col[col] = vm_base[d_idx];
+      }
+    }
 #pragma unroll
     for (int row = 0; row < kORows; ++row) {
       const float inv_sum = (row_sum[row] == 0.0f) ? 1.0f : 1.0f / row_sum[row];
-      const float mul = inv_sum * kFP8FixedPScale;
 #pragma unroll
-      for (int col = 0; col < kOCols; ++col)
-        tCrO_rc(row, col) *= mul;
+      for (int col = 0; col < kOCols; ++col) {
+        const float mul = kVPerChannel
+                              ? inv_sum * vs_d_col[col] / kPQuantScalePerCh
+                              : inv_sum * kFP8FixedPScale;
+        const float o = vm_base ? fmaf(ro_rc(row, col), mul, vm_d_col[col])
+                                : ro_rc(row, col) * mul;
+        tOH_rc(row, col) = ElementO(o);
+      }
     }
-    auto tCrOHalf = ffpa_cute::convert_type<ElementO>(tCrO);
-    if (Br_base + kBr <= Nq) {
-      copy(tCrOHalf, tCgO);
+
+    if (Br_base + kBr <= Nq - q_start_row) {
+      copy(tOHalf, tCgO);
     } else {
 #pragma unroll
-      for (int i = 0; i < size(tCrOHalf); ++i) {
-        const int global_row = Br_base + get<0>(tOcO(i));
+      for (int i = 0; i < size(tOHalf); ++i) {
+        const int global_row = q_start_row + Br_base + get<0>(tOcO(i));
         if (global_row < Nq)
-          tCgO(i) = tCrOHalf(i);
+          tCgO(i) = tOHalf(i);
       }
     }
 
@@ -537,8 +623,8 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
       for (int row = 0; row < kORows; ++row) {
         float lse = (row_max[row] + log2f(row_sum[row])) * FFPA_M_LN2;
         if (smooth_lse)
-          lse += scale_orig * qs * qkm[row];
-        const int global_row = Br_base + get<0>(tScS_rc(row, 0));
+          lse += scale_orig * qs_arr[row] * qkm[row];
+        const int global_row = q_start_row + Br_base + get<0>(tScS_rc(row, 0));
         if (global_row < Nq)
           softmax_lse[lse_base + global_row] = lse;
       }
