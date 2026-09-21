@@ -9,7 +9,11 @@
 #include <cstdlib>
 
 #include "launch/common.cuh"
-#if defined(ENABLE_FFPA_CUTE_EXT) && defined(ENABLE_FFPA_TMA_EXT)
+// The sm89 launcher is TMA-free (cp.async host glue); it compiles under
+// the full TMA ext as well as the sm_89-only ext (real Ada builds where
+// TMA must stay off).
+#if defined(ENABLE_FFPA_CUTE_EXT) && \
+    (defined(ENABLE_FFPA_TMA_EXT) || defined(ENABLE_FFPA_FP8_SM89_EXT))
 #include "cute/fp8/quantize_fp8.cuh"
 #include "cute/fp8/prepare_inputs.cuh"
 #include "generated/fwd_cute_fp8_preprocess.cuh"  // extern templates

@@ -10,7 +10,10 @@
 
 namespace ffpa {
 
-#ifdef ENABLE_FFPA_TMA_EXT
+// Full sm120 family (persist/split/m4n2 + variant tables) needs TMA_EXT;
+// the TMA-free sm_89 kernel (persist_d, D<=224) also compiles under the
+// sm_89-only ext for real Ada builds where TMA must stay off.
+#if defined(ENABLE_FFPA_TMA_EXT) || defined(ENABLE_FFPA_FP8_SM89_EXT)
 template <typename kDataType, const int kHeadDim, const int kStage>
 void ffpa_fwd_fp8(const FfpaFwdParams& p) {
   // q/k quant: per_block (0) for all headdims; per_thread (2) for
@@ -20,7 +23,7 @@ void ffpa_fwd_fp8(const FfpaFwdParams& p) {
               "ffpa_attn: Q/K quant method must be both per_block or "
               "both per_thread");
 #ifdef ENABLE_FFPA_CUTE_EXT
-#ifdef ENABLE_FFPA_FP8_BUILD_DEBUG
+#if defined(ENABLE_FFPA_FP8_BUILD_DEBUG) && defined(ENABLE_FFPA_TMA_EXT)
   // EXPERIMENT: FFPA_FP8_FORCE_KERNEL=split_d|m4n2 forces a specific
   // split-D kernel to A/B test the M8N1/M4N2 dispatch cross-point.
   // Applies only to 224 < D <= 1024; persist-D (D<=224) is unaffected.
@@ -50,7 +53,7 @@ void ffpa_fwd_fp8(const FfpaFwdParams& p) {
       }
     }
   }
-#endif  // ENABLE_FFPA_FP8_BUILD_DEBUG
+#endif  // ENABLE_FFPA_FP8_BUILD_DEBUG && ENABLE_FFPA_TMA_EXT
   // NHD (diffusers BNHD) views and strided fused-QKV rows compose
   // with hybrid across persist-D/split-D/m4n2 (RFC FC-3): the fp16
   // stage-1 kernels consume them natively, prepare_hybrid_stage1
@@ -142,6 +145,7 @@ void ffpa_fwd_fp8(const FfpaFwdParams& p) {
       }
       return;
     }
+#ifdef ENABLE_FFPA_TMA_EXT
     if (p.fp8_hybrid && p.Nq >= p.fp8_hybrid_n_early) {
       const int n_early = static_cast<int>(p.fp8_hybrid_n_early);
       TORCH_CHECK(n_early % 128 == 0,
@@ -274,6 +278,16 @@ void ffpa_fwd_fp8(const FfpaFwdParams& p) {
           /*q_start_row=*/0, p.fp8_hadamard);
     }
   }
+#else
+    // sm_89-only build (no TMA ext): only the sm89 persist-D kernel family
+    // exists. on_sm89 already rejects D>224 loudly for D>224 instantiations;
+    // this raise covers the remaining sm120-only routes (on_sm89==false,
+    // e.g. force_sm89 off on a major>=12 device with a TMA-less build).
+  }
+  TORCH_CHECK(false,
+              "ffpa_attn: fp8 beyond the sm89 persist-D family (D<=224) "
+              "requires ENABLE_FFPA_TMA_EXT");
+#endif
 #else
   TORCH_CHECK(false, "ffpa_attn: cute ext not compiled");
 #endif

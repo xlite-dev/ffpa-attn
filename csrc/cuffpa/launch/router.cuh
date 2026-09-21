@@ -243,11 +243,18 @@ void launch_ffpa_attn_fwd_template(
   p.d_padded = d_padded;
   p.qkv_padded = qkv_padded;
   p.has_attn_bias = has_attn_bias;
-#ifdef ENABLE_FFPA_TMA_EXT
+// The fp8 route also compiles under the sm_89-only ext (TMA-free kernel);
+// every entry below is a dispatch.cuh template declaration, so the TU set
+// (not this guard) decides what links.
+#if defined(ENABLE_FFPA_TMA_EXT) || defined(ENABLE_FFPA_FP8_SM89_EXT)
   if ((force_tma || force_cute_tma || force_fp8 || force_fp4) &&
       !force_native && !force_cute) {
     auto prop = at::cuda::getCurrentDeviceProperties();
-    if (prop->major >= 9) {
+    // fp8 additionally admits real Ada (sm_89, major==8 minor>=9): the
+    // fp8 family has a TMA-free sm_89 persist-D kernel (dispatch picks
+    // it via on_sm89 = major<12). Everything else below needs sm_90+.
+    if (prop->major >= 9 ||
+        (force_fp8 && !force_fp4 && prop->major == 8 && prop->minor >= 9)) {
       if (force_fp4) {
         ffpa::ffpa_fwd_fp4<kDataType, kHeadDim, kStage>(p);
         return;
@@ -284,7 +291,7 @@ void launch_ffpa_attn_fwd_template(
       return;
     }
   }
-#endif  // ENABLE_FFPA_TMA_EXT
+#endif  // ENABLE_FFPA_TMA_EXT || ENABLE_FFPA_FP8_SM89_EXT
 
 #ifdef ENABLE_FFPA_CUTE_EXT
   // CuTe cp.async path: sm_80+ without TMA (tma=0 or sm<90).

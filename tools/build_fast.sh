@@ -275,6 +275,11 @@ if [[ "${ENABLE_FFPA_TMA_EXT:-0}" == "1" ]]; then
     echo "[build_fast] all target archs are sm<90; disabling ENABLE_FFPA_TMA_EXT" \
          "(TMA needs sm>=90; cute falls back to the SM80 cp.async path)"
     export ENABLE_FFPA_TMA_EXT=0
+    # The fp8 family has a TMA-free sm_89 kernel (persist_d, D<=224) that
+    # only needs cp.async: keep it compiled on sm_89-only builds so real
+    # Ada GPUs (L20/L40, major=8 minor=9) get a working fp8 path instead
+    # of silently falling back to fp16.
+    export ENABLE_FFPA_FP8_SM89_EXT=1
   fi
 fi
 
