@@ -40,8 +40,12 @@ class CudaBackendImpl(enum.IntEnum):
   TMA = 2
   CUTE = 3
   CUTE_TMA = 4
-  CUTE_TMA_FP8 = 5
-  CUTE_TMA_FP4 = 6
+  # TMA kernel families; ffpa-attn ships sm_120 variants only. Future
+  # Hopper/Blackwell-datacenter specialisations get their own entries.
+  CUTE_TMA_FP8_SM_120 = 5
+  CUTE_TMA_FP4_SM_120 = 6
+  # TMA-free cp.async fp8 persist-D family (D<=224), sm_89 target.
+  CUTE_FP8_SM_89 = 7
 
 
 def set_cuda_backend_impl(impl: CudaBackendImpl) -> None:

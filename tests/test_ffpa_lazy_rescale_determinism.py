@@ -42,9 +42,9 @@ pytestmark = pytest.mark.skipif(
 _CASES = [
   ("fp16_persist", CudaBackendImpl.CUTE_TMA, False, False, 128),
   ("fp16_split", CudaBackendImpl.CUTE_TMA, False, False, 320),
-  ("fp8_split", CudaBackendImpl.CUTE_TMA_FP8, True, False, 320),
-  ("fp4_persist", CudaBackendImpl.CUTE_TMA_FP4, False, True, 128),
-  ("fp4_split", CudaBackendImpl.CUTE_TMA_FP4, False, True, 320),
+  ("fp8_split", CudaBackendImpl.CUTE_TMA_FP8_SM_120, True, False, 320),
+  ("fp4_persist", CudaBackendImpl.CUTE_TMA_FP4_SM_120, False, True, 128),
+  ("fp4_split", CudaBackendImpl.CUTE_TMA_FP4_SM_120, False, True, 320),
 ]
 
 

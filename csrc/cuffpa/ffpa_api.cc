@@ -54,10 +54,11 @@ void ffpa_attn_fwd_bf16f32(
 //
 // Computes O = softmax(scale * Q@K^T + attn_bias) @ V with optional causal
 // masking and dropout.  Supports fp16/bf16 activations; the FP8 path (backend
-// hint CUTE_TMA_FP8) internally quantizes Q/K/V to e4m3/int8 for low-precision
-// MMA, and the NVFP4 path (backend hint CUTE_TMA_FP4, D=128 only) quantizes
-// Q/K/V to e2m1 with ue4m3 block scales (Q/K smoothed by qm/km means; the
-// delta_s correction restores the exact scores, see cute/fp4/sm_120).
+// hint CUTE_TMA_FP8_SM_120) internally quantizes Q/K/V to e4m3/int8 for
+// low-precision MMA, and the NVFP4 path (backend hint CUTE_TMA_FP4_SM_120,
+// D=128 only) quantizes Q/K/V to e2m1 with ue4m3 block scales (Q/K smoothed by
+// qm/km means; the delta_s correction restores the exact scores, see
+// cute/fp4/sm_120).
 //
 // Tensor args (all CUDA, row-major [B, H, N, D]):
 //   Q            [B, Nh_q,  Nq,  D]  fp16/bf16 query.
@@ -79,7 +80,7 @@ void ffpa_attn_fwd_bf16f32(
 //   dropout_p    Dropout probability on attention weights.  0 = disabled.
 //   philox_seed/offset  RNG seed/offset for the dropout mask.
 //
-// FP8-only args (ignored unless backend hint = CUTE_TMA_FP8):
+// FP8-only args (ignored unless backend hint = CUTE_TMA_FP8_SM_120):
 //   fp8_smooth_k     Subtract per-(b,h) K seq mean before quantize.
 //   fp8_smooth_v     Subtract per-D V mean before quantize.
 //                    Requires fp8_v_quant_method=per_channel.
@@ -88,7 +89,7 @@ void ffpa_attn_fwd_bf16f32(
 //   fp8_pv_acc_type  PV accumulator: 0=f16 / 1=f32 (default).
 //   fp8_qk_mm_type   QK MMA dtype: 0=fp8 (default) / 1=int8.
 //
-// FP4-only args (ignored unless backend hint = CUTE_TMA_FP4):
+// FP4-only args (ignored unless backend hint = CUTE_TMA_FP4_SM_120):
 //   fp4_hybrid       2-stage hybrid: fp16 persist-D computes [0:n_early]
 //                   rows, fp4 computes [n_early:N) via q_start_row offset.
 //   fp4_hybrid_n_early  Leading fp16 row count (multiple of 128, default 256).
@@ -108,8 +109,9 @@ void ffpa_attn_fwd_bf16f32(
 //                smoothing (qm/km + delta_s + lse correction) is always on
 //                in the fp4 path - mandatory for e2m1 accuracy - so this
 //                flag only adds the V side.
-//   fp8_sm89     FP8 only: force the sm89 persist-D kernel (cp.async, no
-//                TMA). Also auto-selected on any major < 12 device.
+//   fp8_sm89     Deprecated no-op: sm89 vs sm120 fp8 selection is resolved
+//                into the CUTE_FP8_SM_89 / CUTE_TMA_FP8_SM_120 backend
+//                hint by the Python layer before launch.
 void ffpa_attn_forward(
     torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor attn_bias,
     torch::Tensor O, torch::Tensor softmax_lse, int64_t stages, int64_t acc,
@@ -150,7 +152,7 @@ void ffpa_attn_forward(
   const int head_dim_og = Q.size(3);
   const int head_dim_pad = (head_dim_og + 31) & ~31;
   const auto pad_backend = ffpa::get_backend_impl_hint();
-  const bool is_fp4 = pad_backend == ffpa::CudaBackendImpl::CUTE_TMA_FP4;
+  const bool is_fp4 = pad_backend == ffpa::CudaBackendImpl::CUTE_TMA_FP4_SM_120;
   // fp4 pads to its own 64-multiple support set (persist-D [64,256],
   // split-D (256,768), split-D m4n2 [768,1024]); Q/K/V are zero-padded by
   // the cuffpa launcher, only O is padded here (fp8 style).
@@ -158,7 +160,7 @@ void ffpa_attn_forward(
   TORCH_CHECK(
       !is_fp4 || (head_dim_og % 8 == 0 && head_dim_pad_fp4 >= 64 &&
                   head_dim_pad_fp4 <= 1024),
-      "ffpa_attn: the NVFP4 path (CUTE_TMA_FP4) requires head_dim %8==0 "
+      "ffpa_attn: the NVFP4 path (CUTE_TMA_FP4_SM_120) requires head_dim %8==0 "
       "within [8,1024] (any such D pads up to the nearest 64-multiple), "
       "got D=",
       head_dim_og);
@@ -335,7 +337,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         ffpa::set_backend_impl_hint(static_cast<ffpa::CudaBackendImpl>(impl));
       },
       "Set CUDA backend implementation hint (0=AUTO, 1=NATIVE, 2=TMA, 3=CUTE, "
-      "4=CUTE_TMA, 5=CUTE_TMA_FP8)");
+      "4=CUTE_TMA, 5=CUTE_TMA_FP8_SM_120, 6=CUTE_TMA_FP4_SM_120, "
+      "7=CUTE_FP8_SM_89)");
   m.def(
       "get_cuda_backend_impl",
       []() { return static_cast<int>(ffpa::get_backend_impl_hint()); },

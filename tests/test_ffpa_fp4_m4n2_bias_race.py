@@ -64,7 +64,7 @@ pytestmark = [
 
 
 def _run(q, k, v, backend, bias):
-  set_cuda_backend_impl(CudaBackendImpl.CUTE_TMA_FP4)
+  set_cuda_backend_impl(CudaBackendImpl.CUTE_TMA_FP4_SM_120)
   o, _ = _ffpa_attn_forward_cuda(
     q, k, v, None, bias, backend.stages, backend.acc_code, 0,
     1.0 / math.sqrt(q.size(-1)), 0.0, 0, 0, backend.fp8_smooth_k,

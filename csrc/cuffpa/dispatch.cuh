@@ -43,8 +43,8 @@ struct FfpaFwdParams {
   bool fp4_hadamard = false;
   int64_t fp4_pv_mm_type = 0;
   bool fp4_smooth_v = false;
-  bool fp8_sm89 = false;  // Force the fp8 sm89 persist-D kernel (also auto
-                          // on any major < 12 device; see cute_fp8.cuh).
+  bool fp8_sm89 = false;  // Deprecated no-op: the Python layer resolves
+                          // sm89 selection into the CUTE_FP8_SM_89 hint.
   int64_t Nb = 0;
   int64_t Nh = 0;
   int64_t Nh_kv = 0;
@@ -89,12 +89,12 @@ template <typename kDataType, const int kHeadDim, const int kStage,
           const int kPersistMaxD>
 void ffpa_fwd_fp16_stage1(const FfpaFwdParams& p);
 
-// CUTE_TMA_FP8 family: force-kernel A/B env, persist/split/M4N2 headdim
+// CUTE_TMA_FP8_SM_120 family: force-kernel A/B env, persist/split/M4N2 headdim
 // gates, hybrid orchestration (stage-1 via ffpa_fwd_fp16_stage1<...,224>).
 template <typename kDataType, const int kHeadDim, const int kStage>
 void ffpa_fwd_fp8(const FfpaFwdParams& p);
 
-// CUTE_TMA_FP4 family: headdim gates, hybrid orchestration (stage-1 via
+// CUTE_TMA_FP4_SM_120 family: headdim gates, hybrid orchestration (stage-1 via
 // ffpa_fwd_fp16_stage1<...,256>). kStage is accepted for a uniform TU
 // scheme but unused (fp4 stages are fixed by the traits).
 template <typename kDataType, const int kHeadDim, const int kStage>

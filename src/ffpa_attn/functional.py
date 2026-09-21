@@ -212,15 +212,23 @@ def _adapt_backend_for_fp8_sm89(backend: CUDABackend) -> None:
   backend.fp8_pv_acc_type = "f16"
 
 
-def _apply_cuda_backend_hint(backend: CUDABackend) -> None:
+def _apply_cuda_backend_hint(
+  backend: CUDABackend, device: torch.device
+) -> None:
   """Set C++ backend impl hint from CUDABackend flags before kernel launch.
 
   Mapping: (enable_tma, enable_cute) → hint. No flag set → NATIVE (Legacy).
+  The fp8 family is arch-resolved here: pre-sm120 devices (or an explicit
+  force) resolve to the TMA-free CUTE_FP8_SM_89 kernel, sm120+ to the
+  CUTE_TMA_FP8_SM_120 TMA family.
   """
   if getattr(backend, "enable_fp4", False):
-    set_cuda_backend_impl(CudaBackendImpl.CUTE_TMA_FP4)
+    set_cuda_backend_impl(CudaBackendImpl.CUTE_TMA_FP4_SM_120)
   elif getattr(backend, "enable_fp8", False):
-    set_cuda_backend_impl(CudaBackendImpl.CUTE_TMA_FP8)
+    if _fp8_sm89_active(backend, device):
+      set_cuda_backend_impl(CudaBackendImpl.CUTE_FP8_SM_89)
+    else:
+      set_cuda_backend_impl(CudaBackendImpl.CUTE_TMA_FP8_SM_120)
   elif backend.enable_tma and backend.enable_cute:
     set_cuda_backend_impl(CudaBackendImpl.CUTE_TMA)
   elif backend.enable_tma:
@@ -305,7 +313,7 @@ def _ffpa_attn_forward(
     forward_backend.fp8_hybrid = bool(forward_backend.enable_fp8 and is_causal)
   if forward_backend.fp4_hybrid is None:
     forward_backend.fp4_hybrid = bool(forward_backend.enable_fp4 and is_causal)
-  _apply_cuda_backend_hint(forward_backend)
+  _apply_cuda_backend_hint(forward_backend, query.device)
   _cuda_input_guard_and_mask_downcast(query, None)  # fp16 guard only here
   O, _ = _ffpa_attn_forward_cuda(
     query,
@@ -652,10 +660,13 @@ class CUDABackend(Backend):
     from .cuda import CudaBackendImpl
     """Default pipeline depth for CUDA backend (non-TMA path)."""
     if self.impl_hint in (
-      CudaBackendImpl.CUTE_TMA_FP8, CudaBackendImpl.CUTE_TMA_FP4
+      CudaBackendImpl.CUTE_TMA_FP8_SM_120,
+      CudaBackendImpl.CUTE_TMA_FP4_SM_120,
+      CudaBackendImpl.CUTE_FP8_SM_89,
     ):
-      # fp8/fp4 persist-D sm120 path (smem budget caps stages). The fp8
-      # split-D m4n2 launcher floors this to 3 stages in C++ (PC-8).
+      # quantized paths (sm120 persist-D / sm89 persist-D; smem budget
+      # caps stages). The fp8 split-D m4n2 launcher floors this to 3
+      # stages in C++ (PC-8).
       return 2
     if _is_hopper_or_later():
       if self.impl_hint in (CudaBackendImpl.NATIVE, CudaBackendImpl.TMA):
@@ -670,9 +681,13 @@ class CUDABackend(Backend):
   def impl_hint(self) -> int:
     from .cuda import CudaBackendImpl
     if self.enable_fp4:
-      return CudaBackendImpl.CUTE_TMA_FP4
+      return CudaBackendImpl.CUTE_TMA_FP4_SM_120
     if self.enable_fp8:
-      return CudaBackendImpl.CUTE_TMA_FP8
+      if torch.cuda.is_available() and _fp8_sm89_active(
+        self, torch.device("cuda", torch.cuda.current_device())
+      ):
+        return CudaBackendImpl.CUTE_FP8_SM_89
+      return CudaBackendImpl.CUTE_TMA_FP8_SM_120
     if self.enable_tma and self.enable_cute:
       return CudaBackendImpl.CUTE_TMA
     if self.enable_tma:
@@ -1352,7 +1367,7 @@ class _FFPAAttnFunc(torch.autograd.Function):
     elif isinstance(meta.forward_meta, CUDABackend):
       forward_meta = meta.forward_meta
       assert _ffpa_attn_forward_cuda is not None, "CUDA backend is not available."
-      _apply_cuda_backend_hint(forward_meta)
+      _apply_cuda_backend_hint(forward_meta, q.device)
       attn_bias = _cuda_input_guard_and_mask_downcast(q, attn_bias)
       rng_state = _reserve_large_d_dropout_rng(q, k, meta.attn_meta.dropout_p)
       O, lse = _ffpa_attn_forward_cuda(

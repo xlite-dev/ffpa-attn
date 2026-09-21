@@ -102,8 +102,11 @@ void launch_ffpa_attn_fwd_template(
   const bool force_tma = (impl_hint == ffpa::CudaBackendImpl::TMA);
   const bool force_cute = (impl_hint == ffpa::CudaBackendImpl::CUTE);
   const bool force_cute_tma = (impl_hint == ffpa::CudaBackendImpl::CUTE_TMA);
-  const bool force_fp8 = (impl_hint == ffpa::CudaBackendImpl::CUTE_TMA_FP8);
-  const bool force_fp4 = (impl_hint == ffpa::CudaBackendImpl::CUTE_TMA_FP4);
+  const bool force_fp8 =
+      (impl_hint == ffpa::CudaBackendImpl::CUTE_TMA_FP8_SM_120 ||
+       impl_hint == ffpa::CudaBackendImpl::CUTE_FP8_SM_89);
+  const bool force_fp4 =
+      (impl_hint == ffpa::CudaBackendImpl::CUTE_TMA_FP4_SM_120);
 #ifdef ENABLE_FFPA_CUTE_EXT
 #ifdef ENABLE_FFPA_TMA_EXT
   // NHD (diffusers BNHD) permute-view inputs are consumed natively by the
@@ -257,6 +260,9 @@ void launch_ffpa_attn_fwd_template(
         (force_fp8 && !force_fp4 && prop->major == 8 && prop->minor >= 9)) {
       if (force_fp4) {
 #ifdef ENABLE_FFPA_TMA_EXT
+        TORCH_CHECK(prop->major >= 12,
+                    "ffpa_attn: the CUTE_TMA_FP4_SM_120 family requires an "
+                    "sm_120 device");
         ffpa::ffpa_fwd_fp4<kDataType, kHeadDim, kStage>(p);
 #else
         // fp4 is the sm_120 family and only compiles under the TMA ext;
@@ -313,6 +319,20 @@ void launch_ffpa_attn_fwd_template(
     }
   }
 #endif  // ENABLE_FFPA_TMA_EXT || ENABLE_FFPA_FP8_SM89_EXT
+  // fp8/fp4 hints that found no compiled family or fell through the arch
+  // gate above (quantized ext off, fp8 on pre-sm_89, fp4 below sm_120)
+  // have no kernel for this config: raise instead of silently degrading
+  // to the fp16 family.
+  if (force_fp8 || force_fp4) {
+    auto prop_ft = at::cuda::getCurrentDeviceProperties();
+    TORCH_CHECK(false,
+                "ffpa_attn: the requested quantized family cannot run on "
+                "sm_",
+                prop_ft->major * 10 + prop_ft->minor,
+                force_fp4 ? " (CUTE_TMA_FP4_SM_120 needs sm_120)"
+                          : " (fp8 needs sm_89+ via CUTE_FP8_SM_89, or "
+                            "sm_120 via CUTE_TMA_FP8_SM_120)");
+  }
 
 #ifdef ENABLE_FFPA_CUTE_EXT
   // CuTe cp.async path: sm_80+ without TMA (tma=0 or sm<90).
