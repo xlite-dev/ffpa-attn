@@ -1,4 +1,4 @@
-// CUTE_TMA_FP4 family entry (moved verbatim from the force_fp4 branch of
+// CUTE_TMA_FP4_SM_120 family entry (moved verbatim from the force_fp4 branch of
 // launch.cuh's TMA super-path). Hybrid stage-1 goes through
 // ffpa_fwd_fp16_stage1<...,256> instead of direct fp16 launcher calls.
 #pragma once

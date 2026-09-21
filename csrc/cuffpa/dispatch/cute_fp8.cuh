@@ -1,16 +1,20 @@
-// CUTE_TMA_FP8 family entry (moved verbatim from the force_fp8 branch of
+// CUTE_TMA_FP8_SM_120 family entry (moved verbatim from the force_fp8 branch of
 // the old cute/launch.cuh TMA super-path). Hybrid stage-1 goes through
 // ffpa_fwd_fp16_stage1<...,224> instead of direct fp16 launcher calls.
 #pragma once
 #include <cstdlib>
 #include <cstring>
+#include "backend.h"
 #include "dispatch.cuh"
 #include "dispatch/cute_hybrid.cuh"
 #include "launch/cute_fp8.cuh"
 
 namespace ffpa {
 
-#ifdef ENABLE_FFPA_TMA_EXT
+// Full sm120 family (persist/split/m4n2 + variant tables) needs TMA_EXT;
+// the TMA-free sm_89 kernel (persist_d, D<=224) also compiles under the
+// sm_89-only ext for real Ada builds where TMA must stay off.
+#if defined(ENABLE_FFPA_TMA_EXT) || defined(ENABLE_FFPA_FP8_SM89_EXT)
 template <typename kDataType, const int kHeadDim, const int kStage>
 void ffpa_fwd_fp8(const FfpaFwdParams& p) {
   // q/k quant: per_block (0) for all headdims; per_thread (2) for
@@ -20,7 +24,7 @@ void ffpa_fwd_fp8(const FfpaFwdParams& p) {
               "ffpa_attn: Q/K quant method must be both per_block or "
               "both per_thread");
 #ifdef ENABLE_FFPA_CUTE_EXT
-#ifdef ENABLE_FFPA_FP8_BUILD_DEBUG
+#if defined(ENABLE_FFPA_FP8_BUILD_DEBUG) && defined(ENABLE_FFPA_TMA_EXT)
   // EXPERIMENT: FFPA_FP8_FORCE_KERNEL=split_d|m4n2 forces a specific
   // split-D kernel to A/B test the M8N1/M4N2 dispatch cross-point.
   // Applies only to 224 < D <= 1024; persist-D (D<=224) is unaffected.
@@ -50,7 +54,7 @@ void ffpa_fwd_fp8(const FfpaFwdParams& p) {
       }
     }
   }
-#endif  // ENABLE_FFPA_FP8_BUILD_DEBUG
+#endif  // ENABLE_FFPA_FP8_BUILD_DEBUG && ENABLE_FFPA_TMA_EXT
   // NHD (diffusers BNHD) views and strided fused-QKV rows compose
   // with hybrid across persist-D/split-D/m4n2 (RFC FC-3): the fp16
   // stage-1 kernels consume them natively, prepare_hybrid_stage1
@@ -61,16 +65,21 @@ void ffpa_fwd_fp8(const FfpaFwdParams& p) {
   // D>=768: split-D M4N2 fp8. Same D<768/D>=768 cross-point as the
   // fp16 dispatch (M4N2 wins only for D>=768; below that M8N1 is
   // faster even with D/2 reg spill, same as fp16).
-  // sm89 selection (fp8_sm89 op arg / FFPA_FP8_SM89_FORCE / arch < 12)
-  // is computed family-agnostically here: reject D>224 loudly instead of
-  // silently running the sm120 split-D/M4N2 families (on real sm89
-  // hardware that path dies on a cubin load with a misleading error).
-  static const bool force_sm89 =
-      (std::getenv("FFPA_FP8_SM89_FORCE") != nullptr);
-  const bool on_sm89 = p.fp8_sm89 || force_sm89 ||
-                       (at::cuda::getCurrentDeviceProperties()->major < 12);
+  // sm89 selection is backend-hint driven (CUTE_FP8_SM_89): the Python
+  // layer resolves device/force knobs into the hint before launch, so
+  // dispatch only reads the hint. Reject D>224 loudly instead of silently
+  // running the sm120 split-D/M4N2 families (on real sm89 hardware that
+  // path dies on a cubin load with a misleading error).
+  const bool on_sm89 =
+      ffpa::get_backend_impl_hint() == ffpa::CudaBackendImpl::CUTE_FP8_SM_89;
   TORCH_CHECK(!on_sm89 || kHeadDim <= 224,
               "ffpa_attn: fp8 sm89 path supports D<=224 only");
+  // The non-sm89 route is the sm_120 TMA family (hard-bound: traits use
+  // Blackwell atoms); reject earlier devices loudly instead of dying on a
+  // cubin load with a misleading no-kernel-image error.
+  TORCH_CHECK(on_sm89 || at::cuda::getCurrentDeviceProperties()->major >= 12,
+              "ffpa_attn: the CUTE_TMA_FP8_SM_120 family requires an sm_120 "
+              "device; use the CUTE_FP8_SM_89 hint on sm_89");
   if constexpr (kHeadDim <= 224) {
     // scope: hybrid via q_start_row (stage-1 = sm_80 cp.async fp16 family),
     // per_block/per_thread QK + per_block/per_channel V (+smooth_v), no
@@ -142,6 +151,7 @@ void ffpa_fwd_fp8(const FfpaFwdParams& p) {
       }
       return;
     }
+#ifdef ENABLE_FFPA_TMA_EXT
     if (p.fp8_hybrid && p.Nq >= p.fp8_hybrid_n_early) {
       const int n_early = static_cast<int>(p.fp8_hybrid_n_early);
       TORCH_CHECK(n_early % 128 == 0,
@@ -274,6 +284,14 @@ void ffpa_fwd_fp8(const FfpaFwdParams& p) {
           /*q_start_row=*/0, p.fp8_hadamard);
     }
   }
+#else
+    // sm_89-only build (no TMA ext): only the sm89 persist-D kernel family
+    // exists; the sm120 families were never compiled.
+  }
+  TORCH_CHECK(false,
+              "ffpa_attn: the CUTE_TMA_FP8_SM_120 family requires "
+              "ENABLE_FFPA_TMA_EXT");
+#endif
 #else
   TORCH_CHECK(false, "ffpa_attn: cute ext not compiled");
 #endif

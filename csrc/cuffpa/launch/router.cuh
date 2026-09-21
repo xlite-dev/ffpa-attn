@@ -34,8 +34,7 @@ void launch_ffpa_attn_fwd_template(
     bool fp8_hybrid = false, int64_t fp8_hybrid_n_early = 256,
     bool fp4_hybrid = false, int64_t fp4_hybrid_n_early = 256,
     bool fp8_hadamard = false, bool fp4_hadamard = false,
-    int64_t fp4_pv_mm_type = 0, bool fp4_smooth_v = false,
-    bool fp8_sm89 = false) {
+    int64_t fp4_pv_mm_type = 0, bool fp4_smooth_v = false) {
   // Q,K,V,O with [B, H, N, D] layout, B=batch, H=head, N=seqlen, D=dim
   // TODO: support BNHD layout, Q,K,V,O with [B, N, H, D] layout.
   // Native block-tile config (MMA atoms, Br/Bc, stages, smem/pad flags) and
@@ -102,8 +101,11 @@ void launch_ffpa_attn_fwd_template(
   const bool force_tma = (impl_hint == ffpa::CudaBackendImpl::TMA);
   const bool force_cute = (impl_hint == ffpa::CudaBackendImpl::CUTE);
   const bool force_cute_tma = (impl_hint == ffpa::CudaBackendImpl::CUTE_TMA);
-  const bool force_fp8 = (impl_hint == ffpa::CudaBackendImpl::CUTE_TMA_FP8);
-  const bool force_fp4 = (impl_hint == ffpa::CudaBackendImpl::CUTE_TMA_FP4);
+  const bool force_fp8 =
+      (impl_hint == ffpa::CudaBackendImpl::CUTE_TMA_FP8_SM_120 ||
+       impl_hint == ffpa::CudaBackendImpl::CUTE_FP8_SM_89);
+  const bool force_fp4 =
+      (impl_hint == ffpa::CudaBackendImpl::CUTE_TMA_FP4_SM_120);
 #ifdef ENABLE_FFPA_CUTE_EXT
 #ifdef ENABLE_FFPA_TMA_EXT
   // NHD (diffusers BNHD) permute-view inputs are consumed natively by the
@@ -233,7 +235,6 @@ void launch_ffpa_attn_fwd_template(
   p.fp4_hadamard = fp4_hadamard;
   p.fp4_pv_mm_type = fp4_pv_mm_type;
   p.fp4_smooth_v = fp4_smooth_v;
-  p.fp8_sm89 = fp8_sm89;
   p.Nb = Nb;
   p.Nh = Nh;
   p.Nh_kv = Nh_kv;
@@ -243,17 +244,48 @@ void launch_ffpa_attn_fwd_template(
   p.d_padded = d_padded;
   p.qkv_padded = qkv_padded;
   p.has_attn_bias = has_attn_bias;
-#ifdef ENABLE_FFPA_TMA_EXT
+// The fp8 route also compiles under the sm_89-only ext (TMA-free kernel);
+// every entry below is a dispatch.cuh template declaration, so the TU set
+// (not this guard) decides what links.
+#if defined(ENABLE_FFPA_TMA_EXT) || defined(ENABLE_FFPA_FP8_SM89_EXT)
   if ((force_tma || force_cute_tma || force_fp8 || force_fp4) &&
       !force_native && !force_cute) {
     auto prop = at::cuda::getCurrentDeviceProperties();
-    if (prop->major >= 9) {
+    // fp8 additionally admits real Ada (sm_89, major==8 minor>=9): the
+    // fp8 family has a TMA-free sm_89 persist-D kernel (dispatch picks
+    // it via on_sm89 = major<12). Everything else below needs sm_90+.
+    if (prop->major >= 9 ||
+        (force_fp8 && !force_fp4 && prop->major == 8 && prop->minor >= 9)) {
       if (force_fp4) {
+#ifdef ENABLE_FFPA_TMA_EXT
+        TORCH_CHECK(prop->major >= 12,
+                    "ffpa_attn: the CUTE_TMA_FP4_SM_120 family requires an "
+                    "sm_120 device");
         ffpa::ffpa_fwd_fp4<kDataType, kHeadDim, kStage>(p);
+#else
+        // fp4 is the sm_120 family and only compiles under the TMA ext;
+        // instantiating the call in sm_89-only builds leaves undefined
+        // symbols that only surface at .so load time (RTLD_NOW).
+        TORCH_CHECK(false,
+                    "ffpa_attn: fp4 requires ENABLE_FFPA_TMA_EXT (sm_120 "
+                    "family)");
+#endif
         return;
       }
       if (force_fp8) {
+#ifdef ENABLE_FFPA_TMA_EXT
         ffpa::ffpa_fwd_fp8<kDataType, kHeadDim, kStage>(p);
+#else
+        // sm_89-only builds instantiate fp8 family TUs for D<=224 only;
+        // guard the call so D>224 entry TUs emit no undefined refs.
+        if constexpr (kHeadDim <= 224) {
+          ffpa::ffpa_fwd_fp8<kDataType, kHeadDim, kStage>(p);
+        } else {
+          TORCH_CHECK(false,
+                      "ffpa_attn: fp8 beyond the sm89 persist-D family "
+                      "(D<=224) requires ENABLE_FFPA_TMA_EXT");
+        }
+#endif
       } else if (prop->major == 9 || prop->major == 10) {
         // sm_90/100 (228 KB smem): WS path, setmaxnreg effective.
         ffpa::ffpa_fwd_native_tma<kDataType, kHeadDim, kMmaAccFloat32QK,
@@ -284,7 +316,21 @@ void launch_ffpa_attn_fwd_template(
       return;
     }
   }
-#endif  // ENABLE_FFPA_TMA_EXT
+#endif  // ENABLE_FFPA_TMA_EXT || ENABLE_FFPA_FP8_SM89_EXT
+  // fp8/fp4 hints that found no compiled family or fell through the arch
+  // gate above (quantized ext off, fp8 on pre-sm_89, fp4 below sm_120)
+  // have no kernel for this config: raise instead of silently degrading
+  // to the fp16 family.
+  if (force_fp8 || force_fp4) {
+    auto prop_ft = at::cuda::getCurrentDeviceProperties();
+    TORCH_CHECK(false,
+                "ffpa_attn: the requested quantized family cannot run on "
+                "sm_",
+                prop_ft->major * 10 + prop_ft->minor,
+                force_fp4 ? " (CUTE_TMA_FP4_SM_120 needs sm_120)"
+                          : " (fp8 needs sm_89+ via CUTE_FP8_SM_89, or "
+                            "sm_120 via CUTE_TMA_FP8_SM_120)");
+  }
 
 #ifdef ENABLE_FFPA_CUTE_EXT
   // CuTe cp.async path: sm_80+ without TMA (tma=0 or sm<90).

@@ -90,6 +90,15 @@ class ENV(object):
   # at runtime on TMA-capable devices. Requires CUDA Toolkit >= 13.0.
   ENABLE_FFPA_TMA_EXT = bool(int(os.environ.get("ENABLE_FFPA_TMA_EXT", 0)))
 
+  # Enable the TMA-free CuTe fp8 sm_89 kernel family (persist_d, D<=224)
+  # for sm_89-only builds where ENABLE_FFPA_TMA_EXT must stay off (TMA
+  # needs sm>=90). Opt-in, default off; tools/build_fast.sh flips it on
+  # automatically when every target arch is sm<90. Requires
+  # ENABLE_FFPA_CUTE_EXT=1 to activate the kernel path.
+  ENABLE_FFPA_FP8_SM89_EXT = bool(
+    int(os.environ.get("ENABLE_FFPA_FP8_SM89_EXT", 0))
+  )
+
   # Enable CuTe C++ kernel extension for sm_120+ (opt-in, default off).
   # Requires ENABLE_FFPA_TMA_EXT=1 AND ENABLE_FFPA_CUTE_EXT=1 to activate
   # the cute-based kernel path. Uses cutlass headers from third_party/cutlass.
@@ -320,6 +329,10 @@ class ENV(object):
     return cls.ENABLE_FFPA_TMA_EXT
 
   @classmethod
+  def enable_fp8_sm89_ext(cls):
+    return cls.ENABLE_FFPA_FP8_SM89_EXT
+
+  @classmethod
   def enable_cute_ext(cls):
     return cls.ENABLE_FFPA_CUTE_EXT
 
@@ -408,6 +421,8 @@ class ENV(object):
       extra_env_cflags.append("-DENABLE_FFPA_CUDA_MASK_FP32")
     if cls.enable_tma_ext():
       extra_env_cflags.append("-DENABLE_FFPA_TMA_EXT")
+    if cls.enable_fp8_sm89_ext():
+      extra_env_cflags.append("-DENABLE_FFPA_FP8_SM89_EXT")
     if cls.enable_cute_ext():
       extra_env_cflags.append("-DENABLE_FFPA_CUTE_EXT")
     for family in ("fp16", "fp8", "fp4"):
@@ -438,6 +453,8 @@ class ENV(object):
     # CUDA_CUTE_TMA_AVAILABLE attr guard reflects the actual build config.
     if cls.enable_tma_ext():
       extra_gcc_flags.append("-DENABLE_FFPA_TMA_EXT")
+    if cls.enable_fp8_sm89_ext():
+      extra_gcc_flags.append("-DENABLE_FFPA_FP8_SM89_EXT")
     if cls.enable_cute_ext():
       extra_gcc_flags.append("-DENABLE_FFPA_CUTE_EXT")
     return extra_gcc_flags
@@ -677,18 +694,21 @@ with r in {0, 1}. See `_fp16_impl_variants` in `env.py`.
       stage-1 entries (kPersistMaxD 224/256); keyed by dtype so fp16f16
       and fp16f32 share one __half TU (duplicate explicit instantiation
       would be a compile error).
-    - ``fwd_<dtype>_cute_fp8_hdim{d}_s{s}.cu`` (ENABLE_FFPA_TMA_EXT):
-      cute_fp8 family TU (``dispatch/cute_fp8.cuh``): explicit
-      instantiation of ``ffpa_fwd_fp8``.
+    - ``fwd_<dtype>_cute_fp8_hdim{d}_s{s}.cu`` (ENABLE_FFPA_TMA_EXT; or
+      ENABLE_FFPA_FP8_SM89_EXT, D<=224 only): cute_fp8 family TU
+      (``dispatch/cute_fp8.cuh``): explicit instantiation of
+      ``ffpa_fwd_fp8``.
     - ``fwd_<dtype>_cute_fp4_hdim{d}.cu`` (ENABLE_FFPA_TMA_EXT): cute_fp4
       family TU (``dispatch/cute_fp4.cuh``): a single TU per (dtype, d)
       instantiating
       ``ffpa_fwd_fp4`` for every compiled stage (the fp4 entry ignores
       kStage, so the kernel templates codegen once inside the TU).
     - ``fwd_cute_fp8_preprocess.cu`` / ``fwd_cute_fp4_preprocess.cu``
-      (+ same-name ``.cuh`` declaration tables, ENABLE_FFPA_TMA_EXT):
-      the single definition sites for the stage/dtype-independent
-      preprocessing chains (``prepare_fp8_inputs`` and the dtype-agnostic
+      (+ same-name ``.cuh`` declaration tables; fp8 under
+      ENABLE_FFPA_TMA_EXT or ENABLE_FFPA_FP8_SM89_EXT, fp4 under
+      ENABLE_FFPA_TMA_EXT): the single definition sites for the
+      stage/dtype-independent preprocessing chains
+      (``prepare_fp8_inputs`` and the dtype-agnostic
       ``launch_fp4_quant_*`` helpers); family TUs see extern-template
       declarations from the ``.cuh`` and skip re-instantiation.
 
@@ -871,7 +891,7 @@ with r in {0, 1}. See `_fp16_impl_variants` in `env.py`.
       "    bool fp8_hadamard,",
       "    bool fp4_hadamard,",
       "    int64_t fp4_pv_mm_type,",
-      "    bool fp4_smooth_v, bool fp8_sm89)",
+      "    bool fp4_smooth_v)",
     ]
     return lines
 
@@ -891,7 +911,7 @@ with r in {0, 1}. See `_fp16_impl_variants` in `env.py`.
       "int64_t fp8_pv_acc_type, int64_t fp8_qk_mm_type, bool fp8_hybrid, "
       "int64_t fp8_hybrid_n_early, bool fp4_hybrid, "
       "int64_t fp4_hybrid_n_early, bool fp8_hadamard, bool fp4_hadamard, "
-      "int64_t fp4_pv_mm_type, bool fp4_smooth_v, bool fp8_sm89"
+      "int64_t fp4_pv_mm_type, bool fp4_smooth_v"
     )
     return f"void {symbol}({args});"
 
@@ -941,7 +961,7 @@ with r in {0, 1}. See `_fp16_impl_variants` in `env.py`.
       "fp8_q_quant_method, fp8_k_quant_method, fp8_v_quant_method, "
       "fp8_pv_acc_type, fp8_qk_mm_type, fp8_hybrid, fp8_hybrid_n_early, "
       "fp4_hybrid, fp4_hybrid_n_early, fp8_hadamard, fp4_hadamard, "
-      "fp4_pv_mm_type, fp4_smooth_v, fp8_sm89"
+      "fp4_pv_mm_type, fp4_smooth_v"
     )
     if len(stages) == 1:
       return f"  ffpa_attn_fwd_{variant}_d{d}_s{stages[0]}({call});\n"
@@ -989,7 +1009,13 @@ with r in {0, 1}. See `_fp16_impl_variants` in `env.py`.
     """
     stages = cls._enabled_stages()
     variants = cls._enabled_variants()
-    if cls.enable_tma_ext():
+    # fp8 kernel availability: the full sm120 family (persist/split/m4n2 +
+    # variant tables) needs TMA_EXT; a TMA-free sm_89-only build
+    # (FP8_SM89_EXT) still needs the shared preprocess TU (the sm89
+    # launcher includes fwd_cute_fp8_preprocess.cuh) and the family TUs,
+    # but NOT the sm120 variant tables.
+    fp8_tus = cls.enable_tma_ext() or cls.enable_fp8_sm89_ext()
+    if fp8_tus:
       # Shared fp8 preprocessing TU: defines the prepare_fp8_inputs
       # instances once; the same header carries extern-template
       # declarations for every family TU (see launch/cute_fp8.cuh).
@@ -1000,10 +1026,11 @@ with r in {0, 1}. See `_fp16_impl_variants` in `env.py`.
         ),
       )
       yield ("fwd_cute_fp8_preprocess.cu", cls._render_fp8_preprocess_tu())
+    if cls.enable_tma_ext():
       # Shared fp8 variant header + one TU per (dtype, d, s, tag) kernel
       # table: the family TUs' s2/s3 single-TU time collapses into small
       # parallel variants (see launch/cute_fp8.cuh wrapper dispatch).
-      # fp16f16/fp16f32 share the __half variant TUs (same dedup as the
+      # fp16f16/fp16 share the __half variant TUs (same dedup as the
       # family TUs; a duplicate explicit instantiation is a compile error).
       dtypes = list(dict.fromkeys(t_in for _, t_in, _ in variants))
       yield (
@@ -1101,6 +1128,16 @@ with r in {0, 1}. See `_fp16_impl_variants` in `env.py`.
             f"fwd_{token}_cute_fp4_hdim{d}.cu",
             cls._render_fp4_family_tu(t_in, d, stages),
           )
+        elif cls.enable_fp8_sm89_ext():
+          # sm_89-only build: the fp8 sm89 kernel family covers D<=224
+          # only (dispatch raises above); skip the D>224 family TUs so
+          # e.g. --headdim all does not compile dead raise-only TUs.
+          if d <= 224:
+            for s in stages:
+              yield (
+                f"fwd_{token}_cute_fp8_hdim{d}_s{s}.cu",
+                cls._render_fp8_family_tu(t_in, d, s),
+              )
 
   @classmethod
   def _render_native_family_tu(
@@ -1132,7 +1169,7 @@ with r in {0, 1}. See `_fp16_impl_variants` in `env.py`.
       "fp8_smooth_v, fp8_q_quant_method, fp8_k_quant_method, "
       "fp8_v_quant_method, fp8_pv_acc_type, fp8_qk_mm_type, fp8_hybrid, "
       "fp8_hybrid_n_early, fp4_hybrid, fp4_hybrid_n_early, fp8_hadamard, "
-      "fp4_hadamard, fp4_pv_mm_type, fp4_smooth_v, fp8_sm89);"
+      "fp4_hadamard, fp4_pv_mm_type, fp4_smooth_v);"
     )
     lines.append("}")
     lines.append("")
@@ -1802,7 +1839,7 @@ with r in {0, 1}. See `_fp16_impl_variants` in `env.py`.
       "fp8_q_quant_method, fp8_k_quant_method, fp8_v_quant_method, "
       "fp8_pv_acc_type, fp8_qk_mm_type, fp8_hybrid, fp8_hybrid_n_early, "
       "fp4_hybrid, fp4_hybrid_n_early, fp8_hadamard, fp4_hadamard, "
-      "fp4_pv_mm_type, fp4_smooth_v, fp8_sm89"
+      "fp4_pv_mm_type, fp4_smooth_v"
     )
 
     out = [

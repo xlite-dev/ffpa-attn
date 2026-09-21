@@ -3,11 +3,16 @@
 // their quantize/smooth/hadamard pre-kernel orchestration), moved
 // verbatim out of the old cute/launch.cuh.
 #include "launch/common.cuh"
-#if defined(ENABLE_FFPA_CUTE_EXT) && defined(ENABLE_FFPA_TMA_EXT)
+// Family umbrella: the sm89 launcher is TMA-free and compiles under the
+// sm_89-only ext too; the sm120 launchers (and their generated variant
+// tables) need the full TMA ext.
+#if defined(ENABLE_FFPA_CUTE_EXT) && \
+    (defined(ENABLE_FFPA_TMA_EXT) || defined(ENABLE_FFPA_FP8_SM89_EXT))
+#include "launch/cute_fp8_persist_d_sm89.cuh"
+#ifdef ENABLE_FFPA_TMA_EXT
 #include "launch/cute_fp8_persist_d.cuh"
 #include "launch/cute_fp8_split_d.cuh"
 #include "launch/cute_fp8_split_d_m4n2.cuh"
-#include "launch/cute_fp8_persist_d_sm89.cuh"
 template <typename kDataType, const int kHeadDim, const int kStage>
 void launch_cute_fwd_persist_d_fp8_sm120(
     torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O,
@@ -309,4 +314,6 @@ void launch_cute_fwd_split_d_m4n2_fp8_sm120(
 // split_d,split_d_m4n2}.cuh) directly and get exactly one kernel table.
 #include "generated/fwd_cute_fp8_variants.cuh"  // extern templates
 
-#endif  // ENABLE_FFPA_CUTE_EXT && ENABLE_FFPA_TMA_EXT
+#endif  // ENABLE_FFPA_TMA_EXT
+#endif  // ENABLE_FFPA_CUTE_EXT && (ENABLE_FFPA_TMA_EXT ||
+        // ENABLE_FFPA_FP8_SM89_EXT)

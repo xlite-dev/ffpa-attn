@@ -72,7 +72,7 @@ def _fp4_out_lse(
   from ffpa_attn.cuda import set_cuda_backend_impl, CudaBackendImpl
   from ffpa_attn.cuda._ffpa_fwd import _ffpa_attn_forward_cuda
 
-  set_cuda_backend_impl(CudaBackendImpl.CUTE_TMA_FP4)
+  set_cuda_backend_impl(CudaBackendImpl.CUTE_TMA_FP4_SM_120)
   return _ffpa_attn_forward_cuda(
     q,
     k,

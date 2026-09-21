@@ -22,6 +22,7 @@ try:
   CUDA_BWD_AVAILABLE = False
   _CUDA_IMPORT_ERROR = None
 except Exception as exc:
+  _cuda_ext = None
   _ffpa_attn_fwd_cuda = None
   CUDA_FWD_AVAILABLE = False
   F16_ACC_AVAILABLE = False
@@ -39,8 +40,12 @@ class CudaBackendImpl(enum.IntEnum):
   TMA = 2
   CUTE = 3
   CUTE_TMA = 4
-  CUTE_TMA_FP8 = 5
-  CUTE_TMA_FP4 = 6
+  # TMA kernel families; ffpa-attn ships sm_120 variants only. Future
+  # Hopper/Blackwell-datacenter specialisations get their own entries.
+  CUTE_TMA_FP8_SM_120 = 5
+  CUTE_TMA_FP4_SM_120 = 6
+  # TMA-free cp.async fp8 persist-D family (D<=224), sm_89 target.
+  CUTE_FP8_SM_89 = 7
 
 
 def set_cuda_backend_impl(impl: CudaBackendImpl) -> None:
@@ -71,7 +76,6 @@ torch.library.define(
   "bool fp8_hybrid, int fp8_hybrid_n_early, "
   "bool fp4_hybrid, int fp4_hybrid_n_early, "
   "bool fp8_hadamard, bool fp4_hadamard, int fp4_pv_mm_type, bool fp4_smooth_v, "
-  "bool fp8_sm89=False, "
   "int tensor_layout=1) -> "
   "(Tensor o, Tensor softmax_lse)",
 )
@@ -105,7 +109,6 @@ def _fwd_cuda_torch_op(
   fp4_hadamard: bool,
   fp4_pv_mm_type: int = 0,
   fp4_smooth_v: bool = False,
-  fp8_sm89: bool = False,
   tensor_layout: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor]:
   if _ffpa_attn_fwd_cuda is None:
@@ -176,7 +179,6 @@ def _fwd_cuda_torch_op(
     fp4_hadamard,
     fp4_pv_mm_type,
     fp4_smooth_v,
-    fp8_sm89,
   )
   if tensor_layout == 0:
     O = O.permute(0, 2, 1, 3)  # noqa: E741
@@ -211,7 +213,6 @@ def _fwd_cuda_fake(
   fp4_hadamard: bool,
   fp4_pv_mm_type: int = 0,
   fp4_smooth_v: bool = False,
-  fp8_sm89: bool = False,
   tensor_layout: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor]:
   if tensor_layout == 0:

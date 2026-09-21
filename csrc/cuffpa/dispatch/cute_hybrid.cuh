@@ -8,7 +8,9 @@
 namespace ffpa {
 
 #ifdef ENABLE_FFPA_CUTE_EXT
-#ifdef ENABLE_FFPA_TMA_EXT
+// The hybrid stage-1 prep is pure host tensor slicing/padding (TMA-free):
+// it also serves the sm_89-only fp8 ext where ENABLE_FFPA_TMA_EXT is off.
+#if defined(ENABLE_FFPA_TMA_EXT) || defined(ENABLE_FFPA_FP8_SM89_EXT)
 // Hybrid Stage-1 prep: slice the early rows and, when head_dim is padded,
 // zero-pad them to kHeadDim so the fp16 launcher's TMA stride matches D_pad.
 // Returns new tensors; the original Q/K/V stay D_og-wide (fp8 quantize reads

@@ -31,7 +31,6 @@ def _ffpa_attn_forward_cuda(
   fp4_hadamard: bool = False,
   fp4_pv_mm_type: int = 0,
   fp4_smooth_v: bool = False,
-  fp8_sm89: bool = False,
   tensor_layout: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor]:
   """Call FFPA CUDA forward via registered torch op, returning ``(O, softmax_lse)``.
@@ -68,7 +67,6 @@ def _ffpa_attn_forward_cuda(
     fp4_hadamard,
     fp4_pv_mm_type,
     fp4_smooth_v,
-    fp8_sm89,
     tensor_layout,
   )
   # lse stays [B, Nh, Nq] for both layouts; the slice is a no-op guard for
