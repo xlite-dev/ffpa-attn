@@ -659,9 +659,9 @@ def _resolve_directional_cli_flags(
         if args.cuda_impl == "fp8_sm_89":
           # Force the sm_89 cp.async persist-D kernel via the backend flag
           # (per-call, no process-wide env latch). The backend adapter
-          # additionally disables hybrid (unsupported on sm_89) and defaults
-          # the f16-only PV accumulator; an explicit --fp8-pv-acc-type
-          # still overrides below (and is then re-clamped to f16).
+          # additionally defaults the f16-only PV accumulator; an explicit
+          # --fp8-pv-acc-type still overrides below (and is then re-clamped
+          # to f16).
           args.force_fp8_sm89 = True
           args.pv_acc_type = "f16"
       else:

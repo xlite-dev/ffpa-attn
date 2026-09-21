@@ -204,12 +204,11 @@ def _fp8_sm89_active(backend: CUDABackend, device: torch.device) -> bool:
 def _adapt_backend_for_fp8_sm89(backend: CUDABackend) -> None:
   """Clamp fp8 knobs to what the sm89 persist-D kernel supports.
 
-  The sm89 path has no 2-stage hybrid and only supports the f16 PV
-  accumulator, so those are forced regardless of auto/explicit settings.
-  Quant methods (per_block/per_thread QK, per_block/per_channel V with
-  smooth_v) pass through since FC-14.
+  The sm89 path only supports the f16 PV accumulator, so that is forced
+  regardless of auto/explicit settings. Hybrid (fp16 early rows via the
+  sm_80 cp.async family + fp8 late rows), quant methods (per_block/
+  per_thread QK, per_block/per_channel V with smooth_v) pass through.
   """
-  backend.fp8_hybrid = False
   backend.fp8_pv_acc_type = "f16"
 
 
@@ -482,7 +481,8 @@ class CUDABackend(Backend):
   enable_fp8: bool = False  # FP8 persist-D sm120 path (fp16/bf16 in).
   # Force the fp8 sm89 persist-D kernel (cp.async, no TMA) even on sm120+.
   # Also auto-selected on any major < 12 device (L20 / 4090); the sm89
-  # path has no hybrid and only supports the f16 PV accumulator.
+  # path only supports the f16 PV accumulator (hybrid runs the sm_80
+  # cp.async fp16 family for the early rows).
   force_fp8_sm89: bool = False
   enable_fp4: bool = False  # NVFP4 persist-D sm120 path (any D%8==0 within [8,256], pads up to {64,128,192,256}).
   fp8_smooth_k: bool = True  # FP8 only: subtract per-(b,h) K seq mean pre-quant.

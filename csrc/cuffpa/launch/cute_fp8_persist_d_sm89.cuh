@@ -39,7 +39,6 @@ void persist_d_fp8_sm89_variant(
   using namespace cute;
   // v1 scope checks (sm89 cp.async path).
   TORCH_CHECK(dropout_p == 0.0, "fp8 sm89 path does not support dropout");
-  TORCH_CHECK(q_start_row == 0, "fp8 sm89 v1 does not support q_start_row");
   TORCH_CHECK((fp8_q_quant_method == 0 && fp8_k_quant_method == 0) ||
                   (fp8_q_quant_method == 2 && fp8_k_quant_method == 2),
               "fp8 sm89 supports per_block or per_thread Q/K quant (matched)");
@@ -138,7 +137,10 @@ void persist_d_fp8_sm89_variant(
       softmax_lse.numel() > 0 ? softmax_lse.data_ptr<float>() : nullptr;
   auto O_ptr = reinterpret_cast<ElementO*>(O.data_ptr());
   const dim3 block(kNumThreads, 1, 1);
-  const dim3 grid(utils::div_ceil(Nq, kBr), Nb * Nh, 1);
+  TORCH_CHECK(q_start_row >= 0 && q_start_row < Nq,
+              "ffpa_attn: q_start_row must be in [0, Nq)");
+  // Hybrid stage-2: grid.x covers the rows past q_start_row.
+  const dim3 grid(utils::div_ceil(Nq - q_start_row, kBr), Nb * Nh, 1);
 
   // The quant granularity only changes register-time constants and the
   // epilogue dequant; instantiate the four combinations over one launch site.
@@ -155,7 +157,8 @@ void persist_d_fp8_sm89_variant(
         reinterpret_cast<Element*>(qi.vt8.data_ptr()), O_ptr, softmax_lse_ptr,
         qi.q_scale.data_ptr<float>(), qi.k_scale.data_ptr<float>(),
         qi.v_scale.data_ptr<float>(), Nq, Nkv, Nh, Nh_kv, n_rb_q, n_rb_kv,
-        scale, Tc, causal, Nkv_pad, qi.km_f32_ptr, qi.vm_kernel, bias.ptr,
+        scale, Tc, causal, Nkv_pad, q_start_row, qi.km_f32_ptr, qi.vm_kernel,
+        bias.ptr,
         bias.dtype, bias.stride_b, bias.stride_h, bias.stride_m, bias.stride_n);
   };
   if (qk_per_thread) {

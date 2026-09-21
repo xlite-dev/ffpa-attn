@@ -72,17 +72,17 @@ void ffpa_fwd_fp8(const FfpaFwdParams& p) {
   TORCH_CHECK(!on_sm89 || kHeadDim <= 224,
               "ffpa_attn: fp8 sm89 path supports D<=224 only");
   if constexpr (kHeadDim <= 224) {
-    // scope: no hybrid / q_start_row, per_block/per_thread QK + per_block/
-    // per_channel V (+smooth_v), no dropout (checked inside the launcher).
+    // scope: hybrid via q_start_row (stage-1 = sm_80 cp.async fp16 family),
+    // per_block/per_thread QK + per_block/per_channel V (+smooth_v), no
+    // dropout (checked inside the launcher).
     // kQKInt8 is a template tag here; the e4m3 QK atom is picked by Traits
     // from the same flag.
     if (on_sm89) {
-      TORCH_CHECK(!p.fp8_hybrid, "ffpa_attn: fp8 sm89 v1 has no hybrid");
       TORCH_CHECK(p.fp8_qk_mm_type == 0 || p.fp8_qk_mm_type == 1,
                   "ffpa_attn: fp8 sm89 v1 supports fp8/int8 QK only");
       const bool qk_int8 = (p.fp8_qk_mm_type == 1);
       const int bias_on = p.attn_bias.numel() > 0 ? 1 : 0;
-      const auto dispatch_sm89 = [&](auto qk_c) {
+      const auto dispatch_sm89 = [&](auto qk_c, int q_start_row) {
         constexpr bool kQ = decltype(qk_c)::value;
         if (!bias_on)
           launch_cute_fwd_persist_d_fp8_sm89<kDataType, kHeadDim, kStage, kQ,
@@ -91,7 +91,7 @@ void ffpa_fwd_fp8(const FfpaFwdParams& p) {
               p.softmax_scale, p.dropout_p, p.philox_seed, p.philox_offset,
               p.fp8_smooth_k, p.fp8_smooth_v, p.fp8_q_quant_method,
               p.fp8_k_quant_method, p.fp8_v_quant_method, p.fp8_pv_acc_type,
-              /*q_start_row=*/0, p.fp8_hadamard);
+              q_start_row, p.fp8_hadamard);
         else
           launch_cute_fwd_persist_d_fp8_sm89<kDataType, kHeadDim, kStage, kQ,
                                              1>(
@@ -99,12 +99,48 @@ void ffpa_fwd_fp8(const FfpaFwdParams& p) {
               p.softmax_scale, p.dropout_p, p.philox_seed, p.philox_offset,
               p.fp8_smooth_k, p.fp8_smooth_v, p.fp8_q_quant_method,
               p.fp8_k_quant_method, p.fp8_v_quant_method, p.fp8_pv_acc_type,
-              /*q_start_row=*/0, p.fp8_hadamard);
+              q_start_row, p.fp8_hadamard);
       };
-      if (qk_int8)
-        dispatch_sm89(std::true_type{});
-      else
-        dispatch_sm89(std::false_type{});
+      if (p.fp8_hybrid && p.Nq >= p.fp8_hybrid_n_early) {
+        const int n_early = static_cast<int>(p.fp8_hybrid_n_early);
+        TORCH_CHECK(n_early % 128 == 0,
+                    "ffpa_attn: fp8_hybrid_n_early must be multiple of 128");
+        torch::Tensor Q_e, K_e, V_e;
+        prepare_hybrid_stage1(Q_e, K_e, V_e, p.Q, p.K, p.V, n_early, p.Nkv,
+                              p.Nq, p.causal, p.D_og, kHeadDim, p.d_padded);
+        auto O_e = torch::empty_like(Q_e);
+        auto lse_e = torch::empty(
+            {p.Nb, p.Nh, n_early},
+            torch::TensorOptions().dtype(torch::kFloat32).device(p.Q.device()));
+        auto bias_e = p.attn_bias.numel() > 0
+                          ? p.attn_bias.slice(2, 0, n_early)
+                          : p.attn_bias;
+        FfpaFwdParams p1;
+        p1.Q = Q_e;
+        p1.K = K_e;
+        p1.V = V_e;
+        p1.O = O_e;
+        p1.attn_bias = bias_e;
+        p1.softmax_lse = lse_e;
+        p1.causal = p.causal;
+        p1.softmax_scale = p.softmax_scale;
+        // Stage-1 must run the cp.async sm_80 fp16 family: the sm89 path
+        // targets sm<=89 hardware with no TMA (the sm120 TMA fp16 kernel
+        // only works on this sm120 dev box, not on real Ada).
+        ffpa_fwd_cute_fp16_sm80<kDataType, kHeadDim, kStage>(p1);
+        p.O.slice(2, 0, n_early).copy_(O_e);
+        if (p.softmax_lse.numel() > 0)
+          p.softmax_lse.slice(2, 0, n_early).copy_(lse_e);
+        if (qk_int8)
+          dispatch_sm89(std::true_type{}, n_early);
+        else
+          dispatch_sm89(std::false_type{}, n_early);
+      } else {
+        if (qk_int8)
+          dispatch_sm89(std::true_type{}, 0);
+        else
+          dispatch_sm89(std::false_type{}, 0);
+      }
       return;
     }
     if (p.fp8_hybrid && p.Nq >= p.fp8_hybrid_n_early) {

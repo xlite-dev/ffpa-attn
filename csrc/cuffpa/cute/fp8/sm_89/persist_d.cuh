@@ -41,7 +41,8 @@
 // kBc*448*2.25 <= 65504 holds for kBc=64, kBc=128 uses 224.
 //
 // v1 scope: additive attn bias in the raw score domain (gmem-direct,
-// mode 0), q_start_row=0, no dropout/hybrid. D % 64 == 0; kBc=128 for
+// mode 0), no dropout. q_start_row serves the fp8-hybrid stage-2 (early
+// rows run the sm_80 cp.async fp16 family). D % 64 == 0; kBc=128 for
 // D <= 128 (matches the 128-col quant blocks, so ks/vs index kv_tile
 // directly) and 64 above.
 
@@ -75,7 +76,7 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 2)
         const float* __restrict__ q_scale, const float* __restrict__ k_scale,
         const float* __restrict__ v_scale, int Nq, int Nkv, int Nh, int Nh_kv,
         int n_rb_q, int n_rb_kv, float scale, int Tc, int causal, int Nkv_pad,
-        const float* __restrict__ km = nullptr,
+        int q_start_row = 0, const float* __restrict__ km = nullptr,
         const float* __restrict__ vm = nullptr,
         const void* __restrict__ attn_bias = nullptr, int attn_bias_dtype = 0,
         long long attn_bias_stride_b = 0, long long attn_bias_stride_h = 0,
@@ -123,20 +124,25 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 2)
   const int Br_base = Q_tile_id * kBr;
   const int tid = threadIdx.x;
 
-  if (Br_base >= Nq)
+  // Hybrid stage-2: rows [q_start_row, Nq); grid.x covers the remainder
+  // and q_tile_abs re-bases the quant-scale indexing on absolute tiles.
+  if (Br_base >= Nq - q_start_row)
     return;
 
   const int kv_offset = Nkv - Nq;
-  const int causal_thresh_row0 = Br_base + kv_offset;
+  const int causal_thresh_row0 = q_start_row + Br_base + kv_offset;
   const int Tc_eff =
-      causal ? min(Tc, ((Br_base + kBr - 1 + kv_offset) / kBc) + 1) : Tc;
+      causal
+          ? min(Tc, ((q_start_row + Br_base + kBr - 1 + kv_offset) / kBc) + 1)
+          : Tc;
   const int mask_start_tile =
       causal ? max(0, (causal_thresh_row0 + 1) / kBc) : INT_MAX;
 
-  const int q_row_offset = (Nb_id * Nh + Nh_id) * Nq;
+  const int q_row_offset = (Nb_id * Nh + Nh_id) * Nq + q_start_row;
   const int kv_row_offset = (Nb_id * Nh_kv + kv_head_idx) * Nkv;
   const int q_bh = Nb_id * Nh + Nh_id;
   const int kv_bh = Nb_id * Nh_kv + kv_head_idx;
+  const int q_tile_abs = Q_tile_id + q_start_row / kBr;
 
   // SMEM carve. kQSharesK: [K stage0 (Q transient) | K 1..S-1 | V stages].
   // Otherwise [Q | K stages | V stages]. Stage s of K/V sits at its base
@@ -287,16 +293,16 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 2)
   if constexpr (kQKPerThread) {
     const int n_q128 = (Nq + 127) / 128;
     const long q_sc_base =
-        static_cast<long>(q_bh) * (n_q128 * 64) + (Q_tile_id >> 1) * 64;
+        static_cast<long>(q_bh) * (n_q128 * 64) + (q_tile_abs >> 1) * 64;
     // Both C-frag rows of a thread share one group ({r, r+8} pair).
-    const int seg_row = (Q_tile_id & 1) * 64 + get<0>(tScS_rc(0, 0));
+    const int seg_row = (q_tile_abs & 1) * 64 + get<0>(tScS_rc(0, 0));
     const int g = (seg_row / 16) * 8 + seg_row % 8;
     const float qs_g = q_scale[q_sc_base + g];
 #pragma unroll
     for (int row = 0; row < kORows; ++row)
       qs_arr[row] = qs_g;
   } else {
-    const float qs = q_scale[static_cast<long>(q_bh) * n_rb_q + Q_tile_id];
+    const float qs = q_scale[static_cast<long>(q_bh) * n_rb_q + q_tile_abs];
 #pragma unroll
     for (int row = 0; row < kORows; ++row)
       qs_arr[row] = qs;
@@ -413,7 +419,7 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 2)
 #pragma unroll
       for (int row = 0; row < kSRows; ++row)
         bias_inv[row] = 1.0f / (qs_arr[row] * ks * scale_orig);
-      const int bias_q_valid = min(kBr, Nq - Br_base);
+      const int bias_q_valid = min(kBr, Nq - q_start_row - Br_base);
       const int bias_kv_valid = min(kBc, Nkv - kv_tile * kBc);
       const bool full_tile = bias_q_valid >= kBr && bias_kv_valid >= kBc;
       if (__builtin_expect(full_tile, 1))
@@ -421,14 +427,14 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 2)
             decltype(scores), decltype(tScS_rc), kSRows, kSCols, false>(
             scores, tScS_rc, attn_bias, attn_bias_dtype, attn_bias_stride_b,
             attn_bias_stride_h, attn_bias_stride_m, attn_bias_stride_n, Nb_id,
-            Nh_id, Br_base, kv_tile, kBc, bias_inv, bias_q_valid,
+            Nh_id, q_start_row + Br_base, kv_tile, kBc, bias_inv, bias_q_valid,
             bias_kv_valid);
       else
         ffpa_cute::apply_attn_bias_quant_rowcol<
             decltype(scores), decltype(tScS_rc), kSRows, kSCols, true>(
             scores, tScS_rc, attn_bias, attn_bias_dtype, attn_bias_stride_b,
             attn_bias_stride_h, attn_bias_stride_m, attn_bias_stride_n, Nb_id,
-            Nh_id, Br_base, kv_tile, kBc, bias_inv, bias_q_valid,
+            Nh_id, q_start_row + Br_base, kv_tile, kBc, bias_inv, bias_q_valid,
             bias_kv_valid);
     }
 
@@ -440,7 +446,8 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 2)
       if (tile_needs_mask) {
 #pragma unroll
         for (int row = 0; row < kSRows; ++row) {
-          const int q_pos = Br_base + get<0>(tScS_rc(row, 0)) + kv_offset;
+          const int q_pos =
+              q_start_row + Br_base + get<0>(tScS_rc(row, 0)) + kv_offset;
 #pragma unroll
           for (int col = 0; col < kSCols; ++col) {
             float s = scores(row, col) * qs_arr[row] * ks * scale;
@@ -552,7 +559,9 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 2)
   // ---- Epilogue: dequant, normalize, store ----
   {
     auto mO = make_tensor(
-        make_gmem_ptr(O + (Nb_id * Nh * Nq * kHeadDim) + Nh_id * Nq * kHeadDim),
+        make_gmem_ptr(O + (Nb_id * Nh * Nq * kHeadDim) +
+                      Nh_id * Nq * kHeadDim +
+                      static_cast<long>(q_start_row) * kHeadDim),
         make_shape(Nq, Int<kHeadDim>{}), make_stride(Int<kHeadDim>{}, _1{}));
     auto gO = local_tile(mO, Shape<Int<kBr>, Int<kHeadDim>>{},
                          make_coord(Q_tile_id, _0{}));
@@ -597,12 +606,12 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 2)
       }
     }
 
-    if (Br_base + kBr <= Nq) {
+    if (Br_base + kBr <= Nq - q_start_row) {
       copy(tOHalf, tCgO);
     } else {
 #pragma unroll
       for (int i = 0; i < size(tOHalf); ++i) {
-        const int global_row = Br_base + get<0>(tOcO(i));
+        const int global_row = q_start_row + Br_base + get<0>(tOcO(i));
         if (global_row < Nq)
           tCgO(i) = tOHalf(i);
       }
@@ -615,7 +624,7 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 2)
         float lse = (row_max[row] + log2f(row_sum[row])) * FFPA_M_LN2;
         if (smooth_lse)
           lse += scale_orig * qs_arr[row] * qkm[row];
-        const int global_row = Br_base + get<0>(tScS_rc(row, 0));
+        const int global_row = q_start_row + Br_base + get<0>(tScS_rc(row, 0));
         if (global_row < Nq)
           softmax_lse[lse_base + global_row] = lse;
       }
