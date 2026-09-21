@@ -559,8 +559,7 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 2)
   // ---- Epilogue: dequant, normalize, store ----
   {
     auto mO = make_tensor(
-        make_gmem_ptr(O + (Nb_id * Nh * Nq * kHeadDim) +
-                      Nh_id * Nq * kHeadDim +
+        make_gmem_ptr(O + (Nb_id * Nh * Nq * kHeadDim) + Nh_id * Nq * kHeadDim +
                       static_cast<long>(q_start_row) * kHeadDim),
         make_shape(Nq, Int<kHeadDim>{}), make_stride(Int<kHeadDim>{}, _1{}));
     auto gO = local_tile(mO, Shape<Int<kBr>, Int<kHeadDim>>{},
