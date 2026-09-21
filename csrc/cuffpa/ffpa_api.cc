@@ -21,7 +21,7 @@ void ffpa_attn_fwd_fp16f16(
     int64_t fp8_v_quant_method, int64_t fp8_pv_acc_type, int64_t fp8_qk_mm_type,
     bool fp8_hybrid, int64_t fp8_hybrid_n_early, bool fp4_hybrid,
     int64_t fp4_hybrid_n_early, bool fp8_hadamard, bool fp4_hadamard,
-    int64_t fp4_pv_mm_type, bool fp4_smooth_v, bool fp8_sm89);
+    int64_t fp4_pv_mm_type, bool fp4_smooth_v);
 #endif
 // fp16-input entries (fp16f32, and fp16f16 above) are opt-in via
 // ENABLE_FFPA_CUDA_INPUT_FP16; the symbols are absent from the generated
@@ -36,7 +36,7 @@ void ffpa_attn_fwd_fp16f32(
     int64_t fp8_v_quant_method, int64_t fp8_pv_acc_type, int64_t fp8_qk_mm_type,
     bool fp8_hybrid, int64_t fp8_hybrid_n_early, bool fp4_hybrid,
     int64_t fp4_hybrid_n_early, bool fp8_hadamard, bool fp4_hadamard,
-    int64_t fp4_pv_mm_type, bool fp4_smooth_v, bool fp8_sm89);
+    int64_t fp4_pv_mm_type, bool fp4_smooth_v);
 #endif
 void ffpa_attn_fwd_bf16f32(
     torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O,
@@ -47,7 +47,7 @@ void ffpa_attn_fwd_bf16f32(
     int64_t fp8_v_quant_method, int64_t fp8_pv_acc_type, int64_t fp8_qk_mm_type,
     bool fp8_hybrid, int64_t fp8_hybrid_n_early, bool fp4_hybrid,
     int64_t fp4_hybrid_n_early, bool fp8_hadamard, bool fp4_hadamard,
-    int64_t fp4_pv_mm_type, bool fp4_smooth_v, bool fp8_sm89);
+    int64_t fp4_pv_mm_type, bool fp4_smooth_v);
 #endif
 
 // Public unified pybind entry for FFPA forward attention.
@@ -109,9 +109,6 @@ void ffpa_attn_fwd_bf16f32(
 //                smoothing (qm/km + delta_s + lse correction) is always on
 //                in the fp4 path - mandatory for e2m1 accuracy - so this
 //                flag only adds the V side.
-//   fp8_sm89     Deprecated no-op: sm89 vs sm120 fp8 selection is resolved
-//                into the CUTE_FP8_SM_89 / CUTE_TMA_FP8_SM_120 backend
-//                hint by the Python layer before launch.
 void ffpa_attn_forward(
     torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor attn_bias,
     torch::Tensor O, torch::Tensor softmax_lse, int64_t stages, int64_t acc,
@@ -121,7 +118,7 @@ void ffpa_attn_forward(
     int64_t fp8_v_quant_method, int64_t fp8_pv_acc_type, int64_t fp8_qk_mm_type,
     bool fp8_hybrid, int64_t fp8_hybrid_n_early, bool fp4_hybrid,
     int64_t fp4_hybrid_n_early, bool fp8_hadamard, bool fp4_hadamard,
-    int64_t fp4_pv_mm_type, bool fp4_smooth_v, bool fp8_sm89) {
+    int64_t fp4_pv_mm_type, bool fp4_smooth_v) {
 #ifdef ENABLE_FFPA_CUDA_IMPL
   const auto dtype = Q.scalar_type();
   const int stages_i = static_cast<int>(stages);
@@ -218,7 +215,7 @@ void ffpa_attn_forward(
       fp8_q_quant_method, fp8_k_quant_method, fp8_v_quant_method,        \
       fp8_pv_acc_type, fp8_qk_mm_type, fp8_hybrid, fp8_hybrid_n_early,   \
       fp4_hybrid, fp4_hybrid_n_early, fp8_hadamard, fp4_hadamard,        \
-      fp4_pv_mm_type, fp4_smooth_v, fp8_sm89
+      fp4_pv_mm_type, fp4_smooth_v
 
   if (dtype == torch::kHalf) {
 #ifdef ENABLE_FFPA_CUDA_INPUT_FP16
@@ -293,7 +290,6 @@ void ffpa_attn_forward(
   (void)fp4_hadamard;
   (void)fp4_pv_mm_type;
   (void)fp4_smooth_v;
-  (void)fp8_sm89;
   throw std::runtime_error(
       "ffpa_attn_forward: native CUDA forward was not compiled. Rebuild with "
       "ENABLE_FFPA_CUDA_IMPL=1 to enable the CUDA forward backend.");

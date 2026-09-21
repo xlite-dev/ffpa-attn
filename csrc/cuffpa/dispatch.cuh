@@ -43,8 +43,6 @@ struct FfpaFwdParams {
   bool fp4_hadamard = false;
   int64_t fp4_pv_mm_type = 0;
   bool fp4_smooth_v = false;
-  bool fp8_sm89 = false;  // Deprecated no-op: the Python layer resolves
-                          // sm89 selection into the CUTE_FP8_SM_89 hint.
   int64_t Nb = 0;
   int64_t Nh = 0;
   int64_t Nh_kv = 0;

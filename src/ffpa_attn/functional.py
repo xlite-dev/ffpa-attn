@@ -343,7 +343,6 @@ def _ffpa_attn_forward(
     forward_backend.fp4_hadamard,
     forward_backend.fp4_pv_mm_type_code,
     forward_backend.fp4_smooth_v,
-    forward_backend.force_fp8_sm89,
     forward_backend.tensor_layout_code,
   )
   return O
@@ -1398,7 +1397,6 @@ class _FFPAAttnFunc(torch.autograd.Function):
         forward_meta.fp4_hadamard,
         forward_meta.fp4_pv_mm_type_code,
         forward_meta.fp4_smooth_v,
-        forward_meta.force_fp8_sm89,
       )
     elif isinstance(meta.forward_meta, TritonBackend):
       forward_meta = meta.forward_meta

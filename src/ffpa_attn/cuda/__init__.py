@@ -76,7 +76,6 @@ torch.library.define(
   "bool fp8_hybrid, int fp8_hybrid_n_early, "
   "bool fp4_hybrid, int fp4_hybrid_n_early, "
   "bool fp8_hadamard, bool fp4_hadamard, int fp4_pv_mm_type, bool fp4_smooth_v, "
-  "bool fp8_sm89=False, "
   "int tensor_layout=1) -> "
   "(Tensor o, Tensor softmax_lse)",
 )
@@ -110,7 +109,6 @@ def _fwd_cuda_torch_op(
   fp4_hadamard: bool,
   fp4_pv_mm_type: int = 0,
   fp4_smooth_v: bool = False,
-  fp8_sm89: bool = False,
   tensor_layout: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor]:
   if _ffpa_attn_fwd_cuda is None:
@@ -181,7 +179,6 @@ def _fwd_cuda_torch_op(
     fp4_hadamard,
     fp4_pv_mm_type,
     fp4_smooth_v,
-    fp8_sm89,
   )
   if tensor_layout == 0:
     O = O.permute(0, 2, 1, 3)  # noqa: E741
@@ -216,7 +213,6 @@ def _fwd_cuda_fake(
   fp4_hadamard: bool,
   fp4_pv_mm_type: int = 0,
   fp4_smooth_v: bool = False,
-  fp8_sm89: bool = False,
   tensor_layout: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor]:
   if tensor_layout == 0:
