@@ -68,6 +68,53 @@ __device__ __forceinline__ void online_safe_softmax(
   }
 }
 
+// Scale-fused variant of online_safe_softmax: the softmax scale multiply is
+// fused into the upstream QK GEMM's A operand. The caller pre-multiplies
+// s = scale * log2(e) into the Q A-fragment once (right after the persist-D
+// Q s2r copy), so S arrives already in the log2 domain:
+//   S_fused = (s * Q) @ K^T = s * (Q @ K^T) = s * S_raw
+// and the two per-element multiplies of online_safe_softmax vanish:
+//   max pass:  fmax(S_raw * s)      == fmax(S_fused)
+//   exp2 pass: exp2(S_raw * s - m)  == exp2(S_fused - m)
+// (idealized; in practice s*Q re-rounds to fp16 once, trading one rounding
+// step for 2 * kRows * kCols fewer FMULs per kv tile). FA-4 conditional
+// rescaling notes above apply unchanged.
+template <typename ScoresTensor, typename CoordTensor, int kRows>
+__device__ __forceinline__ void online_safe_softmax_fused(
+    ScoresTensor& scores, const CoordTensor& tScS_rc, float* row_max,
+    float* row_sum, float* row_scale, float rescale_threshold = 0.0f) {
+#pragma unroll
+  for (int row = 0; row < kRows; ++row) {
+    float tile_max = -INFINITY;
+#pragma unroll
+    for (int col = 0; col < cute::size<1>(scores); ++col)
+      tile_max = fmaxf(tile_max, scores(row, col));
+    tile_max = fmaxf(tile_max, __shfl_xor_sync(0xffffffff, tile_max, 1));
+    tile_max = fmaxf(tile_max, __shfl_xor_sync(0xffffffff, tile_max, 2));
+    const float next_max = fmaxf(row_max[row], tile_max);
+    // log2_diff == FA-4 acc_scale_: already in log2 domain, no * scale_log2.
+    const float log2_diff = row_max[row] - next_max;
+    float eff_max = next_max;
+    if (rescale_threshold > 0.0f && log2_diff >= -rescale_threshold) {
+      row_scale[row] = 1.0f;
+      eff_max = row_max[row];  // stale max; row_max NOT updated
+    } else {
+      row_scale[row] = exp2f(log2_diff);  // exp(<0) -> scale < 1.0
+      row_max[row] = next_max;
+    }
+    float tile_sum = 0.0f;
+#pragma unroll
+    for (int col = 0; col < cute::size<1>(scores); ++col) {
+      const float p = exp2f(scores(row, col) - eff_max);
+      scores(row, col) = p;
+      tile_sum += p;
+    }
+    tile_sum += __shfl_xor_sync(0xffffffff, tile_sum, 1);
+    tile_sum += __shfl_xor_sync(0xffffffff, tile_sum, 2);
+    row_sum[row] = row_sum[row] * row_scale[row] + tile_sum;
+  }
+}
+
 // Cross-N-warp online softmax for M4N2 layout.
 // Each N-warp holds half the Bc columns; row-max and row-sum must be reduced
 // across peer warps (warp_id ^ 4) via SMEM exchange.

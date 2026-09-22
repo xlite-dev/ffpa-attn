@@ -301,6 +301,7 @@ WS split-D 变体（`launch_cute_fwd_split_d_ws_sm120`）已被禁用：`setmaxn
 - **NHD 零拷贝**：NHD permute view 读作 flat `(B*N, H*D)` 2D 行（head 作为列 tile，`domain_offset` 定位 batch），K/V 用 batched 4D TMA descriptor；O 的 NHD 写镜像 Q 的 NHD 读。strided-NHD（row stride > H·D，如 FLUX.2 fused-QKV chunk view 的 V，stride=36864）在 persist-D 通过 `X.stride(2)` 参数化 TMA box 行 stride 支持，配 `ffpa_check_strided_nhd_aligned` 16B 对齐检查。
 - **K/V 同族约束**：`k_nhd == v_nhd`（kernel 的 NHD domain-offset 逻辑共享），但允许 row stride 不同（strided V + packed K 的混合）。
 - **WS epilogue 协议**：R→S→TMA store（对齐）或 R→G（tail）；producer warpgroup 已提前退出，用 named barrier（仅 consumer）代替 `__syncthreads` 防死锁。
+- **softmax scale 融合（PC-18，2026-09-22）**：persist-D（sm120+sm80）在 Q s2r 后把 `s=scale·log2e` 一次性预乘进 Q A-fragment，S 直达 log2 域（`S_fused=(s·Q)·Kᵀ=s·S_raw`），softmax max/exp 两 pass 每 element 乘法归零（`online_safe_softmax_fused`）；additive bias 注入域同步换算 `bias·log2e`（原 raw-S 域 `bias·inv_scale`）。D=128 全 12 task +0.5~2.8%（平均 ~+1.9%）。量化家族不可移植（Q 为 int8/fp4 整数，mma raw 值供 dequant 链；fp8/fp4 已各有 scale 参数折叠/per-row 预乘/exp2-shift/kMaxScaleAfter 融合形态）。
 - **M4N2 的跨 N-warp softmax**：SMEM exchange 两阶段归约（max 一个 barrier、sum 由 P roundtrip 的 `__syncthreads` 顺带发布）；P 经 stmatrix→LDSM_N SMEM 往返；仅 n_warp==0 写 lse。
 - **smem stage clamp**：`kStagesQK` clamp 到 [2,3]（单缓冲会让 TMA async proxy 写与 ldmatrix generic proxy 读冲突）；99KB 预算内按 D 推导 `kMaxStages`。
 
