@@ -201,8 +201,13 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
   constexpr int kSRows = decltype(size<0>(tScS_rc))::value;
   constexpr int kSCols = decltype(size<1>(tScS_rc))::value;
 
-  const float inv_scale = 1.0f / scale;
-  scale *= FFPA_M_LOG2E;
+  // scale*log2e is fused into the Q A-fragment right after the one-time Q
+  // s2r copy (same protocol as the sm_120 persist-D kernel; see
+  // online_safe_softmax_fused): S arrives in the log2 domain, softmax drops
+  // its per-element `* scale` multiplies, bias is injected as bias * log2(e)
+  // instead of bias * inv_scale on raw scores.
+  const float scale_log2e = scale * FFPA_M_LOG2E;
+  const float bias_mul = FFPA_M_LOG2E;
 
   float row_max[kORows];
   float row_sum[kORows];
@@ -248,6 +253,9 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
 #pragma unroll
     for (int tile_k = 0; tile_k < size<2>(tCrQ); ++tile_k)
       copy(s2r_copy_q, tQsQ_s2r(_, _, tile_k), tXrQ(_, _, tile_k));
+#pragma unroll
+    for (int i = 0; i < size(tCrQ); ++i)
+      tCrQ(i) = (Element)(float(tCrQ(i)) * scale_log2e);
   }
 
   // PC-14 dropout bitmap: stage(0) into buffer 0 before the kv loop.
@@ -335,20 +343,21 @@ __global__ void __launch_bounds__(Traits::kNumThreads, 1)
                                           kSRows, kSCols, false>(
             scores, tScS_rc, attn_bias, attn_bias_dtype, attn_bias_stride_b,
             attn_bias_stride_h, attn_bias_stride_m, attn_bias_stride_n, Nb_id,
-            Nh_id, Br_base, kv_tile, kBc, inv_scale, bias_q_valid,
+            Nh_id, Br_base, kv_tile, kBc, bias_mul, bias_q_valid,
             bias_kv_valid);
       else
         ffpa_cute::apply_attn_bias_rowcol<decltype(scores), decltype(tScS_rc),
                                           kSRows, kSCols, true>(
             scores, tScS_rc, attn_bias, attn_bias_dtype, attn_bias_stride_b,
             attn_bias_stride_h, attn_bias_stride_m, attn_bias_stride_n, Nb_id,
-            Nh_id, Br_base, kv_tile, kBc, inv_scale, bias_q_valid,
+            Nh_id, Br_base, kv_tile, kBc, bias_mul, bias_q_valid,
             bias_kv_valid);
     }
 
-    ffpa_cute::online_safe_softmax<decltype(scores), decltype(tScS_rc), kORows>(
-        scores, tScS_rc, scale, row_max, row_sum, row_scale,
-        Traits::kRescaleThreshold);
+    ffpa_cute::online_safe_softmax_fused<decltype(scores), decltype(tScS_rc),
+                                         kORows>(scores, tScS_rc, row_max,
+                                                 row_sum, row_scale,
+                                                 Traits::kRescaleThreshold);
 
     bool local_need_rescale = false;
 #pragma unroll

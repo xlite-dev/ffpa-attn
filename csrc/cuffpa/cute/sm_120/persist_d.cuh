@@ -488,8 +488,14 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_sm120(
   constexpr int kSRows = decltype(size<0>(tScS_rc))::value;
   constexpr int kSCols = decltype(size<1>(tScS_rc))::value;
 
-  const float inv_scale = 1.0f / scale;
-  scale *= FFPA_M_LOG2E;
+  // scale*log2e is fused into the Q A-fragment right after the one-time Q
+  // s2r copy (see online_safe_softmax_fused), so S arrives in the log2
+  // domain and softmax drops its per-element `* scale` multiplies. Additive
+  // bias is injected in that same domain: bias * log2(e) (was
+  // `bias * inv_scale` on raw scores, with inv_scale = 1/scale; fusing S by
+  // scale*log2e maps 1/scale -> log2e).
+  const float scale_log2e = scale * FFPA_M_LOG2E;
+  const float bias_mul = FFPA_M_LOG2E;
 
   float row_max[kORows];
   float row_sum[kORows];
@@ -516,6 +522,9 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_sm120(
 #pragma unroll
     for (int tile_k = 0; tile_k < size<2>(tCrQ); ++tile_k)
       copy(s2r_copy_q, tQsQ_s2r(_, _, tile_k), tXrQ(_, _, tile_k));
+#pragma unroll
+    for (int i = 0; i < size(tCrQ); ++i)
+      tCrQ(i) = (Element)(float(tCrQ(i)) * scale_log2e);
     CtaBarrier::arrive(&q_consumed);
   }
 
@@ -621,22 +630,22 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_sm120(
         ffpa_cute::apply_attn_bias_rowcol_smem<
             float, decltype(scores), decltype(tScS_rc), kSRows, kSCols>(
             scores, tScS_rc, reinterpret_cast<const float*>(b_slot), s_row, 1,
-            inv_scale, reinterpret_cast<const float*>(b_slot2), split_elems);
+            bias_mul, reinterpret_cast<const float*>(b_slot2), split_elems);
       else if (attn_bias_dtype == 2)
         ffpa_cute::apply_attn_bias_rowcol_smem<
             cutlass::bfloat16_t, decltype(scores), decltype(tScS_rc), kSRows,
             kSCols>(scores, tScS_rc,
                     reinterpret_cast<const cutlass::bfloat16_t*>(b_slot), s_row,
-                    1, inv_scale,
+                    1, bias_mul,
                     reinterpret_cast<const cutlass::bfloat16_t*>(b_slot2),
                     split_elems);
       else
         ffpa_cute::apply_attn_bias_rowcol_smem<
             cutlass::half_t, decltype(scores), decltype(tScS_rc), kSRows,
-            kSCols>(
-            scores, tScS_rc, reinterpret_cast<const cutlass::half_t*>(b_slot),
-            s_row, 1, inv_scale,
-            reinterpret_cast<const cutlass::half_t*>(b_slot2), split_elems);
+            kSCols>(scores, tScS_rc,
+                    reinterpret_cast<const cutlass::half_t*>(b_slot), s_row, 1,
+                    bias_mul, reinterpret_cast<const cutlass::half_t*>(b_slot2),
+                    split_elems);
       CtaBarrier::arrive(&bias_empty[b_stg]);
     } else if constexpr (kHasAttnBias) {
       const bool full_tile = bias_q_valid >= kBr && bias_kv_valid >= kBc;
@@ -645,20 +654,21 @@ __global__ void __launch_bounds__(384, 1) persist_d_ws_fwd_cute_sm120(
                                           kSRows, kSCols, false>(
             scores, tScS_rc, attn_bias, attn_bias_dtype, attn_bias_stride_b,
             attn_bias_stride_h, attn_bias_stride_m, attn_bias_stride_n, Nb_id,
-            Nh_id, Br_base, kv_tile, kBc, inv_scale, bias_q_valid,
+            Nh_id, Br_base, kv_tile, kBc, bias_mul, bias_q_valid,
             bias_kv_valid);
       else
         ffpa_cute::apply_attn_bias_rowcol<decltype(scores), decltype(tScS_rc),
                                           kSRows, kSCols, true>(
             scores, tScS_rc, attn_bias, attn_bias_dtype, attn_bias_stride_b,
             attn_bias_stride_h, attn_bias_stride_m, attn_bias_stride_n, Nb_id,
-            Nh_id, Br_base, kv_tile, kBc, inv_scale, bias_q_valid,
+            Nh_id, Br_base, kv_tile, kBc, bias_mul, bias_q_valid,
             bias_kv_valid);
     }
 
-    ffpa_cute::online_safe_softmax<decltype(scores), decltype(tScS_rc), kORows>(
-        scores, tScS_rc, scale, row_max, row_sum, row_scale,
-        Traits::kRescaleThreshold);
+    ffpa_cute::online_safe_softmax_fused<decltype(scores), decltype(tScS_rc),
+                                         kORows>(scores, tScS_rc, row_max,
+                                                 row_sum, row_scale,
+                                                 Traits::kRescaleThreshold);
 
     bool local_need_rescale = false;
 #pragma unroll
