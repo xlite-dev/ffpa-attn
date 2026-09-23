@@ -23,13 +23,13 @@ inline FfpaBiasTilePlan fp16_split_d_bias_plan(const FfpaBiasParams& bias_p,
   constexpr int kBr = 128;
   constexpr int kBc = 128;
   constexpr int kStagesQK = (kStage < 2 ? 2 : (kStage > 3 ? 3 : kStage));
-  constexpr int kStagesPV = kStagesQK;
+  // Bias cases pipeline V deeper (measured faster); bias-less stays at 2.
+  const int kStagesPV = bias_p.ptr != nullptr ? 3 : 2;
   constexpr int kQTileBytes = kBr * kQKDChunk * sizeof(Element);
   constexpr int kKTileBytes = kBc * kQKDChunk * sizeof(Element);
   constexpr int kVTileBytes = kBc * kVDChunk * sizeof(Element);
-  constexpr int kBaseSmemBytes = kStagesQK * kQTileBytes +
-                                 kStagesQK * kKTileBytes +
-                                 kStagesPV * kVTileBytes;
+  const int kBaseSmemBytes = kStagesQK * kQTileBytes + kStagesQK * kKTileBytes +
+                             kStagesPV * kVTileBytes;
   constexpr int kSmemBudgetBytes = 99 * 1024;
   FfpaBiasTilePlan plan = ffpa_bias_tile_plan_of(bias_p, Nb, Nh, Nq, Nkv);
   const int bias_stages = (plan.mode == 2) ? 2 : 1;
@@ -78,7 +78,8 @@ void launch_cute_fwd_split_d_sm120_v(torch::Tensor Q, torch::Tensor K,
   // CtaBarrier (async proxy) can't prove the generic-proxy read finished.
   // Clamp >=2 so double-buffering keeps read/write addresses disjoint.
   constexpr int kStagesQK = (kStage < 2 ? 2 : (kStage > 3 ? 3 : kStage));
-  constexpr int kStagesPV = kStagesQK;
+  // Bias cases pipeline V deeper (measured faster); bias-less stays at 2.
+  constexpr int kStagesPV = kBiasOn ? 3 : 2;
   constexpr int kNumThreads = kBr / 16 * 32;
 
   using Element = std::conditional_t<std::is_same_v<kDataType, __half>,
