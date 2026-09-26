@@ -21,7 +21,7 @@
 
 ## Latest News
 
-- [2026-09] 🚪 FFPA now supports [**FP8 Attention**](#end-to-end-inference) for **sm_89 (Ada)** and achieving **1.5x~1.8x**🎉 speedup over PyTorch SDPA (BF16) for D=64~224 on NVIDIA RTX PRO 5000. Stay tuned for future updates. 🎉🎉
+- [2026-09] 🚪 FFPA now supports [**FP8 Attention**](#end-to-end-inference) for **sm_89 (Ada)** and achieving **1.5x~1.8x**🎉 speedup over PyTorch SDPA (BF16) for D=64~224 on NVIDIA L20. Stay tuned for future updates. 🎉🎉
 - [2026-09] 🎯 FFPA now supports **attn_mask** for [**FP8/FP4 Attention**](#end-to-end-inference) and achieving **4.4x~4.9x**🎉 speedup over PyTorch SDPA (BF16) for D=64/128 on NVIDIA RTX PRO 5000. Stay tuned for future updates. 🎉🎉
 - [2026-08] 🚀 Add [**FFPA FP8/FP4**](#end-to-end-inference) benchmark results (compare with **Sage-2/3**) for NVIDIA RTX [5090](#end-to-end-inference), RTX PRO [5000/6000](#end-to-end-inference), achieving significant speedup for FP4 Attention (nearly [**1000 TOPS**](#end-to-end-inference) for D=128 on PRO 6000). 🎉🎉
 - [2026-08] 🐍 [**Cache-DiT x FFPA (FP8/FP4)**](#end-to-end-inference) is ready! Feel free to take a try for your Diffusion models. 🎉🎉
