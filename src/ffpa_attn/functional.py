@@ -202,12 +202,14 @@ def _fp8_sm89_active(backend: CUDABackend, device: torch.device) -> bool:
 
 
 def _adapt_backend_for_fp8_sm89(backend: CUDABackend) -> None:
-  """Clamp fp8 knobs to what the sm89 persist-D kernel supports.
+  """Clamp fp8 knobs to what the sm89 cp.async kernels support.
 
   The sm89 path only supports the f16 PV accumulator, so that is forced
   regardless of auto/explicit settings. Hybrid (fp16 early rows via the
   sm_80 cp.async family + fp8 late rows), quant methods (per_block/
   per_thread QK, per_block/per_channel V with smooth_v) pass through.
+  Head dims route inside C++: persist-D for D<=224, split-D M8N1 for
+  224<D<=512 (D%64==0); beyond that the dispatch raises.
   """
   backend.fp8_pv_acc_type = "f16"
 

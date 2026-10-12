@@ -90,13 +90,26 @@ class ENV(object):
   # at runtime on TMA-capable devices. Requires CUDA Toolkit >= 13.0.
   ENABLE_FFPA_TMA_EXT = bool(int(os.environ.get("ENABLE_FFPA_TMA_EXT", 0)))
 
-  # Enable the TMA-free CuTe fp8 sm_89 kernel family (persist_d, D<=224)
-  # for sm_89-only builds where ENABLE_FFPA_TMA_EXT must stay off (TMA
-  # needs sm>=90). Opt-in, default off; tools/build_fast.sh flips it on
-  # automatically when every target arch is sm<90. Requires
-  # ENABLE_FFPA_CUTE_EXT=1 to activate the kernel path.
+  # Enable the TMA-free CuTe fp8 sm_89 kernel family (persist_d D<=224,
+  # split_d 224<D<=512) for sm_89-only builds where ENABLE_FFPA_TMA_EXT
+  # must stay off (TMA needs sm>=90). Opt-in, default off;
+  # tools/build_fast.sh flips it on automatically when every target arch
+  # is sm<90. Requires ENABLE_FFPA_CUTE_EXT=1 to activate the kernel path.
   ENABLE_FFPA_FP8_SM89_EXT = bool(
     int(os.environ.get("ENABLE_FFPA_FP8_SM89_EXT", 0))
+  )
+
+  # Compile the split-D quantized attention kernels (fp8 split-D M8N1 +
+  # split-D M4N2, fp4 split-D + split-D M4N2, sm120 and the sm89 split-D
+  # window). Default OFF: --ext all builds a persist-only quantized
+  # family (fp8 D<=224, fp4 D<=256) per the PC-19 decision (large-D
+  # quantized attention has no speedup window vs the bf16 family, so the
+  # split kernels are opt-in). Router calls past the persist window raise
+  # with this env name. Debug builds (ENABLE_FFPA_BUILD_DEBUG=fp8/fp4)
+  # imply it (enable_quant_split_d): the FFPA_FP8_FORCE_KERNEL A/B needs
+  # the split wrappers.
+  ENABLE_FFPA_QUANT_SPLIT_D = bool(
+    int(os.environ.get("ENABLE_FFPA_QUANT_SPLIT_D", 0))
   )
 
   # Enable CuTe C++ kernel extension for sm_120+ (opt-in, default off).
@@ -333,6 +346,15 @@ class ENV(object):
     return cls.ENABLE_FFPA_FP8_SM89_EXT
 
   @classmethod
+  def enable_quant_split_d(cls):
+    # Debug fp8/fp4 builds imply the split kernels: FFPA_FP8_FORCE_KERNEL
+    # and the m4n2 bias-plan A/B instantiate the split wrappers.
+    if cls.ENABLE_FFPA_QUANT_SPLIT_D:
+      return True
+    dbg = cls.build_debug_families()
+    return bool(dbg & {"fp8", "fp4"})
+
+  @classmethod
   def enable_cute_ext(cls):
     return cls.ENABLE_FFPA_CUTE_EXT
 
@@ -423,6 +445,8 @@ class ENV(object):
       extra_env_cflags.append("-DENABLE_FFPA_TMA_EXT")
     if cls.enable_fp8_sm89_ext():
       extra_env_cflags.append("-DENABLE_FFPA_FP8_SM89_EXT")
+    if cls.enable_quant_split_d():
+      extra_env_cflags.append("-DENABLE_FFPA_QUANT_SPLIT_D")
     if cls.enable_cute_ext():
       extra_env_cflags.append("-DENABLE_FFPA_CUTE_EXT")
     for family in ("fp16", "fp8", "fp4"):
@@ -455,6 +479,8 @@ class ENV(object):
       extra_gcc_flags.append("-DENABLE_FFPA_TMA_EXT")
     if cls.enable_fp8_sm89_ext():
       extra_gcc_flags.append("-DENABLE_FFPA_FP8_SM89_EXT")
+    if cls.enable_quant_split_d():
+      extra_gcc_flags.append("-DENABLE_FFPA_QUANT_SPLIT_D")
     if cls.enable_cute_ext():
       extra_gcc_flags.append("-DENABLE_FFPA_CUTE_EXT")
     return extra_gcc_flags
@@ -695,7 +721,8 @@ with r in {0, 1}. See `_fp16_impl_variants` in `env.py`.
       and fp16f32 share one __half TU (duplicate explicit instantiation
       would be a compile error).
     - ``fwd_<dtype>_cute_fp8_hdim{d}_s{s}.cu`` (ENABLE_FFPA_TMA_EXT; or
-      ENABLE_FFPA_FP8_SM89_EXT, D<=224 only): cute_fp8 family TU
+      ENABLE_FFPA_FP8_SM89_EXT, sm89 family window only: D<=224 or
+      224<D<=512 with D%64==0): cute_fp8 family TU
       (``dispatch/cute_fp8.cuh``): explicit instantiation of
       ``ffpa_fwd_fp8``.
     - ``fwd_<dtype>_cute_fp4_hdim{d}.cu`` (ENABLE_FFPA_TMA_EXT): cute_fp4
@@ -711,6 +738,14 @@ with r in {0, 1}. See `_fp16_impl_variants` in `env.py`.
       (``prepare_fp8_inputs`` and the dtype-agnostic
       ``launch_fp4_quant_*`` helpers); family TUs see extern-template
       declarations from the ``.cuh`` and skip re-instantiation.
+
+    Quantized split-D window (PC-19): with ENABLE_FFPA_QUANT_SPLIT_D
+    unset (default, incl. ``--ext all``) only the persist-D windows get
+    quantized TUs — fp8 D<=224, fp4 64<=D<=256 (%64) — for family TUs,
+    variant TUs and preprocess instances alike; the router raises with
+    the env name for Ds past those windows. ENABLE_FFPA_BUILD_DEBUG
+    covering fp8/fp4 implies the split window (the FORCE_KERNEL A/B
+    needs the split wrappers).
 
     The generated dir is wiped and rewritten on every call so stale files
     from a previous config never leak into the build. It is gitignored.
@@ -1119,20 +1154,33 @@ with r in {0, 1}. See `_fp16_impl_variants` in `env.py`.
               cls._render_cute_fp16_family_tu(t_in, d, s),
             )
         if cls.enable_tma_ext():
-          for s in stages:
+          # Persist-only default (ENABLE_FFPA_QUANT_SPLIT_D off, PC-19):
+          # the fp8 family TUs past the persist window (D<=224) would
+          # only instantiate the split-D/m4n2 launchers, so skip them;
+          # the router raises loudly for those Ds instead.
+          if cls.enable_quant_split_d() or d <= 224:
+            for s in stages:
+              yield (
+                f"fwd_{token}_cute_fp8_hdim{d}_s{s}.cu",
+                cls._render_fp8_family_tu(t_in, d, s),
+              )
+          # fp4 persist window is %64==0 and 64<=D<=256; same
+          # persist-only skip for the split (256<D<768) / m4n2
+          # (768<=D<=1024) windows.
+          if cls.enable_quant_split_d() or (d % 64 == 0 and 64 <= d <= 256):
             yield (
-              f"fwd_{token}_cute_fp8_hdim{d}_s{s}.cu",
-              cls._render_fp8_family_tu(t_in, d, s),
+              f"fwd_{token}_cute_fp4_hdim{d}.cu",
+              cls._render_fp4_family_tu(t_in, d, stages),
             )
-          yield (
-            f"fwd_{token}_cute_fp4_hdim{d}.cu",
-            cls._render_fp4_family_tu(t_in, d, stages),
-          )
         elif cls.enable_fp8_sm89_ext():
-          # sm_89-only build: the fp8 sm89 kernel family covers D<=224
-          # only (dispatch raises above); skip the D>224 family TUs so
-          # e.g. --headdim all does not compile dead raise-only TUs.
-          if d <= 224:
+          # sm_89-only build: the fp8 sm89 kernel family covers persist-D
+          # (D<=224) and split-D (224<D<=512, D%64==0, only with
+          # ENABLE_FFPA_QUANT_SPLIT_D); skip the other headdims so e.g.
+          # --headdim all does not compile dead raise-only TUs.
+          if (
+            d <= 224
+            or (cls.enable_quant_split_d() and d % 64 == 0 and d <= 512)
+          ):
             for s in stages:
               yield (
                 f"fwd_{token}_cute_fp8_hdim{d}_s{s}.cu",
@@ -1251,6 +1299,7 @@ with r in {0, 1}. See `_fp16_impl_variants` in `env.py`.
     (kQKInt8, kBiasOn, kBiasPlanMode, kBias4BytesPerElem).
     """
     debug_fp8 = cls.enable_build_debug("fp8")
+    quant_split_d = cls.enable_quant_split_d()
     out = []
     if d % 32 == 0 and 32 <= d <= 224:
       tags = [
@@ -1265,7 +1314,7 @@ with r in {0, 1}. See `_fp16_impl_variants` in `env.py`.
         "launch_cute_fwd_persist_d_fp8_sm120_v",
         cls._mask_f32_tags(tags),
       ))
-    if d % 64 == 0 and 224 < d <= 1024:
+    if d % 64 == 0 and 224 < d <= 1024 and quant_split_d:
       routed_split = 224 < d < 768
       routed_m4n2 = d >= 768
       if routed_split or debug_fp8:
@@ -1384,6 +1433,7 @@ with r in {0, 1}. See `_fp16_impl_variants` in `env.py`.
     kBias4BytesPerElem).
     """
     debug_fp4 = cls.enable_build_debug("fp4")
+    quant_split_d = cls.enable_quant_split_d()
     out = []
     if d % 64 == 0 and 64 <= d <= 256:
       for pv in ((0, 1) if d <= 192 else (0, )):
@@ -1401,7 +1451,7 @@ with r in {0, 1}. See `_fp16_impl_variants` in `env.py`.
             (pv, 1, 0, 0),
           ]),
         ))
-    if d % 64 == 0 and 256 < d < 768:
+    if d % 64 == 0 and 256 < d < 768 and quant_split_d:
       for pv in (0, 1):
         out.append((
           "split",
@@ -1414,7 +1464,7 @@ with r in {0, 1}. See `_fp16_impl_variants` in `env.py`.
             (pv, 1, 0, 0),
           ]),
         ))
-    if d % 64 == 0 and 768 <= d <= 1024:
+    if d % 64 == 0 and 768 <= d <= 1024 and quant_split_d:
       tags = [(0, 0, 0, 0), (0, 1, 0, 0)]
       if debug_fp4:
         tags += [(0, 1, 2, 1), (0, 1, 2, 0)]
@@ -1651,8 +1701,13 @@ with r in {0, 1}. See `_fp16_impl_variants` in `env.py`.
     combos = []
     seen = set()
     debug_fp8 = cls.enable_build_debug("fp8")
+    quant_split_d = cls.enable_quant_split_d()
     for t_in in dtypes:
       for d in headdims:
+        # Persist-only builds (see ENABLE_FFPA_QUANT_SPLIT_D): D>224 has
+        # no fp8 kernel TU, so no preprocess instance either.
+        if d > 224 and not quant_split_d:
+          continue
         br, bc = cls._fp8_variant_blocks(d)
         blocks = [(br, bc)]
         # sm89 persist-D unified kBr=64: kBc=128 and kBc=64 tuning cfgs
@@ -1780,6 +1835,10 @@ with r in {0, 1}. See `_fp16_impl_variants` in `env.py`.
           continue
         if isinstance(d_filter, int) and d > d_filter:
           continue
+        # Persist-only builds (see ENABLE_FFPA_QUANT_SPLIT_D): D>256 has
+        # no fp4 kernel TU, so no preprocess instance either.
+        if d > 256 and not cls.enable_quant_split_d():
+          continue
         lines.append(f"template void ffpa_fp4::{name}<{d}>{sig};")
     lines += ["#else"]
     for name, sig, d_filter in cls._FP4_PREPROCESS_LAUNCHERS:
@@ -1787,6 +1846,8 @@ with r in {0, 1}. See `_fp16_impl_variants` in `env.py`.
         if d_filter == "pow2" and d & (d - 1):
           continue
         if isinstance(d_filter, int) and d > d_filter:
+          continue
+        if d > 256 and not cls.enable_quant_split_d():
           continue
         lines.append(f"extern template void ffpa_fp4::{name}<{d}>{sig};")
     lines += ["#endif", ""]

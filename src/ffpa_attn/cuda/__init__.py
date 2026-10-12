@@ -19,6 +19,12 @@ try:
   CUDA_CUTE_TMA_AVAILABLE = bool(
     getattr(_cuda_ext, "CUDA_CUTE_TMA_AVAILABLE", False)
   )
+  CUDA_FP8_SM89_AVAILABLE = bool(
+    getattr(_cuda_ext, "CUDA_FP8_SM89_AVAILABLE", False)
+  )
+  CUDA_QUANT_SPLIT_D_AVAILABLE = bool(
+    getattr(_cuda_ext, "CUDA_QUANT_SPLIT_D_AVAILABLE", False)
+  )
   CUDA_BWD_AVAILABLE = False
   _CUDA_IMPORT_ERROR = None
 except Exception as exc:
@@ -30,6 +36,8 @@ except Exception as exc:
   CUDA_MASK_FP32_AVAILABLE = False
   CUDA_TMA_AVAILABLE = False
   CUDA_CUTE_TMA_AVAILABLE = False
+  CUDA_FP8_SM89_AVAILABLE = False
+  CUDA_QUANT_SPLIT_D_AVAILABLE = False
   CUDA_BWD_AVAILABLE = False
   _CUDA_IMPORT_ERROR = exc
 
@@ -44,7 +52,8 @@ class CudaBackendImpl(enum.IntEnum):
   # Hopper/Blackwell-datacenter specialisations get their own entries.
   CUTE_TMA_FP8_SM_120 = 5
   CUTE_TMA_FP4_SM_120 = 6
-  # TMA-free cp.async fp8 persist-D family (D<=224), sm_89 target.
+  # TMA-free cp.async fp8 family (persist-D D<=224, split-D 224<D<=512),
+  # sm_89 target.
   CUTE_FP8_SM_89 = 7
 
 

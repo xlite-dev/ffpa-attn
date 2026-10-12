@@ -381,9 +381,10 @@ def _parse_args() -> argparse.Namespace:
     "(per-channel V + dim-mean subtraction, smooth-K off); "
     "'cute_tma_fp8_smkv' (alias 'fp8_smkv') enables smooth-K + smooth-V; "
     "'cute_tma_fp8_smkv_qk_int8' (alias 'fp8_smkv_qk_i8') adds int8 QK MMA; "
-    "'fp8_sm_89' forces the sm_89 cp.async persist-D FP8 kernel (int8 QK + "
-    "f16 PV acc + smooth-K defaults; per-call backend flag, also "
-    "auto-selected on any major<12 device). "
+    "'fp8_sm_89' forces the sm_89 cp.async FP8 kernels (persist-D "
+    "D<=224, split-D 224<D<=512; int8 QK + f16 PV acc + smooth-K "
+    "defaults; per-call backend flag, also auto-selected on any "
+    "major<12 device). "
     "'cute_tma_fp4' (alias 'fp4') selects the NVFP4 path (any D%%8==0 in "
     "[8,256], padded up to {64,128,192,256}; e2m1 + ue4m3 block scales). "
     "Mutually exclusive with --fwd-tma/--cute when not 'auto'.",
@@ -657,7 +658,7 @@ def _resolve_directional_cli_flags(
           "int8" if args.cuda_impl in _FP8_QK_INT8_IMPLS else "fp8"
         )
         if args.cuda_impl == "fp8_sm_89":
-          # Force the sm_89 cp.async persist-D kernel via the backend flag
+          # Force the sm_89 cp.async fp8 family via the backend flag
           # (per-call, no process-wide env latch). The backend adapter
           # additionally defaults the f16-only PV accumulator; an explicit
           # --fp8-pv-acc-type still overrides below (and is then re-clamped

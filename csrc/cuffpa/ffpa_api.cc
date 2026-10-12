@@ -371,5 +371,23 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 #else
   m.attr("CUDA_CUTE_TMA_AVAILABLE") = py::bool_(false);
 #endif
+// The TMA-free fp8 sm_89 family (persist-D / split-D) compiles under the
+// sm_89-only ext as well as the full TMA ext; same guard as the fp8
+// dispatch route.
+#if defined(ENABLE_FFPA_CUTE_EXT) && \
+    (defined(ENABLE_FFPA_TMA_EXT) || defined(ENABLE_FFPA_FP8_SM89_EXT))
+  m.attr("CUDA_FP8_SM89_AVAILABLE") = py::bool_(true);
+#else
+  m.attr("CUDA_FP8_SM89_AVAILABLE") = py::bool_(false);
+#endif
+// Split-D quantized attention kernels (fp8 split-D/M4N2 + fp4
+// split-D/M4N2): opt-in via ENABLE_FFPA_QUANT_SPLIT_D (PC-19 default
+// builds a persist-only quantized family). Tests gate on this for the
+// D>224 (fp8) / D>256 (fp4) windows.
+#if defined(ENABLE_FFPA_QUANT_SPLIT_D)
+  m.attr("CUDA_QUANT_SPLIT_D_AVAILABLE") = py::bool_(true);
+#else
+  m.attr("CUDA_QUANT_SPLIT_D_AVAILABLE") = py::bool_(false);
+#endif
   m.attr("CUDA_BWD_AVAILABLE") = py::bool_(false);
 }

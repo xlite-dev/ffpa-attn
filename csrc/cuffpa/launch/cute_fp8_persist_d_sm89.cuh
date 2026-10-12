@@ -108,7 +108,14 @@ void persist_d_fp8_sm89_variant(
   const float scale = static_cast<float>(softmax_scale);
   const int n_rb_q = utils::div_ceil(Nq, kBr);
   const int n_rb_kv = utils::div_ceil(Nkv, kBc);
-  const int Nkv_pad = (Nkv + 15) / 16 * 16;
+  // Full cp.async read extent of the tail kv tile (ceil(Nkv/kBc)*kBc),
+  // not just 16B alignment: a read past the plane row stride lands past
+  // the vt8 allocation for the last D-row of the last (b,h) plane, and
+  // NaN bit patterns there poison O via 0*NaN in the fp8 PV MMA (P8 == 0
+  // at masked kv positions does not shield against NaN operands). The
+  // V^T quantize kernels zero-fill [Nkv, Nkv_pad) and their grids cover
+  // exactly this extent.
+  const int Nkv_pad = (Nkv + kBc - 1) / kBc * kBc;
   const int D_og = Q.size(3);
 
   const c10::cuda::OptionalCUDAGuard device_guard(Q.device());

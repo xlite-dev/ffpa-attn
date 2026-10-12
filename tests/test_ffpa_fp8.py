@@ -15,10 +15,18 @@ import torch.nn.functional as F
 
 from ffpa_attn import ffpa_attn_func
 from ffpa_attn.cli._flops import attention_fwd_flops, tflops_from_ms
-from ffpa_attn.cuda import CUDA_INPUT_FP16_AVAILABLE
+from ffpa_attn.cuda import CUDA_INPUT_FP16_AVAILABLE, CUDA_QUANT_SPLIT_D_AVAILABLE
 from ffpa_attn.functional import CUDABackend
 
 SAGE_INSTALLED = importlib.util.find_spec("sageattention") is not None
+
+# Split-D / m4n2 fp8 kernels are opt-in (ENABLE_FFPA_QUANT_SPLIT_D);
+# default builds ship the persist-D window only (PC-19).
+requires_quant_split_d = pytest.mark.skipif(
+  not CUDA_QUANT_SPLIT_D_AVAILABLE,
+  reason="fp8 split-D/m4n2 not compiled; rebuild with "
+  "ENABLE_FFPA_QUANT_SPLIT_D=1",
+)
 
 
 def _fp8_available() -> bool:
@@ -391,6 +399,7 @@ def test_fp8_wan_self_attn_shape_parity():
 @pytest.mark.parametrize(
   "dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"]
 )
+@requires_quant_split_d
 def test_fp8_split_d_forward_parity(D, dtype):
   torch.manual_seed(0)
   B, H, N = 1, 32, 4096
@@ -406,6 +415,7 @@ def test_fp8_split_d_forward_parity(D, dtype):
 
 
 @pytest.mark.parametrize("D", [320, 512])
+@requires_quant_split_d
 def test_fp8_split_d_causal_parity(D):
   torch.manual_seed(0)
   B, H, N = 1, 32, 2048
@@ -422,6 +432,7 @@ def test_fp8_split_d_causal_parity(D):
 
 @pytest.mark.parametrize("D", [320, 512])
 @pytest.mark.parametrize("qk_int8", [False, True], ids=["fp8-qk", "int8-qk"])
+@requires_quant_split_d
 def test_fp8_split_d_gqa_parity(D, qk_int8, monkeypatch):
   _set_qk_int8(monkeypatch, qk_int8)
   torch.manual_seed(0)
@@ -441,6 +452,7 @@ def test_fp8_split_d_gqa_parity(D, qk_int8, monkeypatch):
 
 @pytest.mark.parametrize("D", [320, 512])
 @pytest.mark.parametrize("qk_int8", [False, True], ids=["fp8-qk", "int8-qk"])
+@requires_quant_split_d
 def test_fp8_split_d_nkv_unaligned_lse(D, qk_int8, monkeypatch):
   _set_qk_int8(monkeypatch, qk_int8)
   torch.manual_seed(0)
@@ -465,6 +477,7 @@ def test_fp8_split_d_nkv_unaligned_lse(D, qk_int8, monkeypatch):
 @pytest.mark.parametrize(
   "smooth_k", [False, True], ids=["smooth-off", "smooth-on"]
 )
+@requires_quant_split_d
 def test_fp8_split_d_smooth_k_and_lse(D, qk_int8, smooth_k, monkeypatch):
   _set_qk_int8(monkeypatch, qk_int8)
   torch.manual_seed(0)
@@ -493,6 +506,7 @@ def test_fp8_split_d_smooth_k_and_lse(D, qk_int8, smooth_k, monkeypatch):
 @pytest.mark.parametrize(
   "dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"]
 )
+@requires_quant_split_d
 def test_fp8_split_d_m4n2_forward_parity(D, dtype):
   torch.manual_seed(0)
   B, H, N = 1, 32, 4096
@@ -508,6 +522,7 @@ def test_fp8_split_d_m4n2_forward_parity(D, dtype):
 
 
 @pytest.mark.parametrize("D", [768, 1024])
+@requires_quant_split_d
 def test_fp8_split_d_m4n2_causal_parity(D):
   torch.manual_seed(0)
   B, H, N = 1, 32, 2048
@@ -526,6 +541,7 @@ def test_fp8_split_d_m4n2_causal_parity(D):
 
 @pytest.mark.parametrize("D", [768, 1024])
 @pytest.mark.parametrize("qk_int8", [False, True], ids=["fp8-qk", "int8-qk"])
+@requires_quant_split_d
 def test_fp8_split_d_m4n2_gqa_parity(D, qk_int8, monkeypatch):
   _set_qk_int8(monkeypatch, qk_int8)
   torch.manual_seed(0)
@@ -663,7 +679,28 @@ def _sdpa_bias_ref(q, k, v, bias, causal):
   "kind", ["dense", "causal_fused"], ids=["dense", "causal-fused"]
 )
 @pytest.mark.parametrize(
-  "D", [128, 320, 768], ids=["persist_d", "split_d", "split_d_m4n2"]
+  "D",
+  [
+    pytest.param(128, id="persist_d"),
+    pytest.param(
+      320,
+      id="split_d",
+      marks=pytest.mark.skipif(
+        not CUDA_QUANT_SPLIT_D_AVAILABLE,
+        reason="fp8 split-D not compiled; rebuild with "
+        "ENABLE_FFPA_QUANT_SPLIT_D=1",
+      ),
+    ),
+    pytest.param(
+      768,
+      id="split_d_m4n2",
+      marks=pytest.mark.skipif(
+        not CUDA_QUANT_SPLIT_D_AVAILABLE,
+        reason="fp8 m4n2 not compiled; rebuild with "
+        "ENABLE_FFPA_QUANT_SPLIT_D=1",
+      ),
+    ),
+  ],
 )
 def test_fp8_attn_bias_parity(D, kind):
   # The public API rejects explicit attn_mask + is_causal (SDPA semantics),

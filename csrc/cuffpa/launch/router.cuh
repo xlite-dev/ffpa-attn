@@ -261,7 +261,21 @@ void launch_ffpa_attn_fwd_template(
         TORCH_CHECK(prop->major >= 12,
                     "ffpa_attn: the CUTE_TMA_FP4_SM_120 family requires an "
                     "sm_120 device");
+#if defined(ENABLE_FFPA_QUANT_SPLIT_D)
         ffpa::ffpa_fwd_fp4<kDataType, kHeadDim, kStage>(p);
+#else
+        // Persist-only quantized build (PC-19 default): only the fp4
+        // persist-D window (D%64==0, 64<=D<=256) has family TUs; the
+        // call must stay inside it or the entry TU emits an undefined
+        // ffpa_fwd_fp4<d> reference.
+        if constexpr (kHeadDim % 64 == 0 && kHeadDim >= 64 && kHeadDim <= 256) {
+          ffpa::ffpa_fwd_fp4<kDataType, kHeadDim, kStage>(p);
+        } else {
+          TORCH_CHECK(false,
+                      "ffpa_attn: fp4 D>256 (split-D/m4n2) not compiled in "
+                      "this build; rebuild with ENABLE_FFPA_QUANT_SPLIT_D=1");
+        }
+#endif
 #else
         // fp4 is the sm_120 family and only compiles under the TMA ext;
         // instantiating the call in sm_89-only builds leaves undefined
@@ -274,17 +288,44 @@ void launch_ffpa_attn_fwd_template(
       }
       if (force_fp8) {
 #ifdef ENABLE_FFPA_TMA_EXT
+#if defined(ENABLE_FFPA_QUANT_SPLIT_D)
         ffpa::ffpa_fwd_fp8<kDataType, kHeadDim, kStage>(p);
 #else
-        // sm_89-only builds instantiate fp8 family TUs for D<=224 only;
-        // guard the call so D>224 entry TUs emit no undefined refs.
+        // Persist-only quantized build (PC-19 default): only the fp8
+        // persist-D window (D<=224) has family TUs.
         if constexpr (kHeadDim <= 224) {
           ffpa::ffpa_fwd_fp8<kDataType, kHeadDim, kStage>(p);
         } else {
           TORCH_CHECK(false,
-                      "ffpa_attn: fp8 beyond the sm89 persist-D family "
-                      "(D<=224) requires ENABLE_FFPA_TMA_EXT");
+                      "ffpa_attn: fp8 D>224 (split-D/m4n2) not compiled in "
+                      "this build; rebuild with ENABLE_FFPA_QUANT_SPLIT_D=1");
         }
+#endif
+#else
+        // sm_89-only builds instantiate fp8 family TUs for the sm89
+        // family window only (persist-D D<=224; split-D 224<D<=512 with
+        // D%64==0 additionally needs ENABLE_FFPA_QUANT_SPLIT_D); guard
+        // the call so out-of-window entry TUs emit no undefined refs.
+#if defined(ENABLE_FFPA_QUANT_SPLIT_D)
+        if constexpr (kHeadDim <= 224 ||
+                      (kHeadDim % 64 == 0 && kHeadDim <= 512)) {
+          ffpa::ffpa_fwd_fp8<kDataType, kHeadDim, kStage>(p);
+        } else {
+          TORCH_CHECK(false,
+                      "ffpa_attn: fp8 beyond the sm89 family (persist-D "
+                      "D<=224, split-D 224<D<=512 with D%64==0) requires "
+                      "ENABLE_FFPA_TMA_EXT");
+        }
+#else
+        if constexpr (kHeadDim <= 224) {
+          ffpa::ffpa_fwd_fp8<kDataType, kHeadDim, kStage>(p);
+        } else {
+          TORCH_CHECK(false,
+                      "ffpa_attn: fp8 D>224 (split-D, sm89 or sm120) not "
+                      "compiled in this build; rebuild with "
+                      "ENABLE_FFPA_QUANT_SPLIT_D=1");
+        }
+#endif
 #endif
       } else if (prop->major == 9 || prop->major == 10) {
         // sm_90/100 (228 KB smem): WS path, setmaxnreg effective.

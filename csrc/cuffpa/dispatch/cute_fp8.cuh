@@ -24,15 +24,34 @@ void ffpa_fwd_fp8(const FfpaFwdParams& p) {
               "ffpa_attn: Q/K quant method must be both per_block or "
               "both per_thread");
 #ifdef ENABLE_FFPA_CUTE_EXT
+  // sm89 selection is backend-hint driven (CUTE_FP8_SM_89): the Python
+  // layer resolves device/force knobs into the hint before launch, so
+  // dispatch only reads the hint. The TMA-free sm89 cp.async family
+  // (persist-D D<=224, split-D 224<D<=512) is dispatched before the sm120
+  // chain, so it stays reachable in sm_89-only builds where TMA must be
+  // off; the sm120 TMA families below remain hard-bound to sm_120.
+  const bool on_sm89 =
+      ffpa::get_backend_impl_hint() == ffpa::CudaBackendImpl::CUTE_FP8_SM_89;
+  TORCH_CHECK(!on_sm89 || kHeadDim <= 512,
+              "ffpa_attn: fp8 sm89 path supports D<=512 (persist-D D<=224, "
+              "split-D 224<D<=512 with D%64==0)");
+  // The non-sm89 route is the sm_120 TMA family (hard-bound: traits use
+  // Blackwell atoms); reject earlier devices loudly instead of dying on a
+  // cubin load with a misleading no-kernel-image error.
+  TORCH_CHECK(on_sm89 || at::cuda::getCurrentDeviceProperties()->major >= 12,
+              "ffpa_attn: the CUTE_TMA_FP8_SM_120 family requires an sm_120 "
+              "device; use the CUTE_FP8_SM_89 hint on sm_89");
 #if defined(ENABLE_FFPA_FP8_BUILD_DEBUG) && defined(ENABLE_FFPA_TMA_EXT)
   // EXPERIMENT: FFPA_FP8_FORCE_KERNEL=split_d|m4n2 forces a specific
   // split-D kernel to A/B test the M8N1/M4N2 dispatch cross-point.
   // Applies only to 224 < D <= 1024; persist-D (D<=224) is unaffected.
   // Unset -> normal headdim-based dispatch below. Debug-build only: both
   // forced entries instantiate, doubling the fp8 attention codegen per TU.
+  // The forced kernels are sm120 TMA variants, so on the sm89 hint the
+  // normal sm89 dispatch below applies instead.
   if constexpr (kHeadDim > 224 && kHeadDim <= 1024) {
     const char* fk = getenv("FFPA_FP8_FORCE_KERNEL");
-    if (fk != nullptr) {
+    if (fk != nullptr && !on_sm89) {
       if (std::strcmp(fk, "split_d") == 0) {
         launch_cute_fwd_split_d_fp8_sm120<kDataType, kHeadDim, kStage>(
             p.Q, p.K, p.V, p.O, p.attn_bias, p.softmax_lse, p.causal,
@@ -61,32 +80,15 @@ void ffpa_fwd_fp8(const FfpaFwdParams& p) {
   // materializes BHND only for the causal/padded slices, and stage-2
   // quantize is layout-generic with q_start_row offsetting just the
   // attention grid.
-  // D<=224: persist-D fp8; 224<D<768: split-D M8N1 fp8;
-  // D>=768: split-D M4N2 fp8. Same D<768/D>=768 cross-point as the
-  // fp16 dispatch (M4N2 wins only for D>=768; below that M8N1 is
-  // faster even with D/2 reg spill, same as fp16).
-  // sm89 selection is backend-hint driven (CUTE_FP8_SM_89): the Python
-  // layer resolves device/force knobs into the hint before launch, so
-  // dispatch only reads the hint. Reject D>224 loudly instead of silently
-  // running the sm120 split-D/M4N2 families (on real sm89 hardware that
-  // path dies on a cubin load with a misleading error).
-  const bool on_sm89 =
-      ffpa::get_backend_impl_hint() == ffpa::CudaBackendImpl::CUTE_FP8_SM_89;
-  TORCH_CHECK(!on_sm89 || kHeadDim <= 224,
-              "ffpa_attn: fp8 sm89 path supports D<=224 only");
-  // The non-sm89 route is the sm_120 TMA family (hard-bound: traits use
-  // Blackwell atoms); reject earlier devices loudly instead of dying on a
-  // cubin load with a misleading no-kernel-image error.
-  TORCH_CHECK(on_sm89 || at::cuda::getCurrentDeviceProperties()->major >= 12,
-              "ffpa_attn: the CUTE_TMA_FP8_SM_120 family requires an sm_120 "
-              "device; use the CUTE_FP8_SM_89 hint on sm_89");
-  if constexpr (kHeadDim <= 224) {
+  if (on_sm89) {
+    // TMA-free cp.async sm89 family (compiles under the sm_89-only ext):
+    // persist-D for D<=224, split-D M8N1 for 224<D<=512 (D%64==0). Shared
     // scope: hybrid via q_start_row (stage-1 = sm_80 cp.async fp16 family),
     // per_block/per_thread QK + per_block/per_channel V (+smooth_v), no
     // dropout (checked inside the launcher).
     // kQKInt8 is a template tag here; the e4m3 QK atom is picked by Traits
     // from the same flag.
-    if (on_sm89) {
+    if constexpr (kHeadDim <= 224) {
       TORCH_CHECK(p.fp8_qk_mm_type == 0 || p.fp8_qk_mm_type == 1,
                   "ffpa_attn: fp8 sm89 v1 supports fp8/int8 QK only");
       const bool qk_int8 = (p.fp8_qk_mm_type == 1);
@@ -151,7 +153,82 @@ void ffpa_fwd_fp8(const FfpaFwdParams& p) {
       }
       return;
     }
+    // 224 < D <= 512 (D%64==0): the persist branch above already returned
+    // for D<=224, so this window is mutually exclusive with it.
+    if constexpr (kHeadDim > 224 && kHeadDim <= 512 && kHeadDim % 64 == 0) {
+      TORCH_CHECK(p.fp8_qk_mm_type == 0 || p.fp8_qk_mm_type == 1,
+                  "ffpa_attn: fp8 sm89 v1 supports fp8/int8 QK only");
+      const bool qk_int8 = (p.fp8_qk_mm_type == 1);
+      const int bias_on = p.attn_bias.numel() > 0 ? 1 : 0;
+      const auto dispatch_sm89 = [&](auto qk_c, int q_start_row) {
+        constexpr bool kQ = decltype(qk_c)::value;
+        if (!bias_on)
+          launch_cute_fwd_split_d_fp8_sm89<kDataType, kHeadDim, kStage, kQ, 0>(
+              p.Q, p.K, p.V, p.O, p.attn_bias, p.softmax_lse, p.causal,
+              p.softmax_scale, p.dropout_p, p.philox_seed, p.philox_offset,
+              p.fp8_smooth_k, p.fp8_smooth_v, p.fp8_q_quant_method,
+              p.fp8_k_quant_method, p.fp8_v_quant_method, p.fp8_pv_acc_type,
+              q_start_row, p.fp8_hadamard);
+        else
+          launch_cute_fwd_split_d_fp8_sm89<kDataType, kHeadDim, kStage, kQ, 1>(
+              p.Q, p.K, p.V, p.O, p.attn_bias, p.softmax_lse, p.causal,
+              p.softmax_scale, p.dropout_p, p.philox_seed, p.philox_offset,
+              p.fp8_smooth_k, p.fp8_smooth_v, p.fp8_q_quant_method,
+              p.fp8_k_quant_method, p.fp8_v_quant_method, p.fp8_pv_acc_type,
+              q_start_row, p.fp8_hadamard);
+      };
+      if (p.fp8_hybrid && p.Nq >= p.fp8_hybrid_n_early) {
+        const int n_early = static_cast<int>(p.fp8_hybrid_n_early);
+        TORCH_CHECK(n_early % 128 == 0,
+                    "ffpa_attn: fp8_hybrid_n_early must be multiple of 128");
+        torch::Tensor Q_e, K_e, V_e;
+        prepare_hybrid_stage1(Q_e, K_e, V_e, p.Q, p.K, p.V, n_early, p.Nkv,
+                              p.Nq, p.causal, p.D_og, kHeadDim, p.d_padded);
+        auto O_e = torch::empty_like(Q_e);
+        auto lse_e = torch::empty(
+            {p.Nb, p.Nh, n_early},
+            torch::TensorOptions().dtype(torch::kFloat32).device(p.Q.device()));
+        auto bias_e = p.attn_bias.numel() > 0 ? p.attn_bias.slice(2, 0, n_early)
+                                              : p.attn_bias;
+        FfpaFwdParams p1;
+        p1.Q = Q_e;
+        p1.K = K_e;
+        p1.V = V_e;
+        p1.O = O_e;
+        p1.attn_bias = bias_e;
+        p1.softmax_lse = lse_e;
+        p1.causal = p.causal;
+        p1.softmax_scale = p.softmax_scale;
+        // Stage-1 must run the cp.async sm_80 fp16 family: the sm89 path
+        // targets sm<=89 hardware with no TMA (the sm120 TMA fp16 kernel
+        // only works on this sm120 dev box, not on real Ada).
+        ffpa_fwd_cute_fp16_sm80<kDataType, kHeadDim, kStage>(p1);
+        p.O.slice(2, 0, n_early).copy_(O_e);
+        if (p.softmax_lse.numel() > 0)
+          p.softmax_lse.slice(2, 0, n_early).copy_(lse_e);
+        if (qk_int8)
+          dispatch_sm89(std::true_type{}, n_early);
+        else
+          dispatch_sm89(std::false_type{}, n_early);
+      } else {
+        if (qk_int8)
+          dispatch_sm89(std::true_type{}, 0);
+        else
+          dispatch_sm89(std::false_type{}, 0);
+      }
+      return;
+    }
+    TORCH_CHECK(false,
+                "ffpa_attn: fp8 sm89 path supports D<=512 (persist-D D<=224 "
+                "with D%32==0, split-D 224<D<=512 with D%64==0), got D=",
+                kHeadDim);
+  }
 #ifdef ENABLE_FFPA_TMA_EXT
+  // D<=224: persist-D fp8; 224<D<768: split-D M8N1 fp8;
+  // D>=768: split-D M4N2 fp8. Same D<768/D>=768 cross-point as the
+  // fp16 dispatch (M4N2 wins only for D>=768; below that M8N1 is
+  // faster even with D/2 reg spill, same as fp16).
+  if constexpr (kHeadDim <= 224) {
     if (p.fp8_hybrid && p.Nq >= p.fp8_hybrid_n_early) {
       const int n_early = static_cast<int>(p.fp8_hybrid_n_early);
       TORCH_CHECK(n_early % 128 == 0,
@@ -285,9 +362,8 @@ void ffpa_fwd_fp8(const FfpaFwdParams& p) {
     }
   }
 #else
-    // sm_89-only build (no TMA ext): only the sm89 persist-D kernel family
-    // exists; the sm120 families were never compiled.
-  }
+  // sm_89-only build (no TMA ext): the sm120 families were never
+  // compiled; the sm89 cp.async branch above is the only fp8 route.
   TORCH_CHECK(false,
               "ffpa_attn: the CUTE_TMA_FP8_SM_120 family requires "
               "ENABLE_FFPA_TMA_EXT");

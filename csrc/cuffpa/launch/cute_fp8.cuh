@@ -9,6 +9,7 @@
 #if defined(ENABLE_FFPA_CUTE_EXT) && \
     (defined(ENABLE_FFPA_TMA_EXT) || defined(ENABLE_FFPA_FP8_SM89_EXT))
 #include "launch/cute_fp8_persist_d_sm89.cuh"
+#include "launch/cute_fp8_split_d_sm89.cuh"
 #ifdef ENABLE_FFPA_TMA_EXT
 #include "launch/cute_fp8_persist_d.cuh"
 #include "launch/cute_fp8_split_d.cuh"

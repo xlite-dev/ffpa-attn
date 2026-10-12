@@ -17,13 +17,21 @@ import torch.nn.functional as F
 
 from ffpa_attn import ffpa_attn_func
 from ffpa_attn.cli._flops import attention_fwd_flops, tflops_from_ms
-from ffpa_attn.cuda import CUDA_INPUT_FP16_AVAILABLE
+from ffpa_attn.cuda import CUDA_INPUT_FP16_AVAILABLE, CUDA_QUANT_SPLIT_D_AVAILABLE
 from ffpa_attn.functional import CUDABackend
 
 # Documented fp4 quant-error floor (max_abs at sigma=1); sigma=0.5 inputs
 # land at roughly half of these.
 _TOL_DENSE = dict(atol=1.5e-1, rtol=1.5e-1)
 _TOL_CAUSAL = dict(atol=7e-1, rtol=7e-1)
+
+# Split-D / m4n2 fp4 kernels are opt-in (ENABLE_FFPA_QUANT_SPLIT_D);
+# default builds ship the persist-D window (D<=256) only (PC-19).
+requires_quant_split_d = pytest.mark.skipif(
+  not CUDA_QUANT_SPLIT_D_AVAILABLE,
+  reason="fp4 split-D/m4n2 not compiled; rebuild with "
+  "ENABLE_FFPA_QUANT_SPLIT_D=1",
+)
 
 
 def _fp4_available() -> bool:
@@ -246,6 +254,7 @@ def test_fp4_smooth_v_parity(monkeypatch):
 
 @pytest.mark.parametrize("D", [320, 768], ids=["split_d", "m4n2"])
 @pytest.mark.parametrize("causal", [False, True], ids=["dense", "causal"])
+@requires_quant_split_d
 def test_fp4_smooth_v_large_d_parity(D, causal, monkeypatch):
   # FC-6: smooth_v extends past persist-D into split-D and m4n2 — the V^T
   # quantize kernels always took vm; only the launcher wiring and the
@@ -329,7 +338,21 @@ def test_fp4_lse_parity(D, monkeypatch):
   torch.testing.assert_close(lse.float(), lse_ref, atol=1.5e-1, rtol=2e-2)
 
 
-@pytest.mark.parametrize("D", [128, 320], ids=["persist_d", "split_d"])
+@pytest.mark.parametrize(
+  "D",
+  [
+    pytest.param(128, id="persist_d"),
+    pytest.param(
+      320,
+      id="split_d",
+      marks=pytest.mark.skipif(
+        not CUDA_QUANT_SPLIT_D_AVAILABLE,
+        reason="fp4 split-D not compiled; rebuild with "
+        "ENABLE_FFPA_QUANT_SPLIT_D=1",
+      ),
+    ),
+  ],
+)
 def test_fp4_mxfp8_lse_parity(D, monkeypatch):
   # MXFP8 PV row_sum lives in the P*448 domain (not NVFP4's P*2688); the
   # lse correction must divide by 448 (ln(6) smaller). Guards the domain
@@ -362,6 +385,7 @@ def test_fp4_head_dim_pad_persist(monkeypatch):
   torch.testing.assert_close(out.float(), ref, **_TOL_DENSE)
 
 
+@requires_quant_split_d
 def test_fp4_head_dim_pad_split_d():
   torch.manual_seed(0)
   B, H, N, D = 1, 16, 2048, 264  # pads to kHeadDim=320 (split-D range)
@@ -380,6 +404,7 @@ def test_fp4_head_dim_pad_split_d():
 @pytest.mark.parametrize(
   "dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"]
 )
+@requires_quant_split_d
 def test_fp4_split_d_forward_parity(D, dtype):
   torch.manual_seed(0)
   B, H, N = 1, 32, 4096
@@ -393,6 +418,7 @@ def test_fp4_split_d_forward_parity(D, dtype):
 
 
 @pytest.mark.parametrize("D", [320, 512])
+@requires_quant_split_d
 def test_fp4_split_d_causal_parity(D):
   torch.manual_seed(0)
   B, H, N = 1, 32, 2048
@@ -406,6 +432,7 @@ def test_fp4_split_d_causal_parity(D):
 
 
 @pytest.mark.parametrize("D", [320, 512])
+@requires_quant_split_d
 def test_fp4_split_d_gqa_parity(D):
   torch.manual_seed(0)
   B, H, H_kv, N = 1, 32, 8, 4096
@@ -421,6 +448,7 @@ def test_fp4_split_d_gqa_parity(D):
 
 
 @pytest.mark.parametrize("D", [320, 512])
+@requires_quant_split_d
 def test_fp4_split_d_nkv_unaligned_lse(D):
   # N % 128 != 0: tail tile + partial quantize; also pins the lse flat
   # [B, Nh, Nq] indexing (stride Nq per head).

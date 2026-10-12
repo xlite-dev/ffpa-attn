@@ -32,7 +32,11 @@ import torch
 from ffpa_attn.functional import CUDABackend
 
 try:
-  from ffpa_attn.cuda import set_cuda_backend_impl, CudaBackendImpl
+  from ffpa_attn.cuda import (
+    CUDA_QUANT_SPLIT_D_AVAILABLE,
+    set_cuda_backend_impl,
+    CudaBackendImpl,
+  )
   from ffpa_attn.cuda._ffpa_fwd import _ffpa_attn_forward_cuda
   FFPA_CUDA_EXT_BUILT = True
 except Exception:  # pragma: no cover
@@ -52,6 +56,11 @@ def _fp4_available() -> bool:
 
 
 pytestmark = [
+  pytest.mark.skipif(
+    not CUDA_QUANT_SPLIT_D_AVAILABLE,
+    reason="fp4 m4n2 not compiled; rebuild with "
+    "ENABLE_FFPA_QUANT_SPLIT_D=1",
+  ),
   pytest.mark.skipif(not _fp4_available(), reason="fp4 path requires sm_120"),
   pytest.mark.skipif(not FFPA_CUDA_EXT_BUILT, reason="ffpa CUDA ext required"),
   pytest.mark.skipif(
