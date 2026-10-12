@@ -1,6 +1,6 @@
 ## 🎉🎉 Hightlight
 
-[2026-10-12]: FFPA has officially migrated to the new repository: [https://github.com/vipshop/ffpa-attn](https://github.com/vipshop/ffpa‑attn). This change aims to streamline future development and make project maintenance more efficient.
+[2026-10-12]: FFPA has officially migrated to the new repository: https://github.com/vipshop/ffpa-attn. This change aims to streamline future development and make project maintenance more efficient.
 
 ---
 
